@@ -40,7 +40,7 @@ use std::time::Duration;
 use komo_core::domain::llm::LlmClient;
 use komo_core::domain::memory::{
     EvidenceRelation, Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryProvenance,
-    MemoryRepository, MemoryStatus, ScoredMemory, select_related,
+    MemoryRepository, MemoryStatus, Occasion, ScoredMemory, select_related,
 };
 use komo_core::domain::message::Message;
 use komo_core::domain::session::Session;
@@ -177,7 +177,7 @@ impl MemoryConsolidator {
         &self,
         ctx: &MemoryContext,
         session_id: &str,
-        occasion: &str,
+        occasion: &Occasion,
         observations: Vec<Observation>,
     ) -> anyhow::Result<Vec<Consolidated>> {
         let mut library = self.memories.list().await?;
@@ -197,7 +197,7 @@ impl MemoryConsolidator {
         &self,
         ctx: &MemoryContext,
         session_id: &str,
-        occasion: &str,
+        occasion: &Occasion,
         observation: &Observation,
         library: &mut Vec<Memory>,
         now: i64,
@@ -230,10 +230,7 @@ impl MemoryConsolidator {
                 || (memory_key(&m.content) == key
                     && m.evidence.iter().any(|e| e.session == session_id))
         }) {
-            let same_occasion = library[index]
-                .evidence
-                .iter()
-                .any(|e| e.occasion_key() == occasion);
+            let same_occasion = library[index].witnessed_on(occasion);
             // No classifier call: an identical key is trivially the same claim.
             // The one rule that still applies is the provenance rule below — an
             // observation komo read out of tool output supports nothing.
@@ -289,7 +286,7 @@ impl MemoryConsolidator {
                     let memory = &mut library[index];
                     memory.record_evidence(
                         session_id,
-                        occasion,
+                        occasion.key(),
                         EvidenceRelation::Contradicts,
                         &observation.excerpt,
                         now,
@@ -330,25 +327,27 @@ impl MemoryConsolidator {
         &self,
         index: usize,
         session_id: &str,
-        occasion: &str,
+        occasion: &Occasion,
         observation: &Observation,
         library: &mut [Memory],
         now: i64,
     ) -> anyhow::Result<Consolidated> {
         let memory = &mut library[index];
-        let counted = memory.record_evidence(
+        if memory.witnessed_on(occasion) {
+            // This pass already backs the claim — under its canonical name, or
+            // under any other run of its own batch, which is where an explicit
+            // `memory` save made during one of those turns sits. Nothing changed,
+            // so nothing is written.
+            return Ok(Consolidated::Skipped);
+        }
+        memory.record_evidence(
             session_id,
-            occasion,
+            occasion.key(),
             EvidenceRelation::Supports,
             &observation.excerpt,
             now,
         );
         let id = memory.id.clone();
-        if !counted {
-            // This occasion already backs the claim; nothing changed, so nothing
-            // is written.
-            return Ok(Consolidated::Skipped);
-        }
         let memory = memory.clone();
         self.memories.save(&memory).await?;
         Ok(Consolidated::Supported { id })
@@ -359,7 +358,7 @@ impl MemoryConsolidator {
         &self,
         ctx: &MemoryContext,
         session_id: &str,
-        occasion: &str,
+        occasion: &Occasion,
         observation: &Observation,
         library: &mut Vec<Memory>,
         now: i64,
@@ -378,7 +377,7 @@ impl MemoryConsolidator {
         // recorded occasions".
         memory.record_evidence(
             session_id,
-            occasion,
+            occasion.key(),
             EvidenceRelation::Supports,
             &observation.excerpt,
             now,
@@ -679,7 +678,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-1",
-                "s-1",
+                &Occasion::single("s-1"),
                 vec![observation("user prefers rebase")],
             )
             .await
@@ -713,7 +712,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
-                "s-2",
+                &Occasion::single("s-2"),
                 vec![observation(
                     "user rebases rather than merging before a push",
                 )],
@@ -762,7 +761,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
-                "s-2",
+                &Occasion::single("s-2"),
                 vec![from_tool("user rebases rather than merging before a push")],
             )
             .await
@@ -803,7 +802,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
-                "s-2",
+                &Occasion::single("s-2"),
                 vec![observation(
                     "user rebases rather than merging before a push",
                 )],
@@ -830,7 +829,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "home",
-                "run-2",
+                &Occasion::single("run-2"),
                 vec![
                     observation("user rebases rather than merging"),
                     observation("user always rebases their branches"),
@@ -853,7 +852,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "home",
-                "run-3",
+                &Occasion::single("run-3"),
                 vec![observation("user rebases their branches before pushing")],
             )
             .await
@@ -877,7 +876,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
-                "s-2",
+                &Occasion::single("s-2"),
                 vec![observation("user mainly uses Rust")],
             )
             .await
@@ -915,7 +914,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
-                "s-2",
+                &Occasion::single("s-2"),
                 vec![observation("user wants Rust examples from now on")],
             )
             .await
@@ -950,7 +949,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-1",
-                "s-1",
+                &Occasion::single("s-1"),
                 vec![observation("komo is written in Rust")],
             )
             .await
@@ -962,7 +961,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-1",
-                "run-2",
+                &Occasion::single("run-2"),
                 vec![observation("komo is written in Rust")],
             )
             .await
@@ -996,7 +995,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-1",
-                "run-1",
+                &Occasion::single("run-1"),
                 vec![observation("komo is written in Rust")],
             )
             .await
@@ -1029,7 +1028,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
-                "run-2",
+                &Occasion::single("run-2"),
                 vec![observation("komo is written in Rust")],
             )
             .await
@@ -1072,7 +1071,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "home",
-                "run-1",
+                &Occasion::single("run-1"),
                 vec![observation("komo is written in Rust")],
             )
             .await
@@ -1104,7 +1103,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "home",
-                "run-2",
+                &Occasion::single("run-2"),
                 vec![observation("komo is written in Rust")],
             )
             .await
@@ -1134,13 +1133,71 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "home",
-                "run-2",
+                &Occasion::single("run-2"),
                 vec![from_tool("komo is written in Rust")],
             )
             .await
             .unwrap();
         assert_eq!(out[0], Consolidated::Skipped);
         assert_eq!(store.get("mem-1").support_count, 1);
+        assert_eq!(store.len(), 1);
+    }
+
+    /// The `memory` tool founds evidence with the turn's *own* run, while the
+    /// pass that later reviews that turn is a batch of runs named by its oldest.
+    /// A pass whose batch contains the founding run is the same occasion, so it
+    /// supports nothing — otherwise reviewing a turn corroborates what the model
+    /// recorded during it. A batch that does not contain it is a later occasion
+    /// and does.
+    #[tokio::test]
+    async fn a_pass_over_the_batch_that_founded_a_claim_supports_nothing() {
+        // As the `memory` tool leaves it: `source` empty, evidence keyed by the
+        // run of the turn the save was made in.
+        let mut saved = active("mem-1", "komo is written in Rust");
+        saved.status = MemoryStatus::Candidate;
+        saved.record_evidence(
+            "home",
+            "r3",
+            EvidenceRelation::Supports,
+            "user said so",
+            100,
+        );
+        let store = Arc::new(FakeStore::new(vec![saved]));
+        let c = consolidator(
+            store.clone(),
+            Err(anyhow::anyhow!("classifier must not be consulted")),
+        );
+
+        let batch = Occasion::over(["r3".into(), "r1".into(), "r2".into()]);
+        assert_eq!(batch.key(), "r1", "the canonical name is the oldest run");
+        let out = c
+            .consolidate_all(
+                &ctx(),
+                "home",
+                &batch,
+                vec![observation("komo is written in Rust")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(out[0], Consolidated::Skipped);
+        assert_eq!(
+            store.get("mem-1").support_count,
+            1,
+            "the batch already witnessed this claim through r3"
+        );
+
+        // A batch that shares no run with it is a genuinely later occasion.
+        let out = c
+            .consolidate_all(
+                &ctx(),
+                "home",
+                &Occasion::single("r4"),
+                vec![observation("komo is written in Rust")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(out[0], Consolidated::Supported { id: "mem-1".into() });
+        assert_eq!(store.get("mem-1").support_count, 2);
         assert_eq!(store.len(), 1);
     }
 
@@ -1161,7 +1218,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
-                "s-2",
+                &Occasion::single("s-2"),
                 // Same text, different case and spacing — the normalized key matches.
                 vec![observation("user prefers   REBASE before push")],
             )
@@ -1186,7 +1243,7 @@ mod tests {
                 .consolidate_all(
                     &ctx(),
                     "s-2",
-                    "s-2",
+                    &Occasion::single("s-2"),
                     vec![observation("user uses Python 3.12")],
                 )
                 .await
@@ -1217,7 +1274,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-1",
-                "s-1",
+                &Occasion::single("s-1"),
                 vec![
                     observation("user prefers rebase"),
                     observation("user rebases before pushing"),

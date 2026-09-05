@@ -192,13 +192,18 @@ impl Memory {
     /// Record an observation bearing on this memory. Returns whether it counted.
     ///
     /// **Independence is per learning occasion**, not per session. One extraction
-    /// pass over one batch of runs is one occasion; a retry or a re-extraction of
-    /// the same batch names the same occasion and is dropped, which is what makes
+    /// pass over one batch of runs is one occasion, named here by its canonical
+    /// id ([`Occasion::key`]); a retry or a re-extraction of the same batch names
+    /// the same occasion and is dropped, which is what makes
     /// `support_count` mean "N separate occasions" instead of "N sentences" — a
     /// user restating a preference three times in one conversation must not look
     /// like three independent confirmations. Session alone cannot be that unit
     /// any more: the operator's private conversations are all one permanent home
     /// session, so keying on it would mean support never accumulates there at all.
+    ///
+    /// This dedupes on the canonical name alone. A caller holding the whole
+    /// [`Occasion`] — one that must also recognize evidence founded under
+    /// another run of its own batch — asks [`Memory::witnessed_on`] first.
     ///
     /// Legacy evidence stored before this field existed carries an empty
     /// occasion and is keyed by its session instead ([`Evidence::occasion_key`]).
@@ -238,6 +243,18 @@ impl Memory {
         }
         self.updated_at = now;
         true
+    }
+
+    /// Whether this memory already carries evidence from `occasion` — under its
+    /// canonical name or under any other run of the same pass.
+    ///
+    /// [`Occasion`] says why the second half matters: the `memory` tool and the
+    /// review of the turn it ran in name the same pass differently, and only the
+    /// set knows they are one.
+    pub fn witnessed_on(&self, occasion: &Occasion) -> bool {
+        self.evidence
+            .iter()
+            .any(|e| occasion.covers(e.occasion_key()))
     }
 
     /// Something now conflicts with this memory and nothing has resolved which
@@ -510,10 +527,12 @@ pub struct Evidence {
     /// operator's private conversations are all one permanent home session, so
     /// this cannot be the unit of independence.
     pub session: String,
-    /// The learning occasion that produced it — one extraction pass over one
-    /// batch of runs — and the unit of independence: two statements gathered by
-    /// one pass are one observation. Empty on evidence stored before this field
-    /// existed; see [`Evidence::occasion_key`].
+    /// The learning occasion that produced it, by its canonical name — see
+    /// [`Occasion`], which is the whole batch of runs one pass read and not
+    /// necessarily the run these words were said in. The unit of independence:
+    /// two statements gathered by one pass are one observation. Empty on
+    /// evidence stored before this field existed; see
+    /// [`Evidence::occasion_key`].
     #[serde(default)]
     pub occasion: String,
     pub observed_at: i64,
@@ -531,6 +550,54 @@ impl Evidence {
             true => &self.session,
             false => &self.occasion,
         }
+    }
+}
+
+/// One learning occasion, as the set of runs it read.
+///
+/// An occasion is *a pass*, not a turn: a sweep batches up to `LEARN_BATCH_CAP`
+/// runs into one extraction, and everything that pass gathered is one
+/// observation. Its identity therefore has to be the whole batch. New evidence
+/// is stamped with a single canonical name — the oldest run in it, ids being
+/// UUIDv7 and so sorting by time — and the rest of the set is what recognizes
+/// evidence *another* writer founded inside this same pass.
+///
+/// That second half is the whole reason this is a set. The `memory` tool founds
+/// evidence with the turn's own run id, and that turn is usually somewhere in
+/// the middle of the batch whose review reads it later. Compare canonical names
+/// alone and the review of a turn would "support" the claim the model saved
+/// during it — one occasion counted twice, which is exactly the
+/// self-corroboration [`Memory::record_evidence`] exists to prevent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Occasion {
+    /// Sorted and deduplicated, so `runs[0]` is the canonical key.
+    runs: Vec<String>,
+}
+
+impl Occasion {
+    /// The occasion a pass over these runs is. An empty set names nothing: it
+    /// keys as the empty string and covers no evidence.
+    pub fn over(runs: impl IntoIterator<Item = String>) -> Self {
+        let mut runs: Vec<String> = runs.into_iter().collect();
+        runs.sort();
+        runs.dedup();
+        Self { runs }
+    }
+
+    /// An occasion of exactly one id — an explicit `memory` save, whose occasion
+    /// is the turn it was made in.
+    pub fn single(id: impl Into<String>) -> Self {
+        Self::over([id.into()])
+    }
+
+    /// The name evidence recorded on this occasion carries.
+    pub fn key(&self) -> &str {
+        self.runs.first().map(String::as_str).unwrap_or_default()
+    }
+
+    /// Whether an existing [`Evidence::occasion_key`] belongs to this occasion.
+    pub fn covers(&self, key: &str) -> bool {
+        self.runs.iter().any(|run| run == key)
     }
 }
 

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use komo_core::domain::{
     episode::AssessedEpisode,
     llm::LlmClient,
-    memory::{MemoryContext, MemoryKind, MemoryProvenance, parse_memory_kind},
+    memory::{MemoryContext, MemoryKind, MemoryProvenance, Occasion, parse_memory_kind},
     message::Message,
     repository::SkillRepository,
     reviewer::{ReviewOutcome, Reviewer, SELF_REVIEW_PROMPT},
@@ -165,7 +165,12 @@ impl Reviewer for ReflectiveReviewer {
         if !observations.is_empty() {
             let results = self
                 .consolidator
-                .consolidate_all(&ctx, &session.id, learning_occasion(episodes), observations)
+                .consolidate_all(
+                    &ctx,
+                    &session.id,
+                    &learning_occasion(episodes),
+                    observations,
+                )
                 .await?;
             outcome
                 .memories_written
@@ -272,19 +277,20 @@ impl Reviewer for ReflectiveReviewer {
     }
 }
 
-/// The learning occasion this batch of episodes is: the oldest run in it.
+/// The learning occasion this batch of episodes is: every run in it.
 ///
 /// One pass over one batch is one occasion, and a failed pass retires nothing —
 /// so a retry reads the same batch, names the same occasion, and its re-extracted
 /// observations dedupe against the first attempt's evidence instead of
-/// corroborating it. Oldest by run id, which is a UUIDv7 and therefore sorts by
-/// time, so the answer does not depend on the order the caller assembled them in.
-fn learning_occasion(episodes: &[AssessedEpisode]) -> &str {
-    episodes
-        .iter()
-        .map(|e| e.view.run.id.as_str())
-        .min()
-        .unwrap_or_default()
+/// corroborating it.
+///
+/// The *whole* batch, not just the oldest run [`Occasion`] names it by: a sweep
+/// batches up to `LEARN_BATCH_CAP` runs, and a memory the model saved mid-turn
+/// through the `memory` tool is founded on that turn's own run — somewhere in
+/// the middle of the batch. Reviewing that turn would otherwise "support" what
+/// it had already recorded, counting one occasion twice.
+fn learning_occasion(episodes: &[AssessedEpisode]) -> Occasion {
+    Occasion::over(episodes.iter().map(|e| e.view.run.id.clone()))
 }
 
 /// Deterministic, dependency-free dedup key for an extracted commitment: FNV-1a

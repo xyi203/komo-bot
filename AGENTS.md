@@ -652,13 +652,20 @@ call the same functions, which is what keeps validation from forking.
   find related claims, classify via aux as same/supports/contradicts/supersedes/
   unrelated, then record evidence, contest, supersede, or write a candidate. Every
   failure path lands a plain candidate — the pre-seam behavior. Evidence
-  independence is **per learning occasion** — one `LearningCoordinator` pass over
-  one batch of runs, named by that batch's oldest run id, which
-  `record_evidence` drops if it already counted it. That is what stops one
+  independence is **per learning occasion** — one `LearningCoordinator` pass,
+  which `record_evidence` drops if it already counted it. That is what stops one
   talkative pass from corroborating itself, and what a permanent **home
   session** made session-keying unable to do: every private conversation is one
   session, so support never reached `DREAM_MIN_SUPPORT` there and nothing
-  extracted on the main ingress could promote. Legacy evidence carries no
+  extracted on the main ingress could promote.
+  An occasion is the **whole batch** of runs that pass read (`Occasion`), not
+  one run of it: new evidence is stamped with the batch's oldest run id as its
+  canonical name, and `Memory::witnessed_on` asks whether *any* run in the batch
+  already appears. That second half is why it is a set — a memory the model saved
+  mid-turn through the `memory` tool is founded on that turn's own run, which
+  sits somewhere in the middle of the batch whose review reads it later, and
+  comparing canonical names alone would let that review "support" what the turn
+  had already recorded. Legacy evidence carries no
   occasion and falls back to its session (`Evidence::occasion_key`); the list is
   capped at `EVIDENCE_CAP` while the counts keep rising.
   Its related-claim lookup uses `select_related` — recall's set **plus rejected

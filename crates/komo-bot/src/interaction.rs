@@ -40,7 +40,8 @@ use komo_core::domain::{
     cancel::CancelSignal,
     gateway::{InterjectSource, MessageHandler, ReplySink, WeChatLogin},
     home::HomeRepository,
-    inbox::{InboundOrigin, InboxClaim, InboxRepository},
+    inbox::{InboundOrigin, InboxClaim, InboxRepository, UnfinishedInbound},
+    message::Role,
     notify::Notifier,
     pairing::{ApproveOutcome, PairingRepository, PairingStatus},
     policy::{Rule, RuleSpec},
@@ -850,6 +851,10 @@ const QUEUE_CAP: usize = 2;
 struct QueuedMessage {
     input: String,
     sink: Arc<dyn ReplySink>,
+    /// The inbox row this message was claimed under, completed when the turn
+    /// that finally runs it settles. `None` for input no inbox gated (a
+    /// dispatcher with no durable inbox behind it).
+    origin: Option<InboundOrigin>,
 }
 
 impl GatewayDispatcher {
@@ -1628,6 +1633,12 @@ impl GatewayDispatcher {
     /// redelivered `/approve` would approve a second time, which is worse than
     /// a repeated question.
     ///
+    /// The claim is released by whoever finishes the work, not here: a command
+    /// completes as soon as it is answered, a plain message when its turn
+    /// settles ([`dispatch`](Self::dispatch)). Returning early therefore leaves
+    /// the row `claimed`, which is exactly what
+    /// [`recover_inbox`](Self::recover_inbox) re-delivers after a crash.
+    ///
     /// Takes the *correspondent*, not a session id: a channel knows who wrote,
     /// and which conversation that is belongs to the store. Resolving it here
     /// rather than in each channel is what keeps three ingresses from growing
@@ -1650,7 +1661,7 @@ impl GatewayDispatcher {
             }
         };
         let session_id = session_id.as_str();
-        match self.inbox.claim(&origin, session_id, &text).await {
+        match self.inbox.claim(&origin, from, session_id, &text).await {
             Ok(InboxClaim::Duplicate) => {
                 info!(
                     platform = %origin.platform,
@@ -1674,12 +1685,8 @@ impl GatewayDispatcher {
         if let Some(triggers) = &self.triggers {
             triggers.on_inbound(&from.peer, &text).await;
         }
-        self.dispatch(session_id, from, text, sink).await;
-        if let Err(error) = self.inbox.complete(&origin).await {
-            // The row stays `claimed`. Harmless today (the key already blocks a
-            // redelivery); it becomes the signal for crash re-delivery later.
-            warn!(%error, "inbox complete failed (non-fatal)");
-        }
+        self.dispatch(session_id, from, text, sink, Some(origin))
+            .await;
     }
 
     /// Which conversation this message belongs to — the two-step resolution of
@@ -1716,14 +1723,47 @@ impl GatewayDispatcher {
         Ok(session.id)
     }
 
-    /// Route one already-deduped message.
+    /// Route one already-deduped message, then close its inbox row unless a
+    /// spawned turn took it over.
+    ///
+    /// This is the handoff point the durable inbox turns on: a chat command is
+    /// finished when it has been answered, a plain message only when its turn
+    /// has settled — so a message queued behind a busy session, or lost with
+    /// the process before its turn wrote anything, stays `claimed` and is
+    /// re-delivered by [`recover_inbox`](Self::recover_inbox).
     async fn dispatch(
         self: &Arc<Self>,
         session_id: &str,
         from: &InboundPeer,
         text: String,
         sink: Arc<dyn ReplySink>,
+        origin: Option<InboundOrigin>,
     ) {
+        if self
+            .route(session_id, from, text, sink, origin.clone())
+            .await
+        {
+            return;
+        }
+        let Some(origin) = origin else { return };
+        if let Err(error) = self.inbox.complete(&origin).await {
+            // The row stays `claimed`, so the next startup re-delivers a message
+            // that was in fact handled. Answering twice is recoverable; the row
+            // is not worth failing the message over.
+            warn!(%error, "inbox complete failed (non-fatal)");
+        }
+    }
+
+    /// The routing half of [`dispatch`](Self::dispatch). `true` = a spawned
+    /// turn now owns the inbox row and will complete it when it settles.
+    async fn route(
+        self: &Arc<Self>,
+        session_id: &str,
+        from: &InboundPeer,
+        text: String,
+        sink: Arc<dyn ReplySink>,
+        origin: Option<InboundOrigin>,
+    ) -> bool {
         match classify(&text) {
             Command::Approve(answer, id) => {
                 let asked = answer.clone();
@@ -1738,7 +1778,7 @@ impl GatewayDispatcher {
                     .await;
                 if granted.is_none() && woken != Answered::Nothing {
                     let _ = sink.send(answered_elsewhere(&woken)).await;
-                    return;
+                    return false;
                 }
                 let reply = match (&granted, asked) {
                     (Some(Answer::Session), _) => "✅ 已批准（本会话内同类操作将自动放行）",
@@ -1766,7 +1806,7 @@ impl GatewayDispatcher {
                     .await;
                 if !in_memory && woken != Answered::Nothing {
                     let _ = sink.send(answered_elsewhere(&woken)).await;
-                    return;
+                    return false;
                 }
                 let reply = if in_memory {
                     if explained {
@@ -1839,7 +1879,7 @@ impl GatewayDispatcher {
                     .answer_question(session_id, &input, Some(sink.clone()))
                     .await
                 {
-                    return;
+                    return false;
                 }
                 // Same rule for an approval this session is parked on: the user
                 // said something else, and a pending wait is **replaced** by the
@@ -1848,11 +1888,13 @@ impl GatewayDispatcher {
                 // and the turn continues — so the model sees both the refusal
                 // and what was actually said, in one turn instead of two.
                 if self.moved_on(session_id, &input, sink.clone()).await {
-                    return;
+                    return false;
                 }
-                self.spawn_turn(session_id, input, sink)
+                return self.spawn_turn(session_id, input, sink, origin);
             }
         }
+        // Every command above answered the message itself.
+        false
     }
 
     /// Run a `/pair` command against the shared pairing store. Lives in the
@@ -1953,7 +1995,15 @@ impl GatewayDispatcher {
         });
     }
 
-    fn spawn_turn(self: &Arc<Self>, session_id: &str, input: String, sink: Arc<dyn ReplySink>) {
+    /// `true` = a turn owns `origin` now (running, or queued for one). `false`
+    /// = nothing will run it, so the caller closes the inbox row itself.
+    fn spawn_turn(
+        self: &Arc<Self>,
+        session_id: &str,
+        input: String,
+        sink: Arc<dyn ReplySink>,
+        origin: Option<InboundOrigin>,
+    ) -> bool {
         // One turn at a time per session (keeps a session's history
         // append-ordered). A message that arrives mid-turn is queued (bounded)
         // so a quick follow-up is answered after the current turn instead of
@@ -1969,23 +2019,51 @@ impl GatewayDispatcher {
                             .send("上一条还在处理、队列已满；这条未处理，请稍后重发。")
                             .await;
                     });
-                } else {
-                    queue.push_back(QueuedMessage { input, sink });
+                    // Rejected *is* handled: the sender was told to resend, and
+                    // leaving the row open would run this message hours later,
+                    // out of a startup scan, after they already did.
+                    return false;
                 }
-                return;
+                queue.push_back(QueuedMessage {
+                    input,
+                    sink,
+                    origin,
+                });
+                return true;
             }
             // No turn in flight: mark the session busy (empty queue) and fall
             // through to dispatch.
             inflight.insert(session_id.to_string(), VecDeque::new());
         }
-        self.dispatch_turn(session_id.to_string(), input, sink);
+        self.dispatch_turn(
+            session_id.to_string(),
+            input,
+            sink,
+            origin.into_iter().collect(),
+        );
+        true
     }
 
     /// Run one turn on a spawned task. The session is already marked in-flight;
     /// [`TurnGuard`] guarantees the session is released (and the next queued
     /// message dispatched) on every exit path, including a panic or cancellation.
-    fn dispatch_turn(self: &Arc<Self>, session: String, input: String, sink: Arc<dyn ReplySink>) {
+    ///
+    /// `origins` are the inbox rows this turn is answering — the message that
+    /// started it plus everything merged in behind it. They are completed once
+    /// the turn has settled, which is what makes a row still `claimed` mean
+    /// "nobody has answered this yet" after a crash.
+    fn dispatch_turn(
+        self: &Arc<Self>,
+        session: String,
+        input: String,
+        sink: Arc<dyn ReplySink>,
+        origins: Vec<InboundOrigin>,
+    ) {
         let this = self.clone();
+        // Shared with the interjector: a message the running turn takes out of
+        // the queue mid-flight is answered by *this* turn, so its row settles
+        // with this one.
+        let owned = Arc::new(Mutex::new(origins));
         let ctx = SessionContext {
             session_id: session.clone(),
             workspace_root: None,
@@ -2004,6 +2082,7 @@ impl GatewayDispatcher {
             interject: Some(Arc::new(QueueInterjector {
                 dispatcher: this.clone(),
                 session: session.clone(),
+                owned: owned.clone(),
             })),
             // A chat turn is user-driven: policy evaluates it against the
             // channel, and a human is reachable for an approval prompt.
@@ -2040,6 +2119,16 @@ impl GatewayDispatcher {
             if let Err(error) = sink.send(&reply).await {
                 warn!(%error, "failed to send reply");
             }
+            // The turn has settled — answered, failed, or suspended with the log
+            // holding what it is waiting for. Either way the message is no longer
+            // owed a first attempt, so its inbox rows close here rather than at
+            // dispatch.
+            let settled = std::mem::take(&mut *owned.lock().unwrap());
+            for origin in settled {
+                if let Err(error) = this.inbox.complete(&origin).await {
+                    warn!(%error, "inbox complete failed (non-fatal)");
+                }
+            }
             // Normal completion: advance the queue ourselves (safe to spawn from
             // this async context) and disarm the guard's emergency path.
             guard.armed = false;
@@ -2073,9 +2162,144 @@ impl GatewayDispatcher {
                 Some(merge_queued(queue))
             }
         };
-        if let Some(QueuedMessage { input, sink }) = next {
-            self.dispatch_turn(session.to_string(), input, sink);
+        if let Some((input, sink, origins)) = next {
+            self.dispatch_turn(session.to_string(), input, sink, origins);
         }
+    }
+
+    /// Re-deliver the messages a crash swallowed: the fourth startup
+    /// crash-residue check, after the interrupted runs, the suspended turns and
+    /// the orphaned background tasks.
+    ///
+    /// A row is `claimed` from the moment the message arrived and `completed`
+    /// only once its work finished, so a row still claimed at startup is a
+    /// message the dead process was owing an answer to — and the platform will
+    /// not deliver it again, because the claim is exactly what makes a
+    /// redelivery a [`InboxClaim::Duplicate`].
+    ///
+    /// Whether the turn *began* is asked of the transcript rather than the row:
+    /// once the user message is in the log, the run ledger and the suspended-turn
+    /// repair above own that turn, and starting a second one would re-run work
+    /// somebody is already recovering. Everything else goes back through the
+    /// same command-honouring path a channel's message takes, so an `/approve`
+    /// lost in a crash still approves.
+    ///
+    /// Called before the channels serve, so a recovered turn holds its session
+    /// slot before an arriving message can.
+    pub async fn recover_inbox(self: &Arc<Self>, limit: usize) -> usize {
+        let rows = match self.inbox.unfinished(limit).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(%error, "could not read the inbox for unfinished messages");
+                return 0;
+            }
+        };
+        let mut redelivered = 0;
+        for row in rows {
+            // Local input has no platform behind it and no channel to answer
+            // on; its caller owns its own retry story. Close the row so it
+            // stops being offered at every startup.
+            if row.origin.is_local() {
+                info!(session = %row.session_id, "closing a local inbox row left open by a restart");
+                self.complete_recovered(&row.origin).await;
+                continue;
+            }
+            if self.turn_began(&row).await {
+                info!(
+                    platform = %row.origin.platform,
+                    message_id = %row.origin.message_id,
+                    session = %row.session_id,
+                    "inbox row left open by a restart, but its turn had started — the ledger owns it"
+                );
+                self.complete_recovered(&row.origin).await;
+                continue;
+            }
+            // Nothing here addresses an arbitrary correspondent: the gateway's
+            // one outbound path (`HomeNotifier`) writes to the *home* chat, and
+            // the channel sink this message arrived on died with the process.
+            // The turn's answer therefore lands in the transcript only, where a
+            // local client will show it — the chat that wrote sees nothing back.
+            warn!(
+                platform = %row.origin.platform,
+                message_id = %row.origin.message_id,
+                session = %row.session_id,
+                "re-delivering a message lost to a restart; its reply lands in the transcript only"
+            );
+            let peer = row.peer.clone();
+            self.dispatch(
+                &row.session_id,
+                &peer,
+                row.text,
+                Arc::new(DroppedReplies),
+                Some(row.origin),
+            )
+            .await;
+            redelivered += 1;
+        }
+        redelivered
+    }
+
+    /// Whether this message's turn ever reached the transcript.
+    async fn turn_began(&self, row: &UnfinishedInbound) -> bool {
+        let session = match self
+            .sessions
+            .find_windowed(&row.session_id, RECOVERY_WINDOW)
+            .await
+        {
+            Ok(Some(session)) => session,
+            // No session, or a read that failed: re-delivering answers the
+            // message twice at worst, dropping it answers it never.
+            Ok(None) => return false,
+            Err(error) => {
+                warn!(%error, session = %row.session_id, "could not read a session while recovering the inbox");
+                return false;
+            }
+        };
+        session.messages.iter().any(|message| {
+            message.role == Role::User
+                && message.timestamp >= row.claimed_at
+                && says(&message.content, &row.text)
+        })
+    }
+
+    async fn complete_recovered(&self, origin: &InboundOrigin) {
+        if let Err(error) = self.inbox.complete(origin).await {
+            warn!(%error, "inbox complete failed while recovering (non-fatal)");
+        }
+    }
+}
+
+/// Whether a recorded user message carries `text`.
+///
+/// Not plain equality: consecutive messages are merged into one turn's input
+/// (`merge_queued`), so the message that landed may be several joined by
+/// newlines. Matching on whole lines rather than a substring is what keeps
+/// "ok" from matching "not ok".
+fn says(content: &str, text: &str) -> bool {
+    content == text
+        || content.starts_with(&format!("{text}\n"))
+        || content.ends_with(&format!("\n{text}"))
+        || content.contains(&format!("\n{text}\n"))
+}
+
+/// How far back a recovery check reads a session. A message whose turn started
+/// is at the very end of its transcript — the process died right after.
+const RECOVERY_WINDOW: usize = 20;
+
+/// How many unfinished rows one startup re-delivers. A backlog larger than this
+/// is a gateway that crashed repeatedly, and running all of it at once would
+/// spend the restart on old messages.
+pub const INBOX_RECOVERY_LIMIT: usize = 50;
+
+/// The sink a recovered message answers on: nothing. The channel handle its
+/// reply would have gone to died with the process, and the reply is in the
+/// transcript either way.
+struct DroppedReplies;
+
+#[async_trait]
+impl ReplySink for DroppedReplies {
+    async fn send(&self, _text: &str) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 
@@ -2091,17 +2315,27 @@ impl GatewayDispatcher {
 /// The reply goes to the **last** message's sink: it is the freshest reply
 /// handle (WeChat's are short-lived, held in memory) and answering the newest
 /// message is what a person would do.
-fn merge_queued(queue: &mut VecDeque<QueuedMessage>) -> QueuedMessage {
+fn merge_queued(
+    queue: &mut VecDeque<QueuedMessage>,
+) -> (String, Arc<dyn ReplySink>, Vec<InboundOrigin>) {
     let mut inputs = Vec::with_capacity(queue.len());
+    let mut origins = Vec::with_capacity(queue.len());
     let mut last_sink = None;
-    while let Some(QueuedMessage { input, sink }) = queue.pop_front() {
+    while let Some(QueuedMessage {
+        input,
+        sink,
+        origin,
+    }) = queue.pop_front()
+    {
         inputs.push(input);
+        origins.extend(origin);
         last_sink = Some(sink);
     }
-    QueuedMessage {
-        input: inputs.join("\n"),
-        sink: last_sink.expect("callers merge only a non-empty queue"),
-    }
+    (
+        inputs.join("\n"),
+        last_sink.expect("callers merge only a non-empty queue"),
+        origins,
+    )
 }
 
 /// Feeds one session's queued messages to the turn currently running on it.
@@ -2113,6 +2347,9 @@ fn merge_queued(queue: &mut VecDeque<QueuedMessage>) -> QueuedMessage {
 struct QueueInterjector {
     dispatcher: Arc<GatewayDispatcher>,
     session: String,
+    /// The running turn's inbox rows. A message taken here is answered by that
+    /// turn, so its row moves onto the turn's list and completes with it.
+    owned: Arc<Mutex<Vec<InboundOrigin>>>,
 }
 
 impl InterjectSource for QueueInterjector {
@@ -2122,7 +2359,13 @@ impl InterjectSource for QueueInterjector {
         // messages' sinks are dropped here — same conversation either way, and
         // a turn answers on the handle it started with.
         match inflight.get_mut(&self.session) {
-            Some(queue) => queue.drain(..).map(|msg| msg.input).collect(),
+            Some(queue) => queue
+                .drain(..)
+                .map(|msg| {
+                    self.owned.lock().unwrap().extend(msg.origin);
+                    msg.input
+                })
+                .collect(),
             // No entry means the turn already finished; nothing to take.
             None => Vec::new(),
         }
@@ -2675,6 +2918,7 @@ mod tests {
         async fn claim(
             &self,
             _origin: &InboundOrigin,
+            _peer: &InboundPeer,
             _session_id: &str,
             _text: &str,
         ) -> anyhow::Result<InboxClaim> {
@@ -2684,12 +2928,34 @@ mod tests {
         async fn complete(&self, _origin: &InboundOrigin) -> anyhow::Result<()> {
             Ok(())
         }
+
+        async fn unfinished(&self, _limit: usize) -> anyhow::Result<Vec<UnfinishedInbound>> {
+            Ok(Vec::new())
+        }
     }
 
-    /// The real repository's behaviour without a database.
+    /// The real repository's behaviour without a database: one row per platform
+    /// message, `claimed` until whoever handles it says otherwise.
     #[derive(Default)]
     struct DedupingInbox {
-        seen: Mutex<HashSet<String>>,
+        rows: Mutex<Vec<(UnfinishedInbound, bool)>>,
+    }
+
+    impl DedupingInbox {
+        /// A row a dead process left behind — what startup recovery finds.
+        fn left_claimed(row: UnfinishedInbound) -> Arc<Self> {
+            let store = Self::default();
+            store.rows.lock().unwrap().push((row, false));
+            Arc::new(store)
+        }
+
+        fn completed(&self, origin: &InboundOrigin) -> bool {
+            self.rows
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(row, done)| row.origin == *origin && *done)
+        }
     }
 
     #[async_trait]
@@ -2697,18 +2963,46 @@ mod tests {
         async fn claim(
             &self,
             origin: &InboundOrigin,
-            _session_id: &str,
-            _text: &str,
+            peer: &InboundPeer,
+            session_id: &str,
+            text: &str,
         ) -> anyhow::Result<InboxClaim> {
-            if self.seen.lock().unwrap().insert(origin.key()) {
-                Ok(InboxClaim::Fresh)
-            } else {
-                Ok(InboxClaim::Duplicate)
+            let mut rows = self.rows.lock().unwrap();
+            if rows.iter().any(|(row, _)| row.origin == *origin) {
+                return Ok(InboxClaim::Duplicate);
             }
+            rows.push((
+                UnfinishedInbound {
+                    origin: origin.clone(),
+                    session_id: session_id.to_string(),
+                    text: text.to_string(),
+                    peer: peer.clone(),
+                    claimed_at: 0,
+                },
+                false,
+            ));
+            Ok(InboxClaim::Fresh)
         }
 
-        async fn complete(&self, _origin: &InboundOrigin) -> anyhow::Result<()> {
+        async fn complete(&self, origin: &InboundOrigin) -> anyhow::Result<()> {
+            for (row, done) in self.rows.lock().unwrap().iter_mut() {
+                if row.origin == *origin {
+                    *done = true;
+                }
+            }
             Ok(())
+        }
+
+        async fn unfinished(&self, limit: usize) -> anyhow::Result<Vec<UnfinishedInbound>> {
+            Ok(self
+                .rows
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, done)| !done)
+                .map(|(row, _)| row.clone())
+                .take(limit)
+                .collect())
         }
     }
 
@@ -3628,6 +3922,190 @@ mod tests {
         );
     }
 
+    /// A message the process died owing an answer to is re-delivered at
+    /// startup — exactly once, and completed only after its turn has settled.
+    ///
+    /// The claim is what makes the platform's own redelivery a duplicate, so
+    /// nothing else will ever bring this message back.
+    #[tokio::test]
+    async fn a_claimed_message_whose_turn_never_ran_is_redelivered_once() {
+        let origin = InboundOrigin::new("telegram", "77");
+        let inbox = DedupingInbox::left_claimed(UnfinishedInbound {
+            origin: origin.clone(),
+            session_id: "s-lost".to_string(),
+            text: "把昨天的日志整理一下".to_string(),
+            peer: peer(),
+            claimed_at: 100,
+        });
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let dispatcher = dispatcher_with_sessions(
+            Arc::new(GateHandler {
+                entered: entered_tx,
+                permits: Arc::new(Semaphore::new(4)),
+            }),
+            inbox.clone(),
+            Arc::new(MemorySessions::default()),
+        );
+
+        assert_eq!(dispatcher.recover_inbox(50).await, 1);
+        assert_eq!(next_entered(&mut entered_rx).await, "把昨天的日志整理一下");
+
+        // The row closes when the turn does, not when it was dispatched.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(inbox.completed(&origin), "the settled turn closes its row");
+        assert_eq!(
+            dispatcher.recover_inbox(50).await,
+            0,
+            "a recovered message is not offered again"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the message must run exactly once"
+        );
+    }
+
+    /// The other half: the turn *did* start before the crash. Its user message
+    /// is in the transcript, so the run ledger and the suspended-turn repair
+    /// own it — re-running it here would duplicate work somebody else is
+    /// already recovering.
+    #[tokio::test]
+    async fn a_claimed_message_already_in_the_transcript_is_only_closed() {
+        let origin = InboundOrigin::new("telegram", "78");
+        let text = "查一下昨天的告警";
+        let inbox = DedupingInbox::left_claimed(UnfinishedInbound {
+            origin: origin.clone(),
+            session_id: "s-started".to_string(),
+            text: text.to_string(),
+            peer: peer(),
+            claimed_at: 100,
+        });
+        let sessions = Arc::new(MemorySessions::default());
+        let mut session = Session::new("s-started");
+        session.messages.push(komo_core::domain::message::Message {
+            role: Role::User,
+            content: text.to_string(),
+            timestamp: 100,
+            tool_note: String::new(),
+        });
+        SessionRepository::save(sessions.as_ref(), &session)
+            .await
+            .unwrap();
+
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let dispatcher = dispatcher_with_sessions(
+            Arc::new(GateHandler {
+                entered: entered_tx,
+                permits: Arc::new(Semaphore::new(4)),
+            }),
+            inbox.clone(),
+            sessions,
+        );
+
+        assert_eq!(dispatcher.recover_inbox(50).await, 0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the turn that already started is not started again"
+        );
+        assert!(inbox.completed(&origin), "the row is closed all the same");
+    }
+
+    /// Recovery goes back through the command-honouring path, not straight to a
+    /// turn: an `/approve` the crash swallowed still approves.
+    #[tokio::test]
+    async fn a_recovered_command_is_still_a_command() {
+        let origin = InboundOrigin::new("telegram", "79");
+        let inbox = DedupingInbox::left_claimed(UnfinishedInbound {
+            origin: origin.clone(),
+            session_id: "s-cmd".to_string(),
+            text: "/approve".to_string(),
+            peer: peer(),
+            claimed_at: 100,
+        });
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let approvals = Arc::new(ApprovalState::new());
+        approvals.note_pending("s-cmd", sample_pending());
+        let dispatcher = Arc::new(GatewayDispatcher::new(
+            Arc::new(GateHandler {
+                entered: entered_tx,
+                permits: Arc::new(Semaphore::new(4)),
+            }),
+            approvals.clone(),
+            Arc::new(MemorySessions::default()),
+            Arc::new(MemoryHome::default()),
+            Arc::new(MemoryTodos::default()),
+            None,
+            Arc::new(UnusedPairings),
+            inbox.clone(),
+        ));
+
+        assert_eq!(dispatcher.recover_inbox(50).await, 1);
+        assert!(
+            approvals.pending_info("s-cmd").is_none(),
+            "the recovered /approve answered the pending prompt"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "a command never starts a turn"
+        );
+        assert!(
+            inbox.completed(&origin),
+            "a command completes once answered"
+        );
+    }
+
+    /// A message waiting behind a busy session has not been answered yet, so
+    /// its row stays `claimed` — a crash while it waits re-delivers it.
+    #[tokio::test]
+    async fn a_queued_message_stays_claimed_until_its_turn_runs() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let inbox = Arc::new(DedupingInbox::default());
+        let dispatcher = dispatcher_with_parts(
+            Arc::new(GateHandler {
+                entered: entered_tx,
+                permits: permits.clone(),
+            }),
+            inbox.clone(),
+        );
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent }) as Arc<dyn ReplySink>;
+        let first = InboundOrigin::new("telegram", "80");
+        let second = InboundOrigin::new("telegram", "81");
+
+        dispatcher
+            .handle(&peer(), first.clone(), "m1".into(), sink.clone())
+            .await;
+        assert_eq!(next_entered(&mut entered_rx).await, "m1");
+        dispatcher
+            .handle(&peer(), second.clone(), "m2".into(), sink.clone())
+            .await;
+        assert!(
+            !inbox.completed(&first) && !inbox.completed(&second),
+            "nothing has been answered yet"
+        );
+
+        // The running turn settles: its own row closes, the queued one does not.
+        permits.add_permits(1);
+        assert_eq!(next_entered(&mut entered_rx).await, "m2");
+        assert!(inbox.completed(&first));
+        assert!(
+            !inbox.completed(&second),
+            "the queued message is only now running"
+        );
+        assert_eq!(
+            inbox.unfinished(10).await.unwrap().len(),
+            1,
+            "a crash here re-delivers exactly the message nobody answered"
+        );
+
+        permits.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(inbox.completed(&second));
+    }
+
     /// Chat platforms deliver at-least-once: Telegram redelivers a whole batch
     /// when the offset never got committed, Feishu retries what it thinks was
     /// not acked, and either survives a gateway restart. A redelivery must not
@@ -3753,6 +4231,7 @@ mod tests {
         let interjector = QueueInterjector {
             dispatcher: dispatcher.clone(),
             session: "s7".to_string(),
+            owned: Arc::new(Mutex::new(Vec::new())),
         };
         assert_eq!(interjector.take(), vec!["m2".to_string(), "m3".to_string()]);
         assert!(interjector.take().is_empty(), "taken exactly once");
@@ -3790,6 +4269,7 @@ mod tests {
             VecDeque::from(vec![QueuedMessage {
                 input: "跟进的一条".into(),
                 sink: sink.clone(),
+                origin: None,
             }]),
         );
 

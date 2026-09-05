@@ -20,7 +20,7 @@ use komo_core::domain::{
     context::SessionOrigin,
     cron::CronJobRepository,
     home::HomeRepository,
-    inbox::{InboundOrigin, InboxClaim, InboxRepository},
+    inbox::{InboundOrigin, InboxClaim, InboxRepository, UnfinishedInbound},
     memory::MemoryRepository,
     message::Message,
     pairing::{
@@ -31,7 +31,7 @@ use komo_core::domain::{
     repository::{MessageRepository, SessionEventRepository, SessionRepository},
     run::{INTERRUPTED_ERROR, MemoryUse, Run, RunRepository, RunStatus, RunStep, parse_run_status},
     run_projection::{ProjectedRun, RunProjectionStore, project_runs},
-    session::{ChannelPeer, Session},
+    session::{ChannelPeer, InboundPeer, Session},
     session_event::{
         SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader, SurfaceProjection,
     },
@@ -251,13 +251,22 @@ struct InboxRecord {
 
     session_id: String,
     /// The message body, kept so a claimed-but-uncompleted row can be
-    /// re-delivered after a crash. Nothing reads it back yet — see
-    /// `InboxRepository::claim`.
+    /// re-delivered after a crash — `InboxRepository::unfinished` reads it back
+    /// at startup.
     text: String,
     status: String, // "claimed" | "completed"
     claimed_at: i64,
     /// 0 until `complete` runs.
     completed_at: i64,
+    /// The `InboundPeer` the channel handed the dispatcher, spread over four
+    /// additive columns. Re-dispatching a lost message needs the correspondent
+    /// as much as the text: it decides which conversation this is and whether
+    /// the sender is the operator. Empty on rows written before the columns
+    /// existed, which recovery reads as "no peer to answer".
+    peer_platform: String,
+    peer_id: String,
+    peer_private: bool,
+    peer_operator: bool,
 }
 
 /// The exact DDL `push_schema` emits for [`InboxRecord`], for the same reason
@@ -267,7 +276,25 @@ const INBOX_TABLE: &str = "inbox_records";
 const INBOX_TABLE_DDL: &[&str] = &[
     "CREATE TABLE \"inbox_records\" (\"id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \
      \"text\" TEXT NOT NULL, \"status\" TEXT NOT NULL, \"claimed_at\" BIGINT NOT NULL, \
-     \"completed_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
+     \"completed_at\" BIGINT NOT NULL, \"peer_platform\" TEXT NOT NULL, \
+     \"peer_id\" TEXT NOT NULL, \"peer_private\" BOOLEAN NOT NULL, \
+     \"peer_operator\" BOOLEAN NOT NULL, PRIMARY KEY (\"id\"))",
+];
+/// The peer columns, for an `inbox_records` that predates them.
+const INBOX_COLUMNS: &[(&str, &str)] = &[
+    (
+        "peer_platform",
+        "\"peer_platform\" text NOT NULL DEFAULT ''",
+    ),
+    ("peer_id", "\"peer_id\" text NOT NULL DEFAULT ''"),
+    (
+        "peer_private",
+        "\"peer_private\" boolean NOT NULL DEFAULT false",
+    ),
+    (
+        "peer_operator",
+        "\"peer_operator\" boolean NOT NULL DEFAULT false",
+    ),
 ];
 
 /// One `(memory, run)` link — the reverse index behind `runs_using_memory`.
@@ -426,6 +453,7 @@ impl Db {
             ];
             ensure_columns(p, "run_step_records", STEP_COLUMNS).await?;
             ensure_table(p, INBOX_TABLE, INBOX_TABLE_DDL).await?;
+            ensure_columns(p, INBOX_TABLE, INBOX_COLUMNS).await?;
             ensure_table(p, RUN_MEMORY_TABLE, RUN_MEMORY_TABLE_DDL).await?;
             ensure_table(p, WAKEUP_TABLE, WAKEUP_TABLE_DDL).await?;
             // The durable tables keep their own schema knowledge in their own
@@ -1821,6 +1849,7 @@ impl InboxRepository for Db {
     async fn claim(
         &self,
         origin: &InboundOrigin,
+        peer: &InboundPeer,
         session_id: &str,
         text: &str,
     ) -> anyhow::Result<InboxClaim> {
@@ -1844,6 +1873,7 @@ impl InboxRepository for Db {
             let id = id.clone();
             let session_id = session_id.clone();
             let text = text.clone();
+            let peer = peer.clone();
             async move {
                 let mut conn = self.inner.connection().await?;
                 toasty::create!(InboxRecord {
@@ -1853,6 +1883,10 @@ impl InboxRepository for Db {
                     status: INBOX_STATUS_CLAIMED.to_string(),
                     claimed_at: time::OffsetDateTime::now_utc().unix_timestamp(),
                     completed_at: 0,
+                    peer_platform: peer.peer.platform,
+                    peer_id: peer.peer.peer_id,
+                    peer_private: peer.private,
+                    peer_operator: peer.operator,
                 })
                 .exec(&mut conn)
                 .await?;
@@ -1879,6 +1913,35 @@ impl InboxRepository for Db {
             }
         })
         .await
+    }
+
+    async fn unfinished(&self, limit: usize) -> anyhow::Result<Vec<UnfinishedInbound>> {
+        let claimed = INBOX_STATUS_CLAIMED;
+        let mut conn = self.inner.connection().await?;
+        let rows = toasty::query!(
+            InboxRecord FILTER .status == #claimed ORDER BY .claimed_at LIMIT #limit
+        )
+        .exec(&mut conn)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| {
+                // The key is `<platform>:<message_id>`, and a message id may
+                // itself contain a colon — split once, from the left.
+                let (platform, message_id) = row.id.split_once(':')?;
+                Some(UnfinishedInbound {
+                    origin: InboundOrigin::new(platform, message_id),
+                    session_id: row.session_id,
+                    text: row.text,
+                    peer: InboundPeer::new(
+                        ChannelPeer::new(row.peer_platform, row.peer_id),
+                        row.peer_private,
+                        row.peer_operator,
+                    ),
+                    claimed_at: row.claimed_at,
+                })
+            })
+            .collect())
     }
 }
 
@@ -2125,14 +2188,15 @@ mod tests {
             .await
             .unwrap();
         let origin = InboundOrigin::new("telegram", "42");
+        let peer = InboundPeer::new(ChannelPeer::new("telegram", "7"), true, true);
 
         assert_eq!(
-            db.claim(&origin, "telegram:7", "hi").await.unwrap(),
+            db.claim(&origin, &peer, "telegram:7", "hi").await.unwrap(),
             InboxClaim::Fresh
         );
         db.complete(&origin).await.unwrap();
         assert_eq!(
-            db.claim(&origin, "telegram:7", "hi").await.unwrap(),
+            db.claim(&origin, &peer, "telegram:7", "hi").await.unwrap(),
             InboxClaim::Duplicate
         );
 
@@ -2141,18 +2205,22 @@ mod tests {
         // mid-turn safe.
         let midturn = InboundOrigin::new("telegram", "43");
         assert_eq!(
-            db.claim(&midturn, "telegram:7", "second").await.unwrap(),
+            db.claim(&midturn, &peer, "telegram:7", "second")
+                .await
+                .unwrap(),
             InboxClaim::Fresh
         );
         assert_eq!(
-            db.claim(&midturn, "telegram:7", "second").await.unwrap(),
+            db.claim(&midturn, &peer, "telegram:7", "second")
+                .await
+                .unwrap(),
             InboxClaim::Duplicate
         );
 
         // The key is the pair: platforms number their messages independently,
         // so the same id elsewhere is a different message.
         assert_eq!(
-            db.claim(&InboundOrigin::new("feishu", "42"), "feishu:9", "hi")
+            db.claim(&InboundOrigin::new("feishu", "42"), &peer, "feishu:9", "hi")
                 .await
                 .unwrap(),
             InboxClaim::Fresh
@@ -2161,12 +2229,35 @@ mod tests {
         // Local input has no platform to redeliver it — never a duplicate.
         for _ in 0..2 {
             assert_eq!(
-                db.claim(&InboundOrigin::local(), "cli:1", "run")
+                db.claim(&InboundOrigin::local(), &peer, "cli:1", "run")
                     .await
                     .unwrap(),
                 InboxClaim::Fresh
             );
         }
+
+        // What startup recovery reads: everything still claimed, oldest first,
+        // carrying the peer the channel handed in — the completed row is gone
+        // from it, and the one whose turn never ran is not.
+        let unfinished = db.unfinished(50).await.unwrap();
+        assert!(
+            !unfinished.iter().any(|row| row.origin == origin),
+            "a completed message is finished business"
+        );
+        let held = unfinished
+            .iter()
+            .find(|row| row.origin == midturn)
+            .expect("the claim that never completed is offered back");
+        assert_eq!(held.text, "second");
+        assert_eq!(held.session_id, "telegram:7");
+        assert_eq!(held.peer, peer, "the correspondent survives the restart");
+        assert!(held.claimed_at > 0);
+        assert!(
+            unfinished
+                .windows(2)
+                .all(|w| w[0].claimed_at <= w[1].claimed_at),
+            "oldest first"
+        );
     }
 
     /// The reverse direction: which turns did this memory shape? Written from

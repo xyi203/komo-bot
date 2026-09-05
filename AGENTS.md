@@ -897,6 +897,26 @@ call the same functions, which is what keeps validation from forking.
   commands too, since a redelivered `/approve` would approve twice. `dispatch`
   is the un-gated inner routine and stays private. Channels that have no
   platform message id use `InboundOrigin::local()`, which is never a duplicate.
+  **A row is `completed` when the work is, not when it was dispatched**: a chat
+  command completes as soon as it has been answered, a plain message only when
+  its turn settles (success, failure or suspension) — so a message queued behind
+  a busy session stays `claimed` until its own turn has run, and the rows a
+  running turn absorbs as interjections settle with that turn. "Completed" used
+  to mean "handed to `spawn_turn`", which left a crash window nothing closed:
+  the claim was already enough to make the platform's redelivery a duplicate, so
+  a process that died before the turn wrote anything dropped the message for
+  good. `GatewayDispatcher::recover_inbox` (`INBOX_RECOVERY_LIMIT` rows, called
+  from `cli/gateway.rs` after `reregister_suspended_turns` and
+  `reconcile_orphans`, before the channels serve) is the scan that closes it: a
+  row whose text is already a user message in the session's transcript at or
+  after `claimed_at` belongs to the ledger and is only completed, and everything
+  else goes back through `dispatch` — the command-honouring path, so a lost
+  `/approve` still approves. It re-claims nothing (the row is already claimed)
+  and answers on **no sink**: nothing here addresses an arbitrary `ChannelPeer`
+  (`HomeNotifier` writes to the *home* chat), so a recovered turn's reply lands
+  in the transcript and the chat that wrote sees nothing back. A `local` origin
+  is closed rather than re-run — nothing can redeliver it and its caller owns
+  its own retry story.
   **Which conversation a message belongs to is resolved in two steps**
   (docs/bot-runtime.md §3.8, D6). Principal first, off the channel's own
   admission gate: `PairingGuard` already checks `allow_from` before pairing

@@ -227,6 +227,16 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         0 => {}
         n => tracing::info!(count = n, "settled background tasks lost to a restart"),
     }
+    // The fourth: a message claimed from a channel whose turn never started.
+    // Before the channels serve, so a recovered turn holds its session slot
+    // ahead of whatever arrives next.
+    match dispatcher
+        .recover_inbox(komo_bot::interaction::INBOX_RECOVERY_LIMIT)
+        .await
+    {
+        0 => {}
+        n => tracing::info!(count = n, "re-delivered inbound messages lost to a restart"),
+    }
 
     // ── Plugin phase 3: scheduled sweeps ─────────────────────────────────────
     let mut sweep_reg = SweepRegistry::default();

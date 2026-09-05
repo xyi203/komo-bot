@@ -990,10 +990,10 @@ mod tests {
         let mut supported = scored("user prefers rebase", 2.0);
         supported
             .memory
-            .record_evidence("s-1", EvidenceRelation::Supports, "a", now);
+            .record_evidence("s-1", "s-1", EvidenceRelation::Supports, "a", now);
         supported
             .memory
-            .record_evidence("s-2", EvidenceRelation::Supports, "b", now);
+            .record_evidence("s-2", "s-2", EvidenceRelation::Supports, "b", now);
         let block = render_recalled_memory_block(&[supported], now).unwrap();
         assert!(block.contains("/supported]"), "{block}");
         // Checked on the bullet, not the block: the header mentions `stale` by

@@ -165,7 +165,7 @@ impl Reviewer for ReflectiveReviewer {
         if !observations.is_empty() {
             let results = self
                 .consolidator
-                .consolidate_all(&ctx, &session.id, observations)
+                .consolidate_all(&ctx, &session.id, learning_occasion(episodes), observations)
                 .await?;
             outcome
                 .memories_written
@@ -270,6 +270,21 @@ impl Reviewer for ReflectiveReviewer {
 
         Ok(outcome)
     }
+}
+
+/// The learning occasion this batch of episodes is: the oldest run in it.
+///
+/// One pass over one batch is one occasion, and a failed pass retires nothing —
+/// so a retry reads the same batch, names the same occasion, and its re-extracted
+/// observations dedupe against the first attempt's evidence instead of
+/// corroborating it. Oldest by run id, which is a UUIDv7 and therefore sorts by
+/// time, so the answer does not depend on the order the caller assembled them in.
+fn learning_occasion(episodes: &[AssessedEpisode]) -> &str {
+    episodes
+        .iter()
+        .map(|e| e.view.run.id.as_str())
+        .min()
+        .unwrap_or_default()
 }
 
 /// Deterministic, dependency-free dedup key for an extracted commitment: FNV-1a
@@ -584,7 +599,11 @@ mod tests {
             Ok(self.0.lock().unwrap().clone())
         }
         async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
-            self.0.lock().unwrap().push(memory.clone());
+            let mut rows = self.0.lock().unwrap();
+            match rows.iter_mut().find(|m| m.id == memory.id) {
+                Some(slot) => *slot = memory.clone(),
+                None => rows.push(memory.clone()),
+            }
             Ok(())
         }
     }
@@ -670,12 +689,18 @@ mod tests {
     /// the dedup guards — and not the classification, which
     /// `memory_consolidation` tests directly.
     fn consolidator_over(memories: Arc<dyn MemoryRepository>) -> Arc<MemoryConsolidator> {
+        consolidator_answering(memories, r#"{"relation":"unrelated","target":""}"#)
+    }
+
+    /// A consolidator whose classifier always gives `reply`.
+    fn consolidator_answering(
+        memories: Arc<dyn MemoryRepository>,
+        reply: &str,
+    ) -> Arc<MemoryConsolidator> {
         let query = Arc::new(MemoryQueryService::new(memories.clone()));
         Arc::new(MemoryConsolidator::new(
             memories,
-            Arc::new(FixedLlm(
-                r#"{"relation":"unrelated","target":""}"#.to_string(),
-            )),
+            Arc::new(FixedLlm(reply.to_string())),
             query,
         ))
     }
@@ -1037,6 +1062,49 @@ mod tests {
             assert_eq!(rows.len(), 1, "for {said_by:?}");
             assert_eq!(rows[0].provenance, expected, "for {said_by:?}");
         }
+    }
+
+    /// Two learning passes on ONE session — the operator's permanent home
+    /// conversation — are two occasions, and their support accumulates. A third
+    /// pass over the *same* batch is the same occasion and adds nothing, which is
+    /// what keeps a retried extraction from corroborating itself.
+    #[tokio::test]
+    async fn two_passes_on_one_session_accumulate_support() {
+        let mut existing =
+            Memory::new(MemoryKind::Preference, "user prefers squashing before push");
+        existing.id = "mem-1".into();
+        existing.status = MemoryStatus::Active;
+        existing.scope = MemoryScope::Global;
+        let memories = Arc::new(FakeMemories(Mutex::new(vec![existing])));
+        let llm = ScriptedLlm::new(&[
+            r#"{"memories":[{"kind":"preference","said_by":"user","content":"user prefers squashing over stacking"}],"skills":[],"commitments":[]}"#,
+            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}],"skills":[],"commitments":[]}"#,
+            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}],"skills":[],"commitments":[]}"#,
+        ]);
+        let reviewer = ReflectiveReviewer::new(
+            llm,
+            consolidator_answering(
+                memories.clone(),
+                r#"{"relation":"supports","target":"mem-1"}"#,
+            ),
+            Arc::new(FakeSkills::default()),
+            Arc::new(FakeTasks::default()),
+        );
+        let home = session("home");
+
+        let first = episodes_asking("I squash before pushing");
+        let second = episodes_asking("squashed that branch again");
+        reviewer.review(&home, &first).await.unwrap();
+        reviewer.review(&home, &second).await.unwrap();
+        assert_eq!(
+            memories.0.lock().unwrap()[0].support_count,
+            2,
+            "one session, two passes, two occasions"
+        );
+
+        // The same batch learned again: same occasion, no new support.
+        reviewer.review(&home, &second).await.unwrap();
+        assert_eq!(memories.0.lock().unwrap()[0].support_count, 2);
     }
 
     #[tokio::test]

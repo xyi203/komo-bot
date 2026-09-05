@@ -66,7 +66,8 @@ pub struct Memory {
     // reads these, retention reads those — conflating them is what let a wrong
     // memory promote itself by being repeatedly retrieved.
     /// Independent occasions on which the user said something supporting this
-    /// claim. Independence is per session — see [`Memory::record_evidence`].
+    /// claim. Independence is per learning occasion — see
+    /// [`Memory::record_evidence`].
     pub support_count: i64,
     /// Independent occasions on which the user said something conflicting with
     /// it. Any unresolved contradiction is what `Contested` expresses.
@@ -190,25 +191,34 @@ impl Memory {
 
     /// Record an observation bearing on this memory. Returns whether it counted.
     ///
-    /// **Independence is per session.** An observation from a session already
-    /// present in the evidence list is dropped, which is what makes
+    /// **Independence is per learning occasion**, not per session. One extraction
+    /// pass over one batch of runs is one occasion; a retry or a re-extraction of
+    /// the same batch names the same occasion and is dropped, which is what makes
     /// `support_count` mean "N separate occasions" instead of "N sentences" — a
     /// user restating a preference three times in one conversation must not look
-    /// like three independent confirmations.
+    /// like three independent confirmations. Session alone cannot be that unit
+    /// any more: the operator's private conversations are all one permanent home
+    /// session, so keying on it would mean support never accumulates there at all.
+    ///
+    /// Legacy evidence stored before this field existed carries an empty
+    /// occasion and is keyed by its session instead ([`Evidence::occasion_key`]).
+    /// A session id never collides with a run id, so old evidence counts as one
+    /// occasion and every later pass counts separately.
     ///
     /// The evidence *list* is capped at [`EVIDENCE_CAP`] (most recent kept) while
     /// the counts keep rising, so a long-lived memory cannot grow its row without
-    /// bound. Consequence, deliberately accepted: once the cap is reached, a
-    /// session evicted from the list can be counted again. Every threshold that
+    /// bound. Consequence, deliberately accepted: once the cap is reached, an
+    /// occasion evicted from the list can be counted again. Every threshold that
     /// reads these counts sits far below the cap, so this cannot change a verdict.
     pub fn record_evidence(
         &mut self,
         session: &str,
+        occasion: &str,
         relation: EvidenceRelation,
         excerpt: &str,
         now: i64,
     ) -> bool {
-        if self.evidence.iter().any(|e| e.session == session) {
+        if self.evidence.iter().any(|e| e.occasion_key() == occasion) {
             return false;
         }
         match relation {
@@ -217,6 +227,7 @@ impl Memory {
         }
         self.evidence.push(Evidence {
             session: session.to_string(),
+            occasion: occasion.to_string(),
             observed_at: now,
             relation,
             excerpt: truncate_excerpt(excerpt),
@@ -495,14 +506,32 @@ pub fn parse_belief_state(value: &str) -> BeliefState {
 /// its deletion — which is also why it is bounded rather than verbatim.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Evidence {
-    /// Session the observation came from, and the unit of independence: two
-    /// statements within one conversation are one observation.
+    /// Session the observation came from. Provenance and display only — the
+    /// operator's private conversations are all one permanent home session, so
+    /// this cannot be the unit of independence.
     pub session: String,
+    /// The learning occasion that produced it — one extraction pass over one
+    /// batch of runs — and the unit of independence: two statements gathered by
+    /// one pass are one observation. Empty on evidence stored before this field
+    /// existed; see [`Evidence::occasion_key`].
+    #[serde(default)]
+    pub occasion: String,
     pub observed_at: i64,
     pub relation: EvidenceRelation,
     /// Short quote of what was actually said, capped at
     /// [`EVIDENCE_EXCERPT_MAX`] characters.
     pub excerpt: String,
+}
+
+impl Evidence {
+    /// What this observation is deduplicated on: its occasion, falling back to
+    /// its session for rows written before occasions existed.
+    pub fn occasion_key(&self) -> &str {
+        match self.occasion.is_empty() {
+            true => &self.session,
+            false => &self.occasion,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1162,11 +1191,11 @@ pub enum DreamVerdict {
 /// Independent occasions of support a candidate needs to be promoted without an
 /// explicit confirmation.
 ///
-/// Two, not three: independence is already per session (see
-/// [`Memory::record_evidence`]), so two means the user said the same thing in two
-/// separate conversations — a real pattern rather than one talkative session. A
-/// higher bar would leave genuinely established facts sitting in the candidate
-/// pile for weeks.
+/// Two, not three: independence is already per learning occasion (see
+/// [`Memory::record_evidence`]), so two means the user said the same thing on two
+/// occasions komo learned from separately — a real pattern rather than one
+/// talkative pass. A higher bar would leave genuinely established facts sitting
+/// in the candidate pile for weeks.
 pub const DREAM_MIN_SUPPORT: i64 = 2;
 /// A candidate this old (days) that has gone cold — never recalled, or not
 /// recalled within the same window — is archived: the "forget the flotsam" half
@@ -1561,13 +1590,19 @@ mod tests {
     fn dream_promotes_a_candidate_with_independent_support() {
         let now = 10_000 * 86_400;
         let mut m = candidate(0, 5, now);
-        m.record_evidence("s-1", EvidenceRelation::Supports, "said it", now);
+        m.record_evidence("s-1", "s-1", EvidenceRelation::Supports, "said it", now);
         assert_eq!(
             dream_verdict(&m, now),
             DreamVerdict::Keep,
             "one occasion is not a pattern"
         );
-        m.record_evidence("s-2", EvidenceRelation::Supports, "said it again", now);
+        m.record_evidence(
+            "s-2",
+            "s-2",
+            EvidenceRelation::Supports,
+            "said it again",
+            now,
+        );
         assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
     }
 
@@ -1580,8 +1615,14 @@ mod tests {
         let now = 10_000 * 86_400;
         let mut m = candidate(0, 5, now);
         m.provenance = MemoryProvenance::Tool;
-        m.record_evidence("s-1", EvidenceRelation::Supports, "the page said it", now);
-        m.record_evidence("s-2", EvidenceRelation::Supports, "and again", now);
+        m.record_evidence(
+            "s-1",
+            "s-1",
+            EvidenceRelation::Supports,
+            "the page said it",
+            now,
+        );
+        m.record_evidence("s-2", "s-2", EvidenceRelation::Supports, "and again", now);
         assert_eq!(
             dream_verdict(&m, now),
             DreamVerdict::Keep,
@@ -1632,14 +1673,14 @@ mod tests {
     fn dream_never_promotes_a_contested_or_contradicted_candidate() {
         let now = 10_000 * 86_400;
         let mut m = candidate(0, 5, now);
-        m.record_evidence("s-1", EvidenceRelation::Supports, "a", now);
-        m.record_evidence("s-2", EvidenceRelation::Supports, "b", now);
+        m.record_evidence("s-1", "s-1", EvidenceRelation::Supports, "a", now);
+        m.record_evidence("s-2", "s-2", EvidenceRelation::Supports, "b", now);
         assert_eq!(dream_verdict(&m, now), DreamVerdict::Promote);
 
         // A contradiction from a third occasion stops it, even before anything
         // marks the belief contested.
         let mut contradicted = m.clone();
-        contradicted.record_evidence("s-3", EvidenceRelation::Contradicts, "no", now);
+        contradicted.record_evidence("s-3", "s-3", EvidenceRelation::Contradicts, "no", now);
         assert_eq!(dream_verdict(&contradicted, now), DreamVerdict::Keep);
 
         let mut contested = m.clone();
@@ -1662,7 +1703,7 @@ mod tests {
 
         // Warm (recalled yesterday) and young — neither saves it.
         let mut contradicted = candidate(20, 5, now);
-        contradicted.record_evidence("s-1", EvidenceRelation::Contradicts, "no", stale);
+        contradicted.record_evidence("s-1", "s-1", EvidenceRelation::Contradicts, "no", stale);
         assert_eq!(dream_verdict(&contradicted, now), DreamVerdict::Archive);
 
         // `contest`/`supersede` write no evidence entry; the edit clock stands in.
@@ -1679,6 +1720,7 @@ mod tests {
         let mut m = candidate(20, 5, now);
         m.record_evidence(
             "s-1",
+            "s-1",
             EvidenceRelation::Contradicts,
             "no",
             now - (DREAM_REFUTED_FORGET_AGE_DAYS - 1) * 86_400,
@@ -1693,6 +1735,7 @@ mod tests {
         let now = 10_000 * 86_400;
         let mut m = candidate(0, 5, now);
         m.record_evidence(
+            "s-1",
             "s-1",
             EvidenceRelation::Contradicts,
             "no",
@@ -1731,12 +1774,19 @@ mod tests {
 
         // One independent occasion is still not enough — the bar is two.
         let mut once = candidate(0, 10, now);
-        once.record_evidence("session-a", EvidenceRelation::Supports, "said it once", now);
+        once.record_evidence(
+            "session-a",
+            "session-a",
+            EvidenceRelation::Supports,
+            "said it once",
+            now,
+        );
         assert!(!once.is_supported(), "one occasion is not corroboration");
 
         // A second, independent occasion clears it.
         let mut twice = once.clone();
         twice.record_evidence(
+            "session-b",
             "session-b",
             EvidenceRelation::Supports,
             "said it again",
@@ -1750,7 +1800,13 @@ mod tests {
         // ...but the same session saying it twice is one occasion, however
         // talkative it is. Otherwise one conversation corroborates itself.
         let mut echo = once.clone();
-        echo.record_evidence("session-a", EvidenceRelation::Supports, "and again", now);
+        echo.record_evidence(
+            "session-a",
+            "session-a",
+            EvidenceRelation::Supports,
+            "and again",
+            now,
+        );
         assert!(
             !echo.is_supported(),
             "one session cannot be two independent occasions"
@@ -1761,7 +1817,7 @@ mod tests {
     fn dream_score_ranks_supported_candidates_above_merely_recalled_ones() {
         let now = 10_000 * 86_400;
         let mut supported = candidate(0, 5, now);
-        supported.record_evidence("s-1", EvidenceRelation::Supports, "a", now);
+        supported.record_evidence("s-1", "s-1", EvidenceRelation::Supports, "a", now);
         let recalled = candidate(5, 5, now);
         assert!(
             dream_score(&supported, now) > dream_score(&recalled, now),
@@ -1769,7 +1825,7 @@ mod tests {
         );
 
         let mut contradicted = supported.clone();
-        contradicted.record_evidence("s-2", EvidenceRelation::Contradicts, "no", now);
+        contradicted.record_evidence("s-2", "s-2", EvidenceRelation::Contradicts, "no", now);
         assert!(
             dream_score(&contradicted, now) < dream_score(&supported, now),
             "a contradiction pushes a candidate down the queue"
@@ -1864,19 +1920,84 @@ mod tests {
 
     // ---- belief state and evidence ----
 
-    /// Independence is per session: restating a fact three times in one
-    /// conversation is one observation, not three.
+    /// Independence is per occasion: everything one extraction pass gathered is
+    /// one observation, however many sentences it read.
     #[test]
-    fn evidence_from_the_same_session_counts_once() {
+    fn evidence_from_the_same_occasion_counts_once() {
         let now = 1_000;
         let mut m = Memory::new(MemoryKind::Preference, "user prefers rebase");
-        assert!(m.record_evidence("s-1", EvidenceRelation::Supports, "I rebase", now));
-        assert!(!m.record_evidence("s-1", EvidenceRelation::Supports, "always rebase", now + 5));
+        assert!(m.record_evidence("s-1", "run-1", EvidenceRelation::Supports, "I rebase", now));
+        assert!(!m.record_evidence(
+            "s-1",
+            "run-1",
+            EvidenceRelation::Supports,
+            "always rebase",
+            now + 5
+        ));
         assert_eq!(m.support_count, 1);
         assert_eq!(m.evidence.len(), 1);
 
-        // A different session is a genuinely independent observation.
-        assert!(m.record_evidence("s-2", EvidenceRelation::Supports, "rebase again", now + 10));
+        // A different occasion is a genuinely independent observation.
+        assert!(m.record_evidence(
+            "s-1",
+            "run-2",
+            EvidenceRelation::Supports,
+            "rebase again",
+            now + 10
+        ));
+        assert_eq!(m.support_count, 2);
+    }
+
+    /// The case the home session made unreachable: every private conversation is
+    /// one permanent session, so support has to accumulate across passes on it or
+    /// nothing extracted there can ever promote.
+    #[test]
+    fn two_occasions_on_one_session_promote_a_candidate() {
+        let now = 1_000;
+        let mut m = Memory::new(MemoryKind::Preference, "user prefers rebase");
+        m.status = MemoryStatus::Candidate;
+        m.provenance = MemoryProvenance::User;
+        m.record_evidence("home", "run-1", EvidenceRelation::Supports, "I rebase", now);
+        assert_eq!(dream_verdict(&m, now), DreamVerdict::Keep);
+
+        m.record_evidence(
+            "home",
+            "run-2",
+            EvidenceRelation::Supports,
+            "rebased again",
+            now + 86_400,
+        );
+        assert_eq!(m.support_count, DREAM_MIN_SUPPORT);
+        assert_eq!(dream_verdict(&m, now + 86_400), DreamVerdict::Promote);
+    }
+
+    /// Evidence stored before occasions existed is keyed by its session, and a
+    /// session id never collides with a run id — so the old row counts as one
+    /// occasion and the next pass counts separately.
+    #[test]
+    fn legacy_evidence_is_keyed_by_its_session() {
+        let now = 1_000;
+        let mut m = Memory::new(MemoryKind::Preference, "user prefers rebase");
+        m.evidence.push(Evidence {
+            session: "home".into(),
+            occasion: String::new(),
+            observed_at: now,
+            relation: EvidenceRelation::Supports,
+            excerpt: "I rebase".into(),
+        });
+        m.support_count = 1;
+
+        assert!(
+            !m.record_evidence("home", "home", EvidenceRelation::Supports, "again", now + 5),
+            "the legacy row falls back to its session as the key"
+        );
+        assert!(m.record_evidence(
+            "home",
+            "run-2",
+            EvidenceRelation::Supports,
+            "again",
+            now + 10
+        ));
         assert_eq!(m.support_count, 2);
     }
 
@@ -1884,8 +2005,14 @@ mod tests {
     fn contradicting_evidence_counts_separately() {
         let now = 1_000;
         let mut m = Memory::new(MemoryKind::Preference, "user prefers rebase");
-        m.record_evidence("s-1", EvidenceRelation::Supports, "I rebase", now);
-        m.record_evidence("s-2", EvidenceRelation::Contradicts, "merge now", now);
+        m.record_evidence("s-1", "s-1", EvidenceRelation::Supports, "I rebase", now);
+        m.record_evidence(
+            "s-2",
+            "s-2",
+            EvidenceRelation::Contradicts,
+            "merge now",
+            now,
+        );
         assert_eq!(m.support_count, 1);
         assert_eq!(m.contradiction_count, 1);
     }
@@ -1899,6 +2026,7 @@ mod tests {
         for i in 0..(EVIDENCE_CAP + 3) {
             m.record_evidence(
                 &format!("s-{i}"),
+                &format!("occ-{i}"),
                 EvidenceRelation::Supports,
                 "said so",
                 now + i as i64,
@@ -1915,7 +2043,7 @@ mod tests {
         let now = 1_000;
         let mut m = Memory::new(MemoryKind::Fact, "x");
         let long = "语".repeat(EVIDENCE_EXCERPT_MAX + 50);
-        m.record_evidence("s-1", EvidenceRelation::Supports, &long, now);
+        m.record_evidence("s-1", "s-1", EvidenceRelation::Supports, &long, now);
         assert_eq!(
             m.evidence[0].excerpt.chars().count(),
             EVIDENCE_EXCERPT_MAX,

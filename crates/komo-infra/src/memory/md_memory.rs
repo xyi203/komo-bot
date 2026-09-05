@@ -321,8 +321,14 @@ mod tests {
         let store = temp_store("komo_md_memory_belief");
         let now = 1_700_000_000;
         let mut memory = Memory::new(MemoryKind::Preference, "prefers Python examples");
-        memory.record_evidence("s-1", EvidenceRelation::Supports, "I use Python", now);
-        memory.record_evidence("s-2", EvidenceRelation::Contradicts, "Rust now", now);
+        memory.record_evidence(
+            "s-1",
+            "s-1",
+            EvidenceRelation::Supports,
+            "I use Python",
+            now,
+        );
+        memory.record_evidence("s-2", "s-2", EvidenceRelation::Contradicts, "Rust now", now);
         memory.last_confirmed_at = Some(now);
         memory.supersede("mem-rust", now);
         store.save(&memory).await.unwrap();

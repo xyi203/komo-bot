@@ -4461,6 +4461,7 @@ mod tests {
         for i in 0..support {
             m.record_evidence(
                 &format!("s-{id}-{i}"),
+                &format!("occ-{id}-{i}"),
                 EvidenceRelation::Supports,
                 "the user said so",
                 now - 86_400,

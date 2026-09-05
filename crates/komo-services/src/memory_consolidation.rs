@@ -23,10 +23,12 @@
 //!
 //! Two invariants worth stating, because both are load-bearing:
 //!
-//! * **Support is per session.** [`Memory::record_evidence`] drops an observation
-//!   from a session it has already counted, so restating a preference five times
-//!   in one conversation is one observation. Without that, `support_count` would
-//!   measure how talkative a session was.
+//! * **Support is per learning occasion.** [`Memory::record_evidence`] drops an
+//!   observation from an occasion it has already counted, so restating a
+//!   preference five times in one pass is one observation. The occasion, not the
+//!   session, is the unit: the operator's private conversations are all one
+//!   permanent home session, and keying on that would mean support never
+//!   accumulates there at all.
 //! * **Failure degrades to the old behavior.** No related claim, an aux call that
 //!   errors, a reply that will not parse, a target id that does not exist — all
 //!   land the observation as a plain candidate, which is exactly what the reviewer
@@ -168,10 +170,14 @@ impl MemoryConsolidator {
     /// this seam inherited and deliberately kept. It costs a little real support
     /// (a user who restates a fact in *identical* words), which is the cheaper
     /// side of the trade: the other direction lets komo confirm its own beliefs.
+    ///
+    /// `occasion` names the learning pass these observations came out of — the
+    /// unit evidence independence is counted in ([`Memory::record_evidence`]).
     pub async fn consolidate_all(
         &self,
         ctx: &MemoryContext,
         session_id: &str,
+        occasion: &str,
         observations: Vec<Observation>,
     ) -> anyhow::Result<Vec<Consolidated>> {
         let mut library = self.memories.list().await?;
@@ -180,7 +186,7 @@ impl MemoryConsolidator {
 
         for observation in observations {
             let outcome = self
-                .consolidate_one(ctx, session_id, &observation, &mut library, now)
+                .consolidate_one(ctx, session_id, occasion, &observation, &mut library, now)
                 .await?;
             outcomes.push(outcome);
         }
@@ -191,6 +197,7 @@ impl MemoryConsolidator {
         &self,
         ctx: &MemoryContext,
         session_id: &str,
+        occasion: &str,
         observation: &Observation,
         library: &mut Vec<Memory>,
         now: i64,
@@ -238,7 +245,7 @@ impl MemoryConsolidator {
         let index = target.and_then(|id| library.iter().position(|m| m.id == id));
         let Some(index) = index.filter(|_| relation != Relation::Unrelated) else {
             return self
-                .create_candidate(ctx, session_id, observation, library, now)
+                .create_candidate(ctx, session_id, occasion, observation, library, now)
                 .await;
         };
 
@@ -247,6 +254,7 @@ impl MemoryConsolidator {
                 let memory = &mut library[index];
                 let counted = memory.record_evidence(
                     session_id,
+                    occasion,
                     EvidenceRelation::Supports,
                     &observation.excerpt,
                     now,
@@ -276,6 +284,7 @@ impl MemoryConsolidator {
                     let memory = &mut library[index];
                     memory.record_evidence(
                         session_id,
+                        occasion,
                         EvidenceRelation::Contradicts,
                         &observation.excerpt,
                         now,
@@ -286,7 +295,7 @@ impl MemoryConsolidator {
                 self.memories.save(&old).await?;
 
                 let created = self
-                    .create_candidate(ctx, session_id, observation, library, now)
+                    .create_candidate(ctx, session_id, occasion, observation, library, now)
                     .await?;
                 let Consolidated::Created { id: new } = created else {
                     return Ok(created);
@@ -312,6 +321,7 @@ impl MemoryConsolidator {
         &self,
         ctx: &MemoryContext,
         session_id: &str,
+        occasion: &str,
         observation: &Observation,
         library: &mut Vec<Memory>,
         now: i64,
@@ -330,6 +340,7 @@ impl MemoryConsolidator {
         // recorded occasions".
         memory.record_evidence(
             session_id,
+            occasion,
             EvidenceRelation::Supports,
             &observation.excerpt,
             now,
@@ -627,7 +638,12 @@ mod tests {
         let store = Arc::new(FakeStore::new(Vec::new()));
         let c = consolidator(store.clone(), Ok(String::new()));
         let out = c
-            .consolidate_all(&ctx(), "s-1", vec![observation("user prefers rebase")])
+            .consolidate_all(
+                &ctx(),
+                "s-1",
+                "s-1",
+                vec![observation("user prefers rebase")],
+            )
             .await
             .unwrap();
         let Consolidated::Created { id } = &out[0] else {
@@ -658,6 +674,7 @@ mod tests {
         let out = c
             .consolidate_all(
                 &ctx(),
+                "s-2",
                 "s-2",
                 vec![observation(
                     "user rebases rather than merging before a push",
@@ -707,6 +724,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
+                "s-2",
                 vec![from_tool("user rebases rather than merging before a push")],
             )
             .await
@@ -747,6 +765,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
+                "s-2",
                 vec![observation(
                     "user rebases rather than merging before a push",
                 )],
@@ -760,10 +779,10 @@ mod tests {
         assert_eq!(after.evidence[0].session, "s-2");
     }
 
-    /// The same session cannot support one claim twice, however many times it
-    /// says it — that is what makes the count mean "independent occasions".
+    /// One learning pass cannot support one claim twice, however many statements
+    /// it read — that is what makes the count mean "independent occasions".
     #[tokio::test]
-    async fn one_session_cannot_support_the_same_claim_twice() {
+    async fn one_occasion_cannot_support_the_same_claim_twice() {
         let store = Arc::new(FakeStore::new(vec![active("mem-1", "user prefers rebase")]));
         let c = consolidator(
             store.clone(),
@@ -772,7 +791,8 @@ mod tests {
         let out = c
             .consolidate_all(
                 &ctx(),
-                "s-2",
+                "home",
+                "run-2",
                 vec![
                     observation("user rebases rather than merging"),
                     observation("user always rebases their branches"),
@@ -784,9 +804,24 @@ mod tests {
         assert_eq!(
             out[1],
             Consolidated::Skipped,
-            "same session, no new support"
+            "same occasion, no new support"
         );
         assert_eq!(store.get("mem-1").support_count, 1);
+
+        // A later pass on the *same* session is a new occasion, and does count —
+        // the home session is one permanent conversation, so nothing extracted
+        // there could ever promote otherwise.
+        let out = c
+            .consolidate_all(
+                &ctx(),
+                "home",
+                "run-3",
+                vec![observation("user rebases their branches before pushing")],
+            )
+            .await
+            .unwrap();
+        assert_eq!(out[0], Consolidated::Supported { id: "mem-1".into() });
+        assert_eq!(store.get("mem-1").support_count, 2);
     }
 
     /// A conflict silences the old claim rather than letting both be injected.
@@ -801,7 +836,12 @@ mod tests {
             Ok(r#"{"relation":"contradicts","target":"mem-1"}"#.into()),
         );
         let out = c
-            .consolidate_all(&ctx(), "s-2", vec![observation("user mainly uses Rust")])
+            .consolidate_all(
+                &ctx(),
+                "s-2",
+                "s-2",
+                vec![observation("user mainly uses Rust")],
+            )
             .await
             .unwrap();
         let Consolidated::Contested { old, new } = &out[0] else {
@@ -837,6 +877,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
+                "s-2",
                 vec![observation("user wants Rust examples from now on")],
             )
             .await
@@ -860,21 +901,32 @@ mod tests {
         );
     }
 
-    /// Re-reviewing one transcript across sweeps must not manufacture support:
-    /// the same session saying the same thing is one occasion, forever.
+    /// Re-reviewing one transcript across sweeps must not manufacture a second
+    /// candidate: a memory this session already produced, restated in the same
+    /// words, is the same claim whichever pass reads it.
     #[tokio::test]
     async fn a_re_review_of_the_same_session_is_skipped() {
         let store = Arc::new(FakeStore::new(Vec::new()));
         let c = consolidator(store.clone(), Ok(String::new()));
         let first = c
-            .consolidate_all(&ctx(), "s-1", vec![observation("komo is written in Rust")])
+            .consolidate_all(
+                &ctx(),
+                "s-1",
+                "s-1",
+                vec![observation("komo is written in Rust")],
+            )
             .await
             .unwrap();
         assert!(matches!(first[0], Consolidated::Created { .. }));
 
-        // The sweep runs again over the same transcript.
+        // A later sweep, a new occasion, the same transcript.
         let second = c
-            .consolidate_all(&ctx(), "s-1", vec![observation("komo is written in Rust")])
+            .consolidate_all(
+                &ctx(),
+                "s-1",
+                "run-2",
+                vec![observation("komo is written in Rust")],
+            )
             .await
             .unwrap();
         assert_eq!(second[0], Consolidated::Skipped);
@@ -943,6 +995,7 @@ mod tests {
             .consolidate_all(
                 &ctx(),
                 "s-2",
+                "s-2",
                 // Same text, different case and spacing — the normalized key matches.
                 vec![observation("user prefers   REBASE before push")],
             )
@@ -964,7 +1017,12 @@ mod tests {
             let store = Arc::new(FakeStore::new(vec![active("mem-1", "user uses Python")]));
             let c = consolidator(store.clone(), reply);
             let out = c
-                .consolidate_all(&ctx(), "s-2", vec![observation("user uses Python 3.12")])
+                .consolidate_all(
+                    &ctx(),
+                    "s-2",
+                    "s-2",
+                    vec![observation("user uses Python 3.12")],
+                )
                 .await
                 .unwrap();
             assert!(
@@ -992,6 +1050,7 @@ mod tests {
         let out = c
             .consolidate_all(
                 &ctx(),
+                "s-1",
                 "s-1",
                 vec![
                     observation("user prefers rebase"),

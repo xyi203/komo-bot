@@ -237,6 +237,13 @@ impl Tool for MemoryTool {
                 memory.last_confirmed_at = Some(now);
                 memory.record_evidence(
                     &tool_ctx.session.session_id,
+                    // An explicit save is its own occasion; the turn it was made
+                    // in is the narrowest id available for one.
+                    tool_ctx
+                        .run
+                        .as_ref()
+                        .map(|r| r.run_id.as_str())
+                        .unwrap_or(&tool_ctx.session.session_id),
                     EvidenceRelation::Supports,
                     &memory.content.clone(),
                     now,

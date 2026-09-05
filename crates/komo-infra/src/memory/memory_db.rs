@@ -668,6 +668,7 @@ mod tests {
         let mut memory = after;
         memory.record_evidence(
             "s-1",
+            "s-1",
             komo_core::domain::memory::EvidenceRelation::Contradicts,
             "actually no",
             9_100,

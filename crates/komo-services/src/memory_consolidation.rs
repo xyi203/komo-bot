@@ -199,13 +199,18 @@ impl MemoryConsolidator {
         //
         //  - a memory this very session already produced. That is one transcript
         //    re-reviewed across sweeps, not a second occasion — counting it would
-        //    let a single conversation manufacture its own corroboration.
+        //    let a single conversation manufacture its own corroboration. Two
+        //    ways to be that memory: the consolidator wrote it (`source`), or the
+        //    `memory` tool did — which leaves `source` empty (it is rendered as
+        //    "(from X)") but does record this session as evidence.
         //  - an exact restatement of something komo holds active and in scope,
         //    which is indistinguishable from the assistant echoing a memory it was
         //    just injected with.
         let key = memory_key(&observation.content);
         if library.iter().any(|m| {
             (m.source == session_id && m.source_message_id == key)
+                || (memory_key(&m.content) == key
+                    && m.evidence.iter().any(|e| e.session == session_id))
                 || (m.status == MemoryStatus::Active
                     && ctx.allows(&m.scope)
                     && memory_key(&m.content) == key)
@@ -874,6 +879,51 @@ mod tests {
             .unwrap();
         assert_eq!(second[0], Consolidated::Skipped);
         assert_eq!(store.len(), 1, "no duplicate candidate");
+    }
+
+    /// A memory the model itself saved mid-turn via the `memory` tool is this
+    /// session's own output too — the tool leaves `source` empty, so only its
+    /// evidence says so. Extracting it again at review time would count one
+    /// occasion twice.
+    #[tokio::test]
+    async fn a_memory_the_tool_saved_this_session_is_not_extracted_again() {
+        let mut saved = active("mem-1", "komo is written in Rust");
+        saved.status = MemoryStatus::Candidate;
+        saved.record_evidence("s-1", EvidenceRelation::Supports, "user said so", 100);
+        let store = Arc::new(FakeStore::new(vec![saved]));
+        let c = consolidator(
+            store.clone(),
+            Err(anyhow::anyhow!("aux must not be consulted")),
+        );
+
+        let out = c
+            .consolidate_all(&ctx(), "s-1", vec![observation("komo is written in Rust")])
+            .await
+            .unwrap();
+        assert_eq!(out[0], Consolidated::Skipped);
+        assert_eq!(store.len(), 1, "no duplicate candidate");
+        assert_eq!(store.get("mem-1").support_count, 1, "no second occasion");
+    }
+
+    /// …but a *different* session observing the same claim is a real second
+    /// occasion, and must still reach the classifier.
+    #[tokio::test]
+    async fn another_session_observing_the_same_claim_is_not_skipped() {
+        let mut saved = active("mem-1", "komo is written in Rust");
+        saved.status = MemoryStatus::Candidate;
+        saved.record_evidence("s-1", EvidenceRelation::Supports, "user said so", 100);
+        let store = Arc::new(FakeStore::new(vec![saved]));
+        let c = consolidator(
+            store.clone(),
+            Ok(r#"{"relation":"supports","target":"mem-1"}"#.into()),
+        );
+
+        let out = c
+            .consolidate_all(&ctx(), "s-2", vec![observation("komo is written in Rust")])
+            .await
+            .unwrap();
+        assert_eq!(out[0], Consolidated::Supported { id: "mem-1".into() });
+        assert_eq!(store.get("mem-1").support_count, 2);
     }
 
     /// An exact restatement of something komo already holds active is

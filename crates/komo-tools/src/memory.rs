@@ -38,7 +38,7 @@ struct MemoryArgs {
     /// New status (action=update).
     #[serde(default)]
     status: Option<String>,
-    /// Pin/unpin (action=update). Pinning is the only path into L1 injection.
+    /// Pin/unpin (action=save/update). Pinning is the only path into L1 injection.
     #[serde(default)]
     pinned: Option<bool>,
     /// New ranking weight 0–100 (action=update).
@@ -180,7 +180,7 @@ impl Tool for MemoryTool {
                 "query": { "type": "string", "description": "Search term (action=search)." },
                 "id": { "type": "string", "description": "Target memory id (action=update/promote/reject/archive)." },
                 "status": { "type": "string", "enum": ["candidate", "active", "archived", "rejected"], "description": "New status (action=update)." },
-                "pinned": { "type": "boolean", "description": "Pin/unpin for L1 injection (action=update). Only pin user-confirmed durable facts." },
+                "pinned": { "type": "boolean", "description": "Pin/unpin for L1 injection (action=save or update). Only pin user-confirmed durable facts." },
                 "importance": { "type": "integer", "description": "Ranking weight 0–100 (action=update)." },
                 "expiry_days": { "type": "integer", "description": "Optional TTL in days (action=save); omit for permanent." },
                 "supersedes": {
@@ -241,6 +241,9 @@ impl Tool for MemoryTool {
                     &memory.content.clone(),
                     now,
                 );
+                if let Some(pinned) = args.pinned {
+                    memory.pinned = pinned;
+                }
                 // Scope to the current chat so a channel fact does not leak elsewhere.
                 memory.scope = scope.write_scope();
                 if let Some(days) = args.expiry_days.filter(|d| *d > 0) {
@@ -705,6 +708,50 @@ mod tests {
         .unwrap();
         let pinned = tool.memories.get(&cand.id).await.unwrap().unwrap();
         assert!(pinned.pinned);
+    }
+
+    /// `save` used to drop `pinned` on the floor, so a model asked to remember
+    /// something as durable profile context got an unpinned memory and no error.
+    #[tokio::test]
+    async fn save_with_pinned_lands_in_the_l1_profile() {
+        let tool = temp_tool("komo_mem_tool_save_pinned");
+        let out = tool
+            .call(
+                json!({ "action": "save", "text": "User keeps the AC at 24°C", "kind": "preference", "pinned": true }),
+                &ctx(),
+            )
+            .await
+            .unwrap();
+        let id = out.structured["id"].as_str().unwrap().to_string();
+
+        let saved = tool.memories.get(&id).await.unwrap().unwrap();
+        assert!(saved.pinned);
+        let scope = MemoryContext::new("cli:test", None);
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        assert!(saved.is_pinnable(&scope, now));
+        let pinned = tool.memories.pinned(&scope).await.unwrap();
+        assert_eq!(pinned.len(), 1);
+        assert_eq!(pinned[0].id, id);
+    }
+
+    /// A pinned memory that was superseded is not injected, so it must not show
+    /// up as pressure on the L1 budget either.
+    #[tokio::test]
+    async fn pinned_usage_ignores_a_superseded_memory() {
+        let tool = temp_tool("komo_mem_tool_pinned_usage");
+        let scope = MemoryContext::new("cli:test", None);
+        let mut m = Memory::new(MemoryKind::Preference, "User keeps the AC at 26°C");
+        m.pinned = true;
+        m.confidence = MemoryConfidence::UserWritten;
+        tool.memories.save(&m).await.unwrap();
+        assert!(tool.pinned_usage_line(&scope).await.is_some());
+
+        m.supersede(
+            "mem-newer",
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        );
+        tool.memories.save(&m).await.unwrap();
+        assert!(tool.pinned_usage_line(&scope).await.is_none());
     }
 
     #[tokio::test]

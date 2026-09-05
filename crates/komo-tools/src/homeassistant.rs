@@ -303,14 +303,27 @@ impl HomeAssistantTool {
                     return Err(crate::http::status_error(status, "Home Assistant", &text));
                 }
                 // The response is the array of entities that changed state.
-                let changed = serde_json::from_str::<Value>(&text)
-                    .ok()
+                let body = serde_json::from_str::<Value>(&text).ok();
+                let changed = body
+                    .as_ref()
                     .and_then(|v| v.as_array().map(|a| a.len()))
                     .unwrap_or(0);
-                Ok(format!(
+                let mut out = format!(
                     "Called {domain}.{service}{target}; {changed} entit{} changed.",
                     if changed == 1 { "y" } else { "ies" }
-                ))
+                );
+                // The post-call state, not the requested one: a device may clamp,
+                // round or ignore what was asked for, and the model reports what
+                // it was told here.
+                if let Some(body) = &body {
+                    let states = format_changed(body);
+                    if !states.is_empty() {
+                        out.push('\n');
+                        out.push_str(&states);
+                    }
+                }
+                truncate_to_char_boundary(&mut out, MAX_BYTES);
+                Ok(out)
             }
 
             "list_automations" => {
@@ -589,10 +602,7 @@ fn format_entities(states: &Value, domain: Option<&str>, area: Option<&str>) -> 
                 }
             }
             let state = s.get("state").and_then(Value::as_str).unwrap_or("unknown");
-            Some(match name {
-                Some(n) => format!("{id} = {state} ({n})"),
-                None => format!("{id} = {state}"),
-            })
+            Some(entity_line(id, state, name))
         })
         .collect();
     lines.sort();
@@ -601,6 +611,63 @@ fn format_entities(states: &Value, domain: Option<&str>, area: Option<&str>) -> 
     } else {
         lines.join("\n")
     }
+}
+
+/// One entity's `entity_id = state (Friendly Name)` line.
+fn entity_line(id: &str, state: &str, name: Option<&str>) -> String {
+    match name {
+        Some(n) => format!("{id} = {state} ({n})"),
+        None => format!("{id} = {state}"),
+    }
+}
+
+/// Attributes a climate entity's line carries: the state alone (`cool`) says
+/// nothing about the setpoint the user asked about, so a report built on it is
+/// a report of what was requested rather than of what the device holds.
+const CLIMATE_ATTRS: &[&str] = &[
+    "temperature",
+    "current_temperature",
+    "hvac_action",
+    "fan_mode",
+];
+
+/// Render a `POST /api/services/...` response — the entities whose state
+/// changed — one per line, in `format_entities`' style.
+fn format_changed(changed: &Value) -> String {
+    let Some(arr) = changed.as_array() else {
+        return String::new();
+    };
+    let mut lines: Vec<String> = arr
+        .iter()
+        .filter_map(|s| {
+            let id = s.get("entity_id").and_then(Value::as_str)?;
+            let attrs = s.get("attributes");
+            let state = s.get("state").and_then(Value::as_str).unwrap_or("unknown");
+            let name = attrs
+                .and_then(|a| a.get("friendly_name"))
+                .and_then(Value::as_str);
+            let mut line = entity_line(id, state, name);
+            if id.starts_with("climate.") {
+                let extras: Vec<String> = CLIMATE_ATTRS
+                    .iter()
+                    .filter_map(|key| {
+                        let v = attrs?.get(*key).filter(|v| !v.is_null())?;
+                        let shown = match v.as_str() {
+                            Some(s) => s.to_string(),
+                            None => v.to_string(),
+                        };
+                        Some(format!("{key}: {shown}"))
+                    })
+                    .collect();
+                if !extras.is_empty() {
+                    line.push_str(&format!(" [{}]", extras.join(", ")));
+                }
+            }
+            Some(line)
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n")
 }
 
 /// Render `/api/services` into compact `domain.service — description` lines,
@@ -721,6 +788,39 @@ mod tests {
     fn format_entities_empty_filter_reports_none() {
         let out = format_entities(&states(), Some("climate"), None);
         assert_eq!(out, "No matching entities found.");
+    }
+
+    // ── format_changed ────────────────────────────────────────────────────
+
+    #[test]
+    fn format_changed_reports_climate_setpoint_after_the_call() {
+        let body = json!([
+            {"entity_id": "climate.living_room", "state": "cool",
+             "attributes": {"friendly_name": "Living Room AC", "temperature": 24,
+                            "current_temperature": 27.5, "hvac_action": "cooling",
+                            "fan_mode": "auto"}}
+        ]);
+        let out = format_changed(&body);
+        assert_eq!(
+            out,
+            "climate.living_room = cool (Living Room AC) \
+             [temperature: 24, current_temperature: 27.5, hvac_action: cooling, fan_mode: auto]"
+        );
+    }
+
+    #[test]
+    fn format_changed_renders_other_domains_as_state_alone() {
+        let body = json!([
+            {"entity_id": "switch.fan", "state": "on",
+             "attributes": {"friendly_name": "Fan", "device_class": "switch"}}
+        ]);
+        assert_eq!(format_changed(&body), "switch.fan = on (Fan)");
+    }
+
+    #[test]
+    fn format_changed_on_an_empty_or_unexpected_body_adds_nothing() {
+        assert_eq!(format_changed(&json!([])), "");
+        assert_eq!(format_changed(&json!({"result": "ok"})), "");
     }
 
     // ── format_services ───────────────────────────────────────────────────

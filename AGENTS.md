@@ -314,7 +314,11 @@ aux callers.
 
 The `codex` provider authenticates from the Codex CLI's OAuth file
 (`~/.codex/auth.json`, auto-refreshed) instead of an env key, and requires
-streaming — see `komo-infra/src/codex.rs`.
+streaming — see `komo-infra/src/codex.rs`. `$KOMO_HOME/codex/auth.json` is
+accepted as a fallback (`$CODEX_HOME` overrides both): a container has no CLI
+and no browser to log in with, so the login is copied into the volume that
+already holds `.env`. A real `~/.codex/auth.json` still wins, since that is the
+one the CLI itself rotates.
 
 ## Architecture
 

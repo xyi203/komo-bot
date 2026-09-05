@@ -9,6 +9,13 @@
 //! JWT to know when it is expiring, and refresh it against
 //! `auth.openai.com/oauth/token` with the Codex CLI's pinned client id.
 //!
+//! `$KOMO_HOME/codex/` is accepted as a second location, because the login and
+//! the process that uses it need not sit on the same machine: a container has
+//! no Codex CLI and no browser to log in with, so the operator copies
+//! `auth.json` into the volume that already carries `.env`. It is a *fallback*
+//! — a real `~/.codex/auth.json` still wins, so a workstation keeps reading the
+//! file the CLI actually rotates.
+//!
 //! Because the access token lives only a few hours and the gateway is a
 //! long-running process, refresh can't happen once at startup. [`CodexAuth`]
 //! resolves a fresh token on demand, and the provider layer's
@@ -59,19 +66,41 @@ const FORWARD_COMPAT_TEMPLATE_MODELS: &[(&str, &[&str])] = &[
     ("gpt-5.3-codex-spark", &["gpt-5.3-codex"]),
 ];
 
-/// Path to the Codex CLI's shared credential file (`$CODEX_HOME/auth.json`,
-/// defaulting to `~/.codex/auth.json`).
-fn codex_auth_path() -> PathBuf {
-    let home = std::env::var("CODEX_HOME")
+const AUTH_FILE: &str = "auth.json";
+
+/// Where a Codex login may live, in the order we accept one. `$CODEX_HOME` is
+/// explicit and answers alone; otherwise the CLI's own directory comes first
+/// and komo's home is the fallback for hosts that have no CLI.
+fn codex_home_candidates() -> Vec<PathBuf> {
+    if let Some(explicit) = std::env::var("CODEX_HOME")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .expect("cannot determine home directory")
-                .join(".codex")
-        });
-    home.join("auth.json")
+    {
+        return vec![explicit];
+    }
+    let mut candidates = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".codex"));
+    }
+    candidates.push(komo_core::paths::komo_home().join("codex"));
+    candidates
+}
+
+/// The first candidate that actually holds an `auth.json`, else the first one —
+/// so an absent login is reported against the place it is most expected.
+fn pick_codex_home(candidates: &[PathBuf]) -> PathBuf {
+    candidates
+        .iter()
+        .find(|home| home.join(AUTH_FILE).is_file())
+        .or_else(|| candidates.first())
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from(".codex"))
+}
+
+/// Path to the Codex CLI's shared credential file.
+fn codex_auth_path() -> PathBuf {
+    codex_home().join(AUTH_FILE)
 }
 
 pub fn codex_auth_file_path() -> PathBuf {
@@ -79,14 +108,22 @@ pub fn codex_auth_file_path() -> PathBuf {
 }
 
 fn codex_home() -> PathBuf {
-    codex_auth_path()
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| {
-            dirs::home_dir()
-                .expect("cannot determine home directory")
-                .join(".codex")
-        })
+    pick_codex_home(&codex_home_candidates())
+}
+
+/// What to tell an operator with no Codex login. `codex` is the whole answer on
+/// a workstation; on a host without the CLI (a container) it is no answer at
+/// all, so name every file that would be accepted instead.
+pub fn missing_login_hint() -> String {
+    let looked = codex_home_candidates()
+        .iter()
+        .map(|home| home.join(AUTH_FILE).display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "no Codex login found (looked in {looked}) — run `codex` to log in, or copy \
+         an existing auth.json to one of those paths ($CODEX_HOME overrides both)"
+    )
 }
 
 pub fn looks_like_codex_model_id(model: &str) -> bool {
@@ -160,12 +197,11 @@ fn is_expiring(token: &str, skew: u64) -> bool {
 
 /// Read and validate the Codex token set from `path`.
 fn read_tokens(path: &Path) -> anyhow::Result<CodexTokens> {
-    let content = std::fs::read_to_string(path).with_context(|| {
-        format!(
-            "{} not found — run the Codex CLI (`codex`) to log in first",
-            path.display()
-        )
-    })?;
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("{}", missing_login_hint()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     let file: AuthFile = serde_json::from_str(&content)
         .with_context(|| format!("{} is not valid JSON", path.display()))?;
     let tokens = file.tokens.ok_or_else(|| {
@@ -583,6 +619,30 @@ mod tests {
             "https://api.openai.com/auth": { "chatgpt_account_id": "acc-123" }
         }));
         assert_eq!(account_id_from_jwt(&token).as_deref(), Some("acc-123"));
+    }
+
+    #[test]
+    fn komo_home_is_only_a_fallback_for_the_cli_directory() {
+        let dir = std::env::temp_dir().join(format!("komo_codex_pick_{}", std::process::id()));
+        let cli = dir.join(".codex");
+        let fallback = dir.join("komo-home").join("codex");
+        std::fs::create_dir_all(&cli).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        let candidates = vec![cli.clone(), fallback.clone()];
+
+        // Neither exists yet: report against the place the CLI would write.
+        assert_eq!(pick_codex_home(&candidates), cli);
+
+        std::fs::write(fallback.join(AUTH_FILE), "{}").unwrap();
+        assert_eq!(pick_codex_home(&candidates), fallback, "container case");
+
+        std::fs::write(cli.join(AUTH_FILE), "{}").unwrap();
+        assert_eq!(
+            pick_codex_home(&candidates),
+            cli,
+            "a real CLI login still wins — it is the one that rotates"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

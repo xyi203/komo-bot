@@ -1522,10 +1522,11 @@ fn build_provider_llm(
             Err(error) => {
                 tracing::warn!(%error, "Codex credentials unavailable; LLM degraded");
                 return Ok(Arc::new(UnconfiguredLlm {
+                    // The loader's error already names every accepted path and
+                    // how to produce the file; only the restart is news here.
                     message: format!(
-                        "Codex credentials unavailable: {error:#}. Run `codex` to log \
-                         in (it writes ~/.codex/auth.json; $CODEX_HOME honored), then \
-                         restart the gateway."
+                        "Codex credentials unavailable: {error:#}. Restart the gateway \
+                         once the login is in place."
                     ),
                 }));
             }

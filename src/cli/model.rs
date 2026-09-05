@@ -176,10 +176,12 @@ pub async fn set(
     }
     if !auth_present(provider, &config.report) {
         match provider {
-            Provider::Codex => eprintln!(
-                "note: Codex OAuth credentials are missing at {}; run `codex` to log in before using codex",
-                codex::codex_auth_file_path().display()
-            ),
+            // Report the loader's own diagnosis: "missing" and "malformed" want
+            // different fixes, and it knows every path it accepted.
+            Provider::Codex => match CodexAuth::load() {
+                Ok(_) => {}
+                Err(e) => eprintln!("note: {e:#}"),
+            },
             _ => eprintln!(
                 "note: {} is not set — add it to {}/.env before using {}",
                 provider.api_key_var(),

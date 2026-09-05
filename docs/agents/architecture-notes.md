@@ -365,7 +365,9 @@ rule the model needs — recurring *work* is a cron job, a recurring *message* i
 
 The `codex` provider (`provider = "codex"`) is the exception to the API-key
 rule: it has no env key, authenticating instead from the Codex CLI's OAuth login
-at `~/.codex/auth.json` (run `codex` to create it; `$CODEX_HOME` honored). See
+at `~/.codex/auth.json` (run `codex` to create it; `$KOMO_HOME/codex/auth.json`
+is accepted as a fallback for hosts without the CLI, and `$CODEX_HOME` overrides
+both). See
 `infra/codex.rs` in the Architecture section.
 
 Home Assistant keeps its URL and token in `.env` as a single self-contained

@@ -53,6 +53,10 @@ services:
     working_dir: /workspace
     volumes:
       # config.toml, .env, databases, logs, memories, and installed skills.
+      # For `provider = "codex"`: there is no API key and no Codex CLI in this
+      # image to log in with, so copy auth.json from a machine that has one to
+      # ./data/codex/auth.json — komo reads and refreshes it there. Keep it out
+      # of ./workspace, which the agent's own file tools can write.
       - ${KOMO_DATA_DIR:-./data}:/data
       # Files that the agent's file and shell tools are allowed to work with.
       - ${KOMO_WORKSPACE_DIR:-./workspace}:/workspace

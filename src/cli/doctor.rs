@@ -266,10 +266,14 @@ fn model_health(config: &ConfigSnapshot) {
             if has_key { "set" } else { "MISSING" }
         );
     } else {
-        // Codex authenticates from ~/.codex/auth.json — validate that
-        // login rather than looking for an env key.
+        // Codex authenticates from an OAuth file, not an env key — validate
+        // that login, and name the file actually chosen: which of the accepted
+        // locations answered is the whole question when one is missing.
         match komo_infra::codex::CodexAuth::load() {
-            Ok(_) => println!("  {OK} Codex OAuth (~/.codex/auth.json)"),
+            Ok(_) => println!(
+                "  {OK} Codex OAuth ({})",
+                komo_infra::codex::codex_auth_file_path().display()
+            ),
             Err(e) => println!("  {BAD} Codex auth: {e}"),
         }
     }

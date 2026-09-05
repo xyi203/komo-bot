@@ -40,6 +40,18 @@ impl ChannelPeer {
         let (platform, peer_id) = raw.split_once(':')?;
         (!platform.is_empty() && !peer_id.is_empty()).then(|| Self::new(platform, peer_id))
     }
+
+    /// No address at all. Either half missing is enough — [`parse`](Self::parse)
+    /// demands both, so a peer with one of them names nobody.
+    ///
+    /// The one thing that produces such a peer is an inbox row claimed before
+    /// the peer columns existed (`domain/inbox.rs`): the row survived the
+    /// upgrade, its correspondent did not. Startup recovery asks, because a
+    /// message whose sender it cannot name must not run a chat command that
+    /// reads one.
+    pub fn is_empty(&self) -> bool {
+        self.platform.is_empty() || self.peer_id.is_empty()
+    }
 }
 
 /// One inbound message's provenance, as the ingress channel knows it: where it

@@ -901,18 +901,27 @@ call the same functions, which is what keeps validation from forking.
   command completes as soon as it has been answered, a plain message only when
   its turn settles (success, failure or suspension) — so a message queued behind
   a busy session stays `claimed` until its own turn has run, and the rows a
-  running turn absorbs as interjections settle with that turn. "Completed" used
-  to mean "handed to `spawn_turn`", which left a crash window nothing closed:
-  the claim was already enough to make the platform's redelivery a duplicate, so
-  a process that died before the turn wrote anything dropped the message for
-  good. `GatewayDispatcher::recover_inbox` (`INBOX_RECOVERY_LIMIT` rows, called
+  running turn absorbs as interjections settle with that turn. A shutdown that
+  discards a session's queue closes those rows too — the senders are told to
+  resend, and a resend plus a startup re-delivery is two answers to one
+  message. "Completed" used to mean "handed to `spawn_turn`", which left a
+  crash window nothing closed: the claim was already enough to make the
+  platform's redelivery a duplicate, so a process that died before the turn
+  wrote anything dropped the message for good.
+  `GatewayDispatcher::recover_inbox` (`INBOX_RECOVERY_LIMIT` rows, called
   from `cli/gateway.rs` after `reregister_suspended_turns` and
   `reconcile_orphans`, before the channels serve) is the scan that closes it: a
   row whose text is already a user message in the session's transcript at or
   after `claimed_at` belongs to the ledger and is only completed, and everything
   else goes back through `dispatch` — the command-honouring path, so a lost
-  `/approve` still approves. It re-claims nothing (the row is already claimed)
-  and answers on **no sink**: nothing here addresses an arbitrary `ChannelPeer`
+  `/approve` still approves — after the same `TriggerMatcher::on_inbound`
+  `handle` runs before it routes, so a reply a kanban commitment was waiting on
+  still discharges it (claim-before-fire, so a wake that already fired fires
+  nothing twice). One thing never re-runs: a **command** on a row claimed
+  before the peer columns existed, which names no sender — `/sethome` reads
+  the peer, and an empty address is not a home chat. Plain text on such a row
+  still does. Recovery re-claims nothing (the row is already claimed) and
+  answers on **no sink**: nothing here addresses an arbitrary `ChannelPeer`
   (`HomeNotifier` writes to the *home* chat), so a recovered turn's reply lands
   in the transcript and the chat that wrote sees nothing back. A `local` origin
   is closed rather than re-run — nothing can redeliver it and its caller owns

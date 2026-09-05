@@ -2214,6 +2214,33 @@ impl GatewayDispatcher {
                 self.complete_recovered(&row.origin).await;
                 continue;
             }
+            // A row claimed before the peer columns existed carries no
+            // correspondent. Which session it belongs to is still on the row,
+            // so plain text re-runs unharmed — but a chat *command* reads the
+            // peer, and `/sethome` would make the empty address the operator's
+            // home chat. Close it with a note instead.
+            if row.peer.peer.is_empty() && !matches!(classify(&row.text), Command::Plain(_)) {
+                warn!(
+                    platform = %row.origin.platform,
+                    message_id = %row.origin.message_id,
+                    session = %row.session_id,
+                    "dropping a recovered chat command that names no sender (a pre-upgrade row)"
+                );
+                self.complete_recovered(&row.origin).await;
+                continue;
+            }
+            // The wake `handle` fires before it routes — a commitment waiting
+            // on this correspondent (docs/bot-runtime.md §3.7) is still waiting,
+            // and the crash swallowed the reply it was watching for. Firing it
+            // here cannot double up: `TriggerMatcher` claims every hit with
+            // `take`, which answers `false` once the registration is gone, so a
+            // wake that did fire before the crash wakes nothing now. A peerless
+            // legacy row is skipped — there is no address to match against.
+            if let Some(triggers) = &self.triggers
+                && !row.peer.peer.is_empty()
+            {
+                triggers.on_inbound(&row.peer.peer, &row.text).await;
+            }
             // Nothing here addresses an arbitrary correspondent: the gateway's
             // one outbound path (`HomeNotifier`) writes to the *home* chat, and
             // the channel sink this message arrived on died with the process.
@@ -2284,6 +2311,16 @@ fn says(content: &str, text: &str) -> bool {
 
 /// How far back a recovery check reads a session. A message whose turn started
 /// is at the very end of its transcript — the process died right after.
+///
+/// Enough rather than arbitrary: a row is still `claimed` at startup because
+/// the process died owing it an answer, and recovery runs *before* the channels
+/// serve, so nothing has appended to that session since. Whatever the turn
+/// wrote — the user message, an interjection merged into it — is therefore in
+/// the last handful of nodes. The one shape a wider read would catch is a row
+/// whose `complete` write failed after its turn settled, leaving it claimed
+/// while the gateway ran on for days; that site already accepts the
+/// consequence ("answering twice is recoverable"), and buying it back would
+/// cost a full-transcript read per row.
 const RECOVERY_WINDOW: usize = 20;
 
 /// How many unfinished rows one startup re-delivers. A backlog larger than this
@@ -2418,11 +2455,11 @@ impl Drop for TurnGuard {
         if self.armed {
             self.dispatcher.approvals.forget_pending(&self.session);
             self.dispatcher.approvals.release_gate(&self.session);
-            let dropped: Vec<Arc<dyn ReplySink>> = {
+            let dropped: Vec<QueuedMessage> = {
                 let mut inflight = self.dispatcher.inflight.lock().unwrap();
                 let dropped = inflight
                     .remove(&self.session)
-                    .map(|queue| queue.into_iter().map(|msg| msg.sink).collect())
+                    .map(|queue| queue.into_iter().collect())
                     .unwrap_or_default();
                 // Same reason as `finish_turn`: the session just became free.
                 self.dispatcher.idle.notify_waiters();
@@ -2443,10 +2480,22 @@ impl Drop for TurnGuard {
                 // Drop is sync, so the notice needs a task. During a runtime
                 // teardown there may be no handle, or the task may never get to
                 // run — hence best-effort, with the warn above as the record.
+                let inbox = self.dispatcher.inbox.clone();
                 if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                     runtime.spawn(async move {
-                        for sink in dropped {
+                        for QueuedMessage { sink, origin, .. } in dropped {
                             let _ = sink.send(QUEUED_MESSAGE_DROPPED).await;
+                            // Told to resend *is* handled — the reasoning
+                            // `spawn_turn` gives for the queue-full rejection:
+                            // leaving the row claimed would run this message
+                            // out of the next startup scan, after the sender
+                            // already resent it. Closed after the notice, so a
+                            // teardown that cuts this task short leaves the row
+                            // open and re-delivers rather than losing it.
+                            let Some(origin) = origin else { continue };
+                            if let Err(error) = inbox.complete(&origin).await {
+                                warn!(%error, "inbox complete failed for a discarded message (non-fatal)");
+                            }
                         }
                     });
                 }
@@ -2944,8 +2993,17 @@ mod tests {
     impl DedupingInbox {
         /// A row a dead process left behind — what startup recovery finds.
         fn left_claimed(row: UnfinishedInbound) -> Arc<Self> {
+            Self::left_claimed_all(vec![row])
+        }
+
+        /// Several of them: a restart finds whatever was still open.
+        fn left_claimed_all(rows: Vec<UnfinishedInbound>) -> Arc<Self> {
             let store = Self::default();
-            store.rows.lock().unwrap().push((row, false));
+            store
+                .rows
+                .lock()
+                .unwrap()
+                .extend(rows.into_iter().map(|row| (row, false)));
             Arc::new(store)
         }
 
@@ -4056,6 +4114,159 @@ mod tests {
         );
     }
 
+    /// Shutdown drains a session's queue with a "please resend" notice, which
+    /// makes those messages *handled* — so their rows close with them. Left
+    /// `claimed`, the next startup would re-deliver a message the sender was
+    /// just told to send again: one message, two answers.
+    #[tokio::test]
+    async fn a_queued_message_discarded_at_shutdown_closes_its_row() {
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let inbox = Arc::new(DedupingInbox::default());
+        let dispatcher = dispatcher_with_sessions(
+            Arc::new(GateHandler {
+                entered: entered_tx,
+                permits: Arc::new(Semaphore::new(0)),
+            }),
+            inbox.clone(),
+            MemorySessions::seeded("s-busy", &peer().peer),
+        );
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::new(RecordingSink { sent: sent.clone() }) as Arc<dyn ReplySink>;
+        let queued = InboundOrigin::new("telegram", "90");
+
+        // A turn holds the session, so the message queues behind it.
+        let claim = dispatcher.claim_session("s-busy").await;
+        dispatcher
+            .handle(&peer(), queued.clone(), "等会儿看一下".into(), sink)
+            .await;
+        assert!(!inbox.completed(&queued), "nothing has answered it yet");
+
+        // Gateway shutdown: the claim is dropped rather than released, which is
+        // the path that discards the queue.
+        drop(claim);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            sent.lock().unwrap().iter().any(|t| t.contains("请重发")),
+            "the sender is told to resend, got {:?}",
+            sent.lock().unwrap()
+        );
+        assert!(inbox.completed(&queued), "so the message counts as handled");
+        assert!(
+            inbox.unfinished(10).await.unwrap().is_empty(),
+            "and the next startup does not deliver it a second time"
+        );
+        assert!(entered_rx.try_recv().is_err(), "no turn ever ran it");
+    }
+
+    /// A row claimed before the peer columns existed carries no correspondent.
+    /// Its session id still routes plain text, but a chat command reads the
+    /// peer — a recovered `/sethome` would make the empty address the
+    /// operator's home chat.
+    #[tokio::test]
+    async fn a_legacy_row_without_a_peer_never_re_runs_a_command() {
+        let legacy = InboundPeer::new(ChannelPeer::new("", ""), false, false);
+        let command = InboundOrigin::new("telegram", "91");
+        let plain = InboundOrigin::new("telegram", "92");
+        let inbox = DedupingInbox::left_claimed_all(vec![
+            UnfinishedInbound {
+                origin: command.clone(),
+                session_id: "s-legacy".to_string(),
+                text: "/sethome".to_string(),
+                peer: legacy.clone(),
+                claimed_at: 100,
+            },
+            UnfinishedInbound {
+                origin: plain.clone(),
+                session_id: "s-legacy".to_string(),
+                text: "顺手看下磁盘".to_string(),
+                peer: legacy,
+                claimed_at: 100,
+            },
+        ]);
+        let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+        let home = Arc::new(MemoryHome::default());
+        let dispatcher = Arc::new(GatewayDispatcher::new(
+            Arc::new(GateHandler {
+                entered: entered_tx,
+                permits: Arc::new(Semaphore::new(4)),
+            }),
+            Arc::new(ApprovalState::new()),
+            Arc::new(MemorySessions::default()),
+            home.clone(),
+            Arc::new(MemoryTodos::default()),
+            None,
+            Arc::new(UnusedPairings),
+            inbox.clone(),
+        ));
+
+        assert_eq!(
+            dispatcher.recover_inbox(50).await,
+            1,
+            "only the plain message is re-delivered"
+        );
+        assert_eq!(next_entered(&mut entered_rx).await, "顺手看下磁盘");
+        assert!(
+            home.get().await.unwrap().is_none(),
+            "the peerless /sethome never ran"
+        );
+        assert!(
+            inbox.completed(&command),
+            "and its row is closed, not offered again"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(dispatcher.recover_inbox(50).await, 0);
+    }
+
+    /// Recovery takes the whole path `handle` takes, standing wakes included:
+    /// the message a commitment was waiting for still discharges the wait it
+    /// was lost with — once, because the registration is claimed before it
+    /// fires.
+    #[tokio::test]
+    async fn a_recovered_message_fires_the_wake_the_crash_swallowed() {
+        use komo_core::domain::task::{Task, TaskRepository, TaskStatus};
+
+        let db = test_db("komo-inbox-wake").await;
+        let waiting = komo_services::task_waiting::TaskWaiting::new(db.clone(), db.clone());
+        let mut task = Task::new("等李四的回复".into());
+        task.status = TaskStatus::Waiting;
+        task.waiting_on = "李四".into();
+        task.waiting_on_peer = Some(ChannelPeer::new("feishu", "ou_y"));
+        task.source = "s-task".into();
+        waiting.sync(&mut task, 1_000).await.unwrap();
+        TaskRepository::save(db.as_ref(), &task).await.unwrap();
+
+        let origin = InboundOrigin::new("feishu", "93");
+        let inbox = DedupingInbox::left_claimed(UnfinishedInbound {
+            origin: origin.clone(),
+            session_id: "s-chat".to_string(),
+            text: "回复你了".to_string(),
+            peer: group("ou_y"),
+            claimed_at: 100,
+        });
+        let handler = Arc::new(RecordingTurns::default());
+        let dispatcher = triggering_dispatcher(&db, handler.clone(), inbox.clone());
+
+        assert_eq!(dispatcher.recover_inbox(50).await, 1);
+        settle(|| handler.turns.lock().unwrap().len() >= 2).await;
+        let turns = handler.turns.lock().unwrap().clone();
+        assert!(
+            turns.iter().any(|(session, _)| session == "s-task"),
+            "the commitment's own session was woken: {turns:?}"
+        );
+        assert!(
+            turns.iter().any(|(session, _)| session == "s-chat"),
+            "and the message still ran its own turn: {turns:?}"
+        );
+        assert!(
+            WakeupRepository::list(db.as_ref())
+                .await
+                .unwrap()
+                .is_empty(),
+            "the wake was claimed, so nothing fires it twice"
+        );
+    }
+
     /// A message waiting behind a busy session has not been answered yet, so
     /// its row stays `claimed` — a crash while it waits re-delivers it.
     #[tokio::test]
@@ -4356,6 +4567,7 @@ mod tests {
     fn triggering_dispatcher(
         db: &Arc<komo_infra::persistence::db::Db>,
         handler: Arc<dyn MessageHandler>,
+        inbox: Arc<dyn InboxRepository>,
     ) -> Arc<GatewayDispatcher> {
         let triggers = Arc::new(komo_services::triggers::TriggerMatcher::new(
             db.clone(),
@@ -4370,7 +4582,7 @@ mod tests {
                 Arc::new(MemoryTodos::default()),
                 None,
                 Arc::new(UnusedPairings),
-                Arc::new(AlwaysFreshInbox),
+                inbox,
             )
             .with_waits(WaitParts {
                 runs: db.clone(),
@@ -4429,7 +4641,7 @@ mod tests {
         assert_eq!(task.wakeup_id.as_deref(), Some(rows[0].id.as_str()));
 
         let handler = Arc::new(RecordingTurns::default());
-        let dispatcher = triggering_dispatcher(&db, handler.clone());
+        let dispatcher = triggering_dispatcher(&db, handler.clone(), Arc::new(AlwaysFreshInbox));
         let sink = Arc::new(RecordingSink {
             sent: Arc::new(Mutex::new(Vec::new())),
         }) as Arc<dyn ReplySink>;
@@ -4537,7 +4749,7 @@ mod tests {
             .unwrap();
 
         let handler = Arc::new(RecordingTurns::default());
-        let dispatcher = triggering_dispatcher(&db, handler.clone());
+        let dispatcher = triggering_dispatcher(&db, handler.clone(), Arc::new(AlwaysFreshInbox));
         dispatcher
             .handle(
                 &group("ou_x"),

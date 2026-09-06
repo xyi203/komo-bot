@@ -631,6 +631,8 @@ mod tests {
             api_key: "sk-test".into(),
             base_url: None,
             aux_model: None,
+            aux_effort: None,
+            effort: None,
             max_turns: DEFAULT_MAX_TURNS,
             max_tool_result_bytes: komo_config::DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_turn_result_bytes: komo_config::DEFAULT_MAX_TURN_RESULT_BYTES,

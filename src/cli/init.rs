@@ -21,6 +21,7 @@ provider = "deepseek"
 # model = "deepseek-v4-flash"    # defaults per provider
 # base_url = ""                  # OpenAI-compatible endpoint override
 # aux_model = ""                 # cheaper model for sub-tasks (reviewer/recall/briefing)
+# aux_effort = "none"            # aux reasoning effort; "none" = thinking off (deepseek default)
 
 # Maintenance sweep cron (5-field Unix cron). Default: hourly.
 # schedule = "0 * * * *"

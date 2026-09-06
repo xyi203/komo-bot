@@ -73,6 +73,8 @@ pub struct KomoEnv {
     pub models: Option<String>,
     pub base_url: Option<String>,
     pub aux_model: Option<String>,
+    /// Reasoning effort the aux backend runs at (`KOMO_AUX_EFFORT`).
+    pub aux_effort: Option<String>,
     pub schedule: Option<String>,
     pub briefing_schedule: Option<String>,
     /// `KOMO_BRIEFING_SCHEDULE_ENABLED=false` kills the briefing without
@@ -129,6 +131,7 @@ impl KomoEnv {
             &mut self.models,
             &mut self.base_url,
             &mut self.aux_model,
+            &mut self.aux_effort,
             &mut self.schedule,
             &mut self.briefing_schedule,
             &mut self.dream_schedule,
@@ -156,6 +159,7 @@ impl KomoEnv {
             models,
             base_url,
             aux_model,
+            aux_effort,
             schedule,
             briefing_schedule,
             briefing_schedule_enabled,
@@ -255,6 +259,10 @@ pub struct FileConfig {
     pub models: Option<Vec<String>>,
     pub base_url: Option<String>,
     pub aux_model: Option<String>,
+    /// Reasoning effort the aux backend runs at when a session names none.
+    /// Unset = the provider's own aux default (`none` on DeepSeek, i.e.
+    /// thinking off; the provider's default elsewhere).
+    pub aux_effort: Option<String>,
     /// 5-field Unix cron expression for gateway maintenance (default: hourly).
     pub schedule: Option<String>,
     /// 5-field Unix cron expression for the daily briefing. Unset = disabled

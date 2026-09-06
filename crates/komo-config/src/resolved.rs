@@ -272,6 +272,16 @@ pub struct ModelConfig {
     pub base_url: Option<String>,
     /// Optional cheaper model for auxiliary sub-tasks.
     pub aux_model: Option<String>,
+    /// Reasoning effort the aux backend runs at, as configured. Already
+    /// validated against the aux backend's provider — an unusable value is a
+    /// [`ConfigIssue`] and reads as unset. `None` = that provider's own aux
+    /// default (see [`Provider::aux_default_effort`]).
+    pub aux_effort: Option<String>,
+    /// The effort a session with **no** override runs this backend at; `None`
+    /// leaves the provider's own default alone. The main config carries `None`
+    /// (a conversation picks its own level per turn); [`Self::aux_variant`] is
+    /// what fills it in.
+    pub effort: Option<String>,
     /// Maximum tool-calling round-trips per user turn.
     pub max_turns: usize,
     /// Byte cap on a single tool result handed back to the LLM (global backstop).
@@ -301,6 +311,8 @@ impl fmt::Debug for ModelConfig {
             .field("api_key", &mask_secret(&self.api_key))
             .field("base_url", &self.base_url)
             .field("aux_model", &self.aux_model)
+            .field("aux_effort", &self.aux_effort)
+            .field("effort", &self.effort)
             .field("max_turns", &self.max_turns)
             .field("max_tool_result_bytes", &self.max_tool_result_bytes)
             .field("max_turn_result_bytes", &self.max_turn_result_bytes)
@@ -413,6 +425,8 @@ impl ModelConfig {
             keys: self.keys.clone(),
             base_url: default_provider.then(|| self.base_url.clone()).flatten(),
             aux_model: self.aux_model.clone(),
+            aux_effort: self.aux_effort.clone(),
+            effort: self.effort.clone(),
             max_turns: self.max_turns,
             max_tool_result_bytes: self.max_tool_result_bytes,
             max_turn_result_bytes: self.max_turn_result_bytes,
@@ -424,8 +438,21 @@ impl ModelConfig {
     }
 
     /// A variant using the cheaper `aux_model`, falling back to the main model.
+    ///
+    /// It also carries a backend default effort, which the main config never
+    /// does: every aux caller builds a synthetic session with empty overrides,
+    /// so without one the backend runs at whatever the provider does by default
+    /// — on DeepSeek that is full thinking, on every short aux call.
     pub fn aux_variant(&self) -> ModelConfig {
         let model = self.aux_model.clone().unwrap_or_else(|| self.model.clone());
+        // `aux_model` may be qualified (`deepseek:…`) and name a different
+        // backend than `provider`, and the default belongs to whichever one the
+        // aux turns actually run on.
+        let provider = split_model_id(&model).0.unwrap_or(self.provider);
+        let effort = self
+            .aux_effort
+            .clone()
+            .or_else(|| provider.aux_default_effort().map(str::to_string));
         ModelConfig {
             provider: self.provider,
             // The aux agent is not switchable: it runs the configured aux model,
@@ -436,6 +463,8 @@ impl ModelConfig {
             keys: self.keys.clone(),
             base_url: self.base_url.clone(),
             aux_model: self.aux_model.clone(),
+            aux_effort: self.aux_effort.clone(),
+            effort,
             max_turns: self.max_turns,
             max_tool_result_bytes: self.max_tool_result_bytes,
             max_turn_result_bytes: self.max_turn_result_bytes,
@@ -582,6 +611,30 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         .collect();
 
     let aux_model = env.aux_model.or(file.aux_model);
+    // Validated against the provider the aux turns run on — `aux_model` may be
+    // qualified and name another backend. An unusable level is a warning and
+    // reads as unset: a typo must never abort resolution.
+    let aux_provider = aux_model
+        .as_deref()
+        .and_then(|id| split_model_id(id).0)
+        .unwrap_or(provider);
+    let aux_effort = env.aux_effort.or(file.aux_effort).and_then(|effort| {
+        let effort = effort.trim().to_string();
+        if aux_provider.accepts_effort(&effort) {
+            return Some(effort);
+        }
+        let mut accepted: Vec<&str> = aux_provider.efforts().to_vec();
+        accepted.extend(aux_provider.aux_default_effort());
+        issues.push(ConfigIssue {
+            path: "model.aux_effort",
+            severity: IssueSeverity::Warning,
+            message: format!(
+                "aux_effort = {effort:?} is not valid for {aux_provider:?} \
+                 (accepted: {accepted:?}) — ignoring it",
+            ),
+        });
+        None
+    });
     let models = resolve_model_menu(
         &model,
         aux_model.as_deref(),
@@ -596,6 +649,10 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         keys,
         base_url: env.base_url.or(file.base_url),
         aux_model,
+        aux_effort,
+        // A conversation picks its own level per turn; only the aux backend
+        // carries a default (see `ModelConfig::aux_variant`).
+        effort: None,
         max_turns: env
             .max_turns
             .or(file.max_turns)
@@ -1393,6 +1450,67 @@ mod tests {
     }
 
     #[test]
+    fn the_aux_backend_turns_deepseek_thinking_off_by_default() {
+        // Every aux caller builds a session with empty overrides, so the
+        // backend default is the only effort those turns ever carry.
+        let snap = ConfigSnapshot::from_sources(with_deepseek_key(sources()));
+        assert_eq!(
+            snap.runtime.model.effort, None,
+            "a conversation picks its own"
+        );
+        assert_eq!(
+            snap.runtime.model.aux_variant().effort.as_deref(),
+            Some("none")
+        );
+    }
+
+    #[test]
+    fn a_configured_aux_effort_wins_over_the_providers_default() {
+        let mut s = sources();
+        s.secrets.openai_api_key = Some("sk-test".into());
+        s.file.provider = Some("openai".into());
+        s.env.aux_effort = Some("low".into());
+        let snap = ConfigSnapshot::from_sources(s);
+        assert_eq!(
+            snap.runtime.model.aux_variant().effort.as_deref(),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn an_aux_effort_the_provider_rejects_warns_and_reads_as_unset() {
+        // DeepSeek has no effort scale, so `medium` is not a level it accepts.
+        let mut s = with_deepseek_key(sources());
+        s.file.aux_effort = Some("medium".into());
+        let snap = ConfigSnapshot::from_sources(s);
+        let issue = snap
+            .report
+            .issues
+            .iter()
+            .find(|i| i.path == "model.aux_effort")
+            .expect("an unusable aux_effort is reported");
+        assert_eq!(issue.severity, IssueSeverity::Warning);
+        assert!(
+            snap.report.fatal().is_none(),
+            "a typo never aborts resolution"
+        );
+        assert_eq!(
+            snap.runtime.model.aux_variant().effort.as_deref(),
+            Some("none"),
+            "it falls back to the provider's own aux default"
+        );
+    }
+
+    #[test]
+    fn a_provider_with_no_aux_default_leaves_effort_alone() {
+        let mut s = sources();
+        s.secrets.openai_api_key = Some("sk-test".into());
+        s.file.provider = Some("openai".into());
+        let snap = ConfigSnapshot::from_sources(s);
+        assert_eq!(snap.runtime.model.aux_variant().effort, None);
+    }
+
+    #[test]
     fn file_model_reports_file_origin() {
         let mut s = with_deepseek_key(sources());
         s.file.model = Some("deepseek-reasoner".into());
@@ -1690,6 +1808,8 @@ mod tests {
             api_key: String::new(),
             base_url: Some("https://proxy.example".into()),
             aux_model: None,
+            aux_effort: None,
+            effort: None,
             max_turns: DEFAULT_MAX_TURNS,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_turn_result_bytes: DEFAULT_MAX_TURN_RESULT_BYTES,
@@ -1779,6 +1899,8 @@ mod tests {
             api_key: "sk-abcdefghijklmnopqr".into(),
             base_url: None,
             aux_model: None,
+            aux_effort: None,
+            effort: None,
             max_turns: DEFAULT_MAX_TURNS,
             max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
             max_turn_result_bytes: DEFAULT_MAX_TURN_RESULT_BYTES,

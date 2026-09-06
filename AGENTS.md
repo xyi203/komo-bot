@@ -259,6 +259,8 @@ fork — add new operator actions there, not in the CLI or api handlers.
 ## Config
 
 `~/.komo/config.toml` = runtime settings (provider/model/`models`/aux_model,
+`aux_effort` — the aux backend's reasoning effort; defaults to `none` on
+DeepSeek (thinking off), the provider's own default elsewhere —
 `schedule`, `briefing_schedule` + `briefing_workdays_only`, `dream_schedule`
 (default nightly `0 3 * * *`, `"off"` disables), the two sweep kill switches
 `briefing_schedule_enabled` / `dream_schedule_enabled` (default true; `false`
@@ -320,8 +322,13 @@ are per-provider (`Provider::efforts` ↔ `reasoning_params` must agree — ther
 is a test). **Invariant: every aux path (reviewer, delegate, recall, sweeps)
 builds a synthetic `Session` with empty overrides** — that's what keeps a
 conversation's model from leaking onto the aux model; preserve it when adding
-aux callers. Empty overrides send no `reasoning` field, so an `aux_model` on
-DeepSeek runs at the server default (thinking, high).
+aux callers. Empty overrides also mean an aux turn's effort can only come from
+the backend, so `ModelConfig::aux_variant()` carries one (`ModelConfig::effort`,
+`aux_effort` else `Provider::aux_default_effort`) and a session's own choice
+still wins over it. On DeepSeek that default is `"none"` — thinking off, a real
+wire value deliberately kept off `Provider::efforts` because it is not a level
+anyone picks per turn; without it every short aux call (the `mode = "auto"`
+reviewer has 20s) would run the server's default full thinking.
 
 The `codex` provider authenticates from the Codex CLI's OAuth file
 (`~/.codex/auth.json`, auto-refreshed) instead of an env key, and requires

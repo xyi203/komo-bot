@@ -107,6 +107,28 @@ impl Provider {
         }
     }
 
+    /// The effort an auxiliary backend (reviewer, delegate, recall screening,
+    /// sweeps) runs at when the operator names none, or `None` to leave the
+    /// provider's own default alone.
+    ///
+    /// DeepSeek's v4 models think by default, at the server's `high` — the aux
+    /// paths are short, frequent and one of them is on a 20s timeout, so komo
+    /// turns thinking off there unless asked otherwise.
+    pub fn aux_default_effort(self) -> Option<&'static str> {
+        match self {
+            Provider::DeepSeek => Some("none"),
+            Provider::OpenAi | Provider::OpenRouter | Provider::Codex | Provider::Anthropic => None,
+        }
+    }
+
+    /// Whether this provider accepts `effort` as a backend default. Wider than
+    /// [`Provider::efforts`] by exactly one value: DeepSeek's `"none"` is a real
+    /// wire value ("thinking off") but not a level anyone picks per turn, so it
+    /// is configurable without appearing on a client's effort menu.
+    pub fn accepts_effort(self, effort: &str) -> bool {
+        self.efforts().contains(&effort) || self.aux_default_effort() == Some(effort)
+    }
+
     /// Environment variable holding this provider's API key. Codex has none —
     /// it authenticates from `~/.codex/auth.json` (see [`Provider::uses_api_key`]).
     pub fn api_key_var(self) -> &'static str {

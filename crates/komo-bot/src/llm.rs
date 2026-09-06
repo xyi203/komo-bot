@@ -109,6 +109,11 @@ pub struct ProviderLlm {
     /// Which provider this is, for mapping a session's reasoning-effort level
     /// onto request params (see [`reasoning_params`]).
     provider: Provider,
+    /// The effort a session with no override runs at (config `effort`; `None` =
+    /// the provider's own default). Every aux path builds a synthetic session
+    /// with empty overrides, so this is the only way an aux backend's effort is
+    /// ever set — see [`ModelConfig::aux_variant`].
+    default_effort: Option<String>,
     /// Prompt-cache family this backend's turns belong to, when it is not the
     /// session (see [`ProviderLlm::model_for`]). `None` — the main agent — keys
     /// the cache by session id; a backend whose sessions are one-shot but whose
@@ -310,10 +315,11 @@ const THINKING_ANSWER_HEADROOM: u64 = 8_192;
 /// half — how a level is actually spelled on the wire.
 fn reasoning_params(provider: Provider, effort: &str) -> Option<Value> {
     // The scale differs per provider (DeepSeek has `max` and no `medium`), so
-    // the accepted set is the one that provider advertises — not a shared list
-    // that would reject a level the menu offers.
+    // the accepted set is the one that provider advertises — plus its aux
+    // default (`none` on DeepSeek: thinking off, a real wire value kept off the
+    // menu because it is not a level anyone picks per turn).
     let level = effort.trim();
-    if !provider.efforts().contains(&level) {
+    if !provider.accepts_effort(level) {
         return None;
     }
     match provider {
@@ -517,6 +523,7 @@ impl ProviderLlm {
 
         if let Some(params) = session
             .effort_override()
+            .or(self.default_effort.as_deref())
             .and_then(|effort| reasoning_params(self.provider, effort))
         {
             // Anthropic charges thinking against `max_tokens`, so a budget above
@@ -1642,6 +1649,7 @@ fn build_provider_llm(
         tools: tool_catalog,
         default_model: config.model.clone(),
         provider: config.provider,
+        default_effort: config.effort.clone(),
         cache_family: cache_family.map(str::to_string),
         preamble,
         max_history_messages: config.max_history_messages,
@@ -1902,6 +1910,13 @@ mod tests {
                 "{level:?}"
             );
         }
+        // The one value off the menu: `none` turns thinking off, on DeepSeek
+        // only — it is the aux backend's default, not a level anyone picks.
+        assert_eq!(
+            reasoning_params(Provider::DeepSeek, "none"),
+            Some(json!({ "reasoning": { "effort": "none" } }))
+        );
+        assert_eq!(reasoning_params(Provider::OpenAi, "none"), None);
         for level in ["", "  ", "auto", "xhigh", "HIGH"] {
             assert_eq!(reasoning_params(Provider::OpenAi, level), None, "{level:?}");
         }
@@ -2092,6 +2107,7 @@ mod tests {
             tools: None,
             default_model: "m".to_string(),
             provider: Provider::OpenAi,
+            default_effort: None,
             cache_family: None,
             preamble: Arc::new(|| "you are komo".to_string()),
             max_history_messages: 0,
@@ -2099,6 +2115,38 @@ mod tests {
             injections,
             timeout: None,
         }
+    }
+
+    /// A backend's default effort is what an aux turn runs at: every aux caller
+    /// builds a synthetic session whose overrides are empty.
+    #[test]
+    fn a_backend_default_effort_fills_in_for_a_session_that_named_none() {
+        let sent = |provider: Provider, default: Option<&str>, chosen: &str| {
+            let mut llm = llm_with(TurnInjections::default());
+            llm.provider = provider;
+            llm.default_effort = default.map(str::to_string);
+            let mut session = Session::new("s");
+            session.effort = chosen.to_string();
+            llm.model_for("p".into(), &session)
+                .extra
+                .and_then(|extra| extra["reasoning"]["effort"].as_str().map(str::to_string))
+        };
+
+        assert_eq!(
+            sent(Provider::DeepSeek, Some("none"), "").as_deref(),
+            Some("none"),
+            "the aux backend runs with thinking off"
+        );
+        assert_eq!(
+            sent(Provider::OpenAi, Some("low"), "high").as_deref(),
+            Some("high"),
+            "a session's own choice wins over the backend default"
+        );
+        assert_eq!(
+            sent(Provider::OpenAi, None, ""),
+            None,
+            "no default and no override sends no reasoning field at all"
+        );
     }
 
     /// The artifacts directory is per session, so it rides at the **tail** of the

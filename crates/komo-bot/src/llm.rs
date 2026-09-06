@@ -902,6 +902,20 @@ static INTERRUPTED_RESULT_NOTE: std::sync::LazyLock<String> = std::sync::LazyLoc
 /// re-dispatched call fills, `Some` a result the interrupted process already had.
 type ReplaySlot = (String, Option<UserBlock>);
 
+/// A result block's slot key: the `call_id` when there is one, else the item
+/// id — the same derivation [`rebuild_from_events`] keys its slots by. On the
+/// Responses wire the two differ (`fc_…` item id, `call_…` call id), and the
+/// call id is the one the provider matches outputs on: keying a slot one way
+/// and its result the other leaves the hole filled with a placeholder and the
+/// real result appended beside it, which the provider rejects as a duplicate
+/// output for that call.
+fn result_key(block: &UserBlock) -> Option<&str> {
+    match block {
+        UserBlock::ToolResult { id, call_id, .. } => Some(call_id.as_deref().unwrap_or(id)),
+        _ => None,
+    }
+}
+
 /// Close a replayed round: drop what just ran into the holes the interrupted
 /// process left, in the order the model issued the calls.
 ///
@@ -916,10 +930,9 @@ fn fill_replay_slots(slots: Vec<ReplaySlot>, mut fresh: Vec<UserBlock>) -> Vec<U
             blocks.push(block);
             continue;
         }
-        let at = fresh.iter().position(|block| match block {
-            UserBlock::ToolResult { id: got, .. } => *got == id,
-            _ => false,
-        });
+        let at = fresh
+            .iter()
+            .position(|block| result_key(block) == Some(id.as_str()));
         match at {
             Some(at) => blocks.push(fresh.remove(at)),
             // The executor answers every call it is handed, so this is
@@ -2378,6 +2391,28 @@ mod tests {
             })
             .collect();
         assert_eq!(texts, vec!["first", "second", "third", "fourth"]);
+    }
+
+    #[test]
+    fn a_replayed_result_is_matched_by_call_id_not_item_id() {
+        // On the Responses wire the executor answers with the `fc_…` item id
+        // and the `call_…` call id; the slot is keyed by the latter.
+        let slots: Vec<ReplaySlot> = vec![("call_1".into(), None)];
+        let fresh = vec![UserBlock::ToolResult {
+            id: "fc_1".into(),
+            call_id: Some("call_1".into()),
+            text: "ok".into(),
+        }];
+        let blocks = fill_replay_slots(slots, fresh);
+        assert_eq!(blocks.len(), 1);
+        assert!(matches!(
+            &blocks[0],
+            UserBlock::ToolResult { text, .. } if text == "ok"
+        ));
+        assert!(!blocks.iter().any(|b| matches!(
+            b,
+            UserBlock::ToolResult { text, .. } if text.contains("interrupted")
+        )));
     }
 
     #[test]

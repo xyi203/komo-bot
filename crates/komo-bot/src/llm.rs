@@ -1078,6 +1078,7 @@ impl TurnLoop {
     /// history was rebuilt already ending on a user turn — can complete without
     /// pushing anything.
     async fn complete_committed(&mut self) -> anyhow::Result<Step> {
+        let started = std::time::Instant::now();
         let completion = match self.complete_round().await {
             Ok(completion) => completion,
             // Overflowing the context window is not transient — `with_retry`
@@ -1100,15 +1101,28 @@ impl TurnLoop {
             cached_input: completion.usage.cached_input,
         });
         self.rounds += 1;
-        // Per-round token accounting, which is the only honest way to tune the
-        // context knobs: `max_history_bytes` and `max_turn_result_bytes` are
-        // *byte* budgets, and bytes are a poor proxy for tokens (CJK spends ~3
-        // bytes per token, code closer to 3.5), so the caps can only be set from
-        // data. `cached` is the payoff of the prefix-cache work in `assemble` —
-        // a round where it stays near zero across a tool loop means the prefix is
-        // being invalidated and something upstream broke the render invariant.
-        tracing::debug!(
+        // The per-round record of what the model actually did, at `info` because
+        // it is the backbone of every "what happened in that turn?" question.
+        // `tool_calls = 0` on round 1 is the one shape worth naming: the model
+        // answered without touching anything, so whatever the reply asserts
+        // about the world it made up.
+        //
+        // The token fields are also the only honest way to tune the context
+        // knobs: `max_history_bytes` and `max_turn_result_bytes` are *byte*
+        // budgets, and bytes are a poor proxy for tokens (CJK spends ~3 bytes
+        // per token, code closer to 3.5). `cached` is the payoff of the
+        // prefix-cache work in `assemble` — a round where it stays near zero
+        // across a tool loop means the prefix is being invalidated and something
+        // upstream broke the render invariant.
+        let shape = round_shape(&completion.blocks);
+        tracing::info!(
             round = self.rounds,
+            provider = self.provider_name,
+            model = %self.turn.model,
+            tool_calls = shape.tool_calls,
+            text_chars = shape.text_chars,
+            reasoning = shape.reasoning,
+            elapsed_ms = started.elapsed().as_millis() as u64,
             input = completion.usage.input,
             output = completion.usage.output,
             cached = completion.usage.cached_input,
@@ -1386,6 +1400,28 @@ impl TurnDriver for TurnLoop {
     fn memories(&self) -> RecalledMemories {
         self.memories.clone()
     }
+}
+
+/// What one round's blocks amounted to, for the log: counts and a flag, never
+/// content. `tool_calls` is the field an incident is read on — a first round
+/// with none means the model answered out of its own head.
+#[derive(Debug, Default, PartialEq)]
+struct RoundShape {
+    tool_calls: usize,
+    text_chars: usize,
+    reasoning: bool,
+}
+
+fn round_shape(blocks: &[AssistantBlock]) -> RoundShape {
+    let mut shape = RoundShape::default();
+    for block in blocks {
+        match block {
+            AssistantBlock::ToolCall { .. } => shape.tool_calls += 1,
+            AssistantBlock::Text(t) => shape.text_chars += t.chars().count(),
+            AssistantBlock::Reasoning(_) => shape.reasoning = true,
+        }
+    }
+    shape
 }
 
 /// Split a model's assistant turn into komo's [`Step`]: any tool call makes it
@@ -1772,6 +1808,45 @@ fn to_turns(msg: &Message) -> Vec<Turn> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The log's account of a round is counts and a flag — and a round that
+    /// called nothing has to be visibly distinct from one that called something.
+    #[test]
+    fn round_shape_counts_calls_and_text_without_reading_content() {
+        let answered_alone = round_shape(&[AssistantBlock::Text("热水器已打开".into())]);
+        assert_eq!(
+            answered_alone,
+            RoundShape {
+                tool_calls: 0,
+                text_chars: 6,
+                reasoning: false,
+            }
+        );
+        let acted = round_shape(&[
+            AssistantBlock::Reasoning(Default::default()),
+            AssistantBlock::Text("ok".into()),
+            AssistantBlock::ToolCall {
+                id: "1".into(),
+                call_id: None,
+                name: "homeassistant".into(),
+                args: "{}".into(),
+            },
+            AssistantBlock::ToolCall {
+                id: "2".into(),
+                call_id: None,
+                name: "read".into(),
+                args: "{}".into(),
+            },
+        ]);
+        assert_eq!(
+            acted,
+            RoundShape {
+                tool_calls: 2,
+                text_chars: 2,
+                reasoning: true,
+            }
+        );
+    }
 
     #[test]
     fn openai_style_providers_send_reasoning_effort() {

@@ -324,6 +324,7 @@ impl AgentRuntime {
         kind: TurnKind,
     ) -> anyhow::Result<String> {
         let span = info_span!("run", run_id = %turn_id, session = %session_id);
+        let started = std::time::Instant::now();
         let ctx = RunContext::new(turn_id.clone()).with_checkpoint(self.checkpoint.clone());
         // Where this turn starts in the log, filled in as it opens. It is what
         // lets the settle below fold the turn's own tail instead of the whole
@@ -340,14 +341,30 @@ impl AgentRuntime {
         // every field the ledger row used to be assigned here — the reply, what
         // it cost, which memories shaped it, how it ended — is already an event
         // that `run_projection` folds. What is left is saying so out loud.
-        let outcome = outcome.map(|(reply, _, _)| reply);
+        // What the turn cost, alongside how it ended. A turn that failed or was
+        // cancelled reports only what is known — its duration; inventing zeros
+        // for the rest would read as a turn that spent nothing.
+        let elapsed_ms = started.elapsed().as_millis() as u64;
         match &outcome {
-            Ok(_) => info!(run_id = %turn_id, "run done"),
+            Ok(report) => info!(
+                run_id = %turn_id,
+                rounds = report.rounds,
+                tool_calls = report.tool_calls,
+                tokens_in = report.usage.input,
+                tokens_out = report.usage.output,
+                tokens_cached = report.usage.cached_input,
+                reply_chars = report.reply.chars().count(),
+                elapsed_ms,
+                "run done"
+            ),
             // Cancelled, not broken, and deliberately not resumable: there is
             // nothing to resume, the user asked it to stop.
-            Err(error) if is_cancelled(error) => info!(run_id = %turn_id, "run cancelled"),
-            Err(error) => warn!(run_id = %turn_id, %error, "run failed"),
+            Err(error) if is_cancelled(error) => {
+                info!(run_id = %turn_id, elapsed_ms, "run cancelled")
+            }
+            Err(error) => warn!(run_id = %turn_id, elapsed_ms, %error, "run failed"),
         }
+        let outcome = outcome.map(|report| report.reply);
         self.settle_turn(session_id, opened_at.load(Ordering::Relaxed))
             .await;
 
@@ -386,7 +403,7 @@ impl AgentRuntime {
         kind: TurnKind,
         run: RunContext,
         opened_at: &AtomicU64,
-    ) -> anyhow::Result<(String, TokenUsage, RecalledMemories)> {
+    ) -> anyhow::Result<TurnReport> {
         // Load only the recent window for the agent loop — the LLM windows the
         // history to the same bound anyway, so a long-lived chat session no
         // longer deserializes its whole transcript every turn. The reviewer
@@ -410,6 +427,26 @@ impl AgentRuntime {
                 s
             }
         };
+
+        // The turn's opening line in the log. Shape only — how it was started,
+        // over which platform, how much was said and how much history it was
+        // given — never the message itself or the chat it came from.
+        let (kind_label, prompt_chars) = match &kind {
+            TurnKind::Fresh { user_input } => ("fresh", user_input.chars().count()),
+            TurnKind::Resume { .. } => ("resume", 0),
+        };
+        info!(
+            origin = ?session.origin,
+            channel = session
+                .channel
+                .as_ref()
+                .map(|c| c.platform.as_str())
+                .unwrap_or("none"),
+            kind = kind_label,
+            prompt_chars,
+            history_messages = session.messages.len(),
+            "turn started"
+        );
 
         let resume_entries = match kind {
             TurnKind::Fresh { user_input } => {
@@ -489,6 +526,7 @@ impl AgentRuntime {
             reply,
             usage,
             memories,
+            rounds,
             interjections,
         } = match self.run_agent_loop(&session, run, resume_entries).await {
             Ok(outcome) => outcome,
@@ -664,7 +702,12 @@ impl AgentRuntime {
             hook.turn_finished(session_id, &reply).await;
         }
 
-        Ok((reply, usage, memories))
+        Ok(TurnReport {
+            reply,
+            usage,
+            rounds,
+            tool_calls: probe.steps_count(),
+        })
     }
 
     /// Register the wait a suspended turn is holding, so something comes back
@@ -961,6 +1004,9 @@ impl AgentRuntime {
         // Once per turn: the nudge is a correction, and a model that repeats the
         // claim after being told is not going to be talked out of it.
         let mut nudged = false;
+        // Model round-trips, which `rounds` (the tool-round budget) is not: the
+        // completion just awaited is round 1, and every `driver.step` adds one.
+        let mut model_rounds = 1usize;
         // The model's most recent narration alongside its tool calls. Kept so the
         // budget cutoff below can answer in the model's own words instead of a
         // canned line — by then it has usually said what it was doing.
@@ -997,6 +1043,7 @@ impl AgentRuntime {
                             .await?
                         {
                             Some(next) => {
+                                model_rounds += 1;
                                 step = next;
                                 continue;
                             }
@@ -1121,6 +1168,7 @@ impl AgentRuntime {
                     let spun = context.spin.should_stop();
                     let next =
                         Self::until_cancelled(cancel, driver.step(results, interjected)).await?;
+                    model_rounds += 1;
                     // Over budget, the note went back as well-formed tool results;
                     // terminate now no matter what the model did with it.
                     step = if over_budget || spun {
@@ -1140,6 +1188,7 @@ impl AgentRuntime {
         };
         Ok(TurnOutcome {
             reply,
+            rounds: model_rounds,
             usage: driver.usage(),
             memories: driver.memories(),
             interjections,
@@ -1182,10 +1231,25 @@ enum TurnKind {
     },
 }
 
+/// What a finished turn amounted to, for the caller that has to say so out
+/// loud. A tuple grew a field per question the log could not answer; this is
+/// the same data with the fields named.
+struct TurnReport {
+    reply: String,
+    usage: TokenUsage,
+    /// Model round-trips this turn spent (the first completion is round 1).
+    rounds: usize,
+    /// Tool steps the turn claimed — settled and in-flight alike.
+    tool_calls: i64,
+}
+
 /// What one pass of the agent loop produced.
 struct TurnOutcome {
     reply: String,
     usage: TokenUsage,
+    /// Model round-trips the loop drove, counted here because the driver trait
+    /// does not expose its own count.
+    rounds: usize,
     /// The memories prompt assembly injected, on its way to the ledger — the
     /// same trip `usage` makes, for the same reason: both are facts about the
     /// turn that only the layer below knows.

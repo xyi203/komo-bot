@@ -148,6 +148,7 @@ impl MemoryEnricher {
         user_message: &str,
         history: &[Message],
     ) -> Option<MemoryInjection> {
+        let started = std::time::Instant::now();
         let ctx = MemoryContext::new(&session.id, session.channel.as_ref());
 
         // Load the store once and derive both tiers from it — pinned and
@@ -177,6 +178,7 @@ impl MemoryEnricher {
         // `recall_limit` inject directly with zero added latency.
         let query = self.query.build_query(user_message).await;
         let mut hits = select_recall(&all, &ctx, &query, self.config.recall_fetch, now);
+        let fetched = hits.len();
         hits.retain(|h| !pinned_ids.contains(h.memory.id.as_str()));
         // Contested and superseded memories are retrievable but not assertable:
         // injecting both sides of an unresolved conflict and letting the model
@@ -185,6 +187,7 @@ impl MemoryEnricher {
         // *must* still surface them — the model cannot help resolve a conflict it
         // is not allowed to see.
         hits.retain(|h| h.memory.is_injectable());
+        let aux_screened = matches!(&self.aux, Some(_) if hits.len() > self.config.recall_limit);
         let hits = match &self.aux {
             Some(aux) if hits.len() > self.config.recall_limit => {
                 self.aux_select_recall(aux, user_message, history, hits)
@@ -196,6 +199,19 @@ impl MemoryEnricher {
             }
         };
         let recall_block = render_recalled_memory_block(&hits, now);
+
+        // What recall did for this turn, at `info`: without it the log cannot
+        // say whether an answer was shaped by a memory or by nothing at all.
+        // Counts only — the memories themselves are the user's.
+        tracing::info!(
+            pinned = pinned.len(),
+            fetched,
+            injected = hits.len(),
+            aux_screened,
+            semantic = query.has_embedding(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "memory recall"
+        );
 
         // Record the recall usage signal off the reply path: it only touches
         // usage fields, so it must not add latency or fail the answer. Spawned

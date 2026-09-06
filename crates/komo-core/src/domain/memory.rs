@@ -1005,6 +1005,14 @@ impl RecallQuery {
         self.terms.is_empty() && self.embedding.is_empty()
     }
 
+    /// Whether the semantic arm is actually armed for this query — a lexical
+    /// fallback (no backend, or one that errored) is indistinguishable from a
+    /// semantic query from the outside, and that is exactly what recall's log
+    /// line has to be able to say.
+    pub fn has_embedding(&self) -> bool {
+        !self.embedding.is_empty()
+    }
+
     /// Cosine similarity to `memory`, or 0.0 when either side lacks a
     /// comparable vector.
     fn similarity(&self, memory: &Memory) -> f32 {

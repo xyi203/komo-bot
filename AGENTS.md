@@ -45,8 +45,15 @@ Logs: `init_tracing` in `main.rs` installs the subscriber (without it every
 `info!` is a no-op). Gateway tees stderr into daily-rotated
 `~/.komo/logs/gateway.YYYY-MM-DD.log` (what `komo logs` reads). Level via
 `KOMO_LOG` (default `info,toasty=warn`; set `KOMO_LOG=debug` to see full tool
-results and per-round token usage). Turns run in `run` spans, tool calls in `tool` spans,
-matching the run ledger. The chat TUI logs to `~/.komo/logs/chat-tui.log`
+results). Turns run in `run` spans, tool calls in `tool` spans,
+matching the run ledger. At `info` a turn tells its whole story inside that
+span: `turn started` (origin, channel platform, kind, prompt size, history
+depth) → `memory recall` (pinned/fetched/injected, from prompt assembly) → one
+`model round completed` per round (provider/model, `tool_calls`, `text_chars`,
+tokens, `elapsed_ms` — a round 1 with `tool_calls=0` is a model answering out of
+its own head) → `tool ok` / `tool failed` per call → `run done` with `rounds`,
+`tool_calls`, tokens and `elapsed_ms`. Counts, sizes and durations only — no message text, memory text or
+tool arguments at any level. The chat TUI logs to `~/.komo/logs/chat-tui.log`
 instead (stderr would tear the alternate screen) and registers that path with
 `komo_infra::logs::set_active`, which is how the `logs` tool finds the current
 process's own log mid-conversation.

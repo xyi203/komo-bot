@@ -136,6 +136,17 @@ pub trait TurnDriver: Send {
         results: Vec<ToolOutcome>,
         interjected: Option<String>,
     ) -> anyhow::Result<Step>;
+    /// Send the runtime's own message to the model mid-turn and get the next
+    /// round.
+    ///
+    /// Unlike [`step`](Self::step) this carries no tool results: it is the
+    /// runtime speaking for itself (see the reply-claims-an-action check in
+    /// `run_agent_loop`), not the user and not a tool. `None` means this driver
+    /// cannot (a one-shot or scripted driver); the runtime then keeps the reply
+    /// it had.
+    async fn nudge(&mut self, _text: String) -> anyhow::Result<Option<Step>> {
+        Ok(None)
+    }
     /// Tokens spent across every round this driver has run so far. Read by the
     /// runtime once the turn ends, for the ledger. Defaults to zero — a backend
     /// whose provider reports no usage simply records nothing.

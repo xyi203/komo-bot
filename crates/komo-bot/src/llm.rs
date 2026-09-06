@@ -711,6 +711,11 @@ fn rebuild_from_events(
         id: String,
         blocks: Vec<AssistantBlock>,
         settled: std::collections::HashMap<String, String>,
+        /// The runtime's nudge, if this round drew one. It belongs to the round
+        /// it answered — a nudge only ever follows a round that made no call,
+        /// and that round contributes no results message, so this is the only
+        /// thing that keeps the rebuilt history alternating there.
+        nudge: Option<String>,
     }
     let mut rounds: Vec<Round> = Vec::new();
     // Calls that reached the approval gate. A durable `approval/requested` with
@@ -741,6 +746,7 @@ fn rebuild_from_events(
                 blocks: serde_json::from_value(round.blocks.clone())
                     .context("parsing a recorded assistant round")?,
                 settled: std::collections::HashMap::new(),
+                nudge: None,
             }),
             SessionEventKind::ToolCallSettled(call) => {
                 if let Some(round) = rounds.last_mut() {
@@ -750,6 +756,15 @@ fn rebuild_from_events(
                         call.error.clone()
                     };
                     round.settled.insert(call.call_id.clone(), text);
+                }
+            }
+            // The runtime's own mid-turn message, recorded before the round it
+            // asked for. It answers the round it followed, so it rides on that
+            // round rather than on `history` — which at this point still ends
+            // wherever the surface left it.
+            SessionEventKind::UserMessage(m) if m.source == MessageSource::Runtime => {
+                if let Some(round) = rounds.last_mut() {
+                    round.nudge = Some(m.content.clone());
                 }
             }
             SessionEventKind::UserMessage(m) if m.source == MessageSource::Injected => {
@@ -780,6 +795,12 @@ fn rebuild_from_events(
         // call the live turn made. The started events are the ledger's redacted
         // copy, which is the wrong thing to re-issue.
         let Step::ToolCalls { calls, .. } = blocks_to_step(&round.blocks) else {
+            // A round that called nothing sends no results message back, so the
+            // only user turn that can follow it is a nudge. Without it the
+            // rebuilt history would put two assistant turns back to back.
+            if let Some(text) = &round.nudge {
+                history.push(Turn::User(vec![UserBlock::Text(text.clone())]));
+            }
             continue;
         };
         let mut slots: Vec<ReplaySlot> = Vec::new();
@@ -1340,6 +1361,23 @@ impl TurnDriver for TurnLoop {
             .await;
         }
         self.run(Turn::User(blocks)).await
+    }
+
+    async fn nudge(&mut self, text: String) -> anyhow::Result<Option<Step>> {
+        // Recorded before the round it asks for, for the same reason an
+        // interjection is: a turn that fails after the model has read it must
+        // not lose what the model was reacting to — and a resume rebuilds the
+        // live history from exactly these events.
+        self.record(vec![SessionEventKind::UserMessage(UserMessageEvent {
+            turn_id: self.turn_id(),
+            content: text.clone(),
+            source: MessageSource::Runtime,
+            surface: SurfacePlacement::append(),
+        })])
+        .await;
+        Ok(Some(
+            self.run(Turn::User(vec![UserBlock::Text(text)])).await?,
+        ))
     }
 
     fn usage(&self) -> TokenUsage {
@@ -2292,6 +2330,64 @@ mod tests {
             TurnStart::Continue => panic!("expected the answer back, not a continuation"),
             _ => panic!("expected the answer back"),
         }
+    }
+
+    /// A turn the runtime nudged and that then stopped for an approval must
+    /// rebuild to the history the live turn had. The nudged round called
+    /// nothing, so it contributes no results message — without the recorded
+    /// nudge the rebuild would hand the provider two assistant turns in a row.
+    #[test]
+    fn a_nudged_round_replays_the_runtime_message_that_followed_it() {
+        let session = asked("打开热水器");
+        let events = vec![
+            header_event(0),
+            round_event(1, "热水器已打开 ✅", &[]),
+            ev(
+                2,
+                SessionEventKind::UserMessage(UserMessageEvent {
+                    turn_id: "t1".into(),
+                    content: "Runtime check: this turn issued no tool call.".into(),
+                    source: MessageSource::Runtime,
+                    surface: SurfacePlacement::append(),
+                }),
+            ),
+            round_event(3, "", &["homeassistant"]),
+            ev(
+                4,
+                SessionEventKind::ApprovalRequested(
+                    komo_core::domain::session_event::ApprovalRequestedEvent {
+                        turn_id: "t1".into(),
+                        call_id: "call-homeassistant".into(),
+                        call_index: 0,
+                        scope_key: String::new(),
+                    },
+                ),
+            ),
+        ];
+
+        let rebuilt = rebuild_from_events(&session, &events, "t1", &|_| false).unwrap();
+
+        let shape: Vec<&str> = rebuilt
+            .history
+            .iter()
+            .map(|turn| match turn {
+                Turn::User(_) => "user",
+                Turn::Assistant { .. } => "assistant",
+            })
+            .collect();
+        assert_eq!(shape, vec!["user", "assistant", "user", "assistant"]);
+        let Some(Turn::User(blocks)) = rebuilt.history.get(2) else {
+            panic!("the nudge stands between the two rounds");
+        };
+        assert!(matches!(
+            &blocks[0],
+            UserBlock::Text(text) if text.starts_with("Runtime check:")
+        ));
+        // The gated call never ran, so the last round is re-dispatched.
+        let TurnStart::Replay { calls, .. } = rebuilt.start else {
+            panic!("expected the gated call to be replayed");
+        };
+        assert_eq!(calls[0].name, "homeassistant");
     }
 
     #[test]

@@ -140,8 +140,14 @@ impl SessionEvent {
     /// Only the two message-producing variants can answer with `Some`, and they
     /// carry the field in their own payload — which is what makes "a non-message
     /// event with a `surfaceOp`" unrepresentable rather than merely invalid.
+    ///
+    /// The one message that produces nothing is a
+    /// [`MessageSource::Runtime`] nudge: it must claim no surface node, or the
+    /// `None` [`surface_content`] answers for it would leave the fold holding a
+    /// node with no content.
     pub fn surface(&self) -> Option<&SurfacePlacement> {
         match &self.kind {
+            SessionEventKind::UserMessage(m) if m.source == MessageSource::Runtime => None,
             SessionEventKind::UserMessage(m) => Some(&m.surface),
             SessionEventKind::AssistantMessage(m) => Some(&m.surface),
             _ => None,
@@ -493,6 +499,13 @@ pub enum MessageSource {
     Compaction,
     /// Context a tool or hook injected into the conversation.
     Injected,
+    /// Text the runtime itself put in front of the model mid-turn — a nudge —
+    /// never something the user said. It shapes the turn the model is running
+    /// and nothing after it: unlike [`Injected`](Self::Injected), which merges
+    /// into the user's message, this makes **no surface node at all**, so a
+    /// human transcript never shows the runtime talking as the user and a later
+    /// turn never replays it.
+    Runtime,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -941,7 +954,11 @@ pub fn surface_content(event: &SessionEvent) -> Option<SurfaceContent> {
         SessionEventKind::UserMessage(m) => Some(SurfaceContent {
             role: match m.source {
                 MessageSource::Injected => SurfaceRole::Injected,
-                _ => SurfaceRole::User,
+                // The runtime's own mid-turn nudge is not part of the
+                // conversation: it never enters the surface (see
+                // [`SessionEvent::surface`]), so it has no content here either.
+                MessageSource::Runtime => return None,
+                MessageSource::User | MessageSource::Compaction => SurfaceRole::User,
             },
             text: m.content.clone(),
             tool_note: String::new(),
@@ -1574,6 +1591,59 @@ mod tests {
         assert_eq!(
             decode_event(&serde_json::to_string(&continued).unwrap()).unwrap(),
             Some(continued)
+        );
+    }
+
+    /// The runtime's mid-turn nudge is recorded so a resume can rebuild the
+    /// exact history the live turn had — but it is not something anyone said,
+    /// so it makes no surface node and the transcript keeps alternating.
+    #[test]
+    fn a_runtime_nudge_leaves_no_trace_on_the_surface() {
+        let round = |seq: u64, round: u32| {
+            SessionEvent::new(
+                seq,
+                at("2026-08-31T00:00:00Z"),
+                SessionEventKind::AssistantRound(AssistantRoundEvent {
+                    turn_id: "turn-1".into(),
+                    round,
+                    response_id: format!("resp-{round}"),
+                    blocks: serde_json::Value::Null,
+                    tokens_in: 0,
+                    tokens_out: 0,
+                    tokens_cached: 0,
+                }),
+            )
+        };
+        let nudge = SessionEvent::new(
+            2,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::UserMessage(UserMessageEvent {
+                turn_id: "turn-1".into(),
+                content: "Runtime check: this turn issued no tool call.".into(),
+                source: MessageSource::Runtime,
+                surface: SurfacePlacement::append(),
+            }),
+        );
+        let events = vec![
+            user(0, "打开热水器"),
+            round(1, 0),
+            nudge,
+            round(3, 1),
+            assistant(4, "我没有执行任何操作。"),
+        ];
+
+        let folded = SurfaceProjection::fold(&events, 0).unwrap();
+        assert_eq!(folded.surface.nodes(), &[0, 4]);
+        let messages = folded.messages().unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|m| (m.role.clone(), m.content.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (Role::User, "打开热水器"),
+                (Role::Assistant, "我没有执行任何操作。"),
+            ]
         );
     }
 

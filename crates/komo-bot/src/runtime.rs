@@ -47,6 +47,74 @@ use komo_services::tool_execution::{
 const BUDGET_REACHED_NOTE: &str = "Tool-call budget for this turn reached; do not call any \
      more tools. Reply to the user now using what you already have.";
 
+/// Put in front of the model when it answers as if it had acted while the turn
+/// made no tool call at all (see [`claims_completed_action`]). The failure it
+/// answers is real: a non-thinking model asked to 打开热水器 replied "热水器已打开
+/// ✅" having called nothing, and nothing in the runtime could tell.
+const NUDGE_TEXT: &str = "Runtime check: your reply reports that an action was performed or a \
+     state was observed, but this turn issued no tool call. Nothing about the user's devices, \
+     files or external systems can be known without a tool call in this turn. If the action is \
+     needed, perform it now with the appropriate tool and answer from its result. If you cannot \
+     perform it, say plainly that it was not done. Do not restate the previous claim.";
+
+/// Phrases that report a *completed* change to something outside the
+/// conversation. Deliberately explicit and deliberately narrow: a generic 好的 /
+/// "done" says nothing about external state, and nudging on one would interrupt
+/// every ordinary reply.
+const COMPLETION_CLAIMS_ZH: &[&str] = &[
+    "已打开",
+    "已开启",
+    "已关闭",
+    "已关掉",
+    "已设置",
+    "已设为",
+    "已调到",
+    "已调成",
+    "已调整",
+    "已发送",
+    "已创建",
+    "已删除",
+    "已保存",
+    "已更新",
+    "已执行",
+    "已重启",
+    "已开好",
+    "都开好了",
+    "已完成设置",
+];
+
+/// The same claims in English, matched case-insensitively.
+const COMPLETION_CLAIMS_EN: &[&str] = &[
+    "turned on",
+    "turned off",
+    "has been set",
+    "has been sent",
+    "has been created",
+    "has been deleted",
+    "has been updated",
+    "i've set",
+    "i have set",
+    "i've sent",
+    "i've turned",
+    "is now on",
+    "is now off",
+];
+
+/// Whether a reply claims an action was carried out or an external state
+/// observed — the thing a turn that called no tool cannot honestly say.
+fn claims_completed_action(text: &str) -> bool {
+    if COMPLETION_CLAIMS_ZH
+        .iter()
+        .any(|claim| text.contains(claim))
+    {
+        return true;
+    }
+    let lowered = text.to_lowercase();
+    COMPLETION_CLAIMS_EN
+        .iter()
+        .any(|claim| lowered.contains(claim))
+}
+
 /// Sent to the user when the model ends a turn with no text at all (e.g. a final
 /// round that is only tool calls the loop won't run, or an empty completion).
 /// A chat channel rejects an empty message, so never hand one downstream.
@@ -890,6 +958,9 @@ impl AgentRuntime {
         };
         let mut step = Self::until_cancelled(cancel, driver.first()).await?;
         let mut rounds = 0usize;
+        // Once per turn: the nudge is a correction, and a model that repeats the
+        // claim after being told is not going to be talked out of it.
+        let mut nudged = false;
         // The model's most recent narration alongside its tool calls. Kept so the
         // budget cutoff below can answer in the model's own words instead of a
         // canned line — by then it has usually said what it was doing.
@@ -900,7 +971,41 @@ impl AgentRuntime {
 
         let reply = loop {
             match step {
-                Step::Final(text) => break non_empty(text),
+                Step::Final(text) => {
+                    // The model answered as if it had acted, having called
+                    // nothing — the incident this guard exists for. `rounds`
+                    // covers this loop and `steps_count` the whole turn, so a
+                    // continuation that already ran tools before it was
+                    // suspended is not nudged for the answer it comes back
+                    // with. A turn with no tools at all (every aux runtime) has
+                    // nothing to have called.
+                    if !nudged
+                        && rounds == 0
+                        && context
+                            .run
+                            .as_ref()
+                            .is_none_or(|run| run.steps_count() == 0)
+                        && !tools.snapshot().is_empty()
+                        && claims_completed_action(&text)
+                    {
+                        warn!(
+                            reply_chars = text.len(),
+                            "reply claims an action but the turn made no tool call; nudging once"
+                        );
+                        nudged = true;
+                        match Self::until_cancelled(cancel, driver.nudge(NUDGE_TEXT.to_string()))
+                            .await?
+                        {
+                            Some(next) => {
+                                step = next;
+                                continue;
+                            }
+                            // This driver cannot be nudged; keep the reply.
+                            None => break non_empty(text),
+                        }
+                    }
+                    break non_empty(text);
+                }
                 Step::ToolCalls { calls, text } => {
                     rounds += 1;
                     let over_budget = rounds > self.max_turns;
@@ -1178,6 +1283,8 @@ pub(crate) mod tests {
         interjected: Arc<Mutex<Vec<String>>>,
         /// How many journal rows `resume_turn` was handed; `None` until called.
         resumed_entries: Arc<Mutex<Option<usize>>>,
+        /// What the loop nudged the driver with, in order.
+        nudged: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait]
@@ -1197,6 +1304,7 @@ pub(crate) mod tests {
                 steps,
                 received: self.received.clone(),
                 interjected: self.interjected.clone(),
+                nudged: self.nudged.clone(),
                 recorder,
                 round: 0,
             }))
@@ -1222,6 +1330,7 @@ pub(crate) mod tests {
         steps: VecDeque<Step>,
         received: Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
         interjected: Arc<Mutex<Vec<String>>>,
+        nudged: Arc<Mutex<Vec<String>>>,
         /// The real driver records one `assistant/round` per provider
         /// completion, and a fixture that skips it leaves a log claiming the
         /// turn never called a model — which is most of what these tests read
@@ -1297,6 +1406,25 @@ pub(crate) mod tests {
             let step = self.steps.pop_front().expect("script exhausted at step()");
             self.record_round(&step).await;
             Ok(step)
+        }
+        async fn nudge(&mut self, text: String) -> anyhow::Result<Option<Step>> {
+            self.nudged.lock().unwrap().push(text.clone());
+            // The real driver records the nudge before the round it asks for;
+            // a fixture that skipped it would leave a log these tests read back
+            // for exactly that event.
+            if let Some(recorder) = self.recorder.clone() {
+                recorder
+                    .record(vec![SessionEventKind::UserMessage(UserMessageEvent {
+                        turn_id: recorder.turn_id().to_string(),
+                        content: text,
+                        source: MessageSource::Runtime,
+                        surface: SurfacePlacement::append(),
+                    })])
+                    .await;
+            }
+            let step = self.steps.pop_front().expect("script exhausted at nudge()");
+            self.record_round(&step).await;
+            Ok(Some(step))
         }
         fn usage(&self) -> TokenUsage {
             // Fixed, non-zero counts, so a test can tell "recorded" from
@@ -1409,6 +1537,36 @@ pub(crate) mod tests {
         Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
         Arc<Mutex<Vec<String>>>,
     ) {
+        let (rt, received, interjected, _) = scripted_runtime_parts(db, script, tools, max_turns);
+        (rt, received, interjected)
+    }
+
+    /// [`scripted_runtime`] plus a handle on what the loop *nudged* the driver
+    /// with — the runtime's own mid-turn message.
+    #[allow(clippy::type_complexity)]
+    fn scripted_runtime_seeing_nudges(
+        db: Arc<Db>,
+        script: Vec<Step>,
+        tools: Vec<Arc<dyn Tool>>,
+        max_turns: usize,
+    ) -> (AgentRuntime, Arc<Mutex<Vec<String>>>) {
+        let (rt, _, _, nudged) = scripted_runtime_parts(db, script, tools, max_turns);
+        (rt, nudged)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn scripted_runtime_parts(
+        db: Arc<Db>,
+        script: Vec<Step>,
+        tools: Vec<Arc<dyn Tool>>,
+        max_turns: usize,
+    ) -> (
+        AgentRuntime,
+        Arc<Mutex<Vec<Vec<ToolOutcome>>>>,
+        Arc<Mutex<Vec<String>>>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
+        let nudged = Arc::new(Mutex::new(Vec::new()));
         let received = Arc::new(Mutex::new(Vec::new()));
         let interjected = Arc::new(Mutex::new(Vec::new()));
         let mut executor =
@@ -1427,6 +1585,7 @@ pub(crate) mod tests {
                 received: received.clone(),
                 interjected: interjected.clone(),
                 resumed_entries: Arc::new(Mutex::new(None)),
+                nudged: nudged.clone(),
             }),
             sessions: db.clone(),
             messages: db.clone(),
@@ -1443,7 +1602,7 @@ pub(crate) mod tests {
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
         };
-        (rt, received, interjected)
+        (rt, received, interjected, nudged)
     }
 
     /// A tool that parks until released, so a turn can be cancelled *while* a
@@ -3255,6 +3414,134 @@ pub(crate) mod tests {
         assert_ledger_matches_log(&db, "cli:s2").await;
     }
 
+    #[test]
+    fn a_completion_claim_is_told_from_an_offer_or_an_observation() {
+        // The incident: the model reported a device change it never made.
+        assert!(claims_completed_action("热水器已打开（switch.xxx → on）✅"));
+        assert!(claims_completed_action("都开好了：✅"));
+        assert!(claims_completed_action("The heater has been turned on"));
+        assert!(claims_completed_action("I've set the temperature to 45"));
+
+        // Talking *about* an action is not claiming one.
+        assert!(!claims_completed_action("现在热水器是关的"));
+        assert!(!claims_completed_action("要不要我帮你打开？"));
+        assert!(!claims_completed_action("I can turn it on if you want"));
+        assert!(!claims_completed_action("好的，我明白了"));
+        assert!(!claims_completed_action(
+            "komo 的工具循环每轮只发一次补全请求。"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reply_claiming_an_action_with_no_tool_call_is_nudged_once() {
+        let db = Arc::new(Db::connect(&sqlite_url("komo_rt_nudge.db")).await.unwrap());
+        let (rt, nudged) = scripted_runtime_seeing_nudges(
+            db.clone(),
+            vec![
+                Step::Final("热水器已打开 ✅".into()),
+                Step::Final("我没有执行任何操作，需要我现在打开吗？".into()),
+            ],
+            vec![Arc::new(EchoArgsTool)],
+            30,
+        );
+
+        let reply = rt
+            .handle_input("cli:nudge1", "打开热水器".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "我没有执行任何操作，需要我现在打开吗？");
+        assert_eq!(nudged.lock().unwrap().len(), 1);
+
+        // Recorded, so a resume rebuilds the history the live turn had — and
+        // recorded as the runtime, not as the user.
+        let events = SessionEventRepository::events(&*db, "cli:nudge1")
+            .await
+            .unwrap();
+        let sources: Vec<MessageSource> = events
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEventKind::UserMessage(m) => Some(m.source),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            vec![MessageSource::User, MessageSource::Runtime],
+            "the question and the nudge, and nothing else said"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_reply_is_left_alone() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_no_nudge.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, nudged) = scripted_runtime_seeing_nudges(
+            db.clone(),
+            vec![Step::Final("好的，有什么可以帮你？".into())],
+            vec![Arc::new(EchoArgsTool)],
+            30,
+        );
+
+        let reply = rt.handle_input("cli:nudge2", "在吗".into()).await.unwrap();
+        assert_eq!(reply, "好的，有什么可以帮你？");
+        assert!(nudged.lock().unwrap().is_empty());
+    }
+
+    /// The claim is only suspect when nothing was called: a turn that ran a tool
+    /// and then reports what it did is doing exactly the right thing.
+    #[tokio::test]
+    async fn a_claim_after_a_tool_call_is_not_nudged() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_nudge_after_tool.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, nudged) = scripted_runtime_seeing_nudges(
+            db.clone(),
+            vec![
+                tool_calls(vec![call("echo", "on")]),
+                Step::Final("已打开".into()),
+            ],
+            vec![Arc::new(EchoArgsTool)],
+            30,
+        );
+
+        let reply = rt
+            .handle_input("cli:nudge3", "打开热水器".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "已打开");
+        assert!(nudged.lock().unwrap().is_empty());
+    }
+
+    /// One nudge, then the model's answer stands whatever it says. A model that
+    /// repeats the claim after being told is not going to be talked out of it,
+    /// and a second nudge would be a loop.
+    #[tokio::test]
+    async fn a_model_that_keeps_claiming_is_nudged_only_once() {
+        let db = Arc::new(
+            Db::connect(&sqlite_url("komo_rt_nudge_twice.db"))
+                .await
+                .unwrap(),
+        );
+        let (rt, nudged) = scripted_runtime_seeing_nudges(
+            db.clone(),
+            vec![Step::Final("已打开".into()), Step::Final("已打开".into())],
+            vec![Arc::new(EchoArgsTool)],
+            30,
+        );
+
+        let reply = rt
+            .handle_input("cli:nudge4", "打开热水器".into())
+            .await
+            .unwrap();
+        assert_eq!(reply, "已打开");
+        assert_eq!(nudged.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn multi_round_threads_tool_results_back() {
         let db = Arc::new(
@@ -3980,6 +4267,7 @@ pub(crate) mod tests {
                 received: Arc::new(Mutex::new(Vec::new())),
                 interjected: Arc::new(Mutex::new(Vec::new())),
                 resumed_entries: resumed_entries.clone(),
+                nudged: Arc::new(Mutex::new(Vec::new())),
             }),
             sessions: db.clone(),
             messages: db.clone(),

@@ -231,12 +231,13 @@ specific sensitive paths (for example `.ssh` or credential directories).
 | `openai` | `OPENAI_API_KEY` |
 | `anthropic` | `ANTHROPIC_API_KEY` |
 | `openrouter` | `OPENROUTER_API_KEY` |
-| `codex` | none — reads the Codex CLI's OAuth file (`~/.codex/auth.json`, else `~/.komo/codex/auth.json`; `$CODEX_HOME` overrides both) |
+| `codex` | none — reads the Codex CLI's OAuth file (`~/.codex/auth.json`, else `~/.komo/.codex/auth.json` or `~/.komo/codex/auth.json`; `$CODEX_HOME` overrides them all) |
 
 `codex` is the exception to the `.env` rule: it authenticates with the OAuth
 tokens the Codex CLI writes, so there is nothing to paste. On a host with no
 Codex CLI (a container), copy `auth.json` from a machine that does have one to
-`$KOMO_HOME/codex/auth.json` — komo refreshes it in place from there, and
+`$KOMO_HOME/.codex/auth.json` (or `$KOMO_HOME/codex/auth.json`) — komo refreshes
+it in place from there, and
 `komo doctor` prints the file it actually chose.
 
 Channel credentials live in `.env`, for example:

@@ -70,7 +70,9 @@ const AUTH_FILE: &str = "auth.json";
 
 /// Where a Codex login may live, in the order we accept one. `$CODEX_HOME` is
 /// explicit and answers alone; otherwise the CLI's own directory comes first
-/// and komo's home is the fallback for hosts that have no CLI.
+/// and komo's home is the fallback for hosts that have no CLI — under either
+/// spelling, since a login copied there by hand arrives as the `.codex` the CLI
+/// wrote it in as often as the `codex` the docs name.
 fn codex_home_candidates() -> Vec<PathBuf> {
     if let Some(explicit) = std::env::var("CODEX_HOME")
         .ok()
@@ -83,7 +85,9 @@ fn codex_home_candidates() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".codex"));
     }
-    candidates.push(komo_core::paths::komo_home().join("codex"));
+    let komo_home = komo_core::paths::komo_home();
+    candidates.push(komo_home.join(".codex"));
+    candidates.push(komo_home.join("codex"));
     candidates
 }
 
@@ -122,7 +126,7 @@ pub fn missing_login_hint() -> String {
         .join(", ");
     format!(
         "no Codex login found (looked in {looked}) — run `codex` to log in, or copy \
-         an existing auth.json to one of those paths ($CODEX_HOME overrides both)"
+         an existing auth.json to one of those paths ($CODEX_HOME overrides them all)"
     )
 }
 
@@ -625,16 +629,22 @@ mod tests {
     fn komo_home_is_only_a_fallback_for_the_cli_directory() {
         let dir = std::env::temp_dir().join(format!("komo_codex_pick_{}", std::process::id()));
         let cli = dir.join(".codex");
+        let dotted = dir.join("komo-home").join(".codex");
         let fallback = dir.join("komo-home").join("codex");
-        std::fs::create_dir_all(&cli).unwrap();
-        std::fs::create_dir_all(&fallback).unwrap();
-        let candidates = vec![cli.clone(), fallback.clone()];
+        for d in [&cli, &dotted, &fallback] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let candidates = vec![cli.clone(), dotted.clone(), fallback.clone()];
 
-        // Neither exists yet: report against the place the CLI would write.
+        // Nothing exists yet: report against the place the CLI would write.
         assert_eq!(pick_codex_home(&candidates), cli);
 
         std::fs::write(fallback.join(AUTH_FILE), "{}").unwrap();
         assert_eq!(pick_codex_home(&candidates), fallback, "container case");
+
+        // A login copied in under the CLI's own directory name is accepted too.
+        std::fs::write(dotted.join(AUTH_FILE), "{}").unwrap();
+        assert_eq!(pick_codex_home(&candidates), dotted, "hand-copied `.codex`");
 
         std::fs::write(cli.join(AUTH_FILE), "{}").unwrap();
         assert_eq!(

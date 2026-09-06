@@ -18,7 +18,7 @@ const CONFIG_TEMPLATE: &str = r#"# komo runtime settings. Credentials never go h
 # LLM provider: deepseek | openai | anthropic | openrouter | codex
 # (codex needs no API key — it uses the Codex CLI's OAuth login)
 provider = "deepseek"
-# model = "deepseek-chat"        # defaults per provider
+# model = "deepseek-v4-flash"    # defaults per provider
 # base_url = ""                  # OpenAI-compatible endpoint override
 # aux_model = ""                 # cheaper model for sub-tasks (reviewer/recall/briefing)
 

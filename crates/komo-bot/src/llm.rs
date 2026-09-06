@@ -309,13 +309,16 @@ const THINKING_ANSWER_HEADROOM: u64 = 8_192;
 /// Which levels a provider offers is [`Provider::efforts`]; this is the other
 /// half — how a level is actually spelled on the wire.
 fn reasoning_params(provider: Provider, effort: &str) -> Option<Value> {
-    let level = match effort.trim() {
-        level @ ("low" | "medium" | "high") => level,
-        _ => return None,
-    };
+    // The scale differs per provider (DeepSeek has `max` and no `medium`), so
+    // the accepted set is the one that provider advertises — not a shared list
+    // that would reject a level the menu offers.
+    let level = effort.trim();
+    if !provider.efforts().contains(&level) {
+        return None;
+    }
     match provider {
         // Every Responses-API provider takes `reasoning.effort` verbatim.
-        Provider::OpenAi | Provider::OpenRouter | Provider::Codex => {
+        Provider::OpenAi | Provider::OpenRouter | Provider::Codex | Provider::DeepSeek => {
             Some(json!({ "reasoning": { "effort": level } }))
         }
         // Anthropic has no effort scale — it budgets thinking in tokens, so the
@@ -329,8 +332,6 @@ fn reasoning_params(provider: Provider, effort: &str) -> Option<Value> {
             };
             Some(json!({ "thinking": { "type": "enabled", "budget_tokens": budget } }))
         }
-        // Only a thinking on/off flag; see `Provider::efforts`.
-        Provider::DeepSeek => None,
     }
 }
 
@@ -1758,10 +1759,23 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_and_unknown_levels_change_nothing() {
-        // DeepSeek exposes no effort scale (`Provider::efforts` is empty), so a
-        // level arriving anyway must not invent request params.
-        assert_eq!(reasoning_params(Provider::DeepSeek, "high"), None);
+    fn deepseek_maps_its_own_scale_and_nothing_else() {
+        for level in ["low", "high", "max"] {
+            assert_eq!(
+                reasoning_params(Provider::DeepSeek, level),
+                Some(json!({ "reasoning": { "effort": level } })),
+                "{level:?}"
+            );
+        }
+        // `medium` is not on DeepSeek's scale — the server would alias it onto
+        // `high`, so komo declines it rather than sending a level it did not offer.
+        for level in ["", "  ", "medium", "auto", "HIGH"] {
+            assert_eq!(
+                reasoning_params(Provider::DeepSeek, level),
+                None,
+                "{level:?}"
+            );
+        }
         for level in ["", "  ", "auto", "xhigh", "HIGH"] {
             assert_eq!(reasoning_params(Provider::OpenAi, level), None, "{level:?}");
         }
@@ -1873,6 +1887,7 @@ mod tests {
             id: Some("rs".into()),
             summary: vec![],
             encrypted: Some("blob".into()),
+            text: vec![],
         })];
         if !text.is_empty() {
             blocks.push(AssistantBlock::Text(text.into()));
@@ -2854,8 +2869,10 @@ mod tests {
         let blocks = vec![
             AssistantBlock::Reasoning(komo_provider::types::Reasoning {
                 id: Some("rs_1".into()),
-                summary: vec!["thinking".into()],
-                encrypted: Some("OPAQUE".into()),
+                summary: vec![],
+                encrypted: None,
+                // DeepSeek's shape: the reasoning itself, no summary, no blob.
+                text: vec!["thinking".into()],
             }),
             AssistantBlock::Text("the answer".into()),
         ];

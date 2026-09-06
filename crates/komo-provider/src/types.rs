@@ -76,8 +76,8 @@ pub enum AssistantBlock {
     },
     /// Provider-opaque reasoning, echoed back verbatim on the next round so a
     /// reasoning model keeps its chain of thought across a tool loop. komo
-    /// never reads the contents — `encrypted` is ciphertext, and `summary` is
-    /// only for display.
+    /// never reads the contents — `encrypted` is ciphertext, `summary` is only
+    /// for display, and `text` is the model's own words going back to it.
     Reasoning(Reasoning),
 }
 
@@ -92,6 +92,10 @@ pub struct Reasoning {
     /// The opaque blob that actually carries the reasoning across rounds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encrypted: Option<String>,
+    /// Plain-text chain-of-thought chunks, for providers (DeepSeek) that return
+    /// the reasoning itself instead of a summary or an encrypted blob.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub text: Vec<String>,
 }
 
 /// A tool declaration advertised to the provider. Only the schema crosses the
@@ -168,6 +172,7 @@ mod tests {
                         id: Some("rs_1".into()),
                         summary: vec!["thinking…".into()],
                         encrypted: Some("opaque-blob".into()),
+                        text: vec!["step by step".into()],
                     }),
                     AssistantBlock::Text("let me check".into()),
                     AssistantBlock::ToolCall {

@@ -299,18 +299,22 @@ until the user messages the bot after process start. `home_chat` is the
 fallback for proactive output; a `/sethome` chat command override (db) wins.
 
 Model menu: `models = [...]` declares what a session may switch to; entries may
-be provider-qualified (`deepseek:deepseek-chat`) and `ModelConfig::menu()`
+be provider-qualified (`deepseek:deepseek-v4-flash`) and `ModelConfig::menu()`
 drops entries whose provider has no key (except the running `model`).
-**A DeepSeek entry must name a v4-or-later model**: komo speaks only the
-Responses API to DeepSeek, and the v3 models (`deepseek-chat`) have no
-`/v1/responses` endpoint. Choice is
+**A DeepSeek entry must name the model, not an alias**: `deepseek-chat` is a
+deprecated alias for `deepseek-v4-flash` in **non-thinking** mode (and
+`deepseek-reasoner` for its thinking mode), so name `deepseek-v4-flash` /
+`deepseek-v4-pro` directly — thinking is on by default there, and
+`X-Komo-Effort` for DeepSeek is `low` / `high` / `max` (no `medium`, which the
+server would only alias onto `high`). Choice is
 carried per turn in `X-Komo-Model`/`X-Komo-Effort`, validated against the menu,
 stored on the session; `RoutingLlm` dispatches across providers. Effort levels
 are per-provider (`Provider::efforts` ↔ `reasoning_params` must agree — there
 is a test). **Invariant: every aux path (reviewer, delegate, recall, sweeps)
 builds a synthetic `Session` with empty overrides** — that's what keeps a
 conversation's model from leaking onto the aux model; preserve it when adding
-aux callers.
+aux callers. Empty overrides send no `reasoning` field, so an `aux_model` on
+DeepSeek runs at the server default (thinking, high).
 
 The `codex` provider authenticates from the Codex CLI's OAuth file
 (`~/.codex/auth.json`, auto-refreshed) instead of an env key, and requires

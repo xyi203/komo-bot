@@ -177,14 +177,27 @@ fn input_items(history: &[Turn]) -> Vec<Value> {
 }
 
 fn reasoning_item(reasoning: &Reasoning) -> Value {
-    let mut item = json!({
-        "type": "reasoning",
-        "summary": reasoning
+    let mut item = json!({ "type": "reasoning" });
+    // An item carrying plain text is DeepSeek's shape, and DeepSeek documents
+    // `summary` as unsupported on input — so it must not receive the empty
+    // `summary: []` every other item still gets. The condition is "has text"
+    // rather than "summary is empty" because an OpenAI/Codex item routinely has
+    // an empty summary beside its encrypted blob (komo never asks for one), and
+    // `summary` is a required field of that wire's reasoning item.
+    if reasoning.text.is_empty() {
+        item["summary"] = reasoning
             .summary
             .iter()
             .map(|text| json!({ "type": "summary_text", "text": text }))
-            .collect::<Vec<_>>(),
-    });
+            .collect();
+    }
+    if !reasoning.text.is_empty() {
+        item["content"] = reasoning
+            .text
+            .iter()
+            .map(|text| json!({ "type": "reasoning_text", "text": text }))
+            .collect();
+    }
     if let Some(id) = &reasoning.id {
         item["id"] = json!(id);
     }
@@ -441,6 +454,20 @@ fn item_to_block(item: &Value) -> Option<AssistantBlock> {
                 .get("encrypted_content")
                 .and_then(Value::as_str)
                 .map(str::to_string),
+            // DeepSeek returns the chain of thought itself here instead of a
+            // summary or a blob; without this the item parses to nothing.
+            text: item
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter(|p| p.get("type").and_then(Value::as_str) == Some("reasoning_text"))
+                        .filter_map(|p| p.get("text").and_then(Value::as_str))
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default(),
         })),
         _ => None,
     }
@@ -610,6 +637,7 @@ mod tests {
                 id: Some("rs_1".into()),
                 summary: vec!["thinking about it".into()],
                 encrypted: Some("OPAQUE".into()),
+                text: Vec::new(),
             })],
         }];
         let body = request("m", "s", &history, &[], None);
@@ -618,6 +646,55 @@ mod tests {
         assert_eq!(item["id"], "rs_1");
         assert_eq!(item["encrypted_content"], "OPAQUE");
         assert_eq!(item["summary"][0]["type"], "summary_text");
+        assert!(item.get("content").is_none(), "no plain text to send back");
+    }
+
+    #[test]
+    fn a_summaryless_openai_item_still_carries_an_empty_summary() {
+        // komo never asks for a reasoning summary, so this — an encrypted blob
+        // and nothing else — is the ordinary OpenAI/Codex item. `summary` is a
+        // required field of that wire's reasoning item, so it stays.
+        let history = vec![Turn::Assistant {
+            id: None,
+            blocks: vec![AssistantBlock::Reasoning(Reasoning {
+                id: Some("rs_1".into()),
+                summary: Vec::new(),
+                encrypted: Some("OPAQUE".into()),
+                text: Vec::new(),
+            })],
+        }];
+        let body = request("m", "s", &history, &[], None);
+        assert_eq!(body["input"][0]["summary"], json!([]));
+    }
+
+    #[test]
+    fn deepseek_reasoning_is_plain_text_in_both_directions() {
+        // DeepSeek emits neither a summary nor an encrypted blob — the chain of
+        // thought itself arrives as `content[].reasoning_text`, and parsing only
+        // the other two fields left an empty block that carried nothing back.
+        let block = item_to_block(&json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "content": [{ "type": "reasoning_text", "text": "think" }],
+        }));
+        let Some(AssistantBlock::Reasoning(reasoning)) = block else {
+            panic!("expected a reasoning block, got {block:?}");
+        };
+        assert_eq!(reasoning.text, ["think"]);
+        assert!(reasoning.summary.is_empty());
+        assert_eq!(reasoning.encrypted, None);
+
+        // Going back: the text rides along and no empty `summary` is sent, which
+        // DeepSeek does not accept on input.
+        let history = vec![Turn::Assistant {
+            id: None,
+            blocks: vec![AssistantBlock::Reasoning(reasoning)],
+        }];
+        let item = &request("deepseek-v4-flash", "s", &history, &[], None)["input"][0];
+        assert_eq!(item["content"][0]["type"], "reasoning_text");
+        assert_eq!(item["content"][0]["text"], "think");
+        assert!(item.get("summary").is_none(), "unsupported by deepseek");
+        assert_eq!(item["id"], "rs_1");
     }
 
     #[test]

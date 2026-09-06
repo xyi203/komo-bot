@@ -1342,7 +1342,7 @@ mod tests {
         let snap = ConfigSnapshot::from_sources(with_deepseek_key(sources()));
         let rt = &snap.runtime;
         assert_eq!(rt.model.provider, Provider::DeepSeek);
-        assert_eq!(rt.model.model, "deepseek-chat");
+        assert_eq!(rt.model.model, "deepseek-v4-flash");
         assert_eq!(rt.model.max_turns, DEFAULT_MAX_TURNS);
         assert_eq!(rt.maintenance_schedule, DEFAULT_MAINTENANCE_SCHEDULE);
         assert_eq!(rt.briefing_schedule, None, "briefing stays opt-in");
@@ -1712,9 +1712,10 @@ mod tests {
         let deepseek = &menu[1];
         assert_eq!(deepseek.provider, Provider::DeepSeek);
         assert_eq!(deepseek.model, "deepseek-chat", "the prefix is stripped");
-        assert!(
-            deepseek.efforts.is_empty(),
-            "deepseek exposes no effort scale, unlike the codex entries"
+        assert_eq!(
+            deepseek.efforts,
+            ["low", "high", "max"],
+            "deepseek has its own scale, not the codex entries'"
         );
         // An unqualified entry inherits the configured provider.
         assert_eq!(menu[2].provider, Provider::Codex);

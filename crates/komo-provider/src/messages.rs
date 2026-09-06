@@ -342,6 +342,7 @@ fn finish_block(shape: Value, buffer: String) -> Option<AssistantBlock> {
                 id: None,
                 summary: vec![format!("{}{buffer}", str_field("thinking"))],
                 encrypted: signature.map(str::to_string),
+                text: Vec::new(),
             }))
         }
         _ => None,
@@ -521,6 +522,7 @@ mod tests {
                 id: None,
                 summary: vec!["hmm".into()],
                 encrypted: None,
+                text: Vec::new(),
             })],
         }];
         let body = request("claude", "s", &history, &[], None);
@@ -535,6 +537,7 @@ mod tests {
                 id: None,
                 summary: vec!["hmm".into()],
                 encrypted: Some("SIG".into()),
+                text: Vec::new(),
             })],
         }];
         let body = request("claude", "s", &signed, &[], None);

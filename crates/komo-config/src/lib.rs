@@ -77,7 +77,9 @@ impl Provider {
     /// Default model id when `model` is unset.
     pub fn default_model(self) -> &'static str {
         match self {
-            Provider::DeepSeek => "deepseek-chat",
+            // `deepseek-chat` is a retired alias for this model's *non-thinking*
+            // mode; naming the model directly gets thinking, which is its default.
+            Provider::DeepSeek => "deepseek-v4-flash",
             Provider::OpenAi => "gpt-4o-mini",
             Provider::Anthropic => "claude-3-5-sonnet-latest",
             Provider::OpenRouter => "deepseek/deepseek-chat",
@@ -93,15 +95,15 @@ impl Provider {
     /// rendering a switch that changes nothing — see
     /// `infra::llm::reasoning_params`, which turns a level into request params.
     ///
-    /// DeepSeek is deliberately empty: its only knob is a thinking on/off flag,
-    /// and squeezing three levels onto a boolean would misreport what the model
-    /// actually did.
+    /// The scale is each provider's own. DeepSeek's is `low`/`high`/`max`: it
+    /// aliases a requested `medium` onto `high` server-side, so advertising one
+    /// would offer a level that silently becomes another.
     pub fn efforts(self) -> &'static [&'static str] {
         match self {
             Provider::OpenAi | Provider::OpenRouter | Provider::Codex | Provider::Anthropic => {
                 &["low", "medium", "high"]
             }
-            Provider::DeepSeek => &[],
+            Provider::DeepSeek => &["low", "high", "max"],
         }
     }
 

@@ -19,10 +19,6 @@ impl GatewayOperatorAdapter {
         Self { client }
     }
 
-    pub(super) fn client(&self) -> &GatewayClient {
-        &self.client
-    }
-
     pub(super) async fn query(&self, query: OperatorQuery) -> anyhow::Result<OperatorQueryResult> {
         Ok(match query {
             OperatorQuery::Runs { limit } => {

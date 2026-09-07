@@ -13,12 +13,10 @@ use super::run::Run;
 pub trait MessageHandler: Send + Sync {
     async fn handle(&self, session_id: &str, input: String) -> anyhow::Result<String>;
 
-    /// Continue an interrupted run from its turn journal, in place — no new
-    /// user message, the tool rounds already paid for replayed rather than
-    /// re-run. `Ok(None)` = this handler can't (no journal, or the run isn't
-    /// continuable); the caller falls back to a digest-primed [`handle`] turn.
-    ///
-    /// [`handle`]: MessageHandler::handle
+    /// Continue a turn in place — no new user message, the tool rounds already
+    /// paid for replayed rather than re-run. This is how a suspended turn comes
+    /// back once its wait is answered. `Ok(None)` = not continuable (the
+    /// transcript already ends in a reply, or the log has nothing for the run).
     async fn resume_interrupted(&self, _run: &Run) -> anyhow::Result<Option<String>> {
         Ok(None)
     }

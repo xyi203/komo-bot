@@ -17,15 +17,10 @@ mod direct;
 mod gateway;
 pub mod request;
 
-use std::future::Future;
-use std::sync::Arc;
-
 pub use request::*;
 
-use crate::domain::run::Run;
 use crate::infra::gateway_client::GatewayClient;
 use komo_config::RuntimeConfig;
-use komo_infra::persistence::db::Db;
 
 use direct::DirectOperatorAdapter;
 use gateway::GatewayOperatorAdapter;
@@ -95,72 +90,6 @@ impl OperatorControl {
             OperatorBackend::Direct(direct) => direct.command(command).await,
         }
     }
-
-    /// Resume an interrupted run. `id = None` picks the most recent recoverable
-    /// run (same scan on both backends). On the gateway backend the whole
-    /// action runs server-side (trusted loopback). On the direct backend the
-    /// turn itself must run in the caller's process — interactive approval
-    /// needs a human at the terminal — so the caller supplies `local_turn`,
-    /// which receives the already-open stores plus the run and the digest
-    /// priming input, and returns the reply plus whether it *continued* from
-    /// the turn journal (vs re-running fresh from the digest). Eligibility,
-    /// the priming digest, and the at-most-once `recoverable` clear all stay
-    /// in here.
-    pub async fn resume_run<F, Fut>(
-        &self,
-        id: Option<String>,
-        local_turn: F,
-    ) -> anyhow::Result<ResumeOutcome>
-    where
-        F: FnOnce(Arc<Db>, Run, String) -> Fut,
-        Fut: Future<Output = anyhow::Result<(String, bool)>>,
-    {
-        let target_id = match id {
-            Some(id) => id,
-            None => {
-                let OperatorQueryResult::Runs(runs) = self
-                    .query(OperatorQuery::Runs {
-                        limit: actions::RESUME_SCAN_LIMIT,
-                    })
-                    .await?
-                else {
-                    unreachable!("Runs query answers with Runs");
-                };
-                runs.into_iter()
-                    .find(|r| r.recoverable)
-                    .map(|r| r.id)
-                    .ok_or_else(|| anyhow::anyhow!(actions::NO_RECOVERABLE))?
-            }
-        };
-        match &self.backend {
-            OperatorBackend::Gateway(gw) => gw.client().resume(&target_id).await,
-            OperatorBackend::Direct(direct) => {
-                let db = direct.db().await?.clone();
-                match actions::resolve_resume(db.as_ref(), &target_id).await? {
-                    actions::ResumeTarget::Missing => {
-                        anyhow::bail!("no run with id `{target_id}`")
-                    }
-                    actions::ResumeTarget::NotRecoverable { status } => {
-                        anyhow::bail!(actions::not_recoverable_message(&target_id, &status))
-                    }
-                    actions::ResumeTarget::Ready { run, steps, input } => {
-                        let session_id = run.session_id.clone();
-                        let (reply, continued) = local_turn(db.clone(), run, input).await?;
-                        // Nothing to clear: the continuation's own
-                        // `turn/started{resumed_from}` claimed the turn it
-                        // picked up, and a claimed turn is no longer offered.
-                        Ok(ResumeOutcome {
-                            run_id: target_id,
-                            session_id,
-                            steps: steps.len(),
-                            reply,
-                            continued,
-                        })
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// Unix seconds — the operator surface's one clock read per request.
@@ -178,7 +107,6 @@ mod tests {
 
     use super::*;
     use crate::domain::memory::{Memory, MemoryKind, MemoryRepository, MemoryStatus};
-    use crate::domain::run::Run;
 
     fn temp_urls(tag: &str) -> StoreUrls {
         let dir = std::env::temp_dir().join(format!("komo_opctl_{tag}"));
@@ -313,74 +241,5 @@ mod tests {
             panic!();
         };
         assert!(matches!(outcome, PairApproveOutcome::NotFound));
-    }
-
-    #[tokio::test]
-    async fn resume_reports_missing_and_not_recoverable() {
-        let control = direct(temp_urls("resume"));
-        // Nothing recoverable at all.
-        let err = control
-            .resume_run(None, |_, _, _| async { Ok((String::new(), false)) })
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("no recoverable runs"));
-        // An explicit unknown id.
-        let err = control
-            .resume_run(Some("run-x".into()), |_, _, _| async {
-                Ok((String::new(), false))
-            })
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("no run with id `run-x`"));
-        // A finished (non-recoverable) run.
-        let backend = match &control.backend {
-            OperatorBackend::Direct(d) => d,
-            _ => unreachable!(),
-        };
-        let db = backend.db().await.unwrap().clone();
-        let run = Run::start("cli:test", "hello");
-        let run_id = run.id.clone();
-        // The ledger's rows are a projection of the session log, so this is how
-        // a run gets into them.
-        let projected = komo_core::domain::run_projection::ProjectedRun {
-            run: run.clone(),
-            steps: Vec::new(),
-            start_seq: 0,
-        };
-        komo_core::domain::run_projection::RunProjectionStore::commit(
-            db.as_ref(),
-            &run.session_id,
-            &[projected],
-            0,
-        )
-        .await
-        .unwrap();
-        let err = control
-            .resume_run(Some(run_id.clone()), |_, _, _| async {
-                Ok((String::new(), false))
-            })
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("is not recoverable"));
-
-        // Interrupt-reconcile it, then resume dispatches the local turn.
-        komo_core::domain::run::RunRepository::reconcile_interrupted(db.as_ref(), now())
-            .await
-            .unwrap();
-        let outcome = control
-            .resume_run(Some(run_id.clone()), |_, run, input| async move {
-                assert_eq!(run.session_id, "cli:test");
-                assert!(input.contains("hello"), "priming digest carries the input");
-                Ok(("done".to_string(), false))
-            })
-            .await
-            .unwrap();
-        assert_eq!(outcome.run_id, run_id);
-        assert_eq!(outcome.reply, "done");
-        // At-most-once is the log's now, not a flag this function clears: a
-        // real continuation opens with `turn/started{resumed_from}`, and the
-        // projection stops offering a claimed turn (`run_projection`, plus the
-        // runtime's own resume test). The stub dispatch above continues
-        // nothing, so this run stays resumable — which is the honest answer.
     }
 }

@@ -315,75 +315,9 @@ pub struct RunStep {
     pub approval_waited_ms: i64,
 }
 
-/// Per-field cap on a step's args/result inside the resume digest, and the
-/// budget for the digest as a whole (a turn can have up to 100 steps — past
-/// the budget the rest is elided, `run inspect` still has everything).
-const RESUME_SNIPPET_CAP: usize = 200;
-const RESUME_DIGEST_CAP: usize = 8000;
-
-/// Compose the priming input for resuming an interrupted run: the original
-/// request plus a digest of the tool calls that had completed, so the model can
-/// judge which side effects already took hold and continue rather than restart.
-///
-/// The ledger is an audit record, not a checkpoint — intermediate assistant
-/// turns are never persisted and step args are redacted/truncated — so resume
-/// re-dispatches a *fresh* turn primed with this digest instead of pretending
-/// to replay the loop from mid-flight. The result is a normal user message in
-/// the session transcript, visible as such.
-pub fn resume_prompt(run: &Run, steps: &[RunStep]) -> String {
-    // Collapse newlines so each step stays one digest line.
-    let snip = |s: &str| truncate(&s.replace('\n', " "), RESUME_SNIPPET_CAP);
-
-    let mut out = format!(
-        "[resume {id}] The previous attempt at this task was interrupted (the \
-         process restarted mid-turn). Original request:\n\n{input}\n\n",
-        id = run.id,
-        input = run.input,
-    );
-    if steps.is_empty() {
-        out.push_str("No tool calls had completed before the interruption.\n");
-    } else {
-        out.push_str(&format!(
-            "Before the interruption, {} tool call(s) had already completed:\n",
-            steps.len()
-        ));
-        for (idx, s) in steps.iter().enumerate() {
-            if out.len() > RESUME_DIGEST_CAP {
-                out.push_str(&format!(
-                    "…and {} more step(s), elided for length (full record: \
-                     `komo run inspect {}`).\n",
-                    steps.len() - idx,
-                    run.id
-                ));
-                break;
-            }
-            let outcome = if s.ok {
-                snip(&s.result)
-            } else {
-                format!("error: {}", snip(&s.error))
-            };
-            out.push_str(&format!(
-                "{}. {} {} → {}\n",
-                idx + 1,
-                s.tool_name,
-                snip(&s.args),
-                outcome
-            ));
-        }
-    }
-    out.push_str(
-        "\nReview what already took effect, then continue the task from where \
-         it stopped. Do not re-apply side effects that already succeeded — \
-         verify first when unsure. Reply with the completed outcome.",
-    );
-    out
-}
-
-/// Caps for [`tool_digest`]. Tighter than the resume digest's: a resume prompt is
-/// written once for one turn, whereas a tool note rides along in *every*
-/// subsequent turn's history until it ages out of the window — so its per-line
-/// and total budgets are what keep cross-turn continuity from becoming a context
-/// leak.
+/// Caps for [`tool_digest`]: a tool note rides along in *every* subsequent
+/// turn's history until it ages out of the window — so its per-line and total
+/// budgets are what keep cross-turn continuity from becoming a context leak.
 const TOOL_NOTE_SNIPPET_CAP: usize = 160;
 const TOOL_NOTE_CAP: usize = 1500;
 
@@ -546,43 +480,6 @@ mod tests {
             approved_by: String::new(),
             approval_waited_ms: 0,
         }
-    }
-
-    #[test]
-    fn resume_prompt_carries_input_and_step_digest() {
-        let run = interrupted_run();
-        let steps = vec![step(&run, 0, "shell", true), step(&run, 1, "file", false)];
-        let prompt = resume_prompt(&run, &steps);
-
-        assert!(prompt.contains(&run.id));
-        assert!(prompt.contains("deploy the new build"));
-        assert!(prompt.contains("2 tool call(s)"));
-        assert!(prompt.contains("1. shell"));
-        assert!(prompt.contains("2. file"));
-        assert!(prompt.contains("error: boom"));
-        assert!(prompt.contains("Do not re-apply side effects"));
-    }
-
-    #[test]
-    fn resume_prompt_without_steps_says_so() {
-        let run = interrupted_run();
-        let prompt = resume_prompt(&run, &[]);
-        assert!(prompt.contains("No tool calls had completed"));
-    }
-
-    #[test]
-    fn resume_prompt_elides_past_the_digest_budget() {
-        let run = interrupted_run();
-        let steps: Vec<RunStep> = (0..100)
-            .map(|seq| {
-                let mut s = step(&run, seq, "web_fetch", true);
-                s.result = "r".repeat(400); // each line lands near the snippet cap
-                s
-            })
-            .collect();
-        let prompt = resume_prompt(&run, &steps);
-        assert!(prompt.contains("elided for length"));
-        assert!(prompt.len() < RESUME_DIGEST_CAP + 2000);
     }
 
     #[test]

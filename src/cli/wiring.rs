@@ -107,10 +107,6 @@ struct CapabilityProfile {
     /// own output. (`LearningCoordinator` also refuses sweep sessions by id —
     /// this is the half that stops them being offered at all.)
     learns: bool,
-    /// Journals each turn's provider state so an interrupted one can be
-    /// continued. True only for conversations: an aux turn is re-dispatched
-    /// whole, so a journal for one would only ever be written and deleted.
-    resumable: bool,
     /// Summarises its oldest messages once the window starts dropping them.
     /// True only for conversations, which are the only sessions that outlive
     /// their window: a sweep or a delegation opens, answers and is done.
@@ -598,7 +594,6 @@ pub async fn build(
         tools: subagent_tools,
         max_turns: model_config.max_turns,
         learns: false,
-        resumable: false,
         compacts: false,
     }));
     let delegate = Arc::new(DelegateTool::new(
@@ -668,7 +663,6 @@ pub async fn build(
         tools,
         max_turns: model_config.max_turns,
         learns: true,
-        resumable: true,
         compacts: true,
     });
 
@@ -727,7 +721,6 @@ pub async fn build(
         tools: cron_tools,
         max_turns: model_config.max_turns,
         learns: false,
-        resumable: false,
         compacts: false,
     }));
 
@@ -772,7 +765,6 @@ pub async fn build(
         // A briefing is an aggregation read, not a long-running job.
         max_turns: BRIEFING_MAX_TURNS,
         learns: false,
-        resumable: false,
         compacts: false,
     }));
 

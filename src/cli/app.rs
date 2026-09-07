@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 use super::{
     channel, doctor, dream, gateway, health, init, inspect, journey, logs, memory, model, pair,
-    policy, resume, service, skill, upgrade, wechat, wiki, workday,
+    policy, service, skill, upgrade, wechat, wiki, workday,
 };
 
 /// The version every surface reports: the crate version plus the commit it was
@@ -320,13 +320,6 @@ enum RunAction {
         /// Run id (as shown by `run list`)
         id: String,
     },
-    /// Resume an interrupted run: re-dispatch its input in the original
-    /// session, primed with the tool steps that had completed
-    Resume {
-        /// Run id (as shown by `run list`); defaults to the most recent
-        /// recoverable run
-        id: Option<String>,
-    },
     /// Prune old runs (and their tool steps) from the ledger. Pass exactly one
     /// of --before or --keep.
     Prune {
@@ -618,7 +611,6 @@ pub async fn run() -> anyhow::Result<()> {
         Some(Commands::Run { action }) => match action {
             RunAction::List { limit } => inspect::run_list(&operator(&config).await?, limit).await,
             RunAction::Inspect { id } => inspect::run_inspect(&operator(&config).await?, &id).await,
-            RunAction::Resume { id } => resume::run(&config, &operator(&config).await?, id).await,
             RunAction::Prune { before, keep } => {
                 run_prune(&operator(&config).await?, before, keep).await
             }

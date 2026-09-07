@@ -330,9 +330,6 @@ pub async fn run_inspect(control: &OperatorControl, id: &str) -> anyhow::Result<
     if !run.error.is_empty() {
         println!("error   {}", run.error);
     }
-    if run.recoverable {
-        println!("resume  recoverable — `komo run resume {}`", run.id);
-    }
     if !run.final_output.is_empty() {
         println!("output  {}", oneline(&run.final_output, 200));
     }

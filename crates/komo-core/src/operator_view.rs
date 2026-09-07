@@ -55,21 +55,6 @@ pub struct PairingView {
     pub created_at: i64,
 }
 
-/// The result of resuming an interrupted run, consumed by `komo run resume`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResumeOutcome {
-    pub run_id: String,
-    pub session_id: String,
-    /// How many completed steps the priming digest handed to the model.
-    pub steps: usize,
-    pub reply: String,
-    /// `true` when the turn was *continued* from its journal (exact state,
-    /// no re-run); `false` for the digest-primed fresh turn. `default` so an
-    /// older gateway's response still parses.
-    #[serde(default)]
-    pub continued: bool,
-}
-
 /// One candidate in the dreaming preview, carrying the signals behind its
 /// verdict: the truth signals that decide promotion, and the usage signal that
 /// decides retention.

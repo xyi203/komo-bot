@@ -74,11 +74,8 @@ use crate::{
         wakeup::{SUSPENDED_REPLY, is_suspended},
     },
     services::operator_control::{
-        MemoryTransitionAction, ResumeOutcome,
-        actions::{
-            OperatorActions, TransitionOutcome, no_cron_job_message, not_recoverable_message,
-            resolve_resume,
-        },
+        MemoryTransitionAction,
+        actions::{OperatorActions, TransitionOutcome, no_cron_job_message},
     },
 };
 use komo_config::{ApiConfig, ModelEntry};
@@ -379,7 +376,6 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/memories", get(list_memories))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
-        .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/cron", get(list_cron_jobs))
         .route("/api/skills", get(list_skills))
         .route("/api/pairings", get(list_pairings))
@@ -1321,76 +1317,6 @@ async fn get_run(
         )
             .into_response()),
     }
-}
-
-/// Resume an interrupted run (backs `komo run resume` while the gateway holds
-/// the db lock): compose the priming input from the ledger and drive one normal
-/// turn in the run's original session, then clear the `recoverable` flag.
-/// Trust follows the chat rule — loopback + `X-Komo-Trusted` auto-approves
-/// (the CLI user is the host operator); anyone else runs detached (auto-deny).
-async fn resume_run(
-    State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    headers: axum::http::HeaderMap,
-    Path(id): Path<String>,
-) -> Result<Response, ApiError> {
-    // Eligibility + priming come from the shared operator definition, so this
-    // endpoint and the CLI's direct path can never disagree.
-    let (run, steps, input) = match resolve_resume(state.actions.runs.as_ref(), &id).await? {
-        crate::services::operator_control::actions::ResumeTarget::Missing => {
-            return Ok((
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "run not found" })),
-            )
-                .into_response());
-        }
-        crate::services::operator_control::actions::ResumeTarget::NotRecoverable { status } => {
-            return Ok((
-                StatusCode::CONFLICT,
-                Json(json!({ "error": not_recoverable_message(&id, &status) })),
-            )
-                .into_response());
-        }
-        crate::services::operator_control::actions::ResumeTarget::Ready { run, steps, input } => {
-            (run, steps, input)
-        }
-    };
-
-    let trusted = peer.ip().is_loopback() && headers.contains_key("x-komo-trusted");
-    let ctx = if trusted {
-        SessionContext::trusted(&run.session_id)
-    } else {
-        SessionContext::detached(&run.session_id)
-    };
-    // A resume is a turn like any other, so it queues behind whatever the
-    // session is already doing rather than running beside it.
-    let claim = state.dispatcher.claim_session(&run.session_id).await;
-    // Journal-continue first: the interrupted turn picks up exactly where it
-    // stopped, tool rounds already paid for replayed instead of re-run. Only
-    // when the run isn't continuable (no journal, transcript already answered)
-    // does the digest-primed fresh turn run — yesterday's behavior, verbatim.
-    let resumed = match with_session(ctx.clone(), state.handler.resume_interrupted(&run)).await {
-        Ok(Some(reply)) => Ok((reply, true)),
-        Ok(None) => with_session(ctx, state.handler.handle(&run.session_id, input))
-            .await
-            .map(|reply| (reply, false)),
-        Err(error) => Err(error),
-    };
-    claim.release();
-    let (reply, continued) = resumed?;
-
-    // Nothing to clear: the continuation's own `turn/started{resumed_from}` is
-    // the claim on the turn it picked up, and the projection stops offering a
-    // claimed turn for resume.
-    info!(run_id = %id, session = %run.session_id, continued, "run resumed");
-    Ok(Json(ResumeOutcome {
-        run_id: id,
-        session_id: run.session_id,
-        steps: steps.len(),
-        reply,
-        continued,
-    })
-    .into_response())
 }
 
 // ---- control-plane write endpoints ------------------------------------------

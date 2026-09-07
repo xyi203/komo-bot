@@ -2,7 +2,6 @@ mod app;
 
 /// The version string every surface reports — see [`app::VERSION`].
 pub use app::VERSION;
-mod approver;
 mod channel;
 mod doctor;
 mod dream;
@@ -16,7 +15,6 @@ mod memory;
 mod model;
 mod pair;
 mod policy;
-mod resume;
 mod service;
 mod skill;
 mod upgrade;

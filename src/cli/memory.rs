@@ -6,7 +6,7 @@
 //! Every read and write goes through [`OperatorControl`] — whether it reaches a
 //! running gateway or the store directly is not this module's business.
 
-use crate::domain::memory::{Memory, MemoryConfidence, MemoryStatus};
+use crate::domain::memory::{Memory, MemoryStatus};
 use crate::services::operator_control::{
     MemoryTransitionAction, OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery,
     OperatorQueryResult,
@@ -49,44 +49,6 @@ pub async fn list(control: &OperatorControl, status: Option<String>) -> anyhow::
 }
 
 /// Substring search across all scopes (operator view — no scope enforcement).
-/// Which turns a memory reached the prompt of, newest first.
-///
-/// The question worth asking right after correcting a memory: what did it
-/// already shape? Prints run ids so `komo run inspect <id>` is the next step.
-pub async fn used(control: &OperatorControl, id: &str, limit: usize) -> anyhow::Result<()> {
-    let uses = match control
-        .query(OperatorQuery::MemoryUsed {
-            id: id.to_string(),
-            limit,
-        })
-        .await?
-    {
-        OperatorQueryResult::MemoryUsed(uses) => uses,
-        _ => unreachable!("MemoryUsed answers with MemoryUsed"),
-    };
-    if uses.is_empty() {
-        // Two different nothings, and the operator needs them apart: the ledger
-        // is pruned, so "never used" and "used before the ledger was trimmed"
-        // look identical from here.
-        println!(
-            "没有记录到这条记忆进入过 prompt（run ledger 会被 `komo run prune` 清理，更早的使用查不到）。"
-        );
-        return Ok(());
-    }
-    println!("这条记忆进入过 {} 次 prompt：", uses.len());
-    for use_ in &uses {
-        println!(
-            "  {}  {}  {}  {}",
-            crate::cli::inspect::local_time(use_.started_at),
-            if use_.pinned { "常驻" } else { "召回" },
-            use_.run_id,
-            use_.session_id
-        );
-    }
-    println!("\n用 `komo run inspect <run-id>` 看具体那一轮。");
-    Ok(())
-}
-
 pub async fn search(control: &OperatorControl, query: &str) -> anyhow::Result<()> {
     // The same hybrid query recall runs (lexical terms ∪ semantic vectors), not
     // a substring scan: an operator searching 智能设备 must find the memory
@@ -258,102 +220,6 @@ pub async fn pin(control: &OperatorControl, id: &str) -> anyhow::Result<()> {
     transition(control, id, MemoryTransitionAction::Pin).await?;
     println!("Pinned {id} into the L1 profile.");
     Ok(())
-}
-
-/// Memory quality report (roadmap §9): bucket the whole library by status and
-/// confidence, then surface the piles that need attention — candidates awaiting
-/// triage, the pinned L1 set, low-confidence actives, long-unused actives, and
-/// expired memories. Read-only; suggests `promote`/`reject`/`archive`/`pin`.
-///
-/// Recall counts (the dreaming usage signal) are shown per line; `komo dream`
-/// previews which candidates that signal would promote or archive.
-pub async fn report(control: &OperatorControl) -> anyhow::Result<()> {
-    let memories = load_all(control).await?;
-    if memories.is_empty() {
-        println!("(no memories)");
-        return Ok(());
-    }
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let total = memories.len();
-
-    // Counts by status, in lifecycle order.
-    println!("total: {total}");
-    println!("\nby status:");
-    for status in [
-        MemoryStatus::Candidate,
-        MemoryStatus::Active,
-        MemoryStatus::Archived,
-        MemoryStatus::Rejected,
-    ] {
-        let n = memories.iter().filter(|m| m.status == status).count();
-        if n > 0 {
-            println!("  {:<10} {n}", status.as_str());
-        }
-    }
-
-    println!("\nby confidence:");
-    for confidence in [
-        MemoryConfidence::UserWritten,
-        MemoryConfidence::Confirmed,
-        MemoryConfidence::Inferred,
-        MemoryConfidence::Extracted,
-    ] {
-        let n = memories
-            .iter()
-            .filter(|m| m.confidence == confidence)
-            .count();
-        if n > 0 {
-            println!("  {:<12} {n}", confidence.as_str());
-        }
-    }
-
-    // The piles that need an operator's eye.
-    let active = |m: &&Memory| m.status == MemoryStatus::Active;
-    let candidates: Vec<_> = memories
-        .iter()
-        .filter(|m| m.status == MemoryStatus::Candidate)
-        .collect();
-    let pinned: Vec<_> = memories.iter().filter(|m| m.pinned).collect();
-    let low_conf: Vec<_> = memories
-        .iter()
-        .filter(active)
-        .filter(|m| {
-            matches!(
-                m.confidence,
-                MemoryConfidence::Extracted | MemoryConfidence::Inferred
-            )
-        })
-        .collect();
-    // Active but never surfaced, or not surfaced in 90+ days — archival candidates.
-    const STALE_SECS: i64 = 90 * 24 * 60 * 60;
-    let mut unused: Vec<_> = memories
-        .iter()
-        .filter(active)
-        .filter(|m| m.last_used_at.is_none_or(|t| now - t > STALE_SECS))
-        .collect();
-    let expired: Vec<_> = memories.iter().filter(|m| m.is_expired(now)).collect();
-
-    report_bucket("candidates awaiting triage (→ promote/reject)", &candidates);
-    report_bucket("pinned into L1 profile", &pinned);
-    report_bucket("low-confidence active (extracted/inferred)", &low_conf);
-    unused.sort_by_key(|m| m.last_used_at.unwrap_or(0));
-    report_bucket("active, long unused (90d+ → consider archive)", &unused);
-    report_bucket("expired (past expires_at)", &expired);
-    Ok(())
-}
-
-/// Print a named bucket: a header with the count, then up to 10 sample lines.
-fn report_bucket(label: &str, items: &[&Memory]) {
-    if items.is_empty() {
-        return;
-    }
-    println!("\n{label}: {}", items.len());
-    for m in items.iter().take(10) {
-        println!("  {}", line(m));
-    }
-    if items.len() > 10 {
-        println!("  … and {} more", items.len() - 10);
-    }
 }
 
 fn line(m: &Memory) -> String {

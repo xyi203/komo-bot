@@ -22,7 +22,7 @@ use crate::domain::memory::{
 use crate::domain::message::Message;
 use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
 use crate::domain::repository::{MessageRepository, SessionEventRepository, SessionRepository};
-use crate::domain::run::{MemoryUse, Run, RunRepository, RunStep};
+use crate::domain::run::{Run, RunRepository, RunStep};
 use crate::domain::session::Session;
 use crate::domain::skill::Skill;
 use crate::domain::todo::SessionTodoRepository;
@@ -303,20 +303,6 @@ impl OperatorActions {
 
     pub async fn list_skills(&self) -> anyhow::Result<Vec<Skill>> {
         Ok(self.skills.list_active())
-    }
-
-    /// Which turns a memory reached the prompt of, newest first.
-    ///
-    /// The direction that gets asked after a memory turns out to be wrong:
-    /// what did it already shape? `Run.memories` answers the other way round
-    /// (this turn used these memories) and cannot be read backwards without
-    /// scanning every run.
-    pub async fn memory_used(
-        &self,
-        memory_id: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<MemoryUse>> {
-        self.runs.runs_using_memory(memory_id, limit).await
     }
 
     pub async fn pairing_views(&self) -> anyhow::Result<Vec<PairingView>> {

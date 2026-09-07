@@ -466,7 +466,7 @@ mod tests {
     use komo_core::domain::{
         cancel::CANCELLED_ERROR,
         message::Message,
-        run::{MemoryUse, RunStatus, RunStep},
+        run::{RunStatus, RunStep},
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -565,13 +565,6 @@ mod tests {
         }
         async fn reconcile_interrupted(&self, _now: i64) -> anyhow::Result<usize> {
             Ok(0)
-        }
-        async fn runs_using_memory(
-            &self,
-            _memory_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<MemoryUse>> {
-            Ok(Vec::new())
         }
     }
 

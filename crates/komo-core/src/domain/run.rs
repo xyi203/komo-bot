@@ -226,23 +226,6 @@ impl RecalledMemories {
     }
 }
 
-/// One occasion a stored memory reached a turn's prompt.
-///
-/// The reverse of [`Run::memories`], and the direction that actually gets
-/// asked: "I just corrected this memory — which answers did it already shape?"
-/// Kept as its own thin row rather than answered by scanning runs, because a
-/// `Run` carries up to two 4000-char fields and reading thousands of them to
-/// look at one JSON column is the wrong shape of query.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct MemoryUse {
-    pub memory_id: String,
-    pub run_id: String,
-    pub session_id: String,
-    /// Injected unconditionally (L1) rather than retrieved for this question.
-    pub pinned: bool,
-    pub started_at: i64,
-}
-
 /// One tool invocation within a run. `args`/`result` are stored verbatim
 /// (truncated), except that each tool may redact its own args before they reach
 /// the ledger (see [`crate::domain::tool::Tool::redact_args`]) — `shell` scrubs
@@ -410,13 +393,6 @@ pub trait RunRepository: Send + Sync {
     /// "open" and "dead" look identical in an append-only record, and only a
     /// process that has just started knows nothing of its own is running.
     async fn reconcile_interrupted(&self, now: i64) -> anyhow::Result<usize>;
-
-    /// The turns a given memory reached the prompt of, newest first.
-    async fn runs_using_memory(
-        &self,
-        memory_id: &str,
-        limit: usize,
-    ) -> anyhow::Result<Vec<MemoryUse>>;
 
     /// Finished runs the learning pass has not consumed yet ([`Run::learned`]),
     /// **oldest first** — learning replays a session in the order it happened,

@@ -354,15 +354,6 @@ enum MemoryAction {
         #[arg(long)]
         status: Option<String>,
     },
-    /// Which turns a memory reached the prompt of, newest first — the
-    /// question to ask after correcting one: what did it already shape?
-    Used {
-        /// Memory id (as shown by `memory list`)
-        id: String,
-        /// How many turns to show
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
     /// Substring search across all memories
     Search {
         /// Text to match in memory content
@@ -388,8 +379,6 @@ enum MemoryAction {
     /// Interactively triage the candidate pile (oldest first): p=promote,
     /// r=reject, s=skip, q=quit
     Triage,
-    /// Quality report: counts by status/confidence + piles needing triage
-    Report,
     /// Widen memories stranded in a per-conversation `api` scope to global, so
     /// recall can reach them again. Safe to re-run; chat-channel scopes are
     /// left alone.
@@ -610,12 +599,10 @@ pub async fn run() -> anyhow::Result<()> {
             match action {
                 MemoryAction::List { status } => memory::list(&control, status).await,
                 MemoryAction::Search { query } => memory::search(&control, &query).await,
-                MemoryAction::Used { id, limit } => memory::used(&control, &id, limit).await,
                 MemoryAction::Promote { ids } => memory::promote(&control, &ids).await,
                 MemoryAction::Reject { ids } => memory::reject(&control, &ids).await,
                 MemoryAction::Pin { id } => memory::pin(&control, &id).await,
                 MemoryAction::Triage => memory::triage(&control).await,
-                MemoryAction::Report => memory::report(&control).await,
                 MemoryAction::RepairScopes => memory::repair_scopes(&control).await,
                 MemoryAction::Backfill => memory::backfill(&control).await,
             }

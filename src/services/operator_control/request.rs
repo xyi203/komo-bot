@@ -8,7 +8,7 @@
 use crate::domain::{
     cron::{CronJob, CronJobSpec},
     memory::Memory,
-    run::{MemoryUse, Run, RunStep},
+    run::{Run, RunStep},
 };
 
 // The pure view DTOs (no domain dependency) live in `komo-core` so HTTP clients
@@ -36,7 +36,6 @@ pub enum OperatorQuery {
     /// without one the same scoring runs lexical-only.
     MemorySearch { query: String, limit: usize },
     /// Which turns a memory reached the prompt of.
-    MemoryUsed { id: String, limit: usize },
     /// Hash-free pairing rows.
     Pairings,
     /// The dreaming dry-run classification.
@@ -61,7 +60,6 @@ pub enum OperatorQueryResult {
     Sessions(Vec<SessionSummary>),
     Memories(Vec<Memory>),
     MemorySearch(Vec<Memory>),
-    MemoryUsed(Vec<MemoryUse>),
     Pairings(Vec<PairingView>),
     DreamPreview(DreamReport),
     HomeOverride(Option<String>),

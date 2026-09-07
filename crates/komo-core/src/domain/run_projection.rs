@@ -27,8 +27,7 @@ use super::cancel::CANCELLED_ERROR;
 use super::run::{RUN_FIELD_CAP, Run, RunStatus, RunStep, truncate};
 use super::session_event::{MessageSource, SessionEvent, SessionEventKind, ToolOutcome};
 
-/// Where a folded ledger lands: the query tables `komo run` and
-/// `memory used` read.
+/// Where a folded ledger lands: the query tables `komo run` reads.
 ///
 /// The write half of this module. A commit is **idempotent** — it is replayed
 /// after every turn and again by a full rebuild, over rows that may already

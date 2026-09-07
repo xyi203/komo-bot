@@ -46,7 +46,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use komo_core::domain::run::RunStatus;
-    use komo_core::domain::run::{MemoryUse, Run, RunStep};
+    use komo_core::domain::run::{Run, RunStep};
 
     /// A ledger holding hand-built runs and steps, keyed by run id.
     struct FakeRuns {
@@ -97,13 +97,6 @@ mod tests {
         }
         async fn previous_in_session(&self, _run_id: &str) -> anyhow::Result<Option<Run>> {
             Ok(None)
-        }
-        async fn runs_using_memory(
-            &self,
-            _memory_id: &str,
-            _limit: usize,
-        ) -> anyhow::Result<Vec<MemoryUse>> {
-            Ok(Vec::new())
         }
     }
 

@@ -122,8 +122,6 @@ The agent can call these during a chat turn:
 ## Data Layout
 
 Everything lives in `~/.komo/` by default, or under `KOMO_HOME` when set.
-`komo gateway start/restart` unloads the former launchd job before installing
-`com.komo.gateway`.
 
 | Path | Purpose | Durability |
 |---|---|---|

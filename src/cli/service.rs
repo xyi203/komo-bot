@@ -90,7 +90,6 @@ mod launchd {
     use std::process::Command;
 
     const LABEL: &str = "com.komo.gateway";
-    const LEGACY_LABEL: &str = "com.shion.gateway";
     const BUNDLE_INFO: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/resources/macos/Info.plist"
@@ -276,7 +275,7 @@ mod launchd {
     }
 
     pub(super) fn is_loaded(domain: &str) -> bool {
-        is_label_loaded(domain, LABEL) || is_label_loaded(domain, LEGACY_LABEL)
+        is_label_loaded(domain, LABEL)
     }
 
     /// Poll until launchd has fully unloaded the service, returning whether it did
@@ -321,9 +320,6 @@ mod launchd {
     /// Write the plist and bootstrap it into the user's gui domain.
     pub fn start() -> anyhow::Result<()> {
         let domain = gui_domain()?;
-        if unload(&domain, LEGACY_LABEL)? {
-            tracing::info!("migrated legacy launchd gateway to {LABEL}");
-        }
         if is_label_loaded(&domain, LABEL) {
             tracing::info!(
                 "komo gateway is already running under launchd. Use `komo gateway restart` to restart it."
@@ -372,9 +368,7 @@ mod launchd {
     /// Remove the service from launchd (stops the process and disables auto-restart).
     pub fn stop() -> anyhow::Result<()> {
         let domain = gui_domain()?;
-        let current = unload(&domain, LABEL)?;
-        let legacy = unload(&domain, LEGACY_LABEL)?;
-        if !current && !legacy {
+        if !unload(&domain, LABEL)? {
             println!("komo gateway is not running under launchd.");
             return Ok(());
         }
@@ -387,7 +381,6 @@ mod launchd {
     pub fn restart() -> anyhow::Result<()> {
         let domain = gui_domain()?;
         unload(&domain, LABEL)?;
-        unload(&domain, LEGACY_LABEL)?;
         start()
     }
 
@@ -396,12 +389,6 @@ mod launchd {
         let domain = gui_domain()?;
         let out = launchctl(&["print", &format!("{domain}/{LABEL}")])?;
         if !out.status.success() {
-            if is_label_loaded(&domain, LEGACY_LABEL) {
-                println!(
-                    "komo gateway: legacy launchd job is loaded; run `komo gateway restart` to migrate it."
-                );
-                return Ok(());
-            }
             println!("komo gateway: not loaded (run `komo gateway start`).");
             return Ok(());
         }

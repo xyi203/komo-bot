@@ -254,11 +254,8 @@ ADR 0004 合库之前的说法，已作废：`cron_job_records` 现在在 `komo.
 - 老列 `schedule` / `last_run_at` / `last_status` / `last_output` / `last_run_session`
   **留在表里也留在 model 里**（durable 表不能删列，而 `NOT NULL` 无默认值的列一旦不再出现在
   INSERT 里就会让每次写入失败），新写入一律写空值；
-- 连接时一次性回填（`backfill_triggers`，紧挨 `ensure_columns`）：`trigger = ''` 的行按老
-  `schedule` 算出 `Cron` 或 `At`，`last_*` 拼成一条 `RoutineRun`。只动 `trigger = ''` 的行，
-  所以幂等。
-- **这是一次性 repair，不是读路径上的 fallback**：读路径只认新列，下游没有任何地方需要判断
-  一行是哪个形状写的。
+- 老形状的行曾由连接时的一次性回填补成新列；那段代码在唯一部署跑过之后已经删除。读路径只认
+  新列，下游没有任何地方需要判断一行是哪个形状写的。
 
 ### 3.6 Session 投影新增 `awaiting`
 

@@ -18,15 +18,11 @@ interface Gateway {
   key: string;
 }
 
-/** Resolve ~/.komo, honoring KOMO_HOME / SHION_HOME and the .shion legacy dir. */
+/** Resolve ~/.komo, honoring KOMO_HOME. */
 function komoHome(): string {
-  const env = process.env.KOMO_HOME || process.env.SHION_HOME;
+  const env = process.env.KOMO_HOME;
   if (env && env.length > 0) return env;
-  const home = os.homedir();
-  const current = path.join(home, ".komo");
-  const legacy = path.join(home, ".shion");
-  if (!fs.existsSync(current) && fs.existsSync(legacy)) return legacy;
-  return current;
+  return path.join(os.homedir(), ".komo");
 }
 
 /** Read the gateway rendezvous file, or null if absent/unparseable. */

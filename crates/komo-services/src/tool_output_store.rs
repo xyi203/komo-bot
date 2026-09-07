@@ -41,12 +41,6 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// one-word lines; a screen of those teaches the model less than the two ends do.
 const MAX_PREVIEW_LINES: usize = 2000;
 
-/// Per-session metadata journal: one JSON line per stored output.
-/// A metadata journal earlier komo versions wrote beside the outputs. Nothing
-/// writes it any more; the sweep deletes one it finds so the directory holds
-/// only outputs.
-const LEGACY_INDEX_FILE: &str = "index.jsonl";
-
 /// A tool result sized for the model, plus the full-output files it left behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bounded {
@@ -163,13 +157,6 @@ impl ToolOutputStore {
             };
             let mut left = 0;
             for file in files.flatten() {
-                // A leftover index from a komo that still wrote one: it is not
-                // an output, nothing reads it, and it must not keep an
-                // otherwise-empty directory alive.
-                if file.file_name().to_str() == Some(LEGACY_INDEX_FILE) {
-                    let _ = std::fs::remove_file(file.path());
-                    continue;
-                }
                 if expired(&file.path()) {
                     match std::fs::remove_file(file.path()) {
                         Ok(()) => removed += 1,
@@ -443,24 +430,6 @@ mod tests {
     }
 
     #[test]
-    fn a_leftover_index_file_is_swept_away() {
-        // Written by an earlier komo. Nothing reads it, so the sweep removes it
-        // outright rather than letting it age out beside real outputs.
-        let store = store("legacy_index");
-        let dir = store.root().join("cli-1");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(LEGACY_INDEX_FILE), "{}\n").unwrap();
-        let fresh = dir.join("fresh.txt");
-        std::fs::write(&fresh, "new").unwrap();
-
-        store.sweep();
-
-        assert!(!dir.join(LEGACY_INDEX_FILE).exists());
-        assert!(fresh.exists(), "a live output must survive");
-        let _ = std::fs::remove_dir_all(store.root());
-    }
-
-    #[test]
     fn a_stored_output_writes_only_its_own_file() {
         let store = store("no_index");
         let body = "x".repeat(2048);
@@ -480,9 +449,6 @@ mod tests {
         let store = store("empty_dir");
         let dir = store.root().join("cli-1");
         std::fs::create_dir_all(&dir).unwrap();
-        // A leftover index must not keep the directory alive once every output
-        // has expired.
-        std::fs::write(dir.join(LEGACY_INDEX_FILE), "{}\n").unwrap();
         let stale = dir.join("stale.txt");
         std::fs::write(&stale, "old").unwrap();
         std::fs::File::open(&stale)

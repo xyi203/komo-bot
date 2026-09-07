@@ -37,13 +37,14 @@ use komo_services::tool_execution::{
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Tools a program may not call, whatever the catalog says.
+/// Tools python may not call, whatever the catalog says — from a program or
+/// from a plugin's own `@tool` function, which composes them the same way.
 ///
 /// `run_code` itself, because a program spawning a program buys nothing and
 /// costs an unbounded recursion; `ask_user`, because it suspends the *turn* on
 /// a human answer and a program is not a turn — the sentinel would resolve into
 /// a mid-program value nobody is waiting for.
-const NOT_CALLABLE: &[&str] = &["run_code", "ask_user"];
+pub(crate) const NOT_CALLABLE: &[&str] = &["run_code", "ask_user"];
 
 #[derive(Deserialize)]
 struct Args {
@@ -116,22 +117,8 @@ impl Tool for RunCodeTool {
                 "the tool executor is gone; `run_code` cannot dispatch"
             )));
         };
-        // The program's calls join *this* turn: same session, same approver,
-        // and the same ledger run — so every sub-call is audited individually
-        // and the turn's per-call budget keeps counting across them, which is
-        // what bounds a runaway program.
-        //
-        // The *output* budget is not shared, and deliberately: it exists to
-        // bound what enters the model's context, and a sub-call's result enters
-        // the program, not the context. Only what the program returns is paid
-        // for. Each result is still capped individually by the executor, exactly
-        // as a direct call would be.
-        let turn = ToolTurnContext {
-            session: ctx.session.clone(),
-            run: ctx.run.clone(),
-            budget: TurnResultBudget::new(0),
-            spin: SpinDetector::default(),
-        };
+        // The program's calls join *this* turn — see `sub_turn`.
+        let turn = sub_turn(ctx);
 
         let callable = executor.snapshot();
         let outcome = host
@@ -192,12 +179,29 @@ fn elide_source(args: &str) -> String {
     format!("{head}…[{elided} bytes elided]")
 }
 
-/// Run one tool call a program made, through the executor.
+/// The turn a nested call joins: the caller's own session, run and approver,
+/// so every `tools.x(...)` is audited individually and the turn's per-call
+/// budget keeps counting across them — which is what bounds a runaway program.
 ///
-/// Returns `Err(text)` for a call the program should see as a failure — an
+/// The *output* budget is not shared, and deliberately: it exists to bound what
+/// enters the model's context, and a sub-call's result enters the program, not
+/// the context. Only what the program returns is paid for. Each result is still
+/// capped individually by the executor, exactly as a direct call would be.
+pub(crate) fn sub_turn(ctx: &ToolContext) -> ToolTurnContext {
+    ToolTurnContext {
+        session: ctx.session.clone(),
+        run: ctx.run.clone(),
+        budget: TurnResultBudget::new(0),
+        spin: SpinDetector::default(),
+    }
+}
+
+/// Run one tool call python made, through the executor.
+///
+/// Returns `Err(text)` for a call the caller should see as a failure — an
 /// unknown or forbidden name, or a tool that errored. The host turns that into
-/// a `ToolError` the program may catch.
-async fn dispatch(
+/// a `ToolError` the python side may catch.
+pub(crate) async fn dispatch(
     executor: &komo_services::tool_execution::ToolExecutor,
     turn: &ToolTurnContext,
     callable: &Arc<CatalogSnapshot>,

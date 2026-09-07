@@ -133,15 +133,16 @@ class Text(str):
 
 
 class Tools:
-    """The `tools` object a program calls komo's own tools through.
+    """The broker a program — or a plugin function — calls komo's tools through.
 
-    Every attribute is a callable that dispatches back to komo, so `tools`
-    mirrors whatever the calling turn was offered without this file knowing a
-    single tool name.
+    Every attribute is a callable that dispatches back to komo, so it mirrors
+    whatever the calling turn was offered without this file knowing a single
+    tool name. The request id it carries is what keeps two callers' calls from
+    crossing.
     """
 
-    def __init__(self, run_id):
-        self._run_id = run_id
+    def __init__(self, request_id):
+        self._request_id = request_id
 
     def __getattr__(self, name):
         def call(*args, **kwargs):
@@ -156,7 +157,7 @@ class Tools:
                 )
             result = ask_komo(
                 "tool/call",
-                {"run": self._run_id, "name": name, "args": kwargs},
+                {"run": self._request_id, "name": name, "args": kwargs},
             )
             if result.get("is_error"):
                 raise ToolError(name, result.get("content", ""))
@@ -306,8 +307,13 @@ def handle(request, plugins: Plugins):
     if method == "call":
         name = params.get("name", "")
         args = params.get("args") or {}
+        # The same broker a program gets, tagged with this request's id: a
+        # plugin function is a program somebody kept, so it composes komo's
+        # tools the same way.
         with stdout_to_stderr():
-            return {"content": komo_plugin.call(name, args)}
+            return {
+                "content": komo_plugin.call(name, args, Tools(request.get("id")))
+            }
 
     if method == "run_code":
         return run_program(params.get("source", ""), request.get("id"))

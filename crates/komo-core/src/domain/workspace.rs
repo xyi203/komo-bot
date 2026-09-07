@@ -6,6 +6,7 @@ pub struct Workspace {
     roots: Vec<PathBuf>,
     readonly_roots: Vec<PathBuf>,
     artifacts_root: Option<PathBuf>,
+    plugins_root: Option<PathBuf>,
     unrestricted_reads: bool,
 }
 
@@ -16,6 +17,7 @@ impl Workspace {
             roots,
             readonly_roots: Vec::new(),
             artifacts_root: None,
+            plugins_root: None,
             unrestricted_reads: false,
         }
     }
@@ -46,6 +48,19 @@ impl Workspace {
         self
     }
 
+    /// Add komo's own plugin directory (`$KOMO_HOME/plugins`), which a turn may
+    /// **write** — that is how the agent authors a tool of its own.
+    ///
+    /// Writable like [`with_artifacts`](Self::with_artifacts), and nothing like
+    /// it in consequence: a `.py` file here is loaded into the plugin host and
+    /// runs unsandboxed on every later turn, unattended routines included. So
+    /// the tools ask [`is_plugin_path`](Self::is_plugin_path) and gate a write
+    /// here at `Risk::Dangerous` — approved by a human, once, per write.
+    pub fn with_plugins(mut self, root: PathBuf) -> Self {
+        self.plugins_root = Some(root);
+        self
+    }
+
     /// Permit reads from any local path while keeping every mutation confined to
     /// [`roots`](Self::roots). The caller is still responsible for applying the
     /// file-read permission policy before exposing content.
@@ -67,6 +82,20 @@ impl Workspace {
     /// The artifacts root, so a derived workspace carries it over.
     pub fn artifacts_root(&self) -> Option<&Path> {
         self.artifacts_root.as_deref()
+    }
+
+    /// The plugins root, so a derived workspace carries it over.
+    pub fn plugins_root(&self) -> Option<&Path> {
+        self.plugins_root.as_deref()
+    }
+
+    /// Whether `path` lands in the plugin directory — the one writable root
+    /// whose contents komo itself later executes.
+    pub fn is_plugin_path(&self, path: &Path) -> bool {
+        let Some(root) = &self.plugins_root else {
+            return false;
+        };
+        self.resolve(path).starts_with(root)
     }
 
     /// Whether reads may reach paths outside the workspace and named read-only
@@ -109,13 +138,14 @@ impl Workspace {
         .then_some(resolved)
     }
 
-    /// Every root a mutation may land in: the workspace's own, plus the artifacts
-    /// directory when one is configured.
+    /// Every root a mutation may land in: the workspace's own, plus komo's
+    /// artifacts and plugin directories when they are configured.
     fn writable(&self) -> impl Iterator<Item = &Path> {
         self.roots
             .iter()
             .map(PathBuf::as_path)
             .chain(self.artifacts_root.as_deref())
+            .chain(self.plugins_root.as_deref())
     }
 
     fn resolve(&self, path: &Path) -> PathBuf {
@@ -208,6 +238,33 @@ mod tests {
             ws.resolve_contained(Path::new("notes.txt")).unwrap(),
             PathBuf::from("/home/user/project/notes.txt")
         );
+    }
+
+    /// The plugin directory is writable — that is how the agent authors a tool
+    /// — and recognizable, because a write there is the one file mutation that
+    /// installs code komo will later run itself.
+    #[test]
+    fn the_plugins_root_is_writable_and_names_itself() {
+        let ws = Workspace::new(vec![PathBuf::from("/home/user/project")])
+            .with_artifacts(PathBuf::from("/home/user/.komo/artifacts"))
+            .with_plugins(PathBuf::from("/home/user/.komo/plugins"));
+        let plugin = Path::new("/home/user/.komo/plugins/notes.py");
+
+        assert!(ws.resolve_contained(plugin).is_some());
+        assert!(ws.is_plugin_path(plugin));
+        // Every other writable path is an ordinary write, including the
+        // artifacts root beside it and a traversal that leaves the directory.
+        assert!(!ws.is_plugin_path(Path::new("src/main.rs")));
+        assert!(!ws.is_plugin_path(Path::new("/home/user/.komo/artifacts/s1/report.md")));
+        assert!(!ws.is_plugin_path(Path::new("/home/user/.komo/plugins/../komo.db")));
+        // Confinement is unchanged: the root's parent is still out.
+        assert!(
+            ws.resolve_contained(Path::new("/home/user/.komo/plugins/../permissions.json"))
+                .is_none()
+        );
+        // A workspace without one classifies nothing as a plugin write.
+        let plain = Workspace::new(vec![PathBuf::from("/home/user/project")]);
+        assert!(!plain.is_plugin_path(plugin));
     }
 
     #[test]

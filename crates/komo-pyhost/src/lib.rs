@@ -158,9 +158,10 @@ pub struct PyHost {
 struct Inner {
     /// Request id → where its response goes. The reader task drains this.
     pending: Mutex<HashMap<i64, oneshot::Sender<Result<serde_json::Value, PyHostError>>>>,
-    /// `run_code` request id → where that program's tool calls go. A program
-    /// tags every call with the run it belongs to, which is what lets two turns
-    /// run code over one host without their calls crossing.
+    /// Request id → where the callbacks of the handler running it go. Every
+    /// call the host originates is tagged with the request it belongs to, which
+    /// is what lets two programs (or two plugin tools) run over one host
+    /// without their calls crossing.
     code_runs: Mutex<HashMap<i64, mpsc::UnboundedSender<ToolRequest>>>,
     next_id: AtomicI64,
     outbound: mpsc::UnboundedSender<String>,
@@ -279,9 +280,29 @@ impl PyHost {
     }
 
     /// Run one plugin tool. The returned string is what the model sees.
-    pub async fn call(&self, name: &str, args: serde_json::Value) -> Result<String, PyHostError> {
+    ///
+    /// `dispatch` is the same broker a program gets (see [`run_code`]): a
+    /// plugin function's `tools.read(path=...)` is one invocation of it. A
+    /// plugin *is* a program somebody kept, so it reaches komo's own tools the
+    /// same way and pays the same approval, ledger and cap.
+    ///
+    /// [`run_code`]: Self::run_code
+    pub async fn call<F, Fut>(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        dispatch: F,
+    ) -> Result<String, PyHostError>
+    where
+        F: Fn(String, serde_json::Value) -> Fut,
+        Fut: std::future::Future<Output = Result<ToolAnswer, String>>,
+    {
         let value = self
-            .request("call", serde_json::json!({ "name": name, "args": args }))
+            .serving(
+                "call",
+                serde_json::json!({ "name": name, "args": args }),
+                dispatch,
+            )
             .await?;
         Ok(value
             .get("content")
@@ -306,6 +327,33 @@ impl PyHost {
         F: Fn(String, serde_json::Value) -> Fut,
         Fut: std::future::Future<Output = Result<ToolAnswer, String>>,
     {
+        let value = self
+            .serving(
+                "run_code",
+                serde_json::json!({ "source": source }),
+                dispatch,
+            )
+            .await?;
+        serde_json::from_value(value)
+            .map_err(|error| PyHostError::Plugin(format!("malformed program result: {error}")))
+    }
+
+    /// One request whose handler may call back into komo, serviced until it
+    /// answers.
+    ///
+    /// The request's own id is what the host tags each call with, which is what
+    /// lets two of these run over one host without their calls crossing —
+    /// whether they are two programs, two plugin tools, or one of each.
+    async fn serving<F, Fut>(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+        dispatch: F,
+    ) -> Result<serde_json::Value, PyHostError>
+    where
+        F: Fn(String, serde_json::Value) -> Fut,
+        Fut: std::future::Future<Output = Result<ToolAnswer, String>>,
+    {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
         let (calls_tx, mut calls_rx) = mpsc::unbounded_channel();
@@ -319,23 +367,23 @@ impl PyHost {
 
         if let Err(error) = self.send(serde_json::json!({
             "id": id,
-            "method": "run_code",
-            "params": { "source": source },
+            "method": method,
+            "params": params,
         })) {
             cleanup().await;
             return Err(error);
         }
 
-        // Service the program's calls until it answers. One at a time, which is
-        // what the host does anyway — a synchronous program blocks on each call
-        // — and what keeps a program's side effects in the order it wrote them.
+        // Service the callbacks until the handler answers. One at a time, which
+        // is what the host does anyway — synchronous python blocks on each call
+        // — and what keeps the side effects in the order they were written.
         tokio::pin!(response_rx);
         let outcome = loop {
             tokio::select! {
                 answer = &mut response_rx => break match answer {
                     Ok(result) => result,
                     Err(_) => Err(PyHostError::Unavailable(
-                        "the plugin host exited before the program finished".into(),
+                        "the plugin host exited before finishing".into(),
                     )),
                 },
                 Some(request) = calls_rx.recv() => {
@@ -347,7 +395,7 @@ impl PyHost {
                         ),
                     };
                     // Answer even if the send fails: a host that went away is
-                    // about to fail the program's response too.
+                    // about to fail the response too.
                     let _ = self.send(serde_json::json!({
                         "id": request.id,
                         "result": {
@@ -360,10 +408,7 @@ impl PyHost {
             }
         };
         cleanup().await;
-
-        let value = outcome?;
-        serde_json::from_value(value)
-            .map_err(|error| PyHostError::Plugin(format!("malformed program result: {error}")))
+        outcome
     }
 
     /// Ask the host to exit, then wait briefly for it. Dropping the handle also
@@ -561,11 +606,11 @@ async fn read_loop(
     let _ = events.send(HostEvent::Exited { status });
 }
 
-/// Hand a program's tool call to the `run_code` invocation that owns it.
+/// Hand a tool call back to the request that owns it.
 ///
-/// A call whose run is unknown is answered rather than dropped: the program is
-/// blocked on it, and a program hung forever is worse than one told its call
-/// went nowhere.
+/// A call whose request is unknown is answered rather than dropped: the python
+/// side is blocked on it, and a plugin hung forever is worse than one told its
+/// call went nowhere.
 async fn route_tool_call(inner: &Arc<Inner>, id: i64, message: &serde_json::Value) {
     let params = message.get("params");
     let run = params
@@ -590,11 +635,11 @@ async fn route_tool_call(inner: &Arc<Inner>, id: i64, message: &serde_json::Valu
             let _ = sender.send(ToolRequest { id, name, args });
         }
         None => {
-            warn!(id, ?run, tool = %name, "tool call from an unknown program run");
+            warn!(id, ?run, tool = %name, "tool call from an unknown request");
             let _ = inner.outbound.send(
                 serde_json::json!({
                     "id": id,
-                    "error": { "message": "this program run is no longer active" },
+                    "error": { "message": "this request is no longer active" },
                 })
                 .to_string(),
             );
@@ -657,6 +702,15 @@ mod tests {
         }
     }
 
+    /// A broker no plugin under test reaches for. `call` takes one because a
+    /// plugin function may compose komo's tools; most of these do not.
+    fn no_calls(
+        name: String,
+        _args: serde_json::Value,
+    ) -> std::future::Ready<Result<ToolAnswer, String>> {
+        std::future::ready(Err(format!("`{name}` is not available in this test")))
+    }
+
     const GREETER: &str = r#"
 from komo_plugin import tool
 
@@ -692,7 +746,7 @@ def greet(name: str, excited: bool = False) -> str:
         assert_eq!(tools[0].parameters["required"], serde_json::json!(["name"]));
 
         let out = host
-            .call("greet", serde_json::json!({ "name": "komo" }))
+            .call("greet", serde_json::json!({ "name": "komo" }), no_calls)
             .await
             .unwrap();
         assert_eq!(out, "hello komo");
@@ -700,6 +754,7 @@ def greet(name: str, excited: bool = False) -> str:
             .call(
                 "greet",
                 serde_json::json!({ "name": "komo", "excited": true }),
+                no_calls,
             )
             .await
             .unwrap();
@@ -736,14 +791,16 @@ def fine() -> str:
         host.manifest().await.unwrap();
 
         let error = host
-            .call("boom", serde_json::json!({}))
+            .call("boom", serde_json::json!({}), no_calls)
             .await
             .expect_err("a raising tool is an error");
         assert!(format!("{error}").contains("kaboom"), "{error}");
         assert!(!error.retryable(), "the plugin already rejected this call");
 
         assert_eq!(
-            host.call("fine", serde_json::json!({})).await.unwrap(),
+            host.call("fine", serde_json::json!({}), no_calls)
+                .await
+                .unwrap(),
             "ok"
         );
         host.shutdown().await;
@@ -795,7 +852,7 @@ def fine() -> str:
 
         // And it is callable straight away, without asking for the manifest.
         assert_eq!(
-            host.call("greet", serde_json::json!({ "name": "you" }))
+            host.call("greet", serde_json::json!({ "name": "you" }), no_calls)
                 .await
                 .unwrap(),
             "hello you"
@@ -830,11 +887,130 @@ def chatty() -> str:
             .unwrap();
         assert_eq!(host.manifest().await.unwrap().tools.len(), 1);
         assert_eq!(
-            host.call("chatty", serde_json::json!({})).await.unwrap(),
+            host.call("chatty", serde_json::json!({}), no_calls)
+                .await
+                .unwrap(),
             "answered"
         );
         // Still healthy after all that noise.
         assert_eq!(host.manifest().await.unwrap().tools.len(), 1);
+        host.shutdown().await;
+    }
+
+    /// The point of a plugin over a one-off program: it composes komo's own
+    /// tools, and keeps doing it. A `@tool` function reaches them through the
+    /// same `tools` object a program gets, brokered back over the same
+    /// connection.
+    #[tokio::test]
+    async fn a_plugin_tool_calls_komo_tools_through_the_same_broker() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("plugin-tools");
+        scratch.write(
+            "clock.py",
+            r#"
+from komo_plugin import tool, tools
+
+@tool("Say what time komo thinks it is.")
+def now() -> str:
+    answer = tools.time()
+    return f"komo says {answer} (zone {answer.structured['zone']})"
+"#,
+        );
+
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+        assert_eq!(host.manifest().await.unwrap().tools[0].name, "now");
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = seen.clone();
+        let out = host
+            .call("now", serde_json::json!({}), move |name, args| {
+                recorder.lock().unwrap().push((name, args));
+                std::future::ready(Ok(ToolAnswer {
+                    content: "09:00".to_string(),
+                    structured: serde_json::json!({ "zone": "Asia/Shanghai" }),
+                }))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(out, "komo says 09:00 (zone Asia/Shanghai)");
+        // It reached komo as a real tool call, so it pays the same gating a
+        // direct one does.
+        let calls = seen.lock().unwrap().clone();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "time");
+
+        host.shutdown().await;
+    }
+
+    /// A plugin tool and a program over one host must not have their calls
+    /// crossed — the request id each call carries is what keeps them apart.
+    #[tokio::test]
+    async fn a_plugin_tool_and_a_program_keep_their_calls_apart() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("plugin-tools-concurrent");
+        scratch.write(
+            "echo.py",
+            r#"
+from komo_plugin import tool, tools
+
+@tool("Echo what komo answers.")
+def echo() -> str:
+    return str(tools.whoami())
+"#,
+        );
+
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+        host.manifest().await.unwrap();
+
+        let plugin = host.call("echo", serde_json::json!({}), |_n, _a| {
+            std::future::ready(Ok(ToolAnswer::text("plugin")))
+        });
+        let program = host.run_code("return tools.whoami()", |_n, _a| {
+            std::future::ready(Ok(ToolAnswer::text("program")))
+        });
+        let (plugin, program) = tokio::join!(plugin, program);
+        assert_eq!(plugin.unwrap(), "plugin");
+        assert_eq!(program.unwrap().result.unwrap(), "program");
+
+        host.shutdown().await;
+    }
+
+    /// `tools` at import time has no call to dispatch into. It must fail the
+    /// import — the same treatment any other broken plugin gets — rather than
+    /// block the host waiting on an answer nobody is coming to give.
+    #[tokio::test]
+    async fn using_tools_at_import_time_fails_the_import_rather_than_hanging() {
+        let Some(python) = python() else { return };
+        let scratch = Scratch::new("plugin-tools-import");
+        scratch.write("good.py", GREETER);
+        scratch.write(
+            "eager.py",
+            r#"
+from komo_plugin import tool, tools
+
+tools.time()
+
+@tool("Never reached — the module raises above.")
+def unreachable() -> str:
+    return "unreachable"
+"#,
+        );
+
+        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+            .await
+            .unwrap();
+        let tools = host.manifest().await.unwrap().tools;
+        assert_eq!(
+            tools.len(),
+            1,
+            "the broken file costs itself and nothing else: {tools:?}"
+        );
+        assert_eq!(tools[0].name, "greet");
         host.shutdown().await;
     }
 
@@ -1115,7 +1291,7 @@ def die() -> str:
         host.manifest().await.unwrap();
 
         let error = host
-            .call("die", serde_json::json!({}))
+            .call("die", serde_json::json!({}), no_calls)
             .await
             .expect_err("the host died mid-call");
         assert!(error.retryable(), "the call never completed: {error}");

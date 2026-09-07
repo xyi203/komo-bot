@@ -89,11 +89,6 @@ impl Catalogs {
             Runtime::Cron => &self.0[2],
         }
     }
-
-    /// Every catalog, for a mount that reaches all three runtimes.
-    fn all(&self) -> Vec<Arc<ToolCatalog>> {
-        self.0.to_vec()
-    }
 }
 
 /// A wired agent plus the handles background work needs (sessions for sweeping,
@@ -271,15 +266,20 @@ pub async fn build(
     let artifacts = Arc::new(ArtifactStore::new(config.runtime.home.join("artifacts")));
 
     // Mutations and shell workdirs remain confined to the current working
-    // directory plus the artifacts root. Local files are readable from any
-    // directory (subject to the file-read permission policy); both managed roots
-    // are retained for session-derived workspaces as well.
+    // directory plus komo's own two writable roots. Local files are readable
+    // from any directory (subject to the file-read permission policy); every
+    // managed root is retained for session-derived workspaces as well.
     let mut readonly_roots = config.runtime.readable_roots.clone();
     readonly_roots.push(output_store.root().to_path_buf());
     let workspace = Arc::new(
         Workspace::current_dir()?
             .with_readonly(readonly_roots)
             .with_artifacts(artifacts.root().to_path_buf())
+            // The other writable root, and the only one whose contents komo
+            // itself runs: a `.py` file here becomes a tool. Writes to it are
+            // `Risk::Dangerous` (see `fs_common::write_request`), so authoring
+            // a plugin is a thing the operator approves, one file at a time.
+            .with_plugins(config.runtime.home.join("plugins"))
             .with_unrestricted_reads(),
     );
 
@@ -459,15 +459,21 @@ pub async fn build(
     // plugin host — which can gain a tool the moment a file is written — has
     // somewhere to mount into while the process runs.
     let catalogs = Catalogs::new();
-    // Plugin tools reach every tool-wielding runtime, so the host mounts into
-    // all three catalogs. `None` = no host, which costs `run_code` and the
-    // `py__` tools and nothing else.
-    let pyhost = crate::pyhost::start(
+    // Whether a plugin host can run here at all. Asked now because it decides
+    // whether `run_code` is registered below; the host itself is started once
+    // the executors exist, since a plugin tool dispatches its own tool calls
+    // through the executor of the runtime it was mounted into.
+    let plugins_dir = crate::pyhost::available(
         &config.runtime.home,
         config.runtime.pyhost_enabled,
         &config.runtime.policy.policy,
-        catalogs.all(),
     );
+    // The slot `run_code` holds, filled by the supervisor once a host has
+    // answered. `None` = no host, which costs `run_code` and the `py__` tools
+    // and nothing else.
+    let pyhost = plugins_dir.is_some().then(komo_pyhost::SharedHost::default);
+    // Where the host's tools go, collected as each runtime's executor is built.
+    let mut mounts: Vec<crate::pyhost::PluginMount> = Vec::new();
 
     // Keep the always-on preamble small: list a bounded catalog, the rest is
     // discoverable on demand via the `skill` tool.
@@ -548,23 +554,13 @@ pub async fn build(
     // disagree about what a program may call.
     let code_note_for = |tools: &ToolExecutor| -> Option<String> {
         let snapshot = tools.snapshot();
-        let note = snapshot
+        snapshot
             .get("run_code")
             .is_some()
             .then(|| komo_tools::run_code::sdk_note(&snapshot))
-            .flatten()?;
-        // The *actual* plugins directory, because the model otherwise guesses:
-        // "~/.komo/plugins" is only the default, and under Docker the home is
-        // /data — a deployment lost a round of turns to exactly that guess.
-        // Byte-stable per deployment (the home never changes at runtime), so
-        // the prompt cache is untouched.
-        Some(format!(
-            "{note}\nDurable composition belongs in a plugin: a `*.py` file with \
-             `@tool` functions saved into `{}` is hot-loaded within seconds and \
-             becomes a `py__<name>` tool — no restart.",
-            config.runtime.home.join("plugins").display()
-        ))
+            .flatten()
     };
+
     let tool_names_of = |tools: &ToolExecutor| -> Vec<String> {
         tools
             .definitions()
@@ -587,6 +583,7 @@ pub async fn build(
     //   - it shares the run ledger, so each delegation is auditable on its own.
     // No memory enricher: a sub-agent is a worker, not the user's assistant.
     let subagent_tools = executor_for(Runtime::Subagent, approver.clone(), None);
+    mounts.push(crate::pyhost::PluginMount::of(&subagent_tools));
     let subagent_tool_names = tool_names_of(&subagent_tools);
     let subagent_note = skills_note_for(&subagent_tool_names);
     let subagent_builder = Arc::new(
@@ -594,6 +591,7 @@ pub async fn build(
             .tools(subagent_tool_names)
             .skills_note(subagent_note)
             .code_note(code_note_for(&subagent_tools))
+            .plugins_dir(plugins_dir.clone())
             .workspace_root(Some(root.clone())),
     );
     let subagent_preamble: PreambleFn = Arc::new(move || subagent_builder.build());
@@ -665,6 +663,7 @@ pub async fn build(
     // scope runs on a synthetic session (delegate, cron), and a transcript file
     // per one-shot turn is litter, not history.
     let tools = executor_for(Runtime::Main, approver.clone(), Some(delegate));
+    mounts.push(crate::pyhost::PluginMount::of(&tools));
 
     // Assemble the tiered system prompt: stable identity + tool-aware guidance
     // (gated on the tools actually loaded) + skills catalog, then the workspace
@@ -678,6 +677,7 @@ pub async fn build(
             .tools(tool_names)
             .skills_note(main_note)
             .code_note(code_note_for(&tools))
+            .plugins_dir(plugins_dir.clone())
             .workspace_root(Some(root.clone()))
             // The main agent fields "how do I configure Komo" questions, so it
             // gets the built-in platform manual (wechat login, pairing, …).
@@ -747,6 +747,7 @@ pub async fn build(
     // anyway, just less legibly. A cron job that needs a sub-agent should say so
     // explicitly (its own runtime with the unattended approver), not inherit one.
     let cron_tools = executor_for(Runtime::Cron, cron_approver, None);
+    mounts.push(crate::pyhost::PluginMount::of(&cron_tools));
     let cron_tool_names = tool_names_of(&cron_tools);
     // No operations_manual / user_profile: the cron agent is a background task
     // executor, not the user-facing assistant.
@@ -756,6 +757,7 @@ pub async fn build(
             .tools(cron_tool_names)
             .skills_note(cron_note)
             .code_note(code_note_for(&cron_tools))
+            .plugins_dir(plugins_dir.clone())
             .workspace_root(Some(root.clone())),
     );
     let cron_preamble: PreambleFn = Arc::new(move || cron_builder.build());
@@ -779,6 +781,13 @@ pub async fn build(
         learns: false,
         compacts: false,
     }));
+
+    // Now that every runtime has its executor, start the plugin host: a `py__`
+    // tool has to be mounted with a handle back to the executor it will
+    // dispatch its own tool calls through.
+    if let (Some(plugins_dir), Some(host)) = (plugins_dir, pyhost) {
+        crate::pyhost::start(&config.runtime.home, plugins_dir, host, mounts);
+    }
 
     Ok(Wiring {
         runtime,

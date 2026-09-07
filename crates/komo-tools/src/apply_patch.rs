@@ -125,7 +125,9 @@ impl Tool for ApplyPatchTool {
             .join(", ");
         let paths: Vec<PathBuf> = targets.iter().map(|(p, _)| p.clone()).collect();
         let summary = format!("apply a patch to {} file(s): {listing}", targets.len());
-        if let Some(refusal) = fs_common::allow_write_batch(ctx, &paths, summary).await {
+        if let Some(refusal) =
+            fs_common::allow_write_batch(&self.workspace, ctx, &paths, summary).await
+        {
             return Ok(ToolOutput::text(refusal));
         }
 

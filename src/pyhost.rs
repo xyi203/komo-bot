@@ -20,6 +20,7 @@ use komo_core::domain::catalog::{Registration, ToolCatalog};
 use komo_core::domain::policy::{Category, Policy};
 use komo_core::domain::tool::Tool;
 use komo_pyhost::{HostEvent, PluginToolDef, PyHost, SharedHost};
+use komo_services::tool_execution::{ToolExecutor, WeakToolExecutor};
 use komo_tools::plugin::PyTool;
 
 /// The interpreter the host runs on.
@@ -39,16 +40,29 @@ const PYTHON: &str = "python3";
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 const RESTART_DELAY_MAX: Duration = Duration::from_secs(60);
 
-/// Start the plugin host and keep it mounted in `catalogs` for the life of the
-/// process. `None` = no host (opted out, no interpreter, or a policy that
-/// denies plugins outright), which costs the plugin tools and `run_code` and
-/// nothing else.
-pub fn start(
-    home: &std::path::Path,
-    enabled: bool,
-    policy: &Policy,
-    catalogs: Vec<Arc<ToolCatalog>>,
-) -> Option<SharedHost> {
+/// One runtime the plugin tools mount into: the catalog they appear in, and a
+/// handle back to the executor whose gating a plugin's own `tools.<name>(...)`
+/// call has to pay.
+pub struct PluginMount {
+    catalog: Arc<ToolCatalog>,
+    executor: WeakToolExecutor,
+}
+
+impl PluginMount {
+    pub fn of(executor: &ToolExecutor) -> Self {
+        Self {
+            catalog: executor.catalog().clone(),
+            executor: executor.downgrade(),
+        }
+    }
+}
+
+/// Whether a plugin host can run here, and where its plugins live.
+///
+/// Separate from [`start`] because the answer decides whether `run_code` is
+/// registered at all, and that happens while the executors are being built —
+/// before there is anything for the host to mount into.
+pub fn available(home: &std::path::Path, enabled: bool, policy: &Policy) -> Option<PathBuf> {
     if !enabled {
         tracing::info!("the python plugin host is disabled (`pyhost_enabled = false`)");
         return None;
@@ -91,22 +105,32 @@ pub fn start(
         );
         return None;
     }
-    // The slot the supervisor keeps current across restarts. `run_code` holds
-    // it rather than a host handle, so a restarted host is picked up without
-    // re-registering the tool.
-    let host = SharedHost::default();
+    Some(plugins_dir)
+}
+
+/// Start the host and keep its tools mounted in `mounts` for the life of the
+/// process.
+///
+/// `host` is the slot `run_code` already holds: it is filled once a host has
+/// answered and emptied when one dies, so a restarted host is picked up without
+/// re-registering the tool.
+pub fn start(
+    home: &std::path::Path,
+    plugins_dir: PathBuf,
+    host: SharedHost,
+    mounts: Vec<PluginMount>,
+) {
     let supervisor = Supervisor {
         home: home.to_path_buf(),
         plugins_dir,
-        catalogs,
-        host: host.clone(),
+        mounts,
+        host,
     };
     // Supervised in the background: a plugin host that will not start must cost
     // the plugins, never the boot. Its first attempt is made here rather than
     // deferred, so the usual case (a working host) has its tools mounted before
     // the first turn.
     tokio::spawn(supervisor.run());
-    Some(host)
 }
 
 /// Owns one plugin host across restarts, and the registrations that keep its
@@ -114,7 +138,7 @@ pub fn start(
 struct Supervisor {
     home: PathBuf,
     plugins_dir: PathBuf,
-    catalogs: Vec<Arc<ToolCatalog>>,
+    mounts: Vec<PluginMount>,
     /// Published so `run_code` can reach whichever host is current.
     host: SharedHost,
 }
@@ -186,7 +210,7 @@ impl Supervisor {
         status
     }
 
-    /// Mount `tools` into every catalog this supervisor covers.
+    /// Mount `tools` into every runtime this supervisor covers.
     fn mount(&self, host: &PyHost, tools: Vec<PluginToolDef>) -> Vec<Registration> {
         if tools.is_empty() {
             tracing::info!("python plugin host ready; no plugins registered a tool");
@@ -198,17 +222,24 @@ impl Supervisor {
             tools = %names.join(", "),
             "mounted python plugin tools"
         );
-        self.catalogs
+        self.mounts
             .iter()
-            .map(|catalog| {
-                // Built per catalog: each `PyTool` leaks its name, but they are
-                // the same handful of strings and the alternative is sharing
-                // one `Arc<dyn Tool>` across catalogs whose lifetimes differ.
+            .map(|mount| {
+                // Built per runtime: each `PyTool` leaks its name, but they are
+                // the same handful of strings — and each one carries its own
+                // runtime's executor, which is what a plugin's own tool calls
+                // are dispatched and gated through.
                 let adapted: Vec<Arc<dyn Tool>> = tools
                     .iter()
-                    .map(|def| Arc::new(PyTool::new(host.clone(), def.clone())) as Arc<dyn Tool>)
+                    .map(|def| {
+                        Arc::new(PyTool::new(
+                            host.clone(),
+                            def.clone(),
+                            mount.executor.clone(),
+                        )) as Arc<dyn Tool>
+                    })
                     .collect();
-                catalog.mount_all(adapted)
+                mount.catalog.mount_all(adapted)
             })
             .collect()
     }
@@ -241,14 +272,15 @@ mod tests {
     #[test]
     fn a_wholly_denied_policy_stops_the_host_from_starting() {
         let home = std::env::temp_dir().join("komo-pyhost-denied");
-        assert!(start(&home, true, &deny_plugins(), Vec::new()).is_none());
+        assert!(available(&home, true, &deny_plugins()).is_none());
+        assert!(!home.join("plugins").exists());
     }
 
     /// The opt-out is checked before anything is created or probed.
     #[test]
     fn disabling_the_host_skips_it_entirely() {
         let home = std::env::temp_dir().join("komo-pyhost-off");
-        assert!(start(&home, false, &Policy::default(), Vec::new()).is_none());
+        assert!(available(&home, false, &Policy::default()).is_none());
         assert!(!home.join("plugins").exists());
     }
 }

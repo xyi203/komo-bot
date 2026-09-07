@@ -140,6 +140,24 @@ const CODE_GUIDANCE: &str = "`run_code` runs a Python program that calls these \
     program, and inside one prefer `tools.<name>(...)` over `tools.shell(...)` — \
     a program is a way to sequence your tools, not a way around them.";
 
+/// Gated on `run_code` **and** a known plugin directory. The other half of the
+/// routing rule above: `run_code` is how a program is run once, this is how one
+/// is kept. Left unsaid, the model has no idea it can author a tool at all —
+/// nothing else in the prompt names the directory, and the path is not
+/// guessable (`~/.komo/plugins` is only the default; under Docker the home is
+/// `/data`, and a deployment lost a round of turns to exactly that guess).
+///
+/// Formatted with the real path, which never changes at runtime — so this
+/// renders byte-identically every turn and costs the prompt cache nothing.
+const PLUGIN_GUIDANCE: &str = "Use `run_code` for a one-off program. When the \
+    same program is worth keeping, write it as a `@tool` function into \
+    `{dir}` (`from komo_plugin import tool`, one `.py` file, annotate the \
+    arguments and give it a docstring — inside it `tools.<name>(...)` calls \
+    your own tools exactly as a program does): it is loaded within seconds and \
+    becomes a `py__<name>` tool you can call from the next turn on. That write \
+    runs unsandboxed code on the operator's machine on every later turn, so \
+    they approve each one — propose it, don't assume it.";
+
 /// Injected whenever any tool is loaded, and the reason is a real incident: asked
 /// what it had spent this month, the model answered "no records, 0 yuan" in 76
 /// output tokens with zero tool steps in the ledger — the data was there the whole
@@ -281,6 +299,9 @@ pub struct SystemPromptBuilder {
     skills_note: Option<String>,
     /// The `run_code` API listing, when that tool is loaded.
     code_note: Option<String>,
+    /// Where a `@tool` function has to be written to become a tool. `None` =
+    /// this runtime has no plugin host, so there is nowhere to keep one.
+    plugins_dir: Option<PathBuf>,
     workspace_root: Option<PathBuf>,
     /// Include the Komo self-configuration manual (main agent only — aux
     /// sub-agents and sweeps never field "how do I configure Komo" questions).
@@ -318,6 +339,7 @@ impl SystemPromptBuilder {
             tool_names: Vec::new(),
             skills_note: None,
             code_note: None,
+            plugins_dir: None,
             workspace_root: None,
             operations_manual: false,
             include_user_profile: false,
@@ -350,6 +372,14 @@ impl SystemPromptBuilder {
     /// A runtime with no `run_code` passes `None` and pays nothing.
     pub fn code_note(mut self, note: Option<String>) -> Self {
         self.code_note = note;
+        self
+    }
+
+    /// The plugin directory, when a plugin host is running: where a `@tool`
+    /// function has to land to become a tool. Named in the prompt because it is
+    /// not guessable — see [`PLUGIN_GUIDANCE`].
+    pub fn plugins_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.plugins_dir = dir;
         self
     }
 
@@ -452,6 +482,9 @@ impl SystemPromptBuilder {
         // a set of calls the model can name, this one the set it cannot.
         if self.has("run_code") {
             parts.push(CODE_GUIDANCE.to_string());
+            if let Some(dir) = &self.plugins_dir {
+                parts.push(PLUGIN_GUIDANCE.replace("{dir}", &dir.display().to_string()));
+            }
         }
         if self.has("time") {
             parts.push(TIME_GUIDANCE.to_string());
@@ -708,6 +741,35 @@ mod tests {
             .tools(vec!["read".into()])
             .build();
         assert!(!without.contains("reach for a program"));
+    }
+
+    /// Nothing else in the prompt says the agent can author a tool, and the
+    /// path is not guessable — so it is named, and only where a host is
+    /// actually running to load what gets written there.
+    #[test]
+    fn plugin_guidance_names_the_directory_and_needs_both_run_code_and_a_host() {
+        let with = SystemPromptBuilder::new(&config())
+            .home(tmp("plugin_on"))
+            .tools(vec!["run_code".into(), "write".into()])
+            .plugins_dir(Some(PathBuf::from("/data/plugins")))
+            .build();
+        assert!(with.contains("/data/plugins"), "{with}");
+        assert!(with.contains("py__<name>"), "{with}");
+
+        // No host: nowhere to keep a program, so nothing is said about it.
+        let hostless = SystemPromptBuilder::new(&config())
+            .home(tmp("plugin_nohost"))
+            .tools(vec!["run_code".into()])
+            .build();
+        assert!(!hostless.contains("py__<name>"));
+
+        // No `run_code`: this runtime cannot run a program at all.
+        let codeless = SystemPromptBuilder::new(&config())
+            .home(tmp("plugin_nocode"))
+            .tools(vec!["write".into()])
+            .plugins_dir(Some(PathBuf::from("/data/plugins")))
+            .build();
+        assert!(!codeless.contains("/data/plugins"));
     }
 
     #[test]

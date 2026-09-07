@@ -13,16 +13,29 @@ call them like any built-in.
 
 Parameter names and annotations become the JSON schema the model is shown, so
 the signature is the contract: annotate the arguments and write a docstring or
-pass a description. Everything here is stdlib-only on purpose — a plugin that
-needs a third-party package installs it into the interpreter komo runs, and a
-plugin that needs none must not have to.
+pass a description.
+
+A plugin function reaches komo's own tools through `tools`, exactly as a
+`run_code` program does — a plugin is a program somebody kept, so it composes
+the same way:
+
+    from komo_plugin import tool, tools
+
+    @tool("Count the lines of a file.")
+    def linecount(path: str) -> int:
+        return len(str(tools.read(path=path)).splitlines())
+
+Everything here is stdlib-only on purpose — a plugin that needs a third-party
+package installs it into the interpreter komo runs, and a plugin that needs
+none must not have to.
 """
 
 import inspect
 import json
+import threading
 from typing import Any, Callable, Dict, List, Optional
 
-__all__ = ["tool", "registered_tools", "clear"]
+__all__ = ["tool", "tools", "registered_tools", "clear"]
 
 # Name → registration. Ordered by insertion, but komo sorts by name before the
 # model ever sees it, so definition order carries no meaning.
@@ -87,8 +100,51 @@ def clear() -> None:
     _REGISTRY.clear()
 
 
-def call(name: str, args: Dict[str, Any]) -> str:
+# The broker for the call running on this thread. Thread-local because the host
+# handles every request on its own thread, which is also what lets one plugin
+# call block on komo while another runs.
+_current = threading.local()
+
+
+class _Tools:
+    """The `tools` object a plugin function calls komo's own tools through.
+
+    Attribute access is resolved per call against the broker the host installed
+    for it, so this object holds no state and knows no tool names: a plugin
+    reaches whatever the calling turn was offered.
+
+    Outside a call there is nothing to broker, and saying so beats an
+    `AttributeError` on a name that is not the problem.
+    """
+
+    def _broker(self):
+        broker = getattr(_current, "broker", None)
+        if broker is None:
+            raise RuntimeError(
+                "`tools` is only available while komo is calling your @tool "
+                "function — it dispatches back into the turn that called you, "
+                "so there is nothing to call at import time"
+            )
+        return broker
+
+    def __getattr__(self, name: str):
+        return getattr(self._broker(), name)
+
+    # For a name that is not a legal attribute, mirroring the program-side
+    # object a plugin author may already know.
+    def __getitem__(self, name: str):
+        return getattr(self._broker(), name)
+
+
+#: See [`_Tools`]. Import it: `from komo_plugin import tools`.
+tools = _Tools()
+
+
+def call(name: str, args: Dict[str, Any], broker: Optional[Any] = None) -> str:
     """Run a registered tool and render its result as the model-facing text.
+
+    `broker` is what `tools` dispatches through for the duration of the call —
+    the host passes the same object a program gets.
 
     A `str` is returned as-is; anything else is JSON-encoded, so a tool can
     return a dict or a list without every plugin re-implementing formatting.
@@ -96,7 +152,14 @@ def call(name: str, args: Dict[str, Any]) -> str:
     reg = _REGISTRY.get(name)
     if reg is None:
         raise KeyError(f"no tool named `{name}`")
-    result = reg.fn(**args)
+    previous = getattr(_current, "broker", None)
+    _current.broker = broker
+    try:
+        result = reg.fn(**args)
+    finally:
+        # Restored rather than cleared: a plugin tool that calls another one
+        # through `tools` is nested on this same thread.
+        _current.broker = previous
     if inspect.isawaitable(result):
         raise TypeError(
             f"tool `{name}` returned an awaitable; komo plugins are synchronous "

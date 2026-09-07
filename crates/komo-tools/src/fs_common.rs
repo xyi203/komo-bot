@@ -84,6 +84,10 @@ pub(crate) fn effective<'a>(
                 Some(artifacts) => derived.with_artifacts(artifacts.to_path_buf()),
                 None => derived,
             };
+            let derived = match workspace.plugins_root() {
+                Some(plugins) => derived.with_plugins(plugins.to_path_buf()),
+                None => derived,
+            };
             let derived = if workspace.has_unrestricted_reads() {
                 derived.with_unrestricted_reads()
             } else {
@@ -132,13 +136,16 @@ pub async fn allow_read(ctx: &ToolContext, path: &Path) -> Option<String> {
 /// Consult the approver for a **write** (`Risk::Normal` — it prompts).
 /// `summary` describes the mutation for the human. Returns the refusal text,
 /// carrying the user's reason when they gave one, when denied.
-pub async fn allow_write(ctx: &ToolContext, path: &Path, summary: String) -> Option<String> {
-    let request = ApprovalRequest::normal(summary)
-        .with_scope_key("file:write")
-        .with_action(ActionRef::File {
-            path: path.to_path_buf(),
-            write: true,
-        });
+///
+/// A write into the plugin directory is [`Risk::Dangerous`] instead — see
+/// [`write_request`].
+pub async fn allow_write(
+    workspace: &Arc<Workspace>,
+    ctx: &ToolContext,
+    path: &Path,
+    summary: String,
+) -> Option<String> {
+    let request = write_request(workspace, ctx, path, summary);
     let decision = ctx.decide(&request).await;
     if decision.is_allowed() {
         return None;
@@ -152,6 +159,43 @@ pub async fn allow_write(ctx: &ToolContext, path: &Path, summary: String) -> Opt
     })
 }
 
+/// The approval a write asks for, and the one place a path's *risk* is decided.
+///
+/// Ordinary writes are `Risk::Normal`: the operator answers, and may widen the
+/// answer to the session or save it, keyed on `file:write`.
+///
+/// A write into the plugin directory is `Risk::Dangerous` and carries **no
+/// scope key**, so it can be neither auto-allowed by an earlier `file:write`
+/// grant nor widened by this answer — `Risk::Dangerous` already narrows
+/// `/approve session|always` to a single call, and without a key there is
+/// nothing for a session cache to hit. The reason is what the file *becomes*:
+/// python saved there is loaded into the plugin host and runs unsandboxed on
+/// the host, on every later turn, unattended routines included. That is a
+/// standing grant of arbitrary code execution, so a human authorizes each one.
+fn write_request(
+    workspace: &Arc<Workspace>,
+    ctx: &ToolContext,
+    path: &Path,
+    summary: String,
+) -> ApprovalRequest {
+    let action = ActionRef::File {
+        path: path.to_path_buf(),
+        write: true,
+    };
+    if effective(workspace, ctx).is_plugin_path(path) {
+        return ApprovalRequest::dangerous(
+            summary,
+            "This is komo's plugin directory: python saved here is loaded into the \
+             plugin host and runs unsandboxed on this machine, on every later turn \
+             — scheduled routines included.",
+        )
+        .with_action(action);
+    }
+    ApprovalRequest::normal(summary)
+        .with_scope_key("file:write")
+        .with_action(action)
+}
+
 /// Approve a mutation that spans **several** files with a single prompt.
 ///
 /// `summary` should name every target, because that is the one thing the human
@@ -163,16 +207,25 @@ pub async fn allow_write(ctx: &ToolContext, path: &Path, summary: String) -> Opt
 /// patch would ask five times.
 ///
 /// Returns the refusal text naming the path that was blocked.
+///
+/// A batch touching the plugin directory takes that risk for the whole prompt:
+/// the human is approving the batch, and one plugin file in it is the thing
+/// they have to be told about.
 pub async fn allow_write_batch(
+    workspace: &Arc<Workspace>,
     ctx: &ToolContext,
     paths: &[PathBuf],
     summary: String,
 ) -> Option<String> {
     let first = paths.first()?;
-    if let Some(refusal) = allow_write(ctx, first, summary).await {
+    let riskiest = paths
+        .iter()
+        .find(|path| effective(workspace, ctx).is_plugin_path(path))
+        .unwrap_or(first);
+    if let Some(refusal) = allow_write(workspace, ctx, riskiest, summary).await {
         return Some(refusal);
     }
-    for path in paths.iter().skip(1) {
+    for path in paths.iter().filter(|path| *path != riskiest) {
         let request = ApprovalRequest::safe(format!("write {}", path.display())).with_action(
             ActionRef::File {
                 path: path.clone(),
@@ -217,6 +270,70 @@ mod tests {
         assert!(matches!(err, ToolError::Denied(_)));
         // The message names the allowed root so the model can retry sensibly.
         assert!(err.to_string().contains("/home/u/p"));
+    }
+
+    fn ws_with_plugins() -> Arc<Workspace> {
+        Arc::new(
+            Workspace::new(vec![PathBuf::from("/home/u/p")])
+                .with_plugins(PathBuf::from("/home/u/.komo/plugins")),
+        )
+    }
+
+    /// An ordinary write prompts at `Normal` and may be widened — that is what
+    /// the `file:write` scope key is for.
+    #[test]
+    fn an_ordinary_write_is_normal_and_widenable() {
+        let request = write_request(
+            &ws_with_plugins(),
+            &detached_ctx("test"),
+            Path::new("/home/u/p/src/main.rs"),
+            "write src/main.rs".into(),
+        );
+        assert_eq!(request.risk, komo_core::domain::approval::Risk::Normal);
+        assert_eq!(request.scope_key.as_deref(), Some("file:write"));
+    }
+
+    /// A write into the plugin directory installs code komo will run itself, on
+    /// every later turn including an unattended routine's — so it is
+    /// `Dangerous` (which no saved or job grant can allow) and carries no scope
+    /// key, so no earlier `file:write` session grant can allow it either and
+    /// this answer cannot widen into one.
+    #[test]
+    fn a_plugin_write_is_dangerous_and_never_widens() {
+        let request = write_request(
+            &ws_with_plugins(),
+            &detached_ctx("test"),
+            Path::new("/home/u/.komo/plugins/notes.py"),
+            "write notes.py".into(),
+        );
+        assert_eq!(request.risk, komo_core::domain::approval::Risk::Dangerous);
+        assert_eq!(
+            request.scope_key, None,
+            "a scope key is what a session grant hits; a plugin write must have none"
+        );
+        // The human is told what the file becomes, not just where it goes.
+        let detail = request.detail.expect("a dangerous request explains itself");
+        assert!(detail.contains("unsandboxed"), "{detail}");
+    }
+
+    /// The workspace a *session* picked keeps komo's plugin root, so a turn
+    /// working elsewhere does not quietly downgrade a plugin write to `Normal`.
+    #[test]
+    fn a_session_workspace_still_classifies_plugin_writes() {
+        let mut session = komo_core::domain::context::SessionContext::detached("test");
+        session.workspace_root = Some(PathBuf::from("/home/u/elsewhere"));
+        let ctx = komo_core::domain::context::ToolContext::new(
+            session,
+            None,
+            std::sync::Arc::new(crate::test_support::SafeOnly),
+        );
+        let request = write_request(
+            &ws_with_plugins(),
+            &ctx,
+            Path::new("/home/u/.komo/plugins/notes.py"),
+            "write notes.py".into(),
+        );
+        assert_eq!(request.risk, komo_core::domain::approval::Risk::Dangerous);
     }
 
     #[test]

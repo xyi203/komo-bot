@@ -104,7 +104,7 @@ impl Tool for WriteTool {
             path.display(),
             args.content.len()
         );
-        if let Some(refusal) = fs_common::allow_write(ctx, &path, summary).await {
+        if let Some(refusal) = fs_common::allow_write(&self.workspace, ctx, &path, summary).await {
             return Ok(ToolOutput::text(refusal));
         }
 

@@ -183,7 +183,7 @@ impl Tool for EditTool {
             occurrences,
             if occurrences == 1 { "" } else { "s" }
         );
-        if let Some(refusal) = fs_common::allow_write(ctx, &path, summary).await {
+        if let Some(refusal) = fs_common::allow_write(&self.workspace, ctx, &path, summary).await {
             return Ok(ToolOutput::text(refusal));
         }
 

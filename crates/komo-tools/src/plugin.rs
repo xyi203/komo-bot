@@ -17,6 +17,7 @@ use komo_core::domain::tool::{
     APPROVAL_BOUND, RetryHint, Tool, ToolError, ToolOutput, TransientError,
 };
 use komo_pyhost::{PluginToolDef, PyHost, PyHostError};
+use komo_services::tool_execution::WeakToolExecutor;
 use serde_json::Value;
 
 /// Prefix that namespaces every plugin-registered tool.
@@ -35,6 +36,12 @@ pub fn qualified_name(tool: &str) -> String {
 /// One tool registered by a plugin file.
 pub struct PyTool {
     host: PyHost,
+    /// Where the plugin function's own `tools.<name>(...)` calls go — the same
+    /// executor the model's calls take, so a plugin composes komo's tools
+    /// without composing its way around their gating. Weak because this tool is
+    /// registered in the catalog that executor dispatches against (the same
+    /// reason `run_code`'s handle is).
+    executor: WeakToolExecutor,
     /// The namespaced catalog name. Leaked because [`Tool::name`] is
     /// `&'static str` while a plugin's names are only known once the host has
     /// imported it.
@@ -51,11 +58,12 @@ pub struct PyTool {
 }
 
 impl PyTool {
-    pub fn new(host: PyHost, def: PluginToolDef) -> Self {
+    pub fn new(host: PyHost, def: PluginToolDef, executor: WeakToolExecutor) -> Self {
         let name: &'static str = String::leak(qualified_name(&def.name));
         let description: &'static str = String::leak(def.description);
         Self {
             host,
+            executor,
             name,
             description,
             plugin_name: def.name,
@@ -107,11 +115,30 @@ impl Tool for PyTool {
             ));
         }
 
-        let text = self
-            .host
-            .call(&self.plugin_name, input)
-            .await
-            .map_err(|error| map_error(error, &self.plugin_name))?;
+        // A plugin function may call komo's own tools, exactly as a `run_code`
+        // program does — it is a program somebody kept. Each of those calls
+        // goes back through this same executor, so it pays its own approval,
+        // ledger row and result cap.
+        let Some(executor) = self.executor.upgrade() else {
+            return Err(ToolError::Failed(anyhow::anyhow!(
+                "the tool executor is gone; `{}` cannot dispatch",
+                self.name
+            )));
+        };
+        let turn = crate::run_code::sub_turn(ctx);
+        let callable = executor.snapshot();
+        let text =
+            self.host
+                .call(&self.plugin_name, input, |name, args| {
+                    let executor = executor.clone();
+                    let turn = &turn;
+                    let callable = callable.clone();
+                    async move {
+                        crate::run_code::dispatch(&executor, turn, &callable, name, args).await
+                    }
+                })
+                .await
+                .map_err(|error| map_error(error, &self.plugin_name))?;
         Ok(ToolOutput::text(text))
     }
 

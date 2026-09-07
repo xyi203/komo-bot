@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use super::{
-    channel, doctor, dream, gateway, health, init, inspect, journey, logs, memory, model, pair,
-    policy, service, skill, upgrade, wechat, wiki, workday,
+    channel, doctor, dream, gateway, health, init, inspect, logs, memory, model, pair, policy,
+    service, skill, upgrade, wechat, wiki, workday,
 };
 
 /// The version every surface reports: the crate version plus the commit it was
@@ -83,16 +83,6 @@ enum Commands {
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
-    },
-    /// Timeline of what komo has learned: memories (born/promoted/archived)
-    /// and skills (proposed/activated), newest first
-    Journey {
-        /// Maximum number of events to show
-        #[arg(long, default_value_t = 50)]
-        limit: usize,
-        /// Only show events on or after this date (YYYY-MM-DD, local time)
-        #[arg(long)]
-        since: Option<String>,
     },
     /// Config & gateway health: model, schedules, channels, home, recent failures
     Doctor,
@@ -646,9 +636,6 @@ pub async fn run() -> anyhow::Result<()> {
             SkillsAction::Disable { name } => skill::set_enabled(&name, false),
             SkillsAction::Inspect { name } => skill::inspect(&name),
         },
-        Some(Commands::Journey { limit, since }) => {
-            journey::journey(&operator(&config).await?, limit, since).await
-        }
         Some(Commands::Doctor) => doctor::doctor(&config, &operator(&config).await?).await,
         Some(Commands::Health) => health::run().await,
         Some(Commands::Pair { action }) => {

@@ -9,7 +9,6 @@ mod gateway;
 mod health;
 mod init;
 mod inspect;
-mod journey;
 mod logs;
 mod memory;
 mod model;

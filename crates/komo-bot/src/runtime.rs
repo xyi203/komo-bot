@@ -2,7 +2,6 @@ use crate::compaction::Compactor;
 use crate::learning_coordinator::{LearningCoordinator, LearningTrigger};
 use komo_core::domain::{
     cancel::{CANCELLED_REPLY, CancelSignal, Cancelled, is_cancelled},
-    checkpoint::CheckpointStore,
     events::{ToolEventSink, TurnEvent},
     hooks::{StepDecision, StepHook, TurnHook},
     llm::{DeltaSink, LlmClient, Step, TokenUsage, ToolOutcome},
@@ -167,10 +166,6 @@ pub struct AgentRuntime {
     /// it after this process is gone. `None` = nothing schedules a return, and
     /// only the startup re-check would find the turn.
     pub wakeups: Option<Arc<dyn WakeupRepository>>,
-    /// Where a mutating tool leaves the bytes a file held before this turn
-    /// touched it, so `komo run rollback` can put them back. `None` = this
-    /// runtime's file changes are final.
-    pub checkpoint: Option<Arc<dyn CheckpointStore>>,
     /// Turn lifecycle observers (see `domain::hooks`). Registered at wiring,
     /// awaited serially — a hook is a fast observer, never a worker. Empty for
     /// every runtime without plugins contributing one.
@@ -325,7 +320,7 @@ impl AgentRuntime {
     ) -> anyhow::Result<String> {
         let span = info_span!("run", run_id = %turn_id, session = %session_id);
         let started = std::time::Instant::now();
-        let ctx = RunContext::new(turn_id.clone()).with_checkpoint(self.checkpoint.clone());
+        let ctx = RunContext::new(turn_id.clone());
         // Where this turn starts in the log, filled in as it opens. It is what
         // lets the settle below fold the turn's own tail instead of the whole
         // conversation; `UNKNOWN_START` means "read it all", which is always
@@ -1662,7 +1657,6 @@ pub(crate) mod tests {
             learning: None,
             compaction: None,
             wakeups: None,
-            checkpoint: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
         };
@@ -3719,7 +3713,6 @@ pub(crate) mod tests {
             learning: None,
             compaction: None,
             wakeups: None,
-            checkpoint: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
         };
@@ -4340,7 +4333,6 @@ pub(crate) mod tests {
             learning: None,
             compaction: None,
             wakeups: None,
-            checkpoint: None,
             turn_hooks: Vec::new(),
             step_hooks: Vec::new(),
         };

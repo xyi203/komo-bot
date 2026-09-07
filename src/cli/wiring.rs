@@ -19,7 +19,6 @@ use komo_bot::reviewer::ReflectiveReviewer;
 use komo_bot::runtime::AgentRuntime;
 use komo_bot::system_prompt::SystemPromptBuilder;
 use komo_bot::unattended::{UnattendedDeny, UnattendedSuspend};
-use komo_core::domain::checkpoint::CheckpointStore;
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::skill::SkillOffer;
 use komo_infra::embedding::{GatedEmbedder, OllamaEmbedder};
@@ -116,11 +115,6 @@ struct CapabilityProfile {
     /// True only for conversations, which are the only sessions that outlive
     /// their window: a sweep or a delegation opens, answers and is done.
     compacts: bool,
-    /// Keeps the pre-image of every file its turns change, so
-    /// `komo run rollback` can undo one. On wherever the runtime can write:
-    /// a delegation and a cron job produce final file state exactly like a
-    /// conversation does, and are *less* watched while doing it.
-    checkpoints: bool,
 }
 
 /// What every runtime shares. Held once so [`CapabilityProfile`] can be read as
@@ -135,7 +129,6 @@ struct RuntimeParts<'a> {
     /// model will replay and no long transcript is read in full.
     history_window: usize,
     learning: Arc<LearningCoordinator>,
-    checkpoint: Option<Arc<dyn CheckpointStore>>,
 }
 
 impl RuntimeParts<'_> {
@@ -159,10 +152,6 @@ impl RuntimeParts<'_> {
             // turn's wait has to outlive the process — so all of them get the
             // store, conversations and routines alike.
             wakeups: Some(self.db.clone()),
-            checkpoint: profile
-                .checkpoints
-                .then(|| self.checkpoint.clone())
-                .flatten(),
             turn_hooks: self.registry.turn_hooks_for(profile.scope),
             step_hooks: self.registry.step_hooks_for(profile.scope),
         }
@@ -588,15 +577,6 @@ pub async fn build(
         .with_feedback(aux_llm.clone()),
     );
 
-    // Pre-images for `komo run rollback`. Swept once here rather than on a
-    // schedule: the directory is read only on demand, and a gateway start is
-    // the natural moment to drop what has aged out.
-    let checkpoint_store = Arc::new(komo_services::checkpoint_store::FsCheckpointStore::new(
-        komo_config::komo_home().join("checkpoints"),
-    ));
-    checkpoint_store.sweep();
-    let checkpoint: Option<Arc<dyn CheckpointStore>> = Some(checkpoint_store.clone());
-
     // Built before the runtimes because every one of them is assembled from it.
     let parts = RuntimeParts {
         db: db.clone(),
@@ -610,7 +590,6 @@ pub async fn build(
             db.clone(),
             model_config.max_history_messages,
         )),
-        checkpoint,
     };
 
     let subagent_runtime = Arc::new(parts.build(CapabilityProfile {
@@ -621,7 +600,6 @@ pub async fn build(
         learns: false,
         resumable: false,
         compacts: false,
-        checkpoints: true,
     }));
     let delegate = Arc::new(DelegateTool::new(
         subagent_runtime,
@@ -692,7 +670,6 @@ pub async fn build(
         learns: true,
         resumable: true,
         compacts: true,
-        checkpoints: true,
     });
 
     // ── Cron agent runtime (general cron, agent mode) ────────────────────────
@@ -752,7 +729,6 @@ pub async fn build(
         learns: false,
         resumable: false,
         compacts: false,
-        checkpoints: true,
     }));
 
     // ── Briefing runtime (roadmap §2) ────────────────────────────────────────
@@ -798,7 +774,6 @@ pub async fn build(
         learns: false,
         resumable: false,
         compacts: false,
-        checkpoints: false,
     }));
 
     Ok(Wiring {

@@ -6,10 +6,6 @@
 //! through leaves the earlier ones on disk — so the error names exactly what
 //! landed, because a model that doesn't know which half applied will make things
 //! worse. (opencode v2 makes the same trade.)
-//!
-//! A half-applied patch is recoverable after the fact, though not during:
-//! every file this touches is checkpointed, so `komo run rollback` puts the
-//! turn's changes back the way they were.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -136,7 +132,7 @@ impl Tool for ApplyPatchTool {
         let mut applied: Vec<String> = Vec::new();
         let mut files: Vec<Value> = Vec::new();
         for (path, hunk) in &targets {
-            match self.apply_one(path, hunk, ctx).await {
+            match self.apply_one(path, hunk).await {
                 Ok(entry) => {
                     applied.push(format!("{} {}", mark(hunk), path.display()));
                     files.push(entry);
@@ -168,12 +164,7 @@ impl Tool for ApplyPatchTool {
 
 impl ApplyPatchTool {
     /// Apply one hunk, returning its structured record.
-    async fn apply_one(
-        &self,
-        path: &PathBuf,
-        hunk: &patch::Hunk,
-        ctx: &ToolContext,
-    ) -> anyhow::Result<Value> {
+    async fn apply_one(&self, path: &PathBuf, hunk: &patch::Hunk) -> anyhow::Result<Value> {
         match hunk {
             patch::Hunk::Add { contents, .. } => {
                 let before = file_mutation::snapshot(path).await?;
@@ -185,7 +176,7 @@ impl ApplyPatchTool {
                 }
                 // `contents` comes from `+` lines, so it needs its final newline.
                 let body = ensure_newline(contents);
-                file_mutation::write_if_unchanged(path, &before, &body, ctx.run.as_ref()).await?;
+                file_mutation::write_if_unchanged(path, &before, &body).await?;
                 let stats = diff::unified(&path.display().to_string(), "", &body);
                 Ok(json!({
                     "type": "add",
@@ -196,7 +187,7 @@ impl ApplyPatchTool {
                 }))
             }
             patch::Hunk::Delete { .. } => {
-                file_mutation::delete_existing(path, ctx.run.as_ref()).await?;
+                file_mutation::delete_existing(path).await?;
                 Ok(json!({ "type": "delete", "path": path.display().to_string() }))
             }
             patch::Hunk::Update { chunks, .. } => {
@@ -213,8 +204,7 @@ impl ApplyPatchTool {
                 let label = path.display().to_string();
                 let updated =
                     patch::apply(&label, &source, chunks).map_err(|e| anyhow::anyhow!("{e}"))?;
-                file_mutation::write_if_unchanged(path, &before, &updated, ctx.run.as_ref())
-                    .await?;
+                file_mutation::write_if_unchanged(path, &before, &updated).await?;
                 let stats = diff::unified(&label, &source, &updated);
                 Ok(json!({
                     "type": "update",

@@ -12,7 +12,6 @@
 
 pub mod artifact_store;
 pub mod background_tasks;
-pub mod checkpoint_store;
 pub mod conversation;
 pub mod cron_actions;
 pub mod diff;

@@ -17,7 +17,6 @@ mod model;
 mod pair;
 mod policy;
 mod resume;
-pub mod rollback;
 mod service;
 mod skill;
 mod upgrade;

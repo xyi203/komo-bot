@@ -108,7 +108,7 @@ impl Tool for WriteTool {
             return Ok(ToolOutput::text(refusal));
         }
 
-        file_mutation::write_if_unchanged(&path, &before, &args.content, ctx.run.as_ref()).await?;
+        file_mutation::write_if_unchanged(&path, &before, &args.content).await?;
 
         Ok(ToolOutput::text(format!(
             "{} {} ({} bytes).",

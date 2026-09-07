@@ -547,9 +547,9 @@ pub fn valid_cron_job_name(name: &str) -> bool {
             .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ':' | '/' | '\\'))
 }
 
-/// The operator's request to create a job (`komo cron add` / `POST
-/// /api/cron/add`). Validation and `next_run_at` computation happen in the
-/// shared operator action, not here.
+/// The operator's request to create a job (`komo cron add`, the `cron` tool).
+/// Validation and `next_run_at` computation happen in the shared operator
+/// action, not here.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CronJobSpec {
     pub name: String,

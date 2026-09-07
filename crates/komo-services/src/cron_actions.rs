@@ -1,9 +1,9 @@
 //! Cron-job mutations shared by every caller that creates or changes a job.
 //!
-//! The `cron` tool (in conversation), the gateway's `/api/cron/*` handlers and
-//! the direct CLI adapter all funnel through these functions, so validation —
-//! schedule parsing, name uniqueness, the initial `next_run_at` — cannot fork
-//! between the paths. `OperatorActions` wraps them for the operator-control
+//! The `cron` tool (in conversation), the gateway's sweeps and its operator
+//! endpoint all funnel through these functions, so validation — schedule
+//! parsing, name uniqueness, the initial `next_run_at` — cannot fork between
+//! the callers. `OperatorActions` wraps them for the operator-control
 //! surface; it does not reimplement them.
 
 use komo_core::domain::cron::{
@@ -66,7 +66,7 @@ fn first_slot(trigger: &Trigger, now: i64) -> anyhow::Result<i64> {
 /// Validate a job spec and create it — schedule parsed with the same cron
 /// parser the sweep uses (so nothing invalid ever reaches the store), name
 /// uniqueness enforced, and the initial `next_run_at` computed from now.
-/// Shared by the gateway's `/api/cron/add` handler and the direct adapter, so
+/// Shared by the `cron` tool and the operator endpoint's `CronAdd`, so
 /// validation can't fork between the two paths.
 pub async fn add_cron_job(
     jobs: &dyn CronJobRepository,

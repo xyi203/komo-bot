@@ -216,10 +216,7 @@ enum CronAction {
         /// Unique job name (e.g. weekly-alarmhandler-rotation)
         name: String,
         /// When it fires: a 5-field cron expression in local time
-        /// (e.g. "0 14 * * 5"), "@at YYYY-MM-DD HH:MM" for a one-shot, or an
-        /// event — "@webhook <name>", "@feishu <chat> mention|keyword a,b|
-        /// reaction <emoji>", "@file <dir> [glob]". Join with " | " for
-        /// "any of these"
+        /// (e.g. "0 14 * * 5"), or "@at YYYY-MM-DD HH:MM" for a one-shot
         schedule: String,
         /// Program to execute (absolute path; run directly, not via a shell)
         command: String,
@@ -248,10 +245,7 @@ enum CronAction {
         /// Unique job name
         name: String,
         /// When it fires: a 5-field cron expression in local time
-        /// (e.g. "0 8 * * *"), "@at YYYY-MM-DD HH:MM" for a one-shot, or an
-        /// event — "@webhook <name>", "@feishu <chat> mention|keyword a,b|
-        /// reaction <emoji>", "@file <dir> [glob]". Join with " | " for
-        /// "any of these"
+        /// (e.g. "0 8 * * *"), or "@at YYYY-MM-DD HH:MM" for a one-shot
         schedule: String,
         /// The instruction the agent runs each fire
         prompt: String,

@@ -2638,7 +2638,6 @@ pub(crate) mod tests {
                 }),
             }),
             runtime: None,
-            triggers: None,
         };
         let wiring = sweep.wakeups.as_ref().unwrap();
         assert_eq!(
@@ -2802,7 +2801,6 @@ pub(crate) mod tests {
                 }),
             }),
             runtime: None,
-            triggers: None,
         };
         let wiring = sweep.wakeups.as_ref().unwrap();
         assert_eq!(sweep.fire_due_wakeups(wiring, now() + 8 * 86_400).await, 1);
@@ -2830,142 +2828,6 @@ pub(crate) mod tests {
             steps[0].result.starts_with("No answer from the user"),
             "the model is told to proceed on an assumption: {}",
             steps[0].result
-        );
-    }
-
-    /// §5.12's other half: a turn parked on `wait { for_event: { webhook } }`
-    /// comes back when that hook arrives, and what the call returns is the
-    /// event — not a timeout, and not a second wait.
-    #[tokio::test]
-    async fn a_webhook_wakes_the_turn_that_was_waiting_for_it() {
-        let db = Arc::new(
-            Db::connect(&sqlite_url("komo_rt_wait_webhook.db"))
-                .await
-                .unwrap(),
-        );
-        let args = r#"{"for_event":{"webhook":"ci-done"}}"#;
-        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool::new()), args);
-        assert!(
-            rt.handle_input("cli:hooked", "等 CI".into()).await.is_err(),
-            "waiting is not failing"
-        );
-        drop(rt);
-        let suspended = RunRepository::list(&*db, 10).await.unwrap().pop().unwrap();
-        assert_eq!(suspended.status, RunStatus::Suspended);
-
-        // A new process, and the hook arrives — through `on_event_detached`,
-        // which is the route the HTTP handler takes: it answers what the event
-        // matched and leaves the continuation running behind the reply.
-        let rt = Arc::new(waiting_runtime(db.clone(), Arc::new(WaitTool::new()), args));
-        let triggers = Arc::new(komo_services::triggers::TriggerMatcher::new(db.clone()));
-        triggers.attach_dispatch(Arc::new(TestWaker {
-            runtime: rt.clone(),
-            waits: wait_parts(&db),
-        }));
-        let source = Arc::new(crate::daemon::RoutineEventSource {
-            jobs: db.clone(),
-            notifier: Arc::new(SilentNotifier),
-            wakeups: None,
-            runtime: None,
-            triggers: Some(triggers),
-        });
-        let hook = komo_core::domain::trigger::ExternalEvent::Webhook {
-            name: "ci-done".into(),
-            body: "build 4213 succeeded".into(),
-        };
-        let matched = source.on_event_detached(&hook).await;
-        assert_eq!(matched.wakeups, 1, "one wait names this hook");
-        assert_eq!(matched.routines, 0, "no routine does");
-
-        let continuation = continuation_of(&db, &suspended.id).await;
-        let steps = RunRepository::steps(&*db, &continuation.id).await.unwrap();
-        assert_eq!(steps.len(), 1, "the wait ran once, on the way back");
-        assert!(
-            steps[0].result.contains("build 4213 succeeded"),
-            "the model is handed the event: {}",
-            steps[0].result
-        );
-        assert!(
-            komo_core::domain::wakeup::WakeupRepository::list(&*db)
-                .await
-                .unwrap()
-                .is_empty(),
-            "a fired wait is retired"
-        );
-
-        // A redelivery — what an external system does with a timeout — matches
-        // nothing now: the registration was claimed and the turn came back.
-        assert_eq!(source.on_event_detached(&hook).await.wakeups, 0);
-    }
-
-    /// The continuation runs behind the reply, so a test of it waits for the
-    /// record rather than for the call.
-    async fn continuation_of(db: &Arc<Db>, suspended: &str) -> komo_core::domain::run::Run {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            loop {
-                let found = RunRepository::list(db.as_ref(), 20)
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .find(|r| {
-                        r.resumed_from.as_deref() == Some(suspended)
-                            && r.status != RunStatus::Running
-                    });
-                if let Some(run) = found {
-                    return run;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the woken turn never finished")
-    }
-
-    /// And a hook by another name is not that wait's hook.
-    #[tokio::test]
-    async fn a_webhook_nobody_named_wakes_nothing() {
-        let db = Arc::new(
-            Db::connect(&sqlite_url("komo_rt_wait_webhook_other.db"))
-                .await
-                .unwrap(),
-        );
-        let args = r#"{"for_event":{"webhook":"ci-done"}}"#;
-        let rt = waiting_runtime(db.clone(), Arc::new(WaitTool::new()), args);
-        assert!(
-            rt.handle_input("cli:hooked2", "等 CI".into())
-                .await
-                .is_err()
-        );
-
-        let triggers = Arc::new(komo_services::triggers::TriggerMatcher::new(db.clone()));
-        triggers.attach_dispatch(Arc::new(TestWaker {
-            runtime: Arc::new(waiting_runtime(db.clone(), Arc::new(WaitTool::new()), args)),
-            waits: wait_parts(&db),
-        }));
-        let source = crate::daemon::RoutineEventSource {
-            jobs: db.clone(),
-            notifier: Arc::new(SilentNotifier),
-            wakeups: None,
-            runtime: None,
-            triggers: Some(triggers),
-        };
-        assert_eq!(
-            source
-                .on_event(&komo_core::domain::trigger::ExternalEvent::Webhook {
-                    name: "deploy".into(),
-                    body: String::new(),
-                })
-                .await
-                .wakeups,
-            0
-        );
-        assert_eq!(
-            komo_core::domain::wakeup::WakeupRepository::list(&*db)
-                .await
-                .unwrap()
-                .len(),
-            1,
-            "the wait is still standing"
         );
     }
 

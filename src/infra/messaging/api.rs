@@ -40,7 +40,7 @@ use std::{convert::Infallible, time::Duration};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, Request, State},
+    extract::{ConnectInfo, Path, Query, Request, State},
     http::{
         HeaderName, HeaderValue, Method, StatusCode,
         header::{AUTHORIZATION, CONTENT_TYPE},
@@ -382,7 +382,6 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/interactions/{session}", get(get_interactions))
         .merge(operator_writes)
         .merge(interactive_writes)
-        .merge(hooks_router())
         .route_layer(middleware::from_fn_with_state(
             state.api_key.clone(),
             require_auth,
@@ -463,62 +462,6 @@ async fn require_auth(
         Some(token) if bearer_matches(token, key.as_str()) => Ok(next.run(req).await),
         _ => Err(StatusCode::UNAUTHORIZED),
     }
-}
-
-/// Inbound webhooks: `POST /api/hooks/{name}` (docs/bot-runtime.md §5.12).
-///
-/// Merged into `protected`, so the bearer key gates it like everything else —
-/// and **not** into `operator_writes`, whose loopback layer would defeat the
-/// point: the caller is an external system (CI, a monitor, a home device),
-/// which is also why arriving over loopback earns no exemption. The key is the
-/// whole gate.
-fn hooks_router() -> Router<AppState> {
-    Router::new()
-        .route("/api/hooks/{name}", post(inbound_hook))
-        // A hook body is somebody else's payload; komo reads a summary of it
-        // and nothing more, so it has no reason to accept a large one. Axum's
-        // 2 MB default is a browser-form figure, not this.
-        .route_layer(DefaultBodyLimit::max(HOOK_BODY_LIMIT))
-}
-
-/// How much of a webhook body is accepted. Generous for a CI notification,
-/// small enough that a hook cannot be used to push memory around.
-const HOOK_BODY_LIMIT: usize = 64 * 1024;
-
-/// One inbound webhook: the routines it starts and the suspended turns it wakes.
-///
-/// **It answers immediately and does the work behind the reply.** A routine is
-/// an agent turn — minutes, sometimes — while a caller's HTTP timeout is around
-/// ten seconds, and what an external system does with a timeout is *redeliver*.
-/// A routine firing has no dedupe key, so waiting here would turn one CI
-/// notification into two or three runs of the same several-minute routine. The
-/// counts in the body are therefore what the event **matched**, not what
-/// finished: both are reads, so they are cheap and repeatable.
-///
-/// The content type is not checked — a hook may post JSON, a form or plain text
-/// — because nothing here parses it: the body is read as text (lossily, so a
-/// binary payload is still an event rather than an error), summarised onto the
-/// run record, and handed to the routine's turn fenced as data. What the caller
-/// posts is never a command.
-async fn inbound_hook(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    body: axum::body::Bytes,
-) -> Result<Json<Value>, ApiError> {
-    let event = komo_core::domain::trigger::ExternalEvent::Webhook {
-        name: name.clone(),
-        body: String::from_utf8_lossy(&body).into_owned(),
-    };
-    let matched = state.dispatcher.on_external_event_detached(&event).await;
-    info!(
-        hook = %name,
-        routines = matched.routines,
-        wakeups = matched.wakeups,
-        "webhook received"
-    );
-    Ok(Json(
-        json!({ "routines": matched.routines, "wakeups": matched.wakeups }),
-    ))
 }
 
 /// Constant-time bearer-token check. Both sides are SHA-256'd to a fixed-size
@@ -1909,69 +1852,6 @@ mod tests {
             .await
             .unwrap();
         assert!(res.headers().get("access-control-allow-origin").is_none());
-    }
-
-    /// The hook route as the real router mounts it: behind the same bearer-key
-    /// layer, with the same body limit.
-    fn hook_test_router() -> Router {
-        Router::new()
-            // Reads the body, like the real handler: the limit is enforced by
-            // the extractor, so a handler that ignores the body never hits it.
-            .route(
-                "/api/hooks/{name}",
-                post(|_: axum::body::Bytes| async { "fired" }),
-            )
-            .route_layer(DefaultBodyLimit::max(HOOK_BODY_LIMIT))
-            .route_layer(middleware::from_fn_with_state(
-                Arc::new("s3cret".to_string()),
-                require_auth,
-            ))
-    }
-
-    fn hook_request(auth: Option<&str>, body: &str) -> Request {
-        let mut builder = Request::builder()
-            .method(Method::POST)
-            .uri("/api/hooks/ci-done");
-        if let Some(key) = auth {
-            builder = builder.header("authorization", format!("Bearer {key}"));
-        }
-        builder
-            .body(axum::body::Body::from(body.to_string()))
-            .unwrap()
-    }
-
-    /// A webhook's caller is an external system, so the key is the whole gate —
-    /// there is no loopback exemption to fall back on, and no key means 401.
-    #[tokio::test]
-    async fn a_webhook_without_the_key_is_refused() {
-        use tower::ServiceExt;
-
-        for auth in [None, Some("wrong")] {
-            let res = hook_test_router()
-                .oneshot(hook_request(auth, "build failed"))
-                .await
-                .unwrap();
-            assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{auth:?}");
-        }
-        let res = hook_test_router()
-            .oneshot(hook_request(Some("s3cret"), "build failed"))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    /// And a body larger than the cap is refused rather than read: nothing here
-    /// parses a hook payload, so there is no reason to accept a big one.
-    #[tokio::test]
-    async fn an_oversized_webhook_body_is_refused() {
-        use tower::ServiceExt;
-
-        let huge = "x".repeat(HOOK_BODY_LIMIT + 1);
-        let res = hook_test_router()
-            .oneshot(hook_request(Some("s3cret"), &huge))
-            .await
-            .unwrap();
-        assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

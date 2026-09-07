@@ -1,5 +1,5 @@
-//! Routines: work the gateway runs unattended when something happens — a cron
-//! slot, a named moment, and (5.12–5.14) an external event.
+//! Routines: work the gateway runs unattended when its moment comes — a cron
+//! slot or a named moment.
 //!
 //! A routine is a [`CronJob`]: a [`Trigger`], an action, and the [`RoutineRun`]
 //! history of its firings. Jobs live in the **durable** `cron_job_records` —
@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use croner::Cron;
 
 use crate::domain::policy::{Rule, RuleSpec};
-use crate::domain::trigger::{ExternalEvent, FeishuEvent};
 
 /// Default wall-clock budget for a job command — hermes' cron-job budget
 /// (15 min), generous enough for a script that clones a repo and pushes an MR.
@@ -104,120 +103,16 @@ pub fn parse_cron_job_status(s: &str) -> CronJobStatus {
     }
 }
 
-/// What makes a routine fire (docs/bot-runtime.md §3.3). Replaces the bare
-/// schedule string: a routine is "run this when X happens", and a cron slot is
-/// only one shape of X.
-///
-/// Two variants are **schedule-shaped** — `Cron` and `At` name a moment the
-/// sweep computes in advance, which is what `next_run_at` holds. The
-/// event-shaped ones (`Feishu`, `Webhook`, `FileChanged`) name no moment at
-/// all, so a job triggered only by them never becomes *due* and the sweep
-/// passes over it: it fires from its own ingress instead, through
-/// [`Trigger::matched_by`] (docs/bot-runtime.md §5.12–5.14).
+/// What makes a routine fire (docs/bot-runtime.md §3.3). Both shapes name a
+/// moment the sweep computes in advance, which is what `next_run_at` holds.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Trigger {
     /// 5-field cron expression, local timezone.
-    Cron {
-        expr: String,
-    },
+    Cron { expr: String },
     /// One local moment (unix seconds) — the `@at` one-shot, resolved to its
     /// instant when the job is created.
-    At {
-        at: i64,
-    },
-    Feishu {
-        chat: String,
-        #[serde(rename = "match")]
-        matcher: FeishuMatch,
-    },
-    Webhook {
-        name: String,
-    },
-    FileChanged {
-        root: std::path::PathBuf,
-        glob: String,
-    },
-    /// Any of these fires the routine. Capped at [`MAX_ANY_TRIGGERS`]; one
-    /// firing is one [`RoutineRun`], whose `event` names the member that hit.
-    Any {
-        triggers: Vec<Trigger>,
-    },
-}
-
-/// How a feishu message is matched to a routine.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum FeishuMatch {
-    Mention,
-    Keyword { keywords: Vec<String> },
-    Reaction { emoji: String },
-}
-
-impl FeishuMatch {
-    pub fn describe(&self) -> String {
-        match self {
-            Self::Mention => "mention".to_string(),
-            Self::Keyword { keywords } => format!("keyword {}", keywords.join("/")),
-            Self::Reaction { emoji } => format!("reaction {emoji}"),
-        }
-    }
-
-    /// Whether this is the message (or reaction) the routine is watching for.
-    ///
-    /// A reaction and a message are different arrivals: an emoji carries no
-    /// text, so a keyword rule must never read one as an empty message that
-    /// happens not to match, and a `Reaction` rule must never fire on a message
-    /// quoting the emoji.
-    pub fn matches(&self, event: &FeishuEvent) -> bool {
-        match (self, &event.reaction) {
-            (Self::Mention, None) => event.mention,
-            (Self::Keyword { keywords }, None) => {
-                let text = event.text.to_lowercase();
-                keywords.iter().any(|keyword| {
-                    let keyword = keyword.trim().to_lowercase();
-                    !keyword.is_empty() && text.contains(&keyword)
-                })
-            }
-            (Self::Reaction { emoji }, Some(arrived)) => arrived.eq_ignore_ascii_case(emoji),
-            _ => false,
-        }
-    }
-}
-
-/// How many listeners one `Any` may hold — the set is re-read on every sweep
-/// tick, and a routine nobody can read is not a routine.
-pub const MAX_ANY_TRIGGERS: usize = 8;
-
-/// Compile a `FileChanged` glob, or say why it cannot be one. The same matcher
-/// the `glob` and `grep` tools use, so one syntax holds everywhere a glob is
-/// typed. An empty pattern means "anything under the root".
-pub fn compile_glob(glob: &str) -> anyhow::Result<globset::GlobMatcher> {
-    let pattern = match glob.trim() {
-        "" => "**",
-        pattern => pattern,
-    };
-    Ok(globset::Glob::new(pattern)?.compile_matcher())
-}
-
-/// Whether a changed path is one this trigger watches: under its root, and
-/// matched by its glob **relative to that root** — a glob is written about the
-/// tree, not about where the tree happens to live.
-///
-/// A pattern that no longer compiles matches nothing rather than everything:
-/// glob validity is proven where a routine is created, so the only way here is
-/// a hand-edited row, and the safe reading of one is silence.
-fn path_matches(root: &std::path::Path, glob: &str, path: &std::path::Path) -> bool {
-    let Ok(relative) = path.strip_prefix(root) else {
-        return false;
-    };
-    match compile_glob(glob) {
-        Ok(matcher) => matcher.is_match(relative),
-        Err(error) => {
-            tracing::warn!(%error, glob, "unparseable routine glob matches nothing");
-            false
-        }
-    }
+    At { at: i64 },
 }
 
 impl Trigger {
@@ -227,108 +122,22 @@ impl Trigger {
         }
     }
 
-    /// Does this trigger name moments a scheduler can compute? Event-shaped
-    /// triggers do not, and a job made only of them is never *due* — it waits.
-    pub fn is_scheduled(&self) -> bool {
-        match self {
-            Self::Cron { .. } | Self::At { .. } => true,
-            Self::Any { triggers } => triggers.iter().any(Self::is_scheduled),
-            _ => false,
-        }
-    }
-
     /// Does it fire again after the slot it is on? A `Cron` does; an `At` is
     /// spent once it has passed.
     pub fn recurs(&self) -> bool {
-        match self {
-            Self::Cron { .. } => true,
-            Self::Any { triggers } => triggers.iter().any(Self::recurs),
-            _ => false,
-        }
+        matches!(self, Self::Cron { .. })
     }
 
-    /// The next moment this trigger fires strictly after `after`, with the
-    /// member that owns it.
+    /// The next moment this trigger fires strictly after `after`.
     ///
-    /// `Ok(None)` = nothing left to fire (event-only, or every one-shot spent);
-    /// `Err` = an expression that no longer parses, which pauses the job rather
-    /// than erroring every tick.
-    pub fn next_slot(&self, after: i64) -> anyhow::Result<Option<(i64, &Trigger)>> {
+    /// `Ok(None)` = nothing left to fire (a spent one-shot); `Err` = an
+    /// expression that no longer parses, which pauses the job rather than
+    /// erroring every tick.
+    pub fn next_slot(&self, after: i64) -> anyhow::Result<Option<i64>> {
         match self {
-            Self::Cron { expr } => Ok(Some((next_occurrence_local(expr, after)?, self))),
-            Self::At { at } => Ok((*at > after).then_some((*at, self))),
-            Self::Any { triggers } => {
-                let mut soonest: Option<(i64, &Trigger)> = None;
-                for member in triggers {
-                    if let Some(slot) = member.next_slot(after)?
-                        && soonest.is_none_or(|(at, _)| slot.0 < at)
-                    {
-                        soonest = Some(slot);
-                    }
-                }
-                Ok(soonest)
-            }
-            _ => Ok(None),
+            Self::Cron { expr } => Ok(Some(next_occurrence_local(expr, after)?)),
+            Self::At { at } => Ok((*at > after).then_some(*at)),
         }
-    }
-
-    /// Which member is responsible for a fire at `slot` — the one whose own
-    /// occurrence *is* that slot. Two members landing on one slot answer the
-    /// first: one firing is one run, so the record names one of them.
-    pub fn owner_of(&self, slot: i64) -> Option<&Trigger> {
-        match self {
-            Self::Cron { expr } => next_occurrence_local(expr, slot - 1)
-                .is_ok_and(|next| next == slot)
-                .then_some(self),
-            Self::At { at } => (*at == slot).then_some(self),
-            Self::Any { triggers } => triggers.iter().find_map(|m| m.owner_of(slot)),
-            _ => None,
-        }
-    }
-
-    /// Which member this external event fires, if any (docs/bot-runtime.md
-    /// §5.12–5.14).
-    ///
-    /// At most one: an `Any` whose members both match one arrival answers the
-    /// first, because one thing happening is one [`RoutineRun`] — and the run
-    /// has to name *a* member, or "why did that fire?" has no answer (§8,
-    /// criterion 5).
-    pub fn matched_by(&self, event: &ExternalEvent) -> Option<&Trigger> {
-        match (self, event) {
-            (Self::Webhook { name }, ExternalEvent::Webhook { name: arrived, .. }) => {
-                (name == arrived).then_some(self)
-            }
-            (Self::Feishu { chat, matcher }, ExternalEvent::Feishu(arrived)) => {
-                (chat == &arrived.chat && matcher.matches(arrived)).then_some(self)
-            }
-            (Self::FileChanged { root, glob }, ExternalEvent::FileChanged { paths }) => paths
-                .iter()
-                .any(|path| path_matches(root, glob, path))
-                .then_some(self),
-            (Self::Any { triggers }, _) => triggers.iter().find_map(|m| m.matched_by(event)),
-            _ => None,
-        }
-    }
-
-    /// Whether anything here listens for a chat reaction.
-    ///
-    /// Asked by the feishu ingress before it resolves a reaction's chat: that
-    /// costs an API call per emoji in every chat the bot can see, and is worth
-    /// paying only when some routine could possibly care.
-    pub fn watches_reactions(&self) -> bool {
-        match self {
-            Self::Feishu { matcher, .. } => matches!(matcher, FeishuMatch::Reaction { .. }),
-            Self::Any { triggers } => triggers.iter().any(Self::watches_reactions),
-            _ => false,
-        }
-    }
-
-    /// The one-line account of an event-driven firing: which member matched,
-    /// and what arrived. The counterpart of [`Trigger::slot_event`] for the
-    /// triggers that have no slot.
-    pub fn event_line(&self, event: &ExternalEvent) -> String {
-        let owner = self.matched_by(event).unwrap_or(self);
-        format!("{} · {}", owner.describe(), event.summary())
     }
 
     /// One line naming this trigger, for listings and approval prompts.
@@ -336,28 +145,6 @@ impl Trigger {
         match self {
             Self::Cron { expr } => format!("cron `{expr}`"),
             Self::At { at } => format!("@at {}", local_minute(*at)),
-            Self::Feishu { chat, matcher } => format!("feishu {chat} {}", matcher.describe()),
-            Self::Webhook { name } => format!("webhook `{name}`"),
-            Self::FileChanged { root, glob } => format!("file {}/{glob}", root.display()),
-            Self::Any { triggers } => format!(
-                "any({})",
-                triggers
-                    .iter()
-                    .map(Self::describe)
-                    .collect::<Vec<_>>()
-                    .join(" | ")
-            ),
-        }
-    }
-
-    /// The one-line account of *why this run happened*, recorded on the
-    /// [`RoutineRun`]. For an `Any` this is what says which member matched —
-    /// without it "why did that fire?" has no answer in the record.
-    pub fn slot_event(&self, slot: i64) -> String {
-        match self.owner_of(slot) {
-            Some(at @ Self::At { .. }) => at.describe(),
-            Some(owner) => format!("{} @ {}", owner.describe(), local_minute(slot)),
-            None => format!("{} @ {}", self.describe(), local_minute(slot)),
         }
     }
 }
@@ -460,9 +247,6 @@ pub struct RoutineRun {
     pub id: String,
     pub status: RoutineRunStatus,
     pub started_at: i64,
-    /// What set it off, in one line — the cron slot, the matched trigger, the
-    /// message. A routine that does not record this cannot say why it ran.
-    pub event: String,
     /// Ledger session of an agent-mode run; `None` for a command job.
     #[serde(default)]
     pub session_id: Option<String>,
@@ -561,8 +345,7 @@ impl CronAction {
 pub struct CronJob {
     pub id: String,
     pub name: String,
-    /// What makes it fire. Schedule-shaped triggers drive `next_run_at`;
-    /// event-shaped ones wait for their event.
+    /// What makes it fire — the moment `next_run_at` holds.
     pub trigger: Trigger,
     /// What the job does when it fires (command vs agent turn).
     pub action: CronAction,
@@ -577,7 +360,6 @@ pub struct CronJob {
     /// `next_run_at` is due, then advances it — set to "now" to trigger an
     /// off-schedule run on the next sweep tick. For a `Done` one-shot this
     /// keeps the slot that fired.
-    /// `0` = nothing scheduled (an event-only trigger).
     pub next_run_at: i64,
     /// Where a run's outcome is delivered. `Always` = today's behaviour.
     #[serde(default)]
@@ -644,7 +426,7 @@ impl CronJob {
     }
 
     /// Due = active and a scheduled fire time has arrived. `next_run_at == 0`
-    /// is "no moment": an event-only routine waits rather than firing at once.
+    /// is "no moment", which never fires.
     pub fn is_due(&self, now: i64) -> bool {
         self.status == CronJobStatus::Active && self.next_run_at > 0 && self.next_run_at <= now
     }
@@ -652,13 +434,12 @@ impl CronJob {
     /// Claim this firing: record it as `running` before the action starts, so a
     /// crash mid-run leaves the record of what was in flight. Answers the run's
     /// id, which [`CronJob::finish_run`] settles.
-    pub fn begin_run(&mut self, started_at: i64, event: String) -> String {
+    pub fn begin_run(&mut self, started_at: i64) -> String {
         let id = uuid::Uuid::now_v7().to_string();
         self.runs.push(RoutineRun {
             id: id.clone(),
             status: RoutineRunStatus::Running,
             started_at,
-            event,
             session_id: None,
             output: String::new(),
         });
@@ -709,7 +490,7 @@ impl CronJob {
         // old behaviour (run it): refusing because the trigger puzzled us would
         // be a worse failure than running late.
         match self.trigger.next_slot(self.next_run_at) {
-            Ok(Some((following, _))) if late_by >= (following - self.next_run_at).max(1) => {
+            Ok(Some(following)) if late_by >= (following - self.next_run_at).max(1) => {
                 CatchUpVerdict::TooLate { late_by }
             }
             _ => CatchUpVerdict::Late { late_by },
@@ -719,7 +500,7 @@ impl CronJob {
     /// One-shot job: fires once, then completes (`Done`) instead of
     /// rescheduling.
     pub fn is_once(&self) -> bool {
-        self.trigger.is_scheduled() && !self.trigger.recurs()
+        !self.trigger.recurs()
     }
 
     /// This job's grants as policy rules.
@@ -889,10 +670,7 @@ mod trigger_tests {
     #[test]
     fn a_spent_one_shot_has_no_next_slot_but_a_cron_always_does() {
         let moment = 1_767_225_600;
-        assert_eq!(
-            at(moment).next_slot(moment - 1).unwrap().map(|(t, _)| t),
-            Some(moment)
-        );
+        assert_eq!(at(moment).next_slot(moment - 1).unwrap(), Some(moment));
         assert!(at(moment).next_slot(moment).unwrap().is_none());
         assert!(
             Trigger::cron("0 8 * * *")
@@ -902,312 +680,30 @@ mod trigger_tests {
         );
     }
 
-    /// The soonest member wins, and once the one-shot is spent the recurring
-    /// member carries the job on — which is why an `Any` holding both is not a
-    /// one-shot.
-    #[test]
-    fn any_schedules_to_its_soonest_member() {
-        let moment = 1_767_225_600;
-        let any = Trigger::Any {
-            triggers: vec![Trigger::cron("0 8 * * *"), at(moment)],
-        };
-        let cron_slot = Trigger::cron("0 8 * * *")
-            .next_slot(moment - 86_400)
-            .unwrap()
-            .unwrap()
-            .0;
-        let (soonest, _) = any.next_slot(moment - 86_400).unwrap().unwrap();
-        assert_eq!(soonest, cron_slot.min(moment));
-        assert!(any.recurs());
-        assert!(any.is_scheduled());
-    }
-
-    /// Judgement 5: two members due at the same moment produce one run, and the
-    /// event says which of them owns it.
-    #[test]
-    fn a_slot_two_members_share_is_owned_by_one_of_them() {
-        // A slot `0 8 * * *` really lands on, so both members claim it.
-        let slot = next_occurrence_local("0 8 * * *", 1_767_225_600).unwrap();
-        let any = Trigger::Any {
-            triggers: vec![Trigger::cron("0 8 * * *"), at(slot)],
-        };
-        let owner = any.owner_of(slot).expect("one of them owns the slot");
-        assert!(matches!(owner, Trigger::Cron { .. }), "{owner:?}");
-        let event = any.slot_event(slot);
-        assert!(event.contains("0 8 * * *"), "{event}");
-        assert!(
-            !event.contains("any("),
-            "the event names the member, not the set"
-        );
-
-        // The other way round: only the one-shot owns a moment cron never hits.
-        let odd = slot + 61;
-        let any = Trigger::Any {
-            triggers: vec![Trigger::cron("0 8 * * *"), at(odd)],
-        };
-        assert_eq!(any.owner_of(odd), Some(&at(odd)));
-        assert!(
-            any.slot_event(odd).starts_with("@at"),
-            "{}",
-            any.slot_event(odd)
-        );
-    }
-
-    /// Defined but not fired this round: an event-only trigger has no moment,
-    /// so the sweep never finds the job due.
-    #[test]
-    fn event_triggers_have_no_occurrence() {
-        for trigger in [
-            Trigger::Webhook { name: "ci".into() },
-            Trigger::Feishu {
-                chat: "oc_x".into(),
-                matcher: FeishuMatch::Mention,
-            },
-            Trigger::FileChanged {
-                root: "/srv/notes".into(),
-                glob: "**/*.md".into(),
-            },
-        ] {
-            assert!(!trigger.is_scheduled(), "{trigger:?}");
-            assert!(trigger.next_slot(0).unwrap().is_none(), "{trigger:?}");
-            let job = CronJob::new_command("j", trigger, "/bin/true", 0);
-            assert!(!job.is_due(i64::MAX), "an event-only routine is never due");
-        }
-    }
-
     #[test]
     fn a_broken_expression_is_an_error_not_an_absent_slot() {
         assert!(Trigger::cron("not a cron").next_slot(0).is_err());
-        assert!(
-            Trigger::Any {
-                triggers: vec![Trigger::cron("not a cron")]
-            }
-            .next_slot(0)
-            .is_err()
-        );
-    }
-
-    fn feishu(chat: &str, matcher: FeishuMatch) -> Trigger {
-        Trigger::Feishu {
-            chat: chat.into(),
-            matcher,
-        }
-    }
-
-    fn message(chat: &str, text: &str) -> ExternalEvent {
-        ExternalEvent::Feishu(FeishuEvent {
-            chat: chat.into(),
-            sender: "ou_stranger".into(),
-            text: text.into(),
-            ..Default::default()
-        })
-    }
-
-    #[test]
-    fn a_webhook_trigger_answers_to_its_own_name_only() {
-        let trigger = Trigger::Webhook { name: "ci".into() };
-        let fired = ExternalEvent::Webhook {
-            name: "ci".into(),
-            body: "ok".into(),
-        };
-        assert_eq!(trigger.matched_by(&fired), Some(&trigger));
-        assert!(
-            trigger
-                .matched_by(&ExternalEvent::Webhook {
-                    name: "deploy".into(),
-                    body: String::new()
-                })
-                .is_none()
-        );
-        // A chat message is not a hook, whatever it says.
-        assert!(trigger.matched_by(&message("oc_x", "ci")).is_none());
-    }
-
-    /// A keyword rule reads the message text; the chat is part of the address,
-    /// so the same words in another group are another conversation.
-    #[test]
-    fn a_feishu_keyword_matches_its_own_chat() {
-        let trigger = feishu(
-            "oc_x",
-            FeishuMatch::Keyword {
-                keywords: vec!["值班".into(), "Oncall".into()],
-            },
-        );
-        assert!(
-            trigger
-                .matched_by(&message("oc_x", "今天谁值班？"))
-                .is_some()
-        );
-        // Case-insensitive, so a keyword typed in either case still works.
-        assert!(
-            trigger
-                .matched_by(&message("oc_x", "who is oncall"))
-                .is_some()
-        );
-        assert!(trigger.matched_by(&message("oc_x", "早")).is_none());
-        assert!(
-            trigger
-                .matched_by(&message("oc_y", "今天谁值班？"))
-                .is_none()
-        );
-    }
-
-    /// A reaction and a message are different arrivals: an emoji has no text
-    /// for a keyword rule to read, and a message quoting the emoji name is not
-    /// somebody reacting.
-    #[test]
-    fn a_reaction_and_a_message_never_stand_in_for_each_other() {
-        let reaction_rule = feishu(
-            "oc_x",
-            FeishuMatch::Reaction {
-                emoji: "THUMBSUP".into(),
-            },
-        );
-        let keyword_rule = feishu(
-            "oc_x",
-            FeishuMatch::Keyword {
-                keywords: vec!["THUMBSUP".into()],
-            },
-        );
-        let mention_rule = feishu("oc_x", FeishuMatch::Mention);
-        let reacted = ExternalEvent::Feishu(FeishuEvent {
-            chat: "oc_x".into(),
-            sender: "ou_stranger".into(),
-            reaction: Some("THUMBSUP".into()),
-            ..Default::default()
-        });
-        assert!(reaction_rule.matched_by(&reacted).is_some());
-        assert!(keyword_rule.matched_by(&reacted).is_none());
-        assert!(mention_rule.matched_by(&reacted).is_none());
-        assert!(
-            reaction_rule
-                .matched_by(&message("oc_x", "THUMBSUP"))
-                .is_none()
-        );
-
-        let mentioned = ExternalEvent::Feishu(FeishuEvent {
-            chat: "oc_x".into(),
-            mention: true,
-            text: "帮我看看".into(),
-            ..Default::default()
-        });
-        assert!(mention_rule.matched_by(&mentioned).is_some());
-        assert!(
-            mention_rule
-                .matched_by(&message("oc_x", "帮我看看"))
-                .is_none()
-        );
-    }
-
-    /// The glob is written about the tree, not about where the tree lives: it
-    /// is matched against the path *relative* to the root, and a path outside
-    /// the root is not this routine's business at all.
-    #[test]
-    fn a_file_trigger_matches_its_glob_under_its_root() {
-        let trigger = Trigger::FileChanged {
-            root: "/srv/notes".into(),
-            glob: "**/*.md".into(),
-        };
-        let changed = |paths: &[&str]| ExternalEvent::FileChanged {
-            paths: paths.iter().map(std::path::PathBuf::from).collect(),
-        };
-        assert!(
-            trigger
-                .matched_by(&changed(&["/srv/notes/a/b.md"]))
-                .is_some()
-        );
-        assert!(
-            trigger
-                .matched_by(&changed(&["/srv/notes/a.png"]))
-                .is_none()
-        );
-        assert!(trigger.matched_by(&changed(&["/srv/other/a.md"])).is_none());
-        // One matching path in a batch is enough — the batch is one event.
-        assert!(
-            trigger
-                .matched_by(&changed(&["/srv/notes/a.png", "/srv/notes/b.md"]))
-                .is_some()
-        );
-        // An empty glob is "anything under the root".
-        let anything = Trigger::FileChanged {
-            root: "/srv/notes".into(),
-            glob: String::new(),
-        };
-        assert!(
-            anything
-                .matched_by(&changed(&["/srv/notes/a.png"]))
-                .is_some()
-        );
-    }
-
-    /// Criterion 5, on the event side: an `Any` whose members both match one
-    /// arrival fires once, and the line names the member that owns it.
-    #[test]
-    fn an_any_matched_twice_by_one_event_names_one_member() {
-        let keyword = feishu(
-            "oc_x",
-            FeishuMatch::Keyword {
-                keywords: vec!["部署".into()],
-            },
-        );
-        let any = Trigger::Any {
-            triggers: vec![keyword.clone(), feishu("oc_x", FeishuMatch::Mention)],
-        };
-        let both = ExternalEvent::Feishu(FeishuEvent {
-            chat: "oc_x".into(),
-            sender: "张三".into(),
-            text: "该部署了".into(),
-            mention: true,
-            ..Default::default()
-        });
-        assert_eq!(any.matched_by(&both), Some(&keyword));
-        let line = any.event_line(&both);
-        assert!(line.contains("keyword 部署"), "{line}");
-        assert!(!line.contains("any("), "the line names the member: {line}");
-        assert!(line.contains("该部署了"), "and what arrived: {line}");
-
-        // And a member that did not match is never the one named.
-        let webhook_any = Trigger::Any {
-            triggers: vec![keyword, Trigger::Webhook { name: "ci".into() }],
-        };
-        let hook = ExternalEvent::Webhook {
-            name: "ci".into(),
-            body: "build 12 ok".into(),
-        };
-        let line = webhook_any.event_line(&hook);
-        assert!(line.starts_with("webhook `ci`"), "{line}");
-    }
-
-    /// A clock-shaped trigger has nothing to say about an event, and an
-    /// event-shaped one nothing to say about a slot.
-    #[test]
-    fn a_schedule_is_never_matched_by_an_event() {
-        let hook = ExternalEvent::Webhook {
-            name: "ci".into(),
-            body: String::new(),
-        };
-        assert!(Trigger::cron("0 8 * * *").matched_by(&hook).is_none());
-        assert!(Trigger::At { at: 42 }.matched_by(&hook).is_none());
     }
 
     #[test]
     fn triggers_roundtrip_through_json() {
-        let trigger = Trigger::Any {
-            triggers: vec![
-                Trigger::cron("0 8 * * *"),
-                Trigger::At { at: 42 },
-                Trigger::Feishu {
-                    chat: "oc_x".into(),
-                    matcher: FeishuMatch::Keyword {
-                        keywords: vec!["值班".into()],
-                    },
-                },
-            ],
-        };
-        let json = serde_json::to_string(&trigger).unwrap();
-        assert!(json.contains("\"kind\":\"any\""), "{json}");
-        assert!(json.contains("\"match\""), "{json}");
-        assert_eq!(serde_json::from_str::<Trigger>(&json).unwrap(), trigger);
+        for trigger in [Trigger::cron("0 8 * * *"), Trigger::At { at: 42 }] {
+            let json = serde_json::to_string(&trigger).unwrap();
+            assert_eq!(serde_json::from_str::<Trigger>(&json).unwrap(), trigger);
+        }
+    }
+
+    /// A stored trigger this build no longer understands is refused here, so
+    /// the load path can skip that job instead of guessing at what it meant.
+    #[test]
+    fn a_retired_trigger_shape_no_longer_deserializes() {
+        for stored in [
+            r#"{"kind":"webhook","name":"ci"}"#,
+            r#"{"kind":"file_changed","root":"/srv/notes","glob":"**/*.md"}"#,
+            r#"{"kind":"any","triggers":[{"kind":"cron","expr":"0 8 * * *"}]}"#,
+        ] {
+            assert!(serde_json::from_str::<Trigger>(stored).is_err(), "{stored}");
+        }
     }
 }
 
@@ -1222,7 +718,7 @@ mod run_history_tests {
     #[test]
     fn a_run_is_claimed_running_and_settled_in_place() {
         let mut job = job();
-        let id = job.begin_run(100, "cron `* * * * *` @ x".into());
+        let id = job.begin_run(100);
         assert_eq!(job.last_run().unwrap().status, RoutineRunStatus::Running);
         job.finish_run(&id, RoutineRunStatus::Ok, "done", Some("s1".into()));
         let run = job.last_run().unwrap();
@@ -1236,21 +732,21 @@ mod run_history_tests {
     fn history_keeps_the_newest_runs_only() {
         let mut job = job();
         for n in 0..ROUTINE_RUN_HISTORY + 5 {
-            let id = job.begin_run(n as i64, format!("slot {n}"));
+            let id = job.begin_run(n as i64);
             job.finish_run(&id, RoutineRunStatus::Ok, "", None);
         }
         assert_eq!(job.runs.len(), ROUTINE_RUN_HISTORY);
-        assert_eq!(job.runs[0].event, "slot 5");
+        assert_eq!(job.runs[0].started_at, 5);
         assert_eq!(
-            job.last_run().unwrap().event,
-            format!("slot {}", ROUTINE_RUN_HISTORY + 4)
+            job.last_run().unwrap().started_at,
+            (ROUTINE_RUN_HISTORY + 4) as i64
         );
     }
 
     #[test]
     fn a_long_body_is_capped_in_the_record() {
         let mut job = job();
-        let id = job.begin_run(0, "slot".into());
+        let id = job.begin_run(0);
         job.finish_run(&id, RoutineRunStatus::Ok, &"x".repeat(5_000), None);
         let output = &job.last_run().unwrap().output;
         assert!(output.chars().count() < 5_000);

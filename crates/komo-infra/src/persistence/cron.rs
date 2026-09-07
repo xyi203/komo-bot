@@ -110,7 +110,9 @@ pub(crate) async fn import_from(path: &Path) -> anyhow::Result<Vec<CronJob>> {
         .with_context(|| format!("opening {} to merge it in", path.display()))?;
     let mut conn = db.connection().await?;
     let rows = toasty::query!(CronJobRecord).exec(&mut conn).await?;
-    rows.into_iter().map(job_from_record).collect()
+    rows.into_iter()
+        .filter_map(|record| job_from_record(record).transpose())
+        .collect()
 }
 
 /// One-time migration from the pre-status schema: `enabled` (0/1) becomes the
@@ -219,7 +221,6 @@ async fn backfill_triggers(path: &Path) -> anyhow::Result<()> {
                 id: uuid::Uuid::now_v7().to_string(),
                 status: parse_routine_run_status(last_status),
                 started_at: *last_run_at,
-                event: trigger.slot_event(*last_run_at),
                 session_id: (!last_run_session.is_empty()).then(|| last_run_session.clone()),
                 output: last_output.clone(),
             }],
@@ -300,7 +301,7 @@ impl CronJobRepository for Db {
         let rows = toasty::query!(CronJobRecord).exec(&mut conn).await?;
         let mut jobs = rows
             .into_iter()
-            .map(job_from_record)
+            .filter_map(|record| job_from_record(record).transpose())
             .collect::<anyhow::Result<Vec<_>>>()?;
         jobs.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(jobs)
@@ -311,7 +312,7 @@ impl CronJobRepository for Db {
         let rows = toasty::query!(CronJobRecord).exec(&mut conn).await?;
         for record in rows {
             if record.name == name {
-                return Ok(Some(job_from_record(record)?));
+                return job_from_record(record);
             }
         }
         Ok(None)
@@ -347,13 +348,22 @@ impl CronJobRepository for Db {
         .await
     }
 
+    /// Deletes by row, not by job: a routine whose stored trigger no longer
+    /// reads is exactly the one an operator wants gone, and it never becomes a
+    /// `CronJob` to look an id up on.
     async fn delete(&self, name: &str) -> anyhow::Result<bool> {
-        let Some(job) = self.find_by_name(name).await? else {
+        let mut conn = self.inner.connection().await?;
+        let rows = toasty::query!(CronJobRecord).exec(&mut conn).await?;
+        let Some(id) = rows
+            .into_iter()
+            .find(|record| record.name == name)
+            .map(|record| record.id)
+        else {
             return Ok(false);
         };
         with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
-            let record = CronJobRecord::get_by_id(&mut conn, &job.id).await?;
+            let record = CronJobRecord::get_by_id(&mut conn, &id).await?;
             record.delete().exec(&mut conn).await?;
             Ok(())
         })
@@ -437,7 +447,24 @@ fn encode_runs(runs: &[RoutineRun]) -> anyhow::Result<String> {
     Ok(serde_json::to_string(runs)?)
 }
 
-fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
+/// One row as a job, or `None` when its stored trigger is a shape this build no
+/// longer has — a routine that fired on an event rather than a clock. Skipped
+/// and named, never guessed at: reading it as some clock trigger would make a
+/// job run at a time nobody asked for, and failing the read would take every
+/// other routine down with it.
+fn job_from_record(record: CronJobRecord) -> anyhow::Result<Option<CronJob>> {
+    let trigger: Trigger = match serde_json::from_str(&record.trigger) {
+        Ok(trigger) => trigger,
+        Err(error) => {
+            tracing::warn!(
+                job = %record.name,
+                stored = %record.trigger,
+                %error,
+                "skipping a cron job whose trigger this build cannot read"
+            );
+            return Ok(None);
+        }
+    };
     // Default to command for legacy rows written before `kind` existed.
     let action = if record.kind == "agent" {
         CronAction::Agent {
@@ -457,16 +484,10 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
             timeout_secs: record.timeout_secs.max(0) as u64,
         }
     };
-    Ok(CronJob {
+    Ok(Some(CronJob {
         id: record.id,
         name: record.name,
-        // Every row has one by the time this runs: `ensure_schema` repairs the
-        // pre-`Trigger` shape before toasty opens the file. A row that somehow
-        // has neither falls back to its retired schedule column, and the sweep
-        // pauses it with the parse error — a visible stop, never a listing that
-        // fails for every other job too.
-        trigger: serde_json::from_str(&record.trigger)
-            .unwrap_or_else(|_| Trigger::cron(&record.schedule)),
+        trigger,
         action,
         status: parse_cron_job_status(&record.status),
         catch_up: parse_catch_up(&record.catch_up),
@@ -478,7 +499,7 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
         // A row written before the column existed reads as empty, which is the
         // same thing as "no grants" — never an error.
         grants: serde_json::from_str(&record.grants).unwrap_or_default(),
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -540,7 +561,7 @@ mod tests {
         updated.next_run_at = 9999;
         updated.notify = NotifyPolicy::OnError;
         updated.last_error = "exit status: 3".into();
-        let run = updated.begin_run(5000, "cron `0 14 * * 5` @ 2026-01-02 14:00".into());
+        let run = updated.begin_run(5000);
         updated.finish_run(
             &run,
             RoutineRunStatus::Error,
@@ -558,7 +579,6 @@ mod tests {
         assert_eq!(last.status, RoutineRunStatus::Error);
         assert_eq!(last.started_at, 5000);
         assert_eq!(last.output, "boom\n");
-        assert_eq!(last.event, "cron `0 14 * * 5` @ 2026-01-02 14:00");
         assert_eq!(last.session_id.as_deref(), Some("cron:weekly:5000"));
 
         assert!(db.delete("weekly").await.unwrap());
@@ -665,6 +685,67 @@ mod tests {
         assert_eq!(agent.action.kind(), "agent");
     }
 
+    /// A routine stored with a trigger this build no longer has — one that
+    /// fired on an event rather than a clock — is skipped and named, never
+    /// read as some clock trigger and never failing the listing for the jobs
+    /// beside it. It stays deletable, because "get rid of it" is the only
+    /// thing left to do with it.
+    ///
+    /// Its run history still loads: `event` is an unknown field on
+    /// `RoutineRun` now, and serde ignores those.
+    #[tokio::test]
+    async fn a_job_whose_trigger_no_longer_reads_is_skipped_not_fatal() {
+        let home = std::env::temp_dir().join("komo-cron-retired-trigger");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+        let path = home.join("komo.db");
+        let db = Db::connect(&format!("turso:{}", path.display()))
+            .await
+            .unwrap();
+
+        let mut nightly =
+            CronJob::new_command("nightly", Trigger::cron("0 3 * * *"), "/bin/true", 3000);
+        let run = nightly.begin_run(2000);
+        nightly.finish_run(&run, RoutineRunStatus::Ok, "ok", None);
+        db.save(&nightly).await.unwrap();
+
+        // The row a `@webhook ci` routine left behind, run history and all.
+        let mut hooked = CronJob::new_command("on-ci", Trigger::cron("0 3 * * *"), "/bin/true", 0);
+        hooked.id = "id-hooked".into();
+        db.save(&hooked).await.unwrap();
+        {
+            let mut conn = db.inner.connection().await.unwrap();
+            let mut record = CronJobRecord::get_by_id(&mut conn, "id-hooked")
+                .await
+                .unwrap();
+            record
+                .update()
+                .trigger(r#"{"kind":"webhook","name":"ci"}"#.to_string())
+                .runs(
+                    r#"[{"id":"r1","status":"ok","started_at":10,"event":"webhook `ci`","output":"done"}]"#
+                        .to_string(),
+                )
+                .exec(&mut conn)
+                .await
+                .unwrap();
+        }
+
+        let listed = db.list().await.unwrap();
+        assert_eq!(
+            listed.iter().map(|j| j.name.as_str()).collect::<Vec<_>>(),
+            vec!["nightly"],
+            "the readable routine survives its neighbour"
+        );
+        assert_eq!(
+            listed[0].last_run().unwrap().output,
+            "ok",
+            "a run written with an `event` field still deserializes"
+        );
+        assert!(db.find_by_name("on-ci").await.unwrap().is_none());
+        assert!(db.delete("on-ci").await.unwrap(), "and it can be removed");
+        assert!(!db.delete("on-ci").await.unwrap());
+    }
+
     /// The one-time repair, on a row in the shape the store actually held
     /// before `Trigger`: a `@at` schedule becomes the moment it named, the four
     /// `last_*` fields become the single run they described, and running it
@@ -735,7 +816,6 @@ mod tests {
         assert_eq!(run.started_at, 2000);
         assert_eq!(run.output, "disk full");
         assert_eq!(run.session_id.as_deref(), Some("sess-1"));
-        assert!(run.event.contains("0 3 * * *"), "{}", run.event);
 
         // A spent one-shot keeps the moment it named — a `Trigger::At`, past or
         // not, because the record still has to say what it was.
@@ -882,7 +962,7 @@ mod tests {
         assert_eq!(rules[0].value, "climate.set_temperature");
 
         let mut updated = found;
-        let run = updated.begin_run(999, "cron `0 22 * * *` @ slot".into());
+        let run = updated.begin_run(999);
         updated.finish_run(&run, RoutineRunStatus::Ok, "26", None);
         db.update(&updated).await.unwrap();
         let again = db.find_by_name("ac-temp").await.unwrap().unwrap();

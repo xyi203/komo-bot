@@ -1,16 +1,12 @@
-//! An arrival → the standing wakes it fires (docs/bot-runtime.md §3.7, §5.12).
+//! An arrival → the standing wakes it fires (docs/bot-runtime.md §3.7).
 //!
 //! The thin shell around [`komo_core::domain::trigger`]: that decides whether a
 //! filter is about the thing that arrived, this reads the registrations, claims
 //! each hit and wakes what it points at. Split that way because the deciding is
-//! pure and the rest is the store — and because the routine side of an event
-//! (`RoutineEventSource`) is the same shell over the same matcher, differing
-//! only in what a hit turns into.
+//! pure and the rest is the store.
 //!
-//! Two ingresses reach it: every channel's inbound message, through
-//! `GatewayDispatcher::handle`, and a named webhook, through the routine event
-//! source. A feishu message deliberately arrives only by the first — routing it
-//! by both would fire one wait twice.
+//! One ingress reaches it: every channel's inbound message, through
+//! `GatewayDispatcher::handle`.
 //!
 //! **The message keeps its own route.** A trigger never redirects it: whoever
 //! wrote is talking to komo on their own conversation, and that turn happens as
@@ -60,29 +56,12 @@ impl TriggerMatcher {
             .await
     }
 
-    /// The same shell over anything a filter can be written about — a chat
-    /// message, or (§5.12) a named webhook. `payload` is what a woken turn is
-    /// handed: the message itself, or the event's account of what happened.
+    /// The same shell over anything a filter can be written about. `payload` is
+    /// what a woken turn is handed: the message itself, or the arrival's
+    /// account of what happened.
     ///
     /// Best-effort throughout: a trigger store that cannot be read must never
     /// keep the arrival itself from being answered.
-    /// How many standing wakes this arrival matches, claiming and waking
-    /// nothing. What an ingress that must answer before the work is done
-    /// reports (docs/bot-runtime.md §5.12) — a read, so asking twice costs
-    /// nothing and changes nothing.
-    pub async fn count_matching(&self, event: &InboundEvent<'_>) -> usize {
-        if self.dispatch.read().unwrap().is_none() {
-            return 0;
-        }
-        match self.wakeups.list().await {
-            Ok(rows) => matching(&rows, event).len(),
-            Err(error) => {
-                warn!(%error, "could not read standing wakes to count an event's matches");
-                0
-            }
-        }
-    }
-
     pub async fn on_event(&self, event: &InboundEvent<'_>, payload: &str) -> usize {
         let Some(dispatch) = self.dispatch.read().unwrap().clone() else {
             return 0;

@@ -491,10 +491,8 @@ pub struct SweepCx {
     /// `None` = the opt-in sweep is off (unset or a typo'd cron, already
     /// warned about by the host).
     pub dream_schedule: Option<Schedule>,
-    /// Everything a routine firing needs, whatever set it off — the job store,
-    /// the unattended runtime, the notifier, and the standing waits that ride
-    /// the same tick. Host-built and shared, because the three event ingresses
-    /// (§5.12–5.14) fire routines through the very same source.
+    /// Everything a routine firing needs — the job store, the unattended
+    /// runtime, the notifier, and the standing waits that ride the same tick.
     pub routines: Arc<RoutineEventSource>,
 }
 

@@ -86,10 +86,9 @@ fn print_cron_job(job: &CronJob) {
     // job's own record.
     for run in job.runs.iter().rev().take(CRON_RUNS_SHOWN) {
         let mut line = format!(
-            "      run {} {} ({})",
+            "      run {} {}",
             local_time(run.started_at),
-            run.status.as_str(),
-            run.event
+            run.status.as_str()
         );
         if !run.output.is_empty() {
             let first = run.output.lines().next().unwrap_or_default();

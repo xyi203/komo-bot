@@ -37,12 +37,9 @@ impl Plugin for ReviewPlugin {
 /// Routines (`komo cron add`, stored in `cron_job_records`): one every-minute
 /// sweep reads the store and executes the ones whose slot has come, so jobs
 /// added/removed/toggled while the gateway runs take effect on the next tick —
-/// no restart.
-///
-/// It is the *clock* half only: the event-triggered routines (§5.12–5.14) fire
-/// from their own ingresses, through the same shared
-/// [`RoutineEventSource`](komo_bot::daemon::RoutineEventSource) the host
-/// built and handed here.
+/// no restart. The same tick fires the standing wakeups, through the shared
+/// [`RoutineEventSource`](komo_bot::daemon::RoutineEventSource) the host built
+/// and handed here.
 pub struct CronJobsPlugin;
 
 #[async_trait]

@@ -145,11 +145,6 @@ enum ChannelAction {
         /// Channel: feishu | telegram | wechat | api
         channel: String,
     },
-    /// Interactively configure an ingress channel and its credentials
-    Setup {
-        /// Channel: feishu | telegram | wechat
-        channel: String,
-    },
     /// WeChat (微信) channel operator commands
     Wechat {
         #[command(subcommand)]
@@ -680,7 +675,6 @@ pub async fn run() -> anyhow::Result<()> {
         Some(Commands::Channel { action }) => match action {
             ChannelAction::List { json } => channel::list(&config, json).await,
             ChannelAction::Probe { channel: name } => channel::probe(&config, &name).await,
-            ChannelAction::Setup { channel: name } => channel::setup(&config, &name).await,
             ChannelAction::Wechat { action } => match action {
                 WechatAction::Login => wechat::login().await,
             },
@@ -765,9 +759,8 @@ mod tests {
     }
 
     #[test]
-    fn channel_probe_and_setup_accept_supported_channel_names() {
+    fn channel_probe_accepts_supported_channel_names() {
         assert!(Cli::try_parse_from(["komo", "channel", "probe", "telegram"]).is_ok());
-        assert!(Cli::try_parse_from(["komo", "channel", "setup", "telegram"]).is_ok());
     }
 
     #[test]

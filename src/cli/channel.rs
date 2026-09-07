@@ -1,37 +1,16 @@
-//! Channel inventory, setup, and read-only connectivity checks.
+//! Channel inventory and read-only connectivity checks.
 //!
 //! The public interface is intentionally small: `list` renders the resolved
 //! configuration plus the gateway's mounted-channel snapshot; `probe` checks
-//! one provider without sending a message; `setup` owns the interactive
-//! credential/configuration write path.
+//! one provider without sending a message.
 
-use std::{
-    io::{self, IsTerminal, Write},
-    time::Duration,
-};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::json;
 
 use crate::infra::gateway_client::GatewayClient;
 use komo_config::{ApiConfig, ChannelState, ConfigSnapshot};
-
-#[cfg(unix)]
-struct EchoGuard {
-    fd: std::os::fd::RawFd,
-    original: libc::termios,
-}
-
-#[cfg(unix)]
-impl Drop for EchoGuard {
-    fn drop(&mut self) {
-        // Best effort only: a read error must not leave the operator's shell
-        // without echo. (SIGKILL cannot be recovered by any terminal helper.)
-        unsafe {
-            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChannelSummary {
@@ -81,159 +60,12 @@ pub async fn probe(_config: &ConfigSnapshot, name: &str) -> anyhow::Result<()> {
     }
 }
 
-pub async fn setup(config: &ConfigSnapshot, name: &str) -> anyhow::Result<()> {
-    let name = normalize_name(name)?;
-    if name == "api" {
-        anyhow::bail!(
-            "the api channel is already available on loopback. Configure [channels.api] manually \
-             only when you intentionally need external exposure"
-        );
-    }
-    require_terminal()?;
-    match name.as_str() {
-        "feishu" => setup_feishu(config),
-        "telegram" => setup_telegram(config),
-        "wechat" => setup_wechat(config).await,
-        "api" => unreachable!("api is handled before the interactive-terminal check"),
-        _ => unreachable!("normalize_name accepts only built-in channels"),
-    }
-}
-
 fn normalize_name(name: &str) -> anyhow::Result<String> {
     let value = name.trim().to_ascii_lowercase();
     match value.as_str() {
         "feishu" | "telegram" | "wechat" | "api" => Ok(value),
         _ => anyhow::bail!("unknown channel `{name}` (expected feishu | telegram | wechat | api)"),
     }
-}
-
-fn require_terminal() -> anyhow::Result<()> {
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        return Ok(());
-    }
-    anyhow::bail!("`komo channel setup` needs an interactive terminal")
-}
-
-fn prompt(label: &str, required: bool) -> anyhow::Result<String> {
-    print!("{label}");
-    io::stdout().flush()?;
-    let mut value = String::new();
-    io::stdin().read_line(&mut value)?;
-    let value = value.trim().to_string();
-    if required && value.is_empty() {
-        anyhow::bail!("{label} is required")
-    }
-    Ok(value)
-}
-
-/// Read a secret without leaving it in the terminal scrollback. The unix
-/// implementation is deliberately local: operator setup runs on the host
-/// terminal, while non-unix builds retain a functional (but visible) fallback.
-fn prompt_secret(label: &str) -> anyhow::Result<String> {
-    print!("{label}");
-    io::stdout().flush()?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-
-        let stdin = io::stdin();
-        let fd = stdin.as_raw_fd();
-        let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
-        if unsafe { libc::tcgetattr(fd, original.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let original = unsafe { original.assume_init() };
-        let mut hidden = original;
-        hidden.c_lflag &= !libc::ECHO;
-        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &hidden) } != 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        let restore = EchoGuard { fd, original };
-        let mut value = String::new();
-        let read = stdin.read_line(&mut value);
-        drop(restore);
-        println!();
-        read?;
-        let value = value.trim().to_string();
-        if value.is_empty() {
-            anyhow::bail!("{label} is required");
-        }
-        return Ok(value);
-    }
-    #[cfg(not(unix))]
-    {
-        eprintln!("warning: secret input is visible on this platform");
-        prompt(label, true)
-    }
-}
-
-fn report_setup(config_path: &std::path::Path, env_path: Option<&std::path::Path>) {
-    println!("configured {}", config_path.display());
-    if let Some(env_path) = env_path {
-        println!("saved credentials to {}", env_path.display());
-    }
-    println!("Restart the gateway to apply this channel: `komo gateway restart`.");
-}
-
-fn setup_feishu(config: &ConfigSnapshot) -> anyhow::Result<()> {
-    println!("Feishu setup — create an app, then enter its App ID and App Secret.");
-    let app_id = prompt("FEISHU_APP_ID: ", true)?;
-    let app_secret = prompt_secret("FEISHU_APP_SECRET: ")?;
-    komo_config::validate_channel_config(
-        &config.runtime.home,
-        "feishu",
-        [("enabled", toml::Value::Boolean(true))],
-    )?;
-    let env_path = komo_config::write_env_values(
-        &config.runtime.home,
-        &[
-            ("FEISHU_APP_ID", &app_id),
-            ("FEISHU_APP_SECRET", &app_secret),
-        ],
-    )?;
-    let config_path = komo_config::write_channel_config(
-        &config.runtime.home,
-        "feishu",
-        [("enabled", toml::Value::Boolean(true))],
-    )?;
-    report_setup(&config_path, Some(&env_path));
-    Ok(())
-}
-
-fn setup_telegram(config: &ConfigSnapshot) -> anyhow::Result<()> {
-    println!("Telegram setup — create a bot with BotFather, then enter its token.");
-    let token = prompt_secret("TELEGRAM_BOT_TOKEN: ")?;
-    komo_config::validate_channel_config(
-        &config.runtime.home,
-        "telegram",
-        [("enabled", toml::Value::Boolean(true))],
-    )?;
-    let env_path =
-        komo_config::write_env_values(&config.runtime.home, &[("TELEGRAM_BOT_TOKEN", &token)])?;
-    let config_path = komo_config::write_channel_config(
-        &config.runtime.home,
-        "telegram",
-        [("enabled", toml::Value::Boolean(true))],
-    )?;
-    report_setup(&config_path, Some(&env_path));
-    Ok(())
-}
-
-async fn setup_wechat(config: &ConfigSnapshot) -> anyhow::Result<()> {
-    println!("WeChat setup — scan the QR code and confirm on your phone.");
-    komo_config::validate_channel_config(
-        &config.runtime.home,
-        "wechat",
-        [("enabled", toml::Value::Boolean(true))],
-    )?;
-    crate::cli::wechat::login().await?;
-    let config_path = komo_config::write_channel_config(
-        &config.runtime.home,
-        "wechat",
-        [("enabled", toml::Value::Boolean(true))],
-    )?;
-    report_setup(&config_path, None);
-    Ok(())
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
@@ -246,7 +78,7 @@ fn require_ready<'a, T>(name: &str, state: &'a ChannelState<T>) -> anyhow::Resul
     match state {
         ChannelState::Ready(config) => Ok(config),
         ChannelState::Disabled => {
-            anyhow::bail!("{name} is disabled; run `komo channel setup {name}` first")
+            anyhow::bail!("{name} is disabled; enable [channels.{name}] in config.toml first")
         }
         ChannelState::Misconfigured(error) => anyhow::bail!("{name} is misconfigured: {error}"),
     }
@@ -409,7 +241,7 @@ fn wechat_status(state: &ChannelState<komo_config::WeChatConfig>) -> (String, Op
     match state {
         ChannelState::Ready(_) if !komo_config::wechat_cred_path().exists() => (
             "login required".to_string(),
-            Some("run `komo channel wechat login` or `komo channel setup wechat`".to_string()),
+            Some("run `komo channel wechat login`".to_string()),
         ),
         _ => state_status(state),
     }

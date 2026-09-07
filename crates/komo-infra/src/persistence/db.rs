@@ -15,7 +15,6 @@ use crate::persistence::{
 
 use komo_core::domain::{
     awaiting::{Awaiting, project_awaiting},
-    briefing::BriefingMarkRepository,
     context::SessionOrigin,
     cron::CronJobRepository,
     home::HomeRepository,
@@ -70,9 +69,9 @@ struct SessionRecord {
     channel_platform: String,
     channel_peer_id: String,
 
-    /// What drives this conversation (`user` / `cron` / `briefing` /
-    /// `delegate`). Additive column; decides titling, list visibility and
-    /// learning eligibility. Was encoded in the id as a prefix.
+    /// What drives this conversation (`user` / `cron` / `delegate`). Additive
+    /// column; decides titling, list visibility and learning eligibility. Was
+    /// encoded in the id as a prefix.
     origin: String,
 
     /// The wait this session is stopped in, as JSON (empty = not waiting).
@@ -304,8 +303,6 @@ const INBOX_STATUS_COMPLETED: &str = "completed";
 const HOME_SETTING_KEY: &str = "home_chat";
 /// Setting key for the operator's home conversation (D6).
 const HOME_SESSION_KEY: &str = "home_session";
-/// Setting key for the briefing watermark (local date last handled).
-const BRIEFING_MARK_KEY: &str = "briefing_last_handled";
 
 /// Settings key holding how far one session's run projection is committed.
 /// Per session rather than one global cursor: the fold is per session, and a
@@ -519,7 +516,7 @@ impl Db {
     /// failure nobody would notice until they went looking for a memory.
     ///
     /// From `state.db` come the rows nothing can reconstruct: session metadata,
-    /// the settings (home session, `/sethome` override, briefing watermark) and
+    /// the settings (home session, `/sethome` override) and
     /// pairings. The run ledger stays behind — its rows are a projection of the
     /// session logs, which are files and were never in any of these databases,
     /// and the only write path into them takes a fold of a log rather than a
@@ -1204,7 +1201,7 @@ impl PairingRepository for Db {
     }
 }
 
-// ── Settings (HomeRepository, BriefingMarkRepository) ────────────────────────
+// ── Settings (HomeRepository) ────────────────────────────────────────────────
 
 impl Db {
     /// Read one settings row; empty value reads as unset.
@@ -1269,17 +1266,6 @@ impl HomeRepository for Db {
         self.setting_get(HOME_SESSION_KEY)
             .await?
             .ok_or_else(|| anyhow::anyhow!("home session id did not persist"))
-    }
-}
-
-#[async_trait]
-impl BriefingMarkRepository for Db {
-    async fn last_handled(&self) -> anyhow::Result<Option<String>> {
-        self.setting_get(BRIEFING_MARK_KEY).await
-    }
-
-    async fn mark_handled(&self, date: &str) -> anyhow::Result<()> {
-        self.setting_set(BRIEFING_MARK_KEY, date).await
     }
 }
 

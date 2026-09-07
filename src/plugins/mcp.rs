@@ -20,9 +20,6 @@ impl Plugin for McpPlugin {
 
     async fn setup_tools(&self, reg: &mut ToolRegistry, cx: &ToolCx<'_>) -> anyhow::Result<()> {
         for tool in build_mcp_tools(&cx.config.runtime.mcp_servers).await {
-            // Not offered to the briefing runtime, same as before the plugin
-            // split: every MCP call is approval-gated and a briefing has no
-            // approver to ask.
             reg.tool(Scope::AGENTIC, tool);
         }
         Ok(())

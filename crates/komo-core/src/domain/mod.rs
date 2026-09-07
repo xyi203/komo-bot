@@ -1,7 +1,6 @@
 pub mod approval;
 pub mod awaiting;
 pub mod background;
-pub mod briefing;
 pub mod cancel;
 pub mod catalog;
 pub mod chunk_index;
@@ -31,5 +30,4 @@ pub mod todo;
 pub mod tool;
 pub mod trigger;
 pub mod wakeup;
-pub mod workday;
 pub mod workspace;

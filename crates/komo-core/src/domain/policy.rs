@@ -192,8 +192,8 @@ pub struct Rule {
     /// Allow rules don't grant `Risk::Dangerous` actions unless this is set.
     pub include_dangerous: bool,
     /// Allow rules apply only to an attended turn unless this is set: an
-    /// `unattended = true` allow also grants where nobody is watching (the cron
-    /// and briefing sweeps' agent turns). Deny rules ignore this — they are
+    /// `unattended = true` allow also grants where nobody is watching (the
+    /// cron sweep's agent turns). Deny rules ignore this — they are
     /// unconditional everywhere. The narrow channel of roadmap §3.
     ///
     /// Those turns reach the engine with `channel = None`; what makes them

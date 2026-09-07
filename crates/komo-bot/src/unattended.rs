@@ -1,24 +1,17 @@
-//! The inner approvers of the runtimes nobody is watching (cron, briefing) —
-//! the rung [`PolicyApprover`](crate::policy_approver::PolicyApprover) escalates
-//! to when a `Risk::Normal` action matched no `unattended` rule and no grant of
-//! the running job's own.
+//! The inner approver of the runtime nobody is watching (cron) — the rung
+//! [`PolicyApprover`](crate::policy_approver::PolicyApprover) escalates to when
+//! a `Risk::Normal` action matched no `unattended` rule and no grant of the
+//! running job's own.
 //!
-//! Two of them, because "there is no human here" has two honest answers:
+//! A **routine** is a turn the operator scheduled and will hear back from, so
+//! an ungranted action stops the turn and asks them — [`UnattendedSuspend`],
+//! docs/bot-runtime.md §5.4. The answer may arrive hours later, in another
+//! conversation, after a restart; that is what the suspension machinery is for.
 //!
-//! - A **routine** is a turn the operator scheduled and will hear back from, so
-//!   an ungranted action stops the turn and asks them —
-//!   [`UnattendedSuspend`], docs/bot-runtime.md §5.4. The answer may arrive
-//!   hours later, in another conversation, after a restart; that is what the
-//!   suspension machinery is for.
-//! - A **briefing** is a read-only aggregation on a daily slot that degrades to
-//!   a tool-less compose the moment its turn fails. Suspending one would park a
-//!   wait whose eventual continuation nobody is listening for — the briefing
-//!   has already gone out — so it keeps denying: [`UnattendedDeny`].
-//!
-//! Neither ever lets a [`Risk::Dangerous`] action through. Unattended is where
-//! an irreversible action has the least oversight, and a `/approve` typed into
-//! the home chat hours later carries none of the context that would make one
-//! safe to allow.
+//! It never lets a [`Risk::Dangerous`] action through. Unattended is where an
+//! irreversible action has the least oversight, and a `/approve` typed into the
+//! home chat hours later carries none of the context that would make one safe
+//! to allow.
 
 use async_trait::async_trait;
 use tracing::warn;
@@ -49,22 +42,6 @@ impl Approver for UnattendedSuspend {
     }
 }
 
-/// The briefing runtime's inner approver: anything the policy did not grant is
-/// refused, with the reason the model can act on.
-pub struct UnattendedDeny;
-
-#[async_trait]
-impl Approver for UnattendedDeny {
-    async fn decide(&self, request: &ApprovalRequest) -> Decision {
-        warn!(summary = %request.summary,
-            "briefing: denied (unattended; add an `unattended = true` policy rule to grant)");
-        Decision::deny_because(
-            "这是无人值守的后台任务，没有人能批准这一步。只有配置了 \
-             `unattended = true` 的 [policy] 允许规则才会放行；请改用不需要审批的做法。",
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,17 +68,5 @@ mod tests {
         assert!(!decision.is_suspended(), "{decision:?}");
         assert!(!decision.is_allowed());
         assert!(decision.feedback().is_some(), "the model is told why");
-    }
-
-    #[tokio::test]
-    async fn a_briefing_refuses_rather_than_waiting() {
-        for request in [
-            ApprovalRequest::normal("install a skill"),
-            ApprovalRequest::dangerous("rm -rf /", "deletes everything"),
-        ] {
-            let decision = UnattendedDeny.decide(&request).await;
-            assert!(!decision.is_suspended(), "{decision:?}");
-            assert!(!decision.is_allowed());
-        }
     }
 }

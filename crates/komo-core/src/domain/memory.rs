@@ -1166,8 +1166,8 @@ pub trait MemoryRepository: Send + Sync {
     async fn save(&self, memory: &Memory) -> anyhow::Result<()>;
 
     /// All non-expired memories, any status. Callers filter further. (Kept
-    /// no-arg for the briefing sweep and the `memory` tool; richer scope/status
-    /// queries go through [`MemoryRepository::pinned`] / `search`.)
+    /// no-arg for the `memory` tool; richer scope/status queries go through
+    /// [`MemoryRepository::pinned`] / `search`.)
     async fn list(&self) -> anyhow::Result<Vec<Memory>>;
 
     /// L1 pinned profile: the small, stable set eligible for per-turn injection

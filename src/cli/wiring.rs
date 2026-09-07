@@ -18,7 +18,7 @@ use komo_bot::llm::{PreambleFn, TurnInjections, build_llm};
 use komo_bot::reviewer::ReflectiveReviewer;
 use komo_bot::runtime::AgentRuntime;
 use komo_bot::system_prompt::SystemPromptBuilder;
-use komo_bot::unattended::{UnattendedDeny, UnattendedSuspend};
+use komo_bot::unattended::UnattendedSuspend;
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::skill::SkillOffer;
 use komo_infra::embedding::{GatedEmbedder, OllamaEmbedder};
@@ -47,9 +47,7 @@ pub struct Wiring {
     /// The shared review coordinator (post-turn + scheduled), for the
     /// gateway's `ReviewSweep`.
     pub review: Arc<LearningCoordinator>,
-    /// The auxiliary (cheaper) LLM, reused by the daily briefing sweep.
-    pub aux_llm: Arc<dyn LlmClient>,
-    /// The markdown memory store, also read by the briefing sweep.
+    /// The markdown memory store.
     pub memories: Arc<dyn MemoryRepository>,
     /// The hybrid query service, so the operator surface can drive an embedding
     /// backfill through the same one recall uses.
@@ -57,13 +55,8 @@ pub struct Wiring {
     /// The governed skill store (`~/.komo/skills`, files — roadmap §9), shared
     /// with the gateway's api channel.
     pub skills: Arc<FsSkillStore>,
-    /// The briefing sweep's tool-capable agent (roadmap §2): aux model over a
-    /// read-only tool set, policy-gated with a deny-all inner approver — only
-    /// explicit `unattended` policy rules can grant a `Risk::Normal` action.
-    pub briefing_runtime: Arc<AgentRuntime>,
     /// The cron sweep's agent for `CronAction::Agent` jobs: the full tool set
-    /// (unlike briefing) but the same unattended policy gating. Main model, no
-    /// memory enricher.
+    /// with unattended policy gating. Main model, no memory enricher.
     pub cron_runtime: Arc<AgentRuntime>,
     /// Where over-limit tool results are stored in full. Exposed so the gateway
     /// can run the retention sweep once at startup — the store re-sweeps at most
@@ -82,9 +75,9 @@ pub struct Wiring {
 
 /// What distinguishes one runtime from another.
 ///
-/// Five runtimes exist — interactive, delegate, cron, briefing, and the
-/// reviewer's aux calls — and they were four near-identical struct literals
-/// whose *differences* were three fields buried among nine identical ones.
+/// Four runtimes exist — interactive, delegate, cron, and the reviewer's aux
+/// calls — and they were near-identical struct literals whose *differences*
+/// were three fields buried among nine identical ones.
 /// Everything shared (the stores, the history window, the learning
 /// coordinator) is supplied by [`RuntimeParts`]; a profile states only what is
 /// its own.
@@ -135,8 +128,8 @@ impl RuntimeParts<'_> {
             messages: self.db.clone(),
             events: self.db.clone(),
             // Every runtime shares the run ledger, which is what makes a
-            // delegation, a cron job and a briefing each auditable through
-            // `komo run list` alongside ordinary turns.
+            // delegation and a cron job each auditable through `komo run list`
+            // alongside ordinary turns.
             runs: self.db.clone(),
             projection: self.db.clone(),
             tool_executor: profile.tools,
@@ -262,7 +255,7 @@ pub async fn build(
 
     // ── Shared dependencies (built once, used by every tool set) ─────────────
     // Memories are `memory_records` in `komo.db`, shared by the `memory` tool,
-    // the reflective reviewer, the L1 pinned injection and the briefing sweep.
+    // the reflective reviewer and the L1 pinned injection.
     // On first run they seed themselves from any legacy markdown memories under
     // ~/.komo/memory/ (a one-time, no-op-once-populated import).
     let imported = db
@@ -300,10 +293,10 @@ pub async fn build(
     // mode (the default) the decorator is absent, so this is byte-identical to
     // what the chain was before the mode existed.
     //
-    // Attended runtimes only. Cron and briefing build their own `PolicyApprover`
-    // over a deny-all inner further down and deliberately skip this: an
-    // unattended turn grants through rules approved in advance, never a live
-    // judgement call (ADR 0002 / 0003).
+    // Attended runtimes only. Cron builds its own `PolicyApprover` over an
+    // unattended inner further down and deliberately skips this: an unattended
+    // turn grants through rules approved in advance, never a live judgement
+    // call (ADR 0002 / 0003).
     let approver = match config.runtime.policy.mode {
         komo_core::domain::policy::PolicyMode::Auto => {
             tracing::info!("permission policy: auto mode (aux reviewer may auto-allow prompts)");
@@ -432,9 +425,9 @@ pub async fn build(
 
     // Materialize one executor per runtime from the registry: the plugin
     // roster is the single definition, scope filtering replaces the four
-    // hand-written registration lists (briefing's included). `delegate` is
-    // passed in rather than registered by a plugin because the sub-agent it
-    // runs needs an executor of its own — built by this same closure with
+    // hand-written registration lists. `delegate` is passed in rather than
+    // registered by a plugin because the sub-agent it runs needs an executor
+    // of its own — built by this same closure with
     // `delegate: None`, which is the structural guard against recursion.
     let executor_for = |scope: Scope,
                         approver: Arc<dyn Approver>,
@@ -449,9 +442,9 @@ pub async fn build(
         .with_approver(approver)
         .with_output_store(output_store.clone());
         // Only the main runtime records its tool calls in a transcript: every
-        // other scope runs on a synthetic session (delegate, cron, briefing),
-        // where a file per one-shot turn is litter rather than history. Set
-        // here, not on the returned executor — registering a tool shares the
+        // other scope runs on a synthetic session (delegate, cron), where a
+        // file per one-shot turn is litter rather than history. Set here, not
+        // on the returned executor — registering a tool shares the
         // core, and the setters take `Arc::get_mut`.
         if scope == Scope::MAIN {
             tools = tools.with_events(db.clone());
@@ -601,8 +594,8 @@ pub async fn build(
     ));
 
     // Only the main runtime records its tool calls in a transcript. Every other
-    // scope runs on a synthetic session (delegate, cron, briefing), and a
-    // transcript file per one-shot turn is litter, not history.
+    // scope runs on a synthetic session (delegate, cron), and a transcript file
+    // per one-shot turn is litter, not history.
     let tools = executor_for(Scope::MAIN, approver.clone(), Some(delegate));
 
     // Assemble the tiered system prompt: stable identity + tool-aware guidance
@@ -620,10 +613,10 @@ pub async fn build(
             .workspace_root(Some(root.clone()))
             // The main agent fields "how do I configure Komo" questions, so it
             // gets the built-in platform manual (wechat login, pairing, …).
-            // Aux/delegate/briefing builders deliberately don't.
+            // Aux/delegate builders deliberately don't.
             .operations_manual()
             // …and the operator-authored user profile (~/.komo/USER.md), for the
-            // same reason the aux/reviewer/briefing builders don't get it.
+            // same reason the aux/reviewer builders don't get it.
             .user_profile()
             // …and their machine-wide agent instructions (~/.agents/AGENTS.md),
             // shared with whatever other agents read that directory.
@@ -721,65 +714,15 @@ pub async fn build(
         compacts: false,
     }));
 
-    // ── Briefing runtime (roadmap §2) ────────────────────────────────────────
-    // A second, deliberately small agent the BriefingSweep drives: aux model,
-    // read-only tool set (the plugins' `Scope::ALL` registrations — no
-    // shell/file/task/memory writes), and a policy approver whose inner is
-    // deny-all — so a `Risk::Normal` action passes only through an explicit
-    // `unattended` policy rule. Safe reads (web_fetch, skill view) work out of
-    // the box. It denies where a routine waits: the briefing degrades to a
-    // tool-less compose the moment its turn fails, so the digest has already
-    // gone out by the time an operator could answer, and the continuation would
-    // have nobody listening for it.
-    // Sharing the run ledger (`runs: db`) makes every briefing execution
-    // auditable via `komo run list`.
-    // No saved grants here either — see the cron approver above.
-    let briefing_approver = komo_bot::policy_approver::PolicyApprover::wrap(
-        config.runtime.policy.policy.clone(),
-        Arc::new(UnattendedDeny),
-    );
-    let briefing_tools = executor_for(Scope::BRIEFING, briefing_approver, None);
-    let briefing_tool_names = tool_names_of(&briefing_tools);
-    let briefing_note = skills_note_for(&briefing_tool_names);
-    let briefing_builder = Arc::new(
-        SystemPromptBuilder::new(&aux_config)
-            .tools(briefing_tool_names)
-            .skills_note(briefing_note),
-    );
-    let briefing_preamble: PreambleFn = Arc::new(move || briefing_builder.build());
-    // No memory enricher: sweeps must not be fed the user's memory library.
-    let briefing_llm = build_llm(
-        &aux_config,
-        Some(&briefing_tools),
-        briefing_preamble,
-        TurnInjections::default(),
-        Some("briefing"),
-    )?;
-    let briefing_runtime = Arc::new(parts.build(CapabilityProfile {
-        scope: Scope::BRIEFING,
-        llm: briefing_llm,
-        tools: briefing_tools,
-        // A briefing is an aggregation read, not a long-running job.
-        max_turns: BRIEFING_MAX_TURNS,
-        learns: false,
-        compacts: false,
-    }));
-
     Ok(Wiring {
         runtime,
         review,
-        aux_llm,
         memories: memory_repo,
         memory_query: memory_query.clone(),
         skills: skill_store,
-        briefing_runtime,
         cron_runtime,
         output_store,
         background,
         wiki: wiki_ops,
     })
 }
-
-/// Round budget for the briefing runtime: enough for "list skills → load one →
-/// fetch its data → compose", never a long-running loop.
-const BRIEFING_MAX_TURNS: usize = 4;

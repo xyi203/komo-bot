@@ -5,9 +5,6 @@
 //! approver when the policy returns [`Verdict::Ask`]. This keeps the per-action
 //! decision logic in one configurable place instead of scattered `if/else` in
 //! each tool, while leaving each tool's own hardline floor untouched below it.
-//!
-//! Same composition shape as `agent::daemon::WorkdayGated` decorating a
-//! `Maintenance`.
 
 use std::sync::Arc;
 
@@ -29,8 +26,8 @@ pub struct PolicyApprover {
     policy: Policy,
     inner: Arc<dyn Approver>,
     /// Where an "always allow" answer is persisted. `None` for the unattended
-    /// approvers (cron / briefing), which can never receive that answer anyway —
-    /// there is nobody at the prompt.
+    /// approver (cron), which can never receive that answer anyway — there is
+    /// nobody at the prompt.
     saved: Option<Arc<PermissionsStore>>,
 }
 
@@ -95,8 +92,8 @@ impl Approver for PolicyApprover {
     /// entry points: a rung that decides differently depending on who asked is
     /// a rung the audit record cannot describe.
     async fn decide_reported(&self, request: &ApprovalRequest) -> (Decision, &'static str) {
-        // An unattended turn (cron / briefing) is evaluated channel-lessly even
-        // though it *has* a session: `SessionOrigin` is what says nobody is
+        // An unattended turn (cron) is evaluated channel-lessly even though
+        // it *has* a session: `SessionOrigin` is what says nobody is
         // watching, and only that makes the engine's unattended branch run —
         // reading `cron:<job>:<unix>` as a channel would let `default_normal =
         // allow` and plain (non-`unattended`) allow rules grant there.
@@ -440,9 +437,8 @@ mod tests {
     }
 
     /// **The containment guarantee.** One job's grant must not reach anything
-    /// outside that job's turn — not another job, not the briefing, and not a
-    /// conversation. Without this the feature is just a global rule with extra
-    /// steps.
+    /// outside that job's turn — not another job, and not a conversation.
+    /// Without this the feature is just a global rule with extra steps.
     #[tokio::test]
     async fn a_job_grant_does_not_escape_its_turn() {
         let approver = PolicyApprover::wrap(
@@ -465,26 +461,10 @@ mod tests {
         );
 
         // …and gone the moment the scope ends: a later cron turn (a different
-        // job), the briefing, and an ordinary conversation all see nothing.
+        // job) and an ordinary conversation both see nothing.
         assert!(!with_session(cron_ctx(), approver.approve(&shell_req())).await);
-        let briefing =
-            SessionContext::detached("briefing:2026-08-10").with_origin(SessionOrigin::Briefing);
-        assert!(!with_session(briefing, approver.approve(&shell_req())).await);
         let chat = SessionContext::detached("feishu:oc_abc");
         assert!(!with_session(chat, approver.approve(&shell_req())).await);
-    }
-
-    /// The briefing sweep gets the same treatment as cron.
-    #[tokio::test]
-    async fn a_briefing_turn_is_unattended_too() {
-        let inner = Arc::new(Recording {
-            asked: Mutex::new(false),
-            answer: false,
-        });
-        let approver = PolicyApprover::wrap(Policy::new(Vec::new(), Verdict::Allow), inner.clone());
-        let ctx =
-            SessionContext::detached("briefing:2026-08-10").with_origin(SessionOrigin::Briefing);
-        assert!(!with_session(ctx, approver.approve(&shell_req())).await);
     }
 
     /// …and an ordinary conversation is untouched: `default_normal = allow`

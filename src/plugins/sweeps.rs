@@ -8,14 +8,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use komo_bot::daemon::{
-    BriefingSweep, DreamSweep, Maintenance, ReviewSweep, Schedule, WorkdayGated,
-};
+use komo_bot::daemon::{DreamSweep, ReviewSweep, Schedule};
 use komo_bot::gateway::MaintenanceService;
-use komo_infra::workday::HolidayCalendar;
 
 use super::{Plugin, SweepCx, SweepRegistry};
-use crate::domain::briefing::BriefingMarkRepository;
 
 pub struct ReviewPlugin;
 
@@ -25,80 +21,13 @@ impl Plugin for ReviewPlugin {
         "review"
     }
 
-    async fn setup_sweeps(&self, reg: &mut SweepRegistry, cx: &SweepCx<'_>) -> anyhow::Result<()> {
+    async fn setup_sweeps(&self, reg: &mut SweepRegistry, cx: &SweepCx) -> anyhow::Result<()> {
         reg.sweep(MaintenanceService {
             name: "review".to_string(),
             schedule: cx.maintenance_schedule.clone(),
             maintenance: Arc::new(ReviewSweep {
                 review: cx.review.clone(),
             }),
-            alert: Some(cx.notifier.clone()),
-        });
-        Ok(())
-    }
-}
-
-/// Daily briefing — mounts only when the user opted in with
-/// `briefing_schedule`. Reads memories, composes on the aux LLM,
-/// delivers via the same home notifier as every other sweep.
-pub struct BriefingPlugin;
-
-#[async_trait]
-impl Plugin for BriefingPlugin {
-    fn name(&self) -> &'static str {
-        "briefing"
-    }
-
-    async fn setup_sweeps(&self, reg: &mut SweepRegistry, cx: &SweepCx<'_>) -> anyhow::Result<()> {
-        let Some(schedule) = cx.briefing_schedule.clone() else {
-            return Ok(());
-        };
-        let marks: Arc<dyn BriefingMarkRepository> = cx.db.clone();
-        let mut sweep: Arc<dyn Maintenance> = Arc::new(BriefingSweep {
-            memories: cx.memories.clone(),
-            llm: cx.aux_llm.clone(),
-            notifier: cx.notifier.clone(),
-            // Tool-capable agent turn (read-only tools + unattended policy
-            // gating); the sweep degrades to the plain compose on error.
-            runtime: Some(cx.briefing_runtime.clone()),
-            marks: Some(marks.clone()),
-        });
-        // Opt-in: only fire on Chinese working days (statutory holidays and
-        // 调休-adjusted weekends respected). The calendar is built only when
-        // gating is on, so the holiday API is never touched otherwise.
-        if cx.config.runtime.briefing_workdays_only {
-            let calendar = Arc::new(HolidayCalendar::new(komo_config::workday_cache_dir()));
-            sweep = Arc::new(WorkdayGated {
-                inner: sweep,
-                calendar,
-            });
-        }
-        // Startup catch-up: a gateway that was down (restart, upgrade) across
-        // today's slot runs the briefing late, once — the same rule a cron job
-        // gets from its stored `next_run_at`. Goes through the workday-gated
-        // sweep, so a holiday still skips it.
-        if let Some(expr) = cx.briefing_expr.clone() {
-            let catch_up = sweep.clone();
-            tokio::spawn(async move {
-                let handled = marks.last_handled().await.unwrap_or_default();
-                if komo_bot::daemon::briefing_catchup_due(
-                    &expr,
-                    handled.as_deref(),
-                    chrono::Local::now(),
-                ) {
-                    tracing::info!(
-                        "briefing: today's slot passed while the gateway was down; catching up"
-                    );
-                    if let Err(error) = catch_up.run().await {
-                        tracing::warn!(%error, "briefing catch-up failed");
-                    }
-                }
-            });
-        }
-        reg.sweep(MaintenanceService {
-            name: "briefing".to_string(),
-            schedule,
-            maintenance: sweep,
             alert: Some(cx.notifier.clone()),
         });
         Ok(())
@@ -122,7 +51,7 @@ impl Plugin for CronJobsPlugin {
         "cron-jobs"
     }
 
-    async fn setup_sweeps(&self, reg: &mut SweepRegistry, cx: &SweepCx<'_>) -> anyhow::Result<()> {
+    async fn setup_sweeps(&self, reg: &mut SweepRegistry, cx: &SweepCx) -> anyhow::Result<()> {
         reg.sweep(MaintenanceService {
             name: "cron-jobs".to_string(),
             schedule: Schedule::parse("* * * * *")?,
@@ -144,7 +73,7 @@ impl Plugin for DreamPlugin {
         "dream"
     }
 
-    async fn setup_sweeps(&self, reg: &mut SweepRegistry, cx: &SweepCx<'_>) -> anyhow::Result<()> {
+    async fn setup_sweeps(&self, reg: &mut SweepRegistry, cx: &SweepCx) -> anyhow::Result<()> {
         let Some(schedule) = cx.dream_schedule.clone() else {
             return Ok(());
         };

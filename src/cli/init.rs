@@ -20,16 +20,11 @@ const CONFIG_TEMPLATE: &str = r#"# komo runtime settings. Credentials never go h
 provider = "deepseek"
 # model = "deepseek-v4-flash"    # defaults per provider
 # base_url = ""                  # OpenAI-compatible endpoint override
-# aux_model = ""                 # cheaper model for sub-tasks (reviewer/recall/briefing)
+# aux_model = ""                 # cheaper model for sub-tasks (reviewer/recall)
 # aux_effort = "none"            # aux reasoning effort; "none" = thinking off (deepseek default)
 
 # Maintenance sweep cron (5-field Unix cron). Default: hourly.
 # schedule = "0 * * * *"
-
-# Daily briefing — opt-in, no default. Uncomment to enable.
-# briefing_schedule = "30 8 * * *"
-# briefing_workdays_only = true  # skip Chinese non-working days (incl. 调休)
-# briefing_schedule_enabled = false  # kill switch, keeps the cron above
 
 # Usage-driven memory consolidation ("dreaming"). On by default, nightly.
 # dream_schedule = "0 3 * * *"   # set to "off" to disable
@@ -76,7 +71,7 @@ provider = "deepseek"
 # enabled = true
 # allow_from = ["123456789"]     # pre-trusted sender ids (skip pairing)
 # require_mention = true         # group messages must @mention the bot
-# home_chat = "123456789"        # routine output/briefing delivered here
+# home_chat = "123456789"        # routine output delivered here
 
 # [channels.feishu]
 # enabled = true

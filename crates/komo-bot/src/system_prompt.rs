@@ -222,7 +222,7 @@ than expecting events to be pushed here.\n\
 pairing code, which the operator approves with `komo pair approve <code>` on \
 the host. Pre-trusted ids go in the channel's `allow_from` list.\n\
 - `/sethome` sent in any chat makes it the delivery target for proactive \
-output (reminders, daily briefing). `/new` draws a line under the conversation \
+output (reminders). `/new` draws a line under the conversation \
 so far — it starts a fresh context, not a fresh session, and leaves tasks, \
 memories and any pending approval alone; \
 `/approve` / `/deny` answer tool-approval prompts.\n\
@@ -286,7 +286,7 @@ pub struct SystemPromptBuilder {
     /// sub-agents and sweeps never field "how do I configure Komo" questions).
     operations_manual: bool,
     /// Inject the operator-authored `~/.komo/USER.md` profile (main agent only —
-    /// aux/reviewer/briefing stay lean, and the reviewer must not have the
+    /// aux/reviewer stay lean, and the reviewer must not have the
     /// profile bias its extraction).
     include_user_profile: bool,
     /// Inject the machine-wide instruction files (main agent only, same
@@ -721,7 +721,7 @@ mod tests {
 
     #[test]
     fn operations_manual_is_opt_in_and_stable_tier() {
-        // Absent by default (aux/delegate/briefing builders).
+        // Absent by default (aux/delegate builders).
         let p = SystemPromptBuilder::new(&config())
             .home(tmp("ops_off"))
             .build();
@@ -742,7 +742,7 @@ mod tests {
         let home = tmp("user_profile");
         std::fs::write(home.join("USER.md"), "Name: Ada. Prefers terse replies.").unwrap();
 
-        // Off by default (aux/reviewer/briefing builders) — profile stays out.
+        // Off by default (aux/reviewer builders) — profile stays out.
         let off = SystemPromptBuilder::new(&config())
             .home(home.clone())
             .build();
@@ -787,7 +787,7 @@ mod tests {
         let agents = tmp("global_agents");
         std::fs::write(agents.join("AGENTS.md"), "Always answer in Chinese.").unwrap();
 
-        // Off by default (aux/reviewer/briefing builders).
+        // Off by default (aux/reviewer builders).
         let off = SystemPromptBuilder::new(&config())
             .home(home.clone())
             .build();

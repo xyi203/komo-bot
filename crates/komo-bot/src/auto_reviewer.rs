@@ -27,9 +27,9 @@
 //!    to `inner`.
 //! 2. **`Risk::Dangerous` is never reviewed.** Irreversible actions go straight
 //!    to the human, the same reason `include_dangerous` stays config-only.
-//! 3. **Unattended turns are never reviewed.** Cron and briefing keep the
-//!    "shrink the action set in advance" contract (ADR 0002); their runtimes do
-//!    not wire this decorator at all, and this is the second floor.
+//! 3. **Unattended turns are never reviewed.** Cron keeps the "shrink the
+//!    action set in advance" contract (ADR 0002); its runtime does not wire
+//!    this decorator at all, and this is the second floor.
 //! 4. **Fail-closed.** A model error, a timeout, an unparseable verdict, or no
 //!    operator request to judge against all mean "ask the human".
 //!
@@ -480,24 +480,23 @@ mod tests {
         assert!(*human.asked.lock().unwrap());
     }
 
-    /// Structural property 3: the unattended contract is untouched. Cron and
-    /// briefing grant through their own explicit rules or not at all.
+    /// Structural property 3: the unattended contract is untouched. Cron
+    /// grants through its own explicit rules or not at all.
     #[tokio::test]
     async fn unattended_turns_never_reach_the_reviewer() {
-        for origin in [SessionOrigin::Cron, SessionOrigin::Briefing] {
-            let human = Arc::new(Human::default());
-            let llm = FakeLlm::saying("ALLOW");
-            let approver = AutoReviewApprover::wrap(
-                llm.clone(),
-                FakeSessions::with_user("把热水器打开"),
-                human.clone(),
-            );
-            let ctx = SessionContext::detached("cron:heater:1700000000").with_origin(origin);
+        let human = Arc::new(Human::default());
+        let llm = FakeLlm::saying("ALLOW");
+        let approver = AutoReviewApprover::wrap(
+            llm.clone(),
+            FakeSessions::with_user("把热水器打开"),
+            human.clone(),
+        );
+        let ctx =
+            SessionContext::detached("cron:heater:1700000000").with_origin(SessionOrigin::Cron);
 
-            with_session(ctx, approver.decide(&ha_request())).await;
+        with_session(ctx, approver.decide(&ha_request())).await;
 
-            assert_eq!(llm.calls.load(Ordering::Relaxed), 0, "never reviewed");
-        }
+        assert_eq!(llm.calls.load(Ordering::Relaxed), 0, "never reviewed");
     }
 
     /// No operator message means nothing can authorize the action.

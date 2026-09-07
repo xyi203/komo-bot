@@ -40,7 +40,6 @@ use async_trait::async_trait;
 use komo_bot::daemon::{RoutineEventSource, Schedule};
 use komo_bot::gateway::{Channel, MaintenanceService};
 use komo_bot::learning_coordinator::LearningCoordinator;
-use komo_bot::runtime::AgentRuntime;
 use komo_config::ConfigSnapshot;
 use komo_core::domain::catalog::ToolCatalog;
 use komo_core::domain::hooks::{StepHook, ToolHook, TurnHook};
@@ -52,13 +51,13 @@ use komo_services::skill_registry::SkillRegistry;
 use komo_services::tool_execution::ToolExecutor;
 
 use crate::domain::{
-    cron::CronJobRepository, gateway::WeChatLogin, llm::LlmClient, memory::MemoryRepository,
-    notify::Notifier, pairing::PairingRepository, workspace::Workspace,
+    cron::CronJobRepository, gateway::WeChatLogin, memory::MemoryRepository, notify::Notifier,
+    pairing::PairingRepository, workspace::Workspace,
 };
 use crate::infra::messaging::home_notifier::TextSender;
 use crate::services::operator_control::actions::WikiOps;
 
-/// Which of the four runtimes a registration is visible to. A tiny bitset —
+/// Which of the three runtimes a registration is visible to. A tiny bitset —
 /// not the `bitflags` crate for two constants' worth of use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Scope(u8);
@@ -70,13 +69,13 @@ impl Scope {
     pub const SUBAGENT: Scope = Scope(0b0010);
     /// The unattended cron-job runtime.
     pub const CRON: Scope = Scope(0b0100);
-    /// The read-only briefing runtime.
-    pub const BRIEFING: Scope = Scope(0b1000);
-    /// The three tool-wielding agent runtimes (everything but briefing) —
-    /// the default scope for a tool that can mutate state.
+    /// The three tool-wielding agent runtimes — the default scope for a tool
+    /// that can mutate state.
     pub const AGENTIC: Scope = Scope(0b0111);
-    /// Every runtime, briefing included — safe reads only.
-    pub const ALL: Scope = Scope(0b1111);
+    /// Every runtime — safe reads only. Covers the same set as [`Self::AGENTIC`]
+    /// now that every runtime wields tools; the two say different things about
+    /// what a registration is *for*.
+    pub const ALL: Scope = Scope(0b0111);
 
     pub fn contains(self, member: Scope) -> bool {
         self.0 & member.0 == member.0
@@ -129,11 +128,7 @@ pub trait Plugin: Send + Sync {
 
     /// Phase 3: contribute scheduled sweeps. Gateway only; the notifier the
     /// sweeps alert through already exists.
-    async fn setup_sweeps(
-        &self,
-        _reg: &mut SweepRegistry,
-        _cx: &SweepCx<'_>,
-    ) -> anyhow::Result<()> {
+    async fn setup_sweeps(&self, _reg: &mut SweepRegistry, _cx: &SweepCx) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -156,7 +151,6 @@ pub fn builtin() -> Vec<Arc<dyn Plugin>> {
         Arc::new(channels::TelegramPlugin),
         Arc::new(channels::WeChatPlugin),
         Arc::new(sweeps::ReviewPlugin),
-        Arc::new(sweeps::BriefingPlugin),
         Arc::new(sweeps::CronJobsPlugin),
         Arc::new(sweeps::DreamPlugin),
     ]
@@ -254,7 +248,7 @@ run_phase!(
 run_phase!(
     run_sweep_phase,
     SweepRegistry,
-    SweepCx<'_>,
+    SweepCx,
     setup_sweeps,
     "sweeps"
 );
@@ -263,15 +257,14 @@ run_phase!(
 
 /// One tool catalog per runtime.
 ///
-/// Separate rather than shared because the runtimes deliberately differ: the
-/// briefing agent gets read-only tools, the others get the full set. A plugin
-/// mounting at runtime picks which of them it belongs in — and a `Scope` is how
-/// it says so, the same vocabulary the static registrations use.
+/// Separate rather than shared because the runtimes deliberately differ in
+/// which tools they mount. A plugin mounting at runtime picks which of them it
+/// belongs in — and a `Scope` is how it says so, the same vocabulary the static
+/// registrations use.
 pub struct ScopedCatalogs {
     main: Arc<ToolCatalog>,
     subagent: Arc<ToolCatalog>,
     cron: Arc<ToolCatalog>,
-    briefing: Arc<ToolCatalog>,
 }
 
 impl Default for ScopedCatalogs {
@@ -280,7 +273,6 @@ impl Default for ScopedCatalogs {
             main: Arc::new(ToolCatalog::new()),
             subagent: Arc::new(ToolCatalog::new()),
             cron: Arc::new(ToolCatalog::new()),
-            briefing: Arc::new(ToolCatalog::new()),
         }
     }
 }
@@ -291,7 +283,6 @@ impl ScopedCatalogs {
         match runtime {
             Scope::SUBAGENT => &self.subagent,
             Scope::CRON => &self.cron,
-            Scope::BRIEFING => &self.briefing,
             // MAIN, and any composite — a caller asking for "the catalog" of a
             // multi-runtime scope means the conversation's.
             _ => &self.main,
@@ -299,10 +290,9 @@ impl ScopedCatalogs {
     }
 
     /// Every catalog `scope` covers, for a plugin mounting into all of them at
-    /// once (`Scope::AGENTIC` is the usual one: everything but the unattended
-    /// briefing).
+    /// once (`Scope::AGENTIC` is the usual one).
     pub fn covered_by(&self, scope: Scope) -> Vec<Arc<ToolCatalog>> {
-        [Scope::MAIN, Scope::SUBAGENT, Scope::CRON, Scope::BRIEFING]
+        [Scope::MAIN, Scope::SUBAGENT, Scope::CRON]
             .into_iter()
             .filter(|runtime| scope.contains(*runtime))
             .map(|runtime| self.of(runtime).clone())
@@ -493,19 +483,13 @@ impl ChannelRegistry {
 /// pieces, the notifier, and the host-parsed schedules (parsing stays in the
 /// host so the startup banner and the sweeps can never disagree about what's
 /// in effect).
-pub struct SweepCx<'a> {
-    pub config: &'a ConfigSnapshot,
-    pub db: Arc<Db>,
+pub struct SweepCx {
     pub notifier: Arc<dyn Notifier>,
     pub review: Arc<LearningCoordinator>,
     pub memories: Arc<dyn MemoryRepository>,
-    pub aux_llm: Arc<dyn LlmClient>,
-    pub briefing_runtime: Arc<AgentRuntime>,
     pub maintenance_schedule: Schedule,
     /// `None` = the opt-in sweep is off (unset or a typo'd cron, already
     /// warned about by the host).
-    pub briefing_schedule: Option<Schedule>,
-    pub briefing_expr: Option<String>,
     pub dream_schedule: Option<Schedule>,
     /// Everything a routine firing needs, whatever set it off — the job store,
     /// the unattended runtime, the notifier, and the standing waits that ride
@@ -562,29 +546,21 @@ mod tests {
         reg.tools_for(runtime).map(|t| t.name()).collect()
     }
 
-    /// `AGENTIC` is the three tool-wielding runtimes; `ALL` adds briefing.
-    /// Getting this wrong hands the unattended briefing agent a shell.
+    /// Each alias names exactly the runtimes it claims.
     #[test]
     fn scope_membership_matches_the_runtimes_each_alias_names() {
-        assert!(Scope::AGENTIC.contains(Scope::MAIN));
-        assert!(Scope::AGENTIC.contains(Scope::SUBAGENT));
-        assert!(Scope::AGENTIC.contains(Scope::CRON));
-        assert!(
-            !Scope::AGENTIC.contains(Scope::BRIEFING),
-            "briefing is read-only; AGENTIC must not reach it"
-        );
-        for runtime in [Scope::MAIN, Scope::SUBAGENT, Scope::CRON, Scope::BRIEFING] {
+        for runtime in [Scope::MAIN, Scope::SUBAGENT, Scope::CRON] {
+            assert!(Scope::AGENTIC.contains(runtime));
             assert!(Scope::ALL.contains(runtime));
         }
         // A composed scope reaches exactly its members.
-        let pair = Scope::MAIN | Scope::BRIEFING;
-        assert!(pair.contains(Scope::MAIN) && pair.contains(Scope::BRIEFING));
+        let pair = Scope::MAIN | Scope::SUBAGENT;
+        assert!(pair.contains(Scope::MAIN) && pair.contains(Scope::SUBAGENT));
         assert!(!pair.contains(Scope::CRON));
     }
 
-    /// One registry, four runtimes: the filter is what replaced the four
-    /// hand-written registration lists, so a `Scope::ALL` tool must reach the
-    /// briefing runtime and an `AGENTIC` one must not.
+    /// One registry, three runtimes: the filter is what replaced the
+    /// hand-written registration lists.
     #[test]
     fn a_runtime_sees_exactly_the_tools_scoped_to_it() {
         let mut reg = ToolRegistry::default();
@@ -594,11 +570,6 @@ mod tests {
 
         assert_eq!(names(&reg, Scope::MAIN), vec!["time", "shell", "main_only"]);
         assert_eq!(names(&reg, Scope::CRON), vec!["time", "shell"]);
-        assert_eq!(
-            names(&reg, Scope::BRIEFING),
-            vec!["time"],
-            "the briefing runtime gets safe reads only"
-        );
     }
 
     struct NamedHook(&'static str);
@@ -628,17 +599,14 @@ mod tests {
 
         let main: Vec<&str> = reg.tool_hooks_for(Scope::MAIN).map(|h| h.name()).collect();
         assert_eq!(main, vec!["main_gate", "everywhere"]);
-        let briefing: Vec<&str> = reg
-            .tool_hooks_for(Scope::BRIEFING)
-            .map(|h| h.name())
-            .collect();
-        assert_eq!(briefing, vec!["everywhere"]);
+        let cron: Vec<&str> = reg.tool_hooks_for(Scope::CRON).map(|h| h.name()).collect();
+        assert_eq!(
+            cron,
+            vec!["everywhere"],
+            "a MAIN-scoped hook never runs on a sweep's turns"
+        );
 
         assert_eq!(reg.turn_hooks_for(Scope::CRON).len(), 1);
-        assert!(
-            reg.turn_hooks_for(Scope::BRIEFING).is_empty(),
-            "AGENTIC must not reach the briefing runtime"
-        );
     }
 
     /// A plugin that contributes nothing to a phase is not a failure — the
@@ -857,12 +825,6 @@ mod tests {
             sorted(Scope::CRON),
             agentic,
             "the cron runtime shared it too — only its approver differed"
-        );
-
-        // The briefing runtime's second, hand-copied list.
-        assert_eq!(
-            sorted(Scope::BRIEFING),
-            vec!["skill", "time", "wait", "web_fetch", "web_search"],
         );
     }
 

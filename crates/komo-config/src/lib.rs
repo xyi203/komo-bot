@@ -240,13 +240,6 @@ impl ConfigSnapshot {
 // `config::ensure_komo_home()` call sites are unchanged.
 pub use komo_core::paths::{ensure_komo_home, komo_home};
 
-/// Directory holding the cached Chinese workday calendar, one `{year}.json` per
-/// year: `<komo_home>/workdays/`. Disposable — delete a file to force a
-/// re-fetch from the holiday API.
-pub fn workday_cache_dir() -> PathBuf {
-    komo_home().join("workdays")
-}
-
 /// Where the WeChat QR-login credentials are stored. Shared by the gateway
 /// channel and the `komo channel wechat login` provisioning command.
 pub fn wechat_cred_path() -> PathBuf {

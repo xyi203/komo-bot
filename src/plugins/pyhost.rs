@@ -45,10 +45,6 @@ const RESTART_DELAY: Duration = Duration::from_secs(2);
 const RESTART_DELAY_MAX: Duration = Duration::from_secs(60);
 
 /// Which runtimes plugin tools are offered to.
-///
-/// Not the briefing runtime: every plugin call is approval-gated and briefing
-/// turns have no one to ask, so mounting there would cost a schema per turn to
-/// produce a refusal.
 const PLUGIN_SCOPE: Scope = Scope::AGENTIC;
 
 pub struct PyHostPlugin;
@@ -356,13 +352,11 @@ mod tests {
         assert!(!wholly_denied(&Policy::default()));
     }
 
-    /// Plugin tools reach the three tool-wielding runtimes and not the
-    /// unattended briefing one, which has no one to approve a call.
+    /// Plugin tools reach every tool-wielding runtime.
     #[test]
     fn plugin_tools_are_offered_to_the_agentic_runtimes_only() {
         assert!(PLUGIN_SCOPE.contains(Scope::MAIN));
         assert!(PLUGIN_SCOPE.contains(Scope::SUBAGENT));
         assert!(PLUGIN_SCOPE.contains(Scope::CRON));
-        assert!(!PLUGIN_SCOPE.contains(Scope::BRIEFING));
     }
 }

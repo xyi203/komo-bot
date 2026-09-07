@@ -502,7 +502,7 @@ impl ProviderLlm {
         // system-prompt + tool-definition bytes match. For the main agent the
         // two coincide (one conversation = one prefix), so the session id is
         // right. For a backend whose sessions are one-shot — delegate
-        // (`delegate:<uuid>`), cron (`cron:<name>:<ts>`), briefing — the
+        // (`delegate:<uuid>`), cron (`cron:<name>:<ts>`) — the
         // session id is a *different* key every time even though every one of
         // those turns opens with identical bytes, so each would cold-start.
         // Those backends declare a family at wiring instead. Anchoring them on
@@ -561,7 +561,7 @@ struct TurnModel {
 impl LlmClient for ProviderLlm {
     async fn complete(&self, session: &Session) -> anyhow::Result<String> {
         // Tool-less by contract: this is the single-shot path for aux callers
-        // (reviewer / recall screening / briefing fallback), and it advertises no
+        // (reviewer / recall screening), and it advertises no
         // tools at all — nothing here would dispatch a call the model made, so it
         // must not be able to ask for one. One completion is the whole answer.
         let (preamble, prompt, history, _) = self.assemble(session).await?;

@@ -116,7 +116,7 @@ pub struct Session {
     /// Per-session model override (empty = the gateway's configured model).
     /// A conversation may switch models mid-thread, and the last choice is what
     /// the next turn (and any other client opening the session) uses. Only
-    /// honored for the main agent; aux/reviewer/briefing keep their own model.
+    /// honored for the main agent; aux/reviewer keep their own model.
     #[serde(default)]
     pub model: String,
     /// Per-session reasoning effort (`low` / `medium` / `high`; empty = the
@@ -340,11 +340,7 @@ mod tests {
 
     #[test]
     fn komo_never_names_a_session_it_wrote_the_prompt_for() {
-        for origin in [
-            SessionOrigin::Cron,
-            SessionOrigin::Briefing,
-            SessionOrigin::Delegate,
-        ] {
+        for origin in [SessionOrigin::Cron, SessionOrigin::Delegate] {
             assert_eq!(auto_title(origin, "检查告警并汇报"), None, "{origin:?}");
         }
         // The gate is the origin, not the words: a real conversation may open
@@ -407,7 +403,6 @@ mod tests {
         for origin in [
             SessionOrigin::User,
             SessionOrigin::Cron,
-            SessionOrigin::Briefing,
             SessionOrigin::Delegate,
         ] {
             assert_eq!(SessionOrigin::parse(origin.as_str()), origin);
@@ -416,7 +411,6 @@ mod tests {
         // unattended.
         assert!(!SessionOrigin::Delegate.is_unattended());
         assert!(SessionOrigin::Cron.is_unattended());
-        assert!(SessionOrigin::Briefing.is_unattended());
         assert!(!SessionOrigin::User.is_unattended());
     }
 }

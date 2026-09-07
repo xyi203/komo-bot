@@ -29,7 +29,7 @@ use super::{Plugin, Scope, ToolCx, ToolRegistry};
 
 /// komo's own tool set. Scopes reproduce the pre-plugin wiring exactly:
 /// mutating and stateful tools go to the three agentic runtimes; `time` and
-/// `skill` — safe reads the briefing also had — go everywhere.
+/// `skill` — safe reads — go everywhere.
 pub struct CoreToolsPlugin;
 
 #[async_trait]
@@ -91,7 +91,7 @@ impl Plugin for CoreToolsPlugin {
 }
 
 /// `web_fetch` + `web_search` — safe reads, available everywhere the
-/// pre-plugin wiring had them (briefing included).
+/// pre-plugin wiring had them.
 pub struct WebPlugin;
 
 #[async_trait]

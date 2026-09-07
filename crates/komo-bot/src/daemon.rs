@@ -23,21 +23,17 @@ use chrono::Utc;
 use tracing::{error, info, warn};
 
 use komo_core::domain::{
-    briefing::BriefingMarkRepository,
     context::{SessionContext, SessionOrigin},
     cron::{
         CatchUpVerdict, CronAction, CronJob, CronJobRepository, CronJobStatus, RoutineRunStatus,
-        next_occurrence_in, next_occurrence_local,
+        next_occurrence_local,
     },
     gateway::MessageHandler,
-    llm::LlmClient,
-    memory::{Memory, MemoryRepository},
-    message::Message,
+    memory::MemoryRepository,
     notify::Notifier,
     repository::SessionEventRepository,
     run::RunStatus,
     run_projection::project_runs,
-    session::Session,
     session_event::SessionEventKind,
     trigger::ExternalEvent,
     wakeup::{WakeupDispatch, WakeupRegistration, WakeupRepository, is_suspended},
@@ -70,8 +66,8 @@ const BREAKER_ALERT_TIMEOUT: Duration = Duration::from_secs(10);
 /// does it next fire" math goes through `domain::cron::next_occurrence_local`
 /// — the **same** function cron jobs use — so a sweep's `30 8 * * *` and a
 /// job's mean the identical local-time moment. (Matching against `Utc::now()`
-/// here is the bug that made a briefing configured for 8:30 fire at 16:30 on
-/// a UTC+8 machine.)
+/// here is the bug that made a sweep configured for 8:30 fire at 16:30 on a
+/// UTC+8 machine.)
 #[derive(Clone)]
 pub struct Schedule {
     expr: String,
@@ -106,8 +102,6 @@ pub trait Maintenance: Send + Sync {
 pub struct MaintenanceSummary {
     pub sessions_reviewed: usize,
     pub memories_written: usize,
-    /// Daily briefings composed and delivered this sweep (0 or 1).
-    pub briefings_sent: usize,
     /// Candidate memories the dream sweep promoted to active this cycle.
     pub memories_promoted: usize,
     /// Candidate memories the dream sweep archived (never earned a recall) this cycle.
@@ -1013,9 +1007,8 @@ struct PendingWait {
 }
 
 /// Wrap an agent-job prompt with the skill-loading preamble (progressive
-/// disclosure — the turn loads each named skill before acting), mirroring the
-/// briefing's `agentic_briefing_prompt`, and with the event that set this
-/// firing off. Pure, so the wording is testable.
+/// disclosure — the turn loads each named skill before acting), and with the
+/// event that set this firing off. Pure, so the wording is testable.
 ///
 /// The event goes **last and fenced**, under the same rule the main prompt
 /// states in `system_prompt::TRUST_BOUNDARY_GUIDANCE`: a webhook body and a
@@ -1140,243 +1133,6 @@ fn truncate_tail(s: &str, cap: usize) -> String {
     format!("…(earlier output truncated)\n{}", &s[start..])
 }
 
-/// Window for "recently learned" memories surfaced in the briefing.
-const BRIEFING_MEMORY_WINDOW_SECS: i64 = 7 * 86_400;
-/// Cap each briefing list so a large backlog can't produce an unreadable wall;
-/// truncation is disclosed in-line ("+N more") rather than hidden.
-const BRIEFING_SECTION_CAP: usize = 10;
-
-/// Daily proactive briefing: read the recently-learned memories, let the aux
-/// LLM compose a short digest, and deliver it through the notifier
-/// (a channel `home_chat`, else macOS). Opt-in via `briefing_schedule`; the
-/// roadmap's §4 "morning briefing". Reuses the existing scheduler and notifier —
-/// no new delivery mechanism.
-pub struct BriefingSweep {
-    pub memories: Arc<dyn MemoryRepository>,
-    pub llm: Arc<dyn LlmClient>,
-    pub notifier: Arc<dyn Notifier>,
-    /// The tool-capable briefing agent (wiring's `briefing_runtime`): when set,
-    /// the briefing runs as a real agent turn — read-only tools, so a briefing
-    /// skill can pull external data (calendar, weather) — and falls back to the
-    /// tool-less `llm.complete` path on any error, so the briefing always goes
-    /// out. `None` keeps the plain compose (tests, minimal wiring).
-    pub runtime: Option<Arc<dyn MessageHandler>>,
-    /// Watermark of the last local day handled, for the startup catch-up
-    /// ([`briefing_catchup_due`]). `None` = no catch-up wired (tests).
-    pub marks: Option<Arc<dyn BriefingMarkRepository>>,
-}
-
-impl BriefingSweep {
-    /// The original tool-less compose: one synthetic user turn on the aux LLM.
-    async fn compose_plain(&self, prompt: &str, now: i64) -> anyhow::Result<String> {
-        let session = Session {
-            id: "briefing".to_string(),
-            workspace: "__default__".to_string(),
-            messages: vec![Message::user(prompt.to_string())],
-            created_at: now,
-            title: String::new(),
-            status: String::new(),
-            // A sweep runs on the aux model as configured — never a
-            // conversation's per-session model choice.
-            model: String::new(),
-            effort: String::new(),
-            channel: None,
-            origin: SessionOrigin::User,
-            awaiting: None,
-        };
-        self.llm.complete(&session).await
-    }
-}
-
-impl BriefingSweep {
-    /// Stamp today's local date as handled — the catch-up's watermark.
-    /// Best-effort: a failed stamp risks one redundant catch-up check, which is
-    /// not worth failing the cycle over.
-    async fn stamp_handled(&self) {
-        if let Some(marks) = &self.marks {
-            let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-            if let Err(error) = marks.mark_handled(&today).await {
-                warn!(%error, "failed to record the briefing watermark");
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl Maintenance for BriefingSweep {
-    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
-        let mut summary = MaintenanceSummary::default();
-        let memories = self.memories.list().await?;
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-
-        // Nothing on the plate → stay silent rather than ping an empty note —
-        // but the slot was still handled: without the stamp, every restart
-        // today would re-evaluate it.
-        let Some(prompt) = briefing_prompt(&memories, now) else {
-            self.stamp_handled().await;
-            return Ok(summary);
-        };
-
-        // Prefer the tool-capable agent turn (one per-day session, so each
-        // briefing is one clean transcript + run-ledger entry); degrade to the
-        // plain compose on any error — a broken skill or a denied tool call
-        // must never cost the user their briefing.
-        let text = match &self.runtime {
-            Some(handler) => {
-                // One session per briefing; running twice in a day is
-                // prevented by the per-day watermark, not by the id.
-                let session_id = uuid::Uuid::now_v7().to_string();
-                // Unattended, for the same reason as the cron sweep above.
-                let session =
-                    SessionContext::detached(&session_id).with_origin(SessionOrigin::Briefing);
-                match with_session(
-                    session,
-                    handler.handle(&session_id, agentic_briefing_prompt(&prompt)),
-                )
-                .await
-                {
-                    Ok(text) => text,
-                    Err(error) => {
-                        warn!(%error, "briefing agent turn failed; using tool-less compose");
-                        self.compose_plain(&prompt, now).await?
-                    }
-                }
-            }
-            None => self.compose_plain(&prompt, now).await?,
-        };
-        let text = text.trim();
-        if text.is_empty() {
-            self.stamp_handled().await;
-            return Ok(summary);
-        }
-        self.notifier.notify("Komo daily briefing", text).await.ok();
-        summary.briefings_sent = 1;
-        self.stamp_handled().await;
-        Ok(summary)
-    }
-}
-
-/// Should a starting gateway run the briefing immediately? True when today's
-/// slot has already passed and no briefing was handled today — the same
-/// "asleep over a slot → run it late, once" rule a cron job gets from its
-/// stored `next_run_at`. Only today's slot counts: yesterday's briefing is
-/// stale news, not a debt. Timezone-generic (like `next_occurrence_in`) so the
-/// decision is testable without the host's clock.
-pub fn briefing_catchup_due<Tz>(
-    expr: &str,
-    handled: Option<&str>,
-    now: chrono::DateTime<Tz>,
-) -> bool
-where
-    Tz: chrono::TimeZone + Clone,
-    Tz::Offset: std::fmt::Display,
-{
-    let today = now.format("%Y-%m-%d").to_string();
-    if handled == Some(today.as_str()) {
-        return false;
-    }
-    // Today's first slot: strictly after one second before local midnight,
-    // i.e. the earliest occurrence at or after 00:00:00 today.
-    let Some(midnight) = now.date_naive().and_hms_opt(0, 0, 0) else {
-        return false;
-    };
-    let midnight = match now.timezone().from_local_datetime(&midnight) {
-        chrono::LocalResult::Single(dt) => dt,
-        chrono::LocalResult::Ambiguous(dt, _) => dt,
-        chrono::LocalResult::None => return false,
-    };
-    match next_occurrence_in(expr, midnight - chrono::Duration::seconds(1)) {
-        Ok(slot) => slot <= now,
-        // An unparseable expression already disabled the sweep with a warning.
-        Err(_) => false,
-    }
-}
-
-/// Wrap the digest prompt with the agent-turn instructions: how to use the
-/// read-only tools to enrich the briefing, and how to degrade. Pure, so the
-/// wording is testable.
-fn agentic_briefing_prompt(digest_prompt: &str) -> String {
-    format!(
-        "{digest_prompt}\n\n\
-         You have read-only tools. Before composing, check `skill` (action=list) \
-         for briefing-related skills (calendar, weather, mail, …); load any that \
-         apply with action=view and follow them to fetch external data. If a \
-         source is unreachable or a tool call is denied, skip that section \
-         silently — never block the briefing on it. Reply with ONLY the final \
-         briefing text."
-    )
-}
-
-/// Wraps a `Maintenance` so it only runs on Chinese working days: a holiday or
-/// an ordinary weekend skips the inner sweep, while a 调休 makeup workday runs
-/// it. This is the "上班才执行" gate — the cron decides *when* a slot fires;
-/// the calendar decides whether today counts as a workday at all. Calendar
-/// lookups degrade to Monday–Friday, so a data outage never blocks a real
-/// workday's run.
-pub struct WorkdayGated {
-    pub inner: Arc<dyn Maintenance>,
-    pub calendar: Arc<dyn komo_core::domain::workday::WorkdayCalendar>,
-}
-
-#[async_trait]
-impl Maintenance for WorkdayGated {
-    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
-        let today = chrono::Local::now().date_naive();
-        if !self.calendar.is_workday(today).await {
-            info!(date = %today, "not a workday; skipping gated maintenance");
-            return Ok(MaintenanceSummary::default());
-        }
-        self.inner.run().await
-    }
-}
-
-/// Build the briefing prompt from the recently-learned memories. Returns `None`
-/// when there is nothing worth a proactive ping, so the sweep can skip delivery.
-/// Pure and clock-injected (`now`) so the digest is unit-testable without a real
-/// LLM or notifier.
-fn briefing_prompt(memories: &[Memory], now: i64) -> Option<String> {
-    let recent: Vec<&Memory> = memories
-        .iter()
-        .filter(|m| now - m.created_at <= BRIEFING_MEMORY_WINDOW_SECS)
-        .collect();
-    if recent.is_empty() {
-        return None;
-    }
-
-    // A `with_overflow` helper: list up to the cap, then disclose how many were
-    // dropped instead of silently truncating.
-    let render_lines = |out: &mut String, lines: Vec<String>| {
-        for line in lines.iter().take(BRIEFING_SECTION_CAP) {
-            out.push_str(line);
-            out.push('\n');
-        }
-        if lines.len() > BRIEFING_SECTION_CAP {
-            out.push_str(&format!(
-                "- (+{} more)\n",
-                lines.len() - BRIEFING_SECTION_CAP
-            ));
-        }
-    };
-
-    let mut digest = String::new();
-    if !recent.is_empty() {
-        let lines: Vec<String> = recent
-            .iter()
-            .map(|m| format!("- [{}] {}", m.kind.as_str(), m.content))
-            .collect();
-        digest.push_str(&format!("\nRecently learned ({}):\n", recent.len()));
-        render_lines(&mut digest, lines);
-    }
-
-    Some(format!(
-        "Compose a short, friendly daily briefing for the user from the items below. \
-         Give a brief note of what's newly learned. Be concise and warm; never invent \
-         anything not listed, and if nothing is urgent, say so plainly. Reply with the \
-         briefing text only — no preamble.\n\n{}",
-        digest.trim_end()
-    ))
-}
-
 /// Update the consecutive-failure counter and report whether the circuit breaker
 /// has tripped. Pulled out as a pure function so the breaker is unit-testable
 /// without driving the real clock.
@@ -1439,7 +1195,6 @@ where
                     service = name,
                     sessions = summary.sessions_reviewed,
                     memories = summary.memories_written,
-                    briefings = summary.briefings_sent,
                     promoted = summary.memories_promoted,
                     archived = summary.memories_archived,
                     jobs = summary.jobs_run,
@@ -2578,8 +2333,7 @@ mod tests {
     }
 
     /// A fake agent handler that records (session_id, message), to exercise
-    /// agent-mode cron jobs. (The briefing tests' `FakeHandler` records only the
-    /// message; cron needs the session id too.)
+    /// agent-mode cron jobs.
     struct FakeCronHandler {
         reply: String,
         seen: Mutex<Vec<(String, String)>>,
@@ -2677,21 +2431,6 @@ mod tests {
         );
         sweep.sweep_due().await.unwrap();
         assert_eq!(*probe.seen.lock().unwrap(), Some(Some(SessionOrigin::Cron)));
-    }
-
-    #[tokio::test]
-    async fn briefing_agent_turn_runs_under_an_unattended_session() {
-        let probe = Arc::new(OriginProbe::default());
-        let (mut sweep, _notifier) = briefing_with(
-            vec![learned("write report")],
-            "plain compose (must not be used)",
-        );
-        sweep.runtime = Some(probe.clone());
-        sweep.run().await.unwrap();
-        assert_eq!(
-            *probe.seen.lock().unwrap(),
-            Some(Some(SessionOrigin::Briefing))
-        );
     }
 
     fn agent_job(name: &str, prompt: &str, skills: Vec<String>) -> CronJob {
@@ -3407,62 +3146,11 @@ mod tests {
         );
     }
 
-    // ── BriefingSweep ─────────────────────────────────────────────────────────
-
-    use komo_core::domain::memory::{Memory, MemoryKind, MemoryRepository};
-
-    struct FixedLlm(String);
-
-    #[async_trait]
-    impl LlmClient for FixedLlm {
-        async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
-            Ok(self.0.clone())
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeMemories(Mutex<Vec<Memory>>);
-
-    #[async_trait]
-    impl MemoryRepository for FakeMemories {
-        async fn list(&self) -> anyhow::Result<Vec<Memory>> {
-            Ok(self.0.lock().unwrap().clone())
-        }
-        async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
-            self.0.lock().unwrap().push(memory.clone());
-            Ok(())
-        }
-    }
-
-    fn briefing_with(memories: Vec<Memory>, reply: &str) -> (BriefingSweep, Arc<FakeNotifier>) {
-        let notifier = Arc::new(FakeNotifier::default());
-        let sweep = BriefingSweep {
-            memories: Arc::new(FakeMemories(Mutex::new(memories))),
-            llm: Arc::new(FixedLlm(reply.to_string())),
-            notifier: notifier.clone(),
-            runtime: None,
-            marks: None,
-        };
-        (sweep, notifier)
-    }
-
-    #[derive(Default)]
-    struct FakeMarks(Mutex<Option<String>>);
-
-    #[async_trait]
-    impl BriefingMarkRepository for FakeMarks {
-        async fn last_handled(&self) -> anyhow::Result<Option<String>> {
-            Ok(self.0.lock().unwrap().clone())
-        }
-        async fn mark_handled(&self, date: &str) -> anyhow::Result<()> {
-            *self.0.lock().unwrap() = Some(date.to_string());
-            Ok(())
-        }
-    }
+    // ── Schedule ──────────────────────────────────────────────────────────────
 
     /// The sweep scheduler and the cron-job store must mean the same local
     /// moment by the same expression — this is the alignment that keeps a
-    /// `briefing_schedule = "30 8 * * *"` from firing at 16:30 on a UTC+8 host.
+    /// sweep's `"30 8 * * *"` from firing at 16:30 on a UTC+8 host.
     #[test]
     fn schedule_next_after_matches_cron_job_local_semantics() {
         let now = Utc::now();
@@ -3472,172 +3160,14 @@ mod tests {
         assert_eq!(now.timestamp() + wait.as_secs() as i64, expected);
     }
 
-    #[test]
-    fn catchup_due_only_when_todays_slot_passed_unhandled() {
-        use chrono::TimeZone;
-        let tz = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-        // 2026-08-11 is a Tuesday.
-        let now = tz.with_ymd_and_hms(2026, 8, 11, 9, 0, 0).unwrap();
-
-        // Slot 08:30 passed, nothing handled → run it late, once.
-        assert!(briefing_catchup_due("30 8 * * *", None, now));
-        // Handled yesterday counts as unhandled today.
-        assert!(briefing_catchup_due("30 8 * * *", Some("2026-08-10"), now));
-        // Already handled today → no double delivery.
-        assert!(!briefing_catchup_due("30 8 * * *", Some("2026-08-11"), now));
-        // Slot still ahead today → the supervisor will reach it on its own.
-        assert!(!briefing_catchup_due("30 18 * * *", None, now));
-        // No slot today at all (Friday-only schedule) → nothing was missed.
-        assert!(!briefing_catchup_due("30 8 * * 5", None, now));
-        // Exactly at the slot counts as passed (<=), not skipped.
-        let at_slot = tz.with_ymd_and_hms(2026, 8, 11, 8, 30, 0).unwrap();
-        assert!(briefing_catchup_due("30 8 * * *", None, at_slot));
-        // A broken expression never triggers a surprise delivery.
-        assert!(!briefing_catchup_due("not a cron", None, now));
-    }
-
-    #[tokio::test]
-    async fn briefing_stamps_the_watermark_even_when_silent() {
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-
-        // Something to say → delivered and stamped.
-        let (mut sweep, _notifier) = briefing_with(vec![learned("write report")], "brief");
-        let marks = Arc::new(FakeMarks::default());
-        sweep.marks = Some(marks.clone());
-        sweep.run().await.unwrap();
-        assert_eq!(
-            marks.last_handled().await.unwrap().as_deref(),
-            Some(today.as_str())
-        );
-
-        // Nothing to say → silent, but the slot still counts as handled, or
-        // every restart today would re-evaluate it.
-        let (mut sweep, notifier) = briefing_with(vec![], "unused");
-        let marks = Arc::new(FakeMarks::default());
-        sweep.marks = Some(marks.clone());
-        sweep.run().await.unwrap();
-        assert!(notifier.calls.lock().unwrap().is_empty());
-        assert_eq!(
-            marks.last_handled().await.unwrap().as_deref(),
-            Some(today.as_str())
-        );
-    }
-
-    /// A MessageHandler that either answers fixedly or errors, recording calls.
-    struct FakeHandler {
-        reply: Result<String, String>,
-        calls: Mutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl komo_core::domain::gateway::MessageHandler for FakeHandler {
-        async fn handle(&self, _session_id: &str, input: String) -> anyhow::Result<String> {
-            self.calls.lock().unwrap().push(input);
-            match &self.reply {
-                Ok(t) => Ok(t.clone()),
-                Err(e) => Err(anyhow::anyhow!("{e}")),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn briefing_prefers_the_agent_turn_with_tool_instructions() {
-        let (mut sweep, notifier) = briefing_with(
-            vec![learned("write report")],
-            "plain compose (must not be used)",
-        );
-        let handler = Arc::new(FakeHandler {
-            reply: Ok("agentic briefing".into()),
-            calls: Mutex::new(Vec::new()),
-        });
-        sweep.runtime = Some(handler.clone());
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.briefings_sent, 1);
-        assert_eq!(notifier.calls.lock().unwrap()[0].1, "agentic briefing");
-        let calls = handler.calls.lock().unwrap();
-        assert!(calls[0].contains("write report"), "digest is embedded");
-        assert!(
-            calls[0].contains("read-only tools"),
-            "agent-turn instructions appended"
-        );
-    }
-
-    #[tokio::test]
-    async fn briefing_falls_back_to_plain_compose_when_the_agent_turn_fails() {
-        let (mut sweep, notifier) =
-            briefing_with(vec![learned("write report")], "plain fallback briefing");
-        sweep.runtime = Some(Arc::new(FakeHandler {
-            reply: Err("tool exploded".into()),
-            calls: Mutex::new(Vec::new()),
-        }));
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.briefings_sent, 1, "briefing still goes out");
-        assert_eq!(
-            notifier.calls.lock().unwrap()[0].1,
-            "plain fallback briefing"
-        );
-    }
-
-    #[test]
-    fn briefing_prompt_is_none_when_nothing_to_say() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        assert!(briefing_prompt(&[], now).is_none());
-    }
-
-    #[test]
-    fn briefing_prompt_skips_stale_memories() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut old = Memory::new(MemoryKind::Profile, "ancient");
-        old.created_at = now - BRIEFING_MEMORY_WINDOW_SECS - 1;
-        // Only a stale memory → nothing recent → no briefing.
-        assert!(briefing_prompt(std::slice::from_ref(&old), now).is_none());
-    }
-
-    /// A memory learned just now, which is what the digest is built from.
-    fn learned(content: &str) -> Memory {
-        Memory::new(MemoryKind::Profile, content)
-    }
-
-    #[tokio::test]
-    async fn briefing_sweep_sends_when_something_was_learned() {
-        let (sweep, notifier) = briefing_with(
-            vec![learned("ship release")],
-            "Good morning! One note today.",
-        );
-
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.briefings_sent, 1);
-        let calls = notifier.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, "Komo daily briefing");
-        assert!(calls[0].1.contains("Good morning"));
-    }
-
-    #[tokio::test]
-    async fn briefing_sweep_stays_silent_when_nothing_open() {
-        let (sweep, notifier) = briefing_with(vec![], "should never be sent");
-
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.briefings_sent, 0);
-        assert!(notifier.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn briefing_sweep_silent_on_empty_llm_reply() {
-        let (sweep, notifier) = briefing_with(vec![learned("review PR")], "   ");
-
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.briefings_sent, 0);
-        assert!(notifier.calls.lock().unwrap().is_empty());
-    }
-
     // ── DreamSweep ────────────────────────────────────────────────────────────
 
     use komo_core::domain::memory::{
-        DREAM_FORGET_AGE_DAYS, DREAM_MIN_SUPPORT, EvidenceRelation, MemoryConfidence, MemoryStatus,
+        DREAM_FORGET_AGE_DAYS, DREAM_MIN_SUPPORT, EvidenceRelation, Memory, MemoryConfidence,
+        MemoryKind, MemoryRepository, MemoryStatus,
     };
 
-    /// A `FakeMemories` whose `save` overwrites by id (the real store is
+    /// A memory store whose `save` overwrites by id (the real store is
     /// create-or-replace), so a promotion is observable on the next `list`.
     #[derive(Default)]
     struct OverwriteMemories(Mutex<Vec<Memory>>);
@@ -3727,61 +3257,6 @@ mod tests {
         assert!(
             !promoted.is_pinnable(&ctx, now),
             "auto-promoted memory must not be pinnable"
-        );
-    }
-
-    // ── WorkdayGated ──────────────────────────────────────────────────────────
-
-    /// Counts how many times the inner sweep actually ran.
-    #[derive(Default)]
-    struct CountingMaintenance(Mutex<usize>);
-
-    #[async_trait]
-    impl Maintenance for CountingMaintenance {
-        async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
-            *self.0.lock().unwrap() += 1;
-            Ok(MaintenanceSummary {
-                briefings_sent: 1,
-                ..Default::default()
-            })
-        }
-    }
-
-    /// A calendar with a hard-wired verdict — no network, no disk.
-    struct FixedCalendar(bool);
-
-    #[async_trait]
-    impl komo_core::domain::workday::WorkdayCalendar for FixedCalendar {
-        async fn is_workday(&self, _date: chrono::NaiveDate) -> bool {
-            self.0
-        }
-    }
-
-    #[tokio::test]
-    async fn workday_gate_runs_inner_on_a_workday() {
-        let inner = Arc::new(CountingMaintenance::default());
-        let gate = WorkdayGated {
-            inner: inner.clone(),
-            calendar: Arc::new(FixedCalendar(true)),
-        };
-        let summary = gate.run().await.unwrap();
-        assert_eq!(summary.briefings_sent, 1);
-        assert_eq!(*inner.0.lock().unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn workday_gate_skips_inner_off_a_workday() {
-        let inner = Arc::new(CountingMaintenance::default());
-        let gate = WorkdayGated {
-            inner: inner.clone(),
-            calendar: Arc::new(FixedCalendar(false)),
-        };
-        let summary = gate.run().await.unwrap();
-        assert_eq!(summary, MaintenanceSummary::default());
-        assert_eq!(
-            *inner.0.lock().unwrap(),
-            0,
-            "inner must not run off a workday"
         );
     }
 }

@@ -169,8 +169,8 @@ pub trait TurnDriver: Send {
 #[async_trait]
 pub trait LlmClient: Send + Sync {
     /// Produce an assistant reply for a tool-less sub-agent conversation — the
-    /// `delegate` tool, the reflective reviewer, the briefing sweep. These
-    /// expose no tools, so the whole exchange is a single completion.
+    /// `delegate` tool and the reflective reviewer. These expose no tools, so
+    /// the whole exchange is a single completion.
     async fn complete(&self, session: &Session) -> anyhow::Result<String>;
 
     /// Begin a tool-using turn for the main agent. The returned [`TurnDriver`]

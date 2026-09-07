@@ -42,8 +42,8 @@ pub const SESSION_EVENT_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionHeader {
     pub session_id: String,
-    /// What drives this conversation (`user` / `cron` / `briefing` /
-    /// `delegate`) — the same value the session record carries.
+    /// What drives this conversation (`user` / `cron` / `delegate`) — the same
+    /// value the session record carries.
     pub origin: String,
     /// Workspace root this session's tools are confined to, when it has one.
     #[serde(default)]

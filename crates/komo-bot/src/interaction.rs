@@ -921,7 +921,7 @@ impl GatewayDispatcher {
         match origin {
             SessionOrigin::Delegate => None,
             SessionOrigin::User => Some(self.handler.clone()),
-            SessionOrigin::Cron | SessionOrigin::Briefing => match self.by_origin.get(&origin) {
+            SessionOrigin::Cron => match self.by_origin.get(&origin) {
                 Some(handler) => Some(handler.clone()),
                 None => {
                     warn!(

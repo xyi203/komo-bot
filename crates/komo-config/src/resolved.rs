@@ -89,9 +89,8 @@ pub const DEFAULT_REVIEW_INTERVAL: usize = 10;
 pub const DEFAULT_MAINTENANCE_SCHEDULE: &str = "0 * * * *";
 
 /// Default dreaming-sweep schedule: nightly at 3am, mirroring OpenClaw's
-/// dreaming. Unlike the briefing (proactive notifications → opt-in), dreaming is
-/// internal memory housekeeping with no user-facing output, so it is **on by
-/// default**.
+/// dreaming. Internal memory housekeeping with no user-facing output, so it is
+/// **on by default**.
 pub const DEFAULT_DREAM_SCHEDULE: &str = "0 3 * * *";
 
 /// Default Home Assistant URL when `HASS_URL` is unset.
@@ -120,10 +119,6 @@ pub struct RuntimeConfig {
     pub review_interval: usize,
     /// Maintenance sweep cron (5-field Unix).
     pub maintenance_schedule: String,
-    /// Daily briefing cron; `None` = opt-in feature disabled.
-    pub briefing_schedule: Option<String>,
-    /// Gate the briefing to Chinese working days.
-    pub briefing_workdays_only: bool,
     /// Dreaming sweep cron; `None` = explicitly disabled (default is on).
     pub dream_schedule: Option<String>,
     /// Embedding backend for cross-language memory recall; `None` = off, recall
@@ -795,10 +790,6 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
     // `[memory]` backend when it declares no model of its own.
     let embedding = resolve_embedding(file.memory);
     let wiki = resolve_wiki(file.wiki, embedding.as_ref(), &mut issues);
-    let briefing_enabled = env
-        .briefing_schedule_enabled
-        .or(file.briefing_schedule_enabled)
-        .unwrap_or(true);
     let dream_enabled = env
         .dream_schedule_enabled
         .or(file.dream_schedule_enabled)
@@ -816,14 +807,6 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
             .schedule
             .or(file.schedule)
             .unwrap_or_else(|| DEFAULT_MAINTENANCE_SCHEDULE.to_string()),
-        briefing_schedule: enabled_then(
-            briefing_enabled,
-            env.briefing_schedule.or(file.briefing_schedule),
-        ),
-        briefing_workdays_only: env
-            .briefing_workdays_only
-            .or(file.briefing_workdays_only)
-            .unwrap_or(false),
         dream_schedule: enabled_then(
             dream_enabled,
             resolve_dream_schedule(env.dream_schedule.or(file.dream_schedule)),
@@ -1365,7 +1348,6 @@ mod tests {
         assert_eq!(rt.model.model, "deepseek-v4-flash");
         assert_eq!(rt.model.max_turns, DEFAULT_MAX_TURNS);
         assert_eq!(rt.maintenance_schedule, DEFAULT_MAINTENANCE_SCHEDULE);
-        assert_eq!(rt.briefing_schedule, None, "briefing stays opt-in");
         assert_eq!(
             rt.dream_schedule.as_deref(),
             Some(DEFAULT_DREAM_SCHEDULE),
@@ -1671,30 +1653,22 @@ mod tests {
     #[test]
     fn enabled_switches_override_a_configured_schedule() {
         let mut s = with_deepseek_key(sources());
-        s.file.briefing_schedule = Some("30 8 * * *".into());
         s.file.dream_schedule = Some("0 3 * * *".into());
-        s.env.briefing_schedule_enabled = Some(false);
         s.env.dream_schedule_enabled = Some(false);
 
         let rt = ConfigSnapshot::from_sources(s).runtime;
-        assert_eq!(rt.briefing_schedule, None);
         assert_eq!(rt.dream_schedule, None);
     }
 
     #[test]
     fn enabled_switches_default_on_and_env_beats_file() {
         let mut s = with_deepseek_key(sources());
-        s.file.briefing_schedule = Some("30 8 * * *".into());
-        s.file.briefing_schedule_enabled = Some(false);
+        s.file.dream_schedule = Some("0 3 * * *".into());
         s.file.dream_schedule_enabled = Some(false);
-        s.env.briefing_schedule_enabled = Some(true);
+        s.env.dream_schedule_enabled = Some(true);
 
         let rt = ConfigSnapshot::from_sources(s).runtime;
-        assert_eq!(rt.briefing_schedule.as_deref(), Some("30 8 * * *"));
-        assert_eq!(
-            rt.dream_schedule, None,
-            "file switch still disables dreaming"
-        );
+        assert_eq!(rt.dream_schedule.as_deref(), Some("0 3 * * *"));
     }
 
     #[test]

@@ -20,6 +20,5 @@ mod upgrade;
 mod wechat;
 mod wiki;
 pub(crate) mod wiring;
-mod workday;
 
 pub use app::run;

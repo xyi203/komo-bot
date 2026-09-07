@@ -36,7 +36,7 @@ use crate::domain::session_event::{
 /// to see). This says the quiet part explicitly instead.
 ///
 /// An enum rather than a `bool` because the callers already differ in more than
-/// attendance: a cron job's turn is scoped to *one job*, the briefing's is not.
+/// attendance: a cron job's turn is scoped to *one job*, a conversation's is not.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -49,14 +49,12 @@ pub enum SessionOrigin {
     User,
     /// A scheduled cron job's turn (`CronJobSweep`).
     Cron,
-    /// The daily briefing sweep's turn (`BriefingSweep`).
-    Briefing,
     /// A sub-agent's scratch session, spawned by the `delegate` tool.
     ///
     /// Only ever the *session record's* value: a delegation deliberately runs
     /// inside the parent's ambient [`SessionContext`], so the turn's own origin
     /// is whatever the parent's was. It is here because it answers the same
-    /// question the other three do — what is driving this conversation — and
+    /// question the others do — what is driving this conversation — and
     /// the alternative was a second enum overlapping this one three ways.
     Delegate,
 }
@@ -73,7 +71,7 @@ impl SessionOrigin {
     pub fn is_unattended(self) -> bool {
         match self {
             Self::User => false,
-            Self::Cron | Self::Briefing => true,
+            Self::Cron => true,
             // A sub-agent runs inside its parent's turn and inherits its
             // context, so whoever was reachable for the parent is reachable
             // for it.
@@ -86,7 +84,6 @@ impl SessionOrigin {
         match self {
             Self::User => "user",
             Self::Cron => "cron",
-            Self::Briefing => "briefing",
             Self::Delegate => "delegate",
         }
     }
@@ -98,7 +95,6 @@ impl SessionOrigin {
     pub fn parse(raw: &str) -> Self {
         match raw {
             "cron" => Self::Cron,
-            "briefing" => Self::Briefing,
             "delegate" => Self::Delegate,
             _ => Self::User,
         }
@@ -106,7 +102,7 @@ impl SessionOrigin {
 
     /// Whether a turn on this session is a lesson worth extracting from.
     ///
-    /// Only a real conversation is. A sweep (`Cron`/`Briefing`) restates what
+    /// Only a real conversation is. A sweep (`Cron`) restates what
     /// the agent already knows, and each run's session counts as a fresh
     /// "independent occasion" to the memory consolidator — extracting there
     /// lets the library corroborate itself on a timer. A `Delegate` session is
@@ -118,7 +114,7 @@ impl SessionOrigin {
     pub fn is_learnable(self) -> bool {
         match self {
             Self::User => true,
-            Self::Cron | Self::Briefing | Self::Delegate => false,
+            Self::Cron | Self::Delegate => false,
         }
     }
 }

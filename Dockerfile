@@ -11,7 +11,7 @@
 #             LLM API needs a trust store) + libssl3 (the wechat channel's
 #             `wechatbot` crate pulls reqwest's native-tls, which dynamically
 #             links libssl on Linux — without it the binary won't even load) +
-#             tzdata (reminders and the briefing run on local time — set TZ) +
+#             tzdata (reminders run on local time — set TZ) +
 #             git (`komo skills install owner/repo` shells out to `git clone`;
 #             only the single-file `…/SKILL.md` form uses the built-in HTTP
 #             client) + curl / python3 / uv (nothing in komo calls any of

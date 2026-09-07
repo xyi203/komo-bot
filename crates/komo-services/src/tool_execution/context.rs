@@ -183,7 +183,7 @@ tokio::task_local! {
 /// list through it would touch every approver for the sake of one caller.
 ///
 /// Outside this scope there are no grants at all — that is what keeps one job's
-/// approvals from reaching another job, the briefing, or a conversation.
+/// approvals from reaching another job or a conversation.
 pub async fn with_job_grants<F: std::future::Future>(grants: Vec<Rule>, future: F) -> F::Output {
     JOB_GRANTS.scope(Arc::new(grants), future).await
 }
@@ -205,7 +205,7 @@ pub async fn with_session<F: std::future::Future>(ctx: SessionContext, future: F
 /// The ambient session context, if the current task is running inside one.
 /// `None` for aux sub-agents and the sweeps that never run an agent turn.
 ///
-/// Note that the sweeps which *do* run one (cron, briefing) install a context
+/// Note that the sweeps which *do* run one (cron) install a context
 /// here like any other caller — "unattended" is [`SessionContext::origin`], not
 /// the absence of a session. A consumer that cares whether a human is behind the
 /// turn must read the origin; `is_none()` does not answer that question.

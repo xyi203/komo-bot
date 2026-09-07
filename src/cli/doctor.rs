@@ -279,22 +279,11 @@ fn model_health(config: &ConfigSnapshot) {
     }
 }
 
-/// Maintenance cron, daily briefing (opt-in), dreaming, and the workday gate.
+/// Maintenance cron and dreaming.
 fn schedule_health(config: &ConfigSnapshot) {
     let rt = &config.runtime;
     println!("\nsweeps:");
     println!("  maintenance  {}", rt.maintenance_schedule);
-    match &rt.briefing_schedule {
-        Some(s) => {
-            let gate = if rt.briefing_workdays_only {
-                " (Chinese workdays only)"
-            } else {
-                ""
-            };
-            println!("  briefing     {s}{gate}");
-        }
-        None => println!("  briefing     {OFF} disabled (set briefing_schedule to enable)"),
-    }
     match &rt.dream_schedule {
         Some(s) => println!("  dreaming     {s}"),
         None => println!("  dreaming     {OFF} disabled"),

@@ -52,12 +52,10 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
 
     // A cron typo must not crash-loop the always-on gateway (same principle as
     // the missing-credential warnings above): the maintenance schedule degrades
-    // to the built-in default cadence, an opt-in sweep (briefing/dream) is
+    // to the built-in default cadence, an opt-in sweep (dream) is
     // disabled — each with a warning naming the bad expression. Parsed here,
     // once, so the startup banner and the sweeps can never disagree.
     let (review_schedule, schedule_expr) = schedule_or_default(&rt.maintenance_schedule);
-    let (briefing_schedule, briefing_expr) =
-        optional_schedule(rt.briefing_schedule.as_deref(), "briefing_schedule");
     let (dream_schedule, dream_expr) =
         optional_schedule(rt.dream_schedule.as_deref(), "dream_schedule");
 
@@ -161,7 +159,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         // an approver that answers for a human who is not there — so its next
         // ungranted action would come back refused instead of stopping to ask.
         .with_runtime(SessionOrigin::Cron, wired.cron_runtime.clone())
-        .with_runtime(SessionOrigin::Briefing, wired.briefing_runtime.clone())
         // Where a woken routine's *next* question goes — the sweep that
         // delivered the first one is long gone by then.
         .with_notifier(notifier.clone())
@@ -237,16 +234,10 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // ── Plugin phase 3: scheduled sweeps ─────────────────────────────────────
     let mut sweep_reg = SweepRegistry::default();
     let sweep_cx = SweepCx {
-        config,
-        db: db.clone(),
         notifier: notifier.clone(),
         review: wired.review.clone(),
         memories: wired.memories.clone(),
-        aux_llm: wired.aux_llm.clone(),
-        briefing_runtime: wired.briefing_runtime.clone(),
         maintenance_schedule: review_schedule,
-        briefing_schedule,
-        briefing_expr: briefing_expr.clone(),
         dream_schedule,
         routines: routines.clone(),
     };
@@ -339,9 +330,8 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             .unwrap_or_else(|| "off".to_string())
     };
     println!(
-        "Komo gateway — maintenance `{}`, briefing {}, dreaming {}, jobs: {}, channels: {}. Ctrl-C to stop.\n",
+        "Komo gateway — maintenance `{}`, dreaming {}, jobs: {}, channels: {}. Ctrl-C to stop.\n",
         schedule_expr,
-        fmt_opt(&briefing_expr),
         fmt_opt(&dream_expr),
         format!("{cron_job_count} in cron.db"),
         if channels.is_empty() {
@@ -429,13 +419,13 @@ mod tests {
 
     #[test]
     fn optional_schedule_typo_disables_the_sweep() {
-        let (schedule, expr) = optional_schedule(Some("not a cron"), "briefing_schedule");
+        let (schedule, expr) = optional_schedule(Some("not a cron"), "dream_schedule");
         assert!(schedule.is_none());
         assert!(expr.is_none());
         let (schedule, expr) = optional_schedule(Some("0 3 * * *"), "dream_schedule");
         assert!(schedule.is_some());
         assert_eq!(expr.as_deref(), Some("0 3 * * *"));
-        let (schedule, _) = optional_schedule(None, "briefing_schedule");
+        let (schedule, _) = optional_schedule(None, "dream_schedule");
         assert!(schedule.is_none());
     }
 }

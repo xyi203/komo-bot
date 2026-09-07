@@ -76,11 +76,6 @@ pub struct KomoEnv {
     /// Reasoning effort the aux backend runs at (`KOMO_AUX_EFFORT`).
     pub aux_effort: Option<String>,
     pub schedule: Option<String>,
-    pub briefing_schedule: Option<String>,
-    /// `KOMO_BRIEFING_SCHEDULE_ENABLED=false` kills the briefing without
-    /// touching whatever cron `config.toml` declares.
-    pub briefing_schedule_enabled: Option<bool>,
-    pub briefing_workdays_only: Option<bool>,
     pub dream_schedule: Option<String>,
     /// `KOMO_DREAM_SCHEDULE_ENABLED=false` — same kill switch for dreaming.
     pub dream_schedule_enabled: Option<bool>,
@@ -133,7 +128,6 @@ impl KomoEnv {
             &mut self.aux_model,
             &mut self.aux_effort,
             &mut self.schedule,
-            &mut self.briefing_schedule,
             &mut self.dream_schedule,
             &mut self.skills_path,
         ] {
@@ -161,9 +155,6 @@ impl KomoEnv {
             aux_model,
             aux_effort,
             schedule,
-            briefing_schedule,
-            briefing_schedule_enabled,
-            briefing_workdays_only,
             dream_schedule,
             dream_schedule_enabled,
             max_turns,
@@ -265,23 +256,12 @@ pub struct FileConfig {
     pub aux_effort: Option<String>,
     /// 5-field Unix cron expression for gateway maintenance (default: hourly).
     pub schedule: Option<String>,
-    /// 5-field Unix cron expression for the daily briefing. Unset = disabled
-    /// (the briefing is opt-in; e.g. `0 8 * * *` for 8am daily).
-    pub briefing_schedule: Option<String>,
-    /// Master switch for the briefing, independent of its cron. `false` disables
-    /// it while `briefing_schedule` keeps its value — which is what lets a
-    /// deployment turn the sweep off (`KOMO_BRIEFING_SCHEDULE_ENABLED=false`)
-    /// without rewriting the schedule it should return to. Default true.
-    pub briefing_schedule_enabled: Option<bool>,
-    /// Gate the daily briefing to Chinese working days only (statutory holidays
-    /// and 调休-adjusted weekends respected). Default false.
-    pub briefing_workdays_only: Option<bool>,
     /// 5-field Unix cron expression for the usage-driven memory "dreaming" sweep.
     /// Unset = on by default (nightly `0 3 * * *`); set to `"off"` (or empty) to
     /// disable.
     pub dream_schedule: Option<String>,
-    /// Master switch for dreaming, independent of its cron. Same role as
-    /// `briefing_schedule_enabled`. Default true.
+    /// Master switch for dreaming, independent of its cron. `false` disables it
+    /// while `dream_schedule` keeps its value. Default true.
     pub dream_schedule_enabled: Option<bool>,
     /// Maximum tool-calling round-trips per user turn (default: 30).
     pub max_turns: Option<usize>,
@@ -481,7 +461,7 @@ pub struct PolicyRuleFileConfig {
     pub channels: Option<Vec<String>>,
     /// Let an `allow` rule grant `Risk::Dangerous` actions too (default false).
     pub include_dangerous: Option<bool>,
-    /// Let an `allow` rule grant in no-session contexts too — the briefing
+    /// Let an `allow` rule grant in no-session contexts too — an unattended
     /// sweep's tool-capable turn (default false). Deny rules apply everywhere
     /// regardless.
     pub unattended: Option<bool>,
@@ -650,18 +630,6 @@ mod tests {
         fs::write(dir.join("config.toml"), "schedule = \"*/30 * * * *\"\n").unwrap();
         let cfg = FileConfig::load(&dir);
         assert_eq!(cfg.schedule.as_deref(), Some("*/30 * * * *"));
-    }
-
-    #[test]
-    fn file_config_loads_briefing_schedule() {
-        let dir = tmp("briefing");
-        fs::write(
-            dir.join("config.toml"),
-            "briefing_schedule = \"0 8 * * *\"\n",
-        )
-        .unwrap();
-        let cfg = FileConfig::load(&dir);
-        assert_eq!(cfg.briefing_schedule.as_deref(), Some("0 8 * * *"));
     }
 
     #[test]

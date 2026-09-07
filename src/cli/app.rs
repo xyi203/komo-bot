@@ -2,7 +2,7 @@ use clap::{Parser, Subcommand};
 
 use super::{
     channel, doctor, dream, gateway, health, init, inspect, logs, memory, model, pair, policy,
-    service, skill, upgrade, wechat, wiki, workday,
+    service, skill, upgrade, wechat, wiki,
 };
 
 /// The version every surface reports: the crate version plus the commit it was
@@ -109,12 +109,6 @@ enum Commands {
     Channel {
         #[command(subcommand)]
         action: ChannelAction,
-    },
-    /// Check the Chinese working-day calendar (statutory holidays + 调休).
-    /// Reports whether a date is a workday, fetching+caching its year if needed.
-    Workday {
-        /// Date to check (YYYY-MM-DD); defaults to today
-        date: Option<String>,
     },
     /// Print the gateway log (the launchd-captured tracing output)
     Logs {
@@ -679,7 +673,6 @@ pub async fn run() -> anyhow::Result<()> {
                 WechatAction::Login => wechat::login().await,
             },
         },
-        Some(Commands::Workday { date }) => workday::check(date).await,
         Some(Commands::Logs {
             lines,
             follow,

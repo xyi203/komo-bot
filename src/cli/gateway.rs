@@ -18,7 +18,6 @@ use crate::{
         repository::SessionEventRepository,
         repository::SessionRepository,
         run::RunRepository,
-        task::TaskRepository,
         todo::SessionTodoRepository,
         wakeup::{WakeupDispatch, WakeupRepository},
     },
@@ -90,7 +89,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     }
     // Tasks and cron jobs are tables in the same database now (docs/adr/0004);
     // the sweeps still take them as their own repositories.
-    let kanban: Arc<dyn TaskRepository> = db.clone();
     let cron_jobs: Arc<dyn CronJobRepository> = db.clone();
 
     // Tool actions that need approval are gated over the chat channel: the
@@ -143,11 +141,11 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let handler: Arc<dyn MessageHandler> = Arc::new(wired.runtime);
     let sessions: Arc<dyn SessionRepository> = db.clone();
     let todos: Arc<dyn SessionTodoRepository> = db.clone();
-    // An inbound message may be the reply a `waiting` kanban Task is holding a
-    // standing wake for (docs/bot-runtime.md §3.7). Built before the
+    // An inbound message may be the reply a standing wake is holding a turn
+    // for (docs/bot-runtime.md §3.7). Built before the
     // dispatcher because the dispatcher consults it; its way *back* to a turn
     // is attached below, once the waker exists.
-    let triggers = Arc::new(TriggerMatcher::new(db.clone(), kanban.clone()));
+    let triggers = Arc::new(TriggerMatcher::new(db.clone()));
     let dispatcher = Arc::new(
         GatewayDispatcher::new(
             handler.clone(),
@@ -243,7 +241,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let sweep_cx = SweepCx {
         config,
         db: db.clone(),
-        kanban: kanban.clone(),
         notifier: notifier.clone(),
         review: wired.review.clone(),
         memories: wired.memories.clone(),
@@ -306,7 +303,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             messages: db.clone(),
             events: db.clone(),
             todos: db.clone(),
-            tasks: kanban.clone(),
             memories: wired.memories.clone(),
             runs: db.clone(),
             skills: wired.skills.clone(),

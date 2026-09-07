@@ -2863,10 +2863,7 @@ pub(crate) mod tests {
         // which is the route the HTTP handler takes: it answers what the event
         // matched and leaves the continuation running behind the reply.
         let rt = Arc::new(waiting_runtime(db.clone(), Arc::new(WaitTool::new()), args));
-        let triggers = Arc::new(komo_services::triggers::TriggerMatcher::new(
-            db.clone(),
-            db.clone(),
-        ));
+        let triggers = Arc::new(komo_services::triggers::TriggerMatcher::new(db.clone()));
         triggers.attach_dispatch(Arc::new(TestWaker {
             runtime: rt.clone(),
             waits: wait_parts(&db),
@@ -2946,10 +2943,7 @@ pub(crate) mod tests {
                 .is_err()
         );
 
-        let triggers = Arc::new(komo_services::triggers::TriggerMatcher::new(
-            db.clone(),
-            db.clone(),
-        ));
+        let triggers = Arc::new(komo_services::triggers::TriggerMatcher::new(db.clone()));
         triggers.attach_dispatch(Arc::new(TestWaker {
             runtime: Arc::new(waiting_runtime(db.clone(), Arc::new(WaitTool::new()), args)),
             waits: wait_parts(&db),

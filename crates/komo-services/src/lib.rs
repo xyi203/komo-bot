@@ -25,7 +25,6 @@ pub mod patch;
 pub mod search;
 pub mod session_indexing;
 pub mod skill_registry;
-pub mod task_waiting;
 pub mod tool_execution;
 pub mod tool_output_store;
 pub mod triggers;

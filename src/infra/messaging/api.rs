@@ -8,7 +8,7 @@
 //!     and `models`, so third-party chat frontends connect by pointing at
 //!     `http://127.0.0.1:8765/v1` with the bearer key.
 //!   - **dashboard** (`/api/*`): read views over the same repositories the
-//!     `komo` CLI uses — sessions, tasks, memories, runs, plus a `status`
+//!     `komo` CLI uses — sessions, memories, runs, plus a `status`
 //!     aggregate. These back the desktop control panel (roadmap §9).
 //!
 //! Unlike the chat channels, an HTTP request is synchronous request/response,
@@ -376,7 +376,6 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/home-session", get(get_home_session))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{id}/messages", get(session_messages))
-        .route("/api/tasks", get(list_tasks))
         .route("/api/memories", get(list_memories))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
@@ -1160,7 +1159,6 @@ fn build_input(messages: &[ChatMessage], stateful: bool) -> String {
 // ---- dashboard endpoints ---------------------------------------------------
 
 async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let open_tasks = state.actions.open_tasks().await?.len();
     let sessions = state.actions.session_summaries().await?.len();
     Ok(Json(json!({
         "ok": true,
@@ -1172,7 +1170,6 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "context_window": model_context_window(state.model.as_ref()),
         // The provider adapters do not currently expose per-turn token usage.
         "token_usage": Value::Null,
-        "open_tasks": open_tasks,
         "sessions": sessions,
     })))
 }
@@ -1233,13 +1230,6 @@ async fn session_messages(
 ) -> Result<Json<Value>, ApiError> {
     let messages = state.actions.session_messages(&id).await?;
     Ok(Json(json!({ "session_id": id, "messages": messages })))
-}
-
-async fn list_tasks(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    // `Task` serializes verbatim (snake_case status), so the CLI deserializes it
-    // straight back into the domain type and reuses its existing renderer.
-    let tasks = state.actions.open_tasks().await?;
-    Ok(Json(json!({ "tasks": tasks })))
 }
 
 #[derive(Deserialize)]

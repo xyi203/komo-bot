@@ -4,13 +4,11 @@ import { EmptyState } from "@/shared/ui/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { GeneralTab } from "./tabs/general";
 import { RunsTab } from "./tabs/runs";
-import { TasksTab } from "./tabs/tasks";
 
 // Memories left this modal for a surface of their own (features/memory) — they
 // are the product, not a setting.
 const TABS = [
   { value: "general", label: "常规", Panel: GeneralTab, needsGateway: false },
-  { value: "tasks", label: "任务", Panel: TasksTab, needsGateway: true },
   { value: "runs", label: "运行", Panel: RunsTab, needsGateway: true },
 ] as const;
 

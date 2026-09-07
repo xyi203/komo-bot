@@ -11,18 +11,7 @@ export interface StatusSnapshot {
   model?: string;
   context_window?: number | null;
   token_usage?: number | null;
-  open_tasks: number;
   sessions: number;
-}
-
-export interface Task {
-  id: string;
-  title: string;
-  note: string;
-  status: string;
-  board: string;
-  due_at: number | null;
-  created_at: number;
 }
 
 /** A long-term memory, verbatim from `GET /api/memories`.

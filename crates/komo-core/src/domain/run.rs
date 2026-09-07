@@ -5,7 +5,7 @@
 //!
 //! Runs are execution state bound to a session, so they live in `state.db`
 //! (disposable dev state) alongside sessions/messages — not in the durable
-//! kanban/memory files. Every ledger write is best-effort: it must never fail a
+//! memory tables. Every ledger write is best-effort: it must never fail a
 //! turn or a tool call (same contract as memory `mark_used`).
 //!
 //! **These are rows, not facts.** Every field here is folded out of the

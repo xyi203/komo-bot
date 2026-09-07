@@ -23,7 +23,6 @@ use crate::domain::{
     memory::Memory,
     message::Message,
     run::{Run, RunStep},
-    task::Task,
 };
 use crate::infra::rendezvous::{self, GatewayInfo};
 use crate::services::operator_control::{
@@ -198,10 +197,6 @@ impl GatewayClient {
             .map(|channels| GatewayStatus { channels })
     }
 
-    pub async fn tasks(&self) -> anyhow::Result<Vec<Task>> {
-        self.get_field("/api/tasks", "tasks").await
-    }
-
     pub async fn runs(&self, limit: usize) -> anyhow::Result<Vec<Run>> {
         self.get_field(&format!("/api/runs?limit={limit}"), "runs")
             .await
@@ -289,8 +284,6 @@ impl GatewayClient {
             .remove("messages")
             .context("gateway response missing `messages`")?;
         Ok(serde_json::from_value(messages)?)
-    }
-
     }
 
     pub async fn pairings(&self) -> anyhow::Result<Vec<PairingView>> {

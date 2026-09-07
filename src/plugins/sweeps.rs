@@ -9,14 +9,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use komo_bot::daemon::{
-    BriefingSweep, DreamSweep, Maintenance, ReviewSweep, Schedule, TaskSweep, WorkdayGated,
+    BriefingSweep, DreamSweep, Maintenance, ReviewSweep, Schedule, WorkdayGated,
 };
 use komo_bot::gateway::MaintenanceService;
 use komo_infra::workday::HolidayCalendar;
 
 use super::{Plugin, SweepCx, SweepRegistry};
 use crate::domain::briefing::BriefingMarkRepository;
-use crate::domain::task::TaskRepository;
 
 pub struct ReviewPlugin;
 
@@ -39,31 +38,8 @@ impl Plugin for ReviewPlugin {
     }
 }
 
-pub struct TasksPlugin;
-
-#[async_trait]
-impl Plugin for TasksPlugin {
-    fn name(&self) -> &'static str {
-        "tasks"
-    }
-
-    async fn setup_sweeps(&self, reg: &mut SweepRegistry, cx: &SweepCx<'_>) -> anyhow::Result<()> {
-        let tasks: Arc<dyn TaskRepository> = cx.kanban.clone();
-        reg.sweep(MaintenanceService {
-            name: "tasks".to_string(),
-            schedule: Schedule::parse("* * * * *")?,
-            maintenance: Arc::new(TaskSweep {
-                tasks,
-                notifier: cx.notifier.clone(),
-            }),
-            alert: Some(cx.notifier.clone()),
-        });
-        Ok(())
-    }
-}
-
 /// Daily briefing — mounts only when the user opted in with
-/// `briefing_schedule`. Reads tasks + memories, composes on the aux LLM,
+/// `briefing_schedule`. Reads memories, composes on the aux LLM,
 /// delivers via the same home notifier as every other sweep.
 pub struct BriefingPlugin;
 
@@ -79,7 +55,6 @@ impl Plugin for BriefingPlugin {
         };
         let marks: Arc<dyn BriefingMarkRepository> = cx.db.clone();
         let mut sweep: Arc<dyn Maintenance> = Arc::new(BriefingSweep {
-            tasks: cx.kanban.clone(),
             memories: cx.memories.clone(),
             llm: cx.aux_llm.clone(),
             notifier: cx.notifier.clone(),

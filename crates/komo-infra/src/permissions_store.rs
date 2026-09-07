@@ -9,7 +9,7 @@
 //!
 //! - **Its own file, not `state.db`.** That db is disposable (delete it to
 //!   reset); a grant the operator made is durable personal data, like memory.db /
-//!   kanban.db / cron.db.
+//!   cron.db.
 //! - **JSON, not a fourth db.** There are a handful of entries and the operator
 //!   should be able to read and delete them with an editor. The schema is
 //!   deliberately isomorphic with `[[policy.rule]]`, so a saved entry is just "a

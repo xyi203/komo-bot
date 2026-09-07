@@ -94,22 +94,17 @@ pub struct LearningReport {
     pub sessions_learned: usize,
     pub episodes_learned: usize,
     pub memories_written: usize,
-    pub tasks_captured: usize,
 }
 
 impl LearningReport {
     pub fn is_empty(&self) -> bool {
-        self.sessions_learned == 0
-            && self.episodes_learned == 0
-            && self.memories_written == 0
-            && self.tasks_captured == 0
+        self.sessions_learned == 0 && self.episodes_learned == 0 && self.memories_written == 0
     }
 
     fn absorb(&mut self, outcome: &ReviewOutcome, episodes: usize) {
         self.sessions_learned += 1;
         self.episodes_learned += episodes;
         self.memories_written += outcome.memories_written.len();
-        self.tasks_captured += outcome.tasks_captured.len();
     }
 }
 
@@ -1252,7 +1247,6 @@ mod tests {
         let reviewer = Arc::new(RecordingReviewer {
             outcome: ReviewOutcome {
                 memories_written: vec!["m1".into()],
-                tasks_captured: vec!["t1".into()],
             },
             ..Default::default()
         });
@@ -1261,7 +1255,6 @@ mod tests {
         let report = c.run(LearningTrigger::Scheduled).await.unwrap();
 
         assert_eq!(report.memories_written, 1);
-        assert_eq!(report.tasks_captured, 1);
         // The un-advanced watermark just means a future re-read — allowed.
     }
 

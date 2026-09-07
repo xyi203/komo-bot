@@ -11,10 +11,6 @@ Classify insights by ownership:
   the user from having to correct or remind you again. If a fact will be stale within a
   week it does not belong in memory: never store task progress, session outcomes,
   completed-work logs, PR/issue numbers, or commit SHAs.
-- commitment: an open loop the user took on or is waiting on — something they said they
-  would do, need to follow up on, or are waiting for someone else to deliver. Record the
-  obligation as a short actionable title, who it involves (waiting_on), and any deadline.
-  Only durable obligations, never idle chatter or work already finished in this session.
 
 Never write:
 - environment dependency failures such as command not found, missing credentials, or
@@ -27,8 +23,6 @@ Never write:
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewOutcome {
     pub memories_written: Vec<String>,
-    /// Ids of commitments captured into the task inbox this review.
-    pub tasks_captured: Vec<String>,
 }
 
 #[async_trait]

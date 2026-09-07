@@ -1,13 +1,12 @@
 //! Persistence infra: the one toasty-backed connection (`komo.db`) over the
 //! Turso engine, with a per-operation connection pool.
 //!
-//! `db` owns the connection and the session/run tables; `kanban`, `cron` and
+//! `db` owns the connection and the session/run tables; `cron` and
 //! (next door) `memory::memory_db` each hold one durable table's model and its
 //! repository impl **for that same `Db`** — one file per domain, one database
 //! (docs/adr/0004).
 pub mod cron;
 pub mod db;
-pub mod kanban;
 pub mod session_event_store;
 pub mod session_log;
 pub mod wakeup;

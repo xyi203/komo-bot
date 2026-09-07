@@ -21,7 +21,6 @@ use crate::domain::{
     pairing::{ApproveOutcome, PairingRepository},
     repository::SessionRepository,
     run::RunRepository,
-    task::TaskRepository,
 };
 
 use super::actions;
@@ -47,7 +46,7 @@ impl DirectOperatorAdapter {
         }
     }
 
-    /// The database — sessions, runs, tasks, memories, cron jobs — opened on
+    /// The database — sessions, runs, memories, cron jobs — opened on
     /// first use.
     pub(super) async fn db(&self) -> anyhow::Result<&Arc<Db>> {
         self.db
@@ -103,9 +102,6 @@ impl DirectOperatorAdapter {
 
     pub(super) async fn query(&self, query: OperatorQuery) -> anyhow::Result<OperatorQueryResult> {
         Ok(match query {
-            OperatorQuery::Tasks => OperatorQueryResult::Tasks(
-                TaskRepository::list_open(self.db().await?.as_ref()).await?,
-            ),
             OperatorQuery::Runs { limit } => OperatorQueryResult::Runs(
                 RunRepository::list(self.db().await?.as_ref(), limit).await?,
             ),

@@ -4,14 +4,12 @@
 //! arrived, separated from everything that has to happen afterwards — reading
 //! standing registrations, claiming one, waking a turn, opening a routine's
 //! turn — because "is this about that?" is a question with a definite answer
-//! and no I/O, and it is asked by three features: a kanban Task waiting for a
-//! reply, a turn parked on `wait { for_event }`, and a routine whose trigger is
-//! an event rather than a clock.
+//! and no I/O, and it is asked by two features: a turn parked on
+//! `wait { for_event }`, and a routine whose trigger is an event rather than a
+//! clock.
 //!
-//! Matching is on the **address**, never on a name someone typed. `waiting_on:
-//! "张三"` is for a human to read; a [`ChannelPeer`] is what an inbound message
-//! can actually be compared with, and a task whose `waiting_on` never resolved
-//! to one is simply not wakeable.
+//! Matching is on the **address**, never on a name someone typed: a
+//! [`ChannelPeer`] is what an inbound message can actually be compared with.
 //!
 //! [`Trigger`]: super::cron::Trigger
 
@@ -101,7 +99,7 @@ impl ExternalEvent {
     ///
     /// A feishu message answers `None` on purpose: peer waits are fired by the
     /// chat ingress every channel shares, and firing them here too would wake
-    /// one commitment twice. A file changing matches no filter shape at all.
+    /// one wait twice. A file changing matches no filter shape at all.
     pub fn as_inbound(&self) -> Option<InboundEvent<'_>> {
         match self {
             Self::Webhook { name, .. } => Some(InboundEvent::Webhook { name }),
@@ -200,8 +198,8 @@ fn head(text: &str) -> String {
 
 /// Every standing registration this message fires, oldest first.
 ///
-/// All of them, not the first: two commitments waiting on the same person are
-/// two standing instructions, and one arriving message answers both.
+/// All of them, not the first: two waits standing on the same person are two
+/// standing instructions, and one arriving message answers both.
 pub fn matching<'a>(
     registrations: &'a [WakeupRegistration],
     event: &InboundEvent<'_>,
@@ -349,7 +347,7 @@ mod tests {
 
     /// Only a webhook can wake a standing registration. A feishu message
     /// already fires peer waits through the chat ingress; routing it here as
-    /// well would answer one commitment twice.
+    /// well would fire one wait twice.
     #[test]
     fn only_a_webhook_is_offered_to_the_standing_registrations() {
         assert!(

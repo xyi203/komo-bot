@@ -1,6 +1,6 @@
 //! Filesystem-backed skill store — the single source of truth for skills.
 //!
-//! Skills are durable personal data (peers of memory/kanban), so they live as
+//! Skills are durable personal data (peers of memory), so they live as
 //! `SKILL.md` files under `~/.komo/skills/<name>/`, not in the disposable
 //! `state.db`. Files are editable, shareable, and lock-free: every operator
 //! action works while the gateway holds the Turso db lock.

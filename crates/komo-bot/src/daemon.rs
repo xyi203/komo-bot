@@ -39,7 +39,6 @@ use komo_core::domain::{
     run_projection::project_runs,
     session::Session,
     session_event::SessionEventKind,
-    task::{Task, TaskRepository},
     trigger::ExternalEvent,
     wakeup::{WakeupDispatch, WakeupRegistration, WakeupRepository, is_suspended},
 };
@@ -107,9 +106,6 @@ pub trait Maintenance: Send + Sync {
 pub struct MaintenanceSummary {
     pub sessions_reviewed: usize,
     pub memories_written: usize,
-    pub tasks_notified: usize,
-    /// Commitments the reviewer captured into the task inbox this sweep.
-    pub tasks_captured: usize,
     /// Daily briefings composed and delivered this sweep (0 or 1).
     pub briefings_sent: usize,
     /// Candidate memories the dream sweep promoted to active this cycle.
@@ -142,7 +138,6 @@ impl Maintenance for ReviewSweep {
         Ok(MaintenanceSummary {
             sessions_reviewed: report.sessions_learned,
             memories_written: report.memories_written,
-            tasks_captured: report.tasks_captured,
             ..Default::default()
         })
     }
@@ -565,7 +560,7 @@ impl RoutineEventSource {
         // The other half: a turn parked on `wait { for_event }`. Only the
         // shapes a filter can be written about reach it — a feishu message's
         // peer waits are the chat ingress's, and firing them here too would
-        // answer one commitment twice.
+        // fire one wait twice.
         if let (Some(triggers), Some(inbound)) = (&self.triggers, event.as_inbound()) {
             fanout.wakeups = triggers.on_event(&inbound, &event.summary()).await;
         }
@@ -1145,109 +1140,18 @@ fn truncate_tail(s: &str, cap: usize) -> String {
     format!("…(earlier output truncated)\n{}", &s[start..])
 }
 
-/// Grace window: a due item missed by up to this many seconds is still
-/// delivered on time; past it, it is delivered as overdue.
-const REMINDER_GRACE_SECS: i64 = 600;
-
-/// Deliver a group of due items as a **single coalesced notification**, so a
-/// sweep that finds several at once — the common case being the backlog flush
-/// right after a gateway restart, or several things due the same minute — fires
-/// one ping instead of one per item. A lone item keeps its plain form; multiple
-/// items become a bulleted digest under a count-tagged title. Delivery failures
-/// are swallowed (`.ok()`), matching the per-item callers this replaces.
-async fn notify_batch(notifier: &dyn Notifier, title: &str, messages: &[String]) {
-    match messages {
-        [] => {}
-        [only] => {
-            notifier.notify(title, only).await.ok();
-        }
-        many => {
-            let body = many
-                .iter()
-                .map(|m| format!("• {m}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            notifier
-                .notify(&format!("{title} ({} items)", many.len()), &body)
-                .await
-                .ok();
-        }
-    }
-}
-
-/// Sweep open tasks every minute and notify once when one comes due. Unlike a
-/// reminder, the task itself stays open — only `due_notified_at` flips, which
-/// is the at-most-once guard.
-pub struct TaskSweep {
-    pub tasks: Arc<dyn TaskRepository>,
-    pub notifier: Arc<dyn Notifier>,
-}
-
-#[async_trait]
-impl Maintenance for TaskSweep {
-    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut summary = MaintenanceSummary::default();
-
-        let due: Vec<Task> = self
-            .tasks
-            .list_open()
-            .await?
-            .into_iter()
-            .filter(|t| matches!(t.due_at, Some(d) if d <= now) && t.due_notified_at.is_none())
-            .collect();
-
-        // Phase 1 — notify first (before the guard flips, so a crash re-pings
-        // rather than silently drops), coalesced into one ping per group so a
-        // morning with several tasks due, or a post-restart backlog, does not
-        // fire one desktop notification per task.
-        let body_of = |t: &Task| {
-            if t.waiting_on.is_empty() {
-                t.title.clone()
-            } else {
-                format!("{} (waiting on: {})", t.title, t.waiting_on)
-            }
-        };
-        let mut due_now = Vec::new();
-        let mut overdue = Vec::new();
-        for t in &due {
-            // `due_at` is Some here (the filter guaranteed it).
-            if now - t.due_at.unwrap_or(now) > REMINDER_GRACE_SECS {
-                overdue.push(body_of(t));
-            } else {
-                due_now.push(body_of(t));
-            }
-        }
-        notify_batch(&*self.notifier, "Komo task due", &due_now).await;
-        notify_batch(&*self.notifier, "Komo (overdue task)", &overdue).await;
-
-        // Phase 2 — flip the at-most-once guard on each task (it stays open).
-        for task in &due {
-            let mut notified = task.clone();
-            notified.due_notified_at = Some(now);
-            if let Err(e) = self.tasks.update(&notified).await {
-                warn!(error = %e, id = %task.id, "failed to mark task notified");
-            } else {
-                summary.tasks_notified += 1;
-            }
-        }
-        Ok(summary)
-    }
-}
-
 /// Window for "recently learned" memories surfaced in the briefing.
 const BRIEFING_MEMORY_WINDOW_SECS: i64 = 7 * 86_400;
 /// Cap each briefing list so a large backlog can't produce an unreadable wall;
 /// truncation is disclosed in-line ("+N more") rather than hidden.
 const BRIEFING_SECTION_CAP: usize = 10;
 
-/// Daily proactive briefing: read the open tasks and recently-learned memories,
-/// let the aux LLM compose a short digest, and deliver it through the notifier
+/// Daily proactive briefing: read the recently-learned memories, let the aux
+/// LLM compose a short digest, and deliver it through the notifier
 /// (a channel `home_chat`, else macOS). Opt-in via `briefing_schedule`; the
 /// roadmap's §4 "morning briefing". Reuses the existing scheduler and notifier —
 /// no new delivery mechanism.
 pub struct BriefingSweep {
-    pub tasks: Arc<dyn TaskRepository>,
     pub memories: Arc<dyn MemoryRepository>,
     pub llm: Arc<dyn LlmClient>,
     pub notifier: Arc<dyn Notifier>,
@@ -1302,14 +1206,13 @@ impl BriefingSweep {
 impl Maintenance for BriefingSweep {
     async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
         let mut summary = MaintenanceSummary::default();
-        let tasks = self.tasks.list_open().await?;
         let memories = self.memories.list().await?;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
 
         // Nothing on the plate → stay silent rather than ping an empty note —
         // but the slot was still handled: without the stamp, every restart
         // today would re-evaluate it.
-        let Some(prompt) = briefing_prompt(&tasks, &memories, now) else {
+        let Some(prompt) = briefing_prompt(&memories, now) else {
             self.stamp_handled().await;
             return Ok(summary);
         };
@@ -1427,27 +1330,16 @@ impl Maintenance for WorkdayGated {
     }
 }
 
-/// Render a unix timestamp in local time at minute precision for the digest.
-fn briefing_local_time(unix: i64) -> String {
-    chrono::DateTime::from_timestamp(unix, 0)
-        .map(|dt| {
-            dt.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|| unix.to_string())
-}
-
-/// Build the briefing prompt from open tasks and recent memories. Returns
-/// `None` when there is nothing worth a proactive ping (no open tasks and no
-/// recent memories), so the sweep can skip delivery. Pure and clock-injected
-/// (`now`) so the digest is unit-testable without a real LLM or notifier.
-fn briefing_prompt(tasks: &[Task], memories: &[Memory], now: i64) -> Option<String> {
+/// Build the briefing prompt from the recently-learned memories. Returns `None`
+/// when there is nothing worth a proactive ping, so the sweep can skip delivery.
+/// Pure and clock-injected (`now`) so the digest is unit-testable without a real
+/// LLM or notifier.
+fn briefing_prompt(memories: &[Memory], now: i64) -> Option<String> {
     let recent: Vec<&Memory> = memories
         .iter()
         .filter(|m| now - m.created_at <= BRIEFING_MEMORY_WINDOW_SECS)
         .collect();
-    if tasks.is_empty() && recent.is_empty() {
+    if recent.is_empty() {
         return None;
     }
 
@@ -1467,28 +1359,6 @@ fn briefing_prompt(tasks: &[Task], memories: &[Memory], now: i64) -> Option<Stri
     };
 
     let mut digest = String::new();
-    if !tasks.is_empty() {
-        // Oldest-first within the listing; the model is told to surface the
-        // urgent ones, so we keep the raw data ordered by due date then age.
-        let mut ordered: Vec<&Task> = tasks.iter().collect();
-        ordered.sort_by_key(|t| (t.due_at.unwrap_or(i64::MAX), t.created_at));
-        let lines: Vec<String> = ordered
-            .iter()
-            .map(|t| {
-                let mut line = format!("- [{}] {}", t.status.as_str(), t.title);
-                if let Some(due) = t.due_at {
-                    let tag = if due < now { "OVERDUE" } else { "due" };
-                    line.push_str(&format!(" ({tag} {})", briefing_local_time(due)));
-                }
-                if !t.waiting_on.is_empty() {
-                    line.push_str(&format!(" (waiting on: {})", t.waiting_on));
-                }
-                line
-            })
-            .collect();
-        digest.push_str(&format!("Open tasks ({}):\n", tasks.len()));
-        render_lines(&mut digest, lines);
-    }
     if !recent.is_empty() {
         let lines: Vec<String> = recent
             .iter()
@@ -1500,8 +1370,7 @@ fn briefing_prompt(tasks: &[Task], memories: &[Memory], now: i64) -> Option<Stri
 
     Some(format!(
         "Compose a short, friendly daily briefing for the user from the items below. \
-         Lead with anything overdue or due today, then commitments waiting on others, \
-         then a brief note of what's newly learned. Be concise and warm; never invent \
+         Give a brief note of what's newly learned. Be concise and warm; never invent \
          anything not listed, and if nothing is urgent, say so plainly. Reply with the \
          briefing text only — no preamble.\n\n{}",
         digest.trim_end()
@@ -1570,7 +1439,6 @@ where
                     service = name,
                     sessions = summary.sessions_reviewed,
                     memories = summary.memories_written,
-                    tasks_captured = summary.tasks_captured,
                     briefings = summary.briefings_sent,
                     promoted = summary.memories_promoted,
                     archived = summary.memories_archived,
@@ -1635,7 +1503,6 @@ mod tests {
     use super::*;
     use komo_core::domain::cron::{FeishuMatch, Trigger};
     use komo_core::domain::session_event::WakeupCause;
-    use komo_core::domain::task::{Task, TaskStatus};
     use komo_core::domain::trigger::FeishuEvent;
     use std::sync::Mutex;
 
@@ -2816,8 +2683,7 @@ mod tests {
     async fn briefing_agent_turn_runs_under_an_unattended_session() {
         let probe = Arc::new(OriginProbe::default());
         let (mut sweep, _notifier) = briefing_with(
-            vec![Task::new("write report".into())],
-            vec![],
+            vec![learned("write report")],
             "plain compose (must not be used)",
         );
         sweep.runtime = Some(probe.clone());
@@ -3026,7 +2892,7 @@ mod tests {
         let jobs = Arc::new(FakeCronRepo {
             jobs: Mutex::new(vec![job]),
         });
-        let triggers = Arc::new(TriggerMatcher::new(db.clone(), db.clone()));
+        let triggers = Arc::new(TriggerMatcher::new(db.clone()));
         let waker = Arc::new(TurnWaker::new(dispatcher.clone()));
         triggers.attach_dispatch(waker.clone());
         let sweep = Arc::new(RoutineEventSource {
@@ -3541,166 +3407,6 @@ mod tests {
         );
     }
 
-    // ── TaskSweep ─────────────────────────────────────────────────────────────
-
-    #[derive(Default)]
-    struct FakeTasks {
-        tasks: Mutex<Vec<Task>>,
-    }
-
-    #[async_trait]
-    impl komo_core::domain::task::TaskRepository for FakeTasks {
-        async fn save(&self, task: &Task) -> anyhow::Result<()> {
-            self.tasks.lock().unwrap().push(task.clone());
-            Ok(())
-        }
-        async fn find(&self, id: &str) -> anyhow::Result<Option<Task>> {
-            Ok(self
-                .tasks
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|t| t.id == id)
-                .cloned())
-        }
-        async fn list_open(&self) -> anyhow::Result<Vec<Task>> {
-            Ok(self
-                .tasks
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|t| t.status.is_open())
-                .cloned()
-                .collect())
-        }
-        async fn update(&self, task: &Task) -> anyhow::Result<()> {
-            let mut tasks = self.tasks.lock().unwrap();
-            let slot = tasks
-                .iter_mut()
-                .find(|t| t.id == task.id)
-                .ok_or_else(|| anyhow::anyhow!("not found"))?;
-            *slot = task.clone();
-            Ok(())
-        }
-        async fn find_by_source_message_id(
-            &self,
-            source: &str,
-            source_message_id: &str,
-        ) -> anyhow::Result<Option<Task>> {
-            Ok(self
-                .tasks
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|t| t.source == source && t.source_message_id == source_message_id)
-                .cloned())
-        }
-        async fn find_by_wakeup_id(&self, wakeup_id: &str) -> anyhow::Result<Option<Task>> {
-            Ok(self
-                .tasks
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|t| t.wakeup_id.as_deref() == Some(wakeup_id))
-                .cloned())
-        }
-    }
-
-    fn task_sweep_with(tasks: Vec<Task>) -> (TaskSweep, Arc<FakeTasks>, Arc<FakeNotifier>) {
-        let repo = Arc::new(FakeTasks {
-            tasks: Mutex::new(tasks),
-        });
-        let notifier = Arc::new(FakeNotifier::default());
-        let sweep = TaskSweep {
-            tasks: repo.clone() as Arc<dyn komo_core::domain::task::TaskRepository>,
-            notifier: notifier.clone() as Arc<dyn Notifier>,
-        };
-        (sweep, repo, notifier)
-    }
-
-    fn due_task(offset_secs: i64) -> Task {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut task = Task::new("send report".to_string());
-        task.status = TaskStatus::Todo;
-        task.due_at = Some(now + offset_secs);
-        task
-    }
-
-    #[tokio::test]
-    async fn task_sweep_notifies_due_task_once() {
-        let (sweep, repo, notifier) = task_sweep_with(vec![due_task(-30)]);
-
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.tasks_notified, 1);
-        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
-        assert_eq!(notifier.calls.lock().unwrap()[0].0, "Komo task due");
-        // Task stays open; only the guard flips. (Scoped so the guard is
-        // provably released before the next await — clippy's
-        // await_holding_lock doesn't credit an explicit drop().)
-        {
-            let tasks = repo.tasks.lock().unwrap();
-            assert_eq!(tasks[0].status, TaskStatus::Todo);
-            assert!(tasks[0].due_notified_at.is_some());
-        }
-
-        // Second sweep: nothing new.
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.tasks_notified, 0);
-        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn task_sweep_coalesces_multiple_due_tasks() {
-        // Several tasks due the same sweep collapse into one notification.
-        let (sweep, repo, notifier) =
-            task_sweep_with(vec![due_task(-30), due_task(-45), due_task(-60)]);
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.tasks_notified, 3);
-
-        let calls = notifier.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1, "three due tasks must coalesce to one ping");
-        assert_eq!(calls[0].0, "Komo task due (3 items)");
-        // Each task's guard flipped so the next sweep stays silent.
-        assert!(
-            repo.tasks
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|t| t.due_notified_at.is_some())
-        );
-    }
-
-    #[tokio::test]
-    async fn task_sweep_skips_future_and_undated_tasks() {
-        let mut undated = Task::new("someday".to_string());
-        undated.status = TaskStatus::Todo;
-        let (sweep, _repo, notifier) = task_sweep_with(vec![due_task(3600), undated]);
-
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.tasks_notified, 0);
-        assert!(notifier.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn task_sweep_marks_overdue_past_grace() {
-        let (sweep, _repo, notifier) = task_sweep_with(vec![due_task(-(REMINDER_GRACE_SECS + 60))]);
-
-        sweep.run().await.unwrap();
-        let calls = notifier.calls.lock().unwrap();
-        assert_eq!(calls[0].0, "Komo (overdue task)");
-    }
-
-    #[tokio::test]
-    async fn task_sweep_includes_waiting_on_in_body() {
-        let mut task = due_task(-30);
-        task.waiting_on = "alice".to_string();
-        let (sweep, _repo, notifier) = task_sweep_with(vec![task]);
-
-        sweep.run().await.unwrap();
-        let calls = notifier.calls.lock().unwrap();
-        assert!(calls[0].1.contains("waiting on: alice"), "{}", calls[0].1);
-    }
-
     // ── BriefingSweep ─────────────────────────────────────────────────────────
 
     use komo_core::domain::memory::{Memory, MemoryKind, MemoryRepository};
@@ -3728,16 +3434,9 @@ mod tests {
         }
     }
 
-    fn briefing_with(
-        tasks: Vec<Task>,
-        memories: Vec<Memory>,
-        reply: &str,
-    ) -> (BriefingSweep, Arc<FakeNotifier>) {
+    fn briefing_with(memories: Vec<Memory>, reply: &str) -> (BriefingSweep, Arc<FakeNotifier>) {
         let notifier = Arc::new(FakeNotifier::default());
         let sweep = BriefingSweep {
-            tasks: Arc::new(FakeTasks {
-                tasks: Mutex::new(tasks),
-            }),
             memories: Arc::new(FakeMemories(Mutex::new(memories))),
             llm: Arc::new(FixedLlm(reply.to_string())),
             notifier: notifier.clone(),
@@ -3802,8 +3501,7 @@ mod tests {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
 
         // Something to say → delivered and stamped.
-        let (mut sweep, _notifier) =
-            briefing_with(vec![Task::new("write report".into())], vec![], "brief");
+        let (mut sweep, _notifier) = briefing_with(vec![learned("write report")], "brief");
         let marks = Arc::new(FakeMarks::default());
         sweep.marks = Some(marks.clone());
         sweep.run().await.unwrap();
@@ -3814,7 +3512,7 @@ mod tests {
 
         // Nothing to say → silent, but the slot still counts as handled, or
         // every restart today would re-evaluate it.
-        let (mut sweep, notifier) = briefing_with(vec![], vec![], "unused");
+        let (mut sweep, notifier) = briefing_with(vec![], "unused");
         let marks = Arc::new(FakeMarks::default());
         sweep.marks = Some(marks.clone());
         sweep.run().await.unwrap();
@@ -3845,8 +3543,7 @@ mod tests {
     #[tokio::test]
     async fn briefing_prefers_the_agent_turn_with_tool_instructions() {
         let (mut sweep, notifier) = briefing_with(
-            vec![Task::new("write report".into())],
-            vec![],
+            vec![learned("write report")],
             "plain compose (must not be used)",
         );
         let handler = Arc::new(FakeHandler {
@@ -3867,11 +3564,8 @@ mod tests {
 
     #[tokio::test]
     async fn briefing_falls_back_to_plain_compose_when_the_agent_turn_fails() {
-        let (mut sweep, notifier) = briefing_with(
-            vec![Task::new("write report".into())],
-            vec![],
-            "plain fallback briefing",
-        );
+        let (mut sweep, notifier) =
+            briefing_with(vec![learned("write report")], "plain fallback briefing");
         sweep.runtime = Some(Arc::new(FakeHandler {
             reply: Err("tool exploded".into()),
             calls: Mutex::new(Vec::new()),
@@ -3887,7 +3581,7 @@ mod tests {
     #[test]
     fn briefing_prompt_is_none_when_nothing_to_say() {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        assert!(briefing_prompt(&[], &[], now).is_none());
+        assert!(briefing_prompt(&[], now).is_none());
     }
 
     #[test]
@@ -3895,26 +3589,21 @@ mod tests {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let mut old = Memory::new(MemoryKind::Profile, "ancient");
         old.created_at = now - BRIEFING_MEMORY_WINDOW_SECS - 1;
-        // Only a stale memory, no tasks → nothing recent → no briefing.
-        assert!(briefing_prompt(&[], std::slice::from_ref(&old), now).is_none());
+        // Only a stale memory → nothing recent → no briefing.
+        assert!(briefing_prompt(std::slice::from_ref(&old), now).is_none());
     }
 
-    #[test]
-    fn briefing_prompt_marks_overdue_tasks() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut task = Task::new("file taxes".to_string());
-        task.status = TaskStatus::Todo;
-        task.due_at = Some(now - 3600);
-        let prompt = briefing_prompt(std::slice::from_ref(&task), &[], now).unwrap();
-        assert!(prompt.contains("file taxes"));
-        assert!(prompt.contains("OVERDUE"), "{prompt}");
+    /// A memory learned just now, which is what the digest is built from.
+    fn learned(content: &str) -> Memory {
+        Memory::new(MemoryKind::Profile, content)
     }
 
     #[tokio::test]
-    async fn briefing_sweep_sends_when_tasks_present() {
-        let mut task = Task::new("ship release".to_string());
-        task.status = TaskStatus::Todo;
-        let (sweep, notifier) = briefing_with(vec![task], vec![], "Good morning! One task today.");
+    async fn briefing_sweep_sends_when_something_was_learned() {
+        let (sweep, notifier) = briefing_with(
+            vec![learned("ship release")],
+            "Good morning! One note today.",
+        );
 
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.briefings_sent, 1);
@@ -3926,7 +3615,7 @@ mod tests {
 
     #[tokio::test]
     async fn briefing_sweep_stays_silent_when_nothing_open() {
-        let (sweep, notifier) = briefing_with(vec![], vec![], "should never be sent");
+        let (sweep, notifier) = briefing_with(vec![], "should never be sent");
 
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.briefings_sent, 0);
@@ -3935,9 +3624,7 @@ mod tests {
 
     #[tokio::test]
     async fn briefing_sweep_silent_on_empty_llm_reply() {
-        let mut task = Task::new("review PR".to_string());
-        task.status = TaskStatus::Todo;
-        let (sweep, notifier) = briefing_with(vec![task], vec![], "   ");
+        let (sweep, notifier) = briefing_with(vec![learned("review PR")], "   ");
 
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.briefings_sent, 0);

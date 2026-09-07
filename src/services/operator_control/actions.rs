@@ -25,7 +25,6 @@ use crate::domain::repository::{MessageRepository, SessionEventRepository, Sessi
 use crate::domain::run::{MemoryUse, Run, RunRepository, RunStep, resume_prompt};
 use crate::domain::session::Session;
 use crate::domain::skill::Skill;
-use crate::domain::task::{Task, TaskRepository};
 use crate::domain::todo::SessionTodoRepository;
 
 use super::now;
@@ -90,7 +89,6 @@ pub struct OperatorActions {
     pub events: Arc<dyn SessionEventRepository>,
     /// Session-scoped working state, retired by that same boundary.
     pub todos: Arc<dyn SessionTodoRepository>,
-    pub tasks: Arc<dyn TaskRepository>,
     pub memories: Arc<dyn MemoryRepository>,
     pub runs: Arc<dyn RunRepository>,
     /// The concrete store: that is where every skill read lives — the
@@ -227,10 +225,6 @@ impl OperatorActions {
 
     pub async fn session_messages(&self, id: &str) -> anyhow::Result<Vec<Message>> {
         self.messages.list_by_session(id).await
-    }
-
-    pub async fn open_tasks(&self) -> anyhow::Result<Vec<Task>> {
-        self.tasks.list_open().await
     }
 
     pub async fn list_memories(&self, status: Option<MemoryStatus>) -> anyhow::Result<Vec<Memory>> {

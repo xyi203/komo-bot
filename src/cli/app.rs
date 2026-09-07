@@ -57,11 +57,6 @@ enum Commands {
         #[command(subcommand)]
         action: SessionAction,
     },
-    /// Inspect the durable task list
-    Task {
-        #[command(subcommand)]
-        action: TaskAction,
-    },
     /// Inspect the run ledger (every agent turn and its tool steps)
     Run {
         #[command(subcommand)]
@@ -310,12 +305,6 @@ enum CronAction {
     /// Fire a job now: it becomes due and runs on the gateway's next sweep
     /// tick (within a minute)
     Run { name: String },
-}
-
-#[derive(Subcommand)]
-enum TaskAction {
-    /// List open tasks (inbox / todo / waiting), grouped by status
-    List,
 }
 
 #[derive(Subcommand)]
@@ -635,9 +624,6 @@ pub async fn run() -> anyhow::Result<()> {
                 crate::tui::resume(config, &id).await
             }
             SessionAction::Clean => inspect::session_clean(&operator(&config).await?).await,
-        },
-        Some(Commands::Task { action }) => match action {
-            TaskAction::List => inspect::task_list(&operator(&config).await?).await,
         },
         Some(Commands::Run { action }) => match action {
             RunAction::List { limit } => inspect::run_list(&operator(&config).await?, limit).await,

@@ -7,7 +7,6 @@ use tracing::info;
 
 use crate::memory::memory_db::MemoryRecord;
 use crate::persistence::cron::CronJobRecord;
-use crate::persistence::kanban::TaskRecord;
 use crate::persistence::wakeup::{WAKEUP_TABLE, WAKEUP_TABLE_DDL, WakeupRecord};
 use crate::persistence::{
     DEFAULT_POOL_SIZE, drop_retired_columns, ensure_columns, ensure_table, prepare_turso_path,
@@ -34,7 +33,6 @@ use komo_core::domain::{
     session_event::{
         SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader, SurfaceProjection,
     },
-    task::TaskRepository,
     todo::{SessionTodoRepository, TodoItem},
 };
 
@@ -361,7 +359,7 @@ const RUN_PRUNED_BEFORE_KEY: &str = "projection:runs:pruned_before";
 /// use [`with_write_retry`] for MVCC commit conflicts.
 pub struct Db {
     /// The one connection pool. `pub(crate)` because the repository impls for
-    /// `Db` are one file per domain (`kanban`, `cron`, `memory::memory_db`) —
+    /// `Db` are one file per domain (`cron`, `memory::memory_db`) —
     /// the tables share a database, not a module.
     pub(crate) inner: Arc<toasty::Db>,
     /// The session event logs — files rather than rows, one directory per
@@ -376,8 +374,8 @@ impl Db {
         // (sessions, messages, runs, pairings, settings): a legacy SQLite file
         // can't be reopened under Turso's MVCC mode, so `prepare_turso_path`
         // stages it aside to a `.sqlite-backup` (kept as a safety net) and we
-        // start fresh. Durable personal data lives in memory.db / kanban.db,
-        // which migrate their rows instead of resetting.
+        // start fresh. Durable personal data lives in memory.db, which
+        // migrates its rows instead of resetting.
         let (path, is_new) = prepare_turso_path(url)?;
 
         // Additive in-place migration for an EXISTING db: `push_schema` only
@@ -441,7 +439,6 @@ impl Db {
             // The durable tables keep their own schema knowledge in their own
             // modules; they are migrated in place and never dropped to be
             // rebuilt.
-            super::kanban::ensure_schema(p).await?;
             super::cron::ensure_schema(p).await?;
             crate::memory::memory_db::ensure_schema(p).await?;
         }
@@ -463,7 +460,6 @@ impl Db {
                 InboxRecord,
                 RunMemoryRecord,
                 // Durable, and formerly one file each (docs/adr/0004).
-                TaskRecord,
                 CronJobRecord,
                 MemoryRecord,
                 WakeupRecord
@@ -509,8 +505,8 @@ impl Db {
         Ok(this)
     }
 
-    /// Import `state.db`, `kanban.db`, `cron.db` and `memory.db` from beside
-    /// `path`, then rename each to `<name>.merged-backup`.
+    /// Import `state.db`, `cron.db` and `memory.db` from beside `path`, then
+    /// rename each to `<name>.merged-backup`.
     ///
     /// Durable data, so the order is: read the old file, write every row, and
     /// only then rename it. A crash anywhere leaves the old file where it is
@@ -518,8 +514,8 @@ impl Db {
     /// row carries its own id, so a re-import overwrites rather than doubles.
     ///
     /// A file that cannot be read is **fatal**, not skipped: starting up with
-    /// an empty task board while `kanban.db` sits there unread is the failure
-    /// nobody would notice until they went looking for a task.
+    /// an empty memory library while `memory.db` sits there unread is the
+    /// failure nobody would notice until they went looking for a memory.
     ///
     /// From `state.db` come the rows nothing can reconstruct: session metadata,
     /// the settings (home session, `/sethome` override, briefing watermark) and
@@ -529,8 +525,7 @@ impl Db {
     /// stored row, so re-creating one from a legacy row would mean inventing
     /// the `start_seq` and per-step `settled` the fold carries and the row does
     /// not. [`Db::rebuild_projections`] is how an operator gets it back.
-    /// Inbox, todo and wakeup rows are transient and stay behind with it, as do
-    /// reminders, which are being retired.
+    /// Inbox, todo and wakeup rows are transient and stay behind with it.
     async fn merge_legacy_databases(&self, path: &Path) -> anyhow::Result<()> {
         let dir = path.parent().unwrap_or(Path::new("."));
         // Never the file being opened: a `db_url` pointing at one of these
@@ -561,15 +556,6 @@ impl Db {
             );
         }
 
-        if let Some(tasks) = legacy("kanban.db") {
-            let rows = super::kanban::import_from(&tasks).await?;
-            for task in &rows {
-                TaskRepository::save(self, task).await?;
-            }
-            retire_merged(&tasks)?;
-            info!(count = rows.len(), "merged kanban.db into komo.db");
-        }
-
         if let Some(jobs) = legacy("cron.db") {
             let rows = super::cron::import_from(&jobs).await?;
             for job in &rows {
@@ -597,8 +583,8 @@ impl Db {
 /// Read through the same models the live store uses, after the old file gets
 /// the same column upkeep `connect` gives `komo.db` — a `state.db` written
 /// before any of those columns existed cannot be opened with this model. A
-/// pre-Turso file is opened with the SQLite driver, as `kanban.db` and
-/// `memory.db` are. Transcripts need nothing: they are files beside the db.
+/// pre-Turso file is opened with the SQLite driver, as `memory.db` is.
+/// Transcripts need nothing: they are files beside the db.
 async fn import_state_from(
     path: &Path,
 ) -> anyhow::Result<(Vec<Session>, Vec<PairingRequest>, Vec<(String, String)>)> {
@@ -3283,13 +3269,12 @@ mod tests {
         );
     }
 
-    /// ADR 0004's migration, end to end: three durable files become tables in
+    /// ADR 0004's migration, end to end: the durable files become tables in
     /// one, and the operator's data is all still there afterwards.
     #[tokio::test]
-    async fn the_three_durable_files_merge_into_komo_db() {
+    async fn the_durable_files_merge_into_komo_db() {
         use komo_core::domain::cron::{CronAction, CronJob, CronJobRepository};
         use komo_core::domain::memory::{Memory, MemoryKind, MemoryRepository};
-        use komo_core::domain::task::{Task, TaskRepository};
 
         let home = std::env::temp_dir().join("komo-merge-three");
         std::fs::remove_dir_all(&home).ok();
@@ -3321,13 +3306,6 @@ mod tests {
                 }
             }
         }
-
-        let (tasks, dir) = seed("kanban.db").await;
-        TaskRepository::save(&tasks, &Task::new("send the weekly report".to_string()))
-            .await
-            .unwrap();
-        drop(tasks);
-        install(&dir, &home, "kanban.db");
 
         let (jobs, dir) = seed("cron.db").await;
         CronJobRepository::save(
@@ -3364,15 +3342,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            TaskRepository::list_open(&db)
-                .await
-                .unwrap()
-                .into_iter()
-                .map(|t| t.title)
-                .collect::<Vec<_>>(),
-            vec!["send the weekly report".to_string()]
-        );
-        assert_eq!(
             CronJobRepository::list(&db)
                 .await
                 .unwrap()
@@ -3393,7 +3362,7 @@ mod tests {
 
         // Each old file is retired, not deleted: it was the only copy of data
         // that was durable by design.
-        for name in ["kanban.db", "cron.db", "memory.db"] {
+        for name in ["cron.db", "memory.db"] {
             assert!(!home.join(name).exists(), "{name} must be renamed away");
             assert!(
                 home.join(format!("{name}.merged-backup")).exists(),
@@ -3406,7 +3375,7 @@ mod tests {
         let again = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
             .await
             .unwrap();
-        assert_eq!(TaskRepository::list_open(&again).await.unwrap().len(), 1);
+        assert_eq!(MemoryRepository::list(&again).await.unwrap().len(), 1);
     }
 
     /// The fourth file of that migration: `state.db` carries the rows nothing

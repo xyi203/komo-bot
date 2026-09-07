@@ -13,7 +13,6 @@ use komo_core::domain::{
     reviewer::{ReviewOutcome, Reviewer, SELF_REVIEW_PROMPT},
     run::truncate,
     session::Session,
-    task::{Task, TaskRepository, TaskStatus},
 };
 use komo_services::memory_consolidation::{Consolidated, MemoryConsolidator, Observation};
 
@@ -23,20 +22,11 @@ pub struct ReflectiveReviewer {
     /// of its own: deciding what an observation *means* against the existing
     /// library is one rule, and it lives in one place.
     consolidator: Arc<MemoryConsolidator>,
-    tasks: Arc<dyn TaskRepository>,
 }
 
 impl ReflectiveReviewer {
-    pub fn new(
-        llm: Arc<dyn LlmClient>,
-        consolidator: Arc<MemoryConsolidator>,
-        tasks: Arc<dyn TaskRepository>,
-    ) -> Self {
-        Self {
-            llm,
-            consolidator,
-            tasks,
-        }
+    pub fn new(llm: Arc<dyn LlmClient>, consolidator: Arc<MemoryConsolidator>) -> Self {
+        Self { llm, consolidator }
     }
 
     /// A synthetic single-message session for an aux call.
@@ -135,34 +125,6 @@ impl Reviewer for ReflectiveReviewer {
                 .extend(results.into_iter().filter_map(written_id));
         }
 
-        // Commitments land in the inbox only, never straight to `todo`: automated
-        // extraction is a suggestion the user confirms or discards (same governance
-        // as memory writes). `source_message_id` is a content-derived dedup key so
-        // re-reviewing the same session across sweeps never duplicates a task.
-        for commitment in suggestions.commitments {
-            let title = commitment.title.trim();
-            if title.is_empty() || should_skip(title) {
-                continue;
-            }
-            let key = commitment_key(title);
-            if self
-                .tasks
-                .find_by_source_message_id(&session.id, &key)
-                .await?
-                .is_some()
-            {
-                continue;
-            }
-            let mut task = Task::new(title.to_string());
-            task.status = TaskStatus::Inbox;
-            task.note = commitment.note.unwrap_or_default();
-            task.waiting_on = commitment.waiting_on.unwrap_or_default();
-            task.source = session.id.clone();
-            task.source_message_id = key;
-            self.tasks.save(&task).await?;
-            outcome.tasks_captured.push(task.id);
-        }
-
         Ok(outcome)
     }
 }
@@ -183,13 +145,6 @@ fn learning_occasion(episodes: &[AssessedEpisode]) -> Occasion {
     Occasion::over(episodes.iter().map(|e| e.view.run.id.clone()))
 }
 
-/// Deterministic, dependency-free dedup key for an extracted commitment: FNV-1a
-/// over the whitespace-normalized lowercased title. Stable across sweeps and
-/// platforms, so the same obligation always maps to the same key.
-fn commitment_key(title: &str) -> String {
-    format!("commit-{:016x}", fnv1a(title))
-}
-
 /// The id a consolidation outcome reports as "written" for the review summary,
 /// which counts library changes. `Skipped` changed nothing.
 fn written_id(result: Consolidated) -> Option<String> {
@@ -200,22 +155,6 @@ fn written_id(result: Consolidated) -> Option<String> {
         Consolidated::Contested { new, .. } | Consolidated::Superseded { new, .. } => Some(new),
         Consolidated::Skipped => None,
     }
-}
-
-/// FNV-1a over whitespace-normalized lowercased text. Deterministic, dependency-
-/// free, stable across sweeps and platforms.
-fn fnv1a(text: &str) -> u64 {
-    let norm = text
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in norm.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    hash
 }
 
 /// Caps for the episode rendering. A turn's ledger fields run to
@@ -288,10 +227,8 @@ fn review_prompt(episodes: &[AssessedEpisode]) -> String {
         "{SELF_REVIEW_PROMPT}\n\nReturn only JSON in this exact shape:\n\
          {{\"memories\":[{{\"kind\":\"profile|preference|feedback|project|person|fact|decision|reference\",\
          \"content\":\"...\",\"quote\":\"the words this came from\",\
-         \"said_by\":\"user|tool\"}}],\
-         \"commitments\":[{{\"title\":\"short actionable obligation\",\
-         \"waiting_on\":\"who it involves, or empty\",\"note\":\"context/deadline, or empty\"}}]}}\n\
-         Use empty arrays when nothing durable should be written.\n\n\
+         \"said_by\":\"user|tool\"}}]}}\n\
+         Use an empty array when nothing durable should be written.\n\n\
          Each episode below is one completed turn: what the user asked, the tool calls \
          komo actually ran, the reply, and what the evidence says about the result. \
          `outcome: unknown` means the evidence does not settle whether the user got what \
@@ -324,17 +261,6 @@ fn review_prompt(episodes: &[AssessedEpisode]) -> String {
 struct ReviewSuggestions {
     #[serde(default)]
     memories: Vec<MemorySuggestion>,
-    #[serde(default)]
-    commitments: Vec<CommitmentSuggestion>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CommitmentSuggestion {
-    title: String,
-    #[serde(default)]
-    waiting_on: Option<String>,
-    #[serde(default)]
-    note: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,60 +365,6 @@ mod tests {
             Ok(())
         }
     }
-
-    #[derive(Default)]
-    struct FakeTasks(Mutex<Vec<Task>>);
-
-    #[async_trait]
-    impl TaskRepository for FakeTasks {
-        async fn save(&self, task: &Task) -> anyhow::Result<()> {
-            self.0.lock().unwrap().push(task.clone());
-            Ok(())
-        }
-        async fn find(&self, id: &str) -> anyhow::Result<Option<Task>> {
-            Ok(self.0.lock().unwrap().iter().find(|t| t.id == id).cloned())
-        }
-        async fn list_open(&self) -> anyhow::Result<Vec<Task>> {
-            Ok(self
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|t| t.status.is_open())
-                .cloned()
-                .collect())
-        }
-        async fn update(&self, task: &Task) -> anyhow::Result<()> {
-            let mut rows = self.0.lock().unwrap();
-            if let Some(slot) = rows.iter_mut().find(|t| t.id == task.id) {
-                *slot = task.clone();
-            }
-            Ok(())
-        }
-        async fn find_by_source_message_id(
-            &self,
-            source: &str,
-            source_message_id: &str,
-        ) -> anyhow::Result<Option<Task>> {
-            Ok(self
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|t| t.source == source && t.source_message_id == source_message_id)
-                .cloned())
-        }
-        async fn find_by_wakeup_id(&self, wakeup_id: &str) -> anyhow::Result<Option<Task>> {
-            Ok(self
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|t| t.wakeup_id.as_deref() == Some(wakeup_id))
-                .cloned())
-        }
-    }
-
     /// A consolidator over `memories` whose classifier always answers
     /// "unrelated", so these tests exercise the *reviewer* — extraction, scoping,
     /// the dedup guards — and not the classification, which
@@ -512,16 +384,6 @@ mod tests {
             Arc::new(FixedLlm(reply.to_string())),
             query,
         ))
-    }
-
-    fn reviewer_with(reply: &str) -> (ReflectiveReviewer, Arc<FakeTasks>) {
-        let tasks = Arc::new(FakeTasks::default());
-        let reviewer = ReflectiveReviewer::new(
-            Arc::new(FixedLlm(reply.to_string())),
-            consolidator_over(Arc::new(FakeMemories::default())),
-            tasks.clone(),
-        );
-        (reviewer, tasks)
     }
 
     /// Identity and workspace only: the extractor reads episodes, so the
@@ -591,66 +453,6 @@ mod tests {
         }
     }
 
-    // ── commitment extraction ──────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn captures_commitment_into_inbox() {
-        let reply = r#"{"memories":[],"commitments":[{"title":"send Bob the report","waiting_on":"Bob","note":"by tomorrow"}]}"#;
-        let (reviewer, tasks) = reviewer_with(reply);
-
-        let outcome = reviewer
-            .review(&chat_session("s42", "42"), &episodes())
-            .await
-            .unwrap();
-        assert_eq!(outcome.tasks_captured.len(), 1);
-
-        let rows = tasks.0.lock().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].status, TaskStatus::Inbox);
-        assert_eq!(rows[0].waiting_on, "Bob");
-        assert_eq!(rows[0].source, "s42");
-        assert!(!rows[0].source_message_id.is_empty());
-    }
-
-    #[tokio::test]
-    async fn dedups_commitment_across_repeated_reviews() {
-        let reply = r#"{"commitments":[{"title":"send Bob the report"}]}"#;
-        let (reviewer, tasks) = reviewer_with(reply);
-        let s = chat_session("s42", "42");
-
-        reviewer.review(&s, &episodes()).await.unwrap();
-        let second = reviewer.review(&s, &episodes()).await.unwrap();
-
-        // Same session + same commitment → no duplicate on the second sweep.
-        assert_eq!(second.tasks_captured.len(), 0);
-        assert_eq!(tasks.0.lock().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn same_commitment_in_different_sessions_is_not_deduped() {
-        let reply = r#"{"commitments":[{"title":"send Bob the report"}]}"#;
-        let (reviewer, tasks) = reviewer_with(reply);
-
-        reviewer
-            .review(&chat_session("s1", "1"), &episodes())
-            .await
-            .unwrap();
-        reviewer
-            .review(&chat_session("s2", "2"), &episodes())
-            .await
-            .unwrap();
-
-        assert_eq!(tasks.0.lock().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn commitment_key_is_stable_under_whitespace_and_case() {
-        assert_eq!(
-            commitment_key("Send  Bob the REPORT"),
-            commitment_key("send bob the report")
-        );
-    }
-
     #[test]
     fn extracts_fenced_json() {
         let parsed = parse_suggestions(
@@ -669,13 +471,11 @@ mod tests {
 
     #[tokio::test]
     async fn extracted_memory_lands_as_scoped_candidate() {
-        let reply = r#"{"memories":[{"kind":"preference","content":"prefers concise replies"}],"commitments":[]}"#;
-        let tasks = Arc::new(FakeTasks::default());
+        let reply = r#"{"memories":[{"kind":"preference","content":"prefers concise replies"}]}"#;
         let memories = Arc::new(FakeMemories::default());
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
             consolidator_over(memories.clone()),
-            tasks,
         );
 
         reviewer
@@ -712,13 +512,12 @@ mod tests {
         ];
         for (said_by, expected) in cases {
             let reply = format!(
-                r#"{{"memories":[{{"kind":"fact",{said_by}"content":"komo uses Rust"}}],"commitments":[]}}"#
+                r#"{{"memories":[{{"kind":"fact",{said_by}"content":"komo uses Rust"}}]}}"#
             );
             let memories = Arc::new(FakeMemories::default());
             let reviewer = ReflectiveReviewer::new(
                 Arc::new(FixedLlm(reply)),
                 consolidator_over(memories.clone()),
-                Arc::new(FakeTasks::default()),
             );
 
             reviewer
@@ -745,9 +544,9 @@ mod tests {
         existing.scope = MemoryScope::Global;
         let memories = Arc::new(FakeMemories(Mutex::new(vec![existing])));
         let llm = ScriptedLlm::new(&[
-            r#"{"memories":[{"kind":"preference","said_by":"user","content":"user prefers squashing over stacking"}],"commitments":[]}"#,
-            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}],"commitments":[]}"#,
-            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}],"commitments":[]}"#,
+            r#"{"memories":[{"kind":"preference","said_by":"user","content":"user prefers squashing over stacking"}]}"#,
+            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}]}"#,
+            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}]}"#,
         ]);
         let reviewer = ReflectiveReviewer::new(
             llm,
@@ -755,7 +554,6 @@ mod tests {
                 memories.clone(),
                 r#"{"relation":"supports","target":"mem-1"}"#,
             ),
-            Arc::new(FakeTasks::default()),
         );
         let home = session("home");
 
@@ -776,12 +574,11 @@ mod tests {
 
     #[tokio::test]
     async fn dedups_extracted_memory_across_repeated_reviews() {
-        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}]}"#;
         let memories = Arc::new(FakeMemories::default());
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
             consolidator_over(memories.clone()),
-            Arc::new(FakeTasks::default()),
         );
         let s = chat_session("s42", "42");
 
@@ -798,7 +595,7 @@ mod tests {
         // from a *different* session, so the per-session source dedup can't catch
         // it. The reviewer must still refuse to re-ingest it (the assistant likely
         // echoed a recalled fact), instead of minting a duplicate candidate.
-        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}]}"#;
         let memories = Arc::new(FakeMemories::default());
         let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
@@ -812,7 +609,6 @@ mod tests {
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
             consolidator_over(memories.clone()),
-            Arc::new(FakeTasks::default()),
         );
         let outcome = reviewer
             .review(&chat_session("s42", "42"), &episodes())
@@ -829,7 +625,7 @@ mod tests {
         // The same fact held active but scoped to a *different* channel was never
         // eligible to be recalled into this session, so it is not self-echo — a
         // channel-scoped candidate is still captured here.
-        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}]}"#;
         let memories = Arc::new(FakeMemories::default());
         let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
@@ -842,7 +638,6 @@ mod tests {
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
             consolidator_over(memories.clone()),
-            Arc::new(FakeTasks::default()),
         );
         reviewer
             .review(&chat_session("s42", "42"), &episodes())

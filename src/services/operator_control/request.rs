@@ -9,7 +9,6 @@ use crate::domain::{
     cron::{CronJob, CronJobSpec},
     memory::Memory,
     run::{MemoryUse, Run, RunStep},
-    task::Task,
 };
 
 // The pure view DTOs (no domain dependency) live in `komo-core` so HTTP clients
@@ -24,8 +23,6 @@ pub use komo_core::operator_view::{
 /// never knows which transport answers it.
 #[derive(Debug)]
 pub enum OperatorQuery {
-    /// Open tasks (inbox/todo/waiting).
-    Tasks,
     /// Recent runs, newest first.
     Runs { limit: usize },
     /// One run with its tool steps (`None` = no such run).
@@ -59,7 +56,6 @@ pub enum OperatorQuery {
 /// exhaustively — transport JSON shapes never become the caller interface.
 #[derive(Debug)]
 pub enum OperatorQueryResult {
-    Tasks(Vec<Task>),
     Runs(Vec<Run>),
     Run(Option<(Run, Vec<RunStep>)>),
     Sessions(Vec<SessionSummary>),

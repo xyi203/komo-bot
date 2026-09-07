@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use crate::domain::{
     approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
-    reviewer::Reviewer, task::TaskRepository, workspace::Workspace,
+    reviewer::Reviewer, workspace::Workspace,
 };
 use crate::plugins::{self, Scope, ToolCx, ToolRegistry};
 use komo_config::ConfigSnapshot;
@@ -220,11 +220,9 @@ pub async fn build(
     db: Arc<Db>,
     approver: Arc<dyn Approver>,
 ) -> anyhow::Result<Wiring> {
-    // One file, one handle, three repository traits over it. Named separately
-    // because the things they mean are still separate — durable tasks, durable
-    // jobs, durable memories — even though they are now tables in the same
-    // database.
-    let kanban: Arc<dyn TaskRepository> = db.clone();
+    // One file, one handle, several repository traits over it. Named separately
+    // because the things they mean are still separate — durable jobs, durable
+    // memories — even though they are now tables in the same database.
     let cron_jobs: Arc<dyn CronJobRepository> = db.clone();
     // An unusable model selection (bad KOMO_* value, unknown provider,
     // missing API key) can't produce a working agent — fail here like the old
@@ -414,7 +412,6 @@ pub async fn build(
         config,
         catalogs: catalogs.clone(),
         db: db.clone(),
-        kanban: kanban.clone(),
         cron_jobs: cron_jobs.clone(),
         workspace: workspace.clone(),
         memory_repo: memory_repo.clone(),
@@ -572,11 +569,8 @@ pub async fn build(
             memory_query.clone(),
         ),
     );
-    let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
-        aux_llm.clone(),
-        consolidator,
-        kanban.clone(),
-    ));
+    let reviewer: Arc<dyn Reviewer> =
+        Arc::new(ReflectiveReviewer::new(aux_llm.clone(), consolidator));
     // One coordinator instance shared by the runtime's post-run trigger and
     // the gateway's scheduled sweep — that sharing is what makes its
     // per-session in-flight guard effective across the two paths.

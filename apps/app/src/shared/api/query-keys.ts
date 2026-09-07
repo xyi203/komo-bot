@@ -8,7 +8,6 @@ export const qk = {
   status: ["status"] as const,
   workspaces: ["workspaces"] as const,
   models: ["models"] as const,
-  tasks: ["tasks"] as const,
   memories: (status: string) => ["memories", status] as const,
   dream: ["dream"] as const,
   runs: (limit: number) => ["runs", limit] as const,

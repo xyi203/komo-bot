@@ -53,7 +53,7 @@ use komo_services::tool_execution::ToolExecutor;
 
 use crate::domain::{
     cron::CronJobRepository, gateway::WeChatLogin, llm::LlmClient, memory::MemoryRepository,
-    notify::Notifier, pairing::PairingRepository, task::TaskRepository, workspace::Workspace,
+    notify::Notifier, pairing::PairingRepository, workspace::Workspace,
 };
 use crate::infra::messaging::home_notifier::TextSender;
 use crate::services::operator_control::actions::WikiOps;
@@ -156,7 +156,6 @@ pub fn builtin() -> Vec<Arc<dyn Plugin>> {
         Arc::new(channels::TelegramPlugin),
         Arc::new(channels::WeChatPlugin),
         Arc::new(sweeps::ReviewPlugin),
-        Arc::new(sweeps::TasksPlugin),
         Arc::new(sweeps::BriefingPlugin),
         Arc::new(sweeps::CronJobsPlugin),
         Arc::new(sweeps::DreamPlugin),
@@ -322,7 +321,6 @@ pub struct ToolCx<'a> {
     /// [`ToolRegistry::tool`] instead — wiring fills the catalogs from it.
     pub catalogs: Arc<ScopedCatalogs>,
     pub db: Arc<Db>,
-    pub kanban: Arc<dyn TaskRepository>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
     pub workspace: Arc<Workspace>,
     pub memory_repo: Arc<dyn MemoryRepository>,
@@ -498,7 +496,6 @@ impl ChannelRegistry {
 pub struct SweepCx<'a> {
     pub config: &'a ConfigSnapshot,
     pub db: Arc<Db>,
-    pub kanban: Arc<dyn TaskRepository>,
     pub notifier: Arc<dyn Notifier>,
     pub review: Arc<LearningCoordinator>,
     pub memories: Arc<dyn MemoryRepository>,
@@ -705,7 +702,6 @@ mod tests {
             config,
             catalogs: Arc::new(ScopedCatalogs::default()),
             db: db.clone(),
-            kanban: db.clone(),
             cron_jobs: db.clone(),
             workspace: Arc::new(Workspace::current_dir().unwrap()),
             memory_query: Arc::new(MemoryQueryService::new(memory_repo.clone())),
@@ -842,7 +838,6 @@ mod tests {
             "session",
             "shell",
             "skill",
-            "task",
             "time",
             "todo",
             // Everywhere an agent turn runs, unattended ones included: a

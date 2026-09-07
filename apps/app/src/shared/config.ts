@@ -8,7 +8,7 @@ export const POLL = {
   connection: 3_000,
   /** Session list in the sidebar. */
   sessions: 6_000,
-  /** Settings dashboard tabs (status / tasks / memories / runs). */
+  /** Settings dashboard tabs (status / memories / runs). */
   dashboard: 6_000,
   /** Pending approval + clarify question, while a turn is in flight. */
   interactions: 1_000,

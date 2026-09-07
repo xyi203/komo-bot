@@ -7,7 +7,6 @@ use komo_core::domain::checkpoint::CheckpointStore;
 
 use crate::{
     domain::cron::{CronAction, CronJob, CronJobSpec, CronJobStatus, NotifyPolicy},
-    domain::task::TaskStatus,
     services::operator_control::{
         OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery, OperatorQueryResult,
     },
@@ -187,45 +186,6 @@ pub async fn cron_run(control: &OperatorControl, name: &str) -> anyhow::Result<(
             "Job `{}` marked due — it runs once a gateway is up (`komo gateway start`).",
             job.name
         );
-    }
-    Ok(())
-}
-
-/// List open tasks grouped by status (inbox first — it needs triage).
-pub async fn task_list(control: &OperatorControl) -> anyhow::Result<()> {
-    let OperatorQueryResult::Tasks(open) = control.query(OperatorQuery::Tasks).await? else {
-        unreachable!("Tasks query answers with Tasks");
-    };
-
-    if open.is_empty() {
-        println!("No open tasks.");
-        return Ok(());
-    }
-    for status in [TaskStatus::Inbox, TaskStatus::Todo, TaskStatus::Waiting] {
-        let group: Vec<_> = open.iter().filter(|t| t.status == status).collect();
-        if group.is_empty() {
-            continue;
-        }
-        println!("{}:", status.as_str());
-        for t in group {
-            let mut line = format!("  {}  {}", t.id, t.title);
-            if !t.board.is_empty() {
-                line.push_str(&format!("  #{}", t.board));
-            }
-            if !t.waiting_on.is_empty() {
-                line.push_str(&format!("  (waiting on: {})", t.waiting_on));
-            }
-            // A name is not an address: nothing can match an inbound message
-            // against it, so nothing will ever wake this task
-            // (docs/bot-runtime.md §3.7).
-            if status == TaskStatus::Waiting && t.waiting_on_peer.is_none() {
-                line.push_str("  [不可唤醒]");
-            }
-            if let Some(due) = t.due_at {
-                line.push_str(&format!("  due {}", local_time(due)));
-            }
-            println!("{line}");
-        }
     }
     Ok(())
 }

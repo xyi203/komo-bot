@@ -28,7 +28,6 @@ pub mod run_projection;
 pub mod session;
 pub mod session_event;
 pub mod skill;
-pub mod task;
 pub mod todo;
 pub mod tool;
 pub mod trigger;

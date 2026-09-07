@@ -21,8 +21,8 @@ use komo_core::domain::todo::SessionTodoRepository;
 /// working on right now, which is exactly the thing a fresh context does not
 /// inherit.
 ///
-/// **Kept**: everything with a lifecycle of its own. Kanban tasks and memories
-/// outlive any conversation; policy grants (`/approve session`) are answers
+/// **Kept**: everything with a lifecycle of its own. Memories outlive any
+/// conversation; policy grants (`/approve session`) are answers
 /// about what komo may do, not about what it was talking about; a suspended
 /// turn and its wakeup registration are still owed an answer. `/new` used to
 /// end the session, which coupled all three lifecycles to one keystroke.

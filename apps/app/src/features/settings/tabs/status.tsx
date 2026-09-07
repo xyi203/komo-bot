@@ -72,7 +72,6 @@ export function StatusTab() {
       </Field>
 
       <div className="grid grid-cols-2 gap-2.5 pt-4">
-        <Metric value={status.open_tasks} label="开放任务" />
         <Metric value={status.sessions} label="会话数" />
       </div>
     </div>

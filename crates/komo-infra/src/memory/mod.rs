@@ -1,3 +1,2 @@
-//! Memory infra: the durable memory.db connection and legacy markdown store.
-pub mod md_memory;
+//! Memory infra: the durable `memory_records` table and its repository impl.
 pub mod memory_db;

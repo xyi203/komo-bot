@@ -274,19 +274,6 @@ pub async fn backfill(control: &OperatorControl) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn repair_scopes(control: &OperatorControl) -> anyhow::Result<()> {
-    match control.command(OperatorCommand::MemoryRepairScopes).await? {
-        OperatorCommandResult::MemoryScopesRepaired { repaired: 0 } => {
-            println!("no memories needed repair");
-        }
-        OperatorCommandResult::MemoryScopesRepaired { repaired } => {
-            println!("widened {repaired} memories to global scope");
-        }
-        _ => unreachable!("MemoryRepairScopes answers with MemoryScopesRepaired"),
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

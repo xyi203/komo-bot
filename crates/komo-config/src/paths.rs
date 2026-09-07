@@ -10,31 +10,17 @@ use std::path::PathBuf;
 ///
 /// Read directly (not via `KomoEnv`): this is the bootstrap variable that
 /// decides where `~/.komo/.env` lives, so it must work before dotenvy has
-/// loaded that file. During the product rename, `SHION_HOME` and an existing
-/// `~/.shion` remain compatibility fallbacks; the new name always wins when
-/// both are present.
+/// loaded that file.
 pub fn komo_home() -> PathBuf {
     std::env::var("KOMO_HOME")
         .ok()
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var("SHION_HOME")
-                .ok()
-                .filter(|s| !s.is_empty())
-                .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .expect("cannot determine home directory")
+                .join(".komo")
         })
-        .unwrap_or_else(|| default_home(dirs::home_dir().expect("cannot determine home directory")))
-}
-
-fn default_home(base: PathBuf) -> PathBuf {
-    let current = base.join(".komo");
-    let legacy = base.join(".shion");
-    if !current.exists() && legacy.exists() {
-        legacy
-    } else {
-        current
-    }
 }
 
 /// Ensure `~/.komo/` exists (0700) and return its path.
@@ -81,17 +67,5 @@ mod tests {
         let home = komo_home();
         unsafe { std::env::remove_var("KOMO_HOME") };
         assert_eq!(home, dir);
-    }
-
-    #[test]
-    fn default_home_reuses_legacy_data_until_new_home_exists() {
-        let base = std::env::temp_dir().join("komo_core_paths_test_legacy_home");
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join(".shion")).unwrap();
-        assert_eq!(default_home(base.clone()), base.join(".shion"));
-
-        std::fs::create_dir_all(base.join(".komo")).unwrap();
-        assert_eq!(default_home(base.clone()), base.join(".komo"));
-        let _ = std::fs::remove_dir_all(base);
     }
 }

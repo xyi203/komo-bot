@@ -868,14 +868,9 @@ async fn find_windowed_returns_recent_messages_in_order() {
     );
 }
 
-/// A state.db created before the session columns existed must gain them
-/// **in place** on connect (additive ALTER, like memory.db's
-/// ensure_columns) — an upgraded gateway must not hard-fail every session
-/// query until the operator remembers the delete-to-reset convention.
-/// An upgrading komo keeps its conversations: rows in the old table are
-/// moved into the log on connect, and the rows go away only once the file
-/// holds them. Re-connecting must not duplicate what it already moved.
-
+/// A db created before the session columns existed must gain them
+/// **in place** on connect (additive ALTER) — an upgraded gateway must not
+/// hard-fail every session query.
 #[tokio::test]
 async fn adds_missing_session_columns_in_place() {
     // Its own home, so a shared directory cannot carry a previous run's
@@ -910,9 +905,6 @@ async fn adds_missing_session_columns_in_place() {
         .await
         .unwrap();
     }
-    // Mark it turso-native so connect() does not stage it as a sqlite backup.
-    std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
-
     // 2. Connect via Db: ensure_columns adds the session columns in place.
     let db = Db::connect(&format!("turso:{}", path.display()))
         .await
@@ -933,80 +925,10 @@ async fn adds_missing_session_columns_in_place() {
     assert_eq!(retitled.title, "old chat");
 }
 
-/// A state.db whose `push_schema` ran while `reviewed_through` was still a
-/// model field carries the column `NOT NULL` with no default — so once the
-/// field left the model, every new-session insert failed the constraint.
-/// Connect must drop the retired column in place and accept writes again.
-#[tokio::test]
-async fn drops_retired_reviewed_through_column_in_place() {
-    let home = std::env::temp_dir().join("komo-test-db-dropcol");
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::create_dir_all(&home).expect("test home");
-    let path = home.join("state.db");
-
-    // Seed the shape push_schema wrote in the reviewed_through era: the
-    // watermark column NOT NULL and defaultless, beside a live session.
-    {
-        let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-            .build()
-            .await
-            .unwrap();
-        let conn = db.connect().unwrap();
-        conn.pragma_update("journal_mode", "'mvcc'").await.ok();
-        conn.execute(
-            "CREATE TABLE \"session_records\" (\
-                 \"id\" TEXT NOT NULL, \"created_at\" BIGINT NOT NULL, \
-                 \"reviewed_through\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "CREATE TABLE \"message_records\" (\
-                 \"id\" TEXT NOT NULL, \"session_id\" TEXT NOT NULL, \"role\" TEXT NOT NULL, \
-                 \"content\" TEXT NOT NULL, \"timestamp\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO \"session_records\" VALUES ('cli:old', 100, 3)",
-            (),
-        )
-        .await
-        .unwrap();
-    }
-    std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
-
-    let db = Db::connect(&format!("turso:{}", path.display()))
-        .await
-        .unwrap();
-
-    // The pre-existing session survives the drop…
-    assert!(
-        SessionRepository::find(&db, "cli:old")
-            .await
-            .unwrap()
-            .is_some(),
-        "pre-migration session survives the column drop"
-    );
-    // …and the store accepts new sessions again, which is exactly what the
-    // leftover NOT NULL column used to fail.
-    SessionRepository::save(&db, &Session::new("cli:new"))
-        .await
-        .expect("a new session inserts once the retired column is gone");
-    assert!(
-        SessionRepository::find(&db, "cli:new")
-            .await
-            .unwrap()
-            .is_some()
-    );
-}
-
-/// A state.db created before `recoverable` existed must gain the column
+/// A db created before `recoverable` existed must gain the column
 /// **in place** on connect, like the session columns above — otherwise an
 /// upgraded gateway 500s every run-ledger read ("no such column:
-/// recoverable") until the operator remembers the delete-to-reset.
+/// recoverable").
 #[tokio::test]
 async fn adds_missing_run_columns_in_place() {
     let path = std::env::temp_dir().join("komo_db_addcol_runs.db");
@@ -1062,8 +984,6 @@ async fn adds_missing_run_columns_in_place() {
         .await
         .unwrap();
     }
-    std::fs::write(turso_marker_path(&path), b"turso-native\n").unwrap();
-
     // 2. Connect via Db: ensure_columns adds `recoverable` in place, and
     //    run-ledger reads work again.
     let db = Db::connect(&format!("turso:{}", path.display()))
@@ -1184,180 +1104,6 @@ async fn unlearned_offers_finished_runs_until_they_are_marked() {
     assert_eq!(
         ids(RunRepository::unlearned(&db, None, 10).await.unwrap()),
         ["run-b"]
-    );
-}
-
-/// ADR 0004's migration, end to end: the durable files become tables in
-/// one, and the operator's data is all still there afterwards.
-#[tokio::test]
-async fn the_durable_files_merge_into_komo_db() {
-    use komo_core::domain::cron::{CronAction, CronJob, CronJobRepository};
-    use komo_core::domain::memory::{Memory, MemoryKind, MemoryRepository};
-
-    let home = std::env::temp_dir().join("komo-merge-three");
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::create_dir_all(&home).expect("test home");
-
-    // Seed each legacy file through the store that used to own it, each in
-    // a directory of its own so the seeding never merges its neighbours,
-    // then move it in beside where `komo.db` will be. The import reads only
-    // the table it came for, exactly as it would from a file written by the
-    // old per-store code.
-    let seed = |name: &'static str| {
-        let home = home.clone();
-        async move {
-            let dir = home.join(format!("seed-{name}"));
-            std::fs::create_dir_all(&dir).unwrap();
-            let db = Db::connect(&format!("turso:{}", dir.join(name).display()))
-                .await
-                .unwrap();
-            (db, dir)
-        }
-    };
-    /// Move a seeded file and its sidecars in, leaving the seeding
-    /// directory empty.
-    fn install(dir: &Path, home: &Path, name: &str) {
-        for suffix in ["", "-log", "-wal", "-shm", ".turso"] {
-            let from = dir.join(format!("{name}{suffix}"));
-            if from.exists() {
-                std::fs::rename(from, home.join(format!("{name}{suffix}"))).unwrap();
-            }
-        }
-    }
-
-    let (jobs, dir) = seed("cron.db").await;
-    CronJobRepository::save(
-        &jobs,
-        &CronJob::new(
-            "nightly",
-            komo_core::domain::cron::Trigger::cron("0 3 * * *"),
-            CronAction::Command {
-                command: "/opt/backup.sh".into(),
-                args: Vec::new(),
-                workdir: None,
-                timeout_secs: 600,
-            },
-            0,
-        ),
-    )
-    .await
-    .unwrap();
-    drop(jobs);
-    install(&dir, &home, "cron.db");
-
-    let (memories, dir) = seed("memory.db").await;
-    MemoryRepository::save(
-        &memories,
-        &Memory::new(MemoryKind::Preference, "prefers rebase before push"),
-    )
-    .await
-    .unwrap();
-    drop(memories);
-    install(&dir, &home, "memory.db");
-
-    let db = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        CronJobRepository::list(&db)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|j| j.name)
-            .collect::<Vec<_>>(),
-        vec!["nightly".to_string()]
-    );
-    assert_eq!(
-        MemoryRepository::list(&db)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|m| m.content)
-            .collect::<Vec<_>>(),
-        vec!["prefers rebase before push".to_string()]
-    );
-
-    // Each old file is retired, not deleted: it was the only copy of data
-    // that was durable by design.
-    for name in ["cron.db", "memory.db"] {
-        assert!(!home.join(name).exists(), "{name} must be renamed away");
-        assert!(
-            home.join(format!("{name}.merged-backup")).exists(),
-            "{name} must be kept as a backup"
-        );
-    }
-
-    // And a reconnect imports nothing a second time.
-    drop(db);
-    let again = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
-        .await
-        .unwrap();
-    assert_eq!(MemoryRepository::list(&again).await.unwrap().len(), 1);
-}
-
-/// The fourth file of that migration: `state.db` carries the rows nothing
-/// can reconstruct — the session list, the settings the home conversation
-/// is named in, and the pairings.
-#[tokio::test]
-async fn state_db_merges_into_komo_db() {
-    use komo_core::domain::pairing::PairingRequest;
-
-    let home = std::env::temp_dir().join("komo-merge-state");
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::create_dir_all(&home).expect("test home");
-
-    // Seeded in a directory of its own, so `state.db` is not the file the
-    // store is opening when the rows go in.
-    let seed_dir = home.join("seed-state");
-    std::fs::create_dir_all(&seed_dir).unwrap();
-    let seeded = Db::connect(&format!("turso:{}", seed_dir.join("state.db").display()))
-        .await
-        .unwrap();
-    SessionRepository::save(
-        &seeded,
-        &Session::new("11111111-1111-7111-8111-111111111111"),
-    )
-    .await
-    .unwrap();
-    let (request, _code) = PairingRequest::mint("telegram", "42", "xiangyi");
-    PairingRepository::upsert(&seeded, &request).await.unwrap();
-    let minted = HomeRepository::home_session(&seeded).await.unwrap();
-    drop(seeded);
-    for suffix in ["", "-log", "-wal", "-shm", ".turso"] {
-        let from = seed_dir.join(format!("state.db{suffix}"));
-        if from.exists() {
-            std::fs::rename(from, home.join(format!("state.db{suffix}"))).unwrap();
-        }
-    }
-
-    let db = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        SessionRepository::list(&db)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|s| s.id)
-            .collect::<Vec<_>>(),
-        vec!["11111111-1111-7111-8111-111111111111".to_string()]
-    );
-    assert!(
-        PairingRepository::find(&db, "telegram", "42")
-            .await
-            .unwrap()
-            .is_some()
-    );
-    // The home conversation is the same one, not a freshly minted id: that
-    // settings row is what makes the operator's private history continuous.
-    assert_eq!(HomeRepository::home_session(&db).await.unwrap(), minted);
-
-    assert!(!home.join("state.db").exists(), "state.db must be renamed");
-    assert!(
-        home.join("state.db.merged-backup").exists(),
-        "state.db must be kept as a backup"
     );
 }
 

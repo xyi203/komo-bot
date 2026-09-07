@@ -1,8 +1,9 @@
 use super::*;
 use komo_core::domain::cron::{CronJobStatus, NotifyPolicy, RoutineRunStatus};
 
-/// A `komo.db` in a home of this test's own — `Db::connect` scans its
-/// directory for legacy files to merge.
+/// A `komo.db` in a home of this test's own — a home holds transcripts
+/// beside the db, and two tests sharing a directory would read each
+/// other's conversations.
 fn turso_url(name: &str) -> String {
     let home = std::env::temp_dir().join(format!("komo-cron-{name}"));
     std::fs::remove_dir_all(&home).ok();
@@ -83,102 +84,6 @@ async fn job_roundtrip_update_and_delete() {
     assert!(db.list().await.unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn upgrades_command_only_schema_in_place() {
-    let home = std::env::temp_dir().join("komo-cron-addcol");
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::create_dir_all(&home).expect("test home");
-    let path = home.join("cron.db");
-
-    // 1. Seed a turso file with the OLD command-only schema (no
-    //    kind/prompt/skills) + one command row, then drop the handle.
-    {
-        let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-            .build()
-            .await
-            .unwrap();
-        let conn = db.connect().unwrap();
-        conn.pragma_update("journal_mode", "'mvcc'").await.ok();
-        conn.execute(
-            "CREATE TABLE \"cron_job_records\" (\
-                 \"id\" TEXT NOT NULL, \"name\" TEXT NOT NULL, \"schedule\" TEXT NOT NULL, \
-                 \"command\" TEXT NOT NULL, \"args\" TEXT NOT NULL, \"workdir\" TEXT NOT NULL, \
-                 \"timeout_secs\" BIGINT NOT NULL, \"enabled\" BIGINT NOT NULL, \
-                 \"next_run_at\" BIGINT NOT NULL, \"last_run_at\" BIGINT NOT NULL, \
-                 \"last_status\" TEXT NOT NULL, \"last_error\" TEXT NOT NULL, \
-                 \"created_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO \"cron_job_records\" VALUES \
-                 ('id-1', 'legacy', '0 14 * * 5', '/opt/rotate.py', '[\"--push\"]', '', \
-                 900, 1, 1000, 0, '', '', 100)",
-            (),
-        )
-        .await
-        .unwrap();
-        // A disabled legacy row must migrate to `paused`, not `active`.
-        conn.execute(
-            "INSERT INTO \"cron_job_records\" VALUES \
-                 ('id-2', 'parked', '0 3 * * *', '/opt/nightly.sh', '[]', '', \
-                 900, 0, 2000, 0, '', '', 100)",
-            (),
-        )
-        .await
-        .unwrap();
-    }
-    std::fs::write(
-        crate::persistence::turso_marker_path(&path),
-        b"turso-native\n",
-    )
-    .unwrap();
-
-    // 2. Merge it into a fresh `komo.db`: the old file gains
-    //    kind/prompt/skills in place and `enabled` becomes the stored
-    //    status *before* it is read, which is the only way a pre-status
-    //    file is readable through today's model at all.
-    let db = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
-        .await
-        .unwrap();
-    let found = db.find_by_name("legacy").await.unwrap().unwrap();
-    let CronAction::Command { command, args, .. } = &found.action else {
-        panic!("legacy row must read as a command job");
-    };
-    assert_eq!(command, "/opt/rotate.py");
-    assert_eq!(args, &vec!["--push".to_string()]);
-    assert_eq!(found.status, CronJobStatus::Active, "enabled=1 → active");
-    assert_eq!(
-        found.trigger,
-        Trigger::cron("0 14 * * 5"),
-        "the retired schedule column is repaired into a trigger on connect"
-    );
-    assert!(found.runs.is_empty(), "a row that never ran has no history");
-    assert!(
-        found.grants.is_empty(),
-        "a row written before the grants column must read as ungranted, not error"
-    );
-    let parked = db.find_by_name("parked").await.unwrap().unwrap();
-    assert_eq!(parked.status, CronJobStatus::Paused, "enabled=0 → paused");
-
-    // 3. The added columns are usable: an agent job saves and reads back.
-    db.save(&CronJob::new(
-        "brief",
-        Trigger::cron("0 8 * * *"),
-        CronAction::Agent {
-            prompt: "hi".into(),
-            skills: vec!["s".into()],
-            workspace: None,
-        },
-        0,
-    ))
-    .await
-    .unwrap();
-    let agent = db.find_by_name("brief").await.unwrap().unwrap();
-    assert_eq!(agent.action.kind(), "agent");
-}
-
 /// A routine stored with a trigger this build no longer has — one that
 /// fired on an event rather than a clock — is skipped and named, never
 /// read as some clock trigger and never failing the listing for the jobs
@@ -238,108 +143,6 @@ async fn a_job_whose_trigger_no_longer_reads_is_skipped_not_fatal() {
     assert!(db.find_by_name("on-ci").await.unwrap().is_none());
     assert!(db.delete("on-ci").await.unwrap(), "and it can be removed");
     assert!(!db.delete("on-ci").await.unwrap());
-}
-
-/// The one-time repair, on a row in the shape the store actually held
-/// before `Trigger`: a `@at` schedule becomes the moment it named, the four
-/// `last_*` fields become the single run they described, and running it
-/// again changes nothing.
-#[tokio::test]
-async fn a_pre_trigger_row_is_repaired_on_connect() {
-    let home = std::env::temp_dir().join("komo-cron-backfill");
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::create_dir_all(&home).expect("test home");
-    let path = home.join("komo.db");
-
-    // A file with today's columns minus `trigger`/`runs`/`notify`, holding
-    // one recurring job that failed last night and one spent one-shot.
-    {
-        let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-            .build()
-            .await
-            .unwrap();
-        let conn = db.connect().unwrap();
-        conn.pragma_update("journal_mode", "'mvcc'").await.ok();
-        conn.execute(
-            "CREATE TABLE \"cron_job_records\" (\
-                 \"id\" TEXT NOT NULL, \"name\" TEXT NOT NULL, \"schedule\" TEXT NOT NULL, \
-                 \"kind\" TEXT NOT NULL, \"command\" TEXT NOT NULL, \"args\" TEXT NOT NULL, \
-                 \"workdir\" TEXT NOT NULL, \"timeout_secs\" BIGINT NOT NULL, \
-                 \"prompt\" TEXT NOT NULL, \"skills\" TEXT NOT NULL, \"status\" TEXT NOT NULL, \
-                 \"catch_up\" TEXT NOT NULL, \"next_run_at\" BIGINT NOT NULL, \
-                 \"last_run_at\" BIGINT NOT NULL, \"last_status\" TEXT NOT NULL, \
-                 \"last_error\" TEXT NOT NULL, \"last_output\" TEXT NOT NULL, \
-                 \"last_run_session\" TEXT NOT NULL, \"grants\" TEXT NOT NULL, \
-                 \"created_at\" BIGINT NOT NULL, PRIMARY KEY (\"id\"))",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO \"cron_job_records\" VALUES \
-                 ('id-1', 'nightly', '0 3 * * *', 'agent', '', '', '', 0, 'back up', '[]', \
-                 'active', 'late', 3000, 2000, 'failed', '', 'disk full', 'sess-1', '', 100)",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO \"cron_job_records\" VALUES \
-                 ('id-2', 'reboot', '@at 2024-01-02 09:30', 'command', '/sbin/reboot', '[]', \
-                 '', 900, '', '', 'done', 'late', 1704155400, 1704155400, 'ok', '', 'done', \
-                 '', '', 100)",
-            (),
-        )
-        .await
-        .unwrap();
-    }
-    std::fs::write(
-        crate::persistence::turso_marker_path(&path),
-        b"turso-native\n",
-    )
-    .unwrap();
-
-    let db = Db::connect(&format!("turso:{}", path.display()))
-        .await
-        .unwrap();
-    let nightly = db.find_by_name("nightly").await.unwrap().unwrap();
-    assert_eq!(nightly.trigger, Trigger::cron("0 3 * * *"));
-    assert_eq!(nightly.notify, NotifyPolicy::Always);
-    let run = nightly.last_run().expect("last_* became one run");
-    assert_eq!(run.status, RoutineRunStatus::Error);
-    assert_eq!(run.started_at, 2000);
-    assert_eq!(run.output, "disk full");
-    assert_eq!(run.session_id.as_deref(), Some("sess-1"));
-
-    // A spent one-shot keeps the moment it named — a `Trigger::At`, past or
-    // not, because the record still has to say what it was.
-    let reboot = db.find_by_name("reboot").await.unwrap().unwrap();
-    let Trigger::At { at } = reboot.trigger else {
-        panic!(
-            "an `@at` schedule becomes a one-shot moment: {:?}",
-            reboot.trigger
-        );
-    };
-    assert_eq!(
-        at,
-        komo_core::domain::cron::once_moment_local("@at 2024-01-02 09:30").unwrap()
-    );
-    assert_eq!(reboot.status, CronJobStatus::Done);
-    assert_eq!(
-        reboot.last_run().map(|r| r.status),
-        Some(RoutineRunStatus::Ok)
-    );
-
-    // Idempotent: connecting again repairs nothing and changes nothing.
-    drop(db);
-    let db = Db::connect(&format!("turso:{}", path.display()))
-        .await
-        .unwrap();
-    assert_eq!(
-        db.find_by_name("nightly").await.unwrap().unwrap().runs,
-        nightly.runs,
-        "a second connect must not re-append the imported run"
-    );
 }
 
 #[tokio::test]

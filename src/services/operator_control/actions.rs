@@ -17,7 +17,7 @@ use komo_core::domain::context::SessionOrigin;
 use komo_core::domain::cron::{CronJob, CronJobRepository, CronJobSpec};
 use komo_core::domain::home::HomeRepository;
 use komo_core::domain::memory::{
-    DreamVerdict, Memory, MemoryRepository, MemoryScope, MemoryStatus, dream_score, dream_verdict,
+    DreamVerdict, Memory, MemoryRepository, MemoryStatus, dream_score, dream_verdict,
 };
 use komo_core::domain::message::Message;
 use komo_core::domain::pairing::{
@@ -233,11 +233,6 @@ impl OperatorActions {
         apply_memory_transition(self.memories.as_ref(), id, action, now()).await
     }
 
-    /// Widen memories stranded in an ephemeral `api` channel scope to `Global`.
-    pub async fn repair_memory_scopes(&self) -> anyhow::Result<usize> {
-        repair_memory_scopes(self.memories.as_ref()).await
-    }
-
     /// Ranked memory search — the operator's view of the same hybrid query
     /// recall and the model's `memory search` run.
     pub async fn memory_search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<Memory>> {
@@ -382,27 +377,6 @@ pub async fn apply_memory_transition(
     Ok(TransitionOutcome::Applied(Box::new(memory)))
 }
 
-/// The channel scope komo's local surfaces used to write from, back when a
-/// local conversation was modelled as a chat on an `api` platform whose chat id
-/// was a fresh uuid per conversation. No new memory can carry it — a local turn
-/// has no correspondent at all now — but memories are durable, so rows written
-/// while it could still exist and still need widening.
-const RETIRED_LOCAL_CHANNEL: &str = "api";
-
-/// Widen every memory stuck in an ephemeral `api` channel scope to `Global`,
-/// returning how many were moved.
-///
-/// A one-shot repair for memories written before `MemoryContext::write_scope`
-/// learned that `api` chat ids are per-conversation (see
-/// `RETIRED_LOCAL_CHANNEL`). Those memories name a
-/// conversation that has ended, so no later turn can ever recall them — they
-/// are invisible rather than private, and widening them to `Global` restores
-/// exactly the reach they were meant to have.
-///
-/// Deliberately operator-invoked rather than run at startup: this rewrites
-/// durable personal data, so it is the operator's call, not a silent migration.
-/// Idempotent — a second run finds nothing left to move. Only `api` scopes are
-/// touched; a real chat channel's scope is a privacy boundary and stays put.
 /// Ranked memory search over the whole library, one implementation for both
 /// operator paths (gateway and direct).
 ///
@@ -434,25 +408,6 @@ pub async fn search_memories(
             .map(|scored| scored.memory)
             .collect(),
     )
-}
-
-pub async fn repair_memory_scopes(memories: &dyn MemoryRepository) -> anyhow::Result<usize> {
-    let mut repaired = 0usize;
-    for mut memory in memories.list().await? {
-        let MemoryScope::Channel { platform, .. } = &memory.scope else {
-            continue;
-        };
-        if platform != RETIRED_LOCAL_CHANNEL {
-            continue;
-        }
-        memory.scope = MemoryScope::Global;
-        // `updated_at` untouched: this corrects where a memory is visible, not
-        // what it says, and the recency signal should keep reflecting the last
-        // real edit.
-        memories.save(&memory).await?;
-        repaired += 1;
-    }
-    Ok(repaired)
 }
 
 /// Summaries only — a list view never dumps full transcripts.
@@ -551,61 +506,6 @@ mod tests {
         let mut s = Session::new(id);
         s.status = status.to_string();
         s
-    }
-
-    /// The repair widens only the ephemeral `api` scopes, leaves a real chat
-    /// channel's privacy boundary alone, and is safe to run twice.
-    #[tokio::test]
-    async fn repairing_scopes_widens_only_ephemeral_api_channels() {
-        use std::sync::Mutex;
-
-        struct Store(Mutex<Vec<Memory>>);
-        #[async_trait::async_trait]
-        impl MemoryRepository for Store {
-            async fn save(&self, memory: &Memory) -> anyhow::Result<()> {
-                let mut rows = self.0.lock().unwrap();
-                if let Some(slot) = rows.iter_mut().find(|m| m.id == memory.id) {
-                    *slot = memory.clone();
-                }
-                Ok(())
-            }
-            async fn list(&self) -> anyhow::Result<Vec<Memory>> {
-                Ok(self.0.lock().unwrap().clone())
-            }
-        }
-
-        let scoped = |scope: MemoryScope| {
-            let mut m = Memory::new(MemoryKind::Fact, "a fact");
-            m.scope = scope;
-            m
-        };
-        let store = Store(Mutex::new(vec![
-            scoped(MemoryScope::Channel {
-                platform: "api".into(),
-                chat_id: "019fb0ce-9f7a-7c23".into(),
-            }),
-            scoped(MemoryScope::Channel {
-                platform: "feishu".into(),
-                chat_id: "ou_445299e2".into(),
-            }),
-            scoped(MemoryScope::Global),
-        ]));
-
-        assert_eq!(repair_memory_scopes(&store).await.unwrap(), 1);
-        let rows = store.list().await.unwrap();
-        assert_eq!(rows[0].scope, MemoryScope::Global, "api scope widened");
-        assert_eq!(
-            rows[1].scope,
-            MemoryScope::Channel {
-                platform: "feishu".into(),
-                chat_id: "ou_445299e2".into(),
-            },
-            "a chat channel's scope is a privacy boundary and must survive"
-        );
-        assert_eq!(rows[2].scope, MemoryScope::Global);
-
-        // Idempotent: a second run finds nothing left to move.
-        assert_eq!(repair_memory_scopes(&store).await.unwrap(), 0);
     }
 
     #[test]

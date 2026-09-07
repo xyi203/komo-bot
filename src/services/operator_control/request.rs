@@ -84,8 +84,6 @@ pub enum OperatorCommand {
     PairRevoke { id: String },
     /// Run one dreaming consolidation cycle.
     DreamApply,
-    /// Widen memories stranded in an ephemeral `api` channel scope to `Global`.
-    MemoryRepairScopes,
     /// Embed every memory that still lacks a current vector, and wait for it.
     /// Minutes-long on a library that has never been embedded: the gateway
     /// adapter gives this the same long timeout `ChunkIndex` gets.
@@ -126,10 +124,6 @@ pub enum OperatorCommandResult {
     DreamApplied {
         promoted: usize,
         archived: usize,
-    },
-    /// How many memories were widened to `Global`.
-    MemoryScopesRepaired {
-        repaired: usize,
     },
     /// How many memories gained an embedding.
     MemoryBackfilled {

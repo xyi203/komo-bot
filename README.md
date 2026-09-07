@@ -122,10 +122,8 @@ The agent can call these during a chat turn:
 ## Data Layout
 
 Everything lives in `~/.komo/` by default, or under `KOMO_HOME` when set.
-During upgrades from the former `shion` name, an existing `~/.shion` directory
-and `SHION_HOME` / `SHION_*` overrides remain compatibility fallbacks; any
-`komo`-named path or variable takes precedence. `komo gateway start/restart`
-also unloads the former launchd job before installing `com.komo.gateway`.
+`komo gateway start/restart` unloads the former launchd job before installing
+`com.komo.gateway`.
 
 | Path | Purpose | Durability |
 |---|---|---|

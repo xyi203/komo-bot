@@ -10,14 +10,13 @@
 
 use std::path::Path;
 
-use anyhow::Context;
 use async_trait::async_trait;
 
 use super::db::Db;
 use crate::persistence::with_write_retry;
 use komo_core::domain::cron::{
-    CronAction, CronJob, CronJobRepository, RoutineRun, Trigger, once_moment_local, parse_catch_up,
-    parse_cron_job_status, parse_notify_policy, parse_routine_run_status, schedule_is_once,
+    CronAction, CronJob, CronJobRepository, RoutineRun, Trigger, parse_catch_up,
+    parse_cron_job_status, parse_notify_policy,
 };
 use komo_core::domain::policy::RuleSpec;
 
@@ -59,8 +58,8 @@ pub(crate) struct CronJobRecord {
     // Retired columns, still written because the table is durable: dropping a
     // column is a non-additive change, and one declared NOT NULL without a
     // default fails every insert that stops mentioning it. `trigger` replaced
-    // `schedule`, `runs` replaced the four `last_*` run fields; both were
-    // read once by `backfill_triggers` and are dead from then on.
+    // `schedule`, `runs` replaced the four `last_*` run fields; nothing reads
+    // them.
     schedule: String,
     last_run_at: i64,
     last_status: String,
@@ -91,171 +90,7 @@ const EXPECTED: &[(&str, &str)] = &[
 /// Bring an existing file's `cron_job_records` up to the current column set,
 /// before toasty opens it.
 pub(crate) async fn ensure_schema(path: &Path) -> anyhow::Result<()> {
-    crate::persistence::ensure_columns(path, "cron_job_records", EXPECTED).await?;
-    migrate_enabled_to_status(path).await?;
-    backfill_triggers(path).await
-}
-
-/// Every job in a legacy `cron.db`, for the one-time merge into `komo.db`.
-///
-/// The old file gets its own schema upkeep first: a `cron.db` written before
-/// `status` existed still has `enabled`, and opening it with the current model
-/// would fail on the columns it lacks.
-pub(crate) async fn import_from(path: &Path) -> anyhow::Result<Vec<CronJob>> {
-    ensure_schema(path).await?;
-    let db = toasty::Db::builder()
-        .models(toasty::models!(CronJobRecord))
-        .connect(&format!("turso:{}", path.display()))
-        .await
-        .with_context(|| format!("opening {} to merge it in", path.display()))?;
-    let mut conn = db.connection().await?;
-    let rows = toasty::query!(CronJobRecord).exec(&mut conn).await?;
-    rows.into_iter()
-        .filter_map(|record| job_from_record(record).transpose())
-        .collect()
-}
-
-/// One-time migration from the pre-status schema: `enabled` (0/1) becomes the
-/// stored `status` ('active'/'paused'), and the old column is dropped so it
-/// cannot fork from the new authority (and so inserts, which no longer supply
-/// it, don't trip its NOT NULL). Idempotent: a db without `enabled` is a no-op.
-/// Runs on a direct turso handle before toasty's pool connects, like
-/// `ensure_columns`.
-async fn migrate_enabled_to_status(path: &std::path::Path) -> anyhow::Result<()> {
-    use anyhow::Context;
-
-    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-        .build()
-        .await
-        .with_context(|| format!("opening {} for status migration", path.display()))?;
-    let conn = db.connect()?;
-    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
-
-    let mut has_enabled = false;
-    let mut rows = conn
-        .query("PRAGMA table_info(\"cron_job_records\")", ())
-        .await
-        .context("reading cron_job_records columns")?;
-    while let Some(row) = rows.next().await? {
-        if let turso::Value::Text(name) = row.get_value(1)?
-            && name == "enabled"
-        {
-            has_enabled = true;
-        }
-    }
-    if !has_enabled {
-        return Ok(());
-    }
-    conn.execute(
-        "UPDATE \"cron_job_records\" SET \"status\" = \
-         CASE WHEN \"enabled\" = 0 THEN 'paused' ELSE 'active' END",
-        (),
-    )
-    .await
-    .context("backfilling status from enabled")?;
-    conn.execute(
-        "ALTER TABLE \"cron_job_records\" DROP COLUMN \"enabled\"",
-        (),
-    )
-    .await
-    .context("dropping the legacy enabled column")?;
-    tracing::info!("migrated cron.db: enabled column replaced by status");
-    Ok(())
-}
-
-/// One-time repair of rows written before `Trigger` and `runs` existed: the old
-/// `schedule` string becomes a stored trigger, and the four `last_*` fields
-/// become the single run they described.
-///
-/// A **repair**, not a read-path fallback: the read path knows only the new
-/// columns, so nothing downstream branches on which shape a row was written in.
-/// Idempotent by construction — only rows whose `trigger` is still empty are
-/// touched, and every row this writes gets a non-empty one. The retired columns
-/// are left where they are: `cron_job_records` is durable, and dropping a column
-/// is not an additive change.
-async fn backfill_triggers(path: &Path) -> anyhow::Result<()> {
-    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-        .build()
-        .await
-        .with_context(|| format!("opening {} for the trigger backfill", path.display()))?;
-    let conn = db.connect()?;
-    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
-
-    let mut pending = Vec::new();
-    let mut rows = match conn
-        .query(
-            "SELECT \"id\", \"schedule\", \"last_run_at\", \"last_status\", \"last_output\", \
-             \"last_run_session\" FROM \"cron_job_records\" WHERE \"trigger\" = ''",
-            (),
-        )
-        .await
-    {
-        Ok(rows) => rows,
-        // No table yet: a brand-new file, which push_schema builds with the
-        // current columns and nothing to repair.
-        Err(_) => return Ok(()),
-    };
-    while let Some(row) = rows.next().await? {
-        let text = |i: usize| -> anyhow::Result<String> {
-            Ok(match row.get_value(i)? {
-                turso::Value::Text(s) => s,
-                _ => String::new(),
-            })
-        };
-        let number = |i: usize| -> anyhow::Result<i64> {
-            Ok(match row.get_value(i)? {
-                turso::Value::Integer(n) => n,
-                _ => 0,
-            })
-        };
-        pending.push((text(0)?, text(1)?, number(2)?, text(3)?, text(4)?, text(5)?));
-    }
-    if pending.is_empty() {
-        return Ok(());
-    }
-
-    for (id, schedule, last_run_at, last_status, last_output, last_run_session) in &pending {
-        let trigger = trigger_from_schedule(schedule);
-        let runs = match (*last_run_at != 0) || !last_status.is_empty() {
-            true => vec![RoutineRun {
-                id: uuid::Uuid::now_v7().to_string(),
-                status: parse_routine_run_status(last_status),
-                started_at: *last_run_at,
-                session_id: (!last_run_session.is_empty()).then(|| last_run_session.clone()),
-                output: last_output.clone(),
-            }],
-            false => Vec::new(),
-        };
-        conn.execute(
-            "UPDATE \"cron_job_records\" SET \"trigger\" = ?, \"runs\" = ? WHERE \"id\" = ?",
-            turso::params![
-                serde_json::to_string(&trigger)?,
-                encode_runs(&runs)?,
-                id.clone()
-            ],
-        )
-        .await
-        .with_context(|| format!("backfilling trigger for cron job {id}"))?;
-    }
-    tracing::info!(
-        jobs = pending.len(),
-        "backfilled cron triggers and run history from the schedule/last_* columns"
-    );
-    Ok(())
-}
-
-/// The pre-`Trigger` schedule string as a trigger. `@at` resolves to the moment
-/// it named — past included, since a spent one-shot still has to say what it
-/// was — and anything else is the cron expression it always was; an expression
-/// that no longer parses stays stored, and the sweep pauses the job with the
-/// reason, exactly as it did before.
-fn trigger_from_schedule(schedule: &str) -> Trigger {
-    if schedule_is_once(schedule)
-        && let Ok(at) = once_moment_local(schedule)
-    {
-        return Trigger::At { at };
-    }
-    Trigger::cron(schedule)
+    crate::persistence::ensure_columns(path, "cron_job_records", EXPECTED).await
 }
 
 #[async_trait]

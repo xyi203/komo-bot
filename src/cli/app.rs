@@ -362,10 +362,6 @@ enum MemoryAction {
     /// Interactively triage the candidate pile (oldest first): p=promote,
     /// r=reject, s=skip, q=quit
     Triage,
-    /// Widen memories stranded in a per-conversation `api` scope to global, so
-    /// recall can reach them again. Safe to re-run; chat-channel scopes are
-    /// left alone.
-    RepairScopes,
     /// Embed every memory that still lacks a current vector.
     ///
     /// Recall embeds lazily — one small batch per read — which leaves a library
@@ -582,7 +578,6 @@ pub async fn run() -> anyhow::Result<()> {
                 MemoryAction::Reject { ids } => memory::reject(&control, &ids).await,
                 MemoryAction::Pin { id } => memory::pin(&control, &id).await,
                 MemoryAction::Triage => memory::triage(&control).await,
-                MemoryAction::RepairScopes => memory::repair_scopes(&control).await,
                 MemoryAction::Backfill => memory::backfill(&control).await,
             }
         }

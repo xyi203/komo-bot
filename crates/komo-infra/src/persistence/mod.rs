@@ -14,23 +14,6 @@ pub mod wakeup;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Sidecar marker recording that a db file is Turso-native (migrated or born
-/// that way), so startup never re-migrates it or misreads it as a legacy SQLite
-/// file. Lives next to the db as `<name>.turso`.
-pub(crate) fn turso_marker_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(".turso");
-    PathBuf::from(s)
-}
-
-/// Where a legacy SQLite db file is preserved after the engine switch. Kept (not
-/// deleted) so the data can be recovered/verified by hand. `<name>.sqlite-backup`.
-pub(crate) fn sqlite_backup_path(path: &Path) -> PathBuf {
-    let mut s = path.as_os_str().to_os_string();
-    s.push(".sqlite-backup");
-    PathBuf::from(s)
-}
-
 /// Bring an existing `table` up to the current model shape by adding any
 /// columns it lacks, in place — an additive `ALTER TABLE ADD COLUMN` so
 /// existing rows take the default and **no data is lost**. Idempotent: a column
@@ -45,69 +28,6 @@ pub(crate) fn sqlite_backup_path(path: &Path) -> PathBuf {
 /// `expected` maps column name → full column DDL. Every column listed MUST be
 /// `NOT NULL` with a `DEFAULT` (or be nullable), or `ALTER TABLE ADD COLUMN`
 /// fails on a non-empty table.
-/// Drop columns this komo no longer models, if the file still has them.
-///
-/// The dual of [`ensure_columns`], and the reason it has to exist: removing a
-/// field from a model removes it from *new* files only. Every store already on
-/// disk keeps the column — and a column declared `NOT NULL` without a default
-/// (which is what `push_schema` writes for a plain `String` field) then fails
-/// every insert that no longer mentions it. The store does not report a schema
-/// problem; it just stops accepting writes.
-///
-/// Best-effort per column: a drop that fails is logged and skipped, because a
-/// store that is merely carrying a dead column is in better shape than one that
-/// refuses to open.
-pub(crate) async fn drop_retired_columns(
-    path: &Path,
-    table: &str,
-    retired: &[&str],
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-
-    let db = turso::Builder::new_local(path.to_string_lossy().as_ref())
-        .build()
-        .await
-        .with_context(|| format!("opening {} to retire columns", path.display()))?;
-    let conn = db.connect()?;
-    conn.pragma_update("journal_mode", "'mvcc'").await.ok();
-
-    let mut existing = std::collections::HashSet::new();
-    let mut rows = conn
-        .query(&format!("PRAGMA table_info(\"{table}\")"), ())
-        .await
-        .with_context(|| format!("reading {table} columns"))?;
-    while let Some(row) = rows.next().await? {
-        if let turso::Value::Text(name) = row.get_value(1)? {
-            existing.insert(name);
-        }
-    }
-    if existing.is_empty() {
-        return Ok(());
-    }
-
-    for name in retired {
-        if !existing.contains(*name) {
-            continue;
-        }
-        match conn
-            .execute(
-                &format!("ALTER TABLE \"{table}\" DROP COLUMN \"{name}\""),
-                (),
-            )
-            .await
-        {
-            Ok(_) => tracing::info!(column = name, table, "dropped retired column in place"),
-            Err(error) => tracing::warn!(
-                column = name,
-                table,
-                %error,
-                "could not drop a retired column; writes may fail if it is NOT NULL"
-            ),
-        }
-    }
-    Ok(())
-}
-
 pub(crate) async fn ensure_columns(
     path: &Path,
     table: &str,
@@ -190,60 +110,33 @@ pub(crate) async fn ensure_table(path: &Path, table: &str, ddl: &[&str]) -> anyh
     Ok(())
 }
 
-/// Shared prologue for every Turso-backed `connect(url)`: parse the
-/// `turso:<path>` url to its bare filesystem path (`None` for in-memory), ensure
-/// the parent dir exists, stage any legacy SQLite file aside, and report whether
-/// the live file is new (so the caller knows to `push_schema`). The per-db
-/// migration/model wiring that follows genuinely differs, so only this identical
-/// prologue is shared — the three `connect`s each duplicated it verbatim.
-pub(crate) fn prepare_turso_path(url: &str) -> anyhow::Result<(Option<PathBuf>, bool)> {
+/// Shared prologue for the Turso-backed `connect(url)`: parse the
+/// `turso:<path>` url to its bare filesystem path (`None` for in-memory),
+/// ensure the parent dir exists, and report whether the live file is new (so
+/// the caller knows to `push_schema`).
+pub(crate) fn prepare_turso_path(url: &str) -> (Option<PathBuf>, bool) {
     let path = url
         .strip_prefix("turso:")
         .filter(|p| *p != ":memory:")
         .map(PathBuf::from);
-    if let Some(p) = &path {
-        if let Some(dir) = p.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
-        stage_sqlite_backup(p)?;
+    if let Some(p) = &path
+        && let Some(dir) = p.parent()
+    {
+        std::fs::create_dir_all(dir).ok();
     }
     let is_new = path.as_deref().map(|p| !p.exists()).unwrap_or(true);
-    Ok((path, is_new))
+    (path, is_new)
 }
 
-/// If `path` is a legacy SQLite file (no Turso marker, no backup staged yet),
-/// move it aside to its `.sqlite-backup` so Turso opens a fresh db at `path`.
-/// Idempotent: a no-op once a marker or backup exists, or the file is absent.
-/// The rows are re-imported from the backup afterwards where they matter
-/// (`memory_db::import_from`); the backup is kept either way as a safety net.
-pub(crate) fn stage_sqlite_backup(path: &Path) -> anyhow::Result<()> {
-    let marker = turso_marker_path(path);
-    let backup = sqlite_backup_path(path);
-    if marker.exists() || backup.exists() || !path.exists() {
-        return Ok(());
-    }
-    std::fs::rename(path, &backup)
-        .map_err(|e| anyhow::anyhow!("staging sqlite backup at {}: {e}", backup.display()))?;
-    Ok(())
-}
-
-/// Remove a test db and every sidecar Turso/SQLite/migration may leave next to
-/// it (`-log`/`-wal`/`-shm`/`-journal`, plus our `.turso`/`.sqlite-backup`), so a
-/// reused temp path starts clean. A stale MVCC `-log` against a fresh header is
-/// read as corruption, so this must be thorough.
+/// Remove a test db and every sidecar Turso may leave next to it
+/// (`-log`/`-wal`/`-shm`/`-journal`), so a reused temp path starts clean. A
+/// stale MVCC `-log` against a fresh header is read as corruption, so this must
+/// be thorough.
 /// Exposed to dependent crates' tests through the `test-support` feature (the
 /// agent's own tests reuse it), so it still never exists in a release build.
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_test_db(path: &Path) {
-    for suffix in [
-        "",
-        "-log",
-        "-wal",
-        "-shm",
-        "-journal",
-        ".turso",
-        ".sqlite-backup",
-    ] {
+    for suffix in ["", "-log", "-wal", "-shm", "-journal"] {
         let mut p = path.as_os_str().to_os_string();
         p.push(suffix);
         let _ = std::fs::remove_file(PathBuf::from(p));

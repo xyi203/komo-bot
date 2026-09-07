@@ -4,8 +4,7 @@
 //! The strictest durability rule in the repository lives here: this table may
 //! **only ever change additively**. It had its own file (`memory.db`) until
 //! docs/adr/0004 moved that guarantee to the table; the file is gone, the rule
-//! is not. Markdown (`md_memory.rs`) stays an import/export format, never the
-//! canonical backend.
+//! is not.
 //!
 //! Schema is laid out **schema-first**: governance/scope/usage columns land all
 //! at once even before every consumer exists, because toasty's `push_schema`
@@ -13,10 +12,8 @@
 
 use std::path::Path;
 
-use anyhow::Context;
 use async_trait::async_trait;
 
-use crate::memory::md_memory::MdMemoryStore;
 use crate::persistence::db::Db;
 use crate::persistence::with_write_retry;
 use komo_core::domain::memory::{
@@ -123,65 +120,10 @@ fn decode_evidence(encoded: &str) -> Vec<Evidence> {
     serde_json::from_str(encoded).unwrap_or_default()
 }
 
-/// Connection to the memory database. Holds only `MemoryRecord`.
-///
-/// Backed by the Turso engine with a per-operation connection pool: `inner` is a
-/// plain `Arc<toasty::Db>` (no outer `Mutex`), and every method checks out a
-/// pooled `Connection`, so independent reads/writes run concurrently. Writes use
-/// Turso's MVCC concurrent-write mode and retry on commit conflict (see
-/// `infra::persistence::with_write_retry`).
-/// Every memory in a legacy `memory.db`, for the one-time merge into
-/// `komo.db`.
-///
-/// The old file is brought up to the current column set first — a `memory.db`
-/// written before `belief_state` (or with the retired `recall_query_hashes`
-/// still on it) cannot be read through today's model — and a pre-Turso SQLite
-/// file is opened with the SQLite driver, because that per-store migration ran
-/// here before the merge and dropping the path would strand anyone who had not
-/// upgraded through it.
-pub(crate) async fn import_from(path: &Path) -> anyhow::Result<Vec<Memory>> {
-    let native = crate::persistence::turso_marker_path(path).exists();
-    if native {
-        ensure_columns(path).await?;
-    }
-    let url = match native {
-        true => format!("turso:{}", path.display()),
-        false => format!("sqlite:{}", path.display()),
-    };
-    let db = toasty::Db::builder()
-        .models(toasty::models!(MemoryRecord))
-        .connect(&url)
-        .await
-        .with_context(|| format!("opening {} to merge it in", path.display()))?;
-    let mut conn = db.connection().await?;
-    let rows = toasty::query!(MemoryRecord).exec(&mut conn).await?;
-    Ok(rows.into_iter().map(memory_from_record).collect())
-}
-
 /// Bring an existing file's `memory_records` up to the current column set,
 /// before toasty opens it.
 pub(crate) async fn ensure_schema(path: &Path) -> anyhow::Result<()> {
     ensure_columns(path).await
-}
-
-impl Db {
-    /// One-time migration: import every memory from a legacy markdown directory
-    /// into a freshly-created db. No-op when the directory is absent or the db
-    /// already holds memories (so it is safe to call on every startup). Returns
-    /// the number imported.
-    pub async fn import_legacy_markdown(&self, dir: &Path) -> anyhow::Result<usize> {
-        // Only seed an empty db — never double-import or fight live writes.
-        if !self.list().await?.is_empty() {
-            return Ok(0);
-        }
-        let legacy = MdMemoryStore::new(dir.to_path_buf());
-        let memories = legacy.read_all().await?;
-        let count = memories.len();
-        for memory in &memories {
-            self.save(memory).await?;
-        }
-        Ok(count)
-    }
 }
 
 fn record_from_memory(memory: &Memory) -> MemoryRecord {
@@ -385,18 +327,7 @@ async fn ensure_columns(path: &Path) -> anyhow::Result<()> {
             "\"embedding_model\" text NOT NULL DEFAULT ''",
         ),
     ];
-    crate::persistence::ensure_columns(path, "memory_records", EXPECTED).await?;
-
-    // Columns this komo no longer models. `recall_query_hashes` backed the
-    // dream-promotion query-diversity signal, added 2026-07-03 and dropped when
-    // promotion moved to truth signals (2026-08-12) — but dropping it from the
-    // model left it in every store built in between, `NOT NULL` and with no
-    // default, so every insert after the upgrade failed the constraint and the
-    // store silently stopped accepting memories. Durable data may only change
-    // additively (see AGENTS.md); this is the repair for the one time it did
-    // not.
-    const RETIRED: &[&str] = &["recall_query_hashes"];
-    crate::persistence::drop_retired_columns(path, "memory_records", RETIRED).await
+    crate::persistence::ensure_columns(path, "memory_records", EXPECTED).await
 }
 
 #[cfg(test)]

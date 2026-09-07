@@ -9,17 +9,15 @@ use crate::memory::memory_db::MemoryRecord;
 use crate::persistence::cron::CronJobRecord;
 use crate::persistence::wakeup::{WAKEUP_TABLE, WAKEUP_TABLE_DDL, WakeupRecord};
 use crate::persistence::{
-    DEFAULT_POOL_SIZE, drop_retired_columns, ensure_columns, ensure_table, prepare_turso_path,
-    session_event_store::SessionEventStore, turso_marker_path, with_write_retry,
+    DEFAULT_POOL_SIZE, ensure_columns, ensure_table, prepare_turso_path,
+    session_event_store::SessionEventStore, with_write_retry,
 };
 
 use komo_core::domain::{
     awaiting::{Awaiting, project_awaiting},
     context::SessionOrigin,
-    cron::CronJobRepository,
     home::HomeRepository,
     inbox::{InboundOrigin, InboxClaim, InboxRepository, UnfinishedInbound},
-    memory::MemoryRepository,
     message::Message,
     pairing::{
         APPROVE_LOCKOUT_SECS, APPROVE_MAX_FAILURES, ApproveOutcome, PAIRING_CODE_TTL_SECS,
@@ -81,9 +79,7 @@ struct SessionRecord {
     awaiting: String,
 }
 
-/// Columns added to `session_records` after a file was created. Read by
-/// `connect` for the live `komo.db` and by the one-time merge for a legacy
-/// `state.db`, which may predate any of them.
+/// Columns added to `session_records` after a file was created.
 const SESSION_COLUMNS: &[(&str, &str)] = &[
     ("title", "\"title\" text NOT NULL DEFAULT ''"),
     ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
@@ -346,13 +342,8 @@ pub struct Db {
 
 impl Db {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        // `url` is `turso:<path>` (or `turso::memory:`). state.db is disposable
-        // (sessions, messages, runs, pairings, settings): a legacy SQLite file
-        // can't be reopened under Turso's MVCC mode, so `prepare_turso_path`
-        // stages it aside to a `.sqlite-backup` (kept as a safety net) and we
-        // start fresh. Durable personal data lives in memory.db, which
-        // migrates its rows instead of resetting.
-        let (path, is_new) = prepare_turso_path(url)?;
+        // `url` is `turso:<path>` (or `turso::memory:`).
+        let (path, is_new) = prepare_turso_path(url);
 
         // Additive in-place migration for an EXISTING db: `push_schema` only
         // runs for new files, so a column added to a model after the file was
@@ -364,14 +355,6 @@ impl Db {
         // *table* still needs the delete-to-reset.
         if !is_new && let Some(p) = &path {
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
-            // Columns this komo no longer models. `reviewed_through` was the
-            // review sweep's per-session watermark until the watermark moved to
-            // `Run.learned` — but dropping it from the model left it in every
-            // file whose push_schema ran while it existed, `NOT NULL` and with
-            // no default, so creating any new session failed the constraint.
-            // Same repair as memory.db's `recall_query_hashes`.
-            const SESSION_RETIRED: &[&str] = &["reviewed_through"];
-            drop_retired_columns(p, "session_records", SESSION_RETIRED).await?;
             const RUN_COLUMNS: &[(&str, &str)] = &[
                 (
                     "recoverable",
@@ -444,11 +427,6 @@ impl Db {
 
         if is_new {
             db.push_schema().await?;
-            // Mark the file Turso-native so a future run never mistakes it for a
-            // legacy SQLite file to stage aside.
-            if let Some(p) = &path {
-                std::fs::write(turso_marker_path(p), b"turso-native\n").ok();
-            }
         }
 
         // Transcripts sit beside state.db, so `KOMO_HOME` carries them without
@@ -477,20 +455,11 @@ impl Db {
             .await?,
         );
 
-        let this = Self {
+        Ok(Self {
             inner: Arc::new(db),
             events,
             raw,
-        };
-
-        // The one-time merge (docs/adr/0004). Only for a `komo.db` that was
-        // just created: the old files are renamed once their rows are in, so a
-        // second run has nothing to find.
-        if is_new && let Some(p) = &path {
-            this.merge_legacy_databases(p).await?;
-        }
-
-        Ok(this)
+        })
     }
 
     /// A [`ChunkIndex`](komo_core::domain::chunk_index::ChunkIndex) over this
@@ -502,139 +471,6 @@ impl Db {
     ) -> anyhow::Result<crate::chunk_index::TursoChunkIndex> {
         crate::chunk_index::TursoChunkIndex::open(self.raw.clone(), collection).await
     }
-
-    /// Import `state.db`, `cron.db` and `memory.db` from beside `path`, then
-    /// rename each to `<name>.merged-backup`.
-    ///
-    /// Durable data, so the order is: read the old file, write every row, and
-    /// only then rename it. A crash anywhere leaves the old file where it is
-    /// and `komo.db` partially filled — the next start re-imports, and every
-    /// row carries its own id, so a re-import overwrites rather than doubles.
-    ///
-    /// A file that cannot be read is **fatal**, not skipped: starting up with
-    /// an empty memory library while `memory.db` sits there unread is the
-    /// failure nobody would notice until they went looking for a memory.
-    ///
-    /// From `state.db` come the rows nothing can reconstruct: session metadata,
-    /// the settings (home session, `/sethome` override) and
-    /// pairings. The run ledger stays behind — its rows are a projection of the
-    /// session logs, which are files and were never in any of these databases,
-    /// and the only write path into them takes a fold of a log rather than a
-    /// stored row, so re-creating one from a legacy row would mean inventing
-    /// the `start_seq` and per-step `settled` the fold carries and the row does
-    /// not. [`Db::rebuild_projections`] is how an operator gets it back.
-    /// Inbox, todo and wakeup rows are transient and stay behind with it.
-    async fn merge_legacy_databases(&self, path: &Path) -> anyhow::Result<()> {
-        let dir = path.parent().unwrap_or(Path::new("."));
-        // Never the file being opened: a `db_url` pointing at one of these
-        // names would otherwise make the store import from itself and then
-        // rename itself away.
-        let legacy = |name: &str| {
-            let candidate = dir.join(name);
-            (candidate != path && candidate.is_file()).then_some(candidate)
-        };
-
-        if let Some(state) = legacy("state.db") {
-            let (sessions, pairings, settings) = import_state_from(&state).await?;
-            for session in &sessions {
-                SessionRepository::save(self, session).await?;
-            }
-            for request in &pairings {
-                PairingRepository::upsert(self, request).await?;
-            }
-            for (key, value) in &settings {
-                self.setting_set(key, value).await?;
-            }
-            retire_merged(&state)?;
-            info!(
-                sessions = sessions.len(),
-                pairings = pairings.len(),
-                settings = settings.len(),
-                "merged state.db into komo.db"
-            );
-        }
-
-        if let Some(jobs) = legacy("cron.db") {
-            let rows = super::cron::import_from(&jobs).await?;
-            for job in &rows {
-                CronJobRepository::save(self, job).await?;
-            }
-            retire_merged(&jobs)?;
-            info!(count = rows.len(), "merged cron.db into komo.db");
-        }
-
-        if let Some(memories) = legacy("memory.db") {
-            let rows = crate::memory::memory_db::import_from(&memories).await?;
-            for memory in &rows {
-                MemoryRepository::save(self, memory).await?;
-            }
-            retire_merged(&memories)?;
-            info!(count = rows.len(), "merged memory.db into komo.db");
-        }
-        Ok(())
-    }
-}
-
-/// The sessions, pairings and settings of a legacy `state.db`, for the
-/// one-time merge into `komo.db`.
-///
-/// Read through the same models the live store uses, after the old file gets
-/// the same column upkeep `connect` gives `komo.db` — a `state.db` written
-/// before any of those columns existed cannot be opened with this model. A
-/// pre-Turso file is opened with the SQLite driver, as `memory.db` is.
-/// Transcripts need nothing: they are files beside the db.
-async fn import_state_from(
-    path: &Path,
-) -> anyhow::Result<(Vec<Session>, Vec<PairingRequest>, Vec<(String, String)>)> {
-    use anyhow::Context;
-
-    ensure_columns(path, "session_records", SESSION_COLUMNS)
-        .await
-        .ok();
-    let url = match turso_marker_path(path).exists() {
-        true => format!("turso:{}", path.display()),
-        false => format!("sqlite:{}", path.display()),
-    };
-    let db = toasty::Db::builder()
-        .models(toasty::models!(SessionRecord, PairingRecord, SettingRecord))
-        .connect(&url)
-        .await
-        .with_context(|| format!("opening {} to merge it in", path.display()))?;
-    let mut conn = db.connection().await?;
-    let sessions = toasty::query!(SessionRecord).exec(&mut conn).await?;
-    let pairings = toasty::query!(PairingRecord).exec(&mut conn).await?;
-    let settings = toasty::query!(SettingRecord).exec(&mut conn).await?;
-    Ok((
-        sessions
-            .into_iter()
-            .map(|record| session_from_record(record, Vec::new()))
-            .collect(),
-        pairings.into_iter().map(pairing_from_record).collect(),
-        settings
-            .into_iter()
-            .map(|record| (record.id, record.value))
-            .collect(),
-    ))
-}
-
-/// Rename a merged file (and the sidecars that belong to it) aside. Kept rather
-/// than deleted: this is the operator's only copy of data that was durable by
-/// design, and the import is young code.
-fn retire_merged(path: &Path) -> anyhow::Result<()> {
-    for suffix in ["", "-log", "-wal", "-shm", ".turso"] {
-        let mut from = path.as_os_str().to_os_string();
-        from.push(suffix);
-        let from = PathBuf::from(from);
-        if !from.exists() {
-            continue;
-        }
-        let mut to = path.as_os_str().to_os_string();
-        to.push(".merged-backup");
-        to.push(suffix);
-        std::fs::rename(&from, PathBuf::from(to))
-            .map_err(|e| anyhow::anyhow!("retiring {} after the merge: {e}", from.display()))?;
-    }
-    Ok(())
 }
 
 // ── SessionRepository ─────────────────────────────────────────────────────────

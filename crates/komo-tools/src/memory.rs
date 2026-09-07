@@ -476,12 +476,12 @@ fn render_scored(hits: &[ScoredMemory]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_infra::memory::md_memory::MdMemoryStore;
+    use komo_infra::persistence::db::Db;
 
-    fn temp_tool(name: &str) -> MemoryTool {
-        let dir = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&dir);
-        let store: Arc<dyn MemoryRepository> = Arc::new(MdMemoryStore::new(dir));
+    /// The real store on an in-memory db, one per test.
+    async fn temp_tool() -> MemoryTool {
+        let store: Arc<dyn MemoryRepository> =
+            Arc::new(Db::connect("turso::memory:").await.expect("in-memory db"));
         // No embedding backend: the lexical arm alone, which is what a machine
         // with no Ollama running gets.
         let query = Arc::new(MemoryQueryService::new(store.clone()));
@@ -495,7 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn save_list_search_roundtrip() {
-        let tool = temp_tool("komo_mem_tool_test");
+        let tool = temp_tool().await;
 
         tool.call(json!({ "action": "save", "text": "用户喜欢蓝色" }), &ctx())
             .await
@@ -530,7 +530,7 @@ mod tests {
     /// all-candidate store must not read as "the store is empty".
     #[tokio::test]
     async fn list_filtered_to_nothing_reports_where_memories_are() {
-        let tool = temp_tool("komo_mem_tool_filler");
+        let tool = temp_tool().await;
         let mut cand = Memory::new(MemoryKind::Fact, "user prefers rebase before push");
         cand.status = MemoryStatus::Candidate;
         tool.memories.save(&cand).await.unwrap();
@@ -555,7 +555,7 @@ mod tests {
     /// (`parse_memory_status("")` would otherwise default to Active).
     #[tokio::test]
     async fn empty_string_args_are_treated_as_absent() {
-        let tool = temp_tool("komo_mem_tool_empty_args");
+        let tool = temp_tool().await;
         let mut cand = Memory::new(MemoryKind::Fact, "protoc lives in /opt/homebrew/bin");
         cand.status = MemoryStatus::Candidate;
         tool.memories.save(&cand).await.unwrap();
@@ -572,7 +572,7 @@ mod tests {
     /// the same call, so the two never coexist in recall.
     #[tokio::test]
     async fn save_with_supersedes_archives_the_outdated_memory() {
-        let tool = temp_tool("komo_mem_tool_supersede");
+        let tool = temp_tool().await;
         let mut old = Memory::new(MemoryKind::Preference, "User prefers Python for scripting");
         old.status = MemoryStatus::Active;
         tool.memories.save(&old).await.unwrap();
@@ -614,7 +614,7 @@ mod tests {
     /// contradiction while still in context.
     #[tokio::test]
     async fn save_reports_possibly_related_existing_memories() {
-        let tool = temp_tool("komo_mem_tool_related");
+        let tool = temp_tool().await;
         let mut old = Memory::new(MemoryKind::Preference, "User prefers Python for scripting");
         old.status = MemoryStatus::Active;
         tool.memories.save(&old).await.unwrap();
@@ -640,7 +640,7 @@ mod tests {
     /// An unrelated save stays quiet — the hint must not fire on every write.
     #[tokio::test]
     async fn save_with_no_overlap_reports_nothing_related() {
-        let tool = temp_tool("komo_mem_tool_unrelated");
+        let tool = temp_tool().await;
         let mut old = Memory::new(MemoryKind::Preference, "User prefers Python for scripting");
         old.status = MemoryStatus::Active;
         tool.memories.save(&old).await.unwrap();
@@ -660,7 +660,7 @@ mod tests {
     /// memory is not saved, nothing is archived.
     #[tokio::test]
     async fn save_with_unknown_supersede_id_writes_nothing() {
-        let tool = temp_tool("komo_mem_tool_supersede_unknown");
+        let tool = temp_tool().await;
         let err = tool
             .call(
                 json!({
@@ -679,7 +679,7 @@ mod tests {
     /// Placeholder shapes (`[]`, `[""]`) mean "no supersede", not an error.
     #[tokio::test]
     async fn empty_supersedes_placeholders_are_ignored() {
-        let tool = temp_tool("komo_mem_tool_supersede_empty");
+        let tool = temp_tool().await;
         let out = tool
             .call(
                 json!({ "action": "save", "text": "用户喜欢蓝色", "supersedes": [""] }),
@@ -693,7 +693,7 @@ mod tests {
 
     #[tokio::test]
     async fn promote_then_pin_via_update() {
-        let tool = temp_tool("komo_mem_tool_promote");
+        let tool = temp_tool().await;
         // A candidate (simulating a reviewer extraction).
         let mut cand = Memory::new(MemoryKind::Preference, "prefers concise answers");
         cand.status = MemoryStatus::Candidate;
@@ -721,7 +721,7 @@ mod tests {
     /// something as durable profile context got an unpinned memory and no error.
     #[tokio::test]
     async fn save_with_pinned_lands_in_the_l1_profile() {
-        let tool = temp_tool("komo_mem_tool_save_pinned");
+        let tool = temp_tool().await;
         let out = tool
             .call(
                 json!({ "action": "save", "text": "User keeps the AC at 24°C", "kind": "preference", "pinned": true }),
@@ -745,7 +745,7 @@ mod tests {
     /// up as pressure on the L1 budget either.
     #[tokio::test]
     async fn pinned_usage_ignores_a_superseded_memory() {
-        let tool = temp_tool("komo_mem_tool_pinned_usage");
+        let tool = temp_tool().await;
         let scope = MemoryContext::new("cli:test", None);
         let mut m = Memory::new(MemoryKind::Preference, "User keeps the AC at 26°C");
         m.pinned = true;
@@ -763,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn reject_and_archive_set_status() {
-        let tool = temp_tool("komo_mem_tool_reject");
+        let tool = temp_tool().await;
         let m = Memory::new(MemoryKind::Fact, "ephemeral");
         tool.memories.save(&m).await.unwrap();
 
@@ -778,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_unknown_id_errors() {
-        let tool = temp_tool("komo_mem_tool_unknown");
+        let tool = temp_tool().await;
         let err = tool
             .call(json!({ "action": "promote", "id": "nope" }), &ctx())
             .await

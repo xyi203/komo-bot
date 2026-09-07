@@ -22,9 +22,8 @@ pub struct ConfigSources {
     pub file: FileConfig,
     pub env: KomoEnv,
     pub secrets: Secrets,
-    /// Set when the `KOMO_*` environment (or a legacy `SHION_*` fallback)
-    /// failed strict parsing; its overrides are then dropped and resolution
-    /// records a fatal issue.
+    /// Set when the `KOMO_*` environment failed strict parsing; its overrides
+    /// are then dropped and resolution records a fatal issue.
     pub env_error: Option<String>,
 }
 
@@ -100,23 +99,10 @@ impl KomoEnv {
     }
 
     fn load_from_iter(vars: Vec<(String, String)>) -> anyhow::Result<Self> {
-        let current_keys = vars
-            .iter()
-            .filter(|(key, _)| key.starts_with("KOMO_"))
-            .map(|(key, _)| key.clone())
-            .collect::<std::collections::HashSet<_>>();
-        let legacy_vars = vars.iter().filter_map(|(key, value)| {
-            let suffix = key.strip_prefix("SHION_")?;
-            (!current_keys.contains(&format!("KOMO_{suffix}")))
-                .then(|| (key.clone(), value.clone()))
-        });
-        let legacy: KomoEnv = envy::prefixed("SHION_")
-            .from_iter(legacy_vars)
-            .map_err(|e| anyhow::anyhow!("invalid legacy SHION_* environment variable: {e}"))?;
-        let current: KomoEnv = envy::prefixed("KOMO_")
+        let env: KomoEnv = envy::prefixed("KOMO_")
             .from_iter(vars)
             .map_err(|e| anyhow::anyhow!("invalid KOMO_* environment variable: {e}"))?;
-        Ok(legacy.normalized().overlay(current.normalized()))
+        Ok(env.normalized())
     }
 
     /// Treat empty strings as unset, so `KOMO_MODEL=` behaves like an
@@ -137,39 +123,6 @@ impl KomoEnv {
                 *slot = None;
             }
         }
-        self
-    }
-
-    /// Overlay explicitly configured current-name values on legacy fallbacks.
-    fn overlay(mut self, current: Self) -> Self {
-        macro_rules! take_current {
-            ($($field:ident),+ $(,)?) => {
-                $(if current.$field.is_some() {
-                    self.$field = current.$field;
-                })+
-            };
-        }
-        take_current!(
-            provider,
-            model,
-            models,
-            base_url,
-            aux_model,
-            aux_effort,
-            schedule,
-            dream_schedule,
-            dream_schedule_enabled,
-            pyhost_enabled,
-            max_turns,
-            max_tool_result_bytes,
-            max_turn_result_bytes,
-            tool_timeout_secs,
-            max_history_messages,
-            max_history_bytes,
-            llm_timeout_secs,
-            review_interval,
-            skills_path,
-        );
         self
     }
 }
@@ -687,35 +640,6 @@ mod tests {
         .normalized();
         assert_eq!(env.provider.as_deref(), Some("openai"));
         assert_eq!(env.model, None);
-    }
-
-    #[test]
-    fn komo_env_values_override_legacy_fallbacks() {
-        let legacy = KomoEnv {
-            provider: Some("deepseek".into()),
-            model: Some("legacy-model".into()),
-            max_turns: Some(10),
-            ..Default::default()
-        };
-        let current = KomoEnv {
-            provider: Some("openai".into()),
-            max_turns: Some(30),
-            ..Default::default()
-        };
-        let merged = legacy.overlay(current);
-        assert_eq!(merged.provider.as_deref(), Some("openai"));
-        assert_eq!(merged.model.as_deref(), Some("legacy-model"));
-        assert_eq!(merged.max_turns, Some(30));
-    }
-
-    #[test]
-    fn current_env_shadows_a_malformed_legacy_value_before_parsing() {
-        let env = KomoEnv::load_from_iter(vec![
-            ("SHION_MAX_TURNS".into(), "not-a-number".into()),
-            ("KOMO_MAX_TURNS".into(), "30".into()),
-        ])
-        .unwrap();
-        assert_eq!(env.max_turns, Some(30));
     }
 
     #[test]

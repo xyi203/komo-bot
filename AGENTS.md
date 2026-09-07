@@ -23,7 +23,7 @@ komo logs [-n N] [-f] [--stdout]   # tail gateway tracing log
 komo doctor                        # config & gateway health
 komo health                        # liveness probe (exit 0 = healthy; Docker HEALTHCHECK)
 
-komo memory list|search|promote|reject|pin|triage|repair-scopes|backfill
+komo memory list|search|promote|reject|pin|triage|backfill
 komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; index is incremental)
 komo dream [--apply]               # evidence-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent [--skill NAME] [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
@@ -64,8 +64,8 @@ process's own log mid-conversation.
 **One database, table-level durability** (docs/adr/0004). `~/.komo/komo.db`
 holds everything Turso stores; "disposable" and "durable" are properties of each
 *table*, not of which file it sits in. The three files it replaced
-(`state.db`, `memory.db`, `cron.db`) are imported once on first connect and
-renamed `<name>.merged-backup`.
+(`state.db`, `memory.db`, `cron.db`) were imported into it once; that import
+code is gone — an absent `komo.db` is created, a present one is used.
 
 | Where | Contents | Durability |
 |---|---|---|
@@ -87,8 +87,7 @@ field added later reads as its default on every line written before it existed,
 and a change deeper than that dispatches on the line's `v`. Session *metadata*
 stays a row because it is *updated* (title, status, model).
 `MessageRepository` is the log; `SessionRepository` reads the two together.
-Rows left in the old `message_records` table move out on connect, once. Anything
-that used to count messages in SQL must now go through the log — the review
+Anything that used to count messages in SQL must now go through the log — the review
 sweep and `mark_reviewed`'s clamp are the two that do, and a missed one pins
 every watermark at zero.
 
@@ -151,8 +150,9 @@ longer available for anything):
   `CHUNK_TABLE_DDL` and needs no parity test.
 - **A non-additive change** to a durable table (`memory_records`,
   `cron_job_records`, `wakeup_records`) is not available: those may only ever
-  change additively. On a disposable table it is a **row-level** migration or a
-  documented one-time repair (`drop_retired_columns`), never a dropped file.
+  change additively. On a disposable table it is a **row-level** migration,
+  never a dropped file. A retired column keeps being written (empty) rather
+  than dropped — see `cron_job_records.schedule`.
 - **A `Message` field change needs neither**: it is a JSONL line, not a column.
 
 Turso/toasty invariants (`komo-infra`'s `persistence/`, `memory/memory_db.rs` —
@@ -165,8 +165,6 @@ them all, each domain's repository impl in its own module):
 - Conflicting commits fail and must be retried: wrap single-write mutations in
   `with_write_retry`; multi-write sequences in a real transaction *inside*
   `with_write_retry` (rollback + clean re-run, never double-apply).
-- Legacy rusqlite files auto-migrate once (staged to `.sqlite-backup`, `.turso`
-  marker prevents re-migration).
 
 ## Gateway is the process
 
@@ -736,8 +734,7 @@ call the same functions, which is what keeps validation from forking.
   no correspondent, so it writes `Global` — it used to be modelled as a chat on
   an `api` platform whose chat id was a fresh uuid per conversation, which made
   every automated write unrecallable from the next turn and needed an
-  `is_durable_channel` exception to undo. Memories written before that fix are
-  repaired by `komo memory repair-scopes`.
+  `is_durable_channel` exception to undo.
 - `domain/chunk_index.rs` + `komo-infra`'s `chunk_index` + `komo-services`'
   `wiki_indexing` +
   `komo-tools`' `wiki_search` / `wiki_read` / `wiki_index` — semantic search over the note vault

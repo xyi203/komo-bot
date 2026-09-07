@@ -290,15 +290,6 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     // ── Shared dependencies (built once, used by every tool set) ─────────────
     // Memories are `memory_records` in `komo.db`, shared by the `memory` tool,
     // the reflective reviewer and the L1 pinned injection.
-    // On first run they seed themselves from any legacy markdown memories under
-    // ~/.komo/memory/ (a one-time, no-op-once-populated import).
-    let imported = db
-        .import_legacy_markdown(&config.runtime.home.join("memory"))
-        .await
-        .unwrap_or(0);
-    if imported > 0 {
-        tracing::info!(imported, "migrated legacy markdown memories into komo.db");
-    }
     let memory_repo: Arc<dyn MemoryRepository> = db.clone();
 
     // The delegate tool runs a separate, tool-less sub-agent on the (optionally

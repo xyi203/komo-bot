@@ -1393,9 +1393,6 @@ async fn operator_command(
             let (promoted, archived) = actions.dream_apply().await?;
             OperatorCommandResult::DreamApplied { promoted, archived }
         }
-        OperatorCommand::MemoryRepairScopes => OperatorCommandResult::MemoryScopesRepaired {
-            repaired: actions.repair_memory_scopes().await?,
-        },
         OperatorCommand::MemoryBackfill => OperatorCommandResult::MemoryBackfilled {
             embedded: actions.memory_backfill().await?,
         },

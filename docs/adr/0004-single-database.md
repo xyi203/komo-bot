@@ -84,23 +84,20 @@ state.db 也导——它虽被文档标为 disposable，但 pairing 与 settings
 `CronJobRepository` / `MemoryRepository` 都实现在同一个 `Db` 上——一个域一个文件，
 一个库。（`kanban.rs` 随看板一起删掉了；`task_records` 在老库里还留着行，但已经没有模型读它。）
 
-迁移在 `Db::connect` 里，只在 `komo.db` 是新建时跑：逐个读 `state.db` /
-`cron.db` / `memory.db`（`kanban.db` 随看板删除一起不再导），写入后把旧文件（连
-`-log`/`-wal`/`.turso` 等旁挂文件）
-改名成 `<name>.merged-backup`。顺序是「先读、再写、最后改名」，中途崩溃就是旧文件
-还在、下次重来；每行自带 id，重来是覆盖而不是翻倍。**读不出来的旧文件是致命错误
-而不是跳过**——带着空记忆库启动、而 `memory.db` 就在旁边没人读，是那种直到你去找某条
-记忆才发现的故障。旧文件先各自做自己的 schema 修补再读（pre-status 的
-`cron.db` 还带着 `enabled` 列，pre-Turso 的 `memory.db` 得走 SQLite 驱动），
-所以「komo 发布过的每一种文件形状都还能读」这条测试跟着搬到了合库路径上。
+**导入代码已经删除。** 迁移曾在 `Db::connect` 里、只在 `komo.db` 是新建时跑：逐个读
+`state.db` / `cron.db` / `memory.db`，写入后把旧文件（连 `-log`/`-wal`/`.turso` 等旁挂
+文件）改名成 `<name>.merged-backup`。唯一的部署已经跑完这一次，旧文件都已改名，
+按「不留兼容层」这条规则，`merge_legacy_databases` / `import_state_from` /
+各库的 `import_from`、rusqlite→turso 的暂存与 `.turso` 标记、以及
+`drop_retired_columns` 一并删掉了：`komo.db` 不存在就新建（`push_schema`），存在就直接用。
+`ensure_columns` / `ensure_table` 留着——它们是给**新**列、新表做的正向维护，不是迁移。
 
-`state.db` 导的是重建不出来的那几张：`session_records`（转录本身是
-`sessions/` 下的文件，跟着 `KOMO_HOME` 走，不需要导）、`setting_records`
-（home 会话 id、`/sethome` 覆盖）、`pairing_records`。**run 账本
-不导**：它的行是 session 日志的投影，而唯一的写入口 `write_projection` 收的是一份
-fold（`ProjectedRun` 还要 `start_seq` 和每步的 `settled`），旧行里没有这些字段，
-硬造等于反推投影；账本按设计是可弃的，真要找回就 `rebuild_projections` 重折一遍日志。
-inbox / todo / wakeup 是瞬态，也不导。
+导入过的是重建不出来的那几张表：`session_records`（转录本身是 `sessions/` 下的文件，
+跟着 `KOMO_HOME` 走，不需要导）、`setting_records`（home 会话 id、`/sethome` 覆盖）、
+`pairing_records`、`cron_job_records`、`memory_records`。**run 账本没导**：它的行是
+session 日志的投影，旧行里没有 `start_seq` 和每步的 `settled`，硬造等于反推投影；账本
+按设计是可弃的，真要找回就 `rebuild_projections` 重折一遍日志。inbox / todo / wakeup
+是瞬态，也没导。
 
 耐久性规则改写为表级，写在 AGENTS.md 的存储表里：`memory_records` 只能加性变更，
 `cron_job_records` / `wakeup_records` 同样持久；session 元数据、run 账本、inbox、todo、

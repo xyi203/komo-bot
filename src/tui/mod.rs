@@ -1,11 +1,12 @@
 //! Full-screen chat TUI — `komo chat`'s interface (a terminal is required;
 //! scripted access goes through the gateway's api channel instead). A ratatui
-//! front end over two backends: a running gateway via
-//! [`GatewayClient::chat_streaming`] (trusted loopback, approvals auto-granted
-//! server-side), or the in-process [`AgentRuntime`] against the local db.
+//! front end over the **gateway**, which is the only process that opens komo's
+//! state: turns run server-side over
+//! [`GatewayClient::chat_streaming`] (trusted loopback, so a side-effecting
+//! tool the host operator asked for is not prompted for).
 //!
-//! The first frame paints before any backend exists: connecting (gateway
-//! probe, or db opens plus full wiring) runs on a background task ([`Boot`])
+//! The first frame paints before the connection exists: reaching the gateway —
+//! and starting one when none answers — runs on a background task ([`Boot`])
 //! while the event loop is already live. Drafting works immediately; one
 //! submission queues (`in_flight` already enforces one turn at a time) and
 //! dispatches the moment the backend lands.
@@ -16,34 +17,32 @@
 //! `tui/paste.rs`): a big one folds to a `[Pasted: N lines]` chip that edits and
 //! deletes as one object while the draft keeps the text verbatim, and a burst of
 //! keystrokes from a terminal without bracketed paste is coalesced back into one
-//! paste instead of submitting at its first newline. As the agent works, each tool call renders as a live
-//! activity line (`⚙ shell …` → `✓`/`✗` with a result preview) fed by the
-//! turn's [`TurnEvent`] stream — from the in-process executor's event sink in
-//! local mode, or parsed from the gateway's SSE stream in remote mode; the
-//! running tool also shows in the status line. In local mode, a side-effecting
-//! tool's approval request arrives over a channel ([`TuiApprover`]) and renders
-//! as a modal — `y`/`s`/`n` — with the same semantics as `cli/approver.rs`'s
-//! stdin prompt (still used by `komo run resume`).
+//! paste instead of submitting at its first newline. As the agent works, each
+//! tool call renders as a live activity line (`⚙ shell …` → `✓`/`✗` with a
+//! result preview) parsed from the gateway's SSE stream; the running tool also
+//! shows in the status line.
+//!
+//! **A stopped turn is answered out-of-band**, exactly as the desktop app does
+//! it: the loop polls `GET /api/interactions/{session}` and renders an approval
+//! as the `y`/`s`/`n` modal and an `ask_user` question as agent speech, then
+//! posts the answer to `/approval` or `/answer`. The continuation runs
+//! server-side, so its reply arrives by following the session's transcript tail
+//! rather than on a stream this UI holds — which is also how a wait another
+//! ingress parked (a `/approve` sent to Telegram) becomes answerable here.
 //!
 //! Logs: `main.rs::init_tracing` routes tracing to `~/.komo/logs/chat-tui.log`
 //! when it detects the TUI will run — stderr writes would tear the alternate
 //! screen. `ratatui::init` installs a panic hook that restores the terminal.
 
 mod app;
-mod approver;
 mod markdown;
 mod paste;
 mod ui;
 
-use komo_bot::interaction::{CancelState, CancelTicket, WaitParts, is_user_reply, record_wake};
-use komo_bot::runtime::AgentRuntime;
 use komo_core::domain::awaiting::Awaiting;
 use komo_core::domain::cancel::{CANCELLED_REPLY, is_cancelled};
-use komo_core::domain::session_event::WakeupCause;
-use komo_core::domain::wakeup::is_suspended;
-use komo_infra::persistence::db::Db;
-use komo_services::tool_execution::{SessionContext, SessionOrigin, with_session};
-use std::{io, path::PathBuf, sync::Arc};
+use komo_core::domain::wakeup::{SUSPENDED_REPLY, is_suspended};
+use std::{io, path::Path, path::PathBuf, sync::Arc, time::Duration};
 
 use crossterm::{
     event::{
@@ -57,109 +56,54 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::{
-    cli::wiring,
     domain::{
-        approval::Approver,
-        events::{ToolEventSink, TurnEvent},
-        gateway::ReplySink,
-        home::HomeRepository,
+        events::TurnEvent,
         message::{Message, Role as MessageRole},
-        repository::{MessageRepository, SessionRepository},
     },
     infra::gateway_client::{GatewayClient, folder_workspace_id},
 };
-use komo_config::ConfigSnapshot;
 
-use app::{Action, App, Role};
-use approver::{ApprovalPrompt, TuiApprover};
+use app::{Action, App, ApprovalPrompt, Role};
+
+/// How often the session's pending approval / question is re-read. A chat
+/// client's own poll, like the desktop app's: slow enough to cost nothing on a
+/// loopback socket, fast enough that a prompt does not feel lost.
+const INTERACTION_POLL: Duration = Duration::from_secs(2);
 
 /// How a turn reaches the agent. Cloneable (all `Arc`) so each turn can run on
 /// its own task while the event loop keeps handling keys.
 #[derive(Clone)]
-enum Backend {
-    /// A running gateway over loopback HTTP (trusted; server-side approvals).
-    Remote {
-        gateway: Arc<GatewayClient>,
-        /// Opaque, server-validated id for the directory from which this TUI
-        /// was launched. The gateway applies it only when creating a session.
-        workspace: String,
-    },
-    /// In-process agent against the local db (approvals via the TUI modal).
-    Local {
-        runtime: Arc<AgentRuntime>,
-        db: Arc<Db>,
-    },
+struct Backend {
+    gateway: Arc<GatewayClient>,
+    /// Opaque, server-validated id for the directory from which this TUI was
+    /// launched. The gateway resolves it per turn, for loopback callers only.
+    workspace: String,
 }
 
 impl Backend {
-    /// Run one turn. In local mode, `ctx` carries an interactive session
-    /// context (its sink feeds mid-turn messages — `ask_user` questions —
-    /// into the transcript); remote turns are handled server-side.
+    /// Run one turn server-side, forwarding its live tool events onto the
+    /// loop's channel as the SSE stream delivers them.
     async fn turn(
         &self,
         session_id: &str,
         input: String,
-        ctx: Option<SessionContext>,
         events: mpsc::UnboundedSender<TurnEvent>,
     ) -> anyhow::Result<String> {
-        match self {
-            // Remote turns run server-side; stream their tool events over SSE
-            // and forward each onto the loop's event channel.
-            Backend::Remote { gateway, workspace } => {
-                gateway
-                    .chat_streaming_in_workspace(session_id, &input, workspace, |ev| {
-                        let _ = events.send(ev);
-                    })
-                    .await
-            }
-            // Local turns emit tool events through the sink on `ctx` (set by the
-            // caller); the `events` sender is unused on this arm.
-            Backend::Local { runtime, .. } => match ctx {
-                Some(ctx) => with_session(ctx, runtime.handle_input(session_id, input)).await,
-                None => runtime.handle_input(session_id, input).await,
-            },
-        }
-    }
-}
-
-/// A [`ToolEventSink`] that forwards each live [`TurnEvent`] (a tool starting or
-/// finishing) into the TUI event loop's channel for the activity feed. Used by
-/// the local in-process turn; the remote turn feeds the same channel by parsing
-/// the gateway's SSE stream (see [`Backend::turn`]).
-struct TuiEventSink {
-    tx: mpsc::UnboundedSender<TurnEvent>,
-}
-
-impl ToolEventSink for TuiEventSink {
-    fn emit(&self, event: TurnEvent) {
-        // Best-effort: if the loop is gone the send just drops.
-        let _ = self.tx.send(event);
-    }
-}
-
-/// A [`ReplySink`] that feeds mid-turn agent messages (the `ask_user`
-/// question) into the TUI event loop's channel for transcript rendering.
-struct ChannelSink {
-    tx: mpsc::UnboundedSender<String>,
-}
-
-#[async_trait::async_trait]
-impl ReplySink for ChannelSink {
-    async fn send(&self, text: &str) -> anyhow::Result<()> {
-        self.tx
-            .send(text.to_string())
-            .map_err(|_| anyhow::anyhow!("TUI sink closed"))
+        self.gateway
+            .chat_streaming(session_id, &input, &self.workspace, |ev| {
+                let _ = events.send(ev);
+            })
+            .await
     }
 }
 
 /// Everything the event loop needs that is not ready at first paint. Produced
 /// by the background boot task while the first frame is already on screen —
-/// connecting (gateway probe, or three db opens plus full wiring) is the whole
-/// startup cost, and nothing in it needs the terminal, so the paint must not
-/// wait for it.
+/// reaching (or starting) the gateway is the whole startup cost, and nothing in
+/// it needs the terminal, so the paint must not wait for it.
 struct Boot {
     backend: Backend,
-    /// The session to drive: the fresh id, or the resolved one on resume.
+    /// The session to drive: the home conversation, or the resolved one on resume.
     session: String,
     /// The resumed transcript; empty for a fresh session.
     history: Vec<Message>,
@@ -176,30 +120,27 @@ struct Boot {
 type BootTask = tokio::task::JoinHandle<anyhow::Result<Boot>>;
 
 /// Start the TUI on the operator's **home conversation**: paint immediately, and
-/// connect in the background — a running gateway holds the db lock, so route
-/// turns to it; otherwise run in-process.
+/// connect in the background.
 ///
 /// Not a fresh session id per launch. One principal writing privately is one
 /// conversation whichever surface they picked up (docs/bot-runtime.md §2 D6),
 /// so closing the terminal and reopening it continues where the Telegram DM at
 /// lunch left off. `komo resume <id>` is what opens some *other* session — a
 /// correspondent's, or an old one being looked into.
-pub async fn run(config: ConfigSnapshot) -> anyhow::Result<()> {
+pub async fn run() -> anyhow::Result<()> {
     let workspace = startup_workspace()?;
-    let (approval_tx, approval_rx) = mpsc::unbounded_channel();
     let boot: BootTask = tokio::spawn({
         let workspace = workspace.clone();
-        let approval_tx = approval_tx.clone();
         async move {
-            let connected = connect(&config, &workspace, approval_tx).await?;
-            let session = home_session(&connected.backend).await?;
-            let history = resume_messages(&connected.backend, &session).await?;
+            let backend = connect(&workspace).await?;
+            let session = backend.gateway.home_session().await?;
+            let history = backend.gateway.session_messages(&session).await?;
             // The home conversation is shared, so it may already be stopped in
             // a wait another ingress parked — a `/approve` prompt sent to
             // Telegram, a question asked there. Same read as `resume`.
-            let awaiting = resume_awaiting(&connected.backend, &session).await?;
+            let awaiting = resume_awaiting(&backend, &session).await?;
             Ok(Boot {
-                backend: connected.backend,
+                backend,
                 session,
                 history,
                 workspace,
@@ -210,35 +151,24 @@ pub async fn run(config: ConfigSnapshot) -> anyhow::Result<()> {
     // The home id is not known until the backend is up, so the placeholder
     // stands in until the boot task installs the real one — the same shape
     // `resume` already used for an id it has to resolve.
-    drive(boot, (approval_tx, approval_rx), String::new(), workspace).await
-}
-
-/// The one home conversation, from whichever store this backend speaks to.
-async fn home_session(backend: &Backend) -> anyhow::Result<String> {
-    match backend {
-        Backend::Remote { gateway, .. } => gateway.home_session().await,
-        Backend::Local { db, .. } => HomeRepository::home_session(&**db).await,
-    }
+    drive(boot, String::new(), workspace).await
 }
 
 /// Continue an existing session (`komo resume <id>` on a TTY). Errors if the
-/// session doesn't exist — resume never creates one. A bare API id is accepted
-/// as a convenience for the UUID shown by clients.
-pub async fn resume(config: ConfigSnapshot, id: &str) -> anyhow::Result<()> {
+/// session doesn't exist — resume never creates one.
+pub async fn resume(id: &str) -> anyhow::Result<()> {
     let fallback_workspace = startup_workspace()?;
-    let (approval_tx, approval_rx) = mpsc::unbounded_channel();
     let id = id.to_string();
     let boot: BootTask = tokio::spawn({
         let fallback = fallback_workspace.clone();
         let id = id.clone();
-        let approval_tx = approval_tx.clone();
         async move {
-            let connected = connect(&config, &fallback, approval_tx).await?;
-            let session = resolve_resume_id(&connected.backend, &id).await?;
-            let history = resume_messages(&connected.backend, &session).await?;
-            let awaiting = resume_awaiting(&connected.backend, &session).await?;
+            let backend = connect(&fallback).await?;
+            let session = resolve_resume_id(&backend, &id).await?;
+            let history = backend.gateway.session_messages(&session).await?;
+            let awaiting = resume_awaiting(&backend, &session).await?;
             Ok(Boot {
-                backend: connected.backend,
+                backend,
                 session,
                 history,
                 workspace: fallback,
@@ -249,7 +179,7 @@ pub async fn resume(config: ConfigSnapshot, id: &str) -> anyhow::Result<()> {
     // The raw argument stands in as the session id until the boot task
     // resolves it; a queued draft dispatches only after the resolved id is
     // installed.
-    drive(boot, (approval_tx, approval_rx), id, fallback_workspace).await
+    drive(boot, id, fallback_workspace).await
 }
 
 /// Confirm the id names a session that exists. A session id is a UUID and
@@ -267,92 +197,44 @@ async fn resolve_resume_id(backend: &Backend, id: &str) -> anyhow::Result<String
              (its transcript is still in ~/.komo/sessions/); start a new one with `komo chat`"
         );
     }
-    let resolved = match backend {
-        Backend::Remote { gateway, .. } => gateway
-            .sessions()
-            .await?
-            .iter()
-            .find(|s| s.id == id)
-            .map(|s| s.id.clone()),
-        Backend::Local { db, .. } => SessionRepository::find(&**db, id)
-            .await?
-            .map(|session| session.id),
-    };
-    resolved.ok_or_else(|| anyhow::anyhow!("no session with id `{id}` (see `komo session list`)"))
-}
-
-async fn resume_messages(backend: &Backend, id: &str) -> anyhow::Result<Vec<Message>> {
-    match backend {
-        Backend::Remote { gateway, .. } => gateway.session_messages(id).await,
-        Backend::Local { db, .. } => MessageRepository::list_by_session(&**db, id).await,
-    }
+    backend
+        .gateway
+        .sessions()
+        .await?
+        .into_iter()
+        .find(|s| s.id == id)
+        .map(|s| s.id)
+        .ok_or_else(|| anyhow::anyhow!("no session with id `{id}` (see `komo session list`)"))
 }
 
 /// The wait this session is stopped in, if any — the session projection's
 /// `awaiting`, folded from the log at the last turn boundary.
 ///
-/// Read once, on resume: a turn suspended in *this* UI is a turn this UI is
-/// still holding, so the only wait it can learn about here is one another
-/// ingress parked.
+/// Read once, on resume: a turn suspended in *this* UI is one the interaction
+/// poll below is already watching, so the only wait it can learn about here is
+/// one another ingress parked.
 async fn resume_awaiting(backend: &Backend, id: &str) -> anyhow::Result<Option<Awaiting>> {
-    match backend {
-        Backend::Remote { gateway, .. } => Ok(gateway
-            .sessions()
-            .await?
-            .into_iter()
-            .find(|s| s.id == id)
-            .and_then(|s| s.awaiting)),
-        Backend::Local { db, .. } => Ok(SessionRepository::find(&**db, id)
-            .await?
-            .and_then(|session| session.awaiting)),
-    }
+    Ok(backend
+        .gateway
+        .sessions()
+        .await?
+        .into_iter()
+        .find(|s| s.id == id)
+        .and_then(|s| s.awaiting))
 }
 
-struct Connected {
-    backend: Backend,
-}
-
-/// Connect to whatever backend is available. `approval_tx` feeds the event
-/// loop's approval modal; the loop keeps its own parked sender so the channel
-/// stays open in remote mode, where this one is simply dropped.
-async fn connect(
-    config: &ConfigSnapshot,
-    workspace: &PathBuf,
-    approval_tx: mpsc::UnboundedSender<ApprovalPrompt>,
-) -> anyhow::Result<Connected> {
-    if let Some(gw) = GatewayClient::try_connect().await {
-        return Ok(Connected {
-            backend: Backend::Remote {
-                gateway: Arc::new(gw),
-                workspace: folder_workspace_id(workspace)?,
-            },
-        });
-    }
-    // No gateway is running (we'd have taken the remote path above), so opening
-    // the database here can't collide with its exclusive lock. Jobs the user
-    // schedules from this session fire once a gateway comes up.
-    let db = Arc::new(Db::connect(&config.runtime.db_url).await?);
-    let approver: Arc<dyn Approver> = Arc::new(TuiApprover::new(approval_tx));
-    let wired = wiring::build(config, db.clone(), approver).await?;
-    Ok(Connected {
-        backend: Backend::Local {
-            runtime: Arc::new(wired.runtime),
-            db,
-        },
+/// Reach the gateway, starting one if none is running — komo's state lives in
+/// its process, so there is nothing else to connect to.
+async fn connect(workspace: &Path) -> anyhow::Result<Backend> {
+    Ok(Backend {
+        gateway: Arc::new(GatewayClient::connect_or_start().await?),
+        workspace: folder_workspace_id(workspace)?,
     })
 }
 
 /// Set up the terminal, run the event loop, and always restore — including on
 /// an error path (the panic path is covered by `ratatui::init`'s hook).
-async fn drive(
-    boot: BootTask,
-    approvals: (
-        mpsc::UnboundedSender<ApprovalPrompt>,
-        mpsc::UnboundedReceiver<ApprovalPrompt>,
-    ),
-    session: String,
-    workspace: PathBuf,
-) -> anyhow::Result<()> {
+async fn drive(boot: BootTask, session: String, workspace: PathBuf) -> anyhow::Result<()> {
     let mut terminal = ratatui::init();
     // Bracketed paste turns a multi-line clipboard dump into one `Event::Paste`
     // instead of a stream of Enters (which used to send a message per line).
@@ -366,7 +248,7 @@ async fn drive(
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )
         .is_ok();
-    let result = event_loop(&mut terminal, boot, approvals, session, workspace).await;
+    let result = event_loop(&mut terminal, boot, session, workspace).await;
     if enhanced {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
@@ -382,30 +264,29 @@ async fn drive(
     result.map(|_| ())
 }
 
+/// How far this UI has rendered the transcript the gateway holds, and whether
+/// it is currently following it.
+///
+/// A turn this UI started arrives on its own SSE stream. A turn it merely
+/// *released* — by answering an approval or a question — continues server-side
+/// with no stream to hold, so its reply is read off the transcript instead.
+/// `seen` is refreshed the moment following starts, so the two never
+/// double-render the same message.
+#[derive(Default)]
+struct Tail {
+    seen: usize,
+    following: bool,
+}
+
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     boot: BootTask,
-    approvals: (
-        mpsc::UnboundedSender<ApprovalPrompt>,
-        mpsc::UnboundedReceiver<ApprovalPrompt>,
-    ),
     session: String,
     workspace: PathBuf,
 ) -> anyhow::Result<Option<String>> {
-    // Keep the sender alive for the whole loop (remote mode has no other
-    // holder) so `approval_rx.recv()` pends instead of returning None forever.
-    let (_approval_tx, mut approval_rx) = approvals;
-    // Mid-turn agent messages (the `ask_user` question) from the local turn's
-    // sink; the sender is also parked so the arm pends in remote mode.
-    let (sink_tx, mut sink_rx) = mpsc::unbounded_channel::<String>();
-    // Live tool-call events for the activity feed (both backends). The sender is
-    // cloned per turn; this original stays alive so the arm never closes.
+    // Live tool-call events for the activity feed. The sender is cloned per
+    // turn; this original stays alive so the arm never closes.
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<TurnEvent>();
-    // Cancellation slots for local turns, the same registry the api channel uses
-    // — reused rather than reimplemented so "stop" means one thing whichever
-    // surface asked. Remote turns are cancelled server-side over HTTP, where
-    // their slot already lives.
-    let cancels = Arc::new(CancelState::new());
 
     // The backend arrives from the boot task while the UI is already live.
     // Until then the user can draft freely and queue one submission (the same
@@ -415,6 +296,10 @@ async fn event_loop(
     let mut backend: Option<Backend> = None;
     let mut pending: Option<String> = None;
     let mut workspace = workspace;
+    // The question text currently on screen, so a poll that keeps reporting the
+    // same pending question does not re-print it.
+    let mut shown_question: Option<String> = None;
+    let mut tail = Tail::default();
 
     let mut app = App::new(session);
     app.connecting = true;
@@ -443,7 +328,8 @@ async fn event_loop(
             }
         }
     });
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(120));
+    let mut tick = tokio::time::interval(Duration::from_millis(120));
+    let mut poll = tokio::time::interval(INTERACTION_POLL);
 
     'main: loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
@@ -471,6 +357,7 @@ async fn event_loop(
                 app.session_id = ready.session;
                 workspace = ready.workspace;
                 app.awaiting = ready.awaiting;
+                tail.seen = ready.history.len();
                 for message in ready.history {
                     let role = match message.role {
                         MessageRole::User => Role::You,
@@ -482,14 +369,10 @@ async fn event_loop(
                     };
                     app.push(role, message.content);
                 }
-                let mode = match &ready.backend {
-                    Backend::Remote { .. } => "connected to the running gateway (trusted)",
-                    Backend::Local { .. } => "in-process (no gateway)",
-                };
                 app.push(
                     Role::Info,
                     format!(
-                        "{mode}, session `{}`\nworkspace: `{}`",
+                        "connected to the gateway (trusted), session `{}`\nworkspace: `{}`",
                         app.session_id,
                         workspace.display(),
                     ),
@@ -498,14 +381,13 @@ async fn event_loop(
                 if let Some(text) = pending.take() {
                     spawn_turn(
                         backend.as_ref().expect("installed above"),
-                        &cancels, &app.session_id, text,
-                        &turn_tx, &event_tx, &sink_tx,
+                        &app.session_id, text, &turn_tx, &event_tx,
                     );
                 }
             }
-            // Live tool-call events (both backends): render each as an activity
-            // line, updating the same line in place when it finishes. Kept above
-            // `turn_rx` (under `biased`) so a turn's events drain before its reply.
+            // Live tool-call events: render each as an activity line, updating
+            // the same line in place when it finishes. Kept above `turn_rx`
+            // (under `biased`) so a turn's events drain before its reply.
             Some(event) = event_rx.recv() => {
                 match event {
                     TurnEvent::ToolStarted { seq, name, args, .. } => {
@@ -538,28 +420,30 @@ async fn event_loop(
                 app.finish_turn();
                 // No tool is running once the turn is done.
                 app.active_tool = None;
-                // A turn that stopped on a question is not over: the input is
-                // unlocked as its answer, and nothing is rendered — the
-                // question itself already came through the sink.
-                app.awaiting_answer = matches!(result, TurnEnd::Waiting);
                 match result {
                     // The final round streamed this same text, so settle that
                     // live entry on the reply rather than appending a duplicate.
                     TurnEnd::Reply(reply) => app.finish_stream(reply),
-                    TurnEnd::Waiting => {}
+                    // Stopped to wait. Nothing of the turn is rendered: what it
+                    // is waiting for is read out-of-band, right now rather than
+                    // at the next tick — a question that took two seconds to
+                    // appear reads as the turn having died.
+                    TurnEnd::Waiting => {
+                        if let Some(backend) = &backend {
+                            poll_interactions(backend, &mut app, &mut shown_question).await;
+                        }
+                    }
                     TurnEnd::Failed(error) => app.push(Role::Error, error),
                 }
             }
-            // Mid-turn agent message (local mode): the `ask_user` question, or
-            // an approval prompt. Rendered as it arrives; whether the turn is
-            // now waiting is answered by how it *ends* (above), not by this.
-            Some(text) = sink_rx.recv() => {
-                app.push(Role::Agent, text);
-            }
-            // Show one approval at a time; further prompts wait in the channel
-            // until the current modal is answered.
-            Some(prompt) = approval_rx.recv(), if app.modal.is_none() => {
-                app.modal = Some(prompt);
+            // Show one approval at a time, and pick up a question the turn
+            // stopped on. Also follows the transcript when a continuation this
+            // UI released is running with no stream of its own.
+            _ = poll.tick() => {
+                if let Some(backend) = &backend {
+                    poll_interactions(backend, &mut app, &mut shown_question).await;
+                    follow_tail(backend, &mut app, &mut tail).await;
+                }
             }
             _ = tick.tick() => {
                 if app.in_flight || app.connecting {
@@ -599,15 +483,9 @@ async fn event_loop(
                     // Fresh tool feed for the new turn (seqs restart).
                     app.begin_tools();
                     match &backend {
-                        Some(backend) => spawn_turn(
-                            backend,
-                            &cancels,
-                            &app.session_id,
-                            text,
-                            &turn_tx,
-                            &event_tx,
-                            &sink_tx,
-                        ),
+                        Some(backend) => {
+                            spawn_turn(backend, &app.session_id, text, &turn_tx, &event_tx)
+                        }
                         // Still booting: hold the message (`in_flight` blocks a
                         // second one); the boot arm dispatches it on arrival.
                         None => pending = Some(text),
@@ -622,58 +500,48 @@ async fn event_loop(
                         app.push(Role::Info, "正在启动，稍候再 /new。".to_string());
                         continue;
                     };
-                    let drawn = match backend {
-                        Backend::Remote { gateway, .. } => gateway
-                            .conversation_boundary(&app.session_id)
-                            .await
-                            .map(|_| ()),
-                        Backend::Local { db, .. } => {
-                            komo_services::conversation::mark_boundary(
-                                &**db,
-                                &**db,
-                                &app.session_id,
-                            )
-                            .await
-                        }
-                    };
-                    match drawn {
-                        Ok(()) => {
-                            app.push(Role::Info, "已开始新的上下文。".to_string());
-                        }
-                        Err(error) => {
-                            app.push(Role::Info, format!("开始新上下文失败：{error}"));
-                        }
+                    match backend.gateway.conversation_boundary(&app.session_id).await {
+                        Ok(_) => app.push(Role::Info, "已开始新的上下文。".to_string()),
+                        Err(error) => app.push(Role::Info, format!("开始新上下文失败：{error}")),
                     }
                 }
                 Some(Action::Answer { text, shown }) => {
                     let answered = match &backend {
-                        Some(backend) => {
-                            answer_question(
-                                backend,
-                                &cancels,
-                                &app.session_id,
-                                text,
-                                &turn_tx,
-                                &event_tx,
-                                &sink_tx,
-                            )
+                        Some(backend) => backend
+                            .gateway
+                            .answer_question(&app.session_id, &text)
                             .await
-                        }
+                            .unwrap_or(false),
                         None => false,
                     };
+                    shown_question = None;
                     if answered {
                         app.push(Role::You, shown);
                         app.start_turn();
                         app.begin_tools();
+                        // The continuation runs server-side with no stream of
+                        // its own; its reply is read off the transcript.
+                        start_following(backend.as_ref(), &app.session_id, &mut tail).await;
                     } else {
                         app.push(Role::Info, "问题已失效（已被回答或已过期）。".to_string());
                     }
                 }
+                Some(Action::Answered(answer)) => {
+                    let Some(backend) = &backend else { continue };
+                    match backend
+                        .gateway
+                        .resolve_approval(&app.session_id, answer.decision(), answer.feedback())
+                        .await
+                    {
+                        Ok(true) => {
+                            app.start_turn();
+                            start_following(Some(backend), &app.session_id, &mut tail).await;
+                        }
+                        Ok(false) => app.push(Role::Info, "这条审批已经被处理过了。".to_string()),
+                        Err(error) => app.push(Role::Error, format!("审批提交失败：{error:#}")),
+                    }
+                }
                 Some(Action::Interrupt) => {
-                    // A turn suspended on a question is not running, so the
-                    // cancel signal has nothing to interrupt: answering it with
-                    // the stop text is what ends it. Same order the api
-                    // channel's `cancel_turn` uses.
                     // Still booting: the only thing running is the queued
                     // draft, so Esc takes that back.
                     let Some(backend) = &backend else {
@@ -686,26 +554,15 @@ async fn event_loop(
                         app.push(Role::Info, message.to_string());
                         continue;
                     };
-                    let stopped = match backend {
-                        Backend::Remote { gateway, .. } => {
-                            gateway.cancel_turn(&app.session_id).await.unwrap_or(false)
-                        }
-                        Backend::Local { .. } => {
-                            let answered = app.awaiting_answer
-                                && answer_question(
-                                    backend,
-                                    &cancels,
-                                    &app.session_id,
-                                    CANCELLED_REPLY.to_string(),
-                                    &turn_tx,
-                                    &event_tx,
-                                    &sink_tx,
-                                )
-                                .await;
-                            app.awaiting_answer = false;
-                            cancels.cancel(&app.session_id) || answered
-                        }
-                    };
+                    // One request covers every way a turn can be stuck: the
+                    // endpoint denies a pending approval and answers a pending
+                    // question before flipping the cancel signal, because a
+                    // turn parked on either never reaches another await.
+                    let stopped = backend
+                        .gateway
+                        .cancel_turn(&app.session_id)
+                        .await
+                        .unwrap_or(false);
                     // Said out loud either way: "nothing happened" and "stopping,
                     // give it a moment" look identical otherwise, and the turn
                     // ends at its *next* await, not instantly.
@@ -718,7 +575,7 @@ async fn event_loop(
                         },
                     );
                 }
-                Some(Action::Answered(_)) | None => {}
+                None => {}
             }
         }
     }
@@ -727,156 +584,118 @@ async fn event_loop(
     Ok(backend.is_some().then_some(app.session_id))
 }
 
+/// Read what a stopped turn on this session is waiting on and surface it: an
+/// approval as the modal, a question as agent speech that unlocks the input as
+/// its answer. A poll failure is silent — the next tick retries, and a red line
+/// every two seconds would bury the transcript.
+async fn poll_interactions(backend: &Backend, app: &mut App, shown_question: &mut Option<String>) {
+    if app.session_id.is_empty() {
+        return;
+    }
+    let Ok(pending) = backend.gateway.interactions(&app.session_id).await else {
+        return;
+    };
+    if let Some(approval) = pending.approval
+        && app.modal.is_none()
+    {
+        app.modal = Some(ApprovalPrompt {
+            summary: approval.summary,
+            detail: approval.detail,
+            dangerous: approval.risk == "dangerous",
+        });
+    }
+    match pending.question {
+        Some(question) => {
+            if shown_question.as_deref() != Some(question.as_str()) {
+                app.push(Role::Agent, question.clone());
+                *shown_question = Some(question);
+            }
+            app.awaiting_answer = true;
+        }
+        // Answered here, or elsewhere: either way the next thing typed is a new
+        // message, not an answer.
+        None => {
+            *shown_question = None;
+            app.awaiting_answer = false;
+        }
+    }
+}
+
+/// Start following the transcript from wherever it stands now, so the
+/// continuation this UI just released renders and nothing already on screen
+/// renders twice.
+async fn start_following(backend: Option<&Backend>, session: &str, tail: &mut Tail) {
+    let Some(backend) = backend else { return };
+    if let Ok(messages) = backend.gateway.session_messages(session).await {
+        tail.seen = messages.len();
+    }
+    tail.following = true;
+}
+
+/// Append whatever the gateway has written past what this UI has rendered. Ends
+/// at the continuation's answer — a turn that stops again is picked up by the
+/// interaction poll instead.
+async fn follow_tail(backend: &Backend, app: &mut App, tail: &mut Tail) {
+    if !tail.following || app.session_id.is_empty() {
+        return;
+    }
+    let Ok(messages) = backend.gateway.session_messages(&app.session_id).await else {
+        return;
+    };
+    for message in messages.iter().skip(tail.seen) {
+        let role = match message.role {
+            MessageRole::User => Role::You,
+            MessageRole::Assistant => Role::Agent,
+            MessageRole::System | MessageRole::Tool => Role::Info,
+        };
+        app.push(role, message.content.clone());
+        if message.role == MessageRole::Assistant {
+            tail.following = false;
+            app.finish_turn();
+        }
+    }
+    tail.seen = messages.len();
+}
+
 /// How a turn ended, as the loop has to render it.
 enum TurnEnd {
     Reply(String),
-    /// It stopped to wait for the user's answer (`ask_user`). Neither an answer
-    /// nor a failure: the input unlocks, and what is typed continues this same
-    /// turn.
+    /// It stopped to wait — for an approval, or for the user's answer to an
+    /// `ask_user` question. Neither an answer nor a failure.
     Waiting,
     Failed(String),
 }
 
-/// The interactive context a locally driven turn runs under: its sink carries
-/// mid-turn messages (the `ask_user` question, an approval prompt) into the
-/// transcript, and its cancel signal is what Esc flips.
-fn local_ctx(
-    session_id: &str,
-    ticket: Option<&CancelTicket>,
-    event_tx: &mpsc::UnboundedSender<TurnEvent>,
-    sink_tx: &mpsc::UnboundedSender<String>,
-) -> SessionContext {
-    SessionContext {
-        session_id: session_id.to_string(),
-        workspace_root: None,
-        sink: Arc::new(ChannelSink {
-            tx: sink_tx.clone(),
-        }),
-        interactive: true,
-        auto_approve: false,
-        event_sink: Some(Arc::new(TuiEventSink {
-            tx: event_tx.clone(),
-        })),
-        // Esc stops the turn: the loop flips this signal and the agent loop
-        // gives up at its next await.
-        cancel: ticket.map(|ticket| ticket.signal()),
-        interject: None,
-        channel: None,
-        origin: SessionOrigin::User,
-    }
-}
-
 /// Dispatch one turn onto its own task so the loop keeps handling keys. The
-/// result lands on `turn_tx`, live tool events on `event_tx`, and — local mode
-/// only — mid-turn agent messages on `sink_tx`.
+/// result lands on `turn_tx`, live tool events on `event_tx`.
 fn spawn_turn(
     backend: &Backend,
-    cancels: &Arc<CancelState>,
     session_id: &str,
     text: String,
     turn_tx: &mpsc::UnboundedSender<TurnEnd>,
     event_tx: &mpsc::UnboundedSender<TurnEvent>,
-    sink_tx: &mpsc::UnboundedSender<String>,
 ) {
     let session_id = session_id.to_string();
     let turn_tx = turn_tx.clone();
     let events = event_tx.clone();
-    // One registration per local turn, retired when the turn's task ends —
-    // taken only where the context is, so an Esc still reports "nothing to
-    // stop" on a backend that has no interruptible turn.
-    let local = matches!(backend, Backend::Local { .. });
-    let ticket = local.then(|| cancels.register(&session_id));
-    let ctx = local.then(|| local_ctx(&session_id, ticket.as_ref(), event_tx, sink_tx));
     let backend = backend.clone();
     tokio::spawn(async move {
-        let result = classify_end(backend.turn(&session_id, text, ctx, events).await);
-        // Retire the slot so a later Esc can't hit a finished turn.
-        drop(ticket);
+        let result = classify_end(backend.turn(&session_id, text, events).await);
         let _ = turn_tx.send(result);
     });
 }
 
-/// Answer the question a locally suspended turn is waiting on, and continue it.
+/// Read a turn's outcome.
 ///
-/// The TUI drives its own turns, so it continues them itself — but the log
-/// writes go through [`record_wake`], the one writer of `wakeup/fired`.
-/// Without a gateway there is no sweep either, so this is the only wake a local
-/// session can get: a question can be answered here and now, while a `wait 2h`
-/// comes back whenever a gateway next runs.
-///
-/// Answers whether anything was actually waiting.
-async fn answer_question(
-    backend: &Backend,
-    cancels: &Arc<CancelState>,
-    session_id: &str,
-    text: String,
-    turn_tx: &mpsc::UnboundedSender<TurnEnd>,
-    event_tx: &mpsc::UnboundedSender<TurnEvent>,
-    sink_tx: &mpsc::UnboundedSender<String>,
-) -> bool {
-    let Backend::Local { runtime, db } = backend else {
-        return false;
-    };
-    let waits = WaitParts {
-        runs: db.clone(),
-        events: db.clone(),
-        wakeups: db.clone(),
-    };
-    let Ok(registrations) = waits.wakeups.list().await else {
-        return false;
-    };
-    let Some(registration) = registrations
-        .into_iter()
-        .find(|r| r.session_id == session_id && r.turn_id.is_some() && is_user_reply(&r.wakeup))
-    else {
-        return false;
-    };
-    let turn_id = registration.turn_id.clone().expect("filtered above");
-    // Claim it before writing anything: a gateway started meanwhile could be
-    // reaching for the same wait with an expiry.
-    if !matches!(waits.wakeups.take(&registration.id).await, Ok(true)) {
-        return false;
-    }
-    let cause = match text.trim().is_empty() {
-        true => WakeupCause::MovedOn,
-        false => WakeupCause::Reply,
-    };
-    if let Err(error) = record_wake(&waits, &registration, &turn_id, cause, &text).await {
-        tracing::warn!(%error, "failed to record the answer to a question");
-        return false;
-    }
-    let Ok(Some(run)) = waits.runs.get(&turn_id).await else {
-        return false;
-    };
-
-    let runtime = runtime.clone();
-    let session_id = session_id.to_string();
-    let turn_tx = turn_tx.clone();
-    let ticket = cancels.register(&session_id);
-    let ctx = local_ctx(&session_id, Some(&ticket), event_tx, sink_tx);
-    tokio::spawn(async move {
-        let outcome = with_session(ctx, runtime.resume_interrupted(&run)).await;
-        drop(ticket);
-        let result = match outcome {
-            Ok(Some(reply)) => TurnEnd::Reply(reply),
-            // Not continuable: its transcript already ends in a reply, or the
-            // log has nothing for it.
-            Ok(None) => TurnEnd::Failed("那一轮已经结束了，无法继续。".to_string()),
-            Err(error) => classify_end(Err(error)),
-        };
-        let _ = turn_tx.send(result);
-    });
-    true
-}
-
-/// Read a turn's outcome. Classified **before** the error is stringified:
-/// `is_cancelled` / `is_suspended` downcast, and `{e:#}` would leave a
-/// deliberate stop — or a turn that is merely waiting — looking like a failure.
+/// The gateway answers a cancelled or suspended turn with its own sentinel text
+/// rather than an error, so those are recognised by the reply — while the
+/// `is_cancelled` / `is_suspended` downcasts still cover a local transport
+/// failure. Classified **before** the error is stringified: `{e:#}` would leave
+/// a deliberate stop, or a turn that is merely waiting, looking like a failure.
 fn classify_end(outcome: anyhow::Result<String>) -> TurnEnd {
     match outcome {
+        Ok(reply) if reply == SUSPENDED_REPLY => TurnEnd::Waiting,
         Ok(reply) => TurnEnd::Reply(reply),
-        // The remote arm never lands here — the gateway already answers a
-        // cancelled turn with this same text.
         Err(error) if is_cancelled(&error) => TurnEnd::Reply(CANCELLED_REPLY.to_string()),
         Err(error) if is_suspended(&error) => TurnEnd::Waiting,
         Err(error) => TurnEnd::Failed(format!("{error:#}")),

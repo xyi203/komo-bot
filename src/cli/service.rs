@@ -322,10 +322,10 @@ mod launchd {
     pub fn start() -> anyhow::Result<()> {
         let domain = gui_domain()?;
         if unload(&domain, LEGACY_LABEL)? {
-            println!("migrated legacy launchd gateway to {LABEL}");
+            tracing::info!("migrated legacy launchd gateway to {LABEL}");
         }
         if is_label_loaded(&domain, LABEL) {
-            println!(
+            tracing::info!(
                 "komo gateway is already running under launchd. Use `komo gateway restart` to restart it."
             );
             return Ok(());
@@ -361,9 +361,8 @@ mod launchd {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        println!(
-            "komo gateway started under launchd ({LABEL}).\n\
-             It will restart automatically on crash and start at login.\n\
+        tracing::info!(
+            "komo gateway started under launchd ({LABEL}); it restarts on crash and at login. \
              Logs: {}/gateway.log",
             log_dir.display()
         );

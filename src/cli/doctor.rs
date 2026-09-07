@@ -30,12 +30,15 @@ fn local_time(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
-pub async fn doctor(config: &ConfigSnapshot, control: &OperatorControl) -> anyhow::Result<()> {
+pub async fn doctor(config: &ConfigSnapshot) -> anyhow::Result<()> {
     println!("home: {}", config.runtime.home.display());
 
-    // The operator backend was resolved once by the caller; the db-backed
-    // sections below reuse it, and the gateway line reports which side it hit.
-    let health = gateway_health(control.via_gateway()).await;
+    // Probed, never started: komo's state lives in the gateway, but a
+    // diagnosis that boots one has changed the thing it was asked to describe.
+    // The sections that need it say so instead.
+    let control = OperatorControl::probe().await;
+    let control = control.as_ref();
+    let health = gateway_health(control.is_some()).await;
 
     issue_health(config);
     model_health(config);
@@ -53,9 +56,13 @@ pub async fn doctor(config: &ConfigSnapshot, control: &OperatorControl) -> anyho
 
 /// Scheduled cron jobs (cron.db): count, disabled ones, and any whose last run
 /// failed — the operator's "is my weekly job actually running" glance.
-async fn cron_health(control: &OperatorControl) {
+async fn cron_health(control: Option<&OperatorControl>) {
     use crate::domain::cron::{CronJobStatus, RoutineRunStatus};
     println!("\ncron jobs:");
+    let Some(control) = control else {
+        println!("  {OFF} needs a running gateway (`komo gateway start`)");
+        return;
+    };
     let fetched = control
         .query(OperatorQuery::CronJobs)
         .await
@@ -193,13 +200,17 @@ fn plugin_health(config: &ConfigSnapshot, health: Option<&serde_json::Value>) {
 /// error anywhere), and a store written before embeddings were configured
 /// stays unembedded for weeks because backfill is lazy. Neither is visible
 /// unless something counts.
-async fn memory_health(config: &ConfigSnapshot, control: &OperatorControl) {
+async fn memory_health(config: &ConfigSnapshot, control: Option<&OperatorControl>) {
     println!("\nmemory:");
     let Some(embedding) = &config.runtime.embedding else {
         println!(
             "  ! embeddings not configured — recall is lexical-only, so a Chinese \
              question cannot reach an English memory; set [memory] embedding_model"
         );
+        return;
+    };
+    let Some(control) = control else {
+        println!("  {OFF} needs a running gateway to count coverage (`komo gateway start`)");
         return;
     };
     let memories = match control.query(OperatorQuery::Memories).await {
@@ -294,7 +305,7 @@ fn schedule_health(config: &ConfigSnapshot) {
 
 /// The permission policy: configured?, rule count, load errors, and the two
 /// runtime grant sources (saved prompts, scheduled jobs).
-async fn policy_health(config: &ConfigSnapshot, control: &OperatorControl) {
+async fn policy_health(config: &ConfigSnapshot, control: Option<&OperatorControl>) {
     use crate::domain::policy::{PolicyMode, Verdict};
     let report = &config.runtime.policy;
     println!("\npolicy:");
@@ -309,7 +320,10 @@ async fn policy_health(config: &ConfigSnapshot, control: &OperatorControl) {
     }
     // Job grants likewise: a job created purely in conversation carries
     // unattended permissions with no [policy] table anywhere.
-    if let Ok(OperatorQueryResult::CronJobs(jobs)) = control.query(OperatorQuery::CronJobs).await {
+    if let Some(control) = control
+        && let Ok(OperatorQueryResult::CronJobs(jobs)) =
+            control.query(OperatorQuery::CronJobs).await
+    {
         let granting = jobs.iter().filter(|j| !j.grants.is_empty()).count();
         if granting > 0 {
             println!(
@@ -409,8 +423,15 @@ async fn channel_health(config: &ConfigSnapshot) {
 
 /// Resolved proactive-output home: the `/sethome` runtime override (db) wins
 /// over the config `home_chat` fallback (feishu first).
-async fn home_channel_health(control: &OperatorControl, config: &ConfigSnapshot) {
+async fn home_channel_health(control: Option<&OperatorControl>, config: &ConfigSnapshot) {
     println!("\nhome channel (proactive output):");
+    let Some(control) = control else {
+        match config_home_chat(config) {
+            Some((platform, chat)) => println!("  {OK} config home_chat → {platform}:{chat}"),
+            None => println!("  {OFF} none set in config (a /sethome override needs a gateway)"),
+        }
+        return;
+    };
     let over = control
         .query(OperatorQuery::HomeOverride)
         .await
@@ -449,8 +470,12 @@ fn config_home_chat(config: &ConfigSnapshot) -> Option<(&'static str, String)> {
 
 /// Recent run-ledger health: how many of the last 50 turns failed, with the
 /// most recent few. The roadmap §9 "last error" view.
-async fn run_health(control: &OperatorControl) {
+async fn run_health(control: Option<&OperatorControl>) {
     println!("\nrecent runs:");
+    let Some(control) = control else {
+        println!("  {OFF} needs a running gateway (`komo gateway start`)");
+        return;
+    };
     let fetched = control
         .query(OperatorQuery::Runs { limit: 50 })
         .await

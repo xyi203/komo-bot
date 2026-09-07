@@ -3,8 +3,8 @@
 //! Unlike the in-chat `memory` tool (scoped to the current chat), the CLI is a
 //! host-side operator view: it lists and searches across *all* scopes, so you
 //! can triage candidates the reviewer captured and promote/pin the durable ones.
-//! Every read and write goes through [`OperatorControl`] — whether it reaches a
-//! running gateway or the store directly is not this module's business.
+//! Every read and write goes through [`OperatorControl`], which reaches the
+//! gateway — the only process that opens the memory store.
 
 use crate::domain::memory::{Memory, MemoryStatus};
 use crate::services::operator_control::{
@@ -63,9 +63,6 @@ pub async fn search(control: &OperatorControl, query: &str) -> anyhow::Result<()
         OperatorQueryResult::MemorySearch(hits) => hits,
         _ => unreachable!("MemorySearch answers with MemorySearch"),
     };
-    if !control.via_gateway() {
-        println!("(gateway not running — lexical match only, no semantic arm)");
-    }
     if hits.is_empty() {
         println!("(no matches)");
         return Ok(());

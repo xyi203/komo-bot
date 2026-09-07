@@ -1,9 +1,8 @@
-//! Shared construction of a fully-wired `AgentRuntime`.
+//! Construction of a fully-wired `AgentRuntime`.
 //!
-//! Both the chat REPL (`cli/chat.rs`) and the gateway (`cli/gateway.rs`) need
-//! the same agent: identical tools, skills, LLM, and reviewer. The only thing
-//! that differs is the `Approver` — interactive at a TTY vs. auto-deny in the
-//! unattended gateway — so it is passed in.
+//! The gateway is the only caller: it is the only process that opens komo's
+//! state, so it is the only process that has an agent. `komo chat` and the CLI
+//! talk to it over the api channel.
 //!
 //! Every tool komo mounts is built here, once, and registered into one
 //! executor per runtime — so a runtime's tool set cannot drift from the list
@@ -11,6 +10,7 @@
 
 use komo_bot::compaction::Compactor;
 use komo_bot::delegate::DelegateTool;
+use komo_bot::interaction::{ApprovalState, ChatApprover};
 use komo_bot::learning_coordinator::LearningCoordinator;
 use komo_bot::llm::{PreambleFn, TurnInjections, build_llm};
 use komo_bot::reviewer::ReflectiveReviewer;
@@ -103,9 +103,6 @@ pub struct Wiring {
     /// The hybrid query service, so the operator surface can drive an embedding
     /// backfill through the same one recall uses.
     pub memory_query: Arc<komo_services::memory_query::MemoryQueryService>,
-    /// The governed skill store (`~/.komo/skills`, files — roadmap §9), shared
-    /// with the gateway's api channel.
-    pub skills: Arc<FsSkillStore>,
     /// The cron sweep's agent for `CronAction::Agent` jobs: the full tool set
     /// with unattended policy gating. Main model, no memory enricher.
     pub cron_runtime: Arc<AgentRuntime>,
@@ -117,6 +114,11 @@ pub struct Wiring {
     /// Note-vault handles, shared with the operator surface so `komo wiki` works
     /// while the gateway holds the index open.
     pub wiki: Option<crate::services::operator_control::actions::WikiOps>,
+    /// The pending-approval registry the chat approver writes into, shared with
+    /// the gateway's dispatcher and api channel so `/approve` — typed in a chat,
+    /// clicked in the desktop app, or pressed in the TUI's modal — resolves the
+    /// wait the turn is parked on.
+    pub approvals: Arc<ApprovalState>,
 }
 
 /// What distinguishes one runtime from another.
@@ -221,18 +223,20 @@ pub(crate) fn build_embedder(
 }
 
 /// Build the agent against `db` — sessions, tasks, memories, cron jobs, the
-/// ledger, all of it (docs/adr/0004) — gating side-effecting tools through
-/// `approver`. Every setting comes from the caller's one resolved `config`
-/// snapshot — wiring never re-reads config.toml, the env, or `.env`.
+/// ledger, all of it (docs/adr/0004). Every setting comes from the caller's one
+/// resolved `config` snapshot — wiring never re-reads config.toml, the env, or
+/// `.env`.
 ///
 /// The store is passed in rather than opened here because Turso takes an
 /// exclusive lock per file: the gateway already holds it open and must hand its
 /// own handle over.
-pub async fn build(
-    config: &ConfigSnapshot,
-    db: Arc<Db>,
-    approver: Arc<dyn Approver>,
-) -> anyhow::Result<Wiring> {
+pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wiring> {
+    // Tool actions that need approval are gated on the conversation: the agent
+    // sends a prompt and the turn suspends until `/approve` (or the desktop
+    // app's modal, or the TUI's) answers it. The registry is returned so the
+    // dispatcher and the api channel share this one.
+    let approvals = Arc::new(ApprovalState::new());
+    let approver: Arc<dyn Approver> = Arc::new(ChatApprover::new(approvals.clone()));
     // One file, one handle, several repository traits over it. Named separately
     // because the things they mean are still separate — durable jobs, durable
     // memories — even though they are now tables in the same database.
@@ -794,10 +798,10 @@ pub async fn build(
         review,
         memories: memory_repo,
         memory_query: memory_query.clone(),
-        skills: skill_store,
         cron_runtime,
         output_store,
         wiki: wiki_ops,
+        approvals,
     })
 }
 

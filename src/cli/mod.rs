@@ -14,7 +14,7 @@ mod memory;
 mod model;
 mod pair;
 mod policy;
-mod service;
+pub(crate) mod service;
 mod skill;
 mod upgrade;
 mod wechat;

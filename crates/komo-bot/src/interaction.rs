@@ -79,7 +79,7 @@ pub enum Answer {
 /// `GET /api/interactions/{session}` the GUI polls — can render the prompt
 /// without reading the chat reply sink. Chat channels still see the prompt text
 /// via the sink; this is the structured mirror.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PendingApproval {
     pub summary: String,
     pub detail: Option<String>,

@@ -473,12 +473,12 @@ pub async fn run() -> anyhow::Result<()> {
         // explicit, script-friendly spelling, but make a bare `komo` open it.
         None | Some(Commands::Chat) => {
             require_terminal()?;
-            crate::tui::run(config).await
+            crate::tui::run().await
         }
         Some(Commands::Init) => init::run(),
         Some(Commands::Resume { id }) => {
             require_terminal()?;
-            crate::tui::resume(config, &id).await
+            crate::tui::resume(&id).await
         }
         Some(Commands::Gateway { action }) => match action {
             None => gateway::run(&config).await,
@@ -489,7 +489,7 @@ pub async fn run() -> anyhow::Result<()> {
         },
         Some(Commands::Upgrade { no_restart }) => upgrade::run(no_restart),
         Some(Commands::Cron { action }) => match action {
-            CronAction::List => inspect::cron_list(&operator(&config).await?).await,
+            CronAction::List => inspect::cron_list(&operator().await?).await,
             CronAction::Add {
                 name,
                 schedule,
@@ -501,7 +501,7 @@ pub async fn run() -> anyhow::Result<()> {
                 notify,
             } => {
                 inspect::cron_add(
-                    &operator(&config).await?,
+                    &operator().await?,
                     crate::domain::cron::CronJobSpec {
                         name,
                         trigger: parse_schedule_arg(&schedule)?,
@@ -535,7 +535,7 @@ pub async fn run() -> anyhow::Result<()> {
                     .map(|g| policy::parse_grant(g))
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 inspect::cron_add(
-                    &operator(&config).await?,
+                    &operator().await?,
                     crate::domain::cron::CronJobSpec {
                         name,
                         trigger: parse_schedule_arg(&schedule)?,
@@ -551,34 +551,30 @@ pub async fn run() -> anyhow::Result<()> {
                 )
                 .await
             }
-            CronAction::Remove { name } => {
-                inspect::cron_remove(&operator(&config).await?, &name).await
-            }
+            CronAction::Remove { name } => inspect::cron_remove(&operator().await?, &name).await,
             CronAction::Enable { name } => {
-                inspect::cron_set_enabled(&operator(&config).await?, &name, true).await
+                inspect::cron_set_enabled(&operator().await?, &name, true).await
             }
             CronAction::Disable { name } => {
-                inspect::cron_set_enabled(&operator(&config).await?, &name, false).await
+                inspect::cron_set_enabled(&operator().await?, &name, false).await
             }
-            CronAction::Run { name } => inspect::cron_run(&operator(&config).await?, &name).await,
+            CronAction::Run { name } => inspect::cron_run(&operator().await?, &name).await,
         },
         Some(Commands::Session { action }) => match action {
-            SessionAction::List => inspect::session_list(&operator(&config).await?).await,
+            SessionAction::List => inspect::session_list(&operator().await?).await,
             SessionAction::Resume { id } => {
                 require_terminal()?;
-                crate::tui::resume(config, &id).await
+                crate::tui::resume(&id).await
             }
-            SessionAction::Clean => inspect::session_clean(&operator(&config).await?).await,
+            SessionAction::Clean => inspect::session_clean(&operator().await?).await,
         },
         Some(Commands::Run { action }) => match action {
-            RunAction::List { limit } => inspect::run_list(&operator(&config).await?, limit).await,
-            RunAction::Inspect { id } => inspect::run_inspect(&operator(&config).await?, &id).await,
-            RunAction::Prune { before, keep } => {
-                run_prune(&operator(&config).await?, before, keep).await
-            }
+            RunAction::List { limit } => inspect::run_list(&operator().await?, limit).await,
+            RunAction::Inspect { id } => inspect::run_inspect(&operator().await?, &id).await,
+            RunAction::Prune { before, keep } => run_prune(&operator().await?, before, keep).await,
         },
         Some(Commands::Memory { action }) => {
-            let control = operator(&config).await?;
+            let control = operator().await?;
             match action {
                 MemoryAction::List { status } => memory::list(&control, status).await,
                 MemoryAction::Search { query } => memory::search(&control, &query).await,
@@ -590,9 +586,9 @@ pub async fn run() -> anyhow::Result<()> {
                 MemoryAction::Backfill => memory::backfill(&control).await,
             }
         }
-        Some(Commands::Dream { apply }) => dream::run(&operator(&config).await?, apply).await,
+        Some(Commands::Dream { apply }) => dream::run(&operator().await?, apply).await,
         Some(Commands::Wiki { action }) => {
-            let control = operator(&config).await?;
+            let control = operator().await?;
             match action {
                 WikiAction::Index { rebuild } => wiki::index(&control, rebuild).await,
                 WikiAction::Search { query, limit } => wiki::search(&control, &query, limit).await,
@@ -606,10 +602,10 @@ pub async fn run() -> anyhow::Result<()> {
             SkillsAction::Disable { name } => skill::set_enabled(&name, false),
             SkillsAction::Inspect { name } => skill::inspect(&name),
         },
-        Some(Commands::Doctor) => doctor::doctor(&config, &operator(&config).await?).await,
+        Some(Commands::Doctor) => doctor::doctor(&config).await,
         Some(Commands::Health) => health::run().await,
         Some(Commands::Pair { action }) => {
-            let control = operator(&config).await?;
+            let control = operator().await?;
             match action {
                 PairAction::List => pair::list(&control).await,
                 PairAction::Approve { code } => pair::approve(&control, &code).await,
@@ -623,7 +619,7 @@ pub async fn run() -> anyhow::Result<()> {
                 // read. A failure here degrades the listing (one section marked
                 // unavailable) rather than failing a command whose config and
                 // saved sections are perfectly readable.
-                let jobs = match operator(&config).await {
+                let jobs = match operator().await {
                     Ok(control) => match control
                         .query(crate::services::operator_control::OperatorQuery::CronJobs)
                         .await
@@ -679,15 +675,11 @@ pub async fn run() -> anyhow::Result<()> {
     }
 }
 
-/// Resolve one operator backend for this invocation: the gateway is probed
-/// exactly once, and every read/write the command performs reuses it.
-async fn operator(
-    config: &komo_config::ConfigSnapshot,
-) -> anyhow::Result<crate::services::operator_control::OperatorControl> {
-    crate::services::operator_control::OperatorControl::connect(
-        crate::services::operator_control::StoreUrls::from_config(&config.runtime),
-    )
-    .await
+/// Resolve the operator connection for this invocation: the gateway is reached
+/// (or started) exactly once, and every read/write the command performs reuses
+/// it.
+async fn operator() -> anyhow::Result<crate::services::operator_control::OperatorControl> {
+    crate::services::operator_control::OperatorControl::connect().await
 }
 
 /// Resolve `run prune`'s `--before <date>` / `--keep N` into a cutoff timestamp,

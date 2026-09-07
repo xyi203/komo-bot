@@ -10,8 +10,53 @@ use std::{
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use komo_core::domain::awaiting::Awaiting;
 
-use super::approver::{Answer, ApprovalPrompt};
 use super::paste;
+
+/// The user's answer to an approval modal, in the words
+/// `POST /api/interactions/{session}/approval` accepts.
+///
+/// There is no `always` here on purpose: a saved grant is described by the rule
+/// it would write, and the rule is derived from the *running turn's* channel and
+/// action — which live in the gateway, not in this process. Offering the key
+/// without being able to show what it saves is the one thing the modal must not
+/// do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    /// Allow this one action.
+    Once,
+    /// Allow and remember the scope key for the rest of the session.
+    Session,
+    /// Refuse, optionally with a reason the agent is told (typed after `n`).
+    Deny(Option<String>),
+}
+
+impl Answer {
+    /// The wire decision the gateway parses (`api::parse_decision`).
+    pub fn decision(&self) -> &'static str {
+        match self {
+            Answer::Once => "once",
+            Answer::Session => "session",
+            Answer::Deny(_) => "deny",
+        }
+    }
+
+    /// The denial reason, relayed to the model so it can correct the call.
+    pub fn feedback(&self) -> Option<String> {
+        match self {
+            Answer::Deny(reason) => reason.clone(),
+            _ => None,
+        }
+    }
+}
+
+/// One approval rendered as a modal, as
+/// `GET /api/interactions/{session}` reports it.
+#[derive(Debug, Clone)]
+pub struct ApprovalPrompt {
+    pub summary: String,
+    pub detail: Option<String>,
+    pub dangerous: bool,
+}
 
 /// A pasted block the composer folds to a one-line label. Chips never overlap and
 /// stay ordered, so the composer can treat one as a single atomic glyph — grok
@@ -67,9 +112,9 @@ pub enum Action {
     NewSession,
     /// The user answered the approval modal.
     Answered(Answer),
-    /// The user answered a mid-turn `ask_user` question (local mode): resolve
-    /// it into the suspended turn instead of starting a new one. Same
-    /// `text`/`shown` split as [`Action::Submit`].
+    /// The user answered a mid-turn `ask_user` question: resolve it into the
+    /// suspended turn instead of starting a new one. Same `text`/`shown` split
+    /// as [`Action::Submit`].
     Answer {
         text: String,
         shown: String,
@@ -297,15 +342,11 @@ impl App {
         self.scroll_from_bottom = 0;
     }
 
-    /// Close the approval modal, deliver `answer` to the waiting approver, and
-    /// report it to the event loop.
+    /// Close the approval modal and hand the answer to the event loop, which
+    /// posts it to the gateway holding the suspended turn.
     fn resolve_modal(&mut self, answer: Answer) -> Option<Action> {
         self.modal_reason = None;
-        if let Some(mut prompt) = self.modal.take()
-            && let Some(reply) = prompt.reply.take()
-        {
-            let _ = reply.send(answer.clone());
-        }
+        self.modal = None;
         Some(Action::Answered(answer))
     }
 
@@ -339,12 +380,6 @@ impl App {
             let answer = match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(Answer::Once),
                 KeyCode::Char('s') | KeyCode::Char('S') => Some(Answer::Session),
-                // Offered only when the modal showed the rule it would save.
-                KeyCode::Char('a') | KeyCode::Char('A')
-                    if self.modal.as_ref().is_some_and(|m| m.always_rule.is_some()) =>
-                {
-                    Some(Answer::Always)
-                }
                 // `n` asks for a reason first (one extra keystroke); Esc is the
                 // immediate, explanation-free denial.
                 KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -352,8 +387,8 @@ impl App {
                     return None;
                 }
                 KeyCode::Esc => Some(Answer::Deny(None)),
-                // Ctrl-C still quits even under a modal (the dropped reply
-                // reads as a denial on the approver side).
+                // Ctrl-C still quits even under a modal; the approval stays
+                // pending in the gateway for whoever answers it next.
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Some(Action::Quit);
                 }
@@ -1023,15 +1058,12 @@ mod tests {
     /// anyway, so nothing is lost by not interrupting on the first press.
     #[test]
     fn esc_under_the_modal_denies_rather_than_interrupting() {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
         let mut app = App::new("s".into());
         app.in_flight = true;
         app.modal = Some(ApprovalPrompt {
             summary: "rm -rf build".into(),
             detail: None,
             dangerous: true,
-            always_rule: None,
-            reply: Some(tx),
         });
         assert_eq!(
             app.on_key(key(KeyCode::Esc)),
@@ -1082,40 +1114,33 @@ mod tests {
     }
 
     #[test]
-    fn modal_captures_keys_and_replies() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+    fn modal_captures_keys_and_answers() {
         let mut app = App::new("s".into());
         app.modal = Some(ApprovalPrompt {
             summary: "run shell".into(),
             detail: None,
             dangerous: false,
-            always_rule: None,
-            reply: Some(tx),
         });
         // Ordinary typing is captured by the modal.
         assert_eq!(app.on_key(key(KeyCode::Char('x'))), None);
         assert!(app.input.is_empty());
-        // Answering resolves the oneshot and closes the modal.
+        // Answering closes the modal and reports the decision to the loop.
         assert_eq!(
             app.on_key(key(KeyCode::Char('y'))),
             Some(Action::Answered(Answer::Once))
         );
         assert!(app.modal.is_none());
-        assert_eq!(rx.blocking_recv(), Ok(Answer::Once));
     }
 
-    /// `n` opens a one-line reason prompt whose text reaches the approver, so a
+    /// `n` opens a one-line reason prompt whose text rides the denial, so a
     /// refusal can tell the agent what to do instead.
     #[test]
     fn denying_with_n_collects_a_reason() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
         let mut app = App::new("s".into());
         app.modal = Some(ApprovalPrompt {
             summary: "rm -rf build".into(),
             detail: None,
             dangerous: true,
-            always_rule: None,
-            reply: Some(tx),
         });
 
         // `n` does not answer yet — it switches the modal to reason entry.
@@ -1136,41 +1161,30 @@ mod tests {
         );
         assert!(app.modal.is_none());
         assert!(app.modal_reason.is_none());
-        assert_eq!(
-            rx.blocking_recv(),
-            Ok(Answer::Deny(Some("用 trash".into())))
-        );
     }
 
     #[test]
     fn esc_denies_immediately_without_a_reason() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
         let mut app = App::new("s".into());
         app.modal = Some(ApprovalPrompt {
             summary: "rm -rf build".into(),
             detail: None,
             dangerous: true,
-            always_rule: None,
-            reply: Some(tx),
         });
         assert_eq!(
             app.on_key(key(KeyCode::Esc)),
             Some(Action::Answered(Answer::Deny(None)))
         );
-        assert_eq!(rx.blocking_recv(), Ok(Answer::Deny(None)));
     }
 
     /// Esc out of reason entry is still a denial — just an unexplained one.
     #[test]
     fn esc_during_reason_entry_denies_without_the_partial_text() {
-        let (tx, rx) = tokio::sync::oneshot::channel();
         let mut app = App::new("s".into());
         app.modal = Some(ApprovalPrompt {
             summary: "rm -rf build".into(),
             detail: None,
             dangerous: true,
-            always_rule: None,
-            reply: Some(tx),
         });
         app.on_key(key(KeyCode::Char('n')));
         type_reason(&mut app, "half-typed");
@@ -1178,20 +1192,16 @@ mod tests {
             app.on_key(key(KeyCode::Esc)),
             Some(Action::Answered(Answer::Deny(None)))
         );
-        assert_eq!(rx.blocking_recv(), Ok(Answer::Deny(None)));
     }
 
     /// An empty reason is the same as a plain denial.
     #[test]
     fn enter_with_a_blank_reason_is_a_plain_denial() {
-        let (tx, _rx) = tokio::sync::oneshot::channel();
         let mut app = App::new("s".into());
         app.modal = Some(ApprovalPrompt {
             summary: "write".into(),
             detail: None,
             dangerous: false,
-            always_rule: None,
-            reply: Some(tx),
         });
         app.on_key(key(KeyCode::Char('n')));
         type_reason(&mut app, "  ");

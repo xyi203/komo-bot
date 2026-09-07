@@ -1,7 +1,7 @@
 //! Operator subcommands (`komo cron list`, `komo session list/clean`).
 //!
-//! These query the database directly and print to stdout — no LLM, no agent
-//! runtime. They are the operator's view into what the gateway will act on.
+//! These ask the gateway and print to stdout — no LLM, no agent runtime. They
+//! are the operator's view into what the gateway will act on.
 
 use crate::{
     domain::cron::{CronAction, CronJob, CronJobSpec, CronJobStatus, NotifyPolicy},
@@ -118,9 +118,6 @@ pub async fn cron_add(control: &OperatorControl, spec: CronJobSpec) -> anyhow::R
         job.trigger.describe(),
         local_time(job.next_run_at)
     );
-    if !control.via_gateway() {
-        println!("(no gateway running — it fires once `komo gateway` is up)");
-    }
     Ok(())
 }
 
@@ -173,17 +170,10 @@ pub async fn cron_run(control: &OperatorControl, name: &str) -> anyhow::Result<(
     else {
         unreachable!("CronTrigger answers with CronUpdated");
     };
-    if control.via_gateway() {
-        println!(
-            "Job `{}` triggered — it runs on the gateway's next sweep tick (within a minute).",
-            job.name
-        );
-    } else {
-        println!(
-            "Job `{}` marked due — it runs once a gateway is up (`komo gateway start`).",
-            job.name
-        );
-    }
+    println!(
+        "Job `{}` triggered — it runs on the gateway's next sweep tick (within a minute).",
+        job.name
+    );
     Ok(())
 }
 

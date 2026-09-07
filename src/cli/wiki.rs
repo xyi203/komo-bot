@@ -19,9 +19,7 @@ use crate::services::operator_control::{
 /// protocol is request/response and streaming one command's progress would not
 /// pay for the machinery.
 pub async fn index(control: &OperatorControl, rebuild: bool) -> anyhow::Result<()> {
-    if control.via_gateway() {
-        println!("indexing via the running gateway — progress: komo logs -f");
-    }
+    println!("indexing in the gateway — progress: komo logs -f");
     if rebuild {
         println!("(rebuilding from scratch)");
     }

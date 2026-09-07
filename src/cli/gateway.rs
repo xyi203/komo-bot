@@ -1,6 +1,6 @@
 use komo_bot::daemon::{DreamSweep, ReviewSweep, RoutineEventSource, Schedule, WakeupWiring};
 use komo_bot::gateway::{Channel, Gateway, MaintenanceService};
-use komo_bot::interaction::{ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker, WaitParts};
+use komo_bot::interaction::{GatewayDispatcher, TurnWaker, WaitParts};
 use komo_infra::persistence::db::Db;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,7 +8,6 @@ use std::sync::Arc;
 use crate::{
     cli::wiring,
     domain::{
-        approval::Approver,
         context::SessionOrigin,
         cron::CronJobRepository,
         gateway::MessageHandler,
@@ -91,12 +90,11 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // the sweeps still take them as their own repositories.
     let cron_jobs: Arc<dyn CronJobRepository> = db.clone();
 
-    // Tool actions that need approval are gated over the chat channel: the
-    // agent sends an approval prompt and waits for the user's `/approve` (or
-    // `/deny`) reply. Shared with the dispatcher so the reply resolves the wait.
-    let approvals = Arc::new(ApprovalState::new());
-    let approver: Arc<dyn Approver> = Arc::new(ChatApprover::new(approvals.clone()));
-    let mut wired = wiring::build(config, db.clone(), approver).await?;
+    let mut wired = wiring::build(config, db.clone()).await?;
+    // The pending-approval registry the wiring's `ChatApprover` writes into.
+    // Shared with the dispatcher and the api channel so an answer — a chat
+    // `/approve`, the desktop modal, the TUI's — resolves the parked wait.
+    let approvals = wired.approvals.clone();
 
     // Expire stored tool outputs once, here. Not a `Maintenance` sweep on
     // purpose: the list of scheduled sweeps is long already, and a scratch file
@@ -328,7 +326,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             todos: db.clone(),
             memories: wired.memories.clone(),
             runs: db.clone(),
-            skills: wired.skills.clone(),
             pairings: pairings.clone(),
             home: db.clone(),
             cron_jobs: cron_jobs.clone(),

@@ -1,10 +1,10 @@
-//! Shared operator behavior: the projections and transitions that must be
-//! identical whether an operator action runs inside the gateway (behind the
-//! HTTP api channel) or in-process against directly-opened stores.
+//! Shared operator behavior: the projections and transitions behind every
+//! operator action.
 //!
 //! Everything here is parameterized by domain repositories/values, never by a
-//! transport — the api handlers and the direct adapter both call these, so the
-//! business result can't fork between the two paths.
+//! transport. `POST /api/operator` dispatches onto these, and so does every
+//! `/api/*` route a client shares with the CLI — so what an action *does*
+//! cannot fork between the two entry points.
 
 use anyhow::Context;
 use komo_services::cron_actions;
@@ -24,7 +24,6 @@ use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, 
 use crate::domain::repository::{MessageRepository, SessionEventRepository, SessionRepository};
 use crate::domain::run::{Run, RunRepository, RunStep};
 use crate::domain::session::Session;
-use crate::domain::skill::Skill;
 use crate::domain::todo::SessionTodoRepository;
 
 use super::now;
@@ -87,10 +86,6 @@ pub struct OperatorActions {
     pub todos: Arc<dyn SessionTodoRepository>,
     pub memories: Arc<dyn MemoryRepository>,
     pub runs: Arc<dyn RunRepository>,
-    /// The concrete store: that is where every skill read lives — the
-    /// automated write path (find/list/save), while every governance transition
-    /// — promote, archive, expire — is an inherent method on the store.
-    pub skills: Arc<komo_infra::skills::FsSkillStore>,
     pub pairings: Arc<dyn PairingRepository>,
     pub home: Arc<dyn HomeRepository>,
     pub cron_jobs: Arc<dyn CronJobRepository>,
@@ -290,14 +285,6 @@ impl OperatorActions {
         self.sessions.set_status(id, status).await
     }
 
-    pub async fn delete_session(&self, id: &str) -> anyhow::Result<bool> {
-        self.sessions.delete_session(id).await
-    }
-
-    pub async fn list_skills(&self) -> anyhow::Result<Vec<Skill>> {
-        Ok(self.skills.list_active())
-    }
-
     pub async fn pairing_views(&self) -> anyhow::Result<Vec<PairingView>> {
         Ok(pairing_views(self.pairings.list().await?, now()))
     }
@@ -312,6 +299,17 @@ impl OperatorActions {
 
     pub async fn dream_preview(&self) -> anyhow::Result<DreamReport> {
         Ok(dream_classify(&self.memories.list().await?, now()))
+    }
+
+    /// One dreaming consolidation cycle — the same `DreamSweep` the gateway
+    /// schedules nightly, run on demand. Returns `(promoted, archived)`.
+    pub async fn dream_apply(&self) -> anyhow::Result<(usize, usize)> {
+        let summary = komo_bot::daemon::DreamSweep {
+            memories: self.memories.clone(),
+        }
+        .apply()
+        .await?;
+        Ok((summary.memories_promoted, summary.memories_archived))
     }
 
     pub async fn home_override(&self) -> anyhow::Result<Option<String>> {

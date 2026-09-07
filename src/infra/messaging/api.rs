@@ -1,15 +1,19 @@
-//! HTTP API ingress channel.
+//! HTTP API ingress channel — the gateway's only door.
 //!
-//! Exposes the agent over a loopback HTTP port for local UIs (the Tauri
-//! dashboard) and any OpenAI-compatible client (Open WebUI, LobeChat, …). Two
+//! The gateway is the one process that opens komo's state, so every other
+//! surface arrives here: the chat TUI, the desktop and web apps, the `komo`
+//! CLI, and any OpenAI-compatible client (Open WebUI, LobeChat, …). Three
 //! families of endpoints:
 //!
 //!   - **OpenAI-compatible** (`/v1/*`): `chat/completions` (streaming and not)
 //!     and `models`, so third-party chat frontends connect by pointing at
 //!     `http://127.0.0.1:8765/v1` with the bearer key.
-//!   - **dashboard** (`/api/*`): read views over the same repositories the
-//!     `komo` CLI uses — sessions, memories, runs, plus a `status`
-//!     aggregate. These back the desktop control panel (roadmap §9).
+//!   - **client** (`/api/*`): what a komo client reads and writes about a
+//!     conversation — sessions, transcripts, memories, runs, models,
+//!     workspaces, the pending approval/question, `status`.
+//!   - **operator** (`POST /api/operator`): the whole host-operator surface as
+//!     one typed request (`operator_control::request`), because a route per
+//!     action meant a hand-written client method and handler per action.
 //!
 //! Unlike the chat channels, an HTTP request is synchronous request/response,
 //! so it calls the [`MessageHandler`] directly and awaits the reply rather than
@@ -29,7 +33,6 @@
 //! the bearer-key middleware. Only loopback origins are allowed and credentials
 //! are off, so the bearer key remains the sole thing that grants access.
 
-use komo_bot::daemon::DreamSweep;
 use komo_bot::gateway::Channel;
 use komo_bot::interaction::{Answer, ApprovalState, CancelState, GatewayDispatcher};
 use komo_services::tool_execution::{SessionContext, with_session};
@@ -65,7 +68,6 @@ use tracing::{info, warn};
 use crate::{
     domain::{
         cancel::{CANCELLED_REPLY, is_cancelled},
-        cron::CronJobSpec,
         events::{ToolEventSink, TurnEvent},
         gateway::MessageHandler,
         memory::{MemoryStatus, parse_memory_status},
@@ -74,7 +76,8 @@ use crate::{
         wakeup::{SUSPENDED_REPLY, is_suspended},
     },
     services::operator_control::{
-        MemoryTransitionAction,
+        MemoryTransitionAction, OperatorCommand, OperatorCommandResult, OperatorQuery,
+        OperatorQueryResult, OperatorReply, OperatorRequest, PairApproveOutcome,
         actions::{OperatorActions, TransitionOutcome, no_cron_job_message},
     },
 };
@@ -315,35 +318,23 @@ fn cors_layer() -> CorsLayer {
 /// Build the router: `/health` and (if configured) the static web SPA are
 /// public; everything else sits behind the bearer-key middleware.
 fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
-    // Control-plane writes: host-operator actions (memory governance, run
-    // prune, session clean, pairing admission, dream apply). Loopback-gated as
-    // a *layer*, not per-handler checks, so a write route added here is gated
-    // by construction — a publicly-bound api (`[channels.api] enabled = true`)
-    // never reaches these, valid key or not.
+    // Host-operator actions: the whole `komo` CLI behind `/api/operator`, plus
+    // the writes a *client* performs on its own (memory governance, session
+    // rename/archive, `/new`, dreaming). Loopback-gated as a *layer*, not
+    // per-handler checks, so a write route added here is gated by construction
+    // — a publicly-bound api (`[channels.api] enabled = true`) never reaches
+    // these, valid key or not.
     let operator_writes = Router::new()
+        // The whole host-operator surface — every `komo` subcommand that reads
+        // or writes komo's state — behind one typed endpoint.
+        .route("/api/operator", post(operator))
         .route("/api/memories/{id}/promote", post(memory_promote))
         .route("/api/memories/{id}/reject", post(memory_reject))
         .route("/api/memories/{id}/pin", post(memory_pin))
-        .route("/api/runs/prune", post(prune_runs))
-        .route("/api/sessions/clean", post(clean_sessions))
         .route("/api/sessions/{id}/title", post(set_session_title))
         .route("/api/sessions/{id}/status", post(set_session_status))
-        .route("/api/sessions/{id}/delete", post(delete_session))
         .route("/api/sessions/{id}/boundary", post(conversation_boundary))
-        .route("/api/pairings/approve", post(pair_approve))
-        .route("/api/pairings/{id}/revoke", post(pair_revoke))
         .route("/api/dream/apply", post(dream_apply))
-        .route("/api/memories/repair-scopes", post(memory_repair_scopes))
-        .route("/api/memories/backfill", post(memory_backfill))
-        .route("/api/memories/search", post(memory_search))
-        .route("/api/wiki/search", post(wiki_search))
-        .route("/api/wiki/status", get(wiki_status))
-        .route("/api/wiki/index", post(wiki_index))
-        .route("/api/cron/add", post(cron_add))
-        .route("/api/cron/{name}/remove", post(cron_remove))
-        .route("/api/cron/{name}/enable", post(cron_enable))
-        .route("/api/cron/{name}/disable", post(cron_disable))
-        .route("/api/cron/{name}/trigger", post(cron_trigger))
         .route_layer(middleware::from_fn(require_loopback));
 
     // Interactive resolution (the GUI's approval modal + clarify answer). Always
@@ -368,16 +359,12 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/status", get(status))
         .route("/api/models", get(list_model_menu))
         .route("/api/workspaces", get(list_workspaces))
-        .route("/api/home", get(get_home))
         .route("/api/home-session", get(get_home_session))
         .route("/api/sessions", get(list_sessions))
         .route("/api/sessions/{id}/messages", get(session_messages))
         .route("/api/memories", get(list_memories))
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
-        .route("/api/cron", get(list_cron_jobs))
-        .route("/api/skills", get(list_skills))
-        .route("/api/pairings", get(list_pairings))
         .route("/api/dream", get(dream_preview))
         .route("/api/interactions/{session}", get(get_interactions))
         .merge(operator_writes)
@@ -1131,14 +1118,6 @@ fn model_context_window(model: &str) -> Option<u64> {
     }
 }
 
-/// The `/sethome` runtime override (`None` when unset). The config `home_chat`
-/// fallback is *not* resolved here — the CLI derives it from the same
-/// config.toml locally; only the db-held override needs the gateway.
-async fn get_home(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let over = state.actions.home_override().await?;
-    Ok(Json(json!({ "override": over })))
-}
-
 /// The operator's home conversation, opened on first ask. What a local client
 /// starts in, so the TUI and a Telegram DM are one thread rather than two.
 async fn get_home_session(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -1261,79 +1240,12 @@ async fn get_run(
     }
 }
 
-// ---- control-plane write endpoints ------------------------------------------
+// ---- session and memory governance (shared with the CLI) -------------------
 //
-// These back the maintenance CLIs (`run prune`, `session clean`,
-// `pair approve|revoke`, `dream --apply`) while the gateway holds the db lock.
-// All of them are loopback-gated by the `require_loopback` layer on the
-// operator-writes router (see `build_router`) — not per-handler checks.
-
-#[derive(Deserialize)]
-struct PruneParams {
-    cutoff: i64,
-}
-
-/// Drop runs (and their steps) started before `cutoff`. The client resolves
-/// `--before`/`--keep` into the cutoff (it can read runs over `/api/runs`).
-async fn prune_runs(
-    State(state): State<AppState>,
-    Query(params): Query<PruneParams>,
-) -> Result<Response, ApiError> {
-    let removed = state.actions.prune_runs(params.cutoff).await?;
-    Ok(Json(json!({ "removed": removed })).into_response())
-}
-
-#[derive(Deserialize)]
-struct WikiSearchBody {
-    query: String,
-    #[serde(default = "default_wiki_limit")]
-    limit: usize,
-}
-
-fn default_wiki_limit() -> usize {
-    5
-}
-
-/// Note-vault search (backs `komo wiki search`). Routed through the gateway
-/// because it holds the index open — the CLI cannot open it concurrently.
-async fn wiki_search(
-    State(state): State<AppState>,
-    Json(body): Json<WikiSearchBody>,
-) -> Result<Response, ApiError> {
-    let hits = state.actions.wiki_search(&body.query, body.limit).await?;
-    Ok(Json(json!({ "hits": hits })).into_response())
-}
-
-/// What the note-vault index holds (backs `komo wiki status`).
-async fn wiki_status(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let status = state.actions.wiki_status().await?;
-    Ok(Json(json!({ "status": status })).into_response())
-}
-
-#[derive(Deserialize)]
-struct WikiIndexBody {
-    #[serde(default)]
-    rebuild: bool,
-}
-
-/// Index the vault (backs `komo wiki index`).
-///
-/// Runs to completion inside the request — minutes for a full rebuild. The
-/// client calls this on its no-timeout HTTP client for exactly that reason;
-/// progress is visible in the gateway log rather than in the response.
-async fn wiki_index(
-    State(state): State<AppState>,
-    Json(body): Json<WikiIndexBody>,
-) -> Result<Response, ApiError> {
-    let outcome = state.actions.wiki_index(body.rebuild).await?;
-    Ok(Json(json!({ "outcome": outcome })).into_response())
-}
-
-/// Delete every session with no messages (backs `komo session clean`).
-async fn clean_sessions(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let removed = state.actions.clean_sessions().await?;
-    Ok(Json(json!({ "removed": removed })).into_response())
-}
+// These are the writes a *client* performs — the desktop/web apps rename and
+// archive sessions, and act on a memory from the memory view. The CLI reaches
+// the same `OperatorActions` through `/api/operator`, so neither surface owns a
+// second definition of what the action does.
 
 #[derive(Deserialize)]
 struct TitleBody {
@@ -1367,194 +1279,10 @@ async fn set_session_status(
     Ok(Json(json!({ "ok": true })))
 }
 
-/// Delete a session and its messages so it drops off the list. Loopback-gated.
-async fn delete_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let removed = state.actions.delete_session(&id).await?;
-    Ok(Json(json!({ "removed": removed })))
-}
-
-#[derive(Deserialize)]
-struct ApproveParams {
-    code: String,
-}
-
-/// Approve the pending pairing bearing `code` (backs `komo pair approve`). The
-/// outcome variant is echoed so the CLI prints the same message it would locally.
-async fn pair_approve(
-    State(state): State<AppState>,
-    Json(body): Json<ApproveParams>,
-) -> Result<Response, ApiError> {
-    let json = match state.actions.pair_approve(&body.code).await? {
-        ApproveOutcome::Approved(request) => json!({ "outcome": "approved", "id": request.id }),
-        ApproveOutcome::NotFound => json!({ "outcome": "not_found" }),
-        ApproveOutcome::Locked { retry_after_secs } => {
-            json!({ "outcome": "locked", "retry_after_secs": retry_after_secs })
-        }
-    };
-    Ok(Json(json).into_response())
-}
-
-/// Remove a pairing by id (backs `komo pair revoke`).
-async fn pair_revoke(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Response, ApiError> {
-    let revoked = state.actions.pair_revoke(&id).await?;
-    Ok(Json(json!({ "revoked": revoked })).into_response())
-}
-
-/// Run one dreaming consolidation cycle (backs `komo dream --apply`) — the same
-/// `DreamSweep` the gateway schedules.
-async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let summary = DreamSweep {
-        memories: state.actions.memories.clone(),
-    }
-    .apply()
-    .await?;
-    Ok(Json(json!({
-        "promoted": summary.memories_promoted,
-        "archived": summary.memories_archived,
-    }))
-    .into_response())
-}
-
-/// Ranked memory search (backs `komo memory search`): the same hybrid query
-/// recall runs, with the gateway's embedder.
-#[derive(serde::Deserialize)]
-struct MemorySearchBody {
-    query: String,
-    #[serde(default = "default_search_limit")]
-    limit: usize,
-}
-fn default_search_limit() -> usize {
-    20
-}
-async fn memory_search(
-    State(state): State<AppState>,
-    Json(body): Json<MemorySearchBody>,
-) -> Result<Response, ApiError> {
-    let memories = state.actions.memory_search(&body.query, body.limit).await?;
-    Ok(Json(json!({ "memories": memories })).into_response())
-}
-
-/// Embed every memory still missing a current vector (backs
-/// `komo memory backfill`). Slow by nature: one model call per batch.
-async fn memory_backfill(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let embedded = state.actions.memory_backfill().await?;
-    Ok(Json(json!({ "embedded": embedded })).into_response())
-}
-
-/// Widen memories stranded in an ephemeral `api` channel scope to `Global`
-/// (backs `komo memory repair-scopes`).
-async fn memory_repair_scopes(State(state): State<AppState>) -> Result<Response, ApiError> {
-    let repaired = state.actions.repair_memory_scopes().await?;
-    Ok(Json(json!({ "repaired": repaired })).into_response())
-}
-
-// ---- control-plane read endpoints (CLI ↔ gateway) --------------------------
-
-// ---- cron-job endpoints (backs `komo cron`) ---------------------------------
-
-/// Every scheduled cron job, by name.
-async fn list_cron_jobs(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let jobs = state.actions.list_cron_jobs().await?;
-    Ok(Json(json!({ "jobs": jobs })))
-}
-
-/// The uniform 404 for an unknown job name — body carries the same message the
-/// direct path bails with, so the CLI prints one thing on either transport.
-fn cron_not_found(name: &str) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({ "error": no_cron_job_message(name) })),
-    )
-        .into_response()
-}
-
-/// Create a job. Validation failures (bad cron expression, duplicate name,
-/// missing command) are the caller's to fix → 400 with the message.
-async fn cron_add(State(state): State<AppState>, Json(spec): Json<CronJobSpec>) -> Response {
-    match state.actions.add_cron_job(spec).await {
-        Ok(job) => Json(json!({ "job": job })).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-async fn cron_remove(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Response, ApiError> {
-    Ok(if state.actions.remove_cron_job(&name).await? {
-        Json(json!({ "removed": true })).into_response()
-    } else {
-        cron_not_found(&name)
-    })
-}
-
-async fn cron_enable(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Response, ApiError> {
-    cron_set_enabled(state, name, true).await
-}
-
-async fn cron_disable(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Response, ApiError> {
-    cron_set_enabled(state, name, false).await
-}
-
-async fn cron_set_enabled(
-    state: AppState,
-    name: String,
-    enabled: bool,
-) -> Result<Response, ApiError> {
-    Ok(
-        match state.actions.set_cron_enabled(&name, enabled).await? {
-            Some(job) => Json(json!({ "job": job })).into_response(),
-            None => cron_not_found(&name),
-        },
-    )
-}
-
-/// Make a job due now (fires on the sweep's next tick). A disabled job is a
-/// 400 (the shared action refuses it), an unknown one a 404.
-async fn cron_trigger(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    match state.actions.trigger_cron_job(&name).await {
-        Ok(Some(job)) => Json(json!({ "job": job })).into_response(),
-        Ok(None) => cron_not_found(&name),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
-}
-
-/// Registered skills (backs `komo skills list`), by name.
-async fn list_skills(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let skills = state.actions.list_skills().await?;
-    Ok(Json(json!({ "skills": skills })))
-}
-
-/// Pairings (backs `komo pair list`). A hash-free view — the salted code hash
-/// and per-row salt are never serialized off the host.
-async fn list_pairings(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let pairings = state.actions.pairing_views().await?;
-    Ok(Json(json!({ "pairings": pairings })))
-}
-
-/// The dreaming dry-run classification (backs `komo dream`, no `--apply`):
-/// which candidates would promote / archive, with their scores, plus the full
-/// candidate count so a no-op does not look like an empty memory library.
+/// The dreaming dry-run classification (backs the GUI's memory view and
+/// `komo dream` with no `--apply`): which candidates would promote / archive,
+/// with their scores, plus the full candidate count so a no-op does not look
+/// like an empty memory library.
 async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let report = state.actions.dream_preview().await?;
     Ok(Json(json!({
@@ -1562,6 +1290,146 @@ async fn dream_preview(State(state): State<AppState>) -> Result<Json<Value>, Api
         "archive": report.archive,
         "candidate_count": report.candidate_count,
     })))
+}
+
+/// Run one dreaming consolidation cycle — the same `DreamSweep` the gateway
+/// schedules.
+async fn dream_apply(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let (promoted, archived) = state.actions.dream_apply().await?;
+    Ok(Json(json!({ "promoted": promoted, "archived": archived })))
+}
+
+// ---- the operator endpoint --------------------------------------------------
+//
+// One route for the whole `komo` CLI. It used to be a route, a hand-written
+// client method and a hand-written handler per action — forty of each, and a
+// version skew between CLI and gateway surfaced as a 404 on a path nobody could
+// name. Now the request *is* the typed enum both sides hold
+// (`operator_control::request`), and adding an operator action is a variant
+// plus an arm here.
+
+/// Dispatch one operator call onto the shared use cases and answer with the
+/// matching reply arm.
+async fn operator(
+    State(state): State<AppState>,
+    Json(request): Json<OperatorRequest>,
+) -> Result<Json<OperatorReply>, ApiError> {
+    Ok(Json(match request {
+        OperatorRequest::Query(query) => OperatorReply::Query(operator_query(&state, query).await?),
+        OperatorRequest::Command(command) => {
+            OperatorReply::Command(operator_command(&state, command).await?)
+        }
+    }))
+}
+
+async fn operator_query(
+    state: &AppState,
+    query: OperatorQuery,
+) -> Result<OperatorQueryResult, ApiError> {
+    let actions = &state.actions;
+    Ok(match query {
+        OperatorQuery::Runs { limit } => OperatorQueryResult::Runs(actions.runs(limit).await?),
+        OperatorQuery::Run { id } => OperatorQueryResult::Run(actions.run(&id).await?),
+        OperatorQuery::Sessions => {
+            OperatorQueryResult::Sessions(actions.session_summaries().await?)
+        }
+        OperatorQuery::Memories => {
+            OperatorQueryResult::Memories(actions.list_memories(None).await?)
+        }
+        OperatorQuery::MemorySearch { query, limit } => {
+            OperatorQueryResult::MemorySearch(actions.memory_search(&query, limit).await?)
+        }
+        OperatorQuery::Pairings => OperatorQueryResult::Pairings(actions.pairing_views().await?),
+        OperatorQuery::DreamPreview => {
+            OperatorQueryResult::DreamPreview(actions.dream_preview().await?)
+        }
+        OperatorQuery::HomeOverride => {
+            OperatorQueryResult::HomeOverride(actions.home_override().await?)
+        }
+        OperatorQuery::WikiSearch { query, limit } => {
+            OperatorQueryResult::WikiHits(actions.wiki_search(&query, limit).await?)
+        }
+        OperatorQuery::WikiStatus => OperatorQueryResult::WikiStatus(actions.wiki_status().await?),
+        OperatorQuery::CronJobs => OperatorQueryResult::CronJobs(actions.list_cron_jobs().await?),
+    })
+}
+
+async fn operator_command(
+    state: &AppState,
+    command: OperatorCommand,
+) -> Result<OperatorCommandResult, ApiError> {
+    let actions = &state.actions;
+    // A name or expression the operator got wrong is theirs to fix, not a
+    // server fault — the CLI prints the message either way, but a 500 also
+    // logs an incident that never happened.
+    let caller_error = |error: anyhow::Error| ApiError::bad_request(format!("{error:#}"));
+    Ok(match command {
+        OperatorCommand::MemoryTransition { id, action } => {
+            match actions.memory_transition(&id, action).await? {
+                TransitionOutcome::Applied(_) => OperatorCommandResult::MemoryTransitioned,
+                TransitionOutcome::NotFound => {
+                    return Err(ApiError::bad_request(format!("no memory with id `{id}`")));
+                }
+            }
+        }
+        OperatorCommand::PruneRuns { cutoff } => OperatorCommandResult::RunsPruned {
+            removed: actions.prune_runs(cutoff).await?,
+        },
+        OperatorCommand::CleanSessions => OperatorCommandResult::SessionsCleaned {
+            removed: actions.clean_sessions().await?,
+        },
+        OperatorCommand::PairApprove { code } => OperatorCommandResult::PairApproved(match actions
+            .pair_approve(&code)
+            .await?
+        {
+            ApproveOutcome::Approved(request) => PairApproveOutcome::Approved { id: request.id },
+            ApproveOutcome::NotFound => PairApproveOutcome::NotFound,
+            ApproveOutcome::Locked { retry_after_secs } => {
+                PairApproveOutcome::Locked { retry_after_secs }
+            }
+        }),
+        OperatorCommand::PairRevoke { id } => OperatorCommandResult::PairRevoked {
+            revoked: actions.pair_revoke(&id).await?,
+        },
+        OperatorCommand::DreamApply => {
+            let (promoted, archived) = actions.dream_apply().await?;
+            OperatorCommandResult::DreamApplied { promoted, archived }
+        }
+        OperatorCommand::MemoryRepairScopes => OperatorCommandResult::MemoryScopesRepaired {
+            repaired: actions.repair_memory_scopes().await?,
+        },
+        OperatorCommand::MemoryBackfill => OperatorCommandResult::MemoryBackfilled {
+            embedded: actions.memory_backfill().await?,
+        },
+        OperatorCommand::ChunkIndex { rebuild } => {
+            OperatorCommandResult::WikiIndexed(actions.wiki_index(rebuild).await?)
+        }
+        OperatorCommand::CronAdd { spec } => OperatorCommandResult::CronAdded(Box::new(
+            actions.add_cron_job(spec).await.map_err(caller_error)?,
+        )),
+        OperatorCommand::CronRemove { name } => {
+            if !actions.remove_cron_job(&name).await? {
+                return Err(ApiError::bad_request(no_cron_job_message(&name)));
+            }
+            OperatorCommandResult::CronRemoved
+        }
+        OperatorCommand::CronSetEnabled { name, enabled } => {
+            match actions.set_cron_enabled(&name, enabled).await? {
+                Some(job) => OperatorCommandResult::CronUpdated(Box::new(job)),
+                None => return Err(ApiError::bad_request(no_cron_job_message(&name))),
+            }
+        }
+        OperatorCommand::CronTrigger { name } => {
+            match actions
+                .trigger_cron_job(&name)
+                .await
+                .map_err(caller_error)?
+            {
+                Some(job) => OperatorCommandResult::CronUpdated(Box::new(job)),
+                None => return Err(ApiError::bad_request(no_cron_job_message(&name))),
+            }
+        }
+    })
 }
 
 // ---- interactive approval / clarify (for the GUI) --------------------------
@@ -2048,5 +1916,7 @@ mod tests {
     // visible → resolve delivers the decision/answer) is covered at the state
     // layer in `agent::interaction` and `services::clarify`; the handlers here
     // are thin wrappers over those, and `require_loopback` (shared with every
-    // operator write) gates the two POST routes by construction.
+    // operator write, `/api/operator` included) gates them by construction.
+    // The operator request/reply wire shapes are covered where they are defined
+    // (`operator_control::request`) — this dispatcher only names the arms.
 }

@@ -4,8 +4,8 @@
 //!
 //! The home is resolved at notify-time, so a `/sethome` command takes effect on
 //! the next notification without a restart: the runtime override (db) wins over
-//! the config `home_chat` fallback. When nothing resolves to a channel we can
-//! send through, it degrades to the local notifier (macOS).
+//! the config `home_chat` fallback. With no home resolved there is nowhere to
+//! deliver, and the caller is told so rather than left wondering.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -47,8 +47,6 @@ pub struct HomeNotifier {
     /// Config `home_chat`, as a `{platform}:{chat_id}` session id. Used when no
     /// `/sethome` override is set.
     fallback: Option<String>,
-    /// Last resort when no chat home resolves (macOS notifier).
-    local: Arc<dyn Notifier>,
 }
 
 impl HomeNotifier {
@@ -56,13 +54,11 @@ impl HomeNotifier {
         senders: HashMap<String, Arc<dyn TextSender>>,
         home: Arc<dyn HomeRepository>,
         fallback: Option<String>,
-        local: Arc<dyn Notifier>,
     ) -> Self {
         Self {
             senders,
             home,
             fallback,
-            local,
         }
     }
 
@@ -104,7 +100,7 @@ impl Notifier for HomeNotifier {
                 }
                 Ok(())
             }
-            None => self.local.notify(title, body).await,
+            None => anyhow::bail!("no home chat is configured; nothing to notify"),
         }
     }
 }

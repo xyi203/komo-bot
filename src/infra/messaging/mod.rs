@@ -2,7 +2,6 @@
 pub mod api;
 pub mod feishu;
 pub mod home_notifier;
-pub mod macos_notifier;
 pub mod telegram;
 pub mod wechat;
 

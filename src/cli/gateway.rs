@@ -23,7 +23,7 @@ use crate::{
     },
     infra::{
         file_watcher::FileWatcher,
-        messaging::{api::ApiChannel, home_notifier::HomeNotifier, macos_notifier::MacosNotifier},
+        messaging::{api::ApiChannel, home_notifier::HomeNotifier},
     },
     plugins::{self, ChannelCx, ChannelRegistry, SweepCx, SweepRegistry},
     services::operator_control::actions::OperatorActions,
@@ -124,15 +124,13 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // A single home notifier delivers all proactive output (routines, task
     // due notices, the shutdown notice). It resolves the home chat at
     // notify-time — a `/sethome` override (db) wins over the config `home_chat`
-    // (plugin order preserves the feishu-first priority) — and degrades to the
-    // local macOS notifier when no chat home resolves.
+    // (plugin order preserves the feishu-first priority).
     let config_home = channel_reg.config_home();
     let home_repo: Arc<dyn HomeRepository> = db.clone();
     let notifier: Arc<dyn Notifier> = Arc::new(HomeNotifier::new(
         channel_reg.senders(),
         home_repo.clone(),
         config_home.clone(),
-        Arc::new(MacosNotifier),
     ));
 
     // Taken before the runtime moves into the handler: /health reports what the

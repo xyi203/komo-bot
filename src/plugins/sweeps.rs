@@ -9,15 +9,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use komo_bot::daemon::{
-    BriefingSweep, DreamSweep, Maintenance, MemoryMonitorSweep, ReminderSweep, ReviewSweep,
-    Schedule, TaskSweep, WorkdayGated,
+    BriefingSweep, DreamSweep, Maintenance, ReviewSweep, Schedule, TaskSweep, WorkdayGated,
 };
 use komo_bot::gateway::MaintenanceService;
 use komo_infra::workday::HolidayCalendar;
 
 use super::{Plugin, SweepCx, SweepRegistry};
 use crate::domain::briefing::BriefingMarkRepository;
-use crate::domain::reminder::ReminderRepository;
 use crate::domain::task::TaskRepository;
 
 pub struct ReviewPlugin;
@@ -34,29 +32,6 @@ impl Plugin for ReviewPlugin {
             schedule: cx.maintenance_schedule.clone(),
             maintenance: Arc::new(ReviewSweep {
                 review: cx.review.clone(),
-            }),
-            alert: Some(cx.notifier.clone()),
-        });
-        Ok(())
-    }
-}
-
-pub struct RemindersPlugin;
-
-#[async_trait]
-impl Plugin for RemindersPlugin {
-    fn name(&self) -> &'static str {
-        "reminders"
-    }
-
-    async fn setup_sweeps(&self, reg: &mut SweepRegistry, cx: &SweepCx<'_>) -> anyhow::Result<()> {
-        let reminders: Arc<dyn ReminderRepository> = cx.db.clone();
-        reg.sweep(MaintenanceService {
-            name: "reminders".to_string(),
-            schedule: Schedule::parse("* * * * *")?,
-            maintenance: Arc::new(ReminderSweep {
-                reminders,
-                notifier: cx.notifier.clone(),
             }),
             alert: Some(cx.notifier.clone()),
         });
@@ -87,30 +62,9 @@ impl Plugin for TasksPlugin {
     }
 }
 
-/// Always-on RSS observability. Reads only the process's own resident set, so
-/// it's infallible — no breaker alert.
-pub struct MemoryMonitorPlugin;
-
-#[async_trait]
-impl Plugin for MemoryMonitorPlugin {
-    fn name(&self) -> &'static str {
-        "memory-monitor"
-    }
-
-    async fn setup_sweeps(&self, reg: &mut SweepRegistry, _cx: &SweepCx<'_>) -> anyhow::Result<()> {
-        reg.sweep(MaintenanceService {
-            name: "memory-monitor".to_string(),
-            schedule: Schedule::parse("*/5 * * * *")?,
-            maintenance: Arc::new(MemoryMonitorSweep::new()),
-            alert: None,
-        });
-        Ok(())
-    }
-}
-
 /// Daily briefing — mounts only when the user opted in with
 /// `briefing_schedule`. Reads tasks + memories, composes on the aux LLM,
-/// delivers via the same home notifier as reminders.
+/// delivers via the same home notifier as every other sweep.
 pub struct BriefingPlugin;
 
 #[async_trait]

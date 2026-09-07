@@ -405,6 +405,17 @@ impl ActionColumns {
                 prompt: prompt.clone(),
                 skills: serde_json::to_string(skills)?,
             },
+            // The delivered text rides in the `prompt` column for the same
+            // reason a workspace rides in `workdir`: it is the job's one piece
+            // of authored text, and the table is durable.
+            CronAction::Message { text } => Self {
+                command: String::new(),
+                args: String::new(),
+                workdir: String::new(),
+                timeout_secs: 0,
+                prompt: text.clone(),
+                skills: String::new(),
+            },
         })
     }
 }
@@ -433,6 +444,10 @@ fn job_from_record(record: CronJobRecord) -> anyhow::Result<CronJob> {
             prompt: record.prompt,
             skills: serde_json::from_str(&record.skills).unwrap_or_default(),
             workspace: (!record.workdir.is_empty()).then_some(record.workdir),
+        }
+    } else if record.kind == "message" {
+        CronAction::Message {
+            text: record.prompt,
         }
     } else {
         CronAction::Command {

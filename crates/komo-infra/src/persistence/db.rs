@@ -27,7 +27,6 @@ use komo_core::domain::{
         APPROVE_LOCKOUT_SECS, APPROVE_MAX_FAILURES, ApproveOutcome, PAIRING_CODE_TTL_SECS,
         PairingRepository, PairingRequest, PairingStatus, parse_pairing_status, verify_code,
     },
-    reminder::{Reminder, ReminderRepository, ReminderStatus, parse_reminder_status},
     repository::{MessageRepository, SessionEventRepository, SessionRepository},
     run::{INTERRUPTED_ERROR, MemoryUse, Run, RunRepository, RunStatus, RunStep, parse_run_status},
     run_projection::{ProjectedRun, RunProjectionStore, project_runs},
@@ -117,17 +116,6 @@ struct SkillRecord {
     description: String,
     instructions: String,
     protected: bool,
-}
-
-#[derive(Debug, toasty::Model)]
-struct ReminderRecord {
-    #[key]
-    id: String,
-    message: String,
-    run_at: i64,
-    status: String,   // "pending" | "fired" | "missed" | "cancelled"
-    schedule: String, // reserved for v2 cron expressions; always "" in v1
-    created_at: i64,
 }
 
 /// Session-scoped working todo list (`domain/todo.rs`). One row per session;
@@ -477,7 +465,6 @@ impl Db {
             .models(toasty::models!(
                 SessionRecord,
                 SkillRecord,
-                ReminderRecord,
                 SessionTodoRecord,
                 PairingRecord,
                 LockoutRecord,
@@ -1036,64 +1023,6 @@ fn run_from_record(record: RunRecord) -> anyhow::Result<Run> {
         learned: record.learned,
         outcome: record.outcome,
     })
-}
-
-// ── ReminderRepository ────────────────────────────────────────────────────────
-
-#[async_trait]
-impl ReminderRepository for Db {
-    async fn save(&self, reminder: &Reminder) -> anyhow::Result<()> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            toasty::create!(ReminderRecord {
-                id: reminder.id.clone(),
-                message: reminder.message.clone(),
-                run_at: reminder.run_at,
-                status: reminder.status.as_str().to_string(),
-                schedule: reminder.schedule.clone(),
-                created_at: reminder.created_at,
-            })
-            .exec(&mut conn)
-            .await?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn list_pending(&self) -> anyhow::Result<Vec<Reminder>> {
-        let mut conn = self.inner.connection().await?;
-        let rows = toasty::query!(ReminderRecord).exec(&mut conn).await?;
-        let pending = rows
-            .into_iter()
-            .filter(|r| r.status == "pending")
-            .map(reminder_from_record)
-            .collect();
-        Ok(pending)
-    }
-
-    async fn set_status(&self, id: &str, status: ReminderStatus) -> anyhow::Result<()> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            let mut record = ReminderRecord::get_by_id(&mut conn, id).await?;
-            record
-                .update()
-                .status(status.as_str().to_string())
-                .exec(&mut conn)
-                .await?;
-            Ok(())
-        })
-        .await
-    }
-
-    async fn reschedule(&self, id: &str, next_run_at: i64) -> anyhow::Result<()> {
-        with_write_retry(|| async {
-            let mut conn = self.inner.connection().await?;
-            let mut record = ReminderRecord::get_by_id(&mut conn, id).await?;
-            record.update().run_at(next_run_at).exec(&mut conn).await?;
-            Ok(())
-        })
-        .await
-    }
 }
 
 // ── SessionTodoRepository ─────────────────────────────────────────────────────
@@ -2112,17 +2041,6 @@ fn pairing_from_record(record: PairingRecord) -> PairingRequest {
     }
 }
 
-fn reminder_from_record(record: ReminderRecord) -> Reminder {
-    Reminder {
-        id: record.id,
-        message: record.message,
-        run_at: record.run_at,
-        status: parse_reminder_status(&record.status),
-        schedule: record.schedule,
-        created_at: record.created_at,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use komo_core::domain::message::Role;
@@ -2156,7 +2074,6 @@ mod tests {
             .unwrap();
     }
     use super::*;
-    use komo_core::domain::reminder::ReminderStatus;
     use komo_core::domain::run_projection::ProjectedStep;
 
     /// A komo home of this test's own, wiped first.
@@ -2863,55 +2780,6 @@ mod tests {
         let removed = SessionRepository::delete_empty_sessions(&db).await.unwrap();
         assert_eq!(removed, 0);
         assert_eq!(SessionRepository::list(&db).await.unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn db_reminder_schedule_roundtrip() {
-        let db = Db::connect(&sqlite_url("komo_reminder_schedule_test.db"))
-            .await
-            .unwrap();
-        let now_unix = chrono::Utc::now().timestamp();
-        let reminder = komo_core::domain::reminder::Reminder::recurring(
-            "take medication".to_string(),
-            now_unix + 3600,
-            "0 9 * * *".to_string(),
-        );
-
-        ReminderRepository::save(&db, &reminder).await.unwrap();
-        let pending = ReminderRepository::list_pending(&db).await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].schedule, "0 9 * * *");
-        assert_eq!(pending[0].status, ReminderStatus::Pending);
-
-        let new_run_at = now_unix + 90_000;
-        ReminderRepository::reschedule(&db, &reminder.id, new_run_at)
-            .await
-            .unwrap();
-
-        let pending = ReminderRepository::list_pending(&db).await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].run_at, new_run_at);
-        assert_eq!(pending[0].status, ReminderStatus::Pending);
-    }
-
-    #[tokio::test]
-    async fn db_reminder_roundtrip() {
-        let db = Db::connect(&sqlite_url("komo_reminder_repo_test.db"))
-            .await
-            .unwrap();
-        let reminder = Reminder::new("drink water".to_string(), 9999999999);
-
-        ReminderRepository::save(&db, &reminder).await.unwrap();
-        let pending = ReminderRepository::list_pending(&db).await.unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].message, "drink water");
-        assert_eq!(pending[0].status, ReminderStatus::Pending);
-
-        ReminderRepository::set_status(&db, &reminder.id, ReminderStatus::Fired)
-            .await
-            .unwrap();
-        let pending = ReminderRepository::list_pending(&db).await.unwrap();
-        assert!(pending.is_empty());
     }
 
     #[tokio::test]

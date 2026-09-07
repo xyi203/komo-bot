@@ -91,30 +91,24 @@ const STATE_GUIDANCE: &str = "Questions about your own state — your sessions, 
     something earlier that you can no longer see, search the stored transcript \
     with `session` (action=search) instead of guessing.";
 
-/// Gated on the `reminder` tool.
-const REMINDER_GUIDANCE: &str = "You CAN schedule reminders: call the `reminder` tool \
-    (action=create) with a message and a delay. Reminders are delivered as desktop \
-    notifications by the `komo gateway` background process — you do NOT count down \
-    yourself, and you must never pretend to track time in the conversation. If the \
-    user asks for a reminder, create it with the tool and relay the tool's \
-    confirmation. For recurring reminders (\"every day at 9am\"), pass a 5-field cron \
-    expression via the `cron` parameter (e.g. \"0 9 * * *\"); times are the user's \
-    local timezone. One-shot reminders use `after` or `at` as before.";
-
-/// Gated on the `cron` tool. Its job is the routing decision: a recurring ask
-/// is a *job* when it needs work done, and a reminder only when a message is the
-/// whole point.
-const CRON_GUIDANCE: &str = "You CAN schedule recurring work: call the `cron` tool \
-    (action=add) with a name, a 5-field cron `schedule` in the user's local timezone, \
+/// Gated on the `cron` tool. Its job is the routing decision: a scheduled ask
+/// is an agent job when it needs work done, and a `message` job when delivering
+/// the words is the whole point.
+const CRON_GUIDANCE: &str = "You CAN schedule work on a clock: call the `cron` tool \
+    (action=add) with a name, a 5-field cron `schedule` in the user's local timezone \
+    (or `after` for a relative delay), \
     and a `prompt` — an agent job runs that prompt as a full turn with your tools \
-    each time it fires. Choose between the two schedulers by what has to happen: \
+    each time it fires. Choose the action by what has to happen: \
     \"每天8点告诉我今天的日程\" or \"每周五跑一下轮换脚本\" needs work done, so it is a \
-    cron job; \"提醒我下午3点开会\" only needs a message delivered, so it is a \
-    `reminder`. Write the prompt self-contained — the scheduled turn has none of \
+    `prompt` job; a job whose only purpose is delivering fixed text — \
+    \"提醒我下午3点开会\" — uses `message`, which runs nothing at all. \
+    Write the prompt self-contained — the scheduled turn has none of \
     this conversation's history — and use action=list/disable/enable/remove to \
-    inspect and adjust existing jobs instead of adding near-duplicates. Jobs fire \
-    only while `komo gateway` runs, their output is delivered to the user's home \
-    channel rather than here, and creating or changing one asks the user to approve.";
+    inspect and adjust existing jobs instead of adding near-duplicates. You do NOT \
+    count down yourself and must never pretend to track time in the conversation: \
+    jobs fire only while `komo gateway` runs, their output is delivered to the \
+    user's home channel rather than here, and creating or changing one asks the \
+    user to approve.";
 
 /// Injected whenever any tool is loaded. Two per-round economies the executor
 /// already supports but the model won't use unprompted: independent calls run
@@ -474,9 +468,6 @@ impl SystemPromptBuilder {
         if self.has("session") || self.has("memory") || self.has("skill") {
             parts.push(STATE_GUIDANCE.to_string());
         }
-        if self.has("reminder") {
-            parts.push(REMINDER_GUIDANCE.to_string());
-        }
         if self.has("cron") {
             parts.push(CRON_GUIDANCE.to_string());
         }
@@ -659,7 +650,7 @@ mod tests {
         assert!(p.contains("Model: deepseek-chat"));
         assert!(p.contains("Provider: deepseek"));
         // No tools → no tool-aware guidance.
-        assert!(!p.contains("reminder"));
+        assert!(!p.contains("schedule work on a clock"));
         assert!(!p.contains("tmux ls"));
     }
 
@@ -667,13 +658,12 @@ mod tests {
     fn tool_guidance_is_gated_on_loaded_tools() {
         let p = SystemPromptBuilder::new(&config())
             .home(tmp("gated"))
-            .tools(vec!["reminder".into(), "memory".into(), "time".into()])
+            .tools(vec!["memory".into(), "time".into()])
             .build();
-        assert!(p.contains("schedule reminders"));
         assert!(p.contains("tmux ls")); // state guidance, via `memory`
         assert!(p.contains("`time` tool"));
         // `cron` wasn't loaded, so its scheduler-routing guidance stays out.
-        assert!(!p.contains("schedule recurring work"));
+        assert!(!p.contains("schedule work on a clock"));
     }
 
     #[test]
@@ -726,7 +716,7 @@ mod tests {
             .home(tmp("cron"))
             .tools(vec!["cron".into()])
             .build();
-        assert!(p.contains("schedule recurring work"));
+        assert!(p.contains("schedule work on a clock"));
     }
 
     #[test]

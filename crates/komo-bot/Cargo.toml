@@ -22,8 +22,6 @@ reqwest = { workspace = true }
 tokio = { version = "1.53.1", features = ["full"] }
 # Cron-expression parsing for the maintenance supervisor's schedules.
 croner = "3"
-# `mach_task_basic_info` for the memory-monitor sweep's RSS reading.
-libc = "0.2.189"
 # Resolves `~/.agents` for the machine-wide instruction file.
 dirs = { workspace = true }
 

@@ -23,7 +23,6 @@ use crate::domain::memory::{
 };
 use crate::domain::message::Message;
 use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
-use crate::domain::reminder::{Reminder, ReminderRepository};
 use crate::domain::repository::{
     MessageRepository, SessionEventRepository, SessionRepository, SkillRepository,
 };
@@ -100,7 +99,6 @@ pub struct OperatorActions {
     pub tasks: Arc<dyn TaskRepository>,
     pub memories: Arc<dyn MemoryRepository>,
     pub runs: Arc<dyn RunRepository>,
-    pub reminders: Arc<dyn ReminderRepository>,
     /// The concrete store, not `SkillRepository`: that trait carries only the
     /// automated write path (find/list/save), while every governance transition
     /// — promote, archive, expire — is an inherent method on the store.
@@ -313,12 +311,6 @@ impl OperatorActions {
 
     pub async fn delete_session(&self, id: &str) -> anyhow::Result<bool> {
         self.sessions.delete_session(id).await
-    }
-
-    pub async fn pending_reminders(&self) -> anyhow::Result<Vec<Reminder>> {
-        let mut pending = self.reminders.list_pending().await?;
-        pending.sort_by_key(|r| r.run_at);
-        Ok(pending)
     }
 
     pub async fn list_skills(&self) -> anyhow::Result<Vec<Skill>> {

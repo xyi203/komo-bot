@@ -19,7 +19,6 @@ use crate::domain::{
     home::HomeRepository,
     memory::MemoryRepository,
     pairing::{ApproveOutcome, PairingRepository},
-    reminder::ReminderRepository,
     repository::SessionRepository,
     run::RunRepository,
     task::TaskRepository,
@@ -110,12 +109,6 @@ impl DirectOperatorAdapter {
 
     pub(super) async fn query(&self, query: OperatorQuery) -> anyhow::Result<OperatorQueryResult> {
         Ok(match query {
-            OperatorQuery::Reminders => {
-                let mut pending =
-                    ReminderRepository::list_pending(self.db().await?.as_ref()).await?;
-                pending.sort_by_key(|r| r.run_at);
-                OperatorQueryResult::Reminders(pending)
-            }
             OperatorQuery::Tasks => OperatorQueryResult::Tasks(
                 TaskRepository::list_open(self.db().await?.as_ref()).await?,
             ),

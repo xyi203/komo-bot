@@ -381,7 +381,6 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/runs", get(list_runs))
         .route("/api/runs/{id}", get(get_run))
         .route("/api/runs/{id}/resume", post(resume_run))
-        .route("/api/reminders", get(list_reminders))
         .route("/api/cron", get(list_cron_jobs))
         .route("/api/skills", get(list_skills))
         .route("/api/skills/{name}/audit", get(skill_audit))
@@ -1616,12 +1615,6 @@ async fn memory_repair_scopes(State(state): State<AppState>) -> Result<Response,
 }
 
 // ---- control-plane read endpoints (CLI ↔ gateway) --------------------------
-
-/// Pending reminders (backs `komo cron list`), soonest first.
-async fn list_reminders(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let pending = state.actions.pending_reminders().await?;
-    Ok(Json(json!({ "reminders": pending })))
-}
 
 // ---- cron-job endpoints (backs `komo cron`) ---------------------------------
 

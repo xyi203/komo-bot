@@ -21,7 +21,6 @@ pub mod message;
 pub mod notify;
 pub mod pairing;
 pub mod policy;
-pub mod reminder;
 pub mod repository;
 pub mod reviewer;
 pub mod run;

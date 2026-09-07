@@ -502,6 +502,9 @@ pub fn local_minute(unix: i64) -> String {
 ///   policy: with no human to prompt, a `Risk::Normal` action passes only
 ///   through this job's own [`CronJob::grants`] (approved when it was created)
 ///   or an `unattended = true` `[policy]` rule.
+/// - `Message` — deliver a fixed text. No process, no LLM: a routine whose
+///   whole purpose is the nudge ("提醒我下午3点开会"), one-shot via `@at` or
+///   recurring on a cron expression like any other job.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CronAction {
@@ -535,6 +538,10 @@ pub enum CronAction {
         #[serde(default)]
         workspace: Option<String>,
     },
+    Message {
+        /// The text delivered verbatim when the job fires.
+        text: String,
+    },
 }
 
 impl CronAction {
@@ -543,6 +550,7 @@ impl CronAction {
         match self {
             CronAction::Command { .. } => "command",
             CronAction::Agent { .. } => "agent",
+            CronAction::Message { .. } => "message",
         }
     }
 }

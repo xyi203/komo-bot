@@ -23,54 +23,21 @@ pub(crate) fn local_time(unix: i64) -> String {
         .unwrap_or_else(|| unix.to_string())
 }
 
-/// List scheduled jobs (cron.db) and pending reminders — the two things the
-/// gateway fires on a clock.
+/// List scheduled jobs — what the gateway fires on a clock or an event.
 pub async fn cron_list(control: &OperatorControl) -> anyhow::Result<()> {
     let OperatorQueryResult::CronJobs(jobs) = control.query(OperatorQuery::CronJobs).await? else {
         unreachable!("CronJobs query answers with CronJobs");
     };
-    let OperatorQueryResult::Reminders(mut pending) =
-        control.query(OperatorQuery::Reminders).await?
-    else {
-        unreachable!("Reminders query answers with Reminders");
-    };
-    pending.sort_by_key(|r| r.run_at);
-
     if jobs.is_empty() {
         println!("No scheduled jobs. (`komo cron add <name> <schedule> <command>`)");
-    } else {
-        println!("jobs:");
-        for job in &jobs {
-            print_cron_job(job);
-        }
-    }
-
-    if pending.is_empty() {
-        println!("\nNo pending reminders.");
         return Ok(());
     }
-    println!("\nreminders:");
-    for r in pending {
-        if r.is_recurring() {
-            println!(
-                "  {}  [{}]  next {}  {}",
-                r.id,
-                r.schedule,
-                local_time(r.run_at),
-                r.message
-            );
-        } else {
-            println!(
-                "  {}  [one-shot]  due {}  {}",
-                r.id,
-                local_time(r.run_at),
-                r.message
-            );
-        }
+    println!("jobs:");
+    for job in &jobs {
+        print_cron_job(job);
     }
     Ok(())
 }
-
 /// One job line (+ a detail line for its last run, when it has one).
 fn print_cron_job(job: &CronJob) {
     let state = match job.status {
@@ -99,6 +66,7 @@ fn print_cron_job(job: &CronJob) {
             };
             format!("agent: {}{skills}{workspace}", oneline(prompt, 80))
         }
+        CronAction::Message { text } => format!("message: {}", oneline(text, 80)),
     };
     println!(
         "  {}  ({})  [{}]  {}  → {}",

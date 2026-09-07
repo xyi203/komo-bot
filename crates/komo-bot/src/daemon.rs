@@ -34,7 +34,6 @@ use komo_core::domain::{
     memory::{Memory, MemoryRepository},
     message::Message,
     notify::Notifier,
-    reminder::{Reminder, ReminderRepository, ReminderStatus},
     repository::SessionEventRepository,
     run::RunStatus,
     run_projection::project_runs,
@@ -109,7 +108,6 @@ pub struct MaintenanceSummary {
     pub sessions_reviewed: usize,
     pub memories_written: usize,
     pub skills_written: usize,
-    pub reminders_fired: usize,
     pub tasks_notified: usize,
     /// Commitments the reviewer captured into the task inbox this sweep.
     pub tasks_captured: usize,
@@ -272,111 +270,6 @@ impl Maintenance for DreamSweep {
     }
 }
 
-/// Periodic RSS sampler — komo's analog of hermes' `gateway/memory_monitor.py`.
-///
-/// A long-lived gateway holds no per-session process state (transcripts live in
-/// the db, there is no per-session agent cache), so its resident set should sit
-/// roughly flat. The value here is the *time series* it prints: a slow leak — a
-/// map that never releases a session, an unbounded cache — surfaces as a
-/// climbing `rss=` in the logs long before it becomes an OOM, which is exactly
-/// how hermes kept catching and fixing leaks over time.
-///
-/// It reads only the process's own RSS — no repository, no LLM, no allocation of
-/// note — so it is effectively infallible and never trips the circuit breaker
-/// (wired with `alert: None`). Each cycle logs one line:
-/// `[MEMORY] rss=11.4MB peak=12.1MB`, where `peak` is tracked across the process
-/// lifetime so a monotonic climb is obvious even without log aggregation.
-pub struct MemoryMonitorSweep {
-    peak_rss: std::sync::atomic::AtomicU64,
-}
-
-impl MemoryMonitorSweep {
-    pub fn new() -> Self {
-        Self {
-            peak_rss: std::sync::atomic::AtomicU64::new(0),
-        }
-    }
-}
-
-impl Default for MemoryMonitorSweep {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[async_trait]
-impl Maintenance for MemoryMonitorSweep {
-    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
-        match current_rss_bytes() {
-            Some(rss) => {
-                // fetch_max returns the prior peak; the live peak is max(prior, rss).
-                let peak = self
-                    .peak_rss
-                    .fetch_max(rss, std::sync::atomic::Ordering::Relaxed)
-                    .max(rss);
-                info!(
-                    target: "komo::memory",
-                    rss_bytes = rss,
-                    peak_bytes = peak,
-                    "[MEMORY] rss={} peak={}",
-                    fmt_bytes(rss),
-                    fmt_bytes(peak),
-                );
-            }
-            // Unsupported platform: make the absence of a reading visible without
-            // failing the cycle (which would otherwise count toward the breaker).
-            None => warn!(target: "komo::memory", "[MEMORY] rss unavailable on this platform"),
-        }
-        Ok(MaintenanceSummary::default())
-    }
-}
-
-/// Human-friendly byte formatting for the `[MEMORY]` log line.
-fn fmt_bytes(bytes: u64) -> String {
-    const MB: f64 = 1024.0 * 1024.0;
-    format!("{:.1}MB", bytes as f64 / MB)
-}
-
-/// The process's current resident set size (RSS) in bytes, or `None` on a
-/// platform we don't sample. Uses only `libc` (already a dependency) — no extra
-/// crate, no `sysinfo`.
-#[cfg(target_os = "macos")]
-// libc marks the mach task-port accessors deprecated in favor of the `mach2`
-// crate; we keep the one symbol here rather than take on that dependency.
-#[allow(deprecated)]
-fn current_rss_bytes() -> Option<u64> {
-    // MACH_TASK_BASIC_INFO carries `resident_size` in bytes.
-    unsafe {
-        let mut info: libc::mach_task_basic_info = std::mem::zeroed();
-        let mut count = (std::mem::size_of::<libc::mach_task_basic_info>()
-            / std::mem::size_of::<libc::natural_t>())
-            as libc::mach_msg_type_number_t;
-        // `mach_task_self_` (the static port) rather than the deprecated
-        // `mach_task_self()` fn, so we avoid pulling in the `mach2` crate.
-        let kr = libc::task_info(
-            libc::mach_task_self_,
-            libc::MACH_TASK_BASIC_INFO,
-            &mut info as *mut _ as libc::task_info_t,
-            &mut count,
-        );
-        (kr == libc::KERN_SUCCESS).then_some(info.resident_size as u64)
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn current_rss_bytes() -> Option<u64> {
-    // /proc/self/statm field 2 (0-indexed 1) is the resident set size in pages.
-    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
-    let resident_pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    (page_size > 0).then(|| resident_pages * page_size as u64)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn current_rss_bytes() -> Option<u64> {
-    None
-}
-
 /// Cap on the job output forwarded in a notification, so a chatty script can't
 /// blow past a chat platform's message limit. The delivered text is what the
 /// operator reads — logs keep nothing extra, so the cap discloses truncation.
@@ -394,8 +287,7 @@ const JOB_OUTPUT_CAP: usize = 3000;
 /// stamped) *before* the command runs, so a crash mid-run can't re-fire the
 /// slot on restart, and a job running longer than a sweep tick can't be
 /// double-started. A gateway asleep over a slot runs the job late, once —
-/// `next_run_at` is computed from now, never replaying missed ticks (same rule
-/// as recurring reminders).
+/// `next_run_at` is computed from now, never replaying missed ticks.
 ///
 /// Every outcome is delivered, success and failure alike: a weekly job whose
 /// failures were only log lines would silently stop doing its work for weeks.
@@ -987,6 +879,15 @@ impl RoutineEventSource {
                 self.execute_cron_agent(job, prompt, skills, workspace.as_deref(), arrived)
                     .await
             }
+            // Nothing runs: the text *is* the outcome. It still goes out under
+            // the job's `notify` policy and settles as a run like any other,
+            // so a nudge is queryable after the notification is gone.
+            CronAction::Message { text } => JobOutcome {
+                title: format!("Komo「{}」", job.name),
+                body: text.clone(),
+                status: RoutineRunStatus::Ok,
+                session: None,
+            },
         }
     }
 
@@ -1286,8 +1187,8 @@ fn truncate_tail(s: &str, cap: usize) -> String {
     format!("…(earlier output truncated)\n{}", &s[start..])
 }
 
-/// Grace window: reminders missed by up to this many seconds are delivered late
-/// (with a "missed" prefix); older ones are marked missed without re-notifying.
+/// Grace window: a due item missed by up to this many seconds is still
+/// delivered on time; past it, it is delivered as overdue.
 const REMINDER_GRACE_SECS: i64 = 600;
 
 /// Deliver a group of due items as a **single coalesced notification**, so a
@@ -1313,91 +1214,6 @@ async fn notify_batch(notifier: &dyn Notifier, title: &str, messages: &[String])
                 .await
                 .ok();
         }
-    }
-}
-
-/// Sweep due reminders every minute and deliver them as desktop notifications.
-pub struct ReminderSweep {
-    pub reminders: Arc<dyn ReminderRepository>,
-    pub notifier: Arc<dyn Notifier>,
-}
-
-#[async_trait]
-impl Maintenance for ReminderSweep {
-    async fn run(&self) -> anyhow::Result<MaintenanceSummary> {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let mut summary = MaintenanceSummary::default();
-
-        let due: Vec<Reminder> = self
-            .reminders
-            .list_pending()
-            .await?
-            .into_iter()
-            .filter(|r| r.run_at <= now)
-            .collect();
-
-        // Phase 1 — notify first (still before any persist, so a crash prefers a
-        // duplicate over silent loss), but coalesced: split by presentation
-        // (on-time vs missed) and send each group as one ping.
-        let mut on_time = Vec::new();
-        let mut missed = Vec::new();
-        for r in &due {
-            if now - r.run_at > REMINDER_GRACE_SECS {
-                missed.push(r.message.clone());
-            } else {
-                on_time.push(r.message.clone());
-            }
-        }
-        notify_batch(&*self.notifier, "Komo reminder", &on_time).await;
-        notify_batch(&*self.notifier, "Komo (missed reminder)", &missed).await;
-
-        // Phase 2 — persist each reminder's state transition (no per-item notify
-        // now; the ping already went out above).
-        for r in &due {
-            let late = now - r.run_at;
-            if r.is_recurring() {
-                // Compute next occurrence from now (not run_at) so a resting daemon
-                // always jumps to a future slot without replaying missed ticks.
-                match next_occurrence_local(&r.schedule, now) {
-                    Ok(next) => {
-                        if let Err(e) = self.reminders.reschedule(&r.id, next).await {
-                            warn!(error = %e, id = %r.id, "failed to reschedule recurring reminder");
-                        } else {
-                            summary.reminders_fired += 1;
-                        }
-                    }
-                    Err(e) => {
-                        // Broken expression (bypassed tool validation): degrade to
-                        // missed so we don't spam errors on every tick.
-                        warn!(error = %e, id = %r.id, "broken schedule; marking missed");
-                        if let Err(e) = self
-                            .reminders
-                            .set_status(&r.id, ReminderStatus::Missed)
-                            .await
-                        {
-                            warn!(error = %e, id = %r.id, "failed to mark reminder missed");
-                        }
-                    }
-                }
-            } else if late > REMINDER_GRACE_SECS {
-                if let Err(e) = self
-                    .reminders
-                    .set_status(&r.id, ReminderStatus::Missed)
-                    .await
-                {
-                    warn!(error = %e, id = %r.id, "failed to mark reminder missed");
-                }
-            } else if let Err(e) = self
-                .reminders
-                .set_status(&r.id, ReminderStatus::Fired)
-                .await
-            {
-                warn!(error = %e, id = %r.id, "failed to mark reminder fired");
-            } else {
-                summary.reminders_fired += 1;
-            }
-        }
-        Ok(summary)
     }
 }
 
@@ -1797,7 +1613,6 @@ where
                     sessions = summary.sessions_reviewed,
                     memories = summary.memories_written,
                     skills = summary.skills_written,
-                    reminders = summary.reminders_fired,
                     tasks_captured = summary.tasks_captured,
                     briefings = summary.briefings_sent,
                     promoted = summary.memories_promoted,
@@ -1862,7 +1677,6 @@ where
 mod tests {
     use super::*;
     use komo_core::domain::cron::{FeishuMatch, Trigger};
-    use komo_core::domain::reminder::{Reminder, ReminderStatus};
     use komo_core::domain::session_event::WakeupCause;
     use komo_core::domain::task::{Task, TaskStatus};
     use komo_core::domain::trigger::FeishuEvent;
@@ -2191,90 +2005,6 @@ mod tests {
         );
     }
 
-    // ── MemoryMonitorSweep ────────────────────────────────────────────────────
-
-    #[test]
-    fn fmt_bytes_renders_one_decimal_megabytes() {
-        assert_eq!(fmt_bytes(0), "0.0MB");
-        assert_eq!(fmt_bytes(1024 * 1024), "1.0MB");
-        assert_eq!(fmt_bytes(11_639_808), "11.1MB");
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    #[test]
-    fn current_rss_is_nonzero_on_supported_platforms() {
-        let rss = current_rss_bytes().expect("RSS should be readable on macOS/Linux");
-        assert!(rss > 0, "a running test process must have a nonzero RSS");
-    }
-
-    #[tokio::test]
-    async fn memory_monitor_run_succeeds_and_tracks_peak() {
-        let sweep = MemoryMonitorSweep::new();
-        // Infallible by contract — a sampling failure must not fail the cycle.
-        sweep.run().await.expect("monitor cycle must not error");
-        // On a platform we sample, a reading was taken and recorded as the peak;
-        // elsewhere it stays 0. Either way peak is monotonic across cycles.
-        let after_first = sweep.peak_rss.load(std::sync::atomic::Ordering::Relaxed);
-        sweep
-            .run()
-            .await
-            .expect("second monitor cycle must not error");
-        let after_second = sweep.peak_rss.load(std::sync::atomic::Ordering::Relaxed);
-        assert!(after_second >= after_first, "peak RSS must never decrease");
-    }
-
-    // ── FakeReminderRepository ────────────────────────────────────────────────
-
-    #[derive(Default)]
-    struct FakeRepo {
-        reminders: Mutex<Vec<Reminder>>,
-    }
-
-    #[async_trait]
-    impl ReminderRepository for FakeRepo {
-        async fn save(&self, reminder: &Reminder) -> anyhow::Result<()> {
-            self.reminders.lock().unwrap().push(reminder.clone());
-            Ok(())
-        }
-
-        async fn list_pending(&self) -> anyhow::Result<Vec<Reminder>> {
-            Ok(self
-                .reminders
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|r| r.status == ReminderStatus::Pending)
-                .cloned()
-                .collect())
-        }
-
-        async fn set_status(&self, id: &str, status: ReminderStatus) -> anyhow::Result<()> {
-            if let Some(r) = self
-                .reminders
-                .lock()
-                .unwrap()
-                .iter_mut()
-                .find(|r| r.id == id)
-            {
-                r.status = status;
-            }
-            Ok(())
-        }
-
-        async fn reschedule(&self, id: &str, next_run_at: i64) -> anyhow::Result<()> {
-            if let Some(r) = self
-                .reminders
-                .lock()
-                .unwrap()
-                .iter_mut()
-                .find(|r| r.id == id)
-            {
-                r.run_at = next_run_at;
-            }
-            Ok(())
-        }
-    }
-
     // ── FakeNotifier ──────────────────────────────────────────────────────────
 
     #[derive(Default)]
@@ -2414,6 +2144,32 @@ mod tests {
             "the run says what fired it: {}",
             run.event
         );
+    }
+
+    /// A message job runs nothing: the text is delivered verbatim and the
+    /// firing settles `ok` like any other run.
+    #[tokio::test]
+    async fn cron_message_job_delivers_its_text_verbatim() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let job = CronJob::new(
+            "meeting",
+            Trigger::cron("* * * * *"),
+            CronAction::Message {
+                text: "下午3点开会".to_string(),
+            },
+            now,
+        );
+        let (sweep, repo, notifier) = cron_sweep_with(vec![job], false);
+        let summary = sweep.sweep_due().await.unwrap();
+        assert_eq!(summary.jobs_run, 1);
+        let calls = notifier.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, "下午3点开会");
+        let stored = repo.jobs.lock().unwrap()[0].clone();
+        let run = stored.last_run().expect("the firing is recorded");
+        assert_eq!(run.status, RoutineRunStatus::Ok);
+        assert_eq!(run.output, "下午3点开会");
+        assert!(run.session_id.is_none(), "no turn ran");
     }
 
     #[tokio::test]
@@ -3754,190 +3510,6 @@ mod tests {
         let tail = truncate_tail(&long, 10);
         assert!(tail.starts_with("…(earlier output truncated)"));
         assert!(tail.ends_with("然然然"));
-    }
-
-    fn sweep_with(
-        reminders: Vec<Reminder>,
-        notifier_fail: bool,
-    ) -> (ReminderSweep, Arc<FakeRepo>, Arc<FakeNotifier>) {
-        let repo = Arc::new(FakeRepo {
-            reminders: Mutex::new(reminders),
-        });
-        let notifier = Arc::new(FakeNotifier {
-            fail: notifier_fail,
-            ..Default::default()
-        });
-        let sweep = ReminderSweep {
-            reminders: repo.clone() as Arc<dyn ReminderRepository>,
-            notifier: notifier.clone() as Arc<dyn Notifier>,
-        };
-        (sweep, repo, notifier)
-    }
-
-    fn past_reminder(secs_ago: i64) -> Reminder {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        Reminder::new("test".to_string(), now - secs_ago)
-    }
-
-    fn future_reminder() -> Reminder {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        Reminder::new("future".to_string(), now + 3600)
-    }
-
-    fn recurring_reminder(secs_ago: i64, schedule: &str) -> Reminder {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        Reminder::recurring("test".to_string(), now - secs_ago, schedule.to_string())
-    }
-
-    #[tokio::test]
-    async fn sweep_fires_due_reminder() {
-        let r = past_reminder(30);
-        let id = r.id.clone();
-        let (sweep, repo, notifier) = sweep_with(vec![r], false);
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.reminders_fired, 1);
-        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
-        let status = repo
-            .reminders
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|r| r.id == id)
-            .unwrap()
-            .status
-            .clone();
-        assert_eq!(status, ReminderStatus::Fired);
-    }
-
-    #[tokio::test]
-    async fn sweep_skips_future_reminder() {
-        let (sweep, _, notifier) = sweep_with(vec![future_reminder()], false);
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.reminders_fired, 0);
-        assert!(notifier.calls.lock().unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    async fn sweep_marks_long_overdue_as_missed() {
-        let r = past_reminder(REMINDER_GRACE_SECS + 60);
-        let id = r.id.clone();
-        let (sweep, repo, notifier) = sweep_with(vec![r], false);
-        sweep.run().await.unwrap();
-        let status = repo
-            .reminders
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|r| r.id == id)
-            .unwrap()
-            .status
-            .clone();
-        assert_eq!(status, ReminderStatus::Missed);
-        let title = &notifier.calls.lock().unwrap()[0].0;
-        assert!(title.contains("missed"));
-    }
-
-    #[tokio::test]
-    async fn notifier_failure_does_not_abort_sweep() {
-        let r1 = past_reminder(10);
-        let r2 = past_reminder(20);
-        let (sweep, repo, _) = sweep_with(vec![r1, r2], true);
-        // Should not error even though notifier always fails.
-        sweep.run().await.unwrap();
-        // Both reminders attempted set_status despite notify failures.
-        let statuses: Vec<_> = repo
-            .reminders
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|r| r.status.clone())
-            .collect();
-        // set_status is called after notify — with fail=true, notify returns
-        // Err but sweep uses .ok(), so set_status still runs.
-        assert!(
-            statuses
-                .iter()
-                .all(|s| *s == ReminderStatus::Fired || *s == ReminderStatus::Pending)
-        );
-    }
-
-    #[tokio::test]
-    async fn sweep_coalesces_multiple_due_reminders() {
-        // Three on-time reminders due in the same sweep (the post-restart backlog
-        // shape) collapse into ONE notification, not three pings.
-        let (sweep, repo, notifier) = sweep_with(
-            vec![past_reminder(10), past_reminder(20), past_reminder(30)],
-            false,
-        );
-        let summary = sweep.run().await.unwrap();
-        assert_eq!(summary.reminders_fired, 3);
-
-        let calls = notifier.calls.lock().unwrap();
-        assert_eq!(
-            calls.len(),
-            1,
-            "three due reminders must coalesce to one ping"
-        );
-        assert_eq!(calls[0].0, "Komo reminder (3 items)");
-
-        // Every reminder still transitioned (guard flipped), not just the ping.
-        let fired = repo
-            .reminders
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|r| r.status == ReminderStatus::Fired)
-            .count();
-        assert_eq!(fired, 3);
-    }
-
-    // ── recurring sweep ───────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn sweep_advances_recurring_reminder() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let r = recurring_reminder(30, "* * * * *");
-        let id = r.id.clone();
-        let (sweep, repo, notifier) = sweep_with(vec![r], false);
-        sweep.run().await.unwrap();
-
-        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
-        assert_eq!(notifier.calls.lock().unwrap()[0].0, "Komo reminder");
-
-        let rems = repo.reminders.lock().unwrap();
-        let updated = rems.iter().find(|r| r.id == id).unwrap();
-        assert_eq!(updated.status, ReminderStatus::Pending);
-        assert!(updated.run_at > now);
-    }
-
-    #[tokio::test]
-    async fn sweep_recurring_overdue_fires_once_and_skips_catchup() {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        let r = recurring_reminder(3 * 86400, "0 9 * * *");
-        let id = r.id.clone();
-        let (sweep, repo, notifier) = sweep_with(vec![r], false);
-        sweep.run().await.unwrap();
-
-        // Only one notification (missed)
-        assert_eq!(notifier.calls.lock().unwrap().len(), 1);
-        assert!(notifier.calls.lock().unwrap()[0].0.contains("missed"));
-
-        let rems = repo.reminders.lock().unwrap();
-        let updated = rems.iter().find(|r| r.id == id).unwrap();
-        assert_eq!(updated.status, ReminderStatus::Pending);
-        assert!(updated.run_at > now);
-    }
-
-    #[tokio::test]
-    async fn sweep_marks_recurring_with_broken_schedule_missed() {
-        let r = recurring_reminder(30, "not a valid cron");
-        let id = r.id.clone();
-        let (sweep, repo, _) = sweep_with(vec![r], false);
-        sweep.run().await.unwrap();
-
-        let rems = repo.reminders.lock().unwrap();
-        let updated = rems.iter().find(|r| r.id == id).unwrap();
-        assert_eq!(updated.status, ReminderStatus::Missed);
     }
 
     #[test]

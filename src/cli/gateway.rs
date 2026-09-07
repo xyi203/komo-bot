@@ -123,7 +123,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     };
     plugins::run_channel_phase(&roster, &gate, &mut channel_reg, &channel_cx).await?;
 
-    // A single home notifier delivers all proactive output (reminders, task
+    // A single home notifier delivers all proactive output (routines, task
     // due notices, the shutdown notice). It resolves the home chat at
     // notify-time — a `/sethome` override (db) wins over the config `home_chat`
     // (plugin order preserves the feishu-first priority) — and degrades to the
@@ -310,7 +310,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             tasks: kanban.clone(),
             memories: wired.memories.clone(),
             runs: db.clone(),
-            reminders: db.clone(),
             skills: wired.skills.clone(),
             pairings: pairings.clone(),
             home: db.clone(),
@@ -347,7 +346,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             .unwrap_or_else(|| "off".to_string())
     };
     println!(
-        "Komo gateway — maintenance `{}`, reminders every minute, briefing {}, dreaming {}, jobs: {}, channels: {}. Ctrl-C to stop.\n",
+        "Komo gateway — maintenance `{}`, briefing {}, dreaming {}, jobs: {}, channels: {}. Ctrl-C to stop.\n",
         schedule_expr,
         fmt_opt(&briefing_expr),
         fmt_opt(&dream_expr),

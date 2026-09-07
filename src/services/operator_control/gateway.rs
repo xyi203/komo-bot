@@ -25,9 +25,6 @@ impl GatewayOperatorAdapter {
 
     pub(super) async fn query(&self, query: OperatorQuery) -> anyhow::Result<OperatorQueryResult> {
         Ok(match query {
-            OperatorQuery::Reminders => {
-                OperatorQueryResult::Reminders(self.client.reminders().await?)
-            }
             OperatorQuery::Tasks => OperatorQueryResult::Tasks(self.client.tasks().await?),
             OperatorQuery::Runs { limit } => {
                 OperatorQueryResult::Runs(self.client.runs(limit).await?)

@@ -22,7 +22,6 @@ use crate::domain::{
     events::TurnEvent,
     memory::Memory,
     message::Message,
-    reminder::Reminder,
     run::{Run, RunStep},
     task::Task,
 };
@@ -290,10 +289,6 @@ impl GatewayClient {
             .remove("messages")
             .context("gateway response missing `messages`")?;
         Ok(serde_json::from_value(messages)?)
-    }
-
-    pub async fn reminders(&self) -> anyhow::Result<Vec<Reminder>> {
-        self.get_field("/api/reminders", "reminders").await
     }
 
     /// Which turns loaded a skill (derived from the run ledger server-side).

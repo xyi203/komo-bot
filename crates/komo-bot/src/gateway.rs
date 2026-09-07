@@ -70,7 +70,7 @@ pub trait Channel: Send + Sync {
 /// The scheduled background work the gateway hosts (the `daemon.rs` supervisor
 /// loop, reused verbatim).
 pub struct MaintenanceService {
-    /// Short label for logs and the breaker alert (e.g. `"reminders"`).
+    /// Short label for logs and the breaker alert (e.g. `"tasks"`).
     pub name: String,
     pub schedule: Schedule,
     pub maintenance: Arc<dyn Maintenance>,

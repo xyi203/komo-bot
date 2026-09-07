@@ -40,7 +40,7 @@ use komo_core::domain::{
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
-use crate::reminder::parse_after;
+use komo_services::cron_actions::parse_after;
 
 /// How many times one turn may stop to wait. A turn that keeps waiting is a
 /// turn that never answers, and `wait` must not become a way to stay alive

@@ -299,7 +299,6 @@ fn schedule_health(config: &ConfigSnapshot) {
         Some(s) => println!("  dreaming     {s}"),
         None => println!("  dreaming     {OFF} disabled"),
     }
-    println!("  reminders    every minute");
     println!("  tasks        every minute");
     println!("  cron jobs    every minute (see `komo cron list`)");
 }

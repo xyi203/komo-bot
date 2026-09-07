@@ -8,7 +8,6 @@
 use crate::domain::{
     cron::{CronJob, CronJobSpec},
     memory::Memory,
-    reminder::Reminder,
     run::{MemoryUse, Run, RunStep},
     task::Task,
 };
@@ -25,8 +24,6 @@ pub use komo_core::operator_view::{
 /// never knows which transport answers it.
 #[derive(Debug)]
 pub enum OperatorQuery {
-    /// Pending reminders, soonest first.
-    Reminders,
     /// Open tasks (inbox/todo/waiting).
     Tasks,
     /// Recent runs, newest first.
@@ -66,7 +63,6 @@ pub enum OperatorQuery {
 /// exhaustively — transport JSON shapes never become the caller interface.
 #[derive(Debug)]
 pub enum OperatorQueryResult {
-    Reminders(Vec<Reminder>),
     Tasks(Vec<Task>),
     Runs(Vec<Run>),
     Run(Option<(Run, Vec<RunStep>)>),

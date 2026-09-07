@@ -15,7 +15,6 @@ use komo_tools::homeassistant::HomeAssistantTool;
 use komo_tools::logs::LogsTool;
 use komo_tools::memory::MemoryTool;
 use komo_tools::read::ReadTool;
-use komo_tools::reminder::ReminderTool;
 use komo_tools::session::SessionTool;
 use komo_tools::shell::ShellTool;
 use komo_tools::skill::SkillTool;
@@ -70,7 +69,6 @@ impl Plugin for CoreToolsPlugin {
                 }
             }),
         );
-        reg.tool(Scope::AGENTIC, Arc::new(ReminderTool::new(cx.db.clone())));
         // Scheduled jobs from inside a conversation. Every mutation is gated
         // through the executor's approver — a chat-authored job is
         // model-authored, unlike one added with `komo cron add`.

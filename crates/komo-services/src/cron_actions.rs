@@ -126,6 +126,28 @@ fn parse_one_trigger(schedule: &str, now: i64) -> anyhow::Result<Trigger> {
     }
 }
 
+/// Parse a relative duration string: `<number><unit>` where unit is s/m/h/d.
+/// Shared by the `cron` tool's `after` (turned into an `@at` moment) and the
+/// `wait` tool's own delay.
+pub fn parse_after(s: &str) -> anyhow::Result<std::time::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        anyhow::bail!("empty duration string");
+    }
+    let (digits, unit) = s.split_at(s.len() - 1);
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| anyhow::anyhow!("invalid duration `{s}`: expected format like `5m`"))?;
+    let secs = match unit {
+        "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        "d" => n * 86400,
+        other => anyhow::bail!("unknown unit `{other}` in `{s}` (expected s/m/h/d)"),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
 /// Reject a trigger nothing could act on, and resolve what has to be resolved
 /// at creation time, before it reaches the store.
 fn validate_trigger(trigger: Trigger, now: i64) -> anyhow::Result<Trigger> {
@@ -275,6 +297,14 @@ pub async fn add_cron_job(
                     .filter(|s| !s.trim().is_empty())
                     .collect(),
                 workspace: resolve_workspace(workspace)?,
+            }
+        }
+        CronAction::Message { text } => {
+            if text.trim().is_empty() {
+                anyhow::bail!("a message cron job needs some text");
+            }
+            CronAction::Message {
+                text: text.trim().to_string(),
             }
         }
     };
@@ -458,6 +488,22 @@ pub fn no_cron_job_message(name: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[test]
+    fn parse_after_supports_s_m_h_d() {
+        assert_eq!(parse_after("45s").unwrap(), Duration::from_secs(45));
+        assert_eq!(parse_after("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_after("2h").unwrap(), Duration::from_secs(7200));
+        assert_eq!(parse_after("1d").unwrap(), Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn parse_after_rejects_invalid() {
+        assert!(parse_after("abc").is_err());
+        assert!(parse_after("5x").is_err());
+        assert!(parse_after("").is_err());
+    }
 
     #[derive(Default)]
     struct FakeJobs {

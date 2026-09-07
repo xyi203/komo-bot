@@ -22,6 +22,8 @@
 //!   shell *allow* rule can silently grant it (`include_dangerous` is required).
 //!   It runs directly, unattended, with no approver at fire time — the operator
 //!   is approving every future execution at once, so the prompt says so.
+//! - **message mode** (fixed text) is `Risk::Normal`: nothing runs when it
+//!   fires, so there is no action to gate beyond the scheduling itself.
 //! - remove/enable/disable/run are `Risk::Normal`, scope `cron:manage`.
 
 use std::sync::Arc;
@@ -35,7 +37,7 @@ use komo_core::domain::{
     context::ToolContext,
     cron::{
         CronAction, CronJob, CronJobRepository, CronJobSpec, CronJobStatus,
-        DEFAULT_CRON_JOB_TIMEOUT_SECS, NotifyPolicy, RoutineRun, parse_notify_policy,
+        DEFAULT_CRON_JOB_TIMEOUT_SECS, NotifyPolicy, RoutineRun, local_minute, parse_notify_policy,
     },
     policy::RuleSpec,
     tool::{Tool, ToolError, ToolOutput, parse_args},
@@ -52,9 +54,16 @@ struct CronArgs {
     name: Option<String>,
     #[serde(default)]
     schedule: Option<String>,
+    /// Relative delay instead of `schedule`, e.g. `45m` — turned into a
+    /// one-shot `@at` moment.
+    #[serde(default)]
+    after: Option<String>,
     /// Where each run's outcome goes: `always` (default), `on_error`, `never`.
     #[serde(default)]
     notify: Option<String>,
+    /// Message-mode field: the text the job delivers when it fires.
+    #[serde(default)]
+    message: Option<String>,
     // Agent-mode fields.
     #[serde(default)]
     prompt: Option<String>,
@@ -109,9 +118,8 @@ impl From<GrantArg> for RuleSpec {
     }
 }
 
-/// Lets the model create and manage the gateway's scheduled jobs (`cron.db`) —
-/// the recurring-work counterpart to `reminder`, which only re-delivers a
-/// message.
+/// Lets the model create and manage the gateway's scheduled jobs — recurring
+/// or one-shot, from a plain message to an unattended agent turn.
 pub struct CronTool {
     jobs: Arc<dyn CronJobRepository>,
 }
@@ -148,18 +156,20 @@ impl Tool for CronTool {
     }
 
     fn description(&self) -> &'static str {
-        "Manage the gateway's scheduled jobs — scheduled *work*, unlike \
-         `reminder`, which only re-delivers a message. \
+        "Manage the gateway's scheduled jobs — anything that happens on a clock \
+         or an event, from a plain nudge to an unattended agent turn. \
          action=\"list\" returns every job with its trigger, status, next run \
          and last outcome; \
          action=\"add\" creates one (requires `name` + `schedule` — a 5-field \
          cron expression for recurring work, `@at YYYY-MM-DD HH:MM` for a \
          one-shot, both in the user's local timezone, or an event: \
          `@webhook <name>` / `@feishu <chat> keyword …` / `@file <dir> <glob>` \
-         — plus either `prompt` for \
+         — or `after` for a relative delay like \"45m\"; \
+         plus exactly one of `prompt` for \
          an agent job — an unattended agent turn with your full tool set, \
-         optionally preloading `skills` — or `command` \
-         (+ `args`/`workdir`/`timeout_secs`) for a fixed program); \
+         optionally preloading `skills` — `command` \
+         (+ `args`/`workdir`/`timeout_secs`) for a fixed program, or `message` \
+         for text delivered verbatim with no work done); \
          an agent job that must *do* something — control a device, write a file, \
          run a command — also needs `grants` naming those actions, or every one \
          of them is refused when it runs; \
@@ -173,8 +183,9 @@ impl Tool for CronTool {
          Jobs fire only while `komo gateway` runs, and each run's output is \
          delivered to the user's home channel, not into this conversation. \
          Creating or changing a job asks the user for approval. Use this for \
-         \"every morning summarize X\" / \"明早 8 点跑一次这个\"; use `reminder` \
-         for a plain nudge and `task` for one-off work with no clock."
+         \"every morning summarize X\" / \"明早 8 点跑一次这个\" / \
+         \"提醒我下午3点开会\" (a `message` job); use `task` for one-off work \
+         with no clock."
     }
 
     /// These calls can park on an approval prompt, so they must outlast one.
@@ -198,6 +209,14 @@ impl Tool for CronTool {
                 "schedule": {
                     "type": "string",
                     "description": "What makes the job fire (action=add). Clock triggers are in the user's local timezone. Recurring: a 5-field cron expression, e.g. \"0 8 * * *\" for 8 AM daily or \"0 14 * * 5\" for Friday 2 PM. One-shot: \"@at YYYY-MM-DD HH:MM\", e.g. \"@at 2026-08-12 08:30\" — fires once, then the job completes (a past time is rejected). Event triggers fire when something happens instead: \"@webhook <name>\" (an external system POSTs to /api/hooks/<name>), \"@feishu <chat_id> mention\" / \"@feishu <chat_id> keyword 值班,oncall\" / \"@feishu <chat_id> reaction THUMBSUP\" (something said or reacted to in that feishu chat — the routine runs on its own grants whoever set it off), \"@file <directory> <glob>\" e.g. \"@file /srv/notes **/*.md\" (the directory must already exist; a burst of writes fires it once). Combine with \" | \" for \"any of these\", e.g. \"0 8 * * * | @webhook ci-done\"."
+                },
+                "after": {
+                    "type": "string",
+                    "description": "A relative delay instead of `schedule` (action=add): \"45s\", \"5m\", \"2h\", \"1d\". Becomes a one-shot job at that moment, rounded up to the next whole minute. Use it for \"20 分钟后提醒我\"; pick either `schedule` or `after`."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "Text the job delivers verbatim when it fires (action=add; pick prompt OR command OR message). No process and no agent turn runs — use it when delivering the words is the whole point, e.g. \"提醒我下午3点开会\". Anything that needs looking something up or doing something is a `prompt` job instead."
                 },
                 "notify": {
                     "type": "string",
@@ -286,19 +305,32 @@ impl Tool for CronTool {
 
             "add" => {
                 let name = require_name(&args.name)?;
-                let schedule = args
-                    .schedule
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        ToolError::InvalidInput(
+                let given = |field: &Option<String>| {
+                    field
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                };
+                let schedule = match (given(&args.schedule), given(&args.after)) {
+                    (Some(_), Some(_)) => {
+                        return Err(ToolError::InvalidInput(
+                            "pass either `schedule` or `after`, not both".to_string(),
+                        ));
+                    }
+                    (Some(schedule), None) => schedule,
+                    (None, Some(after)) => {
+                        once_at(&after, now).map_err(|e| ToolError::InvalidInput(e.to_string()))?
+                    }
+                    (None, None) => {
+                        return Err(ToolError::InvalidInput(
                             "`schedule` is required for action=add — a 5-field cron \
-                             expression like \"0 8 * * *\" (local time)"
+                             expression like \"0 8 * * *\" (local time), or `after` \
+                             for a relative delay"
                                 .to_string(),
-                        )
-                    })?
-                    .to_string();
+                        ));
+                    }
+                };
                 // The single string→trigger parse site, shared with the CLI:
                 // a bad expression is refused here, not at 03:00.
                 let trigger = actions::parse_schedule(&schedule, now)
@@ -311,14 +343,8 @@ impl Tool for CronTool {
                     .map(parse_notify_policy)
                     .unwrap_or_default();
 
-                let (action, request, grants) = match (args.prompt, args.command) {
-                    (Some(_), Some(_)) => {
-                        return Err(ToolError::InvalidInput(
-                            "pass either `prompt` (agent job) or `command` (program job), not both"
-                                .to_string(),
-                        ));
-                    }
-                    (Some(prompt), None) => {
+                let (action, request, grants) = match (args.prompt, args.command, args.message) {
+                    (Some(prompt), None, None) => {
                         // Normalize *before* prompting: what the operator reads
                         // has to be exactly what gets stored, and a malformed
                         // entry should fail here rather than after they said yes.
@@ -361,7 +387,7 @@ impl Tool for CronTool {
                             grants,
                         )
                     }
-                    (None, Some(command)) => {
+                    (None, Some(command), None) => {
                         let line = command_line(&command, &args.args);
                         // Approving this approves every future execution: the
                         // sweep runs a command job directly, with no approver.
@@ -390,11 +416,27 @@ impl Tool for CronTool {
                             Vec::new(),
                         )
                     }
-                    (None, None) => {
+                    // Nothing runs and nothing is granted: the text is the whole
+                    // job, so this is as ordinary as scheduling gets.
+                    (None, None, Some(text)) => (
+                        CronAction::Message { text: text.clone() },
+                        ApprovalRequest::normal(format!(
+                            "Schedule message job `{name}` [{schedule}]: {}",
+                            oneline(&text, PROMPT_PREVIEW)
+                        ))
+                        .with_scope_key("cron:add".to_string()),
+                        Vec::new(),
+                    ),
+                    (None, None, None) => {
                         return Err(ToolError::InvalidInput(
-                            "action=add needs either `prompt` (an agent job) or `command` \
-                             (a fixed program)"
+                            "action=add needs one of `prompt` (an agent job), `command` \
+                             (a fixed program) or `message` (fixed text to deliver)"
                                 .to_string(),
+                        ));
+                    }
+                    _ => {
+                        return Err(ToolError::InvalidInput(
+                            "pass exactly one of `prompt`, `command` or `message`".to_string(),
                         ));
                     }
                 };
@@ -540,6 +582,18 @@ fn require_name(name: &Option<String>) -> Result<String, ToolError> {
     Ok(name.to_string())
 }
 
+/// A relative delay as the `@at` trigger it names. Rounded **up** to the next
+/// whole minute: `@at` names a minute and has to still be in the future, and
+/// the sweep ticks once a minute anyway, so sub-minute precision would only
+/// mean a schedule that is already past.
+fn once_at(after: &str, now: i64) -> anyhow::Result<String> {
+    let delay = actions::parse_after(after)?;
+    let target = now + delay.as_secs() as i64;
+    let at = target + (60 - target.rem_euclid(60)) % 60;
+    let at = if at <= now { at + 60 } else { at };
+    Ok(format!("@at {}", local_minute(at)))
+}
+
 /// "No such job" is the model naming one that doesn't exist — its mistake to
 /// fix from `action=list`, not a transient failure worth retrying.
 fn missing_job(name: &str) -> ToolError {
@@ -572,6 +626,7 @@ fn describe_job(job: &CronJob) -> String {
             };
             format!("{}{skills}{workspace}", oneline(prompt, PROMPT_PREVIEW))
         }
+        CronAction::Message { text } => oneline(text, PROMPT_PREVIEW),
     };
     let mut line = format!(
         "{} ({}) [{}] {} → {}",
@@ -770,6 +825,33 @@ mod tests {
         let seen = rec.seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].1, komo_core::domain::approval::Risk::Normal);
+    }
+
+    /// A nudge: `message` plus a relative delay, approved as ordinary work
+    /// because nothing runs when it fires.
+    #[tokio::test]
+    async fn add_message_job_from_a_relative_delay() {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let (t, jobs, rec) = tool(true);
+        run(
+            &t,
+            json!({"action": "add", "name": "meeting", "after": "45m", "message": "下午3点开会"}),
+            &rec,
+        )
+        .await
+        .unwrap();
+
+        let stored = jobs.jobs.lock().unwrap();
+        let CronAction::Message { text } = &stored[0].action else {
+            panic!("message job");
+        };
+        assert_eq!(text, "下午3点开会");
+        assert!(matches!(stored[0].trigger, Trigger::At { .. }), "one-shot");
+        assert!(stored[0].next_run_at > now + 45 * 60 - 60);
+        assert_eq!(
+            rec.seen.lock().unwrap()[0].1,
+            komo_core::domain::approval::Risk::Normal
+        );
     }
 
     /// The whole point of the feature: creating the job and approving what it

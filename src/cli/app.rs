@@ -47,7 +47,7 @@ enum Commands {
         #[arg(long)]
         no_restart: bool,
     },
-    /// Inspect scheduled reminders (recurring crons and one-shots)
+    /// Inspect scheduled routines (recurring crons, one-shots and events)
     Cron {
         #[command(subcommand)]
         action: CronAction,
@@ -234,7 +234,7 @@ enum ModelAction {
 
 #[derive(Subcommand)]
 enum CronAction {
-    /// List scheduled jobs (cron.db) and pending reminders
+    /// List scheduled jobs
     List,
     /// Add a command job: a fixed command the gateway runs on a cron
     /// schedule, its stdout delivered to the home channel (deterministic, no LLM)

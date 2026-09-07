@@ -78,7 +78,7 @@ provider = "deepseek"
 # enabled = true
 # allow_from = ["123456789"]     # pre-trusted sender ids (skip pairing)
 # require_mention = true         # group messages must @mention the bot
-# home_chat = "123456789"        # reminders/briefing delivered here
+# home_chat = "123456789"        # routine output/briefing delivered here
 
 # [channels.feishu]
 # enabled = true

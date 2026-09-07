@@ -20,6 +20,7 @@ pub mod gateway;
 pub mod interaction;
 pub mod learning_coordinator;
 pub mod llm;
+pub mod notify;
 pub mod pairing;
 pub mod policy_approver;
 pub mod reviewer;

@@ -8,17 +8,13 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{
+use super::view::{
+    DreamReport, PairingView, SessionSummary, WikiHitView, WikiIndexView, WikiStatusView,
+};
+use komo_core::domain::{
     cron::{CronJob, CronJobSpec},
     memory::Memory,
     run::{Run, RunStep},
-};
-
-// The pure view DTOs (no domain dependency) live in `komo-core` so HTTP clients
-// — the CLI gateway adapter and the Dioxus GUI — share one definition. Re-export
-// them here so `operator_control::{SessionSummary, …}` paths are unchanged.
-pub use komo_core::operator_view::{
-    DreamItem, DreamReport, PairingView, SessionSummary, WikiHitView, WikiIndexView, WikiStatusView,
 };
 
 /// A read-only operator request. One `query` call per CLI render.

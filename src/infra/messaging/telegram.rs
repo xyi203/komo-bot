@@ -30,11 +30,9 @@ use serde::Deserialize;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::{
-    domain::{gateway::ReplySink, pairing::PairingRepository},
-    infra::messaging::reconnect_backoff,
-};
+use crate::infra::messaging::reconnect_backoff;
 use komo_config::TelegramConfig;
+use komo_core::domain::{gateway::ReplySink, pairing::PairingRepository};
 
 const TELEGRAM_BASE_URL: &str = "https://api.telegram.org";
 /// Long-poll wait passed to `getUpdates`.

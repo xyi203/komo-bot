@@ -65,23 +65,21 @@ use tower_http::{
 };
 use tracing::{info, warn};
 
-use crate::{
-    domain::{
-        cancel::{CANCELLED_REPLY, is_cancelled},
-        events::{ToolEventSink, TurnEvent},
-        gateway::MessageHandler,
-        memory::{MemoryStatus, parse_memory_status},
-        pairing::ApproveOutcome,
-        session::{DEFAULT_WORKSPACE, Session},
-        wakeup::{SUSPENDED_REPLY, is_suspended},
-    },
-    services::operator_control::{
-        MemoryTransitionAction, OperatorCommand, OperatorCommandResult, OperatorQuery,
-        OperatorQueryResult, OperatorReply, OperatorRequest, PairApproveOutcome,
-        actions::{OperatorActions, TransitionOutcome, no_cron_job_message},
-    },
+use crate::services::operator_control::{
+    MemoryTransitionAction, OperatorCommand, OperatorCommandResult, OperatorQuery,
+    OperatorQueryResult, OperatorReply, OperatorRequest, PairApproveOutcome,
+    actions::{OperatorActions, TransitionOutcome, no_cron_job_message},
 };
 use komo_config::{ApiConfig, ModelEntry};
+use komo_core::domain::{
+    cancel::{CANCELLED_REPLY, is_cancelled},
+    events::{ToolEventSink, TurnEvent},
+    gateway::MessageHandler,
+    memory::{MemoryStatus, parse_memory_status},
+    pairing::ApproveOutcome,
+    session::{DEFAULT_WORKSPACE, Session},
+    wakeup::{SUSPENDED_REPLY, is_suspended},
+};
 use std::net::SocketAddr;
 
 /// What the HTTP transport itself needs, cheaply cloned per request (all
@@ -465,7 +463,7 @@ fn bearer_matches(presented: &str, expected: &str) -> bool {
             .map(|b| format!("{b:02x}"))
             .collect()
     };
-    crate::domain::pairing::ct_eq(&digest_hex(presented), &digest_hex(expected))
+    komo_core::domain::pairing::ct_eq(&digest_hex(presented), &digest_hex(expected))
 }
 
 /// Maps a handler error to a JSON body — a 500 unless the handler says

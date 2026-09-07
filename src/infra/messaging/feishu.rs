@@ -38,11 +38,9 @@ use serde::Deserialize;
 use tokio::sync::{Mutex, mpsc, watch};
 use tracing::{error, info, warn};
 
-use crate::{
-    domain::{gateway::ReplySink, pairing::PairingRepository},
-    infra::messaging::reconnect_backoff,
-};
+use crate::infra::messaging::reconnect_backoff;
 use komo_config::FeishuConfig;
+use komo_core::domain::{gateway::ReplySink, pairing::PairingRepository};
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn";
 /// Refresh the tenant token this long before Feishu's reported expiry.

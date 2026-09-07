@@ -2634,7 +2634,7 @@ pub(crate) mod tests {
     struct SilentNotifier;
 
     #[async_trait]
-    impl komo_core::domain::notify::Notifier for SilentNotifier {
+    impl crate::notify::Notifier for SilentNotifier {
         async fn notify(&self, _title: &str, _body: &str) -> anyhow::Result<()> {
             Ok(())
         }

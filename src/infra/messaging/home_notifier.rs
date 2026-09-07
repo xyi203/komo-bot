@@ -13,10 +13,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tracing::warn;
 
-use crate::{
-    domain::{home::HomeRepository, notify::Notifier},
-    infra::messaging::{feishu::FeishuSender, telegram::TelegramSender},
-};
+use crate::infra::messaging::{feishu::FeishuSender, telegram::TelegramSender};
+use komo_bot::notify::Notifier;
+use komo_core::domain::home::HomeRepository;
 
 /// Outbound text to one chat, abstracted over the concrete channel senders so
 /// the notifier can route by platform.

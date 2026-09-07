@@ -19,8 +19,9 @@
 
 use crate::daemon::{Maintenance, Schedule, supervise};
 use crate::interaction::GatewayDispatcher;
+use crate::notify::Notifier;
 use crate::runtime::AgentRuntime;
-use komo_core::domain::{gateway::MessageHandler, notify::Notifier};
+use komo_core::domain::gateway::MessageHandler;
 use std::sync::Arc;
 use std::time::Duration;
 

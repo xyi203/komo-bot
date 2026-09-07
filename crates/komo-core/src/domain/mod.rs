@@ -14,7 +14,6 @@ pub mod inbox;
 pub mod llm;
 pub mod memory;
 pub mod message;
-pub mod notify;
 pub mod pairing;
 pub mod policy;
 pub mod repository;

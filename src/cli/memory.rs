@@ -6,11 +6,11 @@
 //! Every read and write goes through [`OperatorControl`], which reaches the
 //! gateway — the only process that opens the memory store.
 
-use crate::domain::memory::{Memory, MemoryStatus};
 use crate::services::operator_control::{
     MemoryTransitionAction, OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery,
     OperatorQueryResult,
 };
+use komo_core::domain::memory::{Memory, MemoryStatus};
 
 /// Load every memory through the operator surface. The CLI's list/search/report
 /// all filter this set client-side, so one loader serves them all (plus
@@ -26,7 +26,7 @@ pub(crate) async fn load_all(control: &OperatorControl) -> anyhow::Result<Vec<Me
 pub async fn list(control: &OperatorControl, status: Option<String>) -> anyhow::Result<()> {
     let filter = status
         .as_deref()
-        .map(crate::domain::memory::parse_memory_status);
+        .map(komo_core::domain::memory::parse_memory_status);
     let mut memories = load_all(control).await?;
     if let Some(status) = filter {
         memories.retain(|m| m.status == status);

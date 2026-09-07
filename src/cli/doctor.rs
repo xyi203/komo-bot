@@ -57,7 +57,7 @@ pub async fn doctor(config: &ConfigSnapshot) -> anyhow::Result<()> {
 /// Scheduled cron jobs (cron.db): count, disabled ones, and any whose last run
 /// failed — the operator's "is my weekly job actually running" glance.
 async fn cron_health(control: Option<&OperatorControl>) {
-    use crate::domain::cron::{CronJobStatus, RoutineRunStatus};
+    use komo_core::domain::cron::{CronJobStatus, RoutineRunStatus};
     println!("\ncron jobs:");
     let Some(control) = control else {
         println!("  {OFF} needs a running gateway (`komo gateway start`)");
@@ -306,7 +306,7 @@ fn schedule_health(config: &ConfigSnapshot) {
 /// The permission policy: configured?, rule count, load errors, and the two
 /// runtime grant sources (saved prompts, scheduled jobs).
 async fn policy_health(config: &ConfigSnapshot, control: Option<&OperatorControl>) {
-    use crate::domain::policy::{PolicyMode, Verdict};
+    use komo_core::domain::policy::{PolicyMode, Verdict};
     let report = &config.runtime.policy;
     println!("\npolicy:");
     // Saved grants are reported whether or not a [policy] table exists — they are
@@ -496,7 +496,7 @@ async fn run_health(control: Option<&OperatorControl>) {
     }
     let failed: Vec<_> = runs
         .iter()
-        .filter(|r| r.status == crate::domain::run::RunStatus::Failed)
+        .filter(|r| r.status == komo_core::domain::run::RunStatus::Failed)
         .collect();
     println!("  last {} turns, {} failed", runs.len(), failed.len());
     for r in failed.iter().take(3) {

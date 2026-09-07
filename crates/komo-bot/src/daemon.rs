@@ -22,6 +22,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use tracing::{error, info, warn};
 
+use crate::notify::Notifier;
 use komo_core::domain::{
     context::{SessionContext, SessionOrigin},
     cron::{
@@ -30,7 +31,6 @@ use komo_core::domain::{
     },
     gateway::MessageHandler,
     memory::MemoryRepository,
-    notify::Notifier,
     repository::SessionEventRepository,
     run::RunStatus,
     run_projection::project_runs,

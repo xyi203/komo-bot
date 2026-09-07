@@ -5,21 +5,22 @@ use komo_infra::persistence::db::Db;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use komo_bot::notify::Notifier;
+use komo_core::domain::{
+    context::SessionOrigin,
+    cron::CronJobRepository,
+    gateway::MessageHandler,
+    home::HomeRepository,
+    pairing::PairingRepository,
+    repository::SessionEventRepository,
+    repository::SessionRepository,
+    run::RunRepository,
+    todo::SessionTodoRepository,
+    wakeup::{WakeupDispatch, WakeupRepository},
+};
+
 use crate::{
     cli::wiring,
-    domain::{
-        context::SessionOrigin,
-        cron::CronJobRepository,
-        gateway::MessageHandler,
-        home::HomeRepository,
-        notify::Notifier,
-        pairing::PairingRepository,
-        repository::SessionEventRepository,
-        repository::SessionRepository,
-        run::RunRepository,
-        todo::SessionTodoRepository,
-        wakeup::{WakeupDispatch, WakeupRepository},
-    },
     infra::messaging::{
         api::ApiChannel,
         feishu::{FeishuChannel, FeishuSender},
@@ -114,7 +115,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let mut senders: HashMap<String, Arc<dyn TextSender>> = HashMap::new();
     // `home_chat` candidates in declaration order — first wins.
     let mut home_candidates: Vec<String> = Vec::new();
-    let mut wechat_login: Option<Arc<dyn crate::domain::gateway::WeChatLogin>> = None;
+    let mut wechat_login: Option<Arc<dyn komo_bot::interaction::WeChatLogin>> = None;
 
     if let Some(cfg) = rt.feishu.ready() {
         let sender = Arc::new(FeishuSender::new(

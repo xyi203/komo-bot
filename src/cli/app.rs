@@ -502,10 +502,10 @@ pub async fn run() -> anyhow::Result<()> {
             } => {
                 inspect::cron_add(
                     &operator().await?,
-                    crate::domain::cron::CronJobSpec {
+                    komo_core::domain::cron::CronJobSpec {
                         name,
                         trigger: parse_schedule_arg(&schedule)?,
-                        action: crate::domain::cron::CronAction::Command {
+                        action: komo_core::domain::cron::CronAction::Command {
                             command,
                             args,
                             workdir,
@@ -536,10 +536,10 @@ pub async fn run() -> anyhow::Result<()> {
                     .collect::<anyhow::Result<Vec<_>>>()?;
                 inspect::cron_add(
                     &operator().await?,
-                    crate::domain::cron::CronJobSpec {
+                    komo_core::domain::cron::CronJobSpec {
                         name,
                         trigger: parse_schedule_arg(&schedule)?,
-                        action: crate::domain::cron::CronAction::Agent {
+                        action: komo_core::domain::cron::CronAction::Agent {
                             prompt,
                             skills,
                             workspace,
@@ -766,19 +766,19 @@ mod tests {
 
 /// `--skip-missed` as a [`CatchUp`]. A flag rather than a value because there
 /// are two behaviours, and "skip" is the one that needs asking for.
-fn catch_up_of(skip_missed: bool) -> crate::domain::cron::CatchUp {
+fn catch_up_of(skip_missed: bool) -> komo_core::domain::cron::CatchUp {
     if skip_missed {
-        crate::domain::cron::CatchUp::Skip
+        komo_core::domain::cron::CatchUp::Skip
     } else {
-        crate::domain::cron::CatchUp::Late
+        komo_core::domain::cron::CatchUp::Late
     }
 }
 
 /// `--notify` as a [`NotifyPolicy`]. Refused rather than defaulted: a typo that
 /// silently means "always" would be discovered only by the notification the
 /// operator asked not to get.
-fn notify_of(value: &str) -> anyhow::Result<crate::domain::cron::NotifyPolicy> {
-    use crate::domain::cron::NotifyPolicy;
+fn notify_of(value: &str) -> anyhow::Result<komo_core::domain::cron::NotifyPolicy> {
+    use komo_core::domain::cron::NotifyPolicy;
     match value.trim() {
         "always" => Ok(NotifyPolicy::Always),
         "on_error" => Ok(NotifyPolicy::OnError),
@@ -789,7 +789,7 @@ fn notify_of(value: &str) -> anyhow::Result<crate::domain::cron::NotifyPolicy> {
 
 /// A schedule typed on the command line, through the shared parse site — so a
 /// CLI job and a chat-created one accept exactly the same expressions.
-fn parse_schedule_arg(schedule: &str) -> anyhow::Result<crate::domain::cron::Trigger> {
+fn parse_schedule_arg(schedule: &str) -> anyhow::Result<komo_core::domain::cron::Trigger> {
     komo_services::cron_actions::parse_schedule(
         schedule,
         time::OffsetDateTime::now_utc().unix_timestamp(),

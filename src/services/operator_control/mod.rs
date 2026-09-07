@@ -11,8 +11,10 @@
 
 pub mod actions;
 pub mod request;
+pub mod view;
 
 pub use request::*;
+pub use view::*;
 
 use crate::infra::gateway_client::GatewayClient;
 

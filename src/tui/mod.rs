@@ -55,12 +55,10 @@ use crossterm::{
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::{
-    domain::{
-        events::TurnEvent,
-        message::{Message, Role as MessageRole},
-    },
-    infra::gateway_client::{GatewayClient, folder_workspace_id},
+use crate::infra::gateway_client::{GatewayClient, folder_workspace_id};
+use komo_core::domain::{
+    events::TurnEvent,
+    message::{Message, Role as MessageRole},
 };
 
 use app::{Action, App, ApprovalPrompt, Role};

@@ -46,14 +46,10 @@ use tokio::sync::{Notify, watch};
 use tracing::{error, info, warn};
 use wechatbot::{BotOptions, WeChatBot};
 
-use crate::{
-    domain::{
-        gateway::{ReplySink, WeChatLogin},
-        pairing::PairingRepository,
-    },
-    infra::messaging::home_notifier::TextSender,
-};
+use crate::infra::messaging::home_notifier::TextSender;
+use komo_bot::interaction::WeChatLogin;
 use komo_config::WeChatConfig;
+use komo_core::domain::{gateway::ReplySink, pairing::PairingRepository};
 
 /// Backoff between poll-loop restarts (e.g. after a login or session error).
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);

@@ -3,12 +3,10 @@
 //! These ask the gateway and print to stdout — no LLM, no agent runtime. They
 //! are the operator's view into what the gateway will act on.
 
-use crate::{
-    domain::cron::{CronAction, CronJob, CronJobSpec, CronJobStatus, NotifyPolicy},
-    services::operator_control::{
-        OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery, OperatorQueryResult,
-    },
+use crate::services::operator_control::{
+    OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery, OperatorQueryResult,
 };
+use komo_core::domain::cron::{CronAction, CronJob, CronJobSpec, CronJobStatus, NotifyPolicy};
 
 /// How many of a job's firings `komo cron list` prints. The store keeps
 /// `ROUTINE_RUN_HISTORY`; a listing is a glance, not the archive.

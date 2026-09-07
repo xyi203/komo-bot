@@ -20,12 +20,12 @@ use base64::Engine as _;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
 
-use crate::domain::{events::TurnEvent, message::Message};
 use crate::infra::rendezvous::{self, GatewayInfo};
 use crate::services::operator_control::{
     OperatorCommand, OperatorCommandResult, OperatorQuery, OperatorQueryResult, OperatorReply,
     OperatorRequest, SessionSummary,
 };
+use komo_core::domain::{events::TurnEvent, message::Message};
 
 /// How long to wait for the gateway to answer a request (a turn can take a
 /// while — chat goes through the full agent loop server-side).

@@ -12,6 +12,7 @@
 //! paths fail fast via [`ConfigSnapshot::validate_agent`] /
 //! [`ConfigSnapshot::validate_gateway`].
 
+mod paths;
 mod report;
 mod resolved;
 mod sources;
@@ -19,6 +20,7 @@ mod write;
 
 use std::path::PathBuf;
 
+pub use paths::{ensure_komo_home, komo_home};
 pub use report::*;
 pub use resolved::*;
 pub use sources::ConfigSources;
@@ -234,19 +236,11 @@ impl ConfigSnapshot {
     }
 }
 
-// `komo_home` / `ensure_komo_home` moved to `komo-core` (the dependency-light
-// crate the GUI client shares) so both resolve the same `~/.komo` without
-// depending on komo's runtime. Re-exported here so `config::komo_home()` /
-// `config::ensure_komo_home()` call sites are unchanged.
-pub use komo_core::paths::{ensure_komo_home, komo_home};
-
 /// Where the WeChat QR-login credentials are stored. Shared by the gateway
 /// channel and the `komo channel wechat login` provisioning command.
 pub fn wechat_cred_path() -> PathBuf {
     komo_home().join("wechat").join("credentials.json")
 }
-
-// `komo_home` / `default_home` tests moved to `komo_core::paths` with the code.
 
 #[cfg(test)]
 mod tests {

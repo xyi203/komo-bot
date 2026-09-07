@@ -1,5 +1,4 @@
 mod cli;
-mod domain;
 mod infra;
 mod pyhost;
 mod services;

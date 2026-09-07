@@ -85,7 +85,7 @@ fn codex_home_candidates() -> Vec<PathBuf> {
     if let Some(home) = dirs::home_dir() {
         candidates.push(home.join(".codex"));
     }
-    let komo_home = komo_core::paths::komo_home();
+    let komo_home = komo_config::komo_home();
     candidates.push(komo_home.join(".codex"));
     candidates.push(komo_home.join("codex"));
     candidates

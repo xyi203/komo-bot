@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
 
 use super::run::Run;
@@ -59,14 +57,4 @@ pub trait InterjectSource: Send + Sync {
     /// empty when nothing is waiting. Never blocks — it is polled on the hot
     /// path between rounds.
     fn take(&self) -> Vec<String>;
-}
-
-/// Drives an interactive WeChat QR login, delivering the QR to `sink` (as a
-/// photo where the channel supports it). Implemented in infra and invoked by
-/// the gateway dispatcher on `/wechat login`, so the WeChat channel can be
-/// provisioned from an existing chat (e.g. Telegram) without host shell access.
-/// Returns the logged-in user id on success.
-#[async_trait]
-pub trait WeChatLogin: Send + Sync {
-    async fn run(&self, sink: Arc<dyn ReplySink>) -> anyhow::Result<String>;
 }

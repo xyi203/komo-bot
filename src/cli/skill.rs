@@ -18,7 +18,7 @@ fn shared_store() -> Option<FsSkillStore> {
 }
 
 struct ReadableSkill {
-    skill: crate::domain::skill::Skill,
+    skill: komo_core::domain::skill::Skill,
     status: &'static str,
     path: PathBuf,
 }
@@ -89,7 +89,7 @@ pub fn list() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn print_skill_line(skill: &crate::domain::skill::Skill, prefix: &str) {
+fn print_skill_line(skill: &komo_core::domain::skill::Skill, prefix: &str) {
     let off = if skill.disabled { " [disabled]" } else { "" };
     println!(
         "{prefix}{}{}  {}",

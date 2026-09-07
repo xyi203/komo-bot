@@ -33,14 +33,14 @@ use futures_util::FutureExt;
 use tokio::sync::{Notify, watch};
 use tracing::{info, warn};
 
+use crate::notify::Notifier;
 use komo_core::domain::{
     approval::{ApprovalRequest, Approver, DECIDED_BY_HUMAN, Decision, Risk},
     cancel::CancelSignal,
-    gateway::{InterjectSource, MessageHandler, ReplySink, WeChatLogin},
+    gateway::{InterjectSource, MessageHandler, ReplySink},
     home::HomeRepository,
     inbox::{InboundOrigin, InboxClaim, InboxRepository, UnfinishedInbound},
     message::Role,
-    notify::Notifier,
     pairing::{ApproveOutcome, PairingRepository, PairingStatus},
     policy::{Rule, RuleSpec},
     repository::{SessionEventRepository, SessionRepository},
@@ -667,6 +667,16 @@ pub struct WaitParts {
     pub runs: Arc<dyn RunRepository>,
     pub events: Arc<dyn SessionEventRepository>,
     pub wakeups: Arc<dyn WakeupRepository>,
+}
+
+/// Drives an interactive WeChat QR login, delivering the QR to `sink` (as a
+/// photo where the channel supports it). Implemented by the WeChat channel and
+/// invoked by the dispatcher on `/wechat login`, so the channel can be
+/// provisioned from an existing chat (e.g. Telegram) without host shell access.
+/// Returns the logged-in user id on success.
+#[async_trait]
+pub trait WeChatLogin: Send + Sync {
+    async fn run(&self, sink: Arc<dyn ReplySink>) -> anyhow::Result<String>;
 }
 
 pub struct GatewayDispatcher {

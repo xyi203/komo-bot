@@ -1,15 +1,12 @@
 //! Operator view DTOs — the serialized shapes the gateway's HTTP endpoints emit
-//! and the CLI / GUI clients deserialize.
+//! and the CLI deserializes.
 //!
-//! These carry no domain dependency (plain rows over `String`/`i64`/`f64`), so
-//! they live in `komo-core` where any HTTP client can reuse them as the single
-//! source of truth. The richer operator request/reply enums that *do* wrap
-//! domain types stay in `komo::services::operator_control::request`, which
-//! re-exports these for path stability.
+//! These carry (almost) no domain dependency: plain rows over
+//! `String`/`i64`/`f64`. The richer request/reply enums that *do* wrap domain
+//! types are the neighbouring [`super::request`].
 
+use komo_core::domain::awaiting::Awaiting;
 use serde::{Deserialize, Serialize};
-
-use crate::domain::awaiting::Awaiting;
 
 /// A session list row (full transcripts are never dumped in a list view).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,12 +100,6 @@ impl DreamReport {
     pub fn observing_count(&self) -> usize {
         self.candidate_count
             .saturating_sub(self.promote.len() + self.archive.len())
-    }
-
-    /// Backwards-compatible spelling for callers that mean “no state changes”,
-    /// not “there are no candidate memories”.
-    pub fn is_empty(&self) -> bool {
-        !self.has_actions()
     }
 }
 

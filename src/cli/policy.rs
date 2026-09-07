@@ -9,10 +9,10 @@
 
 use std::path::PathBuf;
 
-use crate::domain::approval::{ActionRef, ApprovalRequest, Risk};
-use crate::domain::cron::CronJob;
-use crate::domain::policy::{Category, Policy, PolicyMode, Rule, RuleSource, Verdict};
 use komo_config::{ConfigSnapshot, PolicyReport};
+use komo_core::domain::approval::{ActionRef, ApprovalRequest, Risk};
+use komo_core::domain::cron::CronJob;
+use komo_core::domain::policy::{Category, Policy, PolicyMode, Rule, RuleSource, Verdict};
 use komo_infra::permissions_store::PermissionsStore;
 
 /// Rendering lives on the rule itself, so `policy list`, `saved list`, and the

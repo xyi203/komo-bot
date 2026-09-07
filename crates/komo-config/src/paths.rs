@@ -1,9 +1,8 @@
 //! komo home-directory resolution.
 //!
-//! Lives in `komo-core` (not `komo::config`) so both the main crate and any
-//! sibling crate — the GUI client, which reads `~/.komo/gateway.json` via
-//! [`crate::rendezvous`] — resolve the same home without depending on komo's
-//! heavy runtime. `komo::config` re-exports these for path stability.
+//! `KOMO_HOME` is the one environment variable read outside the resolved
+//! config snapshot, because it decides where `config.toml` and `.env`
+//! themselves live.
 
 use std::path::PathBuf;
 

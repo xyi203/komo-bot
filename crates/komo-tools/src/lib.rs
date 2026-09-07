@@ -5,7 +5,7 @@
 //! old bin crate that changes most often — so it compiles in parallel with the
 //! agent instead of ahead of it.
 //!
-//! `delegate` is the exception and stayed in the binary: a delegation *is* a
+//! `delegate` is the exception and lives in `komo-bot`: a delegation *is* a
 //! real agent turn, so that tool holds an `AgentRuntime`.
 
 #[cfg(any(test, feature = "test-support"))]

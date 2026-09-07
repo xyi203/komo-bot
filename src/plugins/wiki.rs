@@ -1,5 +1,5 @@
-//! Note-vault search as a plugin (`[wiki]`). Degrades: a broken vector
-//! backend costs `wiki_search`, never the boot.
+//! Note-vault search as a plugin (`[wiki]`). Degrades: a search backend that
+//! will not open costs `wiki_search`, never the boot.
 
 use std::sync::Arc;
 
@@ -25,29 +25,21 @@ impl Plugin for WikiPlugin {
             return Ok(());
         };
         // Registered before the handles are built, and kept even if they fail:
-        // a broken vector backend costs search, not the ability to read a note
-        // whose path the user or a memory already names.
+        // a search backend that will not open costs search, not the ability to
+        // read a note whose path the user or a memory already names.
         reg.tool(
             Scope::AGENTIC,
             Arc::new(WikiReadTool::new(wiki.vault.clone())),
         );
 
-        let (index, embedder) = match wiki_handles(wiki) {
+        let (index, embedder) = match wiki_handles(wiki, cx).await {
             Ok(handles) => handles,
             Err(error) => {
                 tracing::warn!(error = format!("{error:#}"), "wiki_search unavailable");
                 return Ok(());
             }
         };
-        // Probed once so a wrong url still shows up at boot instead of on the
-        // first search. The outcome is a diagnostic, never a decision.
-        match index.get().await {
-            Ok(_) => tracing::info!(vault = %wiki.vault.display(), "wiki_search ready"),
-            Err(error) => tracing::warn!(
-                error = format!("{error:#}"),
-                "wiki index not open — wiki_search retries on each call"
-            ),
-        }
+        tracing::info!(vault = %wiki.vault.display(), "wiki_search ready");
         // One runner shared by every indexing caller: this process's
         // `wiki_index` tool, `komo wiki index` over the operator channel, and
         // any cron job. Two concurrent runs over one store is not merely
@@ -60,13 +52,6 @@ impl Plugin for WikiPlugin {
         ));
         reg.wiki_ops = Some(WikiOps {
             runner: runner.clone(),
-            backend: wiki.backend.clone(),
-            collection: wiki.collection.clone(),
-            location: if wiki.backend == "server" {
-                wiki.url.clone()
-            } else {
-                wiki.data_dir.join(&wiki.collection).display().to_string()
-            },
         });
         reg.tool(
             Scope::AGENTIC,
@@ -77,25 +62,18 @@ impl Plugin for WikiPlugin {
     }
 }
 
-/// Build the note-vault handles: a lazily-opened index and its embedding
-/// client. Neither touches the network here, so the only failures left are the
-/// ones a running process can never recover from — a backend name that does
-/// not parse, an embedding url that is not a url. Reaching the vault is
-/// deferred to `LazyWikiIndex`, which retries it per call.
-fn wiki_handles(
+/// Build the note-vault handles: the index over `komo.db` and the embedding
+/// client. The index is a table in a database this process already has open,
+/// so there is nothing left to be unreachable — the only failure is an
+/// embedding url that is not a url.
+async fn wiki_handles(
     wiki: &komo_config::WikiConfig,
+    cx: &ToolCx<'_>,
 ) -> anyhow::Result<(
-    Arc<komo_wiki::lazy::LazyWikiIndex>,
+    Arc<komo_infra::chunk_index::TursoChunkIndex>,
     Arc<dyn komo_core::domain::embedding::EmbeddingClient>,
 )> {
-    let index = komo_wiki::lazy::LazyWikiIndex::new(komo_wiki::WikiSettings {
-        backend: komo_wiki::WikiBackend::parse(&wiki.backend)?,
-        data_dir: wiki.data_dir.clone(),
-        url: wiki.url.clone(),
-        collection: wiki.collection.clone(),
-        // Credentials come from the environment, never config.toml.
-        api_key: std::env::var("QDRANT_API_KEY").ok(),
-    });
+    let index = cx.db.chunk_index(komo_infra::chunk_index::WIKI).await?;
     let embedder = komo_infra::embedding::OllamaEmbedder::new(
         wiki.embedding.url.clone(),
         wiki.embedding.model.clone(),

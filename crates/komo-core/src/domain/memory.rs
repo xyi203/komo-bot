@@ -853,7 +853,7 @@ fn signal_bonus(memory: &Memory, now: i64) -> f64 {
 /// Token overlap rather than substring containment, because the input is as
 /// often a whole user message as a focused keyword query — a substring match
 /// would find nothing in the former case.
-fn recall_terms(text: &str) -> HashSet<String> {
+pub(crate) fn recall_terms(text: &str) -> HashSet<String> {
     let mut terms = HashSet::new();
     let mut word = String::new();
     let mut prev_cjk: Option<char> = None;

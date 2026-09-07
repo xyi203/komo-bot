@@ -129,10 +129,6 @@ pub struct WikiHitView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WikiStatusView {
     pub vault: String,
-    pub backend: String,
-    pub collection: String,
-    /// Where the embedded backend keeps its files, or the server URL.
-    pub location: String,
     /// Embedding model from config.
     pub model: String,
     pub files: usize,

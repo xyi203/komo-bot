@@ -6,8 +6,7 @@
 //! not search pays nothing.
 //!
 //! This tool holds only [`ChunkIndex`] and [`EmbeddingClient`], never a concrete
-//! backend — which backend is running (embedded or Qdrant server) is decided in
-//! config and invisible here.
+//! store — where the index lives is wiring's business and invisible here.
 
 use std::sync::Arc;
 

@@ -364,22 +364,19 @@ pub async fn build(
     // `session` search then falls back to the substring scan it had before,
     // which is worse but never silent.
     let episodic = match &embedder {
-        Some(embedder) => {
-            let dir = komo_config::komo_home().join("session-index");
-            match komo_wiki::edge::EdgeIndex::open(&dir, "komo_sessions") {
-                Ok(index) => Some(Arc::new(
-                    komo_services::session_indexing::SessionSearch::new(
-                        Arc::new(index),
-                        embedder.clone(),
-                    ),
-                )),
-                Err(error) => {
-                    tracing::warn!(%error, dir = %dir.display(),
-                        "session index unusable — `session` search stays lexical");
-                    None
-                }
+        Some(embedder) => match db.chunk_index(komo_infra::chunk_index::SESSIONS).await {
+            Ok(index) => Some(Arc::new(
+                komo_services::session_indexing::SessionSearch::new(
+                    Arc::new(index),
+                    embedder.clone(),
+                ),
+            )),
+            Err(error) => {
+                tracing::warn!(%error,
+                    "session index unusable — `session` search stays lexical");
+                None
             }
-        }
+        },
         None => None,
     };
 

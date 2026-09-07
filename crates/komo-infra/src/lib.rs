@@ -9,6 +9,7 @@
 //! prompt), `gateway_client`/`skill_install` (operator actions) — deliberately
 //! stayed in the binary; they are wiring, not infrastructure.
 
+pub mod chunk_index;
 pub mod codex;
 pub mod embedding;
 pub mod logs;

@@ -559,9 +559,9 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // `{:#}` renders the whole context chain. The outermost line alone is
-        // the *least* specific thing known about the failure — "qdrant is not
-        // reachable" hides the "no route to host" underneath that says which
-        // kind of unreachable it was.
+        // the *least* specific thing known about the failure — "the embedding
+        // backend is not reachable" hides the "no route to host" underneath
+        // that says which kind of unreachable it was.
         let message = format!("{:#}", self.error);
         // A rejected request is the caller's business, not an incident.
         if self.status.is_server_error() {

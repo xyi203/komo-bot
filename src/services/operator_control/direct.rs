@@ -56,8 +56,8 @@ impl DirectOperatorAdapter {
 
     /// Open the note-vault index in this process.
     ///
-    /// Only reachable when no gateway is running — if one is, it holds the
-    /// index and the gateway adapter answers instead.
+    /// Only reachable when no gateway is running — if one is, it holds
+    /// `komo.db` and the gateway adapter answers instead.
     async fn wiki_ops(&self) -> anyhow::Result<&Arc<super::actions::WikiOps>> {
         self.wiki
             .get_or_try_init(|| async {
@@ -66,14 +66,11 @@ impl DirectOperatorAdapter {
                     .wiki
                     .as_ref()
                     .context("no [wiki] configured in ~/.komo/config.toml")?;
-                let index = komo_wiki::build_index(&komo_wiki::WikiSettings {
-                    backend: komo_wiki::WikiBackend::parse(&cfg.backend)?,
-                    data_dir: cfg.data_dir.clone(),
-                    url: cfg.url.clone(),
-                    collection: cfg.collection.clone(),
-                    api_key: std::env::var("QDRANT_API_KEY").ok(),
-                })
-                .await?;
+                let index = self
+                    .db()
+                    .await?
+                    .chunk_index(komo_infra::chunk_index::WIKI)
+                    .await?;
                 let embedder = komo_infra::embedding::OllamaEmbedder::new(
                     cfg.embedding.url.clone(),
                     cfg.embedding.model.clone(),
@@ -83,18 +80,11 @@ impl DirectOperatorAdapter {
                     // directly (the gateway is down, or there is none), so its
                     // runner is unshared — the gate still holds within it.
                     runner: Arc::new(komo_services::wiki_indexing::WikiIndexRunner::new(
-                        index,
+                        Arc::new(index),
                         Arc::new(embedder),
                         cfg.vault.clone(),
                         cfg.embedding.model.clone(),
                     )),
-                    backend: cfg.backend.clone(),
-                    collection: cfg.collection.clone(),
-                    location: if cfg.backend == "server" {
-                        cfg.url.clone()
-                    } else {
-                        cfg.data_dir.join(&cfg.collection).display().to_string()
-                    },
                 }))
             })
             .await

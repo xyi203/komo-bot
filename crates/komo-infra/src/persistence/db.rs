@@ -339,6 +339,12 @@ pub struct Db {
     /// session. Session *metadata* is still a row here: it is updated (title,
     /// status, model), and a log is the wrong shape for a value that changes.
     events: SessionEventStore,
+    /// A second handle on the same file, for the one thing toasty's typed API
+    /// cannot express: SQL. The chunk index needs `vector_distance_cos` and
+    /// `instr`, so it talks to the engine directly. An in-memory db gets its
+    /// own in-memory database here — nothing shares rows across the two, which
+    /// only tests ever see.
+    raw: Arc<turso::Database>,
 }
 
 impl Db {
@@ -461,9 +467,23 @@ impl Db {
         };
         let events = SessionEventStore::new(&transcript_home);
 
+        // Opened after the pool, so the DDL migrations above never contend with
+        // it for the file.
+        let raw = Arc::new(
+            turso::Builder::new_local(
+                path.as_deref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| ":memory:".to_string())
+                    .as_str(),
+            )
+            .build()
+            .await?,
+        );
+
         let this = Self {
             inner: Arc::new(db),
             events,
+            raw,
         };
 
         // The one-time merge (docs/adr/0004). Only for a `komo.db` that was
@@ -474,6 +494,16 @@ impl Db {
         }
 
         Ok(this)
+    }
+
+    /// A [`ChunkIndex`](komo_core::domain::chunk_index::ChunkIndex) over this
+    /// database, in its own collection: one table serves both the note vault
+    /// and the transcript corpus.
+    pub async fn chunk_index(
+        &self,
+        collection: &str,
+    ) -> anyhow::Result<crate::chunk_index::TursoChunkIndex> {
+        crate::chunk_index::TursoChunkIndex::open(self.raw.clone(), collection).await
     }
 
     /// Import `state.db`, `cron.db` and `memory.db` from beside `path`, then

@@ -53,10 +53,6 @@ pub struct WikiOps {
     /// from a conversation and one started with `komo wiki index --rebuild`
     /// cannot interleave over the same store.
     pub runner: Arc<WikiIndexRunner>,
-    pub backend: String,
-    pub collection: String,
-    /// Human-facing location: the data directory, or the server URL.
-    pub location: String,
 }
 
 impl WikiOps {
@@ -177,9 +173,6 @@ impl WikiOps {
         let spec = wiki.store().vector_spec().await?;
         Ok(WikiStatusView {
             vault: wiki.vault().display().to_string(),
-            backend: wiki.backend.clone(),
-            collection: wiki.collection.clone(),
-            location: wiki.location.clone(),
             model: wiki.model().to_string(),
             files: indexed.len(),
             chunks: wiki.store().count().await?,
@@ -365,7 +358,6 @@ impl OperatorActions {
         cron_actions::trigger_cron_job(self.cron_jobs.as_ref(), name, now()).await
     }
 }
-
 
 /// A memory governance transition's result: applied, or no such id (each
 /// transport maps `NotFound` to its own shape — 404 vs. a CLI error).

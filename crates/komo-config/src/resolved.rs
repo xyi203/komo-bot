@@ -200,15 +200,6 @@ pub struct WikiConfig {
     /// Root of the note vault, `~` expanded. The switch for the whole feature:
     /// no vault, no wiki.
     pub vault: PathBuf,
-    /// Backend selector, validated by `komo-wiki` (`edge` or `server`). Kept as
-    /// a string here so `komo-config` does not depend on the vector crate.
-    pub backend: String,
-    /// Where the embedded backend keeps its files (`~/.komo/wiki`). Disposable.
-    pub data_dir: PathBuf,
-    /// Qdrant endpoint, used only by the `server` backend.
-    pub url: String,
-    /// Collection name, shared by both backends so an index is portable.
-    pub collection: String,
     /// Embedding backend for the vault. Falls back to `[memory]`'s when `[wiki]`
     /// declares no model, so the common case configures one model, and a vault
     /// that wants a bigger one can say so without touching recall.
@@ -803,7 +794,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
     // Resolved before the struct literal because `wiki` falls back to the
     // `[memory]` backend when it declares no model of its own.
     let embedding = resolve_embedding(file.memory);
-    let wiki = resolve_wiki(file.wiki, embedding.as_ref(), &home, &mut issues);
+    let wiki = resolve_wiki(file.wiki, embedding.as_ref(), &mut issues);
     let briefing_enabled = env
         .briefing_schedule_enabled
         .or(file.briefing_schedule_enabled)
@@ -971,11 +962,6 @@ fn resolve_embedding(memory: Option<crate::sources::MemoryFileConfig>) -> Option
     })
 }
 
-/// Default Qdrant gRPC endpoint (the server's own default bind).
-const DEFAULT_QDRANT_URL: &str = "http://127.0.0.1:6334";
-/// Default collection name, shared by both backends.
-const DEFAULT_WIKI_COLLECTION: &str = "komo_wiki";
-
 /// Expand a leading `~/` against the **real** home, not `KOMO_HOME`: an
 /// operator-typed path names their own directory and does not move when komo's
 /// home is relocated.
@@ -1001,7 +987,6 @@ pub fn expand_home(path: &str) -> PathBuf {
 fn resolve_wiki(
     wiki: Option<crate::sources::WikiFileConfig>,
     memory_embedding: Option<&EmbeddingConfig>,
-    home: &std::path::Path,
     issues: &mut Vec<ConfigIssue>,
 ) -> Option<WikiConfig> {
     let wiki = wiki?;
@@ -1047,28 +1032,6 @@ fn resolve_wiki(
 
     Some(WikiConfig {
         vault: expand_home(vault),
-        backend: wiki
-            .backend
-            .as_deref()
-            .map(str::trim)
-            .filter(|b| !b.is_empty())
-            .unwrap_or("edge")
-            .to_string(),
-        data_dir: home.join("wiki"),
-        url: wiki
-            .url
-            .as_deref()
-            .map(str::trim)
-            .filter(|u| !u.is_empty())
-            .unwrap_or(DEFAULT_QDRANT_URL)
-            .to_string(),
-        collection: wiki
-            .collection
-            .as_deref()
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-            .unwrap_or(DEFAULT_WIKI_COLLECTION)
-            .to_string(),
         embedding,
     })
 }

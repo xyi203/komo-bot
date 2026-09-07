@@ -1,13 +1,12 @@
 //! `komo wiki index|search|status` — build and inspect the note-vault index.
 //!
 //! Routed through `operator_control` like the memory commands, and for the same
-//! reason: a running gateway holds the index open, and the embedded backend
-//! takes an exclusive lock on it. Going direct failed with a WAL lock error
-//! whenever the gateway was up — which is most of the time.
+//! reason: the index is a table in `komo.db`, and Turso holds that file
+//! exclusively — while the gateway is up, nothing else can open it.
 //!
-//! With no gateway running, the direct adapter opens the index in this process
-//! instead. Both paths run the same `WikiOps`, so neither caller knows which
-//! one answered.
+//! With no gateway running, the direct adapter opens the database in this
+//! process instead. Both paths run the same `WikiOps`, so neither caller knows
+//! which one answered.
 
 use crate::services::operator_control::{
     OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery, OperatorQueryResult,
@@ -96,9 +95,6 @@ pub async fn status(control: &OperatorControl) -> anyhow::Result<()> {
     };
 
     println!("vault      {}", status.vault);
-    println!("backend    {}", status.backend);
-    println!("location   {}", status.location);
-    println!("collection {}", status.collection);
     println!("model      {}", status.model);
     println!(
         "indexed    {} files, {} chunks",

@@ -176,6 +176,19 @@ pub fn diversify(hits: Vec<ChunkHit>, limit: usize, max_per_file: usize) -> Vec<
     out
 }
 
+/// Lexical terms for a chunk or a query, sorted and unique.
+///
+/// The same splitter memory recall uses ([`super::memory`]): runs of
+/// alphanumerics become word terms, adjacent CJK characters become bigrams.
+/// Shared rather than reimplemented because it is the same problem in both
+/// stores — CJK has no whitespace boundaries, so a Chinese query and an English
+/// note can never share a token — and two answers to it would be a bug in one.
+pub fn lexical_terms(text: &str) -> Vec<String> {
+    let mut terms: Vec<String> = super::memory::recall_terms(text).into_iter().collect();
+    terms.sort();
+    terms
+}
+
 /// What is currently indexed for one note: its mtime, and how many chunks it
 /// produced. The indexer diffs this against the filesystem to decide what to
 /// re-embed.

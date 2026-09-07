@@ -56,11 +56,9 @@ provider = "deepseek"
 
 # Semantic search over a directory of markdown notes. Absent = no wiki tools.
 # Falls back to [memory]'s embedding settings when its own are unset.
+# The index lives in komo.db; build it with `komo wiki index`.
 # [wiki]
 # vault = "~/notes"
-# backend = "edge"               # edge = in-process; server = shared Qdrant
-# url = "http://127.0.0.1:6334"  # server backend only (QDRANT_API_KEY in .env)
-# collection = "komo_wiki"
 
 # --- python plugins ----------------------------------------------------------
 

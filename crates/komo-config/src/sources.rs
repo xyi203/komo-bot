@@ -437,12 +437,6 @@ pub struct MemoryFileConfig {
 pub struct WikiFileConfig {
     /// Vault root, e.g. `~/notes`. The switch for the whole feature.
     pub vault: Option<String>,
-    /// `edge` (in-process, default) or `server` (a Qdrant instance).
-    pub backend: Option<String>,
-    /// Qdrant gRPC endpoint, `server` backend only.
-    pub url: Option<String>,
-    /// Collection name; shared by both backends so an index stays portable.
-    pub collection: Option<String>,
     /// Embedding model for the vault. Absent = inherit `[memory]`'s, which keeps
     /// one model resident instead of two. Set it when the vault warrants a
     /// bigger model than recall does.

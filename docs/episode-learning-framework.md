@@ -2,9 +2,13 @@
 
 > 存储说明：本文写作时 komo 还有 `state.db` / `kanban.db` / `memory.db` / `cron.db` 四个库文件。ADR 0004 之后它们合并为一个 `~/.komo/komo.db`，文中的库名指的是其中对应的表，disposable / durable 是表的属性，不是文件的属性；除此之外结论不变。
 
-> 状态：Phase 1、2、3 已实现（2026-08-25）。
+> 状态：Phase 1、2 已实现（2026-08-25）。
 >
-> 范围：在现有 run ledger、reflective reviewer、Memory consolidation 和 Skill governance 之上，建立基于任务结果证据的学习闭环。
+> 范围：在现有 run ledger、reflective reviewer 和 Memory consolidation 之上，建立基于任务结果证据的学习闭环。
+>
+> 后续变更：自动 Skill 提案闭环与 kanban Task 都已从代码里删除，Skill 现在只由人书写和安装
+> （`komo skills install`），承诺不再进入任何 task inbox。因此本文的 Procedure → Skill 与
+> Commitment → Task 两条支路已移除，抽取器（`ReviewOutcome`）现在只产出 Memory observation。
 >
 > Phase 1 落地位置与相对本文的偏差：
 >
@@ -31,8 +35,7 @@ Komo 不需要新增一套 Episode 存储。现有 `Run` 已经表示一次用�
 学习闭环也不应实现成一个统一 Validator 驱动的线性流水线。Fact 和 Procedure 的验证问题不同：
 
 - Fact 验证“这个主张是否为真”，进入现有 `MemoryConsolidator`；
-- Procedure 验证“这套做法在什么条件下是否稳定有效”，进入受治理的 Skill candidate；
-- Commitment 不是知识，继续进入 task inbox。
+- Procedure 验证“这套做法在什么条件下是否稳定有效”——这条支路已删除，Skill 由人书写。
 
 Outcome 是一组可追加、可修订的结果证据。它影响候选的可信度，但不决定一次 episode 是否允许产生学习。
 
@@ -56,9 +59,7 @@ Outcome Assessment ◀──────────── 后续用户反馈
     │
     ▼
 Learning Extractor
-    ├── Fact Observation ──▶ Memory Consolidator ──▶ Memory candidate / evidence
-    ├── Skill Patch ───────▶ Skill candidate ──────▶ operator / execution validation
-    └── Commitment ───────▶ Task inbox
+    └── Fact Observation ──▶ Memory Consolidator ──▶ Memory candidate / evidence
 ```
 
 ## 2. 目标
@@ -68,12 +69,11 @@ Learning Extractor
 1. 学习判断能看到一轮执行中真正发生的事情，而不只看到 user/assistant 文本；
 2. 区分“agent 正常返回了回复”和“用户目标确实完成”；
 3. 让成功、失败和后续用户反馈都能成为可审计的证据；
-4. 复用 Memory 与 Skill 已有的治理路径，不增加第二套晋升规则。
+4. 复用 Memory 已有的治理路径，不增加第二套晋升规则。
 
 非目标：
 
-- 不把完整工具输出复制进长期 Memory 或 Skill；
-- 不让 agent 根据一次自评直接激活 Skill；
+- 不把完整工具输出复制进长期 Memory；
 - 不把 transient task result、commit SHA、单次报错等写成长久知识；
 - 不改变 Wiki 的定位。Wiki 仍是用户维护、按需检索的外部知识源。
 
@@ -88,16 +88,11 @@ Learning Extractor
   - 每次工具调用对应一个 `RunStep`；
   - step 保存经过脱敏和截断的 args、result、error、structured output、耗时及 uncertain 状态。
 - `crates/komo-bot/src/reviewer.rs`
-  - 从 transcript 中提取 Memory observation、Skill proposal 和 Commitment；
-  - 修改已有 Skill 前读取真实 Skill body，避免盲写覆盖。
+  - 从 episode 中提取 Memory observation。
 - `crates/komo-services/src/memory_consolidation.rs`
   - 将 observation 分类为 `supports | contradicts | supersedes | unrelated`；
   - 对同一 session 的重复表达只计一次证据；
   - 冲突和替代会阻止旧 Memory 继续自动注入。
-- `crates/komo-infra/src/skills.rs`
-  - reviewer 只能写 Skill candidate；
-  - candidate 在 operator promote 前不会进入运行时；
-  - protected Skill 不接受自动提案。
 
 ### 3.2 关键缺口
 
@@ -107,8 +102,7 @@ Learning Extractor
 - assistant message 上的 `tool_note` 没有进入 reviewer；
 - reviewer 不知道 run 是成功返回、执行失败还是被取消；
 - reviewer 按 session cadence 运行，而不是消费一个已经 settled 的 episode；
-- `RunStatus::Done` 只表示完成了回复，不表示用户目标成功；
-- Skill candidate 没有与使用它的 episode outcome 建立证据关系。
+- `RunStatus::Done` 只表示完成了回复，不表示用户目标成功。
 
 当前 post-turn review 还在 `runs.finish(&run)` 之前异步启动。未来一旦学习依赖最终 Run 和 RunStep，这个顺序会产生竞态，因此学习触发必须移动到 run finalization 之后。
 
@@ -247,15 +241,13 @@ impl LearningCoordinator {
 }
 ```
 
-它负责执行顺序和失败隔离，不负责 Memory 或 Skill 的领域判断：
+它负责执行顺序和失败隔离，不负责 Memory 的领域判断：
 
 ```text
 load EpisodeView
     → assess provisional outcome
     → extract typed candidates
     → route facts to MemoryConsolidator
-    → route procedures to Skill candidate path
-    → route commitments to task inbox
 ```
 
 整个流程是 reply-path 之外的 best-effort 后台工作。学习失败不能让已经交付的用户 turn 失败。
@@ -294,8 +286,6 @@ load EpisodeView
 ```rust
 struct LearningExtraction {
     facts: Vec<Observation>,
-    skill_patches: Vec<SkillPatchProposal>,
-    commitments: Vec<CommitmentProposal>,
 }
 ```
 
@@ -330,29 +320,6 @@ struct Observation {
 
 Outcome 不应机械地增减所有 Fact 的 support：任务是否成功与“用户偏好中文回复”是否为真没有因果关系。只有 Fact 本身是关于执行效果的主张时，outcome 才是它的直接证据。
 
-### 6.2 Procedure → Skill
-
-Procedure 不进入 Memory，也不增加 `MemoryKind::Procedural`。它表示“怎么做”，应生成已有 Skill 的 patch proposal，或在没有归属时生成新的 Skill candidate。
-
-Procedure 的证据不是“相同文本出现了几次”，而是：
-
-- 哪些 run 实际加载或采用了这条 Skill；
-- 当时的任务条件是什么；
-- outcome 是 Success、Failure 还是 Unknown；
-- 是否存在确定性验证；
-- 是否出现回归或反例。
-
-第一阶段保持当前治理规则：所有自动提取只写 candidate，由 operator 通过 `komo skills promote|reject` 决定是否生效。不要在没有 replay、反例治理和回滚语义前增加自动 Skill 晋升。
-
-### 6.3 Commitment → Task
-
-Commitment 不是 Fact 或 Procedure，也不进入 Outcome Validator。继续沿用现有路径：
-
-- 自动提取只进入 inbox；
-- 使用 origin session 与 content-derived key 去重；
-- 已在本轮完成的事项不提取；
-- 用户后续确认、取消或完成时走 Task 自己的状态机。
-
 ## 7. 生命周期与触发顺序
 
 正确顺序：
@@ -370,9 +337,9 @@ persist user message
 
 - `Done`：生成 provisional outcome 并允许提取；
 - ordinary `Failed`：允许从失败与用户纠正中提取，但默认 outcome 为 Unknown 或有明确验证时为 Failure；
-- `Cancelled`：默认不提取。若已经执行过有副作用工具，只保留审计，不把不完整过程固化为 Skill；
+- `Cancelled`：默认不提取。若已经执行过有副作用工具，只保留审计，不把不完整过程固化为知识；
 - `uncertain` step：禁止得出 Success 或确定性 Failure；
-- `briefing:*`、`cron:*`：继续免除 reviewer 学习，避免 sweep 重述已有知识并制造伪独立证据；
+- sweep 与 delegate origin（`SessionOrigin::is_learnable`）：继续免除 reviewer 学习，避免 sweep 重述已有知识并制造伪独立证据；
 - resume run：通过 `resumed_from` 和原 run 形成一个 outcome chain，但仍保留两个独立 execution records。
 
 Phase 1 验证完成后，应切换到以 run 为粒度的 learning watermark，并删除基于 session user-turn 数量的 reviewer cadence 与 `reviewed_through` 路径。它们不应作为长期兼容层并存。
@@ -383,7 +350,7 @@ Phase 1 验证完成后，应切换到以 run 为粒度的 learning watermark，
 
 - `OutcomeAssessment`：若需要被后续反馈修订，应持久化在 disposable `state.db`；
 - learning watermark：记录某个 run 是否完成学习；
-- Memory 与 Skill 仍写入各自现有 durable store；
+- Memory 仍写入现有 durable store；
 - Episode 本身不复制，继续由 Run、RunStep 和 transcript 组成。
 
 Outcome evidence 应保存引用和摘要，而不是复制完整工具输出。完整输出仍由 run ledger 与 `tool-output/` 管理，遵守既有保留期与脱敏规则。
@@ -395,10 +362,9 @@ Outcome evidence 应保存引用和摘要，而不是复制完整工具输出。
 - Outcome evaluator 失败：记录 Unknown，不能阻断 extraction，也不能影响用户 turn；
 - Extractor 失败：不推进 learning watermark，让 scheduled pass 稍后重试；
 - Memory consolidation 失败：保持现有降级语义，落普通 candidate；
-- Skill grounded rewrite 失败：丢弃该 proposal，不写盲目替换；
 - tool result 是不可信输入，只能作为数据，不能授权 evaluator 或 extractor 执行动作；
 - secrets、write bodies 和超限输出不得通过学习链路绕过 ledger 的 redaction；
-- 自动学习不得修改 active Skill、pin Memory 或把 task 直接推进到 todo。
+- 自动学习不得 pin Memory，也不得直接写 active Memory：抽取一律落 candidate。
 
 ## 10. 增量实施
 
@@ -410,7 +376,7 @@ Outcome evidence 应保存引用和摘要，而不是复制完整工具输出。
 - 在 `runs.finish` 之后触发学习；
 - Outcome 先只使用确定性规则；
 - extractor 消费一批未学习的 EpisodeView（同一 session 内按时间正序）；
-- Fact、Skill、Commitment 继续走现有治理路径。
+- Fact 继续走现有 Memory 治理路径。
 - 旧的 session cadence review 路径已删除。
 
 验证（均有测试）：
@@ -423,7 +389,7 @@ Outcome evidence 应保存引用和摘要，而不是复制完整工具输出。
 - 学习失败不影响 turn reply（detached task，且失败不推进 watermark）。
 
 Golden cases 覆盖情况：第 11 节的 1、4、11、12 已有对应测试；2、3 依赖 Phase 2 的
-用户反馈证据与 aux 判定；5–10 由既有 consolidator / skill governance 测试覆盖。
+用户反馈证据与 aux 判定；5–7、10 由既有 consolidator 测试覆盖。
 
 ### Phase 2：接收延迟反馈 ✅ 已实现
 
@@ -448,31 +414,6 @@ Golden cases 覆盖情况：第 11 节的 1、4、11、12 已有对应测试；2
 重新计算确定性部分再追加，而不是从空列表开始。否则一个自身触发未曾跑过的 run
 （崩溃、重启）会在收到反馈的那一刻丢掉它的 uncertain step 和失败记录。
 
-### Phase 3：Procedure 效果证据 ✅ 已实现
-
-实现（`operator_control/actions.rs` 的 `run_verdicts` + `skill_invocations` /
-`skill_usage`）：
-
-- Skill invocation 与 run outcome 关联；
-- `komo skills audit` 聚合视图显示 `N✓ N✗ N?`，单 skill 视图每行显示该 turn 的
-  结局，并单独列出失败反例的 run id；
-- 保留 operator promote，没有自动晋升。
-
-验证（均有测试）：
-
-- 同一 run 内多次 view 只计一次（视图数仍照实显示，但结局按 run 计）；
-- Unknown 不被当作 Success；
-- 窗口外的 run 读作 Unknown，不读作成功；
-- 失败反例在 `komo skills audit <name>` 末尾单独点名，不埋在计数里。
-
-关于「Skill 被加载但没有采用时不算正向证据」：ledger 看不到「是否真的照做」，
-所以这类情况落在 Unknown 桶里 —— 这是诚实的归类而不是检测。CLI 的说明文字里
-写明了这一点。
-
-尚未实现（来自 hermes 借鉴笔记，不属于本文 Phase 3）：`used >= N && 有失败`
-时自动触发 reviewer 生成 skill 修订候选。本阶段先把证据摆出来给 operator 看；
-自动提案建立在这份证据之上。
-
 ## 11. Golden cases
 
 实现前先固定以下端到端样例：
@@ -484,11 +425,9 @@ Golden cases 覆盖情况：第 11 节的 1、4、11、12 已有对应测试；2
 5. 失败 episode 中用户明确说“以后都用中文”：仍生成 Preference observation；
 6. 同一 session 重复表达相同 Fact：support 只计一次；
 7. 两个独立 session 支持同一 Fact：满足 Memory 的独立证据规则；
-8. 相同 Procedure 文本被提取两次但从未验证成功：仍只是 Skill candidate；
-9. protected Skill 被提议修改：不生成 candidate；
-10. scheduled sweep 重读同一 run：不重复产生 evidence 或 proposal；
-11. cancelled pristine run：不学习；
-12. cancelled run 已产生副作用：只保留审计，不推断结果。
+8. scheduled sweep 重读同一 run：不重复产生 evidence 或 proposal；
+9. cancelled pristine run：不学习；
+10. cancelled run 已产生副作用：只保留审计，不推断结果。
 
 ## 12. 最终边界
 
@@ -496,9 +435,7 @@ Golden cases 覆盖情况：第 11 节的 1、4、11、12 已有对应测试；2
 Transcript / Run ledger = 发生过什么
 Outcome Assessment      = 结果证据目前支持什么判断
 Memory                  = agent 受治理地相信什么
-Skill                   = agent 在适用条件下怎么做
-Task                    = 仍需推进什么
 Wiki                    = 用户维护、按需读取的外部知识
 ```
 
-这六个概念不能互相替代。学习闭环的价值不在于把更多内容自动写入长期存储，而在于让每次写入都能回到具体 episode、具体结果证据和明确的治理路径。
+这四个概念不能互相替代。学习闭环的价值不在于把更多内容自动写入长期存储，而在于让每次写入都能回到具体 episode、具体结果证据和明确的治理路径。

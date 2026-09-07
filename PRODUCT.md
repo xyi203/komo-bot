@@ -12,7 +12,7 @@ web
 
 ## Product Purpose
 
-komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊天、本地工具、持久任务与记忆、定时提醒，以及一个 always-on gateway 承载聊天渠道（飞书/Telegram/微信/Home Assistant）和主动后台工作。所有状态本地存于 `~/.komo`。
+komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊天、本地工具、长期记忆、定时 routine（命令 / agent / 消息三种动作），以及一个 always-on gateway 承载聊天渠道（飞书/Telegram/微信）和主动后台工作。gateway 是唯一持有状态的进程，TUI、CLI、桌面与 Web 客户端都是它的 HTTP 客户端。所有状态本地存于 `~/.komo`。
 
 成功的定义（用户确认）：**长期记忆越用越懂我** —— 记忆系统随时间积累出真实价值，agent 越来越了解它的主人，这是与其他 agent 框架的根本差异。日常依赖与工程品质服务于这个目标。
 
@@ -23,8 +23,8 @@ komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊
 ## Operating Context
 
 - 主形态是聊天助理：终端 TUI（`komo chat`）、Electron 桌面壳与 Web SPA（共享 React 渲染层）、以及飞书/Telegram/微信/HA 等渠道内的对话。
-- gateway 作为常驻进程运行（macOS launchd 托管），承担 sweeps、reminder、cron、briefing 等主动输出；主动消息经 home chat 送达。
-- 操作者通过 CLI 管理记忆、技能、cron、run ledger、权限策略等；副作用工具走审批流（chat 内 `/approve`）。
+- gateway 作为常驻进程运行（macOS launchd 托管），承担 review / routine / dream 三个 sweep 与主动输出；主动消息经 home chat 送达。
+- 操作者通过 CLI 管理记忆、技能、cron、run ledger、权限策略等（统一走 gateway 的 `POST /api/operator`）；副作用工具走审批流（chat 内 `/approve`）。
 - 单机单用户：数据库、配置、凭证都在本地 `~/.komo` 下。
 
 ## Capabilities and Constraints

@@ -16,30 +16,31 @@ cargo test tools::time             # single module
 
 komo init                          # scaffold ~/.komo (config.toml/.env/SOUL.md/USER.md; never overwrites)
 cargo run -- chat                  # full-screen TUI (needs a terminal; scripts use the api channel)
-cargo run -- gateway               # always-on process: sweeps + channels (feishu/telegram/wechat/HA)
+cargo run -- gateway               # always-on process: sweeps + channels (feishu/telegram/wechat)
 komo gateway start|stop|restart|status   # macOS launchd supervision
 komo upgrade [--no-restart]        # git pull --ff-only + cargo install + restart gateway
 komo logs [-n N] [-f] [--stdout]   # tail gateway tracing log
 komo doctor                        # config & gateway health
 komo health                        # liveness probe (exit 0 = healthy; Docker HEALTHCHECK)
 
-komo memory list|search|used|promote|reject|pin|triage|report|repair-scopes
-komo memory used <id>              # which turns this memory shaped (run ledger; pruned with it)
+komo memory list|search|promote|reject|pin|triage|repair-scopes|backfill
 komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; index is incremental)
 komo dream [--apply]               # evidence-driven candidate consolidation (preview by default)
-komo cron list|add|add-agent [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
-komo run list|inspect|resume|rollback|prune   # run ledger (⟲ = recoverable)
-komo skills list|install|inspect|promote|reject|protect|unprotect|enable|disable
-komo skills archive|restore            # retire an active skill / bring back an archived or withdrawn one
-komo skills audit [name]               # one skill's loads, or all ranked coldest-first
+komo cron list|add|add-agent [--skill NAME] [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
+komo run list|inspect|prune        # run ledger (⟲ = interrupted and unclaimed)
+komo session list|resume|clean     # stored sessions (`komo resume <id>` is the shortcut)
+komo skills list|install|inspect|enable|disable
 komo policy list|check|saved       # permission policy: config rules + job grants + saved grants
-komo journey                       # learning timeline (memories + skills)
-komo channel list|probe|setup      # channel inventory / verification / interactive setup
+komo channel list|probe            # channel inventory / verification
 komo channel wechat login          # provision WeChat creds via QR (on the host)
 komo pair approve|revoke|list      # admit chat senders
-komo task list                     # kanban tasks
-komo workday [YYYY-MM-DD]          # Chinese working-day check (holidays + 调休)
 ```
+
+**Anything that touches komo's state goes through the gateway**, which the
+command starts if none is running (see "Gateway is the process" below). The
+gateway-free commands are `init`, `gateway *`, `logs`, `upgrade`, `health`,
+`skills *`, `model *`, `channel list|probe|wechat login` and
+`policy check|saved`; `doctor` probes for a gateway but never starts one.
 
 Logs: `init_tracing` in `main.rs` installs the subscriber (without it every
 `info!` is a no-op). Gateway tees stderr into daily-rotated
@@ -62,26 +63,25 @@ process's own log mid-conversation.
 
 **One database, table-level durability** (docs/adr/0004). `~/.komo/komo.db`
 holds everything Turso stores; "disposable" and "durable" are properties of each
-*table*, not of which file it sits in. The four files it replaced
-(`state.db`, `kanban.db`, `memory.db`, `cron.db`) are imported once on first
-connect and renamed `<name>.merged-backup`.
+*table*, not of which file it sits in. The three files it replaced
+(`state.db`, `memory.db`, `cron.db`) are imported once on first connect and
+renamed `<name>.merged-backup`.
 
 | Where | Contents | Durability |
 |---|---|---|
-| `komo.db` · `session_records`, `session_todo_records`, `reminder_records`, `pairing_records`, `setting_records`, `inbox_records`, run ledger (`run_records`, `run_step_records`, `run_memory_records`) | one turn's execution record and the session metadata around it | disposable **by row** — `komo run prune`, `komo sessions clean`; never by dropping the table |
-| `komo.db` · `task_records` | cross-session tasks | durable — **additive changes only** (`kanban::ensure_schema`) |
+| `komo.db` · `session_records`, `session_todo_records`, `pairing_records`, `setting_records`, `inbox_records`, run ledger (`run_records`, `run_step_records`) | one turn's execution record and the session metadata around it | disposable **by row** — `komo run prune`, `komo session clean`; never by dropping the table |
 | `komo.db` · `memory_records` | long-term memories | durable — **additive changes only** |
 | `komo.db` · `cron_job_records` | routines: a `Trigger`, an action, and the last 20 `RoutineRun`s | durable — **additive changes only**; `schedule` / `last_*` are retired columns kept (and written empty) because dropping one is not additive |
-| `komo.db` · `wakeup_records` | standing wakeups — one row per suspended turn's wait | durable |
-| `~/.komo/sessions/` | transcripts — one append-only `.jsonl` per session | disposable |
+| `komo.db` · `wakeup_records` | standing wakeups — one row per suspended turn's wait | durable — same retired-column rule: `at` / `task_id` / `filter` outlived the timer and event waits and are written `0` / `""` |
+| `komo.db` · `chunk_records` | the hybrid search index over the note vault and over komo's own transcripts, split by a `collection` column | disposable **by collection** — every row is reproducible from its source file or transcript |
+| `~/.komo/sessions/<id>/` | transcripts — a manifest plus append-only `.jsonl` segments | disposable |
 | `~/.komo/permissions.json` | saved approval grants | durable |
-| `~/.komo/checkpoints/` | pre-images of files a run changed (7-day retention) | disposable |
-| `~/.komo/session-index/` | episodic search index over transcripts | disposable — rebuilt on search |
 | `~/.komo/tool-output/` | over-limit tool results + per-session `index.jsonl` (7-day retention) | disposable |
 | `~/.komo/artifacts/<session>/` | what a turn *produced* — reports, scripts, downloads | durable — never swept; a writable workspace root |
 | `~/.komo/skills/` | skill files (filesystem is the source of truth) | durable |
+| `~/.komo/plugins/` | `*.py` plugin tools the operator (or the agent, under approval) authored | durable — a writable workspace root, and the only one where a write is `Risk::Dangerous` |
 
-Transcripts are **files, not rows** (`persistence/message_log.rs`), because they
+Transcripts are **files, not rows** (`persistence/session_log.rs`), because they
 are the one thing here that is purely appended — so they pay no schema cost: a
 field added later reads as its default on every line written before it existed,
 and a change deeper than that dispatches on the line's `v`. Session *metadata*
@@ -100,6 +100,12 @@ depends on lives — user and assistant must alternate, because several provider
 reject two consecutive user messages on replay. Keeping that true at each write
 site took three separate patches; it is now one function, testable without a
 database. **Add a new read path through `projected`, never `entries`.**
+
+An event `type` this build has no vocabulary for decodes to an inert
+`SessionEventKind::Unknown` that **keeps its seq** and means nothing — a
+downgrade, or a line a since-retired mechanism wrote, must not renumber every
+event after it or make the session unreadable. A *known* type whose payload will
+not parse still refuses: that is corruption, not vocabulary.
 
 **A transcript and a replay are different reads of one surface.**
 `SurfaceProjection::messages()` is the whole conversation — what `komo run
@@ -134,15 +140,17 @@ longer available for anything):
 
 - **Column additions never need a reset**: `komo-infra/src/persistence/mod.rs::ensure_columns`
   ALTERs in place on connect. Extend the list next to the model — `EXPECTED` in
-  `memory_db.rs`, `cron.rs` and `kanban.rs`, `SESSION_COLUMNS` / `RUN_COLUMNS` /
+  `memory_db.rs` and `cron.rs`, `SESSION_COLUMNS` / `RUN_COLUMNS` /
   `STEP_COLUMNS` in `db.rs::connect` — and add an `ensure_schema` for a table
   that has none yet. Columns must be NOT NULL + DEFAULT, or
   nullable.
 - **A new table** is added with `ensure_table` (its DDL kept beside the model,
   byte-parity locked by a test — see `INBOX_TABLE_DDL`), because an existing
-  `komo.db` will not re-run `push_schema`.
+  `komo.db` will not re-run `push_schema`. `chunk_records` is the one table komo
+  talks to in SQL rather than through the ORM, so it owns its own
+  `CHUNK_TABLE_DDL` and needs no parity test.
 - **A non-additive change** to a durable table (`memory_records`,
-  `task_records`, `cron_job_records`) is not available: those may only ever
+  `cron_job_records`, `wakeup_records`) is not available: those may only ever
   change additively. On a disposable table it is a **row-level** migration or a
   documented one-time repair (`drop_retired_columns`), never a dropped file.
 - **A `Message` field change needs neither**: it is a JSONL line, not a column.
@@ -160,16 +168,36 @@ them all, each domain's repository impl in its own module):
 - Legacy rusqlite files auto-migrate once (staged to `.sqlite-backup`, `.turso`
   marker prevents re-migration).
 
-## Gateway ↔ CLI coexistence
+## Gateway is the process
 
-Turso holds an exclusive cross-process lock per db file. While the gateway
-runs, the CLI cannot open the dbs directly — every operator action goes through
-`services/operator_control/`: probe `~/.komo/gateway.json` (rendezvous file) →
-route over the loopback api channel (`infra/messaging/api.rs`,
-`infra/gateway_client.rs`) or fall back to direct db open. **Both paths run the
-same `operator_control/actions.rs::OperatorActions`**, so business logic can't
-fork — add new operator actions there, not in the CLI or api handlers.
+Turso holds an exclusive cross-process lock per db file, so **the gateway is the
+only process that opens komo's state — and therefore the only process that has
+an agent.** "No gateway" is not a mode with its own behaviour; it is a process
+that has to exist before the command can mean anything.
+`GatewayClient::connect_or_start` (`infra/gateway_client.rs`) probes
+`~/.komo/gateway.json` (rendezvous file) + `/health`, and finding nothing starts
+one: on macOS it loads the launchd job and polls `/health` for up to 60s,
+elsewhere it says who is supposed to (`komo gateway`, or the container's own
+main process). `komo chat`, the TUI and every state-touching CLI command are
+clients of the loopback api channel (`infra/messaging/api.rs`); there is no
+direct-db fallback.
 
+- **The whole operator surface is one endpoint.** `POST /api/operator` carries a
+  serialized `OperatorQuery` / `OperatorCommand` (`OperatorRequest` /
+  `OperatorReply` on the wire) and the gateway matches it against the same
+  definitions the CLI names a variant from, so a shape cannot drift between the
+  two sides. `OperatorControl` (`services/operator_control/`) is the CLI's whole
+  view of it — resolve once per command, then issue queries and commands and
+  never touch HTTP or a route path. The business result comes from
+  `operator_control/actions.rs::OperatorActions`, which the gateway's own
+  handlers call too, so logic can't fork — **add a new operator action there and
+  a variant to the two enums**, never a route.
+- The remaining `/api/*` routes exist for the clients that are not the CLI: the
+  web/desktop apps (`/api/status`, `/api/models`, `/api/workspaces`,
+  `/api/home-session`, `/api/sessions*`, `/api/memories*`, `/api/runs*`,
+  `/api/dream*`, `/api/interactions/*`) and OpenAI-compatible callers
+  (`/v1/models`, `/v1/chat/completions`). Writes sit behind a `require_loopback`
+  *layer* (`operator_writes`), so a route added there is gated by construction.
 - `komo chat` → `POST /v1/chat/completions` with `X-Komo-Trusted` (loopback
   only): side-effecting tools auto-approve for the host operator.
   `X-Komo-Session-Id` **must be a UUID** and is the session id verbatim — 400
@@ -228,9 +256,9 @@ fork — add new operator actions there, not in the CLI or api handlers.
   have read the answer is gone. A woken routine that stops *again* has no sweep
   behind it to deliver the new `wk-` id, so the dispatcher sends that prompt
   itself (`announce_new_wait`, `/approve <id>` only).
-- **A tool can raise the same wait** (`ToolContext::wait_for`, docs/bot-runtime.md
-  §3.4): `wait` and `ask_user` fill in the *same* `PendingSuspension` the
-  approval gate does, so the executor, the loop and the runtime need no second
+- **A tool can raise the same wait** (`ToolContext::wait_for`): `ask_user` fills
+  in the *same* `PendingSuspension` the approval gate does, so the executor, the
+  loop and the runtime need no second
   path. What differs is only the way back: `turn/suspended` carries the
   **`call_id`** that stopped, which puts it in `rebuild_from_events`' `gated`
   set (re-dispatched regardless of idempotency, for the same "it never ran"
@@ -244,39 +272,31 @@ fork — add new operator actions there, not in the CLI or api handlers.
   `remote_interactive = true` lets keyed remote callers run interactive turns
   (`X-Komo-Trusted` stays loopback-only regardless). CORS grants loopback
   origins + Electron's `null` origin; bearer key remains the gate.
-  `POST /api/hooks/{name}` (docs/bot-runtime.md §5.12) is the one route whose
-  caller is *not* the operator: an external system firing a routine. It sits in
-  `protected` (bearer key) and deliberately **not** in `operator_writes`, whose
-  loopback layer would shut out its real callers — and by the same token
-  loopback earns it no exemption. Its body is capped at `HOOK_BODY_LIMIT` and
-  read as text, never parsed. It **answers from the match and runs the work
-  behind the reply** (`on_event_detached`): an external caller's timeout is
-  seconds and its response to one is to redeliver, while a routine firing has
-  no dedupe key — so waiting would turn one notification into several runs of
-  the same routine. The `{routines, wakeups}` it returns is therefore what
-  matched, and deduplicating a redelivery is the caller's problem.
 
 ## Config
 
 `~/.komo/config.toml` = runtime settings (provider/model/`models`/aux_model,
 `aux_effort` — the aux backend's reasoning effort; defaults to `none` on
 DeepSeek (thinking off), the provider's own default elsewhere —
-`schedule`, `briefing_schedule` + `briefing_workdays_only`, `dream_schedule`
-(default nightly `0 3 * * *`, `"off"` disables), the two sweep kill switches
-`briefing_schedule_enabled` / `dream_schedule_enabled` (default true; `false`
+`schedule`, `dream_schedule`
+(default nightly `0 3 * * *`, `"off"` disables) plus its kill switch
+`dream_schedule_enabled` (default true; `false`
 disables the sweep while leaving its cron in place, so
-`KOMO_BRIEFING_SCHEDULE_ENABLED=false` / `KOMO_DREAM_SCHEDULE_ENABLED=false`
-silence a deployment without rewriting config.toml), `[channels.*]`, `[policy]`
+`KOMO_DREAM_SCHEDULE_ENABLED=false`
+silences a deployment without rewriting config.toml), `pyhost_enabled`
+(default true; `KOMO_PYHOST_ENABLED=false` keeps the python plugin host — and
+with it `run_code` and every `py__` tool — out of the process),
+`[channels.*]`, `[policy]`
 — `default_normal`, the `[[policy.rule]]` list, and `mode` (`ask` default /
 `auto`, which routes an escalation through the aux reviewer first; an
 unparseable value warns and stays `ask`, since a typo must never widen the
 gate) —
 `[memory]` — `embedding_model`/`embedding_url` for the Ollama backend behind
 cross-language recall; no model = lexical-only —
-`[wiki]` — `vault` (the note directory; absent = no `wiki_search`/`wiki_read`/`wiki_index`),
-`backend` (`edge` default / `server`), `url` + `collection` for the server
-backend, and its own `embedding_model`/`embedding_url` (falling back to
-`[memory]`'s when unset); `QDRANT_API_KEY` lives in `.env` —
+`[wiki]` — `vault` (the note directory; absent = no `wiki_search`/`wiki_read`/`wiki_index`)
+and its own `embedding_model`/`embedding_url` (falling back to
+`[memory]`'s when unset); the index itself has no configuration, because it is a
+table in `komo.db` —
 and `[mcp.servers.<name>]` — external MCP servers: `url`, `token_env` (names
 the `.env` var, never the token), and a **required** `tools` allowlist
 (or `all_tools = true`), closed by default because every mounted tool's schema
@@ -290,7 +310,7 @@ become `ConfigIssue`s (never abort resolution) checked by `validate_agent` /
 (boots with `UnconfiguredLlm` that errors per call). **Never re-read config.toml
 or call `std::env::var` in callers** — the only exception is `KOMO_HOME`.
 
-Operator-authored prompt files (`agent/system_prompt.rs`, main agent only):
+Operator-authored prompt files (`komo-bot`'s `system_prompt`, main agent only):
 persona `~/.komo/SOUL.md`, profile `~/.komo/USER.md`, and **one instruction file
 per scope, first found wins** — machine-wide `~/.komo/AGENTS.md` else
 `~/.agents/AGENTS.md` (the latter under the real home, not `KOMO_HOME`, since
@@ -348,7 +368,7 @@ CLI/channel → AgentRuntime ─ run_agent_loop ─┬→ LlmClient::begin_turn 
 ```
 
 komo owns the tool loop **and its provider layer** (`crates/komo-provider`, no
-LLM crate): one completion per round, `run_agent_loop` (`agent/runtime.rs`) is where
+LLM crate): one completion per round, `run_agent_loop` (`komo-bot`'s `runtime`) is where
 round-level control lives (`max_turns` budget, cancellation, suspension). Tool
 errors return as outcome content the model can recover from; only a driver/LLM
 error aborts the turn.
@@ -358,24 +378,29 @@ compiles in parallel and so an edit there does not rebuild everything (`src/` wa
 one 50k-line crate). Depend downward only:
 
 ```
-komo-core      traits + value types, no I/O, no runtime — the GUI client reuses it
-komo-config    config.toml + .env + KOMO_* → one ConfigSnapshot   (→ core)
+komo-core      the domain layer only: value types plus repository and port trait
+               signatures. No I/O, no runtime, no `dirs`; its lib is one line,
+               `pub mod domain;` — anything that reads a path, a file or a clock
+               belongs a layer up (that is where `paths`, `rendezvous`,
+               `operator_view` and `Notifier` went)
+komo-config    config.toml + .env + KOMO_* → one ConfigSnapshot; owns `komo_home`
+               and is the only `KOMO_HOME` reader                     (→ core)
 komo-provider  wire formats + HTTP/SSE; references nothing else in komo
 komo-mcp       MCP client over rmcp (Streamable HTTP); ditto — nothing komo
-komo-wiki      note-vault vector index: edge (qdrant-edge, in-process) /
-               server (Qdrant over gRPC) / lazy                        (→ core)
-komo-infra     persistence · memory · skills · logs · workday ·
+komo-pyhost    the python plugin host's protocol and child process; nothing komo
+komo-infra     persistence · chunk_index · memory · skills · logs ·
                permissions_store · codex · embedding         (→ core, config, provider)
 komo-services  tool_execution · tool_output_store · memory_query ·
                memory_consolidation · memory_enrichment ·
                skill_registry · cron_actions · wiki_indexing ·
-               session_indexing · episode · background_tasks ·
+               session_indexing · episode · artifact_store ·
                diff/patch/search/file_mutation                (→ core, config)
-komo-tools     every tool                      (→ core, infra, mcp, services)
+komo-tools     every tool                      (→ core, infra, mcp, pyhost, services)
 komo-bot     runtime · gateway · daemon · interaction · system_prompt ·
-               policy_approver · reviewer · llm · delegate
+               policy_approver · reviewer · llm · delegate · notify
                                             (→ core, config, provider, infra, services)
-komo (bin)     cli · tui · `infra/messaging` (channels) · `infra/gateway_client` ·
+komo (bin)     cli · tui · pyhost (lifecycle) · `infra/messaging` (channels) ·
+               `infra/gateway_client` · `infra/rendezvous` ·
                `services/operator_control` — the wiring layer, plus what needs
                the agent above it; each `mod.rs` says why it stayed
 ```
@@ -432,34 +457,36 @@ call the same functions, which is what keeps validation from forking.
   `Tool::call(Value, &ToolContext)` is the **only** tool entry point; the
   `SESSION` task-local serves the approvers only — tools take `ctx.session`.
 - `komo-tools` — `time`, `shell` (own process group, hardline floor no approval
-  unlocks, nested timeouts; `background: true` hands the same approved command
-  to `background_tasks` and answers with a task id), `grep`/`glob` (ripgrep libraries in-process;
+  unlocks, nested timeouts), `grep`/`glob` (ripgrep libraries in-process;
   policy runs over paths **before** content is read), `read`/`write` +
-  `fs_common` (confined to the workspace's roots **plus `~/.komo/artifacts`** —
-  komo's own writable root, where a turn puts what it *made* rather than what it
-  changed, one directory per session, named to the model at the tail of each
-  turn's user message; `write_if_unchanged` guards the approval
+  `fs_common` (confined to the workspace's roots **plus `~/.komo/artifacts`**
+  and **`~/.komo/plugins`** — komo's own two writable roots: artifacts is where a
+  turn puts what it *made* rather than what it changed, one directory per
+  session, named to the model at the tail of each turn's user message; plugins is
+  where it authors a tool, and a write there is `Risk::Dangerous` —
+  `write_if_unchanged` guards the approval
   window), `edit` (exact match only, no fuzzy) / `apply_patch` (v2 envelope,
   one approval per batch, no rollback — reports exactly what landed),
   `web_fetch` (content-type gated, 256 KB download cap, deny-only network
-  policy), `homeassistant` (`call_service` approval-gated; `BLOCKED_DOMAINS`
-  hardline), `task` (a `waiting` task that names an address registers a wake —
-  see below), `todo` (session-scoped, dies at a `/new` boundary — the
-  only thing that does), `memory`,
-  `skill`, `cron`, `ask_user` / `wait` (the two sentinel tools: both stop the
-  turn through `ToolContext::wait_for` and come back with the wake as their
+  policy) / `web_search`, `homeassistant` (`call_service` approval-gated;
+  `BLOCKED_DOMAINS` hardline), `todo` (session-scoped, dies at a `/new`
+  boundary — the only thing that does), `memory`,
+  `skill` (`list` / `view` / `install`), `cron`, `ask_user` (the one sentinel
+  tool: it stops the
+  turn through `ToolContext::wait_for` and comes back with the wake as its
   result — no process waits, and a restart loses nothing), `logs` (tail of komo's own
   tracing log — file lookup shared with `komo logs` via `komo-infra`'s `logs`, same
   deny-only file-read gate as `read`), `wiki_read` (vault-confined by
   canonicalized prefix, `Risk::Safe` deny-only; reads the markdown, not the
-  index, so a note edited since the last index run is served current).
+  index, so a note edited since the last index run is served current),
+  `run_code` and `plugin`'s `PyTool` (see `src/pyhost.rs` below).
 - `session` + `komo-services`' `session_indexing` — **episodic memory**:
   hybrid search over komo's own transcripts, the third memory beside `memory_records`
   (semantic) and skills (procedural). `search` spans **every** stored
   conversation by default, because "why did we decide against rig?" is a
   question about *some* past session and requiring its id up front is requiring
   the answer as the input. It matches meaning as well as wording, over the same
-  `ChunkIndex` the vault uses but its own collection (`~/.komo/session-index`) —
+  `ChunkIndex` the vault uses but its own collection (`komo_sessions`) —
   transcripts are komo's own corpus and must not depend on `[wiki]` being
   configured. **A chunk is a turn, not a message**: "那就不用 rig 了" embeds into
   nothing alone, and its `ordinal` is its opening user message's `show` offset,
@@ -487,11 +514,8 @@ call the same functions, which is what keeps validation from forking.
   to `Unknown`, never a majority.
   Memory extractions leave here as `Observation`s and are applied by
   `MemoryConsolidator`, never written directly — the reviewer holds no memory
-  store. It has **not** read any skill it proposes to change, so a proposal
-  naming an existing active skill goes through a second aux call
-  (`grounded_rewrite`) that is handed the real body and returns the complete
-  replacement; failing to ground drops the proposal rather than writing the
-  blind one. New skills need no second pass.
+  store. **Memory is the only thing the pass extracts**: skills are written and
+  installed by a human, so nothing here proposes one.
   **The watermark is per run, not a per-session turn count**: a count says how
   many turns there were, never which ones were new. It lives in the log as one
   `learning/completed` / `learning/skipped(reason)` per turn, durably flushed
@@ -542,60 +566,46 @@ call the same functions, which is what keeps validation from forking.
   (`Session.origin = delegate`, which is what keeps it out of the session list); inherits the parent's ambient session context (approvals prompt the
   real conversation, cancel propagates); recursion blocked structurally
   (sub-agent tool set has `delegate: None`); each delegation is its own ledger
-  run. The unattended cron runtime gets no `delegate`. `detach: true` runs that
-  same sub-agent turn as a background task instead of inside the parent's — same
-  sub-session, same recursion guard, but it runs in a task of the process's,
-  outside any conversation, so **an action of its that needs approval is
-  refused**, not parked: prompting the parent would need a `wk-` id that does not
-  exist until after the approver has answered, a second settle for a task whose
-  `spawned`/`settled` pair allows one, and an approval slot per sub-agent so a
-  background prompt cannot displace the one the operator is answering. The tool's
-  `detach` description says so, so work that will need permission is delegated
-  without it.
-- `domain/background.rs` + `komo-services`' `background_tasks` — work a turn
-  starts and does not wait for (docs/bot-runtime.md §5.9): `shell {background}`,
-  `delegate {detach}`. **Two events and no status table** — `task/spawned` /
-  `task/settled`, and "still running" is `unsettled()` folding the log for a
-  spawn with no settle. That fold is the per-session cap
-  (`MAX_BACKGROUND_TASKS_PER_SESSION = 3`) and the startup check both.
-  `task/settled` carries no `turn_id` and is invisible to the run projection:
-  it may land long after the turn ended, and attributing it to a step would put
-  work inside a closed run. The work runs in a task the **process** owns, not
-  the turn's — the executor aborts a call at its limit and the loop ends the
-  turn, and this was explicitly detached from both. Which decides the restart
-  rule: `reconcile_orphans` (gateway startup, *after*
-  `reregister_suspended_turns`) settles everything still open as
-  **`Uncertain`** and re-runs nothing — the process group died with the process,
-  and "it may or may not have landed" is the same claim a tool call makes when
-  it cannot confirm its own effect, so it has to reach the model. Settling
-  claims (`take`) before it fires, then: a turn still parked on
-  `wait { for_task }` is continued with the result; otherwise the result opens a
-  turn of its own (`continue_turn_with`'s `turn_id: None` branch), carrying no
-  `wakeup/fired` because nothing was suspended. Reached from a tool the way an
-  approval gate is — `ToolContext::with_background`, installed per call by the
-  executor, wired for `Scope::MAIN` only.
+  run. The unattended cron runtime gets no `delegate`.
+- `src/pyhost.rs` + `komo-pyhost` + `komo-tools`' `run_code` / `plugin` — the
+  **dynamic-tool loop**, and the one thing in komo that mounts tools into a
+  *running* process rather than at wiring. `run_code` runs a one-off Python
+  program in an out-of-process host; a `@tool`-annotated function in a
+  `$KOMO_HOME/plugins/*.py` file becomes a `py__<name>` tool within seconds of
+  the file being written, and goes away when it is deleted. `PLUGIN_GUIDANCE`
+  (gated on `run_code` plus a known plugins directory) is what tells the model
+  that loop: prototype with `run_code`, persist as a `@tool`. Both directions go
+  through the same broker — a plugin's `tools.<name>(...)` call is dispatched by
+  the runtime's own `WeakToolExecutor` (`PyTool`), so it pays the same approval
+  gate, retry classification and ledger step an ordinary call does. Two
+  structural rules: the plugins directory is a **writable workspace root whose
+  writes are `Risk::Dangerous` with no scope key**, so a human approves each
+  file and no grant ever widens it (a `.py` there runs unsandboxed on every
+  later turn, unattended routines included); and `available()` decides *before*
+  the executors are built whether a host can run at all (`pyhost_enabled`, and a
+  `[policy]` that wholly denies `Category::Plugin`), because that answer decides
+  whether `run_code` is registered — `start()` comes after, once there is
+  something for the host to mount into.
 - `domain/policy.rs` + `komo-bot`'s `policy_approver` — permission policy. Ladder,
   strongest first: **tool hardline floor > config deny > saved grant > config
   allow / `default_normal` > ask**. Saved grants (`permissions.json`, written
   only by `PolicyApprover`) are never read unattended. **A `Risk::Dangerous`
   action is approved for the one call it was asked about and no further** —
   `/approve session` and `/approve always` narrow to `Once`, in
-  `ApprovalState::resolve_scoped` for chat and in `cli/approver.rs` for the
-  TTY, and the user is told. Widening an irreversible action pre-approves a
-  *later* deletion nobody has seen. Unattended contexts (cron/briefing/sweeps) grant only through
+  `ApprovalState::resolve_scoped`, and the user is told. Widening an
+  irreversible action pre-approves a
+  *later* deletion nobody has seen. Unattended contexts (cron/sweeps) grant only through
   `unattended = true` allow rules **or the running job's own `grants`**
   (`CronJob.grants`, approved in the same prompt that created the job; carried
   into the turn by `with_job_grants`, scoped to that turn, revoked with the job)
   — everything else escalates to the runtime's own inner approver
-  (`komo-bot`'s `unattended`), and the two answer differently: a **routine**
-  stops (`UnattendedSuspend` → `Decision::Suspend`) and the sweep tells the
-  operator which wait to answer in the home chat, a **briefing** denies
-  (`UnattendedDeny`), because its digest has already gone out by the time
-  anyone could answer. Neither ever lets a `Risk::Dangerous` action through,
-  however long the operator takes.
+  (`komo-bot`'s `unattended`), which **stops** rather than refuses
+  (`UnattendedSuspend` → `Decision::Suspend`) so the sweep can tell the operator
+  which wait to answer in the home chat. It never lets a `Risk::Dangerous`
+  action through, however long the operator takes.
   Full ladder: **tool hardline floor > config deny > job grant > saved grant >
   config allow / `default_normal` > ask**. **What marks a turn unattended is
-  `SessionContext::origin`** (`SessionOrigin::Cron` / `Briefing`, set by the
+  `SessionContext::origin`** (`SessionOrigin::Cron`, set by the
   sweep that starts the turn), *not* the absence of an ambient session — those
   turns have a real session id, and reading a channel off it is what used to
   make the engine's unattended branch unreachable. Read-only actions (`read`, `web_fetch`) are
@@ -615,8 +625,8 @@ call the same functions, which is what keeps validation from forking.
   judges whether the action is plainly authorized by the operator's own latest
   message, and **may only allow or hand over — never deny**; refusal stays the
   operator's. Four structural properties, each a test: no deny;
-  `Risk::Dangerous` never reviewed; unattended turns never reviewed (cron /
-  briefing keep the "shrink the action set in advance" contract and don't wire
+  `Risk::Dangerous` never reviewed; unattended turns never reviewed (the cron
+  runtime keeps the "shrink the action set in advance" contract and doesn't wire
   it at all); fail-closed — model error, 20s timeout, unparseable verdict, or no
   operator message to judge against all mean "ask". Verdict parsing is
   deliberately strict: the word must lead the first line **and** be the only
@@ -728,28 +738,38 @@ call the same functions, which is what keeps validation from forking.
   every automated write unrecallable from the next turn and needed an
   `is_durable_channel` exception to undo. Memories written before that fix are
   repaired by `komo memory repair-scopes`.
-- `domain/chunk_index.rs` + `komo-wiki` + `komo-services`' `wiki_indexing` +
+- `domain/chunk_index.rs` + `komo-infra`'s `chunk_index` + `komo-services`'
+  `wiki_indexing` +
   `komo-tools`' `wiki_search` / `wiki_read` / `wiki_index` — semantic search over the note vault
   (`[wiki] vault`), **pulled on demand, never auto-injected** like memory recall:
   a vault dwarfs the memory store, so a turn that does not search pays nothing.
-  Two interchangeable backends behind `ChunkIndex` (the corpus-neutral index
-  trait, shared with session search), chosen by `[wiki] backend`:
-  `edge` (qdrant-edge, in-process, the default) and `server` (Qdrant over gRPC,
-  for sharing one collection across processes). They speak the same data model,
-  so an index built by one is readable by the other — but **nothing migrates**,
-  and a switch leaves the new backend empty until `komo wiki index` refills it.
-  Retrieval is hybrid (BM25 fused with dense), capped per note so one long file
-  cannot crowd out a result set. **`wiki_search` finds, `wiki_read` widens**: a
+  `ChunkIndex` is the corpus-neutral index trait (shared with session search) and
+  `TursoChunkIndex` is the only implementation: **one `chunk_records` table in
+  `komo.db`**, split by a `collection` column (`komo_wiki`, `komo_sessions`), so
+  a corpus is disposable by collection and there is no second store to configure,
+  lock or keep in sync. Both arms are SQL. The **dense** arm is
+  `vector_distance_cos` over a raw little-endian `f32` BLOB — brute force, no
+  ANN index, because Turso has none and a few thousand chunks scan in tens of
+  milliseconds (the same trade memory recall already makes in Rust). The
+  **lexical** arm is a `terms` column written at index time and matched with
+  `instr`, IDF-weighted: Turso *has* an FTS index method, but it refuses to be
+  created under MVCC (`Custom index modules are not supported in MVCC mode`) and
+  MVCC is what lets the gateway's sessions write concurrently — so the
+  tokenizing moves to index time, paid once per chunk instead of once per query.
+  Tokens come from the splitter memory recall uses
+  (`chunk_index::lexical_terms`, CJK bigrams plus ASCII words): a Chinese query
+  against an English note is the same problem in both places, and two answers to
+  it would be a bug in one of them. The two arms fuse through the existing RRF
+  and `diversify`, capped per note so one long file cannot crowd out a result
+  set. `Db` holds a second raw `turso::Database` handle for this, since it is the
+  one table komo talks to in SQL rather than through the ORM.
+  **`wiki_search` finds, `wiki_read` widens**: a
   search hit is an isolated chunk, and a turn that needs the whole section asks
   for it by `path` + `heading` rather than making every query pay the context
   cost of the few that do. `wiki_read` shares the chunker's heading parser
   (`is_fence` / `parse_heading`), so it can never miss a heading search reported,
-  and needs no index handle at all — which is why it survives a vector backend
-  that failed to open. `LazyWikiIndex` opens the backend on first use
-  and retries per call: wiring is one-shot, so an eager open that failed would
-  cost `wiki_search` for the life of the process — and the usual causes (a NAS
-  still booting, a local-network permission the launchd job lacks) get fixed
-  while the gateway keeps running. The gateway holds the only handle, so
+  and needs no index handle at all.
+  The gateway holds the only handle, so
   `komo wiki` borrows it through `operator_control` rather than opening its own.
   Indexing is **incremental by mtime** (embedding is the whole cost of a run, so
   an unchanged file costs nothing) and `--rebuild` is the opt-out. **Nothing
@@ -764,29 +784,12 @@ call the same functions, which is what keeps validation from forking.
   `reset()`s the store before refilling it and outlives any `max_duration`, so
   running it inside the call would let a timeout abort it with the store already
   emptied. Its outcome is read back with `status`.
-- `domain/checkpoint.rs` + `komo-services`' `checkpoint_store` — undoing a
-  turn's **file** changes, the one thing a turn did that used to be final.
-  Every other effect is already recoverable: a memory is a candidate, a skill is
-  a candidate, a cron job can be removed, an ambiguous call is `Uncertain` so the
-  model checks rather than repeats. `write`/`edit`/`apply_patch` produced final
-  state. Now `file_mutation` keeps the bytes each file held **before the run
-  first touched it** — inside the same per-path lock as the write, so the
-  pre-image is exactly what that write replaced — and `komo run rollback <id>`
-  puts them back. Recording is best-effort and happens *after* the mutation: a
-  write the user asked for must never fail because a pre-image could not be
-  filed. **A file whose content is not what the run left is skipped and named,
-  never restored** — undoing one turn is the promise, and quietly undoing a
-  later fix along with it is the failure mode. Operator CLI only, never a model
-  tool: an agent that can undo its own turn can undo the turn that corrected it.
-  Not a sandbox and not a workspace snapshot — the pre-image of exactly what
-  changed, which is what a personal agent needs far more often than container
-  isolation.
 - `domain/run.rs` + `domain/run_projection.rs` — run ledger: one `Run` per
   turn, one `RunStep` per call, and **all of it a projection of the session
   event log**. Nothing writes a run or a step directly: `project_runs` folds the
   log and `RunProjectionStore::commit` upserts the rows — once when the turn
   opens (from the opening events alone, so a crash leaves a `running` row for
-  `run list` and `run resume` to find) and once when it closes, from the same
+  `run list` to find) and once when it closes, from the same
   read of the log that computes retention's floor. Two authoritative records of
   one turn disagreed after exactly the crash they were meant to survive; now the
   fold-vs-row cross-check (`assert_ledger_matches_log`) holds to the second.
@@ -806,64 +809,40 @@ call the same functions, which is what keeps validation from forking.
   memory produced *this* answer" — and, read the other way, which turns a
   memory you just corrected had already shaped. Ids only; the store stays the
   authority on content.
-  The reverse direction — *which turns did this memory shape?*, the question
-  asked right after correcting one — is a thin `run_memory_records` index
-  projected from the same `turn/memories` event, and dropped with its run by
-  `prune`. Not answered by scanning runs: a `Run` carries two 4000-char
-  fields, so reading thousands of them for one JSON column is the wrong
-  query.
   `elapsed_ms` is the duration field (`started_at`/`ended_at` are whole
   seconds); 0 / empty `structured` read as *unknown/absent*, never
   instant/empty-object. Args redacted per-tool (`Tool::redact_args`); results
-  truncated not scrubbed. `komo run resume` re-dispatches a *fresh* primed
-  turn (the ledger is an audit record, not a checkpoint); `recoverable` folds
-  as *no terminal event and unclaimed*, and the claim is the continuation's own
-  `turn/started{resumed_from}` — seq assignment decides who owns a recovery, so
-  at-most-once no longer depends on a row update racing another reader. Never
-  auto-resumed.
+  truncated not scrubbed. `recoverable` folds as *no terminal event and
+  unclaimed* and prints as `⟲` in `run list` — an audit marker, not a resume
+  button: nothing re-dispatches an interrupted turn, because the ledger is a
+  record of what happened and not a checkpoint to replay from.
 - `domain/skill.rs` + `komo-infra`'s `skills` + `services/skill_registry.rs` —
-  skills are `SKILL.md` files under `~/.komo/skills/` (active), `.candidates/`
-  (proposals), `.archive/` (retired — `komo skills archive|restore`; nothing
-  here ever deletes an active skill), and `.expired/` (proposals dreaming
-  withdrew). Automated writes (`save` — reviewer +
-  `skill learn`) only ever produce candidates; `install` is the human-in-the-loop
-  exception that lands active. `protected` skills refuse even proposals.
-  A candidate nobody rules on within `SKILL_CANDIDATE_EXPIRY_DAYS` is withdrawn
-  by the dream sweep. **Age is the only signal there is** — a candidate cannot
-  be loaded (dot dirs never enter the registry's scan), so unlike a memory
-  candidate it accrues no usage to be judged on, and its clock is the
-  `updated_at` frontmatter the renderer has always written. `.expired/` is kept
-  apart from `.archive/` because `restore` dispatches on where a skill sits:
-  archived → active, expired → **candidate**, never active — a proposal no human
-  approved must not go live by way of a restore. Restoring restamps the file, or
-  the next night's sweep withdraws it again before anyone can look.
-  A `promote` that overwrites an active body rolls the old one into
-  `.history/<name>/` — the automated path proposes *whole* bodies, so the
-  overwrite has to be recoverable. `SkillRegistry` re-scans dirs on every query
-  (no restart needed); only the capped prompt catalog is a startup snapshot
-  (cache stability). That catalog — and **only** that catalog — is gated by
+  skills are `SKILL.md` files under `~/.komo/skills/<name>/`, and **skills are
+  written and installed by a human**: nothing here writes one on the agent's
+  behalf, so there is no candidate pool and no governance pipeline. The registry
+  scans an ordered search path (`runtime_skill_dirs`: the configured dirs, the
+  workspace's own `skills` / `.claude/skills`, `~/.komo/skills`, then the shared
+  read-only `~/.agents/skills` and `~/.claude/skills` that Codex and other local
+  agents use — earlier wins on a name clash), and re-scans on every query, so a
+  file edited or added needs no restart. Only the capped prompt catalog is a
+  startup snapshot (cache stability). That catalog — and **only** that catalog —
+  is gated by
   `SkillOffer` (frontmatter `platforms:` / `requires_tools:`, evaluated per
   runtime at wiring against its own registered tool set): an always-on prompt
   line is the one place an irrelevant skill costs tokens every turn. It is never
-  a load gate; `skill` view/list and every `komo skills` command ignore it.
-  Usage is **derived**, never counted: `komo skills audit` rolls `skill view`
-  ledger steps up per skill (`domain/run.rs`'s `skill_viewed`), so it reaches
-  only as far back as the pruned run ledger does. Each load is attributed
-  to **how its turn ended** (`Run.outcome`), bucketed per *run* rather than per
-  view — a skill loaded twice in one turn is one piece of evidence about that
-  turn. `Unknown` is the honest majority and never counts as success: it is
-  also where a skill that was loaded but never actually followed lands, since
-  the ledger cannot see adoption. Failing turns are named individually, not
-  summed into a count nobody reads.
+  a load gate; the `skill` tool's `view`/`list` and every `komo skills` command
+  ignore it. `komo skills disable` hides one without deleting it; an agent job
+  names the skills it wants preloaded (`CronAction::Agent`'s `skills`).
 - `komo-bot`'s `daemon` — `Maintenance` sweeps under `supervise` (circuit breaker
   after 5 failures). Sweep cron expressions are matched against **local time**
   via the same `next_occurrence_local` cron jobs use — never `Utc::now()`
   straight into croner, which silently shifts every schedule by the UTC offset.
-  Sweeps: `ReviewSweep` (via the shared `LearningCoordinator`, which
+  Three sweeps, no more: `ReviewSweep` (via the shared `LearningCoordinator`,
+  which
   also serves the post-run trigger — the per-run watermark + in-flight guard
-  prevent duplicate extraction), `ReminderSweep`, `CronJobSweep` (the **clock
-  ingress** for routines: it holds an `Arc<RoutineEventSource>` — everything a
-  firing needs, whatever set it off — and adds only "which slot has come".
+  prevent duplicate extraction), `CronJobSweep` (the **only**
+  ingress for routines: it holds an `Arc<RoutineEventSource>` — everything a
+  firing needs — and adds "which slot has come".
   Claim-before-run: a
   crash never re-fires a slot; a slot missed by more than the job's **own
   interval** is abandoned rather than fired at the wrong hour — `is_due` has no
@@ -876,37 +855,12 @@ call the same functions, which is what keeps validation from forking.
   that already resumed is stale and is dropped, because firing it would re-run
   the continuation's work. `reregister_suspended_turns` closes the loop the
   other way at startup — a turn the log says is waiting with nothing watching
-  it gets its wait back, read out of its own `turn/suspended`), `TaskSweep`, `BriefingSweep` (opt-in; aux-model
-  runtime with read-only tools + deny-all unattended approver; degrades to
-  tool-less `complete` on error; stamps a per-day watermark
-  (`BriefingMarkRepository`, a settings row) so a gateway restarted across
-  today's slot catches up once at startup — `briefing_catchup_due`, same
-  "asleep over a slot → run late, once" rule as cron jobs), `DreamSweep` (one
-  governance cycle over both candidate pools — memories promote/archive by
-  evidence, skill proposals lapse by age — previewed together by `komo dream`).
-  `WorkdayGated` decorator gates a sweep to Chinese working days
-  (`komo-infra`'s `workday`, cached per-year).
-- `komo-bot`'s `daemon::RoutineEventSource` — the **other** ingress for the
-  same routines (docs/bot-runtime.md §5.12–5.14): `on_event(&ExternalEvent)`,
-  where the event is an inbound webhook, a feishu message or reaction, or a
-  debounced batch of changed files. It does two things — start every routine
-  whose `Trigger::matched_by` answers, and fire every standing wait the event
-  matches (through `TriggerMatcher`, the same claim-before-fire shell an inbound
-  message uses; a feishu message deliberately skips that half, since the chat
-  ingress already fires peer waits and doing both would answer one commitment
-  twice). **One arrival is one `RoutineRun`** even when two `Any` members match,
-  and the run's `event` names the member that owns it. Execution is the sweep's
-  own `fire`/`execute`, not a second copy, so an event-fired turn is
-  indistinguishable from a slot-fired one: `SessionOrigin::Cron`, the job's
-  `with_job_grants`, the cron runtime — **who set it off never enters
-  authorization**. The event's content reaches the turn fenced in `<event>` under
-  `TRUST_BOUNDARY_GUIDANCE`'s rule and capped at `EVENT_DETAIL_CAP`; a *command*
-  routine never sees it at all (its argv is fixed, and a hook body is written by
-  the caller). Every ingress reaches it through
-  `GatewayDispatcher::on_external_event`, because the dispatcher is the one
-  thing a `Channel` is handed — `attach_routines` is late-bound for the same
-  reason `TriggerMatcher`'s dispatch is (the source needs the waker, the waker
-  needs the dispatcher).
+  it gets its wait back, read out of its own `turn/suspended`), and `DreamSweep`
+  (the memory governance cycle — candidates promote or archive by evidence,
+  previewed by `komo dream`).
+  `RoutineEventSource` holds everything a firing needs (the jobs, the notifier,
+  the wakeup wiring, the cron runtime) and owns the running itself, so a firing
+  lives in one place and the sweep only decides when.
 - `komo-bot`'s `gateway` + `interaction` — gateway hosts channels +
   sweeps. `GatewayDispatcher` owns turns (spawned per turn so `/approve` can
   arrive mid-turn; one turn per session). **`handle` is the only entry a channel
@@ -928,15 +882,12 @@ call the same functions, which is what keeps validation from forking.
   platform's redelivery a duplicate, so a process that died before the turn
   wrote anything dropped the message for good.
   `GatewayDispatcher::recover_inbox` (`INBOX_RECOVERY_LIMIT` rows, called
-  from `cli/gateway.rs` after `reregister_suspended_turns` and
-  `reconcile_orphans`, before the channels serve) is the scan that closes it: a
+  from `cli/gateway.rs` after `reregister_suspended_turns`, before the channels
+  serve) is the scan that closes it: a
   row whose text is already a user message in the session's transcript at or
   after `claimed_at` belongs to the ledger and is only completed, and everything
   else goes back through `dispatch` — the command-honouring path, so a lost
-  `/approve` still approves — after the same `TriggerMatcher::on_inbound`
-  `handle` runs before it routes, so a reply a kanban commitment was waiting on
-  still discharges it (claim-before-fire, so a wake that already fired fires
-  nothing twice). One thing never re-runs: a **command** on a row claimed
+  `/approve` still approves. One thing never re-runs: a **command** on a row claimed
   before the peer columns existed, which names no sender — `/sethome` reads
   the peer, and an empty address is not a home chat. Plain text on such a row
   still does. Recovery re-claims nothing (the row is already claimed) and
@@ -971,8 +922,10 @@ call the same functions, which is what keeps validation from forking.
   message while an approval is parked **replaces** it: the message joins the
   suspended turn as an interjection, the approval resolves as refused citing it,
   and the turn continues — one turn, not two. No session in context ⇒ deny. `HomeNotifier`
-  delivers all proactive output (sethome override > config `home_chat`,
-  feishu first > macOS notification).
+  delivers all proactive output (sethome override > config `home_chat`, feishu
+  first among the config candidates), routing by the target's
+  `{platform}:{chat_id}` prefix. Nothing resolves ⇒ the caller is told, never
+  silence.
 - `infra/messaging/` — channels: feishu (ws long connection on a dedicated
   thread), telegram (long polling, Markdown with plain-text fallback), wechat
   (iLink, DM-only, shared `WeChatBot` instance, in-memory reply tokens).
@@ -987,39 +940,23 @@ call the same functions, which is what keeps validation from forking.
   demand); recurring device reactions belong in an HA automation written via
   the tool's `save_automation`, not in an event stream that costs an LLM turn
   per sensor tick.
-  **feishu carries a second traffic besides the conversation**: routine triggers
-  (docs/bot-runtime.md §5.13). Every parsed message goes to
-  `on_external_event` unconditionally — a keyword in a group nobody @s is the
-  case the feature exists for — so `admit` no longer *drops* an unmentioned
-  group message, it marks it `admitted: false` and the chat path alone honours
-  that (and pairing). Both may fire for one message; they are two turns, not a
-  redirect. Reactions come from a second subscription
-  (`im.message.reaction.created_v1`), which names a message and not a chat, so
-  the chat is looked up (`message_chat_id`) — and only after
-  `wants_feishu_reactions()` says some routine could care, since that lookup is
-  an API call per emoji in every visible chat.
-- `infra/file_watcher.rs` — the third routine ingress (§5.14), a `Channel`
-  beside `messaging/` rather than in it: it carries no messages and opens no
-  conversation, but `serve` is exactly the shape it needs (a long-lived loop and
-  a shutdown). `notify` (FSEvents/inotify) → a **2s trailing debounce** (ours, a
-  tokio timer — saving fifty files is one thing happening, so it becomes one
-  `ExternalEvent::FileChanged` carrying the batch) → `on_event`. Watches are
-  **per root, deduplicated, add-only** (two routines sharing a directory need
-  one watch, and unwatching would silence the other); globs never enter the
-  watch at all, so which routine a change belongs to is decided by
-  `Trigger::matched_by` whichever ingress the event came from. The watched set
-  is reconciled against the jobs every 60s, so a routine added or paused takes
-  effect without a restart.
-- `cli/wiring.rs` — shared `AgentRuntime` construction (chat vs gateway differ
-  only in `Approver`); register new tools here. Each runtime is a
-  **`CapabilityProfile`** — scope, llm, tools, `max_turns`, `learns`,
-  `resumable` — built by `RuntimeParts`, which holds what all of them share.
-  The load-bearing field is `scope`: it used to be written twice per runtime,
-  once per hook lookup, with nothing checking the two agreed or matched the
-  executor's own scope, so a copy-pasted `Scope::MAIN` would hand a sweep the
-  conversation's hooks. Adding a runtime is a profile, not a struct literal
-  whose three real differences hide among nine identical fields.
-- `tui/` — ratatui chat front end over gateway-or-in-process backends; state +
+- `cli/wiring.rs` — the **only** place an `AgentRuntime` is constructed, and the
+  gateway is its only caller: the gateway is the only process that opens komo's
+  state, so it is the only process that has an agent. Every tool komo mounts is
+  built here, once, and registered into one executor per runtime — register a
+  new tool here. Which runtime an executor is for is a 3-variant `Runtime` enum
+  (`Main` / `Subagent` / `Cron`) that picks a `ToolCatalog` out of `Catalogs`;
+  the catalogs are separate rather than shared because the runtimes deliberately
+  differ in what they mount (`delegate` is the conversation's alone) and because
+  a catalog is what the plugin host mounts into, so each runtime's view of the
+  plugins dies with its own executor. Each runtime is a
+  **`CapabilityProfile`** — llm, tools, `max_turns`, `learns`, `compacts` —
+  built by `RuntimeParts`, which holds what all of them share (the stores, the
+  compactor, the history window, the learning coordinator). Adding a runtime is
+  a profile, not a struct literal whose three real differences hide among nine
+  identical fields.
+- `tui/` — ratatui chat front end, a pure gateway client (`GatewayClient`; there
+  is no in-process backend); state +
   key handling terminal-free in `tui/app.rs`. `komo chat` opens the operator's
   **home conversation** — not a fresh id per launch — so closing the terminal
   and reopening it continues the same thread the morning's Telegram DM is in.
@@ -1032,8 +969,11 @@ call the same functions, which is what keeps validation from forking.
   Enter sends, Shift/Alt-Enter (kitty protocol) or Ctrl-J newline, **Esc stops
   the turn in flight** (nothing when idle — a stop key that sometimes discards the
   draft is worse than one extra keystroke; under the approval modal Esc keeps
-  meaning "deny"). Local turns carry a `CancelState` signal on their
-  `SessionContext`; remote turns cancel over
+  meaning "deny"). An approval or an `ask_user` question reaches it by polling
+  `GET /api/interactions/{session}` every `INTERACTION_POLL` (2s) and is answered
+  by `POST`ing to `/approval` or `/answer`; the modal offers **once / session /
+  deny** and no "always", since a saved grant is the CLI's business, not a
+  keystroke's. Cancel is
   `POST /api/interactions/{session}/cancel`, which also denies a pending approval
   and answers a pending `ask_user` — a turn parked on either never reaches
   another await, so the signal alone would not reach it. `tui/paste.rs`
@@ -1043,30 +983,27 @@ call the same functions, which is what keeps validation from forking.
   that a terminal without bracketed paste delivered as keystrokes. Input events
   go through a channel so a batch can be collected before it is interpreted.
 - `cron` (`cron_job_records`, `CronJobSweep`) — **routines**: a `Trigger`, an
-  action, and a `runs` history. Two job modes: **command**
-  (operator-authored, runs directly, no approver) and **agent** (unattended
+  action, and a `runs` history. Three job modes: **command**
+  (operator-authored, runs directly, no approver), **agent** (unattended
   turn on `cron_runtime`: a side effect needs an `unattended = true` policy
   rule or one of the job's own grants, else the turn **suspends** and the
   operator answers `/approve wk-<id>` in the home chat — the run's status is
-  then `waiting`, which is neither ran nor failed).
-  **`Trigger` is what makes it fire** (docs/bot-runtime.md §3.3), replacing the
-  schedule string: `Cron`/`At` name a moment `next_run_at` holds and the sweep
-  finds due, while `Feishu`/`Webhook`/`FileChanged` name no moment at all
-  (`next_run_at = 0`, the sweep passes over them) and fire from their own
-  ingresses through `Trigger::matched_by` — the pure matcher beside `next_slot`,
-  which also compiles a `FileChanged` glob (`globset`, the same syntax
-  `glob`/`grep` take) and reads a `FeishuMatch` against a message or a reaction,
-  never one as the other.
-  `Any` (≤ 8) schedules to its soonest member and **fires once** — for an arrival
-  as for a slot — with the run's
-  `event` naming the member that hit; a spent `At` inside it simply stops
-  appearing in `next_slot`. A trigger *string* becomes a `Trigger` in exactly
-  one place, `cron_actions::parse_schedule` — the CLI and the `cron` tool both
-  call it, so both write every shape: a cron expression, `@at …`,
-  `@webhook <name>`, `@feishu <chat> mention|keyword a,b|reaction <emoji>`,
-  `@file <root> [glob]`, and ` | ` between any of them for an `Any`. A watched
-  directory is canonicalized and proven to exist **there**, at creation, for the
-  same reason an agent job's `workspace` is.
+  then `waiting`, which is neither ran nor failed), and
+  **message** (`CronAction::Message { text }` — deliver a fixed text, no process
+  and no LLM: this is what a reminder is, one-shot via `@at` or recurring on a
+  cron expression like any other job).
+  **`Trigger` is what makes it fire**, replacing the
+  schedule string, and it names a moment or nothing: `Cron` (a 5-field
+  expression in local time) and `At` (the `@at` one-shot, resolved to its
+  instant at creation) are the only two, so `next_run_at` always holds a slot the
+  sweep can find due. `cron_actions::parse_schedule` is the one place a trigger
+  *string* becomes a `Trigger` — the CLI and the `cron` tool both call it, so
+  both accept exactly a cron expression or `@at YYYY-MM-DD HH:MM`, and a past
+  `@at` is refused while the person who typed it is still there. A **stored** job
+  whose trigger no longer parses is skipped with a `warn!`, never fatal: a row
+  written by an older or newer komo must not take the sweep down.
+  The `cron` tool's `after` (a relative `30m` / `2h`, through `parse_after`) is
+  the same `@at` moment computed from now.
   **One firing is one `RoutineRun`**, claimed `running` in the same write as the
   slot (a crash mid-run leaves the record of what was in flight) and settled
   `ok`/`error`/`waiting` after; `runs` keeps the newest 20 and `runs.last()` is
@@ -1075,7 +1012,7 @@ call the same functions, which is what keeps validation from forking.
   **`notify`** (`always` default / `on_error` / `never`) filters *delivery*, never
   the record — and never a `waiting` run, which is the routine asking for
   something rather than reporting.
-  Chat-created jobs (`tools/cron.rs`) are approval-gated at creation; a
+  Chat-created jobs (`komo-tools`' `cron`) are approval-gated at creation; a
   command job from chat is `Risk::Dangerous`. An agent job declares the actions
   it needs as `grants`, approved in that **same** prompt (which is why a
   grant-carrying `add` drops the `cron:add` scope key) — narrower than a global
@@ -1094,34 +1031,8 @@ call the same functions, which is what keeps validation from forking.
   problem rather than a typo. It shares the `workdir` column with a command
   job's cwd (same question of a process and of a turn, and the table is durable)
   but is a different guarantee — a confinement boundary, not a convenience.
-  Recurring *work* = cron job, recurring *message* = reminder, one-shot
-  scheduled work = `@at` job.
-- `domain/task.rs` + `komo-services`' `task_waiting` / `triggers` +
-  `komo-core`'s `domain::trigger` — kanban `Waiting` is a label **and** a
-  standing wake (docs/bot-runtime.md §3.7). A task that names who it waits on
-  as an *address* (`waiting_on_peer: Option<ChannelPeer>`) registers one
-  `Event{FromPeer}` and holds its id (`wakeup_id`); a task carrying only a name
-  is **not wakeable**, and every listing says so rather than implying somebody
-  is watching — `waiting_on` is for a human to read, and nothing here guesses a
-  peer from it. Both are additive columns on the durable `task_records`
-  (`kanban::ensure_schema`).
-  **One function registers and retires**: `TaskWaiting::sync`, which every
-  write that can enter or leave `Waiting` goes through (the `task` tool's
-  `capture` / `update` / `complete` today) — it mutates `wakeup_id` and the
-  caller writes the row, so one task change is still one write. The wake lands
-  on `task.source`, or the home session when the task came from no
-  conversation; it expires with the task's own `due_at`, else in 30 days.
-  **`TriggerMatcher` fires it**, from `GatewayDispatcher::handle` after the
-  inbox dedupe: pure matching in `domain::trigger` (so §5.13's chat-triggered
-  routine reuses it), the shell claims each hit with `take` before firing.
-  A hit **adds** a turn on the commitment's own session — the message still
-  runs its own conversation, because whoever wrote is talking to komo (§6, no
-  Task router). The task's **status is never changed automatically**: whether
-  that message discharges the commitment is a judgement, and the woken turn's
-  model makes it. `wait { for_task }` is the same wake consumed the other way
-  (`turn_id: Some`, exact continuation) — kanban ids and background-task ids
-  are both UUIDv7, so the kanban store is asked and anything it does not know
-  is a background task.
+  Recurring *work* = an agent or command job, a recurring or one-shot *message*
+  = a `message` job, one-shot scheduled work = `@at`.
 - `apps/` — bun workspace: `apps/app` (shared React renderer) mounted by
   `apps/desktop` (Electron) and `apps/web` (SPA served via `web_dir`). Talks
   to the gateway over HTTP only (`HttpKomoClient`); feature-first layout;
@@ -1137,30 +1048,31 @@ call the same functions, which is what keeps validation from forking.
   (and add it to `tool_execution::policy_scope` if it should be policy-filterable).
 - **Add an MCP server**: config only — an `[mcp.servers.<name>]` table with a
   `tools` allowlist. No code; that is the point of `komo-mcp` being generic.
+- **Add a tool at run time**: a `@tool` function in a `$KOMO_HOME/plugins/*.py`
+  file, no code in komo and no restart. That write is `Risk::Dangerous`.
+- **Add an operator action**: a variant on `OperatorQuery` / `OperatorCommand`
+  plus its reply variant and the arm in `operator_control/actions.rs` — never a
+  new route.
 - **Swap LLM provider**: implement `LlmClient` (`domain/llm.rs`), construct in
   `komo-bot`'s `llm::build_llm`.
 - **Swap persistence**: implement the repository traits; `agent/`/`domain/`
   need no changes.
 - **Add a provider**: an entry in `Provider` plus its base URL / auth / wire in
-  `infra/llm.rs` (`wire_for`, `endpoint_url`, `build_provider_llm`). A new *wire
+  `komo-bot`'s `llm` (`wire_for`, `endpoint_url`, `build_provider_llm`). A new *wire
   format* — only if it speaks neither Responses nor Messages — is a module in
   `crates/komo-provider` and a `Wire` variant.
 - **Agent-loop control**: add round-level control points in `komo-bot`'s `run_agent_loop`;
-  extend `TurnDriver`/`Step`. `komo-tools`' `wait.rs` / `ask_user.rs` are the
+  extend `TurnDriver`/`Step`. `komo-tools`' `ask_user.rs` is the
   sentinel-tool reference: a tool stops its turn with
   `ToolContext::wait_for(wakeup, …)` and reads `ctx.resumed_wait()` on the way
   back, which the executor and the loop treat exactly like a gated call that
   stopped for an approval.
 - **Scheduled action**: implement `Maintenance`, construct in `cli/gateway.rs`.
 - **Gateway ingress**: implement `Channel`, `add_channel` in `cli/gateway.rs`,
-  gate behind a `[channels.*]` declaration — feishu is the reference. A `Channel`
-  need not carry messages: `infra/file_watcher.rs` is one because "a long-lived
-  loop with a shutdown" is exactly what `serve` gives it.
-- **Routine trigger**: a variant on `Trigger` plus an arm in
-  `Trigger::matched_by` (`komo-core`'s `domain::cron`), a shape on
-  `ExternalEvent` (`domain::trigger`), a written form in
-  `cron_actions::parse_schedule`, and an ingress that calls
-  `GatewayDispatcher::on_external_event`. Nothing about *running* the routine
+  gate behind a `[channels.*]` declaration — feishu is the reference.
+- **Routine trigger**: a variant on `Trigger` plus its arm in `next_slot`
+  (`komo-core`'s `domain::cron`) and a written form in
+  `cron_actions::parse_schedule`. Nothing about *running* the routine
   changes — that is `RoutineEventSource`'s, and there is one of it.
 
 ## Testing
@@ -1185,4 +1097,3 @@ run for verification, terminal output when CLI behavior changes.
 - Issues/PRDs: local markdown under `.scratch/<feature-slug>/` — `docs/agents/issue-tracker.md`
 - Triage labels: `needs-triage` / `needs-info` / `ready-for-agent` / `ready-for-human` / `wontfix` — `docs/agents/triage-labels.md`
 - Domain docs: `CONTEXT.md` + `docs/adr/` — `docs/agents/domain.md`
-- Long-form design rationale (archived old AGENTS.md): `docs/agents/architecture-notes.md`

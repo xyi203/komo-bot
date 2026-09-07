@@ -19,7 +19,7 @@ web_fetch、skill 正文），所以这是**按 0002 自己的条款执行**，�
 
 ## 与 0002 的真正分歧点
 
-0002 的论证针对**无人值守**场景，那里的结论至今正确：cron / briefing 仍然只认
+0002 的论证针对**无人值守**场景，那里的结论至今正确：cron routine 仍然只认
 `unattended = true` 规则和 job grants，审查器**结构性地**不介入。
 
 分歧在**有人值守**场景，0002 没有单独论证过它。这里的实际问题不是安全而是摩擦：家庭 HA
@@ -36,7 +36,7 @@ web_fetch、skill 正文），所以这是**按 0002 自己的条款执行**，�
    非放行结果（含它自己的失败）都落到内层审批器。
 2. **`Risk::Dangerous` 永不经审查器。** 不可逆动作直达人，与 `include_dangerous` 只能由
    config 开启是同一条不变量。
-3. **无人值守永不经审查器。** cron / briefing 的 runtime 根本不接这个 decorator，
+3. **无人值守永不经审查器。** cron runtime 根本不接这个 decorator，
    `SessionOrigin::is_unattended()` 是第二道地板。
 4. **Fail-closed。** 模型报错、20 秒超时、verdict 解析失败、没有可作为授权的操作者消息，
    四种情况都等于"问人"。有人在场时，"问人"就是 fail-closed 的正确形态。

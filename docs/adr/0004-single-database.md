@@ -7,7 +7,7 @@
 
 ## 拆分当初的两个依据
 
-拆成四个文件的理由写在 `docs/agents/architecture-notes.md`：
+拆成四个文件的理由写在当时的长篇 AGENTS.md（已归档删除）里：
 
 1. **删文件重置**。toasty 的 `push_schema` 只在新建文件时跑且不幂等，所以 schema 一变就要删文件；
    持久数据放在自己的文件里，删 `state.db` 才不会伤到它。
@@ -17,9 +17,9 @@
 两条今天都不成立。
 
 **依据一已被原地迁移取代。** `persistence/mod.rs` 里的 `ensure_columns`（加列）、`ensure_table`
-（建表，`db.rs` 已用它在既有 state.db 上补了 `inbox_records` 和 `run_memory_records`）、
+（建表，`db.rs` 已用它在既有 state.db 上补了 `inbox_records` 和 `wakeup_records`）、
 `drop_retired_columns`（删列）覆盖了实际发生过的每一种 schema 变更。"删文件重置"这条路已经没人走，
-而且走不得：state.db 里的 reminder、pairing、settings（`/sethome` 覆盖、briefing 水位）都是用户
+而且走不得：state.db 里的 pairing、settings（home 会话 id、`/sethome` 覆盖）都是用户
 手写的，删了就丢。`persistence/mod.rs` 那句"state.db 还装着全部转录"也已过期——转录是文件。
 所谓 disposable 早已名不副实。
 
@@ -33,9 +33,9 @@
   （`.turso` / `.sqlite-backup`）、一个 config url、`direct.rs` 里一个 `OnceCell`、TUI 与 gateway
   wiring 里各一行。
 - 文档里维护一张"改哪个模型删哪个文件"的对照表，而它描述的操作已经不做了。
-- **跨库没有事务。** cron job 与它的 grants 同库所以没事；但 bot-runtime PRD 里的 kanban Task ↔
-  唤醒登记 ↔ 来源 session 三边分属 kanban.db / cron.db / state.db，只能顺序写加补偿。合库之后是一个
-  `with_write_retry` 里的一个事务。
+- **跨库没有事务。** cron job 与它的 grants 同库所以没事；但当时 bot-runtime PRD 里的
+  Task ↔ 唤醒登记 ↔ 来源 session 三边分属 kanban.db / cron.db / state.db，只能顺序写加补偿。
+  合库之后是一个 `with_write_retry` 里的一个事务。
 
 ## 决定
 
@@ -44,10 +44,10 @@
 - config 只剩一个 `db_url`；`KOMO_HOME` 仍然决定它在哪。
 - 耐久性规则改写为表级：
   - `memory_records` **只能加性变更**（原 memory.db 规则原样保留）。
-  - `task_records`、`cron_job_records`、唤醒登记表、`pairing_records`、`reminder_records`、
-    `setting_records` 是持久数据：schema 变更走 `ensure_*`，没有"删了重建"。
-  - session 元数据、run 账本、inbox、todo 允许**行级**清理，操作面就是已有的 `komo run prune`、
-    `komo sessions clean`——重置是删行，不是删文件。
+  - `cron_job_records`、`wakeup_records`、`pairing_records`、`setting_records`
+    是持久数据：schema 变更走 `ensure_*`，没有"删了重建"。
+  - session 元数据、run 账本、inbox、todo、`chunk_records` 允许**行级**（或按 collection）
+    清理，操作面就是已有的 `komo run prune`、`komo session clean`——重置是删行，不是删文件。
 - 不给 memory 留独立文件。唯一像样的理由是"跨机器备份时它是一个实体"，但它一旦独立就仍要保留
   整套 connect / 迁移 / url，而导出应由 `komo memory` 承担，不该依赖拷文件。
 
@@ -58,8 +58,9 @@
 （markdown 记忆 → memory.db、rusqlite → turso）的第三次使用，不是长期兼容层：导入代码在下一个
 大版本删除。
 
-state.db 也导——它虽被文档标为 disposable，但 pairing 与 reminder 丢了就要重新配对、重建提醒，
-导入的成本远低于解释为什么它们没了。
+state.db 也导——它虽被文档标为 disposable，但 pairing 与 settings 丢了就要重新配对、重设 home，
+导入的成本远低于解释为什么它们没了。**这一条当初只写在 ADR 里、代码没做，现在已经补上**
+（`merge_legacy_databases` 导入 `session_records` / `setting_records` / `pairing_records`）。
 
 ## 要留意的
 
@@ -78,32 +79,33 @@ state.db 也导——它虽被文档标为 disposable，但 pairing 与 reminder
 ## 落地情况
 
 **已实现。** `RuntimeConfig` 只剩一个 `db_url`（`~/.komo/komo.db`）；`KanbanDb` /
-`CronDb` / `MemoryDb` 三个连接类型消失，`kanban.rs` / `cron.rs` /
-`memory/memory_db.rs` 保留各自的模型、查询和 schema 维护，但 `TaskRepository` /
+`CronDb` / `MemoryDb` 三个连接类型消失，`cron.rs` /
+`memory/memory_db.rs` 保留各自的模型、查询和 schema 维护，但
 `CronJobRepository` / `MemoryRepository` 都实现在同一个 `Db` 上——一个域一个文件，
-一个库。`wiring::build` 从五个参数收到三个，`DirectOperatorAdapter` 从四个
-`OnceCell` 收到一个（懒开一次仍然保留：`komo doctor` 只打印配置就不该建库）。
+一个库。（`kanban.rs` 随看板一起删掉了；`task_records` 在老库里还留着行，但已经没有模型读它。）
 
-迁移在 `Db::connect` 里，只在 `komo.db` 是新建时跑：逐个读 `state.db` / `kanban.db` /
-`cron.db` / `memory.db`，写入后把旧文件（连 `-log`/`-wal`/`.turso` 等旁挂文件）
+迁移在 `Db::connect` 里，只在 `komo.db` 是新建时跑：逐个读 `state.db` /
+`cron.db` / `memory.db`（`kanban.db` 随看板删除一起不再导），写入后把旧文件（连
+`-log`/`-wal`/`.turso` 等旁挂文件）
 改名成 `<name>.merged-backup`。顺序是「先读、再写、最后改名」，中途崩溃就是旧文件
 还在、下次重来；每行自带 id，重来是覆盖而不是翻倍。**读不出来的旧文件是致命错误
-而不是跳过**——带着空看板启动、而 `kanban.db` 就在旁边没人读，是那种直到你去找某个
-任务才发现的故障。旧文件先各自做自己的 schema 修补再读（pre-status 的
+而不是跳过**——带着空记忆库启动、而 `memory.db` 就在旁边没人读，是那种直到你去找某条
+记忆才发现的故障。旧文件先各自做自己的 schema 修补再读（pre-status 的
 `cron.db` 还带着 `enabled` 列，pre-Turso 的 `memory.db` 得走 SQLite 驱动），
 所以「komo 发布过的每一种文件形状都还能读」这条测试跟着搬到了合库路径上。
 
 `state.db` 导的是重建不出来的那几张：`session_records`（转录本身是
 `sessions/` 下的文件，跟着 `KOMO_HOME` 走，不需要导）、`setting_records`
-（home 会话 id、`/sethome` 覆盖、briefing 水位）、`pairing_records`。**run 账本
+（home 会话 id、`/sethome` 覆盖）、`pairing_records`。**run 账本
 不导**：它的行是 session 日志的投影，而唯一的写入口 `write_projection` 收的是一份
 fold（`ProjectedRun` 还要 `start_seq` 和每步的 `settled`），旧行里没有这些字段，
 硬造等于反推投影；账本按设计是可弃的，真要找回就 `rebuild_projections` 重折一遍日志。
-提醒行也不导（reminder 正在移除），inbox / todo / wakeup 是瞬态。
+inbox / todo / wakeup 是瞬态，也不导。
 
 耐久性规则改写为表级，写在 AGENTS.md 的存储表里：`memory_records` 只能加性变更，
-`task_records` / `cron_job_records` 同样持久；session 元数据、run 账本、inbox、todo
-按**行**清理（`komo run prune` / `komo sessions clean`），删表这条路对谁都不再存在。
+`cron_job_records` / `wakeup_records` 同样持久；session 元数据、run 账本、inbox、todo、
+`chunk_records` 按**行**（或按 collection）清理（`komo run prune` / `komo session clean`），
+删表这条路对谁都不再存在。
 
 ## 回滚与重开条件
 

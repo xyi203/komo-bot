@@ -5,9 +5,9 @@
 </p>
 
 A personal agent framework in Rust. One binary gives you interactive LLM chat,
-local tools, durable tasks and memories, scheduled reminders, and an always-on
-gateway for chat channels and proactive background work. State lives locally
-under `~/.komo`.
+local tools, long-term memories, scheduled routines, and an always-on gateway
+for chat channels and proactive background work. State lives locally under
+`~/.komo`.
 
 ## Brand
 
@@ -54,29 +54,32 @@ agent turns reply with a "key not set" pointer until one is configured.
 
 Inside chat, `/new` (or `/clear` / `/reset`) draws a conversation boundary: the
 model's replay starts fresh, nothing is deleted. Transcripts are append-only
-JSONL files under `~/.komo/sessions/`; session metadata and the run ledger are
-tables in `~/.komo/komo.db`.
+segment files under `~/.komo/sessions/<id>/`; session metadata and the run
+ledger are tables in `~/.komo/komo.db`.
+
+Every command that touches komo's state talks to the gateway, starting one if
+none is running (on macOS through launchd; elsewhere start `komo gateway`
+yourself).
 
 ```bash
 komo session list               # stored sessions with message counts
 komo session clean              # delete empty sessions
-komo cron list                  # routines (cron / @at / event-triggered) and next fire times
-komo task list                  # open durable tasks
+komo cron list                  # routines (cron / @at) and next fire times
 komo memory list                # memory candidates/active items
-komo run list                   # recent agent turns (⟲ marks interrupted, resumable ones)
-komo run resume                 # re-dispatch the last interrupted turn from the run ledger
-komo skills list                # managed + ~/.agents/skills + reviewer candidates
-komo skills promote <name>      # accept a reviewer-proposed skill into the active store
+komo run list                   # recent agent turns (⟲ marks interrupted ones)
+komo skills list                # managed ~/.komo/skills + the shared ~/.agents/skills
+komo skills install <source>    # install a skill from a git repo or a SKILL.md URL
 ```
 
 ## Gateway (always-on background process)
 
-The gateway hosts chat/event ingress and scheduled maintenance:
+The gateway is the process that owns komo's state: it hosts the agent, the chat
+channels and the scheduled maintenance, and every other surface (the TUI, the
+CLI, the desktop and web apps) is a client of its loopback HTTP api.
 
-- reflective review sweeps over stored sessions
-- one-shot and recurring reminder delivery
-- task due notifications
-- optional daily briefing
+- reflective review sweeps over finished turns (memory extraction)
+- routine firing: command, agent and message jobs on a cron slot or an `@at`
+- nightly memory consolidation (the "dream" sweep)
 - Feishu, Telegram, and WeChat channels when configured
 
 ```bash
@@ -97,22 +100,21 @@ The agent can call these during a chat turn:
 
 | Tool | What it does |
 |---|---|
-| `shell` | Run shell commands — safe commands auto-approved, dangerous ones blocked, the rest prompt for approval; `background: true` returns a task id |
-| `read` / `write` / `edit` / `apply_patch` | File tools confined to the workspace roots plus `~/.komo/artifacts` |
+| `shell` | Run shell commands — safe commands auto-approved, dangerous ones blocked, the rest prompt for approval |
+| `read` / `write` / `edit` / `apply_patch` | File tools confined to the workspace roots plus `~/.komo/artifacts` and `~/.komo/plugins` |
 | `grep` / `glob` | ripgrep in-process; policy runs over paths before content is read |
 | `web_fetch` / `web_search` | Fetch pages and search the web |
-| `reminder` | Schedule one-shot and recurring reminders |
-| `cron` | Routines: command or agent jobs fired by a cron slot, `@at`, a webhook, a Feishu message/reaction, or a file change |
-| `task` | Durable cross-session tasks; a `waiting` task that names a peer wakes when they write |
+| `cron` | Routines: command, agent or message jobs fired by a cron slot or an `@at` moment |
 | `todo` | The current conversation's working focus list (the one thing `/new` clears) |
 | `memory` | Govern long-term memories (candidates, pins, search) |
 | `session` | Search komo's own past conversations (episodic memory) |
 | `wiki_search` / `wiki_read` / `wiki_index` | Semantic search over a note vault when `[wiki]` is configured |
-| `ask_user` / `wait` | Suspend the turn until an answer, an event, a time, or a background task |
-| `delegate` | Run a sub-agent turn on the aux model; `detach: true` runs it in the background |
+| `ask_user` | Suspend the turn until the user answers — across restarts |
+| `delegate` | Run a sub-agent turn on the aux model |
 | `run_code` | Run a Python program that calls the other tools through the same gates |
+| `py__<name>` | A `@tool` function from `~/.komo/plugins/*.py`, mounted live |
 | `homeassistant` | Read and control Home Assistant entities when configured |
-| `skill` | Load skills: governed `~/.komo/skills` + shared `~/.agents/skills` |
+| `skill` | Load skills: `~/.komo/skills` + the shared `~/.agents/skills` |
 | `logs` | Tail komo's own tracing log |
 | `time` | Current time (RFC 3339 UTC) |
 | `mcp__<server>__<tool>` | Tools mounted from `[mcp.servers.*]`; every call is approval-gated |
@@ -127,13 +129,13 @@ also unloads the former launchd job before installing `com.komo.gateway`.
 
 | Path | Purpose | Durability |
 |---|---|---|
-| `komo.db` | one Turso database: sessions, run ledger, reminders, pairings, settings (disposable by row); tasks, memories, routines, wakeups (durable, additive schema only) | per table |
-| `sessions/` | transcripts, one append-only `.jsonl` per session | disposable |
+| `komo.db` | one Turso database: sessions, run ledger, pairings, settings, search index (disposable by row or collection); memories, routines, wakeups (durable, additive schema only) | per table |
+| `sessions/<id>/` | transcripts: a manifest plus append-only `.jsonl` segments | disposable |
 | `artifacts/<session>/` | what a turn produced: reports, scripts, downloads | durable |
-| `skills/` | governed skills (`SKILL.md`; proposals in `.candidates/`, retired in `.archive/`) | durable |
+| `skills/` | skills (`SKILL.md`), written and installed by a human | durable |
 | `permissions.json` | saved approval grants | durable |
-| `plugins/` | Python plugins served by `komo-pyhost` | durable |
-| `checkpoints/` · `tool-output/` · `session-index/` | file pre-images, over-limit tool results, episodic search index (7-day retention / rebuilt on search) | disposable |
+| `plugins/` | Python plugin tools served by `komo-pyhost`; writing here needs an approval every time | durable |
+| `tool-output/` | over-limit tool results (7-day retention) | disposable |
 | `logs/` | daily-rotated gateway log (`komo logs`) | disposable |
 | `config.toml` | provider/model/channel behavior | — |
 | `.env` | API keys and channel credentials | — |
@@ -157,10 +159,9 @@ models = ["anthropic:claude-sonnet-5", "openai:gpt-5.5"]   # optional: what a se
 base_url = "https://..."     # optional override for OpenAI-compatible endpoints
 aux_model = "..."            # optional cheaper model for delegated sub-tasks
 schedule = "0 * * * *"       # gateway maintenance cron (5-field, default hourly)
-briefing_schedule = "0 8 * * *"      # optional daily briefing
-briefing_workdays_only = true        # optional Chinese workday gate
-dream_schedule = "0 3 * * *"          # nightly memory/skill governance sweep ("off" disables)
+dream_schedule = "0 3 * * *"          # nightly memory governance sweep ("off" disables)
 max_turns = 30               # max tool-calling round-trips per user turn
+# pyhost_enabled = false     # optional: keep the Python plugin host (and run_code) out
 
 [memory]
 embedding_model = "bge-m3"   # optional Ollama model; enables cross-language recall and episodic search
@@ -195,7 +196,7 @@ allow_from = ["wxid_xxx"]
 default_normal = "ask"       # ask | deny | allow — fallback for unmatched Normal actions
 
 [[policy.rule]]              # let cargo/git run without prompting…
-category = "shell"           # shell | file | network | homeassistant
+category = "shell"           # shell | file | network | homeassistant | mcp | wiki | plugin
 match = "prefix"             # prefix | suffix | exact | contains
 value = "cargo "
 effect = "allow"
@@ -252,10 +253,8 @@ HASS_URL=http://homeassistant.local:8123
 
 Use `komo channel list` to see resolved configuration and the channels loaded by
 the running gateway; add `--json` for scripts. `komo channel probe <channel>`
-validates a configured provider without sending a message, and `komo channel
-setup <channel>` interactively writes credentials and the corresponding channel
-table for Feishu, Telegram, or WeChat. The API channel remains
-loopback-only by default and must be exposed manually in `config.toml`.
+validates a configured provider without sending a message. The API channel
+remains loopback-only by default and must be exposed manually in `config.toml`.
 
 WeChat is QR-based: run `komo channel wechat login` on the host, or send `/wechat login`
 from an already-working chat channel.
@@ -286,12 +285,11 @@ crates/
 ├── komo-provider    LLM wire formats (Responses / Messages) + HTTP/SSE transport
 ├── komo-mcp         MCP client (Streamable HTTP)
 ├── komo-pyhost      out-of-process Python plugin host behind run_code and ~/.komo/plugins
-├── komo-wiki        note-vault vector index (qdrant-edge in-process, or Qdrant server)
-├── komo-infra       persistence (Turso/toasty) · memory store · skills · logs · embedding · codex auth
-├── komo-services    tool execution · memory query/consolidation · skill registry · cron actions · background tasks
+├── komo-infra       persistence (Turso/toasty) · chunk index · memory store · skills · logs · embedding · codex auth
+├── komo-services    tool execution · memory query/consolidation · skill registry · cron actions · wiki indexing
 ├── komo-tools       every built-in tool
 └── komo-bot         runtime (run_agent_loop) · gateway · daemon sweeps · interaction · system prompt · policy approver · reviewer
-src/                 the binary: cli/ · tui/ · infra/messaging (channels) · infra/gateway_client · services/operator_control
+src/                 the binary: cli/ · tui/ · pyhost · infra/messaging (channels) · infra/gateway_client · services/operator_control
 apps/                bun workspace: shared React renderer mounted by the Electron desktop app and the web SPA
 ```
 
@@ -310,13 +308,11 @@ dependency compiles protobuf frames at build time.
 
 Schema changes need no reset: new columns are added in place on connect
 (`ensure_columns`), new tables with `ensure_table`. Durable tables
-(tasks, memories, routines) only ever change additively — see `AGENTS.md`.
+(memories, routines, wakeups) only ever change additively — see `AGENTS.md`.
 
 ## Docs
 
 - [AGENTS.md](AGENTS.md) — the live architecture guide: commands, storage rules, module map, extension points.
 - [CONTEXT.md](CONTEXT.md) + [docs/adr/](docs/adr/) — glossary and architecture decision records.
-- [docs/personal-agent-roadmap.md](docs/personal-agent-roadmap.md) — capability gaps and what comes next.
-- [docs/bot-runtime.md](docs/bot-runtime.md) — suspended turns, wakeups, routines and their triggers.
-- [docs/turn-durability.md](docs/turn-durability.md) — the session event log and how a turn is persisted and recovered.
+- [docs/bot-runtime.md](docs/bot-runtime.md) — suspended turns, wakeups and routines.
 - [docs/episode-learning-framework.md](docs/episode-learning-framework.md) — the post-run learning pass.

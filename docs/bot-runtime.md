@@ -1,6 +1,14 @@
 # Bot 运行时：持久化等待、触发器与任务
 
 > 存储说明：本文写作时 komo 还有 `state.db` / `kanban.db` / `memory.db` / `cron.db` 四个库文件。ADR 0004 之后它们合并为一个 `~/.komo/komo.db`，文中的库名指的是其中对应的表，disposable / durable 是表的属性，不是文件的属性；除此之外结论不变。
+>
+> 后续变更：kanban Task、后台任务与 `wait` 工具、事件类 trigger（feishu / webhook / file
+> changed / `Any`）、每日简报此后都从代码里删除了，描述它们的章节随之移除。现在 `Trigger` 只有
+> `Cron` 与 `At`，`Wakeup` 只有 `Approval` 与 `UserReply`，routine 的动作多了一种
+> `Message`（定时投递一段固定文本，即原来的 reminder）。§1 的现状表、§6「明确不做」、
+> §7 决定记录与 §8 完成判据保留原文作历史对照，其中点名这些机制的条目已不再成立。
+> 文中引用的 `docs/turn-durability.md` 也已删除；session 事件日志的现状见 AGENTS.md 的
+> 「Data & storage rules」与 `komo-core` 的 `domain::session_event`。
 
 范围：komo 从「个人聊天 Agent」转到「7×24 常驻的个人 AI Bot 运行时」需要补的运行时原语——
 一个 turn 如何跨小时/跨天地等待并恢复、什么事件能唤醒它、routine 如何从 cron 泛化、Task 放在哪。
@@ -9,8 +17,9 @@
 依据三份材料，按可信度排序：
 
 1. 对现有代码的逐条核对（§1）。
-2. [`docs/turn-durability.md`](turn-durability.md)——session 权威事件日志。本 PRD 的一切等待/恢复都建在
-   它的第一、二批之上，不另起一套持久化。
+2. session 权威事件日志（`komo-core` 的 `domain::session_event` +
+   `komo-infra` 的 `persistence::session_log`）。本 PRD 的一切等待/恢复都建在它之上，
+   不另起一套持久化。
 3. Grok Bot 0.18 渲染层契约（`/Users/xiangyi/01-code/grok-bot/frontend/src/recovered/`）。
    **只有前端**，后端 coordinator 源码不在本地；从 UI 契约反推数据模型，看得到形状，看不到实现。
    每处引用都标了文件。
@@ -93,30 +102,15 @@ Grok 的 Automation 形状是 `{name, prompt, trigger, isEnabled, runs[]}`，tri
 `{type: "group", listeners: [≤8]}`（任一触发）——`features/automations/routines/trigger-schema.ts`。
 这与 CronJob 的差别只有 trigger 一个字段和 run 历史一个列表。
 
-### D4 · 不建执行型 Task；kanban Task 的「等待」接到 Wakeup 上
+### D5 · 审批、提问、交接是同一原语的三个变体
 
-**决定**：不引入第二个 Task 类型。kanban `Task` 仍是承诺清单，但它的 `Waiting` 状态不再只是一个
-标签：一个进入 `Waiting` 的 Task 登记一条 `Wakeup::Event{ sender 匹配 waiting_on }`，被等的人一来消息，
-就在 Task 的来源 session 上开一个 turn（§3.7）。agent「正在等什么」仍是 session 投影上的
-`awaiting` 字段，来源是 D2 的 fold。
-
-理由：Grok 的渲染层没有任何 Task / Goal 对象——顶层只有 agent、automation（及 runs）、async task
-三种。「会话 + 等待 + routine run + 后台任务」把 Task 表要覆盖的东西全覆盖了，所以不建执行型 Task。
-但 kanban 里已经有「等张三回复」这一类 Task，而 Wakeup 就是「等」的运行时形态——两个「等」不打通，
-就是同一件事两套表达。roadmap §4 写「刻意不做 worker claim，因为 komo 是单 turn 助理」，
-前提被新定位推翻，结论换成：执行不需要 Task，但 Task 的等待需要执行来兑现。
-
-### D5 · 审批、提问、交接、后台任务是同一原语的四个变体
-
-**决定**：四件事共用 `turn/suspended` + 唤醒登记，差别只在 `Wakeup` 变体和恢复时喂回模型的内容：
+**决定**：三件事共用 `turn/suspended` + 唤醒登记，差别只在 `Wakeup` 变体和恢复时喂回模型的内容：
 
 | 变体 | 挂起原因 | 唤醒条件 | 恢复喂回 | Grok 对应 |
 |---|---|---|---|---|
 | Approval | 工具需要审批 | `/approve` `/deny`、超时 | `approval/resolved` 后工具结果 | `auto-review-approval` 卡：`{requestId, status: pending|approved|always|denied|expired}`（`transcript-card/protocol.ts`） |
 | UserReply | `ask_user` | 下一条用户消息、超时 | 答案文本 | widget 卡：`{prompt, options, allowCustom, dismissOnMoveOn}`，落地记 `respondedValue/widgetSkipped/widgetDismissed` |
 | Handoff | 「你去登录一下 / 做件事然后告诉我」 | 用户消息 | 用户说的话 | `ComputerHandoff {requestId, instruction}` → `waiting | handed_back | replied | dismissed`（`computer/shell/model.ts`） |
-| TaskDone | 后台 shell / delegate | 任务结算 | 任务结果引用 | `AsyncTask {kind: subagent|shell|cloud-agent, status: running}`（`agent-info/async-tasks/provider.ts`） |
-| At / Event | 模型主动 `wait` | 时间到 / 事件命中 | 事件描述 | routine `event` 字段 |
 
 Handoff 不是新工具：就是 `ask_user` 带一段 instruction，恢复条件相同。表里单列是因为它决定了
 文案和通知方式，不决定模型。
@@ -191,8 +185,6 @@ compaction summary（turn-durability 第三批）、检索（`session` 工具 + 
 turn/suspended   { turn_id, wakeup: Wakeup, summary, expires_at? }
 wakeup/fired     { turn_id, wakeup_id, cause: "approve"|"deny"|"reply"|"time"|"event"|"task"|"expired", payload? }
 approval/expired { turn_id, call_id, call_index }
-task/spawned     { turn_id, task_id, kind: "shell"|"delegate", label }
-task/settled     { task_id, outcome, result_ref, elapsed_ms }
 conversation/boundary { turn_id? }             ← /new；只影响 surface fold 与窗口起点（§3.8）
 ```
 
@@ -201,17 +193,13 @@ conversation/boundary { turn_id? }             ← /new；只影响 surface fold
 - 恢复走 turn-durability 的精确 resume：`turn/started{resumed_from}` + `request/header{reason: resume}`；
   `wakeup/fired` 是两者之间的因果链，没有它「为什么恢复」在日志里不可见。
 - `approval/expired` 是 `approval/resolved` 之外的第三个结局，恢复后作为拒绝结果喂回模型。
-- 后台任务的 `task/settled` 可以落在 turn 结束之后——这是它和工具调用的本质区别。
 
 ### 3.2 Wakeup 与唤醒登记
 
 ```rust
 enum Wakeup {
-    At { at: i64 },
     Approval { call_id: String },
     UserReply,
-    TaskDone { task_id: String },
-    Event { filter: EventFilter },
 }
 
 struct WakeupRegistration {
@@ -225,13 +213,12 @@ struct WakeupRegistration {
 }
 ```
 
-**存放**：cron.db（durable），与 routine 同库，同一个 sweep 读。session 日志是「turn 在做什么」的权威，
+**存放**：`komo.db` 的 `wakeup_records`（durable），与 routine 同库，同一个 sweep 读。session 日志是「turn 在做什么」的权威，
 登记是「何时叫它」的权威；fire 时先读日志核对该 turn 确实挂起且未恢复，对不上就丢弃登记并 warn。
 启动时反向核对一次：有 `turn/suspended` 无登记的 session 补登记（只扫最近 N 个活跃 session）。
 
-`expires_at` 默认值按变体：Approval 24h、UserReply 7d、At 无、TaskDone 无（任务自己有超时）、
-Event 30d。过期一律以 `cause: expired` 唤醒并把「没等到」告诉模型，**不静默丢弃**——
-一个从未被回答的问题不能让 turn 永远悬着。
+`expires_at` 默认值按变体：Approval 24h、UserReply 7d。过期一律以 `cause: expired` 唤醒并把
+「没等到」告诉模型，**不静默丢弃**——一个从未被回答的问题不能让 turn 永远悬着。
 
 ### 3.3 Routine（CronJob 泛化）—— **已完成**（5.11）
 
@@ -239,17 +226,12 @@ Event 30d。过期一律以 `cause: expired` 唤醒并把「没等到」告诉�
 enum Trigger {
     Cron { expr: String },                          // 现有 5 段（`@every 30m` / `CRON_TZ=` 未做）
     At { at: i64 },                                 // 现有 `@at`，创建时解析成那个本地时刻
-    Feishu { chat: String, match: FeishuMatch },    // mention | keyword(s) | reaction(emoji)
-    Webhook { name: String },                       // POST /api/hooks/{name}，bearer key
-    FileChanged { root: PathBuf, glob: String },
-    Any { triggers: Vec<Trigger> },                 // ≤ 8，任一命中
 }
 
 struct RoutineRun {
     id: String,
     status: RoutineRunStatus,   // running | ok | error | waiting
     started_at: i64,
-    event: String,              // 触发它的事件的一行描述：cron 槽位 / 消息摘要 / 文件路径
     session_id: Option<String>, // agent 模式：那次 turn 的 session
     output: String,             // 有界（1000 字符；投递出去的通知不截）
 }
@@ -259,13 +241,9 @@ struct RoutineRun {
 → `runs: Vec<RoutineRun>`（保留最近 20 条，新的在末尾）。`last_error` 留着——它记的是
 schedule/config 问题，不是 run 结果。
 
-**`Cron` / `At` 是「有槽位」的，事件类三种不是**：`next_slot` 只对前者答得出时刻，
-`next_run_at = 0` 就是「没有时刻」，sweep 于是跳过纯事件 routine——它们由自己的入口 fire
-（5.12–5.14，汇合在 `RoutineEventSource::on_event`）。
-`Any` 取成员里最近的那个槽位；一次 firing 只产生一条 `RoutineRun`，`event` 写的是
-**命中的那个成员**（`owner_of`），不是整个集合——事件触发的 routine 不记 `event` 就说不清
-「这次为什么跑」（Grok 每条 run 都带 `event`：`routines/controller.ts`）。`Any` 里的 `At`
-用完就自然从 `next_slot` 里消失，剩下的 cron 成员继续把 job 带下去。
+**两种 trigger 都是「有槽位」的**：`next_slot` 对 `Cron` 与 `At` 都答得出时刻，
+`next_run_at` 因此永远是 sweep 能判到期的那个槽位；`At` 过去之后 `next_slot` 答 `None`，
+job 在 claim 时就 `done`。
 
 **存储是加性的，不是删库重建。** 本节早先写的「cron.db 按 AGENTS.md 规则删库重建」是
 ADR 0004 合库之前的说法，已作废：`cron_job_records` 现在在 `komo.db` 里，是 durable 表，
@@ -282,69 +260,14 @@ ADR 0004 合库之前的说法，已作废：`cron_job_records` 现在在 `komo.
 - **这是一次性 repair，不是读路径上的 fallback**：读路径只认新列，下游没有任何地方需要判断
   一行是哪个形状写的。
 
-`Feishu` trigger 命中的消息**不是**普通聊天输入：它以 routine 的 prompt 开一个 `origin = cron`
-的 turn，消息作为 event 注入，走 routine 的 grants。否则群里任何人一个 emoji 就能触发有授权的动作。
-
-### 3.4 `wait` 工具
-
-模型主动挂起的入口，`Risk::Safe`，sentinel 工具（同 `ask_user`）：
-
-```
-wait { until: "2h" | "2026-09-03 09:00" }          → Wakeup::At
-wait { for_task: "<task_id>" }                     → Wakeup::TaskDone
-wait { for_event: { webhook: "ci-done" } }         → Wakeup::Event
-```
-
-调用即 `turn/suspended` + 登记；恢复后工具返回值是唤醒事件的描述。**无人值守 turn 也可以调**——
-这正是 routine 能做「检查完等两小时再检查」的方式；它的 grants 随登记带下去。
-每 turn 最多 `WAIT_BUDGET_PER_TURN = 4` 次，防止模型用 wait 代替结束。
-
-### 3.5 后台任务
-
-`shell` 新增 `background: true`；`delegate` 新增 `detach: true`。两者写 `task/spawned`，立即返回
-task_id，turn 可以结束。任务结算写 `task/settled`，若有登记则唤醒：
-
-- turn 仍挂起在 `TaskDone` → 精确恢复；
-- turn 已结束 → 以结果开一个新 turn（`turn_id: None` 的登记），prompt 是「你之前起的任务 X 完成了，结果如下」。
-
-后台任务最多 `MAX_BACKGROUND_TASKS_PER_SESSION = 3`；进程重启时 `running` 的后台 shell 一律判
-`uncertain` 结算（进程组已死，是否完成未知）——和工具调用的 `Uncertain` 同一语义。
-
 ### 3.6 Session 投影新增 `awaiting`
 
 ```rust
 struct Awaiting { kind: WakeupKind, since: i64, summary: String, expires_at: Option<i64> }
 ```
 
-fold 自 3.1 事件，进 state.db 的 session 投影（可重建）。`komo session list` / TUI / apps 用它显示
-「等你审批 · 3h」「等 CI · 已 40min」。这是 Grok `awaitingUserResponse` 的对应物。
-
-### 3.7 kanban Task ↔ Wakeup
-
-```rust
-struct Task {
-    // ...现有字段
-    /// 被等待方的 channel 身份；None = waiting_on 只是一段文字，无法唤醒。
-    waiting_on_peer: Option<ChannelPeer>,
-    /// 进入 Waiting 时登记的唤醒；离开 Waiting 时撤销。
-    wakeup_id: Option<String>,
-}
-```
-
-- **进入 `Waiting`**（`task` 工具 `update status=waiting`、CLI、reviewer 提取）：若能解析出
-  `waiting_on_peer`（消息来自 channel 时，模型从对话上下文给出 peer；CLI 显式传），登记
-  `WakeupRegistration { session_id: task.source, turn_id: None, wakeup: Event{ filter: FromPeer(peer) }, expires_at: due_at.or(30d) }`。
-  只有文字的 `waiting_on` 不登记，`komo task list` 标出「不可唤醒」。
-- **命中**：该 peer 的任一入站消息先照常走它自己的会话（它是对方在和 komo 说话，或是群里说了话），
-  同时 fire 登记：在 `task.source` 上开一个 turn，prompt 是「你在等 <waiting_on> 关于「<title>」的回复，
-  刚收到：<消息>」。Task 不自动改状态——是否算「回复了」由模型判断，`task update` 完成或继续等。
-- **`wait { for_task: <kanban task id> }`**：当前 turn 挂起到该 Task 的等待方回复（`turn_id: Some`，
-  精确恢复）。同一个登记，两种消费方式。
-- **离开 `Waiting`**（done / cancelled / 改回 todo）：撤销登记。
-- `due_at` 到期仍由 `TaskSweep` 投递提醒，不改。
-
-匹配的是 **peer**，不是名字字串：`waiting_on` 是给人看的，`ChannelPeer` 才是能对上入站消息的东西。
-`FromPeer` 是 `EventFilter` 的一个变体，与 §3.3 `Feishu` trigger 共用匹配器。
+fold 自 3.1 事件，进 `komo.db` 的 session 投影（可重建）。`komo session list` / TUI / apps 用它显示
+「等你审批 · 3h」。这是 Grok `awaitingUserResponse` 的对应物。
 
 ### 3.8 会话解析（D6）
 
@@ -376,7 +299,7 @@ InboundMessage { peer, sender, text }
 - **新事件** `conversation/boundary { turn_id? }`：`/new` 写它；surface fold 从最近一条 boundary 之后
   开始取模型历史；`find_windowed` 的窗口不越过它。它对 seq、恢复、审批、投影都不可见——它只影响
   "模型默认看到多长的历史"。
-- `todo`（session 级工作焦点）是 conversational working context，随 boundary 失效；kanban Task、
+- `todo`（session 级工作焦点）是 conversational working context，随 boundary 失效；
   memory、grants、`WakeupRegistration` 不受 boundary 影响，各按自己的规则活或死。
 - 记忆 `write_scope()` 规则不变：home session 没有 correspondent，写 `Global`；这正是它该有的语义。
 
@@ -406,7 +329,7 @@ Grok widget 的 `dismissOnMoveOn` 是同一条规则：**一个 pending 的等�
 
 ### 4.2 无人值守的审批（本 worktree 的命名来源）
 
-cron/briefing turn 遇到 grants 之外的 `Risk::Normal` 动作，今天直接拒绝。改为：
+cron turn 遇到 grants 之外的 `Risk::Normal` 动作，今天直接拒绝。改为：
 
 ```
 → approval/requested + turn/suspended{Approval} + 登记
@@ -425,16 +348,6 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 `ask_user` 改为写 `turn/suspended{UserReply}` + 登记（7d）。下一条用户消息即答案（现有语义保留），
 `/skip` 显式跳过；超时以 expired 恢复，工具返回「没等到答案」，模型按声明的假设继续或收尾——
 现有 `ask_user` 的降级文案不变。Handoff 只是 question 文本是一段 instruction。
-
-### 4.4 事件触发
-
-三个入口一个汇合点 `RoutineEventSource::on_event`（§5.12–5.14 已完成）：命中的 routine 各开一条
-`origin = cron` 的 turn（走 routine 的 grants），命中的唤醒登记被 fire。
-
-- Webhook：`POST /api/hooks/{name}`，bearer key 校验（loopback 也不免），body 有界。
-- Feishu：channel 收到的每条消息都先过 routine 匹配（与 `allow_from`、`require_mention` 无关），
-  聊天路径照旧受它们约束；reaction 走 `im.message.reaction.created_v1`，chat 反查后同样进 `on_event`。
-- FileChanged：`notify` crate 监听 `root`，防抖 2s，glob 由 `Trigger::matched_by` 过滤。
 
 ---
 
@@ -477,8 +390,8 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `a_running_or_finished_turn_is_not_re_registered`，加 store 侧四条（五种变体往返、
   无 turn 的登记、认领两次成功一次、按 turn 一起退休）。
   dispatch 的实现者是 5.3 的 `TurnWaker`（薄适配器，续跑逻辑收在
-  `GatewayDispatcher::continue_turn_with` 一处）；5.9 起 `fire` 多带一个 payload，
-  后台任务的结果和 webhook 的 body 都从这里进日志。
+  `GatewayDispatcher::continue_turn_with` 一处）；`fire` 多带一个 payload——唤醒带来的东西
+  从这里进日志。
 - **5.3 审批改造** —— **已完成**（TUI 的 approver 刻意留在进程内，见末尾）。
   机制侧：`Decision::Suspend`（不是拒绝，是「答案还没到」，只存在于审批器↔gate 之间，
   tool 永远看不到它——顺手把三个 gated tool 的 `match Decision` 改成读 `is_allowed()` +
@@ -537,22 +450,21 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `a_noted_prompt_is_visible_until_it_is_answered`、
   `a_dangerous_prompt_narrows_a_widening_answer`（`Risk::Dangerous` 仍只批一次）。
   刻意保留：TUI 的 approver 仍在进程内等——它守着自己的 turn，不需要跨进程恢复；
-  TUI 本地模式（无 gateway）的 `ask_user` / `wait` 续跑由 TUI 自己驱动（5.8 接上，
-  `tui/mod.rs`），日志那一半共用 `interaction::record_wake`。
+  （后来 TUI 不再有本地模式：它是 gateway 的客户端，审批与提问都经
+  `/api/interactions/{session}` 回答。）
 - **5.4 无人值守审批** —— **已完成**：cron runtime 的内层 approver 换成 `UnattendedSuspend`
   （`komo-bot` 的 `unattended`）：`Risk::Normal` 答 `Suspend`，`Risk::Dangerous` 仍拒绝——
   无人值守永不放行危险动作，事后 `/approve` 也不行。提示由 `CronJobSweep` 发而不是 approver 发，
   因为 `wk-<id>` 要等登记写完才存在：sweep 拿到 `Suspended` 后从日志读 `turn/suspended.summary`、
   从登记读 id，走已有 notifier 投递「回复 `/approve <id>` / `/deny <id>`」，只给 Once——
   `session`/`always` 是放宽，无人值守不给。那次 firing 的 run 记 `waiting`
-  （不是 ok 也不是 error；5.11 之前是 `last_status`），`session_id` 指向挂起的 turn。briefing 保持 deny：
-  它一失败就降级成无工具 compose，简报已经投出去了，挂起只会留一条没人听的续跑。
+  （不是 ok 也不是 error；5.11 之前是 `last_status`），`session_id` 指向挂起的 turn。
   顺带补的两处：`continue_turn` 从 session 记录读回 `origin`、从登记读回 grants——
   原来续跑用 detached context，routine 醒来按普通对话评估权限（更宽）且丢掉自己的 grants；
   `run_projection` 沿 `resumed_from` 链继承 `approval/resolved`，否则答复记在问的那个 turn、
   动作跑在续跑里，§8 判据 2 的 `waited_ms ≈ 5h` 永远是空的。
   **续跑的 runtime 也已经对上**：dispatcher 不再只握一个 handler，而是按 `SessionOrigin`
-  索引一组（`with_runtime`），主 / cron / briefing 三个在 `cli/gateway.rs` 一起传进去，
+  索引一组（`with_runtime`），主 / cron 两个在 `cli/gateway.rs` 一起传进去，
   `continue_turn_with` 与 `start_turn_with` 用 `session_origin()` 选。这不是整洁问题：
   主 runtime 的内层是 `ChatApprover`，续跑里第二个未授权动作会被**拒绝**而不是再次挂起，
   正好和 §4.2 相反；顺带还会给一个 routine 更大的工具集、`delegate`，以及喂进用户记忆库的
@@ -610,14 +522,14 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `/new` 清掉的只有 **todo**（`komo-services` 的 `conversation::mark_boundary`，
   聊天命令、TUI、api 路由三个入口共用一份）；`ApprovalState`（含 `/approve session` 的授权）、
   挂起的 turn 和它的 `WakeupRegistration`（不管它等的是审批还是 5.8 的提问）、
-  `Awaiting` 投影、kanban Task、memory 全部不动——把 Conversation / Task / Policy
+  `Awaiting` 投影、memory 全部不动——把 Conversation / Task / Policy
   三种生命周期重新耦合起来正是这条规则要防的事。边界对 `project_awaiting` 落在
   `_ => {}`，一条测试钉住（`a_conversation_boundary_leaves_the_wait_alone`）。
   `ApprovalState::clear` 因此没有调用者了，删掉。
-  **回复随 turn 走**：`continue_turn_with` / `start_turn_with` 在 5.7 的 `payload` 之后
+  **回复随 turn 走**：`continue_turn_with` / `start_turn_with` 在 `payload` 之后
   再收一个可选 `ReplySink`——`payload` 是「唤醒带来了什么」，sink 是「回答送到哪儿」，
   两件事。`/approve`、`/deny`、`/skip` 和答问题的那条普通消息都把自己那条 sink 传下去，
-  所以在 TUI 挂起、从 Telegram 答的 turn 回 Telegram；sweep 的定时唤醒、结算的后台任务、
+  所以在 TUI 挂起、从 Telegram 答的 turn 回 Telegram；sweep 的定时唤醒与
   GUI 弹窗传 `None`（它们没人站在那头，回复落 transcript，GUI 本来就轮询它）。
   **`Session.workspace` 放弃 creation-locked**：字段留着（日志 manifest 和会话列表还在读），
   但语义改成「这条会话最早是从哪儿说的」；TUI 的 `resume_workspace` 和 api 的
@@ -639,143 +551,23 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   correspondent，各自一条会话——这是配置里就能改的事，而反过来把配对进来的人都当成操作者，
   会让别人的私聊并进 home。
 
-### 第二批 · `wait` 与后台任务
+### 第二批 · `ask_user` 持久化
 
-- **5.7 `wait` 工具** —— **已完成**：三种参数 → 三种 Wakeup（`until` 走 reminder 的
-  `parse_after` 与 cron 的 `@at` 解析，所以「已经过去的时间」和 DST 空洞在这里也被拒）；
-  `WAIT_BUDGET_PER_TURN = 4`；`Scope::ALL`，无人值守 turn 也能调。
-  **工具触发挂起的通道就是审批那条**：`ToolContext::wait_for` 填的是审批 gate 填的同一个
-  `PendingSuspension`，所以 executor（不结算）、loop（`Suspended` 收尾）、runtime
-  （写 `turn/suspended` + 登记）一行都不用改。不同的只有回来的路：
-  `turn/suspended` 多带一个 **`call_id`**（停下来等的那次调用），
-  `rebuild_from_events` 因此把它并进 `gated` 集合无条件重放；runtime 在续跑打开时把整条
-  `attempt_chain` 的等待 fold 到 `RunContext` 上（`fold_turn_waits`），于是
-  `ctx.resumed_wait()` 交给该调用它自己的那次唤醒、`ctx.waits_taken()` 是**从日志数**的
-  每 turn 预算——内存里的计数会被它正在计的那次挂起清掉。
-  `for_task` / `for_event` 只做登记形状：5.9 / 5.12 还不存在，今天没有东西 fire 它们，
-  `Event` 靠 30 天过期回来说「没等到」，`TaskDone` 按 §3.2 不设第二个时钟。
-  验证：`a_wait_stops_the_turn_and_says_when_to_come_back`（`turn/suspended{at, call_id}`、
-  登记 `expires_at` 为 None、无 step）、
-  `a_timer_that_came_due_after_a_restart_continues_the_turn`（**新 runtime 实例**接手，
-  `fire_due_wakeups` 到点 fire，续跑里那次调用只有一个 step 且返回「时间到了」，
-  登记已退休）、`a_spent_budget_reports_instead_of_stopping_the_turn`。
 - **5.8 `ask_user` 持久化** —— **已完成**：`turn/suspended{UserReply}` + 登记（7d），
   内存里的 `ClarifyState`（oneshot、`CLARIFY_TIMEOUT`、`CLARIFY_BOUND`、per-turn 计数）
   整个删掉，不留兼容层。「下一条用户消息即答案」变成
   `GatewayDispatcher::answer_question`——聊天里的普通消息、GUI 的 inline reply、api 的
   cancel 走同一个入口，答案落在 `wakeup/fired{reply, payload}` 上，工具重放时读它；
   `/skip` 以 `moved-on` + 空 payload 显式跳过，过期以 `expired` 回来，两者都返回原来的降级文案。
-  TUI 本地模式没有 dispatcher，但它本来就自己驱动 turn：日志那一半共用
-  `interaction::record_wake`，续跑用 `resume_interrupted`，所以「问 → 答」在没有 gateway 的
-  `komo chat` 里照常工作（没有 sweep，所以本地模式等不到 `wait 2h`——那要等 gateway 起来）。
   验证：`a_question_answered_after_a_restart_comes_back_as_the_answer`、
   `a_question_nobody_answered_comes_back_saying_so`（日志有 `wakeup/fired{expired}`）。
-- **5.9 后台 shell / delegate** —— **已完成**：`shell {background: true}` 与
-  `delegate {detach: true}` 立即返回 task_id，turn 照常结束；活干完了再把结果送回来。
-  两个新事件是全部的状态：`task/spawned {turn_id, task_id, kind, label}` 与
-  `task/settled {task_id, outcome, result_ref, summary, elapsed_ms}`。**没有状态表**——
-  「还在跑的任务」是 `unsettled()` 折日志折出来的（有 spawned 无 settled），
-  `MAX_BACKGROUND_TASKS_PER_SESSION = 3` 数的是它，重启后的核对读的也是它。
-  `task/settled` **不带 turn_id**，`turn_id_of_work()` 对两个事件都答 `None`：它可以落在
-  turn 结束之后，run 投影要是把它当成某个 step 的 settle，就是往一个已经关掉的 run 里塞活。
-  `outcome` 直接复用 `ToolOutcome`——「不知道有没有落地」在这里和在工具调用里是同一句话，
-  值得同一个类型；`result_ref` 指向 `tool_output_store` 里的完整输出
-  （新增 `store()`：`bound()` 只写超限的那部分，而后台任务没有「一轮预算」可超，
-  同目录、同保留期、同读闸，所以 `result_ref` 是模型能直接 `read`/`grep` 的路径）。
-  **持有者是 gateway 进程的一个 tokio task**，不是 turn 的：executor 到点会 abort 调用、
-  loop 会结束 turn，而这份活正是从这两者手里显式拆出来的。工具怎么拿到 store：
-  和审批 gate 同一条路——`ToolContext::with_background`，executor 在建每次调用的 ctx 时装上，
-  wiring 只给 `Scope::MAIN`（和 `with_events` 同一个判据：sweep 的合成 session 没有日志可落）。
-  唯一的晚绑定是 dispatch：实现它的 `TurnWaker` 要等 dispatcher，而 dispatcher 在 runtime 之后，
-  所以 `BackgroundTaskRuntime::attach_dispatch` 在 `cli/gateway.rs` 里补上——和 sweep 的
-  `WakeupWiring` 同一个形状。
-  结算按顺序问三件事，**先 take 认领再 fire**（`take` 答 `false` 就不动，sweep 在同一刻过期它
-  也只醒一次）：登记在且那个 turn 日志上仍是 `Suspended` → 精确续跑，payload 是结果摘要 +
-  `result_ref`，`wait` 从 `ctx.resumed_wait()` 读出来还给模型；登记在但 turn 已经不等了 →
-  结果还是得到达，开新 turn；没有登记（最常见——起了任务的 turn 通常就结束了）→ 也开新 turn。
-  开新 turn 这条路补上了 `continue_turn_with` 里 `turn_id: None` 的分支
-  （`start_turn_with`：payload 就是那条用户消息，抢 session slot，spawn）。
-  它**不写 `wakeup/fired`**——那是「挂起 ↔ 它的续跑」之间的因果链，这里没有挂起；
-  为什么会有这个 turn，日志里紧挨着的 `task/settled` 已经说了。
-  `WakeupDispatch::fire` 因此多一个 `payload` 参数，sweep 传空串：闹钟响了本来就什么也没带来。
-  **重启一律判 uncertain，绝不重放**：`reconcile_orphans` 在 gateway 启动跑（排在
-  `reregister_suspended_turns` **之后**，好让挂在 `wait { for_task }` 上的 turn 先把等待补回来），
-  扫最近 `ORPHAN_RECHECK_SESSIONS` 个 session，把每个没结算的任务补一条
-  `task/settled{uncertain}` 并走同一条唤醒路——进程组已经死了，命令有没有先跑完不可知，
-  这句话必须到达模型（§6「不自动重放 uncertain 的后台任务」）。
-  审批不变：起后台命令和跑前台命令是同一个动作的两种执行方式，`shell` 的 gate 在分叉之前，
-  `delegate` 沿用它今天的（子 agent 的工具各自受闸），递归仍由子 agent 工具集无 `delegate` 结构阻断。
-  **detach 的子 agent 不可审批**：后台 task 跑在进程自己的 task 里、不在任何会话中，
-  `ChatApprover` 看到的是 `handle_input` 就地建的非交互 context，于是需要审批的动作
-  **被拒绝**，并把这句话还给子 agent，让它收尾而不是报一个没人能处理的失败。
-  这条曾经写成「走 `/approve` 的挂起路径」，那是说的和做的不一致；真要挂起需要三样今天
-  没有的东西：提示得带上一个在审批器答完之后才存在的 `wk-` id（routine 的提示由 sweep 发
-  正是这个原因）、一个 task 得结算两次（`task/spawned` ↔ `task/settled` 只允许一次，
-  否则续跑几小时后产出的答案没有路回到父会话）、以及每个子 agent 一个审批位，否则后台
-  提示会顶掉操作者正在回答的那一条。所以改成把它说清楚：`detach` 的参数描述直接告诉模型，
-  需要授权的活别 detach。
-  验证：`a_background_command_returns_at_once_and_reports_when_it_lands`（turn 答
-  「started」没等命令、日志有 `task/spawned`、step 里给了模型 task_id；随后
-  `task/settled{ok}` 且 `result_ref` 非空，session 上出现一条带结果的新 turn）、
-  `a_turn_waiting_for_a_task_is_woken_when_it_settles`（`wait { for_task }` 挂起 →
-  结算 → `wakeup/fired{task}` → 续跑里那次调用只有一个 step 且返回结果摘要，
-  挂起的那次尝试始终没有 step）、
-  `a_fourth_background_task_is_refused_with_something_to_do_instead`（引导文案点名
-  `for_task`，且日志里仍然只有三条 `task/spawned`）、
-  `a_background_task_a_restart_lost_settles_as_uncertain`（**新 runtime 实例** +
-  启动核对，补 `task/settled{uncertain}`、没有第二条 `task/spawned`、新 turn 收到
-  「may or may not」，再核对一次什么也不做）、
-  `a_detached_delegation_answers_with_an_id_and_reports_later`、
-  `a_detached_sub_agent_is_refused_an_approval_nobody_can_answer`（task 结算为 Succeeded、
-  子 agent 收到「没有人能应答」、没有留下任何登记）。
-- **5.10 kanban Task ↔ Wakeup** —— **已完成**：`Waiting` 从一个标签变成一个标签**加一条登记**。
-  `task_records` 加三列（`waiting_on_platform` / `waiting_on_peer_id` / `wakeup_id`，
-  durable 表按 AGENTS.md 只加性变更，`kanban::ensure_schema` 就地 ALTER——这张表此前没有
-  `ensure_schema`，这次给它加了一个），映射到 `Task` 的两个字段：
-  `waiting_on_peer: Option<ChannelPeer>`（**没有地址就是不可唤醒**，绝不从名字猜）与
-  `wakeup_id: Option<String>`。
-  **进入 / 离开 `Waiting` 只有一个函数**：`komo-services` 的 `TaskWaiting::sync`，
-  它读 `task.is_wakeable()`，据此登记或撤销，只改 `task.wakeup_id`，由调用方落一次库——
-  「进来登记、出去撤销」写三遍就是三次漏登记的机会。今天的写入点只有 `task` 工具的
-  `capture` / `update` / `complete` 三条（`komo task` CLI 只有 `list`，reviewer 抽取一律落
-  `Inbox`），全部走它。登记是 `Event{FromPeer}` + `turn_id: None`，session 取 `task.source`，
-  为空则取 home session（`HomeRepository::home_session`）；`expires_at` 取 `due_at`，
-  没有就 30 天。同一个人换成另一个人、或登记已经被 fire 掉，`sync` 都会换一条新的，
-  不会留下一条谁也叫不醒的空 id。
-  **命中**是一个 `TriggerMatcher`（`komo-services/src/triggers.rs`），挂在
-  `GatewayDispatcher::handle` 的 inbox 去重之后、`dispatch` 之前。形状按 5.13 要求拆成两半：
-  纯函数在 `komo-core` 的 `domain::trigger`（`matches(&EventFilter, &InboundEvent)` +
-  `matching(&[WakeupRegistration], …)`，无 I/O、可单测），薄壳只做「列登记 → 逐条 take 认领
-  → fire」。**先 take 再 fire**，所以一条消息和同一刻过期它的 sweep 只会叫醒一次。
-  `turn_id: None` → `start_turn_with`，prompt 是「你在等 <waiting_on> 关于「<title>」的回复，
-  刚收到：<消息原文>」；`turn_id: Some` → 续跑，payload 就是消息原文（那个 turn 自己的历史里
-  已经有上下文了）。**消息本身照常走它自己的会话**——它是对方在和 komo 说话，命中只是在
-  `task.source` 上*另外*开一个 turn，不改消息的路由（§6「不做 Task Router」）。
-  Task 状态**不自动改**：这条算不算「回复了」是判断，由那个 turn 里的模型来做；命中后只把
-  `wakeup_id` 清空，`komo task list` 与工具的 list 立刻显示「不可唤醒」。
-  **`wait { for_task }` 是同一条登记的第二种消费方式**：kanban id 与后台任务 id 都是
-  UUIDv7，只能查表区分——`WaitTool` 拿到 `TaskRepository`，先问 kanban，认得且有
-  `waiting_on_peer` 就登记 `Event{FromPeer}` + `turn_id: Some`（deadline 用 Task 自己的
-  `due_at`），认不得（或只有名字）就还是 `TaskDone`。
-  `due_at` 到期仍由 `TaskSweep` 投递提醒，没动。
-  验证：`a_waiting_tasks_peer_writing_opens_a_turn_where_the_task_came_from`
-  （登记形状 + `wakeup_id` 回写 → 该 peer 来消息 → `task.source` 上出现带消息内容与 title 的
-  新 turn、消息自己的会话也有一个 turn、Task 仍是 `Waiting`、登记已被 take → 标 done 后同一
-  peer 再来消息不再触发）、`a_turn_waiting_on_a_task_is_continued_by_that_peers_message`
-  （`turn_id: Some` 走续跑，`wakeup/fired{event}` 的 payload 就是消息原文）、
-  `a_commitment_with_an_address_registers_a_wake_and_completing_it_retires_it`、
-  `a_commitment_naming_only_a_person_is_listed_as_unwakeable`、
-  `waiting_for_a_kanban_task_waits_for_the_person_it_waits_on`、
-  `an_unknown_id_is_still_a_background_task`、
-  `a_message_that_ended_a_task_wait_comes_back_as_its_text`。
 
 ### 第三批 · Trigger 泛化
 
 - **5.11 `Trigger` 枚举 + `runs` 历史** —— **已完成**：`CronJob.schedule` → `trigger`，
   `last_*` → `runs`（最近 20 条），存储按 §3.3 的加性做法 + 一次性回填，**不删库**。
   字符串 schedule → `Trigger` 的解析只有一处（`cron_actions::parse_schedule`）：
-  `komo cron add/add-agent`、`cron` 工具、api handler 三个入口都调它，结构化 trigger
-  （`Any` 与事件类）直接以自己的形状传，根本不经过字符串。`CronJobSpec.schedule` 换成
+  `komo cron add/add-agent` 与 `cron` 工具都调它。`CronJobSpec.schedule` 换成
   `trigger`，`CronRunStatus` 并进 `RoutineRunStatus`（多一个 `running`——claim 时就写下，
   崩在半路也留得下「当时在跑什么」）。sweep 的 claim 变成「算下一个槽位 → 写一条 `running` 的
   run」一次写入；`--skip-missed`、晚到裁决、`@at` 一次性 `done` 都没动，只是「还有没有下一个
@@ -784,96 +576,7 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   顺带修掉一个既有 bug：`CronJobSpec.catch_up` 从来没被 `add_cron_job` 写进 job，
   `--skip-missed` 一直是个空开关。
   验证：现有 cron 测试全绿；`a_pre_trigger_row_is_repaired_on_connect`（老形状的行连接后
-  读出正确的 `Trigger` 与那条 run，且再连一次不重复）、`an_any_trigger_fires_once_and_names_what_hit`
-  （两个成员同一槽位 → 一条 run，`event` 说出是哪个）、`a_slot_two_members_share_is_owned_by_one_of_them`、
-  `event_triggers_have_no_occurrence`、`history_keeps_the_newest_runs_only`。
-**5.12–5.14 共用的那条路** —— **已完成**：三个入口汇到一个
-`RoutineEventSource::on_event(&ExternalEvent)`（`komo-bot` 的 `daemon.rs`，与
-`CronJobSweep` 并列——后者现在只持有 `Arc<RoutineEventSource>`，是它的**时钟入口**）。
-`on_event` 做两件事：
-
-1. **命中的 routine 各开一条 turn**。匹配是纯函数 `Trigger::matched_by(&ExternalEvent)`
-   （`komo-core` 的 `domain::cron`），`Any` 至多答一个成员——**一次到达一条
-   `RoutineRun`**（判据 5），`event` 由 `Trigger::event_line` 写成「命中的成员 ·
-   事件摘要」。执行走的是 sweep 一直在用的那个 `fire` / `execute` /
-   `execute_cron_agent`，不复制一份：claim 成 `running` run、跑、按 `notify` 策略投递、
-   settle。所以事件触发的 turn 与槽位触发的 turn 完全同构——`SessionOrigin::Cron`、
-   `with_job_grants(job.granted_rules())`、cron runtime。**触发者身份不进授权**（判据 6）。
-2. **命中的登记被唤醒**。`domain::trigger` 的 `InboundEvent` 从结构体变成枚举
-   （`Message` / `Webhook`），`matches` 认 `EventFilter::Webhook`，`TriggerMatcher`
-   多一个 `on_event(&InboundEvent, payload)`——`on_inbound` 现在是它的薄壳，claim-before-fire
-   一套代码。飞书消息**不**走这一半（`ExternalEvent::as_inbound()` 答 `None`）：peer 唤醒由
-   每个 channel 共用的聊天入口 `GatewayDispatcher::handle` 负责，两边都发就把同一个承诺唤醒两次。
-
-事件内容进 prompt 时**打包成数据**：`cron_agent_prompt` 把 `ExternalEvent::detail()`
-（上限 `EVENT_DETAIL_CAP = 2000` 字符）放在任务之后、`<event>` 围栏里，并复述
-`system_prompt::TRUST_BOUNDARY_GUIDANCE` 的那条规则。command 模式的 routine 拿不到事件内容
-（它的 argv 是固定的，webhook body 由调用方书写），只记在 run 上。
-
-三个入口都经 `GatewayDispatcher::on_external_event` 转发（channel 手里只有 dispatcher），
-`attach_routines` 是后绑的——source 要 waker，waker 要 dispatcher。
-
-`on_event` 自己是**等到跑完**的（返回的是实际发生了什么，而不是派发了什么；同一 routine 的两个
-事件也就不会互相踩 `runs`），所以**三个入口都不阻塞在它上面**：飞书消费循环（挡住它就挡住了用户
-正在打的 `/approve`）和文件 watcher（还要继续防抖后面的写入）直接 spawn；webhook 走
-`on_event_detached`——它先只读地数出匹配数答给调用方，再把 `on_event` spawn 出去（理由见 5.12）。
-
-- **5.12 Webhook** —— **已完成**：`POST /api/hooks/{name}`，并进 api channel 的
-  `protected`（bearer key 网关），**不**进 `operator_writes`——那层 loopback 限制会把
-  webhook 的真正调用方（CI、监控）挡在外面；反过来 loopback 也不免鉴权，key 就是全部的门。
-  body 上限 `HOOK_BODY_LIMIT = 64 KB`（`DefaultBodyLimit`），内容类型不限、按文本读（lossy），
-  只取摘要进 `event`。
-  **它立即返回，routine 在后台跑**（`on_event_detached`：先只读地数出匹配数，再 spawn
-  `on_event`）。响应 `{ "routines": n, "wakeups": m }` 里的 n/m 是**匹配到的数量**，不是跑完的
-  数量——外部系统的 webhook 超时普遍在 10 秒量级，而超时的处置是重投；routine 命中没有去重键，
-  等一个几分钟的 routine 就等于把它跑两三次。所以**同一事件重投一次就再跑一次，去重是调用方的事**
-  （或者在 routine 的 prompt 里让它自己拿 body 中的 id 判断——事件内容是数据，判重也只能当数据判）。
-  唤醒那半是幂等的：登记被 `take` 认领过就不再命中，重投只会数出 0。
-  验证：`a_webhook_without_the_key_is_refused`（无 key / 错 key → 401）、
-  `an_oversized_webhook_body_is_refused`、`a_webhook_fires_the_routine_that_named_it`
-  （轮询 run 记录：一条 run、`event` 含 body 摘要、turn 是 `origin=Cron` 且带 routine 的 grants）、
-  `a_webhook_is_answered_before_its_routine_finishes`（routine 跑 3 秒，响应在 1 秒内回）、
-  `a_webhook_wakes_the_turn_that_was_waiting_for_it`（`wait { for_event }` 的 turn 被唤醒，
-  工具返回事件描述，重投不再命中）、`a_webhook_nobody_named_wakes_nothing`。
-- **5.13 Feishu match** —— **已完成**：`admit` 不再丢掉「群里没 @ 机器人」的消息，而是把
-  它标成 `admitted: false` 带出来——routine 触发跟「有没有跟机器人说话」无关，群里一个关键词正是
-  §5.13 存在的理由。channel 的消费循环先无条件调 `on_external_event`（routine 路径），
-  再按 `admitted` + pairing 决定聊天路径走不走：**一条消息既是聊天又命中 routine 时，两条 turn 各走各的**；
-  只命中 routine 时聊天路径本来就不收它。
-  reaction 是新订阅的事件（`im.message.reaction.created_v1`）——它只带 `message_id` 不带
-  `chat_id`，所以要 `FeishuSender::message_chat_id` 反查；这是一次 API 调用，
-  因此先问 `wants_feishu_reactions()`（有没有 active 的 reaction routine），没有就一分钱不花。
-  bot 自己的 reaction（`operator_type != "user"`）不触发。
-  验证：`a_strangers_reaction_runs_the_routine_on_the_routines_authority`
-  （非 allow_from 的群成员 → routine turn 跑了、`origin=Cron`、grants 是 routine 的、
-  prompt 是 routine 的、别的群同一个 emoji 不触发）、
-  `an_any_of_event_triggers_runs_once_per_arrival_and_names_the_member`、
-  `a_reaction_and_a_message_never_stand_in_for_each_other`（core）、
-  `admit_requires_mention_in_groups_only` / `admit_ignores_a_group_mention_of_someone_else`
-  （改成断言 `admitted`）、`a_users_reaction_becomes_an_arrival_and_a_bots_does_not`。
-- **5.14 FileChanged** —— **已完成**：`notify = "8"`（默认 features；防抖是自己的
-  tokio 计时器，不引 `notify-debouncer-mini`），`src/infra/file_watcher.rs` 里的
-  `FileWatcher` 实现 `Channel`——它要的正是 `serve` 给的两样东西：一个长活的循环和一个
-  shutdown。宿主直挂（同 api channel），不做 plugin。
-  三条性质：**防抖 2s**（`DEBOUNCE`，每来一个路径就重置，静下来才合成一个
-  `ExternalEvent::FileChanged { paths }`，最多 `MAX_BATCH_PATHS = 500` 条）；
-  **按 root 去重**（glob 完全不参与 watch，过滤交给 `Trigger::matched_by`，
-  于是哪条 routine 命中由同一段代码决定）；**每 `RESCAN = 60s` 对照一次 jobs**
-  （只加不减：两条 routine 共用一个 root 时撤 watch 会把另一条弄哑；多余的 watch 只是一个闲置句柄）。
-  root 在**创建时**就 canonicalize + 证明存在（`normalize_event_trigger`，与 agent job 的
-  workspace 同一条理由），glob 也在那时编译一次；读路径上编译不出来的 glob 匹配空集而不是全集。
-  验证：`fifty_writes_in_one_window_fire_the_routine_once`（真实临时目录 + 真实 watcher，
-  50 个 `.md` 一条 run，`.png` 不触发）、`a_batch_of_file_writes_fires_a_routine_exactly_once`
-  （`on_event` 层）、`a_file_trigger_matches_its_glob_under_its_root`（core）、
-  `every_watched_root_is_collected_once`、`a_watched_directory_is_proven_and_canonicalized_at_creation`。
-
-**两个入口都能建这三种 routine**：`cron_actions::parse_schedule` 这个唯一的
-「字符串 → `Trigger`」解析点认了事件写法——`@webhook <name>`、
-`@feishu <chat> mention|keyword a,b|reaction <emoji>`、`@file <root> [glob]`，
-以及用 ` | ` 连成 `Any`（`|` 不出现在任何一种写法里，所以切分无歧义）。
-`komo cron add|add-agent <schedule>` 与 `cron` 工具的 `schedule` 因此同时拿到，
-二者的说明都写了这些形状。`komo cron list` 显示 trigger 描述（5.11 已做）。
-验证：`every_event_trigger_is_writable_as_a_string`。
+  读出正确的 `Trigger` 与那条 run，且再连一次不重复）、`history_keeps_the_newest_runs_only`。
 
 ### 第四批 · 收口
 
@@ -909,13 +612,11 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   用户消息尾部加什么」，和 recall 记忆同一个位置、同一个理由。缓存前缀是 tools → system →
   messages，而 artifacts 路径带 session id，放进 system prompt 会让每条会话都有一份自己的冷前缀；
   挂在用户消息尾部则是「新字节本来就在那儿」，对缓存零成本（D6 第 2 条）。主 agent 和 cron
-  runtime 拿到它（两者都会写文件），aux / delegate / briefing 不拿。
+  runtime 拿到它（两者都会写文件），aux / delegate 不拿。
 
   **保留策略**：不扫。tool-output 是调用的副产物所以 7 天过期，artifacts 是 turn 刻意留下的东西，
   按时删掉就是删掉用户要的那份。session 之间不隔离——整个根都可写，昨天的报告今天读得到；
-  per-session 子目录是「放哪」的约定，不是边界。`komo run rollback` 对这里的写照常生效
-  （checkpoint 按绝对路径记 pre-image，对 root 没有假设）。后台任务的 `result_ref`（5.9）不动：
-  那是工具输出，不是产物。
+  per-session 子目录是「放哪」的约定，不是边界。
 
   验证：`the_artifacts_root_is_writable_from_outside_the_workspace`（core）、
   `writes_into_the_artifacts_root_and_still_refuses_to_leave_it`、
@@ -956,7 +657,8 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 
 已决（2026-09-02）：
 
-- **Q1 kanban Task 与 Wakeup 打通** → 打通。Task 的 `Waiting` 登记一条 `FromPeer` 唤醒，详见 §3.7、5.10。
+- **Q1 kanban Task 与 Wakeup 打通** → 打通。Task 的 `Waiting` 登记一条 `FromPeer` 唤醒。（kanban
+  已删除，此条不再成立。）
 - **Q2 审批挂起期间用户在同一 session 说话** → 视为放弃审批：`Deny{feedback: 那条消息}` 结算并恢复
   turn，见 §4.1。Grok widget 的 `dismissOnMoveOn` 与现有 `Answer::Deny(feedback)` 都是这个形状。
 
@@ -965,8 +667,8 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
 - **Q3 登记存哪** → ADR 0004 合库后只有一个 `komo.db`，问题消解：`wakeup_records` 是其中一张
   durable 表（5.2），启动时 `reregister_suspended_turns` 只核对最近 N 个 session。
 - **Q4 过期时长默认值** → 按 §3.2 落在 `wakeup::default_expiry_secs`：Approval 24h、UserReply 7d、
-  Event 30d、At 与 TaskDone 无（前者的 `at` 就是期限，后者由任务自己的超时结算）；
-  kanban Task 的等待用 `due_at`，没有则 30d（`TaskWaiting`，5.10）。
+  Event 30d、At 与 TaskDone 无（前者的 `at` 就是期限，后者由任务自己的超时结算）。
+  （现在只剩 Approval 与 UserReply 两个变体。）
 
 ---
 

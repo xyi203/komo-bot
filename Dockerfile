@@ -11,7 +11,7 @@
 #             LLM API needs a trust store) + libssl3 (the wechat channel's
 #             `wechatbot` crate pulls reqwest's native-tls, which dynamically
 #             links libssl on Linux — without it the binary won't even load) +
-#             tzdata (reminders run on local time — set TZ) +
+#             tzdata (routines fire on local time — set TZ) +
 #             git (`komo skills install owner/repo` shells out to `git clone`;
 #             only the single-file `…/SKILL.md` form uses the built-in HTTP
 #             client) + curl / python3 / uv (nothing in komo calls any of
@@ -82,7 +82,7 @@ COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /uvx /usr/local/bin/
 
 COPY --from=builder /usr/local/bin/komo /usr/local/bin/komo
 
-# All durable state (config.toml, .env, state.db / kanban.db / memory.db, logs)
+# All durable state (config.toml, .env, komo.db, sessions, skills, logs)
 # lives here — mount a TrueNAS dataset to it so nothing is lost on redeploy.
 ENV KOMO_HOME=/data
 VOLUME ["/data"]

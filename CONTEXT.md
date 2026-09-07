@@ -1,6 +1,6 @@
 # komo
 
-个人 agent 框架：以聊天助理为主形态（渠道 + reminder / cron / briefing / sweeps），同时承接单 turn 内自主完成的编码类任务。本文件只是术语表，不含实现细节。
+个人 agent 框架：以聊天助理为主形态（渠道 + routine / sweeps），同时承接单 turn 内自主完成的编码类任务。本文件只是术语表，不含实现细节。
 
 ## Language
 

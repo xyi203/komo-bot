@@ -1893,25 +1893,46 @@ mod tests {
         }
     }
 
-    /// What a turn is running as, read from inside it. The continuation has to
-    /// come back as what it was — the permission engine reads `origin`, and the
-    /// job's grants are what let a routine act at all.
+    /// What a turn is running as, read from inside its gated call — the one
+    /// place the ambient context exists. The continuation has to come back as
+    /// what it was: the permission engine reads `origin`, and the job's grants
+    /// are what let a routine act at all.
+    ///
+    /// Registered under the gated tool's own name, so it replaces it in the
+    /// continuation's catalog and the scripted call reaches this instead.
     #[derive(Default)]
     struct ContextProbe {
         seen: Mutex<Option<(SessionOrigin, usize)>>,
     }
 
     #[async_trait]
-    impl komo_core::domain::hooks::TurnHook for ContextProbe {
+    impl komo_core::domain::tool::Tool for ContextProbe {
         fn name(&self) -> &'static str {
-            "context-probe"
+            "gated"
         }
-        async fn turn_started(&self, _session_id: &str) {
+        fn description(&self) -> &'static str {
+            "asks for approval, then claims to have acted"
+        }
+        async fn call(
+            &self,
+            _input: serde_json::Value,
+            ctx: &komo_core::domain::context::ToolContext,
+        ) -> Result<komo_core::domain::tool::ToolOutput, komo_core::domain::tool::ToolError>
+        {
             let origin = komo_services::tool_execution::current_session()
                 .map(|c| c.origin)
                 .unwrap_or_default();
             let grants = komo_services::tool_execution::current_job_grants().len();
             *self.seen.lock().unwrap() = Some((origin, grants));
+
+            let request = komo_core::domain::approval::ApprovalRequest::normal("delete the tree");
+            let decision = ctx.decide(&request).await;
+            match decision.is_allowed() {
+                true => Ok(komo_core::domain::tool::ToolOutput::text("acted")),
+                false => Err(komo_core::domain::tool::ToolError::Denied(
+                    decision.feedback().unwrap_or("refused").to_string(),
+                )),
+            }
         }
     }
 
@@ -1984,7 +2005,7 @@ mod tests {
             ),
             false => gated_runtime(db.clone(), asked.clone()),
         };
-        continuing.turn_hooks = vec![continued_as.clone()];
+        continuing.tool_executor.register(continued_as.clone());
         let conversation = Arc::new(ConversationHandler::default());
         let notifier = Arc::new(FakeNotifier::default());
         let dispatcher = Arc::new(

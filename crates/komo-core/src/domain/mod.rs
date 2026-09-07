@@ -10,7 +10,6 @@ pub mod episode;
 pub mod events;
 pub mod gateway;
 pub mod home;
-pub mod hooks;
 pub mod inbox;
 pub mod llm;
 pub mod memory;

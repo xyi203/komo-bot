@@ -42,7 +42,7 @@ const HOST_SOURCE: &str = include_str!("../python/host.py");
 
 /// Bumped when the wire contract changes. The host reports the version it
 /// speaks in its manifest; a mismatch is refused rather than half-understood.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// Ceiling on one request to the host. A plugin doing real work can be slow, so
 /// this is generous — it exists to catch a host that stopped answering, not to
@@ -87,38 +87,12 @@ struct Manifest {
     protocol: u32,
     #[serde(default)]
     tools: Vec<PluginToolDef>,
-    #[serde(default)]
-    hooks: Vec<String>,
 }
 
-/// What a host has loaded: its tools, and which hook points anything registered
-/// for.
-///
-/// The hook list is what lets komo skip the host entirely on a round where no
-/// plugin asked to be consulted — a hook point nobody uses must cost a running
-/// turn nothing.
+/// What a host has loaded.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HostManifest {
     pub tools: Vec<PluginToolDef>,
-    pub hooks: Vec<String>,
-}
-
-impl HostManifest {
-    /// Whether any plugin registered for `point`.
-    pub fn has_hook(&self, point: &str) -> bool {
-        self.hooks.iter().any(|hook| hook == point)
-    }
-}
-
-/// What a hook point decided. Absent fields mean "nothing to say".
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
-pub struct HookOutcome {
-    /// Text to put in front of the model for this round.
-    #[serde(default)]
-    pub inject: Option<String>,
-    /// End the turn with this answer instead of driving another round.
-    #[serde(default)]
-    pub stop: Option<String>,
 }
 
 /// What one `run_code` program produced.
@@ -301,28 +275,7 @@ impl PyHost {
         }
         Ok(HostManifest {
             tools: manifest.tools,
-            hooks: manifest.hooks,
         })
-    }
-
-    /// Run one hook point's registered functions.
-    ///
-    /// `payload` is the point's arguments, passed to each function by keyword.
-    /// Callers are expected to skip this entirely when the manifest lists no
-    /// hook for the point — it sits on a turn's critical path.
-    pub async fn hook(
-        &self,
-        point: &str,
-        payload: serde_json::Value,
-    ) -> Result<HookOutcome, PyHostError> {
-        let value = self
-            .request(
-                "hook",
-                serde_json::json!({ "point": point, "payload": payload }),
-            )
-            .await?;
-        serde_json::from_value(value)
-            .map_err(|error| PyHostError::Plugin(format!("malformed hook outcome: {error}")))
     }
 
     /// Run one plugin tool. The returned string is what the model sees.
@@ -558,26 +511,16 @@ async fn read_loop(
 
         match message.get("method").and_then(serde_json::Value::as_str) {
             Some("manifest/changed") => {
-                let params = message.get("params");
-                let tools = params
+                let tools = message
+                    .get("params")
                     .and_then(|p| p.get("tools"))
                     .cloned()
                     .unwrap_or_default();
-                let hooks = params
-                    .and_then(|p| p.get("hooks"))
-                    .cloned()
-                    .unwrap_or_default();
-                match (
-                    serde_json::from_value::<Vec<PluginToolDef>>(tools),
-                    serde_json::from_value::<Vec<String>>(hooks),
-                ) {
-                    (Ok(tools), Ok(hooks)) => {
-                        let _ =
-                            events.send(HostEvent::ManifestChanged(HostManifest { tools, hooks }));
+                match serde_json::from_value::<Vec<PluginToolDef>>(tools) {
+                    Ok(tools) => {
+                        let _ = events.send(HostEvent::ManifestChanged(HostManifest { tools }));
                     }
-                    (Err(error), _) | (_, Err(error)) => {
-                        warn!(%error, "malformed manifest from the plugin host")
-                    }
+                    Err(error) => warn!(%error, "malformed manifest from the plugin host"),
                 }
             }
             Some("log") => {
@@ -892,153 +835,6 @@ def chatty() -> str:
         );
         // Still healthy after all that noise.
         assert_eq!(host.manifest().await.unwrap().tools.len(), 1);
-        host.shutdown().await;
-    }
-
-    // ── Hooks ────────────────────────────────────────────────────────────────
-
-    /// A plugin's `pre_step` hook injects text, and the manifest advertises the
-    /// point so komo knows a round is worth asking about at all.
-    #[tokio::test]
-    async fn a_pre_step_hook_is_advertised_and_injects() {
-        let Some(python) = python() else { return };
-        let scratch = Scratch::new("hook-inject");
-        scratch.write(
-            "guard.py",
-            r#"
-from komo_plugin import hook
-
-@hook("pre_step")
-def remind(session_id, round):
-    if round >= 2:
-        return f"round {round}: wrap up"
-"#,
-        );
-
-        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
-            .await
-            .unwrap();
-        let manifest = host.manifest().await.unwrap();
-        assert!(manifest.has_hook("pre_step"));
-        assert!(manifest.tools.is_empty(), "a hook is not a tool");
-
-        // Round 1: the hook returned nothing, so nothing is injected.
-        let quiet = host
-            .hook(
-                "pre_step",
-                serde_json::json!({ "session_id": "s", "round": 1 }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(quiet, HookOutcome::default());
-
-        let loud = host
-            .hook(
-                "pre_step",
-                serde_json::json!({ "session_id": "s", "round": 2 }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(loud.inject.as_deref(), Some("round 2: wrap up"));
-        assert!(loud.stop.is_none());
-
-        host.shutdown().await;
-    }
-
-    /// `stop(...)` ends the turn, and the hooks after it do not run.
-    #[tokio::test]
-    async fn a_hook_can_stop_the_turn_and_short_circuits_the_rest() {
-        let Some(python) = python() else { return };
-        let scratch = Scratch::new("hook-stop");
-        scratch.write(
-            "guard.py",
-            r#"
-from komo_plugin import hook, stop
-
-@hook("pre_step")
-def halt(session_id, round):
-    return stop("that is enough")
-
-@hook("pre_step")
-def never(session_id, round):
-    return "this must not be delivered"
-"#,
-        );
-
-        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
-            .await
-            .unwrap();
-        host.manifest().await.unwrap();
-
-        let outcome = host
-            .hook(
-                "pre_step",
-                serde_json::json!({ "session_id": "s", "round": 1 }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(outcome.stop.as_deref(), Some("that is enough"));
-        assert!(outcome.inject.is_none());
-
-        host.shutdown().await;
-    }
-
-    /// A hook runs on every round of every turn, so a broken one must cost its
-    /// own effect and nothing else — not the round, and not the hooks beside it.
-    #[tokio::test]
-    async fn a_raising_hook_is_skipped_and_the_others_still_run() {
-        let Some(python) = python() else { return };
-        let scratch = Scratch::new("hook-raise");
-        scratch.write(
-            "guard.py",
-            r#"
-from komo_plugin import hook
-
-@hook("pre_step")
-def broken(session_id, round):
-    raise ValueError("kaboom")
-
-@hook("pre_step")
-def wrong_type(session_id, round):
-    return 42
-
-@hook("pre_step")
-def fine(session_id, round):
-    return "still here"
-"#,
-        );
-
-        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
-            .await
-            .unwrap();
-        host.manifest().await.unwrap();
-
-        let outcome = host
-            .hook(
-                "pre_step",
-                serde_json::json!({ "session_id": "s", "round": 1 }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(outcome.inject.as_deref(), Some("still here"));
-
-        host.shutdown().await;
-    }
-
-    /// A host with no hooks says so, which is what lets komo skip the RPC.
-    #[tokio::test]
-    async fn a_host_without_hooks_advertises_none() {
-        let Some(python) = python() else { return };
-        let scratch = Scratch::new("hook-none");
-        scratch.write("greeter.py", GREETER);
-
-        let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
-            .await
-            .unwrap();
-        let manifest = host.manifest().await.unwrap();
-        assert!(!manifest.has_hook("pre_step"));
-        assert_eq!(manifest.tools.len(), 1);
-
         host.shutdown().await;
     }
 

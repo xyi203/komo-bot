@@ -79,6 +79,8 @@ pub struct KomoEnv {
     pub dream_schedule: Option<String>,
     /// `KOMO_DREAM_SCHEDULE_ENABLED=false` — same kill switch for dreaming.
     pub dream_schedule_enabled: Option<bool>,
+    /// `KOMO_PYHOST_ENABLED=false` — same for the python plugin host.
+    pub pyhost_enabled: Option<bool>,
     pub max_turns: Option<usize>,
     pub max_tool_result_bytes: Option<usize>,
     pub max_turn_result_bytes: Option<usize>,
@@ -157,6 +159,7 @@ impl KomoEnv {
             schedule,
             dream_schedule,
             dream_schedule_enabled,
+            pyhost_enabled,
             max_turns,
             max_tool_result_bytes,
             max_turn_result_bytes,
@@ -263,6 +266,10 @@ pub struct FileConfig {
     /// Master switch for dreaming, independent of its cron. `false` disables it
     /// while `dream_schedule` keeps its value. Default true.
     pub dream_schedule_enabled: Option<bool>,
+    /// Master switch for the python plugin host — `$KOMO_HOME/plugins/*.py` as
+    /// tools, and `run_code`, which rides the same host. Default true; `false`
+    /// starts no interpreter (and silences the missing-python3 warning).
+    pub pyhost_enabled: Option<bool>,
     /// Maximum tool-calling round-trips per user turn (default: 30).
     pub max_turns: Option<usize>,
     /// Byte cap on a tool result handed back to the LLM, a global backstop
@@ -308,20 +315,6 @@ pub struct FileConfig {
     pub mcp: Option<McpFileConfig>,
     /// Note-vault search (`[wiki]`).
     pub wiki: Option<WikiFileConfig>,
-    /// Uniform per-plugin kill switches (`[plugins.<name>] enabled = false`).
-    /// A plugin's own feature config (channel tables, schedules, `[wiki]`, …)
-    /// stays where it is; this is the one overlay that can silence any plugin
-    /// with the same spelling regardless of what it contributes.
-    pub plugins: Option<std::collections::BTreeMap<String, PluginFileConfig>>,
-}
-
-/// One `[plugins.<name>]` table.
-#[derive(Debug, Deserialize, Default)]
-#[serde(default)]
-pub struct PluginFileConfig {
-    /// `false` disables the plugin everywhere (tools, channel, sweeps).
-    /// Default true.
-    pub enabled: Option<bool>,
 }
 
 /// `[mcp]` namespace: external Model Context Protocol servers.

@@ -30,6 +30,15 @@ provider = "deepseek"
 # dream_schedule = "0 3 * * *"   # set to "off" to disable
 # dream_schedule_enabled = false     # kill switch, keeps the cron above
 
+# --- python plugins ----------------------------------------------------------
+
+# On by default: the gateway creates $KOMO_HOME/plugins/ at startup (so
+# ~/.komo/plugins unless KOMO_HOME moved it — `komo doctor` prints the real
+# path) and runs an out-of-process python3 host. Every *.py there with an @tool decorator becomes
+# a py__<name> tool (hot-reloaded on save), and run_code lets the agent write
+# programs that call its own tools. Requires python3 on PATH.
+# pyhost_enabled = false          # opt out (also silences the python3 warning)
+
 # --- memory ------------------------------------------------------------------
 
 # Embeddings for memory recall. Leaving this unset is not a small loss and it
@@ -54,16 +63,6 @@ provider = "deepseek"
 # The index lives in komo.db; build it with `komo wiki index`.
 # [wiki]
 # vault = "~/notes"
-
-# --- python plugins ----------------------------------------------------------
-
-# On by default: the gateway creates $KOMO_HOME/plugins/ at startup (so
-# ~/.komo/plugins unless KOMO_HOME moved it — `komo doctor` prints the real
-# path) and runs an out-of-process python3 host. Every *.py there with an @tool decorator becomes
-# a py__<name> tool (hot-reloaded on save), and run_code lets the agent write
-# programs that call its own tools. Requires python3 on PATH.
-# [plugins.pyhost]
-# enabled = false                # opt out (also silences the python3 warning)
 
 # --- ingress channels (each needs its credential in .env) -------------------
 

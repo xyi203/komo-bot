@@ -1,7 +1,7 @@
 mod cli;
 mod domain;
 mod infra;
-mod plugins;
+mod pyhost;
 mod services;
 mod tui;
 

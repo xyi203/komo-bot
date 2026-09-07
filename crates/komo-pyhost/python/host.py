@@ -28,7 +28,7 @@ from pathlib import Path
 
 import komo_plugin
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 
 # How often to re-stat the plugin directory. A plugin appearing is the agent
 # having just written a file, so this wants to be quick; stat-ing a handful of
@@ -242,10 +242,7 @@ def watch(plugins: Plugins):
             if not plugins.changed():
                 continue
             tools = plugins.load()
-            send({
-                "method": "manifest/changed",
-                "params": {"tools": tools, "hooks": komo_plugin.registered_hooks()},
-            })
+            send({"method": "manifest/changed", "params": {"tools": tools}})
         except Exception:
             log("warn", f"plugin reload failed:\n{traceback.format_exc()}")
 
@@ -304,26 +301,13 @@ def handle(request, plugins: Plugins):
     params = request.get("params") or {}
 
     if method == "manifest":
-        tools = plugins.load()
-        # The hook points anything registered for. komo skips calling a host
-        # that lists none, so a deployment with no hooks pays nothing per round.
-        return {
-            "protocol": PROTOCOL_VERSION,
-            "tools": tools,
-            "hooks": komo_plugin.registered_hooks(),
-        }
+        return {"protocol": PROTOCOL_VERSION, "tools": plugins.load()}
 
     if method == "call":
         name = params.get("name", "")
         args = params.get("args") or {}
         with stdout_to_stderr():
             return {"content": komo_plugin.call(name, args)}
-
-    if method == "hook":
-        point = params.get("point", "")
-        payload = params.get("payload") or {}
-        with stdout_to_stderr():
-            return komo_plugin.run_hook(point, payload, lambda text: log("warn", text))
 
     if method == "run_code":
         return run_program(params.get("source", ""), request.get("id"))

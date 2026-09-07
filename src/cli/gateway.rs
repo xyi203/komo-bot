@@ -1,7 +1,8 @@
-use komo_bot::daemon::{RoutineEventSource, Schedule, WakeupWiring};
-use komo_bot::gateway::Gateway;
+use komo_bot::daemon::{DreamSweep, ReviewSweep, RoutineEventSource, Schedule, WakeupWiring};
+use komo_bot::gateway::{Channel, Gateway, MaintenanceService};
 use komo_bot::interaction::{ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker, WaitParts};
 use komo_infra::persistence::db::Db;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::{
@@ -20,8 +21,13 @@ use crate::{
         todo::SessionTodoRepository,
         wakeup::{WakeupDispatch, WakeupRepository},
     },
-    infra::messaging::{api::ApiChannel, home_notifier::HomeNotifier},
-    plugins::{self, ChannelCx, ChannelRegistry, SweepCx, SweepRegistry},
+    infra::messaging::{
+        api::ApiChannel,
+        feishu::{FeishuChannel, FeishuSender},
+        home_notifier::{HomeNotifier, TextSender},
+        telegram::{TelegramChannel, TelegramSender},
+        wechat::{WeChatChannel, WeChatQrLogin, WeChatSender, build_bot},
+    },
     services::operator_control::actions::OperatorActions,
 };
 use komo_config::{ConfigSnapshot, IssueSeverity};
@@ -30,10 +36,10 @@ use komo_config::{ConfigSnapshot, IssueSeverity};
 /// scheduler and the config-declared ingress channels. Runs until Ctrl-C.
 /// Everything is read from the caller's one resolved `config` snapshot.
 ///
-/// Channels and sweeps come from the plugin roster (`crate::plugins`, phases
-/// 2 and 3); the host keeps what plugins depend on or what must never be
-/// disableable — storage, the dispatcher, the home notifier, and the api
-/// channel (the CLI's only path to a running gateway).
+/// A channel mounts iff its `[channels.<name>]` table is enabled and
+/// credentialed; `validate_gateway` has already made an enabled-but-
+/// misconfigured one fatal, so a `ready()` miss here means "not configured".
+/// Declaration order is the `home_chat` fallback priority (feishu first).
 pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // The gateway hosts every surface, so any fatal config issue (unusable
     // model, enabled-but-credential-less channel) stops startup here, before
@@ -101,28 +107,84 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         n => tracing::info!(removed = n, "expired stored tool outputs"),
     }
 
-    let roster = plugins::builtin();
-    let gate = plugins::PluginGate::new(config, &roster);
-
-    // ── Plugin phase 2: ingress channels ─────────────────────────────────────
+    // ── Ingress channels ─────────────────────────────────────────────────────
     // Senders outside `allow_from` go through the pairing handshake; the
     // pairing store is shared with the `komo pair` CLI via the same db.
     let pairings: Arc<dyn PairingRepository> = db.clone();
-    let mut channel_reg = ChannelRegistry::default();
-    let channel_cx = ChannelCx {
-        config,
-        pairings: pairings.clone(),
-    };
-    plugins::run_channel_phase(&roster, &gate, &mut channel_reg, &channel_cx).await?;
+    let mut chat_channels: Vec<Box<dyn Channel>> = Vec::new();
+    let mut channel_names: Vec<String> = Vec::new();
+    let mut senders: HashMap<String, Arc<dyn TextSender>> = HashMap::new();
+    // `home_chat` candidates in declaration order — first wins.
+    let mut home_candidates: Vec<String> = Vec::new();
+    let mut wechat_login: Option<Arc<dyn crate::domain::gateway::WeChatLogin>> = None;
+
+    if let Some(cfg) = rt.feishu.ready() {
+        let sender = Arc::new(FeishuSender::new(
+            cfg.app_id.clone(),
+            cfg.app_secret.clone(),
+        ));
+        senders.insert("feishu".to_string(), sender.clone());
+        if let Some(chat) = &cfg.home_chat {
+            home_candidates.push(format!("feishu:{chat}"));
+        }
+        channel_names.push("feishu".to_string());
+        chat_channels.push(Box::new(FeishuChannel::new(sender, cfg, pairings.clone())));
+    }
+    if let Some(cfg) = rt.telegram.ready() {
+        let sender = Arc::new(TelegramSender::new(cfg.bot_token.clone()));
+        senders.insert("telegram".to_string(), sender.clone());
+        if let Some(chat) = &cfg.home_chat {
+            home_candidates.push(format!("telegram:{chat}"));
+        }
+        channel_names.push("telegram".to_string());
+        chat_channels.push(Box::new(TelegramChannel::new(
+            sender,
+            cfg,
+            pairings.clone(),
+        )));
+    }
+    if let Some(cfg) = rt.wechat.ready() {
+        let cred_path = komo_config::wechat_cred_path();
+        // One bot instance shared between the sender and the channel so the
+        // channel's poll loop populates the context-token map the sender reads.
+        let bot = build_bot(&cred_path);
+        senders.insert(
+            "wechat".to_string(),
+            Arc::new(WeChatSender::new(bot.clone())),
+        );
+        if let Some(chat) = &cfg.home_chat {
+            home_candidates.push(format!("wechat:{chat}"));
+        }
+        // Shared between the login coordinator (`/wechat login`) and the
+        // channel: a successful login pulses this so the channel starts polling
+        // without a restart.
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let provisioning = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        wechat_login = Some(Arc::new(WeChatQrLogin::new(
+            cred_path.clone(),
+            ready.clone(),
+            bot.clone(),
+            provisioning.clone(),
+        )));
+        channel_names.push("wechat".to_string());
+        chat_channels.push(Box::new(WeChatChannel::new(
+            bot,
+            cfg,
+            cred_path,
+            ready,
+            provisioning,
+            pairings.clone(),
+        )));
+    }
 
     // A single home notifier delivers all proactive output (routines, task
     // due notices, the shutdown notice). It resolves the home chat at
     // notify-time — a `/sethome` override (db) wins over the config `home_chat`
     // (plugin order preserves the feishu-first priority).
-    let config_home = channel_reg.config_home();
+    let config_home = home_candidates.first().cloned();
     let home_repo: Arc<dyn HomeRepository> = db.clone();
     let notifier: Arc<dyn Notifier> = Arc::new(HomeNotifier::new(
-        channel_reg.senders(),
+        senders,
         home_repo.clone(),
         config_home.clone(),
     ));
@@ -140,7 +202,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             sessions,
             home_repo,
             todos,
-            channel_reg.wechat_login.clone(),
+            wechat_login,
             db.clone(),
             db.clone(),
         )
@@ -192,28 +254,46 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         n => tracing::info!(count = n, "re-delivered inbound messages lost to a restart"),
     }
 
-    // ── Plugin phase 3: scheduled sweeps ─────────────────────────────────────
-    let mut sweep_reg = SweepRegistry::default();
-    let sweep_cx = SweepCx {
-        notifier: notifier.clone(),
-        review: wired.review.clone(),
-        memories: wired.memories.clone(),
-        maintenance_schedule: review_schedule,
-        dream_schedule,
-        routines: routines.clone(),
-    };
-    plugins::run_sweep_phase(&roster, &gate, &mut sweep_reg, &sweep_cx).await?;
-
-    let mut gateway = Gateway::new(dispatcher.clone());
-    for service in sweep_reg.into_sweeps() {
-        gateway = gateway.with_maintenance(service);
+    // ── Scheduled sweeps ─────────────────────────────────────────────────────
+    let mut gateway = Gateway::new(dispatcher.clone())
+        .with_maintenance(MaintenanceService {
+            name: "review".to_string(),
+            schedule: review_schedule,
+            maintenance: Arc::new(ReviewSweep {
+                review: wired.review.clone(),
+            }),
+            alert: Some(notifier.clone()),
+        })
+        // Routines (`komo cron add`): one every-minute sweep reads the store
+        // and executes the ones whose slot has come, so jobs added, removed or
+        // toggled while the gateway runs take effect on the next tick — no
+        // restart. The same tick fires the standing wakeups, through the
+        // `RoutineEventSource` above.
+        .with_maintenance(MaintenanceService {
+            name: "cron-jobs".to_string(),
+            schedule: Schedule::parse("* * * * *")?,
+            maintenance: Arc::new(routines.sweep()),
+            alert: Some(notifier.clone()),
+        });
+    // Dreaming — mounted only when `dream_schedule` is in effect. Reads the
+    // whole memory library, promotes well-supported candidates, and archives
+    // cold and refuted ones.
+    if let Some(schedule) = dream_schedule {
+        gateway = gateway.with_maintenance(MaintenanceService {
+            name: "dreaming".to_string(),
+            schedule,
+            maintenance: Arc::new(DreamSweep {
+                memories: wired.memories.clone(),
+            }),
+            alert: Some(notifier.clone()),
+        });
     }
 
     // Whether an interactive chat channel exists — gates the shutdown notice.
-    // Only chat channels register in phase 2; the api channel below is not one.
-    let mut channels = channel_reg.names();
-    let has_chat_channel = !channel_reg.is_empty();
-    for channel in channel_reg.into_channels() {
+    // The api channel below is not one.
+    let mut channels = channel_names;
+    let has_chat_channel = !chat_channels.is_empty();
+    for channel in chat_channels {
         gateway = gateway.add_channel(channel);
     }
 
@@ -222,10 +302,10 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
 
     // HTTP API channel: serves the local dashboard UI and any OpenAI-compatible
     // client. It calls the handler directly (synchronous request/response), so
-    // it needs the repositories rather than just the dispatcher. Host-mounted,
-    // never a plugin: it is how the local `komo` CLI reaches this gateway while
-    // we hold the exclusive Turso db lock, so no `[plugins]` toggle may remove
-    // it. By default it is loopback-only on an ephemeral port (published in the
+    // it needs the repositories rather than just the dispatcher. Always on: it
+    // is how the local `komo` CLI reaches this gateway while we hold the
+    // exclusive Turso db lock, so nothing may switch it off.
+    // By default it is loopback-only on an ephemeral port (published in the
     // rendezvous file); `[channels.api] enabled = true` widens it to an external
     // bind/port for Open WebUI / the dashboard.
     let api = rt

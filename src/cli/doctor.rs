@@ -173,7 +173,7 @@ fn plugin_health(config: &ConfigSnapshot, health: Option<&serde_json::Value>) {
         // predates default-on, or python3 is missing (the gateway log says
         // which).
         Some(false) => println!(
-            "  {BAD} python host not wired — [plugins.pyhost] disabled, python3 missing, \
+            "  {BAD} python host not wired — `pyhost_enabled = false`, python3 missing, \
              or a pre-default-on gateway; `komo logs` says which, `komo gateway restart` \
              picks up changes"
         ),

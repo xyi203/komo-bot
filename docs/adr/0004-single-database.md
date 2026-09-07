@@ -84,7 +84,7 @@ state.db 也导——它虽被文档标为 disposable，但 pairing 与 reminder
 一个库。`wiring::build` 从五个参数收到三个，`DirectOperatorAdapter` 从四个
 `OnceCell` 收到一个（懒开一次仍然保留：`komo doctor` 只打印配置就不该建库）。
 
-迁移在 `Db::connect` 里，只在 `komo.db` 是新建时跑：逐个读 `kanban.db` /
+迁移在 `Db::connect` 里，只在 `komo.db` 是新建时跑：逐个读 `state.db` / `kanban.db` /
 `cron.db` / `memory.db`，写入后把旧文件（连 `-log`/`-wal`/`.turso` 等旁挂文件）
 改名成 `<name>.merged-backup`。顺序是「先读、再写、最后改名」，中途崩溃就是旧文件
 还在、下次重来；每行自带 id，重来是覆盖而不是翻倍。**读不出来的旧文件是致命错误
@@ -92,6 +92,14 @@ state.db 也导——它虽被文档标为 disposable，但 pairing 与 reminder
 任务才发现的故障。旧文件先各自做自己的 schema 修补再读（pre-status 的
 `cron.db` 还带着 `enabled` 列，pre-Turso 的 `memory.db` 得走 SQLite 驱动），
 所以「komo 发布过的每一种文件形状都还能读」这条测试跟着搬到了合库路径上。
+
+`state.db` 导的是重建不出来的那几张：`session_records`（转录本身是
+`sessions/` 下的文件，跟着 `KOMO_HOME` 走，不需要导）、`setting_records`
+（home 会话 id、`/sethome` 覆盖、briefing 水位）、`pairing_records`。**run 账本
+不导**：它的行是 session 日志的投影，而唯一的写入口 `write_projection` 收的是一份
+fold（`ProjectedRun` 还要 `start_seq` 和每步的 `settled`），旧行里没有这些字段，
+硬造等于反推投影；账本按设计是可弃的，真要找回就 `rebuild_projections` 重折一遍日志。
+提醒行也不导（reminder 正在移除），inbox / todo / wakeup 是瞬态。
 
 耐久性规则改写为表级，写在 AGENTS.md 的存储表里：`memory_records` 只能加性变更，
 `task_records` / `cron_job_records` 同样持久；session 元数据、run 账本、inbox、todo

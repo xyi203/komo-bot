@@ -86,6 +86,30 @@ struct SessionRecord {
     awaiting: String,
 }
 
+/// Columns added to `session_records` after a file was created. Read by
+/// `connect` for the live `komo.db` and by the one-time merge for a legacy
+/// `state.db`, which may predate any of them.
+const SESSION_COLUMNS: &[(&str, &str)] = &[
+    ("title", "\"title\" text NOT NULL DEFAULT ''"),
+    ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
+    (
+        "workspace",
+        "\"workspace\" text NOT NULL DEFAULT '__default__'",
+    ),
+    ("model", "\"model\" text NOT NULL DEFAULT ''"),
+    ("effort", "\"effort\" text NOT NULL DEFAULT ''"),
+    (
+        "channel_platform",
+        "\"channel_platform\" text NOT NULL DEFAULT ''",
+    ),
+    (
+        "channel_peer_id",
+        "\"channel_peer_id\" text NOT NULL DEFAULT ''",
+    ),
+    ("origin", "\"origin\" text NOT NULL DEFAULT 'user'"),
+    ("awaiting", "\"awaiting\" text NOT NULL DEFAULT ''"),
+];
+
 #[derive(Debug, toasty::Model)]
 struct SkillRecord {
     #[key]
@@ -387,26 +411,6 @@ impl Db {
         // extend this list (NOT NULL with a DEFAULT, or nullable) — a new
         // *table* still needs the delete-to-reset.
         if !is_new && let Some(p) = &path {
-            const SESSION_COLUMNS: &[(&str, &str)] = &[
-                ("title", "\"title\" text NOT NULL DEFAULT ''"),
-                ("status", "\"status\" text NOT NULL DEFAULT 'active'"),
-                (
-                    "workspace",
-                    "\"workspace\" text NOT NULL DEFAULT '__default__'",
-                ),
-                ("model", "\"model\" text NOT NULL DEFAULT ''"),
-                ("effort", "\"effort\" text NOT NULL DEFAULT ''"),
-                (
-                    "channel_platform",
-                    "\"channel_platform\" text NOT NULL DEFAULT ''",
-                ),
-                (
-                    "channel_peer_id",
-                    "\"channel_peer_id\" text NOT NULL DEFAULT ''",
-                ),
-                ("origin", "\"origin\" text NOT NULL DEFAULT 'user'"),
-                ("awaiting", "\"awaiting\" text NOT NULL DEFAULT ''"),
-            ];
             ensure_columns(p, "session_records", SESSION_COLUMNS).await?;
             // Columns this komo no longer models. `reviewed_through` was the
             // review sweep's per-session watermark until the watermark moved to
@@ -529,8 +533,8 @@ impl Db {
         Ok(this)
     }
 
-    /// Import `kanban.db`, `cron.db` and `memory.db` from beside `path`, then
-    /// rename each to `<name>.merged-backup`.
+    /// Import `state.db`, `kanban.db`, `cron.db` and `memory.db` from beside
+    /// `path`, then rename each to `<name>.merged-backup`.
     ///
     /// Durable data, so the order is: read the old file, write every row, and
     /// only then rename it. A crash anywhere leaves the old file where it is
@@ -540,6 +544,17 @@ impl Db {
     /// A file that cannot be read is **fatal**, not skipped: starting up with
     /// an empty task board while `kanban.db` sits there unread is the failure
     /// nobody would notice until they went looking for a task.
+    ///
+    /// From `state.db` come the rows nothing can reconstruct: session metadata,
+    /// the settings (home session, `/sethome` override, briefing watermark) and
+    /// pairings. The run ledger stays behind — its rows are a projection of the
+    /// session logs, which are files and were never in any of these databases,
+    /// and the only write path into them takes a fold of a log rather than a
+    /// stored row, so re-creating one from a legacy row would mean inventing
+    /// the `start_seq` and per-step `settled` the fold carries and the row does
+    /// not. [`Db::rebuild_projections`] is how an operator gets it back.
+    /// Inbox, todo and wakeup rows are transient and stay behind with it, as do
+    /// reminders, which are being retired.
     async fn merge_legacy_databases(&self, path: &Path) -> anyhow::Result<()> {
         let dir = path.parent().unwrap_or(Path::new("."));
         // Never the file being opened: a `db_url` pointing at one of these
@@ -549,6 +564,26 @@ impl Db {
             let candidate = dir.join(name);
             (candidate != path && candidate.is_file()).then_some(candidate)
         };
+
+        if let Some(state) = legacy("state.db") {
+            let (sessions, pairings, settings) = import_state_from(&state).await?;
+            for session in &sessions {
+                SessionRepository::save(self, session).await?;
+            }
+            for request in &pairings {
+                PairingRepository::upsert(self, request).await?;
+            }
+            for (key, value) in &settings {
+                self.setting_set(key, value).await?;
+            }
+            retire_merged(&state)?;
+            info!(
+                sessions = sessions.len(),
+                pairings = pairings.len(),
+                settings = settings.len(),
+                "merged state.db into komo.db"
+            );
+        }
 
         if let Some(tasks) = legacy("kanban.db") {
             let rows = super::kanban::import_from(&tasks).await?;
@@ -578,6 +613,48 @@ impl Db {
         }
         Ok(())
     }
+}
+
+/// The sessions, pairings and settings of a legacy `state.db`, for the
+/// one-time merge into `komo.db`.
+///
+/// Read through the same models the live store uses, after the old file gets
+/// the same column upkeep `connect` gives `komo.db` — a `state.db` written
+/// before any of those columns existed cannot be opened with this model. A
+/// pre-Turso file is opened with the SQLite driver, as `kanban.db` and
+/// `memory.db` are. Transcripts need nothing: they are files beside the db.
+async fn import_state_from(
+    path: &Path,
+) -> anyhow::Result<(Vec<Session>, Vec<PairingRequest>, Vec<(String, String)>)> {
+    use anyhow::Context;
+
+    ensure_columns(path, "session_records", SESSION_COLUMNS)
+        .await
+        .ok();
+    let url = match turso_marker_path(path).exists() {
+        true => format!("turso:{}", path.display()),
+        false => format!("sqlite:{}", path.display()),
+    };
+    let db = toasty::Db::builder()
+        .models(toasty::models!(SessionRecord, PairingRecord, SettingRecord))
+        .connect(&url)
+        .await
+        .with_context(|| format!("opening {} to merge it in", path.display()))?;
+    let mut conn = db.connection().await?;
+    let sessions = toasty::query!(SessionRecord).exec(&mut conn).await?;
+    let pairings = toasty::query!(PairingRecord).exec(&mut conn).await?;
+    let settings = toasty::query!(SettingRecord).exec(&mut conn).await?;
+    Ok((
+        sessions
+            .into_iter()
+            .map(|record| session_from_record(record, Vec::new()))
+            .collect(),
+        pairings.into_iter().map(pairing_from_record).collect(),
+        settings
+            .into_iter()
+            .map(|record| (record.id, record.value))
+            .collect(),
+    ))
 }
 
 /// Rename a merged file (and the sidecars that belong to it) aside. Kept rather
@@ -3547,6 +3624,71 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(TaskRepository::list_open(&again).await.unwrap().len(), 1);
+    }
+
+    /// The fourth file of that migration: `state.db` carries the rows nothing
+    /// can reconstruct — the session list, the settings the home conversation
+    /// is named in, and the pairings.
+    #[tokio::test]
+    async fn state_db_merges_into_komo_db() {
+        use komo_core::domain::pairing::PairingRequest;
+
+        let home = std::env::temp_dir().join("komo-merge-state");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).expect("test home");
+
+        // Seeded in a directory of its own, so `state.db` is not the file the
+        // store is opening when the rows go in.
+        let seed_dir = home.join("seed-state");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        let seeded = Db::connect(&format!("turso:{}", seed_dir.join("state.db").display()))
+            .await
+            .unwrap();
+        SessionRepository::save(
+            &seeded,
+            &Session::new("11111111-1111-7111-8111-111111111111"),
+        )
+        .await
+        .unwrap();
+        let (request, _code) = PairingRequest::mint("telegram", "42", "xiangyi");
+        PairingRepository::upsert(&seeded, &request).await.unwrap();
+        let minted = HomeRepository::home_session(&seeded).await.unwrap();
+        drop(seeded);
+        for suffix in ["", "-log", "-wal", "-shm", ".turso"] {
+            let from = seed_dir.join(format!("state.db{suffix}"));
+            if from.exists() {
+                std::fs::rename(from, home.join(format!("state.db{suffix}"))).unwrap();
+            }
+        }
+
+        let db = Db::connect(&format!("turso:{}", home.join("komo.db").display()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SessionRepository::list(&db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>(),
+            vec!["11111111-1111-7111-8111-111111111111".to_string()]
+        );
+        assert!(
+            PairingRepository::find(&db, "telegram", "42")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        // The home conversation is the same one, not a freshly minted id: that
+        // settings row is what makes the operator's private history continuous.
+        assert_eq!(HomeRepository::home_session(&db).await.unwrap(), minted);
+
+        assert!(!home.join("state.db").exists(), "state.db must be renamed");
+        assert!(
+            home.join("state.db.merged-backup").exists(),
+            "state.db must be kept as a backup"
+        );
     }
 
     // ── run projection ───────────────────────────────────────────────────────

@@ -22,7 +22,6 @@
 use komo_services::tool_execution::{
     SessionContext, SessionOrigin, current_session, with_job_grants, with_session,
 };
-use komo_services::triggers::TriggerMatcher;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
@@ -692,10 +691,6 @@ pub struct GatewayDispatcher {
     pairings: Arc<dyn PairingRepository>,
     /// Durable dedupe for redelivered platform messages (`domain/inbox.rs`).
     inbox: Arc<dyn InboxRepository>,
-    /// Standing wakes an inbound message can fire — a turn waiting on the
-    /// person who just wrote (docs/bot-runtime.md §3.7). `None` = nothing
-    /// listens, which is what the test fixtures and the local TUI have.
-    triggers: Option<Arc<TriggerMatcher>>,
     /// Per-session turn state. A session key is present iff a turn is in flight;
     /// its queue holds up to [`QUEUE_CAP`] messages that arrived mid-turn, drained
     /// FIFO as each turn finishes (so a quick follow-up is answered, not dropped).
@@ -868,7 +863,6 @@ impl GatewayDispatcher {
             pairings,
             inbox,
             waits: None,
-            triggers: None,
             inflight: Mutex::new(HashMap::new()),
             idle: Notify::new(),
         }
@@ -980,12 +974,6 @@ impl GatewayDispatcher {
     /// dispatcher without it simply reports nothing to answer.
     pub fn with_waits(mut self, waits: WaitParts) -> Self {
         self.waits = Some(waits);
-        self
-    }
-
-    /// Let inbound messages fire the standing wakes they match.
-    pub fn with_triggers(mut self, triggers: Arc<TriggerMatcher>) -> Self {
-        self.triggers = Some(triggers);
         self
     }
 
@@ -1619,14 +1607,6 @@ impl GatewayDispatcher {
                 warn!(%error, "inbox claim failed; handling the message anyway");
             }
         }
-        // What just arrived may be the reply a standing wait has been waiting
-        // for. Before the message is routed, and never *instead* of routing it:
-        // the person is talking to komo on their own conversation, and a wake
-        // is a second turn elsewhere, not a redirection of this one
-        // (docs/bot-runtime.md §6).
-        if let Some(triggers) = &self.triggers {
-            triggers.on_inbound(&from.peer, &text).await;
-        }
         self.dispatch(session_id, from, text, sink, Some(origin))
             .await;
     }
@@ -2170,18 +2150,6 @@ impl GatewayDispatcher {
                 );
                 self.complete_recovered(&row.origin).await;
                 continue;
-            }
-            // The wake `handle` fires before it routes — a wait standing on
-            // this correspondent (docs/bot-runtime.md §3.7) is still standing,
-            // and the crash swallowed the reply it was watching for. Firing it
-            // here cannot double up: `TriggerMatcher` claims every hit with
-            // `take`, which answers `false` once the registration is gone, so a
-            // wake that did fire before the crash wakes nothing now. A peerless
-            // legacy row is skipped — there is no address to match against.
-            if let Some(triggers) = &self.triggers
-                && !row.peer.peer.is_empty()
-            {
-                triggers.on_inbound(&row.peer.peer, &row.text).await;
             }
             // Nothing here addresses an arbitrary correspondent: the gateway's
             // one outbound path (`HomeNotifier`) writes to the *home* chat, and
@@ -4161,47 +4129,6 @@ mod tests {
         assert_eq!(dispatcher.recover_inbox(50).await, 0);
     }
 
-    /// Recovery takes the whole path `handle` takes, standing wakes included:
-    /// the message a wait was standing for still fires it — once, because the
-    /// registration is claimed before it fires.
-    #[tokio::test]
-    async fn a_recovered_message_fires_the_wake_the_crash_swallowed() {
-        let db = test_db("komo-inbox-wake").await;
-        WakeupRepository::save(db.as_ref(), &from_peer_wake("s-task", "ou_y"))
-            .await
-            .unwrap();
-
-        let origin = InboundOrigin::new("feishu", "93");
-        let inbox = DedupingInbox::left_claimed(UnfinishedInbound {
-            origin: origin.clone(),
-            session_id: "s-chat".to_string(),
-            text: "回复你了".to_string(),
-            peer: group("ou_y"),
-            claimed_at: 100,
-        });
-        let handler = Arc::new(RecordingTurns::default());
-        let dispatcher = triggering_dispatcher(&db, handler.clone(), inbox.clone());
-
-        assert_eq!(dispatcher.recover_inbox(50).await, 1);
-        settle(|| handler.turns.lock().unwrap().len() >= 2).await;
-        let turns = handler.turns.lock().unwrap().clone();
-        assert!(
-            turns.iter().any(|(session, _)| session == "s-task"),
-            "the waiting session was woken: {turns:?}"
-        );
-        assert!(
-            turns.iter().any(|(session, _)| session == "s-chat"),
-            "and the message still ran its own turn: {turns:?}"
-        );
-        assert!(
-            WakeupRepository::list(db.as_ref())
-                .await
-                .unwrap()
-                .is_empty(),
-            "the wake was claimed, so nothing fires it twice"
-        );
-    }
-
     /// A message waiting behind a busy session has not been answered yet, so
     /// its row stays `claimed` — a crash while it waits re-delivers it.
     #[tokio::test]
@@ -4468,227 +4395,5 @@ mod tests {
             .await;
         permits.add_permits(1);
         assert_eq!(next_entered(&mut entered_rx).await, "after");
-    }
-
-    // --- inbound message ↔ standing wake (docs/bot-runtime.md §3.7) ---------
-
-    /// Records every turn it was asked to run, with the session it ran on.
-    #[derive(Default)]
-    struct RecordingTurns {
-        turns: Mutex<Vec<(String, String)>>,
-        resumed: Mutex<Vec<String>>,
-    }
-
-    #[async_trait]
-    impl MessageHandler for RecordingTurns {
-        async fn handle(&self, session_id: &str, input: String) -> anyhow::Result<String> {
-            self.turns
-                .lock()
-                .unwrap()
-                .push((session_id.to_string(), input));
-            Ok("ok".to_string())
-        }
-        async fn resume_interrupted(
-            &self,
-            run: &komo_core::domain::run::Run,
-        ) -> anyhow::Result<Option<String>> {
-            self.resumed.lock().unwrap().push(run.id.clone());
-            Ok(Some("continued".to_string()))
-        }
-    }
-
-    /// The dispatcher a triggered wake needs: a real store, a real waker, and
-    /// the matcher wired to the same one.
-    fn triggering_dispatcher(
-        db: &Arc<komo_infra::persistence::db::Db>,
-        handler: Arc<dyn MessageHandler>,
-        inbox: Arc<dyn InboxRepository>,
-    ) -> Arc<GatewayDispatcher> {
-        let triggers = Arc::new(komo_services::triggers::TriggerMatcher::new(db.clone()));
-        let dispatcher = Arc::new(
-            GatewayDispatcher::new(
-                handler,
-                Arc::new(ApprovalState::new()),
-                Arc::new(MemorySessions::default()),
-                Arc::new(MemoryHome::default()),
-                Arc::new(MemoryTodos::default()),
-                None,
-                Arc::new(UnusedPairings),
-                inbox,
-            )
-            .with_waits(WaitParts {
-                runs: db.clone(),
-                events: db.clone(),
-                wakeups: db.clone(),
-            })
-            .with_triggers(triggers.clone()),
-        );
-        triggers.attach_dispatch(Arc::new(TurnWaker::new(dispatcher.clone())));
-        dispatcher
-    }
-
-    /// A standing wake for a Feishu peer's next message, on `session`.
-    fn from_peer_wake(session: &str, peer_id: &str) -> WakeupRegistration {
-        WakeupRegistration::new(
-            session,
-            Wakeup::Event {
-                filter: komo_core::domain::session_event::EventFilter::FromPeer {
-                    platform: "feishu".into(),
-                    peer_id: peer_id.into(),
-                },
-            },
-            1_000,
-        )
-    }
-
-    /// Turns are spawned; give them a moment to land.
-    async fn settle(done: impl Fn() -> bool) {
-        for _ in 0..200 {
-            if done() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    }
-
-    /// A standing wake on a Feishu peer, that peer writing, and the turn it
-    /// opens on the session that registered it — beside the message's own turn,
-    /// never instead of it.
-    #[tokio::test]
-    async fn a_waited_on_peer_writing_opens_a_turn_where_the_wait_came_from() {
-        let db = test_db("komo-peer-trigger").await;
-        let registration = from_peer_wake("s-wait", "ou_x");
-        WakeupRepository::save(db.as_ref(), &registration)
-            .await
-            .unwrap();
-        assert_eq!(
-            registration.turn_id, None,
-            "a reply opens a turn of its own"
-        );
-
-        let handler = Arc::new(RecordingTurns::default());
-        let dispatcher = triggering_dispatcher(&db, handler.clone(), Arc::new(AlwaysFreshInbox));
-        let sink = Arc::new(RecordingSink {
-            sent: Arc::new(Mutex::new(Vec::new())),
-        }) as Arc<dyn ReplySink>;
-
-        dispatcher
-            .handle(
-                &group("ou_x"),
-                InboundOrigin::local(),
-                "方案发你了".into(),
-                sink.clone(),
-            )
-            .await;
-
-        settle(|| handler.turns.lock().unwrap().len() >= 2).await;
-        let turns = handler.turns.lock().unwrap().clone();
-        let woken = turns
-            .iter()
-            .find(|(session, _)| session == "s-wait")
-            .expect("the waiting session got a turn");
-        assert!(woken.1.contains("方案发你了"), "{}", woken.1);
-        assert!(
-            turns.iter().any(|(session, _)| session != "s-wait"),
-            "the message still reaches the conversation it was sent to"
-        );
-
-        // Claimed, so the same person writing again is just a message.
-        assert!(
-            WakeupRepository::list(db.as_ref())
-                .await
-                .unwrap()
-                .is_empty()
-        );
-        let before = handler.turns.lock().unwrap().len();
-        dispatcher
-            .handle(
-                &group("ou_x"),
-                InboundOrigin::local(),
-                "还有件事".into(),
-                sink,
-            )
-            .await;
-        settle(|| handler.turns.lock().unwrap().len() > before).await;
-        assert_eq!(
-            handler
-                .turns
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(session, _)| session == "s-wait")
-                .count(),
-            1,
-            "a spent wake is not fired again"
-        );
-    }
-
-    /// The other way to consume the same wake: a registration naming a
-    /// suspended turn continues it rather than opening a fresh one, and what it
-    /// is handed is the message itself.
-    #[tokio::test]
-    async fn a_turn_waiting_on_a_peer_is_continued_by_that_peers_message() {
-        use komo_core::domain::run::Run;
-
-        let db = test_db("komo-task-trigger-wait").await;
-        let mut run = Run::start("s1", "等张三");
-        run.status = komo_core::domain::run::RunStatus::Suspended;
-        komo_core::domain::run_projection::RunProjectionStore::commit(
-            db.as_ref(),
-            "s1",
-            &[komo_core::domain::run_projection::ProjectedRun {
-                run: run.clone(),
-                steps: Vec::new(),
-                start_seq: 0,
-            }],
-            0,
-        )
-        .await
-        .unwrap();
-        let registration = WakeupRegistration::new(
-            "s1",
-            Wakeup::Event {
-                filter: komo_core::domain::session_event::EventFilter::FromPeer {
-                    platform: "feishu".into(),
-                    peer_id: "ou_x".into(),
-                },
-            },
-            1_000,
-        )
-        .continuing(&run.id);
-        WakeupRepository::save(db.as_ref(), &registration)
-            .await
-            .unwrap();
-
-        let handler = Arc::new(RecordingTurns::default());
-        let dispatcher = triggering_dispatcher(&db, handler.clone(), Arc::new(AlwaysFreshInbox));
-        dispatcher
-            .handle(
-                &group("ou_x"),
-                InboundOrigin::local(),
-                "好了".into(),
-                Arc::new(RecordingSink {
-                    sent: Arc::new(Mutex::new(Vec::new())),
-                }),
-            )
-            .await;
-
-        settle(|| !handler.resumed.lock().unwrap().is_empty()).await;
-        assert_eq!(*handler.resumed.lock().unwrap(), vec![run.id.clone()]);
-
-        // What ended the wait is on the record, carrying what arrived — which
-        // is what the `wait` call reads when it is re-dispatched.
-        let events = SessionEventRepository::events(db.as_ref(), "s1")
-            .await
-            .unwrap();
-        let fired = events
-            .iter()
-            .find_map(|event| match &event.kind {
-                SessionEventKind::WakeupFired(fired) => Some(fired),
-                _ => None,
-            })
-            .expect("the log says what ended the wait");
-        assert_eq!(fired.cause, WakeupCause::Event);
-        assert_eq!(fired.payload, "好了");
     }
 }

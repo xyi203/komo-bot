@@ -27,6 +27,5 @@ pub mod session_event;
 pub mod skill;
 pub mod todo;
 pub mod tool;
-pub mod trigger;
 pub mod wakeup;
 pub mod workspace;

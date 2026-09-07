@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use super::db::Db;
 use crate::persistence::with_write_retry;
 use komo_core::domain::policy::RuleSpec;
-use komo_core::domain::session_event::{EventFilter, Wakeup};
+use komo_core::domain::session_event::Wakeup;
 use komo_core::domain::wakeup::{WakeupRegistration, WakeupRepository};
 
 /// One standing wakeup. The `Wakeup` variant is flattened: `kind` discriminates
@@ -39,7 +39,7 @@ pub(crate) struct WakeupRecord {
     /// The suspended turn to continue; empty = start a fresh turn.
     turn_id: String,
 
-    /// "approval" | "user-reply" | "event".
+    /// "approval" | "user-reply".
     kind: String,
     /// Retired with the `wait` tool's timer; kept (and written 0) because
     /// dropping a column is not an additive change.
@@ -49,7 +49,8 @@ pub(crate) struct WakeupRecord {
     /// Retired with background tasks; kept (and written empty) for the same
     /// reason as `at`.
     task_id: String,
-    /// `Wakeup::Event`'s filter as JSON; empty otherwise.
+    /// Retired with the event wakeup; kept (and written empty) for the same
+    /// reason as `at`.
     filter: String,
 
     /// 0 = no deadline (a timer is its own).
@@ -76,7 +77,7 @@ pub(crate) const WAKEUP_TABLE_DDL: &[&str] = &[
 #[async_trait]
 impl WakeupRepository for Db {
     async fn save(&self, registration: &WakeupRegistration) -> anyhow::Result<()> {
-        let columns = WakeupColumns::from(&registration.wakeup)?;
+        let columns = WakeupColumns::from(&registration.wakeup);
         let grants = encode_grants(&registration.grants)?;
         with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
@@ -88,7 +89,7 @@ impl WakeupRepository for Db {
                 at: 0,
                 call_id: columns.call_id.clone(),
                 task_id: String::new(),
-                filter: columns.filter.clone(),
+                filter: String::new(),
                 expires_at: registration.expires_at.unwrap_or(0),
                 grants: grants.clone(),
                 created_at: registration.created_at,
@@ -153,29 +154,20 @@ impl WakeupRepository for Db {
 struct WakeupColumns {
     kind: &'static str,
     call_id: String,
-    filter: String,
 }
 
 impl WakeupColumns {
-    fn from(wakeup: &Wakeup) -> anyhow::Result<Self> {
-        let mut columns = Self {
-            kind: "",
-            call_id: String::new(),
-            filter: String::new(),
-        };
+    fn from(wakeup: &Wakeup) -> Self {
         match wakeup {
-            Wakeup::Approval { call_id } => {
-                columns.kind = "approval";
-                columns.call_id = call_id.clone();
-            }
-            Wakeup::UserReply => columns.kind = "user-reply",
-            Wakeup::Event { filter } => {
-                columns.kind = "event";
-                columns.filter =
-                    serde_json::to_string(filter).context("encoding an event filter")?;
-            }
+            Wakeup::Approval { call_id } => Self {
+                kind: "approval",
+                call_id: call_id.clone(),
+            },
+            Wakeup::UserReply => Self {
+                kind: "user-reply",
+                call_id: String::new(),
+            },
         }
-        Ok(columns)
     }
 }
 
@@ -195,17 +187,10 @@ fn registration_from_record(record: WakeupRecord) -> WakeupRegistration {
         "approval" => Wakeup::Approval {
             call_id: record.call_id,
         },
-        "event" => match serde_json::from_str::<EventFilter>(&record.filter) {
-            Ok(filter) => Wakeup::Event { filter },
-            Err(error) => {
-                tracing::warn!(%error, id = %record.id, "unreadable wakeup filter; treating it as a plain reply wait");
-                Wakeup::UserReply
-            }
-        },
         // Including the literal "user-reply", and anything an older or newer
-        // komo wrote — a retired timer's row among them: waiting for the user
-        // is the reading that expires and reports back, which is the safe end
-        // of the range.
+        // komo wrote — a retired timer's or event's row among them: waiting for
+        // the user is the reading that expires and reports back, which is the
+        // safe end of the range.
         _ => Wakeup::UserReply,
     };
     WakeupRegistration {
@@ -256,9 +241,6 @@ mod tests {
                 call_id: "call-7".into(),
             },
             Wakeup::UserReply,
-            Wakeup::Event {
-                filter: EventFilter::Webhook { name: "ci".into() },
-            },
         ];
         for (i, wakeup) in wakeups.iter().enumerate() {
             let mut registration = WakeupRegistration::new("s1", wakeup.clone(), 1_000 + i as i64)
@@ -318,15 +300,12 @@ mod tests {
 
     /// A turn that came back takes every wait it was holding with it, whichever
     /// one actually woke it: a turn resumed by an approval must not also be
-    /// woken by the timer that was watching the same wait.
+    /// woken by the question it was holding open.
     #[tokio::test]
     async fn a_turns_registrations_retire_together() {
         let db = Db::connect(&url("per-turn")).await.unwrap();
         for wakeup in [
             Wakeup::UserReply,
-            Wakeup::Event {
-                filter: EventFilter::Webhook { name: "ci".into() },
-            },
             Wakeup::Approval {
                 call_id: "c1".into(),
             },
@@ -347,7 +326,7 @@ mod tests {
             WakeupRepository::take_for_turn(&db, "s1", "run-1")
                 .await
                 .unwrap(),
-            3
+            2
         );
         let left = WakeupRepository::list(&db).await.unwrap();
         assert_eq!(left.len(), 2);

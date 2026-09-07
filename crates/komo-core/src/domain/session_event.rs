@@ -282,10 +282,10 @@ pub enum SessionEventKind {
 
 /// What a suspended turn is waiting for.
 ///
-/// One vocabulary for three things that look different to a user and identical
-/// to the runtime: an approval, a question, and something outside komo. Each is
-/// "stop here, and come back when X" — differing only in what X is and what the
-/// turn is handed on the way back.
+/// One vocabulary for two things that look different to a user and identical
+/// to the runtime: an approval and a question. Each is "stop here, and come
+/// back when X" — differing only in what X is and what the turn is handed on
+/// the way back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Wakeup {
@@ -293,8 +293,6 @@ pub enum Wakeup {
     Approval { call_id: String },
     /// The user's next message in this conversation.
     UserReply,
-    /// Something outside komo: a webhook, a message from a particular peer.
-    Event { filter: EventFilter },
 }
 
 impl Wakeup {
@@ -303,12 +301,11 @@ impl Wakeup {
         match self {
             Self::Approval { .. } => WakeupKind::Approval,
             Self::UserReply => WakeupKind::UserReply,
-            Self::Event { .. } => WakeupKind::Event,
         }
     }
 }
 
-/// A [`Wakeup`] with its payload dropped: which of the three kinds of waiting
+/// A [`Wakeup`] with its payload dropped: which of the two kinds of waiting
 /// this is. What a projection stores and what an operator surface renders — the
 /// payload is the runtime's business, "what are we waiting for" is theirs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -316,7 +313,6 @@ impl Wakeup {
 pub enum WakeupKind {
     Approval,
     UserReply,
-    Event,
 }
 
 impl WakeupKind {
@@ -324,7 +320,6 @@ impl WakeupKind {
         match self {
             Self::Approval => "approval",
             Self::UserReply => "user-reply",
-            Self::Event => "event",
         }
     }
 
@@ -333,23 +328,8 @@ impl WakeupKind {
         match self {
             Self::Approval => "等你审批",
             Self::UserReply => "等待回答",
-            Self::Event => "等事件",
         }
     }
-}
-
-/// What an [`Wakeup::Event`] listens for.
-///
-/// Matched against the thing that arrived, never against a name someone typed:
-/// `waiting_on: "张三"` is for a human to read, and a `ChannelPeer` is what an
-/// inbound message can actually be compared with.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "on", rename_all = "kebab-case")]
-pub enum EventFilter {
-    /// Any inbound message from this correspondent, on any of komo's channels.
-    FromPeer { platform: String, peer_id: String },
-    /// A named inbound webhook (`POST /api/hooks/{name}`).
-    Webhook { name: String },
 }
 
 /// The turn stopped to wait. `expires_at` is not optional in spirit — every
@@ -379,7 +359,6 @@ pub enum WakeupCause {
     Approve,
     Deny,
     Reply,
-    Event,
     /// The wait ran out. Not a silent drop: the turn comes back and is told
     /// nobody answered.
     Expired,
@@ -394,7 +373,6 @@ impl WakeupCause {
             Self::Approve => "approve",
             Self::Deny => "deny",
             Self::Reply => "reply",
-            Self::Event => "event",
             Self::Expired => "expired",
             Self::MovedOn => "moved-on",
         }
@@ -402,7 +380,7 @@ impl WakeupCause {
 }
 
 /// The wait ended. What the turn is handed on its way back rides in `payload` —
-/// the user's answer, the event that fired, the note that nobody replied.
+/// the user's answer, or the note that nobody replied.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WakeupFiredEvent {
     pub turn_id: String,

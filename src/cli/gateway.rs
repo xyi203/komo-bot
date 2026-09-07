@@ -2,7 +2,6 @@ use komo_bot::daemon::{RoutineEventSource, Schedule, WakeupWiring};
 use komo_bot::gateway::Gateway;
 use komo_bot::interaction::{ApprovalState, ChatApprover, GatewayDispatcher, TurnWaker, WaitParts};
 use komo_infra::persistence::db::Db;
-use komo_services::triggers::TriggerMatcher;
 use std::sync::Arc;
 
 use crate::{
@@ -134,11 +133,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     let handler: Arc<dyn MessageHandler> = Arc::new(wired.runtime);
     let sessions: Arc<dyn SessionRepository> = db.clone();
     let todos: Arc<dyn SessionTodoRepository> = db.clone();
-    // An inbound message may be the reply a standing wake is holding a turn
-    // for (docs/bot-runtime.md §3.7). Built before the
-    // dispatcher because the dispatcher consults it; its way *back* to a turn
-    // is attached below, once the waker exists.
-    let triggers = Arc::new(TriggerMatcher::new(db.clone()));
     let dispatcher = Arc::new(
         GatewayDispatcher::new(
             handler.clone(),
@@ -165,18 +159,13 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             runs: db.clone(),
             events: db.clone(),
             wakeups: db.clone(),
-        })
-        .with_triggers(triggers.clone()),
+        }),
     );
 
     // Waking a suspended turn: the scheduler fires, this continues the turn.
     // Built here because it needs the dispatcher (for the session slot) and the
     // handler (for the continuation) — the two things only the gateway holds.
     let waker: Arc<dyn WakeupDispatch> = Arc::new(TurnWaker::new(dispatcher.clone()));
-    // Late-bound because the runtime that holds the trigger store was built
-    // before the dispatcher existed: a triggered wake continues (or opens) a
-    // turn exactly as a sweep's does.
-    triggers.attach_dispatch(waker.clone());
     // Everything a routine firing needs, built once and handed to the
     // every-minute sweep that is its only ingress.
     let routines = Arc::new(RoutineEventSource {

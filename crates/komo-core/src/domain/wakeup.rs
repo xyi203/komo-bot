@@ -26,13 +26,12 @@ use super::session_event::{Wakeup, WakeupCause};
 /// How long each kind of wait may stand before it fires as expired.
 ///
 /// Chosen by what the waiting is *for*: an approval is a person being asked to
-/// look at something now (a day), a question can wait out a weekend (a week),
-/// and an outside event may never come at all.
+/// look at something now (a day), and a question can wait out a weekend (a
+/// week).
 pub fn default_expiry_secs(wakeup: &Wakeup) -> Option<i64> {
     match wakeup {
         Wakeup::Approval { .. } => Some(24 * 3_600),
         Wakeup::UserReply => Some(7 * 86_400),
-        Wakeup::Event { .. } => Some(30 * 86_400),
     }
 }
 
@@ -187,9 +186,6 @@ mod tests {
                 call_id: "c1".into(),
             },
             Wakeup::UserReply,
-            Wakeup::Event {
-                filter: super::super::session_event::EventFilter::Webhook { name: "ci".into() },
-            },
         ] {
             let r = WakeupRegistration::new("s1", wakeup.clone(), now);
             let expires = r.expires_at.expect("every answerable wait has a deadline");

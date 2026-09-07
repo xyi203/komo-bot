@@ -16,8 +16,8 @@ use crate::domain::{
 // — the CLI gateway adapter and the Dioxus GUI — share one definition. Re-export
 // them here so `operator_control::{SessionSummary, …}` paths are unchanged.
 pub use komo_core::operator_view::{
-    DreamItem, DreamReport, PairingView, ResumeOutcome, SessionSummary, SkillInvocation,
-    SkillUsage, WikiHitView, WikiIndexView, WikiStatusView,
+    DreamItem, DreamReport, PairingView, ResumeOutcome, SessionSummary, WikiHitView, WikiIndexView,
+    WikiStatusView,
 };
 
 /// A read-only operator request. One `query` call per CLI render — the CLI
@@ -44,10 +44,6 @@ pub enum OperatorQuery {
     Pairings,
     /// The dreaming dry-run classification.
     DreamPreview,
-    /// Which turns loaded a skill (derived from the run ledger).
-    SkillAudit { name: String },
-    /// Every active skill ranked coldest-first (same ledger derivation).
-    SkillUsage,
     /// The `/sethome` runtime override (`None` when unset).
     HomeOverride,
     /// Note-vault search. Routed like every other operator read so it works
@@ -72,8 +68,6 @@ pub enum OperatorQueryResult {
     MemoryUsed(Vec<MemoryUse>),
     Pairings(Vec<PairingView>),
     DreamPreview(DreamReport),
-    SkillAudit(Vec<SkillInvocation>),
-    SkillUsage(Vec<SkillUsage>),
     HomeOverride(Option<String>),
     CronJobs(Vec<CronJob>),
     WikiHits(Vec<WikiHitView>),
@@ -141,8 +135,6 @@ pub enum OperatorCommandResult {
     DreamApplied {
         promoted: usize,
         archived: usize,
-        /// Skill proposals withdrawn for want of a verdict.
-        skills_expired: usize,
     },
     /// How many memories were widened to `Global`.
     MemoryScopesRepaired {

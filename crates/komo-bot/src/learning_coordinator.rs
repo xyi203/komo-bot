@@ -94,7 +94,6 @@ pub struct LearningReport {
     pub sessions_learned: usize,
     pub episodes_learned: usize,
     pub memories_written: usize,
-    pub skills_written: usize,
     pub tasks_captured: usize,
 }
 
@@ -103,7 +102,6 @@ impl LearningReport {
         self.sessions_learned == 0
             && self.episodes_learned == 0
             && self.memories_written == 0
-            && self.skills_written == 0
             && self.tasks_captured == 0
     }
 
@@ -111,7 +109,6 @@ impl LearningReport {
         self.sessions_learned += 1;
         self.episodes_learned += episodes;
         self.memories_written += outcome.memories_written.len();
-        self.skills_written += outcome.skills_written.len();
         self.tasks_captured += outcome.tasks_captured.len();
     }
 }
@@ -573,9 +570,6 @@ mod tests {
         }
         async fn reconcile_interrupted(&self, _now: i64) -> anyhow::Result<usize> {
             Ok(0)
-        }
-        async fn steps_by_tool(&self, _t: &str, _l: usize) -> anyhow::Result<Vec<RunStep>> {
-            Ok(Vec::new())
         }
         async fn runs_using_memory(
             &self,
@@ -1258,7 +1252,6 @@ mod tests {
         let reviewer = Arc::new(RecordingReviewer {
             outcome: ReviewOutcome {
                 memories_written: vec!["m1".into()],
-                skills_written: Vec::new(),
                 tasks_captured: vec!["t1".into()],
             },
             ..Default::default()

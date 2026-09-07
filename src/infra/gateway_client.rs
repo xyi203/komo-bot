@@ -27,7 +27,7 @@ use crate::domain::{
 };
 use crate::infra::rendezvous::{self, GatewayInfo};
 use crate::services::operator_control::{
-    DreamItem, DreamReport, PairingView, ResumeOutcome, SessionSummary, SkillInvocation, SkillUsage,
+    DreamItem, DreamReport, PairingView, ResumeOutcome, SessionSummary,
 };
 
 /// How long to wait for the gateway to answer a request (a turn can take a
@@ -291,15 +291,6 @@ impl GatewayClient {
         Ok(serde_json::from_value(messages)?)
     }
 
-    /// Which turns loaded a skill (derived from the run ledger server-side).
-    pub async fn skill_audit(&self, name: &str) -> anyhow::Result<Vec<SkillInvocation>> {
-        self.get_field(&format!("/api/skills/{name}/audit"), "invocations")
-            .await
-    }
-
-    /// Every active skill ranked coldest-first (same server-side derivation).
-    pub async fn skill_usage(&self) -> anyhow::Result<Vec<SkillUsage>> {
-        self.get_field("/api/skills/usage", "usage").await
     }
 
     pub async fn pairings(&self) -> anyhow::Result<Vec<PairingView>> {
@@ -333,23 +324,10 @@ impl GatewayClient {
             map.remove("candidate_count")
                 .unwrap_or_else(|| Value::from(promote.len() + archive.len())),
         )?;
-        // An older gateway reports no skill half at all: an empty list and a
-        // zero count, which renders as "no proposals" rather than as a claim
-        // that none of them would expire.
-        let expire_skills: Vec<String> = serde_json::from_value(
-            map.remove("expire_skills")
-                .unwrap_or_else(|| Value::Array(vec![])),
-        )?;
-        let skill_candidate_count = serde_json::from_value(
-            map.remove("skill_candidate_count")
-                .unwrap_or_else(|| Value::from(expire_skills.len())),
-        )?;
         Ok(DreamReport {
             promote,
             archive,
             candidate_count,
-            expire_skills,
-            skill_candidate_count,
         })
     }
 
@@ -576,9 +554,7 @@ impl GatewayClient {
 
     /// Run one dreaming consolidation cycle server-side; returns
     /// `(promoted, archived)` counts.
-    /// One dreaming cycle: `(promoted, archived, skills_expired)`. A missing
-    /// field reads as 0, so an older gateway that ran no skill half still parses.
-    pub async fn dream_apply(&self) -> anyhow::Result<(usize, usize, usize)> {
+    pub async fn dream_apply(&self) -> anyhow::Result<(usize, usize)> {
         let mut map = self.post_json("/api/dream/apply", json!({})).await?;
         let mut take = |k: &str| -> anyhow::Result<usize> {
             Ok(serde_json::from_value(
@@ -587,8 +563,7 @@ impl GatewayClient {
         };
         let promoted = take("promoted")?;
         let archived = take("archived")?;
-        let skills_expired = take("skills_expired")?;
-        Ok((promoted, archived, skills_expired))
+        Ok((promoted, archived))
     }
 
     /// Ranked memory search server-side, where the embedder lives.

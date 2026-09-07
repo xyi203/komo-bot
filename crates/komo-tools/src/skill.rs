@@ -9,8 +9,6 @@ use serde_json::{Value, json};
 use komo_core::domain::{
     approval::{ApprovalRequest, Decision},
     context::ToolContext,
-    repository::SkillRepository,
-    skill::{SOURCE_LEARNED, Skill},
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
@@ -20,20 +18,14 @@ struct SkillArgs {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    description: Option<String>,
-    #[serde(default)]
-    instructions: Option<String>,
-    #[serde(default)]
     source: Option<String>,
 }
 
-/// Lets the model discover, load, author, and install skills (progressive
-/// disclosure): `list` returns the catalog; `view` returns a skill's full
-/// instruction body, which the model then follows; `learn` distills a reusable
-/// procedure into a **candidate** skill (the on-demand analog of the reflective
-/// reviewer's passive extraction — same triage ladder); `install` fetches a
-/// skill from a git repo or a raw SKILL.md URL and — once the operator approves
-/// — installs it **active** (a human is always in the loop for third-party code).
+/// Lets the model discover, load, and install skills (progressive disclosure):
+/// `list` returns the catalog; `view` returns a skill's full instruction body,
+/// which the model then follows; `install` fetches a skill from a git repo or a
+/// raw SKILL.md URL and — once the operator approves — installs it **active** (a
+/// human is always in the loop for third-party code).
 pub struct SkillTool {
     registry: Arc<SkillRegistry>,
     store: Arc<FsSkillStore>,
@@ -52,14 +44,11 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &'static str {
-        "Discover, load, author, and install skills (reusable instruction \
-         playbooks). action=\"list\" returns available skills; action=\"view\" \
-         returns a named skill's full instructions, which you should then \
-         follow; action=\"learn\" saves a reusable procedure you just worked out \
-         as a candidate skill for the operator to review (only learn durable, \
-         reusable know-how, not one-off facts); action=\"install\" fetches a \
-         skill the user points you at (a git repo or a SKILL.md URL) and \
-         installs it after the operator approves."
+        "Discover, load, and install skills (reusable instruction playbooks). \
+         action=\"list\" returns available skills; action=\"view\" returns a \
+         named skill's full instructions, which you should then follow; \
+         action=\"install\" fetches a skill the user points you at (a git repo \
+         or a SKILL.md URL) and installs it after the operator approves."
     }
 
     /// These calls can park on an approval prompt, so they must outlast one.
@@ -73,24 +62,12 @@ impl Tool for SkillTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["list", "view", "learn", "install"],
-                    "description": "Whether to list skills, view one, learn a new one, or install one."
+                    "enum": ["list", "view", "install"],
+                    "description": "Whether to list skills, view one, or install one."
                 },
                 "name": {
                     "type": "string",
-                    "description": "Skill name — required for action=view and action=learn. \
-                     For learn it doubles as the on-disk directory name: letters, digits, \
-                     `-`/`_`/`.` only (a short, class-level slug like `sync-calendar`)."
-                },
-                "description": {
-                    "type": "string",
-                    "description": "One-line summary of what the skill does and when to use it \
-                     (action=learn). Optional but strongly recommended."
-                },
-                "instructions": {
-                    "type": "string",
-                    "description": "The full skill body — the step-by-step reusable procedure \
-                     (required for action=learn)."
+                    "description": "Skill name — required for action=view."
                 },
                 "source": {
                     "type": "string",
@@ -131,47 +108,6 @@ impl Tool for SkillTool {
                     ))),
                 }
             }
-            "learn" => {
-                let name = args.name.ok_or_else(|| {
-                    ToolError::InvalidInput("`name` is required for action=learn".to_string())
-                })?;
-                let instructions = args.instructions.ok_or_else(|| {
-                    ToolError::InvalidInput(
-                        "`instructions` is required for action=learn".to_string(),
-                    )
-                })?;
-                if instructions.trim().is_empty() {
-                    return Err(ToolError::InvalidInput(
-                        "`instructions` must not be empty".to_string(),
-                    ));
-                }
-                let skill = Skill {
-                    name: name.clone(),
-                    description: args.description.unwrap_or_default(),
-                    instructions,
-                    protected: false,
-                    disabled: false,
-                    source: SOURCE_LEARNED.to_string(),
-                    // Ungated: offer gating is an operator judgment about where a
-                    // skill is worth advertising, not something to infer from a turn.
-                    platforms: Vec::new(),
-                    requires_tools: Vec::new(),
-                    // Stamped by the store on write, not carried in.
-                    updated_at: None,
-                };
-                // `save` writes a *candidate* (never an active skill): the same
-                // triage ladder as the reviewer, and it refuses a protected
-                // active skill or a path-escaping name. A candidate is invisible
-                // to the runtime until promoted, so the reply must not imply it's
-                // usable this turn.
-                self.store.save(&skill).await?;
-                Ok(ToolOutput::text(format!(
-                    "Learned `{name}` as a candidate skill. Review it with \
-                     `komo skills inspect {name}`, then `komo skills promote {name}` \
-                     to activate (usable on the agent's next `skill` list once promoted)."
-                ))
-                .with_title(format!("learned {name}")))
-            }
             "install" => {
                 let source = args.source.ok_or_else(|| {
                     ToolError::InvalidInput("`source` is required for action=install".to_string())
@@ -208,7 +144,7 @@ impl Tool for SkillTool {
                 .with_structured(json!({ "name": installed.name, "files": installed.files })))
             }
             other => Err(ToolError::InvalidInput(format!(
-                "unknown action `{other}` (expected list/view/learn/install)"
+                "unknown action `{other}` (expected list/view/install)"
             ))),
         }
     }
@@ -271,12 +207,10 @@ mod tests {
             name: "greet".to_string(),
             description: "Say hello".to_string(),
             instructions: "Greet the user warmly.".to_string(),
-            protected: false,
             disabled: false,
             source: "user".to_string(),
             platforms: Vec::new(),
             requires_tools: Vec::new(),
-            updated_at: None,
         }]))
     }
 
@@ -322,12 +256,10 @@ mod tests {
                 name: "paused".to_string(),
                 description: "d".to_string(),
                 instructions: "secret steps".to_string(),
-                protected: false,
                 disabled: true,
                 source: "user".to_string(),
                 platforms: Vec::new(),
                 requires_tools: Vec::new(),
-                updated_at: None,
             }])),
             store("disabled"),
         );
@@ -444,91 +376,5 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
-    }
-
-    #[tokio::test]
-    async fn learn_writes_a_candidate() {
-        let (tool, store) = tool_with("learn_candidate");
-        let reply = tool
-            .call(
-                json!({
-                    "action": "learn",
-                    "name": "sync-cal",
-                    "description": "Sync the calendar",
-                    "instructions": "Step 1. Open the calendar.\nStep 2. Sync."
-                }),
-                &ctx(),
-            )
-            .await
-            .unwrap()
-            .text;
-        assert!(reply.contains("candidate"));
-
-        // Lands as a candidate (not active), tagged with `learned` provenance.
-        assert!(store.find_active("sync-cal").is_none());
-        let cand = store.find_candidate("sync-cal").unwrap();
-        assert_eq!(cand.source, komo_core::domain::skill::SOURCE_LEARNED);
-        assert_eq!(cand.description, "Sync the calendar");
-        assert!(cand.instructions.contains("Step 2. Sync."));
-    }
-
-    #[tokio::test]
-    async fn learn_requires_name_and_instructions() {
-        let (tool, _) = tool_with("learn_missing");
-        assert!(
-            tool.call(json!({ "action": "learn", "instructions": "x" }), &ctx())
-                .await
-                .is_err()
-        );
-        assert!(
-            tool.call(json!({ "action": "learn", "name": "x" }), &ctx())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn learn_rejects_path_escaping_name() {
-        let (tool, _) = tool_with("learn_badname");
-        let err = tool
-            .call(
-                json!({ "action": "learn", "name": "../escape", "instructions": "body" }),
-                &ctx(),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("invalid skill name"));
-    }
-
-    #[tokio::test]
-    async fn learn_refuses_protected_active_skill() {
-        let (tool, store) = tool_with("learn_protected");
-        // Seed an active, protected skill of the same name.
-        store
-            .save(&Skill {
-                name: "guarded".to_string(),
-                description: "d".to_string(),
-                instructions: "orig".to_string(),
-                protected: false,
-                disabled: false,
-                source: komo_core::domain::skill::SOURCE_LEARNED.to_string(),
-                platforms: Vec::new(),
-                requires_tools: Vec::new(),
-                updated_at: None,
-            })
-            .await
-            .unwrap();
-        store.promote("guarded").unwrap();
-        store.set_protected("guarded", true).unwrap();
-
-        let err = tool
-            .call(
-                json!({ "action": "learn", "name": "guarded", "instructions": "new body" }),
-                &ctx(),
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("protected"));
-        assert!(store.find_candidate("guarded").is_none());
     }
 }

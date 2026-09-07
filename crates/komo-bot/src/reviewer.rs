@@ -10,11 +10,9 @@ use komo_core::domain::{
     llm::LlmClient,
     memory::{MemoryContext, MemoryKind, MemoryProvenance, Occasion, parse_memory_kind},
     message::Message,
-    repository::SkillRepository,
     reviewer::{ReviewOutcome, Reviewer, SELF_REVIEW_PROMPT},
     run::truncate,
     session::Session,
-    skill::{SOURCE_REVIEWER, Skill},
     task::{Task, TaskRepository, TaskStatus},
 };
 use komo_services::memory_consolidation::{Consolidated, MemoryConsolidator, Observation};
@@ -25,7 +23,6 @@ pub struct ReflectiveReviewer {
     /// of its own: deciding what an observation *means* against the existing
     /// library is one rule, and it lives in one place.
     consolidator: Arc<MemoryConsolidator>,
-    skills: Arc<dyn SkillRepository>,
     tasks: Arc<dyn TaskRepository>,
 }
 
@@ -33,13 +30,11 @@ impl ReflectiveReviewer {
     pub fn new(
         llm: Arc<dyn LlmClient>,
         consolidator: Arc<MemoryConsolidator>,
-        skills: Arc<dyn SkillRepository>,
         tasks: Arc<dyn TaskRepository>,
     ) -> Self {
         Self {
             llm,
             consolidator,
-            skills,
             tasks,
         }
     }
@@ -64,38 +59,6 @@ impl ReflectiveReviewer {
             awaiting: None,
         }
     }
-
-    /// Fold a proposed change into a skill's **real** body, and return the
-    /// complete replacement — or `None`, which the caller treats as "drop this
-    /// proposal".
-    ///
-    /// This is the read half of read-before-write. The reviewer's transcript is
-    /// user and assistant text only — tool results are never persisted as
-    /// messages — so it has never seen a single skill body, yet `instructions`
-    /// is a *whole* body and `promote` writes it over the active file. Without
-    /// this pass, every update proposal is a rewrite-from-imagination of a file
-    /// the writer never opened.
-    ///
-    /// A failed or empty second pass returns `None` rather than falling back to
-    /// the ungrounded text: dropping a proposal costs one missed improvement,
-    /// writing it costs the operator's skill.
-    async fn grounded_rewrite(
-        &self,
-        session: &Session,
-        current: &Skill,
-        proposed: &str,
-    ) -> Option<String> {
-        let prompt = rewrite_prompt(current, proposed);
-        let reply = match self.llm.complete(&self.aux_session(session, prompt)).await {
-            Ok(reply) => reply,
-            Err(error) => {
-                tracing::warn!(%error, name = %current.name, "grounded skill rewrite failed");
-                return None;
-            }
-        };
-        let body = strip_code_fence(&reply).trim().to_string();
-        (!body.is_empty()).then_some(body)
-    }
 }
 
 #[async_trait]
@@ -108,12 +71,7 @@ impl Reviewer for ReflectiveReviewer {
         if episodes.is_empty() {
             return Ok(ReviewOutcome::default());
         }
-        // The catalog is what lets the model target an *existing* skill by its
-        // real name instead of inventing a near-duplicate. It has never been in
-        // this prompt, which is why the skill ladder's "patch an existing
-        // skill" steps had nothing to aim at.
-        let catalog = skill_catalog(&self.skills.list().await.unwrap_or_default());
-        let prompt = review_prompt(episodes, &catalog);
+        let prompt = review_prompt(episodes);
         let reply = self
             .llm
             .complete(&self.aux_session(session, prompt))
@@ -175,74 +133,6 @@ impl Reviewer for ReflectiveReviewer {
             outcome
                 .memories_written
                 .extend(results.into_iter().filter_map(written_id));
-        }
-
-        for suggestion in suggestions.skills {
-            if should_skip(&suggestion.instructions) {
-                continue;
-            }
-            let existing = self.skills.find(&suggestion.name).await?;
-            // Protected = operator edits only: no candidate proposal either,
-            // so a "just promote it" nudge can never overwrite the operator's
-            // version (roadmap §9 — protection guards proposal *generation*).
-            if existing.as_ref().is_some_and(|s| s.protected) {
-                continue;
-            }
-            // Read-before-write: a proposal that replaces an existing skill is
-            // re-derived from that skill's real body first. New skills have
-            // nothing to read, so they go through as written.
-            let instructions = match &existing {
-                Some(current) => {
-                    match self
-                        .grounded_rewrite(session, current, &suggestion.instructions)
-                        .await
-                    {
-                        Some(body) => body,
-                        None => {
-                            tracing::info!(
-                                name = %suggestion.name,
-                                "skill update proposal dropped — could not ground it in the current body"
-                            );
-                            continue;
-                        }
-                    }
-                }
-                None => suggestion.instructions,
-            };
-            let skill = Skill {
-                name: suggestion.name,
-                description: suggestion
-                    .description
-                    .or_else(|| existing.as_ref().map(|s| s.description.clone()))
-                    .unwrap_or_default(),
-                instructions,
-                protected: false,
-                disabled: false,
-                source: SOURCE_REVIEWER.to_string(),
-                // Offer gating is the operator's, not the reviewer's: an update
-                // proposal inherits it so promoting one can't quietly widen
-                // where a platform- or tool-gated skill gets advertised.
-                platforms: existing
-                    .as_ref()
-                    .map(|s| s.platforms.clone())
-                    .unwrap_or_default(),
-                requires_tools: existing
-                    .as_ref()
-                    .map(|s| s.requires_tools.clone())
-                    .unwrap_or_default(),
-                // Stamped by the store on write: a re-proposal restarts the
-                // expiry clock, which is what makes a recurring pattern outlast
-                // a single unattended cycle.
-                updated_at: None,
-            };
-            // `save` writes a *candidate* (never an active skill) — automated
-            // extraction goes through triage like memory candidates. A refused
-            // proposal (bad name, protected race) must not fail the review.
-            if let Err(error) = self.skills.save(&skill).await {
-                tracing::warn!(%error, name = %skill.name, "skill proposal not written");
-                continue;
-            }
-            outcome.skills_written.push(skill.name);
         }
 
         // Commitments land in the inbox only, never straight to `todo`: automated
@@ -328,36 +218,6 @@ fn fnv1a(text: &str) -> u64 {
     hash
 }
 
-/// `- name: description` lines for the active skills, or empty when there are
-/// none. Descriptions only — bodies are what the second pass is for.
-fn skill_catalog(skills: &[Skill]) -> String {
-    skills
-        .iter()
-        .filter(|skill| !skill.disabled)
-        .map(|skill| format!("- {}: {}", skill.name, skill.description))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The second pass: the model is shown the skill it asked to change, and
-/// returns the whole updated body. Deliberately prose-in/prose-out — there is
-/// one value to produce, so wrapping it in JSON would only add a parse that can
-/// fail.
-fn rewrite_prompt(current: &Skill, proposed: &str) -> String {
-    format!(
-        "You proposed a change to the existing skill `{}`. Below is its CURRENT body \
-         — the text you are replacing — followed by what you proposed.\n\n\
-         Return ONLY the complete updated skill body: the full replacement text, no \
-         diff, no summary, no commentary, no frontmatter. Keep everything in the \
-         current body that your change does not specifically improve; you are editing \
-         a file someone else wrote, not rewriting it from scratch. If the current body \
-         already covers your change, return it unchanged.\n\n\
-         CURRENT body of `{}`:\n---\n{}\n---\n\n\
-         Proposed change:\n---\n{proposed}\n---",
-        current.name, current.name, current.instructions
-    )
-}
-
 /// Caps for the episode rendering. A turn's ledger fields run to
 /// [`RUN_FIELD_CAP`](komo_core::domain::run::RUN_FIELD_CAP) each and a batch can
 /// hold a whole review interval's worth of turns, so the prompt needs its own
@@ -411,7 +271,7 @@ fn render_episode(index: usize, episode: &AssessedEpisode) -> String {
     out
 }
 
-fn review_prompt(episodes: &[AssessedEpisode], catalog: &str) -> String {
+fn review_prompt(episodes: &[AssessedEpisode]) -> String {
     let mut transcript = String::new();
     for (idx, episode) in episodes.iter().enumerate() {
         if transcript.len() > REVIEW_EPISODES_CAP {
@@ -424,28 +284,11 @@ fn review_prompt(episodes: &[AssessedEpisode], catalog: &str) -> String {
         transcript.push_str(&render_episode(idx + 1, episode));
         transcript.push('\n');
     }
-    // Naming an existing skill means "change this one". Say so explicitly, and
-    // say that the body is not here — otherwise the model writes a replacement
-    // body for a file it has never read, which is exactly what the second pass
-    // exists to prevent.
-    let existing = if catalog.is_empty() {
-        "There are no existing skills yet; any skill you return is a new one.\n\n".to_string()
-    } else {
-        format!(
-            "Existing skills (name: description) — return one of these exact names to \
-             change it, or a new name to create one. You are NOT shown their bodies: \
-             when changing one, write `instructions` as the change you want made, and \
-             it will be folded into the real body for you.\n{catalog}\n\n"
-        )
-    };
-
     format!(
-        "{SELF_REVIEW_PROMPT}\n\n{existing}Return only JSON in this exact shape:\n\
+        "{SELF_REVIEW_PROMPT}\n\nReturn only JSON in this exact shape:\n\
          {{\"memories\":[{{\"kind\":\"profile|preference|feedback|project|person|fact|decision|reference\",\
          \"content\":\"...\",\"quote\":\"the words this came from\",\
          \"said_by\":\"user|tool\"}}],\
-         \"skills\":[{{\"name\":\"class-level-skill-name\",\"description\":\"...\",\
-         \"instructions\":\"full patched skill body\"}}],\
          \"commitments\":[{{\"title\":\"short actionable obligation\",\
          \"waiting_on\":\"who it involves, or empty\",\"note\":\"context/deadline, or empty\"}}]}}\n\
          Use empty arrays when nothing durable should be written.\n\n\
@@ -482,8 +325,6 @@ struct ReviewSuggestions {
     #[serde(default)]
     memories: Vec<MemorySuggestion>,
     #[serde(default)]
-    skills: Vec<SkillSuggestion>,
-    #[serde(default)]
     commitments: Vec<CommitmentSuggestion>,
 }
 
@@ -517,26 +358,12 @@ struct MemorySuggestion {
     said_by: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SkillSuggestion {
-    name: String,
-    #[serde(default)]
-    description: Option<String>,
-    instructions: String,
-}
-
 fn parse_suggestions(reply: &str) -> anyhow::Result<Option<ReviewSuggestions>> {
     let json = extract_json(reply).trim();
     if json.is_empty() {
         return Ok(None);
     }
     Ok(Some(serde_json::from_str(json)?))
-}
-
-/// The second pass returns prose, not JSON, but the fence handling is the same:
-/// models wrap a returned document in a code fence about half the time.
-fn strip_code_fence(reply: &str) -> &str {
-    extract_json(reply)
 }
 
 fn extract_json(reply: &str) -> &str {
@@ -581,7 +408,6 @@ mod tests {
         Memory, MemoryConfidence, MemoryRepository, MemoryScope, MemoryStatus,
     };
     use komo_core::domain::run::{Run, RunStatus};
-    use komo_core::domain::skill::Skill;
     use komo_services::memory_query::MemoryQueryService;
     use std::sync::Mutex;
 
@@ -610,29 +436,6 @@ mod tests {
                 Some(slot) => *slot = memory.clone(),
                 None => rows.push(memory.clone()),
             }
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct FakeSkills(Mutex<Vec<Skill>>);
-
-    #[async_trait]
-    impl SkillRepository for FakeSkills {
-        async fn find(&self, name: &str) -> anyhow::Result<Option<Skill>> {
-            Ok(self
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|s| s.name == name)
-                .cloned())
-        }
-        async fn list(&self) -> anyhow::Result<Vec<Skill>> {
-            Ok(self.0.lock().unwrap().clone())
-        }
-        async fn save(&self, skill: &Skill) -> anyhow::Result<()> {
-            self.0.lock().unwrap().push(skill.clone());
             Ok(())
         }
     }
@@ -716,7 +519,6 @@ mod tests {
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
             consolidator_over(Arc::new(FakeMemories::default())),
-            Arc::new(FakeSkills::default()),
             tasks.clone(),
         );
         (reviewer, tasks)
@@ -768,170 +570,32 @@ mod tests {
         episodes_asking("I'll send Bob the report tomorrow")
     }
 
-    // ── skill extraction ───────────────────────────────────────────────────────
-
-    /// Replies handed out in order, with every prompt it was asked recorded —
-    /// the two-pass skill path is only correct if the *second* prompt carries
-    /// the current body, so the test has to see the prompts.
+    /// Replies handed out in order, one per aux call.
     #[derive(Default)]
     struct ScriptedLlm {
         replies: Mutex<std::collections::VecDeque<String>>,
-        prompts: Mutex<Vec<String>>,
     }
 
     impl ScriptedLlm {
         fn new(replies: &[&str]) -> Arc<Self> {
             Arc::new(Self {
                 replies: Mutex::new(replies.iter().map(|r| r.to_string()).collect()),
-                prompts: Mutex::new(Vec::new()),
             })
         }
     }
 
     #[async_trait]
     impl LlmClient for ScriptedLlm {
-        async fn complete(&self, session: &Session) -> anyhow::Result<String> {
-            self.prompts
-                .lock()
-                .unwrap()
-                .push(session.messages[0].content.clone());
+        async fn complete(&self, _session: &Session) -> anyhow::Result<String> {
             Ok(self.replies.lock().unwrap().pop_front().unwrap_or_default())
         }
-    }
-
-    fn active_skill(name: &str, body: &str) -> Skill {
-        Skill {
-            name: name.to_string(),
-            description: format!("does {name}"),
-            instructions: body.to_string(),
-            protected: false,
-            disabled: false,
-            source: "user".to_string(),
-            platforms: Vec::new(),
-            requires_tools: Vec::new(),
-            updated_at: None,
-        }
-    }
-
-    fn skill_reviewer(
-        llm: Arc<ScriptedLlm>,
-        existing: Vec<Skill>,
-    ) -> (ReflectiveReviewer, Arc<FakeSkills>) {
-        let skills = Arc::new(FakeSkills(Mutex::new(existing)));
-        let reviewer = ReflectiveReviewer::new(
-            llm,
-            consolidator_over(Arc::new(FakeMemories::default())),
-            skills.clone(),
-            Arc::new(FakeTasks::default()),
-        );
-        (reviewer, skills)
-    }
-
-    const PATCH_DEPLOY: &str = r#"{"memories":[],"commitments":[],"skills":[{"name":"deploy","description":"ship it","instructions":"also run the tests first"}]}"#;
-
-    /// The hole this closes: the reviewer never sees a skill body (tool results
-    /// are not persisted as messages), so an update proposal is written blind
-    /// and `promote` writes it over the real file. The second pass is the read.
-    #[tokio::test]
-    async fn an_update_proposal_is_rewritten_against_the_real_body() {
-        let llm = ScriptedLlm::new(&[PATCH_DEPLOY, "STEP ONE\nSTEP TWO\nSTEP THREE: run tests"]);
-        let (reviewer, skills) = skill_reviewer(
-            llm.clone(),
-            vec![active_skill("deploy", "STEP ONE\nSTEP TWO")],
-        );
-
-        let outcome = reviewer
-            .review(&session("api:1"), &episodes())
-            .await
-            .unwrap();
-        assert_eq!(outcome.skills_written, ["deploy"]);
-
-        let prompts = llm.prompts.lock().unwrap();
-        assert_eq!(prompts.len(), 2, "an update takes a grounding pass");
-        // Pass 1 knows the skill exists, but not what it says.
-        assert!(prompts[0].contains("deploy: does deploy"));
-        assert!(!prompts[0].contains("STEP TWO"));
-        // Pass 2 is handed the actual file plus the requested change.
-        assert!(prompts[1].contains("STEP ONE\nSTEP TWO"));
-        assert!(prompts[1].contains("also run the tests first"));
-
-        // What gets written is the grounded body, never the blind proposal.
-        let written = skills.0.lock().unwrap();
-        let candidate = written
-            .iter()
-            .find(|s| s.source == SOURCE_REVIEWER)
-            .unwrap();
-        assert!(candidate.instructions.contains("STEP TWO"));
-        assert!(candidate.instructions.contains("run tests"));
-        assert!(!candidate.instructions.contains("also run the tests first"));
-    }
-
-    /// Failing to ground drops the proposal — it must never fall back to the
-    /// blind body, which is the exact thing being guarded against.
-    #[tokio::test]
-    async fn an_ungroundable_update_is_dropped_not_written() {
-        // Second pass yields nothing usable.
-        let llm = ScriptedLlm::new(&[PATCH_DEPLOY, "   "]);
-        let (reviewer, skills) =
-            skill_reviewer(llm, vec![active_skill("deploy", "STEP ONE\nSTEP TWO")]);
-
-        let outcome = reviewer
-            .review(&session("api:1"), &episodes())
-            .await
-            .unwrap();
-        assert!(outcome.skills_written.is_empty());
-        let written = skills.0.lock().unwrap();
-        assert!(written.iter().all(|s| s.source != SOURCE_REVIEWER));
-    }
-
-    /// A brand-new skill has no body to read, so it costs no second call and
-    /// goes through exactly as proposed.
-    #[tokio::test]
-    async fn a_new_skill_needs_no_grounding_pass() {
-        let llm = ScriptedLlm::new(&[PATCH_DEPLOY]);
-        let (reviewer, skills) = skill_reviewer(llm.clone(), Vec::new());
-
-        let outcome = reviewer
-            .review(&session("api:1"), &episodes())
-            .await
-            .unwrap();
-        assert_eq!(outcome.skills_written, ["deploy"]);
-        assert_eq!(llm.prompts.lock().unwrap().len(), 1);
-        assert_eq!(
-            skills.0.lock().unwrap()[0].instructions,
-            "also run the tests first"
-        );
-    }
-
-    /// Protection still wins before any of this: no grounding call, no proposal.
-    #[tokio::test]
-    async fn a_protected_skill_is_never_even_grounded() {
-        let mut protected = active_skill("deploy", "STEP ONE");
-        protected.protected = true;
-        let llm = ScriptedLlm::new(&[PATCH_DEPLOY, "rewritten"]);
-        let (reviewer, skills) = skill_reviewer(llm.clone(), vec![protected]);
-
-        let outcome = reviewer
-            .review(&session("api:1"), &episodes())
-            .await
-            .unwrap();
-        assert!(outcome.skills_written.is_empty());
-        assert_eq!(llm.prompts.lock().unwrap().len(), 1);
-        assert!(
-            skills
-                .0
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|s| s.source != SOURCE_REVIEWER)
-        );
     }
 
     // ── commitment extraction ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn captures_commitment_into_inbox() {
-        let reply = r#"{"memories":[],"skills":[],"commitments":[{"title":"send Bob the report","waiting_on":"Bob","note":"by tomorrow"}]}"#;
+        let reply = r#"{"memories":[],"commitments":[{"title":"send Bob the report","waiting_on":"Bob","note":"by tomorrow"}]}"#;
         let (reviewer, tasks) = reviewer_with(reply);
 
         let outcome = reviewer
@@ -990,7 +654,7 @@ mod tests {
     #[test]
     fn extracts_fenced_json() {
         let parsed = parse_suggestions(
-            "```json\n{\"memories\":[{\"kind\":\"user\",\"content\":\"prefers concise replies\"}],\"skills\":[]}\n```",
+            "```json\n{\"memories\":[{\"kind\":\"user\",\"content\":\"prefers concise replies\"}]}\n```",
         )
         .unwrap()
         .unwrap();
@@ -1005,13 +669,12 @@ mod tests {
 
     #[tokio::test]
     async fn extracted_memory_lands_as_scoped_candidate() {
-        let reply = r#"{"memories":[{"kind":"preference","content":"prefers concise replies"}],"skills":[],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"preference","content":"prefers concise replies"}],"commitments":[]}"#;
         let tasks = Arc::new(FakeTasks::default());
         let memories = Arc::new(FakeMemories::default());
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
             consolidator_over(memories.clone()),
-            Arc::new(FakeSkills::default()),
             tasks,
         );
 
@@ -1049,13 +712,12 @@ mod tests {
         ];
         for (said_by, expected) in cases {
             let reply = format!(
-                r#"{{"memories":[{{"kind":"fact",{said_by}"content":"komo uses Rust"}}],"skills":[],"commitments":[]}}"#
+                r#"{{"memories":[{{"kind":"fact",{said_by}"content":"komo uses Rust"}}],"commitments":[]}}"#
             );
             let memories = Arc::new(FakeMemories::default());
             let reviewer = ReflectiveReviewer::new(
                 Arc::new(FixedLlm(reply)),
                 consolidator_over(memories.clone()),
-                Arc::new(FakeSkills::default()),
                 Arc::new(FakeTasks::default()),
             );
 
@@ -1083,9 +745,9 @@ mod tests {
         existing.scope = MemoryScope::Global;
         let memories = Arc::new(FakeMemories(Mutex::new(vec![existing])));
         let llm = ScriptedLlm::new(&[
-            r#"{"memories":[{"kind":"preference","said_by":"user","content":"user prefers squashing over stacking"}],"skills":[],"commitments":[]}"#,
-            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}],"skills":[],"commitments":[]}"#,
-            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}],"skills":[],"commitments":[]}"#,
+            r#"{"memories":[{"kind":"preference","said_by":"user","content":"user prefers squashing over stacking"}],"commitments":[]}"#,
+            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}],"commitments":[]}"#,
+            r#"{"memories":[{"kind":"preference","said_by":"user","content":"before a push the user prefers squashing"}],"commitments":[]}"#,
         ]);
         let reviewer = ReflectiveReviewer::new(
             llm,
@@ -1093,7 +755,6 @@ mod tests {
                 memories.clone(),
                 r#"{"relation":"supports","target":"mem-1"}"#,
             ),
-            Arc::new(FakeSkills::default()),
             Arc::new(FakeTasks::default()),
         );
         let home = session("home");
@@ -1115,12 +776,11 @@ mod tests {
 
     #[tokio::test]
     async fn dedups_extracted_memory_across_repeated_reviews() {
-        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"skills":[],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"commitments":[]}"#;
         let memories = Arc::new(FakeMemories::default());
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
             consolidator_over(memories.clone()),
-            Arc::new(FakeSkills::default()),
             Arc::new(FakeTasks::default()),
         );
         let s = chat_session("s42", "42");
@@ -1138,7 +798,7 @@ mod tests {
         // from a *different* session, so the per-session source dedup can't catch
         // it. The reviewer must still refuse to re-ingest it (the assistant likely
         // echoed a recalled fact), instead of minting a duplicate candidate.
-        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"skills":[],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"commitments":[]}"#;
         let memories = Arc::new(FakeMemories::default());
         let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
@@ -1152,7 +812,6 @@ mod tests {
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
             consolidator_over(memories.clone()),
-            Arc::new(FakeSkills::default()),
             Arc::new(FakeTasks::default()),
         );
         let outcome = reviewer
@@ -1170,7 +829,7 @@ mod tests {
         // The same fact held active but scoped to a *different* channel was never
         // eligible to be recalled into this session, so it is not self-echo — a
         // channel-scoped candidate is still captured here.
-        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"skills":[],"commitments":[]}"#;
+        let reply = r#"{"memories":[{"kind":"fact","content":"komo uses Rust"}],"commitments":[]}"#;
         let memories = Arc::new(FakeMemories::default());
         let mut existing = Memory::new(MemoryKind::Fact, "komo uses Rust");
         existing.status = MemoryStatus::Active;
@@ -1183,7 +842,6 @@ mod tests {
         let reviewer = ReflectiveReviewer::new(
             Arc::new(FixedLlm(reply.to_string())),
             consolidator_over(memories.clone()),
-            Arc::new(FakeSkills::default()),
             Arc::new(FakeTasks::default()),
         );
         reviewer
@@ -1202,7 +860,7 @@ mod tests {
 
     #[test]
     fn prompt_bars_device_state_and_demands_self_contained_content() {
-        let prompt = review_prompt(&[], "");
+        let prompt = review_prompt(&[]);
         assert!(prompt.contains("is not a memory"));
         assert!(prompt.contains("target temperature"));
         assert!(prompt.contains("Do not return it under any kind"));

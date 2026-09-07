@@ -9,7 +9,7 @@ use komo_core::domain::skill::{Skill, SkillOffer};
 ///
 /// When built via [`load_from_dirs`](Self::load_from_dirs) the registry holds
 /// only the directory list and **re-scans on every query**, so a skill
-/// installed, promoted, enabled, or disabled on disk is reflected the next time
+/// installed, enabled, or disabled on disk is reflected the next time
 /// the `skill` tool runs — no gateway restart needed (the filesystem is the
 /// source of truth, matching `FsSkillStore` and the `komo skills` CLI). Reads
 /// touch only a handful of small files, so live scanning is cheap. A registry
@@ -284,12 +284,10 @@ mod tests {
             name: "fixed".into(),
             description: "d".into(),
             instructions: "b".into(),
-            protected: false,
             disabled: false,
             source: "user".into(),
             platforms: Vec::new(),
             requires_tools: Vec::new(),
-            updated_at: None,
         }]);
         assert_eq!(reg.get("fixed").unwrap().skill.instructions, "b");
         assert!(reg.catalog().contains("fixed"));
@@ -379,12 +377,10 @@ mod tests {
             name: "paused".into(),
             description: "d".into(),
             instructions: "b".into(),
-            protected: false,
             disabled: true,
             source: "user".into(),
             platforms: Vec::new(),
             requires_tools: Vec::new(),
-            updated_at: None,
         }]);
         assert!(reg.is_empty());
         assert!(reg.catalog().is_empty());

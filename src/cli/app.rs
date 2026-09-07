@@ -84,7 +84,7 @@ enum Commands {
         #[command(subcommand)]
         action: WikiAction,
     },
-    /// Inspect and govern skills
+    /// Inspect and manage skills
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
@@ -442,7 +442,7 @@ enum MemoryAction {
 
 #[derive(Subcommand)]
 enum SkillsAction {
-    /// List managed skills, shared ~/.agents/skills, and reviewer candidates
+    /// List managed skills and the shared ~/.agents/skills
     List,
     /// Install a skill from a git repo or a raw SKILL.md URL into the active
     /// store (owner/repo, owner/repo/subpath, a GitHub URL, a *.git/git@ URL,
@@ -450,26 +450,6 @@ enum SkillsAction {
     Install {
         /// Where to fetch the skill from
         source: String,
-    },
-    /// Accept a reviewer candidate into the active store
-    Promote {
-        /// Skill name (as shown under `candidates` in `skills list`)
-        name: String,
-    },
-    /// Discard a reviewer candidate
-    Reject {
-        /// Skill name
-        name: String,
-    },
-    /// Mark a skill operator-edit-only (the reviewer stops proposing changes)
-    Protect {
-        /// Skill name
-        name: String,
-    },
-    /// Clear the protected flag
-    Unprotect {
-        /// Skill name
-        name: String,
     },
     /// Re-enable a disabled skill
     Enable {
@@ -481,25 +461,10 @@ enum SkillsAction {
         /// Skill name
         name: String,
     },
-    /// Retire an active skill: move it out of the catalog, keep the files
-    Archive {
-        /// Skill name
-        name: String,
-    },
-    /// Bring an archived skill back into the active catalog
-    Restore {
-        /// Skill name
-        name: String,
-    },
-    /// Show one skill in full: status, provenance, path, history, body
+    /// Show one skill in full: status, provenance, path, body
     Inspect {
         /// Skill name
         name: String,
-    },
-    /// Which turns loaded this skill; without a name, every skill coldest-first
-    Audit {
-        /// Skill name (omit for the whole ranking)
-        name: Option<String>,
     },
 }
 
@@ -710,18 +675,9 @@ pub async fn run() -> anyhow::Result<()> {
         Some(Commands::Skills { action }) => match action {
             SkillsAction::List => skill::list(),
             SkillsAction::Install { source } => skill::install(&source).await,
-            SkillsAction::Promote { name } => skill::promote(&name),
-            SkillsAction::Reject { name } => skill::reject(&name),
-            SkillsAction::Protect { name } => skill::protect(&name, true),
-            SkillsAction::Unprotect { name } => skill::protect(&name, false),
             SkillsAction::Enable { name } => skill::set_enabled(&name, true),
             SkillsAction::Disable { name } => skill::set_enabled(&name, false),
-            SkillsAction::Archive { name } => skill::archive(&name),
-            SkillsAction::Restore { name } => skill::restore(&name),
             SkillsAction::Inspect { name } => skill::inspect(&name),
-            SkillsAction::Audit { name } => {
-                skill::audit(&operator(&config).await?, name.as_deref()).await
-            }
         },
         Some(Commands::Journey { limit, since }) => {
             journey::journey(&operator(&config).await?, limit, since).await

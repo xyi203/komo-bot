@@ -135,16 +135,11 @@ pub(crate) fn memory_events(memories: &[Memory]) -> Vec<Event> {
     events
 }
 
-/// Flatten the skill store into candidate / active events, timed by the
-/// `SKILL.md` file mtime. Reads files only — no db lock, so it works while the
-/// gateway runs (same as `komo skills`).
+/// Flatten the skill store into activation events, timed by the `SKILL.md` file
+/// mtime. Reads files only — no db lock, so it works while the gateway runs
+/// (same as `komo skills`).
 fn skill_events(store: &FsSkillStore) -> Vec<Event> {
     let mut events = Vec::new();
-    for s in store.list_candidates() {
-        if let Some(at) = mtime(&store.candidate_path(&s.name)) {
-            events.push(skill_event(at, "候选", &s));
-        }
-    }
     for s in store.list_active() {
         if let Some(at) = mtime(&store.active_path(&s.name)) {
             events.push(skill_event(at, "活跃", &s));

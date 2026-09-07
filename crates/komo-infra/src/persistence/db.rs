@@ -34,7 +34,6 @@ use komo_core::domain::{
     session_event::{
         SESSION_EVENT_VERSION, SessionEvent, SessionEventKind, SessionHeader, SurfaceProjection,
     },
-    skill::Skill,
     task::TaskRepository,
     todo::{SessionTodoRepository, TodoItem},
 };
@@ -108,15 +107,6 @@ const SESSION_COLUMNS: &[(&str, &str)] = &[
     ("origin", "\"origin\" text NOT NULL DEFAULT 'user'"),
     ("awaiting", "\"awaiting\" text NOT NULL DEFAULT ''"),
 ];
-
-#[derive(Debug, toasty::Model)]
-struct SkillRecord {
-    #[key]
-    name: String,
-    description: String,
-    instructions: String,
-    protected: bool,
-}
 
 /// Session-scoped working todo list (`domain/todo.rs`). One row per session;
 /// `items` is the JSON-serialized `Vec<TodoItem>`. Disposable working state —
@@ -464,7 +454,6 @@ impl Db {
         let db = toasty::Db::builder()
             .models(toasty::models!(
                 SessionRecord,
-                SkillRecord,
                 SessionTodoRecord,
                 PairingRecord,
                 LockoutRecord,
@@ -662,22 +651,6 @@ fn retire_merged(path: &Path) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("retiring {} after the merge: {e}", from.display()))?;
     }
     Ok(())
-}
-
-// ── legacy skills (read-only) ─────────────────────────────────────────────────
-
-impl Db {
-    /// The skills a pre-filesystem komo accumulated in `komo.db` (the
-    /// reviewer used to write here; the runtime never read it). Read-only:
-    /// skills now live as files under `~/.komo/skills` (`infra/skills.rs`),
-    /// and this backs the one-time candidate import at wiring time. The
-    /// `SkillRecord` table stays in the schema only so old dbs remain readable.
-    pub async fn export_legacy_skills(&self) -> anyhow::Result<Vec<Skill>> {
-        let mut conn = self.inner.connection().await?;
-        let mut rows = toasty::query!(SkillRecord).exec(&mut conn).await?;
-        rows.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(rows.into_iter().map(skill_from_record).collect())
-    }
 }
 
 // ── SessionRepository ─────────────────────────────────────────────────────────
@@ -1482,18 +1455,6 @@ impl RunRepository for Db {
             .collect())
     }
 
-    async fn steps_by_tool(&self, tool_name: &str, limit: usize) -> anyhow::Result<Vec<RunStep>> {
-        let mut conn = self.inner.connection().await?;
-        // Filter, ordering, and cap pushed to SQL (tool_name is unindexed — a
-        // scan bounded by the pruned ledger's size, audit-frequency only).
-        let rows = toasty::query!(
-            RunStepRecord FILTER .tool_name == #tool_name ORDER BY .started_at DESC LIMIT #limit
-        )
-        .exec(&mut conn)
-        .await?;
-        Ok(rows.into_iter().map(step_from_record).collect())
-    }
-
     async fn unlearned(&self, session_id: Option<&str>, limit: usize) -> anyhow::Result<Vec<Run>> {
         let mut conn = self.inner.connection().await?;
         // The `learned` filter and the cap are pushed to SQL: once the ledger
@@ -2006,25 +1967,6 @@ fn session_from_record(record: SessionRecord, messages: Vec<Message>) -> Session
         channel,
         origin,
         awaiting,
-    }
-}
-
-fn skill_from_record(record: SkillRecord) -> Skill {
-    Skill {
-        name: record.name,
-        description: record.description,
-        instructions: record.instructions,
-        protected: record.protected,
-        disabled: false,
-        // Every db-era skill was a reviewer extraction (there was no other
-        // writer); tag it so the imported candidate shows its provenance.
-        source: komo_core::domain::skill::SOURCE_REVIEWER.to_string(),
-        // The db schema predates offer gating: ungated, like any skill that
-        // declares neither key.
-        platforms: Vec::new(),
-        requires_tools: Vec::new(),
-        // Stamped when the import writes the file, not carried from the row.
-        updated_at: None,
     }
 }
 
@@ -2967,33 +2909,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_skills_export_reads_old_rows() {
-        // Skills now live as files (`infra/skills.rs`); the db only backs the
-        // one-time candidate import. Seed a legacy row directly and check the
-        // export maps it with reviewer provenance.
-        let db = Db::connect(&sqlite_url("komo_skill_repo_test.db"))
-            .await
-            .unwrap();
-        let mut conn = db.inner.connection().await.unwrap();
-        toasty::create!(SkillRecord {
-            name: "debug-builds".to_string(),
-            description: "Debug build failures".to_string(),
-            instructions: "Check compiler errors first.".to_string(),
-            protected: true,
-        })
-        .exec(&mut conn)
-        .await
-        .unwrap();
-        drop(conn);
-
-        let rows = db.export_legacy_skills().await.unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].name, "debug-builds");
-        assert!(rows[0].protected);
-        assert_eq!(rows[0].source, komo_core::domain::skill::SOURCE_REVIEWER);
-    }
-
-    #[tokio::test]
     async fn find_windowed_returns_recent_messages_in_order() {
         let db = Db::connect(&sqlite_url("komo_find_windowed_test.db"))
             .await
@@ -3700,15 +3615,13 @@ mod tests {
             .unwrap();
         assert_eq!(uses.len(), 1);
         assert_eq!(uses[0].run_id, "t1");
-        let audit = RunRepository::steps_by_tool(&db, "time", 10).await.unwrap();
-        assert_eq!(audit.len(), 1);
         let pending = RunRepository::unlearned(&db, None, 10).await.unwrap();
         assert_eq!(pending.len(), 1, "nobody has learned from it yet");
     }
 
     /// A commit runs after every turn and again on a rebuild, over rows it has
     /// already written. Duplicating a step would double the tool's history in
-    /// `skills audit`, and duplicating a link would double `memory used`.
+    /// `run inspect`, and duplicating a link would double `memory used`.
     #[tokio::test]
     async fn committing_the_same_fold_twice_changes_nothing() {
         let db = Db::connect(&sqlite_url("komo_projection_idem.db"))
@@ -3888,11 +3801,10 @@ mod tests {
                 ));
             }
             out.push_str(&format!(
-                "{:?}{:?}{:?}",
+                "{:?}{:?}",
                 RunRepository::runs_using_memory(db, "m1", 10)
                     .await
                     .unwrap(),
-                RunRepository::steps_by_tool(db, "time", 10).await.unwrap(),
                 RunRepository::unlearned(db, None, 10).await.unwrap(),
             ));
             out

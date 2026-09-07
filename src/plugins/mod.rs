@@ -502,9 +502,6 @@ pub struct SweepCx<'a> {
     pub notifier: Arc<dyn Notifier>,
     pub review: Arc<LearningCoordinator>,
     pub memories: Arc<dyn MemoryRepository>,
-    /// The governed skill store — dreaming's proposal half withdraws lapsed
-    /// candidates from it.
-    pub skill_store: Arc<FsSkillStore>,
     pub aux_llm: Arc<dyn LlmClient>,
     pub briefing_runtime: Arc<AgentRuntime>,
     pub maintenance_schedule: Schedule,

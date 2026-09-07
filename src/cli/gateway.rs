@@ -247,7 +247,6 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         notifier: notifier.clone(),
         review: wired.review.clone(),
         memories: wired.memories.clone(),
-        skill_store: wired.skills.clone(),
         aux_llm: wired.aux_llm.clone(),
         briefing_runtime: wired.briefing_runtime.clone(),
         maintenance_schedule: review_schedule,

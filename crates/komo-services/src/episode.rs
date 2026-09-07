@@ -82,9 +82,6 @@ mod tests {
         async fn reconcile_interrupted(&self, _now: i64) -> anyhow::Result<usize> {
             Ok(0)
         }
-        async fn steps_by_tool(&self, _tool: &str, _limit: usize) -> anyhow::Result<Vec<RunStep>> {
-            Ok(Vec::new())
-        }
         async fn unlearned(
             &self,
             _session_id: Option<&str>,

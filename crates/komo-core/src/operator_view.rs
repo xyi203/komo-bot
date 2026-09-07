@@ -55,45 +55,6 @@ pub struct PairingView {
     pub created_at: i64,
 }
 
-/// One `skill view` step from the run ledger (backs `komo skills audit`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillInvocation {
-    pub run_id: String,
-    pub seq: i64,
-    pub started_at: i64,
-    pub ok: bool,
-    /// How the turn that loaded this skill turned out. `ok` above says the
-    /// *load* worked, which is a different and much weaker claim.
-    #[serde(default)]
-    pub verdict: crate::domain::episode::OutcomeVerdict,
-}
-
-/// One skill's usage across the ledger scan window (backs the aggregate
-/// `komo skills audit`). Derived on every call — no counter is stored anywhere,
-/// so this reflects exactly what the ledger still holds.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillUsage {
-    pub name: String,
-    /// `skill view` steps seen in the scan window.
-    pub views: usize,
-    /// When it was last loaded; `None` = not once in the window.
-    pub last_at: Option<i64>,
-    /// Distinct turns that loaded it, bucketed by how they turned out. Counted
-    /// per **run**, not per view: a skill loaded twice in one turn is one piece
-    /// of evidence about that turn, not two.
-    ///
-    /// `unknown` is the honest majority and is not a silent success: a turn
-    /// whose outcome nothing settled says nothing about whether the skill
-    /// helped — and a skill that was loaded but never actually followed lands
-    /// here too, since the ledger cannot see adoption.
-    #[serde(default)]
-    pub succeeded: usize,
-    #[serde(default)]
-    pub failed: usize,
-    #[serde(default)]
-    pub unknown: usize,
-}
-
 /// The result of resuming an interrupted run, consumed by `komo run resume`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeOutcome {
@@ -144,21 +105,12 @@ pub struct DreamReport {
     /// CLI can still render the actionable buckets safely.
     #[serde(default)]
     pub candidate_count: usize,
-    /// Skill proposals this cycle would withdraw, by name — the other half of
-    /// dreaming's governance. Names only: a proposal's body is `komo skills
-    /// inspect`'s business, and the preview's job is to say what will move.
-    #[serde(default)]
-    pub expire_skills: Vec<String>,
-    /// Skill candidates awaiting triage, expiring or not — the denominator the
-    /// withdrawal count means nothing without.
-    #[serde(default)]
-    pub skill_candidate_count: usize,
 }
 
 impl DreamReport {
     /// Whether this cycle has any state transition to apply.
     pub fn has_actions(&self) -> bool {
-        !self.promote.is_empty() || !self.archive.is_empty() || !self.expire_skills.is_empty()
+        !self.promote.is_empty() || !self.archive.is_empty()
     }
 
     /// Memory candidates that are neither ready to promote nor old and cold
@@ -166,12 +118,6 @@ impl DreamReport {
     pub fn observing_count(&self) -> usize {
         self.candidate_count
             .saturating_sub(self.promote.len() + self.archive.len())
-    }
-
-    /// Skill proposals still inside their window, waiting on a human verdict.
-    pub fn skills_awaiting_count(&self) -> usize {
-        self.skill_candidate_count
-            .saturating_sub(self.expire_skills.len())
     }
 
     /// Backwards-compatible spelling for callers that mean “no state changes”,

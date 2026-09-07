@@ -7,12 +7,10 @@
 //! business result can't fork between the two paths.
 
 use anyhow::Context;
-use komo_core::domain::episode::{OutcomeAssessment, OutcomeVerdict};
 use komo_services::cron_actions;
 /// Re-exported so every operator-control caller keeps naming one place for
 /// the unknown-job message, wherever the implementation lives.
 pub use komo_services::cron_actions::no_cron_job_message;
-use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::domain::context::SessionOrigin;
@@ -23,12 +21,8 @@ use crate::domain::memory::{
 };
 use crate::domain::message::Message;
 use crate::domain::pairing::{ApproveOutcome, PairingRepository, PairingRequest, PairingStatus};
-use crate::domain::repository::{
-    MessageRepository, SessionEventRepository, SessionRepository, SkillRepository,
-};
-use crate::domain::run::{
-    MemoryUse, Run, RunRepository, RunStep, resume_prompt, skill_viewed, step_views_skill,
-};
+use crate::domain::repository::{MessageRepository, SessionEventRepository, SessionRepository};
+use crate::domain::run::{MemoryUse, Run, RunRepository, RunStep, resume_prompt};
 use crate::domain::session::Session;
 use crate::domain::skill::Skill;
 use crate::domain::task::{Task, TaskRepository};
@@ -36,8 +30,8 @@ use crate::domain::todo::SessionTodoRepository;
 
 use super::now;
 use super::request::{
-    DreamItem, DreamReport, MemoryTransitionAction, PairingView, SessionSummary, SkillInvocation,
-    SkillUsage, WikiHitView, WikiIndexView, WikiStatusView,
+    DreamItem, DreamReport, MemoryTransitionAction, PairingView, SessionSummary, WikiHitView,
+    WikiIndexView, WikiStatusView,
 };
 use komo_core::domain::chunk_index::{
     ChunkIndex, DIVERSIFY_OVERFETCH, MAX_CHUNKS_PER_FILE, diversify,
@@ -99,7 +93,7 @@ pub struct OperatorActions {
     pub tasks: Arc<dyn TaskRepository>,
     pub memories: Arc<dyn MemoryRepository>,
     pub runs: Arc<dyn RunRepository>,
-    /// The concrete store, not `SkillRepository`: that trait carries only the
+    /// The concrete store: that is where every skill read lives — the
     /// automated write path (find/list/save), while every governance transition
     /// — promote, archive, expire — is an inherent method on the store.
     pub skills: Arc<komo_infra::skills::FsSkillStore>,
@@ -314,29 +308,7 @@ impl OperatorActions {
     }
 
     pub async fn list_skills(&self) -> anyhow::Result<Vec<Skill>> {
-        let mut skills = self.skills.list().await?;
-        skills.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(skills)
-    }
-
-    pub async fn skill_audit(&self, name: &str) -> anyhow::Result<Vec<SkillInvocation>> {
-        let steps = self.runs.steps_by_tool("skill", AUDIT_SCAN_LIMIT).await?;
-        Ok(skill_invocations(
-            steps,
-            name,
-            AUDIT_RESULT_CAP,
-            &self.run_verdicts().await?,
-        ))
-    }
-
-    /// How each recent run turned out, for attributing a skill's loads.
-    ///
-    /// One bounded read rather than a lookup per step: a skill loaded in fifty
-    /// turns would otherwise be fifty key reads to answer one report. A run
-    /// outside the window is absent, which reads as `Unknown` — the same thing
-    /// it would say if it were there and unsettled.
-    async fn run_verdicts(&self) -> anyhow::Result<HashMap<String, OutcomeVerdict>> {
-        Ok(run_verdicts(self.runs.list(AUDIT_SCAN_LIMIT).await?))
+        Ok(self.skills.list_active())
     }
 
     /// Which turns a memory reached the prompt of, newest first.
@@ -353,14 +325,6 @@ impl OperatorActions {
         self.runs.runs_using_memory(memory_id, limit).await
     }
 
-    /// Every active skill ranked coldest-first — the aggregate the per-name
-    /// audit could not answer ("which of these has nobody used?").
-    pub async fn skill_usage(&self) -> anyhow::Result<Vec<SkillUsage>> {
-        let steps = self.runs.steps_by_tool("skill", AUDIT_SCAN_LIMIT).await?;
-        let names = self.skills.list().await?.into_iter().map(|s| s.name);
-        Ok(skill_usage(names, steps, &self.run_verdicts().await?))
-    }
-
     pub async fn pairing_views(&self) -> anyhow::Result<Vec<PairingView>> {
         Ok(pairing_views(self.pairings.list().await?, now()))
     }
@@ -374,13 +338,7 @@ impl OperatorActions {
     }
 
     pub async fn dream_preview(&self) -> anyhow::Result<DreamReport> {
-        let now = now();
-        let mut report = dream_classify(&self.memories.list().await?, now);
-        let (expire_skills, skill_candidate_count) =
-            dream_classify_skills(&self.skills.list_candidates(), now);
-        report.expire_skills = expire_skills;
-        report.skill_candidate_count = skill_candidate_count;
-        Ok(report)
+        Ok(dream_classify(&self.memories.list().await?, now()))
     }
 
     pub async fn home_override(&self) -> anyhow::Result<Option<String>> {
@@ -427,11 +385,6 @@ impl OperatorActions {
         cron_actions::trigger_cron_job(self.cron_jobs.as_ref(), name, now()).await
     }
 }
-
-/// How many `skill`-tool ledger steps one audit request scans, and how many
-/// matches it returns.
-pub const AUDIT_SCAN_LIMIT: usize = 500;
-pub const AUDIT_RESULT_CAP: usize = 50;
 
 /// How many recent runs a no-id `run resume` scans for the latest recoverable.
 pub const RESUME_SCAN_LIMIT: usize = 100;
@@ -629,119 +582,9 @@ pub fn pairing_views(pairings: Vec<PairingRequest>, now: i64) -> Vec<PairingView
         .collect()
 }
 
-/// Index runs by how they turned out. Shared by both operator transports so
-/// the two cannot disagree about what a stored assessment means — an
-/// unparseable or absent one reads as `Unknown`, never as success.
-pub fn run_verdicts(runs: Vec<komo_core::domain::run::Run>) -> HashMap<String, OutcomeVerdict> {
-    runs.into_iter()
-        .map(|run| {
-            let verdict = serde_json::from_str::<OutcomeAssessment>(&run.outcome)
-                .map(|a| a.verdict)
-                .unwrap_or_default();
-            (run.id, verdict)
-        })
-        .collect()
-}
-
-/// Filter `skill`-tool steps down to the views of one skill (newest-first in,
-/// newest-first out). A skill "used" is exactly a `skill view` step — nothing
-/// stores usage counters; the audit is always derived from the ledger.
-pub fn skill_invocations(
-    steps: Vec<RunStep>,
-    name: &str,
-    cap: usize,
-    verdicts: &HashMap<String, OutcomeVerdict>,
-) -> Vec<SkillInvocation> {
-    steps
-        .into_iter()
-        .filter(|s| step_views_skill(s, name))
-        .take(cap)
-        .map(|s| SkillInvocation {
-            verdict: verdicts.get(&s.run_id).copied().unwrap_or_default(),
-            run_id: s.run_id,
-            seq: s.seq,
-            started_at: s.started_at,
-            ok: s.ok,
-        })
-        .collect()
-}
-
-/// Roll `skill`-tool steps up into one row per skill, coldest first (never
-/// loaded, then least recently loaded). Skills are named by the caller rather
-/// than discovered from the steps, so a skill nobody has ever touched — the
-/// whole point of the report — still gets a row.
-pub fn skill_usage(
-    names: impl IntoIterator<Item = String>,
-    steps: Vec<RunStep>,
-    verdicts: &HashMap<String, OutcomeVerdict>,
-) -> Vec<SkillUsage> {
-    let mut rows: BTreeMap<String, SkillUsage> = names
-        .into_iter()
-        .map(|name| {
-            (
-                name.clone(),
-                SkillUsage {
-                    name,
-                    views: 0,
-                    last_at: None,
-                    succeeded: 0,
-                    failed: 0,
-                    unknown: 0,
-                },
-            )
-        })
-        .collect();
-    let mut counted: HashSet<(String, String)> = HashSet::new();
-    for step in steps {
-        let Some(name) = skill_viewed(&step) else {
-            continue;
-        };
-        // A view of a skill that is no longer active still counts: it says the
-        // ledger knows this name, which is exactly what a `restore` decision
-        // wants. It just has no row unless the caller named it.
-        let Some(row) = rows.get_mut(&name) else {
-            continue;
-        };
-        row.views += 1;
-        row.last_at = Some(
-            row.last_at
-                .map_or(step.started_at, |at| at.max(step.started_at)),
-        );
-        // Per run, not per view: a skill loaded twice in one turn is one piece
-        // of evidence about that turn.
-        if counted.insert((name.clone(), step.run_id.clone())) {
-            match verdicts.get(&step.run_id).copied().unwrap_or_default() {
-                OutcomeVerdict::Success => row.succeeded += 1,
-                OutcomeVerdict::Failure => row.failed += 1,
-                OutcomeVerdict::Unknown => row.unknown += 1,
-            }
-        }
-    }
-    let mut rows: Vec<SkillUsage> = rows.into_values().collect();
-    // `None` sorts before `Some`, so never-used lands first; ties keep the
-    // BTreeMap's name order so the report is stable between runs.
-    rows.sort_by(|a, b| a.last_at.cmp(&b.last_at).then_with(|| a.name.cmp(&b.name)));
-    rows
-}
-
 /// Classify the memory library into the dreaming dry-run report: which
 /// candidates would promote (strongest case first) and which would archive.
 /// The same `dream_verdict` the sweep applies — this only *previews* it.
-/// The skill half of the preview: which proposals this cycle would withdraw,
-/// and how many are waiting on a verdict at all.
-pub fn dream_classify_skills(
-    candidates: &[komo_core::domain::skill::Skill],
-    now: i64,
-) -> (Vec<String>, usize) {
-    use komo_core::domain::skill::candidate_expired;
-    let expiring = candidates
-        .iter()
-        .filter(|skill| candidate_expired(skill, now))
-        .map(|skill| skill.name.clone())
-        .collect();
-    (expiring, candidates.len())
-}
-
 pub fn dream_classify(memories: &[Memory], now: i64) -> DreamReport {
     let mut report = DreamReport::default();
     for m in memories {
@@ -781,68 +624,6 @@ mod tests {
         let mut s = Session::new(id);
         s.status = status.to_string();
         s
-    }
-
-    fn skill_step(args: String, at: i64) -> RunStep {
-        RunStep {
-            run_id: "run".to_string(),
-            seq: 1,
-            tool_name: "skill".to_string(),
-            args,
-            result: "done".to_string(),
-            error: String::new(),
-            ok: true,
-            uncertain: false,
-            started_at: at,
-            ended_at: at,
-            elapsed_ms: 1,
-            structured: serde_json::Value::Null,
-            output_paths: Vec::new(),
-            approved_by: String::new(),
-            approval_waited_ms: 0,
-        }
-    }
-
-    fn view_step(skill: &str, at: i64) -> RunStep {
-        skill_step(format!(r#"{{"action":"view","name":"{skill}"}}"#), at)
-    }
-
-    /// The report's reason to exist: a skill nobody has loaded still gets a row,
-    /// and it sorts first.
-    #[test]
-    fn skill_usage_ranks_never_used_skills_first() {
-        let names = ["cold", "warm", "hot"].map(str::to_string);
-        let steps = vec![
-            view_step("hot", 300),
-            view_step("hot", 100),
-            view_step("warm", 200),
-            // A view of a skill that is no longer active is not invented into a row.
-            view_step("archived-one", 400),
-        ];
-
-        let rows = skill_usage(names, steps, &HashMap::new());
-        let shape: Vec<_> = rows
-            .iter()
-            .map(|r| (r.name.as_str(), r.views, r.last_at))
-            .collect();
-        assert_eq!(
-            shape,
-            vec![
-                ("cold", 0, None),
-                ("warm", 1, Some(200)),
-                ("hot", 2, Some(300)),
-            ]
-        );
-    }
-
-    /// Non-`view` skill calls (`learn`, `install`) are not uses of a skill.
-    #[test]
-    fn skill_usage_counts_only_view_steps() {
-        let learn = skill_step(r#"{"action":"learn","name":"warm"}"#.to_string(), 500);
-
-        let rows = skill_usage(["warm".to_string()], vec![learn], &HashMap::new());
-        assert_eq!(rows[0].views, 0);
-        assert_eq!(rows[0].last_at, None);
     }
 
     /// The repair widens only the ephemeral `api` scopes, leaves a real chat
@@ -966,98 +747,5 @@ mod tests {
         assert!(!report.has_actions());
         assert_eq!(report.candidate_count, 1);
         assert_eq!(report.observing_count(), 1);
-    }
-
-    fn viewed_in(run_id: &str, seq: i64, name: &str, at: i64) -> RunStep {
-        RunStep {
-            run_id: run_id.into(),
-            seq,
-            tool_name: "skill".into(),
-            args: format!(r#"{{"action":"view","name":"{name}"}}"#),
-            result: String::new(),
-            error: String::new(),
-            ok: true,
-            uncertain: false,
-            started_at: at,
-            ended_at: at,
-            elapsed_ms: 0,
-            structured: serde_json::Value::Null,
-            output_paths: Vec::new(),
-            approved_by: String::new(),
-            approval_waited_ms: 0,
-        }
-    }
-
-    fn verdicts(pairs: &[(&str, OutcomeVerdict)]) -> HashMap<String, OutcomeVerdict> {
-        pairs.iter().map(|(id, v)| (id.to_string(), *v)).collect()
-    }
-
-    /// A skill loaded twice inside one turn is one piece of evidence about that
-    /// turn. Counting the views would let a single failure look like two.
-    #[test]
-    fn one_turn_counts_once_however_many_times_it_loaded_the_skill() {
-        let steps = vec![
-            viewed_in("run-1", 1, "deploy", 100),
-            viewed_in("run-1", 5, "deploy", 110),
-        ];
-        let rows = skill_usage(
-            ["deploy".to_string()],
-            steps,
-            &verdicts(&[("run-1", OutcomeVerdict::Failure)]),
-        );
-        assert_eq!(rows[0].views, 2, "both loads are still visible");
-        assert_eq!(rows[0].failed, 1, "but they are one failing turn");
-        assert_eq!(rows[0].succeeded + rows[0].unknown, 0);
-    }
-
-    /// An unsettled turn is not a quiet success — which is also where a skill
-    /// that was loaded but never actually followed ends up, since the ledger
-    /// cannot see adoption.
-    #[test]
-    fn an_unsettled_turn_is_never_counted_as_a_success() {
-        let rows = skill_usage(
-            ["deploy".to_string()],
-            vec![
-                viewed_in("run-1", 1, "deploy", 100),
-                viewed_in("run-2", 1, "deploy", 200),
-            ],
-            // run-2 is outside the verdict window entirely.
-            &verdicts(&[("run-1", OutcomeVerdict::Unknown)]),
-        );
-        assert_eq!(rows[0].succeeded, 0);
-        assert_eq!(rows[0].unknown, 2);
-    }
-
-    #[test]
-    fn turns_are_bucketed_by_how_they_ended_not_by_whether_the_load_worked() {
-        let rows = skill_usage(
-            ["deploy".to_string()],
-            vec![
-                viewed_in("run-1", 1, "deploy", 100),
-                viewed_in("run-2", 1, "deploy", 200),
-                viewed_in("run-3", 1, "deploy", 300),
-            ],
-            &verdicts(&[
-                ("run-1", OutcomeVerdict::Success),
-                ("run-2", OutcomeVerdict::Failure),
-                ("run-3", OutcomeVerdict::Unknown),
-            ]),
-        );
-        assert_eq!(
-            (rows[0].succeeded, rows[0].failed, rows[0].unknown),
-            (1, 1, 1)
-        );
-    }
-
-    #[test]
-    fn an_invocation_carries_its_turns_verdict() {
-        let hits = skill_invocations(
-            vec![viewed_in("run-1", 1, "deploy", 100)],
-            "deploy",
-            10,
-            &verdicts(&[("run-1", OutcomeVerdict::Failure)]),
-        );
-        assert_eq!(hits[0].verdict, OutcomeVerdict::Failure);
-        assert!(hits[0].ok, "the load itself still succeeded");
     }
 }

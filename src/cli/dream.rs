@@ -13,8 +13,6 @@
 //! transport answers (a running gateway, or the store directly) is not this
 //! module's business.
 
-use komo_core::domain::skill::SKILL_CANDIDATE_EXPIRY_DAYS;
-
 use crate::services::operator_control::{
     DreamItem, OperatorCommand, OperatorCommandResult, OperatorControl, OperatorQuery,
     OperatorQueryResult,
@@ -39,25 +37,9 @@ pub async fn run(control: &OperatorControl, apply: bool) -> anyhow::Result<()> {
     );
     report_bucket("archive (refuted, or old and gone cold)", &report.archive);
 
-    if !report.expire_skills.is_empty() {
-        println!(
-            "\nwithdraw skill proposal (no verdict in {} days): {}",
-            SKILL_CANDIDATE_EXPIRY_DAYS,
-            report.expire_skills.len()
-        );
-        for name in &report.expire_skills {
-            println!("  {name}");
-        }
-        println!("  → recoverable with `komo skills restore <name>`");
-    }
-
     let observing = report.observing_count();
     if observing > 0 {
         println!("\nobserving: {observing} candidate(s) still within the evidence or aging window");
-    }
-    let awaiting = report.skills_awaiting_count();
-    if awaiting > 0 {
-        println!("awaiting triage: {awaiting} skill proposal(s) still inside the window");
     }
 
     if !apply {
@@ -65,27 +47,22 @@ pub async fn run(control: &OperatorControl, apply: bool) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let OperatorCommandResult::DreamApplied {
-        promoted,
-        archived,
-        skills_expired,
-    } = control.command(OperatorCommand::DreamApply).await?
+    let OperatorCommandResult::DreamApplied { promoted, archived } =
+        control.command(OperatorCommand::DreamApply).await?
     else {
         unreachable!("DreamApply answers with DreamApplied");
     };
-    println!(
-        "\nApplied: promoted {promoted}, archived {archived}, withdrew {skills_expired} skill proposal(s)."
-    );
+    println!("\nApplied: promoted {promoted}, archived {archived}.");
     Ok(())
 }
 
 fn no_action_summary(report: &crate::services::operator_control::DreamReport) -> String {
-    if report.candidate_count == 0 && report.skill_candidate_count == 0 {
-        "Nothing to dream about — no candidate memories and no skill proposals.".into()
+    if report.candidate_count == 0 {
+        "Nothing to dream about — no candidate memories.".into()
     } else {
         format!(
-            "No state changes this cycle — {} memory candidate(s) and {} skill proposal(s) are still being observed.",
-            report.candidate_count, report.skill_candidate_count
+            "No state changes this cycle — {} memory candidate(s) are still being observed.",
+            report.candidate_count
         )
     }
 }
@@ -129,23 +106,14 @@ mod tests {
     fn no_action_summary_distinguishes_no_candidates_from_observation() {
         assert_eq!(
             no_action_summary(&DreamReport::default()),
-            "Nothing to dream about — no candidate memories and no skill proposals."
+            "Nothing to dream about — no candidate memories."
         );
         assert_eq!(
             no_action_summary(&DreamReport {
                 candidate_count: 3,
                 ..Default::default()
             }),
-            "No state changes this cycle — 3 memory candidate(s) and 0 skill proposal(s) are still being observed."
-        );
-        // Skill proposals alone are enough to have something under observation:
-        // a library with no memory candidates is not an idle cycle.
-        assert_eq!(
-            no_action_summary(&DreamReport {
-                skill_candidate_count: 2,
-                ..Default::default()
-            }),
-            "No state changes this cycle — 0 memory candidate(s) and 2 skill proposal(s) are still being observed."
+            "No state changes this cycle — 3 memory candidate(s) are still being observed."
         );
     }
 }

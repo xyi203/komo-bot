@@ -4,7 +4,6 @@ use super::{
     message::Message,
     session::{ChannelPeer, Session},
     session_event::{SessionEvent, SessionEventKind, SurfaceProjection},
-    skill::Skill,
 };
 
 #[async_trait]
@@ -184,11 +183,4 @@ pub trait SessionEventRepository: Send + Sync {
     /// **space never outranks it** — a session sits over budget rather than
     /// drop a turn nobody has finished with.
     async fn retain(&self, session_id: &str, keep_from: u64) -> anyhow::Result<Option<u64>>;
-}
-
-#[async_trait]
-pub trait SkillRepository: Send + Sync {
-    async fn find(&self, name: &str) -> anyhow::Result<Option<Skill>>;
-    async fn list(&self) -> anyhow::Result<Vec<Skill>>;
-    async fn save(&self, skill: &Skill) -> anyhow::Result<()>;
 }

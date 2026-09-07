@@ -47,12 +47,6 @@ impl DirectOperatorAdapter {
         }
     }
 
-    /// The governed skill store. A path holder, not a connection — nothing to
-    /// open, so it is built per use rather than cached like the databases.
-    pub(super) fn skills(&self) -> komo_infra::skills::FsSkillStore {
-        komo_infra::skills::FsSkillStore::new(self.urls.skills_root.clone())
-    }
-
     /// The database — sessions, runs, tasks, memories, cron jobs — opened on
     /// first use.
     pub(super) async fn db(&self) -> anyhow::Result<&Arc<Db>> {
@@ -151,55 +145,8 @@ impl DirectOperatorAdapter {
                 now(),
             )),
             OperatorQuery::DreamPreview => {
-                let at = now();
                 let memories = MemoryRepository::list(self.db().await?.as_ref()).await?;
-                let mut report = actions::dream_classify(&memories, at);
-                let (expire_skills, skill_candidate_count) =
-                    actions::dream_classify_skills(&self.skills().list_candidates(), at);
-                report.expire_skills = expire_skills;
-                report.skill_candidate_count = skill_candidate_count;
-                OperatorQueryResult::DreamPreview(report)
-            }
-            OperatorQuery::SkillAudit { name } => {
-                let steps = RunRepository::steps_by_tool(
-                    self.db().await?.as_ref(),
-                    "skill",
-                    actions::AUDIT_SCAN_LIMIT,
-                )
-                .await?;
-                let runs =
-                    RunRepository::list(self.db().await?.as_ref(), actions::AUDIT_SCAN_LIMIT)
-                        .await?;
-                OperatorQueryResult::SkillAudit(actions::skill_invocations(
-                    steps,
-                    &name,
-                    actions::AUDIT_RESULT_CAP,
-                    &actions::run_verdicts(runs),
-                ))
-            }
-            // The skill store is files, not a locked db, so the direct adapter
-            // reads it straight rather than routing — same store the gateway's
-            // `OperatorActions` holds.
-            OperatorQuery::SkillUsage => {
-                let steps = RunRepository::steps_by_tool(
-                    self.db().await?.as_ref(),
-                    "skill",
-                    actions::AUDIT_SCAN_LIMIT,
-                )
-                .await?;
-                let names = self
-                    .skills()
-                    .list_active()
-                    .into_iter()
-                    .map(|skill| skill.name);
-                let runs =
-                    RunRepository::list(self.db().await?.as_ref(), actions::AUDIT_SCAN_LIMIT)
-                        .await?;
-                OperatorQueryResult::SkillUsage(actions::skill_usage(
-                    names,
-                    steps,
-                    &actions::run_verdicts(runs),
-                ))
+                OperatorQueryResult::DreamPreview(actions::dream_classify(&memories, now()))
             }
             OperatorQuery::HomeOverride => OperatorQueryResult::HomeOverride(
                 HomeRepository::get(self.db().await?.as_ref()).await?,
@@ -271,14 +218,12 @@ impl DirectOperatorAdapter {
             OperatorCommand::DreamApply => {
                 let summary = komo_bot::daemon::DreamSweep {
                     memories: self.db().await?.clone() as Arc<dyn MemoryRepository>,
-                    skills: Arc::new(self.skills()),
                 }
                 .apply()
                 .await?;
                 OperatorCommandResult::DreamApplied {
                     promoted: summary.memories_promoted,
                     archived: summary.memories_archived,
-                    skills_expired: summary.skill_candidates_expired,
                 }
             }
             // Backfill needs an embedder, which is assembled with the rest of

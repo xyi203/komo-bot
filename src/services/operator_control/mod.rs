@@ -38,10 +38,6 @@ pub struct StoreUrls {
     /// direct adapter can open the index itself when no gateway is running —
     /// the same reason the db urls are here.
     pub wiki: Option<komo_config::WikiConfig>,
-    /// The governed skill store's root, for the same reason: resolved from the
-    /// running config rather than from `FsSkillStore::default_root()`, so a
-    /// relocated `KOMO_HOME` reads its own skills and a test reads its temp dir.
-    pub skills_root: std::path::PathBuf,
 }
 
 impl StoreUrls {
@@ -49,7 +45,6 @@ impl StoreUrls {
         Self {
             db: runtime.db_url.clone(),
             wiki: runtime.wiki.clone(),
-            skills_root: runtime.home.join("skills"),
         }
     }
 }
@@ -193,7 +188,6 @@ mod tests {
             db: format!("turso:{}", dir.join("komo.db").display()),
             // These tests exercise the db-backed operations only.
             wiki: None,
-            skills_root: dir.join("skills"),
         }
     }
 

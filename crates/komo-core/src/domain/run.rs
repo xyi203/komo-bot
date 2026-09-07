@@ -477,12 +477,6 @@ pub trait RunRepository: Send + Sync {
     /// process that has just started knows nothing of its own is running.
     async fn reconcile_interrupted(&self, now: i64) -> anyhow::Result<usize>;
 
-    /// The most recent steps of one tool across all runs (newest first, capped
-    /// at `limit`). Backs derived audit views — e.g. which turns loaded a given
-    /// skill (`steps_by_tool("skill", …)` + [`step_views_skill`]) — without
-    /// adding usage fields to any model.
-    async fn steps_by_tool(&self, tool_name: &str, limit: usize) -> anyhow::Result<Vec<RunStep>>;
-
     /// The turns a given memory reached the prompt of, newest first.
     async fn runs_using_memory(
         &self,
@@ -511,30 +505,6 @@ pub trait RunRepository: Send + Sync {
     /// The run immediately before `run_id` in the same session, if any — whose
     /// work the user's next message is most likely commenting on.
     async fn previous_in_session(&self, run_id: &str) -> anyhow::Result<Option<Run>>;
-}
-
-/// Whether a ledger step is the `skill` tool loading `skill_name`'s
-/// instructions (`action=view`). The skill-invocation audit is *derived* from
-/// the ledger — a skill "used" is exactly a skill viewed; no usage counters are
-/// stored anywhere (roadmap §9 / "no dead fields").
-pub fn step_views_skill(step: &RunStep, skill_name: &str) -> bool {
-    skill_viewed(step).is_some_and(|name| name == skill_name)
-}
-
-/// The skill a ledger step loaded, or `None` when the step is not a `skill`
-/// `view`. The aggregate usage report bucket-sorts on this, so it must stay the
-/// single definition of "used" that [`step_views_skill`] also answers with.
-pub fn skill_viewed(step: &RunStep) -> Option<String> {
-    if step.tool_name != "skill" {
-        return None;
-    }
-    let args = serde_json::from_str::<serde_json::Value>(&step.args).ok()?;
-    if args.get("action").and_then(|v| v.as_str()) != Some("view") {
-        return None;
-    }
-    args.get("name")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -669,25 +639,6 @@ mod tests {
         let digest = tool_digest(&steps);
         assert!(digest.contains("more call(s)"), "{digest}");
         assert!(digest.len() < TOOL_NOTE_CAP + 500);
-    }
-
-    #[test]
-    fn step_views_skill_matches_only_view_steps_of_that_skill() {
-        let run = interrupted_run();
-        let mut s = step(&run, 0, "skill", true);
-        s.args = r#"{"action":"view","name":"feishu-calendar"}"#.to_string();
-        assert!(step_views_skill(&s, "feishu-calendar"));
-        assert!(!step_views_skill(&s, "other-skill"));
-
-        s.args = r#"{"action":"list"}"#.to_string();
-        assert!(!step_views_skill(&s, "feishu-calendar"));
-
-        let mut shell = step(&run, 1, "shell", true);
-        shell.args = r#"{"action":"view","name":"feishu-calendar"}"#.to_string();
-        assert!(!step_views_skill(&shell, "feishu-calendar"));
-
-        s.args = "not json".to_string();
-        assert!(!step_views_skill(&s, "feishu-calendar"));
     }
 
     #[test]

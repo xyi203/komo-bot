@@ -810,7 +810,7 @@ impl AgentRuntime {
     /// Close the turn out: commit the ledger, then let the log do its upkeep.
     ///
     /// **One read of the log serves both.** The fold *is* the ledger — the rows
-    /// `run list` and `skills audit` read are committed from it here — and the
+    /// `run list` reads are committed from it here — and the
     /// same fold says which turns retention may not cut, so reading the log
     /// twice per turn would be paying twice for one answer.
     ///

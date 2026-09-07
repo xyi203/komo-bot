@@ -42,12 +42,6 @@ impl GatewayOperatorAdapter {
             OperatorQuery::DreamPreview => {
                 OperatorQueryResult::DreamPreview(self.client.dream_preview().await?)
             }
-            OperatorQuery::SkillAudit { name } => {
-                OperatorQueryResult::SkillAudit(self.client.skill_audit(&name).await?)
-            }
-            OperatorQuery::SkillUsage => {
-                OperatorQueryResult::SkillUsage(self.client.skill_usage().await?)
-            }
             OperatorQuery::HomeOverride => {
                 OperatorQueryResult::HomeOverride(self.client.home_override().await?)
             }
@@ -95,12 +89,8 @@ impl GatewayOperatorAdapter {
                 revoked: self.client.pair_revoke(&id).await?,
             },
             OperatorCommand::DreamApply => {
-                let (promoted, archived, skills_expired) = self.client.dream_apply().await?;
-                OperatorCommandResult::DreamApplied {
-                    promoted,
-                    archived,
-                    skills_expired,
-                }
+                let (promoted, archived) = self.client.dream_apply().await?;
+                OperatorCommandResult::DreamApplied { promoted, archived }
             }
             OperatorCommand::MemoryBackfill => OperatorCommandResult::MemoryBackfilled {
                 embedded: self.client.memory_backfill().await?,

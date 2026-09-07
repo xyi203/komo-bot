@@ -1,15 +1,11 @@
 /// A named capability package: lightweight metadata (`name` + `description`)
 /// plus a full instruction body loaded on demand (progressive disclosure).
 ///
-/// Governance metadata lives in the same `SKILL.md` frontmatter as the
-/// identity fields (skills are files — roadmap §9; the filesystem is the single
-/// source of truth):
-/// - `protected`: only the operator may change this skill — the reviewer never
-///   writes a candidate proposal for it.
+/// Skills are written and installed by a human; the filesystem is the single
+/// source of truth. Two frontmatter keys beyond the identity fields matter:
 /// - `disabled`: kept on disk and inspectable, but hidden from the model's
 ///   catalog; `skill view` reports it as disabled instead of loading it.
-/// - `source`: provenance — `user` (hand-written, the default) or `reviewer`
-///   (extracted by the reflective reviewer).
+/// - `source`: free-form provenance, `user` by default.
 ///
 /// Two further keys gate where a skill is *offered* — see [`SkillOffer`]:
 /// - `platforms`: OS list (`[macos]`, `[linux, macos]`).
@@ -20,8 +16,6 @@ pub struct Skill {
     pub description: String,
     pub instructions: String,
     #[serde(default)]
-    pub protected: bool,
-    #[serde(default)]
     pub disabled: bool,
     #[serde(default = "default_source")]
     pub source: String,
@@ -29,17 +23,6 @@ pub struct Skill {
     pub platforms: Vec<String>,
     #[serde(default)]
     pub requires_tools: Vec<String>,
-    /// When the store last wrote this file, as unix seconds — read back from the
-    /// `updated_at` frontmatter the renderer has always written. `None` for a
-    /// hand-written file that carries no such key.
-    ///
-    /// An observation of the file, not state the caller sets: every write stamps
-    /// it afresh. It exists because a skill *candidate* has no other clock —
-    /// nothing can load one (dot directories never enter the runtime's scan), so
-    /// there is no usage signal to age it by, only how long the proposal has been
-    /// sitting there. See [`candidate_expired`].
-    #[serde(default)]
-    pub updated_at: Option<i64>,
 }
 
 /// What this runtime can offer, for **offer-time** skill gating.
@@ -81,22 +64,16 @@ fn normalize_platform(value: &str) -> String {
     }
 }
 
-/// Provenance values for [`Skill::source`].
+/// Default value for [`Skill::source`].
 pub const SOURCE_USER: &str = "user";
-pub const SOURCE_REVIEWER: &str = "reviewer";
-/// On-demand distillation the operator explicitly asked for (the `learn` action
-/// of the `skill` tool), as opposed to the reviewer's passive extraction. Both
-/// land as candidates for triage; the provenance only records *why* it exists.
-pub const SOURCE_LEARNED: &str = "learned";
 
 fn default_source() -> String {
     SOURCE_USER.to_string()
 }
 
 /// A skill name doubles as its directory name on disk, so it must be a plain
-/// path segment: non-empty, `[A-Za-z0-9._-]`, and not starting with `.` (dot
-/// prefixes are reserved for governance dirs like `.candidates`). This is the
-/// floor that keeps an LLM-suggested name from escaping the skills tree.
+/// path segment: non-empty, `[A-Za-z0-9._-]`, and not starting with `.`. This is
+/// the floor that keeps a fetched skill from escaping the skills tree.
 pub fn valid_skill_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
@@ -106,9 +83,9 @@ pub fn valid_skill_name(name: &str) -> bool {
 }
 
 impl Skill {
-    /// Parse a `SKILL.md` document: YAML-ish frontmatter (`name`, `description`,
-    /// and the governance keys `protected` / `disabled` / `source`) fenced by
-    /// `---`, followed by the instruction body.
+    /// Parse a `SKILL.md` document: YAML-ish frontmatter (`name`,
+    /// `description`, `disabled`, `source`) fenced by `---`, followed by the
+    /// instruction body.
     pub fn parse(content: &str) -> Option<Skill> {
         let rest = content.trim_start().strip_prefix("---")?;
         let fence = rest.find("\n---")?;
@@ -121,12 +98,10 @@ impl Skill {
 
         let mut name = None;
         let mut description = None;
-        let mut protected = false;
         let mut disabled = false;
         let mut source = default_source();
         let mut platforms = Vec::new();
         let mut requires_tools = Vec::new();
-        let mut updated_at = None;
         let lines: Vec<&str> = front.lines().collect();
         let mut cursor = 0;
         while let Some(line) = lines.get(cursor) {
@@ -135,8 +110,6 @@ impl Skill {
                 name = Some(unquote(v.trim()));
             } else if let Some(v) = line.strip_prefix("description:") {
                 description = Some(unquote(v.trim()));
-            } else if let Some(v) = line.strip_prefix("protected:") {
-                protected = v.trim() == "true";
             } else if let Some(v) = line.strip_prefix("disabled:") {
                 disabled = v.trim() == "true";
             } else if let Some(v) = line.strip_prefix("source:") {
@@ -145,8 +118,6 @@ impl Skill {
                 platforms = parse_list(v, &lines, &mut cursor);
             } else if let Some(v) = line.strip_prefix("requires_tools:") {
                 requires_tools = parse_list(v, &lines, &mut cursor);
-            } else if let Some(v) = line.strip_prefix("updated_at:") {
-                updated_at = parse_rfc3339(&unquote(v.trim()));
             }
         }
 
@@ -158,12 +129,10 @@ impl Skill {
             name,
             description: description.unwrap_or_default(),
             instructions: body,
-            protected,
             disabled,
             source,
             platforms,
             requires_tools,
-            updated_at,
         })
     }
 
@@ -217,45 +186,6 @@ fn unquote(s: &str) -> String {
     s.trim_matches(|c| c == '"' || c == '\'').to_string()
 }
 
-/// An RFC 3339 frontmatter stamp as unix seconds, or `None` when it does not
-/// parse — an unreadable date reads as "no date", which is what keeps a
-/// malformed stamp from being taken for the epoch and aging a skill out
-/// instantly.
-fn parse_rfc3339(value: &str) -> Option<i64> {
-    chrono::DateTime::parse_from_rfc3339(value)
-        .ok()
-        .map(|t| t.timestamp())
-}
-
-// ── candidate expiry (the skill half of dreaming) ────────────────────────────
-
-/// How long a skill candidate waits for a human verdict before dreaming
-/// withdraws it.
-///
-/// Thirty days, matching a memory candidate's forget window: these are both
-/// proposals that lapse for want of a decision. Withdrawal is reversible — the
-/// files move aside, nothing is deleted — and a pattern that still holds will be
-/// proposed again by the next review that sees it, which is what makes lapsing
-/// the right default rather than keeping every proposal forever.
-pub const SKILL_CANDIDATE_EXPIRY_DAYS: i64 = 30;
-
-/// Whether a candidate has sat unanswered long enough to be withdrawn.
-///
-/// Age is the *only* signal available here, and deliberately so. A candidate
-/// cannot be loaded — dot directories never enter the runtime's skill scan — so
-/// unlike a memory candidate it accumulates no usage to be judged on. A skill
-/// candidate that is never promoted is never used, and the only thing its
-/// continued presence measures is how long nobody has triaged it.
-///
-/// A file with no readable `updated_at` never expires: absent evidence of age is
-/// not evidence of staleness, and a hand-written candidate should not vanish
-/// because it lacks a key the store happens to write.
-pub fn candidate_expired(skill: &Skill, now: i64) -> bool {
-    skill
-        .updated_at
-        .is_some_and(|at| (now - at).max(0) / 86_400 > SKILL_CANDIDATE_EXPIRY_DAYS)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,18 +198,16 @@ mod tests {
         assert_eq!(skill.description, "Summarize a file");
         assert!(skill.instructions.starts_with("Step 1."));
         assert!(skill.instructions.contains("Step 2."));
-        assert!(!skill.protected);
         assert!(!skill.disabled);
         assert_eq!(skill.source, SOURCE_USER);
     }
 
     #[test]
     fn parses_governance_keys() {
-        let doc = "---\nname: risky\nprotected: true\ndisabled: true\nsource: reviewer\n---\nbody";
+        let doc = "---\nname: risky\ndisabled: true\nsource: shared\n---\nbody";
         let skill = Skill::parse(doc).unwrap();
-        assert!(skill.protected);
         assert!(skill.disabled);
-        assert_eq!(skill.source, SOURCE_REVIEWER);
+        assert_eq!(skill.source, "shared");
     }
 
     fn offer(platform: &str, tools: &[&str]) -> SkillOffer {
@@ -355,53 +283,11 @@ mod tests {
     }
 
     #[test]
-    fn updated_at_is_read_back_from_the_stamp_the_store_writes() {
-        let doc = "---\nname: a\nupdated_at: 2026-07-04T14:45:42.136487Z\n---\nbody";
-        let skill = Skill::parse(doc).unwrap();
-        assert_eq!(skill.updated_at, Some(1783176342));
-
-        // A file the store never wrote, and one whose stamp is unreadable, both
-        // read as undated rather than as the epoch.
-        assert_eq!(
-            Skill::parse("---\nname: a\n---\nb").unwrap().updated_at,
-            None
-        );
-        assert_eq!(
-            Skill::parse("---\nname: a\nupdated_at: last tuesday\n---\nb")
-                .unwrap()
-                .updated_at,
-            None
-        );
-    }
-
-    #[test]
-    fn a_candidate_expires_only_once_it_is_older_than_the_window() {
-        let now = 10_000 * 86_400;
-        let dated = |days_ago: i64| Skill {
-            updated_at: Some(now - days_ago * 86_400),
-            ..Skill::parse("---\nname: a\n---\nbody").unwrap()
-        };
-        assert!(!candidate_expired(&dated(SKILL_CANDIDATE_EXPIRY_DAYS), now));
-        assert!(candidate_expired(
-            &dated(SKILL_CANDIDATE_EXPIRY_DAYS + 1),
-            now
-        ));
-    }
-
-    /// An undated file is not a stale one: without a stamp there is no age to
-    /// judge, so it stays until a human rules on it.
-    #[test]
-    fn an_undated_candidate_never_expires() {
-        let skill = Skill::parse("---\nname: a\n---\nbody").unwrap();
-        assert!(!candidate_expired(&skill, 10_000 * 86_400));
-    }
-
-    #[test]
     fn skill_names_must_be_plain_path_segments() {
         assert!(valid_skill_name("feishu-calendar"));
         assert!(valid_skill_name("v2_sync.beta"));
         assert!(!valid_skill_name(""));
-        assert!(!valid_skill_name(".candidates"));
+        assert!(!valid_skill_name(".hidden"));
         assert!(!valid_skill_name("../escape"));
         assert!(!valid_skill_name("a/b"));
         assert!(!valid_skill_name("with space"));

@@ -36,7 +36,7 @@ use std::sync::Arc;
 
 use crate::domain::{
     approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
-    repository::SkillRepository, reviewer::Reviewer, task::TaskRepository, workspace::Workspace,
+    reviewer::Reviewer, task::TaskRepository, workspace::Workspace,
 };
 use crate::plugins::{self, Scope, ToolCx, ToolRegistry};
 use komo_config::ConfigSnapshot;
@@ -340,19 +340,9 @@ pub async fn build(
     );
 
     // The governed skill store: `~/.komo/skills` is the komo-owned home for
-    // durable skills (files, not db — roadmap §9). Reviewer proposals land in
-    // its `.candidates/` for triage; a one-time import moves any skills a
-    // pre-filesystem komo accumulated in komo.db into that triage pile.
+    // durable skills (files, not db — roadmap §9), written by a human and
+    // installed by a human.
     let skill_store = Arc::new(FsSkillStore::new(FsSkillStore::default_root()));
-    match db.export_legacy_skills().await {
-        Ok(rows) if !rows.is_empty() => match skill_store.import_legacy_db(rows) {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(n, "imported legacy komo.db skills as candidates"),
-            Err(error) => tracing::warn!(%error, "legacy skill import failed"),
-        },
-        Ok(_) => {}
-        Err(error) => tracing::warn!(%error, "failed to read legacy db skills"),
-    }
 
     // Skills load from, in priority order (first to define a name wins):
     //   KOMO_SKILLS_PATH (colon-separated), <workspace>/skills,
@@ -572,7 +562,6 @@ pub async fn build(
         TurnInjections::default(),
         Some("delegate"),
     )?;
-    let skill_repo: Arc<dyn SkillRepository> = skill_store.clone();
     // The seam every extracted observation goes through. It shares the query
     // service with recall, so "which existing claims might this be about" is
     // answered by the same hybrid matching that decides what gets injected.
@@ -586,7 +575,6 @@ pub async fn build(
     let reviewer: Arc<dyn Reviewer> = Arc::new(ReflectiveReviewer::new(
         aux_llm.clone(),
         consolidator,
-        skill_repo,
         kanban.clone(),
     ));
     // One coordinator instance shared by the runtime's post-run trigger and

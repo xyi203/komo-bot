@@ -11,18 +11,10 @@ Classify insights by ownership:
   the user from having to correct or remind you again. If a fact will be stale within a
   week it does not belong in memory: never store task progress, session outcomes,
   completed-work logs, PR/issue numbers, or commit SHAs.
-- skill: style, tone, format, verbosity, workflow corrections, non-trivial techniques,
-  fixes, workarounds, debugging paths, or corrections to a loaded skill.
 - commitment: an open loop the user took on or is waiting on — something they said they
   would do, need to follow up on, or are waiting for someone else to deliver. Record the
   obligation as a short actionable title, who it involves (waiting_on), and any deadline.
   Only durable obligations, never idle chatter or work already finished in this session.
-
-Write priority for skills:
-1. Patch a skill loaded in this session when it fits.
-2. Patch an existing umbrella skill.
-3. Add support material under an existing umbrella skill and point to it.
-4. Create a class-level umbrella skill only when no existing skill fits.
 
 Never write:
 - environment dependency failures such as command not found, missing credentials, or
@@ -35,7 +27,6 @@ Never write:
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReviewOutcome {
     pub memories_written: Vec<String>,
-    pub skills_written: Vec<String>,
     /// Ids of commitments captured into the task inbox this review.
     pub tasks_captured: Vec<String>,
 }

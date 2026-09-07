@@ -107,7 +107,6 @@ pub trait Maintenance: Send + Sync {
 pub struct MaintenanceSummary {
     pub sessions_reviewed: usize,
     pub memories_written: usize,
-    pub skills_written: usize,
     pub tasks_notified: usize,
     /// Commitments the reviewer captured into the task inbox this sweep.
     pub tasks_captured: usize,
@@ -117,8 +116,6 @@ pub struct MaintenanceSummary {
     pub memories_promoted: usize,
     /// Candidate memories the dream sweep archived (never earned a recall) this cycle.
     pub memories_archived: usize,
-    /// Skill proposals the dream sweep withdrew for want of a verdict this cycle.
-    pub skill_candidates_expired: usize,
     /// Cron-job commands that ran to a zero exit this sweep.
     pub jobs_run: usize,
     /// Standing waits this sweep woke — a timer that came due, or a wait that
@@ -127,7 +124,7 @@ pub struct MaintenanceSummary {
 }
 
 /// The fixed maintenance action: learn from every finished turn the interval
-/// left behind, letting the extractor distill durable memories/skills.
+/// left behind, letting the extractor distill durable memories.
 pub struct ReviewSweep {
     /// The shared coordinator (same instance as the runtime's post-run trigger,
     /// so the per-session in-flight guard spans both paths). The interval, the
@@ -145,7 +142,6 @@ impl Maintenance for ReviewSweep {
         Ok(MaintenanceSummary {
             sessions_reviewed: report.sessions_learned,
             memories_written: report.memories_written,
-            skills_written: report.skills_written,
             tasks_captured: report.tasks_captured,
             ..Default::default()
         })
@@ -169,11 +165,6 @@ impl Maintenance for ReviewSweep {
 /// disable). Wired in `cli/gateway.rs`.
 pub struct DreamSweep {
     pub memories: Arc<dyn MemoryRepository>,
-    /// The governed skill store, for the proposal half of the cycle. The
-    /// concrete store rather than `SkillRepository`, which carries only the
-    /// automated write path (find/list/save) — every governance transition,
-    /// promote and archive included, is an inherent method there.
-    pub skills: Arc<komo_infra::skills::FsSkillStore>,
 }
 
 impl DreamSweep {
@@ -226,40 +217,7 @@ impl DreamSweep {
                 DreamVerdict::Keep => {}
             }
         }
-        self.expire_skill_candidates(now, &mut summary);
         Ok(summary)
-    }
-
-    /// Withdraw skill proposals that have gone unanswered past the window.
-    ///
-    /// The counterpart of archiving a cold memory candidate, but decided on age
-    /// alone: a candidate cannot be loaded, so it accumulates no usage to be
-    /// judged on, and the only thing its continued presence measures is how long
-    /// nobody has triaged it. Withdrawal moves the tree to `.expired/` — the
-    /// operator can bring it back, and a pattern that still holds gets proposed
-    /// again by the next review that sees it.
-    ///
-    /// Only ever candidates: an active skill is the operator's, and `komo skills
-    /// archive` is theirs to run.
-    fn expire_skill_candidates(&self, now: i64, summary: &mut MaintenanceSummary) {
-        use komo_core::domain::skill::candidate_expired;
-        for skill in self.skills.list_candidates() {
-            if !candidate_expired(&skill, now) {
-                continue;
-            }
-            match self.skills.expire_candidate(&skill.name) {
-                Ok(_) => {
-                    summary.skill_candidates_expired += 1;
-                    info!(
-                        name = %skill.name,
-                        "dream: withdrew a skill proposal nobody ruled on"
-                    );
-                }
-                Err(error) => {
-                    warn!(%error, name = %skill.name, "dream: expire failed (skipped)")
-                }
-            }
-        }
     }
 }
 
@@ -1612,7 +1570,6 @@ where
                     service = name,
                     sessions = summary.sessions_reviewed,
                     memories = summary.memories_written,
-                    skills = summary.skills_written,
                     tasks_captured = summary.tasks_captured,
                     briefings = summary.briefings_sent,
                     promoted = summary.memories_promoted,
@@ -4014,14 +3971,6 @@ mod tests {
         }
     }
 
-    /// An empty skill store under a unique temp root — the memory-only dream
-    /// tests need one to construct the sweep, and an empty one expires nothing.
-    fn empty_skills(name: &str) -> Arc<komo_infra::skills::FsSkillStore> {
-        let root = std::env::temp_dir().join(name);
-        let _ = std::fs::remove_dir_all(&root);
-        Arc::new(komo_infra::skills::FsSkillStore::new(root))
-    }
-
     /// A candidate with `support` independent occasions of support behind it —
     /// the signal promotion actually reads.
     fn dream_candidate(id: &str, support: i64, age_days: i64, now: i64) -> Memory {
@@ -4055,7 +4004,6 @@ mod tests {
         let repo = Arc::new(OverwriteMemories(Mutex::new(vec![promote, archive, keep])));
         let sweep = DreamSweep {
             memories: repo.clone(),
-            skills: empty_skills("komo_dream_sweep_promote_archive"),
         };
         let summary = sweep.run().await.unwrap();
         assert_eq!(summary.memories_promoted, 1);
@@ -4082,7 +4030,6 @@ mod tests {
         let repo = Arc::new(OverwriteMemories(Mutex::new(vec![m])));
         DreamSweep {
             memories: repo.clone(),
-            skills: empty_skills("komo_dream_sweep_pinnable"),
         }
         .run()
         .await
@@ -4093,72 +4040,6 @@ mod tests {
         assert!(
             !promoted.is_pinnable(&ctx, now),
             "auto-promoted memory must not be pinnable"
-        );
-    }
-
-    /// The proposal half: a candidate nobody ruled on within the window is set
-    /// aside, a fresh one is left for triage, and an *active* skill is never
-    /// touched — retiring one of those is the operator's call.
-    #[tokio::test]
-    async fn dream_sweep_withdraws_only_lapsed_skill_candidates() {
-        use komo_core::domain::repository::SkillRepository;
-        use komo_core::domain::skill::{SKILL_CANDIDATE_EXPIRY_DAYS, Skill};
-
-        let store = empty_skills("komo_dream_sweep_skills");
-        let proposal = |name: &str| Skill {
-            name: name.to_string(),
-            description: format!("does {name}"),
-            instructions: "how to".to_string(),
-            protected: false,
-            disabled: false,
-            source: komo_core::domain::skill::SOURCE_REVIEWER.to_string(),
-            platforms: Vec::new(),
-            requires_tools: Vec::new(),
-            updated_at: None,
-        };
-        store.save(&proposal("lapsed")).await.unwrap();
-        store.save(&proposal("fresh")).await.unwrap();
-        store.save(&proposal("live")).await.unwrap();
-        store.promote("live").unwrap();
-
-        // Backdate one proposal past the window by rewriting its stamp.
-        let path = store.candidate_path("lapsed");
-        let stale =
-            time::OffsetDateTime::now_utc() - time::Duration::days(SKILL_CANDIDATE_EXPIRY_DAYS + 1);
-        let doc = std::fs::read_to_string(&path).unwrap();
-        let restamped: String = doc
-            .lines()
-            .map(|line| {
-                if line.starts_with("updated_at:") {
-                    format!(
-                        "updated_at: {}",
-                        stale
-                            .format(&time::format_description::well_known::Rfc3339)
-                            .unwrap()
-                    )
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, restamped).unwrap();
-
-        let summary = DreamSweep {
-            memories: Arc::new(OverwriteMemories(Mutex::new(vec![]))),
-            skills: store.clone(),
-        }
-        .run()
-        .await
-        .unwrap();
-
-        assert_eq!(summary.skill_candidates_expired, 1);
-        assert!(store.find_candidate("lapsed").is_none());
-        assert!(store.find_expired("lapsed").is_some());
-        assert!(store.find_candidate("fresh").is_some());
-        assert!(
-            store.find_active("live").is_some(),
-            "dreaming never retires an active skill"
         );
     }
 

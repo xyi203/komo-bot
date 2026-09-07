@@ -383,8 +383,6 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/runs/{id}/resume", post(resume_run))
         .route("/api/cron", get(list_cron_jobs))
         .route("/api/skills", get(list_skills))
-        .route("/api/skills/{name}/audit", get(skill_audit))
-        .route("/api/skills/usage", get(skill_usage))
         .route("/api/pairings", get(list_pairings))
         .route("/api/dream", get(dream_preview))
         .route("/api/interactions/{session}", get(get_interactions))
@@ -1555,14 +1553,12 @@ async fn pair_revoke(
 async fn dream_apply(State(state): State<AppState>) -> Result<Response, ApiError> {
     let summary = DreamSweep {
         memories: state.actions.memories.clone(),
-        skills: state.actions.skills.clone(),
     }
     .apply()
     .await?;
     Ok(Json(json!({
         "promoted": summary.memories_promoted,
         "archived": summary.memories_archived,
-        "skills_expired": summary.skill_candidates_expired,
     }))
     .into_response())
 }
@@ -1703,24 +1699,6 @@ async fn cron_trigger(State(state): State<AppState>, Path(name): Path<String>) -
 async fn list_skills(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let skills = state.actions.list_skills().await?;
     Ok(Json(json!({ "skills": skills })))
-}
-
-/// Which turns loaded a skill (backs `komo skills audit` while the gateway
-/// holds the db lock). Derived from the run ledger via the shared operator
-/// projection.
-async fn skill_audit(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<Json<Value>, ApiError> {
-    let invocations = state.actions.skill_audit(&name).await?;
-    Ok(Json(json!({ "invocations": invocations })))
-}
-
-/// Every active skill ranked coldest-first (backs the name-less `komo skills
-/// audit`). Same ledger derivation, rolled up instead of filtered.
-async fn skill_usage(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let usage = state.actions.skill_usage().await?;
-    Ok(Json(json!({ "usage": usage })))
 }
 
 /// Pairings (backs `komo pair list`). A hash-free view — the salted code hash

@@ -39,13 +39,15 @@ pub(crate) struct WakeupRecord {
     /// The suspended turn to continue; empty = start a fresh turn.
     turn_id: String,
 
-    /// "at" | "approval" | "user-reply" | "task-done" | "event".
+    /// "approval" | "user-reply" | "event".
     kind: String,
-    /// `Wakeup::At`'s instant; 0 otherwise.
+    /// Retired with the `wait` tool's timer; kept (and written 0) because
+    /// dropping a column is not an additive change.
     at: i64,
     /// `Wakeup::Approval`'s call; empty otherwise.
     call_id: String,
-    /// `Wakeup::TaskDone`'s task; empty otherwise.
+    /// Retired with background tasks; kept (and written empty) for the same
+    /// reason as `at`.
     task_id: String,
     /// `Wakeup::Event`'s filter as JSON; empty otherwise.
     filter: String,
@@ -83,9 +85,9 @@ impl WakeupRepository for Db {
                 session_id: registration.session_id.clone(),
                 turn_id: registration.turn_id.clone().unwrap_or_default(),
                 kind: columns.kind.to_string(),
-                at: columns.at,
+                at: 0,
                 call_id: columns.call_id.clone(),
-                task_id: columns.task_id.clone(),
+                task_id: String::new(),
                 filter: columns.filter.clone(),
                 expires_at: registration.expires_at.unwrap_or(0),
                 grants: grants.clone(),
@@ -150,9 +152,7 @@ impl WakeupRepository for Db {
 /// The flattened `Wakeup`.
 struct WakeupColumns {
     kind: &'static str,
-    at: i64,
     call_id: String,
-    task_id: String,
     filter: String,
 }
 
@@ -160,25 +160,15 @@ impl WakeupColumns {
     fn from(wakeup: &Wakeup) -> anyhow::Result<Self> {
         let mut columns = Self {
             kind: "",
-            at: 0,
             call_id: String::new(),
-            task_id: String::new(),
             filter: String::new(),
         };
         match wakeup {
-            Wakeup::At { at } => {
-                columns.kind = "at";
-                columns.at = *at;
-            }
             Wakeup::Approval { call_id } => {
                 columns.kind = "approval";
                 columns.call_id = call_id.clone();
             }
             Wakeup::UserReply => columns.kind = "user-reply",
-            Wakeup::TaskDone { task_id } => {
-                columns.kind = "task-done";
-                columns.task_id = task_id.clone();
-            }
             Wakeup::Event { filter } => {
                 columns.kind = "event";
                 columns.filter =
@@ -202,12 +192,8 @@ fn encode_grants(grants: &[RuleSpec]) -> anyhow::Result<String> {
 /// waits forever.
 fn registration_from_record(record: WakeupRecord) -> WakeupRegistration {
     let wakeup = match record.kind.as_str() {
-        "at" => Wakeup::At { at: record.at },
         "approval" => Wakeup::Approval {
             call_id: record.call_id,
-        },
-        "task-done" => Wakeup::TaskDone {
-            task_id: record.task_id,
         },
         "event" => match serde_json::from_str::<EventFilter>(&record.filter) {
             Ok(filter) => Wakeup::Event { filter },
@@ -217,8 +203,9 @@ fn registration_from_record(record: WakeupRecord) -> WakeupRegistration {
             }
         },
         // Including the literal "user-reply", and anything an older or newer
-        // komo wrote: waiting for the user is the reading that expires and
-        // reports back, which is the safe end of the range.
+        // komo wrote — a retired timer's row among them: waiting for the user
+        // is the reading that expires and reports back, which is the safe end
+        // of the range.
         _ => Wakeup::UserReply,
     };
     WakeupRegistration {
@@ -265,14 +252,10 @@ mod tests {
     async fn every_variant_round_trips_with_what_it_carries() {
         let db = Db::connect(&url("variants")).await.unwrap();
         let wakeups = [
-            Wakeup::At { at: 1_700_000_000 },
             Wakeup::Approval {
                 call_id: "call-7".into(),
             },
             Wakeup::UserReply,
-            Wakeup::TaskDone {
-                task_id: "task-3".into(),
-            },
             Wakeup::Event {
                 filter: EventFilter::Webhook { name: "ci".into() },
             },
@@ -341,7 +324,9 @@ mod tests {
         let db = Db::connect(&url("per-turn")).await.unwrap();
         for wakeup in [
             Wakeup::UserReply,
-            Wakeup::At { at: 1_700_000_000 },
+            Wakeup::Event {
+                filter: EventFilter::Webhook { name: "ci".into() },
+            },
             Wakeup::Approval {
                 call_id: "c1".into(),
             },

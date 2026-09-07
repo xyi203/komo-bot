@@ -173,12 +173,8 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
     // Built here because it needs the dispatcher (for the session slot) and the
     // handler (for the continuation) — the two things only the gateway holds.
     let waker: Arc<dyn WakeupDispatch> = Arc::new(TurnWaker::new(dispatcher.clone()));
-    // A background task settling wakes a turn the same way a sweep does, so it
-    // takes the same dispatcher — attached here because the runtime holding the
-    // task store was built before the dispatcher existed.
-    let background = wired.background.clone();
-    background.attach_dispatch(waker.clone());
-    // Same late binding, same reason: a triggered wake continues (or opens) a
+    // Late-bound because the runtime that holds the trigger store was built
+    // before the dispatcher existed: a triggered wake continues (or opens) a
     // turn exactly as a sweep's does.
     triggers.attach_dispatch(waker.clone());
     // Everything a routine firing needs, built once and handed to the
@@ -196,21 +192,7 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
         }),
     });
     // The third crash-residue check, after the interrupted runs and the
-    // suspended turns: a task the dead process was still running. Settled
-    // `uncertain` and never re-run — the process group is gone and whether the
-    // work landed is not knowable. Runs after the suspended-turn repair above,
-    // so a turn parked on `wait { for_task }` has its wait back to be woken by.
-    match background
-        .reconcile_orphans(
-            komo_services::background_tasks::ORPHAN_RECHECK_SESSIONS,
-            now,
-        )
-        .await
-    {
-        0 => {}
-        n => tracing::info!(count = n, "settled background tasks lost to a restart"),
-    }
-    // The fourth: a message claimed from a channel whose turn never started.
+    // suspended turns: a message claimed from a channel whose turn never started.
     // Before the channels serve, so a recovered turn holds its session slot
     // ahead of whatever arrives next.
     match dispatcher

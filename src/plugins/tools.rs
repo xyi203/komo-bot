@@ -20,7 +20,6 @@ use komo_tools::shell::ShellTool;
 use komo_tools::skill::SkillTool;
 use komo_tools::time::TimeTool;
 use komo_tools::todo::TodoTool;
-use komo_tools::wait::WaitTool;
 use komo_tools::web_fetch::WebFetchTool;
 use komo_tools::web_search::WebSearchTool;
 use komo_tools::write::WriteTool;
@@ -75,10 +74,6 @@ impl Plugin for CoreToolsPlugin {
         );
         reg.tool(Scope::AGENTIC, Arc::new(TodoTool::new(cx.db.clone())));
         reg.tool(Scope::AGENTIC, Arc::new(AskUserTool::new()));
-        // Waiting is not conversation: a routine that checks something, waits two
-        // hours and checks again is the reason this is registered everywhere an
-        // agent turn runs, unattended ones included.
-        reg.tool(Scope::ALL, Arc::new(WaitTool::new()));
         reg.tool(
             Scope::AGENTIC,
             Arc::new(MemoryTool::new(

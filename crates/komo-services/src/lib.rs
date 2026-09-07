@@ -11,7 +11,6 @@
 //! and out to the gateway client, so it is wiring rather than a service.
 
 pub mod artifact_store;
-pub mod background_tasks;
 pub mod conversation;
 pub mod cron_actions;
 pub mod diff;

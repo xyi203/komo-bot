@@ -8,10 +8,8 @@ use tokio::io::AsyncReadExt;
 
 use komo_core::domain::{
     approval::{ActionRef, ApprovalRequest, Decision},
-    background::{TaskReport, TaskSpec},
     cancel::Cancelled,
     context::ToolContext,
-    session_event::{TaskKind, ToolOutcome},
     tool::{Tool, ToolError, ToolOutput, parse_args},
     workspace::Workspace,
 };
@@ -124,9 +122,6 @@ struct ShellArgs {
     /// Working directory, relative to the workspace root (default: the root).
     #[serde(default)]
     workdir: Option<String>,
-    /// Hand the command off and return a task id instead of waiting for it.
-    #[serde(default)]
-    background: bool,
 }
 
 /// Default command budget, matching opencode v2's `bash`.
@@ -225,10 +220,7 @@ impl Tool for ShellTool {
         "Run a shell command on the local machine via `sh -c` and return its \
          combined stdout/stderr. Safe (read-only) commands run without a \
          prompt; destructive commands require an explicit dangerous-action \
-         confirmation, and a few catastrophic ones are always refused. Pass \
-         `background: true` for long work: the call returns a task id at once, \
-         the turn is free to end, and the result comes back to this \
-         conversation when it lands."
+         confirmation, and a few catastrophic ones are always refused."
     }
 
     /// The caller may ask for up to [`MAX_TIMEOUT_MS`]; the executor's clock has
@@ -261,10 +253,6 @@ impl Tool for ShellTool {
                 "workdir": {
                     "type": "string",
                     "description": "Directory to run in, relative to the workspace root. Defaults to the root."
-                },
-                "background": {
-                    "type": "boolean",
-                    "description": "Run it detached: this call returns a task id immediately and the turn is free to end. You are told the result in this conversation when it lands, or you can stop and wait for it with `wait`. For work measured in minutes — never for something you need in order to answer now."
                 }
             },
             "required": ["command"]
@@ -361,11 +349,7 @@ impl Tool for ShellTool {
             timeout,
         };
 
-        if args.background {
-            return spawn_background(plan, ctx).await;
-        }
-
-        match plan.run(Some(ctx)).await {
+        match plan.run(ctx).await {
             // The turn is already ending, so nothing will read a reply — the
             // point of returning an error is the ledger, which records this step
             // with the same wording as the run's own cancellation.
@@ -377,8 +361,7 @@ impl Tool for ShellTool {
 }
 
 /// One command, resolved: everything needed to run it and nothing borrowed from
-/// the turn. That is what lets the *same* value run in the foreground under the
-/// turn's cancellation and, detached, in a task that outlives it.
+/// the turn.
 struct CommandPlan {
     command: String,
     cwd: Option<std::path::PathBuf>,
@@ -392,22 +375,17 @@ enum Ran {
         err: Vec<u8>,
         code: Option<i32>,
     },
-    /// Its own `timeout` elapsed and the process group was killed. Whether the
-    /// command had already done its work is not knowable — which is why a
-    /// background task settles this as `Uncertain` rather than as a failure.
+    /// Its own `timeout` elapsed and the process group was killed.
     TimedOut,
-    /// The user stopped the turn. Foreground only: a detached task is not the
-    /// turn's to cancel.
+    /// The user stopped the turn.
     Cancelled,
     /// Never ran, or could not be awaited.
     Broken(String),
 }
 
 impl CommandPlan {
-    /// Run it, optionally racing the turn's cancellation. `cancel: None` is the
-    /// background case: work explicitly detached from the turn must not die
-    /// when the turn does.
-    async fn run(&self, cancel: Option<&ToolContext>) -> Ran {
+    /// Run it, racing the turn's cancellation.
+    async fn run(&self, ctx: &ToolContext) -> Ran {
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c")
             .arg(&self.command)
@@ -463,17 +441,9 @@ impl CommandPlan {
         // budget elapsed, or the user asked to stop the turn. `shell` is the tool
         // that most needs the second one — interrupting a ten-minute build should
         // actually end the build, not just stop waiting for it.
-        let stop = async {
-            match cancel {
-                Some(ctx) => ctx.cancelled().await,
-                // Nothing interrupts a detached task; its own timeout is the
-                // only way it stops early.
-                None => std::future::pending().await,
-            }
-        };
         let outcome = tokio::select! {
             r = tokio::time::timeout(self.timeout, run) => r.map_err(|_| Interrupt::Timeout),
-            _ = stop => Err(Interrupt::Cancelled),
+            _ = ctx.cancelled() => Err(Interrupt::Cancelled),
         };
 
         match outcome {
@@ -544,72 +514,6 @@ impl CommandPlan {
             Ran::Broken(error) => ToolOutput::text(format!("error: {error}")),
         }
     }
-}
-
-/// Hand the command to the background runtime and answer with its id.
-///
-/// The approval already happened above: starting a command in the background
-/// and running it in the foreground are two ways of executing the same action,
-/// so they are gated identically. What differs afterwards is only who waits.
-async fn spawn_background(plan: CommandPlan, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
-    let (Some(tasks), Some(turn_id)) = (ctx.background(), ctx.turn_id()) else {
-        return Ok(ToolOutput::text(
-            "This runtime cannot run a command in the background — nothing here \
-             outlives the turn. Run it in the foreground instead (drop \
-             `background`), raising `timeout` if it is slow.",
-        ));
-    };
-    let label = plan.command.clone();
-    let spec = TaskSpec {
-        kind: TaskKind::Shell,
-        label: label.clone(),
-    };
-    let work = Box::pin(async move {
-        let outcome = plan.run(None).await;
-        let full = plan.render(&outcome).text;
-        TaskReport {
-            outcome: match &outcome {
-                Ran::Exited { code: Some(0), .. } => ToolOutcome::Succeeded,
-                // Killed at its own deadline: the command may well have done its
-                // work before the clock ran out, and nothing here can tell. The
-                // model has to hear that rather than "it failed".
-                Ran::TimedOut => ToolOutcome::Uncertain,
-                _ => ToolOutcome::Failed,
-            },
-            summary: head_of(&full, BACKGROUND_SUMMARY_BYTES),
-            full,
-        }
-    });
-    match tasks
-        .spawn(&ctx.session.session_id, turn_id, spec, work)
-        .await
-    {
-        Ok(task_id) => Ok(ToolOutput::text(format!(
-            "Started `{label}` in the background as task {task_id}. This turn does not wait \
-             for it: finish what you are doing and answer. You will be told the result in \
-             this conversation when it settles — or stop and wait for it now with \
-             `wait` and `for_task: {task_id}`."
-        ))
-        .with_title(format!("shell (background): {label}"))
-        .with_structured(json!({ "task_id": task_id, "background": true }))),
-        Err(error) => Ok(ToolOutput::text(error.to_string())),
-    }
-}
-
-/// How much of a background command's output rides in the wake that reports it.
-/// The rest stays in the store, named by `result_ref`.
-const BACKGROUND_SUMMARY_BYTES: usize = 2_000;
-
-/// The first `budget` bytes, cut on a char boundary, saying so when it cut.
-fn head_of(text: &str, budget: usize) -> String {
-    if text.len() <= budget {
-        return text.to_string();
-    }
-    let mut at = budget;
-    while at > 0 && !text.is_char_boundary(at) {
-        at -= 1;
-    }
-    format!("{}\n…[the rest is in the stored output]", &text[..at])
 }
 
 fn kill_group(pgid: Option<i32>) {

@@ -237,8 +237,6 @@ mod tests {
     fn every_kind_says_what_it_is_waiting_for() {
         assert_eq!(WakeupKind::Approval.label(), "等你审批");
         assert_eq!(WakeupKind::UserReply.label(), "等待回答");
-        assert_eq!(WakeupKind::At.label(), "定时等待");
-        assert_eq!(WakeupKind::TaskDone.label(), "等后台任务");
         assert_eq!(WakeupKind::Event.label(), "等事件");
     }
 

@@ -806,9 +806,6 @@ mod tests {
             "skill",
             "time",
             "todo",
-            // Everywhere an agent turn runs, unattended ones included: a
-            // routine that waits two hours and checks again is the point.
-            "wait",
             "web_fetch",
             "web_search",
             "write",

@@ -26,18 +26,12 @@ use super::session_event::{Wakeup, WakeupCause};
 /// How long each kind of wait may stand before it fires as expired.
 ///
 /// Chosen by what the waiting is *for*: an approval is a person being asked to
-/// look at something now (a day), a question can wait out a weekend (a week), a
-/// timer says its own deadline, and a background job has its own timeout so
-/// nothing here needs to second-guess it.
+/// look at something now (a day), a question can wait out a weekend (a week),
+/// and an outside event may never come at all.
 pub fn default_expiry_secs(wakeup: &Wakeup) -> Option<i64> {
     match wakeup {
-        // Its `at` *is* the deadline.
-        Wakeup::At { .. } => None,
         Wakeup::Approval { .. } => Some(24 * 3_600),
         Wakeup::UserReply => Some(7 * 86_400),
-        // The task settles or times out on its own; a second clock here would
-        // only race it.
-        Wakeup::TaskDone { .. } => None,
         Wakeup::Event { .. } => Some(30 * 86_400),
     }
 }
@@ -123,8 +117,8 @@ impl WakeupRegistration {
         self
     }
 
-    /// Override the default lifetime — a Task waiting on a reply expires with
-    /// its own `due_at`, not with the generic 30 days.
+    /// Override the default lifetime — a commitment waiting on a reply expires
+    /// with its own `due_at`, not with the generic 30 days.
     pub fn expiring_at(mut self, at: Option<i64>) -> Self {
         self.expires_at = at;
         self
@@ -132,16 +126,10 @@ impl WakeupRegistration {
 
     /// Whether the sweep should fire this now, and why.
     ///
-    /// Only the two clock-driven answers live here: a timer that came due, and
-    /// a wait that ran out. Everything else ([`Wakeup::Approval`],
-    /// [`Wakeup::UserReply`], [`Wakeup::Event`], [`Wakeup::TaskDone`]) is fired
-    /// by the thing that happened, not by the sweep noticing time pass.
+    /// Only one clock-driven answer lives here: a wait that ran out. Every
+    /// variant is fired by the thing that happened — an answer, a message, an
+    /// event — and the sweep's job is the case where that never came.
     pub fn due_cause(&self, now: i64) -> Option<WakeupCause> {
-        if let Wakeup::At { at } = self.wakeup
-            && at <= now
-        {
-            return Some(WakeupCause::Time);
-        }
         match self.expires_at {
             Some(at) if at <= now => Some(WakeupCause::Expired),
             _ => None,
@@ -188,23 +176,6 @@ pub trait WakeupRepository: Send + Sync {
 mod tests {
     use super::*;
 
-    fn at(secs: i64) -> Wakeup {
-        Wakeup::At { at: secs }
-    }
-
-    #[test]
-    fn a_timer_comes_due_at_its_own_instant() {
-        let now = 1_000;
-        let r = WakeupRegistration::new("s1", at(now + 100), now);
-        assert_eq!(r.due_cause(now), None);
-        assert_eq!(r.due_cause(now + 99), None);
-        assert_eq!(r.due_cause(now + 100), Some(WakeupCause::Time));
-        assert_eq!(
-            r.expires_at, None,
-            "a timer's deadline is the timer; a second one would only race it"
-        );
-    }
-
     /// The waits nobody may forget. An approval that nobody answers is not a
     /// registration to quietly delete — it is a turn parked forever unless the
     /// clock brings it back and tells it so.
@@ -232,19 +203,16 @@ mod tests {
         }
     }
 
-    /// A background job settles or times out on its own clock; a second one
-    /// here would fire "expired" at a task that is still working.
+    /// A caller that names its own deadline — a commitment's `due_at` — keeps
+    /// it, and a wait with none never comes due on the clock at all.
     #[test]
-    fn a_background_task_is_left_to_its_own_timeout() {
+    fn an_overridden_deadline_is_the_only_clock_that_applies() {
         let now = 1_000;
-        let r = WakeupRegistration::new(
-            "s1",
-            Wakeup::TaskDone {
-                task_id: "t1".into(),
-            },
-            now,
-        );
-        assert_eq!(r.expires_at, None);
-        assert_eq!(r.due_cause(now + 10 * 86_400), None);
+        let r = WakeupRegistration::new("s1", Wakeup::UserReply, now).expiring_at(Some(now + 60));
+        assert_eq!(r.due_cause(now + 59), None);
+        assert_eq!(r.due_cause(now + 60), Some(WakeupCause::Expired));
+
+        let standing = WakeupRegistration::new("s1", Wakeup::UserReply, now).expiring_at(None);
+        assert_eq!(standing.due_cause(now + 10 * 86_400), None);
     }
 }

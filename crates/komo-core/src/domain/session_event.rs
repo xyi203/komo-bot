@@ -6,14 +6,14 @@
 //! appending another event. Two rules follow from that and are enforced here
 //! rather than at each call site:
 //!
-//! **Fail closed on anything unreadable.** An event type this build does not
-//! know may change how the rest of the log must be read, so meeting one is a
-//! refusal to reconstruct the session — not a skipped line. The single escape
-//! is [`SessionEvent::ignorable`], which a writer sets only on records whose
-//! loss cannot affect model history, recovery, or side-effect judgement.
-//! Defaulting to *required* means a forgotten marker over-refuses (an
-//! inconvenience) instead of silently resuming a gutted session. The first
-//! version marks nothing ignorable; the mechanism exists so a later one can.
+//! **Fail closed on anything unreadable.** A record whose declared shape this
+//! build claims to understand but cannot parse is a refusal to reconstruct the
+//! session — not a skipped line. The single escape is
+//! [`SessionEvent::ignorable`], which a writer sets only on records whose loss
+//! cannot affect model history, recovery, or side-effect judgement. A type this
+//! build has no vocabulary for at all is different: it reads as
+//! [`SessionEventKind::Unknown`], keeping its seq and meaning nothing, because
+//! a retired feature's leftovers must not brick the conversation they sit in.
 //!
 //! **`seq` is the only order.** It is contiguous and assigned by the session's
 //! single writer. [`SessionEvent::at`] is for display and diagnostics: a reader
@@ -253,19 +253,6 @@ pub enum SessionEventKind {
     #[serde(rename = "wakeup/fired")]
     WakeupFired(WakeupFiredEvent),
 
-    /// A turn started work that outlives it — a background `shell`, a detached
-    /// `delegate` (docs/bot-runtime.md §5.9).
-    #[serde(rename = "task/spawned")]
-    TaskSpawned(TaskSpawnedEvent),
-    /// That work finished. **This may land long after the turn ended**, which
-    /// is the whole difference between a background task and a tool call: a
-    /// call settles inside the round that made it, and this one settles
-    /// whenever the work does. It names no turn for the same reason — the turn
-    /// that started it may be over, and attributing a step to it would put work
-    /// inside a run that had already closed.
-    #[serde(rename = "task/settled")]
-    TaskSettled(TaskSettledEvent),
-
     /// `/new`: the operator drew a line under the conversation so far.
     ///
     /// One appended event, not a new session id — the home conversation is one
@@ -280,25 +267,32 @@ pub enum SessionEventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
     },
+
+    /// A record whose `type` this build has no vocabulary for — one a retired
+    /// feature left behind, or one a newer komo writes.
+    ///
+    /// It is read rather than skipped so that `seq` stays contiguous and the
+    /// next append lands where it should; it declares no surface node, names no
+    /// turn, and matches nothing, so every projection passes over it. Built by
+    /// [`decode_event`] and never written — serde cannot reach it, because the
+    /// payload it stands in for is a map and this is a unit variant.
+    #[serde(rename = "unknown")]
+    Unknown,
 }
 
 /// What a suspended turn is waiting for.
 ///
-/// One vocabulary for four things that look different to a user and identical
-/// to the runtime: an approval, a question, a timer, and a job it started. Each
-/// is "stop here, and come back when X" — differing only in what X is and what
-/// the turn is handed on the way back.
+/// One vocabulary for three things that look different to a user and identical
+/// to the runtime: an approval, a question, and something outside komo. Each is
+/// "stop here, and come back when X" — differing only in what X is and what the
+/// turn is handed on the way back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Wakeup {
-    /// A wall-clock instant. `komo wait 2h`, and a routine that checks back.
-    At { at: i64 },
     /// One gated call's approval — `/approve`, `/deny`, or nobody in time.
     Approval { call_id: String },
     /// The user's next message in this conversation.
     UserReply,
-    /// A background job this turn started (`task/spawned`).
-    TaskDone { task_id: String },
     /// Something outside komo: a webhook, a message from a particular peer.
     Event { filter: EventFilter },
 }
@@ -307,35 +301,29 @@ impl Wakeup {
     /// A stable short name for the projection and for operator surfaces.
     pub fn kind(&self) -> WakeupKind {
         match self {
-            Self::At { .. } => WakeupKind::At,
             Self::Approval { .. } => WakeupKind::Approval,
             Self::UserReply => WakeupKind::UserReply,
-            Self::TaskDone { .. } => WakeupKind::TaskDone,
             Self::Event { .. } => WakeupKind::Event,
         }
     }
 }
 
-/// A [`Wakeup`] with its payload dropped: which of the five kinds of waiting
+/// A [`Wakeup`] with its payload dropped: which of the three kinds of waiting
 /// this is. What a projection stores and what an operator surface renders — the
 /// payload is the runtime's business, "what are we waiting for" is theirs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WakeupKind {
-    At,
     Approval,
     UserReply,
-    TaskDone,
     Event,
 }
 
 impl WakeupKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::At => "at",
             Self::Approval => "approval",
             Self::UserReply => "user-reply",
-            Self::TaskDone => "task-done",
             Self::Event => "event",
         }
     }
@@ -343,10 +331,8 @@ impl WakeupKind {
     /// What the operator sees.
     pub fn label(&self) -> &'static str {
         match self {
-            Self::At => "定时等待",
             Self::Approval => "等你审批",
             Self::UserReply => "等待回答",
-            Self::TaskDone => "等后台任务",
             Self::Event => "等事件",
         }
     }
@@ -393,9 +379,7 @@ pub enum WakeupCause {
     Approve,
     Deny,
     Reply,
-    Time,
     Event,
-    Task,
     /// The wait ran out. Not a silent drop: the turn comes back and is told
     /// nobody answered.
     Expired,
@@ -410,9 +394,7 @@ impl WakeupCause {
             Self::Approve => "approve",
             Self::Deny => "deny",
             Self::Reply => "reply",
-            Self::Time => "time",
             Self::Event => "event",
-            Self::Task => "task",
             Self::Expired => "expired",
             Self::MovedOn => "moved-on",
         }
@@ -432,61 +414,6 @@ pub struct WakeupFiredEvent {
     pub cause: WakeupCause,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub payload: String,
-}
-
-/// What kind of work a background task is. Two today, and the executor treats
-/// them the same — the distinction is for the operator reading the log and for
-/// the line the model is handed when the task settles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TaskKind {
-    Shell,
-    Delegate,
-}
-
-impl TaskKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Shell => "shell",
-            Self::Delegate => "delegate",
-        }
-    }
-}
-
-/// The turn handed work off and kept going.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskSpawnedEvent {
-    /// The turn that started it — which may well be over by the time the
-    /// matching `task/settled` arrives.
-    pub turn_id: String,
-    pub task_id: String,
-    pub kind: TaskKind,
-    /// One line naming the work, for the operator and for the wake that
-    /// eventually reports it.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub label: String,
-}
-
-/// The work finished, one way or another.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TaskSettledEvent {
-    pub task_id: String,
-    /// [`ToolOutcome::Uncertain`] is the same claim it makes on a tool call:
-    /// nobody knows whether the work landed. A background task inherits it
-    /// wholesale on restart — the process group died with the process, and the
-    /// command may have completed first.
-    pub outcome: ToolOutcome,
-    /// Where the full output is kept (the tool-output store's path). Empty when
-    /// there is nothing to keep — an uncertain settle written by the restart
-    /// check has no output to point at.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub result_ref: String,
-    /// What the model is told when this wakes a turn: the outcome in a few
-    /// lines, with `result_ref` for the rest.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub summary: String,
-    #[serde(default)]
-    pub elapsed_ms: i64,
 }
 
 /// Where a `user/message` came from. A compaction summary enters the surface as
@@ -1000,9 +927,6 @@ pub trait TurnRecorder: Send + Sync {
 /// an event cannot know what the rest of the log means.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FoldError {
-    /// An event type this build does not know, and the writer did not mark it
-    /// skippable.
-    UnknownEventType { seq: u64, type_name: String },
     /// Written by a newer komo.
     UnsupportedVersion { seq: u64, version: u32 },
     /// `seq` is not contiguous — the log has a hole, so what is missing cannot
@@ -1018,11 +942,6 @@ pub enum FoldError {
 impl std::fmt::Display for FoldError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::UnknownEventType { seq, type_name } => write!(
-                f,
-                "event {seq} has type `{type_name}`, which this komo does not know \
-                 and its writer did not mark ignorable — upgrade komo to read this session"
-            ),
             Self::UnsupportedVersion { seq, version } => write!(
                 f,
                 "event {seq} was written by a newer komo (format {version}, this build reads \
@@ -1049,11 +968,14 @@ impl std::error::Error for FoldError {}
 
 /// Decode one stored line.
 ///
-/// `Ok(None)` means the line was an unrecognized event its writer marked
-/// ignorable — the one case a reader may skip. Everything else is a refusal.
+/// A type this build does not know reads as [`SessionEventKind::Unknown`], so a
+/// record a retired feature left behind costs nothing but its seq. A *known*
+/// type whose payload will not parse is still a refusal — the shape it declares
+/// is one this build claims to understand — unless its writer marked it
+/// ignorable, which is the one case `Ok(None)` covers.
 pub fn decode_event(line: &str) -> Result<Option<SessionEvent>, FoldError> {
-    // Read the envelope first: whether an unknown type is fatal is the writer's
-    // call, and that answer is in the envelope, not in the payload.
+    // Read the envelope first: the version decides whether the payload may be
+    // read at all, and whether losing this record is safe is the writer's call.
     let envelope: EventEnvelope =
         serde_json::from_str(line).map_err(|error| FoldError::Malformed {
             seq: None,
@@ -1067,15 +989,23 @@ pub fn decode_event(line: &str) -> Result<Option<SessionEvent>, FoldError> {
     }
     match serde_json::from_str::<SessionEvent>(line) {
         Ok(event) => Ok(Some(event)),
+        Err(_) if !KNOWN_EVENT_TYPES.contains(&envelope.type_name.as_str()) => {
+            tracing::debug!(
+                seq = envelope.seq,
+                event_type = %envelope.type_name,
+                "read a foreign session event as inert"
+            );
+            Ok(Some(SessionEvent {
+                version: envelope.version,
+                seq: envelope.seq,
+                at: envelope.at,
+                ignorable: envelope.ignorable,
+                kind: SessionEventKind::Unknown,
+            }))
+        }
         Err(error) if envelope.ignorable => {
             tracing::debug!(seq = envelope.seq, %error, "skipped an ignorable session event");
             Ok(None)
-        }
-        Err(_) if !KNOWN_EVENT_TYPES.contains(&envelope.type_name.as_str()) => {
-            Err(FoldError::UnknownEventType {
-                seq: envelope.seq,
-                type_name: envelope.type_name,
-            })
         }
         Err(error) => Err(FoldError::Malformed {
             seq: Some(envelope.seq),
@@ -1090,6 +1020,8 @@ struct EventEnvelope {
     #[serde(rename = "v", default = "default_version")]
     version: u32,
     seq: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    at: OffsetDateTime,
     #[serde(default)]
     ignorable: bool,
     #[serde(rename = "type")]
@@ -1100,10 +1032,10 @@ fn default_version() -> u32 {
     SESSION_EVENT_VERSION
 }
 
-/// Every type this build writes. An unrecognized type outside this list is what
-/// the fail-closed rule is about; a *known* type that will not parse is a
-/// malformed record instead.
-pub const KNOWN_EVENT_TYPES: &[&str] = &[
+/// Every type this build writes. A type outside this list is one this build has
+/// no vocabulary for and reads as [`SessionEventKind::Unknown`]; a *known* type
+/// that will not parse is a malformed record instead.
+const KNOWN_EVENT_TYPES: &[&str] = &[
     "session/title-changed",
     "session/model-changed",
     "turn/started",
@@ -1117,6 +1049,7 @@ pub const KNOWN_EVENT_TYPES: &[&str] = &[
     "turn/completed",
     "turn/failed",
     "turn/cancelled",
+    "turn/memories",
     "compaction/started",
     "compaction/completed",
     "learning/completed",
@@ -1126,8 +1059,6 @@ pub const KNOWN_EVENT_TYPES: &[&str] = &[
     "approval/expired",
     "turn/suspended",
     "wakeup/fired",
-    "task/spawned",
-    "task/settled",
     "conversation/boundary",
 ];
 
@@ -1669,23 +1600,37 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_required_event_refuses_the_log() {
-        // Written by a newer komo that added a type this build does not know.
-        let line = r#"{"v":1,"seq":9,"at":"2026-08-31T00:00:00Z","type":"workflow/step-entered","data":{}}"#;
-        assert_eq!(
-            decode_event(line),
-            Err(FoldError::UnknownEventType {
-                seq: 9,
-                type_name: "workflow/step-entered".into(),
-            })
-        );
+    fn an_unknown_event_type_reads_as_inert_and_keeps_its_seq() {
+        // A record a retired feature left behind, and one a newer komo writes:
+        // neither may cost the session it sits in.
+        for line in [
+            r#"{"v":1,"seq":9,"at":"2026-08-31T00:00:00Z","type":"task/spawned","data":{"turn_id":"t1","task_id":"k1","kind":"shell","label":"sleep 1"}}"#,
+            r#"{"v":1,"seq":9,"at":"2026-08-31T00:00:00Z","type":"workflow/step-entered","data":{}}"#,
+        ] {
+            let event = decode_event(line).unwrap().expect("read, not skipped");
+            assert_eq!(event.seq, 9, "the fold needs the seq to stay contiguous");
+            assert_eq!(event.kind, SessionEventKind::Unknown);
+            assert_eq!(event.surface(), None, "and it says nothing");
+            assert_eq!(event.turn_id_of_work(), None);
+        }
     }
 
     #[test]
-    fn an_unknown_ignorable_event_is_skipped_instead() {
+    fn a_known_type_that_will_not_parse_still_refuses() {
+        // The shape it declares is one this build understands, so a payload it
+        // cannot read is a hole in history rather than a foreign record.
+        let line = r#"{"v":1,"seq":9,"at":"2026-08-31T00:00:00Z","type":"turn/started","data":{}}"#;
+        assert!(matches!(
+            decode_event(line),
+            Err(FoldError::Malformed { seq: Some(9), .. })
+        ));
+    }
+
+    #[test]
+    fn an_ignorable_event_is_skipped_instead() {
         // The one escape: its writer promised losing it cannot change what the
         // rest of the log means.
-        let line = r#"{"v":1,"seq":9,"at":"2026-08-31T00:00:00Z","ignorable":true,"type":"telemetry/first-token","data":{}}"#;
+        let line = r#"{"v":1,"seq":9,"at":"2026-08-31T00:00:00Z","ignorable":true,"type":"turn/started","data":{}}"#;
         assert_eq!(decode_event(line), Ok(None));
     }
 

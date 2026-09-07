@@ -34,9 +34,8 @@ pub fn parse_schedule(schedule: &str, now: i64) -> anyhow::Result<Trigger> {
     })
 }
 
-/// Parse a relative duration string: `<number><unit>` where unit is s/m/h/d.
-/// Shared by the `cron` tool's `after` (turned into an `@at` moment) and the
-/// `wait` tool's own delay.
+/// Parse a relative duration string: `<number><unit>` where unit is s/m/h/d —
+/// the `cron` tool's `after`, turned into an `@at` moment.
 pub fn parse_after(s: &str) -> anyhow::Result<std::time::Duration> {
     let s = s.trim();
     if s.is_empty() {

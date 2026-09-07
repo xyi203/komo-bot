@@ -1172,7 +1172,7 @@ mod tests {
         })
     }
 
-    /// A due timer wakes its turn once, and the registration is gone with it —
+    /// A due wait wakes its turn once, and the registration is gone with it —
     /// so the next tick has nothing to fire. Two wakes for one wait would run
     /// the same continuation twice.
     #[tokio::test]
@@ -1182,8 +1182,9 @@ mod tests {
         let db = wakeup_store("fires-once").await;
         log_a_suspended_turn(&db, "s1", "run-1").await;
         let now = 1_700_000_000;
-        let registration =
-            WakeupRegistration::new("s1", Wakeup::At { at: now }, now - 60).continuing("run-1");
+        let registration = WakeupRegistration::new("s1", Wakeup::UserReply, now - 60)
+            .continuing("run-1")
+            .expiring_at(Some(now));
         WakeupRepository::save(db.as_ref(), &registration)
             .await
             .unwrap();
@@ -1199,7 +1200,7 @@ mod tests {
         );
         assert_eq!(
             *dispatch.0.lock().unwrap(),
-            vec![(registration.id.clone(), WakeupCause::Time)]
+            vec![(registration.id.clone(), WakeupCause::Expired)]
         );
 
         // Nothing left to claim, so a second tick wakes nothing.
@@ -1249,8 +1250,9 @@ mod tests {
             .unwrap();
 
         let now = 1_700_000_000;
-        let registration =
-            WakeupRegistration::new("s1", Wakeup::At { at: now }, now - 60).continuing("run-1");
+        let registration = WakeupRegistration::new("s1", Wakeup::UserReply, now - 60)
+            .continuing("run-1")
+            .expiring_at(Some(now));
         WakeupRepository::save(db.as_ref(), &registration)
             .await
             .unwrap();
@@ -1394,7 +1396,7 @@ mod tests {
         let now = 1_700_000_000;
         WakeupRepository::save(
             db.as_ref(),
-            &WakeupRegistration::new("s1", Wakeup::At { at: now }, now - 60),
+            &WakeupRegistration::new("s1", Wakeup::UserReply, now - 60).expiring_at(Some(now)),
         )
         .await
         .unwrap();

@@ -28,9 +28,11 @@
 //! durability boundary or it fails.
 //!
 //! **A torn tail is dropped; a hole is refused.** A process killed mid-append
-//! can leave a half-written final line, and that is not a record. Anything
-//! else that will not parse — or a `seq` that skips — is a gap in history the
-//! reader cannot reason about, so it refuses the session instead of guessing.
+//! can leave a half-written final line, and that is not a record. A record of a
+//! known type that will not parse — or a `seq` that skips — is a gap in history
+//! the reader cannot reason about, so it refuses the session instead of
+//! guessing. A record of an unknown type is neither: it reads as inert and
+//! keeps its seq.
 
 use std::path::{Path, PathBuf};
 
@@ -649,7 +651,9 @@ async fn read_segment(path: &Path) -> Result<(Vec<SessionEvent>, u64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_core::domain::session_event::{MessageSource, SurfacePlacement, UserMessageEvent};
+    use komo_core::domain::session_event::{
+        MessageSource, SurfacePlacement, UserMessageEvent, fold_surface,
+    };
 
     fn header() -> SessionHeader {
         SessionHeader {
@@ -757,31 +761,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A record a retired feature left behind — `task/spawned` here — must not
+    /// cost the conversation it sits in: it reads as inert, keeps its seq, and
+    /// the next append lands after it.
     #[tokio::test]
-    async fn an_unknown_required_event_refuses_the_session() {
+    async fn an_unknown_event_type_is_read_as_inert_and_the_session_still_opens() {
         let dir = dir("unknown");
         let log = open(&dir).await;
         log.append_batch(vec![say("one")]).await;
         log.durable_flush().await.unwrap();
         drop(log);
 
-        // A whole, well-formed record of a type this build does not know.
         let segment = dir.join("000000.jsonl");
         let mut raw = std::fs::read_to_string(&segment).unwrap();
-        raw.push_str("{\"v\":1,\"seq\":1,\"at\":\"2026-09-01T10:30:00Z\",\"type\":\"workflow/entered\",\"data\":{}}\n");
+        raw.push_str("{\"v\":1,\"seq\":1,\"at\":\"2026-09-01T10:30:00Z\",\"type\":\"task/spawned\",\"data\":{\"turn_id\":\"t1\",\"task_id\":\"k1\",\"kind\":\"shell\",\"label\":\"sleep 1\"}}\n");
         std::fs::write(&segment, raw).unwrap();
 
-        // Refused at open, not at read: opening already has to scan the active
-        // segment for `next_seq`, so a session whose log cannot be read never
-        // yields a handle that could be appended to.
-        let reopened = SessionLog::open_or_create(dir.clone(), header()).await;
-        assert!(
-            matches!(
-                reopened,
-                Err(LogError::Fold(FoldError::UnknownEventType { seq: 1, .. }))
-            ),
-            "an unrecognized required event must refuse, not be skipped"
+        let log = SessionLog::open_or_create(dir.clone(), header())
+            .await
+            .expect("a foreign record must not refuse the session");
+        log.append_batch(vec![say("two")]).await;
+        log.durable_flush().await.unwrap();
+
+        let events = log.read_from(0).await.unwrap();
+        assert_eq!(
+            events.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "the inert record keeps its seq, so the next append is contiguous"
         );
+        assert_eq!(events[1].kind, SessionEventKind::Unknown);
+        assert_eq!(fold_surface(&events, 0).unwrap().nodes(), &[0, 2]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

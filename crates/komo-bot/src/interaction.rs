@@ -732,9 +732,9 @@ impl WakeupDispatch for TurnWaker {
         cause: WakeupCause,
         payload: &str,
     ) -> anyhow::Result<()> {
-        // No sink: a sweep tick and a settling background task have nobody
-        // standing at a channel waiting for the answer — it lands in the
-        // transcript, which is where the next reader looks.
+        // No sink: a sweep tick has nobody standing at a channel waiting for
+        // the answer — it lands in the transcript, which is where the next
+        // reader looks.
         self.dispatcher
             .continue_turn_with(registration, cause, payload, None)
             .await
@@ -1027,8 +1027,8 @@ impl GatewayDispatcher {
     /// operator is standing there, and a reply that only lands in a transcript
     /// nobody is looking at reads as silence. It lands in the log either way,
     /// which is what the TUI shows when it is opened again. `None` for a wake
-    /// nobody is waiting on the other end of — a sweep firing a timer, a
-    /// settling background task, the GUI's modal (which polls the transcript).
+    /// nobody is waiting on the other end of — a sweep firing an expiry, the
+    /// GUI's modal (which polls the transcript).
     pub async fn continue_turn_with(
         self: &Arc<Self>,
         registration: &WakeupRegistration,
@@ -1040,10 +1040,9 @@ impl GatewayDispatcher {
             anyhow::bail!("this dispatcher has no store to continue a turn from");
         };
         let Some(turn_id) = registration.turn_id.clone() else {
-            // A wake with nothing to continue *starts* something instead: a
-            // background task that settled after its turn ended, a trigger.
-            // What it brought is the whole message — a wake with no turn and
-            // nothing to say would open a turn about nothing.
+            // A wake with nothing to continue *starts* something instead — a
+            // trigger. What it brought is the whole message: a wake with no
+            // turn and nothing to say would open a turn about nothing.
             return self
                 .start_turn_with(&registration.session_id, payload, sink)
                 .await;
@@ -1118,9 +1117,8 @@ impl GatewayDispatcher {
     ///
     /// No `wakeup/fired` is written, and deliberately: that event is the causal
     /// link between a suspension and *its* continuation, and it names the turn
-    /// it brought back. Nothing was suspended here. What caused this turn is
-    /// already a fact in the same log — the `task/settled` immediately before
-    /// it — and the turn's own user message says what it was told.
+    /// it brought back. Nothing was suspended here, and the turn's own user
+    /// message says what it was told.
     async fn start_turn_with(
         self: &Arc<Self>,
         session_id: &str,
@@ -1155,8 +1153,7 @@ impl GatewayDispatcher {
                 Ok(reply) => {
                     // Same rule as a continuation's: deliver where the wake was
                     // answered from when someone is there, and otherwise let the
-                    // transcript be the record. A settling background task has
-                    // nobody there, so this is usually `None`.
+                    // transcript be the record.
                     if let Some(sink) = &sink
                         && let Err(error) = sink.send(&reply).await
                     {
@@ -2112,9 +2109,9 @@ impl GatewayDispatcher {
         }
     }
 
-    /// Re-deliver the messages a crash swallowed: the fourth startup
-    /// crash-residue check, after the interrupted runs, the suspended turns and
-    /// the orphaned background tasks.
+    /// Re-deliver the messages a crash swallowed: the third startup
+    /// crash-residue check, after the interrupted runs and the suspended
+    /// turns.
     ///
     /// A row is `claimed` from the moment the message arrived and `completed`
     /// only once its work finished, so a row still claimed at startup is a
@@ -3478,8 +3475,9 @@ mod tests {
             1_000,
         )
         .continuing(&run.id);
-        let deadline =
-            WakeupRegistration::new("s1", Wakeup::At { at: 2_000 }, 1_000).continuing(&run.id);
+        let deadline = WakeupRegistration::new("s1", Wakeup::UserReply, 1_000)
+            .continuing(&run.id)
+            .expiring_at(Some(2_000));
         for registration in [&approval, &deadline] {
             WakeupRepository::save(db.as_ref(), registration)
                 .await
@@ -4625,9 +4623,9 @@ mod tests {
         );
     }
 
-    /// The other way to consume the same wake: a turn parked on a wait is
-    /// continued rather than a fresh one opened, and what it is handed is the
-    /// message itself.
+    /// The other way to consume the same wake: a registration naming a
+    /// suspended turn continues it rather than opening a fresh one, and what it
+    /// is handed is the message itself.
     #[tokio::test]
     async fn a_turn_waiting_on_a_peer_is_continued_by_that_peers_message() {
         use komo_core::domain::run::Run;

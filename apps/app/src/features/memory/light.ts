@@ -1,23 +1,8 @@
-// How much light a memory stands in.
-//
-// The encoding is not decorative and it is not "recall count → brightness". It
-// is the memory system's own ladder: how close a memory sits to the model's
-// prompt right now.
-//
-//   常驻 pinned    every turn carries it (L1)          — full sun
-//   受光 active     eligible for recall (L2/L3)         — lit
-//   新芽 candidate  extracted, waiting for promotion    — understory
-//   荫影 archived   out of the prompt, kept on disk     — shade
-//   落叶 rejected   turned down                         — fallen
-//
-// Recall usage modulates *within* a tier rather than replacing it, because a
-// memory that has never been recalled is still in the prompt if it is pinned.
-// On a fresh install every recall counter is zero, so tier is the signal that
-// actually carries information; recall becomes the finer grain as it accrues.
+// Database memory tiers; L1 is maintained separately in MEMORY.md.
 
 import type { Memory } from "@/shared/types";
 
-export type Tier = "pinned" | "active" | "candidate" | "archived" | "rejected";
+export type Tier = "active" | "candidate" | "archived" | "rejected";
 
 export interface TierStyle {
   /** Short Chinese name, used as the row's standing label. */
@@ -30,15 +15,9 @@ export interface TierStyle {
   mote: string;
 }
 
-export const TIER_ORDER: Tier[] = ["pinned", "active", "candidate", "archived", "rejected"];
+export const TIER_ORDER: Tier[] = ["active", "candidate", "archived", "rejected"];
 
 export const TIERS: Record<Tier, TierStyle> = {
-  pinned: {
-    label: "常驻",
-    meaning: "每一轮对话都会带上",
-    row: "border-warning/45 bg-warning/8",
-    mote: "bg-warning shadow-[0_0_10px_2px_color-mix(in_oklch,var(--warning)_55%,transparent)]",
-  },
   active: {
     label: "受光",
     meaning: "可以被回忆检索到",
@@ -66,7 +45,6 @@ export const TIERS: Record<Tier, TierStyle> = {
 };
 
 export function tierOf(memory: Memory): Tier {
-  if (memory.pinned) return "pinned";
   const status = memory.status.toLowerCase();
   if (status === "active") return "active";
   if (status === "candidate") return "candidate";
@@ -108,21 +86,18 @@ export function confidenceLabel(confidence: string): string {
  *
  *  Offering every verb on every row is what the old panel did — a `reject`
  *  button on an already-rejected memory is noise the operator has to read past. */
-export function actionsFor(tier: Tier): ("promote" | "pin" | "reject")[] {
+export function actionsFor(tier: Tier): ("promote" | "reject")[] {
   switch (tier) {
-    case "pinned":
-      return ["reject"];
     case "active":
-      return ["pin", "reject"];
+      return ["reject"];
     case "candidate":
-      return ["promote", "pin", "reject"];
+      return ["promote", "reject"];
     default:
       return ["promote"];
   }
 }
 
-export const ACTION_LABELS: Record<"promote" | "pin" | "reject", string> = {
+export const ACTION_LABELS: Record<"promote" | "reject", string> = {
   promote: "转为受光",
-  pin: "设为常驻",
   reject: "否决",
 };

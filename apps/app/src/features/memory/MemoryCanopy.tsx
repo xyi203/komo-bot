@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronDownIcon, MoonStarIcon, PinIcon, SearchIcon, XIcon } from "lucide-react";
+import { ChevronDownIcon, MoonStarIcon, SearchIcon, XIcon } from "lucide-react";
 
 import { qk } from "@/shared/api/query-keys";
 import { useConnection } from "@/shared/api/use-connection";
@@ -105,14 +105,13 @@ export function MemoryCanopy() {
     return buckets;
   }, [visible]);
 
-  const pinnedCount = all.filter((memory) => memory.pinned).length;
   const litCount = all.filter((memory) => tierOf(memory) === "active").length;
   const everRecalled = all.some((memory) => memory.recall_count > 0);
   const selected = all.find((memory) => memory.id === selectedId) ?? null;
 
   // Candidates first — they are the only rows that are *waiting on the operator*.
   // Everything else is ordered by how much light it stands in.
-  const order: Tier[] = ["candidate", "pinned", "active"];
+  const order: Tier[] = ["candidate", "active"];
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1">
@@ -128,17 +127,13 @@ export function MemoryCanopy() {
                 ) : (
                   <>
                     komo 记住了 <Count>{all.length}</Count> 件事，
-                    <Count>{litCount}</Count> 件能被回忆检索到
-                    {pinnedCount > 0 ? (
-                      <>
-                        ，<Count>{pinnedCount}</Count> 件常驻在每一轮对话里。
-                      </>
-                    ) : (
-                      "，还没有常驻记忆。"
-                    )}
+                    <Count>{litCount}</Count> 件能被回忆检索到 。
                   </>
                 )}
               </h1>
+              <p className="mt-2 text-xs text-muted-foreground">
+                此处管理按需回忆的记忆。每轮携带的常驻记忆在 MEMORY.md 中编辑。
+              </p>
             </div>
             <DreamButton
               candidateCount={dream.data?.candidate_count ?? 0}
@@ -334,9 +329,6 @@ function MemoryRow({
         >
           {memory.content}
         </button>
-        {memory.pinned && (
-          <PinIcon className="mt-1 size-3.5 shrink-0 text-warning-foreground" aria-label="常驻" />
-        )}
       </div>
 
       <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 pl-4 text-xs text-muted-foreground">

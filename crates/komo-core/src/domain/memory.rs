@@ -34,8 +34,7 @@ pub struct Memory {
     pub provenance: MemoryProvenance,
     /// 0–100 ranking weight; ties broken by recency. Default 50.
     pub importance: i32,
-    /// Eligible for L1 pinned-profile injection (every turn). Only ever set by
-    /// the user / explicit confirmation, never by automated extraction.
+    /// Retired storage field. L1 is sourced exclusively from MEMORY.md.
     pub pinned: bool,
 
     /// Where this memory may surface. Scope is enforced at the query layer, not
@@ -351,40 +350,6 @@ impl Memory {
     pub fn reject(&mut self, now: i64) {
         self.status = MemoryStatus::Rejected;
         self.updated_at = now;
-    }
-
-    /// Pin into the L1 per-turn profile (the manual, explicit path — automated
-    /// extraction never pins). Raises confidence so it actually surfaces.
-    pub fn pin(&mut self, now: i64) {
-        self.pinned = true;
-        self.status = MemoryStatus::Active;
-        if self.confidence == MemoryConfidence::Extracted {
-            self.confidence = MemoryConfidence::Confirmed;
-        }
-        self.updated_at = now;
-    }
-
-    /// Whether this memory is eligible for L1 pinned-profile injection in the
-    /// given context: pinned, active, believed, high-confidence, an
-    /// identity/preference kind, in a scope the context allows, and not expired.
-    ///
-    /// The belief check matters most here: a pinned memory is asserted on *every*
-    /// turn, so one the user has just contradicted must stop the moment the
-    /// contradiction lands, without waiting for anyone to unpin it.
-    pub fn is_pinnable(&self, ctx: &MemoryContext, now: i64) -> bool {
-        self.pinned
-            && self.is_injectable()
-            && self.status == MemoryStatus::Active
-            && matches!(
-                self.confidence,
-                MemoryConfidence::Confirmed | MemoryConfidence::UserWritten
-            )
-            && matches!(
-                self.kind,
-                MemoryKind::Profile | MemoryKind::Preference | MemoryKind::Feedback
-            )
-            && ctx.allows(&self.scope)
-            && !self.is_expired(now)
     }
 }
 
@@ -1065,28 +1030,7 @@ pub fn recall_score(memory: &Memory, query: &RecallQuery, now: i64) -> Option<f6
     Some(score)
 }
 
-/// Filter + rank an already-loaded memory set for the L1 pinned profile in
-/// `ctx` (most-important first, ties by most-recent). Split out from
-/// [`MemoryRepository::pinned`] so a caller holding a fresh `list()` can derive
-/// both pinned and recall from a single load — see `assemble` in `infra/llm.rs`,
-/// which used to scan the store twice per turn.
-pub fn select_pinned(memories: &[Memory], ctx: &MemoryContext, now: i64) -> Vec<Memory> {
-    let mut pinned: Vec<Memory> = memories
-        .iter()
-        .filter(|m| m.is_pinnable(ctx, now))
-        .cloned()
-        .collect();
-    pinned.sort_by(|a, b| {
-        b.importance
-            .cmp(&a.importance)
-            .then(b.updated_at.cmp(&a.updated_at))
-    });
-    pinned
-}
-
-/// Rank an already-loaded memory set for L3 recall against `query`, top `limit`
-/// (`0` = no cap). Same filter/score/sort as [`MemoryRepository::recall`], split
-/// out for the single-load turn path (see [`select_pinned`]).
+/// Select in-scope active and candidate memories for L3 recall.
 pub fn select_recall(
     memories: &[Memory],
     ctx: &MemoryContext,
@@ -1167,16 +1111,8 @@ pub trait MemoryRepository: Send + Sync {
 
     /// All non-expired memories, any status. Callers filter further. (Kept
     /// no-arg for the `memory` tool; richer scope/status queries go through
-    /// [`MemoryRepository::pinned`] / `search`.)
+    /// `recall` / `search`.)
     async fn list(&self) -> anyhow::Result<Vec<Memory>>;
-
-    /// L1 pinned profile: the small, stable set eligible for per-turn injection
-    /// in `ctx`. Defaults to filtering [`list`](MemoryRepository::list) by
-    /// [`Memory::is_pinnable`]; a store may override for efficiency.
-    async fn pinned(&self, ctx: &MemoryContext) -> anyhow::Result<Vec<Memory>> {
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        Ok(select_pinned(&self.list().await?, ctx, now))
-    }
 
     /// Fetch a single memory by id. Default scans [`list`](MemoryRepository::list)
     /// (so it does not see expired memories); a store may override to fetch
@@ -1200,7 +1136,7 @@ pub trait MemoryRepository: Send + Sync {
     /// each line with confidence, so the model treats them cautiously.
     ///
     /// The per-turn hot path in `infra/llm.rs` uses [`select_recall`] over a
-    /// single shared `list()` instead (see [`select_pinned`]); this method is
+    /// single shared `list()` instead; this method is
     /// the standalone entry point retained for the memory store's query surface
     /// and its integration tests. Lexical-only: a store holds no embedding
     /// backend, so the semantic arm belongs to the turn path, which does.

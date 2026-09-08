@@ -18,7 +18,7 @@ komo 是一个 Rust 个人 agent 框架：一个二进制提供交互式 LLM 聊
 
 ## Positioning
 
-以「记忆随时间积累」为核心机制的个人 agent：三层记忆面（pinned / memory tool / lexical recall）+ 夜间 dream 巩固 + 使用信号驱动的候选晋升，配合本地优先（一切数据在 `~/.komo`）、单二进制、always-on gateway。邻近产品（通用 chatbot、无状态 agent 框架）无法如实复制这一「越用越懂你」的主张。
+以「记忆随时间积累」为核心机制的个人 agent：三层记忆面（MEMORY.md / memory tool / hybrid recall）+ 夜间 dream 巩固 + 使用信号驱动的候选晋升，配合本地优先（一切数据在 `~/.komo`）、单二进制、always-on gateway。邻近产品（通用 chatbot、无状态 agent 框架）无法如实复制这一「越用越懂你」的主张。
 
 ## Operating Context
 

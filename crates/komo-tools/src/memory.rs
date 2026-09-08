@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_services::memory_enrichment::pinned_budget_usage;
 use komo_services::memory_query::MemoryQueryService;
 use komo_services::tool_execution::SessionContext;
 use serde::Deserialize;
@@ -38,9 +37,6 @@ struct MemoryArgs {
     /// New status (action=update).
     #[serde(default)]
     status: Option<String>,
-    /// Pin/unpin (action=save/update). Pinning is the only path into L1 injection.
-    #[serde(default)]
-    pinned: Option<bool>,
     /// New ranking weight 0–100 (action=update).
     #[serde(default)]
     importance: Option<i32>,
@@ -85,7 +81,7 @@ impl MemoryArgs {
 /// Long-term, cross-session memory with governance. The model `save`s facts,
 /// `search`es them (scoped to the current chat/session), and curates the
 /// library: `promote` a candidate to active, `reject`/`archive` it, or `update`
-/// fields (including `pinned`, which gates L1 per-turn injection). Storage lives
+/// fields. L1 lives in the operator-edited MEMORY.md file. Storage lives
 /// behind [`MemoryRepository`] — the same store the reviewer writes to.
 ///
 /// Searching goes through the same [`MemoryQueryService`] as automatic recall, so
@@ -99,23 +95,6 @@ pub struct MemoryTool {
 impl MemoryTool {
     pub fn new(memories: Arc<dyn MemoryRepository>, query: Arc<MemoryQueryService>) -> Self {
         Self { memories, query }
-    }
-
-    /// A Hermes-style usage line for the L1 pinned profile — the one memory
-    /// surface with a real, finite budget (it is injected verbatim every turn).
-    /// Surfacing "how full is it" nudges the model to keep pinned compact and
-    /// curate before adding. Returns `None` when nothing is pinned (no pressure
-    /// to report). Best-effort: a load failure just omits the line.
-    async fn pinned_usage_line(&self, scope: &MemoryContext) -> Option<String> {
-        let pinned = self.memories.pinned(scope).await.ok()?;
-        let (used, budget) = pinned_budget_usage(&pinned);
-        if used == 0 {
-            return None;
-        }
-        let pct = (used * 100) / budget;
-        Some(format!(
-            "L1 pinned profile: {used}/{budget} chars ({pct}%) used."
-        ))
     }
 
     /// Load a memory by id or return a helpful error.
@@ -147,13 +126,9 @@ impl Tool for MemoryTool {
          it matches across languages, and it is worth re-searching with different terms \
          when the memories you were handed are close but not enough; action=\"list\" \
          returns stored facts; \
-         action=\"update\" changes a memory by id (status / pinned / importance / kind / \
+         action=\"update\" changes a memory by id (status / importance / kind / \
          content); action=\"promote\" marks a candidate active; action=\"reject\" / \
-         \"archive\" retire one. Pin a memory (update pinned=true) only when the user \
-         confirms it as durable profile context. \
-         Write each memory as a declarative fact, not an instruction (\"User prefers \
-         concise replies\" ✓, \"Always reply concisely\" ✗), and prioritize what reduces \
-         future steering. Do not save anything that will be stale within a week — task \
+         \"archive\" retire one. L1 memory is maintained separately in MEMORY.md. Do not save anything that will be stale within a week — task \
          progress, completed-work logs, PR/issue numbers, or commit SHAs do not belong here. \
          When a new fact replaces or contradicts a stored one (a changed preference, a \
          corrected fact), pass `supersedes: [ids]` on save: the outdated memory is \
@@ -180,7 +155,6 @@ impl Tool for MemoryTool {
                 "query": { "type": "string", "description": "Search term (action=search)." },
                 "id": { "type": "string", "description": "Target memory id (action=update/promote/reject/archive)." },
                 "status": { "type": "string", "enum": ["candidate", "active", "archived", "rejected"], "description": "New status (action=update)." },
-                "pinned": { "type": "boolean", "description": "Pin/unpin for L1 injection (action=save or update). Only pin user-confirmed durable facts." },
                 "importance": { "type": "integer", "description": "Ranking weight 0–100 (action=update)." },
                 "expiry_days": { "type": "integer", "description": "Optional TTL in days (action=save); omit for permanent." },
                 "supersedes": {
@@ -248,9 +222,6 @@ impl Tool for MemoryTool {
                     &memory.content.clone(),
                     now,
                 );
-                if let Some(pinned) = args.pinned {
-                    memory.pinned = pinned;
-                }
                 // Scope to the current chat so a channel fact does not leak elsewhere.
                 memory.scope = scope.write_scope();
                 if let Some(days) = args.expiry_days.filter(|d| *d > 0) {
@@ -297,10 +268,6 @@ impl Tool for MemoryTool {
                     }
                 }
 
-                if let Some(usage) = self.pinned_usage_line(&scope).await {
-                    out.push('\n');
-                    out.push_str(&usage);
-                }
                 Ok(ToolOutput::text(out).with_structured(json!({ "id": memory.id })))
             }
             "list" => {
@@ -310,7 +277,7 @@ impl Tool for MemoryTool {
                 if let Some(status) = args.status.as_deref().map(parse_memory_status) {
                     memories.retain(|m| m.status == status);
                 }
-                let mut out = if memories.is_empty() && total > 0 {
+                let out = if memories.is_empty() && total > 0 {
                     // A status filter that matched nothing must not read as "the
                     // store is empty" — say where the memories actually are so
                     // the model can re-list instead of concluding there are none.
@@ -321,10 +288,6 @@ impl Tool for MemoryTool {
                 } else {
                     render(&memories)
                 };
-                if let Some(usage) = self.pinned_usage_line(&scope).await {
-                    out.push_str("\n\n");
-                    out.push_str(&usage);
-                }
                 Ok(ToolOutput::text(out).with_title(format!("{} memories", memories.len())))
             }
             "search" => {
@@ -349,13 +312,6 @@ impl Tool for MemoryTool {
                 }
                 if let Some(status) = args.status.as_deref() {
                     memory.status = parse_memory_status(status);
-                }
-                if let Some(pinned) = args.pinned {
-                    memory.pinned = pinned;
-                    // Pinning requires high confidence to actually surface in L1.
-                    if pinned && memory.confidence == MemoryConfidence::Extracted {
-                        memory.confidence = MemoryConfidence::Confirmed;
-                    }
                 }
                 if let Some(importance) = args.importance {
                     memory.importance = importance.clamp(0, 100);
@@ -435,7 +391,6 @@ fn render(memories: &[Memory]) -> String {
 }
 
 fn render_one(m: &Memory) -> String {
-    let pin = if m.pinned { " 📌" } else { "" };
     // Belief is shown only when it is *not* `current`, so the common line stays
     // short — but a contested or superseded memory can never be read as an
     // ordinary fact, which is the whole point of it being searchable at all.
@@ -445,12 +400,11 @@ fn render_one(m: &Memory) -> String {
         format!("/{}", m.belief.as_str())
     };
     let mut line = format!(
-        "[{}/{}/{}{}{}] {}: {}",
+        "[{}/{}/{}{}] {}: {}",
         m.kind.as_str(),
         m.status.as_str(),
         m.scope.type_str(),
         belief,
-        pin,
         m.id,
         m.content
     );
@@ -540,7 +494,7 @@ mod tests {
                 json!({
                     "action": "list", "status": "active", "kind": "fact",
                     "id": "", "query": "", "text": "",
-                    "importance": 0, "pinned": false, "expiry_days": 0
+                    "importance": 0, "expiry_days": 0
                 }),
                 &ctx(),
             )
@@ -689,76 +643,6 @@ mod tests {
             .unwrap()
             .text;
         assert!(out.contains("Saved memory"));
-    }
-
-    #[tokio::test]
-    async fn promote_then_pin_via_update() {
-        let tool = temp_tool().await;
-        // A candidate (simulating a reviewer extraction).
-        let mut cand = Memory::new(MemoryKind::Preference, "prefers concise answers");
-        cand.status = MemoryStatus::Candidate;
-        cand.confidence = MemoryConfidence::Extracted;
-        tool.memories.save(&cand).await.unwrap();
-
-        tool.call(json!({ "action": "promote", "id": cand.id }), &ctx())
-            .await
-            .unwrap();
-        let after = tool.memories.get(&cand.id).await.unwrap().unwrap();
-        assert_eq!(after.status, MemoryStatus::Active);
-        assert_eq!(after.confidence, MemoryConfidence::Confirmed);
-
-        tool.call(
-            json!({ "action": "update", "id": cand.id, "pinned": true }),
-            &ctx(),
-        )
-        .await
-        .unwrap();
-        let pinned = tool.memories.get(&cand.id).await.unwrap().unwrap();
-        assert!(pinned.pinned);
-    }
-
-    /// `save` used to drop `pinned` on the floor, so a model asked to remember
-    /// something as durable profile context got an unpinned memory and no error.
-    #[tokio::test]
-    async fn save_with_pinned_lands_in_the_l1_profile() {
-        let tool = temp_tool().await;
-        let out = tool
-            .call(
-                json!({ "action": "save", "text": "User keeps the AC at 24°C", "kind": "preference", "pinned": true }),
-                &ctx(),
-            )
-            .await
-            .unwrap();
-        let id = out.structured["id"].as_str().unwrap().to_string();
-
-        let saved = tool.memories.get(&id).await.unwrap().unwrap();
-        assert!(saved.pinned);
-        let scope = MemoryContext::new("cli:test", None);
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        assert!(saved.is_pinnable(&scope, now));
-        let pinned = tool.memories.pinned(&scope).await.unwrap();
-        assert_eq!(pinned.len(), 1);
-        assert_eq!(pinned[0].id, id);
-    }
-
-    /// A pinned memory that was superseded is not injected, so it must not show
-    /// up as pressure on the L1 budget either.
-    #[tokio::test]
-    async fn pinned_usage_ignores_a_superseded_memory() {
-        let tool = temp_tool().await;
-        let scope = MemoryContext::new("cli:test", None);
-        let mut m = Memory::new(MemoryKind::Preference, "User keeps the AC at 26°C");
-        m.pinned = true;
-        m.confidence = MemoryConfidence::UserWritten;
-        tool.memories.save(&m).await.unwrap();
-        assert!(tool.pinned_usage_line(&scope).await.is_some());
-
-        m.supersede(
-            "mem-newer",
-            time::OffsetDateTime::now_utc().unix_timestamp(),
-        );
-        tool.memories.save(&m).await.unwrap();
-        assert!(tool.pinned_usage_line(&scope).await.is_none());
     }
 
     #[tokio::test]

@@ -289,7 +289,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
 
     // ── Shared dependencies (built once, used by every tool set) ─────────────
     // Memories are `memory_records` in `komo.db`, shared by the `memory` tool,
-    // the reflective reviewer and the L1 pinned injection.
+    // the reflective reviewer and L3 recall.
     let memory_repo: Arc<dyn MemoryRepository> = db.clone();
 
     // The delegate tool runs a separate, tool-less sub-agent on the (optionally
@@ -681,6 +681,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
             // …and the operator-authored user profile (~/.komo/USER.md), for the
             // same reason the aux/reviewer builders don't get it.
             .user_profile()
+            .memory()
             // …and their machine-wide agent instructions (~/.agents/AGENTS.md),
             // shared with whatever other agents read that directory.
             .global_instructions(),
@@ -688,7 +689,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
 
     // Hand the same tool instances to the LLM so the model can call them, plus
-    // the memory enricher (main agent only): the memory store for pinned/recall
+    // the memory enricher (main agent only): the memory store for recall
     // selection and the aux agent for recall screening, behind one interface.
     let enricher = Arc::new(MemoryEnricher::new(
         memory_repo.clone(),

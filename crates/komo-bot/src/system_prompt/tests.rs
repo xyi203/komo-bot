@@ -446,3 +446,38 @@ fn cached_prompt_picks_up_a_newly_created_context_file() {
     assert!(second.contains("project instructions from `AGENTS.md`"));
     assert!(second.contains("Be terse."));
 }
+
+#[test]
+fn l1_file_changes_apply_to_next_prompt_and_never_to_aux() {
+    let home = tmp("l1_file");
+    let path = home.join("MEMORY.md");
+    let builder = SystemPromptBuilder::new(&config())
+        .home(home.clone())
+        .memory();
+    assert!(!builder.build().contains("komo:memory:l1"));
+    std::fs::write(&path, "默认用中文回答").unwrap();
+    assert!(builder.build().contains("默认用中文回答"));
+    std::fs::write(&path, "使用 Rust 举例，先给结论").unwrap();
+    let updated = builder.build();
+    assert!(updated.contains("使用 Rust 举例，先给结论"));
+    assert!(!updated.contains("默认用中文回答"));
+    let aux = SystemPromptBuilder::new(&config()).home(home.clone());
+    assert!(!aux.build().contains("使用 Rust 举例"));
+    std::fs::write(&path, "").unwrap();
+    assert!(!builder.build().contains("komo:memory:l1"));
+    std::fs::remove_file(&path).unwrap();
+    assert!(!builder.build().contains("komo:memory:l1"));
+}
+
+#[test]
+fn l1_file_limit_is_visible_and_unicode_safe() {
+    let home = tmp("l1_limit");
+    std::fs::write(home.join("MEMORY.md"), "记".repeat(8_001)).unwrap();
+    let prompt = SystemPromptBuilder::new(&config())
+        .home(home)
+        .memory()
+        .build();
+    assert!(prompt.contains(&"记".repeat(8_000)));
+    assert!(!prompt.contains(&"记".repeat(8_001)));
+    assert!(prompt.contains("[... truncated]"));
+}

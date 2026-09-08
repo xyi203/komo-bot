@@ -62,36 +62,6 @@ fn cli_session_context_writes_global() {
     assert_eq!(ctx.write_scope(), MemoryScope::Global);
 }
 
-fn pinnable_memory() -> Memory {
-    let mut m = Memory::new(MemoryKind::Preference, "prefers concise answers");
-    m.pinned = true;
-    m.confidence = MemoryConfidence::UserWritten;
-    m
-}
-
-#[test]
-fn is_pinnable_requires_pinned_active_confident_identity_kind() {
-    let ctx = MemoryContext::local("s1");
-    let now = 1_000;
-    assert!(pinnable_memory().is_pinnable(&ctx, now));
-
-    let mut not_pinned = pinnable_memory();
-    not_pinned.pinned = false;
-    assert!(!not_pinned.is_pinnable(&ctx, now));
-
-    let mut low_conf = pinnable_memory();
-    low_conf.confidence = MemoryConfidence::Extracted;
-    assert!(!low_conf.is_pinnable(&ctx, now));
-
-    let mut wrong_kind = pinnable_memory();
-    wrong_kind.kind = MemoryKind::Reference;
-    assert!(!wrong_kind.is_pinnable(&ctx, now));
-
-    let mut expired = pinnable_memory();
-    expired.expires_at = Some(now - 1);
-    assert!(!expired.is_pinnable(&ctx, now));
-}
-
 #[test]
 fn recall_terms_splits_ascii_words_and_cjk_bigrams() {
     let terms = recall_terms("Uses Rust 项目");
@@ -233,22 +203,6 @@ fn a_memory_written_in_one_local_conversation_is_recallable_in_the_next() {
     let read_ctx = MemoryContext::local("conversation-two");
     let query = RecallQuery::lexical("rust toolchain");
     assert_eq!(select_recall(&[memory], &read_ctx, &query, 5, now).len(), 1,);
-}
-
-#[test]
-fn select_pinned_keeps_only_eligible_and_orders_by_importance() {
-    let ctx = MemoryContext::local("s1");
-    let now = 1_000;
-    let mut low = pinnable_memory();
-    low.importance = 10;
-    let mut high = pinnable_memory();
-    high.importance = 90;
-    let mut ineligible = pinnable_memory();
-    ineligible.pinned = false; // not pinnable
-    let picked = select_pinned(&[low.clone(), high.clone(), ineligible], &ctx, now);
-    assert_eq!(picked.len(), 2, "the un-pinned memory is excluded");
-    assert_eq!(picked[0].id, high.id, "most important first");
-    assert_eq!(picked[1].id, low.id);
 }
 
 #[test]
@@ -554,21 +508,6 @@ fn governance_transitions_set_status_confidence_and_updated_at() {
     let mut m = candidate(0, 1, 8_000);
     m.reject(now);
     assert_eq!(m.status, MemoryStatus::Rejected);
-
-    let mut m = candidate(0, 1, 8_000);
-    m.pin(now);
-    assert!(m.pinned);
-    assert_eq!(m.status, MemoryStatus::Active);
-    assert_eq!(
-        m.confidence,
-        MemoryConfidence::Confirmed,
-        "pin raises extracted to confirmed so it can surface in L1"
-    );
-    // Pinning must never *lower* confidence.
-    let mut written = candidate(0, 1, 8_000);
-    written.confidence = MemoryConfidence::UserWritten;
-    written.pin(now);
-    assert_eq!(written.confidence, MemoryConfidence::UserWritten);
 }
 
 #[test]
@@ -781,19 +720,6 @@ fn contested_and_superseded_memories_are_not_injectable() {
     assert_eq!(m.superseded_by, "mem-rust");
 }
 
-/// A pinned memory is asserted every single turn, so a contradiction has to
-/// silence it immediately — without anyone unpinning it first.
-#[test]
-fn a_contested_pinned_memory_leaves_the_l1_profile() {
-    let ctx = MemoryContext::local("s1");
-    let now = 1_000;
-    let mut m = pinnable_memory();
-    assert!(m.is_pinnable(&ctx, now));
-    m.contest(now);
-    assert!(!m.is_pinnable(&ctx, now));
-    assert_eq!(select_pinned(&[m], &ctx, now).len(), 0);
-}
-
 /// Retrieval is deliberately belief-agnostic: the scoring layer must keep
 /// returning a contested memory so an explicit search can surface it. The
 /// injection filter lives with the injector.
@@ -838,15 +764,4 @@ fn belief_state_round_trips_and_unknown_reads_as_current() {
     // Every row written before the column existed.
     assert_eq!(parse_belief_state(""), BeliefState::Current);
     assert_eq!(parse_belief_state("nonsense"), BeliefState::Current);
-}
-
-#[test]
-fn pinnable_excludes_out_of_scope() {
-    let ctx = MemoryContext::new("s1", Some(&ChannelPeer::new("telegram", "42")));
-    let mut other_channel = pinnable_memory();
-    other_channel.scope = MemoryScope::Channel {
-        platform: "feishu".into(),
-        chat_id: "oc_x".into(),
-    };
-    assert!(!other_channel.is_pinnable(&ctx, 1_000));
 }

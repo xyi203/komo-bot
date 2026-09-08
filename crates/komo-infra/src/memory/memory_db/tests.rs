@@ -148,36 +148,6 @@ async fn expired_hidden_from_list() {
 }
 
 #[tokio::test]
-async fn pinned_filters_by_eligibility_and_scope() {
-    let db = Db::connect(&turso_url("komo_memory_db_pinned.db"))
-        .await
-        .unwrap();
-
-    // Eligible: pinned, active, user_written, preference, global.
-    let mut good = Memory::new(MemoryKind::Preference, "concise answers");
-    good.pinned = true;
-    good.confidence = MemoryConfidence::UserWritten;
-    db.save(&good).await.unwrap();
-
-    // Not pinned.
-    db.save(&Memory::new(MemoryKind::Preference, "not pinned"))
-        .await
-        .unwrap();
-
-    // Pinned but candidate → excluded.
-    let mut cand = Memory::new(MemoryKind::Profile, "candidate");
-    cand.pinned = true;
-    cand.confidence = MemoryConfidence::UserWritten;
-    cand.status = MemoryStatus::Candidate;
-    db.save(&cand).await.unwrap();
-
-    let ctx = MemoryContext::local("s1");
-    let pinned = db.pinned(&ctx).await.unwrap();
-    assert_eq!(pinned.len(), 1);
-    assert_eq!(pinned[0].content, "concise answers");
-}
-
-#[tokio::test]
 async fn recall_returns_in_scope_active_and_candidate_matches() {
     let db = Db::connect(&turso_url("komo_memory_db_recall.db"))
         .await

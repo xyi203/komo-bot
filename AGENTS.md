@@ -23,7 +23,7 @@ komo logs [-n N] [-f] [--stdout]   # tail gateway tracing log
 komo doctor                        # config & gateway health
 komo health                        # liveness probe (exit 0 = healthy; Docker HEALTHCHECK)
 
-komo memory list|search|promote|reject|pin|triage|backfill
+komo memory list|search|promote|reject|triage|backfill
 komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; index is incremental)
 komo dream [--apply]               # evidence-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent [--skill NAME] [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
@@ -49,7 +49,7 @@ Logs: `init_tracing` in `main.rs` installs the subscriber (without it every
 results). Turns run in `run` spans, tool calls in `tool` spans,
 matching the run ledger. At `info` a turn tells its whole story inside that
 span: `turn started` (origin, channel platform, kind, prompt size, history
-depth) → `memory recall` (pinned/fetched/injected, from prompt assembly) → one
+depth) → `memory recall` (fetched/injected, from prompt assembly) → one
 `model round completed` per round (provider/model, `tool_calls`, `text_chars`,
 tokens, `elapsed_ms` — a round 1 with `tool_calls=0` is a model answering out of
 its own head) → `tool ok` / `tool failed` per call → `run done` with `rounds`,
@@ -78,6 +78,7 @@ code is gone — an absent `komo.db` is created, a present one is used.
 | `~/.komo/permissions.json` | saved approval grants | durable |
 | `~/.komo/tool-output/` | over-limit tool results + per-session `index.jsonl` (7-day retention) | disposable |
 | `~/.komo/artifacts/<session>/` | what a turn *produced* — reports, scripts, downloads | durable — never swept; a writable workspace root |
+| `~/.komo/MEMORY.md` | operator-edited global L1; never generated from database pins or changed by Dream | durable |
 | `~/.komo/skills/` | skill files (filesystem is the source of truth) | durable |
 | `~/.komo/plugins/` | `*.py` plugin tools the operator (or the agent, under approval) authored | durable — a writable workspace root, and the only one where a write is `Risk::Dangerous` |
 
@@ -309,7 +310,9 @@ become `ConfigIssue`s (never abort resolution) checked by `validate_agent` /
 or call `std::env::var` in callers** — the only exception is `KOMO_HOME`.
 
 Operator-authored prompt files (`komo-bot`'s `system_prompt`, main agent only):
-persona `~/.komo/SOUL.md`, profile `~/.komo/USER.md`, and **one instruction file
+persona `~/.komo/SOUL.md`, profile `~/.komo/USER.md`, L1 context
+`~/.komo/MEMORY.md` (sole L1 source, main agent only, 8,000 characters with
+visible truncation), and **one instruction file
 per scope, first found wins** — machine-wide `~/.komo/AGENTS.md` else
 `~/.agents/AGENTS.md` (the latter under the real home, not `KOMO_HOME`, since
 other agents share it), plus project `AGENTS.md` else `CLAUDE.md` else
@@ -652,7 +655,7 @@ call the same functions, which is what keeps validation from forking.
   matching, so an echoed "connection refused" must not re-fire a mutation.
 - `domain/memory.rs` + `services/memory_query.rs` + `services/memory_consolidation.rs`
   + `services/memory_enrichment.rs` — three surfaces:
-  L1 pinned block (manual `pin` only), L2 `memory` tool + operator CLI,
+  L1 operator-edited `MEMORY.md` via `SystemPromptBuilder`, L2 `memory` tool + operator CLI,
   L3 recall (fetch 15, inject ≤5, aux-screened above 5).
   **Truth and utility are different axes, on purpose.** `support_count` /
   `contradiction_count` / `last_confirmed_at` / `evidence` say whether a memory is
@@ -672,7 +675,8 @@ call the same functions, which is what keeps validation from forking.
   **`BeliefState` is a separate column from `status`**, not a new status value.
   Status is the triage pipeline every operator surface is built on; belief is
   `current` / `contested` / `superseded`, and only `current` may be injected
-  (`is_injectable`, checked by `enrich` and `is_pinnable`). Retrieval stays
+  (`is_injectable`, checked by `enrich`). This governs database L3, not the
+  operator-edited L1 file. Retrieval stays
   belief-agnostic — an explicit `memory search` must surface a contested memory or
   the model cannot help settle it.
   **Every extracted observation goes through one seam** (`MemoryConsolidator`):
@@ -701,7 +705,7 @@ call the same functions, which is what keeps validation from forking.
   forgotten. Injection still reads `select_recall`, and `dream_verdict` promotes
   only candidates, so a rejected claim can accumulate evidence and still never
   reach a prompt.
-  Reviewer extractions are always `candidate`, never pinned/active.
+  Reviewer extractions are always `candidate`, never active; they never edit L1.
   **Provenance is a separate axis again** (`MemoryProvenance`: `user` / `tool`,
   additive column, default `user`). A turn reads pages, files and MCP replies,
   and a page that says "the user prefers X" is a page saying so — indistinguishable
@@ -800,7 +804,8 @@ call the same functions, which is what keeps validation from forking.
   A turn's steps reach its closing tool note from `RunContext`, not from the
   rows: mid-turn there are no step rows to read.
   `Run.memories` records **which stored memories reached that turn's prompt**
-  (pinned and recall kept apart), carried out of prompt assembly on
+  (L3 recall; the retired pinned list remains readable for historical runs),
+  carried out of prompt assembly on
   `TurnDriver::memories()` the same way `usage()` carries tokens. It answers
   the question `recall_count` cannot: not "is this memory useful" but "which
   memory produced *this* answer" — and, read the other way, which turns a

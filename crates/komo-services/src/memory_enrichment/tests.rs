@@ -10,8 +10,7 @@ fn now() -> i64 {
 
 use komo_core::domain::llm::{DeltaSink, Step, ToolOutcome, TurnDriver};
 use komo_core::domain::memory::{
-    EvidenceRelation, MEMORY_STALE_AFTER_DAYS, MemoryConfidence, MemoryKind, MemoryScope,
-    MemoryStatus,
+    EvidenceRelation, MEMORY_STALE_AFTER_DAYS, MemoryConfidence, MemoryKind, MemoryStatus,
 };
 use std::sync::Mutex;
 
@@ -204,30 +203,24 @@ async fn store_failure_is_swallowed_not_propagated() {
 }
 
 #[tokio::test]
-async fn pinned_precedes_recall_and_pinned_is_deduped_from_recall() {
-    let mut library = vec![pinned_memory("prefers concise answers about kanban")];
-    library.push(active_fact("m-r", "durable kanban tasks live in kanban.db"));
-    let store = FakeStore::new(library);
-    let e = enricher(store, None);
-    let injection = e
-        .enrich(&Session::new("s"), "where do kanban tasks live?", &[])
-        .await
-        .expect("both tiers inject");
-    let pinned = injection.pinned.as_deref().expect("pinned tier present");
-    let recall = injection.recall.as_deref().expect("recall tier present");
-    assert!(pinned.contains("komo:memory:pinned"));
-    assert!(pinned.contains("prefers concise answers"));
-    assert!(recall.contains("komo:memory:recall"));
-    assert!(recall.contains("kanban.db"));
-    // The pinned memory is active + in-scope, so recall would also match
-    // it — it must appear exactly once (in the pinned block).
-    assert_eq!(
-        injection
-            .joined()
-            .matches("prefers concise answers")
-            .count(),
-        1
+async fn database_pins_are_only_recalled_when_relevant() {
+    let e = enricher(
+        FakeStore::new(vec![pinned_memory("prefers concise answers about kanban")]),
+        None,
     );
+    assert!(
+        e.enrich(&Session::new("s"), "unrelated", &[])
+            .await
+            .is_none()
+    );
+    let injection = e.enrich(&Session::new("s"), "kanban", &[]).await.unwrap();
+    assert!(
+        injection
+            .recall
+            .unwrap()
+            .contains("prefers concise answers")
+    );
+    assert!(injection.used.pinned.is_empty());
 }
 
 #[tokio::test]
@@ -464,17 +457,6 @@ fn an_ordinary_memory_gets_no_markers() {
     assert!(block.contains("- [fact/inferred/global]"), "{block}");
 }
 
-/// The pinned tier is asserted every turn, so it needs the same trust
-/// markers — a stale pinned preference is the most expensive kind.
-#[test]
-fn pinned_block_marks_stale_memories_too() {
-    let now = now();
-    let mut m = pinned_memory("prefers Python examples");
-    m.created_at = now - (MEMORY_STALE_AFTER_DAYS + 1) * 86_400;
-    let block = render_pinned_memory_block(&[m], now).unwrap();
-    assert!(block.contains("/stale:"), "{block}");
-}
-
 /// Screening decides what changes the turn, so it has to see what the turn is
 /// about — not just the last sentence of it.
 #[test]
@@ -544,53 +526,4 @@ fn recall_block_respects_budget_whole_lines_only() {
     for line in &bullets {
         assert!(line.contains("recalled fact number"));
     }
-}
-
-#[test]
-fn empty_pinned_renders_nothing() {
-    assert!(render_pinned_memory_block(&[], now()).is_none());
-}
-
-#[test]
-fn pinned_block_has_markers_caveat_and_tagged_lines() {
-    let block =
-        render_pinned_memory_block(&[pinned_memory("prefers concise answers")], now()).unwrap();
-    assert!(block.starts_with(PINNED_OPEN));
-    assert!(block.trim_end().ends_with(PINNED_CLOSE));
-    assert!(block.contains("untrusted background facts"));
-    assert!(block.contains("- [preference/user_written/global] prefers concise answers"));
-}
-
-#[test]
-fn pinned_block_respects_budget_whole_lines_only() {
-    // Many long memories; only as many as fit the budget are included, and
-    // no line is ever truncated mid-content.
-    let big: Vec<Memory> = (0..50)
-        .map(|i| {
-            pinned_memory(&format!(
-                "preference number {i} stated in full sentence form"
-            ))
-        })
-        .collect();
-    let block = render_pinned_memory_block(&big, now()).unwrap();
-    // The budget governs the bullet lines (header/markers are fixed overhead).
-    let bullets: Vec<&str> = block.lines().filter(|l| l.starts_with("- [")).collect();
-    let bullet_bytes: usize = bullets.iter().map(|l| l.len() + 1).sum();
-    assert!(bullet_bytes <= PINNED_MEMORY_BUDGET);
-    // Not all 50 fit, but at least one did, and each is a complete line.
-    assert!(!bullets.is_empty() && bullets.len() < 50);
-    for line in &bullets {
-        assert!(line.contains("preference number"));
-    }
-}
-
-#[test]
-fn pinned_block_renders_scope_tag() {
-    let mut m = pinned_memory("team uses feishu");
-    m.scope = MemoryScope::Channel {
-        platform: "feishu".into(),
-        chat_id: "oc_x".into(),
-    };
-    let block = render_pinned_memory_block(&[m], now()).unwrap();
-    assert!(block.contains("/channel] team uses feishu"));
 }

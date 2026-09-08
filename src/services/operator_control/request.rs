@@ -137,12 +137,11 @@ pub enum OperatorCommandResult {
 }
 
 /// A memory governance transition. The domain owns the semantics
-/// (`Memory::promote/reject/pin`); this only names them.
+/// (`Memory::promote/reject`); this only names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MemoryTransitionAction {
     Promote,
     Reject,
-    Pin,
 }
 
 impl MemoryTransitionAction {
@@ -151,7 +150,6 @@ impl MemoryTransitionAction {
         match self {
             MemoryTransitionAction::Promote => Memory::promote,
             MemoryTransitionAction::Reject => Memory::reject,
-            MemoryTransitionAction::Pin => Memory::pin,
         }
     }
 }

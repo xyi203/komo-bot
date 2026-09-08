@@ -362,7 +362,7 @@ pub enum TransitionOutcome {
 }
 
 /// Apply one governance transition — the domain owns the semantics
-/// (`Memory::promote/reject/pin`), so both transports share one definition.
+/// (`Memory::promote/reject`), so both transports share one definition.
 pub async fn apply_memory_transition(
     memories: &dyn MemoryRepository,
     id: &str,

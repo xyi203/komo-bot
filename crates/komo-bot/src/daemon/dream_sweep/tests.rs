@@ -94,9 +94,5 @@ async fn dream_sweep_never_promotes_to_pinnable() {
     .unwrap();
     let mems = repo.0.lock().unwrap();
     let promoted = mems.iter().find(|m| m.id == id).unwrap();
-    let ctx = komo_core::domain::memory::MemoryContext::local("s1");
-    assert!(
-        !promoted.is_pinnable(&ctx, now),
-        "auto-promoted memory must not be pinnable"
-    );
+    assert!(!promoted.pinned);
 }

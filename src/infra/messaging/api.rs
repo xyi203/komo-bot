@@ -328,7 +328,6 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/operator", post(operator))
         .route("/api/memories/{id}/promote", post(memory_promote))
         .route("/api/memories/{id}/reject", post(memory_reject))
-        .route("/api/memories/{id}/pin", post(memory_pin))
         .route("/api/sessions/{id}/title", post(set_session_title))
         .route("/api/sessions/{id}/status", post(set_session_status))
         .route("/api/sessions/{id}/boundary", post(conversation_boundary))
@@ -1166,7 +1165,7 @@ async fn list_memories(
     Ok(Json(json!({ "memories": memories })))
 }
 
-// Memory governance writes (`komo memory promote/reject/pin` while the gateway
+// Memory governance writes (`komo memory promote/reject` while the gateway
 // holds the db lock). Host-operator actions — loopback-gated by the
 // `require_loopback` layer on the operator-writes router.
 
@@ -1182,13 +1181,6 @@ async fn memory_reject(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     memory_transition(&state, &id, MemoryTransitionAction::Reject).await
-}
-
-async fn memory_pin(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Response, ApiError> {
-    memory_transition(&state, &id, MemoryTransitionAction::Pin).await
 }
 
 /// Apply one governance transition (the shared operator definition — the

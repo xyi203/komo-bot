@@ -159,6 +159,7 @@ pub fn run() -> anyhow::Result<()> {
     report(".env", &home, created.env);
     report("SOUL.md", &home, created.soul);
     report("USER.md", &home, created.user);
+    report("MEMORY.md", &home, created.memory);
     if created.config || created.env {
         println!(
             "\nNext: put your API key in {}/.env (DEEPSEEK_API_KEY=sk-...),\n\
@@ -185,6 +186,7 @@ struct Created {
     env: bool,
     soul: bool,
     user: bool,
+    memory: bool,
 }
 
 /// Write whichever template doesn't exist yet. Never overwrites — an operator's
@@ -201,11 +203,13 @@ fn init_at(home: &Path) -> anyhow::Result<Created> {
     }
     let soul = write_if_absent(&home.join("SOUL.md"), SOUL_TEMPLATE)?;
     let user = write_if_absent(&home.join("USER.md"), USER_TEMPLATE)?;
+    let memory = write_if_absent(&home.join("MEMORY.md"), "")?;
     Ok(Created {
         config,
         env,
         soul,
         user,
+        memory,
     })
 }
 
@@ -233,7 +237,8 @@ mod tests {
     fn init_creates_all_templates() {
         let home = tmp("creates");
         let created = init_at(&home).unwrap();
-        assert!(created.config && created.env && created.soul && created.user);
+        assert!(created.config && created.env && created.soul && created.user && created.memory);
+        assert_eq!(std::fs::read_to_string(home.join("MEMORY.md")).unwrap(), "");
         let config = std::fs::read_to_string(home.join("config.toml")).unwrap();
         assert!(config.contains("provider = \"deepseek\""));
         let env = std::fs::read_to_string(home.join(".env")).unwrap();
@@ -250,8 +255,14 @@ mod tests {
         std::fs::write(home.join("config.toml"), "provider = \"openai\"\n").unwrap();
         std::fs::write(home.join("SOUL.md"), "You are Nyx.\n").unwrap();
         std::fs::write(home.join("USER.md"), "name: Ada\n").unwrap();
+        std::fs::write(home.join("MEMORY.md"), "默认使用中文").unwrap();
         let created = init_at(&home).unwrap();
         assert!(!created.config, "existing config must be left alone");
+        assert!(!created.memory);
+        assert_eq!(
+            std::fs::read_to_string(home.join("MEMORY.md")).unwrap(),
+            "默认使用中文"
+        );
         assert!(created.env, "missing .env is still scaffolded");
         assert!(
             !created.soul,

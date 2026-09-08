@@ -2,7 +2,7 @@
 //!
 //! Unlike the in-chat `memory` tool (scoped to the current chat), the CLI is a
 //! host-side operator view: it lists and searches across *all* scopes, so you
-//! can triage candidates the reviewer captured and promote/pin the durable ones.
+//! can triage candidates the reviewer captured and promote the durable ones.
 //! Every read and write goes through [`OperatorControl`], which reaches the
 //! gateway — the only process that opens the memory store.
 
@@ -211,16 +211,7 @@ async fn read_choice(prompt: &str) -> anyhow::Result<Option<String>> {
     Ok(line.map(|s| s.trim().to_lowercase()))
 }
 
-/// Pin a memory into the L1 per-turn profile (the manual, explicit path —
-/// automated extraction never pins). Raises confidence so it actually surfaces.
-pub async fn pin(control: &OperatorControl, id: &str) -> anyhow::Result<()> {
-    transition(control, id, MemoryTransitionAction::Pin).await?;
-    println!("Pinned {id} into the L1 profile.");
-    Ok(())
-}
-
 fn line(m: &Memory) -> String {
-    let pin = if m.pinned { " 📌" } else { "" };
     // Belief is shown only when it is not `current`: an operator scanning the
     // library needs to see a contested or superseded memory at a glance.
     let belief = if m.is_injectable() {
@@ -229,13 +220,12 @@ fn line(m: &Memory) -> String {
         format!("/{}", m.belief.as_str())
     };
     let mut s = format!(
-        "{}  [{}/{}/{}{}{}]  {}",
+        "{}  [{}/{}/{}{}]  {}",
         m.id,
         m.status.as_str(),
         m.kind.as_str(),
         m.scope.type_str(),
         belief,
-        pin,
         m.content
     );
     if m.support_count > 0 || m.contradiction_count > 0 {

@@ -377,8 +377,7 @@ impl ProviderLlm {
 
     /// Assemble this turn's `(preamble, prompt, history)`: split the session
     /// into the latest user prompt + prior history, rebuild the system prompt,
-    /// and inject the memory blocks (main agent only) — pinned into the
-    /// preamble, recall in front of the prompt (see below for why they split).
+    /// and inject recalled context (main agent only) in front of the user prompt.
     /// Run once per turn — never per tool-loop round (recall is keyed on the
     /// user message, and re-running it each round would churn the prompt).
     ///
@@ -430,19 +429,10 @@ impl ProviderLlm {
         // Rebuild the system prompt for this turn. It rides on the per-turn
         // request rather than on shared state, so concurrent sessions in the
         // gateway stay independent.
-        let mut preamble = (self.preamble)();
+        let preamble = (self.preamble)();
 
-        // Memory injection (main agent only). The two tiers land in different
-        // places, and the split is what keeps the provider prompt cache warm:
-        // pinned is cross-turn stable so it may join the system prompt, but
-        // recall is keyed on this turn's user message — putting it in the
-        // system prompt would rewrite the cached prefix every turn and
-        // invalidate everything after it (which is exactly what it used to
-        // do). Recall rides in front of the turn's user message instead: new
-        // bytes were arriving at the tail anyway, so it costs the cache
-        // nothing. Render-time only — the stored transcript keeps the user's
-        // raw words. Enrichment failure is absorbed inside the enricher
-        // (memory is background context — it must never fail a reply).
+        // L1 is already in the file-backed preamble. L3 varies per turn and
+        // rides on the user message to preserve the stable prompt prefix.
         let mut prompt = prompt;
         let mut memories = RecalledMemories::default();
         if let Some(enricher) = &self.injections.enricher
@@ -450,10 +440,6 @@ impl ProviderLlm {
                 .enrich(session, &prompt, &session.messages[..last_user_idx])
                 .await
         {
-            if let Some(pinned) = injection.pinned {
-                preamble.push_str("\n\n");
-                preamble.push_str(&pinned);
-            }
             if let Some(recall) = injection.recall {
                 prompt = format!("{recall}\n\n{prompt}");
             }

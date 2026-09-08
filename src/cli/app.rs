@@ -354,11 +354,6 @@ enum MemoryAction {
         #[arg(required = true)]
         ids: Vec<String>,
     },
-    /// Pin a memory into the L1 per-turn profile (the manual, explicit path)
-    Pin {
-        /// Memory id
-        id: String,
-    },
     /// Interactively triage the candidate pile (oldest first): p=promote,
     /// r=reject, s=skip, q=quit
     Triage,
@@ -576,7 +571,6 @@ pub async fn run() -> anyhow::Result<()> {
                 MemoryAction::Search { query } => memory::search(&control, &query).await,
                 MemoryAction::Promote { ids } => memory::promote(&control, &ids).await,
                 MemoryAction::Reject { ids } => memory::reject(&control, &ids).await,
-                MemoryAction::Pin { id } => memory::pin(&control, &id).await,
                 MemoryAction::Triage => memory::triage(&control).await,
                 MemoryAction::Backfill => memory::backfill(&control).await,
             }

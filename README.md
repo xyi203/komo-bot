@@ -135,6 +135,7 @@ Everything lives in `~/.komo/` by default, or under `KOMO_HOME` when set.
 | `logs/` | daily-rotated gateway log (`komo logs`) | disposable |
 | `config.toml` | provider/model/channel behavior | — |
 | `.env` | API keys and channel credentials | — |
+| `MEMORY.md` | operator-edited global L1 context, loaded next turn (8,000 characters; truncation is marked); no database pin injection | durable |
 | `SOUL.md` · `USER.md` · `AGENTS.md` | persona, operator profile, machine-wide instructions (re-read on change) | — |
 
 There is no database file to delete for a reset: disposable state is pruned by
@@ -312,3 +313,22 @@ Schema changes need no reset: new columns are added in place on connect
 - [CONTEXT.md](CONTEXT.md) + [docs/adr/](docs/adr/) — glossary and architecture decision records.
 - [docs/bot-runtime.md](docs/bot-runtime.md) — suspended turns, wakeups and routines.
 - [docs/episode-learning-framework.md](docs/episode-learning-framework.md) — the post-run learning pass.
+
+### L1 memory
+
+Edit `$KOMO_HOME/MEMORY.md` (default `~/.komo/MEMORY.md`) to change the
+global context carried into each main-agent turn. Creation, edits, clearing
+and deletion take effect on the next turn without restarting the gateway.
+The file is background knowledge, not executable instructions. It is shared
+across main-agent conversations; keep channel-specific information in the
+scoped database memory library.
+
+`komo init` creates an empty file without overwriting an existing one.
+The old database pin command, tool parameter and API are removed. Existing
+database memories remain available for relevant L3 recall; they are not
+automatically exported into this file. Dream and automatic extraction do not
+edit the file. Database conflict handling cannot edit or retire its contents;
+the operator maintains it explicitly.
+
+`config.toml` and credentials still require a gateway restart; prompt-file
+refresh does not reload runtime configuration.

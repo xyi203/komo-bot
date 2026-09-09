@@ -522,7 +522,7 @@ impl RoutineEventSource {
         // to exist when the job was created — the sweep resolves nothing, so a
         // path cannot change meaning between approval and 03:00.
         if let Some(root) = workspace {
-            session = session.with_workspace(std::path::PathBuf::from(root));
+            session = session.with_workspace_roots(vec![std::path::PathBuf::from(root)]);
         }
         // …and this job's own approved actions, scoped to exactly this turn.
         // Installed around the whole turn (not per tool call) so the grants are

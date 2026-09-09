@@ -1998,7 +1998,7 @@ impl GatewayDispatcher {
         let owned = Arc::new(Mutex::new(origins));
         let ctx = SessionContext {
             session_id: session.clone(),
-            workspace_root: None,
+            workspace_roots: Vec::new(),
             sink: sink.clone(),
             // A chat channel has a human who can answer an approval prompt.
             interactive: true,

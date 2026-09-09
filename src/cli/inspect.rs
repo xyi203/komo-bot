@@ -449,8 +449,15 @@ pub async fn session_list(control: &OperatorControl) -> anyhow::Result<()> {
             "" => String::new(),
             title => format!("  {title}"),
         };
+        // Which task this is, when it is one: a task session carries the
+        // directory it works in, and that is what `komo resume` in that
+        // directory would land on. An unbound conversation prints none.
+        let workspace = match s.roots.first() {
+            Some(root) => format!("  {}", abbreviate_home(root)),
+            None => String::new(),
+        };
         println!(
-            "{}{title}  created {}  {} messages ({} user turns){waiting}",
+            "{}{title}{workspace}  created {}  {} messages ({} user turns){waiting}",
             s.id,
             local_time(s.created_at),
             s.messages,
@@ -458,6 +465,18 @@ pub async fn session_list(control: &OperatorControl) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// `~` for the home prefix, so a path column stays readable at a glance.
+fn abbreviate_home(path: &str) -> String {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return path.to_string();
+    };
+    match std::path::Path::new(path).strip_prefix(&home) {
+        Ok(rest) if rest.as_os_str().is_empty() => "~".to_string(),
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => path.to_string(),
+    }
 }
 
 /// Delete every session with zero messages. An operator action — run it by

@@ -40,8 +40,16 @@ struct SessionRecord {
     #[key]
     id: String,
     created_at: i64,
-    /// Immutable workspace identity chosen when the session is created.
+    /// Retired: the opaque workspace *id* a session was created under, before a
+    /// task's workspace became a binding set of paths. Kept and written empty
+    /// (dropping a column is not an additive change), never read — `roots` is
+    /// the answer now.
     workspace: String,
+
+    /// The directories this conversation works in, as a JSON array of absolute
+    /// paths (`[]` = unbound). Additive column; written at creation for a task
+    /// session and widened through `SessionRepository::set_roots`.
+    roots: String,
 
     /// Operator-set display name (empty = untitled). Added additively via
     /// `SESSION_COLUMNS`; set through `SessionRepository::set_title`.
@@ -54,8 +62,8 @@ struct SessionRecord {
 
     /// Per-session model override (empty = the gateway's configured model) and
     /// reasoning effort (empty = the provider default). Additive columns; set
-    /// through `SessionRepository::set_model`. Unlike `workspace` these are not
-    /// creation-locked — a conversation may switch models mid-thread.
+    /// through `SessionRepository::set_model` — a conversation may switch
+    /// models mid-thread.
     model: String,
     effort: String,
 
@@ -87,6 +95,7 @@ const SESSION_COLUMNS: &[(&str, &str)] = &[
         "workspace",
         "\"workspace\" text NOT NULL DEFAULT '__default__'",
     ),
+    ("roots", "\"roots\" text NOT NULL DEFAULT '[]'"),
     ("model", "\"model\" text NOT NULL DEFAULT ''"),
     ("effort", "\"effort\" text NOT NULL DEFAULT ''"),
     (
@@ -558,7 +567,8 @@ impl SessionRepository for Db {
             let created = toasty::create!(SessionRecord {
                 id: session.id.clone(),
                 created_at: session.created_at,
-                workspace: session.workspace.clone(),
+                workspace: String::new(),
+                roots: serde_json::to_string(&session.roots)?,
                 title: session.title.clone(),
                 status: session.status.clone(),
                 model: session.model.clone(),
@@ -641,6 +651,23 @@ impl SessionRepository for Db {
             record
                 .update()
                 .title(title.to_string())
+                .exec(&mut conn)
+                .await?;
+            Ok(())
+        })
+        .await
+    }
+
+    async fn set_roots(&self, session_id: &str, roots: &[String]) -> anyhow::Result<()> {
+        let encoded = serde_json::to_string(roots)?;
+        with_write_retry(|| async {
+            let mut conn = self.inner.connection().await?;
+            let Ok(mut record) = SessionRecord::get_by_id(&mut conn, session_id).await else {
+                return Ok(()); // no such session
+            };
+            record
+                .update()
+                .roots(encoded.clone())
                 .exec(&mut conn)
                 .await?;
             Ok(())
@@ -784,10 +811,7 @@ impl Db {
                 .as_ref()
                 .map(|s| s.origin.as_str().to_string())
                 .unwrap_or_else(|| SessionOrigin::User.as_str().to_string()),
-            workspace: row.as_ref().and_then(|s| {
-                Some(s.workspace.clone())
-                    .filter(|w| w != komo_core::domain::session::DEFAULT_WORKSPACE)
-            }),
+            workspace: row.as_ref().and_then(|s| s.roots.first().cloned()),
             created_at: time::OffsetDateTime::now_utc(),
             format_version: SESSION_EVENT_VERSION,
         }
@@ -1687,7 +1711,10 @@ fn step_from_record(record: RunStepRecord) -> RunStep {
 
 fn session_from_record(record: SessionRecord, messages: Vec<Message>) -> Session {
     let id = record.id.clone();
-    let workspace = record.workspace.clone();
+    // An unreadable cell reads as unbound rather than failing the row: a
+    // conversation must stay openable, and an unbound turn falls back to the
+    // process workspace instead of to somebody else's directory.
+    let roots = serde_json::from_str(&record.roots).unwrap_or_default();
     let created_at = record.created_at;
     let title = record.title.clone();
     let status = record.status.clone();
@@ -1702,7 +1729,7 @@ fn session_from_record(record: SessionRecord, messages: Vec<Message>) -> Session
     let awaiting = serde_json::from_str(&record.awaiting).ok();
     Session {
         id,
-        workspace,
+        roots,
         messages,
         created_at,
         title,

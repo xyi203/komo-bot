@@ -567,24 +567,60 @@ async fn session_repository_lists_sessions() {
     let db = Db::connect(&sqlite_url("komo_session_repo_test.db"))
         .await
         .unwrap();
-    let first = Session::with_workspace("first", "alpha");
+    let first = Session::with_roots("first", vec!["/home/u/alpha".into()]);
     let second = Session::new("second");
 
     SessionRepository::save(&db, &first).await.unwrap();
     // A later attempt to reuse the id with another workspace must not
     // rebind the existing conversation.
-    SessionRepository::save(&db, &Session::with_workspace("first", "beta"))
-        .await
-        .unwrap();
+    SessionRepository::save(
+        &db,
+        &Session::with_roots("first", vec!["/home/u/beta".into()]),
+    )
+    .await
+    .unwrap();
     say(&db, "first", &Message::user("hello")).await;
     SessionRepository::save(&db, &second).await.unwrap();
 
     let rows = SessionRepository::list(&db).await.unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].id, "first");
-    assert_eq!(rows[0].workspace, "alpha");
+    assert_eq!(rows[0].roots, vec!["/home/u/alpha".to_string()]);
     assert_eq!(rows[0].user_turns(), 1);
     assert_eq!(rows[1].id, "second");
+    // Everything that is not a task session is unbound.
+    assert!(rows[1].roots.is_empty());
+}
+
+/// `/workspace add` widens a task, and the anchor stays where it was — a
+/// relative path must not start meaning something else because a second project
+/// was admitted.
+#[tokio::test]
+async fn set_roots_widens_a_task_workspace_and_keeps_the_anchor() {
+    let db = Db::connect(&sqlite_url("komo_session_roots_test.db"))
+        .await
+        .unwrap();
+    let session = Session::with_roots("task", vec!["/home/u/proj".into()]);
+    SessionRepository::save(&db, &session).await.unwrap();
+
+    SessionRepository::set_roots(
+        &db,
+        "task",
+        &["/home/u/proj".to_string(), "/home/u/lib".to_string()],
+    )
+    .await
+    .unwrap();
+
+    let stored = SessionRepository::find(&db, "task").await.unwrap().unwrap();
+    assert_eq!(
+        stored.roots,
+        vec!["/home/u/proj".to_string(), "/home/u/lib".to_string()]
+    );
+
+    // A session that does not exist is not an error — there is nothing to widen.
+    SessionRepository::set_roots(&db, "nobody", &["/tmp".to_string()])
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

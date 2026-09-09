@@ -50,12 +50,21 @@ pub trait SessionRepository: Send + Sync {
         Ok(())
     }
 
+    /// Replace a session's workspace roots — what `/workspace add` widens a
+    /// task's environment with. Written whole rather than appended to, so the
+    /// caller (which has already read the row) owns the ordering and the anchor
+    /// stays `roots[0]`. No-op if the session does not exist. Default is a
+    /// no-op.
+    async fn set_roots(&self, _session_id: &str, _roots: &[String]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Set a session's model override and reasoning effort (either empty = fall
-    /// back to the gateway/provider default). Unlike the workspace this is not
-    /// creation-locked: a conversation may switch models mid-thread, and the
-    /// stored choice is what the next turn — and any other client opening the
-    /// session — runs on. No-op if the session does not exist. Default is a
-    /// no-op so stores without the columns aren't forced to implement it.
+    /// back to the gateway/provider default). A conversation may switch models
+    /// mid-thread, and the stored choice is what the next turn — and any other
+    /// client opening the session — runs on. No-op if the session does not
+    /// exist. Default is a no-op so stores without the columns aren't forced to
+    /// implement it.
     async fn set_model(
         &self,
         _session_id: &str,

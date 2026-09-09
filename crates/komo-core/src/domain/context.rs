@@ -126,10 +126,15 @@ impl SessionOrigin {
 #[derive(Clone)]
 pub struct SessionContext {
     pub session_id: String,
-    /// Optional filesystem root selected by a local UI for this turn. HTTP
-    /// adapters must resolve this from a server-owned workspace catalog; tools
-    /// never accept a client-supplied path directly.
-    pub workspace_root: Option<PathBuf>,
+    /// The directories this turn's file and shell tools are confined to, with
+    /// `[0]` the anchor relative paths resolve against. Empty = the wired
+    /// process workspace.
+    ///
+    /// Either the session's own binding (a task conversation carries its roots
+    /// on the row) or, for an unbound conversation, the root the local UI asked
+    /// for this turn. HTTP adapters must resolve these from a server-owned
+    /// workspace catalog; tools never accept a client-supplied path directly.
+    pub workspace_roots: Vec<PathBuf>,
     pub sink: Arc<dyn ReplySink>,
     /// Whether a human can answer a mid-turn approval prompt on this channel.
     /// Chat channels set this `true`; non-interactive callers (the detached
@@ -183,7 +188,7 @@ impl SessionContext {
     pub fn detached(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
-            workspace_root: None,
+            workspace_roots: Vec::new(),
             sink: Arc::new(NoopSink),
             interactive: false,
             auto_approve: false,
@@ -204,7 +209,7 @@ impl SessionContext {
     pub fn trusted(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
-            workspace_root: None,
+            workspace_roots: Vec::new(),
             sink: Arc::new(NoopSink),
             interactive: false,
             auto_approve: true,
@@ -226,7 +231,7 @@ impl SessionContext {
     pub fn interactive_http(session_id: &str) -> Self {
         Self {
             session_id: session_id.to_string(),
-            workspace_root: None,
+            workspace_roots: Vec::new(),
             sink: Arc::new(NoopSink),
             interactive: true,
             auto_approve: false,
@@ -286,9 +291,9 @@ impl SessionContext {
         self
     }
 
-    /// Attach the server-resolved workspace selected for this turn.
-    pub fn with_workspace(mut self, root: PathBuf) -> Self {
-        self.workspace_root = Some(root);
+    /// Attach the server-resolved workspace roots this turn runs in.
+    pub fn with_workspace_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.workspace_roots = roots;
         self
     }
 

@@ -64,11 +64,12 @@ pub fn resolve_readable(
     })
 }
 
-/// The workspace this turn actually resolves against: the session's own root when
-/// it picked one, else the wired default. A session-selected root still carries
-/// komo's own managed roots — the read-only tool-output store and the writable
-/// artifacts directory are komo's, not the workspace's, so moving where a turn
-/// works must not take them away.
+/// The workspace this turn actually resolves against: the roots the turn was
+/// given, else the wired default. `roots[0]` is what a relative path anchors to,
+/// and every root is writable — that is what `/workspace add` widens. Turn-given
+/// roots still carry komo's own managed roots — the read-only tool-output store
+/// and the writable artifacts directory are komo's, not the workspace's, so
+/// moving where a turn works must not take them away.
 ///
 /// `shell` resolves its `workdir` through this too, which is what lets a turn run
 /// a command inside its artifacts directory.
@@ -76,27 +77,25 @@ pub(crate) fn effective<'a>(
     workspace: &'a Arc<Workspace>,
     ctx: &ToolContext,
 ) -> std::borrow::Cow<'a, Workspace> {
-    match ctx.session.workspace_root.as_ref() {
-        Some(root) => {
-            let derived = Workspace::new(vec![root.clone()])
-                .with_readonly(workspace.readonly_roots().to_vec());
-            let derived = match workspace.artifacts_root() {
-                Some(artifacts) => derived.with_artifacts(artifacts.to_path_buf()),
-                None => derived,
-            };
-            let derived = match workspace.plugins_root() {
-                Some(plugins) => derived.with_plugins(plugins.to_path_buf()),
-                None => derived,
-            };
-            let derived = if workspace.has_unrestricted_reads() {
-                derived.with_unrestricted_reads()
-            } else {
-                derived
-            };
-            std::borrow::Cow::Owned(derived)
-        }
-        None => std::borrow::Cow::Borrowed(workspace.as_ref()),
+    let roots = &ctx.session.workspace_roots;
+    if roots.is_empty() {
+        return std::borrow::Cow::Borrowed(workspace.as_ref());
     }
+    let derived = Workspace::new(roots.clone()).with_readonly(workspace.readonly_roots().to_vec());
+    let derived = match workspace.artifacts_root() {
+        Some(artifacts) => derived.with_artifacts(artifacts.to_path_buf()),
+        None => derived,
+    };
+    let derived = match workspace.plugins_root() {
+        Some(plugins) => derived.with_plugins(plugins.to_path_buf()),
+        None => derived,
+    };
+    let derived = if workspace.has_unrestricted_reads() {
+        derived.with_unrestricted_reads()
+    } else {
+        derived
+    };
+    std::borrow::Cow::Owned(derived)
 }
 
 fn roots_note(roots: &[PathBuf]) -> String {
@@ -321,7 +320,7 @@ mod tests {
     #[test]
     fn a_session_workspace_still_classifies_plugin_writes() {
         let mut session = komo_core::domain::context::SessionContext::detached("test");
-        session.workspace_root = Some(PathBuf::from("/home/u/elsewhere"));
+        session.workspace_roots = vec![PathBuf::from("/home/u/elsewhere")];
         let ctx = komo_core::domain::context::ToolContext::new(
             session,
             None,
@@ -338,14 +337,40 @@ mod tests {
 
     #[test]
     fn selected_workspace_overrides_the_process_default() {
+        let ctx = ctx_rooted_at(vec![PathBuf::from("/home/u/selected")]);
+        let resolved = resolve(&ws("/home/u/default"), &ctx, "src/main.rs").unwrap();
+        assert_eq!(resolved, PathBuf::from("/home/u/selected/src/main.rs"));
+    }
+
+    /// A task that ran `/workspace add` works across both directories, and the
+    /// **first** one stays the anchor — a relative path must not start meaning
+    /// something else the moment a second project is admitted.
+    #[test]
+    fn a_second_root_is_writable_and_the_first_stays_the_anchor() {
+        let ctx = ctx_rooted_at(vec![
+            PathBuf::from("/home/u/primary"),
+            PathBuf::from("/home/u/library"),
+        ]);
+        let workspace = ws("/home/u/default");
+        assert_eq!(
+            resolve(&workspace, &ctx, "src/main.rs").unwrap(),
+            PathBuf::from("/home/u/primary/src/main.rs")
+        );
+        assert_eq!(
+            resolve(&workspace, &ctx, "/home/u/library/notes.md").unwrap(),
+            PathBuf::from("/home/u/library/notes.md")
+        );
+        // Everything else is still outside, added root or not.
+        assert!(resolve(&workspace, &ctx, "/home/u/default/x").is_err());
+    }
+
+    fn ctx_rooted_at(roots: Vec<PathBuf>) -> komo_core::domain::context::ToolContext {
         let mut session = komo_core::domain::context::SessionContext::detached("test");
-        session.workspace_root = Some(PathBuf::from("/home/u/selected"));
-        let ctx = komo_core::domain::context::ToolContext::new(
+        session.workspace_roots = roots;
+        komo_core::domain::context::ToolContext::new(
             session,
             None,
             std::sync::Arc::new(crate::test_support::SafeOnly),
-        );
-        let resolved = resolve(&ws("/home/u/default"), &ctx, "src/main.rs").unwrap();
-        assert_eq!(resolved, PathBuf::from("/home/u/selected/src/main.rs"));
+        )
     }
 }

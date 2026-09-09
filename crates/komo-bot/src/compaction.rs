@@ -200,7 +200,7 @@ impl Compactor {
         // model choice must not leak onto the aux model.
         let session = Session {
             id: format!("compaction-{session_id}"),
-            workspace: String::new(),
+            roots: Vec::new(),
             messages: vec![Message::user(format!(
                 "{PROMPT}\n\nThe conversation so far:\n\n{excerpt}"
             ))],

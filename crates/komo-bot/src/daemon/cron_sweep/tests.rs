@@ -661,18 +661,20 @@ impl MessageHandler for OriginProbe {
     }
 }
 
-/// Reads the workspace root the sweep installed on the ambient session —
+/// Reads the workspace roots the sweep installed on the ambient session —
 /// the same field `fs_common` and `shell` confine against.
 #[derive(Default)]
 struct WorkspaceProbe {
-    seen: Mutex<Option<Option<std::path::PathBuf>>>,
+    seen: Mutex<Option<Vec<std::path::PathBuf>>>,
 }
 
 #[async_trait]
 impl MessageHandler for WorkspaceProbe {
     async fn handle(&self, _session_id: &str, _message: String) -> anyhow::Result<String> {
         *self.seen.lock().unwrap() = Some(
-            komo_services::tool_execution::current_session().and_then(|c| c.workspace_root.clone()),
+            komo_services::tool_execution::current_session()
+                .map(|c| c.workspace_roots.clone())
+                .unwrap_or_default(),
         );
         Ok("done".to_string())
     }
@@ -693,7 +695,7 @@ async fn an_agent_job_with_a_workspace_runs_confined_to_it() {
     sweep.sweep_due().await.unwrap();
     assert_eq!(
         *probe.seen.lock().unwrap(),
-        Some(Some(std::path::PathBuf::from("/srv/notes")))
+        Some(vec![std::path::PathBuf::from("/srv/notes")])
     );
 }
 
@@ -708,7 +710,7 @@ async fn an_agent_job_without_a_workspace_leaves_the_root_unset() {
         Some(probe.clone()),
     );
     sweep.sweep_due().await.unwrap();
-    assert_eq!(*probe.seen.lock().unwrap(), Some(None));
+    assert_eq!(*probe.seen.lock().unwrap(), Some(Vec::new()));
 }
 
 /// A cron turn must reach the runtime already marked unattended. Left to

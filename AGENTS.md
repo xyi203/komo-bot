@@ -29,7 +29,8 @@ komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; 
 komo dream [--apply]               # evidence-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent [--skill NAME] [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
 komo run list|inspect|prune        # run ledger (⟲ = interrupted and unclaimed)
-komo session list|resume|clean     # stored sessions (`komo resume <id>` is the shortcut)
+komo session list|resume|clean     # stored sessions (roots printed per row)
+komo resume [id]                   # continue a task; no id = the newest one bound to this directory
 komo skills list|install|inspect|enable|disable
 komo policy list|check|saved       # permission policy: config rules + job grants + saved grants
 komo channel list|probe            # channel inventory / verification
@@ -70,7 +71,7 @@ code is gone — an absent `komo.db` is created, a present one is used.
 
 | Where | Contents | Durability |
 |---|---|---|
-| `komo.db` · `session_records`, `session_todo_records`, `pairing_records`, `setting_records`, `inbox_records`, run ledger (`run_records`, `run_step_records`) | one turn's execution record and the session metadata around it | disposable **by row** — `komo run prune`, `komo session clean`; never by dropping the table |
+| `komo.db` · `session_records`, `session_todo_records`, `pairing_records`, `setting_records`, `inbox_records`, run ledger (`run_records`, `run_step_records`) | one turn's execution record and the session metadata around it — including a task's `roots` (`workspace` is a retired column, written empty) | disposable **by row** — `komo run prune`, `komo session clean`; never by dropping the table |
 | `komo.db` · `memory_records` | long-term memories | durable — **additive changes only** |
 | `komo.db` · `cron_job_records` | routines: a `Trigger`, an action, and the last 20 `RoutineRun`s | durable — **additive changes only**; `schedule` / `last_*` are retired columns kept (and written empty) because dropping one is not additive |
 | `komo.db` · `wakeup_records` | standing wakeups — one row per suspended turn's wait | durable — same retired-column rule: `at` / `task_id` / `filter` outlived the timer and event waits and are written `0` / `""` |
@@ -968,12 +969,23 @@ call the same functions, which is what keeps validation from forking.
   conversation**, so the thread the morning's Telegram DM is in continues here.
   `komo resume <id>` (or the compatible `komo session resume <id>`) opens a
   stored session by its UUID — the task from yesterday, a correspondent's, or an
-  old one being looked into; the id is printed on the way out of every sitting.
-  The identity row says which of the three this is (`home`, or `任务 · <dir>`).
-  A turn's workspace is the **process's** startup directory, not
-  the session's: one conversation is entered from wherever the operator is
-  standing, so `Session.workspace` is descriptive only (the log manifest and the
-  session list read it) and nothing rewrites a turn's tool root from it. Input:
+  old one being looked into; the id is printed on the way out of a sitting that
+  actually ran a turn (a window nobody spoke in has no row to resume). **A bare
+  `komo resume`** takes no id and opens the newest task bound to the current
+  directory. The identity row says which of the three this is (`home`, or
+  `任务 · <dir>`).
+  **A task session owns its workspace** (`Session.roots`, normalized absolute
+  paths, `roots[0]` the anchor): bound on its first turn from the directory the
+  TUI was launched in, honored on every later turn, and `X-Komo-Workspace`
+  ignored from then on — resuming a task from elsewhere continues the task
+  rather than silently moving where its tools write. Widening is explicit:
+  `/workspace add <path>` (`POST /api/sessions/{id}/workspace`), which the TUI
+  resolves against its own cwd; `/workspace` alone prints the roots. Home is
+  **unbound** (`roots` empty) and still runs each turn in the directory it was
+  entered from — one conversation reached from wherever the operator is standing
+  (docs/bot-runtime.md §2 D6) — as are channel conversations, sweeps and
+  sub-agents. Resuming a task from a directory outside its roots says so on
+  open, with the command that admits it. Input:
   Enter sends, Shift/Alt-Enter (kitty protocol) or Ctrl-J newline, **Esc stops
   the turn in flight** (nothing when idle — a stop key that sometimes discards the
   draft is worse than one extra keystroke; under the approval modal Esc keeps
@@ -1032,7 +1044,7 @@ call the same functions, which is what keeps validation from forking.
   transcript, so "what did that job do" outlives the notification.
   `enable`/`run` refuse a `done` job. An agent job may also name a
   **`workspace`** — the directory its file and shell tools are confined to,
-  installed on the turn's `SessionContext::workspace_root` by the sweep. It is
+  installed on the turn's `SessionContext::workspace_roots` by the sweep. It is
   canonicalized and proven to exist **when the job is created**, while the
   person who typed it is still there: resolved late it would fail at 03:00 as a
   permission refusal on every file the turn touches, which reads like a policy

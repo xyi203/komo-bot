@@ -67,10 +67,11 @@ async fn checked(resp: reqwest::Response) -> anyhow::Result<reqwest::Response> {
 
 /// Encode a locally chosen directory for the gateway's workspace header.
 ///
-/// The gateway accepts this form only from loopback callers, canonicalizes it,
-/// and persists the resulting opaque id when the session is first created.  It
-/// deliberately carries a path as base64url rather than exposing path syntax in
-/// an HTTP header (which also keeps Unicode paths valid).
+/// The gateway accepts this form only from loopback callers and canonicalizes
+/// it; a **new** task session is bound to the result, and a session that is
+/// already bound ignores it. It deliberately carries a path as base64url rather
+/// than exposing path syntax in an HTTP header (which also keeps Unicode paths
+/// valid).
 pub fn folder_workspace_id(dir: &Path) -> anyhow::Result<String> {
     let dir = dir
         .canonicalize()
@@ -340,6 +341,22 @@ impl GatewayClient {
         .await
     }
 
+    /// `/workspace add <path>`: widen a task session's environment with another
+    /// directory. The path must be absolute — the caller resolves a relative one
+    /// against its own cwd, which the gateway cannot see.
+    pub async fn add_session_root(
+        &self,
+        session: &str,
+        path: &Path,
+    ) -> anyhow::Result<Vec<String>> {
+        self.post_field(
+            &format!("/api/sessions/{session}/workspace"),
+            json!({ "path": path.display().to_string() }),
+            "roots",
+        )
+        .await
+    }
+
     /// Transcript entries for one known session, used to hydrate a resumed TUI
     /// and to pick up a continuation another surface's answer set going.
     pub async fn session_messages(&self, id: &str) -> anyhow::Result<Vec<Message>> {
@@ -415,8 +432,9 @@ impl GatewayClient {
     /// (`stream: true`), and invoke `on_event` for each live [`TurnEvent`] as it
     /// arrives; returns the final reply.
     ///
-    /// `workspace` binds a **new** session to the caller's startup directory;
-    /// existing sessions keep whatever the header resolves to per turn.
+    /// `workspace` binds a **new** task session to the caller's startup
+    /// directory; a session already bound to roots ignores it, and an unbound
+    /// one (home) takes it for this turn alone.
     ///
     /// The gateway's `/v1/chat/completions` streams SSE frames: `event: tool`
     /// frames carry a JSON [`TurnEvent`]; the final default-event frame is an

@@ -77,7 +77,7 @@ use komo_core::domain::{
     gateway::MessageHandler,
     memory::{MemoryStatus, parse_memory_status},
     pairing::ApproveOutcome,
-    session::{DEFAULT_WORKSPACE, Session},
+    session::Session,
     wakeup::{SUSPENDED_REPLY, is_suspended},
 };
 use std::net::SocketAddr;
@@ -331,6 +331,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/sessions/{id}/title", post(set_session_title))
         .route("/api/sessions/{id}/status", post(set_session_status))
         .route("/api/sessions/{id}/boundary", post(conversation_boundary))
+        .route("/api/sessions/{id}/workspace", post(add_session_root))
         .route("/api/dream/apply", post(dream_apply))
         .route_layer(middleware::from_fn(require_loopback));
 
@@ -569,13 +570,14 @@ async fn chat_completions(
     };
 
     let is_loopback = peer.ip().is_loopback();
-    // Where this *turn* runs. Not a creation-time choice the session row wins
-    // forever: the operator's home conversation is entered from a TUI in
-    // whatever directory they are standing in, and binding it to the first one
-    // would silently redirect every later turn's file tools (docs/bot-runtime.md
-    // §2 D6). The header is still only honored for a local caller, below.
-    let workspace = requested_workspace(&state, &headers, is_loopback);
-    open_session(&state, &session_id, &workspace).await?;
+    // Workspace selection is local-operator-only, like trusted mode: the client
+    // sends an opaque id, resolved either through the gateway's own catalog or —
+    // for a folder the desktop shell picked via the native dialog — decoded from
+    // it. A remote caller can therefore never widen its filesystem root.
+    let requested = is_loopback
+        .then(|| requested_workspace_root(&state, &headers))
+        .flatten();
+    let roots = open_session(&state, &session_id, requested).await?;
 
     // The model / effort choice travels with the session rather than with the
     // turn: a conversation may switch models mid-thread. The client sends its
@@ -614,15 +616,7 @@ async fn chat_completions(
     } else {
         SessionContext::detached(&session_id)
     };
-    // Workspace selection is local-operator-only, like trusted mode: the client
-    // sends an opaque id, resolved either through the gateway's own catalog or —
-    // for a folder the desktop shell picked via the native dialog — decoded from
-    // it. A remote caller can therefore never widen its filesystem root.
-    if is_loopback {
-        if let Some(root) = resolve_workspace_id(&state, &workspace) {
-            ctx = ctx.with_workspace(root);
-        }
-    }
+    ctx = ctx.with_workspace_roots(roots);
     let id = format!("chatcmpl-{}", uuid::Uuid::now_v7());
     let created = now();
 
@@ -694,31 +688,40 @@ async fn chat_completions(
     }
 }
 
+/// The `X-Komo-Workspace` id for "the gateway's own startup directory". Header
+/// vocabulary, not a stored value: a session records the *path* it is bound to,
+/// or nothing at all.
+const DEFAULT_WORKSPACE: &str = "__default__";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WorkspaceEntry {
     id: String,
     name: String,
+    /// Canonicalized, so the path a client matches a session's `roots[0]`
+    /// against is the same string the binding wrote.
     path: PathBuf,
 }
 
 fn workspace_entries(state: &AppState) -> Vec<WorkspaceEntry> {
-    let mut entries = vec![WorkspaceEntry {
-        id: "__default__".to_string(),
-        name: state
-            .default_workspace
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| !name.is_empty())
-            .unwrap_or("默认 workspace")
-            .to_string(),
-        path: state.default_workspace.as_ref().clone(),
-    }];
+    let mut entries = Vec::new();
+    if let Some(path) = canonical_dir(state.default_workspace.as_ref()) {
+        entries.push(WorkspaceEntry {
+            id: DEFAULT_WORKSPACE.to_string(),
+            name: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or("默认 workspace")
+                .to_string(),
+            path,
+        });
+    }
+    let catalogued = entries.len();
     if let Ok(children) = std::fs::read_dir(state.workspace_home.as_ref()) {
         for child in children.flatten() {
-            let path = child.path();
-            if !path.is_dir() {
+            let Some(path) = canonical_dir(&child.path()) else {
                 continue;
-            }
+            };
             let Some(id) = child.file_name().to_str().map(str::to_string) else {
                 continue;
             };
@@ -738,8 +741,16 @@ fn workspace_entries(state: &AppState) -> Vec<WorkspaceEntry> {
             });
         }
     }
-    entries[1..].sort_by(|a, b| a.name.cmp(&b.name));
+    entries[catalogued..].sort_by(|a, b| a.name.cmp(&b.name));
     entries
+}
+
+/// One normalization for every path that reaches a client or a `roots` entry:
+/// canonicalized, and a directory. Anything else is skipped rather than offered
+/// in a form nothing else will match.
+fn canonical_dir(path: &std::path::Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    canonical.is_dir().then_some(canonical)
 }
 
 fn resolve_workspace_id(state: &AppState, id: &str) -> Option<PathBuf> {
@@ -813,35 +824,87 @@ fn requested_model(
     })
 }
 
-fn requested_workspace(
-    state: &AppState,
-    headers: &axum::http::HeaderMap,
-    is_loopback: bool,
-) -> String {
-    if !is_loopback {
-        return DEFAULT_WORKSPACE.to_string();
-    }
-    headers
+/// The directory a loopback caller asked this turn to run in, resolved
+/// server-side from the opaque `X-Komo-Workspace` id. `None` when the header is
+/// absent or names nothing that resolves — the caller falls back to the process
+/// workspace, never to a path it typed.
+fn requested_workspace_root(state: &AppState, headers: &axum::http::HeaderMap) -> Option<PathBuf> {
+    let id = headers
         .get("x-komo-workspace")
         .and_then(|value| value.to_str().ok())
-        .filter(|id| resolve_workspace_id(state, id).is_some())
-        .unwrap_or(DEFAULT_WORKSPACE)
-        .to_string()
+        .unwrap_or(DEFAULT_WORKSPACE);
+    resolve_workspace_id(state, id)
 }
 
-/// Make sure the session row exists before the turn lands on it, recording
-/// where it was first spoken from. Descriptive only — the turn's own root is
-/// the header's, resolved above.
-async fn open_session(state: &AppState, session_id: &str, workspace: &str) -> Result<(), ApiError> {
-    if state.actions.sessions.find(session_id).await?.is_some() {
-        return Ok(());
+/// What a turn does with the workspace it was offered, given the session row it
+/// lands on.
+#[derive(Debug, PartialEq, Eq)]
+struct WorkspacePlan {
+    /// Roots to write onto the row being created. Empty = an unbound session.
+    bind: Vec<PathBuf>,
+    /// Roots this turn's tools confine to. Empty = the process workspace.
+    turn: Vec<PathBuf>,
+}
+
+/// **One task is one session, and its workspace is the task's environment.**
+///
+/// A task session is bound on its first turn and honored on every later one, so
+/// running `komo resume` from another directory continues the task rather than
+/// silently moving where its tools write; widening is the explicit
+/// `/workspace add`. Everything else stays unbound and takes the caller's root
+/// per turn: home is entered from wherever the operator is standing
+/// (docs/bot-runtime.md §2 D6), and a row written before this existed must not
+/// be bound by whichever directory happened to send its next message.
+///
+/// `existing` is the row's roots (`None` = no row yet); `requested` is the
+/// header-resolved directory, already `None` for a caller not entitled to one.
+fn plan_workspace(
+    existing: Option<&[String]>,
+    requested: Option<PathBuf>,
+    is_home: bool,
+) -> WorkspacePlan {
+    if let Some(bound) = existing.filter(|roots| !roots.is_empty()) {
+        return WorkspacePlan {
+            bind: Vec::new(),
+            turn: bound.iter().map(PathBuf::from).collect(),
+        };
     }
-    state
-        .actions
-        .sessions
-        .save(&Session::with_workspace(session_id, workspace))
-        .await?;
-    Ok(())
+    let turn: Vec<PathBuf> = requested.into_iter().collect();
+    let binds = existing.is_none() && !is_home;
+    WorkspacePlan {
+        bind: if binds { turn.clone() } else { Vec::new() },
+        turn,
+    }
+}
+
+/// Make sure the session row exists before the turn lands on it, and answer
+/// which roots the turn runs in — see [`plan_workspace`].
+async fn open_session(
+    state: &AppState,
+    session_id: &str,
+    requested: Option<PathBuf>,
+) -> Result<Vec<PathBuf>, ApiError> {
+    let existing = state.actions.sessions.find(session_id).await?;
+    // Asked only when a row has to be created, which is once per conversation:
+    // the home id is a stored setting, minted on first ask.
+    let is_home = match &existing {
+        Some(_) => false,
+        None => state.actions.home_session().await? == session_id,
+    };
+    let plan = plan_workspace(
+        existing.as_ref().map(|s| s.roots.as_slice()),
+        requested,
+        is_home,
+    );
+    if existing.is_none() {
+        let roots = plan.bind.iter().map(|p| p.display().to_string()).collect();
+        state
+            .actions
+            .sessions
+            .save(&Session::with_roots(session_id, roots))
+            .await?;
+    }
+    Ok(plan.turn)
 }
 
 /// Decode a `folder:<base64url path>` workspace id into an existing directory.
@@ -855,9 +918,7 @@ fn resolve_folder_workspace(id: &str) -> Option<PathBuf> {
     let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
         .ok()?;
-    let path = PathBuf::from(String::from_utf8(bytes).ok()?);
-    let canonical = path.canonicalize().ok()?;
-    canonical.is_dir().then_some(canonical)
+    canonical_dir(&PathBuf::from(String::from_utf8(bytes).ok()?))
 }
 
 /// What a session may be switched to: the model menu (default first, each with
@@ -1250,6 +1311,66 @@ async fn set_session_title(
 ) -> Result<Json<Value>, ApiError> {
     state.actions.set_session_title(&id, &body.title).await?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct WorkspaceBody {
+    /// An absolute path on this host. Canonicalized server-side; a client never
+    /// gets to say what a root resolves to.
+    path: String,
+}
+
+/// `/workspace add <path>`: widen a task's environment with another directory.
+///
+/// Explicit on purpose. A task's roots are bound on its first turn, so working
+/// across projects is a decision someone makes for *this* task — never
+/// something a `cd` does on its behalf. Loopback-gated with the rest of the
+/// operator writes.
+async fn add_session_root(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<WorkspaceBody>,
+) -> Result<Response, ApiError> {
+    let requested = std::path::Path::new(body.path.trim());
+    if !requested.is_absolute() {
+        return Err(ApiError::bad_request(format!(
+            "`{}` is not an absolute path",
+            body.path.trim()
+        )));
+    }
+    let Some(root) = canonical_dir(requested) else {
+        return Err(ApiError::bad_request(format!(
+            "`{}` is not an existing directory",
+            body.path.trim()
+        )));
+    };
+    let Some(session) = state.actions.sessions.find(&id).await? else {
+        return Ok((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("no session with id `{id}`") })),
+        )
+            .into_response());
+    };
+    if session.origin != komo_core::domain::context::SessionOrigin::User
+        || state.actions.home_session().await? == id
+    {
+        return Err(ApiError::bad_request(
+            "只有任务会话有自己的 workspace：home 和 komo 自己的会话按每回合的目录运行".to_string(),
+        ));
+    }
+    if session.roots.is_empty() {
+        return Err(ApiError::bad_request(
+            "这条会话没有绑定 workspace，没有可加宽的范围；在目标目录下用 `komo` 开一个任务会话"
+                .to_string(),
+        ));
+    }
+    let path = root.display().to_string();
+    let mut roots = session.roots;
+    if !roots.contains(&path) {
+        roots.push(path);
+        state.actions.sessions.set_roots(&id, &roots).await?;
+    }
+    Ok(Json(json!({ "ok": true, "roots": roots })).into_response())
 }
 
 #[derive(Deserialize)]

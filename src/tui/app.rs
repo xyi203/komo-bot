@@ -110,6 +110,12 @@ pub enum Action {
     },
     /// Start a fresh session (`/new` / `/clear`).
     NewSession,
+    /// `/workspace add <path>`: widen this task's workspace. The path is
+    /// whatever was typed — the loop resolves a relative one against its own
+    /// cwd, since only it knows where this TUI was launched.
+    AddWorkspace(String),
+    /// `/workspace`: say which directories this session works in.
+    ShowWorkspace,
     /// The user answered the approval modal.
     Answered(Answer),
     /// The user answered a mid-turn `ask_user` question: resolve it into the
@@ -447,6 +453,10 @@ impl App {
                     self.clear_input();
                     return Some(Action::NewSession);
                 }
+                if let Some(action) = workspace_command(&text) {
+                    self.clear_input();
+                    return Some(action);
+                }
                 // The transcript shows the draft as it looked — pasted blocks
                 // stay folded to their chip label. The agent gets `text`, which
                 // is always the full content.
@@ -673,6 +683,18 @@ impl App {
             .map(|(i, _)| i)
             .unwrap_or(self.input.len())
     }
+}
+
+/// Read a `/workspace` line. `/workspace` alone reports; `/workspace add
+/// <path>` widens. Anything else is not this command and goes to the agent as
+/// ordinary text.
+fn workspace_command(text: &str) -> Option<Action> {
+    let rest = text.strip_prefix("/workspace")?.trim_start();
+    if rest.is_empty() {
+        return Some(Action::ShowWorkspace);
+    }
+    let path = rest.strip_prefix("add")?.trim();
+    (!path.is_empty()).then(|| Action::AddWorkspace(path.to_string()))
 }
 
 /// Collapse a (possibly multi-line, possibly long) tool arg/result into a

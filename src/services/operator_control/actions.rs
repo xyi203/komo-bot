@@ -436,7 +436,7 @@ pub fn session_summaries(sessions: Vec<Session>) -> Vec<SessionSummary> {
             title: s.display_title(),
             status: s.status,
             id: s.id,
-            workspace: s.workspace,
+            roots: s.roots,
             model: s.model,
             effort: s.effort,
             awaiting: s.awaiting,

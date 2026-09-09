@@ -55,7 +55,7 @@ routines，可以被消息、定时器和外部事件唤醒，持续执行跨小
 | Task | `domain/task.rs` kanban：`inbox/todo/waiting/done/cancelled` + `waiting_on` + `due_at`，`TaskSweep` 到期投递 | 是承诺清单，不是执行单元；名字已占用 |
 | Routine | `CronJob {schedule, action: Command|Agent, status, catch_up, grants, workspace, last_output, last_run_session}`（`domain/cron.rs`） | 已是 Routine 的 70%：缺 trigger 泛化、缺逐次 run 历史 |
 | 身份 | 单 persona（SOUL.md）、单 config、`CapabilityProfile` 按 runtime 分（main/cron/briefing/delegate） | 无 BotId，也不需要（§2 D1） |
-| 工作区 | `Session.workspace`、`CronJob.workspace`、`SessionContext::workspace_root`、checkpoints、`ArtifactStore`（§5.16） | 浏览器登录态在没有 browser 工具前不可执行 |
+| 工作区 | `Session.roots`、`CronJob.workspace`、`SessionContext::workspace_roots`、checkpoints、`ArtifactStore`（§5.16） | 浏览器登录态在没有 browser 工具前不可执行 |
 | 通知 | `HomeNotifier`：sethome > `home_chat`，feishu 优先 | 全局一把，无 per-routine 策略 |
 | 会话身份 | `session_for(peer)`：一个聊天 peer 一条 session；TUI 每次启动一个新 session id，`komo resume <id>` 才接上；`/new` 换 session | 操作者自己的各个入口互相断裂，Telegram 上午聊的下午 TUI 里接不上；连同一台电脑两次开 TUI 都接不上 |
 
@@ -154,10 +154,13 @@ same principal + private conversation
 
 **三个必须跟着改的东西**：
 
-1. `Session.workspace` 今天是建 session 时锁定的身份字段。一条 home session 会从不同目录的 TUI
-   进入，workspace 只能是 **turn 的属性**（`SessionContext::workspace_root` 已经是），不再是 session
-   身份的一部分。这与 CONTEXT 里"Profile = 谁，Workspace = 哪里"两条正交轴一致：哪里干活是每个
-   turn 自己说的。
+1. **workspace 归属分两种会话答**。对 home 成立的是"turn 的属性"：一条 home session 会从不同目录的
+   TUI 进入，它没有绑定（`Session.roots` 为空），每个 turn 用进入时的目录
+   （`SessionContext::workspace_roots`）。对**任务会话**则相反——一个任务 = 一条 session，
+   workspace 是这个任务的工作环境：首轮把启动目录写进 `Session.roots` 并从此认它，
+   `X-Komo-Workspace` 头之后被忽略，换目录 resume 不会静默改写文件根；要跨项目就在这条任务里
+   显式 `/workspace add <path>`。这与 CONTEXT 里"Profile = 谁，Workspace = 哪里"两条正交轴一致：
+   哪里干活由会话的身份或 turn 自己说，取决于它是不是一个任务。
 2. **system prompt 的 context 层保持 per process，不随 turn 的 workspace 变。** 缓存前缀的顺序是
    tools → system → messages，system 一变，后面整段 history 的缓存全部失效。今天 context 层（项目
    `AGENTS.md`）读的是进程 cwd，`system_prompt.rs` 文档里"stable within a session"这句已经不准，

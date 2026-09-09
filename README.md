@@ -44,13 +44,21 @@ cargo build --release
 komo init                       # scaffold ~/.komo/config.toml + .env + SOUL.md (never overwrites)
 # then fill the DEEPSEEK_API_KEY= line in ~/.komo/.env
 
-komo chat                       # interactive chat (full-screen TUI; needs a terminal)
+komo                            # start a task session in this directory (full-screen TUI)
+komo home                       # the ongoing daily conversation, shared with every private channel
+komo resume                     # continue the newest task bound to this directory (or `komo resume <id>`)
 komo model list                 # show current provider/model
 komo model set anthropic        # switch provider (persists to config.toml)
 ```
 
 Everything boots without a key — the gateway starts and channels serve — but
 agent turns reply with a "key not set" pointer until one is configured.
+
+One task is one session, and its workspace is the task's environment: a task is
+bound to the directory it was started in, so resuming it from somewhere else
+continues the task rather than moving where its tools write. `/workspace add
+<path>` widens it when the work spans projects. The home conversation is not
+bound — it runs each turn in whatever directory it was entered from.
 
 Inside chat, `/new` (or `/clear` / `/reset`) draws a conversation boundary: the
 model's replay starts fresh, nothing is deleted. Transcripts are append-only
@@ -62,7 +70,7 @@ none is running (on macOS through launchd; elsewhere start `komo gateway`
 yourself).
 
 ```bash
-komo session list               # stored sessions with message counts
+komo session list               # stored sessions with their workspace and message counts
 komo session clean              # delete empty sessions
 komo cron list                  # routines (cron / @at) and next fire times
 komo memory list                # memory candidates/active items

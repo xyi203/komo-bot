@@ -85,7 +85,7 @@ pub async fn classify(
     // choice must not leak onto the aux model.
     let session = Session {
         id: format!("feedback-{}", previous.id),
-        workspace: String::new(),
+        roots: Vec::new(),
         messages: vec![Message::user(prompt)],
         created_at: now,
         title: String::new(),

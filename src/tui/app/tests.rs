@@ -518,3 +518,23 @@ fn ctrl_c_quits_everywhere_ctrl_d_only_on_empty_input() {
     assert_eq!(app.on_key(ctrl('d')), None, "Ctrl-D with a draft is inert");
     assert_eq!(app.on_key(ctrl('c')), Some(Action::Quit));
 }
+
+#[test]
+fn a_workspace_line_is_read_by_the_ui_not_sent_to_the_agent() {
+    let mut app = App::new("s".into());
+    type_str(&mut app, "/workspace");
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::ShowWorkspace));
+
+    type_str(&mut app, "/workspace add ../lib");
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Some(Action::AddWorkspace("../lib".into()))
+    );
+
+    // Anything else that merely starts with the word is a message.
+    type_str(&mut app, "/workspaces");
+    assert!(matches!(
+        app.on_key(key(KeyCode::Enter)),
+        Some(Action::Submit { .. })
+    ));
+}

@@ -31,10 +31,11 @@ enum Commands {
     /// Open the home conversation: the operator's one ongoing daily thread,
     /// shared with every private channel (full-screen TUI; needs a terminal)
     Home,
-    /// Resume an existing chat session (shortcut for `komo session resume`)
+    /// Resume a task session (shortcut for `komo session resume`). With no id,
+    /// the newest task bound to the current directory.
     Resume {
         /// Session id (a UUID; `komo session list` prints them)
-        id: String,
+        id: Option<String>,
     },
     /// Run the always-on gateway: maintenance scheduler (and, later,
     /// config-declared ingress channels). Maintenance cron comes from
@@ -417,11 +418,12 @@ enum PairAction {
 enum SessionAction {
     /// List stored sessions with their title, creation time and message counts
     List,
-    /// Resume an existing session: reopen the chat TUI bound to its id, so its
-    /// history is loaded and the conversation continues where it left off
+    /// Resume a session: reopen the chat TUI on it, so its history is loaded
+    /// and the conversation continues where it left off. With no id, the newest
+    /// task session bound to the current directory
     Resume {
         /// Session id (a UUID; `komo session list` prints them)
-        id: String,
+        id: Option<String>,
     },
     /// Delete sessions that contain no messages
     Clean,
@@ -479,7 +481,7 @@ pub async fn run() -> anyhow::Result<()> {
         Some(Commands::Init) => init::run(),
         Some(Commands::Resume { id }) => {
             require_terminal()?;
-            crate::tui::resume(&id).await
+            crate::tui::resume(id.as_deref()).await
         }
         Some(Commands::Gateway { action }) => match action {
             None => gateway::run(&config).await,
@@ -565,7 +567,7 @@ pub async fn run() -> anyhow::Result<()> {
             SessionAction::List => inspect::session_list(&operator().await?).await,
             SessionAction::Resume { id } => {
                 require_terminal()?;
-                crate::tui::resume(&id).await
+                crate::tui::resume(id.as_deref()).await
             }
             SessionAction::Clean => inspect::session_clean(&operator().await?).await,
         },

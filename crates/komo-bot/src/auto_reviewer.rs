@@ -130,7 +130,7 @@ impl AutoReviewApprover {
         // invariant that keeps a conversation's model choice off the aux model.
         let session = Session {
             id: "policy-review".to_string(),
-            workspace: "__default__".to_string(),
+            roots: Vec::new(),
             messages: vec![Message::user(prompt)],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             title: String::new(),

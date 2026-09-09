@@ -200,6 +200,87 @@ fn folder_workspace_id_rejects_non_directories_and_garbage() {
     assert_eq!(resolve_folder_workspace(&format!("folder:{encoded}")), None);
 }
 
+/// A task session is bound on its first turn and honors that binding forever
+/// after: continuing it from another directory continues the *task*, it does
+/// not move where its tools write.
+#[test]
+fn a_bound_session_ignores_the_header() {
+    let bound = vec!["/home/u/proj".to_string()];
+    let plan = plan_workspace(
+        Some(&bound),
+        Some(PathBuf::from("/home/u/somewhere-else")),
+        false,
+    );
+    assert_eq!(
+        plan,
+        WorkspacePlan {
+            bind: Vec::new(),
+            turn: vec![PathBuf::from("/home/u/proj")],
+        }
+    );
+    // Every root travels, not just the anchor — `/workspace add` would be
+    // pointless otherwise.
+    let widened = vec!["/home/u/proj".to_string(), "/home/u/lib".to_string()];
+    assert_eq!(
+        plan_workspace(Some(&widened), None, false).turn,
+        vec![PathBuf::from("/home/u/proj"), PathBuf::from("/home/u/lib")]
+    );
+}
+
+#[test]
+fn a_first_turn_binds_the_directory_it_was_started_in() {
+    let plan = plan_workspace(None, Some(PathBuf::from("/home/u/proj")), false);
+    assert_eq!(
+        plan,
+        WorkspacePlan {
+            bind: vec![PathBuf::from("/home/u/proj")],
+            turn: vec![PathBuf::from("/home/u/proj")],
+        }
+    );
+}
+
+/// Home is the operator's one ongoing thread, entered from whatever directory
+/// they are standing in — binding it to the first one would silently redirect
+/// every later turn's file tools (docs/bot-runtime.md §2 D6).
+#[test]
+fn home_is_never_bound_and_takes_the_header_each_turn() {
+    let plan = plan_workspace(None, Some(PathBuf::from("/home/u/proj")), true);
+    assert_eq!(
+        plan,
+        WorkspacePlan {
+            bind: Vec::new(),
+            turn: vec![PathBuf::from("/home/u/proj")],
+        }
+    );
+    // …and once its row exists, still per turn.
+    let unbound: Vec<String> = Vec::new();
+    assert_eq!(
+        plan_workspace(Some(&unbound), Some(PathBuf::from("/home/u/other")), false).turn,
+        vec![PathBuf::from("/home/u/other")]
+    );
+}
+
+/// A caller with no entitlement to a root (a remote one, or a header that
+/// resolves to nothing) creates an unbound session and runs in the process
+/// workspace. An old row stays unbound too: it must not be captured by whichever
+/// directory happens to send its next message.
+#[test]
+fn nothing_to_bind_leaves_the_session_unbound() {
+    assert_eq!(
+        plan_workspace(None, None, false),
+        WorkspacePlan {
+            bind: Vec::new(),
+            turn: Vec::new(),
+        }
+    );
+    let unbound: Vec<String> = Vec::new();
+    assert!(
+        plan_workspace(Some(&unbound), Some(PathBuf::from("/tmp")), false)
+            .bind
+            .is_empty()
+    );
+}
+
 /// A cross-provider menu: the default (codex, three effort levels), another
 /// codex model, and a deepseek one — which has **no** effort scale. That
 /// asymmetry is what the effort rules below turn on.

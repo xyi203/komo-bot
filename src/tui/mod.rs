@@ -63,6 +63,7 @@ use komo_core::domain::{
     message::{Message, Role as MessageRole},
 };
 
+use crate::services::operator_control::SessionSummary;
 use app::{Action, App, ApprovalPrompt, Role};
 
 /// How often the session's pending approval / question is re-read. A chat
@@ -110,11 +111,13 @@ struct Boot {
     label: String,
     /// The resumed transcript; empty for a fresh session.
     history: Vec<Message>,
-    /// Where this TUI's turns run: the directory it was started in, always.
-    /// A session no longer carries a root of its own — one home conversation is
-    /// opened from wherever the operator happens to be standing, so the
-    /// workspace is a property of the turn (docs/bot-runtime.md §2 D6).
+    /// The directory this TUI was started in. It binds a *new* task session and
+    /// is what an unbound conversation (home) runs each turn in; a task session
+    /// already bound to roots runs in those instead.
     workspace: PathBuf,
+    /// The session's own workspace, when it has one. Empty for home and for a
+    /// task whose first turn has not run yet.
+    roots: Vec<String>,
     /// The wait a turn of this session is stopped in, on resume. A fresh
     /// session has none.
     awaiting: Option<Awaiting>,
@@ -145,6 +148,7 @@ pub async fn run_new() -> anyhow::Result<()> {
                 label,
                 history: Vec::new(),
                 workspace,
+                roots: Vec::new(),
                 awaiting: None,
             })
         }
@@ -177,6 +181,9 @@ pub async fn run_home() -> anyhow::Result<()> {
                 label: HOME_LABEL.to_string(),
                 history,
                 workspace,
+                // Home is never bound: it is entered from wherever the operator
+                // is standing, so each turn runs in that directory.
+                roots: Vec::new(),
                 awaiting,
             })
         }
@@ -187,19 +194,29 @@ pub async fn run_home() -> anyhow::Result<()> {
     drive(boot, String::new(), workspace).await
 }
 
-/// Continue an existing session (`komo resume <id>` on a TTY). Errors if the
+/// Continue an existing session (`komo resume [id]` on a TTY). Errors if the
 /// session doesn't exist — resume never creates one.
-pub async fn resume(id: &str) -> anyhow::Result<()> {
-    let fallback_workspace = startup_workspace()?;
-    let id = id.to_string();
+///
+/// With no id, the task session bound to the current directory — which is what
+/// "pick up where I left off in this project" means once a task carries its own
+/// workspace.
+pub async fn resume(id: Option<&str>) -> anyhow::Result<()> {
+    let cwd = startup_workspace()?;
+    let id = id.map(str::to_string);
     let boot: BootTask = tokio::spawn({
-        let fallback = fallback_workspace.clone();
+        let cwd = cwd.clone();
         let id = id.clone();
         async move {
-            let backend = connect(&fallback).await?;
-            let session = resolve_resume_id(&backend, &id).await?;
+            let backend = connect(&cwd).await?;
+            let sessions = backend.gateway.sessions().await?;
+            let session = match &id {
+                Some(id) => resolve_resume_id(&sessions, id)?,
+                None => latest_task_in(&sessions, &cwd)?,
+            };
             let history = backend.gateway.session_messages(&session).await?;
-            let awaiting = resume_awaiting(&backend, &session).await?;
+            let row = sessions.iter().find(|s| s.id == session);
+            let roots = row.map(|s| s.roots.clone()).unwrap_or_default();
+            let awaiting = row.and_then(|s| s.awaiting.clone());
             // Which of the two a resumed id is cannot be told from the id, and
             // the home conversation reached this way is still the home
             // conversation.
@@ -207,14 +224,15 @@ pub async fn resume(id: &str) -> anyhow::Result<()> {
             let label = if home {
                 HOME_LABEL.to_string()
             } else {
-                task_label(&fallback)
+                task_label(roots.first().map(Path::new).unwrap_or(&cwd))
             };
             Ok(Boot {
                 backend,
                 session,
                 label,
                 history,
-                workspace: fallback,
+                workspace: cwd,
+                roots,
                 awaiting,
             })
         }
@@ -222,7 +240,7 @@ pub async fn resume(id: &str) -> anyhow::Result<()> {
     // The raw argument stands in as the session id until the boot task
     // resolves it; a queued draft dispatches only after the resolved id is
     // installed.
-    drive(boot, id, fallback_workspace).await
+    drive(boot, id.unwrap_or_default(), cwd).await
 }
 
 /// Confirm the id names a session that exists. A session id is a UUID and
@@ -233,21 +251,39 @@ pub async fn resume(id: &str) -> anyhow::Result<()> {
 /// but the gateway will not run a turn on one — so opening a chat window that
 /// hydrates fine and then rejects everything typed into it is the worse of the
 /// two failures.
-async fn resolve_resume_id(backend: &Backend, id: &str) -> anyhow::Result<String> {
+fn resolve_resume_id(sessions: &[SessionSummary], id: &str) -> anyhow::Result<String> {
     if uuid::Uuid::parse_str(id).is_err() {
         anyhow::bail!(
             "`{id}` is a session from an older komo and can no longer be continued \
-             (its transcript is still in ~/.komo/sessions/); start a new one with `komo chat`"
+             (its transcript is still in ~/.komo/sessions/); start a new one with `komo`"
         );
     }
-    backend
-        .gateway
-        .sessions()
-        .await?
-        .into_iter()
+    sessions
+        .iter()
         .find(|s| s.id == id)
-        .map(|s| s.id)
+        .map(|s| s.id.clone())
         .ok_or_else(|| anyhow::anyhow!("no session with id `{id}` (see `komo session list`)"))
+}
+
+/// The task session a bare `komo resume` opens: the newest one whose workspace
+/// includes this directory.
+///
+/// Bound roots are the whole filter. Home, a channel conversation and komo's own
+/// sessions carry none — they are not tasks, and none of them is what somebody
+/// standing in a project directory means by "resume".
+fn latest_task_in(sessions: &[SessionSummary], cwd: &Path) -> anyhow::Result<String> {
+    let here = cwd.display().to_string();
+    sessions
+        .iter()
+        .filter(|s| s.roots.iter().any(|root| root == &here))
+        .max_by_key(|s| s.created_at)
+        .map(|s| s.id.clone())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "当前目录没有任务会话（{here}）。\n\
+                 用 `komo` 在这里开一个，或用 `komo session list` 找一条再 `komo resume <id>`。"
+            )
+        })
 }
 
 /// The wait this session is stopped in, if any — the session projection's
@@ -298,9 +334,10 @@ async fn drive(boot: BootTask, session: String, workspace: PathBuf) -> anyhow::R
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     // Print only after leaving the alternate screen, so the command survives in
-    // the user's normal terminal scrollback and is immediately copyable. A quit
-    // before the backend connected has no session to point at (fresh sessions
-    // are only created once the boot task lands), so the hint is skipped.
+    // the user's normal terminal scrollback and is immediately copyable. Only
+    // for a session that exists: a row is written by a turn, so a window nobody
+    // spoke in has nothing to resume, and the hint would name an id the gateway
+    // then refuses.
     if let Ok(Some(session_id)) = &result {
         println!("komo resume {session_id}");
     }
@@ -339,6 +376,12 @@ async fn event_loop(
     let mut backend: Option<Backend> = None;
     let mut pending: Option<String> = None;
     let mut workspace = workspace;
+    // The session's own workspace, once the boot task has read it.
+    let mut roots: Vec<String> = Vec::new();
+    // Whether this session has a row to resume: one is written by the first
+    // turn, so a window that hydrated history has one and a fresh task does not
+    // until it has said something.
+    let mut spoke = false;
     // The question text currently on screen, so a poll that keeps reporting the
     // same pending question does not re-print it.
     let mut shown_question: Option<String> = None;
@@ -400,7 +443,9 @@ async fn event_loop(
                 app.session_id = ready.session;
                 app.session_label = ready.label;
                 workspace = ready.workspace;
+                roots = ready.roots;
                 app.awaiting = ready.awaiting;
+                spoke = !ready.history.is_empty();
                 tail.seen = ready.history.len();
                 for message in ready.history {
                     let role = match message.role {
@@ -418,9 +463,24 @@ async fn event_loop(
                     format!(
                         "connected to the gateway (trusted), session `{}`\nworkspace: `{}`",
                         app.session_id,
-                        workspace.display(),
+                        workspace_note(&roots, &workspace),
                     ),
                 );
+                // A task carries its workspace, so it can be resumed from
+                // anywhere — and then the directory the terminal is standing in
+                // is *not* part of it. Said once, with the way to widen it,
+                // rather than discovered when a path is refused.
+                if !roots.is_empty() && !roots.contains(&workspace.display().to_string()) {
+                    app.push(
+                        Role::Info,
+                        format!(
+                            "当前目录 `{}` 不在这条任务的 workspace 里；需要的话用 \
+                             `/workspace add {}` 加进来。",
+                            workspace.display(),
+                            workspace.display(),
+                        ),
+                    );
+                }
                 backend = Some(ready.backend);
                 if let Some(text) = pending.take() {
                     spawn_turn(
@@ -528,6 +588,9 @@ async fn event_loop(
                     app.begin_tools();
                     match &backend {
                         Some(backend) => {
+                            // The turn writes the session row, so from here on
+                            // there is something for `komo resume` to open.
+                            spoke = true;
                             spawn_turn(backend, &app.session_id, text, &turn_tx, &event_tx)
                         }
                         // Still booting: hold the message (`in_flight` blocks a
@@ -547,6 +610,36 @@ async fn event_loop(
                     match backend.gateway.conversation_boundary(&app.session_id).await {
                         Ok(_) => app.push(Role::Info, "已开始新的上下文。".to_string()),
                         Err(error) => app.push(Role::Info, format!("开始新上下文失败：{error}")),
+                    }
+                }
+                Some(Action::ShowWorkspace) => {
+                    app.push(
+                        Role::Info,
+                        format!("workspace: {}", workspace_note(&roots, &workspace)),
+                    );
+                }
+                Some(Action::AddWorkspace(path)) => {
+                    let Some(backend) = &backend else {
+                        app.push(Role::Info, "正在启动，稍候再 /workspace add。".to_string());
+                        continue;
+                    };
+                    // Resolved here, not by the gateway: a relative path means
+                    // whatever this terminal is standing in, which the gateway
+                    // cannot see.
+                    let target = workspace.join(&path);
+                    match backend
+                        .gateway
+                        .add_session_root(&app.session_id, &target)
+                        .await
+                    {
+                        Ok(updated) => {
+                            roots = updated;
+                            app.push(
+                                Role::Info,
+                                format!("已加入 workspace：`{}`", target.display()),
+                            );
+                        }
+                        Err(error) => app.push(Role::Error, format!("{error:#}")),
                     }
                 }
                 Some(Action::Answer { text, shown }) => {
@@ -623,9 +716,7 @@ async fn event_loop(
             }
         }
     }
-    // No backend means no session was ever created or resumed — there is
-    // nothing for the resume hint to point at.
-    Ok(backend.is_some().then_some(app.session_id))
+    Ok(spoke.then_some(app.session_id))
 }
 
 /// Read what a stopped turn on this session is waiting on and surface it: an
@@ -746,6 +837,20 @@ fn classify_end(outcome: anyhow::Result<String>) -> TurnEnd {
     }
 }
 
+/// How a session's workspace reads in the transcript: the directories it is
+/// bound to, or — for an unbound conversation — the directory this sitting runs
+/// in.
+fn workspace_note(roots: &[String], fallback: &Path) -> String {
+    if roots.is_empty() {
+        return format!("`{}`", fallback.display());
+    }
+    roots
+        .iter()
+        .map(|root| format!("`{root}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The identity row's name for the home conversation. A task says which
 /// directory it is working in instead; home has none — it is entered from
 /// wherever the operator is standing and is about no directory in particular.
@@ -763,10 +868,72 @@ fn task_label(workspace: &Path) -> String {
 }
 
 /// Snapshot the TUI's startup folder once, so later `cd`s in child shells
-/// cannot redirect this sitting's tools. It is this *process's* root, not the
-/// session's: the same conversation opened from another directory runs its
-/// turns there.
+/// cannot redirect this sitting's tools. What a bare `komo` binds its new task
+/// to, and what an unbound conversation runs each turn in.
 fn startup_workspace() -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     cwd.canonicalize().map_err(Into::into)
+}
+
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+
+    fn session(id: &str, created_at: i64, roots: &[&str]) -> SessionSummary {
+        SessionSummary {
+            id: id.to_string(),
+            roots: roots.iter().map(|r| r.to_string()).collect(),
+            created_at,
+            messages: 2,
+            user_turns: 1,
+            title: String::new(),
+            status: "active".to_string(),
+            model: String::new(),
+            effort: String::new(),
+            awaiting: None,
+        }
+    }
+
+    #[test]
+    fn a_bare_resume_opens_the_newest_task_in_this_directory() {
+        let sessions = vec![
+            session("old", 100, &["/home/u/proj"]),
+            session("new", 200, &["/home/u/proj"]),
+            session("elsewhere", 300, &["/home/u/other"]),
+        ];
+        assert_eq!(
+            latest_task_in(&sessions, Path::new("/home/u/proj")).unwrap(),
+            "new"
+        );
+        // A directory admitted later still counts — that is what widening is.
+        let widened = vec![session("wide", 50, &["/home/u/proj", "/home/u/other"])];
+        assert_eq!(
+            latest_task_in(&widened, Path::new("/home/u/other")).unwrap(),
+            "wide"
+        );
+    }
+
+    /// Home, a channel conversation and komo's own sessions carry no roots.
+    /// None of them is what someone standing in a project means by "resume", and
+    /// the roots filter is what keeps them out without a second flag to read.
+    #[test]
+    fn an_unbound_conversation_is_never_what_a_bare_resume_opens() {
+        let sessions = vec![session("home", 999, &[]), session("task", 1, &["/other"])];
+        let refused = latest_task_in(&sessions, Path::new("/home/u/proj"));
+        let message = refused.unwrap_err().to_string();
+        assert!(message.contains("/home/u/proj"), "{message}");
+        assert!(message.contains("komo session list"), "{message}");
+    }
+
+    #[test]
+    fn an_id_that_is_not_a_uuid_is_refused_before_the_window_opens() {
+        let sessions = vec![session("feishu:oc_abc", 1, &[])];
+        assert!(resolve_resume_id(&sessions, "feishu:oc_abc").is_err());
+        let uuid = "019fad15-8199-7461-9d48-0a6c779f1c8d";
+        assert!(resolve_resume_id(&sessions, uuid).is_err(), "unknown id");
+        assert_eq!(
+            resolve_resume_id(&[session(uuid, 1, &[])], uuid).unwrap(),
+            uuid
+        );
+    }
 }

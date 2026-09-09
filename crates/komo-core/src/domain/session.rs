@@ -93,15 +93,21 @@ impl InboundPeer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
-    /// Where this conversation was first spoken from. **Descriptive, not
-    /// binding**: which directory a turn's tools are confined to is the turn's
-    /// own answer (`SessionContext::workspace_root`), because one home
-    /// conversation is entered from a TUI in whatever directory the operator
-    /// happens to be in (docs/bot-runtime.md §2 D6). Kept because the session
-    /// log's manifest and the operator's session list both want to say where a
-    /// conversation lives.
-    #[serde(default = "default_workspace")]
-    pub workspace: String,
+    /// The directories this conversation works in — normalized absolute paths,
+    /// `roots[0]` the anchor relative paths resolve against.
+    ///
+    /// **Binding, not descriptive.** One task is one session, and its workspace
+    /// is the task's environment: bound on the first turn and honored on every
+    /// later one, so continuing a task from another directory does not silently
+    /// move where its tools write. Widened only by an explicit
+    /// `/workspace add <path>`.
+    ///
+    /// Empty means *no* binding, and the turn's own root decides instead: the
+    /// home conversation (entered from wherever the operator is standing —
+    /// docs/bot-runtime.md §2 D6), a channel conversation, a sweep, a
+    /// sub-agent.
+    #[serde(default)]
+    pub roots: Vec<String>,
     pub messages: Vec<Message>,
     pub created_at: i64,
     /// Optional operator-set display name (empty = untitled; clients fall back
@@ -151,25 +157,24 @@ pub struct Session {
 pub const SESSION_STATUS_ACTIVE: &str = "active";
 pub const SESSION_STATUS_ARCHIVE: &str = "archive";
 pub const SESSION_STATUS_DELETED: &str = "deleted";
-pub const DEFAULT_WORKSPACE: &str = "__default__";
 
 fn default_status() -> String {
     SESSION_STATUS_ACTIVE.to_string()
 }
 
-fn default_workspace() -> String {
-    DEFAULT_WORKSPACE.to_string()
-}
-
 impl Session {
+    /// An unbound conversation: no workspace of its own, so each turn's root is
+    /// the turn's own answer. What home, a channel conversation, a sweep and a
+    /// sub-agent all are.
     pub fn new(id: impl Into<String>) -> Self {
-        Self::with_workspace(id, DEFAULT_WORKSPACE)
+        Self::with_roots(id, Vec::new())
     }
 
-    pub fn with_workspace(id: impl Into<String>, workspace: impl Into<String>) -> Self {
+    /// A task conversation bound to the directories it works in.
+    pub fn with_roots(id: impl Into<String>, roots: Vec<String>) -> Self {
         Self {
             id: id.into(),
-            workspace: workspace.into(),
+            roots,
             messages: Vec::new(),
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             title: String::new(),
@@ -347,6 +352,37 @@ mod tests {
         // with anything, including what a sweep's prompt would say.
         assert!(auto_title(SessionOrigin::User, "cron: 帮我加个定时任务").is_some());
         assert!(auto_title(SessionOrigin::User, "检查告警并汇报").is_some());
+    }
+
+    #[test]
+    fn a_session_is_unbound_unless_it_was_given_roots() {
+        assert!(Session::new("s").roots.is_empty());
+        let bound = Session::with_roots("s", vec!["/home/u/proj".into()]);
+        assert_eq!(bound.roots, vec!["/home/u/proj".to_string()]);
+    }
+
+    #[test]
+    fn a_stored_session_without_roots_reads_as_unbound() {
+        // Every row written before the column existed, plus home and every
+        // channel conversation: absent means "the turn decides", never "the
+        // process default is bound".
+        let stored = serde_json::json!({
+            "id": "s",
+            "messages": [],
+            "created_at": 0,
+        });
+        let session: Session = serde_json::from_value(stored).unwrap();
+        assert!(session.roots.is_empty());
+
+        let round_tripped: Session = serde_json::from_str(
+            &serde_json::to_string(&Session::with_roots("s", vec!["/a".into(), "/b".into()]))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            round_tripped.roots,
+            vec!["/a".to_string(), "/b".to_string()]
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ impl ReflectiveReviewer {
     fn aux_session(&self, session: &Session, prompt: String) -> Session {
         Session {
             id: format!("review-{}", session.id),
-            workspace: session.workspace.clone(),
+            roots: session.roots.clone(),
             messages: vec![Message::user(prompt)],
             created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             title: String::new(),
@@ -400,7 +400,7 @@ mod tests {
     fn session(id: &str) -> Session {
         Session {
             id: id.to_string(),
-            workspace: "__default__".to_string(),
+            roots: Vec::new(),
             messages: Vec::new(),
             created_at: 0,
             title: String::new(),

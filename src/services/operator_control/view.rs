@@ -12,9 +12,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionSummary {
     pub id: String,
-    /// Immutable workspace id selected when the session was created.
-    #[serde(default = "default_workspace")]
-    pub workspace: String,
+    /// The directories this task session is bound to, `roots[0]` the anchor.
+    /// Empty for every unbound conversation — home, a channel, komo's own. A
+    /// client groups and labels sessions by these paths, which are canonical
+    /// and byte-comparable with `/api/workspaces`' own.
+    #[serde(default)]
+    pub roots: Vec<String>,
     pub created_at: i64,
     pub messages: usize,
     pub user_turns: usize,
@@ -27,7 +30,7 @@ pub struct SessionSummary {
     #[serde(default)]
     pub status: String,
     /// Per-session model override (empty = the gateway default). Switchable
-    /// mid-conversation, unlike `workspace`.
+    /// mid-conversation.
     #[serde(default)]
     pub model: String,
     /// Per-session reasoning effort (empty = the provider default).
@@ -37,10 +40,6 @@ pub struct SessionSummary {
     /// suspended turn is otherwise indistinguishable from an idle chat.
     #[serde(default)]
     pub awaiting: Option<Awaiting>,
-}
-
-fn default_workspace() -> String {
-    "__default__".to_string()
 }
 
 /// A pairing row without the salted code hash / salt (never leaves the host).

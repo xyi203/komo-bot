@@ -72,6 +72,20 @@ const EDIT_GUIDANCE: &str = "To change part of a file use `edit` (exact string \
     byte for byte, so read the file first and copy it verbatim rather than \
     reconstructing it from memory.";
 
+/// Gated on `apply_patch`. The v2 envelope is the one thing a caller cannot
+/// infer, and it does not fit in a 240-character tool description.
+const PATCH_GUIDANCE: &str = "`apply_patch` takes one envelope:\n\
+    *** Begin Patch\n\
+    *** Add File: path\n\
+    +new line\n\
+    *** Update File: path\n\
+    @@ optional context line\n\
+    -removed line\n\
+    +added line\n\
+    *** Delete File: path\n\
+    *** End Patch\n\
+    Context lines start with a space.";
+
 /// Gated on the `read` tool. Two habits worth stating: page instead of giving
 /// up on a long file, and don't shell out for what `read` already does (a `cat`
 /// through `shell` loses the line numbers `write` edits depend on, and asks for
@@ -526,6 +540,9 @@ impl SystemPromptBuilder {
         }
         if self.has("edit") {
             parts.push(EDIT_GUIDANCE.to_string());
+        }
+        if self.has("apply_patch") {
+            parts.push(PATCH_GUIDANCE.to_string());
         }
         if self.has("session") || self.has("memory") || self.has("skill") {
             parts.push(STATE_GUIDANCE.to_string());

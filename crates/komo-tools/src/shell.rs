@@ -217,10 +217,9 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a shell command on the local machine via `sh -c` and return its \
-         combined stdout/stderr. Safe (read-only) commands run without a \
-         prompt; destructive commands require an explicit dangerous-action \
-         confirmation, and a few catastrophic ones are always refused."
+        "Run a shell command via `sh -c` and return its combined \
+         stdout/stderr. Destructive commands require approval; a few \
+         catastrophic ones are always refused."
     }
 
     /// The caller may ask for up to [`MAX_TIMEOUT_MS`]; the executor's clock has
@@ -240,14 +239,13 @@ impl Tool for ShellTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command to run, e.g. `ls -la`."
+                    "description": "Shell command to run."
                 },
                 "timeout": {
                     "type": "integer",
                     "description": format!(
-                        "Milliseconds to allow before the command (and anything it \
-                         started) is killed. Default {DEFAULT_TIMEOUT_MS}, maximum \
-                         {MAX_TIMEOUT_MS}. Raise it for builds and test runs."
+                        "Milliseconds before the command and anything it started is \
+                         killed (default {DEFAULT_TIMEOUT_MS}, maximum {MAX_TIMEOUT_MS})."
                     )
                 },
                 "workdir": {

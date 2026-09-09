@@ -86,6 +86,31 @@ fn model_ids(models: &[ModelEntry]) -> Vec<&str> {
     models.iter().map(|entry| entry.id.as_str()).collect()
 }
 
+const DESCRIPTION: &str = "Delegate a self-contained subtask to a sub-agent \
+    with the full tool set and return its result. It cannot see this \
+    conversation, so put everything it needs in `task`, and it cannot delegate \
+    further.";
+
+/// A free function for the same reason [`resolve_model`] is one: it is testable
+/// without standing up a whole sub-agent runtime.
+fn schema(default_model: &str, model_ids: &[&str]) -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "task": {
+                "type": "string",
+                "description": "Fully self-contained instruction for the sub-agent."
+            },
+            "model": {
+                "type": "string",
+                "description": format!("Model to run the sub-agent on; omit for the default ({default_model})."),
+                "enum": model_ids,
+            }
+        },
+        "required": ["task"]
+    })
+}
+
 /// Resolve a requested model to the value stored on the sub-session:
 /// `None`/blank = the gateway default (empty string).
 ///
@@ -113,12 +138,7 @@ impl Tool for DelegateTool {
     }
 
     fn description(&self) -> &'static str {
-        "Delegate a focused, self-contained subtask to a sub-agent that has the \
-         full tool set (it can search, read, edit and run commands) and return \
-         its result. Provide all needed context in `task`; the sub-agent does not \
-         see the main conversation. Optionally pick which model does the work \
-         with `model` — e.g. a stronger model to plan, a faster one to apply \
-         changes. The sub-agent cannot delegate further."
+        DESCRIPTION
     }
 
     /// A sub-agent now runs a whole *tool-using* turn, not one completion, so it
@@ -130,26 +150,7 @@ impl Tool for DelegateTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "Fully self-contained instruction for the sub-agent."
-                },
-                "model": {
-                    "type": "string",
-                    "description": format!(
-                        "Model to run the sub-agent on. Omit to use the default \
-                         ({}). Available: {}.",
-                        self.default_model,
-                        self.model_ids().join(", ")
-                    ),
-                    "enum": self.model_ids(),
-                }
-            },
-            "required": ["task"]
-        })
+        schema(&self.default_model, &self.model_ids())
     }
 
     async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -226,6 +227,15 @@ mod tests {
         assert!(
             msg.contains("deepseek:deepseek-chat"),
             "including cross-provider ids: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        komo_tools::test_support::assert_description_budget("delegate", DESCRIPTION);
+        komo_tools::test_support::assert_schema_budget(
+            "delegate",
+            &schema("gpt-5.6-sol", &model_ids(&menu())),
         );
     }
 }

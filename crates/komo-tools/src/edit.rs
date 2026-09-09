@@ -59,10 +59,8 @@ impl Tool for EditTool {
 
     fn description(&self) -> &'static str {
         "Replace an exact piece of text in one file (requires user approval). \
-         `oldString` must match the file byte for byte, including whitespace and \
-         indentation — read the file first. It must also be unique: include \
-         surrounding lines until it is, or set `replaceAll` to change every \
-         occurrence. Prefer this over `write` for changing part of a file."
+         `oldString` must match the file byte for byte and be unique — add \
+         surrounding lines, or set `replaceAll`."
     }
 
     /// This call can park on an approval prompt, so it must outlast one.
@@ -508,5 +506,12 @@ mod tests {
 
         let long = preview(&"x".repeat(PREVIEW_LINE_CHARS + 50), '+');
         assert!(long[0].ends_with("..."));
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&EditTool::new(Arc::new(Workspace::new(
+            vec![],
+        ))));
     }
 }

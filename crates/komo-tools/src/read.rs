@@ -70,11 +70,9 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a text file with line numbers, or list a directory. Absolute paths may \
-         be anywhere locally; relative paths resolve inside the workspace. Long files are paged: pass `offset` (the \
-         1-based line to start at) and `limit` to walk through one; the result \
-         tells you the next offset when there is more. Binary files are refused \
-         rather than dumped as garbage."
+        "Read a text file with line numbers, or list a directory. Long files are \
+         paged: pass `offset` and `limit`, and the result names the next offset. \
+         Binary files are refused."
     }
 
     /// Read-only: safe to retry after an ambiguous transient failure.
@@ -88,7 +86,7 @@ impl Tool for ReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "File or directory path. Absolute paths may be anywhere locally; relative paths resolve from the workspace root."
+                    "description": "File or directory; relative to the workspace root, or an absolute local path."
                 },
                 "offset": {
                     "type": "integer",
@@ -614,5 +612,12 @@ mod tests {
         let (out, clipped) = truncate_chars("日本語テキスト", 3);
         assert_eq!(out, "日本語");
         assert!(clipped);
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&ReadTool::new(Arc::new(Workspace::new(
+            vec![],
+        ))));
     }
 }

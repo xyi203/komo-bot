@@ -60,10 +60,8 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents by regular expression, returning file paths, line \
-         numbers and the matching lines. Honors .gitignore and skips binaries. \
-         Narrow with `path` (a directory or one file) and `include` (a file glob \
-         like `*.{ts,tsx}`). Prefer this over `grep`/`rg` through `shell`."
+        "Search file contents by regular expression; returns file paths, line \
+         numbers and the matching lines. Honors .gitignore and skips binaries."
     }
 
     fn idempotent(&self) -> bool {
@@ -76,15 +74,15 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Regular expression to search for in file contents."
+                    "description": "Regular expression to match against file contents."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory or file to search. Absolute paths may be anywhere locally; relative paths resolve from the workspace root. Defaults to the root."
+                    "description": "Directory or file to search; relative to the workspace root, or an absolute local path. Defaults to the root."
                 },
                 "include": {
                     "type": "string",
-                    "description": "Glob limiting which files are searched, e.g. `*.rs` or `*.{ts,tsx}`."
+                    "description": "File glob limiting which files are searched, e.g. `*.{ts,tsx}`."
                 },
                 "limit": {
                     "type": "integer",
@@ -402,5 +400,12 @@ mod tests {
     fn long_lines_are_clipped_on_a_char_boundary() {
         let clipped = clip(&"界".repeat(MAX_LINE_CHARS + 10));
         assert!(clipped.ends_with("…[clipped]"));
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&GrepTool::new(Arc::new(Workspace::new(
+            vec![],
+        ))));
     }
 }

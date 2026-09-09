@@ -58,21 +58,10 @@ impl Tool for WikiSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the user's personal note vault (Obsidian) by meaning. Returns the \
-         most relevant passages with their source file and heading. Use it when \
-         the user refers to something they wrote down, asks what they concluded \
-         or decided previously, or when their own notes would answer better than \
-         general knowledge. Matches across languages — a Chinese question finds \
-         an English note. If one search comes back thin, retry with different \
-         wording or an adjacent angle before concluding the note does not exist.\n\
-         This answers \"what did I write about X\", never \"what is in the \
-         vault\". An inventory question has no passage that matches it: the \
-         vault's own index, dashboard and README-style files outrank every real \
-         note, so searching returns a table of contents in fragments and the \
-         answer silently omits whatever those files forgot to list. To report \
-         coverage, `read` the vault's index/dashboard file whole (the vault root \
-         usually names one) and list the directories — do not assemble it from \
-         search hits."
+        "Search the user's note vault by meaning; returns passages with their \
+         source file and heading. It answers \"what did I write about X\", never \
+         \"what is in the vault\" — an inventory question has no passage that \
+         matches it."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -81,9 +70,8 @@ impl Tool for WikiSearchTool {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "What to look for, as a natural-language phrase. \
-                                    Prefer the user's own wording — the vault is \
-                                    theirs and uses their terms."
+                    "description": "What to look for, as a phrase in the user's own \
+                                    wording."
                 },
                 "limit": {
                     "type": "integer",
@@ -325,5 +313,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&tool(Vec::new(), true));
     }
 }

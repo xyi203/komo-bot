@@ -27,5 +27,5 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 # `TimeTool` as a real tool in the runtime's loop tests.
-komo-tools = { path = "../komo-tools" }
+komo-tools = { path = "../komo-tools", features = ["test-support"] }
 tokio = { version = "1.53.1", features = ["full", "test-util"] }

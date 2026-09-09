@@ -45,21 +45,9 @@ impl Tool for ApplyPatchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Apply one patch that adds, updates and/or deletes several files, with a \
-         single approval (requires user approval). Use this instead of many `edit` \
-         calls when a change spans files. Format:\n\
-         *** Begin Patch\n\
-         *** Add File: path\n\
-         +new line\n\
-         *** Update File: path\n\
-         @@ optional context line\n\
-         -removed line\n\
-         +added line\n\
-         *** Delete File: path\n\
-         *** End Patch\n\
-         Context lines start with a space. No line numbers — chunks are located by \
-         their context, so copy enough surrounding lines to be unambiguous. Moves \
-         are not supported: add the new file and delete the old one."
+        "Apply one patch that adds, updates and/or deletes several files, under a \
+         single approval. Chunks are located by their context, not by line \
+         numbers, so copy enough surrounding lines. Moves are not supported."
     }
 
     /// This call can park on an approval prompt, so it must outlast one.
@@ -486,5 +474,12 @@ mod tests {
         let redacted = tool.redact_args(&args);
         assert!(!redacted.contains("secret"));
         assert!(redacted.contains("redacted"));
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&ApplyPatchTool::new(Arc::new(
+            Workspace::new(vec![]),
+        )));
     }
 }

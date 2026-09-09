@@ -103,13 +103,9 @@ impl Tool for WikiReadTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a note from the user's vault by path — the whole note, or one \
-         section with `heading`. Use it after `wiki_search` when a matched \
-         passage is not enough to answer: search returns isolated fragments, \
-         this returns the section they came from. Pass `path` exactly as \
-         `wiki_search` reported it, and `heading` as the last part of the \
-         heading trail it printed. Also the right way to read a note the user \
-         names outright (\"open my note on X\") once search has found its path."
+        "Read a note from the vault by path — the whole note, or one section \
+         with `heading`. Use it when a `wiki_search` passage is not enough; pass \
+         `path` and `heading` exactly as search reported them."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -118,11 +114,11 @@ impl Tool for WikiReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Vault-relative path to the note, as reported by `wiki_search` (e.g. `02-projects/checkout.md`). A missing `.md` is added."
+                    "description": "Vault-relative path to the note, as `wiki_search` reports it. A missing `.md` is added."
                 },
                 "heading": {
                     "type": "string",
-                    "description": "Read only this section: the heading line and everything under it, up to the next heading of the same or higher level. Accepts a `A > B` trail (its last part is matched) or a bare heading. Omit for the whole note."
+                    "description": "Read only this section, down to the next heading of the same or higher level. Accepts an `A > B` trail."
                 }
             },
             "required": ["path"]
@@ -503,5 +499,10 @@ mod tests {
         let (out, overflowed) = cap("short note\n");
         assert!(!overflowed);
         assert_eq!(out, "short note");
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&WikiReadTool::new(PathBuf::from("/vault")));
     }
 }

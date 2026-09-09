@@ -119,22 +119,10 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &'static str {
-        "Persistent long-term memory across sessions, with governance. \
-         action=\"save\" stores a fact (optional kind: profile | preference | feedback | \
-         project | person | fact | decision | reference); action=\"search\" returns facts \
-         matching a query (scoped to this chat) — by meaning as well as by wording, so \
-         it matches across languages, and it is worth re-searching with different terms \
-         when the memories you were handed are close but not enough; action=\"list\" \
-         returns stored facts; \
-         action=\"update\" changes a memory by id (status / importance / kind / \
-         content); action=\"promote\" marks a candidate active; action=\"reject\" / \
-         \"archive\" retire one. L1 memory is maintained separately in MEMORY.md. Do not save anything that will be stale within a week — task \
-         progress, completed-work logs, PR/issue numbers, or commit SHAs do not belong here. \
-         When a new fact replaces or contradicts a stored one (a changed preference, a \
-         corrected fact), pass `supersedes: [ids]` on save: the outdated memory is \
-         retired as history that points at its replacement, instead of coexisting with \
-         it. `save` reports possibly related existing memories so you can catch the \
-         conflict while you are still in context."
+        "Long-term memory across sessions. `save` stores a fact, \
+         `search`/`list` retrieve, `update`/`promote`/`reject`/`archive` govern. \
+         Never store what goes stale within a week: task progress, PR numbers, \
+         commit SHAs."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -152,7 +140,7 @@ impl Tool for MemoryTool {
                     "enum": ["profile", "preference", "feedback", "project", "person", "fact", "decision", "reference"],
                     "description": "Category (action=save, default profile; or action=update)."
                 },
-                "query": { "type": "string", "description": "Search term (action=search)." },
+                "query": { "type": "string", "description": "Search term (action=search); matched by meaning as well as by wording, so retrying different wording helps." },
                 "id": { "type": "string", "description": "Target memory id (action=update/promote/reject/archive)." },
                 "status": { "type": "string", "enum": ["candidate", "active", "archived", "rejected"], "description": "New status (action=update)." },
                 "importance": { "type": "integer", "description": "Ranking weight 0–100 (action=update)." },
@@ -160,7 +148,7 @@ impl Tool for MemoryTool {
                 "supersedes": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Ids of stored memories the new fact replaces (action=save); they are retired as history in the same call, linked to the new memory."
+                    "description": "Ids of stored memories this fact replaces (action=save) — pass them when it contradicts one; they retire as history."
                 }
             },
             "required": ["action"]
@@ -668,5 +656,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no memory with id"));
+    }
+
+    #[tokio::test]
+    async fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&temp_tool().await);
     }
 }

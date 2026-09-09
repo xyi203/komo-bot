@@ -148,20 +148,9 @@ impl Tool for SessionTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search and read Komo's own stored conversations (this agent's chat \
-         history, NOT system/tmux/login sessions). Only a recent window of the \
-         current conversation is replayed to you each turn — everything older, \
-         and every other conversation, still exists here. \
-         action=\"search\" finds past turns by meaning as well as wording, \
-         across ALL stored conversations by default, and matches a question in \
-         one language against a conversation held in another; \
-         action=\"show\" reads stored messages verbatim by position; \
-         action=\"count\"/\"list\" enumerate sessions. \
-         Search whenever the user refers to earlier work, a past decision, or \
-         something they told you that you cannot see — including in other \
-         conversations. Search first, then `show` the turn to read it in full \
-         rather than answering from a snippet. If a search finds nothing, say \
-         you checked instead of guessing."
+        "Search and read Komo's own stored conversations — this agent's chat \
+         history, NOT system/tmux/login sessions. `search` spans every stored \
+         conversation by default; `show` reads messages verbatim by position."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -171,19 +160,19 @@ impl Tool for SessionTool {
                 "action": {
                     "type": "string",
                     "enum": ["count", "list", "search", "show"],
-                    "description": "count/list = session inventory; search = find messages by keyword; show = read messages by position."
+                    "description": "count/list = session inventory; search = find messages; show = read messages by position."
                 },
                 "query": {
                     "type": "string",
-                    "description": "search: what to look for. Matched by meaning and by wording, over message text and tool-activity notes — write it as the question you are actually asking, not as a keyword."
+                    "description": "search: what to look for. Write it as the question you are actually asking, not as keywords."
                 },
                 "session": {
                     "type": "string",
-                    "description": "search: a session id from action=list, to narrow to one conversation. Omit to search all of them, which is usually what you want. show: which conversation to read; defaults to this one."
+                    "description": "search: a session id to narrow to (omit to search all). show: which conversation; defaults to this one."
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "show: 1-based index of the first message to return (search hits are labeled with these indexes)."
+                    "description": "show: 1-based index of the first message (search hits are labeled with these)."
                 },
                 "limit": {
                     "type": "integer",
@@ -784,5 +773,10 @@ mod tests {
             .text;
         assert!(out.contains("no matches"), "{out}");
         assert!(out.contains("say you checked"), "{out}");
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&tool());
     }
 }

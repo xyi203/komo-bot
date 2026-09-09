@@ -78,14 +78,9 @@ impl Tool for TodoTool {
     }
 
     fn description(&self) -> &'static str {
-        "Working task list for THIS conversation only (use `task` for things that \
-         must outlive the session). Call with no arguments to read the current list. \
-         Pass `todos` to replace the whole list — send every item each time with its \
-         latest status. List order is priority. Keep at most ONE item in_progress; \
-         mark an item completed as soon as it is done, and cancel one that no longer \
-         applies. Use it only for longer, non-trivial work (many tool calls, or \
-         steps that can fail independently) so the user can see progress; skip it \
-         for quick linear tasks like a single commit-and-push."
+        "Working task list for this conversation only. Call with no arguments to \
+         read it; pass `todos` to replace the whole list, sending every item each \
+         time. Keep at most one item in_progress."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -94,13 +89,13 @@ impl Tool for TodoTool {
             "properties": {
                 "todos": {
                     "type": "array",
-                    "description": "The full todo list (replaces the previous one). Omit to read.",
+                    "description": "The full todo list, replacing the previous one. Omit to read.",
                     "items": {
                         "type": "object",
                         "properties": {
                             "content": {
                                 "type": "string",
-                                "description": "Imperative step description, e.g. \"Write the parser\"."
+                                "description": "Imperative step, e.g. \"Write the parser\"."
                             },
                             "status": {
                                 "type": "string",
@@ -109,7 +104,7 @@ impl Tool for TodoTool {
                             },
                             "active_form": {
                                 "type": "string",
-                                "description": "Present-continuous form shown while running, e.g. \"Writing the parser\" (optional)."
+                                "description": "Present-continuous form shown while running, e.g. \"Writing the parser\"."
                             }
                         },
                         "required": ["content"]
@@ -288,5 +283,12 @@ mod tests {
         let items = repo.get("s1").await.unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].content, "c");
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&TodoTool::new(
+            Arc::new(MemTodos::default()),
+        ));
     }
 }

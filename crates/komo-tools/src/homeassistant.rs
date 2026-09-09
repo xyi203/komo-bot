@@ -107,24 +107,9 @@ impl Tool for HomeAssistantTool {
     }
 
     fn description(&self) -> &'static str {
-        "Query and control a Home Assistant smart-home instance. \
-         action=\"list_entities\" lists entities + current state (optional \
-         `domain` and/or `area` filter); \
-         action=\"get_state\" returns one entity's full state + attributes \
-         (requires `entity_id`); \
-         action=\"list_services\" discovers callable services per domain (use it \
-         to learn what `call_service` accepts); \
-         action=\"call_service\" invokes a service to change something (requires \
-         `domain` + `service`, e.g. light/turn_on, usually with `entity_id`, \
-         plus optional `data`). \
-         To edit automations: action=\"list_automations\" lists each automation's \
-         entity id, on/off state, name, and config `id`; \
-         action=\"get_automation\" returns one automation's full config (requires \
-         `id`); action=\"save_automation\" creates or updates one (requires `id` + \
-         a `config` object with at least `trigger` and `action`; pass the whole \
-         config — it replaces the automation); action=\"delete_automation\" removes \
-         one (requires `id`). Control and automation-edit actions ask for approval; \
-         saving/deleting an automation persists to automations.yaml and reloads HA."
+        "Query and control a Home Assistant instance: entities and their state, \
+         callable services, and the automations in automations.yaml. Control and \
+         automation edits ask for approval."
     }
 
     /// These calls can park on an approval prompt, so they must outlast one.
@@ -144,11 +129,11 @@ impl Tool for HomeAssistantTool {
                 },
                 "domain": {
                     "type": "string",
-                    "description": "Service domain for call_service/list_services (e.g. \"light\"); or an entity-id prefix filter for list_entities."
+                    "description": "Service domain for call_service/list_services (e.g. \"light\"); or an entity-id prefix for list_entities."
                 },
                 "service": {
                     "type": "string",
-                    "description": "Service name for call_service (e.g. \"turn_on\", \"turn_off\", \"toggle\", \"set_temperature\")."
+                    "description": "Service name for call_service, e.g. \"turn_on\"."
                 },
                 "entity_id": {
                     "type": "string",
@@ -156,7 +141,7 @@ impl Tool for HomeAssistantTool {
                 },
                 "area": {
                     "type": "string",
-                    "description": "Area/room name filter for list_entities (e.g. \"kitchen\"); matched against friendly names."
+                    "description": "Room filter for list_entities, matched against friendly names."
                 },
                 "data": {
                     "type": "object",
@@ -164,11 +149,11 @@ impl Tool for HomeAssistantTool {
                 },
                 "id": {
                     "type": "string",
-                    "description": "Automation config id for get/save/delete_automation (e.g. \"1718900000000\" or a slug). NOT the automation.* entity id; list_automations shows both."
+                    "description": "Automation config `id` for get/save/delete_automation — NOT the automation.* entity id."
                 },
                 "config": {
                     "type": "object",
-                    "description": "Automation config for save_automation: an object with `alias`, `trigger`, optional `condition`, `action`, and `mode`. Pass the complete config — save replaces the whole automation."
+                    "description": "Complete config for save_automation: `alias`, `trigger`, optional `condition`, `action`, `mode`. Save replaces it whole."
                 }
             },
             "required": ["action"]
@@ -1013,5 +998,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("invalid automation id"));
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&tool());
     }
 }

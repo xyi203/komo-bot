@@ -43,7 +43,7 @@ impl Tool for WebSearchTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search the web and return the top result titles, URLs, and snippets."
+        "Search the web; returns the top result titles, URLs and snippets."
     }
 
     /// Read-only query: safe to retry on an ambiguous transient failure.
@@ -220,5 +220,10 @@ mod tests {
         assert_eq!(results[0].title, "The Rust Language");
         assert_eq!(results[0].url, "https://rust-lang.org");
         assert!(results[0].snippet.contains("programming"));
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&WebSearchTool::new());
     }
 }

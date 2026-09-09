@@ -119,18 +119,10 @@ impl Tool for WikiIndexTool {
     }
 
     fn description(&self) -> &'static str {
-        "Inspect and maintain the search index behind `wiki_search`. \
-         action=\"status\" reports what the index holds (files, chunks, the \
-         embedding model that wrote it) and what the last maintenance run did — \
-         use it whenever `wiki_search` returns nothing for a note the user is \
-         sure exists, or before claiming the vault does not contain something. \
-         action=\"refresh\" indexes notes changed since the last run; it is cheap \
-         and is the right answer when the user just wrote or edited notes. \
-         action=\"rebuild\" discards the whole index and builds it again from \
-         scratch — needed only when the embedding model changed or the index is \
-         corrupt, it takes minutes, and it runs in the background (poll \
-         action=\"status\"). Prefer `refresh`; never `rebuild` to fix a search \
-         that simply had no good match."
+        "Inspect and maintain the search index behind `wiki_search`. Run \
+         `status` first when a search misses a note the user is sure exists; \
+         `refresh` indexes changed notes. `rebuild` is for a changed embedding \
+         model only."
     }
 
     /// A synchronous `refresh` can park on an approval prompt *and* then embed;
@@ -146,7 +138,7 @@ impl Tool for WikiIndexTool {
                 "action": {
                     "type": "string",
                     "enum": ["status", "refresh", "rebuild"],
-                    "description": "status = report the index and the last run (read-only); refresh = index changed notes; rebuild = discard and rebuild everything (background, minutes)."
+                    "description": "status = report the index; refresh = index changed notes; rebuild = discard and rebuild it (background, minutes)."
                 }
             },
             "required": ["action"]
@@ -540,5 +532,10 @@ mod tests {
         let (t, rec) = tool_with(1, None, true);
         let err = run(&t, "reindex", &rec).await.unwrap_err();
         assert!(matches!(err, ToolError::InvalidInput(_)), "{err:?}");
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&tool_with(0, None, true).0);
     }
 }

@@ -45,9 +45,7 @@ impl Tool for WriteTool {
 
     fn description(&self) -> &'static str {
         "Create a file, or replace an existing file's entire contents (requires \
-         user approval). Relative paths resolve inside the workspace. To change \
-         part of a file, read it first — replacing the whole body to alter a few \
-         lines risks losing the rest."
+         user approval)."
     }
 
     /// This call can park on an approval prompt, so it must outlast one.
@@ -334,5 +332,12 @@ mod tests {
         assert!(!redacted.contains("secret-body"));
         assert!(redacted.contains("redacted"));
         assert!(redacted.contains("/x/y.txt"));
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&WriteTool::new(Arc::new(Workspace::new(
+            vec![],
+        ))));
     }
 }

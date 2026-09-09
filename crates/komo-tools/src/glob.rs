@@ -51,10 +51,8 @@ impl Tool for GlobTool {
     }
 
     fn description(&self) -> &'static str {
-        "Find files by glob pattern (e.g. `**/*.rs`, `src/**/test_*.py`), newest \
-         first. Searches local directories, honoring .gitignore — so build output and \
-         dependencies stay out of the results. Use `path` to narrow to a \
-         subdirectory. Prefer this over `find`/`ls` through `shell`."
+        "Find files by glob pattern, newest first. Honors .gitignore, so build \
+         output and dependencies stay out of the results."
     }
 
     fn idempotent(&self) -> bool {
@@ -67,11 +65,11 @@ impl Tool for GlobTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Glob pattern matched against each file's path, e.g. `**/*.rs`."
+                    "description": "Glob matched against each file's path, e.g. `**/*.rs`."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Directory to search. Absolute paths may be anywhere locally; relative paths resolve from the workspace root. Defaults to the root."
+                    "description": "Directory to search; relative to the workspace root, or an absolute local path. Defaults to the root."
                 },
                 "limit": {
                     "type": "integer",
@@ -257,5 +255,12 @@ mod tests {
 
         assert!(out.text.contains("visible.txt"), "{}", out.text);
         let _ = std::fs::remove_dir_all(&external);
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&GlobTool::new(Arc::new(Workspace::new(
+            vec![],
+        ))));
     }
 }

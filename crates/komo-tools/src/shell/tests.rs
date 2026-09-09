@@ -493,3 +493,10 @@ async fn safe_commands_are_safe_risk() {
         .await;
     assert_eq!(*rec.risk.lock().unwrap(), Some(Risk::Safe));
 }
+
+#[test]
+fn the_model_facing_text_stays_short() {
+    crate::test_support::assert_model_text_budget(&ShellTool::new(Arc::new(Workspace::new(
+        vec![],
+    ))));
+}

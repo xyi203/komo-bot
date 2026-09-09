@@ -50,15 +50,9 @@ impl Tool for LogsTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read the tail of komo's own runtime log (tracing output: turn spans, \
-         `tool ok`/`tool error` lines, channel and sweep activity). Use it to \
-         diagnose what just happened — a tool that failed, a slow turn, a \
-         reminder that didn't fire — instead of speculating. `contains` filters \
-         to matching lines (case-insensitive, e.g. \"ERROR\" or a tool name), \
-         `lines` sets how many of the newest matches to return. `source` \
-         defaults to this process's own log; \"gateway\" or \"chat\" pick one \
-         explicitly. Note the log level: at the default `info` a tool's full \
-         result is not logged, only its name/outcome/duration."
+        "Read the tail of komo's own runtime log: turn spans, tool outcomes, \
+         channel and sweep activity. At the default `info` level a tool's full \
+         result is not logged, only its name, outcome and duration."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -239,5 +233,10 @@ mod tests {
             }
             Err(other) => panic!("unexpected error kind: {other}"),
         }
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&LogsTool);
     }
 }

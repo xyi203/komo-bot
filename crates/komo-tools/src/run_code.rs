@@ -74,13 +74,9 @@ impl Tool for RunCodeTool {
     }
 
     fn description(&self) -> &'static str {
-        "Run a Python program that can call komo's other tools through a `tools` \
-         object (`tools.read(path=\"a.txt\")`). Use it to do in one call what \
-         would otherwise take several rounds: loop over files, filter results, \
-         combine outputs. Every tool call inside the program is gated exactly as \
-         a direct call would be. `print(...)` reports progress and a top-level \
-         `return` answers; define helper functions freely — they live only for \
-         this program."
+        "Run a Python program that calls komo's other tools through a `tools` \
+         object (`tools.read(path=\"a.txt\")`). `print(...)` reports progress, a \
+         top-level `return` answers. Each call is gated exactly as a direct one."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -89,10 +85,9 @@ impl Tool for RunCodeTool {
             "properties": {
                 "source": {
                     "type": "string",
-                    "description": "The program body. Written as if inside a \
-                                    function: `return` answers, `print` reports. \
-                                    A failed tool call raises `ToolError` \
-                                    (`.tool`, `.message`), which you may catch.",
+                    "description": "The program body, written as if inside a \
+                                    function. A failed tool call raises \
+                                    `ToolError` (`.tool`, `.message`).",
                 }
             },
             "required": ["source"],
@@ -500,5 +495,14 @@ mod tests {
         let redacted = elide_source(&long);
         assert!(redacted.starts_with('读'));
         assert!(redacted.contains("bytes elided"));
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        let executor = komo_services::tool_execution::ToolExecutor::new(Default::default());
+        crate::test_support::assert_model_text_budget(&RunCodeTool::new(
+            Default::default(),
+            executor.downgrade(),
+        ));
     }
 }

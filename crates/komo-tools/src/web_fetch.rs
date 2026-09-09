@@ -111,10 +111,8 @@ impl Tool for WebFetchTool {
 
     fn description(&self) -> &'static str {
         "Fetch an http/https URL (GET) and return its content as markdown \
-         (default), plain text, or raw html. Optional request headers support \
-         authenticated JSON APIs (e.g. an X-Auth-Token). Read-only; images, PDFs \
-         and other binary content types are refused rather than returned as \
-         garbled text."
+         (default), plain text, or raw html. Read-only; binary content types are \
+         refused."
     }
 
     /// Read-only GET: safe to retry on an ambiguous transient failure.
@@ -147,14 +145,13 @@ impl Tool for WebFetchTool {
                 "headers": {
                     "type": "object",
                     "additionalProperties": { "type": "string" },
-                    "description": "Optional request headers (e.g. {\"X-Auth-Token\": \"…\"} for an authenticated API)."
+                    "description": "Optional request headers, e.g. an auth token for a JSON API."
                 },
                 "format": {
                     "type": "string",
                     "enum": ["markdown", "text", "html"],
-                    "description": "How to render an HTML page: `markdown` (default — keeps \
-                     headings, lists, code blocks and link targets), `text` (prose only), or \
-                     `html` (raw source). JSON and plain-text responses ignore this."
+                    "description": "How to render an HTML page; default `markdown`. JSON and \
+                     plain text ignore it."
                 }
             },
             "required": ["url"]
@@ -786,5 +783,10 @@ mod tests {
             serde_json::from_value::<FetchArgs>(json!({ "url": "https://x", "format": "pdf" }))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&WebFetchTool::new());
     }
 }

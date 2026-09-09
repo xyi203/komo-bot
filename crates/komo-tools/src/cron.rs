@@ -156,34 +156,10 @@ impl Tool for CronTool {
     }
 
     fn description(&self) -> &'static str {
-        "Manage the gateway's scheduled jobs — anything that happens on a clock, \
-         from a plain nudge to an unattended agent turn. \
-         action=\"list\" returns every job with its trigger, status, next run \
-         and last outcome; \
-         action=\"add\" creates one (requires `name` + `schedule` — a 5-field \
-         cron expression for recurring work or `@at YYYY-MM-DD HH:MM` for a \
-         one-shot, both in the user's local timezone, or `after` for a relative \
-         delay like \"45m\"; plus exactly one of `prompt` for \
-         an agent job — an unattended agent turn with your full tool set, \
-         optionally preloading `skills` — `command` \
-         (+ `args`/`workdir`/`timeout_secs`) for a fixed program, or `message` \
-         for text delivered verbatim with no work done); \
-         an agent job that must *do* something — control a device, write a file, \
-         run a command — also needs `grants` naming those actions, or every one \
-         of them is refused when it runs; \
-         action=\"disable\" / \"enable\" pauses and resumes a job by `name`; \
-         action=\"remove\" deletes it; action=\"run\" fires it once now. \
-         `notify` decides where each run's outcome goes — \"on_error\" for \
-         \"only tell me when it breaks\". \
-         A one-shot job completes after firing (status `done`) and stays listed \
-         with its output — do not remove it to \"clean up\", the row is the \
-         record of what ran. \
-         Jobs fire only while `komo gateway` runs, and each run's output is \
-         delivered to the user's home channel, not into this conversation. \
-         Creating or changing a job asks the user for approval. Use this for \
-         \"every morning summarize X\" / \"明早 8 点跑一次这个\" / \
-         \"提醒我下午3点开会\" (a `message` job); use `task` for one-off work \
-         with no clock."
+        "Manage the gateway's scheduled jobs. `add` takes `name`, a trigger \
+         (`schedule` or `after`) and exactly one of `prompt` / `command` / \
+         `message`; an agent job that acts also needs `grants`, or its side \
+         effects are refused when it runs."
     }
 
     /// These calls can park on an approval prompt, so they must outlast one.
@@ -202,28 +178,28 @@ impl Tool for CronTool {
                 },
                 "name": {
                     "type": "string",
-                    "description": "Job name — the unique key every action but `list` takes. Short and descriptive (e.g. \"morning-brief\"); no whitespace or `:` `/` `\\`."
+                    "description": "Unique job name, e.g. \"morning-brief\"; no whitespace and no `:` `/` `\\`."
                 },
                 "schedule": {
                     "type": "string",
-                    "description": "When the job fires (action=add), in the user's local timezone. Recurring: a 5-field cron expression, e.g. \"0 8 * * *\" for 8 AM daily or \"0 14 * * 5\" for Friday 2 PM. One-shot: \"@at YYYY-MM-DD HH:MM\", e.g. \"@at 2026-08-12 08:30\" — fires once, then the job completes (a past time is rejected)."
+                    "description": "When the job fires, in local time: a 5-field cron expression, or `@at YYYY-MM-DD HH:MM` for a one-shot."
                 },
                 "after": {
                     "type": "string",
-                    "description": "A relative delay instead of `schedule` (action=add): \"45s\", \"5m\", \"2h\", \"1d\". Becomes a one-shot job at that moment, rounded up to the next whole minute. Use it for \"20 分钟后提醒我\"; pick either `schedule` or `after`."
+                    "description": "A relative one-shot instead of `schedule`: \"45s\", \"5m\", \"2h\", \"1d\", rounded up to the next whole minute."
                 },
                 "message": {
                     "type": "string",
-                    "description": "Text the job delivers verbatim when it fires (action=add; pick prompt OR command OR message). No process and no agent turn runs — use it when delivering the words is the whole point, e.g. \"提醒我下午3点开会\". Anything that needs looking something up or doing something is a `prompt` job instead."
+                    "description": "Text the job delivers verbatim; no process and no agent turn runs (pick prompt OR command OR message)."
                 },
                 "notify": {
                     "type": "string",
                     "enum": ["always", "on_error", "never"],
-                    "description": "Where each run's outcome goes (action=add; default \"always\"). Use \"on_error\" when the user says something like \"只有出问题才告诉我\" / \"only ping me if it fails\" — a successful run then goes unreported and stays in the job's run history. \"never\" delivers nothing at all. A job that stops to ask for approval is delivered under every setting."
+                    "description": "Where each run's outcome goes (default \"always\"); \"on_error\" reports only failures."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "The instruction an agent-mode job runs each time it fires. Write it as a self-contained task — the turn has no conversation history (action=add; pick prompt OR command)."
+                    "description": "Self-contained instruction an agent job runs each time it fires — it has no conversation history."
                 },
                 "skills": {
                     "type": "array",
@@ -232,11 +208,11 @@ impl Tool for CronTool {
                 },
                 "workspace": {
                     "type": "string",
-                    "description": "Directory the agent job's file and shell tools are confined to (action=add, agent mode). Give it when the task is about a specific project or folder — without it the job works in the gateway's own workspace, which is usually not where the user's repo is. The path must already exist; it is checked when the job is created, not when it runs."
+                    "description": "Directory the agent job's file and shell tools are confined to; it must already exist."
                 },
                 "grants": {
                     "type": "array",
-                    "description": "Actions this agent job must be allowed to take when it runs with nobody watching (action=add, agent mode). Without a grant, every side-effecting call the job makes is refused at run time. Declare only what the task plainly needs — the user approves this list together with the job, and an unneeded entry is a permission they did not want to give. If you are unsure an action is needed, leave it out: a missing grant fails loudly at run time and the user is told, whereas an extra one is silent.",
+                    "description": "Actions the job may take when it runs unattended; anything not granted is refused. Declare only what it needs.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -248,11 +224,11 @@ impl Tool for CronTool {
                             "match": {
                                 "type": "string",
                                 "enum": ["exact", "prefix", "suffix", "contains", "any"],
-                                "description": "How `value` is compared against the action's target. Prefer the narrowest that works — `exact` where you know the target. `any` means the whole category and needs no `value`; use it only when the job genuinely cannot be pinned down."
+                                "description": "How `value` is compared to the action's target. Prefer the narrowest; `any` covers the category, no `value`."
                             },
                             "value": {
                                 "type": "string",
-                                "description": "The target: a command prefix for shell (\"git \"), a path prefix for file, a host for network, `domain.service` for homeassistant (\"climate.set_temperature\"), `server.tool` for mcp, the action name for wiki (\"refresh\" / \"rebuild\")."
+                                "description": "The target: a command prefix, a path prefix, a host, `domain.service`, `server.tool`, or a wiki action name."
                             },
                             "access": {
                                 "type": "string",
@@ -265,7 +241,7 @@ impl Tool for CronTool {
                 },
                 "command": {
                     "type": "string",
-                    "description": "Absolute path of the program a command-mode job runs (no shell, so no pipes/globs). Needs prominent approval — prefer an agent job unless the user named a script (action=add; pick prompt OR command)."
+                    "description": "Absolute path of the program a command job runs; no shell, so no pipes or globs."
                 },
                 "args": {
                     "type": "array",
@@ -278,7 +254,7 @@ impl Tool for CronTool {
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "Wall-clock budget for `command`; the process is killed past it (action=add, command mode; default 900)."
+                    "description": "Wall-clock budget in seconds for `command`; the process is killed past it (default 900)."
                 }
             },
             "required": ["action"]

@@ -44,11 +44,9 @@ impl Tool for SkillTool {
     }
 
     fn description(&self) -> &'static str {
-        "Discover, load, and install skills (reusable instruction playbooks). \
-         action=\"list\" returns available skills; action=\"view\" returns a \
-         named skill's full instructions, which you should then follow; \
-         action=\"install\" fetches a skill the user points you at (a git repo \
-         or a SKILL.md URL) and installs it after the operator approves."
+        "Skills are reusable instruction playbooks. `list` shows what is \
+         available, `view` returns one's full instructions for you to then \
+         follow, `install` adds one the user points you at."
     }
 
     /// These calls can park on an approval prompt, so they must outlast one.
@@ -71,9 +69,8 @@ impl Tool for SkillTool {
                 },
                 "source": {
                     "type": "string",
-                    "description": "Where to fetch the skill from (required for action=install): \
-                     `owner/repo`, `owner/repo/subpath`, a GitHub URL, any `*.git`/`git@` URL, \
-                     or a link straight to a raw SKILL.md."
+                    "description": "Where to fetch the skill from (action=install): \
+                     `owner/repo[/subpath]`, a git URL, or a raw SKILL.md link."
                 }
             },
             "required": ["action"]
@@ -376,5 +373,10 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&SkillTool::new(registry(), store("budget")));
     }
 }

@@ -66,10 +66,7 @@ impl Tool for AskUserTool {
 
     fn description(&self) -> &'static str {
         "Ask the user one clarifying question mid-task and wait for their answer. \
-         Use when a key parameter is ambiguous, the target of an action is unclear, \
-         or an irreversible action's intent is uncertain — BEFORE guessing. \
-         Do not use it for things you can safely infer or look up yourself. \
-         Budget: at most 2 questions per turn."
+         At most 2 questions per turn."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -78,7 +75,7 @@ impl Tool for AskUserTool {
             "properties": {
                 "question": {
                     "type": "string",
-                    "description": "The question to ask, in the user's language, specific enough to be answered in one message."
+                    "description": "The question to ask, in the user's language, answerable in one message."
                 },
                 "options": {
                     "type": "array",
@@ -324,5 +321,10 @@ mod tests {
             .unwrap();
         assert_eq!(out.text, NO_ANSWER);
         assert!(ctx.run.as_ref().unwrap().suspension().is_none());
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&AskUserTool::new());
     }
 }

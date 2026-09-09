@@ -536,3 +536,8 @@ fn oneline_flattens_and_caps_on_char_boundaries() {
     assert_eq!(oneline("a\n b  c", 40), "a b c");
     assert_eq!(oneline("日程日程日程", 3), "日程日…");
 }
+
+#[test]
+fn the_model_facing_text_stays_short() {
+    crate::test_support::assert_model_text_budget(&tool(true).0);
+}

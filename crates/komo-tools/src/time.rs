@@ -16,7 +16,7 @@ impl Tool for TimeTool {
     }
 
     fn description(&self) -> &'static str {
-        "Returns the current UTC date and time in RFC 3339 format."
+        "Current date and time, UTC, RFC 3339."
     }
 
     async fn call(&self, _input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
@@ -56,5 +56,10 @@ mod tests {
     async fn time_tool_returns_non_empty_string() {
         let out = TimeTool.call(Value::Null, &ctx()).await.unwrap();
         assert!(!out.text.is_empty());
+    }
+
+    #[test]
+    fn the_model_facing_text_stays_short() {
+        crate::test_support::assert_model_text_budget(&TimeTool);
     }
 }

@@ -161,11 +161,15 @@ same principal + private conversation
    `X-Komo-Workspace` 头之后被忽略，换目录 resume 不会静默改写文件根；要跨项目就在这条任务里
    显式 `/workspace add <path>`。这与 CONTEXT 里"Profile = 谁，Workspace = 哪里"两条正交轴一致：
    哪里干活由会话的身份或 turn 自己说，取决于它是不是一个任务。
-2. **system prompt 的 context 层保持 per process，不随 turn 的 workspace 变。** 缓存前缀的顺序是
-   tools → system → messages，system 一变，后面整段 history 的缓存全部失效。今天 context 层（项目
-   `AGENTS.md`）读的是进程 cwd，`system_prompt.rs` 文档里"stable within a session"这句已经不准，
-   要改成 per process。若某个 turn 需要带上它所在目录的项目指令，照 recall 记忆的做法作为
-   `MessageSource::Injected` 块放到该 turn 用户消息的**尾部**——新字节本来就在那里，对缓存零成本。
+2. **system prompt 的 context 层跟着会话走：任务会话按 `roots[0]` 渲染，无绑定会话按进程目录。**
+   缓存前缀的顺序是 tools → system → messages，system 一变后面整段 history 的缓存全部失效——所以
+   判据不是"每个 turn 都一样"，而是"在一条会话的生命期内不动"。任务会话首轮绑定 workspace 之后
+   `roots[0]` 再也不变，这一层对该会话逐字节稳定，同一目录下的多个任务还共享同一段渲染；home 和
+   渠道会话没有 roots，仍读进程 cwd（launchd 下就是 `~/.komo`），那也是它们唯一能说的工作目录。
+   只读 `roots[0]`：`/workspace add` 加宽的是工具能碰的范围，不是再塞一份项目指令。
+   不走"尾部 `MessageSource::Injected` 块"那条路——尾注入每轮重复花 token，而这段内容在任务内本来
+   就稳定，放前缀只付一次。真正 per session 的东西（artifacts 目录、召回记忆）依然挂尾部：它们每条
+   会话都不同，进 system 层就是给每条会话一份冷前缀。
 3. **D6 排在 compaction（turn-durability 第三批）之后上线。** 今天 TUI 一开是空会话，history 近零；
    合到 home session 后每个 turn 都背历史窗口，上限 `max_history_bytes = 256 KB`（约 64k token）。
    命中率不变——锚定窗口让 history 前缀每 6 轮左右才移一次，和今天的 Telegram 长会话一样——
@@ -538,7 +542,15 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   但语义改成「这条会话最早是从哪儿说的」；TUI 的 `resume_workspace` 和 api 的
   `bind_session_workspace` 都删了——一条 home session 会从不同目录的 TUI 进入，
   按建会话时那次锁定会悄悄改写后面每个 turn 的文件根。
-  system prompt 的 context 层文档改成 per process。
+  system prompt 的 context 层改成跟着会话走：`PreambleFn` 收这一轮的 `Session.roots`，
+  `SystemPromptBuilder::build(roots)` 有 roots 就按 `roots[0]` 渲染工作目录和项目指令文件，
+  没有才回落到 builder 上配置的进程目录（home、渠道、cron、delegate 都走回落）。
+  单条缓存的键因此带上了 root——两个都没有指令文件的目录 mtime 指纹一模一样，只有路径本身
+  分得开它们。验证：`a_bound_session_reads_its_own_root_and_an_unbound_one_the_process_root`、
+  `only_the_first_root_contributes_project_instructions`、
+  `alternating_tasks_never_inherit_each_others_instructions`、
+  `a_task_without_an_instruction_file_still_gets_its_own_directory_named`、
+  `the_system_prompt_is_built_from_the_sessions_roots`。
   验证：`every_private_surface_of_the_operator_is_one_conversation`（Telegram DM + 飞书 DM +
   TUI 读到的 id 是同一条，日志 seq 连续；飞书群落在另一条）、
   `a_boundary_moves_the_replay_without_ending_anything`（边界后模型只看到边界之后 +

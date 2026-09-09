@@ -279,7 +279,7 @@ fn llm_with(injections: TurnInjections) -> ProviderLlm {
         provider: Provider::OpenAi,
         default_effort: None,
         cache_family: None,
-        preamble: Arc::new(|| "you are komo".to_string()),
+        preamble: Arc::new(|_| "you are komo".to_string()),
         max_history_messages: 0,
         max_history_bytes: 0,
         injections,
@@ -345,6 +345,24 @@ async fn the_artifacts_directory_reaches_the_model_after_the_user_message() {
         !preamble.contains(&dir),
         "a per-session path must stay out of the cached prefix"
     );
+}
+
+/// The other half of that split: the project instruction file belongs to the
+/// task's workspace, which is fixed for the session's life — so it is built into
+/// the system prompt, and the session's roots are what the builder renders it
+/// from.
+#[tokio::test]
+async fn the_system_prompt_is_built_from_the_sessions_roots() {
+    let mut llm = llm_with(TurnInjections::default());
+    llm.preamble = Arc::new(|roots: &[String]| format!("roots: {roots:?}"));
+    let mut session = asked("改一下这个函数");
+    session.roots = vec!["/work/proj".to_string(), "/work/lib".to_string()];
+
+    let (preamble, _, _, _) = llm.assemble(&session).await.unwrap();
+    assert_eq!(preamble, r#"roots: ["/work/proj", "/work/lib"]"#);
+
+    let (unbound, _, _, _) = llm.assemble(&asked("你好")).await.unwrap();
+    assert_eq!(unbound, "roots: []", "an unbound session passes none");
 }
 
 /// A runtime that was not granted one is told nothing — an aux or delegate

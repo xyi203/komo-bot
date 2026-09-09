@@ -27,13 +27,18 @@ use komo_provider::{
     ToolSchema, Turn, UserBlock, Wire,
 };
 
-/// Produces the system prompt (preamble) on demand. Called once per user turn
-/// so the prompt is rebuilt per session rather than baked once at startup —
-/// the gateway is a long-lived process, so a baked prompt would freeze the
-/// volatile tier (date) at boot. The factory's output is day-precision, so it
-/// stays byte-identical across turns within a day (upstream prompt cache stays
-/// warm) and self-heals across midnight.
-pub type PreambleFn = Arc<dyn Fn() -> String + Send + Sync>;
+/// Produces the system prompt (preamble) on demand, for a turn on a session
+/// with these roots. Called once per user turn so the prompt is rebuilt per
+/// session rather than baked once at startup — the gateway is a long-lived
+/// process, so a baked prompt would freeze the volatile tier (date) at boot.
+/// The factory's output is day-precision, so it stays byte-identical across
+/// turns within a day (upstream prompt cache stays warm) and self-heals across
+/// midnight.
+///
+/// The roots are what make the context tier the *task's* rather than the
+/// gateway process's; they are fixed for a task session's whole life and empty
+/// for every other kind, so the prompt stays as cacheable as it was.
+pub type PreambleFn = Arc<dyn Fn(&[String]) -> String + Send + Sync>;
 
 /// What a runtime may add to the tail of a turn's user message.
 ///
@@ -428,8 +433,9 @@ impl ProviderLlm {
 
         // Rebuild the system prompt for this turn. It rides on the per-turn
         // request rather than on shared state, so concurrent sessions in the
-        // gateway stay independent.
-        let preamble = (self.preamble)();
+        // gateway stay independent. A task session's roots decide which
+        // project's instructions the context tier carries.
+        let preamble = (self.preamble)(&session.roots);
 
         // L1 is already in the file-backed preamble. L3 varies per turn and
         // rides on the user message to preserve the stable prompt prefix.

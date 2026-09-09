@@ -297,7 +297,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     // skills, or project context — rebuilt per turn like the main agent.
     let aux_config = model_config.aux_variant();
     let aux_builder = Arc::new(SystemPromptBuilder::new(&aux_config));
-    let aux_preamble: PreambleFn = Arc::new(move || aux_builder.build());
+    let aux_preamble: PreambleFn = Arc::new(move |roots| aux_builder.build(roots));
     // Aux/delegate sub-agents must not be fed the user's memory library — and
     // the aux agent never gets an aux of its own (no recursion).
     let aux_llm = build_llm(
@@ -589,7 +589,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
             .plugins_dir(plugins_dir.clone())
             .workspace_root(Some(root.clone())),
     );
-    let subagent_preamble: PreambleFn = Arc::new(move || subagent_builder.build());
+    let subagent_preamble: PreambleFn = Arc::new(move |roots| subagent_builder.build(roots));
     let subagent_llm = build_llm(
         model_config,
         Some(&subagent_tools),
@@ -661,10 +661,13 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     mounts.push(crate::pyhost::PluginMount::of(&tools));
 
     // Assemble the tiered system prompt: stable identity + tool-aware guidance
-    // (gated on the tools actually loaded) + skills catalog, then the workspace
-    // project-instruction file, then the day-precision volatile footer. Wrapped
-    // in a factory so `complete` rebuilds it per turn (per session) rather than
-    // freezing the date at process start — important for the long-lived gateway.
+    // (gated on the tools actually loaded) + skills catalog, then the project
+    // instruction file of the turn's own working directory, then the
+    // day-precision volatile footer. Wrapped in a factory so `complete` rebuilds
+    // it per turn (per session) rather than freezing the date at process start —
+    // important for the long-lived gateway. `workspace_root` is only the
+    // fallback: a task session renders that tier from its own bound root, which
+    // reaches the factory as the turn's `Session.roots`.
     let tool_names = tool_names_of(&tools);
     let main_note = skills_note_for(&tool_names);
     let prompt_builder = Arc::new(
@@ -686,7 +689,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
             // shared with whatever other agents read that directory.
             .global_instructions(),
     );
-    let preamble: PreambleFn = Arc::new(move || prompt_builder.build());
+    let preamble: PreambleFn = Arc::new(move |roots| prompt_builder.build(roots));
 
     // Hand the same tool instances to the LLM so the model can call them, plus
     // the memory enricher (main agent only): the memory store for recall
@@ -756,7 +759,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
             .plugins_dir(plugins_dir.clone())
             .workspace_root(Some(root.clone())),
     );
-    let cron_preamble: PreambleFn = Arc::new(move || cron_builder.build());
+    let cron_preamble: PreambleFn = Arc::new(move |roots| cron_builder.build(roots));
     // An unattended routine writes files too — a nightly report is the case
     // §5.16 is for — so it is told where they belong. No enricher: a sweep must
     // not be fed the user's memory library.

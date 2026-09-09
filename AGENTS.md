@@ -318,9 +318,12 @@ visible truncation), and **one instruction file
 per scope, first found wins** — machine-wide `~/.komo/AGENTS.md` else
 `~/.agents/AGENTS.md` (the latter under the real home, not `KOMO_HOME`, since
 other agents share it), plus project `AGENTS.md` else `CLAUDE.md` else
-`.cursorrules` from the working directory. Taking only the first match per scope
-is what keeps a `CLAUDE.md`→`AGENTS.md` symlink from being injected twice. All of
-them are head-capped and re-read on mtime change (no restart needed).
+`.cursorrules` from the **task session's bound workspace** (`Session.roots[0]`,
+passed to the builder per turn) — home and every other session with no roots
+render that tier from the gateway process's own directory instead, and `roots[1..]`
+(added with `/workspace add`) contribute nothing. Taking only the first match per
+scope is what keeps a `CLAUDE.md`→`AGENTS.md` symlink from being injected twice.
+All of them are head-capped and re-read on mtime change (no restart needed).
 
 Channels (`[channels.feishu|telegram|wechat]`): behavior keys in
 the table, credentials in `.env`. `allow_from` pre-trusts senders; everyone
@@ -437,7 +440,8 @@ call the same functions, which is what keeps validation from forking.
   A new provider is a base URL + auth mode, not new code.
 - `komo-bot`'s `llm` — `ProviderLlm` over that layer; `assemble` builds the tiered
   system prompt once per turn (stable tier incl. `~/.komo/USER.md` and the
-  machine-wide instruction file, then memory
+  machine-wide instruction file, then the context tier rendered from this
+  session's own `roots` — that is what `PreambleFn` takes — then memory
   prefix from `MemoryEnricher` — main agent only). `RoutingLlm` = cross-provider
   dispatch. Reasoning blocks are echoed back verbatim each round, which is what
   carries a reasoning model's chain of thought across a tool loop.

@@ -33,7 +33,7 @@ fn tmp(suffix: &str) -> PathBuf {
 fn minimal_prompt_has_identity_and_volatile_only() {
     let p = SystemPromptBuilder::new(&config())
         .home(tmp("minimal"))
-        .build();
+        .build(&[]);
     assert!(p.contains("You are Komo"));
     assert!(p.contains("Model: deepseek-chat"));
     assert!(p.contains("Provider: deepseek"));
@@ -47,7 +47,7 @@ fn tool_guidance_is_gated_on_loaded_tools() {
     let p = SystemPromptBuilder::new(&config())
         .home(tmp("gated"))
         .tools(vec!["memory".into(), "time".into()])
-        .build();
+        .build(&[]);
     assert!(p.contains("tmux ls")); // state guidance, via `memory`
     assert!(p.contains("`time` tool"));
     // `cron` wasn't loaded, so its scheduler-routing guidance stays out.
@@ -59,12 +59,12 @@ fn todo_guidance_appears_only_with_the_todo_tool() {
     let with = SystemPromptBuilder::new(&config())
         .home(tmp("todo_on"))
         .tools(vec!["todo".into()])
-        .build();
+        .build(&[]);
     assert!(with.contains("Skip it entirely for"));
     let without = SystemPromptBuilder::new(&config())
         .home(tmp("todo_off"))
         .tools(vec!["time".into()])
-        .build();
+        .build(&[]);
     assert!(!without.contains("Skip it entirely for"));
 }
 
@@ -73,12 +73,12 @@ fn tool_economy_guidance_requires_at_least_one_tool() {
     let with = SystemPromptBuilder::new(&config())
         .home(tmp("economy_on"))
         .tools(vec!["time".into()])
-        .build();
+        .build(&[]);
     assert!(with.contains("run concurrently"));
     // No tools loaded → no round-economy advice to give.
     let without = SystemPromptBuilder::new(&config())
         .home(tmp("economy_off"))
-        .build();
+        .build(&[]);
     assert!(!without.contains("run concurrently"));
 }
 
@@ -89,12 +89,12 @@ fn code_guidance_appears_only_with_run_code() {
     let with = SystemPromptBuilder::new(&config())
         .home(tmp("code_on"))
         .tools(vec!["run_code".into(), "read".into()])
-        .build();
+        .build(&[]);
     assert!(with.contains("reach for a program"), "{with}");
     let without = SystemPromptBuilder::new(&config())
         .home(tmp("code_off"))
         .tools(vec!["read".into()])
-        .build();
+        .build(&[]);
     assert!(!without.contains("reach for a program"));
 }
 
@@ -107,7 +107,7 @@ fn plugin_guidance_names_the_directory_and_needs_both_run_code_and_a_host() {
         .home(tmp("plugin_on"))
         .tools(vec!["run_code".into(), "write".into()])
         .plugins_dir(Some(PathBuf::from("/data/plugins")))
-        .build();
+        .build(&[]);
     assert!(with.contains("/data/plugins"), "{with}");
     assert!(with.contains("py__<name>"), "{with}");
 
@@ -115,7 +115,7 @@ fn plugin_guidance_names_the_directory_and_needs_both_run_code_and_a_host() {
     let hostless = SystemPromptBuilder::new(&config())
         .home(tmp("plugin_nohost"))
         .tools(vec!["run_code".into()])
-        .build();
+        .build(&[]);
     assert!(!hostless.contains("py__<name>"));
 
     // No `run_code`: this runtime cannot run a program at all.
@@ -123,7 +123,7 @@ fn plugin_guidance_names_the_directory_and_needs_both_run_code_and_a_host() {
         .home(tmp("plugin_nocode"))
         .tools(vec!["write".into()])
         .plugins_dir(Some(PathBuf::from("/data/plugins")))
-        .build();
+        .build(&[]);
     assert!(!codeless.contains("/data/plugins"));
 }
 
@@ -132,7 +132,7 @@ fn cron_guidance_appears_only_with_the_cron_tool() {
     let p = SystemPromptBuilder::new(&config())
         .home(tmp("cron"))
         .tools(vec!["cron".into()])
-        .build();
+        .build(&[]);
     assert!(p.contains("schedule work on a clock"));
 }
 
@@ -141,13 +141,13 @@ fn operations_manual_is_opt_in_and_stable_tier() {
     // Absent by default (aux/delegate builders).
     let p = SystemPromptBuilder::new(&config())
         .home(tmp("ops_off"))
-        .build();
+        .build(&[]);
     assert!(!p.contains("/wechat login"));
     // Present for the main agent, in the cacheable stable prefix.
     let p = SystemPromptBuilder::new(&config())
         .home(tmp("ops_on"))
         .operations_manual()
-        .build();
+        .build(&[]);
     let manual_at = p.find("/wechat login").expect("manual included");
     let date_at = p.find("Today's date is").unwrap();
     assert!(manual_at < date_at, "manual belongs to the stable prefix");
@@ -162,14 +162,14 @@ fn user_profile_is_opt_in_main_agent_only_and_stable_tier() {
     // Off by default (aux/reviewer builders) — profile stays out.
     let off = SystemPromptBuilder::new(&config())
         .home(home.clone())
-        .build();
+        .build(&[]);
     assert!(!off.contains("Ada"), "profile must be gated off by default");
 
     // On for the main agent: injected, labeled, and in the stable prefix.
     let on = SystemPromptBuilder::new(&config())
         .home(home)
         .user_profile()
-        .build();
+        .build(&[]);
     assert!(on.contains("Name: Ada. Prefers terse replies."));
     let profile_at = on.find("Ada").unwrap();
     let date_at = on.find("Today's date is").unwrap();
@@ -184,14 +184,14 @@ fn user_profile_absent_when_file_missing_or_empty() {
     let p = SystemPromptBuilder::new(&config())
         .home(home.clone())
         .user_profile()
-        .build();
+        .build(&[]);
     assert!(!p.contains("~/.komo/USER.md"), "no header when file absent");
     // Present but blank → still nothing injected (filtered on trim).
     std::fs::write(home.join("USER.md"), "\n  \n").unwrap();
     let p = SystemPromptBuilder::new(&config())
         .home(home)
         .user_profile()
-        .build();
+        .build(&[]);
     assert!(
         !p.contains("~/.komo/USER.md"),
         "no header for a blank profile"
@@ -207,7 +207,7 @@ fn global_instructions_are_opt_in_main_agent_only_and_stable_tier() {
     // Off by default (aux/reviewer builders).
     let off = SystemPromptBuilder::new(&config())
         .home(home.clone())
-        .build();
+        .build(&[]);
     assert!(
         !off.contains("Always answer in Chinese."),
         "global instructions must be gated off by default"
@@ -216,7 +216,7 @@ fn global_instructions_are_opt_in_main_agent_only_and_stable_tier() {
     let on = SystemPromptBuilder::new(&config())
         .home(home)
         .global_instructions_in(agents)
-        .build();
+        .build(&[]);
     assert!(on.contains("Always answer in Chinese."));
     assert!(on.contains("~/.agents/AGENTS.md"), "the block is labeled");
     let text_at = on.find("Always answer in Chinese.").unwrap();
@@ -236,7 +236,7 @@ fn komo_home_agents_file_outranks_the_shared_one() {
     let p = SystemPromptBuilder::new(&config())
         .home(home)
         .global_instructions_in(agents)
-        .build();
+        .build(&[]);
     assert!(p.contains("komo-specific rule."));
     assert!(!p.contains("shared rule."), "only the winner is injected");
     assert!(p.contains("~/.komo/AGENTS.md"));
@@ -254,7 +254,7 @@ fn workspace_agents_file_outranks_claude_md() {
     let p = SystemPromptBuilder::new(&config())
         .home(tmp("ctx_prec_home"))
         .workspace_root(Some(root))
-        .build();
+        .build(&[]);
     assert!(p.contains("canonical project rule."));
     assert!(!p.contains("stale copy."));
     assert!(p.contains("project instructions from `AGENTS.md`"));
@@ -279,7 +279,7 @@ fn machine_wide_and_project_instructions_both_land() {
         .home(home)
         .global_instructions_in(agents)
         .workspace_root(Some(root))
-        .build();
+        .build(&[]);
     let global_at = p.find("machine-wide rule.").expect("machine-wide block");
     let project_at = p.find("project rule.").expect("project block");
     assert!(global_at < project_at, "project instructions come last");
@@ -292,7 +292,7 @@ fn global_instructions_absent_when_file_missing_or_empty() {
     let p = SystemPromptBuilder::new(&config())
         .home(home.clone())
         .global_instructions_in(agents.clone())
-        .build();
+        .build(&[]);
     assert!(
         !p.contains("global agent instructions"),
         "no header when absent"
@@ -302,7 +302,7 @@ fn global_instructions_absent_when_file_missing_or_empty() {
     let p = SystemPromptBuilder::new(&config())
         .home(home)
         .global_instructions_in(agents)
-        .build();
+        .build(&[]);
     assert!(
         !p.contains("global agent instructions"),
         "no header when blank"
@@ -321,7 +321,7 @@ fn a_blank_higher_priority_file_falls_through() {
     let p = SystemPromptBuilder::new(&config())
         .home(home)
         .global_instructions_in(agents)
-        .build();
+        .build(&[]);
     assert!(p.contains("shared rule."));
     assert!(p.contains("~/.agents/AGENTS.md"));
 }
@@ -350,7 +350,7 @@ fn editing_global_instructions_busts_the_cache() {
     let builder = SystemPromptBuilder::new(&config())
         .home(tmp("global_cache_home"))
         .global_instructions_in(agents);
-    assert!(builder.build().contains("first"));
+    assert!(builder.build(&[]).contains("first"));
 
     std::fs::write(&path, "second").unwrap();
     // mtime is second-precision on some filesystems; move it explicitly so
@@ -359,7 +359,7 @@ fn editing_global_instructions_busts_the_cache() {
         .unwrap()
         .set_modified(SystemTime::now() + std::time::Duration::from_secs(2))
         .unwrap();
-    let rebuilt = builder.build();
+    let rebuilt = builder.build(&[]);
     assert!(rebuilt.contains("second"), "edit must be picked up");
     assert!(!rebuilt.contains("first"));
 }
@@ -368,7 +368,7 @@ fn editing_global_instructions_busts_the_cache() {
 fn stable_tier_precedes_volatile_tier() {
     let p = SystemPromptBuilder::new(&config())
         .home(tmp("order"))
-        .build();
+        .build(&[]);
     let identity_at = p.find("You are Komo").unwrap();
     let date_at = p.find("Today's date is").unwrap();
     assert!(
@@ -382,7 +382,7 @@ fn skills_note_lands_in_stable_tier() {
     let p = SystemPromptBuilder::new(&config())
         .home(tmp("skills"))
         .skills_note(Some("You have skills: foo, bar".into()))
-        .build();
+        .build(&[]);
     let note_at = p.find("You have skills").unwrap();
     let date_at = p.find("Today's date is").unwrap();
     assert!(
@@ -399,7 +399,7 @@ fn context_file_is_included_and_labeled() {
     let p = SystemPromptBuilder::new(&config())
         .home(home)
         .workspace_root(Some(root))
-        .build();
+        .build(&[]);
     assert!(p.contains("project instructions from `AGENTS.md`"));
     assert!(p.contains("Prefer bullet points."));
 }
@@ -413,18 +413,94 @@ fn workspace_root_is_named_even_without_an_instruction_file() {
     let p = SystemPromptBuilder::new(&config())
         .home(home)
         .workspace_root(Some(root.clone()))
-        .build();
+        .build(&[]);
     assert!(
         p.contains(&format!("Working directory: {}", root.display())),
         "prompt should name the workspace root: {p}"
     );
 }
 
+/// The whole point of the change: a task session carries its own project's
+/// instructions, not the gateway process's (under launchd, `~/.komo`).
+#[test]
+fn a_bound_session_reads_its_own_root_and_an_unbound_one_the_process_root() {
+    let process_root = tmp("bound_process");
+    let task_root = tmp("bound_task");
+    std::fs::write(process_root.join("AGENTS.md"), "gateway home rule.").unwrap();
+    std::fs::write(task_root.join("AGENTS.md"), "task project rule.").unwrap();
+    let builder = SystemPromptBuilder::new(&config())
+        .home(tmp("bound_home"))
+        .workspace_root(Some(process_root.clone()));
+
+    let bound = builder.build(&[task_root.display().to_string()]);
+    assert!(bound.contains("task project rule."), "{bound}");
+    assert!(!bound.contains("gateway home rule."));
+    assert!(bound.contains(&format!("Working directory: {}", task_root.display())));
+
+    let unbound = builder.build(&[]);
+    assert!(unbound.contains("gateway home rule."), "{unbound}");
+    assert!(!unbound.contains("task project rule."));
+}
+
+/// `/workspace add` widens what the tools may touch; it does not add a second
+/// project's instructions to the prompt.
+#[test]
+fn only_the_first_root_contributes_project_instructions() {
+    let first = tmp("roots_first");
+    let second = tmp("roots_second");
+    std::fs::write(first.join("AGENTS.md"), "first project rule.").unwrap();
+    std::fs::write(second.join("AGENTS.md"), "second project rule.").unwrap();
+    let p = SystemPromptBuilder::new(&config())
+        .home(tmp("roots_home"))
+        .build(&[first.display().to_string(), second.display().to_string()]);
+    assert!(p.contains("first project rule."));
+    assert!(!p.contains("second project rule."));
+    assert_eq!(p.matches("project instructions from").count(), 1);
+}
+
+/// One builder serves every session on its runtime, so the memoized render has
+/// to be keyed on the root as well as on the mtimes: alternating tasks must not
+/// hand each other their project's instructions.
+#[test]
+fn alternating_tasks_never_inherit_each_others_instructions() {
+    let a = tmp("alt_a");
+    let b = tmp("alt_b");
+    std::fs::write(a.join("AGENTS.md"), "rule of A.").unwrap();
+    std::fs::write(b.join("AGENTS.md"), "rule of B.").unwrap();
+    let builder = SystemPromptBuilder::new(&config()).home(tmp("alt_home"));
+    let for_task = |root: &PathBuf| builder.build(&[root.display().to_string()]);
+
+    assert!(for_task(&a).contains("rule of A."));
+    let second = for_task(&b);
+    assert!(second.contains("rule of B."), "{second}");
+    assert!(!second.contains("rule of A."));
+    let back = for_task(&a);
+    assert!(back.contains("rule of A."), "{back}");
+    assert!(!back.contains("rule of B."));
+}
+
+/// Two directories that both keep no instruction file have identical mtime
+/// fingerprints, so only the root itself tells the cached renders apart.
+#[test]
+fn a_task_without_an_instruction_file_still_gets_its_own_directory_named() {
+    let a = tmp("noinstr_a");
+    let b = tmp("noinstr_b");
+    let builder = SystemPromptBuilder::new(&config()).home(tmp("noinstr_home"));
+    assert!(
+        builder
+            .build(&[a.display().to_string()])
+            .contains(&format!("Working directory: {}", a.display()))
+    );
+    let second = builder.build(&[b.display().to_string()]);
+    assert!(second.contains(&format!("Working directory: {}", b.display())));
+    assert!(!second.contains(&format!("Working directory: {}", a.display())));
+}
+
 #[test]
 fn persona_override_replaces_builtin_identity() {
     let home = tmp("persona");
     std::fs::write(home.join("SOUL.md"), "You are Nyx, a terse oracle.").unwrap();
-    let p = SystemPromptBuilder::new(&config()).home(home).build();
+    let p = SystemPromptBuilder::new(&config()).home(home).build(&[]);
     assert!(p.contains("You are Nyx, a terse oracle."));
     assert!(!p.contains("You are Komo"));
 }
@@ -437,12 +513,12 @@ fn cached_prompt_picks_up_a_newly_created_context_file() {
         .home(home)
         .workspace_root(Some(root.clone()));
     // First build: no context file, so none is mentioned (this seeds cache).
-    let first = builder.build();
+    let first = builder.build(&[]);
     assert!(!first.contains("project instructions"));
     // Create one out-of-band — the mtime fingerprint (None→Some) must bust
     // the cache so the next build reflects it, no restart needed.
     std::fs::write(root.join("AGENTS.md"), "Be terse.").unwrap();
-    let second = builder.build();
+    let second = builder.build(&[]);
     assert!(second.contains("project instructions from `AGENTS.md`"));
     assert!(second.contains("Be terse."));
 }
@@ -454,19 +530,19 @@ fn l1_file_changes_apply_to_next_prompt_and_never_to_aux() {
     let builder = SystemPromptBuilder::new(&config())
         .home(home.clone())
         .memory();
-    assert!(!builder.build().contains("komo:memory:l1"));
+    assert!(!builder.build(&[]).contains("komo:memory:l1"));
     std::fs::write(&path, "默认用中文回答").unwrap();
-    assert!(builder.build().contains("默认用中文回答"));
+    assert!(builder.build(&[]).contains("默认用中文回答"));
     std::fs::write(&path, "使用 Rust 举例，先给结论").unwrap();
-    let updated = builder.build();
+    let updated = builder.build(&[]);
     assert!(updated.contains("使用 Rust 举例，先给结论"));
     assert!(!updated.contains("默认用中文回答"));
     let aux = SystemPromptBuilder::new(&config()).home(home.clone());
-    assert!(!aux.build().contains("使用 Rust 举例"));
+    assert!(!aux.build(&[]).contains("使用 Rust 举例"));
     std::fs::write(&path, "").unwrap();
-    assert!(!builder.build().contains("komo:memory:l1"));
+    assert!(!builder.build(&[]).contains("komo:memory:l1"));
     std::fs::remove_file(&path).unwrap();
-    assert!(!builder.build().contains("komo:memory:l1"));
+    assert!(!builder.build(&[]).contains("komo:memory:l1"));
 }
 
 #[test]
@@ -476,7 +552,7 @@ fn l1_file_limit_is_visible_and_unicode_safe() {
     let prompt = SystemPromptBuilder::new(&config())
         .home(home)
         .memory()
-        .build();
+        .build(&[]);
     assert!(prompt.contains(&"记".repeat(8_000)));
     assert!(!prompt.contains(&"记".repeat(8_001)));
     assert!(prompt.contains("[... truncated]"));

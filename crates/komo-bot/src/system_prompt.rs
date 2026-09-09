@@ -10,16 +10,19 @@
 //!     tool-aware behavioral guidance (only for tools that are actually
 //!     loaded), and the skills catalog. Re-read only when a source file's
 //!     mtime moves.
-//!   * **context**  — the project instruction file (`AGENTS.md`, else
-//!     `CLAUDE.md`, else `.cursorrules`) found in the working directory. Stable
-//!     **per process**, not per session: it is read from the process's own
-//!     working directory, and one conversation is now entered from wherever the
-//!     operator happens to be (docs/bot-runtime.md §2 D6). It deliberately does
-//!     not follow a turn's workspace — the cache prefix runs tools → system →
-//!     messages, so a system tier that moved every turn would invalidate the
-//!     whole history behind it. A turn that needs its own directory's
-//!     instructions gets them as an `Injected` block at the tail of its user
-//!     message, where the new bytes already are.
+//!   * **context**  — the working directory and the project instruction file
+//!     (`AGENTS.md`, else `CLAUDE.md`, else `.cursorrules`) found in it. It
+//!     follows the **task**, not the process: a task session binds its workspace
+//!     on its first turn and `roots[0]` never moves afterwards
+//!     (docs/bot-runtime.md §2 D6), so this tier is byte-identical for the whole
+//!     life of that session — and two tasks rooted in the same directory even
+//!     share the render. A session with no roots (home, a channel conversation,
+//!     cron, a delegation) is rendered from the gateway process's own directory,
+//!     which is the only working directory those have. That is what separates it
+//!     from genuinely per-session content — the artifacts directory, recalled
+//!     memory: those differ for *every* conversation, so putting them here would
+//!     hand each one a cold prefix (the cache prefix runs tools → system →
+//!     messages), and they ride at the tail of the user message instead.
 //!   * **volatile** — day-precision date, model, provider. The only part that
 //!     drifts, kept last so the stable+context prefix stays byte-identical and
 //!     upstream prompt caches stay warm.
@@ -289,8 +292,8 @@ fn default_agents_dir() -> PathBuf {
 /// let prompt = SystemPromptBuilder::new(&config)
 ///     .tools(tool_names)
 ///     .skills_note(skills_note)
-///     .workspace_root(Some(root))
-///     .build();
+///     .workspace_root(Some(process_cwd))
+///     .build(&session.roots);
 /// ```
 pub struct SystemPromptBuilder {
     tool_names: Vec<String>,
@@ -317,16 +320,19 @@ pub struct SystemPromptBuilder {
     model: String,
     provider: &'static str,
     home: PathBuf,
-    /// Memoized stable+context render, keyed on the mtimes of the files it reads
-    /// (`SOUL.md` + the project instruction files). The gateway is long-lived
-    /// and rebuilds the prompt every turn, but those files change rarely — so we
-    /// re-read them only when an mtime moves, keeping the per-turn hot path off
-    /// several blocking `std::fs` reads while still picking up an in-place edit.
+    /// Memoized stable+context render, keyed on the turn's working directory and
+    /// the mtimes of the files it reads (`SOUL.md` + the project instruction
+    /// files). The gateway is long-lived and rebuilds the prompt every turn, but
+    /// those files change rarely — so we re-read them only when an mtime moves,
+    /// keeping the per-turn hot path off several blocking `std::fs` reads while
+    /// still picking up an in-place edit.
     cache: Mutex<Option<StableCache>>,
 }
 
-/// The cached stable+context string and the file mtimes it was rendered from.
+/// The cached stable+context string, plus the working directory and the file
+/// mtimes it was rendered from.
 struct StableCache {
+    root: Option<PathBuf>,
     fingerprint: Vec<Option<SystemTime>>,
     stable_context: String,
 }
@@ -383,7 +389,9 @@ impl SystemPromptBuilder {
         self
     }
 
-    /// Working directory to scan for project instruction files (context tier).
+    /// Fallback working directory for the context tier: the gateway process's
+    /// own directory, used by every turn whose session is not bound to a task
+    /// workspace (home, channel conversations, cron, delegations).
     pub fn workspace_root(mut self, root: Option<PathBuf>) -> Self {
         self.workspace_root = root;
         self
@@ -545,11 +553,16 @@ impl SystemPromptBuilder {
         join(parts)
     }
 
-    /// Context tier: the workspace root, then the first project instruction file
-    /// found in it, head-truncated. Stable within a session, may differ
-    /// session-to-session.
-    fn context(&self) -> String {
-        let Some(root) = &self.workspace_root else {
+    /// Context tier: the working directory this turn runs in, then the first
+    /// project instruction file found in it, head-truncated.
+    ///
+    /// `root` is the task session's `roots[0]` when it has one, else the
+    /// process root — see the module docs for why following the task costs the
+    /// prompt cache nothing. Only `roots[0]`: a directory added later with
+    /// `/workspace add` widens what the tools may touch, it does not add a
+    /// second project's instructions to the prompt.
+    fn context(&self, root: Option<&Path>) -> String {
+        let Some(root) = root else {
             return String::new();
         };
         // Naming the directory is what lets a "found nothing" answer say *where*
@@ -586,7 +599,7 @@ impl SystemPromptBuilder {
     /// a cached render can be invalidated when any is edited, created, or
     /// removed. A missing file is `None` (creating it flips `None`→`Some`, so
     /// adding a higher-priority context file also busts the cache).
-    fn dependency_fingerprint(&self) -> Vec<Option<SystemTime>> {
+    fn dependency_fingerprint(&self, root: Option<&Path>) -> Vec<Option<SystemTime>> {
         fn mtime(path: &Path) -> Option<SystemTime> {
             std::fs::metadata(path).and_then(|m| m.modified()).ok()
         }
@@ -604,7 +617,7 @@ impl SystemPromptBuilder {
                 fp.push(mtime(&path));
             }
         }
-        if let Some(root) = &self.workspace_root {
+        if let Some(root) = root {
             for name in CONTEXT_FILES {
                 fp.push(mtime(&root.join(name)));
             }
@@ -612,18 +625,33 @@ impl SystemPromptBuilder {
         fp
     }
 
-    /// Assemble the three tiers into the final system prompt. The stable+context
-    /// prefix is memoized and re-rendered only when a source file's mtime moves;
-    /// the volatile tier (date/model/provider — no I/O) is rebuilt every call.
-    pub fn build(&self) -> String {
-        let fingerprint = self.dependency_fingerprint();
+    /// Assemble the three tiers into the final system prompt for a turn on a
+    /// session with these `roots`. The stable+context prefix is memoized and
+    /// re-rendered only when the root moves or a source file's mtime does; the
+    /// volatile tier (date/model/provider — no I/O) is rebuilt every call.
+    ///
+    /// One builder serves every session on its runtime, so the cache holds one
+    /// entry and consecutive turns on different tasks re-read a few small files.
+    /// The root is part of the key rather than left to the fingerprint: two
+    /// directories that keep no instruction file fingerprint identically, and
+    /// answering one task with the other's "Working directory:" line is exactly
+    /// the confusion this tier exists to prevent.
+    pub fn build(&self, roots: &[String]) -> String {
+        let root = roots
+            .first()
+            .map(PathBuf::from)
+            .or_else(|| self.workspace_root.clone());
+        let fingerprint = self.dependency_fingerprint(root.as_deref());
         let stable_context = {
             let mut cache = self.cache.lock().unwrap();
             match cache.as_ref() {
-                Some(c) if c.fingerprint == fingerprint => c.stable_context.clone(),
+                Some(c) if c.root == root && c.fingerprint == fingerprint => {
+                    c.stable_context.clone()
+                }
                 _ => {
-                    let rendered = join(vec![self.stable(), self.context()]);
+                    let rendered = join(vec![self.stable(), self.context(root.as_deref())]);
                     *cache = Some(StableCache {
+                        root: root.clone(),
                         fingerprint,
                         stable_context: rendered.clone(),
                     });

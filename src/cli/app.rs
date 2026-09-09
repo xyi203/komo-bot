@@ -25,11 +25,15 @@ enum Commands {
     /// Bootstrap ~/.komo: write a commented default config.toml and a .env
     /// credential template. Existing files are never overwritten.
     Init,
-    /// Start an interactive chat session (full-screen TUI; needs a terminal)
+    /// Start a new task session (full-screen TUI; needs a terminal). This is
+    /// what a bare `komo` does.
     Chat,
+    /// Open the home conversation: the operator's one ongoing daily thread,
+    /// shared with every private channel (full-screen TUI; needs a terminal)
+    Home,
     /// Resume an existing chat session (shortcut for `komo session resume`)
     Resume {
-        /// Session id; an API session may be given without its `api:` prefix
+        /// Session id (a UUID; `komo session list` prints them)
         id: String,
     },
     /// Run the always-on gateway: maintenance scheduler (and, later,
@@ -411,12 +415,12 @@ enum PairAction {
 
 #[derive(Subcommand)]
 enum SessionAction {
-    /// List stored sessions with creation time and message counts
+    /// List stored sessions with their title, creation time and message counts
     List,
     /// Resume an existing session: reopen the chat TUI bound to its id, so its
     /// history is loaded and the conversation continues where it left off
     Resume {
-        /// Session id (a bare UUID also resolves an API session)
+        /// Session id (a UUID; `komo session list` prints them)
         id: String,
     },
     /// Delete sessions that contain no messages
@@ -446,7 +450,8 @@ fn require_terminal() -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "`komo` (or `komo chat`) is a full-screen TUI and needs a terminal.\n\
+        "`komo` (and `komo chat` / `komo home` / `komo resume`) is a full-screen TUI \
+         and needs a terminal.\n\
          For scripted access, POST to the gateway's api channel instead \
          (`/v1/chat/completions`; address and key in ~/.komo/gateway.json)."
     )
@@ -460,11 +465,16 @@ pub async fn run() -> anyhow::Result<()> {
     // or a second instance).
     let config = komo_config::ConfigSnapshot::load();
     match cli.command {
-        // The interactive chat is komo's primary surface. Keep `chat` as an
-        // explicit, script-friendly spelling, but make a bare `komo` open it.
+        // One task is one session: a bare `komo` starts a new one, and `chat`
+        // is the explicit, script-friendly spelling of the same thing. The
+        // ongoing daily conversation is its own entry point.
         None | Some(Commands::Chat) => {
             require_terminal()?;
-            crate::tui::run().await
+            crate::tui::run_new().await
+        }
+        Some(Commands::Home) => {
+            require_terminal()?;
+            crate::tui::run_home().await
         }
         Some(Commands::Init) => init::run(),
         Some(Commands::Resume { id }) => {
@@ -716,9 +726,17 @@ mod tests {
     }
 
     #[test]
-    fn bare_command_defaults_to_chat() {
+    fn bare_command_defaults_to_a_new_task_session() {
         let cli = Cli::try_parse_from(["komo"]).expect("bare komo should parse");
         assert!(cli.command.is_none());
+    }
+
+    /// The home conversation has its own entry point now that a bare `komo`
+    /// opens a task session instead.
+    #[test]
+    fn home_is_its_own_command() {
+        let cli = Cli::try_parse_from(["komo", "home"]).expect("komo home should parse");
+        assert!(matches!(cli.command, Some(Commands::Home)));
     }
 
     #[test]
@@ -740,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn session_resume_also_parses_a_bare_api_session_id() {
+    fn session_resume_also_parses_a_bare_session_id() {
         assert!(
             Cli::try_parse_from([
                 "komo",

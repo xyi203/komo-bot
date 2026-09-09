@@ -127,6 +127,10 @@ pub enum Action {
 
 pub struct App {
     pub session_id: String,
+    /// What this sitting is, rendered in the identity row: `home`, or a task
+    /// and the directory it runs in. Empty until the boot task lands — which
+    /// conversation this is is not known before then on every entry point.
+    pub session_label: String,
     pub entries: Vec<Entry>,
     pub input: String,
     /// Cursor as a char index into `input`.
@@ -183,6 +187,7 @@ impl App {
     pub fn new(session_id: String) -> Self {
         Self {
             session_id,
+            session_label: String::new(),
             entries: Vec::new(),
             input: String::new(),
             cursor: 0,

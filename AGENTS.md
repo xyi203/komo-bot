@@ -15,7 +15,8 @@ cargo test --workspace             # REQUIRED: bare `cargo test` skips komo-core
 cargo test tools::time             # single module
 
 komo init                          # scaffold ~/.komo (config.toml/.env/SOUL.md/USER.md; never overwrites)
-cargo run -- chat                  # full-screen TUI (needs a terminal; scripts use the api channel)
+cargo run -- chat                  # full-screen TUI on a NEW task session (bare `komo` does the same)
+komo home                          # the TUI on the ongoing home conversation instead
 cargo run -- gateway               # always-on process: sweeps + channels (feishu/telegram/wechat)
 komo gateway start|stop|restart|status   # macOS launchd supervision
 komo upgrade [--no-restart]        # git pull --ff-only + cargo install + restart gateway
@@ -959,12 +960,17 @@ call the same functions, which is what keeps validation from forking.
   identical fields.
 - `tui/` — ratatui chat front end, a pure gateway client (`GatewayClient`; there
   is no in-process backend); state +
-  key handling terminal-free in `tui/app.rs`. `komo chat` opens the operator's
-  **home conversation** — not a fresh id per launch — so closing the terminal
-  and reopening it continues the same thread the morning's Telegram DM is in.
-  `komo resume <id>` (or the compatible `komo session resume <id>`) is what
-  opens some *other* session by its UUID: a correspondent's, or an old one being
-  looked into. A turn's workspace is the **process's** startup directory, not
+  key handling terminal-free in `tui/app.rs`. **One task is one session**: a bare
+  `komo` (and its explicit spelling `komo chat`) opens a *new* one, minting the
+  uuid locally and leaving the row to the first turn — a conversation nobody has
+  spoken in should not have one, which is what the desktop app already does.
+  `komo home` is the other entry point: the operator's one ongoing **home
+  conversation**, so the thread the morning's Telegram DM is in continues here.
+  `komo resume <id>` (or the compatible `komo session resume <id>`) opens a
+  stored session by its UUID — the task from yesterday, a correspondent's, or an
+  old one being looked into; the id is printed on the way out of every sitting.
+  The identity row says which of the three this is (`home`, or `任务 · <dir>`).
+  A turn's workspace is the **process's** startup directory, not
   the session's: one conversation is entered from wherever the operator is
   standing, so `Session.workspace` is descriptive only (the log manifest and the
   session list read it) and nothing rewrites a turn's tool root from it. Input:

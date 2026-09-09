@@ -109,19 +109,25 @@ fn open_gateway_log() -> Option<tracing_appender::rolling::RollingFileAppender> 
         .ok()
 }
 
-/// Whether this invocation will run the full-screen chat TUI (`komo` / `komo chat` /
-/// `komo resume` / `komo session resume` on a TTY — off a TTY they error out early instead;
-/// see `cli/app.rs::require_terminal`) — checked here because the tracing
-/// writer must be chosen before the CLI parses.
+/// Whether this invocation will run the full-screen chat TUI (on a TTY — off a
+/// TTY it errors out early instead; see `cli/app.rs::require_terminal`) —
+/// checked here because the tracing writer must be chosen before the CLI parses.
 fn will_run_tui() -> bool {
     use std::io::IsTerminal;
     let args: Vec<String> = std::env::args().collect();
-    let sub = args.get(1).map(String::as_str);
-    let is_chat = sub.is_none()
-        || sub == Some("chat")
-        || sub == Some("resume")
-        || (sub == Some("session") && args.get(2).map(String::as_str) == Some("resume"));
-    is_chat && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    opens_tui(
+        args.get(1).map(String::as_str),
+        args.get(2).map(String::as_str),
+    ) && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+}
+
+/// Which subcommands open the TUI: a bare `komo` (a new task session),
+/// `komo chat`, `komo home`, `komo resume` and `komo session resume`. Must stay
+/// in sync with the `require_terminal()` call sites in `cli/app.rs`.
+fn opens_tui(sub: Option<&str>, next: Option<&str>) -> bool {
+    matches!(sub, None | Some("chat") | Some("home") | Some("resume"))
+        || (sub == Some("session") && next == Some("resume"))
 }
 
 /// Append-mode log file for TUI sessions (`~/.komo/logs/chat-tui.log`).
@@ -138,4 +144,27 @@ fn open_tui_log() -> Option<std::fs::File> {
     // agent can read them mid-conversation without guessing at a filename.
     komo_infra::logs::set_active(path);
     Some(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::opens_tui;
+
+    #[test]
+    fn every_tui_entry_point_picks_the_file_writer() {
+        assert!(opens_tui(None, None));
+        assert!(opens_tui(Some("chat"), None));
+        assert!(opens_tui(Some("home"), None));
+        assert!(opens_tui(
+            Some("resume"),
+            Some("019fad15-8199-7461-9d48-0a6c779f1c8d")
+        ));
+        assert!(opens_tui(Some("session"), Some("resume")));
+    }
+
+    #[test]
+    fn other_commands_keep_logging_to_stderr() {
+        assert!(!opens_tui(Some("gateway"), None));
+        assert!(!opens_tui(Some("session"), Some("list")));
+    }
 }

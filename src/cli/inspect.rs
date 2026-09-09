@@ -443,8 +443,14 @@ pub async fn session_list(control: &OperatorControl) -> anyhow::Result<()> {
             .as_ref()
             .map(|awaiting| format!("  ⏸ {}", awaiting.label(now)))
             .unwrap_or_default();
+        // The title is what tells two task sessions apart; a session too young
+        // to have one prints none rather than an empty column.
+        let title = match s.title.trim() {
+            "" => String::new(),
+            title => format!("  {title}"),
+        };
         println!(
-            "{}  created {}  {} messages ({} user turns){waiting}",
+            "{}{title}  created {}  {} messages ({} user turns){waiting}",
             s.id,
             local_time(s.created_at),
             s.messages,

@@ -1,5 +1,7 @@
-//! Full-screen chat TUI — `komo chat`'s interface (a terminal is required;
-//! scripted access goes through the gateway's api channel instead). A ratatui
+//! Full-screen chat TUI — the interface of a bare `komo` (a new task session),
+//! `komo home` (the daily conversation) and `komo resume <id>`; a terminal is
+//! required, and scripted access goes through the gateway's api channel
+//! instead. A ratatui
 //! front end over the **gateway**, which is the only process that opens komo's
 //! state: turns run server-side over
 //! [`GatewayClient::chat_streaming`] (trusted loopback, so a side-effecting
@@ -101,8 +103,11 @@ impl Backend {
 /// it needs the terminal, so the paint must not wait for it.
 struct Boot {
     backend: Backend,
-    /// The session to drive: the home conversation, or the resolved one on resume.
+    /// The session to drive: a fresh task id, the home conversation, or the
+    /// resolved one on resume.
     session: String,
+    /// What this sitting is, for the identity row — see [`task_label`].
+    label: String,
     /// The resumed transcript; empty for a fresh session.
     history: Vec<Message>,
     /// Where this TUI's turns run: the directory it was started in, always.
@@ -117,15 +122,44 @@ struct Boot {
 
 type BootTask = tokio::task::JoinHandle<anyhow::Result<Boot>>;
 
-/// Start the TUI on the operator's **home conversation**: paint immediately, and
-/// connect in the background.
+/// Start the TUI on a **new task session** (a bare `komo`, or `komo chat`):
+/// paint immediately, and connect in the background.
 ///
-/// Not a fresh session id per launch. One principal writing privately is one
-/// conversation whichever surface they picked up (docs/bot-runtime.md §2 D6),
-/// so closing the terminal and reopening it continues where the Telegram DM at
-/// lunch left off. `komo resume <id>` is what opens some *other* session — a
-/// correspondent's, or an old one being looked into.
-pub async fn run() -> anyhow::Result<()> {
+/// One task is one session, so every launch is its own id — minted here rather
+/// than asked of the gateway, exactly as the desktop app does it. No row is
+/// created for it: a conversation nobody has spoken in should not have one, and
+/// the first turn's `open_session` writes it. Continuing this task later is
+/// explicit (`komo resume <id>`, printed on the way out).
+pub async fn run_new() -> anyhow::Result<()> {
+    let workspace = startup_workspace()?;
+    let session = uuid::Uuid::now_v7().to_string();
+    let boot: BootTask = tokio::spawn({
+        let workspace = workspace.clone();
+        let session = session.clone();
+        async move {
+            let backend = connect(&workspace).await?;
+            let label = task_label(&workspace);
+            Ok(Boot {
+                backend,
+                session,
+                label,
+                history: Vec::new(),
+                workspace,
+                awaiting: None,
+            })
+        }
+    });
+    drive(boot, session, workspace).await
+}
+
+/// Start the TUI on the operator's **home conversation** (`komo home`): the
+/// daily thread, entered explicitly.
+///
+/// One principal writing privately is one conversation whichever surface they
+/// picked up (docs/bot-runtime.md §2 D6), so this continues where the Telegram
+/// DM at lunch left off. It is not the launch default: work belongs in a task
+/// session of its own.
+pub async fn run_home() -> anyhow::Result<()> {
     let workspace = startup_workspace()?;
     let boot: BootTask = tokio::spawn({
         let workspace = workspace.clone();
@@ -140,6 +174,7 @@ pub async fn run() -> anyhow::Result<()> {
             Ok(Boot {
                 backend,
                 session,
+                label: HOME_LABEL.to_string(),
                 history,
                 workspace,
                 awaiting,
@@ -165,9 +200,19 @@ pub async fn resume(id: &str) -> anyhow::Result<()> {
             let session = resolve_resume_id(&backend, &id).await?;
             let history = backend.gateway.session_messages(&session).await?;
             let awaiting = resume_awaiting(&backend, &session).await?;
+            // Which of the two a resumed id is cannot be told from the id, and
+            // the home conversation reached this way is still the home
+            // conversation.
+            let home = backend.gateway.home_session().await? == session;
+            let label = if home {
+                HOME_LABEL.to_string()
+            } else {
+                task_label(&fallback)
+            };
             Ok(Boot {
                 backend,
                 session,
+                label,
                 history,
                 workspace: fallback,
                 awaiting,
@@ -304,11 +349,11 @@ async fn event_loop(
     app.push(
         Role::Info,
         if app.session_id.is_empty() {
-            // `komo chat` opens the home conversation, whose id only the store
+            // `komo home` opens the home conversation, whose id only the store
             // knows — it lands with the backend a moment from now.
             format!("Komo v0.1 — opening…\nworkspace: `{}`", workspace.display())
         } else {
-            format!("Komo v0.1 — resuming `{}`…", app.session_id)
+            format!("Komo v0.1 — opening `{}`…", app.session_id)
         },
     );
 
@@ -353,6 +398,7 @@ async fn event_loop(
                 let ready = booted.map_err(anyhow::Error::from).and_then(|r| r)?;
                 app.connecting = false;
                 app.session_id = ready.session;
+                app.session_label = ready.label;
                 workspace = ready.workspace;
                 app.awaiting = ready.awaiting;
                 tail.seen = ready.history.len();
@@ -698,6 +744,22 @@ fn classify_end(outcome: anyhow::Result<String>) -> TurnEnd {
         Err(error) if is_suspended(&error) => TurnEnd::Waiting,
         Err(error) => TurnEnd::Failed(format!("{error:#}")),
     }
+}
+
+/// The identity row's name for the home conversation. A task says which
+/// directory it is working in instead; home has none — it is entered from
+/// wherever the operator is standing and is about no directory in particular.
+const HOME_LABEL: &str = "home";
+
+/// The identity row's name for a task session: the directory its turns run in,
+/// which is the only thing that distinguishes one task window from another
+/// before either has said anything.
+fn task_label(workspace: &Path) -> String {
+    let name = workspace
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| workspace.display().to_string());
+    format!("任务 · {name}")
 }
 
 /// Snapshot the TUI's startup folder once, so later `cd`s in child shells

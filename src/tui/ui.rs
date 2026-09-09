@@ -59,8 +59,10 @@ pub fn render(frame: &mut Frame, app: &App) {
 }
 
 /// A quiet identity row keeps the session visible without repeating its full
-/// UUID below every activity update. The compact form leaves the conversation
-/// as the visual focus while still making screenshots/debug reports useful.
+/// UUID below every activity update, and says **which** conversation this is —
+/// the home thread, or a task and the directory it runs in. The compact form
+/// leaves the conversation as the visual focus while still making
+/// screenshots/debug reports useful.
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
     let [brand_area, session_area] =
         Layout::horizontal([Constraint::Min(1), Constraint::Length(18)]).areas(area);
@@ -70,19 +72,14 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
                 " KOMO",
                 Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  chat", Style::new().fg(Color::DarkGray)),
+            Span::styled(
+                format!("  {}", app.session_label),
+                Style::new().fg(Color::DarkGray),
+            ),
         ])),
         brand_area,
     );
-    let short_id: String = app
-        .session_id
-        .chars()
-        .rev()
-        .take(8)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect();
+    let short_id: String = app.session_id.chars().take(8).collect();
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("session · {short_id} "),
@@ -734,6 +731,26 @@ mod tests {
         let content = format!("{:?}", terminal.backend().buffer());
         assert!(content.contains("rm -rf"), "modal summary rendered");
         assert!(content.contains("拒绝"), "modal key hints rendered");
+    }
+
+    /// The identity row names the conversation: `home`, or the task's own
+    /// directory — a screenful of transcript looks the same either way.
+    #[test]
+    fn the_header_says_which_conversation_this_is() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new("019fad15-8199-7461-9d48-0a6c779f1c8d".into());
+        app.session_label = "任务 · komo-bot".into();
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("任务 · komo-bot"), "task label rendered");
+        assert!(content.contains("019fad15"), "session prefix rendered");
+
+        app.session_label = "home".into();
+        terminal.draw(|f| render(f, &app)).unwrap();
+        let content = format!("{:?}", terminal.backend().buffer());
+        assert!(content.contains("home"), "home label rendered");
     }
 
     /// Full render path with a folded paste in the composer: the label shows, the

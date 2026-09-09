@@ -138,7 +138,10 @@ same principal + private conversation
   今天的 `find_by_peer` 只服务这一类。
 - transport peer **不决定 session identity**，只负责消息来源和回复目的地。回复回到消息来的那个 peer，
   即使 turn 是在另一个入口的上下文里跑的。
-- TUI 启动默认进入 home session；`komo resume <id>` 保留给 correspondent session 和历史排查。
+- TUI 通过 `komo home` **显式**进入 home session；裸 `komo`（`komo chat`）开的是一条新的
+  **任务 session**，`komo resume <id>` 继续某条已有 session（昨天的任务、correspondent、历史排查）。
+  任务 session 不走上面这条「私有对话 ⇒ home」的路由：它不是某个 peer 发来的消息，而是操作者
+  显式为一件事开的会话，id 由客户端本地铸出，行照旧由第一个 turn 建。
 - `/new` 保留，语义是**显式的 context boundary**：之后默认不携带 boundary 之前的 conversational
   working context。durable task / memory / grants / 挂起中的 turn 是否失效，由**各自的生命周期规则**
   决定，`/new` 不碰它们。它不再是"大清理按钮"——把 Conversation、Task、Policy 三种生命周期重新
@@ -504,8 +507,8 @@ Grok 在 `automation_write` surface 上也走同一审批（agent 改 routine �
   `setting_records` 一行 `home_session`，首次需要时铸一个 uuid；session 行照旧由第一个 turn 建，
   没人说过话的会话不该先有行），否则 `find_by_peer` 一 correspondent 一条。飞书 `p2p`、
   Telegram `private`、微信（本来就只有 DM）各自把 `private` 报上来。
-  TUI 启动读同一个 id（本地直接读库，远端走 `GET /api/home-session`），
-  `komo resume <id>` 留给 correspondent session 和历史排查。
+  TUI 的 `komo home` 读同一个 id（走 `GET /api/home-session`）；裸 `komo` 不读它，
+  自己铸一个 uuid 开新任务 session，`komo resume <id>` 继续已有的。
   **`/new` 写 `conversation/boundary`**（`SessionEventKind` 加一个 required 变体），
   `SessionRepository::rotate` 连同它的实现和测试一起删掉——没有第二个调用者了。
   边界只改一件事：`SurfaceProjection::replayed()`。`messages()` 仍是整条 transcript

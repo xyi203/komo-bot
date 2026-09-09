@@ -1,12 +1,19 @@
 import { describe, expect, it } from "vitest";
 
 import type { WorkspaceInfo } from "@/shared/types";
-import { decodeFolderPath, workspaceLabel, workspacePath } from "./workspace";
+import {
+  decodeFolderPath,
+  encodeFolder,
+  rootLabel,
+  workspaceIdForRoot,
+  workspaceLabel,
+  workspacePath,
+} from "./workspace";
 
 const catalog: WorkspaceInfo[] = [{ id: "__default__", name: ".komo", path: "/Users/x/.komo" }];
 
-// base64url of "/Users/xyi/01-code/komo-bot" — the shape the composer's
-// `encodeFolder` produces and the gateway stores on a session.
+// base64url of "/Users/xyi/01-code/komo-bot" — the shape `encodeFolder`
+// produces and the composer sends in `X-Komo-Workspace`.
 const AGENT = "folder:L1VzZXJzL3h5aS8wMS1jb2RlL2tvbW8tYm90";
 
 describe("decodeFolderPath", () => {
@@ -62,5 +69,33 @@ describe("workspacePath", () => {
 
   it("is null for a catalog id this client has not loaded", () => {
     expect(workspacePath("notes", [])).toBeNull();
+  });
+});
+
+describe("encodeFolder", () => {
+  it("round-trips a path through the folder id", () => {
+    expect(encodeFolder("/Users/xyi/01-code/komo-bot")).toBe(AGENT);
+    expect(decodeFolderPath(encodeFolder("/Users/xyi/文档"))).toBe("/Users/xyi/文档");
+  });
+});
+
+describe("rootLabel", () => {
+  it("prefers the catalog name for that directory", () => {
+    expect(rootLabel("/Users/x/.komo", catalog)).toBe(".komo");
+  });
+
+  it("names an unlisted directory by its last segment", () => {
+    expect(rootLabel("/Users/xyi/01-code/komo-bot", catalog)).toBe("komo-bot");
+    expect(rootLabel("/Users/xyi/01-code/komo-bot/", catalog)).toBe("komo-bot");
+  });
+});
+
+describe("workspaceIdForRoot", () => {
+  it("uses the catalog id when the directory is one the gateway lists", () => {
+    expect(workspaceIdForRoot("/Users/x/.komo", catalog)).toBe("__default__");
+  });
+
+  it("encodes an unlisted directory as a folder id", () => {
+    expect(workspaceIdForRoot("/Users/xyi/01-code/komo-bot", catalog)).toBe(AGENT);
   });
 });

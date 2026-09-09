@@ -2,25 +2,12 @@ import { FolderIcon } from "lucide-react";
 
 import { getFolderPicker } from "@/shared/api/runtime";
 import { useAppStore } from "@/shared/store";
-import { workspaceLabel, workspacePath } from "@/shared/lib/workspace";
+import { encodeFolder, workspaceLabel, workspacePath } from "@/shared/lib/workspace";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/select";
 import { useWorkspaceCatalog } from "./use-catalog";
 
 /** Sentinel value for the "pick a folder" row — never a workspace id. */
 const CHOOSE_FOLDER = "__choose_folder__";
-
-/** Encode an absolute path as an opaque `folder:` workspace id.
- *
- *  The gateway resolves catalog ids by name and only decodes this form for a
- *  loopback caller (`resolve_folder_workspace` in infra/messaging/api.rs).
- *  base64url is what makes an arbitrary Unicode path safe to carry in the
- *  ASCII-only `X-Komo-Workspace` header. */
-export function encodeFolder(path: string): string {
-  const bytes = new TextEncoder().encode(path);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return `folder:${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "")}`;
-}
 
 export function WorkspacePicker({
   workspace,
@@ -31,8 +18,8 @@ export function WorkspacePicker({
   onWorkspaceChange: (workspace: string) => void;
   /** The conversation has started, so its workspace is fixed. Renders the choice
    *  as a static label rather than a disabled control: the gateway binds a
-   *  session's workspace at creation and ignores every later request, so an
-   *  interactive-looking picker here would promise something it can't do. */
+   *  session's roots on its first turn and ignores the header from then on, so
+   *  an interactive-looking picker here would promise something it can't do. */
   locked?: boolean;
 }) {
   const addWorkspace = useAppStore((s) => s.addWorkspace);

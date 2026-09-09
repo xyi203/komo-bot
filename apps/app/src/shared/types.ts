@@ -77,8 +77,11 @@ export interface SessionMessage {
 
 export interface SessionSummary {
   id: string;
-  /** Immutable workspace id selected when the session was created. */
-  workspace?: string;
+  /** Canonical absolute directories this session is bound to, `roots[0]` first.
+   *  Empty (or absent, from a gateway older than the field) = no binding: the
+   *  home session, a chat channel's session, a remote caller's. The gateway
+   *  binds them on the session's first turn and ignores the header after. */
+  roots?: string[];
   created_at: number;
   messages: number;
   user_turns: number;
@@ -86,7 +89,7 @@ export interface SessionSummary {
   /** "active" | "archive" (deleted sessions are omitted from the list). */
   status?: string;
   /** Model this session last ran on; empty/absent = the gateway default. Unlike
-   *  `workspace` this is switchable mid-conversation. */
+   *  `roots` this is switchable mid-conversation. */
   model?: string;
   /** Reasoning effort; empty/absent = the provider default. */
   effort?: string;

@@ -3,8 +3,9 @@
 //
 // Reopening the UI returns to the same conversation. A workspace is chosen while
 // the conversation is still empty and then travels with that session forever
-// (the gateway locks it in when the session row is created). The model is
-// switchable at any time, so it is tracked per session and sent with every turn.
+// (the gateway binds it on the session's first turn and ignores the header from
+// then on). The model is switchable at any time, so it is tracked per session
+// and sent with every turn.
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
@@ -38,7 +39,8 @@ export interface AppStore {
   openSession: (id: string, workspace: string) => void;
   startNewSession: () => void;
   /** Rebind the active (still empty) session's workspace. The composer only
-   *  offers this before the first message; the gateway is the real lock. */
+   *  offers this before the first message; the gateway's first turn is the real
+   *  lock. */
   setWorkspace: (id: string) => void;
   addWorkspace: (workspace: WorkspaceInfo) => void;
   setModelChoice: (session: string, choice: ModelChoice) => void;

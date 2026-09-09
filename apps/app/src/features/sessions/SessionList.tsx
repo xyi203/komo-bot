@@ -6,6 +6,7 @@ import {
   ChevronLeftIcon,
   ChevronRightIcon,
   FolderIcon,
+  HouseIcon,
   LeafIcon,
   PencilIcon,
   PlusIcon,
@@ -18,6 +19,7 @@ import { qk } from "@/shared/api/query-keys";
 import { useConnection } from "@/shared/api/use-connection";
 import { POLL } from "@/shared/config";
 import { fmtTs } from "@/shared/lib/format";
+import { DEFAULT_WORKSPACE, workspaceIdForRoot } from "@/shared/lib/workspace";
 import { cn } from "@/shared/lib/utils";
 import { useAppStore, useSession } from "@/shared/store";
 import type { SessionSummary } from "@/shared/types";
@@ -26,12 +28,17 @@ import { IconButton } from "@/shared/ui/icon-button";
 import { Input } from "@/shared/ui/input";
 import { KomoLogo } from "@/shared/ui/komo-logo";
 import { Popover, PopoverContent, PopoverTitle, PopoverTrigger } from "@/shared/ui/popover";
-import { fetchSessions, renameSession, setSessionStatus } from "./api";
-import { DEFAULT_WORKSPACE, groupByWorkspace } from "./grouping";
+import { fetchHomeSession, fetchSessions, renameSession, setSessionStatus } from "./api";
+import { groupByWorkspace } from "./grouping";
 import { sessionLabel } from "./labels";
 import { useWorkspaceCatalog } from "@/features/workspaces/use-catalog";
 
 const ROW = "group flex w-full items-center rounded-md px-2.5 py-1.5 transition-colors";
+
+const rowTint = (isOpen: boolean) =>
+  isOpen
+    ? "bg-primary/10 ring-1 ring-primary/20"
+    : "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground";
 
 export function SessionList({
   mobileOpen,
@@ -65,6 +72,12 @@ export function SessionList({
     enabled: connected,
   });
   const sessions = query.data ?? [];
+  const home = useQuery({
+    queryKey: qk.homeSession,
+    queryFn: fetchHomeSession,
+    enabled: connected,
+  });
+  const homeId = home.data;
   const { workspaces } = useWorkspaceCatalog();
 
   const invalidate = () => void qc.invalidateQueries({ queryKey: qk.sessions });
@@ -94,12 +107,17 @@ export function SessionList({
     restatus.mutate({ id, status: "deleted" });
   };
 
-  const visibleSessions = sessions.filter((item) =>
-    filter === "all"
-      ? true
-      : filter === "archive"
-        ? item.status === "archive"
-        : item.status !== "archive",
+  // The home conversation has its own row at the top of the list, so it is not
+  // also one of the grouped rows — it appears there as soon as it has been
+  // spoken to, and it belongs to no directory to be grouped under.
+  const visibleSessions = sessions.filter(
+    (item) =>
+      item.id !== homeId &&
+      (filter === "all"
+        ? true
+        : filter === "archive"
+          ? item.status === "archive"
+          : item.status !== "archive"),
   );
   const groupedSessions = groupByWorkspace(visibleSessions, workspaces);
 
@@ -131,9 +149,7 @@ export function SessionList({
     // doubles how many conversations are reachable without scrolling.
     const name = item.title?.trim() || sessionLabel(item.id);
     const headline = name ?? fmtTs(item.created_at);
-    const tint = isOpen
-      ? "bg-primary/10 ring-1 ring-primary/20"
-      : "hover:bg-sidebar-accent hover:text-sidebar-accent-foreground";
+    const tint = rowTint(isOpen);
 
     if (editingId === item.id) {
       return (
@@ -160,7 +176,10 @@ export function SessionList({
             type="button"
             className="min-w-0 flex-1 text-left"
             onClick={() => {
-              openSession(item.id, item.workspace ?? DEFAULT_WORKSPACE);
+              // The gateway ignores the header on a bound session; this only
+              // decides what the composer's locked picker shows.
+              const root = item.roots?.[0];
+              openSession(item.id, root ? workspaceIdForRoot(root, workspaces) : DEFAULT_WORKSPACE);
               onViewChange("chat");
               onMobileOpenChange(false);
             }}
@@ -324,22 +343,43 @@ export function SessionList({
             <div className="px-3 py-3 text-sm text-muted-foreground">未连接</div>
           ) : query.isPending ? (
             <div className="px-3 py-3 text-sm text-muted-foreground">加载中…</div>
-          ) : visibleSessions.length === 0 ? (
-            <div className="px-3 py-3 text-sm text-muted-foreground">没有符合条件的会话</div>
           ) : (
-            groupedSessions.map((group) => (
-              <section key={group.workspace} className="pt-4 first:pt-0">
-                <h2
-                  className="flex items-center gap-1.5 px-3 pb-1.5 text-[11px] font-semibold tracking-wide text-muted-foreground"
-                  title={group.label}
+            <>
+              {homeId && (
+                <button
+                  type="button"
+                  className={cn(ROW, rowTint(homeId === session), "gap-1.5")}
+                  onClick={() => {
+                    openSession(homeId, DEFAULT_WORKSPACE);
+                    onViewChange("chat");
+                    onMobileOpenChange(false);
+                  }}
+                  title={`home\n${homeId}`}
                 >
-                  <FolderIcon className="size-3 shrink-0" />
-                  <span className="truncate">{group.label}</span>
-                  <span className="shrink-0 tabular-nums opacity-60">{group.entries.length}</span>
-                </h2>
-                {group.entries.map(renderRow)}
-              </section>
-            ))
+                  <HouseIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                  <span className="truncate text-sm">home</span>
+                </button>
+              )}
+              {visibleSessions.length === 0 ? (
+                <div className="px-3 py-3 text-sm text-muted-foreground">没有符合条件的会话</div>
+              ) : (
+                groupedSessions.map((group) => (
+                  <section key={group.root} className="pt-4 first:pt-0">
+                    <h2
+                      className="flex items-center gap-1.5 px-3 pb-1.5 text-[11px] font-semibold tracking-wide text-muted-foreground"
+                      title={group.label}
+                    >
+                      <FolderIcon className="size-3 shrink-0" />
+                      <span className="truncate">{group.label}</span>
+                      <span className="shrink-0 tabular-nums opacity-60">
+                        {group.entries.length}
+                      </span>
+                    </h2>
+                    {group.entries.map(renderRow)}
+                  </section>
+                ))
+              )}
+            </>
           )}
         </div>
       )}

@@ -5,6 +5,7 @@ export const qk = {
   connection: ["connection"] as const,
   sessions: ["sessions"] as const,
   sessionHistory: (session: string) => ["session-history", session] as const,
+  homeSession: ["home-session"] as const,
   status: ["status"] as const,
   workspaces: ["workspaces"] as const,
   models: ["models"] as const,

@@ -1,13 +1,15 @@
-// Turning a workspace *id* into something a person can read.
+// Two vocabularies meet here, and they are not the same thing.
 //
-// Three surfaces ask this question — the sidebar's group headers, the shell
-// header, and the composer's picker once a conversation has locked its choice —
-// and each used to answer it on its own, falling back to the raw id. That
-// fallback is only harmless for a catalog id: a folder workspace is
-// `folder:<base64url path>` (see features/workspaces/WorkspacePicker's
-// `encodeFolder`, and `folder_workspace_path` on the gateway side), so the raw
-// id reads as a wall of base64 exactly where the operator is scanning for which
-// project a conversation belongs to.
+// A workspace **id** (`__default__`, a catalog name, `folder:<base64url path>`)
+// is what the composer's picker selects and what rides in `X-Komo-Workspace`.
+// A session's **roots** are absolute paths the gateway bound on that session's
+// first turn and reports back on `/api/sessions`. Ids only ever go *out*, paths
+// only ever come *in*; `workspaceIdForRoot` is the one crossing, for the picker
+// that has to display an already-bound session's directory.
+//
+// Either way the raw value is unreadable — base64 on one side, a full path on
+// the other — exactly where the operator is scanning for which project a
+// conversation belongs to, so nothing renders one directly.
 
 import type { WorkspaceInfo } from "@/shared/types";
 
@@ -30,6 +32,19 @@ export function decodeFolderPath(id: string): string | null {
   } catch {
     return null;
   }
+}
+
+/** Encode an absolute path as an opaque `folder:` workspace id.
+ *
+ *  The gateway resolves catalog ids by name and only decodes this form for a
+ *  loopback caller (`resolve_folder_workspace` in infra/messaging/api.rs).
+ *  base64url is what makes an arbitrary Unicode path safe to carry in the
+ *  ASCII-only `X-Komo-Workspace` header. */
+export function encodeFolder(path: string): string {
+  const bytes = new TextEncoder().encode(path);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return `folder:${btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "")}`;
 }
 
 /** The last segment of a path — what a person calls that directory. */
@@ -56,4 +71,18 @@ export function workspaceLabel(id: string, workspaces: WorkspaceInfo[]): string 
  *  share a basename. */
 export function workspacePath(id: string, workspaces: WorkspaceInfo[]): string | null {
   return workspaces.find((workspace) => workspace.id === id)?.path ?? decodeFolderPath(id);
+}
+
+/** How a session's bound root should read on screen: the catalog's name for
+ *  that directory, else its last segment. */
+export function rootLabel(root: string, workspaces: WorkspaceInfo[]): string {
+  return workspaces.find((workspace) => workspace.path === root)?.name ?? basename(root);
+}
+
+/** The workspace id that names a bound root, for the picker that displays it.
+ *
+ *  The gateway ignores `X-Komo-Workspace` once a session is bound, so this only
+ *  ever decides what the operator sees — never where the turn runs. */
+export function workspaceIdForRoot(root: string, workspaces: WorkspaceInfo[]): string {
+  return workspaces.find((workspace) => workspace.path === root)?.id ?? encodeFolder(root);
 }

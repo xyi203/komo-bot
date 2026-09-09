@@ -1,41 +1,48 @@
-// Grouping the session list by workspace. Kept out of the component (which
-// imports the store, and the store touches the DOM) so it stays unit-testable.
+// Grouping the session list by the directory a session is bound to. Kept out of
+// the component (which imports the store, and the store touches the DOM) so it
+// stays unit-testable.
 
 import type { SessionSummary, WorkspaceInfo } from "@/shared/types";
-import { DEFAULT_WORKSPACE, workspaceLabel } from "@/shared/lib/workspace";
+import { rootLabel } from "@/shared/lib/workspace";
 
-export { DEFAULT_WORKSPACE };
+/** Key of the group holding sessions with no bound directory. */
+const UNBOUND = "";
 
-export interface WorkspaceGroup {
-  workspace: string;
+export interface RootGroup {
+  /** The session's primary root, or "" for the unbound group. */
+  root: string;
   label: string;
   entries: SessionSummary[];
 }
 
-/** Sessions grouped by their (immutable) workspace, newest group first.
+/** Sessions grouped by their primary root, newest group first.
  *
- *  Groups are ordered by their most recent session rather than by workspace name:
- *  the sidebar is a recency list, and sorting the *groups* alphabetically would
- *  bury whichever project is being worked on. Within a group the incoming order
- *  is preserved. A session from a pre-workspace gateway counts as the default. */
+ *  Groups are ordered by their most recent session rather than by directory
+ *  name: the sidebar is a recency list, and sorting the *groups* alphabetically
+ *  would bury whichever project is being worked on. Within a group the incoming
+ *  order is preserved. Sessions with no binding at all — chat channels, remote
+ *  callers — go last however recent they are: they name no project to scan for. */
 export function groupByWorkspace(
   sessions: SessionSummary[],
   workspaces: WorkspaceInfo[],
-): WorkspaceGroup[] {
+): RootGroup[] {
   const groups = new Map<string, SessionSummary[]>();
   for (const item of sessions) {
-    const workspace = item.workspace ?? DEFAULT_WORKSPACE;
-    const entries = groups.get(workspace);
+    const root = item.roots?.[0] ?? UNBOUND;
+    const entries = groups.get(root);
     if (entries) entries.push(item);
-    else groups.set(workspace, [item]);
+    else groups.set(root, [item]);
   }
   return Array.from(groups)
-    .map(([workspace, entries]) => ({
-      workspace,
-      label: workspaceLabel(workspace, workspaces),
+    .map(([root, entries]) => ({
+      root,
+      label: root === UNBOUND ? "无 workspace" : rootLabel(root, workspaces),
       entries,
       newest: Math.max(...entries.map((entry) => entry.created_at)),
     }))
-    .sort((a, b) => b.newest - a.newest)
+    .sort((a, b) => {
+      if ((a.root === UNBOUND) !== (b.root === UNBOUND)) return a.root === UNBOUND ? 1 : -1;
+      return b.newest - a.newest;
+    })
     .map(({ newest: _newest, ...group }) => group);
 }

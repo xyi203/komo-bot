@@ -3,6 +3,7 @@ mod app;
 /// The version string every surface reports — see [`app::VERSION`].
 pub use app::VERSION;
 mod channel;
+mod config_cmd;
 mod doctor;
 mod dream;
 mod gateway;

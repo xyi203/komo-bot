@@ -1,8 +1,8 @@
 use clap::{Parser, Subcommand};
 
 use super::{
-    channel, doctor, dream, gateway, health, init, inspect, logs, memory, model, pair, policy,
-    service, skill, upgrade, wechat, wiki,
+    channel, config_cmd, doctor, dream, gateway, health, init, inspect, logs, memory, model, pair,
+    policy, service, skill, upgrade, wechat, wiki,
 };
 
 /// The version every surface reports: the crate version plus the commit it was
@@ -25,17 +25,13 @@ enum Commands {
     /// Bootstrap ~/.komo: write a commented default config.toml and a .env
     /// credential template. Existing files are never overwritten.
     Init,
-    /// Start a new task session (full-screen TUI; needs a terminal). This is
-    /// what a bare `komo` does.
-    Chat,
     /// Open the home conversation: the operator's one ongoing daily thread,
     /// shared with every private channel (full-screen TUI; needs a terminal)
     Home,
-    /// Resume a task session (shortcut for `komo session resume`). With no id,
-    /// the newest task bound to the current directory.
+    /// Resume a task session by id (`komo session list` prints them).
     Resume {
         /// Session id (a UUID; `komo session list` prints them)
-        id: Option<String>,
+        id: String,
     },
     /// Run the always-on gateway: maintenance scheduler (and, later,
     /// config-declared ingress channels). Maintenance cron comes from
@@ -88,6 +84,13 @@ enum Commands {
     Skills {
         #[command(subcommand)]
         action: SkillsAction,
+    },
+    /// Apply an edited ~/.komo/config.toml or .env: validate it, then restart
+    /// the gateway. Most settings are read once at boot, so this is what makes
+    /// a change take effect; `--check` validates without restarting.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
     /// Config & gateway health: model, schedules, channels, home, recent failures
     Doctor,
@@ -415,16 +418,17 @@ enum PairAction {
 }
 
 #[derive(Subcommand)]
+enum ConfigAction {
+    /// Re-read config.toml and .env and report any problems, changing nothing
+    Check,
+    /// Validate, then restart the gateway so the new values take effect
+    Reload,
+}
+
+#[derive(Subcommand)]
 enum SessionAction {
     /// List stored sessions with their title, creation time and message counts
     List,
-    /// Resume a session: reopen the chat TUI on it, so its history is loaded
-    /// and the conversation continues where it left off. With no id, the newest
-    /// task session bound to the current directory
-    Resume {
-        /// Session id (a UUID; `komo session list` prints them)
-        id: Option<String>,
-    },
     /// Delete sessions that contain no messages
     Clean,
 }
@@ -452,7 +456,7 @@ fn require_terminal() -> anyhow::Result<()> {
         return Ok(());
     }
     anyhow::bail!(
-        "`komo` (and `komo chat` / `komo home` / `komo resume`) is a full-screen TUI \
+        "`komo` (and `komo home` / `komo resume`) is a full-screen TUI \
          and needs a terminal.\n\
          For scripted access, POST to the gateway's api channel instead \
          (`/v1/chat/completions`; address and key in ~/.komo/gateway.json)."
@@ -467,10 +471,10 @@ pub async fn run() -> anyhow::Result<()> {
     // or a second instance).
     let config = komo_config::ConfigSnapshot::load();
     match cli.command {
-        // One task is one session: a bare `komo` starts a new one, and `chat`
-        // is the explicit, script-friendly spelling of the same thing. The
-        // ongoing daily conversation is its own entry point.
-        None | Some(Commands::Chat) => {
+        // One task is one session, and a bare `komo` starts one — the only
+        // spelling, so there is nothing to keep in step. The ongoing daily
+        // conversation and an existing task are their own entry points.
+        None => {
             require_terminal()?;
             crate::tui::run_new().await
         }
@@ -479,9 +483,13 @@ pub async fn run() -> anyhow::Result<()> {
             crate::tui::run_home().await
         }
         Some(Commands::Init) => init::run(),
+        Some(Commands::Config { action }) => match action {
+            ConfigAction::Check => config_cmd::check(&config),
+            ConfigAction::Reload => config_cmd::reload(&config),
+        },
         Some(Commands::Resume { id }) => {
             require_terminal()?;
-            crate::tui::resume(id.as_deref()).await
+            crate::tui::resume(&id).await
         }
         Some(Commands::Gateway { action }) => match action {
             None => gateway::run(&config).await,
@@ -565,10 +573,6 @@ pub async fn run() -> anyhow::Result<()> {
         },
         Some(Commands::Session { action }) => match action {
             SessionAction::List => inspect::session_list(&operator().await?).await,
-            SessionAction::Resume { id } => {
-                require_terminal()?;
-                crate::tui::resume(id.as_deref()).await
-            }
             SessionAction::Clean => inspect::session_clean(&operator().await?).await,
         },
         Some(Commands::Run { action }) => match action {
@@ -759,16 +763,44 @@ mod tests {
         );
     }
 
+    /// Which task to continue is the operator's to name. Guessing it from the
+    /// working directory picked one of several — "the newest here" is not the
+    /// same question as "the one I meant" — and reopening the wrong task looks
+    /// exactly like reopening the right one until a few turns in.
     #[test]
-    fn session_resume_also_parses_a_bare_session_id() {
+    fn resume_requires_an_id() {
+        assert!(Cli::try_parse_from(["komo", "resume"]).is_err());
+        assert!(Cli::try_parse_from(["komo", "session", "resume"]).is_err());
+    }
+
+    /// `komo chat` was a second spelling of the bare command; one gesture, one
+    /// name.
+    #[test]
+    fn chat_is_not_a_command() {
+        assert!(Cli::try_parse_from(["komo", "chat"]).is_err());
+    }
+
+    #[test]
+    fn config_has_check_and_reload() {
+        assert!(Cli::try_parse_from(["komo", "config", "check"]).is_ok());
+        assert!(Cli::try_parse_from(["komo", "config", "reload"]).is_ok());
+        // No bare `komo config`: the two do opposite things (one restarts the
+        // gateway), so which one is meant is never inferred.
+        assert!(Cli::try_parse_from(["komo", "config"]).is_err());
+    }
+
+    /// Resuming has one spelling. `komo session` is the inventory surface —
+    /// list and clean — and opening a window is not an inventory operation.
+    #[test]
+    fn session_has_no_resume_of_its_own() {
         assert!(
             Cli::try_parse_from([
                 "komo",
                 "session",
                 "resume",
-                "019fad15-8199-7461-9d48-0a6c779f1c8d",
+                "019fad15-8199-7461-9d48-0a6c779f1c8d"
             ])
-            .is_ok()
+            .is_err()
         );
     }
 }

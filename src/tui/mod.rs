@@ -125,7 +125,7 @@ struct Boot {
 
 type BootTask = tokio::task::JoinHandle<anyhow::Result<Boot>>;
 
-/// Start the TUI on a **new task session** (a bare `komo`, or `komo chat`):
+/// Start the TUI on a **new task session** (a bare `komo`):
 /// paint immediately, and connect in the background.
 ///
 /// One task is one session, so every launch is its own id — minted here rather
@@ -194,25 +194,22 @@ pub async fn run_home() -> anyhow::Result<()> {
     drive(boot, String::new(), workspace).await
 }
 
-/// Continue an existing session (`komo resume [id]` on a TTY). Errors if the
+/// Continue an existing session (`komo resume <id>` on a TTY). Errors if the
 /// session doesn't exist — resume never creates one.
 ///
 /// With no id, the task session bound to the current directory — which is what
 /// "pick up where I left off in this project" means once a task carries its own
 /// workspace.
-pub async fn resume(id: Option<&str>) -> anyhow::Result<()> {
+pub async fn resume(id: &str) -> anyhow::Result<()> {
     let cwd = startup_workspace()?;
-    let id = id.map(str::to_string);
+    let id = id.to_string();
     let boot: BootTask = tokio::spawn({
         let cwd = cwd.clone();
         let id = id.clone();
         async move {
             let backend = connect(&cwd).await?;
             let sessions = backend.gateway.sessions().await?;
-            let session = match &id {
-                Some(id) => resolve_resume_id(&sessions, id)?,
-                None => latest_task_in(&sessions, &cwd)?,
-            };
+            let session = resolve_resume_id(&sessions, &id)?;
             let history = backend.gateway.session_messages(&session).await?;
             let row = sessions.iter().find(|s| s.id == session);
             let roots = row.map(|s| s.roots.clone()).unwrap_or_default();
@@ -238,9 +235,9 @@ pub async fn resume(id: Option<&str>) -> anyhow::Result<()> {
         }
     });
     // The raw argument stands in as the session id until the boot task
-    // resolves it; a queued draft dispatches only after the resolved id is
+    // confirms it; a queued draft dispatches only after the resolved id is
     // installed.
-    drive(boot, id.unwrap_or_default(), cwd).await
+    drive(boot, id, cwd).await
 }
 
 /// Confirm the id names a session that exists. A session id is a UUID and
@@ -263,27 +260,6 @@ fn resolve_resume_id(sessions: &[SessionSummary], id: &str) -> anyhow::Result<St
         .find(|s| s.id == id)
         .map(|s| s.id.clone())
         .ok_or_else(|| anyhow::anyhow!("no session with id `{id}` (see `komo session list`)"))
-}
-
-/// The task session a bare `komo resume` opens: the newest one whose workspace
-/// includes this directory.
-///
-/// Bound roots are the whole filter. Home, a channel conversation and komo's own
-/// sessions carry none — they are not tasks, and none of them is what somebody
-/// standing in a project directory means by "resume".
-fn latest_task_in(sessions: &[SessionSummary], cwd: &Path) -> anyhow::Result<String> {
-    let here = cwd.display().to_string();
-    sessions
-        .iter()
-        .filter(|s| s.roots.iter().any(|root| root == &here))
-        .max_by_key(|s| s.created_at)
-        .map(|s| s.id.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "当前目录没有任务会话（{here}）。\n\
-                 用 `komo` 在这里开一个，或用 `komo session list` 找一条再 `komo resume <id>`。"
-            )
-        })
 }
 
 /// The wait this session is stopped in, if any — the session projection's
@@ -892,37 +868,6 @@ mod resume_tests {
             effort: String::new(),
             awaiting: None,
         }
-    }
-
-    #[test]
-    fn a_bare_resume_opens_the_newest_task_in_this_directory() {
-        let sessions = vec![
-            session("old", 100, &["/home/u/proj"]),
-            session("new", 200, &["/home/u/proj"]),
-            session("elsewhere", 300, &["/home/u/other"]),
-        ];
-        assert_eq!(
-            latest_task_in(&sessions, Path::new("/home/u/proj")).unwrap(),
-            "new"
-        );
-        // A directory admitted later still counts — that is what widening is.
-        let widened = vec![session("wide", 50, &["/home/u/proj", "/home/u/other"])];
-        assert_eq!(
-            latest_task_in(&widened, Path::new("/home/u/other")).unwrap(),
-            "wide"
-        );
-    }
-
-    /// Home, a channel conversation and komo's own sessions carry no roots.
-    /// None of them is what someone standing in a project means by "resume", and
-    /// the roots filter is what keeps them out without a second flag to read.
-    #[test]
-    fn an_unbound_conversation_is_never_what_a_bare_resume_opens() {
-        let sessions = vec![session("home", 999, &[]), session("task", 1, &["/other"])];
-        let refused = latest_task_in(&sessions, Path::new("/home/u/proj"));
-        let message = refused.unwrap_err().to_string();
-        assert!(message.contains("/home/u/proj"), "{message}");
-        assert!(message.contains("komo session list"), "{message}");
     }
 
     #[test]

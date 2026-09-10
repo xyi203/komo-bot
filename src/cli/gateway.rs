@@ -273,6 +273,19 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             schedule: Schedule::parse("* * * * *")?,
             maintenance: Arc::new(routines.sweep()),
             alert: Some(notifier.clone()),
+        })
+        // Config changes: the same every-minute tick, because an edit is worth
+        // hearing about while the operator is still at the keyboard. It only
+        // *reports* — the running process keeps the snapshot it booted with,
+        // and `komo config reload` is what applies one.
+        .with_maintenance(MaintenanceService {
+            name: "config-watch".to_string(),
+            schedule: Schedule::parse("* * * * *")?,
+            maintenance: Arc::new(komo_bot::daemon::config_watch::ConfigWatchSweep::new(
+                &config.runtime.home,
+                notifier.clone(),
+            )),
+            alert: Some(notifier.clone()),
         });
     // Dreaming — mounted only when `dream_schedule` is in effect. Reads the
     // whole memory library, promotes well-supported candidates, and archives

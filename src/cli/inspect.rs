@@ -450,8 +450,9 @@ pub async fn session_list(control: &OperatorControl) -> anyhow::Result<()> {
             title => format!("  {title}"),
         };
         // Which task this is, when it is one: a task session carries the
-        // directory it works in, and that is what `komo resume` in that
-        // directory would land on. An unbound conversation prints none.
+        // directory it works in, which is what tells two tasks in different
+        // projects apart when picking an id to resume. An unbound conversation
+        // prints none.
         let workspace = match s.roots.first() {
             Some(root) => format!("  {}", abbreviate_home(root)),
             None => String::new(),

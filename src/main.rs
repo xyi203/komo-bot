@@ -123,7 +123,7 @@ fn will_run_tui() -> bool {
 }
 
 /// Which subcommands open the TUI: a bare `komo` (a new task session),
-/// `komo chat`, `komo home`, `komo resume` and `komo session resume`. Must stay
+/// a bare `komo`, `komo home` and `komo resume <id>`. Must stay
 /// in sync with the `require_terminal()` call sites in `cli/app.rs`.
 fn opens_tui(sub: Option<&str>, next: Option<&str>) -> bool {
     matches!(sub, None | Some("chat") | Some("home") | Some("resume"))

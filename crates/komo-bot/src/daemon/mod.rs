@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 use crate::notify::Notifier;
 use komo_core::domain::cron::next_occurrence_local;
 
+pub mod config_watch;
 mod cron_sweep;
 mod dream_sweep;
 mod review_sweep;

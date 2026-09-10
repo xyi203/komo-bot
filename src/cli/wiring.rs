@@ -1,7 +1,7 @@
 //! Construction of a fully-wired `AgentRuntime`.
 //!
 //! The gateway is the only caller: it is the only process that opens komo's
-//! state, so it is the only process that has an agent. `komo chat` and the CLI
+//! state, so it is the only process that has an agent. The TUI and the CLI
 //! talk to it over the api channel.
 //!
 //! Every tool komo mounts is built here, once, and registered into one
@@ -37,20 +37,15 @@ use komo_core::domain::{
     approval::Approver, cron::CronJobRepository, llm::LlmClient, memory::MemoryRepository,
     reviewer::Reviewer, workspace::Workspace,
 };
-use komo_tools::apply_patch::ApplyPatchTool;
 use komo_tools::ask_user::AskUserTool;
 use komo_tools::cron::CronTool;
 use komo_tools::edit::EditTool;
-use komo_tools::glob::GlobTool;
 use komo_tools::grep::GrepTool;
 use komo_tools::homeassistant::HomeAssistantTool;
-use komo_tools::logs::LogsTool;
 use komo_tools::memory::MemoryTool;
 use komo_tools::read::ReadTool;
 use komo_tools::session::SessionTool;
 use komo_tools::shell::ShellTool;
-use komo_tools::skill::SkillTool;
-use komo_tools::time::TimeTool;
 use komo_tools::todo::TodoTool;
 use komo_tools::web_fetch::WebFetchTool;
 use komo_tools::web_search::WebSearchTool;
@@ -403,20 +398,15 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     // its name and description to satisfy `Tool`'s `&'static str`, so building
     // one per runtime would leak the same strings three times.
     let mut all_tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(TimeTool),
-        Arc::new(SkillTool::new(skills.clone(), skill_store.clone())),
         Arc::new(WebFetchTool::new()),
         Arc::new(WebSearchTool::new()),
         Arc::new(ReadTool::new(workspace.clone())),
         Arc::new(WriteTool::new(workspace.clone())),
         Arc::new(EditTool::new(workspace.clone())),
-        Arc::new(ApplyPatchTool::new(workspace.clone())),
         Arc::new(GrepTool::new(workspace.clone())),
-        Arc::new(GlobTool::new(workspace.clone())),
         Arc::new(ShellTool::new(workspace.clone())),
         // komo's own tracing log, so a failed tool call can be diagnosed from
         // the `tool` span in the same conversation that hit it.
-        Arc::new(LogsTool),
         Arc::new({
             let tool = SessionTool::new(db.clone(), db.clone());
             match &episodic {
@@ -471,14 +461,20 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     let mut mounts: Vec<crate::pyhost::PluginMount> = Vec::new();
 
     // Keep the always-on preamble small: list a bounded catalog, the rest is
-    // discoverable on demand via the `skill` tool.
+    // discoverable on demand through `komo skills list`.
+    //
+    // There is no `skill` *tool* any more — a skill lives on the filesystem in
+    // one of six directories, only two of which a workspace-confined `read`
+    // can reach, so the CLI is the one thing that can resolve a name the way
+    // the registry does. `komo skills list|inspect` are on the shell tool's
+    // read-only allowlist, so they run without prompting, unattended included.
     //
     // Built per runtime rather than once, because the catalog is gated on what
     // *that* runtime offers: a skill restricted to another OS, or one requiring
     // a tool this runtime never registered (config-absent, or dropped by a
     // policy deny), is not worth a prompt line every turn. Offer-time only —
-    // `skill` view/list and every `komo skills` command ignore the gating, so a
-    // skill left out of the preamble still loads the moment it's named.
+    // `komo skills` ignores the gating, so a skill left out of the preamble
+    // still loads the moment it's named.
     const SKILL_CATALOG_CAP: usize = 30;
     let skills_note_for = |tool_names: &[String]| -> Option<String> {
         let catalog = skills.catalog_capped(
@@ -487,9 +483,11 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
         );
         (!catalog.is_empty()).then(|| {
             format!(
-                "You have skills (instruction playbooks) available. To use one, call the \
-                 `skill` tool with action=view and the skill name to load its instructions, \
-                 then follow them. Available skills:\n{catalog}"
+                "You have skills (instruction playbooks) available. To use one, run \
+                 `komo skills inspect <name>` through `shell` to load its instructions, \
+                 then follow them — that is a read-only command and runs without asking. \
+                 `komo skills list` shows every one, including any left out below. \
+                 Available skills:\n{catalog}"
             )
         })
     };
@@ -524,15 +522,23 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
         if let Some(delegate) = delegate {
             tools.register(delegate);
         }
+        // The indirection to every tool held out of the schema block. Needs a
+        // handle to the catalog it is itself in, so it is built here rather
+        // than in `all_tools` — and per runtime, since the three catalogs hold
+        // different sets.
+        let gateway = Arc::new(komo_tools::tool_gateway::ToolGateway::new(
+            tools.downgrade(),
+        ));
+        tools.register(gateway);
         // Code mode: one tool that runs a program, in place of the model
         // calling three tools in three rounds. Registered last because a
-        // program's calls go back through this executor — see `run_code`.
+        // program's calls go back through this executor — see `python`.
         if let Some(host) = &pyhost {
-            let run_code = Arc::new(komo_tools::run_code::RunCodeTool::new(
+            let python = Arc::new(komo_tools::python::PythonTool::new(
                 host.clone(),
                 tools.downgrade(),
             ));
-            tools.register(run_code);
+            tools.register(python);
         }
         // A tool the policy denies outright never gets advertised: it would
         // otherwise cost a schema, a prompt entry, and a whole round-trip per
@@ -550,10 +556,17 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     let code_note_for = |tools: &ToolExecutor| -> Option<String> {
         let snapshot = tools.snapshot();
         snapshot
-            .get("run_code")
+            .get("python")
             .is_some()
-            .then(|| komo_tools::run_code::sdk_note(&snapshot))
+            .then(|| komo_tools::python::sdk_note(&snapshot))
             .flatten()
+    };
+
+    // Rendered per runtime, from that runtime's own catalog: the three hold
+    // different sets, and a note naming a tool this runtime never mounted is
+    // the same bug as guidance for a deleted one.
+    let lazy_note_of = |tools: &ToolExecutor| -> Option<String> {
+        komo_bot::system_prompt::lazy_tools_note(&tools.snapshot())
     };
 
     let tool_names_of = |tools: &ToolExecutor| -> Vec<String> {
@@ -584,6 +597,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     let subagent_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
             .tools(subagent_tool_names)
+            .lazy_note(lazy_note_of(&subagent_tools))
             .skills_note(subagent_note)
             .code_note(code_note_for(&subagent_tools))
             .plugins_dir(plugins_dir.clone())
@@ -673,6 +687,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     let prompt_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
             .tools(tool_names)
+            .lazy_note(lazy_note_of(&tools))
             .skills_note(main_note)
             .code_note(code_note_for(&tools))
             .plugins_dir(plugins_dir.clone())
@@ -754,6 +769,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     let cron_builder = Arc::new(
         SystemPromptBuilder::new(model_config)
             .tools(cron_tool_names)
+            .lazy_note(lazy_note_of(&cron_tools))
             .skills_note(cron_note)
             .code_note(code_note_for(&cron_tools))
             .plugins_dir(plugins_dir.clone())

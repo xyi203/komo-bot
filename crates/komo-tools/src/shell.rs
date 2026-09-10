@@ -101,6 +101,71 @@ fn dangerous_pattern(command: &str) -> Option<&'static str> {
         .iter()
         .copied()
         .find(|p| matches_at_boundary(&lc, p))
+        .or_else(|| komo_cli_pattern(&lc))
+}
+
+/// The `komo` subcommands that only read. Matched against the words after the
+/// binary; **everything else under `komo ` is dangerous**.
+///
+/// The allowlist is the way round that survives: `komo` reaches every operator
+/// action through the gateway *without* the [`ToolContext`] a tool call
+/// carries, so a mutation invoked this way passes no approval gate and writes
+/// no ledger step — `komo cron remove` through a shell is exactly the bypass
+/// `cron`'s own approval exists to prevent, and it ran silently because no
+/// `rm`/`sudo` pattern matched it. Enumerating the *dangerous* subcommands
+/// instead would leave every subcommand added later ungated by default.
+///
+/// Over-triggering is the acceptable direction: `komo dream` (a preview) and
+/// `komo model` are not listed, so they prompt. Under-triggering is not.
+const KOMO_READ_ONLY: &[&str] = &[
+    "logs",
+    "doctor",
+    "health",
+    "policy list",
+    "policy check",
+    "policy saved",
+    "run list",
+    "run inspect",
+    "session list",
+    "cron list",
+    "memory list",
+    "memory search",
+    "skills list",
+    "skills inspect",
+    "wiki search",
+    "wiki status",
+    "channel list",
+    "channel probe",
+];
+
+/// `Some` when the command invokes `komo` with anything but a read-only
+/// subcommand. Every occurrence is checked, so a `cd x && komo cron remove y`
+/// is caught as surely as a bare one.
+fn komo_cli_pattern(lc: &str) -> Option<&'static str> {
+    let bytes = lc.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = lc[from..].find("komo ") {
+        let at = from + rel;
+        from = at + 1;
+        // `komo` must start a word — `/usr/bin/komo` counts, `mykomo` does not.
+        if at > 0 && bytes[at - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        // Only up to the next shell separator: what follows `;` or `&&` is a
+        // different command, and the patterns above judge it on its own.
+        let rest = &lc[at + "komo ".len()..];
+        let rest = rest
+            .find([';', '&', '|', '\n'])
+            .map_or(rest, |end| &rest[..end]);
+        let words = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+        let read_only = KOMO_READ_ONLY.iter().any(|verb| {
+            words == *verb || words.strip_prefix(verb).is_some_and(|r| r.starts_with(' '))
+        });
+        if !read_only {
+            return Some("komo <mutating subcommand>");
+        }
+    }
+    None
 }
 
 fn hardline_pattern(command: &str) -> Option<&'static str> {

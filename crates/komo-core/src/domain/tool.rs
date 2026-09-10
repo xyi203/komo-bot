@@ -91,7 +91,7 @@ impl From<anyhow::Error> for ToolError {
 }
 
 /// The per-call ceiling for a tool that can park on an interactive approval
-/// prompt (`write`, `edit`, `apply_patch`, `shell`, `cron`, `homeassistant`,
+/// prompt (`write`, `edit`, `shell`, `cron`, `homeassistant`,
 /// `skill install`).
 ///
 /// A chat approval waits up to five minutes for the user
@@ -220,6 +220,23 @@ pub trait Tool: Send + Sync {
     /// Arguments are decoded with [`parse_args`] — one canonical
     /// "rewrite the arguments" error instead of each tool's own phrasing.
     async fn call(&self, input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError>;
+
+    /// Whether this tool's schema is sent to the model every round.
+    ///
+    /// `false` puts a tool **in the catalog but not in the request**: still
+    /// dispatchable by name, still gated and ledgered identically, but its
+    /// `parameters_schema` no longer rides in front of every prompt. It is
+    /// reached through the `tool` indirection, which hands the model the schema
+    /// on demand and then dispatches the real call.
+    ///
+    /// The trade is a discovery round against a schema block re-sent for the
+    /// life of the process, so it is worth taking only where the schema is
+    /// heavy *and* the tool is rare — `cron`'s eighteen parameters against the
+    /// handful of times a conversation schedules anything. A tool used most
+    /// turns must stay advertised: the round costs more than the bytes.
+    fn advertised(&self) -> bool {
+        true
+    }
 
     /// Wall-clock ceiling for **one call** of this tool, overriding the
     /// executor's default (`tool_timeout_secs`, 120s).

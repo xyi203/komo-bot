@@ -57,6 +57,13 @@ impl Tool for WikiSearchTool {
         "wiki_search"
     }
 
+    /// The vault is pulled on demand by definition — a turn that does not ask
+    /// about the notes should pay nothing for them, and that argument does not
+    /// stop at the search results.
+    fn advertised(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Search the user's note vault by meaning; returns passages with their \
          source file and heading. It answers \"what did I write about X\", never \

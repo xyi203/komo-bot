@@ -1,5 +1,5 @@
-//! File-mutation primitives shared by `write` (and next, `edit` /
-//! `apply_patch`).
+//! File-mutation primitives shared by the mutating file tools (`write`,
+//! `edit`).
 //!
 //! The one non-obvious guarantee here is **stale protection**. A write goes:
 //! read the current bytes → ask the user → write. That middle step can take
@@ -159,21 +159,6 @@ pub async fn write_if_unchanged(
     Ok(())
 }
 
-/// Delete `path`, erroring if it is already gone (the caller named a specific
-/// file). Takes the same per-path lock a write does, so a delete can never land
-/// between a concurrent write's compare and its write — otherwise that write
-/// would recreate the file the model just asked to remove.
-pub async fn delete_existing(path: &Path) -> anyhow::Result<()> {
-    let _guard = lock_path(path).await;
-    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
-        anyhow::bail!("{} does not exist, so it cannot be deleted", path.display());
-    }
-    tokio::fs::remove_file(path)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to delete {}: {e}", path.display()))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,13 +231,6 @@ mod tests {
         rb.unwrap();
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "a");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "b");
-    }
-
-    #[tokio::test]
-    async fn deleting_a_missing_file_is_an_error() {
-        let p = temp("delete_missing");
-        let err = delete_existing(&p).await.unwrap_err();
-        assert!(err.to_string().contains("does not exist"));
     }
 
     #[tokio::test]

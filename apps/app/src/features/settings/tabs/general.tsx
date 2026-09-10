@@ -16,7 +16,7 @@ export function GeneralTab() {
         <div>
           <div className="text-sm">信任模式（自动批准）</div>
           <div className="mt-0.5 text-xs text-muted-foreground">
-            开启后副作用工具自动批准（等同 komo chat）；关闭则弹出审批。
+            开启后副作用工具自动批准（等同本机 komo TUI）；关闭则弹出审批。
           </div>
         </div>
         <Switch

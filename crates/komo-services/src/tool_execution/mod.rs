@@ -99,8 +99,8 @@ fn cap_structured(structured: serde_json::Value) -> serde_json::Value {
 fn policy_scope(name: &str) -> Option<(Category, Option<Access>)> {
     match name {
         "shell" => Some((Category::Shell, None)),
-        "read" | "grep" | "glob" | "logs" => Some((Category::File, Some(Access::Read))),
-        "write" | "edit" | "apply_patch" => Some((Category::File, Some(Access::Write))),
+        "read" | "grep" | "logs" => Some((Category::File, Some(Access::Read))),
+        "write" | "edit" => Some((Category::File, Some(Access::Write))),
         "web_fetch" | "web_search" => Some((Category::Network, None)),
         "homeassistant" => Some((Category::HomeAssistant, None)),
         "wiki_index" | "wiki_read" => Some((Category::Wiki, None)),
@@ -114,6 +114,66 @@ fn policy_scope(name: &str) -> Option<(Category, Option<Access>)> {
         name if name.starts_with("py__") => Some((Category::Plugin, None)),
         _ => None,
     }
+}
+
+/// The name of the indirection tool (`komo-tools`' `tool_gateway`), spelled
+/// here because this crate is below `komo-tools` and cannot depend on it.
+const GATEWAY_TOOL: &str = "tool";
+
+/// Rewrite `tool(name = "cron", args = {…})` into a plain `cron({…})`.
+///
+/// **Before the gate, the ledger and the event log**, so nothing downstream
+/// ever learns the call arrived indirectly: one `call_id`, one approval, one
+/// `RunStep` named `cron`, `cron`'s own `redact_args`. The alternative — the
+/// gateway tool dispatching from inside its own `call` — puts the real call
+/// where no recorded assistant block mentions it, and `rebuild_from_events`
+/// only re-dispatches gated calls it can find in a round's blocks. A `cron`
+/// mutation that stopped for approval would then never run after the operator
+/// answered. So this is a correctness requirement, not a shortcut.
+///
+/// Left alone: a `tool` call with no `args` (that is the list/describe half,
+/// which the gateway tool answers itself), and any `name` the catalog does not
+/// know (the gateway answers with what *is* reachable, which beats an
+/// "unknown tool `cron`" naming a tool that exists).
+/// `None` when the round holds no indirection — the overwhelmingly common
+/// case, which then costs no allocation and no clone.
+fn resolve_gateway_calls(
+    calls: &[ToolCallReq],
+    catalog: &CatalogSnapshot,
+) -> Option<Vec<ToolCallReq>> {
+    if !calls.iter().any(|c| c.name == GATEWAY_TOOL) {
+        return None;
+    }
+    let rewritten = calls
+        .iter()
+        .map(|call| {
+            if call.name != GATEWAY_TOOL {
+                return call.clone();
+            }
+            let Ok(serde_json::Value::Object(outer)) =
+                serde_json::from_str::<serde_json::Value>(&call.args)
+            else {
+                return call.clone();
+            };
+            let (Some(serde_json::Value::String(inner)), Some(args)) =
+                (outer.get("name"), outer.get("args"))
+            else {
+                return call.clone();
+            };
+            // `tool(name="tool", …)` would loop; and a name nobody registered
+            // is the gateway's error to explain, not ours to fail on.
+            if inner == GATEWAY_TOOL || catalog.get(inner).is_none() {
+                return call.clone();
+            }
+            ToolCallReq {
+                id: call.id.clone(),
+                call_id: call.call_id.clone(),
+                name: inner.clone(),
+                args: args.to_string(),
+            }
+        })
+        .collect();
+    Some(rewritten)
 }
 
 /// Instance-owned execution policy.
@@ -359,6 +419,10 @@ impl ToolExecutor {
         // One view for the whole round, so two calls in it can never see
         // different catalogs. On a pinned executor this is the turn's view.
         let catalog = self.snapshot();
+        // Resolve `tool(name, args)` into a direct call to `name` before
+        // anything else in this function runs — see `resolve_gateway_calls`.
+        let resolved = resolve_gateway_calls(calls, &catalog);
+        let calls: &[ToolCallReq] = resolved.as_deref().unwrap_or(calls);
         // Bound the per-round fan-out: a single malformed round can request far
         // more calls than any real parallel tool use. Calls past the ceiling get
         // a note without spawning a task or writing a ledger step, so a runaway

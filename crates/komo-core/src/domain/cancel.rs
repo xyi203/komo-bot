@@ -17,12 +17,10 @@
 //!     drop the request). Everything else runs to completion and observes the
 //!     cancellation only after returning.
 //!   - The executor deliberately does **not** race every call against the signal
-//!     on the tools' behalf. That would also interrupt the filesystem tools, and
-//!     `apply_patch` writes several files in sequence: stopping between two of
-//!     them turns a patch that would have finished into a half-applied tree.
-//!     A single `write`/`edit` is safe either way (one `tokio::fs::write` is one
-//!     `spawn_blocking`, so the syscall completes regardless), but there is
-//!     nothing to gain by interrupting a millisecond-long local write.
+//!     on the tools' behalf. That would also interrupt the filesystem tools,
+//!     and there is nothing to gain by interrupting a millisecond-long local
+//!     write: one `tokio::fs::write` is one `spawn_blocking`, so the syscall
+//!     completes regardless of when the signal arrives.
 //!
 //! Like [`ToolEventSink`](crate::domain::events::ToolEventSink), this is a trait
 //! so the domain stays runtime-agnostic; the `watch`-channel implementation

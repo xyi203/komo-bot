@@ -1,9 +1,21 @@
-//! The `grep` tool: search file *contents* by regex.
+//! The `grep` tool: locate code, by contents or by filename.
 //!
-//! The other half of locating code. Output copies opencode v2's shape — a count
-//! line, then `path:` blocks of `Line N: text` — because that is what models
-//! have been trained on, and because it is compact enough that a wide search
-//! still fits in a turn.
+//! Output copies opencode v2's shape — a count line, then `path:` blocks of
+//! `Line N: text` — because that is what models have been trained on, and
+//! because it is compact enough that a wide search still fits in a turn.
+//!
+//! ## Why finding files is the same tool
+//!
+//! Searching contents and finding filenames were two tools (`grep` and `glob`)
+//! that already shared one walk: [`search::candidates`] collects the paths, the
+//! policy filters them, and only then is anything opened. `glob` stopped after
+//! the walk; `grep` went on to read. So the second tool was a schema block —
+//! re-sent every round of every turn — for a code path that already existed.
+//!
+//! Omitting `pattern` is what asks for the walk alone. `include` is then
+//! required: without either, the call is "list the entire tree", which is a
+//! footgun rather than a question. The newest-first order comes from the shared
+//! walk, so a filename search still puts what someone just touched on top.
 //!
 //! Permission order matters here: the walk collects candidate paths first, the
 //! policy filters them, and only the survivors are opened. A `file` deny rule
@@ -32,7 +44,9 @@ const MAX_LINE_CHARS: usize = 400;
 
 #[derive(Deserialize)]
 struct GrepArgs {
-    pattern: String,
+    /// Absent means "find files, don't read them" — see the module docs.
+    #[serde(default)]
+    pattern: Option<String>,
     /// Directory or single file to search; defaults to the workspace root.
     #[serde(default)]
     path: Option<String>,
@@ -51,6 +65,55 @@ impl GrepTool {
     pub fn new(workspace: Arc<Workspace>) -> Self {
         Self { workspace }
     }
+
+    /// The walk without the read: paths matching `matcher`, newest first.
+    ///
+    /// A denied path is not even named — a listing is itself a read, and the
+    /// same filter runs here as on the content path.
+    async fn list_files(
+        &self,
+        ctx: &ToolContext,
+        root: &std::path::Path,
+        matcher: search::GlobMatcher,
+        limit: usize,
+    ) -> Result<ToolOutput, ToolError> {
+        let walk_root = root.to_path_buf();
+        let found = tokio::task::spawn_blocking(move || {
+            search::candidates(&walk_root, |p| matcher.is_match(p), limit)
+        })
+        .await
+        .map_err(|e| ToolError::Failed(anyhow::anyhow!("grep walk failed: {e}")))?;
+
+        let mut paths: Vec<std::path::PathBuf> = Vec::with_capacity(found.items.len());
+        for candidate in found.items {
+            if fs_common::allow_read(ctx, &candidate.path).await.is_none() {
+                paths.push(candidate.path);
+            }
+        }
+
+        if paths.is_empty() {
+            return Ok(ToolOutput::text(format!(
+                "No files match under {}.",
+                search::display_path(root, root)
+            ))
+            .with_structured(json!({ "count": 0, "clipped": false })));
+        }
+
+        let mut out = paths
+            .iter()
+            .map(|p| search::display_path(root, p))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if found.clipped {
+            out.push_str(&format!(
+                "\n…stopped at {limit} results. Narrow `include` or raise `limit`."
+            ));
+        }
+        let count = paths.len();
+        Ok(ToolOutput::text(out)
+            .with_title(format!("{count} file(s)"))
+            .with_structured(json!({ "count": count, "clipped": found.clipped })))
+    }
 }
 
 #[async_trait]
@@ -60,8 +123,9 @@ impl Tool for GrepTool {
     }
 
     fn description(&self) -> &'static str {
-        "Search file contents by regular expression; returns file paths, line \
-         numbers and the matching lines. Honors .gitignore and skips binaries."
+        "Find code. With `pattern`, searches file contents by regex and returns \
+         matching lines; with `include` alone, lists the files whose paths match, \
+         newest first. Honors .gitignore and skips binaries."
     }
 
     fn idempotent(&self) -> bool {
@@ -74,7 +138,7 @@ impl Tool for GrepTool {
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Regular expression to match against file contents."
+                    "description": "Regex matched against file contents. Omit to list matching filenames instead of searching them."
                 },
                 "path": {
                     "type": "string",
@@ -82,14 +146,14 @@ impl Tool for GrepTool {
                 },
                 "include": {
                     "type": "string",
-                    "description": "File glob limiting which files are searched, e.g. `*.{ts,tsx}`."
+                    "description": "Glob on the file path, e.g. `**/*.rs`. Narrows a content search; required when `pattern` is omitted."
                 },
                 "limit": {
                     "type": "integer",
                     "description": format!("Maximum matches to return (default {DEFAULT_LIMIT}, maximum {MAX_LIMIT}).")
                 }
             },
-            "required": ["pattern"]
+            "required": []
         })
     }
 
@@ -102,12 +166,26 @@ impl Tool for GrepTool {
             return Ok(ToolOutput::text(refusal));
         }
 
-        let matcher = search::compile_regex(&args.pattern).map_err(ToolError::InvalidInput)?;
         let include = match &args.include {
             Some(glob) => Some(search::compile_glob(glob).map_err(ToolError::InvalidInput)?),
             None => None,
         };
         let limit = args.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+
+        // No content pattern: the walk *is* the answer. Bounded by `limit`
+        // rather than by `MAX_CANDIDATES`, because here every candidate is a
+        // result rather than a file to open.
+        let Some(pattern) = args.pattern.as_deref().map(str::to_string) else {
+            let Some(matcher) = include else {
+                return Err(ToolError::InvalidInput(
+                    "give a `pattern` to search contents, or an `include` glob to list \
+                     filenames — without either this would list the whole tree"
+                        .to_string(),
+                ));
+            };
+            return self.list_files(ctx, &target, matcher, limit).await;
+        };
+        let matcher = search::compile_regex(&pattern).map_err(ToolError::InvalidInput)?;
 
         // One file or a whole tree: a single file skips the walk entirely.
         let is_file = tokio::fs::metadata(&target)
@@ -155,8 +233,7 @@ impl Tool for GrepTool {
 
         if found.items.is_empty() {
             return Ok(ToolOutput::text(format!(
-                "No matches for `{}` in {searched} file(s).",
-                args.pattern
+                "No matches for `{pattern}` in {searched} file(s).",
             ))
             .with_structured(json!({ "matches": 0, "files_searched": searched })));
         }
@@ -195,8 +272,7 @@ impl Tool for GrepTool {
             .len();
         Ok(ToolOutput::text(lines.join("\n"))
             .with_title(format!(
-                "grep {} ({} matches in {files} files)",
-                args.pattern,
+                "grep {pattern} ({} matches in {files} files)",
                 found.items.len()
             ))
             .with_structured(json!({
@@ -241,6 +317,41 @@ mod tests {
             GrepTool::new(Arc::new(Workspace::new(vec![dir.clone()]))),
             dir,
         )
+    }
+
+    /// The filename half: `include` with no `pattern` lists paths instead of
+    /// reading them, and .gitignore still applies.
+    #[tokio::test]
+    async fn include_without_a_pattern_lists_filenames() {
+        let (tool, _dir) = tool_in("files_only");
+        let out = tool
+            .call(json!({ "include": "**/*.rs" }), &detached_ctx("s"))
+            .await
+            .unwrap();
+        assert!(out.text.contains("src/main.rs"), "{}", out.text);
+        assert!(out.text.contains("src/lib.rs"), "{}", out.text);
+        assert!(
+            !out.text.contains("notes.md"),
+            "the glob should exclude it: {}",
+            out.text
+        );
+        assert!(
+            !out.text.contains("build/gen.rs"),
+            "gitignored: {}",
+            out.text
+        );
+        // Paths, not contents — the walk stops before anything is opened.
+        assert!(!out.text.contains("needle"), "{}", out.text);
+    }
+
+    /// Neither argument would mean "list the whole tree". That is a footgun,
+    /// not a question, so it is refused with the two ways to ask one.
+    #[tokio::test]
+    async fn neither_pattern_nor_include_is_refused() {
+        let (tool, _dir) = tool_in("no_args");
+        let err = tool.call(json!({}), &detached_ctx("s")).await.unwrap_err();
+        assert!(matches!(err, ToolError::InvalidInput(_)), "{err:?}");
+        assert!(err.to_string().contains("include"));
     }
 
     /// A stored over-limit result is only useful if the model can search the

@@ -407,7 +407,7 @@ impl ChatApprover {
             );
         };
 
-        // Trusted turn (a `komo chat` routed over the gateway's loopback api
+        // Trusted turn (a local TUI turn routed over the gateway's loopback api
         // channel): the CLI user is the host operator, so run without prompting.
         // The api channel only builds a trusted context for loopback callers.
         if ctx.auto_approve {

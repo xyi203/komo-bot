@@ -60,6 +60,22 @@ impl CatalogSnapshot {
         self.tools.values()
     }
 
+    /// The tools whose schemas the model is shown — [`Tool::advertised`] only.
+    ///
+    /// The other half of this pair is [`tools`](Self::tools), which is *what
+    /// exists*: dispatch, the prompt's tool-name list and a program's `tools`
+    /// object all read that one. Only the serialized schema block reads this,
+    /// so a hidden tool is invisible in the request and callable everywhere
+    /// else — which is the whole of what "lazy" means here.
+    pub fn advertised(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        self.tools.values().filter(|t| t.advertised())
+    }
+
+    /// The tools deliberately kept out of the schema block, name-sorted.
+    pub fn unadvertised(&self) -> impl Iterator<Item = &Arc<dyn Tool>> {
+        self.tools.values().filter(|t| !t.advertised())
+    }
+
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tools.keys().map(String::as_str)
     }

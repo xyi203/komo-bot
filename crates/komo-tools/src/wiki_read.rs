@@ -102,6 +102,11 @@ impl Tool for WikiReadTool {
         "wiki_read"
     }
 
+    /// Only ever reached after a `wiki_search` hit, which is itself on demand.
+    fn advertised(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Read a note from the vault by path — the whole note, or one section \
          with `heading`. Use it when a `wiki_search` passage is not enough; pass \

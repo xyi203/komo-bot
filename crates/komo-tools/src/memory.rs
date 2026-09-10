@@ -10,7 +10,7 @@ use komo_core::domain::{
     context::ToolContext,
     memory::{
         EvidenceRelation, Memory, MemoryConfidence, MemoryContext, MemoryKind, MemoryRepository,
-        MemoryStatus, ScoredMemory, parse_memory_kind, parse_memory_status,
+        ScoredMemory, parse_memory_kind,
     },
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
@@ -31,15 +31,6 @@ struct MemoryArgs {
     kind: Option<String>,
     #[serde(default)]
     query: Option<String>,
-    /// Target memory id (action=update/promote/reject/archive).
-    #[serde(default)]
-    id: Option<String>,
-    /// New status (action=update).
-    #[serde(default)]
-    status: Option<String>,
-    /// New ranking weight 0–100 (action=update).
-    #[serde(default)]
-    importance: Option<i32>,
     /// Optional TTL in days (action=save).
     #[serde(default)]
     expiry_days: Option<i64>,
@@ -51,18 +42,11 @@ struct MemoryArgs {
 
 impl MemoryArgs {
     /// Some models fill every optional schema field with a placeholder instead
-    /// of omitting it (`"id": ""`, `"status": ""`). An empty string is never a
+    /// of omitting it (`"kind": ""`, `"query": ""`). An empty string is never a
     /// meaningful value for any of these, so normalize it to absent — otherwise
-    /// `parse_memory_status("")` silently becomes an `active` filter and a
-    /// `list` over an all-candidate store returns nothing.
+    /// `parse_memory_kind("")` silently picks a category the model did not mean.
     fn normalized(mut self) -> Self {
-        for field in [
-            &mut self.text,
-            &mut self.kind,
-            &mut self.query,
-            &mut self.id,
-            &mut self.status,
-        ] {
+        for field in [&mut self.text, &mut self.kind, &mut self.query] {
             if field.as_deref().is_some_and(|s| s.trim().is_empty()) {
                 *field = None;
             }
@@ -78,11 +62,14 @@ impl MemoryArgs {
     }
 }
 
-/// Long-term, cross-session memory with governance. The model `save`s facts,
-/// `search`es them (scoped to the current chat/session), and curates the
-/// library: `promote` a candidate to active, `reject`/`archive` it, or `update`
-/// fields. L1 lives in the operator-edited MEMORY.md file. Storage lives
-/// behind [`MemoryRepository`] — the same store the reviewer writes to.
+/// Long-term, cross-session memory. The model `save`s facts and `search`es
+/// them (scoped to the current chat/session); it does not curate the library.
+/// Governance — promote, reject, archive, edit — belongs to the operator
+/// (`komo memory`) and to Dream, which rule on a claim by the evidence for it.
+/// A model that could promote its own candidate would be corroborating itself,
+/// which is the one thing the truth/utility split exists to prevent.
+/// L1 lives in the operator-edited MEMORY.md file. Storage lives behind
+/// [`MemoryRepository`] — the same store the reviewer writes to.
 ///
 /// Searching goes through the same [`MemoryQueryService`] as automatic recall, so
 /// what the model can find by asking is exactly what it can be handed
@@ -97,10 +84,9 @@ impl MemoryTool {
         Self { memories, query }
     }
 
-    /// Load a memory by id or return a helpful error.
-    /// Look up the memory an action names. A missing / unknown id is the model's
-    /// mistake to fix, so both map to [`ToolError::InvalidInput`] rather than a
-    /// retryable failure.
+    /// Look up a memory `supersedes` names. A missing / unknown id is the
+    /// model's mistake to fix, so both map to [`ToolError::InvalidInput`]
+    /// rather than a retryable failure.
     async fn require(&self, id: &Option<String>) -> Result<Memory, ToolError> {
         let id = id.as_deref().ok_or_else(|| {
             ToolError::InvalidInput("`id` is required for this action".to_string())
@@ -118,11 +104,18 @@ impl Tool for MemoryTool {
         "memory"
     }
 
+    /// Recall already injects the relevant memories into every turn's prompt
+    /// (L3, `MemoryEnricher`), and the reviewer extracts new ones after the
+    /// turn ends. What is left for the tool is an explicit "remember this" and
+    /// an explicit lookup — rare enough to pay a discovery round for.
+    fn advertised(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
-        "Long-term memory across sessions. `save` stores a fact, \
-         `search`/`list` retrieve, `update`/`promote`/`reject`/`archive` govern. \
-         Never store what goes stale within a week: task progress, PR numbers, \
-         commit SHAs."
+        "Long-term memory across sessions: `save` stores a fact, `search` \
+         retrieves. Never store what goes stale within a week: task progress, \
+         PR numbers, commit SHAs."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -131,19 +124,16 @@ impl Tool for MemoryTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["save", "search", "list", "update", "promote", "reject", "archive"],
+                    "enum": ["save", "search"],
                     "description": "The memory operation to perform."
                 },
-                "text": { "type": "string", "description": "Fact to store (action=save) or new content (action=update)." },
+                "text": { "type": "string", "description": "Fact to store (action=save)." },
                 "kind": {
                     "type": "string",
                     "enum": ["profile", "preference", "feedback", "project", "person", "fact", "decision", "reference"],
-                    "description": "Category (action=save, default profile; or action=update)."
+                    "description": "Category (action=save, default profile)."
                 },
                 "query": { "type": "string", "description": "Search term (action=search); matched by meaning as well as by wording, so retrying different wording helps." },
-                "id": { "type": "string", "description": "Target memory id (action=update/promote/reject/archive)." },
-                "status": { "type": "string", "enum": ["candidate", "active", "archived", "rejected"], "description": "New status (action=update)." },
-                "importance": { "type": "integer", "description": "Ranking weight 0–100 (action=update)." },
                 "expiry_days": { "type": "integer", "description": "Optional TTL in days (action=save); omit for permanent." },
                 "supersedes": {
                     "type": "array",
@@ -248,7 +238,7 @@ impl Tool for MemoryTool {
                 if !related.is_empty() {
                     out.push_str(
                         "\nPossibly related existing memories — if the new fact replaces one, \
-                         save again with `supersedes: [id]`, or archive it (action=archive):",
+                         save again with `supersedes: [id]`:",
                     );
                     for hit in &related {
                         out.push('\n');
@@ -257,26 +247,6 @@ impl Tool for MemoryTool {
                 }
 
                 Ok(ToolOutput::text(out).with_structured(json!({ "id": memory.id })))
-            }
-            "list" => {
-                let mut memories = self.memories.list().await?;
-                let total = memories.len();
-                let breakdown = status_breakdown(&memories);
-                if let Some(status) = args.status.as_deref().map(parse_memory_status) {
-                    memories.retain(|m| m.status == status);
-                }
-                let out = if memories.is_empty() && total > 0 {
-                    // A status filter that matched nothing must not read as "the
-                    // store is empty" — say where the memories actually are so
-                    // the model can re-list instead of concluding there are none.
-                    format!(
-                        "No memories with that status, but {total} exist: {breakdown}. \
-                         Call list without `status` to see them."
-                    )
-                } else {
-                    render(&memories)
-                };
-                Ok(ToolOutput::text(out).with_title(format!("{} memories", memories.len())))
             }
             "search" => {
                 let text = args.query.ok_or_else(|| {
@@ -290,37 +260,8 @@ impl Tool for MemoryTool {
                 Ok(ToolOutput::text(render_scored(&hits))
                     .with_title(format!("{} matches", hits.len())))
             }
-            "update" => {
-                let mut memory = self.require(&args.id).await?;
-                if let Some(text) = args.text {
-                    memory.content = text;
-                }
-                if let Some(kind) = args.kind.as_deref() {
-                    memory.kind = parse_memory_kind(kind);
-                }
-                if let Some(status) = args.status.as_deref() {
-                    memory.status = parse_memory_status(status);
-                }
-                if let Some(importance) = args.importance {
-                    memory.importance = importance.clamp(0, 100);
-                }
-                memory.updated_at = now;
-                self.memories.save(&memory).await?;
-                Ok(ToolOutput::text(format!("Updated memory {}.", memory.id)))
-            }
-            "promote" => {
-                let mut memory = self.require(&args.id).await?;
-                memory.promote(now);
-                self.memories.save(&memory).await?;
-                Ok(ToolOutput::text(format!(
-                    "Promoted memory {} to active.",
-                    memory.id
-                )))
-            }
-            "reject" => set_status(self, &args.id, MemoryStatus::Rejected, now).await,
-            "archive" => set_status(self, &args.id, MemoryStatus::Archived, now).await,
             other => Err(ToolError::InvalidInput(format!(
-                "unknown action `{other}` (expected save/search/list/update/promote/reject/archive)"
+                "unknown action `{other}` (expected save/search)"
             ))),
         }
     }
@@ -331,51 +272,6 @@ impl Tool for MemoryTool {
 /// does not).
 fn memory_context(session: &SessionContext) -> MemoryContext {
     MemoryContext::new(&session.session_id, session.channel.as_ref())
-}
-
-async fn set_status(
-    tool: &MemoryTool,
-    id: &Option<String>,
-    status: MemoryStatus,
-    now: i64,
-) -> Result<ToolOutput, ToolError> {
-    let mut memory = tool.require(id).await?;
-    memory.status = status;
-    memory.updated_at = now;
-    tool.memories.save(&memory).await?;
-    Ok(ToolOutput::text(format!(
-        "Set memory {} to {}.",
-        memory.id,
-        status.as_str()
-    )))
-}
-
-/// Count memories per status, e.g. `candidate=24, archived=2`.
-fn status_breakdown(memories: &[Memory]) -> String {
-    let mut counts: Vec<(&str, usize)> = Vec::new();
-    for m in memories {
-        let name = m.status.as_str();
-        match counts.iter_mut().find(|(n, _)| *n == name) {
-            Some((_, c)) => *c += 1,
-            None => counts.push((name, 1)),
-        }
-    }
-    counts
-        .iter()
-        .map(|(n, c)| format!("{n}={c}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn render(memories: &[Memory]) -> String {
-    if memories.is_empty() {
-        return "(no memories)".to_string();
-    }
-    memories
-        .iter()
-        .map(render_one)
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn render_one(m: &Memory) -> String {
@@ -418,6 +314,7 @@ fn render_scored(hits: &[ScoredMemory]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use komo_core::domain::memory::MemoryStatus;
     use komo_infra::persistence::db::Db;
 
     /// The real store on an in-memory db, one per test.
@@ -436,7 +333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_list_search_roundtrip() {
+    async fn save_and_search_roundtrip() {
         let tool = temp_tool().await;
 
         tool.call(json!({ "action": "save", "text": "用户喜欢蓝色" }), &ctx())
@@ -449,15 +346,6 @@ mod tests {
         .await
         .unwrap();
 
-        let list = tool
-            .call(json!({ "action": "list" }), &ctx())
-            .await
-            .unwrap()
-            .text;
-        assert!(list.contains("蓝色"));
-        assert!(list.contains("Rust"));
-        assert!(list.contains("[project/"));
-
         let hit = tool
             .call(json!({ "action": "search", "query": "rust" }), &ctx())
             .await
@@ -467,34 +355,27 @@ mod tests {
         assert!(!hit.contains("蓝色"));
     }
 
-    /// The exact call shape observed from a model that fills every optional
-    /// field with a placeholder (run-019fc562): `status: "active"` over an
-    /// all-candidate store must not read as "the store is empty".
+    /// Search reaches candidates, not just active memories — the same set
+    /// recall draws from. A candidate the reviewer wrote is exactly what the
+    /// model has to be able to find in order to help settle it.
     #[tokio::test]
-    async fn list_filtered_to_nothing_reports_where_memories_are() {
+    async fn search_reaches_candidates() {
         let tool = temp_tool().await;
         let mut cand = Memory::new(MemoryKind::Fact, "user prefers rebase before push");
         cand.status = MemoryStatus::Candidate;
         tool.memories.save(&cand).await.unwrap();
 
         let out = tool
-            .call(
-                json!({
-                    "action": "list", "status": "active", "kind": "fact",
-                    "id": "", "query": "", "text": "",
-                    "importance": 0, "expiry_days": 0
-                }),
-                &ctx(),
-            )
+            .call(json!({ "action": "search", "query": "rebase" }), &ctx())
             .await
             .unwrap()
             .text;
-        assert!(!out.contains("(no memories)"));
-        assert!(out.contains("candidate=1"));
+        assert!(out.contains("rebase before push"));
     }
 
-    /// An empty-string `status` is a placeholder, not an `active` filter
-    /// (`parse_memory_status("")` would otherwise default to Active).
+    /// The call shape observed from a model that fills every optional field
+    /// with a placeholder (run-019fc562). An empty string is never a value
+    /// here, so it must read as absent rather than as a filter or a category.
     #[tokio::test]
     async fn empty_string_args_are_treated_as_absent() {
         let tool = temp_tool().await;
@@ -503,7 +384,10 @@ mod tests {
         tool.memories.save(&cand).await.unwrap();
 
         let out = tool
-            .call(json!({ "action": "list", "status": "", "id": "" }), &ctx())
+            .call(
+                json!({ "action": "search", "query": "protoc", "kind": "", "text": "" }),
+                &ctx(),
+            )
             .await
             .unwrap()
             .text;
@@ -633,29 +517,31 @@ mod tests {
         assert!(out.contains("Saved memory"));
     }
 
+    /// Governance is the operator's and Dream's, not the model's: a model that
+    /// could promote its own candidate would corroborate itself, and one that
+    /// could archive would settle by fiat what only evidence settles. The
+    /// verdicts stay reachable through `komo memory`.
     #[tokio::test]
-    async fn reject_and_archive_set_status() {
+    async fn governance_actions_are_not_model_facing() {
         let tool = temp_tool().await;
         let m = Memory::new(MemoryKind::Fact, "ephemeral");
         tool.memories.save(&m).await.unwrap();
 
-        tool.call(json!({ "action": "reject", "id": m.id }), &ctx())
-            .await
-            .unwrap();
+        for action in ["promote", "reject", "archive", "update", "list"] {
+            let err = tool
+                .call(json!({ "action": action, "id": m.id }), &ctx())
+                .await
+                .expect_err(action);
+            assert!(
+                matches!(err, ToolError::InvalidInput(_)),
+                "`{action}` should be an unknown action, got {err:?}"
+            );
+        }
         assert_eq!(
             tool.memories.get(&m.id).await.unwrap().unwrap().status,
-            MemoryStatus::Rejected
+            m.status,
+            "a refused governance action must not have changed anything"
         );
-    }
-
-    #[tokio::test]
-    async fn update_unknown_id_errors() {
-        let tool = temp_tool().await;
-        let err = tool
-            .call(json!({ "action": "promote", "id": "nope" }), &ctx())
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("no memory with id"));
     }
 
     #[tokio::test]

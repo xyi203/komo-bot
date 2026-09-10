@@ -46,10 +46,10 @@ fn minimal_prompt_has_identity_and_volatile_only() {
 fn tool_guidance_is_gated_on_loaded_tools() {
     let p = SystemPromptBuilder::new(&config())
         .home(tmp("gated"))
-        .tools(vec!["memory".into(), "time".into()])
+        .tools(vec!["memory".into(), "python".into()])
         .build(&[]);
     assert!(p.contains("tmux ls")); // state guidance, via `memory`
-    assert!(p.contains("`time` tool"));
+    assert!(p.contains("read a clock")); // code guidance, via `python`
     // `cron` wasn't loaded, so its scheduler-routing guidance stays out.
     assert!(!p.contains("schedule work on a clock"));
 }
@@ -63,7 +63,7 @@ fn todo_guidance_appears_only_with_the_todo_tool() {
     assert!(with.contains("Skip it entirely for"));
     let without = SystemPromptBuilder::new(&config())
         .home(tmp("todo_off"))
-        .tools(vec!["time".into()])
+        .tools(vec!["read".into()])
         .build(&[]);
     assert!(!without.contains("Skip it entirely for"));
 }
@@ -82,13 +82,13 @@ fn tool_economy_guidance_requires_at_least_one_tool() {
     assert!(!without.contains("run concurrently"));
 }
 
-/// The routing rule is what makes `run_code` reachable at all: the API
+/// The routing rule is what makes `python` reachable at all: the API
 /// listing says how to write a program, never when one beats N rounds.
 #[test]
-fn code_guidance_appears_only_with_run_code() {
+fn code_guidance_appears_only_with_python() {
     let with = SystemPromptBuilder::new(&config())
         .home(tmp("code_on"))
-        .tools(vec!["run_code".into(), "read".into()])
+        .tools(vec!["python".into(), "read".into()])
         .build(&[]);
     assert!(with.contains("reach for a program"), "{with}");
     let without = SystemPromptBuilder::new(&config())
@@ -102,10 +102,10 @@ fn code_guidance_appears_only_with_run_code() {
 /// path is not guessable — so it is named, and only where a host is
 /// actually running to load what gets written there.
 #[test]
-fn plugin_guidance_names_the_directory_and_needs_both_run_code_and_a_host() {
+fn plugin_guidance_names_the_directory_and_needs_both_python_and_a_host() {
     let with = SystemPromptBuilder::new(&config())
         .home(tmp("plugin_on"))
-        .tools(vec!["run_code".into(), "write".into()])
+        .tools(vec!["python".into(), "write".into()])
         .plugins_dir(Some(PathBuf::from("/data/plugins")))
         .build(&[]);
     assert!(with.contains("/data/plugins"), "{with}");
@@ -114,11 +114,11 @@ fn plugin_guidance_names_the_directory_and_needs_both_run_code_and_a_host() {
     // No host: nowhere to keep a program, so nothing is said about it.
     let hostless = SystemPromptBuilder::new(&config())
         .home(tmp("plugin_nohost"))
-        .tools(vec!["run_code".into()])
+        .tools(vec!["python".into()])
         .build(&[]);
     assert!(!hostless.contains("py__<name>"));
 
-    // No `run_code`: this runtime cannot run a program at all.
+    // No `python`: this runtime cannot run a program at all.
     let codeless = SystemPromptBuilder::new(&config())
         .home(tmp("plugin_nocode"))
         .tools(vec!["write".into()])
@@ -556,4 +556,111 @@ fn l1_file_limit_is_visible_and_unicode_safe() {
     assert!(prompt.contains(&"记".repeat(8_000)));
     assert!(!prompt.contains(&"记".repeat(8_001)));
     assert!(prompt.contains("[... truncated]"));
+}
+
+/// The roster of held-back tools, and the two ceilings on it. An MCP server
+/// authors its own descriptions and may mount dozens of tools, so an unbounded
+/// roster would put back in the prompt what taking the schemas out saved.
+mod lazy_roster {
+    use super::*;
+    use komo_core::domain::{
+        catalog::ToolCatalog,
+        context::ToolContext,
+        tool::{Tool, ToolError, ToolOutput},
+    };
+    use std::sync::Arc;
+
+    struct Held(&'static str, &'static str);
+    #[async_trait::async_trait]
+    impl Tool for Held {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            self.1
+        }
+        fn advertised(&self) -> bool {
+            false
+        }
+        async fn call(
+            &self,
+            _i: serde_json::Value,
+            _c: &ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    struct Shown;
+    #[async_trait::async_trait]
+    impl Tool for Shown {
+        fn name(&self) -> &'static str {
+            "read"
+        }
+        fn description(&self) -> &'static str {
+            "already in the schema block"
+        }
+        async fn call(
+            &self,
+            _i: serde_json::Value,
+            _c: &ToolContext,
+        ) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    fn catalog(tools: Vec<Arc<dyn Tool>>) -> Arc<komo_core::domain::catalog::CatalogSnapshot> {
+        let catalog = ToolCatalog::new();
+        for tool in tools {
+            catalog.register(tool);
+        }
+        catalog.snapshot()
+    }
+
+    #[test]
+    fn nothing_held_back_means_no_roster() {
+        assert!(lazy_tools_note(&catalog(vec![Arc::new(Shown)])).is_none());
+    }
+
+    #[test]
+    fn the_roster_names_only_the_held_back_tools() {
+        let note = lazy_tools_note(&catalog(vec![
+            Arc::new(Shown),
+            Arc::new(Held("cron", "schedule work")),
+        ]))
+        .expect("one tool is held back");
+        assert!(note.contains("- cron: schedule work"), "{note}");
+        assert!(!note.contains("- read:"), "an advertised tool: {note}");
+        // The roster is useless without saying how to reach one.
+        assert!(note.contains("`tool`"), "{note}");
+    }
+
+    /// A server-authored description is not length-checked anywhere else.
+    #[test]
+    fn a_long_description_is_clipped_on_a_char_boundary() {
+        let long: &'static str = Box::leak("字".repeat(1_000).into_boxed_str());
+        let note = lazy_tools_note(&catalog(vec![Arc::new(Held("mcp__x__y", long))])).unwrap();
+        assert!(note.contains(&"字".repeat(MAX_LAZY_LINE_CHARS)));
+        assert!(!note.contains(&"字".repeat(MAX_LAZY_LINE_CHARS + 1)));
+        assert!(note.contains('…'));
+    }
+
+    /// Past the ceiling the roster says so rather than going on: `tool` with no
+    /// arguments is the complete list, and it costs a round only when wanted.
+    #[test]
+    fn a_long_roster_is_capped_and_says_how_many_it_left_out() {
+        let tools: Vec<Arc<dyn Tool>> = (0..MAX_LAZY_LINES + 7)
+            .map(|i| {
+                let name: &'static str = Box::leak(format!("mcp__s__t{i:03}").into_boxed_str());
+                Arc::new(Held(name, "a remote tool")) as Arc<dyn Tool>
+            })
+            .collect();
+        let note = lazy_tools_note(&catalog(tools)).unwrap();
+        assert_eq!(
+            note.lines().filter(|l| l.starts_with("- ")).count(),
+            MAX_LAZY_LINES + 1,
+            "the ceiling plus the line saying what it cut"
+        );
+        assert!(note.contains("…and 7 more"), "{note}");
+    }
 }

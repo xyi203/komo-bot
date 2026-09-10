@@ -13,7 +13,10 @@
 
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobMatcher};
+use globset::Glob;
+/// Re-exported so a caller can *name* what [`compile_glob`] hands back without
+/// taking its own dependency on globset.
+pub use globset::GlobMatcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::{BinaryDetection, SearcherBuilder};

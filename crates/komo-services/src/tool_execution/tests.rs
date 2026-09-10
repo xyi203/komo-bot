@@ -73,17 +73,7 @@ fn wildcard_deny(category: Category, access: Option<Access>) -> Policy {
     )
 }
 
-const FILE_AND_SHELL: &[&str] = &[
-    "read",
-    "grep",
-    "glob",
-    "write",
-    "edit",
-    "apply_patch",
-    "shell",
-    "time",
-    "memory",
-];
+const FILE_AND_SHELL: &[&str] = &["read", "grep", "write", "edit", "shell", "time", "memory"];
 
 #[test]
 fn a_wholly_denied_tool_leaves_the_catalog() {
@@ -111,13 +101,13 @@ fn denying_file_writes_keeps_the_readers() {
         Category::File,
         Some(komo_core::domain::policy::Access::Write),
     ));
-    assert_eq!(dropped, vec!["apply_patch", "edit", "write"]);
+    assert_eq!(dropped, vec!["edit", "write"]);
     let left: std::collections::BTreeSet<String> = tools
         .definitions()
         .iter()
         .map(|t| t.name().into())
         .collect();
-    assert!(left.contains("read") && left.contains("grep") && left.contains("glob"));
+    assert!(left.contains("read") && left.contains("grep"));
     assert!(left.contains("shell"), "shell is its own category");
 }
 
@@ -1237,5 +1227,116 @@ async fn a_pinned_executor_ignores_later_mounts_and_unmounts() {
             .map(|t| t.name())
             .collect::<Vec<_>>(),
         vec!["late"]
+    );
+}
+
+/// A tool held out of the schema block: in the catalog, dispatchable, just not
+/// advertised.
+struct HiddenTool;
+#[async_trait]
+impl Tool for HiddenTool {
+    fn name(&self) -> &'static str {
+        "cron"
+    }
+    fn description(&self) -> &'static str {
+        "stand-in for a lazily loaded tool"
+    }
+    fn advertised(&self) -> bool {
+        false
+    }
+    async fn call(&self, input: Value, _ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text(format!("cron ran: {input}")))
+    }
+}
+
+fn gateway_call(args: &str) -> ToolCallReq {
+    ToolCallReq {
+        id: "call-1".into(),
+        call_id: Some("fc-1".into()),
+        name: "tool".into(),
+        args: args.into(),
+    }
+}
+
+/// Hiding a tool takes it out of what the model is *shown* and out of nothing
+/// else: `advertised()` is the schema block, `tools()` is what exists, and
+/// dispatch reads the second.
+#[test]
+fn an_unadvertised_tool_stays_in_the_catalog() {
+    let mut tools = catalog_with(&["read", "shell"]);
+    tools.register(Arc::new(HiddenTool));
+    let snapshot = tools.snapshot();
+
+    let shown: Vec<&str> = snapshot.advertised().map(|t| t.name()).collect();
+    assert!(
+        !shown.contains(&"cron"),
+        "not in the schema block: {shown:?}"
+    );
+    assert!(shown.contains(&"read"));
+
+    assert!(snapshot.get("cron").is_some(), "still dispatchable by name");
+    assert_eq!(
+        snapshot
+            .unadvertised()
+            .map(|t| t.name())
+            .collect::<Vec<_>>(),
+        vec!["cron"]
+    );
+    // The prompt's tool-name list reads `definitions`, which must keep naming
+    // it — guidance gated on `has("cron")` has to survive the tool going lazy.
+    assert!(tools.definitions().iter().any(|t| t.name() == "cron"));
+}
+
+/// The indirection is resolved into the real call **before** anything records
+/// or gates it, so the round the executor runs has one call, named `cron`,
+/// carrying `cron`'s own arguments and the model's own correlation handles.
+#[test]
+fn a_gateway_call_is_rewritten_into_the_real_one() {
+    let mut tools = catalog_with(&["read"]);
+    tools.register(Arc::new(HiddenTool));
+    let snapshot = tools.snapshot();
+
+    let call = gateway_call(r#"{"name":"cron","args":{"action":"list"}}"#);
+    let resolved = resolve_gateway_calls(std::slice::from_ref(&call), &snapshot)
+        .expect("a round holding an indirection is rewritten");
+
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].name, "cron", "the ledger step is named `cron`");
+    assert_eq!(resolved[0].args, r#"{"action":"list"}"#);
+    // The provider correlates the result by these; losing them orphans it.
+    assert_eq!(resolved[0].id, "call-1");
+    assert_eq!(resolved[0].call_id.as_deref(), Some("fc-1"));
+}
+
+/// Everything the gateway tool answers for itself, plus the recursion guard,
+/// is left untouched — and a round with no indirection allocates nothing.
+#[test]
+fn only_a_complete_indirection_is_rewritten() {
+    let mut tools = catalog_with(&["read"]);
+    tools.register(Arc::new(HiddenTool));
+    let snapshot = tools.snapshot();
+
+    for (why, args) in [
+        ("listing", r#"{}"#),
+        ("describing", r#"{"name":"cron"}"#),
+        ("recursion", r#"{"name":"tool","args":{}}"#),
+        ("unknown name", r#"{"name":"nope","args":{}}"#),
+        ("unparseable", r#"not json"#),
+    ] {
+        let call = gateway_call(args);
+        let resolved = resolve_gateway_calls(std::slice::from_ref(&call), &snapshot)
+            .expect("the round does hold a `tool` call");
+        assert_eq!(resolved[0].name, "tool", "{why} is the gateway's own job");
+    }
+
+    let plain = ToolCallReq {
+        id: "c".into(),
+        call_id: None,
+        name: "read".into(),
+        args: "{}".into(),
+    };
+    assert!(
+        resolve_gateway_calls(std::slice::from_ref(&plain), &snapshot).is_none(),
+        "a round with no indirection is not rebuilt"
     );
 }

@@ -1,5 +1,5 @@
 //! Shared plumbing for the filesystem tools (`read`, `write`, and — next —
-//! `edit` / `apply_patch`).
+//! `edit`).
 //!
 //! Three things every one of them needs, in the same order every time:
 //! resolve the model's path against the workspace, ask the approver with the

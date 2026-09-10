@@ -66,6 +66,7 @@ impl TokenUsage {
 /// no rig types. `id`/`call_id` are the provider's correlation handles, echoed
 /// back verbatim in the tool result (Anthropic keys on `id`, OpenAI on
 /// `call_id`); `args` is the JSON arguments object for the tool's `execute`.
+#[derive(Clone)]
 pub struct ToolCallReq {
     pub id: String,
     pub call_id: Option<String>,

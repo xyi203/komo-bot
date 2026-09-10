@@ -500,3 +500,65 @@ fn the_model_facing_text_stays_short() {
         vec![],
     ))));
 }
+
+/// `komo` reaches every operator action through the gateway with no
+/// `ToolContext` — no approval gate, no ledger step. So a mutating subcommand
+/// run through a shell is the bypass the tools' own gates exist to prevent,
+/// and it used to pass silently because no `rm`/`sudo` pattern matched it.
+#[test]
+fn a_mutating_komo_subcommand_is_dangerous() {
+    for command in [
+        "komo cron remove nightly",
+        "komo run prune --before 2026-01-01",
+        "komo pair approve 1234",
+        "komo memory reject mem-1",
+        "komo session clean",
+        "komo skills install ./x",
+        "komo gateway restart",
+        "cd /tmp && komo cron add x",
+        "/Users/u/.cargo/bin/komo upgrade",
+        // Not on the allowlist, so it asks — over-triggering is the safe way.
+        "komo dream --apply",
+    ] {
+        assert!(
+            dangerous_pattern(command).is_some(),
+            "should have prompted: {command}"
+        );
+    }
+}
+
+/// The read verbs stay `Risk::Safe`, which is what lets a chat turn — and an
+/// unattended routine — read its own logs without an approval nobody is there
+/// to give. `Risk::Safe` never prompts anywhere, so this list *is* the gate.
+#[test]
+fn a_read_only_komo_subcommand_stays_safe() {
+    for command in [
+        "komo logs",
+        "komo logs -n 200",
+        "komo skills list",
+        "komo skills inspect research",
+        "komo run list --limit 5",
+        "komo cron list",
+        "komo memory search rust",
+        "komo doctor",
+    ] {
+        assert_eq!(
+            dangerous_pattern(command),
+            None,
+            "should have run without asking: {command}"
+        );
+    }
+}
+
+/// The word boundary, and the separator: what follows `;` or `&&` is judged on
+/// its own by the pattern list, not swallowed into the komo check.
+#[test]
+fn the_komo_check_reads_only_its_own_command() {
+    assert_eq!(
+        dangerous_pattern("mykomo cron add x"),
+        None,
+        "not our binary"
+    );
+    assert_eq!(dangerous_pattern("komo logs; ls"), None);
+    assert_eq!(dangerous_pattern("komo logs && rm -rf x"), Some("rm "));
+}

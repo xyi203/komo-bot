@@ -534,12 +534,12 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     // second is invisible from the filesystem alone. Counts only, no names:
     // /health answers unauthenticated.
     let snapshot = state.tools.snapshot();
-    let run_code = snapshot.get("run_code").is_some();
+    let python = snapshot.get("python").is_some();
     let plugin_tools = snapshot.names().filter(|n| n.starts_with("py__")).count();
     Json(json!({
         "status": "ok",
         "version": crate::cli::VERSION,
-        "plugins": { "run_code": run_code, "tools": plugin_tools },
+        "plugins": { "python": python, "tools": plugin_tools },
     }))
 }
 
@@ -596,7 +596,7 @@ async fn chat_completions(
     // Loopback callers may opt into one of two richer contexts (both ignored on
     // an external bind, where there is no host operator behind the socket):
     //   - `X-Komo-Trusted`: auto-approve side-effecting tools (the CLI user is
-    //     the host operator — this is what `komo chat` uses).
+    //     the host operator — this is what the local TUI uses).
     //   - `X-Komo-Interactive`: prompt for approval / clarify and suspend the
     //     turn, exactly like a chat channel, but resolved out-of-band over the
     //     `/api/interactions/*` endpoints (this is what the GUI uses). The reply

@@ -224,7 +224,7 @@ fn page(path: &Path, text: &str, offset: Option<usize>, limit: Option<usize>) ->
             "next_offset": next,
             // The page as data: the same lines, without the header or the line
             // gutter, and without the per-line clipping — which is layout, and a
-            // reader's concern rather than a program's. This is what a `run_code`
+            // reader's concern rather than a program's. This is what a `python`
             // program computes on; parsing the rendered page instead is how the
             // first ones got their line counts wrong. Never sent to the model.
             "text": lines[start - 1..][..shown].join("\n"),
@@ -528,7 +528,7 @@ mod tests {
         assert!(err.to_string().contains("not valid UTF-8"), "{err}");
     }
 
-    /// The rendered page is for a reader; a `run_code` program computes on the
+    /// The rendered page is for a reader; a `python` program computes on the
     /// structured view instead, so the page's own lines have to be in it —
     /// without the header, the gutter, or the per-line clipping, all of which
     /// are layout.

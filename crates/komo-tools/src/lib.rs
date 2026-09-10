@@ -11,26 +11,22 @@
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 
-pub mod apply_patch;
 pub mod ask_user;
 pub mod cron;
 pub mod edit;
 pub mod fs_common;
-pub mod glob;
 pub mod grep;
 pub mod homeassistant;
 pub mod http;
-pub mod logs;
 pub mod mcp;
 pub mod memory;
 pub mod plugin;
+pub mod python;
 pub mod read;
-pub mod run_code;
 pub mod session;
 pub mod shell;
-pub mod skill;
-pub mod time;
 pub mod todo;
+pub mod tool_gateway;
 pub mod web_fetch;
 pub mod web_search;
 pub mod wiki_index;

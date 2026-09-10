@@ -1,4 +1,4 @@
-//! `run_code`: let the model write a Python program that calls komo's tools.
+//! `python`: let the model write a Python program that calls komo's tools.
 //!
 //! ## Why a program beats another tool
 //!
@@ -21,7 +21,7 @@
 //! [`ToolExecutor`] the model's own calls do — approval, policy, redaction,
 //! the run ledger, the result cap. A program is a way to sequence komo's tools,
 //! never a way around what gating them means. That is also why the executor
-//! handle here is weak: `run_code` sits in the catalog it dispatches through.
+//! handle here is weak: `python` sits in the catalog it dispatches through.
 
 use std::sync::Arc;
 
@@ -40,11 +40,14 @@ use serde_json::Value;
 /// Tools python may not call, whatever the catalog says — from a program or
 /// from a plugin's own `@tool` function, which composes them the same way.
 ///
-/// `run_code` itself, because a program spawning a program buys nothing and
+/// `python` itself, because a program spawning a program buys nothing and
 /// costs an unbounded recursion; `ask_user`, because it suspends the *turn* on
 /// a human answer and a program is not a turn — the sentinel would resolve into
-/// a mid-program value nobody is waiting for.
-pub(crate) const NOT_CALLABLE: &[&str] = &["run_code", "ask_user"];
+/// a mid-program value nobody is waiting for; `tool`, because it is an
+/// indirection for a schema a *prompt* does not carry, and a program has the
+/// whole catalog by name already (`sdk_note` lists every tool, held-back ones
+/// included) — going through it would only add a hop.
+pub(crate) const NOT_CALLABLE: &[&str] = &["python", "ask_user", "tool"];
 
 #[derive(Deserialize)]
 struct Args {
@@ -52,7 +55,7 @@ struct Args {
     source: String,
 }
 
-pub struct RunCodeTool {
+pub struct PythonTool {
     /// The slot, not a handle: a restarted host is a different handle, and a
     /// tool registered at wiring outlives any one of them.
     host: SharedHost,
@@ -61,16 +64,16 @@ pub struct RunCodeTool {
     executor: WeakToolExecutor,
 }
 
-impl RunCodeTool {
+impl PythonTool {
     pub fn new(host: SharedHost, executor: WeakToolExecutor) -> Self {
         Self { host, executor }
     }
 }
 
 #[async_trait]
-impl Tool for RunCodeTool {
+impl Tool for PythonTool {
     fn name(&self) -> &'static str {
-        "run_code"
+        "python"
     }
 
     fn description(&self) -> &'static str {
@@ -102,14 +105,14 @@ impl Tool for RunCodeTool {
         let args: Args = parse_args(&input)?;
         let Some(host) = self.host.get() else {
             return Err(ToolError::Failed(anyhow::anyhow!(
-                "the python plugin host is not running, so `run_code` cannot run \
+                "the python plugin host is not running, so `python` cannot run \
                  a program; it restarts on its own — try again, or use the tools \
                  directly"
             )));
         };
         let Some(executor) = self.executor.upgrade() else {
             return Err(ToolError::Failed(anyhow::anyhow!(
-                "the tool executor is gone; `run_code` cannot dispatch"
+                "the tool executor is gone; `python` cannot dispatch"
             )));
         };
         // The program's calls join *this* turn — see `sub_turn`.
@@ -128,7 +131,7 @@ impl Tool for RunCodeTool {
         match outcome {
             Ok(result) => Ok(render(result)),
             Err(PyHostError::Unavailable(message)) => Err(ToolError::Failed(anyhow::anyhow!(
-                "the plugin host is unavailable, so `run_code` did not run: {message}"
+                "the plugin host is unavailable, so `python` did not run: {message}"
             ))),
             // A program that raised is a result the model rewrites from, not a
             // tool failure to retry — same call the executor makes for invalid
@@ -287,7 +290,7 @@ pub fn sdk_note(catalog: &CatalogSnapshot) -> Option<String> {
     }
     lines.sort();
     Some(format!(
-        "Inside `run_code`, these are callable as Python functions with keyword \
+        "Inside `python`, these are callable as Python functions with keyword \
          arguments. Each is the same gated tool you can call directly, and each \
          returns the tool's output as a **str**; a failure raises \
          `ToolError`.\n{}\n\
@@ -424,12 +427,12 @@ mod tests {
     fn the_note_leaves_out_what_a_program_cannot_call() {
         let catalog = ToolCatalog::new();
         catalog.register(Arc::new(Fake("read", schema(&["path"], &[]))));
-        catalog.register(Arc::new(Fake("run_code", schema(&["source"], &[]))));
+        catalog.register(Arc::new(Fake("python", schema(&["source"], &[]))));
         catalog.register(Arc::new(Fake("ask_user", schema(&["question"], &[]))));
 
         let note = sdk_note(&catalog.snapshot()).unwrap();
         // Only the listed signatures matter — the indented lines. The prose
-        // around them names `run_code` itself (the thing being described) and
+        // around them names `python` itself (the thing being described) and
         // `tools.shell` (where to go for unformatted bytes).
         let listed: Vec<&str> = note.lines().filter(|l| l.starts_with("  tools.")).collect();
         assert_eq!(listed, vec!["  tools.read(path)"]);
@@ -441,7 +444,7 @@ mod tests {
     fn an_empty_catalog_produces_no_note() {
         let catalog = ToolCatalog::new();
         assert!(sdk_note(&catalog.snapshot()).is_none());
-        catalog.register(Arc::new(Fake("run_code", schema(&["source"], &[]))));
+        catalog.register(Arc::new(Fake("python", schema(&["source"], &[]))));
         assert!(
             sdk_note(&catalog.snapshot()).is_none(),
             "a catalog with only uncallable tools is still nothing to say"
@@ -500,7 +503,7 @@ mod tests {
     #[test]
     fn the_model_facing_text_stays_short() {
         let executor = komo_services::tool_execution::ToolExecutor::new(Default::default());
-        crate::test_support::assert_model_text_budget(&RunCodeTool::new(
+        crate::test_support::assert_model_text_budget(&PythonTool::new(
             Default::default(),
             executor.downgrade(),
         ));

@@ -43,14 +43,19 @@ struct SessionArgs {
     limit: usize,
 }
 
-/// Introspection over Komo's own stored conversation sessions (this agent's
+/// Retrieval over Komo's own stored conversation sessions (this agent's
 /// chat-history database, NOT system/tmux/login sessions).
 ///
-/// Beyond counting and listing, `search`/`show` are the model's retrieval path
-/// into the parts of a transcript the replay window no longer carries: only a
-/// recent window of a long conversation is replayed each turn, and tool notes
-/// age out of it even sooner — but the store keeps everything, so "which file
-/// did we discuss last week" is answerable instead of gone.
+/// `search`/`show` are the model's path into the parts of a transcript the
+/// replay window no longer carries: only a recent window of a long
+/// conversation is replayed each turn, and tool notes age out of it even
+/// sooner — but the store keeps everything, so "which file did we discuss last
+/// week" is answerable instead of gone.
+///
+/// Inventory — how many sessions exist, when each was created — is **not**
+/// here. It is an operator question (`komo session list`), it is never what a
+/// conversation needs to know, and answering it meant hydrating every stored
+/// transcript to count its messages.
 pub struct SessionTool {
     sessions: Arc<dyn SessionRepository>,
     messages: Arc<dyn MessageRepository>,
@@ -159,8 +164,8 @@ impl Tool for SessionTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["count", "list", "search", "show"],
-                    "description": "count/list = session inventory; search = find messages; show = read messages by position."
+                    "enum": ["search", "show"],
+                    "description": "search = find messages; show = read messages by position."
                 },
                 "query": {
                     "type": "string",
@@ -187,37 +192,6 @@ impl Tool for SessionTool {
         let args: SessionArgs = parse_args(&input)?;
 
         match args.action.as_str() {
-            "count" => {
-                let sessions = self.sessions.list().await?;
-                Ok(
-                    ToolOutput::text(format!("{} stored sessions", sessions.len()))
-                        .with_structured(json!({ "count": sessions.len() })),
-                )
-            }
-            "list" => {
-                let sessions = self.sessions.list().await?;
-                if sessions.is_empty() {
-                    return Ok(ToolOutput::text("no stored sessions"));
-                }
-                let lines: Vec<String> = sessions
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{} | created {} | {} messages ({} user turns)",
-                            s.id,
-                            rfc3339(s.created_at),
-                            s.messages.len(),
-                            s.user_turns()
-                        )
-                    })
-                    .collect();
-                Ok(ToolOutput::text(format!(
-                    "{} sessions:\n{}",
-                    sessions.len(),
-                    lines.join("\n")
-                ))
-                .with_title(format!("{} sessions", sessions.len())))
-            }
             "search" => {
                 let query = args.query.trim();
                 if query.is_empty() {
@@ -305,7 +279,7 @@ impl Tool for SessionTool {
                 .with_title(format!("messages {}-{}", start + 1, end)))
             }
             other => Err(ToolError::InvalidInput(format!(
-                "unknown session action `{other}` (expected: count | list | search | show)"
+                "unknown session action `{other}` (expected: search | show)"
             ))),
         }
     }
@@ -569,23 +543,22 @@ mod tests {
         assert!(!s.contains('\n'), "one line");
     }
 
+    /// Inventory is the operator's question, answered by `komo session list`.
+    /// It was never what a conversation needed to know, and listing hydrated
+    /// every stored transcript just to count its messages.
     #[tokio::test]
-    async fn count_and_list_still_work() {
-        let sessions = vec![Session::new("chat:1")];
+    async fn inventory_actions_are_not_model_facing() {
         let tool = SessionTool::new(
-            Arc::new(FakeSessions(sessions)),
+            Arc::new(FakeSessions(vec![Session::new("chat:1")])),
             Arc::new(FakeMessages(vec![])),
         );
-        let out = tool
-            .call(json!({ "action": "count" }), &ctx("chat:1"))
-            .await
-            .unwrap();
-        assert!(out.text.contains("1 stored sessions"));
-        let out = tool
-            .call(json!({ "action": "list" }), &ctx("chat:1"))
-            .await
-            .unwrap();
-        assert!(out.text.contains("chat:1"));
+        for action in ["count", "list"] {
+            let err = tool
+                .call(json!({ "action": action }), &ctx("chat:1"))
+                .await
+                .expect_err(action);
+            assert!(matches!(err, ToolError::InvalidInput(_)), "{action}");
+        }
     }
 
     #[tokio::test]

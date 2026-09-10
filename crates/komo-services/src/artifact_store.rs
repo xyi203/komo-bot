@@ -13,7 +13,7 @@
 //!
 //!   * **Writable, not read-only.** Tool output is komo's record of a call and
 //!     the model may only read it back. An artifact is the model's own output,
-//!     so `write` / `edit` / `apply_patch` resolve into this root and `shell` may
+//!     so `write` / `edit` resolve into this root and `shell` may
 //!     use it as a working directory.
 //!   * **Durable, not swept.** A stored tool result ages out after a week
 //!     because it is a byproduct. An artifact is the deliberate residue of a

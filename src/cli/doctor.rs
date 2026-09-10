@@ -158,25 +158,25 @@ async fn gateway_health(reachable: bool) -> Option<serde_json::Value> {
 /// The python plugin host — on by default (the gateway creates the plugins
 /// directory at startup), so what needs checking is the *running* gateway's
 /// live state: a config opt-out, an older gateway, or a missing interpreter
-/// all leave run_code and every py__ tool silently absent, indistinguishable
+/// all leave the `python` tool and every py__ tool silently absent, indistinguishable
 /// from working unless something asks the live catalog.
 fn plugin_health(config: &ConfigSnapshot, health: Option<&serde_json::Value>) {
     println!("\nplugins:");
     let dir = config.runtime.home.join("plugins");
     let plugins = health.and_then(|h| h.get("plugins"));
-    let run_code = plugins
-        .and_then(|p| p.get("run_code"))
+    let python = plugins
+        .and_then(|p| p.get("python"))
         .and_then(|v| v.as_bool());
     let mounted = plugins
         .and_then(|p| p.get("tools"))
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    match run_code {
+    match python {
         Some(true) => println!(
-            "  {OK} host wired, run_code + {mounted} python tool(s) mounted ({})",
+            "  {OK} host wired, `python` + {mounted} plugin tool(s) mounted ({})",
             dir.display()
         ),
-        // The gateway answered and run_code is not in its catalog: opted out,
+        // The gateway answered and `python` is not in its catalog: opted out,
         // predates default-on, or python3 is missing (the gateway log says
         // which).
         Some(false) => println!(

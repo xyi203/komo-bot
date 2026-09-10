@@ -28,7 +28,6 @@ async fn say(db: &Db, session_id: &str, message: Message) {
 use super::*;
 use komo_infra::persistence::db::Db;
 use komo_tools::ask_user::AskUserTool;
-use komo_tools::time::TimeTool;
 
 use crate::interaction::{CancelState, CancelTicket};
 use async_trait::async_trait;
@@ -208,6 +207,27 @@ impl TurnDriver for ScriptedDriver {
             output: 340,
             cached_input: 900,
         }
+    }
+}
+
+/// A trivial no-argument tool, for tests that only need *a* call to succeed.
+/// Named `time` because that is what these scripts ask for; nothing here
+/// depends on it telling the time.
+struct TimeTool;
+#[async_trait]
+impl Tool for TimeTool {
+    fn name(&self) -> &'static str {
+        "time"
+    }
+    fn description(&self) -> &'static str {
+        "reports the current moment"
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        _ctx: &komo_core::domain::context::ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        Ok(ToolOutput::text("2026-09-11T10:00:00Z"))
     }
 }
 

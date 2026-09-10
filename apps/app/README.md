@@ -104,7 +104,7 @@ Three layers, deliberately separate:
   Intervals live in `shared/config.ts`.
 - **Client state → zustand** (`shared/store.ts`): the active session and the
   workspace it runs in, per-session model/effort, per-workspace trust mode, the
-  theme. All of it persists — unlike `komo chat` and the TUI, reopening a window
+  theme. All of it persists — unlike the terminal TUI, reopening a window
   returns you to the conversation you were in. Two keying rules matter:
   `workspaceModes` is keyed by **workspace** (trust is a property of the
   directory), `sessionModels` by **session** (the model follows the

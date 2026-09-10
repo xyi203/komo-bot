@@ -42,6 +42,11 @@ impl Tool for WebSearchTool {
         "web_search"
     }
 
+    /// Same reason as `web_fetch`: on demand, not resident.
+    fn advertised(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Search the web; returns the top result titles, URLs and snippets."
     }

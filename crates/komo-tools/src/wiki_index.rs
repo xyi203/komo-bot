@@ -118,6 +118,11 @@ impl Tool for WikiIndexTool {
         "wiki_index"
     }
 
+    /// Maintenance for a tool that is itself on demand.
+    fn advertised(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Inspect and maintain the search index behind `wiki_search`. Run \
          `status` first when a search misses a note the user is sure exists; \

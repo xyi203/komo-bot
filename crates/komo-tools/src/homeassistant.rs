@@ -106,6 +106,16 @@ impl Tool for HomeAssistantTool {
         "homeassistant"
     }
 
+    /// Eight parameters across four actions, for a tool a conversation reaches
+    /// on the turns that are about the house and never otherwise. It is also
+    /// approval-gated where it acts, which is the shape the `tool` indirection
+    /// was built to carry: the gateway call is rewritten into a real
+    /// `homeassistant` call before the gate, so an approval that stops the turn
+    /// resumes onto this call and not onto a wrapper.
+    fn advertised(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Query and control a Home Assistant instance: entities and their state, \
          callable services, and the automations in automations.yaml. Control and \

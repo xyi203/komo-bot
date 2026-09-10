@@ -1,4 +1,4 @@
-//! Unified diffs for the mutating file tools (`edit`, `apply_patch`).
+//! Unified diffs for the mutating file tools (`edit`, `write`).
 //!
 //! Two audiences, one computation: the model gets `+N -M` counts inline (a
 //! cheap, verifiable confirmation of what its edit actually did), while the full

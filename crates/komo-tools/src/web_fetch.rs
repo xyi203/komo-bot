@@ -109,6 +109,13 @@ impl Tool for WebFetchTool {
         "web_fetch"
     }
 
+    /// Reaching the network is a deliberate act, not a background habit: a
+    /// turn that never leaves the machine should not carry the schema for one
+    /// that does.
+    fn advertised(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Fetch an http/https URL (GET) and return its content as markdown \
          (default), plain text, or raw html. Read-only; binary content types are \

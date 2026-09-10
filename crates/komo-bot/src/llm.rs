@@ -371,7 +371,7 @@ impl ProviderLlm {
         };
         catalog
             .snapshot()
-            .tools()
+            .advertised()
             .map(|tool| ToolSchema {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),

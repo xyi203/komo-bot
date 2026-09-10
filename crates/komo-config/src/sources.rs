@@ -480,7 +480,7 @@ pub struct WeChatFileConfig {
 /// bearer key never lives here — it is read from `API_SERVER_KEY` (in
 /// `~/.komo/.env`), like the other channels' credentials.
 ///
-/// The api channel is **always on**: the `komo` CLI (and `komo chat`) reach a
+/// The api channel is **always on**: the `komo` CLI and its TUI reach a
 /// running gateway through it, because Turso's exclusive db lock means the CLI
 /// can't open the db itself while the gateway holds it. `enabled = true` widens
 /// it from the default loopback-only, ephemeral-port, CLI-only listener to an

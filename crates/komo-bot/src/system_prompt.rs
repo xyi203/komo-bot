@@ -53,57 +53,36 @@ const IDENTITY: &str = "You are Komo, a concise and helpful personal agent. \
     When a request needs live information or an action, call one of your tools \
     instead of guessing.";
 
-/// Gated on the `time` tool.
-const TIME_GUIDANCE: &str = "Use the `time` tool when you need the exact current \
-    date and time; never invent a timestamp.";
-
 /// Gated on `grep`. Locating comes before reading: a model that starts by
 /// reading whole files burns the turn's budget on the wrong ones.
-const SEARCH_GUIDANCE: &str = "To find code, use `grep` (contents) and `glob` \
-    (filenames) — not `find`/`rg` through `shell`. Search first, then `read` only \
-    the files that matched.";
+const SEARCH_GUIDANCE: &str = "To find code use `grep` — with `pattern` to \
+    search contents, with `include` alone to list filenames — not `find`/`rg` \
+    through `shell`. Search first, then `read` only the files that matched.";
 
 /// Gated on `edit`. The failure mode this heads off is a model rewriting a whole
 /// file to change three lines, and losing the parts it misremembered.
 const EDIT_GUIDANCE: &str = "To change part of a file use `edit` (exact string \
-    replacement) — or `apply_patch` when the change spans several files, so it \
-    takes one approval instead of one per file. Reserve `write` for creating a \
-    file or genuinely replacing all of it. `edit` requires the text to match \
-    byte for byte, so read the file first and copy it verbatim rather than \
-    reconstructing it from memory.";
+    replacement); reserve `write` for creating a file or genuinely replacing all \
+    of it. `edit` requires the text to match byte for byte, so read the file \
+    first and copy it verbatim rather than reconstructing it from memory. A \
+    change spanning several files is one `edit` per file — each takes its own \
+    approval, so say what you are doing before you start.";
 
-/// Gated on `apply_patch`. The v2 envelope is the one thing a caller cannot
-/// infer, and it does not fit in a 240-character tool description.
-const PATCH_GUIDANCE: &str = "`apply_patch` takes one envelope:\n\
-    *** Begin Patch\n\
-    *** Add File: path\n\
-    +new line\n\
-    *** Update File: path\n\
-    @@ optional context line\n\
-    -removed line\n\
-    +added line\n\
-    *** Delete File: path\n\
-    *** End Patch\n\
-    Context lines start with a space.";
-
-/// Gated on the `read` tool. Two habits worth stating: page instead of giving
-/// up on a long file, and don't shell out for what `read` already does (a `cat`
-/// through `shell` loses the line numbers `write` edits depend on, and asks for
-/// a shell approval the read never needed).
 const READ_GUIDANCE: &str = "Use `read` for file contents and directory listings — \
     not `cat`/`ls` through `shell`. When a file is longer than one page, `read` \
     tells you the next offset: keep reading with `offset` until you have what you \
     need, rather than concluding from the first page alone.";
 
-/// Gated on any of the state-backed tools (`session` / `memory` / `skill`).
+/// Gated on the state-backed tools (`session` / `memory`).
 /// The retrieval sentence is deliberately unconditional (rather than injected
 /// only when the window actually trimmed): a constant prompt stays
 /// byte-identical across turns for the provider cache, and the sentence is
 /// harmlessly true for short conversations too.
 const STATE_GUIDANCE: &str = "Questions about your own state — your sessions, \
-    conversation history, memories, or skills — refer to Komo's database, not the \
-    operating system: answer them with the `session`, `memory`, or `skill` tools, \
-    never with shell commands like `tmux ls` or `who`. Only a recent window of \
+    conversation history, memories or skills — refer to Komo's database, not the \
+    operating system: answer them with `session`, `memory`, or the `komo` CLI \
+    through `shell` (`komo skills list|inspect`, `komo logs`), never with shell \
+    commands like `tmux ls` or `who`. Only a recent window of \
     this conversation is replayed to you each turn; when the user refers to \
     something earlier that you can no longer see, search the stored transcript \
     with `session` (action=search) instead of guessing.";
@@ -111,7 +90,7 @@ const STATE_GUIDANCE: &str = "Questions about your own state — your sessions, 
 /// Gated on the `cron` tool. Its job is the routing decision: a scheduled ask
 /// is an agent job when it needs work done, and a `message` job when delivering
 /// the words is the whole point.
-const CRON_GUIDANCE: &str = "You CAN schedule work on a clock: call the `cron` tool \
+const CRON_GUIDANCE: &str = "You CAN schedule work on a clock: reach the `cron` tool \
     (action=add) with a name, a 5-field cron `schedule` in the user's local timezone \
     (or `after` for a relative delay), \
     and a `prompt` — an agent job runs that prompt as a full turn with your tools \
@@ -137,13 +116,72 @@ const TOOL_ECONOMY_GUIDANCE: &str = "Tool calls in one round run concurrently: \
     have not changed since you last ran it — verify once, at the point the result \
     actually matters.";
 
-/// Gated on `run_code`. How to *write* a program is covered by the API listing
-/// at the tail of this tier (`run_code::sdk_note`); what belongs here is the
+/// The roster of tools whose schemas are not in the request, rendered from the
+/// catalog so it can never name one that is not there — the same reason
+/// `python::sdk_note` is rendered rather than written.
+///
+/// Name and one-line description only. That is the whole trade: the model
+/// learns a tool *exists* and roughly what for, which is what decides whether
+/// to reach for it, and pays for the parameter list only in the turn that
+/// actually uses it.
+pub fn lazy_tools_note(catalog: &komo_core::domain::catalog::CatalogSnapshot) -> Option<String> {
+    let mut lines: Vec<String> = catalog
+        .unadvertised()
+        .map(|tool| {
+            format!(
+                "- {}: {}",
+                tool.name(),
+                clip(tool.description(), MAX_LAZY_LINE_CHARS)
+            )
+        })
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines.sort();
+    let hidden = lines.len().saturating_sub(MAX_LAZY_LINES);
+    lines.truncate(MAX_LAZY_LINES);
+    if hidden > 0 {
+        lines.push(format!(
+            "- …and {hidden} more — call `tool` with no arguments to see them all."
+        ));
+    }
+    Some(format!(
+        "These tools exist but their parameters are not listed above. Reach one \
+         with `tool`: call `tool` with its `name` to read its parameters, then \
+         `tool` again with that `name` and `args` to run it — the second call is \
+         the tool itself, approved and recorded as itself.\n{}",
+        lines.join("\n")
+    ))
+}
+
+/// Bounds on the roster above. Both exist for the same reason and neither is
+/// about komo's own tools, whose descriptions are already capped at 240 chars
+/// by a test: an MCP server authors its tool descriptions itself and may mount
+/// dozens of them, so without a ceiling a single verbose server turns a saving
+/// back into a cost. Nothing is lost by clipping — `tool` with no arguments
+/// lists everything, and `tool(name)` returns that tool's description in full.
+const MAX_LAZY_LINES: usize = 25;
+const MAX_LAZY_LINE_CHARS: usize = 240;
+
+/// First `max` chars, on a char boundary, with an ellipsis when it cut.
+fn clip(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    flat.chars().take(max).collect::<String>() + "…"
+}
+
+/// Gated on `python`. How to *write* a program is covered by the API listing
+/// at the tail of this tier (`python::sdk_note`); what belongs here is the
 /// routing decision, which nothing else states. Left unsaid, the model keeps to
 /// the only pattern it was told about — the round-economy rule right above,
 /// one round per step — and a tool that can collapse a search-then-act loop
 /// into a single call goes unused.
-const CODE_GUIDANCE: &str = "`run_code` runs a Python program that calls these \
+const CODE_GUIDANCE: &str = "`python` is also how you read a clock — the date \
+    above is day precision only, so run `datetime.now()` rather than inventing a \
+    timestamp. More generally it runs a Python program that calls these \
     same tools, and it is the right choice whenever the work is not a fixed set \
     of calls you can name up front: the set comes out of a previous result \
     (search, then act on each hit), the same call repeats over many items, or a \
@@ -157,8 +195,8 @@ const CODE_GUIDANCE: &str = "`run_code` runs a Python program that calls these \
     program, and inside one prefer `tools.<name>(...)` over `tools.shell(...)` — \
     a program is a way to sequence your tools, not a way around them.";
 
-/// Gated on `run_code` **and** a known plugin directory. The other half of the
-/// routing rule above: `run_code` is how a program is run once, this is how one
+/// Gated on `python` **and** a known plugin directory. The other half of the
+/// routing rule above: `python` is how a program is run once, this is how one
 /// is kept. Left unsaid, the model has no idea it can author a tool at all —
 /// nothing else in the prompt names the directory, and the path is not
 /// guessable (`~/.komo/plugins` is only the default; under Docker the home is
@@ -166,7 +204,7 @@ const CODE_GUIDANCE: &str = "`run_code` runs a Python program that calls these \
 ///
 /// Formatted with the real path, which never changes at runtime — so this
 /// renders byte-identically every turn and costs the prompt cache nothing.
-const PLUGIN_GUIDANCE: &str = "Use `run_code` for a one-off program. When the \
+const PLUGIN_GUIDANCE: &str = "Use `python` for a one-off program. When the \
     same program is worth keeping, write it as a `@tool` function into \
     `{dir}` (`from komo_plugin import tool`, one `.py` file, annotate the \
     arguments and give it a docstring — inside it `tools.<name>(...)` calls \
@@ -311,8 +349,9 @@ fn default_agents_dir() -> PathBuf {
 /// ```
 pub struct SystemPromptBuilder {
     tool_names: Vec<String>,
+    lazy_note: Option<String>,
     skills_note: Option<String>,
-    /// The `run_code` API listing, when that tool is loaded.
+    /// The `python` API listing, when that tool is loaded.
     code_note: Option<String>,
     /// Where a `@tool` function has to be written to become a tool. `None` =
     /// this runtime has no plugin host, so there is nowhere to keep one.
@@ -356,6 +395,7 @@ impl SystemPromptBuilder {
     pub fn new(config: &ModelConfig) -> Self {
         Self {
             tool_names: Vec::new(),
+            lazy_note: None,
             skills_note: None,
             code_note: None,
             plugins_dir: None,
@@ -380,16 +420,27 @@ impl SystemPromptBuilder {
     }
 
     /// The skills catalog note (appended to the stable tier), if any.
+    /// One line per tool held out of the schema block, rendered from the
+    /// catalog by [`lazy_tools_note`](crate::system_prompt::lazy_tools_note).
+    ///
+    /// Without it the saving is a loss: a tool the model is never told about
+    /// is a tool it never reaches for, and the guidance below would go on
+    /// naming `cron` while no `cron` schema exists to call.
+    pub fn lazy_note(mut self, note: Option<String>) -> Self {
+        self.lazy_note = note;
+        self
+    }
+
     pub fn skills_note(mut self, note: Option<String>) -> Self {
         self.skills_note = note;
         self
     }
 
-    /// The `run_code` API note (appended to the stable tier), if any.
+    /// The `python` API note (appended to the stable tier), if any.
     ///
     /// Rendered from the tool catalog, so it changes only when the tool set
     /// does — the same condition under which the schema block changes anyway.
-    /// A runtime with no `run_code` passes `None` and pays nothing.
+    /// A runtime with no `python` passes `None` and pays nothing.
     pub fn code_note(mut self, note: Option<String>) -> Self {
         self.code_note = note;
         self
@@ -523,14 +574,14 @@ impl SystemPromptBuilder {
         }
         // Immediately after the round-economy rule it extends: that rule covers
         // a set of calls the model can name, this one the set it cannot.
-        if self.has("run_code") {
+        if let Some(note) = &self.lazy_note {
+            parts.push(note.clone());
+        }
+        if self.has("python") {
             parts.push(CODE_GUIDANCE.to_string());
             if let Some(dir) = &self.plugins_dir {
                 parts.push(PLUGIN_GUIDANCE.replace("{dir}", &dir.display().to_string()));
             }
-        }
-        if self.has("time") {
-            parts.push(TIME_GUIDANCE.to_string());
         }
         if self.has("read") {
             parts.push(READ_GUIDANCE.to_string());
@@ -541,10 +592,7 @@ impl SystemPromptBuilder {
         if self.has("edit") {
             parts.push(EDIT_GUIDANCE.to_string());
         }
-        if self.has("apply_patch") {
-            parts.push(PATCH_GUIDANCE.to_string());
-        }
-        if self.has("session") || self.has("memory") || self.has("skill") {
+        if self.has("session") || self.has("memory") {
             parts.push(STATE_GUIDANCE.to_string());
         }
         if self.has("cron") {

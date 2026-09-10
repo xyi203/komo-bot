@@ -155,6 +155,15 @@ impl Tool for CronTool {
         "cron"
     }
 
+    /// Eighteen parameters — most of them the nested `grants` object — against
+    /// the few times a conversation schedules anything. The schema is handed
+    /// over on demand through `tool` instead of riding in front of every
+    /// prompt, and the discovery round is where the model reads `grants`
+    /// properly rather than half-remembering a 240-character summary of it.
+    fn advertised(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Manage the gateway's scheduled jobs. `add` takes `name`, a trigger \
          (`schedule` or `after`) and exactly one of `prompt` / `command` / \

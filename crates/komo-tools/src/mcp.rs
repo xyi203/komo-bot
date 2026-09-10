@@ -76,6 +76,24 @@ impl Tool for McpTool {
         self.description
     }
 
+    /// Never in the schema block, whatever the server sent.
+    ///
+    /// A remote schema is the one komo cannot size: it is authored elsewhere,
+    /// arrives at wiring, and is re-sent every round for the life of the
+    /// process. That cost is why `[mcp.servers.*]`'s `tools` allowlist is
+    /// required and closed by default — and with the schema out of the
+    /// request, that allowlist goes back to meaning what it should, *which of
+    /// this server's tools may be called at all*, rather than doubling as a
+    /// budget.
+    ///
+    /// Every MCP call is approval-gated, so this relies on the `tool`
+    /// indirection being resolved before the gate (see
+    /// `tool_execution::resolve_gateway_calls`) — a wrapper would break resume
+    /// after an approval.
+    fn advertised(&self) -> bool {
+        false
+    }
+
     fn parameters_schema(&self) -> Value {
         self.schema.clone()
     }

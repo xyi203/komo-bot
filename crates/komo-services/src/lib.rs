@@ -19,7 +19,6 @@ pub mod file_mutation;
 pub mod memory_consolidation;
 pub mod memory_enrichment;
 pub mod memory_query;
-pub mod patch;
 pub mod search;
 pub mod session_indexing;
 pub mod skill_registry;

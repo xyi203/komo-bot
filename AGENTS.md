@@ -15,12 +15,14 @@ cargo test --workspace             # REQUIRED: bare `cargo test` skips komo-core
 cargo test tools::time             # single module
 
 komo init                          # scaffold ~/.komo (config.toml/.env/SOUL.md/USER.md; never overwrites)
-cargo run -- chat                  # full-screen TUI on a NEW task session (bare `komo` does the same)
+komo                               # full-screen TUI on a NEW task session (the only spelling)
 komo home                          # the TUI on the ongoing home conversation instead
+komo resume <id>                   # continue a stored task; the id is required
 cargo run -- gateway               # always-on process: sweeps + channels (feishu/telegram/wechat)
 komo gateway start|stop|restart|status   # macOS launchd supervision
 komo upgrade [--no-restart]        # git pull --ff-only + cargo install + restart gateway
 komo logs [-n N] [-f] [--stdout]   # tail gateway tracing log
+komo config check|reload           # validate an edited config.toml/.env; reload = validate + restart
 komo doctor                        # config & gateway health
 komo health                        # liveness probe (exit 0 = healthy; Docker HEALTHCHECK)
 
@@ -29,8 +31,7 @@ komo wiki index [--rebuild]|search|status   # note-vault index (needs `[wiki]`; 
 komo dream [--apply]               # evidence-driven candidate consolidation (preview by default)
 komo cron list|add|add-agent [--skill NAME] [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
 komo run list|inspect|prune        # run ledger (⟲ = interrupted and unclaimed)
-komo session list|resume|clean     # stored sessions (roots printed per row)
-komo resume [id]                   # continue a task; no id = the newest one bound to this directory
+komo session list|clean            # stored-session inventory (roots printed per row)
 komo skills list|install|inspect|enable|disable
 komo policy list|check|saved       # permission policy: config rules + job grants + saved grants
 komo channel list|probe            # channel inventory / verification
@@ -58,8 +59,10 @@ its own head) → `tool ok` / `tool failed` per call → `run done` with `rounds
 `tool_calls`, tokens and `elapsed_ms`. Counts, sizes and durations only — no message text, memory text or
 tool arguments at any level. The chat TUI logs to `~/.komo/logs/chat-tui.log`
 instead (stderr would tear the alternate screen) and registers that path with
-`komo_infra::logs::set_active`, which is how the `logs` tool finds the current
-process's own log mid-conversation.
+`komo_infra::logs::set_active`, which is how `komo logs` finds the current
+process's own log. There is no `logs` *tool*: the agent reads its own log the
+same way the operator does, through `komo logs` in a `shell` — a read verb, so
+it never prompts.
 
 ## Data & storage rules
 
@@ -179,7 +182,7 @@ that has to exist before the command can mean anything.
 `~/.komo/gateway.json` (rendezvous file) + `/health`, and finding nothing starts
 one: on macOS it loads the launchd job and polls `/health` for up to 60s,
 elsewhere it says who is supposed to (`komo gateway`, or the container's own
-main process). `komo chat`, the TUI and every state-touching CLI command are
+main process). The TUI and every state-touching CLI command are
 clients of the loopback api channel (`infra/messaging/api.rs`); there is no
 direct-db fallback.
 
@@ -199,7 +202,7 @@ direct-db fallback.
   `/api/dream*`, `/api/interactions/*`) and OpenAI-compatible callers
   (`/v1/models`, `/v1/chat/completions`). Writes sit behind a `require_loopback`
   *layer* (`operator_writes`), so a route added there is gated by construction.
-- `komo chat` → `POST /v1/chat/completions` with `X-Komo-Trusted` (loopback
+- The TUI → `POST /v1/chat/completions` with `X-Komo-Trusted` (loopback
   only): side-effecting tools auto-approve for the host operator.
   `X-Komo-Session-Id` **must be a UUID** and is the session id verbatim — 400
   otherwise. It used to be wrapped in an `api:` namespace that every client then
@@ -225,7 +228,7 @@ direct-db fallback.
   of it finishes, the work the user just stopped. A running tool
   stops only if it claims `ToolContext::cancelled()` (shell kills its process
   group; web_fetch/web_search drop the request; fs tools deliberately run to
-  completion so `apply_patch` never half-applies). Cancelled runs are Failed,
+  completion so an `edit` never half-applies). Cancelled runs are Failed,
   **not** recoverable.
 - **A turn can also stop to wait** (docs/bot-runtime.md §4.1): an approver that
   answers `Decision::Suspend` — not a denial, the absence of an answer — makes
@@ -286,7 +289,7 @@ disables the sweep while leaving its cron in place, so
 `KOMO_DREAM_SCHEDULE_ENABLED=false`
 silences a deployment without rewriting config.toml), `pyhost_enabled`
 (default true; `KOMO_PYHOST_ENABLED=false` keeps the python plugin host — and
-with it `run_code` and every `py__` tool — out of the process),
+with it `python` and every `py__` tool — out of the process),
 `[channels.*]`, `[policy]`
 — `default_normal`, the `[[policy.rule]]` list, and `mode` (`ask` default /
 `auto`, which routes an escalation through the aux reviewer first; an
@@ -304,6 +307,19 @@ the `.env` var, never the token), and a **required** `tools` allowlist
 is re-sent every round).
 `~/.komo/.env` = credentials only. Precedence: defaults < config.toml <
 `KOMO_*` env. `KOMO_HOME` relocates the directory.
+
+**Config does not hot-reload; the gateway must restart.** Most of it is read
+before there is anything to change: `[mcp.servers.*]` connects at wiring,
+`pyhost_enabled` decides whether `python` is registered *before* the executors
+exist, `[wiki] vault` and `[channels.*]` decide what is constructed at all.
+What is fixed instead is the **silence** — an edit used to take effect at some
+unrelated future restart with nothing said in between. `ConfigWatchSweep`
+(`komo-bot`'s `daemon`, on the every-minute tick) compares mtimes, re-resolves
+to *validate* and tells the operator in the home chat; `komo config reload`
+validates and then restarts, `komo config check` validates and does nothing.
+That sweep is the one deliberate exception to the rule below, and it keeps the
+rule's purpose: what it re-reads is compared and described, **never installed**,
+so the process still has exactly one authoritative resolution.
 
 Resolution happens **once** in `crates/komo-config` into a `ConfigSnapshot`; problems
 become `ConfigIssue`s (never abort resolution) checked by `validate_agent` /
@@ -463,30 +479,79 @@ call the same functions, which is what keeps validation from forking.
   must outlast the 5-min approval prompt, `APPROVAL_BOUND`).
   `Tool::call(Value, &ToolContext)` is the **only** tool entry point; the
   `SESSION` task-local serves the approvers only — tools take `ctx.session`.
-- `komo-tools` — `time`, `shell` (own process group, hardline floor no approval
-  unlocks, nested timeouts), `grep`/`glob` (ripgrep libraries in-process;
-  policy runs over paths **before** content is read), `read`/`write` +
+- `komo-tools` — `shell` (own process group, hardline floor no approval
+  unlocks, nested timeouts, and a **`komo`-CLI gate**: the CLI reaches every
+  operator action through the gateway with no `ToolContext`, so a mutation run
+  that way passes no approval and writes no ledger step. `KOMO_READ_ONLY` lists
+  the read verbs that stay `Risk::Safe`; everything else under `komo ` is
+  `Dangerous`, which is the way round that keeps a subcommand added later
+  gated by default), `grep` (ripgrep libraries in-process; policy runs
+  over paths **before** content is read — and **one tool for both halves of
+  locating code**: with `pattern` it searches contents, with `include` alone it
+  lists filenames, which is what the separate `glob` did. They already shared
+  the walk (`search::candidates`, newest-first), so the second tool was a schema
+  block for a code path that existed; omitting both arguments is refused rather
+  than listing the tree), `read`/`write` +
   `fs_common` (confined to the workspace's roots **plus `~/.komo/artifacts`**
   and **`~/.komo/plugins`** — komo's own two writable roots: artifacts is where a
   turn puts what it *made* rather than what it changed, one directory per
   session, named to the model at the tail of each turn's user message; plugins is
   where it authors a tool, and a write there is `Risk::Dangerous` —
   `write_if_unchanged` guards the approval
-  window), `edit` (exact match only, no fuzzy) / `apply_patch` (v2 envelope,
-  one approval per batch, no rollback — reports exactly what landed),
-  `web_fetch` (content-type gated, 256 KB download cap, deny-only network
+  window), `edit` (exact match only, no fuzzy — and the only way to change part
+  of a file: the multi-file `apply_patch` is gone, so a change spanning several
+  files is one `edit` each and one approval each, and **deleting a file is
+  `shell rm`**), `web_fetch` (content-type gated, 256 KB download cap, deny-only network
   policy) / `web_search`, `homeassistant` (`call_service` approval-gated;
   `BLOCKED_DOMAINS` hardline), `todo` (session-scoped, dies at a `/new`
-  boundary — the only thing that does), `memory`,
-  `skill` (`list` / `view` / `install`), `cron`, `ask_user` (the one sentinel
+  boundary — the only thing that does), `memory` (`save` / `search` only —
+  governance is the operator's and Dream's, see below),
+  `cron`, `tool` (the lazy-loading
+  indirection, see below), `ask_user` (the one sentinel
   tool: it stops the
   turn through `ToolContext::wait_for` and comes back with the wake as its
-  result — no process waits, and a restart loses nothing), `logs` (tail of komo's own
-  tracing log — file lookup shared with `komo logs` via `komo-infra`'s `logs`, same
-  deny-only file-read gate as `read`), `wiki_read` (vault-confined by
+  result — no process waits, and a restart loses nothing), `wiki_read` (vault-confined by
   canonicalized prefix, `Risk::Safe` deny-only; reads the markdown, not the
   index, so a note edited since the last index run is served current),
-  `run_code` and `plugin`'s `PyTool` (see `src/pyhost.rs` below).
+  `python` and `plugin`'s `PyTool` (see `src/pyhost.rs` below).
+  **Three tools were removed rather than slimmed**, because each duplicated
+  something the CLI already does better: `skill` (a skill lives in one of six
+  directories and only two are reachable by a workspace-confined `read`, so
+  `komo skills list|inspect` is the one thing that resolves a name the way the
+  registry does), `logs` (`komo logs`) and `time` (`python` reads the clock —
+  the prompt's date is day precision on purpose, for prefix-cache stability).
+  All three CLI forms are on `shell`'s read-only allowlist, so they run without
+  prompting, unattended included.
+- `Tool::advertised()` + `tool_gateway` — **which tools cost a schema every
+  round.** A tool's `description` and `parameters_schema` are serialized into
+  every request for the life of the process, which is the right trade for
+  `read` or `edit` and the wrong one for `cron`: eighteen parameters, most of
+  them the nested `grants` object, against the few times a conversation
+  schedules anything. `advertised() == false` puts a tool **in the catalog but
+  not in the request** — still dispatchable, still gated, still ledgered
+  identically. Five are marked: `cron`, `memory`, `wiki_search`, `wiki_read`,
+  `wiki_index`.
+  Two lists, and the split is the whole design: `CatalogSnapshot::advertised()`
+  feeds `llm`'s `tool_schemas` (what the model is *shown*) and filters;
+  `snapshot().tools()` / `ToolExecutor::definitions()` feed dispatch, the
+  prompt's tool-name list and a program's `tools` object, and do **not** —
+  guidance gated on `has("cron")` has to survive the tool going lazy.
+  `system_prompt::lazy_tools_note` renders one line per held-back tool from the
+  catalog (per runtime, since the three hold different sets): a tool the model
+  is never told about is a tool it never reaches for, which would make the
+  saving a loss.
+  The reach is `tool` (`tool_gateway`): no arguments lists them, a `name`
+  returns that tool's parameters, and `name` + `args` runs it. That last shape
+  **never reaches the gateway tool's own `call`** —
+  `tool_execution::resolve_gateway_calls` rewrites it into a direct call at the
+  top of `execute_round`, before the gate, the ledger and the event log, so one
+  `call_id`, one approval, one `RunStep` named `cron`. That is a correctness
+  requirement rather than tidiness: a call made *inside* another tool's body
+  (the way a `python` program makes one) appears in no recorded assistant
+  block, and `rebuild_from_events` only re-dispatches gated calls it finds in a
+  round's blocks — so a `cron` mutation that stopped for approval would never
+  run after the operator answered. The trade paid for it is a discovery round,
+  which is why a tool used most turns must stay advertised.
 - `session` + `komo-services`' `session_indexing` — **episodic memory**:
   hybrid search over komo's own transcripts, the third memory beside `memory_records`
   (semantic) and skills (procedural). `search` spans **every** stored
@@ -574,14 +639,14 @@ call the same functions, which is what keeps validation from forking.
   real conversation, cancel propagates); recursion blocked structurally
   (sub-agent tool set has `delegate: None`); each delegation is its own ledger
   run. The unattended cron runtime gets no `delegate`.
-- `src/pyhost.rs` + `komo-pyhost` + `komo-tools`' `run_code` / `plugin` — the
+- `src/pyhost.rs` + `komo-pyhost` + `komo-tools`' `python` / `plugin` — the
   **dynamic-tool loop**, and the one thing in komo that mounts tools into a
-  *running* process rather than at wiring. `run_code` runs a one-off Python
+  *running* process rather than at wiring. `python` runs a one-off Python
   program in an out-of-process host; a `@tool`-annotated function in a
   `$KOMO_HOME/plugins/*.py` file becomes a `py__<name>` tool within seconds of
   the file being written, and goes away when it is deleted. `PLUGIN_GUIDANCE`
-  (gated on `run_code` plus a known plugins directory) is what tells the model
-  that loop: prototype with `run_code`, persist as a `@tool`. Both directions go
+  (gated on `python` plus a known plugins directory) is what tells the model
+  that loop: prototype with `python`, persist as a `@tool`. Both directions go
   through the same broker — a plugin's `tools.<name>(...)` call is dispatched by
   the runtime's own `WeakToolExecutor` (`PyTool`), so it pays the same approval
   gate, retry classification and ledger step an ordinary call does. Two
@@ -591,7 +656,7 @@ call the same functions, which is what keeps validation from forking.
   later turn, unattended routines included); and `available()` decides *before*
   the executors are built whether a host can run at all (`pyhost_enabled`, and a
   `[policy]` that wholly denies `Category::Plugin`), because that answer decides
-  whether `run_code` is registered — `start()` comes after, once there is
+  whether `python` is registered — `start()` comes after, once there is
   something for the host to mount into.
 - `domain/policy.rs` + `komo-bot`'s `policy_approver` — permission policy. Ladder,
   strongest first: **tool hardline floor > config deny > saved grant > config
@@ -647,11 +712,15 @@ call the same functions, which is what keeps validation from forking.
   `docs/adr/0003-auto-policy-llm-reviewer.md`.
 - `komo-mcp` + `komo-tools`' `mcp` — external MCP servers over Streamable HTTP
   (rmcp, client features only). `[mcp.servers.*]` is connected **once at
-  wiring**: the catalog is immutable after that (`register` takes
-  `Arc::get_mut`, and its byte-stable order is what keeps the provider prompt
-  cache valid), so a server that is down at boot has no tools for the process's
-  lifetime — and an unreachable one is a warning, never a fatal. Each mounted
-  tool becomes `mcp__<server>__<tool>` (leaked to satisfy `Tool::name`'s
+  wiring**, so a server that is down at boot has no tools for the process's
+  lifetime — and an unreachable one is a warning, never a fatal. That is a
+  missing caller, **not** a limit of the catalog: `ToolCatalog::register` /
+  `mount_all` / `retain` all take `&self` through an `RwLock`, and `mount_all`
+  hands back a `Registration` that unmounts on drop (which is how the plugin
+  host adds and removes tools mid-process). What is pinned is the *per-turn*
+  `CatalogSnapshot`, so a change is picked up by the next turn — and since MCP
+  tools are no longer advertised, remounting one no longer touches the schema
+  block at all. Each mounted tool becomes `mcp__<server>__<tool>` (leaked to satisfy `Tool::name`'s
   `&'static str`; built once and `Arc`-shared across every executor). **Every
   MCP call is approval-gated** — `annotations.readOnlyHint` is server-authored,
   and the server is the party being gated; grant specific tools with
@@ -663,6 +732,15 @@ call the same functions, which is what keeps validation from forking.
   + `services/memory_enrichment.rs` — three surfaces:
   L1 operator-edited `MEMORY.md` via `SystemPromptBuilder`, L2 `memory` tool + operator CLI,
   L3 recall (fetch 15, inject ≤5, aux-screened above 5).
+  **The model may only `save` and `search`.** Governance — `promote`,
+  `reject`, `archive`, editing a stored memory — is the operator's
+  (`komo memory`) and Dream's, both of which rule by the evidence. A model that
+  could promote its own candidate would be corroborating itself, which is the
+  one thing the truth/utility split below exists to prevent; and correcting a
+  memory is `save` with `supersedes`, which keeps the forward link an in-place
+  edit would lose. Inventory (`list`) is an operator question too. Note the L1
+  file is a *different store*: the tool never touches `MEMORY.md`, and what
+  recall injects comes from `memory_records`.
   **Truth and utility are different axes, on purpose.** `support_count` /
   `contradiction_count` / `last_confirmed_at` / `evidence` say whether a memory is
   *true*; `recall_count` / `last_used_at` say whether it keeps being *useful*.
@@ -838,8 +916,10 @@ call the same functions, which is what keeps validation from forking.
   `SkillOffer` (frontmatter `platforms:` / `requires_tools:`, evaluated per
   runtime at wiring against its own registered tool set): an always-on prompt
   line is the one place an irrelevant skill costs tokens every turn. It is never
-  a load gate; the `skill` tool's `view`/`list` and every `komo skills` command
-  ignore it. `komo skills disable` hides one without deleting it; an agent job
+  a load gate; every `komo skills` command ignores it. There is no `skill`
+  *tool* — the registry's search path spans six directories and a
+  workspace-confined `read` reaches two, so `komo skills list|inspect` through
+  a `shell` is the only thing that resolves a name the way the registry does. `komo skills disable` hides one without deleting it; an agent job
   names the skills it wants preloaded (`CronAction::Agent`'s `skills`).
 - `komo-bot`'s `daemon` — `Maintenance` sweeps under `supervise` (circuit breaker
   after 5 failures). Sweep cron expressions are matched against **local time**
@@ -966,18 +1046,21 @@ call the same functions, which is what keeps validation from forking.
 - `tui/` — ratatui chat front end, a pure gateway client (`GatewayClient`; there
   is no in-process backend); state +
   key handling terminal-free in `tui/app.rs`. **One task is one session**: a bare
-  `komo` (and its explicit spelling `komo chat`) opens a *new* one, minting the
-  uuid locally and leaving the row to the first turn — a conversation nobody has
+  a bare `komo` opens a *new* one — the only spelling — minting the
+  uuid locally and leaving the row to the first turn: a conversation nobody has
   spoken in should not have one, which is what the desktop app already does.
-  `komo home` is the other entry point: the operator's one ongoing **home
+  `komo home` is the second entry point: the operator's one ongoing **home
   conversation**, so the thread the morning's Telegram DM is in continues here.
-  `komo resume <id>` (or the compatible `komo session resume <id>`) opens a
-  stored session by its UUID — the task from yesterday, a correspondent's, or an
-  old one being looked into; the id is printed on the way out of a sitting that
-  actually ran a turn (a window nobody spoke in has no row to resume). **A bare
-  `komo resume`** takes no id and opens the newest task bound to the current
-  directory. The identity row says which of the three this is (`home`, or
-  `任务 · <dir>`).
+  `komo resume <id>` is the third, opening a stored session by its UUID — the
+  task from yesterday, a correspondent's, or an old one being looked into.
+  **The id is required**, and it is printed on the way out of a sitting that
+  actually ran a turn (a window nobody spoke in has no row to resume, so it
+  prints nothing and that session is gone). It was once optional, defaulting to
+  the newest task bound to the current directory; that guessed which of several
+  tasks was meant, and reopening the wrong one looks exactly like reopening the
+  right one until several turns in. `komo session` keeps the inventory verbs
+  (`list` / `clean`) and no longer opens a window. The identity row says which
+  of the three this is (`home`, or `任务 · <dir>`).
   **A task session owns its workspace** (`Session.roots`, normalized absolute
   paths, `roots[0]` the anchor): bound on its first turn from the directory the
   TUI was launched in, honored on every later turn, and `X-Komo-Workspace`
@@ -1070,6 +1153,17 @@ call the same functions, which is what keeps validation from forking.
 
 - **Add a tool**: implement `Tool` in `crates/komo-tools/src/`, register in `cli/wiring.rs`
   (and add it to `tool_execution::policy_scope` if it should be policy-filterable).
+  Decide `advertised()` while writing it: default `true` costs its schema in
+  every request forever, and `false` costs a discovery round each time it is
+  used — heavy-and-rare takes the second, anything used most turns the first.
+- **Change what a tool's model-facing text says**: the `description` and each
+  parameter description are capped (240 / 120 chars,
+  `test_support::assert_model_text_budget`) because they are re-sent every
+  round. Behavioral rules — when to reach for it, what not to use instead —
+  belong in a gated `*_GUIDANCE` const in `komo-bot`'s `system_prompt`, sent
+  once per turn and **conditional on the tool being loaded**. Deleting or
+  renaming a tool means editing those too: a `*_GUIDANCE` naming a tool that no
+  longer exists is a prompt teaching the model to call nothing.
 - **Add an MCP server**: config only — an `[mcp.servers.<name>]` table with a
   `tools` allowlist. No code; that is the point of `komo-mcp` being generic.
 - **Add a tool at run time**: a `@tool` function in a `$KOMO_HOME/plugins/*.py`

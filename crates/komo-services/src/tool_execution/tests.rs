@@ -1448,3 +1448,101 @@ async fn a_suspended_call_keeps_its_scratch() {
     );
     assert_eq!(key.key, "progress");
 }
+
+// ── nested rounds ────────────────────────────────────────────────────────────
+
+/// A tool that keeps a note and then stops the turn on an approval nobody has
+/// answered — the shape a program's `tools.cron(...)` takes when it reaches the
+/// gate.
+struct GatedTool;
+
+#[async_trait]
+impl Tool for GatedTool {
+    fn name(&self) -> &'static str {
+        "gated"
+    }
+    fn description(&self) -> &'static str {
+        "stops the turn waiting for an approval"
+    }
+    async fn call(&self, _input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        ctx.scratch_set("progress", "asked").await;
+        // The wakeup the approval gate builds: it names the call that asked,
+        // which is what `/approve` resolves against.
+        let _ = ctx.wait_for(
+            Wakeup::Approval {
+                call_id: ctx.call_id().unwrap_or_default().to_string(),
+            },
+            "approve the routine",
+            None,
+        );
+        Ok(ToolOutput::text("never read"))
+    }
+}
+
+/// The turn a program's calls run in: the enclosing call's identity, plus the
+/// counter that numbers them.
+fn nested(enclosing: &str, index: u32) -> ToolTurnContext {
+    ToolTurnContext {
+        nested: Some(Arc::new(NestedCalls::new(enclosing, index))),
+        ..ledgered()
+    }
+}
+
+fn gated_executor() -> (ToolExecutor, Arc<FakeScratch>) {
+    let scratch = Arc::new(FakeScratch::default());
+    let executor = executor(vec![Arc::new(GatedTool)], ToolExecutionConfig::default())
+        .with_scratch(scratch.clone());
+    (executor, scratch)
+}
+
+/// A call made inside another tool's body is in no recorded assistant block, so
+/// a suspension under its id names a call recovery cannot re-dispatch — the
+/// operator answers and nothing runs. The enclosing call is the one the model
+/// asked for, so the wait moves onto it.
+#[tokio::test]
+async fn a_nested_suspension_names_the_enclosing_call() {
+    let (executor, scratch) = gated_executor();
+    let context = nested("outer-7", 3);
+    let run = context.run.clone().unwrap();
+
+    let mut request = call("gated", "{}");
+    request.id = "code-1-gated".into();
+    one(&executor, request, &context).await;
+
+    let pending = run.suspension().expect("the turn stopped");
+    assert_eq!(pending.call_id, "outer-7");
+    assert_eq!(pending.call_index, 3);
+    // Only the address moved: the question was asked about the inner call, and
+    // `/approve` writes its answer against the wakeup's call id — which the
+    // inner gate reads back on the re-run.
+    assert_eq!(
+        pending.wakeup,
+        Wakeup::Approval {
+            call_id: "code-1-gated".into()
+        }
+    );
+
+    assert!(
+        run.steps().is_empty(),
+        "a call that stopped to wait did not happen"
+    );
+    let rows = scratch.rows.lock().unwrap();
+    let key = rows.keys().next().expect("its work survives the wait");
+    assert_eq!(key.call_id, "code-1-gated");
+}
+
+/// And a model's own round has no enclosing call to lift to — its calls *are*
+/// what the assistant block records, which is what makes them findable.
+#[tokio::test]
+async fn a_suspension_in_the_model_own_round_keeps_the_call_that_raised_it() {
+    let (executor, _scratch) = gated_executor();
+    let context = ledgered();
+    let run = context.run.clone().unwrap();
+    assert!(context.nested.is_none());
+
+    let mut request = call("gated", "{}");
+    request.id = "code-1-gated".into();
+    one(&executor, request, &context).await;
+
+    assert_eq!(run.suspension().unwrap().call_id, "code-1-gated");
+}

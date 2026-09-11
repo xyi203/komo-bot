@@ -826,6 +826,132 @@ pub(crate) fn twice_gated_runtime(
     rt
 }
 
+/// A stand-in for `python`: a tool that dispatches a call of its own, the way
+/// a program's `tools.x(...)` does — one nested round, numbered under the
+/// enclosing call's identity. The executor handle arrives after the fact
+/// because this tool sits in the catalog it dispatches through, exactly as the
+/// real one does.
+struct Program(Arc<std::sync::OnceLock<komo_services::tool_execution::WeakToolExecutor>>);
+
+#[async_trait]
+impl Tool for Program {
+    fn name(&self) -> &'static str {
+        "program"
+    }
+    fn description(&self) -> &'static str {
+        "runs a gated call from inside its own body"
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        ctx: &komo_core::domain::context::ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        let executor = self
+            .0
+            .get()
+            .and_then(|weak| weak.upgrade())
+            .expect("the executor outlives the turn");
+        let turn = ToolTurnContext {
+            session: ctx.session.clone(),
+            run: ctx.run.clone(),
+            // 0 = unlimited, the same budget `python`'s own sub-turn takes:
+            // a sub-call's result enters the program, not the context.
+            budget: TurnResultBudget::new(0),
+            spin: SpinDetector::default(),
+            nested: Some(Arc::new(komo_services::tool_execution::NestedCalls::new(
+                ctx.call_id().unwrap_or_default(),
+                ctx.call_index().unwrap_or_default(),
+            ))),
+        };
+        let nested = ToolCallReq {
+            id: "code-1-gated".into(),
+            call_id: None,
+            name: "gated".into(),
+            args: "{}".into(),
+        };
+        executor
+            .execute_round(std::slice::from_ref(&nested), &turn)
+            .await;
+        Ok(ToolOutput::text("the program finished"))
+    }
+}
+
+/// The whole point of lifting: a program's sub-call reaches an approval, and
+/// what the log records as waiting is the **`python` call the model asked
+/// for** — the only id a continuation can find, since a call made inside
+/// another tool's body appears in no assistant block. The wakeup still names
+/// the inner call, because that is the question the operator was asked.
+#[tokio::test]
+async fn a_program_that_stopped_for_approval_is_re_dispatched_as_itself() {
+    let db = Arc::new(
+        Db::connect(&sqlite_url("komo_rt_program_suspend.db"))
+            .await
+            .unwrap(),
+    );
+    let slot = Arc::new(std::sync::OnceLock::new());
+    let (mut rt, _) = scripted_runtime(
+        db.clone(),
+        vec![
+            tool_calls(vec![call("program", "{}")]),
+            Step::Final("done".into()),
+        ],
+        vec![],
+        30,
+    );
+    let mut executor =
+        ToolExecutor::new(komo_services::tool_execution::ToolExecutionConfig::default());
+    executor.register(Arc::new(Program(slot.clone())));
+    executor.register(Arc::new(Gated));
+    rt.tool_executor = executor
+        .with_events(db.clone())
+        .with_approver(Arc::new(Suspending));
+    rt.wakeups = Some(db.clone());
+    let _ = slot.set(rt.tool_executor.downgrade());
+
+    let outcome = rt.handle_input("cli:prog", "tidy the tree".into()).await;
+    assert!(
+        komo_core::domain::wakeup::is_suspended(&outcome.unwrap_err()),
+        "the turn stops as suspended, not as a failure"
+    );
+
+    let events = SessionEventRepository::events(&*db, "cli:prog")
+        .await
+        .unwrap();
+    let suspended = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            SessionEventKind::TurnSuspended(suspended) => Some(suspended.clone()),
+            _ => None,
+        })
+        .expect("the turn recorded what it is waiting for");
+    assert_eq!(
+        suspended.call_id, "id-program",
+        "the wait is recorded against the call the model asked for"
+    );
+    assert_eq!(
+        suspended.wakeup,
+        komo_core::domain::session_event::Wakeup::Approval {
+            call_id: "code-1-gated".into()
+        },
+        "and `/approve` still answers the call that asked"
+    );
+
+    // Which is what makes it re-dispatchable: recovery re-runs the gated calls
+    // it finds in a recorded round's blocks, and only the outer call is there.
+    let recorded = events
+        .iter()
+        .find_map(|event| match &event.kind {
+            SessionEventKind::AssistantRound(round) => Some(round.blocks.to_string()),
+            _ => None,
+        })
+        .expect("the round the model asked for is on record");
+    assert!(recorded.contains("id-program"), "{recorded}");
+    assert!(
+        !recorded.contains("code-1-gated"),
+        "a program's own calls are in no assistant block: {recorded}"
+    );
+}
+
 /// A gated call whose answer has not arrived stops the turn instead of
 /// holding the session slot — and leaves behind exactly what a
 /// continuation needs: the request on record, the call unsettled, and a

@@ -559,7 +559,35 @@ impl ToolExecutor {
                 }
             },
         );
-        futures_util::future::join_all(futures).await
+        let outcomes = futures_util::future::join_all(futures).await;
+
+        // A nested round — a `python` program's `tools.x(...)` — is made inside
+        // another tool's body, so its calls appear in no recorded assistant
+        // block (the fact `komo-tools`' `tool_gateway` module doc turns into a
+        // rewrite for the gateway tool). A suspension left under one of their
+        // ids would name a call `rebuild_from_events` cannot find, and the
+        // operator's answer would bring the turn back to run nothing. The
+        // enclosing call is the one the model asked for and the one the
+        // continuation re-dispatches, so the wait is recorded against it
+        // instead — and the program runs again from its first line.
+        //
+        // After the round, never during it: the inner call has to settle as
+        // the suspended one first, or it would record a step and lose the
+        // scratch its next attempt comes back for.
+        if let (Some(nested), Some(run)) = (&context.nested, &context.run)
+            && let Some(pending) = run.suspension()
+            && calls
+                .iter()
+                .take(MAX_CALLS_PER_ROUND)
+                .any(|call| call.call_id.as_deref().unwrap_or(&call.id) == pending.call_id)
+        {
+            run.lift_suspension(
+                &pending.call_id,
+                &nested.enclosing_call_id,
+                nested.enclosing_call_index,
+            );
+        }
+        outcomes
     }
 }
 

@@ -44,6 +44,20 @@ const HOST_SOURCE: &str = include_str!("../python/host.py");
 /// speaks in its manifest; a mismatch is refused rather than half-understood.
 pub const PROTOCOL_VERSION: u32 = 4;
 
+/// How a sub-call says the *turn* stopped to wait under it.
+///
+/// The one broker answer a program may not treat as a failure it can work
+/// around: komo is already unwinding the turn, and a program that caught this
+/// and kept going would go on making effects nobody is waiting for. `host.py`
+/// matches this prefix and raises `ToolSuspended`, which derives
+/// `BaseException` so neither `except Exception` nor `except ToolError` sees
+/// it.
+///
+/// It lives here rather than beside the tool that produces it because the other
+/// half of the agreement is this crate's embedded `host.py` — two spellings of
+/// one marker is a program that keeps running, so a test holds them together.
+pub const SUSPENDED_MARKER: &str = "komo: the turn stopped to wait";
+
 /// Ceiling on one request to the host. A plugin doing real work can be slow, so
 /// this is generous — it exists to catch a host that stopped answering, not to
 /// bound legitimate work. The tool layer applies its own per-call timeout too.

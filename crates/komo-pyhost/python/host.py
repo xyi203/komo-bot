@@ -113,6 +113,24 @@ class ToolError(Exception):
         self.message = message
 
 
+#: How komo says the *turn* stopped to wait under a sub-call. Kept byte-identical
+#: to `SUSPENDED_MARKER` in komo-pyhost's lib.rs, which a test asserts.
+SUSPENDED_MARKER = "komo: the turn stopped to wait"
+
+
+class ToolSuspended(BaseException):
+    """The turn stopped to wait, so the program stops with it.
+
+    A `BaseException` rather than an `Exception` on purpose: a program that
+    wrapped its work in `except Exception` — or `except ToolError`, which is
+    what a careful one catches — would otherwise swallow this and keep calling
+    tools while komo was already ending the turn. Nothing a program can write
+    catches it by accident, and komo discards whatever this run would have
+    answered: the enclosing call is the suspended one, and the program runs
+    again from its first line once the answer arrives.
+    """
+
+
 class Text(str):
     """What a tool call returns: the text, with the same result as data beside it.
 
@@ -160,7 +178,10 @@ class Tools:
                 {"run": self._request_id, "name": name, "args": kwargs},
             )
             if result.get("is_error"):
-                raise ToolError(name, result.get("content", ""))
+                content = result.get("content", "")
+                if content.startswith(SUSPENDED_MARKER):
+                    raise ToolSuspended(content)
+                raise ToolError(name, content)
             return Text(result.get("content", ""), result.get("structured"))
 
         call.__name__ = name
@@ -348,6 +369,14 @@ def serve(request, plugins: Plugins):
         result = handle(request, plugins)
         if request_id is not None:
             send({"id": request_id, "result": result})
+    except ToolSuspended as stopped:
+        # Not a failure — the turn is waiting, and this program unwound so it
+        # would make no further effects. komo drops the answer (the enclosing
+        # call is the suspended one), but the request still has to *be*
+        # answered, or the host would leave komo blocked on an id nobody
+        # completes.
+        if request_id is not None:
+            send({"id": request_id, "error": {"message": f"{stopped}"}})
     except Exception as error:
         detail = f"{error}"
         if request.get("method") == "run_code":

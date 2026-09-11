@@ -502,6 +502,68 @@ except ToolError as error:
     host.shutdown().await;
 }
 
+/// The marker has two spellings — this constant and the one `host.py` matches
+/// against — and a program that kept running is what a drift between them
+/// would look like.
+#[test]
+fn the_host_speaks_the_same_suspension_marker() {
+    assert!(
+        HOST_SOURCE.contains(&format!("SUSPENDED_MARKER = \"{SUSPENDED_MARKER}\"")),
+        "host.py must declare the same marker komo sends"
+    );
+}
+
+/// A turn that stopped to wait takes the program with it, however carefully
+/// the program catches. `ToolSuspended` derives `BaseException` for exactly
+/// this: a swallowed suspension is a program still making effects while komo
+/// is ending the turn.
+#[tokio::test]
+async fn a_suspension_unwinds_a_program_that_catches_everything() {
+    let Some(python) = python() else { return };
+    let scratch = Scratch::new("codemode-suspended");
+    let (host, _events) = PyHost::spawn(&python, scratch.home(), &scratch.plugins())
+        .await
+        .unwrap();
+
+    let outcome = host
+        .run_code(
+            r#"
+try:
+    tools.cron(action="add")
+except BaseException as error:
+    pass
+return "kept going"
+"#,
+            |_name, _args| std::future::ready(Err(format!("{SUSPENDED_MARKER}: come back later"))),
+        )
+        .await;
+
+    // Caught — `except BaseException` catches anything — but the program is
+    // not what this guards: a bare `except Exception` is, and the program
+    // above proves the exception is not one.
+    assert_eq!(outcome.unwrap().result.unwrap(), "kept going");
+
+    let outcome = host
+        .run_code(
+            r#"
+try:
+    tools.cron(action="add")
+except Exception as error:
+    return "swallowed"
+return "kept going"
+"#,
+            |_name, _args| std::future::ready(Err(format!("{SUSPENDED_MARKER}: come back later"))),
+        )
+        .await;
+    let message = match outcome {
+        Err(PyHostError::Plugin(message)) => message,
+        other => panic!("the program should unwind, not answer: {other:?}"),
+    };
+    assert!(message.contains(SUSPENDED_MARKER), "{message}");
+
+    host.shutdown().await;
+}
+
 /// A positional call says what to do about it. komo dispatches by argument
 /// name, so there is no order to bind a positional to — and the first
 /// programs written against `tools` called them positionally, spending a

@@ -54,6 +54,49 @@ use serde_json::Value;
 /// included) — going through it would only add a hop.
 pub(crate) const NOT_CALLABLE: &[&str] = &["python", "ask_user", "tool"];
 
+/// What a sub-call answers with once the turn has stopped to wait.
+///
+/// Defined by the host crate, because the Python side has to recognize it:
+/// `host.py` raises `ToolSuspended` — a `BaseException` — on this prefix, so a
+/// program cannot catch its way past the stop. See [`komo_pyhost::SUSPENDED_MARKER`].
+pub(crate) const SUSPENDED_MARKER: &str = komo_pyhost::SUSPENDED_MARKER;
+
+/// What the model is told a suspended program did: nothing yet.
+///
+/// The executor drops this — the enclosing call is the suspended one, so it
+/// records no step — but a tool still has to answer something.
+pub(crate) const WAITING_NOTE: &str =
+    "waiting — this program stopped part-way and runs again once the answer arrives";
+
+/// Whether the turn stopped on **this** call: the enclosing `python` / `py__…`
+/// call, which is where the executor lifts a sub-call's suspension to
+/// (`RunContext::lift_suspension`).
+pub(crate) fn stopped_to_wait(ctx: &ToolContext) -> bool {
+    match (&ctx.run, ctx.call_id()) {
+        (Some(run), Some(call_id)) => run.suspended_call(call_id),
+        _ => false,
+    }
+}
+
+/// Whether the turn stopped on the call **this nested round runs under** —
+/// the same question as [`stopped_to_wait`], asked from inside the program.
+///
+/// A sub-call that stops is lifted onto the enclosing call by the executor
+/// before `dispatch` reads this, so "our enclosing call is the suspended one"
+/// is exactly "one of our sub-calls stopped". A wait held by a *sibling* of the
+/// enclosing call — another tool in the model's own round — is not ours to act
+/// on: the loop lets the rest of that round finish, this program included, so
+/// stopping here would turn a neighbour's approval into this program's failure.
+/// Without a nesting record (a detached context) any wait counts, since there
+/// is no round to be a sibling in.
+fn stopped_under(turn: &ToolTurnContext) -> bool {
+    match (&turn.run, &turn.nested) {
+        (Some(run), Some(nested)) => run.suspended_call(&nested.enclosing_call_id),
+        (Some(run), None) => run.suspension().is_some(),
+        _ => false,
+    }
+}
+
 #[derive(Deserialize)]
 struct Args {
     /// The program body. Runs as a function, so a top-level `return` answers.
@@ -132,6 +175,17 @@ impl Tool for PythonTool {
                 async move { dispatch(&executor, turn, &callable, name, args).await }
             })
             .await;
+
+        // A sub-call that stopped to wait took the program with it, and the
+        // wait is now *this* call's (`RunContext::lift_suspension`): the
+        // executor records no step for it, keeps its scratch, and drops
+        // whatever comes back. Answered before the outcome is read, because
+        // how the program ended — an unwound `ToolSuspended`, a `return` — says
+        // nothing about why, and "The program failed" is the wrong thing to
+        // put in front of a model that is about to run it again.
+        if stopped_to_wait(ctx) {
+            return Ok(ToolOutput::text(WAITING_NOTE));
+        }
 
         match outcome {
             Ok(result) => Ok(render(result)),
@@ -222,6 +276,9 @@ pub(crate) fn sub_turn(ctx: &ToolContext) -> ToolTurnContext {
 /// Returns `Err(text)` for a call the caller should see as a failure — an
 /// unknown or forbidden name, or a tool that errored. The host turns that into
 /// a `ToolError` the python side may catch.
+///
+/// One `Err` is not a failure and must not be caught: a call that stopped the
+/// turn answers with [`SUSPENDED_MARKER`], and no further call runs after it.
 pub(crate) async fn dispatch(
     executor: &komo_services::tool_execution::ToolExecutor,
     turn: &ToolTurnContext,
@@ -232,6 +289,17 @@ pub(crate) async fn dispatch(
     if NOT_CALLABLE.contains(&name.as_str()) {
         return Err(format!(
             "`{name}` cannot be called from a program; call it directly instead"
+        ));
+    }
+    // Nothing more runs once *this program's* turn has stopped. A program that
+    // caught the stop and carried on — it cannot, but the guard does not
+    // depend on that — must not make effects the turn is already walking away
+    // from. Scoped to the enclosing call on purpose: a sibling in the model's
+    // round (a `shell` beside this `python`) may be the one waiting, and the
+    // loop lets the rest of that round finish — this program included.
+    if stopped_under(turn) {
+        return Err(format!(
+            "{SUSPENDED_MARKER}: the turn is waiting for an answer, so `{name}` was not run."
         ));
     }
     if callable.get(&name).is_none() {
@@ -264,6 +332,18 @@ pub(crate) async fn dispatch(
     let mut outcomes = executor
         .execute_round(std::slice::from_ref(&call), turn)
         .await;
+    // The round stopped the turn: an approval nobody has answered yet, or a
+    // tool that asked to be woken. The executor has already lifted the wait
+    // onto the enclosing call, so what is left is to stop the program — it is
+    // re-run from its first line on the continuation, and everything it does
+    // between here and the end of the turn is work nobody will read.
+    if stopped_under(turn) {
+        return Err(format!(
+            "{SUSPENDED_MARKER}: `{}` is waiting for an answer. This program stops here and \
+             runs again from its first line once the answer arrives.",
+            call.name
+        ));
+    }
     let outcome = outcomes.pop();
     let content = outcome
         .as_ref()
@@ -646,6 +726,81 @@ mod tests {
         call_tool(&executor, &turn, "read").await;
 
         assert_eq!(*seen.lock().unwrap(), ["code-read"]);
+    }
+
+    /// A tool that stops the turn instead of running — a sub-call whose
+    /// approval nobody has answered yet.
+    struct Waiting;
+
+    #[async_trait]
+    impl Tool for Waiting {
+        fn name(&self) -> &'static str {
+            "gated"
+        }
+        fn description(&self) -> &'static str {
+            "stops the turn waiting for an approval"
+        }
+        fn parameters_schema(&self) -> Value {
+            schema(&[], &[])
+        }
+        async fn call(&self, _input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            let _ = ctx.wait_for(
+                komo_core::domain::session_event::Wakeup::Approval {
+                    call_id: ctx.call_id().unwrap_or_default().to_string(),
+                },
+                "approve it",
+                None,
+            );
+            Ok(ToolOutput::text("never read"))
+        }
+    }
+
+    /// The turn stopped under the program, so the program stops too — and
+    /// nothing it goes on to ask for runs. A second call landing after the stop
+    /// would be an effect nobody is waiting for, made while komo is already
+    /// ending the turn.
+    #[tokio::test]
+    async fn a_suspended_sub_call_stops_the_program() {
+        let (executor, seen) = recording_executor(&["read"]);
+        let mut executor = executor;
+        executor.register(Arc::new(Waiting));
+        let ctx = enclosing_ctx();
+        let turn = sub_turn(&ctx);
+
+        let Err(stopped) = dispatch(
+            &executor,
+            &turn,
+            &executor.snapshot(),
+            "gated".to_string(),
+            serde_json::json!({}),
+        )
+        .await
+        else {
+            panic!("a call that stopped to wait is not an answer");
+        };
+        assert!(stopped.starts_with(SUSPENDED_MARKER), "{stopped}");
+
+        // Lifted onto the `python` call the model actually asked for — the one
+        // a continuation re-dispatches.
+        let pending = ctx.run.as_ref().unwrap().suspension().unwrap();
+        assert_eq!(pending.call_id, "call-0");
+
+        let Err(refused) = dispatch(
+            &executor,
+            &turn,
+            &executor.snapshot(),
+            "read".to_string(),
+            serde_json::json!({}),
+        )
+        .await
+        else {
+            panic!("nothing runs after the turn has stopped");
+        };
+        assert!(refused.starts_with(SUSPENDED_MARKER), "{refused}");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "and it was refused before it ran"
+        );
     }
 
     #[test]

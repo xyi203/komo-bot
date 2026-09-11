@@ -456,6 +456,40 @@ impl RunContext {
             .unwrap_or_else(|| self.run_id.clone())
     }
 
+    /// Move the standing suspension from the call that raised it onto the call
+    /// that **encloses** it, answering whether there was one to move.
+    ///
+    /// A call made inside another tool's body — a `python` program's
+    /// `tools.x(...)` — appears in no recorded assistant block, so a suspension
+    /// left under its id names a call recovery cannot find: `rebuild_from_events`
+    /// only re-dispatches gated calls it reads out of a round's blocks (the same
+    /// fact `komo-tools`' `tool_gateway` module doc turns into a rewrite). The
+    /// call the model asked for is the one the continuation re-runs, so that is
+    /// the one the wait has to be recorded against.
+    ///
+    /// Only the *address* moves. The `wakeup` keeps naming the inner call,
+    /// because that is the question a person was asked: `/approve` writes its
+    /// `approval/resolved` for the wakeup's call id, and the inner gate finds
+    /// that answer on the re-run ([`ApprovalGate::resolved_earlier`]) and lets
+    /// the call through without asking twice. Rewriting it would resolve an
+    /// approval nobody requested and ask for the one they had already given.
+    pub fn lift_suspension(
+        &self,
+        from_call_id: &str,
+        to_call_id: &str,
+        to_call_index: u32,
+    ) -> bool {
+        let mut slot = self.suspend.lock().unwrap();
+        match slot.as_mut() {
+            Some(pending) if pending.call_id == from_call_id => {
+                pending.call_id = to_call_id.to_string();
+                pending.call_index = to_call_index;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Whether *this call* is the one that stopped the turn — the executor's
     /// question, because a suspended call has no outcome to record.
     pub fn suspended_call(&self, call_id: &str) -> bool {

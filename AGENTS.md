@@ -275,7 +275,17 @@ direct-db fallback.
   call **keeps** is `ctx.scratch_get` / `ctx.scratch_set` (`domain/scratch.rs`):
   the call itself did not happen and starts from zero, so progress it made
   before it stopped lives in `scratch_records`, keyed by the attempt chain's
-  root turn and cleared by the executor when the call settles.
+  root turn and cleared by the executor when the call settles. A wait raised
+  inside a **nested** round — a `python` program's `tools.x(...)` — is lifted by
+  the executor onto the enclosing recorded call (`RunContext::lift_suspension`),
+  because a call made inside another tool's body appears in no assistant block
+  and `rebuild_from_events` re-dispatches only what it finds in one. Only the
+  address moves: the wakeup keeps naming the inner call, so `/approve` writes
+  its `approval/resolved` against the id the inner gate reads back on the
+  re-run. The program itself is stopped where it stood (`SUSPENDED_MARKER`, a
+  `BaseException` the Python side cannot catch) and runs again from its first
+  line when the continuation re-dispatches the `python` call — which is what
+  the program-order call numbering is for.
 - api channel is loopback/ephemeral by default; `[channels.api] enabled = true`
   + `API_SERVER_KEY` widens it. `web_dir` serves the built SPA same-origin;
   `remote_interactive = true` lets keyed remote callers run interactive turns
@@ -662,7 +672,10 @@ call the same functions, which is what keeps validation from forking.
   that loop: prototype with `python`, persist as a `@tool`. Both directions go
   through the same broker — a plugin's `tools.<name>(...)` call is dispatched by
   the runtime's own `WeakToolExecutor` (`PyTool`), so it pays the same approval
-  gate, retry classification and ledger step an ordinary call does. Two
+  gate, retry classification and ledger step an ordinary call does — and, when
+  one of those calls stops to wait, the wait is lifted onto the enclosing
+  `python` / `py__…` call, the program is unwound, and the whole program is run
+  again from its first line once the answer arrives. Two
   structural rules: the plugins directory is a **writable workspace root whose
   writes are `Risk::Dangerous` with no scope key**, so a human approves each
   file and no grant ever widens it (a `.py` there runs unsandboxed on every

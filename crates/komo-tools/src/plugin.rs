@@ -127,7 +127,7 @@ impl Tool for PyTool {
         };
         let turn = crate::python::sub_turn(ctx);
         let callable = executor.snapshot();
-        let text = self
+        let outcome = self
             .host
             .call(&self.plugin_name, input, |name, args| {
                 let executor = executor.clone();
@@ -135,9 +135,17 @@ impl Tool for PyTool {
                 let callable = callable.clone();
                 async move { crate::python::dispatch(&executor, turn, &callable, name, args).await }
             })
-            .await
-            .map_err(|error| map_error(error, &self.plugin_name))?;
-        Ok(ToolOutput::text(text))
+            .await;
+        // Same as `python`: one of those calls may have stopped the turn, and
+        // the executor lifted that wait onto *this* call — so this one did not
+        // happen either, and the answer is discarded. Read before the outcome,
+        // which would otherwise read as a plugin that raised.
+        if crate::python::stopped_to_wait(ctx) {
+            return Ok(ToolOutput::text(crate::python::WAITING_NOTE));
+        }
+        Ok(ToolOutput::text(
+            outcome.map_err(|error| map_error(error, &self.plugin_name))?,
+        ))
     }
 
     /// Long enough to outlast a human reading the approval prompt — the same

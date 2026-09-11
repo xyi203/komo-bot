@@ -20,6 +20,7 @@ use crate::domain::gateway::{InterjectSource, ReplySink};
 use crate::domain::policy::LOCAL_CHANNEL;
 use crate::domain::repository::SessionEventRepository;
 use crate::domain::run::RunStep;
+use crate::domain::scratch::{ScratchKey, TurnScratch};
 use crate::domain::session::ChannelPeer;
 use crate::domain::session_event::{
     ApprovalRequestedEvent, ApprovalResolvedEvent, ResumedWait, SessionEvent, SessionEventKind,
@@ -362,6 +363,14 @@ pub struct RunContext {
     /// wake without a log handle of its own — which is what makes waiting work
     /// in a runtime whose executor keeps no transcript (a routine's).
     waits: Arc<Mutex<TurnWaits>>,
+    /// The first turn of this turn's attempt chain — the id every continuation
+    /// of the same question agrees on. Installed by the runtime as a
+    /// continuation opens (it holds the events; nothing here does); unset on a
+    /// fresh turn, which is its own root.
+    ///
+    /// What a call's durable scratch is keyed by, since `run_id` is a new id
+    /// per attempt and would file each attempt's work under a different name.
+    root_turn: Arc<Mutex<Option<String>>>,
     /// Monotonic step counter, shared across clones so steps within a run get a
     /// stable order even when tool calls run concurrently.
     seq: Arc<AtomicI64>,
@@ -374,6 +383,7 @@ impl RunContext {
             steps: Arc::new(Mutex::new(Vec::new())),
             suspend: Arc::new(Mutex::new(None)),
             waits: Arc::new(Mutex::new(TurnWaits::default())),
+            root_turn: Arc::new(Mutex::new(None)),
             seq: Arc::new(AtomicI64::new(0)),
         }
     }
@@ -427,6 +437,25 @@ impl RunContext {
         self.waits.lock().unwrap().clone()
     }
 
+    /// Name the chain this attempt belongs to
+    /// ([`root_of_chain`](crate::domain::session_event::root_of_chain)). Called
+    /// beside [`resumed_with`](Self::resumed_with), from the one place that has
+    /// the log in hand.
+    pub fn resumed_from_root(&self, root_turn_id: String) {
+        *self.root_turn.lock().unwrap() = Some(root_turn_id);
+    }
+
+    /// The chain's root, falling back to this turn's own id — a turn nobody
+    /// resumed is the root of its chain, so the fallback is the answer rather
+    /// than a stand-in for one.
+    pub fn root_turn_id(&self) -> String {
+        self.root_turn
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| self.run_id.clone())
+    }
+
     /// Whether *this call* is the one that stopped the turn — the executor's
     /// question, because a suspended call has no outcome to record.
     pub fn suspended_call(&self, call_id: &str) -> bool {
@@ -457,6 +486,11 @@ pub struct ToolContext {
     /// transcript of its tool calls, and the identity is all that stopping
     /// takes.
     call: Option<CallRef>,
+    /// Where this call keeps work that must outlive a suspension. `None` for a
+    /// runtime with no store (aux completions, tests), which simply means a
+    /// call there starts from zero every time — the behaviour before there was
+    /// a scratch at all.
+    scratch: Option<Arc<dyn TurnScratch>>,
 }
 
 /// One call's place in its round: what a wait has to name to be re-dispatched
@@ -579,6 +613,7 @@ impl ToolContext {
             approver,
             approval: None,
             call: None,
+            scratch: None,
         }
     }
 
@@ -596,6 +631,59 @@ impl ToolContext {
             call_index,
         });
         self
+    }
+
+    /// Install the store this call keeps its across-a-suspension work in.
+    /// Installed by the executor, beside the call identity the key is built
+    /// from.
+    pub fn with_scratch(mut self, store: Arc<dyn TurnScratch>) -> Self {
+        self.scratch = Some(store);
+        self
+    }
+
+    /// Read what this call wrote under `key` on an earlier attempt.
+    ///
+    /// `None` means "nothing to resume from", whether that is because nothing
+    /// was written, because this runtime has no store, or because the store
+    /// could not be read — a caller reading scratch is asking whether it may
+    /// skip work it already did, and the safe answer to a broken store is to
+    /// do it again.
+    pub async fn scratch_get(&self, key: &str) -> Option<String> {
+        let address = self.scratch_key(key)?;
+        match self.scratch.as_ref()?.get(&address).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, key, "could not read this call's scratch; treating it as empty");
+                None
+            }
+        }
+    }
+
+    /// Keep `value` under `key` for this call's next attempt. Best-effort: a
+    /// store that will not take it costs the continuation the work, never the
+    /// call in hand.
+    pub async fn scratch_set(&self, key: &str, value: &str) {
+        let Some(address) = self.scratch_key(key) else {
+            return;
+        };
+        let Some(store) = self.scratch.as_ref() else {
+            return;
+        };
+        if let Err(error) = store.set(&address, value).await {
+            tracing::warn!(%error, key, "could not keep this call's scratch (non-fatal)");
+        }
+    }
+
+    /// This call's address in the scratch store. `None` without a run or a call
+    /// identity: neither the chain's root nor the call is knowable then, and a
+    /// key missing either would collide with somebody else's.
+    fn scratch_key(&self, key: &str) -> Option<ScratchKey> {
+        Some(ScratchKey {
+            session_id: self.session.session_id.clone(),
+            root_turn_id: self.run.as_ref()?.root_turn_id(),
+            call_id: self.call.as_ref()?.call_id.clone(),
+            key: key.to_string(),
+        })
     }
 
     /// Stop the turn here and come back when `wakeup` fires.

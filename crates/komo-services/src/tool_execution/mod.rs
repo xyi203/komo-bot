@@ -41,6 +41,7 @@ use komo_core::domain::llm::{ToolCallReq, ToolOutcome};
 use komo_core::domain::policy::{Access, Category, Policy};
 use komo_core::domain::repository::SessionEventRepository;
 use komo_core::domain::run::{RunStep, STEP_FIELD_CAP, truncate};
+use komo_core::domain::scratch::TurnScratch;
 use komo_core::domain::session_event::{
     SessionEventKind, ToolCallSettledEvent, ToolCallStartedEvent, ToolOutcome as SettledOutcome,
 };
@@ -260,6 +261,10 @@ pub struct ToolExecutionCore {
     /// holds the work and not only what was said. `None` (tests, aux executors)
     /// ⇒ nothing is recorded, which is what the transcript looked like before.
     events: Option<Arc<dyn SessionEventRepository>>,
+    /// Where a call keeps work that has to survive a suspension. `None` (tests,
+    /// aux executors) ⇒ a re-dispatched call starts from zero, which is what it
+    /// always did.
+    scratch: Option<Arc<dyn TurnScratch>>,
 }
 
 impl ToolExecutor {
@@ -278,6 +283,7 @@ impl ToolExecutor {
                 approver: Arc::new(DenyAllApprover),
                 output_store: None,
                 events: None,
+                scratch: None,
             }),
         }
     }
@@ -304,6 +310,7 @@ impl ToolExecutor {
                 approver: self.core.approver.clone(),
                 output_store: self.core.output_store.clone(),
                 events: self.core.events.clone(),
+                scratch: self.core.scratch.clone(),
             }),
         }
     }
@@ -354,6 +361,17 @@ impl ToolExecutor {
         let core = Arc::get_mut(&mut self.core)
             .expect("set the transcript during wiring, before the executor is shared");
         core.events = Some(events);
+        self
+    }
+
+    /// Install the store a call keeps its across-a-suspension work in. Absent
+    /// ⇒ `ctx.scratch_get` answers `None` and `scratch_set` drops the value, so
+    /// a call re-dispatched after a wait redoes everything — the behavior
+    /// before there was a scratch at all.
+    pub fn with_scratch(mut self, scratch: Arc<dyn TurnScratch>) -> Self {
+        let core = Arc::get_mut(&mut self.core)
+            .expect("set the scratch store during wiring, before the executor is shared");
+        core.scratch = Some(scratch);
         self
     }
 
@@ -674,6 +692,12 @@ impl ToolExecutionCore {
                 // Which call this is — what a tool that stops to wait names, so
                 // the continuation re-dispatches it as itself.
                 .with_call(call_id, call_index);
+                // What the call keeps for its own next attempt, should it stop
+                // to wait: the re-dispatch is the same call starting over, and
+                // this is the only thing that crosses that line.
+                if let Some(scratch) = &self.scratch {
+                    ctx = ctx.with_scratch(scratch.clone());
+                }
                 // Makes this call's approval a durable fact — the widest crash
                 // window in a turn is a person deciding.
                 if let (Some(events), Some(run)) = (&self.events, &context.run) {
@@ -949,6 +973,21 @@ impl ToolExecutionCore {
                     warn!(%error, tool = name, "failed to record the settled call (non-fatal)");
                 }
             }
+        }
+
+        // The call is over, so the work it was keeping for its own next attempt
+        // is too. A **suspended** call is exactly the exception: its scratch is
+        // what the continuation comes back for, which is why this reads the
+        // same flag the step above does rather than "the tool returned".
+        // Best-effort, like the step and the event — the record of the work
+        // must never cost the work.
+        if let (Some(scratch), Some(run)) = (&self.scratch, &context.run)
+            && !suspended
+            && let Err(error) = scratch
+                .clear(&context.session.session_id, &run.root_turn_id(), call_id)
+                .await
+        {
+            warn!(%error, tool = name, "failed to clear the call's scratch (non-fatal)");
         }
 
         // Charge the bounded result against the turn's cumulative budget: once

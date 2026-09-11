@@ -512,7 +512,11 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
                 .with_call_timeout_secs(model_config.tool_timeout_secs),
         )
         .with_approver(approver)
-        .with_output_store(output_store.clone());
+        .with_output_store(output_store.clone())
+        // Every runtime, unlike the transcript below: a call that stops to wait
+        // has to find its own earlier progress wherever it stopped, and a
+        // routine's turn suspends on an approval as readily as a conversation's.
+        .with_scratch(db.clone());
         // Only the main runtime records its tool calls in a transcript: every
         // other one runs on a synthetic session (delegate, cron), where a file
         // per one-shot turn is litter rather than history. Set here, not on the

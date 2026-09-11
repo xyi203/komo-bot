@@ -256,6 +256,55 @@ async fn wakeup_table_ddl_matches_push_schema() {
     assert_eq!(table_schema_sql(&old, WAKEUP_TABLE).await, reference);
 }
 
+/// Same story as the wakeup table, one release later: `scratch_records`
+/// arrived after `komo.db` did, so an existing file only gets it through
+/// `ensure_table` — and a call that cannot read back what its earlier attempt
+/// wrote is the whole failure this table exists to prevent.
+#[tokio::test]
+async fn scratch_table_ddl_matches_push_schema() {
+    let fresh = std::env::temp_dir().join("komo_scratch_ddl_fresh.db");
+    crate::persistence::reset_test_db(&fresh);
+    let db = Db::connect(&format!("turso:{}", fresh.display()))
+        .await
+        .unwrap();
+    drop(db);
+    let reference = table_schema_sql(&fresh, SCRATCH_TABLE).await;
+    assert!(!reference.is_empty(), "push_schema created the table");
+
+    let old = std::env::temp_dir().join("komo_scratch_ddl_old.db");
+    crate::persistence::reset_test_db(&old);
+    let db = Db::connect(&format!("turso:{}", old.display()))
+        .await
+        .unwrap();
+    drop(db);
+    {
+        let raw = turso::Builder::new_local(old.to_string_lossy().as_ref())
+            .build()
+            .await
+            .unwrap();
+        let conn = raw.connect().unwrap();
+        conn.pragma_update("journal_mode", "'mvcc'").await.ok();
+        conn.execute("DROP TABLE \"scratch_records\"", ())
+            .await
+            .unwrap();
+    }
+    let db = Db::connect(&format!("turso:{}", old.display()))
+        .await
+        .unwrap();
+    // And it is usable, not merely present.
+    let key = komo_core::domain::scratch::ScratchKey {
+        session_id: "s1".into(),
+        root_turn_id: "turn-1".into(),
+        call_id: "call-0".into(),
+        key: "progress".into(),
+    };
+    komo_core::domain::scratch::TurnScratch::set(&db, &key, "step 1")
+        .await
+        .unwrap();
+    drop(db);
+    assert_eq!(table_schema_sql(&old, SCRATCH_TABLE).await, reference);
+}
+
 #[tokio::test]
 async fn inbox_table_ddl_matches_push_schema() {
     let fresh = std::env::temp_dir().join("komo_inbox_ddl_fresh.db");

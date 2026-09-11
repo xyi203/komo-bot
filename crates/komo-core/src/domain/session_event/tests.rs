@@ -928,3 +928,38 @@ fn an_unchanged_request_header_needs_no_new_snapshot() {
     };
     assert!(one_more_tool.differs_from(&initial));
 }
+
+/// Three attempts at one question walk home to the first of them, because a
+/// call's scratch has to be findable under one name however often the turn
+/// stopped and came back.
+#[test]
+fn a_chain_of_continuations_has_one_root() {
+    let started = |seq: u64, turn: &str, from: Option<&str>| {
+        SessionEvent::new(
+            seq,
+            at("2026-08-31T00:00:00Z"),
+            SessionEventKind::TurnStarted {
+                turn_id: turn.into(),
+                resumed_from: from.map(str::to_string),
+            },
+        )
+    };
+    let events = vec![
+        started(0, "turn-1", None),
+        started(1, "turn-2", Some("turn-1")),
+        started(2, "turn-3", Some("turn-2")),
+    ];
+
+    assert_eq!(root_of_chain(&events, "turn-3"), "turn-1");
+    assert_eq!(root_of_chain(&events, "turn-2"), "turn-1");
+    assert_eq!(
+        root_of_chain(&events, "turn-1"),
+        "turn-1",
+        "a turn nobody resumed is its own root"
+    );
+    assert_eq!(
+        root_of_chain(&[], "turn-9"),
+        "turn-9",
+        "and so is one this log says nothing about"
+    );
+}

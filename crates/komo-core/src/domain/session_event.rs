@@ -745,6 +745,39 @@ pub fn attempt_chain(events: &[SessionEvent], turn_id: &str) -> std::collections
     }
 }
 
+/// The chain's **first** attempt: the turn nobody resumed from.
+///
+/// A continuation carries a new turn id, so anything that has to stay the same
+/// across a suspension — a call's scratch — cannot be keyed on the turn that is
+/// running. This is the one id every attempt at the same question agrees on.
+///
+/// Read off the log rather than threaded through the resume path, so a turn
+/// that came back twice walks all the way home rather than to its predecessor.
+/// A log with no `turn/started` for `turn_id` (an aux runtime, a test) answers
+/// with `turn_id` itself, which is the right reading: a turn nobody resumed is
+/// its own root.
+pub fn root_of_chain(events: &[SessionEvent], turn_id: &str) -> String {
+    let mut current = turn_id.to_string();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(current.clone());
+    loop {
+        let parent = events.iter().find_map(|event| match &event.kind {
+            SessionEventKind::TurnStarted {
+                turn_id,
+                resumed_from: Some(from),
+            } if *turn_id == current => Some(from.clone()),
+            _ => None,
+        });
+        match parent {
+            // The same cycle guard `attempt_chain` carries, for the same
+            // reason: the log's ordering makes one impossible, nothing here
+            // proves it.
+            Some(from) if seen.insert(from.clone()) => current = from,
+            _ => return current,
+        }
+    }
+}
+
 /// What ended one call's wait, as the log recorded it.
 ///
 /// Handed back to the call that stopped, so a `wait` that has come due returns

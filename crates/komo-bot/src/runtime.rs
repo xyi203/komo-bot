@@ -12,7 +12,7 @@ use komo_core::domain::{
     session::Session,
     session_event::{
         AssistantMessageEvent, MessageSource, SessionEvent, SessionEventKind, SurfacePlacement,
-        TurnRecorder, TurnSuspendedEvent, UserMessageEvent, fold_turn_waits,
+        TurnRecorder, TurnSuspendedEvent, UserMessageEvent, fold_turn_waits, root_of_chain,
     },
     wakeup::{Suspended, WakeupRegistration, WakeupRepository, is_suspended},
 };
@@ -495,6 +495,12 @@ impl AgentRuntime {
                 // stopped is about to be re-dispatched and has to recognise its
                 // own wake instead of registering a second one.
                 run.resumed_with(fold_turn_waits(&events, &turn_id));
+                // And which chain this attempt belongs to. A call's scratch is
+                // keyed by the chain's root, not by the turn running it: the
+                // whole point is that a re-dispatched call finds what its
+                // earlier attempt left behind, and every attempt has an id of
+                // its own.
+                run.resumed_from_root(root_of_chain(&events, &turn_id));
                 Some((events, turn_id))
             }
         };

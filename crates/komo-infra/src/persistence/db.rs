@@ -7,6 +7,9 @@ use tracing::info;
 
 use crate::memory::memory_db::MemoryRecord;
 use crate::persistence::cron::CronJobRecord;
+use crate::persistence::scratch::{
+    SCRATCH_TABLE, SCRATCH_TABLE_DDL, ScratchRecord, clear_session_scratch,
+};
 use crate::persistence::wakeup::{WAKEUP_TABLE, WAKEUP_TABLE_DDL, WakeupRecord};
 use crate::persistence::{
     DEFAULT_POOL_SIZE, ensure_columns, ensure_table, prepare_turso_path,
@@ -403,6 +406,7 @@ impl Db {
             ensure_table(p, INBOX_TABLE, INBOX_TABLE_DDL).await?;
             ensure_columns(p, INBOX_TABLE, INBOX_COLUMNS).await?;
             ensure_table(p, WAKEUP_TABLE, WAKEUP_TABLE_DDL).await?;
+            ensure_table(p, SCRATCH_TABLE, SCRATCH_TABLE_DDL).await?;
             // The durable tables keep their own schema knowledge in their own
             // modules; they are migrated in place and never dropped to be
             // rebuilt.
@@ -425,6 +429,7 @@ impl Db {
                 RunRecord,
                 RunStepRecord,
                 InboxRecord,
+                ScratchRecord,
                 // Durable, and formerly one file each (docs/adr/0004).
                 CronJobRecord,
                 MemoryRecord,
@@ -617,6 +622,9 @@ impl SessionRepository for Db {
         for record in rows {
             if self.events.messages(&record.id).await?.is_empty() {
                 // No transcript file to remove — that is what empty means here.
+                // Its scratch goes with it, for the same reason
+                // `delete_session` takes it: nothing is left to resume.
+                clear_session_scratch(&mut conn, &record.id).await?;
                 record.delete().exec(&mut conn).await?;
                 removed += 1;
             }
@@ -719,12 +727,15 @@ impl SessionRepository for Db {
         // row itself, so a mid-sequence failure rolls back cleanly (mirrors
         // `RunRepository::prune`). Runs/todos keyed by this session
         // are left as harmless orphans — they never surface in the session list.
+        // Scratch rows are not: they are a suspended call's working state, and
+        // a session that is gone has no call to come back for them.
         with_write_retry(|| async {
             let mut conn = self.inner.connection().await?;
             let mut tx = conn.transaction().await?;
             let Ok(record) = SessionRecord::get_by_id(&mut tx, session_id).await else {
                 return Ok(false);
             };
+            clear_session_scratch(&mut tx, session_id).await?;
             record.delete().exec(&mut tx).await?;
             tx.commit().await?;
             Ok(true)

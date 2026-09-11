@@ -20,6 +20,7 @@ pub mod repository;
 pub mod reviewer;
 pub mod run;
 pub mod run_projection;
+pub mod scratch;
 pub mod session;
 pub mod session_event;
 pub mod skill;

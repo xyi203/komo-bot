@@ -4,6 +4,8 @@
 
 use super::*;
 use async_trait::async_trait;
+use komo_core::domain::scratch::ScratchKey;
+use komo_core::domain::session_event::Wakeup;
 use komo_core::domain::tool::ToolOutput;
 use serde_json::Value;
 
@@ -1339,4 +1341,106 @@ fn only_a_complete_indirection_is_rewritten() {
         resolve_gateway_calls(std::slice::from_ref(&plain), &snapshot).is_none(),
         "a round with no indirection is not rebuilt"
     );
+}
+
+// ── scratch ──────────────────────────────────────────────────────────────────
+
+/// An in-memory [`TurnScratch`], keyed exactly as the real one is.
+#[derive(Default)]
+struct FakeScratch {
+    rows: Mutex<std::collections::HashMap<ScratchKey, String>>,
+}
+
+#[async_trait]
+impl TurnScratch for FakeScratch {
+    async fn get(&self, key: &ScratchKey) -> anyhow::Result<Option<String>> {
+        Ok(self.rows.lock().unwrap().get(key).cloned())
+    }
+    async fn set(&self, key: &ScratchKey, value: &str) -> anyhow::Result<()> {
+        self.rows
+            .lock()
+            .unwrap()
+            .insert(key.clone(), value.to_string());
+        Ok(())
+    }
+    async fn clear(
+        &self,
+        session_id: &str,
+        root_turn_id: &str,
+        call_id: &str,
+    ) -> anyhow::Result<()> {
+        self.rows.lock().unwrap().retain(|key, _| {
+            !(key.session_id == session_id
+                && key.root_turn_id == root_turn_id
+                && key.call_id == call_id)
+        });
+        Ok(())
+    }
+}
+
+/// Writes a scratch key, and optionally stops the turn on the way out — the
+/// two shapes the executor has to tell apart when it decides whether the key
+/// may go.
+struct ScratchTool {
+    waits: bool,
+}
+
+#[async_trait]
+impl Tool for ScratchTool {
+    fn name(&self) -> &'static str {
+        "scratcher"
+    }
+    fn description(&self) -> &'static str {
+        "keeps a note across a suspension"
+    }
+    async fn call(&self, _input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+        ctx.scratch_set("progress", "step 3 of 5").await;
+        if self.waits {
+            let _ = ctx.wait_for(Wakeup::UserReply, "waiting", None);
+        }
+        Ok(ToolOutput::text("ok"))
+    }
+}
+
+fn scratched(waits: bool) -> (ToolExecutor, Arc<FakeScratch>) {
+    let scratch = Arc::new(FakeScratch::default());
+    let executor = executor(
+        vec![Arc::new(ScratchTool { waits })],
+        ToolExecutionConfig::default(),
+    )
+    .with_scratch(scratch.clone());
+    (executor, scratch)
+}
+
+/// A settled call has nothing left to resume, so its working state goes with
+/// it — otherwise every turn leaves rows behind that nothing will ever read.
+#[tokio::test]
+async fn a_settled_call_takes_its_scratch_with_it() {
+    let (executor, scratch) = scratched(false);
+    let context = ledgered();
+    let out = one(&executor, call("scratcher", "{}"), &context).await;
+    assert_eq!(out.content, "ok");
+    assert!(
+        scratch.rows.lock().unwrap().is_empty(),
+        "the call settled; nothing comes back for its notes"
+    );
+}
+
+/// And a call that stopped to wait keeps it: the continuation is that same
+/// call starting over, and this is the only thing that crosses the line.
+#[tokio::test]
+async fn a_suspended_call_keeps_its_scratch() {
+    let (executor, scratch) = scratched(true);
+    let context = ledgered();
+    one(&executor, call("scratcher", "{}"), &context).await;
+
+    let rows = scratch.rows.lock().unwrap();
+    let (key, value) = rows.iter().next().expect("the note survives the wait");
+    assert_eq!(value, "step 3 of 5");
+    assert_eq!(key.session_id, "cli:test");
+    assert_eq!(
+        key.root_turn_id, "run-1",
+        "a fresh turn is the root of its own chain"
+    );
+    assert_eq!(key.key, "progress");
 }

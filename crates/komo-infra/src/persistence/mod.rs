@@ -7,6 +7,7 @@
 //! (docs/adr/0004).
 pub mod cron;
 pub mod db;
+pub mod scratch;
 pub mod session_event_store;
 pub mod session_log;
 pub mod wakeup;

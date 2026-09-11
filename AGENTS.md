@@ -78,6 +78,7 @@ code is gone — an absent `komo.db` is created, a present one is used.
 | `komo.db` · `memory_records` | long-term memories | durable — **additive changes only** |
 | `komo.db` · `cron_job_records` | routines: a `Trigger`, an action, and the last 20 `RoutineRun`s | durable — **additive changes only**; `schedule` / `last_*` are retired columns kept (and written empty) because dropping one is not additive |
 | `komo.db` · `wakeup_records` | standing wakeups — one row per suspended turn's wait | durable — same retired-column rule: `at` / `task_id` / `filter` outlived the timer and event waits and are written `0` / `""` |
+| `komo.db` · `scratch_records` | a call's durable working state across a suspension, keyed by the attempt chain's root turn | disposable **by row** — cleared when the call settles, deleted with the session |
 | `komo.db` · `chunk_records` | the hybrid search index over the note vault and over komo's own transcripts, split by a `collection` column | disposable **by collection** — every row is reproducible from its source file or transcript |
 | `~/.komo/sessions/<id>/` | transcripts — a manifest plus append-only `.jsonl` segments | disposable |
 | `~/.komo/permissions.json` | saved approval grants | durable |
@@ -270,7 +271,11 @@ direct-db fallback.
   (`fold_turn_waits`) as the continuation opens — so `ctx.resumed_wait()` hands
   the call its own wake, and `ctx.waits_taken()` is a per-turn budget counted
   from the log rather than from memory it would lose. A tool reading `Some`
-  from `resumed_wait` must return it, never wait again.
+  from `resumed_wait` must return it, never wait again. What a re-dispatched
+  call **keeps** is `ctx.scratch_get` / `ctx.scratch_set` (`domain/scratch.rs`):
+  the call itself did not happen and starts from zero, so progress it made
+  before it stopped lives in `scratch_records`, keyed by the attempt chain's
+  root turn and cleared by the executor when the call settles.
 - api channel is loopback/ephemeral by default; `[channels.api] enabled = true`
   + `API_SERVER_KEY` widens it. `web_dir` serves the built SPA same-origin;
   `remote_interactive = true` lets keyed remote callers run interactive turns

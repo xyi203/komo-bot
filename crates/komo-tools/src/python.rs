@@ -39,7 +39,7 @@ use komo_pyhost::{PyHostError, SharedHost, ToolAnswer};
 use komo_services::tool_execution::{
     NestedCalls, SpinDetector, ToolTurnContext, TurnResultBudget, WeakToolExecutor,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Tools python may not call, whatever the catalog says — from a program or
@@ -188,7 +188,12 @@ impl Tool for PythonTool {
         }
 
         match outcome {
-            Ok(result) => Ok(render(result)),
+            // A program that finished after diverging from the attempt it was
+            // replaying has re-done work that attempt had already done, and the
+            // model is the only party that can judge what that cost — so it is
+            // told, rather than left to read a clean answer over a double
+            // effect.
+            Ok(result) => Ok(note_divergence(render(result), &turn)),
             Err(PyHostError::Unavailable(message)) => Err(ToolError::Failed(anyhow::anyhow!(
                 "the plugin host is unavailable, so `python` did not run: {message}"
             ))),
@@ -257,9 +262,14 @@ pub(crate) fn sub_turn(ctx: &ToolContext) -> ToolTurnContext {
         budget: TurnResultBudget::new(0),
         spin: SpinDetector::default(),
         nested: match (ctx.call_id(), ctx.call_index()) {
-            (Some(call_id), Some(call_index)) => {
-                Some(Arc::new(NestedCalls::new(call_id, call_index)))
-            }
+            (Some(call_id), Some(call_index)) => Some(Arc::new(NestedCalls::new(
+                call_id,
+                call_index,
+                // The enclosing call's own scratch: a sub-call's answer is kept
+                // under *this* call's keys, which the executor clears when this
+                // call settles — so a finished program leaves nothing behind.
+                ctx.scratch_handle(),
+            ))),
             _ => None,
         },
     }
@@ -286,20 +296,50 @@ pub(crate) async fn dispatch(
     name: String,
     args: Value,
 ) -> Result<ToolAnswer, String> {
-    if NOT_CALLABLE.contains(&name.as_str()) {
-        return Err(format!(
-            "`{name}` cannot be called from a program; call it directly instead"
-        ));
-    }
     // Nothing more runs once *this program's* turn has stopped. A program that
     // caught the stop and carried on — it cannot, but the guard does not
     // depend on that — must not make effects the turn is already walking away
     // from. Scoped to the enclosing call on purpose: a sibling in the model's
     // round (a `shell` beside this `python`) may be the one waiting, and the
     // loop lets the rest of that round finish — this program included.
+    //
+    // First of everything, memo included: a stopped turn is not asking what
+    // this call already answered, it is asking the program to end.
     if stopped_under(turn) {
         return Err(format!(
             "{SUSPENDED_MARKER}: the turn is waiting for an answer, so `{name}` was not run."
+        ));
+    }
+
+    // The call's index stays the executor's to derive — it is the position in
+    // the round, and a nested round holds one call, so it is always 0. The
+    // ordinal is carried in the id, which is what both the gate and the scratch
+    // key on.
+    //
+    // Taken before the name is judged, so that a call the program makes and
+    // komo refuses still costs an ordinal: the numbering has to describe the
+    // program, not the subset of it komo was willing to run, or a refusal on
+    // one attempt and not the next would shift every ordinal after it.
+    let (id, memo_key) = match &turn.nested {
+        Some(nested) => {
+            let ordinal = nested.next_ordinal();
+            (format!("code-{ordinal}-{name}"), Some(memo_key(ordinal)))
+        }
+        None => (format!("code-{name}"), None),
+    };
+    let args = args.to_string();
+
+    // What this call answered on the attempt that stopped, if it is this call.
+    // Read before every check below, because a memoised call already ran: what
+    // the catalog holds now, and whether the name is one a program may reach
+    // for, are questions about running it.
+    if let Some(memo) = replay(turn, memo_key.as_deref(), &name, &args).await {
+        return finish(memo.content, memo.structured);
+    }
+
+    if NOT_CALLABLE.contains(&name.as_str()) {
+        return Err(format!(
+            "`{name}` cannot be called from a program; call it directly instead"
         ));
     }
     if callable.get(&name).is_none() {
@@ -315,19 +355,11 @@ pub(crate) async fn dispatch(
         ));
     }
 
-    // The call's index stays the executor's to derive — it is the position in
-    // the round, and a nested round holds one call, so it is always 0. The
-    // ordinal is carried in the id, which is what both the gate and the scratch
-    // key on.
-    let id = match &turn.nested {
-        Some(nested) => format!("code-{}-{name}", nested.next_ordinal()),
-        None => format!("code-{name}"),
-    };
     let call = ToolCallReq {
         id,
         call_id: None,
         name,
-        args: args.to_string(),
+        args,
     };
     let mut outcomes = executor
         .execute_round(std::slice::from_ref(&call), turn)
@@ -349,16 +381,126 @@ pub(crate) async fn dispatch(
         .as_ref()
         .map(|o| o.content.clone())
         .unwrap_or_default();
-    // The executor answers a failure as content (the model is meant to recover
-    // from it), so "did this work" has to be read off the text — the same
-    // convention every other reader of an outcome uses.
+    let structured = outcome.map(|o| o.structured).unwrap_or(Value::Null);
+
+    // Keep what the call answered, so a re-run of this program reads it back
+    // instead of doing the work again. A failure and an uncertain outcome are
+    // kept exactly like a success: what the program saw the first time is what
+    // it has to see again, error text included, or the branch it took then is
+    // not the branch it takes now.
+    if let (Some(nested), Some(key)) = (&turn.nested, &memo_key)
+        && let Some(scratch) = &nested.scratch
+        && let Ok(record) = serde_json::to_string(&SubCallMemo {
+            name: call.name.clone(),
+            args: call.args.clone(),
+            content: content.clone(),
+            structured: structured.clone(),
+        })
+    {
+        scratch.set(key, &record).await;
+    }
+
+    finish(content, structured)
+}
+
+/// What one sub-call answered, kept under the enclosing call's scratch so the
+/// re-run after a suspension does not make it again.
+///
+/// The arguments are kept alongside the answer because the ordinal alone does
+/// not identify a call: it says *when* in the program it was made, and only a
+/// program that makes the same calls in the same order is the program this memo
+/// belongs to.
+#[derive(Serialize, Deserialize)]
+struct SubCallMemo {
+    name: String,
+    /// Exactly as the call was serialized — `serde_json` writes an object's
+    /// keys in sorted order (no `preserve_order` anywhere in this workspace),
+    /// so the same kwargs render the same bytes on both attempts.
+    args: String,
+    content: String,
+    structured: Value,
+}
+
+/// Where in the enclosing call's scratch the answer to its `ordinal`-th
+/// sub-call lives.
+fn memo_key(ordinal: u32) -> String {
+    format!("sub/{ordinal}")
+}
+
+/// The answer an earlier attempt of this program left for this call, if that is
+/// what it is.
+///
+/// `None` — run it — whenever the memo is not certainly this call's: no scratch
+/// to read, nothing written at that ordinal, or a record that will not parse.
+/// A record that is there but names a *different* call means the two runs are
+/// different programs, which is the one case that costs something: the earlier
+/// attempt's work at this ordinal already happened and cannot be handed back,
+/// so it is redone as new work and [`mark_diverged`](NestedCalls::mark_diverged)
+/// stops every later ordinal from replaying a program this one is no longer.
+async fn replay(
+    turn: &ToolTurnContext,
+    key: Option<&str>,
+    name: &str,
+    args: &str,
+) -> Option<SubCallMemo> {
+    let nested = turn.nested.as_ref()?;
+    if nested.diverged() {
+        return None;
+    }
+    let memo: SubCallMemo =
+        serde_json::from_str(&nested.scratch.as_ref()?.get(key?).await?).ok()?;
+    if memo.name == name && memo.args == args {
+        tracing::debug!(
+            call = %key.unwrap_or_default(),
+            tool = name,
+            "answered a sub-call from the attempt that stopped"
+        );
+        return Some(memo);
+    }
+    nested.mark_diverged();
+    tracing::warn!(
+        call = %key.unwrap_or_default(),
+        tool = name,
+        was = %memo.name,
+        "this program made a different call than the attempt that stopped; \
+         running it as new work, so what that attempt did here may run twice"
+    );
+    None
+}
+
+/// What the program sees for one call, replayed or freshly run.
+///
+/// The executor answers a failure as content (the model is meant to recover
+/// from it), so "did this work" has to be read off the text — the same
+/// convention every other reader of an outcome uses. Shared with the replay
+/// path so a memoised failure raises the `ToolError` it raised the first time,
+/// rather than arriving as a string the program reads as success.
+fn finish(content: String, structured: Value) -> Result<ToolAnswer, String> {
     if content.starts_with("error:") || content.starts_with("tool `") {
         return Err(content);
     }
     Ok(ToolAnswer {
         content,
-        structured: outcome.map(|o| o.structured).unwrap_or(Value::Null),
+        structured,
     })
+}
+
+/// What the model is told about a program that did not re-run the way it ran
+/// the first time.
+const DIVERGED_NOTE: &str = "Note: this program stopped for an approval earlier and was run \
+     again, but it made different tool calls this time, so work it did before the stop may have \
+     run twice. A program that may stop for an approval should make the same calls in the same \
+     order every time it runs.";
+
+/// Append [`DIVERGED_NOTE`] if this run diverged from the one it replayed.
+pub(crate) fn note_divergence(output: ToolOutput, turn: &ToolTurnContext) -> ToolOutput {
+    match &turn.nested {
+        Some(nested) if nested.diverged() => {
+            let text = format!("{}\n\n{DIVERGED_NOTE}", output.text);
+            ToolOutput { text, ..output }
+        }
+        _ => output,
+    }
 }
 
 /// Turn a finished program into the model's answer.
@@ -447,6 +589,8 @@ fn argument_names(schema: &Value) -> Vec<String> {
 mod tests {
     use super::*;
     use komo_core::domain::catalog::ToolCatalog;
+    use komo_core::domain::context::RunContext;
+    use komo_core::domain::scratch::{ScratchKey, TurnScratch};
     use komo_core::domain::tool::ToolOutput;
 
     struct Fake(&'static str, Value);
@@ -801,6 +945,344 @@ mod tests {
             seen.lock().unwrap().is_empty(),
             "and it was refused before it ran"
         );
+    }
+
+    // ── replaying a program after it stopped ────────────────────────────────
+
+    /// The store the real one stands in for: what one call kept, keyed by the
+    /// attempt chain's root rather than by the attempt.
+    #[derive(Default)]
+    struct FakeScratch {
+        rows: std::sync::Mutex<std::collections::HashMap<ScratchKey, String>>,
+    }
+
+    #[async_trait]
+    impl TurnScratch for FakeScratch {
+        async fn get(&self, key: &ScratchKey) -> anyhow::Result<Option<String>> {
+            Ok(self.rows.lock().unwrap().get(key).cloned())
+        }
+        async fn set(&self, key: &ScratchKey, value: &str) -> anyhow::Result<()> {
+            self.rows
+                .lock()
+                .unwrap()
+                .insert(key.clone(), value.to_string());
+            Ok(())
+        }
+        async fn clear(
+            &self,
+            session_id: &str,
+            root_turn_id: &str,
+            call_id: &str,
+        ) -> anyhow::Result<()> {
+            self.rows.lock().unwrap().retain(|key, _| {
+                !(key.session_id == session_id
+                    && key.root_turn_id == root_turn_id
+                    && key.call_id == call_id)
+            });
+            Ok(())
+        }
+    }
+
+    /// An operator who was not at the keyboard, and then was: the first
+    /// question stops the turn, every one after it is answered yes.
+    #[derive(Default)]
+    struct SuspendOnce(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl komo_core::domain::approval::Approver for SuspendOnce {
+        async fn decide(
+            &self,
+            _request: &komo_core::domain::approval::ApprovalRequest,
+        ) -> komo_core::domain::approval::Decision {
+            match self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed) {
+                0 => komo_core::domain::approval::Decision::Suspend,
+                _ => komo_core::domain::approval::Decision::Allow,
+            }
+        }
+    }
+
+    /// A tool that asks before it acts, and only records a run once it has an
+    /// answer — the `cron add` shape: the whole reason a program stops.
+    struct Gated(Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl Tool for Gated {
+        fn name(&self) -> &'static str {
+            "cron"
+        }
+        fn description(&self) -> &'static str {
+            "asks before it acts"
+        }
+        fn parameters_schema(&self) -> Value {
+            schema(&[], &["action"])
+        }
+        async fn call(&self, _input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            let request = komo_core::domain::approval::ApprovalRequest::normal("add a routine");
+            if ctx.decide(&request).await.is_suspended() {
+                let _ = ctx.wait_for(
+                    komo_core::domain::session_event::Wakeup::Approval {
+                        call_id: ctx.call_id().unwrap_or_default().to_string(),
+                    },
+                    "add a routine",
+                    None,
+                );
+                return Ok(ToolOutput::text("never read"));
+            }
+            self.0
+                .lock()
+                .unwrap()
+                .push(ctx.call_id().unwrap_or_default().to_string());
+            Ok(ToolOutput::text("the routine was added"))
+        }
+    }
+
+    /// A tool that always fails, and says how often it was asked to.
+    struct Failing(Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl Tool for Failing {
+        fn name(&self) -> &'static str {
+            "boom"
+        }
+        fn description(&self) -> &'static str {
+            "fails, every time"
+        }
+        fn parameters_schema(&self) -> Value {
+            schema(&[], &[])
+        }
+        async fn call(&self, _input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(ctx.call_id().unwrap_or_default().to_string());
+            Err(ToolError::Failed(anyhow::anyhow!("the disk is on fire")))
+        }
+    }
+
+    /// The `python` call's own context as the executor builds it: one call
+    /// identity, and the scratch its program's answers are kept under.
+    fn program_ctx(run: RunContext, store: &Arc<FakeScratch>) -> ToolContext {
+        ToolContext::new(
+            komo_core::domain::context::SessionContext::detached("s"),
+            Some(run),
+            Arc::new(crate::test_support::AllowAll),
+        )
+        .with_call("call-0", 0)
+        .with_scratch(store.clone())
+    }
+
+    /// The turn a continuation runs on: a new id, linked back to the chain's
+    /// root — which is the id the first attempt's scratch is filed under.
+    fn continuation(run_id: &str, root: &str) -> RunContext {
+        let run = RunContext::new(run_id.into());
+        run.resumed_from_root(root.into());
+        run
+    }
+
+    async fn try_call(
+        executor: &komo_services::tool_execution::ToolExecutor,
+        turn: &ToolTurnContext,
+        name: &str,
+        args: Value,
+    ) -> Result<ToolAnswer, String> {
+        dispatch(executor, turn, &executor.snapshot(), name.to_string(), args).await
+    }
+
+    /// The text a call that was not supposed to succeed answered with —
+    /// `ToolAnswer` carries no `Debug`, so `expect_err` is not available.
+    fn err_text(outcome: Result<ToolAnswer, String>, why: &str) -> String {
+        match outcome {
+            Err(text) => text,
+            Ok(answer) => panic!("{why}, but it answered `{}`", answer.content),
+        }
+    }
+
+    /// Which sub-calls the store is holding an answer for, in ordinal order.
+    fn memo_keys(store: &FakeScratch) -> Vec<String> {
+        let mut keys: Vec<String> = store
+            .rows
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|key| key.key.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// The whole point of the four steps: a program that read a file and then
+    /// stopped for an approval must not read it again when the operator
+    /// answers an hour — or a restart — later. Same session, same enclosing
+    /// call, a different turn.
+    #[tokio::test]
+    async fn a_program_replays_memoised_sub_calls_after_approval() {
+        let (mut executor, seen) = recording_executor(&["read"]);
+        executor.register(Arc::new(Gated(seen.clone())));
+        let executor = executor.with_approver(Arc::new(SuspendOnce::default()));
+        let store = Arc::new(FakeScratch::default());
+
+        let first = program_ctx(RunContext::new("run-1".into()), &store);
+        let turn = sub_turn(&first);
+        let read = try_call(&executor, &turn, "read", serde_json::json!({}))
+            .await
+            .expect("the read succeeds");
+        assert_eq!(read.content, "ok");
+        let stopped = err_text(
+            try_call(
+                &executor,
+                &turn,
+                "cron",
+                serde_json::json!({"action": "add"}),
+            )
+            .await,
+            "nobody has answered yet",
+        );
+        assert!(stopped.starts_with(SUSPENDED_MARKER), "{stopped}");
+        assert_eq!(
+            first.run.as_ref().unwrap().suspension().unwrap().call_id,
+            "call-0"
+        );
+
+        // The continuation re-dispatches the same `python` call, so the program
+        // runs again from its first line.
+        let second = program_ctx(continuation("run-2", "run-1"), &store);
+        let turn = sub_turn(&second);
+        let replayed = try_call(&executor, &turn, "read", serde_json::json!({}))
+            .await
+            .expect("answered out of the first attempt's scratch");
+        assert_eq!(replayed.content, read.content);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["code-1-read"],
+            "the read is answered from memory, not made again"
+        );
+
+        let allowed = try_call(
+            &executor,
+            &turn,
+            "cron",
+            serde_json::json!({"action": "add"}),
+        )
+        .await
+        .expect("the operator approved, so this one runs");
+        assert_eq!(allowed.content, "the routine was added");
+        assert_eq!(*seen.lock().unwrap(), ["code-1-read", "code-2-cron"]);
+
+        assert_eq!(memo_keys(&store), ["sub/1", "sub/2"]);
+        for key in store.rows.lock().unwrap().keys() {
+            assert_eq!(key.session_id, "s");
+            assert_eq!(
+                key.root_turn_id, "run-1",
+                "filed under the chain's root, which both attempts agree on"
+            );
+            assert_eq!(key.call_id, "call-0", "and under the enclosing call");
+        }
+    }
+
+    /// A call that stopped to wait did not happen, so there is nothing to
+    /// replay — memoising it would answer the continuation with work the
+    /// operator has only just authorized.
+    #[tokio::test]
+    async fn a_gated_call_that_stopped_is_not_memoised() {
+        let (mut executor, seen) = recording_executor(&["read"]);
+        executor.register(Arc::new(Gated(seen.clone())));
+        let executor = executor.with_approver(Arc::new(SuspendOnce::default()));
+        let store = Arc::new(FakeScratch::default());
+
+        let ctx = program_ctx(RunContext::new("run-1".into()), &store);
+        let turn = sub_turn(&ctx);
+        try_call(&executor, &turn, "read", serde_json::json!({}))
+            .await
+            .expect("the read succeeds");
+        err_text(
+            try_call(
+                &executor,
+                &turn,
+                "cron",
+                serde_json::json!({"action": "add"}),
+            )
+            .await,
+            "nobody has answered yet",
+        );
+
+        assert_eq!(memo_keys(&store), ["sub/1"]);
+    }
+
+    /// The memo is keyed by ordinal, so it only means anything while the two
+    /// runs are the same program. A run that asks for something else at an
+    /// ordinal the last one answered is a different program, and every later
+    /// memo belongs to the other one.
+    #[tokio::test]
+    async fn a_divergent_program_is_not_answered_from_memory() {
+        let (mut executor, seen) = recording_executor(&["read", "grep"]);
+        executor.register(Arc::new(Gated(seen.clone())));
+        let executor = executor.with_approver(Arc::new(SuspendOnce::default()));
+        let store = Arc::new(FakeScratch::default());
+
+        let first = program_ctx(RunContext::new("run-1".into()), &store);
+        let turn = sub_turn(&first);
+        try_call(&executor, &turn, "read", serde_json::json!({}))
+            .await
+            .expect("the read succeeds");
+        try_call(&executor, &turn, "grep", serde_json::json!({}))
+            .await
+            .expect("the grep succeeds");
+        err_text(
+            try_call(
+                &executor,
+                &turn,
+                "cron",
+                serde_json::json!({"action": "add"}),
+            )
+            .await,
+            "nobody has answered yet",
+        );
+        assert_eq!(memo_keys(&store), ["sub/1", "sub/2"]);
+
+        // The model rewrote the program before the answer arrived — or it reads
+        // a clock. Either way this run's first call is not the one the memo at
+        // ordinal 1 answers.
+        let second = program_ctx(continuation("run-2", "run-1"), &store);
+        let turn = sub_turn(&second);
+        try_call(&executor, &turn, "grep", serde_json::json!({}))
+            .await
+            .expect("run as new work, since no memo is this call's");
+        assert!(turn.nested.as_ref().unwrap().diverged());
+        try_call(&executor, &turn, "read", serde_json::json!({}))
+            .await
+            .expect("and so is everything after it");
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["code-1-read", "code-2-grep", "code-1-grep", "code-2-read"],
+            "a memo exists at every ordinal here, and none of them was replayed"
+        );
+    }
+
+    /// A failure is what the program saw, so it is what the program has to see
+    /// again: the branch it took the first time is the branch it takes now,
+    /// and re-running the call to reproduce it is exactly the work the memo
+    /// exists to avoid.
+    #[tokio::test]
+    async fn a_failed_sub_call_is_replayed_as_the_same_failure() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut executor = komo_services::tool_execution::ToolExecutor::new(Default::default());
+        executor.register(Arc::new(Failing(seen.clone())));
+        let store = Arc::new(FakeScratch::default());
+
+        let first = program_ctx(RunContext::new("run-1".into()), &store);
+        let failed = err_text(
+            try_call(&executor, &sub_turn(&first), "boom", serde_json::json!({})).await,
+            "the tool errored",
+        );
+
+        let second = program_ctx(continuation("run-2", "run-1"), &store);
+        let again = err_text(
+            try_call(&executor, &sub_turn(&second), "boom", serde_json::json!({})).await,
+            "and says so again, without running",
+        );
+        assert_eq!(again, failed);
+        assert_eq!(*seen.lock().unwrap(), ["code-1-boom"]);
     }
 
     #[test]

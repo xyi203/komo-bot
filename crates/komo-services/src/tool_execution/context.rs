@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 pub use komo_core::domain::context::{RunContext, SessionContext, SessionOrigin, ToolContext};
 use komo_core::domain::policy::Rule;
+use komo_core::domain::scratch::CallScratch;
 
 /// Everything the executor needs to know about the turn a round of tool calls
 /// belongs to. Built once per turn by `AgentRuntime::run_agent_loop`.
@@ -73,21 +74,52 @@ pub struct NestedCalls {
     /// Handed out by [`next_ordinal`](Self::next_ordinal); 1-based, so the
     /// first call a program makes reads as the first.
     next: AtomicU32,
+    /// The **enclosing** call's scratch, which is where a sub-call's answer is
+    /// kept so the re-run does not make it again. `None` where the enclosing
+    /// context has no store, run or call identity — the nested round then works
+    /// the way it did before there was a memo: every call runs, every time.
+    pub scratch: Option<CallScratch>,
+    /// Set once this run has asked for something its last attempt did not, at
+    /// an ordinal the last attempt *had* answered. Everything numbered after a
+    /// divergence is numbered against a different program, so no memo past that
+    /// point is this call's — see [`mark_diverged`](Self::mark_diverged).
+    diverged: AtomicBool,
 }
 
 impl NestedCalls {
-    /// Number the calls made from the call `(call_id, call_index)` names.
-    pub fn new(call_id: impl Into<String>, call_index: u32) -> Self {
+    /// Number the calls made from the call `(call_id, call_index)` names,
+    /// answering them out of `scratch` where an earlier attempt already did the
+    /// work.
+    pub fn new(call_id: impl Into<String>, call_index: u32, scratch: Option<CallScratch>) -> Self {
         Self {
             enclosing_call_id: call_id.into(),
             enclosing_call_index: call_index,
             next: AtomicU32::new(0),
+            scratch,
+            diverged: AtomicBool::new(false),
         }
     }
 
     /// The next call's ordinal, in the order the program makes them.
     pub fn next_ordinal(&self) -> u32 {
         self.next.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Record that this run asked for something its last attempt did not.
+    ///
+    /// The memo is keyed by ordinal alone, so it only means anything while the
+    /// two runs are making the same calls in the same order. Once they are not,
+    /// every later ordinal names a different call in each run and replaying one
+    /// would answer this program with another program's work. New work from
+    /// here on, then — still memoised, since the *next* attempt replays this
+    /// run, not the one before it.
+    pub fn mark_diverged(&self) {
+        self.diverged.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this run has already diverged from the one it is replaying.
+    pub fn diverged(&self) -> bool {
+        self.diverged.load(Ordering::Relaxed)
     }
 }
 

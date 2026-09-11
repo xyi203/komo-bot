@@ -861,6 +861,7 @@ impl Tool for Program {
             nested: Some(Arc::new(komo_services::tool_execution::NestedCalls::new(
                 ctx.call_id().unwrap_or_default(),
                 ctx.call_index().unwrap_or_default(),
+                ctx.scratch_handle(),
             ))),
         };
         let nested = ToolCallReq {

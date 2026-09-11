@@ -201,7 +201,11 @@ const CODE_GUIDANCE: &str = "`python` is also how you read a clock — the date 
     all of them, and reach for a program at the point you would otherwise read a \
     result only to decide what to call next. Do not wrap a single call in a \
     program, and inside one prefer `tools.<name>(...)` over `tools.shell(...)` — \
-    a program is a way to sequence your tools, not a way around them.";
+    a program is a way to sequence your tools, not a way around them. A program \
+    that stops for an approval is run again from its first line once you have the \
+    answer, with the calls it already made answered from memory, so keep the \
+    sequence of calls a program makes deterministic — never let a clock or a \
+    random value decide which tool it calls.";
 
 /// Gated on `python` **and** a known plugin directory. The other half of the
 /// routing rule above: `python` is how a program is run once, this is how one

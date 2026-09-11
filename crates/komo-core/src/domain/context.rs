@@ -20,7 +20,7 @@ use crate::domain::gateway::{InterjectSource, ReplySink};
 use crate::domain::policy::LOCAL_CHANNEL;
 use crate::domain::repository::SessionEventRepository;
 use crate::domain::run::RunStep;
-use crate::domain::scratch::{ScratchKey, TurnScratch};
+use crate::domain::scratch::{CallScratch, TurnScratch};
 use crate::domain::session::ChannelPeer;
 use crate::domain::session_event::{
     ApprovalRequestedEvent, ApprovalResolvedEvent, ResumedWait, SessionEvent, SessionEventKind,
@@ -699,41 +699,33 @@ impl ToolContext {
     /// skip work it already did, and the safe answer to a broken store is to
     /// do it again.
     pub async fn scratch_get(&self, key: &str) -> Option<String> {
-        let address = self.scratch_key(key)?;
-        match self.scratch.as_ref()?.get(&address).await {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(%error, key, "could not read this call's scratch; treating it as empty");
-                None
-            }
-        }
+        self.scratch_handle()?.get(key).await
     }
 
     /// Keep `value` under `key` for this call's next attempt. Best-effort: a
     /// store that will not take it costs the continuation the work, never the
     /// call in hand.
     pub async fn scratch_set(&self, key: &str, value: &str) {
-        let Some(address) = self.scratch_key(key) else {
-            return;
-        };
-        let Some(store) = self.scratch.as_ref() else {
-            return;
-        };
-        if let Err(error) = store.set(&address, value).await {
-            tracing::warn!(%error, key, "could not keep this call's scratch (non-fatal)");
+        if let Some(scratch) = self.scratch_handle() {
+            scratch.set(key, value).await;
         }
     }
 
-    /// This call's address in the scratch store. `None` without a run or a call
-    /// identity: neither the chain's root nor the call is knowable then, and a
-    /// key missing either would collide with somebody else's.
-    fn scratch_key(&self, key: &str) -> Option<ScratchKey> {
-        Some(ScratchKey {
-            session_id: self.session.session_id.clone(),
-            root_turn_id: self.run.as_ref()?.root_turn_id(),
-            call_id: self.call.as_ref()?.call_id.clone(),
-            key: key.to_string(),
-        })
+    /// This call's reach into the scratch store, for code that has to read and
+    /// write the call's keys without holding the context — the nested round a
+    /// `python` program's calls arrive in, which knows the turn but not the
+    /// call it runs under.
+    ///
+    /// `None` without a store, a run or a call identity: neither the chain's
+    /// root nor the call is knowable then, and a key missing either would
+    /// collide with somebody else's.
+    pub fn scratch_handle(&self) -> Option<CallScratch> {
+        Some(CallScratch::new(
+            self.scratch.clone()?,
+            self.session.session_id.clone(),
+            self.run.as_ref()?.root_turn_id(),
+            self.call.as_ref()?.call_id.clone(),
+        ))
     }
 
     /// Stop the turn here and come back when `wakeup` fires.

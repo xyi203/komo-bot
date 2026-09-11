@@ -285,7 +285,12 @@ direct-db fallback.
   re-run. The program itself is stopped where it stood (`SUSPENDED_MARKER`, a
   `BaseException` the Python side cannot catch) and runs again from its first
   line when the continuation re-dispatches the `python` call — which is what
-  the program-order call numbering is for.
+  the program-order call numbering is for. The sub-calls it already made are
+  **answered from the enclosing call's scratch** (`sub/<ordinal>`, matched on
+  the tool name and the serialized arguments) rather than made again, so the
+  three files a program read before it stopped are read once; a run that asks
+  for something else at an ordinal the last one answered is a different program,
+  so it is run as new work from there on and told so in its result.
 - api channel is loopback/ephemeral by default; `[channels.api] enabled = true`
   + `API_SERVER_KEY` widens it. `web_dir` serves the built SPA same-origin;
   `remote_interactive = true` lets keyed remote callers run interactive turns
@@ -675,7 +680,8 @@ call the same functions, which is what keeps validation from forking.
   gate, retry classification and ledger step an ordinary call does — and, when
   one of those calls stops to wait, the wait is lifted onto the enclosing
   `python` / `py__…` call, the program is unwound, and the whole program is run
-  again from its first line once the answer arrives. Two
+  again from its first line once the answer arrives, with every call it had
+  already made replayed out of that call's scratch instead of run twice. Two
   structural rules: the plugins directory is a **writable workspace root whose
   writes are `Risk::Dangerous` with no scope key**, so a human approves each
   file and no grant ever widens it (a `.py` there runs unsandboxed on every

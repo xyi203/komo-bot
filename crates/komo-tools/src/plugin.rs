@@ -143,8 +143,12 @@ impl Tool for PyTool {
         if crate::python::stopped_to_wait(ctx) {
             return Ok(ToolOutput::text(crate::python::WAITING_NOTE));
         }
-        Ok(ToolOutput::text(
-            outcome.map_err(|error| map_error(error, &self.plugin_name))?,
+        // And the same note `python` renders: a plugin function composes tools
+        // the way a program does, so it replays the same way and diverges the
+        // same way.
+        Ok(crate::python::note_divergence(
+            ToolOutput::text(outcome.map_err(|error| map_error(error, &self.plugin_name))?),
+            &turn,
         ))
     }
 

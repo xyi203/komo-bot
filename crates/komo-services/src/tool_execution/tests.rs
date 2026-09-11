@@ -1483,7 +1483,7 @@ impl Tool for GatedTool {
 /// counter that numbers them.
 fn nested(enclosing: &str, index: u32) -> ToolTurnContext {
     ToolTurnContext {
-        nested: Some(Arc::new(NestedCalls::new(enclosing, index))),
+        nested: Some(Arc::new(NestedCalls::new(enclosing, index, None))),
         ..ledgered()
     }
 }

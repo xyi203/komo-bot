@@ -29,6 +29,8 @@
 //! settles (not when it suspends — that is precisely when the continuation
 //! needs them), and a deleted session takes its rows with it.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 
 /// One scratch entry's address: which call, on which attempt chain, wrote it.
@@ -65,4 +67,72 @@ pub trait TurnScratch: Send + Sync {
         root_turn_id: &str,
         call_id: &str,
     ) -> anyhow::Result<()>;
+}
+
+/// One call's reach into the scratch store: the store plus the address prefix
+/// every key it writes shares.
+///
+/// [`ToolContext`](crate::domain::context::ToolContext) is the usual way in, and
+/// a tool that only reads and writes its own keys never needs this. What does
+/// is a tool that dispatches a *nested* round — a `python` program's
+/// `tools.x(...)` — because the code that answers those calls holds the turn
+/// they run in, not the enclosing `ToolContext` they run under. Handing it the
+/// prefix alone would hand it the store's whole namespace; handing it this
+/// keeps it inside the one call that owns the rows.
+#[derive(Clone)]
+pub struct CallScratch {
+    store: Arc<dyn TurnScratch>,
+    session_id: String,
+    root_turn_id: String,
+    call_id: String,
+}
+
+impl CallScratch {
+    pub fn new(
+        store: Arc<dyn TurnScratch>,
+        session_id: String,
+        root_turn_id: String,
+        call_id: String,
+    ) -> Self {
+        Self {
+            store,
+            session_id,
+            root_turn_id,
+            call_id,
+        }
+    }
+
+    /// Read what this call wrote under `key` on an earlier attempt.
+    ///
+    /// `None` means "nothing to resume from", whether that is because nothing
+    /// was written or because the store could not be read — a caller reading
+    /// scratch is asking whether it may skip work it already did, and the safe
+    /// answer to a broken store is to do it again.
+    pub async fn get(&self, key: &str) -> Option<String> {
+        match self.store.get(&self.address(key)).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(%error, key, "could not read this call's scratch; treating it as empty");
+                None
+            }
+        }
+    }
+
+    /// Keep `value` under `key` for this call's next attempt. Best-effort: a
+    /// store that will not take it costs the continuation the work, never the
+    /// call in hand.
+    pub async fn set(&self, key: &str, value: &str) {
+        if let Err(error) = self.store.set(&self.address(key), value).await {
+            tracing::warn!(%error, key, "could not keep this call's scratch (non-fatal)");
+        }
+    }
+
+    fn address(&self, key: &str) -> ScratchKey {
+        ScratchKey {
+            session_id: self.session_id.clone(),
+            root_turn_id: self.root_turn_id.clone(),
+            call_id: self.call_id.clone(),
+            key: key.to_string(),
+        }
+    }
 }

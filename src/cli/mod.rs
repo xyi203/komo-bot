@@ -11,6 +11,7 @@ mod health;
 mod init;
 mod inspect;
 mod logs;
+mod mcp_reconcile;
 mod memory;
 mod model;
 mod pair;

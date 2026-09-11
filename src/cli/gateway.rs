@@ -274,6 +274,19 @@ pub async fn run(config: &ConfigSnapshot) -> anyhow::Result<()> {
             maintenance: Arc::new(routines.sweep()),
             alert: Some(notifier.clone()),
         })
+        // MCP servers that were unreachable at boot. Every five minutes rather
+        // than every one: the work is a network connect to something already
+        // known to be down, and nothing is waiting on it. Adds only — a server
+        // already mounted is left alone, and nothing is ever unmounted.
+        .with_maintenance(MaintenanceService {
+            name: "mcp-reconcile".to_string(),
+            schedule: Schedule::parse("*/5 * * * *")?,
+            maintenance: Arc::new(crate::cli::mcp_reconcile::McpReconcileSweep::new(
+                config.runtime.mcp_servers.clone(),
+                wired.catalogs.clone(),
+            )),
+            alert: Some(notifier.clone()),
+        })
         // Config changes: the same every-minute tick, because an edit is worth
         // hearing about while the operator is still at the keyboard. It only
         // *reports* — the running process keeps the snapshot it booted with,

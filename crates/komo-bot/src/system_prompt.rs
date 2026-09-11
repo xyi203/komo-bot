@@ -116,6 +116,14 @@ const TOOL_ECONOMY_GUIDANCE: &str = "Tool calls in one round run concurrently: \
     have not changed since you last ran it — verify once, at the point the result \
     actually matters.";
 
+/// The held-back-tool roster, evaluated **per turn** rather than captured.
+///
+/// The catalog is live — an MCP server that was down at boot can be mounted
+/// later, a plugin appears within seconds of its file being written — so a
+/// roster fixed at wiring would name a set that has since moved. `None` when
+/// nothing is held back.
+pub type LazyNoteFn = std::sync::Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 /// The roster of tools whose schemas are not in the request, rendered from the
 /// catalog so it can never name one that is not there — the same reason
 /// `python::sdk_note` is rendered rather than written.
@@ -349,7 +357,7 @@ fn default_agents_dir() -> PathBuf {
 /// ```
 pub struct SystemPromptBuilder {
     tool_names: Vec<String>,
-    lazy_note: Option<String>,
+    lazy_note: Option<LazyNoteFn>,
     skills_note: Option<String>,
     /// The `python` API listing, when that tool is loaded.
     code_note: Option<String>,
@@ -426,7 +434,7 @@ impl SystemPromptBuilder {
     /// Without it the saving is a loss: a tool the model is never told about
     /// is a tool it never reaches for, and the guidance below would go on
     /// naming `cron` while no `cron` schema exists to call.
-    pub fn lazy_note(mut self, note: Option<String>) -> Self {
+    pub fn lazy_note(mut self, note: Option<LazyNoteFn>) -> Self {
         self.lazy_note = note;
         self
     }
@@ -574,7 +582,7 @@ impl SystemPromptBuilder {
         }
         // Immediately after the round-economy rule it extends: that rule covers
         // a set of calls the model can name, this one the set it cannot.
-        if let Some(note) = &self.lazy_note {
+        if let Some(note) = self.lazy_note.as_ref().and_then(|f| f()) {
             parts.push(note.clone());
         }
         if self.has("python") {

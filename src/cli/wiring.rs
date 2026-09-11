@@ -109,6 +109,11 @@ pub struct Wiring {
     /// Note-vault handles, shared with the operator surface so `komo wiki` works
     /// while the gateway holds the index open.
     pub wiki: Option<crate::services::operator_control::actions::WikiOps>,
+    /// The three tool catalogs, for the sweep that mounts MCP servers which
+    /// were unreachable at boot. Handed out rather than rebuilt because
+    /// mounting has to land in the same catalogs the runtimes dispatch
+    /// against — a fourth one would be invisible.
+    pub catalogs: Vec<Arc<ToolCatalog>>,
     /// The pending-approval registry the chat approver writes into, shared with
     /// the gateway's dispatcher and api channel so `/approve` — typed in a chat,
     /// clicked in the desktop app, or pressed in the TUI's modal — resolves the
@@ -565,8 +570,14 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     // Rendered per runtime, from that runtime's own catalog: the three hold
     // different sets, and a note naming a tool this runtime never mounted is
     // the same bug as guidance for a deleted one.
-    let lazy_note_of = |tools: &ToolExecutor| -> Option<String> {
-        komo_bot::system_prompt::lazy_tools_note(&tools.snapshot())
+    let lazy_note_of = |tools: &ToolExecutor| -> Option<komo_bot::system_prompt::LazyNoteFn> {
+        // Per turn, not once: the catalog is live (a plugin file, an MCP
+        // server reconnected by the sweep), so a roster fixed here would name
+        // a set that has moved.
+        let tools = tools.clone();
+        Some(std::sync::Arc::new(move || {
+            komo_bot::system_prompt::lazy_tools_note(&tools.snapshot())
+        }))
     };
 
     let tool_names_of = |tools: &ToolExecutor| -> Vec<String> {
@@ -812,6 +823,11 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
         cron_runtime,
         output_store,
         wiki: wiki_ops,
+        catalogs: vec![
+            catalogs.of(Runtime::Main).clone(),
+            catalogs.of(Runtime::Subagent).clone(),
+            catalogs.of(Runtime::Cron).clone(),
+        ],
         approvals,
     })
 }
@@ -880,7 +896,11 @@ async fn wiki_tools(
 
 /// Connect the configured MCP servers and turn their allowlisted tools into
 /// komo tools. An unreachable server is a warning, never a failed boot.
-async fn mcp_tools(servers: &[komo_config::McpServerConfig]) -> Vec<Arc<dyn Tool>> {
+///
+/// Shared with `mcp_reconcile`, which calls it again later for the servers
+/// that were unreachable here — one connect path, so a server mounted at boot
+/// and one mounted an hour later are built identically.
+pub(super) async fn mcp_tools(servers: &[komo_config::McpServerConfig]) -> Vec<Arc<dyn Tool>> {
     if servers.is_empty() {
         return Vec::new();
     }

@@ -711,16 +711,25 @@ call the same functions, which is what keeps validation from forking.
   landed); the sandbox and credential-broker halves stand. See
   `docs/adr/0003-auto-policy-llm-reviewer.md`.
 - `komo-mcp` + `komo-tools`' `mcp` — external MCP servers over Streamable HTTP
-  (rmcp, client features only). `[mcp.servers.*]` is connected **once at
-  wiring**, so a server that is down at boot has no tools for the process's
-  lifetime — and an unreachable one is a warning, never a fatal. That is a
-  missing caller, **not** a limit of the catalog: `ToolCatalog::register` /
-  `mount_all` / `retain` all take `&self` through an `RwLock`, and `mount_all`
-  hands back a `Registration` that unmounts on drop (which is how the plugin
-  host adds and removes tools mid-process). What is pinned is the *per-turn*
-  `CatalogSnapshot`, so a change is picked up by the next turn — and since MCP
-  tools are no longer advertised, remounting one no longer touches the schema
-  block at all. Each mounted tool becomes `mcp__<server>__<tool>` (leaked to satisfy `Tool::name`'s
+  (rmcp, client features only). `[mcp.servers.*]` is connected at wiring, and
+  an unreachable server is a warning, never a fatal — **and is retried**:
+  `cli/mcp_reconcile.rs` is a five-minute sweep that finds the configured
+  servers with nothing in the catalog and mounts what it can, through the same
+  `wiring::mcp_tools` the boot path uses. A server on a network is the one
+  dependency that *is* expected to come and go, so binding komo's view of it to
+  one instant at boot matched nothing about how it behaves.
+  It only **adds**: a mounted server is left alone (its tools are `Arc`-shared
+  across three catalogs and a running turn may be mid-call), and nothing is
+  ever unmounted — a server that stops answering fails its calls with a message
+  the model can act on, which beats a tool that silently vanishes.
+  Three existing properties are what make that safe: `ToolCatalog::mount_all`
+  takes `&self` through an `RwLock` and hands back a `Registration` that
+  unmounts on drop (how the plugin host works); a turn pins one
+  `CatalogSnapshot` for its whole length, so a mount lands *between* turns; and
+  MCP tools are not advertised, so a mount never touches the request's schema
+  block. The held-back roster in the prompt is rendered per turn
+  (`system_prompt::LazyNoteFn`), which is what names a newly mounted tool to
+  the model without a restart. Each mounted tool becomes `mcp__<server>__<tool>` (leaked to satisfy `Tool::name`'s
   `&'static str`; built once and `Arc`-shared across every executor). **Every
   MCP call is approval-gated** — `annotations.readOnlyHint` is server-authored,
   and the server is the party being gated; grant specific tools with

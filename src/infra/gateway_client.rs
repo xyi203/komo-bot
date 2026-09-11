@@ -160,8 +160,9 @@ impl GatewayClient {
     ///
     /// komo's state lives in the gateway's process, so "no gateway" is not a
     /// mode with its own behaviour — it is a process that has to exist before
-    /// the command can mean anything. On macOS the launchd job is started and
-    /// polled; elsewhere the supervisor owns the process, so this only says so.
+    /// the command can mean anything. On macOS (launchd) and Linux (systemd
+    /// --user) the supervised job is started and polled; elsewhere the
+    /// supervisor owns the process, so this only says so.
     pub async fn connect_or_start() -> anyhow::Result<GatewayClient> {
         if let Some(client) = Self::try_connect().await {
             return Ok(client);
@@ -563,14 +564,17 @@ impl GatewayClient {
     }
 }
 
-/// Bring a gateway up, or say who is supposed to.
-#[cfg(target_os = "macos")]
+/// Bring a gateway up under the OS supervisor (launchd on macOS, systemd --user
+/// on Linux), or say who is supposed to. Where there is no systemd user session
+/// — Docker — the supervisor call fails with that same "run it in the
+/// foreground" advice.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn start_gateway() -> anyhow::Result<()> {
     tracing::info!("no gateway is running — starting it");
     crate::cli::service::start()
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn start_gateway() -> anyhow::Result<()> {
     anyhow::bail!(
         "no gateway is running, and komo's state lives in the gateway's process.\n\

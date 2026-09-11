@@ -36,7 +36,7 @@ enum Commands {
     /// Run the always-on gateway: maintenance scheduler (and, later,
     /// config-declared ingress channels). Maintenance cron comes from
     /// `schedule` in ~/.komo/config.toml (or KOMO_SCHEDULE); default hourly.
-    /// With no action, runs in the foreground (this is what launchd invokes).
+    /// With no action, runs in the foreground (this is what the supervisor invokes).
     Gateway {
         #[command(subcommand)]
         action: Option<GatewayAction>,
@@ -435,13 +435,14 @@ enum SessionAction {
 
 #[derive(Subcommand)]
 enum GatewayAction {
-    /// macOS only: install and start the gateway under launchd
+    /// Install and start the gateway under the OS supervisor (launchd on
+    /// macOS, systemd --user on Linux)
     Start,
-    /// macOS only: stop the gateway and remove it from launchd
+    /// Stop the gateway and remove it from the supervisor
     Stop,
-    /// macOS only: restart the launchd gateway
+    /// Restart the supervised gateway (picks up a reinstalled binary)
     Restart,
-    /// macOS only: show launchd state for the gateway
+    /// Show the supervisor's state for the gateway
     Status,
 }
 

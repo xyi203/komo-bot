@@ -1,5 +1,5 @@
 //! `komo upgrade` — pull the latest source, rebuild + reinstall the binary, and
-//! restart the macOS launchd gateway so the new build goes live.
+//! restart the supervised gateway so the new build goes live.
 //!
 //! komo's analog of hermes' `hermes update` (git pull → reinstall → restart),
 //! minus hermes' fork-sync / Windows-ZIP / hangup machinery — komo is a
@@ -9,10 +9,10 @@
 //!      (`CARGO_MANIFEST_DIR`, baked in at compile time).
 //!   2. `cargo install --path <repo> --force`, reinstalled to the **currently
 //!      running** binary's location.
-//!   3. `komo gateway restart` on macOS — but only if the gateway is actually
-//!      loaded under launchd, so an upgrade never installs the service uninvited.
-//!      Docker/Linux deployments should restart the container/process outside
-//!      komo after upgrading.
+//!   3. `komo gateway restart` — but only if the gateway is actually loaded
+//!      under its supervisor, so an upgrade never installs the service
+//!      uninvited. Docker deployments should restart the container/process
+//!      outside komo after upgrading.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -97,8 +97,8 @@ pub fn run(no_restart: bool) -> anyhow::Result<()> {
     }
 
     // 3. Restart the gateway so the new binary goes live — only if it is being
-    //    supervised by komo itself. Docker/Linux deployments run the gateway in
-    //    the foreground and should be restarted by the outer supervisor.
+    //    supervised by komo itself. Docker deployments run the gateway in the
+    //    foreground and should be restarted by the outer supervisor.
     if no_restart {
         println!("\n--no-restart: skipped. Run `komo gateway restart` to go live.");
     } else if service::gateway_loaded().unwrap_or(false) {

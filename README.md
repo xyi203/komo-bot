@@ -66,8 +66,8 @@ segment files under `~/.komo/sessions/<id>/`; session metadata and the run
 ledger are tables in `~/.komo/komo.db`.
 
 Every command that touches komo's state talks to the gateway, starting one if
-none is running (on macOS through launchd; elsewhere start `komo gateway`
-yourself).
+none is running (through launchd on macOS or systemd --user on Linux; in
+Docker the container runs `komo gateway` itself).
 
 ```bash
 komo session list               # stored sessions with their workspace and message counts
@@ -91,13 +91,16 @@ CLI, the desktop and web apps) is a client of its loopback HTTP api.
 - Feishu, Telegram, and WeChat channels when configured
 
 ```bash
-komo gateway start              # macOS only: install + start under launchd
-komo gateway status             # macOS only: launchd state
-komo gateway restart            # macOS only: pick up a reinstalled binary
-komo gateway stop               # macOS only: stop and remove from launchd
+komo gateway start              # install + start under launchd / systemd --user
+komo gateway status             # supervisor state for the gateway
+komo gateway restart            # pick up a reinstalled binary
+komo gateway stop               # stop and remove from the supervisor
 ```
 
-Bare `komo gateway` runs in the foreground (this is what launchd
+On Linux the unit is a systemd *user* unit, so it stops at logout unless you
+run `loginctl enable-linger $USER` once.
+
+Bare `komo gateway` runs in the foreground (this is what the supervisor
 invokes, and what Docker should run as the container process). In chat channels,
 side-effecting tools can ask for approval in the conversation; reply `/approve`,
 `/approve session`, or `/deny`.

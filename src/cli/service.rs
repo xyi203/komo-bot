@@ -4,29 +4,42 @@
 //! bootstraps it; launchd then owns the process (`KeepAlive` relaunches it
 //! after a crash, `RunAtLoad` starts it at login).
 //!
-//! Other platforms, including Linux containers, should run `komo gateway` in
-//! the foreground and let the outer supervisor (Docker, Compose, systemd, etc.)
-//! own start/stop/restart.
+//! Linux uses `systemd --user`: the same command writes a user unit under
+//! `~/.config/systemd/user` and `enable --now`s it; systemd then owns the
+//! process (`Restart=always` after a crash, `WantedBy=default.target` at
+//! login — `loginctl enable-linger $USER` keeps it up while logged out).
+//!
+//! Other platforms, and Linux without a systemd user session (Docker), should
+//! run `komo gateway` in the foreground and let the outer supervisor own
+//! start/stop/restart.
 
-/// Write the plist and bootstrap the gateway under launchd.
+/// Install the gateway under the OS supervisor and start it.
 pub fn start() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         launchd::start()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        systemd::start()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         unsupported("start")
     }
 }
 
-/// Stop the launchd-managed gateway.
+/// Stop the supervised gateway and remove it from the supervisor.
 pub fn stop() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         launchd::stop()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        systemd::stop()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         unsupported("stop")
     }
@@ -38,19 +51,27 @@ pub fn restart() -> anyhow::Result<()> {
     {
         launchd::restart()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        systemd::restart()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         unsupported("restart")
     }
 }
 
-/// Report whether launchd has the gateway loaded.
+/// Report the supervisor's state for the gateway.
 pub fn status() -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
         launchd::status()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        systemd::status()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         unsupported("status")
     }
@@ -65,17 +86,21 @@ pub fn gateway_loaded() -> anyhow::Result<bool> {
         let domain = launchd::gui_domain()?;
         Ok(launchd::is_loaded(&domain))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        Ok(systemd::is_loaded())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         Ok(false)
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn unsupported(action: &str) -> anyhow::Result<()> {
     anyhow::bail!(
-        "gateway {action} is macOS-only. In Docker/Linux, run `komo gateway` in \
-         the foreground and use your supervisor, e.g. `docker restart <container>`."
+        "gateway {action} is supported on macOS (launchd) and Linux (systemd --user) only. \
+         Run `komo gateway` in the foreground and let your supervisor own it."
     )
 }
 
@@ -453,5 +478,233 @@ mod launchd {
             assert!(plist.contains("<key>CFBundleExecutable</key>"));
             assert!(plist.contains("<key>NSLocalNetworkUsageDescription</key>"));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux: systemd user unit
+// ---------------------------------------------------------------------------
+
+/// The unit file itself — pure, so it is unit-testable on any platform.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod systemd_unit {
+    pub(super) const UNIT: &str = "komo-gateway.service";
+
+    /// Render the systemd user unit. `exe` is the absolute komo binary path,
+    /// `komo_home` the resolved komo home (working directory), `log_dir` holds
+    /// the stdout/stderr capture — named as in the launchd plist so `komo logs`
+    /// falls back to the same files.
+    ///
+    /// `Environment=KOMO_HOME` pins the supervised gateway to the home this CLI
+    /// resolved while installing the unit: without it a `KOMO_HOME` exported
+    /// only in the installing shell would leave the two disagreeing.
+    pub(super) fn render_unit(exe: &str, komo_home: &str, log_dir: &str) -> String {
+        let exe_q = quote(exe);
+        let home_q = quote(komo_home);
+        format!(
+            "[Unit]
+Description=komo gateway
+
+[Service]
+ExecStart=\"{exe_q}\" gateway
+WorkingDirectory={komo_home}
+Environment=\"KOMO_HOME={home_q}\"
+Restart=always
+RestartSec=10
+StandardOutput=append:{log_dir}/gateway.log
+StandardError=append:{log_dir}/gateway.err.log
+
+[Install]
+WantedBy=default.target
+"
+        )
+    }
+
+    /// systemd's double-quoted values escape with a backslash.
+    fn quote(s: &str) -> String {
+        s.replace('\\', "\\\\").replace('"', "\\\"")
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn unit_contains_exec_start_workdir_home_restart_and_logs() {
+            let unit = render_unit(
+                "/usr/local/bin/komo",
+                "/home/me/.komo",
+                "/home/me/.komo/logs",
+            );
+            assert!(unit.contains("ExecStart=\"/usr/local/bin/komo\" gateway"));
+            assert!(unit.contains("WorkingDirectory=/home/me/.komo"));
+            assert!(unit.contains("Environment=\"KOMO_HOME=/home/me/.komo\""));
+            assert!(unit.contains("Restart=always"));
+            assert!(unit.contains("StandardOutput=append:/home/me/.komo/logs/gateway.log"));
+            assert!(unit.contains("StandardError=append:/home/me/.komo/logs/gateway.err.log"));
+            assert!(unit.contains("WantedBy=default.target"));
+        }
+
+        #[test]
+        fn unit_escapes_quotes_in_paths() {
+            let unit = render_unit("/odd\"path/komo", "/home", "/logs");
+            assert!(unit.contains("ExecStart=\"/odd\\\"path/komo\" gateway"));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod systemd {
+    use std::io::ErrorKind;
+    use std::path::PathBuf;
+    use std::process::{Command, Output};
+
+    use super::systemd_unit::{UNIT, render_unit};
+
+    fn unit_path() -> anyhow::Result<PathBuf> {
+        let config = dirs::config_dir()
+            .ok_or_else(|| anyhow::anyhow!("cannot determine config directory"))?;
+        Ok(config.join("systemd").join("user").join(UNIT))
+    }
+
+    fn systemctl(args: &[&str]) -> anyhow::Result<Output> {
+        Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .output()
+            .map_err(|e| {
+                if e.kind() == ErrorKind::NotFound {
+                    anyhow::anyhow!(
+                        "systemd is not available here (no `systemctl`). Run `komo gateway` in \
+                         the foreground and let your supervisor own it — in Docker that is the \
+                         container's main process."
+                    )
+                } else {
+                    anyhow::anyhow!("failed to run systemctl: {e}")
+                }
+            })
+    }
+
+    fn check(out: &Output, command: &str) -> anyhow::Result<()> {
+        if out.status.success() {
+            return Ok(());
+        }
+        let raw = String::from_utf8_lossy(&out.stderr);
+        let stderr = raw.trim();
+        let hint = if stderr.contains("Failed to connect to bus") {
+            " (no systemd user session — log in on the machine, or use `loginctl enable-linger $USER`)"
+        } else {
+            ""
+        };
+        anyhow::bail!("systemctl {command} failed: {stderr}{hint}")
+    }
+
+    fn load_state() -> anyhow::Result<String> {
+        let out = systemctl(&["show", "-p", "LoadState", "--value", UNIT])?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    pub(super) fn is_loaded() -> bool {
+        load_state().map(|state| state == "loaded").unwrap_or(false)
+    }
+
+    /// A missing `systemctl` propagates, so nothing below writes a unit file
+    /// on a host that has no systemd to read it.
+    fn is_active() -> anyhow::Result<bool> {
+        Ok(systemctl(&["is-active", "--quiet", UNIT])?.status.success())
+    }
+
+    fn unload() -> anyhow::Result<bool> {
+        if load_state()? != "loaded" {
+            return Ok(false);
+        }
+        check(&systemctl(&["disable", "--now", UNIT])?, "disable --now")?;
+        if let Ok(path) = unit_path() {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => tracing::warn!(error = %e, unit = UNIT, "could not remove systemd unit"),
+            }
+        }
+        check(&systemctl(&["daemon-reload"])?, "daemon-reload")?;
+        Ok(true)
+    }
+
+    /// Write the user unit and `enable --now` it.
+    pub fn start() -> anyhow::Result<()> {
+        if is_active()? {
+            tracing::info!(
+                "komo gateway is already running under systemd. Use `komo gateway restart` to restart it."
+            );
+            return Ok(());
+        }
+
+        let exe = std::env::current_exe()?;
+        let komo_home = komo_config::ensure_komo_home();
+        let log_dir = komo_home.join("logs");
+        std::fs::create_dir_all(&log_dir)?;
+
+        let path = unit_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            &path,
+            render_unit(
+                &exe.display().to_string(),
+                &komo_home.display().to_string(),
+                &log_dir.display().to_string(),
+            ),
+        )?;
+
+        check(&systemctl(&["daemon-reload"])?, "daemon-reload")?;
+        check(&systemctl(&["enable", "--now", UNIT])?, "enable --now")?;
+
+        tracing::info!(
+            "komo gateway started under systemd ({UNIT}); it restarts on crash and at login. \
+             To keep it running while logged out, run `loginctl enable-linger $USER`. \
+             Logs: {}/gateway.log",
+            log_dir.display()
+        );
+        Ok(())
+    }
+
+    /// Disable the unit (stops the process and disables auto-restart) and remove it.
+    pub fn stop() -> anyhow::Result<()> {
+        if !unload()? {
+            println!("komo gateway is not running under systemd.");
+            return Ok(());
+        }
+        println!("komo gateway stopped.");
+        Ok(())
+    }
+
+    /// Stop (if loaded), regenerate the unit, and start again. Regenerating means
+    /// a rebuilt/reinstalled binary or moved log dir is picked up on restart.
+    pub fn restart() -> anyhow::Result<()> {
+        unload()?;
+        start()
+    }
+
+    /// Report whether systemd has the unit and what the process is doing.
+    pub fn status() -> anyhow::Result<()> {
+        let out = systemctl(&[
+            "show",
+            UNIT,
+            "-p",
+            "LoadState,ActiveState,SubState,MainPID,ExecMainStatus,FragmentPath",
+        ])?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if !text.lines().any(|line| line.trim() == "LoadState=loaded") {
+            println!("komo gateway: not loaded (run `komo gateway start`).");
+            return Ok(());
+        }
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains('=') {
+                println!("{trimmed}");
+            }
+        }
+        Ok(())
     }
 }

@@ -19,7 +19,7 @@ komo                               # full-screen TUI on a NEW task session (the 
 komo home                          # the TUI on the ongoing home conversation instead
 komo resume <id>                   # continue a stored task; the id is required
 cargo run -- gateway               # always-on process: sweeps + channels (feishu/telegram/wechat)
-komo gateway start|stop|restart|status   # macOS launchd supervision
+komo gateway start|stop|restart|status   # launchd (macOS) / systemd --user (Linux) supervision
 komo upgrade [--no-restart]        # git pull --ff-only + cargo install + restart gateway
 komo logs [-n N] [-f] [--stdout]   # tail gateway tracing log
 komo config check|reload           # validate an edited config.toml/.env; reload = validate + restart
@@ -181,9 +181,10 @@ an agent.** "No gateway" is not a mode with its own behaviour; it is a process
 that has to exist before the command can mean anything.
 `GatewayClient::connect_or_start` (`infra/gateway_client.rs`) probes
 `~/.komo/gateway.json` (rendezvous file) + `/health`, and finding nothing starts
-one: on macOS it loads the launchd job and polls `/health` for up to 60s,
-elsewhere it says who is supposed to (`komo gateway`, or the container's own
-main process). The TUI and every state-touching CLI command are
+one: on macOS/Linux it starts the launchd / systemd --user job and polls
+`/health` for up to 60s, elsewhere (and where there is no systemd, e.g. Docker)
+it says who is supposed to (`komo gateway`, or the container's own main
+process). The TUI and every state-touching CLI command are
 clients of the loopback api channel (`infra/messaging/api.rs`); there is no
 direct-db fallback.
 

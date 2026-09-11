@@ -99,8 +99,9 @@ detect_platform() {
 
     case "$os" in
         Darwin) os="darwin" ;;
+        Linux) os="linux" ;;
         *)
-            error "unsupported OS: ${os}. Release binaries are currently built for macOS."
+            error "unsupported OS: ${os}. Release binaries are built for macOS and Linux."
             exit 1
             ;;
     esac

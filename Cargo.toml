@@ -115,6 +115,14 @@ grep-regex = "0.1.14"
 # Unified diffs + line-level add/remove counts for `edit` / `apply_patch`.
 similar = "3.1.2"
 
+# wechatbot pins reqwest 0.12 with native-tls, which on Linux links libssl
+# dynamically — a release binary would then refuse to load on any host without
+# the exact libssl3 it was built against. Vendoring compiles OpenSSL in, so a
+# Linux binary depends on glibc alone. macOS's native-tls is Security.framework
+# and needs nothing here.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
+
 [dev-dependencies]
 # `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,
 # which auto-advances virtual time so retry-backoff tests don't sleep for real.

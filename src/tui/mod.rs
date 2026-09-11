@@ -121,6 +121,9 @@ struct Boot {
     /// The wait a turn of this session is stopped in, on resume. A fresh
     /// session has none.
     awaiting: Option<Awaiting>,
+    /// What the status row names as this conversation's model — see
+    /// [`model_label`].
+    model: String,
 }
 
 type BootTask = tokio::task::JoinHandle<anyhow::Result<Boot>>;
@@ -142,6 +145,7 @@ pub async fn run_new() -> anyhow::Result<()> {
         async move {
             let backend = connect(&workspace).await?;
             let label = task_label(&workspace);
+            let model = model_label(&backend, None).await?;
             Ok(Boot {
                 backend,
                 session,
@@ -150,6 +154,7 @@ pub async fn run_new() -> anyhow::Result<()> {
                 workspace,
                 roots: Vec::new(),
                 awaiting: None,
+                model,
             })
         }
     });
@@ -174,7 +179,8 @@ pub async fn run_home() -> anyhow::Result<()> {
             // The home conversation is shared, so it may already be stopped in
             // a wait another ingress parked — a `/approve` prompt sent to
             // Telegram, a question asked there. Same read as `resume`.
-            let awaiting = resume_awaiting(&backend, &session).await?;
+            let row = session_row(&backend, &session).await?;
+            let model = model_label(&backend, row.as_ref()).await?;
             Ok(Boot {
                 backend,
                 session,
@@ -184,7 +190,8 @@ pub async fn run_home() -> anyhow::Result<()> {
                 // Home is never bound: it is entered from wherever the operator
                 // is standing, so each turn runs in that directory.
                 roots: Vec::new(),
-                awaiting,
+                awaiting: row.and_then(|s| s.awaiting),
+                model,
             })
         }
     });
@@ -223,6 +230,7 @@ pub async fn resume(id: &str) -> anyhow::Result<()> {
             } else {
                 task_label(roots.first().map(Path::new).unwrap_or(&cwd))
             };
+            let model = model_label(&backend, row).await?;
             Ok(Boot {
                 backend,
                 session,
@@ -231,6 +239,7 @@ pub async fn resume(id: &str) -> anyhow::Result<()> {
                 workspace: cwd,
                 roots,
                 awaiting,
+                model,
             })
         }
     });
@@ -262,20 +271,41 @@ fn resolve_resume_id(sessions: &[SessionSummary], id: &str) -> anyhow::Result<St
         .ok_or_else(|| anyhow::anyhow!("no session with id `{id}` (see `komo session list`)"))
 }
 
-/// The wait this session is stopped in, if any — the session projection's
-/// `awaiting`, folded from the log at the last turn boundary.
+/// This session's row, if it has one — where its model choice lives, and the
+/// wait it is stopped in (the projection's `awaiting`, folded from the log at
+/// the last turn boundary).
 ///
 /// Read once, on resume: a turn suspended in *this* UI is one the interaction
 /// poll below is already watching, so the only wait it can learn about here is
 /// one another ingress parked.
-async fn resume_awaiting(backend: &Backend, id: &str) -> anyhow::Result<Option<Awaiting>> {
+async fn session_row(backend: &Backend, id: &str) -> anyhow::Result<Option<SessionSummary>> {
     Ok(backend
         .gateway
         .sessions()
         .await?
         .into_iter()
-        .find(|s| s.id == id)
-        .and_then(|s| s.awaiting))
+        .find(|s| s.id == id))
+}
+
+/// What the status row names as the model this conversation runs on: the
+/// session's own choice when it made one (stored as the menu id, qualified or
+/// not), else the gateway default in the same `provider:model` spelling. The
+/// effort follows only when the session set one — the provider default has no
+/// name a client could read.
+async fn model_label(backend: &Backend, row: Option<&SessionSummary>) -> anyhow::Result<String> {
+    let model = match row.filter(|s| !s.model.is_empty()) {
+        Some(row) => row.model.clone(),
+        None => {
+            let status = backend.gateway.status().await?;
+            format!("{}:{}", status.provider, status.model)
+        }
+    };
+    let effort = row.map_or("", |s| s.effort.as_str());
+    Ok(if effort.is_empty() {
+        model
+    } else {
+        format!("{model} · {effort}")
+    })
 }
 
 /// Reach the gateway, starting one if none is running — komo's state lives in
@@ -418,6 +448,7 @@ async fn event_loop(
                 app.connecting = false;
                 app.session_id = ready.session;
                 app.session_label = ready.label;
+                app.model_label = ready.model;
                 workspace = ready.workspace;
                 roots = ready.roots;
                 app.awaiting = ready.awaiting;
@@ -514,6 +545,9 @@ async fn event_loop(
                         }
                     }
                     TurnEnd::Failed(error) => app.push(Role::Error, error),
+                }
+                if let Some(backend) = &backend {
+                    refresh_model(backend, &mut app).await;
                 }
             }
             // Show one approval at a time, and pick up a question the turn
@@ -766,6 +800,23 @@ async fn follow_tail(backend: &Backend, app: &mut App, tail: &mut Tail) {
         }
     }
     tail.seen = messages.len();
+    if !tail.following {
+        refresh_model(backend, app).await;
+    }
+}
+
+/// Re-read what the status row names as the model, once per turn at its end.
+/// The choice lives on the session row and another client — the desktop app
+/// beside this terminal — may have moved it since boot; a turn ending is when
+/// that shows, and is the only time the row is worth another read. Best-effort:
+/// a failed read keeps the last label.
+async fn refresh_model(backend: &Backend, app: &mut App) {
+    let Ok(row) = session_row(backend, &app.session_id).await else {
+        return;
+    };
+    if let Ok(label) = model_label(backend, row.as_ref()).await {
+        app.model_label = label;
+    }
 }
 
 /// How a turn ended, as the loop has to render it.

@@ -105,6 +105,12 @@ pub struct GatewayClient {
 pub struct GatewayStatus {
     #[serde(default)]
     pub channels: Vec<String>,
+    /// The default model's provider and id — what a session with no choice of
+    /// its own runs on.
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
 }
 
 /// What a suspended turn on this session is waiting on, as
@@ -315,9 +321,13 @@ impl GatewayClient {
     // ---- client plane ------------------------------------------------------
 
     pub async fn status(&self) -> anyhow::Result<GatewayStatus> {
-        self.get_field("/api/status", "channels")
-            .await
-            .map(|channels| GatewayStatus { channels })
+        let resp = self
+            .http
+            .get(self.url("/api/status"))
+            .bearer_auth(&self.key)
+            .send()
+            .await?;
+        Ok(checked(resp).await?.json().await?)
     }
 
     pub async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {

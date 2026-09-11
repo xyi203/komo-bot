@@ -137,6 +137,10 @@ pub struct App {
     /// and the directory it runs in. Empty until the boot task lands — which
     /// conversation this is is not known before then on every entry point.
     pub session_label: String,
+    /// The model this conversation runs on, rendered at the right of the status
+    /// row: the session's own choice with its effort, else the gateway default.
+    /// Empty until the boot task lands.
+    pub model_label: String,
     pub entries: Vec<Entry>,
     pub input: String,
     /// Cursor as a char index into `input`.
@@ -194,6 +198,7 @@ impl App {
         Self {
             session_id,
             session_label: String::new(),
+            model_label: String::new(),
             entries: Vec::new(),
             input: String::new(),
             cursor: 0,

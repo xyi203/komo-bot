@@ -250,7 +250,24 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::DarkGray),
         ))
     };
-    frame.render_widget(Paragraph::new(status), area);
+    // The model sits at the right edge of the same row, out of the way of the
+    // activity text but always in view: which model answered is the first
+    // question after a surprising reply, and the header is already spoken for.
+    let model = format!(" {} ", app.model_label);
+    let [status_area, model_area] = Layout::horizontal([
+        Constraint::Min(1),
+        Constraint::Length(display_width(&model) as u16),
+    ])
+    .areas(area);
+    frame.render_widget(Paragraph::new(status), status_area);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            model,
+            Style::new().fg(Color::DarkGray),
+        )))
+        .alignment(ratatui::layout::Alignment::Right),
+        model_area,
+    );
 }
 
 fn elapsed_label(app: &App) -> String {
@@ -565,6 +582,43 @@ fn wrap_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The status row ends with the model, whatever the row's left side is
+    /// saying at the time — idle, thinking, or a tool running.
+    #[test]
+    fn status_row_names_the_model_at_its_right_edge() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut app = App::new("019fad15-8199-7461-9d48-0a6c779f1c8d".to_string());
+        app.model_label = "deepseek:deepseek-v4-flash · high".to_string();
+        let mut terminal = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        for in_flight in [false, true] {
+            app.in_flight = in_flight;
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            // Header, transcript, status, then the 3-row composer: the status
+            // row is the fourth from the bottom.
+            let status_row = buffer.area.height - 4;
+            // Skip the placeholder cell behind each double-width char, or the
+            // CJK words come back with a space inside them.
+            let mut row = String::new();
+            let mut x = 0;
+            while x < buffer.area.width {
+                let symbol = buffer[(x, status_row)].symbol();
+                row.push_str(symbol);
+                x += display_width(symbol).max(1) as u16;
+            }
+            assert!(
+                row.trim_end()
+                    .ends_with("deepseek:deepseek-v4-flash · high"),
+                "in_flight={in_flight}: {row:?}"
+            );
+            assert!(
+                row.contains(if in_flight { "正在思考" } else { "就绪" }),
+                "in_flight={in_flight}: {row:?}"
+            );
+        }
+    }
 
     #[test]
     fn wrap_respects_cjk_double_width() {

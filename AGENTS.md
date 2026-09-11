@@ -282,6 +282,9 @@ direct-db fallback.
 `~/.komo/config.toml` = runtime settings (provider/model/`models`/aux_model,
 `aux_effort` — the aux backend's reasoning effort; defaults to `none` on
 DeepSeek (thinking off), the provider's own default elsewhere —
+`effort` — the reasoning effort a conversation runs at when the session names
+none, validated against `provider` (an unusable level warns and reads as unset)
+and beaten by a session's own `X-Komo-Effort` choice —
 `schedule`, `dream_schedule`
 (default nightly `0 3 * * *`, `"off"` disables) plus its kill switch
 `dream_schedule_enabled` (default true; `false`
@@ -356,21 +359,26 @@ drops entries whose provider has no key (except the running `model`).
 deprecated alias for `deepseek-v4-flash` in **non-thinking** mode (and
 `deepseek-reasoner` for its thinking mode), so name `deepseek-v4-flash` /
 `deepseek-v4-pro` directly — thinking is on by default there, and
-`X-Komo-Effort` for DeepSeek is `low` / `high` / `max` (no `medium`, which the
-server would only alias onto `high`). Choice is
+`X-Komo-Effort` for DeepSeek is `none` / `low` / `high` / `max` (no `medium`,
+which the server would only alias onto `high`; `none` is thinking off). Choice is
 carried per turn in `X-Komo-Model`/`X-Komo-Effort`, validated against the menu,
-stored on the session; `RoutingLlm` dispatches across providers. Effort levels
+stored on the session — the TUI sets it through `POST /api/sessions/{id}/model`
+instead, so the choice lands when it is made; `RoutingLlm` dispatches across
+providers. Effort levels
 are per-provider (`Provider::efforts` ↔ `reasoning_params` must agree — there
 is a test). **Invariant: every aux path (reviewer, delegate, recall, sweeps)
 builds a synthetic `Session` with empty overrides** — that's what keeps a
 conversation's model from leaking onto the aux model; preserve it when adding
 aux callers. Empty overrides also mean an aux turn's effort can only come from
-the backend, so `ModelConfig::aux_variant()` carries one (`ModelConfig::effort`,
-`aux_effort` else `Provider::aux_default_effort`) and a session's own choice
-still wins over it. On DeepSeek that default is `"none"` — thinking off, a real
-wire value deliberately kept off `Provider::efforts` because it is not a level
-anyone picks per turn; without it every short aux call (the `mode = "auto"`
-reviewer has 20s) would run the server's default full thinking.
+the backend, so `ModelConfig::aux_variant()` carries its own
+(`ModelConfig::effort`, `aux_effort` else `Provider::aux_default_effort`) rather
+than the conversation default, and a session's own choice still wins over it.
+On the main config `ModelConfig::effort` is the operator's configured `effort`,
+which `for_provider` drops when the target provider's scale lacks that level.
+On DeepSeek the aux default is `"none"` — thinking off, which is both a level
+one may pick per turn and what the aux backend falls back to; without it every
+short aux call (the `mode = "auto"` reviewer has 20s) would run the server's
+default full thinking.
 
 The `codex` provider authenticates from the Codex CLI's OAuth file
 (`~/.codex/auth.json`, auto-refreshed) instead of an env key, and requires
@@ -1076,7 +1084,14 @@ call the same functions, which is what keeps validation from forking.
   ignored from then on — resuming a task from elsewhere continues the task
   rather than silently moving where its tools write. Widening is explicit:
   `/workspace add <path>` (`POST /api/sessions/{id}/workspace`), which the TUI
-  resolves against its own cwd; `/workspace` alone prints the roots. Home is
+  resolves against its own cwd; `/workspace` alone prints the roots.
+  `/model <id>` and `/effort <level>` set this session's choice through
+  `POST /api/sessions/{id}/model` — the same `check_selection` the
+  `X-Komo-Model`/`X-Komo-Effort` headers get, except that a bad value is
+  refused with the accepted list rather than silently defaulted, because
+  someone typed it and is waiting; the bare forms list the options, and the
+  status row re-reads the moment a choice lands rather than at the next turn.
+  Home is
   **unbound** (`roots` empty) and still runs each turn in the directory it was
   entered from — one conversation reached from wherever the operator is standing
   (docs/bot-runtime.md §2 D6) — as are channel conversations, sweeps and

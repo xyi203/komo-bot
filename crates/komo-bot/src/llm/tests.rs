@@ -64,7 +64,8 @@ fn anthropic_maps_effort_onto_a_thinking_budget() {
 
 #[test]
 fn deepseek_maps_its_own_scale_and_nothing_else() {
-    for level in ["low", "high", "max"] {
+    // `none` is thinking off, and a level of its own on this scale.
+    for level in ["none", "low", "high", "max"] {
         assert_eq!(
             reasoning_params(Provider::DeepSeek, level),
             Some(json!({ "reasoning": { "effort": level } })),
@@ -80,13 +81,9 @@ fn deepseek_maps_its_own_scale_and_nothing_else() {
             "{level:?}"
         );
     }
-    // The one value off the menu: `none` turns thinking off, on DeepSeek
-    // only — it is the aux backend's default, not a level anyone picks.
-    assert_eq!(
-        reasoning_params(Provider::DeepSeek, "none"),
-        Some(json!({ "reasoning": { "effort": "none" } }))
-    );
+    // Nobody else has a "thinking off" rung, so `none` means nothing there.
     assert_eq!(reasoning_params(Provider::OpenAi, "none"), None);
+    assert_eq!(reasoning_params(Provider::Anthropic, "none"), None);
     for level in ["", "  ", "auto", "xhigh", "HIGH"] {
         assert_eq!(reasoning_params(Provider::OpenAi, level), None, "{level:?}");
     }

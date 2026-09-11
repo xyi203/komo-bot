@@ -282,8 +282,8 @@ fn nothing_to_bind_leaves_the_session_unbound() {
 }
 
 /// A cross-provider menu: the default (codex, three effort levels), another
-/// codex model, and a deepseek one — which has **no** effort scale. That
-/// asymmetry is what the effort rules below turn on.
+/// codex model, and a deepseek one — whose scale is its own (`none` instead of
+/// `medium`). That asymmetry is what the effort rules below turn on.
 fn menu() -> Vec<ModelEntry> {
     vec![
         ModelEntry {
@@ -302,7 +302,7 @@ fn menu() -> Vec<ModelEntry> {
             id: "deepseek:deepseek-chat".into(),
             provider: komo_config::Provider::DeepSeek,
             model: "deepseek-chat".into(),
-            efforts: &[],
+            efforts: komo_config::Provider::DeepSeek.efforts(),
         },
     ]
 }
@@ -354,14 +354,14 @@ fn a_qualified_cross_provider_id_is_accepted_verbatim() {
 
 #[test]
 fn effort_is_validated_against_the_model_that_will_run() {
-    // deepseek has no effort scale, so a level valid for the codex default
-    // must not survive the switch — storing it would silently do nothing.
+    // `medium` is not on deepseek's scale, so a level valid for the codex
+    // default must not survive the switch — storing it would do nothing.
     let selection = requested_model(
         &menu(),
         DEFAULT_MODEL,
         &model_headers(&[
             ("x-komo-model", "deepseek:deepseek-chat"),
-            ("x-komo-effort", "high"),
+            ("x-komo-effort", "medium"),
         ]),
     )
     .expect("headers present");
@@ -370,6 +370,29 @@ fn effort_is_validated_against_the_model_that_will_run() {
         selection.effort, "",
         "an effort level the target provider doesn't support must be dropped"
     );
+}
+
+#[test]
+fn none_is_a_per_turn_effort_on_deepseek_only() {
+    let selection = requested_model(
+        &menu(),
+        DEFAULT_MODEL,
+        &model_headers(&[
+            ("x-komo-model", "deepseek:deepseek-chat"),
+            ("x-komo-effort", "none"),
+        ]),
+    )
+    .expect("headers present");
+    assert_eq!(selection.effort, "none", "thinking off is a level to pick");
+
+    // Codex has no "thinking off" rung, so the same header reads as unset.
+    let selection = requested_model(
+        &menu(),
+        DEFAULT_MODEL,
+        &model_headers(&[("x-komo-model", "gpt-5.4-mini"), ("x-komo-effort", "none")]),
+    )
+    .expect("headers present");
+    assert_eq!(selection.effort, "");
 }
 
 #[test]
@@ -401,6 +424,48 @@ fn unadvertised_values_resolve_to_the_default_not_the_provider() {
         "an unknown id must not reach the provider"
     );
     assert_eq!(selection.effort, "");
+}
+
+/// The `/model` route's half of the shared check: the header path drops what
+/// did not validate, this one has to name it, so the check reports it.
+#[test]
+fn an_unknown_model_is_named_back_with_the_menu() {
+    let check = check_selection(&menu(), DEFAULT_MODEL, "gpt-9", "");
+    assert_eq!(check.unknown_model.as_deref(), Some("gpt-9"));
+    assert_eq!(
+        check.selection.model, "",
+        "the header path still gets the default"
+    );
+    assert_eq!(check.effective_model, DEFAULT_MODEL);
+}
+
+#[test]
+fn an_unknown_effort_is_named_back_with_the_levels_that_model_takes() {
+    let check = check_selection(&menu(), DEFAULT_MODEL, "deepseek:deepseek-chat", "medium");
+    assert_eq!(check.unknown_effort.as_deref(), Some("medium"));
+    assert_eq!(check.effective_model, "deepseek:deepseek-chat");
+    assert_eq!(check.efforts, komo_config::Provider::DeepSeek.efforts());
+}
+
+#[test]
+fn a_model_switch_drops_an_effort_the_new_scale_lacks() {
+    // What the route does with a *stored* level on a model change: `max` is
+    // deepseek's, so moving to the codex default clears it rather than failing.
+    let check = check_selection(&menu(), DEFAULT_MODEL, "gpt-5.4-mini", "max");
+    assert_eq!(check.selection.model, "gpt-5.4-mini");
+    assert_eq!(check.selection.effort, "");
+    assert_eq!(check.unknown_effort.as_deref(), Some("max"));
+}
+
+#[test]
+fn an_empty_value_is_a_selection_not_a_mistake() {
+    // `/model` with `""` puts the session back on the gateway default; the
+    // route must not refuse that, so nothing empty is ever reported unknown.
+    let check = check_selection(&menu(), DEFAULT_MODEL, "", "");
+    assert_eq!(check.selection.model, "");
+    assert_eq!(check.selection.effort, "");
+    assert!(check.unknown_model.is_none());
+    assert!(check.unknown_effort.is_none());
 }
 
 #[test]

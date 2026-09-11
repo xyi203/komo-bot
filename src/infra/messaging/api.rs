@@ -108,6 +108,9 @@ struct AppState {
     /// Resolved main model identity (safe, non-secret status metadata).
     provider: Arc<String>,
     model: Arc<String>,
+    /// The configured default reasoning effort, empty when there is none — what
+    /// a session that names no level of its own runs at.
+    effort: Arc<String>,
     /// The models a client may switch a session to, each carrying its own
     /// provider and reasoning-effort levels — with a cross-provider menu those
     /// differ per entry (codex has three levels, deepseek none). Advertised over
@@ -142,6 +145,8 @@ pub struct ModelMenu {
     /// The default provider's name (status metadata; each entry names its own).
     provider: String,
     default_model: String,
+    /// The configured default effort, empty when unset.
+    default_effort: String,
     /// Selectable models, the configured default first (always non-empty). Each
     /// entry carries its provider and that provider's effort levels.
     models: Vec<ModelEntry>,
@@ -152,6 +157,7 @@ impl ModelMenu {
         Self {
             provider: config.provider.name().to_string(),
             default_model: config.model.clone(),
+            default_effort: config.effort.clone().unwrap_or_default(),
             // `menu()` drops entries whose provider has no usable credential, so
             // the UI never offers a model that would error on every turn.
             models: config.menu(),
@@ -197,6 +203,7 @@ impl ApiChannel {
                 home,
                 provider: Arc::new(models.provider),
                 model: Arc::new(models.default_model),
+                effort: Arc::new(models.default_effort),
                 models: Arc::new(models.models),
                 approvals,
                 cancels: Arc::new(CancelState::new()),
@@ -332,6 +339,7 @@ fn build_router(state: AppState, web_dir: Option<&str>) -> Router {
         .route("/api/sessions/{id}/status", post(set_session_status))
         .route("/api/sessions/{id}/boundary", post(conversation_boundary))
         .route("/api/sessions/{id}/workspace", post(add_session_root))
+        .route("/api/sessions/{id}/model", post(set_session_model))
         .route("/api/dream/apply", post(dream_apply))
         .route_layer(middleware::from_fn(require_loopback));
 
@@ -774,6 +782,65 @@ struct ModelSelection {
     effort: String,
 }
 
+/// How a requested model/effort pair resolves against the menu — the one
+/// validation both surfaces run, in the form each of them needs.
+///
+/// They differ only in what they do with a value that did not validate: the
+/// headers drop it (a chat client is not waiting on an answer, and a stale UI
+/// must never push a bogus id at a provider), the `/model` route refuses with
+/// the list that would have been accepted. So the check itself never decides —
+/// it drops, and says what it dropped.
+struct SelectionCheck {
+    /// The pair as it would be stored, anything invalid already dropped.
+    selection: ModelSelection,
+    /// The requested id, when the menu does not carry it.
+    unknown_model: Option<String>,
+    /// The requested level, when [`Self::effective_model`]'s scale lacks it.
+    unknown_effort: Option<String>,
+    /// The menu id the effort was checked against — the requested model, or the
+    /// gateway default when the request named none (or named nothing known).
+    effective_model: String,
+    /// The levels that model accepts; empty = it has no effort scale at all.
+    efforts: &'static [&'static str],
+}
+
+/// Resolve a model/effort pair against what this gateway advertises. An empty
+/// value is a selection, not a mistake: it means "run the gateway/provider
+/// default".
+///
+/// Effort is validated against **the model that will actually run**, not
+/// against a gateway-wide list: switching a session to a provider whose scale
+/// lacks the level clears it instead of storing one that silently does nothing.
+fn check_selection(
+    models: &[ModelEntry],
+    default_model: &str,
+    model: &str,
+    effort: &str,
+) -> SelectionCheck {
+    let known = models.iter().any(|entry| entry.id == model);
+    let chosen = if known { model } else { "" };
+    let effective = if chosen.is_empty() {
+        default_model
+    } else {
+        chosen
+    };
+    let efforts = models
+        .iter()
+        .find(|entry| entry.id == effective)
+        .map_or(&[][..], |entry| entry.efforts);
+    let level_ok = efforts.contains(&effort);
+    SelectionCheck {
+        selection: ModelSelection {
+            model: chosen.to_string(),
+            effort: if level_ok { effort } else { "" }.to_string(),
+        },
+        unknown_model: (!model.is_empty() && !known).then(|| model.to_string()),
+        unknown_effort: (!effort.is_empty() && !level_ok).then(|| effort.to_string()),
+        effective_model: effective.to_string(),
+        efforts,
+    }
+}
+
 /// Read `X-Komo-Model` / `X-Komo-Effort` off a chat request, validated against
 /// what this gateway actually advertises.
 ///
@@ -782,10 +849,6 @@ struct ModelSelection {
 /// must not silently reset a conversation's model). Present-but-unknown values
 /// resolve to empty — i.e. the default — rather than being forwarded verbatim,
 /// so a stale UI or a typo can't push a bogus model id at a provider.
-///
-/// Effort is validated against **the model that will actually run**, not against
-/// a gateway-wide list: switching a session to a provider with no effort scale
-/// clears a stale level instead of storing one that silently does nothing.
 fn requested_model(
     models: &[ModelEntry],
     default_model: &str,
@@ -802,26 +865,17 @@ fn requested_model(
     if model.is_none() && effort.is_none() {
         return None;
     }
-    // Empty = "run the gateway default", which is a legitimate selection.
-    let chosen = model
-        .filter(|want| models.iter().any(|entry| entry.id == *want))
-        .unwrap_or_default();
-    let effective = if chosen.is_empty() {
-        default_model
-    } else {
-        chosen
-    };
-    let allowed = models
-        .iter()
-        .find(|entry| entry.id == effective)
-        .map_or(&[][..], |entry| entry.efforts);
-    Some(ModelSelection {
-        model: chosen.to_string(),
-        effort: effort
-            .filter(|level| allowed.contains(level))
-            .unwrap_or_default()
-            .to_string(),
-    })
+    // A header that is present but absent-valued is the same as an empty one:
+    // one header alone is still a full selection, and clears the other.
+    Some(
+        check_selection(
+            models,
+            default_model,
+            model.unwrap_or_default(),
+            effort.unwrap_or_default(),
+        )
+        .selection,
+    )
 }
 
 /// The directory a loopback caller asked this turn to run in, resolved
@@ -1150,6 +1204,7 @@ async fn status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> 
         "home_chat": state.home,
         "provider": state.provider.as_ref(),
         "model": state.model.as_ref(),
+        "effort": state.effort.as_ref(),
         "context_window": model_context_window(state.model.as_ref()),
         // The provider adapters do not currently expose per-turn token usage.
         "token_usage": Value::Null,
@@ -1371,6 +1426,83 @@ async fn add_session_root(
         state.actions.sessions.set_roots(&id, &roots).await?;
     }
     Ok(Json(json!({ "ok": true, "roots": roots })).into_response())
+}
+
+#[derive(Deserialize)]
+struct ModelBody {
+    /// A menu id, or `""` to go back to the gateway default. Absent = keep what
+    /// the session already stores.
+    model: Option<String>,
+    /// A level on that model's scale, or `""` for the provider default. Absent
+    /// = keep what the session already stores.
+    effort: Option<String>,
+}
+
+/// `/model <id>` / `/effort <level>`: set this conversation's model choice.
+///
+/// The same validation the `X-Komo-Model` / `X-Komo-Effort` headers get, with
+/// one difference: a value that does not validate is **refused**, naming what
+/// would have been accepted, rather than silently resolving to the default — a
+/// person typed this one and is waiting for the answer. A session-level route
+/// rather than a per-turn header because the choice has to land (and show in
+/// the status row) the moment it is made, not at the next turn.
+async fn set_session_model(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ModelBody>,
+) -> Result<Json<Value>, ApiError> {
+    // The choice is stored on the row, so mint one exactly as a turn would: a
+    // bare `komo` is a new session every time, and `/effort none` before the
+    // first message is the natural way to open one — `open_session` binds it to
+    // the caller's launch directory and is a no-op for a row that exists.
+    // Unlike the chat path there is no `is_loopback` check around the workspace
+    // id: this route lives in the `operator_writes` group, behind
+    // `require_loopback` already.
+    let requested = requested_workspace_root(&state, &headers);
+    open_session(&state, &id, requested).await?;
+    let session = state
+        .actions
+        .sessions
+        .find(&id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("session `{id}` is missing right after opening it"))?;
+    let model = body.model.as_deref().map(str::trim);
+    let effort = body.effort.as_deref().map(str::trim);
+    let check = check_selection(
+        &state.models,
+        &state.model,
+        model.unwrap_or(&session.model),
+        effort.unwrap_or(&session.effort),
+    );
+    // Only what this caller actually sent is refused. A value carried over from
+    // the row is dropped the way the header path drops it: switching to a model
+    // whose scale lacks the stored level clears the level, it does not fail.
+    if let Some(wanted) = check.unknown_model.filter(|_| model.is_some()) {
+        let menu: Vec<&str> = state.models.iter().map(|e| e.id.as_str()).collect();
+        return Err(ApiError::bad_request(format!(
+            "`{wanted}` is not one of this gateway's models: {}",
+            menu.join(", ")
+        )));
+    }
+    if let Some(wanted) = check.unknown_effort.filter(|_| effort.is_some()) {
+        let model = check.effective_model;
+        return Err(ApiError::bad_request(if check.efforts.is_empty() {
+            format!("`{model}` has no reasoning-effort scale")
+        } else {
+            format!(
+                "`{wanted}` is not a reasoning effort `{model}` accepts: {}",
+                check.efforts.join(", ")
+            )
+        }));
+    }
+    let ModelSelection { model, effort } = check.selection;
+    state
+        .actions
+        .sessions
+        .set_model(&id, &model, &effort)
+        .await?;
+    Ok(Json(json!({ "model": model, "effort": effort })))
 }
 
 #[derive(Deserialize)]

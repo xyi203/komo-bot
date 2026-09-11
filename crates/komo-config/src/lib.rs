@@ -97,15 +97,17 @@ impl Provider {
     /// rendering a switch that changes nothing — see
     /// `infra::llm::reasoning_params`, which turns a level into request params.
     ///
-    /// The scale is each provider's own. DeepSeek's is `low`/`high`/`max`: it
-    /// aliases a requested `medium` onto `high` server-side, so advertising one
-    /// would offer a level that silently becomes another.
+    /// The scale is each provider's own. DeepSeek's is `none`/`low`/`high`/`max`:
+    /// `none` is its real wire value for thinking off — a quick answer with no
+    /// reasoning, which is a level one picks per turn — and it aliases a requested
+    /// `medium` onto `high` server-side, so advertising one would offer a level
+    /// that silently becomes another.
     pub fn efforts(self) -> &'static [&'static str] {
         match self {
             Provider::OpenAi | Provider::OpenRouter | Provider::Codex | Provider::Anthropic => {
                 &["low", "medium", "high"]
             }
-            Provider::DeepSeek => &["low", "high", "max"],
+            Provider::DeepSeek => &["none", "low", "high", "max"],
         }
     }
 
@@ -123,12 +125,10 @@ impl Provider {
         }
     }
 
-    /// Whether this provider accepts `effort` as a backend default. Wider than
-    /// [`Provider::efforts`] by exactly one value: DeepSeek's `"none"` is a real
-    /// wire value ("thinking off") but not a level anyone picks per turn, so it
-    /// is configurable without appearing on a client's effort menu.
+    /// Whether this provider accepts `effort` — the same scale a client is
+    /// offered, since a backend default is a level like any other.
     pub fn accepts_effort(self, effort: &str) -> bool {
-        self.efforts().contains(&effort) || self.aux_default_effort() == Some(effort)
+        self.efforts().contains(&effort)
     }
 
     /// Environment variable holding this provider's API key. Codex has none —

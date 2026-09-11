@@ -102,7 +102,7 @@ fn the_aux_backend_turns_deepseek_thinking_off_by_default() {
     let snap = ConfigSnapshot::from_sources(with_deepseek_key(sources()));
     assert_eq!(
         snap.runtime.model.effort, None,
-        "a conversation picks its own"
+        "no configured effort, so a conversation picks its own"
     );
     assert_eq!(
         snap.runtime.model.aux_variant().effort.as_deref(),
@@ -124,8 +124,83 @@ fn a_configured_aux_effort_wins_over_the_providers_default() {
 }
 
 #[test]
+fn a_configured_effort_reaches_the_main_model_config() {
+    let mut s = with_deepseek_key(sources());
+    s.file.effort = Some("low".into());
+    s.env.effort = Some("high".into());
+    let snap = ConfigSnapshot::from_sources(s);
+    assert_eq!(
+        snap.runtime.model.effort.as_deref(),
+        Some("high"),
+        "env wins over the file"
+    );
+    assert_eq!(
+        snap.runtime.model.aux_variant().effort.as_deref(),
+        Some("none"),
+        "the aux backend keeps its own default"
+    );
+}
+
+#[test]
+fn an_effort_the_provider_rejects_warns_and_reads_as_unset() {
+    // `medium` is not on DeepSeek's scale — the server would alias it onto `high`.
+    let mut s = with_deepseek_key(sources());
+    s.file.effort = Some("medium".into());
+    let snap = ConfigSnapshot::from_sources(s);
+    let issue = snap
+        .report
+        .issues
+        .iter()
+        .find(|i| i.path == "model.effort")
+        .expect("an unusable effort is reported");
+    assert_eq!(issue.severity, IssueSeverity::Warning);
+    assert!(
+        snap.report.fatal().is_none(),
+        "a typo never aborts resolution"
+    );
+    assert_eq!(snap.runtime.model.effort, None);
+}
+
+#[test]
+fn a_switched_provider_drops_an_effort_its_scale_lacks() {
+    let mut s = with_deepseek_key(sources());
+    s.secrets.openai_api_key = Some("sk-test".into());
+    s.file.effort = Some("max".into());
+    let model = ConfigSnapshot::from_sources(s).runtime.model;
+    assert_eq!(model.effort.as_deref(), Some("max"));
+    assert_eq!(
+        model
+            .for_provider(Provider::OpenAi, "gpt-5.6-terra".into())
+            .effort,
+        None,
+        "openai's scale has no `max`"
+    );
+    assert_eq!(
+        model
+            .for_provider(Provider::DeepSeek, "deepseek-v4-pro".into())
+            .effort
+            .as_deref(),
+        Some("max")
+    );
+
+    let mut s = with_deepseek_key(sources());
+    s.secrets.openai_api_key = Some("sk-test".into());
+    s.file.effort = Some("high".into());
+    assert_eq!(
+        ConfigSnapshot::from_sources(s)
+            .runtime
+            .model
+            .for_provider(Provider::OpenAi, "gpt-5.6-terra".into())
+            .effort
+            .as_deref(),
+        Some("high"),
+        "a level both scales carry follows the switch"
+    );
+}
+
+#[test]
 fn an_aux_effort_the_provider_rejects_warns_and_reads_as_unset() {
-    // DeepSeek has no effort scale, so `medium` is not a level it accepts.
+    // `medium` is not on DeepSeek's scale — the server would alias it onto `high`.
     let mut s = with_deepseek_key(sources());
     s.file.aux_effort = Some("medium".into());
     let snap = ConfigSnapshot::from_sources(s);
@@ -472,7 +547,7 @@ fn menu_resolves_qualified_ids_to_their_own_provider_and_efforts() {
     assert_eq!(deepseek.model, "deepseek-chat", "the prefix is stripped");
     assert_eq!(
         deepseek.efforts,
-        ["low", "high", "max"],
+        ["none", "low", "high", "max"],
         "deepseek has its own scale, not the codex entries'"
     );
     // An unqualified entry inherits the configured provider.

@@ -111,6 +111,31 @@ pub struct GatewayStatus {
     pub provider: String,
     #[serde(default)]
     pub model: String,
+    /// The configured default reasoning effort, empty when there is none.
+    #[serde(default)]
+    pub effort: String,
+}
+
+/// One entry of the model menu (`GET /api/models`): what a session may be
+/// switched to, with the reasoning-effort levels its provider accepts.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ModelMenuEntry {
+    /// The id a session stores and a switch names — qualified
+    /// (`deepseek:deepseek-v4-pro`) when the entry names its own provider.
+    pub id: String,
+    /// Empty when this entry's provider has no effort scale.
+    #[serde(default)]
+    pub efforts: Vec<String>,
+}
+
+/// A session's stored model choice. Either field is empty when the session
+/// names none and the gateway default runs.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct SessionModel {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
 }
 
 /// What a suspended turn on this session is waiting on, as
@@ -236,13 +261,22 @@ impl GatewayClient {
     /// with nothing to do about it (the old gateway holds the lock), so it
     /// becomes an actionable "restart the gateway" message instead.
     async fn post_json(&self, path: &str, body: Value) -> anyhow::Result<Map<String, Value>> {
-        let resp = self
-            .http
-            .post(self.url(path))
-            .bearer_auth(&self.key)
-            .json(&body)
-            .send()
-            .await?;
+        self.post_json_with(path, body, &[]).await
+    }
+
+    /// [`post_json`] with extra headers, for a write that has to carry what a
+    /// turn's headers carry.
+    async fn post_json_with(
+        &self,
+        path: &str,
+        body: Value,
+        headers: &[(&str, &str)],
+    ) -> anyhow::Result<Map<String, Value>> {
+        let mut request = self.http.post(self.url(path)).bearer_auth(&self.key);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let resp = request.json(&body).send().await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             anyhow::bail!(
                 "the running gateway doesn't serve `{path}` — it predates this command.\n\
@@ -330,6 +364,11 @@ impl GatewayClient {
         Ok(checked(resp).await?.json().await?)
     }
 
+    /// The models a session may be switched to, each with its own effort scale.
+    pub async fn models(&self) -> anyhow::Result<Vec<ModelMenuEntry>> {
+        self.get_field("/api/models", "models").await
+    }
+
     pub async fn sessions(&self) -> anyhow::Result<Vec<SessionSummary>> {
         self.get_field("/api/sessions", "sessions").await
     }
@@ -365,6 +404,41 @@ impl GatewayClient {
             "roots",
         )
         .await
+    }
+
+    /// `/model <id>` / `/effort <level>`: set this session's model choice.
+    ///
+    /// `None` leaves that half as the session stores it; `Some("")` puts it back
+    /// to the gateway default. A value the gateway refuses arrives as the reason
+    /// it gave — which is the point of setting this through a route rather than
+    /// the per-turn headers, where a bad value silently becomes the default.
+    ///
+    /// `workspace` is the same id [`chat_streaming`](Self::chat_streaming)
+    /// sends: the choice is stored on the session row, and this may well be the
+    /// first thing a brand-new conversation does, so the row it mints has to be
+    /// bound to the caller's directory exactly as a first turn would bind it.
+    pub async fn set_session_model(
+        &self,
+        session: &str,
+        workspace: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+    ) -> anyhow::Result<SessionModel> {
+        let mut body = Map::new();
+        if let Some(model) = model {
+            body.insert("model".into(), model.into());
+        }
+        if let Some(effort) = effort {
+            body.insert("effort".into(), effort.into());
+        }
+        let reply = self
+            .post_json_with(
+                &format!("/api/sessions/{session}/model"),
+                body.into(),
+                &[("X-Komo-Workspace", workspace)],
+            )
+            .await?;
+        Ok(serde_json::from_value(Value::Object(reply))?)
     }
 
     /// Transcript entries for one known session, used to hydrate a resumed TUI

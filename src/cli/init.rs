@@ -22,6 +22,7 @@ provider = "deepseek"
 # base_url = ""                  # OpenAI-compatible endpoint override
 # aux_model = ""                 # cheaper model for sub-tasks (reviewer/recall)
 # aux_effort = "none"            # aux reasoning effort; "none" = thinking off (deepseek default)
+# effort = ""                    # default reasoning effort for conversations (per provider scale, e.g. none/low/high/max on deepseek)
 
 # Maintenance sweep cron (5-field Unix cron). Default: hourly.
 # schedule = "0 * * * *"

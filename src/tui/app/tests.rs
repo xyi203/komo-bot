@@ -520,6 +520,37 @@ fn ctrl_c_quits_everywhere_ctrl_d_only_on_empty_input() {
 }
 
 #[test]
+fn a_model_line_is_read_by_the_ui_not_sent_to_the_agent() {
+    let mut app = App::new("s".into());
+    type_str(&mut app, "/model");
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::ShowModels));
+
+    type_str(&mut app, "/model deepseek:deepseek-v4-pro");
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Some(Action::SetModel("deepseek:deepseek-v4-pro".into()))
+    );
+
+    type_str(&mut app, "/effort");
+    assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::ShowEffort));
+
+    type_str(&mut app, "/effort high");
+    assert_eq!(
+        app.on_key(key(KeyCode::Enter)),
+        Some(Action::SetEffort("high".into()))
+    );
+
+    // A longer word on the same prefix is a message — the `/workspace` rule.
+    for line in ["/models", "/efforts gpt"] {
+        type_str(&mut app, line);
+        assert!(
+            matches!(app.on_key(key(KeyCode::Enter)), Some(Action::Submit { .. })),
+            "{line} is not a command"
+        );
+    }
+}
+
+#[test]
 fn a_workspace_line_is_read_by_the_ui_not_sent_to_the_agent() {
     let mut app = App::new("s".into());
     type_str(&mut app, "/workspace");

@@ -57,7 +57,9 @@ use crossterm::{
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::infra::gateway_client::{GatewayClient, folder_workspace_id};
+use crate::infra::gateway_client::{
+    GatewayClient, ModelMenuEntry, SessionModel, folder_workspace_id,
+};
 use komo_core::domain::{
     events::TurnEvent,
     message::{Message, Role as MessageRole},
@@ -290,22 +292,139 @@ async fn session_row(backend: &Backend, id: &str) -> anyhow::Result<Option<Sessi
 /// What the status row names as the model this conversation runs on: the
 /// session's own choice when it made one (stored as the menu id, qualified or
 /// not), else the gateway default in the same `provider:model` spelling. The
-/// effort follows only when the session set one — the provider default has no
-/// name a client could read.
+/// effort is the session's own, else the gateway's configured default — that
+/// one only while the session runs the default model, since a switched model
+/// may sit on a provider whose scale does not carry that level.
 async fn model_label(backend: &Backend, row: Option<&SessionSummary>) -> anyhow::Result<String> {
-    let model = match row.filter(|s| !s.model.is_empty()) {
-        Some(row) => row.model.clone(),
-        None => {
-            let status = backend.gateway.status().await?;
-            format!("{}:{}", status.provider, status.model)
-        }
+    let chosen_model = row.map_or("", |s| s.model.as_str());
+    let chosen_effort = row.map_or("", |s| s.effort.as_str());
+    if !chosen_model.is_empty() && !chosen_effort.is_empty() {
+        return Ok(format!("{chosen_model} · {chosen_effort}"));
+    }
+    let status = backend.gateway.status().await?;
+    let default_model = format!("{}:{}", status.provider, status.model);
+    let on_default =
+        chosen_model.is_empty() || chosen_model == default_model || chosen_model == status.model;
+    let model = if chosen_model.is_empty() {
+        default_model
+    } else {
+        chosen_model.to_string()
     };
-    let effort = row.map_or("", |s| s.effort.as_str());
+    let effort = if on_default {
+        status.effort.as_str()
+    } else {
+        ""
+    };
     Ok(if effort.is_empty() {
         model
     } else {
         format!("{model} · {effort}")
     })
+}
+
+/// What `/model` and `/effort` report on: the menu, and what this conversation
+/// runs on — its own choice when it made one, else the gateway default, which
+/// the menu always carries (the running model is its first entry).
+struct Choice {
+    menu: Vec<ModelMenuEntry>,
+    model: String,
+    effort: String,
+}
+
+async fn current_choice(backend: &Backend, session: &str) -> anyhow::Result<Choice> {
+    let row = session_row(backend, session).await?;
+    let effort = row.as_ref().map_or("", |r| r.effort.as_str()).to_string();
+    let model = match row.map(|r| r.model).filter(|model| !model.is_empty()) {
+        Some(model) => model,
+        None => backend.gateway.status().await?.model,
+    };
+    Ok(Choice {
+        menu: backend.gateway.models().await?,
+        model,
+        effort,
+    })
+}
+
+/// `/model`: the ids a switch may name, the running one marked.
+fn menu_note(choice: &Choice) -> String {
+    let mut note = String::from("模型（* 为当前）：");
+    for entry in &choice.menu {
+        let mark = if entry.id == choice.model { "*" } else { " " };
+        note.push_str(&format!("\n{mark} {}", entry.id));
+    }
+    note
+}
+
+/// `/effort`: the level this conversation runs at and the ones it may name.
+/// The scale belongs to the provider, so it is the *model* that decides.
+fn effort_note(choice: &Choice) -> String {
+    let current = if choice.effort.is_empty() {
+        "默认"
+    } else {
+        &choice.effort
+    };
+    let levels = choice
+        .menu
+        .iter()
+        .find(|entry| entry.id == choice.model)
+        .map_or(&[][..], |entry| entry.efforts.as_slice());
+    if levels.is_empty() {
+        return format!("effort → {current}；`{}` 没有 effort 档位。", choice.model);
+    }
+    format!(
+        "effort → {current}；`{}` 可选：{}",
+        choice.model,
+        levels.join(" / ")
+    )
+}
+
+/// What the row now holds. Not always what was typed: switching models drops an
+/// effort the new model's scale does not carry.
+fn choice_note(chosen: &SessionModel) -> String {
+    let named = |value: &str| {
+        if value.is_empty() {
+            "默认".to_string()
+        } else {
+            value.to_string()
+        }
+    };
+    format!(
+        "model → {} · effort → {}",
+        named(&chosen.model),
+        named(&chosen.effort)
+    )
+}
+
+/// Serve a `/model` / `/effort` line: list what may be chosen, or set it and
+/// say what the session now holds. Both halves go through one route, so the
+/// half that was not typed rides as `None` and stays as stored — and the
+/// gateway refuses a bad value rather than defaulting it, which is what makes
+/// the error worth showing.
+async fn model_command(backend: &Backend, app: &mut App, action: Action) -> anyhow::Result<()> {
+    let (model, effort) = match action {
+        Action::SetModel(ref id) => (Some(id.as_str()), None),
+        Action::SetEffort(ref level) => (None, Some(level.as_str())),
+        // The bare forms say what may be chosen instead of choosing.
+        _ => {
+            let choice = current_choice(backend, &app.session_id).await?;
+            let note = if matches!(action, Action::ShowModels) {
+                menu_note(&choice)
+            } else {
+                effort_note(&choice)
+            };
+            app.push(Role::Info, note);
+            return Ok(());
+        }
+    };
+    let chosen = backend
+        .gateway
+        .set_session_model(&app.session_id, &backend.workspace, model, effort)
+        .await?;
+    app.push(Role::Info, choice_note(&chosen));
+    // The status row names the model; the choice just landed, so it is stale
+    // until the next turn ends unless it is re-read now.
+    refresh_model(backend, app).await;
+    Ok(())
 }
 
 /// Reach the gateway, starting one if none is running — komo's state lives in
@@ -650,6 +769,20 @@ async fn event_loop(
                             );
                         }
                         Err(error) => app.push(Role::Error, format!("{error:#}")),
+                    }
+                }
+                Some(
+                    action @ (Action::ShowModels
+                    | Action::SetModel(_)
+                    | Action::ShowEffort
+                    | Action::SetEffort(_)),
+                ) => {
+                    let Some(backend) = &backend else {
+                        app.push(Role::Info, "正在启动，稍候再切换模型。".to_string());
+                        continue;
+                    };
+                    if let Err(error) = model_command(backend, &mut app, action).await {
+                        app.push(Role::Error, format!("{error:#}"));
                     }
                 }
                 Some(Action::Answer { text, shown }) => {

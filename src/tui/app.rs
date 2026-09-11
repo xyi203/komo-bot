@@ -116,6 +116,15 @@ pub enum Action {
     AddWorkspace(String),
     /// `/workspace`: say which directories this session works in.
     ShowWorkspace,
+    /// `/model <id>`: run this conversation on another model from the menu.
+    SetModel(String),
+    /// `/model`: list the menu, marking what this conversation runs on.
+    ShowModels,
+    /// `/effort <level>`: set this conversation's reasoning effort.
+    SetEffort(String),
+    /// `/effort`: say which level this conversation runs at, and which ones
+    /// its model accepts.
+    ShowEffort,
     /// The user answered the approval modal.
     Answered(Answer),
     /// The user answered a mid-turn `ask_user` question: resolve it into the
@@ -458,7 +467,9 @@ impl App {
                     self.clear_input();
                     return Some(Action::NewSession);
                 }
-                if let Some(action) = workspace_command(&text) {
+                if let Some(action) =
+                    workspace_command(&text).or_else(|| model_choice_command(&text))
+                {
                     self.clear_input();
                     return Some(action);
                 }
@@ -700,6 +711,30 @@ fn workspace_command(text: &str) -> Option<Action> {
     }
     let path = rest.strip_prefix("add")?.trim();
     (!path.is_empty()).then(|| Action::AddWorkspace(path.to_string()))
+}
+
+/// Split a one-argument slash command off a line: `Some("")` for the bare
+/// word, `Some(arg)` for the word plus something. `None` when the line merely
+/// starts with those letters — `/models` is a message, not `/model`.
+fn slash_arg<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let rest = text.strip_prefix(name)?;
+    (rest.is_empty() || rest.starts_with(char::is_whitespace)).then(|| rest.trim())
+}
+
+/// Read a `/model` or `/effort` line. The bare word lists what may be chosen;
+/// a word after it sets the choice. Anything else goes to the agent as
+/// ordinary text — the rule `/workspace` follows.
+fn model_choice_command(text: &str) -> Option<Action> {
+    if let Some(id) = slash_arg(text, "/model") {
+        return Some(match id {
+            "" => Action::ShowModels,
+            id => Action::SetModel(id.to_string()),
+        });
+    }
+    Some(match slash_arg(text, "/effort")? {
+        "" => Action::ShowEffort,
+        level => Action::SetEffort(level.to_string()),
+    })
 }
 
 /// Collapse a (possibly multi-line, possibly long) tool arg/result into a

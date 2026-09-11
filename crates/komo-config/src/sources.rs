@@ -74,6 +74,9 @@ pub struct KomoEnv {
     pub aux_model: Option<String>,
     /// Reasoning effort the aux backend runs at (`KOMO_AUX_EFFORT`).
     pub aux_effort: Option<String>,
+    /// Reasoning effort a conversation runs at when the session picks none
+    /// (`KOMO_EFFORT`).
+    pub effort: Option<String>,
     pub schedule: Option<String>,
     pub dream_schedule: Option<String>,
     /// `KOMO_DREAM_SCHEDULE_ENABLED=false` — same kill switch for dreaming.
@@ -115,6 +118,7 @@ impl KomoEnv {
             &mut self.base_url,
             &mut self.aux_model,
             &mut self.aux_effort,
+            &mut self.effort,
             &mut self.schedule,
             &mut self.dream_schedule,
             &mut self.skills_path,
@@ -210,6 +214,9 @@ pub struct FileConfig {
     /// Unset = the provider's own aux default (`none` on DeepSeek, i.e.
     /// thinking off; the provider's default elsewhere).
     pub aux_effort: Option<String>,
+    /// Reasoning effort a conversation runs at when the session picks none.
+    /// Unset = the provider's own default.
+    pub effort: Option<String>,
     /// 5-field Unix cron expression for gateway maintenance (default: hourly).
     pub schedule: Option<String>,
     /// 5-field Unix cron expression for the usage-driven memory "dreaming" sweep.

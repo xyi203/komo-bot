@@ -257,9 +257,10 @@ pub struct ModelConfig {
     /// default (see [`Provider::aux_default_effort`]).
     pub aux_effort: Option<String>,
     /// The effort a session with **no** override runs this backend at; `None`
-    /// leaves the provider's own default alone. The main config carries `None`
-    /// (a conversation picks its own level per turn); [`Self::aux_variant`] is
-    /// what fills it in.
+    /// leaves the provider's own default alone. On the main config this is the
+    /// operator's configured `effort`, already validated against `provider` —
+    /// a session's own choice still wins over it; [`Self::aux_variant`] fills
+    /// in its own instead (the aux backend has a default of its own).
     pub effort: Option<String>,
     /// Maximum tool-calling round-trips per user turn.
     pub max_turns: usize,
@@ -405,7 +406,9 @@ impl ModelConfig {
             base_url: default_provider.then(|| self.base_url.clone()).flatten(),
             aux_model: self.aux_model.clone(),
             aux_effort: self.aux_effort.clone(),
-            effort: self.effort.clone(),
+            // A level configured for the main provider must not follow a
+            // session onto a backend whose scale lacks it.
+            effort: self.effort.clone().filter(|it| provider.accepts_effort(it)),
             max_turns: self.max_turns,
             max_tool_result_bytes: self.max_tool_result_bytes,
             max_turn_result_bytes: self.max_turn_result_bytes,
@@ -418,10 +421,11 @@ impl ModelConfig {
 
     /// A variant using the cheaper `aux_model`, falling back to the main model.
     ///
-    /// It also carries a backend default effort, which the main config never
-    /// does: every aux caller builds a synthetic session with empty overrides,
-    /// so without one the backend runs at whatever the provider does by default
-    /// — on DeepSeek that is full thinking, on every short aux call.
+    /// Its effort is the aux backend's own (`aux_effort` else
+    /// [`Provider::aux_default_effort`]), never the conversation default: every
+    /// aux caller builds a synthetic session with empty overrides, so without
+    /// one the backend runs at whatever the provider does by default — on
+    /// DeepSeek that is full thinking, on every short aux call.
     pub fn aux_variant(&self) -> ModelConfig {
         let model = self.aux_model.clone().unwrap_or_else(|| self.model.clone());
         // `aux_model` may be qualified (`deepseek:…`) and name a different
@@ -602,13 +606,30 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         if aux_provider.accepts_effort(&effort) {
             return Some(effort);
         }
-        let mut accepted: Vec<&str> = aux_provider.efforts().to_vec();
-        accepted.extend(aux_provider.aux_default_effort());
+        let accepted = aux_provider.efforts();
         issues.push(ConfigIssue {
             path: "model.aux_effort",
             severity: IssueSeverity::Warning,
             message: format!(
                 "aux_effort = {effort:?} is not valid for {aux_provider:?} \
+                 (accepted: {accepted:?}) — ignoring it",
+            ),
+        });
+        None
+    });
+    // Same shape against the main provider: a level it does not accept is a
+    // warning and reads as unset, so a typo never silently changes a turn.
+    let effort = env.effort.or(file.effort).and_then(|effort| {
+        let effort = effort.trim().to_string();
+        if provider.accepts_effort(&effort) {
+            return Some(effort);
+        }
+        let accepted = provider.efforts();
+        issues.push(ConfigIssue {
+            path: "model.effort",
+            severity: IssueSeverity::Warning,
+            message: format!(
+                "effort = {effort:?} is not valid for {provider:?} \
                  (accepted: {accepted:?}) — ignoring it",
             ),
         });
@@ -629,9 +650,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         base_url: env.base_url.or(file.base_url),
         aux_model,
         aux_effort,
-        // A conversation picks its own level per turn; only the aux backend
-        // carries a default (see `ModelConfig::aux_variant`).
-        effort: None,
+        effort,
         max_turns: env
             .max_turns
             .or(file.max_turns)

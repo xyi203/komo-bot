@@ -3,8 +3,8 @@
 
 set -euo pipefail
 
-REPO="${KOMO_REPO:-solren7/komo}"
-INSTALL_DIR="/usr/local/bin"
+REPO="${KOMO_REPO:-xyi203/komo-bot}"
+INSTALL_DIR="${KOMO_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${KOMO_VERSION:-latest}"
 
 if [[ -n "${NO_COLOR:-}" ]]; then
@@ -28,14 +28,18 @@ Install komo from GitHub releases.
 Usage:
   install.sh [version] [--prefix DIR]
 
+Installs to ~/.local/bin by default (no sudo). Use --prefix for a
+system-wide install; /usr/local/bin needs sudo, which the script will ask for.
+
 Examples:
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --prefix "\$HOME/.local/bin"
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --prefix /usr/local/bin
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- v0.1.0
 
 Environment:
-  KOMO_REPO       GitHub repo, default: ${REPO}
-  KOMO_VERSION    Release tag, default: latest
+  KOMO_REPO         GitHub repo, default: ${REPO}
+  KOMO_VERSION      Release tag, default: latest
+  KOMO_INSTALL_DIR  Install directory, default: ~/.local/bin
 EOF
 }
 
@@ -213,5 +217,6 @@ else
 fi
 
 if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
-    warn "${INSTALL_DIR} is not in PATH. Add it to your shell profile before running komo globally."
+    warn "${INSTALL_DIR} is not in PATH. Add this line to your shell profile, then open a new shell:"
+    warn "  export PATH=\"${INSTALL_DIR}:\$PATH\""
 fi

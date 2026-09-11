@@ -26,11 +26,14 @@ easy to say and remember, and adapts naturally to logos and domain names.
 
 ## Install
 
-From GitHub release binaries (macOS, Linux):
+From GitHub release binaries (macOS, Linux), into `~/.local/bin`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/solren7/komo/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/xyi203/komo-bot/main/install.sh | bash
 ```
+
+Pass `--prefix /usr/local/bin` after `bash -s --` for a system-wide install
+(needs sudo).
 
 Or build from source:
 

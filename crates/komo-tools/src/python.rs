@@ -22,6 +22,11 @@
 //! the run ledger, the result cap. A program is a way to sequence komo's tools,
 //! never a way around what gating them means. That is also why the executor
 //! handle here is weak: `python` sits in the catalog it dispatches through.
+//!
+//! What such a call does *not* get from the round it arrives in is a name, so
+//! [`sub_turn`] hands it one: the enclosing call's identity plus an ordinal in
+//! program order (`code-1-read`, `code-2-cron`). The gate and the scratch store
+//! both key on the call id, and two calls sharing one id share an approval.
 
 use std::sync::Arc;
 
@@ -32,7 +37,7 @@ use komo_core::domain::llm::ToolCallReq;
 use komo_core::domain::tool::{APPROVAL_BOUND, Tool, ToolError, ToolOutput, parse_args};
 use komo_pyhost::{PyHostError, SharedHost, ToolAnswer};
 use komo_services::tool_execution::{
-    SpinDetector, ToolTurnContext, TurnResultBudget, WeakToolExecutor,
+    NestedCalls, SpinDetector, ToolTurnContext, TurnResultBudget, WeakToolExecutor,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -185,16 +190,34 @@ fn elide_source(args: &str) -> String {
 /// enters the model's context, and a sub-call's result enters the program, not
 /// the context. Only what the program returns is paid for. Each result is still
 /// capped individually by the executor, exactly as a direct call would be.
+///
+/// It also carries this call's own identity as the enclosing one, which is what
+/// [`dispatch`] numbers the program's calls against — see [`NestedCalls`]. A
+/// context with no call in it (a detached one, a test) numbers nothing: there
+/// is no identity to hang the ordinals off, and an unnumbered id is what those
+/// callers had before.
 pub(crate) fn sub_turn(ctx: &ToolContext) -> ToolTurnContext {
     ToolTurnContext {
         session: ctx.session.clone(),
         run: ctx.run.clone(),
         budget: TurnResultBudget::new(0),
         spin: SpinDetector::default(),
+        nested: match (ctx.call_id(), ctx.call_index()) {
+            (Some(call_id), Some(call_index)) => {
+                Some(Arc::new(NestedCalls::new(call_id, call_index)))
+            }
+            _ => None,
+        },
     }
 }
 
 /// Run one tool call python made, through the executor.
+///
+/// Each call is named `code-<ordinal>-<tool>` off the turn's [`NestedCalls`]
+/// counter, so a program calling one tool twice makes two calls the approval
+/// gate and the scratch store can tell apart — and makes the *same* two on a
+/// re-run, since the ordinals follow program order. A turn context with no
+/// nesting (a detached caller) keeps the unnumbered `code-<tool>`.
 ///
 /// Returns `Err(text)` for a call the caller should see as a failure — an
 /// unknown or forbidden name, or a tool that errored. The host turns that into
@@ -224,8 +247,16 @@ pub(crate) async fn dispatch(
         ));
     }
 
+    // The call's index stays the executor's to derive — it is the position in
+    // the round, and a nested round holds one call, so it is always 0. The
+    // ordinal is carried in the id, which is what both the gate and the scratch
+    // key on.
+    let id = match &turn.nested {
+        Some(nested) => format!("code-{}-{name}", nested.next_ordinal()),
+        None => format!("code-{name}"),
+    };
     let call = ToolCallReq {
-        id: format!("code-{name}"),
+        id,
         call_id: None,
         name,
         args: args.to_string(),
@@ -498,6 +529,123 @@ mod tests {
         let redacted = elide_source(&long);
         assert!(redacted.starts_with('读'));
         assert!(redacted.contains("bytes elided"));
+    }
+
+    /// A tool that keeps the call id the executor handed it: that id is what
+    /// the approval gate and the scratch store key on, so it is the only thing
+    /// that tells one of a program's calls from the next.
+    struct Recording(&'static str, Arc<std::sync::Mutex<Vec<String>>>);
+
+    #[async_trait]
+    impl Tool for Recording {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &'static str {
+            "records the call id it ran under"
+        }
+        fn parameters_schema(&self) -> Value {
+            schema(&[], &[])
+        }
+        async fn call(&self, _input: Value, ctx: &ToolContext) -> Result<ToolOutput, ToolError> {
+            self.1
+                .lock()
+                .unwrap()
+                .push(ctx.call_id().unwrap_or_default().to_string());
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    /// An executor holding one [`Recording`] tool per name, and the list they
+    /// all write their call ids to.
+    fn recording_executor(
+        names: &[&'static str],
+    ) -> (
+        komo_services::tool_execution::ToolExecutor,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut executor = komo_services::tool_execution::ToolExecutor::new(Default::default());
+        for name in names {
+            executor.register(Arc::new(Recording(name, seen.clone())));
+        }
+        (executor, seen)
+    }
+
+    /// The context a `python` call itself runs in — a real call identity, which
+    /// is what `sub_turn` numbers its program's calls against.
+    fn enclosing_ctx() -> ToolContext {
+        ToolContext::new(
+            komo_core::domain::context::SessionContext::detached("s"),
+            Some(komo_core::domain::context::RunContext::new("run-1".into())),
+            Arc::new(crate::test_support::AllowAll),
+        )
+        .with_call("call-0", 0)
+    }
+
+    async fn call_tool(
+        executor: &komo_services::tool_execution::ToolExecutor,
+        turn: &ToolTurnContext,
+        name: &str,
+    ) {
+        dispatch(
+            executor,
+            turn,
+            &executor.snapshot(),
+            name.to_string(),
+            serde_json::json!({}),
+        )
+        .await
+        .expect("the fake tool succeeds");
+    }
+
+    /// Two calls from one program are two calls, and the ordinal is what says
+    /// so: sharing an id would let the first one's approval answer the second.
+    #[tokio::test]
+    async fn nested_calls_are_numbered_in_program_order() {
+        let (executor, seen) = recording_executor(&["read", "cron"]);
+        let turn = sub_turn(&enclosing_ctx());
+
+        call_tool(&executor, &turn, "read").await;
+        call_tool(&executor, &turn, "cron").await;
+
+        assert_eq!(*seen.lock().unwrap(), ["code-1-read", "code-2-cron"]);
+    }
+
+    /// The numbering has to be the *same* the second time round, because the
+    /// second time round is what a suspended `python` call comes back as: the
+    /// program reruns from its first line, and the answer recorded against
+    /// `code-2-cron` has to still be that call's.
+    #[tokio::test]
+    async fn a_second_program_run_numbers_its_calls_the_same_way() {
+        let (executor, seen) = recording_executor(&["read", "cron"]);
+        let ctx = enclosing_ctx();
+
+        let first = sub_turn(&ctx);
+        call_tool(&executor, &first, "read").await;
+        call_tool(&executor, &first, "cron").await;
+
+        let second = sub_turn(&ctx);
+        call_tool(&executor, &second, "read").await;
+        call_tool(&executor, &second, "cron").await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["code-1-read", "code-2-cron", "code-1-read", "code-2-cron"]
+        );
+    }
+
+    /// A context nobody dispatched has no identity to number against, and keeps
+    /// the unnumbered id it always had.
+    #[tokio::test]
+    async fn a_detached_context_keeps_the_unnumbered_id() {
+        let (executor, seen) = recording_executor(&["read"]);
+        let turn = sub_turn(&crate::test_support::approving_ctx("s"));
+        assert!(turn.nested.is_none());
+
+        call_tool(&executor, &turn, "read").await;
+
+        assert_eq!(*seen.lock().unwrap(), ["code-read"]);
     }
 
     #[test]

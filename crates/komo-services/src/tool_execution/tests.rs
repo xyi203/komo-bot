@@ -220,6 +220,7 @@ fn ledgered() -> ToolTurnContext {
         run: Some(RunContext::new("run-1".into())),
         budget: TurnResultBudget::unlimited(),
         spin: SpinDetector::default(),
+        nested: None,
     }
 }
 
@@ -229,6 +230,7 @@ fn unledgered() -> ToolTurnContext {
         run: None,
         budget: TurnResultBudget::unlimited(),
         spin: SpinDetector::default(),
+        nested: None,
     }
 }
 
@@ -767,6 +769,7 @@ async fn a_claimed_cancel_ends_the_call_once_and_reads_as_cancelled() {
         run: Some(RunContext::new("run-1".into())),
         budget: TurnResultBudget::unlimited(),
         spin: SpinDetector::default(),
+        nested: None,
     };
     let run = context.run.clone().unwrap();
 
@@ -1137,6 +1140,7 @@ fn budgeted(cap: usize) -> ToolTurnContext {
         run: None,
         budget: TurnResultBudget::new(cap),
         spin: SpinDetector::default(),
+        nested: None,
     }
 }
 

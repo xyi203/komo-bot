@@ -633,6 +633,22 @@ impl ToolContext {
         self
     }
 
+    /// Which call this is, as the executor named it — `None` for a context
+    /// nobody dispatched (a detached one, a test), which has no place in a
+    /// round to name.
+    ///
+    /// Read by a tool that dispatches calls of its own: a `python` program's
+    /// `tools.x(...)` is a real call with no identity of its own, and the one
+    /// it borrows has to be this call's.
+    pub fn call_id(&self) -> Option<&str> {
+        self.call.as_ref().map(|call| call.call_id.as_str())
+    }
+
+    /// This call's position in its round — see [`call_id`](Self::call_id).
+    pub fn call_index(&self) -> Option<u32> {
+        self.call.as_ref().map(|call| call.call_index)
+    }
+
     /// Install the store this call keeps its across-a-suspension work in.
     /// Installed by the executor, beside the call identity the key is built
     /// from.

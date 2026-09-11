@@ -956,6 +956,9 @@ impl AgentRuntime {
             // Fresh per turn: a repeat only means anything within the one
             // sequence of calls that is trying to accomplish one thing.
             spin: SpinDetector::default(),
+            // The model's own calls; a nested numbering belongs only to the
+            // turn context a tool builds for the calls it makes itself.
+            nested: None,
         };
         // Cancellation, if this caller offers a stop. Raced against each await
         // rather than only checked between rounds: the model round-trip is the

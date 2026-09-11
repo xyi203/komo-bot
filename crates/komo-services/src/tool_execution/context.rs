@@ -16,7 +16,7 @@
 //! ledgered.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 pub use komo_core::domain::context::{RunContext, SessionContext, SessionOrigin, ToolContext};
 use komo_core::domain::policy::Rule;
@@ -35,6 +35,60 @@ pub struct ToolTurnContext {
     pub budget: TurnResultBudget,
     /// Detects a turn that has stopped making progress — see [`SpinDetector`].
     pub spin: SpinDetector,
+    /// Set on the turn context a tool builds for the calls *it* makes (a
+    /// `python` program's `tools.x(...)`): which recorded call encloses them,
+    /// and the counter that numbers them. `None` on the turn context a model's
+    /// own round runs under — those calls are the round's, and the round
+    /// numbers them itself.
+    pub nested: Option<Arc<NestedCalls>>,
+}
+
+/// What encloses a nested round, and what gives each of its calls a name.
+///
+/// A `tools.x(...)` inside a program is a real call — its own approval, its own
+/// ledger step — but it is not a call the model asked for, so nothing about the
+/// round it arrives in tells it apart from the next one. Both the approval gate
+/// (`ApprovalGate::resolved_earlier`) and a call's durable scratch key on the
+/// call id, so a program calling one tool twice under one id would be asked
+/// once and act twice: the second call would read the first's answer as its
+/// own.
+///
+/// The ordinal is what separates them, and separating them **in program order**
+/// is what makes the separation survive a suspension: a `python` call that
+/// stopped to wait is re-dispatched from zero, its program runs again from the
+/// first line, and the third call of the second run has to be the same
+/// `code-3-…` the third call of the first run was — or the answer recorded
+/// against it belongs to nobody.
+///
+/// It lives here rather than inside `python.rs` because the plugin tool
+/// (`PyTool`) makes its calls through the same dispatch, and because the
+/// executor's own handling of a nested call reads the enclosing identity off
+/// the turn it was handed.
+pub struct NestedCalls {
+    /// The recorded call these are made from — the `python` / `py__…` call the
+    /// model itself asked for.
+    pub enclosing_call_id: String,
+    /// Its position in the round the model asked for it in.
+    pub enclosing_call_index: u32,
+    /// Handed out by [`next_ordinal`](Self::next_ordinal); 1-based, so the
+    /// first call a program makes reads as the first.
+    next: AtomicU32,
+}
+
+impl NestedCalls {
+    /// Number the calls made from the call `(call_id, call_index)` names.
+    pub fn new(call_id: impl Into<String>, call_index: u32) -> Self {
+        Self {
+            enclosing_call_id: call_id.into(),
+            enclosing_call_index: call_index,
+            next: AtomicU32::new(0),
+        }
+    }
+
+    /// The next call's ordinal, in the order the program makes them.
+    pub fn next_ordinal(&self) -> u32 {
+        self.next.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 /// How many times in a row the same call may be requested before the executor

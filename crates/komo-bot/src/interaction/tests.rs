@@ -1978,3 +1978,197 @@ async fn a_panicking_turn_does_not_wedge_the_session() {
     permits.add_permits(1);
     assert_eq!(next_entered(&mut entered_rx).await, "after");
 }
+
+/// Reports the [`SessionContext`] its turn ran in.
+struct ContextProbe(Mutex<Option<SessionContext>>);
+
+#[async_trait]
+impl MessageHandler for ContextProbe {
+    async fn handle(&self, _session_id: &str, input: String) -> anyhow::Result<String> {
+        *self.0.lock().unwrap() = current_session();
+        Ok(input)
+    }
+    async fn resume_interrupted(
+        &self,
+        _run: &komo_core::domain::run::Run,
+    ) -> anyhow::Result<Option<String>> {
+        *self.0.lock().unwrap() = current_session();
+        Ok(Some("continued".to_string()))
+    }
+}
+
+/// A suspended turn plus the wait that is holding it, ready to be answered.
+async fn parked_on_an_approval(
+    home: &str,
+) -> (
+    Arc<komo_infra::persistence::db::Db>,
+    komo_core::domain::run::Run,
+) {
+    let db = test_db(home).await;
+    let mut run = komo_core::domain::run::Run::start("s1", "do the thing");
+    run.status = komo_core::domain::run::RunStatus::Suspended;
+    komo_core::domain::run_projection::RunProjectionStore::commit(
+        db.as_ref(),
+        "s1",
+        &[komo_core::domain::run_projection::ProjectedRun {
+            run: run.clone(),
+            steps: Vec::new(),
+            start_seq: 0,
+        }],
+        0,
+    )
+    .await
+    .unwrap();
+    WakeupRepository::save(
+        db.as_ref(),
+        &WakeupRegistration::new(
+            "s1",
+            Wakeup::Approval {
+                call_id: "c1".into(),
+            },
+            1_000,
+        )
+        .continuing(&run.id),
+    )
+    .await
+    .unwrap();
+    (db, run)
+}
+
+fn probing_dispatcher(
+    probe: Arc<ContextProbe>,
+    db: Arc<komo_infra::persistence::db::Db>,
+) -> Arc<GatewayDispatcher> {
+    Arc::new(
+        GatewayDispatcher::new(
+            probe,
+            Arc::new(ApprovalState::new()),
+            Arc::new(MemorySessions::default()),
+            Arc::new(MemoryHome::default()),
+            Arc::new(MemoryTodos::default()),
+            None,
+            Arc::new(UnusedPairings),
+            Arc::new(AlwaysFreshInbox),
+        )
+        .with_waits(WaitParts {
+            runs: db.clone(),
+            events: db.clone(),
+            wakeups: db.clone(),
+        }),
+    )
+}
+
+async fn probed(probe: &Arc<ContextProbe>) -> SessionContext {
+    for _ in 0..200 {
+        if let Some(ctx) = probe.0.lock().unwrap().clone() {
+            return ctx;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the continuation never ran");
+}
+
+/// The person who answered `/approve` is still there — so the continuation is
+/// interactive and prompts back through the surface that answered.
+///
+/// It used to run detached: `interactive` false for the rest of the turn, so
+/// the *next* thing needing approval was auto-denied with "this session is
+/// non-interactive, nobody can answer", and the refusal reached the model as
+/// the user's own. Answering one approval was what made the second impossible.
+#[tokio::test]
+async fn a_chat_answered_continuation_can_still_ask() {
+    let (db, _run) = parked_on_an_approval("komo-wake-ctx-chat").await;
+    let probe = Arc::new(ContextProbe(Mutex::new(None)));
+    let dispatcher = probing_dispatcher(probe.clone(), db);
+
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::new(RecordingSink { sent: sent.clone() }) as Arc<dyn ReplySink>;
+    dispatcher
+        .answer_suspended("s1", None, &Answer::Once, WakeReply::Sink(sink))
+        .await;
+
+    let ctx = probed(&probe).await;
+    assert!(ctx.interactive, "someone answered; they can answer again");
+    ctx.sink.send("⚠️ 需要审批").await.unwrap();
+    assert_eq!(
+        sent.lock().unwrap().last().map(String::as_str),
+        Some("⚠️ 需要审批"),
+        "and the next prompt goes to the surface that answered the last one"
+    );
+    assert!(
+        ctx.interject.is_some(),
+        "a continuation hears an interjection like any other turn"
+    );
+}
+
+/// The GUI answers through surfaces it polls rather than a sink — which is a
+/// human all the same. The absent sink used to make it indistinguishable from
+/// a sweep firing a timer at nobody.
+#[tokio::test]
+async fn a_polling_client_counts_as_someone_who_can_answer() {
+    let (db, _run) = parked_on_an_approval("komo-wake-ctx-gui").await;
+    let probe = Arc::new(ContextProbe(Mutex::new(None)));
+    let dispatcher = probing_dispatcher(probe.clone(), db);
+
+    dispatcher.answer_approval("s1", None, Answer::Once).await;
+
+    assert!(probed(&probe).await.interactive);
+}
+
+/// …and a sweep firing an expiry really is nobody: the continuation stays
+/// non-interactive, so a further approval is refused rather than parked on a
+/// prompt no one will ever read.
+#[tokio::test]
+async fn a_sweep_fired_continuation_has_nobody_to_ask() {
+    let (db, _run) = parked_on_an_approval("komo-wake-ctx-sweep").await;
+    let probe = Arc::new(ContextProbe(Mutex::new(None)));
+    let dispatcher = probing_dispatcher(probe.clone(), db.clone());
+
+    let registration = WakeupRepository::list(db.as_ref())
+        .await
+        .unwrap()
+        .pop()
+        .expect("the wait is registered");
+    dispatcher
+        .continue_turn_with(&registration, WakeupCause::Expired, "", WakeReply::Nobody)
+        .await
+        .unwrap();
+
+    assert!(!probed(&probe).await.interactive);
+}
+
+/// A turn that stopped to wait has not failed and has not answered: the prompt
+/// or the question already went to this chat, and an error message beside it
+/// reads as the request having been refused. Every other ingress told the two
+/// apart; this one said "处理消息时出错了: suspended, waiting".
+#[tokio::test]
+async fn a_suspended_turn_says_nothing_more_to_the_chat() {
+    struct Suspends;
+    #[async_trait]
+    impl MessageHandler for Suspends {
+        async fn handle(&self, _session_id: &str, _input: String) -> anyhow::Result<String> {
+            Err(komo_core::domain::wakeup::Suspended.into())
+        }
+    }
+
+    let dispatcher = Arc::new(GatewayDispatcher::new(
+        Arc::new(Suspends),
+        Arc::new(ApprovalState::new()),
+        Arc::new(MemorySessions::default()),
+        Arc::new(MemoryHome::default()),
+        Arc::new(MemoryTodos::default()),
+        None,
+        Arc::new(UnusedPairings),
+        Arc::new(AlwaysFreshInbox),
+    ));
+    let sent = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::new(RecordingSink { sent: sent.clone() }) as Arc<dyn ReplySink>;
+    dispatcher.dispatch_turn("s1".to_string(), "rm the tree".to_string(), sink, vec![]);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        sent.lock().unwrap().is_empty(),
+        "nothing is said on top of the prompt: {:?}",
+        sent.lock().unwrap()
+    );
+}

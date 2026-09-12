@@ -118,6 +118,8 @@ fn dangerous_pattern(command: &str) -> Option<&'static str> {
 /// Over-triggering is the acceptable direction: `komo dream` (a preview) and
 /// `komo model` are not listed, so they prompt. Under-triggering is not.
 const KOMO_READ_ONLY: &[&str] = &[
+    "help",
+    "version",
     "logs",
     "doctor",
     "health",
@@ -138,6 +140,38 @@ const KOMO_READ_ONLY: &[&str] = &[
     "channel probe",
 ];
 
+/// Flags clap answers itself: it prints and exits inside the parser, so no
+/// subcommand runs and nothing is mutated. `komo cron remove --help` is a
+/// question about `cron remove`, not a removal, and judging it by its
+/// subcommand made asking how a command works cost an approval.
+///
+/// Case-folded along with the rest of the scan, which is why `-v` appears
+/// beside `-V`'s lowercase form: komo defines no lowercase `-v`, so the fold
+/// widens this to nothing the CLI would accept.
+const KOMO_INERT_FLAGS: &[&str] = &["-h", "--help", "-v", "--version"];
+
+/// Whether clap will print and exit before this invocation's subcommand runs.
+///
+/// A flag counts only while it is still being parsed as one. After `--` every
+/// word is a value, and a flag sitting directly after another flag may be that
+/// flag's value (`--prompt --help`) — in both cases the subcommand does run,
+/// so the command is judged by it as before. Over-triggering stays the safe
+/// direction here too.
+fn prints_and_exits(words: &[&str]) -> bool {
+    let mut previous: Option<&str> = None;
+    for word in words {
+        if *word == "--" {
+            return false;
+        }
+        let maybe_a_value = previous.is_some_and(|p| p.starts_with('-'));
+        if !maybe_a_value && KOMO_INERT_FLAGS.contains(word) {
+            return true;
+        }
+        previous = Some(word);
+    }
+    false
+}
+
 /// `Some` when the command invokes `komo` with anything but a read-only
 /// subcommand. Every occurrence is checked, so a `cd x && komo cron remove y`
 /// is caught as surely as a bare one.
@@ -157,10 +191,11 @@ fn komo_cli_pattern(lc: &str) -> Option<&'static str> {
         let rest = rest
             .find([';', '&', '|', '\n'])
             .map_or(rest, |end| &rest[..end]);
-        let words = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+        let split = rest.split_whitespace().collect::<Vec<_>>();
+        let words = split.join(" ");
         let read_only = KOMO_READ_ONLY.iter().any(|verb| {
             words == *verb || words.strip_prefix(verb).is_some_and(|r| r.starts_with(' '))
-        });
+        }) || prints_and_exits(&split);
         if !read_only {
             return Some("komo <mutating subcommand>");
         }

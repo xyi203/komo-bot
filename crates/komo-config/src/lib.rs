@@ -25,7 +25,8 @@ pub use report::*;
 pub use resolved::*;
 pub use sources::ConfigSources;
 pub use write::{
-    validate_channel_config, write_channel_config, write_env_values, write_model_selection,
+    validate_channel_config, write_channel_config, write_config_values, write_env_values,
+    write_model_selection,
 };
 
 /// Supported LLM providers (all OpenAI-compatible or natively wired in `rig`).

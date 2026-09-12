@@ -1,4 +1,5 @@
-//! The one config *write* path: persisting a model selection.
+//! The config *write* paths: persisting a model selection, a setting, a
+//! credential or a channel table — every write komo makes to its own config.
 
 use std::{
     io::Write,
@@ -8,7 +9,9 @@ use std::{
 use super::Provider;
 
 /// Persist the provider/model selection into `<home>/config.toml`, preserving
-/// every other key already present (schedule, base_url, aux_model, …).
+/// every other key already present (schedule, base_url, aux_model, …) **and the
+/// comments around them** — `komo init` scaffolds a heavily documented file,
+/// and a setter that reformatted it would delete its documentation.
 ///
 /// `model: None` removes the `model` key so the provider's default applies.
 /// Returns the path written. Note: any `KOMO_PROVIDER` / `KOMO_MODEL` env
@@ -18,29 +21,139 @@ pub fn write_model_selection(
     provider: Provider,
     model: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
-    let path = home.join("config.toml");
-    let mut table: toml::Table = match std::fs::read_to_string(&path) {
-        Ok(s) => toml::from_str(&s)
-            .map_err(|e| anyhow::anyhow!("{} is invalid TOML: {e}", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-        Err(e) => return Err(e.into()),
-    };
+    write_config_values(
+        home,
+        &[
+            (
+                "provider",
+                Some(toml::Value::String(provider.name().to_string())),
+            ),
+            ("model", model.map(|m| toml::Value::String(m.to_string()))),
+        ],
+    )
+}
 
-    table.insert(
-        "provider".to_string(),
-        toml::Value::String(provider.name().to_string()),
-    );
-    match model {
-        Some(m) => {
-            table.insert("model".to_string(), toml::Value::String(m.to_string()));
-        }
-        None => {
-            table.remove("model");
+/// Set (or, with `None`, remove) settings in `<home>/config.toml`, addressed by
+/// dotted key — `"aux_model"`, `"memory.model"` — leaving every other key,
+/// table, comment and blank line exactly where it was.
+///
+/// One write for the whole batch, so a `komo model` command that changes a
+/// model and its effort together can never leave one of the two behind.
+/// Removing the last key of a table leaves the table itself, which resolves the
+/// same and keeps the operator's comments in it.
+pub fn write_config_values(
+    home: &Path,
+    values: &[(&str, Option<toml::Value>)],
+) -> anyhow::Result<PathBuf> {
+    let path = home.join("config.toml");
+    let mut doc = read_config_document(&path)?;
+    for (key, value) in values {
+        let (leaf, table) = descend(&mut doc, key, &path)?;
+        match value {
+            Some(value) => {
+                let item = item_of(value)?;
+                // Assigning through the entry keeps an existing key's own
+                // decoration — the comment trailing it stays trailing it.
+                match table.get_mut(&leaf) {
+                    Some(existing) => *existing = item,
+                    None => {
+                        table.insert(&leaf, item);
+                    }
+                }
+            }
+            None => {
+                table.remove(&leaf);
+            }
         }
     }
-
-    atomic_write(&path, &toml::to_string_pretty(&table)?, None)?;
+    atomic_write(&path, &doc.to_string(), None)?;
     Ok(path)
+}
+
+/// Walk a dotted key down to the table holding its last segment, creating the
+/// tables on the way. Returns that segment and the table it belongs in.
+fn descend<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    key: &str,
+    path: &Path,
+) -> anyhow::Result<(String, &'a mut toml_edit::Table)> {
+    let mut segments: Vec<&str> = key.split('.').collect();
+    let leaf = segments
+        .pop()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("invalid config key `{key}`"))?;
+    // A new table is appended after everything the document already holds —
+    // including the commented-out keys `komo init` leaves at the root. Those
+    // would then sit *under* the new header, where uncommenting `aux_model`
+    // would quietly file it as `memory.aux_model`, so the trailing block moves
+    // ahead of the table instead.
+    let orphaned_trailing = match segments.first() {
+        Some(first) if !doc.as_table().contains_key(first) => {
+            let trailing = doc.trailing().as_str().unwrap_or_default().to_string();
+            doc.set_trailing("");
+            trailing
+        }
+        _ => String::new(),
+    };
+    let mut table = doc.as_table_mut();
+    for segment in segments {
+        // A table created on the way is *implicit*: `channels.telegram` should
+        // render its own header alone, not an empty `[channels]` above it.
+        let mut created = toml_edit::Table::new();
+        created.set_implicit(true);
+        table = table
+            .entry(segment)
+            .or_insert(toml_edit::Item::Table(created))
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("{} has non-table `{segment}`", path.display()))?;
+    }
+    // On the deepest table, which is the one that renders a header: an implicit
+    // parent may print nothing at all, and a prefix on it would take the
+    // comments with it.
+    if !orphaned_trailing.is_empty() {
+        // One blank line between the block and the header it now precedes.
+        let separator = if orphaned_trailing.ends_with("\n\n") {
+            ""
+        } else {
+            "\n"
+        };
+        table
+            .decor_mut()
+            .set_prefix(format!("{orphaned_trailing}{separator}"));
+    }
+    Ok((leaf.to_string(), table))
+}
+
+/// The scalar and string-list values komo's own writers use. Anything else is
+/// refused rather than guessed at — every caller here is in this crate.
+fn item_of(value: &toml::Value) -> anyhow::Result<toml_edit::Item> {
+    Ok(match value {
+        toml::Value::String(v) => toml_edit::value(v.as_str()),
+        toml::Value::Integer(v) => toml_edit::value(*v),
+        toml::Value::Float(v) => toml_edit::value(*v),
+        toml::Value::Boolean(v) => toml_edit::value(*v),
+        toml::Value::Array(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                match item {
+                    toml::Value::String(v) => array.push(v.as_str()),
+                    other => anyhow::bail!("unsupported config list entry `{other}`"),
+                }
+            }
+            toml_edit::value(array)
+        }
+        other => anyhow::bail!("unsupported config value `{other}`"),
+    })
+}
+
+fn read_config_document(path: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    text.parse()
+        .map_err(|e| anyhow::anyhow!("{} is invalid TOML: {e}", path.display()))
 }
 
 /// Update named credentials in `<home>/.env`, preserving comments and every
@@ -143,26 +256,19 @@ fn render_channel_config(
         anyhow::bail!("invalid channel name `{channel}`");
     }
     let path = home.join("config.toml");
-    let mut root: toml::Table = match std::fs::read_to_string(&path) {
-        Ok(s) => toml::from_str(&s)
-            .map_err(|e| anyhow::anyhow!("{} is invalid TOML: {e}", path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-        Err(e) => return Err(e.into()),
-    };
-    let channels = root
-        .entry("channels".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("{} has non-table `channels`", path.display()))?;
-    let table = channels
-        .entry(channel.to_string())
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-        .as_table_mut()
-        .ok_or_else(|| anyhow::anyhow!("{} has non-table `channels.{channel}`", path.display()))?;
+    let mut doc = read_config_document(&path)?;
     for (key, value) in values {
-        table.insert(key.to_string(), value);
+        let key = format!("channels.{channel}.{key}");
+        let (leaf, table) = descend(&mut doc, &key, &path)?;
+        let item = item_of(&value)?;
+        match table.get_mut(&leaf) {
+            Some(existing) => *existing = item,
+            None => {
+                table.insert(&leaf, item);
+            }
+        }
     }
-    Ok((path, toml::to_string_pretty(&root)?))
+    Ok((path, doc.to_string()))
 }
 
 fn env_assignment(key: &str, value: &str) -> String {
@@ -258,6 +364,90 @@ mod tests {
             std::fs::read_to_string(home.join(".env")).unwrap(),
             "TELEGRAM_BOT_TOKEN=\"has # and spaces\"\n"
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The template `komo init` writes is mostly comments, and they are the
+    /// documentation — a setter that reformatted the file would delete it.
+    #[test]
+    fn writing_a_setting_keeps_the_files_comments_and_layout() {
+        let home =
+            std::env::temp_dir().join(format!("komo_write_comments_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let original = "# komo runtime settings\nprovider = \"deepseek\"\n\n\
+                        # --- memory ---\n[memory]\n# served by ollama\n\
+                        embedding_model = \"qwen\"\n";
+        std::fs::write(home.join("config.toml"), original).unwrap();
+
+        write_config_values(
+            &home,
+            &[("memory.model", Some(toml::Value::String("pro".into())))],
+        )
+        .unwrap();
+        write_model_selection(&home, Provider::OpenAi, Some("gpt-5.4-mini")).unwrap();
+        write_channel_config(&home, "telegram", [("enabled", toml::Value::Boolean(true))]).unwrap();
+
+        let written = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        assert!(written.contains("# komo runtime settings"), "{written}");
+        assert!(written.contains("# --- memory ---"), "{written}");
+        assert!(written.contains("# served by ollama"), "{written}");
+        assert!(written.contains("provider = \"openai\""), "{written}");
+        assert!(written.contains("model = \"gpt-5.4-mini\""), "{written}");
+        assert!(written.contains("[channels.telegram]"), "{written}");
+        assert!(
+            !written.contains("[channels]\n[channels.telegram]"),
+            "an intermediate table gets no empty header of its own: {written}"
+        );
+        // Re-reading what was written must give back what was set — the
+        // property a misplaced table header would break.
+        let value: toml::Value = toml::from_str(&written).unwrap();
+        assert_eq!(value["memory"]["model"].as_str(), Some("pro"));
+        assert_eq!(
+            value["channels"]["telegram"]["enabled"].as_bool(),
+            Some(true)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn setting_a_nested_key_keeps_every_unrelated_setting() {
+        let home =
+            std::env::temp_dir().join(format!("komo_write_values_test_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            "provider = \"deepseek\"\naux_model = \"flash\"\n\n[memory]\nembedding_model = \"qwen\"\n",
+        )
+        .unwrap();
+
+        write_config_values(
+            &home,
+            &[
+                ("memory.model", Some(toml::Value::String("pro".into()))),
+                ("memory.effort", Some(toml::Value::String("high".into()))),
+            ],
+        )
+        .unwrap();
+
+        let value: toml::Value =
+            toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+        assert_eq!(value["memory"]["model"].as_str(), Some("pro"));
+        assert_eq!(value["memory"]["effort"].as_str(), Some("high"));
+        assert_eq!(
+            value["memory"]["embedding_model"].as_str(),
+            Some("qwen"),
+            "the table's other keys survive"
+        );
+        assert_eq!(value["aux_model"].as_str(), Some("flash"));
+
+        // Clearing removes the key and leaves the rest of the table standing.
+        write_config_values(&home, &[("memory.model", None), ("memory.effort", None)]).unwrap();
+        let value: toml::Value =
+            toml::from_str(&std::fs::read_to_string(home.join("config.toml")).unwrap()).unwrap();
+        assert!(value["memory"].get("model").is_none());
+        assert_eq!(value["memory"]["embedding_model"].as_str(), Some("qwen"));
         let _ = std::fs::remove_dir_all(&home);
     }
 

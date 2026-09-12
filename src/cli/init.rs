@@ -20,7 +20,7 @@ const CONFIG_TEMPLATE: &str = r#"# komo runtime settings. Credentials never go h
 provider = "deepseek"
 # model = "deepseek-v4-flash"    # defaults per provider
 # base_url = ""                  # OpenAI-compatible endpoint override
-# aux_model = ""                 # cheaper model for sub-tasks (reviewer/recall)
+# aux_model = ""                 # cheaper model for sub-tasks (policy review, compaction)
 # aux_effort = "none"            # aux reasoning effort; "none" = thinking off (deepseek default)
 # effort = ""                    # default reasoning effort for conversations (per provider scale, e.g. none/low/high/max on deepseek)
 
@@ -53,7 +53,13 @@ provider = "deepseek"
 # After setting this on an existing store, run `komo memory backfill` — recall
 # embeds lazily, one batch per read, so a library written before this was
 # configured would stay half-lexical for a long time.
+# The memory pipeline runs on the aux model by default. Point it somewhere else
+# when memory is worth a better model than compaction is: this is the one aux job
+# whose mistakes outlive the turn, since a misclassified observation becomes a
+# stored claim that later turns are handed. Unset = the aux backend.
 # [memory]
+# model = ""                               # e.g. "deepseek:deepseek-v4-pro"
+# effort = ""                              # per-provider scale; "none" = thinking off
 # embedding_model = "qwen3-embedding:4b"   # served by ollama
 # embedding_url = "http://127.0.0.1:11434"
 

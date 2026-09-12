@@ -256,6 +256,14 @@ pub struct ModelConfig {
     /// [`ConfigIssue`] and reads as unset. `None` = that provider's own aux
     /// default (see [`Provider::aux_default_effort`]).
     pub aux_effort: Option<String>,
+    /// Optional model for the memory pipeline, replacing `aux_model` there —
+    /// see [`Self::memory_variant`]. `None` = the memory turns run on the aux
+    /// backend, which is what they did before the key existed.
+    pub memory_model: Option<String>,
+    /// Reasoning effort the memory backend runs at, as configured. Validated
+    /// against that backend's provider exactly like [`Self::aux_effort`], and an
+    /// unusable value is a [`ConfigIssue`] that reads as unset.
+    pub memory_effort: Option<String>,
     /// The effort a session with **no** override runs this backend at; `None`
     /// leaves the provider's own default alone. On the main config this is the
     /// operator's configured `effort`, already validated against `provider` —
@@ -292,6 +300,8 @@ impl fmt::Debug for ModelConfig {
             .field("base_url", &self.base_url)
             .field("aux_model", &self.aux_model)
             .field("aux_effort", &self.aux_effort)
+            .field("memory_model", &self.memory_model)
+            .field("memory_effort", &self.memory_effort)
             .field("effort", &self.effort)
             .field("max_turns", &self.max_turns)
             .field("max_tool_result_bytes", &self.max_tool_result_bytes)
@@ -406,6 +416,8 @@ impl ModelConfig {
             base_url: default_provider.then(|| self.base_url.clone()).flatten(),
             aux_model: self.aux_model.clone(),
             aux_effort: self.aux_effort.clone(),
+            memory_model: self.memory_model.clone(),
+            memory_effort: self.memory_effort.clone(),
             // A level configured for the main provider must not follow a
             // session onto a backend whose scale lacks it.
             effort: self.effort.clone().filter(|it| provider.accepts_effort(it)),
@@ -447,6 +459,8 @@ impl ModelConfig {
             base_url: self.base_url.clone(),
             aux_model: self.aux_model.clone(),
             aux_effort: self.aux_effort.clone(),
+            memory_model: self.memory_model.clone(),
+            memory_effort: self.memory_effort.clone(),
             effort,
             max_turns: self.max_turns,
             max_tool_result_bytes: self.max_tool_result_bytes,
@@ -455,6 +469,43 @@ impl ModelConfig {
             max_history_messages: self.max_history_messages,
             max_history_bytes: self.max_history_bytes,
             llm_timeout_secs: self.llm_timeout_secs,
+        }
+    }
+
+    /// A variant for the **memory pipeline**: the reflective reviewer, the
+    /// consolidator classifying what it extracted, the outcome verdict read off
+    /// the user's next message, and the aux screening above five recalled
+    /// memories.
+    ///
+    /// Memory is the one aux job whose mistakes outlive the turn — a
+    /// misclassified observation becomes a stored claim that later turns are
+    /// handed — so it is worth pointing at a different model than the reviewer
+    /// and compactor run on. Unset falls through to [`Self::aux_variant`]
+    /// unchanged, which is exactly what these callers used before the key
+    /// existed.
+    pub fn memory_variant(&self) -> ModelConfig {
+        let Some(model) = self
+            .memory_model
+            .clone()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty())
+        else {
+            return self.aux_variant();
+        };
+        // Same rule as `aux_variant`: the effort default belongs to whichever
+        // backend the turns actually run on, which a qualified id may redirect.
+        let provider = split_model_id(&model).0.unwrap_or(self.provider);
+        let effort = self
+            .memory_effort
+            .clone()
+            .or_else(|| provider.aux_default_effort().map(str::to_string));
+        ModelConfig {
+            // Not switchable either — a one-entry menu keeps `allows_model`
+            // honest for it.
+            models: vec![model.clone()],
+            model,
+            effort,
+            ..self.aux_variant()
         }
     }
 }
@@ -593,6 +644,9 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         .filter_map(|p| secrets.key(*p).map(|k| (*p, k.to_string())))
         .collect();
 
+    // Taken before the model block because `[memory]` now carries two model
+    // keys as well as the embedding backend, which is resolved further down.
+    let memory_file = file.memory;
     let aux_model = env.aux_model.or(file.aux_model);
     // Validated against the provider the aux turns run on — `aux_model` may be
     // qualified and name another backend. An unusable level is a warning and
@@ -617,6 +671,38 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         });
         None
     });
+    // `[memory] model` / `[memory] effort`: the same shape again, against
+    // whichever backend the memory turns land on. Unset leaves the memory
+    // pipeline on the aux backend.
+    let memory_model = env
+        .memory_model
+        .or_else(|| memory_file.as_ref().and_then(|m| m.model.clone()))
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    let memory_provider = memory_model
+        .as_deref()
+        .and_then(|id| split_model_id(id).0)
+        .or_else(|| aux_model.as_deref().and_then(|id| split_model_id(id).0))
+        .unwrap_or(provider);
+    let memory_effort = env
+        .memory_effort
+        .or_else(|| memory_file.as_ref().and_then(|m| m.effort.clone()))
+        .and_then(|effort| {
+            let effort = effort.trim().to_string();
+            if memory_provider.accepts_effort(&effort) {
+                return Some(effort);
+            }
+            let accepted = memory_provider.efforts();
+            issues.push(ConfigIssue {
+                path: "memory.effort",
+                severity: IssueSeverity::Warning,
+                message: format!(
+                    "[memory] effort = {effort:?} is not valid for {memory_provider:?} \
+                     (accepted: {accepted:?}) — ignoring it",
+                ),
+            });
+            None
+        });
     // Same shape against the main provider: a level it does not accept is a
     // warning and reads as unset, so a typo never silently changes a turn.
     let effort = env.effort.or(file.effort).and_then(|effort| {
@@ -650,6 +736,8 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
         base_url: env.base_url.or(file.base_url),
         aux_model,
         aux_effort,
+        memory_model,
+        memory_effort,
         effort,
         max_turns: env
             .max_turns
@@ -800,7 +888,7 @@ pub(super) fn resolve(sources: ConfigSources) -> (RuntimeConfig, ConfigReport) {
     let db_url = |file: &str| format!("turso:{}", home.join(file).display());
     // Resolved before the struct literal because `wiki` falls back to the
     // `[memory]` backend when it declares no model of its own.
-    let embedding = resolve_embedding(file.memory);
+    let embedding = resolve_embedding(memory_file);
     let wiki = resolve_wiki(file.wiki, embedding.as_ref(), &mut issues);
     let dream_enabled = env
         .dream_schedule_enabled

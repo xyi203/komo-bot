@@ -1,7 +1,7 @@
 use super::super::ConfigSnapshot;
 use super::super::sources::{
-    ApiFileConfig, ChannelsFileConfig, FileConfig, McpFileConfig, McpServerFileConfig, Secrets,
-    TelegramFileConfig,
+    ApiFileConfig, ChannelsFileConfig, FileConfig, McpFileConfig, McpServerFileConfig,
+    MemoryFileConfig, Secrets, TelegramFileConfig,
 };
 use super::*;
 use std::path::PathBuf;
@@ -120,6 +120,92 @@ fn a_configured_aux_effort_wins_over_the_providers_default() {
     assert_eq!(
         snap.runtime.model.aux_variant().effort.as_deref(),
         Some("low")
+    );
+}
+
+/// The memory pipeline is the aux backend until `[memory] model` says
+/// otherwise — that inheritance is what keeps the new key from changing any
+/// existing deployment.
+#[test]
+fn the_memory_model_falls_back_to_the_aux_backend() {
+    let mut s = with_deepseek_key(sources());
+    s.file.aux_model = Some("deepseek-v4-flash".into());
+    let model = ConfigSnapshot::from_sources(s).runtime.model;
+    assert_eq!(model.memory_variant().model, model.aux_variant().model);
+    assert_eq!(model.memory_variant().effort, model.aux_variant().effort);
+
+    // …and the aux backend is itself the conversation's model when unset, so a
+    // config naming neither leaves all three on one model.
+    let model = ConfigSnapshot::from_sources(with_deepseek_key(sources()))
+        .runtime
+        .model;
+    assert_eq!(model.memory_variant().model, model.model);
+}
+
+#[test]
+fn a_configured_memory_model_replaces_the_aux_one() {
+    let mut s = with_deepseek_key(sources());
+    s.file.aux_model = Some("deepseek-v4-flash".into());
+    s.file.memory = Some(MemoryFileConfig {
+        model: Some("deepseek-v4-pro".into()),
+        effort: Some("high".into()),
+        ..Default::default()
+    });
+    let model = ConfigSnapshot::from_sources(s).runtime.model;
+    assert_eq!(model.memory_variant().model, "deepseek-v4-pro");
+    assert_eq!(model.memory_variant().effort.as_deref(), Some("high"));
+    assert_eq!(
+        model.aux_variant().model,
+        "deepseek-v4-flash",
+        "the aux backend is untouched by the memory one"
+    );
+    assert_eq!(
+        model.models.contains(&"deepseek-v4-pro".to_string()),
+        false,
+        "the memory backend is not a model a conversation may switch to"
+    );
+}
+
+/// `KOMO_MEMORY_MODEL` wins over the file, and a memory effort the memory
+/// backend rejects is a warning that reads as unset — a typo must never
+/// silently change what the memory pipeline runs at.
+#[test]
+fn the_memory_effort_is_validated_against_its_own_backend() {
+    let mut s = with_deepseek_key(sources());
+    s.secrets.openai_api_key = Some("sk-test".into());
+    s.file.memory = Some(MemoryFileConfig {
+        model: Some("deepseek-v4-flash".into()),
+        effort: Some("medium".into()),
+        ..Default::default()
+    });
+    s.env.memory_model = Some("openai:gpt-5.4-mini".into());
+    let snap = ConfigSnapshot::from_sources(s);
+    assert_eq!(
+        snap.runtime.model.memory_model.as_deref(),
+        Some("openai:gpt-5.4-mini"),
+        "the env wins over the file"
+    );
+    assert_eq!(
+        snap.runtime.model.memory_variant().effort.as_deref(),
+        Some("medium"),
+        "the level the *memory* provider accepts, not the configured one's"
+    );
+
+    // The same level against a backend whose scale lacks it reads as unset.
+    let mut s = with_deepseek_key(sources());
+    s.file.memory = Some(MemoryFileConfig {
+        effort: Some("medium".into()),
+        ..Default::default()
+    });
+    let snap = ConfigSnapshot::from_sources(s);
+    assert!(
+        snap.report.issues.iter().any(|i| i.path == "memory.effort"),
+        "an unusable level is reported"
+    );
+    assert_eq!(
+        snap.runtime.model.memory_variant().effort.as_deref(),
+        Some("none"),
+        "and reads as unset, leaving the backend default"
     );
 }
 
@@ -522,6 +608,8 @@ fn cross_provider_config(with_deepseek_key: bool) -> ModelConfig {
         base_url: Some("https://proxy.example".into()),
         aux_model: None,
         aux_effort: None,
+        memory_model: None,
+        memory_effort: None,
         effort: None,
         max_turns: DEFAULT_MAX_TURNS,
         max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,
@@ -613,6 +701,8 @@ fn debug_output_masks_api_key() {
         base_url: None,
         aux_model: None,
         aux_effort: None,
+        memory_model: None,
+        memory_effort: None,
         effort: None,
         max_turns: DEFAULT_MAX_TURNS,
         max_tool_result_bytes: DEFAULT_MAX_TOOL_RESULT_BYTES,

@@ -268,6 +268,16 @@ fn model_health(config: &ConfigSnapshot) {
     let model = &config.runtime.model;
     let provider = model.provider;
     println!("\nmodel: {} / {}", provider.name(), model.model);
+    // The secondary backends, named only when they differ from the
+    // conversation's: a role that inherits is not a second thing to check.
+    for (label, resolved) in [
+        ("aux", model.aux_variant()),
+        ("memory", model.memory_variant()),
+    ] {
+        if resolved.model != model.model {
+            println!("  {label} {}", resolved.model);
+        }
+    }
     if provider.uses_api_key() {
         let has_key = config.report.key_present(provider);
         let mark = if has_key { OK } else { BAD };

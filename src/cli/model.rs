@@ -1,12 +1,26 @@
-//! Model inspection and switching (`komo model list`, `komo model set`).
+//! Model inspection and switching (`komo model list`, `komo model set`, and
+//! one verb per secondary role: `aux`, `memory`, `embedding`).
 //!
-//! `list` shows the resolved provider/model and where each value comes from —
-//! straight from the shared `ConfigSnapshot`'s provenance report, so it can
-//! never disagree with what the agent actually resolves — plus every available
-//! provider. `set` persists a new selection into `~/.komo/config.toml`.
-//! Neither touches the database or requires the API key to be present.
+//! `list` shows every model komo runs — the conversation's, the aux backend's,
+//! the memory pipeline's and the embedding backend's — with where each value
+//! comes from, straight from the shared `ConfigSnapshot` so it can never
+//! disagree with what the agent actually resolves. The setters persist into
+//! `~/.komo/config.toml`; none of them touches the database or needs the API
+//! key to be present.
+//!
+//! Every role is **validated while the person who typed it is still there**: a
+//! qualified id naming an unknown provider and an effort level the backend does
+//! not accept are both refused with the accepted list, rather than written and
+//! discovered as a warning at the next gateway boot. What is only *warned*
+//! about is a missing credential — that is a thing to go fix, not a typo.
+//!
+//! Config does not hot-reload, so each setter ends by naming
+//! `komo config reload`.
 
-use komo_config::{ConfigReport, ConfigSnapshot, Origin, Provider, write_model_selection};
+use komo_config::{
+    ConfigReport, ConfigSnapshot, ModelConfig, Origin, Provider, split_model_id,
+    write_config_values, write_model_selection,
+};
 use komo_infra::codex::{self, CodexAuth};
 
 fn auth_present(provider: Provider, report: &ConfigReport) -> bool {
@@ -133,9 +147,13 @@ pub async fn list(config: &ConfigSnapshot) -> anyhow::Result<()> {
         );
     }
 
+    role_lines(config);
+
     println!();
     println!("Switch with: komo model set <provider> [model]");
     println!("Codex shortcut: komo model set gpt-5.5");
+    println!("Secondary roles: komo model aux|memory <model> [--effort <level>]");
+    println!("Embeddings:      komo model embedding <model> [--url <base-url>]");
     Ok(())
 }
 
@@ -193,6 +211,327 @@ pub async fn set(
     Ok(())
 }
 
+/// A secondary model role — everything komo runs that is not the conversation
+/// itself. One enum rather than two near-identical command handlers: the two
+/// differ only in which keys hold them and what they fall back to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// `aux_model`: the policy reviewer, the compactor and the delegate's
+    /// preamble.
+    Aux,
+    /// `[memory] model`: the reflective reviewer, the consolidator, the outcome
+    /// verdict and recall screening. Falls back to the aux backend.
+    Memory,
+}
+
+impl Role {
+    fn label(self) -> &'static str {
+        match self {
+            Role::Aux => "aux",
+            Role::Memory => "memory",
+        }
+    }
+
+    /// The dotted config keys holding this role, model first.
+    fn keys(self) -> (&'static str, &'static str) {
+        match self {
+            Role::Aux => ("aux_model", "aux_effort"),
+            Role::Memory => ("memory.model", "memory.effort"),
+        }
+    }
+
+    fn env_vars(self) -> (&'static str, &'static str) {
+        match self {
+            Role::Aux => ("KOMO_AUX_MODEL", "KOMO_AUX_EFFORT"),
+            Role::Memory => ("KOMO_MEMORY_MODEL", "KOMO_MEMORY_EFFORT"),
+        }
+    }
+
+    /// What the role is configured with — `None` when it inherits.
+    fn configured(self, model: &ModelConfig) -> (Option<&str>, Option<&str>) {
+        match self {
+            Role::Aux => (model.aux_model.as_deref(), model.aux_effort.as_deref()),
+            Role::Memory => (
+                model.memory_model.as_deref(),
+                model.memory_effort.as_deref(),
+            ),
+        }
+    }
+
+    /// What the role actually resolves to, inheritance applied.
+    fn resolved(self, model: &ModelConfig) -> ModelConfig {
+        match self {
+            Role::Aux => model.aux_variant(),
+            Role::Memory => model.memory_variant(),
+        }
+    }
+
+    /// What this role runs once its own keys are gone — the conversation's
+    /// model for aux, and the aux backend for memory.
+    fn fallback_model(self, config: &ModelConfig) -> String {
+        match self {
+            Role::Aux => config.model.clone(),
+            Role::Memory => config.aux_variant().model,
+        }
+    }
+
+    /// Where this role's model comes from when it names none of its own.
+    fn inherits(self) -> &'static str {
+        match self {
+            Role::Aux => "inherits model",
+            Role::Memory => "inherits aux",
+        }
+    }
+}
+
+/// The provider a model id runs on: the one it names, else the configured
+/// default. An unqualified id (including an Ollama-shaped `llama3:8b`) is not a
+/// provider prefix — see `split_model_id`.
+fn provider_of(id: &str, config: &ModelConfig) -> Provider {
+    split_model_id(id).0.unwrap_or(config.provider)
+}
+
+fn effort_label(effort: Option<&str>) -> String {
+    match effort {
+        Some(level) => format!("effort {level}"),
+        None => "effort provider default".to_string(),
+    }
+}
+
+/// The four models komo runs, each with what it resolves to and where that came
+/// from. Read from the same resolved snapshot the gateway boots on, so a role
+/// that inherits says so rather than repeating a value it does not hold.
+fn role_lines(config: &ConfigSnapshot) {
+    let model = &config.runtime.model;
+    println!();
+    println!("Roles  (what each model komo runs resolves to)");
+    println!(
+        "  {:<10} {:<26} {:<26} {}",
+        "main",
+        model.model,
+        effort_label(model.effort.as_deref()),
+        model.provider.name()
+    );
+    for role in [Role::Aux, Role::Memory] {
+        let resolved = role.resolved(model);
+        let (configured, _) = role.configured(model);
+        let source = match configured {
+            Some(_) => role.keys().0.to_string(),
+            None => role.inherits().to_string(),
+        };
+        println!(
+            "  {:<10} {:<26} {:<26} {:<10} ({source})",
+            role.label(),
+            resolved.model,
+            effort_label(resolved.effort.as_deref()),
+            provider_of(&resolved.model, model).name(),
+        );
+    }
+    match &config.runtime.embedding {
+        Some(embedding) => println!(
+            "  {:<10} {:<26} {:<26} ollama  ([memory] embedding_model)",
+            "embedding", embedding.model, embedding.url
+        ),
+        // The one role whose absence changes behavior rather than falling back:
+        // without it recall is lexical-only, so a Chinese question structurally
+        // cannot reach an English memory.
+        None => println!(
+            "  {:<10} off — recall is lexical-only, so a question cannot reach a \
+             memory written in another language",
+            "embedding"
+        ),
+    }
+}
+
+/// Set (or clear) one secondary role, persisting both its keys in one write.
+///
+/// With neither a model nor an effort nor `--clear`, this reports what the role
+/// resolves to instead of changing it — the bare verb is a question.
+pub fn set_role(
+    config: &ConfigSnapshot,
+    role: Role,
+    model: Option<String>,
+    effort: Option<String>,
+    clear: bool,
+) -> anyhow::Result<()> {
+    let current = &config.runtime.model;
+    let (model_key, effort_key) = role.keys();
+    let (env_model, env_effort) = role.env_vars();
+
+    if !clear && model.is_none() && effort.is_none() {
+        let resolved = role.resolved(current);
+        let (configured, _) = role.configured(current);
+        println!(
+            "{} = {}  ({})",
+            role.label(),
+            resolved.model,
+            configured.map(|_| model_key).unwrap_or(role.inherits())
+        );
+        println!("  {}", effort_label(resolved.effort.as_deref()));
+        println!(
+            "  set with: komo model {} <model> [--effort <level>]",
+            role.label()
+        );
+        return Ok(());
+    }
+
+    if clear {
+        let path = write_config_values(
+            &config.runtime.home,
+            &[(model_key, None), (effort_key, None)],
+        )?;
+        println!(
+            "{} = {}  ({})",
+            role.label(),
+            role.fallback_model(current),
+            role.inherits()
+        );
+        println!("wrote {}", path.display());
+        return reload_note(env_model, env_effort);
+    }
+
+    // Effort is validated against whichever backend this role will run on —
+    // the model being set now, else the one it already resolves to.
+    let target = model
+        .clone()
+        .unwrap_or_else(|| role.resolved(current).model);
+    let provider = provider_of(&target, current);
+    let effort = effort.map(|level| level.trim().to_string());
+    check_effort(provider, effort.as_deref())?;
+
+    let mut values: Vec<(&str, Option<toml::Value>)> = Vec::new();
+    if let Some(model) = model.as_deref() {
+        values.push((model_key, Some(toml::Value::String(model.to_string()))));
+    }
+    if let Some(level) = effort.as_deref() {
+        values.push((effort_key, Some(toml::Value::String(level.to_string()))));
+    }
+    let path = write_config_values(&config.runtime.home, &values)?;
+
+    println!("{} = {target}  ({})", role.label(), provider.name());
+    match effort.as_deref() {
+        Some(level) => println!("  effort {level}"),
+        None => println!(
+            "  {}",
+            effort_label(role.resolved(current).effort.as_deref())
+        ),
+    }
+    println!("wrote {}", path.display());
+    if !auth_present(provider, &config.report) && provider.uses_api_key() {
+        eprintln!(
+            "note: {} is not set — {} turns will fail until it is added to {}/.env",
+            provider.api_key_var(),
+            role.label(),
+            config.runtime.home.display()
+        );
+    }
+    reload_note(env_model, env_effort)
+}
+
+/// Point the embedding backend at another Ollama model (or clear it).
+///
+/// Vectors are stored with the model that produced them, so a switch does not
+/// invalidate the store — it leaves every existing memory unmatched by the
+/// semantic arm until `komo memory backfill` re-embeds them, which is the one
+/// thing worth saying out loud here.
+pub fn set_embedding(
+    config: &ConfigSnapshot,
+    model: Option<String>,
+    url: Option<String>,
+    clear: bool,
+) -> anyhow::Result<()> {
+    let home = &config.runtime.home;
+    if clear {
+        let path = write_config_values(home, &[("memory.embedding_model", None)])?;
+        println!("embedding = off — recall falls back to lexical-only matching");
+        println!("wrote {}", path.display());
+        return reload_note("", "");
+    }
+    if model.is_none() && url.is_none() {
+        match &config.runtime.embedding {
+            Some(embedding) => {
+                println!("embedding = {}  ({})", embedding.model, embedding.url);
+            }
+            None => println!("embedding = off — recall is lexical-only"),
+        }
+        println!("  set with: komo model embedding <model> [--url <base-url>]");
+        return Ok(());
+    }
+    if let Some(url) = url.as_deref()
+        && !(url.starts_with("http://") || url.starts_with("https://"))
+    {
+        anyhow::bail!("embedding url must start with http:// or https:// (got {url:?})");
+    }
+
+    let mut values: Vec<(&str, Option<toml::Value>)> = Vec::new();
+    if let Some(model) = model.as_deref() {
+        values.push((
+            "memory.embedding_model",
+            Some(toml::Value::String(model.trim().to_string())),
+        ));
+    }
+    if let Some(url) = url.as_deref() {
+        values.push((
+            "memory.embedding_url",
+            Some(toml::Value::String(url.trim().to_string())),
+        ));
+    }
+    let path = write_config_values(home, &values)?;
+    let effective = model
+        .clone()
+        .or_else(|| config.runtime.embedding.as_ref().map(|e| e.model.clone()))
+        .unwrap_or_default();
+    println!("embedding = {effective}");
+    if let Some(url) = url.as_deref() {
+        println!("  url {url}");
+    }
+    println!("wrote {}", path.display());
+    let changed_model = model.as_deref().is_some_and(|m| {
+        config
+            .runtime
+            .embedding
+            .as_ref()
+            .is_none_or(|e| e.model != m)
+    });
+    if changed_model {
+        eprintln!(
+            "note: vectors are stored with the model that produced them — run \
+             `komo memory backfill` to re-embed, or recall stays lexical for \
+             everything already stored"
+        );
+    }
+    reload_note("", "")
+}
+
+/// Refuse a level the backend's scale does not have, naming the ones it does.
+///
+/// Resolution would only *warn* about this and read it as unset, which is right
+/// for a file written long ago and wrong for a word someone just typed and is
+/// waiting on — the same split `/model` makes in the TUI.
+fn check_effort(provider: Provider, effort: Option<&str>) -> anyhow::Result<()> {
+    let Some(level) = effort else { return Ok(()) };
+    if provider.accepts_effort(level) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "effort {level:?} is not valid for {} (accepted: {:?})",
+        provider.name(),
+        provider.efforts()
+    )
+}
+
+/// Config is read once at boot, so a write here changes nothing until the
+/// gateway restarts — and an env override changes nothing ever.
+fn reload_note(env_model: &str, env_effort: &str) -> anyhow::Result<()> {
+    for var in [env_model, env_effort] {
+        if !var.is_empty() && std::env::var(var).is_ok_and(|v| !v.is_empty()) {
+            eprintln!("note: {var} is set and overrides config.toml; unset it for this to apply");
+        }
+    }
+    println!("restart to apply: komo config reload");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -217,5 +556,21 @@ mod tests {
     #[test]
     fn set_args_keeps_non_codex_models_as_unknown_providers() {
         assert!(resolve_set_args("gpt-4o-mini", None).is_err());
+    }
+
+    #[test]
+    fn an_effort_the_backend_lacks_is_refused_with_the_accepted_list() {
+        let error = check_effort(Provider::DeepSeek, Some("medium")).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("medium"), "{message}");
+        assert!(
+            message.contains("none") && message.contains("high"),
+            "it names what the backend does accept: {message}"
+        );
+        assert!(check_effort(Provider::DeepSeek, Some("none")).is_ok());
+        assert!(
+            check_effort(Provider::DeepSeek, None).is_ok(),
+            "setting only a model leaves the effort alone"
+        );
     }
 }

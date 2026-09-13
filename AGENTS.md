@@ -32,6 +32,9 @@ komo dream [--apply]               # evidence-driven candidate consolidation (pr
 komo cron list|add|add-agent [--skill NAME] [--workspace DIR] [--grant c:m:v]|run|enable|disable|remove
 komo run list|inspect|prune        # run ledger (⟲ = interrupted and unclaimed)
 komo session list|clean            # stored-session inventory (roots printed per row)
+komo model list|set <provider> [model]    # the conversation's backend
+komo model aux|memory [<model>] [--effort L] [--clear]   # the two secondary backends
+komo model embedding [<model>] [--url U] [--clear]       # the Ollama recall backend
 komo skills list|install|inspect|enable|disable
 komo policy list|check|saved       # permission policy: config rules + job grants + saved grants
 komo channel list|probe            # channel inventory / verification
@@ -319,8 +322,10 @@ with it `python` and every `py__` tool — out of the process),
 `auto`, which routes an escalation through the aux reviewer first; an
 unparseable value warns and stays `ask`, since a typo must never widen the
 gate) —
-`[memory]` — `embedding_model`/`embedding_url` for the Ollama backend behind
-cross-language recall; no model = lexical-only —
+`[memory]` — `model`/`effort`, the backend the **memory pipeline** runs on
+(unset = the aux backend, see `ModelConfig::memory_variant`), plus
+`embedding_model`/`embedding_url` for the Ollama backend behind
+cross-language recall; no embedding model = lexical-only —
 `[wiki]` — `vault` (the note directory; absent = no `wiki_search`/`wiki_read`/`wiki_index`)
 and its own `embedding_model`/`embedding_url` (falling back to
 `[memory]`'s when unset); the index itself has no configuration, because it is a
@@ -396,6 +401,21 @@ the backend, so `ModelConfig::aux_variant()` carries its own
 than the conversation default, and a session's own choice still wins over it.
 On the main config `ModelConfig::effort` is the operator's configured `effort`,
 which `for_provider` drops when the target provider's scale lacks that level.
+**The memory pipeline gets its own backend** (`ModelConfig::memory_variant`,
+`[memory] model` / `[memory] effort`): the reflective reviewer, the
+consolidator classifying what it extracted, the outcome verdict and the recall
+screening. It is worth separating from the rest of aux because it is the one aux
+job whose mistakes outlive the turn — a misclassified observation becomes a
+stored claim later turns are handed — while the policy reviewer and the
+compactor only ever affect the turn in front of them. Unset, it *is*
+`aux_variant()`, so a config that names neither leaves all three on one model.
+`komo model list` prints what each of the four roles (main / aux / memory /
+embedding) resolves to and which key it came from; `komo model aux|memory
+<model> [--effort L]` and `komo model embedding <model>` write them, refusing —
+not warning about — an effort level the target backend's scale lacks, since
+someone typed it and is waiting. Every config write goes through
+`write_config_values` (`komo-config`'s `write`), which edits config.toml with
+`toml_edit` and so keeps the comments `komo init` scaffolded.
 On DeepSeek the aux default is `"none"` — thinking off, which is both a level
 one may pick per turn and what the aux backend falls back to; without it every
 short aux call (the `mode = "auto"` reviewer has 20s) would run the server's

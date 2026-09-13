@@ -34,7 +34,7 @@
 //! are off, so the bearer key remains the sole thing that grants access.
 
 use komo_bot::gateway::Channel;
-use komo_bot::interaction::{Answer, ApprovalState, CancelState, GatewayDispatcher};
+use komo_bot::interaction::{Answer, ApprovalState, CancelState, GatewayDispatcher, WakeReply};
 use komo_services::tool_execution::{SessionContext, with_session};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1706,7 +1706,7 @@ async fn cancel_turn(State(state): State<AppState>, Path(session): Path<String>)
     let denied = state.approvals.resolve(&session, Answer::Deny(None));
     let answered = state
         .dispatcher
-        .answer_question(&session, CANCELLED_REPLY, None)
+        .answer_question(&session, CANCELLED_REPLY, WakeReply::Polling)
         .await;
     let cancelled = state.cancels.cancel(&session);
     if cancelled {
@@ -1777,7 +1777,7 @@ async fn answer_question(
 ) -> Result<Json<Value>, ApiError> {
     let resolved = state
         .dispatcher
-        .answer_question(&session, &body.text, None)
+        .answer_question(&session, &body.text, WakeReply::Polling)
         .await;
     Ok(Json(json!({ "resolved": resolved })))
 }

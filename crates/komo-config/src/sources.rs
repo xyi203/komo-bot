@@ -74,6 +74,11 @@ pub struct KomoEnv {
     pub aux_model: Option<String>,
     /// Reasoning effort the aux backend runs at (`KOMO_AUX_EFFORT`).
     pub aux_effort: Option<String>,
+    /// Model the memory pipeline runs on (`KOMO_MEMORY_MODEL`); unset =
+    /// whatever the aux backend runs.
+    pub memory_model: Option<String>,
+    /// Reasoning effort that memory model runs at (`KOMO_MEMORY_EFFORT`).
+    pub memory_effort: Option<String>,
     /// Reasoning effort a conversation runs at when the session picks none
     /// (`KOMO_EFFORT`).
     pub effort: Option<String>,
@@ -118,6 +123,8 @@ impl KomoEnv {
             &mut self.base_url,
             &mut self.aux_model,
             &mut self.aux_effort,
+            &mut self.memory_model,
+            &mut self.memory_effort,
             &mut self.effort,
             &mut self.schedule,
             &mut self.dream_schedule,
@@ -355,6 +362,15 @@ impl FileConfig {
 #[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct MemoryFileConfig {
+    /// Model the memory pipeline runs on — the reflective reviewer that reads a
+    /// finished turn, the consolidator that classifies what it extracted, and
+    /// the aux screening above five recalled memories. Unset = the aux model
+    /// (`aux_model`, itself falling back to `model`), which is what this was
+    /// before the key existed. May be provider-qualified (`deepseek:…`).
+    pub model: Option<String>,
+    /// Reasoning effort that model runs at. Unset = the memory backend's own aux
+    /// default (`none` on DeepSeek — thinking off).
+    pub effort: Option<String>,
     /// Ollama model serving embeddings (e.g. `qwen3-embedding:0.6b`). Unset or
     /// empty = embeddings off, recall stays lexical-only. Pick a *multilingual*
     /// model — an English-only one reintroduces the very gap this closes.

@@ -203,7 +203,7 @@ enum SavedAction {
 
 #[derive(Subcommand)]
 enum ModelAction {
-    /// Show the current provider/model and list available providers
+    /// Show every model komo runs (conversation, aux, memory, embeddings)
     List,
     /// Switch provider (and optionally model); persists to config.toml
     Set {
@@ -211,6 +211,39 @@ enum ModelAction {
         provider: String,
         /// Model id (defaults to the provider's default model)
         model: Option<String>,
+    },
+    /// The aux backend: policy reviewer, compactor, delegate. Bare = show it
+    Aux {
+        /// Model id, optionally provider-qualified (deepseek:deepseek-v4-flash)
+        model: Option<String>,
+        /// Reasoning effort that backend runs at
+        #[arg(long)]
+        effort: Option<String>,
+        /// Drop both keys, so the role runs the conversation's model again
+        #[arg(long, conflicts_with_all = ["model", "effort"])]
+        clear: bool,
+    },
+    /// The memory pipeline: reviewer, consolidator, recall screening. Bare = show it
+    Memory {
+        /// Model id, optionally provider-qualified; unset = the aux backend
+        model: Option<String>,
+        /// Reasoning effort that backend runs at
+        #[arg(long)]
+        effort: Option<String>,
+        /// Drop both keys, so the memory pipeline runs on the aux backend again
+        #[arg(long, conflicts_with_all = ["model", "effort"])]
+        clear: bool,
+    },
+    /// The embedding backend behind cross-language recall. Bare = show it
+    Embedding {
+        /// Ollama model id (pick a multilingual one)
+        model: Option<String>,
+        /// Ollama base URL (default http://127.0.0.1:11434)
+        #[arg(long)]
+        url: Option<String>,
+        /// Turn embeddings off, leaving recall lexical-only
+        #[arg(long, conflicts_with_all = ["model", "url"])]
+        clear: bool,
     },
 }
 
@@ -661,6 +694,21 @@ pub async fn run() -> anyhow::Result<()> {
         Some(Commands::Model { action }) => match action {
             ModelAction::List => model::list(&config).await,
             ModelAction::Set { provider, model } => model::set(&config, &provider, model).await,
+            ModelAction::Aux {
+                model: id,
+                effort,
+                clear,
+            } => model::set_role(&config, model::Role::Aux, id, effort, clear),
+            ModelAction::Memory {
+                model: id,
+                effort,
+                clear,
+            } => model::set_role(&config, model::Role::Memory, id, effort, clear),
+            ModelAction::Embedding {
+                model: id,
+                url,
+                clear,
+            } => model::set_embedding(&config, id, url, clear),
         },
         Some(Commands::Channel { action }) => match action {
             ChannelAction::List { json } => channel::list(&config, json).await,

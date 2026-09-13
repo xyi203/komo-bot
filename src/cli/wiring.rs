@@ -308,6 +308,22 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
         Some("aux"),
     )?;
 
+    // The memory pipeline's own backend: the reflective reviewer, the
+    // consolidator classifying what it extracted, the outcome verdict and the
+    // screening above five recalled memories. `[memory] model` unset makes this
+    // the aux backend again, byte for byte — a second client on the same model,
+    // which costs one extra prompt builder and keeps the wiring one shape.
+    let memory_config = model_config.memory_variant();
+    let memory_builder = Arc::new(SystemPromptBuilder::new(&memory_config));
+    let memory_preamble: PreambleFn = Arc::new(move |roots| memory_builder.build(roots));
+    let memory_llm = build_llm(
+        &memory_config,
+        None,
+        memory_preamble,
+        TurnInjections::default(),
+        Some("memory"),
+    )?;
+
     // ── The attended approval chain ──────────────────────────────────────────
     // Built here rather than at the top of `build` because its middle rung needs
     // the aux model above.
@@ -632,12 +648,12 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
     let consolidator = Arc::new(
         komo_services::memory_consolidation::MemoryConsolidator::new(
             memory_repo.clone(),
-            aux_llm.clone(),
+            memory_llm.clone(),
             memory_query.clone(),
         ),
     );
     let reviewer: Arc<dyn Reviewer> =
-        Arc::new(ReflectiveReviewer::new(aux_llm.clone(), consolidator));
+        Arc::new(ReflectiveReviewer::new(memory_llm.clone(), consolidator));
     // One coordinator instance shared by the runtime's post-run trigger and
     // the gateway's scheduled sweep — that sharing is what makes its
     // per-session in-flight guard effective across the two paths.
@@ -652,7 +668,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
         // Reads the user's next message as a verdict on the previous turn.
         // Without it every outcome stays `Unknown`, since nothing observable
         // when a turn ends tells success from silence.
-        .with_feedback(aux_llm.clone()),
+        .with_feedback(memory_llm.clone()),
     );
 
     // Built before the runtimes because every one of them is assembled from it.
@@ -723,10 +739,11 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
 
     // Hand the same tool instances to the LLM so the model can call them, plus
     // the memory enricher (main agent only): the memory store for recall
-    // selection and the aux agent for recall screening, behind one interface.
+    // selection and the memory backend for recall screening, behind one
+    // interface.
     let enricher = Arc::new(MemoryEnricher::new(
         memory_repo.clone(),
-        Some(aux_llm.clone()),
+        Some(memory_llm.clone()),
         memory_query.clone(),
     ));
     let llm = build_llm(

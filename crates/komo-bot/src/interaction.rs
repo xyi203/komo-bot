@@ -59,6 +59,44 @@ use komo_core::domain::{
 // sits through: the turn gives up its slot and the answer may arrive after a
 // restart.
 
+/// Who is on the other end of a wake, and therefore what the continuation may
+/// expect of them.
+///
+/// It replaces the bare `Option<ReplySink>` because the absent sink was two
+/// different situations wearing one shape: the GUI answering through a surface
+/// it polls, and a sweep firing a timer with nobody there at all. The first has
+/// a human who can answer the *next* prompt too; the second does not, and a
+/// continuation that cannot tell them apart has to assume the worse one for
+/// both.
+#[derive(Clone)]
+pub enum WakeReply {
+    /// Nobody is standing at the other end — a sweep firing an expiry. The
+    /// transcript is the record, and a further approval has no one to ask.
+    Nobody,
+    /// A chat surface answered: the continuation replies there, and that is
+    /// also where its next approval prompt goes.
+    Sink(Arc<dyn ReplySink>),
+    /// A polling client answered (the GUI, the api). It reads the reply out of
+    /// the transcript and the next prompt out of
+    /// `GET /api/interactions/{session}`, so there is a human — just not a sink.
+    Polling,
+}
+
+impl WakeReply {
+    /// Where the continuation's reply goes, when anywhere.
+    fn sink(&self) -> Option<&Arc<dyn ReplySink>> {
+        match self {
+            WakeReply::Sink(sink) => Some(sink),
+            _ => None,
+        }
+    }
+
+    /// Whether a human can answer a prompt this turn raises *after* the wake.
+    fn has_a_human(&self) -> bool {
+        !matches!(self, WakeReply::Nobody)
+    }
+}
+
 /// The user's answer to an approval prompt.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Answer {
@@ -737,11 +775,10 @@ impl WakeupDispatch for TurnWaker {
         cause: WakeupCause,
         payload: &str,
     ) -> anyhow::Result<()> {
-        // No sink: a sweep tick has nobody standing at a channel waiting for
-        // the answer — it lands in the transcript, which is where the next
-        // reader looks.
+        // A sweep tick has nobody standing at a channel waiting for the answer
+        // — it lands in the transcript, which is where the next reader looks.
         self.dispatcher
-            .continue_turn_with(registration, cause, payload, None)
+            .continue_turn_with(registration, cause, payload, WakeReply::Nobody)
             .await
     }
 }
@@ -1008,7 +1045,8 @@ impl GatewayDispatcher {
         registration: &WakeupRegistration,
         cause: WakeupCause,
     ) -> anyhow::Result<()> {
-        self.continue_turn_with(registration, cause, "", None).await
+        self.continue_turn_with(registration, cause, "", WakeReply::Nobody)
+            .await
     }
 
     /// The same, carrying what the wake brought and where to answer.
@@ -1019,20 +1057,19 @@ impl GatewayDispatcher {
     /// one record, so what woke the turn and what it was handed cannot
     /// disagree.
     ///
-    /// `sink` is where the continuation's reply goes, and it is **the surface
-    /// that answered, not the one that asked**. A turn suspended in the TUI and
-    /// released by `/approve` from Telegram answers into Telegram — the
-    /// operator is standing there, and a reply that only lands in a transcript
-    /// nobody is looking at reads as silence. It lands in the log either way,
-    /// which is what the TUI shows when it is opened again. `None` for a wake
-    /// nobody is waiting on the other end of — a sweep firing an expiry, the
-    /// GUI's modal (which polls the transcript).
+    /// `reply` is **the surface that answered, not the one that asked**. A turn
+    /// suspended in the TUI and released by `/approve` from Telegram answers
+    /// into Telegram — the operator is standing there, and a reply that only
+    /// lands in a transcript nobody is looking at reads as silence. It lands in
+    /// the log either way, which is what the TUI shows when it is opened again.
+    /// It also decides whether the continuation can *ask* for anything more:
+    /// see [`GatewayDispatcher::wake_context`].
     pub async fn continue_turn_with(
         self: &Arc<Self>,
         registration: &WakeupRegistration,
         cause: WakeupCause,
         payload: &str,
-        sink: Option<Arc<dyn ReplySink>>,
+        reply: WakeReply,
     ) -> anyhow::Result<()> {
         let Some(waits) = self.waits.clone() else {
             anyhow::bail!("this dispatcher has no store to continue a turn from");
@@ -1042,7 +1079,7 @@ impl GatewayDispatcher {
             // trigger. What it brought is the whole message: a wake with no
             // turn and nothing to say would open a turn about nothing.
             return self
-                .start_turn_with(&registration.session_id, payload, sink)
+                .start_turn_with(&registration.session_id, payload, reply)
                 .await;
         };
         let Some(run) = waits.runs.get(&turn_id).await? else {
@@ -1076,14 +1113,15 @@ impl GatewayDispatcher {
         let dispatcher = self.clone();
         tokio::spawn(async move {
             let claim = dispatcher.claim_session(&session_id).await;
-            let ctx = SessionContext::detached(&session_id).with_origin(origin);
+            let (ctx, owned) = dispatcher.wake_context(&session_id, origin, &reply);
             let outcome =
                 with_job_grants(grants, with_session(ctx, handler.resume_interrupted(&run))).await;
+            dispatcher.complete_owned(&owned).await;
             claim.release();
             match outcome {
-                Ok(Some(reply)) => {
-                    if let Some(sink) = &sink
-                        && let Err(error) = sink.send(&reply).await
+                Ok(Some(answer)) => {
+                    if let Some(sink) = reply.sink()
+                        && let Err(error) = sink.send(&answer).await
                     {
                         warn!(%error, turn = %run.id, "failed to deliver a woken turn's reply");
                     }
@@ -1121,7 +1159,7 @@ impl GatewayDispatcher {
         self: &Arc<Self>,
         session_id: &str,
         payload: &str,
-        sink: Option<Arc<dyn ReplySink>>,
+        reply: WakeReply,
     ) -> anyhow::Result<()> {
         if payload.trim().is_empty() {
             warn!(session = %session_id, "a wake with no turn and nothing to say opens nothing");
@@ -1144,16 +1182,17 @@ impl GatewayDispatcher {
             // while the conversation is mid-turn queues behind it rather than
             // running beside it.
             let claim = dispatcher.claim_session(&session).await;
-            let ctx = SessionContext::detached(&session).with_origin(origin);
+            let (ctx, owned) = dispatcher.wake_context(&session, origin, &reply);
             let outcome = with_session(ctx, handler.handle(&session, input)).await;
+            dispatcher.complete_owned(&owned).await;
             claim.release();
             match outcome {
-                Ok(reply) => {
+                Ok(answer) => {
                     // Same rule as a continuation's: deliver where the wake was
                     // answered from when someone is there, and otherwise let the
                     // transcript be the record.
-                    if let Some(sink) = &sink
-                        && let Err(error) = sink.send(&reply).await
+                    if let Some(sink) = reply.sink()
+                        && let Err(error) = sink.send(&answer).await
                     {
                         warn!(%error, session = %session, "failed to deliver a woken turn's reply");
                     }
@@ -1166,6 +1205,65 @@ impl GatewayDispatcher {
             }
         });
         Ok(())
+    }
+
+    /// The context a woken turn continues in.
+    ///
+    /// A continuation is **not** a detached turn, and building it as one was
+    /// the bug: `interactive` stayed false for the rest of the turn, so the
+    /// next thing that needed approval was auto-denied with "this session is
+    /// non-interactive, nobody can answer" — reaching the model as the user's
+    /// own refusal. One approval was all a conversation could ever give,
+    /// because the act of answering the first was what made the second
+    /// impossible. What woke the turn was a person answering; that person is
+    /// still there.
+    ///
+    /// Two things the detached context also dropped come back with it: the
+    /// sink, so the next prompt reaches the surface that answered the last
+    /// one, and the interjector, so a continuation hears what the user says
+    /// while it runs like any other turn. The correspondent needs no help here
+    /// — `run_agent_loop` fills `channel` from the session record.
+    ///
+    /// An **unattended** turn keeps the detached context it always had: its
+    /// approver stops rather than prompts (docs/bot-runtime.md §4.2), and the
+    /// sink that answered it is the home chat rather than a human watching
+    /// that turn.
+    ///
+    /// Returns the inbox rows an interjection would claim, for
+    /// [`complete_owned`](Self::complete_owned) to settle when the turn ends.
+    fn wake_context(
+        self: &Arc<Self>,
+        session_id: &str,
+        origin: SessionOrigin,
+        reply: &WakeReply,
+    ) -> (SessionContext, Arc<Mutex<Vec<InboundOrigin>>>) {
+        let owned = Arc::new(Mutex::new(Vec::new()));
+        let mut ctx = SessionContext::detached(session_id).with_origin(origin);
+        if origin.is_unattended() {
+            return (ctx, owned);
+        }
+        ctx.interactive = reply.has_a_human();
+        if let Some(sink) = reply.sink() {
+            ctx.sink = sink.clone();
+        }
+        ctx.interject = Some(Arc::new(QueueInterjector {
+            dispatcher: self.clone(),
+            session: session_id.to_string(),
+            owned: owned.clone(),
+        }));
+        (ctx, owned)
+    }
+
+    /// Close the inbox rows a turn absorbed as interjections — the same rule
+    /// `dispatch_turn` settles by: a row is completed when the work is, so a
+    /// message a continuation answered is not redelivered after a crash.
+    async fn complete_owned(&self, owned: &Arc<Mutex<Vec<InboundOrigin>>>) {
+        let settled = std::mem::take(&mut *owned.lock().unwrap());
+        for origin in settled {
+            if let Err(error) = self.inbox.complete(&origin).await {
+                warn!(%error, "inbox complete failed (non-fatal)");
+            }
+        }
     }
 
     /// Tell the operator about the wait a *woken* unattended turn left behind.
@@ -1305,7 +1403,7 @@ impl GatewayDispatcher {
         )));
         self.approvals.resolve(session_id, refusal.clone());
         matches!(
-            self.answer_suspended(session_id, None, &refusal, Some(sink))
+            self.answer_suspended(session_id, None, &refusal, WakeReply::Sink(sink))
                 .await,
             Answered::Here | Answered::Elsewhere(_)
         )
@@ -1327,9 +1425,13 @@ impl GatewayDispatcher {
     ) -> bool {
         let granted = self.approvals.resolve_scoped(session_id, answer.clone());
         let narrowed = granted.clone().unwrap_or_else(|| narrow_unknown(answer));
-        // No sink: the GUI reads the continuation's reply out of the transcript
-        // it is already polling.
-        let woken = self.answer_suspended(session_id, id, &narrowed, None).await;
+        // The GUI reads the continuation's reply out of the transcript it is
+        // already polling — and its next approval prompt out of the
+        // interactions endpoint it polls beside it, which is why this is
+        // `Polling` and not "nobody is there".
+        let woken = self
+            .answer_suspended(session_id, id, &narrowed, WakeReply::Polling)
+            .await;
         granted.is_some() || woken != Answered::Nothing
     }
 
@@ -1345,7 +1447,7 @@ impl GatewayDispatcher {
         session_id: &str,
         id: Option<&str>,
         answer: &Answer,
-        sink: Option<Arc<dyn ReplySink>>,
+        reply: WakeReply,
     ) -> Answered {
         let Some(waits) = self.waits.clone() else {
             return Answered::Nothing;
@@ -1421,7 +1523,7 @@ impl GatewayDispatcher {
             false => WakeupCause::Deny,
         };
         if let Err(error) = self
-            .continue_turn_with(&registration, cause, "", sink)
+            .continue_turn_with(&registration, cause, "", reply)
             .await
         {
             warn!(%error, turn = %turn_id, "failed to continue an answered turn");
@@ -1487,14 +1589,15 @@ impl GatewayDispatcher {
     /// which the tool reads as "nobody answered"). Answers whether anything was
     /// waiting.
     ///
-    /// `sink` is where the continuation replies — the surface that answered,
-    /// which need not be the one that asked. `None` for the GUI and the api,
-    /// which read the reply out of the transcript they already poll.
+    /// `reply` is where the continuation replies — the surface that answered,
+    /// which need not be the one that asked. [`WakeReply::Polling`] for the GUI
+    /// and the api, which read the reply out of the transcript they already
+    /// poll.
     pub async fn answer_question(
         self: &Arc<Self>,
         session_id: &str,
         text: &str,
-        sink: Option<Arc<dyn ReplySink>>,
+        reply: WakeReply,
     ) -> bool {
         let Some(waits) = self.waits.clone() else {
             return false;
@@ -1523,7 +1626,7 @@ impl GatewayDispatcher {
             false => WakeupCause::Reply,
         };
         if let Err(error) = self
-            .continue_turn_with(&registration, cause, text, sink)
+            .continue_turn_with(&registration, cause, text, reply)
             .await
         {
             warn!(%error, "failed to continue an answered turn");
@@ -1706,7 +1809,12 @@ impl GatewayDispatcher {
                 let granted = self.approvals.resolve_scoped(session_id, answer.clone());
                 let narrowed = granted.clone().unwrap_or_else(|| narrow_unknown(answer));
                 let woken = self
-                    .answer_suspended(session_id, id.as_deref(), &narrowed, Some(sink.clone()))
+                    .answer_suspended(
+                        session_id,
+                        id.as_deref(),
+                        &narrowed,
+                        WakeReply::Sink(sink.clone()),
+                    )
                     .await;
                 if granted.is_none() && woken != Answered::Nothing {
                     let _ = sink.send(answered_elsewhere(&woken)).await;
@@ -1734,7 +1842,12 @@ impl GatewayDispatcher {
                 let answer = Answer::Deny(reason);
                 let in_memory = self.approvals.resolve(session_id, answer.clone());
                 let woken = self
-                    .answer_suspended(session_id, id.as_deref(), &answer, Some(sink.clone()))
+                    .answer_suspended(
+                        session_id,
+                        id.as_deref(),
+                        &answer,
+                        WakeReply::Sink(sink.clone()),
+                    )
                     .await;
                 if !in_memory && woken != Answered::Nothing {
                     let _ = sink.send(answered_elsewhere(&woken)).await;
@@ -1753,7 +1866,7 @@ impl GatewayDispatcher {
             }
             Command::Skip => {
                 let reply = match self
-                    .answer_question(session_id, "", Some(sink.clone()))
+                    .answer_question(session_id, "", WakeReply::Sink(sink.clone()))
                     .await
                 {
                     true => "已跳过，这一轮正在继续。",
@@ -1808,7 +1921,7 @@ impl GatewayDispatcher {
                 // etc. never reach here), and a second message while the turn
                 // keeps running queues as usual via `spawn_turn`.
                 if self
-                    .answer_question(session_id, &input, Some(sink.clone()))
+                    .answer_question(session_id, &input, WakeReply::Sink(sink.clone()))
                     .await
                 {
                     return false;
@@ -2038,17 +2151,28 @@ impl GatewayDispatcher {
                 .catch_unwind()
                 .await;
             let reply = match outcome {
-                Ok(Ok(reply)) => reply,
+                Ok(Ok(reply)) => Some(reply),
+                // The turn stopped to *wait*, which is not a failure and not an
+                // answer: the approval prompt or the question has already gone
+                // to this chat, and an error beside it reads as the request
+                // having been refused. Every other ingress already told the two
+                // apart; this one called it "处理消息时出错了: suspended, waiting".
+                Ok(Err(error)) if is_suspended(&error) => {
+                    info!(session = %session, "turn suspended; waiting for an answer");
+                    None
+                }
                 Ok(Err(error)) => {
                     warn!(%error, "message handling failed");
-                    format!("处理消息时出错了: {error}")
+                    Some(format!("处理消息时出错了: {error}"))
                 }
                 Err(_panic) => {
                     warn!(session = %session, "turn panicked");
-                    "处理消息时发生内部错误，请重试。".to_string()
+                    Some("处理消息时发生内部错误，请重试。".to_string())
                 }
             };
-            if let Err(error) = sink.send(&reply).await {
+            if let Some(reply) = reply
+                && let Err(error) = sink.send(&reply).await
+            {
                 warn!(%error, "failed to send reply");
             }
             // The turn has settled — answered, failed, or suspended with the log

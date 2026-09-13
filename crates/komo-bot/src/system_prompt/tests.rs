@@ -11,6 +11,8 @@ fn config() -> ModelConfig {
         base_url: None,
         aux_model: None,
         aux_effort: None,
+        memory_model: None,
+        memory_effort: None,
         effort: None,
         max_turns: DEFAULT_MAX_TURNS,
         max_tool_result_bytes: komo_config::DEFAULT_MAX_TOOL_RESULT_BYTES,

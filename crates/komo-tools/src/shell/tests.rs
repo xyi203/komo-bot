@@ -562,3 +562,44 @@ fn the_komo_check_reads_only_its_own_command() {
     assert_eq!(dangerous_pattern("komo logs; ls"), None);
     assert_eq!(dangerous_pattern("komo logs && rm -rf x"), Some("rm "));
 }
+
+/// Asking what a subcommand does is not doing it. `--help` is answered by
+/// clap's parser and exits, so `komo cron remove --help` mutates nothing — it
+/// used to cost an approval, which in an unattended or already-suspended turn
+/// meant the question could not be asked at all.
+#[test]
+fn a_komo_help_flag_is_not_a_mutation() {
+    for command in [
+        "komo --help",
+        "komo -h",
+        "komo --version",
+        "komo cron remove --help",
+        "komo cron add -h",
+        "komo logs -n 200 --help",
+        "komo help",
+        "komo help cron",
+        "komo version",
+    ] {
+        assert_eq!(
+            dangerous_pattern(command),
+            None,
+            "should have run without asking: {command}"
+        );
+    }
+}
+
+/// …but only while it is still a flag. After `--`, and directly after another
+/// flag that may be consuming it as a value, the subcommand really does run.
+#[test]
+fn a_help_flag_that_is_really_a_value_still_gates() {
+    for command in [
+        "komo cron add --prompt --help",
+        "komo cron remove -- --help",
+    ] {
+        assert_eq!(
+            dangerous_pattern(command),
+            Some("komo <mutating subcommand>"),
+            "should have prompted: {command}"
+        );
+    }
+}

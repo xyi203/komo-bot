@@ -237,6 +237,10 @@ where
 /// A qualified id (`deepseek:deepseek-chat`) picks the backend here; the bare
 /// remainder picks the model inside it.
 ///
+/// A session naming no model of its own — every aux caller — runs the config's
+/// own model, so a qualified *config* model decides its backend too
+/// ([`RoutingLlm::own_provider`]).
+///
 /// An unqualified id — or one naming a provider this gateway has no client for —
 /// falls through to the default backend rather than failing the turn: the api
 /// channel already validates a client's choice against the advertised menu, so
@@ -244,15 +248,26 @@ where
 /// session, and running on the default is the recoverable answer.
 struct RoutingLlm {
     by_provider: Vec<(Provider, Arc<dyn LlmClient>)>,
+    /// The configured provider: where a session's **unqualified** id belongs
+    /// (see `ModelConfig::menu`), and the last resort for one that names a
+    /// backend this gateway has no client for.
     default_provider: Provider,
+    /// The provider the **config's own model** names — where a session that
+    /// names no model runs. The two differ exactly when that model is
+    /// provider-qualified, which is what an aux or memory variant is
+    /// (`[memory] model = "codex:gpt-5.6-sol"` on a DeepSeek conversation).
+    /// Every aux caller builds a synthetic session with empty overrides, so
+    /// without this the memory pipeline would quietly stay on the
+    /// conversation's backend.
+    own_provider: Provider,
 }
 
 impl RoutingLlm {
     fn route(&self, session: &Session) -> &Arc<dyn LlmClient> {
-        let wanted = session
-            .model_override()
-            .and_then(|id| split_model_id(id).0)
-            .unwrap_or(self.default_provider);
+        let wanted = match session.model_override() {
+            Some(id) => split_model_id(id).0.unwrap_or(self.default_provider),
+            None => self.own_provider,
+        };
         self.backend(wanted)
             .or_else(|| self.backend(self.default_provider))
             .expect("routing llm always holds its default provider's backend")
@@ -1556,6 +1571,11 @@ pub fn build_llm(
     Ok(Arc::new(RoutingLlm {
         by_provider,
         default_provider: config.provider,
+        // The config's *own* model may be qualified — an aux/memory variant
+        // naming `codex:…` on a DeepSeek conversation — and every aux caller
+        // hands this router a session with no model of its own, so that id, not
+        // `provider`, is where those turns belong.
+        own_provider: config.own_provider(),
     }))
 }
 

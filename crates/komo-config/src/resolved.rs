@@ -398,6 +398,27 @@ impl ModelConfig {
         out
     }
 
+    /// The provider a model id runs on: the one it names, else the configured
+    /// default. An unqualified id belongs to [`Self::provider`] — including an
+    /// Ollama-shaped `llama3:8b`, whose prefix is not a provider (see
+    /// [`split_model_id`]).
+    pub fn provider_of(&self, id: &str) -> Provider {
+        split_model_id(id).0.unwrap_or(self.provider)
+    }
+
+    /// The provider **this config's own model** names — where a session that
+    /// names no model of its own runs.
+    ///
+    /// It differs from [`Self::provider`] exactly when `model` is
+    /// provider-qualified, which is what an aux or memory variant looks like
+    /// (`[memory] model = "codex:gpt-5.6-sol"` on a DeepSeek conversation, or an
+    /// `aux_model` on another backend). Every aux caller builds a synthetic
+    /// session with empty overrides, so those turns run on *this* backend, never
+    /// on the conversation's — see `RoutingLlm` in `komo-bot`.
+    pub fn own_provider(&self) -> Provider {
+        self.provider_of(&self.model)
+    }
+
     /// This config re-pointed at `provider`, running `model`. Used to build one
     /// backend per provider behind the cross-provider router: the agent-loop
     /// knobs carry over, only the identity and credential change.

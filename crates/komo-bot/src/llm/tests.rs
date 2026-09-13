@@ -785,6 +785,13 @@ async fn resume_routes_on_the_recorded_provider_not_the_session() {
 }
 
 fn router() -> RoutingLlm {
+    router_on(Provider::Codex, Provider::Codex)
+}
+
+/// A router whose configured default and whose config's own model sit on
+/// different providers — what an aux/memory variant looks like on a DeepSeek
+/// conversation, and the case `own_provider` exists for.
+fn router_on(default_provider: Provider, own_provider: Provider) -> RoutingLlm {
     RoutingLlm {
         by_provider: vec![
             (
@@ -796,7 +803,8 @@ fn router() -> RoutingLlm {
                 Arc::new(Tagged("deepseek")) as Arc<dyn LlmClient>,
             ),
         ],
-        default_provider: Provider::Codex,
+        default_provider,
+        own_provider,
     }
 }
 
@@ -819,15 +827,39 @@ async fn a_qualified_id_routes_to_that_provider() {
 }
 
 #[tokio::test]
-async fn an_unqualified_or_default_id_stays_on_the_default_provider() {
+async fn an_unqualified_id_stays_on_the_default_provider() {
     let router = router();
-    for model in ["", "gpt-5.5", "codex:gpt-5.6-sol"] {
+    for model in ["gpt-5.5", "codex:gpt-5.6-sol"] {
         assert_eq!(
             router.complete(&session_on(model)).await.unwrap(),
             "codex",
             "model {model:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_session_with_no_model_runs_the_configs_own_model() {
+    // Every aux caller — the memory pipeline's reviewer, the consolidator, the
+    // verdict, recall screening — builds a session with empty overrides, so this
+    // is the *only* routing decision those turns ever make. Sending them to the
+    // configured provider regardless would run the memory pipeline on the
+    // conversation's backend while `komo model memory` reported Codex.
+    let router = router_on(Provider::DeepSeek, Provider::Codex);
+    assert_eq!(router.complete(&session_on("")).await.unwrap(), "codex");
+    assert_eq!(
+        router.complete(&Session::new("s")).await.unwrap(),
+        "codex",
+        "a session that never picked a model is the same case"
+    );
+    // A bare id is *not* that case: it belongs to the configured provider.
+    assert_eq!(
+        router
+            .complete(&session_on("deepseek-v4-flash"))
+            .await
+            .unwrap(),
+        "deepseek"
+    );
 }
 
 #[tokio::test]

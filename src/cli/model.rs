@@ -18,8 +18,8 @@
 //! `komo config reload`.
 
 use komo_config::{
-    ConfigReport, ConfigSnapshot, ModelConfig, Origin, Provider, split_model_id,
-    write_config_values, write_model_selection,
+    ConfigReport, ConfigSnapshot, ModelConfig, Origin, Provider, write_config_values,
+    write_model_selection,
 };
 use komo_infra::codex::{self, CodexAuth};
 
@@ -284,13 +284,6 @@ impl Role {
     }
 }
 
-/// The provider a model id runs on: the one it names, else the configured
-/// default. An unqualified id (including an Ollama-shaped `llama3:8b`) is not a
-/// provider prefix — see `split_model_id`.
-fn provider_of(id: &str, config: &ModelConfig) -> Provider {
-    split_model_id(id).0.unwrap_or(config.provider)
-}
-
 fn effort_label(effort: Option<&str>) -> String {
     match effort {
         Some(level) => format!("effort {level}"),
@@ -324,7 +317,7 @@ fn role_lines(config: &ConfigSnapshot) {
             role.label(),
             resolved.model,
             effort_label(resolved.effort.as_deref()),
-            provider_of(&resolved.model, model).name(),
+            model.provider_of(&resolved.model).name(),
         );
     }
     match &config.runtime.embedding {
@@ -395,7 +388,7 @@ pub fn set_role(
     let target = model
         .clone()
         .unwrap_or_else(|| role.resolved(current).model);
-    let provider = provider_of(&target, current);
+    let provider = current.provider_of(&target);
     let effort = effort.map(|level| level.trim().to_string());
     check_effort(provider, effort.as_deref())?;
 

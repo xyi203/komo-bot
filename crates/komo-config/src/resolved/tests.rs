@@ -166,6 +166,39 @@ fn a_configured_memory_model_replaces_the_aux_one() {
     );
 }
 
+/// A qualified `[memory] model` names a backend, and the memory turns have to
+/// land on it: every one of them is a synthetic session with no model of its
+/// own, so the wiring routes them by the *config's* model — `own_provider` — and
+/// never by the conversation's provider, which keeps resolving to DeepSeek.
+#[test]
+fn a_qualified_memory_model_moves_its_turns_to_that_backend() {
+    let mut s = with_deepseek_key(sources());
+    s.file.memory = Some(MemoryFileConfig {
+        model: Some("codex:gpt-5.6-sol".into()),
+        effort: Some("high".into()),
+        ..Default::default()
+    });
+    let model = ConfigSnapshot::from_sources(s).runtime.model;
+
+    let memory = model.memory_variant();
+    // The id keeps its prefix — `komo model list` reads the provider off it —
+    // and `own_provider` is the same rule applied to it.
+    assert_eq!(memory.model, "codex:gpt-5.6-sol");
+    assert_eq!(memory.own_provider(), Provider::Codex);
+    assert_eq!(memory.effort.as_deref(), Some("high"));
+    assert!(
+        memory.menu_providers().contains(&Provider::Codex),
+        "the router needs a Codex client to send those turns to"
+    );
+
+    // The conversation itself is untouched: it stays on DeepSeek, so a bare id
+    // in a session still belongs there.
+    assert_eq!(model.provider, Provider::DeepSeek);
+    assert_eq!(model.own_provider(), Provider::DeepSeek);
+    assert_eq!(model.provider_of("gpt-5.6-sol"), Provider::DeepSeek);
+    assert_eq!(model.provider_of("codex:gpt-5.6-sol"), Provider::Codex);
+}
+
 /// `KOMO_MEMORY_MODEL` wins over the file, and a memory effort the memory
 /// backend rejects is a warning that reads as unset — a typo must never
 /// silently change what the memory pipeline runs at.

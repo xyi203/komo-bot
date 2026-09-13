@@ -96,6 +96,94 @@ pub fn gateway_loaded() -> anyhow::Result<bool> {
     }
 }
 
+/// The `PATH` a supervised gateway runs with — and so every process the agent's
+/// `shell` tool spawns from there.
+///
+/// Neither supervisor hands a service the environment of the shell that
+/// installed it. A systemd user unit starts with the *manager's* `PATH`
+/// (`/usr/local/bin:/usr/bin` on a stock setup); launchd's default is narrower
+/// still. Inherited unchanged, that is the whole reason a `shell` call inside
+/// the gateway cannot find `git`, `cargo` or `komo`: the gateway runs in a
+/// smaller world than the terminal that started it.
+///
+/// So the unit records the `PATH` the installing process had (the operator's own
+/// preference, in their own order), the directory this binary itself was run
+/// from — the one place komo knows holds a `komo` that works — and a floor of
+/// standard locations, for a host whose `PATH` arrived empty. Additions only
+/// fill gaps: nothing already inherited is reordered or dropped.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn service_path(exe: &std::path::Path) -> String {
+    compose_service_path(std::env::var("PATH").ok().as_deref(), exe)
+}
+
+/// The pure half of [`service_path`], so the policy is testable without
+/// mutating this process's own environment.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+fn compose_service_path(inherited: Option<&str>, exe: &std::path::Path) -> String {
+    let mut entries: Vec<String> = Vec::new();
+    for entry in inherited.unwrap_or_default().split(':') {
+        push_path_entry(&mut entries, entry);
+    }
+    if let Some(dir) = exe.parent() {
+        push_path_entry(&mut entries, &dir.to_string_lossy());
+    }
+    for entry in FALLBACK_PATH {
+        push_path_entry(&mut entries, entry);
+    }
+    entries.join(":")
+}
+
+/// What the gateway gets whether or not the installing shell had it: the
+/// standard system locations, so `sh` and its usual neighbours resolve even
+/// from an empty `PATH`. Deliberately not a guess at the user's own layout
+/// (`~/.cargo/bin`, mise shims, …) — those are on the inherited `PATH` of
+/// whoever ran `komo gateway start`, and inventing a toolchain here would have
+/// komo claim paths that may not exist.
+const FALLBACK_PATH: &[&str] = &["/usr/local/bin", "/usr/bin", "/bin"];
+
+fn push_path_entry(entries: &mut Vec<String>, entry: &str) {
+    let entry = entry.trim();
+    if !entry.is_empty() && !entries.iter().any(|seen| seen == entry) {
+        entries.push(entry.to_string());
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    #[test]
+    fn the_inherited_path_is_kept_and_only_gaps_are_filled() {
+        let path = compose_service_path(
+            Some("/usr/local/bin:/home/me/.cargo/bin"),
+            std::path::Path::new("/home/me/.local/bin/komo"),
+        );
+        assert_eq!(
+            path, "/usr/local/bin:/home/me/.cargo/bin:/home/me/.local/bin:/usr/bin:/bin",
+            "inherited order first, then the binary's own directory, then the floor"
+        );
+    }
+
+    #[test]
+    fn an_empty_inherited_path_still_gets_a_usable_one() {
+        // `komo gateway start` from a desktop launcher, or any environment with
+        // no PATH at all: the gateway must not end up with a `PATH` of nothing.
+        for inherited in [None, Some("")] {
+            let path = compose_service_path(inherited, std::path::Path::new("/srv/komo"));
+            assert_eq!(path, "/srv:/usr/local/bin:/usr/bin:/bin");
+        }
+    }
+
+    #[test]
+    fn duplicates_are_dropped_and_the_order_is_preserved() {
+        let path = compose_service_path(
+            Some("/usr/bin:/usr/local/bin:/usr/bin"),
+            std::path::Path::new("/srv/bin/komo"),
+        );
+        assert_eq!(path, "/usr/bin:/usr/local/bin:/srv/bin:/bin");
+    }
+}
+
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn unsupported(action: &str) -> anyhow::Result<()> {
     anyhow::bail!(
@@ -124,11 +212,14 @@ mod launchd {
     /// Render the LaunchAgent plist. Pure so the XML is unit-testable.
     /// `exe` is the absolute komo binary path; `log_dir` holds stdout/stderr logs;
     /// `work_dir` is the process working directory (launchd defaults to `/`, which
-    /// would make the workspace-confined tools useless).
-    fn render_plist(exe: &str, log_dir: &str, work_dir: &str) -> String {
+    /// would make the workspace-confined tools useless); `path` is the `PATH` the
+    /// gateway runs with — see [`super::service_path`] for why the supervisor
+    /// cannot be left to pick one.
+    fn render_plist(exe: &str, log_dir: &str, work_dir: &str, path: &str) -> String {
         let exe = xml_escape(exe);
         let log_dir = xml_escape(log_dir);
         let work_dir = xml_escape(work_dir);
+        let path = xml_escape(path);
         format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -157,6 +248,11 @@ mod launchd {
     <string>{log_dir}/gateway.log</string>
     <key>StandardErrorPath</key>
     <string>{log_dir}/gateway.err.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>{path}</string>
+    </dict>
 </dict>
 </plist>
 "#
@@ -372,6 +468,7 @@ mod launchd {
                 &gateway_exe.display().to_string(),
                 &log_dir.display().to_string(),
                 &komo_home.display().to_string(),
+                &super::service_path(&exe),
             ),
         )?;
 
@@ -437,11 +534,12 @@ mod launchd {
         use super::*;
 
         #[test]
-        fn plist_contains_label_exe_keepalive_and_workdir() {
+        fn plist_contains_label_exe_keepalive_workdir_and_path() {
             let plist = render_plist(
                 "/usr/local/bin/komo",
                 "/Users/me/.komo/logs",
                 "/Users/me/.komo",
+                "/usr/local/bin:/usr/bin",
             );
             assert!(plist.contains("<string>com.komo.gateway</string>"));
             assert!(plist.contains("<key>AssociatedBundleIdentifiers</key>"));
@@ -451,11 +549,16 @@ mod launchd {
             assert!(plist.contains("/Users/me/.komo/logs/gateway.log"));
             assert!(plist.contains("<key>WorkingDirectory</key>"));
             assert!(plist.contains("<string>/Users/me/.komo</string>"));
+            // launchd's own default is `/usr/bin:/bin:/usr/sbin:/sbin`: without
+            // this key the gateway's `shell` calls run without git.
+            assert!(plist.contains("<key>EnvironmentVariables</key>"));
+            assert!(plist.contains("<string>/usr/local/bin:/usr/bin</string>"));
         }
 
         #[test]
         fn plist_escapes_xml_special_chars_in_paths() {
-            let plist = render_plist("/odd<&>path/komo", "/logs", "/work");
+            let plist = render_plist("/odd<&>path/komo", "/logs", "/work", "/a<b>&c");
+            assert!(plist.contains("/a&lt;b&gt;&amp;c"));
             assert!(plist.contains("/odd&lt;&amp;&gt;path/komo"));
             assert!(!plist.contains("/odd<&>path"));
         }
@@ -498,9 +601,15 @@ mod systemd_unit {
     /// `Environment=KOMO_HOME` pins the supervised gateway to the home this CLI
     /// resolved while installing the unit: without it a `KOMO_HOME` exported
     /// only in the installing shell would leave the two disagreeing.
-    pub(super) fn render_unit(exe: &str, komo_home: &str, log_dir: &str) -> String {
+    ///
+    /// `Environment=PATH` is the same idea one step further out: a user unit
+    /// starts with the *manager's* `PATH`, never the installing shell's, so
+    /// without this line every `shell` call the agent makes runs without `git`,
+    /// `cargo` or `komo` — see [`super::service_path`].
+    pub(super) fn render_unit(exe: &str, komo_home: &str, log_dir: &str, path: &str) -> String {
         let exe_q = quote(exe);
         let home_q = quote(komo_home);
+        let path_q = quote(path);
         format!(
             "[Unit]
 Description=komo gateway
@@ -509,6 +618,7 @@ Description=komo gateway
 ExecStart=\"{exe_q}\" gateway
 WorkingDirectory={komo_home}
 Environment=\"KOMO_HOME={home_q}\"
+Environment=\"PATH={path_q}\"
 Restart=always
 RestartSec=10
 StandardOutput=append:{log_dir}/gateway.log
@@ -522,7 +632,9 @@ WantedBy=default.target
 
     /// systemd's double-quoted values escape with a backslash.
     fn quote(s: &str) -> String {
-        s.replace('\\', "\\\\").replace('"', "\\\"")
+        s.replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('%', "%%")
     }
 
     #[cfg(test)]
@@ -530,15 +642,19 @@ WantedBy=default.target
         use super::*;
 
         #[test]
-        fn unit_contains_exec_start_workdir_home_restart_and_logs() {
+        fn unit_contains_exec_start_workdir_home_path_restart_and_logs() {
             let unit = render_unit(
                 "/usr/local/bin/komo",
                 "/home/me/.komo",
                 "/home/me/.komo/logs",
+                "/home/me/.cargo/bin:/usr/local/bin:/usr/bin",
             );
             assert!(unit.contains("ExecStart=\"/usr/local/bin/komo\" gateway"));
             assert!(unit.contains("WorkingDirectory=/home/me/.komo"));
             assert!(unit.contains("Environment=\"KOMO_HOME=/home/me/.komo\""));
+            assert!(
+                unit.contains("Environment=\"PATH=/home/me/.cargo/bin:/usr/local/bin:/usr/bin\"")
+            );
             assert!(unit.contains("Restart=always"));
             assert!(unit.contains("StandardOutput=append:/home/me/.komo/logs/gateway.log"));
             assert!(unit.contains("StandardError=append:/home/me/.komo/logs/gateway.err.log"));
@@ -546,8 +662,12 @@ WantedBy=default.target
         }
 
         #[test]
-        fn unit_escapes_quotes_in_paths() {
-            let unit = render_unit("/odd\"path/komo", "/home", "/logs");
+        fn unit_escapes_quotes_and_a_literal_percent_in_paths() {
+            let unit = render_unit("/odd\"path/komo", "/home", "/logs", "/odd%path");
+            assert!(
+                unit.contains("Environment=\"PATH=/odd%%path\""),
+                "systemd expands `%` even in Environment=, so a literal one is doubled: {unit}"
+            );
             assert!(unit.contains("ExecStart=\"/odd\\\"path/komo\" gateway"));
         }
     }
@@ -654,6 +774,7 @@ mod systemd {
                 &exe.display().to_string(),
                 &komo_home.display().to_string(),
                 &log_dir.display().to_string(),
+                &super::service_path(&exe),
             ),
         )?;
 

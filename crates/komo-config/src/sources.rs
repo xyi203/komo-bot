@@ -195,8 +195,9 @@ impl Secrets {
             Provider::OpenAi => &self.openai_api_key,
             Provider::Anthropic => &self.anthropic_api_key,
             Provider::OpenRouter => &self.openrouter_api_key,
-            // Codex has no env API key (OAuth via ~/.codex/auth.json).
-            Provider::Codex => return None,
+            // Neither OAuth backend has an env API key: Codex reads
+            // ~/.codex/auth.json, claude-code the Claude Code login.
+            Provider::Codex | Provider::ClaudeCode => return None,
         };
         slot.as_deref().filter(|s| !s.is_empty())
     }

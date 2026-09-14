@@ -10,6 +10,7 @@
 //! stayed in the binary; they are wiring, not infrastructure.
 
 pub mod chunk_index;
+pub mod claude_code;
 pub mod codex;
 pub mod embedding;
 pub mod logs;

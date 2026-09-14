@@ -62,6 +62,38 @@ fn anthropic_maps_effort_onto_a_thinking_budget() {
     );
 }
 
+/// A Claude Code login only reaches Claude 4.6+, where the budget above is a
+/// 400 — the level rides on `output_config.effort` instead.
+#[test]
+fn claude_code_maps_effort_onto_adaptive_thinking() {
+    for level in ["low", "medium", "high", "xhigh", "max"] {
+        let params = reasoning_params(Provider::ClaudeCode, level).unwrap();
+        assert_eq!(params["thinking"]["type"], "adaptive", "{level:?}");
+        assert_eq!(params["output_config"]["effort"], level);
+        assert!(
+            params["thinking"]["budget_tokens"].is_null(),
+            "the manual thinking budget is rejected on adaptive models"
+        );
+        // The default is `omitted`, which would drop the reasoning komo's
+        // clients render.
+        assert_eq!(params["thinking"]["display"], "summarized");
+    }
+}
+
+/// An adaptive model thinks unless told not to, so the aux default has to send
+/// a real disable rather than simply omit the parameter.
+#[test]
+fn claude_code_disables_thinking_for_the_aux_default() {
+    assert_eq!(Provider::ClaudeCode.aux_default_effort(), Some("none"));
+    assert_eq!(
+        reasoning_params(Provider::ClaudeCode, "none"),
+        Some(json!({ "thinking": { "type": "disabled" } }))
+    );
+    // …and it is a level a session can pick too, like DeepSeek's: on an
+    // adaptive model "no thinking" is a real answer shape, not just a default.
+    assert!(Provider::ClaudeCode.efforts().contains(&"none"));
+}
+
 #[test]
 fn deepseek_maps_its_own_scale_and_nothing_else() {
     // `none` is thinking off, and a level of its own on this scale.
@@ -103,15 +135,16 @@ fn every_advertised_effort_level_actually_maps() {
     }
 }
 
-/// Four providers on one codec is the reason this layer is small; Anthropic
-/// is the one exception, because it serves no Responses endpoint.
+/// Four providers on one codec is the reason this layer is small; the two
+/// Anthropic backends are the exception, because Anthropic serves no Responses
+/// endpoint — and they differ from each other only in where the credential
+/// comes from, not in what it speaks.
 #[test]
-fn every_provider_but_anthropic_speaks_responses() {
+fn only_the_anthropic_backends_speak_messages() {
     for provider in Provider::ALL {
-        let expected = if provider == Provider::Anthropic {
-            Wire::Messages
-        } else {
-            Wire::Responses
+        let expected = match provider {
+            Provider::Anthropic | Provider::ClaudeCode => Wire::Messages,
+            _ => Wire::Responses,
         };
         assert_eq!(wire_for(provider), expected, "{provider:?}");
     }

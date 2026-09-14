@@ -21,11 +21,13 @@ use komo_config::{
     ConfigReport, ConfigSnapshot, ModelConfig, Origin, Provider, write_config_values,
     write_model_selection,
 };
+use komo_infra::claude_code::{self, ClaudeCodeAuth};
 use komo_infra::codex::{self, CodexAuth};
 
 fn auth_present(provider: Provider, report: &ConfigReport) -> bool {
     match provider {
         Provider::Codex => CodexAuth::load().is_ok(),
+        Provider::ClaudeCode => ClaudeCodeAuth::load().is_ok(),
         _ => report.key_present(provider),
     }
 }
@@ -35,6 +37,15 @@ fn credential_line(provider: Provider, report: &ConfigReport) -> String {
         Provider::Codex => format!(
             "Codex OAuth {}  {}",
             codex::codex_auth_file_path().display(),
+            if auth_present(provider, report) {
+                "✓ logged in"
+            } else {
+                "✗ missing"
+            }
+        ),
+        Provider::ClaudeCode => format!(
+            "Claude Code OAuth {}  {}",
+            claude_code::credentials_file_path().display(),
             if auth_present(provider, report) {
                 "✓ logged in"
             } else {
@@ -197,6 +208,10 @@ pub async fn set(
             // Report the loader's own diagnosis: "missing" and "malformed" want
             // different fixes, and it knows every path it accepted.
             Provider::Codex => match CodexAuth::load() {
+                Ok(_) => {}
+                Err(e) => eprintln!("note: {e:#}"),
+            },
+            Provider::ClaudeCode => match ClaudeCodeAuth::load() {
                 Ok(_) => {}
                 Err(e) => eprintln!("note: {e:#}"),
             },

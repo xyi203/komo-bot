@@ -40,16 +40,25 @@ pub enum Provider {
     /// OAuth tokens (`~/.codex/auth.json`) rather than an API key. See
     /// `infra/codex.rs`.
     Codex,
+    /// Claude on the operator's Claude Pro/Max **subscription**: the same
+    /// Anthropic Messages endpoint as [`Provider::Anthropic`], authenticated
+    /// with the Claude Code CLI's OAuth login (`~/.claude/.credentials.json`
+    /// or the macOS Keychain) rather than an API key. Separate from
+    /// `Anthropic` for the same reason `Codex` is separate from `OpenAi`: the
+    /// wire is shared but the credential source, the request identity and the
+    /// models reached are not. See `infra/claude_code.rs`.
+    ClaudeCode,
 }
 
 impl Provider {
     /// Every supported provider, in display order.
-    pub const ALL: [Provider; 5] = [
+    pub const ALL: [Provider; 6] = [
         Provider::DeepSeek,
         Provider::OpenAi,
         Provider::Anthropic,
         Provider::OpenRouter,
         Provider::Codex,
+        Provider::ClaudeCode,
     ];
 
     pub fn parse(s: &str) -> anyhow::Result<Self> {
@@ -59,9 +68,10 @@ impl Provider {
             "anthropic" | "claude" => Provider::Anthropic,
             "openrouter" | "or" => Provider::OpenRouter,
             "codex" | "openai-codex" => Provider::Codex,
+            "claude-code" | "claudecode" => Provider::ClaudeCode,
             other => anyhow::bail!(
                 "unknown provider `{other}` \
-                 (expected: deepseek | openai | anthropic | openrouter | codex)"
+                 (expected: deepseek | openai | anthropic | openrouter | codex | claude-code)"
             ),
         })
     }
@@ -74,6 +84,7 @@ impl Provider {
             Provider::Anthropic => "anthropic",
             Provider::OpenRouter => "openrouter",
             Provider::Codex => "codex",
+            Provider::ClaudeCode => "claude-code",
         }
     }
 
@@ -90,6 +101,10 @@ impl Provider {
             // gpt-5.4, gpt-5.4-mini). Account-/tier-dependent — override via
             // config.toml `model`; discover live at GET /codex/models.
             Provider::Codex => "gpt-5.5",
+            // A subscription serves the Claude 5 family; Sonnet is the one whose
+            // rate limits a conversation can lean on all day. `claude-opus-5` /
+            // `claude-fable-5-1` are the other two, via config `model`.
+            Provider::ClaudeCode => "claude-sonnet-5",
         }
     }
 
@@ -109,6 +124,13 @@ impl Provider {
                 &["low", "medium", "high"]
             }
             Provider::DeepSeek => &["none", "low", "high", "max"],
+            // Claude's *adaptive* thinking scale (4.6+), passed to
+            // `output_config.effort` verbatim. Two rungs above `high`, which
+            // the API-key backend's token budgets cannot express — and `none`
+            // below them, which on an adaptive model is a real wire value
+            // (`thinking.type = disabled`) rather than an omission, since the
+            // model thinks unless told not to.
+            Provider::ClaudeCode => &["none", "low", "medium", "high", "xhigh", "max"],
         }
     }
 
@@ -121,7 +143,11 @@ impl Provider {
     /// turns thinking off there unless asked otherwise.
     pub fn aux_default_effort(self) -> Option<&'static str> {
         match self {
-            Provider::DeepSeek => Some("none"),
+            // Adaptive Claude thinks by *default*, so omitting the parameter is
+            // not "off" — `none` sends the explicit disable. Same reasoning as
+            // DeepSeek's: the aux paths are short and frequent, and one of them
+            // has a 20s budget.
+            Provider::DeepSeek | Provider::ClaudeCode => Some("none"),
             Provider::OpenAi | Provider::OpenRouter | Provider::Codex | Provider::Anthropic => None,
         }
     }
@@ -132,23 +158,26 @@ impl Provider {
         self.efforts().contains(&effort)
     }
 
-    /// Environment variable holding this provider's API key. Codex has none —
-    /// it authenticates from `~/.codex/auth.json` (see [`Provider::uses_api_key`]).
+    /// Environment variable holding this provider's API key. The two OAuth
+    /// backends have none — they authenticate from a CLI's login file
+    /// (`~/.codex/auth.json`, `~/.claude/.credentials.json`); see
+    /// [`Provider::uses_api_key`].
     pub fn api_key_var(self) -> &'static str {
         match self {
             Provider::DeepSeek => "DEEPSEEK_API_KEY",
             Provider::OpenAi => "OPENAI_API_KEY",
             Provider::Anthropic => "ANTHROPIC_API_KEY",
             Provider::OpenRouter => "OPENROUTER_API_KEY",
-            Provider::Codex => "",
+            Provider::Codex | Provider::ClaudeCode => "",
         }
     }
 
-    /// Whether this provider authenticates with an environment API key.
-    /// Codex is the exception: its credentials come from the Codex CLI's OAuth
-    /// login, resolved at build time in `infra/codex.rs`.
+    /// Whether this provider authenticates with an environment API key. The two
+    /// borrowed-login backends are the exceptions: their credentials come from
+    /// another CLI's OAuth login, resolved in `infra/codex.rs` and
+    /// `infra/claude_code.rs`.
     pub fn uses_api_key(self) -> bool {
-        !matches!(self, Provider::Codex)
+        !matches!(self, Provider::Codex | Provider::ClaudeCode)
     }
 }
 

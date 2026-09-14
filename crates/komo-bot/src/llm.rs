@@ -1,3 +1,4 @@
+use komo_infra::claude_code::{self, CLAUDE_BASE_URL, ClaudeCodeAuth};
 use komo_infra::codex::{CODEX_BASE_URL, CodexAuth, codex_static_headers};
 use komo_services::artifact_store::ArtifactStore;
 use komo_services::memory_enrichment::MemoryEnricher;
@@ -328,6 +329,11 @@ impl LlmClient for RoutingLlm {
 /// model has room to write a reply after it finishes reasoning.
 const THINKING_ANSWER_HEADROOM: u64 = 8_192;
 
+/// `max_tokens` for a Claude Code turn. Adaptive thinking names no budget of
+/// its own and is charged against this cap, so it has to leave room for a
+/// reasoning pass *and* the answer after it.
+const CLAUDE_CODE_MAX_TOKENS: u64 = 32_000;
+
 /// Map a reasoning-effort level onto the provider's request params, or `None`
 /// when this provider/level pair has no effect.
 ///
@@ -358,6 +364,22 @@ fn reasoning_params(provider: Provider, effort: &str) -> Option<Value> {
             };
             Some(json!({ "thinking": { "type": "enabled", "budget_tokens": budget } }))
         }
+        // A Claude Code login only reaches Claude 4.6+, where extended thinking
+        // is *adaptive*: the manual `thinking` block above is rejected outright
+        // (4.7+) and the level goes to `output_config.effort` instead. `display`
+        // defaults to `omitted` there, which would drop the reasoning komo shows
+        // in its clients, so it asks for summaries.
+        //
+        // `none` sends the explicit disable rather than omitting the parameter,
+        // because an adaptive model thinks unless it is told not to.
+        Provider::ClaudeCode => Some(if level == "none" {
+            json!({ "thinking": { "type": "disabled" } })
+        } else {
+            json!({
+                "thinking": { "type": "adaptive", "display": "summarized" },
+                "output_config": { "effort": level },
+            })
+        }),
     }
 }
 
@@ -498,6 +520,24 @@ impl ProviderLlm {
             preamble,
             extra: None,
         };
+
+        if self.provider == Provider::ClaudeCode {
+            // Claude Code's own opening line, ahead of komo's prompt. Anthropic
+            // routes OAuth traffic by client identity and the headers are only
+            // half of it: requests that do not announce themselves this way
+            // intermittently answer 500. It leads the stable tier, so the
+            // cached prefix is unaffected.
+            turn.preamble = format!("{}\n\n{}", claude_code::SYSTEM_PREFIX, turn.preamble);
+            // Anthropic requires `max_tokens` and charges thinking against it,
+            // and adaptive thinking has no budget for the codec's default to be
+            // sized against — an 8K cap would let a long reasoning pass eat the
+            // whole answer. Well under the model's 128K ceiling, so a long
+            // conversation stays clear of the prompt-relative limit.
+            turn.extra = Some(merge_params(
+                turn.extra.take(),
+                json!({ "max_tokens": CLAUDE_CODE_MAX_TOKENS }),
+            ));
+        }
 
         // The Responses API caches by prefix automatically, but shard routing is
         // best-effort; `prompt_cache_key` pins related requests to the same
@@ -1638,6 +1678,25 @@ fn build_provider_llm(
                 }));
             }
         },
+        // Same story as Codex, one directory over: the login belongs to the
+        // Claude Code CLI, the access token rotates within the day, and the
+        // request has to present Claude Code's own identity (user agent, betas,
+        // `x-app`) or Anthropic answers 500s. An absent login degrades rather
+        // than aborting boot, for the same reason a missing API key does.
+        Provider::ClaudeCode => match ClaudeCodeAuth::load() {
+            Ok(auth) => (Auth::Dynamic(auth), claude_code::static_headers()),
+            Err(error) => {
+                tracing::warn!(%error, "Claude Code credentials unavailable; LLM degraded");
+                return Ok(Arc::new(UnconfiguredLlm {
+                    // The loader's error already names every accepted path and
+                    // how to produce the login; only the restart is news here.
+                    message: format!(
+                        "Claude Code credentials unavailable: {error:#}. Restart the gateway \
+                         once the login is in place."
+                    ),
+                }));
+            }
+        },
         // Anthropic versions its API by header, not by URL.
         Provider::Anthropic => (
             Auth::ApiKey(config.api_key.clone()),
@@ -1680,7 +1739,7 @@ fn build_provider_llm(
 /// the only reason komo carries a second codec at all.
 fn wire_for(provider: Provider) -> Wire {
     match provider {
-        Provider::Anthropic => Wire::Messages,
+        Provider::Anthropic | Provider::ClaudeCode => Wire::Messages,
         Provider::DeepSeek | Provider::OpenAi | Provider::OpenRouter | Provider::Codex => {
             Wire::Responses
         }
@@ -1699,6 +1758,7 @@ fn endpoint_url(provider: Provider, base_url: Option<&str>) -> String {
         Provider::Anthropic => "https://api.anthropic.com/v1",
         Provider::OpenRouter => "https://openrouter.ai/api/v1",
         Provider::Codex => CODEX_BASE_URL,
+        Provider::ClaudeCode => CLAUDE_BASE_URL,
     });
     let path = match wire_for(provider) {
         Wire::Responses => "responses",

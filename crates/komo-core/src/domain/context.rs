@@ -10,10 +10,10 @@
 //! scope.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::domain::approval::{ApprovalRequest, Approver, Decision};
+use crate::domain::approval::{ApprovalRequest, Approver, Decision, Risk};
 use crate::domain::cancel::CancelSignal;
 use crate::domain::events::ToolEventSink;
 use crate::domain::gateway::{InterjectSource, ReplySink};
@@ -374,6 +374,18 @@ pub struct RunContext {
     /// Monotonic step counter, shared across clones so steps within a run get a
     /// stable order even when tool calls run concurrently.
     seq: Arc<AtomicI64>,
+    /// Whether this turn has been allowed to change anything outside the
+    /// conversation. Set by [`ToolContext::decide`] for every allowed call the
+    /// tool itself declared above `Risk::Safe`, and by the few state-changing
+    /// tools that never reach the approver (`memory`'s `save`).
+    ///
+    /// Shared across clones and per **attempt**, like `seq`: a continuation
+    /// re-dispatches the call that stopped it, so the call that was going to
+    /// take effect takes it inside the attempt that answers for it.
+    ///
+    /// The one thing the runtime can say for certain about a reply claiming an
+    /// action: a turn that was never permitted to change anything did not.
+    effectful: Arc<AtomicBool>,
 }
 
 impl RunContext {
@@ -385,6 +397,7 @@ impl RunContext {
             waits: Arc::new(Mutex::new(TurnWaits::default())),
             root_turn: Arc::new(Mutex::new(None)),
             seq: Arc::new(AtomicI64::new(0)),
+            effectful: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -396,6 +409,22 @@ impl RunContext {
     /// How many tool steps have been claimed so far (the post-turn count).
     pub fn steps_count(&self) -> i64 {
         self.seq.load(Ordering::Relaxed)
+    }
+
+    /// Record that this turn was allowed to take an action beyond reading.
+    ///
+    /// Called from one funnel ([`ToolContext::decide`]) plus the tools that
+    /// change state without asking anyone. Monotonic on purpose: a turn that
+    /// wrote a file and then read ten more has still written a file.
+    pub fn note_effectful(&self) {
+        self.effectful.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether anything this turn ran could have changed state outside the
+    /// conversation. `false` means every call it made was read-only — which is
+    /// what makes a reply claiming a completed action worth challenging.
+    pub fn effectful(&self) -> bool {
+        self.effectful.load(Ordering::Relaxed)
     }
 
     /// Keep a settled step, as the log records it.
@@ -802,6 +831,27 @@ impl ToolContext {
     /// [`ToolError::Denied`](crate::domain::tool::ToolError::Denied) so the next
     /// round can correct itself rather than retry verbatim.
     pub async fn decide(&self, request: &ApprovalRequest) -> Decision {
+        let decision = self.decide_inner(request).await;
+        // The one funnel every tool's approval request passes through, and so
+        // the only place that sees both what a call intended and whether it was
+        // let through. A call the tool itself declared above `Risk::Safe` and
+        // that came back allowed is this turn's proof that it was permitted to
+        // change something; `Risk::Safe` is read-only by construction (it is
+        // evaluated deny-only and never prompts), so it proves nothing.
+        //
+        // Recorded on the *decision*, not on the call settling: a tool that
+        // errors after being allowed may still have landed its effect, and the
+        // turn must not be told it changed nothing.
+        if decision.is_allowed()
+            && request.risk != Risk::Safe
+            && let Some(run) = &self.run
+        {
+            run.note_effectful();
+        }
+        decision
+    }
+
+    async fn decide_inner(&self, request: &ApprovalRequest) -> Decision {
         let Some(gate) = &self.approval else {
             return self.approver.decide(request).await;
         };
@@ -1024,6 +1074,67 @@ mod approval_gate_tests {
 
     fn request() -> ApprovalRequest {
         ApprovalRequest::normal("write /tmp/x").with_scope_key("file:write")
+    }
+
+    /// A context carrying a run, so the effect flag has somewhere to land.
+    fn ctx_with_run(decision: Decision, run: RunContext) -> ToolContext {
+        ToolContext::new(
+            SessionContext::detached("s"),
+            Some(run),
+            Arc::new(Fixed(decision)),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_allowed_call_above_safe_marks_the_turn_effectful() {
+        let run = RunContext::new("t1".into());
+        assert!(!run.effectful(), "a turn starts having changed nothing");
+        ctx_with_run(Decision::Allow, run.clone())
+            .decide(&ApprovalRequest::normal("write /tmp/x"))
+            .await;
+        assert!(run.effectful());
+    }
+
+    #[tokio::test]
+    async fn a_safe_call_leaves_the_turn_read_only() {
+        // `Risk::Safe` is read-only by construction — it is evaluated deny-only
+        // and never prompts — so allowing one proves nothing was changed. This
+        // is what lets the loop challenge a reply claiming an action after a
+        // turn that only read.
+        let run = RunContext::new("t1".into());
+        ctx_with_run(Decision::Allow, run.clone())
+            .decide(&ApprovalRequest::safe("read /tmp/x"))
+            .await;
+        assert!(!run.effectful());
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_leaves_the_turn_read_only() {
+        let run = RunContext::new("t1".into());
+        ctx_with_run(Decision::deny_because("no"), run.clone())
+            .decide(&ApprovalRequest::dangerous("rm -rf /", "everything"))
+            .await;
+        assert!(
+            !run.effectful(),
+            "a refused action is one that did not happen"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_effect_flag_is_shared_across_clones() {
+        // The executor clones the run onto every call's context; a flag that
+        // did not travel would report only whatever the last call did.
+        let run = RunContext::new("t1".into());
+        ctx_with_run(Decision::Allow, run.clone())
+            .decide(&ApprovalRequest::normal("write /tmp/x"))
+            .await;
+        ctx_with_run(Decision::Allow, run.clone())
+            .decide(&ApprovalRequest::safe("read /tmp/y"))
+            .await;
+        assert!(
+            run.effectful(),
+            "a turn that wrote and then read has still written"
+        );
     }
 
     #[tokio::test]

@@ -256,6 +256,30 @@ impl Tool for EchoArgsTool {
     }
 }
 
+/// A tool that changes something. It marks the turn the way `memory`'s `save`
+/// does — the state-changing tools that never reach the approver mark
+/// themselves — so the loop can tell it apart from a read.
+struct MutatingTool;
+#[async_trait]
+impl Tool for MutatingTool {
+    fn name(&self) -> &'static str {
+        "switch"
+    }
+    fn description(&self) -> &'static str {
+        "turns something on"
+    }
+    async fn call(
+        &self,
+        _input: serde_json::Value,
+        ctx: &komo_core::domain::context::ToolContext,
+    ) -> Result<ToolOutput, ToolError> {
+        if let Some(run) = &ctx.run {
+            run.note_effectful();
+        }
+        Ok(ToolOutput::text("on"))
+    }
+}
+
 /// A tool that always errors, for asserting failures feed back (not abort).
 struct FailTool;
 #[async_trait]
@@ -2108,10 +2132,10 @@ async fn an_ordinary_reply_is_left_alone() {
     assert!(nudged.lock().unwrap().is_empty());
 }
 
-/// The claim is only suspect when nothing was called: a turn that ran a tool
-/// and then reports what it did is doing exactly the right thing.
+/// A turn that actually changed something and then reports what it did is
+/// doing exactly the right thing.
 #[tokio::test]
-async fn a_claim_after_a_tool_call_is_not_nudged() {
+async fn a_claim_after_an_effectful_call_is_not_nudged() {
     let db = Arc::new(
         Db::connect(&sqlite_url("komo_rt_nudge_after_tool.db"))
             .await
@@ -2120,10 +2144,10 @@ async fn a_claim_after_a_tool_call_is_not_nudged() {
     let (rt, nudged) = scripted_runtime_seeing_nudges(
         db.clone(),
         vec![
-            tool_calls(vec![call("echo", "on")]),
+            tool_calls(vec![call("switch", "on")]),
             Step::Final("已打开".into()),
         ],
-        vec![Arc::new(EchoArgsTool)],
+        vec![Arc::new(MutatingTool)],
         30,
     );
 
@@ -2133,6 +2157,47 @@ async fn a_claim_after_a_tool_call_is_not_nudged() {
         .unwrap();
     assert_eq!(reply, "已打开");
     assert!(nudged.lock().unwrap().is_empty());
+}
+
+/// Having called *a* tool is not the same as having changed anything. The shape
+/// this catches is a model that orients itself with a read and then reports the
+/// action it was about to take as done — which the old "no calls at all" test
+/// let through, because the read counted.
+#[tokio::test]
+async fn a_claim_after_only_read_only_calls_is_nudged() {
+    let db = Arc::new(
+        Db::connect(&sqlite_url("komo_rt_nudge_readonly.db"))
+            .await
+            .unwrap(),
+    );
+    let (rt, nudged) = scripted_runtime_seeing_nudges(
+        db.clone(),
+        vec![
+            tool_calls(vec![call("echo", "state?")]),
+            Step::Final("热水器已打开 ✅".into()),
+            Step::Final("我查到它是开着的，但这一轮我没有执行开关操作。".into()),
+        ],
+        vec![Arc::new(EchoArgsTool)],
+        30,
+    );
+
+    let reply = rt
+        .handle_input("cli:nudge_ro", "打开热水器".into())
+        .await
+        .unwrap();
+    assert_eq!(reply, "我查到它是开着的，但这一轮我没有执行开关操作。");
+
+    // And nudged with the read-only wording, not the "no tool call" one: a turn
+    // that only looked may have *observed* the state it is describing, and
+    // telling it to say the action "was not done" would trade a false claim for
+    // a false denial.
+    let nudges = nudged.lock().unwrap();
+    assert_eq!(nudges.len(), 1);
+    assert!(
+        nudges[0].contains("every tool call this turn was read-only"),
+        "got: {}",
+        nudges[0]
+    );
 }
 
 /// One nudge, then the model's answer stands whatever it says. A model that

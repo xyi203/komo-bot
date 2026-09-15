@@ -206,6 +206,15 @@ impl Tool for MemoryTool {
                     memory.expires_at = Some(now + days * 86_400);
                 }
                 self.memories.save(&memory).await?;
+                // `memory` is the one state-changing tool that never consults
+                // the approver — saving a fact the user just stated is not an
+                // action anybody should have to approve — so it marks the turn
+                // itself. Without this, a turn whose only work was a save is
+                // read-only as far as the runtime can tell, and its honest
+                // "已保存" reads as a claim about something it never did.
+                if let Some(run) = &tool_ctx.run {
+                    run.note_effectful();
+                }
                 let mut out = format!("Saved memory {}.", memory.id);
 
                 let superseded_ids: Vec<String> = superseded.iter().map(|m| m.id.clone()).collect();

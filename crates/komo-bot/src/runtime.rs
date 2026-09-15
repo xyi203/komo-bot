@@ -49,11 +49,29 @@ const BUDGET_REACHED_NOTE: &str = "Tool-call budget for this turn reached; do no
 /// made no tool call at all (see [`claims_completed_action`]). The failure it
 /// answers is real: a non-thinking model asked to 打开热水器 replied "热水器已打开
 /// ✅" having called nothing, and nothing in the runtime could tell.
-const NUDGE_TEXT: &str = "Runtime check: your reply reports that an action was performed or a \
+const NUDGE_NO_CALL: &str = "Runtime check: your reply reports that an action was performed or a \
      state was observed, but this turn issued no tool call. Nothing about the user's devices, \
      files or external systems can be known without a tool call in this turn. If the action is \
      needed, perform it now with the appropriate tool and answer from its result. If you cannot \
      perform it, say plainly that it was not done. Do not restate the previous claim.";
+
+/// The same check one step further out: the turn *did* call tools, but every
+/// one of them was read-only (`Risk::Safe`), so nothing it ran could have
+/// changed what the reply says it changed. The common shape is a model that
+/// orients itself with `read`/`grep`/a state query and then reports the action
+/// it was going to take as done.
+///
+/// Deliberately **not** the same text. A read-only turn may have observed the
+/// state it is describing — "热水器已打开" is both "I turned it on" and "it is
+/// on" — and telling that turn to "say plainly that it was not done" would
+/// trade a false claim for a false denial. So this one offers the observational
+/// reading first and only then the two honest alternatives.
+const NUDGE_NO_EFFECT: &str = "Runtime check: your reply reports that an action was carried out, \
+     but every tool call this turn was read-only — nothing you ran could have changed anything. \
+     If you were describing state you actually observed, say so in observational terms rather \
+     than as an action you performed. If the action is still needed, perform it now with the \
+     appropriate tool and answer from its result. If you cannot perform it, say plainly that it \
+     was not done. Do not restate the previous claim.";
 
 /// Phrases that report a *completed* change to something outside the
 /// conversation. Deliberately explicit and deliberately narrow: a generic 好的 /
@@ -1002,29 +1020,48 @@ impl AgentRuntime {
         let reply = loop {
             match step {
                 Step::Final(text) => {
-                    // The model answered as if it had acted, having called
-                    // nothing — the incident this guard exists for. `rounds`
-                    // covers this loop and `steps_count` the whole turn, so a
-                    // continuation that already ran tools before it was
-                    // suspended is not nudged for the answer it comes back
-                    // with. A turn with no tools at all (every aux runtime) has
-                    // nothing to have called.
+                    // The model answered as if it had acted while nothing it
+                    // ran could have made that true — the incident this guard
+                    // exists for. The question is not whether the turn called a
+                    // tool but whether it was ever *allowed to change
+                    // anything*: a turn that read three files and then reported
+                    // an action is exactly as unfounded as one that called
+                    // nothing, and the narrower "no calls at all" test let it
+                    // through. `RunContext::effectful` is that answer, recorded
+                    // at the approval funnel from the risk each tool declares
+                    // for itself.
+                    //
+                    // Per attempt, like `steps_count` before it: a continuation
+                    // re-dispatches the call that stopped it, so a turn that
+                    // suspended on an approval and came back marks itself when
+                    // that call runs. A runtime with no tools at all (every aux
+                    // one) has nothing to have called.
+                    //
+                    // A turn with no ledger at all reads as "changed nothing",
+                    // the same way it read as "called nothing" before: the
+                    // guard stays armed where it cannot see, and the tool-set
+                    // check below is what actually excludes the aux runtimes.
+                    let no_effect = context.run.as_ref().is_none_or(|run| !run.effectful());
                     if !nudged
-                        && rounds == 0
-                        && context
-                            .run
-                            .as_ref()
-                            .is_none_or(|run| run.steps_count() == 0)
+                        && no_effect
                         && !tools.snapshot().is_empty()
                         && claims_completed_action(&text)
                     {
+                        let called_nothing = context
+                            .run
+                            .as_ref()
+                            .is_none_or(|run| run.steps_count() == 0);
+                        let nudge = match called_nothing {
+                            true => NUDGE_NO_CALL,
+                            false => NUDGE_NO_EFFECT,
+                        };
                         warn!(
                             reply_chars = text.len(),
-                            "reply claims an action but the turn made no tool call; nudging once"
+                            called_nothing,
+                            "reply claims an action the turn was never allowed to take; nudging once"
                         );
                         nudged = true;
-                        match Self::until_cancelled(cancel, driver.nudge(NUDGE_TEXT.to_string()))
-                            .await?
+                        match Self::until_cancelled(cancel, driver.nudge(nudge.to_string())).await?
                         {
                             Some(next) => {
                                 model_rounds += 1;

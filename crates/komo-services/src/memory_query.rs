@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use komo_core::domain::embedding::EmbeddingClient;
 use komo_core::domain::memory::{
-    Memory, MemoryContext, MemoryRepository, RecallQuery, ScoredMemory, select_recall,
+    Memory, MemoryContext, MemoryRepository, RecallQuery, ScoredMemory, SemanticArm, select_recall,
 };
 
 /// Budget for embedding one query. Recall runs on the reply's critical path, so
@@ -87,17 +87,21 @@ impl MemoryQueryService {
             Ok(Ok(mut vectors)) if !vectors.is_empty() => {
                 RecallQuery::semantic(text, vectors.remove(0), embedder.model_id())
             }
+            // All three are `degraded`, not `lexical`: a backend *is*
+            // configured, so the caller has to report a thin result as
+            // incomplete rather than as an answer. Scoring is identical — only
+            // what may be claimed about the outcome changes.
             Ok(Ok(_)) => {
-                tracing::warn!("embedding backend returned no vector — query stays lexical");
-                RecallQuery::lexical(text)
+                tracing::warn!("embedding backend returned no vector — recall degraded to lexical");
+                RecallQuery::degraded(text)
             }
             Ok(Err(error)) => {
-                tracing::warn!(%error, "embedding the query failed — query stays lexical");
-                RecallQuery::lexical(text)
+                tracing::warn!(%error, "embedding the query failed — recall degraded to lexical");
+                RecallQuery::degraded(text)
             }
             Err(_) => {
-                tracing::warn!("embedding the query timed out — query stays lexical");
-                RecallQuery::lexical(text)
+                tracing::warn!("embedding the query timed out — recall degraded to lexical");
+                RecallQuery::degraded(text)
             }
         }
     }
@@ -119,10 +123,26 @@ impl MemoryQueryService {
         text: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<ScoredMemory>> {
+        Ok(self.lookup_reported(ctx, text, limit).await?.0)
+    }
+
+    /// [`lookup`](Self::lookup), also answering whether the semantic half ran.
+    ///
+    /// Separate rather than a changed signature because most callers do not
+    /// need it — but the one that renders "(no matches)" to the model does:
+    /// under [`SemanticArm::Degraded`] an empty result is a fact about the
+    /// backend, not about the library, and reporting it as the latter is how
+    /// the model concludes a memory does not exist.
+    pub async fn lookup_reported(
+        &self,
+        ctx: &MemoryContext,
+        text: &str,
+        limit: usize,
+    ) -> anyhow::Result<(Vec<ScoredMemory>, SemanticArm)> {
         let all = self.memories.list().await?;
         let query = self.build_query(text).await;
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        Ok(select_recall(&all, ctx, &query, limit, now))
+        Ok((select_recall(&all, ctx, &query, limit, now), query.arm()))
     }
 
     /// Embed up to `backfill_batch` memories that lack a vector for the current
@@ -380,9 +400,47 @@ mod tests {
                     hang,
                 }))
                 .with_embed_timeout(Duration::from_millis(20));
-            let hits = service.lookup(&ctx(), "kanban tasks", 5).await.unwrap();
+            let (hits, arm) = service
+                .lookup_reported(&ctx(), "kanban tasks", 5)
+                .await
+                .unwrap();
             assert_eq!(hits.len(), 1, "lexical matching still works");
+            assert_eq!(
+                arm,
+                SemanticArm::Degraded,
+                "a configured backend that did not answer is a fault, and the caller has to be                  able to say so"
+            );
         }
+    }
+
+    /// The distinction the whole type exists for: no backend is a
+    /// configuration, not a fault, and must not make every turn announce a
+    /// degradation that is really just how this deployment is set up.
+    #[tokio::test]
+    async fn no_backend_at_all_is_off_rather_than_degraded() {
+        let store = FakeStore::new(vec![memory(
+            "durable kanban tasks live in kanban.db",
+            MemoryStatus::Active,
+        )]);
+        let service = MemoryQueryService::new(Arc::new(store));
+        let (hits, arm) = service
+            .lookup_reported(&ctx(), "kanban tasks", 5)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(arm, SemanticArm::Off);
+    }
+
+    #[tokio::test]
+    async fn a_working_backend_reports_an_active_arm() {
+        let store = FakeStore::new(vec![memory("kanban tasks", MemoryStatus::Active)]);
+        let service =
+            MemoryQueryService::new(Arc::new(store)).with_embedder(embedder(vec![1.0, 0.0]));
+        let (_, arm) = service
+            .lookup_reported(&ctx(), "kanban tasks", 5)
+            .await
+            .unwrap();
+        assert_eq!(arm, SemanticArm::Active);
     }
 
     #[tokio::test]

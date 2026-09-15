@@ -261,13 +261,20 @@ impl Tool for MemoryTool {
                 let text = args.query.ok_or_else(|| {
                     ToolError::InvalidInput("`query` is required for action=search".to_string())
                 })?;
-                let hits = self
+                let (hits, arm) = self
                     .query
-                    .lookup(&scope, &text, SEARCH_LIMIT)
+                    .lookup_reported(&scope, &text, SEARCH_LIMIT)
                     .await
                     .map_err(ToolError::Failed)?;
-                Ok(ToolOutput::text(render_scored(&hits))
-                    .with_title(format!("{} matches", hits.len())))
+                // "(no matches)" is an answer about the library. With the
+                // semantic half down it is an answer about the backend, and the
+                // model cannot tell the two apart unless told — so say it here,
+                // where it is reading the result.
+                let mut out = render_scored(&hits);
+                if arm.is_degraded() {
+                    out.push_str(SEARCH_DEGRADED_NOTE);
+                }
+                Ok(ToolOutput::text(out).with_title(format!("{} matches", hits.len())))
             }
             other => Err(ToolError::InvalidInput(format!(
                 "unknown action `{other}` (expected save/search)"
@@ -309,6 +316,15 @@ fn render_one(m: &Memory) -> String {
     }
     line
 }
+
+/// Appended to a `search` result whose semantic half did not run. Same fact as
+/// the recall block's note and for the same reason: lexical matching compares
+/// CJK bigrams against ASCII words and can never equate them, so a degraded
+/// search across languages returns nothing — which is indistinguishable from
+/// there being nothing to return.
+const SEARCH_DEGRADED_NOTE: &str = "\n\n(Semantic search was unavailable for this query — \
+    these are literal word-overlap matches only. A memory phrased in another language would \
+    not appear. Do not report an empty result as proof that nothing is stored.)";
 
 fn render_scored(hits: &[ScoredMemory]) -> String {
     if hits.is_empty() {

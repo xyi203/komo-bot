@@ -126,6 +126,80 @@ impl komo_core::domain::embedding::EmbeddingClient for FakeEmbedder {
     }
 }
 
+/// A backend that is configured and does not answer — the shape that makes
+/// recall degraded rather than lexical-by-design.
+struct DeadEmbedder;
+
+#[async_trait]
+impl komo_core::domain::embedding::EmbeddingClient for DeadEmbedder {
+    async fn embed(&self, _texts: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::bail!("backend down")
+    }
+    fn model_id(&self) -> &str {
+        "fake-model"
+    }
+}
+
+fn dead_enricher(store: FakeStore) -> MemoryEnricher {
+    let store = Arc::new(store);
+    let query =
+        Arc::new(MemoryQueryService::new(store.clone()).with_embedder(Arc::new(DeadEmbedder)));
+    MemoryEnricher::new(store, None, query)
+}
+
+/// The case the note exists for. With the semantic half down, a question in
+/// one language retrieves nothing from a library written in another — and
+/// nothing is also what an empty library returns. Silence here is what makes
+/// the model tell the user it has no record of something it holds, so a
+/// degraded turn must produce a block even with zero hits.
+#[tokio::test]
+async fn a_degraded_arm_speaks_up_even_with_nothing_to_show() {
+    let e = dead_enricher(FakeStore::new(Vec::new()));
+    let injection = e
+        .enrich(&Session::new("s"), "我平时用什么语言", &[])
+        .await
+        .expect("a degraded turn must say so rather than return nothing");
+    let recall = injection.recall.expect("a block carrying the note");
+    assert!(recall.contains("[recall degraded]"), "got: {recall}");
+    assert!(
+        recall.contains("do NOT conclude"),
+        "the note has to forbid the inference, not just mention the fault: {recall}"
+    );
+    assert!(
+        injection.used.recall.is_empty(),
+        "nothing was recalled, so nothing may be recorded as having shaped the turn"
+    );
+}
+
+/// And when it does have something, the note rides in front of it rather than
+/// replacing it — the hits are still valid, the set is just incomplete.
+#[tokio::test]
+async fn a_degraded_arm_keeps_the_hits_it_did_find() {
+    let e = dead_enricher(FakeStore::new(vec![active_fact(
+        "m1",
+        "kanban tasks live in kanban.db",
+    )]));
+    let recall = e
+        .enrich(&Session::new("s"), "where do kanban tasks live", &[])
+        .await
+        .expect("hits")
+        .recall
+        .expect("a block");
+    assert!(recall.contains("[recall degraded]"));
+    assert!(recall.contains("kanban.db"), "got: {recall}");
+}
+
+/// No backend configured is a deployment choice, not a fault. Announcing a
+/// degradation every turn would train the model to ignore the note.
+#[tokio::test]
+async fn a_lexical_only_deployment_never_announces_a_degradation() {
+    let e = enricher(FakeStore::new(Vec::new()), None);
+    assert!(
+        e.enrich(&Session::new("s"), "hello", &[]).await.is_none(),
+        "no backend, nothing found: there is nothing to report"
+    );
+}
+
 /// A memory carrying a vector for the fake backend's model.
 fn embedded_fact(id: &str, content: &str, vector: Vec<f32>) -> Memory {
     let mut m = active_fact(id, content);

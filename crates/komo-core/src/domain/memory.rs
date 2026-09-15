@@ -929,6 +929,36 @@ pub const RECALL_SEMANTIC_FLOOR: f32 = 0.45;
 /// evidence still leads when both are present.
 const RECALL_SEMANTIC_WEIGHT: f64 = 3.0;
 
+/// Whether recall's semantic half was actually working for one query.
+///
+/// The three states are answers to different questions, and collapsing them is
+/// what made a failure indistinguishable from an absence. `Off` is a
+/// configuration (lexical-only is the design when no backend is set, and
+/// nothing is wrong); `Degraded` is a fault in *this* turn. The difference
+/// matters because a Chinese question has zero term overlap with an English
+/// memory by construction — so under `Degraded` an empty result set is not
+/// evidence that nothing is stored, and saying it is, is the one thing recall
+/// must never tell the model (docs/bot-v2.md §9.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticArm {
+    /// No embedding backend configured. Lexical-only by design.
+    Off,
+    /// A query vector was produced; both arms ran.
+    Active,
+    /// A backend is configured but produced no usable vector for this query —
+    /// it errored, timed out, or came back empty.
+    Degraded,
+}
+
+impl SemanticArm {
+    /// Whether recall reached less than it was configured to reach, so an
+    /// empty or short result has to be reported as incomplete rather than as
+    /// an answer.
+    pub fn is_degraded(self) -> bool {
+        matches!(self, SemanticArm::Degraded)
+    }
+}
+
 /// One turn's recall query: the lexical terms, plus optionally the embedding
 /// that lets it match memories written in another language.
 ///
@@ -942,15 +972,29 @@ pub struct RecallQuery {
     /// Model that produced `embedding`; only memories carrying the same model's
     /// vector are comparable to it.
     model: String,
+    /// Whether the semantic half ran, was switched off, or failed.
+    arm: SemanticArm,
 }
 
 impl RecallQuery {
-    /// Terms only — the lexical-only path.
+    /// Terms only, because no embedding backend is configured — the
+    /// lexical-only path, working as intended.
     pub fn lexical(text: &str) -> Self {
         Self {
             terms: recall_terms(text),
             embedding: Vec::new(),
             model: String::new(),
+            arm: SemanticArm::Off,
+        }
+    }
+
+    /// Terms only, because the configured backend did not answer. Scores
+    /// exactly like [`lexical`](Self::lexical) — the degradation is in what the
+    /// caller must *say* about the result, not in how it is ranked.
+    pub fn degraded(text: &str) -> Self {
+        Self {
+            arm: SemanticArm::Degraded,
+            ..Self::lexical(text)
         }
     }
 
@@ -960,7 +1004,13 @@ impl RecallQuery {
             terms: recall_terms(text),
             embedding,
             model: model.into(),
+            arm: SemanticArm::Active,
         }
+    }
+
+    /// Whether the semantic half ran, was switched off, or failed this turn.
+    pub fn arm(&self) -> SemanticArm {
+        self.arm
     }
 
     /// Nothing to match on: no terms *and* no vector. (Terms alone being empty

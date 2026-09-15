@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 
 use komo_core::domain::{
     context::ToolContext,
-    todo::{SessionTodoRepository, TodoItem, TodoStatus, parse_todo_status},
+    todo::{SessionTodoRepository, TodoItem, TodoStatus, parse_todo_status, render_todo_list},
     tool::{Tool, ToolError, ToolOutput, parse_args},
 };
 
@@ -45,30 +45,10 @@ impl TodoTool {
 }
 
 /// Render the list plus a one-line summary, the model's view after any op.
+/// Shared with prompt assembly, which carries the same list at the tail of
+/// every user message — see [`render_todo_list`].
 fn render(items: &[TodoItem]) -> String {
-    if items.is_empty() {
-        return "Todo list is empty.".to_string();
-    }
-    let mut out = String::new();
-    for (i, item) in items.iter().enumerate() {
-        let mark = match item.status {
-            TodoStatus::Pending => "[ ]",
-            TodoStatus::InProgress => "[~]",
-            TodoStatus::Completed => "[x]",
-            TodoStatus::Cancelled => "[-]",
-        };
-        out.push_str(&format!("{}. {} {}\n", i + 1, mark, item.content));
-    }
-    let active = items.iter().filter(|t| t.status.is_active()).count();
-    let in_progress = items
-        .iter()
-        .filter(|t| t.status == TodoStatus::InProgress)
-        .count();
-    out.push_str(&format!(
-        "({} items, {active} active, {in_progress} in progress)",
-        items.len()
-    ));
-    out
+    render_todo_list(items)
 }
 
 #[async_trait]

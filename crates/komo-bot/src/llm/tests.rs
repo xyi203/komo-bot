@@ -359,8 +359,8 @@ async fn the_artifacts_directory_reaches_the_model_after_the_user_message() {
         "/komo/artifacts",
     )));
     let llm = llm_with(TurnInjections {
-        enricher: None,
         artifacts: Some(store.clone()),
+        ..TurnInjections::default()
     });
     let session = asked("写个报告");
     let dir = store.session_dir(&session.id).display().to_string();
@@ -402,6 +402,84 @@ async fn a_runtime_without_an_artifacts_grant_says_nothing_about_it() {
     let llm = llm_with(TurnInjections::default());
     let (_, prompt, _, _) = llm.assemble(&asked("写个报告")).await.unwrap();
     assert_eq!(prompt, "写个报告");
+}
+
+/// A fake todo store, so `assemble` can be asked what it carries.
+struct FixedTodos(Vec<komo_core::domain::todo::TodoItem>);
+
+#[async_trait::async_trait]
+impl komo_core::domain::todo::SessionTodoRepository for FixedTodos {
+    async fn get(&self, _s: &str) -> anyhow::Result<Vec<komo_core::domain::todo::TodoItem>> {
+        Ok(self.0.clone())
+    }
+    async fn set(&self, _s: &str, _i: &[komo_core::domain::todo::TodoItem]) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn clear(&self, _s: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+fn item(
+    content: &str,
+    status: komo_core::domain::todo::TodoStatus,
+) -> komo_core::domain::todo::TodoItem {
+    komo_core::domain::todo::TodoItem {
+        content: content.to_string(),
+        status,
+        active_form: String::new(),
+    }
+}
+
+/// The plan the model wrote for itself rides at the tail of the user message,
+/// for the same reason the artifacts note does — and because a tool result is
+/// a message, so on any task long enough to need a plan the original `todo`
+/// call has left the replayed window while the work is still going.
+#[tokio::test]
+async fn the_working_plan_reaches_the_model_after_the_user_message() {
+    use komo_core::domain::todo::TodoStatus;
+    let llm = llm_with(TurnInjections {
+        todos: Some(Arc::new(FixedTodos(vec![
+            item("read the parser", TodoStatus::Completed),
+            item("fix the off-by-one", TodoStatus::InProgress),
+            item("add a regression test", TodoStatus::Pending),
+        ]))),
+        ..TurnInjections::default()
+    });
+
+    let (preamble, prompt, _, _) = llm.assemble(&asked("继续")).await.unwrap();
+    assert!(prompt.starts_with("继续"), "user's words first: {prompt}");
+    assert!(prompt.contains("fix the off-by-one"), "{prompt}");
+    assert!(prompt.contains("[~]"), "in-progress is marked: {prompt}");
+    assert!(
+        prompt.contains("(3 items, 2 active, 1 in progress)"),
+        "the shared renderer's summary line: {prompt}"
+    );
+    assert!(
+        !preamble.contains("off-by-one"),
+        "per-session state must stay out of the cached prefix"
+    );
+}
+
+/// An empty list says nothing. Most turns have one, and a task short enough to
+/// skip the todo tool must not start paying for a block announcing that.
+#[tokio::test]
+async fn an_empty_plan_costs_the_prompt_nothing() {
+    let llm = llm_with(TurnInjections {
+        todos: Some(Arc::new(FixedTodos(Vec::new()))),
+        ..TurnInjections::default()
+    });
+    let (_, prompt, _, _) = llm.assemble(&asked("你好")).await.unwrap();
+    assert_eq!(prompt, "你好");
+}
+
+/// A runtime with no todo grant is told nothing — a cron job or a delegation
+/// is one turn, so its list is still on screen when it ends.
+#[tokio::test]
+async fn a_runtime_without_a_todo_grant_says_nothing_about_it() {
+    let llm = llm_with(TurnInjections::default());
+    let (_, prompt, _, _) = llm.assemble(&asked("你好")).await.unwrap();
+    assert_eq!(prompt, "你好");
 }
 
 /// A turn resumed **twice**: A died after a round, B (resumed from A) died

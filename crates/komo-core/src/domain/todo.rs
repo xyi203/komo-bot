@@ -52,6 +52,39 @@ pub struct TodoItem {
     pub active_form: String,
 }
 
+/// The model's view of a todo list: one line per item, then a one-line count.
+///
+/// Lives here rather than beside the `todo` tool because two surfaces render
+/// it — the tool's own result, and the copy prompt assembly carries at the tail
+/// of every user message. Two renderers would be two answers to "what does the
+/// list look like", and the drift would show up as the model believing its plan
+/// changed shape between reading it and being shown it.
+pub fn render_todo_list(items: &[TodoItem]) -> String {
+    if items.is_empty() {
+        return "Todo list is empty.".to_string();
+    }
+    let mut out = String::new();
+    for (i, item) in items.iter().enumerate() {
+        let mark = match item.status {
+            TodoStatus::Pending => "[ ]",
+            TodoStatus::InProgress => "[~]",
+            TodoStatus::Completed => "[x]",
+            TodoStatus::Cancelled => "[-]",
+        };
+        out.push_str(&format!("{}. {} {}\n", i + 1, mark, item.content));
+    }
+    let active = items.iter().filter(|t| t.status.is_active()).count();
+    let in_progress = items
+        .iter()
+        .filter(|t| t.status == TodoStatus::InProgress)
+        .count();
+    out.push_str(&format!(
+        "({} items, {active} active, {in_progress} in progress)",
+        items.len()
+    ));
+    out
+}
+
 /// Per-session storage for the working todo list. Keyed by session id; an
 /// absent session reads as an empty list.
 #[async_trait]

@@ -22,6 +22,7 @@ use komo_core::domain::{
         AssistantRoundEvent, HeaderReason, MessageSource, RequestHeaderEvent, SessionEvent,
         SessionEventKind, SurfacePlacement, TurnRecorder, UserMessageEvent, fold_request_header,
     },
+    todo::{SessionTodoRepository, TodoItem, render_todo_list},
 };
 use komo_provider::{
     AssistantBlock, Auth, Completion, Delta, Endpoint, LlmError, LlmErrorKind, ProviderClient,
@@ -43,11 +44,11 @@ pub type PreambleFn = Arc<dyn Fn(&[String]) -> String + Send + Sync>;
 
 /// What a runtime may add to the tail of a turn's user message.
 ///
-/// Both vary per turn or per session, which is precisely why they live here
-/// rather than in the system prompt: the provider cache prefix runs tools →
+/// All of them vary per turn or per session, which is precisely why they live
+/// here rather than in the system prompt: the provider cache prefix runs tools →
 /// system → messages, so anything that moves that often must land where the new
-/// bytes already are. Both are granted per runtime — an aux or delegate
-/// sub-agent gets neither.
+/// bytes already are. Each is granted per runtime — an aux or delegate
+/// sub-agent gets none of them.
 #[derive(Clone, Default)]
 pub struct TurnInjections {
     /// Per-turn memory enrichment. `Some` only for the main agent — aux/delegate
@@ -59,6 +60,36 @@ pub struct TurnInjections {
     /// names this session's own subdirectory; the workspace is what makes it
     /// writable (docs/bot-runtime.md §5.16).
     pub artifacts: Option<Arc<ArtifactStore>>,
+    /// This session's working todo list, for a runtime that has the `todo` tool.
+    ///
+    /// The list is already session state (`session_todo_records`, cleared at a
+    /// `/new` boundary); what it was missing is a way to stay *in front of* the
+    /// model. It reached the model only as a tool result, and a tool result is
+    /// a message — so on any task long enough to need a plan, the plan scrolls
+    /// out of the `max_history_messages` window while the work it describes is
+    /// still going. The prompt then tells the model not to spend a round on
+    /// bookkeeping, which is the one move that would have brought it back.
+    ///
+    /// Re-read per turn rather than cached: the model rewrites the list through
+    /// the tool mid-turn, and a stale copy is worse than none.
+    pub todos: Option<Arc<dyn SessionTodoRepository>>,
+}
+
+/// The working plan, carried at the tail of every user message.
+///
+/// Says *what it is for* rather than only showing the list: without the second
+/// sentence the block reads as a reminder to keep the list tidy, which is the
+/// bookkeeping-for-its-own-sake the todo guidance spends its length heading
+/// off. What earns its place is that the list is now authoritative — the model
+/// no longer has to remember, or re-read, what it set out to do.
+fn todo_note(items: &[TodoItem]) -> String {
+    format!(
+        "[plan] Your current todo list for this conversation, as it stands now:\n{}\n\
+         This is the authoritative copy — earlier versions of it have scrolled out of the \
+         replayed history. Work the next unfinished item rather than re-deriving the plan, \
+         and update it through the `todo` tool in the same round as real work.",
+        render_todo_list(items)
+    )
 }
 
 /// The line that tells the model where its own output belongs. Deliberately
@@ -495,6 +526,23 @@ impl ProviderLlm {
         // different cached prefix.
         if let Some(artifacts) = &self.injections.artifacts {
             prompt = format!("{prompt}\n\n{}", artifacts_note(artifacts, &session.id));
+        }
+
+        // The plan the model wrote for itself, kept in front of it. An empty
+        // list costs nothing — most turns have one, and a task short enough to
+        // skip the todo tool must not start paying for a block that says so.
+        //
+        // A read failure is silence, not an error: the todo list is working
+        // state, and no turn should fail to answer because its plan could not
+        // be loaded.
+        if let Some(todos) = &self.injections.todos {
+            match todos.get(&session.id).await {
+                Ok(items) if !items.is_empty() => {
+                    prompt = format!("{prompt}\n\n{}", todo_note(&items));
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "failed to load the todo list for this turn"),
+            }
         }
 
         Ok((preamble, prompt, history, memories))

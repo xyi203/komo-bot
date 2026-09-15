@@ -753,6 +753,13 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
         TurnInjections {
             enricher: Some(enricher),
             artifacts: Some(artifacts.clone()),
+            // The conversation only, like the enricher above — and for a
+            // reason of its own: what this fixes is the plan scrolling out of
+            // the replayed window between turns, which cannot happen to a
+            // runtime whose turns never have a next one. A cron job or a
+            // delegation is one turn, so its list is still on screen when it
+            // ends.
+            todos: Some(db.clone()),
         },
         None,
     )?;
@@ -818,6 +825,7 @@ pub async fn build(config: &ConfigSnapshot, db: Arc<Db>) -> anyhow::Result<Wirin
         TurnInjections {
             enricher: None,
             artifacts: Some(artifacts.clone()),
+            todos: None,
         },
         Some("cron"),
     )?;

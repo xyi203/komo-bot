@@ -271,7 +271,9 @@ const TODO_GUIDANCE: &str = "The `todo` list is for longer, non-trivial work \
     short linear tasks — roughly three obvious steps or fewer, like \
     commit-and-push. When you do keep a list, never spend a round on bookkeeping \
     alone: batch the todo status update into the same round as your next real \
-    tool call.";
+    tool call. When the current list is shown to you at the end of the user \
+    message, that is the authoritative copy — work the next unfinished item \
+    rather than calling `todo` to read it back.";
 
 /// Gated on the `ask_user` tool.
 const CLARIFY_GUIDANCE: &str = "When a key parameter is ambiguous, the target of an \

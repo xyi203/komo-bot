@@ -286,7 +286,16 @@ impl CancelSignal for WatchCancel {
 /// between [`ChatApprover`] (registers/awaits) and [`GatewayDispatcher`]
 /// (resolves on `/approve`).
 pub struct ApprovalState {
-    pending: Mutex<HashMap<String, PendingApproval>>,
+    /// What each session has been asked and not yet answered, oldest first.
+    ///
+    /// A **list**, because one round can gate several calls ("打开热水器和空调"
+    /// is two), and they are one question to the person reading them. As a
+    /// single slot the newest prompt silently replaced the rest, which cost two
+    /// things: the GUI modal could only ever render the last one, and
+    /// [`resolve_scoped`](Self::resolve_scoped) read its risk off that same
+    /// slot — so a dangerous action followed by an ordinary one lost the
+    /// narrowing that keeps "always" from ever applying to the dangerous one.
+    pending: Mutex<HashMap<String, Vec<PendingApproval>>>,
     approved: Mutex<HashMap<String, HashSet<String>>>,
     /// Per-session serialization gate. A round's tool calls now run
     /// concurrently (`AgentRuntime::run_agent_loop`), so two side-effecting
@@ -319,17 +328,24 @@ impl ApprovalState {
             .clone()
     }
 
-    /// Note what `session` is being asked, for the GUI's approval modal.
+    /// Note what `session` is being asked, for the GUI's approval modal, and
+    /// answer how many questions are now outstanding for it.
     ///
-    /// A cache of the prompt, not the wait itself: the wait is
+    /// A cache of the prompts, not the waits themselves: a wait is
     /// `turn/suspended` plus its registration, and this is lost on a restart
-    /// while those are not. Replaces any prior prompt for the session — the
-    /// newest question is the one on screen.
-    fn note_pending(&self, session: &str, info: PendingApproval) {
-        self.pending
-            .lock()
-            .unwrap()
-            .insert(session.to_string(), info);
+    /// while those are not. Appends rather than replaces — a round's questions
+    /// accumulate and are answered together.
+    fn note_pending(&self, session: &str, info: PendingApproval) -> usize {
+        let mut pending = self.pending.lock().unwrap();
+        let list = pending.entry(session.to_string()).or_default();
+        // Keyed on the summary, which is what the person actually reads. Two
+        // entries saying the same sentence are one question however many calls
+        // produced them, and a re-dispatch that asks again must not make the
+        // round look longer than it is.
+        if !list.iter().any(|p| p.summary == info.summary) {
+            list.push(info);
+        }
+        list.len()
     }
 
     /// Deliver `decision` to the approver waiting on `session`. Returns whether
@@ -349,18 +365,37 @@ impl ApprovalState {
     /// through, rather than at each grant-recording site — one of those is easy
     /// to add and forget.
     pub fn resolve_scoped(&self, session: &str, decision: Answer) -> Option<Answer> {
-        let info = self.pending.lock().unwrap().remove(session)?;
-        Some(match info.risk == "dangerous" {
+        let pending = self.pending.lock().unwrap().remove(session)?;
+        if pending.is_empty() {
+            return None;
+        }
+        // **Any** dangerous action in the batch narrows the whole answer. One
+        // `/approve` covers every question the round asked, so the strictest
+        // one present decides what that answer may widen to — reading the risk
+        // off one of them would let an ordinary action carry a grant for the
+        // irreversible one standing beside it.
+        Some(match pending.iter().any(|p| p.risk == "dangerous") {
             true => narrow_unknown(decision),
             false => decision,
         })
+    }
+
+    /// How many questions `session` is currently holding, for prompt wording.
+    fn pending_count(&self, session: &str) -> usize {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(session)
+            .map_or(0, Vec::len)
     }
 
     /// The structured description of the approval pending for `session`, if any.
     /// Backs the HTTP `GET /api/interactions/{session}` poll the GUI uses to
     /// render an approval modal (chat channels instead see it via the sink).
     pub fn pending_info(&self, session: &str) -> Option<PendingApproval> {
-        self.pending.lock().unwrap().get(session).cloned()
+        // The oldest outstanding one: the modal renders the question at the
+        // front of the queue, and answering it answers the round.
+        self.pending.lock().unwrap().get(session)?.first().cloned()
     }
 
     /// Drop any pending approval for `session` without resolving it (the waiter
@@ -481,8 +516,15 @@ impl ChatApprover {
             return Decision::Allow;
         }
 
+        // Recorded before the prompt is sent, so the prompt can say where this
+        // question sits in the round. Safe to do first: the gate mutex above
+        // serializes the round's calls, and a send that fails drops it again.
+        let position = self
+            .state
+            .note_pending(&ctx.session_id, PendingApproval::from_request(request));
+
         let channel = ctx.channel_name().to_string();
-        if let Err(error) = ctx.sink.send(&prompt(request, &channel)).await {
+        if let Err(error) = ctx.sink.send(&prompt(request, &channel, position)).await {
             warn!(%error, "failed to send approval prompt; denying");
             return Decision::deny();
         }
@@ -492,23 +534,35 @@ impl ChatApprover {
         // GUI's modal) writes the answer into the log, and the turn is
         // continued then, in this process or the next one.
         //
-        // The pending info still goes into memory: it is what the GUI's
+        // The pending info is already in memory (above): it is what the GUI's
         // approval modal polls. It is a *cache* — a restart loses it, exactly
         // as it lost the whole approval before — while the answer itself is
         // durable.
-        self.state
-            .note_pending(&ctx.session_id, PendingApproval::from_request(request));
         Decision::Suspend
     }
 }
 
-fn prompt(request: &ApprovalRequest, channel: &str) -> String {
+/// Render the question for the chat. `position` is this request's place in the
+/// round — 1 for the first, higher for each sibling gated in the same round.
+///
+/// A round can gate several calls ("打开热水器和空调" is two), and they are one
+/// question to the person reading them: a single `/approve` answers every one
+/// the round has asked. The second and later prompts therefore name the action
+/// and say so, instead of repeating a full menu that reads like a second,
+/// independent decision to make.
+fn prompt(request: &ApprovalRequest, channel: &str, position: usize) -> String {
     let mut s = match request.risk {
         Risk::Dangerous => format!("🛑 需要审批（危险操作）：{}", request.summary),
         _ => format!("⚠️ 需要审批：{}", request.summary),
     };
     if let Some(detail) = &request.detail {
         s.push_str(&format!("\n（{detail}）"));
+    }
+    if position > 1 {
+        s.push_str(&format!(
+            "\n（本轮第 {position} 项，与上面的一起，一次 /approve 全部批准 · /deny 全部拒绝）"
+        ));
+        return s;
     }
     s.push_str(
         "\n回复 /approve 批准本次 · /approve session 批准本会话内同类操作 · \
@@ -869,6 +923,42 @@ async fn requested_call_index(
             _ => None,
         })
         .unwrap_or(0)
+}
+
+/// Every call in `turn_id` whose approval was asked for and never answered,
+/// oldest first, as `(call_id, call_index)`.
+///
+/// This set is exactly "the questions the person has been shown and has not
+/// answered", which is what makes it safe to resolve together.
+/// `ToolContext::decide` writes `approval/requested` *before* it consults the
+/// approver, and every path that does not suspend writes an
+/// `approval/resolved` of its own — a rung above the human allowing it, a
+/// policy denying it, even a prompt that failed to send. So a request left
+/// unresolved can only be one the approver suspended on, and the approver
+/// suspends only after the prompt is out.
+async fn open_approval_requests(
+    waits: &WaitParts,
+    session_id: &str,
+    turn_id: &str,
+) -> Vec<(String, u32)> {
+    let Ok(events) = waits.events.events(session_id).await else {
+        return Vec::new();
+    };
+    let mut open: Vec<(String, u32)> = Vec::new();
+    for event in &events {
+        match &event.kind {
+            SessionEventKind::ApprovalRequested(requested) if requested.turn_id == turn_id => {
+                if !open.iter().any(|(id, _)| *id == requested.call_id) {
+                    open.push((requested.call_id.clone(), requested.call_index));
+                }
+            }
+            SessionEventKind::ApprovalResolved(resolved) if resolved.turn_id == turn_id => {
+                open.retain(|(id, _)| *id != resolved.call_id);
+            }
+            _ => {}
+        }
+    }
+    open
 }
 
 /// How many mid-turn messages a session may queue before further ones are
@@ -1467,27 +1557,59 @@ impl GatewayDispatcher {
             Answer::Deny(reason) => (false, reason.clone().unwrap_or_default()),
             _ => (true, String::new()),
         };
-        let resolved = SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
-            turn_id: turn_id.clone(),
-            call_id: call_id.clone(),
-            call_index: self
+        // Every question this turn has open, not just the one the wait names.
+        //
+        // A round's calls run concurrently, so one instruction ("打开热水器和空调")
+        // gates several of them and the person is shown a prompt for each. Only
+        // the first records a suspension — `RunContext::suspend` keeps one per
+        // turn — so answering only that one left the rest to ask again after the
+        // turn resumed, turning one instruction into an approval round-trip per
+        // action. They were all read before the answer was typed; they are one
+        // question, and this is the one answer.
+        //
+        // Falls back to the wait's own call if the log cannot be read: answering
+        // one is what this did before, and is never worse than answering none.
+        let mut open = open_approval_requests(&waits, &registration.session_id, &turn_id).await;
+        if !open.iter().any(|(id, _)| *id == call_id) {
+            let index = self
                 .requested_call_index(&waits, &registration.session_id, &turn_id, &call_id)
-                .await,
-            allowed,
-            decided_by: DECIDED_BY_HUMAN.to_string(),
-            reason,
-            // How long the person took, from the wait being registered. The
-            // question is "did somebody think about this", and the registration
-            // is when it was put in front of them.
-            waited_ms: (now_secs() - registration.created_at).max(0) * 1_000,
-        });
+                .await;
+            open.push((call_id.clone(), index));
+        }
+        // From the wait being registered: the question is "did somebody think
+        // about this", and the registration is when it was put in front of them.
+        let waited_ms = (now_secs() - registration.created_at).max(0) * 1_000;
+        let answered: Vec<SessionEventKind> = open
+            .iter()
+            .map(|(id, index)| {
+                SessionEventKind::ApprovalResolved(ApprovalResolvedEvent {
+                    turn_id: turn_id.clone(),
+                    call_id: id.clone(),
+                    call_index: *index,
+                    allowed,
+                    decided_by: DECIDED_BY_HUMAN.to_string(),
+                    reason: reason.clone(),
+                    waited_ms,
+                })
+            })
+            .collect();
+        let resolved_count = answered.len();
+        // One append, so the round's answers land together or not at all — a
+        // half-written batch would run some of the calls and re-ask for the rest.
         if let Err(error) = waits
             .events
-            .append(&registration.session_id, vec![resolved])
+            .append(&registration.session_id, answered)
             .await
         {
             warn!(%error, turn = %turn_id, "failed to record an approval answer");
             return Answered::Nothing;
+        }
+        if resolved_count > 1 {
+            info!(
+                turn = %turn_id,
+                calls = resolved_count,
+                "one answer resolved the round's approvals"
+            );
         }
         // Durable before the turn acts on it: an allow the log would forget is
         // an action nobody approved.
@@ -1510,12 +1632,19 @@ impl GatewayDispatcher {
         // and the key that defines "same kind" is the one the gate recorded
         // when it asked — the in-memory prompt that used to carry it is gone
         // once the turn suspends.
-        if matches!(answer, Answer::Session | Answer::Always)
-            && let Some(key) = self
-                .requested_scope_key(&waits, &registration.session_id, &turn_id, &call_id)
-                .await
-        {
-            self.approvals.remember(&registration.session_id, &key);
+        //
+        // Every call the answer covered, not only the wait's own: the point of
+        // "for this session" is not to be asked again, and remembering one of a
+        // round's two keys would have the other prompt on the very next turn.
+        if matches!(answer, Answer::Session | Answer::Always) {
+            for (id, _) in &open {
+                if let Some(key) = self
+                    .requested_scope_key(&waits, &registration.session_id, &turn_id, id)
+                    .await
+                {
+                    self.approvals.remember(&registration.session_id, &key);
+                }
+            }
         }
 
         let cause = match allowed {

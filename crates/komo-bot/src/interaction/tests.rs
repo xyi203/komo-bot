@@ -118,6 +118,84 @@ async fn a_noted_prompt_is_visible_until_it_is_answered() {
     assert!(!state.resolve("s1", Answer::Once));
 }
 
+/// One round can gate several calls ("打开热水器和空调" is two), and they are
+/// one question to the person reading them — so they queue rather than
+/// replacing each other. As a single slot the newest prompt overwrote the rest.
+#[tokio::test]
+async fn a_rounds_questions_queue_instead_of_replacing_each_other() {
+    let state = ApprovalState::new();
+    assert_eq!(
+        state.note_pending(
+            "s1",
+            PendingApproval {
+                summary: "switch.turn_on".to_string(),
+                ..sample_pending()
+            }
+        ),
+        1
+    );
+    assert_eq!(
+        state.note_pending(
+            "s1",
+            PendingApproval {
+                summary: "climate.set_temperature".to_string(),
+                ..sample_pending()
+            }
+        ),
+        2,
+        "the second question is the round's second, not a replacement"
+    );
+    assert_eq!(
+        state.pending_info("s1").map(|p| p.summary),
+        Some("switch.turn_on".to_string()),
+        "the modal renders the front of the queue, not the last to arrive"
+    );
+    // Re-asking the same thing does not make the round look longer.
+    assert_eq!(
+        state.note_pending(
+            "s1",
+            PendingApproval {
+                summary: "switch.turn_on".to_string(),
+                ..sample_pending()
+            }
+        ),
+        2
+    );
+    // One answer clears the whole round.
+    assert!(state.resolve("s1", Answer::Once));
+    assert!(state.pending_info("s1").is_none());
+}
+
+/// The reason the queue had to stop being a single slot. `resolve_scoped` reads
+/// the risk off what is pending, so an ordinary action arriving after a
+/// dangerous one used to overwrite it — and with it the narrowing that keeps
+/// "always" from ever applying to the irreversible one.
+#[tokio::test]
+async fn a_dangerous_question_narrows_the_answer_even_beside_an_ordinary_one() {
+    let state = ApprovalState::new();
+    state.note_pending(
+        "s1",
+        PendingApproval {
+            summary: "rm -rf /data".to_string(),
+            detail: None,
+            risk: "dangerous".to_string(),
+        },
+    );
+    state.note_pending(
+        "s1",
+        PendingApproval {
+            summary: "write a file".to_string(),
+            detail: None,
+            risk: "normal".to_string(),
+        },
+    );
+    assert_eq!(
+        state.resolve_scoped("s1", Answer::Always),
+        Some(Answer::Once),
+        "the strictest question in the batch decides what the one answer may widen to"
+    );
+}
+
 /// A dangerous action is approved for the one call it was asked about,
 /// whatever the user typed: widening pre-approves a *later* deletion nobody
 /// has seen.

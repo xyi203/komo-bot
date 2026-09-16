@@ -1,0 +1,29 @@
+[package]
+name = "komo-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：gateway 看不到 toasty 类型（store 只通过 runtime 的构造函数暴露），也看不到 ratatui。
+[dependencies]
+komo-kernel = { workspace = true }
+komo-runtime = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal", "fs"] }
+reqwest = { workspace = true }
+openlark = { workspace = true, optional = true }
+wechatbot = { workspace = true, optional = true }
+qrcode = { workspace = true, optional = true }
+
+[features]
+# §13.4：三个渠道各自一个 feature，默认全开。feature 的用处不是裁功能，是让
+# `cargo tree -d` 能按渠道归因重复版本，以及某家 SDK 坏掉时能单独关掉它继续构建。
+default = ["feishu", "telegram", "wechat"]
+feishu = ["dep:openlark"]
+telegram = []
+wechat = ["dep:wechatbot", "dep:qrcode"]
+
+[dev-dependencies]
+komo-kernel = { workspace = true, features = ["test-support"] }

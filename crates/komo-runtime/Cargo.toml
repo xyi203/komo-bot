@@ -1,0 +1,17 @@
+[package]
+name = "komo-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：日常改动落在这里；它从不重新展开 toasty 宏。
+[dependencies]
+komo-kernel = { workspace = true }
+komo-store = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "process", "io-util"] }
+arc-swap = { workspace = true }
+
+[dev-dependencies]
+komo-kernel = { workspace = true, features = ["test-support"] }

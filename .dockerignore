@@ -1,8 +1,0 @@
-# Keep the build context small and the image clean.
-target/
-.git/
-.github/
-# Never bake local state/secrets into an image layer.
-**/*.db
-.env
-*.log

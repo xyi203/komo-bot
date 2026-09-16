@@ -1,0 +1,25 @@
+[package]
+name = "komo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：clap 分发；`komo` / `komo resume` → client 的 TUI；操作子命令 → client；
+# `komo gateway` → gateway。rustls 只为在 main 里安装 ring provider。
+[[bin]]
+name = "komo"
+path = "src/main.rs"
+
+[dependencies]
+komo-client = { workspace = true }
+komo-gateway = { workspace = true }
+clap = { workspace = true }
+rustls = { workspace = true }
+
+[features]
+# 渠道 feature 的直通口，好让 `cargo build --no-default-features` 在工作区根部也有意义。
+default = ["feishu", "telegram", "wechat"]
+feishu = ["komo-gateway/feishu"]
+telegram = ["komo-gateway/telegram"]
+wechat = ["komo-gateway/wechat"]

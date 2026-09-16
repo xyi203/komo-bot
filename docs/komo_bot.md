@@ -4,7 +4,7 @@
 
 本文定义一个全新项目。Komo 是程序名称；架构只依据本文的需求与约束。
 
-v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；工程结构改为六个 crate，编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，审批主要在聊天里完成（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）。全新实现，不迁移旧代码与旧数据。
+v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；工程结构改为六个 crate，编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，审批主要在聊天里完成（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env / policy.toml 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
 
 ## 1. 已确定的范围
 
@@ -90,10 +90,10 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector         |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |
-| `komo config check`                          | 校验各模型、effort、向量参数及其他配置                                      |
+| `komo config check`                          | 校验各模型、effort、向量参数、渠道名单及其他配置；只读，不改变运行中的 Gateway |
+| `komo config reload`                         | 让 Gateway 立即重载配置（等价于文件保存后的自动重载或 `SIGHUP`）；校验失败则保留旧配置并返回错误 |
 | `komo channel list/probe`                    | 渠道清单与连通性核对（飞书 tenant token、Telegram `getMe`、微信凭证文件）；不经 Gateway |
 | `komo channel wechat login`                  | 终端显示二维码完成微信登录，凭证写入数据目录                                |
-| `komo pair approve/revoke/list`              | 准入聊天发送者（§11.2）                                                     |
 | `komo skills list/inspect/enable/disable`    | Skills 目录（§5.6）；只读文件系统，不经 Gateway                             |
 
 聊天启动顺序：
@@ -107,6 +107,15 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 Gateway 获得数据目录进程锁并完成存储校验后，自动扫描未完成运行；不必等用户打开 CLI 或发送 resume。恢复与新请求共用调度器，恢复扫描本身不等待全部旧任务完成才提供服务。
 
 Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许一个 Gateway 接管实例；启动失败不能通过删除仍有效的锁来强行重试。
+
+**配置热重载。** `config.toml`、`.env`、`policy.toml` 改了不用重启 Gateway。三个触发方式落到同一个函数：文件 mtime 变化（每秒轮询一次，不引入 inotify 依赖，编辑器的临时文件与原子替换都覆盖到）、`komo config reload`、`SIGHUP`。流程固定：
+
+1. 重新解析三个文件成一份**完整的**新快照，跑与 `komo config check` 相同的校验；任何错误 → 旧快照原样保留，错误写日志并投递到 home chat，重载命令返回该错误。**校验不过的配置永远不会被装上**，哪怕只错一个键。
+2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（arc-swap）。**读配置的地方按用途读当前快照，不缓存**：Dispatcher 判定 Principal 时读 `allow_from` / `groups`，Notifier 解析 home chat 时读 `home_chat`，Policy 每次决策读规则，新 Run 在 `accept_input` 时抓一份模型 / effort 快照存进 `runs.config_snapshot`——所以名单改完，下一条消息就按新名单判；策略改完，下一次决策就按新规则；模型改完，下一个 Run 用新模型，**正在跑的 Run 与后台记忆任务继续用它们各自开始时抓的快照**（§13.3），不在半路换模型。
+3. 逐段比对新旧快照，只重建变化了的东西：某个 `[channels.*]` 的 `enabled` 或凭证变了 → 只停掉并重启那个渠道的 `serve`（飞书重连 ws、Telegram 重新起轮询），其他渠道不受影响，未 ack 的入站消息按平台的至少一次投递重来；模型 `base_url` / 凭证变了 → 换掉对应 `LlmClient` 实例；向量模型变了 → 走 §9.5 的空间指纹与索引代次流程，不在重载里偷偷重建索引。
+4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径、Python 环境根目录。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
+
+重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
 Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台形式的 Gateway。Mac 若后续需要操作用户桌面应用，应按登录用户的执行环境配置。后台服务不会让睡眠中的电脑继续执行任务。[Fedora systemd](https://fedoraproject.org/wiki/Packaging:Systemd) · [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
 
@@ -837,7 +846,7 @@ komo cron remove JOB_ID
 Telegram long polling ─┤
 WeChat iLink (DM) ─────┼─→ Dispatcher::handle(InboundMessage)
 HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的请求键）
-                              2. 解析 Principal（allow_from / pairing）
+                              2. 解析 Principal（config.toml 的 `allow_from`）
                               3. 解析 Conversation → SessionId
                               4. 冲刷该会话 pending 的投递（§11.4）
                               5. 命令？→ 直接处理并 ack
@@ -846,14 +855,45 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的�
                              审批请求、needs_attention 走 Notifier（§11.4）
 ```
 
-- `request_key`：飞书是 `feishu:{chat_id}:{message_id}`，Telegram 是 `telegram:{chat_id}:{update_id}`，WeChat 是 `wechat:{from}:{msg_id}`。三个平台都是至少一次投递（飞书 ws 断线重连后会重推未 ack 的事件），重发命中同一 Run；**命令也去重**——重发的 `/approve` 不会批准两次。这正是 §8.5 请求键的语义，不另做 inbox 表。
+- `request_key`：飞书是 `feishu:{event_id}`（`header.event_id`，消息事件与卡片回调同一个字段；官方对 2.0 事件的去重建议就是「通过事件结构中的 `event_id` 字段判断事件唯一性」），Telegram 是 `telegram:{update_id}`（long polling 重投的单位是整个 `Update`，`offset` 未推进就原样再取一次，普通消息与 `callback_query` 因此共用这一个键），WeChat 是 `wechat:{from}:{msg_id}`。不带 `chat_id` 前缀：两个 id 在单个应用 / 单个 bot 内已唯一，而 Telegram inline 模式的按钮回调根本没有 chat，硬拼会逼出占位值。三个平台都是至少一次投递（飞书官方原话「即使成功接收，仍会收到重复消息」；未在 3 秒内响应会按 15s / 5min / 1h / 6h 重推最多 4 次，ws 长连接同样有超时重推），重发命中同一 Run；**命令也去重**——重发的 `/approve` 不会批准两次。这正是 §8.5 请求键的语义，不另做 inbox 表。
+- **去重键只管平台重投，不管用户连点**：两次真实点击带着两个不同的 `event_id` / `update_id`，是两条合法输入。挡住它的是审批本身的幂等（§11.3：已决定的返回原决定）。两层分开，不要用组合键去兼职。
 - 飞书 ws 在独立线程上跑 openlark 的运行时，事件通过 channel 交给 tokio 侧的 `Channel::serve`；ack 在 Dispatcher 返回 `InboundAck` 之后发，不是收到就 ack。
 - 渠道交给 Dispatcher 的是 `InboundMessage { peer: ChannelPeer, is_private, sender, text, request_key }`，**不是 Session ID**。哪个会话属于 Dispatcher 与存储。
 
 ### 11.2 身份与会话
 
-- **Principal**：`allow_from` 里的发送者是操作者；其余必须配对（`komo pair approve <code>`，码盐哈希、限速、1h 过期）。未配对的消息得到一条配对提示，不进入 Run。**审批命令只接受操作者。**
-- **Conversation**：操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session，群里只响应 @机器人 的消息并剥掉提及。WeChat 只有 DM。
+**渠道的身份匹配信息全部在配置文件里，不进 state.db。** 谁是操作者、哪些会话可以说话、哪个会话是 home chat，都是操作者对自己机器的一次性声明——和模型、策略规则是同一类东西，改动就是编辑文件，Gateway 热重载（§3）后立即生效，没有配对码、没有 `komo pair`、没有 `/sethome`，也没有对应的表和 HTTP 接口。原因：这份信息只有操作者一个人写，写它的场合一定是人在终端前；放进数据库只会多出一套 CLI、一组接口和一张耐久表来维护一个本来就该是静态的名单，而数据库丢了还要靠这张表决定谁能审批。
+
+```toml
+# ~/.komo/config.toml —— 行为键
+[channels.feishu]
+enabled    = true
+allow_from = ["ou_xxx"]            # 操作者的 open_id；为空则没人能说话
+home_chat  = "oc_xxx"              # 主动投递（审批请求等）的目标会话
+groups     = ["oc_yyy"]            # 允许响应的群；缺省 = 只响应 allow_from 的私聊
+
+[channels.telegram]
+enabled    = true
+allow_from = [123456789]           # 操作者的 user id
+home_chat  = 123456789
+
+[channels.wechat]
+enabled    = true
+allow_from = ["wxid_xxx"]          # iLink 的 from
+```
+
+```dotenv
+# ~/.komo/.env —— 只放凭证；config.toml 里没有任何 secret
+FEISHU_APP_ID=cli_xxx
+FEISHU_APP_SECRET=...
+TELEGRAM_BOT_TOKEN=...
+# 微信凭证由 `komo channel wechat login` 写到 ~/.komo/wechat/credentials.json，不在 .env
+```
+
+- **Principal**：发送者在该渠道 `allow_from` 里就是操作者，否则**拒绝**——回一条固定提示，带上发送者在该平台的 id（`ou_xxx` / `123456789` / `wxid_xxx`），操作者把它抄进 `allow_from` 即可；消息不进入 Run，也不留任何记录。`allow_from` 为空的渠道等于只出不进：还能作 `home_chat` 收投递，但没人能通过它下指令。**审批命令只接受操作者。**
+- **怎么知道自己的 id**：任何人对机器人说 `/id`，机器人回 `{platform}:{chat_id}` 与发送者 id——被拒绝的提示里也带着同样的信息。这是唯一的"发现"手段，没有别的准入流程。
+- **Conversation**：操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session，只有 `groups` 列出的群会被响应，群里只响应 @机器人 的消息并剥掉提及，且发送者仍须在 `allow_from` 里。WeChat 只有 DM。
+- **改名单不改数据库，也不重启**：`allow_from` / `home_chat` / `groups` 每条消息、每次投递都从当前配置快照读（§3 热重载第 2 步），文件保存后下一条消息就按新名单判定；`komo config check` 与重载共用同一套校验（id 形态、`home_chat` 所属渠道必须 enabled 且有凭证），校验不过则旧名单继续生效并在 home chat 报错。`komo doctor` 把"某渠道 enabled 但 `allow_from` 为空"当作警告列出。
 - Cron 触发的 Run 来源仍是 Cron（§8.8）；在聊天里 `/approve` 它的等待，不会让它获得交互操作者的权限。
 
 ### 11.3 审批在聊天里
@@ -881,9 +921,13 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的�
 | `/new` | 当前 Session 追加 `conversation.boundary`，不切 Session |
 | `/cancel` | 取消该 Session 当前 Run |
 | `/status` | 当前 Run 状态、待审批数 |
-| `/sethome` | 把当前会话设为 home chat（§11.4） |
+| `/id` | 回显 `{platform}:{chat_id}` 与发送者 id，供抄进 config.toml 的 `allow_from` / `home_chat` / `groups`；任何人可用，也是唯一不要求操作者身份的命令 |
 
-按钮回调与文本命令走同一个 `Dispatcher::handle`：飞书卡片回调（`card.action.trigger`）的 `request_key` 是 `feishu:{chat_id}:{event_id}`，Telegram `callback_query` 的是 `telegram:{chat_id}:{callback_query_id}`。回调里带的 `approval_id` 是渠道回传的数据，只用来**定位**请求；批准与否仍由 Dispatcher 核对 Principal 后决定，回调负载不构成授权。
+按钮回调与文本命令走同一个 `Dispatcher::handle`，**去重键与普通消息同源**（§11.1）：飞书卡片回调（`card.action.trigger`）用 `feishu:{event_id}`，Telegram `callback_query` 用 `telegram:{update_id}`——`callback_query` 是 `Update` 的一个字段，不是比 `update_id` 更细的投递单位。回调里带的 `approval_id` 是渠道回传的数据，只用来**定位**请求；批准与否仍由 Dispatcher 核对 Principal 后决定，回调负载不构成授权。
+
+**去重之外还有一层幂等，两层各管一件事。** 去重键挡平台重投（飞书至少一次投递，ws 断线重连与 3 秒超时都会重推；Telegram 的 `offset` 未推进就重取同一个 `Update`），幂等键挡用户连点——同一人连点「批准」两次是两条合法输入、两个不同的 `event_id` / `update_id`，只有按 `approval_id` 幂等才能让第二次得到「已决定」而不是第二次执行。因此**不**把去重键换成 `(open_message_id, action.value, operator.open_id)` 这类组合键：那是个幂等键，用作投递键会把语义不同的两次点击也静默吞掉。
+
+**决定后的原地更新用 `PATCH /open-apis/im/v1/messages/{message_id}`，不用回调响应体。** 飞书官方给了三条路：回调响应里直接回传新卡片（须在 3 秒内）、用回调 `token` 延时更新（30 分钟内、最多 2 次、且必须在响应回调之后）、以及无条件 PATCH（仅 `interactive` 消息、仅 14 天内发送的消息、单条 5 QPS、更新前后 `config` 均须 `update_multi:true`）。komo 取第三条：审批的决定先落 Ledger 再回写界面，这件事跨越了回调的 3 秒预算；而且 PATCH 是普通 REST 调用，与「ws 长连接还是 HTTP 回调」无关，不必赌 ws 客户端能不能回传响应帧。回调本身只需尽快返回，必要时带一个 `toast`。Telegram 侧对应 `editMessageReplyMarkup` 去掉按钮：官方的 48 小时编辑限制只约束「非机器人自己发送且不含 inline keyboard 的 business message」，机器人自己发的审批卡片不受时限；编辑失败按**非致命**处理——决定已在 Ledger 里，界面回写失败不改变结论，也不要去匹配错误文案（官方明示 `error_code` 内容将来会变）。
 
 一条普通消息在 Run 等待审批时到达：Run 不会被越过（§6），消息排在它后面；不做"插话替换审批"这类特殊路径。
 
@@ -893,7 +937,7 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的�
 
 - `Notifier::deliver` 先在 `deliveries` 表写一行（目标、内容引用、状态 `pending`），再发送，成功后标 `sent`。重启后 `pending` 的行补发，按 `DeliveryId` 幂等。
 - **审批请求的投递目标**：Run 的来源会话，**加上** home chat（若不同）。两处都能回答，第二个答复得到"已决定"。来源是 Cron 或已断开的 TUI 时只有 home chat。
-- home chat 解析：`/sethome` 的设置 > 配置 `home_chat`（可列多个渠道）> 无目标时返回错误给调用方，**不静默丢弃**。配置候选的默认顺序是**飞书 > Telegram > WeChat**：前两者能通过 API 对任意已加入的会话主动推送，微信不能（下一条）。
+- home chat 解析：只看配置——每个 enabled 渠道的 `home_chat`（§11.2），没有运行时覆盖；一个都没配时返回错误给调用方，**不静默丢弃**。多个渠道都配了时的默认顺序是**飞书 > Telegram > WeChat**：前两者能通过 API 对任意已加入的会话主动推送，微信不能（下一条）。
 - **WeChat 的平台约束**：DM 回推依赖用户最近一条消息带来的回复令牌（进程内、有时效）；进程启动后用户没发过消息时**无法主动推送**。对应处理：该渠道的 `deliver` 在没有令牌时把行留在 `pending` 并返回 `Deferred`；用户下一条消息到达时 Dispatcher 先冲刷该会话的 `pending` 投递（§11.1 第 4 步），再处理新消息。审批请求因此不会丢，只会晚到；`home_chat` 里排在它前面的飞书或 Telegram 会先送到。
 - TUI 的 SSE 是另一个 Notifier 实现，不持久化——连接断了从事件流补读。
 
@@ -905,7 +949,8 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的�
 
 ```text
 ~/.komo/
-├── config.toml
+├── config.toml          # 行为配置：模型、渠道的 allow_from / home_chat / groups 等
+├── .env                 # 凭证：飞书 app secret、Telegram bot token、模型 key
 ├── policy.toml
 ├── state.db             # Turso；调度状态、审批、投递记录、Cron、Memory 与内容索引
 ├── sessions/
@@ -933,7 +978,7 @@ Session 内容以目录为单位管理和归档，不再使用顶层 tool-output
 
 数据目录可通过配置或 KOMO_HOME 改变。配置项中的相对路径按配置文件所在目录解析；JSONL、payloads 与 output.json 中的正文 / 输出引用统一按对应 Session 目录解析。每个实例独占自己的数据库；Turso 对 db 文件持进程独占锁，文件放在运行机器的本地磁盘，不能作为多机器共享数据库。
 
-备份在明确的一致性水位上取得数据库快照，以及各 Session 目录内的 JSONL 已同步前缀、payloads、tool-output 和被引用产物。可短暂暂停持久化协调入口来建立水位，再按固定长度复制追加文件；不能只备份 state.db，也不能把不同时间点的 JSONL 和数据库随意拼接。state.db 的授权与配置数据不能单靠会话 JSONL 重建。
+备份在明确的一致性水位上取得数据库快照，以及各 Session 目录内的 JSONL 已同步前缀、payloads、tool-output 和被引用产物。可短暂暂停持久化协调入口来建立水位，再按固定长度复制追加文件；不能只备份 state.db，也不能把不同时间点的 JSONL 和数据库随意拼接。state.db 的授权数据不能单靠会话 JSONL 重建；渠道的身份匹配（`allow_from` / `home_chat`）不在 state.db，备份 config.toml 与 .env 即可。
 
 ## 13. 通信、技术栈与项目结构
 
@@ -969,9 +1014,6 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | POST /v1/memories/{id}/forget    | 停用指定 revision 并失效索引                   |
 | GET /v1/memory-index             | 当前空间、进度、覆盖率和错误                   |
 | POST /v1/memory-index/rebuild    | 幂等提交重建任务                               |
-| GET /v1/pairings                 | 待准入与已准入的聊天发送者                     |
-| POST /v1/pairings/{code}/approve | 准入一个配对码                                 |
-| DELETE /v1/pairings/{id}         | 撤销准入                                       |
 
 除最小健康检查外统一认证。提交输入、审批、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。
 
@@ -993,7 +1035,7 @@ SSE 事件带 Session 内递增序号，断线后按游标补读。JSONL 事件�
 | 关键词检索            | state.db 的 `memory_terms` 列：索引时 CJK bigram + ASCII 词分词，查询 `instr`，IDF 加权（§9.4） |
 | 向量存储与检索        | state.db 保存向量（f32 BLOB + 维度 + 代次），Rust 在过滤后执行精确余弦检索               |
 | 向量生成              | 独立 EmbeddingClient，使用 memory.embedding 配置                         |
-| 配置与结构化数据      | TOML、Serde                                                              |
+| 配置与结构化数据      | TOML、Serde；进程内唯一 `Arc<ConfigSnapshot>` 用 arc-swap 原子替换，mtime 轮询触发热重载（§3） |
 | Schema 与异步工具接口 | Schemars、async-trait                                                    |
 | 日志                  | tracing                                                                  |
 | Python                | 独立解释器进程和虚拟环境                                                 |
@@ -1069,7 +1111,7 @@ effort 的行为统一，取值按协议和具体模型校验：
 
 不同模型的 effort 可用档位确实不同；例如 Claude 的官方文档按模型列出支持档位，Ollama embed 的请求则列出输入、维度等参数，没有通用 effort 字段。[Claude effort](https://platform.claude.com/docs/en/build-with-claude/effort) · [Ollama embed](https://docs.ollama.com/api/embed)
 
-Gateway 启动时解析一次配置，修改后通过重启生效；保留当前 Run 与后台记忆任务使用的配置快照。resume 默认沿用原运行的模型 / effort；若操作者明确切换，记录配置变更事件并重新验证协议历史可回放性。任何情况下都不能通过重放已完成工具来适应新模型。
+配置热重载（§3）：模型 / effort / 凭证改动对**新** Run 立即生效；当前 Run 与后台记忆任务保留各自开始时抓取的配置快照，跑完才换。resume 默认沿用原运行的模型 / effort；若操作者明确切换，记录配置变更事件并重新验证协议历史可回放性。任何情况下都不能通过重放已完成工具来适应新模型。
 
 每次生成与向量请求记录角色、模型身份、实际 effort 或 provider_default、耗时和错误；不记录密钥。具体服务可能更改默认值，所以未设置 effort 时只记录“服务端默认”，不能虚构当时采用的强度。索引任务还记录向量空间、代次与条目版本。
 
@@ -1123,7 +1165,11 @@ kernel ← client ────────────────────�
 | `reqwest` | `default-features = false, features = ["rustls-no-provider", "json", "stream", "charset"]` | `rustls` 特性 = `__rustls-aws-lc-rs`；`no-provider` 后由 komo 在 `main` 里 `rustls::crypto::ring::default_provider().install_default()`，且必须在飞书 ws 线程启动之前 |
 | `rustls` | `default-features = false, features = ["ring"]` | 同上 |
 | `tokio` | 按需特性，不用 `full` | kernel 不依赖 tokio |
-| `axum` | 默认 + `tower-http/cors` | 仅 gateway |
+| `axum` | 默认 + `tower-http/cors` | 仅 gateway；gateway 自己直接声明 `tokio`（`rt-multi-thread`, `signal`, `fs`），不靠 axum 传递 |
+| `tower-http` | `0.6`，`default-features = false, features = ["cors"]` | 与 reqwest 对齐（两个大版本都要 `^0.6`）；选 0.7 只会多一条自找的重复版本 |
+| `sha2` | `0.10` | openlark-core 用 0.10；选 0.11 会把 `digest` / `block-buffer` / `crypto-common` / `cpufeatures` 一起劈成两份 |
+| `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
+| `arc-swap` | 默认；仅 komo-runtime（`config`） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
 | `clap` | `derive` | 仅 bin |
 | `ratatui` + `crossterm` + `pulldown-cmark` | 仅 komo-client | 在 client 支线上，与 gateway 并行编译 |
 | `syntect` / `two-face`（代码高亮） | 可选，按编译预算实测再定 | 纯 UI 增强，不是需求 |
@@ -1158,14 +1204,14 @@ codegen-units = 16
 
 编译预算——第一阶段结束时在目标 Mac 与 Fedora 上各测一次并记入仓库，之后每个阶段重测；下面是初始预算，实测后校准：
 
-| 场景 | 命令 | 初始预算 |
-|---|---|---|
-| 冷编 | `cargo build` | ≤ 60s（基线 65s：去掉 aws-lc、rusqlite、MCP、image；保留 ratatui 与三家渠道 SDK；若 openlark 拉回 aws-lc，+20s） |
-| 改 runtime 一行 | `touch crates/komo-runtime/src/agent.rs && cargo check` | ≤ 5s |
-| 改 client 一行 | `touch crates/komo-client/src/tui/app.rs && cargo check` | ≤ 5s；不得触发 gateway / runtime / store 重编 |
-| 改 store 一个模型 | `touch crates/komo-store/src/models/run.rs && cargo check` | ≤ 12s（toasty 展开不可避免，但只影响 store 及以上） |
-| 改 kernel 一个类型 | `cargo check` | 全量，允许 ≤ 20s；这是有意为之的代价 |
-| `cargo test --workspace` | 增量 | ≤ 30s |
+| 场景 | 命令 | 初始预算 | 骨架实测（2026-09-16，Fedora） |
+|---|---|---|---|
+| 冷编 | `cargo build` | ≤ 60s（基线 65s：去掉 aws-lc、rusqlite、MCP、image；保留 ratatui 与三家渠道 SDK；若 openlark 拉回 aws-lc，+20s） | 70.2s（8 核 / 11 GB；`--no-default-features --features feishu,telegram`——本机缺 `openssl-devel`，`wechat` 无法构建。关键路径 `zstd-sys` 构建脚本 10.5s → `tantivy` 14.6s → `turso_core` 26.8s → `turso_sync_*` → `toasty-driver-turso` 5.1s → `toasty` 3.3s → 四个 komo crate 0.4s。openlark 确实把 aws-lc 拉了回来：`aws-lc-sys` 构建脚本 32.4s，但并行不在关键路径上。三个渠道全关时 68.5s） |
+| 改 runtime 一行 | `touch crates/komo-runtime/src/agent.rs && cargo check` | ≤ 5s | 0.34s（骨架为空，只验证扇出形状：runtime → gateway → bin） |
+| 改 client 一行 | `touch crates/komo-client/src/tui/app.rs && cargo check` | ≤ 5s；不得触发 gateway / runtime / store 重编 | 0.32s；只重检 komo-client 与 bin，gateway / runtime / store 未重编 |
+| 改 store 一个模型 | `touch crates/komo-store/src/models/run.rs && cargo check` | ≤ 12s（toasty 展开不可避免，但只影响 store 及以上） | 0.37s（骨架里还没有 toasty 模型，此数不代表展开成本；文件现为 `src/models.rs`） |
+| 改 kernel 一个类型 | `cargo check` | 全量，允许 ≤ 20s；这是有意为之的代价 | 0.41s（六个 crate 全部重检，骨架为空） |
+| `cargo test --workspace` | 增量 | ≤ 30s | — |
 
 预算不达标时，先用 `--timings` 找关键路径，再决定拆 crate 或换依赖——不凭感觉拆。
 
@@ -1290,10 +1336,10 @@ pub trait Clock: Send + Sync {
 
 | 阶段 | 交付 | 验证 |
 |---|---|---|
-| 1. 进程与会话骨架 | 六个 crate 骨架（§13.4）；komo、Gateway 自动启动、HTTP/SSE；`komo-store`：Turso 连接、`ensure_schema` + DDL 对齐测试、`with_write_retry`、统一 Session 目录与状态索引；`komo-client`：HTTP/SSE 客户端与 TUI 骨架；**编译预算首次测量** | 多个 CLI 同时启动仅产生一个实例；断线后能查看原会话；两个写入器对不同 Session 并发提交不互相阻塞，对同一行冲突时一方重试成功且只应用一次；DDL 对齐测试挂掉能定位到列；改 client 一行不重编 gateway |
+| 1. 进程与会话骨架 | 六个 crate 骨架（§13.4）；komo、Gateway 自动启动、HTTP/SSE；`komo-store`：Turso 连接、`ensure_schema` + DDL 对齐测试、`with_write_retry`、统一 Session 目录与状态索引；`komo-client`：HTTP/SSE 客户端与 TUI 骨架；**编译预算首次测量** | 多个 CLI 同时启动仅产生一个实例；断线后能查看原会话；两个写入器对不同 Session 并发提交不互相阻塞，对同一行冲突时一方重试成功且只应用一次；DDL 对齐测试挂掉能定位到列；改 client 一行不重编 gateway；保存一份合法的 config.toml 后 `komo doctor` 一秒内显示新 mtime 已生效，保存一份非法的则旧配置继续生效且 home chat / 日志有具体错误 |
 | 2. AgentLoop 与 Policy | 模型往返、执行计划、Allow/Ask/Deny、审批持久化；`Ledger`、`Policy`、`ApprovedPlan` 类型状态；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测 | 危险操作批准前不执行；重复批准不重复执行；Deny 不被授权覆盖；不构造 `Proof` 就调不到 `execute`（编译期）；`Ask` 后 Run 让出名额且 TUI 弹出审批 |
 | 3. 五个工具 | 文件、进程、Python 环境与输出处理；`verify` 默认实现与 write/edit 的哈希核对 | 文件版本冲突可见；取消停止子进程；未知工具无法调用 |
-| 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、pairing、`deliveries`、审批渲染、短 ID、飞书卡片与 Telegram 内联按钮、`komo channel probe` | 同一 `message_id` / `update_id` / `msg_id` 重发只产生一个 Run；`/approve` 与按钮回调重发只批准一次；来源会话与 home chat 都收到请求且第二个答复得到"已决定"；决定后卡片 / 消息原地更新；Gateway 重启后 pending 投递补发一次；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的审批请求 |
+| 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、审批渲染、短 ID、飞书卡片与 Telegram 内联按钮、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一人连点两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/approve` 与按钮回调重发只批准一次；来源会话与 home chat 都收到请求且第二个答复得到"已决定"；决定后卡片 / 消息原地更新；Gateway 重启后 pending 投递补发一次；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的审批请求 |
 | 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，raw SQL）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的审批仍能在手机上批 |
 | 6. toolbox 迭代 + Skills | 保存模块、候选测试、版本审核与启用；`SkillRegistry`、目录行门控、`read` 只读根 | 调用使用已批准且已测试版本；模块更新使旧授权失效；新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect；toolbox 启用的审批在微信里能看到版本差异与测试结果 |
 | 7. Cron | 持久调度、去重、重叠处理、人工接手 | 重启不重复创建同次触发；新危险操作等待审批；Cron 的等待在聊天里 `/approve` 后按 Cron 权限继续，不升权 |
@@ -1346,11 +1392,12 @@ Memory 与模型验收覆盖：
 |---|---|---|
 | Turso MVCC 模式提交是否 fsync；能否读回同步设置 | §8.2 权威边界 | 启用 §8.2 的 outbox-先-确认保护 |
 | toasty 0.10 是否支持带条件的 UPDATE 并返回受影响行数 | §8.7 领取代次 | 直接用 raw SQL（已计入设计） |
-| `reqwest` `rustls-no-provider` 下没有其他依赖重新启用 `aws-lc-rs`；`openlark` 的 tokio-rustls 是否以默认特性把它拉回来（特性可加不可减） | §13.4 冷编预算 | 接受 aws-lc，冷编预算 +20s；或 `[patch]` 一份 openlark-client 改成 `default-features = false` |
+| `reqwest` `rustls-no-provider` 下没有其他依赖重新启用 `aws-lc-rs`；`openlark` 是否把它拉回来 | §13.4 冷编预算 | **已核实（2026-09-16，骨架实测）：拉回来了**，肇事者是 `openlark-core 0.20` 显式声明 reqwest 的 `rustls` 特性（= `__rustls-aws-lc-rs`），特性可加不可减，`default-features = false` 压不住，要挡只能 `[patch]` openlark-**core** 把该特性换成 `rustls-no-provider`。代价实测：`aws-lc-sys` 构建脚本 32s 但 8 核并行、不在关键路径，墙钟只 +1.7s（68.5s → 70.2s）。**决定：接受，不维护 patch。** |
 | `instr` 全表关键词臂在 1 万条时的 P95 | §9.4 | 加 `memory_terms` 的按 token 倒排表（仍是普通表，仍可重建） |
 | Turso 长读事务（SSE 游标补读）与并发写提交的快照语义 | §11.1 回复订阅 | 读路径改为短事务分页 |
 | `toasty-driver-turso` 能否通过 `[patch]` 关闭 `turso` 的 `fts` 默认特性且链接正常 | §13.4 可选项 | 放弃该项，冷编多 ~14s |
 | iLink 消息是否带稳定 `msg_id` 可作 `request_key` | §11.1 微信去重 | 用 `(from, 内容哈希, 60s 窗口)` 近似去重，并标明微信侧可能重复 |
 | `wechatbot` 的 native-tls 在 Fedora 上链系统 openssl 是否顺利；与 `rustls-no-provider` 的 reqwest 0.13 共存 | §13.4 | 退回 vendored openssl，Linux 冷编多 1–2 分钟 |
-| `lark-websocket-protobuf` 是否需要 `protoc`（本地缓存的 0.1.2 没有 build.rs，看起来是预生成代码） | 构建工具链要求 | 安装说明里加 `protobuf` |
-| 飞书卡片回调的 `event_id`、Telegram `callback_query_id` 在重推时是否保持不变 | §11.3 按钮去重 | 改用 `(message_id, action.value)` 组合键 |
+| `lark-websocket-protobuf` 是否需要 `protoc` | 构建工具链要求 | **已核实（2026-09-16）：不需要。** 0.1.2 无 `build.rs`，依赖树里没有 prost-build / tonic-build / protobuf-codegen，本机无 protoc 编译通过。安装说明不加 `protobuf` |
+| 飞书卡片回调的 `event_id`、Telegram `callback_query_id` 在重推时是否保持不变 | §11.3 按钮去重 | **已核实（2026-09-16，官方文档）**：飞书对 2.0 事件与回调的官方去重建议就是「通过 `event_id` 字段判断事件唯一性」，配合「至少发送一次」与 15s/5min/1h/6h 最多 4 次重推，等价于保证重推携带同一 `event_id`；Telegram long polling 重投的单位是整个 `Update`（`offset` 未推进即原样再取），`update_id` 与其中的 `callback_query.id` 一并不变。**两个键都稳定，组合键退路作废**；去重键只挡平台重投，用户连点由 `approval_id` 幂等承担（已写入 §11.3）。剩余未核实：① 卡片回调自身的重推间隔 / 次数（官方只在「事件」侧给表）；② ws 模式下卡片回调载荷与 HTTP 是否逐字段一致；③ openlark 的 ws 客户端能否回传卡片响应帧——设计已改用 PATCH 绕开，不阻塞 |
+| Telegram 把消息编辑成与现状相同内容时返回的错误（官方未文档化，且声明 `error_code` 内容会变） | §11.3 决定后去掉按钮的幂等重试 | 不匹配错误文案；编辑失败一律当非致命，决定以 Ledger 为准 |

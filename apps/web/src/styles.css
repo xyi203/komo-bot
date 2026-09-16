@@ -1,4 +1,0 @@
-/* The host's stylesheet entry: pull in the shared app's styles and tell
-   Tailwind to scan this host's own source (the shared package scans itself). */
-@import "@komo/app/styles/main.css";
-@source "./";

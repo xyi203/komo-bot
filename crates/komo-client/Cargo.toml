@@ -1,0 +1,18 @@
+[package]
+name = "komo-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：只依赖 kernel——不认识 store / runtime。
+[dependencies]
+komo-kernel = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "io-util"] }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+pulldown-cmark = { workspace = true }
+
+[dev-dependencies]
+komo-kernel = { workspace = true, features = ["test-support"] }

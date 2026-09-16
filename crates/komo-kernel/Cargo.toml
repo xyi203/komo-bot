@@ -1,0 +1,21 @@
+[package]
+name = "komo-kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：值类型、状态机、事件与 fold、Policy 规则引擎、cron 到期计算、
+# §8.4 恢复决策表（纯函数）、协议线格式、全部 trait（§13.5）。不依赖 tokio。
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+croner = { workspace = true }
+
+[features]
+# §13.4：跨 crate 需要的替身放在 test-support 后面，只作为 dev-dependency 启用。
+test-support = []

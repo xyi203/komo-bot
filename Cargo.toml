@@ -1,195 +1,95 @@
-[package]
-name = "komo"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-komo-core = { path = "crates/komo-core" }
-# The provider layer (wire formats + HTTP/SSE boundary). Its own crate because
-# it references nothing else in komo — the `Wire`-per-format bet made it a
-# self-contained unit, so it compiles in parallel with everything above it.
-komo-provider = { path = "crates/komo-provider" }
-# Config resolution (config.toml + .env + KOMO_* env into one snapshot).
-komo-config = { path = "crates/komo-config" }
-# Storage + the outbound adapters that depend on nothing above them.
-komo-infra = { path = "crates/komo-infra" }
-# The tool loop's services: execution, output bounding, memory enrichment,
-# the skill registry, and the fs/search primitives tools are built on.
-komo-services = { path = "crates/komo-services" }
-# Every tool but `delegate`, which needs the runtime it dispatches into.
-komo-tools = { path = "crates/komo-tools" }
-# The generic MCP client, used by wiring to mount `[mcp.servers.*]` tools.
-komo-mcp = { path = "crates/komo-mcp" }
-# The out-of-process Python plugin host (`~/.komo/plugins/*.py`).
-komo-pyhost = { path = "crates/komo-pyhost" }
-# The agent: tool loop, gateway, sweeps, and the provider client it drives.
-komo-bot = { path = "crates/komo-bot" }
-clap = { version = "4.6.6", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["full"] }
-toasty = { version = "0.10.0", features = ["sqlite", "turso"] }
-toasty-driver-turso = "0.10.0"
-# Direct handle to the same Turso engine toasty uses, for the one thing toasty's
-# typed API can't do: run a raw `ALTER TABLE ADD COLUMN` to migrate an existing
-# memory.db in place (additive, no data loss). See `memory_db::ensure_columns`.
-# Must stay on the same major as toasty-driver-turso's pin (`turso = "0.6"`):
-# a second turso version both duplicates the engine over the same db files and
-# drags in a second `#[global_allocator]` (mimalloc), which fails to link.
-turso = "0.7.2"
-serde = { workspace = true }
-serde_json = { workspace = true }
-anyhow = { workspace = true }
-thiserror = { workspace = true }
-async-trait = { workspace = true }
-dotenvy = "0.15"
-envy = { workspace = true }
-toml = { workspace = true }
-dirs = { workspace = true }
-reqwest = { version = "0.13", default-features = false, features = [
-    "rustls",
-    "charset",
-    "query",
-    "json",
-    "multipart",
-    # `bytes_stream()` — the provider layer reads every completion as SSE.
-    "stream",
-] }
-# Only the WebSocket long connection — event payloads are consumed raw
-# (`register_raw`) with our own tolerant serde structs, and replies go
-# through reqwest, so no business-domain feature is needed.
-openlark = { version = "0.20", default-features = false, features = [
-    "websocket",
-] }
-tracing = { workspace = true }
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-time = { workspace = true }
-uuid = { workspace = true }
-sha2 = { workspace = true }
-# Decode the Codex OAuth access-token JWT to read its `exp` / account-id claims
-# (no signature verification — we only inspect the payload). See `infra/codex.rs`.
-base64 = "0.23.1"
-# `http` for the Codex OAuth refresh request's header constants; `bytes` for the
-# provider layer's SSE chunk stream.
-http = "1.5.0"
-bytes = { workspace = true }
-croner = "3"
-chrono = { workspace = true }
-tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-# Both `ring` and `aws-lc-rs` are activated transitively. Select ring explicitly
-# before any TLS client is constructed (notably openlark's WebSocket runtime).
-rustls = { version = "0.23.43", default-features = false, features = ["ring"] }
-futures-util = { workspace = true }
-wechatbot = "=0.4.0"
-qrcode = { version = "0.14.1", default-features = false }
-# PNG only — render the wechat login QR for delivery over chat (no image codecs we don't need).
-image = { version = "0.25", default-features = false, features = ["png"] }
-# HTTP API channel: OpenAI-compatible + dashboard endpoints over a loopback port.
-axum = "0.8"
-# Static-file serving for the api channel's optional web SPA (`web_dir`).
-tower-http = { version = "0.7.0", features = ["fs", "cors"] }
-ratatui = "0.30.2"
-crossterm = { version = "0.29.0", features = ["event-stream"] }
-unicode-width = "0.2.2"
-# Markdown rendering for agent replies in the chat TUI.
-pulldown-cmark = { version = "0.13", default-features = false }
-# Code-block syntax highlighting in the TUI (syntect + two-face's extended
-# syntax set, pure-Rust regex backend — the pairing must match on both crates).
-syntect = { version = "5.3", default-features = false, features = [
-    "parsing",
-    "regex-fancy",
-    "dump-load",
-] }
-two-face = { version = "0.5.2+bat-0.26.1", default-features = false, features = [
-    "syntect-fancy",
-] }
-tracing-appender = "0.2.5"
-libc = "0.2.189"
-# `grep`/`glob` are built on ripgrep's own component libraries rather than
-# shelling out to an `rg` binary: komo ships as a single binary and can't assume
-# one exists on the host (or in a container). `ignore` is the .gitignore-aware
-# parallel walker, `globset` the glob matcher, `grep-searcher`/`grep-regex` the
-# line searcher — all BurntSushi's, all what ripgrep itself is assembled from.
-ignore = "0.4.33"
-globset = "0.4.20"
-grep-searcher = "0.1.17"
-grep-regex = "0.1.14"
-# Unified diffs + line-level add/remove counts for `edit` / `apply_patch`.
-similar = "3.1.2"
-
-# wechatbot pins reqwest 0.12 with native-tls, which on Linux links libssl
-# dynamically — a release binary would then refuse to load on any host without
-# the exact libssl3 it was built against. Vendoring compiles OpenSSL in, so a
-# Linux binary depends on glibc alone. macOS's native-tls is Security.framework
-# and needs nothing here.
-[target.'cfg(target_os = "linux")'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
-
-[dev-dependencies]
-# `test-util` (not part of tokio's `full`) enables `#[tokio::test(start_paused)]`,
-# which auto-advances virtual time so retry-backoff tests don't sleep for real.
-tokio = { version = "1.52.0", features = ["full", "test-util"] }
-# `ServiceExt::oneshot`, to drive a router in-process (api channel CORS tests).
-tower = { version = "0.5", features = ["util"] }
-# `reset_test_db` for the agent-runtime tests (feature is off in real builds).
-komo-infra = { path = "crates/komo-infra", features = ["test-support"] }
-# A static `SkillRegistry` for the skill tool's tests.
-komo-services = { path = "crates/komo-services", features = ["test-support"] }
-# Shared tool-test fixtures for the delegate tool's tests.
-komo-tools = { path = "crates/komo-tools", features = ["test-support"] }
-# A defaults-only `ConfigSnapshot` for the plugin-phase tests.
-komo-config = { path = "crates/komo-config", features = ["test-support"] }
-
 [workspace]
+resolver = "2"
 members = [
-    "crates/komo-core",
-    "crates/komo-config",
-    "crates/komo-provider",
-    "crates/komo-pyhost",
-    "crates/komo-mcp",
-    "crates/komo-infra",
-    "crates/komo-services",
-    "crates/komo-tools",
-    "crates/komo-bot",
+    "crates/komo-kernel",
+    "crates/komo-store",
+    "crates/komo-runtime",
+    "crates/komo-gateway",
+    "crates/komo-client",
+    "crates/komo",
 ]
-resolver = "3"
 
-# Keep full symbols for Komo itself during local development, but omit them from
-# third-party crates. The dependency graph (notably Turso and Tantivy) dominates
-# cold-build time and debug artifact size; their source-level debugging is rarely
-# needed while working on Komo.
+[workspace.package]
+version = "0.8.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+
+# 依赖清单与禁用项照 docs/komo_bot.md §13.4。特性在这里写死，成员 crate 只写
+# `workspace = true`（必要时按 §13.4 的 crate 行补自己需要的可加特性）。
+# 不引入 rmcp / image / strum / derive_more / bon。
+[workspace.dependencies]
+# 内部 crate，依赖只向下：kernel ← store ← runtime ← gateway；kernel ← client。
+komo-kernel = { path = "crates/komo-kernel" }
+komo-store = { path = "crates/komo-store" }
+komo-runtime = { path = "crates/komo-runtime" }
+komo-gateway = { path = "crates/komo-gateway", default-features = false }
+komo-client = { path = "crates/komo-client" }
+
+# §13.4：去掉 `sqlite` 特性拉进来的 rusqlite / libsqlite3-sys。
+toasty = { version = "0.10.0", default-features = false, features = ["turso"] }
+# §13.4：与 toasty-driver-turso 同 major（0.10 依赖 turso ^0.7），工作区唯一。
+turso = "0.7.2"
+
+# §13.4：`rustls` 特性 = `__rustls-aws-lc-rs`；`no-provider` 后由 komo 在 main 里
+# 安装 ring provider，且必须在飞书 ws 线程启动之前。
+reqwest = { version = "0.13.5", default-features = false, features = [
+    "rustls-no-provider",
+    "json",
+    "stream",
+    "charset",
+] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
+
+# §13.4：按需特性，不用 `full`；kernel 不依赖 tokio。
+tokio = { version = "1.53.1", default-features = false, features = [
+    "rt",
+    "macros",
+    "sync",
+    "time",
+] }
+
+# §13.4：仅 gateway。
+axum = "0.8.9"
+tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+
+# §13.4：仅 bin。
+clap = { version = "4.6.7", features = ["derive"] }
+
+# §13.4：仅 gateway，feature `feishu`（默认开）。只要 ws 长连接；事件负载用
+# register_raw 拿原始 JSON 自己解析。
+openlark = { version = "0.20.0", default-features = false, features = ["websocket"] }
+# §13.4：仅 gateway，feature `wechat`（默认开）。它 pin reqwest 0.12 + native-tls，
+# 带来一份 reqwest / hyper 重复——接受。Linux 下不 vendored openssl。
+wechatbot = "0.4.0"
+# §13.4：微信登录二维码渲染为终端字符，不需要 `image`。
+qrcode = { version = "0.14.1", default-features = false }
+
+# §13.4：仅 komo-client，在 client 支线上与 gateway 并行编译。
+ratatui = "0.30.2"
+crossterm = "0.29.0"
+pulldown-cmark = "0.13.4"
+
+# §3 配置热重载：进程内唯一的 Arc<ConfigSnapshot> 原子替换。
+arc-swap = "1.9.2"
+
+croner = "4.0.0"
+async-trait = "0.1.92"
+thiserror = "2.0.20"
+uuid = { version = "1.26.1", features = ["v7", "serde"] }
+time = { version = "0.3.55", features = ["serde", "formatting", "parsing", "macros"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.10"
+
+# §13.4 profile：逐字照抄。
 [profile.dev.package."*"]
-debug = "none"
+debug = "none"               # 第三方不带调试信息
 
-# The TUI's first frame pays for loading this binary: dyld page-in and the
-# one-time-per-install Gatekeeper scan both scale with file size, so the
-# release binary is stripped and thin-LTO'd — measured ~40% smaller and a
-# visibly faster `komo` open, for a moderately longer release build.
+[profile.dev]
+debug = "line-tables-only"   # 自己的 crate 保留行号即可
+
 [profile.release]
 strip = "symbols"
 lto = "thin"
-
-# Shared across the workspace so komo and komo-core pin one version each.
-# Crate-unique / heavy deps (toasty, axum, ratatui, …) stay in their own
-# manifests.
-[workspace.dependencies]
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-anyhow = "1.0.104"
-thiserror = "2.0.20"
-async-trait = "0.1.92"
-dirs = "6"
-sha2 = "0.11"
-tracing = "0.1"
-time = { version = "0.3.55", features = ["formatting", "macros", "parsing", "serde-well-known"] }
-uuid = { version = "1.24.0", features = ["v4", "v7"] }
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-bytes = "1"
-futures-util = "0.3.34"
-toml = "1.1.4"
-toml_edit = "0.25.13"
-envy = "0.4"
-reqwest = { version = "0.13", default-features = false, features = [
-    "rustls",
-    "charset",
-    "query",
-    "json",
-] }
+codegen-units = 16

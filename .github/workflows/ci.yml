@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup show && rustup component add rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
+      # §13.4：`cargo tree -d` 进入 CI，出现新的重复版本要有理由。
+      # W0 只收集输出存成 artifact，暂不做失败判定。
+      - name: cargo tree -d
+        run: cargo tree -d --workspace > cargo-tree-duplicates.txt || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-tree-duplicates
+          path: cargo-tree-duplicates.txt

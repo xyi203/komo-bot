@@ -12,8 +12,12 @@ name = "komo"
 path = "src/main.rs"
 
 [dependencies]
+# 协议类型（请求 / 响应体）——client 的每个方法都收发它们。kernel 是叶子 crate，
+# 加这一条不改变依赖图的形状（§13.4 的两条支线仍在 bin 汇合）。
+komo-kernel = { workspace = true }
 komo-client = { workspace = true }
 komo-gateway = { workspace = true }
+time = { workspace = true }
 clap = { workspace = true }
 rustls = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }

@@ -1,0 +1,441 @@
+//! 领到一个 Run 之后，这一段要的上下文从哪来（`SegmentSource` 的生产实现）。
+//!
+//! 三样东西在这里凑齐（`agent::handler` 的模块注释列的就是它们）：
+//!
+//! - **工作目录与已授权根**：Session 的 `workdir`，没有就是 `workspaces/`。
+//! - **`TurnRequest`**：系统提示 + 回放窗口（最新一个 `conversation.boundary` 之后的
+//!   消息，`Surface::replay`）+ 执行器挂着的工具 Schema。
+//! - **恢复位置**：这个 Run 还有没有没收尾的调用。有就把它们原样交回执行器——**沿用
+//!   同一份计划**，因为审批绑定的是计划的哈希，重新 prepare 会换一个哈希（§7.4）。
+//!
+// TODO(decide: 系统提示的正文文档没有规定（§5.6 只说 skills 目录行是启动快照、§9 说
+// 记忆注入在装配时发生）。W4 先给一段最小的、不含记忆与 skills 目录的提示，等
+// MemoryManager 与 SkillRegistry 接进来时从这里换掉——`preamble` 那一口已经在
+// `LlmFactory::with_preamble` 上留好了。)
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use komo_kernel::events::{Event, EventPayload};
+use komo_kernel::fold::{Surface, fold};
+use komo_kernel::traits::{ApprovalRepo, Ledger};
+use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
+use komo_kernel::types::turn::{ReplayMessage, ToolResultForModel, TurnRequest};
+use komo_runtime::agent::handler::SegmentSource;
+use komo_runtime::agent::{Budget, ResumedRound, RetryBudget, Segment};
+use komo_runtime::executor::{CallEnv, CallRequest, resumed_from};
+use komo_runtime::scheduler::HandlerError;
+use komo_store::Db;
+
+use super::ledgers::RoutedLedger;
+
+/// 装配执行段，并持有每个 Run 的取消开关。
+pub struct GatewaySegments {
+    routed: Arc<RoutedLedger>,
+    db: Db,
+    approvals: Arc<dyn ApprovalRepo>,
+    workspaces: PathBuf,
+    max_rounds: u32,
+    max_retries: u32,
+    cancels: Mutex<BTreeMap<RunId, CancelToken>>,
+}
+
+impl std::fmt::Debug for GatewaySegments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewaySegments").finish_non_exhaustive()
+    }
+}
+
+impl GatewaySegments {
+    pub fn new(
+        routed: Arc<RoutedLedger>,
+        db: Db,
+        approvals: Arc<dyn ApprovalRepo>,
+        workspaces: PathBuf,
+        max_rounds: u32,
+        max_retries: u32,
+    ) -> Self {
+        GatewaySegments {
+            routed,
+            db,
+            approvals,
+            workspaces,
+            max_rounds,
+            max_retries,
+            cancels: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// 这个 Run 的取消开关。**取消通过明确操作发起**（§13.1）——CLI 退出不取消。
+    pub fn cancel(&self, run: &RunId) {
+        if let Some(token) = self.cancels.lock().expect("取消表").get(run) {
+            token.cancel();
+        }
+    }
+
+    fn token_for(&self, run: &RunId) -> CancelToken {
+        let mut cancels = self.cancels.lock().expect("取消表");
+        // 上一段留下的那个可能已经被按过；每一段拿一个新的。
+        let token = CancelToken::new();
+        cancels.insert(run.clone(), token.clone());
+        token
+    }
+
+    /// 读完这个 Session 的日志。
+    async fn events_of(&self, session: &SessionId) -> Result<Vec<Event>, HandlerError> {
+        let mut all = Vec::new();
+        let mut from = Seq::ZERO;
+        loop {
+            let batch = self.routed.read(session, from, 0).await?;
+            if batch.events.is_empty() {
+                return Ok(all);
+            }
+            for event in batch.events {
+                from = from.max(event.seq);
+                all.push(event);
+            }
+            if batch.next.is_none() {
+                return Ok(all);
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl SegmentSource for GatewaySegments {
+    async fn segment(
+        &self,
+        claimed: &komo_kernel::types::status::Claimed,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<Segment, HandlerError> {
+        let run = claimed.run.clone();
+        let session = self
+            .routed
+            .session_of_run(&run)
+            .await
+            .map_err(HandlerError::Ledger)?;
+        // 续跑要按调用号找回 Session：把这个会话的调用与尝试先补记进来。
+        self.routed
+            .learn(&session)
+            .await
+            .map_err(HandlerError::Ledger)?;
+
+        let record = komo_store::repos::runs::get(&self.db, &run)
+            .await?
+            .ok_or_else(|| HandlerError::Failed(format!("run {run} 不在账本里")))?;
+        let session_record = komo_store::repos::session::get(&self.db, &session).await?;
+
+        let events = self.events_of(&session).await?;
+        let surface = fold(&events);
+        let rounds_so_far = surface
+            .runs
+            .get(&run)
+            .map(|view| view.rounds)
+            .unwrap_or_default();
+
+        let cwd = session_record
+            .as_ref()
+            .and_then(|record| record.workdir.clone())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.workspaces.clone());
+        let roots = vec![WorkspaceRoot {
+            path: cwd.clone(),
+            writable: true,
+            label: "workspace".into(),
+        }];
+
+        let request = TurnRequest {
+            session: session.clone(),
+            run: run.clone(),
+            model: record.model.clone(),
+            system_prompt: system_prompt(&cwd, &tools),
+            messages: replay(&surface),
+            tools,
+            memories: Vec::new(),
+            covers: None,
+        };
+
+        let env = CallEnv {
+            session: session.clone(),
+            run: run.clone(),
+            source: record.source.clone(),
+            cwd,
+            roots,
+            env_version: None,
+            principal: None,
+            cancel: self.token_for(&run),
+        };
+
+        let budget = Budget {
+            max_rounds: self.max_rounds,
+            max_tokens: None,
+            first_round: rounds_so_far + 1,
+            retry: RetryBudget {
+                attempts: record.retry_attempts,
+                max_attempts: self.max_retries,
+                ..RetryBudget::default()
+            },
+        };
+
+        let resume = self.resumed(&surface, &events, &run).await;
+
+        Ok(Segment {
+            session,
+            run,
+            request,
+            env,
+            budget,
+            resume,
+        })
+    }
+}
+
+impl GatewaySegments {
+    /// 这个 Run 还有没有没收尾的调用（§8.4 第 4 / 6 / 7 行）。
+    ///
+    /// 有就把它们原样交回执行器：**同一份计划、同一个调用号**，加上"这是第几次"。停在
+    /// 审批上的那一个还带着它的 `approval`——`/approve` 之后续跑走的就是这条路。
+    async fn resumed(
+        &self,
+        surface: &Surface,
+        events: &[Event],
+        run: &RunId,
+    ) -> Option<ResumedRound> {
+        let view = surface.runs.get(run)?;
+        let waiting = waiting_approval(events, run);
+        let mut pending = Vec::new();
+        for call_id in &view.calls {
+            let call = surface.calls.get(call_id)?;
+            if call.state.is_terminal() {
+                continue;
+            }
+            let request = call_request(surface, events, call_id)?;
+            let approval = waiting
+                .as_ref()
+                .filter(|(_, on)| on.as_ref() == Some(call_id))
+                .map(|(approval, _)| approval.clone());
+            pending.push(CallRequest {
+                resumed: Some(resumed_from(
+                    call.state,
+                    call.attempt.clone(),
+                    call.attempts,
+                )),
+                approval,
+                ..request
+            });
+        }
+        if pending.is_empty() {
+            return None;
+        }
+        // 已经收尾的那些在回放窗口里（`Role::Tool` 的消息），不必再交一遍。
+        let settled: Vec<ToolResultForModel> = Vec::new();
+        // 停在审批上的调用，决定还没写下来就别再跑一遍——那会把同一个问题问第二次。
+        if let Some((approval, _)) = &waiting
+            && let Ok(Some(record)) = self.approvals.get(approval).await
+            && record.decision.is_none()
+        {
+            tracing::debug!(run = %run, approval = %approval, "审批还没有结论，这一段不续跑");
+            return None;
+        }
+        Some(ResumedRound { settled, pending })
+    }
+}
+
+/// 这个 Run 停在哪条审批、哪个调用上。
+fn waiting_approval(
+    events: &[Event],
+    run: &RunId,
+) -> Option<(komo_kernel::types::ids::ApprovalId, Option<ToolCallId>)> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.run.as_ref() == Some(run))
+        .find_map(|event| match &event.payload {
+            EventPayload::RunWaitingApproval(body) => {
+                Some((body.approval.clone(), body.call.clone()))
+            }
+            _ => None,
+        })
+}
+
+/// 从日志里把一个调用的原始请求与计划找回来。
+fn call_request(surface: &Surface, events: &[Event], call: &ToolCallId) -> Option<CallRequest> {
+    let requested = events.iter().rev().find_map(|event| match &event.payload {
+        EventPayload::MessageAssistant(body) => body
+            .tool_calls
+            .iter()
+            .find(|candidate| &candidate.call_id == call)
+            .cloned(),
+        _ => None,
+    })?;
+    let plan = events.iter().rev().find_map(|event| match &event.payload {
+        EventPayload::ToolPlanned(body) if &body.call_id == call => {
+            body.plan.as_ref().map(|plan| (**plan).clone())
+        }
+        _ => None,
+    });
+    let _ = surface;
+    Some(CallRequest {
+        call: call.clone(),
+        provider_call_id: requested.provider_call_id,
+        tool: requested.name,
+        arguments: requested.arguments,
+        plan,
+        resumed: None,
+        approval: None,
+    })
+}
+
+/// 回放窗口：最新一个 `conversation.boundary` 之后的消息（§13.1 的 `/new`）。
+fn replay(surface: &Surface) -> Vec<ReplayMessage> {
+    surface
+        .replay()
+        .iter()
+        .map(|message| ReplayMessage {
+            role: message.role,
+            seq: message.seq,
+            text: message.text.clone(),
+            tool_calls: message.tool_calls.clone(),
+            tool_results: message
+                .tool_results
+                .iter()
+                .map(|result| ToolResultForModel {
+                    provider_call_id: provider_call_id(surface, &result.call)
+                        .unwrap_or_else(|| result.call.to_string()),
+                    call_id: result.call.clone(),
+                    content: result
+                        .preview
+                        .clone()
+                        .unwrap_or_else(|| format!("[完整输出：{}]", result.output.path())),
+                    is_error: !matches!(
+                        result.status,
+                        komo_kernel::types::refs::ToolResultStatus::Completed
+                    ),
+                })
+                .collect(),
+            provider_blocks: message.provider_blocks.clone(),
+        })
+        .collect()
+}
+
+/// 结果要按 provider 自己的 call_id 回传（§6）。
+fn provider_call_id(surface: &Surface, call: &ToolCallId) -> Option<String> {
+    surface.messages.iter().rev().find_map(|message| {
+        message
+            .tool_calls
+            .iter()
+            .find(|candidate| &candidate.call_id == call)
+            .map(|candidate| candidate.provider_call_id.clone())
+    })
+}
+
+/// W4 的最小系统提示。
+fn system_prompt(cwd: &std::path::Path, tools: &[ToolDefinition]) -> String {
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    format!(
+        "你是 komo，一个在用户自己机器上运行的助手。\n\
+         工作目录：{}\n\
+         可用工具：{}\n\
+         危险操作会被拦下来等人批准；被拒绝就把它当作结果，不要绕过。\n\
+         做完之后如实报告做了什么、有什么证据；没有证据就说没有。",
+        cwd.display(),
+        if names.is_empty() {
+            "（这一段没有工具）".to_string()
+        } else {
+            names.join("、")
+        }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use komo_kernel::events::MessageAssistant;
+    use komo_kernel::types::ids::EventId;
+
+    fn event(seq: u64, run: &RunId, payload: EventPayload) -> Event {
+        Event {
+            v: 1,
+            seq: Seq(seq),
+            event_id: EventId::from_raw(format!("evt-{seq}")),
+            session: SessionId::from_raw("sess-1"),
+            run: Some(run.clone()),
+            ts: time::macros::datetime!(2026-09-16 08:00:00 UTC),
+            payload,
+        }
+    }
+
+    #[test]
+    fn a_call_request_comes_back_with_its_provider_id_and_arguments() {
+        let run = RunId::from_raw("run-1");
+        let call = ToolCallId::from_raw("call-1");
+        let events = vec![event(
+            1,
+            &run,
+            EventPayload::MessageAssistant(MessageAssistant {
+                round: 1,
+                text: None,
+                text_ref: None,
+                tool_calls: vec![komo_kernel::types::turn::ToolCallRequest {
+                    call_id: call.clone(),
+                    provider_call_id: "pc-7".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "a.txt"}),
+                    arguments_ref: None,
+                }],
+                provider_blocks: None,
+                input_tokens: None,
+                output_tokens: None,
+            }),
+        )];
+        let surface = fold(&events);
+        let request = call_request(&surface, &events, &call).expect("找得回来");
+        assert_eq!(request.provider_call_id, "pc-7");
+        assert_eq!(request.tool, "read");
+        assert_eq!(request.arguments["path"], "a.txt");
+        assert!(request.plan.is_none(), "还没有计划落盘");
+    }
+
+    #[test]
+    fn the_waiting_approval_is_the_latest_one() {
+        let run = RunId::from_raw("run-1");
+        let events = vec![
+            event(
+                1,
+                &run,
+                EventPayload::RunWaitingApproval(komo_kernel::events::RunWaitingApproval {
+                    approval: komo_kernel::types::ids::ApprovalId::from_raw("ap-1"),
+                    call: Some(ToolCallId::from_raw("call-1")),
+                }),
+            ),
+            event(
+                2,
+                &run,
+                EventPayload::RunWaitingApproval(komo_kernel::events::RunWaitingApproval {
+                    approval: komo_kernel::types::ids::ApprovalId::from_raw("ap-2"),
+                    call: Some(ToolCallId::from_raw("call-2")),
+                }),
+            ),
+        ];
+        let (approval, call) = waiting_approval(&events, &run).expect("停在审批上");
+        assert_eq!(approval.as_str(), "ap-2");
+        assert_eq!(call, Some(ToolCallId::from_raw("call-2")));
+    }
+
+    #[test]
+    fn the_system_prompt_names_the_tools_that_are_actually_mounted() {
+        let prompt = system_prompt(
+            std::path::Path::new("/tmp/w"),
+            &[ToolDefinition {
+                name: "read".into(),
+                description: "读文件".into(),
+                parameters: serde_json::json!({}),
+            }],
+        );
+        assert!(prompt.contains("read"), "{prompt}");
+        assert!(prompt.contains("/tmp/w"), "{prompt}");
+    }
+}

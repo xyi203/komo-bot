@@ -41,5 +41,8 @@ wechat = ["dep:wechatbot", "dep:qrcode"]
 
 [dev-dependencies]
 komo-kernel = { workspace = true, features = ["test-support"] }
+# 测试里自己发 HTTP：reqwest 是 `rustls-no-provider`，provider 平时由 bin 的 `main` 装
+# （§13.4），测试进程里没有那个 `main`，所以自己装一次。
+rustls = { workspace = true }
 komo-store = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

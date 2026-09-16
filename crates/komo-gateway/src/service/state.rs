@@ -1,0 +1,634 @@
+//! Gateway 的进程状态：一次装配，所有入口共用。
+//!
+//! HTTP 与聊天渠道走的是**同一段代码**（§13.1 最后一段），所以"提交一条输入"、"记一个
+//! 审批决定"、"把等着的 Run 放回队列"这些动作都只在这里实现一次；`http` 与
+//! `dispatcher` 各自只做自己的那层翻译。
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use komo_kernel::protocol::config::ConfigSnapshot;
+use komo_kernel::protocol::http::{ApprovalDecisionResponse, SubmitRunResponse};
+use komo_kernel::traits::{
+    ApprovalRepo, Clock, CronRepo, GatewayError, Ledger, LlmClient, MemoryRepo, RepoError,
+    RunQueue, StoreError, ToolOutputStore,
+};
+use komo_kernel::types::chat::{ApprovalScope, ChannelPeer, PeerId};
+use komo_kernel::types::ids::{ApprovalId, ExecutorId, RequestKey, RunId, SessionId};
+use komo_kernel::types::model::ModelConfig;
+use komo_kernel::types::plan::PlanSource;
+use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::turn::{AcceptInput, LlmError, TurnRequest};
+use komo_runtime::agent::handler::{AgentRunHandler, SegmentSource};
+use komo_runtime::agent::{AgentLoop, Budget, ResumedRound, RetryBudget, Segment};
+use komo_runtime::approvals::ApprovalGate;
+use komo_runtime::config::{ConfigHolder, EffortCapabilities};
+use komo_runtime::executor::{CallEnv, ToolExecutor};
+use komo_runtime::policy::PolicyEngine;
+use komo_runtime::recovery::{RecoveryIndex, RecoveryScan, UnfinishedRun};
+use komo_runtime::scheduler::{HandlerError, Scheduler, SchedulerConfig, Waker};
+use komo_store::{
+    Db, RecoveryStore, TursoApprovalRepo, TursoCronRepo, TursoDeliveryRepo, TursoMemoryRepo,
+    TursoRunQueue,
+};
+use time::OffsetDateTime;
+
+use crate::channels::ChannelFactory;
+use crate::channels::ChannelRegistry;
+use crate::deliveries::DeliveryLog;
+use crate::notifier::HomeNotifier;
+use crate::sse::{EventHub, SharedHub};
+
+use super::ledgers::{RoutedLedger, RoutedOutputs, SessionLedgers};
+use super::segment::GatewaySegments;
+
+/// 系统时钟。**进程里唯一读墙上时间的地方**（其余一切经 `Clock`）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> OffsetDateTime {
+        OffsetDateTime::now_utc()
+    }
+}
+
+/// 可以在热重载时换掉的模型后端。
+///
+/// 「模型改完，下一个 Run 用新模型，**正在跑的 Run 继续用它开始时抓的快照**」
+/// （§3 第 2 步）——`begin_turn` 时读一次当前实例，读到之后那个 driver 就属于那个
+/// Run，中途不会被换走。
+pub struct SwappableLlm {
+    inner: arc_swap::ArcSwap<ArcLlm>,
+}
+
+struct ArcLlm(Arc<dyn LlmClient>);
+
+impl std::fmt::Debug for SwappableLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwappableLlm").finish_non_exhaustive()
+    }
+}
+
+impl SwappableLlm {
+    pub fn new(client: Arc<dyn LlmClient>) -> Self {
+        SwappableLlm {
+            inner: arc_swap::ArcSwap::from_pointee(ArcLlm(client)),
+        }
+    }
+
+    /// 换成新造的那一个。**只影响之后开始的 Run。**
+    pub fn swap(&self, client: Arc<dyn LlmClient>) {
+        self.inner.store(Arc::new(ArcLlm(client)));
+    }
+}
+
+#[async_trait]
+impl LlmClient for SwappableLlm {
+    async fn begin_turn(
+        &self,
+        req: TurnRequest,
+    ) -> Result<Box<dyn komo_kernel::traits::TurnDriver>, LlmError> {
+        let current = self.inner.load();
+        current.0.begin_turn(req).await
+    }
+}
+
+/// 没有配置模型 / 配置不可用时的后端：每次调用都报同一个明确的错误。
+///
+/// 它存在只是为了让 Gateway **起得来**——渠道、审批、恢复扫描与操作命令都不依赖模型，
+/// 而一个连 `komo doctor` 都跑不起来的进程什么都诊断不了。
+#[derive(Debug)]
+pub struct UnconfiguredLlm {
+    reason: String,
+}
+
+impl UnconfiguredLlm {
+    pub fn new(reason: impl Into<String>) -> Self {
+        UnconfiguredLlm {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl LlmClient for UnconfiguredLlm {
+    async fn begin_turn(
+        &self,
+        _req: TurnRequest,
+    ) -> Result<Box<dyn komo_kernel::traits::TurnDriver>, LlmError> {
+        Err(LlmError::Rejected {
+            status: 503,
+            message: format!("模型后端不可用：{}", self.reason),
+        })
+    }
+}
+
+/// store 的 `RecoveryStore` 包成 runtime 的 [`RecoveryIndex`]。
+///
+/// 「`UnfinishedRun.retry.exhausted` 由拿着预算的那一层填」——预算在这里
+/// （[`GatewayState::max_retries`]），所以填在这里。
+#[derive(Debug)]
+pub struct RecoveryIndexOf {
+    store: RecoveryStore,
+    max_retries: u32,
+}
+
+impl RecoveryIndexOf {
+    pub fn new(store: RecoveryStore, max_retries: u32) -> Self {
+        RecoveryIndexOf { store, max_retries }
+    }
+}
+
+#[async_trait]
+impl RecoveryIndex for RecoveryIndexOf {
+    async fn unfinished_runs(&self) -> Result<Vec<UnfinishedRun>, StoreError> {
+        Ok(self
+            .store
+            .unfinished_runs()
+            .await?
+            .into_iter()
+            .map(|run| UnfinishedRun {
+                run: run.run,
+                session: run.session,
+                status: run.status,
+                claimed_by: run.claimed_by,
+                retry: run.retry.map(|mut retry| {
+                    retry.exhausted = retry.attempts >= self.max_retries;
+                    retry
+                }),
+                result_delivered: run.result_delivered,
+            })
+            .collect())
+    }
+
+    async fn reclaim_running(&self, executor: &ExecutorId) -> Result<u64, StoreError> {
+        self.store.reclaim_running(executor).await
+    }
+
+    async fn backfill(&self, run: &RunId) -> Result<(), StoreError> {
+        self.store.backfill(run).await
+    }
+
+    async fn requeue(&self, run: &RunId) -> Result<(), StoreError> {
+        self.store.requeue(run).await
+    }
+
+    async fn mark_needs_attention(&self, run: &RunId, reason: &str) -> Result<(), StoreError> {
+        self.store.mark_needs_attention(run, reason).await
+    }
+}
+
+/// 一次装配出来的 Gateway。
+pub struct GatewayState {
+    pub home: PathBuf,
+    pub instance_id: String,
+    pub token: String,
+    pub started_at: OffsetDateTime,
+    pub executor: ExecutorId,
+    pub clock: Arc<dyn Clock>,
+    pub config: Arc<ConfigHolder>,
+    pub caps: EffortCapabilities,
+    pub db: Db,
+    pub hub: SharedHub,
+    pub ledgers: Arc<SessionLedgers>,
+    pub routed: Arc<RoutedLedger>,
+    pub outputs: Arc<dyn ToolOutputStore>,
+    pub queue: Arc<TursoRunQueue>,
+    pub approvals: Arc<ApprovalGate>,
+    pub approval_repo: Arc<dyn ApprovalRepo>,
+    pub cron: Arc<dyn CronRepo>,
+    pub memory: Arc<dyn MemoryRepo>,
+    pub recovery_store: RecoveryStore,
+    pub notifier: Arc<HomeNotifier>,
+    pub channels: Arc<ChannelRegistry>,
+    pub llm: Arc<SwappableLlm>,
+    pub scheduler: Arc<Scheduler>,
+    pub segments: Arc<GatewaySegments>,
+    pub supervisor: Arc<super::channels::ChannelSupervisor>,
+    /// Dispatcher。**构造之后才填**：它握着这份状态，反过来也要被渠道拿到。
+    pub inbound: std::sync::OnceLock<Arc<dyn komo_kernel::traits::Inbound>>,
+    /// 会话的工作目录。
+    ///
+    // TODO(decide: `sessions.workdir` 这一列 store 只在建行时写（`ensure_in` 永远写
+    // `None`），公开面上没有改它的函数，而 `POST /v1/sessions` 收 `workdir`。这里先记在
+    // 进程里——重启后会话回到"用 workspaces/"。要持久化需要 store 加一个
+    // `repos::session::set_workdir_in`，见报告。)
+    pub workdirs: Mutex<std::collections::BTreeMap<SessionId, String>>,
+    /// 模型请求的有界退避预算上限（§8.5）。
+    pub max_retries: u32,
+    /// 一段最多跑几轮模型（§6）。
+    pub max_rounds: u32,
+}
+
+impl std::fmt::Debug for GatewayState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GatewayState")
+            .field("instance_id", &self.instance_id)
+            .field("home", &self.home)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 装配 Gateway 要的那几样外部东西。
+pub struct Assembly {
+    pub home: PathBuf,
+    pub config: Arc<ConfigHolder>,
+    pub caps: EffortCapabilities,
+    pub db: Db,
+    pub clock: Arc<dyn Clock>,
+    pub instance_id: String,
+    pub token: String,
+    /// 测试注入的模型后端；`None` = 按配置造。
+    pub llm: Option<Arc<dyn LlmClient>>,
+    pub tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
+    /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
+    pub channels: Vec<Arc<dyn ChannelFactory>>,
+}
+
+impl GatewayState {
+    /// 把 store、runtime 与渠道接成一个进程。
+    pub async fn assemble(parts: Assembly) -> Result<Arc<GatewayState>, GatewayError> {
+        let Assembly {
+            home,
+            config,
+            caps,
+            db,
+            clock,
+            instance_id,
+            token,
+            llm,
+            tools,
+            channels: factories,
+        } = parts;
+
+        let snapshot = config.current();
+        let executor = ExecutorId::from_raw(instance_id.clone());
+        let hub: SharedHub = Arc::new(EventHub::new());
+        let sessions_root = snapshot.paths.sessions_dir.clone();
+
+        let ledgers = Arc::new(SessionLedgers::new(
+            db.clone(),
+            sessions_root.clone(),
+            Arc::clone(&clock),
+            Arc::clone(&hub),
+            executor.clone(),
+        ));
+        let routed = Arc::new(RoutedLedger::new(Arc::clone(&ledgers), db.clone()));
+        let outputs: Arc<dyn ToolOutputStore> = Arc::new(RoutedOutputs::new(
+            Arc::clone(&ledgers),
+            Arc::clone(&routed),
+        ));
+
+        let queue = Arc::new(TursoRunQueue::new(db.clone()));
+        let approval_repo: Arc<dyn ApprovalRepo> = Arc::new(TursoApprovalRepo::new(db.clone()));
+        let approvals = Arc::new(ApprovalGate::new(
+            Arc::clone(&approval_repo),
+            Arc::clone(&clock),
+        ));
+        let cron: Arc<dyn CronRepo> = Arc::new(TursoCronRepo::new(db.clone()));
+        let memory: Arc<dyn MemoryRepo> = Arc::new(TursoMemoryRepo::new(db.clone()));
+        let deliveries = Arc::new(TursoDeliveryRepo::new(db.clone()));
+        let channels = Arc::new(ChannelRegistry::new());
+        let delivery_log = Arc::new(DeliveryLog::new(
+            deliveries,
+            Arc::clone(&channels),
+            Arc::clone(&clock),
+        ));
+        let notifier = Arc::new(HomeNotifier::new(delivery_log, Arc::clone(&config)));
+
+        let llm = Arc::new(SwappableLlm::new(match llm {
+            Some(client) => client,
+            None => build_llm(&snapshot, &config, &caps),
+        }));
+
+        let executor_tools = Arc::new(ToolExecutor::new(
+            tools,
+            Arc::clone(&routed) as Arc<dyn Ledger>,
+            Arc::clone(&outputs),
+            ApprovalGate::new(Arc::clone(&approval_repo), Arc::clone(&clock)),
+            PolicyEngine::from_rules(snapshot.policy.clone()),
+            Arc::clone(&clock),
+        ));
+
+        let agent = Arc::new(AgentLoop::new(
+            Arc::clone(&llm) as Arc<dyn LlmClient>,
+            Arc::clone(&routed) as Arc<dyn Ledger>,
+            Arc::clone(&executor_tools),
+            Arc::clone(&clock),
+        ));
+
+        let max_rounds = Budget::default().max_rounds;
+        let max_retries = RetryBudget::default().max_attempts;
+
+        let segments = Arc::new(GatewaySegments::new(
+            Arc::clone(&routed),
+            db.clone(),
+            Arc::clone(&approval_repo),
+            snapshot.paths.workspaces_dir.clone(),
+            max_rounds,
+            max_retries,
+        ));
+
+        let handler = Arc::new(AgentRunHandler::new(
+            agent,
+            Arc::clone(&executor_tools),
+            Arc::clone(&routed) as Arc<dyn Ledger>,
+            Arc::clone(&segments) as Arc<dyn SegmentSource>,
+            executor.clone(),
+        ));
+
+        let scheduler = Arc::new(Scheduler::new(
+            Arc::clone(&queue) as Arc<dyn RunQueue>,
+            handler,
+            executor.clone(),
+            SchedulerConfig::default(),
+        ));
+
+        let recovery_store = RecoveryStore::new(db.clone(), sessions_root);
+
+        Ok(Arc::new(GatewayState {
+            home,
+            instance_id,
+            token,
+            started_at: clock.now(),
+            executor,
+            clock,
+            config,
+            caps,
+            db,
+            hub,
+            ledgers,
+            routed,
+            outputs,
+            queue,
+            approvals,
+            approval_repo,
+            cron,
+            memory,
+            recovery_store,
+            notifier,
+            channels,
+            llm,
+            scheduler,
+            segments,
+            supervisor: Arc::new(super::channels::ChannelSupervisor::new(factories)),
+            inbound: std::sync::OnceLock::new(),
+            workdirs: Mutex::new(std::collections::BTreeMap::new()),
+            max_retries,
+            max_rounds,
+        }))
+    }
+
+    pub fn snapshot(&self) -> Arc<ConfigSnapshot> {
+        self.config.current()
+    }
+
+    /// 记下一个会话的工作目录。
+    pub fn remember_workdir(&self, session: &SessionId, workdir: &str) {
+        self.workdirs
+            .lock()
+            .expect("工作目录表")
+            .insert(session.clone(), workdir.to_string());
+    }
+
+    pub fn workdir_of(&self, session: &SessionId) -> Option<String> {
+        self.workdirs
+            .lock()
+            .expect("工作目录表")
+            .get(session)
+            .cloned()
+    }
+
+    /// 按**当前**快照造一个 Cron 调度器。
+    ///
+    /// 每次现造而不是存一个：Job 的模型覆盖之外，它还握着主模型的那一份快照，而模型
+    /// 改完之后下一次触发就该用新的（§3 第 2 步）。
+    pub fn cron_scheduler(&self) -> komo_runtime::scheduler::CronScheduler {
+        komo_runtime::scheduler::CronScheduler::new(
+            Arc::clone(&self.cron),
+            Arc::clone(&self.routed) as Arc<dyn Ledger>,
+            Arc::clone(&self.clock),
+            Arc::new(komo_runtime::scheduler::JiffZoneResolver::new()),
+            self.snapshot().model.clone(),
+        )
+        .with_waker(self.waker())
+    }
+
+    /// 模型 / 凭证变了：换掉实例。**正在跑的 Run 不换**——它握着自己那一个 driver。
+    pub fn rebuild_llm(&self) {
+        let snapshot = self.snapshot();
+        self.llm
+            .swap(build_llm(&snapshot, &self.config, &self.caps));
+        tracing::info!("模型后端已按新配置重建（正在跑的 Run 不受影响）");
+    }
+
+    /// 某个 `[channels.*]` 变了：只停掉并重启那一个渠道（§3 第 3 步）。
+    pub async fn restart_channel(
+        self: &Arc<Self>,
+        platform: komo_kernel::types::chat::ChannelPlatform,
+    ) {
+        let supervisor = Arc::clone(&self.supervisor);
+        supervisor.restart(self, platform).await;
+    }
+
+    pub fn waker(&self) -> Waker {
+        self.scheduler.waker()
+    }
+
+    /// 恢复扫描（§8.7）。
+    pub fn recovery(&self) -> RecoveryScan {
+        RecoveryScan::new(
+            Arc::clone(&self.routed) as Arc<dyn Ledger>,
+            Arc::new(RecoveryIndexOf::new(
+                self.recovery_store.clone(),
+                self.max_retries,
+            )),
+            Arc::clone(&self.outputs),
+            Arc::clone(&self.approval_repo),
+            Arc::clone(&self.clock),
+            self.executor.clone(),
+            Arc::new(komo_runtime::recovery::LockHolderLiveness::holding_lock(
+                self.executor.clone(),
+                komo_runtime::recovery::ChildRegistry::new(
+                    self.snapshot().paths.runtime_dir.join("children"),
+                ),
+            )),
+        )
+    }
+
+    /// 操作者那**一个**常驻会话（§11.2 的 home session）。
+    ///
+    /// 「操作者的私聊——飞书 DM、Telegram DM、WeChat、TUI——全部落到同一个 home
+    /// session」：它是 `sessions` 表里 `origin = "home"` 的那一行，第一次问的时候铸
+    /// 出来，此后一直是它。**不另存一个文件**：会话表本来就答得出这个问题。
+    pub async fn home_session(&self) -> Result<SessionId, GatewayError> {
+        if let Some(existing) = self.find_home_session().await? {
+            return Ok(existing);
+        }
+        let session = SessionId::new_at(self.clock.now());
+        self.ledgers.open(&session, HOME_ORIGIN).await?;
+        // 开的过程里可能有别人也开了一个；以表里最早的那一行为准。
+        Ok(self.find_home_session().await?.unwrap_or(session))
+    }
+
+    async fn find_home_session(&self) -> Result<Option<SessionId>, GatewayError> {
+        let mut homes: Vec<SessionId> = komo_store::repos::session::list(&self.db)
+            .await?
+            .into_iter()
+            .filter(|record| record.origin == HOME_ORIGIN)
+            .map(|record| record.session)
+            .collect();
+        homes.sort();
+        Ok(homes.into_iter().next())
+    }
+
+    /// 提交一条输入：**HTTP 与聊天渠道共用的那一段**（§13.1）。
+    pub async fn submit(
+        &self,
+        session: &SessionId,
+        request_key: RequestKey,
+        text: String,
+        peer: Option<ChannelPeer>,
+        model: Option<ModelConfig>,
+    ) -> Result<SubmitRunResponse, GatewayError> {
+        let snapshot = self.snapshot();
+        let accepted = self
+            .routed
+            .accept_input(AcceptInput {
+                session: session.clone(),
+                request_key,
+                text,
+                source: PlanSource::Interactive {
+                    session: session.clone(),
+                },
+                peer: peer.clone(),
+                // 「新 Run 在 `accept_input` 时抓一份模型 / effort 快照」（§3 第 2 步）。
+                model: model.unwrap_or_else(|| snapshot.model.clone()),
+                at: self.clock.now(),
+            })
+            .await?;
+        self.waker().wake();
+        Ok(SubmitRunResponse {
+            run: accepted.run,
+            session: accepted.session,
+            seq: accepted.seq,
+            status: RunStatus::Queued,
+            deduplicated: accepted.deduplicated,
+        })
+    }
+
+    /// 记一个审批决定，并把等着它的 Run 放回队列。
+    ///
+    /// **重复回答幂等**：已决定的返回原决定（§11.3）。已经决定过的那一次不再叫醒调度器
+    /// ——它早就被叫醒过了。
+    pub async fn decide_approval(
+        &self,
+        approval: &ApprovalId,
+        approved: bool,
+        scope: ApprovalScope,
+        by: Option<PeerId>,
+    ) -> Result<ApprovalDecisionResponse, GatewayError> {
+        let record =
+            self.approval_repo
+                .get(approval)
+                .await?
+                .ok_or_else(|| GatewayError::NotFound {
+                    what: format!("审批 {approval}"),
+                })?;
+        let response = self
+            .approvals
+            .decide(approval, approved, scope, by)
+            .await
+            .map_err(GatewayError::from)?;
+
+        if !response.already_decided {
+            self.hub.publish_decision(
+                &record.session,
+                approval,
+                response.decision.approved,
+                komo_kernel::types::ids::Seq::ZERO,
+            );
+            // 界面回写：**决定先落账本，再回写界面**（§11.3）。渠道据此把卡片原地
+            // 更新成"已批准 / 已拒绝 · 谁 · 何时"；投不出去不改变结论。
+            let settled = komo_kernel::types::chat::Outbound::ApprovalSettled {
+                approval: record.approval.clone(),
+                short_id: record.short_id.clone(),
+                approved: response.decision.approved,
+                by: response
+                    .decision
+                    .by
+                    .clone()
+                    .unwrap_or_else(|| PeerId::new("operator")),
+                at: response.decision.decided_at,
+            };
+            if let Err(error) = self.notifier.deliver_home(settled).await {
+                tracing::debug!(%error, "没有 home chat 可投，跳过界面回写");
+            }
+            if let Some(run) = &record.run {
+                self.wake_run(run).await?;
+            }
+        }
+        Ok(response)
+    }
+
+    /// 把一个等着的 Run 放回队列并叫醒调度器（`/approve` 之后、`resume` 之后都走它）。
+    pub async fn wake_run(&self, run: &RunId) -> Result<(), GatewayError> {
+        self.recovery_store.requeue(run).await?;
+        self.waker().wake();
+        Ok(())
+    }
+
+    /// 取消一个 Run。
+    ///
+    /// 已终态的返回原状态而不是报错——重复取消是幂等的，而"取消一个已经完成的任务"不是
+    /// 一个错误，是一句"它已经完成了"。
+    pub async fn cancel_run(&self, run: &RunId) -> Result<RunStatus, GatewayError> {
+        let record = komo_store::repos::runs::get(&self.db, run)
+            .await?
+            .ok_or_else(|| GatewayError::NotFound {
+                what: format!("run {run}"),
+            })?;
+        if record.status.is_terminal() {
+            return Ok(record.status);
+        }
+        self.segments.cancel(run);
+        let session = record.session.clone();
+        let entry = self.ledgers.open(&session, "agent").await?;
+        entry
+            .ledger
+            .complete(
+                run,
+                komo_kernel::types::status::RunEnd::Cancelled { by: None },
+            )
+            .await?;
+        Ok(RunStatus::Cancelled)
+    }
+}
+
+/// `sessions.origin` 里 home session 的那个值。
+pub const HOME_ORIGIN: &str = "home";
+
+/// 按快照造模型后端；造不出来就退到 [`UnconfiguredLlm`]，**不让 Gateway 起不来**。
+fn build_llm(
+    snapshot: &ConfigSnapshot,
+    config: &ConfigHolder,
+    caps: &EffortCapabilities,
+) -> Arc<dyn LlmClient> {
+    let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone());
+    match komo_runtime::llm::RoutingLlm::from_snapshot(snapshot, factory) {
+        Ok(routing) => Arc::new(routing),
+        Err(error) => {
+            tracing::warn!(%error, "模型后端造不出来：Gateway 照常启动，模型调用会报这个错");
+            Arc::new(UnconfiguredLlm::new(error.to_string()))
+        }
+    }
+}
+
+/// `RepoError` / `StoreError` 到 Gateway 错误。
+pub fn repo_error(error: RepoError) -> GatewayError {
+    GatewayError::Repo(error)
+}
+
+#[allow(dead_code)]
+fn assert_segment_types(_: &ResumedRound, _: &Segment, _: &CallEnv, _: HandlerError) {}

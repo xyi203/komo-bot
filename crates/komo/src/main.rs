@@ -1,9 +1,18 @@
 //! komo 二进制：clap 分发（docs/komo_bot.md §3 命令表、§13.4）。
 //!
-//! 这一层只做分发：`komo` / `komo resume` 与操作子命令走 komo-client，
-//! `komo gateway` 走 komo-gateway。命令体在 W4 填。
+//! 这一层只做分发：`komo` / `komo home` / `komo resume` 与操作子命令走 komo-client，
+//! `komo gateway` 走 komo-gateway。**没有第二份业务逻辑**——每条命令要么打一个 HTTP
+//! 接口，要么读一次配置文件。
+
+mod commands;
+mod connect;
+
+use std::path::Path;
 
 use clap::{Parser, Subcommand};
+use komo_client::{TuiMode, run_tui};
+use komo_kernel::protocol::http::CreateSessionRequest;
+use komo_kernel::types::ids::SessionId;
 
 #[derive(Parser)]
 #[command(name = "komo", version, about = "komo：个人 Agent 框架", long_about = None)]
@@ -15,6 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// 操作者那一个常驻会话：早上在微信说的话，回到终端接着说（§11.2）。
+    Home,
     /// 连接原会话并查看进度或处理待办；恢复调度由 Gateway 自动进行（§3）。
     Resume {
         /// 会话 ID。
@@ -126,7 +137,21 @@ enum ApprovalCommand {
 #[derive(Subcommand)]
 enum CronCommand {
     /// 创建定时任务。
-    Add,
+    Add {
+        #[arg(long)]
+        name: String,
+        /// 五字段 cron 表达式，或 `@at YYYY-MM-DD HH:MM`。
+        #[arg(long)]
+        schedule: String,
+        /// IANA 时区名。
+        #[arg(long, default_value = "UTC")]
+        timezone: String,
+        #[arg(long)]
+        prompt: String,
+        /// 这个 Job 的工作目录；**创建时就核实**（§10）。
+        #[arg(long)]
+        workdir: Option<String>,
+    },
     /// 列出定时任务。
     List,
     /// 手动触发一次。
@@ -169,11 +194,16 @@ enum MemoryCommand {
     Confirm {
         /// 记忆 ID。
         memory_id: String,
+        /// 预期 revision（§9.6：confirm / forget 都带着它来）。
+        #[arg(long)]
+        revision: u32,
     },
     /// 停用指定 revision 并失效索引；不删除 Memos 原文。
     Forget {
         /// 记忆 ID。
         memory_id: String,
+        #[arg(long)]
+        revision: u32,
     },
     /// 向量索引（§9.5）。
     Index {
@@ -238,7 +268,8 @@ enum SkillsCommand {
     },
 }
 
-fn main() {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
     // §13.4 reqwest 行：reqwest 用 `rustls-no-provider`，进程里必须由我们自己装上
     // ring provider。这一步必须发生在任何网络线程之前——特别是飞书 ws 线程启动之前，
     // 否则第一次握手会因为没有默认 provider 而 panic。
@@ -247,65 +278,345 @@ fn main() {
         .expect("安装 rustls ring provider");
 
     let cli = Cli::parse();
+    let home = connect::komo_home();
+
+    let code = match dispatch(cli, &home).await {
+        Ok(Some(text)) => {
+            if !text.is_empty() {
+                println!("{text}");
+            }
+            0
+        }
+        Ok(None) => 0,
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    };
+    std::process::exit(code);
+}
+
+/// 跑一条命令。`Ok(None)` = 这条命令自己管输出（TUI、前台 Gateway）。
+async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
     match cli.command {
-        // `komo`：确保本机 Gateway 就绪，创建新 Session，进入 TUI 聊天。
-        None => todo!("W4"),
-        Some(Command::Resume { .. }) => todo!("W4"),
-        Some(Command::Session { action }) => match action {
-            SessionCommand::List => todo!("W4"),
-        },
-        Some(Command::Run { action }) => match action {
-            RunCommand::Inspect { .. } => todo!("W4"),
-            RunCommand::Cancel { .. } => todo!("W4"),
-        },
-        Some(Command::Gateway { action, .. }) => match action {
-            None => todo!("W4"),
-            Some(GatewayCommand::Status) => todo!("W4"),
-            Some(GatewayCommand::Stop) => todo!("W4"),
-            Some(GatewayCommand::Restart) => todo!("W4"),
-        },
-        Some(Command::Approval { action }) => match action {
-            ApprovalCommand::List => todo!("W4"),
-            ApprovalCommand::Show { .. } => todo!("W4"),
-            ApprovalCommand::Approve { .. } => todo!("W4"),
-            ApprovalCommand::Reject { .. } => todo!("W4"),
-        },
-        Some(Command::Cron { action }) => match action {
-            CronCommand::Add => todo!("W4"),
-            CronCommand::List => todo!("W4"),
-            CronCommand::Run { .. } => todo!("W4"),
-            CronCommand::Pause { .. } => todo!("W4"),
-            CronCommand::Resume { .. } => todo!("W4"),
-            CronCommand::Remove { .. } => todo!("W4"),
-        },
-        Some(Command::Memory { action }) => match action {
-            MemoryCommand::List => todo!("W4"),
-            MemoryCommand::Search { .. } => todo!("W4"),
-            MemoryCommand::Show { .. } => todo!("W4"),
-            MemoryCommand::Confirm { .. } => todo!("W4"),
-            MemoryCommand::Forget { .. } => todo!("W4"),
-            MemoryCommand::Index { action } => match action {
-                MemoryIndexCommand::Status => todo!("W4"),
-                MemoryIndexCommand::Rebuild => todo!("W4"),
-            },
-        },
-        Some(Command::Config { action }) => match action {
-            ConfigCommand::Check => todo!("W4"),
-            ConfigCommand::Reload => todo!("W4"),
-        },
+        // `komo`：确保本机 Gateway 就绪，创建新 Session，进入 TUI 聊天（§3）。
+        None => {
+            init_tracing(None);
+            let client = connect::connect_or_start(home).await?;
+            let session = client
+                .create_session(&CreateSessionRequest::default())
+                .await
+                .map_err(|error| error.to_string())?;
+            run_tui(client, session.session, TuiMode::New)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(None)
+        }
+        Some(Command::Home) => {
+            init_tracing(None);
+            let client = connect::connect_or_start(home).await?;
+            let discovery = komo_client::discovery::read_discovery_file(home)
+                .map_err(|error| error.to_string())?;
+            let session = komo_gateway::http::fetch_home_session(
+                client.base_url(),
+                discovery.token.as_deref(),
+            )
+            .await?;
+            run_tui(client, session.session, TuiMode::Home)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(None)
+        }
+        Some(Command::Resume { session_id }) => {
+            init_tracing(None);
+            let client = connect::connect_or_start(home).await?;
+            run_tui(client, SessionId::from_raw(session_id), TuiMode::Resume)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(None)
+        }
+        Some(Command::Gateway { foreground, action }) => gateway(home, foreground, action).await,
+        Some(Command::Doctor) => commands::doctor(home).await.map(Some),
+        // 三条不经 Gateway 的（§3）。
         Some(Command::Channel { action }) => match action {
-            ChannelCommand::List => todo!("W4"),
-            ChannelCommand::Probe => todo!("W4"),
+            ChannelCommand::List => commands::channel_list(home).map(Some),
+            ChannelCommand::Probe => commands::channel_probe(home).await.map(Some),
             ChannelCommand::Wechat { action } => match action {
-                WechatCommand::Login => todo!("W4"),
+                // TODO(decide: 微信登录要 wechatbot 的二维码流程，实现在
+                // `channels/wechat.rs`（另一个子代理的文件）。接上之前先说清楚。)
+                WechatCommand::Login => {
+                    Err("微信渠道还没接上，`komo channel wechat login` 暂时不可用".into())
+                }
             },
         },
-        Some(Command::Skills { action }) => match action {
-            SkillsCommand::List => todo!("W4"),
-            SkillsCommand::Inspect { .. } => todo!("W4"),
-            SkillsCommand::Enable { .. } => todo!("W4"),
-            SkillsCommand::Disable { .. } => todo!("W4"),
+        Some(Command::Skills { action }) => {
+            use commands::SkillsAction;
+            let action = match &action {
+                SkillsCommand::List => SkillsAction::List,
+                SkillsCommand::Inspect { name } => SkillsAction::Inspect(name),
+                SkillsCommand::Enable { name } => SkillsAction::Enable(name),
+                SkillsCommand::Disable { name } => SkillsAction::Disable(name),
+            };
+            commands::skills(home, action).map(Some)
+        }
+        // 其余都要一个在跑的 Gateway。
+        other => {
+            let client = connect::connect_or_start(home).await?;
+            operator(other, &client).await.map(Some)
+        }
+    }
+}
+
+async fn operator(
+    command: Option<Command>,
+    client: &komo_client::KomoClient,
+) -> Result<String, String> {
+    let Some(command) = command else {
+        return Err("没有这条命令".into());
+    };
+    match command {
+        Command::Session { action } => match action {
+            SessionCommand::List => commands::session_list(client).await,
         },
-        Some(Command::Doctor) => todo!("W4"),
+        Command::Run { action } => match action {
+            RunCommand::Inspect { run_id } => commands::run_inspect(client, &run_id).await,
+            RunCommand::Cancel { run_id } => commands::run_cancel(client, &run_id).await,
+        },
+        Command::Approval { action } => match action {
+            ApprovalCommand::List => commands::approval_list(client).await,
+            ApprovalCommand::Show { approval_id } => {
+                commands::approval_show(client, &approval_id).await
+            }
+            ApprovalCommand::Approve { approval_id } => {
+                commands::approval_decide(client, &approval_id, true).await
+            }
+            ApprovalCommand::Reject { approval_id } => {
+                commands::approval_decide(client, &approval_id, false).await
+            }
+        },
+        Command::Cron { action } => match action {
+            CronCommand::Add {
+                name,
+                schedule,
+                timezone,
+                prompt,
+                workdir,
+            } => {
+                commands::cron_add(
+                    client,
+                    &name,
+                    &schedule,
+                    &timezone,
+                    &prompt,
+                    workdir.as_deref(),
+                )
+                .await
+            }
+            CronCommand::List => commands::cron_list(client).await,
+            CronCommand::Run { job_id } => commands::cron_run(client, &job_id).await,
+            CronCommand::Pause { job_id } => {
+                commands::cron_status(client, &job_id, komo_kernel::cron::JobStatus::Paused).await
+            }
+            CronCommand::Resume { job_id } => {
+                commands::cron_status(client, &job_id, komo_kernel::cron::JobStatus::Active).await
+            }
+            CronCommand::Remove { job_id } => commands::cron_remove(client, &job_id).await,
+        },
+        Command::Memory { action } => match action {
+            MemoryCommand::List => commands::memory_list(client, None).await,
+            MemoryCommand::Search { query } => commands::memory_list(client, Some(&query)).await,
+            MemoryCommand::Show { memory_id } => commands::memory_show(client, &memory_id).await,
+            MemoryCommand::Confirm {
+                memory_id,
+                revision,
+            } => commands::memory_confirm(client, &memory_id, revision).await,
+            MemoryCommand::Forget {
+                memory_id,
+                revision,
+            } => commands::memory_forget(client, &memory_id, revision).await,
+            MemoryCommand::Index { action } => match action {
+                MemoryIndexCommand::Status => commands::memory_index(client).await,
+                MemoryIndexCommand::Rebuild => commands::memory_rebuild(client).await,
+            },
+        },
+        Command::Config { action } => match action {
+            ConfigCommand::Check => commands::config_check(client).await,
+            ConfigCommand::Reload => commands::config_reload(client).await,
+        },
+        _ => Err("没有这条命令".into()),
+    }
+}
+
+/// `komo gateway [--foreground] [status|stop|restart]`（§3）。
+async fn gateway(
+    home: &Path,
+    foreground: bool,
+    action: Option<GatewayCommand>,
+) -> Result<Option<String>, String> {
+    use komo_gateway::service::units;
+
+    match action {
+        // 前台运行：服务管理器起的就是这一种。
+        None if foreground => {
+            init_tracing(Some(home));
+            komo_gateway::run(komo_gateway::ServiceOptions {
+                home: Some(home.to_path_buf()),
+                listen: None,
+                channels: komo_gateway::channels::factories(),
+                llm: None,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            Ok(None)
+        }
+        // 后台启动，等就绪后返回。
+        None => {
+            init_tracing(None);
+            connect::request_start(home)?;
+            let client = connect::wait_ready(home).await?;
+            let health = client.health().await.map_err(|error| error.to_string())?;
+            Ok(Some(format!(
+                "Gateway 就绪：{}（实例 {}）",
+                client.base_url(),
+                health.instance_id
+            )))
+        }
+        Some(GatewayCommand::Status) => match connect::connect(home).await {
+            Ok(client) => {
+                let health = client.health().await.map_err(|error| error.to_string())?;
+                let managed = units::status().unwrap_or_else(|error| format!("（{error}）"));
+                Ok(Some(format!(
+                    "在跑：{}（实例 {}，启动于 {}）\n服务管理器：{}",
+                    client.base_url(),
+                    health.instance_id,
+                    health.started_at,
+                    managed.trim()
+                )))
+            }
+            // **不隐式启动服务**（§3）。
+            Err(error) => Ok(Some(format!("没在跑：{error}"))),
+        },
+        Some(GatewayCommand::Stop) => {
+            units::stop().map_err(|error| error.to_string())?;
+            Ok(Some("已请服务管理器停止 Gateway".into()))
+        }
+        Some(GatewayCommand::Restart) => {
+            units::restart(&connect::user_home(), home).map_err(|error| error.to_string())?;
+            let client = connect::wait_ready(home).await?;
+            Ok(Some(format!("Gateway 已重启：{}", client.base_url())))
+        }
+    }
+}
+
+/// 日志：级别看 `KOMO_LOG`，前台 Gateway 同时写 `logs/gateway.log`。
+fn init_tracing(gateway_home: Option<&Path>) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_env("KOMO_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+
+    let file = gateway_home.and_then(|home| {
+        let dir = home.join("logs");
+        std::fs::create_dir_all(&dir).ok()?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("gateway.log"))
+            .ok()?;
+        Some(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Arc::new(file)),
+        )
+    });
+
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(stderr)
+        .with(file)
+        .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// clap 的命令树自洽（重名、短选项冲突、必填与默认值打架都在这里挂）。
+    #[test]
+    fn the_command_tree_is_well_formed() {
+        Cli::command().debug_assert();
+    }
+
+    /// §3 的命令表里那几条要能解析出来。
+    #[test]
+    fn the_documented_commands_parse() {
+        assert!(Cli::parse_from(["komo"]).command.is_none());
+        assert!(matches!(
+            Cli::parse_from(["komo", "home"]).command,
+            Some(Command::Home)
+        ));
+        assert!(matches!(
+            Cli::parse_from(["komo", "resume", "sess-1"]).command,
+            Some(Command::Resume { .. })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["komo", "gateway", "--foreground"]).command,
+            Some(Command::Gateway {
+                foreground: true,
+                action: None
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["komo", "gateway", "status"]).command,
+            Some(Command::Gateway {
+                action: Some(GatewayCommand::Status),
+                ..
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["komo", "config", "check"]).command,
+            Some(Command::Config {
+                action: ConfigCommand::Check
+            })
+        ));
+    }
+
+    /// `komo cron add` 的四个必填项。
+    #[test]
+    fn cron_add_requires_a_schedule_and_a_prompt() {
+        let parsed = Cli::parse_from([
+            "komo",
+            "cron",
+            "add",
+            "--name",
+            "morning",
+            "--schedule",
+            "0 9 * * *",
+            "--timezone",
+            "Asia/Shanghai",
+            "--prompt",
+            "整理今天的动态",
+        ]);
+        let Some(Command::Cron {
+            action:
+                CronCommand::Add {
+                    name,
+                    schedule,
+                    timezone,
+                    ..
+                },
+        }) = parsed.command
+        else {
+            panic!("解析不出 cron add");
+        };
+        assert_eq!(name, "morning");
+        assert_eq!(schedule, "0 9 * * *");
+        assert_eq!(timezone, "Asia/Shanghai");
+
+        // 少一个必填项就该失败，而不是用一个猜出来的默认值跑起来。
+        assert!(Cli::try_parse_from(["komo", "cron", "add", "--name", "x"]).is_err());
     }
 }

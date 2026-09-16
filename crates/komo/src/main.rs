@@ -342,10 +342,15 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
             ChannelCommand::List => commands::channel_list(home).map(Some),
             ChannelCommand::Probe => commands::channel_probe(home).await.map(Some),
             ChannelCommand::Wechat { action } => match action {
-                // TODO(decide: 微信登录要 wechatbot 的二维码流程，实现在
-                // `channels/wechat.rs`（另一个子代理的文件）。接上之前先说清楚。)
+                // 不经 Gateway（§3）：二维码打到 stderr，凭证写入数据目录 `wechat/credentials.json`
+                // （0600）。返回值里不带 token / userId。
                 WechatCommand::Login => {
-                    Err("微信渠道还没接上，`komo channel wechat login` 暂时不可用".into())
+                    let path = komo_gateway::channels::wechat::credentials_path(home);
+                    let mut out = std::io::stderr();
+                    komo_gateway::channels::wechat::login(&path, &mut out)
+                        .await
+                        .map(|_| Some(format!("微信登录成功，凭证已写入 {}", path.display())))
+                        .map_err(|error| error.to_string())
                 }
             },
         },

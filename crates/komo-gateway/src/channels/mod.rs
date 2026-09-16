@@ -153,7 +153,7 @@ pub fn factories() -> Vec<Arc<dyn ChannelFactory>> {
     #[cfg(feature = "feishu")]
     out.push(Arc::new(feishu::FeishuFactory::new()));
     #[cfg(feature = "wechat")]
-    out.push(Arc::new(NotWired::new(ChannelPlatform::Wechat)));
+    out.push(Arc::new(wechat::WeChatFactory::new()));
     out
 }
 

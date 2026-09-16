@@ -32,6 +32,9 @@ toasty = { version = "0.10.0", default-features = false, features = ["turso"] }
 # spikes/store.md：关掉 turso 默认特性 `fts`（MVCC 下本来就被拒绝），tantivy / zstd-sys / lz4 与
 # 一条 C 工具链随之消失，少 62 个编译单元；toasty-driver-turso 也 vendor 一份只改 4 行 manifest 对齐。
 turso = { version = "0.7.2", default-features = false, features = ["mimalloc"] }
+# toasty 0.10 不再导出驱动类型（`Turso::file(..).concurrent_writes()` 只在驱动里），store 直接依赖它；
+# [patch.crates-io] 已把它指向 vendor/ 那一份。
+toasty-driver-turso = { version = "0.10.0", default-features = false }
 
 # §13.4：`rustls` 特性 = `__rustls-aws-lc-rs`；`no-provider` 后由 komo 在 main 里
 # 安装 ring provider，且必须在飞书 ws 线程启动之前。

@@ -9,8 +9,13 @@ license.workspace = true
 [dependencies]
 komo-kernel = { workspace = true }
 toasty = { workspace = true }
+# §8.2：`Turso::file(path).concurrent_writes()` 这个具体驱动类型 toasty 不再导出，只能
+# 直接依赖驱动包。工作区的 `[patch.crates-io]` 把它指向 vendor/ 那一份（关掉 `fts`）。
+# **待编排者把它提到 `[workspace.dependencies]`**——版本号现在写在这里，与 toasty 的
+# major 手工对齐。
+toasty-driver-turso = { workspace = true }
 turso = { workspace = true }
-tokio = { workspace = true, features = ["fs"] }
+tokio = { workspace = true, features = ["fs", "io-util"] }
 sha2 = { workspace = true }
 
 serde = { workspace = true }
@@ -20,6 +25,12 @@ time = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+# 只在 `test-support` 下进入构建（见 [features]）。
+tempfile = { workspace = true, optional = true }
+
+[features]
+# §13.4：跨 crate 需要的构造器放在 test-support 后面，只作为 dev-dependency 启用。
+test-support = ["dep:tempfile"]
 
 [dev-dependencies]
 komo-kernel = { workspace = true, features = ["test-support"] }

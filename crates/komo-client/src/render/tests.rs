@@ -4,18 +4,15 @@ use super::*;
 use crate::tui::test_support as fixture;
 use komo_kernel::cron::{TimeZone, Trigger};
 use komo_kernel::protocol::PROTOCOL_VERSION;
-use komo_kernel::protocol::config::{
-    ChannelConfig, ChannelsConfig, KeyPath, MemoryConfig, PathsConfig, RetrievalConfig, SourceFile,
-    StartOnly,
-};
+use komo_kernel::protocol::config::{KeyPath, SourceFile};
 use komo_kernel::protocol::http::{
-    ApprovalDecisionRecord, RunSummary, SessionSummary, ToolCallSummary,
+    ApprovalDecisionRecord, ModelMenuEntry, RunSummary, SessionSummary, ToolCallSummary,
 };
 use komo_kernel::types::chat::{ApprovalScope, PeerId};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{Evidence, EvidenceRef, ExtractionMetadata, MemoryUsage};
-use komo_kernel::types::model::{Effort, ModelConfig};
+use komo_kernel::types::model::Effort;
 use komo_kernel::types::refs::{ContentRef, OutputRef};
 use komo_kernel::types::turn::MemoryUse;
 use std::path::PathBuf;
@@ -385,77 +382,13 @@ fn issues() -> Vec<ConfigIssue> {
     ]
 }
 
-#[test]
-fn config_check_locates_every_problem_at_a_key() {
-    let printed = config_check(&issues());
-    insta_like(
-        &printed,
-        &[
-            "错误  memory.embedding.base_url: 缺少 base_url",
-            "警告  channels.telegram.allow_from: 已启用但名单为空",
-            "1 个错误——这份配置不会被装上",
-        ],
-    );
-}
-
-#[test]
-fn config_check_with_only_warnings_does_not_claim_the_config_is_rejected() {
-    let only_warning = vec![issues()[1].clone()];
-    let printed = config_check(&only_warning);
-    assert!(printed.contains("1 个警告，没有错误"), "{printed}");
-    assert!(!printed.contains("不会被装上"), "{printed}");
-}
-
-#[test]
-fn config_check_on_a_clean_config_says_so() {
-    assert_eq!(config_check(&[]), "配置校验通过");
-}
-
-fn model(name: &str) -> ModelConfig {
-    ModelConfig {
-        provider: "openai_compatible".into(),
-        base_url: "https://llm.example.com/v1".into(),
-        model: name.into(),
-        api_key_env: "KOMO_LLM_API_KEY".into(),
-        effort: None,
-        timeout_secs: 120,
-    }
-}
-
-fn snapshot(loaded_at: OffsetDateTime, mtime: OffsetDateTime) -> ConfigSnapshot {
-    ConfigSnapshot {
-        start_only: StartOnly {
-            data_dir: PathBuf::from("/home/u/.komo"),
-            listen: "127.0.0.1:7777".into(),
-            db_path: PathBuf::from("/home/u/.komo/state.db"),
-            python_env_root: PathBuf::from("/home/u/.komo/python-envs"),
-        },
-        model: model("chat-a"),
-        memory: MemoryConfig {
-            enabled: true,
-            model: model("memory-a"),
-            embedding: None,
-            retrieval: RetrievalConfig::default(),
-        },
-        channels: ChannelsConfig {
-            telegram: ChannelConfig {
-                enabled: true,
-                allow_from: vec![],
-                home_chat: None,
-                groups: vec![],
-            },
-            ..ChannelsConfig::default()
-        },
-        policy: komo_kernel::policy::RuleTable::default(),
-        paths: PathsConfig {
-            sessions_dir: "/home/u/.komo/sessions".into(),
-            toolbox_dir: "/home/u/.komo/toolbox".into(),
-            skill_dirs: vec![],
-            runtime_dir: "/home/u/.komo/runtime".into(),
-            logs_dir: "/home/u/.komo/logs".into(),
-            workspaces_dir: "/home/u/.komo/workspaces".into(),
-        },
-        credentials: Default::default(),
+fn config_response(
+    issues: Vec<ConfigIssue>,
+    loaded_at: OffsetDateTime,
+    mtime: OffsetDateTime,
+) -> ConfigCheckResponse {
+    ConfigCheckResponse {
+        issues,
         loaded_at,
         sources: vec![SourceFile {
             path: PathBuf::from("/home/u/.komo/config.toml"),
@@ -475,12 +408,131 @@ fn health() -> HealthResponse {
 }
 
 #[test]
+fn config_check_locates_every_problem_at_a_key() {
+    let printed = config_check(&config_response(issues(), NOW, NOW));
+    insta_like(
+        &printed,
+        &[
+            "错误  memory.embedding.base_url: 缺少 base_url",
+            "警告  channels.telegram.allow_from: 已启用但名单为空",
+            "1 个错误——这份配置不会被装上",
+            "当前配置装载于 2026-09-16 08:00:00",
+        ],
+    );
+}
+
+#[test]
+fn config_check_with_only_warnings_does_not_claim_the_config_is_rejected() {
+    let printed = config_check(&config_response(vec![issues()[1].clone()], NOW, NOW));
+    assert!(printed.contains("1 个警告，没有错误"), "{printed}");
+    assert!(!printed.contains("不会被装上"), "{printed}");
+}
+
+#[test]
+fn config_check_on_a_clean_config_says_so() {
+    let printed = config_check(&config_response(vec![], NOW, NOW));
+    assert!(printed.starts_with("配置校验通过"), "{printed}");
+}
+
+#[test]
+fn config_check_calls_out_a_file_edited_after_the_config_was_loaded() {
+    let printed = config_check(&config_response(
+        vec![],
+        NOW,
+        NOW + time::Duration::minutes(5),
+    ));
+    assert!(printed.contains("⚠ 文件改了但没装上"), "{printed}");
+}
+
+#[test]
+fn a_reload_names_the_keys_that_changed_without_their_values() {
+    let printed = config_reload(&ConfigReloadResponse {
+        changed: vec![
+            KeyPath::new("model.model"),
+            KeyPath::new("start_only.listen"),
+        ],
+        start_only: vec![KeyPath::new("start_only.listen")],
+        warnings: vec![issues()[1].clone()],
+    });
+    insta_like(
+        &printed,
+        &[
+            "2 个键变化",
+            "model.model",
+            // §3 第 4 步：不静默忽略，也不假装已生效。
+            "只在启动时生效",
+            "komo gateway restart",
+            "警告  channels.telegram.allow_from",
+        ],
+    );
+    // 只出键名，不出值。
+    assert!(!printed.contains("127.0.0.1"), "{printed}");
+}
+
+#[test]
+fn a_reload_that_changed_nothing_says_so() {
+    let printed = config_reload(&ConfigReloadResponse::default());
+    assert_eq!(printed, "配置已重新装载，没有键变化");
+}
+
+#[test]
+fn a_rejected_reload_prints_the_keys_and_says_the_old_config_stands() {
+    let error = crate::error::ClientError::from_body(
+        400,
+        r#"{"error":{"code":"config_invalid","message":"缺少 base_url","keys":["memory.embedding.base_url"]}}"#,
+    );
+    let printed = config_error(&error);
+    insta_like(
+        &printed,
+        &[
+            "缺少 base_url",
+            "memory.embedding.base_url",
+            "运行中的 Gateway 保留原配置",
+        ],
+    );
+}
+
+#[test]
+fn a_model_list_says_which_efforts_each_model_takes() {
+    let printed = model_list(&ModelsResponse {
+        models: vec![
+            ModelMenuEntry {
+                id: "chat-a".into(),
+                provider: "openai_compatible".into(),
+                efforts: vec![Effort::new("low"), Effort::new("high")],
+                default: true,
+            },
+            ModelMenuEntry {
+                id: "chat-b".into(),
+                provider: "anthropic".into(),
+                efforts: vec![],
+                default: false,
+            },
+        ],
+    });
+    insta_like(
+        &printed,
+        &[
+            "chat-a",
+            "low · high",
+            "← 当前",
+            "chat-b",
+            // 空表 = 一档都不支持，不是「还不知道」。
+            "（不接受显式 effort）",
+        ],
+    );
+}
+
+#[test]
 fn doctor_calls_out_a_file_that_was_edited_after_the_config_was_loaded() {
     // §3：两者不一致就是「文件改了但没装上」。
     let printed = doctor(
         &health(),
-        Some(&snapshot(NOW, NOW + time::Duration::minutes(5))),
-        &issues(),
+        Some(&config_response(
+            issues(),
+            NOW,
+            NOW + time::Duration::minutes(5),
+        )),
     );
     insta_like(
         &printed,
@@ -501,26 +553,19 @@ fn doctor_calls_out_a_file_that_was_edited_after_the_config_was_loaded() {
 fn doctor_is_quiet_about_staleness_when_the_file_has_not_moved() {
     let printed = doctor(
         &health(),
-        Some(&snapshot(NOW, NOW - time::Duration::minutes(1))),
-        &[],
+        Some(&config_response(
+            vec![],
+            NOW,
+            NOW - time::Duration::minutes(1),
+        )),
     );
     assert!(!printed.contains("没装上"), "{printed}");
     assert!(!printed.contains("上一次校验"), "{printed}");
 }
 
 #[test]
-fn doctor_warns_about_a_channel_nobody_can_speak_through() {
-    let printed = doctor(&health(), Some(&snapshot(NOW, NOW)), &[]);
-    assert!(
-        printed.contains("channels.telegram 已启用但 allow_from 为空"),
-        "{printed}"
-    );
-    assert!(printed.contains("没有任何渠道配了 home_chat"), "{printed}");
-}
-
-#[test]
 fn doctor_without_a_snapshot_says_it_could_not_get_one() {
-    let printed = doctor(&health(), None, &[]);
+    let printed = doctor(&health(), None);
     assert!(printed.contains("取不到当前快照"), "{printed}");
 }
 

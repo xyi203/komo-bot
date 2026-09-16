@@ -3,6 +3,10 @@
 //! 两条语义在这里落地，它们都不是"存一行"那么简单：
 //!
 //! - **重复回答幂等**：已决定的返回原决定并把 `already_decided` 置位，不报错（§11.3）。
+//! - **`ConsumeIntent` 把「第一次跑」和「恢复核对过」分开**（§7.4）：一条已经用掉的
+//!   一次性授权，对 [`ConsumeIntent::First`] 是一个可分辨的失败，而不是悄悄放行第二次
+//!   副作用；只有 [`ConsumeIntent::KnownNotToHaveRun`] 才豁免 `consumed` 这**一条**，
+//!   计划、范围、版本、有效期照查。
 //! - **消费的参数是整份计划，不是它的哈希**（§7.2）。三种范围核对的不是同一件事：
 //!   `Once` 按计划哈希逐字比，且消费后标 `consumed`；`Run` / `CronJob` 按
 //!   [`Grant::covers`] 判定，**不因一次使用而消耗**，但返回的 [`ConsumedApproval`] 仍
@@ -13,13 +17,13 @@ use komo_kernel::policy::{Grant, GrantScope};
 use komo_kernel::protocol::http::{
     ApprovalDecisionRecord, ApprovalDecisionResponse, ApprovalRecord,
 };
-use komo_kernel::traits::{ApprovalRepo, RepoError};
+use komo_kernel::traits::{ApprovalRepo, RepoError, StoreError};
 use komo_kernel::types::ids::{ApprovalId, CronJobId, RunId, SessionId, ShortId};
-use komo_kernel::types::plan::{ConsumedApproval, ExecutionPlan};
+use komo_kernel::types::plan::{ConsumeIntent, ConsumedApproval, ExecutionPlan};
 use time::OffsetDateTime;
 use toasty::Executor;
 
-use crate::db::{BoxFuture, Db, decode, encode, map_toasty, store_to_repo, to_ts, to_ts_opt};
+use crate::db::{BoxFuture, Db, decode, encode, map_toasty, to_ts, to_ts_opt};
 use crate::models::{ApprovalRequestRow, PolicyGrantRow};
 
 /// Turso 上的 [`ApprovalRepo`]。
@@ -39,10 +43,10 @@ impl TursoApprovalRepo {
             .with_write_retry(move |ex| {
                 let grant = grant.clone();
                 Box::pin(async move { put_grant_in(ex, &grant).await.map(|_| grant) })
-                    as BoxFuture<'_, Result<Grant, komo_kernel::traits::StoreError>>
+                    as BoxFuture<'_, Result<Grant, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     /// 读一条授权。
@@ -64,11 +68,10 @@ impl TursoApprovalRepo {
                         return Ok(None);
                     };
                     Ok(Some(grant_from_row(&row)?))
-                })
-                    as BoxFuture<'_, Result<Option<Grant>, komo_kernel::traits::StoreError>>
+                }) as BoxFuture<'_, Result<Option<Grant>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 }
 
@@ -113,11 +116,10 @@ impl ApprovalRepo for TursoApprovalRepo {
                     .await
                     .map_err(map_toasty)?;
                     Ok(request)
-                })
-                    as BoxFuture<'_, Result<ApprovalRecord, komo_kernel::traits::StoreError>>
+                }) as BoxFuture<'_, Result<ApprovalRecord, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn get(&self, id: &ApprovalId) -> Result<Option<ApprovalRecord>, RepoError> {
@@ -135,14 +137,10 @@ impl ApprovalRepo for TursoApprovalRepo {
                         return Ok(None);
                     };
                     Ok(Some(record_from_row(&row)?))
-                })
-                    as BoxFuture<
-                        '_,
-                        Result<Option<ApprovalRecord>, komo_kernel::traits::StoreError>,
-                    >
+                }) as BoxFuture<'_, Result<Option<ApprovalRecord>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn find_by_short_id(&self, short: &ShortId) -> Result<Option<ApprovalRecord>, RepoError> {
@@ -165,14 +163,10 @@ impl ApprovalRepo for TursoApprovalRepo {
                         Some(row) => Ok(Some(record_from_row(row)?)),
                         None => Ok(None),
                     }
-                })
-                    as BoxFuture<
-                        '_,
-                        Result<Option<ApprovalRecord>, komo_kernel::traits::StoreError>,
-                    >
+                }) as BoxFuture<'_, Result<Option<ApprovalRecord>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn list_pending(
@@ -199,11 +193,10 @@ impl ApprovalRepo for TursoApprovalRepo {
                         out.push(record_from_row(row)?);
                     }
                     Ok(out)
-                })
-                    as BoxFuture<'_, Result<Vec<ApprovalRecord>, komo_kernel::traits::StoreError>>
+                }) as BoxFuture<'_, Result<Vec<ApprovalRecord>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn decide(
@@ -221,7 +214,7 @@ impl ApprovalRepo for TursoApprovalRepo {
                         .exec(ex)
                         .await
                         .map_err(map_toasty)?
-                        .ok_or_else(|| komo_kernel::traits::StoreError::NotFound {
+                        .ok_or_else(|| StoreError::NotFound {
                             what: format!("approval {id}"),
                         })?;
 
@@ -253,20 +246,17 @@ impl ApprovalRepo for TursoApprovalRepo {
                         decision,
                         already_decided: false,
                     })
-                })
-                    as BoxFuture<
-                        '_,
-                        Result<ApprovalDecisionResponse, komo_kernel::traits::StoreError>,
-                    >
+                }) as BoxFuture<'_, Result<ApprovalDecisionResponse, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn consume(
         &self,
         id: &ApprovalId,
         plan: &ExecutionPlan,
+        intent: ConsumeIntent,
         now: OffsetDateTime,
     ) -> Result<ConsumedApproval, RepoError> {
         let id = id.clone();
@@ -274,20 +264,13 @@ impl ApprovalRepo for TursoApprovalRepo {
         self.db
             .with_write_retry(move |ex| {
                 let (id, plan) = (id.clone(), plan.clone());
-                Box::pin(async move { consume_in(ex, &id, &plan, now).await })
-                    as BoxFuture<'_, Result<ConsumedApproval, komo_kernel::traits::StoreError>>
+                Box::pin(async move { consume_in(ex, &id, &plan, intent, now).await })
+                    as BoxFuture<'_, Result<ConsumedApproval, StoreError>>
             })
             .await
-            .map_err(|e| match e {
-                komo_kernel::traits::StoreError::Other(message)
-                    if message.starts_with(GRANT_MISMATCH) =>
-                {
-                    RepoError::GrantMismatch(
-                        message[GRANT_MISMATCH.len()..].trim_start().to_string(),
-                    )
-                }
-                other => store_to_repo(other),
-            })
+            // `StoreError::GrantMismatch` 逐个对上 `RepoError::GrantMismatch`（kernel 的
+            // `From`），所以这里不再有字符串前缀那一道还原。
+            .map_err(RepoError::from)
     }
 
     async fn grants_for_run(
@@ -313,11 +296,10 @@ impl ApprovalRepo for TursoApprovalRepo {
                         }
                     }
                     Ok(out)
-                })
-                    as BoxFuture<'_, Result<Vec<Grant>, komo_kernel::traits::StoreError>>
+                }) as BoxFuture<'_, Result<Vec<Grant>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn grants_for_job(
@@ -350,34 +332,35 @@ impl ApprovalRepo for TursoApprovalRepo {
                         }
                     }
                     Ok(out)
-                })
-                    as BoxFuture<'_, Result<Vec<Grant>, komo_kernel::traits::StoreError>>
+                }) as BoxFuture<'_, Result<Vec<Grant>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 }
 
-/// `with_write_retry` 的错误通道只有 [`StoreError`]，而 `consume` 要答得出
-/// [`RepoError::GrantMismatch`]——用一个前缀把它带出来，出口处还原。
-const GRANT_MISMATCH: &str = "grant-mismatch:";
-
-fn mismatch(message: impl std::fmt::Display) -> komo_kernel::traits::StoreError {
-    komo_kernel::traits::StoreError::Other(format!("{GRANT_MISMATCH} {message}"))
+/// 「这条授权用不了」在事务里就说清楚。
+///
+/// `with_write_retry` 的错误通道只有 [`StoreError`]，而它现在有
+/// [`StoreError::GrantMismatch`]——kernel 那边有 `impl From<StoreError> for RepoError`
+/// 把它逐个搬到 [`RepoError::GrantMismatch`]，所以不需要再用字符串前缀把类别夹带出去。
+fn mismatch(message: impl std::fmt::Display) -> StoreError {
+    StoreError::GrantMismatch(message.to_string())
 }
 
 async fn consume_in(
     ex: &mut dyn Executor,
     id: &ApprovalId,
     plan: &ExecutionPlan,
+    intent: ConsumeIntent,
     now: OffsetDateTime,
-) -> Result<ConsumedApproval, komo_kernel::traits::StoreError> {
+) -> Result<ConsumedApproval, StoreError> {
     let mut row = ApprovalRequestRow::filter_by_id(id.as_str())
         .first()
         .exec(ex)
         .await
         .map_err(map_toasty)?
-        .ok_or_else(|| komo_kernel::traits::StoreError::NotFound {
+        .ok_or_else(|| StoreError::NotFound {
             what: format!("approval {id}"),
         })?;
 
@@ -402,7 +385,23 @@ async fn consume_in(
                 .map_err(map_toasty)?
                 .ok_or_else(|| mismatch(format!("找不到授权 {grant_id}")))?;
             let grant = grant_from_row(&grant_row)?;
-            if !grant.covers(plan, now) {
+            // 一次性授权已经用掉了：只有恢复流程核对过才准重用（§7.4）。先单独答这一
+            // 条，免得"用过了"和"根本不匹配"混成同一句话——操作者要分得清。
+            let used_up = matches!(grant.scope, GrantScope::Once { .. }) && grant.consumed;
+            if used_up && intent != ConsumeIntent::KnownNotToHaveRun {
+                return Err(mismatch(
+                    "这条一次性授权已经用过了；已完成的调用不能再执行一次",
+                ));
+            }
+            // 核对过"没发生过"就只差 consumed 这一条；计划、范围、版本、有效期照查。
+            let covered = if used_up {
+                let mut fresh = grant.clone();
+                fresh.consumed = false;
+                fresh.covers(plan, now)
+            } else {
+                grant.covers(plan, now)
+            };
+            if !covered {
                 return Err(mismatch("这条授权覆盖不到这份计划"));
             }
             // 只有一次性授权会被用掉；范围授权本来就是给这个范围里的多次调用用的。
@@ -420,6 +419,10 @@ async fn consume_in(
             // 没有挂授权的审批就是"本次调用"，按哈希逐字比。
             if row.plan_hash != plan.plan_hash().to_string() {
                 return Err(mismatch("计划哈希与审批绑定的不一致"));
+            }
+            // 用过一次就没了——除非恢复流程核对过原动作没发生（§7.4）。
+            if decision.consumed && intent != ConsumeIntent::KnownNotToHaveRun {
+                return Err(mismatch("这条审批已经消费过了；已完成的调用不能再执行一次"));
             }
             None
         }
@@ -454,10 +457,7 @@ async fn consume_in(
     ))
 }
 
-async fn put_grant_in(
-    ex: &mut dyn Executor,
-    grant: &Grant,
-) -> Result<(), komo_kernel::traits::StoreError> {
+async fn put_grant_in(ex: &mut dyn Executor, grant: &Grant) -> Result<(), StoreError> {
     let (scope_kind, run_id, job_id, job_version) = match &grant.scope {
         GrantScope::Once { .. } => ("once", None, None, 0),
         GrantScope::Run { run, .. } => ("run", Some(run.to_string()), None, 0),
@@ -504,9 +504,7 @@ async fn put_grant_in(
     Ok(())
 }
 
-fn record_from_row(
-    row: &ApprovalRequestRow,
-) -> Result<ApprovalRecord, komo_kernel::traits::StoreError> {
+fn record_from_row(row: &ApprovalRequestRow) -> Result<ApprovalRecord, StoreError> {
     Ok(ApprovalRecord {
         approval: ApprovalId::from_raw(row.id.clone()),
         short_id: ShortId::parse(&row.short_id).unwrap_or_else(|| ShortId::from_index(0)),
@@ -531,7 +529,7 @@ fn record_from_row(
     })
 }
 
-fn grant_from_row(row: &PolicyGrantRow) -> Result<Grant, komo_kernel::traits::StoreError> {
+fn grant_from_row(row: &PolicyGrantRow) -> Result<Grant, StoreError> {
     Ok(Grant {
         id: komo_kernel::types::ids::GrantId::from_raw(row.id.clone()),
         approval: ApprovalId::from_raw(row.approval_id.clone()),
@@ -692,13 +690,23 @@ mod tests {
         // 换一份计划就不是它了。
         let other = shell_plan("rm -rf /");
         let error = repo
-            .consume(&ApprovalId::from_raw("ap-1"), &other, NOW)
+            .consume(
+                &ApprovalId::from_raw("ap-1"),
+                &other,
+                ConsumeIntent::First,
+                NOW,
+            )
             .await
             .unwrap_err();
         assert!(matches!(error, RepoError::GrantMismatch(_)), "{error}");
 
         let consumed = repo
-            .consume(&ApprovalId::from_raw("ap-1"), &plan, NOW)
+            .consume(
+                &ApprovalId::from_raw("ap-1"),
+                &plan,
+                ConsumeIntent::First,
+                NOW,
+            )
             .await
             .unwrap();
         assert_eq!(consumed.plan_hash(), &plan.plan_hash());
@@ -723,8 +731,13 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            repo.consume(&ApprovalId::from_raw("ap-deny"), &plan, NOW)
-                .await,
+            repo.consume(
+                &ApprovalId::from_raw("ap-deny"),
+                &plan,
+                ConsumeIntent::First,
+                NOW
+            )
+            .await,
             Err(RepoError::GrantMismatch(_))
         ));
 
@@ -735,16 +748,26 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            repo.consume(&ApprovalId::from_raw("ap-old"), &plan, NOW)
-                .await,
+            repo.consume(
+                &ApprovalId::from_raw("ap-old"),
+                &plan,
+                ConsumeIntent::First,
+                NOW
+            )
+            .await,
             Err(RepoError::GrantMismatch(_))
         ));
 
         // 还没决定的同样不行。
         repo.create(request("ap-open", &plan, 3)).await.unwrap();
         assert!(matches!(
-            repo.consume(&ApprovalId::from_raw("ap-open"), &plan, NOW)
-                .await,
+            repo.consume(
+                &ApprovalId::from_raw("ap-open"),
+                &plan,
+                ConsumeIntent::First,
+                NOW
+            )
+            .await,
             Err(RepoError::GrantMismatch(_))
         ));
     }
@@ -776,7 +799,12 @@ mod tests {
         // 同一族计划，多次消费都成——范围授权本来就是给多次调用用的。
         for command in ["cargo test", "cargo test --workspace", "cargo build"] {
             let consumed = repo
-                .consume(&ApprovalId::from_raw("ap-1"), &shell_plan(command), NOW)
+                .consume(
+                    &ApprovalId::from_raw("ap-1"),
+                    &shell_plan(command),
+                    ConsumeIntent::First,
+                    NOW,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -790,8 +818,13 @@ mod tests {
         let mut elsewhere = shell_plan("cargo test");
         elsewhere.run = Some(RunId::from_raw("run-2"));
         assert!(matches!(
-            repo.consume(&ApprovalId::from_raw("ap-1"), &elsewhere, NOW)
-                .await,
+            repo.consume(
+                &ApprovalId::from_raw("ap-1"),
+                &elsewhere,
+                ConsumeIntent::First,
+                NOW
+            )
+            .await,
             Err(RepoError::GrantMismatch(_))
         ));
 
@@ -840,9 +873,14 @@ mod tests {
         .await
         .unwrap();
 
-        repo.consume(&ApprovalId::from_raw("ap-1"), &cron_plan, NOW)
-            .await
-            .expect("同一个 Job 版本覆盖得到");
+        repo.consume(
+            &ApprovalId::from_raw("ap-1"),
+            &cron_plan,
+            ConsumeIntent::First,
+            NOW,
+        )
+        .await
+        .expect("同一个 Job 版本覆盖得到");
 
         let mut next_version = cron_plan.clone();
         next_version.source = PlanSource::Cron {
@@ -850,8 +888,13 @@ mod tests {
             job_version: 4,
         };
         assert!(matches!(
-            repo.consume(&ApprovalId::from_raw("ap-1"), &next_version, NOW)
-                .await,
+            repo.consume(
+                &ApprovalId::from_raw("ap-1"),
+                &next_version,
+                ConsumeIntent::First,
+                NOW
+            )
+            .await,
             Err(RepoError::GrantMismatch(_))
         ));
 
@@ -869,6 +912,149 @@ mod tests {
                 .is_empty(),
             "Job 版本变了就不该再返回旧的"
         );
+    }
+
+    /// 验收：`ConsumeIntent` 把「第一次跑」和「恢复核对过」分开（§7.4）。
+    #[tokio::test]
+    async fn a_used_up_once_grant_is_refused_to_a_first_run_and_reusable_only_after_verification() {
+        let (db, _dir) = temp().await;
+        let repo = TursoApprovalRepo::new(db);
+        let plan = shell_plan("rm -rf build");
+        repo.create(request("ap-1", &plan, 1)).await.unwrap();
+        repo.put_grant(grant(
+            "g-once",
+            GrantScope::Once {
+                plan_hash: plan.plan_hash(),
+                call: None,
+            },
+        ))
+        .await
+        .unwrap();
+        repo.decide(
+            &ApprovalId::from_raw("ap-1"),
+            decision(true, Some(GrantId::from_raw("g-once"))),
+        )
+        .await
+        .unwrap();
+
+        repo.consume(
+            &ApprovalId::from_raw("ap-1"),
+            &plan,
+            ConsumeIntent::First,
+            NOW,
+        )
+        .await
+        .expect("第一次用得了");
+
+        // 第二次"第一次跑"：这个动作已经发生过了，要一个**可分辨的**失败。
+        let error = repo
+            .consume(
+                &ApprovalId::from_raw("ap-1"),
+                &plan,
+                ConsumeIntent::First,
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, RepoError::GrantMismatch(message) if message.contains("已经用过了")),
+            "「用过了」要和「根本不匹配」分得开：{error}"
+        );
+
+        // 恢复核对过"没发生过"才准重用。
+        repo.consume(
+            &ApprovalId::from_raw("ap-1"),
+            &plan,
+            ConsumeIntent::KnownNotToHaveRun,
+            NOW,
+        )
+        .await
+        .expect("核对过就准重用");
+
+        // 但它只豁免 consumed 这**一条**：计划变了照样不行。
+        let error = repo
+            .consume(
+                &ApprovalId::from_raw("ap-1"),
+                &shell_plan("rm -rf /"),
+                ConsumeIntent::KnownNotToHaveRun,
+                NOW,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, RepoError::GrantMismatch(message) if message.contains("覆盖不到")),
+            "{error}"
+        );
+    }
+
+    /// 没有挂授权的审批（"本次调用"）同样只能用一次。
+    #[tokio::test]
+    async fn a_bare_approval_is_also_spent_after_one_use() {
+        let (db, _dir) = temp().await;
+        let repo = TursoApprovalRepo::new(db);
+        let plan = shell_plan("ls");
+        repo.create(request("ap-1", &plan, 1)).await.unwrap();
+        repo.decide(&ApprovalId::from_raw("ap-1"), decision(true, None))
+            .await
+            .unwrap();
+
+        repo.consume(
+            &ApprovalId::from_raw("ap-1"),
+            &plan,
+            ConsumeIntent::First,
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.consume(
+                &ApprovalId::from_raw("ap-1"),
+                &plan,
+                ConsumeIntent::First,
+                NOW
+            )
+            .await,
+            Err(RepoError::GrantMismatch(_))
+        ));
+        repo.consume(
+            &ApprovalId::from_raw("ap-1"),
+            &plan,
+            ConsumeIntent::KnownNotToHaveRun,
+            NOW,
+        )
+        .await
+        .expect("核对过就准重用");
+    }
+
+    /// 范围授权**不因一次使用而消耗**，所以 `intent` 对它没有影响。
+    #[tokio::test]
+    async fn a_scoped_grant_is_not_spent_so_the_intent_changes_nothing() {
+        let (db, _dir) = temp().await;
+        let repo = TursoApprovalRepo::new(db);
+        let plan = shell_plan("cargo test");
+        repo.create(request("ap-1", &plan, 1)).await.unwrap();
+        repo.put_grant(grant(
+            "g-run",
+            GrantScope::Run {
+                run: RunId::from_raw("run-1"),
+                matcher: Matcher::operations([OperationMatch::ShellCommand]),
+                versions: Default::default(),
+            },
+        ))
+        .await
+        .unwrap();
+        repo.decide(
+            &ApprovalId::from_raw("ap-1"),
+            decision(true, Some(GrantId::from_raw("g-run"))),
+        )
+        .await
+        .unwrap();
+
+        for intent in [ConsumeIntent::First, ConsumeIntent::KnownNotToHaveRun] {
+            repo.consume(&ApprovalId::from_raw("ap-1"), &plan, intent, NOW)
+                .await
+                .unwrap_or_else(|e| panic!("{intent:?} 该过：{e}"));
+        }
     }
 
     /// 一次性授权用掉之后**不是重试依据**（§7.4）。
@@ -894,17 +1080,36 @@ mod tests {
         .await
         .unwrap();
 
-        repo.consume(&ApprovalId::from_raw("ap-1"), &plan, NOW)
-            .await
-            .expect("第一次用得了");
+        repo.consume(
+            &ApprovalId::from_raw("ap-1"),
+            &plan,
+            ConsumeIntent::First,
+            NOW,
+        )
+        .await
+        .expect("第一次用得了");
         assert!(
             matches!(
-                repo.consume(&ApprovalId::from_raw("ap-1"), &plan, NOW)
-                    .await,
+                repo.consume(
+                    &ApprovalId::from_raw("ap-1"),
+                    &plan,
+                    ConsumeIntent::First,
+                    NOW
+                )
+                .await,
                 Err(RepoError::GrantMismatch(_))
             ),
             "用过就不能再用"
         );
+        // 只有恢复核对过才准重用。
+        repo.consume(
+            &ApprovalId::from_raw("ap-1"),
+            &plan,
+            ConsumeIntent::KnownNotToHaveRun,
+            NOW,
+        )
+        .await
+        .expect("核对过就准重用");
     }
 
     #[tokio::test]

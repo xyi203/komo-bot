@@ -66,7 +66,7 @@ impl Fixture {
         format!(
             r#"
 [model]
-provider = "openai_compatible"
+provider = "openai_responses"
 base_url = "https://llm.example.com/v1"
 model = "{model}"
 api_key_env = "KOMO_LLM_API_KEY"
@@ -76,7 +76,7 @@ effort = "{effort}"
 enabled = true
 
 [memory.model]
-provider = "openai_compatible"
+provider = "openai_responses"
 base_url = "https://memory-llm.example.com/v1"
 model = "memory-a"
 api_key_env = "KOMO_MEMORY_API_KEY"
@@ -138,13 +138,14 @@ writable = false
 "#;
 }
 
-fn model(name: &str, key_env: &str, effort: Option<&str>) -> ModelConfig {
+fn model(provider: &str, name: &str, key_env: &str, effort: Option<&str>) -> ModelConfig {
     ModelConfig {
-        provider: "openai_compatible".into(),
+        provider: provider.into(),
         base_url: "https://llm.example.com/v1".into(),
         model: name.into(),
         api_key_env: key_env.into(),
         effort: effort.map(Effort::new),
+        efforts: None,
         timeout_secs: 120,
     }
 }
@@ -159,14 +160,32 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             db_path: home.join("state.db"),
             python_env_root: home.join("python-envs"),
         },
-        model: model("chat-a", "KOMO_LLM_API_KEY", Some("medium")),
+        model: model(
+            "openai_responses",
+            "chat-a",
+            "KOMO_LLM_API_KEY",
+            Some("medium"),
+        ),
         memory: MemoryConfig {
             enabled: true,
-            model: model("memory-a", "KOMO_MEMORY_API_KEY", Some("low")),
+            model: model(
+                "openai_responses",
+                "memory-a",
+                "KOMO_MEMORY_API_KEY",
+                Some("low"),
+            ),
             embedding: Some(EmbeddingConfig {
-                model: model("embed-a", "KOMO_EMBEDDING_API_KEY", None),
+                // 向量协议仍是 OpenAI 兼容的 `/embeddings`（§13.2）。
+                model: model(
+                    "openai_compatible",
+                    "embed-a",
+                    "KOMO_EMBEDDING_API_KEY",
+                    None,
+                ),
                 revision: None,
                 dimensions: Some(1024),
+                document_prefix: None,
+                query_prefix: None,
             }),
             retrieval: RetrievalConfig::default(),
         },

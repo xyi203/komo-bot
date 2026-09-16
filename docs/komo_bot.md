@@ -1410,6 +1410,16 @@ pub trait Clock: Send + Sync {
 }
 ```
 
+**W3 落地后的契约修订**（2026-09-16；实现见 `crates/komo-kernel/src/traits.rs`，与上面的示意不一致时以代码为准）：
+
+- `Tool::execute(&self, plan: ApprovedPlan, ctx: &ToolContext, sink: &mut dyn OutputWriter)`：工具**借用**本次尝试的流式写入器，发布仍在 executor 手里（§8.5 的下一步）。
+- `ApprovalRepo::consume(&self, id, plan: &ExecutionPlan, intent: ConsumeIntent, now)`，`ConsumeIntent::{First, KnownNotToHaveRun}`：已消费的一次性授权对 `First` 是可分辨失败（`GrantMismatch`），只有核对确认「原动作未发生」才允许重用——§7.4 的两句话各落一处。
+- `Ledger::start_run(&self, run, executor, generation)` 写 `run.started`；领取（`RunQueue::claim` / `claim_run`）只改行，`rows affected` 是胜负的唯一信号。
+- `CronRepo::advance(&self, id, next_run_at, status, last_error)`：推进槽位**不递增版本**，否则每次触发都作废绑定该 Job 的授权。
+- `Wait::Approval { approval, call: Option<ToolCallId>, attempt: Option<AttemptId> }`；`RunEnd::Completed { final_message, rounds }`。
+- `StoreError::{VersionConflict, GrantMismatch}` + `From<StoreError> for RepoError`：store 的事务闭包只有一条错误通道。
+- protocol：`ManualCronRunRequest`、`BoundaryRequest`、`ApprovalListQuery`、`MemoryScope` 的 `Display` / `FromStr`（`personal` | `project:<id>` | `environment:<id>`）、`GET /v1/models` → `ModelsResponse`、`GET /v1/config/check`、`POST /v1/config/reload`、`SseEvent::AssistantDelta`（**只在 SSE 上，永不进 JSONL**；`message.assistant` 仍是一次完整回复）。§13.1 的接口表相应多这三个端点。
+
 ## 14. 实现顺序与验收
 
 | 阶段 | 交付 | 验证 |

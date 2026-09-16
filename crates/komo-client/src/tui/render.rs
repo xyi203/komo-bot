@@ -119,6 +119,17 @@ fn transcript(app: &App, area: Rect) -> Paragraph<'static> {
         }
     }
 
+    // 模型正在打字的那一段：接在历史后面，带一个「生成中」的记号，**不是历史的一部分**
+    // （`message.assistant` 到了它就被那一条替换掉）。
+    if let Some(draft) = &app.draft {
+        lines.extend(markdown::render(&draft.text, width));
+        lines.push(Line::from(Span::styled(
+            "▌生成中…",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        )));
+        lines.push(Line::default());
+    }
+
     if app.phase.is_backfilling() {
         lines.push(dim("正在补读历史……"));
     }
@@ -625,6 +636,30 @@ fn main() {
         assert!(screen.contains("滚动"), "放不下要说还有多少行：{screen}");
         // 输入框在这么窄的窗口里被弹窗盖住了；它禁用这件事由状态说了算。
         assert!(!app.input_enabled());
+    }
+
+    #[test]
+    fn a_draft_shows_on_screen_with_a_generating_marker_and_then_goes_away() {
+        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        feed(&mut app, &fixture::conversation()[..3]);
+        app.apply(ServerEvent::Frame(Box::new(SseFrame {
+            id: komo_kernel::types::ids::Seq(100),
+            session: fixture::session(),
+            event: SseEvent::AssistantDelta {
+                run: fixture::run(),
+                round: 1,
+                text: "我来清一".into(),
+            },
+        })));
+        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
+        assert!(screen.contains("我来清一"), "{screen}");
+        assert!(screen.contains("生成中"), "{screen}");
+
+        // 正式回复到了，草稿与记号一起消失，屏幕上只剩那一条。
+        feed(&mut app, &fixture::conversation()[3..4]);
+        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
+        assert!(!screen.contains("生成中"), "{screen}");
+        assert_eq!(screen.matches("我来清一下。").count(), 1, "{screen}");
     }
 
     #[test]

@@ -18,10 +18,13 @@ fn config(provider: &str, dimensions: Option<u32>) -> EmbeddingConfig {
             model: "embed-a".into(),
             api_key_env: "KOMO_EMBEDDING_API_KEY".into(),
             effort: None,
+            efforts: None,
             timeout_secs: 10,
         },
         revision: Some("2026-09".into()),
         dimensions,
+        document_prefix: None,
+        query_prefix: None,
     }
 }
 

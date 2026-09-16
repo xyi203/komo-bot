@@ -3,14 +3,16 @@
 //! 顺序在每个方法里都写成三步注释：**外置正文（如有）→ JSONL 追加并 sync_all →
 //! state.db 事务**。读到一个方法只有两步，那就是漏了一步。
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use komo_kernel::events::{
     ConversationBoundary, EventPayload, MessageAssistant, RunAccepted, RunCancelled, RunCompleted,
-    RunFailed, RunNeedsAttention, RunQueued, RunWaitingApproval, RunWaitingRetry, ToolPlanned,
-    ToolResult, ToolStarted,
+    RunFailed, RunNeedsAttention, RunQueued, RunStarted, RunWaitingApproval, RunWaitingRetry,
+    ToolPlanned, ToolResult, ToolStarted,
 };
 use komo_kernel::traits::{Ledger, LedgerError, StoreError};
-use komo_kernel::types::ids::{AttemptId, EventId, RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::refs::{INLINE_ARGUMENT_LIMIT_BYTES, PublishedOutput, ToolResultStatus};
 use komo_kernel::types::status::{AttemptState, RunEnd, Wait};
@@ -231,6 +233,56 @@ impl Ledger for Coordinator {
         Ok(ids)
     }
 
+    async fn start_run(
+        &self,
+        run: &RunId,
+        executor: &ExecutorId,
+        generation: u64,
+    ) -> Result<(), LedgerError> {
+        // ① JSONL 追加 run.started 并同步。
+        //
+        // **领取与它是两件事**：`RunQueue::claim` / `claim_run` 只改 `runs` 那一行（条件
+        // UPDATE，`rows affected` 是胜负的唯一信号，写不出事件）；这条事件由 handler 在
+        // 真正开跑时写，所以账本上的 `run.started` 记的是"谁开始跑了"。
+        let appended = self
+            .append(
+                Some(run.clone()),
+                EventPayload::RunStarted(RunStarted {
+                    executor: executor.clone(),
+                    generation,
+                }),
+            )
+            .await?;
+
+        // ② state.db 事务：代次围栏 + 坐实 running + 事件索引 + applied_seq。
+        let run_id = run.clone();
+        let executor = executor.clone();
+        let stale = Arc::new(std::sync::Mutex::new(None::<u64>));
+        let sink = stale.clone();
+        self.commit(&appended, move |ex, _appended, now| {
+            let (run_id, executor, sink) = (run_id.clone(), executor.clone(), sink.clone());
+            Box::pin(async move {
+                if let Some(current) =
+                    runs::start_in(ex, &run_id, &executor, generation, now).await?
+                {
+                    *sink.lock().expect("旧代次标记") = Some(current);
+                }
+                Ok(())
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await?;
+
+        // 旧代次不是"写失败"——事件与索引都该留下（它确实发生过），但这个执行者必须
+        // 知道自己已经不是当班的那一个（§8.7）。
+        if let Some(current) = *stale.lock().expect("旧代次标记") {
+            return Err(LedgerError::StaleGeneration {
+                held: generation,
+                current,
+            });
+        }
+        Ok(())
+    }
+
     async fn plan_call(
         &self,
         call: &ToolCallId,
@@ -433,16 +485,17 @@ impl Ledger for Coordinator {
     async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError> {
         let status = wait.status();
         let payload = match &wait {
-            Wait::Approval { approval, call: _ } => {
-                EventPayload::RunWaitingApproval(RunWaitingApproval {
-                    approval: approval.clone(),
-                    // `Wait::Approval::call` 是一个 **AttemptId**，而事件上的 `call` 是
-                    // **ToolCallId**——两者不是一回事，硬塞进去会让恢复按一个不存在的
-                    // 调用去配对。停在哪个调用上由 `approval_requests` 记（那张表两个
-                    // ID 都有列）。见报告里对 kernel 的那条改动请求。
-                    call: None,
-                })
-            }
+            // `attempt` **故意不落**：`approval_requests` 上没有尝试这一列，而
+            // `Wait::Approval::attempt` 通常本来就是 None——审批发生在 `tool.started`
+            // 之前，那时候一次尝试都还没有。真要记它得先给那张耐久表加一列，不在这一波。
+            Wait::Approval {
+                approval,
+                call,
+                attempt: _,
+            } => EventPayload::RunWaitingApproval(RunWaitingApproval {
+                approval: approval.clone(),
+                call: call.clone(),
+            }),
             Wait::Retry {
                 attempts,
                 next_retry_at,
@@ -483,7 +536,10 @@ impl Ledger for Coordinator {
     async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError> {
         let status = end.status();
         let (payload, reason) = match &end {
-            RunEnd::Completed { final_message } => {
+            RunEnd::Completed {
+                final_message,
+                rounds,
+            } => {
                 let (text, text_ref) = match final_message {
                     Some(text) => self.split_text(text).await?,
                     None => (None, None),
@@ -492,7 +548,7 @@ impl Ledger for Coordinator {
                     EventPayload::RunCompleted(RunCompleted {
                         final_message: text,
                         final_message_ref: text_ref,
-                        rounds: 0,
+                        rounds: *rounds,
                     }),
                     None,
                 )
@@ -513,15 +569,24 @@ impl Ledger for Coordinator {
 
         let appended = self.append(Some(run.clone()), payload).await?;
 
+        // 轮数由调用方交进来（`RunEnd::Completed.rounds`）；失败 / 取消没有这个数，
+        // 用行上记着的那个——它是 `record_round` 每轮推进的。
+        let declared_rounds = match &end {
+            RunEnd::Completed { rounds, .. } => Some(*rounds),
+            _ => None,
+        };
         let run_id = run.clone();
         let session = self.session.clone();
         self.commit(&appended, move |ex, appended, now| {
             let (run_id, session, reason) = (run_id.clone(), session.clone(), reason.clone());
             Box::pin(async move {
-                let rounds = runs::get_in(ex, &run_id)
-                    .await?
-                    .map(|row| row.rounds.max(0) as u32)
-                    .unwrap_or(0);
+                let rounds = match declared_rounds {
+                    Some(rounds) => rounds,
+                    None => runs::get_in(ex, &run_id)
+                        .await?
+                        .map(|row| row.rounds.max(0) as u32)
+                        .unwrap_or(0),
+                };
                 runs::mark_final_in(
                     ex,
                     &run_id,
@@ -678,6 +743,7 @@ mod tests {
     use komo_kernel::events::ApprovalDecided;
     use komo_kernel::test_support::{MemLedger, TestClock, sample_model, sample_plan};
     use komo_kernel::traits::Clock as _;
+    use komo_kernel::traits::RunQueue as _;
     use komo_kernel::traits::ToolOutputStore as _;
     use komo_kernel::types::chat::ApprovalScope;
     use komo_kernel::types::ids::{ApprovalId, RequestKey};
@@ -816,6 +882,7 @@ mod tests {
                 &accepted.run,
                 RunEnd::Completed {
                     final_message: Some("读好了".into()),
+                    rounds: 1,
                 },
             )
             .await
@@ -866,6 +933,174 @@ mod tests {
         };
         assert_eq!(body.plan_ref, plan_event);
         assert_eq!(body.attempt_id, attempt);
+    }
+
+    /// `run.started` 是 handler 开跑时写的，不是领取时写的。
+    #[tokio::test]
+    async fn starting_a_run_records_the_executor_and_its_generation() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", "你好", &f.session))
+            .await
+            .unwrap();
+
+        // 领取只改行——它写不出事件（条件 UPDATE 的 rows affected 是胜负的唯一信号）。
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let executor = ExecutorId::from_raw("exec-1");
+        let claimed = queue
+            .claim_run(&accepted.run, &executor)
+            .await
+            .unwrap()
+            .expect("领得到");
+        assert_eq!(
+            types(&f.coordinator, &f.session).await,
+            vec!["run.accepted", "run.queued"],
+            "领取不写事件"
+        );
+
+        f.coordinator
+            .start_run(&accepted.run, &executor, claimed.generation)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            types(&f.coordinator, &f.session).await.last().unwrap(),
+            "run.started"
+        );
+        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let started = batch
+            .events
+            .iter()
+            .find(|e| e.type_name() == "run.started")
+            .unwrap();
+        let EventPayload::RunStarted(body) = &started.payload else {
+            panic!()
+        };
+        assert_eq!(body.executor, executor);
+        assert_eq!(body.generation, claimed.generation);
+
+        let record = crate::repos::runs::get(&f.db, &accepted.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.status, RunStatus::Running);
+    }
+
+    /// 旧代次开不了跑——§8.7：停止这个任务的一切写入，不重试、不降级。
+    #[tokio::test]
+    async fn a_stale_executor_cannot_start_the_run() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", "你好", &f.session))
+            .await
+            .unwrap();
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let first = ExecutorId::from_raw("exec-1");
+        let claimed = queue
+            .claim_run(&accepted.run, &first)
+            .await
+            .unwrap()
+            .unwrap();
+        queue.release(&claimed).await.unwrap();
+        let second = ExecutorId::from_raw("exec-2");
+        queue
+            .claim_run(&accepted.run, &second)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let error = f
+            .coordinator
+            .start_run(&accepted.run, &first, claimed.generation)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            LedgerError::StaleGeneration {
+                held: 1,
+                current: 2
+            }
+        );
+    }
+
+    /// 停在哪个**逻辑调用**上要透传到事件里——恢复按它配对。
+    #[tokio::test]
+    async fn waiting_for_approval_names_the_call_it_stopped_on() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", "跑一下", &f.session))
+            .await
+            .unwrap();
+        let ids = f
+            .coordinator
+            .record_round(&accepted.run, round(1, vec![call("call-1")]))
+            .await
+            .unwrap();
+
+        f.coordinator
+            .suspend(
+                &accepted.run,
+                Wait::Approval {
+                    approval: ApprovalId::from_raw("ap-1"),
+                    call: Some(ids[0].clone()),
+                    attempt: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let EventPayload::RunWaitingApproval(body) = &batch.events.last().unwrap().payload else {
+            panic!()
+        };
+        assert_eq!(body.call.as_ref(), Some(&ids[0]));
+        assert_eq!(body.approval.as_str(), "ap-1");
+        assert_eq!(
+            crate::repos::runs::get(&f.db, &accepted.run)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::WaitingApproval
+        );
+    }
+
+    /// 轮数由调用方交进来，事件与行上是同一个数——`RunCompleted.rounds` 不再恒为 0。
+    #[tokio::test]
+    async fn the_round_count_reaches_both_the_event_and_the_row() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", "算一下", &f.session))
+            .await
+            .unwrap();
+        f.coordinator
+            .complete(
+                &accepted.run,
+                RunEnd::Completed {
+                    final_message: Some("等于 2".into()),
+                    rounds: 3,
+                },
+            )
+            .await
+            .unwrap();
+
+        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let EventPayload::RunCompleted(body) = &batch.events.last().unwrap().payload else {
+            panic!()
+        };
+        assert_eq!(body.rounds, 3);
+        assert_eq!(
+            crate::repos::runs::get(&f.db, &accepted.run)
+                .await
+                .unwrap()
+                .unwrap()
+                .rounds,
+            3
+        );
     }
 
     /// 同一请求键重发返回原 Run；内容哈希不同则拒绝（§8.5）。

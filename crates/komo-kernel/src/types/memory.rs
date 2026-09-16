@@ -3,6 +3,9 @@
 //! 确认状态与来源**分开保存**：把"模型从用户原话整理"写成"用户确认了模型摘要"是这
 //! 组类型存在的全部理由。
 
+use std::fmt;
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -20,12 +23,52 @@ pub enum MemoryKind {
 
 /// 作用域，绑定当前操作者、稳定项目 ID 或实例 ID。工作路径相似**不**自动意味着同一
 /// 项目（§9.2）。
+///
+/// 在 JSON 里是一个带 `kind` 的对象；在 **query string 里**是一行文本
+/// （`personal` / `project:<id>` / `environment:<id>`，见 [`Display`] 与 [`FromStr`]），
+/// 因为 `?scope=` 装不下一个对象。两种写法必须能互相还原，所以它们有一个往返测试。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MemoryScope {
     Personal,
     Project { project_id: String },
     Environment { instance_id: String },
+}
+
+impl fmt::Display for MemoryScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            MemoryScope::Personal => f.write_str("personal"),
+            MemoryScope::Project { project_id } => write!(f, "project:{project_id}"),
+            MemoryScope::Environment { instance_id } => write!(f, "environment:{instance_id}"),
+        }
+    }
+}
+
+/// 解析作用域文本失败。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("作用域要写成 personal / project:<id> / environment:<id>，收到：{0}")]
+pub struct MemoryScopeParseError(String);
+
+impl FromStr for MemoryScope {
+    type Err = MemoryScopeParseError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let trimmed = raw.trim();
+        let invalid = || MemoryScopeParseError(raw.to_string());
+        match trimmed.split_once(':') {
+            None if trimmed == "personal" => Ok(MemoryScope::Personal),
+            None => Err(invalid()),
+            Some((_, "")) => Err(invalid()),
+            Some(("project", id)) => Ok(MemoryScope::Project {
+                project_id: id.to_string(),
+            }),
+            Some(("environment", id)) => Ok(MemoryScope::Environment {
+                instance_id: id.to_string(),
+            }),
+            Some(_) => Err(invalid()),
+        }
+    }
 }
 
 /// 这条内容是谁说的。
@@ -271,6 +314,45 @@ mod tests {
         m.valid_until = Some(datetime!(2026-09-10 00:00:00 UTC));
         assert!(!m.is_recallable_at(datetime!(2026-09-15 00:00:00 UTC)));
         assert!(m.is_recallable_at(datetime!(2026-09-05 00:00:00 UTC)));
+    }
+
+    #[test]
+    fn a_scope_round_trips_through_its_query_string_spelling() {
+        for scope in [
+            MemoryScope::Personal,
+            MemoryScope::Project {
+                project_id: "komo".into(),
+            },
+            MemoryScope::Environment {
+                instance_id: "nas".into(),
+            },
+        ] {
+            let text = scope.to_string();
+            assert_eq!(text.parse::<MemoryScope>().unwrap(), scope, "{text}");
+        }
+        assert_eq!(
+            "  project:komo ".parse::<MemoryScope>().unwrap(),
+            MemoryScope::Project {
+                project_id: "komo".into()
+            }
+        );
+        // 带冒号的 id 原样留着——项目 ID 是别人给的，不是这里的语法。
+        assert_eq!(
+            "project:a:b".parse::<MemoryScope>().unwrap(),
+            MemoryScope::Project {
+                project_id: "a:b".into()
+            }
+        );
+        for bad in [
+            "",
+            "personal:x",
+            "project",
+            "project:",
+            "team:x",
+            "PERSONAL",
+        ] {
+            assert!(bad.parse::<MemoryScope>().is_err(), "{bad}");
+        }
     }
 
     #[test]

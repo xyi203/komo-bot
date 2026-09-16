@@ -270,6 +270,10 @@ impl CronScheduler {
 
     /// 推进到下一个槽位并落库。
     ///
+    /// 走 [`CronRepo::advance`] 而不是 `put`：推进槽位不是定义变更，**版本一个字都不能
+    /// 动**——`put` 会递增版本，而绑定这个 Job 的授权是按版本绑的（§7.2 / §10），每触发
+    /// 一次就作废一次授权是说不通的。
+    ///
     /// 一次性触发在这里**完成**（§10：`@at` 是一次性，claim 时完成）；算不出下一槽的
     /// Job 把原因写进 `last_error` 并留在清单里——安静地再也不响是最糟的结果。
     async fn advance(&self, job: &mut CronJob, now: OffsetDateTime) -> Result<(), CronError> {
@@ -280,11 +284,9 @@ impl CronScheduler {
             // `CronJob::advance` 已经把 next_run_at 清空、把原因写进 last_error 了。
             tracing::warn!(job = %job.id, error = %error, "算不出下一个槽位");
         }
-        // TODO(decide: `CronRepo::put` 的契约是"创建或整体替换，**版本递增**"，而推进
-        // 槽位并不是定义变更——按契约走会让绑定这个 Job 的授权在每次触发后失效（§7.2）。
-        // 需要 kernel 给 CronRepo 加一个只写槽位的方法（见交付报告里的请求）。在那之前
-        // 这里照契约调 put，正确性由"授权按 job_version 绑定"那一侧兜底。
-        self.jobs.put(job.clone()).await?;
+        self.jobs
+            .advance(&job.id, job.next_run_at, job.status, job.last_error.clone())
+            .await?;
         Ok(())
     }
 }
@@ -558,11 +560,12 @@ mod tests {
         let h = harness();
         let mut with_override = job("job-1", Some(NOW - time::Duration::minutes(1)));
         with_override.model = Some(ModelConfig {
-            provider: "openai_compatible".into(),
+            provider: "openai_responses".into(),
             base_url: "https://other.example.com/v1".into(),
             model: "job-model".into(),
             api_key_env: "OTHER_KEY".into(),
             effort: None,
+            efforts: None,
             timeout_secs: 60,
         });
         with_override.effort = Some(komo_kernel::types::model::Effort::new("high"));

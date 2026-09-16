@@ -310,6 +310,23 @@ impl Proof {
     }
 }
 
+/// 这次消费是**第一次跑这个调用**，还是恢复流程已经核对过、确定原动作没发生。
+///
+/// §7.4 在这里分了两句话：「已取消或已完成调用不能再次执行」和「恢复时若确定原动作未
+/// 发生……可在原授权范围内继续；**已经消费授权本身不是重试依据**」。把这件事交给
+/// `ApprovalRepo` 用一个参数问出来，而不是让每个调用点自己记得判断——两个语境说的是
+/// 同一条授权，只有"这一次算不算重来"不同。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsumeIntent {
+    /// 这个调用的第一次执行。一次性授权已经用过了就拒绝——那意味着这个动作已经发生过。
+    #[default]
+    First,
+    /// 恢复流程核对过了：§8.4 第 6 行的"确定尚未执行"，或 §8.6 的核对给出
+    /// [`Verification::NotPerformed`]。这时候才准重用一条已消费的一次性授权。
+    KnownNotToHaveRun,
+}
+
 /// 一条被成功消费的审批。只有执行器从 `ApprovalRepo` 消费成功才拿得到它。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConsumedApproval {

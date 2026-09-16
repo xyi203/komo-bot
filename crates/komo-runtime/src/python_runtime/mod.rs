@@ -22,7 +22,7 @@ use komo_kernel::types::plan::EnvVersion;
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{CancelToken, PyError, PythonJob, PythonResult};
 
-use crate::tools::process::{ChildSpec, ProcessError, run_child};
+use crate::tools::process::{ChildRegistration, ChildSpec, ProcessError, run_child};
 
 /// 解释器驱动。脚本输出与控制协议分开就靠它。
 const DRIVER: &str = include_str!("driver.py");
@@ -75,6 +75,8 @@ impl PythonEnvConfig {
 pub struct PythonRuntime {
     config: PythonEnvConfig,
     env_version: EnvVersion,
+    /// 在册登记（§8.7）。
+    register: Option<ChildRegistration>,
 }
 
 impl std::fmt::Debug for PythonRuntime {
@@ -92,7 +94,14 @@ impl PythonRuntime {
         Self {
             config,
             env_version,
+            register: None,
         }
+    }
+
+    /// 把解释器进程登记在册，恢复扫描才核实得了它（§8.7）。
+    pub fn registered(mut self, registration: ChildRegistration) -> Self {
+        self.register = Some(registration);
+        self
     }
 
     /// 探一次解释器，算出这个环境的版本。
@@ -170,6 +179,8 @@ impl PythonHost for PythonRuntime {
             stdin: Some(body),
             timeout: self.config.timeout,
             output_limit: self.config.output_limit,
+            register: self.register.clone(),
+            label: format!("python · {}", self.config.interpreter_path().display()),
         };
 
         let outcome = run_child(spec, sink, &cancel)

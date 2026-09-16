@@ -115,6 +115,17 @@ pub async fn record_started_in(
     process: Option<String>,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
+    // 幂等：这条尝试已经记过了就什么都不做。恢复的 `backfill` 会把同一段 JSONL 重放
+    // 进索引，累加 `attempts` 会让"跑了几次"这个数字随重启膨胀。
+    if ToolAttemptRow::filter_by_id(attempt.as_str())
+        .first()
+        .exec(ex)
+        .await
+        .map_err(map_toasty)?
+        .is_some()
+    {
+        return Ok(());
+    }
     let mut row = require(ex, call).await?;
     let ordinal = row.attempts + 1;
     let (session, run) = (row.session_id.clone(), row.run_id.clone());

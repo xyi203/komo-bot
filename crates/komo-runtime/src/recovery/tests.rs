@@ -8,14 +8,11 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use komo_kernel::events::{EVENT_FORMAT_VERSION, Event, EventPayload, RunStarted};
 use komo_kernel::protocol::http::{ApprovalDecisionRecord, ApprovalRecord};
 use komo_kernel::test_support::{MemApprovalRepo, MemLedger, MemOutputStore, TestClock};
 use komo_kernel::traits::{ApprovalRepo, Ledger, OutputWriter, ToolOutputStore};
 use komo_kernel::types::chat::ApprovalScope;
-use komo_kernel::types::ids::{
-    ApprovalId, AttemptId, EventId, RequestKey, Seq, ShortId, ToolCallId,
-};
+use komo_kernel::types::ids::{ApprovalId, RequestKey, ShortId, ToolCallId};
 use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::refs::{
     AttemptRef, ContentRef, OutputRef, ToolResultBody, ToolResultStatus,
@@ -105,84 +102,6 @@ struct FakeLiveness(bool);
 impl ExecutorLiveness for FakeLiveness {
     fn stopped(&self, _previous: Option<&ExecutorId>) -> bool {
         self.0
-    }
-}
-
-/// 只负责把一串事件交出去的账本——用来构造 `run.started` 这种**目前没有写入方法**的尾部
-/// （`Ledger` 上没有写它的那一步；生产里由 store 的领取路径写）。
-struct ScriptedLedger(Vec<Event>);
-
-#[async_trait]
-impl Ledger for ScriptedLedger {
-    async fn accept_input(
-        &self,
-        _input: AcceptInput,
-    ) -> Result<komo_kernel::types::turn::Accepted, LedgerError> {
-        unimplemented!("恢复扫描只读")
-    }
-    async fn record_round(
-        &self,
-        _run: &RunId,
-        _round: AssistantRound,
-    ) -> Result<Vec<ToolCallId>, LedgerError> {
-        unimplemented!("恢复扫描只读")
-    }
-    async fn plan_call(
-        &self,
-        _call: &ToolCallId,
-        _plan: &ExecutionPlan,
-    ) -> Result<EventId, LedgerError> {
-        unimplemented!("恢复扫描只读")
-    }
-    async fn start_call(
-        &self,
-        _call: &ToolCallId,
-        _plan: &ExecutionPlan,
-        _grant: Option<komo_kernel::types::turn::GrantUse>,
-    ) -> Result<AttemptId, LedgerError> {
-        unimplemented!("恢复扫描只读")
-    }
-    async fn finish_call(
-        &self,
-        _attempt: &AttemptId,
-        _published: komo_kernel::types::refs::PublishedOutput,
-    ) -> Result<(), LedgerError> {
-        unimplemented!("恢复扫描只读")
-    }
-    async fn suspend(&self, _run: &RunId, _wait: Wait) -> Result<(), LedgerError> {
-        unimplemented!("恢复扫描只读")
-    }
-    async fn complete(&self, _run: &RunId, _end: RunEnd) -> Result<(), LedgerError> {
-        unimplemented!("恢复扫描只读")
-    }
-    async fn read(
-        &self,
-        session: &SessionId,
-        from: Seq,
-        _limit: u32,
-    ) -> Result<komo_kernel::types::turn::EventBatch, LedgerError> {
-        Ok(komo_kernel::types::turn::EventBatch {
-            session: session.clone(),
-            events: self
-                .0
-                .iter()
-                .filter(|event| event.seq > from)
-                .cloned()
-                .collect(),
-            next: None,
-        })
-    }
-    async fn boundary(&self, _session: &SessionId) -> Result<Seq, LedgerError> {
-        unimplemented!("恢复扫描只读")
-    }
-    async fn append_audit(
-        &self,
-        _session: &SessionId,
-        _event_id: &EventId,
-        _payload: EventPayload,
-        _at: OffsetDateTime,
-    ) -> Result<Seq, LedgerError> {
-        unimplemented!("恢复扫描只读")
     }
 }
 
@@ -327,22 +246,6 @@ impl World {
     }
 }
 
-fn started_event(events: &mut Vec<Event>, run: &RunId, session: &SessionId) {
-    let seq = Seq(events.last().map(|e| e.seq.0).unwrap_or(0) + 1);
-    events.push(Event {
-        v: EVENT_FORMAT_VERSION,
-        seq,
-        event_id: EventId::from_raw("e-started"),
-        session: session.clone(),
-        run: Some(run.clone()),
-        ts: NOW,
-        payload: EventPayload::RunStarted(RunStarted {
-            executor: ExecutorId::from_raw("exec-old"),
-            generation: 1,
-        }),
-    });
-}
-
 // ---------------------------------------------------------------- 逐行
 
 /// 第 1 行：输入已在 JSONL 持久保存，Run 尚未开始 → 补齐索引后自动入队。
@@ -382,15 +285,13 @@ async fn row_2_only_the_id_was_reserved() {
 async fn row_3_the_model_reply_never_arrived_in_full() {
     let world = World::new();
     let run = world.accept().await;
-    let mut events = world.ledger.events();
-    started_event(&mut events, &run, &world.session);
+    world
+        .ledger
+        .start_run(&run, &ExecutorId::from_raw("exec-old"), 1)
+        .await
+        .unwrap();
 
-    let (scan, index) = world.scan_with(
-        Arc::new(ScriptedLedger(events)),
-        Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
-        vec![world.run_row(&run, RunStatus::Running)],
-        true,
-    );
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::Running)]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
         report.outcomes[0].action,
@@ -524,6 +425,7 @@ async fn row_8_waiting_on_an_approval() {
             Wait::Approval {
                 approval: approval.clone(),
                 call: None,
+                attempt: None,
             },
         )
         .await
@@ -555,6 +457,7 @@ async fn row_8_waiting_on_an_approval() {
             Wait::Approval {
                 approval: approval.clone(),
                 call: None,
+                attempt: None,
             },
         )
         .await
@@ -599,6 +502,7 @@ async fn row_8_waiting_on_an_approval() {
             Wait::Approval {
                 approval: approval.clone(),
                 call: None,
+                attempt: None,
             },
         )
         .await
@@ -644,6 +548,7 @@ async fn an_approval_the_database_lost_asks_the_operator_again() {
             Wait::Approval {
                 approval: ApprovalId::from_raw("ap-gone"),
                 call: None,
+                attempt: None,
             },
         )
         .await
@@ -704,6 +609,7 @@ async fn row_10_the_result_is_final_but_the_client_never_saw_it() {
             &run,
             RunEnd::Completed {
                 final_message: Some("看完了".into()),
+                rounds: 1,
             },
         )
         .await
@@ -728,6 +634,7 @@ async fn row_11_a_terminal_run_stays_terminal() {
             RunStatus::Completed,
             RunEnd::Completed {
                 final_message: None,
+                rounds: 1,
             },
         ),
         (

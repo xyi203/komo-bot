@@ -1,15 +1,17 @@
 //! LlmClient / TurnDriver 的协议适配器（§13.3、§13.5）。
 //!
-//! **首版只接一种生成协议**（§13.2）：OpenAI 兼容的 Chat Completions，流式 + tool
-//! calling——DeepSeek、OpenRouter、本地推理服务都讲它，`base_url` / `model` /
-//! `api_key_env` 一换就是另一个端点。它**不是**"所有字段都兼容"的保证，所以协议特有
-//! 的东西留在 [`openai_chat`] / [`wire`] 里，新协议是新模块而不是新分支。
+//! **首版只接一种生成协议**（§13.2，2026-09-16 拍板）：**OpenAI Responses API**，流式
+//! SSE + 函数调用 + `reasoning.effort`。provider 串是 `openai_responses`；OpenAI /
+//! Codex / DeepSeek / OpenRouter 等按它接入，换端点只改 `base_url` / `model` /
+//! `api_key_env`。**不做 Chat Completions**——`openai_compatible` / `openai_chat` 这两个
+//! 串在这里一律是 [`LlmBuildError::UnknownProvider`]，免得留下一条没人测的第二路径。
+//! 协议特有的东西在 [`responses`] / [`wire`] 里，新协议是新模块而不是新分支。
 //!
 //! 主模型与记忆模型是**同一个 trait 的两个实例**（§13.3），按各自的 [`ModelConfig`]
 //! 构造；[`RoutingLlm`] 按每个 Run 固定下来的那份配置挑实例，所以配置热重载不会在半路
 //! 换掉正在跑的那个（§3 第 2 步）。
 
-mod openai_chat;
+mod responses;
 mod sse;
 pub mod transport;
 mod wire;
@@ -23,18 +25,20 @@ use komo_kernel::traits::{LlmClient, TurnDriver};
 use komo_kernel::types::model::{ModelConfig, ModelRole};
 use komo_kernel::types::turn::{LlmError, TurnRequest};
 
-pub use openai_chat::{OpenAiChatLlm, SystemPreamble};
+pub use responses::{OpenAiResponsesLlm, SystemPreamble};
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};
 
 use crate::config::{EffortCapabilities, Secrets};
 
-/// 本 crate 认识的生成协议。
-pub const OPENAI_COMPATIBLE: &str = "openai_compatible";
+/// 本 crate 认识的生成协议（§13.2）。
+pub const OPENAI_RESPONSES: &str = "openai_responses";
 
 /// 构造一个后端时会出的问题。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LlmBuildError {
-    #[error("不认识 provider `{provider}`：首版只接入 `{OPENAI_COMPATIBLE}`（Chat Completions）")]
+    #[error(
+        "不认识 provider `{provider}`：生成协议只有 `{OPENAI_RESPONSES}`（OpenAI Responses API）"
+    )]
     UnknownProvider { provider: String },
     /// 档位不可用一类——在**请求前**就定得下来的那些（§13.3）。
     #[error(transparent)]
@@ -142,9 +146,9 @@ impl LlmFactory {
         role: ModelRole,
     ) -> Result<Arc<dyn LlmClient>, LlmBuildError> {
         match config.provider.as_str() {
-            OPENAI_COMPATIBLE => {
+            OPENAI_RESPONSES => {
                 let key = self.secrets.get(&config.api_key_env).map(str::to_string);
-                let mut client = OpenAiChatLlm::new(
+                let mut client = OpenAiResponsesLlm::new(
                     config.clone(),
                     role,
                     key,

@@ -32,9 +32,9 @@ pub use model::{
     ModelRole, TokenUsage, Vector,
 };
 pub use plan::{
-    ApprovedPlan, ConsumedApproval, EnvVersion, ExecutionPlan, Operation, PlanHash, PlanSource,
-    PlanTarget, PlanVersions, Proof, RecoveryMode, ResourceRef, SourceKind, TargetAccess,
-    Verification,
+    ApprovedPlan, ConsumeIntent, ConsumedApproval, EnvVersion, ExecutionPlan, Operation, PlanHash,
+    PlanSource, PlanTarget, PlanVersions, Proof, RecoveryMode, ResourceRef, SourceKind,
+    TargetAccess, Verification,
 };
 pub use refs::{
     AttemptRef, ContentRef, INLINE_ARGUMENT_LIMIT_BYTES, OutputRef, PREVIEW_LIMIT_BYTES,

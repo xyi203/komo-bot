@@ -18,5 +18,6 @@ pub mod deliveries;
 pub mod memory;
 pub mod outbox;
 pub mod queue;
+pub mod recovery;
 pub mod runs;
 pub mod session;

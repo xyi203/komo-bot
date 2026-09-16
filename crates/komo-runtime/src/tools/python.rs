@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_kernel::traits::{PythonHost, Tool};
+use komo_kernel::traits::{OutputWriter, PythonHost, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
@@ -24,7 +24,6 @@ use komo_kernel::types::tool::{
 use serde::{Deserialize, Serialize};
 
 use super::{normalized, parse_args, plan_time};
-use crate::executor::sink::AttemptSinks;
 
 /// 模型给的参数就是一个 [`PythonJob`]；`version` 由 prepare 补。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,7 +44,6 @@ pub struct PythonToolResult {
 
 pub struct PythonTool {
     host: Arc<dyn PythonHost>,
-    sinks: AttemptSinks,
 }
 
 impl std::fmt::Debug for PythonTool {
@@ -57,8 +55,8 @@ impl std::fmt::Debug for PythonTool {
 }
 
 impl PythonTool {
-    pub fn new(host: Arc<dyn PythonHost>, sinks: AttemptSinks) -> Self {
-        Self { host, sinks }
+    pub fn new(host: Arc<dyn PythonHost>) -> Self {
+        Self { host }
     }
 }
 
@@ -167,6 +165,7 @@ impl Tool for PythonTool {
         &self,
         plan: ApprovedPlan,
         ctx: &ToolContext,
+        sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
         let plan = plan.plan();
         let args: PythonArgs = parse_args(plan.args.clone(), "python")?;
@@ -181,18 +180,8 @@ impl Tool for PythonTool {
             });
         }
 
-        let Some(handle) = self.sinks.handle(&ctx.attempt) else {
-            return Err(ToolError::Failed {
-                message: format!("这次尝试（{}）没有可用的输出写入器", ctx.attempt),
-            });
-        };
-
-        let outcome = {
-            let mut writer = handle.lock().await;
-            self.host
-                .run(args.job, writer.as_mut(), ctx.cancel.clone())
-                .await
-        };
+        // 拿到的 sink 原样交给宿主：脚本的 print 流进去，结构化结果走另一条路（§5.1）。
+        let outcome = self.host.run(args.job, sink, ctx.cancel.clone()).await;
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -241,32 +230,21 @@ impl Tool for PythonTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context};
-    use komo_kernel::test_support::{FakePythonHost, MemOutputWriter};
-    use komo_kernel::types::refs::AttemptRef;
+    use crate::tools::test_support::{approved, context, writer};
+    use komo_kernel::test_support::FakePythonHost;
     use komo_kernel::types::tool::PythonResult;
 
-    fn wire(ctx: &ToolContext) -> (Arc<FakePythonHost>, AttemptSinks, PythonTool) {
+    fn wire() -> (Arc<FakePythonHost>, PythonTool) {
         let host = Arc::new(FakePythonHost::new());
-        let sinks = AttemptSinks::new();
-        sinks.install(
-            &ctx.attempt,
-            Box::new(MemOutputWriter::new(AttemptRef {
-                session: ctx.session.clone(),
-                run: ctx.run.clone(),
-                call: ctx.call.clone(),
-                attempt: ctx.attempt.clone(),
-            })),
-        );
-        let tool = PythonTool::new(host.clone(), sinks.clone());
-        (host, sinks, tool)
+        let tool = PythonTool::new(host.clone());
+        (host, tool)
     }
 
     #[tokio::test]
     async fn code_mode_binds_the_code_hash_and_the_environment() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (host, _sinks, tool) = wire(&ctx);
+        let (host, tool) = wire();
         let plan = tool
             .prepare(
                 serde_json::json!({ "mode": "code", "code": "result = 1 + 1" }),
@@ -286,7 +264,7 @@ mod tests {
     async fn call_mode_is_a_different_operation_so_policy_can_tell_them_apart() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (_host, _sinks, tool) = wire(&ctx);
+        let (_host, tool) = wire();
         let plan = tool
             .prepare(
                 serde_json::json!({
@@ -311,7 +289,7 @@ mod tests {
     async fn a_private_function_is_refused_before_it_reaches_the_interpreter() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (host, _sinks, tool) = wire(&ctx);
+        let (host, tool) = wire();
         let error = tool
             .prepare(
                 serde_json::json!({ "mode": "call", "module": "toolbox.ha", "function": "_secret" }),
@@ -330,7 +308,7 @@ mod tests {
     async fn the_job_reaches_the_host_and_the_result_comes_back() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (host, _sinks, tool) = wire(&ctx);
+        let (host, tool) = wire();
         host.push_result(PythonResult {
             status: ToolResultStatus::Completed,
             result: serde_json::json!(2),
@@ -345,7 +323,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let output = tool.execute(approved(plan), &ctx).await.unwrap();
+        let output = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap();
         assert_eq!(output.status, ToolResultStatus::Completed);
         assert_eq!(
             host.calls(),
@@ -359,7 +340,7 @@ mod tests {
     async fn an_environment_that_moved_since_the_plan_is_a_version_conflict() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (host, _sinks, tool) = wire(&ctx);
+        let (host, tool) = wire();
         let plan = tool
             .prepare(
                 serde_json::json!({ "mode": "code", "code": "result = 1" }),
@@ -369,7 +350,10 @@ mod tests {
             .unwrap();
 
         host.set_env_version("py-test-2");
-        let error = tool.execute(approved(plan), &ctx).await.unwrap_err();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, ToolError::VersionConflict { .. }),
             "{error:?}"
@@ -381,7 +365,7 @@ mod tests {
     async fn a_host_that_lost_the_result_is_uncertain_not_failed() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (host, _sinks, tool) = wire(&ctx);
+        let (host, tool) = wire();
         host.push_error(PyError::Protocol("解释器没有写下结果".into()));
         let plan = tool
             .prepare(
@@ -390,7 +374,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = tool.execute(approved(plan), &ctx).await.unwrap_err();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
         assert!(error.is_uncertain(), "{error:?}");
     }
 
@@ -398,7 +385,7 @@ mod tests {
     async fn python_has_no_verification_yet_so_it_lands_on_a_human() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (_host, _sinks, tool) = wire(&ctx);
+        let (_host, tool) = wire();
         let plan = tool
             .prepare(
                 serde_json::json!({ "mode": "code", "code": "result = 1" }),

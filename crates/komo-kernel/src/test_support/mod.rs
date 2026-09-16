@@ -122,6 +122,7 @@ pub fn sample_model() -> crate::types::model::ModelConfig {
         model: "scripted".into(),
         api_key_env: "KOMO_TEST_KEY".into(),
         effort: None,
+        efforts: None,
         timeout_secs: 30,
     }
 }

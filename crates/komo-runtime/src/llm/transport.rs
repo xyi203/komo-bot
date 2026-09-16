@@ -170,18 +170,11 @@ pub(crate) mod testing {
     }
 
     impl Reply {
-        /// 一个正常的 SSE 回应。`terminate` 为假时**没有 `[DONE]`**。
-        pub fn sse(events: &[&str], terminate: bool) -> Self {
-            let mut chunks: Vec<Vec<u8>> = events
-                .iter()
-                .map(|event| format!("data: {event}\n\n").into_bytes())
-                .collect();
-            if terminate {
-                chunks.push(b"data: [DONE]\n\n".to_vec());
-            }
+        /// 一串已经排好的 SSE 帧，一帧一段字节——半帧、跨帧的拼接都靠切分它模拟。
+        pub fn raw(status: u16, frames: &[String]) -> Self {
             Reply {
-                status: 200,
-                chunks,
+                status,
+                chunks: frames.iter().map(|f| f.as_bytes().to_vec()).collect(),
             }
         }
 

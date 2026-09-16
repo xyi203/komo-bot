@@ -14,7 +14,7 @@ use komo_kernel::types::chat::{
 use komo_kernel::types::ids::DeliveryId;
 use time::OffsetDateTime;
 
-use crate::db::{BoxFuture, Db, decode, encode, map_toasty, store_to_repo, to_ts};
+use crate::db::{BoxFuture, Db, decode, encode, map_toasty, to_ts};
 use crate::models::DeliveryRow;
 
 /// 一条投递记录，读出来的样子。
@@ -99,7 +99,7 @@ impl TursoDeliveryRepo {
                 }) as BoxFuture<'_, Result<DeliveryRecord, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     /// 送到了 / 推不出去 / 又失败了一次。
@@ -137,7 +137,7 @@ impl TursoDeliveryRepo {
                 }) as BoxFuture<'_, Result<(), StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     /// 还没送到的投递。重启后补发的就是它们，按 [`DeliveryId`] 幂等。
@@ -171,7 +171,7 @@ impl TursoDeliveryRepo {
                 }) as BoxFuture<'_, Result<Vec<DeliveryRecord>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     pub async fn get(&self, id: &DeliveryId) -> Result<Option<DeliveryRecord>, RepoError> {
@@ -192,7 +192,7 @@ impl TursoDeliveryRepo {
                 }) as BoxFuture<'_, Result<Option<DeliveryRecord>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 }
 

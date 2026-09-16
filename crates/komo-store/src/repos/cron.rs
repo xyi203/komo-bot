@@ -6,15 +6,14 @@
 //! `with_write_retry` 干净重跑一次后看见行已在，答 `false`。
 
 use async_trait::async_trait;
-use komo_kernel::cron::{CronFiring, CronJob};
+use komo_kernel::cron::{CronFiring, CronJob, JobStatus};
 use komo_kernel::traits::{CronRepo, RepoError, StoreError};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{CronJobId, RunId, SessionId};
 use time::OffsetDateTime;
 
 use crate::db::{
-    BoxFuture, Db, decode, encode, from_ts, from_ts_opt, map_toasty, store_to_repo, to_ts,
-    to_ts_opt,
+    BoxFuture, Db, decode, encode, from_ts, from_ts_opt, map_toasty, to_ts, to_ts_opt,
 };
 use crate::models::{CronFiringRow, CronJobRow, RunRow};
 
@@ -62,7 +61,7 @@ impl TursoCronRepo {
                 }) as BoxFuture<'_, Result<(), StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 }
 
@@ -96,7 +95,7 @@ impl CronRepo for TursoCronRepo {
                 }) as BoxFuture<'_, Result<Vec<CronJob>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn get(&self, id: &CronJobId) -> Result<Option<CronJob>, RepoError> {
@@ -117,7 +116,7 @@ impl CronRepo for TursoCronRepo {
                 }) as BoxFuture<'_, Result<Option<CronJob>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn put(&self, job: CronJob) -> Result<CronJob, RepoError> {
@@ -191,7 +190,48 @@ impl CronRepo for TursoCronRepo {
                 }) as BoxFuture<'_, Result<CronJob, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
+    }
+
+    async fn advance(
+        &self,
+        id: &CronJobId,
+        next_run_at: Option<OffsetDateTime>,
+        status: JobStatus,
+        last_error: Option<String>,
+    ) -> Result<(), RepoError> {
+        let id = id.to_string();
+        let now = OffsetDateTime::now_utc();
+        self.db
+            .with_write_retry(move |ex| {
+                let (id, last_error) = (id.clone(), last_error.clone());
+                Box::pin(async move {
+                    let Some(mut row) = CronJobRow::filter_by_id(&id)
+                        .first()
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?
+                    else {
+                        // 推进一个不存在的 Job 是错误，不是无声无息。
+                        return Err(StoreError::NotFound {
+                            what: format!("cron job {id}"),
+                        });
+                    };
+                    // **`version` 一个字都不动**：推进槽位不是定义变更。走 `put` 的话
+                    // 每次触发都会让版本 +1，而 `GrantScope::CronJob` 绑的正是版本
+                    // （§7.2、§10），于是一个每天跑的 Job 的授权活不过第一次触发。
+                    row.update()
+                        .next_run_at(to_ts_opt(next_run_at))
+                        .status(enum_str(&status))
+                        .last_error(last_error)
+                        .updated_at(to_ts(now))
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)
+                }) as BoxFuture<'_, Result<(), StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
     }
 
     async fn remove(&self, id: &CronJobId) -> Result<bool, RepoError> {
@@ -214,7 +254,7 @@ impl CronRepo for TursoCronRepo {
                 }) as BoxFuture<'_, Result<bool, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn due(&self, now: OffsetDateTime) -> Result<Vec<CronJob>, RepoError> {
@@ -259,7 +299,7 @@ impl CronRepo for TursoCronRepo {
                 }) as BoxFuture<'_, Result<bool, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn has_unfinished_firing(&self, id: &CronJobId) -> Result<bool, RepoError> {
@@ -297,7 +337,7 @@ impl CronRepo for TursoCronRepo {
                 }) as BoxFuture<'_, Result<bool, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn firings(&self, id: &CronJobId, limit: u32) -> Result<Vec<CronFiring>, RepoError> {
@@ -328,7 +368,7 @@ impl CronRepo for TursoCronRepo {
                 }) as BoxFuture<'_, Result<Vec<CronFiring>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 }
 
@@ -437,6 +477,64 @@ mod tests {
         assert_eq!(repo.put(job("job-1")).await.unwrap().version, 1);
         assert_eq!(repo.put(job("job-1")).await.unwrap().version, 2);
         assert_eq!(repo.put(job("job-1")).await.unwrap().version, 3);
+    }
+
+    /// 验收 ⑤：`advance` **不碰 version**，`put` 才递增。
+    ///
+    /// 走 `put` 推进槽位的话，每次触发都会让版本 +1，而 `GrantScope::CronJob` 绑的正是
+    /// 版本（§7.2、§10）——于是一个每天跑的 Job 的授权活不过第一次触发。
+    #[tokio::test]
+    async fn advancing_a_slot_does_not_invalidate_the_jobs_grants() {
+        let (db, _dir) = temp().await;
+        let repo = TursoCronRepo::new(db);
+        let stored = repo.put(job("job-1")).await.unwrap();
+        assert_eq!(stored.version, 1);
+
+        let next = NOW + time::Duration::days(1);
+        repo.advance(&stored.id, Some(next), JobStatus::Active, None)
+            .await
+            .unwrap();
+        let after = repo.get(&stored.id).await.unwrap().unwrap();
+        assert_eq!(after.version, 1, "推进槽位不是定义变更");
+        assert_eq!(after.next_run_at, Some(next));
+        assert_eq!(after.status, JobStatus::Active);
+
+        // 一次性触发跑完了：状态变 done，槽位清空，版本还是不动。
+        repo.advance(&stored.id, None, JobStatus::Done, None)
+            .await
+            .unwrap();
+        let done = repo.get(&stored.id).await.unwrap().unwrap();
+        assert_eq!(done.version, 1);
+        assert_eq!(done.status, JobStatus::Done);
+        assert!(done.next_run_at.is_none());
+
+        // 触发层面的问题记在 last_error 上——一个区名解析不了的 Job 要在清单里看得见。
+        repo.advance(
+            &stored.id,
+            None,
+            JobStatus::Active,
+            Some("时区解析不了".into()),
+        )
+        .await
+        .unwrap();
+        let broken = repo.get(&stored.id).await.unwrap().unwrap();
+        assert_eq!(broken.last_error.as_deref(), Some("时区解析不了"));
+        assert_eq!(broken.version, 1);
+
+        // 改定义才递增——旧授权就该在这一刻失效。
+        assert_eq!(repo.put(broken).await.unwrap().version, 2);
+    }
+
+    /// 推进一个不存在的 Job 是错误，不是无声无息。
+    #[tokio::test]
+    async fn advancing_a_job_that_is_not_there_is_an_error() {
+        let (db, _dir) = temp().await;
+        let repo = TursoCronRepo::new(db);
+        assert!(matches!(
+            repo.advance(&CronJobId::from_raw("job-9"), None, JobStatus::Active, None)
+                .await,
+            Err(RepoError::NotFound { .. })
+        ));
     }
 
     /// 验收：`claim_firing` 的唯一键是 `job + scheduled_at`，重复就是 `false`。

@@ -4,11 +4,29 @@
 //! 同一键对应不同内容则拒绝。」——所以每个**写**接口都带一个可选的
 //! [`crate::types::ids::RequestKey`]，而 [`ErrorCode::RequestKeyConflict`] 是它对应的
 //! 那个明确失败。
+//!
+//! 几个端点的响应类型在这里**定死**，免得服务端和客户端各自猜一个：
+//!
+//! | 端点 | 请求体 | 响应体 |
+//! |---|---|---|
+//! | `POST /v1/sessions` | [`CreateSessionRequest`] | [`SessionSummary`] |
+//! | `POST /v1/sessions/{id}/boundary` | [`BoundaryRequest`] | [`BoundaryResponse`] |
+//! | `POST /v1/cron` | [`CreateCronRequest`] | [`CronJob`] |
+//! | `PATCH /v1/cron/{id}` | [`UpdateCronRequest`] | [`CronJob`] |
+//! | `POST /v1/cron/{id}/run` | [`ManualCronRunRequest`] | [`ManualCronRunResponse`] |
+//! | `POST /v1/memories/{id}/confirm` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
+//! | `POST /v1/memories/{id}/forget` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
+//! | `GET /v1/models` | — | [`ModelsResponse`] |
+//! | `GET /v1/config/check` | — | [`ConfigCheckResponse`] |
+//! | `POST /v1/config/reload` | — | [`ConfigReloadResponse`]，失败走 [`ErrorBody`] |
+//!
+//! `confirm` 与 `forget` 都返回**整条**记忆而不是一个 `{ok:true}`：它们带着预期
+//! revision 来，回去的那条才说得清现在是第几版（§9.6 的幂等就是靠这个比出来的）。
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::config::KeyPath;
+use super::config::{ConfigIssue, KeyPath, SourceFile};
 use crate::cron::{CronJob, JobStatus, OverlapPolicy};
 use crate::types::chat::{ApprovalScope, PeerId};
 use crate::types::ids::{
@@ -214,6 +232,14 @@ pub enum PendingItem {
 
 // ---- POST /v1/sessions/{id}/boundary ----
 
+/// `POST /v1/sessions/{id}/boundary`：`/new`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BoundaryRequest {
+    /// 谁划的这一刀。聊天渠道带上发送者，TUI 不带。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<PeerId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoundaryResponse {
     pub session: SessionId,
@@ -331,6 +357,21 @@ pub struct ApprovalDecisionRecord {
     pub consumed: bool,
 }
 
+/// `GET /v1/approvals` 的 query。
+///
+/// `include_decided` 存在是因为 `komo run inspect` 要答「这一步是谁放行的」——那条审批
+/// 早就不在待处理集合里了，按默认的 pending 过滤永远查不到它（§7.4 的审计面）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
+    /// 默认 `false` = 只列待处理。
+    #[serde(default)]
+    pub include_decided: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalListResponse {
     pub approvals: Vec<ApprovalRecord>,
@@ -413,7 +454,16 @@ pub struct UpdateCronRequest {
     pub max_rounds: Option<u32>,
 }
 
-/// `POST /v1/cron/{id}/run`：手动触发。**使用独立请求幂等键，不冒充定时触发**（§10）。
+/// `POST /v1/cron/{id}/run`：手动触发。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualCronRunRequest {
+    /// 不给就由服务端铸一个。无论哪种，它都是一个**独立**的键——手动触发不冒充定时
+    /// 触发（§10）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<RequestKey>,
+}
+
+/// **使用独立请求幂等键，不冒充定时触发**（§10）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManualCronRunResponse {
     pub job: CronJobId,
@@ -521,6 +571,62 @@ pub struct RebuildIndexResponse {
 pub struct MemoryRef {
     pub memory: MemoryId,
     pub revision: u32,
+}
+
+// ---- GET /v1/models ----
+
+/// 可选模型清单里的一项。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelMenuEntry {
+    pub id: String,
+    pub provider: String,
+    /// 这个模型支持的档位。**空表就是"一档都不支持"**，不是"还不知道"——不知道的模型
+    /// 不该出现在给人挑的清单里（§13.3「能力未知……无法确定时拒绝该显式参数」）。
+    #[serde(default)]
+    pub efforts: Vec<Effort>,
+    /// 当前配置里的主模型。
+    #[serde(default)]
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelsResponse {
+    pub models: Vec<ModelMenuEntry>,
+}
+
+// ---- /v1/config ----
+
+/// `GET /v1/config/check`：只读，**不改变运行中的 Gateway**（§3 的命令表）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigCheckResponse {
+    /// 空 = 校验通过。
+    #[serde(default)]
+    pub issues: Vec<ConfigIssue>,
+    /// 当前**生效**配置的加载时间。
+    #[serde(with = "time::serde::rfc3339")]
+    pub loaded_at: OffsetDateTime,
+    /// 各来源文件与它们的 mtime。和 `loaded_at` 对不上就是"文件改了但没装上"（§3）。
+    #[serde(default)]
+    pub sources: Vec<SourceFile>,
+}
+
+/// `POST /v1/config/reload`：校验通过才装，装完报告差异。
+///
+/// **校验不过不走这个响应**——走 [`ErrorBody`] 的 [`ErrorCode::ConfigInvalid`]，`keys`
+/// 带定位；旧快照原样保留（§3 第 1 步：「校验不过的配置永远不会被装上，哪怕只错一个
+/// 键」）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigReloadResponse {
+    /// 变化了的键名，**不带值**（§3 第 3 步）。
+    #[serde(default)]
+    pub changed: Vec<KeyPath>,
+    /// 其中只在启动时生效的那些——这些**没有**生效，要 `komo gateway restart`（§3 第 4
+    /// 步：不静默忽略，也不假装已生效）。
+    #[serde(default)]
+    pub start_only: Vec<KeyPath>,
+    /// 装上了，但有话要说（例如"某渠道 enabled 但 allow_from 为空"）。
+    #[serde(default)]
+    pub warnings: Vec<ConfigIssue>,
 }
 
 #[cfg(test)]

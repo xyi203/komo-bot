@@ -11,8 +11,8 @@ use crate::types::ids::*;
 
 use crate::events::{
     ConversationBoundary, EVENT_FORMAT_VERSION, Event, EventPayload, MessageAssistant, RunAccepted,
-    RunCancelled, RunCompleted, RunFailed, RunNeedsAttention, RunQueued, RunWaitingApproval,
-    RunWaitingRetry, ToolPlanned, ToolResult, ToolStarted,
+    RunCancelled, RunCompleted, RunFailed, RunNeedsAttention, RunQueued, RunStarted,
+    RunWaitingApproval, RunWaitingRetry, ToolPlanned, ToolResult, ToolStarted,
 };
 use crate::fold::{Surface, fold};
 use crate::types::plan::{ExecutionPlan, PlanHash};
@@ -201,6 +201,32 @@ impl Ledger for MemLedger {
         Ok(calls)
     }
 
+    async fn start_run(
+        &self,
+        run: &RunId,
+        executor: &ExecutorId,
+        generation: u64,
+    ) -> Result<(), LedgerError> {
+        let mut state = self.state.lock().expect("账本");
+        let session = state
+            .sessions
+            .get(run)
+            .cloned()
+            .ok_or_else(|| LedgerError::NotFound {
+                what: format!("run {run}"),
+            })?;
+        self.append(
+            &mut state,
+            &session,
+            Some(run.clone()),
+            EventPayload::RunStarted(RunStarted {
+                executor: executor.clone(),
+                generation,
+            }),
+        );
+        Ok(())
+    }
+
     async fn plan_call(
         &self,
         call: &ToolCallId,
@@ -314,11 +340,8 @@ impl Ledger for MemLedger {
                 what: format!("run {run}"),
             })?;
         let payload = match wait {
-            Wait::Approval { approval, .. } => {
-                EventPayload::RunWaitingApproval(RunWaitingApproval {
-                    approval,
-                    call: None,
-                })
+            Wait::Approval { approval, call, .. } => {
+                EventPayload::RunWaitingApproval(RunWaitingApproval { approval, call })
             }
             Wait::Retry {
                 attempts,
@@ -347,10 +370,13 @@ impl Ledger for MemLedger {
                 what: format!("run {run}"),
             })?;
         let payload = match end {
-            RunEnd::Completed { final_message } => EventPayload::RunCompleted(RunCompleted {
+            RunEnd::Completed {
+                final_message,
+                rounds,
+            } => EventPayload::RunCompleted(RunCompleted {
                 final_message,
                 final_message_ref: None,
-                rounds: 0,
+                rounds,
             }),
             RunEnd::Failed { reason } => EventPayload::RunFailed(RunFailed { reason }),
             RunEnd::Cancelled { by } => EventPayload::RunCancelled(RunCancelled {

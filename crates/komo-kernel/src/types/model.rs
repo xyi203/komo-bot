@@ -104,8 +104,25 @@ pub struct ModelConfig {
     pub api_key_env: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    /// 操作者显式声明这个模型支持哪些档位。
+    ///
+    /// §13.3 的「能力未知：需要显式能力声明或在实际启用前完成最小探测。无法确定时拒绝
+    /// 该显式参数」——这就是那个显式声明。`None` **不是"没有档位"**，而是"没人在配置
+    /// 里说过，问适配器自己的内建表去"；写成空 `Vec` 才是"这个模型一档都不支持"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub efforts: Option<Vec<Effort>>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl ModelConfig {
+    /// 配置里这个 effort 立不立得住。`efforts` 没声明就答 `None`——**不是 `true`**：
+    /// 「无法确定时拒绝该显式参数」，由适配器拿自己的能力表来答。
+    pub fn declares_effort(&self, effort: &Effort) -> Option<bool> {
+        self.efforts
+            .as_ref()
+            .map(|declared| declared.contains(effort))
+    }
 }
 
 fn default_timeout_secs() -> u64 {
@@ -123,6 +140,15 @@ pub struct EmbeddingConfig {
     /// 省略时使用模型返回的维度，校验后固定到索引代次。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<u32>,
+    /// 文档侧的输入前缀，例如 e5 的 `passage: `、bge 的 `Represent this sentence…`。
+    ///
+    /// §9.5：「查询与文档必须使用同一空间规定的模型与**各自**输入规则」，而这两条规则
+    /// 进空间指纹——同一个模型换了前缀就是另一个空间，旧向量不能拿来比。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_prefix: Option<String>,
+    /// 查询侧的输入前缀，例如 e5 的 `query: `。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_prefix: Option<String>,
 }
 
 /// 向量空间指纹（§9.5）。同维度不代表同一空间；凭证值不进入指纹。
@@ -244,6 +270,67 @@ mod tests {
         let mut same_model_new_weights = base.clone();
         same_model_new_weights.revision = Some("2026-09".into());
         assert_ne!(base.fingerprint(), same_model_new_weights.fingerprint());
+    }
+
+    #[test]
+    fn an_undeclared_effort_list_is_not_an_empty_one() {
+        let mut config = ModelConfig {
+            provider: "openai_compatible".into(),
+            base_url: "https://x/v1".into(),
+            model: "m".into(),
+            api_key_env: "K".into(),
+            effort: None,
+            efforts: None,
+            timeout_secs: 120,
+        };
+        assert_eq!(
+            config.declares_effort(&Effort::new("high")),
+            None,
+            "没人声明过，配置说不出话，问适配器去"
+        );
+
+        config.efforts = Some(vec![]);
+        assert_eq!(
+            config.declares_effort(&Effort::new("high")),
+            Some(false),
+            "空表是「一档都不支持」"
+        );
+
+        config.efforts = Some(vec![Effort::new("low"), Effort::new("high")]);
+        assert_eq!(config.declares_effort(&Effort::new("high")), Some(true));
+        assert_eq!(config.declares_effort(&Effort::new("max")), Some(false));
+    }
+
+    #[test]
+    fn a_model_written_before_efforts_existed_reads_as_undeclared() {
+        let json = r#"{"provider":"p","base_url":"u","model":"m","api_key_env":"K"}"#;
+        let config: ModelConfig = serde_json::from_str(json).unwrap();
+        assert!(config.efforts.is_none());
+        assert_eq!(config.timeout_secs, 120);
+    }
+
+    #[test]
+    fn changing_an_input_prefix_changes_the_space() {
+        let base = EmbeddingSpace {
+            provider: "p".into(),
+            endpoint: "https://e/v1".into(),
+            model: "e5".into(),
+            revision: None,
+            dimensions: 1024,
+            preprocessing: "v1".into(),
+            document_prefix: "passage: ".into(),
+            query_prefix: "query: ".into(),
+            normalized: true,
+            distance: DistanceRule::Cosine,
+            effort: None,
+        };
+        let mut swapped = base.clone();
+        swapped.query_prefix = String::new();
+        assert_ne!(
+            base.fingerprint(),
+            swapped.fingerprint(),
+            "前缀是空间的一部分，不是调用处的装饰"
+        );
     }
 
     #[test]

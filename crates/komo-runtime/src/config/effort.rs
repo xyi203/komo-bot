@@ -5,11 +5,9 @@
 //! 确定时拒绝该显式参数」。所以这里是一张**声明表**，不是一个猜测函数：认识的后端列
 //! 出它的档位，不认识的后端答"未知"，而未知 + 显式 effort = 拒绝。
 //!
-// TODO(decide: 档位声明目前只能内建在这里，因为 kernel 的 `ModelConfig` 没有
-// `efforts` 字段，而快照的形状不归 W3 改。要让操作者为一个新模型自己声明档位（§13.3
-// 说的"显式能力声明"），需要 kernel 给 `ModelConfig` 加一个 `efforts: Option<Vec<Effort>>`；
-// 在那之前，新后端要么落进下面的内建表，要么由调用方用 `with_provider` / `with_model`
-// 在构造时补声明。
+//! 两级声明，操作者的那一级在上：配置里写了
+//! [`ModelConfig::efforts`](komo_kernel::types::model::ModelConfig::efforts) 就以它为准
+//! （那就是 §13.3 说的"显式能力声明"），没人写过才问下面这张内建表。
 
 use std::collections::BTreeMap;
 
@@ -18,7 +16,7 @@ use komo_kernel::types::model::{Effort, ModelConfig};
 /// 一个后端的档位声明。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EffortSupport {
-    levels: Vec<Effort>,
+    pub(super) levels: Vec<Effort>,
 }
 
 impl EffortSupport {
@@ -85,19 +83,17 @@ impl EffortCapabilities {
 
     /// 内建声明。
     ///
-    /// - `openai_compatible`：本 crate 的生成适配器讲 Chat Completions，它的
-    ///   `reasoning_effort` 就是 `minimal / low / medium / high`。
+    /// - `openai_responses`：生成协议是 Responses API（§13.2），effort 落在
+    ///   `reasoning.effort` 上，档位 `none`（gpt-5.1 起）/ `minimal` / `low` /
+    ///   `medium` / `high`。
     /// - `deepseek-*` 模型：`none / low / high / max`，没有 `medium`。
-    /// - `ollama`：`/api/embed` 没有 effort 参数，任何显式档位都是配置错误。
+    /// - 向量后端（下面那张表）：`/embeddings` 与 `/api/embed` 都没有 effort 参数。
     pub fn builtin() -> Self {
         EffortCapabilities {
-            providers: BTreeMap::from([
-                (
-                    "openai_compatible".to_string(),
-                    EffortSupport::new(["minimal", "low", "medium", "high"]),
-                ),
-                ("ollama".to_string(), EffortSupport::none()),
-            ]),
+            providers: BTreeMap::from([(
+                "openai_responses".to_string(),
+                EffortSupport::new(["none", "minimal", "low", "medium", "high"]),
+            )]),
             // 两个实现了的向量后端（`/embeddings` 与 `/api/embed`）都没有 effort 参数。
             embedding_providers: BTreeMap::from([
                 ("openai_compatible".to_string(), EffortSupport::none()),
@@ -164,6 +160,22 @@ impl EffortCapabilities {
         let Some(effort) = &config.effort else {
             return Ok(());
         };
+        // §13.3 的"显式能力声明"：配置里写了 `efforts` 就以它为准，内建表只是没人说过
+        // 时的回答。
+        match config.declares_effort(effort) {
+            Some(true) => return Ok(()),
+            Some(false) => {
+                return Err(EffortProblem::Unsupported {
+                    model: config.model.clone(),
+                    effort: effort.clone(),
+                    supported: EffortSupport {
+                        levels: config.efforts.clone().unwrap_or_default(),
+                    }
+                    .describe(),
+                });
+            }
+            None => {}
+        }
         match support {
             None => Err(EffortProblem::UnknownCapability {
                 model: config.model.clone(),
@@ -213,6 +225,7 @@ mod tests {
             model: name.into(),
             api_key_env: "K".into(),
             effort: effort.map(Effort::new),
+            efforts: None,
             timeout_secs: 120,
         }
     }
@@ -227,7 +240,7 @@ mod tests {
     fn an_unsupported_level_names_the_model_and_the_supported_ones() {
         let caps = EffortCapabilities::builtin();
         let error = caps
-            .check(&model("openai_compatible", "gpt-x", Some("max")))
+            .check(&model("openai_responses", "gpt-x", Some("max")))
             .unwrap_err();
         let text = error.to_string();
         assert!(text.contains("gpt-x"), "{text}");
@@ -238,17 +251,17 @@ mod tests {
     #[test]
     fn a_model_family_declaration_beats_its_providers() {
         let caps = EffortCapabilities::builtin();
-        // DeepSeek 没有 medium，哪怕它走的也是 openai_compatible 协议。
+        // DeepSeek 没有 medium，哪怕它走的也是 Responses 协议。
         assert!(
             caps.check(&model(
-                "openai_compatible",
+                "openai_responses",
                 "deepseek-v4-pro",
                 Some("medium")
             ))
             .is_err()
         );
         assert!(
-            caps.check(&model("openai_compatible", "deepseek-v4-pro", Some("max")))
+            caps.check(&model("openai_responses", "deepseek-v4-pro", Some("max")))
                 .is_ok()
         );
     }
@@ -266,9 +279,28 @@ mod tests {
     fn an_interface_without_the_parameter_says_so() {
         let caps = EffortCapabilities::builtin();
         let error = caps
-            .check(&model("ollama", "embeddinggemma", Some("low")))
+            .check_embedding(&model("ollama", "embeddinggemma", Some("low")))
             .unwrap_err();
         assert!(error.to_string().contains("没有 effort 参数"), "{error}");
+    }
+
+    /// 配置里写了 `efforts` 就以它为准——§13.3 的"显式能力声明"。
+    #[test]
+    fn an_operators_declaration_beats_the_builtin_table_both_ways() {
+        let caps = EffortCapabilities::builtin();
+
+        let mut declared = model("brand_new", "m", Some("low"));
+        declared.efforts = Some(vec![Effort::new("low"), Effort::new("high")]);
+        assert!(caps.check(&declared).is_ok(), "不认识的后端也能靠声明过关");
+
+        let mut refused = model("openai_responses", "gpt-x", Some("high"));
+        refused.efforts = Some(vec![Effort::new("low")]);
+        let error = caps.check(&refused).unwrap_err();
+        assert!(
+            matches!(error, EffortProblem::Unsupported { .. }),
+            "声明里没有就是没有：{error}"
+        );
+        assert!(error.to_string().contains("low"), "{error}");
     }
 
     #[test]

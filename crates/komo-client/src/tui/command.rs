@@ -59,12 +59,31 @@ pub enum CommandError {
     BadModel { raw: String, options: String },
 }
 
-/// TUI 能提供的 effort 档位。
+/// 当前可选的模型与 effort 档位——`GET /v1/models` 取回来的那份，由 [`super::app::App`]
+/// 摊平成字符串传进来。
 ///
-// TODO(decide: §13.3 明说「low / medium / high / max 等值不是所有模型共享的固定集合」，
-// 而 §13.1 里没有一个接口能报出当前模型支持哪几档。在有那个接口之前，TUI 用这五个
-// 常见档位做白名单——**宁可拒绝一个模型其实支持的档位，也不放过一个它不支持的**：
-// 后者要到请求发出才失败，而 §13.3 要求「不支持的 effort 在请求前拒绝」。
+/// 两边都是**空表 = 不校验**：菜单还没取到时拦一个自己也不知道对不对的值只会挡住人。
+/// 「这个模型一档 effort 都不支持」是另一回事，由调用方用一张真的空表之外的方式表达
+/// （见 [`App::effort_options`](super::app::App::effort_options)）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandMenu {
+    pub models: Vec<String>,
+    pub efforts: Vec<String>,
+}
+
+impl CommandMenu {
+    pub fn efforts(efforts: Vec<String>) -> Self {
+        CommandMenu {
+            models: Vec::new(),
+            efforts,
+        }
+    }
+}
+
+/// 菜单拿不到时的内建 effort 白名单。
+///
+/// §13.3 明说「low / medium / high / max 等值不是所有模型共享的固定集合」，所以它只是
+/// **兜底**：`GET /v1/models` 报得出这个模型支持哪几档时，以那份为准。
 pub const EFFORT_LEVELS: [&str; 5] = [
     Effort::NONE,
     Effort::LOW,
@@ -122,8 +141,9 @@ pub fn complete(prefix: &str) -> Option<String> {
     (completed.len() > prefix.len()).then(|| completed.to_string())
 }
 
-/// 解析一条命令。`models` 是当前可选的模型清单；为空 = 不校验（Gateway 没给清单）。
-pub fn parse(text: &str, models: &[String]) -> Result<Command, CommandError> {
+/// 解析一条命令。非法值**报错并列出可选值**，不静默取默认。
+pub fn parse(text: &str, menu: &CommandMenu) -> Result<Command, CommandError> {
+    let models = &menu.models;
     let text = text.trim();
     let body = text.strip_prefix('/').unwrap_or(text);
     let mut parts = body.split_whitespace();
@@ -193,10 +213,14 @@ pub fn parse(text: &str, models: &[String]) -> Result<Command, CommandError> {
             None => Ok(Command::Effort { level: None }),
             Some(raw) => {
                 let level = Effort::new(raw);
-                if !EFFORT_LEVELS.contains(&level.as_str()) {
+                if !menu.efforts.iter().any(|option| option == level.as_str()) {
                     return Err(CommandError::BadEffort {
                         raw: (*raw).to_string(),
-                        options: EFFORT_LEVELS.join(" · "),
+                        options: if menu.efforts.is_empty() {
+                            "（这个模型不接受显式 effort）".to_string()
+                        } else {
+                            menu.efforts.join(" · ")
+                        },
                     });
                 }
                 Ok(Command::Effort { level: Some(level) })
@@ -212,21 +236,26 @@ pub fn parse(text: &str, models: &[String]) -> Result<Command, CommandError> {
 mod tests {
     use super::*;
 
+    /// 菜单还没取到的那一刻：模型不校验，effort 用内建白名单。
+    fn menu() -> CommandMenu {
+        CommandMenu::efforts(EFFORT_LEVELS.iter().map(|e| e.to_string()).collect())
+    }
+
     #[test]
     fn the_seven_chat_commands_parse() {
-        assert_eq!(parse("/new", &[]).unwrap(), Command::New);
-        assert_eq!(parse("/cancel", &[]).unwrap(), Command::Cancel);
-        assert_eq!(parse("/status", &[]).unwrap(), Command::Status);
-        assert_eq!(parse("/pending", &[]).unwrap(), Command::Pending);
+        assert_eq!(parse("/new", &menu()).unwrap(), Command::New);
+        assert_eq!(parse("/cancel", &menu()).unwrap(), Command::Cancel);
+        assert_eq!(parse("/status", &menu()).unwrap(), Command::Status);
+        assert_eq!(parse("/pending", &menu()).unwrap(), Command::Pending);
         assert_eq!(
-            parse("/approve", &[]).unwrap(),
+            parse("/approve", &menu()).unwrap(),
             Command::Approve {
                 short_id: None,
                 scope: ApprovalScope::Once
             }
         );
         assert_eq!(
-            parse("/reject", &[]).unwrap(),
+            parse("/reject", &menu()).unwrap(),
             Command::Reject { short_id: None }
         );
     }
@@ -234,7 +263,7 @@ mod tests {
     #[test]
     fn approve_with_a_short_id_and_a_run_scope() {
         assert_eq!(
-            parse("/approve 7k2m run", &[]).unwrap(),
+            parse("/approve 7k2m run", &menu()).unwrap(),
             Command::Approve {
                 short_id: ShortId::parse("7K2M"),
                 scope: ApprovalScope::Run
@@ -242,7 +271,7 @@ mod tests {
         );
         // 顺序不重要：范围是个词，不是第二个位置。
         assert_eq!(
-            parse("/approve run 7K2M", &[]).unwrap(),
+            parse("/approve run 7K2M", &menu()).unwrap(),
             Command::Approve {
                 short_id: ShortId::parse("7K2M"),
                 scope: ApprovalScope::Run
@@ -252,14 +281,14 @@ mod tests {
 
     #[test]
     fn a_short_id_that_is_not_one_is_refused_not_ignored() {
-        let error = parse("/approve 7K2I", &[]).unwrap_err();
+        let error = parse("/approve 7K2I", &menu()).unwrap_err();
         assert!(matches!(error, CommandError::BadShortId { .. }), "{error}");
         assert!(error.to_string().contains("7K2I"));
     }
 
     #[test]
     fn an_unknown_command_names_itself() {
-        let error = parse("/aprove", &[]).unwrap_err();
+        let error = parse("/aprove", &menu()).unwrap_err();
         assert_eq!(
             error,
             CommandError::Unknown {
@@ -270,7 +299,7 @@ mod tests {
 
     #[test]
     fn a_command_that_takes_nothing_refuses_an_argument() {
-        let error = parse("/new now", &[]).unwrap_err();
+        let error = parse("/new now", &menu()).unwrap_err();
         assert!(
             matches!(error, CommandError::UnexpectedArgument { .. }),
             "{error}"
@@ -280,14 +309,14 @@ mod tests {
     #[test]
     fn effort_lists_its_options_when_given_none() {
         assert_eq!(
-            parse("/effort", &[]).unwrap(),
+            parse("/effort", &menu()).unwrap(),
             Command::Effort { level: None }
         );
     }
 
     #[test]
     fn an_illegal_effort_is_refused_and_the_error_lists_the_options() {
-        let error = parse("/effort hgih", &[]).unwrap_err();
+        let error = parse("/effort hgih", &menu()).unwrap_err();
         let message = error.to_string();
         assert!(message.contains("hgih"), "{message}");
         for level in EFFORT_LEVELS {
@@ -298,7 +327,7 @@ mod tests {
     #[test]
     fn an_effort_is_normalized_before_it_is_checked() {
         assert_eq!(
-            parse("/effort  HIGH ", &[]).unwrap(),
+            parse("/effort  HIGH ", &menu()).unwrap(),
             Command::Effort {
                 level: Some(Effort::new("high"))
             }
@@ -307,7 +336,10 @@ mod tests {
 
     #[test]
     fn a_model_outside_the_menu_is_refused_and_the_error_lists_the_menu() {
-        let menu = vec!["gpt-x".to_string(), "claude-y".to_string()];
+        let menu = CommandMenu {
+            models: vec!["gpt-x".into(), "claude-y".into()],
+            efforts: Vec::new(),
+        };
         let error = parse("/model gpt-z", &menu).unwrap_err();
         let message = error.to_string();
         assert!(
@@ -317,9 +349,24 @@ mod tests {
     }
 
     #[test]
+    fn a_model_that_accepts_no_explicit_effort_refuses_every_level() {
+        // kernel：空表就是「一档都不支持」，不是「还不知道」。
+        let error = parse("/effort low", &CommandMenu::default()).unwrap_err();
+        assert!(error.to_string().contains("不接受显式 effort"), "{error}");
+    }
+
+    #[test]
+    fn the_menus_effort_list_beats_the_built_in_one() {
+        let menu = CommandMenu::efforts(vec!["none".into(), "max".into()]);
+        assert!(parse("/effort max", &menu).is_ok());
+        let error = parse("/effort medium", &menu).unwrap_err();
+        assert!(error.to_string().contains("none · max"), "{error}");
+    }
+
+    #[test]
     fn without_a_menu_any_model_name_is_accepted() {
         assert_eq!(
-            parse("/model whatever", &[]).unwrap(),
+            parse("/model whatever", &menu()).unwrap(),
             Command::Model {
                 id: Some("whatever".into())
             }

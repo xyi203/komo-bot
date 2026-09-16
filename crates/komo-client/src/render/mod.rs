@@ -7,10 +7,11 @@
 //! 发生未知，不能在这里假装失败），`allowed by …` 只在真的拿到那条审批记录时才印。
 
 use komo_kernel::cron::{CronJob, JobStatus, OverlapPolicy, Trigger};
-use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, IssueSeverity};
+use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
-    ApprovalListResponse, ApprovalRecord, HealthResponse, IndexState, MemoryIndexStatus,
-    MemoryListResponse, RunDetail, SessionListResponse, SessionSummary, ToolCallSummary,
+    ApprovalListResponse, ApprovalRecord, ConfigCheckResponse, ConfigReloadResponse,
+    HealthResponse, IndexState, MemoryIndexStatus, MemoryListResponse, ModelsResponse, RunDetail,
+    SessionListResponse, SessionSummary, ToolCallSummary,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
@@ -53,10 +54,9 @@ fn session_title(session: &SessionSummary) -> String {
 
 /// `komo run inspect RUN_ID`。
 ///
-/// `approvals` 是与这个 Run 相关的审批记录，用来印「allowed by …」。
-// TODO(decide: §13.1 里 `RunDetail` 不带审批引用，`GET /v1/approvals` 又只列待处理的，
-// 所以「这一步是谁放行的」目前**只能由调用方另外取来**。给不出就不印——印一个猜的
-// 放行来源，比不印更糟。)
+/// `approvals` 是与这个 Run 相关的审批记录，用来印「allowed by …」——调用方用
+/// `GET /v1/approvals` 加 `ApprovalListQuery { run: Some(run), include_decided: true, .. }`
+/// 取来：那条审批早就不在待处理集合里了。给不出就**不印**，印一个猜的放行来源比不印更糟。
 pub fn run_inspect(detail: &RunDetail, approvals: &[ApprovalRecord]) -> String {
     let mut out = Vec::new();
     let summary = &detail.summary;
@@ -519,7 +519,131 @@ pub fn memory_index(status: &MemoryIndexStatus) -> String {
 }
 
 /// `komo config check`：**每条问题定位到键**（§3 第 1 步）。
-pub fn config_check(issues: &[ConfigIssue]) -> String {
+///
+/// 只读，不改变运行中的 Gateway——所以它顺带把「当前生效的那份是什么时候装的、来源
+/// 文件什么时候改的」也印出来，那是同一个问题的另一半。
+pub fn config_check(response: &ConfigCheckResponse) -> String {
+    let mut out = vec![issues_text(&response.issues)];
+    out.push(String::new());
+    out.push(format!("当前配置装载于 {}", stamp(response.loaded_at)));
+    out.extend(source_lines(response.loaded_at, &response.sources));
+    if let Some(warning) = stale_warning(response.loaded_at, &response.sources) {
+        out.push(warning);
+    }
+    out.join("\n")
+}
+
+/// `komo config reload`：**成功**的那一支。
+///
+/// 校验不过根本走不到这里——那是一个带 `keys` 的 [`ErrorCode::ConfigInvalid`]
+/// （`render_config_error`），旧快照原样保留。
+pub fn config_reload(response: &ConfigReloadResponse) -> String {
+    let mut out = Vec::new();
+    if response.changed.is_empty() {
+        out.push("配置已重新装载，没有键变化".into());
+    } else {
+        out.push(format!(
+            "配置已重新装载，{} 个键变化",
+            response.changed.len()
+        ));
+        for key in &response.changed {
+            out.push(format!("  {key}"));
+        }
+    }
+    if !response.start_only.is_empty() {
+        // §3 第 4 步：不静默忽略，也不假装已生效。
+        out.push(String::new());
+        out.push("以下键**只在启动时生效**，这次没有生效，需要 `komo gateway restart`：".into());
+        for key in &response.start_only {
+            out.push(format!("  {key}"));
+        }
+    }
+    if !response.warnings.is_empty() {
+        out.push(String::new());
+        for issue in &response.warnings {
+            out.push(format!("警告  {}: {}", issue.key, issue.message));
+        }
+    }
+    out.join("\n")
+}
+
+/// `komo config reload` 的**失败**那一支：把 [`ErrorCode::ConfigInvalid`] 的 `keys`
+/// 印成人能直接去改的样子。
+pub fn config_error(error: &crate::error::ClientError) -> String {
+    let mut out = vec![error.to_string()];
+    for key in error.keys() {
+        out.push(format!("  {key}"));
+    }
+    if error.is(komo_kernel::protocol::http::ErrorCode::ConfigInvalid) {
+        // §3 第 1 步：校验不过的配置永远不会被装上，哪怕只错一个键。
+        out.push("运行中的 Gateway 保留原配置".into());
+    }
+    out.join("\n")
+}
+
+/// `komo model list`：每个模型支持哪几档 effort（§13.3）。
+pub fn model_list(response: &ModelsResponse) -> String {
+    if response.models.is_empty() {
+        return "没有可选模型".into();
+    }
+    let mut out = vec![format!("{:<30} {:<14} {}", "MODEL", "PROVIDER", "EFFORT")];
+    for entry in &response.models {
+        let efforts = if entry.efforts.is_empty() {
+            // 空表 = 一档都不支持，不是「还不知道」。
+            "（不接受显式 effort）".to_string()
+        } else {
+            entry
+                .efforts
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join(" · ")
+        };
+        out.push(format!(
+            "{:<30} {:<14} {efforts}{}",
+            entry.id,
+            entry.provider,
+            if entry.default { "   ← 当前" } else { "" }
+        ));
+    }
+    out.join("\n")
+}
+
+/// `komo doctor`。
+///
+/// §3：「显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是『文件改了但没装
+/// 上』，把上一次校验错误一并印出来。」——两件事都在 [`ConfigCheckResponse`] 里，所以
+/// doctor 就是 health 加它。
+pub fn doctor(health: &HealthResponse, config: Option<&ConfigCheckResponse>) -> String {
+    let mut out = vec![
+        format!("实例      {}", health.instance_id),
+        format!(
+            "版本      {}（协议 v{}）",
+            health.version, health.protocol_version
+        ),
+        format!("启动于    {}", stamp(health.started_at)),
+        format!("数据目录  {}", health.data_dir),
+    ];
+
+    match config {
+        None => out.push("配置      取不到当前快照".into()),
+        Some(config) => {
+            out.push(format!("配置装载  {}", stamp(config.loaded_at)));
+            out.extend(source_lines(config.loaded_at, &config.sources));
+            if let Some(warning) = stale_warning(config.loaded_at, &config.sources) {
+                out.push(warning);
+            }
+            if !config.issues.is_empty() {
+                out.push(String::new());
+                out.push("上一次校验".into());
+                out.push(issues_text(&config.issues));
+            }
+        }
+    }
+    out.join("\n")
+}
+
+fn issues_text(issues: &[ConfigIssue]) -> String {
     if issues.is_empty() {
         return "配置校验通过".into();
     }
@@ -545,72 +669,33 @@ pub fn config_check(issues: &[ConfigIssue]) -> String {
     out.join("\n")
 }
 
-/// `komo doctor`。
-///
-/// §3：「显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是『文件改了但没装
-/// 上』，把上一次校验错误一并印出来。」
-pub fn doctor(
-    health: &HealthResponse,
-    snapshot: Option<&ConfigSnapshot>,
-    last_issues: &[ConfigIssue],
-) -> String {
-    let mut out = vec![
-        format!("实例      {}", health.instance_id),
+fn source_lines(loaded_at: OffsetDateTime, sources: &[SourceFile]) -> Vec<String> {
+    sources
+        .iter()
+        .map(|source| {
+            format!(
+                "  {} {}   mtime {}",
+                if source.mtime > loaded_at { "⚠" } else { " " },
+                source.path.display(),
+                stamp(source.mtime)
+            )
+        })
+        .collect()
+}
+
+/// 文件比生效的那份新 = 「文件改了但没装上」（§3）。
+fn stale_warning(loaded_at: OffsetDateTime, sources: &[SourceFile]) -> Option<String> {
+    let stale: Vec<String> = sources
+        .iter()
+        .filter(|source| source.mtime > loaded_at)
+        .map(|source| source.path.display().to_string())
+        .collect();
+    (!stale.is_empty()).then(|| {
         format!(
-            "版本      {}（协议 v{}）",
-            health.version, health.protocol_version
-        ),
-        format!("启动于    {}", stamp(health.started_at)),
-        format!("数据目录  {}", health.data_dir),
-    ];
-
-    match snapshot {
-        None => out.push("配置      取不到当前快照".into()),
-        Some(snapshot) => {
-            out.push(format!("配置装载  {}", stamp(snapshot.loaded_at)));
-            let mut stale = Vec::new();
-            for source in &snapshot.sources {
-                let newer = source.mtime > snapshot.loaded_at;
-                out.push(format!(
-                    "  {} {}   mtime {}",
-                    if newer { "⚠" } else { " " },
-                    source.path.display(),
-                    stamp(source.mtime)
-                ));
-                if newer {
-                    stale.push(source.path.display().to_string());
-                }
-            }
-            if !stale.is_empty() {
-                out.push(format!(
-                    "⚠ 文件改了但没装上：{}。`komo config reload` 校验并装载",
-                    stale.join(" · ")
-                ));
-            }
-            for (platform, config) in [
-                ("feishu", &snapshot.channels.feishu),
-                ("telegram", &snapshot.channels.telegram),
-                ("wechat", &snapshot.channels.wechat),
-            ] {
-                if config.is_outbound_only() {
-                    // §11.2：enabled 但没人能说话。
-                    out.push(format!(
-                        "⚠ channels.{platform} 已启用但 allow_from 为空——只出不进"
-                    ));
-                }
-            }
-            if snapshot.channels.home_chats().is_empty() {
-                out.push("⚠ 没有任何渠道配了 home_chat——主动投递无处可去".into());
-            }
-        }
-    }
-
-    if !last_issues.is_empty() {
-        out.push(String::new());
-        out.push("上一次校验".into());
-        out.push(config_check(last_issues));
-    }
-    out.join("\n")
+            "⚠ 文件改了但没装上：{}。`komo config reload` 校验并装载",
+            stale.join(" · ")
+        )
+    })
 }
 
 // ---- 小工具 ----

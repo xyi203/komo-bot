@@ -288,6 +288,7 @@ mod tests {
                 model: "m".into(),
                 api_key_env: "K".into(),
                 effort: None,
+                efforts: None,
                 timeout_secs: 120,
             },
             at: datetime!(2026-09-15 08:00:00 UTC),

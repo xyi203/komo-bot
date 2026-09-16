@@ -136,7 +136,7 @@ impl App {
     }
 
     fn run_command(&mut self, text: &str) -> Vec<Effect> {
-        let command = match command::parse(text, &self.model_menu) {
+        let command = match command::parse(text, &self.command_menu()) {
             Ok(command) => command,
             Err(error) => {
                 self.fail(error.to_string());
@@ -164,30 +164,28 @@ impl App {
             Command::Reject { short_id } => {
                 self.decide_by_short_id(short_id, false, ApprovalScope::Once)
             }
-            Command::Model { id } => {
-                match id {
-                    Some(id) => {
-                        self.note(format!("下一个 Run 用模型 {id}"));
-                        self.model = Some(id);
-                    }
-                    None => self.note(self.model_options()),
+            Command::Model { id } => match id {
+                Some(id) => {
+                    self.note(format!("下一个 Run 用模型 {id}"));
+                    self.model = Some(id);
+                    // 换了模型，可选的 effort 档位也就换了。
+                    self.note(self.effort_blurb());
+                    Vec::new()
                 }
-                Vec::new()
-            }
+                // 清单是**去问来的**，不是启动时抄下来就再不更新的一份（§3：模型改完，
+                // 下一个 Run 用新模型）。取回来再印，见 `ServerEvent::ModelMenu`。
+                None => {
+                    self.listing_models = true;
+                    vec![Effect::FetchModels]
+                }
+            },
             Command::Effort { level } => {
                 match level {
                     Some(level) => {
                         self.note(format!("下一个 Run 的 effort = {level}"));
                         self.effort = Some(level);
                     }
-                    None => self.note(format!(
-                        "可选 effort：{}（当前 {}）",
-                        command::EFFORT_LEVELS.join(" · "),
-                        self.effort
-                            .as_ref()
-                            .map(|e| e.to_string())
-                            .unwrap_or_else(|| "跟随 Gateway".into())
-                    )),
+                    None => self.note(self.effort_blurb()),
                 }
                 Vec::new()
             }
@@ -204,20 +202,40 @@ impl App {
         }
     }
 
-    fn model_options(&self) -> String {
+    /// 解析命令时用的菜单：模型 id 表 + **当前模型**支持的 effort 档位。
+    pub(super) fn command_menu(&self) -> command::CommandMenu {
+        command::CommandMenu {
+            models: self.model_options(),
+            efforts: self.effort_options(),
+        }
+    }
+
+    /// `/model` 无参时印的那一段。
+    pub(super) fn model_blurb(&self) -> String {
         let current = self
             .model
             .clone()
             .unwrap_or_else(|| "跟随 Gateway".to_string());
-        if self.model_menu.is_empty() {
-            // TODO(decide: §13.1 没有「列出可选模型」的接口，所以清单可能是空的。空清单
-            // 时 `/model x` 不拦——拦一个自己也不知道对不对的值只会挡住人。)
-            format!("当前模型：{current}。Gateway 没有提供模型清单，`/model <id>` 直接设定")
+        let options = self.model_options();
+        if options.is_empty() {
+            format!("当前模型：{current}。Gateway 没有报出模型清单，`/model <id>` 直接设定")
         } else {
-            format!(
-                "可选模型：{}（当前 {current}）",
-                self.model_menu.join(" · ")
-            )
+            format!("可选模型：{}（当前 {current}）", options.join(" · "))
+        }
+    }
+
+    /// `/effort` 无参时印的那一段。
+    pub(super) fn effort_blurb(&self) -> String {
+        let current = self
+            .effort
+            .as_ref()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "跟随 Gateway".into());
+        let options = self.effort_options();
+        if options.is_empty() {
+            format!("这个模型不接受显式 effort（当前 {current}）")
+        } else {
+            format!("可选 effort：{}（当前 {current}）", options.join(" · "))
         }
     }
 

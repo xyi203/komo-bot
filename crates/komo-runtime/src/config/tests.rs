@@ -57,7 +57,7 @@ fn an_omitted_memory_model_inherits_the_whole_main_model_including_effort() {
     // 把 [memory.model] 整段去掉。
     let trimmed: String = text
         .replace(
-            "[memory.model]\nprovider = \"openai_compatible\"\n\
+            "[memory.model]\nprovider = \"openai_responses\"\n\
              base_url = \"https://memory-llm.example.com/v1\"\n\
              model = \"memory-a\"\napi_key_env = \"KOMO_MEMORY_API_KEY\"\neffort = \"low\"\n",
             "",

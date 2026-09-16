@@ -411,6 +411,39 @@ pub async fn read_events(
     Ok((events, more))
 }
 
+/// 扫描一个 Session 的 JSONL，给出**每一行**的事件、坐标与摘要。
+///
+/// 恢复的 `backfill` 要的就是它：`session_log_index` 存的正是这三样，而
+/// [`read_events`] 只给事件本身。校验与 [`SessionLog::open`] 同一套（中间损坏 / 未知
+/// 版本一律 [`LedgerError::Corrupt`]），但**不隔离、不截断**——补索引是只读的。
+pub async fn scan_records(
+    paths: &SessionPaths,
+    session: &SessionId,
+) -> Result<Vec<AppendedEvent>, LedgerError> {
+    let bytes = match tokio::fs::read(paths.events()).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(persist(StoreError::Io(format!(
+                "读 events.jsonl 失败：{e}"
+            ))));
+        }
+    };
+    let scan = scan(&bytes, session, &TailExpectation::default())?;
+
+    let mut out = Vec::with_capacity(scan.index.len());
+    for loc in &scan.index {
+        let line = &bytes[loc.offset as usize..(loc.offset + loc.len - 1) as usize];
+        out.push(AppendedEvent {
+            event: parse_line(line, loc.offset)?,
+            byte_offset: loc.offset,
+            byte_len: loc.len,
+            digest: ContentHash::of_bytes(line).as_str().to_string(),
+        });
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------- 扫描与校验
 
 struct Scan {

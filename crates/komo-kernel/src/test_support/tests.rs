@@ -2,9 +2,7 @@
 //! 真的核对计划哈希。
 
 use super::*;
-use crate::cron::CronFiring;
 use crate::events::{Event, EventPayload};
-use crate::protocol::http::{ApprovalDecisionRecord, ApprovalRecord};
 use crate::traits::*;
 use crate::types::ids::*;
 use crate::types::model::{InputKind, TokenUsage};
@@ -117,6 +115,7 @@ fn the_mem_ledger_writes_a_log_that_actually_folds() {
                 &accepted.run,
                 RunEnd::Completed {
                     final_message: Some("等于 2".into()),
+                    rounds: 2,
                 },
             )
             .await
@@ -265,112 +264,6 @@ fn the_scripted_driver_hands_back_the_rounds_in_order() {
 }
 
 #[test]
-fn a_claim_is_exclusive_and_bumps_the_generation() {
-    block_on(async {
-        let queue = MemRunQueue::new();
-        let run = RunId::from_raw("run-1");
-        queue.enqueue(run.clone());
-
-        let executor = ExecutorId::from_raw("ex-1");
-        let first = queue.claim(&executor).await.unwrap().unwrap();
-        assert_eq!(first.generation, 1);
-        assert!(
-            queue.claim(&executor).await.unwrap().is_none(),
-            "同一个 Run 只被一个执行者接管"
-        );
-
-        queue.release(&first).await.unwrap();
-        let second = queue.claim(&executor).await.unwrap().unwrap();
-        assert_eq!(second.generation, 2, "代次递增");
-
-        // 旧代次不能交还名额。
-        queue.release(&first).await.unwrap();
-        assert_eq!(queue.depth(), 0);
-    });
-}
-
-#[test]
-fn deciding_twice_returns_the_first_decision() {
-    block_on(async {
-        let repo = MemApprovalRepo::new();
-        let approval = ApprovalId::from_raw("ap-1");
-        let plan = sample_plan("shell", &SessionId::from_raw("sess-1"));
-        let record = ApprovalRecord {
-            approval: approval.clone(),
-            short_id: ShortId::from_index(1),
-            session: SessionId::from_raw("sess-1"),
-            run: None,
-            call: None,
-            plan_hash: plan.plan_hash(),
-            plan: plan.clone(),
-            reason: "任意 shell".into(),
-            changes: None,
-            evidence: None,
-            scopes: vec![],
-            requested_at: time::macros::datetime!(2026-09-15 08:00:00 UTC),
-            valid_until: None,
-            decision: None,
-        };
-        repo.create(record).await.unwrap();
-
-        let decision = ApprovalDecisionRecord {
-            approved: true,
-            scope: crate::types::chat::ApprovalScope::Once,
-            by: None,
-            decided_at: time::macros::datetime!(2026-09-15 08:01:00 UTC),
-            grant: None,
-            consumed: false,
-        };
-        let first = repo.decide(&approval, decision.clone()).await.unwrap();
-        assert!(!first.already_decided);
-
-        let mut rejection = decision.clone();
-        rejection.approved = false;
-        let second = repo.decide(&approval, rejection).await.unwrap();
-        assert!(second.already_decided);
-        assert!(second.decision.approved, "返回的是原决定");
-
-        // 消费时核对计划哈希。
-        let other = sample_plan("write", &SessionId::from_raw("sess-1"));
-        assert!(
-            repo.consume(
-                &approval,
-                &other,
-                time::macros::datetime!(2026-09-15 08:02:00 UTC)
-            )
-            .await
-            .is_err()
-        );
-        let consumed = repo
-            .consume(
-                &approval,
-                &plan,
-                time::macros::datetime!(2026-09-15 08:02:00 UTC),
-            )
-            .await
-            .unwrap();
-        assert_eq!(consumed.plan_hash(), &plan.plan_hash());
-    });
-}
-
-#[test]
-fn the_same_scheduled_time_is_only_claimed_once() {
-    block_on(async {
-        let repo = MemCronRepo::new();
-        let firing = CronFiring {
-            job: CronJobId::from_raw("job-1"),
-            job_version: 1,
-            scheduled_at: time::macros::datetime!(2026-09-16 01:00:00 UTC),
-            prompt: "整理今天的动态".into(),
-            session: None,
-            run: None,
-        };
-        assert!(repo.claim_firing(firing.clone()).await.unwrap());
-        assert!(!repo.claim_firing(firing).await.unwrap());
-    });
-}
-
-#[test]
 fn the_fixed_embedding_client_is_deterministic_and_normalized() {
     block_on(async {
         let client = FixedEmbeddingClient::new(8);
@@ -495,188 +388,39 @@ fn reading_a_session_comes_back_one_page_at_a_time() {
 }
 
 #[test]
-fn two_executors_claiming_the_same_run_leaves_one_winner() {
+fn a_claimed_run_is_written_down_as_started() {
     block_on(async {
+        let clock = TestClock::fixed();
+        let ledger = MemLedger::new(clock.clone());
         let queue = MemRunQueue::new();
-        let run = RunId::from_raw("run-1");
-        queue.enqueue(run.clone());
-
-        // 手动 resume 与启动扫描领的都是**指定**的那个 Run。
-        let first = queue
-            .claim_run(&run, &ExecutorId::from_raw("ex-1"))
-            .await
-            .unwrap();
-        let second = queue
-            .claim_run(&run, &ExecutorId::from_raw("ex-2"))
-            .await
-            .unwrap();
-        assert!(first.is_some());
-        assert!(second.is_none(), "只有一个执行者接管得了");
-        assert_eq!(first.unwrap().generation, 1);
-
-        // 不在队列里的 Run 领不走。
-        assert!(
-            queue
-                .claim_run(&RunId::from_raw("run-9"), &ExecutorId::from_raw("ex-1"))
-                .await
-                .unwrap()
-                .is_none()
-        );
-    });
-}
-
-#[test]
-fn a_scoped_grant_covers_several_plans_and_survives_being_used() {
-    block_on(async {
-        use crate::policy::{Grant, GrantScope, Matcher};
-        use crate::types::ids::GrantId;
-        use crate::types::plan::{Operation, PlanVersions};
-
-        let now = time::macros::datetime!(2026-09-15 08:00:00 UTC);
         let session = SessionId::from_raw("sess-1");
-        let run = RunId::from_raw("run-1");
-        let repo = MemApprovalRepo::new();
 
-        let call = |command: &str| {
-            let mut plan = sample_plan("shell", &session);
-            plan.run = Some(run.clone());
-            plan.operation = Operation::ShellCommand {
-                command: command.into(),
-            };
-            plan
-        };
-
-        let grant = Grant {
-            id: GrantId::from_raw("g-1"),
-            approval: ApprovalId::from_raw("ap-1"),
-            scope: GrantScope::Run {
-                run: run.clone(),
-                matcher: Matcher {
-                    command_prefixes: Some(vec!["cargo test".into()]),
-                    ..Default::default()
-                },
-                versions: PlanVersions::default(),
-            },
-            granted_at: now,
-            valid_until: None,
-            consumed: false,
-            reason: "本次 Run 内可以跑测试".into(),
-        };
-        repo.add_grant(grant);
-
-        let first = call("cargo test --workspace");
-        let approval = ApprovalRecord {
-            approval: ApprovalId::from_raw("ap-1"),
-            short_id: ShortId::from_index(2),
-            session: session.clone(),
-            run: Some(run.clone()),
-            call: None,
-            plan_hash: first.plan_hash(),
-            plan: first.clone(),
-            reason: "任意 shell".into(),
-            changes: None,
-            evidence: None,
-            scopes: vec![crate::types::chat::ApprovalScope::Run],
-            requested_at: now,
-            valid_until: None,
-            decision: None,
-        };
-        repo.create(approval).await.unwrap();
-        repo.decide(
-            &ApprovalId::from_raw("ap-1"),
-            ApprovalDecisionRecord {
-                approved: true,
-                scope: crate::types::chat::ApprovalScope::Run,
-                by: None,
-                decided_at: now,
-                grant: Some(GrantId::from_raw("g-1")),
-                consumed: false,
-            },
-        )
-        .await
-        .unwrap();
-
-        // 第一份计划过得去，而且记下了是凭哪条授权。
-        let used = repo
-            .consume(&ApprovalId::from_raw("ap-1"), &first, now)
+        let accepted = ledger
+            .accept_input(accept(&session, "api:1", "跑一下测试", &clock))
             .await
             .unwrap();
-        assert_eq!(used.plan_hash(), &first.plan_hash());
+        queue.enqueue(accepted.run.clone());
 
-        // **另一份**计划——哈希不同——同一条范围授权照样覆盖得到。
-        let second = call("cargo test -p komo-kernel");
-        assert_ne!(second.plan_hash(), first.plan_hash());
-        assert!(
-            repo.consume(&ApprovalId::from_raw("ap-1"), &second, now)
-                .await
-                .is_ok(),
-            "范围授权不因一次使用而作废"
-        );
-
-        // 范围之外的命令还是不行。
-        let outside = call("rm -rf /");
-        assert!(
-            repo.consume(&ApprovalId::from_raw("ap-1"), &outside, now)
-                .await
-                .is_err()
-        );
-    });
-}
-
-#[test]
-fn a_once_grant_is_used_up_by_the_call_it_was_given_for() {
-    block_on(async {
-        let now = time::macros::datetime!(2026-09-15 08:00:00 UTC);
-        let session = SessionId::from_raw("sess-1");
-        let repo = MemApprovalRepo::new();
-        let plan = sample_plan("shell", &session);
-
-        repo.create(ApprovalRecord {
-            approval: ApprovalId::from_raw("ap-2"),
-            short_id: ShortId::from_index(3),
-            session: session.clone(),
-            run: None,
-            call: None,
-            plan_hash: plan.plan_hash(),
-            plan: plan.clone(),
-            reason: "任意 shell".into(),
-            changes: None,
-            evidence: None,
-            scopes: vec![],
-            requested_at: now,
-            valid_until: None,
-            decision: None,
-        })
-        .await
-        .unwrap();
-        repo.decide(
-            &ApprovalId::from_raw("ap-2"),
-            ApprovalDecisionRecord {
-                approved: true,
-                scope: crate::types::chat::ApprovalScope::Once,
-                by: None,
-                decided_at: now,
-                grant: None,
-                consumed: false,
-            },
-        )
-        .await
-        .unwrap();
-
-        let used = repo
-            .consume(&ApprovalId::from_raw("ap-2"), &plan, now)
+        let executor = ExecutorId::from_raw("ex-1");
+        let claimed = queue.claim(&executor).await.unwrap().unwrap();
+        ledger
+            .start_run(&claimed.run, &executor, claimed.generation)
             .await
             .unwrap();
-        assert!(used.into_proof().approval_id().is_some());
+
+        let surface = ledger.surface();
+        let run = &surface.runs[&accepted.run];
+        assert_eq!(run.status, crate::types::status::RunStatus::Running);
+        assert_eq!(
+            run.generation,
+            Some(claimed.generation),
+            "领取代次跟着 run.started 进日志——JSONL 追加和状态提交都要校验它"
+        );
         assert!(
-            repo.get(&ApprovalId::from_raw("ap-2"))
-                .await
-                .unwrap()
-                .unwrap()
-                .decision
-                .unwrap()
-                .consumed,
-            "一次性授权用过了就记下来"
+            ledger
+                .events()
+                .iter()
+                .any(|e| e.type_name() == "run.started")
         );
     });
 }

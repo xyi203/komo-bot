@@ -7,7 +7,7 @@ use komo_kernel::types::ids::{ApprovalId, ToolCallId};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::ToolCallState;
 
-use super::{App, Effect, Phase, ServerEvent, blank_tool, resume_summary, status_summary};
+use super::{App, Draft, Effect, Phase, ServerEvent, blank_tool, resume_summary, status_summary};
 use crate::tui::approval::ApprovalModal;
 
 impl App {
@@ -122,6 +122,10 @@ impl App {
             }
             ServerEvent::ModelMenu(models) => {
                 self.model_menu = models;
+                if std::mem::take(&mut self.listing_models) {
+                    self.note(self.model_blurb());
+                    self.note(self.effort_blurb());
+                }
                 Vec::new()
             }
             ServerEvent::Failed(text) => {
@@ -157,6 +161,22 @@ impl App {
         match frame.event {
             SseEvent::Event(event) => {
                 self.absorb(&event);
+                Vec::new()
+            }
+            // 模型正在打字。**纯界面提示**：不进 `Surface`，丢了也不影响任何东西——
+            // 一轮结束时 `message.assistant` 会把完整回复正式送到（kernel 的
+            // `SseEvent::AssistantDelta` 注释）。
+            SseEvent::AssistantDelta { run, round, text } => {
+                self.current_run = Some(run.clone());
+                match self.draft.as_mut() {
+                    // 同一轮：接着打。
+                    Some(draft) if draft.run == run && draft.round == round => {
+                        draft.text.push_str(&text)
+                    }
+                    // 换了一轮或换了一个 Run：上一段草稿已经被它的 `message.assistant`
+                    // 取代过了，这里重新起一段。
+                    _ => self.draft = Some(Draft { run, round, text }),
+                }
                 Vec::new()
             }
             // Run 状态是派生的，我们自己折；收到它只当一次提示。
@@ -215,6 +235,10 @@ impl App {
             | EventPayload::RunCancelled(_) => {
                 if let Some(run) = &event.run {
                     self.runs.entry(run.clone()).or_default().ended_at = Some(event.ts);
+                    // Run 结束了就没人在打字了；留着一段孤儿草稿会一直显示"生成中"。
+                    if self.draft.as_ref().is_some_and(|draft| &draft.run == run) {
+                        self.draft = None;
+                    }
                 }
             }
             EventPayload::ConfigChanged(body) => {
@@ -229,6 +253,14 @@ impl App {
                 }
             }
             EventPayload::MessageAssistant(body) => {
+                // 正式回复到了，草稿让位——消息面上这一轮只留一条。
+                if self
+                    .draft
+                    .as_ref()
+                    .is_some_and(|draft| Some(&draft.run) == event.run.as_ref())
+                {
+                    self.draft = None;
+                }
                 for call in &body.tool_calls {
                     let line = self.tools.entry(call.call_id.clone()).or_insert_with(|| {
                         blank_tool(call.call_id.clone(), event.run.clone(), event.seq)

@@ -36,6 +36,7 @@ pub use repos::cron::TursoCronRepo;
 pub use repos::deliveries::{DeliveryRecord, TursoDeliveryRepo};
 pub use repos::memory::{TursoMemoryRepo, lexical_terms};
 pub use repos::queue::{TursoRunQueue, reclaim_abandoned_runs};
+pub use repos::recovery::{RecoveryStore, UnfinishedRun};
 pub use session_log::{SessionLog, SessionPaths, TailExpectation, TailRepair};
 pub use tool_output::FileToolOutputStore;
 

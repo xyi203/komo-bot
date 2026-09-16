@@ -84,3 +84,65 @@ impl RunQueue for MemRunQueue {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::block_on;
+
+    #[test]
+    fn a_claim_is_exclusive_and_bumps_the_generation() {
+        block_on(async {
+            let queue = MemRunQueue::new();
+            let run = RunId::from_raw("run-1");
+            queue.enqueue(run.clone());
+
+            let executor = ExecutorId::from_raw("ex-1");
+            let first = queue.claim(&executor).await.unwrap().unwrap();
+            assert_eq!(first.generation, 1);
+            assert!(
+                queue.claim(&executor).await.unwrap().is_none(),
+                "同一个 Run 只被一个执行者接管"
+            );
+
+            queue.release(&first).await.unwrap();
+            let second = queue.claim(&executor).await.unwrap().unwrap();
+            assert_eq!(second.generation, 2, "代次递增");
+
+            // 旧代次不能交还名额。
+            queue.release(&first).await.unwrap();
+            assert_eq!(queue.depth(), 0);
+        });
+    }
+
+    #[test]
+    fn two_executors_claiming_the_same_run_leaves_one_winner() {
+        block_on(async {
+            let queue = MemRunQueue::new();
+            let run = RunId::from_raw("run-1");
+            queue.enqueue(run.clone());
+
+            // 手动 resume 与启动扫描领的都是**指定**的那个 Run。
+            let first = queue
+                .claim_run(&run, &ExecutorId::from_raw("ex-1"))
+                .await
+                .unwrap();
+            let second = queue
+                .claim_run(&run, &ExecutorId::from_raw("ex-2"))
+                .await
+                .unwrap();
+            assert!(first.is_some());
+            assert!(second.is_none(), "只有一个执行者接管得了");
+            assert_eq!(first.unwrap().generation, 1);
+
+            // 不在队列里的 Run 领不走。
+            assert!(
+                queue
+                    .claim_run(&RunId::from_raw("run-9"), &ExecutorId::from_raw("ex-1"))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+        });
+    }
+}

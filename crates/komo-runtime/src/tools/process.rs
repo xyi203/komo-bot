@@ -8,10 +8,14 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use komo_kernel::traits::OutputWriter;
+use komo_kernel::types::ids::ExecutorId;
 use komo_kernel::types::tool::CancelToken;
+
+use crate::recovery::{ChildProcess, ChildRegistry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
@@ -21,6 +25,17 @@ use crate::executor::cancel::cancelled;
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 预览保留的尾部字节数。
 const TAIL_LIMIT: usize = 4096;
+
+/// 谁给这次子进程登记在册（§8.7）。
+///
+/// 「异常退出可能遗留子进程」——启动子进程的那一方留一行，恢复扫描才核实得了"上一个
+/// 执行实例真的停了吗"。`None` = 不登记：测试里没有 runtime 目录，而一个登记不了的
+/// 子进程不该让命令跑不起来。
+#[derive(Debug, Clone)]
+pub struct ChildRegistration {
+    pub registry: Arc<ChildRegistry>,
+    pub executor: ExecutorId,
+}
 
 /// 起一个子进程要的全部东西。
 #[derive(Debug, Clone)]
@@ -36,6 +51,11 @@ pub struct ChildSpec {
     pub timeout: Duration,
     /// 写进 [`OutputWriter`] 的字节上限；超出后停止转发并置 `truncated`。
     pub output_limit: u64,
+    /// 在册登记（§8.7）。
+    #[allow(clippy::doc_markdown)]
+    pub register: Option<ChildRegistration>,
+    /// 给操作者看的一句话，写进登记行。
+    pub label: String,
 }
 
 /// 一次子进程执行的结果。
@@ -112,6 +132,27 @@ pub async fn run_child(
     let pgid = child
         .id()
         .ok_or_else(|| ProcessError::Spawn("子进程没有 pid".into()))?;
+
+    // 在册：留下 pid、进程组与起来的时刻。`started_at` 走真实时钟——它是给 pid 复用
+    // 核对用的事实，不是一个判决输入。登记失败只是少了一条恢复线索，不该让命令跑不起来。
+    if let Some(registration) = &spec.register
+        && let Err(error) = registration.registry.record(
+            &registration.executor,
+            ChildProcess {
+                pid: pgid,
+                pgid: Some(pgid),
+                started_at: Some(time::OffsetDateTime::now_utc()),
+                what: spec.label.clone(),
+            },
+        )
+    {
+        tracing::warn!(pid = pgid, %error, "子进程登记写不进去");
+    }
+    // 无论怎么收尾都要销号：正常退出、超时、取消、读输出出错，都从这个函数出去。
+    let _forget = ForgetOnDrop {
+        registration: spec.register.clone(),
+        pid: pgid,
+    };
 
     if let Some(body) = &spec.stdin
         && let Some(mut handle) = child.stdin.take()
@@ -236,6 +277,24 @@ async fn forward(
     .map_err(|error| ProcessError::Sink(error.to_string()))
 }
 
+/// 收尾时把在册的那一行销掉。放在守卫里是因为 `run_child` 有好几条出口。
+struct ForgetOnDrop {
+    registration: Option<ChildRegistration>,
+    pid: u32,
+}
+
+impl Drop for ForgetOnDrop {
+    fn drop(&mut self) {
+        if let Some(registration) = &self.registration
+            && let Err(error) = registration
+                .registry
+                .forget(&registration.executor, self.pid)
+        {
+            tracing::warn!(pid = self.pid, %error, "子进程销号写不进去");
+        }
+    }
+}
+
 /// 给整个进程组发信号。
 ///
 /// 没有 `libc` 依赖（§13.4 的依赖清单里没有它，而 Cargo.toml 不归运行时改），所以走
@@ -274,7 +333,7 @@ pub fn process_group_alive(pgid: u32) -> bool {
 mod tests {
     use super::*;
     use komo_kernel::test_support::MemOutputWriter;
-    use komo_kernel::types::ids::{AttemptId, RunId, SessionId, ToolCallId};
+    use komo_kernel::types::ids::{AttemptId, ExecutorId, RunId, SessionId, ToolCallId};
     use komo_kernel::types::refs::AttemptRef;
 
     fn writer() -> MemOutputWriter {
@@ -295,6 +354,8 @@ mod tests {
             stdin: None,
             timeout: Duration::from_secs(30),
             output_limit: 1 << 20,
+            register: None,
+            label: "测试".into(),
         }
     }
 
@@ -338,5 +399,82 @@ mod tests {
             .await
             .unwrap();
         assert!(outcome.timed_out);
+    }
+
+    /// 在册登记：跑着的时候有一行，收尾之后没有（§8.7）。
+    #[tokio::test]
+    async fn a_child_is_registered_while_it_runs_and_forgotten_when_it_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ChildRegistry::new(dir.path().join("children")));
+        let executor = ExecutorId::from_raw("exec-1");
+        let registration = ChildRegistration {
+            registry: registry.clone(),
+            executor: executor.clone(),
+        };
+
+        // 子进程一边跑一边让我们看一眼登记文件。
+        let marker = dir.path().join("started");
+        let mut running = spec(&format!(
+            "touch {}; while [ -e {} ]; do sleep 0.05; done",
+            marker.display(),
+            marker.display()
+        ));
+        running.register = Some(registration);
+        running.label = "测试命令".into();
+
+        let mut sink = writer();
+        let watcher = registry.clone();
+        let watched = executor.clone();
+        let marker_path = marker.clone();
+        let peek = tokio::spawn(async move {
+            let mut seen = Vec::new();
+            for _ in 0..100 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let children = watcher.children(&watched);
+                if !children.is_empty() {
+                    seen = children;
+                    break;
+                }
+            }
+            let _ = std::fs::remove_file(&marker_path);
+            seen
+        });
+
+        let outcome = run_child(running, &mut sink, &CancelToken::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.exit_code, Some(0));
+
+        let seen = peek.await.unwrap();
+        assert_eq!(seen.len(), 1, "跑着的时候在册");
+        assert_eq!(seen[0].what, "测试命令");
+        assert_eq!(seen[0].pgid, Some(seen[0].pid), "登记的是它自己的进程组");
+        assert!(seen[0].started_at.is_some());
+
+        assert!(
+            registry.children(&executor).is_empty(),
+            "收尾之后销号，不然恢复扫描会以为上一代还留着子进程"
+        );
+    }
+
+    /// 取消也要销号——`run_child` 有好几条出口，不能只有正常那条记得。
+    #[tokio::test]
+    async fn a_cancelled_child_is_forgotten_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(ChildRegistry::new(dir.path().join("children")));
+        let executor = ExecutorId::from_raw("exec-1");
+        let mut running = spec("sleep 30");
+        running.register = Some(ChildRegistration {
+            registry: registry.clone(),
+            executor: executor.clone(),
+        });
+        running.timeout = Duration::from_millis(200);
+
+        let mut sink = writer();
+        let outcome = run_child(running, &mut sink, &CancelToken::new())
+            .await
+            .unwrap();
+        assert!(outcome.timed_out);
+        assert!(registry.children(&executor).is_empty());
     }
 }

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
 
-use komo_kernel::traits::{LedgerError, RepoError, StoreError};
+use komo_kernel::traits::{LedgerError, StoreError};
 use time::OffsetDateTime;
 use toasty::Executor;
 use toasty_driver_turso::Turso;
@@ -482,23 +482,26 @@ pub fn map_toasty(error: toasty::Error) -> StoreError {
     }
 }
 
-/// [`StoreError`] → [`RepoError`]。两个错误族在争用与"找不到"上一一对应。
-pub fn store_to_repo(error: StoreError) -> RepoError {
-    match error {
-        StoreError::NotFound { what } => RepoError::NotFound { what },
-        StoreError::Contended => RepoError::Contended,
-        StoreError::Corrupt(message) => RepoError::Other(format!("引用损坏：{message}")),
-        StoreError::Io(message) => RepoError::Other(message),
-        StoreError::Other(message) => RepoError::Other(message),
-    }
-}
-
 /// [`StoreError`] → [`LedgerError`]。
+///
+/// `StoreError` → `RepoError` 的方向**不在这里**：kernel 有
+/// `impl From<StoreError> for RepoError`，两个领域性变体在那儿逐个对上，仓储直接
+/// `?` 或 `.map_err(RepoError::from)` 就行。
+///
+/// 账本这边没有对应的变体：预期 revision 不符、授权覆盖不到这份计划，对
+/// [`LedgerError`] 来说都是"这个状态下做不了这件事"，所以并进 [`LedgerError::Conflict`]
+/// ——**并进去的是文本，不是沉默**。
 pub fn store_to_ledger(error: StoreError) -> LedgerError {
     match error {
         StoreError::NotFound { what } => LedgerError::NotFound { what },
         StoreError::Contended => LedgerError::Contended,
         StoreError::Corrupt(message) => LedgerError::Corrupt(message),
+        StoreError::VersionConflict { expected, actual } => {
+            LedgerError::Conflict(format!("版本冲突：预期 {expected}，当前 {actual}"))
+        }
+        StoreError::GrantMismatch(message) => {
+            LedgerError::Conflict(format!("授权不匹配：{message}"))
+        }
         StoreError::Io(message) => LedgerError::Persist(message),
         StoreError::Other(message) => LedgerError::Conflict(message),
     }

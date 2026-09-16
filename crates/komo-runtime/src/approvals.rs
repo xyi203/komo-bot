@@ -20,7 +20,7 @@ use komo_kernel::protocol::http::{
 use komo_kernel::traits::{ApprovalRepo, Clock, RepoError};
 use komo_kernel::types::chat::{ApprovalPresentation, ApprovalScope, PeerId};
 use komo_kernel::types::ids::{ApprovalId, RunId, SessionId, ShortId, ToolCallId};
-use komo_kernel::types::plan::{ConsumedApproval, ExecutionPlan};
+use komo_kernel::types::plan::{ConsumeIntent, ConsumedApproval, ExecutionPlan};
 use time::{Duration, OffsetDateTime};
 
 /// 一条审批默认多久失效。
@@ -44,26 +44,6 @@ pub struct ApprovalRequest {
     pub evidence: Option<String>,
     /// 这条请求可以批到哪些范围。总是含 [`ApprovalScope::Once`]。
     pub scopes: Vec<ApprovalScope>,
-}
-
-/// 这次来消费这条授权，是**第一次用**，还是一次确定没跑过的续跑。
-///
-/// 两个方向都写在 §7.4 里，而它们要的答案相反：
-///
-/// - 「重复回答幂等，已取消或已完成调用不能再次执行」——一条已经用掉的一次性授权
-///   不能换来第二次执行。
-/// - 「恢复时若确定原动作未发生……可在原授权范围内继续；**已经消费授权本身不是重试
-///   依据**」——所以"消费过"也不能一概拒绝，否则崩在 `consume` 与 `tool.started`
-///   之间的那个调用会被迫再问一次人，而「审批无需用户因重启再答一次」。
-///
-/// 分辨它们的事实只有一个：这个调用**确定没有跑过**吗。那个事实在 executor 手里
-/// （`ToolContext::resumed`），所以由它告诉这里。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConsumeIntent {
-    /// 第一次用。已经消费过的一次性授权在这里读作"重复派发"。
-    First,
-    /// 恢复执行，且已经确定原动作未发生（§8.4 第 6 行，或核对给出 `NotPerformed`）。
-    KnownNotToHaveRun,
 }
 
 /// 问一条审批"现在怎么样了"的答案。
@@ -193,17 +173,10 @@ impl ApprovalGate {
                 reason: format!("操作者拒绝了这次执行（{}）", record.reason),
             });
         }
-        // 已经用掉的一次性授权换不来第二次执行——除非调用方能证明那次动作没发生。
-        if decision.consumed
-            && decision.scope == ApprovalScope::Once
-            && intent == ConsumeIntent::First
-        {
-            return Ok(ApprovalOutcome::Stale {
-                approval: approval.clone(),
-                reason: "这条一次性审批已经被用过了，要再做一次请重新审核".into(),
-            });
-        }
-        match self.repo.consume(approval, plan, now).await {
+        // 「已经用掉的一次性授权换不来第二次执行」不在这里判——`ApprovalRepo::consume`
+        // 的契约要求 repo 自己守，`intent` 就是问它的那句话。在这里再写一遍，两处规则
+        // 迟早会漂移，而漂移的方向里有一个是"放行了第二次副作用"。
+        match self.repo.consume(approval, plan, intent, now).await {
             Ok(consumed) => Ok(ApprovalOutcome::Approved {
                 approval: approval.clone(),
                 consumed,
@@ -540,6 +513,8 @@ mod tests {
         );
     }
 
+    /// 规则**在 repo 里**（`ApprovalRepo::consume` 的契约）：这里断言的是它那个
+    /// `GrantMismatch` 被映射成同一个 outcome，而不是 gate 自己又判了一遍。
     #[test]
     fn a_spent_one_shot_approval_is_refused_unless_the_call_is_known_not_to_have_run() {
         let repo = MemApprovalRepo::new();

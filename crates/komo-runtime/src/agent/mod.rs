@@ -41,6 +41,34 @@ pub struct Budget {
     pub max_tokens: Option<u64>,
     /// 这一段从第几轮编号起（续跑时接着数）。
     pub first_round: u32,
+    /// 模型请求的有界退避预算（§8.5）。
+    pub retry: RetryBudget,
+}
+
+/// 「普通模型超时可按有界退避重试，次数、已用预算和下次时间都持久化。**重启不重置
+/// 预算**」（§8.5）。
+///
+/// 所以 `attempts` 是**输入**：由调用方从账本里已保存的次数给，不是每段从零开始。
+#[derive(Debug, Clone)]
+pub struct RetryBudget {
+    /// 这个 Run 的模型请求已经重试过几次。
+    pub attempts: u32,
+    /// 最多几次。到了就是 failed，不是无限循环（§8.4）。
+    pub max_attempts: u32,
+    /// 指数退避的底：第 n 次等 `base * 2^n`。
+    pub base: std::time::Duration,
+}
+
+impl Default for RetryBudget {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            max_attempts: 5,
+            // TODO(decide: 文档没有给退避的数。2s 起步、5 次封顶（累计约 1 分钟）是
+            // "限流一会儿就过去了"与"别把配额耗在重试上"之间的保守取值)。
+            base: std::time::Duration::from_secs(2),
+        }
+    }
 }
 
 impl Default for Budget {
@@ -49,6 +77,7 @@ impl Default for Budget {
             max_rounds: 24,
             max_tokens: None,
             first_round: 1,
+            retry: RetryBudget::default(),
         }
     }
 }
@@ -158,7 +187,7 @@ impl AgentLoop {
 
         let mut driver = match self.llm.begin_turn(request).await {
             Ok(driver) => driver,
-            Err(error) => return self.fail(&run, rounds, &error).await,
+            Err(error) => return self.llm_error(&run, rounds, &budget.retry, &error).await,
         };
 
         // 续跑：先把上一回合剩下的调用跑完，再请求下一轮模型。
@@ -192,7 +221,9 @@ impl AgentLoop {
             // 一回合一次 completion。取消和它赛跑——**每个 await 都要**。
             let round = match crate::executor::cancel::race(&env.cancel, driver.next(input)).await {
                 None => return self.cancel(&run, rounds).await,
-                Some(Err(error)) => return self.fail(&run, rounds, &error).await,
+                Some(Err(error)) => {
+                    return self.llm_error(&run, rounds, &budget.retry, &error).await;
+                }
                 Some(Ok(round)) => round,
             };
             rounds += 1;
@@ -220,6 +251,7 @@ impl AgentLoop {
                         &run,
                         RunEnd::Completed {
                             final_message: round.text.clone(),
+                            rounds,
                         },
                     )
                     .await?;
@@ -288,13 +320,12 @@ impl AgentLoop {
         stop: RoundStop,
     ) -> Result<SegmentOutcome, AgentError> {
         match stop {
-            RoundStop::Approval { approval, .. } => {
+            RoundStop::Approval { approval, call } => {
                 let wait = Wait::Approval {
                     approval,
-                    // `Wait::Approval::call` 的类型是 `AttemptId`，而停在审批上的调用
-                    // 恰恰是**还没有 attempt** 的那个（`start_call` 在放行之后）。
-                    // 见报告里给编排者的那条：这个字段应当是 `ToolCallId`。
-                    call: None,
+                    call: Some(call),
+                    // 审批发生在 `tool.started` 之前，这时候一次尝试都还没有。
+                    attempt: None,
                 };
                 self.ledger.suspend(run, wait.clone()).await?;
                 Ok(SegmentOutcome::Suspended { wait, rounds })
@@ -315,13 +346,43 @@ impl AgentLoop {
         Ok(SegmentOutcome::Cancelled { rounds })
     }
 
-    async fn fail(
+    /// 模型 / 驱动出错了：**能重试的让出名额去等退避，不能重试的当场终止**（§8.5）。
+    ///
+    /// 判"能不能重试"用 `llm::is_retryable`——一处判断，适配器与 loop 不会各有一套。
+    /// 结果与用量都未知（`LlmError::Unknown`）不在其中：那种情形要保留未知标记，
+    /// 不能自动再来一次。
+    async fn llm_error(
         &self,
         run: &RunId,
         rounds: u32,
+        budget: &RetryBudget,
         error: &LlmError,
     ) -> Result<SegmentOutcome, AgentError> {
-        self.fail_with(run, rounds, error.to_string()).await
+        if !crate::llm::is_retryable(error) {
+            return self.fail_with(run, rounds, error.to_string()).await;
+        }
+        let attempts = budget.attempts + 1;
+        if attempts >= budget.max_attempts {
+            return self
+                .fail_with(
+                    run,
+                    rounds,
+                    format!(
+                        "重试预算已用完（{attempts}/{}）：{error}",
+                        budget.max_attempts
+                    ),
+                )
+                .await;
+        }
+        let backoff = budget.base.saturating_mul(1u32 << budget.attempts.min(16));
+        let wait = Wait::Retry {
+            attempts,
+            next_retry_at: self.clock.now()
+                + time::Duration::try_from(backoff).unwrap_or(time::Duration::seconds(2)),
+            reason: error.to_string(),
+        };
+        self.ledger.suspend(run, wait.clone()).await?;
+        Ok(SegmentOutcome::Suspended { wait, rounds })
     }
 
     async fn fail_with(
@@ -348,5 +409,9 @@ fn spent(usage: &TokenUsage) -> u64 {
     usage.input.unwrap_or(0) + usage.output.unwrap_or(0) + usage.reasoning.unwrap_or(0)
 }
 
+pub mod handler;
+
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) mod tests_support;

@@ -17,7 +17,7 @@
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
-use crate::cron::{CronFiring, CronJob, ZoneError, ZoneResolution};
+use crate::cron::{CronFiring, CronJob, JobStatus, ZoneError, ZoneResolution};
 use crate::policy::{Grant, PolicyContext, PolicyDecision};
 use crate::protocol::http::{ApprovalDecisionRecord, ApprovalDecisionResponse, ApprovalRecord};
 use crate::protocol::{InboundAck, InboundMessage};
@@ -28,7 +28,9 @@ use crate::types::ids::{
 };
 use crate::types::memory::{MemoryItem, RecallQuery, RecallResult};
 use crate::types::model::{EmbeddingSpace, InputKind, TokenUsage, Vector};
-use crate::types::plan::{ApprovedPlan, ConsumedApproval, ExecutionPlan, Verification};
+use crate::types::plan::{
+    ApprovedPlan, ConsumeIntent, ConsumedApproval, ExecutionPlan, Verification,
+};
 use crate::types::refs::{AttemptRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput};
 use crate::types::status::{Claimed, RunEnd, Wait};
 use crate::types::tool::{
@@ -68,6 +70,11 @@ pub enum LedgerError {
 }
 
 /// 存储层失败。
+///
+/// 它比"IO 出错了"宽一点：store 的 `with_write_retry` 闭包只有这一条错误通道
+/// （§8.2），而闭包里跑的正是那些要报**领域性**失败的事务——预期 revision 不符、这条
+/// 授权覆盖不到这份计划。没有对应的变体，那些失败只能塞进 `Other(String)` 再靠字符串
+/// 前缀在上层认回来，而字符串前缀不是类型。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
     #[error("找不到 {what}")]
@@ -75,6 +82,12 @@ pub enum StoreError {
     /// 引用的正文缺失或哈希不符。**返回它，不返回内容。**
     #[error("引用损坏：{0}")]
     Corrupt(String),
+    /// 预期 revision / 版本不符。与 [`RepoError::VersionConflict`] 一一对应。
+    #[error("版本冲突：预期 {expected}，当前 {actual}")]
+    VersionConflict { expected: u32, actual: u32 },
+    /// 这条授权不能用来执行这份计划。与 [`RepoError::GrantMismatch`] 一一对应。
+    #[error("授权不匹配：{0}")]
+    GrantMismatch(String),
     #[error("IO 失败：{0}")]
     Io(String),
     #[error("写入争用，重试超限")]
@@ -98,6 +111,25 @@ pub enum RepoError {
     Contended,
     #[error("{0}")]
     Other(String),
+}
+
+/// store 的事务错误通道抬到仓储接口上。
+///
+/// 两个领域性变体**逐个对上**，不经字符串；其余的按语义收进最接近的那个。
+impl From<StoreError> for RepoError {
+    fn from(error: StoreError) -> Self {
+        match error {
+            StoreError::NotFound { what } => RepoError::NotFound { what },
+            StoreError::VersionConflict { expected, actual } => {
+                RepoError::VersionConflict { expected, actual }
+            }
+            StoreError::GrantMismatch(message) => RepoError::GrantMismatch(message),
+            StoreError::Contended => RepoError::Contended,
+            StoreError::Corrupt(message) => RepoError::Other(format!("引用损坏：{message}")),
+            StoreError::Io(message) => RepoError::Other(format!("IO 失败：{message}")),
+            StoreError::Other(message) => RepoError::Other(message),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -178,6 +210,18 @@ pub trait Ledger: Send + Sync {
         run: &RunId,
         round: AssistantRound,
     ) -> Result<Vec<ToolCallId>, LedgerError>;
+
+    /// `run.started`：某个执行实例领取了这个 Run，带上它的领取代次。
+    ///
+    /// （事件词汇里本来就有 `run.started`——`RunQueue::claim` 拿到 `Claimed` 之后总得有
+    /// 人把它写下来，而 trait 上原先没有一个方法写得出它。`fold` 认它：状态变
+    /// `Running`，`generation` 记在 `RunView` 上。）
+    async fn start_run(
+        &self,
+        run: &RunId,
+        executor: &ExecutorId,
+        generation: u64,
+    ) -> Result<(), LedgerError>;
 
     /// `tool.planned`：准备好的执行计划落盘。返回承载它的事件 ID，`tool.started` 的
     /// `plan_ref` 指向它。
@@ -339,12 +383,20 @@ pub trait ApprovalRepo: Send + Sync {
     /// 只有哈希是不够的：一条"本次 Run 内可以跑 cargo test"的授权，按定义覆盖的是一族
     /// 计划，每个都有自己的哈希。
     ///
+    /// `intent` 是 §7.4 那两句话的分界线：「已取消或**已完成调用不能再次执行**」与
+    /// 「恢复时**若确定原动作未发生**……可在原授权范围内继续；**已经消费授权本身不是
+    /// 重试依据**」。一条已经用掉的一次性授权，对
+    /// [`ConsumeIntent::First`] 必须是 [`RepoError::GrantMismatch`]——一个可分辨的失败，
+    /// 而不是悄悄放行第二次副作用；只有恢复流程核对过、拿着
+    /// [`ConsumeIntent::KnownNotToHaveRun`] 来，才准重用它。
+    ///
     /// **[`PolicyDecision::Deny`] 时不会走到这里**——executor 在 Deny 上直接返回拒绝，
     /// 根本不去消费任何授权，这就是"审批不覆盖显式 Deny"在执行侧成立的方式。
     async fn consume(
         &self,
         id: &ApprovalId,
         plan: &ExecutionPlan,
+        intent: ConsumeIntent,
         now: OffsetDateTime,
     ) -> Result<ConsumedApproval, RepoError>;
 
@@ -375,6 +427,20 @@ pub trait CronRepo: Send + Sync {
 
     /// 创建或整体替换一个 Job。**版本递增**——Job 改了，绑定它的授权失效。
     async fn put(&self, job: CronJob) -> Result<CronJob, RepoError>;
+
+    /// 只写调度状态：下一个槽位、生命周期、触发层面的错误。
+    ///
+    /// **它不递增版本**，这是它与 [`CronRepo::put`] 的全部区别，也是它存在的全部理由：
+    /// 推进槽位不是定义变更。走 `put` 的话每次触发都会让版本 +1，而 `GrantScope::CronJob`
+    /// 绑的正是版本（§7.2、§10「Job 版本变了就不该再返回旧的」）——于是一个每天跑的
+    /// Job 的授权活不过第一次触发，操作者每天早上都要重新批一遍。
+    async fn advance(
+        &self,
+        id: &CronJobId,
+        next_run_at: Option<OffsetDateTime>,
+        status: JobStatus,
+        last_error: Option<String>,
+    ) -> Result<(), RepoError>;
 
     async fn remove(&self, id: &CronJobId) -> Result<bool, RepoError>;
 
@@ -502,8 +568,17 @@ pub trait Tool: Send + Sync {
 
     /// 真正执行。只接受 [`ApprovedPlan`]——"没经过 Policy 或审批就执行"在类型上写不
     /// 出来。
-    async fn execute(&self, plan: ApprovedPlan, ctx: &ToolContext)
-    -> Result<ToolOutput, ToolError>;
+    ///
+    /// `sink` 是本次尝试的流式写入器，**借用**：工具把子进程的 stdout / stderr 流进去，
+    /// 但关不掉也发布不了——executor 在返回后收回所有权去 `ToolOutputStore::publish`，
+    /// "先持久化输出、再追加 `tool.result`"那一步不在工具手里（§8.5）。`read` / `write` /
+    /// `edit` 不产生流式输出，忽略它即可。
+    async fn execute(
+        &self,
+        plan: ApprovedPlan,
+        ctx: &ToolContext,
+        sink: &mut dyn OutputWriter,
+    ) -> Result<ToolOutput, ToolError>;
 
     /// §8.6：对 started 而无结果的调用核对目标状态。默认 `Unavailable` →
     /// `needs_attention`。`write` / `edit` 用内容哈希覆盖它；`python` 交给模块自带的
@@ -617,6 +692,39 @@ mod tests {
         assert_object_safe::<dyn Notifier>();
         assert_object_safe::<dyn Clock>();
         assert_object_safe::<dyn ZoneResolver>();
+    }
+
+    #[test]
+    fn the_two_domain_store_errors_map_across_one_for_one() {
+        assert_eq!(
+            RepoError::from(StoreError::VersionConflict {
+                expected: 3,
+                actual: 4
+            }),
+            RepoError::VersionConflict {
+                expected: 3,
+                actual: 4
+            },
+            "预期 revision 不符不该在跨层时退化成一句字符串"
+        );
+        assert_eq!(
+            RepoError::from(StoreError::GrantMismatch("覆盖不到这份计划".into())),
+            RepoError::GrantMismatch("覆盖不到这份计划".into())
+        );
+        assert_eq!(
+            RepoError::from(StoreError::NotFound {
+                what: "run x".into()
+            }),
+            RepoError::NotFound {
+                what: "run x".into()
+            }
+        );
+        assert_eq!(RepoError::from(StoreError::Contended), RepoError::Contended);
+        // 其余的收进 Other，但把原来的类别留在文本里。
+        assert!(matches!(
+            RepoError::from(StoreError::Corrupt("哈希不符".into())),
+            RepoError::Other(message) if message.contains("引用损坏")
+        ));
     }
 
     #[test]

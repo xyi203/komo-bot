@@ -308,6 +308,7 @@ mod tests {
             model: name.into(),
             api_key_env: "KOMO_LLM_API_KEY".into(),
             effort: Some(Effort::new("medium")),
+            efforts: None,
             timeout_secs: 120,
         }
     }

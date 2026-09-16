@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::ids::{ApprovalId, AttemptId, EventId, RunId};
+use super::ids::{ApprovalId, AttemptId, EventId, RunId, ToolCallId};
 
 /// Run 的状态。§8.4 的状态图逐个列出，没有第十一个。
 ///
@@ -119,9 +119,14 @@ pub enum Wait {
     /// 等审批。`approval` 是 `approval_requests` 里的那一条。
     Approval {
         approval: ApprovalId,
-        /// 停在哪个调用上；没有工具调用的审批（例如 Memory 内部变更）为 None。
+        /// 停在哪个**逻辑调用**上；没有工具调用的审批（例如 Memory 内部变更）为 None。
+        /// 它与 `run.waiting_approval` 事件里的 `call` 是同一个东西，所以是同一个类型。
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        call: Option<AttemptId>,
+        call: Option<ToolCallId>,
+        /// 停在哪次**尝试**上。**通常是 None**：审批发生在 `tool.started` 之前，那时候
+        /// 一次尝试都还没有；只有"执行到一半才发现要再批一次"这类情形才填得出来。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attempt: Option<AttemptId>,
     },
     /// 等一次有界退避到期。
     Retry {
@@ -152,6 +157,10 @@ pub enum RunEnd {
     Completed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         final_message: Option<String>,
+        /// 这个 Run 一共跑了几轮模型。`run inspect` 与预算核对读它——`RunCompleted.rounds`
+        /// 原先恒为 0，因为账本接口上根本没地方把这个数交进来。
+        #[serde(default)]
+        rounds: u32,
     },
     Failed {
         reason: String,
@@ -235,9 +244,31 @@ mod tests {
     fn a_wait_names_the_status_it_puts_the_run_in() {
         let approval = Wait::Approval {
             approval: ApprovalId::from_raw("a-1"),
-            call: None,
+            call: Some(ToolCallId::from_raw("call-7")),
+            attempt: None,
         };
         assert_eq!(approval.status(), RunStatus::WaitingApproval);
+        let text = serde_json::to_string(&approval).unwrap();
+        assert!(
+            !text.contains("attempt"),
+            "停在审批上的调用通常还没有尝试：{text}"
+        );
+        assert_eq!(serde_json::from_str::<Wait>(&text).unwrap(), approval);
+
+        let end = RunEnd::Completed {
+            final_message: Some("等于 2".into()),
+            rounds: 2,
+        };
+        assert_eq!(end.status(), RunStatus::Completed);
+        let old = r#"{"kind":"completed","final_message":"好了"}"#;
+        assert_eq!(
+            serde_json::from_str::<RunEnd>(old).unwrap(),
+            RunEnd::Completed {
+                final_message: Some("好了".into()),
+                rounds: 0
+            },
+            "老行没有 rounds，读为默认"
+        );
         assert_eq!(
             Wait::Attention {
                 reason: "结果不明".into()

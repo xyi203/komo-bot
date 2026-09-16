@@ -81,6 +81,9 @@ pub(super) struct ModelSection {
     pub model: String,
     pub api_key_env: String,
     pub effort: Option<String>,
+    /// 操作者显式声明这个模型支持哪些档位（§13.3 的"显式能力声明"）。省略 = 问适配器
+    /// 自己的内建表；写成空表 = 这个模型一档都不支持。
+    pub efforts: Option<Vec<String>>,
     pub timeout_secs: Option<u64>,
 }
 
@@ -92,6 +95,9 @@ impl ModelSection {
             model: self.model.trim().to_string(),
             api_key_env: self.api_key_env.trim().to_string(),
             effort: self.effort.map(Effort::new),
+            efforts: self
+                .efforts
+                .map(|levels| levels.into_iter().map(Effort::new).collect()),
             timeout_secs: self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
         }
     }
@@ -115,9 +121,13 @@ pub(super) struct EmbeddingSection {
     pub model: String,
     pub api_key_env: String,
     pub effort: Option<String>,
+    pub efforts: Option<Vec<String>>,
     pub timeout_secs: Option<u64>,
     pub revision: Option<String>,
     pub dimensions: Option<u32>,
+    /// 文档侧 / 查询侧的输入前缀（§9.5）。两条都进空间指纹。
+    pub document_prefix: Option<String>,
+    pub query_prefix: Option<String>,
 }
 
 impl EmbeddingSection {
@@ -129,11 +139,14 @@ impl EmbeddingSection {
                 model: self.model,
                 api_key_env: self.api_key_env,
                 effort: self.effort,
+                efforts: self.efforts,
                 timeout_secs: self.timeout_secs,
             }
             .into_model(),
             revision: self.revision,
             dimensions: self.dimensions,
+            document_prefix: self.document_prefix,
+            query_prefix: self.query_prefix,
         }
     }
 }

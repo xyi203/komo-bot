@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::protocol::http::{
-    ApprovalRecord, EventPage, PendingItem, ResumeResponse, SessionDetail,
+    ApprovalRecord, EventPage, ModelMenuEntry, PendingItem, ResumeResponse, SessionDetail,
 };
 use komo_kernel::protocol::sse::SseFrame;
 use komo_kernel::types::chat::ApprovalScope;
@@ -105,8 +105,8 @@ pub enum ServerEvent {
     Status(Box<SessionDetail>),
     /// 待处理审批清单。
     Pending(Vec<ApprovalRecord>),
-    /// 可选的模型清单。
-    ModelMenu(Vec<String>),
+    /// `GET /v1/models` 的结果。
+    ModelMenu(Vec<ModelMenuEntry>),
     /// 一次操作失败。
     Failed(String),
     Notice(String),
@@ -138,6 +138,8 @@ pub enum Effect {
     },
     FetchPending,
     FetchStatus,
+    /// `GET /v1/models`：模型清单与每个模型支持的 effort 档位。
+    FetchModels,
     Quit,
 }
 
@@ -155,6 +157,18 @@ pub struct RunMeta {
     pub ended_at: Option<OffsetDateTime>,
     pub model: Option<String>,
     pub effort: Option<EffortSetting>,
+}
+
+/// 模型正在打字的那一段。
+///
+/// **不是历史**：`assistant_delta` 只在 SSE 上，永不进 JSONL（kernel 的 `SseEvent`
+/// 注释说清了为什么）。所以它住在 `Surface` 外面的一个字段里——一轮结束时
+/// `message.assistant` 把完整回复正式送到，草稿就地清掉，消息面上只留那一条。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Draft {
+    pub run: RunId,
+    pub round: u32,
+    pub text: String,
 }
 
 /// 一次工具调用在界面上的一行。
@@ -237,12 +251,16 @@ pub struct App {
     /// 还没取到详情的待处理审批（`approval.pending` 只给 id）。
     pub pending_short_ids: BTreeMap<ApprovalId, komo_kernel::types::ids::ShortId>,
     pub current_run: Option<RunId>,
+    /// 正在打字的那一段（[`Draft`]）。
+    pub draft: Option<Draft>,
     pub runs: BTreeMap<RunId, RunMeta>,
     tools: BTreeMap<ToolCallId, ToolLine>,
     /// 下一个 Run 的模型 / effort 覆盖（`/model` `/effort`）。
     pub model: Option<String>,
     pub effort: Option<Effort>,
-    pub model_menu: Vec<String>,
+    pub model_menu: Vec<ModelMenuEntry>,
+    /// `/model` 无参时先去取一次清单；回来了才印。
+    listing_models: bool,
     /// 消息面滚动：从底部往上数多少行。0 = 贴底。
     pub scroll: u16,
     pub now: Option<OffsetDateTime>,
@@ -273,11 +291,13 @@ impl App {
             approval: None,
             pending_short_ids: BTreeMap::new(),
             current_run: None,
+            draft: None,
             runs: BTreeMap::new(),
             tools: BTreeMap::new(),
             model: None,
             effort: None,
             model_menu: Vec::new(),
+            listing_models: false,
             scroll: 0,
             now: None,
             quit: false,
@@ -318,6 +338,36 @@ impl App {
         let started = meta.started_at?;
         let end = meta.ended_at.or(self.now)?;
         Some(end - started)
+    }
+
+    /// 可以切到的模型 id。
+    pub fn model_options(&self) -> Vec<String> {
+        self.model_menu
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect()
+    }
+
+    /// 当前这个模型支持哪几档 effort。
+    ///
+    /// **菜单里那一项说了算**：kernel 写明「空表就是『一档都不支持』，不是『还不知道』」
+    /// ——所以找到了条目就用它的表，哪怕是空的。只有**菜单拿不到**（没取到、或当前模型
+    /// 不在菜单里）才退到内建白名单，因为那时才真的是「不知道」。
+    pub fn effort_options(&self) -> Vec<String> {
+        match self.current_model_entry() {
+            Some(entry) => entry.efforts.iter().map(|e| e.to_string()).collect(),
+            None => command::EFFORT_LEVELS
+                .iter()
+                .map(|e| e.to_string())
+                .collect(),
+        }
+    }
+
+    fn current_model_entry(&self) -> Option<&ModelMenuEntry> {
+        match &self.model {
+            Some(id) => self.model_menu.iter().find(|entry| &entry.id == id),
+            None => self.model_menu.iter().find(|entry| entry.default),
+        }
     }
 
     /// 界面上还没决定的审批有几条。

@@ -11,7 +11,6 @@ use komo_kernel::protocol::http::*;
 use komo_kernel::types::ids::{
     ApprovalId, CronJobId, MemoryId, RequestKey, RunId, SessionId, uuid_v7_at,
 };
-use komo_kernel::types::memory::MemoryScope;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -137,8 +136,6 @@ impl KomoClient {
         &self,
         request: &CreateSessionRequest,
     ) -> ClientResult<SessionSummary> {
-        // TODO(decide: §13.1 只说 "POST /v1/sessions 创建会话"，没有指定响应类型。
-        // 取 `SessionSummary`——它是列表与详情共用的那一个。)
         self.post("/v1/sessions", request).await
     }
 
@@ -179,12 +176,15 @@ impl KomoClient {
     }
 
     /// `/new`：追加 `conversation.boundary`，**不切 Session**（§13.1）。
-    pub async fn boundary(&self, session: &SessionId) -> ClientResult<BoundaryResponse> {
-        self.post(
-            &format!("/v1/sessions/{session}/boundary"),
-            &serde_json::json!({}),
-        )
-        .await
+    ///
+    /// TUI 不带 `by`——那个字段是给聊天渠道填发送者的，终端前的人没有平台身份。
+    pub async fn boundary(
+        &self,
+        session: &SessionId,
+        request: &BoundaryRequest,
+    ) -> ClientResult<BoundaryResponse> {
+        self.post(&format!("/v1/sessions/{session}/boundary"), request)
+            .await
     }
 
     // ---- /v1/runs ----
@@ -204,10 +204,22 @@ impl KomoClient {
     // ---- /v1/approvals ----
 
     /// 待审核列表（§13.1）。
-    // TODO(decide: §13.1 没有给这个接口的查询参数，所以也没有"列出已决定的"。
-    // `run inspect` 想印 "allowed by …" 时只能由调用方另行取 `GET /v1/approvals/{id}`。)
-    pub async fn approvals(&self) -> ClientResult<ApprovalListResponse> {
-        self.get("/v1/approvals").await
+    ///
+    /// 默认只列待处理的。`komo run inspect` 要答「这一步是谁放行的」时传
+    /// `ApprovalListQuery { run: Some(run), include_decided: true, .. }`——那条审批早就
+    /// 不在待处理集合里了。
+    pub async fn approvals(&self, query: &ApprovalListQuery) -> ClientResult<ApprovalListResponse> {
+        let mut params: Vec<(&str, String)> = Vec::new();
+        if let Some(run) = &query.run {
+            params.push(("run", run.to_string()));
+        }
+        if let Some(session) = &query.session {
+            params.push(("session", session.to_string()));
+        }
+        if query.include_decided {
+            params.push(("include_decided", "true".into()));
+        }
+        self.get_with("/v1/approvals", &params).await
     }
 
     pub async fn approval(&self, approval: &ApprovalId) -> ClientResult<ApprovalRecord> {
@@ -235,7 +247,6 @@ impl KomoClient {
         &self,
         request: &CreateCronRequest,
     ) -> ClientResult<komo_kernel::cron::CronJob> {
-        // TODO(decide: §13.1 未指定响应类型；取 `CronJob`——创建完就该看见它的 next_run_at。)
         self.post("/v1/cron", request).await
     }
 
@@ -243,15 +254,9 @@ impl KomoClient {
     pub async fn cron_run(
         &self,
         job: &CronJobId,
-        request_key: Option<RequestKey>,
+        request: &ManualCronRunRequest,
     ) -> ClientResult<ManualCronRunResponse> {
-        // TODO(decide: kernel 有 `ManualCronRunResponse` 而没有对应的请求类型。
-        // 这里就地拼一个只有 request_key 的对象；kernel 补了类型就换过去。)
-        self.post(
-            &format!("/v1/cron/{job}/run"),
-            &serde_json::json!({ "request_key": request_key }),
-        )
-        .await
+        self.post(&format!("/v1/cron/{job}/run"), request).await
     }
 
     pub async fn cron_update(
@@ -277,7 +282,9 @@ impl KomoClient {
     pub async fn memories(&self, query: &MemoryListQuery) -> ClientResult<MemoryListResponse> {
         let mut params: Vec<(&str, String)> = Vec::new();
         if let Some(scope) = &query.scope {
-            params.push(("scope", scope_param(scope)));
+            // `MemoryScope` 自己的 query string 写法（kernel 的 `Display` / `FromStr`），
+            // 两边共用一份，不在这里再编一种。
+            params.push(("scope", scope.to_string()));
         }
         if let Some(state) = &query.state {
             params.push(("state", enum_param(state)?));
@@ -326,6 +333,29 @@ impl KomoClient {
     ) -> ClientResult<RebuildIndexResponse> {
         self.post("/v1/memory-index/rebuild", request).await
     }
+
+    // ---- /v1/models、/v1/config ----
+
+    /// 这个 Gateway 能切到哪些模型，每个支持哪几档 effort（§13.3）。
+    pub async fn models(&self) -> ClientResult<ModelsResponse> {
+        self.get("/v1/models").await
+    }
+
+    /// `komo config check`：只读，**不改变运行中的 Gateway**（§3 命令表）。
+    ///
+    /// 校验不过**不是**这个调用的错误——问题在 `issues` 里，因为 check 本来就是去问
+    /// 「现在这份配置有没有毛病」的。
+    pub async fn config_check(&self) -> ClientResult<ConfigCheckResponse> {
+        self.get("/v1/config/check").await
+    }
+
+    /// `komo config reload`：校验通过才装。
+    ///
+    /// **校验不过走错误体**——[`ErrorCode::ConfigInvalid`] 带 `keys` 定位，旧快照原样
+    /// 保留（§3 第 1 步）。所以这里的 `Err` 是一个正常结果，调用方要把 `keys` 印出来。
+    pub async fn config_reload(&self) -> ClientResult<ConfigReloadResponse> {
+        self.post("/v1/config/reload", &serde_json::json!({})).await
+    }
 }
 
 /// 把参数拼成 `?a=1&b=2`。
@@ -358,17 +388,6 @@ fn percent_encode(raw: &str, out: &mut String) {
             }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
-    }
-}
-
-/// `MemoryScope` 是个带负载的枚举，query string 装不下嵌套对象。
-// TODO(decide: §13.1 只说 "GET /v1/memories 按作用域、状态和查询条件列出"，没给写法。
-// 取 `personal` / `project:<id>` / `environment:<id>` 这个扁平写法；Gateway 侧要认同一个。)
-pub fn scope_param(scope: &MemoryScope) -> String {
-    match scope {
-        MemoryScope::Personal => "personal".to_string(),
-        MemoryScope::Project { project_id } => format!("project:{project_id}"),
-        MemoryScope::Environment { instance_id } => format!("environment:{instance_id}"),
     }
 }
 
@@ -424,13 +443,19 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_flattens_into_one_query_value() {
-        assert_eq!(scope_param(&MemoryScope::Personal), "personal");
+    fn a_scope_goes_on_the_wire_in_kernels_own_spelling() {
+        // 两边共用 kernel 的 `Display` / `FromStr`，这里不再编一种。
+        use komo_kernel::types::memory::MemoryScope;
+        assert_eq!(MemoryScope::Personal.to_string(), "personal");
         assert_eq!(
-            scope_param(&MemoryScope::Project {
-                project_id: "komo".into()
-            }),
-            "project:komo"
+            query_string(&[(
+                "scope",
+                MemoryScope::Project {
+                    project_id: "komo".into()
+                }
+                .to_string()
+            )]),
+            "?scope=project%3Akomo"
         );
     }
 
@@ -626,6 +651,140 @@ mod wire_tests {
         let sent = &server.requests()[0];
         assert_eq!(sent.param("from").as_deref(), Some("7"));
         assert_eq!(sent.param("limit").as_deref(), Some("500"));
+    }
+
+    #[tokio::test]
+    async fn an_approval_query_asks_for_the_decided_ones_when_it_needs_provenance() {
+        let server =
+            FakeGateway::spawn(|_, _| Reply::ok(serde_json::json!({"approvals": []}))).await;
+        server
+            .client()
+            .approvals(&ApprovalListQuery {
+                run: Some(RunId::from_raw("run-1")),
+                session: None,
+                include_decided: true,
+            })
+            .await
+            .unwrap();
+        let sent = &server.requests()[0];
+        assert_eq!(sent.param("run").as_deref(), Some("run-1"));
+        assert_eq!(sent.param("include_decided").as_deref(), Some("true"));
+    }
+
+    #[tokio::test]
+    async fn the_default_approval_query_asks_for_pending_only() {
+        let server =
+            FakeGateway::spawn(|_, _| Reply::ok(serde_json::json!({"approvals": []}))).await;
+        server
+            .client()
+            .approvals(&ApprovalListQuery::default())
+            .await
+            .unwrap();
+        assert_eq!(server.requests()[0].query, "");
+    }
+
+    #[tokio::test]
+    async fn a_boundary_from_the_tui_names_nobody() {
+        let server = FakeGateway::spawn(|_, _| {
+            Reply::ok(serde_json::json!({"session": "sess-1", "seq": 10}))
+        })
+        .await;
+        server
+            .client()
+            .boundary(&SessionId::from_raw("sess-1"), &BoundaryRequest::default())
+            .await
+            .unwrap();
+        let sent = &server.requests()[0];
+        assert_eq!(sent.path, "/v1/sessions/sess-1/boundary");
+        // 终端前的人没有平台身份，所以 `by` 根本不上线。
+        assert!(!sent.body.contains("\"by\""), "{}", sent.body);
+    }
+
+    #[tokio::test]
+    async fn a_manual_cron_run_carries_its_own_key() {
+        let server = FakeGateway::spawn(|_, _| {
+            Reply::ok(serde_json::json!({
+                "job": "job-1", "session": "sess-1", "run": "run-9",
+                "request_key": "cli:manual-1"
+            }))
+        })
+        .await;
+        let response = server
+            .client()
+            .cron_run(
+                &CronJobId::from_raw("job-1"),
+                &ManualCronRunRequest {
+                    request_key: Some(RequestKey::new("cli:manual-1")),
+                },
+            )
+            .await
+            .unwrap();
+        // §10：手动触发不冒充定时触发。
+        assert_eq!(response.request_key.as_str(), "cli:manual-1");
+        assert!(server.requests()[0].body.contains("cli:manual-1"));
+    }
+
+    #[tokio::test]
+    async fn the_model_menu_says_which_efforts_each_model_takes() {
+        let server = FakeGateway::spawn(|_, _| {
+            Reply::ok(serde_json::json!({"models": [
+                {"id": "chat-a", "provider": "openai_compatible",
+                 "efforts": ["low", "high"], "default": true},
+                {"id": "chat-b", "provider": "anthropic"}
+            ]}))
+        })
+        .await;
+        let response = server.client().models().await.unwrap();
+        assert_eq!(server.requests()[0].path, "/v1/models");
+        assert_eq!(response.models[0].efforts.len(), 2);
+        assert!(response.models[0].default);
+        // 老行没有这两个字段：空表 + 非默认。
+        assert!(response.models[1].efforts.is_empty());
+        assert!(!response.models[1].default);
+    }
+
+    #[tokio::test]
+    async fn config_check_reports_problems_without_failing_the_call() {
+        let server = FakeGateway::spawn(|_, _| {
+            Reply::ok(serde_json::json!({
+                "issues": [{"key": "model.base_url", "severity": "error", "message": "缺"}],
+                "loaded_at": "2026-09-16T08:00:00Z",
+                "sources": [{"path": "/home/u/.komo/config.toml",
+                             "mtime": "2026-09-16T08:05:00Z"}]
+            }))
+        })
+        .await;
+        // check 就是去问「有没有毛病」的——有毛病不是这次调用失败。
+        let response = server.client().config_check().await.unwrap();
+        assert_eq!(server.requests()[0].path, "/v1/config/check");
+        assert_eq!(response.issues.len(), 1);
+        assert!(response.sources[0].mtime > response.loaded_at);
+    }
+
+    #[tokio::test]
+    async fn a_reload_that_only_touched_start_only_keys_says_they_did_not_take_effect() {
+        let server = FakeGateway::spawn(|_, _| {
+            Reply::ok(serde_json::json!({
+                "changed": ["start_only.listen"],
+                "start_only": ["start_only.listen"]
+            }))
+        })
+        .await;
+        let response = server.client().config_reload().await.unwrap();
+        assert_eq!(server.requests()[0].method, "POST");
+        assert_eq!(response.start_only.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rejected_reload_comes_back_as_config_invalid_with_its_keys() {
+        let server = FakeGateway::spawn(|_, _| Reply::Json {
+            status: 400,
+            body: r#"{"error":{"code":"config_invalid","message":"缺少 base_url","keys":["memory.embedding.base_url"]}}"#.into(),
+        })
+        .await;
+        let error = server.client().config_reload().await.unwrap_err();
+        assert!(error.is(komo_kernel::protocol::http::ErrorCode::ConfigInvalid));
+        assert_eq!(error.keys()[0].as_str(), "memory.embedding.base_url");
     }
 
     #[tokio::test]

@@ -5,9 +5,10 @@ use crate::tui::paste::{InputEvent, PASTE_MIN_BYTES, PasteChip};
 use crate::tui::test_support as fixture;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use komo_kernel::events::{Event, EventPayload};
-use komo_kernel::protocol::http::{RunSummary, SessionSummary};
+use komo_kernel::protocol::http::{ModelMenuEntry, RunSummary, SessionSummary};
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
 use komo_kernel::types::ids::{ApprovalId, RunId, Seq, ShortId};
+use komo_kernel::types::model::Effort;
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::{RunStatus, ToolCallState};
 
@@ -357,25 +358,51 @@ fn a_legal_effort_rides_on_the_next_submit() {
     );
 }
 
+/// `GET /v1/models` 回来的一份菜单。
+fn menu() -> Vec<ModelMenuEntry> {
+    vec![
+        ModelMenuEntry {
+            id: "gpt-x".into(),
+            provider: "openai_compatible".into(),
+            efforts: vec![Effort::new("low"), Effort::new("high")],
+            default: true,
+        },
+        ModelMenuEntry {
+            id: "claude-y".into(),
+            provider: "anthropic".into(),
+            efforts: vec![],
+            default: false,
+        },
+    ]
+}
+
 #[test]
-fn model_with_no_argument_lists_the_menu() {
+fn model_with_no_argument_goes_and_asks_then_lists_what_came_back() {
     let mut app = app();
-    app.apply(ServerEvent::ModelMenu(vec![
-        "gpt-x".into(),
-        "claude-y".into(),
-    ]));
-    command(&mut app, "/model");
+    // 清单是去问来的，不是启动时抄下来就不再更新的一份。
+    assert_eq!(command(&mut app, "/model"), vec![Effect::FetchModels]);
+    app.apply(ServerEvent::ModelMenu(menu()));
     let printed = notices(&app);
     assert!(
         printed.contains("gpt-x") && printed.contains("claude-y"),
         "{printed}"
     );
+    // 顺带把当前模型能选的 effort 也印出来。
+    assert!(printed.contains("low · high"), "{printed}");
+}
+
+#[test]
+fn a_menu_arriving_on_its_own_does_not_print_anything() {
+    let mut app = app();
+    app.apply(ServerEvent::ModelMenu(menu()));
+    assert!(app.notices.is_empty(), "{:?}", app.notices);
+    assert_eq!(app.model_options(), vec!["gpt-x", "claude-y"]);
 }
 
 #[test]
 fn a_model_outside_the_menu_is_refused_with_the_menu_spelled_out() {
     let mut app = app();
-    app.apply(ServerEvent::ModelMenu(vec!["gpt-x".into()]));
+    app.apply(ServerEvent::ModelMenu(menu()));
     assert!(command(&mut app, "/model gpt-z").is_empty());
     assert!(notices(&app).contains("gpt-x"), "{}", notices(&app));
     assert!(app.model.is_none());
@@ -385,21 +412,51 @@ fn a_model_outside_the_menu_is_refused_with_the_menu_spelled_out() {
 fn model_says_so_when_the_gateway_offered_no_menu() {
     let mut app = app();
     command(&mut app, "/model");
+    // 还没回来，先什么都不印；空菜单回来了才说「没有报出模型清单」。
+    app.apply(ServerEvent::ModelMenu(vec![]));
     assert!(
-        notices(&app).contains("没有提供模型清单"),
+        notices(&app).contains("没有报出模型清单"),
         "{}",
         notices(&app)
     );
 }
 
 #[test]
-fn effort_with_no_argument_lists_its_options() {
+fn the_effort_options_come_from_the_menus_entry_for_the_current_model() {
     let mut app = app();
-    command(&mut app, "/effort");
-    let printed = notices(&app);
-    for level in command::EFFORT_LEVELS {
-        assert!(printed.contains(level), "{printed}");
-    }
+    app.apply(ServerEvent::ModelMenu(menu()));
+    // 没选模型 ⇒ 菜单里标了 default 的那一个。
+    assert_eq!(app.effort_options(), vec!["low", "high"]);
+    assert!(command(&mut app, "/effort medium").is_empty());
+    assert!(notices(&app).contains("low · high"), "{}", notices(&app));
+    assert!(app.effort.is_none());
+    assert!(command(&mut app, "/effort high").is_empty());
+    assert_eq!(
+        app.effort.as_ref().map(|e| e.to_string()).as_deref(),
+        Some("high")
+    );
+}
+
+#[test]
+fn a_model_that_takes_no_explicit_effort_refuses_every_level() {
+    let mut app = app();
+    app.apply(ServerEvent::ModelMenu(menu()));
+    command(&mut app, "/model claude-y");
+    // kernel：空表就是「一档都不支持」，不是「还不知道」。
+    assert!(app.effort_options().is_empty());
+    assert!(command(&mut app, "/effort low").is_empty());
+    assert!(
+        notices(&app).contains("不接受显式 effort"),
+        "{}",
+        notices(&app)
+    );
+    assert!(app.effort.is_none());
+}
+
+#[test]
+fn without_a_menu_the_built_in_effort_whitelist_stands_in() {
+    let app = app();
+    assert_eq!(app.effort_options(), command::EFFORT_LEVELS);
 }
 
 #[test]
@@ -519,6 +576,97 @@ fn ctrl_t_expands_and_collapses_the_tool_calls() {
     assert!(app.tool_lines()[0].expanded, "展开看参数与结果预览");
     app.handle_key(with(KeyCode::Char('t'), KeyModifiers::CONTROL));
     assert!(!app.tool_lines()[0].expanded);
+}
+
+// ---- 打字机效果（`assistant_delta`） ----
+
+fn delta(app: &mut App, seq: u64, round: u32, text: &str) {
+    app.apply(ServerEvent::Frame(Box::new(SseFrame {
+        id: Seq(seq),
+        session: fixture::session(),
+        event: SseEvent::AssistantDelta {
+            run: fixture::run(),
+            round,
+            text: text.into(),
+        },
+    })));
+}
+
+#[test]
+fn deltas_accumulate_then_the_real_message_replaces_the_draft() {
+    let mut app = app();
+    feed(&mut app, &fixture::conversation()[..3]);
+    let history_before = app.messages().len();
+
+    delta(&mut app, 100, 1, "我来");
+    delta(&mut app, 101, 1, "清一");
+    delta(&mut app, 102, 1, "下。");
+    assert_eq!(
+        app.draft.as_ref().map(|d| d.text.as_str()),
+        Some("我来清一下。")
+    );
+    // 草稿不是历史：`Surface` 一条都没多。
+    assert_eq!(app.messages().len(), history_before);
+
+    // 正式回复到了。
+    feed(&mut app, &fixture::conversation()[3..4]);
+    assert!(app.draft.is_none(), "草稿让位给正式消息");
+    let assistant: Vec<&str> = app
+        .messages()
+        .iter()
+        .filter(|m| m.role == komo_kernel::types::turn::Role::Assistant)
+        .filter_map(|m| m.text.as_deref())
+        .collect();
+    // 历史上只有一条，不是「草稿一条 + 正式一条」。
+    assert_eq!(assistant, vec!["我来清一下。"]);
+}
+
+#[test]
+fn a_delta_for_a_new_round_starts_a_fresh_draft() {
+    let mut app = app();
+    delta(&mut app, 100, 1, "第一轮");
+    delta(&mut app, 101, 2, "第二轮");
+    let draft = app.draft.as_ref().unwrap();
+    assert_eq!(draft.round, 2);
+    assert_eq!(draft.text, "第二轮", "换轮不往上一段后面接");
+}
+
+#[test]
+fn a_delta_never_reaches_the_replay_window() {
+    let mut app = app();
+    feed(&mut app, &fixture::conversation()[..3]);
+    delta(&mut app, 100, 1, "还没说完");
+    // 它只在 SSE 上，JSONL 里没有它——所以 fold 出来的 applied_seq 不因它前进。
+    assert_eq!(app.surface.applied_seq, Seq(3));
+    assert!(
+        app.surface
+            .messages
+            .iter()
+            .all(|m| m.text.as_deref() != Some("还没说完"))
+    );
+}
+
+#[test]
+fn a_run_that_ends_without_a_final_message_still_clears_the_draft() {
+    let mut app = app();
+    feed(&mut app, &fixture::conversation()[..3]);
+    delta(&mut app, 100, 1, "打了一半");
+    feed(
+        &mut app,
+        &[fixture::event(
+            4,
+            Some(fixture::run()),
+            EventPayload::RunCancelled(komo_kernel::events::RunCancelled { by: None }),
+        )],
+    );
+    assert!(app.draft.is_none(), "没人在打字了就别一直显示生成中");
+}
+
+#[test]
+fn a_delta_that_arrives_before_anything_else_still_names_the_run() {
+    let mut app = app();
+    delta(&mut app, 1, 1, "嗯");
+    assert_eq!(app.current_run.as_ref(), Some(&fixture::run()));
 }
 
 #[test]

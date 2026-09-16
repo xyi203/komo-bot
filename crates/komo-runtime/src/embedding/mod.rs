@@ -135,12 +135,10 @@ fn space_for(config: &EmbeddingConfig, dimensions: u32) -> EmbeddingSpace {
         revision: config.revision.clone(),
         dimensions,
         preprocessing: PREPROCESSING.to_string(),
-        // TODO(decide: 文档 / 查询前缀是某些模型（e5、bge 一类）要求的输入规则，但
-        // §13.3 的 `[memory.embedding]` 里没有对应的键，kernel 的 `EmbeddingConfig`
-        // 也没有字段。在定下配置形状之前一律为空——空前缀是一个明确的、进了指纹的
-        // 选择，而不是一个被忽略的设置。
-        document_prefix: String::new(),
-        query_prefix: String::new(),
+        // §9.5：查询与文档各自的输入规则，两条都进指纹——同一个模型换了前缀就是另一个
+        // 空间，旧向量不能拿来比。没配就是空前缀，那也是一个明确的、进了指纹的选择。
+        document_prefix: config.document_prefix.clone().unwrap_or_default(),
+        query_prefix: config.query_prefix.clone().unwrap_or_default(),
         // 我们不动服务端给的向量，所以不能声称它是归一化的。
         normalized: false,
         distance: DistanceRule::Cosine,

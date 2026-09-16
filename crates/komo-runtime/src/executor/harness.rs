@@ -24,7 +24,6 @@ use komo_kernel::types::tool::{
 use komo_kernel::types::turn::{AcceptInput, AssistantRound, ToolCallRequest};
 
 use crate::approvals::ApprovalGate;
-use crate::executor::sink::AttemptSinks;
 use crate::executor::{CallEnv, CallRequest, ExecutionLimits, ToolExecutor};
 use crate::policy::PolicyEngine;
 
@@ -34,7 +33,6 @@ pub struct Harness {
     pub outputs: Arc<MemOutputStore>,
     pub approvals: MemApprovalRepo,
     pub gate: ApprovalGate,
-    pub sinks: AttemptSinks,
     pub dir: tempfile::TempDir,
 }
 
@@ -54,7 +52,6 @@ impl Harness {
             outputs: Arc::new(MemOutputStore::new()),
             approvals,
             gate,
-            sinks: AttemptSinks::new(),
             dir: tempfile::tempdir().expect("临时目录"),
             clock,
         }
@@ -69,7 +66,6 @@ impl Harness {
                 self.gate.clone(),
                 policy,
                 Arc::new(self.clock.clone()),
-                self.sinks.clone(),
             )
             .with_limits(ExecutionLimits::default()),
         )
@@ -278,6 +274,7 @@ impl Tool for RecordingTool {
         &self,
         _plan: ApprovedPlan,
         _ctx: &ToolContext,
+        _sink: &mut dyn komo_kernel::traits::OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
         self.executions.fetch_add(1, Ordering::SeqCst);
         self.outcome

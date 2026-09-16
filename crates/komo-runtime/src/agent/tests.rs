@@ -4,47 +4,15 @@ use std::sync::Arc;
 
 use komo_kernel::fold::Surface;
 use komo_kernel::test_support::{ScriptedLlm, sample_model};
-use komo_kernel::traits::ApprovalRepo;
-use komo_kernel::types::ids::SessionId;
+use komo_kernel::traits::{ApprovalRepo, Clock};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::{RunStatus, Wait};
 use komo_kernel::types::tool::{CancelToken, ToolError, ToolOutput};
-use komo_kernel::types::turn::{ProviderToolCall, Role, Round, TurnRequest};
+use komo_kernel::types::turn::{Role, Round};
 
-use super::{AgentLoop, Budget, Segment, SegmentOutcome};
+use super::tests_support::{FailingLlm, call, round, turn_request};
+use super::{AgentLoop, Budget, RetryBudget, Segment, SegmentOutcome};
 use crate::executor::harness::{Harness, RecordingTool};
-
-fn round(number: u32, text: Option<&str>, calls: Vec<ProviderToolCall>) -> Round {
-    Round {
-        round: number,
-        text: text.map(str::to_string),
-        tool_calls: calls,
-        provider_blocks: None,
-        usage: Default::default(),
-        truncated: false,
-    }
-}
-
-fn call(id: &str, name: &str, args: serde_json::Value) -> ProviderToolCall {
-    ProviderToolCall {
-        provider_call_id: id.into(),
-        name: name.into(),
-        arguments: args,
-    }
-}
-
-fn turn_request(session: &SessionId, run: &komo_kernel::types::ids::RunId) -> TurnRequest {
-    TurnRequest {
-        session: session.clone(),
-        run: run.clone(),
-        model: sample_model(),
-        system_prompt: "你是 komo".into(),
-        messages: vec![],
-        tools: vec![],
-        memories: vec![],
-        covers: None,
-    }
-}
 
 struct Wired {
     harness: Harness,
@@ -607,4 +575,124 @@ async fn a_tool_output_with_no_preview_still_produces_one() {
         .find_map(|result| result.preview)
         .expect("有预览");
     assert!(preview.contains("42"), "{preview}");
+}
+
+/// 能重试的模型错误**让出名额去等退避**，不当场失败（§8.5）。
+#[tokio::test]
+async fn a_retryable_model_error_suspends_on_a_backoff_instead_of_failing() {
+    let harness = Harness::new();
+    let executor = harness.permissive(vec![]);
+    let agent = AgentLoop::new(
+        Arc::new(FailingLlm::at_round(
+            komo_kernel::types::turn::LlmError::Timeout,
+        )),
+        harness.ledger.clone(),
+        executor,
+        Arc::new(harness.clock.clone()),
+    );
+    let (session, run) = harness.open_run().await;
+    let outcome = agent
+        .run(Segment {
+            request: turn_request(&session, &run),
+            env: harness.env(&session, &run),
+            budget: Budget::default(),
+            resume: None,
+            session,
+            run: run.clone(),
+        })
+        .await
+        .unwrap();
+
+    let SegmentOutcome::Suspended {
+        wait:
+            Wait::Retry {
+                attempts,
+                next_retry_at,
+                ..
+            },
+        ..
+    } = &outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(*attempts, 1);
+    assert!(*next_retry_at > harness.clock.now(), "退避要落在将来");
+    assert_eq!(
+        surface(&harness).runs.get(&run).unwrap().status,
+        RunStatus::WaitingRetry
+    );
+}
+
+/// 结果与用量都未知不能自动再来一次（§8.5）——它是终止，不是退避。
+#[tokio::test]
+async fn an_unknown_model_outcome_is_not_retried() {
+    let harness = Harness::new();
+    let executor = harness.permissive(vec![]);
+    let agent = AgentLoop::new(
+        Arc::new(FailingLlm::at_begin(
+            komo_kernel::types::turn::LlmError::Unknown("结果未知".into()),
+        )),
+        harness.ledger.clone(),
+        executor,
+        Arc::new(harness.clock.clone()),
+    );
+    let (session, run) = harness.open_run().await;
+    let outcome = agent
+        .run(Segment {
+            request: turn_request(&session, &run),
+            env: harness.env(&session, &run),
+            budget: Budget::default(),
+            resume: None,
+            session,
+            run,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, SegmentOutcome::Failed { .. }),
+        "{outcome:?}"
+    );
+}
+
+/// **重启不重置预算**：已经用掉的次数由调用方给，用完就是 failed（§8.4、§8.5）。
+#[tokio::test]
+async fn an_exhausted_retry_budget_ends_in_a_failure() {
+    let harness = Harness::new();
+    let executor = harness.permissive(vec![]);
+    let agent = AgentLoop::new(
+        Arc::new(FailingLlm::at_round(
+            komo_kernel::types::turn::LlmError::Timeout,
+        )),
+        harness.ledger.clone(),
+        executor,
+        Arc::new(harness.clock.clone()),
+    );
+    let (session, run) = harness.open_run().await;
+    let outcome = agent
+        .run(Segment {
+            request: turn_request(&session, &run),
+            env: harness.env(&session, &run),
+            budget: Budget {
+                retry: RetryBudget {
+                    attempts: 4,
+                    max_attempts: 5,
+                    ..RetryBudget::default()
+                },
+                ..Budget::default()
+            },
+            resume: None,
+            session,
+            run: run.clone(),
+        })
+        .await
+        .unwrap();
+
+    let SegmentOutcome::Failed { reason, .. } = &outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(reason.contains("重试预算已用完"), "{reason}");
+    assert_eq!(
+        surface(&harness).runs.get(&run).unwrap().status,
+        RunStatus::Failed
+    );
 }

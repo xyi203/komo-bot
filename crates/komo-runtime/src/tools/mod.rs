@@ -186,6 +186,17 @@ pub(crate) mod test_support {
     pub fn approved(plan: ExecutionPlan) -> ApprovedPlan {
         ApprovedPlan::new(plan, komo_kernel::test_support::proof())
     }
+
+    /// 这次尝试的流式写入器。生产里由 `ToolOutputStore::begin` 开、executor 借给
+    /// `execute`；测试里用内存替身。
+    pub fn writer(ctx: &ToolContext) -> komo_kernel::test_support::MemOutputWriter {
+        komo_kernel::test_support::MemOutputWriter::new(komo_kernel::types::refs::AttemptRef {
+            session: ctx.session.clone(),
+            run: ctx.run.clone(),
+            call: ctx.call.clone(),
+            attempt: ctx.attempt.clone(),
+        })
+    }
 }
 
 #[cfg(test)]

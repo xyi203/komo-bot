@@ -16,11 +16,14 @@
 //!
 //! **恢复执行**（`ToolContext::resumed` 为 `Some`）走 §8.4 第 6 / 7 行：确定尚未执行
 //! 的直接跑，started 而无结果的**先核对**，核对不出结论就交给人——不盲目重跑。
+//!
+//! 流式输出的写入器由 `ToolOutputStore::begin` 开、**借给** `Tool::execute`、返回后
+//! 在这里 `publish`。所有权不下放，因为"先持久化输出、再追加 `tool.result`"是 §8.5
+//! 的一步，而工具不知道这一步存在。
 
 pub mod cancel;
 #[cfg(test)]
 pub mod harness;
-pub mod sink;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -34,7 +37,7 @@ use komo_kernel::traits::{
 use komo_kernel::types::chat::Principal;
 use komo_kernel::types::ids::{ApprovalId, AttemptId, RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::{
-    ApprovedPlan, EnvVersion, ExecutionPlan, PlanSource, RecoveryMode, Verification,
+    ApprovedPlan, ConsumeIntent, EnvVersion, ExecutionPlan, PlanSource, RecoveryMode, Verification,
 };
 use komo_kernel::types::refs::{
     AttemptRef, PREVIEW_LIMIT_BYTES, PublishedOutput, ToolResultBody, ToolResultStatus,
@@ -45,11 +48,10 @@ use komo_kernel::types::tool::{
 };
 use komo_kernel::types::turn::{GrantUse, ToolResultForModel};
 
-use crate::approvals::{ApprovalGate, ApprovalOutcome, ApprovalRequest, ConsumeIntent};
+use crate::approvals::{ApprovalGate, ApprovalOutcome, ApprovalRequest};
 use crate::policy::{DecisionEnv, PolicyEngine, grants_for};
 
 use self::cancel::race;
-use self::sink::AttemptSinks;
 
 /// 一次执行的预算（§6：Gateway 设置总轮数、活动执行时限、输出长度）。
 #[derive(Debug, Clone)]
@@ -161,7 +163,6 @@ pub struct ToolExecutor {
     approvals: ApprovalGate,
     policy: PolicyEngine,
     clock: Arc<dyn Clock>,
-    sinks: AttemptSinks,
     limits: ExecutionLimits,
 }
 
@@ -182,7 +183,6 @@ impl ToolExecutor {
         approvals: ApprovalGate,
         policy: PolicyEngine,
         clock: Arc<dyn Clock>,
-        sinks: AttemptSinks,
     ) -> Self {
         Self {
             tools: tools
@@ -194,7 +194,6 @@ impl ToolExecutor {
             approvals,
             policy,
             clock,
-            sinks,
             limits: ExecutionLimits::default(),
         }
     }
@@ -207,10 +206,6 @@ impl ToolExecutor {
     /// 交给模型的工具 Schema。
     pub fn definitions(&self) -> Vec<komo_kernel::types::tool::ToolDefinition> {
         self.tools.values().map(|tool| tool.definition()).collect()
-    }
-
-    pub fn sinks(&self) -> &AttemptSinks {
-        &self.sinks
     }
 
     /// **首版顺序执行同一轮的多个调用**，减少文件操作顺序歧义（§6）。
@@ -358,8 +353,9 @@ impl ToolExecutor {
             call: request.call.clone(),
             attempt: attempt.clone(),
         };
-        let writer = self.outputs.begin(&attempt_ref).await?;
-        let handle = self.sinks.install(&attempt, writer);
+        // 写入器**借给**工具，所有权留在这里：发布是 §8.5 的下一步（先持久化输出，
+        // 再追加 `tool.result`），不在工具手里。
+        let mut writer = self.outputs.begin(&attempt_ref).await?;
 
         let mut ctx = self.context(&request, env, attempt.clone());
         ctx.resumed = resumed;
@@ -367,7 +363,10 @@ impl ToolExecutor {
         let approved = ApprovedPlan::new(plan.clone(), proof);
         let executed = race(
             &env.cancel,
-            tokio::time::timeout(self.limits.call_timeout, tool.execute(approved, &ctx)),
+            tokio::time::timeout(
+                self.limits.call_timeout,
+                tool.execute(approved, &ctx, writer.as_mut()),
+            ),
         )
         .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -377,13 +376,6 @@ impl ToolExecutor {
             Some(Err(_elapsed)) => Err(timeout_error(&plan, self.limits.call_timeout)),
             Some(Ok(result)) => result,
         };
-
-        // 收回写入器去发布。工具没放手就说明它还在写——这时候发布会丢东西。
-        drop(handle);
-        let writer = self
-            .sinks
-            .take(&attempt)
-            .ok_or_else(|| StoreError::Other(format!("attempt {attempt} 的输出写入器收不回来")))?;
 
         let body = result_body(&outcome);
         let status = body.status;
@@ -555,7 +547,7 @@ impl ToolExecutor {
 }
 
 /// `prepare` / `verify` 时还没有尝试——`start_call` 才发号。用一个认得出来的哨兵，
-/// 这样 [`AttemptSinks`] 上不会误命中任何真实尝试的写入器。
+/// 这样账本里的 attempt ID 与它不会混。
 const PENDING_ATTEMPT: &str = "attempt-not-started";
 
 enum CallSettlement {

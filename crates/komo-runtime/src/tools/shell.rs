@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use komo_kernel::traits::Tool;
+use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
@@ -23,9 +23,8 @@ use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 
-use super::process::{ChildSpec, ProcessError, run_child};
+use super::process::{ChildRegistration, ChildSpec, ProcessError, run_child};
 use super::{normalized, parse_args, plan_time};
-use crate::executor::sink::AttemptSinks;
 
 /// 一条命令默认跑多久。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -64,10 +63,11 @@ pub struct ShellResult {
 }
 
 pub struct ShellTool {
-    sinks: AttemptSinks,
     default_timeout: Duration,
     output_limit: u64,
     shell: String,
+    /// 在册登记（§8.7）。`None` = 不登记。
+    register: Option<ChildRegistration>,
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -79,14 +79,26 @@ impl std::fmt::Debug for ShellTool {
     }
 }
 
+impl Default for ShellTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShellTool {
-    pub fn new(sinks: AttemptSinks) -> Self {
+    pub fn new() -> Self {
         Self {
-            sinks,
             default_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             output_limit: DEFAULT_OUTPUT_LIMIT,
             shell: "/bin/sh".into(),
+            register: None,
         }
+    }
+
+    /// 把这个工具起的子进程登记在册，恢复扫描才核实得了它们（§8.7）。
+    pub fn registered(mut self, registration: ChildRegistration) -> Self {
+        self.register = Some(registration);
+        self
     }
 
     pub fn with_limits(mut self, timeout: Duration, output_limit: u64) -> Self {
@@ -160,6 +172,7 @@ impl Tool for ShellTool {
         &self,
         plan: ApprovedPlan,
         ctx: &ToolContext,
+        sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
         let plan = plan.plan();
         let args: ShellArgs = parse_args(plan.args.clone(), "shell")?;
@@ -176,30 +189,20 @@ impl Tool for ShellTool {
             stdin: None,
             timeout,
             output_limit: self.output_limit,
+            register: self.register.clone(),
+            label: format!("shell · run {} · call {}", ctx.run, ctx.call),
         };
 
-        let handle = self.sinks.handle(&ctx.attempt);
-        let outcome = match &handle {
-            Some(handle) => {
-                let mut writer = handle.lock().await;
-                run_child(spec, writer.as_mut(), &ctx.cancel).await
-            }
-            None => {
-                // 没有寄存的 writer 就没人收输出——宁可明说，也不要静默丢掉 stdout。
-                return Err(ToolError::Failed {
-                    message: format!("这次尝试（{}）没有可用的输出写入器", ctx.attempt),
-                });
-            }
-        };
-
-        let outcome = outcome.map_err(|error| match error {
-            ProcessError::Spawn(message) => ToolError::Failed {
-                message: format!("起不来：{message}"),
-            },
-            ProcessError::Io(message) | ProcessError::Sink(message) => {
-                ToolError::Failed { message }
-            }
-        })?;
+        let outcome = run_child(spec, sink, &ctx.cancel)
+            .await
+            .map_err(|error| match error {
+                ProcessError::Spawn(message) => ToolError::Failed {
+                    message: format!("起不来：{message}"),
+                },
+                ProcessError::Io(message) | ProcessError::Sink(message) => {
+                    ToolError::Failed { message }
+                }
+            })?;
 
         if outcome.cancelled {
             return Err(ToolError::Cancelled);
@@ -278,25 +281,8 @@ fn environment(ctx: &ToolContext) -> BTreeMap<String, String> {
 mod tests {
     use super::*;
     use crate::tools::process::process_group_alive;
-    use crate::tools::test_support::{approved, context, context_with_cancel};
-    use komo_kernel::test_support::MemOutputWriter;
-    use komo_kernel::types::refs::AttemptRef;
+    use crate::tools::test_support::{approved, context, context_with_cancel, writer};
     use komo_kernel::types::tool::CancelToken;
-
-    fn with_sink(ctx: &ToolContext) -> (AttemptSinks, ShellTool) {
-        let sinks = AttemptSinks::new();
-        sinks.install(
-            &ctx.attempt,
-            Box::new(MemOutputWriter::new(AttemptRef {
-                session: ctx.session.clone(),
-                run: ctx.run.clone(),
-                call: ctx.call.clone(),
-                attempt: ctx.attempt.clone(),
-            })),
-        );
-        let tool = ShellTool::new(sinks.clone());
-        (sinks, tool)
-    }
 
     fn shell_result(output: &ToolOutput) -> ShellResult {
         serde_json::from_value(output.result.clone()).expect("shell 的结果")
@@ -306,7 +292,8 @@ mod tests {
     async fn it_returns_the_exit_code_and_the_output() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (sinks, tool) = with_sink(&ctx);
+        let tool = ShellTool::new();
+        let mut sink = writer(&ctx);
         let plan = tool
             .prepare(serde_json::json!({ "command": "echo hi" }), &ctx)
             .await
@@ -320,24 +307,23 @@ mod tests {
         assert_eq!(plan.recovery, RecoveryMode::NoSafeRecovery);
         assert_eq!(plan.versions.code, Some(ContentHash::of_str("echo hi")));
 
-        let output = tool.execute(approved(plan), &ctx).await.unwrap();
+        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(shell_result(&output).stdout_tail.trim(), "hi");
-        drop(tool);
-        let writer = sinks.take(&ctx.attempt).expect("收得回来");
-        assert!(writer.bytes_written() > 0, "输出流进了写入器");
+        assert!(sink.bytes_written() > 0, "输出流进了写入器");
     }
 
     #[tokio::test]
     async fn a_non_zero_exit_is_a_result_the_model_can_read_not_a_tool_failure() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (_sinks, tool) = with_sink(&ctx);
+        let tool = ShellTool::new();
+        let mut sink = writer(&ctx);
         let plan = tool
             .prepare(serde_json::json!({ "command": "exit 3" }), &ctx)
             .await
             .unwrap();
-        let output = tool.execute(approved(plan), &ctx).await.unwrap();
+        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
         assert_eq!(output.status, ToolResultStatus::Failed);
         assert_eq!(output.exit_code, Some(3));
     }
@@ -347,12 +333,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         let ctx = context(dir.path());
-        let (_sinks, tool) = with_sink(&ctx);
+        let tool = ShellTool::new();
+        let mut sink = writer(&ctx);
         let plan = tool
             .prepare(serde_json::json!({ "command": "pwd", "cwd": "sub" }), &ctx)
             .await
             .unwrap();
-        let output = tool.execute(approved(plan), &ctx).await.unwrap();
+        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
         assert!(
             shell_result(&output).stdout_tail.trim().ends_with("sub"),
             "{:?}",
@@ -366,7 +353,8 @@ mod tests {
         unsafe { std::env::set_var("KOMO_TEST_SECRET", "must-not-leak") };
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (_sinks, tool) = with_sink(&ctx);
+        let tool = ShellTool::new();
+        let mut sink = writer(&ctx);
         let plan = tool
             .prepare(
                 serde_json::json!({ "command": "echo \"[${KOMO_TEST_SECRET}]\"" }),
@@ -374,7 +362,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let output = tool.execute(approved(plan), &ctx).await.unwrap();
+        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
         assert_eq!(shell_result(&output).stdout_tail.trim(), "[]");
         unsafe { std::env::remove_var("KOMO_TEST_SECRET") };
     }
@@ -384,7 +372,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cancel = CancelToken::new();
         let ctx = context_with_cancel(dir.path(), cancel.clone());
-        let (_sinks, tool) = with_sink(&ctx);
+        let tool = ShellTool::new();
+        let mut sink = writer(&ctx);
         let pid_file = dir.path().join("pgid");
         let plan = tool
             .prepare(
@@ -401,7 +390,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(400)).await;
             stopper.cancel();
         });
-        let error = tool.execute(approved(plan), &ctx).await.unwrap_err();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut sink)
+            .await
+            .unwrap_err();
         assert!(matches!(error, ToolError::Cancelled), "{error:?}");
 
         let pgid: u32 = std::fs::read_to_string(&pid_file)
@@ -423,7 +415,8 @@ mod tests {
     async fn a_timeout_is_reported_as_a_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (_sinks, tool) = with_sink(&ctx);
+        let tool = ShellTool::new();
+        let mut sink = writer(&ctx);
         let plan = tool
             .prepare(
                 serde_json::json!({ "command": "sleep 30", "timeout_secs": 1 }),
@@ -431,7 +424,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = tool.execute(approved(plan), &ctx).await.unwrap_err();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut sink)
+            .await
+            .unwrap_err();
         assert!(matches!(error, ToolError::Timeout { .. }), "{error:?}");
     }
 
@@ -439,7 +435,7 @@ mod tests {
     async fn an_empty_command_is_refused_at_prepare_time() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (_sinks, tool) = with_sink(&ctx);
+        let tool = ShellTool::new();
         let error = tool
             .prepare(serde_json::json!({ "command": "   " }), &ctx)
             .await
@@ -454,7 +450,7 @@ mod tests {
     async fn an_arbitrary_command_has_no_verification_so_it_lands_on_a_human() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let (_sinks, tool) = with_sink(&ctx);
+        let tool = ShellTool::new();
         let plan = tool
             .prepare(serde_json::json!({ "command": "deploy.sh" }), &ctx)
             .await

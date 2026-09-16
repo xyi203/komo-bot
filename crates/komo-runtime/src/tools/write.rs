@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use komo_kernel::traits::Tool;
+use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
@@ -101,6 +101,8 @@ impl Tool for WriteTool {
         &self,
         plan: ApprovedPlan,
         _ctx: &ToolContext,
+        // 文件工具不产生流式输出：结构化结果由 executor 发布。
+        _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
         let plan = plan.plan();
         let args: WriteArgs = parse_args(plan.args.clone(), "write")?;
@@ -308,7 +310,7 @@ impl Drop for TempGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context};
+    use crate::tools::test_support::{approved, context, writer};
 
     fn write_result(output: &ToolOutput) -> WriteResult {
         serde_json::from_value(output.result.clone()).expect("write 的结果")
@@ -329,7 +331,12 @@ mod tests {
         assert_eq!(plan.operation, Operation::WriteFile);
         assert_eq!(plan.recovery, RecoveryMode::VerifyTarget);
 
-        let result = write_result(&tool.execute(approved(plan), &ctx).await.unwrap());
+        let result = write_result(
+            &tool
+                .execute(approved(plan), &ctx, &mut writer(&ctx))
+                .await
+                .unwrap(),
+        );
         assert!(result.created);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
@@ -350,7 +357,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = tool.execute(approved(plan), &ctx).await.unwrap_err();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
         let ToolError::VersionConflict { path } = &error else {
             panic!("{error:?}")
         };
@@ -379,7 +389,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = tool.execute(approved(plan), &ctx).await.unwrap_err();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, ToolError::VersionConflict { .. }),
             "{error:?}"
@@ -407,7 +420,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let result = write_result(&tool.execute(approved(plan), &ctx).await.unwrap());
+        let result = write_result(
+            &tool
+                .execute(approved(plan), &ctx, &mut writer(&ctx))
+                .await
+                .unwrap(),
+        );
         assert!(!result.created);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),

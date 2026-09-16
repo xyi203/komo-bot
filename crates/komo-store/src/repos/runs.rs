@@ -4,7 +4,7 @@
 //! 一切——建行、记事件引用、记终态、按请求键去重。
 
 use komo_kernel::traits::StoreError;
-use komo_kernel::types::ids::{EventId, RequestKey, RunId, SessionId};
+use komo_kernel::types::ids::{EventId, ExecutorId, RequestKey, RunId, SessionId};
 use komo_kernel::types::memory::MemoryWork;
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::PlanSource;
@@ -73,6 +73,11 @@ pub struct NewRun {
     pub model: ModelConfig,
     pub effort: Option<String>,
     pub at: OffsetDateTime,
+}
+
+/// 一行的状态枚举。列里存的是 `snake_case` 字符串。
+pub fn status_of(row: &RunRow) -> Result<RunStatus, StoreError> {
+    decode(&format!("\"{}\"", row.status), "runs.status")
 }
 
 /// 把状态枚举写成列里的那个字符串。
@@ -160,6 +165,39 @@ pub async fn mark_queued_in(
         .exec(ex)
         .await
         .map_err(map_toasty)
+}
+
+/// 某个执行实例开跑：确认领取代次仍是自己的，然后把状态坐实成 `running`。
+///
+/// 返回 `Ok(None)` = 坐实了；`Ok(Some(current))` = **自己已经是旧代次**，当前是
+/// `current`。§8.7：这时候要停止这个任务的一切写入，不重试、不降级。
+///
+/// 领取（[`super::queue::TursoRunQueue::claim`] / `claim_run`）只改行——它是一条条件
+/// UPDATE，`rows affected` 是胜负的唯一信号，所以它不写事件。事件由 handler 在真正开跑
+/// 时通过 `Ledger::start_run` 写，于是 JSONL 上的 `run.started` 记的是"谁开始跑了"，而
+/// 不是"谁抢到了名额"——中间可能隔着一次失败的接管。
+///
+/// 这里是**读—核对—写**，整段在一个 `BEGIN CONCURRENT` 事务里：并发的代次递增会让这
+/// 个事务提交失败并干净重跑，重跑时读到的就是新代次。
+pub async fn start_in(
+    ex: &mut dyn Executor,
+    run: &RunId,
+    executor: &ExecutorId,
+    generation: u64,
+    now: OffsetDateTime,
+) -> Result<Option<u64>, StoreError> {
+    let mut row = require(ex, run).await?;
+    let current = row.claim_generation.max(0) as u64;
+    if current != generation || row.claimed_by.as_deref() != Some(executor.as_str()) {
+        return Ok(Some(current));
+    }
+    row.update()
+        .status(status_str(RunStatus::Running))
+        .updated_at(to_ts(now))
+        .exec(ex)
+        .await
+        .map_err(map_toasty)?;
+    Ok(None)
 }
 
 /// 让出执行名额时的状态提交（`waiting_approval` / `waiting_retry` / `needs_attention`）。

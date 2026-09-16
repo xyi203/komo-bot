@@ -7,7 +7,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use komo_kernel::traits::Tool;
+use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
     ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
@@ -144,6 +144,8 @@ impl Tool for ReadTool {
         &self,
         plan: komo_kernel::types::plan::ApprovedPlan,
         _ctx: &ToolContext,
+        // 文件工具不产生流式输出：结构化结果由 executor 发布。
+        _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
         let plan = plan.plan();
         let args: ReadArgs = parse_args(plan.args.clone(), "read")?;
@@ -263,7 +265,7 @@ fn preview_of(result: &ReadResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context};
+    use crate::tools::test_support::{approved, context, writer};
 
     fn read_result(output: &ToolOutput) -> ReadResult {
         serde_json::from_value(output.result.clone()).expect("read 的结果")
@@ -285,7 +287,10 @@ mod tests {
         assert_eq!(plan.recovery, RecoveryMode::SafeReread);
         assert_eq!(plan.targets[0].path, std::fs::canonicalize(&file).unwrap());
 
-        let output = tool.execute(approved(plan), &ctx).await.unwrap();
+        let output = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap();
         let result = read_result(&output);
         assert_eq!(result.text, "one\ntwo\n");
         assert_eq!(result.total_lines, 2);
@@ -308,7 +313,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let result = read_result(&tool.execute(approved(plan), &ctx).await.unwrap());
+        let result = read_result(
+            &tool
+                .execute(approved(plan), &ctx, &mut writer(&ctx))
+                .await
+                .unwrap(),
+        );
 
         assert_eq!(result.text, "line 3\nline 4\n");
         assert_eq!((result.start_line, result.end_line), (3, 4));
@@ -335,7 +345,12 @@ mod tests {
             .prepare(serde_json::json!({ "path": "big.txt" }), &ctx)
             .await
             .unwrap();
-        let result = read_result(&tool.execute(approved(plan), &ctx).await.unwrap());
+        let result = read_result(
+            &tool
+                .execute(approved(plan), &ctx, &mut writer(&ctx))
+                .await
+                .unwrap(),
+        );
         assert!(result.truncated);
         assert!(result.text.len() <= 28, "{:?}", result.text);
         assert!(!result.unread.is_empty());
@@ -354,7 +369,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let result = read_result(&tool.execute(approved(plan), &ctx).await.unwrap());
+        let result = read_result(
+            &tool
+                .execute(approved(plan), &ctx, &mut writer(&ctx))
+                .await
+                .unwrap(),
+        );
         assert!(result.text.is_empty());
         assert_eq!(
             result.unread[0],
@@ -375,7 +395,10 @@ mod tests {
             .prepare(serde_json::json!({ "path": "nope.txt" }), &ctx)
             .await
             .unwrap();
-        let error = tool.execute(approved(plan), &ctx).await.unwrap_err();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
         assert!(matches!(error, ToolError::Failed { .. }), "{error:?}");
     }
 

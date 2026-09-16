@@ -27,7 +27,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use komo_kernel::protocol::http::{CancelRunRequest, EventQuery, ResumeRequest, SubmitRunRequest};
+use komo_kernel::protocol::http::{
+    ApprovalListQuery, BoundaryRequest, CancelRunRequest, EventQuery, ResumeRequest,
+    SubmitRunRequest,
+};
 use komo_kernel::protocol::sse::Cursor;
 use komo_kernel::types::ids::{SessionId, uuid_v7_at};
 use ratatui::Terminal;
@@ -88,6 +91,13 @@ pub async fn run_tui(
                     .await;
             }
         }
+    }
+
+    // 一开机就问一次模型清单：`/model <id>` 与 `/effort <level>` 的校验靠它，而
+    // §13.3 要求「不支持的 effort 在请求前拒绝」——拿不到清单只是退到内建白名单，
+    // 不是让人在发出请求之后才发现。
+    if let Ok(models) = client.models().await {
+        let _ = events_tx.send(ServerEvent::ModelMenu(models.models)).await;
     }
 
     // 先把补读来的事件吃完，游标才是对的——订阅要从它之后开始。
@@ -239,7 +249,7 @@ async fn run_effect(
                 Err(error) => Some(ServerEvent::Failed(format!("取消失败：{error}"))),
             }
         }
-        Effect::Boundary => match client.boundary(session).await {
+        Effect::Boundary => match client.boundary(session, &BoundaryRequest::default()).await {
             Ok(_) => None,
             Err(error) => Some(ServerEvent::Failed(format!("/new 失败：{error}"))),
         },
@@ -267,13 +277,17 @@ async fn run_effect(
                 Err(error) => Some(ServerEvent::Failed(format!("答复失败：{error}"))),
             }
         }
-        Effect::FetchPending => match client.approvals().await {
+        Effect::FetchPending => match client.approvals(&ApprovalListQuery::default()).await {
             Ok(response) => Some(ServerEvent::Pending(response.approvals)),
             Err(error) => Some(ServerEvent::Failed(format!("取待审批失败：{error}"))),
         },
         Effect::FetchStatus => match client.session(session).await {
             Ok(detail) => Some(ServerEvent::Status(Box::new(detail))),
             Err(error) => Some(ServerEvent::Failed(format!("取状态失败：{error}"))),
+        },
+        Effect::FetchModels => match client.models().await {
+            Ok(response) => Some(ServerEvent::ModelMenu(response.models)),
+            Err(error) => Some(ServerEvent::Failed(format!("取模型清单失败：{error}"))),
         },
         Effect::Quit => None,
     }

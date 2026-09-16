@@ -27,6 +27,21 @@ pub struct SseFrame {
 pub enum SseEvent {
     /// 一条已经同步且索引完成的 JSONL 事件（§8.8）。
     Event(Box<Event>),
+    /// 模型正在打字。
+    ///
+    /// **只在 SSE 上，永不进 JSONL。**§8.3：「工具输出先独立持久化，再一次提交对应结果
+    /// 事件，**不按流式 token 写 JSONL**」，而 §6 的账本单位是"一次完整的 assistant
+    /// 回复 + 该轮全部调用计划，一个逻辑事件"。把增量写进日志会得到一份按 token 切碎的
+    /// 历史，恢复时拼不回一轮完整的调用；更要紧的是「未完成的流式模型输出没有执行
+    /// 权限」——一个能被回放的增量事件正好模糊了这条线。
+    ///
+    /// 所以它是纯粹的界面提示：TUI 拿它做打字机效果，丢了不影响任何东西，一轮结束时
+    /// `message.assistant` 会把完整回复正式送到。
+    AssistantDelta {
+        run: RunId,
+        round: u32,
+        text: String,
+    },
     /// Run 的状态变了。派生自事件，给不想自己 fold 的客户端。
     RunStatus { run: RunId, status: RunStatus },
     /// 有新的待处理审批；详情去 `GET /v1/approvals/{id}` 取，**不靠这条通知传授权**。
@@ -73,6 +88,30 @@ mod tests {
         let text = serde_json::to_string(&frame).unwrap();
         assert!(text.contains(r#""event":"run_status""#), "{text}");
         assert_eq!(serde_json::from_str::<SseFrame>(&text).unwrap(), frame);
+    }
+
+    #[test]
+    fn an_assistant_delta_is_an_sse_only_shape() {
+        let frame = SseFrame {
+            id: Seq(0),
+            session: SessionId::from_raw("sess-1"),
+            event: SseEvent::AssistantDelta {
+                run: RunId::from_raw("run-1"),
+                round: 1,
+                text: "我算".into(),
+            },
+        };
+        let text = serde_json::to_string(&frame).unwrap();
+        assert!(text.contains(r#""event":"assistant_delta""#), "{text}");
+        assert_eq!(serde_json::from_str::<SseFrame>(&text).unwrap(), frame);
+
+        // 它在事件词汇里没有对应的 `type`：JSONL 那边读到只会是 Unknown。
+        let as_log_line = r#"{"v":1,"seq":1,"event_id":"e","session_id":"s","at":"2026-09-15T08:00:00Z","type":"assistant_delta","data":{}}"#;
+        let event = crate::events::Event::from_line(as_log_line).unwrap();
+        assert!(
+            event.payload.is_unknown(),
+            "增量不是一个日志事件，账本里没有它的位置"
+        );
     }
 
     #[test]

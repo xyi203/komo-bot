@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use async_trait::async_trait;
-use komo_kernel::traits::Tool;
+use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
@@ -140,6 +140,8 @@ impl Tool for EditTool {
         &self,
         plan: ApprovedPlan,
         _ctx: &ToolContext,
+        // 文件工具不产生流式输出：结构化结果由 executor 发布。
+        _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
         let plan = plan.plan();
         let args: EditArgs = parse_args(plan.args.clone(), "edit")?;
@@ -249,7 +251,7 @@ fn apply(text: &str, args: &EditArgs, path: &std::path::Path) -> Result<(String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context};
+    use crate::tools::test_support::{approved, context, writer};
 
     async fn plan_for(
         tool: &EditTool,
@@ -272,7 +274,9 @@ mod tests {
         )
         .await
         .unwrap();
-        tool.execute(approved(plan), &ctx).await.unwrap();
+        tool.execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "alpha\nBETA\ngamma\n"
@@ -326,7 +330,9 @@ mod tests {
         )
         .await
         .unwrap();
-        tool.execute(approved(plan), &ctx).await.unwrap();
+        tool.execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "y\ny\n"
@@ -351,7 +357,10 @@ mod tests {
         )
         .await
         .unwrap();
-        let error = tool.execute(approved(plan), &ctx).await.unwrap_err();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, ToolError::VersionConflict { .. }),
             "{error:?}"
@@ -378,7 +387,10 @@ mod tests {
 
         // 审批期间别人改了这个文件。
         std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\n").unwrap();
-        let error = tool.execute(approved(plan), &ctx).await.unwrap_err();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
         assert!(
             matches!(error, ToolError::VersionConflict { .. }),
             "{error:?}"
@@ -404,7 +416,9 @@ mod tests {
             Verification::NotPerformed { .. }
         ));
 
-        tool.execute(approved(plan.clone()), &ctx).await.unwrap();
+        tool.execute(approved(plan.clone()), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap();
         assert!(matches!(
             tool.verify(&plan, &ctx).await.unwrap(),
             Verification::AlreadySatisfied { .. }

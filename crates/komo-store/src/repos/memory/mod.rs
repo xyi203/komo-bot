@@ -26,8 +26,7 @@ use toasty::Executor;
 mod terms;
 
 use crate::db::{
-    BoxFuture, Db, column_i64, decode, encode, from_ts, from_ts_opt, map_toasty, store_to_repo,
-    to_ts, to_ts_opt,
+    BoxFuture, Db, column_i64, decode, encode, from_ts, from_ts_opt, map_toasty, to_ts, to_ts_opt,
 };
 pub use terms::{lexical_terms, terms_column};
 
@@ -109,7 +108,7 @@ impl TursoMemoryRepo {
                 }) as BoxFuture<'_, Result<(), StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     /// 当前生效的索引代次。没有配置向量模型时是 `None`。
@@ -127,7 +126,7 @@ impl TursoMemoryRepo {
                 }) as BoxFuture<'_, Result<Option<String>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 }
 
@@ -142,7 +141,7 @@ impl MemoryRepo for TursoMemoryRepo {
                     as BoxFuture<'_, Result<Option<MemoryItem>, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn put(
@@ -150,16 +149,16 @@ impl MemoryRepo for TursoMemoryRepo {
         item: MemoryItem,
         expected_revision: Option<u32>,
     ) -> Result<MemoryItem, RepoError> {
-        let outcome = self
-            .db
+        self.db
             .with_write_retry(move |ex| {
                 let item = item.clone();
                 Box::pin(async move { put_in(ex, item, expected_revision).await })
-                    as BoxFuture<'_, Result<PutOutcome, StoreError>>
+                    as BoxFuture<'_, Result<MemoryItem, StoreError>>
             })
             .await
-            .map_err(store_to_repo)?;
-        outcome.into_result()
+            // `StoreError::VersionConflict` 逐个对上 `RepoError::VersionConflict`
+            // （kernel 的 `From`），所以结论直接走错误通道，不再需要一个载具枚举。
+            .map_err(RepoError::from)
     }
 
     async fn recall(&self, query: &RecallQuery) -> Result<RecallResult, RepoError> {
@@ -171,7 +170,7 @@ impl MemoryRepo for TursoMemoryRepo {
                     as BoxFuture<'_, Result<RecallResult, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn confirm(
@@ -181,25 +180,11 @@ impl MemoryRepo for TursoMemoryRepo {
         at: OffsetDateTime,
     ) -> Result<MemoryItem, RepoError> {
         let id = id.to_string();
-        let outcome = self
-            .db
+        self.db
             .with_write_retry(move |ex| {
                 let id = id.clone();
                 Box::pin(async move {
-                    let Some(mut row) = MemoryItemRow::filter_by_id(&id)
-                        .first()
-                        .exec(ex)
-                        .await
-                        .map_err(map_toasty)?
-                    else {
-                        return Ok(PutOutcome::Missing(id));
-                    };
-                    if row.revision != i64::from(expected_revision) {
-                        return Ok(PutOutcome::Conflict {
-                            expected: expected_revision,
-                            actual: row.revision.max(0) as u32,
-                        });
-                    }
+                    let mut row = require_revision(ex, &id, expected_revision).await?;
                     // 操作者确认绑定具体 id / revision；模型返回的 user_confirmed 字段
                     // 没有写入权限（§9.2、§9.6）——它进不到这条路径上来。
                     row.update()
@@ -208,13 +193,11 @@ impl MemoryRepo for TursoMemoryRepo {
                         .exec(ex)
                         .await
                         .map_err(map_toasty)?;
-                    let item = load_item(ex, &id).await?.expect("刚刚还在");
-                    Ok(PutOutcome::Ok(Box::new(item)))
-                }) as BoxFuture<'_, Result<PutOutcome, StoreError>>
+                    Ok(load_item(ex, &id).await?.expect("刚刚还在"))
+                }) as BoxFuture<'_, Result<MemoryItem, StoreError>>
             })
             .await
-            .map_err(store_to_repo)?;
-        outcome.into_result()
+            .map_err(RepoError::from)
     }
 
     async fn forget(
@@ -224,25 +207,11 @@ impl MemoryRepo for TursoMemoryRepo {
         at: OffsetDateTime,
     ) -> Result<MemoryItem, RepoError> {
         let id = id.to_string();
-        let outcome = self
-            .db
+        self.db
             .with_write_retry(move |ex| {
                 let id = id.clone();
                 Box::pin(async move {
-                    let Some(mut row) = MemoryItemRow::filter_by_id(&id)
-                        .first()
-                        .exec(ex)
-                        .await
-                        .map_err(map_toasty)?
-                    else {
-                        return Ok(PutOutcome::Missing(id));
-                    };
-                    if row.revision != i64::from(expected_revision) {
-                        return Ok(PutOutcome::Conflict {
-                            expected: expected_revision,
-                            actual: row.revision.max(0) as u32,
-                        });
-                    }
+                    let mut row = require_revision(ex, &id, expected_revision).await?;
                     row.update()
                         .state(enum_str(&MemoryState::Forgotten))
                         .updated_at(to_ts(at))
@@ -251,13 +220,11 @@ impl MemoryRepo for TursoMemoryRepo {
                         .map_err(map_toasty)?;
                     // forget 立即停用内容，**并使关键词、向量里的引用失效**（§9.6）。
                     clear_index_in(ex, &id).await?;
-                    let item = load_item(ex, &id).await?.expect("刚刚还在");
-                    Ok(PutOutcome::Ok(Box::new(item)))
-                }) as BoxFuture<'_, Result<PutOutcome, StoreError>>
+                    Ok(load_item(ex, &id).await?.expect("刚刚还在"))
+                }) as BoxFuture<'_, Result<MemoryItem, StoreError>>
             })
             .await
-            .map_err(store_to_repo)?;
-        outcome.into_result()
+            .map_err(RepoError::from)
     }
 
     async fn put_vector(
@@ -326,7 +293,7 @@ impl MemoryRepo for TursoMemoryRepo {
                 }) as BoxFuture<'_, Result<(), StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 
     async fn index_status(&self) -> Result<MemoryIndexStatus, RepoError> {
@@ -389,37 +356,40 @@ impl MemoryRepo for TursoMemoryRepo {
                 }) as BoxFuture<'_, Result<MemoryIndexStatus, StoreError>>
             })
             .await
-            .map_err(store_to_repo)
+            .map_err(RepoError::from)
     }
 }
 
-/// `with_write_retry` 的错误通道只有 [`StoreError`]，而 `put` / `confirm` / `forget`
-/// 要答得出 [`RepoError::VersionConflict`]——用一个枚举把结论带出事务，出口处还原。
-enum PutOutcome {
-    Ok(Box<MemoryItem>),
-    Conflict { expected: u32, actual: u32 },
-    Missing(String),
-}
-
-impl PutOutcome {
-    fn into_result(self) -> Result<MemoryItem, RepoError> {
-        match self {
-            PutOutcome::Ok(item) => Ok(*item),
-            PutOutcome::Conflict { expected, actual } => {
-                Err(RepoError::VersionConflict { expected, actual })
-            }
-            PutOutcome::Missing(id) => Err(RepoError::NotFound {
-                what: format!("memory {id}"),
-            }),
-        }
+/// 读一行并核对预期 revision。不符就 [`StoreError::VersionConflict`]，没有就
+/// [`StoreError::NotFound`]——两者都在事务里说清楚，出口处由 kernel 的 `From` 搬到
+/// [`RepoError`]。
+async fn require_revision(
+    ex: &mut dyn Executor,
+    id: &str,
+    expected_revision: u32,
+) -> Result<MemoryItemRow, StoreError> {
+    let row = MemoryItemRow::filter_by_id(id)
+        .first()
+        .exec(ex)
+        .await
+        .map_err(map_toasty)?
+        .ok_or_else(|| StoreError::NotFound {
+            what: format!("memory {id}"),
+        })?;
+    if row.revision != i64::from(expected_revision) {
+        return Err(StoreError::VersionConflict {
+            expected: expected_revision,
+            actual: row.revision.max(0) as u32,
+        });
     }
+    Ok(row)
 }
 
 async fn put_in(
     ex: &mut dyn Executor,
     item: MemoryItem,
     expected_revision: Option<u32>,
-) -> Result<PutOutcome, StoreError> {
+) -> Result<MemoryItem, StoreError> {
     let id = item.id.to_string();
     let existing = MemoryItemRow::filter_by_id(&id)
         .first()
@@ -430,7 +400,7 @@ async fn put_in(
     if let (Some(expected), Some(row)) = (expected_revision, existing.as_ref())
         && row.revision != i64::from(expected)
     {
-        return Ok(PutOutcome::Conflict {
+        return Err(StoreError::VersionConflict {
             expected,
             actual: row.revision.max(0) as u32,
         });
@@ -547,8 +517,7 @@ async fn put_in(
         }
     }
 
-    let stored = load_item(ex, &id).await?.expect("刚刚写进去的");
-    Ok(PutOutcome::Ok(Box::new(stored)))
+    Ok(load_item(ex, &id).await?.expect("刚刚写进去的"))
 }
 
 async fn clear_index_in(ex: &mut dyn Executor, id: &str) -> Result<(), StoreError> {

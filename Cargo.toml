@@ -73,7 +73,7 @@ pulldown-cmark = "0.13.4"
 # §3 配置热重载：进程内唯一的 Arc<ConfigSnapshot> 原子替换。
 arc-swap = "1.9.2"
 
-croner = "4.0.0"
+croner = { version = "4.0.0", default-features = false }
 async-trait = "0.1.92"
 thiserror = "2.0.20"
 uuid = { version = "1.26.1", features = ["v7", "serde"] }
@@ -93,3 +93,9 @@ debug = "line-tables-only"   # 自己的 crate 保留行号即可
 strip = "symbols"
 lto = "thin"
 codegen-units = 16
+
+# §13.4 / spikes/wechat.md：wechatbot 0.4.0 上游把 reqwest 0.12 默认特性（native-tls → openssl-sys）
+# 留着不管，特性只加不减，工作区无法关掉；vendor 一份只改它的 reqwest 行，走工作区同一份
+# rustls 0.23 + ring provider。openssl / native-tls 整条构建链消失，Fedora 不需要 openssl-devel。
+[patch.crates-io]
+wechatbot = { path = "vendor/wechatbot" }

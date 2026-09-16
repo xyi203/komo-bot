@@ -15,6 +15,9 @@ time = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
 croner = { workspace = true }
+# §7.2 的 plan_hash、§8.3 的内容哈希与 §3 的凭证指纹都要一个真哈希；手写的散列哪怕
+# 对，也不该住在与密钥相邻的代码里。
+sha2 = { workspace = true }
 
 [features]
 # §13.4：跨 crate 需要的替身放在 test-support 后面，只作为 dev-dependency 启用。

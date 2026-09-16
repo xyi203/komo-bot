@@ -875,7 +875,7 @@ komo cron remove JOB_ID
 - 唯一键 `job_id + scheduled_at_utc` 防止同一计划时间重复创建运行。
 - 同一 Job 上一次仍未结束（含等待审批、重试或结果核对）时，跳过本次并记录原因。
 - Gateway 停机期间错过的触发不集中补跑；停机前已经持久创建、尚未完成的 Cron Run 则按原 Run 自动恢复，这是两种不同情况。
-- 时区明确保存；同一日历时间因夏令时出现两次时，两次不同 UTC 时刻分别视为计划时间；不存在的本地时间跳过。
+- 时区明确保存（IANA 名，`TimeZone` 只存名字）；同一日历时间因夏令时出现两次时，两次不同 UTC 时刻分别视为计划时间；不存在的本地时间跳过。**这两条与 croner 的内建策略相反**（它把缺口里的固定时刻抬到缺口之后、把重复的只算较早一次），所以由 kernel 的 `cron::search_from`（跳缺口）和 `cron::repeated_twin`（补后一半）自己实现，换 croner 版本时要一起看。时区解析走 `ZoneResolver` port（§13.5）：kernel 不带 tzdb，真 tzdb 实现在 runtime；没有 tzdb 时 `FixedOffsetZone` 是**明确的降级**（答不出重复与缺口，等于当这个区没有夏令时），不是默认。
 - 手动 run 使用独立请求幂等键，不冒充定时触发。
 - 新增危险操作暂停等待审批，不能因无人值守而自动放行。
 - Job、模块或权限发生变化时重新匹配授权。
@@ -1172,7 +1172,8 @@ effort 的行为统一，取值按协议和具体模型校验：
 ```text
 komo-kernel    值类型、状态机、事件与 fold、Policy 规则引擎、cron 到期计算、
                §8.4 恢复决策表（纯函数）、协议线格式、全部 trait（§13.5）。
-               deps: serde, serde_json, uuid, time, thiserror, async-trait, croner。不依赖 tokio。
+               deps: serde, serde_json, uuid, time, thiserror, async-trait, sha2, croner（`default-features = false`，
+               无 chrono；它自己仍拉 derive_builder / darling / strum，接受）。不依赖 tokio，不带 tzdb。
 
 komo-store     session_log（JSONL 写入器 / 范围读 / 尾部校验）、payloads、tool_output、
                Turso Db + toasty 模型 + ensure_schema、repositories、Coordinator（impl Ledger）、checkpoint。
@@ -1282,6 +1283,7 @@ codegen-units = 16
 | `Policy` | 规则引擎（runtime） | 表驱动规则 | 同步、纯函数；授权在 `PolicyContext` 里传入，不在内部查库 |
 | `Channel` / `Inbound` / `Notifier` | 飞书、Telegram、WeChat、HTTP API、SSE（gateway） | 内存渠道 | 首版就有三个真实现；审批请求的渲染是各渠道实现的事 |
 | `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避、审批有效期全部依赖时间 |
+| `ZoneResolver` | tzdb 实现（runtime，W3 选 crate） | `ScriptedZoneResolver`（可编脚本的假时区）/ `FixedOffsetZone`（降级） | §10 的夏令时两条规则要在无 tzdb 下测；kernel 不带时区数据库 |
 
 不是 trait 的东西：`AgentLoop`、`ToolExecutor`、`Scheduler`、`Recovery`、`MemoryManager`、`SkillRegistry`、`Coordinator`、`Dispatcher`——各只有一个实现，依赖上表的 trait 就可测。`SessionRepo`、`ToolCallRepo`、`CheckpointRepo`、`OutboxRepo` 是 store 内部的具体类型，只被 `Coordinator` 用。审批也不需要 `Approver` trait：§6 定了审批暂停 Run，`Policy` 答 `Ask` 后 executor 写 `approval_requests` 并 `Ledger::suspend`，飞书卡片按钮、Telegram / WeChat 命令、TUI 弹窗、CLI 子命令都打到 `POST /v1/approvals/{id}/decision`，调度器把 Run 重新入队，executor 从 `ApprovalRepo` 消费授权再执行。渠道之间的差别只在渲染（§11.3），不在决策。
 
@@ -1296,15 +1298,23 @@ pub trait Ledger: Send + Sync {
     async fn accept_input(&self, input: AcceptInput) -> Result<Accepted, LedgerError>;
     /// 完整 assistant 回复 + 本轮全部调用计划，一个逻辑事件；返回 Runtime 分配的 ToolCallId。
     async fn record_round(&self, run: &RunId, round: AssistantRound) -> Result<Vec<ToolCallId>, LedgerError>;
+    /// tool.planned：准备好的执行计划落盘（§8.4 第 6 行要求"planned 而未执行"是可分辨的状态）。
+    async fn plan_call(&self, call: &ToolCallId, plan: &ExecutionPlan) -> Result<EventId, LedgerError>;
     /// tool.started + 执行尝试 + 首次授权消费，同一事务；返回后才允许产生真实副作用。
     async fn start_call(&self, call: &ToolCallId, plan: &ExecutionPlan, grant: Option<GrantUse>) -> Result<AttemptId, LedgerError>;
     /// 输出已由 ToolOutputStore 发布；这里只写 tool.result 元信息与引用。
     async fn finish_call(&self, attempt: &AttemptId, published: PublishedOutput) -> Result<(), LedgerError>;
     /// waiting_approval / waiting_retry / needs_attention，释放执行名额。
     async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError>;
+    /// 调用前这一轮的最终回复必须已作为 message.assistant 落盘（record_round → complete）；
+    /// run.completed 的 final_message 只用于补读，不进消息面。
     async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError>;
-    /// 按 seq 范围读事件；引用正文按需加载并校验哈希。
-    async fn read(&self, session: &SessionId, from: Seq) -> Result<EventBatch, LedgerError>;
+    /// 按 seq 分页读事件（短事务，limit=0 由实现定页大小）；EventBatch.next 为 None 即读到末尾。
+    async fn read(&self, session: &SessionId, from: Seq, limit: u32) -> Result<EventBatch, LedgerError>;
+    /// `/new`：追加 conversation.boundary，不切 Session。
+    async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError>;
+    /// control_outbox 审计补写，按 event_id 幂等；不创建授权。
+    async fn append_audit(&self, session: &SessionId, event_id: &EventId, payload: EventPayload, occurred_at: OffsetDateTime) -> Result<Seq, LedgerError>;
 }
 
 #[async_trait]
@@ -1351,14 +1361,34 @@ pub trait PythonHost: Send + Sync {
 
 #[async_trait]
 pub trait RunQueue: Send + Sync {
-    /// 条件更新 + 递增代次；返回 None 表示没有可领取的 Run。
+    /// 条件更新 + 递增代次；返回 None 表示没有可领取的 Run（调度器：下一个到期的）。
     async fn claim(&self, executor: &ExecutorId) -> Result<Option<Claimed>, StoreError>;
+    /// 领取指定 Run（手动 resume、恢复扫描）；同样的条件更新，两个执行者只一个成功。
+    async fn claim_run(&self, run: &RunId, executor: &ExecutorId) -> Result<Option<Claimed>, StoreError>;
+    /// 交还名额（等审批 / 等重试 / 执行者退出）；代次不对就什么都不做。
+    async fn release(&self, claimed: &Claimed) -> Result<(), StoreError>;
+}
+
+#[async_trait]
+pub trait ApprovalRepo: Send + Sync {
+    /// 决定幂等：已决定的返回原决定。
+    async fn decide(&self, id: &ApprovalId, decision: ApprovalDecisionRecord) -> Result<ApprovalDecisionResponse, RepoError>;
+    /// 消费授权换 Proof：Once 比计划哈希并标记 consumed；Run / CronJob 范围走 Grant::covers(plan)，
+    /// 不因一次使用作废，但 ConsumedApproval 记下用的是哪条 grant。Deny 上 executor 根本不来这里。
+    async fn consume(&self, id: &ApprovalId, plan: &ExecutionPlan, now: OffsetDateTime) -> Result<ConsumedApproval, RepoError>;
+    // create / get / find_by_short_id / list_pending / grants_for_run / grants_for_job 略
+}
+
+/// kernel 不带 tzdb；两个方向都要，cron 的搜索两头都走。
+pub trait ZoneResolver: Send + Sync {
+    fn resolve(&self, zone: &str, local: PrimitiveDateTime) -> Result<ZoneResolution, ZoneError>; // Single / Ambiguous(早, 晚) / Gap
+    fn offset_at(&self, zone: &str, instant: OffsetDateTime) -> Result<UtcOffset, ZoneError>;
 }
 
 #[async_trait]
 pub trait Channel: Send + Sync {
     fn name(&self) -> &'static str;
-    async fn serve(&self, inbound: Arc<dyn Inbound>, shutdown: Shutdown) -> anyhow::Result<()>;
+    async fn serve(&self, inbound: Arc<dyn Inbound>, shutdown: Shutdown) -> Result<(), ChannelError>; // kernel 无 anyhow
 }
 
 /// Gateway 交给渠道的唯一入口。渠道不知道 Session 是什么。

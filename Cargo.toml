@@ -84,6 +84,18 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10"
 
+# W3 预声明（避免并行子代理碰同一个文件）。§13.2：配置 TOML、日志 tracing、tokio-util。
+toml = "1.1"
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# runtime 的 ZoneResolver 实现（§10 / §13.5）：自带 tzdb，kernel 侧仍只用 `time`，靠 unix 时间戳换算。
+jiff = "0.2"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+bytes = "1"
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+tempfile = "3"
+
 # §13.4 profile：逐字照抄。
 [profile.dev.package."*"]
 debug = "none"               # 第三方不带调试信息

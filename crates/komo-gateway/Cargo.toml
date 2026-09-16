@@ -16,6 +16,17 @@ reqwest = { workspace = true }
 openlark = { workspace = true, optional = true }
 wechatbot = { workspace = true, optional = true }
 qrcode = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+time = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+arc-swap = { workspace = true }
+futures-util = { workspace = true }
+bytes = { workspace = true }
+tokio-util = { workspace = true }
 
 [features]
 # §13.4：三个渠道各自一个 feature，默认全开。feature 的用处不是裁功能，是让
@@ -25,5 +36,7 @@ feishu = ["dep:openlark"]
 telegram = []
 wechat = ["dep:wechatbot", "dep:qrcode"]
 
+
 [dev-dependencies]
 komo-kernel = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }

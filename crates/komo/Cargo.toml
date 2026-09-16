@@ -16,6 +16,9 @@ komo-client = { workspace = true }
 komo-gateway = { workspace = true }
 clap = { workspace = true }
 rustls = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [features]
 # 渠道 feature 的直通口，好让 `cargo build --no-default-features` 在工作区根部也有意义。

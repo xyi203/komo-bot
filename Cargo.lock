@@ -2109,6 +2109,7 @@ dependencies = [
  "futures-util",
  "komo-kernel",
  "komo-runtime",
+ "komo-store",
  "openlark",
  "qrcode",
  "reqwest",

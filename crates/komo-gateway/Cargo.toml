@@ -9,6 +9,8 @@ license.workspace = true
 [dependencies]
 komo-kernel = { workspace = true }
 komo-runtime = { workspace = true }
+# 只用 store 的构造函数与 repo 类型（Db / Coordinator / Turso*Repo / RecoveryStore），不碰 toasty 类型。
+komo-store = { workspace = true }
 axum = { workspace = true }
 tower-http = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "fs"] }
@@ -39,4 +41,5 @@ wechat = ["dep:wechatbot", "dep:qrcode"]
 
 [dev-dependencies]
 komo-kernel = { workspace = true, features = ["test-support"] }
+komo-store = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }

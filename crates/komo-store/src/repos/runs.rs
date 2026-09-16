@@ -150,6 +150,29 @@ pub async fn get_in(ex: &mut dyn Executor, run: &RunId) -> Result<Option<RunRow>
         .map_err(map_toasty)
 }
 
+/// 只记下承载输入的事件，**不动状态**。
+///
+/// 回放补索引用它：`run.accepted` 在日志里说明"输入已经完整落盘"，但这一行现在是
+/// `cancelled` 还是 `waiting_approval`，是数据库自己的事——「回放只补索引与派生执行状态，
+/// 不能覆盖 state.db 已记录的用户取消或权限撤销」（§8.5）。
+pub async fn set_input_event_in(
+    ex: &mut dyn Executor,
+    run: &RunId,
+    input_event: &EventId,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let mut row = require(ex, run).await?;
+    if row.input_event.as_deref() == Some(input_event.as_str()) {
+        return Ok(());
+    }
+    row.update()
+        .input_event(Some(input_event.to_string()))
+        .updated_at(to_ts(now))
+        .exec(ex)
+        .await
+        .map_err(map_toasty)
+}
+
 /// 记下承载输入的事件，并把状态推成 `queued`——**这一步之后才能向客户端确认已接收**。
 pub async fn mark_queued_in(
     ex: &mut dyn Executor,
@@ -201,6 +224,11 @@ pub async fn start_in(
 }
 
 /// 让出执行名额时的状态提交（`waiting_approval` / `waiting_retry` / `needs_attention`）。
+///
+/// **一并把 `claimed_by` 清掉**：让出执行名额就是交还领取权（§7.4「停在一条审批上，已
+/// 释放执行名额」）。不清的话 §8.7 的候选查询里那个 `claimed_by IS NULL` 永远筛不到这
+/// 一行——等审批答复了、退避到期了，它也再没有人领得走，一个"等一会儿"就变成了永久
+/// 停摆。
 pub async fn mark_waiting_in(
     ex: &mut dyn Executor,
     run: &RunId,
@@ -213,6 +241,7 @@ pub async fn mark_waiting_in(
     let mut row = require(ex, run).await?;
     row.update()
         .status(status_str(status))
+        .claimed_by(None as Option<String>)
         .retry_attempts(i64::from(attempts))
         .next_retry_at(crate::db::to_ts_opt(next_retry_at))
         .last_error(reason)
@@ -313,6 +342,35 @@ pub async fn unfinished(db: &Db) -> Result<Vec<RunRecord>, StoreError> {
                 }
             }
             out.sort_by(|a, b| a.run.as_str().cmp(b.run.as_str()));
+            Ok(out)
+        }) as BoxFuture<'_, Result<Vec<RunRecord>, StoreError>>
+    })
+    .await
+}
+
+/// 已经终态、但结果还没送到客户端的 Run（§8.4 第 10 行）。
+///
+/// `delivered` 是"已经送过了"的那一组 Run id，由调用方查 `deliveries` 得出——这里不自
+/// 己去查，因为同一轮扫描的两批行要用**同一份**送达观察。
+pub async fn terminal_undelivered(
+    db: &Db,
+    delivered: &std::collections::BTreeSet<String>,
+) -> Result<Vec<RunRecord>, StoreError> {
+    let delivered = delivered.clone();
+    db.read(move |ex| {
+        let delivered = delivered.clone();
+        Box::pin(async move {
+            let rows = RunRow::all().exec(ex).await.map_err(map_toasty)?;
+            let mut out = Vec::new();
+            for row in &rows {
+                if delivered.contains(&row.id) {
+                    continue;
+                }
+                let record = RunRecord::try_from_row(row)?;
+                if record.status.is_terminal() {
+                    out.push(record);
+                }
+            }
             Ok(out)
         }) as BoxFuture<'_, Result<Vec<RunRecord>, StoreError>>
     })

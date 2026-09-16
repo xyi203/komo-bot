@@ -61,6 +61,26 @@ impl ApprovalRepo for MemApprovalRepo {
             .cloned())
     }
 
+    async fn find_latest_by_short_id(
+        &self,
+        short: &ShortId,
+    ) -> Result<Option<ApprovalRecord>, RepoError> {
+        let state = self.state.lock().expect("审批");
+        if let Some(pending) = state
+            .approvals
+            .values()
+            .find(|a| &a.short_id == short && a.decision.is_none())
+        {
+            return Ok(Some(pending.clone()));
+        }
+        Ok(state
+            .approvals
+            .values()
+            .filter(|a| &a.short_id == short)
+            .max_by_key(|a| a.decision.as_ref().map(|d| d.decided_at))
+            .cloned())
+    }
+
     async fn list_pending(
         &self,
         session: Option<&SessionId>,

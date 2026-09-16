@@ -402,30 +402,67 @@ impl RoutedLedger {
         self.ledgers.open(&session, "agent").await
     }
 
+    fn known_call(&self, call: &ToolCallId) -> Option<SessionId> {
+        self.calls.lock().expect("调用表").get(call).cloned()
+    }
+
+    fn known_attempt(&self, attempt: &AttemptId) -> Option<SessionId> {
+        self.attempts.lock().expect("尝试表").get(attempt).cloned()
+    }
+
     async fn for_call(&self, call: &ToolCallId) -> Result<Arc<SessionEntry>, LedgerError> {
-        let session = self
-            .calls
-            .lock()
-            .expect("调用表")
-            .get(call)
-            .cloned()
-            .ok_or_else(|| LedgerError::NotFound {
-                what: format!("调用 {call} 属于哪个会话"),
-            })?;
+        let session = match self.known_call(call) {
+            Some(session) => session,
+            None => {
+                self.relearn().await?;
+                self.known_call(call).ok_or_else(|| LedgerError::NotFound {
+                    what: format!("调用 {call} 属于哪个会话"),
+                })?
+            }
+        };
         self.ledgers.open(&session, "agent").await
     }
 
     async fn for_attempt(&self, attempt: &AttemptId) -> Result<Arc<SessionEntry>, LedgerError> {
-        let session = self
-            .attempts
-            .lock()
-            .expect("尝试表")
-            .get(attempt)
-            .cloned()
-            .ok_or_else(|| LedgerError::NotFound {
-                what: format!("尝试 {attempt} 属于哪个会话"),
-            })?;
+        let session = match self.known_attempt(attempt) {
+            Some(session) => session,
+            None => {
+                self.relearn().await?;
+                self.known_attempt(attempt)
+                    .ok_or_else(|| LedgerError::NotFound {
+                        what: format!("尝试 {attempt} 属于哪个会话"),
+                    })?
+            }
+        };
         self.ledgers.open(&session, "agent").await
+    }
+
+    /// 冷进程里的兜底：把**还没终态的那些 Run** 所在会话的日志过一遍，把调用与尝试补记
+    /// 进来。
+    ///
+    /// 恢复扫描补记 `finish_call` 走的正是这条路：尝试号是从磁盘上的孤儿 `output.json`
+    /// 与日志里读出来的，进程内的表还是空的（§8.4 第 7/8 行）。
+    ///
+    // TODO(decide: 真正该有的是 store 的 `repos::calls::session_of_{call,attempt}`——
+    // `tool_calls` / `tool_attempts` 上本来就有 `session_id` 列，一次按主键的查询就够。
+    // 那两个函数还没有（store 的交付报告里列过），所以这里先按"未完成 Run 的会话"补学
+    // 一遍：数量是一次启动里未完成的任务数，且学过就缓存，不是每次调用都扫。)
+    async fn relearn(&self) -> Result<(), LedgerError> {
+        let sessions = {
+            let mut sessions: Vec<SessionId> = komo_store::repos::runs::unfinished(&self.db)
+                .await
+                .map_err(komo_store::db::store_to_ledger)?
+                .into_iter()
+                .map(|record| record.session)
+                .collect();
+            sessions.sort();
+            sessions.dedup();
+            sessions
+        };
+        for session in sessions {
+            self.learn(&session).await?;
+        }
+        Ok(())
     }
 }
 

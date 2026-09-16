@@ -15,6 +15,7 @@ use komo_kernel::traits::{LedgerError, RunQueue, StoreError};
 use komo_kernel::types::ids::{ExecutorId, RunId};
 use komo_kernel::types::status::{Claimed, RunStatus};
 use time::OffsetDateTime;
+use toasty::Executor;
 
 use crate::db::{BoxFuture, Db, column_i64, column_string, map_toasty, to_ts};
 
@@ -281,15 +282,22 @@ pub async fn reclaim_abandoned_runs(db: &Db, executor: &ExecutorId) -> Result<u6
     let who = executor.to_string();
     db.with_write_retry(move |ex| {
         let who = who.clone();
-        Box::pin(async move {
-            toasty::sql::statement(RECLAIM_SQL)
-                .bind(who)
-                .exec(ex)
-                .await
-                .map_err(map_toasty)
-        }) as BoxFuture<'_, Result<u64, StoreError>>
+        Box::pin(async move { reclaim_abandoned_runs_in(ex, &ExecutorId::from_raw(who)).await })
+            as BoxFuture<'_, Result<u64, StoreError>>
     })
     .await
+}
+
+/// 同上，但在调用方已经打开的事务里跑——恢复要把它和"收拾遗留的尝试"放在一起提交。
+pub async fn reclaim_abandoned_runs_in(
+    ex: &mut dyn Executor,
+    executor: &ExecutorId,
+) -> Result<u64, StoreError> {
+    toasty::sql::statement(RECLAIM_SQL)
+        .bind(executor.to_string())
+        .exec(ex)
+        .await
+        .map_err(map_toasty)
 }
 
 #[cfg(test)]
@@ -553,6 +561,113 @@ mod tests {
 
         let still = crate::repos::runs::get(&db, &mine).await.unwrap().unwrap();
         assert_eq!(still.status, RunStatus::Running, "自己的那个不动");
+    }
+
+    /// 验收 B1：**让出执行名额就是交还领取权**。
+    ///
+    /// 挂起时不清 `claimed_by` 的话，§8.7 那两条语句里的 `claimed_by IS NULL` 永远筛不
+    /// 到这一行——退避到期了、审批答复了，它也再没有人领得走。
+    #[tokio::test]
+    async fn a_run_waiting_for_its_backoff_can_be_claimed_again_when_it_is_due() {
+        let (db, _dir) = temp().await;
+        let queue = TursoRunQueue::new(db.clone());
+        let run = queued_run(&db, "run-suspend").await;
+
+        let claimed = queue
+            .claim_run(&run, &ExecutorId::from_raw("exec-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(claimed.generation, 1);
+
+        suspend(&db, &run, RunStatus::WaitingRetry).await;
+
+        let record = crate::repos::runs::get(&db, &run).await.unwrap().unwrap();
+        assert_eq!(record.status, RunStatus::WaitingRetry);
+        assert!(record.claimed_by.is_none(), "让出名额就要交还领取权");
+
+        // 到期的候选查询看得到它（`DUE_SQL` 收 `queued` 与 `waiting_retry` 两种）。
+        assert!(
+            queue
+                .due(OffsetDateTime::now_utc(), 10)
+                .await
+                .unwrap()
+                .contains(&run)
+        );
+        // 而且真的领得走，代次递增。
+        let again = queue
+            .claim(&ExecutorId::from_raw("exec-2"))
+            .await
+            .unwrap()
+            .expect("领得到");
+        assert_eq!(again.run, run);
+        assert_eq!(again.generation, 2, "换人接管，代次要涨");
+    }
+
+    /// 等审批的那一行同样交还领取权。
+    ///
+    /// 它**不进**候选查询——`DUE_SQL` 只收 `queued` 与 `waiting_retry`，等人回答的那一
+    /// 行要等决定到达后被重新入队（§13.5）。所以这里断言的是"重新入队之后领得走"，
+    /// 而不是"现在就领得走"：领取权有没有交还，正是这两者的分界。
+    #[tokio::test]
+    async fn a_run_waiting_for_an_approval_also_hands_back_its_claim() {
+        let (db, _dir) = temp().await;
+        let queue = TursoRunQueue::new(db.clone());
+        let run = queued_run(&db, "run-approval").await;
+        queue
+            .claim_run(&run, &ExecutorId::from_raw("exec-1"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        suspend(&db, &run, RunStatus::WaitingApproval).await;
+        let record = crate::repos::runs::get(&db, &run).await.unwrap().unwrap();
+        assert_eq!(record.status, RunStatus::WaitingApproval);
+        assert!(record.claimed_by.is_none());
+        assert!(
+            queue
+                .due(OffsetDateTime::now_utc(), 10)
+                .await
+                .unwrap()
+                .is_empty(),
+            "等人回答的行不该被调度器捡走"
+        );
+
+        // 决定到了 → 重新入队 → 领得走。
+        crate::repos::recovery::RecoveryStore::new(db.clone(), std::path::PathBuf::from("."))
+            .requeue(&run)
+            .await
+            .unwrap();
+        let again = queue
+            .claim(&ExecutorId::from_raw("exec-2"))
+            .await
+            .unwrap()
+            .expect("领得到");
+        assert_eq!(again.run, run);
+        assert_eq!(again.generation, 2);
+    }
+
+    /// 让一行停下来等。
+    async fn suspend(db: &Db, run: &RunId, status: RunStatus) {
+        let due_at = OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let run = run.clone();
+        db.with_write_retry(move |ex| {
+            let run = run.clone();
+            Box::pin(async move {
+                crate::repos::runs::mark_waiting_in(
+                    ex,
+                    &run,
+                    status,
+                    1,
+                    Some(due_at),
+                    Some("等一会儿".into()),
+                    OffsetDateTime::now_utc(),
+                )
+                .await
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
     }
 
     /// `due` 只给没人领、到期了的。

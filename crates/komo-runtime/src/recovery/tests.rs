@@ -105,6 +105,151 @@ impl ExecutorLiveness for FakeLiveness {
     }
 }
 
+/// 一个会话读不出来的账本：除了那一个会话，其余一律照常。
+///
+/// 中间损坏、半行、已提交范围缺失——在这一层都长一个样：`read` 报
+/// [`LedgerError::Corrupt`]。
+struct PoisonedLedger {
+    inner: Arc<MemLedger>,
+    corrupt: SessionId,
+    /// 补记结果这一步也失败（例如冷进程里 attempt → session 的路由丢了）。
+    finish_fails: bool,
+}
+
+impl PoisonedLedger {
+    fn corrupting(inner: Arc<MemLedger>, corrupt: SessionId) -> Arc<Self> {
+        Arc::new(PoisonedLedger {
+            inner,
+            corrupt,
+            finish_fails: false,
+        })
+    }
+
+    /// 会话读得出来，但补记结果会失败。
+    fn unroutable(inner: Arc<MemLedger>) -> Arc<Self> {
+        Arc::new(PoisonedLedger {
+            inner,
+            corrupt: SessionId::from_raw("没有这个会话"),
+            finish_fails: true,
+        })
+    }
+}
+
+#[async_trait]
+impl Ledger for PoisonedLedger {
+    async fn accept_input(
+        &self,
+        input: AcceptInput,
+    ) -> Result<komo_kernel::types::turn::Accepted, LedgerError> {
+        self.inner.accept_input(input).await
+    }
+    async fn record_round(
+        &self,
+        run: &RunId,
+        round: AssistantRound,
+    ) -> Result<Vec<ToolCallId>, LedgerError> {
+        self.inner.record_round(run, round).await
+    }
+    async fn start_run(
+        &self,
+        run: &RunId,
+        executor: &ExecutorId,
+        generation: u64,
+    ) -> Result<(), LedgerError> {
+        self.inner.start_run(run, executor, generation).await
+    }
+    async fn plan_call(
+        &self,
+        call: &ToolCallId,
+        plan: &ExecutionPlan,
+    ) -> Result<komo_kernel::types::ids::EventId, LedgerError> {
+        self.inner.plan_call(call, plan).await
+    }
+    async fn start_call(
+        &self,
+        call: &ToolCallId,
+        plan: &ExecutionPlan,
+        grant: Option<komo_kernel::types::turn::GrantUse>,
+    ) -> Result<komo_kernel::types::ids::AttemptId, LedgerError> {
+        self.inner.start_call(call, plan, grant).await
+    }
+    async fn finish_call(
+        &self,
+        attempt: &komo_kernel::types::ids::AttemptId,
+        published: komo_kernel::types::refs::PublishedOutput,
+    ) -> Result<(), LedgerError> {
+        if self.finish_fails {
+            return Err(LedgerError::NotFound {
+                what: format!("尝试 {attempt} 属于哪个会话"),
+            });
+        }
+        self.inner.finish_call(attempt, published).await
+    }
+    async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError> {
+        self.inner.suspend(run, wait).await
+    }
+    async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError> {
+        self.inner.complete(run, end).await
+    }
+    async fn read(
+        &self,
+        session: &SessionId,
+        from: komo_kernel::types::ids::Seq,
+        limit: u32,
+    ) -> Result<komo_kernel::types::turn::EventBatch, LedgerError> {
+        if session == &self.corrupt {
+            return Err(LedgerError::Corrupt(format!(
+                "{session} 的 JSONL 中间缺了一段，seq 不连续"
+            )));
+        }
+        self.inner.read(session, from, limit).await
+    }
+    async fn boundary(
+        &self,
+        session: &SessionId,
+    ) -> Result<komo_kernel::types::ids::Seq, LedgerError> {
+        self.inner.boundary(session).await
+    }
+    async fn append_audit(
+        &self,
+        session: &SessionId,
+        event_id: &komo_kernel::types::ids::EventId,
+        payload: komo_kernel::events::EventPayload,
+        at: OffsetDateTime,
+    ) -> Result<komo_kernel::types::ids::Seq, LedgerError> {
+        self.inner
+            .append_audit(session, event_id, payload, at)
+            .await
+    }
+}
+
+/// 按 attempt 交出一份已经落盘的孤儿 `output.json`。
+#[derive(Debug, Default)]
+struct FoundOrphans {
+    found: Mutex<Vec<(AttemptRef, PublishedOutput)>>,
+}
+
+impl FoundOrphans {
+    fn with(attempt: AttemptRef, published: PublishedOutput) -> Arc<Self> {
+        Arc::new(FoundOrphans {
+            found: Mutex::new(vec![(attempt, published)]),
+        })
+    }
+}
+
+#[async_trait]
+impl OrphanOutputs for FoundOrphans {
+    async fn find(&self, attempt: &AttemptRef) -> Result<Option<PublishedOutput>, StoreError> {
+        Ok(self
+            .found
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(reference, _)| reference == attempt)
+            .map(|(_, published)| published.clone()))
+    }
+}
+
 /// 输出正文**丢了**（不是哈希不符）的存储。
 #[derive(Debug)]
 struct LostOutputs;
@@ -155,13 +300,18 @@ impl World {
 
     /// 输入落盘：`run.accepted` + `run.queued`。
     async fn accept(&self) -> RunId {
+        self.accept_in(&self.session, "api:1").await
+    }
+
+    /// 同上，但落在指定会话上。
+    async fn accept_in(&self, session: &SessionId, key: &str) -> RunId {
         self.ledger
             .accept_input(AcceptInput {
-                session: self.session.clone(),
-                request_key: RequestKey::new("api:1"),
+                session: session.clone(),
+                request_key: RequestKey::new(key),
                 text: "帮我看看".into(),
                 source: PlanSource::Interactive {
-                    session: self.session.clone(),
+                    session: session.clone(),
                 },
                 peer: None,
                 model: komo_kernel::test_support::sample_model(),
@@ -206,9 +356,13 @@ impl World {
     }
 
     fn run_row(&self, run: &RunId, status: RunStatus) -> UnfinishedRun {
+        self.run_row_in(run, &self.session, status)
+    }
+
+    fn run_row_in(&self, run: &RunId, session: &SessionId, status: RunStatus) -> UnfinishedRun {
         UnfinishedRun {
             run: run.clone(),
-            session: self.session.clone(),
+            session: session.clone(),
             status,
             claimed_by: None,
             retry: None,
@@ -232,6 +386,23 @@ impl World {
         rows: Vec<UnfinishedRun>,
         previous_stopped: bool,
     ) -> (RecoveryScan, Arc<MemIndex>) {
+        self.scan_full(
+            ledger,
+            outputs,
+            Arc::new(NoOrphanLookup),
+            rows,
+            previous_stopped,
+        )
+    }
+
+    fn scan_full(
+        &self,
+        ledger: Arc<dyn Ledger>,
+        outputs: Arc<dyn ToolOutputStore>,
+        orphans: Arc<dyn OrphanOutputs>,
+        rows: Vec<UnfinishedRun>,
+        previous_stopped: bool,
+    ) -> (RecoveryScan, Arc<MemIndex>) {
         let index = MemIndex::with(rows);
         let scan = RecoveryScan::new(
             ledger,
@@ -241,8 +412,38 @@ impl World {
             Arc::new(self.clock.clone()),
             ExecutorId::from_raw("exec-now"),
             Arc::new(FakeLiveness(previous_stopped)),
-        );
+        )
+        .with_orphan_outputs(orphans);
         (scan, index)
+    }
+
+    /// 为一次尝试真的发布一份 `output.json`。
+    async fn publish(
+        &self,
+        run: &RunId,
+        call: &ToolCallId,
+        attempt: &komo_kernel::types::ids::AttemptId,
+    ) -> PublishedOutput {
+        let reference = AttemptRef {
+            session: self.session.clone(),
+            run: run.clone(),
+            call: call.clone(),
+            attempt: attempt.clone(),
+        };
+        let writer = self.outputs.begin(&reference).await.unwrap();
+        self.outputs
+            .publish(
+                writer,
+                ToolResultBody {
+                    status: ToolResultStatus::Completed,
+                    result: serde_json::json!({ "stdout": "hi" }),
+                    error: None,
+                    exit_code: Some(0),
+                    artifacts: vec![],
+                },
+            )
+            .await
+            .unwrap()
     }
 }
 
@@ -872,4 +1073,290 @@ fn published_pointing_at(path: &str) -> komo_kernel::types::refs::PublishedOutpu
         stdout: None,
         stderr: None,
     }
+}
+
+// ---------------------------------------------------------------- 一个坏会话只停它自己
+
+/// §8.4「JSONL 已提交范围缺失或中间损坏 → 停止受影响会话，报告损坏」——**受影响的是
+/// 它自己**。一个读不出来的会话不能让别的 Run 少判一个。
+#[tokio::test]
+async fn a_corrupt_session_stops_itself_and_the_others_are_still_judged() {
+    let world = World::new();
+    let broken_session = SessionId::from_raw("01a0a414-7800-7bbd-8fa1-000000000001");
+    let healthy_session = SessionId::from_raw("01a0a414-7800-7bbd-8fa1-000000000002");
+
+    let broken = world.accept_in(&broken_session, "api:broken").await;
+    let healthy = world.accept_in(&healthy_session, "api:healthy").await;
+
+    let ledger = PoisonedLedger::corrupting(Arc::clone(&world.ledger), broken_session.clone());
+    let (scan, index) = world.scan_full(
+        ledger,
+        Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
+        Arc::new(NoOrphanLookup),
+        vec![
+            world.run_row_in(&broken, &broken_session, RunStatus::Interrupted),
+            world.run_row_in(&healthy, &healthy_session, RunStatus::Ingesting),
+        ],
+        true,
+    );
+
+    let report = scan.scan().await.unwrap();
+    assert_eq!(report.outcomes.len(), 2, "两个都判了：{report:?}");
+
+    // 坏的：停下来，原因看得见。
+    let stopped = &report.outcomes[0];
+    assert_eq!(stopped.run, broken);
+    assert!(
+        matches!(stopped.action, RecoveryAction::HaltCorrupt { .. }),
+        "{stopped:?}"
+    );
+    assert_eq!(stopped.applied, Applied::NeedsOperator);
+    let (run, reason) = index.attention()[0].clone();
+    assert_eq!(run, broken);
+    assert!(reason.contains("读不出来"), "原因要说得出是什么：{reason}");
+    assert_eq!(report.corrupt().len(), 1);
+    assert!(
+        report.summary().contains("因损坏已停止"),
+        "{}",
+        report.summary()
+    );
+
+    // 好的：照常判、照常入队。
+    let ok = &report.outcomes[1];
+    assert_eq!(ok.run, healthy);
+    assert_eq!(ok.action, RecoveryAction::BackfillIndexAndQueue);
+    assert_eq!(index.requeued(), vec![healthy], "其他 Session 正常运行");
+}
+
+/// 坏会话排在最后也一样——它不能把已经判完的那些带走，也不能让扫描本身失败。
+#[tokio::test]
+async fn a_corrupt_session_never_fails_the_whole_scan() {
+    let world = World::new();
+    let broken_session = SessionId::from_raw("01a0a414-7800-7bbd-8fa1-000000000003");
+    let healthy = world.accept().await;
+    let broken = world.accept_in(&broken_session, "api:broken").await;
+
+    let ledger = PoisonedLedger::corrupting(Arc::clone(&world.ledger), broken_session.clone());
+    let (scan, index) = world.scan_full(
+        ledger,
+        Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
+        Arc::new(NoOrphanLookup),
+        vec![
+            world.run_row(&healthy, RunStatus::Ingesting),
+            world.run_row_in(&broken, &broken_session, RunStatus::Running),
+        ],
+        true,
+    );
+
+    let report = scan.scan().await.expect("一个坏会话不该让整轮扫描失败");
+    assert_eq!(report.requeued(), 1);
+    assert_eq!(report.corrupt().len(), 1);
+    assert_eq!(index.requeued(), vec![healthy]);
+}
+
+// ---------------------------------------------------------------- 孤儿输出
+
+/// §14 故障注入表：「output.json 已完成但 JSONL 结果事件尚未写入 → 校验身份、计划及
+/// 完成状态后补记结果；不能只凭文件存在判断」。
+#[tokio::test]
+async fn an_orphan_output_is_verified_and_its_result_is_backfilled() {
+    let world = World::new();
+    let run = world.accept().await;
+    let calls = world.round(&run, &["call-1"]).await;
+    let plan = world.plan(&calls[0]);
+    world.ledger.plan_call(&calls[0], &plan).await.unwrap();
+    let attempt = world
+        .ledger
+        .start_call(&calls[0], &plan, None)
+        .await
+        .unwrap();
+    // 工具跑完了，output.json 完整落盘——**但 tool.result 没写就崩了**。
+    let published = world.publish(&run, &calls[0], &attempt).await;
+    assert!(tool_results(&world).is_empty(), "结果事件尚未写入");
+
+    let orphans = FoundOrphans::with(
+        AttemptRef {
+            session: world.session.clone(),
+            run: run.clone(),
+            call: calls[0].clone(),
+            attempt: attempt.clone(),
+        },
+        published.clone(),
+    );
+    let (scan, index) = world.scan_full(
+        Arc::clone(&world.ledger) as Arc<dyn Ledger>,
+        Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
+        orphans,
+        vec![world.run_row(&run, RunStatus::Interrupted)],
+        true,
+    );
+
+    let report = scan.scan().await.unwrap();
+    assert_eq!(
+        report.outcomes[0].action,
+        RecoveryAction::VerifyEffect {
+            call: calls[0].clone()
+        },
+        "核对，而不是当它没发生过"
+    );
+    assert_eq!(report.outcomes[0].applied, Applied::Requeued);
+
+    // 账本里补上了**那次尝试**的结果，用的是**原来那份输出**。
+    let results = tool_results(&world);
+    assert_eq!(results.len(), 1, "补记了一条结果");
+    assert_eq!(results[0].attempt_id, attempt, "补记的是原来那次尝试");
+    assert_eq!(results[0].call_id, calls[0]);
+    assert_eq!(
+        results[0].output_ref.0.path, published.output.0.path,
+        "复用已经完整落盘的那份输出"
+    );
+    // 工具没重跑：还是只有一条 tool.started。
+    assert_eq!(tool_started_count(&world), 1, "不重跑");
+    assert_eq!(index.requeued(), vec![run]);
+}
+
+/// 「不能只凭文件存在判断」：身份对不上的那份输出是损坏，不是证据。
+#[tokio::test]
+async fn an_output_from_another_attempt_is_corruption_not_evidence() {
+    let world = World::new();
+    let run = world.accept().await;
+    let calls = world.round(&run, &["call-1"]).await;
+    let plan = world.plan(&calls[0]);
+    world.ledger.plan_call(&calls[0], &plan).await.unwrap();
+    let attempt = world
+        .ledger
+        .start_call(&calls[0], &plan, None)
+        .await
+        .unwrap();
+
+    // 查到的那份 output.json 属于**另一次尝试**。
+    let stranger = komo_kernel::types::ids::AttemptId::from_raw("attempt-from-another-life");
+    let published = world.publish(&run, &calls[0], &stranger).await;
+    let orphans = FoundOrphans::with(
+        AttemptRef {
+            session: world.session.clone(),
+            run: run.clone(),
+            call: calls[0].clone(),
+            attempt: attempt.clone(),
+        },
+        published,
+    );
+
+    let (scan, index) = world.scan_full(
+        Arc::clone(&world.ledger) as Arc<dyn Ledger>,
+        Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
+        orphans,
+        vec![world.run_row(&run, RunStatus::Interrupted)],
+        true,
+    );
+
+    let report = scan.scan().await.unwrap();
+    assert!(
+        matches!(
+            report.outcomes[0].action,
+            RecoveryAction::HaltCorrupt { .. }
+        ),
+        "{:?}",
+        report.outcomes[0]
+    );
+    assert!(tool_results(&world).is_empty(), "不补记来路不明的结果");
+    assert!(index.requeued().is_empty());
+}
+
+/// 没有孤儿输出时照旧：交给 AgentLoop 去调工具自己的 `verify`（§8.4 第 7 行）。
+#[tokio::test]
+async fn without_an_orphan_output_the_call_still_goes_to_the_tools_own_verify() {
+    let world = World::new();
+    let run = world.accept().await;
+    let calls = world.round(&run, &["call-1"]).await;
+    let plan = world.plan(&calls[0]);
+    world.ledger.plan_call(&calls[0], &plan).await.unwrap();
+    world
+        .ledger
+        .start_call(&calls[0], &plan, None)
+        .await
+        .unwrap();
+
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::Interrupted)]);
+    let report = scan.scan().await.unwrap();
+
+    assert_eq!(
+        report.outcomes[0].action,
+        RecoveryAction::VerifyEffect {
+            call: calls[0].clone()
+        }
+    );
+    assert!(tool_results(&world).is_empty(), "没有证据就不补记");
+    assert_eq!(index.requeued(), vec![run]);
+}
+
+fn tool_results(world: &World) -> Vec<komo_kernel::events::ToolResult> {
+    world
+        .ledger
+        .events()
+        .into_iter()
+        .filter_map(|event| match event.payload {
+            komo_kernel::events::EventPayload::ToolResult(result) => Some(result),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_started_count(world: &World) -> usize {
+    world
+        .ledger
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.payload,
+                komo_kernel::events::EventPayload::ToolStarted(_)
+            )
+        })
+        .count()
+}
+
+/// 找到了完整的输出、却补记不进账本（冷进程里 attempt → session 的路由丢了）：**退回
+/// 工具核对**，而且这一轮扫描照常走完——别的 Run 还等着判。
+#[tokio::test]
+async fn a_backfill_that_cannot_be_written_falls_back_to_the_tools_verify() {
+    let world = World::new();
+    let run = world.accept().await;
+    let calls = world.round(&run, &["call-1"]).await;
+    let plan = world.plan(&calls[0]);
+    world.ledger.plan_call(&calls[0], &plan).await.unwrap();
+    let attempt = world
+        .ledger
+        .start_call(&calls[0], &plan, None)
+        .await
+        .unwrap();
+    let published = world.publish(&run, &calls[0], &attempt).await;
+
+    let orphans = FoundOrphans::with(
+        AttemptRef {
+            session: world.session.clone(),
+            run: run.clone(),
+            call: calls[0].clone(),
+            attempt: attempt.clone(),
+        },
+        published,
+    );
+    let (scan, index) = world.scan_full(
+        PoisonedLedger::unroutable(Arc::clone(&world.ledger)),
+        Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
+        orphans,
+        vec![world.run_row(&run, RunStatus::Interrupted)],
+        true,
+    );
+
+    let report = scan.scan().await.expect("补记失败不该让整轮扫描失败");
+    assert_eq!(
+        report.outcomes[0].action,
+        RecoveryAction::VerifyEffect {
+            call: calls[0].clone()
+        }
+    );
+    assert_eq!(report.outcomes[0].applied, Applied::Requeued, "照常接着跑");
+    assert!(tool_results(&world).is_empty(), "没补上就是没补上，不假装");
+    assert_eq!(index.requeued(), vec![run]);
 }

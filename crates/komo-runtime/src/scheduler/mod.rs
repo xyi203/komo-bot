@@ -37,12 +37,37 @@ pub trait RunHandler: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HandlerError {
+    /// 这一次没跑成，但**再领一次是有意义的**（临时故障、装配失败一类）。调度器交还
+    /// 领取权。
     #[error("{0}")]
     Failed(String),
+    /// handler 已经把这个 Run 停在一个不该再被领取的状态上（`needs_attention`、终态、
+    /// 或者它自己写了挂起）。**不要交还领取权**。
+    ///
+    /// 它存在的理由是实测出来的：一个中间损坏的会话装配不出上下文，handler 每次都失败，
+    /// 而交还领取权等于让它立刻被再领一次——"领取 → 装配失败 → 交还"在两秒里能转几十
+    /// 圈，既不前进也不停下。停止受影响任务是 §8.4 的要求，停止的做法就是**不要放回去**。
+    #[error("已停止：{reason}")]
+    Stopped { reason: String },
     #[error(transparent)]
     Ledger(#[from] LedgerError),
     #[error(transparent)]
     Store(#[from] StoreError),
+}
+
+impl HandlerError {
+    /// 出了这个错之后，这个 Run 该不该回到队列里等下一次领取。
+    ///
+    /// 两种情况**不该**：handler 说它已经停了（[`HandlerError::Stopped`]），以及账本
+    /// 报损坏——一个读不出来的会话下一次照样读不出来，放回去只是空转。
+    pub fn returns_to_queue(&self) -> bool {
+        !matches!(
+            self,
+            HandlerError::Stopped { .. }
+                | HandlerError::Ledger(LedgerError::Corrupt(_))
+                | HandlerError::Store(StoreError::Corrupt(_))
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -149,11 +174,22 @@ impl Scheduler {
                 let run = claimed.run.clone();
                 let result = handler.run(claimed.clone()).await;
                 if let Err(error) = result {
-                    // 交还名额，让它能被再领一次。**这不是"重试这次执行"**——账本上的
-                    // 状态由 handler 自己写，这里只把领取权还回去。
-                    tracing::warn!(run = %run, error = %error, "Run 执行失败，交还领取权");
-                    if let Err(error) = queue.release(&claimed).await {
-                        tracing::error!(run = %run, error = %error, "交还领取权失败");
+                    if error.returns_to_queue() {
+                        // 交还名额，让它能被再领一次。**这不是"重试这次执行"**——账本上
+                        // 的状态由 handler 自己写，这里只把领取权还回去。
+                        tracing::warn!(run = %run, error = %error, "Run 执行失败，交还领取权");
+                        if let Err(error) = queue.release(&claimed).await {
+                            tracing::error!(run = %run, error = %error, "交还领取权失败");
+                        }
+                    } else {
+                        // handler 说它已经停了（或者会话本身损坏）：**不放回队列**，
+                        // 否则就是"领取 → 失败 → 交还"的空转。停止这个任务的账本状态
+                        // 由 handler 负责写（`needs_attention`）。
+                        tracing::error!(
+                            run = %run,
+                            error = %error,
+                            "Run 已停止，不交还领取权——状态由 handler 自己写"
+                        );
                     }
                 }
                 drop(permit);
@@ -215,6 +251,8 @@ mod tests {
     struct Recorder {
         state: Mutex<RecorderState>,
         fail_once: Mutex<Vec<RunId>>,
+        /// 这些 Run 每次都以"已停止"收场——调度器不该再把它们放回队列。
+        stop: Mutex<Vec<RunId>>,
         hold: Duration,
     }
 
@@ -259,6 +297,11 @@ mod tests {
             tokio::time::sleep(self.hold).await;
             self.state.lock().unwrap().running -= 1;
 
+            if self.stop.lock().unwrap().contains(&claimed.run) {
+                return Err(HandlerError::Stopped {
+                    reason: "会话损坏，已标成 needs_attention".into(),
+                });
+            }
             let mut failures = self.fail_once.lock().unwrap();
             if let Some(at) = failures.iter().position(|run| run == &claimed.run) {
                 failures.remove(at);
@@ -368,6 +411,41 @@ mod tests {
         scheduler.run_once().await.unwrap();
         assert_eq!(queue.depth(), 0, "第二次成功");
         assert_eq!(handler.seen().len(), 2);
+    }
+
+    /// handler 说它已经停了 → **不交还领取权**，否则就是"领取 → 失败 → 交还"的空转。
+    #[tokio::test]
+    async fn a_stopped_run_is_not_put_back_in_the_queue() {
+        let queue = Arc::new(MemRunQueue::new());
+        let run = RunId::from_raw("run-broken");
+        queue.enqueue(run.clone());
+        let handler = Recorder::new(Duration::from_millis(1));
+        handler.stop.lock().unwrap().push(run.clone());
+
+        let scheduler = scheduler(Arc::clone(&queue), Arc::clone(&handler), 1);
+        scheduler.run_once().await.unwrap();
+        assert_eq!(queue.depth(), 0, "停了就是停了，不放回队列");
+
+        // 再扫一轮：没有东西可领，也就不会有第二次交出去。
+        scheduler.run_once().await.unwrap();
+        assert_eq!(handler.seen().len(), 1, "不空转");
+    }
+
+    /// 账本报损坏同理：下一次照样读不出来。
+    #[test]
+    fn a_corrupt_ledger_error_never_returns_to_the_queue() {
+        assert!(!HandlerError::Ledger(LedgerError::Corrupt("半行".into())).returns_to_queue());
+        assert!(
+            !HandlerError::Stopped {
+                reason: "已停止".into()
+            }
+            .returns_to_queue()
+        );
+        assert!(HandlerError::Failed("临时".into()).returns_to_queue());
+        assert!(
+            HandlerError::Ledger(LedgerError::Contended).returns_to_queue(),
+            "写入争用下一次可能就成了"
+        );
     }
 
     #[tokio::test]

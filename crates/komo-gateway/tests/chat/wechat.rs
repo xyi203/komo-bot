@@ -7,10 +7,10 @@ use komo_gateway::channels::ChannelSender;
 use komo_kernel::traits::Channel;
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, DeliveryState};
 
-use crate::fake_wechat::{Behavior, FakeILink, text_wire};
 use crate::harness::{
     FixedFactory, GatewayBuilder, TestGateway, config_toml, eventually, wechat_block,
 };
+use komo_gateway::channels::wechat::fake::{Behavior, FakeILink, text_wire};
 
 struct Wired {
     gateway: TestGateway,
@@ -20,7 +20,8 @@ struct Wired {
 async fn wire(behavior: Behavior, msgs: Vec<wechatbot::types::WireMessage>) -> Wired {
     crate::harness::install_crypto();
     let fake = Arc::new(FakeILink::start_with(behavior, msgs).await);
-    let channel = fake.channel();
+    // 渠道自带的假 iLink 交出的是一个 `WeChatChannel`；这里包一层 `Arc` 共用给收发两半。
+    let channel = Arc::new(fake.channel());
     let sender = channel.sender() as Arc<dyn ChannelSender>;
     let factory = FixedFactory::new(
         ChannelPlatform::Wechat,

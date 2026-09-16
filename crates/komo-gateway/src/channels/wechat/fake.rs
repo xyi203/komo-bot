@@ -207,6 +207,27 @@ impl FakeILink {
         WeChatChannel::with_credentials(&self.credentials(), Default::default())
     }
 
+    /// 之后再塞一条入站消息（"用户又说话了"）。
+    pub fn push(&self, wire: &WireMessage) {
+        self.state
+            .msgs
+            .lock()
+            .expect("消息")
+            .push(serde_json::to_value(wire).expect("WireMessage 可序列化"));
+    }
+
+    /// 真的发出去的每一段文本，按顺序。
+    pub fn sent_texts(&self) -> Vec<String> {
+        self.calls_to("/ilink/bot/sendmessage")
+            .into_iter()
+            .filter_map(|body| {
+                body.pointer("/msg/item_list/0/text_item/text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
     /// 打到某个 endpoint 的请求体（GET 则是它的查询串）。
     pub fn calls_to(&self, endpoint: &str) -> Vec<Value> {
         self.state
@@ -263,17 +284,16 @@ async fn handle(
                     }],
                 }));
             }
-            let msgs = state.msgs.lock().expect("消息").clone();
+            let mut msgs = state.msgs.lock().expect("消息");
             if state.behavior.replay {
                 // 回了消息却回空游标：SDK 不推进游标，下一轮原样再来一次。
-                return Json(json!({ "ret": 0, "get_updates_buf": "", "msgs": msgs }));
+                return Json(json!({ "ret": 0, "get_updates_buf": "", "msgs": msgs.clone() }));
             }
-            let cursor = parsed["get_updates_buf"].as_str().unwrap_or_default();
-            if cursor.is_empty() {
-                Json(json!({ "ret": 0, "get_updates_buf": "c1", "msgs": msgs }))
-            } else {
-                Json(json!({ "ret": 0, "get_updates_buf": "c1", "msgs": [] }))
-            }
+            // 正常的一次拉取：把**还没交过的**都交出去，游标推进。用"交过就出队"而不是
+            // "按游标只给第一批"，`push` 才能表达"用户后来又说了一句"——测试里的积压冲刷
+            // 与被拒者的 `/id` 都是这么发生的。
+            let batch: Vec<Value> = std::mem::take(&mut *msgs);
+            Json(json!({ "ret": 0, "get_updates_buf": "c1", "msgs": batch }))
         }
         "/ilink/bot/sendmessage" => {
             if state.behavior.refuse_sends {

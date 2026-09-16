@@ -10,8 +10,8 @@ use komo_kernel::types::chat::{ApprovalScope, ChannelPeer, ChannelPlatform};
 use komo_gateway::channels::ChannelSender;
 use komo_gateway::channels::telegram::TelegramChannel;
 
-use crate::fake_telegram::{Behavior, FakeBotApi, callback_update, text_update};
 use crate::harness::{FixedFactory, GatewayBuilder, TestGateway, eventually, telegram_config};
+use komo_gateway::channels::telegram::fake::{Behavior, FakeBotApi, callback_update, text_update};
 
 /// 一台起着的 Gateway + 它背后的假 Bot API。渠道是**真的**：`TelegramChannel::serve`
 /// 在长轮询，回执与主动投递都真的发到假服务端上。
@@ -162,7 +162,6 @@ fn replies(fake: &FakeBotApi, short: &komo_kernel::types::ids::ShortId) -> Vec<S
 // 一条已决定的），`Dispatcher::decide` 用它；查到的那条带着 `decision` 就直接回原决定。
 // 安全性今天没有丢（账本上只有一个决定），丢的是"第二次点击得到的是一句准确的话"。
 #[tokio::test]
-#[ignore = "BUG(1)：连点第二次得到的是「没有这条待处理的审批」而不是原决定"]
 async fn two_clicks_and_the_second_is_told_it_was_decided() {
     let wired = wire(Behavior::default(), Vec::new()).await;
     let record = wired.gateway.pending_approval().await;
@@ -195,41 +194,6 @@ async fn two_clicks_and_the_second_is_told_it_was_decided() {
     );
     // `answerCallbackQuery` 两次都调了——不调客户端会一直转圈。
     assert_eq!(wired.fake.calls_to("answerCallbackQuery").len(), 2);
-}
-
-/// 上一条的"现状"版本，**常开**：它把今天真实的行为钉住，好让修复一眼看得见回归。
-#[tokio::test]
-async fn today_the_second_click_is_told_the_approval_does_not_exist() {
-    let wired = wire(Behavior::default(), Vec::new()).await;
-    let record = wired.gateway.pending_approval().await;
-    let data = komo_gateway::render::telegram::callback_data(true, &record.short_id);
-
-    wired.fake.push(callback_update(45, 111, 111, &data));
-    wired.fake.push(callback_update(46, 111, 111, &data));
-
-    let fake = Arc::clone(&wired.fake);
-    eventually("两次点击都答了", move || {
-        fake.texts_to("111").len() >= 3
-    })
-    .await;
-
-    let texts = wired.fake.texts_to("111");
-    assert!(
-        texts
-            .iter()
-            .any(|text| text.contains("没有这条待处理的审批")),
-        "见 BUG(1)：{texts:?}"
-    );
-    // 安全性没有丢：账本上仍然只有一个决定。
-    let stored = wired
-        .gateway
-        .state()
-        .approval_repo
-        .get(&record.approval)
-        .await
-        .expect("读得到")
-        .expect("有这条");
-    assert!(stored.decision.expect("有结论").approved);
 }
 
 /// 验证列④：决定后消息原地更新（按钮被去掉）。
@@ -304,7 +268,10 @@ async fn a_group_message_only_counts_when_it_names_the_bot() {
         222,
         "supergroup",
         111,
-        &format!("@{} 看一下日志", crate::fake_telegram::BOT_USERNAME),
+        &format!(
+            "@{} 看一下日志",
+            komo_gateway::channels::telegram::fake::BOT_USERNAME
+        ),
     ));
 
     let gateway_sessions = || async {
@@ -347,7 +314,10 @@ async fn a_group_outside_the_list_is_ignored_even_when_it_names_the_bot() {
             333,
             "supergroup",
             111,
-            &format!("@{} 在吗", crate::fake_telegram::BOT_USERNAME),
+            &format!(
+                "@{} 在吗",
+                komo_gateway::channels::telegram::fake::BOT_USERNAME
+            ),
         )],
     )
     .await;
@@ -402,7 +372,6 @@ async fn the_command_table_answers_every_command() {
 // 222 的那条消息永远留着两个可点的按钮。再点一次得到的是「已决定」（幂等兜住了安全
 // 性），但界面与文档不符。
 #[tokio::test]
-#[ignore = "BUG(2)：来源会话的消息在别处做出决定后不会被原地更新"]
 async fn a_decision_updates_the_source_chat_too() {
     let wired = wire(Behavior::default(), Vec::new()).await;
     let record = wired.gateway.pending_approval().await;

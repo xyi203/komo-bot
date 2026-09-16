@@ -329,9 +329,15 @@ async fn row_5_a_started_call_is_verified_rather_than_assumed() {
 /// 第 6 行：**外部写入成功，完整输出与结果事件尚未持久保存** → 借助可靠幂等或关联信息
 /// 核对；没有证据则等待处理，**不产生第二条记录**。
 ///
-/// 注入：`shell` 真的跑完（计数文件里多了一行），`finish_call` 之前跳闸。`shell` 的恢复
-/// 方式是 `NoSafeRecovery`、`verify` 是 `Unavailable`——没有证据，所以恢复必须停在
-/// needs_attention，而不是再跑一次命令。
+/// 这一行的分界在 `ToolOutputStore::publish` 上：外部副作用已经发生，**输出还没落盘**。
+/// 落盘之后再中断是第 8 行（那时盘上有一份身份齐全的 `output.json`，补记结果才是对的）。
+///
+/// 注入两步：① `finish_call` 之前跳闸——`shell` 真的跑完，计数文件多了一行；② 停机之后
+/// 把这次尝试的输出目录整棵删掉，等价于 `publish` 从未发生（故障装饰器包的是 `Ledger`，
+/// 包不到 `ToolOutputStore`，所以这一刀走"直接篡改磁盘"那条注入路）。
+///
+/// 于是恢复手上**一点证据都没有**：`shell` 的恢复方式是 `NoSafeRecovery`、`verify` 是
+/// `Unavailable`，只能停在 needs_attention，而不是再跑一次命令。
 #[tokio::test]
 async fn row_6_an_external_write_without_evidence_waits_instead_of_writing_twice() {
     let home = Home::new();
@@ -351,8 +357,16 @@ async fn row_6_an_external_write_without_evidence_waits_instead_of_writing_twice
     gw.stop().await;
     assert_eq!(counter.count(), 1, "外部写入成功了一次");
     let events = home.events(&session);
+    let started = tool_started(&events)[0].clone();
     assert_eq!(tool_started(&events).len(), 1);
     assert!(tool_results(&events).is_empty(), "结果事件尚未持久保存");
+
+    // ② 输出也没落盘。
+    home.drop_attempt_output(&session, &run, &started);
+    assert!(
+        !home.attempt_dir(&session, &run, &started).exists(),
+        "完整输出尚未持久保存"
+    );
 
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
@@ -369,6 +383,25 @@ async fn row_6_an_external_write_without_evidence_waits_instead_of_writing_twice
         "没有核对证据就等人处理，而不是重跑或宣布失败：{detail:?}"
     );
     assert_eq!(counter.count(), 1, "**不产生第二条记录**");
+
+    // 那条上一世的 `tool.started` 要配一条**明确的 uncertain**，不能悬着（§14 事件配对）。
+    let events = home.events(&session);
+    assert_eq!(tool_started(&events).len(), 1, "没有第二次尝试");
+    assert!(
+        unpaired_attempts(&events).is_empty(),
+        "没配上的尝试：{:?}",
+        unpaired_attempts(&events)
+    );
+    assert_eq!(
+        result_statuses(&events),
+        vec![komo_kernel::types::refs::ToolResultStatus::Uncertain],
+        "副作用发生没发生不知道——这就是 uncertain 的意思（§8.6）"
+    );
+    assert_eq!(
+        tool_results(&events)[0].attempt_id,
+        started.attempt_id,
+        "配的是**那一次**尝试"
+    );
     gw.stop().await;
 }
 

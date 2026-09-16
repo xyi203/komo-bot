@@ -287,8 +287,8 @@ fn token(secrets: &Secrets, var: &str, channel: &str) -> Result<String, ChannelE
         })
 }
 
-#[cfg(test)]
-pub(crate) mod test_channel {
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_channel {
     //! 内存渠道：集成测试的收发两半。
 
     use super::*;

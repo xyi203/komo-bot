@@ -178,6 +178,20 @@ impl FakeBotApi {
             .collect()
     }
 
+    /// 往队列里再放一条 update（测试运行中"平台又来了一条"）。
+    pub fn push(&self, update: Value) {
+        self.state.updates.lock().expect("update 队列").push(update);
+    }
+
+    /// 发给某个会话的每一段文本，按顺序。
+    pub fn texts_to(&self, chat_id: &str) -> Vec<String> {
+        self.calls_to("sendMessage")
+            .into_iter()
+            .filter(|body| body["chat_id"] == chat_id)
+            .filter_map(|body| body["text"].as_str().map(str::to_string))
+            .collect()
+    }
+
     /// 每次 `getUpdates` 带的 `offset`（没带的是 `None`）。
     pub fn polled_offsets(&self) -> Vec<Option<i64>> {
         self.calls_to("getUpdates")

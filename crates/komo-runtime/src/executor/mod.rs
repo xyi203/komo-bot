@@ -286,32 +286,68 @@ impl ToolExecutor {
                     // 确定未执行且前提仍成立：可以重新执行同一原子修改。
                     state.verification = Some(verdict);
                 }
-                Ok(Verification::AlreadySatisfied { evidence }) => {
+                Ok(verdict @ Verification::AlreadySatisfied { .. }) => {
                     // 目标已满足**不等于**又做了一次：报告核对结论，不重跑。
+                    let summary =
+                        format!("核对后目标已满足，未重新执行：{}", evidence_of(&verdict));
+                    self.settle_verified(
+                        &request,
+                        env,
+                        state.previous_attempt.as_ref(),
+                        ToolResultStatus::Completed,
+                        &verdict,
+                        &summary,
+                    )
+                    .await?;
                     return Ok(CallSettlement::Result(ToolResultForModel {
                         provider_call_id: request.provider_call_id.clone(),
                         call_id: request.call.clone(),
-                        content: format!("核对后目标已满足，未重新执行：{evidence}"),
+                        content: summary,
                         is_error: false,
                     }));
                 }
-                Ok(Verification::Conflict { evidence }) => {
-                    return Ok(self.attention(&request, format!("核对发现冲突：{evidence}")));
-                }
-                Ok(Verification::Unknown { reason }) => {
-                    return Ok(self.attention(&request, format!("核对不出结论：{reason}")));
-                }
-                Ok(Verification::Unavailable) => {
-                    return Ok(self.attention(
-                        &request,
-                        format!(
+                // 冲突 / 不出结论 / 没有核对方式：**副作用发生没发生不知道**。那条
+                // 上一世的 `tool.started` 要配一条明确的 uncertain，然后交给人。
+                Ok(verdict) => {
+                    let summary = match &verdict {
+                        Verification::Conflict { evidence } => {
+                            format!("核对发现冲突：{evidence}")
+                        }
+                        Verification::Unknown { reason } => format!("核对不出结论：{reason}"),
+                        Verification::Unavailable => format!(
                             "{} 没有可用的核对方式，不能判断上一次是否已经生效",
                             request.tool
                         ),
-                    ));
+                        // NotPerformed 与 AlreadySatisfied 在上面两个分支里已经答过。
+                        other => format!("核对结论：{other:?}"),
+                    };
+                    self.settle_verified(
+                        &request,
+                        env,
+                        state.previous_attempt.as_ref(),
+                        ToolResultStatus::Uncertain,
+                        &verdict,
+                        &summary,
+                    )
+                    .await?;
+                    return Ok(self.attention(&request, summary));
                 }
                 Err(error) => {
-                    return Ok(self.attention(&request, format!("核对失败：{error}")));
+                    // 核对本身跑不起来也是"不知道"，同样不能让 started 悬着。
+                    let summary = format!("核对失败：{error}");
+                    let verdict = Verification::Unknown {
+                        reason: error.to_string(),
+                    };
+                    self.settle_verified(
+                        &request,
+                        env,
+                        state.previous_attempt.as_ref(),
+                        ToolResultStatus::Uncertain,
+                        &verdict,
+                        &summary,
+                    )
+                    .await?;
+                    return Ok(self.attention(&request, summary));
                 }
             }
         }
@@ -408,6 +444,47 @@ impl ToolExecutor {
             }),
             _ => Ok(CallSettlement::Result(result)),
         }
+    }
+
+    /// 为**上一世那次尝试**落一条结果。
+    ///
+    /// §14 的目录验收要求「每个 `tool.started` 都要配一个结果或一条明确的 uncertain」。
+    /// 恢复时 `verify` 给出的结论就是那次尝试的结果——不写下来，那条 started 会永远悬
+    /// 着，而"悬着的 started"正是下一次恢复扫描还要再核对一遍的东西：同一次副作用会
+    /// 被反复追问，却永远不落账。
+    ///
+    /// `previous` 为 `None` = 只 planned 过、一次尝试都没有，没有东西要收尾。
+    async fn settle_verified(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        previous: Option<&AttemptId>,
+        status: ToolResultStatus,
+        verdict: &Verification,
+        summary: &str,
+    ) -> Result<(), ExecError> {
+        let Some(previous) = previous else {
+            return Ok(());
+        };
+        let attempt_ref = AttemptRef {
+            session: env.session.clone(),
+            run: env.run.clone(),
+            call: request.call.clone(),
+            attempt: previous.clone(),
+        };
+        let writer = self.outputs.begin(&attempt_ref).await?;
+        let body = ToolResultBody {
+            status,
+            result: serde_json::to_value(verdict).unwrap_or(serde_json::Value::Null),
+            error: (status != ToolResultStatus::Completed).then(|| summary.to_string()),
+            exit_code: None,
+            artifacts: vec![],
+        };
+        let mut published = self.outputs.publish(writer, body).await?;
+        // `elapsed_ms` 留 0：那次尝试跑了多久**我们不知道**，0 读作未知而不是"瞬间"。
+        published.preview = Some(truncate(summary, PREVIEW_LIMIT_BYTES));
+        self.ledger.finish_call(previous, published).await?;
+        Ok(())
     }
 
     /// 放行梯子。Deny 分支里**没有任何一次 `consume`**。
@@ -655,6 +732,17 @@ fn truncate(text: &str, limit: usize) -> String {
         cut -= 1;
     }
     format!("{}{marker}", &text[..cut])
+}
+
+/// 核对结论里那句证据。
+fn evidence_of(verdict: &Verification) -> &str {
+    match verdict {
+        Verification::AlreadySatisfied { evidence }
+        | Verification::NotPerformed { evidence }
+        | Verification::Conflict { evidence } => evidence,
+        Verification::Unknown { reason } => reason,
+        Verification::Unavailable => "没有可用的核对方式",
+    }
 }
 
 fn error_result(request: &CallRequest, message: String) -> ToolResultForModel {

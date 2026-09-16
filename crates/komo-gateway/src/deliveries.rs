@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use komo_kernel::traits::{Clock, DeliverError};
-use komo_kernel::types::chat::{ChannelPeer, Delivery, DeliveryState, DeliveryTarget, Outbound};
+use komo_kernel::types::chat::{
+    ChannelPeer, ChannelPlatform, Delivery, DeliveryState, DeliveryTarget, Outbound,
+};
 use komo_kernel::types::ids::DeliveryId;
 use komo_store::{DeliveryRecord, TursoDeliveryRepo};
 
@@ -120,6 +122,34 @@ impl DeliveryLog {
             .pending(peer)
             .await
             .map_err(|error| DeliverError::Persist(error.to_string()))
+    }
+
+    /// 冲刷**一个平台**名下的 pending。渠道刚登记完发送口时走它。
+    pub async fn flush_platform(&self, platform: ChannelPlatform) -> usize {
+        let pending = match self.pending(None).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%error, "读不出待补发的投递");
+                return 0;
+            }
+        };
+        let mut sent = 0;
+        for record in pending
+            .into_iter()
+            .filter(|record| record.target.peer.platform == platform)
+        {
+            match self.send_recorded(&record).await {
+                Ok(Delivery {
+                    state: DeliveryState::Sent,
+                    ..
+                }) => sent += 1,
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(delivery = %record.id, %error, "补发失败，留在 pending");
+                }
+            }
+        }
+        sent
     }
 
     /// 冲刷：pending 的行逐条再发一次。返回这次送出去了几条。

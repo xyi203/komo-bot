@@ -19,7 +19,7 @@ pub mod api;
 pub mod inbound;
 pub mod send;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 
 use std::sync::Arc;
@@ -104,8 +104,9 @@ impl TelegramChannel {
         &self.config
     }
 
-    #[cfg(test)]
-    fn tuned(mut self, poll_timeout_secs: u64, idle_floor: Duration) -> Self {
+    /// 把轮询节奏调快，给测试用。
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tuned(mut self, poll_timeout_secs: u64, idle_floor: Duration) -> Self {
         self.poll_timeout_secs = poll_timeout_secs;
         self.idle_floor = idle_floor;
         self.retry_base = Duration::from_millis(20);

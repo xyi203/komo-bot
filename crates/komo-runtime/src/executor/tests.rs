@@ -13,7 +13,23 @@ use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::tool::{CancelToken, ToolError, ToolOutput};
 
 use super::harness::{Harness, RecordingTool};
-use super::{RoundStop, resumed_from};
+use super::{CallRequest, RoundStop, resumed_from};
+
+/// 这个调用现在这一刻的计划——`crashed_attempt` 要用它写 `tool.planned`。
+async fn plan_of(
+    tool: &dyn Tool,
+    harness: &Harness,
+    session: &komo_kernel::types::ids::SessionId,
+    run: &komo_kernel::types::ids::RunId,
+    request: &CallRequest,
+) -> komo_kernel::types::plan::ExecutionPlan {
+    tool.prepare(
+        request.arguments.clone(),
+        &harness.tool_context(session, run, &request.call),
+    )
+    .await
+    .expect("现做一份计划")
+}
 use crate::policy::PolicyEngine;
 use crate::tools::{ReadTool, WriteTool};
 
@@ -302,9 +318,15 @@ async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
     let mut calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
         .await;
+    let previous = harness
+        .crashed_attempt(
+            &calls[0].call,
+            &plan_of(&*tool, &harness, &session, &run, &calls[0]).await,
+        )
+        .await;
     calls[0].resumed = Some(resumed_from(
         ToolCallState::Started,
-        Some(AttemptId::from_raw("attempt-1")),
+        Some(previous.clone()),
         1,
     ));
 
@@ -319,6 +341,15 @@ async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
         panic!("{:?}", outcome.stop)
     };
     assert!(reason.contains("核对不出结论"), "{reason}");
+
+    // 上一世那条 `tool.started` 配上了一条明确的 uncertain——不写下来它会永远悬着。
+    let results = harness.results_for(&previous);
+    assert_eq!(results.len(), 1, "有且只有一条结果：{results:?}");
+    assert_eq!(results[0].status, ToolResultStatus::Uncertain);
+    assert_eq!(
+        harness.ledger.surface().calls[&results[0].call_id].state,
+        ToolCallState::Uncertain
+    );
 }
 
 /// ⑦（另一半）planned = 确定尚未执行 → 直接执行一次，不核对。
@@ -341,6 +372,21 @@ async fn a_planned_call_is_known_not_to_have_run_and_executes_once() {
     assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
     assert_eq!(tool.ran(), 1);
     assert_eq!(tool.verified(), 0, "确定没跑过就不必核对");
+
+    // 只 planned 过，没有上一次尝试要收尾；这一次自己的那条结果照常落下。
+    let started: Vec<AttemptId> = harness
+        .ledger
+        .events()
+        .iter()
+        .filter_map(|event| match &event.payload {
+            komo_kernel::events::EventPayload::ToolStarted(started) => {
+                Some(started.attempt_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started.len(), 1, "只有这一次尝试");
+    assert_eq!(harness.results_for(&started[0]).len(), 1);
 }
 
 /// 核对说"目标已满足"→ 报告结论，**不重做**。
@@ -359,9 +405,15 @@ async fn a_satisfied_target_is_reported_not_redone() {
     let mut calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
         .await;
+    let previous = harness
+        .crashed_attempt(
+            &calls[0].call,
+            &plan_of(&*tool, &harness, &session, &run, &calls[0]).await,
+        )
+        .await;
     calls[0].resumed = Some(resumed_from(
         ToolCallState::Started,
-        Some(AttemptId::from_raw("attempt-1")),
+        Some(previous.clone()),
         1,
     ));
 
@@ -375,6 +427,15 @@ async fn a_satisfied_target_is_reported_not_redone() {
         outcome.results[0].content.contains("核对后目标已满足"),
         "{}",
         outcome.results[0].content
+    );
+
+    // 核对结论就是那次尝试的结果：一条，completed。
+    let results = harness.results_for(&previous);
+    assert_eq!(results.len(), 1, "有且只有一条结果：{results:?}");
+    assert_eq!(results[0].status, ToolResultStatus::Completed);
+    assert_eq!(
+        harness.ledger.surface().calls[&results[0].call_id].state,
+        ToolCallState::Completed
     );
 }
 
@@ -390,9 +451,15 @@ async fn a_safe_reread_is_redone_without_a_verification() {
     let mut calls = harness
         .record_round(&run, &[("read", serde_json::json!({ "path": "a.txt" }))])
         .await;
+    let previous = harness
+        .crashed_attempt(
+            &calls[0].call,
+            &plan_of(&*tool, &harness, &session, &run, &calls[0]).await,
+        )
+        .await;
     calls[0].resumed = Some(resumed_from(
         ToolCallState::Started,
-        Some(AttemptId::from_raw("attempt-1")),
+        Some(previous.clone()),
         1,
     ));
 

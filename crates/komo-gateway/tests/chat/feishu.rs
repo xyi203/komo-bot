@@ -16,8 +16,10 @@ use komo_gateway::channels::feishu::{FeishuSender, inbound as feishu_inbound};
 use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::types::chat::{ApprovalScope, ChannelPeer, ChannelPlatform};
 
-use crate::fake_feishu::{BOT_OPEN_ID, FakeOpenApi, card_action_event, text_event};
 use crate::harness::{FixedFactory, GatewayBuilder, TestGateway, config_toml, feishu_block};
+use komo_gateway::channels::feishu::fake::{
+    BOT_OPEN_ID, Behavior, FakeOpenApi, card_action_event, text_event,
+};
 
 struct Wired {
     gateway: TestGateway,
@@ -26,7 +28,7 @@ struct Wired {
 
 async fn wire() -> Wired {
     crate::harness::install_crypto();
-    let fake = Arc::new(FakeOpenApi::start().await);
+    let fake = Arc::new(FakeOpenApi::start(Behavior::default()).await);
     let sender = Arc::new(FeishuSender::with_api(fake.api())) as Arc<dyn ChannelSender>;
     let gateway = GatewayBuilder::new(&config_toml(&feishu_block("\"ou_op\"")))
         .env("KOMO_LLM_API_KEY=test-key\nFEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=test-app-secret\n")

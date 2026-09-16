@@ -51,4 +51,7 @@ komo-kernel = { workspace = true, features = ["test-support"] }
 # （§13.4），测试进程里没有那个 `main`，所以自己装一次。
 rustls = { workspace = true }
 komo-store = { workspace = true, features = ["test-support"] }
+# W5：`tests/recovery/e2e.rs` 的 resume 那一步要走**真客户端**那条路（§14 的"随后 resume
+# 原会话查看结果"说的就是 CLI）。client 不依赖 gateway，所以这条 dev-dependency 不成环。
+komo-client = { workspace = true }
 tempfile = { workspace = true }

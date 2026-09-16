@@ -13,9 +13,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_kernel::traits::Ledger;
+use komo_kernel::traits::{Ledger, LedgerError, StoreError};
 use komo_kernel::types::ids::ExecutorId;
-use komo_kernel::types::status::Claimed;
+use komo_kernel::types::status::{Claimed, Wait};
 use komo_kernel::types::tool::ToolDefinition;
 
 use crate::executor::{ExecError, ToolExecutor};
@@ -101,6 +101,49 @@ impl AgentRunHandler {
 #[async_trait]
 impl RunHandler for AgentRunHandler {
     async fn run(&self, claimed: Claimed) -> Result<(), HandlerError> {
+        match self.attempt(&claimed).await {
+            Ok(()) => Ok(()),
+            // 「JSONL 已提交范围缺失或中间损坏时停止受影响会话的自动执行」（§8.3、
+            // §8.5）。停止的做法有两半，缺一不可：**账本上说清楚**（needs_attention，
+            // 操作者看得见"为什么不动了"），以及**不放回队列**——一个读不出来的会话
+            // 下一次照样读不出来，交还领取权只会变成"领取 → 装配失败 → 交还"的空转。
+            Err(error) if is_corrupt(&error) => {
+                let reason = format!("会话损坏，已停止自动执行：{error}");
+                if let Err(write) = self
+                    .ledger
+                    .suspend(
+                        &claimed.run,
+                        Wait::Attention {
+                            reason: reason.clone(),
+                        },
+                    )
+                    .await
+                {
+                    // 连这条都写不进去，那就只剩"不放回队列"这一半。**不要用这次写
+                    // 失败盖掉损坏本身**——报告里要看到的是损坏。
+                    tracing::error!(
+                        run = %claimed.run,
+                        error = %write,
+                        "会话损坏，且 needs_attention 也写不进去"
+                    );
+                }
+                Err(HandlerError::Stopped { reason })
+            }
+            Err(other) => Err(other),
+        }
+    }
+}
+
+/// 损坏：读不出来的东西下一次照样读不出来。
+fn is_corrupt(error: &HandlerError) -> bool {
+    matches!(
+        error,
+        HandlerError::Ledger(LedgerError::Corrupt(_)) | HandlerError::Store(StoreError::Corrupt(_))
+    )
+}
+
+impl AgentRunHandler {
+    async fn attempt(&self, claimed: &Claimed) -> Result<(), HandlerError> {
         // `run.started`：领取这件事得有人写下来，而 `RunQueue::claim` 只改数据库里的
         // 行。fold 认它——状态变 `Running`，代次记在 `RunView` 上。
         self.ledger
@@ -109,7 +152,7 @@ impl RunHandler for AgentRunHandler {
 
         let segment = self
             .source
-            .segment(&claimed, self.executor.definitions())
+            .segment(claimed, self.executor.definitions())
             .await?;
 
         match self.agent.run(segment).await {
@@ -234,6 +277,150 @@ mod tests {
             surface.runs.get(&run).expect("有这个 Run").status,
             RunStatus::Running,
             "装配失败不该被写成一个执行结果"
+        );
+    }
+
+    /// 一个损坏的会话：handler 说它已经停了，账本上是 `needs_attention`，
+    /// 而调度器**不把它放回队列**——否则就是"领取 → 装配失败 → 交还"的空转。
+    #[tokio::test]
+    async fn a_corrupt_session_stops_the_run_and_never_returns_to_the_queue() {
+        use komo_kernel::test_support::MemRunQueue;
+        use komo_kernel::traits::RunQueue;
+
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![]);
+        let agent = Arc::new(AgentLoop::new(
+            Arc::new(ScriptedLlm::once(vec![])),
+            harness.ledger.clone(),
+            executor.clone(),
+            Arc::new(harness.clock.clone()),
+        ));
+        let (_session, run) = harness.open_run().await;
+
+        let source = Arc::new(from_fn(|_claimed, _tools| async {
+            Err(HandlerError::Ledger(LedgerError::Corrupt(
+                "seq 43 与 45 之间缺了一行".into(),
+            )))
+        })) as Arc<dyn SegmentSource>;
+
+        let handler = AgentRunHandler::new(
+            agent,
+            executor,
+            harness.ledger.clone(),
+            source,
+            ExecutorId::from_raw("exec-1"),
+        );
+
+        // 调度器那一侧：领了它，handler 失败，按 `returns_to_queue()` 决定放不放回。
+        let queue = MemRunQueue::new();
+        queue.enqueue(run.clone());
+        let claimed = queue
+            .claim(&ExecutorId::from_raw("exec-1"))
+            .await
+            .unwrap()
+            .expect("领得到");
+        assert_eq!(queue.depth(), 0);
+
+        let error = handler.run(claimed.clone()).await.unwrap_err();
+        let HandlerError::Stopped { reason } = &error else {
+            panic!("{error:?}")
+        };
+        assert!(reason.contains("损坏"), "{reason}");
+        assert!(!error.returns_to_queue(), "损坏的会话不该回到队列里");
+
+        assert_eq!(
+            harness.ledger.surface().runs.get(&run).unwrap().status,
+            RunStatus::NeedsAttention,
+            "账本上要说得出为什么不动了"
+        );
+
+        // 调度器照 `returns_to_queue()` 行事：不 release。队列仍然是空的。
+        if error.returns_to_queue() {
+            queue.release(&claimed).await.unwrap();
+        }
+        assert_eq!(queue.depth(), 0, "不放回去，才不会空转");
+    }
+
+    /// 存储侧的损坏走同一条路。
+    #[tokio::test]
+    async fn a_corrupt_output_reference_stops_the_run_too() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![]);
+        let agent = Arc::new(AgentLoop::new(
+            Arc::new(ScriptedLlm::once(vec![])),
+            harness.ledger.clone(),
+            executor.clone(),
+            Arc::new(harness.clock.clone()),
+        ));
+        let (_session, run) = harness.open_run().await;
+
+        let source = Arc::new(from_fn(|_claimed, _tools| async {
+            Err(HandlerError::Store(
+                komo_kernel::traits::StoreError::Corrupt("output.json 哈希不符".into()),
+            ))
+        })) as Arc<dyn SegmentSource>;
+
+        let handler = AgentRunHandler::new(
+            agent,
+            executor,
+            harness.ledger.clone(),
+            source,
+            ExecutorId::from_raw("exec-1"),
+        );
+        let error = handler
+            .run(Claimed {
+                run: run.clone(),
+                generation: 1,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HandlerError::Stopped { .. }), "{error:?}");
+        assert!(!error.returns_to_queue());
+        assert_eq!(
+            harness.ledger.surface().runs.get(&run).unwrap().status,
+            RunStatus::NeedsAttention
+        );
+    }
+
+    /// 普通失败（不是损坏）照旧交还领取权，让它能被再领一次。
+    #[tokio::test]
+    async fn an_ordinary_failure_still_returns_to_the_queue() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![]);
+        let agent = Arc::new(AgentLoop::new(
+            Arc::new(ScriptedLlm::once(vec![])),
+            harness.ledger.clone(),
+            executor.clone(),
+            Arc::new(harness.clock.clone()),
+        ));
+        let (_session, run) = harness.open_run().await;
+
+        let source = Arc::new(from_fn(|_claimed, _tools| async {
+            Err(HandlerError::Ledger(LedgerError::Contended))
+        })) as Arc<dyn SegmentSource>;
+
+        let handler = AgentRunHandler::new(
+            agent,
+            executor,
+            harness.ledger.clone(),
+            source,
+            ExecutorId::from_raw("exec-1"),
+        );
+        let error = handler
+            .run(Claimed {
+                run: run.clone(),
+                generation: 1,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            error.returns_to_queue(),
+            "写入争用下一次可能就过去了：{error:?}"
+        );
+        assert_eq!(
+            harness.ledger.surface().runs.get(&run).unwrap().status,
+            RunStatus::Running,
+            "争用不是一个执行结果，也不是损坏"
         );
     }
 }

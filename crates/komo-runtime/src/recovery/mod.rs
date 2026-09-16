@@ -10,6 +10,7 @@
 //! 它以后的事，而它读的是同一份日志。
 
 mod observe;
+mod orphan;
 mod processes;
 
 use std::sync::Arc;
@@ -23,11 +24,15 @@ use komo_kernel::recovery::{
 use komo_kernel::traits::{
     ApprovalRepo, Clock, Ledger, LedgerError, RepoError, StoreError, ToolOutputStore,
 };
-use komo_kernel::types::ids::{ExecutorId, RunId, Seq, SessionId};
+use komo_kernel::types::ids::{AttemptId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::types::refs::{AttemptRef, PublishedOutput};
 use komo_kernel::types::status::RunStatus;
 use time::OffsetDateTime;
 
-pub use observe::{events_of, log_tail, output_ref_of, waiting_approval};
+pub use observe::{
+    StartedCall, events_of, log_tail, output_ref_of, started_call, waiting_approval,
+};
+pub use orphan::SessionDirOrphanOutputs;
 pub use processes::{
     ChildProcess, ChildRegistry, ExecutorLiveness, Liveness, LockHolderLiveness, ProcessProbe,
     SysProcessProbe,
@@ -64,6 +69,46 @@ pub trait RecoveryIndex: Send + Sync {
 
     /// 需要操作者判断：结果不明、引用损坏、授权失效。
     async fn mark_needs_attention(&self, run: &RunId, reason: &str) -> Result<(), StoreError>;
+}
+
+/// 按一次尝试的身份找**孤儿 `output.json`**：工具跑完、`output.json` 已经完整落盘，
+/// 而 `tool.result` 还没写就崩了的那种（§14 故障注入表「output.json 已完成但 JSONL
+/// 结果事件尚未写入 → 校验身份、计划及完成状态后补记结果；**不能只凭文件存在判断**」）。
+///
+/// 它没有并进 [`ToolOutputStore`]，因为那个 trait 在 kernel，而这一条能力目前只有恢复
+/// 扫描要用；接上之后这里换成直接调 `ToolOutputStore` 即可（见交付报告的请求）。
+/// **没有接的部署行为与今天一致**：[`NoOrphanLookup`] 一律答"找不到"，于是
+/// `started` 而无结果仍旧走 §8.4 第 7 行的工具核对。
+#[async_trait]
+pub trait OrphanOutputs: Send + Sync {
+    /// 没有 → `Ok(None)`；有但读不出来或身份对不上 → [`StoreError::Corrupt`]。
+    async fn find(&self, attempt: &AttemptRef) -> Result<Option<PublishedOutput>, StoreError>;
+}
+
+/// 没有这个能力时的明确降级：一律答"找不到"。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoOrphanLookup;
+
+#[async_trait]
+impl OrphanOutputs for NoOrphanLookup {
+    async fn find(&self, _attempt: &AttemptRef) -> Result<Option<PublishedOutput>, StoreError> {
+        Ok(None)
+    }
+}
+
+/// 一次找到的孤儿输出。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Orphan {
+    call: ToolCallId,
+    attempt: AttemptId,
+    published: PublishedOutput,
+}
+
+/// 一次观察，以及它顺手捞到的那份孤儿输出。
+#[derive(Debug, Clone)]
+struct Observed {
+    input: RecoveryInput,
+    orphan: Option<Orphan>,
 }
 
 /// 一个未终态 Run 在 state.db 里的样子。
@@ -132,6 +177,20 @@ impl RecoveryReport {
         self.count(Applied::NeedsOperator)
     }
 
+    /// 因为损坏被停下来的那些 Run，以及原因。
+    ///
+    /// 「停止受影响会话，报告损坏」（§8.4）——**报告**这一半就是它：一个读不出来的会话
+    /// 不会让别的 Run 少判一个，但它自己得在这份报告里看得见。
+    pub fn corrupt(&self) -> Vec<(&RunId, &str)> {
+        self.outcomes
+            .iter()
+            .filter_map(|outcome| match &outcome.action {
+                RecoveryAction::HaltCorrupt { reason } => Some((&outcome.run, reason.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn to_redeliver(&self) -> Vec<&RecoveryOutcome> {
         self.outcomes
             .iter()
@@ -158,6 +217,10 @@ impl RecoveryReport {
         if self.needs_operator() > 0 {
             parts.push(format!("{} 个需要你处理", self.needs_operator()));
         }
+        let corrupt = self.corrupt().len();
+        if corrupt > 0 {
+            parts.push(format!("{corrupt} 个因损坏已停止"));
+        }
         if parts.is_empty() {
             "没有未完成的任务".to_string()
         } else {
@@ -175,6 +238,7 @@ pub struct RecoveryScan {
     clock: Arc<dyn Clock>,
     executor: ExecutorId,
     liveness: Arc<dyn ExecutorLiveness>,
+    orphans: Arc<dyn OrphanOutputs>,
 }
 
 impl std::fmt::Debug for RecoveryScan {
@@ -203,10 +267,23 @@ impl RecoveryScan {
             clock,
             executor,
             liveness,
+            // 默认不查孤儿输出：行为与接这条能力之前一致。
+            orphans: Arc::new(NoOrphanLookup),
         }
     }
 
+    /// 接上孤儿 `output.json` 的查找（§14 故障注入表那一行）。不接就一律答"找不到"。
+    pub fn with_orphan_outputs(mut self, orphans: Arc<dyn OrphanOutputs>) -> Self {
+        self.orphans = orphans;
+        self
+    }
+
     /// 跑一遍（§8.7 的启动顺序里"将旧执行实例的 running 标为 interrupted"之后那几步）。
+    ///
+    /// **一个坏会话只停它自己**（§8.4：「停止受影响会话，报告损坏」——受影响的是它，
+    /// 不是这一轮扫描）。所以观察失败在循环里当场接住：把那个 Run 标成
+    /// `needs_attention` 并记下原因，然后继续判下一个。会一路冒上去的只有索引层的失败
+    /// ——那是数据库级的问题，不是某一个会话的。
     pub async fn scan(&self) -> Result<RecoveryReport, RecoveryError> {
         let reclaimed = self.index.reclaim_running(&self.executor).await?;
         if reclaimed > 0 {
@@ -218,9 +295,22 @@ impl RecoveryScan {
             ..Default::default()
         };
         for run in self.index.unfinished_runs().await? {
-            let observed = self.observe(&run).await?;
-            let action = decide(&observed);
-            let applied = self.apply(&run, &action).await?;
+            let (action, orphan) = match self.observe_full(&run).await {
+                Ok(observed) => (decide(&observed.input), observed.orphan),
+                Err(error) => {
+                    // 读不出来的会话：停止**它**，报告损坏，不重跑来掩盖（§8.5）。
+                    let reason = format!("会话 {} 读不出来：{error}", run.session);
+                    tracing::error!(
+                        run = %run.run,
+                        session = %run.session,
+                        %error,
+                        "会话读不出来，停止这个 Run，继续判下一个"
+                    );
+                    (RecoveryAction::HaltCorrupt { reason }, None)
+                }
+            };
+
+            let applied = self.apply(&run, &action, orphan.as_ref()).await?;
             tracing::info!(
                 run = %run.run,
                 session = %run.session,
@@ -241,20 +331,27 @@ impl RecoveryScan {
 
     /// 单个 Run 的三样观察。公开出来，因为 `komo resume` 要的是同一份判断。
     pub async fn observe(&self, run: &UnfinishedRun) -> Result<RecoveryInput, RecoveryError> {
+        Ok(self.observe_full(run).await?.input)
+    }
+
+    async fn observe_full(&self, run: &UnfinishedRun) -> Result<Observed, RecoveryError> {
         let events = self.read_session(&run.session).await?;
         let log_tail = log_tail(&events, &run.run);
-        let output_check = self.check_output(&events, run, &log_tail).await;
+        let (output_check, orphan) = self.check_output(&events, run, &log_tail).await;
         let approval = self.observe_approval(&events, run).await?;
 
-        Ok(RecoveryInput {
-            db_status: run.status,
-            log_tail,
-            output_check,
-            approval,
-            retry: run.retry.clone(),
-            result_delivered: run.result_delivered,
-            // 「无法确认旧执行已结束时，阻止该任务重复启动并显示原因」（§8.7）。
-            previous_executor_stopped: self.liveness.stopped(run.claimed_by.as_ref()),
+        Ok(Observed {
+            input: RecoveryInput {
+                db_status: run.status,
+                log_tail,
+                output_check,
+                approval,
+                retry: run.retry.clone(),
+                result_delivered: run.result_delivered,
+                // 「无法确认旧执行已结束时，阻止该任务重复启动并显示原因」（§8.7）。
+                previous_executor_stopped: self.liveness.stopped(run.claimed_by.as_ref()),
+            },
+            orphan,
         })
     }
 
@@ -273,19 +370,40 @@ impl RecoveryScan {
         Ok(all)
     }
 
-    /// 「若结果引用存在但对应输出缺失或哈希不符，停止受影响任务」（§8.5）。
+    /// 输出引用的校验，以及**孤儿 `output.json` 的打捞**。
+    ///
+    /// 两种情形，同一个问题「那份输出到底成不成立」：
+    ///
+    /// - `tool.result` 已经写了（第 5 行）：按事件里的引用核对。「若结果引用存在但对应
+    ///   输出缺失或哈希不符，停止受影响任务」（§8.5）。
+    /// - `tool.started` 写了而结果没写（第 7 行）：去存储里按这次尝试的身份找
+    ///   `output.json`。找到、身份对得上、哈希也读得回来——那这次动作**确实发生过**，
+    ///   而且结果是完整的；这是 §8.6「先判断是否发生」能拿到的最硬的证据。
+    ///   找不到就照旧走工具核对，**不能只凭文件存在判断**。
     async fn check_output(
         &self,
         events: &[Event],
         run: &UnfinishedRun,
         log_tail: &LogTail,
-    ) -> OutputCheck {
-        let LogTail::RoundPersisted {
-            pending: PendingCall::ResultPersisted { call },
-        } = log_tail
-        else {
-            return OutputCheck::NotApplicable;
+    ) -> (OutputCheck, Option<Orphan>) {
+        let LogTail::RoundPersisted { pending } = log_tail else {
+            return (OutputCheck::NotApplicable, None);
         };
+        match pending {
+            PendingCall::ResultPersisted { call } => {
+                (self.check_result(events, run, call).await, None)
+            }
+            PendingCall::Started { call } => self.check_orphan(events, run, call).await,
+            PendingCall::Planned { .. } | PendingCall::None => (OutputCheck::NotApplicable, None),
+        }
+    }
+
+    async fn check_result(
+        &self,
+        events: &[Event],
+        run: &UnfinishedRun,
+        call: &ToolCallId,
+    ) -> OutputCheck {
         let Some(reference) = output_ref_of(events, &run.run, call) else {
             return OutputCheck::NotApplicable;
         };
@@ -297,6 +415,83 @@ impl RecoveryScan {
             Err(error) => {
                 tracing::warn!(run = %run.run, %error, "输出引用核对不了");
                 OutputCheck::Missing
+            }
+        }
+    }
+
+    async fn check_orphan(
+        &self,
+        events: &[Event],
+        run: &UnfinishedRun,
+        call: &ToolCallId,
+    ) -> (OutputCheck, Option<Orphan>) {
+        let Some(started) = observe::started_call(events, &run.run, call) else {
+            return (OutputCheck::NotApplicable, None);
+        };
+        let attempt = AttemptRef {
+            session: run.session.clone(),
+            run: run.run.clone(),
+            call: call.clone(),
+            attempt: started.attempt.clone(),
+        };
+
+        let published = match self.orphans.find(&attempt).await {
+            Ok(None) => return (OutputCheck::NotApplicable, None),
+            Ok(Some(published)) => published,
+            Err(StoreError::Corrupt(reason)) => {
+                tracing::error!(run = %run.run, call = %call, %reason, "孤儿输出损坏");
+                return (OutputCheck::HashMismatch, None);
+            }
+            Err(error) => {
+                tracing::warn!(run = %run.run, call = %call, %error, "孤儿输出查不了");
+                return (OutputCheck::NotApplicable, None);
+            }
+        };
+
+        // 身份：这份 output.json 必须**正是这次尝试**的那一份。「不能只凭文件存在判断」
+        // ——路径里编着 run / call / attempt，对不上就是另一次尝试的东西。
+        let expected = format!(
+            "tool-output/{}/{}/{}/output.json",
+            run.run, call, started.attempt
+        );
+        if published.output.0.path != expected {
+            tracing::error!(
+                run = %run.run,
+                found = %published.output.0.path,
+                %expected,
+                "孤儿输出的身份对不上"
+            );
+            return (OutputCheck::HashMismatch, None);
+        }
+
+        // 哈希：`open` 读回来并逐字核对（对不上它返回 Corrupt，且**不返回内容**）。
+        match self.outputs.open(&published.output).await {
+            Ok(_) => {
+                tracing::info!(
+                    run = %run.run,
+                    call = %call,
+                    attempt = %started.attempt,
+                    plan_hash = %started.plan_hash,
+                    output = %published.output.0.path,
+                    "找到一份完整的孤儿输出，这次动作确实发生过"
+                );
+                (
+                    OutputCheck::Verified,
+                    Some(Orphan {
+                        call: call.clone(),
+                        attempt: started.attempt,
+                        published,
+                    }),
+                )
+            }
+            Err(StoreError::NotFound { .. }) => (OutputCheck::Missing, None),
+            Err(StoreError::Corrupt(reason)) => {
+                tracing::error!(run = %run.run, %reason, "孤儿输出哈希不符");
+                (OutputCheck::HashMismatch, None)
+            }
+            Err(error) => {
+                tracing::warn!(run = %run.run, %error, "孤儿输出核对不了");
+                (OutputCheck::Missing, None)
             }
         }
     }
@@ -327,10 +522,14 @@ impl RecoveryScan {
     }
 
     /// 执行一个决定。**这里没有任何一条路径会调用工具、发请求或消费授权。**
+    ///
+    /// 唯一"写"到账本上的是补记一条已经完整落盘的结果（`VerifyEffect` 那一支），而那是
+    /// **复用原输出**，不是重放动作。
     async fn apply(
         &self,
         run: &UnfinishedRun,
         action: &RecoveryAction,
+        orphan: Option<&Orphan>,
     ) -> Result<Applied, RecoveryError> {
         match action {
             // 能确定恢复位置的：补索引 → 放回队列。接着跑是 AgentLoop 的事，它读的是
@@ -339,14 +538,52 @@ impl RecoveryScan {
             | RecoveryAction::DiscardPartialAndRerequestModel
             | RecoveryAction::ResumeFromPlan
             | RecoveryAction::ExecutePlannedCall { .. }
-            | RecoveryAction::VerifyEffect { .. }
             | RecoveryAction::BackfillResultAndContinue { .. }
             | RecoveryAction::ResumeWithDecision { .. } => {
                 self.index.backfill(&run.run).await?;
                 self.index.requeue(&run.run).await?;
                 Ok(Applied::Requeued)
             }
+            // 「先核对外部效果，按 §8.6 决定是否安全继续」。核对在这里只有一种做法：
+            // 看那次尝试的 `output.json` 在不在、对不对。**在**，就说明动作发生过而且
+            // 结果是完整的——于是把这条结果补记进账本（复用原输出，工具不重做），后面
+            // 照常接着跑；**不在**，才交给 AgentLoop 去调工具自己的 `verify`。
+            RecoveryAction::VerifyEffect { call } => {
+                if let Some(orphan) = orphan.filter(|found| &found.call == call) {
+                    match self
+                        .ledger
+                        .finish_call(&orphan.attempt, orphan.published.clone())
+                        .await
+                    {
+                        Ok(()) => tracing::info!(
+                            run = %run.run,
+                            call = %call,
+                            attempt = %orphan.attempt,
+                            output = %orphan.published.output.0.path,
+                            "补记了那次尝试的结果，复用原输出"
+                        ),
+                        // 补记不上就退回第 7 行：交给 AgentLoop 去调工具自己的 `verify`。
+                        // **不让它把这一轮扫描带走**——别的 Run 还等着判（B5 的教训）。
+                        Err(error) => tracing::error!(
+                            run = %run.run,
+                            call = %call,
+                            attempt = %orphan.attempt,
+                            %error,
+                            "找到了完整的输出却补记不进账本，退回工具核对"
+                        ),
+                    }
+                }
+                self.index.backfill(&run.run).await?;
+                self.index.requeue(&run.run).await?;
+                Ok(Applied::Requeued)
+            }
             // 等人、等钟、等重传、已经是终态：原样留着。
+            //
+            // `WaitUntilRetry` 也在这里：**恢复扫描不动等退避的 Run**。它的
+            // `next_retry_at` 与已用次数都已经持久化（§8.5：重启不重置预算），到期之后
+            // 由调度器的领取查询（`status IN ('queued','waiting_retry') AND
+            // next_retry_at <= now`，§8.7）自己领回去。在这里 requeue 只会让它提前跑，
+            // 正好绕过那次退避。
             RecoveryAction::AwaitResend
             | RecoveryAction::KeepWaitingApproval { .. }
             | RecoveryAction::WaitUntilRetry { .. }

@@ -146,6 +146,36 @@ enabled = false
             .collect()
     }
 
+    /// 一次尝试的输出目录（`tool-output/<run>/<call>/<attempt>/`，§8.3 的形状）。
+    pub fn attempt_dir(
+        &self,
+        session: &SessionId,
+        run: &RunId,
+        started: &komo_kernel::events::ToolStarted,
+    ) -> PathBuf {
+        self.session_dir(session)
+            .join("tool-output")
+            .join(run.as_str())
+            .join(started.call_id.as_str())
+            .join(started.attempt_id.as_str())
+    }
+
+    /// 把这次尝试的输出整棵删掉——等价于**`ToolOutputStore::publish` 从未发生**。
+    ///
+    /// 故障装饰器包的是 `Ledger`，包不到 `ToolOutputStore`，而"外部副作用已经发生、
+    /// 完整输出还没落盘"这一段（§14 故障注入表第 6 行）的分界正好在 `publish` 上。所以
+    /// 这一刀走的是另一条注入路：停机之后直接改磁盘。`orphan::find` 对"文件不在"的判断
+    /// 就是"没跑到落盘那一步"，与真正的中断无法区分。
+    pub fn drop_attempt_output(
+        &self,
+        session: &SessionId,
+        run: &RunId,
+        started: &komo_kernel::events::ToolStarted,
+    ) {
+        let dir = self.attempt_dir(session, run, started);
+        std::fs::remove_dir_all(&dir).unwrap_or_else(|e| panic!("删 {}：{e}", dir.display()));
+    }
+
     /// 在 `runtime/children/<executor>.json` 里登记一个**还活着**的子进程
     /// （§8.7「无法确认旧执行已结束时，阻止该任务重复启动」）。
     pub fn register_live_child(&self, executor: &str, pid: u32) {
@@ -179,6 +209,11 @@ impl Gw {
 
     pub fn executor_id(&self) -> String {
         self.running.state.instance_id.clone()
+    }
+
+    /// 一个**真的** CLI 客户端，指着这台 Gateway（`komo resume` 走的就是它）。
+    pub fn client(&self) -> komo_client::KomoClient {
+        komo_client::KomoClient::new(&self.base, Some(self.token.clone())).expect("客户端")
     }
 
     pub async fn get(&self, path: &str) -> (u16, String) {
@@ -728,6 +763,14 @@ pub fn tool_results(events: &[Event]) -> Vec<&komo_kernel::events::ToolResult> {
             EventPayload::ToolResult(body) => Some(body),
             _ => None,
         })
+        .collect()
+}
+
+/// 这个 Run 的结果事件的状态，按顺序。
+pub fn result_statuses(events: &[Event]) -> Vec<komo_kernel::types::refs::ToolResultStatus> {
+    tool_results(events)
+        .iter()
+        .map(|result| result.status)
         .collect()
 }
 

@@ -699,11 +699,12 @@ impl Ledger for Coordinator {
         };
 
         let event_id = event_id.clone();
-        self.commit(&appended, move |ex, appended, _now| {
+        self.commit(&appended, move |ex, _appended, _now| {
             let event_id = event_id.clone();
             Box::pin(async move {
-                // state.db 标记 outbox 已交付并更新日志索引（§8.5 第三步）。
-                outbox::mark_delivered_in(ex, &event_id, appended.seq()).await
+                // state.db 标记 outbox 已交付并更新日志索引（§8.5 第三步）。落在哪个 seq
+                // 由 `session_log_index` 那一行说——`commit` 刚在同一个事务里写过它。
+                outbox::mark_delivered_in(ex, &event_id).await
             }) as BoxFuture<'_, Result<(), StoreError>>
         })
         .await?;

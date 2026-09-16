@@ -42,6 +42,8 @@ use state::{Assembly, GatewayState, SystemClock};
 
 /// Cron 的扫描节奏：一分钟一次（五字段表达式的精度就是分钟）。
 const CRON_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+/// 控制审计补写的节奏。补写是审计与顺序，不承担耐久性（§8.2），所以不必更密。
+const AUDIT_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 /// 停机时给手上的任务多少时间收尾（§8.7「给正在完成的工具短暂收尾时间」）。
 const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -210,6 +212,23 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
                     })
                     .await;
             }
+            for (run, reason) in report.corrupt() {
+                // 「停止受影响会话，**报告损坏**」（§8.4 / §8.5）——报告这一半就是这一条：
+                // 一个读不出来的会话不会自己好起来，操作者得知道是哪一个、为什么。
+                let _ = state
+                    .notifier
+                    .deliver_home(Outbound::NeedsAttention {
+                        session: report
+                            .outcomes
+                            .iter()
+                            .find(|outcome| &outcome.run == run)
+                            .map(|outcome| outcome.session.clone())
+                            .unwrap_or_else(|| komo_kernel::types::ids::SessionId::from_raw("")),
+                        run: run.clone(),
+                        reason: format!("恢复时停下了：{reason}"),
+                    })
+                    .await;
+            }
             if report.requeued() > 0 {
                 state.waker().wake();
             }
@@ -217,14 +236,20 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         Err(error) => tracing::error!(%error, "恢复扫描失败：新请求照常，未完成的任务等下一次扫描"),
     }
 
-    // 上一次没送到的投递，现在补发（§11.4）。
-    state.notifier.flush(None).await;
+    // 8. 补写控制审计 outbox（§8.7 的启动顺序第 3 步：恢复扫描之后、服务起来之前）。
+    state.drain_audit().await;
 
-    // 8. 后台任务：调度器、Cron、配置轮询、SIGHUP。
+    // 9. 后台任务：调度器、Cron、配置轮询、SIGHUP。
     spawn_background(&state, &shutdown);
 
-    // 9. 渠道与 HTTP。
+    // 10. 渠道与 HTTP。
+    //
+    // **补发在渠道登记之后**：`DeliveryLog::send_recorded` 找不到发送口就把行原样留在
+    // pending，所以在 `start_all` 之前冲刷等于什么都没做（W5 验收 BUG(3)）。每个渠道起来
+    // 时还会按自己的平台冲刷一次（`ChannelSupervisor::start`），这里补的是"渠道都起完了"
+    // 之后的那一遍，包括没有工厂、由别处登记发送口的情形。
     state.supervisor.start_all(&state).await;
+    state.notifier.flush(None).await;
     let app = crate::http::router(Api::new(Arc::clone(&state)));
     let serving = shutdown.clone();
     tokio::spawn(async move {
@@ -273,6 +298,21 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "Cron 这一轮扫描失败"),
                 }
+            }
+        });
+    }
+    {
+        // 控制审计的周期补写（§8.5 的反向顺序）。启动时补过一次；这一遍管的是运行期
+        // 产生的那些——补写按 `event_id` 幂等，补不上的留在 outbox 里下次再来。
+        let state = Arc::clone(state);
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(AUDIT_TICK).await;
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                state.drain_audit().await;
             }
         });
     }

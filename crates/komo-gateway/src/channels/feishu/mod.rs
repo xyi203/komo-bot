@@ -32,7 +32,7 @@ pub mod inbound;
 pub mod send;
 pub mod ws;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 
 use std::collections::{HashSet, VecDeque};
@@ -93,7 +93,7 @@ enum EventSource {
     /// openlark 的 ws 长连接。
     Ws { app_id: String, app_secret: String },
     /// 测试注入。
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Injected(mpsc::UnboundedReceiver<Vec<u8>>),
 }
 
@@ -138,8 +138,10 @@ impl FeishuChannel {
     }
 
     /// 测试用：事件从一个 channel 来，不建 ws。
-    #[cfg(test)]
-    fn injected(api: Arc<FeishuApi>, events: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
+    /// 事件从一个 channel 里来，而不是 ws。集成测试拿它把原始事件负载喂进真的
+    /// `serve`（`#[cfg(test)]` 时集成测试够不着，所以门控放宽到 `test-support`）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn injected(api: Arc<FeishuApi>, events: mpsc::UnboundedReceiver<Vec<u8>>) -> Self {
         Self::with_api(api, ChannelConfig::default(), EventSource::Injected(events))
     }
 
@@ -196,7 +198,7 @@ impl FeishuChannel {
                 let (events, thread) = ws::spawn(app_id, app_secret, shutdown.clone());
                 (events, Some(thread))
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             EventSource::Injected(events) => (events, None),
         })
     }

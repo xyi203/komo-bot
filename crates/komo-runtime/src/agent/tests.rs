@@ -696,3 +696,68 @@ async fn an_exhausted_retry_budget_ends_in_a_failure() {
         RunStatus::Failed
     );
 }
+
+/// **重启不重置预算**（§8.5）：已经用掉的次数由调用方从账本里给，第三次失败记的就是
+/// 第 3 次，不是第 1 次；退避也按它指数增长。
+#[tokio::test]
+async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
+    let harness = Harness::new();
+    let executor = harness.permissive(vec![]);
+    let agent = AgentLoop::new(
+        Arc::new(FailingLlm::at_round(
+            komo_kernel::types::turn::LlmError::Timeout,
+        )),
+        harness.ledger.clone(),
+        executor,
+        Arc::new(harness.clock.clone()),
+    );
+    let (session, run) = harness.open_run().await;
+    let started_at = harness.clock.now();
+
+    let outcome = agent
+        .run(Segment {
+            request: turn_request(&session, &run),
+            env: harness.env(&session, &run),
+            budget: Budget {
+                retry: RetryBudget {
+                    attempts: 2,
+                    max_attempts: 5,
+                    base: std::time::Duration::from_secs(2),
+                },
+                ..Budget::default()
+            },
+            resume: None,
+            session,
+            run: run.clone(),
+        })
+        .await
+        .unwrap();
+
+    let SegmentOutcome::Suspended {
+        wait:
+            Wait::Retry {
+                attempts,
+                next_retry_at,
+                ..
+            },
+        ..
+    } = &outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(*attempts, 3, "接着上一次的次数数，不是从 1 起");
+    // base * 2^2 = 8s：退避跟着已经用掉的次数涨，不是每次都退回起步值。
+    assert_eq!(*next_retry_at, started_at + time::Duration::seconds(8));
+
+    // 账本上落的也是这个数——下一段从这里读回来。
+    let waiting = harness
+        .ledger
+        .events()
+        .iter()
+        .find_map(|event| match &event.payload {
+            komo_kernel::events::EventPayload::RunWaitingRetry(body) => Some(body.clone()),
+            _ => None,
+        })
+        .expect("有一条 run.waiting_retry");
+    assert_eq!(waiting.attempts, 3);
+}

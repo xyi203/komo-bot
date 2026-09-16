@@ -169,6 +169,47 @@ impl ApprovalRepo for TursoApprovalRepo {
             .map_err(RepoError::from)
     }
 
+    async fn find_latest_by_short_id(
+        &self,
+        short: &ShortId,
+    ) -> Result<Option<ApprovalRecord>, RepoError> {
+        let short = short.to_string();
+        self.db
+            .read(move |ex| {
+                let short = short.clone();
+                Box::pin(async move {
+                    let rows = ApprovalRequestRow::filter(
+                        ApprovalRequestRow::fields().short_id().eq(short.as_str()),
+                    )
+                    .exec(ex)
+                    .await
+                    .map_err(map_toasty)?;
+
+                    // **待处理的优先**：短 ID 的重用窗口是"下一条审批产生之前"，所以待
+                    // 处理那条才是用户正看着的那张卡（§11.3）。
+                    if let Some(row) = rows.iter().find(|row| !row.decided) {
+                        return Ok(Some(record_from_row(row)?));
+                    }
+                    // 没有待处理的就给**最近一条已决定的**，让 Dispatcher 能回「已决定：
+                    // 原决定」而不是「没有这条」。
+                    let latest = rows.iter().max_by_key(|row| {
+                        row.decision
+                            .as_deref()
+                            .and_then(|raw| {
+                                serde_json::from_str::<ApprovalDecisionRecord>(raw).ok()
+                            })
+                            .map(|decision| decision.decided_at)
+                    });
+                    match latest {
+                        Some(row) => Ok(Some(record_from_row(row)?)),
+                        None => Ok(None),
+                    }
+                }) as BoxFuture<'_, Result<Option<ApprovalRecord>, StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
     async fn list_pending(
         &self,
         session: Option<&SessionId>,
@@ -674,6 +715,94 @@ mod tests {
         repo.create(request("ap-2", &plan, 7)).await.unwrap();
         let found = repo.find_by_short_id(&short).await.unwrap().unwrap();
         assert_eq!(found.approval.as_str(), "ap-2");
+    }
+
+    /// 验收 BUG(1)：`/approve <short_id>` 第二次到达时还认得出那条。
+    ///
+    /// `find_by_short_id` 只看待处理集合（§11.3），所以决定之后它就答不出来了——而
+    /// Dispatcher 这时候要回的是「已决定：原决定」，不是「没有这条」。
+    #[tokio::test]
+    async fn a_short_id_still_resolves_after_the_decision() {
+        let (db, _dir) = temp().await;
+        let repo = TursoApprovalRepo::new(db);
+        let plan = shell_plan("ls");
+        repo.create(request("ap-1", &plan, 7)).await.unwrap();
+        let short = ShortId::from_index(7);
+
+        let pending = repo.find_latest_by_short_id(&short).await.unwrap().unwrap();
+        assert_eq!(pending.approval.as_str(), "ap-1");
+        assert!(pending.decision.is_none());
+
+        repo.decide(&ApprovalId::from_raw("ap-1"), decision(true, None))
+            .await
+            .unwrap();
+
+        assert!(
+            repo.find_by_short_id(&short).await.unwrap().is_none(),
+            "待处理集合里已经没有它了"
+        );
+        let decided = repo.find_latest_by_short_id(&short).await.unwrap().unwrap();
+        assert_eq!(decided.approval.as_str(), "ap-1");
+        assert!(decided.decision.expect("带着原决定").approved);
+    }
+
+    /// **待处理的优先**：短 ID 的重用窗口是"下一条审批产生之前"，用户正看着的是新那张卡。
+    #[tokio::test]
+    async fn a_reused_short_id_resolves_to_the_pending_one_first() {
+        let (db, _dir) = temp().await;
+        let repo = TursoApprovalRepo::new(db);
+        let plan = shell_plan("ls");
+        let short = ShortId::from_index(7);
+
+        repo.create(request("ap-old", &plan, 7)).await.unwrap();
+        repo.decide(&ApprovalId::from_raw("ap-old"), decision(false, None))
+            .await
+            .unwrap();
+        // 短 ID 被下一条审批重用了。
+        repo.create(request("ap-new", &plan, 7)).await.unwrap();
+
+        let found = repo.find_latest_by_short_id(&short).await.unwrap().unwrap();
+        assert_eq!(found.approval.as_str(), "ap-new");
+        assert!(found.decision.is_none());
+    }
+
+    /// 都决定过了就给**最近那一条**（按 `decided_at`）。
+    #[tokio::test]
+    async fn among_decided_records_the_latest_decision_wins() {
+        let (db, _dir) = temp().await;
+        let repo = TursoApprovalRepo::new(db);
+        let plan = shell_plan("ls");
+        let short = ShortId::from_index(7);
+
+        repo.create(request("ap-old", &plan, 7)).await.unwrap();
+        let mut early = decision(false, None);
+        early.decided_at = NOW - time::Duration::hours(2);
+        repo.decide(&ApprovalId::from_raw("ap-old"), early)
+            .await
+            .unwrap();
+
+        repo.create(request("ap-new", &plan, 7)).await.unwrap();
+        let mut late = decision(true, None);
+        late.decided_at = NOW;
+        repo.decide(&ApprovalId::from_raw("ap-new"), late)
+            .await
+            .unwrap();
+
+        let found = repo.find_latest_by_short_id(&short).await.unwrap().unwrap();
+        assert_eq!(found.approval.as_str(), "ap-new");
+        assert!(found.decision.expect("带着决定").approved);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_short_id_resolves_to_nothing() {
+        let (db, _dir) = temp().await;
+        let repo = TursoApprovalRepo::new(db);
+        assert!(
+            repo.find_latest_by_short_id(&ShortId::from_index(31))
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// 验收 ⑪（后半，Once）：计划哈希逐字相同才算，消费之后标 `consumed`。

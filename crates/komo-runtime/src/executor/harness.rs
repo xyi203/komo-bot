@@ -13,7 +13,7 @@ use komo_kernel::test_support::{
     MemApprovalRepo, MemLedger, MemOutputStore, TestClock, sample_model,
 };
 use komo_kernel::traits::{Clock, Ledger, Tool};
-use komo_kernel::types::ids::{OperationId, RequestKey, RunId, SessionId, ToolCallId};
+use komo_kernel::types::ids::{AttemptId, OperationId, RequestKey, RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::{
     ApprovedPlan, ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode, Verification,
 };
@@ -151,8 +151,52 @@ impl Harness {
         requests
     }
 
+    /// 造出"上一世那次 started 而没有结果的尝试"——崩溃留下的正是这个样子：计划落了
+    /// 盘、`tool.started` 写了下来，然后什么都没有。
+    pub async fn crashed_attempt(&self, call: &ToolCallId, plan: &ExecutionPlan) -> AttemptId {
+        self.ledger.plan_call(call, plan).await.expect("落计划");
+        self.ledger
+            .start_call(call, plan, None)
+            .await
+            .expect("写 tool.started")
+    }
+
+    /// 账本里挂在这次尝试上的结果事件。**恢复的验收断言的是它有且只有一条**。
+    pub fn results_for(&self, attempt: &AttemptId) -> Vec<komo_kernel::events::ToolResult> {
+        self.ledger
+            .events()
+            .iter()
+            .filter_map(|event| match &event.payload {
+                komo_kernel::events::EventPayload::ToolResult(result)
+                    if &result.attempt_id == attempt =>
+                {
+                    Some(result.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn env(&self, session: &SessionId, run: &RunId) -> CallEnv {
         self.env_with_cancel(session, run, CancelToken::new())
+    }
+
+    /// 一个工具在这个 Run 里的上下文。`attempt` 是 `prepare` 那一刻的哨兵——那时候
+    /// 一次尝试都还没有。
+    pub fn tool_context(&self, session: &SessionId, run: &RunId, call: &ToolCallId) -> ToolContext {
+        let env = self.env(session, run);
+        ToolContext {
+            session: session.clone(),
+            run: run.clone(),
+            call: call.clone(),
+            attempt: AttemptId::from_raw("attempt-not-started"),
+            source: env.source,
+            cwd: env.cwd,
+            roots: env.roots,
+            env_version: None,
+            resumed: None,
+            cancel: CancelToken::new(),
+        }
     }
 
     pub fn env_with_cancel(

@@ -69,10 +69,22 @@ impl RecoveryStore {
         &self.sessions_root
     }
 
-    /// 所有未终态 Run（§8.4 要逐个判断的就是它们）。
+    /// 启动扫描要逐个判断的那些 Run（§8.4）。
+    ///
+    /// 两批，不是一批：
+    ///
+    /// - **未终态的**——那张表前九行说的就是它们；
+    /// - **已终态但结果还没送到客户端的**——第 10 行「已保存最终结果，但客户端没有收到
+    ///   → 补发或补读原结果，**不重新执行任务**」。不带上它们，`RecoveryAction::
+    ///   RedeliverResult` 就是一段永远走不到的代码。
+    ///
+    /// 结构里不需要多一个字段区分：`status` 本身已经说了是哪一批。补发过一次之后
+    /// `deliveries` 里就有了一行 `sent`，下一轮它自己退出这个集合。
     pub async fn unfinished_runs(&self) -> Result<Vec<UnfinishedRun>, StoreError> {
-        let rows = runs::unfinished(&self.db).await?;
         let delivered = delivered_runs(&self.db).await?;
+        let mut rows = runs::unfinished(&self.db).await?;
+        rows.extend(runs::terminal_undelivered(&self.db, &delivered).await?);
+        rows.sort_by(|a, b| a.run.as_str().cmp(b.run.as_str()));
 
         Ok(rows
             .into_iter()
@@ -95,8 +107,34 @@ impl RecoveryStore {
     }
 
     /// 「启动回收：旧实例的 running -> interrupted，并交还领取权」（§8.7）。返回影响行数。
+    ///
+    /// 同一个事务里还要**收拾那几个 Run 遗留的尝试**：上一个执行实例没回来，它开着的
+    /// `tool_attempts` 就停在 `started`，而 `started` 在 §8.6 里的意思是"正在跑"。不标
+    /// 成 `interrupted` 的话，核对流程看到的是一个永远在跑的尝试。
+    ///
+    /// **`tool_calls` 的状态一个字不动**：`started` 而无结果的调用仍要走核对流程——把它
+    /// 改成 failed 就等于宣布副作用没发生，而那正是不知道的事。
     pub async fn reclaim_running(&self, executor: &ExecutorId) -> Result<u64, StoreError> {
-        super::queue::reclaim_abandoned_runs(&self.db, executor).await
+        let executor = executor.clone();
+        let now = OffsetDateTime::now_utc();
+        self.db
+            .with_write_retry(move |ex| {
+                let executor = executor.clone();
+                Box::pin(async move {
+                    let reclaimed = super::queue::reclaim_abandoned_runs_in(ex, &executor).await?;
+                    // **按执行实例收拾，不按被回收的那几行**：正常停机时
+                    // `RunQueue::release` 已经把 Run 从 `running` 放回 `queued`，于是它
+                    // 根本不在回收集合里——可它的尝试还停在 `started`。一个 db 文件只有
+                    // 一个进程开着，所以"不属于本次启动身份的 started 尝试"就是上一世
+                    // 留下的，一个不漏。
+                    let closed = calls::interrupt_open_attempts_in(ex, &executor, now).await?;
+                    if closed > 0 {
+                        tracing::info!(closed, "收拾了上一代遗留的、没有收尾的尝试");
+                    }
+                    Ok(reclaimed)
+                }) as BoxFuture<'_, Result<u64, StoreError>>
+            })
+            .await
     }
 
     /// 用 JSONL 已有的事件补齐 state.db 的索引与派生执行状态。**不重放动作。**
@@ -247,7 +285,10 @@ async fn apply_event(
     let event_id = &record.event.event_id;
     match &record.event.payload {
         EventPayload::RunAccepted(_) => {
-            runs::mark_queued_in(ex, run, event_id, now).await?;
+            // **只记引用，不动状态**：入不入队是决策表的结论（`RecoveryAction::Requeue`），
+            // 不是"日志里有 run.accepted"这件事的推论。推成 queued 的话，一个已取消的
+            // Run 会在补发结果那条路径上（第 10 行也走 backfill）被悄悄复活。
+            runs::set_input_event_in(ex, run, event_id, now).await?;
         }
         EventPayload::MessageAssistant(body) => {
             for request in &body.tool_calls {
@@ -383,6 +424,44 @@ mod tests {
         }
     }
 
+    /// 一个 Run，上面有一次**开着没收尾**的尝试。
+    async fn a_run_with_an_open_attempt(f: &Fixture) -> (RunId, ToolCallId) {
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", &f.session))
+            .await
+            .unwrap();
+        let ids = f
+            .coordinator
+            .record_round(
+                &accepted.run,
+                AssistantRound {
+                    round: 1,
+                    text: None,
+                    text_ref: None,
+                    tool_calls: vec![ToolCallRequest {
+                        call_id: ToolCallId::from_raw("call-1"),
+                        provider_call_id: "pc-1".into(),
+                        name: "shell".into(),
+                        arguments: serde_json::json!({}),
+                        arguments_ref: None,
+                    }],
+                    provider_blocks: None,
+                    usage: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let plan = sample_plan("shell", &f.session);
+        f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
+        // 开跑了，但没有结果——上一个实例就停在这里。
+        f.coordinator
+            .start_call(&ids[0], &plan, None)
+            .await
+            .unwrap();
+        (accepted.run, ids[0].clone())
+    }
+
     async fn a_run_with_one_finished_call(f: &Fixture) -> RunId {
         let accepted = f
             .coordinator
@@ -440,7 +519,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unfinished_runs_lists_only_the_ones_still_in_flight() {
+    async fn the_scan_set_is_the_in_flight_runs_plus_the_undelivered_terminal_ones() {
         let f = fixture().await;
         let open = f
             .coordinator
@@ -464,13 +543,77 @@ mod tests {
             .unwrap();
 
         let unfinished = f.store.unfinished_runs().await.unwrap();
-        assert_eq!(unfinished.len(), 1);
-        assert_eq!(unfinished[0].run, open.run);
-        assert_eq!(unfinished[0].session, f.session);
-        assert_eq!(unfinished[0].status, RunStatus::Queued);
-        assert!(unfinished[0].claimed_by.is_none());
-        assert!(unfinished[0].retry.is_none());
-        assert!(!unfinished[0].result_delivered);
+        let in_flight = unfinished
+            .iter()
+            .find(|row| row.run == open.run)
+            .expect("未终态的那个在");
+        assert_eq!(in_flight.session, f.session);
+        assert_eq!(in_flight.status, RunStatus::Queued);
+        assert!(in_flight.claimed_by.is_none());
+        assert!(in_flight.retry.is_none());
+        assert!(!in_flight.result_delivered);
+
+        // §8.4 第 10 行：已终态、结果还没送到，也要进扫描集合，否则
+        // `RecoveryAction::RedeliverResult` 是一段永远走不到的代码。
+        let undelivered = unfinished
+            .iter()
+            .find(|row| row.run == closed.run)
+            .expect("已终态但没送到的那个也在");
+        assert_eq!(undelivered.status, RunStatus::Completed);
+        assert!(!undelivered.result_delivered);
+        assert_eq!(unfinished.len(), 2);
+    }
+
+    /// 验收 B6：送达过的终态 Run **退出**扫描集合——补发一次之后它自己就不来了。
+    #[tokio::test]
+    async fn a_terminal_run_whose_result_reached_the_client_leaves_the_scan_set() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", &f.session))
+            .await
+            .unwrap();
+        f.coordinator
+            .complete(
+                &accepted.run,
+                RunEnd::Completed {
+                    final_message: Some("跑完了".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(f.store.unfinished_runs().await.unwrap().len(), 1);
+
+        let deliveries = crate::repos::deliveries::TursoDeliveryRepo::new(f.db.clone());
+        let id = DeliveryId::from_raw("d-1");
+        deliveries
+            .record(
+                &id,
+                &DeliveryTarget::to_peer(ChannelPeer::new(ChannelPlatform::Telegram, "42")),
+                &komo_kernel::types::chat::Outbound::RunFinished {
+                    session: f.session.clone(),
+                    run: accepted.run.clone(),
+                    summary: "跑完了".into(),
+                },
+                TestClock::fixed().now(),
+            )
+            .await
+            .unwrap();
+        deliveries
+            .settle(
+                &id,
+                komo_kernel::types::chat::DeliveryState::Sent,
+                None,
+                TestClock::fixed().now(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            f.store.unfinished_runs().await.unwrap().is_empty(),
+            "送到了就不该再被扫描出来"
+        );
     }
 
     /// 等退避的 Run 带出次数与下次时间——**重启不重置预算**（§8.5）。
@@ -568,6 +711,98 @@ mod tests {
         let unfinished = f.store.unfinished_runs().await.unwrap();
         assert_eq!(unfinished[0].status, RunStatus::Interrupted);
         assert!(unfinished[0].claimed_by.is_none());
+    }
+
+    /// 验收 B2：回收领取权的**同一个事务**里，把那几个 Run 遗留的尝试标成 `interrupted`。
+    ///
+    /// 不标的话，`started` 而无结果的尝试在 §8.6 里读起来是"正在跑"——核对流程看到的是
+    /// 一个永远跑不完的尝试。**`tool_calls` 的状态一个字不动**：它仍要走核对。
+    #[tokio::test]
+    async fn reclaim_also_closes_the_attempts_the_dead_instance_left_open() {
+        let f = fixture().await;
+        let (run, call) = a_run_with_an_open_attempt(&f).await;
+
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        queue
+            .claim_run(&run, &ExecutorId::from_raw("exec-old"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let before = calls::attempts_of(&f.db, &call).await.unwrap();
+        assert_eq!(before[0].state, "started");
+
+        assert_eq!(
+            f.store
+                .reclaim_running(&ExecutorId::from_raw("exec-now"))
+                .await
+                .unwrap(),
+            1
+        );
+
+        let after = calls::attempts_of(&f.db, &call).await.unwrap();
+        assert_eq!(after[0].state, "interrupted", "那次尝试没有收尾");
+        assert!(after[0].ended_at > 0, "记下它停在什么时候");
+        assert_eq!(
+            calls::list_for_run(&f.db, &run).await.unwrap()[0].state,
+            "started",
+            "调用状态不动——它仍要走 §8.6 的核对"
+        );
+    }
+
+    /// 正常停机把 Run 放回了 `queued`，可它的尝试还停在 `started`——照样要收拾。
+    ///
+    /// 这是按"被回收的那几行"去收拾会漏掉的那一种：`RunQueue::release` 已经让它离开
+    /// `running`，回收集合里一个都没有，而那次尝试确实没有收尾。
+    #[tokio::test]
+    async fn an_attempt_left_open_by_a_gracefully_stopped_instance_is_still_closed() {
+        let f = fixture().await;
+        let (run, call) = a_run_with_an_open_attempt(&f).await;
+
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let old = ExecutorId::from_raw("exec-old");
+        let claimed = queue.claim_run(&run, &old).await.unwrap().unwrap();
+        // 正常停机：交还名额，这一行回到 queued。
+        queue.release(&claimed).await.unwrap();
+        assert_eq!(
+            runs::get(&f.db, &run).await.unwrap().unwrap().status,
+            RunStatus::Queued
+        );
+
+        let reclaimed = f
+            .store
+            .reclaim_running(&ExecutorId::from_raw("exec-now"))
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, 0, "没有 running 行要回收");
+        assert_eq!(
+            calls::attempts_of(&f.db, &call).await.unwrap()[0].state,
+            "interrupted",
+            "可那次尝试还是没有收尾"
+        );
+    }
+
+    /// 自己这一代开着的尝试不能被自己回收——那是**正在跑**的。
+    #[tokio::test]
+    async fn reclaim_leaves_this_instances_own_runs_alone() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", &f.session))
+            .await
+            .unwrap();
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let mine = ExecutorId::from_raw("exec-now");
+        queue
+            .claim_run(&accepted.run, &mine)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(f.store.reclaim_running(&mine).await.unwrap(), 0);
+        let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
+        assert_eq!(record.status, RunStatus::Running);
+        assert_eq!(record.claimed_by.as_deref(), Some("exec-now"));
     }
 
     /// `backfill` 用 JSONL 补索引与派生状态，**不重放动作**，而且可以重复跑。
@@ -720,10 +955,13 @@ mod tests {
             .mark_needs_attention(&accepted.run, "结果不明")
             .await
             .unwrap();
+        // 第 10 行「补发原结果」走的也是 backfill——它同样不能把这一行推回队列。
+        f.store.backfill(&accepted.run).await.unwrap();
 
         let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
         assert_eq!(record.status, RunStatus::Cancelled, "终态不动");
         assert!(record.last_error.is_none());
+        assert!(record.input_event.is_some(), "引用还是补上了");
     }
 
     #[tokio::test]

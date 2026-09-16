@@ -13,8 +13,9 @@ use crate::harness::*;
 /// > 文件。随后验证一次待审批 shell 在重启后仍等待，在飞书或 Telegram 里批准后**只执行
 /// > 一次**已确认的调用；若模拟执行结果丢失，则进入未知状态核对而不是自动重跑。
 ///
-/// 这里的"CLI"是 `komo-client` 那条 HTTP 路（`crates/komo-gateway` 不依赖它，所以这个
-/// 测试自己发同样的请求）。关键是**顺序**：先什么客户端都不开地让它自己接续，再连上去看。
+/// 这里的"CLI"就是 `komo-client` 的那条 HTTP 路——`resume` 这一步用**真的 `KomoClient`**
+/// 发（它是 gateway 的 dev-dependency，不成环）。关键是**顺序**：先什么客户端都不开地让
+/// 它自己接续，再连上去看。
 #[tokio::test]
 async fn the_first_end_to_end_acceptance() {
     let home = Home::new();
@@ -67,15 +68,17 @@ async fn the_first_end_to_end_acceptance() {
         "接续不重放已经完成的动作"
     );
 
-    // ── 3. 现在才 resume 原会话看结果。
-    let (code, body) = gw
-        .post(
-            &format!("/v1/sessions/{session}/resume"),
-            serde_json::json!({}),
+    // ── 3. 现在才 resume 原会话看结果——走 CLI 那条路（`komo resume` 用的就是它）。
+    let client = gw.client();
+    let resumed = client
+        .resume(
+            &session,
+            &komo_kernel::protocol::http::ResumeRequest::default(),
         )
-        .await;
-    assert_eq!(code, 200, "{body}");
-    let detail = gw.run_detail(&run).await;
+        .await
+        .expect("resume 得动");
+    assert_eq!(resumed.session, session);
+    let detail = client.run(&run).await.expect("读得到运行详情");
     assert_eq!(detail.summary.status, RunStatus::Completed);
     assert_eq!(detail.final_message.as_deref(), Some("报告写好了。"));
 
@@ -167,7 +170,77 @@ async fn the_first_end_to_end_acceptance() {
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     assert_eq!(counter.count(), 1, "重复批准不重复执行");
 
-    // ── 6. 模拟执行结果丢失 → 进入未知状态核对，而不是自动重跑。
+    // ── 6. 模拟执行结果丢失。§8.6 的规矩是「**先判断是否发生**，再决定是否重试」，所以
+    //    "丢了结果"有两种结局，取决于这个工具核对不核对得出来。两种各断言一次。
+    //
+    //    6a. `write`：目标身份与内容哈希都在计划里，核对**答得出来**。丢了输出之后恢复
+    //        读到"目标已是预期内容"，于是照实报告、**不重跑**，Run 正常收尾。
+    let written = home.workspace().join("e2e-verifiable.txt");
+    gw.stop().await;
+    let fault = home.inject(Fault::BeforeFinishCall);
+    let gw = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(
+                1,
+                "pc-verifiable",
+                "write",
+                serde_json::json!({
+                    "path": written.display().to_string(),
+                    "content": "核对得出来"
+                }),
+            ),
+            text_round(2, "写好了。"),
+        ]]))
+        .await;
+    let verifiable_run = gw.submit(&session, "e2e-4", "写一个能核对的文件").await.run;
+    fault.wait_tripped().await;
+    gw.stop().await;
+    let events = home.events(&session);
+    let written_started = tool_started(&events)
+        .last()
+        .map(|s| (*s).clone())
+        .expect("有这次尝试");
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap_or_default(),
+        "核对得出来",
+        "动作发出去了"
+    );
+    // 结果丢了：输出没落盘，`tool.result` 也没写。
+    home.drop_attempt_output(&session, &verifiable_run, &written_started);
+
+    home.clear_injection();
+    let gw = home.start(FakeLlm::finisher("核对之后收尾。")).await;
+    let status = gw
+        .wait_db_status(
+            &verifiable_run,
+            |s| s.is_terminal() || s == RunStatus::NeedsAttention,
+            "收场",
+        )
+        .await;
+    assert_eq!(
+        status,
+        RunStatus::Completed,
+        "核对答得出「目标已满足」，就照实报告并收尾（§8.6），不是停在 needs_attention"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&written).unwrap_or_default(),
+        "核对得出来",
+        "**没有重跑**：内容还是原来那一份"
+    );
+    let events = home.events(&session);
+    let attempts_of_write: Vec<_> = tool_started(&events)
+        .into_iter()
+        .filter(|started| started.call_id == written_started.call_id)
+        .collect();
+    assert_eq!(attempts_of_write.len(), 1, "只有那一次尝试，没有第二次");
+    assert!(
+        unpaired_attempts(&events).is_empty(),
+        "核对之后那条 started 也配上了结果：{:?}",
+        unpaired_attempts(&events)
+    );
+
+    //    6b. `shell`：默认 `verify` 是 `Unavailable`，**核对不出来**。同样丢了结果，这一
+    //        次只能进未知状态等人，且不能把命令再跑一遍。
     let counter2 = Counter::new(&home, "e2e-lost.count");
     gw.stop().await;
     let fault = home.inject(Fault::BeforeFinishCall);
@@ -182,12 +255,18 @@ async fn the_first_end_to_end_acceptance() {
             text_round(2, "跑过了。"),
         ]]))
         .await;
-    let lost_run = gw.submit(&session, "e2e-4", "再跑一条命令").await.run;
+    let lost_run = gw.submit(&session, "e2e-5", "再跑一条命令").await.run;
     let record = gw.wait_approval().await;
     gw.decide(&record.approval, true).await;
     fault.wait_tripped().await;
     gw.stop().await;
     assert_eq!(counter2.count(), 1, "动作发出去了，结果丢了");
+    let events = home.events(&session);
+    let lost_started = tool_started(&events)
+        .last()
+        .map(|s| (*s).clone())
+        .expect("有这次尝试");
+    home.drop_attempt_output(&session, &lost_run, &lost_started);
 
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
@@ -201,9 +280,24 @@ async fn the_first_end_to_end_acceptance() {
     assert_eq!(
         status,
         RunStatus::NeedsAttention,
-        "结果丢了要进未知状态核对，而不是自动重跑"
+        "核对不出结论就进未知状态等人，而不是自动重跑"
     );
     assert_eq!(counter2.count(), 1, "**没有自动重跑**");
+    let events = home.events(&session);
+    assert!(
+        unpaired_attempts(&events).is_empty(),
+        "那条 started 要配一条明确的 uncertain：{:?}",
+        unpaired_attempts(&events)
+    );
+    let settled = tool_results(&events)
+        .into_iter()
+        .find(|result| result.attempt_id == lost_started.attempt_id)
+        .expect("配上了");
+    assert_eq!(
+        settled.status,
+        komo_kernel::types::refs::ToolResultStatus::Uncertain,
+        "副作用发生没发生不知道"
+    );
     gw.stop().await;
 }
 
@@ -315,11 +409,14 @@ async fn directories_and_references() {
 
     gw.stop().await;
 
-    // ④ 不同 attempt 不互相覆盖：同一个调用被中断之后重做一次，两次尝试各写各的目录。
+    // ④ 不同 attempt 不互相覆盖：同一个调用被中断之后**真的重做一次**，两次尝试各写各的
+    //    目录，第二次不许碰第一次那一份。
     //
-    // 造法：`finish_call` 之前跳闸——第一次尝试已经把 output.json 发布出去了，结果事件没
-    // 写；停机之后把目标文件删掉，于是恢复时 `write` 的核对给出"确定未执行"，第二次尝试
-    // 真的跑起来并发布自己那一份输出。
+    // 造法三步：① `finish_call` 之前跳闸——第一次尝试已经把 output.json 发布出去了，结果
+    // 事件没写；② 停机之后把第一次那份 output.json **改名**存到旁边（`orphan::find` 于是
+    // 读不到"这次动作确实发生过"的证据，恢复退回工具自己的核对；改名而不是删除，是为了在
+    // 那个目录里留下一份第二次尝试**不许动**的真文件）；③ 把写好的目标文件删掉，于是
+    // `write` 的核对给出"确定未执行"，第二次尝试真的跑起来并发布自己那一份输出。
     let home2 = Home::new();
     let target = home2.workspace().join("attempts.txt");
     let fault = home2.inject(Fault::BeforeFinishCall);
@@ -338,6 +435,15 @@ async fn directories_and_references() {
     let run = gw.submit(&session, "attempts", "写个文件").await.run;
     fault.wait_tripped().await;
     gw.stop().await;
+
+    let first = tool_started(&home2.events(&session))
+        .first()
+        .map(|s| (*s).clone())
+        .expect("第一次尝试");
+    let first_dir = home2.attempt_dir(&session, &run, &first);
+    let kept = first_dir.join("output.json.kept");
+    std::fs::rename(first_dir.join("output.json"), &kept).expect("把第一次那份挪到旁边");
+    let kept_bytes = std::fs::read(&kept).expect("读得到");
     std::fs::remove_file(&target).expect("把写好的文件删掉");
 
     home2.clear_injection();
@@ -354,28 +460,48 @@ async fn directories_and_references() {
     );
     assert_eq!(started[0].call_id, started[1].call_id, "同一个 ToolCall");
     assert_ne!(started[0].attempt_id, started[1].attempt_id);
-    let call_dir = home2
-        .session_dir(&session)
-        .join("tool-output")
-        .join(run.as_str())
-        .join(started[0].call_id.as_str());
+    assert_eq!(started[0].attempt_id, first.attempt_id);
+
+    let call_dir = first_dir.parent().expect("调用目录").to_path_buf();
     let mut dirs: Vec<String> = std::fs::read_dir(&call_dir)
         .expect("调用目录在")
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .collect();
     dirs.sort();
+    assert_eq!(dirs.len(), 2, "两次尝试各有一个目录：{dirs:?}");
     assert!(
         dirs.contains(&started[0].attempt_id.to_string())
             && dirs.contains(&started[1].attempt_id.to_string()),
-        "两次尝试各有一个目录，谁也没盖掉谁：{dirs:?}"
+        "目录名就是 attempt ID：{dirs:?}"
     );
-    for attempt in [&started[0].attempt_id, &started[1].attempt_id] {
-        assert!(
-            call_dir.join(attempt.as_str()).join("output.json").exists(),
-            "每次尝试的完整输出都在自己那一份里：{attempt}"
-        );
-    }
+
+    // 第二次尝试把自己的输出写进**自己**那个目录，一个字节都没碰第一次那一份。
+    let second_output = call_dir
+        .join(started[1].attempt_id.as_str())
+        .join("output.json");
+    assert!(
+        second_output.exists(),
+        "第二次尝试的完整输出：{}",
+        second_output.display()
+    );
+    assert_eq!(
+        std::fs::read(&kept).expect("第一次那份还在"),
+        kept_bytes,
+        "谁也没盖掉谁"
+    );
+    let last = tool_results(&events)
+        .last()
+        .map(|r| (*r).clone())
+        .expect("有结果");
+    assert_eq!(
+        last.output_ref.path(),
+        format!(
+            "tool-output/{run}/{}/{}/output.json",
+            started[1].call_id, started[1].attempt_id
+        ),
+        "结果引用指的是第二次那一份"
+    );
     assert_eq!(
         std::fs::read_to_string(&target).unwrap_or_default(),
         "两次尝试",

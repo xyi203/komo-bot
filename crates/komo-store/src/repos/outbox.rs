@@ -28,13 +28,15 @@ pub struct PendingAudit {
 }
 
 /// 在控制事务里排一条审计事件。**event_id 由调用方固定**，补写按它幂等。
+///
+/// 没有 `now` 参数：入队时间由这里读钟。`occurred_at` 才是要保留的那个——补写保留**原始
+/// 发生时间**，不凭日志行相邻推断审批关系（§8.3），而"什么时候排进队的"只是运维信息。
 pub async fn enqueue_in(
     ex: &mut dyn Executor,
     session: &SessionId,
     event_id: &EventId,
-    payload: &EventPayload,
+    payload: EventPayload,
     occurred_at: OffsetDateTime,
-    now: OffsetDateTime,
 ) -> Result<(), StoreError> {
     if ControlOutboxRow::filter_by_id(event_id.as_str())
         .first()
@@ -45,7 +47,8 @@ pub async fn enqueue_in(
     {
         return Ok(());
     }
-    let (payload_type, data) = split_payload(payload)?;
+    let (payload_type, data) = split_payload(&payload)?;
+    let now = OffsetDateTime::now_utc();
     toasty::create!(ControlOutboxRow {
         id: event_id.as_str(),
         session_id: session.as_str(),
@@ -89,11 +92,13 @@ pub async fn pending(db: &Db, limit: usize) -> Result<Vec<PendingAudit>, StoreEr
     .await
 }
 
-/// 标记已交付，并记下它落在 JSONL 的哪个 seq。
+/// 标记已交付。
+///
+/// 落在 JSONL 的哪个 seq **从索引读回来**，不要调用方再报一遍：`session_log_index` 那一
+/// 行是同一个 `event_id` 在同一个事务里写下的，让它当唯一来源，两处就不会各说各的。
 pub async fn mark_delivered_in(
     ex: &mut dyn Executor,
     event_id: &EventId,
-    seq: Seq,
 ) -> Result<(), StoreError> {
     let Some(mut row) = ControlOutboxRow::filter_by_id(event_id.as_str())
         .first()
@@ -103,9 +108,16 @@ pub async fn mark_delivered_in(
     else {
         return Ok(());
     };
+    let seq = crate::models::SessionLogIndexRow::filter_by_id(event_id.as_str())
+        .first()
+        .exec(ex)
+        .await
+        .map_err(map_toasty)?
+        .map(|indexed| indexed.seq)
+        .unwrap_or(0);
     row.update()
         .delivered(true)
-        .seq(i64::try_from(seq.0).unwrap_or(i64::MAX))
+        .seq(seq)
         .exec(ex)
         .await
         .map_err(map_toasty)
@@ -160,7 +172,6 @@ mod tests {
     use komo_kernel::types::ids::ApprovalId;
     use time::macros::datetime;
 
-    const NOW: OffsetDateTime = datetime!(2026-09-15 08:00:00 UTC);
     const DECIDED_AT: OffsetDateTime = datetime!(2026-09-14 20:30:00 UTC);
 
     async fn temp() -> (Db, tempfile::TempDir) {
@@ -191,9 +202,8 @@ mod tests {
                     ex,
                     &SessionId::from_raw("sess-1"),
                     &EventId::from_raw(id),
-                    &payload(),
+                    payload(),
                     DECIDED_AT,
-                    NOW,
                 )
                 .await
             }) as BoxFuture<'_, Result<(), StoreError>>
@@ -218,9 +228,8 @@ mod tests {
         assert_eq!(waiting[0].payload, payload());
 
         db.with_write_retry(|ex| {
-            Box::pin(
-                async move { mark_delivered_in(ex, &EventId::from_raw("evt-1"), Seq(7)).await },
-            ) as BoxFuture<'_, Result<(), StoreError>>
+            Box::pin(async move { mark_delivered_in(ex, &EventId::from_raw("evt-1")).await })
+                as BoxFuture<'_, Result<(), StoreError>>
         })
         .await
         .unwrap();
@@ -252,9 +261,8 @@ mod tests {
                     ex,
                     &SessionId::from_raw("sess-1"),
                     &EventId::from_raw("evt-x"),
-                    &unknown,
+                    unknown,
                     DECIDED_AT,
-                    NOW,
                 )
                 .await
             }) as BoxFuture<'_, Result<(), StoreError>>

@@ -11,7 +11,7 @@ use komo_kernel::traits::{RepoError, StoreError};
 use komo_kernel::types::chat::{
     ChannelPeer, ChannelPlatform, Delivery, DeliveryState, DeliveryTarget, Outbound, PeerId,
 };
-use komo_kernel::types::ids::DeliveryId;
+use komo_kernel::types::ids::{ApprovalId, DeliveryId};
 use time::OffsetDateTime;
 
 use crate::db::{BoxFuture, Db, decode, encode, map_toasty, to_ts};
@@ -78,6 +78,7 @@ impl TursoDeliveryRepo {
                         chat_id: target.peer.chat_id.as_str(),
                         is_home: target.is_home,
                         outbound: encode(&outbound)?,
+                        approval_id: approval_of(&outbound).map(|a| a.to_string()),
                         state: enum_str(&DeliveryState::Pending),
                         attempts: 0_i64,
                         last_error: None as Option<String>,
@@ -174,6 +175,58 @@ impl TursoDeliveryRepo {
             .map_err(RepoError::from)
     }
 
+    /// 当初把这条审批**投到过哪几个地方**。
+    ///
+    /// 「审批请求的投递目标：Run 的来源会话，**加上** home chat（若不同）」（§11.4）。
+    /// 决定之后要把 `ApprovalSettled` 投回**每一个**，否则另一头那张卡会一直停在"等你
+    /// 回答"——而那个人已经答过了。
+    ///
+    /// 只看 `ApprovalRequest` 那几行：`ApprovalSettled` 自己也带审批 ID，把它算进来会
+    /// 让第二次结算投到自己刚投过的地方。**按目标去重**，同一个会话只回一次。
+    pub async fn targets_for_approval(
+        &self,
+        approval: &ApprovalId,
+    ) -> Result<Vec<ChannelPeer>, RepoError> {
+        let approval = approval.to_string();
+        self.db
+            .read(move |ex| {
+                let approval = approval.clone();
+                Box::pin(async move {
+                    let mut rows = DeliveryRow::filter(
+                        DeliveryRow::fields().approval_id().eq(approval.as_str()),
+                    )
+                    .exec(ex)
+                    .await
+                    .map_err(map_toasty)?;
+                    rows.sort_by(|a, b| a.id.cmp(&b.id));
+
+                    let mut out: Vec<ChannelPeer> = Vec::new();
+                    for row in &rows {
+                        // 行里的正文是渠道写下的；解不出来就跳过，不让一行坏数据把结算
+                        // 投递整个带走。
+                        let Ok(outbound) = serde_json::from_str::<Outbound>(&row.outbound) else {
+                            continue;
+                        };
+                        if !matches!(outbound, Outbound::ApprovalRequest(_)) {
+                            continue;
+                        }
+                        let platform: ChannelPlatform =
+                            decode(&format!("\"{}\"", row.platform), "deliveries.platform")?;
+                        let peer = ChannelPeer {
+                            platform,
+                            chat_id: PeerId::new(row.chat_id.clone()),
+                        };
+                        if !out.contains(&peer) {
+                            out.push(peer);
+                        }
+                    }
+                    Ok(out)
+                }) as BoxFuture<'_, Result<Vec<ChannelPeer>, StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
     pub async fn get(&self, id: &DeliveryId) -> Result<Option<DeliveryRecord>, RepoError> {
         let id = id.to_string();
         self.db
@@ -193,6 +246,15 @@ impl TursoDeliveryRepo {
             })
             .await
             .map_err(RepoError::from)
+    }
+}
+
+/// 这条外发说的是哪条审批。`ApprovalRequest` 与 `ApprovalSettled` 有，其余没有。
+fn approval_of(outbound: &Outbound) -> Option<&ApprovalId> {
+    match outbound {
+        Outbound::ApprovalRequest(presentation) => Some(&presentation.approval),
+        Outbound::ApprovalSettled { approval, .. } => Some(approval),
+        _ => None,
     }
 }
 
@@ -243,6 +305,25 @@ mod tests {
             peer: ChannelPeer::new(platform, chat),
             is_home,
         }
+    }
+
+    fn approval_request(approval: &ApprovalId, index: u32) -> Outbound {
+        use komo_kernel::types::chat::{ApprovalPresentation, ApprovalScope};
+        let plan = komo_kernel::test_support::sample_plan(
+            "shell",
+            &komo_kernel::types::ids::SessionId::from_raw("sess-1"),
+        );
+        Outbound::ApprovalRequest(Box::new(ApprovalPresentation {
+            approval: approval.clone(),
+            short_id: komo_kernel::types::ids::ShortId::from_index(index),
+            plan_hash: plan.plan_hash(),
+            plan,
+            reason: "要人看一眼".into(),
+            changes: None,
+            evidence: None,
+            scopes: vec![ApprovalScope::Once],
+            valid_until: None,
+        }))
     }
 
     fn text() -> Outbound {
@@ -316,6 +397,111 @@ mod tests {
         assert_eq!(repo.pending(Some(&peer)).await.unwrap().len(), 1);
         assert!(
             repo.pending(Some(&ChannelPeer::new(ChannelPlatform::Wechat, "wxid_y")))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// 验收 BUG(2)：决定之后要把结算投回当初投过的**每一个**目标（§11.4）。
+    #[tokio::test]
+    async fn an_approvals_targets_are_every_place_the_request_went() {
+        let (db, _dir) = temp().await;
+        let repo = TursoDeliveryRepo::new(db);
+        let approval = ApprovalId::from_raw("ap-1");
+
+        // 「Run 的来源会话，**加上** home chat（若不同）」。
+        let source = ChannelPeer::new(ChannelPlatform::Telegram, "42");
+        let home = ChannelPeer::new(ChannelPlatform::Feishu, "oc_home");
+        repo.record(
+            &DeliveryId::from_raw("d-1"),
+            &DeliveryTarget::to_peer(source.clone()),
+            &approval_request(&approval, 1),
+            NOW,
+        )
+        .await
+        .unwrap();
+        repo.record(
+            &DeliveryId::from_raw("d-2"),
+            &DeliveryTarget::home(home.clone()),
+            &approval_request(&approval, 1),
+            NOW,
+        )
+        .await
+        .unwrap();
+        // 别的审批、别的会话——不该混进来。
+        repo.record(
+            &DeliveryId::from_raw("d-3"),
+            &DeliveryTarget::to_peer(ChannelPeer::new(ChannelPlatform::Wechat, "wxid_x")),
+            &approval_request(&ApprovalId::from_raw("ap-2"), 2),
+            NOW,
+        )
+        .await
+        .unwrap();
+        // 一条普通文本，不带审批 ID。
+        repo.record(
+            &DeliveryId::from_raw("d-4"),
+            &DeliveryTarget::to_peer(ChannelPeer::new(ChannelPlatform::Wechat, "wxid_y")),
+            &text(),
+            NOW,
+        )
+        .await
+        .unwrap();
+
+        let targets = repo.targets_for_approval(&approval).await.unwrap();
+        assert_eq!(targets, vec![source.clone(), home.clone()]);
+
+        // 结算投出去之后再问一次：不能把自己刚投过的地方也算进来，否则第二次结算会
+        // 再投一轮。
+        repo.record(
+            &DeliveryId::from_raw("d-5"),
+            &DeliveryTarget::to_peer(source.clone()),
+            &Outbound::ApprovalSettled {
+                approval: approval.clone(),
+                short_id: komo_kernel::types::ids::ShortId::from_index(1),
+                approved: true,
+                by: PeerId::new("operator"),
+                at: NOW,
+            },
+            NOW,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.targets_for_approval(&approval).await.unwrap(),
+            vec![source, home]
+        );
+    }
+
+    /// 同一个会话投过两次也只回一次。
+    #[tokio::test]
+    async fn a_target_that_was_written_twice_is_only_returned_once() {
+        let (db, _dir) = temp().await;
+        let repo = TursoDeliveryRepo::new(db);
+        let approval = ApprovalId::from_raw("ap-1");
+        let peer = ChannelPeer::new(ChannelPlatform::Telegram, "42");
+        for id in ["d-1", "d-2"] {
+            repo.record(
+                &DeliveryId::from_raw(id),
+                &DeliveryTarget::to_peer(peer.clone()),
+                &approval_request(&approval, 1),
+                NOW,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            repo.targets_for_approval(&approval).await.unwrap(),
+            vec![peer]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_nobody_delivered_has_no_targets() {
+        let (db, _dir) = temp().await;
+        let repo = TursoDeliveryRepo::new(db);
+        assert!(
+            repo.targets_for_approval(&ApprovalId::from_raw("ap-9"))
                 .await
                 .unwrap()
                 .is_empty()

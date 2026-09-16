@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
-use komo_kernel::protocol::http::{ApprovalDecisionResponse, SubmitRunResponse};
+use komo_kernel::protocol::http::{ApprovalDecisionResponse, ApprovalRecord, SubmitRunResponse};
 use komo_kernel::traits::{
     ApprovalRepo, Clock, CronRepo, GatewayError, Ledger, LlmClient, MemoryRepo, RepoError,
     RunQueue, StoreError, ToolOutputStore,
@@ -193,6 +193,9 @@ pub struct GatewayState {
     pub hub: SharedHub,
     pub ledgers: Arc<SessionLedgers>,
     pub routed: Arc<RoutedLedger>,
+    /// 一次 Run 的三个写入者共用的那个账本句柄（测试的故障注入口包的就是它）。审计补写
+    /// 也走它——补写是账本写入的一种，没有理由绕过同一条缝。
+    pub turn_ledger: Arc<dyn Ledger>,
     pub outputs: Arc<dyn ToolOutputStore>,
     pub queue: Arc<TursoRunQueue>,
     pub approvals: Arc<ApprovalGate>,
@@ -200,6 +203,7 @@ pub struct GatewayState {
     pub cron: Arc<dyn CronRepo>,
     pub memory: Arc<dyn MemoryRepo>,
     pub recovery_store: RecoveryStore,
+    pub deliveries: Arc<TursoDeliveryRepo>,
     pub notifier: Arc<HomeNotifier>,
     pub channels: Arc<ChannelRegistry>,
     pub llm: Arc<SwappableLlm>,
@@ -291,7 +295,7 @@ impl GatewayState {
         let deliveries = Arc::new(TursoDeliveryRepo::new(db.clone()));
         let channels = Arc::new(ChannelRegistry::new());
         let delivery_log = Arc::new(DeliveryLog::new(
-            deliveries,
+            Arc::clone(&deliveries),
             Arc::clone(&channels),
             Arc::clone(&clock),
         ));
@@ -333,6 +337,7 @@ impl GatewayState {
             Arc::clone(&routed),
             db.clone(),
             Arc::clone(&approval_repo),
+            RecoveryStore::new(db.clone(), sessions_root.clone()),
             snapshot.paths.workspaces_dir.clone(),
             max_rounds,
             max_retries,
@@ -368,6 +373,7 @@ impl GatewayState {
             hub,
             ledgers,
             routed,
+            turn_ledger,
             outputs,
             queue,
             approvals,
@@ -375,6 +381,7 @@ impl GatewayState {
             cron,
             memory,
             recovery_store,
+            deliveries,
             notifier,
             channels,
             llm,
@@ -463,6 +470,15 @@ impl GatewayState {
                 ),
             )),
         )
+        // 「output.json 已完成但 JSONL 结果事件尚未写入 → 校验身份、计划及完成状态后补记
+        // 结果；**不能只凭文件存在判断**」（§14 故障注入表）。没有这一口时恢复只能把
+        // `started` 而无结果的调用交给工具核对，那条路对一次已经跑完的 `shell` 答不出
+        // "它到底发生了没有"。
+        .with_orphan_outputs(Arc::new(
+            komo_runtime::recovery::SessionDirOrphanOutputs::new(
+                self.snapshot().paths.sessions_dir.clone(),
+            ),
+        ))
     }
 
     /// 操作者那**一个**常驻会话（§11.2 的 home session）。
@@ -570,14 +586,145 @@ impl GatewayState {
                     .unwrap_or_else(|| PeerId::new("operator")),
                 at: response.decision.decided_at,
             };
-            if let Err(error) = self.notifier.deliver_home(settled).await {
-                tracing::debug!(%error, "没有 home chat 可投，跳过界面回写");
-            }
+            self.settle_everywhere(approval, settled).await;
+
+            // §8.5 的**反向补写**：决定的权威是 state.db，审计事件随后补进 JSONL。这里
+            // 只**排队**——补写由启动顺序的第 3 步与后台的周期补写做（§8.7）。
+            //
+            // 不在这里当场补写，是因为审批决定与 Run 的续跑是同一瞬间的事：决定之后
+            // `wake_run` 会让这个 Run 立刻回到队列，而补写是另一次账本写入，插在中间只会
+            // 让"决定"这条路径多一个可能失败的步骤——而它一个字都不该影响决定（§8.2：
+            // 提交即 fsync，审批生效不依赖审计补写成功）。
+            self.enqueue_audit(&record, &response.decision).await;
+
             if let Some(run) = &record.run {
                 self.wake_run(run).await?;
             }
         }
         Ok(response)
+    }
+
+    /// 把结论投回**当初投过这条审批的每一个会话**（§11.4）。
+    ///
+    /// 「决定过的请求不该还长着可点的按钮」（§11.3）——请求投到了来源会话**加上** home
+    /// chat，那么结论也要回到这两处，而不是只回其中一处。目标从 `deliveries` 里查：那张
+    /// 表记的正是"当初投到过哪儿"，用它就不必让决定这一侧再猜一遍路由。
+    async fn settle_everywhere(
+        &self,
+        approval: &ApprovalId,
+        settled: komo_kernel::types::chat::Outbound,
+    ) {
+        let mut targets = match self.deliveries.targets_for_approval(approval).await {
+            Ok(targets) => targets,
+            Err(error) => {
+                tracing::warn!(%error, "查不到这条审批投过哪儿，只回写 home chat");
+                Vec::new()
+            }
+        };
+        // home chat 永远补一份：它可能是在请求之后才配上的。
+        for target in self.notifier.home_targets() {
+            if !targets.contains(&target.peer) {
+                targets.push(target.peer);
+            }
+        }
+        if targets.is_empty() {
+            tracing::debug!(%approval, "没有可回写的会话，跳过界面回写");
+            return;
+        }
+        for peer in targets {
+            if let Err(error) = self
+                .notifier
+                .log()
+                .deliver(
+                    &komo_kernel::types::chat::DeliveryTarget::to_peer(peer.clone()),
+                    settled.clone(),
+                )
+                .await
+            {
+                // 界面回写失败**不改变结论**（§11.3）。
+                tracing::debug!(%error, %peer, "结论回写投不出去");
+            }
+        }
+    }
+
+    /// 把一条 `approval.decided` 排进 `control_outbox`（§8.5 的反向顺序第一步）。
+    async fn enqueue_audit(
+        &self,
+        record: &ApprovalRecord,
+        decision: &komo_kernel::protocol::http::ApprovalDecisionRecord,
+    ) {
+        let event_id = komo_kernel::types::ids::EventId::new_at(decision.decided_at);
+        let payload = komo_kernel::events::EventPayload::ApprovalDecided(
+            komo_kernel::events::ApprovalDecided {
+                approval: record.approval.clone(),
+                approved: decision.approved,
+                scope: decision.scope,
+                by: decision.by.clone(),
+                decided_at: decision.decided_at,
+                grant: decision.grant.clone(),
+            },
+        );
+        let session = record.session.clone();
+        let occurred_at = decision.decided_at;
+        let result = self
+            .db
+            .with_write_retry(move |ex| {
+                let (session, event_id, payload) =
+                    (session.clone(), event_id.clone(), payload.clone());
+                Box::pin(async move {
+                    komo_store::repos::outbox::enqueue_in(
+                        ex,
+                        &session,
+                        &event_id,
+                        payload,
+                        occurred_at,
+                    )
+                    .await
+                }) as komo_store::db::BoxFuture<'_, Result<(), StoreError>>
+            })
+            .await;
+        if let Err(error) = result {
+            // 排不进去只是**审计**补不上，决定本身已经提交了（§8.2：提交即 fsync）。
+            tracing::warn!(%error, approval = %record.approval, "审计事件排不进 outbox");
+        }
+    }
+
+    /// 把 `control_outbox` 里还没补写的审计事件追加到各自 Session 的 JSONL。
+    ///
+    /// 「重启后重发同一个 outbox 事件先按 `event_id` 去重，已写入就复用原事件位置」
+    /// （§8.5）——幂等在 `Coordinator::append_audit` 里，这里只负责把它们递过去。返回
+    /// 这次补写了几条。
+    pub async fn drain_audit(&self) -> usize {
+        let pending = match komo_store::repos::outbox::pending(&self.db, AUDIT_DRAIN_LIMIT).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                tracing::warn!(%error, "读不出待补写的审计事件");
+                return 0;
+            }
+        };
+        let mut written = 0;
+        for audit in pending {
+            match self
+                .turn_ledger
+                .append_audit(
+                    &audit.session,
+                    &audit.event_id,
+                    audit.payload,
+                    audit.occurred_at,
+                )
+                .await
+            {
+                // `append_audit` 在同一个提交里标记 outbox 已交付，这里不必再写一次。
+                Ok(_) => written += 1,
+                Err(error) => {
+                    tracing::warn!(%error, event = %audit.event_id, "审计事件补写不进去，留在 outbox");
+                }
+            }
+        }
+        if written > 0 {
+            tracing::info!(written, "补写了审计事件");
+        }
+        written
     }
 
     /// 把一个等着的 Run 放回队列并叫醒调度器（`/approve` 之后、`resume` 之后都走它）。
@@ -616,6 +763,9 @@ impl GatewayState {
 
 /// `sessions.origin` 里 home session 的那个值。
 pub const HOME_ORIGIN: &str = "home";
+
+/// 一次补写最多处理多少条审计事件。
+const AUDIT_DRAIN_LIMIT: usize = 128;
 
 /// 按快照造模型后端；造不出来就退到 [`UnconfiguredLlm`]，**不让 Gateway 起不来**。
 fn build_llm(

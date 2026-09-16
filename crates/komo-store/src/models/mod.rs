@@ -114,6 +114,7 @@ pub const INDEXES: &[&str] = &[
     r#"CREATE INDEX IF NOT EXISTS "grants_job" ON "policy_grants" ("job_id", "job_version")"#,
     r#"CREATE INDEX IF NOT EXISTS "outbox_undelivered" ON "control_outbox" ("delivered")"#,
     r#"CREATE INDEX IF NOT EXISTS "deliveries_state" ON "deliveries" ("state")"#,
+    r#"CREATE INDEX IF NOT EXISTS "deliveries_approval" ON "deliveries" ("approval_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "cron_firings_job" ON "cron_firings" ("job_id", "scheduled_at")"#,
     r#"CREATE INDEX IF NOT EXISTS "memory_evidence_memory" ON "memory_evidence" ("memory_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "memory_vectors_memory" ON "memory_vectors" ("memory_id", "generation")"#,

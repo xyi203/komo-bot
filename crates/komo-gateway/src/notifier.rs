@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::traits::{DeliverError, Notifier};
 use komo_kernel::types::chat::{
-    ApprovalPresentation, ChannelPeer, Delivery, DeliveryTarget, Outbound,
+    ApprovalPresentation, ChannelPeer, ChannelPlatform, Delivery, DeliveryTarget, Outbound,
 };
 use komo_runtime::config::ConfigHolder;
 
@@ -98,6 +98,12 @@ impl HomeNotifier {
     /// 冲刷某个会话（或全部）还没送到的投递。
     pub async fn flush(&self, peer: Option<&ChannelPeer>) -> usize {
         self.log.flush(peer).await
+    }
+
+    /// 冲刷**一个平台**名下还没送到的投递。渠道刚起来时用它——在发送口登记之前冲刷是
+    /// 一个空动作（W5 验收 BUG(3)）。
+    pub async fn flush_platform(&self, platform: ChannelPlatform) -> usize {
+        self.log.flush_platform(platform).await
     }
 }
 

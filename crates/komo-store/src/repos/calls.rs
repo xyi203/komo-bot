@@ -212,10 +212,17 @@ pub async fn record_result_in(
     Ok(call)
 }
 
-/// 把上一代执行实例遗留的、没有收尾的尝试标成 `interrupted`（§8.7）。
+/// 把**不属于本次启动身份**的、没有收尾的尝试标成 `interrupted`（§8.7）。返回改了几行。
 ///
-/// **调用状态不动**：`started` 而无结果的调用仍要走 §8.6 的核对流程，把它改成 failed
-/// 就等于宣布副作用没发生，而那正是不知道的事。
+/// **调用状态一个字不动**：`started` 而无结果的调用仍要走 §8.6 的核对流程，把它改成
+/// failed 就等于宣布副作用没发生，而那正是不知道的事。这里说的只有"那个执行实例没回
+/// 来"——`AttemptState::Interrupted` 的全部含义。
+///
+/// 按**执行实例**作用域，不按"被回收的那几个 Run"：正常停机时 `RunQueue::release` 已经
+///把 Run 从 `running` 放回 `queued`，于是它根本不在回收集合里，可它的尝试还停在
+/// `started`。一个 db 文件只有一个进程开着（§8.2），所以"不是本次启动身份的 started
+/// 尝试"就是上一世留下的，一个不漏。`executor` 为空的同理——不知道是谁的，就一定不是
+/// 这次的。
 pub async fn interrupt_open_attempts_in(
     ex: &mut dyn Executor,
     executor: &ExecutorId,

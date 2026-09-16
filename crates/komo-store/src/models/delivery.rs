@@ -17,6 +17,12 @@ pub struct DeliveryRow {
     pub is_home: bool,
     /// `Outbound` 的 JSON。
     pub outbound: String,
+    /// 这条投递说的是哪条审批（只有 `ApprovalRequest` / `ApprovalSettled` 有）。
+    ///
+    /// 它是从 `outbound` 里提出来的**同一个值**，另开一列只为了能在 SQL 里筛：决定之后
+    /// 要把 `ApprovalSettled` 投到当初 `ApprovalRequest` 投过的**每一个**目标，那是一次
+    /// 按审批 ID 的查询（§11.4）。
+    pub approval_id: Option<String>,
     /// `DeliveryState`：pending / sent / deferred。
     pub state: String,
     pub attempts: i64,
@@ -31,7 +37,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "deliveries" ("id" TEXT NOT NULL, "platform" TEXT NOT NULL, "chat_id" TEXT NOT NULL, "is_home" BOOLEAN NOT NULL, "outbound" TEXT NOT NULL, "state" TEXT NOT NULL, "attempts" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "deliveries" ("id" TEXT NOT NULL, "platform" TEXT NOT NULL, "chat_id" TEXT NOT NULL, "is_home" BOOLEAN NOT NULL, "outbound" TEXT NOT NULL, "approval_id" TEXT, "state" TEXT NOT NULL, "attempts" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -39,6 +45,7 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("chat_id", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("is_home", "BOOLEAN NOT NULL DEFAULT 0"),
     ColumnSpec::new("outbound", "TEXT NOT NULL DEFAULT '{}'"),
+    ColumnSpec::new("approval_id", "TEXT"),
     ColumnSpec::new("state", "TEXT NOT NULL DEFAULT 'pending'"),
     ColumnSpec::new("attempts", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("last_error", "TEXT"),

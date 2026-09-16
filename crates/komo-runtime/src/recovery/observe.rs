@@ -7,7 +7,8 @@
 
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::recovery::{LogTail, PendingCall};
-use komo_kernel::types::ids::{ApprovalId, RunId, ToolCallId};
+use komo_kernel::types::ids::{ApprovalId, AttemptId, RunId, ToolCallId};
+use komo_kernel::types::plan::PlanHash;
 use komo_kernel::types::refs::OutputRef;
 
 /// 这个 Run 在日志里的事件，按 seq 顺序。
@@ -128,6 +129,31 @@ pub fn output_ref_of(events: &[Event], run: &RunId, call: &ToolCallId) -> Option
             EventPayload::ToolResult(result) if &result.call_id == call => {
                 Some(result.output_ref.clone())
             }
+            _ => None,
+        })
+}
+
+/// 一条 `tool.started` 说了什么：哪次尝试、哪份计划。
+///
+/// 恢复要它是因为「started 本身不证明副作用已发生」（§8.5）——要去核对那次**尝试**的
+/// 输出，就得先知道它的 ID；而计划哈希是核对身份的另一半。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StartedCall {
+    pub attempt: AttemptId,
+    pub plan_hash: PlanHash,
+}
+
+/// 这个调用**最后一次** `tool.started`。一次重试沿用 ToolCall ID、新增一条 attempt
+/// （§8.6），所以要的是最后那条。
+pub fn started_call(events: &[Event], run: &RunId, call: &ToolCallId) -> Option<StartedCall> {
+    events_of(events, run)
+        .iter()
+        .rev()
+        .find_map(|event| match &event.payload {
+            EventPayload::ToolStarted(started) if &started.call_id == call => Some(StartedCall {
+                attempt: started.attempt_id.clone(),
+                plan_hash: started.plan_hash.clone(),
+            }),
             _ => None,
         })
 }

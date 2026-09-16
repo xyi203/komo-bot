@@ -35,7 +35,7 @@ pub mod inbound;
 pub mod login;
 pub mod send;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 
 use std::collections::{HashSet, VecDeque};
@@ -203,8 +203,9 @@ impl WeChatChannel {
         &self.config
     }
 
-    #[cfg(test)]
-    fn tuned(mut self) -> Self {
+    /// 把重试与空转节奏调快，给测试用。
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn tuned(mut self) -> Self {
         self.idle_floor = Duration::from_millis(5);
         self.retry_base = Duration::from_millis(5);
         self.retry_cap = Duration::from_millis(20);

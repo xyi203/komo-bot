@@ -214,7 +214,16 @@ impl Dispatcher {
         from: &ChannelPeer,
     ) -> Result<InboundAck, GatewayError> {
         let record = match short_id {
-            Some(short) => self.state.approval_repo.find_by_short_id(&short).await?,
+            // **`find_latest_by_short_id`，不是 `find_by_short_id`**：后者只看待处理集合
+            // （§11.3 的短 ID 就活在那个集合里），于是第二次点击查到 `None`，得到的是
+            // 「没有这条」而不是「已决定」。§11.3 的命令表要求「已决定的返回原决定，
+            // 不报错」，§14 的验证列逐字要求「同一人连点两次第二次得到『已决定』」。
+            Some(short) => {
+                self.state
+                    .approval_repo
+                    .find_latest_by_short_id(&short)
+                    .await?
+            }
             None => {
                 // 「无 ID 时只有**恰好一个**待处理请求才生效；多于一个则列出并要求指明」
                 let pending = self.state.approval_repo.list_pending(None).await?;
@@ -239,9 +248,18 @@ impl Dispatcher {
         };
         let Some(record) = record else {
             return Ok(InboundAck::Replied {
-                text: "没有这条待处理的审批（也可能它已经有结论了）。".into(),
+                text: "没有这条审批——这个短 ID 从来没有出现过。".into(),
             });
         };
+
+        // 已经有结论了：回原决定，**不报错、也不再决定一次**（§11.3）。走
+        // `decide_approval` 也答得出同样的话（它是幂等的），但那要多一次写事务，而这里
+        // 手上已经有那条记录了。
+        if let Some(decision) = &record.decision {
+            return Ok(InboundAck::Replied {
+                text: decided_text(&record, decision),
+            });
+        }
 
         let response = self
             .state
@@ -253,37 +271,14 @@ impl Dispatcher {
             )
             .await?;
 
-        // 决定之后把结论投回**这个**会话：卡片就长在这里。home chat 那一份由
-        // `decide_approval` 投（四个界面共用的那一段），所以这里只补来源会话。
-        let settled = Outbound::ApprovalSettled {
-            approval: record.approval.clone(),
-            short_id: record.short_id.clone(),
-            approved: response.decision.approved,
-            by: principal.id().clone(),
-            at: response.decision.decided_at,
-        };
-        if !self
-            .state
-            .notifier
-            .home_targets()
-            .iter()
-            .any(|target| &target.peer == from)
-        {
-            let _ = self
-                .state
-                .notifier
-                .log()
-                .deliver(&DeliveryTarget::to_peer(from.clone()), settled)
-                .await;
-        }
+        // 结论投回**当初投过这条审批的每一个会话**，那一段在
+        // `GatewayState::decide_approval` 里（四个界面共用）——这里不再另投一份，否则
+        // 下命令的这个会话会收到两条。
+        let _ = from;
 
         Ok(InboundAck::Replied {
             text: if response.already_decided {
-                format!(
-                    "{} 已经决定过了：{}。",
-                    record.short_id,
-                    decision_text(response.decision.approved)
-                )
+                decided_text(&record, &response.decision)
             } else {
                 format!(
                     "{} {}。",
@@ -446,6 +441,40 @@ fn reject(msg: &InboundMessage) -> InboundAck {
 
 fn id_reply(msg: &InboundMessage) -> String {
     format!("会话：{}\n发送者：{}", msg.peer, msg.sender)
+}
+
+/// 「已决定：原决定 · 谁 · 何时」。
+///
+/// §11.3：「已决定的返回原决定，**不报错**」——所以这句话要说得出是谁、什么时候决定的，
+/// 否则第二个人只知道"轮不到我了"，不知道轮到了谁。
+fn decided_text(
+    record: &komo_kernel::protocol::http::ApprovalRecord,
+    decision: &komo_kernel::protocol::http::ApprovalDecisionRecord,
+) -> String {
+    let by = decision
+        .by
+        .as_ref()
+        .map(|peer| peer.to_string())
+        .unwrap_or_else(|| "操作者".to_string());
+    format!(
+        "{} 已经决定过了：{} · {} · {}",
+        record.short_id,
+        decision_text(decision.approved),
+        by,
+        stamp(decision.decided_at)
+    )
+}
+
+/// 决定时刻，按本地可读的样子。
+fn stamp(at: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute()
+    )
 }
 
 fn decision_text(approved: bool) -> &'static str {

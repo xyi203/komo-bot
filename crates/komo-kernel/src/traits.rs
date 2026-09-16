@@ -356,6 +356,15 @@ pub trait ApprovalRepo: Send + Sync {
     /// 短 ID 在**待处理集合内**唯一，所以这个查找只在待处理集合里做（§11.3）。
     async fn find_by_short_id(&self, short: &ShortId) -> Result<Option<ApprovalRecord>, RepoError>;
 
+    /// 聊天里的 `/approve <short_id>` 第二次到达时用：**待处理的优先**，没有就取**最近一条
+    /// 已决定的**同短 ID 记录，让 Dispatcher 能回「已决定：原决定」而不是「没有这条」
+    /// （§11.3「已决定的返回原决定，不报错」）。短 ID 的重用窗口是「下一条审批产生之前」，
+    /// 所以待处理那条才是用户正看着的那张卡。
+    async fn find_latest_by_short_id(
+        &self,
+        short: &ShortId,
+    ) -> Result<Option<ApprovalRecord>, RepoError>;
+
     async fn list_pending(
         &self,
         session: Option<&SessionId>,

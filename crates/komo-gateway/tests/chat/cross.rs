@@ -258,7 +258,6 @@ allow_from = [111]
 // 建议：把 `flush(None)` 挪到 `supervisor.start_all` 之后（它不依赖 HTTP 监听，只依赖
 // 渠道注册表），或者在 `ChannelRegistry::register` 之后按平台冲刷一次。
 #[tokio::test]
-#[ignore = "BUG(3)：启动时的 flush 跑在渠道登记之前，pending 投递不会被补发"]
 async fn a_pending_delivery_is_resent_once_after_a_restart() {
     let first = MemSender::new(ChannelPlatform::Telegram);
     first.defer(true);
@@ -302,62 +301,6 @@ async fn a_pending_delivery_is_resent_once_after_a_restart() {
     assert!(
         gateway.pending_deliveries().await.is_empty(),
         "补发之后不再 pending"
-    );
-}
-
-/// 上一条的"现状"版本，**常开**：重启没有补发，但下一条入站消息会把它冲刷出去——
-/// 也就是说数据没丢，丢的是"不用等人说话"这条保证。
-#[tokio::test]
-async fn today_a_restart_leaves_the_delivery_pending_until_someone_speaks() {
-    let first = MemSender::new(ChannelPlatform::Telegram);
-    first.defer(true);
-    let mut gateway = GatewayBuilder::new(&telegram_config("111"))
-        .factory(FixedFactory::sender_only(
-            Arc::clone(&first) as Arc<dyn ChannelSender>
-        ))
-        .start()
-        .await;
-    gateway
-        .state()
-        .notifier
-        .deliver(
-            &DeliveryTarget::home(ChannelPeer::new(ChannelPlatform::Telegram, "111")),
-            Outbound::Text {
-                text: "要批一下".into(),
-            },
-        )
-        .await
-        .expect("登记得上");
-
-    let second = MemSender::new(ChannelPlatform::Telegram);
-    gateway
-        .restart_with(
-            &telegram_config("111"),
-            vec![FixedFactory::sender_only(
-                Arc::clone(&second) as Arc<dyn ChannelSender>
-            )],
-        )
-        .await;
-
-    // 见 BUG(3)：启动的那一次冲刷什么都没送出去。
-    assert!(second.texts().is_empty(), "{:?}", second.texts());
-    assert_eq!(gateway.pending_deliveries().await.len(), 1, "行还在");
-
-    // 操作者说了一句话——这一次才真的补发，而且只补发一次。
-    gateway.handle(operator_dm("在", "telegram:100")).await;
-    assert_eq!(second.texts(), vec!["要批一下".to_string()]);
-    assert!(gateway.pending_deliveries().await.is_empty());
-
-    // 再说一句也不会送第二遍。
-    gateway.handle(operator_dm("还在", "telegram:101")).await;
-    assert_eq!(
-        second
-            .texts()
-            .iter()
-            .filter(|text| *text == "要批一下")
-            .count(),
-        1,
-        "补发按 DeliveryId 幂等"
     );
 }
 

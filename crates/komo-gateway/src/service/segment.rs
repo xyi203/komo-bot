@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::{Surface, fold};
-use komo_kernel::traits::{ApprovalRepo, Ledger};
+use komo_kernel::traits::{ApprovalRepo, Ledger, LedgerError};
 use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
 use komo_kernel::types::turn::{ReplayMessage, ToolResultForModel, TurnRequest};
@@ -28,7 +28,7 @@ use komo_runtime::agent::handler::SegmentSource;
 use komo_runtime::agent::{Budget, ResumedRound, RetryBudget, Segment};
 use komo_runtime::executor::{CallEnv, CallRequest, resumed_from};
 use komo_runtime::scheduler::HandlerError;
-use komo_store::Db;
+use komo_store::{Db, RecoveryStore};
 
 use super::ledgers::RoutedLedger;
 
@@ -37,6 +37,8 @@ pub struct GatewaySegments {
     routed: Arc<RoutedLedger>,
     db: Db,
     approvals: Arc<dyn ApprovalRepo>,
+    /// 读不出来的会话要停在 `needs_attention` 上，而不是被反复领取——写那一笔要它。
+    recovery: RecoveryStore,
     workspaces: PathBuf,
     max_rounds: u32,
     max_retries: u32,
@@ -54,6 +56,7 @@ impl GatewaySegments {
         routed: Arc<RoutedLedger>,
         db: Db,
         approvals: Arc<dyn ApprovalRepo>,
+        recovery: RecoveryStore,
         workspaces: PathBuf,
         max_rounds: u32,
         max_retries: u32,
@@ -62,6 +65,7 @@ impl GatewaySegments {
             routed,
             db,
             approvals,
+            recovery,
             workspaces,
             max_rounds,
             max_retries,
@@ -118,17 +122,22 @@ impl SegmentSource for GatewaySegments {
             .await
             .map_err(HandlerError::Ledger)?;
         // 续跑要按调用号找回 Session：把这个会话的调用与尝试先补记进来。
-        self.routed
-            .learn(&session)
-            .await
-            .map_err(HandlerError::Ledger)?;
+        if let Err(error) = self.routed.learn(&session).await {
+            return Err(self.halt_if_corrupt(&run, error).await);
+        }
 
         let record = komo_store::repos::runs::get(&self.db, &run)
             .await?
             .ok_or_else(|| HandlerError::Failed(format!("run {run} 不在账本里")))?;
         let session_record = komo_store::repos::session::get(&self.db, &session).await?;
 
-        let events = self.events_of(&session).await?;
+        let events = match self.events_of(&session).await {
+            Ok(events) => events,
+            Err(HandlerError::Ledger(error)) => {
+                return Err(self.halt_if_corrupt(&run, error).await);
+            }
+            Err(other) => return Err(other),
+        };
         let surface = fold(&events);
         let rounds_so_far = surface
             .runs
@@ -194,6 +203,24 @@ impl SegmentSource for GatewaySegments {
 }
 
 impl GatewaySegments {
+    /// 装配读不出上下文时怎么收场。
+    ///
+    /// **损坏就停下来，不要放回队列**（§8.4「停止受影响会话，报告损坏」）：一个中间损坏
+    /// 的会话下一次照样读不出来，而交还领取权等于让它立刻被再领一次——"领取 → 装配失败
+    /// → 交还"在两秒里能转几十圈，既不前进也不停下。其余的失败照旧是 `Ledger`，调度器
+    /// 交还领取权、下一轮再试。
+    async fn halt_if_corrupt(&self, run: &RunId, error: LedgerError) -> HandlerError {
+        let LedgerError::Corrupt(reason) = &error else {
+            return HandlerError::Ledger(error);
+        };
+        let reason = format!("会话读不出来：{reason}");
+        if let Err(problem) = self.recovery.mark_needs_attention(run, &reason).await {
+            tracing::warn!(%problem, run = %run, "连 needs_attention 都写不下去");
+        }
+        tracing::error!(run = %run, %reason, "装配不出上下文，停止这个任务");
+        HandlerError::Stopped { reason }
+    }
+
     /// 这个 Run 还有没有没收尾的调用（§8.4 第 4 / 6 / 7 行）。
     ///
     /// 有就把它们原样交回执行器：**同一份计划、同一个调用号**，加上"这是第几次"。停在

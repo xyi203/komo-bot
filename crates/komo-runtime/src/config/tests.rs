@@ -1,0 +1,235 @@
+//! 加载路径的端到端测试：真文件、真解析、真校验。
+
+use super::testing::{Fixture, SECRET_VALUE, write};
+use super::*;
+
+#[test]
+fn a_valid_directory_loads_into_a_snapshot() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+
+    assert_eq!(loaded.snapshot.model.model, "chat-a");
+    assert_eq!(loaded.snapshot.memory.model.model, "memory-a");
+    assert_eq!(
+        loaded
+            .snapshot
+            .memory
+            .embedding
+            .as_ref()
+            .unwrap()
+            .dimensions,
+        Some(1024)
+    );
+    assert_eq!(
+        loaded.snapshot.channels.feishu.allow_from,
+        vec![komo_kernel::types::chat::PeerId::new("ou_operator")]
+    );
+    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+}
+
+#[test]
+fn paths_default_under_the_data_directory_and_resolve_relative_to_the_config_file() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[paths]\nlogs_dir = \"logs-elsewhere\"\n");
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(
+        loaded.snapshot.paths.logs_dir,
+        fixture.path().join("logs-elsewhere"),
+        "相对路径按配置文件所在目录解析（§12）"
+    );
+    assert_eq!(
+        loaded.snapshot.start_only.db_path,
+        fixture.path().join("state.db")
+    );
+    assert_eq!(
+        loaded.snapshot.paths.sessions_dir,
+        fixture.path().join("sessions")
+    );
+}
+
+#[test]
+fn an_omitted_memory_model_inherits_the_whole_main_model_including_effort() {
+    let fixture = Fixture::valid();
+    let text = Fixture::config_text("chat-a", "medium");
+    // 把 [memory.model] 整段去掉。
+    let trimmed: String = text
+        .replace(
+            "[memory.model]\nprovider = \"openai_compatible\"\n\
+             base_url = \"https://memory-llm.example.com/v1\"\n\
+             model = \"memory-a\"\napi_key_env = \"KOMO_MEMORY_API_KEY\"\neffort = \"low\"\n",
+            "",
+        )
+        .to_string();
+    write(&fixture.sources().config, &trimmed);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.memory.model, loaded.snapshot.model);
+}
+
+#[test]
+fn policy_toml_becomes_the_rule_table_and_its_absence_is_the_initial_one() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    let ids: Vec<&str> = loaded
+        .snapshot
+        .policy
+        .rules
+        .iter()
+        .map(|r| r.id.as_str())
+        .collect();
+    assert_eq!(ids, vec!["deny-policy-change", "allow-read-in-roots"]);
+
+    let bare = Fixture::without_policy();
+    let loaded = load_config(&bare.options()).unwrap();
+    assert_eq!(
+        loaded.snapshot.policy,
+        komo_kernel::policy::RuleTable::initial()
+    );
+}
+
+#[test]
+fn a_bad_effort_refuses_the_whole_load_and_points_at_the_key() {
+    let fixture = Fixture::valid();
+    write(
+        &fixture.sources().config,
+        &Fixture::config_text("chat-a", "ultra"),
+    );
+    let error = load_config(&fixture.options()).unwrap_err();
+    let issues = error.issues();
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(issues[0].key.as_str(), "model.effort");
+    assert!(issues[0].message.contains("ultra"), "{:?}", issues[0]);
+}
+
+#[test]
+fn a_missing_credential_variable_refuses_the_load() {
+    let fixture = Fixture::valid();
+    write(
+        &fixture.sources().env,
+        "FEISHU_APP_ID=cli_x\nFEISHU_APP_SECRET=y\n",
+    );
+    let error = load_config(&fixture.options()).unwrap_err();
+    let keys: Vec<&str> = error.issues().iter().map(|i| i.key.as_str()).collect();
+    assert!(keys.contains(&"model.api_key_env"), "{keys:?}");
+}
+
+#[test]
+fn a_malformed_channel_id_refuses_the_load() {
+    let fixture = Fixture::valid();
+    let text = Fixture::config_text("chat-a", "medium").replace("ou_operator", "operator");
+    write(&fixture.sources().config, &text);
+    let error = load_config(&fixture.options()).unwrap_err();
+    let keys: Vec<&str> = error.issues().iter().map(|i| i.key.as_str()).collect();
+    assert_eq!(keys, vec!["channels.feishu.allow_from"]);
+}
+
+#[test]
+fn an_unknown_key_is_a_parse_error_naming_the_file() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[model_typo]\nprovider = \"x\"\n");
+    write(&fixture.sources().config, &text);
+
+    let error = load_config(&fixture.options()).unwrap_err();
+    let ConfigError::Parse { file, message } = &error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(file, &fixture.sources().config);
+    assert!(message.contains("model_typo"), "{message}");
+}
+
+#[test]
+fn a_config_without_a_model_section_says_which_key_is_missing() {
+    let fixture = Fixture::valid();
+    write(&fixture.sources().config, "[memory]\nenabled = false\n");
+    let error = load_config(&fixture.options()).unwrap_err();
+    let ConfigError::Missing { key, .. } = &error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(key.as_str(), "model");
+}
+
+/// §3：重载日志「只出键名，凭证更不带」。这条断言把它钉在**所有**对外结构上。
+#[test]
+fn an_env_value_never_reaches_a_snapshot_a_diff_or_a_report() {
+    let fixture = Fixture::valid();
+    let holder = fixture.holder();
+    let before = holder.current();
+
+    // 换一个凭证值 + 换一个模型名，然后重载。
+    write(
+        &fixture.sources().env,
+        &Fixture::env_text().replace(SECRET_VALUE, "sk-rotated-9999"),
+    );
+    write(
+        &fixture.sources().config,
+        &Fixture::config_text("chat-b", "medium"),
+    );
+    let report = holder.reload().unwrap();
+    let after = holder.current();
+
+    // 凭证换了是看得见的——以**键名**的形式。
+    assert!(
+        report
+            .changed
+            .iter()
+            .any(|k| k.as_str() == "credentials.KOMO_LLM_API_KEY"),
+        "{report:?}"
+    );
+
+    let surfaces = [
+        format!("{before:?}"),
+        format!("{after:?}"),
+        format!("{report:?}"),
+        report.summary(),
+        format!("{:?}", before.diff(&after)),
+        format!("{:?}", holder.secrets()),
+        format!("{holder:?}"),
+        serde_json::to_string(&*after).unwrap(),
+    ];
+    for surface in surfaces {
+        assert!(!surface.contains(SECRET_VALUE), "泄漏了旧凭证：{surface}");
+        assert!(
+            !surface.contains("sk-rotated-9999"),
+            "泄漏了新凭证：{surface}"
+        );
+    }
+    // 但值本身当然还拿得到——它只住在 Secrets 里。
+    assert_eq!(
+        holder.secrets().get("KOMO_LLM_API_KEY"),
+        Some("sk-rotated-9999")
+    );
+}
+
+#[test]
+fn the_snapshot_records_the_source_files_it_was_built_from() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    let paths: Vec<_> = loaded
+        .snapshot
+        .sources
+        .iter()
+        .map(|s| s.path.clone())
+        .collect();
+    assert!(paths.contains(&fixture.sources().config));
+    assert!(paths.contains(&fixture.sources().env));
+    assert!(paths.contains(&fixture.sources().policy));
+}
+
+#[test]
+fn a_warning_rides_along_with_a_config_that_still_loads() {
+    let fixture = Fixture::valid();
+    let text = Fixture::config_text("chat-a", "medium")
+        .replace("allow_from = [\"ou_operator\"]", "allow_from = []");
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.issues.len(), 1, "{:?}", loaded.issues);
+    assert_eq!(
+        loaded.issues[0].severity,
+        komo_kernel::protocol::config::IssueSeverity::Warning
+    );
+}

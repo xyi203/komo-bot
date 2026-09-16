@@ -1096,7 +1096,7 @@ SSE 事件带 Session 内递增序号，断线后按游标补读。JSONL 事件�
 
 Axum 已提供 SSE 响应；toasty 的 turso 驱动提供连接与事务，MVCC 冲突重试由 komo 自己包（§8.2）。实现时锁定实际依赖版本并验证 Fedora/macOS 构建。[Axum SSE](https://docs.rs/axum/latest/axum/response/sse/index.html) · [toasty](https://docs.rs/toasty)
 
-首版生成模型与向量模型分别接入一种明确的协议，由具体适配器实现。base_url、model、effort 与凭证引用可配置；相同协议可以连接不同端点。不同协议后续按需要增加，不把“OpenAI compatible”当成所有字段都兼容的保证。生成适配器必须保留协议回放所需的消息块和元数据。
+首版生成模型与向量模型分别接入一种明确的协议，由具体适配器实现。**生成协议是 OpenAI Responses API**（2026-09-16 拍板；流式 SSE 事件、`tools` 函数调用、`reasoning.effort`，回放时把 reasoning 项原样带回），provider 串为 `openai_responses`，OpenAI / Codex / DeepSeek / OpenRouter 等按它接入，换端点只改 `base_url` / `model` / `api_key_env`；不做 Chat Completions。向量协议是 OpenAI-compatible `/embeddings` 与 Ollama `/api/embed` 两种。base_url、model、effort 与凭证引用可配置；相同协议可以连接不同端点。不同协议后续按需要增加，不把“OpenAI compatible”当成所有字段都兼容的保证。生成适配器必须保留协议回放所需的消息块和元数据。
 
 ### 13.3 模型角色与统一 effort 配置
 

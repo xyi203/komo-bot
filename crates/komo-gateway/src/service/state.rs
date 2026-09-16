@@ -302,9 +302,17 @@ impl GatewayState {
             None => build_llm(&snapshot, &config, &caps),
         }));
 
+        // 一次 Run 的三个账本写入者（执行器、AgentLoop、handler）共用这一个句柄。
+        // W5 的故障注入口就在这里：没装过注入时它**就是** `routed` 本身（§14）。
+        #[cfg(any(test, feature = "test-support"))]
+        let turn_ledger =
+            super::test_support::wrap_ledger(&home, Arc::clone(&routed) as Arc<dyn Ledger>);
+        #[cfg(not(any(test, feature = "test-support")))]
+        let turn_ledger = Arc::clone(&routed) as Arc<dyn Ledger>;
+
         let executor_tools = Arc::new(ToolExecutor::new(
             tools,
-            Arc::clone(&routed) as Arc<dyn Ledger>,
+            Arc::clone(&turn_ledger),
             Arc::clone(&outputs),
             ApprovalGate::new(Arc::clone(&approval_repo), Arc::clone(&clock)),
             PolicyEngine::from_rules(snapshot.policy.clone()),
@@ -313,7 +321,7 @@ impl GatewayState {
 
         let agent = Arc::new(AgentLoop::new(
             Arc::clone(&llm) as Arc<dyn LlmClient>,
-            Arc::clone(&routed) as Arc<dyn Ledger>,
+            Arc::clone(&turn_ledger),
             Arc::clone(&executor_tools),
             Arc::clone(&clock),
         ));
@@ -333,7 +341,7 @@ impl GatewayState {
         let handler = Arc::new(AgentRunHandler::new(
             agent,
             Arc::clone(&executor_tools),
-            Arc::clone(&routed) as Arc<dyn Ledger>,
+            Arc::clone(&turn_ledger),
             Arc::clone(&segments) as Arc<dyn SegmentSource>,
             executor.clone(),
         ));

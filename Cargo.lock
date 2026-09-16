@@ -2109,6 +2109,7 @@ dependencies = [
  "axum",
  "bytes",
  "futures-util",
+ "komo-gateway",
  "komo-kernel",
  "komo-runtime",
  "komo-store",

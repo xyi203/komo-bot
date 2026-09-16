@@ -18,7 +18,8 @@ pub mod segment;
 pub mod state;
 pub mod units;
 
-#[cfg(test)]
+// W5 恢复故障注入验收（§14）要在集成测试里包一层故障账本，所以它也在 feature 后面。
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 #[cfg(test)]
 mod tests;

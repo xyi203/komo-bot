@@ -4,22 +4,32 @@
 //! 用 [`super::start`] 而不是另起一套装配——验收要证的是**这条启动路径**本身对，
 //! 而不是一条只在测试里存在的近似路径。
 
+#[cfg(test)]
 use std::path::Path;
+#[cfg(test)]
 use std::sync::Arc;
 
+#[cfg(test)]
 use komo_kernel::policy::RuleTable;
+#[cfg(test)]
 use komo_kernel::protocol::config::{
     ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig, StartOnly,
 };
+#[cfg(test)]
 use komo_kernel::traits::LlmClient;
+#[cfg(test)]
 use komo_kernel::types::chat::ChannelPlatform;
+#[cfg(test)]
 use komo_kernel::types::model::ModelConfig;
 
+#[cfg(test)]
 use crate::channels::{ChannelSender, test_channel::MemChannel};
 
+#[cfg(test)]
 use super::{Running, ServiceOptions, start};
 
 /// 一份能通过校验的最小 config.toml。
+#[cfg(test)]
 pub fn config_toml(extra: &str) -> String {
     format!(
         r#"
@@ -37,6 +47,7 @@ enabled = false
 }
 
 /// 配置里有一个 Telegram 渠道：操作者 111，home chat 111，允许的群 222。
+#[cfg(test)]
 pub fn telegram_config(allow_from: &str) -> String {
     config_toml(&format!(
         r#"
@@ -50,6 +61,7 @@ groups = [222]
 }
 
 /// 一份手搭的快照（纯函数的测试用它，不落文件）。
+#[cfg(test)]
 pub fn sample_snapshot() -> ConfigSnapshot {
     let model = ModelConfig {
         provider: "openai_responses".into(),
@@ -91,12 +103,14 @@ pub fn sample_snapshot() -> ConfigSnapshot {
 }
 
 /// 一台起着的 Gateway，外加一个内存渠道。
+#[cfg(test)]
 pub struct TestGateway {
     pub home: tempfile::TempDir,
     pub running: Running,
     pub channel: Arc<MemChannel>,
 }
 
+#[cfg(test)]
 impl TestGateway {
     /// 默认配置：一个 Telegram 渠道，操作者 111。
     pub async fn start() -> TestGateway {
@@ -187,6 +201,7 @@ impl TestGateway {
     }
 }
 
+#[cfg(test)]
 fn write_home(home: &Path, config: &str) {
     std::fs::create_dir_all(home).expect("数据目录");
     std::fs::write(home.join("config.toml"), config).expect("写 config.toml");
@@ -200,9 +215,73 @@ fn write_home(home: &Path, config: &str) {
 
 /// reqwest 用 `rustls-no-provider`：provider 由 `komo` 的 `main` 装（§13.4）。测试进程
 /// 里没有那个 `main`，所以这里装一次——**只装一次**，装第二次会失败。
+#[cfg(test)]
 pub fn install_crypto() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
+}
+
+// ---------------------------------------------------------------- 故障注入口
+//
+// W5「恢复故障注入验收」（§14）要的是"在 §8.5 的步骤之间停下"：一台**真** Gateway
+// 跑到某一步，账本的那一步半途而废，然后同一个数据目录重启，断言恢复扫描做了
+// §8.4 / §14 那两张表右列的事。
+//
+// 注入口做成一张按数据目录索引的表，而不是 `ServiceOptions` 上的一个字段：字段会让
+// 每一处 `ServiceOptions { .. }` 字面量在 feature 打开时编译不过（bin 的 `main` 也
+// 在内），而这里只要装配那一行读一次表。**表是空的时候什么都不发生**，生产路径上
+// 连一次哈希查找都不做（`is_empty` 就退）。
+
+/// 把装配出来的 `Arc<dyn Ledger>` 换成另一个（通常是包一层故障装饰器）。
+pub type LedgerWrap = std::sync::Arc<
+    dyn Fn(
+            std::sync::Arc<dyn komo_kernel::traits::Ledger>,
+        ) -> std::sync::Arc<dyn komo_kernel::traits::Ledger>
+        + Send
+        + Sync,
+>;
+
+type WrapTable = std::sync::Mutex<Vec<(std::path::PathBuf, LedgerWrap)>>;
+
+fn wraps() -> &'static WrapTable {
+    static TABLE: std::sync::OnceLock<WrapTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// 下一次在 `home` 起 Gateway 时，用 `wrap` 包住账本。同一个 `home` 再装一次覆盖前一次。
+pub fn install_ledger_wrap(home: &std::path::Path, wrap: LedgerWrap) {
+    let mut table = wraps().lock().expect("故障注入表");
+    table.retain(|(path, _)| path != home);
+    table.push((home.to_path_buf(), wrap));
+}
+
+/// 撤掉 `home` 上的注入（重启一台"好的"之前调它）。
+pub fn clear_ledger_wrap(home: &std::path::Path) {
+    wraps()
+        .lock()
+        .expect("故障注入表")
+        .retain(|(p, _)| p != home);
+}
+
+/// 装配时的那一次查表。**没装过就原样返回**。
+pub(crate) fn wrap_ledger(
+    home: &std::path::Path,
+    ledger: std::sync::Arc<dyn komo_kernel::traits::Ledger>,
+) -> std::sync::Arc<dyn komo_kernel::traits::Ledger> {
+    let found = {
+        let table = wraps().lock().expect("故障注入表");
+        if table.is_empty() {
+            return ledger;
+        }
+        table
+            .iter()
+            .find(|(path, _)| path == home)
+            .map(|(_, wrap)| std::sync::Arc::clone(wrap))
+    };
+    match found {
+        Some(wrap) => wrap(ledger),
+        None => ledger,
+    }
 }

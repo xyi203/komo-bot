@@ -37,9 +37,15 @@ default = ["feishu", "telegram", "wechat"]
 feishu = ["dep:openlark"]
 telegram = []
 wechat = ["dep:wechatbot", "dep:qrcode"]
+# W5：集成测试（`tests/recovery`）要的故障注入口。只开这个 feature 时编进来的是
+# `service::test_support` 里的注入表，生产构建里那张表根本不存在。
+test-support = ["komo-kernel/test-support", "komo-store/test-support"]
 
 
 [dev-dependencies]
+# 自依赖：只给 test / bench 目标打开 `test-support`，`cargo test -p komo-gateway` 因此
+# 不必带 `--features`，而 `cargo build` 仍然看不到注入口。
+komo-gateway = { path = ".", features = ["test-support"] }
 komo-kernel = { workspace = true, features = ["test-support"] }
 # 测试里自己发 HTTP：reqwest 是 `rustls-no-provider`，provider 平时由 bin 的 `main` 装
 # （§13.4），测试进程里没有那个 `main`，所以自己装一次。

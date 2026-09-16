@@ -29,7 +29,9 @@ komo-client = { path = "crates/komo-client" }
 # §13.4：去掉 `sqlite` 特性拉进来的 rusqlite / libsqlite3-sys。
 toasty = { version = "0.10.0", default-features = false, features = ["turso"] }
 # §13.4：与 toasty-driver-turso 同 major（0.10 依赖 turso ^0.7），工作区唯一。
-turso = "0.7.2"
+# spikes/store.md：关掉 turso 默认特性 `fts`（MVCC 下本来就被拒绝），tantivy / zstd-sys / lz4 与
+# 一条 C 工具链随之消失，少 62 个编译单元；toasty-driver-turso 也 vendor 一份只改 4 行 manifest 对齐。
+turso = { version = "0.7.2", default-features = false, features = ["mimalloc"] }
 
 # §13.4：`rustls` 特性 = `__rustls-aws-lc-rs`；`no-provider` 后由 komo 在 main 里
 # 安装 ring provider，且必须在飞书 ws 线程启动之前。
@@ -99,3 +101,4 @@ codegen-units = 16
 # rustls 0.23 + ring provider。openssl / native-tls 整条构建链消失，Fedora 不需要 openssl-devel。
 [patch.crates-io]
 wechatbot = { path = "vendor/wechatbot" }
+toasty-driver-turso = { path = "vendor/toasty-driver-turso" }

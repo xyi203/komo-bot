@@ -457,19 +457,22 @@ state.db 中的主要表：
 
 control_outbox 只保存控制事件，例如审批请求和回答，不复制消息或工具结果。它和队列表都在同一个 state.db 中，不增加外部消息服务。
 
-**state.db 是 Turso，MVCC 模式，通过 toasty 访问。** 文件同步和数据库提交各自有持久化边界，不能称为跨文件原子事务；数据库提交是否 fsync 在 Turso 上尚未核实（§14 待验证事项），设计不依赖它：内容权威始终是 Session 目录，每一步先 `sync_all` 再往下走，state.db 只是调度与授权的权威。若核实结果是提交不保证落盘，审批决定要补一道保护——决定与 `control_outbox` 同一事务写入，outbox 补写到 JSONL 后才向客户端确认"已批准"；JSONL 里的审计副本仍不能创建授权，只用来在数据库丢失该行时拒绝执行并要求操作者重答。
+**state.db 是 Turso，MVCC 模式，通过 toasty 访问。** 文件同步和数据库提交各自有持久化边界，不能称为跨文件原子事务；但两边都是真的落盘。**Turso 0.7.2 已核实（2026-09-16）：MVCC 与 WAL 两条提交路径都在提交内 fsync——MVCC fsync 逻辑日志 `state.db-log`，WAL fsync `state.db-wal`——同步档位是每连接状态，默认 `SyncMode::Full`（比 SQLite 在 WAL 下默认 NORMAL 更严），`PRAGMA synchronous` 可设可读回（`turso_core` 的 `mvcc/database/mod.rs:3107` / `storage/pager.rs:4297` / `translate/pragma.rs:647,1548`；strace 与 `synchronous=OFF` 对照实验见 `.scratch/komo-v08-rewrite/spikes/store.md`）。因此原先预备的「outbox 补写到 JSONL 后才确认已批准」这道保护不启用**：审批决定一经数据库提交即已落盘，客户端可以立刻得到确认，outbox 只承担审计补写与顺序，不承担耐久性。内容权威仍然是 Session 目录，每一步先 `sync_all` 再往下走，state.db 是调度与授权的权威。
+
+两条随之而来的运维事实：① `state.db-log` / `state.db-wal` 与 `state.db` 同等重要，备份和清理不能只拷主文件；② Turso 默认 `data_sync_retry = false`，此时 fsync **出错是 `panic!` 而不是返回 `Err`**（`storage/pager.rs:4330`）。Gateway 在 `Db::connect` 里显式 `PRAGMA data_sync_retry = 1`，把「磁盘写失败」变成一个可以进 `needs_attention` 的错误，而不是一个把整个进程带走的 panic。
 
 引擎事实与由此而来的规则：
 
 | 事实 | 规则 |
 |---|---|
-| MVCC `concurrent_writes`：不同 Session 的写入器并发提交，冲突的提交**失败而不是等待** | 每个写操作包在 `with_write_retry`；多表序列放在真实事务里、再包进 retry——回滚后干净重跑，绝不双重应用。闭包只依赖入参和事务内读到的状态，里面不 `await` 模型、子进程、文件同步或用户；重试超限报 `Contended`，按 §8.4 进 `waiting_retry` |
-| MVCC 拒绝 `AUTOINCREMENT` | 每个主键是 `String` UUIDv7；Session 内的 `seq` 是 JSONL 写入器分配的整数列，不由数据库生成 |
-| MVCC 下自定义索引模块不可创建（FTS 不可用） | 关键词检索在索引时分词写入 `memory_terms`（§9.4） |
-| toasty 的类型化 API 表达不了 `ALTER TABLE`、`instr`、`vector_distance_cos`、带条件的 `UPDATE` | `Db` 持有第二个 `turso::Database` raw 句柄；raw SQL 只允许出现在 store crate 的三个模块：schema、keyword index、run claim |
+| MVCC `concurrent_writes`：**只有 `BEGIN CONCURRENT` 事务**才并发提交；冲突的提交**失败而不是等待**。toasty 只在显式 `db.transaction()` 上发 `BEGIN CONCURRENT`，autocommit 单语句走普通写事务，且驱动不设 `busy_timeout`——实测 4 个写入器并发写 200 行不同主键，autocommit 只成 6 次，包进事务 200 次全成 | **每个写操作、包括只有一条语句的，都放进 `db.transaction()`，再整个包进 `with_write_retry`**；回滚后干净重跑，绝不双重应用。重试条件是 `toasty_core::Error::is_serialization_failure()`（驱动把 `Busy` / `BusySnapshot` / 消息含 `conflict` 的错误都归到这里），不是字符串匹配。闭包只依赖入参和事务内读到的状态，里面不 `await` 模型、子进程、文件同步或用户；重试超限报 `Contended`，按 §8.4 进 `waiting_retry` |
+| MVCC 支持 `AUTOINCREMENT`（原子序列，`turso_core` 的 `test_autoincrement_works_in_mvcc`，2026-09-16 实测 CREATE / INSERT / `sqlite_sequence` 正常）——但 komo 不用它 | 每个主键仍是 `String` UUIDv7：ID 要在写库之前就存在（JSONL 先写、事件里带 ID、跨进程恢复按 ID 对账），数据库生成的自增值满足不了这个顺序。Session 内的 `seq` 是 JSONL 写入器分配的整数列，不由数据库生成 |
+| MVCC 下自定义索引模块不可创建（FTS 不可用）——已实测：`CREATE INDEX … USING fts (…)` 报 `Custom index modules are not supported in MVCC mode`（`translate/index.rs:70`），`CREATE VIRTUAL TABLE … USING fts5` 报 `Virtual tables are not supported in MVCC mode`（`translate/schema.rs:1692`） | 关键词检索在索引时分词写入 `memory_terms`（§9.4） |
+| toasty 的类型化 API 能表达带条件的 `UPDATE`（`Model::filter(...)` 支持非索引列、`AND`、`IS NULL`），但**拿不到受影响行数**——查询目标的 `.exec()` 恒为 `Ok(())`，命中 0 行与 1 行不可区分；`ALTER TABLE`、`instr`、`vector_distance_cos` 也不在类型化 API 里 | 这四件事全部走 toasty 自带的 raw SQL 口子 `toasty::sql::statement(..) -> Result<u64>` / `toasty::sql::query(..) -> Vec<Value>`（占位符 `?1`、`?2`；`Db` 与 `Transaction` 上都可用，因此 raw 语句照样在事务里）。**不需要第二个 `turso::Database` 句柄**；raw SQL 仍只允许出现在 store crate 的三个模块：schema、keyword index、run claim |
 | 每个 db 文件由进程独占锁定 | Gateway 是唯一打开 state.db 的进程，CLI 与 TUI 永远走 HTTP（§3） |
-| `turso` 默认特性启用 `mimalloc` 全局分配器 | 工作区只能有一个 turso 版本，且与 `toasty-driver-turso` 的 pin 同 major；其他 crate 不得声明 `#[global_allocator]` |
+| `turso` 的 `mimalloc` 特性是全局分配器 | 工作区只能有一个 turso 版本，且与 `toasty-driver-turso` 的 pin 同 major；其他 crate 不得声明 `#[global_allocator]`。工作区把 turso 写成 `default-features = false, features = ["mimalloc"]`，关掉 `fts`（§13.4） |
 | toasty `push_schema` 只对新文件执行，且不幂等 | 见下面的 schema 演进 |
+| 提交在 Turso 上确实 fsync（MVCC 写 `state.db-log`，WAL 写 `state.db-wal`），默认 `synchronous=FULL` | 审批决定提交即持久，不需要 outbox-先-确认；`state.db-log` 与主库同等重要；连接建立时设 `data_sync_retry=1`，让 fsync 错误可报告而非 panic |
 
 Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_TABLE_DDL` 常量；`Db::connect` 对已存在的文件逐表 `CREATE TABLE IF NOT EXISTS`、逐列 `ALTER TABLE ADD COLUMN`，对新文件让 toasty 建表。一个测试对每张表断言 toasty 为空库生成的 DDL 与常量**字节相等**——模型改了列却没改常量，测试挂。新列必须 `NOT NULL DEFAULT …` 或可空；退役的列继续写空值，不删。耐久表（`approval_requests`、`policy_grants`、`cron_jobs`、`cron_firings`、`memory_items`、`memory_evidence`、`deliveries`）只允许加法变更；可重建表（`session_log_index`、`tool_calls`、`tool_attempts`、`checkpoints`、`memory_terms`、`memory_vectors`、`memory_index_generations`）按行或按代次从 JSONL / 原文重建，从不删文件——一个文件里同时住着耐久表，"删掉重来"不存在。
 
@@ -642,6 +645,51 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 ```
 
 启动扫描、Cron、审批回调和手动 resume 共用同一个领取入口。领取通过数据库条件更新与递增代次保证同一 Run 只被一个执行者接管；旧代次不能继续提交新状态。单实例使用进程锁与数据库事务即可，不引入跨机器选主或分布式队列。
+
+领取就是下面这条语句，`rows affected == 1` 是接管成功，`== 0` 是别人先到（表名 / 列名以 store 的模型为准）：
+
+```sql
+-- RunQueue::claim
+UPDATE runs
+   SET status           = 'running',
+       claimed_by       = ?1,   -- 本次启动身份（执行实例 ID）
+       claim_generation = claim_generation + 1,
+       claimed_at       = ?2
+ WHERE id               = ?3
+   AND claimed_by IS NULL
+   AND status IN ('queued', 'waiting_retry')
+```
+
+候选由一条普通查询给出，领取一个一条：
+
+```sql
+-- RunQueue::due
+SELECT id FROM runs
+ WHERE claimed_by IS NULL
+   AND status IN ('queued', 'waiting_retry')
+   AND next_retry_at <= ?1
+ ORDER BY next_retry_at
+ LIMIT ?2
+```
+
+领取之后，这个执行者写账本的每一条状态提交都带同一道代次围栏；`rows affected == 0` 意味着自己已经是旧代次，**停止这个任务的一切写入**，不重试、不降级：
+
+```sql
+-- 代次围栏（每次状态提交）
+UPDATE runs SET status = ?1, …
+ WHERE id = ?2 AND claim_generation = ?3 AND claimed_by = ?4
+```
+
+启动扫描把上一代执行实例遗留的 running 释放出来，同样是一条条件更新：
+
+```sql
+-- 启动回收：旧实例的 running -> interrupted，并交还领取权
+UPDATE runs
+   SET status = 'interrupted', claimed_by = NULL
+ WHERE status = 'running' AND claimed_by <> ?1
+```
+
+四条都通过 `toasty::sql::statement(...).bind(...).exec(&mut tx).await?` 执行，`u64` 就是受影响行数。**竞争失败的第一手信号是错误而不是 0 行**：并发竞争同一行时，败者拿到 `serialization failure`（MVCC 事务里是 `Write-write conflict`，autocommit 是 `database is locked`），只有在胜负已分之后再跑才会拿到 `0`。因此 `claim` 也包在 `with_write_retry` 里——它是少数几个「可以安全重跑的写」，因为守卫写在 `WHERE` 子句里：重跑一次要么还是没人领（赢），要么已经有人领了（`0`，判为输）。实测 120 轮（raw）+ 100 轮（走 toasty）、每轮 2–4 个竞争者，恰好一个赢家，没有 0 赢家也没有多赢家（`spikes/store.md`）。
 
 JSONL 追加和状态提交都校验领取代次。领取代次只防止旧执行者写账本，不能撤销已经发出的外部动作。因此必须先确认旧执行已停止，再考虑启动替代执行。
 
@@ -1029,7 +1077,7 @@ SSE 事件带 Session 内递增序号，断线后按游标补读。JSONL 事件�
 | HTTP / SSE            | Axum                                                                     |
 | HTTP 客户端与模型调用 | Reqwest                                                                  |
 | CLI                   | Clap                                                                     |
-| 状态数据库            | Turso（MVCC）+ toasty；raw `turso` 句柄限于 schema / 关键词索引 / 领取三处（§8.2）      |
+| 状态数据库            | Turso（MVCC，关 `fts`）+ toasty；raw SQL 走 `toasty::sql`，限于 schema / 关键词索引 / 领取三处（§8.2） |
 | 对话与执行记录        | Session JSONL，由 Serde 序列化；大正文外置                               |
 | 工具完整输出          | 按执行尝试保存 output.json / stdout.txt / stderr.txt，流式写入后持久发布 |
 | 关键词检索            | state.db 的 `memory_terms` 列：索引时 CJK bigram + ASCII 词分词，查询 `instr`，IDF 加权（§9.4） |
@@ -1177,7 +1225,7 @@ kernel ← client ────────────────────�
 | `wechatbot` | 仅 gateway，feature `wechat`（默认开）；**`[patch.crates-io]` 指向 `vendor/wechatbot`**（0.4.0 原样复制，只改 `Cargo.toml` 一行：reqwest `0.12` 默认特性 → `0.13`，`default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"]`） | 上游所有发布版本都写 `reqwest = { version = "0.12", features = ["json"] }`，默认特性开着 = native-tls = openssl-sys，自己一个 feature 都没有；cargo 特性只加不减，工作区里无论怎么声明都关不掉。patch 后复用 komo `main` 装的同一个 ring provider，openssl / native-tls / hyper-tls 整条 C 构建链消失，**构建不再依赖任何系统库**（Fedora 不必 `openssl-devel`，Mac 不必 `brew install openssl@3`），且 reqwest 只剩 0.13 一份（wechatbot 用到的 reqwest API 面极小，0.13 全保留；2026-09-16 实测默认特性全量构建通过）。不选 vendored openssl：OpenSSL 3.6.3、1210 个 .c，`make depend` / `install_dev` 串行，估 2–3 分钟且在 wechat 关键路径起点，会取代 turso 链成为新关键路径。升级 wechatbot = 重新复制 + 重打这一行，见 `vendor/README.md` |
 | `qrcode` | `default-features = false`；微信登录二维码渲染为终端字符 | 不需要 `image` |
 | **不引入** | rmcp / image | MCP 不在首版 |
-| `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | 可选：`[patch.crates-io]` 一份 `toasty-driver-turso`，把 `turso` 改成 `default-features = false, features = ["mimalloc"]` | 只影响冷编（约 14s）；FTS 在 MVCC 下本来就不可用。留到冷编成为痛点再做 |
+| `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | **已做**：`[patch.crates-io]` 一份 `toasty-driver-turso`（`vendor/toasty-driver-turso`，上游原包，只改 manifest 里 `turso` 那几行），工作区的 `turso` 也写 `default-features = false, features = ["mimalloc"]` | 实测（2026-09-16）：冷编 71.5s → 64.2s，编译单元 577 → 515，单元耗时总和 −36s CPU，`tantivy` / `zstd` / `lz4_flex` 从依赖树消失，少一条 C 工具链。墙钟只省 7s 是因为它们与 `aws-lc-sys` 并行、不在关键路径。功能零损失：turso 的 FTS 是索引方法，MVCC 直接拒绝。升级时整包替换 + 重加那几行，CI 用 `cargo tree -e features -i turso` 断言只剩 `mimalloc`；见 `vendor/README.md` |
 
 三个渠道各自一个 feature，默认全开。feature 的用处不是裁功能，是让 `cargo tree -d` 能按渠道归因重复版本，以及某家 SDK 坏掉时能单独关掉它继续构建。`cargo tree -d` 进入 CI：出现新的重复版本要有理由。
 
@@ -1223,7 +1271,7 @@ codegen-units = 16
 |---|---|---|---|
 | `Ledger` | `Coordinator`（store）：正文 → JSONL → 数据库 | `MemLedger` | Agent Loop 的唯一写入口；让 loop 和 executor 的测试不碰文件与 Turso |
 | `ToolOutputStore` | 文件流式写入 + 原子发布（store） | 内存 | 子进程 stdout/stderr 流式落盘，`shell` / `python` 测试需要替身 |
-| `RunQueue` | raw SQL 条件更新 + 代次（store） | 内存 | 调度器、恢复扫描、Cron、手动 resume 共用的领取入口；并发领取测试 |
+| `RunQueue` | `toasty::sql::statement` 条件更新 + 代次（store，无第二个 turso 句柄） | 内存 | 调度器、恢复扫描、Cron、手动 resume 共用的领取入口；并发领取测试 |
 | `ApprovalRepo` | toasty（store） | 内存 | executor 等待、聊天 / TUI 答复、outbox 补写三方共用 |
 | `CronRepo` | toasty（store） | 内存 | 调度器 + CLI + Gateway API |
 | `MemoryRepo` | toasty + `memory_terms`（store） | 内存 | `MemoryManager` 的全部状态读写；召回排序逻辑要在无数据库下测 |
@@ -1340,7 +1388,7 @@ pub trait Clock: Send + Sync {
 | 2. AgentLoop 与 Policy | 模型往返、执行计划、Allow/Ask/Deny、审批持久化；`Ledger`、`Policy`、`ApprovedPlan` 类型状态；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测 | 危险操作批准前不执行；重复批准不重复执行；Deny 不被授权覆盖；不构造 `Proof` 就调不到 `execute`（编译期）；`Ask` 后 Run 让出名额且 TUI 弹出审批 |
 | 3. 五个工具 | 文件、进程、Python 环境与输出处理；`verify` 默认实现与 write/edit 的哈希核对 | 文件版本冲突可见；取消停止子进程；未知工具无法调用 |
 | 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、审批渲染、短 ID、飞书卡片与 Telegram 内联按钮、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一人连点两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/approve` 与按钮回调重发只批准一次；来源会话与 home chat 都收到请求且第二个答复得到"已决定"；决定后卡片 / 消息原地更新；Gateway 重启后 pending 投递补发一次；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的审批请求 |
-| 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，raw SQL）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的审批仍能在手机上批 |
+| 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，`toasty::sql`）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的审批仍能在手机上批 |
 | 6. toolbox 迭代 + Skills | 保存模块、候选测试、版本审核与启用；`SkillRegistry`、目录行门控、`read` 只读根 | 调用使用已批准且已测试版本；模块更新使旧授权失效；新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect；toolbox 启用的审批在微信里能看到版本差异与测试结果 |
 | 7. Cron | 持久调度、去重、重叠处理、人工接手 | 重启不重复创建同次触发；新危险操作等待审批；Cron 的等待在聊天里 `/approve` 后按 Cron 权限继续，不升权 |
 | 8. 模型配置与 Memory | 独立记忆 / 向量模型、effort 校验、自动提取、混合召回（`memory_terms` + 向量）与遗忘 | 不串用模型配置；推断不自行确认；过期或遗忘内容不召回；重建可恢复 |
@@ -1390,12 +1438,12 @@ Memory 与模型验收覆盖：
 
 | 项 | 影响 | 若不成立 |
 |---|---|---|
-| Turso MVCC 模式提交是否 fsync；能否读回同步设置 | §8.2 权威边界 | 启用 §8.2 的 outbox-先-确认保护 |
-| toasty 0.10 是否支持带条件的 UPDATE 并返回受影响行数 | §8.7 领取代次 | 直接用 raw SQL（已计入设计） |
+| Turso MVCC 模式提交是否 fsync；能否读回同步设置 | §8.2 权威边界 | **已核实（2026-09-16，spikes/store.md）：提交 fsync，MVCC 写 `state.db-log`、WAL 写 `state.db-wal`，默认 `synchronous=FULL` 且可读回可改写；`synchronous=OFF` 后 strace 里 fsync 全部消失，说明不是空实现。§8.2 的 outbox-先-确认保护不启用。** 附带：`state.db-log` 与主库同等重要；`data_sync_retry` 默认 false 时 fsync 出错是 panic，连接时设成 1。未核实：真正的断电 / 内核崩溃持久性（只做了 25/25 的进程 abort） |
+| toasty 0.10 是否支持带条件的 UPDATE 并返回受影响行数 | §8.7 领取代次 | **已核实（2026-09-16，spikes/store.md）：条件能表达，行数拿不到——查询目标的 `.exec()` 恒 `Ok(())`。改用 toasty 自带的 `toasty::sql::statement -> Result<u64>`，`Transaction` 上也能用，所以不需要第二个 `turso::Database` 句柄（§8.2、§13.5 已改）。并发正确性已验：220 轮 × 2–4 竞争者恰好一个赢家。附带纠正：autocommit 单语句写在 4 写入器下 200 次只成 6 次，每个写都必须进 `db.transaction()`（§8.2 已改）** |
 | `reqwest` `rustls-no-provider` 下没有其他依赖重新启用 `aws-lc-rs`；`openlark` 是否把它拉回来 | §13.4 冷编预算 | **已核实（2026-09-16，骨架实测）：拉回来了**，肇事者是 `openlark-core 0.20` 显式声明 reqwest 的 `rustls` 特性（= `__rustls-aws-lc-rs`），特性可加不可减，`default-features = false` 压不住，要挡只能 `[patch]` openlark-**core** 把该特性换成 `rustls-no-provider`。代价实测：`aws-lc-sys` 构建脚本 32s 但 8 核并行、不在关键路径，墙钟只 +1.7s（68.5s → 70.2s）。**决定：接受，不维护 patch。** |
 | `instr` 全表关键词臂在 1 万条时的 P95 | §9.4 | 加 `memory_terms` 的按 token 倒排表（仍是普通表，仍可重建） |
 | Turso 长读事务（SSE 游标补读）与并发写提交的快照语义 | §11.1 回复订阅 | 读路径改为短事务分页 |
-| `toasty-driver-turso` 能否通过 `[patch]` 关闭 `turso` 的 `fts` 默认特性且链接正常 | §13.4 可选项 | 放弃该项，冷编多 ~14s |
+| `toasty-driver-turso` 能否通过 `[patch]` 关闭 `turso` 的 `fts` 默认特性且链接正常 | §13.4 | **已核实并已做（2026-09-16）**：能链接，toasty 读写照常；冷编 −7.3s、−62 编译单元。见 §13.4 依赖表 |
 | iLink 消息是否带稳定 `msg_id` 可作 `request_key` | §11.1 微信去重 | **已核实（2026-09-16，wechatbot 0.4.0 源码）：没有 `msg_id`。** 逐消息的唯一候选是 `client_id`——发送方客户端生成的 UUID，`String` 非 Option。**键改为 `wechat:{from_user_id}:{client_id}`**，`(from, 内容哈希, 60s 窗口)` 降级为 `client_id` 为空时的回退。已确认两条重投来源：拉取游标不持久化（重启从空游标开始）、「回了消息却回空游标」时 SDK 原地重取。**剩余未核实（需真机登录，步骤见 `spikes/wechat.md` §5）**：① 入站 `client_id` 的形态与是否恒非空；② 空游标对服务端意味着「重发未确认」还是「从现在开始」——后者是丢消息，比重复严重，会要求把游标持久化进 state.db；③ 重投时 `client_id` 是否不变；④ 旧 `context_token` 能否跨进程使用 |
 | `wechatbot` 的 native-tls 在 Fedora 上链系统 openssl 是否顺利；与 `rustls-no-provider` 的 reqwest 0.13 共存 | §13.4 | **已核实（2026-09-16，源码 + 实测）：共存没有问题，但 native-tls 这条路整个不走了。** 共存侧：native-tls 走 openssl 自己的 `Once`，与 rustls 无共享状态，`CryptoProvider::install_default()` 仍只由 `main` 调一次；原文「一份 reqwest / hyper 重复」里 hyper 是错的，锁文件里 hyper / hyper-util / rustls / hyper-rustls 各只有一份。TLS 侧：上游让 reqwest 0.12 默认特性开着且自己没有 feature，工作区无法关掉。**决定并已做：`vendor/wechatbot` + `[patch.crates-io]`，reqwest 升 0.13 走 rustls**，openssl 整条链消失，reqwest 重复也消失，默认特性全量构建通过，Fedora 不必装 `openssl-devel`。vendored openssl 作为退路而非首选（估 2–3 分钟且在关键路径起点） |
 | `lark-websocket-protobuf` 是否需要 `protoc` | 构建工具链要求 | **已核实（2026-09-16）：不需要。** 0.1.2 无 `build.rs`，依赖树里没有 prost-build / tonic-build / protobuf-codegen，本机无 protoc 编译通过。安装说明不加 `protobuf` |

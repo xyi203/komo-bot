@@ -558,6 +558,150 @@ fn offer_context() -> OfferContext {
     OfferContext::here(["read", "write", "edit", "shell", "python"])
 }
 
+// ---------------------------------------------------------------- toolbox（§5.3、§5.4）
+
+/// Gateway 的地址与令牌。这组端点不在 §13.1 的接口表里，所以不经 `KomoClient`
+/// （见 `main.rs` 的 TODO）。
+pub type GatewayAt<'a> = (&'a str, Option<&'a str>);
+
+pub async fn toolbox_list(at: GatewayAt<'_>) -> Outcome {
+    let response = komo_gateway::http::toolbox::client::list(at.0, at.1).await?;
+    if response.modules.is_empty() {
+        return Ok("toolbox 里还没有模块。写一个候选：write 到 toolbox/.staging/<name>.py".into());
+    }
+    let mut out = String::new();
+    for module in &response.modules {
+        out.push_str(&toolbox_line(module));
+        out.push('\n');
+    }
+    Ok(out.trim_end().to_string())
+}
+
+pub async fn toolbox_inspect(at: GatewayAt<'_>, module: &str) -> Outcome {
+    let info = komo_gateway::http::toolbox::client::show(at.0, at.1, module).await?;
+    Ok(toolbox_detail(&info))
+}
+
+pub async fn toolbox_test(at: GatewayAt<'_>, module: &str) -> Outcome {
+    let response = komo_gateway::http::toolbox::client::test(at.0, at.1, module).await?;
+    // **没通过就不提示去启用**：那一步本来也会被挡下来，多说一句只会让人白试一次。
+    let next = if response.report.passed {
+        format!("\n\n可以启用了：komo toolbox enable {}", response.module)
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "{}\n\n{}{next}",
+        response.report.headline(),
+        response.report.output.trim()
+    ))
+}
+
+pub async fn toolbox_enable(at: GatewayAt<'_>, module: &str, version: Option<String>) -> Outcome {
+    let response = komo_gateway::http::toolbox::client::enable(at.0, at.1, module, version).await?;
+    Ok(change_line(&response))
+}
+
+pub async fn toolbox_disable(at: GatewayAt<'_>, module: &str) -> Outcome {
+    let response = komo_gateway::http::toolbox::client::disable(at.0, at.1, module).await?;
+    Ok(change_line(&response))
+}
+
+/// 清单里的一行：模块、当前版本、候选。
+fn toolbox_line(module: &komo_gateway::toolbox::ModuleInfo) -> String {
+    let enabled = match &module.enabled {
+        Some(enabled) => format!(
+            "{}{}",
+            enabled.version,
+            if enabled.builtin { "（内置）" } else { "" }
+        ),
+        None => "未启用".to_string(),
+    };
+    let candidate = match &module.candidate {
+        Some(candidate) => match &candidate.tests {
+            Some(report) if report.version == candidate.version && report.passed => {
+                format!("  候选 {}（已测过）", candidate.version)
+            }
+            _ => format!("  候选 {}（未测过）", candidate.version),
+        },
+        None => String::new(),
+    };
+    format!("{:<16} {enabled}{candidate}", module.module)
+}
+
+/// `inspect` 的全文。
+fn toolbox_detail(module: &komo_gateway::toolbox::ModuleInfo) -> String {
+    let mut out = format!("{}\n", module.module);
+    if let Some(doc) = &module.doc {
+        out.push_str(&format!("\n{doc}\n"));
+    }
+    match &module.enabled {
+        Some(enabled) => {
+            out.push_str(&format!(
+                "\n当前版本 {}{}，启用于 {}\n",
+                enabled.version,
+                if enabled.builtin { "（内置）" } else { "" },
+                enabled.enabled_at
+            ));
+            if let Some(report) = &enabled.tests {
+                out.push_str(&format!("验证：{}\n", report.headline()));
+            }
+        }
+        None => out.push_str("\n当前没有启用中的版本\n"),
+    }
+    if !module.exports.is_empty() {
+        out.push_str(&format!("导出：{}\n", module.exports.join("、")));
+    }
+    if let Some(verifier) = &module.verifier {
+        out.push_str(&format!("核对函数：{verifier}（§8.6）\n"));
+    }
+    if !module.env.is_empty() {
+        // **变量名**，不是值（§5.3）。
+        out.push_str(&format!("凭证引用：{}\n", module.env.join("、")));
+    }
+    if let Some(candidate) = &module.candidate {
+        out.push_str(&format!("\n候选 {}\n", candidate.version));
+        match &candidate.tests {
+            Some(report) if report.version == candidate.version => {
+                out.push_str(&format!("  {}\n", report.headline()));
+            }
+            Some(_) => out.push_str("  上一次测试测的是另一版，代码在那之后改过\n"),
+            None => out.push_str("  还没跑过测试：komo toolbox test\n"),
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// 一次启用 / 停用的结论。
+fn change_line(response: &komo_gateway::http::toolbox::ToolboxChangeResponse) -> String {
+    use komo_gateway::http::toolbox::ChangeStatus;
+    match response.status {
+        ChangeStatus::Applied => format!(
+            "{} 已切换到 {}",
+            response.module,
+            response
+                .version
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        ),
+        // 短 ID 在**待处理集合内**唯一（§11.3），所以印它而不是那个 uuid。
+        ChangeStatus::Pending => {
+            let short = response
+                .short_id
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            format!(
+                "已提交审批：{}\n在聊天里回 /approve {short} 或 /reject {short}；\
+                 也可以 komo approval show {short}",
+                response.reason
+            )
+        }
+        ChangeStatus::Refused => format!("没有执行：{}", response.reason),
+    }
+}
+
 #[cfg(test)]
 mod cron_render_tests {
     //! `komo cron` 各子命令的回执。**纯函数**，所以测得起来：一句话里该有哪些东西是
@@ -670,5 +814,134 @@ mod cron_render_tests {
 
         assert!(NotifyPolicy::parse("nerver").is_none());
         assert_eq!(NotifyPolicy::parse("never"), Some(NotifyPolicy::Never));
+    }
+}
+
+#[cfg(test)]
+mod toolbox_render_tests {
+    //! `komo toolbox` 的印法。纯函数，所以不用起 Gateway。
+
+    use super::*;
+    use komo_gateway::http::toolbox::{ChangeStatus, ToolboxChangeResponse};
+    use komo_gateway::toolbox::{Candidate, Enabled, ModuleInfo, ModuleVersion, TestReport};
+
+    const NOW: time::OffsetDateTime = time::macros::datetime!(2026-09-17 08:00:00 UTC);
+
+    fn version(raw: &str) -> ModuleVersion {
+        ModuleVersion(raw.to_string())
+    }
+
+    fn report(v: &str, passed: bool) -> TestReport {
+        TestReport {
+            version: version(v),
+            passed,
+            ran: 3,
+            failures: u32::from(!passed),
+            errors: 0,
+            skipped: 0,
+            output: "ok".into(),
+            at: NOW,
+        }
+    }
+
+    fn info() -> ModuleInfo {
+        ModuleInfo {
+            module: "memos".into(),
+            enabled: Some(Enabled {
+                module: "memos".into(),
+                version: version("v1"),
+                enabled_at: NOW,
+                tests: Some(report("v1", true)),
+                builtin: true,
+            }),
+            candidate: None,
+            exports: vec!["create".into(), "get".into()],
+            verifier: Some("verify".into()),
+            env: vec!["MEMOS_TOKEN".into()],
+            doc: Some("Memos 客户端。".into()),
+        }
+    }
+
+    /// 清单一眼要答出"现在跑的是哪一版、有没有等着装的候选、那个候选测过没有"。
+    #[test]
+    fn the_list_line_says_which_version_runs_and_whether_a_candidate_was_tested() {
+        let line = toolbox_line(&info());
+        assert!(line.contains("memos"), "{line}");
+        assert!(line.contains("v1"), "{line}");
+        assert!(line.contains("内置"), "{line}");
+
+        let mut with_candidate = info();
+        with_candidate.candidate = Some(Candidate {
+            module: "memos".into(),
+            version: version("v2"),
+            saved_at: NOW,
+            tests: Some(report("v2", true)),
+        });
+        let line = toolbox_line(&with_candidate);
+        assert!(line.contains("候选 v2（已测过）"), "{line}");
+
+        // 测试测的是上一版 → **未测过**。一个"测过"的说法在这里是错的（§5.4）。
+        with_candidate.candidate.as_mut().unwrap().tests = Some(report("v1", true));
+        let line = toolbox_line(&with_candidate);
+        assert!(line.contains("候选 v2（未测过）"), "{line}");
+    }
+
+    /// `inspect` 印凭证的**变量名**，绝不印值（§5.3）。
+    #[test]
+    fn inspect_names_the_credential_variables_and_prints_no_values() {
+        let text = toolbox_detail(&info());
+        assert!(text.contains("MEMOS_TOKEN"), "{text}");
+        assert!(text.contains("核对函数：verify"), "{text}");
+        assert!(text.contains("create、get"), "{text}");
+        assert!(text.contains("Memos 客户端。"), "{text}");
+    }
+
+    #[test]
+    fn a_module_with_no_enabled_version_says_so_rather_than_printing_a_blank() {
+        let mut none = info();
+        none.enabled = None;
+        none.exports.clear();
+        none.candidate = Some(Candidate {
+            module: "memos".into(),
+            version: version("v2"),
+            saved_at: NOW,
+            tests: None,
+        });
+        let text = toolbox_detail(&none);
+        assert!(text.contains("当前没有启用中的版本"), "{text}");
+        assert!(text.contains("还没跑过测试"), "{text}");
+    }
+
+    /// 三种去向各说各的话——**等审批时要印那个 4 位短 ID**，那是回答它的钥匙（§11.3）。
+    #[test]
+    fn the_three_outcomes_each_say_what_to_do_next() {
+        let applied = ToolboxChangeResponse {
+            module: "memos".into(),
+            status: ChangeStatus::Applied,
+            version: Some(version("v2")),
+            enabled: None,
+            approval: None,
+            short_id: None,
+            reason: "配置 Allow".into(),
+        };
+        assert!(change_line(&applied).contains("已切换到 v2"));
+
+        let pending = ToolboxChangeResponse {
+            status: ChangeStatus::Pending,
+            short_id: Some(komo_kernel::types::ids::ShortId::from_index(0)),
+            reason: "等操作者批准".into(),
+            ..applied.clone()
+        };
+        let line = change_line(&pending);
+        assert!(line.contains("/approve 0000"), "{line}");
+        assert!(line.contains("/reject 0000"), "{line}");
+
+        let refused = ToolboxChangeResponse {
+            status: ChangeStatus::Refused,
+            short_id: None,
+            reason: "操作者拒绝了这次执行".into(),
+            ..applied
+        };
+        assert!(change_line(&refused).contains("没有执行"), "{refused:?}");
     }
 }

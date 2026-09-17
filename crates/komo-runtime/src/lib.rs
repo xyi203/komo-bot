@@ -12,4 +12,5 @@ pub mod python_runtime;
 pub mod recovery;
 pub mod scheduler;
 pub mod skills;
+pub mod toolbox;
 pub mod tools;

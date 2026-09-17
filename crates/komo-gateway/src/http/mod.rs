@@ -15,6 +15,7 @@ pub mod idempotency;
 pub mod memories;
 pub mod runs;
 pub mod sessions;
+pub mod toolbox;
 
 use std::sync::Arc;
 
@@ -38,6 +39,8 @@ use idempotency::Idempotency;
 pub struct Api {
     pub state: Arc<GatewayState>,
     pub idempotency: Arc<Idempotency>,
+    /// 已经问出去、还没答复的 toolbox 启用（`http::toolbox`）。
+    pub toolbox: Arc<toolbox::PendingEnables>,
 }
 
 impl std::fmt::Debug for Api {
@@ -51,6 +54,7 @@ impl Api {
         Api {
             state,
             idempotency: Arc::new(Idempotency::new()),
+            toolbox: Arc::new(toolbox::PendingEnables::new()),
         }
     }
 }
@@ -82,6 +86,11 @@ pub fn router(api: Api) -> Router {
         .route("/v1/memories/{id}/forget", post(memories::forget))
         .route("/v1/memory-index", get(memories::index))
         .route("/v1/memory-index/rebuild", post(memories::rebuild))
+        .route("/v1/toolbox", get(toolbox::list))
+        .route("/v1/toolbox/{module}", get(toolbox::show))
+        .route("/v1/toolbox/{module}/test", post(toolbox::test))
+        .route("/v1/toolbox/{module}/enable", post(toolbox::enable))
+        .route("/v1/toolbox/{module}/disable", post(toolbox::disable))
         .route("/v1/models", get(config::models))
         .route("/v1/config/check", get(config::check))
         .route("/v1/config/reload", post(config::reload))

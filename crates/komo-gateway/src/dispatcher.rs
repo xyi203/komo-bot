@@ -26,9 +26,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use komo_kernel::protocol::{ChatCommand, InboundAck, InboundMessage};
 use komo_kernel::traits::{GatewayError, Inbound};
-use komo_kernel::types::chat::{
-    ApprovalScope, ChannelPeer, ChannelPlatform, DeliveryTarget, Outbound, PeerId, Principal,
-};
+use komo_kernel::types::chat::{ApprovalScope, ChannelPeer, ChannelPlatform, PeerId, Principal};
 use komo_kernel::types::ids::{RequestKey, RunId, SessionId, ShortId};
 use komo_kernel::types::status::RunStatus;
 
@@ -305,49 +303,6 @@ impl Dispatcher {
         };
         Ok(format!("{head}\n待处理审批：{pending} 条"))
     }
-
-    /// 第 6 步之后：订阅这个 Session 的事件流，Run 有终态时把最终回复发回来源会话。
-    fn watch_reply(&self, session: SessionId, run: RunId, peer: ChannelPeer) {
-        let state = Arc::clone(&self.state);
-        let mut events = state.hub.subscribe(&session);
-        tokio::spawn(async move {
-            loop {
-                let frame = match events.recv().await {
-                    Ok(frame) => frame,
-                    // 落后了就重读一次账本：内存通知丢了不丢数据（§13.1）。
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(_) => return,
-                };
-                let komo_kernel::protocol::sse::SseEvent::Event(event) = &frame.event else {
-                    continue;
-                };
-                if event.run.as_ref() != Some(&run) {
-                    continue;
-                }
-                let text = match &event.payload {
-                    komo_kernel::events::EventPayload::RunCompleted(body) => body
-                        .final_message
-                        .clone()
-                        .unwrap_or_else(|| "（这一轮没有文字回复）".to_string()),
-                    komo_kernel::events::EventPayload::RunFailed(body) => {
-                        format!("任务失败：{}", body.reason)
-                    }
-                    komo_kernel::events::EventPayload::RunCancelled(_) => "任务已取消。".into(),
-                    _ => continue,
-                };
-                let target = DeliveryTarget::to_peer(peer.clone());
-                if let Err(error) = state
-                    .notifier
-                    .log()
-                    .deliver(&target, Outbound::Text { text })
-                    .await
-                {
-                    tracing::warn!(%error, run = %run, "回复投不出去");
-                }
-                return;
-            }
-        });
-    }
 }
 
 impl GatewayState {
@@ -413,12 +368,14 @@ impl Inbound for Dispatcher {
                 None,
             )
             .await?;
+        // 谁在看这个 Run：`GatewayState::submit` 已经按来源会话起了一个看客
+        // （§11.4：终态回到来源会话，等待审批投来源会话 + home chat），所以这里不再
+        // 另起一个——两个看客会把同一条审批投两遍。
         let ack = if submitted.deduplicated {
             InboundAck::Duplicate {
                 run: Some(submitted.run.clone()),
             }
         } else {
-            self.watch_reply(session.clone(), submitted.run.clone(), msg.peer.clone());
             InboundAck::Queued {
                 session,
                 run: submitted.run.clone(),

@@ -3,6 +3,13 @@
 //!
 //! 用 [`super::start`] 而不是另起一套装配——验收要证的是**这条启动路径**本身对，
 //! 而不是一条只在测试里存在的近似路径。
+//!
+//! 这个模块里的 `TestGateway` 是**单元测试**（`service::tests`）用的那一份；四个集成
+//! 测试目标（chat / cron / memory / recovery）共用的那一套在 [`harness`] 里——它们原先
+//! 各自抄了一份"真 Gateway + MemSender + FakeLlm + 数据目录"，四份的差别只在各自特有的
+//! 那几个助手上。
+
+pub mod harness;
 
 #[cfg(test)]
 use std::path::Path;

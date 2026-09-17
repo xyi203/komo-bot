@@ -9,7 +9,10 @@
 //! 升级，绑定旧环境的授权就覆盖不到新计划了（§5.4）。环境本身的变更（装依赖、切
 //! 版本）是 `Operation::PythonEnvChange`，走 Policy，**不在这个模块里做**。
 //!
-//! toolbox 的保存、候选测试与启用是后面的阶段（§5.4），这里只有"跑"。
+//! toolbox 的保存、候选测试与启用在 [`crate::toolbox`]，这里只有"跑"——外加一件
+//! **执行边界**的事（§7.3）：`denied_imports` 里的目录（候选与历史快照）经
+//! `KOMO_DENIED_IMPORTS` 交给 driver 的导入钩子，于是"通过导入未知模块提前执行未审核
+//! 代码"这条路是关着的。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -45,6 +48,13 @@ pub struct PythonEnvConfig {
     pub toolbox_parent: Option<PathBuf>,
     /// 依赖锁定清单。它的哈希是 `env_version` 的另一半（§5.1「依赖按锁定清单安装」）。
     pub requirements: Option<PathBuf>,
+    /// `code` 模式**不许 import** 的目录（§7.3）：toolbox 的 `.staging` 与
+    /// `.versions`。模型不能通过 import 未审核的候选把它提前跑起来。
+    pub denied_imports: Vec<PathBuf>,
+    /// 透传给子进程的**变量名**：已启用模块声明的 `__komo_env__`（§5.3「地址和凭证
+    /// 引用通过配置传给已授权模块」）。这里存的是名字，值在 `base_env` 里从进程环境
+    /// 取一次，**不经过计划、不进提示词**。
+    pub resource_env: Vec<String>,
     /// 子进程的工作目录。
     pub cwd: PathBuf,
     pub timeout: Duration,
@@ -58,6 +68,8 @@ impl PythonEnvConfig {
             interpreter: None,
             toolbox_parent: None,
             requirements: None,
+            denied_imports: Vec::new(),
+            resource_env: Vec::new(),
             cwd: cwd.into(),
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             output_limit: DEFAULT_OUTPUT_LIMIT,
@@ -275,8 +287,30 @@ fn base_env(config: &PythonEnvConfig) -> BTreeMap<String, String> {
     if let Some(parent) = &config.toolbox_parent {
         env.insert("PYTHONPATH".into(), parent.display().to_string());
     }
+    // §7.3：driver 读它，拒绝任何解析到这些目录下的 import。名单为空时钩子不装。
+    if !config.denied_imports.is_empty() {
+        let joined: Vec<String> = config
+            .denied_imports
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        env.insert("KOMO_DENIED_IMPORTS".into(), joined.join(SEPARATOR));
+    }
+    // 已授权模块要的服务地址与凭证（§5.3）。**按名字透传**：这里读一次进程环境，
+    // 值既不进 `ExecutionPlan`，也不进日志。
+    for name in &config.resource_env {
+        if INHERITED.contains(&name.as_str()) {
+            continue; // 基础变量已经在上面了，不让模块声明覆盖它们。
+        }
+        if let Ok(value) = std::env::var(name) {
+            env.insert(name.clone(), value);
+        }
+    }
     env
 }
+
+/// `KOMO_DENIED_IMPORTS` 的分隔符。不用 `:`——路径里有冒号的系统上那会切错。
+const SEPARATOR: &str = "\n";
 
 #[cfg(test)]
 mod tests {
@@ -437,6 +471,166 @@ mod tests {
                 "{hidden} 不该被 call 模式够到"
             );
         }
+    }
+
+    /// §7.3：`code` 模式 **import 不到未启用的候选**。
+    ///
+    /// 两道门各挡一半：`.staging` 不是合法包名（所以 `import toolbox..staging.ha` 根本
+    /// 不成立），而把候选目录塞进 `sys.path` 再 `import ha` 这一手由 driver 的钩子挡。
+    /// 这里测的是第二道——第一道由布局保证，测不出"失败"来。
+    #[tokio::test]
+    async fn code_mode_cannot_import_a_candidate_that_was_never_enabled() {
+        if !have_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("toolbox/.staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(
+            staging.join("sneaky.py"),
+            "import pathlib
+pathlib.Path('/tmp/komo-should-not-exist').write_text('x')
+",
+        )
+        .unwrap();
+
+        let mut config = PythonEnvConfig::new(dir.path().join("env"), dir.path().to_path_buf());
+        config.interpreter = Some(PathBuf::from("python3"));
+        config.denied_imports = vec![staging.clone()];
+        config.timeout = Duration::from_secs(20);
+        let host = PythonRuntime::new(config, EnvVersion("py-test".into()));
+
+        let mut sink = writer();
+        let outcome = host
+            .run(
+                PythonJob::Code {
+                    code: format!(
+                        "import sys
+sys.path.insert(0, {:?})
+import sneaky
+result = 'imported'",
+                        staging.display().to_string()
+                    ),
+                },
+                &mut sink,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ToolResultStatus::Failed, "{outcome:?}");
+        let error = outcome.error.unwrap_or_default();
+        assert!(error.contains("未经审核"), "{error}");
+    }
+
+    /// 名单为空时钩子不装，普通 import 一切照旧——一道只在需要时存在的门。
+    #[tokio::test]
+    async fn an_empty_deny_list_leaves_ordinary_imports_alone() {
+        if !have_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = writer();
+        let outcome = host(dir.path())
+            .run(
+                PythonJob::Code {
+                    code: "import json
+result = json.dumps({'ok': True})"
+                        .into(),
+                },
+                &mut sink,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ToolResultStatus::Completed, "{outcome:?}");
+    }
+
+    /// 已启用的模块照常 import 得到：禁区只挡候选与快照，不挡当前版本。
+    #[tokio::test]
+    async fn the_enabled_version_is_still_importable_while_the_candidate_is_not() {
+        if !have_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let toolbox = dir.path().join("toolbox");
+        let staging = toolbox.join(".staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(toolbox.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            toolbox.join("ha.py"),
+            "__all__ = ['ping']
+
+def ping():
+    return 'pong'
+",
+        )
+        .unwrap();
+        std::fs::write(
+            staging.join("ha.py"),
+            "raise SystemExit(1)
+",
+        )
+        .unwrap();
+
+        let mut config = PythonEnvConfig::new(dir.path().join("env"), dir.path().to_path_buf());
+        config.interpreter = Some(PathBuf::from("python3"));
+        config.toolbox_parent = Some(dir.path().to_path_buf());
+        config.denied_imports = vec![staging];
+        config.timeout = Duration::from_secs(20);
+        let host = PythonRuntime::new(config, EnvVersion("py-test".into()));
+
+        let mut sink = writer();
+        let outcome = host
+            .run(
+                PythonJob::Call {
+                    module: "toolbox.ha".into(),
+                    function: "ping".into(),
+                    args: serde_json::json!({}),
+                },
+                &mut sink,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, serde_json::json!("pong"), "{outcome:?}");
+    }
+
+    /// 已授权模块要的服务地址与凭证按**名字**透传，其余一个都不进子进程（§5.3）。
+    #[tokio::test]
+    async fn only_the_named_resource_variables_reach_the_child() {
+        if !have_python() {
+            return;
+        }
+        // SAFETY: 测试进程自己的环境，两个名字都只在这一条测试里用。
+        unsafe {
+            std::env::set_var("KOMO_TEST_RESOURCE", "passed-through");
+            std::env::set_var("KOMO_TEST_SECRET", "must-not-leak");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = PythonEnvConfig::new(dir.path().join("env"), dir.path().to_path_buf());
+        config.interpreter = Some(PathBuf::from("python3"));
+        config.resource_env = vec!["KOMO_TEST_RESOURCE".into()];
+        config.timeout = Duration::from_secs(20);
+        let host = PythonRuntime::new(config, EnvVersion("py-test".into()));
+
+        let mut sink = writer();
+        let outcome = host
+            .run(
+                PythonJob::Code {
+                    code: "import os
+result = [os.environ.get('KOMO_TEST_RESOURCE'), os.environ.get('KOMO_TEST_SECRET')]"
+                        .into(),
+                },
+                &mut sink,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.result,
+            serde_json::json!(["passed-through", null]),
+            "点名的那个进去了，没点名的没有"
+        );
     }
 
     #[tokio::test]

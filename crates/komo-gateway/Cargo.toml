@@ -29,6 +29,10 @@ arc-swap = { workspace = true }
 futures-util = { workspace = true }
 bytes = { workspace = true }
 tokio-util = { workspace = true }
+# 只在 `test-support` 下编进来：共用的集成测试脚手架（`service::test_support::harness`）
+# 要一个临时目录与 TLS provider。生产构建里这两条不在依赖树上。
+tempfile = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
 
 [features]
 # §13.4：三个渠道各自一个 feature，默认全开。feature 的用处不是裁功能，是让
@@ -39,7 +43,12 @@ telegram = []
 wechat = ["dep:wechatbot", "dep:qrcode"]
 # W5：集成测试（`tests/recovery`）要的故障注入口。只开这个 feature 时编进来的是
 # `service::test_support` 里的注入表，生产构建里那张表根本不存在。
-test-support = ["komo-kernel/test-support", "komo-store/test-support"]
+test-support = [
+    "komo-kernel/test-support",
+    "komo-store/test-support",
+    "dep:tempfile",
+    "dep:rustls",
+]
 
 
 [dev-dependencies]

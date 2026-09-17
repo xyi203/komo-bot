@@ -219,6 +219,13 @@ pub struct GatewayState {
     pub supervisor: Arc<super::channels::ChannelSupervisor>,
     /// Dispatcher。**构造之后才填**：它握着这份状态，反过来也要被渠道拿到。
     pub inbound: std::sync::OnceLock<Arc<dyn komo_kernel::traits::Inbound>>,
+    /// 正在被人看着的 Run，以及已经投出去的审批。
+    ///
+    /// **一个 Run 只有一个看的人**：Cron 的看客与交互的看客都走
+    /// [`run_watch::watch`](super::run_watch::watch)，登记表是它们之间唯一的约定——
+    /// 没有它，一条审批会被投两遍（去重键那一层管的是平台重投，管不到这个）。
+    pub watching: Mutex<std::collections::BTreeSet<RunId>>,
+    pub approvals_delivered: Mutex<std::collections::BTreeSet<ApprovalId>>,
     /// 会话的工作目录。
     ///
     // TODO(decide: `sessions.workdir` 这一列 store 只在建行时写（`ensure_in` 永远写
@@ -429,6 +436,8 @@ impl GatewayState {
             segments,
             supervisor: Arc::new(super::channels::ChannelSupervisor::new(factories)),
             inbound: std::sync::OnceLock::new(),
+            watching: Mutex::new(std::collections::BTreeSet::new()),
+            approvals_delivered: Mutex::new(std::collections::BTreeSet::new()),
             workdirs: Mutex::new(std::collections::BTreeMap::new()),
             max_retries,
             max_rounds,
@@ -484,6 +493,39 @@ impl GatewayState {
                 None => tracing::debug!(job = %one.job, "触发之后这个 Job 不在了，不盯了"),
             }
         }
+    }
+
+    /// 开始盯这个 Run。答 `false` = 已经有人在看了，别再起一个。
+    pub fn start_watching(&self, run: &RunId) -> bool {
+        self.watching.lock().expect("看客表").insert(run.clone())
+    }
+
+    pub fn stop_watching(&self, run: &RunId) {
+        self.watching.lock().expect("看客表").remove(run);
+    }
+
+    /// 这条审批还没被投出去过。答 `false` = 投过了（同一条审批只问一次人）。
+    pub fn start_delivering_approval(&self, approval: &ApprovalId) -> bool {
+        self.approvals_delivered
+            .lock()
+            .expect("审批投递表")
+            .insert(approval.clone())
+    }
+
+    /// 盯一个交互 Run：终态回到来源会话，等待审批 / 需要处理投来源会话 + home chat
+    /// （§11.4）。`peer` 为 `None` 就是 TUI / HTTP——那时只有 home chat。
+    pub fn watch_interactive_run(
+        self: &Arc<Self>,
+        session: &SessionId,
+        run: &RunId,
+        peer: Option<ChannelPeer>,
+    ) {
+        super::run_watch::watch(
+            Arc::clone(self),
+            session.clone(),
+            run.clone(),
+            super::run_watch::Watcher::Interactive { peer },
+        );
     }
 
     /// 盯一次触发。`scheduled = false` 是手动 run：它**没有触发记录**（§10：不冒充
@@ -583,7 +625,7 @@ impl GatewayState {
 
     /// 提交一条输入：**HTTP 与聊天渠道共用的那一段**（§13.1）。
     pub async fn submit(
-        &self,
+        self: &Arc<Self>,
         session: &SessionId,
         request_key: RequestKey,
         text: String,
@@ -608,6 +650,11 @@ impl GatewayState {
             })
             .await?;
         self.waker().wake();
+        // 有人看着它：终态回到来源会话，停下来等审批时把那条审批投出去（§11.4）。
+        // 重发命中原 Run 时不再起第二个看客——登记表也会挡住，这里先省一次 spawn。
+        if !accepted.deduplicated {
+            self.watch_interactive_run(&accepted.session, &accepted.run, peer);
+        }
         Ok(SubmitRunResponse {
             run: accepted.run,
             session: accepted.session,

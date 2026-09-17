@@ -24,7 +24,7 @@ async fn a_paraphrase_finds_it_over_http() {
 
     // 一个字都不重合的中文查询。
     let (status, body) = gateway
-        .get("/v1/memories?query=%E7%95%8C%E9%9D%A2%E9%83%BD%E7%BB%99%E6%88%91%E7%94%A8%E6%9A%97%E8%89%B2")
+        .get_json("/v1/memories?query=%E7%95%8C%E9%9D%A2%E9%83%BD%E7%BB%99%E6%88%91%E7%94%A8%E6%9A%97%E8%89%B2")
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["degraded"], serde_json::json!(false));
@@ -40,7 +40,7 @@ async fn a_paraphrase_finds_it_over_http() {
 
     // 同一个查询在纯关键词下够不着：这正是向量臂存在的理由。
     let (status, body) = gateway
-        .get("/v1/memories?query=%E7%95%8C%E9%9D%A2%E9%83%BD%E7%BB%99%E6%88%91%E7%94%A8%E6%9A%97%E8%89%B2&mode=keyword")
+        .get_json("/v1/memories?query=%E7%95%8C%E9%9D%A2%E9%83%BD%E7%BB%99%E6%88%91%E7%94%A8%E6%9A%97%E8%89%B2&mode=keyword")
         .await;
     assert_eq!(status, 200);
     assert!(body["memories"].as_array().unwrap().is_empty(), "{body}");
@@ -70,7 +70,7 @@ async fn a_two_character_chinese_query_hits_the_bigram_arm() {
 
     // "空调" = 一个 bigram。
     let (status, body) = gateway
-        .get("/v1/memories?query=%E7%A9%BA%E8%B0%83&mode=keyword")
+        .get_json("/v1/memories?query=%E7%A9%BA%E8%B0%83&mode=keyword")
         .await;
     assert_eq!(status, 200, "{body}");
     let memories = body["memories"].as_array().expect("数组");
@@ -94,7 +94,9 @@ async fn a_dead_endpoint_degrades_hybrid_and_fails_vector_only() {
     .await;
     embeddings.set_down(true);
 
-    let (status, body) = gateway.get("/v1/memories?query=%E7%A9%BA%E8%B0%83").await;
+    let (status, body) = gateway
+        .get_json("/v1/memories?query=%E7%A9%BA%E8%B0%83")
+        .await;
     assert_eq!(status, 200, "hybrid 不该整个失败：{body}");
     assert_eq!(body["degraded"], serde_json::json!(true), "要明示降级");
     assert!(body["degraded_reason"].is_string(), "要说原因：{body}");
@@ -105,7 +107,7 @@ async fn a_dead_endpoint_degrades_hybrid_and_fails_vector_only() {
     );
 
     let (status, body) = gateway
-        .get("/v1/memories?query=%E7%A9%BA%E8%B0%83&mode=vector")
+        .get_json("/v1/memories?query=%E7%A9%BA%E8%B0%83&mode=vector")
         .await;
     assert_ne!(status, 200, "vector-only 要明确报不可用，不是 200 + 空集");
     assert_eq!(
@@ -119,7 +121,7 @@ async fn a_dead_endpoint_degrades_hybrid_and_fails_vector_only() {
 /// （§9.4）。
 #[tokio::test]
 async fn hybrid_without_an_embedding_section_is_reported_as_a_configuration_error() {
-    let gateway = GatewayBuilder::new(&memory_config("keyword", false))
+    let gateway = memory_gateway(&memory_config("keyword", false))
         .start()
         .await;
     gateway
@@ -138,13 +140,15 @@ async fn hybrid_without_an_embedding_section_is_reported_as_a_configuration_erro
         .unwrap();
 
     // 配置里写的是 keyword，所以默认那一问照常。
-    let (status, body) = gateway.get("/v1/memories?query=%E7%A9%BA%E8%B0%83").await;
+    let (status, body) = gateway
+        .get_json("/v1/memories?query=%E7%A9%BA%E8%B0%83")
+        .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["memories"].as_array().unwrap().len(), 1);
 
     // 明确要 hybrid 就是配置错误。
     let (status, body) = gateway
-        .get("/v1/memories?query=%E7%A9%BA%E8%B0%83&mode=hybrid")
+        .get_json("/v1/memories?query=%E7%A9%BA%E8%B0%83&mode=hybrid")
         .await;
     assert_ne!(status, 200, "{body}");
     assert_eq!(
@@ -177,20 +181,20 @@ async fn listing_without_a_query_is_inventory_not_an_empty_search() {
     )
     .await;
 
-    let (status, body) = gateway.get("/v1/memories").await;
+    let (status, body) = gateway.get_json("/v1/memories").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["memories"].as_array().unwrap().len(), 2, "库存两条");
     assert_eq!(body["degraded"], serde_json::json!(false), "列库存不碰向量");
 
     // 按状态筛。
-    let (status, body) = gateway.get("/v1/memories?state=candidate").await;
+    let (status, body) = gateway.get_json("/v1/memories?state=candidate").await;
     assert_eq!(status, 200, "{body}");
     let only = body["memories"].as_array().unwrap();
     assert_eq!(only.len(), 1);
     assert_eq!(only[0]["id"], serde_json::json!("m-2"));
 
     // 按作用域筛。
-    let (status, body) = gateway.get("/v1/memories?scope=project%3Akomo").await;
+    let (status, body) = gateway.get_json("/v1/memories?scope=project%3Akomo").await;
     assert_eq!(status, 200, "{body}");
     assert!(body["memories"].as_array().unwrap().is_empty(), "{body}");
 }
@@ -209,7 +213,9 @@ async fn a_contested_memory_is_out_of_recall_but_findable_on_purpose() {
     )
     .await;
 
-    let (status, body) = gateway.get("/v1/memories?query=%E7%A9%BA%E8%B0%83").await;
+    let (status, body) = gateway
+        .get_json("/v1/memories?query=%E7%A9%BA%E8%B0%83")
+        .await;
     assert_eq!(status, 200, "{body}");
     assert!(
         body["memories"].as_array().unwrap().is_empty(),
@@ -217,7 +223,7 @@ async fn a_contested_memory_is_out_of_recall_but_findable_on_purpose() {
     );
 
     let (status, body) = gateway
-        .get("/v1/memories?query=%E7%A9%BA%E8%B0%83&state=contested")
+        .get_json("/v1/memories?query=%E7%A9%BA%E8%B0%83&state=contested")
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
@@ -235,7 +241,7 @@ async fn a_turn_records_which_memories_reached_it() {
         1,
         "知道了，26 度。",
     )]]);
-    let gateway = GatewayBuilder::new(&memory_config("hybrid", true))
+    let gateway = memory_gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
         .llm(Arc::new(llm.clone()) as Arc<dyn komo_kernel::traits::LlmClient>)
         .start()

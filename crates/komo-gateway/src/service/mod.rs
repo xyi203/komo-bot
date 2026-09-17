@@ -15,6 +15,7 @@
 pub mod channels;
 pub mod cron_watch;
 pub mod ledgers;
+pub mod run_watch;
 pub mod segment;
 pub mod state;
 pub mod units;
@@ -32,7 +33,9 @@ use std::sync::Arc;
 use komo_kernel::traits::{Clock, Inbound, LlmClient, Shutdown, Tool};
 use komo_kernel::types::chat::Outbound;
 use komo_runtime::config::{ConfigHolder, EffortCapabilities, LoadOptions};
+use komo_runtime::toolbox::Toolbox;
 use komo_store::Db;
+use time::OffsetDateTime;
 
 use crate::channels::ChannelFactory;
 use crate::dispatcher::Dispatcher;
@@ -151,13 +154,13 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         home: home.clone(),
         config: Arc::clone(&config),
         caps: EffortCapabilities::builtin(),
-        db,
+        db: db.clone(),
         clock: Arc::clone(&clock),
         instance_id: instance_id.clone(),
         token: token.clone(),
         llm: options.llm,
         embeddings: options.embeddings,
-        tools: build_tools(&snapshot, &instance_id).await,
+        tools: build_tools(&snapshot, &instance_id, &db, Arc::clone(&clock)).await,
         channels: options.channels,
     })
     .await
@@ -380,10 +383,70 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
     }
 }
 
+/// 这台 Gateway 的 toolbox（§5.3）。
+///
+/// 目录一定建出来，内置模块首次启动装进去（§5.5 的 memos）——「首次启动若 toolbox 里
+/// 没有就写入并标已启用」，已经有同名模块就**不动**。
+pub fn toolbox_of(snapshot: &komo_kernel::protocol::config::ConfigSnapshot) -> Arc<Toolbox> {
+    let toolbox = Arc::new(Toolbox::new(snapshot.paths.toolbox_dir.clone()));
+    if let Err(error) = toolbox.ensure_layout() {
+        tracing::warn!(%error, "toolbox 目录建不出来");
+    }
+    match komo_runtime::toolbox::builtin::install(&toolbox, OffsetDateTime::now_utc()) {
+        Ok(installed) => {
+            for module in installed {
+                tracing::info!(module = %module.module, version = %module.version, "装上内置 toolbox 模块");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "内置 toolbox 模块装不进去"),
+    }
+    toolbox
+}
+
+/// 受管理解释器的配置（§5.1）。
+///
+/// 两件与 toolbox 相关的事在这里接上：`toolbox_parent` 让 `import toolbox.x` 成立，
+/// `denied_imports` 让候选与历史快照 import 不到（§7.3）。`resource_env` 是**已启用
+/// 模块声明的变量名**——值在子进程里从进程环境取，不进计划也不进提示词（§5.3）。
+pub fn python_env(
+    snapshot: &komo_kernel::protocol::config::ConfigSnapshot,
+    toolbox: &Toolbox,
+) -> komo_runtime::python_runtime::PythonEnvConfig {
+    let mut python = komo_runtime::python_runtime::PythonEnvConfig::new(
+        snapshot.start_only.python_env_root.clone(),
+        snapshot.paths.workspaces_dir.clone(),
+    );
+    // 受管理环境还没建出来时**退回系统解释器**，并且说出来。
+    //
+    // 不静默：`env_version` 会变成系统解释器的版本 + `no-lock`，那正是"这台机器上跑的
+    // 是哪一个解释器、锁没锁依赖"的诚实答案（§5.1）。反过来，让整个 `python` 工具因为
+    // 一个还没 `python -m venv` 过的目录而消失，等于把一句诊断换成一个空白。
+    if !python.interpreter_path().exists() {
+        tracing::warn!(
+            env_root = %python.env_root.display(),
+            "受管理的 Python 环境还没建出来，这次退回系统 python3"
+        );
+        python.interpreter = Some(std::path::PathBuf::from("python3"));
+    }
+    python.toolbox_parent = Some(toolbox.layout().parent());
+    python.denied_imports = toolbox.layout().denied_import_roots();
+    python.resource_env = toolbox
+        .list()
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|module| module.env)
+        .collect();
+    python.resource_env.sort();
+    python.resource_env.dedup();
+    python
+}
+
 /// 五个基础工具（§4）。`python` 要有一个跑得起来的解释器才挂。
 async fn build_tools(
     snapshot: &komo_kernel::protocol::config::ConfigSnapshot,
     instance_id: &str,
+    db: &komo_store::Db,
+    clock: Arc<dyn Clock>,
 ) -> Vec<Arc<dyn Tool>> {
     use komo_runtime::tools::{EditTool, ReadTool, ShellTool, WriteTool};
 
@@ -402,14 +465,23 @@ async fn build_tools(
         Arc::new(ShellTool::new().registered(registration.clone())),
     ];
 
-    let python = komo_runtime::python_runtime::PythonEnvConfig::new(
-        snapshot.start_only.python_env_root.clone(),
-        snapshot.paths.workspaces_dir.clone(),
-    );
+    let toolbox = toolbox_of(snapshot);
+    let python = python_env(snapshot, &toolbox);
     match komo_runtime::python_runtime::PythonRuntime::probe(python).await {
-        Ok(runtime) => tools.push(Arc::new(komo_runtime::tools::PythonTool::new(Arc::new(
-            runtime.registered(registration),
-        )))),
+        Ok(runtime) => {
+            // 核对函数的那道门（§8.6）。它自己带一份 Policy 与授权表：核对是一次**新的**
+            // 执行计划（`PlanSource::Verification`），要按当时的规则重新判一次。
+            let gate = komo_runtime::tools::python::VerificationGate {
+                policy: komo_runtime::policy::PolicyEngine::from_rules(snapshot.policy.clone()),
+                approvals: Arc::new(komo_store::TursoApprovalRepo::new(db.clone())),
+                clock,
+            };
+            tools.push(Arc::new(
+                komo_runtime::tools::PythonTool::new(Arc::new(runtime.registered(registration)))
+                    .with_toolbox(toolbox)
+                    .with_verification(gate),
+            ));
+        }
         Err(error) => {
             // 「没有解释器」不该让整台 Gateway 起不来——别的四个工具照常。
             tracing::warn!(%error, "Python 环境探测不到：这台 Gateway 不挂 python 工具");

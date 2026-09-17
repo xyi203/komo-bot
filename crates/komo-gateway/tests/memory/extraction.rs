@@ -21,7 +21,7 @@ use crate::{seeded, text_round};
 async fn run_and_learn(scripts: Vec<Vec<Round>>, text: &str) -> (TestGateway, ScriptedLlm) {
     let embeddings = ConceptEmbeddings::new();
     let llm = ScriptedLlm::new(scripts);
-    let gateway = GatewayBuilder::new(&memory_config("hybrid", true))
+    let gateway = memory_gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
         .llm(Arc::new(llm.clone()) as Arc<dyn LlmClient>)
         .start()
@@ -90,7 +90,7 @@ async fn a_user_statement_lands_active_and_unconfirmed_with_its_evidence() {
 async fn an_observation_with_a_real_evidence_id_is_stored_with_its_provenance() {
     let embeddings = ConceptEmbeddings::new();
     let llm = ScriptedLlm::new(vec![vec![text_round(1, "记住了。")]]);
-    let gateway = GatewayBuilder::new(&memory_config("hybrid", true))
+    let gateway = memory_gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
         .llm(Arc::new(llm.clone()) as Arc<dyn LlmClient>)
         .start()
@@ -230,14 +230,14 @@ async fn the_four_provenances_stay_apart_end_to_end() {
     .await;
     // 第四种：用户确认过的。**只有操作者路径抬得起来**（§9.2）。
     let (status, body) = gateway
-        .post(
+        .post_json(
             "/v1/memories/m-1/confirm",
             serde_json::json!({"expected_revision": 1}),
         )
         .await;
     assert_eq!(status, 200, "{body}");
 
-    let (status, body) = gateway.get("/v1/memories").await;
+    let (status, body) = gateway.get_json("/v1/memories").await;
     assert_eq!(status, 200, "{body}");
     let memories = body["memories"].as_array().unwrap();
 
@@ -271,7 +271,9 @@ async fn the_four_provenances_stay_apart_end_to_end() {
     );
     assert_eq!(by_id("m-3")["state"], serde_json::json!("candidate"));
     // 候选**不进自动召回**（"不作为已确认事实注入"，§9.2）。
-    let (_status, body) = gateway.get("/v1/memories?query=%E6%A8%A1%E5%9E%8B").await;
+    let (_status, body) = gateway
+        .get_json("/v1/memories?query=%E6%A8%A1%E5%9E%8B")
+        .await;
     assert!(
         body["memories"]
             .as_array()
@@ -343,7 +345,7 @@ async fn a_failed_extraction_stays_pending_for_the_next_round() {
     let embeddings = ConceptEmbeddings::new();
     // 只给对话那一轮脚本；提取那一问会在模型这一层失败。
     let llm = ScriptedLlm::new(vec![vec![text_round(1, "好的。")]]);
-    let gateway = GatewayBuilder::new(&memory_config("hybrid", true))
+    let gateway = memory_gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
         .llm(Arc::new(llm) as Arc<dyn LlmClient>)
         .start()

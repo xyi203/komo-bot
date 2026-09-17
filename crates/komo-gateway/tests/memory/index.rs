@@ -13,7 +13,7 @@ use crate::seeded;
 #[tokio::test]
 async fn a_rebuild_really_runs_and_its_progress_is_queryable() {
     let embeddings = ConceptEmbeddings::new();
-    let gateway = GatewayBuilder::new(&memory_config("hybrid", true))
+    let gateway = memory_gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn EmbeddingClient>)
         .start()
         .await;
@@ -35,7 +35,7 @@ async fn a_rebuild_really_runs_and_its_progress_is_queryable() {
     }
 
     // 还没建：有 embedding 配置，但一个代次都没有——那是"还没建"，不是"没配置"。
-    let (status, body) = gateway.get("/v1/memory-index").await;
+    let (status, body) = gateway.get_json("/v1/memory-index").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["state"], serde_json::json!("building"), "{body}");
     assert_eq!(body["indexed"], serde_json::json!(0));
@@ -50,7 +50,7 @@ async fn a_rebuild_really_runs_and_its_progress_is_queryable() {
     );
 
     let (status, body) = gateway
-        .post("/v1/memory-index/rebuild", serde_json::json!({}))
+        .post_json("/v1/memory-index/rebuild", serde_json::json!({}))
         .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["accepted"], serde_json::json!(true), "{body}");
@@ -72,7 +72,7 @@ async fn a_rebuild_really_runs_and_its_progress_is_queryable() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    let (status, body) = gateway.get("/v1/memory-index").await;
+    let (status, body) = gateway.get_json("/v1/memory-index").await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["state"], serde_json::json!("ready"), "{body}");
     assert_eq!(body["indexed"], serde_json::json!(5));
@@ -95,16 +95,16 @@ async fn a_rebuild_really_runs_and_its_progress_is_queryable() {
 /// 没有配置向量模型时 `GET /v1/memory-index` 是一个**状态**，重建则是配置错误。
 #[tokio::test]
 async fn an_index_without_an_embedding_model_reads_as_unconfigured() {
-    let gateway = GatewayBuilder::new(&memory_config("keyword", false))
+    let gateway = memory_gateway(&memory_config("keyword", false))
         .start()
         .await;
 
-    let (status, body) = gateway.get("/v1/memory-index").await;
+    let (status, body) = gateway.get_json("/v1/memory-index").await;
     assert_eq!(status, 200, "没配置是一个状态，不是一次失败：{body}");
     assert_eq!(body["state"], serde_json::json!("unconfigured"));
 
     let (status, body) = gateway
-        .post("/v1/memory-index/rebuild", serde_json::json!({}))
+        .post_json("/v1/memory-index/rebuild", serde_json::json!({}))
         .await;
     assert_ne!(status, 200, "{body}");
     assert_eq!(
@@ -175,7 +175,7 @@ async fn editing_a_memory_retires_its_vector() {
 #[tokio::test]
 async fn a_rebuild_survives_a_restart() {
     let embeddings = ConceptEmbeddings::new();
-    let mut gateway = GatewayBuilder::new(&memory_config("hybrid", true))
+    let mut gateway = memory_gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn EmbeddingClient>)
         .start()
         .await;
@@ -219,7 +219,7 @@ async fn a_rebuild_survives_a_restart() {
     // 重启：同一个数据目录、同一个空间。
     let revived = ConceptEmbeddings::new();
     gateway
-        .restart(
+        .restart_with_embeddings(
             &memory_config("hybrid", true),
             Arc::clone(&revived) as Arc<dyn EmbeddingClient>,
         )

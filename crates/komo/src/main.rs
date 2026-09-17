@@ -79,6 +79,15 @@ enum Command {
         #[command(subcommand)]
         action: SkillsCommand,
     },
+    /// 已保存的 Python 能力：候选、测试、启用与停用（§5.3、§5.4）。
+    ///
+    // TODO(decide: §3 的命令表里没有它。toolbox 是文件系统上的东西，但**启用要审批**，
+    // 而审批在 state.db 里、只有 Gateway 打得开（§12）——所以整组走 Gateway，不像
+    // `komo skills` 那样直接读盘。见报告。)
+    Toolbox {
+        #[command(subcommand)]
+        action: ToolboxCommand,
+    },
     /// 显示当前生效配置的加载时间与来源文件 mtime，以及上一次校验错误（§3）。
     Doctor,
 }
@@ -295,6 +304,28 @@ enum WechatCommand {
 }
 
 #[derive(Subcommand)]
+enum ToolboxCommand {
+    /// 列出模块：已启用的、只有候选的，都算。
+    List,
+    /// 看一个模块：当前版本、导出函数、候选与它的测试结果。
+    Inspect {
+        /// 模块名，`memos` 或 `toolbox.memos` 都收。
+        module: String,
+    },
+    /// 跑候选自带的测试，结果记进候选的元数据（§5.4）。
+    Test { module: String },
+    /// 启用候选版本。**产生一条审批**，消息里带版本差异与测试结果（§7.1 第 4 行）。
+    Enable {
+        module: String,
+        /// 只启用这一版；与当前候选对不上就拒绝（§5.4「校验候选哈希与已测版本一致」）。
+        #[arg(long)]
+        version: Option<String>,
+    },
+    /// 停用一个模块。正文移出 toolbox/，快照与元数据保留。
+    Disable { module: String },
+}
+
+#[derive(Subcommand)]
 enum SkillsCommand {
     /// 列出 Skills。
     List,
@@ -410,6 +441,24 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
                 SkillsCommand::Disable { name } => SkillsAction::Disable(name),
             };
             commands::skills(home, action).map(Some)
+        }
+        Some(Command::Toolbox { action }) => {
+            let client = connect::connect_or_start(home).await?;
+            // 这组端点不在 §13.1 的接口表里，所以 `KomoClient` 上没有它们；地址与令牌
+            // 从发现文件读一次（`komo home` 已经是这个形状）。
+            let discovery = komo_client::discovery::read_discovery_file(home)
+                .map_err(|error| error.to_string())?;
+            let at = (client.base_url(), discovery.token.as_deref());
+            match action {
+                ToolboxCommand::List => commands::toolbox_list(at).await,
+                ToolboxCommand::Inspect { module } => commands::toolbox_inspect(at, &module).await,
+                ToolboxCommand::Test { module } => commands::toolbox_test(at, &module).await,
+                ToolboxCommand::Enable { module, version } => {
+                    commands::toolbox_enable(at, &module, version).await
+                }
+                ToolboxCommand::Disable { module } => commands::toolbox_disable(at, &module).await,
+            }
+            .map(Some)
         }
         // 其余都要一个在跑的 Gateway。
         other => {
@@ -650,6 +699,49 @@ mod tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// `komo toolbox ...` 的五条（§5.3、§5.4；**不在 §3 的命令表里**，见上面的 TODO）。
+    #[test]
+    fn the_toolbox_commands_parse() {
+        assert!(matches!(
+            Cli::parse_from(["komo", "toolbox", "list"]).command,
+            Some(Command::Toolbox {
+                action: ToolboxCommand::List
+            })
+        ));
+        let Some(Command::Toolbox {
+            action: ToolboxCommand::Inspect { module },
+        }) = Cli::parse_from(["komo", "toolbox", "inspect", "memos"]).command
+        else {
+            panic!("解析不出 inspect");
+        };
+        assert_eq!(module, "memos");
+
+        // `--version` 是"只启用这一版"，不是 clap 的版本号——它必须真的到得了参数里。
+        let Some(Command::Toolbox {
+            action: ToolboxCommand::Enable { module, version },
+        }) = Cli::parse_from(["komo", "toolbox", "enable", "memos", "--version", "abc-1"]).command
+        else {
+            panic!("解析不出 enable");
+        };
+        assert_eq!(module, "memos");
+        assert_eq!(version.as_deref(), Some("abc-1"));
+
+        assert!(matches!(
+            Cli::parse_from(["komo", "toolbox", "test", "memos"]).command,
+            Some(Command::Toolbox {
+                action: ToolboxCommand::Test { .. }
+            })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["komo", "toolbox", "disable", "memos"]).command,
+            Some(Command::Toolbox {
+                action: ToolboxCommand::Disable { .. }
+            })
+        ));
+        // 模块名是必填的：`komo toolbox enable` 不该对着"某个模块"生效。
+        assert!(Cli::try_parse_from(["komo", "toolbox", "enable"]).is_err());
     }
 
     /// §3 的命令表里那几条要能解析出来。

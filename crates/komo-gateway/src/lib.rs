@@ -20,6 +20,9 @@ pub mod sse;
 /// client / gateway / clap 三条，加第四条会把二进制挪到另一条依赖边上。
 pub use komo_runtime::config;
 pub use komo_runtime::skills;
+/// `komo toolbox` 的那几个类型（§5.3）。同一个理由：bin 的依赖是 client / gateway /
+/// clap 三条，不加第四条。
+pub use komo_runtime::toolbox;
 
 pub use dispatcher::Dispatcher;
 pub use lock::{DiscoveryFile, GatewayDiscovery, InstanceLock};

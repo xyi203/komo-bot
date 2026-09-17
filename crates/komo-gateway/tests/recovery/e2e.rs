@@ -69,7 +69,8 @@ async fn the_first_end_to_end_acceptance() {
     );
 
     // ── 3. 现在才 resume 原会话看结果——走 CLI 那条路（`komo resume` 用的就是它）。
-    let client = gw.client();
+    let (base, token) = gw.address();
+    let client = komo_client::KomoClient::new(&base, Some(token)).expect("客户端");
     let resumed = client
         .resume(
             &session,

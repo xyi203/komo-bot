@@ -9,11 +9,73 @@
 - code：任意代码。脚本可以设 `result` 返回 JSON 可表达的数据。
 - call：已保存模块中**明确导出**的函数。导出 = 模块 `__all__` 里列了这个名字；
   查的是 `module.__dict__`，不是 `getattr`——后者会顺着 `__getattr__` 走到任意属性。
+
+执行边界（§7.3）：`KOMO_DENIED_IMPORTS` 列出的目录里的东西 **import 不进来**。
+toolbox 的候选（`.staging/`）与历史快照（`.versions/`）在那张名单上，所以
+「模型通过导入未知模块提前执行未审核代码」这条路是关着的——候选目录本来就不是合法的
+包名，钩子挡的是绕开包名直接把它加进 `sys.path` 的那一手。
+
+这不是沙箱，文档也没有声称它是：任意代码一旦启动就有其运行账号的权限（§7.3），
+`exec(open(...).read())` 之类挡不住。挡的是 *import* 这条被点名的路径。
 """
 
+import importlib.machinery
 import json
 import os
 import sys
+
+
+def _denied_roots():
+    """不许 import 的目录（§7.3）。名单为空就不装钩子。"""
+    raw = os.environ.get("KOMO_DENIED_IMPORTS") or ""
+    return [os.path.realpath(line) for line in raw.split("\n") if line.strip()]
+
+
+class _DenyFinder:
+    """排在 sys.meta_path 最前面的查找器：解析到禁区里就拒绝，否则让开。
+
+    它不自己找模块——先问标准的 `PathFinder`"这个名字会落到哪个文件"，再看那个文件在不
+    在禁区里。拒绝是 ImportError 的子类，所以 `try: import ...` 看得见它，而不是一个
+    看不懂的崩溃。
+
+    `PathFinder` 在**装钩子之前**就抓在手里（模块顶层的 import），而且 `find_spec` 里
+    带一个重入标记：钩子自己触发的任何 import 都会再走一遍 meta_path，不挡住这一层就是
+    一次必然的无限递归。
+    """
+
+    def __init__(self, roots):
+        self.roots = roots
+        self.inside = False
+
+    def find_spec(self, fullname, path=None, target=None):
+        if self.inside:
+            return None
+        self.inside = True
+        try:
+            spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
+        finally:
+            self.inside = False
+        if spec is None:
+            return None
+        origin = getattr(spec, "origin", None)
+        locations = list(getattr(spec, "submodule_search_locations", None) or [])
+        for candidate in [origin] + locations:
+            if not candidate or candidate in ("built-in", "frozen", "namespace"):
+                continue
+            real = os.path.realpath(candidate)
+            for root in self.roots:
+                if real == root or real.startswith(root + os.sep):
+                    raise ImportError(
+                        "%s 解析到 %s：那是未经审核的 toolbox 目录，不能 import（§7.3）"
+                        % (fullname, candidate)
+                    )
+        return None  # 不拦就让开，正常的查找链接着走。
+
+
+def _install_import_guard():
+    roots = _denied_roots()
+    if roots:
+        sys.meta_path.insert(0, _DenyFinder(roots))
 
 
 def _jsonable(value):
@@ -70,6 +132,8 @@ def _run_call(job):
 def main():
     out = {"status": "completed", "result": None, "error": None}
     try:
+        # 钩子先装：读作业之前就装上，任何一条 import 都躲不过它。
+        _install_import_guard()
         job = json.load(sys.stdin)
         mode = job.get("mode")
         if mode == "code":

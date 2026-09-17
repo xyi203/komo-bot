@@ -26,7 +26,7 @@ async fn confirm_and_forget_are_idempotent_over_http() {
 
     // 版本不符：拒绝，并说清当前是第几版。
     let (status, body) = gateway
-        .post(
+        .post_json(
             "/v1/memories/m-1/confirm",
             serde_json::json!({"expected_revision": 7}),
         )
@@ -40,7 +40,7 @@ async fn confirm_and_forget_are_idempotent_over_http() {
 
     // 对上了就确认。**只有这条路抬得起确认等级**（§9.2）。
     let (status, body) = gateway
-        .post(
+        .post_json(
             "/v1/memories/m-1/confirm",
             serde_json::json!({"expected_revision": 1, "request_key": "cli-confirm-1"}),
         )
@@ -58,7 +58,7 @@ async fn confirm_and_forget_are_idempotent_over_http() {
 
     // 同一个请求键重发：原样返回，不做第二次。
     let (status, again) = gateway
-        .post(
+        .post_json(
             "/v1/memories/m-1/confirm",
             serde_json::json!({"expected_revision": 1, "request_key": "cli-confirm-1"}),
         )
@@ -68,7 +68,7 @@ async fn confirm_and_forget_are_idempotent_over_http() {
 
     // forget 同理。
     let (status, body) = gateway
-        .post(
+        .post_json(
             "/v1/memories/m-1/forget",
             serde_json::json!({"expected_revision": 1, "request_key": "cli-forget-1"}),
         )
@@ -77,7 +77,7 @@ async fn confirm_and_forget_are_idempotent_over_http() {
     assert_eq!(body["memory"]["state"], serde_json::json!("forgotten"));
 
     let (status, again) = gateway
-        .post(
+        .post_json(
             "/v1/memories/m-1/forget",
             serde_json::json!({"expected_revision": 1, "request_key": "cli-forget-1"}),
         )
@@ -86,7 +86,7 @@ async fn confirm_and_forget_are_idempotent_over_http() {
     assert_eq!(again, body);
 
     // **遗忘不等于删除原文**（§9.6）：正文还读得到，界面要说清遗忘范围。
-    let (status, detail) = gateway.get("/v1/memories/m-1").await;
+    let (status, detail) = gateway.get_json("/v1/memories/m-1").await;
     assert_eq!(status, 200, "{detail}");
     assert_eq!(
         detail["memory"]["content"],
@@ -95,7 +95,9 @@ async fn confirm_and_forget_are_idempotent_over_http() {
     assert_eq!(detail["memory"]["state"], serde_json::json!("forgotten"));
 
     // 但召回不到了，关键词与向量的引用都失效了（§9.6）。
-    let (status, body) = gateway.get("/v1/memories?query=%E7%A9%BA%E8%B0%83").await;
+    let (status, body) = gateway
+        .get_json("/v1/memories?query=%E7%A9%BA%E8%B0%83")
+        .await;
     assert_eq!(status, 200, "{body}");
     assert!(body["memories"].as_array().unwrap().is_empty(), "{body}");
 }
@@ -111,7 +113,7 @@ async fn a_forgotten_memory_never_comes_back_into_a_turn() {
         vec![text_round(1, "26 度。")],
         vec![text_round(1, "我这边看不到了。")],
     ]);
-    let gateway = GatewayBuilder::new(&memory_config("hybrid", true))
+    let gateway = memory_gateway(&memory_config("hybrid", true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
         .llm(Arc::new(llm.clone()) as Arc<dyn LlmClient>)
         .start()
@@ -148,7 +150,7 @@ async fn a_forgotten_memory_never_comes_back_into_a_turn() {
 
     // 操作者遗忘它。
     let (status, body) = gateway
-        .post(
+        .post_json(
             "/v1/memories/m-1/forget",
             serde_json::json!({"expected_revision": 1}),
         )
@@ -157,7 +159,7 @@ async fn a_forgotten_memory_never_comes_back_into_a_turn() {
 
     // 第二轮：同一个会话，同一个问题。
     let (status, body) = gateway
-        .post(
+        .post_json(
             &format!("/v1/sessions/{session}/runs"),
             serde_json::json!({"request_key": "rk-2", "text": "空调几度来着"}),
         )
@@ -180,7 +182,7 @@ async fn a_forgotten_memory_never_comes_back_into_a_turn() {
 #[tokio::test]
 async fn an_unknown_memory_is_a_not_found_not_an_empty_answer() {
     let (gateway, _embeddings) = crate::with_memories("keyword", vec![]).await;
-    let (status, body) = gateway.get("/v1/memories/nope").await;
+    let (status, body) = gateway.get_json("/v1/memories/nope").await;
     assert_eq!(status, 404, "{body}");
     assert_eq!(
         body["error"]["code"],

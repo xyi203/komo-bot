@@ -10,8 +10,8 @@ use komo_kernel::types::chat::{
 };
 
 use crate::harness::{
-    FixedFactory, GatewayBuilder, MemSender, TestGateway, config_toml, feishu_block, inbound,
-    telegram_block, telegram_config,
+    FakeLlm, FixedFactory, GatewayBuilder, MemSender, TestGateway, call_round, config_toml,
+    eventually, feishu_block, inbound, telegram_block, telegram_config, text_round,
 };
 
 fn operator_dm(text: &str, key: &str) -> komo_kernel::protocol::InboundMessage {
@@ -500,4 +500,123 @@ async fn an_empty_allow_list_still_receives_but_nobody_can_speak() {
         .await
         .expect("home chat 仍然收得到");
     assert_eq!(sender.texts(), vec!["夜里跑完了".to_string()]);
+}
+
+/// **一条真的消息**停在等待审批上时，那条审批请求真的被投出去了。
+///
+/// 这一条与上面那个 `an_approval_reaches_both_the_source_and_home` 的分别是**谁在投**：
+/// 那一条直接调 `deliver_approval`（证的是目标怎么挑），这一条什么都不调——一条 Telegram
+/// 私聊消息进来、模型要跑 `shell`、Policy 答 Ask，然后审批请求应当自己出现在两个会话里。
+/// §7.4 的「投递到 Run 的来源会话与 home chat」说的是这条生产路径，而它一度**只有测试在
+/// 走**：TUI 靠轮询 `/v1/approvals` 才看得见，聊天渠道什么都收不到。
+#[tokio::test]
+async fn a_waiting_run_sends_its_approval_to_the_chat_and_home() {
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    // home chat 故意与私聊不是同一个会话，这样"各一条"才说得清。
+    let gateway = GatewayBuilder::new(&config_toml(
+        r#"
+[channels.telegram]
+enabled = true
+allow_from = [111]
+home_chat = 999
+"#,
+    ))
+    .llm(FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-1",
+            "shell",
+            serde_json::json!({"command": "echo hi"}),
+        ),
+        text_round(2, "跑完了。"),
+    ]]))
+    .factory(FixedFactory::sender_only(
+        Arc::clone(&sender) as Arc<dyn ChannelSender>
+    ))
+    .start()
+    .await;
+
+    let ack = gateway
+        .handle(operator_dm("跑一下 echo", "telegram:1"))
+        .await;
+    assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
+
+    let watching = Arc::clone(&sender);
+    eventually("两个会话都收到了审批请求", move || {
+        watching
+            .sent()
+            .iter()
+            .filter(|message| matches!(message.outbound, Outbound::ApprovalRequest(_)))
+            .count()
+            >= 2
+    })
+    .await;
+
+    let mut targets: Vec<String> = sender
+        .sent()
+        .iter()
+        .filter(|message| matches!(message.outbound, Outbound::ApprovalRequest(_)))
+        .map(|message| message.peer.chat_id.to_string())
+        .collect();
+    targets.sort();
+    assert_eq!(
+        targets,
+        vec!["111".to_string(), "999".to_string()],
+        "来源会话与 home chat **各一条**，不多不少"
+    );
+}
+
+/// HTTP 提交的 Run 没有来源会话：审批请求**只有 home chat**（§11.4「来源是 Cron 或已
+/// 断开的 TUI 时只有 home chat」）。
+#[tokio::test]
+async fn an_http_run_sends_its_approval_to_home_only() {
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = GatewayBuilder::new(&telegram_config("111"))
+        .llm(FakeLlm::new(vec![vec![
+            call_round(
+                1,
+                "pc-1",
+                "shell",
+                serde_json::json!({"command": "echo hi"}),
+            ),
+            text_round(2, "跑完了。"),
+        ]]))
+        .factory(FixedFactory::sender_only(
+            Arc::clone(&sender) as Arc<dyn ChannelSender>
+        ))
+        .start()
+        .await;
+
+    let (code, body) = gateway.post("/v1/sessions", serde_json::json!({})).await;
+    assert_eq!(code, 200, "{body}");
+    let summary: komo_kernel::protocol::http::SessionSummary =
+        serde_json::from_str(&body).expect("会话");
+    let (code, body) = gateway
+        .post(
+            &format!("/v1/sessions/{}/runs", summary.session),
+            serde_json::json!({ "request_key": "http-1", "text": "跑一下 echo" }),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+
+    let watching = Arc::clone(&sender);
+    eventually("home chat 收到了审批请求", move || {
+        watching
+            .sent()
+            .iter()
+            .any(|message| matches!(message.outbound, Outbound::ApprovalRequest(_)))
+    })
+    .await;
+
+    let targets: Vec<String> = sender
+        .sent()
+        .iter()
+        .filter(|message| matches!(message.outbound, Outbound::ApprovalRequest(_)))
+        .map(|message| message.peer.chat_id.to_string())
+        .collect();
+    assert_eq!(
+        targets,
+        vec!["111".to_string()],
+        "没有来源会话，就**只有** home chat 这一条"
+    );
 }

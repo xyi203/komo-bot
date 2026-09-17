@@ -1,21 +1,17 @@
-//! 一整台真 Gateway，带上 `[memory]`：真数据目录、真 state.db、真 HTTP 监听、真
-//! MemoryManager，模型与向量端点是替身。
-//!
-//! 照 `tests/chat/harness.rs` 的形状写（那一份是 `#[cfg(test)]` 的，集成测试拿不到）。
-//! 这里只多两样：一份带 `[memory]` 的 config.toml，和一个**按概念**给向量的 embedding
-//! 替身——同一件事的两种说法要落在同一个方向上，否则"换一种表述仍可语义召回"这条验收
-//! 就只是在测哈希。
+//! 这一组测试要的那一台 Gateway：共用件在
+//! `komo_gateway::service::test_support::harness`，这里只留 memory 特有的两样——一份带
+//! `[memory]` 的 config.toml，和一个**按概念**给向量的 embedding 替身（同一件事的两种
+//! 说法要落在同一个方向上，否则"换一种表述仍可语义召回"这条验收就只是在测哈希）。
 
-#![allow(dead_code)]
+#![allow(dead_code, unused_imports)]
 
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use komo_gateway::service::state::GatewayState;
-use komo_gateway::service::{Running, ServiceOptions, start};
-use komo_kernel::traits::{EmbedError, EmbeddingClient, LlmClient};
+use komo_kernel::traits::{EmbedError, EmbeddingClient};
 use komo_kernel::types::model::{DistanceRule, EmbeddingSpace, InputKind, Vector};
+
+pub use komo_gateway::service::test_support::harness::*;
 
 // ---------------------------------------------------------------- 配置
 
@@ -61,7 +57,8 @@ max_tokens = 1500
     )
 }
 
-const DEFAULT_ENV: &str = "KOMO_LLM_API_KEY=test-key\n\
+/// `[memory]` 的三把钥匙：主模型、记忆模型、向量端点各一把（§13.3）。
+pub const MEMORY_ENV: &str = "KOMO_LLM_API_KEY=test-key\n\
                            KOMO_MEMORY_API_KEY=test-memory-key\n\
                            KOMO_EMBEDDING_API_KEY=test-embedding-key\n";
 
@@ -150,170 +147,15 @@ impl EmbeddingClient for ConceptEmbeddings {
     }
 }
 
-// ---------------------------------------------------------------- Gateway
+// ---------------------------------------------------------------- 起一台
 
-pub struct GatewayBuilder {
-    config: String,
-    llm: Option<Arc<dyn LlmClient>>,
-    embeddings: Option<Arc<dyn EmbeddingClient>>,
-    home: Option<PathBuf>,
+/// 带 `[memory]` 三把钥匙的 builder（共用件的默认 `.env` 只有主模型那一把）。
+pub fn memory_gateway(config: &str) -> GatewayBuilder {
+    GatewayBuilder::new(config).env(MEMORY_ENV)
 }
 
-impl GatewayBuilder {
-    pub fn new(config: &str) -> Self {
-        GatewayBuilder {
-            config: config.to_string(),
-            llm: None,
-            embeddings: None,
-            home: None,
-        }
-    }
+// ---------------------------------------------------------------- 等待
 
-    pub fn llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
-        self.llm = Some(llm);
-        self
-    }
-
-    pub fn embeddings(mut self, client: Arc<dyn EmbeddingClient>) -> Self {
-        self.embeddings = Some(client);
-        self
-    }
-
-    pub fn at(mut self, home: &Path) -> Self {
-        self.home = Some(home.to_path_buf());
-        self
-    }
-
-    pub async fn start(self) -> TestGateway {
-        install_crypto();
-        let (home_dir, home) = match self.home {
-            Some(path) => (None, path),
-            None => {
-                let dir = tempfile::tempdir().expect("临时数据目录");
-                let path = dir.path().to_path_buf();
-                (Some(dir), path)
-            }
-        };
-        write_home(&home, &self.config);
-
-        let running = start(ServiceOptions {
-            home: Some(home.clone()),
-            listen: Some("127.0.0.1:0".into()),
-            channels: Vec::new(),
-            llm: self.llm,
-            embeddings: self.embeddings,
-        })
-        .await
-        .expect("Gateway 起得来");
-
-        TestGateway {
-            _home_dir: home_dir,
-            home,
-            running: Some(running),
-        }
-    }
-}
-
-pub struct TestGateway {
-    _home_dir: Option<tempfile::TempDir>,
-    pub home: PathBuf,
-    running: Option<Running>,
-}
-
-impl TestGateway {
-    fn running(&self) -> &Running {
-        self.running.as_ref().expect("Gateway 还在跑")
-    }
-
-    pub fn state(&self) -> &Arc<GatewayState> {
-        &self.running().state
-    }
-
-    pub fn base_url(&self) -> &str {
-        &self.running().base_url
-    }
-
-    pub fn token(&self) -> &str {
-        &self.running().state.token
-    }
-
-    pub async fn stop(&mut self) {
-        if let Some(running) = self.running.take() {
-            running.stop().await;
-        }
-    }
-
-    /// 停机再按**同一个数据目录**起一台（"重建中崩溃可接续"用它）。
-    pub async fn restart(&mut self, config: &str, embeddings: Arc<dyn EmbeddingClient>) {
-        self.stop().await;
-        let started = GatewayBuilder::new(config)
-            .at(&self.home)
-            .embeddings(embeddings)
-            .start()
-            .await;
-        self.running = started.running;
-    }
-
-    pub async fn get(&self, path: &str) -> (u16, serde_json::Value) {
-        self.request(reqwest::Method::GET, path, None).await
-    }
-
-    pub async fn post(&self, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
-        self.request(reqwest::Method::POST, path, Some(body)).await
-    }
-
-    pub async fn request(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        body: Option<serde_json::Value>,
-    ) -> (u16, serde_json::Value) {
-        let mut request = reqwest::Client::new()
-            .request(method, format!("{}{path}", self.base_url()))
-            .bearer_auth(self.token());
-        if let Some(body) = body {
-            request = request.json(&body);
-        }
-        let response = request.send().await.expect("请求发得出去");
-        let status = response.status().as_u16();
-        let text = response.text().await.unwrap_or_default();
-        let json =
-            serde_json::from_str(&text).unwrap_or_else(|_| serde_json::Value::String(text.clone()));
-        (status, json)
-    }
-}
-
-fn write_home(home: &Path, config: &str) {
-    std::fs::create_dir_all(home).expect("数据目录");
-    std::fs::write(home.join("config.toml"), config).expect("写 config.toml");
-    std::fs::write(home.join(".env"), DEFAULT_ENV).expect("写 .env");
-    std::fs::write(home.join("policy.toml"), "rules = []\n").expect("写 policy.toml");
-}
-
-/// reqwest 用 `rustls-no-provider`：provider 由 `komo` 的 `main` 装（§13.4）。
-pub fn install_crypto() {
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-    });
-}
-
-/// 等一个条件成真（或超时）。
-pub async fn eventually<F: Fn() -> bool>(what: &str, done: F) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if done() {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("等了 10 秒还没有：{what}");
-}
-
-/// 等一个 Run 走到终态。
-///
-/// **不能用 `eventually` 包一个 `block_on`**：那会在 tokio 的工作线程上阻塞着等另一个
-/// 需要同一个运行时的 future，是个现成的死锁。所以这一条自己 `await`。
 pub async fn wait_for_terminal(gateway: &TestGateway, run: &komo_kernel::types::ids::RunId) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {

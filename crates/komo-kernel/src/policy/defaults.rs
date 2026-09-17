@@ -99,6 +99,20 @@ impl RuleTable {
                     "任意 shell / Python 代码",
                     Matcher::operations([OperationMatch::ShellCommand, OperationMatch::PythonCode]),
                 ),
+                // §8.6：恢复流程调用模块自带的核对函数。核对是只读的、绑定已审核的模块
+                // 版本、由执行器而不是模型发起（`PlanSource::Verification`），默认放行——
+                // 否则默认配置下每次核对都答 Unknown，核对函数等于没有。这条排在
+                // `python-call` 之前，只匹配核对来源；模型自己发起的 call 走下一条。
+                rule(
+                    "verification-call",
+                    Effect::Allow,
+                    "恢复流程的核对调用：只读，且绑定已审核的模块版本",
+                    Matcher {
+                        sources: Some(vec![SourceKind::Verification]),
+                        operations: Some(vec![OperationMatch::PythonCall]),
+                        ..Default::default()
+                    },
+                ),
                 // 第 6 行与第 8 行：Python call（含 Memos 的写入 / 修改 / 删除）
                 // → 按已审核版本、导出函数、参数与授权范围判断。默认要人看。
                 rule(
@@ -446,6 +460,40 @@ mod tests {
     }
 
     /// 第 7 行：自动提取记忆与生成索引，在配置范围内 Allow。
+    #[test]
+    fn a_verification_call_from_the_recovery_flow_is_allowed_without_a_grant() {
+        let f = Fixture::new();
+        let mut plan = plan(
+            "python",
+            Operation::PythonCall {
+                module: "toolbox.ha".into(),
+                function: "__komo_verify__".into(),
+            },
+            vec![],
+        );
+        plan.versions.module = Some("v3".into());
+        plan.source = PlanSource::Verification {
+            of: ToolCallId::from_raw("call-1"),
+        };
+        let decision = RuleTable::initial().decide(&plan, &f.ctx());
+        assert!(decision.is_allow(), "{decision:?}");
+        assert!(
+            decision.reason().contains("verification-call"),
+            "{}",
+            decision.reason()
+        );
+
+        // 同一个调用换成模型自己发起的来源 → 仍是第 6 行的 Ask。
+        plan.source = PlanSource::Interactive {
+            session: SessionId::from_raw("sess-1"),
+        };
+        let decision = RuleTable::initial().decide(&plan, &f.ctx());
+        assert!(
+            matches!(decision, PolicyDecision::Ask { .. }),
+            "{decision:?}"
+        );
+    }
+
     #[test]
     fn row_7_memory_maintenance_is_allowed_within_its_configured_scope() {
         let f = Fixture::new();

@@ -83,7 +83,7 @@ pub async fn with_memories(
     items: Vec<MemoryItem>,
 ) -> (TestGateway, Arc<ConceptEmbeddings>) {
     let embeddings = ConceptEmbeddings::new();
-    let gateway = GatewayBuilder::new(&memory_config(mode, true))
+    let gateway = memory_gateway(&memory_config(mode, true))
         .embeddings(Arc::clone(&embeddings) as Arc<dyn komo_kernel::traits::EmbeddingClient>)
         .llm(Arc::new(ScriptedLlm::new(vec![])) as Arc<dyn komo_kernel::traits::LlmClient>)
         .start()
@@ -107,12 +107,14 @@ pub async fn with_memories(
 
 /// 断言用：会话与 Run 的那一对。
 pub async fn a_run(gateway: &TestGateway, key: &str, text: &str) -> (SessionId, RunId) {
-    let (status, body) = gateway.post("/v1/sessions", serde_json::json!({})).await;
+    let (status, body) = gateway
+        .post_json("/v1/sessions", serde_json::json!({}))
+        .await;
     assert_eq!(status, 200, "{body}");
     let session: SessionId = serde_json::from_value(body["session"].clone()).expect("会话 id");
 
     let (status, body) = gateway
-        .post(
+        .post_json(
             &format!("/v1/sessions/{session}/runs"),
             serde_json::json!({"request_key": key, "text": text}),
         )

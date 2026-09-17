@@ -20,7 +20,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
 use crate::tui::app::{App, status_text};
 use crate::tui::approval::approval_lines;
@@ -33,7 +33,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
     let palette_height = if palette.is_empty() {
         0
     } else {
-        (palette.len() as u16 + 2).min(8)
+        (palette.len() as u16).min(6)
     };
     let input_height = input_height(app, area.width);
 
@@ -145,17 +145,12 @@ fn transcript(app: &App, area: Rect) -> Paragraph<'static> {
     }
 
     // 贴底显示：只画放得下的最后那些行，`scroll` 往上挪。
-    let height = area.height.saturating_sub(2) as usize;
+    let height = area.height as usize;
     let end = lines.len().saturating_sub(app.scroll as usize);
     let start = end.saturating_sub(height);
     let window = lines[start.min(lines.len())..end.min(lines.len())].to_vec();
 
-    Paragraph::new(window).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    )
+    Paragraph::new(window).block(Block::default().padding(Padding::horizontal(1)))
 }
 
 fn tool_lines_of(app: &App, message: &SurfaceMessage, width: u16) -> Vec<Line<'static>> {
@@ -305,13 +300,7 @@ fn palette_block(matches: &[(&'static str, &'static str)]) -> Paragraph<'static>
             ])
         })
         .collect();
-    Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(" 命令 ")
-            .border_style(Style::default().fg(Color::DarkGray)),
-    )
+    Paragraph::new(lines).block(Block::default().padding(Padding::horizontal(1)))
 }
 
 fn input_block(app: &App) -> Paragraph<'static> {

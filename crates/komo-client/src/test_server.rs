@@ -61,6 +61,8 @@ pub enum Reply {
     },
     /// 一段 `text/event-stream`，**写完就断连**——重连路径要的就是这一下。
     Sse(Vec<String>),
+    /// 一段 `text/event-stream`，写完**挂着不断**，直到客户端自己走。
+    SseOpen(Vec<String>),
     /// 什么都不回，直接断。
     Hangup,
 }
@@ -224,6 +226,21 @@ async fn serve_one(
                 let _ = stream.flush().await;
             }
             // 写完就断——客户端应当自己按最后一个 id 重连。
+        }
+        Reply::SseOpen(chunks) => {
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes()).await;
+            for chunk in chunks {
+                if stream.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = stream.flush().await;
+            }
+            // 客户端关连接时 read 返回 0；上限兜底，免得测试进程被挂住。
+            let mut probe = [0u8; 1];
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut probe))
+                    .await;
         }
         Reply::Hangup => {}
     }

@@ -167,7 +167,17 @@ async fn run_subscription(
     let mut backoff = config.initial_backoff;
 
     loop {
-        match connect_once(&http, &url, token.as_deref(), cursor, &config, &frames).await {
+        match connect_once(
+            &http,
+            &url,
+            token.as_deref(),
+            cursor,
+            &config,
+            &frames,
+            &state,
+        )
+        .await
+        {
             // 服务端正常收尾（读完一段就关流）：重连，从新游标继续。
             Ok(next) => {
                 cursor = next;
@@ -224,6 +234,7 @@ async fn connect_once(
     mut cursor: Cursor,
     config: &SseConfig,
     frames: &mpsc::Sender<SseMessage>,
+    state: &watch::Sender<ConnectionState>,
 ) -> Result<Cursor, StreamStop> {
     let mut request = http
         .get(format!("{url}{}", cursor_query(cursor)))
@@ -246,6 +257,7 @@ async fn connect_once(
             reason: format!("HTTP {status}：{}", body.trim()),
         });
     }
+    let _ = state.send(ConnectionState::Connected);
 
     let mut stream = response.bytes_stream();
     let mut parser = FrameParser::default();
@@ -577,6 +589,28 @@ mod wire_tests {
         // 标准的续读头说的是同一件事。
         assert_eq!(requests[1].header("last-event-id"), Some("42"));
         assert_eq!(requests[1].header("accept"), Some("text/event-stream"));
+    }
+
+    #[tokio::test]
+    async fn an_open_stream_is_reported_as_connected() {
+        let server = FakeGateway::spawn(|_, _| Reply::SseOpen(vec![frame_chunk(1)])).await;
+        let client = server.client();
+        let subscription = subscribe_with(
+            &client,
+            SessionId::from_raw("sess-1"),
+            Cursor::default(),
+            fast(),
+        );
+        let mut state = subscription.state();
+        let mut connected = false;
+        for _ in 0..20 {
+            if state.borrow_and_update().is_connected() {
+                connected = true;
+                break;
+            }
+            let _ = tokio::time::timeout(Duration::from_millis(200), state.changed()).await;
+        }
+        assert!(connected, "服务端已接受订阅，状态行要显示已连接");
     }
 
     #[tokio::test]

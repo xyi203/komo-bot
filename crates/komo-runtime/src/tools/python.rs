@@ -108,6 +108,39 @@ impl PythonTool {
         self.verification = Some(gate);
         self
     }
+
+    /// 这份计划绑的模块版本还是**现在已启用的那一版**吗（§7.2）。
+    ///
+    /// `code` 模式没有模块可言，直接过。`call` 模式有三种不通过，**都是版本冲突**：
+    /// 没有 toolbox（证不出这是已审核的那一版）、模块解析不出来了（停用 / 删掉 / 不再
+    /// 导出这个函数）、以及版本真的变了。一律**在 spawn 之前**返回，所以子进程一个都
+    /// 不起。
+    fn module_still_matches(&self, plan: &ExecutionPlan) -> Result<(), ToolError> {
+        let Operation::PythonCall { module, function } = &plan.operation else {
+            return Ok(());
+        };
+        let conflict = |detail: String| {
+            Err(ToolError::VersionConflict {
+                path: format!("{module}：{detail}"),
+            })
+        };
+        let Some(toolbox) = &self.toolbox else {
+            return conflict("这台 Gateway 没有 toolbox，证不出这是已审核的那一版".into());
+        };
+        match toolbox.resolve_call(module, function) {
+            Ok(resolved) if plan.versions.module.as_deref() == Some(resolved.version.as_str()) => {
+                Ok(())
+            }
+            Ok(resolved) => conflict(format!(
+                "计划绑定 {}，现在已启用的是 {}",
+                plan.versions.module.as_deref().unwrap_or("（未绑定）"),
+                resolved.version
+            )),
+            // 模块在审批期间被停用 / 删掉 / 改得不再导出这个函数。原因原样转述——
+            // 模型下一步要做什么取决于是哪一种。
+            Err(error) => conflict(error.to_string()),
+        }
+    }
 }
 
 #[async_trait]
@@ -254,6 +287,17 @@ impl Tool for PythonTool {
                 path: format!("Python 环境：计划绑定 {}，当前 {}", planned.0, current.0),
             });
         }
+
+        // 模块版本也一样（§7.2「**批准后再次校验目标和版本**，变化则重新评估」）。
+        //
+        // 审批可以停在那里一天，而 `komo toolbox enable` 在那期间可以把模块换掉。换过
+        // 之后，这份计划里的一切——导出的函数、参数的含义、`resources` 里那串凭证引用
+        // ——说的都是**上一版**的事；照着跑一遍等于拿一份对旧代码的批准去执行新代码。
+        // `verify` 那一路已经这么判了（"模块升级过 → Unknown"），执行这一路没有理由更松。
+        //
+        // 交回模型的是一个**版本冲突**，和 `write` / `edit` 覆盖到别人改过的文件是同一类：
+        // 它会重新 `prepare` → 新计划 → 新哈希 → 旧授权覆盖不到 → 重新审（§5.4）。
+        self.module_still_matches(plan)?;
 
         // 拿到的 sink 原样交给宿主：脚本的 print 流进去，结构化结果走另一条路（§5.1）。
         let outcome = self.host.run(args.job, sink, ctx.cancel.clone()).await;
@@ -775,6 +819,98 @@ def turn_off(entity_id):
             "{error:?}"
         );
         assert!(host.calls().is_empty(), "版本对不上就根本不执行");
+    }
+
+    /// §7.2「**批准后再次校验目标和版本，变化则重新评估**」。
+    ///
+    /// 审批可以停一天，而这期间模块可以被换掉——换掉之后，这份计划里的导出函数、参数
+    /// 含义与凭证引用说的都是上一版的事。这里换的是**声明了不同 `__komo_env__`** 的
+    /// 一版：它正好是那条"计划里写着要 X、子进程拿到的是 Y"的缝。
+    #[tokio::test]
+    async fn a_module_swapped_during_the_approval_window_is_a_version_conflict_not_a_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let (host, toolbox, tool) = wired(dir.path(), HA);
+        let plan = tool.prepare(call_args(), &ctx).await.unwrap();
+        assert_eq!(
+            plan.resources
+                .iter()
+                .filter_map(|r| r.credential_env.as_deref())
+                .collect::<Vec<_>>(),
+            Vec::<&str>::new(),
+            "这一版没有声明任何凭证引用"
+        );
+
+        // 审批还等着的时候，模块被换成了声明 `HA_TOKEN` 的一版——快照与指针都跟着
+        // 走，这一版在 toolbox 眼里是**正正当当的当前版本**，只是不是被批准的那一版。
+        let next = format!("{HA}\n__komo_env__ = [\"HA_TOKEN\"]\n");
+        toolbox.disable("ha").unwrap();
+        toolbox
+            .install_builtin("ha", &next, None, TestClock::fixed().now())
+            .unwrap()
+            .expect("换上去了");
+        assert_eq!(
+            toolbox.resolve_call("toolbox.ha", "turn_off").unwrap().env,
+            vec!["HA_TOKEN"],
+            "新那一版声明的凭证引用与计划里那串对不上"
+        );
+
+        let error = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::VersionConflict { .. }),
+            "{error:?}"
+        );
+        assert!(
+            error.to_string().contains("toolbox.ha"),
+            "说得出是哪个模块：{error}"
+        );
+        assert!(host.calls().is_empty(), "**一个子进程都不该起**");
+    }
+
+    /// 模块在审批期间被停用 / 删掉，同样是版本冲突——而且说得出是哪一种。
+    #[tokio::test]
+    async fn a_module_disabled_during_the_approval_window_is_a_version_conflict_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let (host, toolbox, tool) = wired(dir.path(), HA);
+        let plan = tool.prepare(call_args(), &ctx).await.unwrap();
+
+        toolbox.disable("ha").unwrap();
+
+        let error = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::VersionConflict { .. }),
+            "{error:?}"
+        );
+        assert!(host.calls().is_empty(), "一个子进程都不该起");
+    }
+
+    /// 没换过就照常跑——这条守的是"别把版本校验写成永远冲突"。
+    #[tokio::test]
+    async fn an_untouched_module_runs_as_planned() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let (host, _toolbox, tool) = wired(dir.path(), HA);
+        let plan = tool.prepare(call_args(), &ctx).await.unwrap();
+        host.push_result(PythonResult {
+            status: ToolResultStatus::Completed,
+            result: serde_json::json!({ "off": "light.living_room" }),
+            error: None,
+            artifacts: vec![],
+            env_version: host.env_version(),
+        });
+        let output = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap();
+        assert_eq!(output.status, ToolResultStatus::Completed);
+        assert_eq!(host.calls().len(), 1);
     }
 
     #[tokio::test]

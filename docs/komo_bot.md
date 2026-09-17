@@ -95,6 +95,7 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo channel list/probe`                    | 渠道清单与连通性核对（飞书 tenant token、Telegram `getMe`、微信凭证文件）；不经 Gateway |
 | `komo channel wechat login`                  | 终端显示二维码完成微信登录，凭证写入数据目录                                |
 | `komo skills list/inspect/enable/disable`    | Skills 目录（§5.6）；只读文件系统，不经 Gateway                             |
+| `komo toolbox list/inspect/test/enable [--version]/disable` | toolbox 模块（§5.3–5.4）；**经 Gateway**——启用是一次审批，审批只有 Gateway 打得开 |
 
 聊天启动顺序：
 
@@ -117,7 +118,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
-Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台形式的 Gateway。Mac 若后续需要操作用户桌面应用，应按登录用户的执行环境配置。后台服务不会让睡眠中的电脑继续执行任务。[Fedora systemd](https://fedoraproject.org/wiki/Packaging:Systemd) · [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
+Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台形式的 Gateway。**单元文件只设 `KOMO_HOME`（与可选的 `KOMO_LISTEN`），不加载 `.env`、不含任何凭证**：launchd 没有 `EnvironmentFile` 的等价物，只能把值抄进 plist，那是把密钥复制到第二个文件；走进程环境还会让 `.env` 的热重载失效，并让每个子进程与日志都可能看到它。`.env` 由 Gateway 自己读成 `Secrets`（§3 热重载覆盖它），需要凭证的 Python 模块按**变量名**声明（§5.3），Gateway 在起子进程时按名注入。Mac 若后续需要操作用户桌面应用，应按登录用户的执行环境配置。后台服务不会让睡眠中的电脑继续执行任务。[Fedora systemd](https://fedoraproject.org/wiki/Packaging:Systemd) · [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
 
 默认监听回环地址。首版远程访问可通过 SSH 转发连接；直接开放网络监听时需要 HTTPS 和认证。选择远程实例时，不因连接失败而启动一个本机替代实例。`status` 与 `stop` 不隐式启动服务。
 
@@ -242,7 +243,9 @@ toolbox/
 
 README 与模块说明提供用法。LLM 通过 read 查看说明，再通过 python 调用。保存工具不会扩张模型侧的五个工具 Schema。
 
-HA、Memos、搜索服务地址和凭证引用通过配置传给已授权模块。原始凭证不放进模型提示词，不打印到对话或日志。
+可见的树之外还有两处**隐藏**位置（2026-09-17 落地）：`.staging/<m>.json` 存候选元数据（版本、测试结果），`.versions/<m>/{<ver>.py, test_<ver>.py, <ver>.json, enabled.json}` 存每个版本的快照与「当前启用哪个」——§5.4 要求记录实际使用的模块版本并保存快照。版本号 = 代码哈希前 12 位 + 依赖锁哈希前 8 位。`code` 模式的解释器装了一个排在 `sys.meta_path` 最前的查找器，按解析后的落点拒绝 `.staging` / `.versions` 的导入（§7.3）；它挡的是 import 这条路，`exec(open(...).read())` 不在承诺内。
+
+HA、Memos、搜索服务地址和凭证引用通过配置传给已授权模块：模块用 `__komo_env__ = ["MEMOS_TOKEN", …]` 声明它要哪些**变量名**，变量名进执行计划（`ResourceRef`），Gateway 起子进程时从 `Secrets`（`.env`）按名解析注入，`.env` 改了下一次调用即生效；解析不到就不设置并告警一次，由模块自己报「未配置」。原始凭证不放进模型提示词、不进计划、不进事件、不打印到对话或日志，也不进服务单元文件（§3）。Memos 是随 komo 安装的首个内置已启用模块（同名模块已存在则不覆盖）。
 
 ### 5.4 AI 迭代流程
 
@@ -358,6 +361,7 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 | 访问范围外文件或敏感内容                      | Ask；命中显式禁用规则则 Deny                                         |
 | 修改启用中的 toolbox 或 Python 环境           | Ask，展示具体差异                                                    |
 | 任意 shell / Python code                      | Ask；有匹配的明确执行授权时允许                                      |
+| 恢复流程发起的核对调用（`PlanSource::Verification` + Python call） | Allow；核对只读、绑定已审核的模块版本、由执行器而非模型发起——不放行则默认配置下每次核对都答 Unknown，核对函数等于没有（§8.6） |
 | Python call                                   | 按已审核版本、导出函数、参数与授权范围判断                           |
 | 自动提取记忆与生成索引                        | 在配置的来源、模型端点和记忆范围内 Allow；推断不能自行升级为用户确认 |
 | Memos 的写入、修改或删除                      | 按 Python 模块版本、函数、参数与用户指令范围审核                     |
@@ -853,7 +857,7 @@ Cron Scheduler 只负责产生 Run，复用 AgentLoop、Policy、工具和存储
  → 更新本次触发状态
 ```
 
-每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略及版本化授权。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体模块版本及授权。
+每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 及版本化授权。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；Run 停在等待审批或 `needs_attention` 时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体模块版本及授权。
 
 ```bash
 komo cron add --name morning-summary \
@@ -965,6 +969,7 @@ TELEGRAM_BOT_TOKEN=...
 | `/approve <short_id>` / `/reject <short_id>` | 打 `POST /v1/approvals/{id}/decision`；已决定的返回原决定，不报错 |
 | `/approve` / `/reject`（无 ID） | 操作者只有**一个**待处理请求时生效；多于一个则列出并要求指明 |
 | `/approve <short_id> run` | 本次 Run 的范围授权（§7.2 第二种）；只对 Policy 标记为可范围化的计划生效，`Deny` 不可覆盖 |
+| `/approve <short_id> cron` | Cron Job 的范围授权（§7.2 第三种），绑定 Job 与其版本；只对来源是 Cron 的请求出现（Policy 对 Cron 来源的 Ask 自动多给这一档） |
 | `/pending` | 列出待处理审批及其短 ID |
 | `/new` | 当前 Session 追加 `conversation.boundary`，不切 Session |
 | `/cancel` | 取消该 Session 当前 Run |
@@ -1062,6 +1067,11 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | POST /v1/memories/{id}/forget    | 停用指定 revision 并失效索引                   |
 | GET /v1/memory-index             | 当前空间、进度、覆盖率和错误                   |
 | POST /v1/memory-index/rebuild    | 幂等提交重建任务                               |
+| GET /v1/models                   | 模型菜单：每个模型的 provider 与支持的 effort 档位 |
+| GET /v1/config/check             | 当前配置的校验结果（与热重载同一个函数）       |
+| POST /v1/config/reload           | 热重载；校验不过 422 并保留原配置               |
+| GET /v1/home-session             | 操作者的 home session（§11.2）                 |
+| GET /v1/toolbox · GET /v1/toolbox/{m} · POST /v1/toolbox/{m}/test · POST /v1/toolbox/{m}/enable · POST /v1/toolbox/{m}/disable | toolbox 模块清单、详情、候选测试、启用（产生一次审批）、停用（§5.4） |
 
 除最小健康检查外统一认证。提交输入、审批、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。
 

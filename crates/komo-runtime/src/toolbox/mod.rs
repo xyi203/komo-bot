@@ -985,5 +985,8 @@ const README: &str = r#"# toolbox
   `verify(function=..., args={...})`，要答
   `{"kind": "already_satisfied" | "not_performed" | "conflict" | "unknown", ...}`。
   核对函数自己也要写进 `__all__`。
-- 服务地址与凭证**从环境变量读**，由配置点名传进来；不要把凭证写进代码或打印出来。
+- `__komo_env__ = ["MEMOS_TOKEN"]` 列出这个模块要的**凭证引用**（变量名）。值写在
+  `~/.komo/.env` 里，Gateway 在每次调用时按名解析、只放进那一个子进程——所以改完
+  `.env` 跑一次 `komo config reload` 就生效，不必重启；解析不到的变量**不设置**，模块
+  应当自己报"未配置"。不要把凭证写进代码、不要打印它，也不要指望进程环境里有它。
 "#;

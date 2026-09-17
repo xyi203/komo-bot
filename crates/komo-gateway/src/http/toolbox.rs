@@ -157,8 +157,7 @@ pub async fn test(
     Path(module): Path<String>,
 ) -> ApiResult<Json<ToolboxTestResponse>> {
     let toolbox = toolbox_of(&api);
-    let snapshot = api.state.snapshot();
-    let config = crate::service::python_env(&snapshot, &toolbox);
+    let config = crate::service::python_env(&api.state.config, &toolbox);
     let host = komo_runtime::python_runtime::PythonRuntime::probe(config)
         .await
         .map_err(|error| {
@@ -482,7 +481,7 @@ fn watch(
 /// 自动覆盖不到新的那一份。
 async fn plan_of(
     api: &Api,
-    toolbox: &Toolbox,
+    toolbox: &Arc<Toolbox>,
     change: &Change,
 ) -> Result<ExecutionPlan, ApiFailure> {
     let session = api.state.home_session().await?;
@@ -524,10 +523,9 @@ async fn plan_of(
 /// 的 `std::process` 会把整个执行线程按住。
 async fn python_env_version(
     api: &Api,
-    toolbox: &Toolbox,
+    toolbox: &Arc<Toolbox>,
 ) -> Option<komo_kernel::types::plan::EnvVersion> {
-    let snapshot = api.state.snapshot();
-    let config = crate::service::python_env(&snapshot, toolbox);
+    let config = crate::service::python_env(&api.state.config, toolbox);
     let interpreter = config.interpreter_path();
     let output = tokio::process::Command::new(&interpreter)
         .arg("-c")

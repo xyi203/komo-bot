@@ -16,6 +16,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -37,8 +38,32 @@ pub const DEFAULT_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 
 const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR"];
 
+/// 凭证引用的**解析口**（§5.3「HA、Memos、搜索服务地址和凭证引用通过配置传给已授权
+/// 模块」）。
+///
+/// 为什么不是"从 Gateway 的进程环境里取"：单元文件里不放 `.env` 的内容（launchd 没有
+/// `EnvironmentFile` 的等价物，只能把值抄进 plist），而且一旦进了进程环境，`.env` 的
+/// 热重载就失效了——旧值会一直活到重启为止——并且这台机器上每一个子进程、每一条
+/// `/proc/<pid>/environ` 都看得见它。所以值由 Gateway **按名、在每次 spawn 时**解析，
+/// 用完就随子进程一起消失。
+///
+/// 它同时回答"名字"那一半，因为两个问题的答主本来就是同一个：**哪些名字**由模块自己的
+/// `__komo_env__` 声明（`ExecutionPlan.resources` 里那串 `credential_env` 就是从它长出
+/// 来的，同一处解析，两边不可能对不上），**值**由 `.env` 给。分成两个 port 只会让
+/// "计划里写着要 X、子进程里拿到的却是 Y" 变成一个可能发生的事。
+///
+/// **值不进 `Debug`、不进日志、不进任何事件或计划。**
+pub trait SecretResolver: Send + Sync {
+    /// 这个 toolbox 模块声明了哪些凭证引用——**只有名字**。
+    fn names_for(&self, module: &str) -> Vec<String>;
+
+    /// 按名解析一个值。解析不到答 `None`：那个变量就**不设置**，让模块自己说
+    /// "未配置"——一个空串会让模块以为配过了。
+    fn resolve(&self, name: &str) -> Option<String>;
+}
+
 /// 受管理环境的位置。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PythonEnvConfig {
     /// 虚拟环境目录（`~/.komo/python-envs/<版本>`）。
     pub env_root: PathBuf,
@@ -51,14 +76,30 @@ pub struct PythonEnvConfig {
     /// `code` 模式**不许 import** 的目录（§7.3）：toolbox 的 `.staging` 与
     /// `.versions`。模型不能通过 import 未审核的候选把它提前跑起来。
     pub denied_imports: Vec<PathBuf>,
-    /// 透传给子进程的**变量名**：已启用模块声明的 `__komo_env__`（§5.3「地址和凭证
-    /// 引用通过配置传给已授权模块」）。这里存的是名字，值在 `base_env` 里从进程环境
-    /// 取一次，**不经过计划、不进提示词**。
-    pub resource_env: Vec<String>,
+    /// 凭证引用的解析口。`None` = 这台 Gateway 不给任何模块传凭证。
+    pub secrets: Option<Arc<dyn SecretResolver>>,
     /// 子进程的工作目录。
     pub cwd: PathBuf,
     pub timeout: Duration,
     pub output_limit: u64,
+}
+
+/// 手写的 `Debug`：`secrets` 只说有没有装上。一个 `#[derive(Debug)]` 迟早会把某个
+/// 实现者的内部状态（连着它握着的那份 `.env`）印进日志。
+impl std::fmt::Debug for PythonEnvConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PythonEnvConfig")
+            .field("env_root", &self.env_root)
+            .field("interpreter", &self.interpreter)
+            .field("toolbox_parent", &self.toolbox_parent)
+            .field("requirements", &self.requirements)
+            .field("denied_imports", &self.denied_imports)
+            .field("secrets", &self.secrets.as_ref().map(|_| "<装上了>"))
+            .field("cwd", &self.cwd)
+            .field("timeout", &self.timeout)
+            .field("output_limit", &self.output_limit)
+            .finish()
+    }
 }
 
 impl PythonEnvConfig {
@@ -69,7 +110,7 @@ impl PythonEnvConfig {
             toolbox_parent: None,
             requirements: None,
             denied_imports: Vec::new(),
-            resource_env: Vec::new(),
+            secrets: None,
             cwd: cwd.into(),
             timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             output_limit: DEFAULT_OUTPUT_LIMIT,
@@ -181,6 +222,16 @@ impl PythonHost for PythonRuntime {
 
         let mut env = base_env(&self.config);
         env.insert("KOMO_RESULT_PATH".into(), result_path.display().to_string());
+        // 凭证在**这一刻**解析，跟着这一个子进程走（§5.3）。
+        let (credentials, missing) = credential_env(&self.config, &job);
+        if !missing.is_empty() {
+            // 名字，不是值。
+            tracing::warn!(
+                variables = missing.join("、"),
+                "模块声明的凭证引用没有配置：这些变量不会传给子进程"
+            );
+        }
+        env.extend(credentials);
 
         let spec = ChildSpec {
             program: self.config.interpreter_path().display().to_string(),
@@ -296,17 +347,44 @@ fn base_env(config: &PythonEnvConfig) -> BTreeMap<String, String> {
             .collect();
         env.insert("KOMO_DENIED_IMPORTS".into(), joined.join(SEPARATOR));
     }
-    // 已授权模块要的服务地址与凭证（§5.3）。**按名字透传**：这里读一次进程环境，
-    // 值既不进 `ExecutionPlan`，也不进日志。
-    for name in &config.resource_env {
+    env
+}
+
+/// 这一次调用要带上的凭证（§5.3）。**每次 spawn 现解析**，所以 `.env` 改完、
+/// `komo config reload` 之后，下一次调用拿到的就是新值。
+///
+/// 两条边界：
+///
+/// - **只有 `call` 模式有凭证。** 任意 `code` 一个都拿不到——「任意 code 模式不会因为
+///   import 了已审核模块而自动获得同样授权」（§5.2），那么它也不该拿到那个模块的钥匙。
+/// - **基础变量不许被模块声明覆盖**：一个声明了 `PATH` 的模块不能借此换掉解释器要走的
+///   那条路径。
+///
+/// 答 `(要设置的变量, 声明了却解析不到的名字)`。第二个由调用方 `warn!` 出来——**名字**，
+/// 不是值。
+fn credential_env(
+    config: &PythonEnvConfig,
+    job: &PythonJob,
+) -> (BTreeMap<String, String>, Vec<String>) {
+    let mut env = BTreeMap::new();
+    let mut missing = Vec::new();
+    let (Some(secrets), PythonJob::Call { module, .. }) = (&config.secrets, job) else {
+        return (env, missing);
+    };
+    for name in secrets.names_for(module) {
         if INHERITED.contains(&name.as_str()) {
-            continue; // 基础变量已经在上面了，不让模块声明覆盖它们。
+            continue;
         }
-        if let Ok(value) = std::env::var(name) {
-            env.insert(name.clone(), value);
+        match secrets.resolve(&name) {
+            Some(value) => {
+                env.insert(name, value);
+            }
+            // 不设置，也不放一个空串进去：模块因此会说"未配置"，而不是拿着空令牌去
+            // 敲远端然后收到一个 401。
+            None => missing.push(name),
         }
     }
-    env
+    (env, missing)
 }
 
 /// `KOMO_DENIED_IMPORTS` 的分隔符。不用 `:`——路径里有冒号的系统上那会切错。
@@ -595,42 +673,256 @@ def ping():
         assert_eq!(outcome.result, serde_json::json!("pong"), "{outcome:?}");
     }
 
-    /// 已授权模块要的服务地址与凭证按**名字**透传，其余一个都不进子进程（§5.3）。
+    /// 一份只认得几个名字的解析口。**测试里也不碰进程环境**——这一整波改动的要点
+    /// 就是"凭证不走进程环境"。
+    #[derive(Debug, Default)]
+    struct FakeSecrets {
+        declared: BTreeMap<String, Vec<String>>,
+        values: BTreeMap<String, String>,
+        /// 问过哪些名字，按顺序——用来证明"每次 spawn 现解析"。
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeSecrets {
+        fn new(module: &str, declared: &[&str], values: &[(&str, &str)]) -> Arc<FakeSecrets> {
+            Arc::new(FakeSecrets {
+                declared: BTreeMap::from([(
+                    module.to_string(),
+                    declared.iter().map(|n| (*n).to_string()).collect(),
+                )]),
+                values: values
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+                asked: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> Vec<String> {
+            self.asked.lock().expect("问过的名字").clone()
+        }
+    }
+
+    impl SecretResolver for FakeSecrets {
+        fn names_for(&self, module: &str) -> Vec<String> {
+            self.declared.get(module).cloned().unwrap_or_default()
+        }
+
+        fn resolve(&self, name: &str) -> Option<String> {
+            self.asked
+                .lock()
+                .expect("问过的名字")
+                .push(name.to_string());
+            self.values.get(name).cloned()
+        }
+    }
+
+    /// 一个 `toolbox.vault` 模块，把问到的三个变量原样交回来。
+    fn vault(dir: &Path) -> PythonRuntime {
+        let toolbox = dir.join("toolbox");
+        std::fs::create_dir_all(&toolbox).unwrap();
+        std::fs::write(toolbox.join("__init__.py"), "").unwrap();
+        std::fs::write(
+            toolbox.join("vault.py"),
+            "import os\n\n__all__ = ['peek']\n\n\ndef peek(names):\n    return {name: os.environ.get(name) for name in names}\n",
+        )
+        .unwrap();
+        let mut config = PythonEnvConfig::new(dir.join("env"), dir.to_path_buf());
+        config.interpreter = Some(PathBuf::from("python3"));
+        config.toolbox_parent = Some(dir.to_path_buf());
+        config.timeout = Duration::from_secs(20);
+        PythonRuntime::new(config, EnvVersion("py-test".into()))
+    }
+
+    async fn peek(host: &PythonRuntime, names: &[&str]) -> serde_json::Value {
+        let mut sink = writer();
+        host.run(
+            PythonJob::Call {
+                module: "toolbox.vault".into(),
+                function: "peek".into(),
+                args: serde_json::json!({ "names": names }),
+            },
+            &mut sink,
+            CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .result
+    }
+
+    /// 凭证**不经过 Gateway 的进程环境**：进程里没有这个变量，解析口里有，子进程就
+    /// 读得到（§5.3）。
     #[tokio::test]
-    async fn only_the_named_resource_variables_reach_the_child() {
+    async fn a_declared_credential_reaches_the_child_without_ever_touching_the_process_environment()
+    {
         if !have_python() {
             return;
         }
-        // SAFETY: 测试进程自己的环境，两个名字都只在这一条测试里用。
-        unsafe {
-            std::env::set_var("KOMO_TEST_RESOURCE", "passed-through");
-            std::env::set_var("KOMO_TEST_SECRET", "must-not-leak");
+        assert!(
+            std::env::var("KOMO_TEST_VAULT_TOKEN").is_err(),
+            "这个测试的前提就是进程环境里没有它"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = vault(dir.path());
+        let secrets = FakeSecrets::new(
+            "toolbox.vault",
+            &["KOMO_TEST_VAULT_TOKEN"],
+            &[("KOMO_TEST_VAULT_TOKEN", "from-dot-env")],
+        );
+        host.config.secrets = Some(Arc::clone(&secrets) as Arc<dyn SecretResolver>);
+
+        let read = peek(&host, &["KOMO_TEST_VAULT_TOKEN"]).await;
+        assert_eq!(
+            read,
+            serde_json::json!({ "KOMO_TEST_VAULT_TOKEN": "from-dot-env" })
+        );
+        assert!(
+            std::env::var("KOMO_TEST_VAULT_TOKEN").is_err(),
+            "解析一次不该把它塞进 Gateway 自己的环境"
+        );
+    }
+
+    /// **每次 spawn 现解析**：`.env` 改完之后下一次调用就是新值，不用重启。
+    #[tokio::test]
+    async fn the_value_is_resolved_at_every_spawn_so_a_reloaded_env_takes_effect_at_once() {
+        if !have_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = vault(dir.path());
+
+        let first = FakeSecrets::new("toolbox.vault", &["TOK"], &[("TOK", "old")]);
+        host.config.secrets = Some(Arc::clone(&first) as Arc<dyn SecretResolver>);
+        assert_eq!(
+            peek(&host, &["TOK"]).await,
+            serde_json::json!({ "TOK": "old" })
+        );
+        assert_eq!(first.asked(), vec!["TOK"], "问过一次");
+
+        // `.env` 改了、reload 了——生产里换的是 `ConfigHolder` 里那份快照，解析口每次
+        // 现读，所以这里换掉它背后的值就等价。
+        let next = FakeSecrets::new("toolbox.vault", &["TOK"], &[("TOK", "new")]);
+        host.config.secrets = Some(Arc::clone(&next) as Arc<dyn SecretResolver>);
+        assert_eq!(
+            peek(&host, &["TOK"]).await,
+            serde_json::json!({ "TOK": "new" })
+        );
+        assert_eq!(next.asked(), vec!["TOK"], "第二次是重新问出来的，不是缓存");
+    }
+
+    /// 子进程里**只有声明过的名字**：`.env` 里其余的变量一个都不进去。
+    #[tokio::test]
+    async fn only_the_names_the_module_declared_reach_the_child() {
+        if !have_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut host = vault(dir.path());
+        host.config.secrets = Some(FakeSecrets::new(
+            "toolbox.vault",
+            &["DECLARED"],
+            &[
+                ("DECLARED", "yes"),
+                ("ANOTHER_SECRET_IN_DOT_ENV", "must-not-leak"),
+                // 基础变量：声明了也不许覆盖。
+                ("PATH", "/hijacked"),
+            ],
+        ) as Arc<dyn SecretResolver>);
+
+        let read = peek(&host, &["DECLARED", "ANOTHER_SECRET_IN_DOT_ENV"]).await;
+        assert_eq!(
+            read,
+            serde_json::json!({ "DECLARED": "yes", "ANOTHER_SECRET_IN_DOT_ENV": null })
+        );
+    }
+
+    /// 声明了 `PATH` 也换不掉解释器要走的那条路。
+    #[tokio::test]
+    async fn a_module_cannot_declare_its_way_over_a_base_variable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = PythonEnvConfig::new(dir.path().join("env"), dir.path().to_path_buf());
+        config.secrets = Some(FakeSecrets::new(
+            "toolbox.vault",
+            &["PATH", "TOK"],
+            &[("PATH", "/hijacked"), ("TOK", "ok")],
+        ) as Arc<dyn SecretResolver>);
+        let (env, missing) = credential_env(
+            &config,
+            &PythonJob::Call {
+                module: "toolbox.vault".into(),
+                function: "peek".into(),
+                args: serde_json::json!({}),
+            },
+        );
+        assert_eq!(env.get("TOK").map(String::as_str), Some("ok"));
+        assert!(!env.contains_key("PATH"), "基础变量不许被声明覆盖");
+        assert!(missing.is_empty());
+    }
+
+    /// 声明了、`.env` 里却没有：**不设置**那个变量，并把名字（不是值）报出来，
+    /// 模块自己会说"未配置"。
+    #[tokio::test]
+    async fn a_declared_but_unconfigured_credential_is_left_unset_and_named() {
+        if !have_python() {
+            return;
         }
         let dir = tempfile::tempdir().unwrap();
         let mut config = PythonEnvConfig::new(dir.path().join("env"), dir.path().to_path_buf());
-        config.interpreter = Some(PathBuf::from("python3"));
-        config.resource_env = vec!["KOMO_TEST_RESOURCE".into()];
-        config.timeout = Duration::from_secs(20);
-        let host = PythonRuntime::new(config, EnvVersion("py-test".into()));
-
-        let mut sink = writer();
-        let outcome = host
-            .run(
-                PythonJob::Code {
-                    code: "import os
-result = [os.environ.get('KOMO_TEST_RESOURCE'), os.environ.get('KOMO_TEST_SECRET')]"
-                        .into(),
-                },
-                &mut sink,
-                CancelToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome.result,
-            serde_json::json!(["passed-through", null]),
-            "点名的那个进去了，没点名的没有"
+        config.secrets = Some(
+            FakeSecrets::new("toolbox.vault", &["MISSING_TOK"], &[]) as Arc<dyn SecretResolver>
         );
+        let job = PythonJob::Call {
+            module: "toolbox.vault".into(),
+            function: "peek".into(),
+            args: serde_json::json!({}),
+        };
+        let (env, missing) = credential_env(&config, &job);
+        assert!(env.is_empty(), "一个空串比没有更糟：模块会以为配过了");
+        assert_eq!(missing, vec!["MISSING_TOK"]);
+
+        // 子进程那一侧：变量真的不在，模块因此报得出"未配置"。
+        let mut host = vault(dir.path());
+        host.config.secrets = Some(
+            FakeSecrets::new("toolbox.vault", &["MISSING_TOK"], &[]) as Arc<dyn SecretResolver>
+        );
+        assert_eq!(
+            peek(&host, &["MISSING_TOK"]).await,
+            serde_json::json!({ "MISSING_TOK": null })
+        );
+    }
+
+    /// 任意 `code` 一个凭证都拿不到（§5.2：import 了已审核模块也不获得同样授权，
+    /// 那么也不该拿到它的钥匙）。
+    #[tokio::test]
+    async fn arbitrary_code_gets_no_credentials_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = PythonEnvConfig::new(dir.path().join("env"), dir.path().to_path_buf());
+        let secrets = FakeSecrets::new("toolbox.vault", &["TOK"], &[("TOK", "value")]);
+        config.secrets = Some(Arc::clone(&secrets) as Arc<dyn SecretResolver>);
+        let (env, missing) = credential_env(
+            &config,
+            &PythonJob::Code {
+                code: "import os; result = os.environ.get('TOK')".into(),
+            },
+        );
+        assert!(env.is_empty(), "{env:?}");
+        assert!(missing.is_empty());
+        assert!(secrets.asked().is_empty(), "连问都不该问");
+    }
+
+    /// 凭证的值不进 `Debug`。
+    #[test]
+    fn the_config_debug_never_prints_a_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = PythonEnvConfig::new(dir.path().join("env"), dir.path().to_path_buf());
+        config.secrets = Some(FakeSecrets::new(
+            "toolbox.vault",
+            &["TOK"],
+            &[("TOK", "super-secret-value")],
+        ) as Arc<dyn SecretResolver>);
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("super-secret-value"), "{printed}");
+        assert!(printed.contains("<装上了>"), "{printed}");
     }
 
     #[tokio::test]

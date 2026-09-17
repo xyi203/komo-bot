@@ -17,8 +17,10 @@ pub const MEMOS: &str = include_str!("memos.py");
 /// 它自带的测试：对一个本地假 Memos 跑，不碰真实例。
 pub const MEMOS_TEST: &str = include_str!("test_memos.py");
 
-/// 这个模块用到的环境变量——`PythonEnvConfig` 按名字把它们透传进子进程，**值不经过
-/// 提示词，也不进计划**（§5.3）。
+/// 这个模块用到的凭证引用。**名字**由模块的 `__komo_env__` 声明、进计划的
+/// `ResourceRef`；**值**由 Gateway 在每次 spawn 时从 `.env` 按名解析进那一个子进程
+/// （`python_runtime::SecretResolver`）——不进提示词、不进计划、不进 Gateway 自己的
+/// 进程环境（§5.3、§7.2）。
 pub const MEMOS_ENV: &[&str] = &["MEMOS_BASE_URL", "MEMOS_TOKEN"];
 
 /// 首次启动时把内置模块装进 toolbox。答"这一次装了哪些"。
@@ -49,11 +51,14 @@ mod tests {
         assert!(read.doc.is_some(), "模块说明是模型先读的那一层（§5.3）");
     }
 
-    /// 凭证只从环境变量来，**代码里不能有任何写死的值**（§5.3）。
+    /// 凭证只从被点名的变量来，**代码里不能有任何写死的值**（§5.3）。
     #[test]
     fn the_builtin_module_carries_no_credentials_of_its_own() {
         for name in MEMOS_ENV {
-            assert!(MEMOS.contains(name), "{name} 该从环境变量读");
+            assert!(
+                MEMOS.contains(name),
+                "{name} 该由 __komo_env__ 点名并从中读取"
+            );
         }
         assert!(
             !MEMOS.contains("Bearer ey") && !MEMOS.contains("token = \""),

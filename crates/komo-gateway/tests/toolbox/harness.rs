@@ -26,10 +26,23 @@ use serde_json::{Value, json};
 ///
 /// **令牌真的校验**：模块"凭证只进 Authorization 头"这句话，没有一个会拒绝的服务端就
 /// 证不出来。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct FakeMemos {
     memos: Arc<Mutex<BTreeMap<u64, String>>>,
     next: Arc<Mutex<u64>>,
+    /// 现在认哪个令牌。**可以换**——`.env` 轮换一次令牌之后，这里跟着换，就能证明
+    /// 子进程拿到的是重载后的那个值而不是缓存。
+    token: Arc<Mutex<String>>,
+}
+
+impl Default for FakeMemos {
+    fn default() -> Self {
+        FakeMemos {
+            memos: Arc::default(),
+            next: Arc::default(),
+            token: Arc::new(Mutex::new(MEMOS_TOKEN.to_string())),
+        }
+    }
 }
 
 pub struct RunningMemos {
@@ -48,6 +61,11 @@ impl RunningMemos {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// 换一个它认的令牌。
+    pub fn rotate_token(&self, token: &str) {
+        *self.state.token.lock().expect("假 Memos") = token.to_string();
     }
 
     /// 直接往服务端塞一条，绕过 HTTP——模拟"写入已经发生但响应丢了"。
@@ -96,11 +114,12 @@ pub async fn start_memos() -> RunningMemos {
     }
 }
 
-fn authorized(headers: &HeaderMap) -> bool {
+fn authorized(state: &FakeMemos, headers: &HeaderMap) -> bool {
+    let expected = format!("Bearer {}", state.token.lock().expect("假 Memos"));
     headers
         .get("authorization")
         .and_then(|value| value.to_str().ok())
-        == Some(&format!("Bearer {MEMOS_TOKEN}"))
+        == Some(expected.as_str())
 }
 
 fn memo(id: u64, content: &str) -> Value {
@@ -112,7 +131,7 @@ async fn create(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    if !authorized(&headers) {
+    if !authorized(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"message": "no"})));
     }
     let content = body
@@ -132,7 +151,7 @@ async fn create(
 }
 
 async fn list(State(state): State<FakeMemos>, headers: HeaderMap) -> (StatusCode, Json<Value>) {
-    if !authorized(&headers) {
+    if !authorized(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"message": "no"})));
     }
     // **故意不实现 filter**：模块因此必须自己在本地再筛一遍，那正是 §5.5「不能把
@@ -152,7 +171,7 @@ async fn show(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    if !authorized(&headers) {
+    if !authorized(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"message": "no"})));
     }
     let key: u64 = match id.parse() {
@@ -171,7 +190,7 @@ async fn update(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
-    if !authorized(&headers) {
+    if !authorized(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"message": "no"})));
     }
     let key: u64 = match id.parse() {
@@ -196,7 +215,7 @@ async fn remove(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> (StatusCode, Json<Value>) {
-    if !authorized(&headers) {
+    if !authorized(&state, &headers) {
         return (StatusCode::UNAUTHORIZED, Json(json!({"message": "no"})));
     }
     let key: u64 = id.parse().unwrap_or(0);
@@ -211,6 +230,62 @@ async fn remove(
 /// 这台 Gateway 的 toolbox 目录。
 pub fn toolbox_dir(home: &std::path::Path) -> std::path::PathBuf {
     home.join("toolbox")
+}
+
+/// 写这台 Gateway 的 `.env`。
+///
+/// **凭证只在这里**——不进单元文件、不进 Gateway 的进程环境、不进计划（§5.3、§12）。
+/// 测试因此也不碰 `std::env`：那正是这一整条链子要避免的东西。
+pub fn write_env(home: &std::path::Path, extra: &[(&str, &str)]) {
+    let mut text = String::from("KOMO_LLM_API_KEY=test-key\nTELEGRAM_BOT_TOKEN=test-bot-token\n");
+    for (name, value) in extra {
+        text.push_str(&format!("{name}={value}\n"));
+    }
+    std::fs::write(home.join(".env"), text).expect("写 .env");
+}
+
+/// 改完 `.env` 之后让 Gateway 重新读一遍（等价于 `komo config reload`，§3）。
+pub fn reload(gw: &Gw) {
+    gw.state().config.reload().expect("新配置校验得过");
+}
+
+/// 一台 Gateway 的 toolbox 与一个指着它的解释器——**凭证走 `python_env` 装上的那个
+/// 解析口**，不走进程环境。
+pub fn interpreter(
+    gw: &Gw,
+) -> (
+    Arc<komo_runtime::toolbox::Toolbox>,
+    komo_runtime::python_runtime::PythonRuntime,
+) {
+    let toolbox = komo_gateway::service::toolbox_of(&gw.state().snapshot());
+    let config = komo_gateway::service::python_env(&gw.state().config, &toolbox);
+    let host = komo_runtime::python_runtime::PythonRuntime::new(
+        config,
+        komo_kernel::types::plan::EnvVersion("py-test".into()),
+    );
+    (toolbox, host)
+}
+
+/// 调一个已启用模块的导出函数。
+pub async fn call(
+    host: &komo_runtime::python_runtime::PythonRuntime,
+    module: &str,
+    function: &str,
+    args: serde_json::Value,
+) -> komo_kernel::types::tool::PythonResult {
+    use komo_kernel::traits::PythonHost;
+    let mut sink = komo_runtime::toolbox::NullWriter::detached();
+    host.run(
+        komo_kernel::types::tool::PythonJob::Call {
+            module: module.into(),
+            function: function.into(),
+            args,
+        },
+        &mut sink,
+        komo_kernel::types::tool::CancelToken::new(),
+    )
+    .await
+    .expect("宿主跑得起来")
 }
 
 /// 写一个候选（模型走的是 `write` 工具，验收这一侧直接写盘——测的是启用流程，

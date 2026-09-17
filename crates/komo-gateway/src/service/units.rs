@@ -5,6 +5,12 @@
 //! 然后等就绪。
 //!
 //! 「`status` 与 `stop` **不隐式启动服务**。」
+//!
+//! **单元里只有 `KOMO_HOME`，没有任何凭证。** `.env` 由 Gateway 自己读（§12），要用的
+//! 时候按名解析（`service::python_env` 的 `ToolboxSecrets`）。理由有三条，每一条单独
+//! 就够：launchd 没有 `EnvironmentFile` 的等价物，只能把值逐字抄进 plist；一旦抄进去，
+//! `.env` 的热重载就失效了，旧值活到下一次重装单元为止；而进了进程环境的东西，这台
+//! 机器上每一个子进程与每一条 `/proc/<pid>/environ` 都看得见。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -80,6 +86,7 @@ pub fn unit_text(manager: Manager, exe: &Path, komo_home: &Path, logs: &Path) ->
     <string>gateway</string>
     <string>--foreground</string>
   </array>
+  <!-- 只有 KOMO_HOME。凭证在 {home}/.env，由 Gateway 自己读取，不进本文件。 -->
   <key>EnvironmentVariables</key>
   <dict><key>KOMO_HOME</key><string>{home}</string></dict>
   <key>RunAtLoad</key><true/>
@@ -100,6 +107,7 @@ After=network.target
 
 [Service]
 Type=simple
+# 只有 KOMO_HOME。凭证在 {home}/.env，由 Gateway 自己读取，不进本文件。
 Environment=KOMO_HOME={home}
 ExecStart={exe} gateway --foreground
 Restart=on-failure
@@ -236,6 +244,50 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("KOMO_HOME=/home/u/.komo"), "{text}");
+    }
+
+    /// **单元文件里一个凭证都没有**（§12：`.env` 由 Gateway 自己读）。
+    ///
+    /// 断言的是"没有"，所以要拿真的会出现在 `.env` 里的那几个名字去比——一个只检查
+    /// "不含 `.env` 三个字"的测试挡不住任何东西。
+    #[test]
+    fn no_unit_file_carries_anything_from_dot_env() {
+        // 假的 `.env` 内容：名字与值都用真实形状。
+        let secrets = [
+            ("KOMO_LLM_API_KEY", "sk-live-0123456789abcdef"),
+            ("TELEGRAM_BOT_TOKEN", "1234567:AAH-live-token"),
+            ("MEMOS_TOKEN", "eyJhbGciOiJIUzI1NiJ9.live"),
+            ("FEISHU_APP_SECRET", "live-app-secret"),
+        ];
+        for manager in [Manager::Systemd, Manager::Launchd] {
+            let text = unit_text(
+                manager,
+                Path::new("/usr/local/bin/komo"),
+                Path::new("/home/u/.komo"),
+                Path::new("/home/u/.komo/logs"),
+            );
+            for (name, value) in secrets {
+                assert!(
+                    !text.contains(value),
+                    "{manager:?} 的单元里出现了凭证：{text}"
+                );
+                assert!(
+                    !text.contains(name),
+                    "{manager:?} 的单元里连凭证的变量名都不该有：{text}"
+                );
+            }
+            // 唯一该有的那个环境变量，以及那句说明。
+            assert!(text.contains("KOMO_HOME"), "{text}");
+            assert_eq!(
+                text.matches("KOMO_HOME").count(),
+                2,
+                "一次设置 + 一次注释里提到它，再多就是别处又设了一遍：{text}"
+            );
+            assert!(
+                text.contains("/.env，由 Gateway 自己读取，不进本文件"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

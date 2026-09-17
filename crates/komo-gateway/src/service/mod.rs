@@ -160,7 +160,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         token: token.clone(),
         llm: options.llm,
         embeddings: options.embeddings,
-        tools: build_tools(&snapshot, &instance_id, &db, Arc::clone(&clock)).await,
+        tools: build_tools(&config, &instance_id, &db, Arc::clone(&clock)).await,
         channels: options.channels,
     })
     .await
@@ -403,15 +403,50 @@ pub fn toolbox_of(snapshot: &komo_kernel::protocol::config::ConfigSnapshot) -> A
     toolbox
 }
 
+/// 凭证引用的解析口：**名字**问 toolbox（模块的 `__komo_env__`），**值**问
+/// `ConfigHolder`（`.env`）。
+///
+/// 两边都是**每次现读**：`toolbox.inspect` 读的是磁盘上当前那一份，
+/// `ConfigHolder::secrets()` 读的是 arc-swap 里当前那一份。所以启用一个新版本、或者改
+/// 完 `.env` 跑一次 `komo config reload`，下一次调用就按新的来，不必重启（§3 第 2 步）。
+///
+/// **值到此为止**：它只在 `PythonRuntime::run` 里被放进那一次 spawn 的 env，不进
+/// Gateway 自己的进程环境、不进计划、不进日志（§5.3、§7.2）。
+struct ToolboxSecrets {
+    toolbox: Arc<Toolbox>,
+    config: Arc<ConfigHolder>,
+}
+
+impl komo_runtime::python_runtime::SecretResolver for ToolboxSecrets {
+    fn names_for(&self, module: &str) -> Vec<String> {
+        // 读不出这个模块（被停用、被删掉）就是"它没有声明任何凭证"——不猜一个名单。
+        self.toolbox
+            .inspect(module)
+            .map(|info| info.env)
+            .unwrap_or_default()
+    }
+
+    fn resolve(&self, name: &str) -> Option<String> {
+        // 空串当作没配：一个空令牌只会在第一次请求时才失败，而那时说的是"401"，
+        // 不是"没配"（`Secrets::has` 已经是这个约定）。
+        self.config
+            .secrets()
+            .get(name)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+    }
+}
+
 /// 受管理解释器的配置（§5.1）。
 ///
-/// 两件与 toolbox 相关的事在这里接上：`toolbox_parent` 让 `import toolbox.x` 成立，
-/// `denied_imports` 让候选与历史快照 import 不到（§7.3）。`resource_env` 是**已启用
-/// 模块声明的变量名**——值在子进程里从进程环境取，不进计划也不进提示词（§5.3）。
+/// 三件与 toolbox 相关的事在这里接上：`toolbox_parent` 让 `import toolbox.x` 成立，
+/// `denied_imports` 让候选与历史快照 import 不到（§7.3），`secrets` 让已授权模块在
+/// **每次 spawn 时**按名拿到它声明的那几个变量（§5.3）。
 pub fn python_env(
-    snapshot: &komo_kernel::protocol::config::ConfigSnapshot,
-    toolbox: &Toolbox,
+    config: &Arc<ConfigHolder>,
+    toolbox: &Arc<Toolbox>,
 ) -> komo_runtime::python_runtime::PythonEnvConfig {
+    let snapshot = config.current();
     let mut python = komo_runtime::python_runtime::PythonEnvConfig::new(
         snapshot.start_only.python_env_root.clone(),
         snapshot.paths.workspaces_dir.clone(),
@@ -430,26 +465,23 @@ pub fn python_env(
     }
     python.toolbox_parent = Some(toolbox.layout().parent());
     python.denied_imports = toolbox.layout().denied_import_roots();
-    python.resource_env = toolbox
-        .list()
-        .unwrap_or_default()
-        .into_iter()
-        .flat_map(|module| module.env)
-        .collect();
-    python.resource_env.sort();
-    python.resource_env.dedup();
+    python.secrets = Some(Arc::new(ToolboxSecrets {
+        toolbox: Arc::clone(toolbox),
+        config: Arc::clone(config),
+    }));
     python
 }
 
 /// 五个基础工具（§4）。`python` 要有一个跑得起来的解释器才挂。
 async fn build_tools(
-    snapshot: &komo_kernel::protocol::config::ConfigSnapshot,
+    config: &Arc<ConfigHolder>,
     instance_id: &str,
     db: &komo_store::Db,
     clock: Arc<dyn Clock>,
 ) -> Vec<Arc<dyn Tool>> {
     use komo_runtime::tools::{EditTool, ReadTool, ShellTool, WriteTool};
 
+    let snapshot = config.current();
     let registry = Arc::new(komo_runtime::recovery::ChildRegistry::new(
         snapshot.paths.runtime_dir.join("children"),
     ));
@@ -465,8 +497,8 @@ async fn build_tools(
         Arc::new(ShellTool::new().registered(registration.clone())),
     ];
 
-    let toolbox = toolbox_of(snapshot);
-    let python = python_env(snapshot, &toolbox);
+    let toolbox = toolbox_of(&config.current());
+    let python = python_env(config, &toolbox);
     match komo_runtime::python_runtime::PythonRuntime::probe(python).await {
         Ok(runtime) => {
             // 核对函数的那道门（§8.6）。它自己带一份 Policy 与授权表：核对是一次**新的**

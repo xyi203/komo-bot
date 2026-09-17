@@ -117,8 +117,29 @@ fn check_model(
     caps: &EffortCapabilities,
     issues: &mut Vec<ConfigIssue>,
 ) {
-    if model.provider.trim().is_empty() {
+    let provider = model.provider.trim();
+    let known = match role {
+        Role::Chat => caps.knows_provider(provider),
+        Role::Embedding => caps.knows_embedding_provider(provider),
+    };
+    if provider.is_empty() {
         issues.push(error(&format!("{key}.provider"), "provider 不能为空"));
+    } else if !known {
+        let expected = match role {
+            Role::Chat => format!(
+                "生成协议只有 `{}`（OpenAI Responses API）",
+                crate::llm::OPENAI_RESPONSES
+            ),
+            Role::Embedding => format!(
+                "向量后端只有 `{}` 与 `{}`",
+                crate::embedding::OPENAI_COMPATIBLE,
+                crate::embedding::OLLAMA
+            ),
+        };
+        issues.push(error(
+            &format!("{key}.provider"),
+            format!("不认识 provider `{provider}`：{expected}"),
+        ));
     }
     check_base_url(&model.base_url, &format!("{key}.base_url"), issues);
 
@@ -145,6 +166,10 @@ fn check_model(
         issues.push(error(&format!("{key}.timeout_secs"), "超时不能是 0"));
     }
 
+    // provider 都不认识，档位就无从谈起；上面已经报过，不再叠一条 effort 的错。
+    if !known {
+        return;
+    }
     // §13.3：不支持的档位要指出**模型、配置位置及支持值**，不静默映射为另一档。
     let checked = match role {
         Role::Chat => caps.check(model),
@@ -386,6 +411,20 @@ mod tests {
     #[test]
     fn a_healthy_snapshot_has_no_issues() {
         assert_eq!(validate(&snapshot_fixture()), vec![]);
+    }
+
+    #[test]
+    fn an_unknown_provider_is_reported_at_the_provider_key_not_at_effort() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.model.provider = "chat_completions".into();
+        snapshot.model.effort = Some(Effort::new("medium"));
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["model.provider"]);
+        assert!(
+            issues[0].message.contains("openai_responses"),
+            "{}",
+            issues[0].message
+        );
     }
 
     #[test]

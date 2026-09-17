@@ -9,10 +9,10 @@
 //! [`ConfigHolder::reload`]。
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arc_swap::ArcSwap;
-use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, KeyPath};
+use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, KeyPath, SourceFile};
 use time::OffsetDateTime;
 
 use super::effort::EffortCapabilities;
@@ -71,6 +71,9 @@ impl ReloadReport {
 /// 持有当前快照的那一个东西。
 pub struct ConfigHolder {
     current: ArcSwap<Loaded>,
+    /// 上一次**尝试**重载时三个文件的 mtime——不是上一次装上时的。校验不过的那一版
+    /// 也算看过了：否则轮询每秒都会把同一份坏配置再报一遍，直到有人改文件。
+    seen: Mutex<Vec<SourceFile>>,
     sources: Sources,
     home: PathBuf,
     caps: EffortCapabilities,
@@ -91,8 +94,10 @@ impl ConfigHolder {
         let loaded = load_config(options)?;
         let home = loaded.home.clone();
         let sources = loaded.sources.clone();
+        let seen = Mutex::new(loaded.snapshot.sources.clone());
         Ok(ConfigHolder {
             current: ArcSwap::from(Arc::new(loaded)),
+            seen,
             sources,
             home,
             caps: options.caps.clone(),
@@ -103,8 +108,10 @@ impl ConfigHolder {
     pub fn adopt(loaded: Loaded, caps: EffortCapabilities) -> Self {
         let home = loaded.home.clone();
         let sources = loaded.sources.clone();
+        let seen = Mutex::new(loaded.snapshot.sources.clone());
         ConfigHolder {
             current: ArcSwap::from(Arc::new(loaded)),
+            seen,
             sources,
             home,
             caps,
@@ -134,12 +141,12 @@ impl ConfigHolder {
         &self.home
     }
 
-    /// 三个来源文件的 mtime 和装上这份快照时记下的不一样吗。
+    /// 三个来源文件的 mtime 和上一次重载（成功或失败）时看到的不一样吗。
     ///
     /// Gateway 每秒调一次它（§3：mtime 轮询，不引入 inotify）。文件**消失**也算变化：
     /// 删掉 policy.toml 是一次真实的配置改动。
     pub fn changed_since(&self) -> bool {
-        let recorded = &self.current.load().snapshot.sources;
+        let recorded = self.seen.lock().expect("锁没中毒");
         let now = self.sources.stamps();
         if recorded.len() != now.len() {
             return true;
@@ -157,6 +164,7 @@ impl ConfigHolder {
             home: Some(self.home.clone()),
             caps: self.caps.clone(),
         };
+        *self.seen.lock().expect("锁没中毒") = self.sources.stamps();
         // 解析 + 校验。失败就直接返回——`current` 一个字节都没动。
         let next = load_config(&options)?;
 
@@ -262,6 +270,29 @@ mod tests {
 
         holder.reload().unwrap();
         assert!(!holder.changed_since(), "装上之后就不再是「改了但没装上」");
+    }
+
+    #[test]
+    fn a_failed_reload_is_not_reported_again_until_the_file_changes_again() {
+        let fixture = Fixture::valid();
+        let holder = fixture.holder();
+        let path = fixture.sources().config.clone();
+        write(&path, &Fixture::config_text("chat-b", "ultra"));
+        filetime_bump(&path);
+        assert!(holder.changed_since());
+
+        holder.reload().unwrap_err();
+        assert!(
+            !holder.changed_since(),
+            "坏配置看过一次就够了，不该每秒再报一遍"
+        );
+
+        write(&path, &Fixture::config_text("chat-b", "high"));
+        filetime_bump(&path);
+        filetime_bump(&path);
+        assert!(holder.changed_since(), "文件再改才算新的变化");
+        holder.reload().unwrap();
+        assert!(!holder.changed_since());
     }
 
     #[test]

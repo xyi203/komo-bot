@@ -235,6 +235,46 @@ home_chat = 111
     );
 }
 
+/// 编辑器每次自动保存都触发一次重载：同一条错误只投一次，装上之后说一声。
+#[tokio::test]
+async fn a_repeated_reload_error_is_delivered_once_and_recovery_is_announced() {
+    let gateway = TestGateway::start().await;
+    let broken = config_toml(
+        r#"
+[gateway]
+listen = "这不是一个地址"
+"#,
+    );
+    let count = |gateway: &TestGateway, needle: &str| {
+        gateway
+            .channel
+            .sent()
+            .iter()
+            .filter(|message| {
+                matches!(&message.outbound, Outbound::Text { text } if text.contains(needle))
+            })
+            .count()
+    };
+
+    gateway.write_config(&broken);
+    crate::reload::reload(gateway.state()).await.unwrap_err();
+    gateway.write_config(&broken);
+    crate::reload::reload(gateway.state()).await.unwrap_err();
+    assert_eq!(count(&gateway, "配置没装上"), 1, "同一条错误不重复投");
+
+    gateway.write_config(&telegram_config("111"));
+    crate::reload::reload(gateway.state())
+        .await
+        .expect("装得上");
+    assert_eq!(count(&gateway, "配置已装上"), 1, "恢复要说一声");
+
+    gateway.write_config(&telegram_config("111"));
+    crate::reload::reload(gateway.state())
+        .await
+        .expect("装得上");
+    assert_eq!(count(&gateway, "配置已装上"), 1, "没出过错就不用说");
+}
+
 /// ⑤ 审批请求投到来源会话与 home chat；第二个答复得到"已决定"。
 #[tokio::test]
 async fn an_approval_goes_to_both_the_source_and_home_and_is_decided_once() {

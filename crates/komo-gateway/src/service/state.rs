@@ -214,6 +214,8 @@ pub struct GatewayState {
     pub notifier: Arc<HomeNotifier>,
     pub channels: Arc<ChannelRegistry>,
     pub llm: Arc<SwappableLlm>,
+    /// 上一条投到 home chat 的重载错误。同一条错误不重复投；装上之后清掉并说一声。
+    pub reload_notice: Mutex<Option<String>>,
     pub scheduler: Arc<Scheduler>,
     pub segments: Arc<GatewaySegments>,
     pub supervisor: Arc<super::channels::ChannelSupervisor>,
@@ -429,6 +431,7 @@ impl GatewayState {
             preamble,
             recovery_store,
             deliveries,
+            reload_notice: Mutex::new(None),
             notifier,
             channels,
             llm,

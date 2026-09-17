@@ -106,6 +106,16 @@ impl EffortCapabilities {
         }
     }
 
+    /// 这个生成协议有人声明过吗。
+    pub fn knows_provider(&self, provider: &str) -> bool {
+        self.providers.contains_key(provider)
+    }
+
+    /// 这个向量后端有人声明过吗。
+    pub fn knows_embedding_provider(&self, provider: &str) -> bool {
+        self.embedding_providers.contains_key(provider)
+    }
+
     /// 补一个 provider 的声明。
     pub fn with_provider(mut self, provider: impl Into<String>, support: EffortSupport) -> Self {
         self.providers.insert(provider.into(), support);

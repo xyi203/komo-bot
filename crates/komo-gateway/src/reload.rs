@@ -34,6 +34,7 @@ pub async fn reload(state: &Arc<GatewayState>) -> Result<ConfigReloadResponse, A
                 "配置已重载"
             );
             apply(state, &report.changed).await;
+            announce_recovered(state).await;
             announce_start_only(state, &report.start_only).await;
             Ok(ConfigReloadResponse {
                 changed: report.changed,
@@ -42,12 +43,39 @@ pub async fn reload(state: &Arc<GatewayState>) -> Result<ConfigReloadResponse, A
             })
         }
         Err(error) => {
-            // 「旧快照原样保留，错误写日志并投递到 home chat」。
+            // 「旧快照原样保留，错误写日志并投递到 home chat」。编辑器每次自动保存都会
+            // 触发一次重载，所以**同一条错误只投一次**。
             tracing::error!(%error, "配置校验不过，继续用旧的那一份");
             let text = format!("配置没装上，还在用上一份：{error}");
-            let _ = state.notifier.deliver_home(Outbound::Text { text }).await;
+            let repeated = {
+                let mut last = state.reload_notice.lock().expect("锁没中毒");
+                let repeated = last.as_deref() == Some(text.as_str());
+                *last = Some(text.clone());
+                repeated
+            };
+            if !repeated {
+                let _ = state.notifier.deliver_home(Outbound::Text { text }).await;
+            }
             Err(config_failure(error))
         }
+    }
+}
+
+/// 上一次没装上、这一次装上了：说一声，不然操作者只看到过错误。
+async fn announce_recovered(state: &Arc<GatewayState>) {
+    let had_error = state
+        .reload_notice
+        .lock()
+        .expect("锁没中毒")
+        .take()
+        .is_some();
+    if had_error {
+        let _ = state
+            .notifier
+            .deliver_home(Outbound::Text {
+                text: "配置已装上。".into(),
+            })
+            .await;
     }
 }
 

@@ -12,5 +12,9 @@
 .env
 /.codegraph
 /.scratch
-
+node_modules/
+dist/
+build/
+.vite/
+.turbo/
 .env.local

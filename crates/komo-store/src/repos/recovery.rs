@@ -43,6 +43,10 @@ pub struct UnfinishedRun {
     /// "用完了没有"由拿着预算的那一层判。包 newtype 的时候顺手填上。
     pub retry: Option<RetryObservation>,
     /// 最终结果已经送达客户端了吗（§8.4 第 10 行）。
+    ///
+    /// 「送达」按投递义务判：`deliveries` 里没有一行 `RunFinished` 还卡在 pending /
+    /// deferred 就算送达。TUI / HTTP 来源的 Run 从来不产生投递行——结果由客户端**补读**
+    /// （§8.4：「补发或补读」），不是补发。
     pub result_delivered: bool,
 }
 
@@ -78,12 +82,13 @@ impl RecoveryStore {
     ///   → 补发或补读原结果，**不重新执行任务**」。不带上它们，`RecoveryAction::
     ///   RedeliverResult` 就是一段永远走不到的代码。
     ///
-    /// 结构里不需要多一个字段区分：`status` 本身已经说了是哪一批。补发过一次之后
-    /// `deliveries` 里就有了一行 `sent`，下一轮它自己退出这个集合。
+    /// 结构里不需要多一个字段区分：`status` 本身已经说了是哪一批。「没送到」= 有一行
+    /// `RunFinished` 投递还不是 `sent`；没有投递行的 Run（TUI / HTTP 来源）不在其中，
+    /// 它们的结果由客户端补读。补发之后那行变成 `sent`，下一轮它自己退出这个集合。
     pub async fn unfinished_runs(&self) -> Result<Vec<UnfinishedRun>, StoreError> {
-        let delivered = delivered_runs(&self.db).await?;
+        let undelivered = undelivered_runs(&self.db).await?;
         let mut rows = runs::unfinished(&self.db).await?;
-        rows.extend(runs::terminal_undelivered(&self.db, &delivered).await?);
+        rows.extend(runs::terminal_undelivered(&self.db, &undelivered).await?);
         rows.sort_by(|a, b| a.run.as_str().cmp(b.run.as_str()));
 
         Ok(rows
@@ -97,7 +102,7 @@ impl RecoveryStore {
                     }),
                     _ => None,
                 },
-                result_delivered: delivered.contains(record.run.as_str()),
+                result_delivered: !undelivered.contains(record.run.as_str()),
                 claimed_by: record.claimed_by.clone().map(ExecutorId::from_raw),
                 run: record.run,
                 session: record.session,
@@ -337,10 +342,11 @@ async fn apply_event(
 /// 「已保存最终结果，但客户端没有收到 → 补发或补读原结果，不重新执行任务」（§8.4）。
 /// 判据就是 `deliveries` 里有没有一条 `sent` 的行提到它——补发按 `DeliveryId` 幂等，
 /// 所以"送过了"是一个查得出来的事实，不是一个猜测。
-async fn delivered_runs(db: &Db) -> Result<std::collections::BTreeSet<String>, StoreError> {
+/// 有一行 `RunFinished` 投递还没到 `sent` 的那些 Run。
+async fn undelivered_runs(db: &Db) -> Result<std::collections::BTreeSet<String>, StoreError> {
     db.read(move |ex| {
         Box::pin(async move {
-            let rows = DeliveryRow::filter(DeliveryRow::fields().state().eq("sent"))
+            let rows = DeliveryRow::filter(DeliveryRow::fields().state().ne("sent"))
                 .exec(ex)
                 .await
                 .map_err(crate::db::map_toasty)?;
@@ -542,6 +548,23 @@ mod tests {
             )
             .await
             .unwrap();
+        // 没有投递义务的终态 Run（TUI / HTTP 来源）不进集合：结果由客户端补读。
+        assert_eq!(f.store.unfinished_runs().await.unwrap().len(), 1);
+        // 给它一行卡在 pending 的结果投递——这才是「客户端没有收到」。
+        let deliveries = crate::repos::deliveries::TursoDeliveryRepo::new(f.db.clone());
+        deliveries
+            .record(
+                &DeliveryId::from_raw("d-1"),
+                &DeliveryTarget::to_peer(ChannelPeer::new(ChannelPlatform::Telegram, "42")),
+                &komo_kernel::types::chat::Outbound::RunFinished {
+                    session: f.session.clone(),
+                    run: closed.run.clone(),
+                    summary: "跑完了".into(),
+                },
+                TestClock::fixed().now(),
+            )
+            .await
+            .unwrap();
 
         let unfinished = f.store.unfinished_runs().await.unwrap();
         let in_flight = unfinished
@@ -552,7 +575,10 @@ mod tests {
         assert_eq!(in_flight.status, RunStatus::Queued);
         assert!(in_flight.claimed_by.is_none());
         assert!(in_flight.retry.is_none());
-        assert!(!in_flight.result_delivered);
+        assert!(
+            in_flight.result_delivered,
+            "没有卡住的投递 = 没有欠着的结果"
+        );
 
         // §8.4 第 10 行：已终态、结果还没送到，也要进扫描集合，否则
         // `RecoveryAction::RedeliverResult` 是一段永远走不到的代码。
@@ -584,7 +610,6 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(f.store.unfinished_runs().await.unwrap().len(), 1);
 
         let deliveries = crate::repos::deliveries::TursoDeliveryRepo::new(f.db.clone());
         let id = DeliveryId::from_raw("d-1");
@@ -601,6 +626,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(f.store.unfinished_runs().await.unwrap().len(), 1);
         deliveries
             .settle(
                 &id,

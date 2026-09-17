@@ -353,20 +353,20 @@ pub async fn unfinished(db: &Db) -> Result<Vec<RunRecord>, StoreError> {
 
 /// 已经终态、但结果还没送到客户端的 Run（§8.4 第 10 行）。
 ///
-/// `delivered` 是"已经送过了"的那一组 Run id，由调用方查 `deliveries` 得出——这里不自
-/// 己去查，因为同一轮扫描的两批行要用**同一份**送达观察。
+/// `undelivered` 是"有结果投递卡在半路"的那一组 Run id，由调用方查 `deliveries` 得出
+/// ——这里不自己去查，因为同一轮扫描的两批行要用**同一份**送达观察。
 pub async fn terminal_undelivered(
     db: &Db,
-    delivered: &std::collections::BTreeSet<String>,
+    undelivered: &std::collections::BTreeSet<String>,
 ) -> Result<Vec<RunRecord>, StoreError> {
-    let delivered = delivered.clone();
+    let undelivered = undelivered.clone();
     db.read(move |ex| {
-        let delivered = delivered.clone();
+        let undelivered = undelivered.clone();
         Box::pin(async move {
             let rows = RunRow::all().exec(ex).await.map_err(map_toasty)?;
             let mut out = Vec::new();
             for row in &rows {
-                if delivered.contains(&row.id) {
+                if !undelivered.contains(&row.id) {
                     continue;
                 }
                 let record = RunRecord::try_from_row(row)?;

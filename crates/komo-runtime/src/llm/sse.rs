@@ -77,11 +77,6 @@ fn decode_event(event: &str) -> Option<SseEvent> {
     if data.is_empty() {
         return None;
     }
-    // 有的实现在最后补一帧 `data: [DONE]`。Responses 的终止信号是
-    // `response.completed`，所以这一帧没有意义，丢掉——**不能把它当成收齐了**。
-    if data.trim() == "[DONE]" {
-        return None;
-    }
     Some(SseEvent { name, data })
 }
 
@@ -143,9 +138,15 @@ mod tests {
     }
 
     #[test]
-    fn a_trailing_done_frame_is_not_a_completion() {
+    fn a_trailing_done_frame_is_left_for_the_protocol_adapter() {
         let mut decoder = SseDecoder::new();
-        assert!(decoder.push(b"data: [DONE]\n\n").is_empty());
+        assert_eq!(
+            decoder.push(b"data: [DONE]\n\n"),
+            vec![SseEvent {
+                name: None,
+                data: "[DONE]".into(),
+            }]
+        );
     }
 
     #[test]

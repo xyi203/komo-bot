@@ -366,12 +366,14 @@ fn menu() -> Vec<ModelMenuEntry> {
             provider: "openai_compatible".into(),
             efforts: vec![Effort::new("low"), Effort::new("high")],
             default: true,
+            ..ModelMenuEntry::default()
         },
         ModelMenuEntry {
             id: "claude-y".into(),
             provider: "anthropic".into(),
             efforts: vec![],
             default: false,
+            ..ModelMenuEntry::default()
         },
     ]
 }

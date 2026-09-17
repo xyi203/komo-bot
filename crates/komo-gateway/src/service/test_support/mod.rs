@@ -27,7 +27,7 @@ use komo_kernel::traits::LlmClient;
 #[cfg(test)]
 use komo_kernel::types::chat::ChannelPlatform;
 #[cfg(test)]
-use komo_kernel::types::model::ModelConfig;
+use komo_kernel::types::model::{CatalogModel, ModelCatalog, ModelConfig};
 
 #[cfg(test)]
 use crate::channels::{ChannelSender, test_channel::MemChannel};
@@ -40,11 +40,15 @@ use super::{Running, ServiceOptions, start};
 pub fn config_toml(extra: &str) -> String {
     format!(
         r#"
-[model]
-provider = "openai_responses"
+[model.main]
+type = "completion"
+api_backend = "responses"
 base_url = "https://llm.example.com/v1"
 model = "gpt-test"
 api_key_env = "KOMO_LLM_API_KEY"
+
+[models]
+default = "main"
 
 [memory]
 enabled = false
@@ -71,7 +75,7 @@ groups = [222]
 #[cfg(test)]
 pub fn sample_snapshot() -> ConfigSnapshot {
     let model = ModelConfig {
-        provider: "openai_responses".into(),
+        provider: "responses".into(),
         base_url: "https://llm.example.com/v1".into(),
         model: "gpt-test".into(),
         api_key_env: "KOMO_LLM_API_KEY".into(),
@@ -85,6 +89,18 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             listen: "127.0.0.1:7777".into(),
             db_path: "/tmp/komo/state.db".into(),
             python_env_root: "/tmp/komo/python-envs".into(),
+        },
+        model_catalog: ModelCatalog {
+            default: "main".into(),
+            entries: std::collections::BTreeMap::from([(
+                "main".into(),
+                CatalogModel::Completion {
+                    name: "main".into(),
+                    model_provider: None,
+                    context_window: None,
+                    config: model.clone(),
+                },
+            )]),
         },
         model: model.clone(),
         memory: MemoryConfig {

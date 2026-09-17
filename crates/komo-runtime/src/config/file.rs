@@ -1,8 +1,8 @@
 //! `config.toml` / `policy.toml` 的文件形状 → 一份 kernel [`ConfigSnapshot`]（§3、§13.3）。
 //!
-//! 文件结构在这里单独写一遍，不直接 `Deserialize` 快照本身，有两个理由：文件里很多段
-//! 可以省略（`[memory.model]` 整段省略要继承主模型的**完整**配置，§13.3），而快照里
-//! 它们是必填；以及错误要定位到**键路径**，这需要逐字段自己装配。
+//! 文件结构在这里单独写一遍，不直接 `Deserialize` 快照本身：`model_providers` 只是
+//! 连接默认值，`model.<alias>` 才是模型目录项，角色最后解析成完整配置。运行时不再做
+//! 继承，也不会把一个模型名拼到另一个模型的端点上。
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,9 @@ use komo_kernel::protocol::config::{
 };
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
 use komo_kernel::types::memory::RetrievalMode;
-use komo_kernel::types::model::{Effort, EmbeddingConfig, ModelConfig};
+use komo_kernel::types::model::{
+    CatalogModel, Effort, EmbeddingConfig, ModelCatalog, ModelConfig, ModelType,
+};
 use serde::Deserialize;
 use time::OffsetDateTime;
 
@@ -45,7 +47,11 @@ pub(super) struct FileConfig {
     pub gateway: GatewaySection,
     #[serde(default)]
     pub paths: PathsSection,
-    pub model: Option<ModelSection>,
+    #[serde(default)]
+    pub model_providers: BTreeMap<String, ModelProviderSection>,
+    #[serde(default)]
+    pub model: BTreeMap<String, ModelSection>,
+    pub models: Option<ModelsSection>,
     #[serde(default)]
     pub memory: MemorySection,
     #[serde(default)]
@@ -73,82 +79,54 @@ pub(super) struct PathsSection {
     pub skill_dirs: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ModelProviderSection {
+    pub base_url: Option<String>,
+    #[serde(alias = "env_key")]
+    pub api_key_env: Option<String>,
+    pub api_backend: Option<String>,
+    pub timeout_secs: Option<u64>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ModelSection {
-    pub provider: String,
-    pub base_url: String,
+    #[serde(rename = "type")]
+    pub model_type: ModelType,
     pub model: String,
-    pub api_key_env: String,
+    pub name: Option<String>,
+    pub model_provider: Option<String>,
+    pub base_url: Option<String>,
+    #[serde(alias = "env_key")]
+    pub api_key_env: Option<String>,
+    pub api_backend: Option<String>,
     pub effort: Option<String>,
     /// 操作者显式声明这个模型支持哪些档位（§13.3 的"显式能力声明"）。省略 = 问适配器
     /// 自己的内建表；写成空表 = 这个模型一档都不支持。
     pub efforts: Option<Vec<String>>,
     pub timeout_secs: Option<u64>,
+    pub context_window: Option<u64>,
+    pub revision: Option<String>,
+    pub dimensions: Option<u32>,
+    pub document_prefix: Option<String>,
+    pub query_prefix: Option<String>,
 }
 
-impl ModelSection {
-    fn into_model(self) -> ModelConfig {
-        ModelConfig {
-            provider: self.provider.trim().to_string(),
-            base_url: self.base_url.trim_end_matches('/').to_string(),
-            model: self.model.trim().to_string(),
-            api_key_env: self.api_key_env.trim().to_string(),
-            effort: self.effort.map(Effort::new),
-            efforts: self
-                .efforts
-                .map(|levels| levels.into_iter().map(Effort::new).collect()),
-            timeout_secs: self.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS),
-        }
-    }
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ModelsSection {
+    pub default: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct MemorySection {
     pub enabled: Option<bool>,
-    pub model: Option<ModelSection>,
-    pub embedding: Option<EmbeddingSection>,
+    pub model: Option<String>,
+    pub embedding: Option<String>,
     #[serde(default)]
     pub retrieval: RetrievalSection,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(super) struct EmbeddingSection {
-    pub provider: String,
-    pub base_url: String,
-    pub model: String,
-    pub api_key_env: String,
-    pub effort: Option<String>,
-    pub efforts: Option<Vec<String>>,
-    pub timeout_secs: Option<u64>,
-    pub revision: Option<String>,
-    pub dimensions: Option<u32>,
-    /// 文档侧 / 查询侧的输入前缀（§9.5）。两条都进空间指纹。
-    pub document_prefix: Option<String>,
-    pub query_prefix: Option<String>,
-}
-
-impl EmbeddingSection {
-    fn into_embedding(self) -> EmbeddingConfig {
-        EmbeddingConfig {
-            model: ModelSection {
-                provider: self.provider,
-                base_url: self.base_url,
-                model: self.model,
-                api_key_env: self.api_key_env,
-                effort: self.effort,
-                efforts: self.efforts,
-                timeout_secs: self.timeout_secs,
-            }
-            .into_model(),
-            revision: self.revision,
-            dimensions: self.dimensions,
-            document_prefix: self.document_prefix,
-            query_prefix: self.query_prefix,
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -336,27 +314,61 @@ pub(super) fn assemble(
         ),
     };
 
-    let Some(model) = file.model else {
+    let Some(models) = file.models else {
         return Err(ConfigError::Missing {
-            key: KeyPath::new("model"),
+            key: KeyPath::new("models"),
             file: sources.config.clone(),
-            message: "没有 [model] 段：主模型是必填的（§13.3）".into(),
+            message: "没有 [models] 段：需要用 default 指定主模型 alias".into(),
         });
     };
-    let model = model.into_model();
+    let model_catalog = assemble_catalog(
+        file.model_providers,
+        file.model,
+        models.default,
+        &sources.config,
+    )?;
+    let model = model_catalog
+        .completion(&model_catalog.default)
+        .cloned()
+        .ok_or_else(|| ConfigError::Missing {
+            key: KeyPath::new("models.default"),
+            file: sources.config.clone(),
+            message: format!(
+                "`{}` 不是一个已配置的 completion 模型",
+                model_catalog.default
+            ),
+        })?;
 
-    // §13.3：「memory.model 整段省略时，继承配置文件中主模型的**完整**配置，包括
-    // effort」——在解析时就填好，不在使用处拼接。
-    let memory_model = file
+    // memory.model 省略时继承 default alias；显式写时必须引用 completion。
+    let memory_alias = file
         .memory
         .model
-        .map(ModelSection::into_model)
-        .unwrap_or_else(|| model.clone());
+        .as_deref()
+        .unwrap_or(&model_catalog.default);
+    let memory_model = model_catalog
+        .completion(memory_alias)
+        .cloned()
+        .ok_or_else(|| ConfigError::Missing {
+            key: KeyPath::new("memory.model"),
+            file: sources.config.clone(),
+            message: format!("`{memory_alias}` 不是一个已配置的 completion 模型"),
+        })?;
+    let memory_embedding =
+        match file.memory.embedding.as_deref() {
+            Some(alias) => Some(model_catalog.embedding(alias).cloned().ok_or_else(|| {
+                ConfigError::Missing {
+                    key: KeyPath::new("memory.embedding"),
+                    file: sources.config.clone(),
+                    message: format!("`{alias}` 不是一个已配置的 embedding 模型"),
+                }
+            })?),
+            None => None,
+        };
 
     let memory = MemoryConfig {
         enabled: file.memory.enabled.unwrap_or(true),
         model: memory_model,
-        embedding: file.memory.embedding.map(EmbeddingSection::into_embedding),
+        embedding: memory_embedding,
         retrieval: file.memory.retrieval.into_retrieval(),
     };
 
@@ -366,10 +378,11 @@ pub(super) fn assemble(
         wechat: file.channels.wechat.into_channel(),
     };
 
-    let credentials = credential_fingerprints(&model, &memory, &channels, secrets);
+    let credentials = credential_fingerprints(&model_catalog, &channels, secrets);
 
     Ok(ConfigSnapshot {
         start_only,
+        model_catalog,
         model,
         memory,
         channels,
@@ -381,17 +394,123 @@ pub(super) fn assemble(
     })
 }
 
+fn assemble_catalog(
+    providers: BTreeMap<String, ModelProviderSection>,
+    models: BTreeMap<String, ModelSection>,
+    default: String,
+    config_file: &Path,
+) -> Result<ModelCatalog, ConfigError> {
+    if models.is_empty() {
+        return Err(ConfigError::Missing {
+            key: KeyPath::new("model"),
+            file: config_file.to_path_buf(),
+            message: "至少需要一个 [model.<alias>]".into(),
+        });
+    }
+
+    let mut entries = BTreeMap::new();
+    for (alias, section) in models {
+        let provider = match section.model_provider.as_deref() {
+            Some(name) => Some(providers.get(name).ok_or_else(|| ConfigError::Missing {
+                key: KeyPath::new(format!("model.{alias}.model_provider")),
+                file: config_file.to_path_buf(),
+                message: format!("没有 [model_providers.{name}]"),
+            })?),
+            None => None,
+        };
+
+        let base_url = inherited_string(
+            section.base_url.as_deref(),
+            provider.and_then(|p| p.base_url.as_deref()),
+            &format!("model.{alias}.base_url"),
+            config_file,
+        )?;
+        let api_backend = inherited_string(
+            section.api_backend.as_deref(),
+            provider.and_then(|p| p.api_backend.as_deref()),
+            &format!("model.{alias}.api_backend"),
+            config_file,
+        )?;
+        let api_key_env = inherited_string(
+            section.api_key_env.as_deref(),
+            provider.and_then(|p| p.api_key_env.as_deref()),
+            &format!("model.{alias}.api_key_env"),
+            config_file,
+        )?;
+        let timeout_secs = section
+            .timeout_secs
+            .or_else(|| provider.and_then(|p| p.timeout_secs))
+            .unwrap_or(DEFAULT_TIMEOUT_SECS);
+        let common = ModelConfig {
+            // 运行时 provider 字段仍表示协议 adapter；供应商 alias 单独留在 catalog。
+            provider: api_backend.trim().to_ascii_lowercase(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            model: section.model.trim().to_string(),
+            api_key_env: api_key_env.trim().to_string(),
+            effort: section.effort.map(Effort::new),
+            efforts: section
+                .efforts
+                .map(|levels| levels.into_iter().map(Effort::new).collect()),
+            timeout_secs,
+        };
+        let name = section.name.unwrap_or_else(|| alias.clone());
+        let model_provider = section.model_provider;
+        let entry = match section.model_type {
+            ModelType::Completion => CatalogModel::Completion {
+                name,
+                model_provider,
+                context_window: section.context_window,
+                config: common,
+            },
+            ModelType::Embedding => CatalogModel::Embedding {
+                name,
+                model_provider,
+                config: EmbeddingConfig {
+                    model: common,
+                    revision: section.revision,
+                    dimensions: section.dimensions,
+                    document_prefix: section.document_prefix,
+                    query_prefix: section.query_prefix,
+                },
+            },
+        };
+        entries.insert(alias, entry);
+    }
+
+    Ok(ModelCatalog {
+        default: default.trim().to_string(),
+        entries,
+    })
+}
+
+fn inherited_string(
+    own: Option<&str>,
+    inherited: Option<&str>,
+    key: &str,
+    config_file: &Path,
+) -> Result<String, ConfigError> {
+    own.or(inherited)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ConfigError::Missing {
+            key: KeyPath::new(key),
+            file: config_file.to_path_buf(),
+            message: "model 与 model_provider 都没有提供这个必填字段".into(),
+        })
+}
+
 /// 快照里的凭证**指纹**：这份配置引用到的变量名，加上已启用渠道的固定变量名。
 fn credential_fingerprints(
-    model: &ModelConfig,
-    memory: &MemoryConfig,
+    catalog: &ModelCatalog,
     channels: &ChannelsConfig,
     secrets: &Secrets,
 ) -> BTreeMap<String, komo_kernel::types::digest::ContentHash> {
-    let mut names: Vec<String> = vec![model.api_key_env.clone(), memory.model.api_key_env.clone()];
-    if let Some(embedding) = &memory.embedding {
-        names.push(embedding.model.api_key_env.clone());
-    }
+    let mut names: Vec<String> = catalog
+        .entries
+        .values()
+        .map(|model| model.common().api_key_env.clone())
+        .collect();
     for platform in [
         ChannelPlatform::Feishu,
         ChannelPlatform::Telegram,

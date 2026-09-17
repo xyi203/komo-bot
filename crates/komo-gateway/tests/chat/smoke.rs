@@ -31,11 +31,15 @@ fn home() -> tempfile::TempDir {
 [gateway]
 listen = "127.0.0.1:0"
 
-[model]
-provider = "openai_responses"
+[model.main]
+type = "completion"
+api_backend = "responses"
 base_url = "https://llm.example.com/v1"
 model = "gpt-test"
 api_key_env = "KOMO_LLM_API_KEY"
+
+[models]
+default = "main"
 
 [memory]
 enabled = false

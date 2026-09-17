@@ -56,13 +56,13 @@ pub use work::{DbMemoryWork, MemoryWorkItem, MemoryWorkLog};
 /// 记忆这一层的失败。
 ///
 /// **`VectorUnconfigured` 与 `VectorUnavailable` 是两件事**：前者是配置错误（选了
-/// hybrid / vector 却没有 `[memory.embedding]`，§9.4 说它"不能静默变成长期关键词模式"），
+/// hybrid / vector 却没有 `memory.embedding` alias，§9.4 说它"不能静默变成长期关键词模式"），
 /// 后者是端点这一刻不通。两者都不能被当成"没有相关记忆"。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MemoryError {
     #[error("`[memory]` 没有启用")]
     Disabled,
-    #[error("检索模式要向量，但没有配置 `[memory.embedding]`：这是配置错误，不是空结果")]
+    #[error("检索模式要向量，但没有配置 `memory.embedding` alias：这是配置错误，不是空结果")]
     VectorUnconfigured,
     #[error("向量后端不可用：{0}")]
     VectorUnavailable(String),
@@ -293,7 +293,7 @@ pub struct MemoryParts {
     pub config: MemoryConfig,
     pub repo: Arc<dyn MemoryRepo>,
     pub catalog: Arc<dyn MemoryCatalog>,
-    /// `None` = 没有配置 `[memory.embedding]`，只有关键词臂。
+    /// `None` = 没有配置 `memory.embedding` alias，只有关键词臂。
     pub embeddings: Option<Arc<dyn EmbeddingClient>>,
     pub llm: Arc<dyn LlmClient>,
     pub events: Arc<dyn SessionEvents>,

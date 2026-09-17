@@ -11,8 +11,8 @@
 //!   `status`（`pause` / `resume`）走 [`CronRepo::advance`]（版本一个字不动）。把两者
 //!   混成一条路的代价是具体的：操作者每暂停一次就要把这个 Job 的授权重批一遍。
 //! - **「可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析」**：
-//!   [`resolve_model`] 要么整份用请求给的 `model_config`，要么在主模型那一份上只换
-//!   `model` 这个名字——两种都产出一份**完整**配置，而且都不碰记忆与向量模型（那两个
+//!   [`resolve_model`] 要么整份用请求给的 `model_config`，要么把 `model` 当作目录 alias
+//!   解析——两种都产出一份**完整**配置，而且都不碰记忆与向量模型（那两个
 //!   角色在快照里，这里一个字都不读）。
 //!
 //! 时区与 effort **在请求前拒绝并指出支持值**：两者都是打字打出来的，而它们出错的
@@ -285,8 +285,7 @@ pub async fn run_now(
 /// 三条路，产出都是一份完整配置或者 `None`：
 ///
 /// - 给了 `model_config`：整份用它。
-/// - 只给了模型名：在**主模型**那一份上换掉 `model`。同一个后端换一个模型是这条路
-///   唯一成立的意思，所以 provider / base_url / api_key_env 一个都不猜。
+/// - 只给了模型名：按 `model.<alias>` 解析完整配置。
 /// - 都没给：`None`，触发时用当时的主模型快照。
 ///
 /// 无论哪条，**记忆整理与向量模型一个字都不动**——它们是另外两个角色，在快照里各自
@@ -300,9 +299,7 @@ fn resolve_model(
     let mut model = match (full, name) {
         (Some(full), _) => full,
         (None, Some(name)) if !name.trim().is_empty() => {
-            let mut model = api.state.snapshot().model.clone();
-            model.model = name.trim().to_string();
-            model
+            super::config::completion_model(api, name)?
         }
         _ => {
             // 没有模型覆盖，但可能单给了 effort：那一档也得立得住，否则它会在凌晨三点

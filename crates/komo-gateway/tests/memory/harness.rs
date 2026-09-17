@@ -20,8 +20,9 @@ pub use komo_gateway::service::test_support::harness::*;
 pub fn memory_config(mode: &str, with_embedding: bool) -> String {
     let embedding = if with_embedding {
         r#"
-[memory.embedding]
-provider = "openai_compatible"
+[model.embedding]
+type = "embedding"
+api_backend = "embeddings"
 base_url = "https://embedding.example.com/v1"
 model = "concept-v1"
 api_key_env = "KOMO_EMBEDDING_API_KEY"
@@ -30,24 +31,36 @@ dimensions = 4
     } else {
         ""
     };
+    let embedding_ref = if with_embedding {
+        "embedding = \"embedding\""
+    } else {
+        ""
+    };
     format!(
         r#"
-[model]
-provider = "openai_responses"
+[model.main]
+type = "completion"
+api_backend = "responses"
 base_url = "https://llm.example.com/v1"
 model = "gpt-test"
 api_key_env = "KOMO_LLM_API_KEY"
 
-[memory]
-enabled = true
-
-[memory.model]
-provider = "openai_responses"
+[model.memory]
+type = "completion"
+api_backend = "responses"
 base_url = "https://memory-llm.example.com/v1"
 model = "memory-test"
 api_key_env = "KOMO_MEMORY_API_KEY"
 effort = "low"
 {embedding}
+[models]
+default = "main"
+
+[memory]
+enabled = true
+model = "memory"
+{embedding_ref}
+
 [memory.retrieval]
 mode = "{mode}"
 candidate_limit = 40

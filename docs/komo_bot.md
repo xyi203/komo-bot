@@ -1067,7 +1067,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | POST /v1/memories/{id}/forget    | 停用指定 revision 并失效索引                   |
 | GET /v1/memory-index             | 当前空间、进度、覆盖率和错误                   |
 | POST /v1/memory-index/rebuild    | 幂等提交重建任务                               |
-| GET /v1/models                   | 模型菜单：每个模型的 provider 与支持的 effort 档位 |
+| GET /v1/models                   | completion alias 菜单：显示名、上游 model、provider、协议、上下文与 effort 档位 |
 | GET /v1/config/check             | 当前配置的校验结果（与热重载同一个函数）       |
 | POST /v1/config/reload           | 热重载；校验不过 422 并保留原配置               |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
@@ -1106,48 +1106,63 @@ SSE 事件带 Session 内递增序号，断线后按游标补读。JSONL 事件�
 
 Axum 已提供 SSE 响应；toasty 的 turso 驱动提供连接与事务，MVCC 冲突重试由 komo 自己包（§8.2）。实现时锁定实际依赖版本并验证 Fedora/macOS 构建。[Axum SSE](https://docs.rs/axum/latest/axum/response/sse/index.html) · [toasty](https://docs.rs/toasty)
 
-首版生成模型与向量模型分别接入一种明确的协议，由具体适配器实现。**生成协议是 OpenAI Responses API**（2026-09-16 拍板；流式 SSE 事件、`tools` 函数调用、`reasoning.effort`，回放时把 reasoning 项原样带回），provider 串为 `openai_responses`，OpenAI / Codex / DeepSeek / OpenRouter 等按它接入，换端点只改 `base_url` / `model` / `api_key_env`；不做 Chat Completions。向量协议是 OpenAI-compatible `/embeddings` 与 Ollama `/api/embed` 两种。base_url、model、effort 与凭证引用可配置；相同协议可以连接不同端点。不同协议后续按需要增加，不把“OpenAI compatible”当成所有字段都兼容的保证。生成适配器必须保留协议回放所需的消息块和元数据。
+生成模型有两个独立协议适配器：OpenAI Responses API（`api_backend = "responses"`）与 Chat Completions（`api_backend = "chat_completions"`）。两者分别处理请求形状、流式终态、tool call 拼接和原生历史回放；切换协议时只用标准化的文字与 tool call 历史，不把一种协议的私有块直接发给另一种协议。向量协议是 OpenAI-compatible `/embeddings`（`embeddings`）与 Ollama `/api/embed`（`ollama_embeddings`）两种。`model_provider` 只表示一组可继承的连接默认值，`api_backend` 才决定适配器；因此 OpenAI、OpenRouter 与自建网关可以复用协议实现，但不会被误认为同一个供应商。
 
 ### 13.3 模型角色与统一 effort 配置
 
-模型配置按实际用途独立解析：
+模型先进入统一目录，再由角色引用：
 
-| 配置             | 职责                             | 与其他角色的关系                                |
-| ---------------- | -------------------------------- | ----------------------------------------------- |
-| model            | 对话、计划、tool call 与任务输出 | Session / Cron 可覆盖本角色；运行时固定配置快照 |
-| memory.model     | 记忆提取、去重和冲突整理         | 可使用独立服务、凭证、model 和 effort           |
-| memory.embedding | 记忆文本与检索查询的向量生成     | 独立端点与模型，固定向量空间；不继承聊天模型    |
+| 配置                    | 职责 |
+| ----------------------- | ---- |
+| `model_providers.<name>` | 一组可复用的 `base_url`、`api_backend`、`env_key` 与超时默认值 |
+| `model.<alias>`          | 一项模型；`type = "completion"` 或 `"embedding"`，可覆盖 provider 的任一连接字段 |
+| `models.default`         | 默认对话模型 alias；Session / Cron 的 `model` 参数也使用 alias |
+| `memory.model`           | 记忆提取模型 alias；省略时使用 `models.default` |
+| `memory.embedding`       | 向量模型 alias；hybrid / vector 检索时必填 |
 
-所有模型配置复用 ModelConfig 的公共字段：provider、base_url、model、api_key_env、可选 effort、超时等。Embedding 配置额外支持模型 revision、可选 dimensions 和必要输入规则。生成与 embedding 仍由各自的客户端和能力校验处理，不向 embedding 端点发送聊天工具字段。
+解析优先级固定为“模型项 > model provider > 非敏感默认值”。进入 `ConfigSnapshot` 前，每个 alias 已经展开成完整配置；运行时、Cron 持久化和热重载不再临时拼接字段。`env_key` 是凭证所在的环境变量名（兼容旧拼法 `api_key_env`），凭证值仍只存在 `.env` / 进程环境中。
 
 以下是配置模板，模型名称与服务地址为占位值，effort 示例需要替换为目标模型支持的值：
 
 ```toml
-[model]
-provider = "openai_compatible"
-base_url = "https://llm.example.com/v1"
-model = "YOUR_CHAT_MODEL"
-api_key_env = "KOMO_LLM_API_KEY"
+[model_providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_backend = "chat_completions"
+env_key = "OPENROUTER_API_KEY"
+timeout_secs = 120
+
+[model.union]
+type = "completion"
+model_provider = "openrouter"
+model = "stealth/union-alpha"
+name = "union-alpha"
+context_window = 200000
 effort = "medium"
+
+[model.memory]
+type = "completion"
+model_provider = "openrouter"
+model = "openai/gpt-5.4-mini"
+# 单项可覆盖 provider 默认值：
+api_backend = "responses"
+effort = "low"
+
+[model.embedding]
+type = "embedding"
+api_backend = "ollama_embeddings"
+base_url = "https://embedding.example.com/v1"
+model = "YOUR_EMBEDDING_MODEL"
+env_key = "OLLAMA_API_KEY"
+# dimensions 省略时使用模型返回维度，校验后固定到索引代次。
+# revision 可用于标识服务端同名模型的权重版本。
+
+[models]
+default = "union"
 
 [memory]
 enabled = true
-
-[memory.model]
-provider = "openai_compatible"
-base_url = "https://memory-llm.example.com/v1"
-model = "YOUR_MEMORY_MODEL"
-api_key_env = "KOMO_MEMORY_API_KEY"
-effort = "low"
-
-[memory.embedding]
-provider = "openai_compatible"
-base_url = "https://embedding.example.com/v1"
-model = "YOUR_EMBEDDING_MODEL"
-api_key_env = "KOMO_EMBEDDING_API_KEY"
-# dimensions 省略时使用模型返回维度，校验后固定到索引代次。
-# revision 可用于标识服务端同名模型的权重版本。
-# effort 只有该 embedding 接口和模型支持时才能显式设置。
+model = "memory"
+embedding = "embedding"
 
 [memory.retrieval]
 mode = "hybrid"
@@ -1156,7 +1171,7 @@ top_k = 8
 max_tokens = 1500
 ```
 
-memory.model 整段省略时，继承配置文件中主模型的完整配置，包括 effort；它不继承某个聊天 Session 或 Cron 的临时覆盖。显式配置该段时是独立完整配置，不能拼接一个模型名和另一个模型的 effort / 端点。embedding 必须独立指定；若明确选择 keyword 模式，可以不配置 embedding。
+`memory.model` 省略时使用默认 completion alias 的完整配置，包括 effort；它不继承某个 Session 或 Cron 的临时覆盖。显式引用时必须指向 completion，`memory.embedding` 必须指向 embedding。若明确选择 keyword 模式，可以不配置 embedding。`GET /v1/models` 只列 completion alias；选择 alias 会携带完整端点、协议和凭证引用，而不是只替换上游 model id。
 
 effort 的行为统一，取值按协议和具体模型校验：
 

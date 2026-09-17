@@ -10,7 +10,7 @@ use komo_kernel::protocol::config::{
 };
 use komo_kernel::types::chat::PeerId;
 use komo_kernel::types::digest::ContentHash;
-use komo_kernel::types::model::{Effort, EmbeddingConfig, ModelConfig};
+use komo_kernel::types::model::{CatalogModel, Effort, EmbeddingConfig, ModelCatalog, ModelConfig};
 
 use super::{ConfigHolder, LoadOptions, Sources};
 
@@ -65,29 +65,40 @@ impl Fixture {
     pub fn config_text(model: &str, effort: &str) -> String {
         format!(
             r#"
-[model]
-provider = "openai_responses"
+[model_providers.openrouter]
 base_url = "https://llm.example.com/v1"
+env_key = "KOMO_LLM_API_KEY"
+api_backend = "responses"
+
+[model.chat]
+type = "completion"
 model = "{model}"
-api_key_env = "KOMO_LLM_API_KEY"
+model_provider = "openrouter"
 effort = "{effort}"
 
-[memory]
-enabled = true
-
-[memory.model]
-provider = "openai_responses"
+[model.memory]
+type = "completion"
 base_url = "https://memory-llm.example.com/v1"
 model = "memory-a"
 api_key_env = "KOMO_MEMORY_API_KEY"
+api_backend = "responses"
 effort = "low"
 
-[memory.embedding]
-provider = "openai_compatible"
+[model.embedding]
+type = "embedding"
 base_url = "https://embedding.example.com/v1"
 model = "embed-a"
 api_key_env = "KOMO_EMBEDDING_API_KEY"
+api_backend = "embeddings"
 dimensions = 1024
+
+[models]
+default = "chat"
+
+[memory]
+enabled = true
+model = "memory"
+embedding = "embedding"
 
 [memory.retrieval]
 mode = "hybrid"
@@ -153,6 +164,46 @@ fn model(provider: &str, name: &str, key_env: &str, effort: Option<&str>) -> Mod
 /// 一份**校验得过**的内存快照，给 `validate` 的测试用。
 pub fn snapshot_fixture() -> ConfigSnapshot {
     let home = PathBuf::from("/home/u/.komo");
+    let main = model("responses", "chat-a", "KOMO_LLM_API_KEY", Some("medium"));
+    let memory_model = model("responses", "memory-a", "KOMO_MEMORY_API_KEY", Some("low"));
+    let embedding = EmbeddingConfig {
+        model: model("embeddings", "embed-a", "KOMO_EMBEDDING_API_KEY", None),
+        revision: None,
+        dimensions: Some(1024),
+        document_prefix: None,
+        query_prefix: None,
+    };
+    let model_catalog = ModelCatalog {
+        default: "chat".into(),
+        entries: BTreeMap::from([
+            (
+                "chat".into(),
+                CatalogModel::Completion {
+                    name: "chat".into(),
+                    model_provider: Some("openrouter".into()),
+                    context_window: None,
+                    config: main.clone(),
+                },
+            ),
+            (
+                "memory".into(),
+                CatalogModel::Completion {
+                    name: "memory".into(),
+                    model_provider: None,
+                    context_window: None,
+                    config: memory_model.clone(),
+                },
+            ),
+            (
+                "embedding".into(),
+                CatalogModel::Embedding {
+                    name: "embedding".into(),
+                    model_provider: None,
+                    config: embedding.clone(),
+                },
+            ),
+        ]),
+    };
     ConfigSnapshot {
         start_only: StartOnly {
             data_dir: home.clone(),
@@ -160,33 +211,12 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             db_path: home.join("state.db"),
             python_env_root: home.join("python-envs"),
         },
-        model: model(
-            "openai_responses",
-            "chat-a",
-            "KOMO_LLM_API_KEY",
-            Some("medium"),
-        ),
+        model_catalog,
+        model: main,
         memory: MemoryConfig {
             enabled: true,
-            model: model(
-                "openai_responses",
-                "memory-a",
-                "KOMO_MEMORY_API_KEY",
-                Some("low"),
-            ),
-            embedding: Some(EmbeddingConfig {
-                // 向量协议仍是 OpenAI 兼容的 `/embeddings`（§13.2）。
-                model: model(
-                    "openai_compatible",
-                    "embed-a",
-                    "KOMO_EMBEDDING_API_KEY",
-                    None,
-                ),
-                revision: None,
-                dimensions: Some(1024),
-                document_prefix: None,
-                query_prefix: None,
-            }),
+            model: memory_model,
+            embedding: Some(embedding),
             retrieval: RetrievalConfig::default(),
         },
         channels: ChannelsConfig {

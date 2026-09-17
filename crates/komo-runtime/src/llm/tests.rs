@@ -18,7 +18,7 @@ use crate::config::{EffortCapabilities, Secrets};
 
 fn model(effort: Option<&str>) -> ModelConfig {
     ModelConfig {
-        provider: OPENAI_RESPONSES.into(),
+        provider: RESPONSES.into(),
         base_url: "https://llm.example.com/v1".into(),
         model: "chat-a".into(),
         api_key_env: "KOMO_LLM_API_KEY".into(),
@@ -404,10 +404,15 @@ async fn a_missing_credential_is_refused_with_the_variable_name_not_a_value() {
     assert!(transport.requests().is_empty());
 }
 
-/// 不留 Chat Completions 那条路径。
-#[tokio::test]
-async fn the_chat_completions_provider_strings_are_not_accepted() {
+#[test]
+fn chat_completions_is_supported_and_unimplemented_protocols_are_refused() {
     let transport = ScriptedTransport::new(vec![]);
+    let mut chat = model(None);
+    chat.provider = CHAT_COMPLETIONS.into();
+    factory(&transport)
+        .build(&chat, ModelRole::Main)
+        .expect("chat_completions 应该有独立适配器");
+
     for provider in ["openai_compatible", "openai_chat", "anthropic_messages"] {
         let mut config = model(None);
         config.provider = provider.into();

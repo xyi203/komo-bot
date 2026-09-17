@@ -47,11 +47,22 @@ use crate::service::{Running, ServiceOptions, start};
 pub fn config_toml(extra: &str) -> String {
     format!(
         r#"
-[model]
-provider = "openai_responses"
+[model.main]
+type = "completion"
+api_backend = "responses"
 base_url = "https://llm.example.com/v1"
 model = "gpt-test"
 api_key_env = "KOMO_LLM_API_KEY"
+
+[model.job]
+type = "completion"
+api_backend = "responses"
+base_url = "https://jobs.example.com/v1"
+model = "job-model"
+api_key_env = "KOMO_LLM_API_KEY"
+
+[models]
+default = "main"
 
 [memory]
 enabled = false

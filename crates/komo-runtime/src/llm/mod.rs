@@ -1,16 +1,13 @@
 //! LlmClient / TurnDriver 的协议适配器（§13.3、§13.5）。
 //!
-//! **首版只接一种生成协议**（§13.2，2026-09-16 拍板）：**OpenAI Responses API**，流式
-//! SSE + 函数调用 + `reasoning.effort`。provider 串是 `openai_responses`；OpenAI /
-//! Codex / DeepSeek / OpenRouter 等按它接入，换端点只改 `base_url` / `model` /
-//! `api_key_env`。**不做 Chat Completions**——`openai_compatible` / `openai_chat` 这两个
-//! 串在这里一律是 [`LlmBuildError::UnknownProvider`]，免得留下一条没人测的第二路径。
-//! 协议特有的东西在 [`responses`] / [`wire`] 里，新协议是新模块而不是新分支。
+//! 两个生成协议 adapter：OpenAI Chat Completions 与 Responses。二者共用传输与
+//! [`LlmClient`] seam，但请求、流式终态和 provider 回放各自在自己的模块里实现。
 //!
 //! 主模型与记忆模型是**同一个 trait 的两个实例**（§13.3），按各自的 [`ModelConfig`]
 //! 构造；[`RoutingLlm`] 按每个 Run 固定下来的那份配置挑实例，所以配置热重载不会在半路
 //! 换掉正在跑的那个（§3 第 2 步）。
 
+mod chat;
 mod responses;
 mod sse;
 pub mod transport;
@@ -25,20 +22,21 @@ use komo_kernel::traits::{LlmClient, TurnDriver};
 use komo_kernel::types::model::{ModelConfig, ModelRole};
 use komo_kernel::types::turn::{LlmError, TurnRequest};
 
+pub use chat::ChatCompletionsLlm;
 pub use responses::{OpenAiResponsesLlm, SystemPreamble};
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};
 
 use crate::config::{EffortCapabilities, Secrets};
 
 /// 本 crate 认识的生成协议（§13.2）。
-pub const OPENAI_RESPONSES: &str = "openai_responses";
+pub const CHAT_COMPLETIONS: &str = "chat_completions";
+pub const RESPONSES: &str = "responses";
+const LEGACY_OPENAI_RESPONSES: &str = "openai_responses";
 
 /// 构造一个后端时会出的问题。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LlmBuildError {
-    #[error(
-        "不认识 provider `{provider}`：生成协议只有 `{OPENAI_RESPONSES}`（OpenAI Responses API）"
-    )]
+    #[error("不认识 api_backend `{provider}`：生成协议只有 `{CHAT_COMPLETIONS}` 与 `{RESPONSES}`")]
     UnknownProvider { provider: String },
     /// 档位不可用一类——在**请求前**就定得下来的那些（§13.3）。
     #[error(transparent)]
@@ -146,9 +144,23 @@ impl LlmFactory {
         role: ModelRole,
     ) -> Result<Arc<dyn LlmClient>, LlmBuildError> {
         match config.provider.as_str() {
-            OPENAI_RESPONSES => {
+            RESPONSES | LEGACY_OPENAI_RESPONSES => {
                 let key = self.secrets.get(&config.api_key_env).map(str::to_string);
                 let mut client = OpenAiResponsesLlm::new(
+                    config.clone(),
+                    role,
+                    key,
+                    Arc::clone(&self.transport),
+                    self.caps.clone(),
+                )?;
+                if let Some(preamble) = &self.preamble {
+                    client = client.with_preamble(Arc::clone(preamble));
+                }
+                Ok(Arc::new(client))
+            }
+            CHAT_COMPLETIONS => {
+                let key = self.secrets.get(&config.api_key_env).map(str::to_string);
+                let mut client = ChatCompletionsLlm::new(
                     config.clone(),
                     role,
                     key,

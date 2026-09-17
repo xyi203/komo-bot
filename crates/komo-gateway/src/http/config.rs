@@ -5,33 +5,61 @@ use axum::extract::State;
 use komo_kernel::protocol::http::{
     ConfigCheckResponse, ConfigReloadResponse, ModelMenuEntry, ModelsResponse,
 };
+use komo_kernel::types::model::{CatalogModel, ModelConfig};
 
 use super::Api;
-use super::error::ApiResult;
+use super::error::{ApiFailure, ApiResult};
+
+/// 把外部提交的 completion alias 解析成一份完整配置。Session 与 Cron 共用这一条路，
+/// 避免一个按 alias、另一个又退回“只换上游 model id”。
+pub(super) fn completion_model(api: &Api, alias: &str) -> Result<ModelConfig, ApiFailure> {
+    let snapshot = api.state.snapshot();
+    snapshot
+        .model_catalog
+        .completion(alias.trim())
+        .cloned()
+        .ok_or_else(|| {
+            let configured = snapshot
+                .model_catalog
+                .completions()
+                .map(|(alias, _)| alias)
+                .collect::<Vec<_>>()
+                .join(", ");
+            ApiFailure::invalid(format!(
+                "未知 completion 模型 alias `{}`；可选值：{}",
+                alias.trim(),
+                configured
+            ))
+        })
+}
 
 /// `GET /v1/models`：可选模型清单。
 ///
-/// 清单从**当前快照的模型角色**来：主模型，以及独立配置的记忆模型（§13.3——「切换聊天
-/// 模型或 effort 不影响独立配置的记忆模型」，所以它们是两条，不是一条）。每条带自己
-/// 支持的档位；**空表就是"一档都不支持"，不是"还不知道"**——不知道的模型不该出现在
-/// 给人挑的清单里。
+/// 清单来自 `model.<alias>` 目录中的 completion 项。调用者提交的是 alias，不是上游模型
+/// id；这样一次选择会带上该项完整的端点、协议与凭证引用。
 pub async fn models(State(api): State<Api>) -> Json<ModelsResponse> {
     let snapshot = api.state.snapshot();
-    let mut models = vec![entry(&api, &snapshot.model, true)];
-    if snapshot.memory.enabled && snapshot.memory.model.model != snapshot.model.model {
-        models.push(entry(&api, &snapshot.memory.model, false));
-    }
+    let models = snapshot
+        .model_catalog
+        .completions()
+        .map(|(alias, model)| entry(&api, alias, model, alias == snapshot.model_catalog.default))
+        .collect();
     Json(ModelsResponse { models })
 }
 
-fn entry(
-    api: &Api,
-    config: &komo_kernel::types::model::ModelConfig,
-    default: bool,
-) -> ModelMenuEntry {
+fn entry(api: &Api, alias: &str, model: &CatalogModel, default: bool) -> ModelMenuEntry {
+    let config = model.completion().expect("调用方只遍历 completion 目录项");
+    let context_window = match model {
+        CatalogModel::Completion { context_window, .. } => *context_window,
+        CatalogModel::Embedding { .. } => None,
+    };
     ModelMenuEntry {
-        id: config.model.clone(),
-        provider: config.provider.clone(),
+        id: alias.to_string(),
+        name: model.name().to_string(),
+        model: config.model.clone(),
+        provider: model.model_provider().unwrap_or("standalone").to_string(),
+        api_backend: config.provider.clone(),
+        context_window,
         efforts: config
             .efforts
             .clone()

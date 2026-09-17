@@ -79,7 +79,7 @@ pub struct ServiceOptions {
     pub channels: Vec<Arc<dyn ChannelFactory>>,
     /// 测试注入的模型后端。
     pub llm: Option<Arc<dyn LlmClient>>,
-    /// 测试注入的向量后端；`None` = 按 `[memory.embedding]` 造。
+    /// 测试注入的向量后端；`None` = 按 `memory.embedding` alias 造。
     pub embeddings: Option<Arc<dyn komo_kernel::traits::EmbeddingClient>>,
 }
 

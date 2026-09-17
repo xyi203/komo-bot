@@ -29,8 +29,8 @@ pub use memory::{
     SupersededRef,
 };
 pub use model::{
-    DistanceRule, Effort, EffortSetting, EmbeddingConfig, EmbeddingSpace, InputKind, ModelConfig,
-    ModelRole, TokenUsage, Vector,
+    CatalogModel, DistanceRule, Effort, EffortSetting, EmbeddingConfig, EmbeddingSpace, InputKind,
+    ModelCatalog, ModelConfig, ModelRole, ModelType, TokenUsage, Vector,
 };
 pub use plan::{
     ApprovedPlan, ConsumeIntent, ConsumedApproval, EnvVersion, ExecutionPlan, Operation, PlanHash,

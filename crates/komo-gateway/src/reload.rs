@@ -83,7 +83,8 @@ async fn announce_recovered(state: &Arc<GatewayState>) {
 async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) {
     if changed.iter().any(|key| {
         let key = key.as_str();
-        key.starts_with("model.")
+        key.starts_with("model_catalog.")
+            || key.starts_with("model.")
             || key.starts_with("memory.model")
             || key.starts_with("credentials.")
     }) {

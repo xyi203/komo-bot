@@ -15,6 +15,38 @@ fn daily(prompt: &str) -> serde_json::Value {
     })
 }
 
+#[tokio::test]
+async fn model_menu_and_job_selection_use_catalog_aliases() {
+    let home = Home::new();
+    let gw = home
+        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+
+    let (status, body) = gw.get("/v1/models").await;
+    assert_eq!(status, 200, "{body}");
+    let menu: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(menu["models"][0]["id"], "job");
+    assert_eq!(menu["models"][0]["model"], "job-model");
+    assert_eq!(menu["models"][0]["provider"], "standalone");
+    assert_eq!(menu["models"][0]["api_backend"], "responses");
+    assert_eq!(menu["models"][1]["id"], "main");
+    assert_eq!(menu["models"][1]["default"], true);
+
+    let (status, body) = gw
+        .post(
+            "/v1/cron",
+            serde_json::json!({
+                "name": "x", "schedule": "0 9 * * *", "timezone": "UTC", "prompt": "p",
+                "model": "not-configured",
+            }),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("job") && body.contains("main"), "{body}");
+
+    gw.stop().await;
+}
+
 /// §10 的字段表**全部**过得去一次 `POST /v1/cron`，并且原样读得回来。
 ///
 /// 一个写得进去但读不回来的字段，最坏的形态是 03:00 才发现——那时人已经走了。
@@ -33,7 +65,7 @@ async fn every_field_in_the_job_definition_round_trips() {
             "timezone": "Asia/Shanghai",
             "prompt": "搜索今天关注的技术动态，整理后保存到 Memos",
             "workdir": workdir.display().to_string(),
-            "model": "job-model",
+            "model": "job",
             "effort": "high",
             "skills": ["memos", "search"],
             "overlap": "allow",
@@ -75,15 +107,16 @@ async fn a_model_override_is_a_whole_config_and_leaves_memory_alone() {
     let job = gw
         .add_job(serde_json::json!({
             "name": "x", "schedule": "0 9 * * *", "timezone": "UTC", "prompt": "p",
-            "model": "job-model",
+            "model": "job",
         }))
         .await;
 
-    // 一份**完整**配置：端点与凭证变量名是主模型那一份，模型名是 Job 的。
+    // alias 解析成一份**完整**配置；不是在主模型配置上只换上游 model id。
     let model = job.model.expect("有模型覆盖");
     let main = gw.state().snapshot().model.clone();
     assert_eq!(model.model, "job-model");
-    assert_eq!(model.base_url, main.base_url);
+    assert_eq!(model.base_url, "https://jobs.example.com/v1");
+    assert_ne!(model.base_url, main.base_url);
     assert_eq!(model.provider, main.provider);
     assert_eq!(model.api_key_env, main.api_key_env);
 

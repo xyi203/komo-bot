@@ -83,20 +83,34 @@ impl EffortCapabilities {
 
     /// 内建声明。
     ///
-    /// - `openai_responses`：生成协议是 Responses API（§13.2），effort 落在
-    ///   `reasoning.effort` 上，档位 `none`（gpt-5.1 起）/ `minimal` / `low` /
-    ///   `medium` / `high`。
+    /// - `responses` 与 `chat_completions` 都支持常见 effort 档位；具体模型可用
+    ///   `efforts` 进一步收窄。
     /// - `deepseek-*` 模型：`none / low / high / max`，没有 `medium`。
     /// - 向量后端（下面那张表）：`/embeddings` 与 `/api/embed` 都没有 effort 参数。
     pub fn builtin() -> Self {
         EffortCapabilities {
-            providers: BTreeMap::from([(
-                "openai_responses".to_string(),
-                EffortSupport::new(["none", "minimal", "low", "medium", "high"]),
-            )]),
+            providers: BTreeMap::from([
+                (
+                    crate::llm::RESPONSES.to_string(),
+                    EffortSupport::new(["none", "minimal", "low", "medium", "high"]),
+                ),
+                (
+                    "openai_responses".to_string(),
+                    EffortSupport::new(["none", "minimal", "low", "medium", "high"]),
+                ),
+                (
+                    crate::llm::CHAT_COMPLETIONS.to_string(),
+                    EffortSupport::new(["none", "minimal", "low", "medium", "high"]),
+                ),
+            ]),
             // 两个实现了的向量后端（`/embeddings` 与 `/api/embed`）都没有 effort 参数。
             embedding_providers: BTreeMap::from([
+                (
+                    crate::embedding::OPENAI_COMPATIBLE.to_string(),
+                    EffortSupport::none(),
+                ),
                 ("openai_compatible".to_string(), EffortSupport::none()),
+                (crate::embedding::OLLAMA.to_string(), EffortSupport::none()),
                 ("ollama".to_string(), EffortSupport::none()),
             ]),
             model_prefixes: vec![(

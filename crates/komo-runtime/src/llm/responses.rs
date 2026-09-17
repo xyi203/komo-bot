@@ -177,9 +177,9 @@ fn replay(messages: &[ReplayMessage]) -> Vec<Value> {
             Role::Assistant => match &message.provider_blocks {
                 // 一轮的全部 output items。
                 Some(Value::Array(items)) => input.extend(items.iter().cloned()),
-                // 单个 item 也收（旧记录或别的写法）。
-                Some(other) => input.push(other.clone()),
-                None => {
+                // Chat Completions 的原生 assistant message 不能送进 Responses；跨协议
+                // 切模型时从规范化的正文和调用记录重建。
+                Some(_) | None => {
                     if let Some(text) = &message.text
                         && !text.is_empty()
                     {

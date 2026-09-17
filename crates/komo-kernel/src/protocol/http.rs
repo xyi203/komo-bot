@@ -675,10 +675,23 @@ pub struct MemoryRef {
 // ---- GET /v1/models ----
 
 /// 可选模型清单里的一项。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelMenuEntry {
+    /// 配置目录 alias；提交 Run / Cron 时使用它。
     pub id: String,
+    /// 面向人的显示名；省略时等于 alias。
+    #[serde(default)]
+    pub name: String,
+    /// 上游服务使用的真实 model id。
+    #[serde(default)]
+    pub model: String,
+    /// 连接默认值来自哪个 `model_providers.<name>`；独立配置时为 `standalone`。
     pub provider: String,
+    /// 实际协议适配器，如 `responses` / `chat_completions`。
+    #[serde(default)]
+    pub api_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     /// 这个模型支持的档位。**空表就是"一档都不支持"**，不是"还不知道"——不知道的模型
     /// 不该出现在给人挑的清单里（§13.3「能力未知……无法确定时拒绝该显式参数」）。
     #[serde(default)]

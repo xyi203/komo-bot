@@ -25,9 +25,9 @@ pub use ollama::OllamaEmbeddings;
 pub use openai::OpenAiEmbeddings;
 
 /// OpenAI 兼容的 `/embeddings`。
-pub const OPENAI_COMPATIBLE: &str = "openai_compatible";
+pub const OPENAI_COMPATIBLE: &str = "embeddings";
 /// Ollama 的 `/api/embed`。
-pub const OLLAMA: &str = "ollama";
+pub const OLLAMA: &str = "ollama_embeddings";
 
 /// 文本预处理的版本号。改了预处理就要改它——同一段文本经不同预处理得到的向量不在
 /// 一个空间里（§9.5）。
@@ -41,7 +41,7 @@ pub enum EmbeddingBuildError {
     #[error("不认识的向量 provider `{provider}`：首版接入 `{OPENAI_COMPATIBLE}` 与 `{OLLAMA}`")]
     UnknownProvider { provider: String },
     /// §13.3：普通向量接口没有 effort 参数时必须省略。
-    #[error("模型 {model} 的向量接口没有 effort 参数，请去掉 `memory.embedding.effort`")]
+    #[error("模型 {model} 的向量接口没有 effort 参数，请去掉对应 `model.<alias>.effort`")]
     EffortNotSupported { model: String },
     #[error(transparent)]
     Embed(#[from] EmbedError),
@@ -75,13 +75,13 @@ fn build_with(
     let key = secrets.get(&config.model.api_key_env).map(str::to_string);
     let space = space_for(config, dimensions);
     match config.model.provider.as_str() {
-        OPENAI_COMPATIBLE => Ok(Arc::new(OpenAiEmbeddings::new(
+        OPENAI_COMPATIBLE | "openai_compatible" => Ok(Arc::new(OpenAiEmbeddings::new(
             config.clone(),
             space,
             key,
             transport,
         ))),
-        OLLAMA => Ok(Arc::new(OllamaEmbeddings::new(
+        OLLAMA | "ollama" => Ok(Arc::new(OllamaEmbeddings::new(
             config.clone(),
             space,
             key,

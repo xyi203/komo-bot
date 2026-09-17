@@ -1,5 +1,6 @@
 //! 模型角色、effort 与向量空间（§13.3、§9.5）。
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -21,10 +22,127 @@ pub enum ModelRole {
 impl ModelRole {
     pub fn as_str(self) -> &'static str {
         match self {
-            ModelRole::Main => "model",
+            ModelRole::Main => "models.default",
             ModelRole::Memory => "memory.model",
             ModelRole::Embedding => "memory.embedding",
         }
+    }
+}
+
+/// 配置目录里一项模型的用途。用途与线上的具体协议是两件事：生成模型可以走
+/// Chat Completions 或 Responses，向量模型可以走 OpenAI `/embeddings` 或 Ollama
+/// `/api/embed`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelType {
+    Completion,
+    Embedding,
+}
+
+/// 模型目录里的一项。配置文件里的 provider 继承已经在进入快照前解析完；运行时拿到
+/// 的永远是完整配置，不需要再知道继承规则。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CatalogModel {
+    Completion {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
+        config: ModelConfig,
+    },
+    Embedding {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_provider: Option<String>,
+        config: EmbeddingConfig,
+    },
+}
+
+impl CatalogModel {
+    pub fn model_type(&self) -> ModelType {
+        match self {
+            CatalogModel::Completion { .. } => ModelType::Completion,
+            CatalogModel::Embedding { .. } => ModelType::Embedding,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            CatalogModel::Completion { name, .. } | CatalogModel::Embedding { name, .. } => name,
+        }
+    }
+
+    pub fn model_provider(&self) -> Option<&str> {
+        match self {
+            CatalogModel::Completion { model_provider, .. }
+            | CatalogModel::Embedding { model_provider, .. } => model_provider.as_deref(),
+        }
+    }
+
+    pub fn common(&self) -> &ModelConfig {
+        match self {
+            CatalogModel::Completion { config, .. } => config,
+            CatalogModel::Embedding { config, .. } => &config.model,
+        }
+    }
+
+    pub fn completion(&self) -> Option<&ModelConfig> {
+        match self {
+            CatalogModel::Completion { config, .. } => Some(config),
+            CatalogModel::Embedding { .. } => None,
+        }
+    }
+
+    pub fn embedding(&self) -> Option<&EmbeddingConfig> {
+        match self {
+            CatalogModel::Completion { .. } => None,
+            CatalogModel::Embedding { config, .. } => Some(config),
+        }
+    }
+}
+
+/// `model.<alias>` 的完整目录，以及 `[models].default` 指向的默认生成模型。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalog {
+    pub default: String,
+    #[serde(default)]
+    pub entries: BTreeMap<String, CatalogModel>,
+}
+
+impl ModelCatalog {
+    pub fn get(&self, alias: &str) -> Option<&CatalogModel> {
+        self.entries.get(alias)
+    }
+
+    pub fn completion(&self, alias: &str) -> Option<&ModelConfig> {
+        self.get(alias).and_then(CatalogModel::completion)
+    }
+
+    pub fn completion_mut(&mut self, alias: &str) -> Option<&mut ModelConfig> {
+        match self.entries.get_mut(alias) {
+            Some(CatalogModel::Completion { config, .. }) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn embedding(&self, alias: &str) -> Option<&EmbeddingConfig> {
+        self.get(alias).and_then(CatalogModel::embedding)
+    }
+
+    pub fn embedding_mut(&mut self, alias: &str) -> Option<&mut EmbeddingConfig> {
+        match self.entries.get_mut(alias) {
+            Some(CatalogModel::Embedding { config, .. }) => Some(config),
+            _ => None,
+        }
+    }
+
+    pub fn completions(&self) -> impl Iterator<Item = (&str, &CatalogModel)> {
+        self.entries
+            .iter()
+            .filter(|(_, model)| model.model_type() == ModelType::Completion)
+            .map(|(alias, model)| (alias.as_str(), model))
     }
 }
 

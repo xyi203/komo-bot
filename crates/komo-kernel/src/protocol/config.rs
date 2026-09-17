@@ -23,7 +23,7 @@ use crate::policy::RuleTable;
 use crate::types::chat::{ChannelPlatform, PeerId};
 use crate::types::digest::ContentHash;
 use crate::types::memory::RetrievalMode;
-use crate::types::model::{EmbeddingConfig, ModelConfig};
+use crate::types::model::{EmbeddingConfig, ModelCatalog, ModelConfig};
 
 /// 一个配置键的路径，例如 `channels.feishu.allow_from`。**只有键名，没有值。**
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -214,6 +214,9 @@ pub struct SourceFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub start_only: StartOnly,
+    /// `model.<alias>` 解析后的完整模型目录。运行时按 alias 选择，不在调用处拼接端点。
+    #[serde(default)]
+    pub model_catalog: ModelCatalog,
     pub model: ModelConfig,
     pub memory: MemoryConfig,
     pub channels: ChannelsConfig,
@@ -321,6 +324,7 @@ mod tests {
                 db_path: PathBuf::from("/home/u/.komo/state.db"),
                 python_env_root: PathBuf::from("/home/u/.komo/python-envs"),
             },
+            model_catalog: ModelCatalog::default(),
             model: model("chat-a"),
             memory: MemoryConfig {
                 enabled: true,

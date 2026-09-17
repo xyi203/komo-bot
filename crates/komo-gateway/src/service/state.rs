@@ -261,7 +261,7 @@ pub struct Assembly {
     pub token: String,
     /// 测试注入的模型后端；`None` = 按配置造。
     pub llm: Option<Arc<dyn LlmClient>>,
-    /// 测试注入的向量后端；`None` = 按 `[memory.embedding]` 造（造不出来就只有关键词臂）。
+    /// 测试注入的向量后端；`None` = 按 `memory.embedding` alias 造（造不出来就只有关键词臂）。
     pub embeddings: Option<Arc<dyn EmbeddingClient>>,
     pub tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
     /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
@@ -966,7 +966,7 @@ fn llm_for_memory(
     }
 }
 
-/// 按 `[memory.embedding]` 造向量后端。
+/// 按 `memory.embedding` alias 解析后的完整配置造向量后端。
 ///
 /// **端点这一刻不通不该让 Gateway 起不来**：没有向量客户端时 hybrid 会如实降级并说明
 /// 原因（§9.4），这比一个起不来的进程强。配了 `dimensions` 就不碰网络；省略时要探一次

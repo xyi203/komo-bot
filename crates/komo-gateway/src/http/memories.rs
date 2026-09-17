@@ -194,7 +194,7 @@ fn memory_failure(error: MemoryError) -> ApiFailure {
             )],
         ),
         MemoryError::VectorUnconfigured => ApiFailure::config_invalid(
-            "检索模式要向量，但没有配置 `[memory.embedding]`：要么补上，要么把 \
+            "检索模式要向量，但没有配置 `memory.embedding` alias：要么补上，要么把 \
              memory.retrieval.mode 明确设成 \"keyword\"",
             vec![komo_kernel::protocol::config::KeyPath::new(
                 "memory.embedding",

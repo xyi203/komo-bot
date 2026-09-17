@@ -25,6 +25,62 @@ fn a_valid_directory_loads_into_a_snapshot() {
         vec![komo_kernel::types::chat::PeerId::new("ou_operator")]
     );
     assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+    let chat = loaded.snapshot.model_catalog.get("chat").unwrap();
+    assert_eq!(chat.model_provider(), Some("openrouter"));
+    assert_eq!(
+        chat.completion().unwrap().base_url,
+        "https://llm.example.com/v1"
+    );
+}
+
+#[test]
+fn a_model_overrides_its_providers_connection_defaults_as_one_unit() {
+    let fixture = Fixture::valid();
+    let text = Fixture::config_text("chat-a", "medium").replacen(
+        "model_provider = \"openrouter\"\neffort = \"medium\"",
+        "model_provider = \"openrouter\"\n\
+         base_url = \"https://special.example.com/v1/\"\n\
+         api_backend = \"chat_completions\"\n\
+         env_key = \"SPECIAL_API_KEY\"\n\
+         effort = \"medium\"",
+        1,
+    );
+    write(&fixture.sources().config, &text);
+    write(
+        &fixture.sources().env,
+        &format!("{}SPECIAL_API_KEY=special\n", Fixture::env_text()),
+    );
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    let chat = loaded.snapshot.model_catalog.completion("chat").unwrap();
+    assert_eq!(chat.base_url, "https://special.example.com/v1");
+    assert_eq!(chat.provider, "chat_completions");
+    assert_eq!(chat.api_key_env, "SPECIAL_API_KEY");
+    assert_eq!(loaded.snapshot.model, *chat);
+}
+
+#[test]
+fn role_aliases_must_point_at_the_right_model_type() {
+    let fixture = Fixture::valid();
+    let text = Fixture::config_text("chat-a", "medium")
+        .replace("default = \"chat\"", "default = \"embedding\"");
+    write(&fixture.sources().config, &text);
+    let error = load_config(&fixture.options()).unwrap_err();
+    let ConfigError::Missing { key, .. } = error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(key.as_str(), "models.default");
+
+    let text = Fixture::config_text("chat-a", "medium").replace(
+        "model = \"memory\"\nembedding",
+        "model = \"embedding\"\nembedding",
+    );
+    write(&fixture.sources().config, &text);
+    let error = load_config(&fixture.options()).unwrap_err();
+    let ConfigError::Missing { key, .. } = error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(key.as_str(), "memory.model");
 }
 
 #[test]
@@ -54,15 +110,8 @@ fn paths_default_under_the_data_directory_and_resolve_relative_to_the_config_fil
 fn an_omitted_memory_model_inherits_the_whole_main_model_including_effort() {
     let fixture = Fixture::valid();
     let text = Fixture::config_text("chat-a", "medium");
-    // 把 [memory.model] 整段去掉。
-    let trimmed: String = text
-        .replace(
-            "[memory.model]\nprovider = \"openai_responses\"\n\
-             base_url = \"https://memory-llm.example.com/v1\"\n\
-             model = \"memory-a\"\napi_key_env = \"KOMO_MEMORY_API_KEY\"\neffort = \"low\"\n",
-            "",
-        )
-        .to_string();
+    // 去掉 memory.model alias，便继承 [models].default。
+    let trimmed = text.replace("model = \"memory\"\n", "");
     write(&fixture.sources().config, &trimmed);
 
     let loaded = load_config(&fixture.options()).unwrap();
@@ -100,7 +149,7 @@ fn a_bad_effort_refuses_the_whole_load_and_points_at_the_key() {
     let error = load_config(&fixture.options()).unwrap_err();
     let issues = error.issues();
     assert_eq!(issues.len(), 1, "{issues:?}");
-    assert_eq!(issues[0].key.as_str(), "model.effort");
+    assert_eq!(issues[0].key.as_str(), "model.chat.effort");
     assert!(issues[0].message.contains("ultra"), "{:?}", issues[0]);
 }
 
@@ -113,7 +162,14 @@ fn a_missing_credential_variable_refuses_the_load() {
     );
     let error = load_config(&fixture.options()).unwrap_err();
     let keys: Vec<&str> = error.issues().iter().map(|i| i.key.as_str()).collect();
-    assert!(keys.contains(&"model.api_key_env"), "{keys:?}");
+    assert_eq!(
+        keys,
+        vec![
+            "model.chat.api_key_env",
+            "model.embedding.api_key_env",
+            "model.memory.api_key_env"
+        ]
+    );
 }
 
 #[test]
@@ -149,7 +205,7 @@ fn a_config_without_a_model_section_says_which_key_is_missing() {
     let ConfigError::Missing { key, .. } = &error else {
         panic!("{error:?}")
     };
-    assert_eq!(key.as_str(), "model");
+    assert_eq!(key.as_str(), "models");
 }
 
 /// §3：重载日志「只出键名，凭证更不带」。这条断言把它钉在**所有**对外结构上。

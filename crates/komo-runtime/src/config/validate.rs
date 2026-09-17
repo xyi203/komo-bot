@@ -12,7 +12,7 @@ use komo_kernel::protocol::config::{
 };
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
 use komo_kernel::types::memory::RetrievalMode;
-use komo_kernel::types::model::ModelConfig;
+use komo_kernel::types::model::{CatalogModel, EmbeddingConfig, ModelConfig};
 
 use super::effort::EffortCapabilities;
 use super::file::channel_credentials;
@@ -31,25 +31,44 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
     let mut issues = Vec::new();
 
     check_start_only(snapshot, &mut issues);
-    check_model(
-        &snapshot.model,
-        "model",
-        Role::Chat,
-        snapshot,
-        caps,
-        &mut issues,
-    );
+    for (alias, model) in &snapshot.model_catalog.entries {
+        let key = format!("model.{alias}");
+        if alias.trim().is_empty() {
+            issues.push(error("model", "模型 alias 不能为空"));
+        }
+        if model.name().trim().is_empty() {
+            issues.push(error(&format!("{key}.name"), "显示名不能为空"));
+        }
+        match model {
+            CatalogModel::Completion {
+                config,
+                context_window,
+                ..
+            } => {
+                check_model(config, &key, Role::Chat, snapshot, caps, &mut issues);
+                if *context_window == Some(0) {
+                    issues.push(error(
+                        &format!("{key}.context_window"),
+                        "context_window 不能是 0",
+                    ));
+                }
+            }
+            CatalogModel::Embedding { config, .. } => {
+                check_model(
+                    &config.model,
+                    &key,
+                    Role::Embedding,
+                    snapshot,
+                    caps,
+                    &mut issues,
+                );
+                check_embedding_options(config, &key, &mut issues);
+            }
+        }
+    }
 
     if snapshot.memory.enabled {
-        check_model(
-            &snapshot.memory.model,
-            "memory.model",
-            Role::Chat,
-            snapshot,
-            caps,
-            &mut issues,
-        );
-        check_embedding(snapshot, caps, &mut issues);
+        check_memory_embedding(snapshot, &mut issues);
         check_retrieval(snapshot, &mut issues);
     }
 
@@ -123,12 +142,13 @@ fn check_model(
         Role::Embedding => caps.knows_embedding_provider(provider),
     };
     if provider.is_empty() {
-        issues.push(error(&format!("{key}.provider"), "provider 不能为空"));
+        issues.push(error(&format!("{key}.api_backend"), "api_backend 不能为空"));
     } else if !known {
         let expected = match role {
             Role::Chat => format!(
-                "生成协议只有 `{}`（OpenAI Responses API）",
-                crate::llm::OPENAI_RESPONSES
+                "生成协议只有 `{}` 与 `{}`",
+                crate::llm::CHAT_COMPLETIONS,
+                crate::llm::RESPONSES,
             ),
             Role::Embedding => format!(
                 "向量后端只有 `{}` 与 `{}`",
@@ -137,8 +157,8 @@ fn check_model(
             ),
         };
         issues.push(error(
-            &format!("{key}.provider"),
-            format!("不认识 provider `{provider}`：{expected}"),
+            &format!("{key}.api_backend"),
+            format!("不认识 api_backend `{provider}`：{expected}"),
         ));
     }
     check_base_url(&model.base_url, &format!("{key}.base_url"), issues);
@@ -192,18 +212,14 @@ fn check_base_url(base_url: &str, key: &str, issues: &mut Vec<ConfigIssue>) {
     }
 }
 
-fn check_embedding(
-    snapshot: &ConfigSnapshot,
-    caps: &EffortCapabilities,
-    issues: &mut Vec<ConfigIssue>,
-) {
-    let Some(embedding) = &snapshot.memory.embedding else {
+fn check_memory_embedding(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    let Some(_embedding) = &snapshot.memory.embedding else {
         // §13.3：「embedding 必须独立指定；若明确选择 keyword 模式，可以不配置」。
         if snapshot.memory.retrieval.mode != RetrievalMode::Keyword {
             issues.push(error(
                 "memory.embedding",
                 format!(
-                    "检索模式是 {:?} 却没有 [memory.embedding]；要么补上，要么把 \
+                    "检索模式是 {:?} 却没有 memory.embedding alias；要么补上，要么把 \
                      memory.retrieval.mode 明确设成 \"keyword\"",
                     snapshot.memory.retrieval.mode
                 ),
@@ -211,20 +227,13 @@ fn check_embedding(
         }
         return;
     };
+}
 
-    check_model(
-        &embedding.model,
-        "memory.embedding",
-        Role::Embedding,
-        snapshot,
-        caps,
-        issues,
-    );
-
+fn check_embedding_options(embedding: &EmbeddingConfig, key: &str, issues: &mut Vec<ConfigIssue>) {
     match embedding.dimensions {
-        Some(0) => issues.push(error("memory.embedding.dimensions", "维度不能是 0")),
+        Some(0) => issues.push(error(&format!("{key}.dimensions"), "维度不能是 0")),
         Some(dimensions) if dimensions > MAX_DIMENSIONS => issues.push(error(
-            "memory.embedding.dimensions",
+            &format!("{key}.dimensions"),
             format!("维度 {dimensions} 超出可信范围（1..={MAX_DIMENSIONS}）"),
         )),
         // 省略时用模型返回的维度，校验后固定到索引代次（§9.5）——这是允许的。
@@ -237,7 +246,7 @@ fn check_embedding(
         .is_some_and(|r| r.trim().is_empty())
     {
         issues.push(error(
-            "memory.embedding.revision",
+            &format!("{key}.revision"),
             "写了 revision 就要写一个非空的版本标识；不写就整行去掉",
         ));
     }
@@ -416,12 +425,14 @@ mod tests {
     #[test]
     fn an_unknown_provider_is_reported_at_the_provider_key_not_at_effort() {
         let mut snapshot = snapshot_fixture();
-        snapshot.model.provider = "chat_completions".into();
-        snapshot.model.effort = Some(Effort::new("medium"));
+        let model = snapshot.model_catalog.completion_mut("chat").unwrap();
+        model.provider = "unknown_chat_api".into();
+        model.effort = Some(Effort::new("medium"));
         let issues = validate(&snapshot);
-        assert_eq!(keys(&issues), vec!["model.provider"]);
+        assert_eq!(keys(&issues), vec!["model.chat.api_backend"]);
         assert!(
-            issues[0].message.contains("openai_responses"),
+            issues[0].message.contains("chat_completions")
+                && issues[0].message.contains("responses"),
             "{}",
             issues[0].message
         );
@@ -430,9 +441,13 @@ mod tests {
     #[test]
     fn an_unsupported_effort_is_an_error_located_at_its_key() {
         let mut snapshot = snapshot_fixture();
-        snapshot.model.effort = Some(Effort::new("ultra"));
+        snapshot
+            .model_catalog
+            .completion_mut("chat")
+            .unwrap()
+            .effort = Some(Effort::new("ultra"));
         let issues = validate(&snapshot);
-        assert_eq!(keys(&issues), vec!["model.effort"]);
+        assert_eq!(keys(&issues), vec!["model.chat.effort"]);
         assert_eq!(issues[0].severity, IssueSeverity::Error);
         assert!(issues[0].message.contains("ultra"), "{:?}", issues[0]);
     }
@@ -440,21 +455,30 @@ mod tests {
     #[test]
     fn a_missing_credential_variable_is_located_at_the_role_that_names_it() {
         let mut snapshot = snapshot_fixture();
-        snapshot.memory.model.api_key_env = "KOMO_NOT_IN_ENV".into();
+        snapshot
+            .model_catalog
+            .completion_mut("memory")
+            .unwrap()
+            .api_key_env = "KOMO_NOT_IN_ENV".into();
         let issues = validate(&snapshot);
-        assert_eq!(keys(&issues), vec!["memory.model.api_key_env"]);
+        assert_eq!(keys(&issues), vec!["model.memory.api_key_env"]);
     }
 
     #[test]
     fn every_broken_key_is_reported_in_one_pass() {
         let mut snapshot = snapshot_fixture();
-        snapshot.model.effort = Some(Effort::new("ultra"));
-        snapshot.model.base_url = "llm.example.com".into();
+        let model = snapshot.model_catalog.completion_mut("chat").unwrap();
+        model.effort = Some(Effort::new("ultra"));
+        model.base_url = "llm.example.com".into();
         snapshot.start_only.listen = "nowhere".into();
         let issues = validate(&snapshot);
         assert_eq!(
             keys(&issues),
-            vec!["model.base_url", "model.effort", "start_only.listen"]
+            vec![
+                "model.chat.base_url",
+                "model.chat.effort",
+                "start_only.listen"
+            ]
         );
     }
 
@@ -514,13 +538,13 @@ mod tests {
     /// 支持这一档**。
     #[test]
     fn a_vector_interface_without_an_effort_parameter_refuses_one() {
-        for provider in ["ollama", "openai_compatible"] {
+        for provider in ["ollama_embeddings", "embeddings"] {
             let mut snapshot = snapshot_fixture();
-            let embedding = snapshot.memory.embedding.as_mut().unwrap();
+            let embedding = snapshot.model_catalog.embedding_mut("embedding").unwrap();
             embedding.model.provider = provider.into();
             embedding.model.effort = Some(Effort::new("low"));
             let issues = validate(&snapshot);
-            assert_eq!(keys(&issues), vec!["memory.embedding.effort"], "{provider}");
+            assert_eq!(keys(&issues), vec!["model.embedding.effort"], "{provider}");
             assert!(
                 issues[0].message.contains("没有 effort 参数"),
                 "{:?}",
@@ -532,10 +556,14 @@ mod tests {
     #[test]
     fn a_nonsense_dimension_is_refused_before_the_index_is_built() {
         let mut snapshot = snapshot_fixture();
-        snapshot.memory.embedding.as_mut().unwrap().dimensions = Some(0);
+        snapshot
+            .model_catalog
+            .embedding_mut("embedding")
+            .unwrap()
+            .dimensions = Some(0);
         assert_eq!(
             keys(&validate(&snapshot)),
-            vec!["memory.embedding.dimensions"]
+            vec!["model.embedding.dimensions"]
         );
     }
 

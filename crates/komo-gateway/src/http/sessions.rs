@@ -192,10 +192,11 @@ fn model_override(
     if model.is_none() && effort.is_none() {
         return Ok(None);
     }
-    let mut config = api.state.snapshot().model.clone();
-    if let Some(name) = model {
-        config.model = name.trim().to_string();
-    }
+    let snapshot = api.state.snapshot();
+    let mut config = match model {
+        Some(alias) => super::config::completion_model(api, alias)?,
+        None => snapshot.model.clone(),
+    };
     if let Some(effort) = effort {
         config.effort = Some(effort.clone());
     }

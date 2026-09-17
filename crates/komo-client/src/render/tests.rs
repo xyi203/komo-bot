@@ -593,12 +593,14 @@ fn a_model_list_says_which_efforts_each_model_takes() {
                 provider: "openai_compatible".into(),
                 efforts: vec![Effort::new("low"), Effort::new("high")],
                 default: true,
+                ..ModelMenuEntry::default()
             },
             ModelMenuEntry {
                 id: "chat-b".into(),
                 provider: "anthropic".into(),
                 efforts: vec![],
                 default: false,
+                ..ModelMenuEntry::default()
             },
         ],
     });

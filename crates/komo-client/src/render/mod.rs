@@ -6,12 +6,12 @@
 //! 一条贯穿的规矩：**不知道就说不知道**。`??` 是 uncertain 的记号（§8.6：副作用是否
 //! 发生未知，不能在这里假装失败），`allowed by …` 只在真的拿到那条审批记录时才印。
 
-use komo_kernel::cron::{CronJob, JobStatus, OverlapPolicy, Trigger};
+use komo_kernel::cron::{FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, Trigger};
 use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
     ApprovalListResponse, ApprovalRecord, ConfigCheckResponse, ConfigReloadResponse,
-    HealthResponse, IndexState, MemoryIndexStatus, MemoryListResponse, ModelsResponse, RunDetail,
-    SessionListResponse, SessionSummary, ToolCallSummary,
+    CronListResponse, HealthResponse, IndexState, MemoryIndexStatus, MemoryListResponse,
+    ModelsResponse, RunDetail, SessionListResponse, SessionSummary, ToolCallSummary,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
@@ -273,20 +273,24 @@ fn flatten(line: &ratatui::text::Line<'_>) -> String {
 }
 
 /// `komo cron list`。
-pub fn cron_list(jobs: &[CronJob], now: OffsetDateTime) -> String {
-    if jobs.is_empty() {
+///
+/// 每一行是"这个 Job 是什么"，下一行是"它上一次怎么样了"——§10 的
+/// 「Cron 的结果去原 Session 查看」需要先知道有没有结果、是哪一个 Session。
+pub fn cron_list(response: &CronListResponse, now: OffsetDateTime) -> String {
+    if response.jobs.is_empty() {
         return "没有定时任务".into();
     }
     let mut out = vec![format!(
-        "{:<38} {:<10} {:<8} {:<22} {}",
-        "JOB", "状态", "重叠", "下次", "名称 / 触发"
+        "{:<38} {:<10} {:<8} {:<8} {:<22} {}",
+        "JOB", "状态", "重叠", "投递", "下次", "名称 / 触发"
     )];
-    for job in jobs {
+    for job in &response.jobs {
         out.push(format!(
-            "{:<38} {:<10} {:<8} {:<22} {} · {}",
+            "{:<38} {:<10} {:<8} {:<8} {:<22} {} · {}",
             job.id,
             job_status(job.status),
             overlap(job.overlap),
+            notify(job.notify),
             match job.next_run_at {
                 Some(next) => format!("{} ({})", stamp(next), relative(next, now)),
                 None => "—".into(),
@@ -294,12 +298,51 @@ pub fn cron_list(jobs: &[CronJob], now: OffsetDateTime) -> String {
             job.name,
             trigger(&job.trigger)
         ));
+        if let Some(last) = response
+            .status
+            .iter()
+            .find(|status| status.job == job.id)
+            .and_then(|status| status.last.as_ref())
+        {
+            // 「更新本次触发状态」（§10）：ok / error / waiting / skipped 都要看得见，
+            // 否则一个天天被跳过的 Job 和一个天天跑成的 Job 长得一样。
+            let mut line = format!(
+                "  上次 {} · {}",
+                stamp(last.scheduled_at),
+                firing_status(last.status)
+            );
+            if let Some(session) = &last.session {
+                line.push_str(&format!(" · 会话 {session}"));
+            }
+            if let Some(error) = &last.error {
+                line.push_str(&format!(" · {error}"));
+            }
+            out.push(line);
+        }
         if let Some(error) = &job.last_error {
             // 一个再也不响的 Job 应当在清单里看得见。
             out.push(format!("  ⚠ {error}"));
         }
     }
     out.join("\n")
+}
+
+fn notify(policy: NotifyPolicy) -> &'static str {
+    match policy {
+        NotifyPolicy::Always => "总是",
+        NotifyPolicy::OnError => "仅出错",
+        NotifyPolicy::Never => "不投",
+    }
+}
+
+fn firing_status(status: FiringStatus) -> &'static str {
+    match status {
+        FiringStatus::Queued => "排队中",
+        FiringStatus::Ok => "ok",
+        FiringStatus::Error => "error",
+        FiringStatus::Waiting => "waiting（在等人）",
+        FiringStatus::Skipped => "skipped",
+    }
 }
 
 fn job_status(status: JobStatus) -> &'static str {
@@ -387,6 +430,13 @@ pub fn memory_show(item: &MemoryItem) -> String {
     ];
     if let Some(until) = item.valid_until {
         out.push(format!("有效期  至 {}", stamp(until)));
+    }
+    // 取代关系是前向链：读到的人手里拿着的正是新的这一条（§9.6）。
+    if let Some(superseded) = &item.supersedes {
+        out.push(format!(
+            "取代      {}@{}",
+            superseded.memory, superseded.revision
+        ));
     }
     out.push(format!(
         "提取    {} / {} / prompt {}",
@@ -700,7 +750,9 @@ fn stale_warning(loaded_at: OffsetDateTime, sources: &[SourceFile]) -> Option<St
 
 // ---- 小工具 ----
 
-fn stamp(at: OffsetDateTime) -> String {
+/// 一个可读的时刻。`komo cron` 那几条回执也印它，所以它是公开的——两处各写一遍
+/// 格式，迟早有一处会和另一处不一样。
+pub fn stamp(at: OffsetDateTime) -> String {
     let format = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
     at.format(&format).unwrap_or_else(|_| at.to_string())
 }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{PolicyContext, PolicyDecision};
 use crate::types::chat::ApprovalScope;
-use crate::types::plan::{ExecutionPlan, Operation, SourceKind};
+use crate::types::plan::{ExecutionPlan, Operation, PlanSource, SourceKind};
 
 /// 一条规则的效果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -270,7 +270,7 @@ impl RuleTable {
         if let Some(rule) = self.first_match(Effect::Ask, plan, ctx) {
             return PolicyDecision::Ask {
                 reason: format!("{}（规则 {}）", rule.reason, rule.id),
-                scopes: normalize_scopes(&rule.scopes),
+                scopes: offered_scopes(&rule.scopes, plan),
             };
         }
 
@@ -307,6 +307,23 @@ impl RuleTable {
             .iter()
             .find(|rule| rule.effect == effect && rule.matcher.matches(plan, ctx))
     }
+}
+
+/// 这条 Ask 实际可以批到哪些范围。
+///
+/// 规则说了算，外加一条**来源**决定的：一个 Cron 来源的计划多一个
+/// [`ApprovalScope::CronJob`]（§7.2 的第三种范围）。它不是凭空多出来的权限——
+/// `GrantScope::CronJob` 绑的是这个 Job 的**这一个版本**加上从这份计划长出来的匹配器
+/// （见 [`crate::policy::scope_for`]），改定义就失效（§10）。
+///
+/// 反过来，`Run` 范围在 Cron 的计划上**照样给**：一次触发就是一个 Run，"这一次触发
+/// 里都算数"是一个说得通、而且比 Job 范围更窄的答复。
+pub(super) fn offered_scopes(scopes: &[ApprovalScope], plan: &ExecutionPlan) -> Vec<ApprovalScope> {
+    let mut out = normalize_scopes(scopes);
+    if matches!(plan.source, PlanSource::Cron { .. }) && !out.contains(&ApprovalScope::CronJob) {
+        out.push(ApprovalScope::CronJob);
+    }
+    out
 }
 
 pub(super) fn normalize_scopes(scopes: &[ApprovalScope]) -> Vec<ApprovalScope> {

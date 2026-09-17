@@ -25,7 +25,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-pub use grants::{Grant, GrantScope};
+pub use grants::{Grant, GrantScope, scope_for};
 pub use rules::{
     Effect, IsolationCapability, Matcher, OperationMatch, PathMatch, PolicyRule, RuleTable,
 };

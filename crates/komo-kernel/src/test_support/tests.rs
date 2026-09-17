@@ -24,6 +24,7 @@ fn accept(session: &SessionId, key: &str, text: &str, clock: &TestClock) -> Acce
         },
         peer: None,
         model: sample_model(),
+        workdir: None,
         at: clock.now(),
     }
 }

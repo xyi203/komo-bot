@@ -531,7 +531,15 @@ pub fn parse_command(text: &str) -> Option<ChatCommand> {
     match name.as_str() {
         "approve" => {
             let short_id = rest.first().and_then(|raw| ShortId::parse(raw));
-            let scope = if rest.iter().any(|word| word.eq_ignore_ascii_case("run")) {
+            // `/approve <id> run` 是 §11.3 那张表里的一行；`cron` 是 §7.2 第三种范围
+            // 的同一个形状——三个渠道的渲染里已经这么写了（`render::*::approval`）。
+            // 认不出来的词一律当**没写**，也就是 `Once`：把一个不认识的词理解成一个
+            // 更宽的范围是最糟的那一种宽容。
+            // TODO(decide: 文档的命令表只写了 `run`。`cron` 的写法是按 `run` 的形状定
+            // 的，等文档收口。)
+            let scope = if rest.iter().any(|word| word.eq_ignore_ascii_case("cron")) {
+                ApprovalScope::CronJob
+            } else if rest.iter().any(|word| word.eq_ignore_ascii_case("run")) {
                 ApprovalScope::Run
             } else {
                 ApprovalScope::Once

@@ -420,6 +420,7 @@ mod tests {
             },
             peer: None,
             model: sample_model(),
+            workdir: None,
             at: TestClock::fixed().now(),
         }
     }

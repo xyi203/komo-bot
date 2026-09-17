@@ -315,6 +315,7 @@ impl World {
                 },
                 peer: None,
                 model: komo_kernel::test_support::sample_model(),
+                workdir: None,
                 at: NOW,
             })
             .await

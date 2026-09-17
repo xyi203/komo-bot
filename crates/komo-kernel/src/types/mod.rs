@@ -26,6 +26,7 @@ pub use ids::{
 pub use memory::{
     Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryItem, MemoryKind, MemoryScope,
     MemoryState, MemoryUsage, MemoryWork, Provenance, RecallQuery, RecallResult, RetrievalMode,
+    SupersededRef,
 };
 pub use model::{
     DistanceRule, Effort, EffortSetting, EmbeddingConfig, EmbeddingSpace, InputKind, ModelConfig,

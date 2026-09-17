@@ -233,6 +233,7 @@ pub struct GatewayBuilder {
     config: String,
     env: String,
     llm: Option<Arc<dyn LlmClient>>,
+    embeddings: Option<Arc<dyn komo_kernel::traits::EmbeddingClient>>,
     factories: Vec<Arc<dyn ChannelFactory>>,
     home: Option<PathBuf>,
 }
@@ -243,6 +244,7 @@ impl GatewayBuilder {
             config: config.to_string(),
             env: DEFAULT_ENV.to_string(),
             llm: None,
+            embeddings: None,
             factories: Vec::new(),
             home: None,
         }
@@ -255,6 +257,12 @@ impl GatewayBuilder {
 
     pub fn llm(mut self, llm: Arc<dyn LlmClient>) -> Self {
         self.llm = Some(llm);
+        self
+    }
+
+    /// 注入向量后端（`tests/memory` 用）。
+    pub fn embeddings(mut self, client: Arc<dyn komo_kernel::traits::EmbeddingClient>) -> Self {
+        self.embeddings = Some(client);
         self
     }
 
@@ -287,6 +295,7 @@ impl GatewayBuilder {
             listen: Some("127.0.0.1:0".into()),
             channels: self.factories.clone(),
             llm: self.llm,
+            embeddings: self.embeddings,
         })
         .await
         .expect("Gateway 起得来");

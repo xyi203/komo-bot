@@ -328,6 +328,85 @@ pub enum OverlapPolicy {
     Allow,
 }
 
+/// 一次触发的结果要不要投给操作者（§10 的 `notify`）。
+///
+/// 它过滤的是**投递**，不是记录：`runs` 里那一条无论如何都写下来，"这个 Job 昨天怎么样
+/// 了"永远答得出。而 `waiting` 那一档**不受它约束**——那是任务在**问**，不是在报告，
+/// 一条没人看见的提问等于这个 Job 从此停在那里。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyPolicy {
+    /// 每次都投。默认。
+    #[default]
+    Always,
+    /// 只在出错时投。
+    OnError,
+    /// 从不投（结果去原 Session 看，§10 最后一条）。
+    Never,
+}
+
+impl NotifyPolicy {
+    /// 这一次触发的结果该不该投出去。
+    ///
+    /// `Waiting` 永远 `true`，理由见类型文档。
+    pub fn delivers(self, status: FiringStatus) -> bool {
+        match status {
+            // 任务在问，不是在报告。
+            FiringStatus::Waiting => true,
+            FiringStatus::Error => self != NotifyPolicy::Never,
+            _ => self == NotifyPolicy::Always,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotifyPolicy::Always => "always",
+            NotifyPolicy::OnError => "on_error",
+            NotifyPolicy::Never => "never",
+        }
+    }
+
+    /// CLI / HTTP 上收到的写法。**不认识就报错**，不静默当默认——打错字的人还在。
+    pub fn parse(raw: &str) -> Option<NotifyPolicy> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "always" => Some(NotifyPolicy::Always),
+            "on_error" | "on-error" => Some(NotifyPolicy::OnError),
+            "never" => Some(NotifyPolicy::Never),
+            _ => None,
+        }
+    }
+}
+
+/// 一次触发跑成了什么样（§10「更新本次触发状态」）。
+///
+/// **跳过也是一种状态**：重叠跳过、这个计划时间已经有记录、错过太久——每一种都要在
+/// `komo cron list` 上看得见，否则一个天天被跳过的 Job 和一个天天跑成的 Job 长得一样。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FiringStatus {
+    /// 已经排进队列，还没有结果。
+    #[default]
+    Queued,
+    Ok,
+    Error,
+    /// 停在等待审批 / 需要操作者处理上——**既不是跑成也不是失败**。
+    Waiting,
+    /// 这一槽没有跑，原因记在 `error` 里。
+    Skipped,
+}
+
+impl FiringStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FiringStatus::Queued => "queued",
+            FiringStatus::Ok => "ok",
+            FiringStatus::Error => "error",
+            FiringStatus::Waiting => "waiting",
+            FiringStatus::Skipped => "skipped",
+        }
+    }
+}
+
 /// Job 的生命周期。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -363,6 +442,9 @@ pub struct CronJob {
     /// 执行预算：最大轮数。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    /// 触发结果要不要投给操作者（§10 的 `notify`）。
+    #[serde(default)]
+    pub notify: NotifyPolicy,
     /// 下一个槽位。`next_occurrence` 算出来的那个。
     #[serde(
         default,
@@ -379,6 +461,40 @@ impl CronJob {
     /// 在 `now` 这一刻该不该触发。
     pub fn is_due(&self, now: OffsetDateTime) -> bool {
         self.status == JobStatus::Active && self.next_run_at.is_some_and(|slot| slot <= now)
+    }
+
+    /// 这个槽位错过得太久了吗——**超过这个 Job 自己的间隔**就不补跑（§10：停机期间
+    /// 错过的触发不集中补跑）。
+    ///
+    /// 间隔是这个触发器自己的：每分钟的 Job 迟到两分钟就没有意义了，每月一次的 Job
+    /// 迟到一天照跑。用"下一槽减这一槽"量它，而不是给一个全局的宽限期——后者对两端的
+    /// Job 一定有一端是错的。
+    ///
+    /// 一次性触发 `@at` **永不过期**：人指定了一个时刻要它跑一次，机器关了三天不是
+    /// 「这件事不用做了」的意思，而它跑完就 `Done`，也不存在补跑一串的问题。
+    // TODO(decide: 文档没有给 `@at` 的迟到上限。这里取「不设限」，理由见上；真要设，
+    // 应当是一个显式的 Job 字段而不是一个藏在这里的常数。)
+    pub fn slot_missed_by_too_much(
+        &self,
+        slot: OffsetDateTime,
+        now: OffsetDateTime,
+        zones: &dyn ZoneResolver,
+    ) -> bool {
+        let Some(interval) = self.own_interval(slot, zones) else {
+            return false;
+        };
+        now - slot > interval
+    }
+
+    /// 这个触发器自己的间隔：这一槽到下一槽。一次性触发没有间隔。
+    pub fn own_interval(&self, slot: OffsetDateTime, zones: &dyn ZoneResolver) -> Option<Duration> {
+        match &self.trigger {
+            Trigger::At { .. } => None,
+            Trigger::Cron { .. } => next_occurrence(&self.trigger, slot, zones)
+                .ok()
+                .flatten()
+                .map(|next| next - slot),
+        }
     }
 
     /// 重算下一个槽位。算不出来时把 `next_run_at` 清空并把原因写进 `last_error`——一个
@@ -417,6 +533,41 @@ pub struct CronFiring {
     pub session: Option<SessionId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunId>,
+    /// 这一次跑成了什么样。**跳过也是一种状态**，见 [`FiringStatus`]。
+    #[serde(default)]
+    pub status: FiringStatus,
+    /// `Skipped` 的原因，或 `Error` 的错误。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl CronFiring {
+    /// 一条只有触发本身、还没有 Session / Run 的记录。
+    pub fn claimed(job: &CronJob, scheduled_at: OffsetDateTime) -> CronFiring {
+        CronFiring {
+            job: job.id.clone(),
+            job_version: job.version,
+            scheduled_at,
+            prompt: job.prompt.clone(),
+            session: None,
+            run: None,
+            status: FiringStatus::Queued,
+            error: None,
+        }
+    }
+
+    /// 一条"这一槽没有跑"的记录。
+    pub fn skipped(
+        job: &CronJob,
+        scheduled_at: OffsetDateTime,
+        reason: impl Into<String>,
+    ) -> CronFiring {
+        CronFiring {
+            status: FiringStatus::Skipped,
+            error: Some(reason.into()),
+            ..CronFiring::claimed(job, scheduled_at)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -577,6 +728,7 @@ mod tests {
             effort: None,
             skills: vec![],
             max_rounds: None,
+            notify: Default::default(),
             next_run_at: None,
             last_error: None,
         };
@@ -626,6 +778,7 @@ mod tests {
             effort: None,
             skills: vec![],
             max_rounds: None,
+            notify: Default::default(),
             next_run_at: Some(NOW),
             last_error: None,
         };
@@ -648,6 +801,127 @@ mod tests {
             serde_json::from_str::<TimeZone>("\"Asia/Shanghai\"").unwrap(),
             tz
         );
+    }
+
+    /// `notify` 过滤的是**结果**的投递；`waiting` 不受它约束——那是任务在**问**。
+    #[test]
+    fn notify_never_still_lets_a_waiting_firing_reach_the_operator() {
+        use FiringStatus::*;
+        assert!(NotifyPolicy::Always.delivers(Ok));
+        assert!(NotifyPolicy::Always.delivers(Error));
+
+        assert!(!NotifyPolicy::OnError.delivers(Ok));
+        assert!(NotifyPolicy::OnError.delivers(Error));
+
+        assert!(!NotifyPolicy::Never.delivers(Ok));
+        assert!(!NotifyPolicy::Never.delivers(Error));
+
+        // 三档都投：一条没人看见的提问等于这个 Job 从此停在那里。
+        for policy in [
+            NotifyPolicy::Always,
+            NotifyPolicy::OnError,
+            NotifyPolicy::Never,
+        ] {
+            assert!(policy.delivers(Waiting), "{policy:?} 也要投 waiting");
+        }
+    }
+
+    #[test]
+    fn an_unknown_notify_spelling_is_refused_rather_than_read_as_the_default() {
+        assert_eq!(NotifyPolicy::parse("always"), Some(NotifyPolicy::Always));
+        assert_eq!(
+            NotifyPolicy::parse(" On_Error "),
+            Some(NotifyPolicy::OnError)
+        );
+        assert_eq!(NotifyPolicy::parse("on-error"), Some(NotifyPolicy::OnError));
+        assert_eq!(NotifyPolicy::parse("never"), Some(NotifyPolicy::Never));
+        // 打错字不该变成"每次都投"。
+        assert_eq!(NotifyPolicy::parse("nerver"), None);
+        assert_eq!(NotifyPolicy::parse(""), None);
+    }
+
+    /// 错过太久的槽位不补跑，而"太久"是**这个 Job 自己的间隔**（§10）。
+    #[test]
+    fn a_slot_missed_by_more_than_the_jobs_own_interval_is_not_made_up() {
+        let zone = FixedOffsetZone::utc();
+        let mut daily = CronJob {
+            id: CronJobId::from_raw("job-1"),
+            name: "daily".into(),
+            version: 1,
+            trigger: parse_schedule("0 9 * * *", &TimeZone::utc(), NOW, &zone).unwrap(),
+            prompt: String::new(),
+            workdir: None,
+            status: JobStatus::Active,
+            overlap: OverlapPolicy::Skip,
+            model: None,
+            effort: None,
+            skills: vec![],
+            max_rounds: None,
+            notify: NotifyPolicy::Always,
+            next_run_at: None,
+            last_error: None,
+        };
+        let slot = datetime!(2026-09-15 09:00:00 UTC);
+
+        // 迟到一小时：照跑。
+        assert!(!daily.slot_missed_by_too_much(slot, slot + Duration::hours(1), &zone));
+        // 迟到两天：这一槽过去了。
+        assert!(daily.slot_missed_by_too_much(slot, slot + Duration::days(2), &zone));
+        assert_eq!(daily.own_interval(slot, &zone), Some(Duration::days(1)));
+
+        // 同一段延迟，对每分钟的 Job 早就太久了——一个全局宽限期对两端一定有一端是错的。
+        daily.trigger = parse_schedule("* * * * *", &TimeZone::utc(), NOW, &zone).unwrap();
+        assert_eq!(daily.own_interval(slot, &zone), Some(Duration::minutes(1)));
+        assert!(daily.slot_missed_by_too_much(slot, slot + Duration::hours(1), &zone));
+
+        // 一次性触发**永不过期**：人指定了一个时刻要它跑一次。
+        daily.trigger = Trigger::At { at: slot };
+        assert_eq!(daily.own_interval(slot, &zone), None);
+        assert!(!daily.slot_missed_by_too_much(slot, slot + Duration::days(30), &zone));
+    }
+
+    /// 一条 `skipped` 的触发记录是**留痕**，不是一个空行：它说得出为什么。
+    #[test]
+    fn a_skipped_firing_keeps_the_reason() {
+        let zone = FixedOffsetZone::utc();
+        let job = CronJob {
+            id: CronJobId::from_raw("job-1"),
+            name: "x".into(),
+            version: 7,
+            trigger: parse_schedule("0 9 * * *", &TimeZone::utc(), NOW, &zone).unwrap(),
+            prompt: "整理".into(),
+            workdir: None,
+            status: JobStatus::Active,
+            overlap: OverlapPolicy::Skip,
+            model: None,
+            effort: None,
+            skills: vec![],
+            max_rounds: None,
+            notify: NotifyPolicy::Always,
+            next_run_at: None,
+            last_error: None,
+        };
+        let slot = datetime!(2026-09-15 09:00:00 UTC);
+
+        let claimed = CronFiring::claimed(&job, slot);
+        assert_eq!(claimed.status, FiringStatus::Queued);
+        assert_eq!(claimed.job_version, 7, "触发记的是当时那一版");
+        assert_eq!(claimed.prompt, "整理", "不可变的触发快照");
+
+        let skipped = CronFiring::skipped(&job, slot, "上一次还没结束");
+        assert_eq!(skipped.status, FiringStatus::Skipped);
+        assert_eq!(skipped.error.as_deref(), Some("上一次还没结束"));
+    }
+
+    /// 旧版本写下的一行（没有 `notify` / `status`）读得出来，读成默认值。
+    #[test]
+    fn a_row_written_before_these_fields_existed_still_reads() {
+        let firing: CronFiring = serde_json::from_str(
+            r#"{"job":"job-1","job_version":1,"scheduled_at":"2026-09-15T09:00:00Z","prompt":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(firing.status, FiringStatus::Queued);
+        assert!(firing.error.is_none());
     }
 
     #[test]

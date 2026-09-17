@@ -38,6 +38,25 @@ impl Ledger for Coordinator {
         let now = self.clock.now();
         let hash = input.input_hash();
 
+        // Job 的工作目录落到 Session 行上（§10 的 `workdir`）。放在预留 Run **之前**：
+        // 装配执行段读的是这一行，而 Run 一进队列就可能被领走。写不进去不该让这一条
+        // 输入整个失败——目录不对最坏是回到 `workspaces/`，而丢掉输入是丢掉任务。
+        if let Some(workdir) = input.workdir.as_ref().map(|p| p.display().to_string()) {
+            let session = self.session.clone();
+            if let Err(error) = self
+                .db
+                .with_write_retry(move |ex| {
+                    let (session, workdir) = (session.clone(), workdir.clone());
+                    Box::pin(
+                        async move { session::set_workdir_in(ex, &session, &workdir, now).await },
+                    ) as BoxFuture<'_, Result<(), StoreError>>
+                })
+                .await
+            {
+                tracing::warn!(%error, session = %self.session, "工作目录没记到会话上");
+            }
+        }
+
         // ① state.db 用请求键预留 Run ID，状态 ingesting，**仅存输入哈希与来源**。
         let reserved = {
             let input = input.clone();
@@ -798,6 +817,7 @@ mod tests {
             },
             peer: None,
             model: sample_model(),
+            workdir: None,
             at: time::macros::datetime!(2026-09-15 08:00:00 UTC),
         }
     }

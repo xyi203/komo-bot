@@ -137,21 +137,10 @@ enum ApprovalCommand {
 #[derive(Subcommand)]
 enum CronCommand {
     /// 创建定时任务。
-    Add {
-        #[arg(long)]
-        name: String,
-        /// 五字段 cron 表达式，或 `@at YYYY-MM-DD HH:MM`。
-        #[arg(long)]
-        schedule: String,
-        /// IANA 时区名。
-        #[arg(long, default_value = "UTC")]
-        timezone: String,
-        #[arg(long)]
-        prompt: String,
-        /// 这个 Job 的工作目录；**创建时就核实**（§10）。
-        #[arg(long)]
-        workdir: Option<String>,
-    },
+    ///
+    /// **装箱**：§10 的 Job 字段还会长，而 clap 的子命令枚举按最大变体定大小——一个
+    /// 只在启动时解析一次的枚举不值得让其余每个变体都跟着它变胖。
+    Add(Box<CronAddArgs>),
     /// 列出定时任务。
     List,
     /// 手动触发一次。
@@ -176,14 +165,72 @@ enum CronCommand {
     },
 }
 
+/// `komo cron add` 的 flag（§10 的 Job 字段表）。
+#[derive(clap::Args)]
+struct CronAddArgs {
+    #[arg(long)]
+    name: String,
+    /// 五字段 cron 表达式，或 `@at YYYY-MM-DD HH:MM`。
+    #[arg(long)]
+    schedule: String,
+    /// IANA 时区名。
+    #[arg(long, default_value = "UTC")]
+    timezone: String,
+    #[arg(long)]
+    prompt: String,
+    /// 这个 Job 的工作目录；**创建时就核实**（§10）。
+    #[arg(long)]
+    workdir: Option<String>,
+    /// 这个 Job 的主模型。**按完整模型配置解析**：只换模型名，端点与凭证仍是
+    /// 主模型那一份；记忆整理与向量模型一个字都不动（§10、§13.3）。
+    #[arg(long)]
+    model: Option<String>,
+    /// 这个 Job 的 effort。不支持的档位**在请求前**被拒绝并指出支持值（§13.3）。
+    #[arg(long)]
+    effort: Option<String>,
+    /// 触发时预载进首轮上下文的 SKILL.md（§5.6）。可重复。
+    #[arg(long = "skill")]
+    skills: Vec<String>,
+    /// 执行预算：一次触发最多跑几轮模型。
+    #[arg(long)]
+    max_rounds: Option<u32>,
+    /// 上一次还没结束时：skip（默认）/ allow。
+    #[arg(long, default_value = "skip")]
+    overlap: String,
+    /// 结果投递：always（默认）/ on_error / never。等待审批**不受它约束**。
+    #[arg(long, default_value = "always")]
+    notify: String,
+}
+
 #[derive(Subcommand)]
 enum MemoryCommand {
     /// 按作用域、状态和查询条件列出记忆。
-    List,
+    List {
+        /// 只看这个作用域：personal / project:<id> / environment:<id>。
+        #[arg(long)]
+        scope: Option<String>,
+        /// 只看这个状态：candidate / active / contested / superseded / forgotten。
+        #[arg(long)]
+        state: Option<String>,
+        /// 最多列多少条。
+        #[arg(long)]
+        limit: Option<u32>,
+    },
     /// 检索；支持 hybrid / keyword / vector（§9.4）。
     Search {
         /// 查询词。
         query: String,
+        /// 检索模式：hybrid（默认，按配置）/ keyword / vector。
+        #[arg(long)]
+        mode: Option<String>,
+        /// 只看这个作用域：personal / project:<id> / environment:<id>。
+        #[arg(long)]
+        scope: Option<String>,
+        /// 只看这个状态。**明确写出来才查得到 contested**（§9.6）。
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
     },
     /// 内容、版本、证据与确认记录。
     Show {
@@ -400,20 +447,35 @@ async fn operator(
             }
         },
         Command::Cron { action } => match action {
-            CronCommand::Add {
-                name,
-                schedule,
-                timezone,
-                prompt,
-                workdir,
-            } => {
+            CronCommand::Add(args) => {
+                let CronAddArgs {
+                    name,
+                    schedule,
+                    timezone,
+                    prompt,
+                    workdir,
+                    model,
+                    effort,
+                    skills,
+                    max_rounds,
+                    overlap,
+                    notify,
+                } = *args;
                 commands::cron_add(
                     client,
-                    &name,
-                    &schedule,
-                    &timezone,
-                    &prompt,
-                    workdir.as_deref(),
+                    commands::CronAdd {
+                        name,
+                        schedule,
+                        timezone,
+                        prompt,
+                        workdir,
+                        model,
+                        effort,
+                        skills,
+                        max_rounds,
+                        overlap,
+                        notify,
+                    },
                 )
                 .await
             }
@@ -428,8 +490,42 @@ async fn operator(
             CronCommand::Remove { job_id } => commands::cron_remove(client, &job_id).await,
         },
         Command::Memory { action } => match action {
-            MemoryCommand::List => commands::memory_list(client, None).await,
-            MemoryCommand::Search { query } => commands::memory_list(client, Some(&query)).await,
+            MemoryCommand::List {
+                scope,
+                state,
+                limit,
+            } => {
+                commands::memory_list(
+                    client,
+                    commands::MemoryFilter {
+                        query: None,
+                        mode: None,
+                        scope,
+                        state,
+                        limit,
+                    },
+                )
+                .await
+            }
+            MemoryCommand::Search {
+                query,
+                mode,
+                scope,
+                state,
+                limit,
+            } => {
+                commands::memory_list(
+                    client,
+                    commands::MemoryFilter {
+                        query: Some(query),
+                        mode,
+                        scope,
+                        state,
+                        limit,
+                    },
+                )
+                .await
+            }
             MemoryCommand::Show { memory_id } => commands::memory_show(client, &memory_id).await,
             MemoryCommand::Confirm {
                 memory_id,
@@ -469,6 +565,7 @@ async fn gateway(
                 listen: None,
                 channels: komo_gateway::channels::factories(),
                 llm: None,
+                embeddings: None,
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -606,22 +703,70 @@ mod tests {
             "整理今天的动态",
         ]);
         let Some(Command::Cron {
-            action:
-                CronCommand::Add {
-                    name,
-                    schedule,
-                    timezone,
-                    ..
-                },
+            action: CronCommand::Add(args),
         }) = parsed.command
         else {
             panic!("解析不出 cron add");
         };
-        assert_eq!(name, "morning");
-        assert_eq!(schedule, "0 9 * * *");
-        assert_eq!(timezone, "Asia/Shanghai");
+        assert_eq!(args.name, "morning");
+        assert_eq!(args.schedule, "0 9 * * *");
+        assert_eq!(args.timezone, "Asia/Shanghai");
+        // 没写的那些是默认值，不是空——`notify` 缺省是 `always`（§10）。
+        assert_eq!(args.notify, "always");
+        assert_eq!(args.overlap, "skip");
+        assert!(args.model.is_none());
+        assert!(args.skills.is_empty());
 
         // 少一个必填项就该失败，而不是用一个猜出来的默认值跑起来。
         assert!(Cli::try_parse_from(["komo", "cron", "add", "--name", "x"]).is_err());
+    }
+
+    /// §10 的 Job 字段在 CLI 上**全都有 flag**：`komo cron add` 是唯一的写入口
+    /// （「模型需要管理 Cron 时通过 shell 调这些命令」），少一个 flag 就等于那个字段
+    /// 只能改配置文件——而它根本不在配置文件里。
+    #[test]
+    fn cron_add_covers_every_job_field() {
+        let parsed = Cli::parse_from([
+            "komo",
+            "cron",
+            "add",
+            "--name",
+            "morning",
+            "--schedule",
+            "0 9 * * *",
+            "--timezone",
+            "Asia/Shanghai",
+            "--prompt",
+            "整理",
+            "--workdir",
+            "/tmp",
+            "--model",
+            "job-model",
+            "--effort",
+            "high",
+            "--skill",
+            "memos",
+            "--skill",
+            "search",
+            "--max-rounds",
+            "12",
+            "--overlap",
+            "allow",
+            "--notify",
+            "on_error",
+        ]);
+        let Some(Command::Cron {
+            action: CronCommand::Add(args),
+        }) = parsed.command
+        else {
+            panic!("解析不出 cron add");
+        };
+        assert_eq!(args.workdir.as_deref(), Some("/tmp"));
+        assert_eq!(args.model.as_deref(), Some("job-model"));
+        assert_eq!(args.effort.as_deref(), Some("high"));
+        assert_eq!(args.skills, vec!["memos".to_string(), "search".to_string()]);
+        assert_eq!(args.max_rounds, Some(12));
+        assert_eq!(args.overlap, "allow");
+        assert_eq!(args.notify, "on_error");
     }
 }

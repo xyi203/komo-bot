@@ -197,6 +197,12 @@ pub struct AcceptInput {
     pub peer: Option<ChannelPeer>,
     /// 本次 Run 固定的模型配置快照。
     pub model: ModelConfig,
+    /// 这个 Session 的工作目录。Cron Job 的 `workdir`（§10）从这里落到 Session 行上——
+    /// 它在**创建 Job 时**就已经核实过存在，这里只是把它带到会话上。
+    ///
+    /// `None` = 不改（已经在的会话保留它自己的），不是"清空"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<std::path::PathBuf>,
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
 }
@@ -291,6 +297,7 @@ mod tests {
                 efforts: None,
                 timeout_secs: 120,
             },
+            workdir: None,
             at: datetime!(2026-09-15 08:00:00 UTC),
         };
         let first = input.input_hash();

@@ -13,6 +13,7 @@
 //! 调度器，与新请求同一条路。
 
 pub mod channels;
+pub mod cron_watch;
 pub mod ledgers;
 pub mod segment;
 pub mod state;
@@ -44,6 +45,9 @@ use state::{Assembly, GatewayState, SystemClock};
 const CRON_TICK: std::time::Duration = std::time::Duration::from_secs(60);
 /// 控制审计补写的节奏。补写是审计与顺序，不承担耐久性（§8.2），所以不必更密。
 const AUDIT_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+/// 记忆后台队列的节奏（§9.3）。「run.completed …提交终态与 memory_work = pending →
+/// **后台领取**」——领取是这一拍，不在 Run 的关键路径上。
+const MEMORY_TICK: std::time::Duration = std::time::Duration::from_secs(30);
 /// 停机时给手上的任务多少时间收尾（§8.7「给正在完成的工具短暂收尾时间」）。
 const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -72,6 +76,8 @@ pub struct ServiceOptions {
     pub channels: Vec<Arc<dyn ChannelFactory>>,
     /// 测试注入的模型后端。
     pub llm: Option<Arc<dyn LlmClient>>,
+    /// 测试注入的向量后端；`None` = 按 `[memory.embedding]` 造。
+    pub embeddings: Option<Arc<dyn komo_kernel::traits::EmbeddingClient>>,
 }
 
 impl std::fmt::Debug for ServiceOptions {
@@ -150,6 +156,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         instance_id: instance_id.clone(),
         token: token.clone(),
         llm: options.llm,
+        embeddings: options.embeddings,
         tools: build_tools(&snapshot, &instance_id).await,
         channels: options.channels,
     })
@@ -239,6 +246,14 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // 8. 补写控制审计 outbox（§8.7 的启动顺序第 3 步：恢复扫描之后、服务起来之前）。
     state.drain_audit().await;
 
+    // 8b. 把卡在 `processing` 的记忆处理放回 pending（§9.3「进程崩溃后可重新领取」）。
+    // 与恢复扫描同一个理由，也同一个位置：上一次没跑完的，这一次要能再领一遍。
+    match state.requeue_memory_work().await {
+        Ok(0) => {}
+        Ok(requeued) => tracing::info!(requeued, "上次没跑完的记忆处理已放回队列"),
+        Err(error) => tracing::warn!(%error, "记忆处理队列的复位没做成"),
+    }
+
     // 9. 后台任务：调度器、Cron、配置轮询、SIGHUP。
     spawn_background(&state, &shutdown);
 
@@ -292,10 +307,14 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
                     return;
                 }
                 match state.cron_scheduler().tick().await {
-                    Ok(tick) if !tick.fired.is_empty() => {
-                        tracing::info!(fired = tick.fired.len(), "定时任务已入队");
+                    Ok(tick) => {
+                        if !tick.fired.is_empty() {
+                            tracing::info!(fired = tick.fired.len(), "定时任务已入队");
+                        }
+                        // 投出去之后要有人盯着（§10 的最后两步 + §7.4 的"投递到 home
+                        // chat"）：Cron 没有来源会话，等待审批就只能从这里投出去。
+                        state.watch_fired(&tick.fired).await;
                     }
-                    Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "Cron 这一轮扫描失败"),
                 }
             }
@@ -313,6 +332,39 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
                     return;
                 }
                 state.drain_audit().await;
+            }
+        });
+    }
+    {
+        // 记忆的后台队列（§9.3）。失败的 Run 放回 pending，下一拍重试；这一拍什么都没领
+        // 到是常态，不记日志。
+        let state = Arc::clone(state);
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(MEMORY_TICK).await;
+                if shutdown.is_cancelled() {
+                    return;
+                }
+                match state
+                    .memories
+                    .process_pending(komo_runtime::memory::WORK_BATCH)
+                    .await
+                {
+                    Ok(report)
+                        if report.processed > 0 || report.failed > 0 || report.skipped > 0 =>
+                    {
+                        tracing::info!(
+                            processed = report.processed,
+                            applied = report.applied,
+                            skipped = report.skipped,
+                            failed = report.failed,
+                            "记忆提取这一轮结束"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%error, "记忆提取这一轮没跑成"),
+                }
             }
         });
     }

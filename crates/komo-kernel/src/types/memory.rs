@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::ids::{EventId, MemoryId, RunId, Seq, SessionId};
-use super::model::{Effort, EffortSetting};
+use super::model::{Effort, EffortSetting, Vector};
 
 /// 记忆的种类。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -180,6 +180,17 @@ pub struct MemoryUsage {
     pub last_used_at: Option<OffsetDateTime>,
 }
 
+/// 这条内容取代了**哪一条记忆的哪个版本**（§9.6）。
+///
+/// 取代是跨条目的：新主张是一条自己的记忆，旧的那条随后标 [`MemoryState::Superseded`]。
+/// 前向链留在新的这一条上，因为读到的人手里拿着的正是它——"它取代了什么"要能就地答
+/// 出来，而不是反过来去全表找谁指着自己。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededRef {
+    pub memory: MemoryId,
+    pub revision: u32,
+}
+
 /// 一条自动记忆。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryItem {
@@ -210,6 +221,9 @@ pub struct MemoryItem {
     pub extraction: ExtractionMetadata,
     #[serde(default)]
     pub usage: MemoryUsage,
+    /// 取代了哪一条（§9.6）。`None` = 这条不取代任何东西。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<SupersededRef>,
 }
 
 impl MemoryItem {
@@ -230,7 +244,10 @@ pub enum RetrievalMode {
 }
 
 /// 一次检索的请求。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Eq` 不在派生列表里**：`query_vector` 里是 f32，而"两个 NaN 相等"不是这个类型
+/// 能签的字。没有谁把它放进 `HashSet`，所以这只是把一句不成立的话去掉。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RecallQuery {
     pub text: String,
     pub mode: RetrievalMode,
@@ -242,6 +259,28 @@ pub struct RecallQuery {
     /// 有效期与状态都按这一刻判定。kernel 不读时钟。
     #[serde(with = "time::serde::rfc3339")]
     pub now: OffsetDateTime,
+    /// 查询向量（§9.4 的向量臂）。**由 MemoryManager 算好交下来**——仓储不认识
+    /// embedding 端点，也不该在一次读事务里发网络请求（§9.5「模型调用期间不持有数据库
+    /// 事务」）。`None` + 非 keyword 模式 = 向量臂这一次不可用，实现要如实标 degraded。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_vector: Option<Vector>,
+    /// 放行哪些状态。**空 = 只要能自动召回的那些**（active 且没过期，§9.4）。
+    ///
+    /// 显式列出状态是"明确 search"这条路：`contested` 暂停自动召回，但用户要能查到它，
+    /// 否则没人帮得上把冲突定下来（§9.6）。去重与冲突整理也走这一口，它要看见候选。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub include_states: Vec<MemoryState>,
+}
+
+impl RecallQuery {
+    /// 这条记忆能不能出现在**这一次**检索的结果里。
+    pub fn admits(&self, item: &MemoryItem) -> bool {
+        if self.include_states.is_empty() {
+            return item.is_recallable_at(self.now);
+        }
+        self.include_states.contains(&item.state)
+            && item.valid_until.is_none_or(|until| until > self.now)
+    }
 }
 
 /// 一次检索的结果，带检索元信息——降级要明说（§9.4）。
@@ -291,7 +330,37 @@ mod tests {
             updated_at: datetime!(2026-09-01 00:00:00 UTC),
             extraction: ExtractionMetadata::new("m", None, "v1"),
             usage: MemoryUsage::default(),
+            supersedes: None,
         }
+    }
+
+    fn any_query(include_states: Vec<MemoryState>) -> RecallQuery {
+        RecallQuery {
+            text: "深色".into(),
+            mode: RetrievalMode::Keyword,
+            scopes: vec![],
+            candidate_limit: 40,
+            top_k: 8,
+            max_tokens: 1500,
+            now: datetime!(2026-09-15 00:00:00 UTC),
+            query_vector: None,
+            include_states,
+        }
+    }
+
+    /// `contested` 暂停自动召回，但**显式列出状态**时要查得到（§9.6）。
+    #[test]
+    fn an_explicit_state_list_is_what_reaches_a_contested_memory() {
+        let contested = item(MemoryState::Contested);
+        assert!(!any_query(vec![]).admits(&contested), "自动召回够不着");
+        assert!(
+            any_query(vec![MemoryState::Contested]).admits(&contested),
+            "明确 search 要查得到"
+        );
+        // 过期仍然是过期——列出状态不等于放行有效期。
+        let mut expired = item(MemoryState::Contested);
+        expired.valid_until = Some(datetime!(2026-09-10 00:00:00 UTC));
+        assert!(!any_query(vec![MemoryState::Contested]).admits(&expired));
     }
 
     #[test]

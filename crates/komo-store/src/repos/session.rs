@@ -128,6 +128,33 @@ pub async fn advance_applied_in(
         .map_err(map_toasty)
 }
 
+/// 记一个 Session 的工作目录。
+///
+/// `ensure_in` 建行时永远写 `None`（它不知道），所以这条路是后补的那一次。**幂等且
+/// 只在有值时写**：`None` 是"不改"，不是"清空"——一个已经绑好目录的会话不该因为下一
+/// 条输入没带目录就回到 `workspaces/`。
+pub async fn set_workdir_in(
+    ex: &mut dyn Executor,
+    session: &SessionId,
+    workdir: &str,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let Some(mut row) = get_in(ex, session).await? else {
+        return Err(StoreError::NotFound {
+            what: format!("session {session}"),
+        });
+    };
+    if row.workdir.as_deref() == Some(workdir) {
+        return Ok(());
+    }
+    row.update()
+        .workdir(Some(workdir.to_string()))
+        .updated_at(to_ts(now))
+        .exec(ex)
+        .await
+        .map_err(map_toasty)
+}
+
 /// 记一个 Session 的当前 Run。
 pub async fn set_current_run_in(
     ex: &mut dyn Executor,

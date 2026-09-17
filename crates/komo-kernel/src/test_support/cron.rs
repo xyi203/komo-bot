@@ -108,6 +108,19 @@ impl CronRepo for MemCronRepo {
         Ok(true)
     }
 
+    async fn update_firing(&self, firing: CronFiring) -> Result<bool, RepoError> {
+        let mut state = self.state.lock().expect("cron");
+        let Some(row) = state
+            .firings
+            .iter_mut()
+            .find(|f| f.job == firing.job && f.scheduled_at == firing.scheduled_at)
+        else {
+            return Ok(false);
+        };
+        *row = firing;
+        Ok(true)
+    }
+
     async fn has_unfinished_firing(&self, id: &CronJobId) -> Result<bool, RepoError> {
         Ok(self.state.lock().expect("cron").unfinished.contains(id))
     }
@@ -142,6 +155,8 @@ mod tests {
                 prompt: "整理今天的动态".into(),
                 session: None,
                 run: None,
+                status: Default::default(),
+                error: None,
             };
             assert!(repo.claim_firing(firing.clone()).await.unwrap());
             assert!(!repo.claim_firing(firing).await.unwrap());
@@ -171,6 +186,7 @@ mod tests {
                 effort: None,
                 skills: vec![],
                 max_rounds: None,
+                notify: Default::default(),
                 next_run_at: Some(now),
                 last_error: None,
             };

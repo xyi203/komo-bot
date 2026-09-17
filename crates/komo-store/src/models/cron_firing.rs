@@ -19,6 +19,10 @@ pub struct CronFiringRow {
     pub prompt: String,
     pub session_id: Option<String>,
     pub run_id: Option<String>,
+    /// `FiringStatus`：queued / ok / error / waiting / skipped。**跳过也是一种状态**。
+    pub status: String,
+    /// `skipped` 的原因，或 `error` 的错误。
+    pub error: Option<String>,
     pub created_at: i64,
 }
 
@@ -28,7 +32,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "cron_firings" ("id" TEXT NOT NULL, "job_id" TEXT NOT NULL, "job_version" BIGINT NOT NULL, "scheduled_at" BIGINT NOT NULL, "prompt" TEXT NOT NULL, "session_id" TEXT, "run_id" TEXT, "created_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "cron_firings" ("id" TEXT NOT NULL, "job_id" TEXT NOT NULL, "job_version" BIGINT NOT NULL, "scheduled_at" BIGINT NOT NULL, "prompt" TEXT NOT NULL, "session_id" TEXT, "run_id" TEXT, "status" TEXT NOT NULL, "error" TEXT, "created_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -38,5 +42,7 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("prompt", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("session_id", "TEXT"),
     ColumnSpec::new("run_id", "TEXT"),
+    ColumnSpec::new("status", "TEXT NOT NULL DEFAULT 'queued'"),
+    ColumnSpec::new("error", "TEXT"),
     ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
 ];

@@ -75,7 +75,7 @@ impl MemoryRepo for MemMemoryRepo {
         let items: Vec<MemoryItem> = state
             .items
             .values()
-            .filter(|m| m.is_recallable_at(query.now))
+            .filter(|m| query.admits(m))
             .filter(|m| query.text.is_empty() || m.content.contains(&query.text))
             .take(query.top_k as usize)
             .cloned()

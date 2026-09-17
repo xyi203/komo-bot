@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::tui::test_support as fixture;
-use komo_kernel::cron::{TimeZone, Trigger};
+use komo_kernel::cron::{CronJob, TimeZone, Trigger};
 use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::config::{KeyPath, SourceFile};
 use komo_kernel::protocol::http::{
@@ -229,6 +229,7 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
             effort: None,
             skills: vec![],
             max_rounds: None,
+            notify: Default::default(),
             next_run_at: Some(NOW + time::Duration::hours(2)),
             last_error: None,
         },
@@ -245,24 +246,114 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
             effort: None,
             skills: vec![],
             max_rounds: None,
+            notify: Default::default(),
             next_run_at: None,
             last_error: Some("时区 Mars/Olympus 解析不了".into()),
         },
     ];
-    let printed = cron_list(&jobs, NOW);
+    let response = komo_kernel::protocol::http::CronListResponse {
+        status: vec![
+            // 上一次跑成了，会话号在这一行上——「Cron 的结果去原 Session 查看」（§10）。
+            komo_kernel::protocol::http::CronJobStatus {
+                job: CronJobId::from_raw("job-1"),
+                next_run_at: jobs[0].next_run_at,
+                last: Some(komo_kernel::cron::CronFiring {
+                    job: CronJobId::from_raw("job-1"),
+                    job_version: 3,
+                    scheduled_at: NOW - time::Duration::hours(22),
+                    prompt: "把昨天的事说一遍".into(),
+                    session: Some(SessionId::from_raw("sess-9")),
+                    run: Some(RunId::from_raw("run-9")),
+                    status: komo_kernel::cron::FiringStatus::Ok,
+                    error: None,
+                }),
+            },
+            // 上一次被跳过了，**原因在同一行**：一个天天被跳过的 Job 不该和一个天天
+            // 跑成的 Job 长得一样。
+            komo_kernel::protocol::http::CronJobStatus {
+                job: CronJobId::from_raw("job-2"),
+                next_run_at: None,
+                last: Some(komo_kernel::cron::CronFiring {
+                    job: CronJobId::from_raw("job-2"),
+                    job_version: 1,
+                    scheduled_at: NOW - time::Duration::days(1),
+                    prompt: "x".into(),
+                    session: None,
+                    run: None,
+                    status: komo_kernel::cron::FiringStatus::Skipped,
+                    error: Some("上一次触发还没结束".into()),
+                }),
+            },
+        ],
+        jobs,
+    };
+    let printed = cron_list(&response, NOW);
     insta_like(
         &printed,
         &[
             "job-1",
             "启用",
             "跳过",
+            "总是",
             "还有 2h0m",
             "早报 · 0 9 * * * @Asia/Shanghai",
+            "上次",
+            "ok",
+            "会话 sess-9",
             "job-2",
             "暂停",
             "并行",
+            "skipped",
+            "上一次触发还没结束",
             "⚠ 时区 Mars/Olympus 解析不了",
         ],
+    );
+}
+
+/// `notify` 与触发状态在清单里都看得见——`waiting` 尤其：那是任务在**问**，
+/// 而一条没人看见的提问等于这个 Job 从此停在那里（§10）。
+#[test]
+fn a_waiting_firing_says_it_is_waiting_for_a_person() {
+    let jobs = vec![CronJob {
+        id: CronJobId::from_raw("job-3"),
+        name: "夜间整理".into(),
+        version: 1,
+        trigger: Trigger::Cron {
+            expr: "0 3 * * *".into(),
+            tz: TimeZone::new("Europe/Berlin"),
+        },
+        prompt: "整理".into(),
+        workdir: None,
+        status: JobStatus::Active,
+        overlap: OverlapPolicy::Skip,
+        model: None,
+        effort: None,
+        skills: vec![],
+        max_rounds: None,
+        notify: komo_kernel::cron::NotifyPolicy::OnError,
+        next_run_at: Some(NOW + time::Duration::hours(5)),
+        last_error: None,
+    }];
+    let response = komo_kernel::protocol::http::CronListResponse {
+        status: vec![komo_kernel::protocol::http::CronJobStatus {
+            job: CronJobId::from_raw("job-3"),
+            next_run_at: jobs[0].next_run_at,
+            last: Some(komo_kernel::cron::CronFiring {
+                job: CronJobId::from_raw("job-3"),
+                job_version: 1,
+                scheduled_at: NOW - time::Duration::hours(19),
+                prompt: "整理".into(),
+                session: Some(SessionId::from_raw("sess-3")),
+                run: Some(RunId::from_raw("run-3")),
+                status: komo_kernel::cron::FiringStatus::Waiting,
+                error: None,
+            }),
+        }],
+        jobs,
+    };
+    insta_like(
+        &cron_list(&response, NOW),
+        &["仅出错", "waiting（在等人）", "会话 sess-3"],
     );
 }
 
@@ -299,6 +390,7 @@ fn memory_item() -> MemoryItem {
             count: 5,
             last_used_at: Some(NOW),
         },
+        supersedes: None,
     }
 }
 

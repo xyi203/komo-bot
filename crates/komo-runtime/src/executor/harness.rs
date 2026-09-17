@@ -102,6 +102,7 @@ impl Harness {
                 },
                 peer: None,
                 model: sample_model(),
+                workdir: None,
                 at: self.clock.now(),
             })
             .await

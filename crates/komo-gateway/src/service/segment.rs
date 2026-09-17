@@ -8,10 +8,13 @@
 //! - **恢复位置**：这个 Run 还有没有没收尾的调用。有就把它们原样交回执行器——**沿用
 //!   同一份计划**，因为审批绑定的是计划的哈希，重新 prepare 会换一个哈希（§7.4）。
 //!
-// TODO(decide: 系统提示的正文文档没有规定（§5.6 只说 skills 目录行是启动快照、§9 说
-// 记忆注入在装配时发生）。W4 先给一段最小的、不含记忆与 skills 目录的提示，等
-// MemoryManager 与 SkillRegistry 接进来时从这里换掉——`preamble` 那一口已经在
-// `LlmFactory::with_preamble` 上留好了。)
+//! **记忆在这里召回，不在提示里拼**（§9.4）：这一段装配时按最新一句用户输入召回一次，
+//! 正文交给 `LlmFactory::with_preamble` 挂到系统提示后面，而用到的条目连同它们的
+//! revision 写进 [`TurnRequest::memories`]——那是审计证据，resume 时要按它重新核对
+//! （§9.7）。续跑时先拿检查点里记的那一批去核对，**过期或已遗忘的复活不了**。
+//
+// TODO(decide: 系统提示的正文文档没有规定（§5.6 只说 skills 目录行是启动快照）。W4 给
+// 的那段最小提示留到 SkillRegistry 接进来时再换。)
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -27,8 +30,9 @@ use komo_kernel::types::turn::{ReplayMessage, ToolResultForModel, TurnRequest};
 use komo_runtime::agent::handler::SegmentSource;
 use komo_runtime::agent::{Budget, ResumedRound, RetryBudget, Segment};
 use komo_runtime::executor::{CallEnv, CallRequest, resumed_from};
+use komo_runtime::memory::MemoryManager;
 use komo_runtime::scheduler::HandlerError;
-use komo_store::{Db, RecoveryStore};
+use komo_store::{CheckpointStore, Db, RecoveryStore};
 
 use super::ledgers::RoutedLedger;
 
@@ -43,6 +47,12 @@ pub struct GatewaySegments {
     max_rounds: u32,
     max_retries: u32,
     cancels: Mutex<BTreeMap<RunId, CancelToken>>,
+    /// `None` = 这台 Gateway 没有记忆这一层（测试里的精简装配）。
+    memories: Option<Arc<MemoryManager>>,
+    checkpoints: Option<CheckpointStore>,
+    /// Cron Job 的**执行预算**要从 Job 上读（§10：每个 Job 有自己的执行预算）。
+    /// `None` = 没接 Cron 这一层，所有 Run 都用全局的 `max_rounds`。
+    cron: Option<Arc<dyn komo_kernel::traits::CronRepo>>,
 }
 
 impl std::fmt::Debug for GatewaySegments {
@@ -70,6 +80,47 @@ impl GatewaySegments {
             max_rounds,
             max_retries,
             cancels: Mutex::new(BTreeMap::new()),
+            cron: None,
+            memories: None,
+            checkpoints: None,
+        }
+    }
+
+    /// 接上记忆这一层。
+    pub fn with_memories(
+        mut self,
+        memories: Arc<MemoryManager>,
+        checkpoints: CheckpointStore,
+    ) -> Self {
+        self.memories = Some(memories);
+        self.checkpoints = Some(checkpoints);
+        self
+    }
+
+    /// 接上 Cron，这样一个 Cron Run 用的是**它那个 Job 的**执行预算（§10）。
+    pub fn with_cron(mut self, cron: Arc<dyn komo_kernel::traits::CronRepo>) -> Self {
+        self.cron = Some(cron);
+        self
+    }
+
+    /// 这一段最多跑几轮。
+    ///
+    /// Cron Job 可以有自己的预算；读不出那个 Job（被删了、读不出来）就回到全局值——
+    /// **不要因为读不到预算就不跑**，那会把一次配置问题变成一次静默的失败。
+    async fn max_rounds_for(&self, source: &komo_kernel::types::plan::PlanSource) -> u32 {
+        let komo_kernel::types::plan::PlanSource::Cron { job, .. } = source else {
+            return self.max_rounds;
+        };
+        let Some(cron) = &self.cron else {
+            return self.max_rounds;
+        };
+        match cron.get(job).await {
+            Ok(Some(job)) => job.max_rounds.unwrap_or(self.max_rounds),
+            Ok(None) => self.max_rounds,
+            Err(error) => {
+                tracing::warn!(%error, %job, "读不出这个 Job 的执行预算，用全局的");
+                self.max_rounds
+            }
         }
     }
 
@@ -156,6 +207,8 @@ impl SegmentSource for GatewaySegments {
             label: "workspace".into(),
         }];
 
+        let memories = self.recall_for(&session, &run, &surface).await;
+
         let request = TurnRequest {
             session: session.clone(),
             run: run.clone(),
@@ -163,7 +216,7 @@ impl SegmentSource for GatewaySegments {
             system_prompt: system_prompt(&cwd, &tools),
             messages: replay(&surface),
             tools,
-            memories: Vec::new(),
+            memories,
             covers: None,
         };
 
@@ -179,7 +232,7 @@ impl SegmentSource for GatewaySegments {
         };
 
         let budget = Budget {
-            max_rounds: self.max_rounds,
+            max_rounds: self.max_rounds_for(&record.source).await,
             max_tokens: None,
             first_round: rounds_so_far + 1,
             retry: RetryBudget {
@@ -203,6 +256,36 @@ impl SegmentSource for GatewaySegments {
 }
 
 impl GatewaySegments {
+    /// 这一段注入哪些记忆（§9.4、§9.7）。
+    ///
+    /// 查询文本是回放面上**最后一条用户消息**——「当前用户输入 + 少量任务上下文」
+    /// （§9.4）。续跑时先把检查点里记的那一批交给
+    /// [`MemoryManager::prepare`] 重新核对：活下来的沿用（不必再问一次 embedding），
+    /// 已经遗忘或改了版本的掉出去（§9.7）。
+    async fn recall_for(
+        &self,
+        session: &SessionId,
+        run: &RunId,
+        surface: &Surface,
+    ) -> Vec<komo_kernel::types::turn::MemoryUse> {
+        let Some(memories) = self.memories.as_ref() else {
+            return Vec::new();
+        };
+        let carried = match &self.checkpoints {
+            Some(store) => match store.latest(session).await {
+                Ok(Some(record)) => record.memories,
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    tracing::debug!(%error, "读不出检查点，这一段重新召回");
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        let text = latest_user_text(surface).unwrap_or_default();
+        memories.prepare(run, &text, &carried).await.uses
+    }
+
     /// 装配读不出上下文时怎么收场。
     ///
     /// **损坏就停下来，不要放回队列**（§8.4「停止受影响会话，报告损坏」）：一个中间损坏
@@ -346,6 +429,16 @@ fn replay(surface: &Surface) -> Vec<ReplayMessage> {
             provider_blocks: message.provider_blocks.clone(),
         })
         .collect()
+}
+
+/// 回放面上最后一条用户消息的正文。
+fn latest_user_text(surface: &Surface) -> Option<String> {
+    surface
+        .replay()
+        .iter()
+        .rev()
+        .find(|message| message.role == komo_kernel::types::turn::Role::User)
+        .and_then(|message| message.text.clone())
 }
 
 /// 结果要按 provider 自己的 call_id 回传（§6）。

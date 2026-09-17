@@ -91,6 +91,7 @@ enabled = false
             listen: Some("127.0.0.1:0".into()),
             channels: Vec::new(),
             llm: Some(llm),
+            embeddings: None,
         })
         .await
         .expect("Gateway 起得来");

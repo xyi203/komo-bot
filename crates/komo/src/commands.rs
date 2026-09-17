@@ -11,13 +11,15 @@ use komo_client::render;
 use komo_gateway::channels;
 use komo_gateway::config::{LoadOptions, load_config};
 use komo_gateway::skills::{OfferContext, SkillRegistry};
-use komo_kernel::cron::JobStatus;
+use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
     ApprovalDecisionRequest, ApprovalListQuery, CancelRunRequest, CreateCronRequest,
     MemoryListQuery, MemoryRevisionRequest, RebuildIndexRequest, UpdateCronRequest,
 };
 use komo_kernel::types::chat::ApprovalScope;
 use komo_kernel::types::ids::{ApprovalId, CronJobId, MemoryId, RunId, ShortId};
+use komo_kernel::types::memory::{MemoryScope, MemoryState, RetrievalMode};
+use komo_kernel::types::model::Effort;
 
 pub type Outcome = Result<String, String>;
 
@@ -135,36 +137,80 @@ async fn resolve_approval(
 pub async fn cron_list(client: &KomoClient) -> Outcome {
     let response = client.cron_list().await.map_err(failed)?;
     Ok(render::cron_list(
-        &response.jobs,
+        &response,
         time::OffsetDateTime::now_utc(),
     ))
 }
 
-pub async fn cron_add(
-    client: &KomoClient,
-    name: &str,
-    schedule: &str,
-    timezone: &str,
-    prompt: &str,
-    workdir: Option<&str>,
-) -> Outcome {
+/// `komo cron add` 的全部 flag（§10 的 Job 字段）。
+///
+/// 一个结构体而不是十一个参数：这些字段会随 §10 继续长，而一串同类型的
+/// `Option<String>` 位置参数是一个等着发生的错配。
+#[derive(Debug, Clone, Default)]
+pub struct CronAdd {
+    pub name: String,
+    pub schedule: String,
+    pub timezone: String,
+    pub prompt: String,
+    pub workdir: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub skills: Vec<String>,
+    pub max_rounds: Option<u32>,
+    pub overlap: String,
+    pub notify: String,
+}
+
+pub async fn cron_add(client: &KomoClient, add: CronAdd) -> Outcome {
+    // 重叠策略与 notify **在发请求之前**校验：它们是打字打出来的，而"不认识就当默认"
+    // 会让一个写错的 `--notify nerver` 变成"每次都投"。
+    let overlap = parse_overlap(&add.overlap)?;
+    let notify = NotifyPolicy::parse(&add.notify).ok_or_else(|| {
+        format!(
+            "--notify 只接受 always / on_error / never，收到：{}",
+            add.notify
+        )
+    })?;
     let job = client
         .cron_create(&CreateCronRequest {
-            name: name.to_string(),
-            schedule: schedule.to_string(),
-            timezone: timezone.to_string(),
-            prompt: prompt.to_string(),
-            workdir: workdir.map(str::to_string),
-            model: None,
-            effort: None,
-            skills: Vec::new(),
-            overlap: Default::default(),
-            max_rounds: None,
+            name: add.name,
+            schedule: add.schedule,
+            timezone: add.timezone,
+            prompt: add.prompt,
+            workdir: add.workdir,
+            model: add.model,
+            effort: add.effort.as_deref().map(Effort::new),
+            skills: add.skills,
+            overlap,
+            max_rounds: add.max_rounds,
+            notify: Some(notify),
+            model_config: None,
             request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
         })
         .await
         .map_err(failed)?;
-    Ok(format!("已创建 {}（{}）", job.name, job.id))
+    Ok(added_line(&job))
+}
+
+/// `komo cron add` 的回执。
+///
+/// 一个 Job 创建之后操作者要能立刻答出两件事：**它是哪一个**（ID，后面每条命令都要
+/// 它），以及**下一次什么时候**——一个写错了时区的 Job 与一个写对了的长得一样，
+/// 只有下一次的时刻不一样。
+pub fn added_line(job: &komo_kernel::cron::CronJob) -> String {
+    let next = match job.next_run_at {
+        Some(next) => render::stamp(next),
+        None => "—".to_string(),
+    };
+    format!("已创建 {}（{}）；下一次 {next}", job.name, job.id)
+}
+
+fn parse_overlap(raw: &str) -> Result<OverlapPolicy, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "skip" => Ok(OverlapPolicy::Skip),
+        "allow" => Ok(OverlapPolicy::Allow),
+        other => Err(format!("--overlap 只接受 skip / allow，收到：{other}")),
+    }
 }
 
 pub async fn cron_run(client: &KomoClient, job: &str) -> Outcome {
@@ -177,10 +223,16 @@ pub async fn cron_run(client: &KomoClient, job: &str) -> Outcome {
         )
         .await
         .map_err(failed)?;
-    Ok(format!(
-        "已手动触发：run {}（会话 {}）",
+    Ok(manual_run_line(&response))
+}
+
+/// `komo cron run` 的回执。**会话号要印出来**：「Cron 的结果去原 Session 查看」
+/// （§10），而手动触发不写触发记录，清单上事后找不到它。
+pub fn manual_run_line(response: &komo_kernel::protocol::http::ManualCronRunResponse) -> String {
+    format!(
+        "已手动触发：run {}（会话 {}）；这一次不算定时触发，不推进槽位",
         response.run, response.session
-    ))
+    )
 }
 
 pub async fn cron_status(client: &KomoClient, job: &str, status: JobStatus) -> Outcome {
@@ -194,7 +246,27 @@ pub async fn cron_status(client: &KomoClient, job: &str, status: JobStatus) -> O
         )
         .await
         .map_err(failed)?;
-    Ok(format!("{} 现在是 {:?}", job.name, job.status))
+    Ok(status_line(&job))
+}
+
+/// `komo cron pause` / `resume` 的回执。
+///
+/// 印出版本号，因为这条命令**不递增它**（§7.2 / §10：暂停不是定义变更，绑定这个 Job
+/// 的授权不该因为暂停一次就失效）——看得见才说得清。
+pub fn status_line(job: &komo_kernel::cron::CronJob) -> String {
+    let state = match job.status {
+        JobStatus::Active => "启用",
+        JobStatus::Paused => "暂停",
+        JobStatus::Done => "已完成",
+    };
+    let next = match job.next_run_at {
+        Some(next) => render::stamp(next),
+        None => "—".to_string(),
+    };
+    format!(
+        "{} 现在是{state}（v{}）；下一次 {next}",
+        job.name, job.version
+    )
 }
 
 pub async fn cron_remove(client: &KomoClient, job: &str) -> Outcome {
@@ -202,25 +274,82 @@ pub async fn cron_remove(client: &KomoClient, job: &str) -> Outcome {
         .cron_delete(&CronJobId::from_raw(job))
         .await
         .map_err(failed)?;
-    Ok(format!(
+    Ok(removed_line(&response))
+}
+
+/// `komo cron remove` 的回执。「移除后续调度，**已有执行历史保留**」（§13.1）——
+/// 保留了多少条要说出来，否则"移除"听起来像把历史也删了。
+pub fn removed_line(response: &komo_kernel::protocol::http::CronDeleteResponse) -> String {
+    format!(
         "{}：{}（保留了 {} 条触发历史）",
         response.job,
         if response.removed {
-            "已移除"
+            "已移除后续调度"
         } else {
             "本来就没有"
         },
         response.firings_kept
-    ))
+    )
 }
 
 // ---------------------------------------------------------------- Memory
 
-pub async fn memory_list(client: &KomoClient, query: Option<&str>) -> Outcome {
+/// `komo memory list` / `search` 的筛选条件。
+///
+/// **模式、作用域、状态都是显式的**：§9.4 说 hybrid / keyword / vector「供明确选择与
+/// 诊断」，而 §9.6 说 contested 暂停自动召回但用户要查得到——两句话都要求这几个开关在
+/// 命令行上存在，不能只有一个默认。
+#[derive(Debug, Clone, Default)]
+pub struct MemoryFilter {
+    pub query: Option<String>,
+    pub mode: Option<String>,
+    pub scope: Option<String>,
+    pub state: Option<String>,
+    pub limit: Option<u32>,
+}
+
+pub async fn memory_list(client: &KomoClient, filter: MemoryFilter) -> Outcome {
+    // 参数在**发出去之前**就要判——打错一个模式名，答案该是"支持这三种"而不是一次
+    // 沉默的默认值。
+    let mode = match filter.mode.as_deref() {
+        None => None,
+        Some("hybrid") => Some(RetrievalMode::Hybrid),
+        Some("keyword") => Some(RetrievalMode::Keyword),
+        Some("vector") => Some(RetrievalMode::Vector),
+        Some(other) => {
+            return Err(format!(
+                "不认识的检索模式 `{other}`：支持 hybrid / keyword / vector"
+            ));
+        }
+    };
+    let scope = match filter.scope.as_deref() {
+        None => None,
+        Some(raw) => Some(
+            raw.parse::<MemoryScope>()
+                .map_err(|error| error.to_string())?,
+        ),
+    };
+    let state = match filter.state.as_deref() {
+        None => None,
+        Some("candidate") => Some(MemoryState::Candidate),
+        Some("active") => Some(MemoryState::Active),
+        Some("contested") => Some(MemoryState::Contested),
+        Some("superseded") => Some(MemoryState::Superseded),
+        Some("forgotten") => Some(MemoryState::Forgotten),
+        Some(other) => {
+            return Err(format!(
+                "不认识的状态 `{other}`：支持 candidate / active / contested / superseded / forgotten"
+            ));
+        }
+    };
+
     let response = client
         .memories(&MemoryListQuery {
-            query: query.map(str::to_string),
-            ..Default::default()
+            query: filter.query,
+            mode,
+            scope,
+            state,
+            limit: filter.limit,
         })
         .await
         .map_err(failed)?;
@@ -427,4 +556,119 @@ pub enum SkillsAction<'a> {
 #[allow(dead_code)]
 fn offer_context() -> OfferContext {
     OfferContext::here(["read", "write", "edit", "shell", "python"])
+}
+
+#[cfg(test)]
+mod cron_render_tests {
+    //! `komo cron` 各子命令的回执。**纯函数**，所以测得起来：一句话里该有哪些东西是
+    //! 一个能出错的决定（少印一个 ID、少印一个版本号），而它出错的时候没人会崩。
+
+    use super::*;
+    use komo_kernel::cron::{CronJob, JobStatus, OverlapPolicy, TimeZone, Trigger};
+    use komo_kernel::types::ids::{RunId, SessionId};
+    use time::macros::datetime;
+
+    const NOW: time::OffsetDateTime = datetime!(2026-09-16 01:00:00 UTC);
+
+    fn job() -> CronJob {
+        CronJob {
+            id: CronJobId::from_raw("job-1"),
+            name: "早报".into(),
+            version: 3,
+            trigger: Trigger::Cron {
+                expr: "0 9 * * *".into(),
+                tz: TimeZone::new("Asia/Shanghai"),
+            },
+            prompt: "整理".into(),
+            workdir: None,
+            status: JobStatus::Active,
+            overlap: OverlapPolicy::Skip,
+            model: None,
+            effort: None,
+            skills: vec![],
+            max_rounds: None,
+            notify: Default::default(),
+            next_run_at: Some(NOW),
+            last_error: None,
+        }
+    }
+
+    #[test]
+    fn add_says_which_job_it_made_and_when_it_will_next_run() {
+        let line = added_line(&job());
+        assert!(line.contains("早报"), "{line}");
+        assert!(line.contains("job-1"), "后面每条命令都要这个 ID：{line}");
+        assert!(line.contains("2026-09-16 01:00:00"), "{line}");
+    }
+
+    /// 一个算不出槽位的 Job（区名解析不了一类）不该印成"下一次 1970"。
+    #[test]
+    fn add_says_dash_when_there_is_no_next_slot() {
+        let mut job = job();
+        job.next_run_at = None;
+        assert!(added_line(&job).contains("—"), "{}", added_line(&job));
+    }
+
+    /// `pause` / `resume` **不递增版本**（§7.2 / §10）——印出来才说得清。
+    #[test]
+    fn pause_prints_the_version_it_did_not_bump() {
+        let mut job = job();
+        job.status = JobStatus::Paused;
+        let line = status_line(&job);
+        assert!(line.contains("暂停"), "{line}");
+        assert!(line.contains("v3"), "版本没动，而这句话要说得出：{line}");
+
+        let mut done = job.clone();
+        done.status = JobStatus::Done;
+        done.next_run_at = None;
+        let line = status_line(&done);
+        assert!(line.contains("已完成"), "{line}");
+        assert!(line.contains("—"), "{line}");
+    }
+
+    /// 手动触发要印会话号——「Cron 的结果去原 Session 查看」（§10），而它不写触发
+    /// 记录，事后在清单上找不到。
+    #[test]
+    fn a_manual_run_prints_the_session_to_look_at() {
+        let line = manual_run_line(&komo_kernel::protocol::http::ManualCronRunResponse {
+            job: CronJobId::from_raw("job-1"),
+            session: SessionId::from_raw("sess-9"),
+            run: RunId::from_raw("run-9"),
+            request_key: RequestKeys::fresh(NOW),
+        });
+        assert!(line.contains("sess-9"), "{line}");
+        assert!(line.contains("run-9"), "{line}");
+        assert!(line.contains("不推进槽位"), "{line}");
+    }
+
+    /// 「移除后续调度，**已有执行历史保留**」（§13.1）：保留了多少条要说出来。
+    #[test]
+    fn remove_says_how_much_history_it_kept() {
+        let line = removed_line(&komo_kernel::protocol::http::CronDeleteResponse {
+            job: CronJobId::from_raw("job-1"),
+            removed: true,
+            firings_kept: 7,
+        });
+        assert!(line.contains("已移除后续调度"), "{line}");
+        assert!(line.contains("7"), "{line}");
+
+        let line = removed_line(&komo_kernel::protocol::http::CronDeleteResponse {
+            job: CronJobId::from_raw("job-2"),
+            removed: false,
+            firings_kept: 0,
+        });
+        assert!(line.contains("本来就没有"), "{line}");
+    }
+
+    /// `--overlap` / `--notify` 写错**当场拒绝**，并说出接受哪几个词——不静默当默认。
+    #[test]
+    fn a_misspelled_flag_is_refused_with_the_accepted_spellings() {
+        let err = parse_overlap("skipp").unwrap_err();
+        assert!(err.contains("skip") && err.contains("allow"), "{err}");
+        assert_eq!(parse_overlap(" Skip ").unwrap(), OverlapPolicy::Skip);
+        assert_eq!(parse_overlap("ALLOW").unwrap(), OverlapPolicy::Allow);
+
+        assert!(NotifyPolicy::parse("nerver").is_none());
+        assert_eq!(NotifyPolicy::parse("never"), Some(NotifyPolicy::Never));
+    }
 }

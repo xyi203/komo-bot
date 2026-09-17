@@ -30,6 +30,8 @@ pub struct CronJobRow {
     pub skills: String,
     /// `0` = 不限。
     pub max_rounds: i64,
+    /// `NotifyPolicy`：always / on_error / never。
+    pub notify: String,
     /// `0` = 没有下一个槽位。
     pub next_run_at: i64,
     /// 触发 / 配置层面的问题。执行失败记在 firing 上，不记这里。
@@ -44,7 +46,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "cron_jobs" ("id" TEXT NOT NULL, "name" TEXT NOT NULL, "version" BIGINT NOT NULL, "trigger" TEXT NOT NULL, "prompt" TEXT NOT NULL, "workdir" TEXT, "status" TEXT NOT NULL, "overlap" TEXT NOT NULL, "model" TEXT, "effort" TEXT, "skills" TEXT NOT NULL, "max_rounds" BIGINT NOT NULL, "next_run_at" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "cron_jobs" ("id" TEXT NOT NULL, "name" TEXT NOT NULL, "version" BIGINT NOT NULL, "trigger" TEXT NOT NULL, "prompt" TEXT NOT NULL, "workdir" TEXT, "status" TEXT NOT NULL, "overlap" TEXT NOT NULL, "model" TEXT, "effort" TEXT, "skills" TEXT NOT NULL, "max_rounds" BIGINT NOT NULL, "notify" TEXT NOT NULL, "next_run_at" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -59,6 +61,7 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("effort", "TEXT"),
     ColumnSpec::new("skills", "TEXT NOT NULL DEFAULT '[]'"),
     ColumnSpec::new("max_rounds", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("notify", "TEXT NOT NULL DEFAULT 'always'"),
     ColumnSpec::new("next_run_at", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("last_error", "TEXT"),
     ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),

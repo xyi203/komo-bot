@@ -6,7 +6,7 @@
 //! `with_write_retry` 干净重跑一次后看见行已在，答 `false`。
 
 use async_trait::async_trait;
-use komo_kernel::cron::{CronFiring, CronJob, JobStatus};
+use komo_kernel::cron::{CronFiring, CronJob, FiringStatus, JobStatus, NotifyPolicy};
 use komo_kernel::traits::{CronRepo, RepoError, StoreError};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{CronJobId, RunId, SessionId};
@@ -151,6 +151,7 @@ impl CronRepo for TursoCronRepo {
                                 .effort(job.effort.as_ref().map(|e| e.to_string()))
                                 .skills(encode(&job.skills)?)
                                 .max_rounds(i64::from(job.max_rounds.unwrap_or(0)))
+                                .notify(job.notify.as_str())
                                 .next_run_at(to_ts_opt(job.next_run_at))
                                 .last_error(job.last_error.clone())
                                 .updated_at(to_ts(now))
@@ -175,6 +176,7 @@ impl CronRepo for TursoCronRepo {
                                 effort: job.effort.as_ref().map(|e| e.to_string()),
                                 skills: encode(&job.skills)?,
                                 max_rounds: i64::from(job.max_rounds.unwrap_or(0)),
+                                notify: job.notify.as_str(),
                                 next_run_at: to_ts_opt(job.next_run_at),
                                 last_error: job.last_error.clone(),
                                 created_at: to_ts(now),
@@ -290,11 +292,43 @@ impl CronRepo for TursoCronRepo {
                         prompt: firing.prompt.clone(),
                         session_id: firing.session.as_ref().map(|s| s.to_string()),
                         run_id: firing.run.as_ref().map(|r| r.to_string()),
+                        status: firing.status.as_str(),
+                        error: firing.error.clone(),
                         created_at: to_ts(now),
                     })
                     .exec(ex)
                     .await
                     .map_err(map_toasty)?;
+                    Ok(true)
+                }) as BoxFuture<'_, Result<bool, StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
+    async fn update_firing(&self, firing: CronFiring) -> Result<bool, RepoError> {
+        self.db
+            .with_write_retry(move |ex| {
+                let firing = firing.clone();
+                Box::pin(async move {
+                    let id = firing_id(&firing.job, firing.scheduled_at);
+                    let Some(mut row) = CronFiringRow::filter_by_id(&id)
+                        .first()
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?
+                    else {
+                        // 手动 run 没有触发记录：说"没有这一行"，不是报错。
+                        return Ok(false);
+                    };
+                    row.update()
+                        .session_id(firing.session.as_ref().map(|s| s.to_string()))
+                        .run_id(firing.run.as_ref().map(|r| r.to_string()))
+                        .status(firing.status.as_str())
+                        .error(firing.error.clone())
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?;
                     Ok(true)
                 }) as BoxFuture<'_, Result<bool, StoreError>>
             })
@@ -363,12 +397,26 @@ impl CronRepo for TursoCronRepo {
                             prompt: row.prompt,
                             session: row.session_id.map(SessionId::from_raw),
                             run: row.run_id.map(RunId::from_raw),
+                            status: firing_status(&row.status),
+                            error: row.error,
                         })
                         .collect::<Vec<_>>())
                 }) as BoxFuture<'_, Result<Vec<CronFiring>, StoreError>>
             })
             .await
             .map_err(RepoError::from)
+    }
+}
+
+/// 一个读不出来的触发状态读成 `queued`——**不要让一行数据把整张历史带走**（§10 那条
+/// 「跳过一个读不出来的 cron job」是同一条理由）。
+fn firing_status(raw: &str) -> FiringStatus {
+    match raw {
+        "ok" => FiringStatus::Ok,
+        "error" => FiringStatus::Error,
+        "waiting" => FiringStatus::Waiting,
+        "skipped" => FiringStatus::Skipped,
+        _ => FiringStatus::Queued,
     }
 }
 
@@ -398,6 +446,9 @@ fn job_from_row(row: &CronJobRow) -> Result<CronJob, StoreError> {
             .as_ref()
             .map(komo_kernel::types::model::Effort::new),
         skills: decode(&row.skills, "cron_jobs.skills")?,
+        // 一个写不出来的 notify 读成默认的 `always`，不是整行读不出来：投多一条胜过
+        // 让一个 Job 从清单里消失。
+        notify: NotifyPolicy::parse(&row.notify).unwrap_or_default(),
         max_rounds: (row.max_rounds > 0).then_some(row.max_rounds as u32),
         next_run_at: from_ts_opt(row.next_run_at),
         last_error: row.last_error.clone(),
@@ -437,6 +488,7 @@ mod tests {
             effort: None,
             skills: vec!["memos".into()],
             max_rounds: Some(12),
+            notify: Default::default(),
             next_run_at: Some(NOW - time::Duration::minutes(1)),
             last_error: None,
         }
@@ -450,6 +502,8 @@ mod tests {
             prompt: "整理今天的动态".into(),
             session: None,
             run: None,
+            status: Default::default(),
+            error: None,
         }
     }
 
@@ -554,6 +608,67 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(repo.firings(&id, 10).await.unwrap().len(), 2);
+    }
+
+    /// `notify` 与触发状态是真的列，不是内存里的东西——**重启之后还在**。
+    #[tokio::test]
+    async fn notify_and_firing_status_survive_a_reopen() {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let path = dir.path().join("state.db");
+        let id = CronJobId::from_raw("job-1");
+
+        {
+            let db = Db::connect(&path).await.expect("打开库");
+            let repo = TursoCronRepo::new(db);
+            let mut j = job("job-1");
+            j.notify = NotifyPolicy::OnError;
+            j.workdir = Some(std::path::PathBuf::from("/tmp"));
+            repo.put(j).await.unwrap();
+            repo.claim_firing(firing(&id, NOW)).await.unwrap();
+            assert!(
+                repo.update_firing(CronFiring {
+                    session: Some(SessionId::from_raw("sess-1")),
+                    run: Some(RunId::from_raw("run-1")),
+                    status: FiringStatus::Waiting,
+                    error: Some("停在审批上".into()),
+                    ..firing(&id, NOW)
+                })
+                .await
+                .unwrap()
+            );
+        }
+
+        // 同一个数据目录再打开一次 = 重启。
+        let db = Db::connect(&path).await.expect("重新打开");
+        let repo = TursoCronRepo::new(db);
+        let read = repo.get(&id).await.unwrap().unwrap();
+        assert_eq!(read.notify, NotifyPolicy::OnError);
+        assert_eq!(read.workdir, Some(std::path::PathBuf::from("/tmp")));
+
+        let firings = repo.firings(&id, 10).await.unwrap();
+        assert_eq!(firings.len(), 1);
+        assert_eq!(firings[0].status, FiringStatus::Waiting);
+        assert_eq!(firings[0].error.as_deref(), Some("停在审批上"));
+        assert_eq!(firings[0].run, Some(RunId::from_raw("run-1")));
+
+        // **重启不重复创建同次触发**（§14 阶段 7 第一句）：同一个 `scheduled_at`
+        // 第二次 claim 仍然是 `false`，而且**不覆盖**已经记下的那一行。
+        assert!(!repo.claim_firing(firing(&id, NOW)).await.unwrap());
+        let after = repo.firings(&id, 10).await.unwrap();
+        assert_eq!(after.len(), 1, "还是一条");
+        assert_eq!(after[0].status, FiringStatus::Waiting, "没有被盖回 queued");
+        assert_eq!(after[0].run, Some(RunId::from_raw("run-1")));
+    }
+
+    /// 一条不存在的触发记录：`update_firing` 答 `false`，不是错误。
+    ///
+    /// 手动 run 本来就没有触发记录（§10：不冒充定时触发），所以"没有这一行"是常态。
+    #[tokio::test]
+    async fn updating_a_firing_that_is_not_there_says_so_without_failing() {
+        let (db, _dir) = temp().await;
+        let repo = TursoCronRepo::new(db);
+        let id = CronJobId::from_raw("job-1");
+        assert!(!repo.update_firing(firing(&id, NOW)).await.unwrap());
     }
 
     /// 并发抢同一个计划时间也只成一次。

@@ -11,8 +11,8 @@ use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::protocol::http::{ApprovalDecisionResponse, ApprovalRecord, SubmitRunResponse};
 use komo_kernel::traits::{
-    ApprovalRepo, Clock, CronRepo, GatewayError, Ledger, LlmClient, MemoryRepo, RepoError,
-    RunQueue, StoreError, ToolOutputStore,
+    ApprovalRepo, Clock, CronRepo, EmbeddingClient, GatewayError, Ledger, LlmClient, MemoryRepo,
+    RepoError, RunQueue, StoreError, ToolOutputStore,
 };
 use komo_kernel::types::chat::{ApprovalScope, ChannelPeer, PeerId};
 use komo_kernel::types::ids::{ApprovalId, ExecutorId, RequestKey, RunId, SessionId};
@@ -25,6 +25,9 @@ use komo_runtime::agent::{AgentLoop, Budget, ResumedRound, RetryBudget, Segment}
 use komo_runtime::approvals::ApprovalGate;
 use komo_runtime::config::{ConfigHolder, EffortCapabilities};
 use komo_runtime::executor::{CallEnv, ToolExecutor};
+use komo_runtime::memory::{
+    DbMemoryWork, LedgerEvents, MemoryManager, MemoryParts, MemoryPreamble,
+};
 use komo_runtime::policy::PolicyEngine;
 use komo_runtime::recovery::{RecoveryIndex, RecoveryScan, UnfinishedRun};
 use komo_runtime::scheduler::{HandlerError, Scheduler, SchedulerConfig, Waker};
@@ -202,6 +205,10 @@ pub struct GatewayState {
     pub approval_repo: Arc<dyn ApprovalRepo>,
     pub cron: Arc<dyn CronRepo>,
     pub memory: Arc<dyn MemoryRepo>,
+    /// §9 的那一层：召回与注入、自动积累、向量索引与代次。
+    pub memories: Arc<MemoryManager>,
+    /// 记忆注入接在系统提示后面的那一口。热重载重建模型后端时要把它接回去，所以留着。
+    pub preamble: Arc<MemoryPreamble>,
     pub recovery_store: RecoveryStore,
     pub deliveries: Arc<TursoDeliveryRepo>,
     pub notifier: Arc<HomeNotifier>,
@@ -245,6 +252,8 @@ pub struct Assembly {
     pub token: String,
     /// 测试注入的模型后端；`None` = 按配置造。
     pub llm: Option<Arc<dyn LlmClient>>,
+    /// 测试注入的向量后端；`None` = 按 `[memory.embedding]` 造（造不出来就只有关键词臂）。
+    pub embeddings: Option<Arc<dyn EmbeddingClient>>,
     pub tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
     /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
     pub channels: Vec<Arc<dyn ChannelFactory>>,
@@ -262,6 +271,7 @@ impl GatewayState {
             instance_id,
             token,
             llm,
+            embeddings,
             tools,
             channels: factories,
         } = parts;
@@ -301,9 +311,27 @@ impl GatewayState {
         ));
         let notifier = Arc::new(HomeNotifier::new(delivery_log, Arc::clone(&config)));
 
+        // 记忆这一层要**先于**模型后端装好：注入是系统提示的一部分，而
+        // `LlmFactory::with_preamble` 在造后端时就要拿到它（§9.4）。
+        let embeddings = match embeddings {
+            Some(client) => Some(client),
+            None => build_embeddings(&snapshot, &config).await,
+        };
+        let memories = Arc::new(MemoryManager::new(MemoryParts {
+            config: snapshot.memory.clone(),
+            repo: Arc::clone(&memory),
+            catalog: Arc::new(TursoMemoryRepo::new(db.clone())),
+            embeddings,
+            llm: Arc::clone(&llm_for_memory(&snapshot, &config, &caps, llm.as_ref())),
+            events: Arc::new(LedgerEvents(Arc::clone(&routed) as Arc<dyn Ledger>)),
+            work: Arc::new(DbMemoryWork::new(db.clone(), Arc::clone(&clock))),
+            clock: Arc::clone(&clock),
+        }));
+        let preamble = Arc::new(MemoryPreamble::new(Arc::clone(&memories)));
+
         let llm = Arc::new(SwappableLlm::new(match llm {
             Some(client) => client,
-            None => build_llm(&snapshot, &config, &caps),
+            None => build_llm(&snapshot, &config, &caps, &preamble),
         }));
 
         // 一次 Run 的三个账本写入者（执行器、AgentLoop、handler）共用这一个句柄。
@@ -333,15 +361,25 @@ impl GatewayState {
         let max_rounds = Budget::default().max_rounds;
         let max_retries = RetryBudget::default().max_attempts;
 
-        let segments = Arc::new(GatewaySegments::new(
-            Arc::clone(&routed),
-            db.clone(),
-            Arc::clone(&approval_repo),
-            RecoveryStore::new(db.clone(), sessions_root.clone()),
-            snapshot.paths.workspaces_dir.clone(),
-            max_rounds,
-            max_retries,
-        ));
+        let segments = Arc::new(
+            GatewaySegments::new(
+                Arc::clone(&routed),
+                db.clone(),
+                Arc::clone(&approval_repo),
+                RecoveryStore::new(db.clone(), sessions_root.clone()),
+                snapshot.paths.workspaces_dir.clone(),
+                max_rounds,
+                max_retries,
+            )
+            // Cron Run 用它那个 Job 的执行预算（§10）。
+            .with_cron(Arc::clone(&cron))
+            // 每一段装配时按当前用户输入召回一次，并把用到的条目记进
+            // `TurnRequest::memories`（§9.7 的审计证据）。
+            .with_memories(
+                Arc::clone(&memories),
+                komo_store::CheckpointStore::new(db.clone()),
+            ),
+        );
 
         let handler = Arc::new(AgentRunHandler::new(
             agent,
@@ -380,6 +418,8 @@ impl GatewayState {
             approval_repo,
             cron,
             memory,
+            memories,
+            preamble,
             recovery_store,
             deliveries,
             notifier,
@@ -430,11 +470,45 @@ impl GatewayState {
         .with_waker(self.waker())
     }
 
+    /// 这一轮扫描投出去的每一次触发都找个人盯着（§10 的最后两步）。
+    ///
+    /// Cron 没有来源会话，所以"等待审批"这条路只能从这里投到 home chat——不盯着，
+    /// 一个 Cron Run 会停在等待上而没有人知道它在等（§7.4 / §11.4）。
+    pub async fn watch_fired(self: &Arc<Self>, fired: &[komo_runtime::scheduler::Fired]) {
+        for one in fired {
+            // Job 可能在触发与这一刻之间被改了；读不出来就按默认的 `always` 盯着，
+            // **投多一条胜过一次静默的等待**。
+            let job = self.cron.get(&one.job).await.ok().flatten();
+            match job {
+                Some(job) => self.watch_cron_run(one, &job, true),
+                None => tracing::debug!(job = %one.job, "触发之后这个 Job 不在了，不盯了"),
+            }
+        }
+    }
+
+    /// 盯一次触发。`scheduled = false` 是手动 run：它**没有触发记录**（§10：不冒充
+    /// 定时触发），所以只投递，不回写状态。
+    pub fn watch_cron_run(
+        self: &Arc<Self>,
+        fired: &komo_runtime::scheduler::Fired,
+        job: &komo_kernel::cron::CronJob,
+        scheduled: bool,
+    ) {
+        super::cron_watch::watch(
+            Arc::clone(self),
+            super::cron_watch::Watched::of(fired, job, scheduled),
+        );
+    }
+
     /// 模型 / 凭证变了：换掉实例。**正在跑的 Run 不换**——它握着自己那一个 driver。
     pub fn rebuild_llm(&self) {
         let snapshot = self.snapshot();
-        self.llm
-            .swap(build_llm(&snapshot, &self.config, &self.caps));
+        self.llm.swap(build_llm(
+            &snapshot,
+            &self.config,
+            &self.caps,
+            &self.preamble,
+        ));
         tracing::info!("模型后端已按新配置重建（正在跑的 Run 不受影响）");
     }
 
@@ -529,6 +603,7 @@ impl GatewayState {
                 peer: peer.clone(),
                 // 「新 Run 在 `accept_input` 时抓一份模型 / effort 快照」（§3 第 2 步）。
                 model: model.unwrap_or_else(|| snapshot.model.clone()),
+                workdir: None,
                 at: self.clock.now(),
             })
             .await?;
@@ -560,9 +635,21 @@ impl GatewayState {
                 .ok_or_else(|| GatewayError::NotFound {
                     what: format!("审批 {approval}"),
                 })?;
+        // 范围授权（§7.2 的第二、第三种）：先把**范围**落成一条授权，再把决定写下来并
+        // 指着它。顺序是这一边的：一条写不下的授权只该让这次批准**降级成 `Once`**，
+        // 不该让批准本身失败——操作者已经说了"可以"，而一条授权写不下去不改变这件事。
+        //
+        // 落不成范围的（计划里没有 Run、在交互 Run 里说 `cron`、Policy 根本没给这个
+        // 范围）一律按 `Once` 处理，**不静默放宽**：一句说错的话不该变成一条比它宽的
+        // 授权。
+        let grant = if approved && scope != ApprovalScope::Once {
+            self.mint_grant(&record, scope).await
+        } else {
+            None
+        };
         let response = self
             .approvals
-            .decide(approval, approved, scope, by)
+            .decide_with_grant(approval, approved, scope, by, grant)
             .await
             .map_err(GatewayError::from)?;
 
@@ -602,6 +689,43 @@ impl GatewayState {
             }
         }
         Ok(response)
+    }
+
+    /// 操作者答应的那个范围，落成一条授权。
+    ///
+    /// Policy 没在这条请求上给出这个范围就不给——`record.scopes` 是 §11.3 的
+    /// 「只对 Policy 标记为可范围化的计划生效」在代码里的样子。
+    async fn mint_grant(
+        &self,
+        record: &komo_kernel::protocol::http::ApprovalRecord,
+        scope: ApprovalScope,
+    ) -> Option<komo_kernel::policy::Grant> {
+        if !record.scopes.contains(&scope) {
+            tracing::info!(
+                approval = %record.approval,
+                ?scope,
+                "Policy 没给这个范围，按本次调用处理"
+            );
+            return None;
+        }
+        let grant_scope = komo_kernel::policy::scope_for(&record.plan, scope)?;
+        let grant = komo_kernel::policy::Grant {
+            id: komo_kernel::types::ids::GrantId::new_at(self.clock.now()),
+            approval: record.approval.clone(),
+            scope: grant_scope,
+            granted_at: self.clock.now(),
+            // 授权跟着审批本身的有效期走（§8.4：过期不能按旧指令直接产生新的外部影响）。
+            valid_until: record.valid_until,
+            consumed: false,
+            reason: record.reason.clone(),
+        };
+        match self.approval_repo.put_grant(grant).await {
+            Ok(grant) => Some(grant),
+            Err(error) => {
+                tracing::warn!(%error, approval = %record.approval, "范围授权写不下，按本次调用处理");
+                None
+            }
+        }
     }
 
     /// 把结论投回**当初投过这条审批的每一个会话**（§11.4）。
@@ -727,6 +851,11 @@ impl GatewayState {
         written
     }
 
+    /// 把卡在 `processing` 的记忆处理放回 `pending`（§9.3）。返回放回了几行。
+    pub async fn requeue_memory_work(&self) -> Result<u64, GatewayError> {
+        Ok(komo_store::repos::runs::requeue_stuck_memory_work(&self.db).await?)
+    }
+
     /// 把一个等着的 Run 放回队列并叫醒调度器（`/approve` 之后、`resume` 之后都走它）。
     pub async fn wake_run(&self, run: &RunId) -> Result<(), GatewayError> {
         self.recovery_store.requeue(run).await?;
@@ -767,13 +896,60 @@ pub const HOME_ORIGIN: &str = "home";
 /// 一次补写最多处理多少条审计事件。
 const AUDIT_DRAIN_LIMIT: usize = 128;
 
+/// 记忆提取 / 冲突整理用的那个后端。
+///
+/// 测试注入了模型时就用那一个（脚本化的 driver 要同时答两种问）；否则按快照造一份自己
+/// 的 [`RoutingLlm`]——它**不带 preamble**：记忆模型不读记忆，注入只属于对话那一路。
+fn llm_for_memory(
+    snapshot: &ConfigSnapshot,
+    config: &ConfigHolder,
+    caps: &EffortCapabilities,
+    injected: Option<&Arc<dyn LlmClient>>,
+) -> Arc<dyn LlmClient> {
+    if let Some(client) = injected {
+        return Arc::clone(client);
+    }
+    let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone());
+    match komo_runtime::llm::RoutingLlm::from_snapshot(snapshot, factory) {
+        Ok(routing) => Arc::new(routing),
+        Err(error) => Arc::new(UnconfiguredLlm::new(error.to_string())),
+    }
+}
+
+/// 按 `[memory.embedding]` 造向量后端。
+///
+/// **端点这一刻不通不该让 Gateway 起不来**：没有向量客户端时 hybrid 会如实降级并说明
+/// 原因（§9.4），这比一个起不来的进程强。配了 `dimensions` 就不碰网络；省略时要探一次
+/// （§9.5），那一次探测失败就是这里唯一会用到网络的地方。
+async fn build_embeddings(
+    snapshot: &ConfigSnapshot,
+    config: &ConfigHolder,
+) -> Option<Arc<dyn EmbeddingClient>> {
+    if !snapshot.memory.enabled {
+        return None;
+    }
+    let embedding = snapshot.memory.embedding.as_ref()?;
+    let transport = komo_runtime::llm::default_transport();
+    match komo_runtime::embedding::connect_embedding(embedding, &config.secrets(), transport).await
+    {
+        Ok(client) => Some(client),
+        Err(error) => {
+            tracing::warn!(%error, "向量后端造不出来：检索这一侧会如实报降级，不静默当成关键词模式");
+            None
+        }
+    }
+}
+
 /// 按快照造模型后端；造不出来就退到 [`UnconfiguredLlm`]，**不让 Gateway 起不来**。
 fn build_llm(
     snapshot: &ConfigSnapshot,
     config: &ConfigHolder,
     caps: &EffortCapabilities,
+    preamble: &Arc<MemoryPreamble>,
 ) -> Arc<dyn LlmClient> {
-    let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone());
+    let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone())
+        // 记忆注入的位置（§9.4）：正文由 MemoryManager 给，这里只是把它放进系统提示。
+        .with_preamble(Arc::clone(preamble) as Arc<dyn komo_runtime::llm::SystemPreamble>);
     match komo_runtime::llm::RoutingLlm::from_snapshot(snapshot, factory) {
         Ok(routing) => Arc::new(routing),
         Err(error) => {

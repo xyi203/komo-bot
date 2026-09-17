@@ -695,6 +695,7 @@ mod tests {
             },
             peer: None,
             model: sample_model(),
+            workdir: None,
             at: time::macros::datetime!(2026-09-16 08:00:00 UTC),
         }
     }

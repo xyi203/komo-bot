@@ -33,6 +33,9 @@ struct LedgerState {
     /// attempt → call
     attempts: BTreeMap<AttemptId, ToolCallId>,
     sessions: BTreeMap<RunId, SessionId>,
+    /// 收到过的输入，原样留着。`workdir` 一类**不进事件**的字段只能从这里问
+    /// （它落在 `sessions.workdir` 那一列上，见 `komo_store::coordinator`）。
+    inputs: Vec<AcceptInput>,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +64,11 @@ impl MemLedger {
     /// 到目前为止写下的全部事件。
     pub fn events(&self) -> Vec<Event> {
         self.state.lock().expect("账本").events.clone()
+    }
+
+    /// 收到过的输入，按顺序。
+    pub fn accepted(&self) -> Vec<AcceptInput> {
+        self.state.lock().expect("账本").inputs.clone()
     }
 
     /// 折出来的现状——替身"够真"的那部分就在这：它折得出来。
@@ -104,6 +112,7 @@ impl MemLedger {
 impl Ledger for MemLedger {
     async fn accept_input(&self, input: AcceptInput) -> Result<Accepted, LedgerError> {
         let mut state = self.state.lock().expect("账本");
+        state.inputs.push(input.clone());
         let hash = input.input_hash();
         if let Some((run, previous)) = state.accepted.get(input.request_key.as_str()).cloned() {
             if previous != hash {

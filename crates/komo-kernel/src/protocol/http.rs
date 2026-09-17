@@ -27,13 +27,13 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use super::config::{ConfigIssue, KeyPath, SourceFile};
-use crate::cron::{CronJob, JobStatus, OverlapPolicy};
+use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
 use crate::types::chat::{ApprovalScope, PeerId};
 use crate::types::ids::{
     ApprovalId, CronJobId, MemoryId, RequestKey, RunId, Seq, SessionId, ShortId,
 };
 use crate::types::memory::{MemoryItem, MemoryScope, MemoryState, RetrievalMode};
-use crate::types::model::{Effort, EmbeddingSpace};
+use crate::types::model::{Effort, EmbeddingSpace, ModelConfig};
 use crate::types::plan::{ExecutionPlan, PlanHash, PlanSource};
 use crate::types::status::RunStatus;
 
@@ -408,6 +408,26 @@ pub struct ApprovalDecisionResponse {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CronListResponse {
     pub jobs: Vec<CronJob>,
+    /// 每个 Job 的**最近一次触发**与下一次时间（§10「Cron 的结果去原 Session 查看」的
+    /// 入口）。与 `jobs` 按 `job` 对齐，不按下标——一个读不出来的 Job 会从 `jobs` 里
+    /// 掉出去，按下标配对就会错位。
+    #[serde(default)]
+    pub status: Vec<CronJobStatus>,
+}
+
+/// 一个 Job 的运行面：下一次什么时候，上一次怎么样。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CronJobStatus {
+    pub job: CronJobId,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub next_run_at: Option<OffsetDateTime>,
+    /// 最近一次触发。没有就是这个 Job 还没响过。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<CronFiring>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -430,6 +450,13 @@ pub struct CreateCronRequest {
     pub overlap: OverlapPolicy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    /// 触发结果的投递规则（§10 的 `notify`）。缺省 `always`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<NotifyPolicy>,
+    /// **完整**模型配置覆盖（§10：「覆盖按完整模型配置解析」）。给了它就整份用它，
+    /// `model` 那个名字被忽略——不拿一个模型名去配另一个端点。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_config: Option<ModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<RequestKey>,
 }
@@ -452,6 +479,43 @@ pub struct UpdateCronRequest {
     pub overlap: Option<OverlapPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 见 [`CreateCronRequest::model_config`]。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_config: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<NotifyPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<RequestKey>,
+}
+
+impl UpdateCronRequest {
+    /// 这次 PATCH 改的是**定义**吗（§7.2 / §10：改定义 → 版本 +1，绑定这个 Job 的授权
+    /// 失效）。
+    ///
+    /// `status` 单独一个不算：`pause` / `resume` 不是定义变更，让它递增版本等于让操作者
+    /// 每暂停一次就重批一遍授权。
+    pub fn changes_definition(&self) -> bool {
+        self.name.is_some()
+            || self.schedule.is_some()
+            || self.timezone.is_some()
+            || self.prompt.is_some()
+            || self.overlap.is_some()
+            || self.max_rounds.is_some()
+            || self.workdir.is_some()
+            || self.skills.is_some()
+            || self.model.is_some()
+            || self.model_config.is_some()
+            || self.effort.is_some()
+            || self.notify.is_some()
+    }
 }
 
 /// `POST /v1/cron/{id}/run`：手动触发。
@@ -486,7 +550,17 @@ pub struct CronDeleteResponse {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryListQuery {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// **query string 里是一行文本**（`personal` / `project:<id>` / `environment:<id>`），
+    /// JSON 里是一个带 `kind` 的对象——[`MemoryScope`] 的文档说的就是这两种写法。
+    ///
+    /// 这里必须有一个自定义反序列化：`?scope=` 送来的是字符串，而 `MemoryScope` 是内部
+    /// 标记的枚举，`serde_urlencoded` 对着它只会报 "expected internally tagged enum"。
+    /// 两种写法都收，于是文档里那句往返关系才真的成立。
+    #[serde(
+        default,
+        deserialize_with = "scope_from_text_or_object",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub scope: Option<MemoryScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<MemoryState>,
@@ -496,6 +570,31 @@ pub struct MemoryListQuery {
     pub mode: Option<RetrievalMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+}
+
+/// `?scope=project:komo` 与 `{"kind":"project","project_id":"komo"}` 都收。
+fn scope_from_text_or_object<'de, D>(deserializer: D) -> Result<Option<MemoryScope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Either {
+        Text(String),
+        Object(MemoryScope),
+    }
+
+    match Option::<Either>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Either::Object(scope)) => Ok(Some(scope)),
+        Some(Either::Text(text)) if text.trim().is_empty() => Ok(None),
+        Some(Either::Text(text)) => text
+            .parse::<MemoryScope>()
+            .map(Some)
+            .map_err(D::Error::custom),
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -648,6 +747,46 @@ mod tests {
         let request: ApprovalDecisionRequest =
             serde_json::from_str(r#"{"approved":true}"#).unwrap();
         assert_eq!(request.scope, ApprovalScope::Once);
+    }
+
+    /// `?scope=` 的两种写法都收得下——文档里那句"两种写法必须能互相还原"落到接口上。
+    ///
+    /// 这里用 JSON 的字符串值走**同一个**反序列化分支；真正的 query string 那一路在
+    /// `komo-gateway` 的 `tests/memory` 里端到端测（kernel 不依赖 `serde_urlencoded`）。
+    #[test]
+    fn a_scope_arrives_either_as_text_or_as_an_object() {
+        let from_text: MemoryListQuery =
+            serde_json::from_str(r#"{"scope":"project:komo","state":"candidate"}"#)
+                .expect("一行文本收得下");
+        assert_eq!(
+            from_text.scope,
+            Some(MemoryScope::Project {
+                project_id: "komo".into()
+            })
+        );
+        assert_eq!(from_text.state, Some(MemoryState::Candidate));
+
+        let from_object: MemoryListQuery =
+            serde_json::from_str(r#"{"scope":{"kind":"environment","instance_id":"nas"}}"#)
+                .expect("一个对象也收得下");
+        assert_eq!(
+            from_object.scope,
+            Some(MemoryScope::Environment {
+                instance_id: "nas".into()
+            })
+        );
+
+        assert_eq!(
+            serde_json::from_str::<MemoryListQuery>(r#"{"query":"x"}"#)
+                .unwrap()
+                .scope,
+            None,
+            "不写就是不筛"
+        );
+        assert!(
+            serde_json::from_str::<MemoryListQuery>(r#"{"scope":"team:x"}"#).is_err(),
+            "写错了要报错，不是静默不筛"
+        );
     }
 
     #[test]

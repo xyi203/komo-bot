@@ -409,6 +409,16 @@ pub trait ApprovalRepo: Send + Sync {
         now: OffsetDateTime,
     ) -> Result<ConsumedApproval, RepoError>;
 
+    /// 写下一条范围授权（§7.2 的第二、第三种）。
+    ///
+    /// **它不是"批准"**：批准是 [`ApprovalRepo::decide`] 那一行，这里只是把操作者答应
+    /// 的那个**范围**落成一条可以被 [`Grant::covers`](crate::policy::Grant::covers) 查到
+    /// 的记录。两步分开，是因为一条 `Once` 的批准根本不产生授权（审批自己按计划哈希
+    /// 绑定），而把两者合在一起就得让"没有授权"和"写不下授权"长成同一个样子。
+    ///
+    /// 幂等：同一个 [`GrantId`](crate::types::ids::GrantId) 重写覆盖原行。
+    async fn put_grant(&self, grant: Grant) -> Result<Grant, RepoError>;
+
     /// 这个 Run 当前有效的范围授权。
     async fn grants_for_run(
         &self,
@@ -459,6 +469,16 @@ pub trait CronRepo: Send + Sync {
     /// 插入一条触发记录并占住它。唯一键是 `job_id + scheduled_at`，**已经存在就返回
     /// `false`**——同一计划时间不重复创建运行（§10）。
     async fn claim_firing(&self, firing: CronFiring) -> Result<bool, RepoError>;
+
+    /// 给一条**已经存在**的触发记录补字段：它产生的 Session / Run，或它最终的状态。
+    ///
+    /// 与 [`CronRepo::claim_firing`] 分开是因为两件事不同：claim 回答"这一槽归谁"，
+    /// 它回答"那一槽后来怎么样了"。用 claim 兼做更新，就得靠它返回 `false` 来表示
+    /// "行已在、字段已补"，而那个 `false` 同时还是"别人抢走了"的意思——两个相反的结论
+    /// 一个返回值（§10「更新本次触发状态」）。
+    ///
+    /// 行不在时答 `false`，不是错误：一次手动 run 本来就没有触发记录。
+    async fn update_firing(&self, firing: CronFiring) -> Result<bool, RepoError>;
 
     /// 这个 Job 上一次触发还没结束吗（含等待审批、重试或结果核对）。
     async fn has_unfinished_firing(&self, id: &CronJobId) -> Result<bool, RepoError>;

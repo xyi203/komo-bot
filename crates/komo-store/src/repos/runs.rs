@@ -4,7 +4,7 @@
 //! 一切——建行、记事件引用、记终态、按请求键去重。
 
 use komo_kernel::traits::StoreError;
-use komo_kernel::types::ids::{EventId, ExecutorId, RequestKey, RunId, SessionId};
+use komo_kernel::types::ids::{EventId, ExecutorId, RequestKey, RunId, Seq, SessionId};
 use komo_kernel::types::memory::MemoryWork;
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::PlanSource;
@@ -34,6 +34,8 @@ pub struct RunRecord {
     pub rounds: u32,
     pub model: ModelConfig,
     pub memory_work: MemoryWork,
+    /// 记忆处理游标：这个 Run 的证据已经处理到哪条 seq（§9.3）。
+    pub memory_cursor: Seq,
     pub last_error: Option<String>,
 }
 
@@ -56,6 +58,7 @@ impl RunRecord {
             rounds: row.rounds.max(0) as u32,
             model: decode(&row.model_snapshot, "runs.model_snapshot")?,
             memory_work: decode(&format!("\"{}\"", row.memory_work), "runs.memory_work")?,
+            memory_cursor: Seq(row.memory_cursor.max(0) as u64),
             last_error: row.last_error.clone(),
         })
     }
@@ -381,4 +384,106 @@ async fn require(ex: &mut dyn Executor, run: &RunId) -> Result<RunRow, StoreErro
     get_in(ex, run).await?.ok_or_else(|| StoreError::NotFound {
         what: format!("run {run}"),
     })
+}
+
+// ---------------------------------------------------------------- Memory 处理游标（§9.3）
+
+/// 领取一批待处理的 Run：**终态 + `memory_work = pending`**，领到就翻成 `processing`。
+///
+/// 领取是"读—核对—写"，整段在 `with_write_retry` 的事务里：两个消费者同时扫到同一行
+/// 时，后提交的那个会冲突重跑，重跑时读到的已经是 `processing`，于是只有一个领到。
+/// 「进程崩溃后可重新领取」（§9.3）由 [`requeue_stuck_memory_work`] 在启动时完成——
+/// 一个 `processing` 但没人在处理的行，和一个从未处理过的行是同一件事。
+pub async fn claim_memory_work(db: &Db, limit: usize) -> Result<Vec<RunRecord>, StoreError> {
+    let limit = limit.max(1);
+    db.with_write_retry(move |ex| {
+        Box::pin(async move {
+            let rows = RunRow::all().exec(ex).await.map_err(map_toasty)?;
+            let mut candidates: Vec<RunRow> = Vec::new();
+            for row in rows {
+                let status = status_of(&row)?;
+                if !status.is_terminal() {
+                    continue;
+                }
+                if row.memory_work != memory_work_str(MemoryWork::Pending) {
+                    continue;
+                }
+                candidates.push(row);
+            }
+            candidates.sort_by(|a, b| a.id.cmp(&b.id));
+            candidates.truncate(limit);
+
+            let mut claimed = Vec::with_capacity(candidates.len());
+            for mut row in candidates {
+                let record = RunRecord::try_from_row(&row)?;
+                row.update()
+                    .memory_work(memory_work_str(MemoryWork::Processing))
+                    .exec(ex)
+                    .await
+                    .map_err(map_toasty)?;
+                claimed.push(RunRecord {
+                    memory_work: MemoryWork::Processing,
+                    ..record
+                });
+            }
+            Ok(claimed)
+        }) as BoxFuture<'_, Result<Vec<RunRecord>, StoreError>>
+    })
+    .await
+}
+
+/// 处理完：记状态与游标。**失败时调用方传 `Pending` 且不推进游标**——「失败不推进、
+/// 下次重试」（§9.3），而"重试"这件事在这张表上就是把标记放回 pending。
+pub async fn finish_memory_work(
+    db: &Db,
+    run: &RunId,
+    work: MemoryWork,
+    cursor: Seq,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let run = run.clone();
+    db.with_write_retry(move |ex| {
+        let run = run.clone();
+        Box::pin(async move {
+            let mut row = require(ex, &run).await?;
+            // 游标只进不退：重复处理相同来源不重复新增（§9.3）。
+            let cursor = row.memory_cursor.max(cursor.0 as i64);
+            row.update()
+                .memory_work(memory_work_str(work))
+                .memory_cursor(cursor)
+                .updated_at(to_ts(now))
+                .exec(ex)
+                .await
+                .map_err(map_toasty)?;
+            Ok(())
+        }) as BoxFuture<'_, Result<(), StoreError>>
+    })
+    .await
+}
+
+/// 启动时把卡在 `processing` 的行放回 `pending`（§9.3「进程崩溃后可重新领取」）。
+///
+/// 返回放回了几行。`processing` 是**进程内**的状态：没有哪个进程还握着上一次的那一批，
+/// 所以启动时它一定是"上次没跑完"，而不是"别人正在跑"——Gateway 只有一个实例（§8.7）。
+pub async fn requeue_stuck_memory_work(db: &Db) -> Result<u64, StoreError> {
+    db.with_write_retry(move |ex| {
+        Box::pin(async move {
+            let rows = RunRow::all().exec(ex).await.map_err(map_toasty)?;
+            let processing = memory_work_str(MemoryWork::Processing);
+            let mut requeued: u64 = 0;
+            for mut row in rows {
+                if row.memory_work != processing {
+                    continue;
+                }
+                row.update()
+                    .memory_work(memory_work_str(MemoryWork::Pending))
+                    .exec(ex)
+                    .await
+                    .map_err(map_toasty)?;
+                requeued += 1;
+            }
+            Ok(requeued)
+        }) as BoxFuture<'_, Result<u64, StoreError>>
+    })
+    .await
 }

@@ -224,6 +224,15 @@ impl ApprovalRepo for MemApprovalRepo {
         ))
     }
 
+    async fn put_grant(&self, grant: Grant) -> Result<Grant, RepoError> {
+        let mut state = self.state.lock().expect("审批");
+        match state.grants.iter_mut().find(|g| g.id == grant.id) {
+            Some(slot) => *slot = grant.clone(),
+            None => state.grants.push(grant.clone()),
+        }
+        Ok(grant)
+    }
+
     async fn grants_for_run(
         &self,
         run: &RunId,

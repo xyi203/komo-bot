@@ -37,18 +37,6 @@ impl TursoApprovalRepo {
         Self { db }
     }
 
-    /// 写入一条范围授权。审批决定与它在**同一个控制事务**里提交（§7.4）。
-    pub async fn put_grant(&self, grant: Grant) -> Result<Grant, RepoError> {
-        self.db
-            .with_write_retry(move |ex| {
-                let grant = grant.clone();
-                Box::pin(async move { put_grant_in(ex, &grant).await.map(|_| grant) })
-                    as BoxFuture<'_, Result<Grant, StoreError>>
-            })
-            .await
-            .map_err(RepoError::from)
-    }
-
     /// 读一条授权。
     pub async fn grant(
         &self,
@@ -311,6 +299,18 @@ impl ApprovalRepo for TursoApprovalRepo {
             .await
             // `StoreError::GrantMismatch` 逐个对上 `RepoError::GrantMismatch`（kernel 的
             // `From`），所以这里不再有字符串前缀那一道还原。
+            .map_err(RepoError::from)
+    }
+
+    /// 写入一条范围授权。
+    async fn put_grant(&self, grant: Grant) -> Result<Grant, RepoError> {
+        self.db
+            .with_write_retry(move |ex| {
+                let grant = grant.clone();
+                Box::pin(async move { put_grant_in(ex, &grant).await.map(|_| grant) })
+                    as BoxFuture<'_, Result<Grant, StoreError>>
+            })
+            .await
             .map_err(RepoError::from)
     }
 

@@ -6,10 +6,15 @@
 //! 所以分词挪到**索引时**——`memory_terms.terms` 是首尾带空格的 token 串，查询时每个
 //! token 一个 `instr(terms, ' tok ') > 0`，命中数按 IDF 加权（§9.4）。
 //!
-//! 这一波只做关键词臂。**向量臂是 W6 的事**，所以 `recall` 在 `hybrid` / `vector` 上
-//! 如实把 [`RecallResult::degraded`] 置位并说明原因——§9.4 的"向量服务故障时在检索元信
-//! 息中标记 degraded / 原因 / 覆盖率"要的就是这个；把故障解释成"没有相关记忆"是这里
-//! 唯一不能说的话。
+//! 两条臂都在这里，**融合也在这里**（[`fuse`]）：一次 `recall` 出去一趟数据库，回来的
+//! 是已经按 RRF 排好、按作用域与状态筛过的条目。向量由 [`RecallQuery::query_vector`]
+//! 交下来——仓储不认识 embedding 端点，也不该在一次读事务里发网络请求（§9.5「模型调用
+//! 期间不持有数据库事务」）。
+//!
+//! 向量臂拿不到查询向量、或者没有生效代次时，`hybrid` 退化为关键词并如实把
+//! [`RecallResult::degraded`] 置位、写清原因与覆盖率（§9.4）；`vector` 模式返回空集**并
+//! 且**带着 degraded，由上一层翻成"不可用"。把故障解释成"没有相关记忆"是这里唯一不能
+//! 说的话。
 
 use async_trait::async_trait;
 use komo_kernel::protocol::http::{IndexState, MemoryIndexStatus};
@@ -23,11 +28,17 @@ use komo_kernel::types::model::Vector;
 use time::OffsetDateTime;
 use toasty::Executor;
 
+#[cfg(test)]
+mod bench;
+mod catalog;
+mod fuse;
 mod terms;
 
 use crate::db::{
     BoxFuture, Db, column_i64, decode, encode, from_ts, from_ts_opt, map_toasty, to_ts, to_ts_opt,
 };
+pub use catalog::{GenerationRecord, IndexCandidate};
+pub use fuse::{RRF_K, cosine, decode_vector, encode_vector, reciprocal_rank_fusion};
 pub use terms::{lexical_terms, terms_column};
 
 use crate::models::{
@@ -258,7 +269,7 @@ impl MemoryRepo for TursoMemoryRepo {
                         return Ok(());
                     }
 
-                    let bytes: Vec<u8> = vector.0.iter().flat_map(|f| f.to_le_bytes()).collect();
+                    let bytes = encode_vector(&vector.0);
                     let key = vector_id(&id, revision, &row.content_hash, &generation);
                     if let Some(mut existing) = MemoryVectorRow::filter_by_id(&key)
                         .first()
@@ -327,15 +338,24 @@ impl MemoryRepo for TursoMemoryRepo {
                         });
                     };
 
-                    let vectors = MemoryVectorRow::filter(
-                        MemoryVectorRow::fields()
-                            .generation()
-                            .eq(active.id.as_str()),
+                    // **与向量臂用同一个 join**：代次要对，`revision` 与 `content_hash`
+                    // 也要对。一条改过正文的记忆留下的旧向量召回不到，那它就不该算进
+                    // 覆盖率——两处口径不一致时，"就绪"会是一句假话。
+                    let counted = toasty::sql::query(
+                        "SELECT COUNT(*) FROM memory_vectors v JOIN memory_items i \
+                         ON i.id = v.memory_id AND i.revision = v.revision \
+                         AND i.content_hash = v.content_hash \
+                         WHERE v.generation = ?1 AND i.state != 'forgotten'",
                     )
+                    .bind(active.id.clone())
                     .exec(ex)
                     .await
                     .map_err(map_toasty)?;
-                    let indexed = vectors.len() as u64;
+                    let indexed = counted
+                        .first()
+                        .and_then(|row| column_i64(row, 0))
+                        .unwrap_or(0)
+                        .max(0) as u64;
 
                     Ok(MemoryIndexStatus {
                         space: match &active.space {
@@ -408,6 +428,10 @@ async fn put_in(
 
     let content_hash = ContentHash::of_str(&item.content).as_str().to_string();
     let scope_kind = scope_kind(&item.scope);
+    let supersedes = match &item.supersedes {
+        Some(reference) => Some(encode(reference)?),
+        None => None,
+    };
     match existing {
         Some(mut row) => {
             row.update()
@@ -426,6 +450,7 @@ async fn put_in(
                 .extraction(encode(&item.extraction)?)
                 .usage_count(i64::try_from(item.usage.count).unwrap_or(i64::MAX))
                 .last_used_at(to_ts_opt(item.usage.last_used_at))
+                .supersedes(supersedes.clone())
                 .exec(ex)
                 .await
                 .map_err(map_toasty)?;
@@ -449,6 +474,7 @@ async fn put_in(
                 extraction: encode(&item.extraction)?,
                 usage_count: i64::try_from(item.usage.count).unwrap_or(i64::MAX),
                 last_used_at: to_ts_opt(item.usage.last_used_at),
+                supersedes: supersedes.clone(),
             })
             .exec(ex)
             .await
@@ -539,27 +565,88 @@ async fn clear_index_in(ex: &mut dyn Executor, id: &str) -> Result<(), StoreErro
     Ok(())
 }
 
+/// 向量臂为什么这一次没跑成。`None` = 跑成了。
+fn vector_unavailable(reason: &str) -> Option<String> {
+    Some(reason.to_string())
+}
+
 async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallResult, StoreError> {
-    // TODO(decide: 向量臂是 W6。这一波只有关键词臂，`hybrid` 与 `vector` 都如实标
-    // degraded；§9.4 说"未配置向量模型却选择 hybrid / vector 属于配置错误，不能静默变
-    // 成长期关键词模式"——那条判断在 MemoryManager 那一层，这里只负责不撒谎。)
-    let degraded = !matches!(query.mode, RetrievalMode::Keyword);
-    let degraded_reason = degraded.then(|| "向量臂尚未实现（W6），本次只走了关键词".to_string());
-
-    let tokens = lexical_terms(&query.text);
     let candidate_limit = query.candidate_limit.max(1) as usize;
+    let wants_keyword = !matches!(query.mode, RetrievalMode::Vector);
+    let wants_vector = !matches!(query.mode, RetrievalMode::Keyword);
 
-    // 候选：状态可召回 + 没过有效期 + 作用域命中。
+    let keyword = if wants_keyword {
+        keyword_arm(ex, query, candidate_limit).await?
+    } else {
+        Vec::new()
+    };
+
+    let mut vector_note: Option<String> = None;
+    let mut coverage = 0.0f32;
+    let vector = if wants_vector {
+        match vector_arm(ex, query, candidate_limit).await? {
+            VectorArm::Ran { ranked, covered } => {
+                coverage = covered;
+                ranked
+            }
+            VectorArm::Unavailable { reason } => {
+                vector_note = vector_unavailable(&reason);
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
+    // 「按排名融合（RRF），避免直接相加不同量纲的分数」（§9.4）。一条臂没跑时融合退化
+    // 成恒等，所以这里不必分支。
+    let mut arms: Vec<Vec<String>> = Vec::new();
+    if wants_keyword {
+        arms.push(keyword);
+    }
+    if wants_vector && vector_note.is_none() {
+        arms.push(vector);
+    }
+    let ranked = reciprocal_rank_fusion(&arms);
+
+    // 去重后核对当前 revision、来源与冲突状态（§9.4）——`admits` 是"这一次放行哪些状态"
+    // 那条规则的唯一实现，自动召回与显式 search 都经它。
     let mut items: Vec<MemoryItem> = Vec::new();
+    for id in ranked {
+        let Some(item) = load_item(ex, &id).await? else {
+            continue;
+        };
+        if !query.admits(&item) {
+            continue;
+        }
+        if !query.scopes.is_empty() && !query.scopes.contains(&item.scope) {
+            continue;
+        }
+        items.push(item);
+        if items.len() >= query.top_k.max(1) as usize {
+            break;
+        }
+    }
+
+    Ok(RecallResult {
+        items,
+        mode: query.mode,
+        degraded: vector_note.is_some(),
+        degraded_reason: vector_note,
+        vector_coverage: wants_vector.then_some(coverage),
+    })
+}
+
+/// 关键词臂：`memory_terms` 的 `instr` 命中数按 IDF 加权（§9.4）。返回按分降序的 id。
+async fn keyword_arm(
+    ex: &mut dyn Executor,
+    query: &RecallQuery,
+    candidate_limit: usize,
+) -> Result<Vec<String>, StoreError> {
+    let tokens = lexical_terms(&query.text);
     if tokens.is_empty() {
         // 没有可检索的 token 时不回退成"给你全部"——§9.4：没有足够相关内容时返回空。
-        return Ok(RecallResult {
-            items,
-            mode: query.mode,
-            degraded,
-            degraded_reason,
-            vector_coverage: Some(0.0),
-        });
+        return Ok(Vec::new());
     }
 
     // IDF 在查询时用 `memory_terms` 行数和每个 token 的命中行数算（§9.4）。
@@ -599,33 +686,109 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
             .then(a.0.cmp(&b.0))
     });
     ranked.truncate(candidate_limit);
+    Ok(ranked.into_iter().map(|(id, _)| id).collect())
+}
 
-    for (id, _) in ranked {
-        let Some(item) = load_item(ex, &id).await? else {
-            continue;
-        };
-        if !item.is_recallable_at(query.now) {
-            continue;
-        }
-        if !query.scopes.is_empty() && !query.scopes.contains(&item.scope) {
-            continue;
-        }
-        items.push(item);
-        if items.len() >= query.top_k.max(1) as usize {
-            break;
-        }
+enum VectorArm {
+    Ran { ranked: Vec<String>, covered: f32 },
+    Unavailable { reason: String },
+}
+
+/// 向量臂：当前代次内的**精确**余弦（§9.4「由 Rust 在作用域过滤后做精确余弦检索」）。
+///
+/// 三道闸都在这一个 SQL 里：代次要对，`revision` 要对，`content_hash` 要对。第二、三道
+/// 是"修改记忆时旧 revision 不召回"——一条改过正文的记忆留下的旧向量在这里根本 join 不
+/// 上，而不是"排得靠后"。
+async fn vector_arm(
+    ex: &mut dyn Executor,
+    query: &RecallQuery,
+    candidate_limit: usize,
+) -> Result<VectorArm, StoreError> {
+    let Some(probe) = query.query_vector.as_ref() else {
+        return Ok(VectorArm::Unavailable {
+            reason: "这一次没有查询向量：向量端点不可用或未配置".into(),
+        });
+    };
+
+    let generations =
+        MemoryIndexGenerationRow::filter(MemoryIndexGenerationRow::fields().active().eq(true))
+            .exec(ex)
+            .await
+            .map_err(map_toasty)?;
+    let Some(active) = generations.into_iter().next() else {
+        return Ok(VectorArm::Unavailable {
+            reason: "还没有生效的索引代次：重建尚未追平（§9.5）".into(),
+        });
+    };
+    // 「同维度不代表同一空间」——维度只是第一道，指纹的其余部分由代次 ID 本身承担：
+    // MemoryManager 用指纹算代次 ID，所以能走到这里的向量就是这一空间的。
+    if active.dimensions != probe.0.len() as i64 {
+        return Ok(VectorArm::Unavailable {
+            reason: format!(
+                "查询向量 {} 维，当前代次 {} 维：不是同一个空间，不比",
+                probe.0.len(),
+                active.dimensions
+            ),
+        });
     }
 
-    Ok(RecallResult {
-        items,
-        mode: query.mode,
-        degraded,
-        degraded_reason,
-        vector_coverage: Some(0.0),
+    let rows = toasty::sql::query(
+        "SELECT v.memory_id, v.dimensions, v.vector FROM memory_vectors v \
+         JOIN memory_items i ON i.id = v.memory_id AND i.revision = v.revision \
+         AND i.content_hash = v.content_hash \
+         WHERE v.generation = ?1 AND i.state != 'forgotten'",
+    )
+    .bind(active.id.clone())
+    .exec(ex)
+    .await
+    .map_err(map_toasty)?;
+
+    let indexable = {
+        let items = MemoryItemRow::all().exec(ex).await.map_err(map_toasty)?;
+        items
+            .iter()
+            .filter(|row| row.state != enum_str(&MemoryState::Forgotten))
+            .count()
+    };
+    let covered = if indexable == 0 {
+        0.0
+    } else {
+        rows.len() as f32 / indexable as f32
+    };
+
+    let mut scored: Vec<(String, f32)> = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let (Some(id), Some(dimensions), Some(bytes)) = (
+            crate::db::column_string(row, 0),
+            column_i64(row, 1),
+            crate::db::column_bytes(row, 2),
+        ) else {
+            continue;
+        };
+        // 截断或结构错误的向量不接受（§9.5）——跳过，不拿半截去比。
+        let Some(values) = decode_vector(&bytes, dimensions.max(0) as usize) else {
+            tracing::warn!(memory = %id, "向量长度与声明的维度对不上，跳过");
+            continue;
+        };
+        scored.push((id, cosine(&values, &probe.0)));
+    }
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    scored.truncate(candidate_limit);
+
+    Ok(VectorArm::Ran {
+        ranked: scored.into_iter().map(|(id, _)| id).collect(),
+        covered,
     })
 }
 
-async fn load_item(ex: &mut dyn Executor, id: &str) -> Result<Option<MemoryItem>, StoreError> {
+pub(super) async fn load_item(
+    ex: &mut dyn Executor,
+    id: &str,
+) -> Result<Option<MemoryItem>, StoreError> {
     let Some(row) = MemoryItemRow::filter_by_id(id)
         .first()
         .exec(ex)
@@ -678,6 +841,10 @@ async fn load_item(ex: &mut dyn Executor, id: &str) -> Result<Option<MemoryItem>
             count: row.usage_count.max(0) as u64,
             last_used_at: from_ts_opt(row.last_used_at),
         },
+        supersedes: match &row.supersedes {
+            Some(raw) => Some(decode(raw, "memory_items.supersedes")?),
+            None => None,
+        },
     }))
 }
 
@@ -687,7 +854,7 @@ fn vector_id(memory: &str, revision: u32, content_hash: &str, generation: &str) 
         .to_string()
 }
 
-fn scope_kind(scope: &MemoryScope) -> String {
+pub(super) fn scope_kind(scope: &MemoryScope) -> String {
     match scope {
         MemoryScope::Personal => "personal",
         MemoryScope::Project { .. } => "project",
@@ -696,7 +863,7 @@ fn scope_kind(scope: &MemoryScope) -> String {
     .to_string()
 }
 
-fn enum_str<T: serde::Serialize>(value: &T) -> String {
+pub(super) fn enum_str<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_value(value)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
@@ -749,6 +916,7 @@ mod tests {
             updated_at: NOW,
             extraction: ExtractionMetadata::new("memory-model", None, "v1"),
             usage: MemoryUsage::default(),
+            supersedes: None,
         }
     }
 
@@ -761,6 +929,8 @@ mod tests {
             top_k: 8,
             max_tokens: 1500,
             now: NOW,
+            query_vector: None,
+            include_states: vec![],
         }
     }
 
@@ -946,8 +1116,11 @@ mod tests {
         );
     }
 
-    /// 向量臂还没有——`hybrid` / `vector` 要**如实说降级**，不能把故障解释成"没有相关
-    /// 记忆"（§9.4）。
+    /// 向量臂跑不成时**如实说降级**，不能把故障解释成"没有相关记忆"（§9.4）。
+    ///
+    /// 两种模式的收场**不同**，这正是 §9.4 最后一段的两句话：`hybrid` 退化为关键词并
+    /// 带着原因（结果照给），`vector` 给不出东西并带着原因——由 MemoryManager 把那一条
+    /// 翻成"不可用"，而不是在这里假装成一个空结果。
     #[tokio::test]
     async fn hybrid_and_vector_say_out_loud_that_the_vector_arm_is_unavailable() {
         let (db, _dir) = temp().await;
@@ -960,8 +1133,24 @@ mod tests {
             let result = repo.recall(&query("空调", mode)).await.unwrap();
             assert!(result.degraded, "{mode:?} 要标 degraded");
             assert!(result.degraded_reason.is_some(), "{mode:?} 要说原因");
-            assert!(!result.items.is_empty(), "关键词臂照常给结果");
         }
+        assert_eq!(
+            repo.recall(&query("空调", RetrievalMode::Hybrid))
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1,
+            "hybrid 退化为关键词，结果照给"
+        );
+        assert!(
+            repo.recall(&query("空调", RetrievalMode::Vector))
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "vector-only 没有向量臂就没有答案——空集 + degraded，由上一层报不可用"
+        );
 
         let keyword = repo
             .recall(&query("空调", RetrievalMode::Keyword))
@@ -1007,5 +1196,484 @@ mod tests {
         assert_eq!(status.indexed, 0);
         assert!(status.generation.is_none());
         assert!(repo.active_generation().await.unwrap().is_none());
+    }
+
+    // ---------------------------------------------------------------- 向量臂（W6）
+
+    fn space(dimensions: u32) -> komo_kernel::types::model::EmbeddingSpace {
+        komo_kernel::types::model::EmbeddingSpace {
+            provider: "test".into(),
+            endpoint: "memory://test".into(),
+            model: "fixed".into(),
+            revision: Some("1".into()),
+            dimensions,
+            preprocessing: "v1".into(),
+            document_prefix: String::new(),
+            query_prefix: String::new(),
+            normalized: true,
+            distance: komo_kernel::types::model::DistanceRule::Cosine,
+            effort: None,
+        }
+    }
+
+    fn vector_query(mode: RetrievalMode, probe: &[f32]) -> RecallQuery {
+        RecallQuery {
+            query_vector: Some(Vector(probe.to_vec())),
+            ..query("", mode)
+        }
+    }
+
+    /// 向量臂：作用域过滤之后做精确余弦，方向最近的排前面（§9.4）。
+    #[tokio::test]
+    async fn the_vector_arm_ranks_by_cosine_within_the_active_generation() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put_generation("gen-1", Some(&space(2)), IndexState::Ready, true)
+            .await
+            .unwrap();
+        for (id, content, vector) in [
+            ("m-1", "客厅空调设 26 度", [1.0, 0.0]),
+            ("m-2", "用 cargo test 跑测试", [0.0, 1.0]),
+        ] {
+            repo.put(item(id, content, MemoryState::Active), None)
+                .await
+                .unwrap();
+            repo.put_vector(&MemoryId::from_raw(id), 1, "gen-1", Vector(vector.to_vec()))
+                .await
+                .unwrap();
+        }
+
+        let hit = repo
+            .recall(&vector_query(RetrievalMode::Vector, &[0.9, 0.1]))
+            .await
+            .unwrap();
+        assert!(!hit.degraded, "有查询向量、有生效代次，就不是降级");
+        assert_eq!(hit.items.len(), 2);
+        assert_eq!(hit.items[0].id.as_str(), "m-1", "方向最近的在前");
+        assert_eq!(hit.vector_coverage, Some(1.0));
+    }
+
+    /// **修改记忆时旧 revision 不召回**（§14 的验收列第五条）。
+    ///
+    /// 旧向量在库里还在（下一轮索引才清），但它 join 不上当前的 revision 与正文哈希，所以
+    /// 向量臂根本看不见它——这是"排得靠后"与"不存在"的区别。
+    #[tokio::test]
+    async fn a_vector_for_an_old_revision_is_invisible_to_the_vector_arm() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put_generation("gen-1", Some(&space(2)), IndexState::Ready, true)
+            .await
+            .unwrap();
+        repo.put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        repo.put_vector(
+            &MemoryId::from_raw("m-1"),
+            1,
+            "gen-1",
+            Vector(vec![1.0, 0.0]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            repo.recall(&vector_query(RetrievalMode::Vector, &[1.0, 0.0]))
+                .await
+                .unwrap()
+                .items
+                .len(),
+            1
+        );
+
+        // 改正文 → revision 2。旧向量还在表里，但它说的是上一版的意思。
+        let mut next = item("m-1", "客厅空调改成 24 度", MemoryState::Active);
+        next.revision = 2;
+        repo.put(next, Some(1)).await.unwrap();
+
+        let after = repo
+            .recall(&vector_query(RetrievalMode::Vector, &[1.0, 0.0]))
+            .await
+            .unwrap();
+        assert!(after.items.is_empty(), "旧 revision 的向量不能再召回它");
+        assert_eq!(after.vector_coverage, Some(0.0), "覆盖率也要如实掉下去");
+    }
+
+    /// 同维度但不同代次的向量**不混用**（§9.5「同维度不代表同一空间」）。
+    #[tokio::test]
+    async fn vectors_from_another_generation_are_never_compared() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        // 生效的是 gen-2，而向量写在 gen-1 上——同样是 2 维。
+        repo.put_generation("gen-1", Some(&space(2)), IndexState::Ready, false)
+            .await
+            .unwrap();
+        repo.put_generation("gen-2", Some(&space(2)), IndexState::Ready, true)
+            .await
+            .unwrap();
+        repo.put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        repo.put_vector(
+            &MemoryId::from_raw("m-1"),
+            1,
+            "gen-1",
+            Vector(vec![1.0, 0.0]),
+        )
+        .await
+        .unwrap();
+
+        let result = repo
+            .recall(&vector_query(RetrievalMode::Vector, &[1.0, 0.0]))
+            .await
+            .unwrap();
+        assert!(result.items.is_empty(), "不是这一代的向量，不拿来比");
+        assert_eq!(result.vector_coverage, Some(0.0));
+    }
+
+    /// 维度对不上就是**另一个空间**：不比，并且说出来（§9.5）。
+    #[tokio::test]
+    async fn a_query_vector_of_another_dimension_is_refused_not_compared() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put_generation("gen-1", Some(&space(2)), IndexState::Ready, true)
+            .await
+            .unwrap();
+        repo.put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        repo.put_vector(
+            &MemoryId::from_raw("m-1"),
+            1,
+            "gen-1",
+            Vector(vec![1.0, 0.0]),
+        )
+        .await
+        .unwrap();
+
+        let result = repo
+            .recall(&vector_query(RetrievalMode::Vector, &[1.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        assert!(result.degraded);
+        assert!(
+            result.degraded_reason.as_deref().unwrap().contains("维"),
+            "{:?}",
+            result.degraded_reason
+        );
+    }
+
+    /// hybrid：两条臂融合，**两臂都认的那条排在前面**（RRF，§9.4）。
+    #[tokio::test]
+    async fn hybrid_fuses_both_arms_by_rank() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put_generation("gen-1", Some(&space(2)), IndexState::Ready, true)
+            .await
+            .unwrap();
+        // 两条在关键词臂上同分，所以按 id 排：m-1 第一、m-2 第二。**只有 m-2 有向量**，
+        // 于是它在向量臂上是第一——两臂都认的那条应当越过只有一臂认的头名。
+        repo.put(item("m-1", "客厅空调很吵", MemoryState::Active), None)
+            .await
+            .unwrap();
+        repo.put(item("m-2", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        repo.put_vector(
+            &MemoryId::from_raw("m-2"),
+            1,
+            "gen-1",
+            Vector(vec![1.0, 0.0]),
+        )
+        .await
+        .unwrap();
+
+        let keyword_only = repo
+            .recall(&query("空调", RetrievalMode::Keyword))
+            .await
+            .unwrap();
+        assert_eq!(
+            keyword_only.items[0].id.as_str(),
+            "m-1",
+            "只看关键词时 m-1 在前"
+        );
+
+        let result = repo
+            .recall(&RecallQuery {
+                query_vector: Some(Vector(vec![1.0, 0.0])),
+                ..query("空调", RetrievalMode::Hybrid)
+            })
+            .await
+            .unwrap();
+        assert!(!result.degraded);
+        assert_eq!(result.items.len(), 2);
+        assert_eq!(result.items[0].id.as_str(), "m-2", "两臂都认的那条赢");
+        assert_eq!(result.vector_coverage, Some(0.5), "覆盖率如实报一半");
+    }
+
+    /// 没有查询向量时 hybrid **如实降级**，vector 也标降级（上一层把它翻成"不可用"）。
+    #[tokio::test]
+    async fn without_a_query_vector_the_hybrid_arm_says_it_degraded() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+
+        let hybrid = repo
+            .recall(&query("空调", RetrievalMode::Hybrid))
+            .await
+            .unwrap();
+        assert!(hybrid.degraded);
+        assert!(hybrid.degraded_reason.is_some());
+        assert_eq!(hybrid.items.len(), 1, "关键词臂照常给结果，不是空集");
+
+        let vector = repo
+            .recall(&query("空调", RetrievalMode::Vector))
+            .await
+            .unwrap();
+        assert!(vector.degraded, "vector 模式也要标，由上一层报不可用");
+    }
+
+    /// 有 embedding、却还没有生效代次（重建中）：hybrid 走关键词并说清原因（§9.5 第 3 步）。
+    #[tokio::test]
+    async fn a_generation_that_is_still_building_degrades_hybrid_to_keyword() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put_generation("gen-1", Some(&space(2)), IndexState::Building, false)
+            .await
+            .unwrap();
+        repo.put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+
+        let result = repo
+            .recall(&RecallQuery {
+                query_vector: Some(Vector(vec![1.0, 0.0])),
+                ..query("空调", RetrievalMode::Hybrid)
+            })
+            .await
+            .unwrap();
+        assert!(result.degraded);
+        assert!(
+            result.degraded_reason.as_deref().unwrap().contains("代次"),
+            "{:?}",
+            result.degraded_reason
+        );
+        assert_eq!(result.items.len(), 1, "关键词维持查询");
+    }
+
+    /// `include_states`：contested 只在**明确列出状态**时出（§9.6）。
+    #[tokio::test]
+    async fn a_contested_memory_only_shows_up_when_asked_for_by_state() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put(
+            item("m-1", "客厅空调设 26 度", MemoryState::Contested),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            repo.recall(&query("空调", RetrievalMode::Keyword))
+                .await
+                .unwrap()
+                .items
+                .is_empty(),
+            "自动召回够不着"
+        );
+        let explicit = repo
+            .recall(&RecallQuery {
+                include_states: vec![MemoryState::Contested],
+                ..query("空调", RetrievalMode::Keyword)
+            })
+            .await
+            .unwrap();
+        assert_eq!(explicit.items.len(), 1);
+    }
+
+    // ---------------------------------------------------------------- 库存与索引目录
+
+    #[tokio::test]
+    async fn the_catalog_lists_by_scope_and_state() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put(item("m-1", "喜欢深色主题", MemoryState::Active), None)
+            .await
+            .unwrap();
+        let mut project = item(
+            "m-2",
+            "这个仓库用 cargo test --workspace",
+            MemoryState::Candidate,
+        );
+        project.scope = MemoryScope::Project {
+            project_id: "komo".into(),
+        };
+        repo.put(project, None).await.unwrap();
+
+        assert_eq!(repo.list(None, None, 100).await.unwrap().len(), 2);
+        assert_eq!(
+            repo.list(Some(MemoryScope::Personal), None, 100)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            repo.list(None, Some(MemoryState::Candidate), 100)
+                .await
+                .unwrap()[0]
+                .id
+                .as_str(),
+            "m-2"
+        );
+    }
+
+    /// 逐字相同的那一条按作用域找回来——「重复来源幂等合并」的第一道闸（§9.6）。
+    #[tokio::test]
+    async fn the_same_sentence_in_another_scope_is_another_memory() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put(item("m-1", "喜欢深色主题", MemoryState::Active), None)
+            .await
+            .unwrap();
+
+        assert!(
+            repo.find_by_content(&MemoryScope::Personal, "喜欢深色主题")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.find_by_content(
+                &MemoryScope::Project {
+                    project_id: "komo".into()
+                },
+                "喜欢深色主题"
+            )
+            .await
+            .unwrap()
+            .is_none(),
+            "不同作用域的同一句话不是同一条记忆（§9.6）"
+        );
+    }
+
+    /// 索引候选：还欠向量的那些，按 id 升序，游标之后接着走（§9.5 第 2 步）。
+    #[tokio::test]
+    async fn pending_vectors_is_a_stable_cursor_over_what_is_still_owed() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        for id in ["m-1", "m-2", "m-3"] {
+            repo.put(item(id, &format!("记忆 {id}"), MemoryState::Active), None)
+                .await
+                .unwrap();
+        }
+        let first = repo.pending_vectors("gen-1", None, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0].memory.as_str(), "m-1");
+
+        let next = repo
+            .pending_vectors("gen-1", Some("m-2".into()), 10)
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].memory.as_str(), "m-3");
+
+        // 写进一条之后它就不欠了。
+        repo.put_vector(&MemoryId::from_raw("m-1"), 1, "gen-1", Vector(vec![1.0]))
+            .await
+            .unwrap();
+        let owed = repo.pending_vectors("gen-1", None, 10).await.unwrap();
+        assert_eq!(owed.len(), 2);
+        assert!(owed.iter().all(|c| c.memory.as_str() != "m-1"));
+    }
+
+    /// 切换生效代次：**一个事务里**别人全下线（§9.5 第 4 步），随后清理旧代次的向量。
+    #[tokio::test]
+    async fn activating_a_generation_retires_every_other_one() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        repo.put_generation("gen-1", Some(&space(2)), IndexState::Ready, true)
+            .await
+            .unwrap();
+        repo.put_generation("gen-2", Some(&space(3)), IndexState::Building, false)
+            .await
+            .unwrap();
+        repo.put_vector(
+            &MemoryId::from_raw("m-1"),
+            1,
+            "gen-1",
+            Vector(vec![1.0, 0.0]),
+        )
+        .await
+        .unwrap();
+        repo.put_vector(
+            &MemoryId::from_raw("m-1"),
+            1,
+            "gen-2",
+            Vector(vec![1.0, 0.0, 0.0]),
+        )
+        .await
+        .unwrap();
+
+        repo.activate_generation("gen-2").await.unwrap();
+        assert_eq!(
+            repo.active_generation().await.unwrap().as_deref(),
+            Some("gen-2")
+        );
+
+        let removed = repo.prune_generations("gen-2").await.unwrap();
+        assert_eq!(removed, 1, "旧代次的向量被清掉");
+        assert_eq!(repo.indexed_in("gen-2").await.unwrap(), 1);
+        assert_eq!(repo.generations().await.unwrap().len(), 1);
+    }
+
+    /// 使用计数**只碰这两列**（§9.2：只度量使用，不增加真实性）。
+    #[tokio::test]
+    async fn recording_a_use_touches_nothing_but_the_counters() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        let stored = repo
+            .put(item("m-1", "喜欢深色主题", MemoryState::Candidate), None)
+            .await
+            .unwrap();
+        repo.record_use(&[MemoryId::from_raw("m-1")], NOW)
+            .await
+            .unwrap();
+
+        let after = repo.get(&MemoryId::from_raw("m-1")).await.unwrap().unwrap();
+        assert_eq!(after.usage.count, 1);
+        assert_eq!(after.usage.last_used_at, Some(NOW));
+        assert_eq!(after.state, stored.state, "用了十次仍然是候选");
+        assert_eq!(after.confirmation, stored.confirmation);
+        assert_eq!(after.revision, stored.revision);
+    }
+
+    /// 取代链存得下、读得回（§9.6）。
+    #[tokio::test]
+    async fn a_supersedes_link_round_trips() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put(
+            item("m-1", "客厅空调设 26 度", MemoryState::Superseded),
+            None,
+        )
+        .await
+        .unwrap();
+        let mut newer = item("m-2", "客厅空调改成 24 度", MemoryState::Active);
+        newer.supersedes = Some(komo_kernel::types::memory::SupersededRef {
+            memory: MemoryId::from_raw("m-1"),
+            revision: 1,
+        });
+        repo.put(newer, None).await.unwrap();
+
+        let read = repo.get(&MemoryId::from_raw("m-2")).await.unwrap().unwrap();
+        assert_eq!(
+            read.supersedes.unwrap().memory.as_str(),
+            "m-1",
+            "前向链读得回来"
+        );
     }
 }

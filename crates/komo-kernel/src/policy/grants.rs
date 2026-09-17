@@ -110,6 +110,73 @@ impl Grant {
     }
 }
 
+/// 操作者答应的那个**范围**，落成一条绑定这份计划的授权（§7.2）。
+///
+/// 三件事让它不至于变成"今后任意脚本均可执行"：
+///
+/// 1. **匹配器从这份计划长出来**，不是一张空表——同一个工具、同一类操作，shell 还要
+///    同一条命令的前缀。批准一次 `cargo test` 不等于批准 `rm -rf`。
+/// 2. **版本逐字绑定**（[`PlanVersions`]）：代码、模块或环境版本变了就不再覆盖
+///    （§5.4「模块更新使旧授权失效」）。
+/// 3. **范围本身有边界**：`Run` 绑这一个 Run，`CronJob` 绑这个 Job 的**这一个版本**
+///    ——改定义就失效（§10）。
+///
+/// 答 `None` = 这份计划落不成这个范围：`Once` 本来就不需要一条授权（审批自己按哈希
+/// 绑定），而一个既没有 Run 也不是 Cron 的计划没有范围可言。
+pub fn scope_for(
+    plan: &ExecutionPlan,
+    scope: crate::types::chat::ApprovalScope,
+) -> Option<GrantScope> {
+    use crate::types::chat::ApprovalScope;
+
+    let matcher = matcher_for(plan);
+    let versions = plan.versions.clone();
+    match scope {
+        ApprovalScope::Once => None,
+        ApprovalScope::Run => plan.run.clone().map(|run| GrantScope::Run {
+            run,
+            matcher,
+            versions,
+        }),
+        ApprovalScope::CronJob => match &plan.source {
+            PlanSource::Cron { job, job_version } => Some(GrantScope::CronJob {
+                job: job.clone(),
+                job_version: *job_version,
+                matcher,
+                versions,
+            }),
+            // 交互 Run 里说 "cron" 没有意义：它绑不到任何 Job，而**默默降级成 Run 范围
+            // 会把一句说错的话变成一条比它宽的授权**。
+            _ => None,
+        },
+    }
+}
+
+/// 从一份计划长出一个匹配器。
+fn matcher_for(plan: &ExecutionPlan) -> Matcher {
+    use crate::policy::rules::OperationMatch;
+    use crate::types::plan::Operation;
+
+    Matcher {
+        tools: Some(vec![plan.tool.clone()]),
+        operations: Some(vec![OperationMatch::of(&plan.operation)]),
+        // 「明确命令模板」（§7.2）：整条命令本身就是最窄的前缀。放宽到"第一个词"是
+        // 另一个决定，要由写规则的人显式做，不该由一次批准隐式做。
+        command_prefixes: match &plan.operation {
+            Operation::ShellCommand { command } => Some(vec![command.clone()]),
+            _ => None,
+        },
+        modules: match &plan.operation {
+            Operation::PythonCall { module, .. } | Operation::ToolboxChange { module } => {
+                Some(vec![module.clone()])
+            }
+            _ => None,
+        },
+        sources: None,
+        paths: None,
+    }
+}
+
 /// 授权绑定的版本覆不覆盖计划的版本。
 ///
 /// 授权**没有**绑定某个维度时，那个维度不构成约束；绑定了就必须逐字相同——「版本变化
@@ -226,6 +293,65 @@ mod tests {
         let mut other_run = p.clone();
         other_run.run = Some(RunId::from_raw("run-2"));
         assert!(!g.covers(&other_run, NOW));
+    }
+
+    /// `/approve <id> cron` 落下的那条授权：**绑 Job 的这一版 + 这条命令**，
+    /// 而不是"今后任意 shell"。
+    #[test]
+    fn a_cron_scope_binds_the_job_version_and_the_command() {
+        use crate::types::chat::ApprovalScope;
+
+        let mut p = plan(Operation::ShellCommand {
+            command: "cargo test".into(),
+        });
+        p.source = PlanSource::Cron {
+            job: CronJobId::from_raw("job-1"),
+            job_version: 3,
+        };
+
+        let scope = scope_for(&p, ApprovalScope::CronJob).expect("落得成 Job 范围");
+        let g = grant(scope);
+        assert!(g.covers(&p, NOW));
+
+        // 换一条命令：这条授权覆盖不到它。批准一次 `cargo test` 不等于批准 `rm -rf`。
+        let mut other = p.clone();
+        other.operation = Operation::ShellCommand {
+            command: "rm -rf /".into(),
+        };
+        assert!(!g.covers(&other, NOW), "另一条命令不在这条授权里");
+
+        // 换一个工具：同样覆盖不到。
+        let mut other_tool = p.clone();
+        other_tool.tool = "python".into();
+        assert!(!g.covers(&other_tool, NOW));
+
+        // 改定义（版本 +1）：失效（§10）。
+        let mut bumped = p.clone();
+        bumped.source = PlanSource::Cron {
+            job: CronJobId::from_raw("job-1"),
+            job_version: 4,
+        };
+        assert!(!g.covers(&bumped, NOW), "Job 改了，旧授权失效");
+    }
+
+    /// 在交互 Run 里说 `cron` 落不成任何授权——**不静默降级成 Run 范围**：一句说错的
+    /// 话不该变成一条比它宽的授权。
+    #[test]
+    fn a_cron_scope_on_an_interactive_plan_grants_nothing() {
+        use crate::types::chat::ApprovalScope;
+
+        let p = plan(Operation::ShellCommand {
+            command: "cargo test".into(),
+        });
+        assert!(matches!(p.source, PlanSource::Interactive { .. }));
+        assert!(scope_for(&p, ApprovalScope::CronJob).is_none());
+        // `Once` 从来不产生授权：审批自己按计划哈希绑定。
+        assert!(scope_for(&p, ApprovalScope::Once).is_none());
+        // Run 范围照常。
+        assert!(matches!(
+            scope_for(&p, ApprovalScope::Run),
+            Some(GrantScope::Run { .. })
+        ));
     }
 
     #[test]

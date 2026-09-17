@@ -352,6 +352,7 @@ async fn only_one_gateway_holds_a_data_directory() {
         listen: Some("127.0.0.1:0".into()),
         channels: Vec::new(),
         llm: None,
+        embeddings: None,
     })
     .await;
     let error = second.expect_err("第二台起不来");

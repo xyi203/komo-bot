@@ -212,6 +212,23 @@ impl ApprovalGate {
         scope: ApprovalScope,
         by: Option<PeerId>,
     ) -> Result<ApprovalDecisionResponse, RepoError> {
+        self.decide_with_grant(approval, approved, scope, by, None)
+            .await
+    }
+
+    /// 同上，外加这次批准落成的那条范围授权（§7.2）。
+    ///
+    /// 授权本身由调用方写下（它知道 Policy 在这条请求上给了哪些范围）；这里只把它的
+    /// ID 记到决定上——`ApprovalRepo::consume` 读的就是这个字段，没有它，一条范围授权
+    /// 写下了也没人用得上。
+    pub async fn decide_with_grant(
+        &self,
+        approval: &ApprovalId,
+        approved: bool,
+        scope: ApprovalScope,
+        by: Option<PeerId>,
+        grant: Option<komo_kernel::policy::Grant>,
+    ) -> Result<ApprovalDecisionResponse, RepoError> {
         self.repo
             .decide(
                 approval,
@@ -220,7 +237,7 @@ impl ApprovalGate {
                     scope,
                     by,
                     decided_at: self.clock.now(),
-                    grant: None,
+                    grant: grant.map(|g| g.id),
                     consumed: false,
                 },
             )

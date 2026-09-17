@@ -70,8 +70,14 @@ impl fmt::Display for Effort {
 ///
 /// 「未配置」和「显式 none」不是一回事：未配置时不发送 effort 字段，由服务端采用默认
 /// 行为，日志只能记"服务端默认"，不能虚构当时采用的强度。
+/// **邻接标记，不是内部标记。**`Explicit` 装的是一个 newtype（序列化成字符串），而
+/// serde 的内部标记（`tag = "kind"` 单独用）序列化不了"装着字符串的 newtype 变体"——
+/// 它会在运行时报 `cannot serialize tagged newtype variant`。`content = "effort"` 把值
+/// 放进自己的一格，于是 `{"kind":"explicit","effort":"low"}` 写得出也读得回，而
+/// `ProviderDefault` 仍然是 `{"kind":"provider_default"}`，与之前逐字一致（那是唯一
+/// 写得出去过的形态，所以这不是一次线上格式变更）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", content = "effort", rename_all = "snake_case")]
 pub enum EffortSetting {
     /// 没有配置：请求里不带这个字段。
     ProviderDefault,
@@ -246,6 +252,28 @@ mod tests {
         assert_ne!(unset, explicit_none);
         assert!(unset.as_option().is_none());
         assert_eq!(explicit_none.as_option().map(|e| e.as_str()), Some("none"));
+    }
+
+    /// 两个变体都要**写得出去、读得回来**。
+    ///
+    /// `Explicit` 曾经写不出去：内部标记 + 装着字符串的 newtype 变体，serde 在运行时
+    /// 报错，于是任何带 effort 的 `ExtractionMetadata` 都存不进 `memory_items`。回归就
+    /// 是这一条。
+    #[test]
+    fn both_effort_settings_survive_a_json_round_trip() {
+        for setting in [
+            EffortSetting::ProviderDefault,
+            EffortSetting::Explicit(Effort::new("low")),
+        ] {
+            let json = serde_json::to_string(&setting).expect("写得出去");
+            let back: EffortSetting = serde_json::from_str(&json).expect("读得回来");
+            assert_eq!(back, setting, "{json}");
+        }
+        // 「未配置」那一格的写法与从前逐字一致——它是唯一写得出去过的形态。
+        assert_eq!(
+            serde_json::to_string(&EffortSetting::ProviderDefault).unwrap(),
+            r#"{"kind":"provider_default"}"#
+        );
     }
 
     #[test]

@@ -180,6 +180,14 @@ pub fn stop() -> Result<(), UnitError> {
 /// 重启。
 pub fn restart(home_dir: &Path, komo_home: &Path) -> Result<(), UnitError> {
     let _ = stop();
+    // launchd 的 bootout 是异步的：服务还在卸的那几百毫秒里 bootstrap 会失败（被
+    // `start` 吞掉），随后 kickstart 就找不到服务。等它真的消失再起。
+    for _ in 0..25 {
+        if status().is_err() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
     start(home_dir, komo_home)
 }
 

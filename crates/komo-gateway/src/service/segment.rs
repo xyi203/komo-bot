@@ -32,6 +32,7 @@ use komo_runtime::agent::{Budget, ResumedRound, RetryBudget, Segment};
 use komo_runtime::executor::{CallEnv, CallRequest, resumed_from};
 use komo_runtime::memory::MemoryManager;
 use komo_runtime::scheduler::HandlerError;
+use komo_runtime::tools::paths;
 use komo_store::{CheckpointStore, Db, RecoveryStore};
 
 use super::ledgers::RoutedLedger;
@@ -201,6 +202,10 @@ impl SegmentSource for GatewaySegments {
             .and_then(|record| record.workdir.clone())
             .map(PathBuf::from)
             .unwrap_or_else(|| self.workspaces.clone());
+        // **根必须是真实路径**：工具解析目标时解掉符号链接（`tools::paths::resolve`），
+        // 根停在字面上就会让 workspace 里的动作被判成"范围外"（macOS 的 `/tmp`、`/var`
+        // 都是链接）。两边同一个口径，前缀匹配才是"在不在这个根里"。
+        let cwd = paths::real_root(&cwd);
         let roots = vec![WorkspaceRoot {
             path: cwd.clone(),
             writable: true,

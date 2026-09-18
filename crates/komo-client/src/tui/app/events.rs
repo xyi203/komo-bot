@@ -7,7 +7,10 @@ use komo_kernel::types::ids::{ApprovalId, ToolCallId};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::ToolCallState;
 
-use super::{App, Draft, Effect, Phase, ServerEvent, blank_tool, resume_summary, status_summary};
+use super::{
+    App, Draft, Effect, Phase, ServerEvent, SubmissionState, blank_tool, resume_summary,
+    status_summary,
+};
 use crate::tui::approval::ApprovalModal;
 
 impl App {
@@ -47,6 +50,21 @@ impl App {
                 Vec::new()
             }
             ServerEvent::Connection(state) => {
+                let was_reconnecting = matches!(
+                    &self.connection,
+                    crate::sse::ConnectionState::Reconnecting { .. }
+                );
+                match &state {
+                    crate::sse::ConnectionState::Reconnecting { reason, .. }
+                        if !was_reconnecting =>
+                    {
+                        self.fail(format!("事件订阅断开，正在重连：{reason}"));
+                    }
+                    crate::sse::ConnectionState::Closed { reason } => {
+                        self.fail(format!("事件订阅已关闭：{reason}"));
+                    }
+                    _ => {}
+                }
                 self.connection = state;
                 Vec::new()
             }
@@ -133,6 +151,36 @@ impl App {
                 if let Some(modal) = self.approval.as_mut() {
                     // 答复没送到，允许再答一次。
                     modal.answering = false;
+                }
+                Vec::new()
+            }
+            ServerEvent::Submitted {
+                request_key,
+                response,
+            } => {
+                if let Some(pending) = self
+                    .pending_submissions
+                    .iter_mut()
+                    .find(|pending| pending.request_key == request_key)
+                {
+                    pending.state = SubmissionState::Submitted {
+                        run: response.run.clone(),
+                        deduplicated: response.deduplicated,
+                    };
+                }
+                Vec::new()
+            }
+            ServerEvent::SubmitFailed { request_key, error } => {
+                if let Some(pending) = self
+                    .pending_submissions
+                    .iter_mut()
+                    .find(|pending| pending.request_key == request_key)
+                {
+                    pending.state = SubmissionState::Failed {
+                        error: error.clone(),
+                    };
+                } else {
+                    self.fail(format!("提交失败：{error}"));
                 }
                 Vec::new()
             }
@@ -223,6 +271,8 @@ impl App {
         }
         match &event.payload {
             EventPayload::RunAccepted(body) => {
+                self.pending_submissions
+                    .retain(|pending| pending.request_key != body.request_key);
                 if let Some(run) = &event.run {
                     let meta = self.runs.entry(run.clone()).or_default();
                     meta.started_at = Some(event.ts);
@@ -230,15 +280,31 @@ impl App {
                     meta.effort = body.effort.clone();
                 }
             }
-            EventPayload::RunCompleted(_)
-            | EventPayload::RunFailed(_)
-            | EventPayload::RunCancelled(_) => {
+            EventPayload::RunCompleted(_) | EventPayload::RunCancelled(_) => {
                 if let Some(run) = &event.run {
                     self.runs.entry(run.clone()).or_default().ended_at = Some(event.ts);
                     // Run 结束了就没人在打字了；留着一段孤儿草稿会一直显示"生成中"。
                     if self.draft.as_ref().is_some_and(|draft| &draft.run == run) {
                         self.draft = None;
                     }
+                }
+            }
+            EventPayload::RunFailed(body) => {
+                if let Some(run) = &event.run {
+                    self.runs.entry(run.clone()).or_default().ended_at = Some(event.ts);
+                    if self.draft.as_ref().is_some_and(|draft| &draft.run == run) {
+                        self.draft = None;
+                    }
+                    self.fail(format!("任务 {run} 失败：{}", body.reason));
+                } else {
+                    self.fail(format!("任务失败：{}", body.reason));
+                }
+            }
+            EventPayload::RunNeedsAttention(body) => {
+                if let Some(run) = &event.run {
+                    self.fail(format!("任务 {run} 需要处理：{}", body.reason));
+                } else {
+                    self.fail(format!("任务需要处理：{}", body.reason));
                 }
             }
             EventPayload::ConfigChanged(body) => {

@@ -155,6 +155,14 @@ pub struct RecoveryReport {
     pub outcomes: Vec<RecoveryOutcome>,
 }
 
+/// 同一个损坏会话可能挂着多个未完成 Run。状态仍逐 Run 落库，通知则按这一组发送一次。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CorruptGroup {
+    pub session: SessionId,
+    pub reason: String,
+    pub runs: Vec<RunId>,
+}
+
 impl RecoveryReport {
     pub fn requeued(&self) -> usize {
         self.count(Applied::Requeued)
@@ -189,6 +197,30 @@ impl RecoveryReport {
                 _ => None,
             })
             .collect()
+    }
+
+    /// 给操作者看的损坏通知按「会话 + 原因」聚合，避免一个坏会话有几个未完成 Run 就刷
+    /// 几条看起来完全一样的消息。恢复动作本身仍保留逐 Run 结果。
+    pub fn corrupt_groups(&self) -> Vec<CorruptGroup> {
+        let mut groups: Vec<CorruptGroup> = Vec::new();
+        for outcome in &self.outcomes {
+            let RecoveryAction::HaltCorrupt { reason } = &outcome.action else {
+                continue;
+            };
+            if let Some(group) = groups
+                .iter_mut()
+                .find(|group| group.session == outcome.session && group.reason == *reason)
+            {
+                group.runs.push(outcome.run.clone());
+            } else {
+                groups.push(CorruptGroup {
+                    session: outcome.session.clone(),
+                    reason: reason.clone(),
+                    runs: vec![outcome.run.clone()],
+                });
+            }
+        }
+        groups
     }
 
     pub fn to_redeliver(&self) -> Vec<&RecoveryOutcome> {

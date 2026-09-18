@@ -19,6 +19,7 @@ use std::collections::BTreeMap;
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::protocol::http::{
     ApprovalRecord, EventPage, ModelMenuEntry, PendingItem, ResumeResponse, SessionDetail,
+    SubmitRunResponse,
 };
 use komo_kernel::protocol::sse::SseFrame;
 use komo_kernel::types::chat::ApprovalScope;
@@ -109,6 +110,16 @@ pub enum ServerEvent {
     ModelMenu(Vec<ModelMenuEntry>),
     /// 一次操作失败。
     Failed(String),
+    /// 提交 HTTP 已确认；权威的用户消息仍等 `run.accepted` 从事件流对账。
+    Submitted {
+        request_key: RequestKey,
+        response: Box<SubmitRunResponse>,
+    },
+    /// 提交 HTTP 失败。带原请求键，才能把错误贴回那条本地消息。
+    SubmitFailed {
+        request_key: RequestKey,
+        error: String,
+    },
     Notice(String),
     /// 时钟推进——耗时是**驱动**读的钟，状态机不读时钟。
     Tick(OffsetDateTime),
@@ -169,6 +180,23 @@ pub struct Draft {
     pub run: RunId,
     pub round: u32,
     pub text: String,
+}
+
+/// 用户已经按下 Enter、但权威 `run.accepted` 还没从事件流回来的消息。
+///
+/// 它只是一层可对账的界面状态，不写进 [`Surface`]，也不会进入模型回放。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSubmission {
+    pub request_key: RequestKey,
+    pub text: String,
+    pub state: SubmissionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmissionState {
+    Sending,
+    Submitted { run: RunId, deduplicated: bool },
+    Failed { error: String },
 }
 
 /// 一次工具调用在界面上的一行。
@@ -247,6 +275,8 @@ pub struct App {
     /// 翻历史前的草稿。
     history_draft: Option<String>,
     pub notices: Vec<Notice>,
+    /// Enter 后立即显示；收到同一 `request_key` 的 `run.accepted` 后移除。
+    pub pending_submissions: Vec<PendingSubmission>,
     pub approval: Option<ApprovalModal>,
     /// 还没取到详情的待处理审批（`approval.pending` 只给 id）。
     pub pending_short_ids: BTreeMap<ApprovalId, komo_kernel::types::ids::ShortId>,
@@ -288,6 +318,7 @@ impl App {
             history_pos: None,
             history_draft: None,
             notices: Vec::new(),
+            pending_submissions: Vec::new(),
             approval: None,
             pending_short_ids: BTreeMap::new(),
             current_run: None,

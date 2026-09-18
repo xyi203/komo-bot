@@ -1,6 +1,7 @@
 //! `App` 状态机的测试：按键序列 / 服务端事件 → 状态断言，不需要终端。
 
 use super::*;
+use crate::sse::ConnectionState;
 use crate::tui::paste::{InputEvent, PASTE_MIN_BYTES, PasteChip};
 use crate::tui::test_support as fixture;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -60,6 +61,43 @@ fn enter_sends_and_the_text_goes_out_whole() {
         Effect::Submit { text, .. } if text == "你好"
     ));
     assert!(app.input.is_empty(), "发出去之后输入框清空");
+    assert_eq!(
+        app.pending_submissions.len(),
+        1,
+        "事件回声到达前也要有本地消息"
+    );
+    assert_eq!(app.pending_submissions[0].text, "你好");
+}
+
+#[test]
+fn the_authoritative_run_accepted_replaces_the_local_submission() {
+    let mut app = app();
+    type_text(&mut app, "只显示一次");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    let Effect::Submit { request_key, .. } = &effects[0] else {
+        panic!("{effects:?}")
+    };
+
+    let mut accepted = fixture::conversation()[0].clone();
+    if let EventPayload::RunAccepted(body) = &mut accepted.payload {
+        body.request_key = request_key.clone();
+        body.text = Some("只显示一次".into());
+    } else {
+        panic!("fixture 第一条必须是 run.accepted");
+    }
+    feed(&mut app, &[accepted]);
+
+    assert!(
+        app.pending_submissions.is_empty(),
+        "权威事件到达后移除本地副本"
+    );
+    assert_eq!(
+        app.messages()
+            .iter()
+            .filter_map(|message| message.text.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["只显示一次"]
+    );
 }
 
 #[test]
@@ -250,6 +288,27 @@ fn a_failed_decision_lets_the_operator_answer_again() {
     app.handle_key(key(KeyCode::Char('y')));
     app.apply(ServerEvent::Failed("网络断了".into()));
     assert_eq!(app.handle_key(key(KeyCode::Char('y'))).len(), 1);
+}
+
+#[test]
+fn a_subscription_failure_shows_its_reason_once_while_retrying() {
+    let mut app = app();
+    app.apply(ServerEvent::Connection(ConnectionState::Reconnecting {
+        attempt: 1,
+        reason: "connection reset".into(),
+    }));
+    app.apply(ServerEvent::Connection(ConnectionState::Reconnecting {
+        attempt: 2,
+        reason: "connection reset".into(),
+    }));
+
+    let errors: Vec<&Notice> = app
+        .notices
+        .iter()
+        .filter(|notice| notice.is_error)
+        .collect();
+    assert_eq!(errors.len(), 1, "每次退避不重复刷同一条错误");
+    assert!(errors[0].text.contains("connection reset"));
 }
 
 #[test]

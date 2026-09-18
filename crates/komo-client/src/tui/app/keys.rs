@@ -3,7 +3,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use komo_kernel::types::chat::ApprovalScope;
 
-use super::{App, Effect};
+use super::{App, Effect, PendingSubmission, SubmissionState};
 use crate::tui::approval::ApprovalAnswer;
 use crate::tui::command::{self, Command};
 use crate::tui::paste::InputEvent;
@@ -126,6 +126,11 @@ impl App {
 
         let body = self.input.take();
         let request_key = self.next_key("run");
+        self.pending_submissions.push(PendingSubmission {
+            request_key: request_key.clone(),
+            text: body.clone(),
+            state: SubmissionState::Sending,
+        });
         self.scroll = 0;
         vec![Effect::Submit {
             request_key,

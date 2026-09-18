@@ -224,6 +224,7 @@ async fn run_effect(
             model,
             effort,
         } => {
+            let reply_key = request_key.clone();
             let request = SubmitRunRequest {
                 request_key,
                 text,
@@ -231,9 +232,15 @@ async fn run_effect(
                 effort,
             };
             match client.submit_run(session, &request).await {
-                // 成功什么都不说：`run.accepted` 会从事件流里回来。
-                Ok(_) => None,
-                Err(error) => Some(ServerEvent::Failed(format!("提交失败：{error}"))),
+                // HTTP 回执先更新本地 pending；`run.accepted` 回来后再由权威事件替换。
+                Ok(response) => Some(ServerEvent::Submitted {
+                    request_key: reply_key,
+                    response: Box::new(response),
+                }),
+                Err(error) => Some(ServerEvent::SubmitFailed {
+                    request_key: reply_key,
+                    error: error.to_string(),
+                }),
             }
         }
         Effect::Cancel { run, request_key } => {

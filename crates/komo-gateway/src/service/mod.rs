@@ -222,20 +222,30 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
                     })
                     .await;
             }
-            for (run, reason) in report.corrupt() {
+            for group in report.corrupt_groups() {
                 // 「停止受影响会话，**报告损坏**」（§8.4 / §8.5）——报告这一半就是这一条：
                 // 一个读不出来的会话不会自己好起来，操作者得知道是哪一个、为什么。
+                let affected = if group.runs.len() == 1 {
+                    String::new()
+                } else {
+                    format!(
+                        "\n\n同一会话有 {} 个未完成任务受影响：\n{}",
+                        group.runs.len(),
+                        group
+                            .runs
+                            .iter()
+                            .map(|run| format!("- {run}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    )
+                };
                 let _ = state
                     .notifier
                     .deliver_home(Outbound::NeedsAttention {
-                        session: report
-                            .outcomes
-                            .iter()
-                            .find(|outcome| &outcome.run == run)
-                            .map(|outcome| outcome.session.clone())
-                            .unwrap_or_else(|| komo_kernel::types::ids::SessionId::from_raw("")),
-                        run: run.clone(),
-                        reason: format!("恢复时停下了：{reason}"),
+                        session: group.session,
+                        // Outbound 的兼容字段保留一个代表 Run；正文列出这一组的全部 Run。
+                        run: group.runs[0].clone(),
+                        reason: format!("恢复时停下了：{}{affected}", group.reason),
                     })
                     .await;
             }

@@ -22,7 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
-use crate::tui::app::{App, status_text};
+use crate::tui::app::{App, SubmissionState, status_text};
 use crate::tui::approval::approval_lines;
 use crate::tui::markdown;
 
@@ -117,6 +117,41 @@ fn transcript(app: &App, area: Rect) -> Paragraph<'static> {
             // 工具结果在调用那一行上显示，不另占一个消息节点。
             Role::Tool => {}
         }
+    }
+
+    // Enter 后立刻显示，不等 SSE 绕一圈。权威 `run.accepted` 到达时状态机会移除对应项，
+    // 因而不会和 JSONL 折出来的用户消息重复。
+    for pending in &app.pending_submissions {
+        for piece in markdown::wrap_to_width(&pending.text, width.saturating_sub(3) as usize) {
+            lines.push(Line::from(vec![
+                Span::styled("你 ", Style::default().fg(Color::Green).bold()),
+                Span::raw(piece),
+            ]));
+        }
+        let (label, style) = match &pending.state {
+            SubmissionState::Sending => (
+                "  ↥ 发送中…".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            ),
+            SubmissionState::Submitted { deduplicated, .. } if *deduplicated => (
+                "  ✓ 已存在，等待事件同步…".to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+            ),
+            SubmissionState::Submitted { .. } => (
+                "  ✓ 已提交，等待事件同步…".to_string(),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+            ),
+            SubmissionState::Failed { error } => (
+                format!("  !! 发送失败：{error}"),
+                Style::default().fg(Color::Red),
+            ),
+        };
+        for piece in markdown::wrap_to_width(&label, width as usize) {
+            lines.push(Line::from(Span::styled(piece, style)));
+        }
+        lines.push(Line::default());
     }
 
     // 模型正在打字的那一段：接在历史后面，带一个「生成中」的记号，**不是历史的一部分**
@@ -407,8 +442,9 @@ fn dim(text: &str) -> Line<'static> {
 mod tests {
     use super::*;
     use crate::sse::ConnectionState;
-    use crate::tui::app::{App, ServerEvent, TuiMode};
+    use crate::tui::app::{App, Effect, ServerEvent, TuiMode};
     use crate::tui::test_support as fixture;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use komo_kernel::events::{Event, EventPayload, MessageAssistant};
     use komo_kernel::protocol::sse::{SseEvent, SseFrame};
     use ratatui::Terminal;
@@ -494,6 +530,55 @@ fn main() {
                 row.trim_end().to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn a_submitted_message_is_visible_before_the_event_stream_echoes_it() {
+        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        app.input.set("刚发出去的消息");
+        let effects = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(effects.as_slice(), [Effect::Submit { .. }]));
+
+        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
+        assert!(screen.contains("刚发出去的消息"), "{screen}");
+        assert!(screen.contains("发送中"), "{screen}");
+    }
+
+    #[test]
+    fn a_submit_failure_is_attached_to_the_message_that_failed() {
+        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        app.input.set("这条没有送到");
+        let effects = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Effect::Submit { request_key, .. } = &effects[0] else {
+            panic!("{effects:?}")
+        };
+        app.apply(ServerEvent::SubmitFailed {
+            request_key: request_key.clone(),
+            error: "Gateway 不可用".into(),
+        });
+
+        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
+        assert!(screen.contains("这条没有送到"), "{screen}");
+        assert!(screen.contains("发送失败：Gateway 不可用"), "{screen}");
+    }
+
+    #[test]
+    fn a_run_failure_shows_its_reason_in_the_transcript() {
+        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let events = vec![
+            fixture::conversation()[0].clone(),
+            fixture::event(
+                2,
+                Some(fixture::run()),
+                EventPayload::RunFailed(komo_kernel::events::RunFailed {
+                    reason: "上游拒绝了这次请求".into(),
+                }),
+            ),
+        ];
+        feed(&mut app, &events);
+
+        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
+        assert!(screen.contains("上游拒绝了这次请求"), "{screen}");
     }
 
     /// 每一行都恰好占满缓冲区的宽度——没有一格越界，也没有一行被截短。

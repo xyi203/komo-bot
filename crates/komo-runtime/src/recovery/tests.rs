@@ -25,6 +25,32 @@ use super::*;
 
 const NOW: OffsetDateTime = datetime!(2026-09-15 08:00:00 UTC);
 
+#[test]
+fn corrupt_runs_in_one_session_form_one_operator_notification_group() {
+    let session = SessionId::from_raw("session-broken");
+    let reason = "会话读不出来".to_string();
+    let report = RecoveryReport {
+        reclaimed: 0,
+        outcomes: ["run-1", "run-2", "run-3"]
+            .into_iter()
+            .map(|run| RecoveryOutcome {
+                run: RunId::from_raw(run),
+                session: session.clone(),
+                action: RecoveryAction::HaltCorrupt {
+                    reason: reason.clone(),
+                },
+                applied: Applied::NeedsOperator,
+            })
+            .collect(),
+    };
+
+    let groups = report.corrupt_groups();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].session, session);
+    assert_eq!(groups[0].reason, reason);
+    assert_eq!(groups[0].runs.len(), 3);
+}
+
 // ---------------------------------------------------------------- 替身
 
 /// 记账用的索引：恢复做了什么，事后数得出来。

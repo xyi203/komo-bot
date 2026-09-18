@@ -495,8 +495,7 @@ fn window(surface: &Surface) -> Vec<&SurfaceMessage> {
 fn latest_user_text(surface: &Surface) -> Option<String> {
     window(surface)
         .into_iter()
-        .filter(|message| message.role == komo_kernel::types::turn::Role::User)
-        .last()
+        .rfind(|message| message.role == komo_kernel::types::turn::Role::User)
         .and_then(|message| message.text.clone())
 }
 

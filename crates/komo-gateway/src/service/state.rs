@@ -198,6 +198,9 @@ pub struct GatewayState {
     pub hub: SharedHub,
     pub ledgers: Arc<SessionLedgers>,
     pub routed: Arc<RoutedLedger>,
+    /// 审计补写的叫醒铃。审批请求落库之后由 [`RoutedLedger::suspend`] 按一下，周期
+    /// （`AUDIT_TICK`）只是兜底——界面等不起那一拍（§8.5 的补写顺序不变）。
+    pub audit_wake: Arc<tokio::sync::Notify>,
     /// 一次 Run 的三个写入者共用的那个账本句柄（测试的故障注入口包的就是它）。审计补写
     /// 也走它——补写是账本写入的一种，没有理由绕过同一条缝。
     pub turn_ledger: Arc<dyn Ledger>,
@@ -299,7 +302,12 @@ impl GatewayState {
             Arc::clone(&hub),
             executor.clone(),
         ));
-        let routed = Arc::new(RoutedLedger::new(Arc::clone(&ledgers), db.clone()));
+        let audit_wake = Arc::new(tokio::sync::Notify::new());
+        let routed = Arc::new(RoutedLedger::new(
+            Arc::clone(&ledgers),
+            db.clone(),
+            Arc::clone(&audit_wake),
+        ));
         let outputs: Arc<dyn ToolOutputStore> = Arc::new(RoutedOutputs::new(
             Arc::clone(&ledgers),
             Arc::clone(&routed),
@@ -324,21 +332,24 @@ impl GatewayState {
 
         // 记忆这一层要**先于**模型后端装好：注入是系统提示的一部分，而
         // `LlmFactory::with_preamble` 在造后端时就要拿到它（§9.4）。
-        let embeddings = match embeddings {
-            Some(client) => Some(client),
-            None => build_embeddings(&snapshot, &config).await,
-        };
+        //
+        // 向量后端**注入的优先**（测试），否则这里只留空槽：探测在后台跑
+        // （`spawn_embedding_probe`），不等它。
+        let injected_embeddings = embeddings;
         let memories = Arc::new(MemoryManager::new(MemoryParts {
             config: snapshot.memory.clone(),
             repo: Arc::clone(&memory),
             catalog: Arc::new(TursoMemoryRepo::new(db.clone())),
-            embeddings,
+            embeddings: injected_embeddings.clone(),
             llm: Arc::clone(&llm_for_memory(&snapshot, &config, &caps, llm.as_ref())),
             events: Arc::new(LedgerEvents(Arc::clone(&routed) as Arc<dyn Ledger>)),
             work: Arc::new(DbMemoryWork::new(db.clone(), Arc::clone(&clock))),
             clock: Arc::clone(&clock),
         }));
         let preamble = Arc::new(MemoryPreamble::new(Arc::clone(&memories)));
+        if injected_embeddings.is_none() {
+            spawn_embedding_probe(Arc::clone(&memories), Arc::clone(&config));
+        }
 
         let llm = Arc::new(SwappableLlm::new(match llm {
             Some(client) => client,
@@ -422,6 +433,7 @@ impl GatewayState {
             hub,
             ledgers,
             routed,
+            audit_wake,
             turn_ledger,
             outputs,
             queue,
@@ -893,7 +905,12 @@ impl GatewayState {
         if let Err(error) = result {
             // 排不进去只是**审计**补不上，决定本身已经提交了（§8.2：提交即 fsync）。
             tracing::warn!(%error, approval = %record.approval, "审计事件排不进 outbox");
+            return;
         }
+        // 与请求那条对称：`approval.decided` 也走补写（§8.5 的反向顺序），而别的界面
+        // （第二个 TUI、聊天里那张卡旁边的会话）正是靠它知道这条已经答过了。等周期就是
+        // 让他们最多晚一分钟才看到结论。
+        self.audit_wake.notify_one();
     }
 
     /// 把 `control_outbox` 里还没补写的审计事件追加到各自 Session 的 JSONL。
@@ -1019,28 +1036,45 @@ fn llm_for_memory(
     }
 }
 
-/// 按 `memory.embedding` alias 解析后的完整配置造向量后端。
+/// §9.5 的「省略 `dimensions` 时先探一次维度」。**这一步不在就绪路径上。**
 ///
-/// **端点这一刻不通不该让 Gateway 起不来**：没有向量客户端时 hybrid 会如实降级并说明
-/// 原因（§9.4），这比一个起不来的进程强。配了 `dimensions` 就不碰网络；省略时要探一次
-/// （§9.5），那一次探测失败就是这里唯一会用到网络的地方。
-async fn build_embeddings(
-    snapshot: &ConfigSnapshot,
-    config: &ConfigHolder,
-) -> Option<Arc<dyn EmbeddingClient>> {
-    if !snapshot.memory.enabled {
-        return None;
-    }
-    let embedding = snapshot.memory.embedding.as_ref()?;
-    let transport = komo_runtime::llm::default_transport();
-    match komo_runtime::embedding::connect_embedding(embedding, &config.secrets(), transport).await
-    {
-        Ok(client) => Some(client),
-        Err(error) => {
-            tracing::warn!(%error, "向量后端造不出来：检索这一侧会如实报降级，不静默当成关键词模式");
-            None
+/// 那一次探测是一次网络往返（`connect_embedding` 拿模型返回的维度，再固定成空间指纹），
+/// 端点慢、或者在收连接但不回话，就要等满模型超时——本机实测 120s。它原本跑在
+/// `GatewayState::assemble` 里、也就是绑监听与写发现文件**之前**，于是 `Gateway 就绪`
+/// 与发现文件一起被推后整整一个超时：`komo gateway restart` 看上去就是卡住。
+///
+/// 顺序改成「先起服务，再探模型」：探到了走 `install_embeddings` 装上，检索立刻能用
+/// 向量臂；探不到就一直空着，检索按 §9.4 **如实报降级**（与端点本来就不通时同一个行为，
+/// 不是新的静默失败）。
+fn spawn_embedding_probe(memories: Arc<MemoryManager>, config: Arc<ConfigHolder>) {
+    tokio::spawn(async move {
+        // 探测时读**当前**快照与凭证：热重载换掉的端点、`.env` 里新填的 key 都在这一
+        // 刻生效，而不是启动那一刻的旧值。
+        let snapshot = config.current();
+        if !snapshot.memory.enabled {
+            return;
         }
-    }
+        let Some(embedding) = snapshot.memory.embedding.clone() else {
+            return;
+        };
+        let transport = komo_runtime::llm::default_transport();
+        match komo_runtime::embedding::connect_embedding(&embedding, &config.secrets(), transport)
+            .await
+        {
+            Ok(client) => {
+                tracing::info!(
+                    model = %embedding.model.model,
+                    endpoint = %embedding.model.base_url,
+                    dimensions = client.space().dimensions,
+                    "向量后端就绪"
+                );
+                memories.install_embeddings(client);
+            }
+            Err(error) => {
+                tracing::warn!(%error, "向量后端造不出来：检索这一侧会如实报降级，不静默当成关键词模式");
+            }
+        }
+    });
 }
 
 /// 按快照造模型后端；造不出来就退到 [`UnconfiguredLlm`]，**不让 Gateway 起不来**。

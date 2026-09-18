@@ -28,7 +28,7 @@ mod preamble;
 mod work;
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::{MemoryConfig, RetrievalConfig};
@@ -325,7 +325,15 @@ pub struct MemoryManager {
     retrieval: RetrievalConfig,
     repo: Arc<dyn MemoryRepo>,
     catalog: Arc<dyn MemoryCatalog>,
-    embeddings: Option<Arc<dyn EmbeddingClient>>,
+    /// 向量后端。**可以后装**：Gateway 先把服务起来，再在后台探维度（§9.5「省略
+    /// `dimensions` 时先探一次」）——那一次探测是一个网络往返，挂在启动路径上就是让
+    /// 「Gateway 就绪」等网络（本机实测一个只收不回话的端点 = 等满模型超时）。探到就
+    /// [`MemoryManager::install_embeddings`]，探不到就一直空着，检索按 §9.4 如实降级。
+    embeddings: RwLock<Option<Arc<dyn EmbeddingClient>>>,
+    /// 配了 `memory.embedding` alias 吗。**与"后端在不在手上"是两件事**：配了但探测还没
+    /// 落定（或探测失败）时，§9.4 的规则是"hybrid 退化成关键词、vector-only 报不可用"，
+    /// 不是"配置错误"。
+    configured: bool,
     llm: Arc<dyn LlmClient>,
     events: Arc<dyn SessionEvents>,
     work: Arc<dyn MemoryWorkLog>,
@@ -345,7 +353,7 @@ impl std::fmt::Debug for MemoryManager {
         f.debug_struct("MemoryManager")
             .field("enabled", &self.enabled)
             .field("model", &self.model.model)
-            .field("has_embeddings", &self.embeddings.is_some())
+            .field("has_embeddings", &self.vector_backend().is_some())
             .finish()
     }
 }
@@ -355,13 +363,15 @@ pub const WORK_BATCH: usize = 8;
 
 impl MemoryManager {
     pub fn new(parts: MemoryParts) -> Self {
+        let configured = parts.config.embedding.is_some();
         MemoryManager {
             enabled: parts.config.enabled,
             model: parts.config.model.clone(),
             retrieval: parts.config.retrieval.clone(),
             repo: parts.repo,
             catalog: parts.catalog,
-            embeddings: parts.embeddings,
+            embeddings: RwLock::new(parts.embeddings),
+            configured,
             llm: parts.llm,
             events: parts.events,
             work: parts.work,
@@ -394,8 +404,32 @@ impl MemoryManager {
         &self.catalog
     }
 
+    /// 当前这一拍的向量后端。**取出就放锁**：`None` = 还没探到（或探不到），检索按
+    /// §9.4 降级。
+    fn vector_backend(&self) -> Option<Arc<dyn EmbeddingClient>> {
+        self.embeddings.read().expect("向量后端槽").clone()
+    }
+
+    /// 装上向量后端。**后台探测的落点**（§9.5）：探测拿到维度才调它，拿不到就一直空着，
+    /// 检索按 §9.4 把降级如实报出去。
+    pub fn install_embeddings(&self, client: Arc<dyn EmbeddingClient>) {
+        *self.embeddings.write().expect("向量后端槽") = Some(client);
+    }
+
+    /// 手上没有向量后端时的错误。**配了 alias = 端点这一刻不可用，没配 = 配置错误**
+    /// （§9.4 的两句话分开报，HTTP 侧也分开映射：503 与 422）。
+    fn missing_backend_error(&self) -> MemoryError {
+        if self.configured {
+            MemoryError::VectorUnavailable(
+                "向量后端还没就绪：维度探测还在跑，或者上一次探测失败了".into(),
+            )
+        } else {
+            MemoryError::VectorUnconfigured
+        }
+    }
+
     pub fn space(&self) -> Option<EmbeddingSpace> {
-        self.embeddings.as_ref().map(|c| c.space().clone())
+        self.vector_backend().map(|client| client.space().clone())
     }
 
     // ------------------------------------------------------------ 检索
@@ -414,20 +448,31 @@ impl MemoryManager {
             return Err(MemoryError::Disabled);
         }
         if query.mode != RetrievalMode::Keyword {
-            let Some(client) = self.embeddings.as_ref() else {
-                return Err(MemoryError::VectorUnconfigured);
-            };
-            match self.embed_query(client.as_ref(), &query.text).await {
-                Ok(Some(vector)) => query.query_vector = Some(vector),
-                Ok(None) => {
-                    // 空查询文本没有向量可言；这不是故障，交给关键词臂（它也会返回空）。
-                }
-                Err(error) => {
-                    if query.mode == RetrievalMode::Vector {
-                        return Err(MemoryError::VectorUnavailable(error.to_string()));
+            match self.vector_backend() {
+                Some(client) => match self.embed_query(client.as_ref(), &query.text).await {
+                    Ok(Some(vector)) => query.query_vector = Some(vector),
+                    Ok(None) => {
+                        // 空查询文本没有向量可言；这不是故障，交给关键词臂（它也会返回空）。
                     }
-                    tracing::warn!(%error, "向量端点不通，这一次 hybrid 退化为关键词");
+                    Err(error) => {
+                        if query.mode == RetrievalMode::Vector {
+                            return Err(MemoryError::VectorUnavailable(error.to_string()));
+                        }
+                        tracing::warn!(%error, "向量端点不通，这一次 hybrid 退化为关键词");
+                    }
+                },
+                // 配了 alias 但后端还没在手上（维度探测在跑，或探测失败）：§9.4 的
+                // "配了但这一刻不通"——hybrid 退化成关键词并留下降级说明，vector-only
+                // 明确报不可用。**不是配置错误**。
+                None if self.configured => {
+                    if query.mode == RetrievalMode::Vector {
+                        return Err(self.missing_backend_error());
+                    }
+                    tracing::warn!("向量后端还没就绪，这一次 hybrid 退化为关键词");
                 }
+                // 没配 alias 却选了 hybrid / vector：**配置错误**，不能静默变成长期
+                // 关键词模式（§9.4）。
+                None => return Err(MemoryError::VectorUnconfigured),
             }
         }
 
@@ -784,8 +829,8 @@ impl MemoryManager {
 
     /// 同步地跑一轮索引构建（测试与启动补齐走它）。
     pub async fn build_index(&self) -> Result<IndexOutcome, MemoryError> {
-        let Some(client) = self.embeddings.clone() else {
-            return Err(MemoryError::VectorUnconfigured);
+        let Some(client) = self.vector_backend() else {
+            return Err(self.missing_backend_error());
         };
         IndexBuilder::new(Arc::clone(&self.repo), Arc::clone(&self.catalog), client)
             .run()

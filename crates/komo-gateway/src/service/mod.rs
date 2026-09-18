@@ -359,11 +359,20 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
     {
         // 控制审计的周期补写（§8.5 的反向顺序）。启动时补过一次；这一遍管的是运行期
         // 产生的那些——补写按 `event_id` 幂等，补不上的留在 outbox 里下次再来。
+        //
+        // **不只靠这一拍**：停在待审批上的 Run 会按 `audit_wake` 立刻叫它（`RoutedLedger`
+        // 的 `suspend`）。界面（TUI 的弹窗、任何按 `approval.requested` 帧走的东西）等的
+        // 就是这条补写，60 秒一拍等于让操作者的弹窗晚到一分钟。周期留下当兜底：漏掉的、
+        // 别处写进去的，一拍之内照样会补上。
         let state = Arc::clone(state);
         let shutdown = shutdown.clone();
+        let wake = Arc::clone(&state.audit_wake);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(AUDIT_TICK).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(AUDIT_TICK) => {}
+                    _ = wake.notified() => {}
+                }
                 if shutdown.is_cancelled() {
                     return;
                 }

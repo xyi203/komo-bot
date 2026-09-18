@@ -172,6 +172,8 @@ fn matcher_for(plan: &ExecutionPlan) -> Matcher {
             }
             _ => None,
         },
+        // 一次批准长出来的范围授权**不按形状放宽**：它认的是刚才那份计划本身。
+        command_patterns: None,
         sources: None,
         paths: None,
     }

@@ -300,6 +300,8 @@ pub struct RoutedLedger {
     runs: Mutex<BTreeMap<RunId, SessionId>>,
     calls: Mutex<BTreeMap<ToolCallId, SessionId>>,
     attempts: Mutex<BTreeMap<AttemptId, SessionId>>,
+    /// 「有人刚停在一份**待审批**上」的信号（见 [`Self::suspend`]）。
+    audit_wake: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for RoutedLedger {
@@ -309,13 +311,14 @@ impl std::fmt::Debug for RoutedLedger {
 }
 
 impl RoutedLedger {
-    pub fn new(ledgers: Arc<SessionLedgers>, db: Db) -> Self {
+    pub fn new(ledgers: Arc<SessionLedgers>, db: Db, audit_wake: Arc<tokio::sync::Notify>) -> Self {
         RoutedLedger {
             ledgers,
             db,
             runs: Mutex::new(BTreeMap::new()),
             calls: Mutex::new(BTreeMap::new()),
             attempts: Mutex::new(BTreeMap::new()),
+            audit_wake,
         }
     }
 
@@ -543,7 +546,23 @@ impl Ledger for RoutedLedger {
     }
 
     async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError> {
-        self.for_run(run).await?.ledger.suspend(run, wait).await
+        let outcome = self
+            .for_run(run)
+            .await?
+            .ledger
+            .suspend(run, wait.clone())
+            .await;
+        // 停在**待审批**上：`approval.requested` 那条审计事件还在 `control_outbox` 里
+        // （§8.5 的反向顺序：state.db 权威先提交，JSONL 那一条随后补写），而界面正是靠
+        // 它才知道有人等着回答——`run.waiting_approval` 只说"停下了"，短 ID 在它身上。
+        // 等周期（`AUDIT_TICK`）就是让操作者的弹窗晚到一分钟，所以这里立刻叫醒补写。
+        //
+        // 审批请求此刻**已经提交**（`ApprovalGate::request` 在 `suspend` 之前跑完），
+        // 所以醒来一定能读到那一行；拿不到时补写留到下一拍，不影响权威。
+        if outcome.is_ok() && matches!(wait, Wait::Approval { .. }) {
+            self.audit_wake.notify_one();
+        }
+        outcome
     }
 
     async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError> {
@@ -681,7 +700,11 @@ mod tests {
             Arc::clone(&hub),
             ExecutorId::from_raw("exec-1"),
         ));
-        let routed = Arc::new(RoutedLedger::new(Arc::clone(&ledgers), store.db().clone()));
+        let routed = Arc::new(RoutedLedger::new(
+            Arc::clone(&ledgers),
+            store.db().clone(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
         (ledgers, routed, hub)
     }
 

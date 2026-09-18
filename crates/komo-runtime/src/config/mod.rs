@@ -130,10 +130,73 @@ fn read_policy(path: &Path) -> Result<RuleTable, ConfigError> {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
-    toml::from_str(&text).map_err(|e| ConfigError::Parse {
+    let file: PolicyFile = toml::from_str(&text).map_err(|e| ConfigError::Parse {
         file: path.to_path_buf(),
         message: e.to_string(),
+    })?;
+    file.resolve().map_err(|message| ConfigError::Parse {
+        file: path.to_path_buf(),
+        message,
     })
+}
+
+/// `policy.toml` 的**文件形状**：比 [`RuleTable`] 多一个可选的 `mode`。
+///
+/// 两条路二选一，不允许同时写：
+///
+/// - `mode = "strict" | "auto"`：选一张**基表**（§7.1 的两套建议），文件里的
+///   `[[rules]]` **追加在基表之后**。基表自带默认结论，所以这条路里不许再写 `default`。
+/// - 不写 `mode`：文件本身就是整张表（`default` + `[[rules]]`），与 §7.1 的内建建议
+///   无关——"我全都要自己写"那条路，也是这个键出现之前唯一的行为。
+///
+/// 规则本身的形状还是 kernel 的 [`PolicyRule`]，这里多出来的只有"选哪张基表"这一个决定。
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<PolicyMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default: Option<komo_kernel::policy::Effect>,
+    #[serde(default)]
+    rules: Vec<komo_kernel::policy::PolicyRule>,
+}
+
+/// 一张**基表**（§7.1）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PolicyMode {
+    /// §7.1 的初始建议：任意 shell / Python 都要人看一眼。
+    Strict,
+    /// 只问危险形状（`RuleTable::auto`）：日常命令不再打扰。
+    Auto,
+}
+
+impl PolicyFile {
+    fn resolve(self) -> Result<RuleTable, String> {
+        match (self.mode, self.default) {
+            // 基表自带默认结论，再写一个就是两个互相打架的答案。
+            (Some(mode), Some(_)) => Err(format!(
+                "`mode = \"{}\"` 与 `default` 只能留一个：`mode` 选一张基表（默认结论跟着基表走），\
+                 `default` 是自己写整张表时的默认结论",
+                match mode {
+                    PolicyMode::Strict => "strict",
+                    PolicyMode::Auto => "auto",
+                }
+            )),
+            (Some(mode), None) => {
+                let mut base = match mode {
+                    PolicyMode::Strict => RuleTable::initial(),
+                    PolicyMode::Auto => RuleTable::auto(),
+                };
+                base.rules.extend(self.rules);
+                Ok(base)
+            }
+            (None, default) => Ok(RuleTable {
+                rules: self.rules,
+                default: default.unwrap_or(komo_kernel::policy::Effect::Ask),
+            }),
+        }
+    }
 }
 
 #[cfg(test)]

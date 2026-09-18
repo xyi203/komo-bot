@@ -182,6 +182,17 @@ impl FaultState {
         LedgerError::Persist("注入的故障：这个进程从这一步起写不动账本了".into())
     }
 
+    /// 记一次穿过故障点，但**不毒化**：给那些不在 Run 推进路径上的写用（审计补写）。
+    ///
+    /// 毒化对推进路径上的故障点是必须的（见 [`FaultLedger`] 的注释），对补写却会把随后
+    /// 每一次账本写入也一起废掉——那表达的是"进程死了"，由 `stop()` 表达就够了。补写要
+    /// 表达的是"这一条审计没能落进 JSONL"，重启之后还得能再来一次。
+    fn refuse(&self) -> LedgerError {
+        self.trip_count.fetch_add(1, Ordering::SeqCst);
+        self.tripped.notify_waiters();
+        LedgerError::Persist("注入的故障：这一条审计补写不进去".into())
+    }
+
     fn poisoned(&self) -> Option<LedgerError> {
         self.poisoned
             .load(Ordering::SeqCst)
@@ -324,7 +335,10 @@ impl Ledger for FaultLedger {
     ) -> Result<Seq, LedgerError> {
         poisoned!(self);
         if self.state.fault == Fault::BeforeAppendAudit {
-            return Err(self.state.trip());
+            // 补写**不在 Run 自己的推进路径上**（§8.5：权威已在 state.db，这一条是补写的
+            // 审计副本），所以这里只拒绝这一次写入、不毒化整个账本——毒化会把 Run 的正常
+            // 写入也一起废掉，"审计没写进去"就变成了"任务再也推不动"。
+            return Err(self.state.refuse());
         }
         self.inner
             .append_audit(session, event_id, payload, occurred_at)

@@ -20,7 +20,7 @@ use komo_kernel::types::memory::{
     Confirmation, MemoryScope, MemoryState, MemoryWork, Provenance, RetrievalMode,
 };
 use komo_kernel::types::model::{
-    DistanceRule, Effort, EmbeddingSpace, InputKind, ModelConfig, Vector,
+    DistanceRule, Effort, EmbeddingConfig, EmbeddingSpace, InputKind, ModelConfig, Vector,
 };
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultStatus};
@@ -842,6 +842,68 @@ async fn hybrid_without_any_embedding_configured_is_a_configuration_error() {
             .unwrap_err(),
         MemoryError::VectorUnconfigured
     );
+}
+
+/// 配了 alias 但后端还**没在手上**（启动时那次维度探测还在跑，或者探测失败了）：这是
+/// §9.4 的"配了但这一刻不通"，不是配置错误——hybrid 降级成关键词并说明，vector-only 报
+/// 不可用；探测落定后 `install_embeddings` 让同一台 manager 立刻有向量臂。
+#[tokio::test]
+async fn a_backend_that_has_not_landed_yet_degrades_and_then_installs() {
+    let mut config = memory_config(true, RetrievalMode::Hybrid);
+    config.embedding = Some(EmbeddingConfig {
+        model: model("embed", None),
+        revision: None,
+        dimensions: Some(4),
+        document_prefix: None,
+        query_prefix: None,
+    });
+    let harness = HarnessBuilder::new().config(config).build().await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+
+    assert!(harness.manager.space().is_none(), "还没装上就没有空间");
+    assert!(
+        matches!(
+            harness.manager.build_index().await.unwrap_err(),
+            MemoryError::VectorUnavailable(_)
+        ),
+        "配了 alias 却报「没配置」会把配置错误与后端不可用搅在一起"
+    );
+
+    let hybrid = harness
+        .manager
+        .search(harness.manager.query("空调", None))
+        .await
+        .expect("hybrid 不该整个失败");
+    assert!(hybrid.degraded, "要明示这一次只有关键词臂");
+    assert!(!hybrid.items.is_empty(), "关键词臂照常给结果");
+
+    let error = harness
+        .manager
+        .search(harness.manager.query("空调", Some(RetrievalMode::Vector)))
+        .await
+        .expect_err("vector-only 要明确报不可用");
+    assert!(
+        matches!(error, MemoryError::VectorUnavailable(_)),
+        "{error:?}"
+    );
+
+    harness
+        .manager
+        .install_embeddings(Arc::clone(&harness.embeddings) as Arc<dyn EmbeddingClient>);
+    assert_eq!(
+        harness.manager.space().as_ref(),
+        Some(harness.embeddings.space()),
+        "装上的就是探测拿到的那个空间"
+    );
+    harness
+        .manager
+        .build_index()
+        .await
+        .expect("装上之后建得起来");
 }
 
 // =========================================================== ⑦ confirm / forget / resume

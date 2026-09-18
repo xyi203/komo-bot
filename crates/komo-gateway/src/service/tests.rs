@@ -646,3 +646,104 @@ async fn wait_for_run(
 /// 让编译器盯住这几个在别处用到的类型。
 #[allow(dead_code)]
 fn unused(_: RequestKey) {}
+
+// ---------------------------------------------------------------- §7.1 的 auto 模式
+
+/// `policy.toml` 写 `mode = "auto"`：**日常命令不问就跑**（§7.1）。
+///
+/// 这是这个模式存在的全部理由——`mode = "strict"`（以及不写 `policy.toml` 时的初始建议）
+/// 对每一条 shell 都问一次，于是 agent 干任何活都要人去点一下。
+#[tokio::test]
+async fn auto_mode_runs_an_ordinary_shell_command_without_asking() {
+    use crate::service::test_support::harness::{
+        FakeLlm, Home, call_round, home_config, text_round,
+    };
+
+    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let once = home.workspace().join("auto.count");
+    let command = format!("echo once >> {}", once.display());
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-1",
+            "shell",
+            serde_json::json!({ "command": command }),
+        ),
+        text_round(2, "做完了。"),
+    ]]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway.submit(&session, "auto-1", "跑一下 echo").await.run;
+    gateway
+        .wait_status(
+            &run,
+            |status| status.is_terminal() || status == RunStatus::NeedsAttention,
+            "收场",
+        )
+        .await;
+
+    assert!(
+        gateway.approvals().await.is_empty(),
+        "auto 模式下这条命令不该问：{:?}",
+        gateway.approvals().await
+    );
+    assert_eq!(
+        std::fs::read_to_string(&once)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        1,
+        "命令要真的跑过"
+    );
+}
+
+/// 同一个文件里，**危险形状仍然把人叫来**，而且批准之前什么都不跑（§7.4）。
+#[tokio::test]
+async fn auto_mode_still_stops_at_a_dangerous_shape() {
+    use crate::service::test_support::harness::{
+        FakeLlm, Home, call_round, home_config, text_round,
+    };
+
+    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    // 「`rm -rf /` 开头」正是清单里的形状；这条路径不存在，所以就算漏放行也删不掉东西。
+    let doomed = home.workspace().join("never-touched");
+    let command = format!("rm -rf {}", doomed.display());
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-1",
+            "shell",
+            serde_json::json!({ "command": command }),
+        ),
+        text_round(2, "删掉了。"),
+    ]]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(&session, "auto-2", "把这个目录删了")
+        .await
+        .run;
+
+    let approval = gateway.wait_approval().await;
+    assert!(
+        approval.reason.contains("dangerous-shapes"),
+        "要说清是撞上哪条形状：{}",
+        approval.reason
+    );
+    assert!(!doomed.exists(), "批准之前不能执行");
+
+    // 拒绝：Run 收场，命令始终没跑。
+    gateway.decide(&approval.approval, false).await;
+    gateway
+        .wait_status(
+            &run,
+            |status| status.is_terminal() || status == RunStatus::NeedsAttention,
+            "收场",
+        )
+        .await;
+    assert!(!doomed.exists(), "拒绝了就更不能跑");
+}

@@ -12,8 +12,8 @@ use komo_kernel::types::chat::{
 use komo_kernel::types::status::RunStatus;
 
 use crate::harness::{
-    FakeLlm, FixedFactory, GatewayBuilder, Gw, Home, MemSender, TestGateway, call_round,
-    config_toml, eventually, feishu_block, inbound, multi_call_round, telegram_block,
+    EVENT_DEADLINE, FakeLlm, FixedFactory, GatewayBuilder, Gw, Home, MemSender, TestGateway,
+    call_round, config_toml, eventually, feishu_block, inbound, multi_call_round, telegram_block,
     telegram_config, text_round,
 };
 
@@ -627,8 +627,9 @@ home_chat = 999
 /// 的待处理帧都是从它派生的。少了它，TUI 停在"等待审批"却没有待审批计数、也不弹窗，
 /// 只能自己轮询 `/v1/approvals` 才发现自己在等（§7.4「TUI 同时可见」）。
 ///
-/// 补写这一步在生产里由启动时与 `AUDIT_TICK` 各做一次（§8.5 的反向顺序：state.db 是
-/// 权威，JSONL 那一条是补写的审计副本）。这里直接叫一次补写器，省掉等那一拍。
+/// 权威在 state.db，JSONL 那一条是**反向补写**的审计副本（§8.5）。补写的时机是这里
+/// 测的东西：它曾经只由启动与 `AUDIT_TICK`（60s）各做一次，于是弹窗最多晚一分钟才
+/// 出现——现在停在待审批上就按一次叫醒铃，**不手动调补写器**。
 #[tokio::test]
 async fn a_waiting_run_writes_the_approval_request_into_the_session_log() {
     let home = Home::new();
@@ -643,6 +644,8 @@ async fn a_waiting_run_writes_the_approval_request_into_the_session_log() {
     ]]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gw.open_session().await;
+    // **先订阅再交任务**：界面看见弹窗靠的就是这一条直播帧，而它由那次补写派生。
+    let mut frames = gw.state().hub.subscribe(&session);
     let run = gw.submit(&session, "approval-1", "跑一下 echo").await.run;
     gw.wait_status(
         &run,
@@ -651,25 +654,15 @@ async fn a_waiting_run_writes_the_approval_request_into_the_session_log() {
     )
     .await;
 
-    // 权威在 state.db：这一条停住时 JSONL 里还没有它，补写是**随后**的一步。
-    assert!(
-        !home
-            .event_types(&session)
-            .iter()
-            .any(|name| name == "approval.requested"),
-        "{:?}",
-        home.event_types(&session)
-    );
-    assert_eq!(gw.state().drain_audit().await, 1, "补写一条");
-
-    let requested = home
-        .events(&session)
-        .into_iter()
-        .find_map(|event| match event.payload {
-            EventPayload::ApprovalRequested(body) => Some(body),
-            _ => None,
-        })
-        .unwrap_or_else(|| panic!("账本里没有那条请求：{:?}", home.event_types(&session)));
+    let event = home
+        .wait_event(&session, "approval.requested", EVENT_DEADLINE)
+        .await;
+    let EventPayload::ApprovalRequested(requested) = event.payload else {
+        panic!("{} 不是审批请求", event.type_name())
+    };
+    let pending = home.wait_approval_frame(&mut frames, EVENT_DEADLINE).await;
+    assert_eq!(pending.approval, requested.approval, "帧与账本说同一条");
+    assert_eq!(pending.short_id, requested.short_id);
 
     // 它是**答得了**的那一条：界面拿这个 ID 去取详情、去答复。
     let pending = gw.approvals().await;

@@ -752,6 +752,17 @@ impl TestGateway {
 
 // ---------------------------------------------------------------- 一个数据目录
 
+/// 等一条**补写**的审计事件落盘的期限（见 [`Home::wait_event`]）。
+pub const EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// 一条 `approval_pending` 直播帧的内容：界面拿它去取详情、去弹窗（§13.1：帧里只有
+/// 编号，授权与详情另外去取）。
+#[derive(Debug, Clone)]
+pub struct PendingApprovalFrame {
+    pub approval: komo_kernel::types::ids::ApprovalId,
+    pub short_id: komo_kernel::types::ids::ShortId,
+}
+
 /// 一个真实的数据目录，可以反复起落。
 ///
 /// **故意写一份 `rules = []` 的 policy.toml**——那样 §7.1 的初始建议生效：根内写入是
@@ -780,6 +791,14 @@ impl Home {
         Home { dir }
     }
 
+    /// 同 [`Home::with_config`]，但 `policy.toml` 由调用方给——测 §7.1 的模式（`mode`）用。
+    pub fn with_policy(config: &str, policy: &str) -> Home {
+        install_crypto();
+        let dir = tempfile::tempdir().expect("临时数据目录");
+        write_home_with(dir.path(), config, DEFAULT_ENV, Some(policy));
+        Home { dir }
+    }
+
     pub fn path(&self) -> &Path {
         self.dir.path()
     }
@@ -798,6 +817,64 @@ impl Home {
 
     pub fn events_path(&self, session: &SessionId) -> PathBuf {
         self.session_dir(session).join("events.jsonl")
+    }
+
+    /// 等到某一类事件**真的落进**会话账本，返回它。
+    ///
+    /// 补写是异步的一步（§8.5 的反向顺序：权威先落 state.db，JSONL 那一条随后补），所以
+    /// "它会不会到"只能给一个期限来问，不能靠"此刻还没有"来断言。期限取
+    /// [`EVENT_DEADLINE`]：比一次补写该花的时间宽出几个数量级，又远低于任何周期拍子
+    /// （`AUDIT_TICK` 是 60s），周期兜底接不住就算失败。
+    pub async fn wait_event(
+        &self,
+        session: &SessionId,
+        wanted: &str,
+        timeout: std::time::Duration,
+    ) -> komo_kernel::events::Event {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if let Some(event) = self
+                .events(session)
+                .into_iter()
+                .find(|event| event.type_name() == wanted)
+            {
+                return event;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "等了 {:?} 也没有 {}：{:?}",
+                    timeout,
+                    wanted,
+                    self.event_types(session)
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// 从直播帧里等一条 `approval_pending`。**先订阅再交任务**，否则这一帧已经过去了。
+    pub async fn wait_approval_frame(
+        &self,
+        frames: &mut tokio::sync::broadcast::Receiver<komo_kernel::protocol::sse::SseFrame>,
+        timeout: std::time::Duration,
+    ) -> PendingApprovalFrame {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(left, frames.recv()).await {
+                Ok(Ok(frame)) => {
+                    if let komo_kernel::protocol::sse::SseEvent::ApprovalPending {
+                        approval,
+                        short_id,
+                    } = frame.event
+                    {
+                        return PendingApprovalFrame { approval, short_id };
+                    }
+                }
+                Ok(Err(error)) => panic!("直播帧断了：{error}"),
+                Err(_) => panic!("等了 {timeout:?} 也没有 approval_pending 帧"),
+            }
+        }
     }
 
     pub fn quarantine_path(&self, session: &SessionId) -> PathBuf {

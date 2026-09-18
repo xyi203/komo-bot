@@ -139,6 +139,71 @@ fn policy_toml_becomes_the_rule_table_and_its_absence_is_the_initial_one() {
     );
 }
 
+/// `mode = "auto"` 选的是 auto 基表，文件里的规则**追加在它之后**（§7.1）。
+#[test]
+fn a_policy_mode_picks_a_base_table_and_appends_the_files_own_rules() {
+    let fixture = Fixture::valid();
+    write(
+        &fixture.sources().policy,
+        r#"
+mode = "auto"
+
+[[rules]]
+id = "my-own-allow"
+effect = "allow"
+reason = "我自己放的"
+scopes = ["once"]
+requires_isolation = false
+
+[rules.matcher]
+operations = ["read_file"]
+"#,
+    );
+    let loaded = load_config(&fixture.options()).unwrap();
+    let table = &loaded.snapshot.policy;
+
+    // 基表在：auto 的那几条（含"只问危险形状"），而且默认结论跟着基表走。
+    let ids: Vec<&str> = table.rules.iter().map(|r| r.id.as_str()).collect();
+    assert!(ids.contains(&"dangerous-shapes"), "{ids:?}");
+    assert!(ids.contains(&"policy-change"), "{ids:?}");
+    assert_eq!(ids.last(), Some(&"my-own-allow"), "追加在基表之后：{ids:?}");
+    assert_eq!(table.default, komo_kernel::policy::Effect::Allow);
+    assert_eq!(table.rules.len(), RuleTable::auto().rules.len() + 1);
+}
+
+/// `mode = "strict"` 是 §7.1 的初始建议，一字不差。
+#[test]
+fn a_strict_mode_is_exactly_the_initial_suggestion() {
+    let fixture = Fixture::valid();
+    write(&fixture.sources().policy, "mode = \"strict\"\n");
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.policy, RuleTable::initial());
+}
+
+/// `mode` 与 `default` 同时写是**两个互相打架的答案**，宁可起不来也不猜。
+#[test]
+fn a_policy_mode_with_its_own_default_is_refused() {
+    let fixture = Fixture::valid();
+    write(
+        &fixture.sources().policy,
+        "mode = \"auto\"\ndefault = \"ask\"\n",
+    );
+    let error = load_config(&fixture.options()).unwrap_err().to_string();
+    assert!(
+        error.contains("mode") && error.contains("default"),
+        "{error}"
+    );
+}
+
+/// 认不出的 `mode` 值（打错字）不是"没有 mode"。
+#[test]
+fn an_unknown_policy_mode_is_refused_instead_of_falling_back() {
+    let fixture = Fixture::valid();
+    write(&fixture.sources().policy, "mode = \"aut\"\n");
+    let error = load_config(&fixture.options()).unwrap_err().to_string();
+    assert!(error.contains("aut"), "{error}");
+}
+
 #[test]
 fn a_bad_effort_refuses_the_whole_load_and_points_at_the_key() {
     let fixture = Fixture::valid();

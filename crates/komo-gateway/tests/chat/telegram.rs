@@ -224,8 +224,11 @@ async fn a_decision_removes_the_buttons() {
     ));
 
     let fake = Arc::clone(&wired.fake);
-    eventually("按钮被去掉", move || {
+    // 去掉按钮与写回结论是**两次**平台往返（`update_after_decision` 先 markup 再 text），
+    // 所以等的是这两样都到——只等前一样就会在负载下读到半路的结果。
+    eventually("按钮被去掉且结论写回", move || {
         !fake.calls_to("editMessageReplyMarkup").is_empty()
+            && !fake.calls_to("editMessageText").is_empty()
     })
     .await;
 

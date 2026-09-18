@@ -101,6 +101,17 @@ pub struct Matcher {
     /// 命令必须以其中之一开头——"明确命令模板"的范围授权用它。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_prefixes: Option<Vec<String>>,
+    /// 命令**形状**清单：shell 命令文本里出现其中任意一条就命中。
+    ///
+    /// 比对比的是**归一后的文本**：连续空白压成一个空格、两边都降为小写（`rm   -RF` 与
+    /// `rm -rf` 是同一件事）。
+    ///
+    /// **这是手滑网，不是边界**（§7.3）：它认的是文本，绕过它并不比写一句话难
+    /// （`rm -r -f`、`find -delete`、变量拼出来的命令都在网外）。真正约束任意代码的是
+    /// 执行环境（[`IsolationCapability`]）。放进语言里是为了让「auto 模式」能表达
+    /// "这几类命令仍然要问我"（§7.1），不是为了声称这里有一道墙。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_patterns: Option<Vec<String>>,
 }
 
 impl Matcher {
@@ -168,6 +179,18 @@ impl Matcher {
                 return false;
             }
         }
+        if let Some(patterns) = &self.command_patterns {
+            let Operation::ShellCommand { command } = &plan.operation else {
+                return false;
+            };
+            let command = normalize_command(command);
+            if !patterns
+                .iter()
+                .any(|pattern| command.contains(&normalize_command(pattern)))
+            {
+                return false;
+            }
+        }
         true
     }
 
@@ -202,6 +225,19 @@ impl Matcher {
                 .any(|t| prefixes.iter().any(|p| t.path.starts_with(p))),
         }
     }
+}
+
+/// 比对命令形状前的归一：连续空白压成一个空格、降为小写。
+///
+/// 只做这两件事，是因为它们对"同一件事的不同写法"几乎没有误伤：`rm  -RF` 与 `rm -rf`
+/// 显然是一回事。反过来，任何更强的归一（去引号、解析变量展开）都会让人以为这道网能
+/// 认出实际要跑的东西——它认不出，也不该装出能认出的样子（见
+/// [`Matcher::command_patterns`]）。
+fn normalize_command(text: &str) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// 一条规则。

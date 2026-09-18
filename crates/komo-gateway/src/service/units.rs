@@ -112,6 +112,10 @@ Environment=KOMO_HOME={home}
 ExecStart={exe} gateway --foreground
 Restart=on-failure
 RestartSec=3
+# 停机有界：`Running::stop` 自己的排空窗口是 10s，再久就是这个进程卡住了。systemd 默认
+# 停等 90s，真卡住一次 `komo gateway restart` 就白等一分半，所以这里压到 20s——超过就
+# 让 systemd 收尾。
+TimeoutStopSec=20
 
 [Install]
 WantedBy=default.target

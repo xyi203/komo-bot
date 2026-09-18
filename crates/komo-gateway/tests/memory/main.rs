@@ -28,6 +28,7 @@ mod extraction;
 mod governance;
 mod index;
 mod recall;
+mod startup;
 
 use std::sync::Arc;
 

@@ -23,7 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
 
 use crate::tui::app::{App, SubmissionState, status_text};
-use crate::tui::approval::approval_lines;
+use crate::tui::approval::{ApprovalRow, approval_lines};
 use crate::tui::markdown;
 
 /// 画一帧。
@@ -365,8 +365,16 @@ fn input_block(app: &App) -> Paragraph<'static> {
 
 /// 审批弹窗：居中，盖住底下的内容（[`Clear`]），不动布局。
 ///
-/// 按键提示放在**边框的底栏**而不是正文里：正文会滚动，而一个滚出屏幕的「y 批准 /
-/// n 拒绝」等于没有提示——在窄终端上正文几乎一定滚。
+/// 弹窗里有两块地方**不滚**：
+///
+/// ```text
+/// ├ 正文（五项：短 ID / 动作 / 改动 / 原因 / 范围）   ← 会滚，PgUp / PgDn
+/// ├ 答案菜单（每一行是一个答案，↑ / ↓ 选、Enter 确认） ← 钉在底部
+/// └ 边框底栏（怎么开这张菜单）
+/// ```
+///
+/// 钉住是因为正文在窄终端上几乎一定放不下，而一个滚出屏幕的「Enter 确认」等于没有提示
+/// ——这个弹窗上所有的答案都在菜单里。
 fn draw_approval(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(modal) = app.approval.as_ref() else {
         return;
@@ -379,7 +387,7 @@ fn draw_approval(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .border_type(BorderType::Double)
         .title(" 需要批准 ")
         .title_bottom(Line::from(Span::styled(
-            format!(" {} ", modal.keys_hint(app.pending_count())),
+            format!(" {} ", modal.keys_hint()),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -388,32 +396,104 @@ fn draw_approval(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    let mut lines = approval_lines(&modal.record);
-    // 弹窗里也不许有一行比它宽。
-    for line in &mut lines {
-        if line.width() > inner.width as usize {
-            let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            let style = line.spans.first().map(|s| s.style).unwrap_or_default();
-            *line = Line::from(Span::styled(
-                markdown::truncate_to_width(&flat, inner.width as usize),
-                style,
-            ));
+    // 菜单钉在底部：正文多长都不许把它挤出窗口。这里手工切 `Rect` 而不是用 `Layout`
+    // ——窗口矮到装不下菜单时，`Length` 约束怎么取舍是布局库的事，而这里要的是"菜单
+    // 优先，正文归零"这一条明确的规矩。
+    let pending = app.pending_count();
+    let rows = modal.rows(pending);
+    let menu_height = (rows.len() as u16).min(inner.height);
+    let menu = Rect {
+        y: inner.y + inner.height - menu_height,
+        height: menu_height,
+        ..inner
+    };
+    let body = Rect {
+        height: inner.height - menu_height,
+        ..inner
+    };
+
+    if body.height > 0 {
+        let mut lines = approval_lines(&modal.record);
+        // 弹窗里也不许有一行比它宽。
+        for line in &mut lines {
+            if line.width() > body.width as usize {
+                let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let style = line.spans.first().map(|s| s.style).unwrap_or_default();
+                *line = Line::from(Span::styled(
+                    markdown::truncate_to_width(&flat, body.width as usize),
+                    style,
+                ));
+            }
         }
-    }
-    // 放不下就说还有多少行——滚动条之外最起码的一句话。
-    let hidden = lines.len().saturating_sub(inner.height as usize);
-    if hidden > 0 {
-        let scrolled = (modal.scroll as usize).min(hidden);
-        lines.insert(
-            0,
-            Line::from(Span::styled(
-                format!("（还有 {} 行，↑/↓ 或 PgUp/PgDn 滚动）", hidden - scrolled),
-                Style::default().fg(Color::DarkGray),
-            )),
-        );
+        // 放不下就说还有多少行——滚动条之外最起码的一句话。
+        let hidden = lines.len().saturating_sub(body.height as usize);
+        if hidden > 0 {
+            let scrolled = (modal.scroll as usize).min(hidden);
+            lines.insert(
+                0,
+                Line::from(Span::styled(
+                    format!("（还有 {} 行，PgUp/PgDn 滚动）", hidden - scrolled),
+                    Style::default().fg(Color::DarkGray),
+                )),
+            );
+        }
+        frame.render_widget(Paragraph::new(lines).scroll((modal.scroll, 0)), body);
     }
 
-    frame.render_widget(Paragraph::new(lines).scroll((modal.scroll, 0)), inner);
+    if menu_height > 0 {
+        let lines = menu_lines(
+            &rows,
+            modal.selected_index(pending),
+            modal.answering,
+            menu.width,
+        );
+        frame.render_widget(Paragraph::new(lines), menu);
+    }
+}
+
+/// 菜单的每一行：高亮那一行是实心色块，其余是灰的；行尾挂着它的直通键。
+///
+/// 每一行按 `width` 自己裁、自己补空格——高亮要是一条通到底的色块，而"超宽就截断"那
+/// 套循环作用在正文的 `Vec<Line>` 上，够不着这里。
+fn menu_lines(
+    rows: &[ApprovalRow],
+    selected: usize,
+    answering: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    // "▸ " + 标签 + 标签到直通键之间的空格 + 直通键。
+    let label_width = (width as usize).saturating_sub(4);
+    rows.iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let chosen = index == selected && !answering;
+            let row_style = if answering {
+                Style::default().fg(Color::DarkGray)
+            } else if chosen {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let label = markdown::truncate_to_width(&row.label, label_width);
+            let fill = label_width.saturating_sub(markdown::display_width(&label)) + 1;
+            Line::from(vec![
+                Span::styled(if chosen { "▸ " } else { "  " }, row_style),
+                Span::styled(label, row_style),
+                Span::styled(" ".repeat(fill), row_style),
+                Span::styled(
+                    row.key.to_string(),
+                    if chosen {
+                        row_style
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
@@ -683,10 +763,14 @@ fn main() {
             assert!(screen.contains("+新的一行"), "diff：{screen}");
             assert!(screen.contains("原因"), "四、原因：{screen}");
             assert!(screen.contains("范围"), "五、范围：{screen}");
-            // 待审批时输入框禁用并提示——提示里只列这条请求真的能用的键。
-            assert!(screen.contains("y 本条"), "输入框提示：{screen}");
-            assert!(screen.contains("r 本条 Run 范围"), "输入框提示：{screen}");
-            assert!(screen.contains("n / Esc 拒绝本条"), "输入框提示：{screen}");
+            // 答案一行行列在弹窗底部的菜单里，行的尾巴上挂着它的直通键。
+            assert!(
+                screen.contains("本次任务默认通过（本次 Run 范围）"),
+                "菜单：{screen}"
+            );
+            assert!(screen.contains("只批准本次调用"), "菜单：{screen}");
+            assert!(screen.contains("拒绝（本次不执行）"), "菜单：{screen}");
+            assert!(screen.contains("Enter 确认"), "底栏：{screen}");
         }
     }
 
@@ -696,7 +780,7 @@ fn main() {
         feed(&mut app, &fixture::conversation()[..4]);
         app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
 
-        // 一个放不下正文的窄窗口：按键提示在边框上，滚不走。
+        // 一个放不下正文的窄窗口：菜单与底栏钉在弹窗底部，正文滚不走它们。
         let buffer = snapshot(&app, 80, 24);
         assert_within(&buffer, 80, 24);
         let rows = rows(&buffer);
@@ -707,8 +791,9 @@ fn main() {
             );
         }
         let screen = rows.join("\n");
-        assert!(screen.contains("y 批准本次"), "{screen}");
-        assert!(screen.contains("n / Esc 拒绝"), "{screen}");
+        assert!(screen.contains("本次任务默认通过"), "菜单：{screen}");
+        assert!(screen.contains("拒绝（本次不执行）"), "菜单：{screen}");
+        assert!(screen.contains("Enter 确认"), "底栏：{screen}");
         assert!(screen.contains("滚动"), "放不下要说还有多少行：{screen}");
         // 输入框在这么窄的窗口里被弹窗盖住了；它禁用这件事由状态说了算。
         assert!(!app.input_enabled());

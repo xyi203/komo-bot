@@ -443,17 +443,9 @@ impl App {
 
     pub fn input_hint(&self) -> String {
         if let Some(modal) = &self.approval {
-            // 提示里只列**这条请求真的能用**的键：`r` 是 Policy 标了可范围化才有的，
-            // 这一个请求没有时把它写出来，等于教人按一个没反应的键（弹窗底栏的规则
-            // 一样，见 `ApprovalModal::keys_hint`）。
-            let mut keys = vec!["y 本条"];
-            if modal.allows_run_scope() {
-                keys.push("r 本条 Run 范围");
-            }
-            if self.pending_count() > 1 {
-                keys.push("a 全部批准");
-            }
-            keys.push("n / Esc 拒绝本条");
+            // 提示行只说**怎么开这张菜单**：菜单自己把每一行的答案与直通键写在脸上，这里
+            // 再抄一遍只会在窄终端里被截掉半行（弹窗底栏的那一行同理，见
+            // `ApprovalModal::keys_hint`）。
             return format!(
                 "{}——待批准 {} 条 · {}",
                 if self.pending_count() > 1 {
@@ -462,7 +454,7 @@ impl App {
                     "有待批准的操作"
                 },
                 self.pending_count(),
-                keys.join(" · ")
+                modal.keys_hint()
             );
         }
         if self.pending_count() > 0 {

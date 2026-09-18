@@ -5,10 +5,12 @@
 //! [`approval_lines`] 就是那五项，一项一个小标题，缺一项是这个模块的 bug 而不是
 //! 「那次没有」——`changes` 为空时印「（无）」，不是不印这一节。
 //!
-//! 按键只有三个答案：`y` 本次、`r` 本次 Run 范围、`n` / `Esc` 拒绝。**没有 `always`**：
-//! §7.2「不把『同意一次 Python』解释为『今后任意脚本均可执行』」，而 `r` 也只在这条
-//! 请求的 `scopes` 真的含 [`ApprovalScope::Run`] 时才生效——范围是 Policy 标出来的，
-//! 不是按键变出来的。
+//! 答案不是藏在按键后面的，而是弹窗底部**列出来的一行行**（[`ApprovalModal::rows`]）：
+//! `↑` / `↓` 移动高亮、`Enter` 确认，行首那个字母是直通键——习惯按 `y` 的人不必先移动
+//! 高亮。菜单里只有 Policy 真给了的那些：`本次任务默认通过（本次 Run 范围）` 只在这条
+//! 请求的 `scopes` 真的含 [`ApprovalScope::Run`] 时出现，`全部批准` 只在待处理多于一条
+//! 时出现。**没有 `always`**：§7.2「不把『同意一次 Python』解释为『今后任意脚本均可执行』」，
+//! 范围是 Policy 标出来的，不是按键变出来的。
 
 use komo_kernel::protocol::http::ApprovalRecord;
 use komo_kernel::types::chat::ApprovalScope;
@@ -16,13 +18,16 @@ use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanSource, RecoveryMod
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-/// 弹窗自己的状态：一条请求加一个滚动位置。
+/// 弹窗自己的状态：一条请求、一个滚动位置、一个高亮位置。
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalModal {
     pub record: ApprovalRecord,
     pub scroll: u16,
     /// 已经答过了，正在等服务端回执——再按一次不该发第二个请求。
     pub answering: bool,
+    /// 菜单里高亮的那一行，[`ApprovalModal::rows`] 的下标。行数会随待处理条数变（批量
+    /// 那行），所以读的时候一律过 [`ApprovalModal::selected_index`] 夹一遍。
+    pub selected: usize,
 }
 
 impl ApprovalModal {
@@ -31,6 +36,7 @@ impl ApprovalModal {
             record,
             scroll: 0,
             answering: false,
+            selected: 0,
         }
     }
 
@@ -39,22 +45,68 @@ impl ApprovalModal {
         self.record.scopes.contains(&ApprovalScope::Run)
     }
 
-    /// 底部那一行提示，按键随 `scopes` 与待处理条数变——列一个按下去没反应的键比不列
-    /// 它更糟。
+    /// 弹窗底部那张菜单：**操作者能给的答案就是这些行**，没有藏在别处的键。
     ///
-    /// `pending` 是**此刻待处理的全部条数**（含眼前这条）：`a` 答的是全部，条数得摆在
-    /// 键旁边——"全部"是 1 条还是 6 条，是按下去之前唯一要看清的事。
-    pub fn keys_hint(&self, pending: usize) -> String {
-        let batch = if pending > 1 {
-            format!("a 全部批准（{pending} 条，各按本次调用） · ")
-        } else {
-            // 只有这一条时 `a` 与 `y` 同义，列它只会让人以为还有什么没批。
-            String::new()
-        };
+    /// 第一行是 `Enter` 的默认落点。顺序是刻意的：能范围化时它排第一（一次 `Enter` 就是
+    /// 最常见的那一下），不能范围化时它就整个不出现，高亮自然落在「只批准本次调用」上。
+    ///
+    /// `pending` 是**此刻待处理的全部条数**（含眼前这条）：批量那行答的是全部，条数得摆在
+    /// 标签里——"全部"是 1 条还是 6 条，是按下去之前唯一要看清的事；只有这一条时那行不列，
+    /// 因为此时它和「只批准本次调用」同义。
+    pub fn rows(&self, pending: usize) -> Vec<ApprovalRow> {
+        let mut rows = Vec::with_capacity(4);
         if self.allows_run_scope() {
-            format!("y 批准本次 · r 批准本次 Run 范围 · {batch}n / Esc 拒绝")
+            rows.push(ApprovalRow {
+                key: 'r',
+                label: "本次任务默认通过（本次 Run 范围）".to_string(),
+                choice: ApprovalChoice::This(ApprovalAnswer::RUN),
+            });
+        }
+        rows.push(ApprovalRow {
+            key: 'y',
+            label: "只批准本次调用".to_string(),
+            choice: ApprovalChoice::This(ApprovalAnswer::ONCE),
+        });
+        rows.push(ApprovalRow {
+            key: 'n',
+            label: "拒绝（本次不执行）".to_string(),
+            choice: ApprovalChoice::This(ApprovalAnswer::REJECT),
+        });
+        if pending > 1 {
+            rows.push(ApprovalRow {
+                key: 'a',
+                label: format!("全部批准（{pending} 条，各按本次调用）"),
+                choice: ApprovalChoice::AllPending,
+            });
+        }
+        rows
+    }
+
+    /// 高亮那一行的下标，夹在 `pending` 下菜单的行数里。
+    pub fn selected_index(&self, pending: usize) -> usize {
+        self.selected
+            .min(self.rows(pending).len().saturating_sub(1))
+    }
+
+    /// `↑` / `↓`：移动高亮。到两头就停住，**不绕回去**——想按「拒绝」时多按一下不该跳回
+    /// 「本次任务默认通过」。
+    pub fn move_selection(&mut self, delta: i16, pending: usize) {
+        let moved = if delta < 0 {
+            self.selected.saturating_sub(delta.unsigned_abs() as usize)
         } else {
-            format!("y 批准本次 · {batch}n / Esc 拒绝　（这条请求不可范围化）")
+            self.selected.saturating_add(delta as usize)
+        };
+        let last = self.rows(pending).len().saturating_sub(1);
+        self.selected = moved.min(last);
+    }
+
+    /// 边框底栏那一行：怎么开这张菜单，或者为什么现在按不动。菜单自己把每一行的答案与
+    /// 直通键写在脸上，这一行不该再抄一遍。
+    pub fn keys_hint(&self) -> &'static str {
+        if self.answering {
+            "已答复，等待服务端回执……"
+        } else {
+            "↑/↓ 选择 · Enter 确认 · Esc 拒绝"
         }
     }
 
@@ -65,6 +117,23 @@ impl ApprovalModal {
     pub fn scroll_down(&mut self) {
         self.scroll = self.scroll.saturating_add(4);
     }
+}
+
+/// 菜单里的一行：行首的直通键、印出来的字、按下去答的是什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalRow {
+    pub key: char,
+    pub label: String,
+    pub choice: ApprovalChoice,
+}
+
+/// 一行答案答的是谁。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalChoice {
+    /// 眼前这一条（批还是拒、什么范围，都在 [`ApprovalAnswer`] 里）。
+    This(ApprovalAnswer),
+    /// **此刻待处理的全部**，各按本次调用（§11.3 的 `/approve all`）。
+    AllPending,
 }
 
 /// 一次答复。
@@ -429,33 +498,104 @@ mod tests {
         assert_eq!(colour(0), Some(Color::White));
     }
 
+    /// 菜单就是全部答案，顺序固定：范围 → 本次 → 拒绝。
     #[test]
-    fn the_run_key_is_offered_only_when_policy_marked_the_plan_scopable() {
+    fn the_menu_lists_every_answer_with_its_direct_key() {
+        let modal = ApprovalModal::new(approval_record());
+        let rows = modal.rows(1);
+        let keys: Vec<char> = rows.iter().map(|row| row.key).collect();
+        assert_eq!(keys, vec!['r', 'y', 'n'], "{rows:?}");
+        assert_eq!(rows[0].choice, ApprovalChoice::This(ApprovalAnswer::RUN));
+        assert_eq!(rows[1].choice, ApprovalChoice::This(ApprovalAnswer::ONCE));
+        assert_eq!(rows[2].choice, ApprovalChoice::This(ApprovalAnswer::REJECT));
+        assert!(rows[2].label.contains("拒绝"), "{rows:?}");
+    }
+
+    /// 范围那行只在 Policy 标了可范围化时出现——范围不是按键变出来的（§7.2）。
+    #[test]
+    fn the_run_row_is_offered_only_when_policy_marked_the_plan_scopable() {
         let mut record = approval_record();
         let modal = ApprovalModal::new(record.clone());
         assert!(modal.allows_run_scope());
-        assert!(modal.keys_hint(1).contains('r'));
+        assert!(modal.rows(1)[0].label.contains("Run 范围"), "范围行排第一");
 
         record.scopes = vec![ApprovalScope::Once];
         let modal = ApprovalModal::new(record);
         assert!(!modal.allows_run_scope());
-        assert!(modal.keys_hint(1).contains("不可范围化"));
+        assert!(
+            !modal.rows(1).iter().any(|row| row.key == 'r'),
+            "{:?}",
+            modal.rows(1)
+        );
+        // 没有范围行时，`Enter` 的默认落点就是「只批准本次调用」。
+        assert_eq!(
+            modal.rows(1)[0].choice,
+            ApprovalChoice::This(ApprovalAnswer::ONCE)
+        );
     }
 
-    /// 「全部批准」那个键只在**真的还有别的**待处理时出现，而且带着条数（§11.3）。
+    /// 批量那行只在**真的还有别的**待处理时出现，而且带着条数（§11.3）。
     ///
-    /// 一条时它和 `y` 同义，列出来只会让人以为还有什么没批；多条时不写条数，按下去
-    /// 之前就不知道这一次要替几条计划签字。
+    /// 一条时它和「只批准本次调用」同义，列出来只会让人以为还有什么没批；多条时不写条数，
+    /// 按下去之前就不知道这一次要替几条计划签字。
     #[test]
-    fn the_batch_key_appears_with_the_count_only_when_there_is_more_than_one() {
+    fn the_batch_row_appears_with_the_count_only_when_there_is_more_than_one() {
         let modal = ApprovalModal::new(approval_record());
-        let alone = modal.keys_hint(1);
-        assert!(!alone.contains("全部批准"), "{alone}");
+        assert!(
+            !modal
+                .rows(1)
+                .iter()
+                .any(|row| row.choice == ApprovalChoice::AllPending),
+            "{:?}",
+            modal.rows(1)
+        );
 
-        let together = modal.keys_hint(3);
-        assert!(together.contains("全部批准"), "{together}");
-        assert!(together.contains('3'), "{together}");
-        assert!(together.contains("各按本次调用"), "{together}");
+        let rows = modal.rows(3);
+        let batch = rows.last().expect("批量那行");
+        assert_eq!(batch.choice, ApprovalChoice::AllPending);
+        assert_eq!(batch.key, 'a');
+        assert!(batch.label.contains('3'), "{batch:?}");
+        assert!(batch.label.contains("各按本次调用"), "{batch:?}");
+    }
+
+    /// 高亮到两头就停住：想按「拒绝」时多按一下不该跳回第一行。
+    #[test]
+    fn the_highlight_stops_at_both_ends() {
+        let mut modal = ApprovalModal::new(approval_record());
+        assert_eq!(modal.selected_index(1), 0, "默认落在第一行");
+        for _ in 0..5 {
+            modal.move_selection(1, 1);
+        }
+        assert_eq!(modal.selected_index(1), 2, "最后一行是拒绝");
+        modal.move_selection(-1, 1);
+        assert_eq!(modal.selected_index(1), 1);
+        for _ in 0..9 {
+            modal.move_selection(-1, 1);
+        }
+        assert_eq!(modal.selected_index(1), 0);
+
+        // 待处理少到批量那行没了，高亮也不会指到不存在的行上。
+        let mut modal = ApprovalModal::new(approval_record());
+        modal.selected = 3;
+        assert_eq!(modal.selected_index(1), 2);
+        modal.move_selection(1, 1);
+        assert_eq!(modal.selected_index(1), 2);
+    }
+
+    #[test]
+    fn the_footer_hint_says_how_to_drive_the_menu() {
+        let mut modal = ApprovalModal::new(approval_record());
+        assert!(
+            modal.keys_hint().contains("Enter 确认"),
+            "{}",
+            modal.keys_hint()
+        );
+        modal.answering = true;
+        assert!(
+            modal.keys_hint().contains("等待服务端回执"),
+            "{}",
+            modal.keys_hint()
+        );
     }
 
     #[test]

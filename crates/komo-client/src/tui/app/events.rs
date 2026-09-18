@@ -4,7 +4,7 @@ use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
 use komo_kernel::types::ids::{ApprovalId, ToolCallId};
 use komo_kernel::types::refs::ToolResultStatus;
-use komo_kernel::types::status::ToolCallState;
+use komo_kernel::types::status::{RunStatus, ToolCallState};
 
 use super::{
     App, Draft, Effect, Phase, ServerEvent, SubmissionState, blank_tool, resume_summary,
@@ -299,6 +299,13 @@ impl App {
             SseEvent::RunStatus { run, status } => {
                 if status.is_terminal() && self.current_run.as_ref() == Some(&run) {
                     self.scroll = 0;
+                }
+                // 「停在一份待审批上」这个信号来得比审计补写早：`run.waiting_approval` 走
+                // Run 自己的路径，`approval.requested` 是随后补写的审计副本（§8.5 的反向
+                // 顺序）。弹窗要的是后者，而权威清单在 `GET /v1/approvals`——顺手问一遍，
+                // 于是弹窗不取决于那条审计副本什么时候落盘。
+                if status == RunStatus::WaitingApproval {
+                    return vec![Effect::FetchPending];
                 }
                 Vec::new()
             }

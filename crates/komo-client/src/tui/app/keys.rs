@@ -6,7 +6,7 @@ use komo_kernel::types::chat::ApprovalScope;
 use komo_kernel::types::ids::ApprovalId;
 
 use super::{App, Effect, PendingSubmission, SubmissionState};
-use crate::tui::approval::ApprovalAnswer;
+use crate::tui::approval::{ApprovalAnswer, ApprovalChoice};
 use crate::tui::command::{self, Command};
 use crate::tui::paste::InputEvent;
 
@@ -344,64 +344,88 @@ impl App {
         if modal.answering {
             return Vec::new();
         }
+        let pending = self.pending_count();
         let run_scope_ok = modal.allows_run_scope();
         let approval = modal.record.approval.clone();
+        let rows = modal.rows(pending);
+        let highlighted = rows[modal.selected_index(pending)].clone();
 
-        // 滚动键只动弹窗。
-        let scroll_by: Option<i16> = match key.code {
-            KeyCode::PageUp | KeyCode::Up => Some(-1),
-            KeyCode::PageDown | KeyCode::Down => Some(1),
-            _ => None,
-        };
-        if let Some(direction) = scroll_by {
-            if let Some(modal) = self.approval.as_mut() {
-                if direction < 0 {
-                    modal.scroll_up();
-                } else {
-                    modal.scroll_down();
+        // 菜单键：`↑` / `↓` 移动高亮，正文留给 `PgUp` / `PgDn`。两件事各有各的键——
+        // 正文可能比窗口长，而高亮不该跟着正文滚走。
+        match key.code {
+            KeyCode::Up | KeyCode::Down => {
+                let delta = if key.code == KeyCode::Up { -1 } else { 1 };
+                if let Some(modal) = self.approval.as_mut() {
+                    modal.move_selection(delta, pending);
                 }
+                return Vec::new();
             }
-            return Vec::new();
+            KeyCode::PageUp | KeyCode::PageDown => {
+                if let Some(modal) = self.approval.as_mut() {
+                    if key.code == KeyCode::PageDown {
+                        modal.scroll_down();
+                    } else {
+                        modal.scroll_up();
+                    }
+                }
+                return Vec::new();
+            }
+            _ => {}
         }
 
-        // `a` = **全部批准**（§11.3 的 `/approve all`）：一批互不相干的审批逐条按本次
-        // 调用答。它答的是所有待处理，**含眼前这条**——眼前这条排在名单第一个。
-        if matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A')) {
-            let mut approvals: Vec<ApprovalId> = self
-                .pending
-                .keys()
-                .filter(|candidate| **candidate != approval)
-                .cloned()
-                .collect();
-            approvals.insert(0, approval.clone());
-            self.mark_answering(&approvals);
-            let request_key = self.next_key("decisions");
-            return vec![Effect::DecideMany {
-                approvals,
-                approved: true,
-                request_key,
-            }];
-        }
-
-        let answer = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => ApprovalAnswer::ONCE,
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                if !run_scope_ok {
-                    self.fail("这条请求不可范围化，只能批本次（y）或拒绝（n）");
-                    return Vec::new();
-                }
-                ApprovalAnswer::RUN
-            }
+        // 一行答案：`Enter` 答的是高亮那一行；行首那个字母是直通键，习惯按 `y` 的人
+        // 不必先移动高亮。两条路给出的是同一件事。
+        let choice = match key.code {
+            KeyCode::Enter => highlighted.choice,
             // **Esc 在弹窗里就是拒绝**，和 n 一样：一个没答案的审批会一直占着 Run。
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ApprovalAnswer::REJECT,
+            KeyCode::Esc => ApprovalChoice::This(ApprovalAnswer::REJECT),
+            KeyCode::Char(ch) => match ch.to_ascii_lowercase() {
+                'y' => ApprovalChoice::This(ApprovalAnswer::ONCE),
+                'r' => {
+                    if !run_scope_ok {
+                        self.fail("这条请求不可范围化，只能批本次（y）或拒绝（n）");
+                        return Vec::new();
+                    }
+                    ApprovalChoice::This(ApprovalAnswer::RUN)
+                }
+                'n' => ApprovalChoice::This(ApprovalAnswer::REJECT),
+                // `a` = **全部批准**（§11.3 的 `/approve all`）。
+                'a' => ApprovalChoice::AllPending,
+                _ => return Vec::new(),
+            },
             _ => return Vec::new(),
         };
-        self.mark_answering(std::slice::from_ref(&approval));
-        let request_key = self.next_key("decision");
-        vec![Effect::Decide {
-            approval,
-            approved: answer.approved,
-            scope: answer.scope,
+
+        match choice {
+            ApprovalChoice::This(answer) => {
+                self.mark_answering(std::slice::from_ref(&approval));
+                let request_key = self.next_key("decision");
+                vec![Effect::Decide {
+                    approval,
+                    approved: answer.approved,
+                    scope: answer.scope,
+                    request_key,
+                }]
+            }
+            ApprovalChoice::AllPending => self.decide_all_pending(approval),
+        }
+    }
+
+    /// 弹窗上的「全部批准」：一批互不相干的审批逐条按本次调用答。它答的是所有待处理，
+    /// **含眼前这条**——眼前这条排在名单第一个，它就是弹窗上那一条。
+    fn decide_all_pending(&mut self, current: ApprovalId) -> Vec<Effect> {
+        let mut approvals: Vec<ApprovalId> = self
+            .pending
+            .keys()
+            .filter(|candidate| **candidate != current)
+            .cloned()
+            .collect();
+        approvals.insert(0, current);
+        self.mark_answering(&approvals);
+        let request_key = self.next_key("decisions");
+        vec![Effect::DecideMany {
+            approvals,
+            approved: true,
             request_key,
         }]
     }

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::sse::ConnectionState;
+use crate::tui::approval::ApprovalChoice;
 use crate::tui::paste::{InputEvent, PASTE_MIN_BYTES, PasteChip};
 use crate::tui::test_support as fixture;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -284,10 +285,132 @@ fn n_and_esc_both_reject() {
 fn the_input_is_disabled_while_an_approval_is_open() {
     let mut app = with_modal();
     assert!(!app.input_enabled());
-    assert!(app.input_hint().contains("批准"));
-    // 打字不进输入框——y / n / r 才是这时候的键。
+    // 提示行说出**怎么开这张菜单**：答案本身在弹窗的菜单里，这里不抄第二遍。
+    let hint = app.input_hint();
+    assert!(hint.contains("批准"), "{hint}");
+    assert!(hint.contains("Enter 确认"), "{hint}");
+    // 打字不进输入框——菜单才是这时候的输入。
     type_text(&mut app, "abc");
     assert!(app.input.is_empty());
+}
+
+/// 菜单的默认落点就是 `Enter` 的答案：能范围化时是「本次任务默认通过」，不能时是
+/// 「只批准本次调用」——一次 `Enter` 永远落在看得见的那一行上。
+#[test]
+fn enter_confirms_the_highlighted_row() {
+    let mut app = with_modal();
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(
+            &effects[0],
+            Effect::Decide {
+                approved: true,
+                scope: ApprovalScope::Run,
+                ..
+            }
+        ),
+        "{effects:?}"
+    );
+
+    // Policy 没标可范围化：菜单里没有那一行，默认落点跟着往下挪。
+    let mut record = fixture::approval_record();
+    record.scopes = vec![ApprovalScope::Once];
+    let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+    app.apply(ServerEvent::Approval(Box::new(record)));
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(
+            &effects[0],
+            Effect::Decide {
+                approved: true,
+                scope: ApprovalScope::Once,
+                ..
+            }
+        ),
+        "{effects:?}"
+    );
+}
+
+/// `↑` / `↓` 只动高亮：往下走到「拒绝」，`Enter` 就是拒绝；到两头停住，不绕回去。
+#[test]
+fn the_arrows_move_the_highlight_and_stop_at_the_ends() {
+    let mut app = with_modal();
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(
+        app.approval.as_ref().expect("弹窗").selected_index(1),
+        1,
+        "第二行是「只批准本次调用」"
+    );
+    app.handle_key(key(KeyCode::Down));
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(
+            &effects[0],
+            Effect::Decide {
+                approved: false,
+                ..
+            }
+        ),
+        "{effects:?}"
+    );
+
+    // 到头了：再往下不动，往上回到第一行（`Enter` = 本次任务默认通过）。
+    let mut app = with_modal();
+    for _ in 0..9 {
+        app.handle_key(key(KeyCode::Down));
+    }
+    assert_eq!(app.approval.as_ref().expect("弹窗").selected_index(1), 2);
+    for _ in 0..9 {
+        app.handle_key(key(KeyCode::Up));
+    }
+    assert_eq!(app.approval.as_ref().expect("弹窗").selected_index(1), 0);
+}
+
+/// 正文的滚动键与菜单无关：`PgUp` / `PgDn` 滚正文，高亮一动不动（正文可能比窗口长，
+/// 高亮不该跟着滚走）。
+#[test]
+fn the_page_keys_scroll_the_body_without_moving_the_highlight() {
+    let mut app = with_modal();
+    app.handle_key(key(KeyCode::PageDown));
+    app.handle_key(key(KeyCode::PageDown));
+    let modal = app.approval.as_ref().expect("弹窗");
+    assert_eq!(modal.scroll, 8, "滚的是正文");
+    assert_eq!(modal.selected_index(1), 0, "高亮还在第一行");
+    app.handle_key(key(KeyCode::PageUp));
+    assert_eq!(app.approval.as_ref().expect("弹窗").scroll, 4);
+}
+
+/// 菜单里那行「全部批准」按下去和 `a` 是同一个答复：三条一起答，眼前这条排第一。
+#[test]
+fn the_batch_row_answers_the_visible_one_first() {
+    let mut app = app();
+    app.apply(pending_list(&[
+        ("appr-1", "7K2M"),
+        ("appr-2", "9QRS"),
+        ("appr-3", "3TVW"),
+    ]));
+    app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
+
+    // 往下走三下到批量那一行（范围 → 本次 → 拒绝 → 全部批准）。
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Down));
+    }
+    let rows = app.approval.as_ref().expect("弹窗").rows(3);
+    assert_eq!(
+        rows[app.approval.as_ref().expect("弹窗").selected_index(3)].choice,
+        ApprovalChoice::AllPending
+    );
+
+    let effects = app.handle_key(key(KeyCode::Enter));
+    let [Effect::DecideMany { approvals, .. }] = effects.as_slice() else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(approvals.len(), 3, "{approvals:?}");
+    assert_eq!(
+        approvals[0].as_str(),
+        fixture::approval_record().approval.as_str(),
+        "眼前这条排第一"
+    );
 }
 
 #[test]
@@ -382,6 +505,33 @@ fn an_approval_pending_notice_never_carries_the_authorization_itself() {
         ]
     );
     assert!(app.approval.is_none(), "通知本身不足以弹窗");
+}
+
+/// 停在等待审批上的状态帧**顺手问一次清单**：弹窗等的是 `approval.requested`（补写的
+/// 审计副本，§8.5），而它的到达时间不由界面决定；权威清单在 `GET /v1/approvals`。
+#[test]
+fn a_run_stopping_for_approval_asks_for_the_pending_list() {
+    let mut app = app();
+    let effects = app.apply(ServerEvent::Frame(Box::new(SseFrame {
+        id: Seq(21),
+        session: fixture::session(),
+        event: SseEvent::RunStatus {
+            run: fixture::run(),
+            status: RunStatus::WaitingApproval,
+        },
+    })));
+    assert_eq!(effects, vec![Effect::FetchPending]);
+
+    // 别的状态不额外问一次（列表在决定、重连、`/pending` 时都会问）。
+    let quiet = app.apply(ServerEvent::Frame(Box::new(SseFrame {
+        id: Seq(22),
+        session: fixture::session(),
+        event: SseEvent::RunStatus {
+            run: fixture::run(),
+            status: RunStatus::Running,
+        },
+    })));
+    assert!(quiet.is_empty(), "{quiet:?}");
 }
 
 // ---- 命令 ----
@@ -994,8 +1144,8 @@ fn a_batch_key_answers_everything_pending() {
     assert!(app.handle_key(key(KeyCode::Char('a'))).is_empty());
 }
 
-/// 只有一条待处理时 `a` 仍然可用（和 `y` 同义），但**按键提示里不列它**——列一个不必
-/// 要的键会让人以为还有什么没批。
+/// 只有一条待处理时 `a` 仍然可用（和 `y` 同义），但**菜单里不列它**——列一行不必要
+/// 的答案会让人以为还有什么没批。
 #[test]
 fn the_batch_key_is_harmless_when_only_one_is_waiting() {
     let mut app = app();
@@ -1007,8 +1157,13 @@ fn the_batch_key_is_harmless_when_only_one_is_waiting() {
         panic!("{effects:?}");
     };
     assert_eq!(approvals.len(), 1, "{approvals:?}");
-    let hint = app.approval.as_ref().expect("弹窗").keys_hint(1);
-    assert!(!hint.contains("全部批准"), "{hint}");
+    let rows = app.approval.as_ref().expect("弹窗").rows(1);
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.choice == ApprovalChoice::AllPending),
+        "{rows:?}"
+    );
 }
 
 /// `/approve all` 与 `/reject all`：命令行走同一条路，名单来自**服务端那份清单**。

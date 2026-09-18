@@ -291,6 +291,9 @@ pub struct App {
     pub model_menu: Vec<ModelMenuEntry>,
     /// `/model` 无参时先去取一次清单；回来了才印。
     listing_models: bool,
+    /// 已经提示过"有一帧读不懂"——只说一次，之后只进日志（见
+    /// [`ServerEvent::FrameSkipped`]）。
+    skipped_noticed: bool,
     /// 消息面滚动：从底部往上数多少行。0 = 贴底。
     pub scroll: u16,
     pub now: Option<OffsetDateTime>,
@@ -329,6 +332,7 @@ impl App {
             effort: None,
             model_menu: Vec::new(),
             listing_models: false,
+            skipped_noticed: false,
             scroll: 0,
             now: None,
             quit: false,

@@ -47,6 +47,15 @@ impl App {
             ServerEvent::FrameSkipped { id, reason } => {
                 self.cursor = self.cursor.max(id);
                 tracing::debug!(seq = id.0, %reason, "跳过一帧读不懂的事件");
+                // 一帧都解不开通常不是"未来的事件类型"，而是**两端说的不是同一种格式**——
+                // 那时候每一帧都会走这里。静默跳过等于什么都不说：界面永远停在旧状态，
+                // 看上去像服务端没干活。所以第一条要说出来，之后只在日志里。
+                if !self.skipped_noticed {
+                    self.skipped_noticed = true;
+                    self.note(format!(
+                        "seq {id} 这一帧读不懂，已跳过（{reason}）；后续同类只记日志"
+                    ));
+                }
                 Vec::new()
             }
             ServerEvent::Connection(state) => {

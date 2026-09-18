@@ -128,27 +128,36 @@ fn derived_frames(event: &Event) -> Vec<SseEvent> {
 /// 一帧渲染成 SSE 的三行（`id:` / `event:` / `data:`）。
 ///
 /// `id` 就是 Session 内的 seq，客户端断线后把它作为 `Last-Event-ID` 交回来。
+///
+/// **`data:` 是完整的 [`SseFrame`]**：客户端（`komo-client::sse::FrameParser`）拿这一行
+/// 直接 `from_str::<SseFrame>`，两边共用同一个类型才不会各说各话。早先这里只写
+/// `event` 的负载，客户端却拿它去解 `SseFrame`——每一帧都必然解不开，于是全部落进
+/// 「读不懂，跳过」，TUI 一帧都收不到（消息永远停在"已提交，等待事件同步"）。补读与
+/// 直播都走这一个出口，所以改这里就够了。
 pub fn encode_frame(frame: &SseFrame) -> String {
-    let (name, data) = match serde_json::to_value(&frame.event) {
-        Ok(serde_json::Value::Object(mut map)) => {
-            let name = map
-                .remove("event")
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_else(|| "message".to_string());
-            let data = map
-                .remove("data")
-                .unwrap_or(serde_json::Value::Object(Default::default()));
-            (name, data)
-        }
-        _ => ("message".to_string(), serde_json::Value::Null),
-    };
-    let payload = serde_json::to_string(&data).unwrap_or_else(|_| "null".to_string());
+    let name = event_name(&frame.event);
+    let payload = serde_json::to_string(frame).unwrap_or_else(|_| "null".to_string());
     format!("id: {}\nevent: {}\ndata: {}\n\n", frame.id, name, payload)
 }
 
-/// 心跳帧（不带 `id:`——它不是一个游标位置）。
+/// `event:` 那一行用的名字：就是 [`SseEvent`] 的 serde 标签，只给人（`curl`）看，
+/// 不参与解析。
+fn event_name(event: &SseEvent) -> String {
+    match serde_json::to_value(event) {
+        Ok(serde_json::Value::Object(mut map)) => map
+            .remove("event")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "message".to_string()),
+        _ => "message".to_string(),
+    }
+}
+
+/// 心跳（不带 `id:`——它不是一个游标位置）。
+///
+/// 只是一行注释：保活靠"有字节到"，不需要客户端解释它，更不能让它顶着一个假的
+/// `event: heartbeat` 冒充一帧。
 pub fn heartbeat() -> String {
-    ": keep-alive\nevent: heartbeat\ndata: {}\n\n".to_string()
+    ": keep-alive\n\n".to_string()
 }
 
 /// `Last-Event-ID` 头与 `?from=` 两种游标，都认。头优先——重连时它更新。
@@ -221,6 +230,42 @@ mod tests {
             "{text}"
         );
         assert!(text.ends_with("\n\n"));
+    }
+
+    /// 客户端（`komo-client::sse::FrameParser`）只解 `data:` 那一行，且按 [`SseFrame`] 解。
+    /// 这里就做它做的那一步：解不出来 = 每一帧都被"跳过"，TUI 一帧都收不到。
+    #[test]
+    fn the_data_line_round_trips_through_the_client_s_type() {
+        let frames = [
+            SseFrame {
+                id: Seq(7),
+                session: SessionId::from_raw("sess-1"),
+                event: SseEvent::Event(Box::new(completed(7))),
+            },
+            SseFrame {
+                id: Seq(8),
+                session: SessionId::from_raw("sess-1"),
+                event: SseEvent::RunStatus {
+                    run: RunId::from_raw("run-1"),
+                    status: RunStatus::Completed,
+                },
+            },
+            SseFrame {
+                id: Seq(9),
+                session: SessionId::from_raw("sess-1"),
+                event: SseEvent::Heartbeat,
+            },
+        ];
+        for frame in &frames {
+            let text = encode_frame(frame);
+            let data = text
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .unwrap_or_else(|| panic!("这一帧没有 data 行：{text}"));
+            let parsed: SseFrame = serde_json::from_str(data)
+                .unwrap_or_else(|error| panic!("客户端解不开这一帧：{error}\n{text}"));
+            assert_eq!(&parsed, frame);
+        }
     }
 
     #[test]

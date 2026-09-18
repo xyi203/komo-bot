@@ -222,6 +222,9 @@ pub struct GatewayState {
     /// 上一条投到 home chat 的重载错误。同一条错误不重复投；装上之后清掉并说一声。
     pub reload_notice: Mutex<Option<String>>,
     pub scheduler: Arc<Scheduler>,
+    /// 判决用的那一份规则表。**热重载换的就是它**（[`Self::install_policy`] 的兄弟：
+    /// `reload::apply` 直接调 `policy.install`）。
+    pub policy: Arc<PolicyEngine>,
     pub segments: Arc<GatewaySegments>,
     pub supervisor: Arc<super::channels::ChannelSupervisor>,
     /// Dispatcher。**构造之后才填**：它握着这份状态，反过来也要被渠道拿到。
@@ -364,12 +367,16 @@ impl GatewayState {
         #[cfg(not(any(test, feature = "test-support")))]
         let turn_ledger = Arc::clone(&routed) as Arc<dyn Ledger>;
 
+        // **一份 engine，两处用**：executor 判每一次调用，热重载换的是同一处的规则表
+        // （§3：Policy 每次决策读规则，不缓存）。各造一份的写法会让 `policy.toml` 改完
+        // 只有快照变了、判决还是旧的——"改 policy 不用重启"就成了假话。
+        let policy = Arc::new(PolicyEngine::from_rules(snapshot.policy.clone()));
         let executor_tools = Arc::new(ToolExecutor::new(
             tools,
             Arc::clone(&turn_ledger),
             Arc::clone(&outputs),
             ApprovalGate::new(Arc::clone(&approval_repo), Arc::clone(&clock)),
-            PolicyEngine::from_rules(snapshot.policy.clone()),
+            policy.as_ref().clone(),
             Arc::clone(&clock),
         ));
 
@@ -450,6 +457,7 @@ impl GatewayState {
             channels,
             llm,
             scheduler,
+            policy,
             segments,
             supervisor: Arc::new(super::channels::ChannelSupervisor::new(factories)),
             inbound: std::sync::OnceLock::new(),

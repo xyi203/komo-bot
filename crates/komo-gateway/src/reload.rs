@@ -90,6 +90,13 @@ async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) {
     }) {
         state.rebuild_llm();
     }
+    // 判决用的规则表：executor 手里与这里**是同一份**（`GatewayState::policy`），换上
+    // 就走（§3：Policy 每次决策读规则，不缓存）。线上踩到过它的缺席：`policy.toml`
+    // 换成了 `mode = "auto"`，快照确实变了、日志也说重载成功，但每一次调用仍然按旧表
+    // 问人——因为 executor 那份 engine 是装配时造的，没人动它。
+    if changed.iter().any(|key| key.as_str().starts_with("policy")) {
+        state.policy.install(state.snapshot().policy.clone());
+    }
     for platform in [
         ChannelPlatform::Feishu,
         ChannelPlatform::Telegram,

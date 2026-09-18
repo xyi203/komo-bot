@@ -687,6 +687,121 @@ async fn a_bare_yes_with_nothing_pending_is_just_a_message() {
     );
 }
 
+// ---------------------------------------------------------------- §3 的 policy 热重载
+
+/// **改 `policy.toml` 不用重启**——改完下一次判决就用新表。
+///
+/// 这条测试盯的是一个真实缺陷：executor 的 `PolicyEngine` 曾是装配时造的，热重载只换了
+/// 快照，判决仍旧按旧表走。于是 `mode = "auto"` 换上去、日志也说"配置已重载"，可每一次
+/// 调用照样问人（线上就卡在这里）。
+#[tokio::test]
+async fn a_reloaded_policy_decides_the_next_call() {
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round, text_round};
+
+    // 一开始不写 policy.toml：§7.1 的初始建议生效，shell 要问。
+    let home = Home::new();
+    let once = home.workspace().join("reload.count");
+    let command = format!("echo once >> {}", once.display());
+
+    let first = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(
+                1,
+                "pc-1",
+                "shell",
+                serde_json::json!({ "command": command }),
+            ),
+            text_round(2, "做完了。"),
+        ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = first.open_session().await;
+    let run = first.submit(&session, "reload-1", "跑一下").await.run;
+    let approval = first.wait_approval().await;
+    assert_eq!(approval.run.as_ref(), Some(&run), "初始建议下这条要问");
+    first.decide(&approval.approval, false).await;
+    first.stop().await;
+
+    // 换成 auto（**不重启**），再来一条同样的命令。
+    std::fs::write(home.path().join("policy.toml"), "mode = \"auto\"\n").expect("写 policy.toml");
+    let second = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(
+                1,
+                "pc-1",
+                "shell",
+                serde_json::json!({ "command": command }),
+            ),
+            text_round(2, "做完了。"),
+        ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    // 这条是**重启之后**的启动路径，先证明它按新表装了；再证明热重载这条路也一样。
+    let session = second.open_session().await;
+    let run = second.submit(&session, "reload-2", "跑一下").await.run;
+    second
+        .wait_status(
+            &run,
+            |status| status.is_terminal() || status == RunStatus::NeedsAttention,
+            "收场",
+        )
+        .await;
+    assert!(
+        second
+            .approvals()
+            .await
+            .iter()
+            .all(|record| record.run.as_ref() != Some(&run)),
+        "auto 表下这条不该问：{:?}",
+        second.approvals().await
+    );
+}
+
+/// 同一台实例上：**热重载**（不重启）之后，判决立刻按新表走。
+#[tokio::test]
+async fn hot_reloading_the_policy_changes_the_very_next_decision() {
+    use crate::service::test_support::harness::{
+        FakeLlm, Home, call_round, home_config, text_round,
+    };
+
+    // 起点：auto —— 命令不问就跑。
+    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let gateway = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(
+                1,
+                "pc-1",
+                "shell",
+                serde_json::json!({ "command": "echo hi" }),
+            ),
+            text_round(2, "做完了。"),
+        ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+
+    // 换成 strict：**同一台实例**，不重启，只重载。
+    std::fs::write(
+        home.path().join("policy.toml"),
+        "default = \"ask\"\n\n[[rules]]\nid = \"ask-shell\"\neffect = \"ask\"\nreason = \"重载之后这条要问我\"\nscopes = [\"once\"]\nrequires_isolation = false\n\n[rules.matcher]\noperations = [\"shell_command\"]\n",
+    )
+    .expect("写 policy.toml");
+    crate::reload::reload(gateway.state())
+        .await
+        .expect("新配置装得上");
+
+    let session = gateway.open_session().await;
+    let run = gateway.submit(&session, "reload-3", "跑一下").await.run;
+    let approval = gateway.wait_approval().await;
+    assert_eq!(
+        approval.run.as_ref(),
+        Some(&run),
+        "重载之后必须按新表问：{:?}",
+        approval.reason
+    );
+    assert!(
+        approval.reason.contains("重载之后这条要问我"),
+        "理由要来自新表：{}",
+        approval.reason
+    );
+}
+
 /// 让编译器盯住这几个在别处用到的类型。
 #[allow(dead_code)]
 fn unused(_: RequestKey) {}

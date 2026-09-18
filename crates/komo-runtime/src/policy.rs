@@ -13,17 +13,23 @@
 
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use komo_kernel::policy::{Grant, IsolationCapability, PolicyContext, PolicyDecision, RuleTable};
-use komo_kernel::traits::{ApprovalRepo, Clock, Policy, RepoError};
+use komo_kernel::traits::{ApprovalRepo, Clock, RepoError};
 use komo_kernel::types::chat::Principal;
 use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::tool::WorkspaceRoot;
 use time::OffsetDateTime;
 
 /// 决策入口：一张规则表 + 这台机器能不能约束任意代码。
+///
+/// **规则表是可换的，而且每次判决读当前那一份**（§3：「读配置的地方按用途读当前快照，
+/// 不缓存」——它把 Policy 单列了一句「每次决策读规则」）。热重载因此不需要重启：换上
+/// 新表之后，下一句话就用新表判。executor 手里拿的是同一个 engine（`Clone` 共享一处
+/// 规则），所以改 `policy.toml` 对正在跑的 Run 也立刻生效。
 #[derive(Clone)]
 pub struct PolicyEngine {
-    policy: Arc<dyn Policy>,
+    rules: Arc<ArcSwap<RuleTable>>,
     isolation: IsolationCapability,
 }
 
@@ -36,8 +42,16 @@ impl std::fmt::Debug for PolicyEngine {
 }
 
 impl PolicyEngine {
-    pub fn new(policy: Arc<dyn Policy>, isolation: IsolationCapability) -> Self {
-        Self { policy, isolation }
+    pub fn new(table: RuleTable, isolation: IsolationCapability) -> Self {
+        Self {
+            rules: Arc::new(ArcSwap::from_pointee(table)),
+            isolation,
+        }
+    }
+
+    /// 换一张规则表（热重载，§3 第 3 步）。**下一次判决就用它。**
+    pub fn install(&self, table: RuleTable) {
+        self.rules.store(Arc::new(table));
     }
 
     /// 配置侧给一张表就够了。
@@ -45,7 +59,7 @@ impl PolicyEngine {
     /// `isolation` 默认是 `confines_arbitrary_code: false`——§7.3 说得很清楚，cwd 和
     /// 参数检查不是完整进程沙箱，所以默认值就是首版的事实。有了真沙箱再由构造方改。
     pub fn from_rules(table: RuleTable) -> Self {
-        Self::new(Arc::new(table), IsolationCapability::default())
+        Self::new(table, IsolationCapability::default())
     }
 
     /// 最保守的起点：什么都问。
@@ -63,7 +77,7 @@ impl PolicyEngine {
     }
 
     pub fn decide(&self, plan: &ExecutionPlan, env: &DecisionEnv<'_>) -> PolicyDecision {
-        self.policy.decide(plan, &env.context(self.isolation))
+        self.rules.load().decide(plan, &env.context(self.isolation))
     }
 
     /// 命中的那条授权。

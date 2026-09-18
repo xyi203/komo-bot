@@ -87,9 +87,12 @@ pub fn approval_text(presentation: &ApprovalPresentation) -> String {
     format!("{body}\n\n{}", command_hint(&presentation.short_id))
 }
 
-/// 回答这条审批的两条命令。§11.3 微信列：范围授权**用命令**。
+/// 回答这条审批的路。§11.3 微信列：没有按钮，范围授权**用命令**。
+///
+/// **最短的那条放最前面**：待处理只有一条时，一个 `y` 就够了——手机上抄那 4 位短 ID
+/// 才是真正的摩擦。短 ID 仍然写在里面：多条待处理、或者这条已经不在眼前时要用它。
 pub fn command_hint(short_id: &ShortId) -> String {
-    format!("回复 /approve {short_id} 或 /reject {short_id}")
+    format!("回复 y 批准 · n 拒绝（要指明哪一条：/approve {short_id} · /reject {short_id}）")
 }
 
 /// 五项正文，未截断。
@@ -375,11 +378,14 @@ mod tests {
         presentation.changes = Some("差".repeat(MESSAGE_LIMIT * 3));
         let text = approval_text(&presentation);
         assert!(text.contains(TRUNCATION_NOTE), "该截断了：{text}");
+        // 提示行本身就带短 ID 与两条短答复；这里断言它是**按原样**落在末尾的那一段。
+        let short = ShortId::parse("7K2M").expect("短 ID");
         assert!(
-            text.ends_with("回复 /approve 7K2M 或 /reject 7K2M"),
+            text.ends_with(&command_hint(&short)),
             "截断不能把这条请求变成死信：{}",
             &text[text.len().saturating_sub(120)..]
         );
+        assert!(text.ends_with('）'), "{text}");
     }
 
     #[test]

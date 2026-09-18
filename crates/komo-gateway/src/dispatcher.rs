@@ -198,6 +198,18 @@ impl Dispatcher {
                 self.decide(target, ApprovalScope::Once, false, principal, &msg.peer)
                     .await
             }
+            // 待处理只有一条时的最短答复（`handle` 已经确认过真的有人在等）。语义就是
+            // `Only`：多于一条时它会列出清单让人挑（§11.3）。
+            ChatCommand::BareVerdict { approved } => {
+                self.decide(
+                    ApprovalTarget::Only,
+                    ApprovalScope::Once,
+                    approved,
+                    principal,
+                    &msg.peer,
+                )
+                .await
+            }
         }
     }
 
@@ -406,9 +418,22 @@ impl Inbound for Dispatcher {
 
         // ⑤ 命令。
         if let Some(command) = command {
-            let ack = self.command(command, &msg, &principal, &session).await?;
-            self.remember(&msg.request_key, &ack);
-            return Ok(ack);
+            // 裸 `y` / `n` 只在**真有一条在等**的时候才算答复：没有待处理审批时它落到下面
+            // 那条普通消息的路（模型问"要不要…"，回个 `n` 不该被读成"拒绝一条不存在的
+            // 审批"）。§11.3：这条捷径不改变"待处理只有一条才生效"的语义。
+            let bare = matches!(command, ChatCommand::BareVerdict { .. });
+            if !bare
+                || !self
+                    .state
+                    .approval_repo
+                    .list_pending(None)
+                    .await?
+                    .is_empty()
+            {
+                let ack = self.command(command, &msg, &principal, &session).await?;
+                self.remember(&msg.request_key, &ack);
+                return Ok(ack);
+            }
         }
 
         // ⑥ 普通文本。
@@ -541,6 +566,15 @@ fn parse_target(rest: &[&str]) -> ApprovalTarget {
 /// 三个渠道都认的那几条命令（§11.3）。解析在这里，渲染在渠道。
 pub fn parse_command(text: &str) -> Option<ChatCommand> {
     let trimmed = text.trim();
+    // 最短的那条路：待处理只有一条时，`y` / `n` 连短 ID 都不用抄（§11.3）。**只认单个词**
+    // ——`y 7K2M` 这种半懂不懂的写法宁可当普通消息，也不猜他想批哪一条。
+    if !trimmed.contains(char::is_whitespace) {
+        match trimmed.to_ascii_lowercase().as_str() {
+            "y" | "yes" => return Some(ChatCommand::BareVerdict { approved: true }),
+            "n" | "no" => return Some(ChatCommand::BareVerdict { approved: false }),
+            _ => {}
+        }
+    }
     let mut parts = trimmed.split_whitespace();
     let head = parts.next()?;
     if !head.starts_with('/') {
@@ -632,6 +666,33 @@ mod tests {
                 scope: ApprovalScope::Once,
             })
         );
+    }
+
+    /// 待处理只有一条时最短的那条路：`y` / `n`（§11.3）。**只认单个词**。
+    #[test]
+    fn a_bare_yes_or_no_is_the_shortest_answer() {
+        for text in ["y", "Y", " y ", "yes", "YES"] {
+            assert_eq!(
+                parse_command(text),
+                Some(ChatCommand::BareVerdict { approved: true }),
+                "{text}"
+            );
+        }
+        for text in ["n", "N", "no", "No"] {
+            assert_eq!(
+                parse_command(text),
+                Some(ChatCommand::BareVerdict { approved: false }),
+                "{text}"
+            );
+        }
+        // 带别的词就不猜了：`y 7K2M` 是半懂不懂的写法，宁可当普通消息。
+        assert_eq!(parse_command("y 7K2M"), None);
+        assert_eq!(parse_command("yes please"), None);
+        // 别的单字/单词不能变成答复（中文里"好"太常见，绝不能绑）。
+        assert_eq!(parse_command("好"), None);
+        assert_eq!(parse_command("可以"), None);
+        assert_eq!(parse_command("ok"), None);
+        assert_eq!(parse_command(""), None);
     }
 
     /// `/approve all` 是**可以批量答**（§11.3），不是"这条叫 all 的短 ID 不存在"。

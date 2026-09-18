@@ -105,6 +105,12 @@ pub enum ChatCommand {
     Status,
     /// `/id`：回显 `{platform}:{chat_id}` 与发送者 id。**唯一不要求操作者身份的命令。**
     Id,
+    /// 裸的 `y` / `n`（也认 `yes` / `no`）：**待处理审批只有一条**时的最短答复（§11.3）。
+    ///
+    /// 它不是一条独立命令：没有待处理审批时它就是一句普通消息——模型问"要不要…"、操作者
+    /// 回个 `n`，不该被当成"拒绝一条不存在的审批"。这个判断由 Dispatcher 做（只有它看得见
+    /// 有没有人在等）；判断通过之后它的语义就是 [`ApprovalTarget::Only`]。
+    BareVerdict { approved: bool },
 }
 
 #[cfg(test)]

@@ -643,6 +643,50 @@ async fn wait_for_run(
     panic!("等了 10 秒 run {run} 还没有终态");
 }
 
+/// 待处理只有一条时，聊天里回一个 `y` 就批了——**不用抄短 ID**（§11.3）。
+///
+/// 而且没有待处理审批时它**不是命令**：模型问"要不要…"、操作者回个 `n`，那是回话，不是
+/// "拒绝一条不存在的审批"。
+#[tokio::test]
+async fn a_bare_yes_decides_the_only_pending_approval() {
+    let gateway = TestGateway::start().await;
+    let record = pending_approval(&gateway).await;
+
+    let ack = gateway
+        .dispatcher()
+        .handle(operator_dm("y", "telegram:900"))
+        .await
+        .expect("答复");
+    assert!(matches!(ack, InboundAck::Replied { .. }), "{ack:?}");
+
+    let decided = gateway
+        .state()
+        .approval_repo
+        .get(&record.approval)
+        .await
+        .expect("读得到")
+        .expect("有这条");
+    assert!(
+        decided.decision.as_ref().is_some_and(|d| d.approved),
+        "`y` 要真的批了：{decided:?}"
+    );
+}
+
+/// 没有待处理审批时，`y` / `n` 走普通消息那条路（不是命令）。
+#[tokio::test]
+async fn a_bare_yes_with_nothing_pending_is_just_a_message() {
+    let gateway = TestGateway::start().await;
+    let ack = gateway
+        .dispatcher()
+        .handle(operator_dm("n", "telegram:901"))
+        .await
+        .expect("收下");
+    assert!(
+        matches!(ack, InboundAck::Queued { .. }),
+        "没有待审批时 `n` 是回话，不该被读成拒绝：{ack:?}"
+    );
+}
+
 /// 让编译器盯住这几个在别处用到的类型。
 #[allow(dead_code)]
 fn unused(_: RequestKey) {}

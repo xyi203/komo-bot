@@ -201,7 +201,7 @@ pub fn approval_card(presentation: &ApprovalPresentation) -> Value {
     // 所以"按钮点了没反应"是一种真实状态。文本命令走 `im.message.receive_v1`，不受它
     // 影响——这句话是那张卡片在按钮不可用时**唯一**还指得出的路。
     elements.push(note(format!(
-        "也可以直接回：/approve {short_id}（拒绝：/reject {short_id}）"
+        "也可以直接回：y 批准 · n 拒绝（要指明哪一条：/approve {short_id} · /reject {short_id}）"
     )));
 
     // 两个按钮。§11.3：**按钮只给"本次"**，范围授权用命令。

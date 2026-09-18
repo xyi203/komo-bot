@@ -3,15 +3,18 @@
 use std::sync::Arc;
 
 use komo_gateway::channels::ChannelSender;
+use komo_kernel::events::EventPayload;
 use komo_kernel::protocol::InboundAck;
-use komo_kernel::traits::Notifier;
+use komo_kernel::traits::{LlmClient, Notifier};
 use komo_kernel::types::chat::{
     ApprovalScope, ChannelPeer, ChannelPlatform, DeliveryState, DeliveryTarget, Outbound, PeerId,
 };
+use komo_kernel::types::status::RunStatus;
 
 use crate::harness::{
-    FakeLlm, FixedFactory, GatewayBuilder, MemSender, TestGateway, call_round, config_toml,
-    eventually, feishu_block, inbound, telegram_block, telegram_config, text_round,
+    FakeLlm, FixedFactory, GatewayBuilder, Gw, Home, MemSender, TestGateway, call_round,
+    config_toml, eventually, feishu_block, inbound, multi_call_round, telegram_block,
+    telegram_config, text_round,
 };
 
 fn operator_dm(text: &str, key: &str) -> komo_kernel::protocol::InboundMessage {
@@ -247,16 +250,13 @@ allow_from = [111]
 
 /// 验证列：Gateway 重启后 pending 投递**补发一次**。
 ///
-// BUG(3): 补发不会发生。`service::start`（`src/service/mod.rs:221`）在
-// **第 7 步之后、第 9 步之前**调 `state.notifier.flush(None)`，而渠道是在第 9 步
-// （`supervisor.start_all`）才登记发送口的。于是这一次冲刷在
-// `DeliveryLog::send_recorded`（`src/deliveries.rs:66`）里走的是"渠道此刻不在"那条路，
-// 把每一行原样再标成 `Deferred` 就返回——启动时的补发是个空动作。
-// 后果：飞书 / Telegram 这两个**能主动推送**的渠道，重启前没送到的审批请求要等到操作者
-// 自己再说一句话（`Dispatcher::handle` 第 4 步的 `flush(Some(peer))`）才会送出去；
-// 而§11.4 的整条设计就是"不能为补发一条结果消息重跑任务"。
-// 建议：把 `flush(None)` 挪到 `supervisor.start_all` 之后（它不依赖 HTTP 监听，只依赖
-// 渠道注册表），或者在 `ChannelRegistry::register` 之后按平台冲刷一次。
+/// 补发**在就绪之后**（`service::start` 的第 11 步），所以它是"尽快发生"而不是"返回之前
+/// 已经发生"——断言要等它，不能假设 `start` 回来时它已经跑完。这个次序是有代价换来的：
+/// 它曾经同步跑在 "Gateway 就绪" 之前，于是卡住的投递直接把重启拖长（§11.4）。
+///
+/// 顺序上有一条硬要求：**渠道登记之后**才有意义。`DeliveryLog::send_recorded` 找不到
+/// 发送口就把行原样留在 pending，所以在 `supervisor.start_all` 之前冲刷等于什么都没干
+/// （W5 验收 BUG(3)）。
 #[tokio::test]
 async fn a_pending_delivery_is_resent_once_after_a_restart() {
     let first = MemSender::new(ChannelPlatform::Telegram);
@@ -293,15 +293,70 @@ async fn a_pending_delivery_is_resent_once_after_a_restart() {
         )
         .await;
 
-    assert_eq!(
-        second.texts(),
-        vec!["要批一下".to_string()],
-        "重启后 pending 投递要补发**一次**"
-    );
+    let watching = Arc::clone(&second);
+    eventually("重启后 pending 投递补发一次", move || {
+        watching.texts() == vec!["要批一下".to_string()]
+    })
+    .await;
+    let left = gateway.pending_deliveries().await;
+    assert!(left.is_empty(), "补发之后不再 pending：{left:?}");
+}
+
+/// **就绪不等补发**：积压的投递再慢，也只慢在后台（§3、§11.4）。
+///
+/// 这一条守的是重启耗时。补发是网络 I/O，一条 pending 一个平台往返；它同步跑在
+/// "Gateway 就绪" 之前时，积压多少就等多久——线上 10 条卡住的投递是 3 秒，几百条能拖过
+/// 客户端 60 秒的就绪超时，而这段时间里客户端连不上、渠道也还没开始收消息。
+#[tokio::test]
+async fn becoming_ready_does_not_wait_for_the_delivery_backlog() {
+    let first = MemSender::new(ChannelPlatform::Telegram);
+    first.defer(true);
+    let mut gateway = GatewayBuilder::new(&telegram_config("111"))
+        .factory(FixedFactory::sender_only(
+            Arc::clone(&first) as Arc<dyn ChannelSender>
+        ))
+        .start()
+        .await;
+
+    // 三条卡住的投递：每次补发要跟平台往返三次。
+    for text in ["一".to_string(), "二".to_string(), "三".to_string()] {
+        gateway
+            .state()
+            .notifier
+            .deliver(
+                &DeliveryTarget::home(ChannelPeer::new(ChannelPlatform::Telegram, "111")),
+                Outbound::Text { text },
+            )
+            .await
+            .expect("登记得上");
+    }
+    assert_eq!(gateway.pending_deliveries().await.len(), 3);
+
+    // 新发送口每条要 1 秒：三条就是 3 秒。同步补发的话，重启至少要 3 秒。
+    let second = MemSender::new(ChannelPlatform::Telegram);
+    second.slow_down(std::time::Duration::from_secs(1));
+    let started = std::time::Instant::now();
+    gateway
+        .restart_with(
+            &telegram_config("111"),
+            vec![FixedFactory::sender_only(
+                Arc::clone(&second) as Arc<dyn ChannelSender>
+            )],
+        )
+        .await;
+    let ready = started.elapsed();
     assert!(
-        gateway.pending_deliveries().await.is_empty(),
-        "补发之后不再 pending"
+        ready < std::time::Duration::from_millis(1500),
+        "就绪等了 {ready:?}——补发又回到就绪之前了"
     );
+
+    // 补发照样发生，只是晚一步。等它（3 秒的往返 + 余量）。
+    let watching = Arc::clone(&second);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while watching.sent().len() < 3 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(watching.sent().len(), 3, "就绪不等补发，但补发还是要发生");
 }
 
 /// §11.2：操作者在 Telegram 私聊与飞书私聊说话，落到**同一个 home session**。
@@ -566,6 +621,293 @@ home_chat = 999
     );
 }
 
+/// 停在等待审批时，**会话账本里也有那一条**——界面靠它看得见审批。
+///
+/// `run.waiting_approval` 只说"停下了"，短 ID 在 `approval.requested` 身上：折叠与 SSE
+/// 的待处理帧都是从它派生的。少了它，TUI 停在"等待审批"却没有待审批计数、也不弹窗，
+/// 只能自己轮询 `/v1/approvals` 才发现自己在等（§7.4「TUI 同时可见」）。
+///
+/// 补写这一步在生产里由启动时与 `AUDIT_TICK` 各做一次（§8.5 的反向顺序：state.db 是
+/// 权威，JSONL 那一条是补写的审计副本）。这里直接叫一次补写器，省掉等那一拍。
+#[tokio::test]
+async fn a_waiting_run_writes_the_approval_request_into_the_session_log() {
+    let home = Home::new();
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-1",
+            "shell",
+            serde_json::json!({"command": "echo hi"}),
+        ),
+        text_round(2, "跑完了。"),
+    ]]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "approval-1", "跑一下 echo").await.run;
+    gw.wait_status(
+        &run,
+        |status| status == RunStatus::WaitingApproval,
+        "等待审批",
+    )
+    .await;
+
+    // 权威在 state.db：这一条停住时 JSONL 里还没有它，补写是**随后**的一步。
+    assert!(
+        !home
+            .event_types(&session)
+            .iter()
+            .any(|name| name == "approval.requested"),
+        "{:?}",
+        home.event_types(&session)
+    );
+    assert_eq!(gw.state().drain_audit().await, 1, "补写一条");
+
+    let requested = home
+        .events(&session)
+        .into_iter()
+        .find_map(|event| match event.payload {
+            EventPayload::ApprovalRequested(body) => Some(body),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("账本里没有那条请求：{:?}", home.event_types(&session)));
+
+    // 它是**答得了**的那一条：界面拿这个 ID 去取详情、去答复。
+    let pending = gw.approvals().await;
+    assert_eq!(pending.len(), 1, "{pending:?}");
+    assert_eq!(requested.approval.as_str(), pending[0].approval.as_str());
+    assert_eq!(requested.short_id, pending[0].short_id);
+    assert_eq!(requested.plan_hash, pending[0].plan_hash);
+
+    // 再补一次不会多出第二条（按 `event_id` 幂等）。
+    assert_eq!(gw.state().drain_audit().await, 0, "没有第二条");
+    assert_eq!(
+        home.event_types(&session)
+            .iter()
+            .filter(|name| *name == "approval.requested")
+            .count(),
+        1
+    );
+}
+
+/// §8.4：前一个 Run 还停在等待审批时，**同一 Session 的下一条消息不越过它**。
+///
+/// 越过去不是"顺序不好看"：停住的那半轮里那次调用还没有结果，回放窗口只能带着一个没有
+/// 输出的 `function_call` 发给模型，provider 直接 400（`No tool output found for tool
+/// call …`）——用户在审批弹窗之外敲的那句 `y` 就是这么变成一次失败的。
+#[tokio::test]
+async fn a_message_behind_a_waiting_approval_waits_instead_of_overtaking() {
+    let home = Home::new();
+    let llm = FakeLlm::new(vec![
+        // 第一段：要跑 shell → 停在审批。
+        vec![call_round(
+            1,
+            "pc-1",
+            "shell",
+            serde_json::json!({"command": "echo hi"}),
+        )],
+        // 批准之后续跑的那一段。
+        vec![text_round(2, "跑完了。")],
+        // 排队那条 Run 的那一段。
+        vec![text_round(1, "y")],
+    ]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gw.open_session().await;
+
+    let first = gw.submit(&session, "overtake-1", "跑一下 echo").await.run;
+    gw.wait_status(
+        &first,
+        |status| status == RunStatus::WaitingApproval,
+        "等待审批",
+    )
+    .await;
+    let turns_before = llm.turns();
+
+    // 同一个 Session 再来一条：前一个没结束，它只能排队。
+    let second = gw.submit(&session, "overtake-2", "y").await.run;
+    assert_eq!(
+        gw.run_detail(&second).await.summary.status,
+        RunStatus::Queued,
+        "前一个还停在等待审批，后一个不许领"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(llm.turns(), turns_before, "排队的这条不该走到模型");
+    assert_eq!(
+        gw.run_detail(&second).await.summary.status,
+        RunStatus::Queued
+    );
+
+    // 答复之后前一个跑完，后一个才轮到。
+    let record = gw
+        .approvals()
+        .await
+        .into_iter()
+        .find(|candidate| candidate.run.as_ref() == Some(&first))
+        .expect("那条审批");
+    gw.decide(&record.approval, true).await;
+    gw.wait_terminal(&first).await;
+    gw.wait_terminal(&second).await;
+
+    // 而且交给模型的每一份转写都过得了 provider 那一关。
+    let requests = llm.requests.lock().expect("脚本模型").clone();
+    assert_transcripts_close_every_call(&requests);
+}
+
+/// §8.3 / §8.4：一轮要了两次调用、**第一个就停下**时，续跑要把后面的也跑完。
+///
+/// `tool.planned` 是执行到那个调用才写的，所以第一个停在审批上时，**第二个连计划都还
+/// 没有**。按"有计划的调用"恢复，续跑只跑完第一个，模型下一轮拿到的是"要了两次、只回了
+/// 一次输出"的转写——provider 直接 400（`No tool output found for tool call …`），这条
+/// Run 从此不可能完成。
+#[tokio::test]
+async fn a_round_stopped_at_its_first_call_still_finishes_the_rest() {
+    let home = Home::new();
+    let llm = FakeLlm::new(vec![
+        vec![multi_call_round(
+            1,
+            &[
+                (
+                    "call_00_one",
+                    "shell",
+                    serde_json::json!({"command": "echo one"}),
+                ),
+                (
+                    "call_01_two",
+                    "shell",
+                    serde_json::json!({"command": "echo two"}),
+                ),
+            ],
+        )],
+        vec![text_round(2, "两条都跑完了。")],
+    ]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "two-calls", "跑两条命令").await.run;
+    gw.wait_status(
+        &run,
+        |status| status == RunStatus::WaitingApproval,
+        "第一次等待审批",
+    )
+    .await;
+
+    // 批准第一个。它跑掉之后，第二个必须也停下来问一次——而不是被跳过。
+    let first = pending_for(&gw, &run).await;
+    gw.decide(&first.approval, true).await;
+    let second = wait_for_another_approval(&gw, &run, &first).await;
+    assert_ne!(
+        second.call, first.call,
+        "第二个调用是另一个调用：它原先连计划都没有"
+    );
+    gw.decide(&second.approval, true).await;
+    gw.wait_terminal(&run).await;
+
+    // 两次调用都真的跑过。
+    let results = home
+        .events(&session)
+        .iter()
+        .filter(|event| event.type_name() == "tool.result" && event.run.as_ref() == Some(&run))
+        .count();
+    assert_eq!(
+        results,
+        2,
+        "一轮里的两次调用都要有结果：{:?}",
+        home.event_types(&session)
+    );
+
+    // 而且每一步交给模型的转写都过得了 provider 那一关。
+    let requests = llm.requests.lock().expect("脚本模型").clone();
+    assert_transcripts_close_every_call(&requests);
+}
+
+/// 这个 Run 当下的待审批（不操心是第几条）。
+async fn pending_for(
+    gw: &Gw,
+    run: &komo_kernel::types::ids::RunId,
+) -> komo_kernel::protocol::http::ApprovalRecord {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Some(record) = gw
+            .approvals()
+            .await
+            .into_iter()
+            .find(|candidate| candidate.run.as_ref() == Some(run))
+        {
+            return record;
+        }
+        assert!(std::time::Instant::now() < deadline, "这条 Run 没有待审批");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 等**下一条**审批出现（同一 Run，调用号与刚答过的那条不同）。
+async fn wait_for_another_approval(
+    gw: &Gw,
+    run: &komo_kernel::types::ids::RunId,
+    answered: &komo_kernel::protocol::http::ApprovalRecord,
+) -> komo_kernel::protocol::http::ApprovalRecord {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let found = gw.approvals().await.into_iter().find(|candidate| {
+            candidate.run.as_ref() == Some(run)
+                && candidate.approval != answered.approval
+                && candidate.call != answered.call
+        });
+        if let Some(record) = found {
+            return record;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "第一个调用批准之后，第二个调用应当接着问——它被跳过了"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 转写里**调用还没有输出之前，不能出现下一条用户消息**。
+///
+/// 这就是 provider 判的那条（`No tool output found for tool call …`）：夹在中间的用户消息
+/// 会让那次调用看起来永远没有输出。排队那条 Run 的输入恰好会长在这个位置——接收即落盘
+/// （§8.5），而它开跑要等前一个结束。
+fn assert_transcripts_close_every_call(requests: &[komo_kernel::types::turn::TurnRequest]) {
+    for (index, request) in requests.iter().enumerate() {
+        let mut open = 0usize;
+        for message in &request.messages {
+            let shape = format!(
+                "{:?}({}){:?}",
+                message.role,
+                message.tool_calls.len(),
+                message.text.as_deref().unwrap_or("")
+            );
+            match message.role {
+                komo_kernel::types::turn::Role::User => assert_eq!(
+                    open,
+                    0,
+                    "第 {index} 份转写把用户消息夹在了没有输出的调用中间：{shape}；\n{}",
+                    transcript(request)
+                ),
+                komo_kernel::types::turn::Role::Assistant => open += message.tool_calls.len(),
+                komo_kernel::types::turn::Role::Tool => open = 0,
+            }
+        }
+    }
+}
+
+fn transcript(request: &komo_kernel::types::turn::TurnRequest) -> String {
+    request
+        .messages
+        .iter()
+        .map(|message| {
+            format!(
+                "  {:?} calls={} results={} text={:?}",
+                message.role,
+                message.tool_calls.len(),
+                message.tool_results.len(),
+                message.text.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// HTTP 提交的 Run 没有来源会话：审批请求**只有 home chat**（§11.4「来源是 Cron 或已
 /// 断开的 TUI 时只有 home chat」）。
 #[tokio::test]
@@ -618,5 +960,184 @@ async fn an_http_run_sends_its_approval_to_home_only() {
         targets,
         vec!["111".to_string()],
         "没有来源会话，就**只有** home chat 这一条"
+    );
+}
+
+/// **一次答一批**（§11.3 的 `/approve all`，`POST /v1/approvals/decisions`）。
+///
+/// 两个会话各停一条 shell 审批（不同会话才谈得上"各自卡着"，同一会话里后一个 Run 不许
+/// 越过前一个）。一次请求答两条，两条 Run 都接着跑完——**每一条各自落一条决定、各自换
+/// 一份凭据**：批量省的是按键，不是把两次授权合并成一次。
+#[tokio::test]
+async fn one_batch_decision_answers_every_pending_approval() {
+    let home = Home::new();
+    // 每个 Run 一段：要一次 shell（停在审批），脚本演完之后的那一句收尾由 FakeLlm 的
+    // 兜底给——两条 Run 的续跑先后不定，断言不依赖谁先谁后。
+    let llm = FakeLlm::new(vec![
+        vec![call_round(
+            1,
+            "pc-1",
+            "shell",
+            serde_json::json!({"command": "echo one"}),
+        )],
+        vec![call_round(
+            1,
+            "pc-2",
+            "shell",
+            serde_json::json!({"command": "echo two"}),
+        )],
+    ]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+
+    let mut runs = Vec::new();
+    let mut approvals = Vec::new();
+    for index in 0..2 {
+        let session = gw.open_session().await;
+        let run = gw
+            .submit(&session, &format!("batch-{index}"), "跑一下 echo")
+            .await
+            .run;
+        gw.wait_status(
+            &run,
+            |status| status == RunStatus::WaitingApproval,
+            "等待审批",
+        )
+        .await;
+        let record = pending_for(&gw, &run).await;
+        runs.push(run);
+        approvals.push(record.approval);
+    }
+    assert_eq!(gw.approvals().await.len(), 2, "两条都在等");
+
+    let (code, body) = gw
+        .post(
+            "/v1/approvals/decisions",
+            serde_json::json!({
+                "approvals": approvals,
+                "approved": true,
+                "request_key": "batch-1",
+            }),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    let response: komo_kernel::protocol::http::ApprovalBatchDecisionResponse =
+        serde_json::from_str(&body).expect("批量回执");
+    assert_eq!(response.decisions.len(), 2, "{body}");
+    assert!(response.missing.is_empty(), "{body}");
+    for decision in &response.decisions {
+        assert!(decision.decision.approved, "{body}");
+        assert!(!decision.already_decided, "第一次答复不该是「早已决定」");
+    }
+
+    // 两条 Run 都接着跑完。
+    for run in &runs {
+        gw.wait_terminal(run).await;
+    }
+    assert!(gw.approvals().await.is_empty(), "没有剩下的待处理审批");
+
+    // 同样的名单再答一次：每一条都返回**它自己那个原决定**，不报错（§11.3）。
+    let (code, body) = gw
+        .post(
+            "/v1/approvals/decisions",
+            serde_json::json!({
+                "approvals": approvals,
+                "approved": true,
+                "request_key": "batch-2",
+            }),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    let again: komo_kernel::protocol::http::ApprovalBatchDecisionResponse =
+        serde_json::from_str(&body).expect("批量回执");
+    assert_eq!(again.decisions.len(), 2, "{body}");
+    assert!(
+        again
+            .decisions
+            .iter()
+            .all(|decision| decision.already_decided),
+        "第二次答复得到的是原决定：{body}"
+    );
+}
+
+/// 名单里夹着一条**不存在的**审批：其余照答，不存在的单独列出来（不让整批失败）。
+///
+/// 一批里夹着一条刚刚在别的界面答掉的请求是常态（手机、另一台机器、另一个 TUI），为它
+/// 把其余几条一起挡下，等于逼操作者去猜是哪一条不见了。
+#[tokio::test]
+async fn a_batch_skips_the_names_that_are_not_there() {
+    let (gateway, _sender) = TestGateway::start().await;
+    let record = gateway.pending_approval().await;
+    let ghost = komo_kernel::types::ids::ApprovalId::from_raw("ap-nobody");
+
+    let (code, body) = gateway
+        .post(
+            "/v1/approvals/decisions",
+            serde_json::json!({
+                "approvals": [record.approval.clone(), ghost],
+                "approved": true,
+            }),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    let response: komo_kernel::protocol::http::ApprovalBatchDecisionResponse =
+        serde_json::from_str(&body).expect("批量回执");
+    assert_eq!(response.decisions.len(), 1, "{body}");
+    assert_eq!(
+        response.decisions[0].approval.as_str(),
+        record.approval.as_str(),
+        "{body}"
+    );
+    assert_eq!(response.missing.len(), 1, "{body}");
+    assert_eq!(response.missing[0].as_str(), "ap-nobody");
+    assert!(gateway.approvals().await.is_empty(), "那一条真的答掉了");
+}
+
+/// 聊天里的 `/approve all`：**一次把待处理的全部答了**（§11.3）。
+///
+/// 三条待处理时，`/approve`（不带 ID）只回一句"请指明"——那是设计；操作者要的是
+/// `/approve all` 这一句，而它必须真的答掉全部，并在回执里**点名**答了哪几条。
+#[tokio::test]
+async fn the_chat_all_command_answers_every_pending_one() {
+    let (gateway, _sender) = TestGateway::start().await;
+    for _ in 0..3 {
+        gateway.pending_approval().await;
+    }
+    let short_ids: Vec<String> = gateway
+        .approvals()
+        .await
+        .iter()
+        .map(|record| record.short_id.to_string())
+        .collect();
+    assert_eq!(short_ids.len(), 3, "{short_ids:?}");
+
+    // 不带 ID 的老路：多于一条就列出来要求指明，不猜。
+    let ambiguous = gateway.handle(operator_dm("/approve", "telegram:1")).await;
+    let InboundAck::Replied { text } = ambiguous else {
+        panic!("{ambiguous:?}");
+    };
+    assert!(text.contains("请指明"), "{text}");
+    assert!(text.contains("/approve all"), "要说得出怎么全批：{text}");
+    assert_eq!(gateway.approvals().await.len(), 3, "那句不改变任何状态");
+
+    let ack = gateway
+        .handle(operator_dm("/approve all", "telegram:2"))
+        .await;
+    let InboundAck::Replied { text } = ack else {
+        panic!("{ack:?}");
+    };
+    assert!(text.contains("3 条"), "{text}");
+    assert!(text.contains("各按本次调用"), "{text}");
+    for short_id in &short_ids {
+        assert!(text.contains(short_id), "回执要点名答了哪几条：{text}");
+    }
+    assert!(gateway.approvals().await.is_empty(), "三条都答掉了");
+
+    // 已经答过的再来一次：不报错，也不假装又答了一遍。
+    let again = gateway
+        .handle(operator_dm("/approve all", "telegram:3"))
+        .await;
+    assert!(
+        matches!(&again, InboundAck::Replied { text } if text.contains("没有待处理")),
+        "{again:?}"
     );
 }

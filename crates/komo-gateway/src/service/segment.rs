@@ -22,9 +22,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_kernel::events::{Event, EventPayload};
-use komo_kernel::fold::{Surface, fold};
+use komo_kernel::fold::{Surface, SurfaceMessage, fold};
 use komo_kernel::traits::{ApprovalRepo, Ledger, LedgerError};
 use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
 use komo_kernel::types::turn::{ReplayMessage, ToolResultForModel, TurnRequest};
 use komo_runtime::agent::handler::SegmentSource;
@@ -319,25 +320,26 @@ impl GatewaySegments {
         events: &[Event],
         run: &RunId,
     ) -> Option<ResumedRound> {
-        let view = surface.runs.get(run)?;
+        // 这个 Run 得在这个会话里。
+        surface.runs.get(run)?;
         let waiting = waiting_approval(events, run);
         let mut pending = Vec::new();
-        for call_id in &view.calls {
-            let call = surface.calls.get(call_id)?;
-            if call.state.is_terminal() {
-                continue;
-            }
+        // **这一轮还没有结果的调用，全部交回执行器**——不只是已经写过计划的那几个：
+        // 一轮里前一个停下时，后面的调用连 `tool.planned` 都还没有（`Surface::open_calls`）。
+        for call_id in &surface.open_calls(run) {
+            // 有那一行就用它的状态；没有（连计划都还没落盘）就是 §8.4 第 6 行说的
+            // "确定尚未执行"——一次尝试都还没有过。
+            let (state, attempt, attempts) = match surface.calls.get(call_id) {
+                Some(call) => (call.state, call.attempt.clone(), call.attempts),
+                None => (ToolCallState::Planned, None, 0),
+            };
             let request = call_request(surface, events, call_id)?;
             let approval = waiting
                 .as_ref()
                 .filter(|(_, on)| on.as_ref() == Some(call_id))
                 .map(|(approval, _)| approval.clone());
             pending.push(CallRequest {
-                resumed: Some(resumed_from(
-                    call.state,
-                    call.attempt.clone(),
-                    call.attempts,
-                )),
+                resumed: Some(resumed_from(state, attempt, attempts)),
                 approval,
                 ..request
             });
@@ -405,10 +407,15 @@ fn call_request(surface: &Surface, events: &[Event], call: &ToolCallId) -> Optio
 }
 
 /// 回放窗口：最新一个 `conversation.boundary` 之后的消息（§13.1 的 `/new`）。
+///
+/// **还没被领走的 Run 的用户消息不进窗口**（§8.4「同一 Session 后续 Run 不越过它」）。
+/// 输入是接收那一刻就落盘的（§8.5 内容权威），所以它在日志里的位置**早于**当前这一轮
+/// 的收尾；照搬位置发出去，provider 看到的就是"助手要了一次调用、紧接着另一个 Run 的
+/// 用户消息、最后才是那次调用的输出"，直接 400（`No tool output found for tool call …`）。
+/// 领取那一步已经保证后一个 Run 不会先跑（`DUE_SQL`），这里管的是它**还没跑**时那半句话。
 fn replay(surface: &Surface) -> Vec<ReplayMessage> {
-    surface
-        .replay()
-        .iter()
+    window(surface)
+        .into_iter()
         .map(|message| ReplayMessage {
             role: message.role,
             seq: message.seq,
@@ -436,13 +443,60 @@ fn replay(surface: &Surface) -> Vec<ReplayMessage> {
         .collect()
 }
 
-/// 回放面上最后一条用户消息的正文。
-fn latest_user_text(surface: &Surface) -> Option<String> {
-    surface
+/// 回放窗口里属于**已经开跑过**的那些 Run，**按 Run 分组、Run 之间先来后到**。
+///
+/// 日志的顺序是**接收**的顺序（输入落盘的时机，§8.5 内容权威），不是执行的顺序：一个
+/// Run 停在半轮上时，后一个 Run 的输入会落在它的调用与调用结果之间。照搬这个位置发出去，
+/// provider 看到的是"助手要了一次调用、紧接着另一个 Run 的用户消息、最后才是那次调用的
+/// 输出"，直接 400（`No tool output found for tool call …`）。§8.4 的次序本来就是 Run
+/// 之间不越过，转写按它排：每个 Run 的那几句连在一起，Run 之间按先来后到。
+///
+/// 还没被领走的 Run 整个不进转写（`awaits_claim`）：它的输入已经落盘，但这一轮还没轮到
+/// 它。TUI 走的是 `Surface::replay`（原样、按日志顺序），两者不是一回事——用户在界面上要
+/// 立刻看到自己刚发的那句话，而模型不能在半轮中间读到它。
+fn window(surface: &Surface) -> Vec<&SurfaceMessage> {
+    let kept: Vec<&SurfaceMessage> = surface
         .replay()
         .iter()
-        .rev()
-        .find(|message| message.role == komo_kernel::types::turn::Role::User)
+        .filter(|message| {
+            message
+                .run
+                .as_ref()
+                .and_then(|run| surface.runs.get(run))
+                .is_none_or(|view| !view.status.awaits_claim())
+        })
+        .collect();
+
+    // 每个 Run 的第一个 `seq` 就是它在对话里的位置；不在 Run 里的消息（`message.user`）
+    // 按自己的 `seq` 排。
+    let mut starts: BTreeMap<&RunId, Seq> = BTreeMap::new();
+    for message in &kept {
+        if let Some(run) = &message.run {
+            let entry = starts.entry(run).or_insert(message.seq);
+            *entry = (*entry).min(message.seq);
+        }
+    }
+
+    let mut keyed: Vec<((Seq, Seq), &SurfaceMessage)> = kept
+        .into_iter()
+        .map(|message| {
+            let key = match &message.run {
+                Some(run) => (starts.get(run).copied().unwrap_or(Seq::ZERO), message.seq),
+                None => (message.seq, message.seq),
+            };
+            (key, message)
+        })
+        .collect();
+    keyed.sort_by_key(|(key, _)| *key);
+    keyed.into_iter().map(|(_, message)| message).collect()
+}
+
+/// 回放面上最后一条用户消息的正文。
+fn latest_user_text(surface: &Surface) -> Option<String> {
+    window(surface)
+        .into_iter()
+        .filter(|message| message.role == komo_kernel::types::turn::Role::User)
+        .last()
         .and_then(|message| message.text.clone())
 }
 

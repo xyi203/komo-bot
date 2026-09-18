@@ -284,6 +284,21 @@ async fn run_effect(
                 Err(error) => Some(ServerEvent::Failed(format!("答复失败：{error}"))),
             }
         }
+        Effect::DecideMany {
+            approvals,
+            approved,
+            request_key,
+        } => {
+            let request = komo_kernel::protocol::http::ApprovalBatchDecisionRequest {
+                approvals,
+                approved,
+                request_key: Some(request_key),
+            };
+            match client.decide_approvals(&request).await {
+                Ok(response) => Some(ServerEvent::BatchSettled(Box::new(response))),
+                Err(error) => Some(ServerEvent::Failed(format!("批量答复失败：{error}"))),
+            }
+        }
         Effect::FetchPending => match client.approvals(&ApprovalListQuery::default()).await {
             Ok(response) => Some(ServerEvent::Pending(response.approvals)),
             Err(error) => Some(ServerEvent::Failed(format!("取待审批失败：{error}"))),

@@ -13,18 +13,20 @@
 //!   记下用的是哪一条授权，于是 `GrantUse` 进账本，事后答得出"这次是凭哪条授权跑的"。
 
 use async_trait::async_trait;
+use komo_kernel::events::{ApprovalRequested, EventPayload};
 use komo_kernel::policy::{Grant, GrantScope};
 use komo_kernel::protocol::http::{
     ApprovalDecisionRecord, ApprovalDecisionResponse, ApprovalRecord,
 };
 use komo_kernel::traits::{ApprovalRepo, RepoError, StoreError};
-use komo_kernel::types::ids::{ApprovalId, CronJobId, RunId, SessionId, ShortId};
+use komo_kernel::types::ids::{ApprovalId, CronJobId, EventId, RunId, SessionId, ShortId};
 use komo_kernel::types::plan::{ConsumeIntent, ConsumedApproval, ExecutionPlan};
 use time::OffsetDateTime;
 use toasty::Executor;
 
 use crate::db::{BoxFuture, Db, decode, encode, map_toasty, to_ts, to_ts_opt};
 use crate::models::{ApprovalRequestRow, PolicyGrantRow};
+use crate::repos::outbox;
 
 /// Turso 上的 [`ApprovalRepo`]。
 #[derive(Debug, Clone)]
@@ -66,9 +68,13 @@ impl TursoApprovalRepo {
 #[async_trait]
 impl ApprovalRepo for TursoApprovalRepo {
     async fn create(&self, request: ApprovalRecord) -> Result<ApprovalRecord, RepoError> {
+        // 审计事件的 `event_id` 在事务外定下：`with_write_retry` 重跑时补写仍按同一个
+        // `event_id` 幂等（§8.5）。与 `approval.decided` 取自 `decided_at` 对称。
+        let event_id = EventId::new_at(request.requested_at);
         self.db
             .with_write_retry(move |ex| {
                 let request = request.clone();
+                let event_id = event_id.clone();
                 Box::pin(async move {
                     if ApprovalRequestRow::filter_by_id(request.approval.as_str())
                         .first()
@@ -103,6 +109,29 @@ impl ApprovalRepo for TursoApprovalRepo {
                     .exec(ex)
                     .await
                     .map_err(map_toasty)?;
+
+                    // 权威行与"待补写的审计事件"同一个事务提交（§7.4「审批请求…在
+                    // state.db 事务提交」、§8.5 的反向顺序），会话 JSONL 里那一条由
+                    // `drain_audit` 随后补上。
+                    //
+                    // **少了它，折叠与 SSE 就不知道有东西在等人回答**：`run.waiting_approval`
+                    // 只说"停下了"，短 ID 在 `approval.requested` 身上。界面会停在"等待
+                    // 审批"——没有待审批计数、也不弹窗（§7.4「TUI 同时可见」）。
+                    outbox::enqueue_in(
+                        ex,
+                        &request.session,
+                        &event_id,
+                        EventPayload::ApprovalRequested(ApprovalRequested {
+                            approval: request.approval.clone(),
+                            short_id: request.short_id.clone(),
+                            plan_hash: request.plan_hash.clone(),
+                            call_id: request.call.clone(),
+                            reason: request.reason.clone(),
+                            scopes: request.scopes.clone(),
+                        }),
+                        request.requested_at,
+                    )
+                    .await?;
                     Ok(request)
                 }) as BoxFuture<'_, Result<ApprovalRecord, StoreError>>
             })
@@ -662,6 +691,34 @@ mod tests {
             consumed: false,
             reason: "操作者批准".into(),
         }
+    }
+
+    /// §7.4 / §8.5：审批请求的**权威行与待补写的审计事件同一个事务提交**。
+    ///
+    /// 少了那条 `approval.requested`，折叠与 SSE 就不知道有东西在等人回答：
+    /// `run.waiting_approval` 只说"停下了"，短 ID 在它身上。
+    #[tokio::test]
+    async fn creating_an_approval_leaves_one_audit_event_to_write_back() {
+        let (db, _dir) = temp().await;
+        let repo = TursoApprovalRepo::new(db.clone());
+        let plan = shell_plan("ls");
+        repo.create(request("ap-1", &plan, 1)).await.unwrap();
+
+        let pending = outbox::pending(&db, 10).await.unwrap();
+        assert_eq!(pending.len(), 1, "一条审批一条审计事件：{pending:?}");
+        assert_eq!(pending[0].session.as_str(), "sess-1");
+        assert_eq!(pending[0].occurred_at, NOW, "保留原始发生时间");
+        let EventPayload::ApprovalRequested(body) = &pending[0].payload else {
+            panic!("写成了别的：{:?}", pending[0].payload);
+        };
+        assert_eq!(body.approval.as_str(), "ap-1");
+        assert_eq!(body.short_id, ShortId::from_index(1));
+        assert_eq!(body.plan_hash.to_string(), plan.plan_hash().to_string());
+        assert_eq!(body.reason, "要人看一眼");
+
+        // 重复创建是幂等的（那一刻已经定下了），审计事件也就不该多出一条。
+        repo.create(request("ap-1", &plan, 1)).await.unwrap();
+        assert_eq!(outbox::pending(&db, 10).await.unwrap().len(), 1);
     }
 
     /// 验收 ⑪（前半）：重复回答**幂等**——已决定的返回原决定并置位

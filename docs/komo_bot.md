@@ -107,6 +107,8 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 
 Gateway 获得数据目录进程锁并完成存储校验后，自动扫描未完成运行；不必等用户打开 CLI 或发送 resume。恢复与新请求共用调度器，恢复扫描本身不等待全部旧任务完成才提供服务。
 
+**就绪不等投递补发。** 上一次没送到的投递（§11.4）在"Gateway 就绪"**之后**的后台补发，不压住第 4 步的等待：补发是网络 I/O，一条 pending 一个平台往返，积压多少条就等多久——线上十来个卡住的投递是几秒，上百条会拖过客户端的就绪超时。补发晚一步没有代价：投递记录先写后发，按 `DeliveryId` 幂等，重来一次也不会重复发。**顺序上唯一的硬要求是渠道登记之后**——渠道没登记时冲刷等于什么都没干。
+
 Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许一个 Gateway 接管实例；启动失败不能通过删除仍有效的锁来强行重试。
 
 **配置热重载。** `config.toml`、`.env`、`policy.toml` 改了不用重启 Gateway。三个触发方式落到同一个函数：文件 mtime 变化（每秒轮询一次，不引入 inotify 依赖，编辑器的临时文件与原子替换都覆盖到）、`komo config reload`、`SIGHUP`。流程固定：
@@ -376,6 +378,7 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 - 本次调用授权：只批准眼前的执行计划。
 - 本次 Run 的范围授权：例如指定目录的写入，或明确命令模板。
 - Cron Job 授权：绑定 Job 版本、工具或模块版本、参数范围和权限。
+- **一次答一批**：一条 Run 里连着几个命令、几个 Run 各自卡在等待上时，操作者一次答复把**此刻待处理的全部**答了（TUI 的 `a`、聊天与 CLI 的 `/approve all`）。它**不是第四条范围**：名单里的每一条各自落一条决定、各自换一份凭据、各自写一条审计事件——只是把 N 次按键变成一次。名单由发起方列出（"此刻看到的那些"），协议里没有"全部"这个词，服务端不会在答复到达时才决定名单，因而也不会把答复之后新出现的请求一起答掉。**批量的范围固定为本次调用**：范围授权绑的是一份具体的计划（shell 绑整条命令、Python 绑模块与版本），一批互不相干的计划共用一个范围，只能是替操作者猜一个他没看过的答复；他说了范围却被按本次答时，回执必须**说出来**，不静默降级。
 
 不把“同意一次 Python”解释为“今后任意脚本均可执行”。审批不覆盖显式 Deny。批准后再次校验目标和版本，变化则重新评估。
 
@@ -647,6 +650,8 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
   → 需要审批或核对的保留待处理状态
   → 周期扫描，补齐内存通知丢失的任务
 ```
+
+**就绪（HTTP 监听起、发现文件有效）之后**才做两件不影响调度事实的事：渠道起来后按平台补发它名下积压的投递，以及启动时那一次整体补发（§11.4）。两件都在后台，就绪不等它们——它们是网络 I/O，积压多少就等多久；顺序上唯一的硬要求是**渠道登记之后**（§3）。
 
 启动扫描、Cron、审批回调和手动 resume 共用同一个领取入口。领取通过数据库条件更新与递增代次保证同一 Run 只被一个执行者接管；旧代次不能继续提交新状态。单实例使用进程锁与数据库事务即可，不引入跨机器选主或分布式队列。
 
@@ -968,6 +973,7 @@ TELEGRAM_BOT_TOKEN=...
 |---|---|
 | `/approve <short_id>` / `/reject <short_id>` | 打 `POST /v1/approvals/{id}/decision`；已决定的返回原决定，不报错 |
 | `/approve` / `/reject`（无 ID） | 操作者只有**一个**待处理请求时生效；多于一个则列出并要求指明 |
+| `/approve all` / `/reject all` | 打 `POST /v1/approvals/decisions`，把**此刻待处理的全部**一次答了（§7.2）；每条各自落一条决定，回执点名答了哪几条。**批量的范围是本次调用**——要范围请逐条 `/approve <短ID> run` |
 | `/approve <short_id> run` | 本次 Run 的范围授权（§7.2 第二种）；只对 Policy 标记为可范围化的计划生效，`Deny` 不可覆盖 |
 | `/approve <short_id> cron` | Cron Job 的范围授权（§7.2 第三种），绑定 Job 与其版本；只对来源是 Cron 的请求出现（Policy 对 Cron 来源的 Ask 自动多给这一档） |
 | `/pending` | 列出待处理审批及其短 ID |
@@ -976,9 +982,13 @@ TELEGRAM_BOT_TOKEN=...
 | `/status` | 当前 Run 状态、待审批数 |
 | `/id` | 回显 `{platform}:{chat_id}` 与发送者 id，供抄进 config.toml 的 `allow_from` / `home_chat` / `groups`；任何人可用，也是唯一不要求操作者身份的命令 |
 
+**TUI 是同一个决策接口的第四个界面，它的按键必须自己说出来。** 聊天里的请求自带按钮（飞书）或命令（Telegram / WeChat），TUI 只有一块弹窗，所以：弹窗底部那一行写出**此时真的生效**的键——`y` 本次、`r` 本次 Run 范围（只在 Policy 标了可范围化时出现）、`a` 全部批准（只在待处理多于一条时出现，并写出有几条）、`n` / `Esc` 拒绝本条；正文会滚，这一行不会。待处理条数同时出现在状态行上。弹窗没打开而审批还在等（请求还没投到、详情取不回来、事件流断了）时，输入框的提示行要**说出路**（`/pending` 看清单、`/approve <短ID>`、`/approve all`），而不是只显示一句"等待审批"——那是审批的主界面之外唯一还能看见它的地方。
+
 按钮回调与文本命令走同一个 `Dispatcher::handle`，**去重键与普通消息同源**（§11.1）：飞书卡片回调（`card.action.trigger`）用 `feishu:{event_id}`，Telegram `callback_query` 用 `telegram:{update_id}`——`callback_query` 是 `Update` 的一个字段，不是比 `update_id` 更细的投递单位。回调里带的 `approval_id` 是渠道回传的数据，只用来**定位**请求；批准与否仍由 Dispatcher 核对 Principal 后决定，回调负载不构成授权。
 
 **去重之外还有一层幂等，两层各管一件事。** 去重键挡平台重投（飞书至少一次投递，ws 断线重连与 3 秒超时都会重推；Telegram 的 `offset` 未推进就重取同一个 `Update`），幂等键挡用户连点——同一人连点「批准」两次是两条合法输入、两个不同的 `event_id` / `update_id`，只有按 `approval_id` 幂等才能让第二次得到「已决定」而不是第二次执行。因此**不**把去重键换成 `(open_message_id, action.value, operator.open_id)` 这类组合键：那是个幂等键，用作投递键会把语义不同的两次点击也静默吞掉。
+
+**飞书卡片是 JSON 2.0（`schema: "2.0"`），而 2.0 去掉了 `note` 组件与 `action` 模块。** 官方的不兼容变更写明：2.0 不再支持 note 与 action（`tag` 为 `action`），且 2.0 对不认识的组件是**整张卡打回**而不是忽略。所以"卡片备注"（原因、有效期、结论那一行）是普通文本组件加 `notation` 字号与灰色；一行按钮是 `column_set`，每列一个 button，那一块带固定的 `element_id`——决定之后那张无按钮的卡靠它整块摘掉。踩过的坑在 §14：带 `note` 的卡片被平台拒（`230099 / 200861 unsupported tag note`），于是审批请求**一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上。
 
 **决定后的原地更新用 `PATCH /open-apis/im/v1/messages/{message_id}`，不用回调响应体。** 飞书官方给了三条路：回调响应里直接回传新卡片（须在 3 秒内）、用回调 `token` 延时更新（30 分钟内、最多 2 次、且必须在响应回调之后）、以及无条件 PATCH（仅 `interactive` 消息、仅 14 天内发送的消息、单条 5 QPS、更新前后 `config` 均须 `update_multi:true`）。komo 取第三条：审批的决定先落 Ledger 再回写界面，这件事跨越了回调的 3 秒预算；而且 PATCH 是普通 REST 调用，与「ws 长连接还是 HTTP 回调」无关，不必赌 ws 客户端能不能回传响应帧。回调本身只需尽快返回，必要时带一个 `toast`。Telegram 侧对应 `editMessageReplyMarkup` 去掉按钮：官方的 48 小时编辑限制只约束「非机器人自己发送且不含 inline keyboard 的 business message」，机器人自己发的审批卡片不受时限；编辑失败按**非致命**处理——决定已在 Ledger 里，界面回写失败不改变结论，也不要去匹配错误文案（官方明示 `error_code` 内容将来会变）。
 
@@ -989,6 +999,7 @@ TELEGRAM_BOT_TOKEN=...
 §8.8："应为待发送结果持久保存投递记录，不能为补发一条结果消息重跑任务。"
 
 - `Notifier::deliver` 先在 `deliveries` 表写一行（目标、内容引用、状态 `pending`），再发送，成功后标 `sent`。重启后 `pending` 的行补发，按 `DeliveryId` 幂等。
+- **补发在就绪之后跑，而且同一时刻只跑一趟。** 就绪（§3 第 4 步）不等它：它是网络 I/O，一条一个平台往返，积压多少就等多久。三个入口——渠道起来时按平台冲刷、启动时整体冲刷、微信入站前按会话冲刷——共用一把锁：两趟并发地在同一批 `pending` 行上跑，同一行会被送两次（发送在结算之前）。
 - **审批请求的投递目标**：Run 的来源会话，**加上** home chat（若不同）。两处都能回答，第二个答复得到"已决定"。来源是 Cron 或已断开的 TUI 时只有 home chat。
 - home chat 解析：只看配置——每个 enabled 渠道的 `home_chat`（§11.2），没有运行时覆盖；一个都没配时返回错误给调用方，**不静默丢弃**。多个渠道都配了时的默认顺序是**飞书 > Telegram > WeChat**：前两者能通过 API 对任意已加入的会话主动推送，微信不能（下一条）。
 - **WeChat 的平台约束**：DM 回推依赖回复令牌 `context_token`——每条入站消息自带一个，SDK 按 `user_id` 存在**进程内存**里，源码里没有过期逻辑，唯一的失效路径是会话过期（`errcode -14`）清空整张表；真正挡住主动推送的是**进程重启即全丢**，不是令牌到期。没有令牌时 `send` 直接返回 `NoContext`，不会联网去补——这就是 `Deferred` 的精确触发条件（按错误**变体**匹配，不按字符串）。因此进程启动后用户没发过消息时**无法主动推送**。对应处理：该渠道的 `deliver` 在没有令牌时把行留在 `pending` 并返回 `Deferred`；用户下一条消息到达时 Dispatcher 先冲刷该会话的 `pending` 投递（§11.1 第 4 步），再处理新消息。审批请求因此不会丢，只会晚到；`home_chat` 里排在它前面的飞书或 Telegram 会先送到。待验证：服务端是否接受跨进程的旧 `context_token`——若接受，把每个 `user_id` 的最新令牌持久化到 state.db 即可让重启后的主动推送直接成功，`Deferred` 退化为「这台机器从没收过这个人的消息」一种情形。另：SDK 的 `message_type` / `message_state` 枚举没有 unknown 兜底，服务端多一个值就整批反序列化失败并无限退避重试，渠道会静默卡死——komo 的 wechat 渠道把连续 N 次 JSON 错误升级为 home chat 告警。
@@ -1056,6 +1067,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/approvals                | 待审核列表，列表项包含短 ID、具体动作与计划   |
 | GET /v1/approvals/{id}           | 单项审批详情                                   |
 | POST /v1/approvals/{id}/decision | 批准或拒绝                                     |
+| POST /v1/approvals/decisions     | 一次答一批（§7.2、§11.3 的 `/approve all`）：名单由发起方列出，每条各自落一条决定，各按本次调用 |
 | GET /v1/cron                     | 列出定时任务                                   |
 | POST /v1/cron                    | 创建定时任务                                   |
 | POST /v1/cron/{id}/run           | 手动触发                                       |
@@ -1310,7 +1322,7 @@ codegen-units = 16
 | `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避、审批有效期全部依赖时间 |
 | `ZoneResolver` | tzdb 实现（runtime，W3 选 crate） | `ScriptedZoneResolver`（可编脚本的假时区）/ `FixedOffsetZone`（降级） | §10 的夏令时两条规则要在无 tzdb 下测；kernel 不带时区数据库 |
 
-不是 trait 的东西：`AgentLoop`、`ToolExecutor`、`Scheduler`、`Recovery`、`MemoryManager`、`SkillRegistry`、`Coordinator`、`Dispatcher`——各只有一个实现，依赖上表的 trait 就可测。`SessionRepo`、`ToolCallRepo`、`CheckpointRepo`、`OutboxRepo` 是 store 内部的具体类型，只被 `Coordinator` 用。审批也不需要 `Approver` trait：§6 定了审批暂停 Run，`Policy` 答 `Ask` 后 executor 写 `approval_requests` 并 `Ledger::suspend`，飞书卡片按钮、Telegram / WeChat 命令、TUI 弹窗、CLI 子命令都打到 `POST /v1/approvals/{id}/decision`，调度器把 Run 重新入队，executor 从 `ApprovalRepo` 消费授权再执行。渠道之间的差别只在渲染（§11.3），不在决策。
+不是 trait 的东西：`AgentLoop`、`ToolExecutor`、`Scheduler`、`Recovery`、`MemoryManager`、`SkillRegistry`、`Coordinator`、`Dispatcher`——各只有一个实现，依赖上表的 trait 就可测。`SessionRepo`、`ToolCallRepo`、`CheckpointRepo`、`OutboxRepo` 是 store 内部的具体类型，只被 `Coordinator` 用。审批也不需要 `Approver` trait：§6 定了审批暂停 Run，`Policy` 答 `Ask` 后 executor 写 `approval_requests` 并 `Ledger::suspend`，飞书卡片按钮、Telegram / WeChat 命令、TUI 弹窗、CLI 子命令都打到 `POST /v1/approvals/{id}/decision`（一次答一批时是 `POST /v1/approvals/decisions`，逐条落决定），调度器把 Run 重新入队，executor 从 `ApprovalRepo` 消费授权再执行。渠道之间的差别只在渲染（§11.3），不在决策。
 
 关键签名（接口示意，辅助类型省略；`Tool` 见 §4）：
 
@@ -1513,4 +1525,7 @@ Memory 与模型验收覆盖：
 | `wechatbot` 的 native-tls 在 Fedora 上链系统 openssl 是否顺利；与 `rustls-no-provider` 的 reqwest 0.13 共存 | §13.4 | **已核实（2026-09-16，源码 + 实测）：共存没有问题，但 native-tls 这条路整个不走了。** 共存侧：native-tls 走 openssl 自己的 `Once`，与 rustls 无共享状态，`CryptoProvider::install_default()` 仍只由 `main` 调一次；原文「一份 reqwest / hyper 重复」里 hyper 是错的，锁文件里 hyper / hyper-util / rustls / hyper-rustls 各只有一份。TLS 侧：上游让 reqwest 0.12 默认特性开着且自己没有 feature，工作区无法关掉。**决定并已做：`vendor/wechatbot` + `[patch.crates-io]`，reqwest 升 0.13 走 rustls**，openssl 整条链消失，reqwest 重复也消失，默认特性全量构建通过，Fedora 不必装 `openssl-devel`。vendored openssl 作为退路而非首选（估 2–3 分钟且在关键路径起点） |
 | `lark-websocket-protobuf` 是否需要 `protoc` | 构建工具链要求 | **已核实（2026-09-16）：不需要。** 0.1.2 无 `build.rs`，依赖树里没有 prost-build / tonic-build / protobuf-codegen，本机无 protoc 编译通过。安装说明不加 `protobuf` |
 | 飞书卡片回调的 `event_id`、Telegram `callback_query_id` 在重推时是否保持不变 | §11.3 按钮去重 | **已核实（2026-09-16，官方文档）**：飞书对 2.0 事件与回调的官方去重建议就是「通过 `event_id` 字段判断事件唯一性」，配合「至少发送一次」与 15s/5min/1h/6h 最多 4 次重推，等价于保证重推携带同一 `event_id`；Telegram long polling 重投的单位是整个 `Update`（`offset` 未推进即原样再取），`update_id` 与其中的 `callback_query.id` 一并不变。**两个键都稳定，组合键退路作废**；去重键只挡平台重投，用户连点由 `approval_id` 幂等承担（已写入 §11.3）。剩余未核实：① 卡片回调自身的重推间隔 / 次数（官方只在「事件」侧给表）；② ws 模式下卡片回调载荷与 HTTP 是否逐字段一致；③ openlark 的 ws 客户端能否回传卡片响应帧——设计已改用 PATCH 绕开，不阻塞 |
+| ws 上 `card.action.trigger` 能不能到 komo（按钮回调） | §11.3 卡片按钮 | **源码核实（2026-09-18，`openlark-client 0.20.0/src/ws_client/frame_handler.rs:106`）：不能。** 数据帧按 header 的 `type` 分发，`"event" \| ""` 进事件分发，**`"card"` 是 `debug!("Card frame received, skipping")` 后返回 `None`——丢掉，连 ack 都不回**；`"card"` 这个分支的存在本身就说明飞书把卡片回调归成 `card` 帧。所以按钮要么等上游支持，要么 vendored openlark 自己接上（`[patch.crates-io]` 已有 wechatbot / toasty 的先例）。**未定：** 是否值得为此维护一个 patch——在那之前，答复的路是文本命令（`/approve <短ID>`、`/approve all`），卡片正文已写出命令；卡片回调仍需在开放平台的事件订阅里配置，否则连 `card` 帧都不会来 |
 | Telegram 把消息编辑成与现状相同内容时返回的错误（官方未文档化，且声明 `error_code` 内容会变） | §11.3 决定后去掉按钮的幂等重试 | 不匹配错误文案；编辑失败一律当非致命，决定以 Ledger 为准 |
+| 补发积压投递的真实代价（启动路径） | §3 第 4 步、§11.4 | **已核实（2026-09-18，本机实测）：它就是"重启好慢"的全部。** `komo gateway restart` 9.0s：bootout + 等待 launchctl 卸完 + bootstrap 只占 0.22s（分别 6ms / 220ms / 11ms），**约 5.1s 花在渠道起来时的按平台补发、2.9s 花在启动时的整体补发**——两者都在 "Gateway 就绪" 之前同步跑，每条 pending 一个平台往返（飞书 ~290ms），而当时积压的投递因为卡片被平台拒（下一行）永远送不出去。改成就绪之后后台跑之后：**2.7s**，其中进程启动到就绪 1.8s。剩余 1.25s 是启动时的 embedding 维度探测（本地 ollama 往返），与补发无关，未动 |
+| 飞书卡片 2.0 支持哪些组件 | §11.3 卡片渲染 | **已核实（2026-09-18，官方不兼容变更 + 线上报文）：2.0 不再支持 `note` 组件与 `action` 模块**，且 2.0 对不认识的组件是**整张卡打回**而不是忽略。线上表现：每一个审批请求都被拒（`http 400 / code 230099`，`ErrCode 200861 unsupported tag note`），**审批一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上——审批的主入口（§11.3）整个是死的，操作者只看得到"等待审批"的 Run。替代写法已按官方给的来：备注 = 普通文本组件 + `notation` 字号 + 灰色；按钮行 = `column_set` 每列一个 button，那一块带固定 `element_id` 供决定后整块摘掉 |

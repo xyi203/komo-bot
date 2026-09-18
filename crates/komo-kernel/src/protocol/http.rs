@@ -403,6 +403,36 @@ pub struct ApprovalDecisionResponse {
     pub already_decided: bool,
 }
 
+/// `POST /v1/approvals/decisions`：**一次答一批**（§11.3 的 `/approve all`）。
+///
+/// 一条 Run 里连着几个 shell 命令、几个 Run 各自卡在等待上——一次按键答一批是操作者
+/// 真正要的那件事。它**不是**一条决定覆盖多个计划：名单里每一条各自落一条决定、各自
+/// 排一条审计事件（§7.4），与逐条答完全等价，只是不必按 N 次键。
+///
+/// 名单由**发起方列出**（TUI 拿手上的待处理集合、CLI 与聊天先 `list_pending`），协议里
+/// 没有"全部"这个词：服务端不替操作者决定"哪些算全部"——那会在答复到达之前，把这之后
+/// 新出现的请求也一起答掉。
+///
+/// **范围固定为本次调用**（请求体里没有 `scope`）：范围授权绑的是一份具体的计划——shell
+/// 绑的是整条命令、Python 绑的是模块与版本（`policy::scope_for`）——一批互不相干的计划
+/// 共用一个范围，只能是替操作者猜一个他没看过的答复。要范围就逐条答
+/// `POST /v1/approvals/{id}/decision`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalBatchDecisionRequest {
+    pub approvals: Vec<ApprovalId>,
+    pub approved: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<RequestKey>,
+}
+
+/// 一批答复的结果。`decisions` 与请求同序；点了名却没有的那些单独列出，不让整批失败。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovalBatchDecisionResponse {
+    pub decisions: Vec<ApprovalDecisionResponse>,
+    #[serde(default)]
+    pub missing: Vec<ApprovalId>,
+}
+
 // ---- /v1/cron ----
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

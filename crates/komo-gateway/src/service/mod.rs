@@ -144,6 +144,18 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // 2. 取得实例锁。**拿不到就是有别的实例在跑**，不删仍有效的锁（§3）。
     let lock = InstanceLock::acquire(&home, &instance_id, clock.now())?;
 
+    // 2b. 数据目录的骨架。**`workspaces/` 必须真的存在**：它是会话默认的 cwd（§12），
+    //     少了它每一次 shell / python 的 spawn 都以 ENOENT 失败，而报错只会说是程序
+    //     起不来——一个把人引偏的结论。建不出来不让整台 Gateway 起来：别的工具照常，
+    //     这一条报在日志里（与渠道、向量端点的处理同一个取舍）。
+    if let Err(error) = std::fs::create_dir_all(&snapshot.paths.workspaces_dir) {
+        tracing::warn!(
+            dir = %snapshot.paths.workspaces_dir.display(),
+            %error,
+            "工作目录建不出来，shell / python 会在这一步上失败"
+        );
+    }
+
     // 3. 打开 state.db（Turso 对 db 文件持进程独占锁，所以这一步也再证一次只有一个）。
     let db = Db::connect(&snapshot.start_only.db_path)
         .await
@@ -272,12 +284,11 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
 
     // 10. 渠道与 HTTP。
     //
-    // **补发在渠道登记之后**：`DeliveryLog::send_recorded` 找不到发送口就把行原样留在
-    // pending，所以在 `start_all` 之前冲刷等于什么都没做（W5 验收 BUG(3)）。每个渠道起来
-    // 时还会按自己的平台冲刷一次（`ChannelSupervisor::start`），这里补的是"渠道都起完了"
-    // 之后的那一遍，包括没有工厂、由别处登记发送口的情形。
+    // **补发不在就绪之前**：它是网络 I/O，一条 pending 一个平台往返，积压多少就等多久。
+    // 它曾经同步跑在 "Gateway 就绪" 之前，于是卡住的投递直接把重启拖长——10 条卡住的
+    // 投递是 3 秒，几百条能拖过客户端 60 秒的就绪超时（§11.4 的补发等得起：投递记录先
+    // 写后发，按 `DeliveryId` 幂等，晚几十毫秒没有代价）。
     state.supervisor.start_all(&state).await;
-    state.notifier.flush(None).await;
     let app = crate::http::router(Api::new(Arc::clone(&state)));
     let serving = shutdown.clone();
     tokio::spawn(async move {
@@ -292,6 +303,18 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     });
 
     tracing::info!(%base_url, instance = %instance_id, "Gateway 就绪");
+
+    // 11. 补发积压的投递。**渠道全部登记之后**才有意义：`DeliveryLog::send_recorded`
+    //     找不到发送口就把行原样留在 pending，所以在 `start_all` 之前冲刷等于什么都没干
+    //     （W5 验收 BUG(3)）。这一步补的是"渠道都起完了"之后的那一遍，包括没有工厂、
+    //     由别处登记发送口的情形。
+    {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            state.notifier.flush(None).await;
+        });
+    }
+
     Ok(Running {
         state,
         dispatcher,

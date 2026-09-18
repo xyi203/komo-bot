@@ -14,12 +14,12 @@ mod keys;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::protocol::http::{
-    ApprovalRecord, EventPage, ModelMenuEntry, PendingItem, ResumeResponse, SessionDetail,
-    SubmitRunResponse,
+    ApprovalBatchDecisionResponse, ApprovalRecord, EventPage, ModelMenuEntry, PendingItem,
+    ResumeResponse, SessionDetail, SubmitRunResponse,
 };
 use komo_kernel::protocol::sse::SseFrame;
 use komo_kernel::types::chat::ApprovalScope;
@@ -100,6 +100,8 @@ pub enum ServerEvent {
         approved: bool,
         already_decided: bool,
     },
+    /// `POST /v1/approvals/decisions` 的回执（一批）。
+    BatchSettled(Box<ApprovalBatchDecisionResponse>),
     /// `POST /v1/sessions/{id}/resume` 的结果（§8.8 的「2 个任务已接续，1 个等待审批」）。
     Resumed(Box<ResumeResponse>),
     /// `GET /v1/sessions/{id}` 的结果。
@@ -145,6 +147,12 @@ pub enum Effect {
         approval: ApprovalId,
         approved: bool,
         scope: ApprovalScope,
+        request_key: RequestKey,
+    },
+    /// 一次答一批（§11.3 的 `/approve all`）：名单由状态机列出，各按本次调用。
+    DecideMany {
+        approvals: Vec<ApprovalId>,
+        approved: bool,
         request_key: RequestKey,
     },
     FetchPending,
@@ -278,8 +286,24 @@ pub struct App {
     /// Enter 后立即显示；收到同一 `request_key` 的 `run.accepted` 后移除。
     pub pending_submissions: Vec<PendingSubmission>,
     pub approval: Option<ApprovalModal>,
-    /// 还没取到详情的待处理审批（`approval.pending` 只给 id）。
-    pub pending_short_ids: BTreeMap<ApprovalId, komo_kernel::types::ids::ShortId>,
+    /// **待处理审批的权威清单**（`GET /v1/approvals` 那一份，按 id）。
+    ///
+    /// 不从本会话的事件折：审批可以属于**别的会话**——定时任务那条、聊天里那条、别的
+    /// TUI 里开的那个——而操作者问的是"现在有谁在等我"。折出来的那份只覆盖本会话，
+    /// 于是"打开 TUI 一条待审批也看不到"和"`/approve all` 说没有待处理、而 `/pending`
+    /// 列着三条"会同时成立。
+    ///
+    /// `ApprovalRecord` 整个存着（不只是短 ID）：状态行的条数、`a` 键的名单、`/pending`
+    /// 的清单都从这一份走，三处不可能各有各的答案。
+    pub pending: BTreeMap<ApprovalId, ApprovalRecord>,
+    /// **这个客户端自己答过、还在等回执的那些**。
+    ///
+    /// 决定会在 SSE 上以 `approval_decided` 回来（网关每条决定推一帧），而它和"别人在
+    /// 别处答的"长得一模一样。没有这一张表，自己按下 `y` 之后收到的第一帧会被说成
+    /// 「这条审批在别处批准了」——一句假话，而且是在用户刚按完键的下一秒。
+    pub answering: BTreeSet<ApprovalId>,
+    /// `/pending` 问了一句——空清单也要有回答，别的时候不印。
+    pub asking_pending: bool,
     pub current_run: Option<RunId>,
     /// 正在打字的那一段（[`Draft`]）。
     pub draft: Option<Draft>,
@@ -323,7 +347,9 @@ impl App {
             notices: Vec::new(),
             pending_submissions: Vec::new(),
             approval: None,
-            pending_short_ids: BTreeMap::new(),
+            pending: BTreeMap::new(),
+            answering: BTreeSet::new(),
+            asking_pending: false,
             current_run: None,
             draft: None,
             runs: BTreeMap::new(),
@@ -405,9 +431,9 @@ impl App {
         }
     }
 
-    /// 界面上还没决定的审批有几条。
+    /// 界面上还没决定的审批有几条——**全部会话的**，不是本会话的。
     pub fn pending_count(&self) -> usize {
-        self.surface.pending_approvals.len()
+        self.pending.len()
     }
 
     /// 有审批弹窗时输入框禁用（§11.3：先把眼前这件事答了）。
@@ -415,14 +441,42 @@ impl App {
         self.approval.is_none() && !self.phase.is_backfilling()
     }
 
-    pub fn input_hint(&self) -> &'static str {
-        if self.approval.is_some() {
-            "有待批准的操作——先 y / r 批准或 n / Esc 拒绝"
-        } else if self.phase.is_backfilling() {
-            "正在补读历史……"
-        } else {
-            "Enter 发送 · Shift/Alt-Enter 或 Ctrl-J 换行 · Ctrl-T 展开工具 · / 看命令"
+    pub fn input_hint(&self) -> String {
+        if let Some(modal) = &self.approval {
+            // 提示里只列**这条请求真的能用**的键：`r` 是 Policy 标了可范围化才有的，
+            // 这一个请求没有时把它写出来，等于教人按一个没反应的键（弹窗底栏的规则
+            // 一样，见 `ApprovalModal::keys_hint`）。
+            let mut keys = vec!["y 本条"];
+            if modal.allows_run_scope() {
+                keys.push("r 本条 Run 范围");
+            }
+            if self.pending_count() > 1 {
+                keys.push("a 全部批准");
+            }
+            keys.push("n / Esc 拒绝本条");
+            return format!(
+                "{}——待批准 {} 条 · {}",
+                if self.pending_count() > 1 {
+                    "待批准的操作"
+                } else {
+                    "有待批准的操作"
+                },
+                self.pending_count(),
+                keys.join(" · ")
+            );
         }
+        if self.pending_count() > 0 {
+            // 没弹窗却有等待中的审批：审批请求还没投到（断线、投递失败），但操作者手上有
+            // `komo approval list` 的短 ID，也有命令行。**说出路，不要只说状态**。
+            return format!(
+                "有 {} 条待批复——/pending 看清单，/approve <短ID> 批一条，/approve all 全批",
+                self.pending_count()
+            );
+        }
+        if self.phase.is_backfilling() {
+            return "正在补读历史……".to_string();
+        }
+        "Enter 发送 · Shift/Alt-Enter 或 Ctrl-J 换行 · Ctrl-T 展开工具 · / 看命令".to_string()
     }
 
     /// 命令面板的候选。
@@ -513,16 +567,19 @@ pub fn resume_summary(response: &ResumeResponse) -> String {
     }
 }
 
-fn status_summary(detail: &SessionDetail) -> String {
+/// `/status` 那一行。
+///
+/// 待审批数用**清单那一份**（全部会话），不是 `GET /v1/sessions/{id}` 里本会话那几条：
+/// 状态行、`a` 的名单、`/pending` 都读清单，四个地方各说一个数就没人信了。
+fn status_summary(detail: &SessionDetail, pending: usize) -> String {
     let status = detail
         .summary
         .current_status
         .map(status_text)
         .unwrap_or("空闲");
     format!(
-        "{status} · 未完成 {} · 待审批 {}",
-        detail.unfinished.len(),
-        detail.pending_approvals.len()
+        "{status} · 未完成 {} · 待审批 {pending}",
+        detail.unfinished.len()
     )
 }
 

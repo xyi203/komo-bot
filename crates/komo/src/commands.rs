@@ -13,8 +13,9 @@ use komo_gateway::config::{LoadOptions, load_config};
 use komo_gateway::skills::{OfferContext, SkillRegistry};
 use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
-    ApprovalDecisionRequest, ApprovalListQuery, CancelRunRequest, CreateCronRequest,
-    MemoryListQuery, MemoryRevisionRequest, RebuildIndexRequest, UpdateCronRequest,
+    ApprovalBatchDecisionRequest, ApprovalDecisionRequest, ApprovalListQuery, CancelRunRequest,
+    CreateCronRequest, MemoryListQuery, MemoryRevisionRequest, RebuildIndexRequest,
+    UpdateCronRequest,
 };
 use komo_kernel::types::chat::ApprovalScope;
 use komo_kernel::types::ids::{ApprovalId, CronJobId, MemoryId, RunId, ShortId};
@@ -106,6 +107,45 @@ pub async fn approval_decide(client: &KomoClient, id: &str, approved: bool) -> O
             ""
         }
     ))
+}
+
+/// 一次答一批待处理（`komo approval approve --all` / `reject --all`，§11.3 的
+/// `/approve all`）。
+///
+/// 名单**先列出来再答复**：协议里没有"全部"这个词（见 `ApprovalBatchDecisionRequest`
+/// 的注释），而操作者按下的这一刻看到的就是 `komo approval list` 的那一份。名单进请求
+/// 键，所以同一条命令重发还是同一批、不会多答一条在这之间新出现的请求。
+pub async fn approval_decide_all(client: &KomoClient, approved: bool) -> Outcome {
+    let pending = client
+        .approvals(&ApprovalListQuery::default())
+        .await
+        .map_err(failed)?
+        .approvals;
+    if pending.is_empty() {
+        return Ok("没有待处理的审批".into());
+    }
+    let approvals: Vec<ApprovalId> = pending
+        .iter()
+        .map(|record| record.approval.clone())
+        .collect();
+    let verdict = if approved { "approve" } else { "reject" };
+    let names = approvals
+        .iter()
+        .map(ApprovalId::as_str)
+        .collect::<Vec<_>>()
+        .join(",");
+    let response = client
+        .decide_approvals(&ApprovalBatchDecisionRequest {
+            approvals,
+            approved,
+            request_key: Some(RequestKeys::named(
+                "cli-decisions",
+                &format!("{verdict}:{names}"),
+            )),
+        })
+        .await
+        .map_err(failed)?;
+    Ok(render::approval_batch(&response))
 }
 
 /// 命令行上给的可能是 4 位短 ID，也可能是完整 ID。

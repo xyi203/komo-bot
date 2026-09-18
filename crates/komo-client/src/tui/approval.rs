@@ -39,12 +39,22 @@ impl ApprovalModal {
         self.record.scopes.contains(&ApprovalScope::Run)
     }
 
-    /// 底部那一行提示，按键随 `scopes` 变——列一个按下去没反应的键比不列它更糟。
-    pub fn keys_hint(&self) -> String {
-        if self.allows_run_scope() {
-            "y 批准本次 · r 批准本次 Run 范围 · n / Esc 拒绝".into()
+    /// 底部那一行提示，按键随 `scopes` 与待处理条数变——列一个按下去没反应的键比不列
+    /// 它更糟。
+    ///
+    /// `pending` 是**此刻待处理的全部条数**（含眼前这条）：`a` 答的是全部，条数得摆在
+    /// 键旁边——"全部"是 1 条还是 6 条，是按下去之前唯一要看清的事。
+    pub fn keys_hint(&self, pending: usize) -> String {
+        let batch = if pending > 1 {
+            format!("a 全部批准（{pending} 条，各按本次调用） · ")
         } else {
-            "y 批准本次 · n / Esc 拒绝　（这条请求不可范围化）".into()
+            // 只有这一条时 `a` 与 `y` 同义，列它只会让人以为还有什么没批。
+            String::new()
+        };
+        if self.allows_run_scope() {
+            format!("y 批准本次 · r 批准本次 Run 范围 · {batch}n / Esc 拒绝")
+        } else {
+            format!("y 批准本次 · {batch}n / Esc 拒绝　（这条请求不可范围化）")
         }
     }
 
@@ -424,12 +434,28 @@ mod tests {
         let mut record = approval_record();
         let modal = ApprovalModal::new(record.clone());
         assert!(modal.allows_run_scope());
-        assert!(modal.keys_hint().contains('r'));
+        assert!(modal.keys_hint(1).contains('r'));
 
         record.scopes = vec![ApprovalScope::Once];
         let modal = ApprovalModal::new(record);
         assert!(!modal.allows_run_scope());
-        assert!(modal.keys_hint().contains("不可范围化"));
+        assert!(modal.keys_hint(1).contains("不可范围化"));
+    }
+
+    /// 「全部批准」那个键只在**真的还有别的**待处理时出现，而且带着条数（§11.3）。
+    ///
+    /// 一条时它和 `y` 同义，列出来只会让人以为还有什么没批；多条时不写条数，按下去
+    /// 之前就不知道这一次要替几条计划签字。
+    #[test]
+    fn the_batch_key_appears_with_the_count_only_when_there_is_more_than_one() {
+        let modal = ApprovalModal::new(approval_record());
+        let alone = modal.keys_hint(1);
+        assert!(!alone.contains("全部批准"), "{alone}");
+
+        let together = modal.keys_hint(3);
+        assert!(together.contains("全部批准"), "{together}");
+        assert!(together.contains('3'), "{together}");
+        assert!(together.contains("各按本次调用"), "{together}");
     }
 
     #[test]

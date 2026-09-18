@@ -134,12 +134,20 @@ enum ApprovalCommand {
     /// 批准。
     Approve {
         /// 审批短 ID。
-        approval_id: String,
+        #[arg(required_unless_present = "all")]
+        approval_id: Option<String>,
+        /// 待处理的**全部**：一次答一批（等价于聊天里的 `/approve all`）。
+        #[arg(long)]
+        all: bool,
     },
     /// 拒绝。
     Reject {
         /// 审批短 ID。
-        approval_id: String,
+        #[arg(required_unless_present = "all")]
+        approval_id: Option<String>,
+        /// 待处理的**全部**：一次答一批（等价于聊天里的 `/reject all`）。
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -488,12 +496,14 @@ async fn operator(
             ApprovalCommand::Show { approval_id } => {
                 commands::approval_show(client, &approval_id).await
             }
-            ApprovalCommand::Approve { approval_id } => {
-                commands::approval_decide(client, &approval_id, true).await
-            }
-            ApprovalCommand::Reject { approval_id } => {
-                commands::approval_decide(client, &approval_id, false).await
-            }
+            ApprovalCommand::Approve { approval_id, all } => match (approval_id, all) {
+                (Some(id), _) => commands::approval_decide(client, &id, true).await,
+                (None, _) => commands::approval_decide_all(client, true).await,
+            },
+            ApprovalCommand::Reject { approval_id, all } => match (approval_id, all) {
+                (Some(id), _) => commands::approval_decide(client, &id, false).await,
+                (None, _) => commands::approval_decide_all(client, false).await,
+            },
         },
         Command::Cron { action } => match action {
             CronCommand::Add(args) => {

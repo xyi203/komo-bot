@@ -53,6 +53,15 @@ impl RunStatus {
         !self.is_terminal()
     }
 
+    /// 还在排队等领取：输入**已经落盘、但还没进会话**（§8.5 的接收顺序 + §8.4 的次序）。
+    ///
+    /// 回放窗口要跳过这一种的用户消息。照搬日志位置发出去，provider 看到的是"助手要了
+    /// 一次调用、紧接着另一个 Run 的用户消息、最后才是那次调用的输出"，直接 400
+    /// （`No tool output found for tool call …`）。
+    pub fn awaits_claim(self) -> bool {
+        matches!(self, RunStatus::Ingesting | RunStatus::Queued)
+    }
+
     /// 正在等人或等时钟，已经让出执行名额。
     pub fn is_waiting(self) -> bool {
         matches!(

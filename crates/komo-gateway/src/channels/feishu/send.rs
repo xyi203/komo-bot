@@ -261,7 +261,7 @@ mod tests {
             .unwrap()
             .last()
             .unwrap()
-            .get("actions")
+            .get("columns")
             .and_then(Value::as_array)
             .expect("两个按钮");
         assert_eq!(actions.len(), 2);

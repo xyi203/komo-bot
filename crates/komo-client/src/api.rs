@@ -237,6 +237,14 @@ impl KomoClient {
             .await
     }
 
+    /// 一次答一批（§11.3 的 `/approve all`）。名单由调用方列出——协议里没有"全部"。
+    pub async fn decide_approvals(
+        &self,
+        request: &ApprovalBatchDecisionRequest,
+    ) -> ClientResult<ApprovalBatchDecisionResponse> {
+        self.post("/v1/approvals/decisions", request).await
+    }
+
     // ---- /v1/cron ----
 
     pub async fn cron_list(&self) -> ClientResult<CronListResponse> {

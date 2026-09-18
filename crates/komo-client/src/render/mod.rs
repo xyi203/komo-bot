@@ -9,9 +9,10 @@
 use komo_kernel::cron::{FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, Trigger};
 use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
-    ApprovalListResponse, ApprovalRecord, ConfigCheckResponse, ConfigReloadResponse,
-    CronListResponse, HealthResponse, IndexState, MemoryIndexStatus, MemoryListResponse,
-    ModelsResponse, RunDetail, SessionListResponse, SessionSummary, ToolCallSummary,
+    ApprovalBatchDecisionResponse, ApprovalListResponse, ApprovalRecord, ConfigCheckResponse,
+    ConfigReloadResponse, CronListResponse, HealthResponse, IndexState, MemoryIndexStatus,
+    MemoryListResponse, ModelsResponse, RunDetail, SessionListResponse, SessionSummary,
+    ToolCallSummary,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
@@ -204,6 +205,48 @@ pub fn approval_list(response: &ApprovalListResponse) -> String {
     }
     out.push(String::new());
     out.push("`komo approval approve <短ID> [run]` / `komo approval reject <短ID>`".into());
+    out.push(
+        "一条一条答太慢时：`komo approval approve --all` / `reject --all`（各按本次调用）".into(),
+    );
+    out.join("\n")
+}
+
+/// `komo approval approve --all` / `reject --all`（§11.3 的 `/approve all`）。
+///
+/// 逐条印结果，不只报个数：批里某一条可能早就决定过了（`already_decided`），而它**原来
+/// 那个决定**说不定与这一批相反——只印一行"完成"就把那一条藏起来了。
+pub fn approval_batch(response: &ApprovalBatchDecisionResponse) -> String {
+    if response.decisions.is_empty() && response.missing.is_empty() {
+        return "没有待处理的审批".into();
+    }
+    let mut out = Vec::new();
+    for decision in &response.decisions {
+        out.push(format!(
+            "{} {}{}",
+            decision.short_id,
+            if decision.decision.approved {
+                "已批准"
+            } else {
+                "已拒绝"
+            },
+            if decision.already_decided {
+                "（早已决定，这次没有改变什么）"
+            } else {
+                ""
+            }
+        ));
+    }
+    for missing in &response.missing {
+        out.push(format!("{missing} 没有这条审批"));
+    }
+    if !response.decisions.is_empty() {
+        out.push(String::new());
+        out.push(
+            "以上各按**本次调用**。范围授权（§7.2 的本次 Run / Cron Job）绑的是单份计划，\
+             逐条来：`/approve <短ID> run`"
+                .into(),
+        );
+    }
     out.join("\n")
 }
 

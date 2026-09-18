@@ -24,10 +24,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use komo_kernel::protocol::{ChatCommand, InboundAck, InboundMessage};
+use komo_kernel::protocol::{ApprovalTarget, ChatCommand, InboundAck, InboundMessage};
 use komo_kernel::traits::{GatewayError, Inbound};
 use komo_kernel::types::chat::{ApprovalScope, ChannelPeer, ChannelPlatform, PeerId, Principal};
-use komo_kernel::types::ids::{RequestKey, RunId, SessionId, ShortId};
+use komo_kernel::types::ids::{ApprovalId, RequestKey, RunId, SessionId, ShortId};
 use komo_kernel::types::status::RunStatus;
 
 use crate::service::state::{GatewayState, HOME_ORIGIN};
@@ -191,12 +191,11 @@ impl Dispatcher {
                     text: format!("{run} 现在是 {}。", status_text(status)),
                 })
             }
-            ChatCommand::Approve { short_id, scope } => {
-                self.decide(short_id, scope, true, principal, &msg.peer)
-                    .await
+            ChatCommand::Approve { target, scope } => {
+                self.decide(target, scope, true, principal, &msg.peer).await
             }
-            ChatCommand::Reject { short_id } => {
-                self.decide(short_id, ApprovalScope::Once, false, principal, &msg.peer)
+            ChatCommand::Reject { target } => {
+                self.decide(target, ApprovalScope::Once, false, principal, &msg.peer)
                     .await
             }
         }
@@ -205,24 +204,27 @@ impl Dispatcher {
     /// `/approve` / `/reject`：**审批命令只接受操作者**（上面已经挡过）。
     async fn decide(
         &self,
-        short_id: Option<ShortId>,
+        target: ApprovalTarget,
         scope: ApprovalScope,
         approved: bool,
         principal: &Principal,
         from: &ChannelPeer,
     ) -> Result<InboundAck, GatewayError> {
-        let record = match short_id {
+        if target == ApprovalTarget::All {
+            return self.decide_all(scope, approved, principal).await;
+        }
+        let record = match target {
             // **`find_latest_by_short_id`，不是 `find_by_short_id`**：后者只看待处理集合
             // （§11.3 的短 ID 就活在那个集合里），于是第二次点击查到 `None`，得到的是
             // 「没有这条」而不是「已决定」。§11.3 的命令表要求「已决定的返回原决定，
             // 不报错」，§14 的验证列逐字要求「同一人连点两次第二次得到『已决定』」。
-            Some(short) => {
+            ApprovalTarget::One(short) => {
                 self.state
                     .approval_repo
                     .find_latest_by_short_id(&short)
                     .await?
             }
-            None => {
+            ApprovalTarget::Only => {
                 // 「无 ID 时只有**恰好一个**待处理请求才生效；多于一个则列出并要求指明」
                 let pending = self.state.approval_repo.list_pending(None).await?;
                 match pending.len() {
@@ -235,7 +237,7 @@ impl Dispatcher {
                     _ => {
                         return Ok(InboundAck::Replied {
                             text: format!(
-                                "有 {} 条待处理，请指明是哪一条：\n{}",
+                                "有 {} 条待处理，请指明是哪一条（`/approve all` 是全答）：\n{}",
                                 pending.len(),
                                 render_pending(&pending)
                             ),
@@ -243,6 +245,7 @@ impl Dispatcher {
                     }
                 }
             }
+            ApprovalTarget::All => unreachable!("`all` 在上面就分流了"),
         };
         let Some(record) = record else {
             return Ok(InboundAck::Replied {
@@ -285,6 +288,57 @@ impl Dispatcher {
                 )
             },
         })
+    }
+
+    /// `/approve all` / `/reject all`：一次答一批（§11.3）。
+    ///
+    /// 名单**在这里列**——协议里没有"全部"这个词（见 `ApprovalBatchDecisionRequest`
+    /// 的注释：那会在答复到达之前，把这之后新出现的请求也一起答掉）。范围固定成"本次
+    /// 调用"：一条命令替一批互不相干的计划选一个范围，是在替操作者猜一件他没看过的事。
+    /// 他说了范围时，回执要**说出来它没被采纳**，而不是静默降级。
+    async fn decide_all(
+        &self,
+        scope: ApprovalScope,
+        approved: bool,
+        principal: &Principal,
+    ) -> Result<InboundAck, GatewayError> {
+        let pending = self.state.approval_repo.list_pending(None).await?;
+        if pending.is_empty() {
+            return Ok(InboundAck::Replied {
+                text: "现在没有待处理的审批。".into(),
+            });
+        }
+        let approvals: Vec<ApprovalId> = pending
+            .iter()
+            .map(|record| record.approval.clone())
+            .collect();
+        let response = self
+            .state
+            .decide_approvals(&approvals, approved, Some(principal.id().clone()))
+            .await?;
+        let names: Vec<String> = response
+            .decisions
+            .iter()
+            .map(|decision| decision.short_id.to_string())
+            .collect();
+        let mut text = format!(
+            "{} {} 条（各按本次调用）：{}。",
+            decision_text(approved),
+            names.len(),
+            names.join(" ")
+        );
+        if scope != ApprovalScope::Once {
+            text.push_str(
+                "\n批量答复不带范围授权——范围绑的是单份计划，要范围请逐条 `/approve <短ID> run`。",
+            );
+        }
+        if !response.missing.is_empty() {
+            text.push_str(&format!(
+                "\n{} 条在答复前已经不在待处理集合里，跳过。",
+                response.missing.len()
+            ));
+        }
+        Ok(InboundAck::Replied { text })
     }
 
     async fn current_run(&self, session: &SessionId) -> Result<Option<RunId>, GatewayError> {
@@ -469,6 +523,21 @@ fn render_pending(pending: &[komo_kernel::protocol::http::ApprovalRecord]) -> St
         .join("\n")
 }
 
+/// `/approve` / `/reject` 后面那一段说的是**哪一条**。
+///
+/// `all` 是个词，不是短 ID：`ShortId::parse("all")` 会失败，按老规矩"认不出来的词当没
+/// 写"就落进 `Only`——那在三条待处理时会回一句"请指明"，而不是把它们全答了。所以这个
+/// 词要先认出来。
+fn parse_target(rest: &[&str]) -> ApprovalTarget {
+    if rest.iter().any(|word| word.eq_ignore_ascii_case("all")) {
+        return ApprovalTarget::All;
+    }
+    match rest.first().and_then(|raw| ShortId::parse(raw)) {
+        Some(short) => ApprovalTarget::One(short),
+        None => ApprovalTarget::Only,
+    }
+}
+
 /// 三个渠道都认的那几条命令（§11.3）。解析在这里，渲染在渠道。
 pub fn parse_command(text: &str) -> Option<ChatCommand> {
     let trimmed = text.trim();
@@ -487,7 +556,7 @@ pub fn parse_command(text: &str) -> Option<ChatCommand> {
     let rest: Vec<&str> = parts.collect();
     match name.as_str() {
         "approve" => {
-            let short_id = rest.first().and_then(|raw| ShortId::parse(raw));
+            let target = parse_target(&rest);
             // `/approve <id> run` 是 §11.3 那张表里的一行；`cron` 是 §7.2 第三种范围
             // 的同一个形状——三个渠道的渲染里已经这么写了（`render::*::approval`）。
             // 认不出来的词一律当**没写**，也就是 `Once`：把一个不认识的词理解成一个
@@ -501,10 +570,10 @@ pub fn parse_command(text: &str) -> Option<ChatCommand> {
             } else {
                 ApprovalScope::Once
             };
-            Some(ChatCommand::Approve { short_id, scope })
+            Some(ChatCommand::Approve { target, scope })
         }
         "reject" | "deny" => Some(ChatCommand::Reject {
-            short_id: rest.first().and_then(|raw| ShortId::parse(raw)),
+            target: parse_target(&rest),
         }),
         "pending" => Some(ChatCommand::Pending),
         "new" => Some(ChatCommand::New),
@@ -545,21 +614,51 @@ mod tests {
         assert_eq!(
             parse_command("/approve 7K2M"),
             Some(ChatCommand::Approve {
-                short_id: ShortId::parse("7K2M"),
+                target: ApprovalTarget::One(ShortId::parse("7K2M").expect("短 ID")),
                 scope: ApprovalScope::Once,
             })
         );
         assert_eq!(
             parse_command("/approve 7K2M run"),
             Some(ChatCommand::Approve {
-                short_id: ShortId::parse("7K2M"),
+                target: ApprovalTarget::One(ShortId::parse("7K2M").expect("短 ID")),
                 scope: ApprovalScope::Run,
             })
         );
         assert_eq!(
             parse_command("/approve"),
             Some(ChatCommand::Approve {
-                short_id: None,
+                target: ApprovalTarget::Only,
+                scope: ApprovalScope::Once,
+            })
+        );
+    }
+
+    /// `/approve all` 是**可以批量答**（§11.3），不是"这条叫 all 的短 ID 不存在"。
+    ///
+    /// 少了 `all` 这个词的识别，`ShortId::parse("all")` 失败 → 按"当没写"落进 `Only`，
+    /// 于是它回的是"有 3 条待处理，请指明"——一句既不说明能批量、也不说 `all` 拼错了
+    /// 的话，而它正是操作者看见三条待审批时最会打的那一句。
+    #[test]
+    fn approve_all_is_a_batch_not_an_unreadable_short_id() {
+        assert_eq!(
+            parse_command("/approve all"),
+            Some(ChatCommand::Approve {
+                target: ApprovalTarget::All,
+                scope: ApprovalScope::Once,
+            })
+        );
+        assert_eq!(
+            parse_command("/reject all"),
+            Some(ChatCommand::Reject {
+                target: ApprovalTarget::All,
+            })
+        );
+        // 大小写与位置都不重要——它是个词，不是位置参数。
+        assert_eq!(
+            parse_command("/approve ALL"),
+            Some(ChatCommand::Approve {
+                target: ApprovalTarget::All,
                 scope: ApprovalScope::Once,
             })
         );

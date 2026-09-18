@@ -146,7 +146,9 @@ pub fn write_home_with(home: &Path, config: &str, env: &str, policy: Option<&str
             let _ = std::fs::remove_file(home.join("policy.toml"));
         }
     }
-    std::fs::create_dir_all(home.join("workspaces")).expect("工作目录");
+    // **故意不建 `workspaces/`**：它是数据目录骨架的一部分，该由 Gateway 自己在启动时
+    // 建（§12）。这里替它建过，于是生产路径上少了那一步也一直看不出来——每一个 shell /
+    // python 调用都在报"程序起不来"，而真正不在的是会话 cwd。
 }
 
 /// 同上，带一份空规则表（`rules = []`）。
@@ -163,12 +165,15 @@ pub struct SentMessage {
     pub outbound: Outbound,
 }
 
-/// 一个内存发送口：`send` 记在 `sent` 里，可以被调成"此刻推不出去"。
+/// 一个内存发送口：`send` 记在 `sent` 里，可以被调成"此刻推不出去"、也可以被调慢。
 #[derive(Debug)]
 pub struct MemSender {
     platform: ChannelPlatform,
     sent: Mutex<Vec<SentMessage>>,
     deferring: std::sync::atomic::AtomicBool,
+    /// 每条发送先睡这么久。**启动补发是网络 I/O**：这个旋钮让"积压多少就等多久"在测试
+    /// 里可复现（§11.4 的补发不得压在就绪之前）。
+    delay: Mutex<std::time::Duration>,
 }
 
 impl MemSender {
@@ -177,6 +182,7 @@ impl MemSender {
             platform,
             sent: Mutex::new(Vec::new()),
             deferring: std::sync::atomic::AtomicBool::new(false),
+            delay: Mutex::new(std::time::Duration::ZERO),
         })
     }
 
@@ -220,6 +226,11 @@ impl MemSender {
         self.deferring
             .store(deferring, std::sync::atomic::Ordering::SeqCst);
     }
+
+    /// 每条发送先睡这么久——"跟平台往返一次"的替身。
+    pub fn slow_down(&self, delay: std::time::Duration) {
+        *self.delay.lock().expect("发送延迟") = delay;
+    }
 }
 
 #[async_trait]
@@ -229,6 +240,10 @@ impl ChannelSender for MemSender {
     }
 
     async fn send(&self, peer: &ChannelPeer, msg: Outbound) -> Result<SendOutcome, DeliverError> {
+        let delay = *self.delay.lock().expect("发送延迟");
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         if self.deferring.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(SendOutcome::Deferred {
                 reason: "没有回复令牌".into(),
@@ -345,6 +360,31 @@ pub fn call_round(
             name: tool.to_string(),
             arguments: args,
         }],
+        provider_blocks: None,
+        usage: TokenUsage::default(),
+        truncated: false,
+    })
+}
+
+/// 一轮里**多个**调用（`provider_id` / 工具名 / 参数各一份）。
+///
+/// 一轮多调用是一种独立形状：第一个调用停下时，后面的连 `tool.planned` 都还没有，
+/// 恢复要照样把它们跑完。
+pub fn multi_call_round(
+    n: u32,
+    calls: &[(&str, &str, serde_json::Value)],
+) -> Result<Round, LlmError> {
+    Ok(Round {
+        round: n,
+        text: None,
+        tool_calls: calls
+            .iter()
+            .map(|(provider_id, tool, args)| ProviderToolCall {
+                provider_call_id: provider_id.to_string(),
+                name: tool.to_string(),
+                arguments: args.clone(),
+            })
+            .collect(),
         provider_blocks: None,
         usage: TokenUsage::default(),
         truncated: false,
@@ -668,6 +708,15 @@ impl TestGateway {
     pub async fn pending_approval(&self) -> ApprovalRecord {
         let session = self.state().home_session().await.expect("home session");
         self.pending_approval_in(&session, None).await
+    }
+
+    /// 此刻待处理的审批。
+    pub async fn approvals(&self) -> Vec<ApprovalRecord> {
+        self.state()
+            .approval_repo
+            .list_pending(None)
+            .await
+            .expect("读得出")
     }
 
     pub async fn pending_approval_in(

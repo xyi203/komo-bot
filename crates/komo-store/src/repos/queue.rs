@@ -20,6 +20,13 @@ use toasty::Executor;
 use crate::db::{BoxFuture, Db, column_i64, column_string, map_toasty, to_ts};
 
 /// §8.7：领取一个 Run。`rows affected == 1` 是接管成功。
+///
+/// **同一 Session 里更早的那个没结束就不领**（`is_unfinished` 那段注释里的 §8.4）：
+/// `waiting_approval` / `waiting_retry` / `interrupted` / `needs_attention` 都是没结束。
+/// 少了这一条，后一个 Run 会越到前一个头上，而前一个停在的半轮里**那次调用还没有结果**
+/// ——回放窗口就会带着一个没有输出的 `function_call` 发给模型，provider 直接 400
+/// （`No tool output found for tool call …`）。序号用 id 比：UUIDv7 的字典序就是创建序，
+/// 而且是全序，不会出现两个 Run 互相挡住的死结。
 const CLAIM_SQL: &str = r#"
 UPDATE runs
    SET status           = 'running',
@@ -29,15 +36,28 @@ UPDATE runs
  WHERE id               = ?3
    AND claimed_by IS NULL
    AND status IN ('queued', 'waiting_retry')
+   AND NOT EXISTS (
+       SELECT 1 FROM runs AS earlier
+        WHERE earlier.session_id = runs.session_id
+          AND earlier.id         < runs.id
+          AND earlier.status NOT IN ('completed', 'failed', 'cancelled')
+   )
 "#;
 
-/// §8.7：候选由一条普通查询给出，领取一个一条。
+/// §8.7：候选由一条普通查询给出，领取一个一条。同一 Session 的次序约束与
+/// [`CLAIM_SQL`] 同源，两处都要有：候选筛选会把不该领的排掉，领取那一句才是最终守卫。
 const DUE_SQL: &str = r#"
-SELECT id FROM runs
- WHERE claimed_by IS NULL
-   AND status IN ('queued', 'waiting_retry')
-   AND next_retry_at <= ?1
- ORDER BY next_retry_at
+SELECT r.id FROM runs AS r
+ WHERE r.claimed_by IS NULL
+   AND r.status IN ('queued', 'waiting_retry')
+   AND r.next_retry_at <= ?1
+   AND NOT EXISTS (
+       SELECT 1 FROM runs AS earlier
+        WHERE earlier.session_id = r.session_id
+          AND earlier.id         < r.id
+          AND earlier.status NOT IN ('completed', 'failed', 'cancelled')
+   )
+ ORDER BY r.next_retry_at
  LIMIT ?2
 "#;
 
@@ -320,15 +340,17 @@ mod tests {
         (db, dir)
     }
 
-    async fn queued_run(db: &Db, id: &str) -> RunId {
+    async fn queued_run(db: &Db, session: &str, id: &str) -> RunId {
         let id = id.to_string();
+        let session = session.to_string();
         let for_tx = id.clone();
         db.with_write_retry(move |ex| {
             let id = for_tx.clone();
+            let session = session.clone();
             Box::pin(async move {
                 toasty::create!(RunRow {
                     id,
-                    session_id: "sess",
+                    session_id: session,
                     request_key: "k",
                     input_hash: "h",
                     input_event: None as Option<String>,
@@ -380,7 +402,8 @@ mod tests {
         let mut exactly_one = 0usize;
 
         for round in 0..ROUNDS {
-            let run = queued_run(&db, &format!("run-{round:04}")).await;
+            let run =
+                queued_run(&db, &format!("sess-{round:04}"), &format!("run-{round:04}")).await;
             let competitors = 2 + (round % 3);
 
             let mut handles = Vec::new();
@@ -426,7 +449,7 @@ mod tests {
         let (db, _dir) = temp().await;
         let queue = TursoRunQueue::new(db.clone());
         for index in 0..RUNS {
-            queued_run(&db, &format!("run-{index:04}")).await;
+            queued_run(&db, &format!("sess-{index:04}"), &format!("run-{index:04}")).await;
         }
 
         let mut handles = Vec::new();
@@ -452,13 +475,49 @@ mod tests {
         assert_eq!(unique.len(), RUNS, "每个 Run 都被领走了");
     }
 
+    /// §8.4：**同一 Session 里更早的那个没结束，后一个不越过它。**
+    ///
+    /// 少了这条约束，后一个 Run 会踩在前一个停住的半轮上：那次调用还没有结果，回放窗口
+    /// 只能带着一个没有输出的 `function_call` 发给模型，provider 直接 400
+    /// （`No tool output found for tool call …`）。停在哪一种未完成状态都算——这里用
+    /// 用户那条路径上的 `waiting_approval`。
+    #[tokio::test]
+    async fn a_later_run_in_the_same_session_waits_for_the_unfinished_one() {
+        let (db, _dir) = temp().await;
+        let queue = TursoRunQueue::new(db.clone());
+        let executor = ExecutorId::from_raw("exec-1");
+        let first = queued_run(&db, "sess-1", "run-0001").await;
+        let second = queued_run(&db, "sess-1", "run-0002").await;
+        let now = OffsetDateTime::now_utc();
+
+        let claimed = queue.claim(&executor).await.unwrap().expect("先来先领");
+        assert_eq!(claimed.run, first, "先来的先领");
+
+        queue
+            .commit_status(&claimed, &executor, RunStatus::WaitingApproval, now)
+            .await
+            .unwrap();
+        assert!(
+            queue.claim(&executor).await.unwrap().is_none(),
+            "前一个还停在等待审批，后一个不许领"
+        );
+
+        // 前一个收尾之后才轮到后一个。
+        queue
+            .commit_status(&claimed, &executor, RunStatus::Completed, now)
+            .await
+            .unwrap();
+        let next = queue.claim(&executor).await.unwrap().expect("轮到后一个了");
+        assert_eq!(next.run, second);
+    }
+
     /// 验收 ⑥：代次围栏——旧代次的状态提交 `rows affected == 0`，报
     /// [`LedgerError::StaleGeneration`]。
     #[tokio::test]
     async fn a_stale_generation_cannot_commit_state() {
         let (db, _dir) = temp().await;
         let queue = TursoRunQueue::new(db.clone());
-        let run = queued_run(&db, "run-fenced").await;
+        let run = queued_run(&db, "sess-fenced", "run-fenced").await;
 
         let first = ExecutorId::from_raw("exec-1");
         let claimed = queue
@@ -514,7 +573,7 @@ mod tests {
     async fn releasing_with_a_stale_generation_does_nothing() {
         let (db, _dir) = temp().await;
         let queue = TursoRunQueue::new(db.clone());
-        let run = queued_run(&db, "run-release").await;
+        let run = queued_run(&db, "sess-release", "run-release").await;
 
         let executor = ExecutorId::from_raw("exec-1");
         let claimed = queue.claim_run(&run, &executor).await.unwrap().unwrap();
@@ -541,8 +600,8 @@ mod tests {
     async fn startup_reclaims_runs_left_running_by_another_instance() {
         let (db, _dir) = temp().await;
         let queue = TursoRunQueue::new(db.clone());
-        let mine = queued_run(&db, "run-mine").await;
-        let theirs = queued_run(&db, "run-theirs").await;
+        let mine = queued_run(&db, "sess-mine", "run-mine").await;
+        let theirs = queued_run(&db, "sess-theirs", "run-theirs").await;
 
         let old = ExecutorId::from_raw("exec-old");
         let now = ExecutorId::from_raw("exec-now");
@@ -571,7 +630,7 @@ mod tests {
     async fn a_run_waiting_for_its_backoff_can_be_claimed_again_when_it_is_due() {
         let (db, _dir) = temp().await;
         let queue = TursoRunQueue::new(db.clone());
-        let run = queued_run(&db, "run-suspend").await;
+        let run = queued_run(&db, "sess-suspend", "run-suspend").await;
 
         let claimed = queue
             .claim_run(&run, &ExecutorId::from_raw("exec-1"))
@@ -613,7 +672,7 @@ mod tests {
     async fn a_run_waiting_for_an_approval_also_hands_back_its_claim() {
         let (db, _dir) = temp().await;
         let queue = TursoRunQueue::new(db.clone());
-        let run = queued_run(&db, "run-approval").await;
+        let run = queued_run(&db, "sess-approval", "run-approval").await;
         queue
             .claim_run(&run, &ExecutorId::from_raw("exec-1"))
             .await
@@ -675,7 +734,7 @@ mod tests {
     async fn a_run_waiting_for_its_backoff_is_not_due_yet() {
         let (db, _dir) = temp().await;
         let queue = TursoRunQueue::new(db.clone());
-        let run = queued_run(&db, "run-backoff").await;
+        let run = queued_run(&db, "sess-backoff", "run-backoff").await;
 
         let later = OffsetDateTime::now_utc() + time::Duration::hours(1);
         let claimed = queue

@@ -91,9 +91,19 @@ impl ChannelSupervisor {
 
         // 这个平台**此刻**才有了发送口：把它名下还没送到的投递补发掉（§11.4「重启后
         // pending 的行补发，按 DeliveryId 幂等」）。热重载重启某个渠道之后同样走这里。
-        let flushed = state.notifier.flush_platform(platform).await;
-        if flushed > 0 {
-            tracing::info!(%platform, flushed, "渠道起来后补发了积压的投递");
+        //
+        // **在后台跑**：补发是网络 I/O，一条一个平台往返，而这里在 `start_all` 里，
+        // 也就压在 "Gateway 就绪" 之前、并且压在这条渠道**开始收消息**之前。晚几十毫秒
+        // 没有代价——那几行是已经写好的投递记录，按 `DeliveryId` 结算，重来一次也不会
+        // 重复发（`DeliveryLog` 的补发锁保证两趟不并发）。
+        {
+            let state = Arc::clone(state);
+            tokio::spawn(async move {
+                let flushed = state.notifier.flush_platform(platform).await;
+                if flushed > 0 {
+                    tracing::info!(%platform, flushed, "渠道起来后补发了积压的投递");
+                }
+            });
         }
 
         let channel = Arc::clone(&built.channel);

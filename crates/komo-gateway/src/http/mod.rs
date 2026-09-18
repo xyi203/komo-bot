@@ -75,6 +75,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/runs/{id}", get(runs::detail))
         .route("/v1/runs/{id}/cancel", post(runs::cancel))
         .route("/v1/approvals", get(approvals::list))
+        .route("/v1/approvals/decisions", post(approvals::decide_batch))
         .route("/v1/approvals/{id}", get(approvals::show))
         .route("/v1/approvals/{id}/decision", post(approvals::decide))
         .route("/v1/cron", get(cron::list).post(cron::create))

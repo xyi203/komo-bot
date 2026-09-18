@@ -194,14 +194,21 @@ pub fn approval_card(presentation: &ApprovalPresentation) -> Value {
         elements.push(note(format!("有效期至 {}", format_time(valid_until))));
     }
 
+    // 按钮之外，把**文本命令**也写出来。
+    //
+    // 按钮要应用在开放平台开通卡片回调、并且回调真的投得到；而 ws 那一条路在 openlark
+    // 0.20.0 上对 `card` 帧是直接丢（`frame_handler.rs` 的 `"card" => skip`，见 §14），
+    // 所以"按钮点了没反应"是一种真实状态。文本命令走 `im.message.receive_v1`，不受它
+    // 影响——这句话是那张卡片在按钮不可用时**唯一**还指得出的路。
+    elements.push(note(format!(
+        "也可以直接回：/approve {short_id}（拒绝：/reject {short_id}）"
+    )));
+
     // 两个按钮。§11.3：**按钮只给"本次"**，范围授权用命令。
-    elements.push(json!({
-        "tag": "action",
-        "actions": [
-            button("批准", "primary", button_value(true, short_id)),
-            button("拒绝", "danger", button_value(false, short_id)),
-        ],
-    }));
+    elements.push(actions(vec![
+        button("批准", "primary", button_value(true, short_id)),
+        button("拒绝", "danger", button_value(false, short_id)),
+    ]));
 
     card(
         format!("🔐 待审批 · {short_id}"),
@@ -212,9 +219,9 @@ pub fn approval_card(presentation: &ApprovalPresentation) -> Value {
 
 /// 决定之后那张**无按钮**的卡片（§11.3：决定过的请求不该还长着可点的按钮）。
 ///
-/// 飞书没有"只去掉按钮"的接口，PATCH 换的是整张卡，所以它由原卡片派生：去掉 `action`
-/// 块、换掉标题、在末尾追加结论。原卡片不在手上时（重启之后那份进程内的账没了）退化
-/// 成一张只有结论的卡。
+/// 飞书没有"只去掉按钮"的接口，PATCH 换的是整张卡，所以它由原卡片派生：去掉按钮那一块
+/// 、换掉标题、在末尾追加结论。原卡片不在手上时（重启之后那份进程内的账没了）退化成
+/// 一张只有结论的卡。
 pub fn settled_card(
     original: Option<&Value>,
     short_id: &ShortId,
@@ -232,7 +239,11 @@ pub fn settled_card(
         .map(|elements| {
             elements
                 .iter()
-                .filter(|element| element.get("tag").and_then(Value::as_str) != Some("action"))
+                .filter(|element| {
+                    // 按 `element_id` 认按钮那一块：按钮嵌在 `column_set` 的 `column`
+                    // 里，按 `tag` 找要递归，而按 id 是一句话。
+                    element.get("element_id").and_then(Value::as_str) != Some(ACTIONS_ID)
+                })
                 .cloned()
                 .collect()
         })
@@ -279,10 +290,46 @@ fn markdown(content: impl Into<String>) -> Value {
     json!({ "tag": "markdown", "content": content.into() })
 }
 
+/// 按钮那一块的 `element_id`。`settled_card` 靠它把按钮整块摘掉。
+const ACTIONS_ID: &str = "approval_actions";
+
+/// 一行小字："原因：…"、"有效期至 …"、以及结论那一行。
+///
+/// **卡片 2.0 里没有 `note` 组件。** 飞书的 2.0 不兼容变更写得很直接：「2.0 结构不再
+/// 支持 note 组件与 action 模块（`tag` 为 `action`）」，并给出替代写法——普通文本组件
+/// 加 `notation` 字号与灰色。这件事的后果不是"样式差一点"：带 `note` 的卡片被平台整张
+/// 打回（`230099 / 200861 unsupported tag note`），**一条审批都到不了聊天里**，而聊天
+/// 正是审批的主入口（§11.3）。而 2.0 对不认识的属性是**报错**而不是忽略，所以这不是
+/// 可以留着的风格问题。
 fn note(content: impl Into<String>) -> Value {
     json!({
-        "tag": "note",
-        "elements": [{ "tag": "plain_text", "content": content.into() }],
+        "tag": "div",
+        "text": {
+            "tag": "plain_text",
+            "content": content.into(),
+            "text_size": "notation",
+            "text_color": "grey",
+        },
+    })
+}
+
+/// 并排的按钮。**2.0 里没有 `action` 模块**（与 `note` 一起被去掉），替代写法是按钮
+/// 组件加容器：`column_set` 一列一个，各占一半宽。
+fn actions(buttons: Vec<Value>) -> Value {
+    json!({
+        "tag": "column_set",
+        "element_id": ACTIONS_ID,
+        "flex_mode": "none",
+        "horizontal_spacing": "default",
+        "columns": buttons
+            .into_iter()
+            .map(|button| json!({
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "elements": [button],
+            }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -547,11 +594,11 @@ mod tests {
         assert_eq!(panel["expanded"], json!(false));
         assert!(flat(panel).contains("--- a/x"), "{}", flat(panel));
 
-        // 四、原因：备注。
+        // 四、原因：小字（2.0 里由"普通文本 + notation 字号"替代 note 组件）。
         let reason = elements
             .iter()
-            .find(|e| e["tag"] == json!("note"))
-            .expect("原因是备注");
+            .find(|e| e["tag"] == json!("div") && e["text"]["text_size"] == json!("notation"))
+            .expect("原因是小字");
         assert!(
             flat(reason).contains("原因：写入 workspace 之外的路径"),
             "{}",
@@ -571,21 +618,74 @@ mod tests {
         let actions = elements
             .last()
             .expect("最后一块是按钮")
-            .get("actions")
+            .get("columns")
             .and_then(Value::as_array)
-            .expect("action 块");
+            .expect("按钮那一块是 column_set");
         assert_eq!(actions.len(), 2);
-        assert_eq!(actions[0]["text"]["content"], json!("批准"));
-        assert_eq!(actions[1]["text"]["content"], json!("拒绝"));
+        let buttons: Vec<&Value> = actions
+            .iter()
+            .map(|column| &column["elements"][0])
+            .collect();
+        assert_eq!(buttons[0]["text"]["content"], json!("批准"));
+        assert_eq!(buttons[1]["text"]["content"], json!("拒绝"));
         assert_eq!(
-            actions[0]["behaviors"][0]["value"],
+            buttons[0]["behaviors"][0]["value"],
             json!({ "action": "approve", "short_id": "7K2M" })
         );
         assert_eq!(
-            actions[1]["behaviors"][0]["value"],
+            buttons[1]["behaviors"][0]["value"],
             json!({ "action": "reject", "short_id": "7K2M" })
         );
-        assert_eq!(actions[0]["behaviors"][0]["type"], json!("callback"));
+        assert_eq!(buttons[0]["behaviors"][0]["type"], json!("callback"));
+    }
+
+    /// **卡片里不许有 2.0 去掉的那两个 tag。**
+    ///
+    /// 飞书的 2.0 不兼容变更：「2.0 结构不再支持 note 组件与 action 模块（`tag` 为
+    /// `action`）」，而且 2.0 对不认识的组件是**整张卡打回**而不是忽略。这一条在线上
+    /// 发生过一次：每一条审批请求都被平台拒（`230099 / 200861 unsupported tag note`），
+    /// 于是**审批一条都到不了聊天里**——审批的主入口整个是死的，而失败只落在网关日志的
+    /// 一行 WARN 上。
+    ///
+    /// 按 `tag` 递归找，不只看第一层：以后它们长到哪一层都得拦住。
+    #[test]
+    fn a_card_carries_no_component_the_2_0_schema_dropped() {
+        let asked = approval_card(&presentation());
+        let settled = settled_card(
+            Some(&asked),
+            &ShortId::parse("7K2M").unwrap(),
+            true,
+            &PeerId::new("ou_op"),
+            OffsetDateTime::from_unix_timestamp(1_760_000_000).unwrap(),
+        );
+        for card in [&asked, &settled] {
+            let mut pending = vec![card.clone()];
+            while let Some(node) = pending.pop() {
+                match node {
+                    Value::Object(map) => {
+                        let tag = map.get("tag").and_then(Value::as_str);
+                        assert_ne!(tag, Some("note"), "2.0 没有 note：{}", flat(card));
+                        assert_ne!(tag, Some("action"), "2.0 没有 action：{}", flat(card));
+                        pending.extend(map.values().cloned());
+                    }
+                    Value::Array(items) => pending.extend(items),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// **卡片上必须有文本命令**：按钮不是唯一的答复方式，也不能当它是。
+    ///
+    /// 按钮要应用在开放平台开通卡片回调、并且回调投得到；ws 那一条路上 openlark 0.20.0
+    /// 对 `card` 帧是直接丢（`"card" => skip`，见 §14），所以"按钮点了没反应"是一种真实
+    /// 状态。那一刻这张卡片上唯一还指得出的路就是这行命令——它走
+    /// `im.message.receive_v1`，与卡片回调无关。
+    #[test]
+    fn an_approval_card_also_carries_the_text_command() {
+        let flat = flat(&approval_card(&presentation()));
+        assert!(flat.contains("/approve 7K2M"), "{flat}");
+        assert!(flat.contains("/reject 7K2M"), "{flat}");
     }
 
     #[test]
@@ -615,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn a_valid_until_shows_up_as_a_note() {
+    fn a_valid_until_shows_up_as_small_text() {
         let mut presentation = presentation();
         presentation.valid_until =
             Some(OffsetDateTime::from_unix_timestamp(1_760_000_000).unwrap());
@@ -680,7 +780,9 @@ mod tests {
             json!("已批准 · 7K2M")
         );
         assert!(
-            !body(&settled).iter().any(|e| e["tag"] == json!("action")),
+            !body(&settled)
+                .iter()
+                .any(|e| e["element_id"] == json!(ACTIONS_ID)),
             "决定过的请求不该还长着可点的按钮"
         );
         let flat = flat(&settled);

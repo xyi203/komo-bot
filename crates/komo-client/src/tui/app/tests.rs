@@ -41,6 +41,24 @@ fn feed(app: &mut App, events: &[Event]) {
     }
 }
 
+/// 待处理清单按它**真正来的路**进来：`GET /v1/approvals` 的那一份（§13.1）。
+///
+/// 不是从本会话的 `approval.requested` 折出来的那份——审批可以属于别的会话，操作者在
+/// TUI 里要看到的正是"现在有谁在等我"，所以清单只能问服务端。
+fn pending_list(records: &[(&str, &str)]) -> ServerEvent {
+    ServerEvent::Pending(
+        records
+            .iter()
+            .map(|(approval, short)| {
+                let mut record = fixture::approval_record();
+                record.approval = ApprovalId::from_raw(*approval);
+                record.short_id = ShortId::parse(short).expect("短 ID");
+                record
+            })
+            .collect(),
+    )
+}
+
 fn notices(app: &App) -> String {
     app.notices
         .iter()
@@ -357,7 +375,11 @@ fn an_approval_pending_notice_never_carries_the_authorization_itself() {
     })));
     assert_eq!(
         effects,
-        vec![Effect::FetchApproval(ApprovalId::from_raw("appr-1"))]
+        vec![
+            Effect::FetchApproval(ApprovalId::from_raw("appr-1")),
+            // 顺带把清单问一遍：计数与 `a` 的名单要它。
+            Effect::FetchPending,
+        ]
     );
     assert!(app.approval.is_none(), "通知本身不足以弹窗");
 }
@@ -527,21 +549,7 @@ fn approve_without_an_id_needs_exactly_one_pending_request() {
     assert!(notices(&app).contains("没有待处理的审批"));
 
     // 一条待处理：无 ID 生效。
-    feed(
-        &mut app,
-        &[fixture::event(
-            10,
-            Some(fixture::run()),
-            EventPayload::ApprovalRequested(komo_kernel::events::ApprovalRequested {
-                approval: ApprovalId::from_raw("appr-1"),
-                short_id: ShortId::parse("7K2M").unwrap(),
-                plan_hash: fixture::plan().plan_hash(),
-                call_id: Some(fixture::call()),
-                reason: "要人看一眼".into(),
-                scopes: vec![ApprovalScope::Once, ApprovalScope::Run],
-            }),
-        )],
-    );
+    app.apply(pending_list(&[("appr-1", "7K2M")]));
     let effects = command(&mut app, "/approve run");
     assert!(matches!(
         &effects[0],
@@ -553,21 +561,7 @@ fn approve_without_an_id_needs_exactly_one_pending_request() {
     ));
 
     // 两条待处理：要求指明。
-    feed(
-        &mut app,
-        &[fixture::event(
-            11,
-            Some(fixture::run()),
-            EventPayload::ApprovalRequested(komo_kernel::events::ApprovalRequested {
-                approval: ApprovalId::from_raw("appr-2"),
-                short_id: ShortId::parse("9QRS").unwrap(),
-                plan_hash: fixture::plan().plan_hash(),
-                call_id: None,
-                reason: "另一件".into(),
-                scopes: vec![ApprovalScope::Once],
-            }),
-        )],
-    );
+    app.apply(pending_list(&[("appr-1", "7K2M"), ("appr-2", "9QRS")]));
     assert!(command(&mut app, "/approve").is_empty());
     assert!(notices(&app).contains("请指明短 ID"), "{}", notices(&app));
     assert!(notices(&app).contains("9QRS"));
@@ -874,7 +868,14 @@ fn a_pending_approval_pops_the_moment_the_history_is_read() {
     app.apply(ServerEvent::HistoryPage(Box::new(fixture::page(
         events, false,
     ))));
-    let effects = app.apply(ServerEvent::HistoryDone);
+    // 补读完之后**问一次清单**：待处理的可以属于别的会话，本会话的事件流里没有它们。
+    assert_eq!(
+        app.apply(ServerEvent::HistoryDone),
+        vec![Effect::FetchPending]
+    );
+
+    // 清单回来了，第一条就弹（§8.8「打开即弹」）。
+    let effects = app.apply(pending_list(&[("appr-1", "7K2M")]));
     assert_eq!(
         effects,
         vec![Effect::FetchApproval(ApprovalId::from_raw("appr-1"))],
@@ -925,6 +926,8 @@ fn the_resume_summary_reads_like_the_design_doc_sentence() {
 #[test]
 fn a_status_reply_says_what_is_running_and_how_many_wait() {
     let mut app = app();
+    // 待审批数读的是**清单那一份**（全部会话），不是会话详情里本会话那几条。
+    app.apply(pending_list(&[("appr-1", "7K2M")]));
     app.apply(ServerEvent::Status(Box::new(SessionDetail {
         summary: SessionSummary {
             session: fixture::session(),
@@ -937,7 +940,7 @@ fn a_status_reply_says_what_is_running_and_how_many_wait() {
             updated_at: fixture::T0,
         },
         unfinished: vec![],
-        pending_approvals: vec![fixture::approval_record()],
+        pending_approvals: vec![],
     })));
     assert!(notices(&app).contains("等待审批"), "{}", notices(&app));
     assert!(notices(&app).contains("待审批 1"), "{}", notices(&app));
@@ -951,4 +954,176 @@ fn a_frame_this_build_cannot_read_still_moves_the_cursor() {
         reason: "未来的事件类型".into(),
     });
     assert_eq!(app.cursor, Seq(77));
+}
+// ---- 一次答一批（§11.3 的 `/approve all`）----
+
+/// 待处理三条、弹窗开着时按 `a`：**一个请求答三条**，名单里第一条是眼前这条。
+///
+/// 这是"一个任务里连着几个命令"在界面上的样子：逐条答要按 N 次 `y`、等 N 次续跑。批量
+/// 省的是按键——每一条仍然各自落一条决定（网关侧，§7.4）。
+#[test]
+fn a_batch_key_answers_everything_pending() {
+    let mut app = app();
+    app.apply(pending_list(&[
+        ("appr-1", "7K2M"),
+        ("appr-2", "9QRS"),
+        ("appr-3", "3TVW"),
+    ]));
+    app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
+    assert_eq!(app.pending_count(), 3, "三条待处理");
+
+    let effects = app.handle_key(key(KeyCode::Char('a')));
+    let [
+        Effect::DecideMany {
+            approvals,
+            approved: true,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("`a` 应当一次答一批：{effects:?}");
+    };
+    assert_eq!(approvals.len(), 3, "{approvals:?}");
+    assert_eq!(
+        approvals[0].as_str(),
+        fixture::approval_record().approval.as_str(),
+        "眼前这条排第一：它就是弹窗上那一条"
+    );
+
+    // 再按一次不发第二个请求（已经答过，在等服务端回执）。
+    assert!(app.handle_key(key(KeyCode::Char('a'))).is_empty());
+}
+
+/// 只有一条待处理时 `a` 仍然可用（和 `y` 同义），但**按键提示里不列它**——列一个不必
+/// 要的键会让人以为还有什么没批。
+#[test]
+fn the_batch_key_is_harmless_when_only_one_is_waiting() {
+    let mut app = app();
+    app.apply(pending_list(&[("appr-1", "7K2M")]));
+    app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
+
+    let effects = app.handle_key(key(KeyCode::Char('a')));
+    let [Effect::DecideMany { approvals, .. }] = effects.as_slice() else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    let hint = app.approval.as_ref().expect("弹窗").keys_hint(1);
+    assert!(!hint.contains("全部批准"), "{hint}");
+}
+
+/// `/approve all` 与 `/reject all`：命令行走同一条路，名单来自**服务端那份清单**。
+#[test]
+fn the_all_commands_go_through_the_same_batch() {
+    let mut app = app();
+    app.apply(pending_list(&[("appr-1", "7K2M"), ("appr-2", "9QRS")]));
+    app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
+    app.approval = None;
+
+    let effects = command(&mut app, "/approve all");
+    let [
+        Effect::DecideMany {
+            approved: true,
+            approvals,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(approvals.len(), 2, "{approvals:?}");
+
+    let effects = command(&mut app, "/reject all");
+    let [
+        Effect::DecideMany {
+            approved: false,
+            approvals,
+            ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(approvals.len(), 2, "{approvals:?}");
+}
+
+/// **自己答的那一下不能被说成"在别处批准了"。**
+///
+/// 决定会以 `approval_decided` 从 SSE 回来，它和"别人在别处答的"长得一模一样。少了这层
+/// 区分，用户按下 `y` 的下一秒会看到"这条审批在别处批准了"——一句假话，刚好盖住他要看的
+/// 回执。
+#[test]
+fn our_own_decision_is_not_reported_as_someone_elses() {
+    let mut app = with_modal();
+    let approval = fixture::approval_record().approval;
+    let effects = app.handle_key(key(KeyCode::Char('y')));
+    assert!(matches!(&effects[0], Effect::Decide { .. }));
+
+    app.apply(ServerEvent::Frame(Box::new(SseFrame {
+        id: Seq(50),
+        session: fixture::session(),
+        event: SseEvent::ApprovalDecided {
+            approval,
+            approved: true,
+        },
+    })));
+    assert!(
+        !notices(&app).contains("在别处"),
+        "自己答的不能说成别处答的：{}",
+        notices(&app)
+    );
+    assert!(app.approval.is_none(), "回执到了就收窗");
+}
+
+/// 别人在别处答的，仍然要说出来。
+#[test]
+fn someone_elses_decision_is_still_reported() {
+    let mut app = with_modal();
+    let approval = fixture::approval_record().approval;
+    app.apply(ServerEvent::Frame(Box::new(SseFrame {
+        id: Seq(51),
+        session: fixture::session(),
+        event: SseEvent::ApprovalDecided {
+            approval,
+            approved: false,
+        },
+    })));
+    assert!(notices(&app).contains("在别处已拒绝"), "{}", notices(&app));
+}
+
+/// 待批复但**没有弹窗**时，输入框的提示要说出路——那是审批在界面上唯一还看得见的地方。
+#[test]
+fn a_pending_approval_without_a_popup_still_tells_you_how_to_answer() {
+    let mut app = app();
+    app.apply(pending_list(&[("appr-1", "7K2M")]));
+    // 详情取不回来的情形：弹窗没开，但清单里有它。
+    app.approval = None;
+    let hint = app.input_hint();
+    assert!(hint.contains("待批复"), "{hint}");
+    assert!(hint.contains("/approve"), "{hint}");
+    assert!(hint.contains("/approve all"), "{hint}");
+}
+
+/// **别的会话的待审批，打开 TUI 也看得见。**
+///
+/// 审批可以属于定时任务那条会话、聊天里那条、别的 TUI 里开的那个，而本会话的事件流里
+/// 没有它们——清单只能问服务端。少了这一步，"打开 TUI 一条待审批也看不到"与
+/// "`/approve all` 说没有待处理、而 `GET /v1/approvals` 列着三条"会同时成立。
+#[test]
+fn approvals_from_other_sessions_are_visible_here() {
+    let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+    assert_eq!(app.pending_count(), 0);
+
+    // 本会话一条 `approval.requested` 都没有——清单照样把三条带回来。
+    let effects = app.apply(pending_list(&[
+        ("appr-1", "7K2M"),
+        ("appr-2", "9QRS"),
+        ("appr-3", "3TVW"),
+    ]));
+    assert_eq!(app.pending_count(), 3);
+    assert!(
+        matches!(effects.as_slice(), [Effect::FetchApproval(_)]),
+        "清单回来就该弹第一条：{effects:?}"
+    );
+    let hint = app.input_hint();
+    assert!(hint.contains('3'), "提示里要写清有几条：{hint}");
 }

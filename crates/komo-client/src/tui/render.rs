@@ -379,7 +379,7 @@ fn draw_approval(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .border_type(BorderType::Double)
         .title(" 需要批准 ")
         .title_bottom(Line::from(Span::styled(
-            format!(" {} ", modal.keys_hint()),
+            format!(" {} ", modal.keys_hint(app.pending_count())),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -683,8 +683,10 @@ fn main() {
             assert!(screen.contains("+新的一行"), "diff：{screen}");
             assert!(screen.contains("原因"), "四、原因：{screen}");
             assert!(screen.contains("范围"), "五、范围：{screen}");
-            // 待审批时输入框禁用并提示。
-            assert!(screen.contains("先 y / r 批准"), "输入框提示：{screen}");
+            // 待审批时输入框禁用并提示——提示里只列这条请求真的能用的键。
+            assert!(screen.contains("y 本条"), "输入框提示：{screen}");
+            assert!(screen.contains("r 本条 Run 范围"), "输入框提示：{screen}");
+            assert!(screen.contains("n / Esc 拒绝本条"), "输入框提示：{screen}");
         }
     }
 

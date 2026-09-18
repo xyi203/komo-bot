@@ -1,7 +1,9 @@
 //! 按键与命令：状态机的输入一侧（[`super::App`] 的方法，拆出来只是为了文件不过长）。
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use komo_kernel::protocol::ApprovalTarget;
 use komo_kernel::types::chat::ApprovalScope;
+use komo_kernel::types::ids::ApprovalId;
 
 use super::{App, Effect, PendingSubmission, SubmissionState};
 use crate::tui::approval::ApprovalAnswer;
@@ -164,11 +166,13 @@ impl App {
                 }
             },
             Command::Status => vec![Effect::FetchStatus],
-            Command::Pending => vec![Effect::FetchPending],
-            Command::Approve { short_id, scope } => self.decide_by_short_id(short_id, true, scope),
-            Command::Reject { short_id } => {
-                self.decide_by_short_id(short_id, false, ApprovalScope::Once)
+            Command::Pending => {
+                // 命令行问的，空清单也要印一句"没有"（自动那一问不印，见 `Pending`）。
+                self.asking_pending = true;
+                vec![Effect::FetchPending]
             }
+            Command::Approve { target, scope } => self.decide_by_target(target, true, scope),
+            Command::Reject { target } => self.decide_by_target(target, false, ApprovalScope::Once),
             Command::Model { id } => match id {
                 Some(id) => {
                     self.note(format!("下一个 Run 用模型 {id}"));
@@ -244,22 +248,25 @@ impl App {
         }
     }
 
-    /// `/approve` / `/reject`：无 ID 时只有**恰好一个**待处理请求才生效（§11.3）。
-    fn decide_by_short_id(
+    /// `/approve` / `/reject`：`Only` 只在**恰好一个**待处理时生效（§11.3），`All` 是
+    /// 待处理的**全部**（一次答一批，各按本次调用）。
+    fn decide_by_target(
         &mut self,
-        short_id: Option<komo_kernel::types::ids::ShortId>,
+        target: ApprovalTarget,
         approved: bool,
         scope: ApprovalScope,
     ) -> Vec<Effect> {
-        let target = match short_id {
-            Some(short_id) => self
-                .surface
-                .pending_approvals
+        if target == ApprovalTarget::All {
+            return self.decide_all(approved, scope);
+        }
+        let target = match target {
+            ApprovalTarget::One(short_id) => self
+                .pending
                 .values()
-                .find(|view| view.short_id == short_id)
-                .map(|view| view.approval.clone()),
-            None => {
-                let mut pending = self.surface.pending_approvals.values();
+                .find(|record| record.short_id == short_id)
+                .map(|record| record.approval.clone()),
+            ApprovalTarget::Only => {
+                let mut pending = self.pending.values();
                 match (pending.next(), pending.next()) {
                     (Some(only), None) => Some(only.approval.clone()),
                     (None, _) => {
@@ -267,21 +274,20 @@ impl App {
                         return Vec::new();
                     }
                     (Some(_), Some(_)) => {
-                        let ids: Vec<String> = self
-                            .surface
-                            .pending_approvals
-                            .values()
-                            .map(|view| view.short_id.to_string())
-                            .collect();
-                        self.fail(format!("有多条待处理：{}。请指明短 ID", ids.join(" · ")));
+                        self.fail(format!(
+                            "有多条待处理：{}。请指明短 ID，或 `/approve all` 全批",
+                            self.pending_short_list()
+                        ));
                         return Vec::new();
                     }
                 }
             }
+            ApprovalTarget::All => unreachable!("`all` 在上面就分流了"),
         };
         match target {
             Some(approval) => {
                 let request_key = self.next_key("decision");
+                self.answering.insert(approval.clone());
                 vec![Effect::Decide {
                     approval,
                     approved,
@@ -296,40 +302,101 @@ impl App {
         }
     }
 
+    /// 待处理的**全部**，一次答一批（`a` 键与 `/approve all` 共用）。
+    ///
+    /// 名单是**这一刻清单上那几条**（`GET /v1/approvals`，`App::pending`）：操作者按下键
+    /// 的那一刻看到的就是那一份，而不是服务端在答复到达时才决定的一份。
+    ///
+    /// 范围只按**本次调用**：一批互不相干的计划共用一个范围（本次 Run / Cron Job）只能
+    /// 是替操作者猜——`scope` 参数只用来在他说了范围却拿到本次时**告诉他**。
+    fn decide_all(&mut self, approved: bool, scope: ApprovalScope) -> Vec<Effect> {
+        let approvals: Vec<ApprovalId> = self.pending.keys().cloned().collect();
+        if approvals.is_empty() {
+            self.fail("没有待处理的审批");
+            return Vec::new();
+        }
+        if scope != ApprovalScope::Once {
+            self.fail("批量答复按本次调用——范围绑的是单份计划，要范围请逐条 /approve <短ID> run");
+        }
+        let request_key = self.next_key("decisions");
+        self.answering.extend(approvals.iter().cloned());
+        vec![Effect::DecideMany {
+            approvals,
+            approved,
+            request_key,
+        }]
+    }
+
+    /// 待处理的那几个短 ID，一行。
+    fn pending_short_list(&self) -> String {
+        self.pending
+            .values()
+            .map(|record| record.short_id.to_string())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
     fn approval_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        let Some(modal) = self.approval.as_mut() else {
+        let Some(modal) = self.approval.as_ref() else {
             return Vec::new();
         };
-        let answer = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => Some(ApprovalAnswer::ONCE),
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                if modal.allows_run_scope() {
-                    Some(ApprovalAnswer::RUN)
-                } else {
-                    self.fail("这条请求不可范围化，只能批本次（y）或拒绝（n）");
-                    return Vec::new();
-                }
-            }
-            // **Esc 在弹窗里就是拒绝**，和 n 一样：一个没答案的审批会一直占着 Run。
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(ApprovalAnswer::REJECT),
-            KeyCode::PageUp | KeyCode::Up => {
-                modal.scroll_up();
-                None
-            }
-            KeyCode::PageDown | KeyCode::Down => {
-                modal.scroll_down();
-                None
-            }
-            _ => None,
-        };
-        let Some(answer) = answer else {
-            return Vec::new();
-        };
+        // 已经答过了，正在等服务端回执——再按一次不该发第二个请求。
         if modal.answering {
             return Vec::new();
         }
-        modal.answering = true;
+        let run_scope_ok = modal.allows_run_scope();
         let approval = modal.record.approval.clone();
+
+        // 滚动键只动弹窗。
+        let scroll_by: Option<i16> = match key.code {
+            KeyCode::PageUp | KeyCode::Up => Some(-1),
+            KeyCode::PageDown | KeyCode::Down => Some(1),
+            _ => None,
+        };
+        if let Some(direction) = scroll_by {
+            if let Some(modal) = self.approval.as_mut() {
+                if direction < 0 {
+                    modal.scroll_up();
+                } else {
+                    modal.scroll_down();
+                }
+            }
+            return Vec::new();
+        }
+
+        // `a` = **全部批准**（§11.3 的 `/approve all`）：一批互不相干的审批逐条按本次
+        // 调用答。它答的是所有待处理，**含眼前这条**——眼前这条排在名单第一个。
+        if matches!(key.code, KeyCode::Char('a') | KeyCode::Char('A')) {
+            let mut approvals: Vec<ApprovalId> = self
+                .pending
+                .keys()
+                .filter(|candidate| **candidate != approval)
+                .cloned()
+                .collect();
+            approvals.insert(0, approval.clone());
+            self.mark_answering(&approvals);
+            let request_key = self.next_key("decisions");
+            return vec![Effect::DecideMany {
+                approvals,
+                approved: true,
+                request_key,
+            }];
+        }
+
+        let answer = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => ApprovalAnswer::ONCE,
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                if !run_scope_ok {
+                    self.fail("这条请求不可范围化，只能批本次（y）或拒绝（n）");
+                    return Vec::new();
+                }
+                ApprovalAnswer::RUN
+            }
+            // **Esc 在弹窗里就是拒绝**，和 n 一样：一个没答案的审批会一直占着 Run。
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => ApprovalAnswer::REJECT,
+            _ => return Vec::new(),
+        };
+        self.mark_answering(std::slice::from_ref(&approval));
         let request_key = self.next_key("decision");
         vec![Effect::Decide {
             approval,
@@ -337,6 +404,18 @@ impl App {
             scope: answer.scope,
             request_key,
         }]
+    }
+
+    /// 记下"这几条是**我们自己**在答"。
+    ///
+    /// 决定会以 `approval_decided` 从 SSE 回来（网关每条决定推一帧），它和"别人在别处
+    /// 答的"长得一模一样。没有这张表，自己按下的那一下会在下一秒被说成「这条审批在别处
+    /// 批准了」——一句假话。
+    fn mark_answering(&mut self, approvals: &[ApprovalId]) {
+        if let Some(modal) = self.approval.as_mut() {
+            modal.answering = true;
+        }
+        self.answering.extend(approvals.iter().cloned());
     }
 
     fn history_back(&mut self) {

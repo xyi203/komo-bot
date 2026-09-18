@@ -4,6 +4,7 @@
 //! 值报错而不是静默取默认——打字的人还在屏幕前，把 `/effort hgih` 悄悄当成没设置，他
 //! 要到下一个 Run 的状态行才发现。
 
+use komo_kernel::protocol::ApprovalTarget;
 use komo_kernel::types::chat::ApprovalScope;
 use komo_kernel::types::ids::ShortId;
 use komo_kernel::types::model::Effort;
@@ -20,14 +21,14 @@ pub enum Command {
     Status,
     /// `/pending`：列出待处理审批及其短 ID。
     Pending,
-    /// `/approve [short_id] [run]`
+    /// `/approve [short_id|all] [run]`
     Approve {
-        short_id: Option<ShortId>,
+        target: ApprovalTarget,
         scope: ApprovalScope,
     },
-    /// `/reject [short_id]`
+    /// `/reject [short_id|all]`
     Reject {
-        short_id: Option<ShortId>,
+        target: ApprovalTarget,
     },
     /// `/model`（列出）/ `/model <id>`（设定）
     Model {
@@ -98,8 +99,11 @@ pub const COMMANDS: [(&str, &str); 10] = [
     ("/cancel", "取消本会话正在跑的 Run"),
     ("/status", "当前 Run 状态与待审批数"),
     ("/pending", "列出待处理审批及其短 ID"),
-    ("/approve", "[短ID] [run] 批准；带 run = 本次 Run 范围"),
-    ("/reject", "[短ID] 拒绝"),
+    (
+        "/approve",
+        "[短ID|all] [run] 批准；all 全批，run = 本次 Run 范围",
+    ),
+    ("/reject", "[短ID|all] 拒绝"),
     ("/model", "[模型] 列出或设定下一个 Run 的模型"),
     ("/effort", "[档位] 列出或设定下一个 Run 的推理强度"),
     ("/help", "这张表"),
@@ -168,32 +172,38 @@ pub fn parse(text: &str, menu: &CommandMenu) -> Result<Command, CommandError> {
         "help" | "h" | "?" => no_args(Command::Help),
         "quit" | "exit" | "q" => no_args(Command::Quit),
         "approve" => {
-            let mut short_id = None;
+            let mut target = ApprovalTarget::Only;
             let mut scope = ApprovalScope::Once;
             for arg in &args {
                 if arg.eq_ignore_ascii_case("run") {
                     scope = ApprovalScope::Run;
-                } else if short_id.is_none() {
-                    short_id =
-                        Some(ShortId::parse(arg).ok_or_else(|| CommandError::BadShortId {
+                } else if arg.eq_ignore_ascii_case("all") {
+                    target = ApprovalTarget::All;
+                } else if target == ApprovalTarget::Only {
+                    target = ApprovalTarget::One(ShortId::parse(arg).ok_or_else(|| {
+                        CommandError::BadShortId {
                             raw: (*arg).to_string(),
-                        })?);
+                        }
+                    })?);
                 } else {
                     return Err(CommandError::BadScope {
                         raw: (*arg).to_string(),
                     });
                 }
             }
-            Ok(Command::Approve { short_id, scope })
+            Ok(Command::Approve { target, scope })
         }
         "reject" | "deny" => {
-            let short_id = match args.first() {
-                None => None,
-                Some(raw) => Some(ShortId::parse(raw).ok_or_else(|| CommandError::BadShortId {
-                    raw: (*raw).to_string(),
+            let target = match args.first() {
+                None => ApprovalTarget::Only,
+                Some(raw) if raw.eq_ignore_ascii_case("all") => ApprovalTarget::All,
+                Some(raw) => ApprovalTarget::One(ShortId::parse(raw).ok_or_else(|| {
+                    CommandError::BadShortId {
+                        raw: (*raw).to_string(),
+                    }
                 })?),
             };
-            Ok(Command::Reject { short_id })
+            Ok(Command::Reject { target })
         }
         "model" => match args.first() {
             None => Ok(Command::Model { id: None }),
@@ -250,13 +260,33 @@ mod tests {
         assert_eq!(
             parse("/approve", &menu()).unwrap(),
             Command::Approve {
-                short_id: None,
+                target: ApprovalTarget::Only,
                 scope: ApprovalScope::Once
             }
         );
         assert_eq!(
             parse("/reject", &menu()).unwrap(),
-            Command::Reject { short_id: None }
+            Command::Reject {
+                target: ApprovalTarget::Only
+            }
+        );
+    }
+
+    /// `/approve all`：待处理的**全部**，一次答一批（§11.3）。
+    #[test]
+    fn approve_all_asks_for_every_pending_one() {
+        assert_eq!(
+            parse("/approve all", &menu()).unwrap(),
+            Command::Approve {
+                target: ApprovalTarget::All,
+                scope: ApprovalScope::Once
+            }
+        );
+        assert_eq!(
+            parse("/reject ALL", &menu()).unwrap(),
+            Command::Reject {
+                target: ApprovalTarget::All
+            }
         );
     }
 
@@ -265,7 +295,7 @@ mod tests {
         assert_eq!(
             parse("/approve 7k2m run", &menu()).unwrap(),
             Command::Approve {
-                short_id: ShortId::parse("7K2M"),
+                target: ApprovalTarget::One(ShortId::parse("7K2M").expect("短 ID")),
                 scope: ApprovalScope::Run
             }
         );
@@ -273,7 +303,7 @@ mod tests {
         assert_eq!(
             parse("/approve run 7K2M", &menu()).unwrap(),
             Command::Approve {
-                short_id: ShortId::parse("7K2M"),
+                target: ApprovalTarget::One(ShortId::parse("7K2M").expect("短 ID")),
                 scope: ApprovalScope::Run
             }
         );

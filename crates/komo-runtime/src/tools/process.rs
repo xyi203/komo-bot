@@ -126,6 +126,15 @@ pub async fn run_child(
         .process_group(0)
         .kill_on_drop(true);
 
+    // cwd 不在时 spawn 的 ENOENT 会挂在**程序名**上（`/bin/sh: No such file or
+    // directory`），真正不在的是工作目录。这一条在现场把人引偏过一次，所以单独认出来。
+    if !spec.cwd.is_dir() {
+        return Err(ProcessError::Spawn(format!(
+            "工作目录不存在：{}",
+            spec.cwd.display()
+        )));
+    }
+
     let mut child = command
         .spawn()
         .map_err(|error| ProcessError::Spawn(format!("{}: {error}", spec.program)))?;
@@ -357,6 +366,26 @@ mod tests {
             register: None,
             label: "测试".into(),
         }
+    }
+
+    /// 工作目录不存在时，报的必须是**工作目录**，不是程序名。
+    ///
+    /// spawn 的 ENOENT 挂在程序名上（`/bin/sh: No such file or directory`），而 `/bin/sh`
+    /// 明明在。这条已在现场把人引偏过一次（每个 shell / python 调用都"起不来"，真正
+    /// 不在的是会话 cwd）。
+    #[tokio::test]
+    async fn a_missing_cwd_is_reported_as_such() {
+        let mut spec = spec("echo hi");
+        spec.cwd = std::env::temp_dir().join("komo-没有这个目录-9f3a");
+        let error = run_child(spec, &mut writer(), &CancelToken::new())
+            .await
+            .expect_err("起不来");
+        let ProcessError::Spawn(message) = error else {
+            panic!("该报 Spawn：{error}");
+        };
+        assert!(message.contains("工作目录不存在"), "{message}");
+        assert!(message.contains("komo-没有这个目录-9f3a"), "{message}");
+        assert!(!message.contains("/bin/sh"), "别把程序名当原因：{message}");
     }
 
     #[tokio::test]

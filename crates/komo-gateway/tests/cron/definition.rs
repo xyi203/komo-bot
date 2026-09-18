@@ -420,6 +420,10 @@ async fn a_job_runs_on_its_own_round_budget() {
     let home = Home::new();
     // 根内读取是 Allow（§7.1 第一行），所以这一串调用不会停在审批上——停住它的只能
     // 是预算。
+    //
+    // 先放一份文件进去：数据目录里已经有东西，这个目录当然也在（Gateway 起过一次就有
+    // 它了，§12 的骨架）。
+    std::fs::create_dir_all(home.workspace()).expect("工作目录");
     let readable = home.workspace().join("notes.md");
     std::fs::write(&readable, "一点东西\n").expect("写得下");
     let path = readable.display().to_string();

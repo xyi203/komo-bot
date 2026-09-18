@@ -90,6 +90,29 @@ impl Surface {
         &self.messages[self.replay_from.min(self.messages.len())..]
     }
 
+    /// 这个 Run **还没有结果的调用**，按它们被要到的次序。
+    ///
+    /// 与 `runs[..].calls` 里那些非终态的不是一回事：`calls` 要等到 `tool.planned` 才有
+    /// 那一行（计划是执行到它才 `prepare` 的），而**一轮里前一个调用停下时，后面的调用
+    /// 连计划都还没有**（§8.3 把一轮的回复与全部调用计划当一个逻辑事件，但计划落盘是后
+    /// 来的事）。只看 `calls`，续跑就只跑完前一个，模型下一轮拿到"要了两次、只回了一次
+    /// 输出"的转写——provider 直接 400（`No tool output found for tool call …`）。
+    pub fn open_calls(&self, run: &RunId) -> Vec<ToolCallId> {
+        let mut open: Vec<ToolCallId> = Vec::new();
+        for message in self.replay() {
+            if message.run.as_ref() == Some(run) {
+                for call in &message.tool_calls {
+                    open.push(call.call_id.clone());
+                }
+            }
+            // 结果按调用号销账，不按它落在哪条消息上。
+            for result in &message.tool_results {
+                open.retain(|call| call != &result.call);
+            }
+        }
+        open
+    }
+
     /// 回放窗口里用户侧与助手侧是否交替。
     pub fn replay_alternates(&self) -> bool {
         let mut previous: Option<Role> = None;

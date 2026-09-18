@@ -818,6 +818,64 @@ async fn row_12_a_corrupt_middle_stops_only_the_affected_session() {
     gw.stop().await;
 }
 
+/// §8.2 的权威边界：**取消是调度事实**（state.db），不该因为会话内容已经不在就整条失败。
+///
+/// 日志丢了以后这条 Run 停在「需要处理」（`HaltCorrupt`），而取消得往那个会话写一条
+/// `run.cancelled`——写不进去就 500。于是 §8.4 的「操作者处理后 queued / cancelled」两条
+/// 路一条也走不通，这条 Run 永远挂在清单上，操作者手上偏偏只有 `komo run cancel` 这一把。
+#[tokio::test]
+async fn a_run_in_a_session_whose_log_is_gone_can_still_be_cancelled() {
+    let home = Home::new();
+    let llm = FakeLlm::new(vec![vec![call_round(
+        1,
+        "pc-1",
+        "shell",
+        serde_json::json!({"command": "echo hi"}),
+    )]]);
+    let gw = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "gone-1", "跑一条命令").await.run;
+    gw.wait_approval().await;
+    gw.stop().await;
+
+    // 日志没了：state.db 说应用到了 seq N，文件只有 0。
+    std::fs::remove_file(home.events_path(&session)).expect("删掉日志");
+
+    let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
+    assert!(
+        gw.db_status(&run).await.is_unfinished(),
+        "读不出会话的那条 Run 停在原地：{:?}",
+        gw.db_status(&run).await
+    );
+
+    // 操作者取消：**不该 500**。
+    let (code, body) = gw
+        .post(&format!("/v1/runs/{run}/cancel"), serde_json::json!({}))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(gw.db_status(&run).await, RunStatus::Cancelled);
+
+    // 会话清单上它不再"未完成"——这正是操作者要的那一步。
+    let (code, body) = gw.get(&format!("/v1/sessions/{session}")).await;
+    assert_eq!(code, 200, "{body}");
+    let detail: serde_json::Value = serde_json::from_str(&body).expect("会话详情");
+    assert!(
+        detail["unfinished"]
+            .as_array()
+            .expect("未完成是个数组")
+            .is_empty(),
+        "{detail}"
+    );
+    assert_eq!(
+        detail["current_status"],
+        serde_json::Value::Null,
+        "{detail}"
+    );
+    gw.stop().await;
+}
+
 // ---------------------------------------------------------------- 第 13 行
 
 /// 第 13 行：**最终结果已同步到 JSONL，SSE 尚未送达** → 客户端补读原结果，Run 保持

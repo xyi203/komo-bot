@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
-use komo_kernel::protocol::http::{ApprovalDecisionResponse, ApprovalRecord, SubmitRunResponse};
+use komo_kernel::protocol::http::{
+    ApprovalBatchDecisionResponse, ApprovalDecisionResponse, ApprovalRecord, SubmitRunResponse,
+};
 use komo_kernel::traits::{
     ApprovalRepo, Clock, CronRepo, EmbeddingClient, GatewayError, Ledger, LlmClient, MemoryRepo,
     RepoError, RunQueue, StoreError, ToolOutputStore,
@@ -741,6 +743,37 @@ impl GatewayState {
         Ok(response)
     }
 
+    /// 一次答一批待处理审批（§11.3 的 `/approve all`）。
+    ///
+    /// **逐条走 [`Self::decide_approval`]**：每一条各自落一条决定、各自排一条审计事件、
+    /// 各自叫醒自己那个 Run。批量只是把 N 次按键变成一次，不是一条决定覆盖 N 个计划
+    /// （所以范围只有"本次调用"，见 [`ApprovalBatchDecisionRequest`]）。
+    ///
+    /// 点名却没有的那些收进 `missing`，**不让整批失败**：一批里夹着一条刚刚在别的界面答
+    /// 掉的请求是常态，为它把其余几条一起挡下，等于逼操作者去猜是哪一条不见了。
+    ///
+    /// [`ApprovalBatchDecisionRequest`]: komo_kernel::protocol::http::ApprovalBatchDecisionRequest
+    pub async fn decide_approvals(
+        &self,
+        approvals: &[ApprovalId],
+        approved: bool,
+        by: Option<PeerId>,
+    ) -> Result<ApprovalBatchDecisionResponse, GatewayError> {
+        let mut decisions = Vec::with_capacity(approvals.len());
+        let mut missing = Vec::new();
+        for approval in approvals {
+            match self
+                .decide_approval(approval, approved, ApprovalScope::Once, by.clone())
+                .await
+            {
+                Ok(response) => decisions.push(response),
+                Err(GatewayError::NotFound { .. }) => missing.push(approval.clone()),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(ApprovalBatchDecisionResponse { decisions, missing })
+    }
+
     /// 操作者答应的那个范围，落成一条授权。
     ///
     /// Policy 没在这条请求上给出这个范围就不给——`record.scopes` 是 §11.3 的
@@ -928,14 +961,34 @@ impl GatewayState {
         }
         self.segments.cancel(run);
         let session = record.session.clone();
-        let entry = self.ledgers.open(&session, "agent").await?;
-        entry
-            .ledger
-            .complete(
+        let outcome = match self.ledgers.open(&session, "agent").await {
+            Ok(entry) => entry
+                .ledger
+                .complete(
+                    run,
+                    komo_kernel::types::status::RunEnd::Cancelled { by: None },
+                )
+                .await
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = outcome {
+            // 会话那一侧写不进去（日志丢了 / 中间损坏）。取消是**调度事实**（§8.2 把会话
+            // 内容与调度分开），它不产生会话内容；卡在这里就等于：这条 Run 永远停在
+            // `needs_attention` 上，§8.4 的「操作者处理后 queued / cancelled」一条路都走
+            // 不通，而操作者手上只有 `komo run cancel` 这一把。所以终态照样落下，缺的那条
+            // 会话副本如实报到日志里。
+            tracing::warn!(%error, %run, %session, "会话写不进去，取消只落在 state.db 上");
+            komo_store::repos::runs::stop_without_event(
+                &self.db,
+                &session,
                 run,
-                komo_kernel::types::status::RunEnd::Cancelled { by: None },
+                komo_kernel::types::status::RunStatus::Cancelled,
+                Some(format!("取消时这个会话读不出来：{error}")),
+                self.clock.now(),
             )
             .await?;
+        }
         Ok(RunStatus::Cancelled)
     }
 }

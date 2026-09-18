@@ -280,6 +280,62 @@ pub async fn mark_final_in(
         .map_err(map_toasty)
 }
 
+/// 终态，**但没有会话事件落在它身上**。
+///
+/// 走这条路的是「这个会话已经读不出来」（日志丢了 / 中间损坏）时的一次取消。取消是
+/// **调度事实**（§8.2 把会话内容与调度分开），它不产生会话内容，所以那条 `run.cancelled`
+/// 写不进去的时候不能整个失败——否则这条 Run 永远停在 `needs_attention` 上，§8.4 的
+/// 「操作者处理后 queued / cancelled」一条也走不通。`final_event` 留空：**没有**那一条
+/// 事件，不假装有。
+pub async fn mark_final_without_event_in(
+    ex: &mut dyn Executor,
+    run: &RunId,
+    status: RunStatus,
+    rounds: u32,
+    reason: Option<String>,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let mut row = require(ex, run).await?;
+    row.update()
+        .status(status_str(status))
+        .rounds(i64::from(rounds))
+        .last_error(reason)
+        .memory_work(memory_work_str(MemoryWork::Pending))
+        .ended_at(to_ts(now))
+        .updated_at(to_ts(now))
+        .exec(ex)
+        .await
+        .map_err(map_toasty)
+}
+
+/// 同上，自己开事务，并顺手清掉会话的当前 Run——**与 `Ledger::complete` 的收尾一致**
+/// （终态之后 `sessions.current_run` 不该还指着它）。
+pub async fn stop_without_event(
+    db: &Db,
+    session: &SessionId,
+    run: &RunId,
+    status: RunStatus,
+    reason: Option<String>,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let (session, run) = (session.clone(), run.clone());
+    db.with_write_retry(move |ex| {
+        let (session, run, reason) = (session.clone(), run.clone(), reason.clone());
+        Box::pin(async move {
+            let rounds = get_in(ex, &run)
+                .await?
+                .map(|row| row.rounds.max(0) as u32)
+                .unwrap_or(0);
+            mark_final_without_event_in(ex, &run, status, rounds, reason, now).await?;
+            if status.is_terminal() {
+                crate::repos::session::set_current_run_in(ex, &session, None, now).await?;
+            }
+            Ok(())
+        }) as BoxFuture<'_, Result<(), StoreError>>
+    })
+    .await
+}
+
 /// 记这一轮之后的轮次计数。
 pub async fn bump_rounds_in(
     ex: &mut dyn Executor,

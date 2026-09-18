@@ -21,6 +21,12 @@ pub struct DeliveryLog {
     repo: Arc<TursoDeliveryRepo>,
     channels: Arc<ChannelRegistry>,
     clock: Arc<dyn Clock>,
+    /// 补发是**排他的**：同一时刻只跑一趟。
+    ///
+    /// 补发有两个入口——渠道起来时按平台冲刷一次（§11.4）、以及启动时（与微信入站前）
+    /// 的整体冲刷。两趟并发地在同一批 pending 行上跑，一行就会被送两次：`send_recorded`
+    /// 按行结算，但**发送本身在结算之前**，所以两个任务都会把那条消息发出去。
+    flushing: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for DeliveryLog {
@@ -39,6 +45,7 @@ impl DeliveryLog {
             repo,
             channels,
             clock,
+            flushing: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -126,6 +133,9 @@ impl DeliveryLog {
 
     /// 冲刷**一个平台**名下的 pending。渠道刚登记完发送口时走它。
     pub async fn flush_platform(&self, platform: ChannelPlatform) -> usize {
+        // 先拿锁再读：拿到锁的那一刻看到的是**别人刚结算完**的那一份，于是同一行不会
+        // 被两趟补发各送一次。
+        let _exclusive = self.flushing.lock().await;
         let pending = match self.pending(None).await {
             Ok(pending) => pending,
             Err(error) => {
@@ -154,8 +164,10 @@ impl DeliveryLog {
 
     /// 冲刷：pending 的行逐条再发一次。返回这次送出去了几条。
     ///
-    /// 启动时（补发上一次没送到的）与每条入站消息之前（微信那条路径）都调它。
+    /// 启动时（补发上一次没送到的）与每条入站消息之前（微信那条路径）都调它。**一趟一
+    /// 趟排队**（见 [`DeliveryLog::flushing`]）：两趟并发会在同一行上各发一次。
     pub async fn flush(&self, peer: Option<&ChannelPeer>) -> usize {
+        let _exclusive = self.flushing.lock().await;
         let pending = match self.pending(peer).await {
             Ok(pending) => pending,
             Err(error) => {

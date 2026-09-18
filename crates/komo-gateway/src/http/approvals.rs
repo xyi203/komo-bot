@@ -6,8 +6,8 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::protocol::http::{
-    ApprovalDecisionRequest, ApprovalDecisionResponse, ApprovalListQuery, ApprovalListResponse,
-    ApprovalRecord,
+    ApprovalBatchDecisionRequest, ApprovalBatchDecisionResponse, ApprovalDecisionRequest,
+    ApprovalDecisionResponse, ApprovalListQuery, ApprovalListResponse, ApprovalRecord,
 };
 use komo_kernel::types::ids::ApprovalId;
 
@@ -70,6 +70,31 @@ pub async fn decide(
     let response = api
         .state
         .decide_approval(&approval, request.approved, request.scope, None)
+        .await?;
+    api.idempotency
+        .remember(request.request_key.as_ref(), &hash, &response);
+    Ok(Json(response))
+}
+
+/// `POST /v1/approvals/decisions`：**一次答一批**（§11.3 的 `/approve all`）。
+///
+/// 逐条决定，逐条记审计（§7.4）——批量只是省掉 N 次按键，不是一条决定覆盖 N 个计划。
+/// 幂等按整批一个请求键：重发得到同一份回执；批里每一条各自的幂等仍由 `decide_approval`
+/// 保证（已决定的返回原决定）。
+pub async fn decide_batch(
+    State(api): State<Api>,
+    Json(request): Json<ApprovalBatchDecisionRequest>,
+) -> ApiResult<Json<ApprovalBatchDecisionResponse>> {
+    let hash = body_hash(&request);
+    if let Some(previous) = api
+        .idempotency
+        .lookup::<ApprovalBatchDecisionResponse>(request.request_key.as_ref(), &hash)?
+    {
+        return Ok(Json(previous));
+    }
+    let response = api
+        .state
+        .decide_approvals(&request.approvals, request.approved, None)
         .await?;
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &response);

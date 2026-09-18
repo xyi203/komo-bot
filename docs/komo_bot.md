@@ -398,9 +398,12 @@ auto 模式与 strict 的差别只有两处，都是刻意的：默认结论从 
 照样把人叫来；正常的命令一路走到默认 `Allow`。范围外文件、toolbox / Python 环境变更、
 模型发起的模块调用、以及"修改 Policy"那条 Deny 一条都没动。
 
-形状清单（`DANGEROUS_COMMANDS`）挑的是两类：**一次手滑就没了**（`rm -rf /`、`mkfs`、
-`dd of=/dev/`、`shred`）与**把控制权交出去**（`sudo`、管道进解释器、`ssh`、`git push
---force`、`kubectl delete`）。匹配是**归一后**的子串：连续空白压成一个空格、两边降为
+形状清单（`DANGEROUS_COMMANDS`）挑的是三类：**一次手滑就没了**（`rm -rf /`、`mkfs`、
+`dd of=/dev/`、`shred`）、**把控制权交出去**（`sudo`、管道进解释器、`ssh`、`git push
+--force`、`kubectl delete`），以及**把密钥念进模型上下文**（`.env`、`gateway.json`、
+`credentials.json`、`.ssh`、`id_rsa`、`printenv`）——最后一组是线上证据逼出来的：agent
+找不到想要的数据时会去翻 Gateway 的发现文件（里面有 API 的 Bearer token）与 `.env`。
+匹配是**归一后**的子串：连续空白压成一个空格、两边降为
 小写，所以 `RM   -RF /` 与 `rm -rf /` 是同一件事。递归删除只列灾难形状，不列 `rm -rf`
 本身——`rm -rf target` 是日常操作，把它也拦下来，这个模式就退化成"每次都要问"。
 

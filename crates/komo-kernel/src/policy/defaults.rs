@@ -87,6 +87,16 @@ pub const DANGEROUS_COMMANDS: &[&str] = &[
     "docker system prune",
     "docker volume rm",
     "kubectl delete",
+    // 凭据：**把密钥念进模型上下文**。这一组是线上证据逼出来的：agent 找不到想要的数据
+    // 时，会去翻 Gateway 的发现文件（里面有 API 的 Bearer token）与 `.env`。
+    ".env",
+    "gateway.json",
+    "credentials.json",
+    "auth.json",
+    ".ssh",
+    "id_rsa",
+    "id_ed25519",
+    "printenv",
 ];
 
 impl RuleTable {
@@ -902,6 +912,10 @@ mod tests {
             "systemctl restart nginx",
             "kubectl delete pod api-1",
             "shutdown -h now",
+            // 线上实测：agent 卡住时会去翻 Gateway 的发现文件（含 Bearer token）与 .env。
+            "cat /home/u/.komo/runtime/gateway.json 2>/dev/null | head -60",
+            "sed -E 's/(=.{0,4}).*/\\1****/' /home/u/.komo/.env",
+            "cat ~/.ssh/id_ed25519",
         ] {
             let plan = shell(command);
             let decision = RuleTable::auto().decide(&plan, &f.ctx());

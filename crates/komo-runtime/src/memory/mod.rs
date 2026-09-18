@@ -78,6 +78,20 @@ pub enum MemoryError {
     Invalid(String),
 }
 
+impl MemoryError {
+    /// 这一次失败**再试也不会变**。
+    ///
+    /// 只有一种：证据读不出来。JSONL 损坏或已提交范围缺失是 §8.3 的"停止受影响会话，
+    /// 报告损坏"，不是"等一会儿再试"——文件不会自己长回来。其余几种都能好起来：端点
+    /// 恢复、配置改对、模型的下一句话不一样（[`MemoryError::Model`]、
+    /// [`MemoryError::Invalid`]、[`MemoryError::VectorUnavailable`]、
+    /// [`MemoryError::VectorUnconfigured`]、[`MemoryError::Store`]），所以照旧放回
+    /// `pending`。
+    pub fn is_permanent(&self) -> bool {
+        matches!(self, MemoryError::Ledger(_))
+    }
+}
+
 impl From<LedgerError> for MemoryError {
     fn from(error: LedgerError) -> Self {
         MemoryError::Ledger(error.to_string())
@@ -286,6 +300,8 @@ pub struct PassReport {
     pub applied: usize,
     /// 失败并放回 `pending` 的。
     pub failed: usize,
+    /// 失败且**不再重试**的（证据读不出来，标记翻成 `error`）。
+    pub abandoned: usize,
 }
 
 /// 装配一台 MemoryManager 要的东西。
@@ -319,6 +335,9 @@ pub struct MemoryManager {
     selections: Mutex<BTreeMap<RunId, Injection>>,
     /// 正在重建的代次。`POST /v1/memory-index/rebuild` 的幂等就是它。
     building: Mutex<BTreeSet<String>>,
+    /// 已经报过一次失败的 Run。**只为不刷日志**：一分钟后还失败是同一件事，每拍都
+    /// `warn` 一遍只会把别人的日志挤下去。成功的那些在这里被划掉，下次再失败照样报。
+    reported: Mutex<BTreeSet<RunId>>,
 }
 
 impl std::fmt::Debug for MemoryManager {
@@ -349,6 +368,7 @@ impl MemoryManager {
             clock: parts.clock,
             selections: Mutex::new(BTreeMap::new()),
             building: Mutex::new(BTreeSet::new()),
+            reported: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -552,6 +572,10 @@ impl MemoryManager {
     /// 「run.completed 在 JSONL 持久保存后，state.db 提交终态与 memory_work = pending
     /// → **后台领取该 Run 尚未处理的新证据**」（§9.3）。失败的放回 pending，下次重试；
     /// 已经写进去的记忆正文不回滚——"索引失败独立重试，不撤销已经保存的记忆正文"。
+    ///
+    /// **只有会好的失败才放回 pending。**证据读不出来是 §8.3 的"停止受影响会话，报告
+    /// 损坏"——重试一万次也读不出来，所以标记翻成 `error`（§9.3 的四个状态里就是这一个
+    /// 的用处），队列不再为它空转。见 [`MemoryError::is_permanent`]。
     pub async fn process_pending(&self, limit: usize) -> Result<PassReport, MemoryError> {
         if !self.enabled {
             return Ok(PassReport::default());
@@ -570,9 +594,28 @@ impl MemoryManager {
                     tracing::debug!(run = %item.run, %reason, "这个 Run 没有可提取的证据");
                     self.settle(&item.run, MemoryWork::Done, cursor).await;
                 }
+                Err(error) if error.is_permanent() => {
+                    report.abandoned += 1;
+                    tracing::warn!(
+                        %error,
+                        run = %item.run,
+                        "证据读不出来，这个 Run 不再重试（标记翻成 error）"
+                    );
+                    self.settle(&item.run, MemoryWork::Error, item.cursor).await;
+                }
                 Err(error) => {
                     report.failed += 1;
-                    tracing::warn!(%error, run = %item.run, "记忆提取失败，放回 pending 下次重试");
+                    // 同一条错误只报一次：下一拍还是它，`warn` 一遍没有新信息。
+                    let first = self
+                        .reported
+                        .lock()
+                        .expect("失败表")
+                        .insert(item.run.clone());
+                    if first {
+                        tracing::warn!(%error, run = %item.run, "记忆提取失败，放回 pending 下次重试");
+                    } else {
+                        tracing::debug!(%error, run = %item.run, "记忆提取仍然失败");
+                    }
                     // **失败不推进游标**（§9.3）：放回 pending 就是"下次重试"。
                     self.settle(&item.run, MemoryWork::Pending, item.cursor)
                         .await;
@@ -583,6 +626,10 @@ impl MemoryManager {
     }
 
     async fn settle(&self, run: &RunId, work: MemoryWork, cursor: Seq) {
+        // 这一条已经不在"报过的失败"里了：下次再失败要重新出声，而不是被旧记录压住。
+        if work != MemoryWork::Pending {
+            self.reported.lock().expect("失败表").remove(run);
+        }
         if let Err(error) = self.work.finish(run, work, cursor).await {
             tracing::warn!(%error, run = %run, "记忆处理标记写不下去");
         }

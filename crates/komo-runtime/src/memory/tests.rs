@@ -129,6 +129,9 @@ impl EmbeddingClient for ConceptEmbeddings {
 #[derive(Debug, Default)]
 struct SeedEvents {
     events: Mutex<std::collections::BTreeMap<SessionId, Vec<Event>>>,
+    /// 读出来就是 [`LedgerError::Corrupt`] 的会话——JSONL 没了、损坏、已提交范围缺失
+    /// 在这一层长一个样（§8.3）。
+    poisoned: Mutex<std::collections::BTreeSet<SessionId>>,
 }
 
 impl SeedEvents {
@@ -138,11 +141,21 @@ impl SeedEvents {
             .expect("事件表")
             .insert(session.clone(), events);
     }
+
+    fn poison(&self, session: &SessionId) {
+        self.poisoned
+            .lock()
+            .expect("损坏表")
+            .insert(session.clone());
+    }
 }
 
 #[async_trait]
 impl SessionEvents for SeedEvents {
     async fn events_of(&self, session: &SessionId) -> Result<Vec<Event>, MemoryError> {
+        if self.poisoned.lock().expect("损坏表").contains(session) {
+            return Err(MemoryError::Ledger("记录损坏：已提交范围缺失".to_string()));
+        }
         Ok(self
             .events
             .lock()
@@ -1134,6 +1147,34 @@ async fn a_failed_extraction_leaves_the_cursor_where_it_was() {
         "游标停在原处，标记回 pending"
     );
     assert!(harness.repo.list(None, None, 10).await.unwrap().is_empty());
+}
+
+/// **证据读不出来就不重试**：JSONL 损坏 / 已提交范围缺失换个时间点也是同一个答案
+/// （§8.3「停止受影响会话，报告损坏」）。翻成 `error` 是对 §9.3 那四个状态的用法——
+/// 否则它会每 30 秒被领一次、失败一次，永远占着队列最前面那几个位置。
+#[tokio::test]
+async fn an_unreadable_session_abandons_the_run_instead_of_retrying_forever() {
+    let harness = HarnessBuilder::new()
+        .work(vec![MemoryWorkItem {
+            cursor: Seq(2),
+            ..work_item(RunStatus::Completed, interactive())
+        }])
+        .build()
+        .await;
+    harness.ledger.poison(&SessionId::from_raw("sess-1"));
+
+    let report = harness.manager.process_pending(4).await.unwrap();
+    assert_eq!(report.abandoned, 1, "{report:?}");
+    assert_eq!(report.failed, 0, "这不是下次重试，别记成失败：{report:?}");
+    assert!(
+        harness.llm.requests.lock().unwrap().is_empty(),
+        "证据都读不出来，一次模型都不该发"
+    );
+    assert_eq!(
+        harness.work.settled(),
+        vec![(RunId::from_raw("run-1"), MemoryWork::Error, Seq(2))],
+        "终态，队列不再为它空转"
+    );
 }
 
 /// 写库路径全测：一条用户原话落 `active + user_statement + unconfirmed`，带着证据。

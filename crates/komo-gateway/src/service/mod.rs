@@ -365,13 +365,17 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
                     .await
                 {
                     Ok(report)
-                        if report.processed > 0 || report.failed > 0 || report.skipped > 0 =>
+                        if report.processed > 0
+                            || report.failed > 0
+                            || report.skipped > 0
+                            || report.abandoned > 0 =>
                     {
                         tracing::info!(
                             processed = report.processed,
                             applied = report.applied,
                             skipped = report.skipped,
                             failed = report.failed,
+                            abandoned = report.abandoned,
                             "记忆提取这一轮结束"
                         );
                     }

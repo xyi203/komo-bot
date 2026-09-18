@@ -774,17 +774,19 @@ async fn auto_mode_runs_an_ordinary_shell_command_without_asking() {
     );
 }
 
-/// 同一个文件里，**危险形状仍然把人叫来**，而且批准之前什么都不跑（§7.4）。
+/// 同一个文件里，**危险形状也不问**：auto 是"不审批"，不是"少问几条"。
+///
+/// 靶子是一条不存在的路径（`rm -rf <workspace>/never`）：即使放行也删不掉别的东西，
+/// 但可以断言"一条审批都没产生"且"命令真的执行了"——先建文件，再看它没了。
 #[tokio::test]
-async fn auto_mode_still_stops_at_a_dangerous_shape() {
+async fn auto_mode_runs_even_a_dangerous_command_without_asking() {
     use crate::service::test_support::harness::{
         FakeLlm, Home, call_round, home_config, text_round,
     };
 
     let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
-    // 「`rm -rf /` 开头」正是清单里的形状；这条路径不存在，所以就算漏放行也删不掉东西。
-    let doomed = home.workspace().join("never-touched");
-    let command = format!("rm -rf {}", doomed.display());
+    let doom = home.workspace().join("never-touched");
+    let command = format!("rm -rf {}", doom.display());
     let llm = FakeLlm::new(vec![vec![
         call_round(
             1,
@@ -798,21 +800,13 @@ async fn auto_mode_still_stops_at_a_dangerous_shape() {
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
     let session = gateway.open_session().await;
+    // `workspaces/` 是 Gateway 启动时建的（§12），所以靶子要在这之后才落得下来。
+    std::fs::write(&doom, "x").expect("建个靶子");
+
     let run = gateway
-        .submit(&session, "auto-2", "把这个目录删了")
+        .submit(&session, "auto-2", "把这个文件删了")
         .await
         .run;
-
-    let approval = gateway.wait_approval().await;
-    assert!(
-        approval.reason.contains("dangerous-shapes"),
-        "要说清是撞上哪条形状：{}",
-        approval.reason
-    );
-    assert!(!doomed.exists(), "批准之前不能执行");
-
-    // 拒绝：Run 收场，命令始终没跑。
-    gateway.decide(&approval.approval, false).await;
     gateway
         .wait_status(
             &run,
@@ -820,5 +814,11 @@ async fn auto_mode_still_stops_at_a_dangerous_shape() {
             "收场",
         )
         .await;
-    assert!(!doomed.exists(), "拒绝了就更不能跑");
+
+    assert!(
+        gateway.approvals().await.is_empty(),
+        "auto 模式一条都不该问：{:?}",
+        gateway.approvals().await
+    );
+    assert!(!doom.exists(), "命令要真的执行过");
 }

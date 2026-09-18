@@ -162,10 +162,13 @@ operations = ["read_file"]
     let loaded = load_config(&fixture.options()).unwrap();
     let table = &loaded.snapshot.policy;
 
-    // 基表在：auto 的那几条（含"只问危险形状"），而且默认结论跟着基表走。
+    // 基表在：auto 唯一留下的那条 Deny，以及它自己的默认结论。
     let ids: Vec<&str> = table.rules.iter().map(|r| r.id.as_str()).collect();
-    assert!(ids.contains(&"dangerous-shapes"), "{ids:?}");
     assert!(ids.contains(&"policy-change"), "{ids:?}");
+    assert!(
+        !ids.contains(&"arbitrary-code"),
+        "auto 是「不审批」，不该还留着 Ask 规则：{ids:?}"
+    );
     assert_eq!(ids.last(), Some(&"my-own-allow"), "追加在基表之后：{ids:?}");
     assert_eq!(table.default, komo_kernel::policy::Effect::Allow);
     assert_eq!(table.rules.len(), RuleTable::auto().rules.len() + 1);

@@ -371,47 +371,62 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 | Memos 的写入、修改或删除                      | 按 Python 模块版本、函数、参数与用户指令范围审核                     |
 | 权限扩大或修改 Policy                         | 通过操作者配置流程处理，不能由模型自行放宽                           |
 
-**两套建议，操作者选一套。** 上面那张表落成 `RuleTable::initial()`（"strict"）；另有一套
-`RuleTable::auto()`（"auto"）——**只有危险形状才问**，日常的 shell / Python 不再每次打扰。
+**两套建议，操作者选一套。** 上面那张表落成 `RuleTable::initial()`（"strict"）；另一套是
+`RuleTable::auto()`（"auto"）——**不审批**：一条 `Ask` 都不留，agent 一路跑到底，不打断人。
 `policy.toml` 顶层用 `mode` 选基表，文件里的 `[[rules]]` 追加在基表之后；不写 `mode` 时
 文件本身就是整张表（"我全都要自己写"，也是这个键出现之前唯一的行为）。`mode` 与 `default`
 不能同时写：默认结论跟着基表走，两个答案放在一起是矛盾，宁可起不来也不猜。
 
 ```toml
 mode = "auto"          # 或 "strict"；省略 = 下面自己写整张表（这时才写 default）
+```
 
-[[rules]]              # 追加在基表之后，可以把基表的某条形状收回成 Deny
-id = "no-drop-database"
+auto 只有两个动作：默认结论 `Allow`，**没有一条 `Ask` 规则**；剩下的唯一一条 `Deny` 是
+`policy-change`（§7.1 第 9 行）。那条不是操作者设的边界，而是设计里那句"模型不能自行放宽
+自己的权限"——今天没有哪个工具产生这个操作，留着是为了那天它出现时不必再想一遍。
+
+**auto 与 strict 的差别就是"要不要人看一眼"这一件事，别的什么都没动**：范围外的文件、
+toolbox / Python 环境变更、模型发起的模块调用，在 strict 里都要问，在 auto 里都直接放行。
+不审批模式不能只在顺手的命令上成立——名字叫什么就得是什么。
+
+**代价必须说清楚：不审批 = 这个进程能做的事，agent 都能做。** 首版没有能约束任意代码的
+执行环境（`confines_arbitrary_code = false`，§7.3），所以 auto 之下 agent 可以读 `.env`、
+`rm -rf`、把数据发出去，一个都不问；§7.3 那句话的另一面正是这一条：**没有沙箱时，"别
+打扰我"和"这里有真正的禁区"不可能同时成立**。所以 auto 是操作者在文件里**显式选择**的，
+不是默认；默认那份 strict 至少让人每一次都看见。
+
+**想要一张网，只能自己加规则——并且要知道那只是网。** `Matcher::command_patterns` 是给
+这件事用的：命中形状的规则可以 `deny`（不问、直接不许）或 `ask`（仍然问一下）。匹配是
+**归一后的子串**（连续空白压成一个空格、两边降为小写，所以 `RM   -RF /` 与 `rm -rf /` 是
+同一件事）：
+
+```toml
+mode = "auto"
+
+# 想拦住的形状自己写：下面是那三类里最不会误伤的一批（一次手滑就没了 / 把控制权交出去 /
+# 把密钥念进模型上下文），删掉哪条就少拦哪条。
+[[rules]]
+id = "catastrophic-shapes"
 effect = "deny"
-reason = "删库这种事不要问我，直接不许"
+reason = "这几类形状不问你，直接不许"
 scopes = ["once"]
 requires_isolation = false
 
 [rules.matcher]
-command_patterns = ["drop database", "drop table"]
+operations = ["shell_command"]
+command_patterns = [
+  "rm -rf /", "rm -rf ~", "rm -rf *", "--no-preserve-root",  # 递归删除的灾难形状
+  "mkfs", "dd of=/dev/", "shred ", "> /dev/sd",              # 磁盘
+  "sudo ", "chown -r", "chmod -r 777",                        # 提权
+  "| sh", "| bash", "|sh", "|bash",                           # 管道进解释器
+  ".env", "gateway.json", "credentials.json", ".ssh", "id_rsa", "printenv",  # 凭据
+]
 ```
 
-auto 模式与 strict 的差别只有两处，都是刻意的：默认结论从 `Ask` 变成 `Allow`，并且删掉
-`arbitrary-code` 那条 Ask；换来一条 `dangerous-shapes`——命中形状清单的命令仍然 Ask。
-梯子决定了它成立：危险形状那条在 **Ask 组**，而没有任何一条 `Allow` 会命中一个 shell 计划
-（`read-within-roots` / `write-within-roots` 只匹配 `read_file` / `write_file`），所以它
-照样把人叫来；正常的命令一路走到默认 `Allow`。范围外文件、toolbox / Python 环境变更、
-模型发起的模块调用、以及"修改 Policy"那条 Deny 一条都没动。
-
-形状清单（`DANGEROUS_COMMANDS`）挑的是三类：**一次手滑就没了**（`rm -rf /`、`mkfs`、
-`dd of=/dev/`、`shred`）、**把控制权交出去**（`sudo`、管道进解释器、`ssh`、`git push
---force`、`kubectl delete`），以及**把密钥念进模型上下文**（`.env`、`gateway.json`、
-`credentials.json`、`.ssh`、`id_rsa`、`printenv`）——最后一组是线上证据逼出来的：agent
-找不到想要的数据时会去翻 Gateway 的发现文件（里面有 API 的 Bearer token）与 `.env`。
-匹配是**归一后**的子串：连续空白压成一个空格、两边降为
-小写，所以 `RM   -RF /` 与 `rm -rf /` 是同一件事。递归删除只列灾难形状，不列 `rm -rf`
-本身——`rm -rf target` 是日常操作，把它也拦下来，这个模式就退化成"每次都要问"。
-
-**它不是边界，别当成边界用。** 形状清单认的是命令文本，`rm -r -f /`、`find -delete`、
-变量拼出来的命令全在网外；而首版没有能约束任意代码的执行环境（`confines_arbitrary_code
-= false`，§7.3），所以 auto 模式下的 shell 是**真的没有边界**，这张网挡的是手滑，不是
-有意绕过。要边界就得先有沙箱，那是 §7.3 的事，不是把清单写长。这也是为什么 auto 是
-**文件里显式选择**的，不是默认：默认那份 strict 至少让人每一次都看见。
+**它不是边界，别当成边界用。** 形状清单认的是命令文本：`rm -r -f /`、`find -delete`、
+变量拼出来的命令全在网外，真正的边界只有 §7.3 的执行环境。上面那份清单来自线上证据——
+一条 WeChat 会话在找不到数据时去读 `runtime/gateway.json`（里面有 API 的 Bearer token）与
+`.env`——它挡的是手滑，不是有意绕过。
 
 ### 7.2 审批对象与范围
 

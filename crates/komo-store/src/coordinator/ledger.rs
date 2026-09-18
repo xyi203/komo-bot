@@ -57,6 +57,25 @@ impl Ledger for Coordinator {
             }
         }
 
+        // 会话的标题 = **第一条输入**（`sessions.title`，`komo session list` 与 TUI 列表的那
+        // 一列）。只填空的会话，所以后来的消息改不掉它。写不进去不该让这条输入失败——
+        // 标题是给人看的，输入是任务。
+        if let Some(title) = title_for(&input.text) {
+            let session = self.session.clone();
+            if let Err(error) = self
+                .db
+                .with_write_retry(move |ex| {
+                    let (session, title) = (session.clone(), title.clone());
+                    Box::pin(async move {
+                        session::set_title_if_empty_in(ex, &session, &title, now).await
+                    }) as BoxFuture<'_, Result<(), StoreError>>
+                })
+                .await
+            {
+                tracing::warn!(%error, session = %self.session, "标题没记到会话上");
+            }
+        }
+
         // ① state.db 用请求键预留 Run ID，状态 ingesting，**仅存输入哈希与来源**。
         let reserved = {
             let input = input.clone();
@@ -755,6 +774,22 @@ async fn existing_seq(db: &Db, event_id: &EventId) -> Result<Option<Seq>, Ledger
     .map_err(store_to_ledger)
 }
 
+/// 会话标题取哪一段：输入的**第一行**（去掉首尾空白），最多 [`TITLE_MAX_CHARS`] 个字符。
+///
+/// 空白输入没有标题可言（返回 `None`，于是空会话在列表里仍然是"无标题"，而不是一行空白）。
+/// 截断按**字符**切，不按字节——中文按字节切会切出半个字。
+fn title_for(text: &str) -> Option<String> {
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    let mut title: String = first.chars().take(TITLE_MAX_CHARS).collect();
+    if first.chars().count() > TITLE_MAX_CHARS {
+        title.push('…');
+    }
+    Some(title)
+}
+
+/// 标题最多这么多个字符。够列表里认出是哪个会话，又不至于把整段话塞进一列。
+const TITLE_MAX_CHARS: usize = 60;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,6 +901,41 @@ mod tests {
             .iter()
             .map(|e| e.type_name().to_string())
             .collect()
+    }
+
+    /// 会话的标题是**第一条输入**，而且只写一次（`komo session list` 那一列不再全是
+    /// 「（无标题）」）。空白输入不产生标题。
+    #[tokio::test]
+    async fn the_first_input_becomes_the_session_title_once() {
+        let f = fixture().await;
+        f.coordinator
+            .accept_input(input("api:1", "  空调状态\n顺便看看湿度  ", &f.session))
+            .await
+            .unwrap();
+        let row = session::get(&f.db, &f.session).await.unwrap().unwrap();
+        assert_eq!(row.title, "空调状态", "取第一行，去掉首尾空白");
+
+        f.coordinator
+            .accept_input(input("api:2", "热水器呢", &f.session))
+            .await
+            .unwrap();
+        let row = session::get(&f.db, &f.session).await.unwrap().unwrap();
+        assert_eq!(row.title, "空调状态", "后来的消息不改写已有的标题");
+    }
+
+    /// 长标题按**字符**截断（中文按字节切会切出半个字）。
+    #[test]
+    fn a_long_title_is_cut_on_a_character_boundary() {
+        let long = "很".repeat(TITLE_MAX_CHARS + 10);
+        let title = title_for(&long).unwrap();
+        assert_eq!(
+            title.chars().count(),
+            TITLE_MAX_CHARS + 1,
+            "60 个字加一个省略号"
+        );
+        assert!(title.ends_with('…'));
+        assert_eq!(title_for("   \n  \t "), None, "空白输入没有标题");
+        assert_eq!(title_for("就好"), Some("就好".into()));
     }
 
     /// §8.5 的一整条箭头走一遍：输入 → 一轮回复 → 计划 → 开始 → 结果 → 终态。

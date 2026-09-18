@@ -155,6 +155,32 @@ pub async fn set_workdir_in(
         .map_err(map_toasty)
 }
 
+/// 会话的标题**只写一次**：空着才写（§12 的 `sessions.title`，`komo session list` 那一列）。
+///
+/// 已经有标题就不动：后来的消息不该把这一行改掉——它是这个会话在列表里的名字，不是
+/// 最后一次说话的内容。
+pub async fn set_title_if_empty_in(
+    ex: &mut dyn Executor,
+    session: &SessionId,
+    title: &str,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let Some(mut row) = get_in(ex, session).await? else {
+        return Err(StoreError::NotFound {
+            what: format!("session {session}"),
+        });
+    };
+    if !row.title.trim().is_empty() {
+        return Ok(());
+    }
+    row.update()
+        .title(title)
+        .updated_at(to_ts(now))
+        .exec(ex)
+        .await
+        .map_err(map_toasty)
+}
+
 /// 记一个 Session 的当前 Run。
 pub async fn set_current_run_in(
     ex: &mut dyn Executor,

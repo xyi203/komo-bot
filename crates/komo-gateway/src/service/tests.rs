@@ -647,8 +647,39 @@ async fn wait_for_run(
 #[allow(dead_code)]
 fn unused(_: RequestKey) {}
 
-// ---------------------------------------------------------------- §7.1 的 auto 模式
+/// `komo session list` / TUI 列表那一列的标题：第一条消息的前 60 个字符，后来改不掉。
+///
+/// 没有它，列表里每一行都是「（无标题）」——今晚一排 8 个会话全是这样，认不出哪个是哪个。
+#[tokio::test]
+async fn the_session_list_shows_the_first_message_as_its_title() {
+    let home = crate::service::test_support::harness::Home::new();
+    let llm = crate::service::test_support::harness::FakeLlm::new(vec![vec![
+        crate::service::test_support::harness::text_round(1, "好。"),
+    ]]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    gateway
+        .submit(&session, "title-1", "空调状态\n顺便看看湿度")
+        .await;
 
+    let (status, body) = gateway.get("/v1/sessions").await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("空调状态"),
+        "列表里要有标题，读到的是：{}",
+        &body[..body.len().min(400)]
+    );
+
+    // 第二条消息不改写标题。
+    gateway.submit(&session, "title-2", "热水器呢").await;
+    let (_, body) = gateway.get("/v1/sessions").await;
+    assert!(body.contains("空调状态"), "{body}");
+    assert!(!body.contains("热水器呢"), "后来的消息不该改标题：{body}");
+}
+
+// ---------------------------------------------------------------- §7.1 的 auto 模式
 /// `policy.toml` 写 `mode = "auto"`：**日常命令不问就跑**（§7.1）。
 ///
 /// 这是这个模式存在的全部理由——`mode = "strict"`（以及不写 `policy.toml` 时的初始建议）

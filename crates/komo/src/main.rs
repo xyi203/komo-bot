@@ -12,7 +12,6 @@ use std::path::Path;
 
 use clap::{Parser, Subcommand};
 use komo_client::{TuiMode, run_tui};
-use komo_kernel::protocol::http::CreateSessionRequest;
 use komo_kernel::types::ids::SessionId;
 
 #[derive(Parser)]
@@ -418,15 +417,13 @@ async fn main() {
 /// 跑一条命令。`Ok(None)` = 这条命令自己管输出（TUI、前台 Gateway）。
 async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
     match cli.command {
-        // `komo`：确保本机 Gateway 就绪，创建新 Session，进入 TUI 聊天（§3）。
+        // `komo`：确保本机 Gateway 就绪，进入 TUI 聊天（§3）。**会话不在这里建**——
+        // TUI 里发出第一条消息时才铸：看一眼、一个字没发就退出，不该在账本和磁盘上
+        // 留下一个空壳会话。
         None => {
             init_tracing(None);
             let client = connect::connect_or_start(home).await?;
-            let session = client
-                .create_session(&CreateSessionRequest::default())
-                .await
-                .map_err(|error| error.to_string())?;
-            run_tui(client, session.session, TuiMode::New)
+            run_tui(client, None, TuiMode::New)
                 .await
                 .map_err(|error| error.to_string())?;
             Ok(None)
@@ -440,7 +437,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
             let session =
                 komo_gateway::http::fetch_home_session(&base_url, discovery.token.as_deref())
                     .await?;
-            run_tui(client, session.session, TuiMode::Home)
+            run_tui(client, Some(session.session), TuiMode::Home)
                 .await
                 .map_err(|error| error.to_string())?;
             Ok(None)
@@ -448,9 +445,13 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
         Some(Command::Resume { session_id }) => {
             init_tracing(None);
             let client = connect::connect_or_start(home).await?;
-            run_tui(client, SessionId::from_raw(session_id), TuiMode::Resume)
-                .await
-                .map_err(|error| error.to_string())?;
+            run_tui(
+                client,
+                Some(SessionId::from_raw(session_id)),
+                TuiMode::Resume,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
             Ok(None)
         }
         Some(Command::Gateway { foreground, action }) => gateway(home, foreground, action).await,

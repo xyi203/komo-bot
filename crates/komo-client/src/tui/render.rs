@@ -80,7 +80,11 @@ fn identity_line(app: &App) -> Paragraph<'static> {
         ),
         Span::raw(" "),
         Span::styled(
-            app.session.to_string(),
+            match &app.session {
+                Some(session) => session.to_string(),
+                // `komo` 裸命令的第一条消息之前：会话还没铸出来，别在这里编一个。
+                None => "还没有会话".to_string(),
+            },
             Style::default().fg(Color::DarkGray),
         ),
     ];
@@ -567,7 +571,7 @@ fn main() {
 ";
 
     fn conversation_app() -> App {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         let mut events = fixture::conversation();
         // 把最后一轮的回复换成那段长 Markdown。
         if let EventPayload::MessageAssistant(body) = &mut events[7].payload {
@@ -626,7 +630,7 @@ fn main() {
 
     #[test]
     fn a_submitted_message_is_visible_before_the_event_stream_echoes_it() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         app.input.set("刚发出去的消息");
         let effects = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(effects.as_slice(), [Effect::Submit { .. }]));
@@ -638,7 +642,7 @@ fn main() {
 
     #[test]
     fn a_submit_failure_is_attached_to_the_message_that_failed() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         app.input.set("这条没有送到");
         let effects = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let Effect::Submit { request_key, .. } = &effects[0] else {
@@ -656,7 +660,7 @@ fn main() {
 
     #[test]
     fn a_run_failure_shows_its_reason_in_the_transcript() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         let events = vec![
             fixture::conversation()[0].clone(),
             fixture::event(
@@ -732,7 +736,7 @@ fn main() {
 
     #[test]
     fn an_uncertain_call_shows_two_question_marks_on_screen() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         let mut events = fixture::conversation();
         if let EventPayload::ToolResult(body) = &mut events[6].payload {
             body.status = komo_kernel::types::refs::ToolResultStatus::Uncertain;
@@ -744,7 +748,7 @@ fn main() {
 
     #[test]
     fn the_approval_popup_shows_the_five_items_and_does_not_overflow() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         feed(&mut app, &fixture::conversation()[..4]);
         app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
 
@@ -788,7 +792,7 @@ fn main() {
 
     #[test]
     fn the_popup_keys_stay_visible_even_when_the_body_does_not_fit() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         feed(&mut app, &fixture::conversation()[..4]);
         app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
 
@@ -813,7 +817,7 @@ fn main() {
 
     #[test]
     fn a_draft_shows_on_screen_with_a_generating_marker_and_then_goes_away() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         feed(&mut app, &fixture::conversation()[..3]);
         app.apply(ServerEvent::Frame(Box::new(SseFrame {
             id: komo_kernel::types::ids::Seq(100),
@@ -839,7 +843,7 @@ fn main() {
     /// 为什么"还是没人答得上。理由住在 fold 的第二个维度里（`wait`），不在状态里。
     #[test]
     fn the_status_line_says_what_a_waiting_run_is_waiting_for() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         feed(&mut app, &fixture::conversation()[..3]);
         feed(
             &mut app,
@@ -867,7 +871,7 @@ fn main() {
     /// 状态行上的条数是**三类合计**（§7.5）：只有审批那一种会被漏掉另外两条的等待。
     #[test]
     fn the_status_line_counts_every_kind_waiting_on_a_person() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         app.apply(ServerEvent::Pending(vec![
             fixture::intervention_summary(
                 "7K2M",
@@ -899,7 +903,7 @@ fn main() {
 
     #[test]
     fn the_command_palette_appears_while_a_slash_command_is_being_typed() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         app.input.set("/ap");
         let screen = rows(&snapshot(&app, 80, 20)).join("\n");
         assert!(screen.contains("/approve"), "{screen}");
@@ -908,7 +912,7 @@ fn main() {
 
     #[test]
     fn a_folded_paste_shows_its_chip_not_its_content() {
-        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         app.handle_input(crate::tui::paste::InputEvent::Paste(
             "机密第一行\n机密第二行\n机密第三行\n机密第四行".into(),
         ));

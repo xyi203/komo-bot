@@ -268,7 +268,9 @@ fn one_line(text: &str) -> String {
 /// TUI 的全部状态。
 #[derive(Debug, Clone)]
 pub struct App {
-    pub session: SessionId,
+    /// 这个界面正对着哪个会话。**`None` = 还没有**：`komo` 裸命令不在启动时建会话，
+    /// 它在第一条消息送出去之前由驱动铸出来（[`crate::tui::run_tui`]）。
+    pub session: Option<SessionId>,
     pub mode: TuiMode,
     pub phase: Phase,
     /// 由 kernel 的 fold 折出来的消息面。
@@ -330,7 +332,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session: SessionId, mode: TuiMode, key_seed: impl Into<String>) -> Self {
+    pub fn new(session: Option<SessionId>, mode: TuiMode, key_seed: impl Into<String>) -> Self {
         App {
             session,
             mode,

@@ -154,6 +154,11 @@ impl App {
         };
         match command {
             Command::New => {
+                // 会话还没铸出来（`komo` 裸命令、还没发过消息）：没有可划的边界。
+                if self.session.is_none() {
+                    self.fail("还没有会话：/new 先要有第一条消息");
+                    return Vec::new();
+                }
                 self.note("已划一条回放边界");
                 vec![Effect::Boundary]
             }
@@ -167,7 +172,13 @@ impl App {
                     Vec::new()
                 }
             },
-            Command::Status => vec![Effect::FetchStatus],
+            Command::Status => {
+                if self.session.is_none() {
+                    self.fail("还没有会话：/status 先要有第一条消息");
+                    return Vec::new();
+                }
+                vec![Effect::FetchStatus]
+            }
             Command::Pending => {
                 // 命令行问的，空清单也要印一句"没有"（自动那一问不印，见 `Pending`）。
                 self.asking_pending = true;

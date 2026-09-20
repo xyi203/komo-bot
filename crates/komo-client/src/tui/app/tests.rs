@@ -17,7 +17,7 @@ use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::{RetryCause, RunState, SessionState, ToolCallState, WaitReason};
 
 fn app() -> App {
-    App::new(fixture::session(), TuiMode::New, "seed")
+    App::new(Some(fixture::session()), TuiMode::New, "seed")
 }
 
 fn key(code: KeyCode) -> KeyEvent {
@@ -276,7 +276,7 @@ fn r_approves_the_run_scope_only_when_policy_offered_it() {
     // 一条只可批本次的请求：`r` 不生效，而且说出为什么。
     let mut record = fixture::approval_record();
     record.scopes = vec![ApprovalScope::Once];
-    let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+    let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
     app.apply(ServerEvent::Approval(Box::new(record)));
     assert!(app.handle_key(key(KeyCode::Char('r'))).is_empty());
     assert!(notices(&app).contains("不可范围化"), "{}", notices(&app));
@@ -335,7 +335,7 @@ fn enter_confirms_the_highlighted_row() {
     // Policy 没标可范围化：菜单里没有那一行，默认落点跟着往下挪。
     let mut record = fixture::approval_record();
     record.scopes = vec![ApprovalScope::Once];
-    let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+    let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
     app.apply(ServerEvent::Approval(Box::new(record)));
     let effects = app.handle_key(key(KeyCode::Enter));
     assert!(
@@ -1004,7 +1004,7 @@ fn a_boundary_moves_the_replay_window_without_losing_the_transcript() {
 
 #[test]
 fn a_resume_reads_the_whole_history_before_it_becomes_interactive() {
-    let mut app = App::new(fixture::session(), TuiMode::Resume, "seed");
+    let mut app = App::new(Some(fixture::session()), TuiMode::Resume, "seed");
     assert!(app.phase.is_backfilling());
 
     let events = fixture::conversation();
@@ -1041,7 +1041,7 @@ fn a_resume_reads_the_whole_history_before_it_becomes_interactive() {
 
 #[test]
 fn a_pending_approval_pops_the_moment_the_history_is_read() {
-    let mut app = App::new(fixture::session(), TuiMode::Resume, "seed");
+    let mut app = App::new(Some(fixture::session()), TuiMode::Resume, "seed");
     let mut events = fixture::conversation()[..4].to_vec();
     events.push(fixture::event(
         5,
@@ -1076,7 +1076,7 @@ fn a_pending_approval_pops_the_moment_the_history_is_read() {
 
 #[test]
 fn a_new_session_does_not_wait_for_a_backfill() {
-    let app = App::new(fixture::session(), TuiMode::New, "seed");
+    let app = App::new(Some(fixture::session()), TuiMode::New, "seed");
     assert_eq!(app.phase, Phase::Interactive);
 }
 
@@ -1482,7 +1482,7 @@ fn the_all_command_answers_only_the_approvals() {
     assert_eq!(handles, &vec!["7K2M".to_string()], "只有审批那一条");
 
     // 一条审批都没有时，明说没有——别静默什么都不做。
-    let mut only_verify = App::new(fixture::session(), TuiMode::New, "seed");
+    let mut only_verify = App::new(Some(fixture::session()), TuiMode::New, "seed");
     only_verify.apply(ServerEvent::Pending(vec![fixture::intervention_summary(
         "run-1",
         InterventionKind::Verify,
@@ -1583,7 +1583,7 @@ fn an_answer_receipt_prints_the_note_and_drops_it_from_the_list() {
 /// "`/approve all` 说没有待处理、而 `GET /v1/approvals` 列着三条"会同时成立。
 #[test]
 fn approvals_from_other_sessions_are_visible_here() {
-    let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+    let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
     assert_eq!(app.pending_count(), 0);
 
     // 本会话一条 `approval.requested` 都没有——清单照样把三条带回来。

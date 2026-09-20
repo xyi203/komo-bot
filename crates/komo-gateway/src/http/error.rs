@@ -15,6 +15,10 @@ use komo_kernel::traits::{GatewayError, LedgerError, RepoError, StoreError};
 pub struct ApiFailure {
     pub status: StatusCode,
     pub error: ApiError,
+    /// 覆盖响应体。**只在失败正文不是错误结构时用**——今天只有 `purge` 的
+    /// [`PurgeBlocked`](komo_kernel::protocol::http::PurgeBlocked)：§8.10 要求它"列出要先
+    /// 处置什么"，那是一份数据，不是一个错误消息。
+    pub body: Option<serde_json::Value>,
 }
 
 impl ApiFailure {
@@ -22,6 +26,7 @@ impl ApiFailure {
         ApiFailure {
             status: status_of(code),
             error: ApiError::new(code, message),
+            body: None,
         }
     }
 
@@ -31,6 +36,59 @@ impl ApiFailure {
 
     pub fn invalid(message: impl Into<String>) -> Self {
         ApiFailure::new(ErrorCode::InvalidRequest, message)
+    }
+
+    /// 这个会话不接受新输入（§8.10）：409，而且**说清楚是哪种状态**——`closing`（还在
+    /// 服务、只是不收新活）、`deleted`（逻辑删除完成）、`purged`（内容已回收）三句话
+    /// 对操作者意味着三件不同的事。
+    pub fn session_not_open(state: komo_kernel::types::status::SessionState) -> Self {
+        let what = match state {
+            komo_kernel::types::status::SessionState::Active => "接受输入",
+            komo_kernel::types::status::SessionState::Closing => {
+                "正在关闭（`closing`）：未完成的 Run 照常跑完，但不再接受新输入"
+            }
+            komo_kernel::types::status::SessionState::Deleted => {
+                "已逻辑删除（`deleted`）：要接着用它得先明确恢复，不是「重新开始」"
+            }
+            komo_kernel::types::status::SessionState::Purged => {
+                "内容已回收（`purged`）：只剩墓碑行，不接受任何新内容"
+            }
+        };
+        let mut failure = ApiFailure::new(
+            ErrorCode::Conflict,
+            format!("这个会话当前状态是 {}（{what}）", state.as_str()),
+        );
+        failure.status = StatusCode::CONFLICT;
+        failure
+    }
+
+    /// 结论与种类不符（§7.5：结论按种类分派，不混用）：`422` + `ErrorCode::InvalidRequest`。
+    ///
+    /// 状态码是 422 而不是 400：请求本身读得懂，是**它与此刻那条 Intervention 对不上**
+    /// ——和配置校验不过同一类（`CONFIG_INVALID` 也是 422）。
+    pub fn verdict_mismatch(message: impl Into<String>) -> Self {
+        let mut failure = ApiFailure::new(ErrorCode::InvalidRequest, message);
+        failure.status = StatusCode::UNPROCESSABLE_ENTITY;
+        failure
+    }
+
+    /// `purge` 的引用检查没过（§8.10 第 3 条）：409，正文是 [`PurgeBlocked`]。
+    ///
+    /// [`PurgeBlocked`]: komo_kernel::protocol::http::PurgeBlocked
+    pub fn purge_blocked(blocked: komo_kernel::protocol::http::PurgeBlocked) -> Self {
+        let message = format!(
+            "先处置这些再回收内容：{}",
+            blocked
+                .blockers
+                .iter()
+                .map(|blocker| format!("{}（{}）", blocker.what, blocker.detail))
+                .collect::<Vec<_>>()
+                .join("；")
+        );
+        let mut failure = ApiFailure::new(ErrorCode::Conflict, message);
+        failure.status = StatusCode::CONFLICT;
+        failure.body = serde_json::to_value(&blocked).ok();
+        failure
     }
 
     /// 配置校验不过：带上键名定位，**不带值**（§3 第 3 步）。
@@ -63,7 +121,11 @@ pub fn status_of(code: ErrorCode) -> StatusCode {
 
 impl IntoResponse for ApiFailure {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.error })).into_response()
+        match self.body.clone() {
+            // `PurgeBlocked` 这类：状态码与错误码仍然在，但正文是那份数据（§8.10）。
+            Some(body) => (self.status, Json(body)).into_response(),
+            None => (self.status, Json(ErrorBody { error: self.error })).into_response(),
+        }
     }
 }
 

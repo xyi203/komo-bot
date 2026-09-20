@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::types::ids::{ApprovalId, AttemptId, EventId, RunId, Seq, ShortId, ToolCallId};
 use crate::types::plan::PlanHash;
 use crate::types::refs::{OutputRef, PayloadRef, ToolResultStatus};
-use crate::types::status::{RunStatus, ToolCallState};
+use crate::types::status::{RunState, ToolCallState, WaitReason};
 use crate::types::turn::{Role, ToolCallRequest};
 
 use super::Surface;
@@ -51,7 +51,13 @@ pub struct SurfaceToolResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunView {
     pub run: RunId,
-    pub status: RunStatus,
+    pub status: RunState,
+    /// 停在什么上（只在 `status == Waiting` 时有意义，§8.4）。
+    ///
+    /// 它与状态是**两个维度**：状态说"能不能跑"，这一格说"在等谁、等到什么时候"。
+    /// 少了它，"排队二十分钟"就只是一句状态，答不出为什么。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitReason>,
     /// 承载输入的事件（`run.accepted`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_event: Option<EventId>,

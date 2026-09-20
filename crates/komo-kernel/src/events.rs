@@ -27,7 +27,7 @@ use crate::types::ids::{
 use crate::types::model::EffortSetting;
 use crate::types::plan::{ExecutionPlan, PlanHash, PlanSource};
 use crate::types::refs::{ContentRef, OutputRef, PayloadRef, ToolResultStatus};
-use crate::types::status::AttemptState;
+use crate::types::status::{AttemptState, WaitReason};
 use crate::types::turn::{MemoryUse, SeqRange, ToolCallRequest};
 
 /// 当前的事件格式版本。
@@ -216,14 +216,17 @@ event_payload! {
     RunQueued(RunQueued) => "run.queued",
     /// 某个执行实例领取了它。
     RunStarted(RunStarted) => "run.started",
-    /// 停在一条审批上，已释放执行名额（§7.4）。
-    RunWaitingApproval(RunWaitingApproval) => "run.waiting_approval",
-    /// 停在一次有界退避上。
-    RunWaitingRetry(RunWaitingRetry) => "run.waiting_retry",
-    /// 上一个执行实例没有收尾。停机或崩溃，不等于用户取消。
-    RunInterrupted(RunInterrupted) => "run.interrupted",
-    /// 需要操作者判断。
-    RunNeedsAttention(RunNeedsAttention) => "run.needs_attention",
+    /// 停在某个外部条件上，已释放执行名额（§8.4）：审批答复、退避到点、干预答复、
+    /// 前一条 Run 进终态。`reason` 说清是哪一种——**状态只有一个 `waiting`**，
+    /// "为什么停着"在这一条事件里。
+    RunWaiting(RunWaiting) => "run.waiting",
+    /// 上一次执行没有收尾，领取权已交还（§8.9）。**它不是状态**：那条 Run 由 reconcile
+    /// 当场判成 `queued`（安全）或 `waiting + intervention`（副作用不明），所以这里只
+    /// 记"发生过什么"，不写状态。
+    RunReclaimed(RunReclaimed) => "run.reclaimed",
+    /// 操作者在 Intervention 清单上放弃（§7.5）。**与取消分得开**：不是用户不想跑了，
+    /// 而是这件事不会再有下文。
+    RunAbandoned(RunAbandoned) => "run.abandoned",
     /// 正常结束，带最终回复。
     RunCompleted(RunCompleted) => "run.completed",
     RunFailed(RunFailed) => "run.failed",
@@ -291,24 +294,19 @@ pub struct RunStarted {
     pub generation: u64,
 }
 
+/// 停在某个外部条件上（§8.4）。
+///
+/// **只记"在等什么"，不记"停在哪个调用上"**：后者是派生的——等审批时它在审批行上
+/// （`approval_requests.call_id`），结果不明时它在 `tool_calls.state = 'uncertain'` 那一条上
+/// （§7.5）。事件里再存一份就是同一个事实的第三个落点，而它会漂。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunWaitingApproval {
-    pub approval: ApprovalId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call: Option<ToolCallId>,
+pub struct RunWaiting {
+    pub reason: WaitReason,
 }
 
+/// 上一次执行没有收尾（停机、崩溃、handler 任务死了），领取权已交还（§8.9）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunWaitingRetry {
-    pub attempts: u32,
-    #[serde(with = "time::serde::rfc3339")]
-    pub next_retry_at: OffsetDateTime,
-    #[serde(default)]
-    pub reason: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunInterrupted {
+pub struct RunReclaimed {
     /// 哪个执行实例没有收尾。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<crate::types::ids::ExecutorId>,
@@ -316,12 +314,13 @@ pub struct RunInterrupted {
     pub reason: String,
 }
 
+/// 操作者放弃（§7.5 的 `abandon`）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RunNeedsAttention {
-    pub reason: String,
-    /// 停在哪个调用上（如果有）。
+pub struct RunAbandoned {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call: Option<ToolCallId>,
+    pub by: Option<PeerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

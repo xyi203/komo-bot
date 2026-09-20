@@ -41,7 +41,10 @@ pub use refs::{
     AttemptRef, ContentRef, INLINE_ARGUMENT_LIMIT_BYTES, OutputRef, PREVIEW_LIMIT_BYTES,
     PayloadRef, PublishedOutput, ToolResultBody, ToolResultStatus, VerifiedOutput,
 };
-pub use status::{AttemptState, Claimed, FinalEventRef, RunEnd, RunStatus, ToolCallState, Wait};
+pub use status::{
+    AttemptState, Claimed, FinalEventRef, RetryCause, RunEnd, RunState, SessionState,
+    ToolCallState, WaitReason,
+};
 pub use tool::{
     CancelToken, PyError, PythonJob, PythonResult, ResumedCall, ToolContext, ToolDefinition,
     ToolError, ToolOutput, WorkspaceRoot,

@@ -10,14 +10,14 @@ use crate::traits::*;
 use crate::types::ids::*;
 
 use crate::events::{
-    ConversationBoundary, EVENT_FORMAT_VERSION, Event, EventPayload, MessageAssistant, RunAccepted,
-    RunCancelled, RunCompleted, RunFailed, RunNeedsAttention, RunQueued, RunStarted,
-    RunWaitingApproval, RunWaitingRetry, ToolPlanned, ToolResult, ToolStarted,
+    ConversationBoundary, EVENT_FORMAT_VERSION, Event, EventPayload, MessageAssistant,
+    RunAbandoned, RunAccepted, RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted,
+    RunWaiting, ToolPlanned, ToolResult, ToolStarted,
 };
 use crate::fold::{Surface, fold};
 use crate::types::plan::{ExecutionPlan, PlanHash};
 use crate::types::refs::{PublishedOutput, ToolResultStatus};
-use crate::types::status::{AttemptState, RunEnd, Wait};
+use crate::types::status::{AttemptState, RunEnd, WaitReason};
 use crate::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse};
 
 use super::TestClock;
@@ -339,7 +339,7 @@ impl Ledger for MemLedger {
         Ok(())
     }
 
-    async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError> {
+    async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
         let mut state = self.state.lock().expect("账本");
         let session = state
             .sessions
@@ -348,23 +348,7 @@ impl Ledger for MemLedger {
             .ok_or_else(|| LedgerError::NotFound {
                 what: format!("run {run}"),
             })?;
-        let payload = match wait {
-            Wait::Approval { approval, call, .. } => {
-                EventPayload::RunWaitingApproval(RunWaitingApproval { approval, call })
-            }
-            Wait::Retry {
-                attempts,
-                next_retry_at,
-                reason,
-            } => EventPayload::RunWaitingRetry(RunWaitingRetry {
-                attempts,
-                next_retry_at,
-                reason,
-            }),
-            Wait::Attention { reason } => {
-                EventPayload::RunNeedsAttention(RunNeedsAttention { reason, call: None })
-            }
-        };
+        let payload = EventPayload::RunWaiting(RunWaiting { reason: wait });
         self.append(&mut state, &session, Some(run.clone()), payload);
         Ok(())
     }
@@ -390,6 +374,10 @@ impl Ledger for MemLedger {
             RunEnd::Failed { reason } => EventPayload::RunFailed(RunFailed { reason }),
             RunEnd::Cancelled { by } => EventPayload::RunCancelled(RunCancelled {
                 by: by.map(crate::types::chat::PeerId::new),
+            }),
+            RunEnd::Abandoned { by, reason } => EventPayload::RunAbandoned(RunAbandoned {
+                by: by.map(crate::types::chat::PeerId::new),
+                reason,
             }),
         };
         self.append(&mut state, &session, Some(run.clone()), payload);

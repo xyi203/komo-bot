@@ -12,7 +12,7 @@ use komo_kernel::traits::{Clock, StoreError};
 use komo_kernel::types::ids::{RunId, Seq, SessionId};
 use komo_kernel::types::memory::MemoryWork;
 use komo_kernel::types::plan::PlanSource;
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::RunState;
 use komo_store::Db;
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ pub struct MemoryWorkItem {
     pub run: RunId,
     pub session: SessionId,
     /// 终态。取消的不整理成经验（§9.3）。
-    pub status: RunStatus,
+    pub status: RunState,
     /// 来源。Cron 的 Run 不整理用户偏好（§9.3）。
     pub source: PlanSource,
     /// 已经处理到哪条 seq。
@@ -69,7 +69,7 @@ impl MemoryWorkLog for DbMemoryWork {
             .map(|record| MemoryWorkItem {
                 run: record.run,
                 session: record.session,
-                status: record.status,
+                status: record.state,
                 source: record.source,
                 cursor: record.memory_cursor,
             })

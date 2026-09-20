@@ -7,15 +7,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use komo_kernel::events::{
-    ConversationBoundary, EventPayload, MessageAssistant, RunAccepted, RunCancelled, RunCompleted,
-    RunFailed, RunNeedsAttention, RunQueued, RunStarted, RunWaitingApproval, RunWaitingRetry,
-    ToolPlanned, ToolResult, ToolStarted,
+    ConversationBoundary, EventPayload, MessageAssistant, RunAbandoned, RunAccepted, RunCancelled,
+    RunCompleted, RunFailed, RunQueued, RunStarted, RunWaiting, ToolPlanned, ToolResult,
+    ToolStarted,
 };
 use komo_kernel::traits::{Ledger, LedgerError, StoreError};
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::refs::{INLINE_ARGUMENT_LIMIT_BYTES, PublishedOutput, ToolResultStatus};
-use komo_kernel::types::status::{AttemptState, RunEnd, Wait};
+use komo_kernel::types::status::{AttemptState, RunEnd, WaitReason};
 use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse};
 use time::OffsetDateTime;
 
@@ -194,7 +194,7 @@ impl Ledger for Coordinator {
                 Box::pin(async move {
                     session::index_event_in(ex, &accepted).await?;
                     session::index_event_in(ex, &queued).await?;
-                    runs::mark_queued_in(ex, &run, &input_event, now).await?;
+                    runs::mark_queued_in(ex, &run, &input_event, input_seq, now).await?;
                     session::set_current_run_in(ex, &session, Some(run.to_string()), now).await?;
                     session::advance_applied_in(ex, &session, queued.seq(), bytes, now).await?;
                     Ok(())
@@ -520,59 +520,35 @@ impl Ledger for Coordinator {
         .await
     }
 
-    async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError> {
-        let status = wait.status();
-        let payload = match &wait {
-            // `attempt` **故意不落**：`approval_requests` 上没有尝试这一列，而
-            // `Wait::Approval::attempt` 通常本来就是 None——审批发生在 `tool.started`
-            // 之前，那时候一次尝试都还没有。真要记它得先给那张耐久表加一列，不在这一波。
-            Wait::Approval {
-                approval,
-                call,
-                attempt: _,
-            } => EventPayload::RunWaitingApproval(RunWaitingApproval {
-                approval: approval.clone(),
-                call: call.clone(),
-            }),
-            Wait::Retry {
-                attempts,
-                next_retry_at,
-                reason,
-            } => EventPayload::RunWaitingRetry(RunWaitingRetry {
-                attempts: *attempts,
-                next_retry_at: *next_retry_at,
-                reason: reason.clone(),
-            }),
-            Wait::Attention { reason } => EventPayload::RunNeedsAttention(RunNeedsAttention {
-                reason: reason.clone(),
-                call: None,
-            }),
-        };
+    async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
+        // 「停在哪个调用上」**不在这条事件里**：审批的调用在 `approval_requests.call_id`
+        // 上，结果不明的调用在 `tool_calls.state = 'uncertain'` 那一条上——两处各自是权威，
+        // 事件里再存一份只会和它们漂移（§7.5）。
+        let payload = EventPayload::RunWaiting(RunWaiting {
+            reason: wait.clone(),
+        });
 
         let appended = self.append(Some(run.clone()), payload).await?;
 
         let run_id = run.clone();
-        let (attempts, next_retry_at, reason) = match &wait {
-            Wait::Retry {
-                attempts,
-                next_retry_at,
-                reason,
-            } => (*attempts, Some(*next_retry_at), Some(reason.clone())),
-            Wait::Attention { reason } => (0, None, Some(reason.clone())),
-            Wait::Approval { .. } => (0, None, None),
-        };
         self.commit(&appended, move |ex, _appended, now| {
-            let (run_id, reason) = (run_id.clone(), reason.clone());
+            let (run_id, wait) = (run_id.clone(), wait.clone());
             Box::pin(async move {
-                runs::mark_waiting_in(ex, &run_id, status, attempts, next_retry_at, reason, now)
-                    .await
+                // 让出的那一刻**一并交还领取权**（在 `mark_waiting_in` 里），否则
+                // `claimed_by IS NULL` 那条候选永远筛不到它，一个"等一会儿"就变成永久
+                // 停摆（§7.4）。
+                //
+                // `last_error` 不再是"为什么停下"的通道：停下这件事现在由 `WaitReason`
+                // 说完（`runs.wait_kind / wait_ref / wake_at`），而 `blocked` 条目的正文
+                // 由清单当场派生（§7.5）。写一句自由文本只会与它漂移。
+                runs::mark_waiting_in(ex, &run_id, &wait, None, now).await
             }) as BoxFuture<'_, Result<(), StoreError>>
         })
         .await
     }
 
     async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError> {
-        let status = end.status();
+        let state = end.state();
         let (payload, reason) = match &end {
             RunEnd::Completed {
                 final_message,
@@ -603,6 +579,13 @@ impl Ledger for Coordinator {
                 }),
                 None,
             ),
+            RunEnd::Abandoned { by, reason } => (
+                EventPayload::RunAbandoned(RunAbandoned {
+                    by: by.clone().map(komo_kernel::types::chat::PeerId::new),
+                    reason: reason.clone(),
+                }),
+                reason.clone(),
+            ),
         };
 
         let appended = self.append(Some(run.clone()), payload).await?;
@@ -628,14 +611,14 @@ impl Ledger for Coordinator {
                 runs::mark_final_in(
                     ex,
                     &run_id,
-                    status,
+                    state,
                     &appended.event.event_id,
                     rounds,
                     reason,
                     now,
                 )
                 .await?;
-                if status.is_terminal() {
+                if state.is_terminal() {
                     session::set_current_run_in(ex, &session, None, now).await?;
                 }
                 Ok(())
@@ -804,7 +787,7 @@ mod tests {
     use komo_kernel::types::ids::{ApprovalId, RequestKey};
     use komo_kernel::types::plan::PlanSource;
     use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultBody};
-    use komo_kernel::types::status::RunStatus;
+    use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
     use komo_kernel::types::turn::ToolCallRequest;
 
     use crate::session_log::TailRepair;
@@ -997,7 +980,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(record.status, RunStatus::Completed);
+        assert_eq!(record.state, RunState::Completed);
         assert_eq!(record.input_event, Some(accepted.event.clone()));
         assert!(record.final_event.is_some());
         assert_eq!(
@@ -1075,7 +1058,123 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(record.status, RunStatus::Running);
+        assert_eq!(record.state, RunState::Running);
+    }
+
+    /// §8.4 的次序**在受理那一刻**就定下来：前一条还没结束 → 新 Run 落库就是
+    /// `waiting + dependency`，不存在"先 queued 再补写"的窗口。
+    ///
+    /// 少了这条，窗口里调度器能把它领走——那就越过了前面那条未完成的 Run，回放窗口会拿
+    /// 一个没有输出的 `function_call` 去问模型（provider 400）。这里从头到尾都断言它领
+    /// 不走：受理之后立刻不是候选、`claim_run` 也拿不到；前一条终态之后一次放行才可领。
+    #[tokio::test]
+    async fn a_run_accepted_behind_an_unfinished_one_lands_waiting_on_it_atomically() {
+        let f = fixture().await;
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let executor = ExecutorId::from_raw("exec-1");
+
+        let first = f
+            .coordinator
+            .accept_input(input("api:1", "先来", &f.session))
+            .await
+            .unwrap();
+        // **不推进时钟**：同一瞬间受理的两条也必须按 seq 排对（次序的权威是输入事件的
+        // seq，§8.3），而 Run ID 的字典序在这里是随机的。
+        let second = f
+            .coordinator
+            .accept_input(input("api:2", "后来", &f.session))
+            .await
+            .unwrap();
+
+        // 落库的形状：受理返回时它**已经是** dependency 等待，没有"先 queued"的那一刻。
+        let row = crate::repos::runs::get(&f.db, &second.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RunState::Waiting);
+        assert_eq!(
+            row.wait,
+            Some(WaitReason::Dependency {
+                run: first.run.clone(),
+            })
+        );
+        assert!(row.input_event.is_some(), "输入的事件引用也落了");
+
+        // 从头到尾领不到它。
+        let now = f.clock.now();
+        assert!(!queue.due(now, 10).await.unwrap().contains(&second.run));
+        assert!(
+            queue
+                .claim_run(&second.run, &executor)
+                .await
+                .unwrap()
+                .is_none(),
+            "前面的没结束，后面的领不走"
+        );
+
+        // 前一条终态 → 一次放行 → 可领。
+        f.coordinator
+            .complete(
+                &first.run,
+                RunEnd::Completed {
+                    final_message: None,
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::repos::queue::release_satisfied_dependencies(&f.db, now)
+                .await
+                .unwrap(),
+            1
+        );
+        let row = crate::repos::runs::get(&f.db, &second.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RunState::Queued);
+        assert!(row.wait.is_none());
+        assert!(
+            queue
+                .claim_run(&second.run, &executor)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// 前面那条已经终态了就不挡：新 Run 照旧直接 `queued`。
+    #[tokio::test]
+    async fn a_run_accepted_after_the_earlier_one_ended_is_queued_right_away() {
+        let f = fixture().await;
+        let first = f
+            .coordinator
+            .accept_input(input("api:1", "先来", &f.session))
+            .await
+            .unwrap();
+        f.coordinator
+            .complete(
+                &first.run,
+                RunEnd::Completed {
+                    final_message: None,
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let second = f
+            .coordinator
+            .accept_input(input("api:2", "后来", &f.session))
+            .await
+            .unwrap();
+        let row = crate::repos::runs::get(&f.db, &second.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RunState::Queued);
+        assert!(row.wait.is_none());
     }
 
     /// 旧代次开不了跑——§8.7：停止这个任务的一切写入，不重试、不降级。
@@ -1094,7 +1193,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        // 交还名额只是交还名额（§8.7）：要让它重新可领取得走恢复那条路——reconcile 判成
+        // `queued`。这里直接用 `requeue`（它就是那个结论）。
         queue.release(&claimed).await.unwrap();
+        crate::repos::recovery::RecoveryStore::new(f.db.clone(), std::path::PathBuf::from("."))
+            .requeue(&accepted.run)
+            .await
+            .unwrap();
         let second = ExecutorId::from_raw("exec-2");
         queue
             .claim_run(&accepted.run, &second)
@@ -1116,46 +1221,42 @@ mod tests {
         );
     }
 
-    /// 停在哪个**逻辑调用**上要透传到事件里——恢复按它配对。
+    /// 停在一条审批上：事件里带的是**等什么**（`WaitReason`），行上是 `waiting` + 三列。
     #[tokio::test]
-    async fn waiting_for_approval_names_the_call_it_stopped_on() {
+    async fn waiting_for_approval_writes_the_reason_both_to_the_event_and_the_row() {
         let f = fixture().await;
         let accepted = f
             .coordinator
             .accept_input(input("api:1", "跑一下", &f.session))
             .await
             .unwrap();
-        let ids = f
-            .coordinator
-            .record_round(&accepted.run, round(1, vec![call("call-1")]))
-            .await
-            .unwrap();
-
         f.coordinator
             .suspend(
                 &accepted.run,
-                Wait::Approval {
+                WaitReason::Approval {
                     approval: ApprovalId::from_raw("ap-1"),
-                    call: Some(ids[0].clone()),
-                    attempt: None,
                 },
             )
             .await
             .unwrap();
 
         let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
-        let EventPayload::RunWaitingApproval(body) = &batch.events.last().unwrap().payload else {
+        let EventPayload::RunWaiting(body) = &batch.events.last().unwrap().payload else {
             panic!()
         };
-        assert_eq!(body.call.as_ref(), Some(&ids[0]));
-        assert_eq!(body.approval.as_str(), "ap-1");
+        assert_eq!(body.reason.kind(), "approval");
+        assert_eq!(body.reason.reference().as_deref(), Some("ap-1"));
+
+        let record = crate::repos::runs::get(&f.db, &accepted.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, RunState::Waiting);
         assert_eq!(
-            crate::repos::runs::get(&f.db, &accepted.run)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            RunStatus::WaitingApproval
+            record.wait,
+            Some(WaitReason::Approval {
+                approval: ApprovalId::from_raw("ap-1"),
+            }),
         );
     }
 
@@ -1411,9 +1512,9 @@ mod tests {
         );
     }
 
-    /// 让出执行名额：状态与事件都落到位。
+    /// 让出执行名额等退避：状态、等待三列与事件都落到位，而且**读回来是同一份等待**。
     #[tokio::test]
-    async fn suspending_records_both_the_event_and_the_status() {
+    async fn suspending_records_both_the_event_and_the_wait() {
         let f = fixture().await;
         let accepted = f
             .coordinator
@@ -1424,10 +1525,10 @@ mod tests {
         f.coordinator
             .suspend(
                 &accepted.run,
-                Wait::Retry {
+                WaitReason::Retry {
                     attempts: 2,
-                    next_retry_at: later,
-                    reason: "provider 超时".into(),
+                    not_before: later,
+                    cause: RetryCause::Transport,
                 },
             )
             .await
@@ -1437,12 +1538,20 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(record.status, RunStatus::WaitingRetry);
+        assert_eq!(record.state, RunState::Waiting);
         assert_eq!(record.retry_attempts, 2);
-        assert_eq!(record.next_retry_at, Some(later));
+        assert_eq!(record.wake_at, Some(later));
+        assert_eq!(
+            record.wait,
+            Some(WaitReason::Retry {
+                attempts: 2,
+                not_before: later,
+                cause: RetryCause::Transport,
+            }),
+        );
         assert_eq!(
             types(&f.coordinator, &f.session).await.last().unwrap(),
-            "run.waiting_retry"
+            "run.waiting"
         );
     }
 

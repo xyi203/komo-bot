@@ -5,9 +5,10 @@
 
 use std::sync::Arc;
 
+use komo_kernel::protocol::http::{InterventionKind, InterventionListQuery, InterventionSummary};
 use komo_kernel::traits::StoreError;
-use komo_kernel::types::ids::{ExecutorId, RunId};
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::ids::{ExecutorId, InterventionId, RunId};
+use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
 use komo_kernel::types::turn::LlmError;
 
 use crate::harness::*;
@@ -41,9 +42,9 @@ fn shell_then_done(command: &str) -> Arc<FakeLlm> {
 
 /// 第 1 行：**Run 已提交，内存队列尚未收到通知** → 启动或周期扫描找到原 Run，自动执行一次。
 ///
-/// 注入：`start_run` 之前跳闸。执行者一个字都没写进日志，调度器 `release` 之后这一行回到
-/// `queued`——正是"已提交、没人在跑"。重启后的进程内存队列里什么都没有，只有启动扫描能
-/// 找到它。
+/// 注入：`start_run` 之前跳闸。执行者一个字都没写进日志，调度器 `release` 之后这一行成了
+/// 「`running` 且没有主人」的孤儿——正是"已提交、没人在跑"。重启后的进程内存队列里什么都
+/// 没有，只有启动扫描（对账）能发现它、按日志尾部判成 `queued` 并跑起来。
 #[tokio::test]
 async fn row_1_a_committed_run_whose_wake_up_was_lost_is_found_and_executed_once() {
     let home = Home::new();
@@ -64,10 +65,19 @@ async fn row_1_a_committed_run_whose_wake_up_was_lost_is_found_and_executed_once
     assert!(!target.exists(), "工具一次都没跑");
     gw.stop().await;
 
-    let status = db_status(&home, &run).await;
+    // 停机不再留一个叫 `interrupted` 的状态（§8.4），而**交还领取权也不改状态**（§8.7）：
+    // 这一行是「`running` 且没有主人」的孤儿——一个可查询的事实（§8.9 的
+    // `unowned_running`），而且不可领取（候选只有 `queued` 与 `waiting + retry`），所以
+    // 重启后的对账先按日志尾部（一个字都没执行）把它判成 `queued` 再跑。
+    let record = db_record(&home, &run).await;
+    assert_eq!(
+        record.state,
+        RunState::Running,
+        "停机前这一行是「已提交、没人在跑」的孤儿：{record:?}"
+    );
     assert!(
-        matches!(status, RunStatus::Queued | RunStatus::Interrupted),
-        "停机前这一行是「已提交、没人在跑」：{status:?}"
+        record.claimed_by.is_none(),
+        "领取权已经交还（`claimed_by IS NULL`），状态留在 `running`：{record:?}"
     );
 
     // 重启：新进程的内存队列是空的。
@@ -77,7 +87,7 @@ async fn row_1_a_committed_run_whose_wake_up_was_lost_is_found_and_executed_once
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
     let detail = gw.wait_terminal(&run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     assert_eq!(detail.summary.run, run, "还是原来那个 Run");
 
     assert_eq!(
@@ -142,7 +152,7 @@ async fn row_2_the_same_request_key_after_a_restart_returns_the_original_run() {
 /// 第 3 行：**LLM 输出尚未收齐** → 重试模型请求；未收齐的调用从未执行。
 ///
 /// 注入：模型驱动返回 `LlmError::Incomplete`（"回复未收齐"，`llm::is_retryable` 认它）。
-/// Run 让出名额进 `waiting_retry`，日志上没有任何 `message.assistant`。
+/// Run 让出名额进 `waiting + retry`，日志上没有任何 `message.assistant`。
 #[tokio::test]
 async fn row_3_a_reply_that_never_arrived_in_full_is_re_requested_and_ran_nothing() {
     let home = Home::new();
@@ -153,8 +163,19 @@ async fn row_3_a_reply_that_never_arrived_in_full_is_re_requested_and_ran_nothin
         .await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "row-3", "写个文件").await.run;
-    gw.wait_status(&run, |s| s == RunStatus::WaitingRetry, "waiting_retry")
-        .await;
+    // 让出名额去等退避：状态只有一个 `waiting`，"在等什么"在 `WaitReason` 里（§8.4）。
+    let wait = gw.wait_waiting(&run).await;
+    assert!(
+        matches!(
+            wait,
+            WaitReason::Retry {
+                attempts: 1,
+                cause: RetryCause::Transport,
+                ..
+            }
+        ),
+        "回复没收齐要等一次退避（次数与哪一种失败都要写下来）：{wait:?}"
+    );
 
     let events = home.events(&session);
     assert!(
@@ -175,17 +196,17 @@ async fn row_3_a_reply_that_never_arrived_in_full_is_re_requested_and_ran_nothin
         .await;
     tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
-    // BUG（见报告）：`suspend(Wait::Retry)` 之后 handler 返回 `Ok`，调度器不 `release`，
-    // 于是 `runs.claimed_by` 一直指着那个已经死掉的执行实例；`RunQueue::due` 要
-    // `claimed_by IS NULL`，这一行从此谁也领不走——"到期再尝试"永远不会发生。
-    let status = gw.db_status(&run).await;
+    // 到期之后由调度器自己领回去（§8.7 的候选查询里 `wait_kind = 'retry' AND
+    // wake_at <= now`）：退避的等待三列与**交还领取权**是同一个提交（`mark_waiting_in`
+    // 里连 `claimed_by` 一起清），所以这一行不再是"停在等待上"。
+    let status = gw.db_state(&run).await;
     assert_ne!(
         status,
-        RunStatus::WaitingRetry,
+        RunState::Waiting,
         "到期之后要重新请求模型（§8.4 第 9 行），实际停在 {status:?} 不动"
     );
     let detail = gw.wait_terminal(&run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     assert!(llm.turns() >= 1, "重启后确实重新请求了模型");
     assert_eq!(
         std::fs::read_to_string(&target).unwrap_or_default(),
@@ -236,7 +257,7 @@ async fn row_4_a_persisted_plan_runs_on_restart_under_the_same_call_id() {
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
     let detail = gw.wait_terminal(&run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
     assert_eq!(
         std::fs::read_to_string(&target).unwrap_or_default(),
@@ -288,7 +309,7 @@ async fn row_5_a_started_call_is_verified_rather_than_assumed() {
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("核对之后做完了。")).await;
     let detail = gw.wait_terminal(&run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
     assert_eq!(
         std::fs::read_to_string(&target).unwrap_or_default(),
@@ -315,10 +336,10 @@ async fn row_5_a_started_call_is_verified_rather_than_assumed() {
         .iter()
         .find(|row| row.id == attempt_before.to_string())
         .expect("那次尝试还在账本上");
-    // BUG（见报告）：`repos::calls::interrupt_open_attempts_in`（§8.7「把上一代执行实例
-    // 遗留的、没有收尾的尝试标成 interrupted」）整个仓库里一个调用方都没有。
-    assert_ne!(
-        stale.state, "started",
+    // 启动回收在同一个事务里收拾上一代遗留的尝试（§8.7）：`started` 在 §8.6 里的意思是
+    // "正在跑"，不标成 `interrupted` 的话，核对流程看到的就是一个永远跑不完的尝试。
+    assert_eq!(
+        stale.state, "interrupted",
         "上一代遗留的尝试要有一个明确结论（interrupted），不能停在 started：{stale:?}"
     );
     gw.stop().await;
@@ -337,7 +358,8 @@ async fn row_5_a_started_call_is_verified_rather_than_assumed() {
 /// 包不到 `ToolOutputStore`，所以这一刀走"直接篡改磁盘"那条注入路）。
 ///
 /// 于是恢复手上**一点证据都没有**：`shell` 的恢复方式是 `NoSafeRecovery`、`verify` 是
-/// `Unavailable`，只能停在 needs_attention，而不是再跑一次命令。
+/// `Unavailable`，只能停在 `waiting + intervention`（一条 `verify` 的清单条目），而不是
+/// 再跑一次命令。
 #[tokio::test]
 async fn row_6_an_external_write_without_evidence_waits_instead_of_writing_twice() {
     let home = Home::new();
@@ -371,17 +393,30 @@ async fn row_6_an_external_write_without_evidence_waits_instead_of_writing_twice
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
     let detail = gw
-        .wait_status(
+        .wait_state(
             &run,
-            |s| s == RunStatus::NeedsAttention || s.is_terminal(),
-            "needs_attention",
+            |s| s == RunState::Waiting || s.is_terminal(),
+            "waiting",
         )
         .await;
     assert_eq!(
-        detail.summary.status,
-        RunStatus::NeedsAttention,
+        detail.summary.state,
+        RunState::Waiting,
         "没有核对证据就等人处理，而不是重跑或宣布失败：{detail:?}"
     );
+    assert_eq!(
+        detail.summary.wait,
+        Some(WaitReason::Intervention {
+            intervention: InterventionId::for_run(&run),
+        }),
+        "停在 `waiting` 就要说得出在等哪一条 Intervention（§8.4）：{detail:?}"
+    );
+    // 等人就是等人：它必须在 §7.5 的清单里，且因为有一条 `uncertain` 的调用而是
+    // `verify`——操作者要回答的是"上次那个调用到底发生没有"。
+    let pending = pending_intervention(&gw, &run)
+        .await
+        .expect("停成这样的一条要在清单里（§7.5）");
+    assert_eq!(pending.kind, InterventionKind::Verify, "{pending:?}");
     assert_eq!(counter.count(), 1, "**不产生第二条记录**");
 
     // 那条上一世的 `tool.started` 要配一条**明确的 uncertain**，不能悬着（§14 事件配对）。
@@ -445,7 +480,7 @@ async fn row_7_a_result_the_database_never_indexed_is_backfilled_not_rerun() {
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("复用原输出，做完了。")).await;
     let detail = gw.wait_terminal(&run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
     assert_eq!(counter.count(), 1, "工具不重做");
     let events = home.events(&session);
@@ -497,12 +532,12 @@ async fn row_8_a_finished_output_without_its_result_event_is_verified_and_backfi
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("补记之后做完了。")).await;
     let detail = gw.wait_terminal(&run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
     let events = home.events(&session);
     let results = tool_results(&events);
-    // BUG（见报告）之一：那条 `tool.started` 到最后一个结果都没有配上——既没有
-    // `tool.result`，也没有一条明确的 uncertain。§14 要求的事件配对在这里断了。
+    // 恢复在存储里找到了那份**身份逐字段对得上**的孤儿 output.json（`OrphanOutputs` 接
+    // 在恢复扫描上），于是给那次尝试补记结果再入队——那条 `tool.started` 因此配上了。
     assert!(
         unpaired_attempts(&events).is_empty(),
         "每个 tool.started 都要配一个结果或一条明确的 uncertain，没配上的：{:?}；\
@@ -516,8 +551,7 @@ async fn row_8_a_finished_output_without_its_result_event_is_verified_and_backfi
         "补记了一条结果：{:?}",
         home.event_types(&session)
     );
-    // BUG（见报告）：恢复走的是工具 `verify`，从不去核对那份已经完整落盘的 output.json，
-    // 于是原输出被孤立，补记的结果换了一个 attempt 目录。
+    // 补记用的是**原来那次尝试**的身份与原输出，不是另起一次（§8.6：核对之后复用原输出）。
     assert_eq!(
         results[0].attempt_id, started.attempt_id,
         "补记的是**原来那次尝试**的结果，而不是另起一次"
@@ -573,16 +607,33 @@ async fn row_9_a_missing_or_altered_output_body_halts_the_task() {
         home.clear_injection();
         let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
         let detail = gw
-            .wait_status(
+            .wait_state(
                 &run,
-                |s| s == RunStatus::NeedsAttention || s.is_terminal(),
-                "needs_attention",
+                |s| s == RunState::Waiting || s.is_terminal(),
+                "waiting",
             )
             .await;
         assert_eq!(
-            detail.summary.status,
-            RunStatus::NeedsAttention,
+            detail.summary.state,
+            RunState::Waiting,
             "{label}：停止受影响任务：{detail:?}"
+        );
+        // 引用损坏是"前提没了"那一类（§7.5）：停在 `waiting + intervention` 上等人
+        // 处置，清单里是一条 `blocked`（没有 `uncertain` 的调用可核对）。
+        assert_eq!(
+            detail.summary.wait,
+            Some(WaitReason::Intervention {
+                intervention: InterventionId::for_run(&run),
+            }),
+            "{label}：{detail:?}"
+        );
+        let pending = pending_intervention(&gw, &run)
+            .await
+            .expect("引用损坏要出现在清单里");
+        assert_eq!(
+            pending.kind,
+            InterventionKind::Blocked,
+            "{label}：{pending:?}"
         );
         let reason = db_last_error(&home, &gw, &run).await.unwrap_or_default();
         assert!(
@@ -621,12 +672,9 @@ async fn row_10_a_saved_approval_is_reused_and_its_audit_event_is_backfilled_onc
         .expect("有这条");
     assert!(stored.decision.as_ref().expect("有结论").approved);
 
-    gw.wait_status(
-        &run,
-        |s| s.is_terminal() || s == RunStatus::NeedsAttention,
-        "收场",
-    )
-    .await;
+    // 只等终态：这一条 Run 一开始就停在审批上（`waiting + approval`），把 `Waiting`
+    // 也算成"收场"会在决定生效之前就返回。
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
     gw.stop().await;
     let _ = fault;
 
@@ -639,13 +687,8 @@ async fn row_10_a_saved_approval_is_reused_and_its_audit_event_is_backfilled_onc
 
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("做完了。")).await;
-    gw.wait_status(
-        &run,
-        |s| s.is_terminal() || s == RunStatus::NeedsAttention,
-        "收场",
-    )
-    .await;
-    // 给 outbox 补写一点时间。
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
+    // 给 outbox 补写一点时间（启动那一步就补过一次；这一拍是兜底）。
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     // 不重新询问：待处理审批里没有新的一条。
@@ -656,8 +699,8 @@ async fn row_10_a_saved_approval_is_reused_and_its_audit_event_is_backfilled_onc
     );
     assert_eq!(counter.count(), 1, "已批准的动作只执行一次");
 
-    // BUG（见报告）：§8.5 的反向补写在 Gateway 里没有接线——`control_outbox` 没人写、
-    // 没人补，`Ledger::append_audit` 没有任何调用方。
+    // §8.5 的反向补写：决定先落 state.db 与 `control_outbox`，审计那条随后（也叫醒
+    // 补写器）按 `event_id` 幂等补进 JSONL——重启补一次，还只补一条。
     let types = home.event_types(&session);
     assert!(
         types.iter().any(|t| t == "approval.decided"),
@@ -704,7 +747,7 @@ async fn row_11_a_half_written_tail_is_quarantined_and_recovery_continues() {
         .start(FakeLlm::finisher("按最后完整记录接着做完了。"))
         .await;
     let detail = gw.wait_terminal(&run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
     assert!(
         home.quarantine_path(&session).exists(),
@@ -778,9 +821,9 @@ async fn row_12_a_corrupt_middle_stops_only_the_affected_session() {
 
     // 健康会话照常跑完（「其他 Session 正常运行」，§8.4）。
     let healthy = gw
-        .wait_db_status(&healthy_run, |s| s.is_terminal(), "终态")
+        .wait_db_state(&healthy_run, |s| s.is_terminal(), "终态")
         .await;
-    assert_eq!(healthy, RunStatus::Completed, "其他 Session 正常运行");
+    assert_eq!(healthy, RunState::Completed, "其他 Session 正常运行");
     assert_eq!(
         std::fs::read_to_string(&healthy_target).unwrap_or_default(),
         "row-12"
@@ -795,34 +838,49 @@ async fn row_12_a_corrupt_middle_stops_only_the_affected_session() {
         "读一个中间损坏的会话要报损坏：{read_back:?}"
     );
 
-    // 损坏的会话没有被"停止"：它回到 `queued`，被领走、装配失败、`release`、再被领走……
-    // 两秒里 handler 被交出去了多少次，就是这个循环转了多少圈。
+    // 受损的那一条被停成 `waiting + intervention`：停下来等人处置，而且**不再空转**
+    // ——停在等待上的 Run 不可领取，不会在"领取→装配失败→交还"之间转圈。
     let handled_before = gw.running.state.scheduler.handled();
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     let handled_after = gw.running.state.scheduler.handled();
 
-    // BUG（见报告）：恢复扫描读到损坏的会话就整体报错退出（一个坏会话拖住全表），没有
-    // 任何一行被标成 needs_attention；那一行随后在"领取→装配失败→交还"之间空转。
-    let broken = gw.db_status(&broken_run).await;
-    assert!(
-        broken == RunStatus::NeedsAttention,
-        "停止受影响会话并**报告**损坏：账本上这一行停在 {broken:?}，last_error 是 {:?}；\
-         而且它还在空转——两秒里又被领走了 {} 次（{handled_before} → {handled_after}）",
+    let broken = gw.db_state(&broken_run).await;
+    assert_eq!(
+        broken,
+        RunState::Waiting,
+        "停止受影响会话并**报告**损坏：账本上这一行停在 {broken:?}，last_error 是 {:?}",
         komo_store::repos::runs::get(&gw.running.state.db, &broken_run)
             .await
             .ok()
             .flatten()
             .and_then(|r| r.last_error),
-        handled_after - handled_before,
+    );
+    assert_eq!(
+        gw.db_wait(&broken_run).await,
+        Some(WaitReason::Intervention {
+            intervention: InterventionId::for_run(&broken_run),
+        }),
+        "停下来等操作者处置那个读不出来的会话（§7.5 的 `blocked`）"
+    );
+    let pending = pending_intervention(&gw, &broken_run)
+        .await
+        .expect("损坏要出现在清单里——否则就是'卡住但清单为空'");
+    assert_eq!(pending.kind, InterventionKind::Blocked, "{pending:?}");
+    assert_eq!(
+        handled_after,
+        handled_before,
+        "被停成 waiting 之后不该再被领走：两秒里又多领了 {} 次",
+        handled_after - handled_before
     );
     gw.stop().await;
 }
 
 /// §8.2 的权威边界：**取消是调度事实**（state.db），不该因为会话内容已经不在就整条失败。
 ///
-/// 日志丢了以后这条 Run 停在「需要处理」（`HaltCorrupt`），而取消得往那个会话写一条
-/// `run.cancelled`——写不进去就 500。于是 §8.4 的「操作者处理后 queued / cancelled」两条
-/// 路一条也走不通，这条 Run 永远挂在清单上，操作者手上偏偏只有 `komo run cancel` 这一把。
+/// 日志丢了以后这条 Run 停在 `waiting + intervention`（内容读不出来——§8.9 的"数据库与
+/// 内容对不上"），而取消得往那个会话写一条 `run.cancelled`——写不进去就 500。于是 §8.4 的
+/// 「操作者处理后 queued / cancelled」两条路一条也走不通，这条 Run 永远挂在清单上，操作者
+/// 手上偏偏只有 `komo run cancel` 这一把。
 #[tokio::test]
 async fn a_run_in_a_session_whose_log_is_gone_can_still_be_cancelled() {
     let home = Home::new();
@@ -844,10 +902,20 @@ async fn a_run_in_a_session_whose_log_is_gone_can_still_be_cancelled() {
     std::fs::remove_file(home.events_path(&session)).expect("删掉日志");
 
     let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
-    assert!(
-        gw.db_status(&run).await.is_unfinished(),
-        "读不出会话的那条 Run 停在原地：{:?}",
-        gw.db_status(&run).await
+    // 「Session 内容缺失……不许领这条 Run，停成 `waiting + intervention`，理由里说清缺
+    // 什么」（§8.4）。它仍然是非终态，说得出在等什么。
+    assert_eq!(
+        gw.db_state(&run).await,
+        RunState::Waiting,
+        "读不出会话的那条 Run 停在等待上：{:?}",
+        gw.db_state(&run).await
+    );
+    assert_eq!(
+        gw.db_wait(&run).await,
+        Some(WaitReason::Intervention {
+            intervention: InterventionId::for_run(&run),
+        }),
+        "它得说得出在等什么（§8.4）"
     );
 
     // 操作者取消：**不该 500**。
@@ -855,7 +923,7 @@ async fn a_run_in_a_session_whose_log_is_gone_can_still_be_cancelled() {
         .post(&format!("/v1/runs/{run}/cancel"), serde_json::json!({}))
         .await;
     assert_eq!(code, 200, "{body}");
-    assert_eq!(gw.db_status(&run).await, RunStatus::Cancelled);
+    assert_eq!(gw.db_state(&run).await, RunState::Cancelled);
 
     // 会话清单上它不再"未完成"——这正是操作者要的那一步。
     let (code, body) = gw.get(&format!("/v1/sessions/{session}")).await;
@@ -868,11 +936,7 @@ async fn a_run_in_a_session_whose_log_is_gone_can_still_be_cancelled() {
             .is_empty(),
         "{detail}"
     );
-    assert_eq!(
-        detail["current_status"],
-        serde_json::Value::Null,
-        "{detail}"
-    );
+    assert_eq!(detail["current_state"], serde_json::Value::Null, "{detail}");
     gw.stop().await;
 }
 
@@ -889,7 +953,7 @@ async fn row_13_a_final_result_nobody_received_is_re_read_not_re_run() {
     let session = gw.open_session().await;
     let run = gw.submit(&session, "row-13", "写个文件").await.run;
     let before = gw.wait_terminal(&run).await;
-    assert_eq!(before.summary.status, RunStatus::Completed);
+    assert_eq!(before.summary.state, RunState::Completed);
     // 没有任何客户端连过 SSE。
     gw.stop().await;
 
@@ -904,8 +968,8 @@ async fn row_13_a_final_result_nobody_received_is_re_read_not_re_run() {
 
     let after = gw.run_detail(&run).await;
     assert_eq!(
-        after.summary.status,
-        RunStatus::Completed,
+        after.summary.state,
+        RunState::Completed,
         "Run 保持 completed"
     );
     assert_eq!(after.final_message.as_deref(), Some("写好了。"));
@@ -918,16 +982,20 @@ async fn row_13_a_final_result_nobody_received_is_re_read_not_re_run() {
     assert_eq!(tool_started(&events).len(), 1);
 
     // 「已保存最终结果，但客户端没有收到 → **补发**或补读原结果」（§8.4 第 10 行）。
-    // 补读这一半成立（上面已经断言）。补发那一半是**死代码**，这里把它钉住：启动扫描的
-    // 候选来自 `runs::unfinished`，而它只给未终态的行——一个 completed 的 Run 根本不会
-    // 被 `decide` 看到，于是 `RecoveryAction::RedeliverResult` /
-    // `RecoveryReport::to_redeliver()` 与 `service::start` 里那段补发永远走不到（见报告）。
-    let unfinished = komo_store::repos::runs::unfinished(&gw.running.state.db)
+    // 补读这一半上面已经断言；补发那一半的候选是"**终态但投递还卡着**"的行——恢复候选
+    // 把 `terminal_undelivered` 也带上，否则 `RecoveryAction::RedeliverResult` 永远走不到。
+    // 这条 Run 由 HTTP 提交、没有任何投递行（§8.9：TUI / HTTP 来源的结果靠客户端补读），
+    // 所以它不该出现在候选里：没有卡住的投递，就没有补发这回事。
+    let candidates = gw
+        .running
+        .state
+        .recovery_store
+        .unfinished_runs()
         .await
         .expect("读得到");
     assert!(
-        !unfinished.iter().any(|record| record.run == run),
-        "completed 的 Run 不在恢复扫描的候选里，所以补发那一条路走不到：{unfinished:?}"
+        !candidates.iter().any(|candidate| candidate.run == run),
+        "没有卡住的投递，completed 的 Run 就不该在恢复扫描的候选里：{candidates:?}"
     );
     gw.stop().await;
 }
@@ -960,16 +1028,36 @@ async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_c
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
     let detail = gw
-        .wait_status(
+        .wait_state(
             &run,
-            |s| s == RunStatus::NeedsAttention || s.is_terminal(),
-            "needs_attention",
+            |s| s == RunState::Waiting || s.is_terminal(),
+            "waiting",
         )
         .await;
     assert_eq!(
-        detail.summary.status,
-        RunStatus::NeedsAttention,
+        detail.summary.state,
+        RunState::Waiting,
         "核实不了旧执行已结束就先阻止重复执行：{detail:?}"
+    );
+    // "无法确认旧执行已结束"属于 `blocked` 那一类（§7.5 的表）：停在
+    // `waiting + intervention` 上等人，而且**不可领取**，所以不会重复启动。
+    assert_eq!(
+        detail.summary.wait,
+        Some(WaitReason::Intervention {
+            intervention: InterventionId::for_run(&run),
+        }),
+        "{detail:?}"
+    );
+    let pending = pending_intervention(&gw, &run)
+        .await
+        .expect("核实不了旧执行已结束的那条要在清单里");
+    // 具体进哪一类由权威当场判（§7.5 第 1 条）：这条 Run 上还挂着一次 `uncertain` 的
+    // 调用，所以它是 `verify`（"这次调用到底发生没有"），而不是 `blocked`——操作者要核
+    // 的就是那一次调用。
+    assert_eq!(pending.kind, InterventionKind::Verify, "{pending:?}");
+    assert!(
+        pending.call.is_some(),
+        "`verify` 一定说得出停在哪一次调用上：{pending:?}"
     );
     assert_eq!(counter.count(), 0, "没有重复执行");
     gw.stop().await;
@@ -992,12 +1080,8 @@ async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_c
         )
         .await;
     assert!(status == 200 || status == 409, "{status} {body}");
-    gw.wait_status(
-        &run,
-        |s| s.is_terminal() || s == RunStatus::NeedsAttention,
-        "收场",
-    )
-    .await;
+    gw.wait_state(&run, |s| s.is_terminal() || s == RunState::Waiting, "收场")
+        .await;
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     assert_eq!(
@@ -1036,7 +1120,7 @@ async fn row_15_a_cancelled_run_never_revives_and_an_exhausted_budget_ends() {
         )
         .await;
     assert_eq!(status, 200, "{body}");
-    gw.wait_status(&cancelled_run, |s| s == RunStatus::Cancelled, "cancelled")
+    gw.wait_state(&cancelled_run, |s| s == RunState::Cancelled, "cancelled")
         .await;
 
     gw.stop().await;
@@ -1047,12 +1131,11 @@ async fn row_15_a_cancelled_run_never_revives_and_an_exhausted_budget_ends() {
         .await;
     let other = gw.open_session().await;
     let exhausted_run = gw.submit(&other, "row-15-b", "写个文件").await.run;
-    gw.wait_status(
-        &exhausted_run,
-        |s| s == RunStatus::WaitingRetry,
-        "waiting_retry",
-    )
-    .await;
+    let wait = gw.wait_waiting(&exhausted_run).await;
+    assert!(
+        matches!(wait, WaitReason::Retry { .. }),
+        "回复没收齐是等一次退避：{wait:?}"
+    );
     gw.stop().await;
     exhaust_retry_budget(&home, &exhausted_run).await;
 
@@ -1060,34 +1143,69 @@ async fn row_15_a_cancelled_run_never_revives_and_an_exhausted_budget_ends() {
     let gw = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     assert_eq!(
-        gw.run_status(&cancelled_run).await,
-        RunStatus::Cancelled,
+        gw.run_state(&cancelled_run).await,
+        RunState::Cancelled,
         "用户明确取消的 Run 不自动复活"
     );
     assert_eq!(counter.count(), 0, "取消之后那条命令一次都没跑");
 
-    let exhausted = gw.run_detail(&exhausted_run).await;
+    // §8.4 第 9 行：`waiting + retry` 那一行是「**沿用已保存的次数与到点时刻，到点再
+    // 尝试**」——到点了就再试一次，而不是由恢复扫描替它判死（那条路只写状态，不制造
+    // 新事实，§8.9）。
+    //
+    // 预算耗尽这件事的判定在**错误路径**上（`AgentLoop::llm_error`：下一次失败时
+    // `attempts >= max_attempts` 才写 `failed`）。所以这一段断言的是：到点被再试一次，
+    // 而且**沿用了原来的次数**——重启既不重置预算，也不凭预算把一个还没失败过的请求
+    // 提前判死。
+    let exhausted = gw
+        .wait_state(&exhausted_run, |s| s.is_terminal(), "终态")
+        .await;
     assert_eq!(
-        exhausted.summary.status,
-        RunStatus::NeedsAttention,
-        "预算用完有一个明确终态，不是无限循环：{exhausted:?}"
+        exhausted.summary.state,
+        RunState::Completed,
+        "到点就再试一次，不是被恢复扫描判死：{exhausted:?}"
     );
-    assert!(!target.exists(), "预算用完的 Run 不再请求模型");
+    assert!(target.exists(), "这一次真的请求了模型，所以文件写出来了");
+    let carried = komo_store::repos::runs::get(&gw.state().db, &exhausted_run)
+        .await
+        .expect("读得到")
+        .expect("有这个 Run")
+        .retry_attempts;
+    assert!(
+        carried >= 99,
+        "沿用了保存的次数（重启不重置预算）：{carried}"
+    );
     gw.stop().await;
 }
 
 // ---------------------------------------------------------------- 工具函数
 
-async fn db_status(home: &Home, run: &RunId) -> RunStatus {
+/// 停机之后直接从 state.db 读这一行——恢复要判的就是它的**形状**：状态与领取权是两格
+/// （§8.7 的孤儿是 `running` 且 `claimed_by IS NULL`）。
+async fn db_record(home: &Home, run: &RunId) -> komo_store::repos::runs::RunRecord {
     let db = home.open_db().await;
-    let record = komo_store::repos::runs::get(&db, run)
+    komo_store::repos::runs::get(&db, run)
         .await
         .expect("读得到")
-        .expect("有这一行");
-    record.status
+        .expect("有这一行")
+}
+
+/// §7.5 的清单里这条 Run 现在等人的那一条（没有就是 `None`）。
+///
+/// 它是**派生视图**（`runs` 与 `approval_requests` 的并集查询），所以断言它就是在断言
+/// "这条 Run 挡着队、而且操作者看得见"——§8.4 的那句"卡住但清单为空"正好是它的反面。
+async fn pending_intervention(gw: &Gw, run: &RunId) -> Option<InterventionSummary> {
+    gw.state()
+        .interventions(&InterventionListQuery {
+            run: Some(run.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("读得出清单")
+        .into_iter()
+        .next()
 }
 
 async fn db_call_state(home: &Home, call: &komo_kernel::types::ids::ToolCallId) -> String {
@@ -1200,20 +1318,26 @@ async fn force_claimed_by(home: &Home, run: &RunId, executor: &str) {
 }
 
 /// 把重试次数按到预算上限（`RetryBudget::default().max_attempts`）。
+///
+/// 退避的进度就是 `WaitReason::Retry` 那三个字段（§8.4），所以"用完了"这件事只能按它的
+/// 形状写进去：次数按到上限、到点时刻就是现在（重启后对账当场放它回 `queued`）。
 async fn exhaust_retry_budget(home: &Home, run: &RunId) {
     let db = home.open_db().await;
     let run = run.clone();
     db.with_write_retry(move |ex| {
         let run = run.clone();
         Box::pin(async move {
+            let now = time::OffsetDateTime::now_utc();
             komo_store::repos::runs::mark_waiting_in(
                 ex,
                 &run,
-                RunStatus::WaitingRetry,
-                99,
-                Some(time::OffsetDateTime::now_utc()),
+                &WaitReason::Retry {
+                    attempts: 99,
+                    not_before: now,
+                    cause: RetryCause::Transport,
+                },
                 Some("注入：预算用完了".into()),
-                time::OffsetDateTime::now_utc(),
+                now,
             )
             .await
         }) as komo_store::db::BoxFuture<'_, Result<(), StoreError>>

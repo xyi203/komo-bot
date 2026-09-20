@@ -228,3 +228,69 @@ fn the_same_directory_listed_twice_is_only_searched_once() {
     let dirs = runtime_skill_dirs(&snapshot, None, None);
     assert_eq!(dirs, vec![PathBuf::from("/home/u/.komo/skills")]);
 }
+
+/// §5.6：拼进系统提示的那一块——根在前、目录行在后。
+#[test]
+fn the_prompt_block_names_the_roots_in_search_order_then_the_lines() {
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    // 两个目录各一个同名 skill：先到先得，只有一份进目录行，两个根里也只该出现
+    // **真的出了条目的那一份**。
+    write_skill(
+        first.path(),
+        "pr-review",
+        "name: pr-review\ndescription: 生效的那一份\n",
+        "第一步……\n",
+    );
+    write_skill(
+        second.path(),
+        "pr-review",
+        "name: pr-review\ndescription: 被盖住的那一份\n",
+        "……\n",
+    );
+    write_skill(
+        second.path(),
+        "release-notes",
+        "name: release-notes\ndescription: 怎么写发布说明\n",
+        "……\n",
+    );
+    let registry = SkillRegistry::new(vec![
+        first.path().to_path_buf(),
+        second.path().to_path_buf(),
+    ]);
+
+    let block = registry.prompt_block(&context()).expect("有目录行");
+    assert!(block.contains("- pr-review：生效的那一份"), "{block}");
+    assert!(!block.contains("被盖住的那一份"), "同名只出一条：{block}");
+    assert!(block.contains("- release-notes：怎么写发布说明"), "{block}");
+    // 根的先后就是搜索顺序：模型顺着找，先撞上的那份正是生效的那一份。
+    let first_root = block.find(&first.path().display().to_string());
+    let second_root = block.find(&second.path().display().to_string());
+    assert!(first_root.is_some() && second_root.is_some(), "{block}");
+    assert!(first_root < second_root, "{block}");
+}
+
+#[test]
+fn an_empty_catalog_is_not_a_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = SkillRegistry::new(vec![dir.path().to_path_buf()]);
+    assert_eq!(registry.prompt_block(&context()), None);
+}
+
+#[test]
+fn a_gated_or_disabled_skill_leaves_the_block_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    // 只给 macos 的，而这里问的是 linux。
+    write_skill(
+        dir.path(),
+        "finder-tricks",
+        "name: finder-tricks\ndescription: Finder 脚本\nplatforms: [macos]\n",
+        "……\n",
+    );
+    let registry = SkillRegistry::new(vec![dir.path().to_path_buf()]);
+    assert_eq!(
+        registry.prompt_block(&context()),
+        None,
+        "平台不满足就不该露面"
+    );
+}

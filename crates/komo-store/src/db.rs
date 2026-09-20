@@ -545,6 +545,8 @@ mod tests {
                     applied_bytes: 0_i64,
                     created_at: 0_i64,
                     updated_at: 0_i64,
+                    state: "active",
+                    state_changed_at: 0_i64,
                 })
                 .exec(ex)
                 .await

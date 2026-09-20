@@ -360,10 +360,9 @@ impl CronRepo for TursoCronRepo {
                         else {
                             return Ok(true);
                         };
-                        // 「含等待审批、重试或结果核对」都算没结束（§10）。
-                        let status: komo_kernel::types::status::RunStatus =
-                            decode(&format!("\"{}\"", run.status), "runs.status")?;
-                        if status.is_unfinished() {
+                        // 「含等待审批、重试或结果核对」都算没结束（§10）——判据就是
+                        // §8.4 的"非终态"，与领取语句、reconcile 同一份。
+                        if crate::repos::runs::state_of(&run)?.is_unfinished() {
                             return Ok(true);
                         }
                     }

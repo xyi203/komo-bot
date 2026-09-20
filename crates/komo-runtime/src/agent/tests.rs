@@ -5,8 +5,9 @@ use std::sync::Arc;
 use komo_kernel::fold::Surface;
 use komo_kernel::test_support::{ScriptedLlm, sample_model};
 use komo_kernel::traits::{ApprovalRepo, Clock};
+use komo_kernel::types::ids::InterventionId;
 use komo_kernel::types::refs::ToolResultStatus;
-use komo_kernel::types::status::{RunStatus, Wait};
+use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
 use komo_kernel::types::tool::{CancelToken, ToolError, ToolOutput};
 use komo_kernel::types::turn::{Role, Round};
 
@@ -75,7 +76,7 @@ async fn the_final_reply_is_recorded_before_the_run_completes() {
     assert_eq!(last.role, Role::Assistant);
     assert_eq!(last.text.as_deref(), Some("写好了。"));
     let run = surface.runs.values().next().unwrap();
-    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(run.status, RunState::Completed);
 
     // 顺序也要对：assistant 消息在终态事件之前。
     let events = wired.harness.ledger.events();
@@ -150,12 +151,17 @@ async fn an_ask_suspends_the_run_instead_of_waiting_in_process() {
     let SegmentOutcome::Suspended { wait, .. } = &outcome else {
         panic!("{outcome:?}")
     };
-    assert!(matches!(wait, Wait::Approval { .. }), "{wait:?}");
+    assert!(matches!(wait, WaitReason::Approval { .. }), "{wait:?}");
     assert_eq!(tool.ran(), 0, "批准之前不执行");
 
     let surface = surface(&wired.harness);
     let run = surface.runs.values().next().unwrap();
-    assert_eq!(run.status, RunStatus::WaitingApproval);
+    assert_eq!(run.status, RunState::Waiting, "停着");
+    assert!(
+        matches!(run.wait, Some(WaitReason::Approval { .. })),
+        "而且说得出在等一条审批：{:?}",
+        run.wait
+    );
     // 待处理的审批在数据库里，**不是**折出来的：JSONL 里的审批事件是审计补写
     // （§8.5 的反向顺序），它不创建授权，也不由 executor 写。
     let pending = wired.harness.approvals.list_pending(None).await.unwrap();
@@ -235,7 +241,7 @@ async fn a_driver_error_fails_the_run() {
     let surface = surface(&wired.harness);
     assert_eq!(
         surface.runs.values().next().unwrap().status,
-        RunStatus::Failed
+        RunState::Failed
     );
 }
 
@@ -320,7 +326,7 @@ async fn cancelling_ends_the_run_as_cancelled() {
     assert_eq!(tool.ran(), 0);
     assert_eq!(
         surface(&wired.harness).runs.values().next().unwrap().status,
-        RunStatus::Cancelled
+        RunState::Cancelled
     );
 }
 
@@ -413,7 +419,7 @@ async fn a_resumed_segment_can_suspend_again() {
         matches!(
             &outcome,
             SegmentOutcome::Suspended {
-                wait: Wait::Approval { .. },
+                wait: WaitReason::Approval { .. },
                 ..
             }
         ),
@@ -422,7 +428,7 @@ async fn a_resumed_segment_can_suspend_again() {
     assert_eq!(tool.ran(), 0);
 }
 
-/// 结果不明 → 这一段停在 `needs_attention`，等人（§8.6）。
+/// 结果不明 → 这一段停在 `waiting + intervention`，等人（§8.6）。
 #[tokio::test]
 async fn an_uncertain_call_suspends_the_run_for_a_human() {
     let tool = Arc::new(
@@ -446,15 +452,25 @@ async fn an_uncertain_call_suspends_the_run_for_a_human() {
         matches!(
             &outcome,
             SegmentOutcome::Suspended {
-                wait: Wait::Attention { .. },
+                wait: WaitReason::Intervention { .. },
                 ..
             }
         ),
         "{outcome:?}"
     );
+    let run = surface(&wired.harness)
+        .runs
+        .values()
+        .next()
+        .cloned()
+        .unwrap();
+    assert_eq!(run.status, RunState::Waiting);
     assert_eq!(
-        surface(&wired.harness).runs.values().next().unwrap().status,
-        RunStatus::NeedsAttention
+        run.wait,
+        Some(WaitReason::Intervention {
+            intervention: InterventionId::for_run(&run.run)
+        }),
+        "干预的句柄就是这个 Run：一个 Run 上最多停一条要人判断的干预"
     );
 }
 
@@ -605,10 +621,10 @@ async fn a_retryable_model_error_suspends_on_a_backoff_instead_of_failing() {
 
     let SegmentOutcome::Suspended {
         wait:
-            Wait::Retry {
+            WaitReason::Retry {
                 attempts,
-                next_retry_at,
-                ..
+                not_before,
+                cause,
             },
         ..
     } = &outcome
@@ -616,10 +632,25 @@ async fn a_retryable_model_error_suspends_on_a_backoff_instead_of_failing() {
         panic!("{outcome:?}")
     };
     assert_eq!(*attempts, 1);
-    assert!(*next_retry_at > harness.clock.now(), "退避要落在将来");
+    assert!(*not_before > harness.clock.now(), "退避要落在将来");
     assert_eq!(
-        surface(&harness).runs.get(&run).unwrap().status,
-        RunStatus::WaitingRetry
+        *cause,
+        RetryCause::Transport,
+        "超时是「这一次没送达」，不是限流"
+    );
+    let view = surface(&harness).runs.get(&run).cloned().unwrap();
+    assert_eq!(view.status, RunState::Waiting);
+    assert!(
+        matches!(
+            view.wait,
+            Some(WaitReason::Retry {
+                attempts: 1,
+                cause: RetryCause::Transport,
+                ..
+            })
+        ),
+        "{:?}",
+        view.wait
     );
 }
 
@@ -693,7 +724,7 @@ async fn an_exhausted_retry_budget_ends_in_a_failure() {
     assert!(reason.contains("重试预算已用完"), "{reason}");
     assert_eq!(
         surface(&harness).runs.get(&run).unwrap().status,
-        RunStatus::Failed
+        RunState::Failed
     );
 }
 
@@ -735,9 +766,9 @@ async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
 
     let SegmentOutcome::Suspended {
         wait:
-            Wait::Retry {
+            WaitReason::Retry {
                 attempts,
-                next_retry_at,
+                not_before,
                 ..
             },
         ..
@@ -747,17 +778,20 @@ async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
     };
     assert_eq!(*attempts, 3, "接着上一次的次数数，不是从 1 起");
     // base * 2^2 = 8s：退避跟着已经用掉的次数涨，不是每次都退回起步值。
-    assert_eq!(*next_retry_at, started_at + time::Duration::seconds(8));
+    assert_eq!(*not_before, started_at + time::Duration::seconds(8));
 
-    // 账本上落的也是这个数——下一段从这里读回来。
+    // 账本上落的也是这个数——**次数只在 `WaitReason::Retry` 里**，没有第二处可读。
     let waiting = harness
         .ledger
         .events()
         .iter()
         .find_map(|event| match &event.payload {
-            komo_kernel::events::EventPayload::RunWaitingRetry(body) => Some(body.clone()),
+            komo_kernel::events::EventPayload::RunWaiting(body) => match &body.reason {
+                WaitReason::Retry { attempts, .. } => Some(*attempts),
+                _ => None,
+            },
             _ => None,
         })
-        .expect("有一条 run.waiting_retry");
-    assert_eq!(waiting.attempts, 3);
+        .expect("有一条 run.waiting");
+    assert_eq!(waiting, 3);
 }

@@ -443,14 +443,14 @@ async fn a_job_runs_on_its_own_round_budget() {
     gw.make_due(&job.id).await;
     let run = gw.tick().await.fired[0].run.clone();
 
-    gw.wait_status(&run, |s| s.is_terminal(), "终态").await;
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
     let record = komo_store::repos::runs::get(&gw.state().db, &run)
         .await
         .expect("读得到")
         .expect("有这一行");
     assert_eq!(
-        record.status,
-        komo_kernel::types::status::RunStatus::Failed,
+        record.state,
+        komo_kernel::types::status::RunState::Failed,
         "预算用完是一个明确的终态，不是无限循环"
     );
 

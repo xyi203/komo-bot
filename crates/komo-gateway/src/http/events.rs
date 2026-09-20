@@ -67,10 +67,18 @@ pub async fn stream(
 
     // **先订阅再补读**：中间新写进来的事件才不会掉在两者之间。
     let live = api.state.hub.subscribe(&session);
+    // 而且**记一笔"有人在看"**：审批投递靠它判断要不要投 home chat（没人看着才投）。
+    // 守卫跟着这条响应体走，连接断了就自动减一。
+    let watching = api.state.hub.watch(&session);
     let history = backfill(&api, &session, from).await?;
     let last = history.last().map(|frame| frame.id).unwrap_or(from);
 
-    let body = Body::from_stream(frames(history, live, last));
+    // 守卫跟着这条响应体的流走：闭包持有它，流被丢掉（连接断了、进程退出）时它跟着掉，
+    // "有人在看"这个计数就还回去了。
+    let body = Body::from_stream(frames(history, live, last).map(move |item| {
+        let _ = &watching;
+        item
+    }));
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
@@ -119,7 +127,7 @@ fn frames(
                     Ok(frame) => {
                         // 补读已经给过的那些不再给一遍——**这条只对原始事件成立**。补读
                         // 只发 `SseEvent::Event`（`backfill` 造的那些），而派生帧
-                        // （`run_status` / `approval_pending` / `approval_decided` /
+                        // （`run_state` / `approval_pending` / `approval_decided` /
                         // `assistant_delta`）与它们的源事件**同号**（`EventHub::publish_event`
                         // 一对多推），一帧都没被补读过。按号一律丢的话这四类**永远到不了
                         // 客户端**：原始帧先把号推上去，紧接着的派生帧就被当成重复吃掉。

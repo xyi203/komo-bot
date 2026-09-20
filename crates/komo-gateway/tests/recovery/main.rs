@@ -11,4 +11,6 @@
 
 mod e2e;
 mod harness;
+mod reconcile;
 mod rows;
+mod verdicts;

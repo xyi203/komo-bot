@@ -4,20 +4,25 @@
 //! 只有一条语句的，都在一个 `BEGIN CONCURRENT` 事务里，§8.2）；读走
 //! [`crate::db::Db::read`]。
 //!
-//! raw SQL 只允许出现在 [`queue`]（§8.7 的四条领取语句）和 [`memory`]（关键词臂的
-//! `instr`）——别处一律走 toasty 的类型化 API，那是"拿不到受影响行数"这件事真正要紧的
-//! 地方之外的全部。
+//! raw SQL 只允许出现在 [`queue`]（§8.7 的领取 / 回收 / 租约语句）、[`memory`]（关键词臂
+//! 的 `instr`）与 [`session`]（生命周期状态的 CAS）——别处一律走 toasty 的类型化 API。
+//! 这三个地方的理由是同一个：**`rows affected` 是唯一可用的信号**（toasty 的类型化
+//! `UPDATE` 恒返回 `Ok(())`，命中 0 行与 1 行不可区分，§8.2 那张表）。
 //!
 //! [`session`]、[`calls`]、[`outbox`] 不是 trait 的实现：它们是 store 内部的具体类型，
-//! 只被 [`crate::coordinator::Coordinator`] 用（§13.5 末尾）。
+//! 只被 [`crate::coordinator::Coordinator`] 用（§13.5 末尾）。[`interventions`] 与
+//! [`reconcile`] 也不是 trait 实现：它们是 §7.5 / §8.9 的**派生查询与判定**，由 runtime
+//! 的清单接口与对账扫描直接调。
 
 pub mod approvals;
 pub mod calls;
 pub mod cron;
 pub mod deliveries;
+pub mod interventions;
 pub mod memory;
 pub mod outbox;
 pub mod queue;
+pub mod reconcile;
 pub mod recovery;
 pub mod runs;
 pub mod session;

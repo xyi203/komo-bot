@@ -41,7 +41,7 @@ pub enum HandlerError {
     /// 领取权。
     #[error("{0}")]
     Failed(String),
-    /// handler 已经把这个 Run 停在一个不该再被领取的状态上（`needs_attention`、终态、
+    /// handler 已经把这个 Run 停在一个不该再被领取的状态上（`waiting + intervention`、终态、
     /// 或者它自己写了挂起）。**不要交还领取权**。
     ///
     /// 它存在的理由是实测出来的：一个中间损坏的会话装配不出上下文，handler 每次都失败，
@@ -184,7 +184,7 @@ impl Scheduler {
                     } else {
                         // handler 说它已经停了（或者会话本身损坏）：**不放回队列**，
                         // 否则就是"领取 → 失败 → 交还"的空转。停止这个任务的账本状态
-                        // 由 handler 负责写（`needs_attention`）。
+                        // 由 handler 负责写（`waiting + intervention`）。
                         tracing::error!(
                             run = %run,
                             error = %error,
@@ -299,7 +299,7 @@ mod tests {
 
             if self.stop.lock().unwrap().contains(&claimed.run) {
                 return Err(HandlerError::Stopped {
-                    reason: "会话损坏，已标成 needs_attention".into(),
+                    reason: "会话损坏，已停成 waiting + intervention".into(),
                 });
             }
             let mut failures = self.fail_once.lock().unwrap();

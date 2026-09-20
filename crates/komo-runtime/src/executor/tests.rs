@@ -13,7 +13,7 @@ use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::tool::{CancelToken, ToolError, ToolOutput};
 
 use super::harness::{Harness, RecordingTool};
-use super::{CallRequest, RoundStop, resumed_from};
+use super::{CallRequest, OperatorVerdict, RoundStop, resumed_from};
 
 /// 这个调用现在这一刻的计划——`crashed_attempt` 要用它写 `tool.planned`。
 async fn plan_of(
@@ -504,6 +504,157 @@ async fn an_uncertain_result_stops_for_a_human_instead_of_retrying() {
             if result.status == ToolResultStatus::Uncertain)
     });
     assert!(uncertain, "uncertain 必须留在账本上");
+}
+
+/// §7.5：操作者对一次「结果不明」的调用下结论——**给那次尝试补一条结果，不重跑工具**。
+///
+/// 这条测试盯的是三个可观察的结果：工具只跑过一次（核对不是重做）、那次尝试上多了一条
+/// 结果（不再悬着）、正文里带着**证据**（事后答得出这一条凭什么算完了）。
+#[tokio::test]
+async fn an_operator_verdict_settles_the_uncertain_attempt_without_rerunning_it() {
+    let harness = Harness::new();
+    let tool = Arc::new(
+        RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
+            message: "解释器没有写下结果".into(),
+        })),
+    );
+    let executor = harness.permissive(vec![tool.clone()]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .await;
+
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+    assert_eq!(tool.ran(), 1);
+    let call = match &outcome.stop {
+        Some(RoundStop::Attention { call, .. }) => call.clone(),
+        other => panic!("{other:?}"),
+    };
+    let attempt = harness.ledger.surface().calls[&call]
+        .attempt
+        .clone()
+        .expect("那次尝试记在账上");
+
+    let status = executor
+        .settle_by_operator(
+            &session,
+            &run,
+            &call,
+            &attempt,
+            OperatorVerdict::AlreadySatisfied {
+                evidence: "HA 读回来是 off".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(status, ToolResultStatus::Completed);
+    assert_eq!(tool.ran(), 1, "核对不是重跑");
+    // 账本是**追加**的（§8.3）：原来那条 `uncertain` 留着不删，结论写在它后面，
+    // 由读者取最后一条。所以这里数的是"最后一条是谁"，而不是"只有一条"。
+    let results = harness.results_for(&attempt);
+    assert_eq!(results.len(), 2, "原来那条结果不会被擦掉：{results:?}");
+    let settled = results.last().expect("有结论");
+    assert_eq!(settled.status, ToolResultStatus::Completed);
+    assert_eq!(
+        settled.attempt_id, attempt,
+        "结论落在**原来那次尝试**上，不是新开一次（§8.6）"
+    );
+    assert_eq!(
+        harness.ledger.surface().calls[&call].state,
+        ToolCallState::Completed,
+        "这条调用不再悬着"
+    );
+    let stored = harness
+        .outputs
+        .published_body(settled.output_ref.path())
+        .expect("输出存储里有它");
+    assert!(
+        stored.error.is_none()
+            && stored.result["verdict"] == serde_json::json!("already_satisfied"),
+        "正文里留得下这是谁下的什么结论：{stored:?}"
+    );
+    assert!(
+        settled
+            .preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("HA 读回来是 off"),
+        "证据要进正文：{:?}",
+        settled.preview
+    );
+}
+
+/// 「确定没执行」是**失败**收尾：重做要走新的一次调用，因此照常过 Policy——旧的一次性
+/// 授权不会被当成重试许可（§7.4）。
+#[tokio::test]
+async fn not_performed_closes_the_call_as_failed_so_a_retry_is_a_new_call() {
+    let harness = Harness::new();
+    let tool = Arc::new(
+        RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
+            message: "结果不明".into(),
+        })),
+    );
+    let executor = harness.permissive(vec![tool.clone()]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .await;
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+    let call = match &outcome.stop {
+        Some(RoundStop::Attention { call, .. }) => call.clone(),
+        other => panic!("{other:?}"),
+    };
+    let attempt = harness.ledger.surface().calls[&call]
+        .attempt
+        .clone()
+        .unwrap();
+
+    let verdict = OperatorVerdict::NotPerformed {
+        evidence: "远端没有这条记录".into(),
+    };
+    assert_eq!(verdict.status(), ToolResultStatus::Failed);
+    assert_eq!(
+        verdict.as_verification(),
+        Verification::NotPerformed {
+            evidence: "远端没有这条记录".into()
+        },
+        "续跑时它读的形状就是 §8.6 的核对结论"
+    );
+
+    let status = executor
+        .settle_by_operator(&session, &run, &call, &attempt, verdict)
+        .await
+        .unwrap();
+    assert_eq!(status, ToolResultStatus::Failed);
+    let results = harness.results_for(&attempt);
+    let settled = results.last().expect("有结论");
+    assert_eq!(
+        settled.status,
+        ToolResultStatus::Failed,
+        "最后一条才是这次尝试的结论（前面那条是工具报的 uncertain）"
+    );
+    assert!(
+        settled
+            .preview
+            .as_deref()
+            .unwrap_or_default()
+            .contains("确定没有执行"),
+        "{:?}",
+        settled.preview
+    );
+    assert_eq!(
+        harness.ledger.surface().calls[&call].state,
+        ToolCallState::Failed,
+        "读账本的人看到的是这个调用已经收口"
+    );
+    assert_eq!(tool.ran(), 1, "结论只写账，不去重做");
 }
 
 /// ⑩ 预览 ≤ 1 KiB，完整输出走 `ToolOutputStore`。

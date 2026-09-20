@@ -28,7 +28,8 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use komo_kernel::protocol::http::{
-    ApprovalListQuery, BoundaryRequest, CancelRunRequest, EventQuery, ResumeRequest,
+    BoundaryRequest, CancelRunRequest, EventQuery, InterventionAnswerRequest,
+    InterventionBatchAnswerRequest, InterventionDetail, InterventionListQuery, ResumeRequest,
     SubmitRunRequest,
 };
 use komo_kernel::protocol::sse::Cursor;
@@ -251,7 +252,7 @@ async fn run_effect(
                 Ok(response) => Some(ServerEvent::Notice(format!(
                     "{} 现在是 {}",
                     response.run,
-                    app::status_text(response.status)
+                    app::status_text(response.state)
                 ))),
                 Err(error) => Some(ServerEvent::Failed(format!("取消失败：{error}"))),
             }
@@ -260,48 +261,56 @@ async fn run_effect(
             Ok(_) => None,
             Err(error) => Some(ServerEvent::Failed(format!("/new 失败：{error}"))),
         },
-        Effect::FetchApproval(approval) => match client.approval(&approval).await {
-            Ok(record) => Some(ServerEvent::Approval(Box::new(record))),
-            Err(error) => Some(ServerEvent::Failed(format!("取审批详情失败：{error}"))),
+        Effect::FetchApproval(handle) => match client.intervention(&handle).await {
+            // 详情只有审批那一种会弹窗：另两类在清单、状态行与提示行里说得出路（§7.5）。
+            Ok(InterventionDetail::Approval(record)) => Some(ServerEvent::Approval(record)),
+            Ok(other) => Some(ServerEvent::Failed(format!(
+                "{handle} 不是一条审批（{}），没有可打开的弹窗",
+                match other {
+                    InterventionDetail::Approval(_) => unreachable!("上面已经取走了"),
+                    InterventionDetail::Verify { .. } => "结果不明",
+                    InterventionDetail::Blocked { .. } => "阻塞",
+                }
+            ))),
+            Err(error) => Some(ServerEvent::Failed(format!("取详情失败：{error}"))),
         },
-        Effect::Decide {
-            approval,
-            approved,
+        Effect::Answer {
+            handle,
+            verdict,
             scope,
             request_key,
         } => {
-            let request = komo_kernel::protocol::http::ApprovalDecisionRequest {
-                approved,
+            let request = InterventionAnswerRequest {
+                verdict,
                 scope,
                 request_key: Some(request_key),
             };
-            match client.decide_approval(&approval, &request).await {
-                Ok(response) => Some(ServerEvent::ApprovalSettled {
-                    approval,
-                    approved: response.decision.approved,
-                    already_decided: response.already_decided,
-                }),
+            match client.answer_intervention(&handle, &request).await {
+                Ok(response) => Some(ServerEvent::Answered(Box::new(response))),
                 Err(error) => Some(ServerEvent::Failed(format!("答复失败：{error}"))),
             }
         }
-        Effect::DecideMany {
-            approvals,
+        Effect::AnswerMany {
+            handles,
             approved,
             request_key,
         } => {
-            let request = komo_kernel::protocol::http::ApprovalBatchDecisionRequest {
-                approvals,
+            let request = InterventionBatchAnswerRequest {
+                handles,
                 approved,
                 request_key: Some(request_key),
             };
-            match client.decide_approvals(&request).await {
-                Ok(response) => Some(ServerEvent::BatchSettled(Box::new(response))),
+            match client.answer_interventions(&request).await {
+                Ok(response) => Some(ServerEvent::BatchAnswered(Box::new(response))),
                 Err(error) => Some(ServerEvent::Failed(format!("批量答复失败：{error}"))),
             }
         }
-        Effect::FetchPending => match client.approvals(&ApprovalListQuery::default()).await {
-            Ok(response) => Some(ServerEvent::Pending(response.approvals)),
-            Err(error) => Some(ServerEvent::Failed(format!("取待审批失败：{error}"))),
+        Effect::FetchPending => match client
+            .interventions(&InterventionListQuery::default())
+            .await
+        {
+            Ok(response) => Some(ServerEvent::Pending(response.interventions)),
+            Err(error) => Some(ServerEvent::Failed(format!("取待处理清单失败：{error}"))),
         },
         Effect::FetchStatus => match client.session(session).await {
             Ok(detail) => Some(ServerEvent::Status(Box::new(detail))),

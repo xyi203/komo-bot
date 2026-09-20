@@ -35,7 +35,7 @@ use crate::types::ids::{
 use crate::types::memory::{MemoryItem, MemoryScope, MemoryState, RetrievalMode};
 use crate::types::model::{Effort, EmbeddingSpace, ModelConfig};
 use crate::types::plan::{ExecutionPlan, PlanHash, PlanSource};
-use crate::types::status::RunStatus;
+use crate::types::status::{RunState, SessionState, WaitReason};
 
 /// 统一错误体。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,17 +115,36 @@ pub struct CreateSessionRequest {
 pub struct SessionSummary {
     pub session: SessionId,
     pub title: String,
+    /// 生命周期状态（§8.10）。老客户端读到的是默认的 `active`（这个字段之前不存在）。
+    #[serde(default = "session_still_active")]
+    pub state: SessionState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_run: Option<RunId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub current_status: Option<RunStatus>,
+    pub current_state: Option<RunState>,
+    /// **当前这条 Run 在等什么**（§8.4）。`komo session list` 的"为什么它不动"全靠这一格；
+    /// 它只在 `current_state == Some(Waiting)` 时有值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_wait: Option<WaitReason>,
     pub applied_seq: Seq,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+fn session_still_active() -> SessionState {
+    SessionState::Active
+}
+
+/// `GET /v1/sessions` 的 query。逻辑删除过的会话默认不列（§8.10）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionListQuery {
+    /// 把已逻辑删除的也列出来（`closing` / `deleted`；`purged` 只在显式查看单个会话时可见）。
+    #[serde(default)]
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,8 +159,82 @@ pub struct SessionDetail {
     /// 未完成的 Run。
     #[serde(default)]
     pub unfinished: Vec<RunSummary>,
+    /// 这个会话上待处理的 Intervention（§7.5）。**不是**只列审批：结果不明与阻塞也在
+    /// 这里，否则"卡住但清单为空"会从这一个入口重新长出来。
     #[serde(default)]
-    pub pending_approvals: Vec<ApprovalRecord>,
+    pub pending: Vec<InterventionSummary>,
+}
+
+// ---- Session 生命周期（§8.10）----
+
+/// `POST /v1/sessions/{id}/delete`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteSessionRequest {
+    /// 不等待未完成的 Run：立刻把它们各写一条明确取消，再进 `deleted`（§8.10）。
+    #[serde(default)]
+    pub now: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<RequestKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLifecycleResponse {
+    pub session: SessionId,
+    pub state: SessionState,
+    #[serde(with = "time::serde::rfc3339")]
+    pub changed_at: OffsetDateTime,
+    /// `now` 时被明确取消的未完成 Run。空数组 = 没有要处置的。
+    #[serde(default)]
+    pub cancelled: Vec<RunId>,
+}
+
+/// `POST /v1/sessions/{id}/purge`：内容回收入 `purged`。引用没处置完就 409。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeSessionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<RequestKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeSessionResponse {
+    pub session: SessionId,
+    pub state: SessionState,
+    /// 这次回收掉的字节数（目录已不在时是 0——墓碑先落、内容后删，重跑是幂等的）。
+    #[serde(default)]
+    pub removed_bytes: u64,
+}
+
+/// 引用检查不过时的 409 正文：**列出要先处置什么**，不假装成功（§8.10）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeBlocked {
+    pub session: SessionId,
+    pub blockers: Vec<PurgeBlocker>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PurgeBlocker {
+    /// 哪一类（`memory_evidence` / `checkpoint` / `delivery` / `cron_firing` / `unfinished_run`）。
+    pub what: String,
+    pub detail: String,
+}
+
+/// `POST /v1/reconcile`：立刻跑一次对账（§8.9）。幂等。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconcileResponse {
+    /// 看了多少条非终态 Run。
+    pub checked: u32,
+    /// 交给 §8.4 决策表继续的。
+    pub resumed: u32,
+    /// 停成 `blocked` Intervention 的。
+    pub blocked: u32,
+    /// 没主人的 `running` 回收成 `interrupted` 的。
+    pub reclaimed: u32,
+    /// `closing → deleted` 推进的会话数。
+    pub closed: u32,
+    /// 墓碑已落、内容还没删完，这次补齐的会话数。
+    pub purged: u32,
+    #[serde(with = "time::serde::rfc3339")]
+    pub finished_at: OffsetDateTime,
 }
 
 // ---- GET /v1/sessions/{id}/events ----
@@ -183,7 +276,7 @@ pub struct SubmitRunResponse {
     pub run: RunId,
     pub session: SessionId,
     pub seq: Seq,
-    pub status: RunStatus,
+    pub state: RunState,
     /// 这次命中了同一请求键的原 Run。
     #[serde(default)]
     pub deduplicated: bool,
@@ -207,27 +300,9 @@ pub struct ResumeResponse {
     /// 已经在跑或刚被接续的 Run。
     #[serde(default)]
     pub resumed: Vec<RunSummary>,
-    /// 需要人处理的：审批、时效、结果不明（§8.4）。
+    /// 需要人处理的（§7.5）：审批、结果不明、阻塞。**三类一起列**。
     #[serde(default)]
-    pub pending: Vec<PendingItem>,
-}
-
-/// "2 个任务已接续，1 个等待审批"里的那一项（§8.8）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PendingItem {
-    /// `ApprovalRecord` 里带着整份 `ExecutionPlan`，比别的变体大一个数量级，所以装箱。
-    Approval(Box<ApprovalRecord>),
-    /// 结果不明，等人判断。
-    Uncertain {
-        run: RunId,
-        call: crate::types::ids::ToolCallId,
-        reason: String,
-    },
-    NeedsAttention {
-        run: RunId,
-        reason: String,
-    },
+    pub pending: Vec<InterventionSummary>,
 }
 
 // ---- POST /v1/sessions/{id}/boundary ----
@@ -252,7 +327,14 @@ pub struct BoundaryResponse {
 pub struct RunSummary {
     pub run: RunId,
     pub session: SessionId,
-    pub status: RunStatus,
+    pub state: RunState,
+    /// **在等什么**（`state == Waiting` 时有值，§8.4）。
+    ///
+    /// 少了这一格，"排队二十分钟"就只是一个状态：答不出在等审批、等一个到点时刻、还是
+    /// 在等同会话里更早的那条 Run。它是界面唯一的依据，也是 `/v1/interventions` 之外
+    /// 唯一能看到 `Dependency` 的地方（依赖不进清单——那不是"等人"）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitReason>,
     pub source: PlanSource,
     #[serde(default)]
     pub rounds: u32,
@@ -303,7 +385,7 @@ pub struct CancelRunRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelRunResponse {
     pub run: RunId,
-    pub status: RunStatus,
+    pub state: RunState,
 }
 
 // ---- /v1/approvals ----
@@ -377,22 +459,12 @@ pub struct ApprovalListResponse {
     pub approvals: Vec<ApprovalRecord>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalDecisionRequest {
-    pub approved: bool,
-    /// `/approve <id>` 是 `Once`，`/approve <id> run` 是 `Run`（§11.3）。
-    #[serde(default = "scope_once")]
-    pub scope: ApprovalScope,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_key: Option<RequestKey>,
-}
-
-fn scope_once() -> ApprovalScope {
-    ApprovalScope::Once
-}
-
-/// 决定的结果。**已决定的返回原决定，不报错**（§11.3）——同一人连点两次，第二次得到
-/// 的是"已决定"。
+/// 落一条审批决定的返回。**已决定的返回原决定，不报错**（§11.3）——同一人连点两次，
+/// 第二次得到的是"已决定"。
+///
+/// 它是**审批层**的结果（`ApprovalRepo::decide` 的返回，也是回执要渲染的那一份）；
+/// 统一清单上的答复是 [`InterventionAnswerResponse`]，里面带着同样的
+/// [`ApprovalDecisionRecord`]。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalDecisionResponse {
     pub approval: ApprovalId,
@@ -403,34 +475,213 @@ pub struct ApprovalDecisionResponse {
     pub already_decided: bool,
 }
 
-/// `POST /v1/approvals/decisions`：**一次答一批**（§11.3 的 `/approve all`）。
+// ---- /v1/interventions（§7.5）----
+
+/// 一条待处理的 Intervention。**清单是派生视图**：它是 `runs` 与 `approval_requests` 的
+/// 并集查询，没有自己的表——多一张表就多一处会与权威漂移的状态，而这次改造的全部理由
+/// 就是不要那个（§8.9）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterventionSummary {
+    /// 答复时用的句柄：审批是短 ID（§11.3），`verify` / `blocked` 是 Run ID。
+    pub handle: String,
+    pub kind: InterventionKind,
+    pub session: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunId>,
+    /// 停在哪一次逻辑调用上（`verify` 一定有；审批可能有）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<crate::types::ids::ToolCallId>,
+    /// 一句话：审批是"要你放行什么"，另外两类是"哪里不清楚"。
+    pub question: String,
+    /// 这一条**此刻**允许答复什么。列表项自带答案菜单，界面不必自己推——推错一个
+    /// 界面就会给出一个按下去没反应的答案（§11.3 的 TUI 菜单是同一条理由）。
+    #[serde(default)]
+    pub verdicts: Vec<InterventionVerdict>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterventionKind {
+    /// 一份执行计划等人放行（§7.4）。
+    Approval,
+    /// 一次调用的结果不明，等人核对（§8.6）。
+    Verify,
+    /// 前提没了：引用损坏、旧执行者未确认、会话不可服务（§8.9）。
+    Blocked,
+}
+
+impl InterventionKind {
+    /// 这一类能答什么，按固定顺序（界面直接照抄）。
+    pub fn verdicts(self) -> Vec<InterventionVerdict> {
+        match self {
+            InterventionKind::Approval => {
+                vec![InterventionVerdict::Approve, InterventionVerdict::Reject]
+            }
+            InterventionKind::Verify => vec![
+                InterventionVerdict::Satisfied,
+                InterventionVerdict::NotPerformed,
+                InterventionVerdict::Abandon,
+            ],
+            InterventionKind::Blocked => {
+                vec![InterventionVerdict::Resolve, InterventionVerdict::Abandon]
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InterventionKind::Approval => "approval",
+            InterventionKind::Verify => "verify",
+            InterventionKind::Blocked => "blocked",
+        }
+    }
+}
+
+/// 一个结论。**没有"我确认副作用已发生"这一条**——操作者可能看错，而账本一旦这么记
+/// 就再也纠不回来（§7.5）。`Satisfied` 说的是"核对之后目标已经是那个样子"，不是"我相信
+/// 它跑过了"。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterventionVerdict {
+    /// 审批：放行这份计划（范围由 `scope` 另给）。
+    Approve,
+    Reject,
+    /// `verify`：核对后目标已满足——给那次调用补一条结果，原 Run 继续。
+    Satisfied,
+    /// `verify`：确定没执行——标记后重新入队（一次性授权按 §7.4 的原范围重放）。
+    NotPerformed,
+    /// `blocked`：前提已处理，**重新观察并重新决策**（不强行放行）。
+    Resolve,
+    /// 三类共有：这条 Run 到此为止。
+    Abandon,
+}
+
+impl InterventionVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            InterventionVerdict::Approve => "approve",
+            InterventionVerdict::Reject => "reject",
+            InterventionVerdict::Satisfied => "satisfied",
+            InterventionVerdict::NotPerformed => "not_performed",
+            InterventionVerdict::Resolve => "resolve",
+            InterventionVerdict::Abandon => "abandon",
+        }
+    }
+
+    /// CLI / 聊天的写法。也认几个手滑得不算离谱的拼法（`not-performed`、`notperformed`）。
+    pub fn parse(raw: &str) -> Option<InterventionVerdict> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "approve" | "y" | "yes" => Some(InterventionVerdict::Approve),
+            "reject" | "n" | "no" => Some(InterventionVerdict::Reject),
+            "satisfied" | "done" => Some(InterventionVerdict::Satisfied),
+            "not_performed" | "not-performed" | "notperformed" => {
+                Some(InterventionVerdict::NotPerformed)
+            }
+            "resolve" | "retry" => Some(InterventionVerdict::Resolve),
+            "abandon" | "cancel" => Some(InterventionVerdict::Abandon),
+            _ => None,
+        }
+    }
+
+    /// 这个结论属于这一类吗（§7.5：结论按种类分派，不混用）。
+    pub fn allowed_for(self, kind: InterventionKind) -> bool {
+        kind.verdicts().contains(&self)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterventionListQuery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<InterventionKind>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterventionListResponse {
+    pub interventions: Vec<InterventionSummary>,
+}
+
+/// 单项详情。审批类的那一份就是 §7.2 要求界面展示的全部内容。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InterventionDetail {
+    /// `ApprovalRecord` 里带着整份 `ExecutionPlan`，比别的变体大一个数量级，所以装箱。
+    Approval(Box<ApprovalRecord>),
+    Verify {
+        summary: InterventionSummary,
+        tool: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan_hash: Option<PlanHash>,
+        reason: String,
+    },
+    Blocked {
+        summary: InterventionSummary,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterventionAnswerRequest {
+    pub verdict: InterventionVerdict,
+    /// 只有 `Approve` 用得上（§7.2 的三种范围）。不给 = `Once`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<ApprovalScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<RequestKey>,
+}
+
+/// 答复的结果。**已答复的返回原结论，不报错**（§11.3）——同一人连点两次，第二次得到
+/// 的是"已经答过了"。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InterventionAnswerResponse {
+    pub handle: String,
+    pub kind: InterventionKind,
+    pub verdict: InterventionVerdict,
+    /// 审批类才有：这次（或之前那次）决定本身。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<ApprovalDecisionRecord>,
+    /// 这条 Run 现在的状态（`abandon` 之后是 `cancelled`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_state: Option<RunState>,
+    /// 一句人话，回执直接用它。
+    pub note: String,
+    /// 这次请求没有改变任何东西，返回的是之前那个结论。
+    #[serde(default)]
+    pub already_answered: bool,
+}
+
+/// `POST /v1/interventions/answers`：**一次答一批**（§11.3 的 `/approve all`）。
 ///
 /// 一条 Run 里连着几个 shell 命令、几个 Run 各自卡在等待上——一次按键答一批是操作者
-/// 真正要的那件事。它**不是**一条决定覆盖多个计划：名单里每一条各自落一条决定、各自
-/// 排一条审计事件（§7.4），与逐条答完全等价，只是不必按 N 次键。
+/// 真正要的那件事。它**不是**一条结论覆盖多个计划：名单里每一条各自落一条结论、各自排
+/// 一条审计事件（§7.4），与逐条答完全等价，只是不必按 N 次键。
 ///
-/// 名单由**发起方列出**（TUI 拿手上的待处理集合、CLI 与聊天先 `list_pending`），协议里
-/// 没有"全部"这个词：服务端不替操作者决定"哪些算全部"——那会在答复到达之前，把这之后
-/// 新出现的请求也一起答掉。
+/// 名单由**发起方列出**（TUI 拿手上的待处理集合、CLI 与聊天先列一次），协议里没有
+/// "全部"这个词：服务端不替操作者决定"哪些算全部"——那会把答复到达之后新出现的请求
+/// 也一起答掉。
 ///
-/// **范围固定为本次调用**（请求体里没有 `scope`）：范围授权绑的是一份具体的计划——shell
-/// 绑的是整条命令、Python 绑的是模块与版本（`policy::scope_for`）——一批互不相干的计划
-/// 共用一个范围，只能是替操作者猜一个他没看过的答复。要范围就逐条答
-/// `POST /v1/approvals/{id}/decision`。
+/// **只答审批，而且范围固定为本次调用**：范围授权绑的是一份具体的计划（shell 绑整条
+/// 命令、Python 绑模块与版本），一批互不相干的计划共用一个范围，只能是替操作者猜一个
+/// 他没看过的答复。要范围就逐条答。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalBatchDecisionRequest {
-    pub approvals: Vec<ApprovalId>,
+pub struct InterventionBatchAnswerRequest {
+    pub handles: Vec<String>,
     pub approved: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<RequestKey>,
 }
 
-/// 一批答复的结果。`decisions` 与请求同序；点了名却没有的那些单独列出，不让整批失败。
+/// 一批答复的结果。`answered` 与请求同序；点了名却已经不在的那些单独列出，不让整批失败。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalBatchDecisionResponse {
-    pub decisions: Vec<ApprovalDecisionResponse>,
+pub struct InterventionBatchAnswerResponse {
+    pub answered: Vec<InterventionAnswerResponse>,
     #[serde(default)]
-    pub missing: Vec<ApprovalId>,
+    pub missing: Vec<String>,
 }
 
 // ---- /v1/cron ----
@@ -786,10 +1037,32 @@ mod tests {
     }
 
     #[test]
-    fn a_decision_request_defaults_to_this_call_only() {
-        let request: ApprovalDecisionRequest =
-            serde_json::from_str(r#"{"approved":true}"#).unwrap();
-        assert_eq!(request.scope, ApprovalScope::Once);
+    fn an_answer_without_a_scope_is_this_call_only() {
+        // 不给 `scope` 就是本次调用——`scope` 只在 `Approve` 上有意义（§7.2）。
+        let request: InterventionAnswerRequest =
+            serde_json::from_str(r#"{"verdict":"approve"}"#).unwrap();
+        assert_eq!(request.verdict, InterventionVerdict::Approve);
+        assert_eq!(request.scope, None);
+
+        // 结论按种类分派，不混用（§7.5）：
+        assert!(InterventionVerdict::Satisfied.allowed_for(InterventionKind::Verify));
+        assert!(!InterventionVerdict::Satisfied.allowed_for(InterventionKind::Approval));
+        assert!(InterventionVerdict::Resolve.allowed_for(InterventionKind::Blocked));
+        assert!(!InterventionVerdict::Approve.allowed_for(InterventionKind::Blocked));
+    }
+
+    #[test]
+    fn a_verdict_parses_the_way_operators_type_it() {
+        assert_eq!(
+            InterventionVerdict::parse("not-performed"),
+            Some(InterventionVerdict::NotPerformed)
+        );
+        assert_eq!(
+            InterventionVerdict::parse(" YES "),
+            Some(InterventionVerdict::Approve)
+        );
+        assert_eq!(InterventionVerdict::parse("maybe"), None);
+        assert_eq!(InterventionKind::Verify.as_str(), "verify");
     }
 
     /// `?scope=` 的两种写法都收得下——文档里那句"两种写法必须能互相还原"落到接口上。
@@ -835,8 +1108,9 @@ mod tests {
     #[test]
     fn a_submit_response_without_the_dedup_flag_reads_as_new() {
         let response: SubmitRunResponse =
-            serde_json::from_str(r#"{"run":"run-1","session":"sess-1","seq":1,"status":"queued"}"#)
+            serde_json::from_str(r#"{"run":"run-1","session":"sess-1","seq":1,"state":"queued"}"#)
                 .unwrap();
         assert!(!response.deduplicated);
+        assert_eq!(response.state, RunState::Queued);
     }
 }

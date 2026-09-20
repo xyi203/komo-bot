@@ -41,6 +41,22 @@ impl RuleTable {
                     "权限扩大或修改 Policy 只能走操作者的配置流程",
                     Matcher::operations([OperationMatch::PolicyChange]),
                 ),
+                // §8.10 第 4 条：komo 自己的状态不是工具的目标。
+                //
+                // 这条是**网**，不是墙：文件工具的目标路径是解析后的真实路径，拦得住；
+                // 任意 shell / Python 只有 §7.3 那一层（没有沙箱时它本来就拥有这个账号
+                // 的全部权限），再加 §7.1 的 `command_patterns` 兜手滑形状。真正的保证
+                // 在 reconcile：目录没了而状态不是 `purged`，它会报出来（§8.9）。
+                rule(
+                    "komo-state-write",
+                    Effect::Deny,
+                    "komo 的状态目录与数据库不是工具的写入目标（§8.10）",
+                    Matcher {
+                        operations: Some(vec![OperationMatch::WriteFile]),
+                        paths: Some(PathMatch::TouchesProtected),
+                        ..Default::default()
+                    },
+                ),
                 // 第 1 行：已授权范围内读取普通文件 → Allow。
                 rule(
                     "read-within-roots",
@@ -196,10 +212,22 @@ mod tests {
         ]
     }
 
+    /// §8.10 第 4 条要拦的那些路径。名字与 `WorkspaceRoot` 里的工作区**故意重叠**：
+    /// 数据目录下的 `sessions/` 从来不是可写根，两者不冲突，但测试要能分辨。
+    fn protected() -> Vec<PathBuf> {
+        vec![
+            PathBuf::from("/home/u/.komo/sessions"),
+            PathBuf::from("/home/u/.komo/state.db"),
+            PathBuf::from("/home/u/.komo/runtime"),
+            PathBuf::from("/home/u/.komo/.env"),
+        ]
+    }
+
     struct Fixture {
         roots: Vec<WorkspaceRoot>,
         grants: Vec<Grant>,
         isolation: IsolationCapability,
+        protected: Vec<PathBuf>,
     }
 
     impl Fixture {
@@ -208,6 +236,7 @@ mod tests {
                 roots: roots(),
                 grants: vec![],
                 isolation: IsolationCapability::default(),
+                protected: protected(),
             }
         }
 
@@ -218,6 +247,7 @@ mod tests {
                 roots: &self.roots,
                 now: NOW,
                 isolation: self.isolation,
+                protected: &self.protected,
             }
         }
     }
@@ -299,6 +329,56 @@ mod tests {
         assert!(
             matches!(decision, PolicyDecision::Ask { .. }),
             "{decision:?}"
+        );
+    }
+
+    /// §8.10 第 4 条：工具不许写 komo 自己的状态。**而且授权盖不过去**——它是一条
+    /// `Deny`，Deny 在梯子上高于任何授权（§7.1）。
+    #[test]
+    fn komo_state_is_never_a_write_target_even_with_a_grant() {
+        let into_state = plan(
+            "write",
+            Operation::WriteFile,
+            vec![target(
+                "/home/u/.komo/sessions/sess-1/events.jsonl",
+                TargetAccess::Write,
+            )],
+        );
+        let mut f = Fixture::new();
+        let decision = RuleTable::initial().decide(&into_state, &f.ctx());
+        assert!(decision.is_deny(), "{decision:?}");
+        assert!(decision.reason().contains("komo-state-write"));
+
+        f.grants.push(Grant {
+            id: GrantId::from_raw("g-1"),
+            approval: ApprovalId::from_raw("ap-1"),
+            scope: GrantScope::Once {
+                plan_hash: into_state.plan_hash(),
+                call: None,
+            },
+            granted_at: NOW,
+            valid_until: None,
+            consumed: false,
+            reason: "操作者批准".into(),
+        });
+        assert!(
+            RuleTable::initial().decide(&into_state, &f.ctx()).is_deny(),
+            "数据目录不是靠审批就能写的"
+        );
+
+        // 反过来：这条规则不能顺手把工作区也拦掉——那是第 2 行的地盘。
+        let into_workspace = plan(
+            "write",
+            Operation::WriteFile,
+            vec![target(
+                "/home/u/.komo/workspaces/p/out.txt",
+                TargetAccess::Write,
+            )],
+        );
+        assert!(
+            RuleTable::initial()
+                .decide(&into_workspace, &f.ctx())
+                .is_allow()
         );
     }
 

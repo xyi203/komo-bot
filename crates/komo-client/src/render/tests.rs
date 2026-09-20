@@ -6,7 +6,8 @@ use komo_kernel::cron::{CronJob, TimeZone, Trigger};
 use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::config::{KeyPath, SourceFile};
 use komo_kernel::protocol::http::{
-    ApprovalDecisionRecord, ModelMenuEntry, RunSummary, SessionSummary, ToolCallSummary,
+    ApprovalDecisionRecord, InterventionAnswerResponse, InterventionKind, InterventionVerdict,
+    ModelMenuEntry, RunSummary, SessionSummary, ToolCallSummary,
 };
 use komo_kernel::types::chat::{ApprovalScope, PeerId};
 use komo_kernel::types::digest::ContentHash;
@@ -14,6 +15,7 @@ use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{Evidence, EvidenceRef, ExtractionMetadata, MemoryUsage};
 use komo_kernel::types::model::Effort;
 use komo_kernel::types::refs::{ContentRef, OutputRef};
+use komo_kernel::types::status::{RetryCause, WaitReason};
 use komo_kernel::types::turn::MemoryUse;
 use std::path::PathBuf;
 use time::macros::datetime;
@@ -29,9 +31,16 @@ fn a_session_list_shows_status_and_title() {
             SessionSummary {
                 session: SessionId::from_raw("sess-1"),
                 title: "清理构建目录".into(),
+                state: SessionState::Active,
                 workdir: Some("/home/u/project".into()),
                 current_run: Some(RunId::from_raw("run-1")),
-                current_status: Some(RunStatus::WaitingApproval),
+                current_state: Some(RunState::Waiting),
+                // 「为什么它不动」那一格：`session list` 就靠它答（§8.4）。
+                current_wait: Some(WaitReason::Retry {
+                    attempts: 2,
+                    not_before: NOW + time::Duration::seconds(30),
+                    cause: RetryCause::RateLimited,
+                }),
                 applied_seq: Seq(9),
                 created_at: NOW,
                 updated_at: NOW,
@@ -39,22 +48,26 @@ fn a_session_list_shows_status_and_title() {
             SessionSummary {
                 session: SessionId::from_raw("sess-2"),
                 title: String::new(),
+                state: SessionState::Active,
                 workdir: None,
                 current_run: None,
-                current_status: None,
+                current_state: None,
+                current_wait: None,
                 applied_seq: Seq(0),
                 created_at: NOW,
                 updated_at: NOW,
             },
         ],
     };
-    let printed = session_list(&response);
+    let printed = session_list(&response, NOW);
     insta_like(
         &printed,
         &[
             "SESSION",
             "sess-1",
-            "等待审批",
+            "等待中",
+            // §8.4：状态只说"能不能跑"，这一列还要答"为什么它不动"。
+            "等待中 · 30s 后重试（限流，第 2 次）",
             "清理构建目录 · /home/u/project",
             "sess-2",
             "空闲",
@@ -63,9 +76,72 @@ fn a_session_list_shows_status_and_title() {
     );
 }
 
+/// §7.5：`Dependency` **不进**干预清单（等前一条 Run 不是"等人"），所以清单外的这一列
+/// 是它唯一说得清的地方——"排队二十分钟"里有一半是它。
+#[test]
+fn a_session_list_says_when_a_run_is_waiting_on_an_earlier_one() {
+    let printed = session_list(
+        &SessionListResponse {
+            sessions: vec![SessionSummary {
+                session: SessionId::from_raw("sess-3"),
+                title: "后面的那条".into(),
+                state: SessionState::Active,
+                workdir: None,
+                current_run: Some(RunId::from_raw("run-3")),
+                current_state: Some(RunState::Waiting),
+                current_wait: Some(WaitReason::Dependency {
+                    run: RunId::from_raw("run-2"),
+                }),
+                applied_seq: Seq(0),
+                created_at: NOW,
+                updated_at: NOW,
+            }],
+        },
+        NOW,
+    );
+    assert!(printed.contains("等待中 · 在等 Run run-2"), "{printed}");
+}
+
+/// §8.10：逻辑删除过的会话与活会话在这一列唯一的区别就是那个标注——`active` 留空，
+/// 另外三个各印各的词。
+#[test]
+fn a_session_list_marks_every_state_that_is_not_active() {
+    let session = |state| SessionSummary {
+        session: SessionId::from_raw("sess-1"),
+        title: "清理".into(),
+        state,
+        workdir: None,
+        current_run: None,
+        current_state: None,
+        current_wait: None,
+        applied_seq: Seq(0),
+        created_at: NOW,
+        updated_at: NOW,
+    };
+    let printed = session_list(
+        &SessionListResponse {
+            sessions: vec![
+                session(SessionState::Active),
+                session(SessionState::Closing),
+                session(SessionState::Deleted),
+                session(SessionState::Purged),
+            ],
+        },
+        NOW,
+    );
+    assert!(printed.contains("正在关闭"), "{printed}");
+    assert!(printed.contains("已删除"), "{printed}");
+    assert!(printed.contains("已回收"), "{printed}");
+    // `active` 是常态，不占一列噪音。
+    assert!(!printed.contains("使用中"), "{printed}");
+}
+
 #[test]
 fn an_empty_session_list_says_so() {
-    assert_eq!(session_list(&SessionListResponse::default()), "没有会话");
+    assert_eq!(
+        session_list(&SessionListResponse::default(), NOW),
+        "没有会话"
+    );
 }
 
 // ---- run inspect ----
@@ -75,7 +151,8 @@ fn run_detail(state: ToolCallState) -> RunDetail {
         summary: RunSummary {
             run: RunId::from_raw("run-1"),
             session: SessionId::from_raw("sess-1"),
-            status: RunStatus::Completed,
+            state: RunState::Completed,
+            wait: None,
             source: komo_kernel::types::plan::PlanSource::Interactive {
                 session: SessionId::from_raw("sess-1"),
             },
@@ -107,7 +184,7 @@ fn run_detail(state: ToolCallState) -> RunDetail {
 
 #[test]
 fn run_inspect_prints_two_question_marks_for_an_uncertain_call() {
-    let printed = run_inspect(&run_detail(ToolCallState::Uncertain), &[]);
+    let printed = run_inspect(&run_detail(ToolCallState::Uncertain), &[], NOW);
     assert!(printed.contains("?? shell"), "{printed}");
     // §8.6：不能装成失败，也不能用重试成功盖掉。
     assert!(printed.contains("结果不明"), "{printed}");
@@ -141,7 +218,7 @@ fn run_inspect_says_who_allowed_a_call_when_the_record_is_at_hand() {
         grant: None,
         consumed: true,
     });
-    let printed = run_inspect(&run_detail(ToolCallState::Completed), &[record]);
+    let printed = run_inspect(&run_detail(ToolCallState::Completed), &[record], NOW);
     assert!(printed.contains("allowed by ou_xxx"), "{printed}");
     assert!(printed.contains("本次 Run 范围"), "{printed}");
     assert!(printed.contains("7K2M"), "{printed}");
@@ -149,44 +226,137 @@ fn run_inspect_says_who_allowed_a_call_when_the_record_is_at_hand() {
 
 #[test]
 fn run_inspect_says_nothing_about_provenance_when_it_has_no_record() {
-    let printed = run_inspect(&run_detail(ToolCallState::Completed), &[]);
+    let printed = run_inspect(&run_detail(ToolCallState::Completed), &[], NOW);
     assert!(
         !printed.contains("allowed by"),
         "猜的放行来源不如不印：{printed}"
     );
 }
 
+/// §8.4：`waiting` 一个词说不出"在等什么"——摘要里那一格（`wait`）现在有了，就要印出来。
 #[test]
-fn run_inspect_explains_an_interrupted_run_is_not_a_cancellation() {
+fn run_inspect_says_what_a_waiting_run_is_waiting_for() {
+    // 等一条**依赖**：它不进干预清单（§7.5——等前一条 Run 不是等人），所以这里是它唯一
+    // 说得清的地方。
     let mut detail = run_detail(ToolCallState::Started);
-    detail.summary.status = RunStatus::Interrupted;
-    let printed = run_inspect(&detail, &[]);
+    detail.summary.state = RunState::Waiting;
+    detail.summary.wait = Some(WaitReason::Dependency {
+        run: RunId::from_raw("run-9"),
+    });
+    let printed = run_inspect(&detail, &[], NOW);
+    assert!(printed.contains("等待中 · 在等 Run run-9"), "{printed}");
+
+    // 退了休的 `Interrupted` 不再是状态，而"上一次执行没收尾"仍然说得出来。
+    let mut detail = run_detail(ToolCallState::Started);
+    detail.summary.state = RunState::Abandoned;
+    let printed = run_inspect(&detail, &[], NOW);
     assert!(printed.contains("不等于用户取消"), "{printed}");
+
+    // 理由缺了（老数据）也不许编一个：只说"停着，不是结束"。
+    let mut detail = run_detail(ToolCallState::Started);
+    detail.summary.state = RunState::Waiting;
+    let printed = run_inspect(&detail, &[], NOW);
+    assert!(printed.contains("停着，不是结束"), "{printed}");
+    assert!(!printed.contains("在等 Run"), "{printed}");
 }
 
-// ---- approval ----
+// ---- intervention ----
 
+/// §7.5：一张表列出三类，每一条都带句柄、种类、问题与**它此刻能答什么**。
 #[test]
-fn an_approval_list_gives_the_short_ids_and_how_to_answer() {
-    let printed = approval_list(&ApprovalListResponse {
-        approvals: vec![fixture::approval_record()],
+fn an_intervention_list_names_all_three_kinds_and_what_they_take() {
+    let printed = interventions(&InterventionListResponse {
+        interventions: vec![
+            fixture::intervention_summary(
+                "7K2M",
+                InterventionKind::Approval,
+                "放行 rm -rf build？",
+            ),
+            fixture::intervention_summary(
+                "run-1",
+                InterventionKind::Verify,
+                "上次那个调用发生了没有",
+            ),
+            fixture::intervention_summary(
+                "run-2",
+                InterventionKind::Blocked,
+                "会话已删除，内容读不出来",
+            ),
+        ],
     });
     insta_like(
         &printed,
         &[
-            "短ID",
+            "句柄",
+            "种类",
+            "会话",
+            "问题",
+            "可答结论",
             "7K2M",
-            "shell",
+            "审批",
+            "approve / reject",
             "run-1",
-            "命中 shell 规则",
-            "komo approval approve",
+            "结果不明",
+            "satisfied / not_performed / abandon",
+            "run-2",
+            "阻塞",
+            "resolve / abandon",
+            "komo intervention answer",
+        ],
+    );
+}
+
+/// 没有待处理时也要说清楚"没有"——空清单是 `/pending` 唯一的回答。
+#[test]
+fn an_empty_intervention_list_says_so() {
+    assert_eq!(
+        interventions(&InterventionListResponse::default()),
+        "没有待处理的事项"
+    );
+}
+
+/// `verify` / `blocked` 的详情要说得出路：它是什么、要核对什么、能答什么。
+#[test]
+fn an_intervention_detail_says_what_to_check_and_what_it_takes() {
+    let summary =
+        fixture::intervention_summary("run-1", InterventionKind::Verify, "上次那个调用发生了没有");
+    let printed = intervention_detail(&InterventionDetail::Verify {
+        summary,
+        tool: "memos.write".into(),
+        plan_hash: Some(fixture::plan().plan_hash()),
+        reason: "副作用可能已经发生，完整输出没落盘".into(),
+    });
+    insta_like(
+        &printed,
+        &[
+            "句柄   run-1（结果不明）",
+            "会话",
+            "memos.write",
+            "副作用可能已经发生",
+            "satisfied / not_performed / abandon",
+        ],
+    );
+
+    let summary = fixture::intervention_summary("run-2", InterventionKind::Blocked, "会话已删除");
+    let printed = intervention_detail(&InterventionDetail::Blocked {
+        summary,
+        reason: "会话已删除：内容读不出来，不许领这条 Run".into(),
+    });
+    insta_like(
+        &printed,
+        &[
+            "句柄   run-2（阻塞）",
+            "不许领这条 Run",
+            "resolve / abandon",
         ],
     );
 }
 
 #[test]
-fn an_approval_show_carries_the_same_five_items_as_the_tui_popup() {
-    let printed = approval_show(&fixture::approval_record());
+fn an_intervention_detail_for_an_approval_carries_the_same_five_items_as_the_tui_popup() {
+    let printed = intervention_detail(&InterventionDetail::Approval(Box::new(
+        fixture::approval_record(),
+    )));
     insta_like(
         &printed,
         &[
@@ -205,6 +375,51 @@ fn an_approval_show_carries_the_same_five_items_as_the_tui_popup() {
             "范围",
             "本次 Run 范围",
         ],
+    );
+}
+
+/// 一批答复逐条印：某一条可能早就答过了，而它原来那个结论说不定与这一批相反。
+#[test]
+fn an_intervention_batch_prints_each_answer_including_the_stale_one() {
+    let printed = intervention_batch(&InterventionBatchAnswerResponse {
+        answered: vec![
+            InterventionAnswerResponse {
+                handle: "7K2M".into(),
+                kind: InterventionKind::Approval,
+                verdict: InterventionVerdict::Approve,
+                decision: None,
+                run_state: None,
+                note: "已批准（本次调用）".into(),
+                already_answered: false,
+            },
+            InterventionAnswerResponse {
+                handle: "9QRS".into(),
+                kind: InterventionKind::Approval,
+                verdict: InterventionVerdict::Reject,
+                decision: None,
+                run_state: None,
+                note: "早已答复：拒绝".into(),
+                already_answered: true,
+            },
+        ],
+        missing: vec!["3TVW".into()],
+    });
+    insta_like(
+        &printed,
+        &[
+            "7K2M approve· 已批准（本次调用）",
+            "9QRS reject· 早已答复：拒绝（早已答复，这次没有改变什么）",
+            "3TVW 没有这条待处理事项",
+            "本次调用",
+        ],
+    );
+}
+
+#[test]
+fn an_empty_intervention_batch_says_there_was_nothing_to_answer() {
+    assert_eq!(
+        intervention_batch(&InterventionBatchAnswerResponse::default()),
+        "没有待处理的审批"
     );
 }
 

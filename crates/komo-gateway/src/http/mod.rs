@@ -12,6 +12,7 @@ pub mod cron;
 pub mod error;
 pub mod events;
 pub mod idempotency;
+pub mod interventions;
 pub mod memories;
 pub mod runs;
 pub mod sessions;
@@ -24,7 +25,7 @@ use axum::routing::{get, patch, post};
 use axum::{Router, extract::State};
 use komo_kernel::events::Event;
 use komo_kernel::protocol::PROTOCOL_VERSION;
-use komo_kernel::protocol::http::{HealthResponse, SessionSummary};
+use komo_kernel::protocol::http::{HealthResponse, ReconcileResponse, SessionSummary};
 use komo_kernel::traits::Ledger;
 use komo_kernel::types::ids::{Seq, SessionId};
 use time::OffsetDateTime;
@@ -72,12 +73,26 @@ pub fn router(api: Api) -> Router {
         .route("/v1/sessions/{id}/runs", post(sessions::submit))
         .route("/v1/sessions/{id}/resume", post(sessions::resume))
         .route("/v1/sessions/{id}/boundary", post(sessions::boundary))
+        .route("/v1/sessions/{id}/delete", post(sessions::delete))
+        .route("/v1/sessions/{id}/purge", post(sessions::purge))
+        .route("/v1/reconcile", post(reconcile))
         .route("/v1/runs/{id}", get(runs::detail))
         .route("/v1/runs/{id}/cancel", post(runs::cancel))
+        // §7.5：三个回答面。`/v1/interventions/answers` 是**批量**（§11.3 的 `/approve all`），
+        // 静态段优先于 `{handle}`，两条不冲突。
+        .route("/v1/interventions", get(interventions::list))
+        .route(
+            "/v1/interventions/answers",
+            post(interventions::answer_batch),
+        )
+        .route("/v1/interventions/{handle}", get(interventions::show))
+        .route(
+            "/v1/interventions/{handle}/answer",
+            post(interventions::answer),
+        )
+        // 审批只留**审计读**（§7.4：这一步是谁放行的）。答复只走 interventions——单条与
+        // 批量的决定端点都删了，留着它们就是第二套语义。
         .route("/v1/approvals", get(approvals::list))
-        .route("/v1/approvals/decisions", post(approvals::decide_batch))
-        .route("/v1/approvals/{id}", get(approvals::show))
-        .route("/v1/approvals/{id}/decision", post(approvals::decide))
         .route("/v1/cron", get(cron::list).post(cron::create))
         .route("/v1/cron/{id}", patch(cron::update).delete(cron::remove))
         .route("/v1/cron/{id}/run", post(cron::run_now))
@@ -98,6 +113,18 @@ pub fn router(api: Api) -> Router {
         .layer(crate::auth::bearer(token));
 
     open.merge(guarded).with_state(api)
+}
+
+/// `POST /v1/reconcile`：**立刻跑一次对账**（§8.9）。幂等，返回这次判定了什么。
+///
+/// 三个触发点之一（另外两个是 Gateway 启动与 `AUDIT_TICK` 那一拍）：`komo doctor
+/// --reconcile` 打它。它是"数据库是权威，其余一切都是派生"（§8.9）唯一的手动入口——
+/// 一条 handler 任务自己 panic 掉的 `running`、一个被手工 `rm -rf` 掉的会话目录，都由
+/// 它当场判成 `queued` 或 `waiting + intervention`，而不是留在日志里。
+///
+/// 返回的是这一趟的**汇总**：看了多少、判了什么。逐条的明细在日志里（一行一条恢复决定）。
+async fn reconcile(State(api): State<Api>) -> ApiResult<Json<ReconcileResponse>> {
+    Ok(Json(api.state.reconcile_response().await?))
 }
 
 /// `GET /healthz`：最小健康检查与**实例标识**。

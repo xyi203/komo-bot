@@ -574,7 +574,7 @@ async fn put_grant_in(ex: &mut dyn Executor, grant: &Grant) -> Result<(), StoreE
     Ok(())
 }
 
-fn record_from_row(row: &ApprovalRequestRow) -> Result<ApprovalRecord, StoreError> {
+pub(crate) fn record_from_row(row: &ApprovalRequestRow) -> Result<ApprovalRecord, StoreError> {
     Ok(ApprovalRecord {
         approval: ApprovalId::from_raw(row.id.clone()),
         short_id: ShortId::parse(&row.short_id).unwrap_or_else(|| ShortId::from_index(0)),

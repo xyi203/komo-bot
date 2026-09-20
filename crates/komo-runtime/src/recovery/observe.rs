@@ -44,7 +44,10 @@ pub fn log_tail(events: &[Event], run: &RunId) -> LogTail {
             }
             EventPayload::RunCompleted(_)
             | EventPayload::RunFailed(_)
-            | EventPayload::RunCancelled(_) => return LogTail::Final,
+            | EventPayload::RunCancelled(_)
+            // 操作者放弃也是终态（§7.5、§8.4：四个终态各自算数）。漏掉它，一条已经
+            // `abandoned` 的 Run 会被当成"还在跑"，于是被放回队列再跑一次。
+            | EventPayload::RunAbandoned(_) => return LogTail::Final,
             _ => {}
         }
     }
@@ -159,14 +162,27 @@ pub fn started_call(events: &[Event], run: &RunId, call: &ToolCallId) -> Option<
 }
 
 /// 这个 Run 最后停在哪条审批上（日志侧；**权威仍是 state.db**，§7.4）。
-pub fn waiting_approval(events: &[Event], run: &RunId) -> Option<ApprovalId> {
-    events_of(events, run)
-        .iter()
+///
+/// 事件只有一个 `run.waiting`，"在等什么"在 `WaitReason` 里（§8.4）。这里只认**最后
+/// 那一条** `run.waiting`，而且它必须是等审批：
+///
+/// - 往前翻找"最近一条等审批的"会把一条**早就答复过**的审批当成现在的落点，于是恢复
+///   扫描拿着一个陈旧的审批号去问数据库，答"有效"就把 Run 接着跑起来——那是拿旧授权
+///   放行新动作。
+/// - 最后停的不是审批（等退避、等前一条 Run）→ 答案就是"没有"，让上层照 §8.4 判成
+///   需要人重答，而不是替它挑一个。
+pub fn waiting_on_approval(events: &[Event], run: &RunId) -> Option<ApprovalId> {
+    let last = events_of(events, run)
+        .into_iter()
         .rev()
-        .find_map(|event| match &event.payload {
-            EventPayload::RunWaitingApproval(waiting) => Some(waiting.approval.clone()),
+        .find(|event| matches!(event.payload, EventPayload::RunWaiting(_)))?;
+    match &last.payload {
+        EventPayload::RunWaiting(waiting) => match &waiting.reason {
+            komo_kernel::types::status::WaitReason::Approval { approval } => Some(approval.clone()),
             _ => None,
-        })
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -176,6 +192,7 @@ mod tests {
     use komo_kernel::types::digest::ContentHash;
     use komo_kernel::types::ids::{EventId, RequestKey, Seq, SessionId};
     use komo_kernel::types::plan::PlanSource;
+    use komo_kernel::types::status::{RetryCause, WaitReason};
     use komo_kernel::types::turn::ToolCallRequest;
     use time::macros::datetime;
 
@@ -287,5 +304,73 @@ mod tests {
         let mut other = event(1, accepted());
         other.run = Some(RunId::from_raw("run-2"));
         assert_eq!(log_tail(&[other], &run()), LogTail::InputIncomplete);
+    }
+
+    /// 操作者放弃也是终态（§7.5、§8.4）。漏掉它，一条已经 `abandoned` 的 Run 会被当成
+    /// "还在跑"，于是被放回队列再跑一次。
+    #[test]
+    fn an_abandoned_run_is_final_in_the_log_too() {
+        let events = vec![
+            event(1, accepted()),
+            event(
+                2,
+                EventPayload::RunAbandoned(komo_kernel::events::RunAbandoned {
+                    by: None,
+                    reason: Some("查过了，不追究".into()),
+                }),
+            ),
+        ];
+        assert_eq!(log_tail(&events, &run()), LogTail::Final);
+    }
+
+    /// 只有**最后停的那一条**是等审批时，才答得出审批号（§8.4）。
+    ///
+    /// 往前翻找"最近一条等审批的"会把一条早就答复过的审批当成现在的落点——恢复扫描
+    /// 于是拿着它去问数据库，答"有效"就把 Run 接着跑起来，那是拿旧授权放行新动作。
+    #[test]
+    fn only_the_last_wait_counts_and_only_if_it_is_an_approval() {
+        let approval = ApprovalId::from_raw("ap-7");
+        let waiting = |reason: WaitReason| {
+            EventPayload::RunWaiting(komo_kernel::events::RunWaiting { reason })
+        };
+        let approval_wait = event(
+            2,
+            waiting(WaitReason::Approval {
+                approval: approval.clone(),
+            }),
+        );
+        let retry_wait = event(
+            3,
+            waiting(WaitReason::Retry {
+                attempts: 1,
+                not_before: datetime!(2026-09-15 08:05:00 UTC),
+                cause: RetryCause::Transport,
+            }),
+        );
+
+        // 停审批：答得出来。
+        let events = vec![event(1, accepted()), approval_wait.clone()];
+        assert_eq!(waiting_on_approval(&events, &run()), Some(approval.clone()));
+
+        // 它之后又停在退避上：最后那条不是审批，答案就是"没有"。
+        let events = vec![
+            event(1, accepted()),
+            approval_wait.clone(),
+            retry_wait.clone(),
+        ];
+        assert_eq!(waiting_on_approval(&events, &run()), None);
+
+        // 之后停在前一条 Run 上也一样。
+        let events = vec![
+            event(1, accepted()),
+            approval_wait,
+            event(
+                4,
+                waiting(WaitReason::Dependency {
+                    run: RunId::from_raw("run-0"),
+                }),
+            ),
+        ];
+        assert_eq!(waiting_on_approval(&events, &run()), None);
     }
 }

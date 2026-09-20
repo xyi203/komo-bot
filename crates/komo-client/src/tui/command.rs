@@ -5,6 +5,7 @@
 //! 要到下一个 Run 的状态行才发现。
 
 use komo_kernel::protocol::ApprovalTarget;
+use komo_kernel::protocol::http::InterventionVerdict;
 use komo_kernel::types::chat::ApprovalScope;
 use komo_kernel::types::ids::ShortId;
 use komo_kernel::types::model::Effort;
@@ -29,6 +30,11 @@ pub enum Command {
     /// `/reject [short_id|all]`
     Reject {
         target: ApprovalTarget,
+    },
+    /// `/answer <句柄> <结论>`：§11.3 里答另外两类（以及审批）的那条路。
+    Answer {
+        handle: String,
+        verdict: InterventionVerdict,
     },
     /// `/model`（列出）/ `/model <id>`（设定）
     Model {
@@ -56,6 +62,10 @@ pub enum CommandError {
     BadScope { raw: String },
     #[error("「{raw}」不是可选的 effort；可选值：{options}")]
     BadEffort { raw: String, options: String },
+    #[error("「{raw}」不是可答的结论；可选值：{options}")]
+    BadVerdict { raw: String, options: String },
+    #[error("/answer 要两个参数：句柄与结论（如 `/answer run-1 satisfied`）；可选结论：{options}")]
+    AnswerNeedsTwoArguments { options: String },
     #[error("「{raw}」不在模型清单里；可选值：{options}")]
     BadModel { raw: String, options: String },
 }
@@ -93,17 +103,46 @@ pub const EFFORT_LEVELS: [&str; 5] = [
     Effort::MAX,
 ];
 
+/// §7.5 表里那一列结论词，按种类各归各的，合起来就是 `/answer` 认的这些。
+///
+/// 顺序与 `InterventionKind::verdicts` 一致（审批 → `verify` → `blocked`），因为报错时
+/// 印的就是它。
+pub const VERDICT_WORDS: [InterventionVerdict; 6] = [
+    InterventionVerdict::Approve,
+    InterventionVerdict::Reject,
+    InterventionVerdict::Satisfied,
+    InterventionVerdict::NotPerformed,
+    InterventionVerdict::Resolve,
+    InterventionVerdict::Abandon,
+];
+
+/// 报错时印出来的那份词表。
+fn verdict_options() -> String {
+    VERDICT_WORDS
+        .iter()
+        .map(|verdict| verdict.as_str())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
 /// 命令名与一行说明，`/help` 与命令面板共用一张表。
-pub const COMMANDS: [(&str, &str); 10] = [
+pub const COMMANDS: [(&str, &str); 11] = [
     ("/new", "在当前会话划一条回放边界（不切会话）"),
     ("/cancel", "取消本会话正在跑的 Run"),
-    ("/status", "当前 Run 状态与待审批数"),
-    ("/pending", "列出待处理审批及其短 ID"),
+    ("/status", "当前 Run 状态与待处理条数"),
+    (
+        "/pending",
+        "列出全部待处理事项（审批 / 结果不明 / 阻塞）与各自的句柄",
+    ),
     (
         "/approve",
         "[短ID|all] [run] 批准；all 全批，run = 本次 Run 范围",
     ),
     ("/reject", "[短ID|all] 拒绝"),
+    (
+        "/answer",
+        "<句柄> <结论>：satisfied / not_performed / resolve / abandon",
+    ),
     ("/model", "[模型] 列出或设定下一个 Run 的模型"),
     ("/effort", "[档位] 列出或设定下一个 Run 的推理强度"),
     ("/help", "这张表"),
@@ -204,6 +243,28 @@ pub fn parse(text: &str, menu: &CommandMenu) -> Result<Command, CommandError> {
                 })?),
             };
             Ok(Command::Reject { target })
+        }
+        "answer" => {
+            let [handle, verdict, rest @ ..] = args.as_slice() else {
+                return Err(CommandError::AnswerNeedsTwoArguments {
+                    options: verdict_options(),
+                });
+            };
+            if let Some(extra) = rest.first() {
+                return Err(CommandError::UnexpectedArgument {
+                    name: name.clone(),
+                    extra: (*extra).to_string(),
+                });
+            }
+            let verdict =
+                InterventionVerdict::parse(verdict).ok_or_else(|| CommandError::BadVerdict {
+                    raw: (*verdict).to_string(),
+                    options: verdict_options(),
+                })?;
+            Ok(Command::Answer {
+                handle: (*handle).to_string(),
+                verdict,
+            })
         }
         "model" => match args.first() {
             None => Ok(Command::Model { id: None }),

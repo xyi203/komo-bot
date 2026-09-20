@@ -9,39 +9,79 @@
 use komo_kernel::cron::{FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, Trigger};
 use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
-    ApprovalBatchDecisionResponse, ApprovalListResponse, ApprovalRecord, ConfigCheckResponse,
-    ConfigReloadResponse, CronListResponse, HealthResponse, IndexState, MemoryIndexStatus,
-    MemoryListResponse, ModelsResponse, RunDetail, SessionListResponse, SessionSummary,
-    ToolCallSummary,
+    ApprovalRecord, ConfigCheckResponse, ConfigReloadResponse, CronListResponse, HealthResponse,
+    IndexState, InterventionAnswerResponse, InterventionBatchAnswerResponse, InterventionDetail,
+    InterventionListResponse, InterventionSummary, MemoryIndexStatus, MemoryListResponse,
+    ModelsResponse, RunDetail, SessionListResponse, SessionSummary, ToolCallSummary,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
 };
-use komo_kernel::types::status::{RunStatus, ToolCallState};
+use komo_kernel::types::status::{RunState, SessionState, ToolCallState, WaitReason};
 use time::OffsetDateTime;
 
-use crate::tui::app::status_text;
+use crate::tui::app::{intervention_kind_text, status_text, verdicts_text, wait_text};
+
+/// 状态那一格：`Waiting` 时把**理由**接上（§8.4）。
+///
+/// 状态与理由是**两个维度**：状态说"能不能跑"，理由说"在等谁、等到什么时候"。清单与
+/// `run inspect` 都要它，所以只写一处。
+///
+/// `Dependency` 只在这里与人见面：它**不进** §7.5 的清单（等前一条 Run 不是"等人"），
+/// 于是"前面那条还没跑完"唯一说得清的地方就是这一格。
+fn run_state_cell(state: RunState, wait: Option<&WaitReason>, now: OffsetDateTime) -> String {
+    match (state, wait) {
+        (RunState::Waiting, Some(reason)) => format!(
+            "{} · {}",
+            status_text(RunState::Waiting),
+            wait_text(reason, Some(now))
+        ),
+        // `Waiting` 而没有理由：只说得出"停着"。**不编一个原因**——猜错比不说更糟。
+        (state, _) => status_text(state).into(),
+    }
+}
 
 /// `komo session list`。
-pub fn session_list(response: &SessionListResponse) -> String {
+///
+/// 两列状态不是一回事：`运行` 是这个会话**当下那个 Run** 的状态（`Waiting` 时接上理由，
+/// §8.4），`生命周期` 是会话自己在 §8.10 阶梯上的位置。`active` 不印（绝大多数会话都是
+/// 它，印满一列噪音），非 `active` 必须印出来——一个正在关闭、已删除的会话与一个活会话
+/// **在这一列唯一的区别**。
+///
+/// `now` 由调用方给（这个模块不读时钟）：等待理由里的"还有多久"要它才算得出来。
+pub fn session_list(response: &SessionListResponse, now: OffsetDateTime) -> String {
     if response.sessions.is_empty() {
         return "没有会话".into();
     }
     let mut out = Vec::new();
     out.push(format!(
-        "{:<38} {:<10} {:<22} {}",
-        "SESSION", "状态", "更新时间", "标题"
+        "{:<38} {:<10} {:<44} {:<22} {}",
+        "SESSION", "生命周期", "运行", "更新时间", "标题"
     ));
     for session in &response.sessions {
         out.push(format!(
-            "{:<38} {:<10} {:<22} {}",
+            "{:<38} {:<10} {:<44} {:<22} {}",
             session.session,
-            session.current_status.map(status_text).unwrap_or("空闲"),
+            session_state(session.state),
+            match session.current_state {
+                Some(state) => run_state_cell(state, session.current_wait.as_ref(), now),
+                None => "空闲".into(),
+            },
             stamp(session.updated_at),
             session_title(session)
         ));
     }
     out.join("\n")
+}
+
+/// §8.10 的四个状态在清单里的写法。`active` 是常态，留空。
+fn session_state(state: SessionState) -> &'static str {
+    match state {
+        SessionState::Active => "",
+        SessionState::Closing => "正在关闭",
+        SessionState::Deleted => "已删除",
+        SessionState::Purged => "已回收",
+    }
 }
 
 fn session_title(session: &SessionSummary) -> String {
@@ -55,20 +95,29 @@ fn session_title(session: &SessionSummary) -> String {
 
 /// `komo run inspect RUN_ID`。
 ///
-/// `approvals` 是与这个 Run 相关的审批记录，用来印「allowed by …」——调用方用
-/// `GET /v1/approvals` 加 `ApprovalListQuery { run: Some(run), include_decided: true, .. }`
-/// 取来：那条审批早就不在待处理集合里了。给不出就**不印**，印一个猜的放行来源比不印更糟。
-pub fn run_inspect(detail: &RunDetail, approvals: &[ApprovalRecord]) -> String {
+/// `approvals` 是与这个 Run 相关的**审批层审计记录**（§7.4：那一步是谁放行的），由调用方
+/// 用 [`crate::api::KomoClient::approvals_of_run`] 取好传进来——它问的是"已经决定过的那些"，
+/// 而 §7.5 的统一清单只列待处理的，两者不是一份查询。给不出就**不印**，印一个猜的放行来源
+/// 比不印更糟。
+///
+/// `now` 由调用方给：`Waiting` 那一格的理由里"还有多久"要它才算得出来。
+pub fn run_inspect(
+    detail: &RunDetail,
+    approvals: &[ApprovalRecord],
+    now: OffsetDateTime,
+) -> String {
     let mut out = Vec::new();
     let summary = &detail.summary;
     out.push(format!("Run    {}", summary.run));
     out.push(format!("会话   {}", summary.session));
     out.push(format!(
         "状态   {}{}",
-        status_text(summary.status),
-        match summary.status {
-            RunStatus::Interrupted => "（上一个执行实例没有收尾，不等于用户取消）",
-            RunStatus::NeedsAttention => "（等操作者判断）",
+        run_state_cell(summary.state, summary.wait.as_ref(), now),
+        match (summary.state, summary.wait.as_ref()) {
+            // 理由不在（老数据、或者服务端没给）时至少说清"停着不是结束"；理由在的时候
+            // 这句话是废话——它已经说清在等谁了。
+            (RunState::Waiting, None) => "（停着，不是结束）",
+            (RunState::Abandoned, _) => "（操作者在 Intervention 清单上放弃，不等于用户取消）",
             _ => "",
         }
     ));
@@ -181,77 +230,93 @@ fn approval_provenance(record: &ApprovalRecord) -> String {
     }
 }
 
-/// `komo approval list`。
-pub fn approval_list(response: &ApprovalListResponse) -> String {
-    if response.approvals.is_empty() {
-        return "没有待处理的审批".into();
+/// `komo intervention list`：审批、结果不明、阻塞三类一张表（§7.5）。
+///
+/// 每一行都带**句柄**（审批是短 ID，另两类是 Run ID）、**种类**、**问题**与**可答的结论**
+/// ——§11.3 要求界面「写清这一条该答什么」。结论直接印线格式的词（`satisfied` /
+/// `not_performed` / `resolve` / `abandon`），因为答的时候打的就是它。
+pub fn interventions(response: &InterventionListResponse) -> String {
+    if response.interventions.is_empty() {
+        return "没有待处理的事项".into();
     }
     let mut out = vec![format!(
-        "{:<6} {:<10} {:<38} {}",
-        "短ID", "工具", "RUN", "原因"
+        "{:<6} {:<10} {:<38} {:<44} {}",
+        "句柄", "种类", "会话", "问题", "可答结论"
     )];
-    for record in &response.approvals {
+    for item in &response.interventions {
         out.push(format!(
-            "{:<6} {:<10} {:<38} {}",
-            record.short_id,
-            record.plan.tool,
-            record
-                .run
-                .as_ref()
-                .map(|r| r.to_string())
-                .unwrap_or_else(|| "—".into()),
-            record.reason
+            "{:<6} {:<10} {:<38} {:<44} {}",
+            item.handle,
+            intervention_kind_text(item.kind),
+            item.session,
+            one_line(&item.question),
+            verdicts_text(&item.verdicts)
         ));
     }
     out.push(String::new());
-    out.push("`komo approval approve <短ID> [run]` / `komo approval reject <短ID>`".into());
     out.push(
-        "一条一条答太慢时：`komo approval approve --all` / `reject --all`（各按本次调用）".into(),
+        "`komo intervention answer <句柄> <结论>`；审批类也可以逐条批范围：`approve <短ID> run`"
+            .into(),
     );
     out.join("\n")
 }
 
-/// `komo approval approve --all` / `reject --all`（§11.3 的 `/approve all`）。
+/// `komo intervention show <句柄>`：单项详情，三类各印各的。
 ///
-/// 逐条印结果，不只报个数：批里某一条可能早就决定过了（`already_decided`），而它**原来
-/// 那个决定**说不定与这一批相反——只印一行"完成"就把那一条藏起来了。
-pub fn approval_batch(response: &ApprovalBatchDecisionResponse) -> String {
-    if response.decisions.is_empty() && response.missing.is_empty() {
-        return "没有待处理的审批".into();
-    }
-    let mut out = Vec::new();
-    for decision in &response.decisions {
-        out.push(format!(
-            "{} {}{}",
-            decision.short_id,
-            if decision.decision.approved {
-                "已批准"
-            } else {
-                "已拒绝"
-            },
-            if decision.already_decided {
-                "（早已决定，这次没有改变什么）"
-            } else {
-                ""
+/// 审批类的那一份就是 §7.2 要求界面展示的全部内容（五项）；`verify` 多一次调用的名字与
+/// 计划哈希——核对"到底发生没有"看的就是它；`blocked` 印的是前提为什么没了。
+pub fn intervention_detail(detail: &InterventionDetail) -> String {
+    match detail {
+        InterventionDetail::Approval(record) => approval_detail(record),
+        InterventionDetail::Verify {
+            summary,
+            tool,
+            plan_hash,
+            reason,
+        } => {
+            let mut out = intervention_head(summary);
+            out.push(format!("调用   {tool}"));
+            if let Some(hash) = plan_hash {
+                out.push(format!("计划   {}", hash.as_str()));
             }
-        ));
+            out.push(String::new());
+            out.push(format!("问题   {}", reason));
+            out.join("\n")
+        }
+        InterventionDetail::Blocked { summary, reason } => {
+            let mut out = intervention_head(summary);
+            out.push(String::new());
+            out.push(format!("问题   {reason}"));
+            out.join("\n")
+        }
     }
-    for missing in &response.missing {
-        out.push(format!("{missing} 没有这条审批"));
-    }
-    if !response.decisions.is_empty() {
-        out.push(String::new());
-        out.push(
-            "以上各按**本次调用**。范围授权（§7.2 的本次 Run / Cron Job）绑的是单份计划，\
-             逐条来：`/approve <短ID> run`"
-                .into(),
-        );
-    }
-    out.join("\n")
 }
 
-/// `komo approval show <id>`：与 TUI 弹窗**同一组内容**（§11.3 的五项）。
-pub fn approval_show(record: &ApprovalRecord) -> String {
+/// 三类的公共抬头：句柄、种类、会话、Run、问题、可答结论。
+fn intervention_head(summary: &InterventionSummary) -> Vec<String> {
+    let mut out = vec![
+        format!(
+            "句柄   {}（{}）",
+            summary.handle,
+            intervention_kind_text(summary.kind)
+        ),
+        format!("会话   {}", summary.session),
+    ];
+    out.push(format!(
+        "Run    {}",
+        summary
+            .run
+            .as_ref()
+            .map(|run| run.to_string())
+            .unwrap_or_else(|| "—".into())
+    ));
+    out.push(format!("问题   {}", summary.question));
+    out.push(format!("可答   {}", verdicts_text(&summary.verdicts)));
+    out
+}
+
+/// 审批类的详情：短 ID、动作、改动、原因、范围（§11.3 的五项）。
+fn approval_detail(record: &ApprovalRecord) -> String {
     let mut out = Vec::new();
     out.push(format!(
         "短 ID   {}  ({})",
@@ -281,29 +346,70 @@ pub fn approval_show(record: &ApprovalRecord) -> String {
     out.push(format!("  {}", record.reason));
     out.push(String::new());
     out.push("范围".into());
-    let scopes: Vec<&str> = record
-        .scopes
+    out.push(format!("  {}", scopes_text(&record.scopes)));
+    if record.decision.is_some() {
+        out.push(String::new());
+        out.push(format!("已决定  {}", approval_provenance(record)));
+    }
+    out.join("\n")
+}
+
+fn scopes_text(scopes: &[komo_kernel::types::chat::ApprovalScope]) -> String {
+    if scopes.is_empty() {
+        // §7.2：`Once` 总是在里面；空的 scopes 是服务端的问题，说出来而不是当成没有。
+        return "本次调用（服务端没有给出范围清单）".into();
+    }
+    scopes
         .iter()
         .map(|scope| match scope {
             komo_kernel::types::chat::ApprovalScope::Once => "本次调用",
             komo_kernel::types::chat::ApprovalScope::Run => "本次 Run 范围",
             komo_kernel::types::chat::ApprovalScope::CronJob => "Cron Job",
         })
-        .collect();
-    out.push(format!(
-        "  {}",
-        if scopes.is_empty() {
-            "本次调用".to_string()
-        } else {
-            scopes.join(" · ")
-        }
-    ));
-    if let Some(decision) = &record.decision {
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// `komo intervention answer <句柄> ... --all`（§11.3 的 `/approve all`）。
+///
+/// 逐条印结果，不只报个数：批里某一条可能早就答过了（`already_answered`），而它**原来
+/// 那个结论**说不定与这一批相反——只印一行"完成"就把那一条藏起来了。
+pub fn intervention_batch(response: &InterventionBatchAnswerResponse) -> String {
+    if response.answered.is_empty() && response.missing.is_empty() {
+        return "没有待处理的审批".into();
+    }
+    let mut out = Vec::new();
+    for answer in &response.answered {
+        out.push(answer_line(answer));
+    }
+    for missing in &response.missing {
+        out.push(format!("{missing} 没有这条待处理事项"));
+    }
+    if !response.answered.is_empty() {
         out.push(String::new());
-        out.push(format!("已决定  {}", approval_provenance(record)));
-        let _ = decision;
+        out.push(
+            "以上各按**本次调用**。范围授权（§7.2 的本次 Run / Cron Job）绑的是单份计划，\
+             逐条来：`komo intervention answer <短ID> approve --scope run`"
+                .into(),
+        );
     }
     out.join("\n")
+}
+
+/// 一条答复的回执。`note` 是服务端给的那句人话，**回执直接用它是刻意的**：同一句话不该在
+/// 四个界面里各写一遍。
+fn answer_line(answer: &InterventionAnswerResponse) -> String {
+    format!(
+        "{} {}· {}{}",
+        answer.handle,
+        answer.verdict.as_str(),
+        answer.note,
+        if answer.already_answered {
+            "（早已答复，这次没有改变什么）"
+        } else {
+            ""
+        }
+    )
 }
 
 fn flatten(line: &ratatui::text::Line<'_>) -> String {

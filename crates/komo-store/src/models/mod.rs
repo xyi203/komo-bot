@@ -9,7 +9,7 @@
 //! - 主键一律 `String` UUIDv7（`#[key] id: String`），不用 `#[auto]`——ID 要在写库之前
 //!   就存在（JSONL 先写、事件里带 ID、跨进程恢复按 ID 对账）。
 //! - 时间一律 `i64` **unix 纳秒**（[`crate::db::to_ts`] / [`crate::db::from_ts`]）。可空的
-//!   时间用哨兵 `0`（= 未设置），因为 §8.7 的领取 SQL 要对 `next_retry_at` 直接做
+//!   时间用哨兵 `0`（= 未设置），因为 §8.7 的领取 SQL 要对 `runs.wake_at` 直接做
 //!   `<= ?1` 比较，NULL 在那里会把整行筛掉。
 //! - 结构化字段存 JSON 文本；**在 SQL 里被筛选或排序的维度另开一列**（`scope_kind`、
 //!   `job_version`…），不要指望从 JSON 里查。
@@ -104,7 +104,7 @@ pub const TABLES: &[TableSpec] = &[
 /// 索引由 store 自己建（见模块头），新文件与旧文件走同一条路。
 pub const INDEXES: &[&str] = &[
     r#"CREATE INDEX IF NOT EXISTS "runs_session" ON "runs" ("session_id")"#,
-    r#"CREATE INDEX IF NOT EXISTS "runs_claimable" ON "runs" ("status", "next_retry_at")"#,
+    r#"CREATE INDEX IF NOT EXISTS "runs_claimable" ON "runs" ("state", "wait_kind", "wake_at")"#,
     r#"CREATE INDEX IF NOT EXISTS "log_index_session_seq" ON "session_log_index" ("session_id", "seq")"#,
     r#"CREATE INDEX IF NOT EXISTS "tool_calls_run" ON "tool_calls" ("run_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "tool_attempts_call" ON "tool_attempts" ("call_id")"#,

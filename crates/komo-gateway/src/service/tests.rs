@@ -10,8 +10,8 @@ use komo_kernel::traits::Inbound;
 use komo_kernel::types::chat::{
     ApprovalScope, ChannelPeer, ChannelPlatform, DeliveryTarget, Outbound, PeerId,
 };
-use komo_kernel::types::ids::{RequestKey, RunId};
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::ids::{RequestKey, RunId, SessionId};
+use komo_kernel::types::status::{RunState, WaitReason};
 
 use crate::dispatcher::inbound;
 use crate::service::test_support::{TestGateway, config_toml, telegram_config};
@@ -138,7 +138,7 @@ async fn a_stranger_is_refused_and_leaves_no_trace() {
     );
 
     // 不留任何记录：没有会话、没有 Run、没有投递。
-    let sessions = komo_store::repos::session::list(&gateway.state().db)
+    let sessions = komo_store::repos::session::list(&gateway.state().db, false)
         .await
         .expect("读得到");
     assert!(
@@ -504,7 +504,7 @@ async fn an_end_to_end_turn_completes_and_reaches_the_event_stream() {
 
     // 等它跑完。
     let detail = wait_for_run(&gateway, &submitted.run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     assert_eq!(
         detail.final_message.as_deref(),
         Some("好了，两加二等于四。")
@@ -634,7 +634,7 @@ async fn wait_for_run(
         if status == 200
             && let Ok(detail) =
                 serde_json::from_str::<komo_kernel::protocol::http::RunDetail>(&body)
-            && detail.summary.status.is_terminal()
+            && detail.summary.state.is_terminal()
         {
             return detail;
         }
@@ -738,9 +738,9 @@ async fn a_reloaded_policy_decides_the_next_call() {
     let session = second.open_session().await;
     let run = second.submit(&session, "reload-2", "跑一下").await.run;
     second
-        .wait_status(
+        .wait_state(
             &run,
-            |status| status.is_terminal() || status == RunStatus::NeedsAttention,
+            |status| status.is_terminal() || status == RunState::Waiting,
             "收场",
         )
         .await;
@@ -867,9 +867,9 @@ async fn auto_mode_runs_an_ordinary_shell_command_without_asking() {
     let session = gateway.open_session().await;
     let run = gateway.submit(&session, "auto-1", "跑一下 echo").await.run;
     gateway
-        .wait_status(
+        .wait_state(
             &run,
-            |status| status.is_terminal() || status == RunStatus::NeedsAttention,
+            |status| status.is_terminal() || status == RunState::Waiting,
             "收场",
         )
         .await;
@@ -923,9 +923,9 @@ async fn auto_mode_runs_even_a_dangerous_command_without_asking() {
         .await
         .run;
     gateway
-        .wait_status(
+        .wait_state(
             &run,
-            |status| status.is_terminal() || status == RunStatus::NeedsAttention,
+            |status| status.is_terminal() || status == RunState::Waiting,
             "收场",
         )
         .await;
@@ -936,4 +936,463 @@ async fn auto_mode_runs_even_a_dangerous_command_without_asking() {
         gateway.approvals().await
     );
     assert!(!doom.exists(), "命令要真的执行过");
+}
+
+// ---------------------------------------------------------------- §8.4 / §7.5 / §8.10
+
+/// §7.5 第 2 条 / §8.4：**等前一条 Run 的那一类不进清单，但说得出在等谁。**
+///
+/// 「挡着会话的每一条都必须在清单里」说的是**停在人身上**的那两类（`approval`、
+/// `intervention`）。`dependency` 在等前一条 Run 跑完，那件事不需要人回答——把它塞进清单
+/// 等于让操作者去答一个他答不了的问题；反过来把它藏起来（旧模型里的"排队中"），就正好是
+/// §8.4 要消掉的那个"排队二十分钟不知道在等什么"。所以它只在这两格露面：
+/// `RunSummary.wait` 与 `SessionSummary.current_wait`。
+#[tokio::test]
+async fn a_dependency_wait_is_not_an_intervention_but_says_which_run_it_waits_for() {
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round};
+
+    let home = Home::with_config(&config_toml(""));
+    // 前一条 Run 停在审批上——**确定性**地占住队列；批复之后两段脚本都用默认的收尾。
+    let llm = FakeLlm::new(vec![vec![call_round(
+        1,
+        "a-1",
+        "shell",
+        serde_json::json!({ "command": "echo 一" }),
+    )]]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let first = gateway.submit(&session, "dep-1", "先跑这个").await.run;
+    let first_wait = gateway.wait_waiting(&first).await;
+    assert!(
+        matches!(first_wait, WaitReason::Approval { .. }),
+        "前一条该停在审批上：{first_wait:?}"
+    );
+
+    let second = gateway.submit(&session, "dep-2", "再跑这个").await.run;
+    let wait = gateway.wait_waiting(&second).await;
+    assert_eq!(
+        wait,
+        WaitReason::Dependency { run: first.clone() },
+        "后一条要说出在等哪一条 Run"
+    );
+
+    // 清单里只有停在人身上的那一条。
+    let listed = gateway.interventions().await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert!(
+        listed.iter().all(|one| one.run.as_ref() != Some(&second)),
+        "等前一条 Run 不是等人，不进清单：{listed:?}"
+    );
+
+    // 会话详情：`unfinished` 两维都在，`pending` 里没有它。
+    let (code, detail) = gateway.get_json(&format!("/v1/sessions/{session}")).await;
+    assert_eq!(code, 200, "{detail}");
+    let unfinished: Vec<komo_kernel::protocol::http::RunSummary> =
+        serde_json::from_value(detail["unfinished"].clone()).expect("unfinished");
+    let entry = unfinished
+        .iter()
+        .find(|one| one.run == second)
+        .expect("后一条在 unfinished 里");
+    assert_eq!(entry.state, RunState::Waiting);
+    assert_eq!(
+        entry.wait,
+        Some(WaitReason::Dependency { run: first.clone() })
+    );
+    let pending: Vec<komo_kernel::protocol::http::InterventionSummary> =
+        serde_json::from_value(detail["pending"].clone()).expect("pending");
+    assert_eq!(
+        pending.len(),
+        1,
+        "这个会话上停着的是前一条那条审批：{pending:?}"
+    );
+    assert!(
+        pending.iter().all(|one| one.run.as_ref() != Some(&second)),
+        "后一条（等前一条 Run）不该出现在待处理清单里：{pending:?}"
+    );
+
+    // 会话列表那一格（`komo session list` 的"为什么它不动"）。
+    let (code, list) = gateway.get_json("/v1/sessions").await;
+    assert_eq!(code, 200, "{list}");
+    let summaries: Vec<komo_kernel::protocol::http::SessionSummary> =
+        serde_json::from_value(list["sessions"].clone()).expect("sessions");
+    let summary = summaries
+        .iter()
+        .find(|one| one.session == session)
+        .expect("会话在列表里");
+    assert_eq!(
+        summary.state,
+        komo_kernel::types::status::SessionState::Active
+    );
+    assert_eq!(summary.current_state, Some(RunState::Waiting));
+    assert_eq!(
+        summary.current_wait,
+        Some(WaitReason::Dependency { run: first.clone() })
+    );
+
+    // 前一条进终态 → 这一条自己回队列、跑完（§8.9 第三步，以及终态那一刻的放行）。
+    let record = gateway.wait_approval().await;
+    gateway.decide(&record.approval, true).await;
+    assert_eq!(
+        gateway.wait_terminal(&first).await.summary.state,
+        RunState::Completed
+    );
+    assert_eq!(
+        gateway.wait_terminal(&second).await.summary.state,
+        RunState::Completed,
+        "前一条完了，后一条要自己走"
+    );
+}
+
+/// 直接往库里落一条 `queued` 的 Run：一个崩溃现场留下的"半个事实"。
+///
+/// 走 store 而不是走 `POST /v1/sessions/{id}/runs`，是因为要测的**正是**"受理这条路已经
+/// 被挡住之后，库里那条 Run 还会不会被领走"——受理拒绝（§8.10）与领取守卫是两道不同的
+/// 闸，这一条验的是后面那道。
+async fn seed_queued_run(
+    gateway: &crate::service::test_support::harness::Gw,
+    session: &SessionId,
+    key: &str,
+) -> RunId {
+    let state = gateway.state();
+    let now = state.clock.now();
+    let run = RunId::new_at(now);
+    let new = komo_store::repos::runs::NewRun {
+        run: run.clone(),
+        session: session.clone(),
+        request_key: komo_kernel::types::ids::RequestKey::new(key),
+        input_hash: "seed".into(),
+        source: komo_kernel::types::plan::PlanSource::Interactive {
+            session: session.clone(),
+        },
+        peer: None,
+        model: state.snapshot().model.clone(),
+        effort: None,
+        at: now,
+    };
+    let event = komo_kernel::types::ids::EventId::new_at(now);
+    // 输入序号：受理那一笔用它排同会话的次序（§8.4 的 `dependency` 就看这个）。这里没有
+    // 真的追加事件，所以取"这个会话已索引到的下一个"——语义上正是这条输入该占的位置。
+    let applied = komo_store::repos::session::get(&state.db, session)
+        .await
+        .expect("读会话")
+        .expect("有这个会话")
+        .applied_seq;
+    let seq = komo_kernel::types::ids::Seq(applied.0 + 1);
+    let db = state.db.clone();
+    let for_write = run.clone();
+    db.with_write_retry(move |ex| {
+        let (new, event, for_write) = (new.clone(), event.clone(), for_write.clone());
+        Box::pin(async move {
+            komo_store::repos::runs::reserve_in(ex, &new).await?;
+            komo_store::repos::runs::mark_queued_in(ex, &for_write, &event, seq, now).await
+        }) as komo_store::db::BoxFuture<'_, Result<(), komo_kernel::traits::StoreError>>
+    })
+    .await
+    .expect("落一条 Run");
+    run
+}
+
+/// §8.9 / §8.10：**已回收会话的 Run 抄不跑，而且对账要说得出为什么。**
+///
+/// 这是"数据库与内容对不上"最坏的一种：一个 `purged` 的会话上还挂着一条 `queued` 的 Run。
+/// 没有领取守卫，它会**照着空上下文跑一轮**——§8.9 说那比停下来更糟。
+#[tokio::test]
+async fn a_run_in_a_purged_session_is_never_claimed_and_the_reconcile_says_why() {
+    use crate::service::test_support::harness::{FakeLlm, Home, text_round};
+    use komo_kernel::traits::RunQueue;
+
+    let home = Home::with_config(&config_toml(""));
+    // 真跑起来的话这一轮会留下痕迹（`turns`）：一次都不该被调用。
+    let llm = FakeLlm::always(vec![text_round(1, "不该跑到这里")]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = seed_queued_run(&gateway, &session, "purged-1").await;
+
+    // 墓碑先落（§8.10 第 3 条：数据库先提交，内容后删）。
+    let db = gateway.state().db.clone();
+    let now = gateway.state().clock.now();
+    let for_state = session.clone();
+    db.with_write_retry(move |ex| {
+        let for_state = for_state.clone();
+        Box::pin(async move {
+            komo_store::repos::session::set_state_in(
+                ex,
+                &for_state,
+                komo_kernel::types::status::SessionState::Active,
+                komo_kernel::types::status::SessionState::Deleted,
+                now,
+            )
+            .await
+            .map(|_| ())
+        }) as komo_store::db::BoxFuture<'_, Result<(), komo_kernel::traits::StoreError>>
+    })
+    .await
+    .expect("逻辑删除");
+    assert!(
+        komo_store::repos::reconcile::mark_purged(&db, &session, now)
+            .await
+            .expect("落墓碑")
+    );
+
+    // 领取这一侧：候选里没有它，指名领也领不到（§8.9 那条硬约束）。
+    let due = gateway.state().queue.due(now, 32).await.expect("读候选");
+    assert!(
+        !due.contains(&run),
+        "purged 会话的 Run 不该出现在候选里：{due:?}"
+    );
+    assert!(
+        gateway
+            .state()
+            .queue
+            .claim_run(&run, &gateway.state().executor)
+            .await
+            .expect("领取")
+            .is_none(),
+        "purged 会话的 Run 领不走"
+    );
+    assert_eq!(llm.turns(), 0, "一次模型都没该被调过");
+
+    // 对账：把它停成一条说得清理由的 `blocked`。
+    let (code, body) = gateway
+        .post_json("/v1/reconcile", serde_json::json!({}))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert!(
+        body["blocked"].as_u64().unwrap_or(0) >= 1,
+        "对账要判成等人答复：{body}"
+    );
+
+    let wait = gateway.wait_waiting(&run).await;
+    assert!(
+        matches!(wait, WaitReason::Intervention { .. }),
+        "要停在干预上：{wait:?}"
+    );
+    let listed = gateway.interventions().await;
+    let entry = listed
+        .iter()
+        .find(|one| one.run.as_ref() == Some(&run))
+        .unwrap_or_else(|| panic!("这一条要在清单里：{listed:?}"));
+    assert!(
+        entry.question.contains("回收"),
+        "理由要说清是哪种不可服务：{entry:?}"
+    );
+    assert_eq!(llm.turns(), 0, "对账自己不跑模型，也不该让别人跑");
+}
+
+/// §8.10：**逻辑删除之后不再接受新输入，而且拒绝要说清楚是哪种状态。**
+///
+/// `closing` 只是不再收新活（没跑完的照跑），`deleted` 是逻辑删除完成，`purged` 内容已经
+/// 回收——三句话对操作者意味着三件不同的事，所以 409 的正文要说得出是哪一种。
+#[tokio::test]
+async fn a_logically_deleted_session_refuses_new_input_and_names_the_state() {
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round};
+
+    let home = Home::with_config(&config_toml(""));
+    // 前一条停在审批上：这样 `closing` 期间**手里还有活**——§8.10 说 `closing` 仍然服务，
+    // 而未完成 Run 在的时候对账不会把它推进到 `deleted`（那一步是判定，不是时钟）。
+    let llm = FakeLlm::new(vec![vec![call_round(
+        1,
+        "life-1",
+        "shell",
+        serde_json::json!({ "command": "echo 一" }),
+    )]]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let first = gateway.submit(&session, "life-1", "先跑一条").await.run;
+    gateway.wait_waiting(&first).await;
+
+    // `closing`：不再收新活，但列表里还在（§8.10 的列表那一列）。
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/delete"),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["state"], "closing", "{body}");
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/runs"),
+            serde_json::json!({ "request_key": "life-2", "text": "还能聊吗" }),
+        )
+        .await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(body["error"]["code"], "conflict", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("closing"),
+        "{body}"
+    );
+
+    let (code, list) = gateway.get_json("/v1/sessions").await;
+    assert_eq!(code, 200);
+    let visible: Vec<komo_kernel::protocol::http::SessionSummary> =
+        serde_json::from_value(list["sessions"].clone()).expect("sessions");
+    assert!(
+        visible.iter().any(|one| one.session == session),
+        "`closing` 要列出来并标注：{visible:?}"
+    );
+
+    // `closing` 仍然服务（§8.10）：手里那条 Run 照常答复、跑完。
+    let record = gateway.wait_approval().await;
+    gateway.decide(&record.approval, true).await;
+    assert_eq!(
+        gateway.wait_terminal(&first).await.summary.state,
+        RunState::Completed,
+        "closing 只是不收新活，手里的活要跑完"
+    );
+
+    // `deleted`：默认列表不再列，`?all=1` 才列（§8.10）。
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/delete"),
+            serde_json::json!({ "now": true }),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["state"], "deleted", "{body}");
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/runs"),
+            serde_json::json!({ "request_key": "life-3", "text": "现在呢" }),
+        )
+        .await;
+    assert_eq!(code, 409, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("deleted"),
+        "{body}"
+    );
+
+    let (_, list) = gateway.get_json("/v1/sessions").await;
+    let default_list: Vec<komo_kernel::protocol::http::SessionSummary> =
+        serde_json::from_value(list["sessions"].clone()).expect("sessions");
+    assert!(
+        default_list.iter().all(|one| one.session != session),
+        "已逻辑删除的默认不列：{default_list:?}"
+    );
+    let (_, list) = gateway.get_json("/v1/sessions?all=1").await;
+    let all: Vec<komo_kernel::protocol::http::SessionSummary> =
+        serde_json::from_value(list["sessions"].clone()).expect("sessions");
+    let shown = all
+        .iter()
+        .find(|one| one.session == session)
+        .expect("`?all=1` 才列得出来");
+    assert_eq!(
+        shown.state,
+        komo_kernel::types::status::SessionState::Deleted
+    );
+}
+
+/// §8.10 第 3 条：**先算引用，再落墓碑，最后删内容**；幂等；`purged` 只剩墓碑。
+#[tokio::test]
+async fn purging_a_session_removes_its_content_and_is_idempotent() {
+    use crate::service::test_support::harness::{FakeLlm, Home, text_round};
+
+    let home = Home::with_config(&config_toml(""));
+    let llm = FakeLlm::always(vec![text_round(1, "好。")]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway.submit(&session, "purge-1", "说句话").await.run;
+    gateway.wait_terminal(&run).await;
+
+    // 未完成的 Run 挡着就先 409 并列出要先处置什么——那一条由下一个测试管；这里先把会话
+    // 逻辑删除掉（`purge` 只从 `deleted` 起步）。
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/delete"),
+            serde_json::json!({ "now": true }),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/purge"),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["state"], "purged", "{body}");
+    assert!(
+        body["removed_bytes"].as_u64().unwrap_or(0) > 0,
+        "真的删了内容才报得出来：{body}"
+    );
+
+    // 幂等：再跑一次不报错，`removed_bytes` 是 0（目录已经不在）。
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/purge"),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(body["removed_bytes"], 0, "{body}");
+
+    // 墓碑还在答"它曾经存在"，但两种列表都不列它（§8.10）。
+    let (code, _) = gateway.get_json(&format!("/v1/sessions/{session}")).await;
+    assert_eq!(code, 200, "purged 的会话仍然答得出它曾经存在");
+    let (_, list) = gateway.get_json("/v1/sessions?all=1").await;
+    let all: Vec<komo_kernel::protocol::http::SessionSummary> =
+        serde_json::from_value(list["sessions"].clone()).expect("sessions");
+    assert!(all.iter().all(|one| one.session != session), "{all:?}");
+}
+
+/// §8.10 第 3 条：**引用检查不过就 409 并列出要先处置什么**，不假装成功。
+#[tokio::test]
+async fn purging_a_session_with_unfinished_work_is_a_409_that_lists_the_blockers() {
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round};
+
+    let home = Home::with_config(&config_toml(""));
+    let llm = FakeLlm::new(vec![vec![call_round(
+        1,
+        "p-1",
+        "shell",
+        serde_json::json!({ "command": "echo 一" }),
+    )]]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(&session, "purge-2", "跑一条等着批")
+        .await
+        .run;
+    gateway.wait_waiting(&run).await;
+
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/purge"),
+            serde_json::json!({}),
+        )
+        .await;
+    assert_eq!(code, 409, "{body}");
+    assert_eq!(
+        body["session"],
+        serde_json::json!(session.to_string()),
+        "{body}"
+    );
+    let blockers = body["blockers"].as_array().cloned().unwrap_or_default();
+    assert!(
+        blockers
+            .iter()
+            .any(|blocker| blocker["what"] == "unfinished_run"),
+        "未完成的 Run 要先处置：{body}"
+    );
+    // 内容还在：414 之后什么都没被删。
+    let paths =
+        komo_store::SessionPaths::new(&gateway.state().snapshot().paths.sessions_dir, &session);
+    assert!(paths.root().exists(), "拒绝回收之后目录要原样在");
 }

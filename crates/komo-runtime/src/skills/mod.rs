@@ -253,6 +253,42 @@ impl SkillRegistry {
             .join("\n")
     }
 
+    /// 系统提示里要拼的那一块（§5.6）：先给**按序的根**，再给目录行。
+    ///
+    /// 根只列真的出了条目的那几个，顺序就是搜索顺序——目录行里的名字要能顺着这个顺序
+    /// 定位到文件（`<根>/<名字>/SKILL.md`），"同名先到先得"这件事才落得下来：模型按这个
+    /// 顺序找，先撞上的那份正是加载时生效的那一份。
+    ///
+    /// 一条能露面的都没有时回答 `None`：那种情况下系统提示**一个字都不多**，不因为
+    /// "配置里有 skills 概念"就凭空多出一段空标题。
+    pub fn prompt_block(&self, context: &OfferContext) -> Option<String> {
+        let lines = self.catalog(context);
+        if lines.is_empty() {
+            return None;
+        }
+        let roots: Vec<String> = self
+            .dirs
+            .iter()
+            .filter(|dir| lines.iter().any(|skill| skill.path.starts_with(dir)))
+            .map(|dir| dir.display().to_string())
+            .collect();
+        let mut block = String::from(
+            "Skills（人写的操作说明；要用的时候按下面的顺序找 <根>/<名字>/SKILL.md，\
+             用 read 读了再照做）：\n",
+        );
+        block.push_str("根：");
+        block.push_str(&roots.join("、"));
+        block.push('\n');
+        block.push_str(
+            &lines
+                .iter()
+                .map(Skill::catalog_line)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        Some(block)
+    }
+
     /// 被 `disable` 隐藏的名字。
     pub fn disabled(&self) -> BTreeSet<String> {
         let Some(path) = &self.disabled_file else {

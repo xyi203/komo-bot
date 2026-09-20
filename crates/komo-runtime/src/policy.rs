@@ -11,6 +11,7 @@
 //! 授权**按来源取**：交互 Run 取 `grants_for_run`，Cron 取 `grants_for_job` 且带上
 //! Job 版本——一条 Cron 授权不该漏进交互 Run，反过来也一样（§10）。
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -31,12 +32,22 @@ use time::OffsetDateTime;
 pub struct PolicyEngine {
     rules: Arc<ArcSwap<RuleTable>>,
     isolation: IsolationCapability,
+    /// **受保护路径**（§8.10 第 4 条的第 2 层）：komo 自己的状态（数据目录下的
+    /// `sessions/`、`state.db*`、`runtime/`、`.env`）不许被工具写。
+    ///
+    /// 它是**这台机器**的事实，所以由接线方（Gateway，按本机数据目录）算出来交给
+    /// engine，而不是塞进规则表——规则表是配置，不该背着某一台机器的 home 目录。装在
+    /// engine 上而不是让每个调用点各传一份，是因为判决有三个入口（工具执行、Python
+    /// 核对、toolbox 的 HTTP 入口），三份参数迟早会漂移，而"这条路径受不受保护"对所有
+    /// 入口是同一件事。
+    protected: Arc<[PathBuf]>,
 }
 
 impl std::fmt::Debug for PolicyEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PolicyEngine")
             .field("isolation", &self.isolation)
+            .field("protected", &self.protected)
             .finish_non_exhaustive()
     }
 }
@@ -46,7 +57,21 @@ impl PolicyEngine {
         Self {
             rules: Arc::new(ArcSwap::from_pointee(table)),
             isolation,
+            protected: Arc::from(Vec::new()),
         }
+    }
+
+    /// 带上本机受保护路径（§8.10 第 4 条）。**生产的 engine 都应该走它**：不带的
+    /// engine 只有规则表这一层，"不许写 komo 自己的状态"那条规则不命中（`touches_protected`
+    /// 对空名单永远为假）。
+    pub fn with_protection(mut self, protected: impl Into<Arc<[PathBuf]>>) -> Self {
+        self.protected = protected.into();
+        self
+    }
+
+    /// 这台机器的受保护路径——给测试与 `komo doctor` 看。
+    pub fn protected(&self) -> &[PathBuf] {
+        &self.protected
     }
 
     /// 换一张规则表（热重载，§3 第 3 步）。**下一次判决就用它。**
@@ -77,7 +102,18 @@ impl PolicyEngine {
     }
 
     pub fn decide(&self, plan: &ExecutionPlan, env: &DecisionEnv<'_>) -> PolicyDecision {
-        self.rules.load().decide(plan, &env.context(self.isolation))
+        // 上下文在这里拼：`protected` 来自 engine（本机事实），其余几样来自调用方。
+        // 它就是 kernel 的 [`PolicyContext`] 的全部字段——少一个，规则表里对应那一维
+        // 的规则就永远不命中（例如 §8.10 的"不许写 komo 自己的状态"）。
+        let context = PolicyContext {
+            grants: env.grants,
+            principal: env.principal,
+            roots: env.roots,
+            now: env.now,
+            isolation: self.isolation,
+            protected: &self.protected,
+        };
+        self.rules.load().decide(plan, &context)
     }
 
     /// 命中的那条授权。
@@ -97,23 +133,14 @@ impl PolicyEngine {
 
 /// 一次判决要的上下文。和 [`PolicyContext`] 的区别只在生命周期方便：它是运行时这边
 /// 组装出来的那几样东西的容器。
+///
+/// **它不带 `protected`**：受保护路径是这台机器的事实，装在 [`PolicyEngine`] 上，
+/// 判决时由 engine 填进 [`PolicyContext`]——三个判决入口各传一份，迟早会漂移。
 pub struct DecisionEnv<'a> {
     pub grants: &'a [Grant],
     pub principal: Option<&'a Principal>,
     pub roots: &'a [WorkspaceRoot],
     pub now: OffsetDateTime,
-}
-
-impl<'a> DecisionEnv<'a> {
-    pub fn context(&self, isolation: IsolationCapability) -> PolicyContext<'a> {
-        PolicyContext {
-            grants: self.grants,
-            principal: self.principal,
-            roots: self.roots,
-            now: self.now,
-            isolation,
-        }
-    }
 }
 
 /// 这份计划的来源对应的**有效范围授权**。

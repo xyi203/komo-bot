@@ -50,7 +50,7 @@ pub struct PythonToolResult {
 /// 跑核对函数要的那三样（§8.6「核对本身仍经过 Policy」）。
 ///
 /// 没有它，[`PythonTool::verify`] 一律答 [`Verification::Unavailable`]——那是"这个工具
-/// 没有可用的核对方式"，executor 会停在 `needs_attention`。**不装这个门就没有核对**，
+/// 没有可用的核对方式"，executor 会停在 `waiting + intervention`。**不装这个门就没有核对**，
 /// 而不是"核对不过 Policy 也照跑"。
 #[derive(Clone)]
 pub struct VerificationGate {
@@ -193,7 +193,7 @@ impl Tool for PythonTool {
                         env: Some(env_version),
                     },
                     vec![],
-                    // 任意代码没有可靠恢复方式：停在 needs_attention，不自动从头再跑
+                    // 任意代码没有可靠恢复方式：停在 waiting + intervention，不自动从头再跑
                     // 整个脚本（§8.6 那张表的最后一行）。
                     RecoveryMode::NoSafeRecovery,
                 )
@@ -356,7 +356,7 @@ impl Tool for PythonTool {
     /// 3. 过得去就用同一个 [`PythonHost`] 调它，把它的答复映射成四种结论之一。
     ///
     /// 三种情况直接答 [`Verification::Unavailable`]（= 没有可用的核对方式 →
-    /// `needs_attention`）：`code` 模式、模块没声明核对函数、这台 Gateway 没装核对门。
+    /// `waiting + intervention`）：`code` 模式、模块没声明核对函数、这台 Gateway 没装核对门。
     /// **模块自称幂等不构成证明**：这里只认核对函数真的跑出来的那个答案。
     async fn verify(
         &self,
@@ -418,7 +418,7 @@ impl Tool for PythonTool {
         match gate.policy.decide(&check, &env) {
             PolicyDecision::Allow { .. } => {}
             // Ask 在这里**不能**变成"问一次人"：核对是恢复流程里的一步，不是一次新的
-            // 模型动作。答不出结论就说答不出结论，executor 会停在 needs_attention，
+            // 模型动作。答不出结论就说答不出结论，executor 会停在 waiting + intervention，
             // 由操作者决定——那正是"交给人"的正确形状。
             PolicyDecision::Ask { reason, .. } => {
                 return Ok(Verification::Unknown {
@@ -963,7 +963,7 @@ def turn_off(entity_id):
         }
     }
 
-    /// 任意 code 没有核对方式：停在 `needs_attention`，不自动从头跑整个脚本（§8.6）。
+    /// 任意 code 没有核对方式：停在 `waiting + intervention`，不自动从头跑整个脚本（§8.6）。
     #[tokio::test]
     async fn code_mode_has_no_verification_so_it_lands_on_a_human() {
         let dir = tempfile::tempdir().unwrap();

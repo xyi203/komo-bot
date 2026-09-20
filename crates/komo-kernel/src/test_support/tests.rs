@@ -126,7 +126,7 @@ fn the_mem_ledger_writes_a_log_that_actually_folds() {
         assert_eq!(surface.violations, vec![], "写出来的日志自己是交替的");
         assert_eq!(
             surface.runs[&accepted.run].status,
-            crate::types::status::RunStatus::Completed
+            crate::types::status::RunState::Completed
         );
         assert_eq!(
             surface.calls[&call].state,
@@ -411,7 +411,7 @@ fn a_claimed_run_is_written_down_as_started() {
 
         let surface = ledger.surface();
         let run = &surface.runs[&accepted.run];
-        assert_eq!(run.status, crate::types::status::RunStatus::Running);
+        assert_eq!(run.status, crate::types::status::RunState::Running);
         assert_eq!(
             run.generation,
             Some(claimed.generation),

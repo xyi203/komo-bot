@@ -144,7 +144,7 @@ async fn the_backlog_is_flushed_before_the_new_message() {
         "第一条要是积压的审批请求：{texts:?}"
     );
     assert!(
-        texts[1].contains("待处理审批"),
+        texts[1].contains("待处理（共 1 条）：审批 1"),
         "第二条才是 `/status` 的回执：{texts:?}"
     );
     assert!(

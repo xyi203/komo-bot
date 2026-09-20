@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::{RunState, WaitReason};
 
 use crate::harness::*;
 
@@ -60,8 +60,8 @@ async fn the_first_end_to_end_acceptance() {
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
     // 只看账本，不发任何 HTTP：这就是"不打开 CLI"。
-    let status = gw.wait_db_status(&run, |s| s.is_terminal(), "终态").await;
-    assert_eq!(status, RunStatus::Completed, "自动接续并跑完了原 Run");
+    let status = gw.wait_db_state(&run, |s| s.is_terminal(), "终态").await;
+    assert_eq!(status, RunState::Completed, "自动接续并跑完了原 Run");
     assert_eq!(
         tool_started(&home.events(&session)).len(),
         1,
@@ -80,7 +80,7 @@ async fn the_first_end_to_end_acceptance() {
         .expect("resume 得动");
     assert_eq!(resumed.session, session);
     let detail = client.run(&run).await.expect("读得到运行详情");
-    assert_eq!(detail.summary.status, RunStatus::Completed);
+    assert_eq!(detail.summary.state, RunState::Completed);
     assert_eq!(detail.final_message.as_deref(), Some("报告写好了。"));
 
     // ── 4. 再让模型 `read` 读出原文件——文件真的在，内容真的是那一份。
@@ -99,7 +99,7 @@ async fn the_first_end_to_end_acceptance() {
         .await;
     let read_run = gw.submit(&session, "e2e-2", "把那份报告读出来").await.run;
     let detail = gw.wait_terminal(&read_run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     // 结果正文在 tool-output 里，读回来核对。
     let events = home.events(&session);
     let last = (*tool_results(&events).last().expect("有结果")).clone();
@@ -143,16 +143,25 @@ async fn the_first_end_to_end_acceptance() {
     assert_eq!(still.len(), 1, "重启后仍等待：{still:?}");
     assert_eq!(still[0].approval, pending.approval, "还是原来那一条");
     assert_eq!(still[0].short_id, pending.short_id, "短 ID 也没变");
+    // §8.4 把"停"拆成两维：状态是 `Waiting`，**在等什么**另说。只断言状态等于弱化——
+    // 退避、依赖那些"不是在等人"的等待也是 `Waiting`，所以第二维必须一起断言。
     assert_eq!(
-        gw.db_status(&shell_run).await,
-        RunStatus::WaitingApproval,
-        "Run 还停在审批上"
+        gw.db_state(&shell_run).await,
+        RunState::Waiting,
+        "Run 还停在等待上"
+    );
+    assert_eq!(
+        gw.wait_waiting(&shell_run).await,
+        WaitReason::Approval {
+            approval: pending.approval.clone()
+        },
+        "等的是原来那一条审批，不是别的理由"
     );
 
     // 在"聊天里"批准（HTTP 与聊天走的是同一段代码，§13.1）。
     gw.decide(&pending.approval, true).await;
     let detail = gw.wait_terminal(&shell_run).await;
-    assert_eq!(detail.summary.status, RunStatus::Completed, "{detail:?}");
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     assert_eq!(counter.count(), 1, "**只执行一次**已确认的调用");
 
     // 授权消费：一次性授权用掉了，重复批准不再放行第二次执行。
@@ -212,16 +221,16 @@ async fn the_first_end_to_end_acceptance() {
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("核对之后收尾。")).await;
     let status = gw
-        .wait_db_status(
+        .wait_db_state(
             &verifiable_run,
-            |s| s.is_terminal() || s == RunStatus::NeedsAttention,
+            |s| s.is_terminal() || s == RunState::Waiting,
             "收场",
         )
         .await;
     assert_eq!(
         status,
-        RunStatus::Completed,
-        "核对答得出「目标已满足」，就照实报告并收尾（§8.6），不是停在 needs_attention"
+        RunState::Completed,
+        "核对答得出「目标已满足」，就照实报告并收尾（§8.6），不是停在等人（`waiting`）"
     );
     assert_eq!(
         std::fs::read_to_string(&written).unwrap_or_default(),
@@ -272,16 +281,23 @@ async fn the_first_end_to_end_acceptance() {
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
     let status = gw
-        .wait_db_status(
+        .wait_db_state(
             &lost_run,
-            |s| s == RunStatus::NeedsAttention || s.is_terminal(),
-            "needs_attention",
+            |s| s == RunState::Waiting || s.is_terminal(),
+            "等人",
         )
         .await;
     assert_eq!(
         status,
-        RunStatus::NeedsAttention,
+        RunState::Waiting,
         "核对不出结论就进未知状态等人，而不是自动重跑"
+    );
+    // 第二维：这个 `waiting` 停在**要人判断**的那一类上，不是退避到点或等同会话前一条
+    // Run（§8.4、§8.6）——只断言状态名等于弱化。
+    let why = gw.wait_waiting(&lost_run).await;
+    assert!(
+        matches!(why, WaitReason::Intervention { .. }),
+        "等的是「要人判断」那一条 Intervention：{why:?}"
     );
     assert_eq!(counter2.count(), 1, "**没有自动重跑**");
     let events = home.events(&session);

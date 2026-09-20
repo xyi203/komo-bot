@@ -55,6 +55,11 @@ pub struct GatewaySegments {
     /// Cron Job 的**执行预算**要从 Job 上读（§10：每个 Job 有自己的执行预算）。
     /// `None` = 没接 Cron 这一层，所有 Run 都用全局的 `max_rounds`。
     cron: Option<Arc<dyn komo_kernel::traits::CronRepo>>,
+    /// §5.6 的 skills 目录行。**启动时算一次**，之后只有配置重载会重算——它在一个
+    /// 前缀里，每一段都重扫目录就成了"每次都不一样的前缀"。
+    ///
+    /// 与 Gateway 共享同一个 `Arc`：重载时换的是这里面的字符串，不必重建装配层。
+    skills: Option<Arc<std::sync::RwLock<String>>>,
 }
 
 impl std::fmt::Debug for GatewaySegments {
@@ -85,7 +90,23 @@ impl GatewaySegments {
             cron: None,
             memories: None,
             checkpoints: None,
+            skills: None,
         }
+    }
+
+    /// 接上系统提示里的 skills 目录（§5.6）。
+    pub fn with_skills(mut self, skills: Arc<std::sync::RwLock<String>>) -> Self {
+        self.skills = Some(skills);
+        self
+    }
+
+    /// 现在这一份 skills 目录。没接就是空的——精简装配（测试、`skills` 关掉的部署）
+    /// 不该因为少这一块就少别的。
+    fn skills_prompt(&self) -> String {
+        self.skills
+            .as_ref()
+            .map(|skills| skills.read().expect("skills 目录").clone())
+            .unwrap_or_default()
     }
 
     /// 接上记忆这一层。
@@ -219,7 +240,7 @@ impl SegmentSource for GatewaySegments {
             session: session.clone(),
             run: run.clone(),
             model: record.model.clone(),
-            system_prompt: system_prompt(&cwd, &tools),
+            system_prompt: system_prompt(&cwd, &tools, &self.skills_prompt()),
             messages: replay(&surface),
             tools,
             memories,
@@ -289,7 +310,12 @@ impl GatewaySegments {
             None => Vec::new(),
         };
         let text = latest_user_text(surface).unwrap_or_default();
-        memories.prepare(run, &text, &carried).await.uses
+        // **按"这一段对话"取**，不是按这一轮重新召回（§9.4）：注入段在 system 消息里，
+        // 每轮重算一次就等于每轮把服务端前缀缓存打掉一次。
+        memories
+            .prepare_segment(session, run, &text, &carried, surface.boundary())
+            .await
+            .uses
     }
 
     /// 装配读不出上下文时怎么收场。
@@ -323,6 +349,19 @@ impl GatewaySegments {
         // 这个 Run 得在这个会话里。
         surface.runs.get(run)?;
         let waiting = waiting_approval(events, run);
+        // **停在哪一次调用上由审批行回答**（`approval_requests.call_id`）：`run.waiting`
+        // 只说"停在审批上"（`RunWaiting.call` 恒为 `None`），而落点在那个权威表上——在
+        // 事件里编一个只会和它漂移。
+        let waiting_call = match &waiting {
+            Some(approval) => self
+                .approvals
+                .get(approval)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|record| record.call),
+            None => None,
+        };
         let mut pending = Vec::new();
         // **这一轮还没有结果的调用，全部交回执行器**——不只是已经写过计划的那几个：
         // 一轮里前一个停下时，后面的调用连 `tool.planned` 都还没有（`Surface::open_calls`）。
@@ -336,8 +375,8 @@ impl GatewaySegments {
             let request = call_request(surface, events, call_id)?;
             let approval = waiting
                 .as_ref()
-                .filter(|(_, on)| on.as_ref() == Some(call_id))
-                .map(|(approval, _)| approval.clone());
+                .filter(|_| waiting_call.as_ref() == Some(call_id))
+                .cloned();
             pending.push(CallRequest {
                 resumed: Some(resumed_from(state, attempt, attempts)),
                 approval,
@@ -350,7 +389,7 @@ impl GatewaySegments {
         // 已经收尾的那些在回放窗口里（`Role::Tool` 的消息），不必再交一遍。
         let settled: Vec<ToolResultForModel> = Vec::new();
         // 停在审批上的调用，决定还没写下来就别再跑一遍——那会把同一个问题问第二次。
-        if let Some((approval, _)) = &waiting
+        if let Some(approval) = &waiting
             && let Ok(Some(record)) = self.approvals.get(approval).await
             && record.decision.is_none()
         {
@@ -361,19 +400,26 @@ impl GatewaySegments {
     }
 }
 
-/// 这个 Run 停在哪条审批、哪个调用上。
-fn waiting_approval(
-    events: &[Event],
-    run: &RunId,
-) -> Option<(komo_kernel::types::ids::ApprovalId, Option<ToolCallId>)> {
+/// 这个 Run 停在哪条审批上。
+///
+/// §8.4 把"停"收成一个事件（`run.waiting`）加一个理由：审批是四类等待里的一类，所以这里
+/// 按 `WaitReason::Approval` 挑——`retry` / `intervention` / `dependency` 那三类不是审批，
+/// 续跑这一段要它们各自的条件成立（到点、答复、前一条终态），所以一律当"没停在审批上"。
+///
+/// **只答"哪条审批"**：停在哪个调用上是审批行自己的事（`approval_requests.call_id`），
+/// 这里返不回来——调用方去查那一行。
+fn waiting_approval(events: &[Event], run: &RunId) -> Option<komo_kernel::types::ids::ApprovalId> {
     events
         .iter()
         .rev()
         .filter(|event| event.run.as_ref() == Some(run))
         .find_map(|event| match &event.payload {
-            EventPayload::RunWaitingApproval(body) => {
-                Some((body.approval.clone(), body.call.clone()))
-            }
+            EventPayload::RunWaiting(body) => match &body.reason {
+                komo_kernel::types::status::WaitReason::Approval { approval } => {
+                    Some(approval.clone())
+                }
+                _ => None,
+            },
             _ => None,
         })
 }
@@ -510,10 +556,13 @@ fn provider_call_id(surface: &Surface, call: &ToolCallId) -> Option<String> {
     })
 }
 
-/// W4 的最小系统提示。
-fn system_prompt(cwd: &std::path::Path, tools: &[ToolDefinition]) -> String {
+/// 系统提示的正文：身份 / 工作目录 / 挂着的工具 / §5.6 的 skills 目录 / 两条行为约束。
+///
+/// `skills` 是 [`crate::service::state::skills_prompt`] 在**启动时**算好的那一块
+/// （§5.6：目录行是启动快照，为的是提示前缀稳定）；没有能露面的 skills 时它是空串。
+fn system_prompt(cwd: &std::path::Path, tools: &[ToolDefinition], skills: &str) -> String {
     let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
-    format!(
+    let mut prompt = format!(
         "你是 komo，一个在用户自己机器上运行的助手。\n\
          工作目录：{}\n\
          可用工具：{}\n\
@@ -525,7 +574,12 @@ fn system_prompt(cwd: &std::path::Path, tools: &[ToolDefinition]) -> String {
         } else {
             names.join("、")
         }
-    )
+    );
+    if !skills.trim().is_empty() {
+        prompt.push_str("\n\n");
+        prompt.push_str(skills);
+    }
+    prompt
 }
 
 #[cfg(test)]
@@ -580,27 +634,61 @@ mod tests {
     #[test]
     fn the_waiting_approval_is_the_latest_one() {
         let run = RunId::from_raw("run-1");
+        let waiting = |approval: &str| {
+            EventPayload::RunWaiting(komo_kernel::events::RunWaiting {
+                reason: komo_kernel::types::status::WaitReason::Approval {
+                    approval: komo_kernel::types::ids::ApprovalId::from_raw(approval),
+                },
+            })
+        };
+        let events = vec![
+            event(1, &run, waiting("ap-1")),
+            event(2, &run, waiting("ap-2")),
+        ];
+        // 最后一条说了算：中途答过的那一条不是"现在停在哪儿"。
+        assert_eq!(
+            waiting_approval(&events, &run)
+                .expect("停在审批上")
+                .as_str(),
+            "ap-2"
+        );
+    }
+
+    /// **另外三类等待不是审批**：`retry` / `intervention` / `dependency` 停在同一个
+    /// `run.waiting` 上，但各自的放行条件完全不是"有人批了这份计划"——把它们读成审批，
+    /// 续跑那一段就会拿着一条不存在的授权往下跑（§8.4、§7.5 第 3 条）。
+    #[test]
+    fn waiting_on_a_clock_or_a_person_is_not_a_waiting_approval() {
+        let run = RunId::from_raw("run-1");
+        let reason = |reason: komo_kernel::types::status::WaitReason| {
+            EventPayload::RunWaiting(komo_kernel::events::RunWaiting { reason })
+        };
         let events = vec![
             event(
                 1,
                 &run,
-                EventPayload::RunWaitingApproval(komo_kernel::events::RunWaitingApproval {
-                    approval: komo_kernel::types::ids::ApprovalId::from_raw("ap-1"),
-                    call: Some(ToolCallId::from_raw("call-1")),
+                reason(komo_kernel::types::status::WaitReason::Retry {
+                    attempts: 2,
+                    not_before: time::macros::datetime!(2026-09-16 08:00:00 UTC),
+                    cause: komo_kernel::types::status::RetryCause::RateLimited,
                 }),
             ),
             event(
                 2,
                 &run,
-                EventPayload::RunWaitingApproval(komo_kernel::events::RunWaitingApproval {
-                    approval: komo_kernel::types::ids::ApprovalId::from_raw("ap-2"),
-                    call: Some(ToolCallId::from_raw("call-2")),
+                reason(komo_kernel::types::status::WaitReason::Dependency {
+                    run: RunId::from_raw("run-0"),
+                }),
+            ),
+            event(
+                3,
+                &run,
+                reason(komo_kernel::types::status::WaitReason::Intervention {
+                    intervention: komo_kernel::types::ids::InterventionId::from_raw("run-1"),
                 }),
             ),
         ];
-        let (approval, call) = waiting_approval(&events, &run).expect("停在审批上");
-        assert_eq!(approval.as_str(), "ap-2");
-        assert_eq!(call, Some(ToolCallId::from_raw("call-2")));
+        assert_eq!(waiting_approval(&events, &run), None);
     }
 
     #[test]
@@ -612,8 +700,27 @@ mod tests {
                 description: "读文件".into(),
                 parameters: serde_json::json!({}),
             }],
+            "",
         );
         assert!(prompt.contains("read"), "{prompt}");
         assert!(prompt.contains("/tmp/w"), "{prompt}");
+    }
+
+    /// §5.6 的目录行拼在**后面**（原来那段正文一句不少），空的时候一个字都不多。
+    #[test]
+    fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
+        let tools = [ToolDefinition {
+            name: "read".into(),
+            description: "读文件".into(),
+            parameters: serde_json::json!({}),
+        }];
+        let block = "Skills（人写的操作说明…）：\n- pr-review：怎么审一个 PR";
+        let prompt = system_prompt(std::path::Path::new("/tmp/w"), &tools, block);
+        assert!(prompt.ends_with(block), "{prompt}");
+        assert!(prompt.contains("你是 komo"), "{prompt}");
+
+        let bare = system_prompt(std::path::Path::new("/tmp/w"), &tools, "");
+        assert!(!bare.contains("Skills"), "{bare}");
+        assert_eq!(bare.lines().count(), 5, "{bare}");
     }
 }

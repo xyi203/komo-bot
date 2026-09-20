@@ -27,7 +27,7 @@ pub use views::{
 
 use crate::events::{Event, EventPayload};
 use crate::types::ids::{ApprovalId, RunId, Seq, SessionId, ToolCallId};
-use crate::types::status::{RunStatus, ToolCallState};
+use crate::types::status::{RunState, ToolCallState};
 use crate::types::turn::Role;
 
 /// 一串事件折出来的全部派生状态。
@@ -86,6 +86,14 @@ impl Surface {
     }
 
     /// 交给模型回放的窗口：最新一个 `conversation.boundary` 之后的消息（§13.1）。
+    /// 最新一个 `conversation.boundary` 在 `messages` 里的位置。
+    ///
+    /// 记忆注入按它分段（§9.4）：**同一段里逐字复用**，只有换了段（`/new`）才重新召回。
+    /// 注入段在 system 消息里，它一变，服务端前缀缓存里**整条前缀**（连对话历史）都失效。
+    pub fn boundary(&self) -> usize {
+        self.replay_from
+    }
+
     pub fn replay(&self) -> &[SurfaceMessage] {
         &self.messages[self.replay_from.min(self.messages.len())..]
     }
@@ -139,7 +147,7 @@ impl Surface {
 
         match &event.payload {
             EventPayload::RunAccepted(body) => {
-                self.run_mut(event).status = RunStatus::Ingesting;
+                self.run_mut(event).status = RunState::Accepted;
                 self.run_mut(event).input_event = Some(event.event_id.clone());
                 self.push_message(SurfaceMessage {
                     seq: event.seq,
@@ -153,39 +161,52 @@ impl Surface {
                     provider_blocks: None,
                 });
             }
-            EventPayload::RunQueued(_) => self.run_mut(event).status = RunStatus::Queued,
+            EventPayload::RunQueued(_) => {
+                let run = self.run_mut(event);
+                run.status = RunState::Queued;
+                // 回到"缺 worker"这一刻，"在等什么"就没了——它不再等任何外部条件。
+                run.wait = None;
+            }
             EventPayload::RunStarted(body) => {
                 let run = self.run_mut(event);
-                run.status = RunStatus::Running;
+                run.status = RunState::Running;
+                run.wait = None;
                 run.generation = Some(body.generation);
             }
-            EventPayload::RunWaitingApproval(_) => {
-                self.run_mut(event).status = RunStatus::WaitingApproval
+            // 「停着」只有一个状态，**为什么停着**记在 `wait` 里（§8.4）。这正是
+            // "排队二十分钟不知道为什么"的解药：界面读这一格就能说出在等谁、等到什么时候。
+            EventPayload::RunWaiting(body) => {
+                let run = self.run_mut(event);
+                run.status = RunState::Waiting;
+                run.wait = Some(body.reason.clone());
             }
-            EventPayload::RunWaitingRetry(_) => {
-                self.run_mut(event).status = RunStatus::WaitingRetry
-            }
-            EventPayload::RunInterrupted(_) => self.run_mut(event).status = RunStatus::Interrupted,
-            EventPayload::RunNeedsAttention(_) => {
-                self.run_mut(event).status = RunStatus::NeedsAttention
-            }
+            // 回收只说明"上一次执行没收尾、领取权交还了"，**它不是一个状态**（§8.9）：
+            // 那条 Run 由 reconcile 按 §8.4 当场判成 `queued` 或 `waiting + intervention`，
+            // 这里不替它猜。
+            EventPayload::RunReclaimed(_) => {}
             EventPayload::RunCompleted(body) => {
                 let event_id = event.event_id.clone();
                 let run = self.run_mut(event);
-                run.status = RunStatus::Completed;
+                run.status = RunState::Completed;
                 run.final_event = Some(event_id);
                 run.final_message = body.final_message.clone();
             }
             EventPayload::RunFailed(_) => {
                 let event_id = event.event_id.clone();
                 let run = self.run_mut(event);
-                run.status = RunStatus::Failed;
+                run.status = RunState::Failed;
                 run.final_event = Some(event_id);
             }
             EventPayload::RunCancelled(_) => {
                 let event_id = event.event_id.clone();
                 let run = self.run_mut(event);
-                run.status = RunStatus::Cancelled;
+                run.status = RunState::Cancelled;
+                run.final_event = Some(event_id);
+            }
+            EventPayload::RunAbandoned(_) => {
+                let event_id = event.event_id.clone();
+                let run = self.run_mut(event);
+                run.status = RunState::Abandoned;
                 run.final_event = Some(event_id);
             }
             EventPayload::MessageUser(body) => self.push_message(SurfaceMessage {
@@ -358,7 +379,8 @@ impl Surface {
             .unwrap_or_else(|| RunId::from_raw(format!("orphan:{}", event.seq)));
         self.runs.entry(id.clone()).or_insert_with(|| RunView {
             run: id,
-            status: RunStatus::Ingesting,
+            status: RunState::Accepted,
+            wait: None,
             input_event: None,
             final_event: None,
             final_message: None,
@@ -560,7 +582,7 @@ mod tests {
         assert_eq!(surface.messages[3].role, Role::Assistant);
 
         let run = &surface.runs[&RunId::from_raw("run-1")];
-        assert_eq!(run.status, RunStatus::Completed);
+        assert_eq!(run.status, RunState::Completed);
         assert_eq!(run.rounds, 2);
         assert_eq!(run.calls, vec![ToolCallId::from_raw("call-7")]);
         assert_eq!(run.final_message.as_deref(), Some("等于 2"));

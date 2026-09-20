@@ -22,6 +22,11 @@ pub struct SessionRow {
     pub applied_bytes: i64,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 生命周期状态（§8.10）。列里就是那四个词：`active` / `closing` / `deleted` /
+    /// `purged`。**认不出的值按损坏处理**，不默认成 `active`——那会把墓碑读成活会话。
+    pub state: String,
+    /// 状态变更时刻（unix 纳秒，哨兵 `0` = 未设置）。
+    pub state_changed_at: i64,
 }
 
 pub const SPEC: TableSpec = TableSpec {
@@ -30,7 +35,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "sessions" ("id" TEXT NOT NULL, "title" TEXT NOT NULL, "origin" TEXT NOT NULL, "workdir" TEXT, "current_run" TEXT, "jsonl_path" TEXT NOT NULL, "applied_seq" BIGINT NOT NULL, "applied_bytes" BIGINT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "sessions" ("id" TEXT NOT NULL, "title" TEXT NOT NULL, "origin" TEXT NOT NULL, "workdir" TEXT, "current_run" TEXT, "jsonl_path" TEXT NOT NULL, "applied_seq" BIGINT NOT NULL, "applied_bytes" BIGINT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "state" TEXT NOT NULL, "state_changed_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -43,4 +48,6 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("applied_bytes", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("updated_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("state", "TEXT NOT NULL DEFAULT 'active'"),
+    ColumnSpec::new("state_changed_at", "BIGINT NOT NULL DEFAULT 0"),
 ];

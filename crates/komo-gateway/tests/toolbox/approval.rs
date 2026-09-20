@@ -48,12 +48,9 @@ async fn upgrade_request() -> (Home, ApprovalPresentation) {
     assert!(toolbox_test(&gw, "greeter").await.passed);
     let (_, body) = gw.post("/v1/toolbox/greeter/enable", json!({})).await;
     let change: serde_json::Value = serde_json::from_str(&body).expect("响应");
-    let approval = change["approval"].as_str().expect("审批号").to_string();
-    gw.post(
-        &format!("/v1/approvals/{approval}/decision"),
-        json!({ "approved": true, "scope": "once" }),
-    )
-    .await;
+    let approval =
+        komo_kernel::types::ids::ApprovalId::from_raw(change["approval"].as_str().expect("审批号"));
+    gw.decide(&approval, true).await;
     eventually("greeter v1 装上", || async {
         toolbox_show(&gw, "greeter").await.enabled.is_some()
     })

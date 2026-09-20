@@ -32,7 +32,7 @@ use crate::types::plan::{
     ApprovedPlan, ConsumeIntent, ConsumedApproval, ExecutionPlan, Verification,
 };
 use crate::types::refs::{AttemptRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput};
-use crate::types::status::{Claimed, RunEnd, Wait};
+use crate::types::status::{Claimed, RunEnd, WaitReason};
 use crate::types::tool::{
     CancelToken, PyError, PythonJob, PythonResult, ToolContext, ToolDefinition, ToolError,
     ToolOutput,
@@ -251,8 +251,8 @@ pub trait Ledger: Send + Sync {
         published: PublishedOutput,
     ) -> Result<(), LedgerError>;
 
-    /// `waiting_approval` / `waiting_retry` / `needs_attention`，释放执行名额。
-    async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError>;
+    /// 停在某个外部条件上（§8.4）：状态变 `Waiting`，理由进 `WaitReason`，释放执行名额。
+    async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError>;
 
     /// Run 的终态。
     ///
@@ -264,6 +264,11 @@ pub trait Ledger: Send + Sync {
     async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError>;
 
     /// 按 seq 范围读**一页**事件；引用正文按需加载并校验哈希。
+    ///
+    /// **读不得创建或修改内容**（§8.9：观察不改写）。实现不许在 `read` 里建目录、建
+    /// 文件、补行或改写任何字节——一个还没写过日志的会话读回来就是空的一页。理由不止
+    /// "干净"：§8.10 判一条未完成的 Run 能不能领，靠的是"内容到底在不在"，而一个会
+    /// 顺手把内容造出来的 `read` 会让那个判断永远答"在"。
     ///
     /// `limit` 不是可选的：§14 的待验证项里「Turso 长读事务与并发写提交的快照语义」还
     /// 没核实，而它的对策已经定了——读路径改成短事务分页。接口先把这件事定死，实现换
@@ -342,6 +347,22 @@ pub trait RunQueue: Send + Sync {
     /// 交还名额：Run 让出执行（等审批 / 等重试）或执行者退出时调用。代次不对就什么
     /// 都不做。
     async fn release(&self, claimed: &Claimed) -> Result<(), StoreError>;
+
+    /// **续租**：还在跑就别说它没人管（§8.7）。
+    ///
+    /// handler 每 `TTL/3` 调一次。租约只用来**发现**"没人管了"——对账见到过期还要过
+    /// 一道"持有者确已不在"才回收（§8.9）：少那一道，一次二十分钟的调用会在主人还活着
+    /// 的时候被第二个执行者抢走，那不是恢复，是重复副作用（§8.6）。
+    ///
+    /// 复用一个代次围栏：`false` = 这个 Run 的领取权已经不是自己的了，调用方应当
+    /// **停止这个任务的一切写入**（与状态提交拿到 `StaleGeneration` 同一个信号，所以它
+    /// 返回布尔而不是错误）。
+    async fn renew(
+        &self,
+        claimed: &Claimed,
+        executor: &ExecutorId,
+        until: time::OffsetDateTime,
+    ) -> Result<bool, StoreError>;
 }
 
 // ---------------------------------------------------------------- 审批

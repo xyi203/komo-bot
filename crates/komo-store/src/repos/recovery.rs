@@ -12,12 +12,11 @@
 use std::path::{Path, PathBuf};
 
 use komo_kernel::events::EventPayload;
-use komo_kernel::recovery::RetryObservation;
 use komo_kernel::traits::StoreError;
 use komo_kernel::types::chat::Outbound;
-use komo_kernel::types::ids::{ExecutorId, RunId, SessionId};
+use komo_kernel::types::ids::{ExecutorId, InterventionId, RunId, SessionId};
 use komo_kernel::types::plan::ExecutionPlan;
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::{RunState, WaitReason};
 use time::OffsetDateTime;
 use toasty::Executor;
 
@@ -34,14 +33,12 @@ use crate::session_log::{SessionPaths, scan_records};
 pub struct UnfinishedRun {
     pub run: RunId,
     pub session: SessionId,
-    pub status: RunStatus,
+    pub state: RunState,
+    pub wait: Option<WaitReason>,
     /// 还握着领取权的执行实例。
     pub claimed_by: Option<ExecutorId>,
-    /// 等待重试时已经用掉的次数与下次时间。**重启不重置预算**（§8.5）。
-    ///
-    /// `exhausted` 这里恒为 `false`：**预算是配置，不是行**——store 记的是计数器，
-    /// "用完了没有"由拿着预算的那一层判。包 newtype 的时候顺手填上。
-    pub retry: Option<RetryObservation>,
+    /// `waiting` 时在等什么（§8.4）。**预算不在这里**：`retry_attempts` 是行上的计数器，
+    /// "用完了没有"由拿着预算的那一层判。
     /// 最终结果已经送达客户端了吗（§8.4 第 10 行）。
     ///
     /// 「送达」按投递义务判：`deliveries` 里没有一行 `RunFinished` 还卡在 pending /
@@ -94,19 +91,12 @@ impl RecoveryStore {
         Ok(rows
             .into_iter()
             .map(|record| UnfinishedRun {
-                retry: match (record.status, record.next_retry_at) {
-                    (RunStatus::WaitingRetry, Some(next_retry_at)) => Some(RetryObservation {
-                        attempts: record.retry_attempts,
-                        next_retry_at,
-                        exhausted: false,
-                    }),
-                    _ => None,
-                },
                 result_delivered: !undelivered.contains(record.run.as_str()),
                 claimed_by: record.claimed_by.clone().map(ExecutorId::from_raw),
                 run: record.run,
                 session: record.session,
-                status: record.status,
+                state: record.state,
+                wait: record.wait,
             })
             .collect())
     }
@@ -126,7 +116,7 @@ impl RecoveryStore {
             .with_write_retry(move |ex| {
                 let executor = executor.clone();
                 Box::pin(async move {
-                    let reclaimed = super::queue::reclaim_abandoned_runs_in(ex, &executor).await?;
+                    let reclaimed = super::queue::reclaim_unowned_in(ex, &executor).await?;
                     // **按执行实例收拾，不按被回收的那几行**：正常停机时
                     // `RunQueue::release` 已经把 Run 从 `running` 放回 `queued`，于是它
                     // 根本不在回收集合里——可它的尝试还停在 `started`。一个 db 文件只有
@@ -218,8 +208,7 @@ impl RecoveryStore {
     /// 放回队列，等调度器领。
     ///
     /// **不覆盖已经记下的终态**（§8.5）：一个已取消的 Run 不会因为回放又活过来。重试
-    /// 计数与 `next_retry_at` 原样留着——「沿用已保存的次数与 next_retry_at，到期再
-    /// 尝试」（§8.4）。
+    /// 重试计数原样留着——「沿用已保存的次数，到期再尝试」（§8.4）。
     pub async fn requeue(&self, run: &RunId) -> Result<(), StoreError> {
         let run = run.clone();
         self.db
@@ -231,12 +220,17 @@ impl RecoveryStore {
                             what: format!("run {run}"),
                         });
                     };
-                    if runs::status_of(&row)?.is_terminal() {
+                    if runs::state_of(&row)?.is_terminal() {
                         tracing::debug!(run = %run, "已经是终态，回放不复活它");
                         return Ok(());
                     }
+                    // 回 `queued` 就是"现在就能跑"（§8.4）：等待三列一起清掉。重试预算
+                    // 留在 `retry_attempts` 上——**重启不重置**（§8.5）。
                     row.update()
-                        .status(runs::status_str(RunStatus::Queued))
+                        .state(runs::state_str(RunState::Queued))
+                        .wait_kind(None as Option<String>)
+                        .wait_ref(None as Option<String>)
+                        .wake_at(0_i64)
                         .claimed_by(None as Option<String>)
                         .updated_at(to_ts(OffsetDateTime::now_utc()))
                         .exec(ex)
@@ -260,12 +254,17 @@ impl RecoveryStore {
                             what: format!("run {run}"),
                         });
                     };
-                    if runs::status_of(&row)?.is_terminal() {
-                        tracing::debug!(run = %run, "已经是终态，不再标 needs_attention");
+                    if runs::state_of(&row)?.is_terminal() {
+                        tracing::debug!(run = %run, "已经是终态，不再停在等人判断上");
                         return Ok(());
                     }
+                    // `waiting + intervention`，句柄就是这个 Run（§7.5：一个 Run 上最多停着
+                    // 一条要人判断的 Intervention，所以 Run ID 本身就是它的句柄）。
                     row.update()
-                        .status(runs::status_str(RunStatus::NeedsAttention))
+                        .state(runs::state_str(RunState::Waiting))
+                        .wait_kind(Some("intervention".to_string()))
+                        .wait_ref(Some(InterventionId::for_run(&run).to_string()))
+                        .wake_at(0_i64)
                         .claimed_by(None as Option<String>)
                         .last_error(Some(reason))
                         .updated_at(to_ts(OffsetDateTime::now_utc()))
@@ -293,7 +292,7 @@ async fn apply_event(
             // **只记引用，不动状态**：入不入队是决策表的结论（`RecoveryAction::Requeue`），
             // 不是"日志里有 run.accepted"这件事的推论。推成 queued 的话，一个已取消的
             // Run 会在补发结果那条路径上（第 10 行也走 backfill）被悄悄复活。
-            runs::set_input_event_in(ex, run, event_id, now).await?;
+            runs::set_input_event_in(ex, run, event_id, record.event.seq, now).await?;
         }
         EventPayload::MessageAssistant(body) => {
             for request in &body.tool_calls {
@@ -376,7 +375,7 @@ mod tests {
     use komo_kernel::types::ids::{DeliveryId, RequestKey, Seq, ToolCallId};
     use komo_kernel::types::plan::PlanSource;
     use komo_kernel::types::refs::{ContentRef, OutputRef, PublishedOutput, ToolResultStatus};
-    use komo_kernel::types::status::RunEnd;
+    use komo_kernel::types::status::{RetryCause, RunEnd, RunState, WaitReason};
     use komo_kernel::types::turn::{AcceptInput, AssistantRound, ToolCallRequest};
     use std::sync::Arc;
 
@@ -572,9 +571,9 @@ mod tests {
             .find(|row| row.run == open.run)
             .expect("未终态的那个在");
         assert_eq!(in_flight.session, f.session);
-        assert_eq!(in_flight.status, RunStatus::Queued);
+        assert_eq!(in_flight.state, RunState::Queued);
+        assert!(in_flight.wait.is_none());
         assert!(in_flight.claimed_by.is_none());
-        assert!(in_flight.retry.is_none());
         assert!(
             in_flight.result_delivered,
             "没有卡住的投递 = 没有欠着的结果"
@@ -586,7 +585,7 @@ mod tests {
             .iter()
             .find(|row| row.run == closed.run)
             .expect("已终态但没送到的那个也在");
-        assert_eq!(undelivered.status, RunStatus::Completed);
+        assert_eq!(undelivered.state, RunState::Completed);
         assert!(!undelivered.result_delivered);
         assert_eq!(unfinished.len(), 2);
     }
@@ -643,9 +642,9 @@ mod tests {
         );
     }
 
-    /// 等退避的 Run 带出次数与下次时间——**重启不重置预算**（§8.5）。
+    /// 等退避的 Run 把**在等什么**整份带出来——**重启不重置预算**（§8.5）。
     #[tokio::test]
-    async fn a_run_waiting_for_a_backoff_carries_its_counters() {
+    async fn a_run_waiting_for_a_backoff_carries_its_wait() {
         let f = fixture().await;
         let accepted = f
             .coordinator
@@ -656,20 +655,26 @@ mod tests {
         f.coordinator
             .suspend(
                 &accepted.run,
-                komo_kernel::types::status::Wait::Retry {
+                WaitReason::Retry {
                     attempts: 2,
-                    next_retry_at: later,
-                    reason: "provider 超时".into(),
+                    not_before: later,
+                    cause: RetryCause::Transport,
                 },
             )
             .await
             .unwrap();
 
         let unfinished = f.store.unfinished_runs().await.unwrap();
-        let retry = unfinished[0].retry.clone().expect("带着计数器");
-        assert_eq!(retry.attempts, 2);
-        assert_eq!(retry.next_retry_at, later);
-        assert!(!retry.exhausted, "预算是配置，不是行");
+        assert_eq!(unfinished[0].state, RunState::Waiting);
+        assert_eq!(
+            unfinished[0].wait,
+            Some(WaitReason::Retry {
+                attempts: 2,
+                not_before: later,
+                cause: RetryCause::Transport,
+            }),
+            "重启之后仍答得出在等什么、等到什么时候"
+        );
     }
 
     /// 送达过结果的 Run 认得出来（§8.4 第 10 行）。
@@ -736,8 +741,10 @@ mod tests {
             .unwrap();
         assert_eq!(reclaimed, 1);
         let unfinished = f.store.unfinished_runs().await.unwrap();
-        assert_eq!(unfinished[0].status, RunStatus::Interrupted);
-        assert!(unfinished[0].claimed_by.is_none());
+        // **只交还领取权**：状态留着 `running`，那一行是 reconcile 的输入（§8.9）——
+        // store 判不了旧执行者停在哪一步，所以它不判。
+        assert_eq!(unfinished[0].state, RunState::Running);
+        assert!(unfinished[0].claimed_by.is_none(), "领取权交还了");
     }
 
     /// 验收 B2：回收领取权的**同一个事务**里，把那几个 Run 遗留的尝试标成 `interrupted`。
@@ -789,11 +796,12 @@ mod tests {
         let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
         let old = ExecutorId::from_raw("exec-old");
         let claimed = queue.claim_run(&run, &old).await.unwrap().unwrap();
-        // 正常停机：交还名额，这一行回到 queued。
+        // 交还名额：只清 `claimed_by`，状态不动（§8.7）——要回 `queued` 得由 reconcile
+        // 按 §8.4 判，store 不替它猜。
         queue.release(&claimed).await.unwrap();
         assert_eq!(
-            runs::get(&f.db, &run).await.unwrap().unwrap().status,
-            RunStatus::Queued
+            runs::get(&f.db, &run).await.unwrap().unwrap().state,
+            RunState::Running
         );
 
         let reclaimed = f
@@ -828,7 +836,7 @@ mod tests {
 
         assert_eq!(f.store.reclaim_running(&mine).await.unwrap(), 0);
         let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
-        assert_eq!(record.status, RunStatus::Running);
+        assert_eq!(record.state, RunState::Running);
         assert_eq!(record.claimed_by.as_deref(), Some("exec-now"));
     }
 
@@ -951,7 +959,8 @@ mod tests {
 
         f.store.requeue(&accepted.run).await.unwrap();
         let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
-        assert_eq!(record.status, RunStatus::Queued);
+        assert_eq!(record.state, RunState::Queued);
+        assert!(record.wait.is_none(), "回队列就是现在能跑，没有在等什么");
         assert!(record.claimed_by.is_none());
         // 交还之后别人领得到。
         assert!(
@@ -960,6 +969,48 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    /// 回放把老行的 `input_seq` 补上（§8.3）：`0` = 未知，不补它那条 Run 的次序会一直
+    /// 退化到按 id 比——而 UUIDv7 的字典序不是可靠的创建序。
+    #[tokio::test]
+    async fn backfill_fills_in_the_input_seq_of_a_run_accepted_before_this_change() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", &f.session))
+            .await
+            .unwrap();
+        // 造一条"这次改造之前受理的"行：引用与 seq 都缺。
+        let run_id = accepted.run.to_string();
+        f.db.with_write_retry(move |ex| {
+            let run_id = run_id.clone();
+            Box::pin(async move {
+                toasty::sql::statement(
+                    "UPDATE runs SET input_event = NULL, input_seq = 0 WHERE id = ?1",
+                )
+                .bind(run_id)
+                .exec(ex)
+                .await
+                .map(|_| ())
+                .map_err(crate::db::map_toasty)
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+        let before = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
+        assert_eq!(before.input_seq, Seq(0), "先把这一列打回未知");
+        assert!(before.input_event.is_none());
+
+        f.store.backfill(&accepted.run).await.unwrap();
+
+        let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
+        assert!(record.input_event.is_some(), "引用补上了");
+        assert_eq!(
+            record.input_seq,
+            Seq(1),
+            "`run.accepted` 是这个会话的第一条事件"
         );
     }
 
@@ -986,7 +1037,7 @@ mod tests {
         f.store.backfill(&accepted.run).await.unwrap();
 
         let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
-        assert_eq!(record.status, RunStatus::Cancelled, "终态不动");
+        assert_eq!(record.state, RunState::Cancelled, "终态不动");
         assert!(record.last_error.is_none());
         assert!(record.input_event.is_some(), "引用还是补上了");
     }
@@ -1011,7 +1062,13 @@ mod tests {
             .await
             .unwrap();
         let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
-        assert_eq!(record.status, RunStatus::NeedsAttention);
+        assert_eq!(record.state, RunState::Waiting);
+        assert_eq!(
+            record.wait,
+            Some(WaitReason::Intervention {
+                intervention: InterventionId::for_run(&accepted.run),
+            })
+        );
         assert_eq!(record.last_error.as_deref(), Some("输出引用哈希不符"));
         assert!(record.claimed_by.is_none());
     }

@@ -81,6 +81,11 @@ pub enum PathMatch {
     WithinPrefixes { prefixes: Vec<PathBuf> },
     /// 至少一个目标碰到了给定前缀——敏感路径的禁用规则用它。
     TouchesPrefixes { prefixes: Vec<PathBuf> },
+    /// 至少一个目标碰到了 [`PolicyContext::protected`]（komo 自己的状态）。
+    ///
+    /// 名单不在规则里而在上下文里，因为它是**本机的**数据目录：写进表就等于把某一台
+    /// 机器的 home 目录抄进了配置，换台机器或改 `KOMO_HOME` 就失效（§8.10 第 4 条）。
+    TouchesProtected,
 }
 
 /// 一条规则的匹配条件。字段都是 `Option`，`None` = 这一维不约束；给出的条件全部成立
@@ -223,6 +228,13 @@ impl Matcher {
                 .targets
                 .iter()
                 .any(|t| prefixes.iter().any(|p| t.path.starts_with(p))),
+            // 没有上下文时**不命中**：这条规则说的是"本机数据目录"，而授权那一侧
+            // （`matches_scope`）没有上下文，也就不该因为一条本机路径而变宽或变窄。
+            PathMatch::TouchesProtected => ctx.is_some_and(|ctx| {
+                plan.targets
+                    .iter()
+                    .any(|target| ctx.touches_protected(&target.path))
+            }),
         }
     }
 }

@@ -4,7 +4,9 @@ use komo_kernel::events::{
     EVENT_FORMAT_VERSION, Event, EventPayload, MessageAssistant, RunAccepted, RunCompleted,
     RunQueued, RunStarted, ToolPlanned, ToolResult, ToolStarted,
 };
-use komo_kernel::protocol::http::{ApprovalRecord, EventPage};
+use komo_kernel::protocol::http::{
+    ApprovalRecord, EventPage, InterventionKind, InterventionSummary,
+};
 use komo_kernel::types::chat::ApprovalScope;
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{
@@ -197,6 +199,26 @@ pub fn plan() -> ExecutionPlan {
         },
         resources: vec![],
         recovery: RecoveryMode::NoSafeRecovery,
+    }
+}
+
+/// 一条待处理 Intervention 的摘要（`GET /v1/interventions` 的一项，§7.5）。
+///
+/// `verdicts` 用 kernel 给这一类定的那几档：清单里"此刻能答什么"就是它，界面不该自己推。
+pub fn intervention_summary(
+    handle: &str,
+    kind: InterventionKind,
+    question: &str,
+) -> InterventionSummary {
+    InterventionSummary {
+        handle: handle.to_string(),
+        kind,
+        session: session(),
+        run: Some(run()),
+        call: Some(call()),
+        question: question.to_string(),
+        verdicts: kind.verdicts(),
+        created_at: T0,
     }
 }
 

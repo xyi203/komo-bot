@@ -24,11 +24,14 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use komo_kernel::protocol::http::{
+    InterventionKind, InterventionListQuery, InterventionSummary, InterventionVerdict,
+};
 use komo_kernel::protocol::{ApprovalTarget, ChatCommand, InboundAck, InboundMessage};
 use komo_kernel::traits::{GatewayError, Inbound};
 use komo_kernel::types::chat::{ApprovalScope, ChannelPeer, ChannelPlatform, PeerId, Principal};
-use komo_kernel::types::ids::{ApprovalId, RequestKey, RunId, SessionId, ShortId};
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::ids::{RequestKey, RunId, SessionId, ShortId};
+use komo_kernel::types::status::{RunState, WaitReason};
 
 use crate::service::state::{GatewayState, HOME_ORIGIN};
 
@@ -134,7 +137,7 @@ impl Dispatcher {
     /// 把 `{platform}:{chat_id}` 直接当 ID 会让每个消费者再去拆一次字符串。
     pub async fn session_for_peer(&self, peer: &ChannelPeer) -> Result<SessionId, GatewayError> {
         let origin = chat_origin(peer);
-        let existing = komo_store::repos::session::list(&self.state.db)
+        let existing = komo_store::repos::session::list(&self.state.db, true)
             .await?
             .into_iter()
             .filter(|record| record.origin == origin)
@@ -165,7 +168,7 @@ impl Dispatcher {
                 text: id_reply(msg),
             }),
             ChatCommand::Pending => {
-                let pending = self.state.approval_repo.list_pending(None).await?;
+                let pending = self.pending().await?;
                 Ok(InboundAck::Replied {
                     text: render_pending(&pending),
                 })
@@ -186,9 +189,9 @@ impl Dispatcher {
                         text: "这个会话没有在跑的任务。".into(),
                     });
                 };
-                let status = self.state.cancel_run(&run).await?;
+                let state = self.state.cancel_run(&run).await?;
                 Ok(InboundAck::Replied {
-                    text: format!("{run} 现在是 {}。", status_text(status)),
+                    text: format!("{run} 现在是 {}。", state_text(state)),
                 })
             }
             ChatCommand::Approve { target, scope } => {
@@ -213,7 +216,17 @@ impl Dispatcher {
         }
     }
 
+    /// 待处理的 Intervention，三类一起（§7.5）。
+    async fn pending(&self) -> Result<Vec<InterventionSummary>, GatewayError> {
+        self.state
+            .interventions(&InterventionListQuery::default())
+            .await
+    }
+
     /// `/approve` / `/reject`：**审批命令只接受操作者**（上面已经挡过）。
+    ///
+    /// 它们打的是 `POST /v1/interventions/{handle}/answer`（§11.3）——审批就是 §7.5 的
+    /// 三类之一，`approve` / `reject` 就是它那两个结论，没有再走一条自己的路。
     async fn decide(
         &self,
         target: ApprovalTarget,
@@ -225,33 +238,39 @@ impl Dispatcher {
         if target == ApprovalTarget::All {
             return self.decide_all(scope, approved, principal).await;
         }
-        let record = match target {
-            // **`find_latest_by_short_id`，不是 `find_by_short_id`**：后者只看待处理集合
-            // （§11.3 的短 ID 就活在那个集合里），于是第二次点击查到 `None`，得到的是
-            // 「没有这条」而不是「已决定」。§11.3 的命令表要求「已决定的返回原决定，
-            // 不报错」，§14 的验证列逐字要求「同一人连点两次第二次得到『已决定』」。
-            ApprovalTarget::One(short) => {
-                self.state
-                    .approval_repo
-                    .find_latest_by_short_id(&short)
-                    .await?
-            }
+        let handle = match target {
+            // 短 ID 是审批的句柄（§11.3 那张表）；已经答过的那条也定位得到，答复侧回原结论。
+            ApprovalTarget::One(short) => short.to_string(),
             ApprovalTarget::Only => {
                 // 「无 ID 时只有**恰好一个**待处理请求才生效；多于一个则列出并要求指明」
-                let pending = self.state.approval_repo.list_pending(None).await?;
-                match pending.len() {
-                    0 => {
+                let pending = self.pending().await?;
+                match pending.as_slice() {
+                    [] => {
                         return Ok(InboundAck::Replied {
-                            text: "现在没有待处理的审批。".into(),
+                            text: "现在没有待处理的 Intervention。".into(),
                         });
                     }
-                    1 => Some(pending.into_iter().next().expect("刚数过")),
-                    _ => {
+                    [only] if only.kind == InterventionKind::Approval => only.handle.clone(),
+                    // 只有一条、但它不是审批：`y` / `n` 只作用于审批（§11.3），所以这里
+                    // 说清楚它是哪一类、该用哪条命令答——而不是把它当审批答下去。
+                    [only] => {
                         return Ok(InboundAck::Replied {
                             text: format!(
-                                "有 {} 条待处理，请指明是哪一条（`/approve all` 是全答）：\n{}",
-                                pending.len(),
-                                render_pending(&pending)
+                                "现在待处理的这一条是 {}（`{}`）：{}\n它不是审批，用 `/answer {} {}` 答。",
+                                only.kind.as_str(),
+                                only.handle,
+                                only.question,
+                                only.handle,
+                                answer_hint(only.kind)
+                            ),
+                        });
+                    }
+                    many => {
+                        return Ok(InboundAck::Replied {
+                            text: format!(
+                                "有 {} 条待处理，请指明是哪一条（`/approve all` 是全答审批）：\n{}",
+                                many.len(),
+                                render_pending(many)
                             ),
                         });
                     }
@@ -259,27 +278,17 @@ impl Dispatcher {
             }
             ApprovalTarget::All => unreachable!("`all` 在上面就分流了"),
         };
-        let Some(record) = record else {
-            return Ok(InboundAck::Replied {
-                text: "没有这条审批——这个短 ID 从来没有出现过。".into(),
-            });
-        };
-
-        // 已经有结论了：回原决定，**不报错、也不再决定一次**（§11.3）。走
-        // `decide_approval` 也答得出同样的话（它是幂等的），但那要多一次写事务，而这里
-        // 手上已经有那条记录了。
-        if let Some(decision) = &record.decision {
-            return Ok(InboundAck::Replied {
-                text: decided_text(&record, decision),
-            });
-        }
 
         let response = self
             .state
-            .decide_approval(
-                &record.approval,
-                approved,
-                scope,
+            .answer_intervention(
+                &handle,
+                if approved {
+                    InterventionVerdict::Approve
+                } else {
+                    InterventionVerdict::Reject
+                },
+                Some(if approved { scope } else { ApprovalScope::Once }),
                 Some(principal.id().clone()),
             )
             .await?;
@@ -288,54 +297,98 @@ impl Dispatcher {
         // `GatewayState::decide_approval` 里（四个界面共用）——这里不再另投一份，否则
         // 下命令的这个会话会收到两条。
         let _ = from;
-
         Ok(InboundAck::Replied {
-            text: if response.already_decided {
-                decided_text(&record, &response.decision)
-            } else {
-                format!(
-                    "{} {}。",
-                    record.short_id,
-                    decision_text(response.decision.approved)
-                )
-            },
+            text: response.note,
+        })
+    }
+
+    /// `/answer <handle> <结论>`：答复**另外两类**（§7.5），也认审批。
+    ///
+    /// 结论按种类分派：拼错了就把这一类**能答的**列出来（[`InterventionSummary::verdicts`]
+    /// 是权威），而不是猜一个。
+    async fn answer(
+        &self,
+        handle: &str,
+        verdict: InterventionVerdict,
+        by: PeerId,
+    ) -> Result<InboundAck, GatewayError> {
+        // 先看这一条的结论拼对了没有：`InterventionVerdict::parse` 认几个手滑得不算离谱
+        // 的拼法，认不出来的到不了这里。
+        let detail = self.state.intervention(handle).await?;
+        if let Some(detail) = detail {
+            let kind = match &detail {
+                komo_kernel::protocol::http::InterventionDetail::Approval(_) => {
+                    InterventionKind::Approval
+                }
+                komo_kernel::protocol::http::InterventionDetail::Verify { .. } => {
+                    InterventionKind::Verify
+                }
+                komo_kernel::protocol::http::InterventionDetail::Blocked { .. } => {
+                    InterventionKind::Blocked
+                }
+            };
+            if !verdict.allowed_for(kind) {
+                return Ok(InboundAck::Replied {
+                    text: format!(
+                        "`{}` 答不了 `{}`——这一条是 {}，能答的是：{}。",
+                        handle,
+                        verdict.as_str(),
+                        kind.as_str(),
+                        kind.verdicts()
+                            .iter()
+                            .map(|one| one.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    ),
+                });
+            }
+        }
+        let response = self
+            .state
+            .answer_intervention(handle, verdict, Some(ApprovalScope::Once), Some(by))
+            .await?;
+        Ok(InboundAck::Replied {
+            text: response.note,
         })
     }
 
     /// `/approve all` / `/reject all`：一次答一批（§11.3）。
     ///
-    /// 名单**在这里列**——协议里没有"全部"这个词（见 `ApprovalBatchDecisionRequest`
+    /// 名单**在这里列**——协议里没有"全部"这个词（见 `InterventionBatchAnswerRequest`
     /// 的注释：那会在答复到达之前，把这之后新出现的请求也一起答掉）。范围固定成"本次
     /// 调用"：一条命令替一批互不相干的计划选一个范围，是在替操作者猜一件他没看过的事。
     /// 他说了范围时，回执要**说出来它没被采纳**，而不是静默降级。
+    ///
+    /// **只答审批**：另外两类各有各的结论，一次按键替它们选不了（§7.5）。
     async fn decide_all(
         &self,
         scope: ApprovalScope,
         approved: bool,
         principal: &Principal,
     ) -> Result<InboundAck, GatewayError> {
-        let pending = self.state.approval_repo.list_pending(None).await?;
-        if pending.is_empty() {
+        let pending = self.pending().await?;
+        let approvals: Vec<String> = pending
+            .iter()
+            .filter(|one| one.kind == InterventionKind::Approval)
+            .map(|one| one.handle.clone())
+            .collect();
+        if approvals.is_empty() {
             return Ok(InboundAck::Replied {
                 text: "现在没有待处理的审批。".into(),
             });
         }
-        let approvals: Vec<ApprovalId> = pending
-            .iter()
-            .map(|record| record.approval.clone())
-            .collect();
         let response = self
             .state
-            .decide_approvals(&approvals, approved, Some(principal.id().clone()))
+            .answer_approvals(&approvals, approved, Some(principal.id().clone()))
             .await?;
         let names: Vec<String> = response
-            .decisions
+            .answered
             .iter()
-            .map(|decision| decision.short_id.to_string())
+            .map(|answer| answer.handle.clone())
             .collect();
         let mut text = format!(
             "{} {} 条（各按本次调用）：{}。",
-            decision_text(approved),
+            if approved { "已批准" } else { "已拒绝" },
             names.len(),
             names.join(" ")
         );
@@ -350,24 +403,49 @@ impl Dispatcher {
                 response.missing.len()
             ));
         }
+        let others = pending
+            .iter()
+            .filter(|one| one.kind != InterventionKind::Approval)
+            .count();
+        if others > 0 {
+            text.push_str(&format!(
+                "\n另有 {others} 条不是审批（结果不明 / 前提没了），用 `/answer <句柄> <结论>` 逐条答。"
+            ));
+        }
         Ok(InboundAck::Replied { text })
     }
 
     async fn current_run(&self, session: &SessionId) -> Result<Option<RunId>, GatewayError> {
         let mut runs = komo_store::repos::runs::list_for_session(&self.state.db, session).await?;
-        runs.retain(|run| !run.status.is_terminal());
+        runs.retain(|run| run.state.is_unfinished());
         Ok(runs.into_iter().next_back().map(|run| run.run))
     }
 
+    /// `/status`：当前 Run 的状态、在等什么，以及**三类合计**的待处理数。
+    ///
+    /// 计数是三类合计（§7.5）：单看审批数会正好落回"清单为空而会话停着"那个老毛病——
+    /// 一条 `verify` 挂在那里，审批数是 0。
     async fn status_text(&self, session: &SessionId) -> Result<String, GatewayError> {
         let runs = komo_store::repos::runs::list_for_session(&self.state.db, session).await?;
-        let pending = self.state.approval_repo.list_pending(None).await?.len();
-        let current = runs.iter().rev().find(|run| !run.status.is_terminal());
+        let pending = self.pending().await?;
+        let by_kind =
+            |kind: InterventionKind| pending.iter().filter(|one| one.kind == kind).count();
+        let current = runs.iter().rev().find(|run| run.state.is_unfinished());
         let head = match current {
-            Some(run) => format!("当前任务 {}：{}", run.run, status_text(run.status)),
+            Some(run) => format!(
+                "当前任务 {}：{}",
+                run.run,
+                state_line(run.state, run.wait.as_ref())
+            ),
             None => "没有在跑的任务。".to_string(),
         };
-        Ok(format!("{head}\n待处理审批：{pending} 条"))
+        Ok(format!(
+            "{head}\n待处理（共 {} 条）：审批 {} · 结果不明 {} · 前提没了 {}",
+            pending.len(),
+            by_kind(InterventionKind::Approval),
+            by_kind(InterventionKind::Verify),
+            by_kind(InterventionKind::Blocked),
+        ))
     }
 }
 
@@ -417,19 +495,32 @@ impl Inbound for Dispatcher {
         self.state.notifier.flush(Some(&msg.peer)).await;
 
         // ⑤ 命令。
+        //
+        // `/answer <句柄> <结论>` 不在 kernel 的 `ChatCommand` 里（那是三个渠道共用的解析
+        // 结果，而"答复另外两类"这条路只有网关看得到清单）：它在这里当场认，走的是与
+        // `/approve` 同一个入口（§7.5：四个界面语义相同）。
+        if let Some((handle, verdict)) = parse_answer(&msg.text) {
+            let ack = self
+                .answer(&handle, verdict, principal.id().clone())
+                .await?;
+            self.remember(&msg.request_key, &ack);
+            return Ok(ack);
+        }
+        // 写歪了的 `/answer`（少了结论、或者结论拼错），**列出来**：一句"我不知道"比
+        // 悄悄把它当普通消息发出去好得多——那条消息会真的跑一轮模型。
+        if let Some(help) = parse_answer_help(&msg.text) {
+            let ack = InboundAck::Replied { text: help };
+            self.remember(&msg.request_key, &ack);
+            return Ok(ack);
+        }
         if let Some(command) = command {
-            // 裸 `y` / `n` 只在**真有一条在等**的时候才算答复：没有待处理审批时它落到下面
-            // 那条普通消息的路（模型问"要不要…"，回个 `n` 不该被读成"拒绝一条不存在的
-            // 审批"）。§11.3：这条捷径不改变"待处理只有一条才生效"的语义。
+            // 裸 `y` / `n` 只在**真有一条在等**的时候才算答复：没有待处理的 Intervention
+            // 时它落到下面那条普通消息的路（模型问"要不要…"，回个 `n` 不该被读成"拒绝
+            // 一条不存在的审批"）。§11.3 的判据是"没有待处理 Intervention 时它不是命令"
+            // ——三类都算，不只是审批：一条 `verify` 挂在那里时 `y` 仍然该被当成答复
+            // 来对待（只是它答不了那一类，会得到一句说明）。
             let bare = matches!(command, ChatCommand::BareVerdict { .. });
-            if !bare
-                || !self
-                    .state
-                    .approval_repo
-                    .list_pending(None)
-                    .await?
-                    .is_empty()
-            {
+            if !bare || !self.pending().await?.is_empty() {
                 let ack = self.command(command, &msg, &principal, &session).await?;
                 self.remember(&msg.request_key, &ack);
                 return Ok(ack);
@@ -446,7 +537,15 @@ impl Inbound for Dispatcher {
                 Some(msg.peer.clone()),
                 None,
             )
-            .await?;
+            .await
+            .map_err(|error| match error {
+                // 「已逻辑删除的会话拒绝新输入」（§8.10）：聊天这一侧也要说清楚是哪种
+                // 状态、以及该怎么做——HTTP 那侧是 409 加同一句话。
+                GatewayError::InvalidRequest(message) => GatewayError::InvalidRequest(format!(
+                    "{message}。要接着聊就在 TUI 里新建一个会话（`/new` 只是划一段边界）。"
+                )),
+                other => other,
+            })?;
         // 谁在看这个 Run：`GatewayState::submit` 已经按来源会话起了一个看客
         // （§11.4：终态回到来源会话，等待审批投来源会话 + home chat），所以这里不再
         // 另起一个——两个看客会把同一条审批投两遍。
@@ -479,28 +578,6 @@ fn id_reply(msg: &InboundMessage) -> String {
     format!("会话：{}\n发送者：{}", msg.peer, msg.sender)
 }
 
-/// 「已决定：原决定 · 谁 · 何时」。
-///
-/// §11.3：「已决定的返回原决定，**不报错**」——所以这句话要说得出是谁、什么时候决定的，
-/// 否则第二个人只知道"轮不到我了"，不知道轮到了谁。
-fn decided_text(
-    record: &komo_kernel::protocol::http::ApprovalRecord,
-    decision: &komo_kernel::protocol::http::ApprovalDecisionRecord,
-) -> String {
-    let by = decision
-        .by
-        .as_ref()
-        .map(|peer| peer.to_string())
-        .unwrap_or_else(|| "操作者".to_string());
-    format!(
-        "{} 已经决定过了：{} · {} · {}",
-        record.short_id,
-        decision_text(decision.approved),
-        by,
-        stamp(decision.decided_at)
-    )
-}
-
 /// 决定时刻，按本地可读的样子。
 fn stamp(at: time::OffsetDateTime) -> String {
     format!(
@@ -513,39 +590,137 @@ fn stamp(at: time::OffsetDateTime) -> String {
     )
 }
 
-fn decision_text(approved: bool) -> &'static str {
-    if approved { "已批准" } else { "已拒绝" }
-}
-
-fn status_text(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Ingesting => "正在接收",
-        RunStatus::Queued => "排队中",
-        RunStatus::Running => "执行中",
-        RunStatus::WaitingApproval => "等待审批",
-        RunStatus::WaitingRetry => "等待重试",
-        RunStatus::Interrupted => "被中断",
-        RunStatus::NeedsAttention => "需要你处理",
-        RunStatus::Completed => "已完成",
-        RunStatus::Failed => "失败",
-        RunStatus::Cancelled => "已取消",
+/// 一个 Run 状态的中文说法。
+fn state_text(state: RunState) -> &'static str {
+    match state {
+        RunState::Accepted => "正在接收",
+        RunState::Queued => "排队中",
+        RunState::Running => "执行中",
+        RunState::Waiting => "在等一个条件",
+        RunState::Completed => "已完成",
+        RunState::Failed => "失败",
+        RunState::Cancelled => "已取消",
+        RunState::Abandoned => "已放弃（不会再有下文）",
     }
 }
 
-fn render_pending(pending: &[komo_kernel::protocol::http::ApprovalRecord]) -> String {
+/// **为什么不动**（§8.4 的第二维）。`/status` 与 `/pending` 靠它答得出"在等什么"。
+fn wait_text(wait: &WaitReason) -> String {
+    match wait {
+        WaitReason::Approval { approval } => format!("等你批一份执行计划（{approval}）"),
+        WaitReason::Retry {
+            attempts,
+            not_before,
+            cause,
+        } => format!(
+            "等一次退避到点（第 {attempts} 次，{}，原因 {}）",
+            stamp(*not_before),
+            cause.as_str()
+        ),
+        WaitReason::Intervention { .. } => {
+            "等你答一条 Intervention（`/pending` 看清单）".to_string()
+        }
+        WaitReason::Dependency { run } => format!("等同会话里更早的那条 Run（{run}）"),
+    }
+}
+
+/// 一行"状态 + 在等什么"。
+fn state_line(state: RunState, wait: Option<&WaitReason>) -> String {
+    match (state, wait) {
+        (RunState::Waiting, Some(wait)) => format!("{}：{}", state_text(state), wait_text(wait)),
+        (RunState::Waiting, None) => "在等一个条件（没说清在等什么）".to_string(),
+        _ => state_text(state).to_string(),
+    }
+}
+
+/// 这一类该用哪条命令答——列一条**按下去有反应**的路（§11.3 的 TUI 菜单同一条理由）。
+fn answer_hint(kind: InterventionKind) -> &'static str {
+    match kind {
+        InterventionKind::Approval => "approve",
+        InterventionKind::Verify => "satisfied",
+        InterventionKind::Blocked => "resolve",
+    }
+}
+
+/// `/pending`：三类一起，句柄 + 种类 + 问题 + 可答的结论（§11.3）。
+fn render_pending(pending: &[InterventionSummary]) -> String {
     if pending.is_empty() {
-        return "现在没有待处理的审批。".to_string();
+        return "现在没有待处理的 Intervention。".to_string();
     }
     pending
         .iter()
-        .map(|record| {
+        .map(|one| {
             format!(
-                "{} · {} · {}",
-                record.short_id, record.plan.tool, record.reason
+                "{} · {} · {}\n  可答：{}",
+                one.handle,
+                kind_text(one.kind),
+                one.question,
+                one.verdicts
+                    .iter()
+                    .map(|verdict| verdict.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
             )
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn kind_text(kind: InterventionKind) -> &'static str {
+    match kind {
+        InterventionKind::Approval => "审批",
+        InterventionKind::Verify => "结果不明",
+        InterventionKind::Blocked => "前提没了",
+    }
+}
+
+/// `/answer <句柄> <结论>`（§11.3）。
+///
+/// 认不出结论就**列可选项**，不猜：`/answer run-1 done` 与 `/answer run-1 notperformed`
+/// 都认（`InterventionVerdict::parse` 的手滑表），别的到不了这里。句柄缺失时也要说清楚。
+fn parse_answer(text: &str) -> Option<(String, InterventionVerdict)> {
+    let trimmed = text.trim();
+    let mut parts = trimmed.split_whitespace();
+    let head = parts.next()?;
+    let name = head
+        .trim_start_matches('/')
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name != "answer" {
+        return None;
+    }
+    let handle = parts.next()?;
+    // 结论拼错：返回 `None` 让调用方落进"说一句它接受哪些写法"那条路
+    // （见 `parse_answer_help`），不在这里编一个"答不了"的结论。
+    parts
+        .next()
+        .and_then(InterventionVerdict::parse)
+        .map(|verdict| (handle.to_string(), verdict))
+}
+
+/// `/answer` 拼错了什么，以及它接受哪些写法。
+fn parse_answer_help(text: &str) -> Option<String> {
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let head = parts.first()?.trim_start_matches('/').split('@').next()?;
+    if !head.eq_ignore_ascii_case("answer") {
+        return None;
+    }
+    match parts.len() {
+        1 => Some("用法：`/answer <句柄> <结论>`（句柄见 `/pending`）。".to_string()),
+        2 => Some(format!(
+            "`/answer {} …` 还要一个结论：{}。",
+            parts[1],
+            InterventionVerdict::parse("satisfied")
+                .map(|_| "satisfied / not_performed / resolve / abandon（审批是 approve / reject）")
+                .unwrap_or_default()
+        )),
+        _ => Some(format!(
+            "`{}` 不是一个结论。能答的是：satisfied / not_performed / resolve / abandon（审批用 approve / reject，也认 y / n）。",
+            parts[2]
+        )),
+    }
 }
 
 /// `/approve` / `/reject` 后面那一段说的是**哪一条**。

@@ -30,6 +30,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use komo_kernel::policy::PolicyDecision;
 use komo_kernel::traits::{
     Clock, Ledger, LedgerError, RepoError, StoreError, Tool, ToolOutputStore,
@@ -154,6 +156,55 @@ pub enum ExecError {
     Store(#[from] StoreError),
     #[error(transparent)]
     Repo(#[from] RepoError),
+}
+
+/// 操作者对一次「结果不明」的调用能给的两个结论（§7.5 的 `verify` 条目）。
+///
+/// **没有"我确认副作用已发生"这一条**：操作者可能看错，而账本一旦这么记就再也纠不
+/// 回来（§8.6）。`AlreadySatisfied` 说的是"核对之后外部状态已经是那个样子"，不是
+/// "我相信它跑过了"——所以两个结论都要带上**看了什么**。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum OperatorVerdict {
+    /// 核对后目标已满足：这次调用按**已完成**收尾，正文里带证据。
+    AlreadySatisfied { evidence: String },
+    /// 确定没有执行：按**失败**收尾。重做是**新的一次调用**，因此照常过 Policy——
+    /// 旧的那条一次性授权不会被当成重试许可（§7.4）。
+    NotPerformed { evidence: String },
+}
+
+impl OperatorVerdict {
+    /// 写进账本的正文。带上证据与"是谁关掉的"，事后答得出这一条凭什么算了。
+    pub fn summary(&self) -> String {
+        match self {
+            OperatorVerdict::AlreadySatisfied { evidence } => {
+                format!("操作者核对：目标已满足。证据：{evidence}")
+            }
+            OperatorVerdict::NotPerformed { evidence } => {
+                format!("操作者核对：确定没有执行。证据：{evidence}")
+            }
+        }
+    }
+
+    pub fn status(&self) -> ToolResultStatus {
+        match self {
+            OperatorVerdict::AlreadySatisfied { .. } => ToolResultStatus::Completed,
+            OperatorVerdict::NotPerformed { .. } => ToolResultStatus::Failed,
+        }
+    }
+
+    /// 折算成 §8.6 的核对结论——`ResumedCall.verification` 读的就是这个形状，所以操作者
+    /// 的结论与核对函数给出的结论在续跑时走同一条判断。
+    pub fn as_verification(&self) -> Verification {
+        match self {
+            OperatorVerdict::AlreadySatisfied { evidence } => Verification::AlreadySatisfied {
+                evidence: evidence.clone(),
+            },
+            OperatorVerdict::NotPerformed { evidence } => Verification::NotPerformed {
+                evidence: evidence.clone(),
+            },
+        }
+    }
 }
 
 pub struct ToolExecutor {
@@ -444,6 +495,48 @@ impl ToolExecutor {
             }),
             _ => Ok(CallSettlement::Result(result)),
         }
+    }
+
+    /// §7.5：**操作者**对一次「结果不明」的调用下的结论，落到那次尝试上。
+    ///
+    /// 与 [`Self::settle_verified`] 是同一个动作（给那次尝试写一条 `tool.result`），
+    /// 区别只在结论是谁下的：那边是工具自带的核对函数（§8.6 的第二种恢复方式，模块
+    /// 已被审核过），这边是人在清单上按的键（§7.5 的 `verify` 条目）。**两条路不能
+    /// 合并**：操作者的结论只有"我看过外部状态了"这一种由来，而账本上要留得下"这一条
+    /// 是谁凭什么关掉的"——所以证据进正文，方法只收那两种写法。
+    ///
+    /// 写完这条结果，这个调用的这一轮就算收口了（`Run` 由调用方按 §8.4 重新入队）：
+    /// `AlreadySatisfied` 写成 `completed`（目标已经是那个样子），`NotPerformed` 写成
+    /// `failed`（重做要走新的一次调用，因此照常过 Policy）。**两种都不重跑工具**。
+    pub async fn settle_by_operator(
+        &self,
+        session: &SessionId,
+        run: &RunId,
+        call: &ToolCallId,
+        attempt: &AttemptId,
+        verdict: OperatorVerdict,
+    ) -> Result<ToolResultStatus, ExecError> {
+        let attempt_ref = AttemptRef {
+            session: session.clone(),
+            run: run.clone(),
+            call: call.clone(),
+            attempt: attempt.clone(),
+        };
+        let summary = verdict.summary();
+        let status = verdict.status();
+        let writer = self.outputs.begin(&attempt_ref).await?;
+        let body = ToolResultBody {
+            status,
+            result: serde_json::to_value(&verdict).unwrap_or(serde_json::Value::Null),
+            error: (status != ToolResultStatus::Completed).then(|| summary.clone()),
+            exit_code: None,
+            artifacts: vec![],
+        };
+        let mut published = self.outputs.publish(writer, body).await?;
+        // `elapsed_ms` 留 0：那次尝试跑了多久**我们不知道**，0 读作未知而不是"瞬间"。
+        published.preview = Some(truncate(&summary, PREVIEW_LIMIT_BYTES));
+        self.ledger.finish_call(attempt, published).await?;
+        Ok(status)
     }
 
     /// 为**上一世那次尝试**落一条结果。

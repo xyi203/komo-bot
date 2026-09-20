@@ -99,13 +99,36 @@ async fn step(
     payload: &EventPayload,
 ) -> Step {
     match payload {
-        // **等待审批**：先投出去，再回写触发状态。投递在前是因为这一条是给人看的，
-        // 而状态是给清单看的。
+        // **停在一个外部条件上**（§8.4）：一个事件（`run.waiting`）加一个理由。投不投、
+        // 投到哪儿，由理由决定——"需要人判断"的那两类要投（§11.4），等时钟与等前一条
+        // Run 不投（那不是问人）。
         //
-        // 「新增危险操作暂停等待审批，不能因无人值守而自动放行」（§10）——没有这一步，
+        // 「新增危险操作暂停等待审批，不能因无人值守而自动放行」（§10）——少了投递这一步，
         // Run 会停在等待上而**没有人知道它在等**。
-        EventPayload::RunWaitingApproval(body) => {
-            deliver_approval(state, watcher, &body.approval).await;
+        EventPayload::RunWaiting(body) => {
+            match &body.reason {
+                komo_kernel::types::status::WaitReason::Approval { approval } => {
+                    deliver_approval(state, watcher, approval).await;
+                }
+                // 结果不明 / 前提没了（§7.5 的另外两类）：同一句话问人，投**来源会话 +
+                // home chat**。"需要人判断"不该因为种类不同而有不同的到达率（§11.4）。
+                komo_kernel::types::status::WaitReason::Intervention { .. } => {
+                    let question = question_for(state, run, watcher).await;
+                    deliver_to_source_and_home(
+                        state,
+                        watcher,
+                        Outbound::NeedsAttention {
+                            session: session.clone(),
+                            run: run.clone(),
+                            reason: question,
+                        },
+                    )
+                    .await;
+                }
+                // 等时钟（`retry`）与等前一条 Run（`dependency`）：不是在等人，不投。
+                komo_kernel::types::status::WaitReason::Retry { .. }
+                | komo_kernel::types::status::WaitReason::Dependency { .. } => {}
+            }
             if let Watcher::Cron(watched) = watcher {
                 super::cron_watch::settle(
                     state,
@@ -115,32 +138,8 @@ async fn step(
                 )
                 .await;
             }
-            // 不 return：批准之后这个 Run 会接着跑，终态还要记。
+            // 不 return：答复 / 到点 / 前一条终态之后这个 Run 会接着跑，终态还要记。
             Step::Keep
-        }
-        // 「需要操作者判断」（§8.6）与等待审批同一类：它在**问**，所以不受 `notify`
-        // 约束，也一样投到来源会话 + home chat。
-        EventPayload::RunNeedsAttention(body) => {
-            let reason = match watcher.label() {
-                Some(name) => format!("定时任务「{name}」：{}", body.reason),
-                None => body.reason.clone(),
-            };
-            let message = Outbound::NeedsAttention {
-                session: session.clone(),
-                run: run.clone(),
-                reason,
-            };
-            deliver_to_source_and_home(state, watcher, message).await;
-            if let Watcher::Cron(watched) = watcher {
-                super::cron_watch::settle(
-                    state,
-                    watched,
-                    komo_kernel::cron::FiringStatus::Waiting,
-                    Some(body.reason.clone()),
-                )
-                .await;
-            }
-            Step::Done
         }
         EventPayload::RunCompleted(body) => {
             let text = body
@@ -185,7 +184,49 @@ async fn step(
             .await;
             Step::Done
         }
+        // 操作者在清单上放弃（§7.5）：**与取消分得开**——不是用户不想跑了，而是这件事
+        // 不会再有下文。话也要说得不一样，否则那个 Run 看起来像是被人取消的。
+        EventPayload::RunAbandoned(body) => {
+            let why = body
+                .reason
+                .clone()
+                .unwrap_or_else(|| "操作者放弃".to_string());
+            finish(
+                state,
+                session,
+                run,
+                watcher,
+                komo_kernel::cron::FiringStatus::Error,
+                Some(why.clone()),
+                format!("任务已放弃（abandoned）：{why}"),
+            )
+            .await;
+            Step::Done
+        }
         _ => Step::Keep,
+    }
+}
+
+/// 一条"需要人判断"的通知正文（§11.4）。
+///
+/// 问题本身**不在事件里**：§7.5 第 1 条把清单钉成派生视图，`kind` 与问题都由权威当场判出
+/// （"有没有一条 `uncertain` 调用"、"会话还在不在服务范围里"）。所以这里按句柄回清单取
+/// 那一条——照事件编一句话，只会和权威漂移。取不到（这一条刚刚被答掉）就退回一句说得清
+/// 出处的话。
+async fn question_for(state: &Arc<GatewayState>, run: &RunId, watcher: &Watcher) -> String {
+    let question = match state.intervention(run.as_str()).await {
+        Ok(Some(detail)) => super::interventions::question_of(&detail),
+        Ok(None) => {
+            "这条 Run 停在一次需要你判断的答复上（去 `GET /v1/interventions` 看这一条）".to_string()
+        }
+        Err(error) => {
+            tracing::warn!(%error, %run, "读不出这条 Intervention 的问题正文");
+            "这条 Run 停在一次需要你判断的答复上（清单这一次没读出来）".to_string()
+        }
+    };
+    match watcher.label() {
+        Some(name) => format!("定时任务「{name}」：{question}"),
+        None => question,
     }
 }
 
@@ -199,6 +240,10 @@ async fn finish(
     error: Option<String>,
     text: String,
 ) {
+    // **它进终态了，后面等着的那些可以走了**（§8.4 的次序规则）：一条条件 UPDATE 把
+    // `waiting + dependency` 且前置已终态的放回 `queued`。对账每一拍也会做（§8.9），但
+    // "同会话的下一条白等一分钟"是操作者看得见的延迟。
+    state.release_dependents().await;
     match watcher {
         Watcher::Interactive { peer } => {
             let Some(peer) = peer else {
@@ -232,10 +277,6 @@ async fn finish(
 /// 已经决定过的不再问一次；投不出去（一个 home_chat 都没配、来源会话也没有）**报到
 /// 日志**，不静默丢弃——一个没人能回答的等待会让这个 Run 从此停在那里。
 async fn deliver_approval(state: &Arc<GatewayState>, watcher: &Watcher, approval: &ApprovalId) {
-    if !state.start_delivering_approval(approval) {
-        tracing::debug!(%approval, "这条审批已经投过了");
-        return;
-    }
     let record = match state.approval_repo.get(approval).await {
         Ok(Some(record)) => record,
         Ok(None) => return,
@@ -246,6 +287,28 @@ async fn deliver_approval(state: &Arc<GatewayState>, watcher: &Watcher, approval
     };
     if record.decision.is_some() {
         return; // 已经决定过了，不必再问一次。
+    }
+    // **屏幕前有人在看的时候不投 chat 那份。** TUI / HTTP 来源的 Run 没有 chat 对端
+    // （`peer` 是 `None`），照 §11.4 那份卡片就只剩 home chat 一个出口——而它是一次
+    // 网络往返（实测几秒到几十秒，渠道不通时更久），人在看着这一条的时候它只会晚到，
+    // 顺带多一份噪音（另外它还会在原地回写一条"已批准 · 短ID"，人刚在弹窗里答过）。
+    //
+    // 弹窗走的是 SSE 那一帧（`approval.requested` 一到就推，TUI 见 `run.waiting` 就自己
+    // 去问清单），所以"有人在看"= 这条审批已经有人看见了。
+    //
+    // **没人在看就一定投**：Cron、`komo run` 脚本、TUI 关掉之后都落在那一支上——
+    // §10 的底线是"不能因为无人值守就没人知道它在等"。TUI 关上而审批还挂着的那种，
+    // 由周期兜底（[`GatewayState::sweep_unseen_interventions`]）在下一拍补投。
+    //
+    // 这一条**不占** `start_delivering_intervention` 那个"投过一次"的名额：看见的人走了
+    // 之后兜底还要能补投。
+    if watcher.peer().is_none() && state.hub.viewers(&record.session) > 0 {
+        tracing::debug!(%approval, session = %record.session, "有人在看着这个会话，审批只弹在他面前");
+        return;
+    }
+    if !state.start_delivering_intervention(record.short_id.as_str()) {
+        tracing::debug!(%approval, "这条审批已经投过了");
+        return;
     }
     if let Err(error) = state
         .notifier

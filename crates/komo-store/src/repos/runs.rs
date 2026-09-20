@@ -4,11 +4,13 @@
 //! 一切——建行、记事件引用、记终态、按请求键去重。
 
 use komo_kernel::traits::StoreError;
-use komo_kernel::types::ids::{EventId, ExecutorId, RequestKey, RunId, Seq, SessionId};
+use komo_kernel::types::ids::{
+    ApprovalId, EventId, ExecutorId, InterventionId, RequestKey, RunId, Seq, SessionId,
+};
 use komo_kernel::types::memory::MemoryWork;
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::PlanSource;
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
 use time::OffsetDateTime;
 use toasty::Executor;
 
@@ -23,14 +25,22 @@ pub struct RunRecord {
     pub request_key: RequestKey,
     pub input_hash: String,
     pub input_event: Option<EventId>,
+    /// 承载输入那条事件的 `seq`（§8.3）：**同 Session 内次序的权威**。`Seq(0)` = 未知。
+    pub input_seq: Seq,
     pub final_event: Option<EventId>,
-    pub status: RunStatus,
+    /// 调度状态（§8.4）。
+    pub state: RunState,
+    /// `state == Waiting` 时在等什么（§8.4）。
+    pub wait: Option<WaitReason>,
     pub source: PlanSource,
     pub peer: Option<String>,
     pub claimed_by: Option<String>,
     pub claim_generation: u64,
     pub retry_attempts: u32,
-    pub next_retry_at: Option<OffsetDateTime>,
+    /// `wait_kind = 'retry'` 的到点时刻（`wake_at` 列的哨兵 `0` 读成 `None`）。
+    pub wake_at: Option<OffsetDateTime>,
+    /// 心跳租约的到期时刻（`lease_until` 列的哨兵 `0` 读成 `None` = 没租约）。
+    pub lease_until: Option<OffsetDateTime>,
     pub rounds: u32,
     pub model: ModelConfig,
     pub memory_work: MemoryWork,
@@ -47,14 +57,17 @@ impl RunRecord {
             request_key: RequestKey::new(row.request_key.clone()),
             input_hash: row.input_hash.clone(),
             input_event: row.input_event.clone().map(EventId::from_raw),
+            input_seq: Seq(row.input_seq.max(0) as u64),
             final_event: row.final_event.clone().map(EventId::from_raw),
-            status: decode(&format!("\"{}\"", row.status), "runs.status")?,
+            state: state_of(row)?,
+            wait: wait_of(row)?,
             source: decode(&row.source, "runs.source")?,
             peer: row.peer.clone(),
             claimed_by: row.claimed_by.clone(),
             claim_generation: row.claim_generation.max(0) as u64,
             retry_attempts: row.retry_attempts.max(0) as u32,
-            next_retry_at: crate::db::from_ts_opt(row.next_retry_at),
+            wake_at: crate::db::from_ts_opt(row.wake_at),
+            lease_until: crate::db::from_ts_opt(row.lease_until),
             rounds: row.rounds.max(0) as u32,
             model: decode(&row.model_snapshot, "runs.model_snapshot")?,
             memory_work: decode(&format!("\"{}\"", row.memory_work), "runs.memory_work")?,
@@ -78,17 +91,116 @@ pub struct NewRun {
     pub at: OffsetDateTime,
 }
 
-/// 一行的状态枚举。列里存的是 `snake_case` 字符串。
-pub fn status_of(row: &RunRow) -> Result<RunStatus, StoreError> {
-    decode(&format!("\"{}\"", row.status), "runs.status")
+/// 一行的调度状态。**认不出就是损坏**，不默认成 `queued`——那会让一条不该跑的 Run
+/// 被领走（`RunState::parse` 的同一句话）。
+pub fn state_of(row: &RunRow) -> Result<RunState, StoreError> {
+    RunState::parse(&row.state).ok_or_else(|| {
+        StoreError::Corrupt(format!(
+            "runs.state 认不出的值 {:?}（Run {}）：只认 accepted / queued / running / \
+             waiting / completed / failed / cancelled / abandoned",
+            row.state, row.id
+        ))
+    })
 }
 
-/// 把状态枚举写成列里的那个字符串。
-pub fn status_str(status: RunStatus) -> String {
-    serde_json::to_value(status)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .expect("RunStatus 序列化成一个字符串")
+/// 一行停在什么上（§8.4）。`wait_kind` 为空 = 不在等待。
+///
+/// **等待三列要自洽**：`wait_kind` 认不出、或者指到了具体对象却没写下 `wait_ref`，都是
+/// 损坏——把一条"在等什么说不清"的 Run 当正常读回去，正是这次改造要消掉的那种形状。
+pub fn wait_of(row: &RunRow) -> Result<Option<WaitReason>, StoreError> {
+    let Some(kind) = row.wait_kind.as_deref() else {
+        return Ok(None);
+    };
+    let reference = |what: &str| -> Result<String, StoreError> {
+        row.wait_ref.clone().ok_or_else(|| {
+            StoreError::Corrupt(format!(
+                "runs.wait_kind = {what} 却没有 runs.wait_ref（Run {}）",
+                row.id
+            ))
+        })
+    };
+    Ok(Some(match kind {
+        "approval" => WaitReason::Approval {
+            approval: ApprovalId::from_raw(reference("approval")?),
+        },
+        "intervention" => WaitReason::Intervention {
+            intervention: InterventionId::from_raw(reference("intervention")?),
+        },
+        "dependency" => WaitReason::Dependency {
+            run: RunId::from_raw(reference("dependency")?),
+        },
+        "retry" => WaitReason::Retry {
+            attempts: row.retry_attempts.max(0) as u32,
+            not_before: crate::db::from_ts(row.wake_at),
+            // 哪一种失败必须回写得出来：`WaitReason::Retry.cause` 是必填字段，
+            // 编一个默认值就是"替它猜"。见 [`wait_ref_str`]。
+            cause: row
+                .wait_ref
+                .as_deref()
+                .and_then(RetryCause::parse)
+                .ok_or_else(|| {
+                    StoreError::Corrupt(format!(
+                        "runs.wait_kind = retry 却没写下退避原因（runs.wait_ref = {:?}，Run {}）",
+                        row.wait_ref, row.id
+                    ))
+                })?,
+        },
+        other => {
+            return Err(StoreError::Corrupt(format!(
+                "runs.wait_kind 认不出的值 {other:?}（Run {}）：只认 approval / retry / \
+                 intervention / dependency",
+                row.id
+            )));
+        }
+    }))
+}
+
+/// 写进 `runs.state` 的那一段。
+pub fn state_str(state: RunState) -> String {
+    state.as_str().to_string()
+}
+
+/// 写进 `runs.wait_ref` 的那一段。
+///
+/// kernel 的 [`WaitReason::reference`] 对 `retry` 给 `None`（它认为退避的进度就是次数 +
+/// 到点时刻），但 [`WaitReason::Retry`] 的 `cause` 是必填字段：不回写它，读回来那条
+/// `WaitReason::Retry` 就少了"是哪一种失败"，而 `wait_of` 拒绝替它挑一个。所以 `retry`
+/// 把 `cause` 写进 `wait_ref`——`wait_of` 用 [`RetryCause::parse`] 认它。
+pub fn wait_ref_str(wait: &WaitReason) -> Option<String> {
+    match wait {
+        WaitReason::Retry { cause, .. } => Some(cause.as_str().to_string()),
+        other => other.reference(),
+    }
+}
+
+/// 把一条 Run 写进等待：状态、等待三列、重试计数、原因，与**交还领取权**同一个提交。
+///
+/// 交还领取权是这一条的一部分（§7.4「停在一条审批上，已释放执行名额」）：不清
+/// `claimed_by`，§8.7 的候选查询里那个 `claimed_by IS NULL` 永远筛不到这一行——审批答复
+/// 了、退避到期了，它也再没有人领得走，一个"等一会儿"就变成了永久停摆。
+async fn write_wait_in(
+    ex: &mut dyn Executor,
+    row: &mut RunRow,
+    wait: &WaitReason,
+    reason: Option<String>,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let retry_attempts = match wait {
+        WaitReason::Retry { attempts, .. } => i64::from(*attempts),
+        _ => row.retry_attempts,
+    };
+    row.update()
+        .state(state_str(wait.state()))
+        .wait_kind(Some(wait.kind().to_string()))
+        .wait_ref(wait_ref_str(wait))
+        .wake_at(wait.wake_at().map(to_ts).unwrap_or(0))
+        .retry_attempts(retry_attempts)
+        .claimed_by(None as Option<String>)
+        .last_error(reason)
+        .updated_at(to_ts(now))
+        .exec(ex)
+        .await
+        .map_err(map_toasty)
 }
 
 fn memory_work_str(work: MemoryWork) -> String {
@@ -98,7 +210,10 @@ fn memory_work_str(work: MemoryWork) -> String {
         .expect("MemoryWork 序列化成一个字符串")
 }
 
-/// 用请求键预留一个 Run，状态 `ingesting`，**只存输入哈希与来源**（§8.5 第一段箭头）。
+/// 用请求键预留一个 Run，状态 `accepted`，**只存输入哈希与来源**（§8.5 第一段箭头）。
+///
+/// `accepted` 不是"可以跑了"：输入正文可能还没写完，所以它**不可领取**。`mark_queued_in`
+/// 才是那一步。
 pub async fn reserve_in(ex: &mut dyn Executor, new: &NewRun) -> Result<RunRow, StoreError> {
     toasty::create!(RunRow {
         id: new.run.as_str(),
@@ -106,8 +221,16 @@ pub async fn reserve_in(ex: &mut dyn Executor, new: &NewRun) -> Result<RunRow, S
         request_key: new.request_key.as_str(),
         input_hash: new.input_hash.clone(),
         input_event: None as Option<String>,
+        // 受理那一步（[`mark_queued_in`]）才拿得到输入事件的 seq（§8.3）。
+        input_seq: 0_i64,
         final_event: None as Option<String>,
-        status: status_str(RunStatus::Ingesting),
+        // 退役列：不再读，写入给空值（§8.2 只允许加列）。
+        status: String::new(),
+        state: state_str(RunState::Accepted),
+        wait_kind: None as Option<String>,
+        wait_ref: None as Option<String>,
+        wake_at: 0_i64,
+        lease_until: 0_i64,
         source: encode(&new.source)?,
         peer: new.peer.clone(),
         claimed_by: None as Option<String>,
@@ -156,41 +279,141 @@ pub async fn get_in(ex: &mut dyn Executor, run: &RunId) -> Result<Option<RunRow>
 /// 只记下承载输入的事件，**不动状态**。
 ///
 /// 回放补索引用它：`run.accepted` 在日志里说明"输入已经完整落盘"，但这一行现在是
-/// `cancelled` 还是 `waiting_approval`，是数据库自己的事——「回放只补索引与派生执行状态，
+/// `cancelled` 还是停在等待上，是数据库自己的事——「回放只补索引与派生执行状态，
 /// 不能覆盖 state.db 已记录的用户取消或权限撤销」（§8.5）。
 pub async fn set_input_event_in(
     ex: &mut dyn Executor,
     run: &RunId,
     input_event: &EventId,
+    seq: Seq,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
     let mut row = require(ex, run).await?;
-    if row.input_event.as_deref() == Some(input_event.as_str()) {
+    let seq = i64::try_from(seq.0).unwrap_or(i64::MAX);
+    // 引用与 seq 一起补齐：老行（这次改造之前受理的）`input_seq` 是 0，而回放手里正好有
+    // 那条事件的 seq——不补，它的次序会一直退化到按 id 比（§8.3）。
+    if row.input_event.as_deref() == Some(input_event.as_str()) && row.input_seq == seq {
         return Ok(());
     }
     row.update()
         .input_event(Some(input_event.to_string()))
+        .input_seq(seq)
         .updated_at(to_ts(now))
         .exec(ex)
         .await
         .map_err(map_toasty)
 }
 
-/// 记下承载输入的事件，并把状态推成 `queued`——**这一步之后才能向客户端确认已接收**。
+/// 同 Session 内的次序键：`(input_seq, id)`。**seq 是权威**（§8.3），id 只在 seq 相同时
+/// 做次级比较（`input_seq = 0` 的老行）。
+pub fn order_key(row: &RunRow) -> (i64, String) {
+    (row.input_seq, row.id.clone())
+}
+
+/// 比 `key` 早的那些行里，**紧挨着的那一条还非终态的 Run**。
+///
+/// 这是"谁挡着谁"的**唯一一处实现**：受理判定、依赖放行都用它，§8.7 的领取语句用的是同一
+/// 条谓词（`earlier.input_seq < … OR (… AND earlier.id < …)` 且非终态）。选"紧挨着"而不是
+/// "最早那条"，是因为 `queued` 的定义是"现在就能跑、只缺 worker"：等最早那条结束还不够，
+/// 它后面可能还压着在跑的。
+///
+/// `exclude` 是"不要把自己算进去"的那个 id：受理那一刻，被受理那行的 `input_seq` 列还没写
+/// 进去（还是 0），拿它自己列的键比会把自己当成更早的一条。
+pub fn nearest_unfinished_predecessor(
+    rows: &[RunRow],
+    session: &str,
+    key: (i64, &str),
+    exclude: Option<&str>,
+) -> Result<Option<String>, StoreError> {
+    let mut nearest: Option<(i64, String)> = None;
+    for row in rows {
+        if row.session_id != session || exclude == Some(row.id.as_str()) {
+            continue;
+        }
+        let candidate = order_key(row);
+        if (candidate.0, candidate.1.as_str()) >= key {
+            continue;
+        }
+        if state_of(row)?.is_terminal() {
+            continue;
+        }
+        if nearest.as_ref().is_none_or(|current| candidate > *current) {
+            nearest = Some(candidate);
+        }
+    }
+    Ok(nearest.map(|(_, id)| id))
+}
+
+/// 受理：记下承载输入的事件与它的 `seq`，并把状态定成 **`queued` 或
+/// `waiting + dependency`**。
+///
+/// **次序在受理那一刻就定下来**（§8.4）：同一 Session 里更早的那条还没结束，这条新的就是
+/// `waiting + dependency`，句柄指向那条更早的 Run。`queued` 只是"现在就能跑、只缺 worker"
+/// ——先写 `queued`、再由调用方补一条 suspend 的两个写者之间，调度器（`claim` 随时可调）
+/// 能把它领走，那就**越过了前面那条未完成的 Run**：回放窗口会带着一个没有输出的
+/// `function_call` 发给模型，provider 直接 400。
+///
+/// **先后按 `(input_seq, id)` 比**，判据与 §8.7 领取语句里那句 `NOT EXISTS`、以及
+/// [`crate::repos::queue::release_satisfied_dependencies`] 的放行判据同源。次序的权威是
+/// 输入事件的 seq（§8.3），id 只在 seq 相同时做次级比较（`input_seq = 0` 的老行）。
 pub async fn mark_queued_in(
     ex: &mut dyn Executor,
     run: &RunId,
     input_event: &EventId,
+    seq: Seq,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
     let mut row = require(ex, run).await?;
-    row.update()
-        .input_event(Some(input_event.to_string()))
-        .status(status_str(RunStatus::Queued))
-        .updated_at(to_ts(now))
+    let (session_id, self_id) = (row.session_id.clone(), row.id.clone());
+    let self_key = (i64::try_from(seq.0).unwrap_or(i64::MAX), self_id.clone());
+
+    // 紧挨着的那一条：最大的、比它早的非终态 Run（判据见
+    // [`nearest_unfinished_predecessor`]）。只取这个会话的行（`runs_session` 索引），
+    // 别为了受理一条输入扫全表。
+    let rows = RunRow::filter(RunRow::fields().session_id().eq(session_id.as_str()))
         .exec(ex)
         .await
-        .map_err(map_toasty)
+        .map_err(map_toasty)?;
+    let predecessor = nearest_unfinished_predecessor(
+        &rows,
+        &session_id,
+        (self_key.0, self_key.1.as_str()),
+        Some(&self_id),
+    )?;
+
+    match predecessor {
+        Some(earlier) => {
+            row.update()
+                .input_event(Some(input_event.to_string()))
+                .input_seq(self_key.0)
+                .exec(ex)
+                .await
+                .map_err(map_toasty)?;
+            // 复用等待三列的唯一映射：`wait_ref` 就是那条更早的 Run ID。
+            write_wait_in(
+                ex,
+                &mut row,
+                &WaitReason::Dependency {
+                    run: RunId::from_raw(earlier),
+                },
+                None,
+                now,
+            )
+            .await
+        }
+        None => row
+            .update()
+            .input_event(Some(input_event.to_string()))
+            .input_seq(self_key.0)
+            .state(state_str(RunState::Queued))
+            .wait_kind(None as Option<String>)
+            .wait_ref(None as Option<String>)
+            .wake_at(0_i64)
+            .updated_at(to_ts(now))
+            .exec(ex)
+            .await
+            .map_err(map_toasty),
+    }
 }
 
 /// 某个执行实例开跑：确认领取代次仍是自己的，然后把状态坐实成 `running`。
@@ -218,7 +441,7 @@ pub async fn start_in(
         return Ok(Some(current));
     }
     row.update()
-        .status(status_str(RunStatus::Running))
+        .state(state_str(RunState::Running))
         .updated_at(to_ts(now))
         .exec(ex)
         .await
@@ -226,47 +449,38 @@ pub async fn start_in(
     Ok(None)
 }
 
-/// 让出执行名额时的状态提交（`waiting_approval` / `waiting_retry` / `needs_attention`）。
+/// 让出执行名额时的状态提交：`waiting` + **在等什么**（§8.4）。
 ///
-/// **一并把 `claimed_by` 清掉**：让出执行名额就是交还领取权（§7.4「停在一条审批上，已
-/// 释放执行名额」）。不清的话 §8.7 的候选查询里那个 `claimed_by IS NULL` 永远筛不到这
-/// 一行——等审批答复了、退避到期了，它也再没有人领得走，一个"等一会儿"就变成了永久
-/// 停摆。
+/// 状态与等待三列必须一起写：只有一个 `waiting` 而说不出在等谁，reconcile 与清单都
+/// 处置不了它。
 pub async fn mark_waiting_in(
     ex: &mut dyn Executor,
     run: &RunId,
-    status: RunStatus,
-    attempts: u32,
-    next_retry_at: Option<OffsetDateTime>,
+    wait: &WaitReason,
     reason: Option<String>,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
     let mut row = require(ex, run).await?;
-    row.update()
-        .status(status_str(status))
-        .claimed_by(None as Option<String>)
-        .retry_attempts(i64::from(attempts))
-        .next_retry_at(crate::db::to_ts_opt(next_retry_at))
-        .last_error(reason)
-        .updated_at(to_ts(now))
-        .exec(ex)
-        .await
-        .map_err(map_toasty)
+    write_wait_in(ex, &mut row, wait, reason, now).await
 }
 
 /// 终态，连同最终事件引用与 Memory 待处理标记（§8.5 的"结束任务"）。
 pub async fn mark_final_in(
     ex: &mut dyn Executor,
     run: &RunId,
-    status: RunStatus,
+    state: RunState,
     final_event: &EventId,
     rounds: u32,
     reason: Option<String>,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
+    debug_assert!(state.is_terminal(), "终态只能是那四个");
     let mut row = require(ex, run).await?;
     row.update()
-        .status(status_str(status))
+        .state(state_str(state))
+        .wait_kind(None as Option<String>)
+        .wait_ref(None as Option<String>)
+        .wake_at(0_i64)
         .final_event(Some(final_event.to_string()))
         .rounds(i64::from(rounds))
         .last_error(reason)
@@ -284,20 +498,23 @@ pub async fn mark_final_in(
 ///
 /// 走这条路的是「这个会话已经读不出来」（日志丢了 / 中间损坏）时的一次取消。取消是
 /// **调度事实**（§8.2 把会话内容与调度分开），它不产生会话内容，所以那条 `run.cancelled`
-/// 写不进去的时候不能整个失败——否则这条 Run 永远停在 `needs_attention` 上，§8.4 的
-/// 「操作者处理后 queued / cancelled」一条也走不通。`final_event` 留空：**没有**那一条
-/// 事件，不假装有。
+/// 写不进去的时候不能整个失败——否则这条 Run 永远停在等人判断上，§8.4 的「操作者处理后
+/// queued / cancelled」一条也走不通。`final_event` 留空：**没有**那一条事件，不假装有。
 pub async fn mark_final_without_event_in(
     ex: &mut dyn Executor,
     run: &RunId,
-    status: RunStatus,
+    state: RunState,
     rounds: u32,
     reason: Option<String>,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
+    debug_assert!(state.is_terminal(), "终态只能是那四个");
     let mut row = require(ex, run).await?;
     row.update()
-        .status(status_str(status))
+        .state(state_str(state))
+        .wait_kind(None as Option<String>)
+        .wait_ref(None as Option<String>)
+        .wake_at(0_i64)
         .rounds(i64::from(rounds))
         .last_error(reason)
         .memory_work(memory_work_str(MemoryWork::Pending))
@@ -314,7 +531,7 @@ pub async fn stop_without_event(
     db: &Db,
     session: &SessionId,
     run: &RunId,
-    status: RunStatus,
+    state: RunState,
     reason: Option<String>,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
@@ -326,8 +543,8 @@ pub async fn stop_without_event(
                 .await?
                 .map(|row| row.rounds.max(0) as u32)
                 .unwrap_or(0);
-            mark_final_without_event_in(ex, &run, status, rounds, reason, now).await?;
-            if status.is_terminal() {
+            mark_final_without_event_in(ex, &run, state, rounds, reason, now).await?;
+            if state.is_terminal() {
                 crate::repos::session::set_current_run_in(ex, &session, None, now).await?;
             }
             Ok(())
@@ -396,7 +613,7 @@ pub async fn unfinished(db: &Db) -> Result<Vec<RunRecord>, StoreError> {
             let mut out = Vec::new();
             for row in &rows {
                 let record = RunRecord::try_from_row(row)?;
-                if record.status.is_unfinished() {
+                if record.state.is_unfinished() {
                     out.push(record);
                 }
             }
@@ -426,7 +643,7 @@ pub async fn terminal_undelivered(
                     continue;
                 }
                 let record = RunRecord::try_from_row(row)?;
-                if record.status.is_terminal() {
+                if record.state.is_terminal() {
                     out.push(record);
                 }
             }
@@ -457,8 +674,7 @@ pub async fn claim_memory_work(db: &Db, limit: usize) -> Result<Vec<RunRecord>, 
             let rows = RunRow::all().exec(ex).await.map_err(map_toasty)?;
             let mut candidates: Vec<RunRow> = Vec::new();
             for row in rows {
-                let status = status_of(&row)?;
-                if !status.is_terminal() {
+                if !state_of(&row)?.is_terminal() {
                     continue;
                 }
                 if row.memory_work != memory_work_str(MemoryWork::Pending) {

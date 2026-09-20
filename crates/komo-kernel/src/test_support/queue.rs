@@ -20,6 +20,8 @@ pub struct MemRunQueue {
 struct QueueState {
     queued: Vec<RunId>,
     generations: BTreeMap<RunId, u64>,
+    /// 租约到期时刻（§8.7）。替身只记下来给测试断言，不做回收。
+    leases: BTreeMap<RunId, time::OffsetDateTime>,
 }
 
 impl MemRunQueue {
@@ -82,6 +84,21 @@ impl RunQueue for MemRunQueue {
             state.queued.push(claimed.run.clone());
         }
         Ok(())
+    }
+
+    async fn renew(
+        &self,
+        claimed: &Claimed,
+        _executor: &ExecutorId,
+        until: time::OffsetDateTime,
+    ) -> Result<bool, StoreError> {
+        let mut state = self.state.lock().expect("队列");
+        // 代次围栏与状态提交同源：代次不对就是"这个 Run 已经不是自己的了"。
+        let mine = state.generations.get(&claimed.run) == Some(&claimed.generation);
+        if mine {
+            state.leases.insert(claimed.run.clone(), until);
+        }
+        Ok(mine)
     }
 }
 

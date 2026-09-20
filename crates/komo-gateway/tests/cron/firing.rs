@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use komo_kernel::cron::FiringStatus;
 use komo_kernel::traits::LlmClient;
+use komo_kernel::types::status::WaitReason;
 
 use crate::harness::*;
 
@@ -39,7 +40,7 @@ async fn a_restart_does_not_create_the_same_firing_twice() {
     let first = gw.tick().await;
     assert_eq!(first.fired.len(), 1, "{first:?}");
     let run = first.fired[0].run.clone();
-    gw.wait_status(&run, |s| s.is_terminal(), "终态").await;
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
     gw.stop().await;
 
     let firings_before = {
@@ -104,12 +105,11 @@ async fn an_overlapping_slot_is_skipped_and_leaves_a_trace() {
     gw.make_due(&job.id).await;
     let first = gw.tick().await;
     assert_eq!(first.fired.len(), 1);
-    gw.wait_status(
-        &first.fired[0].run,
-        |s| s == komo_kernel::types::status::RunStatus::WaitingApproval,
-        "等待审批",
-    )
-    .await;
+    let wait = gw.wait_waiting(&first.fired[0].run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "「还没结束」就是这条：停在等审批上：{wait:?}"
+    );
 
     // 下一槽到了，而上一次还在等人。
     gw.make_due(&job.id).await;
@@ -150,12 +150,11 @@ async fn an_allow_policy_fires_even_when_the_last_one_is_still_waiting() {
 
     gw.make_due(&job.id).await;
     let first = gw.tick().await;
-    gw.wait_status(
-        &first.fired[0].run,
-        |s| s == komo_kernel::types::status::RunStatus::WaitingApproval,
-        "等待审批",
-    )
-    .await;
+    let wait = gw.wait_waiting(&first.fired[0].run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "停在等审批上：{wait:?}"
+    );
 
     gw.make_due(&job.id).await;
     let second = gw.tick().await;
@@ -188,7 +187,7 @@ async fn the_list_shows_the_last_firing_and_the_next_slot() {
     let tick = gw.tick().await;
     let run = tick.fired[0].run.clone();
     let session = tick.fired[0].session.clone();
-    gw.wait_status(&run, |s| s.is_terminal(), "终态").await;
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
 
     // 「更新本次触发状态」：盯梢把它记成了 ok。
     eventually("触发状态记成 ok", || true).await;

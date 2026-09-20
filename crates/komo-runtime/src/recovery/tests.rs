@@ -17,7 +17,7 @@ use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::refs::{
     AttemptRef, ContentRef, OutputRef, ToolResultBody, ToolResultStatus,
 };
-use komo_kernel::types::status::{RunEnd, Wait};
+use komo_kernel::types::status::{RetryCause, RunEnd, RunState, SessionState, WaitReason};
 use komo_kernel::types::turn::{AcceptInput, AssistantRound, ToolCallRequest};
 use time::macros::datetime;
 
@@ -58,6 +58,10 @@ fn corrupt_runs_in_one_session_form_one_operator_notification_group() {
 struct MemIndex {
     runs: Mutex<Vec<UnfinishedRun>>,
     state: Mutex<IndexState>,
+    /// `sessions.state`（§8.10）。默认是一处世外桃源：`active` 且内容在。
+    session: Mutex<Option<SessionState>>,
+    /// 内容在不在（§8.9）。默认在；要验"内容缺失而状态没说不服务"就把它设成 `false`。
+    content: Mutex<bool>,
 }
 
 #[derive(Debug, Default)]
@@ -76,7 +80,20 @@ impl MemIndex {
                 reclaimed: 1,
                 ..Default::default()
             }),
+            // §8.9 的默认观察：会话在服务范围里、内容也在。`None` = 连会话行都不在了。
+            session: Mutex::new(Some(SessionState::Active)),
+            content: Mutex::new(true),
         })
+    }
+
+    /// `sessions.state` 这一列（§8.10）。`None` = 那一行都没了。
+    fn set_session_state(&self, state: Option<SessionState>) {
+        *self.session.lock().unwrap() = state;
+    }
+
+    /// 内容在不在（§8.9 的第二个问题）：`false` = 目录/日志读不出来。
+    fn set_session_content(&self, available: bool) {
+        *self.content.lock().unwrap() = available;
     }
 
     fn requeued(&self) -> Vec<RunId> {
@@ -119,6 +136,17 @@ impl RecoveryIndex for MemIndex {
             .attention
             .push((run.clone(), reason.to_string()));
         Ok(())
+    }
+
+    async fn session_state(
+        &self,
+        _session: &SessionId,
+    ) -> Result<Option<SessionState>, StoreError> {
+        Ok(*self.session.lock().unwrap())
+    }
+
+    async fn session_content(&self, _session: &SessionId) -> Result<bool, StoreError> {
+        Ok(*self.content.lock().unwrap())
     }
 }
 
@@ -211,7 +239,7 @@ impl Ledger for PoisonedLedger {
         }
         self.inner.finish_call(attempt, published).await
     }
-    async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError> {
+    async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
         self.inner.suspend(run, wait).await
     }
     async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError> {
@@ -382,19 +410,26 @@ impl World {
         plan
     }
 
-    fn run_row(&self, run: &RunId, status: RunStatus) -> UnfinishedRun {
-        self.run_row_in(run, &self.session, status)
+    fn run_row(&self, run: &RunId, state: RunState) -> UnfinishedRun {
+        self.run_row_in(run, &self.session, state)
     }
 
-    fn run_row_in(&self, run: &RunId, session: &SessionId, status: RunStatus) -> UnfinishedRun {
+    fn run_row_in(&self, run: &RunId, session: &SessionId, state: RunState) -> UnfinishedRun {
         UnfinishedRun {
             run: run.clone(),
             session: session.clone(),
-            status,
+            state,
+            wait: None,
             claimed_by: None,
-            retry: None,
             result_delivered: false,
         }
+    }
+
+    /// 停在某个外部条件上的 Run（§8.4：状态只有一个 `waiting`，理由在 `WaitReason`）。
+    fn waiting_row(&self, run: &RunId, wait: WaitReason) -> UnfinishedRun {
+        let mut row = self.run_row(run, RunState::Waiting);
+        row.wait = Some(wait);
+        row
     }
 
     fn scan(&self, rows: Vec<UnfinishedRun>) -> (RecoveryScan, Arc<MemIndex>) {
@@ -481,7 +516,7 @@ impl World {
 async fn row_1_input_persisted_but_the_run_never_started() {
     let world = World::new();
     let run = world.accept().await;
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::Ingesting)]);
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Accepted)]);
 
     let report = scan.scan().await.unwrap();
     assert_eq!(
@@ -499,7 +534,7 @@ async fn row_1_input_persisted_but_the_run_never_started() {
 async fn row_2_only_the_id_was_reserved() {
     let world = World::new();
     let run = RunId::from_raw("run-ghost");
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::Ingesting)]);
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Accepted)]);
 
     let report = scan.scan().await.unwrap();
     assert_eq!(report.outcomes[0].action, RecoveryAction::AwaitResend);
@@ -519,7 +554,7 @@ async fn row_3_the_model_reply_never_arrived_in_full() {
         .await
         .unwrap();
 
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::Running)]);
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Running)]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
         report.outcomes[0].action,
@@ -535,7 +570,7 @@ async fn row_4_the_round_is_persisted_and_nothing_is_left_unfinished() {
     let run = world.accept().await;
     world.round(&run, &[]).await;
 
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::Interrupted)]);
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Running)]);
     let report = scan.scan().await.unwrap();
     assert_eq!(report.outcomes[0].action, RecoveryAction::ResumeFromPlan);
     assert_eq!(index.requeued(), vec![run]);
@@ -581,7 +616,7 @@ async fn row_5_the_result_is_on_disk_and_verified_while_the_database_lags() {
         .unwrap();
     world.ledger.finish_call(&attempt, published).await.unwrap();
 
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::Running)]);
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Running)]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
         report.outcomes[0].action,
@@ -601,7 +636,7 @@ async fn row_6_the_call_is_planned_and_certainly_never_ran() {
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
 
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::Interrupted)]);
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Running)]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
         report.outcomes[0].action,
@@ -627,7 +662,7 @@ async fn row_7_the_call_started_and_left_no_result() {
         .await
         .unwrap();
 
-    let (scan, _index) = world.scan(vec![world.run_row(&run, RunStatus::Interrupted)]);
+    let (scan, _index) = world.scan(vec![world.run_row(&run, RunState::Running)]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
         report.outcomes[0].action,
@@ -650,10 +685,8 @@ async fn row_8_waiting_on_an_approval() {
         .ledger
         .suspend(
             &run,
-            Wait::Approval {
+            WaitReason::Approval {
                 approval: approval.clone(),
-                call: None,
-                attempt: None,
             },
         )
         .await
@@ -664,16 +697,23 @@ async fn row_8_waiting_on_an_approval() {
         .await
         .unwrap();
 
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::WaitingApproval)]);
+    let (scan, index) = world.scan(vec![world.waiting_row(
+        &run,
+        WaitReason::Approval {
+            approval: approval.clone(),
+        },
+    )]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
         report.outcomes[0].action,
-        RecoveryAction::KeepWaitingApproval {
-            approval: approval.clone()
+        RecoveryAction::KeepWaiting {
+            reason: WaitReason::Approval {
+                approval: approval.clone()
+            }
         }
     );
     assert!(index.requeued().is_empty());
-    assert_eq!(report.summary(), "1 个等待审批或重试");
+    assert_eq!(report.summary(), "1 个在等待（审批 / 干预 / 退避）");
 
     // (b) 答了，而且还有效。
     let world = World::new();
@@ -682,10 +722,8 @@ async fn row_8_waiting_on_an_approval() {
         .ledger
         .suspend(
             &run,
-            Wait::Approval {
+            WaitReason::Approval {
                 approval: approval.clone(),
-                call: None,
-                attempt: None,
             },
         )
         .await
@@ -708,7 +746,12 @@ async fn row_8_waiting_on_an_approval() {
         .await
         .unwrap();
 
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::WaitingApproval)]);
+    let (scan, index) = world.scan(vec![world.waiting_row(
+        &run,
+        WaitReason::Approval {
+            approval: approval.clone(),
+        },
+    )]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
         report.outcomes[0].action,
@@ -727,10 +770,8 @@ async fn row_8_waiting_on_an_approval() {
         .ledger
         .suspend(
             &run,
-            Wait::Approval {
+            WaitReason::Approval {
                 approval: approval.clone(),
-                call: None,
-                attempt: None,
             },
         )
         .await
@@ -751,12 +792,17 @@ async fn row_8_waiting_on_an_approval() {
     expired.valid_until = Some(NOW - time::Duration::hours(1));
     world.approvals.create(expired).await.unwrap();
 
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::WaitingApproval)]);
+    let (scan, index) = world.scan(vec![world.waiting_row(
+        &run,
+        WaitReason::Approval {
+            approval: approval.clone(),
+        },
+    )]);
     let report = scan.scan().await.unwrap();
     assert!(
         matches!(
             report.outcomes[0].action,
-            RecoveryAction::NeedsAttention { .. }
+            RecoveryAction::WaitingForOperator { .. }
         ),
         "{:?}",
         report.outcomes[0]
@@ -773,18 +819,21 @@ async fn an_approval_the_database_lost_asks_the_operator_again() {
         .ledger
         .suspend(
             &run,
-            Wait::Approval {
+            WaitReason::Approval {
                 approval: ApprovalId::from_raw("ap-gone"),
-                call: None,
-                attempt: None,
             },
         )
         .await
         .unwrap();
 
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::WaitingApproval)]);
+    let (scan, index) = world.scan(vec![world.waiting_row(
+        &run,
+        WaitReason::Approval {
+            approval: ApprovalId::from_raw("ap-gone"),
+        },
+    )]);
     let report = scan.scan().await.unwrap();
-    let RecoveryAction::NeedsAttention { reason } = &report.outcomes[0].action else {
+    let RecoveryAction::WaitingForOperator { reason } = &report.outcomes[0].action else {
         panic!("{:?}", report.outcomes[0])
     };
     assert!(reason.contains("审计副本"), "{reason}");
@@ -801,21 +850,25 @@ async fn row_9_waiting_for_a_backoff_to_expire() {
         .ledger
         .suspend(
             &run,
-            Wait::Retry {
+            WaitReason::Retry {
                 attempts: 2,
-                next_retry_at: at,
-                reason: "连接被拒".into(),
+                not_before: at,
+                cause: RetryCause::Transport,
             },
         )
         .await
         .unwrap();
 
-    let mut row = world.run_row(&run, RunStatus::WaitingRetry);
-    row.retry = Some(RetryObservation {
-        attempts: 2,
-        next_retry_at: at,
-        exhausted: false,
-    });
+    // 次数与到点时刻现在就在 `WaitReason::Retry` 里——**没有一个平行的 `retry` 观察**，
+    // 所以"重启不重置预算"这件事只有一个来源可读。
+    let row = world.waiting_row(
+        &run,
+        WaitReason::Retry {
+            attempts: 2,
+            not_before: at,
+            cause: RetryCause::Transport,
+        },
+    );
     let (scan, index) = world.scan(vec![row]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
@@ -823,6 +876,11 @@ async fn row_9_waiting_for_a_backoff_to_expire() {
         RecoveryAction::WaitUntilRetry { at, attempts: 2 }
     );
     assert!(index.requeued().is_empty());
+    assert_eq!(
+        report.outcomes[0].applied,
+        Applied::LeftAsIs,
+        "到点之前原样不动"
+    );
 }
 
 /// 第 10 行：结果已保存但客户端没收到 → 补发或补读，**不重新执行任务**。
@@ -843,7 +901,7 @@ async fn row_10_the_result_is_final_but_the_client_never_saw_it() {
         .await
         .unwrap();
 
-    let mut row = world.run_row(&run, RunStatus::Completed);
+    let mut row = world.run_row(&run, RunState::Completed);
     row.result_delivered = false;
     let (scan, index) = world.scan(vec![row]);
     let report = scan.scan().await.unwrap();
@@ -857,38 +915,178 @@ async fn row_10_the_result_is_final_but_the_client_never_saw_it() {
 /// 第 11 行：终态就保持终态，不因重启自动开启新一轮。
 #[tokio::test]
 async fn row_11_a_terminal_run_stays_terminal() {
-    for (status, end) in [
+    for (state, end) in [
         (
-            RunStatus::Completed,
+            RunState::Completed,
             RunEnd::Completed {
                 final_message: None,
                 rounds: 1,
             },
         ),
         (
-            RunStatus::Failed,
+            RunState::Failed,
             RunEnd::Failed {
                 reason: "模型不可用".into(),
             },
         ),
-        (RunStatus::Cancelled, RunEnd::Cancelled { by: None }),
+        (RunState::Cancelled, RunEnd::Cancelled { by: None }),
     ] {
         let world = World::new();
         let run = world.accept().await;
         world.ledger.complete(&run, end).await.unwrap();
 
-        let mut row = world.run_row(&run, status);
+        let mut row = world.run_row(&run, state);
         row.result_delivered = true;
         let (scan, index) = world.scan(vec![row]);
         let report = scan.scan().await.unwrap();
 
         assert_eq!(
             report.outcomes[0].action,
-            RecoveryAction::KeepTerminal { status },
-            "{status:?}"
+            RecoveryAction::KeepTerminal { state },
+            "{state:?}"
         );
-        assert!(index.requeued().is_empty(), "{status:?}");
+        assert!(index.requeued().is_empty(), "{state:?}");
     }
+}
+
+/// 第 11 行的另一半：操作者放弃（`abandoned`）也是终态，重启不给它开第二轮（§7.5）。
+#[tokio::test]
+async fn an_abandoned_run_stays_terminal_too() {
+    let world = World::new();
+    let run = world.accept().await;
+    // 放弃走网关那条 `Ledger::complete(RunEnd::Abandoned { .. })`——与取消分开记，
+    // 事后统计"多少人放弃了什么"才有意义（§8.4）。
+    world
+        .ledger
+        .complete(
+            &run,
+            RunEnd::Abandoned {
+                by: None,
+                reason: Some("查过了，不追究".into()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut row = world.run_row(&run, RunState::Abandoned);
+    row.result_delivered = true;
+    let (scan, index) = world.scan(vec![row]);
+    let report = scan.scan().await.unwrap();
+    assert_eq!(
+        report.outcomes[0].action,
+        RecoveryAction::KeepTerminal {
+            state: RunState::Abandoned
+        }
+    );
+    assert_eq!(report.outcomes[0].applied, Applied::LeftAsIs);
+    assert!(index.requeued().is_empty(), "不因重启自动开启新一轮");
+}
+
+/// 等前一条 Run 的那一条：**原样不动**。放它出来是 reconcile 的事（前一条进终态时由
+/// `wait_kind = 'dependency'` 那条 UPDATE 机械放行），恢复扫描不替它判（§8.4、§8.9）。
+#[tokio::test]
+async fn a_dependency_wait_is_left_alone_for_the_reconciler() {
+    let world = World::new();
+    let run = world.accept().await;
+    let earlier = RunId::from_raw("run-earlier");
+    let row = world.waiting_row(
+        &run,
+        WaitReason::Dependency {
+            run: earlier.clone(),
+        },
+    );
+
+    let (scan, index) = world.scan(vec![row]);
+    let report = scan.scan().await.unwrap();
+    assert_eq!(
+        report.outcomes[0].action,
+        RecoveryAction::KeepWaiting {
+            reason: WaitReason::Dependency { run: earlier }
+        },
+        "状态是 waiting，理由也说得出来在等谁"
+    );
+    assert_eq!(report.outcomes[0].applied, Applied::LeftAsIs);
+    assert!(index.requeued().is_empty());
+    assert!(index.attention().is_empty(), "等前一条 Run 不是在等人");
+}
+
+/// 验收口径的反面：状态说 `waiting` 却说不清在等什么——**这是损坏，不是"没关系"**。
+/// 恢复扫描不替它编一个理由，把它停到人那里（§8.4）。
+#[tokio::test]
+async fn a_waiting_run_that_cannot_say_what_it_waits_for_goes_to_a_human() {
+    let world = World::new();
+    let run = world.accept().await;
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Waiting)]);
+
+    let report = scan.scan().await.unwrap();
+    let RecoveryAction::WaitingForOperator { reason } = &report.outcomes[0].action else {
+        panic!("{:?}", report.outcomes[0])
+    };
+    assert!(reason.contains("却没有记录在等什么"), "{reason}");
+    assert!(index.requeued().is_empty(), "不许凭空造一个理由再放它去跑");
+}
+
+/// §8.9 的第一问：这个会话还在服务范围里吗。不在 → **不许领**，停成
+/// `waiting + intervention`，理由说清是哪一种（会话已删 / 内容缺失）。
+#[tokio::test]
+async fn a_session_outside_the_serving_range_stops_the_run_for_the_operator() {
+    for (observed, expected) in [
+        (Some(SessionState::Deleted), "逻辑删除"),
+        (Some(SessionState::Purged), "回收"),
+        // 连会话行都不在了：数据库与内容对不上，同样不许按空上下文继续。
+        (None, "回收"),
+    ] {
+        let world = World::new();
+        let run = world.accept().await;
+        let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Accepted)]);
+        index.set_session_state(observed);
+
+        let report = scan.scan().await.unwrap();
+        let RecoveryAction::WaitingForOperator { reason } = &report.outcomes[0].action else {
+            panic!("{:?}", report.outcomes[0])
+        };
+        assert!(reason.contains(expected), "{observed:?}：{reason}");
+        assert_eq!(report.outcomes[0].applied, Applied::NeedsOperator);
+        assert_eq!(index.attention().len(), 1, "{observed:?}");
+        assert!(
+            index.requeued().is_empty(),
+            "一个不服务的会话不许被领走（{observed:?}）"
+        );
+    }
+}
+
+/// §8.9 的第二个问题单独成一条：**内容读不出来，而会话状态没说"不服务"**。
+///
+/// 这一条钉的是"内容在不在"为什么得是**独立于 `read` 的一问**：`Ledger::read` 对缺失的
+/// 内容返回空列表（新会话本来就该是空的，`GET /v1/sessions/{id}/events` 依赖它），所以
+/// 拿"读回来没报错"顶替的话，内容缺失永远判不出来——这条 Run 会被当成"内容在"，然后
+/// 按空上下文继续一轮。
+#[tokio::test]
+async fn missing_content_stops_the_run_even_while_the_session_says_active() {
+    let world = World::new();
+    let run = world.accept().await;
+    let (scan, index) = world.scan(vec![world.waiting_row(
+        &run,
+        WaitReason::Retry {
+            attempts: 1,
+            not_before: NOW + time::Duration::seconds(30),
+            cause: RetryCause::Transport,
+        },
+    )]);
+    index.set_session_state(Some(SessionState::Active));
+    index.set_session_content(false);
+
+    let report = scan.scan().await.unwrap();
+    let RecoveryAction::WaitingForOperator { reason } = &report.outcomes[0].action else {
+        panic!("{:?}", report.outcomes[0]);
+    };
+    assert!(reason.contains("内容"), "{reason}");
+    assert_eq!(report.outcomes[0].applied, Applied::NeedsOperator);
+    assert_eq!(index.attention().len(), 1);
+    assert!(
+        index.requeued().is_empty(),
+        "内容缺失不许按空上下文继续（§8.9）"
+    );
 }
 
 /// 表外：用户取消过的 Run，哪怕日志里还留着没跑完的调用，也不复活。
@@ -905,14 +1103,14 @@ async fn a_cancelled_run_is_not_revived_even_with_work_left_in_the_log() {
         .await
         .unwrap();
 
-    let mut row = world.run_row(&run, RunStatus::Cancelled);
+    let mut row = world.run_row(&run, RunState::Cancelled);
     row.result_delivered = true;
     let (scan, index) = world.scan(vec![row]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
         report.outcomes[0].action,
         RecoveryAction::KeepTerminal {
-            status: RunStatus::Cancelled
+            state: RunState::Cancelled
         }
     );
     assert!(index.requeued().is_empty());
@@ -943,7 +1141,7 @@ async fn a_missing_output_body_stops_the_task_instead_of_rerunning_it() {
     let (scan, index) = world.scan_with(
         Arc::clone(&world.ledger) as Arc<dyn Ledger>,
         Arc::new(LostOutputs),
-        vec![world.run_row(&run, RunStatus::Running)],
+        vec![world.run_row(&run, RunState::Running)],
         true,
     );
     let report = scan.scan().await.unwrap();
@@ -1000,7 +1198,7 @@ async fn an_altered_output_body_stops_the_task_too() {
     published.output.0.hash = komo_kernel::types::digest::ContentHash::of_str("别的内容");
     world.ledger.finish_call(&attempt, published).await.unwrap();
 
-    let (scan, _index) = world.scan(vec![world.run_row(&run, RunStatus::Running)]);
+    let (scan, _index) = world.scan(vec![world.run_row(&run, RunState::Running)]);
     let report = scan.scan().await.unwrap();
     assert!(
         matches!(
@@ -1021,7 +1219,7 @@ async fn a_surviving_previous_executor_blocks_a_second_start() {
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
 
-    let mut row = world.run_row(&run, RunStatus::Interrupted);
+    let mut row = world.run_row(&run, RunState::Running);
     row.claimed_by = Some(ExecutorId::from_raw("exec-old"));
     let (scan, index) = world.scan_with(
         Arc::clone(&world.ledger) as Arc<dyn Ledger>,
@@ -1033,7 +1231,7 @@ async fn a_surviving_previous_executor_blocks_a_second_start() {
     assert!(
         matches!(
             report.outcomes[0].action,
-            RecoveryAction::NeedsAttention { .. }
+            RecoveryAction::WaitingForOperator { .. }
         ),
         "{:?}",
         report.outcomes[0]
@@ -1046,7 +1244,7 @@ async fn a_surviving_previous_executor_blocks_a_second_start() {
 async fn the_scan_reclaims_before_it_decides() {
     let world = World::new();
     let run = world.accept().await;
-    let (scan, _index) = world.scan(vec![world.run_row(&run, RunStatus::Ingesting)]);
+    let (scan, _index) = world.scan(vec![world.run_row(&run, RunState::Accepted)]);
     let report = scan.scan().await.unwrap();
     assert_eq!(report.reclaimed, 1);
     assert_eq!(report.outcomes.len(), 1);
@@ -1121,8 +1319,8 @@ async fn a_corrupt_session_stops_itself_and_the_others_are_still_judged() {
         Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
         Arc::new(NoOrphanLookup),
         vec![
-            world.run_row_in(&broken, &broken_session, RunStatus::Interrupted),
-            world.run_row_in(&healthy, &healthy_session, RunStatus::Ingesting),
+            world.run_row_in(&broken, &broken_session, RunState::Running),
+            world.run_row_in(&healthy, &healthy_session, RunState::Accepted),
         ],
         true,
     );
@@ -1169,8 +1367,8 @@ async fn a_corrupt_session_never_fails_the_whole_scan() {
         Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
         Arc::new(NoOrphanLookup),
         vec![
-            world.run_row(&healthy, RunStatus::Ingesting),
-            world.run_row_in(&broken, &broken_session, RunStatus::Running),
+            world.run_row(&healthy, RunState::Accepted),
+            world.run_row_in(&broken, &broken_session, RunState::Running),
         ],
         true,
     );
@@ -1214,7 +1412,7 @@ async fn an_orphan_output_is_verified_and_its_result_is_backfilled() {
         Arc::clone(&world.ledger) as Arc<dyn Ledger>,
         Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
         orphans,
-        vec![world.run_row(&run, RunStatus::Interrupted)],
+        vec![world.run_row(&run, RunState::Running)],
         true,
     );
 
@@ -1273,7 +1471,7 @@ async fn an_output_from_another_attempt_is_corruption_not_evidence() {
         Arc::clone(&world.ledger) as Arc<dyn Ledger>,
         Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
         orphans,
-        vec![world.run_row(&run, RunStatus::Interrupted)],
+        vec![world.run_row(&run, RunState::Running)],
         true,
     );
 
@@ -1304,7 +1502,7 @@ async fn without_an_orphan_output_the_call_still_goes_to_the_tools_own_verify() 
         .await
         .unwrap();
 
-    let (scan, index) = world.scan(vec![world.run_row(&run, RunStatus::Interrupted)]);
+    let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Running)]);
     let report = scan.scan().await.unwrap();
 
     assert_eq!(
@@ -1372,7 +1570,7 @@ async fn a_backfill_that_cannot_be_written_falls_back_to_the_tools_verify() {
         PoisonedLedger::unroutable(Arc::clone(&world.ledger)),
         Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
         orphans,
-        vec![world.run_row(&run, RunStatus::Interrupted)],
+        vec![world.run_row(&run, RunState::Running)],
         true,
     );
 

@@ -18,14 +18,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::protocol::http::{
-    ApprovalBatchDecisionResponse, ApprovalRecord, EventPage, ModelMenuEntry, PendingItem,
-    ResumeResponse, SessionDetail, SubmitRunResponse,
+    ApprovalRecord, EventPage, InterventionAnswerResponse, InterventionBatchAnswerResponse,
+    InterventionKind, InterventionSummary, InterventionVerdict, ModelMenuEntry, ResumeResponse,
+    SessionDetail, SubmitRunResponse,
 };
 use komo_kernel::protocol::sse::SseFrame;
 use komo_kernel::types::chat::ApprovalScope;
 use komo_kernel::types::ids::{ApprovalId, RequestKey, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::model::{Effort, EffortSetting};
-use komo_kernel::types::status::{RunStatus, ToolCallState};
+use komo_kernel::types::status::{RetryCause, RunState, ToolCallState, WaitReason};
 use time::OffsetDateTime;
 
 use crate::sse::ConnectionState;
@@ -92,22 +93,18 @@ pub enum ServerEvent {
         reason: String,
     },
     Connection(ConnectionState),
-    /// `GET /v1/approvals/{id}` 的结果。
+    /// `GET /v1/interventions/{handle}` 拿回来的那一条审批的详情。
     Approval(Box<ApprovalRecord>),
-    /// `POST /v1/approvals/{id}/decision` 的回执。
-    ApprovalSettled {
-        approval: ApprovalId,
-        approved: bool,
-        already_decided: bool,
-    },
-    /// `POST /v1/approvals/decisions` 的回执（一批）。
-    BatchSettled(Box<ApprovalBatchDecisionResponse>),
+    /// `POST /v1/interventions/{handle}/answer` 的回执。
+    Answered(Box<InterventionAnswerResponse>),
+    /// `POST /v1/interventions/answers` 的回执（一批）。
+    BatchAnswered(Box<InterventionBatchAnswerResponse>),
     /// `POST /v1/sessions/{id}/resume` 的结果（§8.8 的「2 个任务已接续，1 个等待审批」）。
     Resumed(Box<ResumeResponse>),
     /// `GET /v1/sessions/{id}` 的结果。
     Status(Box<SessionDetail>),
-    /// 待处理审批清单。
-    Pending(Vec<ApprovalRecord>),
+    /// 待处理清单（§7.5）：审批、结果不明、阻塞三类一起。
+    Pending(Vec<InterventionSummary>),
     /// `GET /v1/models` 的结果。
     ModelMenu(Vec<ModelMenuEntry>),
     /// 一次操作失败。
@@ -142,16 +139,18 @@ pub enum Effect {
     },
     /// `/new`。
     Boundary,
-    FetchApproval(ApprovalId),
-    Decide {
-        approval: ApprovalId,
-        approved: bool,
-        scope: ApprovalScope,
+    /// `GET /v1/interventions/{handle}`：打开审批弹窗要的那一份详情。句柄就是短 ID。
+    FetchApproval(String),
+    /// 答一条（§7.5）：结论按种类分派，`scope` 只有 `approve` 用得上。
+    Answer {
+        handle: String,
+        verdict: InterventionVerdict,
+        scope: Option<ApprovalScope>,
         request_key: RequestKey,
     },
-    /// 一次答一批（§11.3 的 `/approve all`）：名单由状态机列出，各按本次调用。
-    DecideMany {
-        approvals: Vec<ApprovalId>,
+    /// 一次答一批（§11.3 的 `/approve all`）：名单由状态机列出，**只含审批**，各按本次调用。
+    AnswerMany {
+        handles: Vec<String>,
         approved: bool,
         request_key: RequestKey,
     },
@@ -286,21 +285,24 @@ pub struct App {
     /// Enter 后立即显示；收到同一 `request_key` 的 `run.accepted` 后移除。
     pub pending_submissions: Vec<PendingSubmission>,
     pub approval: Option<ApprovalModal>,
-    /// **待处理审批的权威清单**（`GET /v1/approvals` 那一份，按 id）。
+    /// **待处理 Intervention 的权威清单**（`GET /v1/interventions` 那一份，按句柄）。
     ///
-    /// 不从本会话的事件折：审批可以属于**别的会话**——定时任务那条、聊天里那条、别的
-    /// TUI 里开的那个——而操作者问的是"现在有谁在等我"。折出来的那份只覆盖本会话，
-    /// 于是"打开 TUI 一条待审批也看不到"和"`/approve all` 说没有待处理、而 `/pending`
-    /// 列着三条"会同时成立。
+    /// 三类一起装：审批、结果不明、阻塞（§7.5）。不从本会话的事件折：待处理可以属于
+    /// **别的会话**——定时任务那条、聊天里那条、别的 TUI 里开的那个——而操作者问的是
+    /// "现在有谁在等我"。折出来的那份只覆盖本会话，于是"打开 TUI 一条也看不到"和
+    /// "`/approve all` 说没有待处理、而 `/pending` 列着三条"会同时成立。
     ///
-    /// `ApprovalRecord` 整个存着（不只是短 ID）：状态行的条数、`a` 键的名单、`/pending`
-    /// 的清单都从这一份走，三处不可能各有各的答案。
-    pub pending: BTreeMap<ApprovalId, ApprovalRecord>,
-    /// **这个客户端自己答过、还在等回执的那些**。
+    /// 键就是线格式上的**句柄**：审批是短 ID，`verify` / `blocked` 是 Run ID（§7.5）。
+    /// 清单里存的是摘要（句柄、种类、问题、可答结论）——审批的整份计划在弹窗那份详情里，
+    /// 状态行的条数、`a` 的名单、`/pending` 的每一行都从这一份走，三处不可能各有各的答案。
+    pub pending: BTreeMap<String, InterventionSummary>,
+    /// **这个客户端自己答过、还在等回执的那些**（按审批层的 id）。
     ///
-    /// 决定会在 SSE 上以 `approval_decided` 回来（网关每条决定推一帧），而它和"别人在
-    /// 别处答的"长得一模一样。没有这一张表，自己按下 `y` 之后收到的第一帧会被说成
-    /// 「这条审批在别处批准了」——一句假话，而且是在用户刚按完键的下一秒。
+    /// 结论会在 SSE 上以 `approval_decided` 回来（网关每条决定推一帧），而它和"别人在
+    /// 别处答的"长得一模一样，帧里也只有审批 id、没有句柄。没有这一张表，自己按下 `y`
+    /// 之后收到的第一帧会被说成「这条审批在别处批准了」——一句假话，而且是在用户刚按完键
+    /// 的下一秒。所以它按**弹窗上那一条的审批 id** 记：只有看得见的那一条需要这个区分，
+    /// 别的那几条根本不在屏幕上。
     pub answering: BTreeSet<ApprovalId>,
     /// `/pending` 问了一句——空清单也要有回答，别的时候不印。
     pub asking_pending: bool,
@@ -384,9 +386,21 @@ impl App {
         self.tools.get(call)
     }
 
-    pub fn run_status(&self) -> Option<RunStatus> {
+    pub fn run_state(&self) -> Option<RunState> {
         let run = self.current_run.as_ref()?;
         self.surface.runs.get(run).map(|view| view.status)
+    }
+
+    /// 这条 Run **在等什么**（§8.4 的第二个维度）。
+    ///
+    /// 状态只说"能不能跑"，这一格说"在等谁、等到什么时候"——少了它，状态行上的"等待中"
+    /// 就是一句等于没说的话。
+    pub fn run_wait(&self) -> Option<&WaitReason> {
+        let run = self.current_run.as_ref()?;
+        self.surface
+            .runs
+            .get(run)
+            .and_then(|view| view.wait.as_ref())
     }
 
     pub fn run_meta(&self) -> Option<&RunMeta> {
@@ -431,39 +445,90 @@ impl App {
         }
     }
 
-    /// 界面上还没决定的审批有几条——**全部会话的**，不是本会话的。
+    /// 界面上还没答的待处理有几条——**三类合计，全部会话的**（§7.5）。
     pub fn pending_count(&self) -> usize {
         self.pending.len()
     }
 
-    /// 有审批弹窗时输入框禁用（§11.3：先把眼前这件事答了）。
+    /// 待处理里**审批**有几条。弹窗底部那张菜单的「全部批准（N 条）」数的是它：批量只答
+    /// 审批（§11.3），把结果不明和阻塞也算进去，那个数字就与按下去会发生的事不符。
+    pub fn pending_approvals(&self) -> usize {
+        self.pending_of(InterventionKind::Approval)
+    }
+
+    /// 这一类现在待处理几条。
+    pub fn pending_of(&self, kind: InterventionKind) -> usize {
+        self.pending
+            .values()
+            .filter(|item| item.kind == kind)
+            .count()
+    }
+
+    /// 三类的条数：审批、结果不明、阻塞。
+    pub fn pending_breakdown(&self) -> (usize, usize, usize) {
+        (
+            self.pending_of(InterventionKind::Approval),
+            self.pending_of(InterventionKind::Verify),
+            self.pending_of(InterventionKind::Blocked),
+        )
+    }
+
+    /// 按句柄找清单上那一条。
+    pub fn pending_item(&self, handle: &str) -> Option<&InterventionSummary> {
+        self.pending.get(handle)
+    }
+
+    /// 有弹窗时输入框禁用（§11.3：先把眼前这件事答了）。
     pub fn input_enabled(&self) -> bool {
         self.approval.is_none() && !self.phase.is_backfilling()
     }
 
     pub fn input_hint(&self) -> String {
+        let (approvals, verify, blocked) = self.pending_breakdown();
         if let Some(modal) = &self.approval {
             // 提示行只说**怎么开这张菜单**：菜单自己把每一行的答案与直通键写在脸上，这里
             // 再抄一遍只会在窄终端里被截掉半行（弹窗底栏的那一行同理，见
             // `ApprovalModal::keys_hint`）。
-            return format!(
-                "{}——待批准 {} 条 · {}",
-                if self.pending_count() > 1 {
+            let mut hint = format!(
+                "{}——待批准 {} 条",
+                if approvals > 1 {
                     "待批准的操作"
                 } else {
                     "有待批准的操作"
                 },
-                self.pending_count(),
-                modal.keys_hint()
+                approvals
             );
+            let others = self.pending_count().saturating_sub(approvals);
+            if others > 0 {
+                // 弹窗旁边唯一说得出"另外那些"有出路的地方：它们没有弹窗（§7.5 的三类共用
+                // 一张清单，不等于共用一种界面）。
+                hint.push_str(&format!(
+                    "，另有 {others} 条要答（/pending 看清单，/answer <句柄> <结论>）"
+                ));
+            }
+            hint.push_str(&format!(" · {}", modal.keys_hint()));
+            return hint;
         }
         if self.pending_count() > 0 {
-            // 没弹窗却有等待中的审批：审批请求还没投到（断线、投递失败），但操作者手上有
-            // `komo approval list` 的短 ID，也有命令行。**说出路，不要只说状态**。
-            return format!(
-                "有 {} 条待批复——/pending 看清单，/approve <短ID> 批一条，/approve all 全批",
-                self.pending_count()
-            );
+            // 没弹窗却还有待处理：请求还没投到（断线、投递失败），或者那一条根本没有弹窗
+            // （`verify` / `blocked`）。操作者手上有 `/pending` 的句柄，也有命令行。
+            // **说出路，不要只说状态**。
+            let mut hint = format!("有 {} 条待处理", self.pending_count());
+            if verify > 0 || blocked > 0 {
+                hint.push_str(&format!(
+                    "（审批 {approvals} · 结果不明 {verify} · 阻塞 {blocked}）"
+                ));
+            }
+            hint.push_str("——/pending 看清单");
+            if approvals > 0 {
+                hint.push_str("，/approve <短ID> 批一条，/approve all 全批");
+            }
+            if verify > 0 || blocked > 0 {
+                hint.push_str(
+                    "，/answer <句柄> <结论>：satisfied / not_performed / resolve / abandon",
+                );
+            }
+            return hint;
         }
         if self.phase.is_backfilling() {
             return "正在补读历史……".to_string();
@@ -527,16 +592,19 @@ fn blank_tool(call: ToolCallId, run: Option<RunId>, seq: Seq) -> ToolLine {
 }
 
 /// §8.8 的那句话：「2 个任务已接续，1 个等待审批」。
+///
+/// 待处理按 §7.5 的三类分开数——三类要的操作者做的是不同的事，合成一个数只说得出"有
+/// 事没完"。
 pub fn resume_summary(response: &ResumeResponse) -> String {
     let resumed = response.resumed.len();
     let mut approvals = 0;
-    let mut uncertain = 0;
-    let mut attention = 0;
+    let mut verify = 0;
+    let mut blocked = 0;
     for item in &response.pending {
-        match item {
-            PendingItem::Approval(_) => approvals += 1,
-            PendingItem::Uncertain { .. } => uncertain += 1,
-            PendingItem::NeedsAttention { .. } => attention += 1,
+        match item.kind {
+            InterventionKind::Approval => approvals += 1,
+            InterventionKind::Verify => verify += 1,
+            InterventionKind::Blocked => blocked += 1,
         }
     }
     let mut parts = Vec::new();
@@ -546,11 +614,11 @@ pub fn resume_summary(response: &ResumeResponse) -> String {
     if approvals > 0 {
         parts.push(format!("{approvals} 个等待审批"));
     }
-    if uncertain > 0 {
-        parts.push(format!("{uncertain} 个结果不明"));
+    if verify > 0 {
+        parts.push(format!("{verify} 个结果不明"));
     }
-    if attention > 0 {
-        parts.push(format!("{attention} 个需要处理"));
+    if blocked > 0 {
+        parts.push(format!("{blocked} 个阻塞"));
     }
     if parts.is_empty() {
         "没有未完成的任务".to_string()
@@ -561,32 +629,108 @@ pub fn resume_summary(response: &ResumeResponse) -> String {
 
 /// `/status` 那一行。
 ///
-/// 待审批数用**清单那一份**（全部会话），不是 `GET /v1/sessions/{id}` 里本会话那几条：
-/// 状态行、`a` 的名单、`/pending` 都读清单，四个地方各说一个数就没人信了。
+/// 待处理数用**清单那一份**（全部会话），不是 `GET /v1/sessions/{id}` 里本会话那几条：
+/// 状态行、`a` 的名单、`/pending` 都读清单，四个地方各说一个数就没人信了。三类合计之后
+/// 措辞跟着改——它已经不是"待审批数"了（§7.5）。
 fn status_summary(detail: &SessionDetail, pending: usize) -> String {
     let status = detail
         .summary
-        .current_status
+        .current_state
         .map(status_text)
         .unwrap_or("空闲");
     format!(
-        "{status} · 未完成 {} · 待审批 {pending}",
+        "{status} · 未完成 {} · 待处理 {pending}",
         detail.unfinished.len()
     )
 }
 
-/// §6 / §8.4 的十个状态，如实显示。
-pub fn status_text(status: RunStatus) -> &'static str {
-    match status {
-        RunStatus::Ingesting => "接收中",
-        RunStatus::Queued => "排队中",
-        RunStatus::Running => "运行中",
-        RunStatus::WaitingApproval => "等待审批",
-        RunStatus::WaitingRetry => "等待重试",
-        RunStatus::Interrupted => "被中断",
-        RunStatus::NeedsAttention => "需要处理",
-        RunStatus::Completed => "已完成",
-        RunStatus::Failed => "已失败",
-        RunStatus::Cancelled => "已取消",
+/// §7.5 的三类，如实显示。清单、提示行、弹窗都要它，所以放在这里而不是各写一份。
+pub fn intervention_kind_text(kind: InterventionKind) -> &'static str {
+    match kind {
+        InterventionKind::Approval => "审批",
+        InterventionKind::Verify => "结果不明",
+        InterventionKind::Blocked => "阻塞",
+    }
+}
+
+/// 这一条此刻允许答复什么。**空表如实印成「（无）」**——自己推一个菜单会给出一个按下去
+/// 没反应的答案（§11.3）。
+pub fn verdicts_text(verdicts: &[InterventionVerdict]) -> String {
+    if verdicts.is_empty() {
+        return "（无）".into();
+    }
+    verdicts
+        .iter()
+        .map(|verdict| verdict.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// §6 / §8.4 的状态，如实显示。
+///
+/// `Waiting` 只有一个词，因为**"在等什么"是另一个维度**（[`WaitReason`]）：状态行把它
+/// 接在后面印（见 [`wait_text`]），而不是在这里编出"等待审批 / 等待重试"三种状态。
+pub fn status_text(state: RunState) -> &'static str {
+    match state {
+        RunState::Accepted => "已受理",
+        RunState::Queued => "排队中",
+        RunState::Running => "运行中",
+        RunState::Waiting => "等待中",
+        RunState::Completed => "已完成",
+        RunState::Failed => "已失败",
+        RunState::Cancelled => "已取消",
+        RunState::Abandoned => "已放弃",
+    }
+}
+
+/// 「停着，而且在等什么」。§8.4：**排队二十分钟不知道为什么**正是这一格要答的问题。
+///
+/// `now` 由驱动传进来（状态机不读时钟）；`Retry` 那一句要算"还有多久"才算说得清。
+pub fn wait_text(reason: &WaitReason, now: Option<OffsetDateTime>) -> String {
+    match reason {
+        // 句柄才是操作者要用的东西（审批是短 ID，另两类是 Run ID），而这一格只报"在等谁"：
+        // 具体那一条在 §7.5 的清单里，状态行不复述它、也不替它编一个 id。
+        WaitReason::Approval { .. } => "等审批答复".into(),
+        WaitReason::Intervention { .. } => "等一条干预的答复".into(),
+        WaitReason::Dependency { run } => format!("在等 Run {run}"),
+        WaitReason::Retry {
+            attempts,
+            not_before,
+            cause,
+        } => {
+            let remaining = match now {
+                Some(now) if *not_before > now => {
+                    format!("{} 后", human_span(*not_before - now))
+                }
+                // 到点了却还停着：下一拍就会重试，别报一个负数的"还要等"。
+                _ => "马上".into(),
+            };
+            format!(
+                "{remaining}重试（{}，第 {attempts} 次）",
+                retry_cause_text(*cause)
+            )
+        }
+    }
+}
+
+/// 一次有界退避是**哪一种**失败（§8.5）：分类不是为了好看，是让人一眼知道该不该干预。
+fn retry_cause_text(cause: RetryCause) -> &'static str {
+    match cause {
+        RetryCause::RateLimited => "限流",
+        RetryCause::Transport => "连不上",
+        RetryCause::Server => "服务端错误",
+        RetryCause::Contended => "本地写争用",
+    }
+}
+
+/// 一段时长的人话。
+fn human_span(duration: time::Duration) -> String {
+    let seconds = duration.whole_seconds().max(0);
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60)
     }
 }

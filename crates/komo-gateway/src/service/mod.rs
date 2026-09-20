@@ -14,7 +14,9 @@
 
 pub mod channels;
 pub mod cron_watch;
+pub mod interventions;
 pub mod ledgers;
+pub mod lifecycle;
 pub mod run_watch;
 pub mod segment;
 pub mod state;
@@ -218,11 +220,25 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
 
     let shutdown = Shutdown::new();
 
-    // 7. 恢复扫描。**只补索引与派生状态，不调用工具、不发外部请求**（§8.5）。
-    match state.recovery().scan().await {
-        Ok(report) => {
-            tracing::info!(summary = %report.summary(), reclaimed = report.reclaimed, "恢复扫描完成");
-            for outcome in report.to_redeliver() {
+    // 7. 启动对账（§8.7 的第 7 步就是 §8.9 的 reconcile）：**只补索引与派生状态，不调用
+    //    工具、不发外部请求**（§8.5）。它同时把"输入已在 JSONL 里而索引落后"的补齐、
+    //    把没主人的 `running` 判成 `queued` 或 `waiting + intervention`、把 `closing`
+    //    且已无未完成 Run 的会话推进到 `deleted`、把墓碑已落而内容还在的补齐回收。
+    match state.reconcile_reporting().await {
+        Ok((report, scan)) => {
+            tracing::info!(
+                checked = report.checked,
+                resumed = report.resumed,
+                blocked = report.blocked,
+                reclaimed = report.reclaimed,
+                closed = report.closed,
+                purged = report.purged,
+                summary = %scan.summary(),
+                "启动对账完成"
+            );
+            // §8.7：「就绪之后」才做两件不影响调度事实的事——补发与报告。这两步在这里
+            // 之外没有别的入口，而它们都是网络 / 界面的事，所以对账本身不发请求。
+            for outcome in scan.to_redeliver() {
                 // 「已保存最终结果，但客户端没有收到 → 补发或补读原结果，**不重新执行
                 // 任务**」（§8.4）。
                 let _ = state
@@ -234,7 +250,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
                     })
                     .await;
             }
-            for group in report.corrupt_groups() {
+            for group in scan.corrupt_groups() {
                 // 「停止受影响会话，**报告损坏**」（§8.4 / §8.5）——报告这一半就是这一条：
                 // 一个读不出来的会话不会自己好起来，操作者得知道是哪一个、为什么。
                 let affected = if group.runs.len() == 1 {
@@ -255,17 +271,17 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
                     .notifier
                     .deliver_home(Outbound::NeedsAttention {
                         session: group.session,
-                        // Outbound 的兼容字段保留一个代表 Run；正文列出这一组的全部 Run。
+                        // Outbound 里保留一个代表 Run；正文列出这一组的全部 Run。
                         run: group.runs[0].clone(),
                         reason: format!("恢复时停下了：{}{affected}", group.reason),
                     })
                     .await;
             }
-            if report.requeued() > 0 {
+            if scan.requeued() > 0 {
                 state.waker().wake();
             }
         }
-        Err(error) => tracing::error!(%error, "恢复扫描失败：新请求照常，未完成的任务等下一次扫描"),
+        Err(error) => tracing::error!(%error, "启动对账失败：新请求照常，未完成的任务等下一拍"),
     }
 
     // 8. 补写控制审计 outbox（§8.7 的启动顺序第 3 步：恢复扫描之后、服务起来之前）。
@@ -377,6 +393,17 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
                     return;
                 }
                 state.drain_audit().await;
+                // 同一拍里顺手兜底：有人看着的审批只弹在他面前，而看着的人可能已经
+                // 关掉界面走了——挂着没人知道的审批是 §10 明确要挡的状态。
+                state.sweep_unseen_interventions().await;
+                // §8.9 的第三个触发点：`AUDIT_TICK` 那一拍的周期对账（另外两个是启动与
+                // `POST /v1/reconcile`）。「它可以比补写粗一点，比如每拍最多干一次」——
+                // 它本来就是六十秒一拍，所以每拍一次就够；代价是几十条 SELECT。
+                //
+                // 它只**写状态**：不调工具、不发外部请求、不消费授权（§8.9）。
+                if let Err(error) = state.reconcile().await {
+                    tracing::warn!(%error, "这一拍的周期对账没跑成");
+                }
             }
         });
     }
@@ -550,7 +577,10 @@ async fn build_tools(
             // 核对函数的那道门（§8.6）。它自己带一份 Policy 与授权表：核对是一次**新的**
             // 执行计划（`PlanSource::Verification`），要按当时的规则重新判一次。
             let gate = komo_runtime::tools::python::VerificationGate {
-                policy: komo_runtime::policy::PolicyEngine::from_rules(snapshot.policy.clone()),
+                policy: komo_runtime::policy::PolicyEngine::from_rules(snapshot.policy.clone())
+                    // 同一条 §8.10 第 4 条的名单：核对也是一次执行计划，写 komo 自己的
+                    // 状态同样要拦。
+                    .with_protection(state::protected_paths(&snapshot, config.home())),
                 approvals: Arc::new(komo_store::TursoApprovalRepo::new(db.clone())),
                 clock,
             };

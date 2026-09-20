@@ -173,7 +173,7 @@ pub async fn wait_for_terminal(gateway: &TestGateway, run: &komo_kernel::types::
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while std::time::Instant::now() < deadline {
         if let Ok(Some(record)) = komo_store::repos::runs::get(&gateway.state().db, run).await
-            && record.status.is_terminal()
+            && record.state.is_terminal()
         {
             return;
         }

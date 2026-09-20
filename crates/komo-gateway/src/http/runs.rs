@@ -8,6 +8,7 @@ use komo_kernel::protocol::http::{
     CancelRunRequest, CancelRunResponse, RunDetail, RunSummary, ToolCallSummary,
 };
 use komo_kernel::types::ids::RunId;
+use komo_kernel::types::status::RunState;
 use komo_store::repos::runs::RunRecord;
 
 use super::error::{ApiFailure, ApiResult};
@@ -59,17 +60,25 @@ pub async fn cancel(
 ) -> ApiResult<Json<CancelRunResponse>> {
     let run = RunId::from_raw(id);
     let _ = body;
-    let status = api.state.cancel_run(&run).await?;
-    Ok(Json(CancelRunResponse { run, status }))
+    let state = api.state.cancel_run(&run).await?;
+    Ok(Json(CancelRunResponse { run, state }))
 }
 
 /// 一个 Run 的概览。
+///
+/// `wait` 是**唯一**看得到 `Dependency` 的地方之一（另一处是 `SessionSummary` 的
+/// `current_wait`）：等前一条 Run 的那一类不进 §7.5 的清单——它不是在等人（§7.5 第 2 条），
+/// 但它仍然挡着同 Session 后面的 Run，所以它必须在这一格说得出来。
 pub fn summary_of(record: &RunRecord) -> RunSummary {
     let created = created_at(record.run.as_str(), time::OffsetDateTime::UNIX_EPOCH);
     RunSummary {
         run: record.run.clone(),
         session: record.session.clone(),
-        status: record.status,
+        state: record.state,
+        // 只在 `waiting` 时有值（§8.4）：`queued` 的 Run "一定说得出有活干"。
+        wait: (record.state == RunState::Waiting)
+            .then(|| record.wait.clone())
+            .flatten(),
         source: record.source.clone(),
         rounds: record.rounds,
         created_at: created,

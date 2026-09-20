@@ -32,3 +32,6 @@ tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "net", "ma
 # 否则 panic；正式构建里那是 `komo` 的 main 装的（§13.4 reqwest 行），测试进程里没有
 # main，所以测试自己装一次。**只是 dev-dependency**：komo-client 的正式依赖不变。
 rustls = { workspace = true }
+# 网关重启那条自愈要一个真数据目录（发现文件写在 `<home>/runtime/gateway.json`）：
+# 与 store / runtime / gateway 的测试用同一个临时目录工具。
+tempfile = { workspace = true }

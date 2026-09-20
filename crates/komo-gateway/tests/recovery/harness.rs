@@ -23,7 +23,7 @@ use komo_kernel::traits::{Ledger, LedgerError};
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::refs::PublishedOutput;
-use komo_kernel::types::status::{RunEnd, Wait};
+use komo_kernel::types::status::{RunEnd, WaitReason};
 use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse};
 
 pub use komo_gateway::service::test_support::harness::*;
@@ -293,11 +293,7 @@ impl Ledger for FaultLedger {
         self.inner.finish_call(attempt, published).await
     }
 
-    async fn suspend(
-        &self,
-        run: &RunId,
-        wait: komo_kernel::types::status::Wait,
-    ) -> Result<(), LedgerError> {
+    async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
         poisoned!(self);
         self.inner.suspend(run, wait).await
     }

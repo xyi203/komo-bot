@@ -351,8 +351,12 @@ async fn the_command_table_answers_every_command() {
     .await;
 
     let texts = wired.fake.texts_to("111");
+    // §7.5：`/status` 的计数是**三类合计**，而且分得开是哪三类——只看审批数会正好
+    // 落回"会话停着而审批数是 0"那个老毛病。
     assert!(
-        texts.iter().any(|text| text.contains("待处理审批")),
+        texts
+            .iter()
+            .any(|text| text.contains("待处理（共 1 条）：审批 1 · 结果不明 0 · 前提没了 0")),
         "/status：{texts:?}"
     );
     assert!(

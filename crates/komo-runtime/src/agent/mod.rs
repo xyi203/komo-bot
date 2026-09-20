@@ -15,16 +15,17 @@
 //!   里消失，而账本看上去一切正常。
 //! - **`Ask` 让出名额。**executor 报「需审批」时这一段就结束：`Ledger::suspend` 之后
 //!   返回，**不在进程里等人**。审批可能一天后才从手机上来，等着的进程只是占着一个
-//!   执行名额（§6、§7.4）。
+//!   执行名额（§6、§7.4）。停下来的形状是 `waiting` + 一条 `WaitReason`——"在等谁、
+//!   等到什么时候"是另一个问题，答案不在状态里。
 //! - **工具失败是结果，驱动失败是终止。**普通工具失败交给模型修正；只有驱动 / LLM
 //!   错误中止整轮（§6）。
 
 use std::sync::Arc;
 
 use komo_kernel::traits::{Clock, Ledger, LedgerError, LlmClient};
-use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
+use komo_kernel::types::ids::{InterventionId, RunId, SessionId, ToolCallId};
 use komo_kernel::types::model::TokenUsage;
-use komo_kernel::types::status::{RunEnd, Wait};
+use komo_kernel::types::status::{RunEnd, WaitReason};
 use komo_kernel::types::turn::{
     AssistantRound, LlmError, Round, RoundInput, ToolCallRequest, ToolResultForModel, TurnRequest,
 };
@@ -74,7 +75,11 @@ impl Default for RetryBudget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            max_rounds: 24,
+            // 100 轮：24 在真活上太紧——一次"读几个文件、跑几次命令、再核对一遍"的活
+            // 就能撞到顶，撞上就是一次失败的 Run（线上撞过：一个抓取整理的任务在 24 轮上
+            // 停住，事情其实快做完了）。仍然是个数，不是无限；单个 Job 还能用
+            // `max_rounds` 覆盖（§10）。
+            max_rounds: 100,
             max_tokens: None,
             first_round: 1,
             retry: RetryBudget::default(),
@@ -111,9 +116,10 @@ pub enum SegmentOutcome {
         rounds: u32,
         usage: TokenUsage,
     },
-    /// 让出了执行名额，等审批 / 等人处理。
+    /// 让出了执行名额，等审批 / 等人处理 / 等退避到点（§8.4）。**状态只有一个
+    /// `waiting`**，是 [`WaitReason`] 说得出在等什么。
     Suspended {
-        wait: Wait,
+        wait: WaitReason,
         rounds: u32,
     },
     Failed {
@@ -320,18 +326,30 @@ impl AgentLoop {
         stop: RoundStop,
     ) -> Result<SegmentOutcome, AgentError> {
         match stop {
+            // 停在哪条调用上是**事件**的落点（`RunWaiting.call`），而这里交给
+            // `Ledger::suspend` 的只有"在等一条审批"这件事：调用 ID 在 `approval_requests
+            // .call_id` 上，那是权威，`suspend` 不替它猜（见 store 的实现）。
             RoundStop::Approval { approval, call } => {
-                let wait = Wait::Approval {
-                    approval,
-                    call: Some(call),
-                    // 审批发生在 `tool.started` 之前，这时候一次尝试都还没有。
-                    attempt: None,
-                };
+                tracing::info!(run = %run, %approval, %call, "停在审批上，让出执行名额");
+                let wait = WaitReason::Approval { approval };
                 self.ledger.suspend(run, wait.clone()).await?;
                 Ok(SegmentOutcome::Suspended { wait, rounds })
             }
-            RoundStop::Attention { reason, .. } => {
-                let wait = Wait::Attention { reason };
+            // 「结果不明」停在**一条 Intervention** 上等人核对（§7.5、§8.6）。句柄就是
+            // 这个 Run：一个 Run 上最多停着一条要人判断的干预，再编一个 ID 只会和清单
+            // 对不上。自由文本的理由没有地方可放（`WaitReason::Intervention` 只有句柄，
+            // 事件也只有 `reason`）——那条调用的 `tool.result` 已经把"为什么不明"连同
+            // 核对证据写在账上了，这里只留一条日志。
+            RoundStop::Attention { reason, call } => {
+                tracing::warn!(
+                    run = %run,
+                    %call,
+                    %reason,
+                    "结果不明，停在 waiting + intervention 上等人核对"
+                );
+                let wait = WaitReason::Intervention {
+                    intervention: InterventionId::for_run(run),
+                };
                 self.ledger.suspend(run, wait.clone()).await?;
                 Ok(SegmentOutcome::Suspended { wait, rounds })
             }
@@ -348,9 +366,9 @@ impl AgentLoop {
 
     /// 模型 / 驱动出错了：**能重试的让出名额去等退避，不能重试的当场终止**（§8.5）。
     ///
-    /// 判"能不能重试"用 `llm::is_retryable`——一处判断，适配器与 loop 不会各有一套。
-    /// 结果与用量都未知（`LlmError::Unknown`）不在其中：那种情形要保留未知标记，
-    /// 不能自动再来一次。
+    /// 判"能不能重试、退哪一种"用 [`crate::llm::retry_cause`]——一处判断，适配器与
+    /// loop 不会各有一套。结果与用量都未知（`LlmError::Unknown`）不在其中：那种情形要
+    /// 保留未知标记，不能自动再来一次。
     async fn llm_error(
         &self,
         run: &RunId,
@@ -358,9 +376,9 @@ impl AgentLoop {
         budget: &RetryBudget,
         error: &LlmError,
     ) -> Result<SegmentOutcome, AgentError> {
-        if !crate::llm::is_retryable(error) {
+        let Some(cause) = crate::llm::retry_cause(error) else {
             return self.fail_with(run, rounds, error.to_string()).await;
-        }
+        };
         let attempts = budget.attempts + 1;
         if attempts >= budget.max_attempts {
             return self
@@ -375,11 +393,22 @@ impl AgentLoop {
                 .await;
         }
         let backoff = budget.base.saturating_mul(1u32 << budget.attempts.min(16));
-        let wait = Wait::Retry {
+        let not_before = self.clock.now()
+            + time::Duration::try_from(backoff).unwrap_or(time::Duration::seconds(2));
+        // 自由文本的失败原因在 `WaitReason::Retry` 里没有位置（它只有次数、到点时刻与
+        // 哪一种失败）——退避的进程状态由那三个字段说清楚，而"哪一次为什么退"留在日志里。
+        tracing::warn!(
+            run = %run,
             attempts,
-            next_retry_at: self.clock.now()
-                + time::Duration::try_from(backoff).unwrap_or(time::Duration::seconds(2)),
-            reason: error.to_string(),
+            cause = cause.as_str(),
+            %not_before,
+            %error,
+            "模型请求失败，让出执行名额去等退避"
+        );
+        let wait = WaitReason::Retry {
+            attempts,
+            not_before,
+            cause,
         };
         self.ledger.suspend(run, wait.clone()).await?;
         Ok(SegmentOutcome::Suspended { wait, rounds })

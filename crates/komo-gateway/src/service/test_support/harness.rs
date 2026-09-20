@@ -33,7 +33,7 @@ use komo_kernel::traits::{
 use komo_kernel::types::chat::{ApprovalPresentation, ChannelPeer, ChannelPlatform, Outbound};
 use komo_kernel::types::ids::{ApprovalId, RunId, SessionId};
 use komo_kernel::types::model::TokenUsage;
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{LlmError, ProviderToolCall, Round, RoundInput, TurnRequest};
 use komo_runtime::config::Secrets;
 
@@ -737,10 +737,64 @@ impl TestGateway {
             .expect("读得出")
     }
 
+    /// 全部会话，**含已逻辑删除的**（`all = true`）：测试要看得到 `closing` / `deleted`
+    /// 那两格（§8.10）。`purged` 两种都不列——它只剩墓碑行，只有显式查看单个会话才可见。
     pub async fn sessions(&self) -> Vec<komo_store::repos::session::SessionRecord> {
-        komo_store::repos::session::list(&self.state().db)
+        komo_store::repos::session::list(&self.state().db, true)
             .await
             .expect("读得出")
+    }
+
+    /// 待处理清单（三类一起，§7.5）。
+    pub async fn interventions(&self) -> Vec<komo_kernel::protocol::http::InterventionSummary> {
+        let (code, body) = self.get_json("/v1/interventions").await;
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_value(body["interventions"].clone()).expect("清单读得出")
+    }
+
+    /// 走 HTTP 那条路做决定（四个界面共用的那一个接口，§13.5）。
+    ///
+    /// 打的是 `POST /v1/interventions/{handle}/answer`（§7.5）：审批的答复**只走这一条
+    /// 路**，句柄是短 ID（§11.3）。单条的 `/v1/approvals/{id}/decision` 已经不在了。
+    pub async fn decide(&self, approval: &ApprovalId, approved: bool) -> String {
+        let handle = self.short_id_of(approval).await;
+        self.answer(&handle, if approved { "approve" } else { "reject" }, None)
+            .await
+    }
+
+    /// 那条审批现在的短 ID（它就是 §7.5 清单里那一条的句柄）。
+    pub async fn short_id_of(&self, approval: &ApprovalId) -> String {
+        self.state()
+            .approval_repo
+            .get(approval)
+            .await
+            .expect("读得出")
+            .expect("有这条审批")
+            .short_id
+            .to_string()
+    }
+
+    /// `POST /v1/interventions/{handle}/answer`（§7.5）。`scope` 只对 `approve` 有含义。
+    pub async fn answer(&self, handle: &str, verdict: &str, scope: Option<&str>) -> String {
+        let mut body = serde_json::json!({ "verdict": verdict });
+        if let Some(scope) = scope {
+            body["scope"] = serde_json::json!(scope);
+        }
+        let (code, body) = self
+            .post(&format!("/v1/interventions/{handle}/answer"), body)
+            .await;
+        assert_eq!(code, 200, "{body}");
+        body
+    }
+
+    /// 记一次答复的接口（`POST /v1/interventions/{handle}/answer`）**不做 200 断言**的
+    /// 版本：要验错误码（422）的时候用它。
+    pub async fn answer_raw(&self, handle: &str, verdict: &str) -> (u16, serde_json::Value) {
+        self.post_json(
+            &format!("/v1/interventions/{handle}/answer"),
+            serde_json::json!({ "verdict": verdict }),
+        )
+        .await
     }
 
     pub async fn runs_of(&self, session: &SessionId) -> Vec<komo_store::repos::runs::RunRecord> {
@@ -982,6 +1036,24 @@ impl Gw {
         self.request(reqwest::Method::PATCH, path, Some(body)).await
     }
 
+    /// 同上，但把响应体当 JSON 读（§8.10 的 `PurgeBlocked` 正文就是一份数据）。
+    pub async fn get_json(&self, path: &str) -> (u16, serde_json::Value) {
+        let (code, body) = self.get(path).await;
+        (code, as_json(body))
+    }
+
+    pub async fn post_json(&self, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+        let (code, body) = self.post(path, body).await;
+        (code, as_json(body))
+    }
+
+    /// 待处理清单（三类一起，§7.5）。
+    pub async fn interventions(&self) -> Vec<komo_kernel::protocol::http::InterventionSummary> {
+        let (code, body) = self.get_json("/v1/interventions").await;
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_value(body["interventions"].clone()).expect("清单读得出")
+    }
+
     pub async fn request(
         &self,
         method: reqwest::Method,
@@ -1027,24 +1099,24 @@ impl Gw {
     }
 
     /// 直接问账本这个 Run 现在什么状态（HTTP 那条路读的是同一行）。
-    pub async fn db_status(&self, run: &RunId) -> RunStatus {
+    pub async fn db_state(&self, run: &RunId) -> RunState {
         komo_store::repos::runs::get(&self.state().db, run)
             .await
             .expect("读得到")
             .expect("有这个 Run")
-            .status
+            .state
     }
 
-    pub async fn wait_db_status<F: Fn(RunStatus) -> bool>(
+    pub async fn wait_db_state<F: Fn(RunState) -> bool>(
         &self,
         run: &RunId,
         done: F,
         what: &str,
-    ) -> RunStatus {
+    ) -> RunState {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        let mut last = RunStatus::Queued;
+        let mut last = RunState::Queued;
         while std::time::Instant::now() < deadline {
-            last = self.db_status(run).await;
+            last = self.db_state(run).await;
             if done(last) {
                 return last;
             }
@@ -1053,22 +1125,51 @@ impl Gw {
         panic!("等了 20 秒 run {run} 还没到「{what}」，现在是 {last:?}");
     }
 
-    pub async fn run_status(&self, run: &RunId) -> RunStatus {
-        self.db_status(run).await
+    pub async fn run_state(&self, run: &RunId) -> RunState {
+        self.db_state(run).await
     }
 
-    pub async fn wait_status<F: Fn(RunStatus) -> bool>(
+    /// 这条 Run 现在**在等什么**（§8.4 的第二维）。`None` = 它没停在等待上。
+    pub async fn db_wait(&self, run: &RunId) -> Option<komo_kernel::types::status::WaitReason> {
+        komo_store::repos::runs::get(&self.state().db, run)
+            .await
+            .expect("读得到")
+            .expect("有这个 Run")
+            .wait
+    }
+
+    /// 等它停在 `waiting` 上并说得出在等什么，返回那个理由。
+    ///
+    /// 「`Waiting` 的 Run 一定说得出在等什么」是这套状态机的验收口径（§8.4）：一条
+    /// `waiting` 却答不出理由的 Run 是损坏，所以这里直接 panic。
+    pub async fn wait_waiting(&self, run: &RunId) -> komo_kernel::types::status::WaitReason {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut last = None;
+        while std::time::Instant::now() < deadline {
+            if self.db_state(run).await == RunState::Waiting {
+                match self.db_wait(run).await {
+                    Some(wait) => return wait,
+                    None => panic!("run {run} 是 waiting 却说不出在等什么（§8.4）"),
+                }
+            }
+            last = self.db_wait(run).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("等了 20 秒 run {run} 还没停在等待上，现在是 {last:?}");
+    }
+
+    pub async fn wait_state<F: Fn(RunState) -> bool>(
         &self,
         run: &RunId,
         done: F,
         what: &str,
     ) -> RunDetail {
-        self.wait_db_status(run, done, what).await;
+        self.wait_db_state(run, done, what).await;
         self.run_detail(run).await
     }
 
     pub async fn wait_terminal(&self, run: &RunId) -> RunDetail {
-        self.wait_status(run, |status| status.is_terminal(), "终态")
+        self.wait_state(run, |status| status.is_terminal(), "终态")
             .await
     }
 
@@ -1093,15 +1194,38 @@ impl Gw {
     }
 
     /// 走 HTTP 那条路做决定（四个界面共用的那一个接口，§13.5）。
+    ///
+    /// 打的是 `POST /v1/interventions/{handle}/answer`（§7.5）：审批的答复**只走这一条
+    /// 路**，句柄是短 ID（§11.3）。单条的 `/v1/approvals/{id}/decision` 已经不在了。
     pub async fn decide(&self, approval: &ApprovalId, approved: bool) -> String {
+        let handle = self.short_id_of(approval).await;
+        self.answer(&handle, if approved { "approve" } else { "reject" }, None)
+            .await
+    }
+
+    /// `POST /v1/interventions/{handle}/answer`（§7.5）。`scope` 只对 `approve` 有含义。
+    pub async fn answer(&self, handle: &str, verdict: &str, scope: Option<&str>) -> String {
+        let mut body = serde_json::json!({ "verdict": verdict });
+        if let Some(scope) = scope {
+            body["scope"] = serde_json::json!(scope);
+        }
         let (code, body) = self
-            .post(
-                &format!("/v1/approvals/{approval}/decision"),
-                serde_json::json!({ "approved": approved }),
-            )
+            .post(&format!("/v1/interventions/{handle}/answer"), body)
             .await;
         assert_eq!(code, 200, "{body}");
         body
+    }
+
+    /// 那条审批现在的短 ID（它是 §7.5 清单里的句柄）。
+    pub async fn short_id_of(&self, approval: &ApprovalId) -> String {
+        self.state()
+            .approval_repo
+            .get(approval)
+            .await
+            .expect("读得出")
+            .expect("有这条审批")
+            .short_id
+            .to_string()
     }
 
     /// 造一条待处理的审批。

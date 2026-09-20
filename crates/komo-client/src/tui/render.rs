@@ -14,7 +14,7 @@
 //! ```
 
 use komo_kernel::fold::SurfaceMessage;
-use komo_kernel::types::status::{RunStatus, ToolCallState};
+use komo_kernel::types::status::{RunState, ToolCallState};
 use komo_kernel::types::turn::Role;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -236,18 +236,29 @@ fn state_colour(state: ToolCallState) -> Color {
     }
 }
 
-/// 状态行：Run 状态 · 本轮耗时 · 模型与 effort · 连接状态 · 待审批数。
+/// 状态行：Run 状态（等什么就说出什么） · 本轮耗时 · 模型与 effort · 连接状态 · 待处理数。
 fn status_line(app: &App) -> Paragraph<'static> {
     let mut parts: Vec<Span<'static>> = Vec::new();
 
-    match app.run_status() {
-        Some(status) => parts.push(Span::styled(
-            format!(" {} ", status_text(status)),
-            Style::default()
-                .fg(Color::Black)
-                .bg(run_colour(status))
-                .add_modifier(Modifier::BOLD),
-        )),
+    match app.run_state() {
+        Some(state) => {
+            parts.push(Span::styled(
+                format!(" {} ", status_text(state)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(run_colour(state))
+                    .add_modifier(Modifier::BOLD),
+            ));
+            // §8.4：状态只说"能不能跑"，理由说"在等谁、等到什么时候"。**排队二十分钟
+            // 不知道为什么**就是少了这一格；窄终端下行会被截，但截掉的是一句话的后半段，
+            // 不是全部。
+            if let Some(reason) = app.run_wait() {
+                parts.push(Span::styled(
+                    format!("{} ", crate::tui::app::wait_text(reason, app.now)),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
         None => parts.push(Span::styled(
             " 空闲 ",
             Style::default().fg(Color::Black).bg(Color::DarkGray),
@@ -285,8 +296,9 @@ fn status_line(app: &App) -> Paragraph<'static> {
     ));
 
     if app.pending_count() > 0 {
+        // 三类合计（§7.5）：状态行只报"有几条在等人"，哪一种在哪一条由清单与提示行说。
         parts.push(Span::styled(
-            format!("· 待审批 {} ", app.pending_count()),
+            format!("· 待处理 {} ", app.pending_count()),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
@@ -296,16 +308,14 @@ fn status_line(app: &App) -> Paragraph<'static> {
     Paragraph::new(Line::from(parts))
 }
 
-fn run_colour(status: RunStatus) -> Color {
-    match status {
-        RunStatus::Running | RunStatus::Queued | RunStatus::Ingesting => Color::Cyan,
-        RunStatus::WaitingApproval | RunStatus::WaitingRetry | RunStatus::NeedsAttention => {
-            Color::Yellow
-        }
-        RunStatus::Interrupted => Color::Magenta,
-        RunStatus::Completed => Color::Green,
-        RunStatus::Failed => Color::Red,
-        RunStatus::Cancelled => Color::DarkGray,
+fn run_colour(state: RunState) -> Color {
+    match state {
+        RunState::Accepted | RunState::Queued | RunState::Running => Color::Cyan,
+        // 等待：**停着**，所以是黄色——但它是哪一种等待，由状态行后面那句理由说。
+        RunState::Waiting => Color::Yellow,
+        RunState::Completed => Color::Green,
+        RunState::Failed => Color::Red,
+        RunState::Cancelled | RunState::Abandoned => Color::DarkGray,
     }
 }
 
@@ -525,8 +535,10 @@ mod tests {
     use crate::tui::app::{App, Effect, ServerEvent, TuiMode};
     use crate::tui::test_support as fixture;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use komo_kernel::events::{Event, EventPayload, MessageAssistant};
+    use komo_kernel::events::{Event, EventPayload, MessageAssistant, RunWaiting};
+    use komo_kernel::protocol::http::InterventionKind;
     use komo_kernel::protocol::sse::{SseEvent, SseFrame};
+    use komo_kernel::types::status::{RetryCause, WaitReason};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -821,6 +833,57 @@ fn main() {
         let screen = rows(&snapshot(&app, 80, 24)).join("\n");
         assert!(!screen.contains("生成中"), "{screen}");
         assert_eq!(screen.matches("我来清一下。").count(), 1, "{screen}");
+    }
+
+    /// §8.4：状态行只说"等待中"等于没说——**理由要一起印出来**，否则"排队二十分钟不知道
+    /// 为什么"还是没人答得上。理由住在 fold 的第二个维度里（`wait`），不在状态里。
+    #[test]
+    fn the_status_line_says_what_a_waiting_run_is_waiting_for() {
+        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        feed(&mut app, &fixture::conversation()[..3]);
+        feed(
+            &mut app,
+            &[fixture::event(
+                4,
+                Some(fixture::run()),
+                EventPayload::RunWaiting(RunWaiting {
+                    reason: WaitReason::Retry {
+                        attempts: 2,
+                        not_before: fixture::T0 + time::Duration::seconds(30),
+                        cause: RetryCause::RateLimited,
+                    },
+                }),
+            )],
+        );
+        app.apply(ServerEvent::Tick(fixture::T0 + time::Duration::seconds(10)));
+
+        let screen = rows(&snapshot(&app, 120, 20)).join("\n");
+        assert!(screen.contains("等待中"), "{screen}");
+        assert!(screen.contains("20s 后重试"), "理由要印出来：{screen}");
+        assert!(screen.contains("限流"), "{screen}");
+        assert!(screen.contains("第 2 次"), "{screen}");
+    }
+
+    /// 状态行上的条数是**三类合计**（§7.5）：只有审批那一种会被漏掉另外两条的等待。
+    #[test]
+    fn the_status_line_counts_every_kind_waiting_on_a_person() {
+        let mut app = App::new(fixture::session(), TuiMode::New, "seed");
+        app.apply(ServerEvent::Pending(vec![
+            fixture::intervention_summary(
+                "7K2M",
+                InterventionKind::Approval,
+                "放行 rm -rf build？",
+            ),
+            fixture::intervention_summary(
+                "run-1",
+                InterventionKind::Verify,
+                "上次那个调用发生了没有",
+            ),
+            fixture::intervention_summary("run-2", InterventionKind::Blocked, "会话已删除"),
+        ]));
+        // 弹窗盖住的是消息面，状态行还看得见。
+        let screen = rows(&snapshot(&app, 120, 20)).join("\n");
+        assert!(screen.contains("待处理 3"), "{screen}");
     }
 
     #[test]

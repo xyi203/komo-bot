@@ -19,18 +19,18 @@ use async_trait::async_trait;
 use komo_kernel::events::Event;
 use komo_kernel::recovery::{
     ApprovalObservation, LogTail, OutputCheck, PendingCall, RecoveryAction, RecoveryInput,
-    RetryObservation, decide,
+    SessionObservation, decide,
 };
 use komo_kernel::traits::{
     ApprovalRepo, Clock, Ledger, LedgerError, RepoError, StoreError, ToolOutputStore,
 };
 use komo_kernel::types::ids::{AttemptId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::refs::{AttemptRef, PublishedOutput};
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::{RunState, SessionState, WaitReason};
 use time::OffsetDateTime;
 
 pub use observe::{
-    StartedCall, events_of, log_tail, output_ref_of, started_call, waiting_approval,
+    StartedCall, events_of, log_tail, output_ref_of, started_call, waiting_on_approval,
 };
 pub use orphan::SessionDirOrphanOutputs;
 pub use processes::{
@@ -58,7 +58,9 @@ pub trait RecoveryIndex: Send + Sync {
     /// 所有未终态 Run（§8.4 要逐个判断的就是它们）。
     async fn unfinished_runs(&self) -> Result<Vec<UnfinishedRun>, StoreError>;
 
-    /// 「启动回收：旧实例的 running -> interrupted，并交还领取权」（§8.7）。返回影响行数。
+    /// 「启动回收：旧实例遗留的 running，**只交还领取权、不判状态**」（§8.7）。返回
+    /// 影响行数。交还之后那一行是 `running` 且没有主人——一个可查询的孤儿，由 §8.4
+    /// 判成 `queued` 或 `waiting + intervention`。
     async fn reclaim_running(&self, executor: &ExecutorId) -> Result<u64, StoreError>;
 
     /// 用 JSONL 已有的事件补齐 state.db 的索引与派生执行状态。**不重放动作。**
@@ -67,8 +69,28 @@ pub trait RecoveryIndex: Send + Sync {
     /// 放回队列，等调度器领。
     async fn requeue(&self, run: &RunId) -> Result<(), StoreError>;
 
-    /// 需要操作者判断：结果不明、引用损坏、授权失效。
+    /// 需要操作者判断：停成 `waiting + intervention`（§8.4、§9.7 的清单）。理由是给
+    /// 操作者看的那一句（`runs.last_error`），因为 `WaitReason::Intervention` 只有句柄。
     async fn mark_needs_attention(&self, run: &RunId, reason: &str) -> Result<(), StoreError>;
+
+    /// `sessions.state`（§8.10）。**§8.9 的第一个问题就是它**：「这条未完成的 Run，
+    /// 它所属的会话还在服务范围里吗」——一条 Run 自己的状态说得再清楚，也答不出这件事，
+    /// 而按空上下文继续一轮比停下来更糟。
+    ///
+    /// 行不在 = `None`：那是一处"数据库与内容对不上"的损坏（会话墓碑都没了），调用方
+    /// 把它当**不服务**处置（停成 `waiting + intervention`），而不是让整轮扫描失败。
+    async fn session_state(&self, session: &SessionId) -> Result<Option<SessionState>, StoreError>;
+
+    /// 内容在不在（§8.9 的第二个问题）：目录在、且 `events.jsonl` 打得开。
+    ///
+    /// **它必须是独立于 `read` 的一问**，不能拿"读回来没报错"顶替：`Ledger::read` 对
+    /// "还没有日志的新会话"返回空列表（`GET /v1/sessions/{id}/events` 依赖那个行为），
+    /// 于是内容缺失会永远判不出来——一条被搬走的会话会被当成"内容在"，然后**按空上下文
+    /// 继续一轮**，而 §8.9 说那比停下来更糟。
+    ///
+    /// 只观察、不创建（§8.9：观察不改写）；权威实现是 store 的
+    /// `repos::reconcile::content_available`。
+    async fn session_content(&self, session: &SessionId) -> Result<bool, StoreError>;
 }
 
 /// 按一次尝试的身份找**孤儿 `output.json`**：工具跑完、`output.json` 已经完整落盘，
@@ -116,11 +138,13 @@ struct Observed {
 pub struct UnfinishedRun {
     pub run: RunId,
     pub session: SessionId,
-    pub status: RunStatus,
+    /// 能不能跑（§8.4）。
+    pub state: RunState,
+    /// 为什么不能跑（`state == Waiting` 时有值）。**它与状态是两个维度**：少了它，
+    /// "排队二十分钟"就只是一句状态，答不出在等谁、等到什么时候。
+    pub wait: Option<WaitReason>,
     /// 还握着领取权的执行实例。
     pub claimed_by: Option<ExecutorId>,
-    /// 等待重试时已经用掉的次数与下次时间。**重启不重置预算**（§8.5）。
-    pub retry: Option<RetryObservation>,
     /// 最终结果已经送达客户端了吗。
     pub result_delivered: bool,
 }
@@ -139,9 +163,11 @@ pub struct RecoveryOutcome {
 pub enum Applied {
     /// 补齐索引后放回队列，由 AgentLoop 接着跑。
     Requeued,
-    /// 保持原状：还在等审批 / 等退避 / 已经是终态 / 等同一请求键重传。
+    /// 保持原状：还在等审批 / 等干预 / 等退避 / 等前一条 Run / 已经是终态 / 等同一请求键
+    /// 重传。**放它出来不是恢复扫描的事**——等退避的看时钟、等依赖的看前一条的终态
+    /// （§8.9）。
     LeftAsIs,
-    /// 标成 needs_attention，等人。
+    /// 停成 `waiting + intervention`，等人来答（§7.5 的清单）。
     NeedsOperator,
     /// 结果是好的，只是没送到——调用方补发（§8.4 第 10 行）。
     Redeliver,
@@ -168,14 +194,14 @@ impl RecoveryReport {
         self.count(Applied::Requeued)
     }
 
+    /// 还停着等人或等钟的那些——**它们每一个都说得出在等什么**（§8.4 的验收口径）。
     pub fn waiting(&self) -> usize {
         self.outcomes
             .iter()
             .filter(|o| {
                 matches!(
                     o.action,
-                    RecoveryAction::KeepWaitingApproval { .. }
-                        | RecoveryAction::WaitUntilRetry { .. }
+                    RecoveryAction::KeepWaiting { .. } | RecoveryAction::WaitUntilRetry { .. }
                 )
             })
             .count()
@@ -244,7 +270,7 @@ impl RecoveryReport {
             parts.push(format!("{} 个任务已接续", self.requeued()));
         }
         if self.waiting() > 0 {
-            parts.push(format!("{} 个等待审批或重试", self.waiting()));
+            parts.push(format!("{} 个在等待（审批 / 干预 / 退避）", self.waiting()));
         }
         if self.needs_operator() > 0 {
             parts.push(format!("{} 个需要你处理", self.needs_operator()));
@@ -310,12 +336,12 @@ impl RecoveryScan {
         self
     }
 
-    /// 跑一遍（§8.7 的启动顺序里"将旧执行实例的 running 标为 interrupted"之后那几步）。
+    /// 跑一遍（§8.7 的启动顺序里"回收没有主人的 running"之后那几步）。
     ///
     /// **一个坏会话只停它自己**（§8.4：「停止受影响会话，报告损坏」——受影响的是它，
-    /// 不是这一轮扫描）。所以观察失败在循环里当场接住：把那个 Run 标成
-    /// `needs_attention` 并记下原因，然后继续判下一个。会一路冒上去的只有索引层的失败
-    /// ——那是数据库级的问题，不是某一个会话的。
+    /// 不是这一轮扫描）。所以观察失败在循环里当场接住：把那个 Run 停成
+    /// `waiting + intervention` 并记下原因，然后继续判下一个。会一路冒上去的只有索引层
+    /// 的失败——那是数据库级的问题，不是某一个会话的。
     pub async fn scan(&self) -> Result<RecoveryReport, RecoveryError> {
         let reclaimed = self.index.reclaim_running(&self.executor).await?;
         if reclaimed > 0 {
@@ -346,7 +372,7 @@ impl RecoveryScan {
             tracing::info!(
                 run = %run.run,
                 session = %run.session,
-                status = ?run.status,
+                state = ?run.state,
                 action = ?action,
                 ?applied,
                 "恢复决定"
@@ -367,26 +393,64 @@ impl RecoveryScan {
     }
 
     async fn observe_full(&self, run: &UnfinishedRun) -> Result<Observed, RecoveryError> {
-        let events = self.read_session(&run.session).await?;
+        // 会话这一维先取（§8.9 的第一个问题）。数据库级失败是整轮扫描的事，不在这里
+        // 吞掉——一个 Run 的会话行读不出来，说明这一层已经不可信了。
+        let state = self.index.session_state(&run.session).await?;
+        // 墓碑都没了也是"不服务"：内容不该在，这条 Run 不许领（§8.10）。
+        let state = state.unwrap_or(SessionState::Purged);
+
+        // 「内容在不在」是**另一个维度，另一次询问**（§8.9 的第二个问题）。它不能从
+        // `read` 的结果推：`Ledger::read` 对"还没有日志的新会话"返回空列表（那是
+        // `GET /v1/sessions/{id}/events` 要的行为），所以"读回来没报错"不等于"内容在"。
+        // 拿它顶替的话，一个被搬走的会话会被判成"内容在"，然后按空上下文继续一轮。
+        let content_available = self.index.session_content(&run.session).await?;
+
+        // 事件另取一份。这里的失败分两种：
+        // - **JSONL 中间损坏**：内容在，只是坏了 → 这是损坏，交给 `scan` 的损坏处置
+        //   （§8.3：停止受影响会话，报告损坏），**不走"内容缺失"**。
+        // - **读不出来**（IO 失败）：`read` 只负责取事件，取不到就是空列表——内容在不在
+        //   已经由上面那一问回答了，这里不重复判一次。
+        let events = match self.read_session(&run.session).await {
+            Ok(events) => events,
+            Err(error) => match &error {
+                RecoveryError::Ledger(LedgerError::Corrupt(_)) => return Err(error),
+                _ => {
+                    tracing::warn!(
+                        run = %run.run,
+                        session = %run.session,
+                        %error,
+                        "会话事件读不出来，这一轮按空日志判；内容在不在已单独问过"
+                    );
+                    Vec::new()
+                }
+            },
+        };
+
         let log_tail = log_tail(&events, &run.run);
         let (output_check, orphan) = self.check_output(&events, run, &log_tail).await;
         let approval = self.observe_approval(&events, run).await?;
 
         Ok(Observed {
             input: RecoveryInput {
-                db_status: run.status,
+                state: run.state,
+                wait: run.wait.clone(),
                 log_tail,
                 output_check,
                 approval,
-                retry: run.retry.clone(),
                 result_delivered: run.result_delivered,
                 // 「无法确认旧执行已结束时，阻止该任务重复启动并显示原因」（§8.7）。
                 previous_executor_stopped: self.liveness.stopped(run.claimed_by.as_ref()),
+                session: SessionObservation {
+                    state,
+                    content_available,
+                },
             },
             orphan,
         })
     }
 
+    /// 取这个会话的全部事件。**只负责取事件**：读不到就是空列表，不在这里判"内容在不在"
+    /// ——那是 [`RecoveryIndex::session_content`] 的活（§8.9 的两个问题是两次询问）。
     async fn read_session(&self, session: &SessionId) -> Result<Vec<Event>, RecoveryError> {
         // 短事务分页（§13.5 `Ledger::read` 的注释：`limit` 不是可选的）。
         let mut all = Vec::new();
@@ -529,15 +593,18 @@ impl RecoveryScan {
     }
 
     /// 审批的观察。**权威是 state.db**——JSONL 里的审计副本不能自行创建授权（§7.4）。
+    ///
+    /// 只有**真的停在审批上**才去问数据库：停在退避、干预或前一条 Run 上的 Run 问不出
+    /// 审批来，硬问只会把"找不到"当成损坏。
     async fn observe_approval(
         &self,
         events: &[Event],
         run: &UnfinishedRun,
     ) -> Result<ApprovalObservation, RecoveryError> {
-        if run.status != RunStatus::WaitingApproval {
+        if !matches!(run.wait, Some(WaitReason::Approval { .. })) {
             return Ok(ApprovalObservation::None);
         }
-        let Some(id) = waiting_approval(events, &run.run) else {
+        let Some(id) = waiting_on_approval(events, &run.run) else {
             return Ok(ApprovalObservation::None);
         };
         let Some(record) = self.approvals.get(&id).await? else {
@@ -609,23 +676,29 @@ impl RecoveryScan {
                 self.index.requeue(&run.run).await?;
                 Ok(Applied::Requeued)
             }
-            // 等人、等钟、等重传、已经是终态：原样留着。
+            // 等人、等钟、等重传、已经是终态：原样留着，**一个字都不写**。
             //
-            // `WaitUntilRetry` 也在这里：**恢复扫描不动等退避的 Run**。它的
-            // `next_retry_at` 与已用次数都已经持久化（§8.5：重启不重置预算），到期之后
-            // 由调度器的领取查询（`status IN ('queued','waiting_retry') AND
-            // next_retry_at <= now`，§8.7）自己领回去。在这里 requeue 只会让它提前跑，
-            // 正好绕过那次退避。
+            // - `KeepWaiting`：它就是从这个 Run 自己的等待列上读出来的，再写一遍是同值
+            //   覆盖；而 `Ledger::suspend` 还会往 JSONL 追一条新的 `run.waiting`——
+            //   回放只补索引，不制造新的事实（§8.5、§8.9）。
+            // - `WaitUntilRetry`：**恢复扫描不动等退避的 Run**。次数与到点时刻都已经
+            //   持久化（§8.5：重启不重置预算），到期之后由调度器的领取查询
+            //   （`wait_kind = 'retry' AND wake_at <= now`，§8.7）自己领回去。在这里
+            //   requeue 只会让它提前跑，正好绕过那次退避。
+            // - `KeepTerminal`：已经是那四个之一了。补写一条终态事件是**重复的终态**，
+            //   不是"补齐"——真要补的是索引（第 10 行那条路径的 `RedeliverResult`）。
             RecoveryAction::AwaitResend
-            | RecoveryAction::KeepWaitingApproval { .. }
+            | RecoveryAction::KeepWaiting { .. }
             | RecoveryAction::WaitUntilRetry { .. }
-            | RecoveryAction::KeepTerminal { .. } => Ok(Applied::LeftAsIs),
+            | RecoveryAction::KeepTerminal { state: _ } => Ok(Applied::LeftAsIs),
             // 结果是好的，只是没送到。**不重新执行任务。**
             RecoveryAction::RedeliverResult => {
                 self.index.backfill(&run.run).await?;
                 Ok(Applied::Redeliver)
             }
-            RecoveryAction::NeedsAttention { reason } => {
+            // 需要操作者判断：停成 `waiting + intervention`（§8.4、§7.5 的清单）。理由
+            // 落在 `last_error` 上，因为 `WaitReason::Intervention` 只有句柄。
+            RecoveryAction::WaitingForOperator { reason } => {
                 self.index.mark_needs_attention(&run.run, reason).await?;
                 Ok(Applied::NeedsOperator)
             }

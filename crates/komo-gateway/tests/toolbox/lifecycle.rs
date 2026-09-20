@@ -63,14 +63,11 @@ async fn a_candidate_becomes_callable_only_after_it_is_tested_and_approved() {
     );
 
     // 5. 批准 → 后台把它装上。
-    let approval = change["approval"].as_str().expect("审批号").to_string();
-    let (code, body) = gw
-        .post(
-            &format!("/v1/approvals/{approval}/decision"),
-            json!({ "approved": true, "scope": "once" }),
-        )
-        .await;
-    assert_eq!(code, 200, "{body}");
+    // 审批的答复**只走** `POST /v1/interventions/{handle}/answer`（§7.5），句柄是短 ID；
+    // 发起方手上只有审批号，`decide` 顺手把短 ID 查出来（它内部断言 200）。
+    let approval =
+        komo_kernel::types::ids::ApprovalId::from_raw(change["approval"].as_str().expect("审批号"));
+    gw.decide(&approval, true).await;
 
     eventually("adder 装上", || async {
         toolbox_show(&gw, "adder").await.enabled.is_some()
@@ -98,12 +95,9 @@ async fn a_rejected_enable_leaves_the_module_alone_and_keeps_the_candidate() {
 
     let (_, body) = gw.post("/v1/toolbox/adder/enable", json!({})).await;
     let change: serde_json::Value = serde_json::from_str(&body).expect("响应");
-    let approval = change["approval"].as_str().expect("审批号").to_string();
-    gw.post(
-        &format!("/v1/approvals/{approval}/decision"),
-        json!({ "approved": false, "scope": "once" }),
-    )
-    .await;
+    let approval =
+        komo_kernel::types::ids::ApprovalId::from_raw(change["approval"].as_str().expect("审批号"));
+    gw.decide(&approval, false).await;
 
     // 给后台任务一点时间去看见那个"拒绝"。
     tokio::time::sleep(std::time::Duration::from_millis(600)).await;
@@ -134,7 +128,8 @@ async fn a_candidate_edited_during_the_approval_window_does_not_ride_in_on_the_o
     let (_, body) = gw.post("/v1/toolbox/adder/enable", json!({})).await;
     let change: serde_json::Value = serde_json::from_str(&body).expect("响应");
     assert_eq!(change["version"], json!(approved_version));
-    let approval = change["approval"].as_str().expect("审批号").to_string();
+    let approval =
+        komo_kernel::types::ids::ApprovalId::from_raw(change["approval"].as_str().expect("审批号"));
 
     // 审批窗口里又改了一版（而且这一版没测过）。
     write_candidate(
@@ -144,11 +139,7 @@ async fn a_candidate_edited_during_the_approval_window_does_not_ride_in_on_the_o
         Some(ADDER_TEST),
     );
 
-    gw.post(
-        &format!("/v1/approvals/{approval}/decision"),
-        json!({ "approved": true, "scope": "once" }),
-    )
-    .await;
+    gw.decide(&approval, true).await;
     tokio::time::sleep(std::time::Duration::from_millis(800)).await;
 
     assert!(

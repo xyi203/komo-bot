@@ -5,6 +5,7 @@
 
 use komo_kernel::traits::StoreError;
 use komo_kernel::types::ids::{Seq, SessionId};
+use komo_kernel::types::status::SessionState;
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
 use toasty::Executor;
@@ -24,11 +25,17 @@ pub struct SessionRecord {
     pub jsonl_path: String,
     pub applied_seq: Seq,
     pub applied_bytes: u64,
+    /// 生命周期状态（§8.10）。
+    pub state: SessionState,
+    /// 状态变更时刻（写库时间；`0` 读成 Unix 纪元）。
+    pub state_changed_at: OffsetDateTime,
 }
 
-impl From<&SessionRow> for SessionRecord {
-    fn from(row: &SessionRow) -> Self {
-        Self {
+impl SessionRecord {
+    /// 从行读出来。**`state` 认不出就是损坏**（§8.10 第 1 条）：默认成 `active` 会把
+    /// `deleted` / `purged` 的墓碑读成活的。
+    fn try_from_row(row: &SessionRow) -> Result<SessionRecord, StoreError> {
+        Ok(SessionRecord {
             session: SessionId::from_raw(row.id.clone()),
             title: row.title.clone(),
             origin: row.origin.clone(),
@@ -37,8 +44,25 @@ impl From<&SessionRow> for SessionRecord {
             jsonl_path: row.jsonl_path.clone(),
             applied_seq: Seq(row.applied_seq.max(0) as u64),
             applied_bytes: row.applied_bytes.max(0) as u64,
-        }
+            state: state_of_row(row)?,
+            state_changed_at: crate::db::from_ts(row.state_changed_at),
+        })
     }
+
+    /// 这个会话接不接受新输入（§8.10）。
+    pub fn accepts_input(&self) -> bool {
+        self.state.accepts_input()
+    }
+}
+
+/// 一行里的生命周期状态。**认不出的值报错**，不挑默认值。
+pub fn state_of_row(row: &SessionRow) -> Result<SessionState, StoreError> {
+    SessionState::parse(&row.state).ok_or_else(|| {
+        StoreError::Corrupt(format!(
+            "sessions.state 认不出的值 {:?}（会话 {}）：只认 active / closing / deleted / purged",
+            row.state, row.id
+        ))
+    })
 }
 
 /// 读一个 Session 的元数据。
@@ -52,7 +76,10 @@ pub async fn get(db: &Db, session: &SessionId) -> Result<Option<SessionRecord>, 
                 .exec(ex)
                 .await
                 .map_err(map_toasty)?;
-            Ok(row.as_ref().map(SessionRecord::from))
+            match row {
+                Some(row) => Ok(Some(SessionRecord::try_from_row(&row)?)),
+                None => Ok(None),
+            }
         }) as BoxFuture<'_, Result<Option<SessionRecord>, StoreError>>
     })
     .await
@@ -92,10 +119,83 @@ pub async fn ensure_in(
         applied_bytes: 0_i64,
         created_at: to_ts(now),
         updated_at: to_ts(now),
+        // 新会话一律 `active`；状态变更时刻与建行时刻一致（§8.10 第 1 条）。
+        state: SessionState::Active.as_str(),
+        state_changed_at: to_ts(now),
     })
     .exec(ex)
     .await
     .map_err(map_toasty)
+}
+
+/// 在事务里读一个 Session 的生命周期状态。行不在 = `None`。
+pub async fn state_in(
+    ex: &mut dyn Executor,
+    session: &SessionId,
+) -> Result<Option<SessionState>, StoreError> {
+    let Some(row) = get_in(ex, session).await? else {
+        return Ok(None);
+    };
+    state_of_row(&row).map(Some)
+}
+
+/// 读一个 Session 的生命周期状态。行不在 = `None`；值认不出 = 错误（§8.10）。
+pub async fn state(db: &Db, session: &SessionId) -> Result<Option<SessionState>, StoreError> {
+    let id = session.to_string();
+    db.read(move |ex| {
+        let id = id.clone();
+        Box::pin(async move {
+            let Some(row) = SessionRow::filter_by_id(&id)
+                .first()
+                .exec(ex)
+                .await
+                .map_err(map_toasty)?
+            else {
+                return Ok(None);
+            };
+            state_of_row(&row).map(Some)
+        }) as BoxFuture<'_, Result<Option<SessionState>, StoreError>>
+    })
+    .await
+}
+
+/// **条件**推进生命周期状态：只有当前状态**恰好是** `from` 才写成 `to`。
+///
+/// 返回 `true` = 这次调用推进了它（`rows affected == 1`），`false` = 状态已经不是 `from`
+/// 了，什么都没改。`from` 是 CAS：重跑一次不会把 `deleted` 盖回 `closing`——`komo
+/// session delete`（`active → closing`）与 `purge`（`deleted → purged`）都可能被重试或
+/// 并发调用，只有受影响行数能分辨"我推进了"与"别人已经推过了"（§8.10）。
+///
+/// **`purged` 是墓碑，没有出口**：内容已经删了，把它推回任何一个前面的状态都只会得到一个
+/// 说不清自己内容的会话，所以那一类请求一律 `false`。§8.10 的"`purged` 之后没有任何路径再
+/// 创建那个目录"要从这里就开始兜住，不能只靠调用方自觉。
+///
+/// **这是 raw SQL 的第四处**，理由与 §8.2 表里那句一样：toasty 的类型化 `UPDATE` 拿不到
+/// 受影响行数，`rows affected` 是这里唯一可用的信号。
+pub async fn set_state_in(
+    ex: &mut dyn Executor,
+    session: &SessionId,
+    from: SessionState,
+    to: SessionState,
+    now: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    if from == SessionState::Purged {
+        return Ok(false);
+    }
+    let at = to_ts(now);
+    let affected = toasty::sql::statement(
+        r#"UPDATE sessions
+              SET state = ?1, state_changed_at = ?2, updated_at = ?2
+            WHERE id = ?3 AND state = ?4"#,
+    )
+    .bind(to.as_str())
+    .bind(at)
+    .bind(session.as_str())
+    .bind(from.as_str())
+    .exec(ex)
+    .await
+    .map_err(map_toasty)?;
+    Ok(affected == 1)
 }
 
 /// 推进 `applied_seq` / `applied_bytes`。
@@ -254,12 +354,28 @@ pub async fn digests(db: &Db, session: &SessionId) -> Result<BTreeMap<Seq, Strin
     .await
 }
 
-/// 全部 Session（按 id，也就是按创建时间——UUIDv7）。
-pub async fn list(db: &Db) -> Result<Vec<SessionRecord>, StoreError> {
+/// Session 列表（按 id，也就是按创建时间——UUIDv7）。
+///
+/// `all = false`（默认）只列 `active` 与 `closing`：逻辑删除过的会话默认不列（§8.10；
+/// `closing` 要列出来并标注"正在关闭"，它还在服务）。`all = true` 把 `deleted` 也带上
+/// ——它是墓碑但还在列表语义里（可 `show`、可 `purge`）。**`purged` 两种都不列**：那一行
+/// 只是"这个会话曾经存在"的记录，只在显式查看单个会话时可见（§8.10 的列表列）。
+pub async fn list(db: &Db, all: bool) -> Result<Vec<SessionRecord>, StoreError> {
     db.read(move |ex| {
         Box::pin(async move {
             let rows = SessionRow::all().exec(ex).await.map_err(map_toasty)?;
-            let mut out: Vec<SessionRecord> = rows.iter().map(SessionRecord::from).collect();
+            let mut out = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let record = SessionRecord::try_from_row(row)?;
+                let visible = match record.state {
+                    SessionState::Active | SessionState::Closing => true,
+                    SessionState::Deleted => all,
+                    SessionState::Purged => false,
+                };
+                if visible {
+                    out.push(record);
+                }
+            }
             out.sort_by(|a, b| a.session.as_str().cmp(b.session.as_str()));
             Ok(out)
         }) as BoxFuture<'_, Result<Vec<SessionRecord>, StoreError>>
@@ -347,7 +463,7 @@ mod tests {
         })
         .await;
 
-        let all = list(&db).await.unwrap();
+        let all = list(&db, false).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].origin, "api", "已经在了就原样返回，不改写来源");
     }
@@ -427,5 +543,206 @@ mod tests {
         let digests = digests(&db, &SessionId::from_raw("sess-1")).await.unwrap();
         assert_eq!(digests.len(), 3);
         assert_eq!(digests[&Seq(2)], format!("{:064}", 2));
+    }
+
+    async fn ensure(db: &Db, id: &str) {
+        let id = id.to_string();
+        db.with_write_retry(move |ex| {
+            let id = id.clone();
+            Box::pin(async move {
+                ensure_in(ex, &SessionId::from_raw(id), "api", "p", NOW)
+                    .await
+                    .map(|_| ())
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn set_state(db: &Db, id: &str, from: SessionState, to: SessionState) -> bool {
+        let id = id.to_string();
+        db.with_write_retry(move |ex| {
+            let id = id.clone();
+            Box::pin(async move { set_state_in(ex, &SessionId::from_raw(id), from, to, NOW).await })
+                as BoxFuture<'_, Result<bool, StoreError>>
+        })
+        .await
+        .unwrap()
+    }
+
+    /// 新建的会话是 `active`，而且状态变更时刻就是建行时刻（§8.10 第 1 条）。
+    #[tokio::test]
+    async fn a_new_session_starts_active() {
+        let (db, _dir) = temp().await;
+        ensure(&db, "sess-1").await;
+        let record = get(&db, &SessionId::from_raw("sess-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, SessionState::Active);
+        assert!(record.accepts_input());
+        assert_eq!(record.state_changed_at, NOW);
+    }
+
+    /// `set_state_in` 是 CAS：`from` 对不上就什么都不改。
+    ///
+    /// 重跑一次逻辑删除（`active → closing`）不能再改一次时间；`purge` 的重跑更不能把
+    /// `deleted` 盖回 `closing`——那会让一个已经删掉的会话看起来又在服务（§8.10）。
+    #[tokio::test]
+    async fn set_state_only_advances_from_the_expected_state() {
+        let (db, _dir) = temp().await;
+        ensure(&db, "sess-1").await;
+
+        assert!(
+            set_state(&db, "sess-1", SessionState::Active, SessionState::Closing).await,
+            "第一次受理逻辑删除：推进了"
+        );
+        assert!(
+            !set_state(&db, "sess-1", SessionState::Active, SessionState::Closing).await,
+            "重跑：状态已经不是 active，什么都不改"
+        );
+        assert!(
+            set_state(&db, "sess-1", SessionState::Closing, SessionState::Deleted).await,
+            "没有未完成的 Run 时由 reconcile 推进到 deleted"
+        );
+        assert!(
+            !set_state(&db, "sess-1", SessionState::Closing, SessionState::Deleted).await,
+            "重跑：不重复推进"
+        );
+        // `komo session delete` 的重跑是 `active → closing`：对已经 `deleted` 的行不生效，
+        // 所以它**不会把墓碑盖回 `closing`**（§8.10）。
+        assert!(
+            !set_state(&db, "sess-1", SessionState::Active, SessionState::Closing).await,
+            "**不许把 deleted 盖回 closing**"
+        );
+
+        // 墓碑只能往回收方向走，而且重跑幂等。
+        assert!(
+            set_state(&db, "sess-1", SessionState::Deleted, SessionState::Purged).await,
+            "deleted → purged 是最后一步"
+        );
+        assert!(
+            !set_state(&db, "sess-1", SessionState::Deleted, SessionState::Purged).await,
+            "回收重跑什么都不改"
+        );
+        assert!(!set_state(&db, "sess-1", SessionState::Purged, SessionState::Active).await);
+
+        let record = get(&db, &SessionId::from_raw("sess-1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, SessionState::Purged);
+        assert!(!record.accepts_input());
+    }
+
+    /// 列里出现认不出的状态值 = 损坏，**不默认成 active**：默认会把墓碑读成活会话。
+    #[tokio::test]
+    async fn an_unknown_state_value_is_corruption_not_active() {
+        let (db, _dir) = temp().await;
+        ensure(&db, "sess-1").await;
+        let bad = db.clone();
+        bad.with_write_retry(|ex| {
+            Box::pin(async move {
+                toasty::sql::statement("UPDATE sessions SET state = 'zombie' WHERE id = 'sess-1'")
+                    .exec(ex)
+                    .await
+                    .map(|_| ())
+                    .map_err(map_toasty)
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+
+        let error = get(&db, &SessionId::from_raw("sess-1"))
+            .await
+            .expect_err("认不出的状态要报损坏");
+        assert!(
+            matches!(&error, StoreError::Corrupt(why) if why.contains("zombie")),
+            "错误要说清是哪个值：{error}"
+        );
+        assert!(state(&db, &SessionId::from_raw("sess-1")).await.is_err());
+    }
+
+    /// 默认只列 `active` / `closing`；`all` 带上 `deleted`；`purged` 两种都不列（§8.10）。
+    #[tokio::test]
+    async fn deleted_sessions_are_hidden_unless_asked_for() {
+        let (db, _dir) = temp().await;
+        for id in ["sess-active", "sess-closing", "sess-deleted", "sess-purged"] {
+            ensure(&db, id).await;
+        }
+        assert!(
+            set_state(
+                &db,
+                "sess-closing",
+                SessionState::Active,
+                SessionState::Closing
+            )
+            .await
+        );
+        assert!(
+            set_state(
+                &db,
+                "sess-deleted",
+                SessionState::Active,
+                SessionState::Closing
+            )
+            .await
+        );
+        assert!(
+            set_state(
+                &db,
+                "sess-deleted",
+                SessionState::Closing,
+                SessionState::Deleted
+            )
+            .await
+        );
+        assert!(
+            set_state(
+                &db,
+                "sess-purged",
+                SessionState::Active,
+                SessionState::Closing
+            )
+            .await
+        );
+        assert!(
+            set_state(
+                &db,
+                "sess-purged",
+                SessionState::Closing,
+                SessionState::Deleted
+            )
+            .await
+        );
+        assert!(
+            set_state(
+                &db,
+                "sess-purged",
+                SessionState::Deleted,
+                SessionState::Purged
+            )
+            .await
+        );
+
+        let visible: Vec<String> = list(&db, false)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.session.to_string())
+            .collect();
+        assert_eq!(visible, vec!["sess-active", "sess-closing"]);
+
+        let all: Vec<String> = list(&db, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|record| record.session.to_string())
+            .collect();
+        assert_eq!(
+            all,
+            vec!["sess-active", "sess-closing", "sess-deleted"],
+            "墓碑行只在显式查看单个会话时可见"
+        );
     }
 }

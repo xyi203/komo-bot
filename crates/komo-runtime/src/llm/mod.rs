@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::traits::{LlmClient, TurnDriver};
 use komo_kernel::types::model::{ModelConfig, ModelRole};
+use komo_kernel::types::status::RetryCause;
 use komo_kernel::types::turn::{LlmError, TurnRequest};
 
 pub use chat::ChatCompletionsLlm;
@@ -55,26 +56,45 @@ impl From<LlmBuildError> for LlmError {
     }
 }
 
-/// 这次失败可以重试吗。
+/// 这次失败属于哪一种**可安全重试**的退避（§8.5），`None` = 不能重试。
 ///
-/// 穷举匹配，因为「哪些错误可以再发一次」这件事必须随 [`LlmError`] 一起长——新增一个
-/// 变体时编译器会在这里停下来问。两条是硬的：**流没收到终止帧**（`Incomplete`）可以
-/// 重试；**effort 不被支持**不可以——重试只会再发一次同样的参数，而"删掉 effort 再试"
-/// 是 §13.3 明令禁止的。
-pub fn is_retryable(error: &LlmError) -> bool {
+/// 穷举匹配，因为「哪些错误可以再发一次、退多久」这两件事必须随 [`LlmError`] 一起长——
+/// 新增一个变体时编译器会在这里停下来问。两条是硬的：**流没收到终止帧**（`Incomplete`）
+/// 可以重试；**effort 不被支持**不可以——重试只会再发一次同样的参数，而"删掉 effort
+/// 再试"是 §13.3 明令禁止的。
+///
+/// 分类的意义在 §8.4 的那句话上：`RateLimited` 要尊重服务端给的 `Retry-After`,
+/// `Contended` 退几毫秒就够，而 5xx 要退得比它们久——混成一个数字就只能取最保守值。
+/// 模型这一路只出得了三种：429（服务端限流）、5xx（服务端错误），其余 **分不出是谁的
+/// 问题就按 `Transport` 算**——它不是"我请求写错了"（那种由 `is_retryable` 的 `None`
+/// 拦下），而是"这一次没送达"，多等一会儿再发一次是安全的。
+pub fn retry_cause(error: &LlmError) -> Option<RetryCause> {
     match error {
-        // 408 请求超时 / 409 冲突 / 425 too early / 429 限流 / 5xx。
-        LlmError::Rejected { status, .. } => {
-            matches!(status, 408 | 409 | 425 | 429) || (500..600).contains(status)
-        }
-        LlmError::Timeout => true,
+        LlmError::Rejected { status, .. } => match status {
+            429 => Some(RetryCause::RateLimited),
+            500..=599 => Some(RetryCause::Server),
+            // 408 请求超时 / 409 冲突 / 425 too early：都是"这一次没成"。它们既不是
+            // 限流（没有 `Retry-After` 可尊重），也说不清是 4xx 里的哪一方的问题，
+            // 所以按传输失败退避。
+            408 | 409 | 425 => Some(RetryCause::Transport),
+            _ => None,
+        },
+        LlmError::Timeout => Some(RetryCause::Transport),
         // 「回复未收齐」——包括流断在终止帧之前。
-        LlmError::Incomplete => true,
-        LlmError::Transport(_) => true,
-        LlmError::UnsupportedEffort { .. } => false,
+        LlmError::Incomplete => Some(RetryCause::Transport),
+        LlmError::Transport(_) => Some(RetryCause::Transport),
+        LlmError::UnsupportedEffort { .. } => None,
         // §8.5：结果与用量都未知时保留未知标记，不能当成零，也不能自动再来一次。
-        LlmError::Unknown(_) => false,
+        LlmError::Unknown(_) => None,
     }
+}
+
+/// 这次失败可以重试吗——[`retry_cause`] 的另一种说法。
+///
+/// 一处判断，适配器、loop 与巡检不会各有一套：`is_retryable` 与 `retry_cause` 不可能
+/// 对同一个错误给出互相矛盾的答案。
+pub fn is_retryable(error: &LlmError) -> bool {
+    retry_cause(error).is_some()
 }
 
 /// 适配器共用的出站通道。连接池共用一份就够；每次请求自己的超时由

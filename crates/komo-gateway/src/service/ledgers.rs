@@ -29,7 +29,7 @@ use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::refs::{
     AttemptRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput,
 };
-use komo_kernel::types::status::{RunEnd, Wait};
+use komo_kernel::types::status::{RunEnd, WaitReason};
 use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse};
 use komo_store::{Coordinator, Db, FileToolOutputStore, SessionPaths};
 
@@ -101,7 +101,19 @@ impl SessionLedgers {
         &self.root
     }
 
+    /// 这个 Session 的目录路径。**只算路径，不碰磁盘**——`Ledger::read` 那条只读路径
+    /// 从这里拿位置，再去 [`komo_store::session_log::read_events`] 读（§8.9：观察不改写）。
+    pub fn paths_for(&self, session: &SessionId) -> SessionPaths {
+        paths_for(&self.root, session)
+    }
+
     /// 拿这个 Session 的三件套；没开过就开一个。
+    ///
+    /// **它会创建内容**：`Coordinator::open` → `SessionPaths::ensure` 建出会话目录、
+    /// `SessionLog::open` 落下一份 `events.jsonl`。所以它是**写路径的入口**（accept /
+    /// boundary / suspend / complete / append_audit）——只读的观察不能走它，否则"读一次"
+    /// 就把被搬走的目录又建回来了（§8.9、§8.10：reconcile 正是靠"内容在不在"判一条 Run
+    /// 能不能领）。
     pub async fn open(
         &self,
         session: &SessionId,
@@ -256,7 +268,7 @@ impl Ledger for PublishingLedger {
         pumped!(self, self.inner.finish_call(attempt, published).await)
     }
 
-    async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError> {
+    async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
         pumped!(self, self.inner.suspend(run, wait).await)
     }
 
@@ -545,7 +557,7 @@ impl Ledger for RoutedLedger {
             .await
     }
 
-    async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError> {
+    async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
         let outcome = self
             .for_run(run)
             .await?
@@ -554,12 +566,12 @@ impl Ledger for RoutedLedger {
             .await;
         // 停在**待审批**上：`approval.requested` 那条审计事件还在 `control_outbox` 里
         // （§8.5 的反向顺序：state.db 权威先提交，JSONL 那一条随后补写），而界面正是靠
-        // 它才知道有人等着回答——`run.waiting_approval` 只说"停下了"，短 ID 在它身上。
+        // 它才知道有人等着回答——`run.waiting` 只说"停在审批上"，短 ID 在它身上。
         // 等周期（`AUDIT_TICK`）就是让操作者的弹窗晚到一分钟，所以这里立刻叫醒补写。
         //
         // 审批请求此刻**已经提交**（`ApprovalGate::request` 在 `suspend` 之前跑完），
         // 所以醒来一定能读到那一行；拿不到时补写留到下一拍，不影响权威。
-        if outcome.is_ok() && matches!(wait, Wait::Approval { .. }) {
+        if outcome.is_ok() && matches!(wait, WaitReason::Approval { .. }) {
             self.audit_wake.notify_one();
         }
         outcome
@@ -575,12 +587,19 @@ impl Ledger for RoutedLedger {
         from: Seq,
         limit: u32,
     ) -> Result<EventBatch, LedgerError> {
-        self.ledgers
-            .open(session, "agent")
-            .await?
-            .ledger
-            .read(session, from, limit)
-            .await
+        // **读不得创建或修改内容**（§8.9：观察不改写）。所以这里不走
+        // `SessionLedgers::open`——那条路会 `ensure` 建目录、落一份日志，读一次就把搬走
+        // 的会话目录又建回来了，而 §8.10 判一条 Run 能不能领靠的正是"内容在不在"。
+        // 直接按路径读磁盘：目录/日志不在就是"读不出来"，不替它造一份空的。
+        let paths = self.ledgers.paths_for(session);
+        let (events, more) =
+            komo_store::session_log::read_events(&paths, session, from, limit).await?;
+        let next = more.then(|| events.last().map(|event| event.seq)).flatten();
+        Ok(EventBatch {
+            session: session.clone(),
+            events,
+            next,
+        })
     }
 
     async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError> {

@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
 use komo_kernel::types::ids::{RunId, Seq, SessionId};
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::RunState;
 
 /// 每个订阅者的缓冲。满了就丢最老的——丢掉只是"晚一点知道"，内容补读仍在账本里。
 const CHANNEL_CAPACITY: usize = 256;
@@ -26,6 +26,30 @@ pub const HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(15);
 #[derive(Debug, Default)]
 pub struct EventHub {
     channels: Mutex<BTreeMap<SessionId, tokio::sync::broadcast::Sender<SseFrame>>>,
+    /// 每个 Session 现在有**几个客户端在看**（HTTP 的 SSE 连接）。
+    ///
+    /// 与 `channels` 里的订阅者数不是一回事：Run 的看客（`service::run_watch`）自己也
+    /// 订阅同一个广播，那是 Gateway 内部的一条，不代表屏幕前有人。要判断"有没有人在看"
+    /// 只能用这个计数——它由 [`EventHub::watch`] 的守卫加减。
+    viewers: Mutex<BTreeMap<SessionId, usize>>,
+}
+
+/// 一条客户端订阅的凭据：**掉了就减一**（连接断开、任务被取消、进程退出都算）。
+pub struct Viewer {
+    hub: Arc<EventHub>,
+    session: SessionId,
+}
+
+impl Drop for Viewer {
+    fn drop(&mut self) {
+        let mut viewers = self.hub.viewers.lock().expect("看客表");
+        if let Some(count) = viewers.get_mut(&self.session) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                viewers.remove(&self.session);
+            }
+        }
+    }
 }
 
 impl EventHub {
@@ -44,6 +68,36 @@ impl EventHub {
             .entry(session.clone())
             .or_insert_with(|| tokio::sync::broadcast::channel(CHANNEL_CAPACITY).0)
             .clone()
+    }
+
+    /// 记下"有一个客户端在看这个 Session"，返回一个**掉了就减一**的守卫。
+    ///
+    /// 谁该调它：真正把帧送到人眼前的那些连接（HTTP 的 SSE 处理器）。Run 的看客是
+    /// Gateway 自己的一条内部订阅，不算。
+    pub fn watch(self: &Arc<Self>, session: &SessionId) -> Viewer {
+        *self
+            .viewers
+            .lock()
+            .expect("看客表")
+            .entry(session.clone())
+            .or_insert(0) += 1;
+        Viewer {
+            hub: Arc::clone(self),
+            session: session.clone(),
+        }
+    }
+
+    /// 这个 Session 现在有几个客户端在看（TUI / HTTP 的 SSE 连接）。
+    ///
+    /// 审批投递要问它：屏幕前有人看着时，审批只弹在他面前——home chat 那条卡片是一次
+    /// 网络往返（实测几秒到几十秒），人在看着的时候它只会**晚到**，还多一份噪音。
+    pub fn viewers(&self, session: &SessionId) -> usize {
+        self.viewers
+            .lock()
+            .expect("看客表")
+            .get(session)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// 推一帧。没有订阅者就当没发生。
@@ -90,29 +144,32 @@ impl EventHub {
 /// 从一条事件派生出的附加帧：Run 状态与待处理审批。
 ///
 /// 「派生自事件，给不想自己 fold 的客户端。」
+///
+/// **`run.waiting` 只推 `state: waiting`**（帧里没有 `WaitReason` 那一格，那是 kernel 的
+/// 形状）："在等什么"要么去 `GET /v1/runs/{id}` 的 `wait`、要么去 `GET /v1/interventions`
+/// 的清单——两处都是权威，帧只负责说"它停下了"。
+///
+/// `run.reclaimed` **不推状态帧**：它是一条审计（"上一次执行没有收尾"），§8.9 明说它
+/// 不改状态——那条 Run 由对账当场判成 `queued` 或 `waiting`，那两条各自有自己的事件。
 fn derived_frames(event: &Event) -> Vec<SseEvent> {
-    let run = |status: RunStatus| -> Option<SseEvent> {
+    let run = |state: RunState| -> Option<SseEvent> {
         event
             .run
             .clone()
-            .map(|run: RunId| SseEvent::RunStatus { run, status })
+            .map(|run: RunId| SseEvent::RunStatus { run, state })
     };
     match &event.payload {
-        EventPayload::RunAccepted(_) => run(RunStatus::Ingesting).into_iter().collect(),
-        EventPayload::RunQueued(_) => run(RunStatus::Queued).into_iter().collect(),
-        EventPayload::RunStarted(_) => run(RunStatus::Running).into_iter().collect(),
-        EventPayload::RunWaitingRetry(_) => run(RunStatus::WaitingRetry).into_iter().collect(),
-        EventPayload::RunInterrupted(_) => run(RunStatus::Interrupted).into_iter().collect(),
-        EventPayload::RunNeedsAttention(_) => run(RunStatus::NeedsAttention).into_iter().collect(),
-        EventPayload::RunCompleted(_) => run(RunStatus::Completed).into_iter().collect(),
-        EventPayload::RunFailed(_) => run(RunStatus::Failed).into_iter().collect(),
-        EventPayload::RunCancelled(_) => run(RunStatus::Cancelled).into_iter().collect(),
-        // `run.waiting_approval` 只说"停下了"；待处理审批的那一帧由
-        // `approval.requested` 推——短 ID 在它身上，而伪造一个短 ID 会让客户端拿着
-        // 一个答不了的编号去回复。
-        EventPayload::RunWaitingApproval(_) => {
-            run(RunStatus::WaitingApproval).into_iter().collect()
-        }
+        EventPayload::RunAccepted(_) => run(RunState::Accepted).into_iter().collect(),
+        EventPayload::RunQueued(_) => run(RunState::Queued).into_iter().collect(),
+        EventPayload::RunStarted(_) => run(RunState::Running).into_iter().collect(),
+        EventPayload::RunWaiting(_) => run(RunState::Waiting).into_iter().collect(),
+        EventPayload::RunAbandoned(_) => run(RunState::Abandoned).into_iter().collect(),
+        EventPayload::RunCompleted(_) => run(RunState::Completed).into_iter().collect(),
+        EventPayload::RunFailed(_) => run(RunState::Failed).into_iter().collect(),
+        EventPayload::RunCancelled(_) => run(RunState::Cancelled).into_iter().collect(),
+        EventPayload::RunReclaimed(_) => Vec::new(),
+        // 待审批的那一帧由 `approval.requested` 推——短 ID 在它身上，而伪造一个短 ID 会让
+        // 客户端拿着一个答不了的编号去回复。
         EventPayload::ApprovalRequested(body) => vec![SseEvent::ApprovalPending {
             approval: body.approval.clone(),
             short_id: body.short_id.clone(),
@@ -209,7 +266,7 @@ mod tests {
         assert!(matches!(
             derived.event,
             SseEvent::RunStatus {
-                status: RunStatus::Completed,
+                state: RunState::Completed,
                 ..
             }
         ));
@@ -222,7 +279,7 @@ mod tests {
             session: SessionId::from_raw("sess-1"),
             event: SseEvent::RunStatus {
                 run: RunId::from_raw("run-1"),
-                status: RunStatus::Running,
+                state: RunState::Running,
             },
         });
         assert!(
@@ -247,7 +304,7 @@ mod tests {
                 session: SessionId::from_raw("sess-1"),
                 event: SseEvent::RunStatus {
                     run: RunId::from_raw("run-1"),
-                    status: RunStatus::Completed,
+                    state: RunState::Completed,
                 },
             },
             SseFrame {
@@ -277,5 +334,69 @@ mod tests {
             Seq(3),
             "读不懂就用 ?from="
         );
+    }
+
+    /// `run.waiting` 推的是 `waiting` 这一个状态帧——**四类等待共用它**（§8.4 把"等什么"
+    /// 收进了 `WaitReason`）：界面靠这一帧知道"它停下了"，再去问清单/详情在等谁。
+    #[test]
+    fn a_waiting_run_pushes_one_waiting_frame_whatever_it_waits_for() {
+        let run = RunId::from_raw("run-1");
+        let waiting = |reason: komo_kernel::types::status::WaitReason| Event {
+            v: 1,
+            seq: Seq(3),
+            event_id: EventId::from_raw("evt-3"),
+            session: SessionId::from_raw("sess-1"),
+            run: Some(run.clone()),
+            ts: datetime!(2026-09-16 08:00:00 UTC),
+            payload: EventPayload::RunWaiting(komo_kernel::events::RunWaiting { reason }),
+        };
+        for reason in [
+            komo_kernel::types::status::WaitReason::Approval {
+                approval: komo_kernel::types::ids::ApprovalId::from_raw("ap-1"),
+            },
+            komo_kernel::types::status::WaitReason::Intervention {
+                intervention: komo_kernel::types::ids::InterventionId::from_raw("run-1"),
+            },
+            komo_kernel::types::status::WaitReason::Retry {
+                attempts: 1,
+                not_before: datetime!(2026-09-16 08:05:00 UTC),
+                cause: komo_kernel::types::status::RetryCause::RateLimited,
+            },
+            komo_kernel::types::status::WaitReason::Dependency {
+                run: RunId::from_raw("run-0"),
+            },
+        ] {
+            let frames = derived_frames(&waiting(reason.clone()));
+            assert_eq!(frames.len(), 1, "{reason:?}");
+            assert!(
+                matches!(
+                    &frames[0],
+                    SseEvent::RunStatus {
+                        state: RunState::Waiting,
+                        ..
+                    }
+                ),
+                "{reason:?} 推出的是 {frames:?}"
+            );
+        }
+    }
+
+    /// `run.reclaimed`（上一次执行没收尾，领取权已交还）**不推状态帧**：§8.9 明说它不改
+    /// 状态——推一个 `interrupted` 会让客户端显示一个数据库里根本没有的状态。
+    #[test]
+    fn a_reclaim_audit_pushes_no_state_frame() {
+        let event = Event {
+            v: 1,
+            seq: Seq(4),
+            event_id: EventId::from_raw("evt-4"),
+            session: SessionId::from_raw("sess-1"),
+            run: Some(RunId::from_raw("run-1")),
+            ts: datetime!(2026-09-16 08:00:00 UTC),
+            payload: EventPayload::RunReclaimed(komo_kernel::events::RunReclaimed {
+                executor: Some(komo_kernel::types::ids::ExecutorId::from_raw("exec-0")),
+                reason: "上一次执行没有收尾".into(),
+            }),
+        };
+        assert!(derived_frames(&event).is_empty());
     }
 }

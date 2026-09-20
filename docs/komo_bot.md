@@ -79,13 +79,14 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | -------------------------------------------- | --------------------------------------------------------------------------- |
 | `komo`                                       | 确保本机 Gateway 就绪，创建新 Session，进入 TUI 聊天                        |
 | `komo resume SESSION_ID`                     | 连接原会话并查看进度或处理待办；恢复调度由 Gateway 自动进行，不重复创建 Run |
-| `komo session list`                          | 查看会话列表和状态                                                          |
+| `komo session list`                          | 查看会话列表和状态；`--all` 才列出已逻辑删除的会话（§8.10）                  |
+| `komo session delete/purge SESSION_ID`       | 逻辑删除（`closing` → `deleted`）与回收（`purged`）。**删除只有这一条路**：`--now` 把未完成 Run 各写一条明确取消，`purge` 前先算引用（§8.10） |
 | `komo run inspect RUN_ID`                    | 查看执行过程、工具结果与产物                                                |
 | `komo run cancel RUN_ID`                     | 请求取消运行                                                                |
 | `komo gateway`                               | 启动后台 Gateway，等待就绪后返回                                            |
 | `komo gateway --foreground`                  | 前台运行 Gateway，供服务管理器及调试使用                                    |
 | `komo gateway status/stop/restart`           | 管理后台进程                                                                |
-| `komo approval list/show/approve/reject`     | 查看和处理待审核操作；等价于聊天里的 `/approve` / `/reject`（§11.3）        |
+| `komo intervention list/show/answer`         | 待处理清单：审批、结果不明、阻塞三类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
 | `komo cron add/list/run/pause/resume/remove` | 管理定时任务                                                                |
 | `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector         |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
@@ -105,7 +106,7 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 4. 等待服务就绪，超时则返回具体诊断信息。
 5. 建立聊天连接并订阅会话事件。
 
-Gateway 获得数据目录进程锁并完成存储校验后，自动扫描未完成运行；不必等用户打开 CLI 或发送 resume。恢复与新请求共用调度器，恢复扫描本身不等待全部旧任务完成才提供服务。
+Gateway 获得数据目录进程锁并完成存储校验后，自动扫描未完成运行；不必等用户打开 CLI 或发送 resume。恢复与新请求共用调度器，恢复扫描本身不等待全部旧任务完成才提供服务。这次扫描就是 §8.9 的 reconcile：会话是否还能服务、哪条 `running` 已经没主人（租约过期或旧实例遗留）、哪条停在等待上的该放行，与 Run 自己的位置一起在下一次领取之前判定完。
 
 **就绪不等投递补发。** 上一次没送到的投递（§11.4）在"Gateway 就绪"**之后**的后台补发，不压住第 4 步的等待：补发是网络 I/O，一条 pending 一个平台往返，积压多少条就等多久——线上十来个卡住的投递是几秒，上百条会拖过客户端的就绪超时。补发晚一步没有代价：投递记录先写后发，按 `DeliveryId` 幂等，重来一次也不会重复发。**顺序上唯一的硬要求是渠道登记之后**——渠道没登记时冲刷等于什么都没干。
 
@@ -157,7 +158,7 @@ pub trait Tool: Send + Sync {
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ToolError>;
 
-    /// §8.6：对 started 而无结果的调用核对目标状态。默认 Unavailable → needs_attention。
+    /// §8.6：对 started 而无结果的调用核对目标状态。默认 Unavailable → `waiting + intervention`（等人判）。
     /// write / edit 用内容哈希覆盖它；python 交给模块自带的核对函数。
     async fn verify(
         &self,
@@ -292,7 +293,7 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 
 - `SKILL.md` frontmatter：`name`、`description`，可选 `platforms:`、`requires_tools:`（对 5 个基础工具或 toolbox 模块名）。
 - 搜索路径有序，**同名先到先得**；每次查询重扫目录，编辑或新增无需重启。
-- 只有系统提示里的**目录行**（名字 + 一句描述，总量有上限）是启动时快照，为了提示前缀稳定；`platforms:` / `requires_tools:` 只门控这份目录，不门控加载。
+- 只有系统提示里的**目录行**（名字 + 一句描述，总量有上限）是启动时快照，为了提示前缀稳定；`platforms:` / `requires_tools:` 只门控这份目录，不门控加载。实现上这一块是两行开头加若干目录行：先给**按序的根**（只列真的出了条目的那些，顺序就是搜索顺序——"同名先到先得"因此落得下来），再给目录行；模型按这个顺序去找 `<根>/<名字>/SKILL.md` 并 `read` 它。一条能露面的都没有时这一块整个不出现（不留空标题）。启动时算一次，配置重载时按新快照重算，此外不随文件变化——目录行是提示前缀的一部分，不能每段都不一样。
 - **没有 skill 工具。**模型通过 `read` 读 `SKILL.md`；skills 目录是 Policy 里的只读根，读取 Allow。Skill 里写的"可以直接执行"不构成授权，Policy 只看 `ExecutionPlan`。
 - Cron Job 可以声明 `skills = ["…"]`，触发时把这些 SKILL.md 正文预载进首轮上下文。
 - `komo skills list | inspect <name> | enable | disable`；`disable` 只从目录行隐藏，不删文件。没有安装 / 候选 / 治理流程——Skills 由人写、由人放进目录。
@@ -454,9 +455,9 @@ command_patterns = [
 ```text
 Ask
  → 先持久保存待审核计划的 JSONL 引用
- → 审批请求、waiting_approval 与审计待写事件在 state.db 事务提交
+ → 审批请求、`waiting + approval` 与审计待写事件在 state.db 事务提交
  → 释放执行名额
- → 投递到 Run 的来源会话与 home chat（§11.4），TUI 同时可见（TUI 的弹窗读的是补写进 JSONL 的 `approval.requested`，补写在请求落库后**立即**触发，§8.5；`run.waiting_approval` 里没有短 ID）
+ → 投递到 Run 的来源会话与 home chat（§11.4），TUI 同时可见（TUI 的弹窗读的是补写进 JSONL 的 `approval.requested`，补写在请求落库后**立即**触发，§8.5；`run.waiting` 只说"停在审批上"，短 ID 不在这条事件里）
  → 用户在聊天里或 TUI 中批准或拒绝
  → state.db 原子记录决策及审计待写事件
  → 继续前重新校验并消费授权
@@ -473,13 +474,33 @@ Ask
 
 Cron、交互聊天与 resume 都经过这一条路径。
 
+### 7.5 Intervention：一切"需要人判断"的同一个入口
+
+审批只是"需要人判断"的一种。§8.4 / §8.6 还会产出另外两类：**结果不明**（副作用可能已经发生、没有可靠恢复方式）与**阻塞**（引用损坏、无法确认旧执行已结束、会话内容与账本对不上）。今天它们是三套互不相干的出口——审批有短 ID、有清单、有四个界面；结果不明只有一条事件与一句投递；而"上一次执行没收尾"在 `resume` 里被直接续跑。操作者因此会撞上最难解释的现象：**会话停着不动，而 `komo approval list` 是空的**。
+
+统一成一个概念：**Intervention = 一条未完成的 Run 停在某个只有人能回答的问题上**。
+
+| 种类 | 它从哪里派生（权威） | 句柄 | 问题 | 可答的结论 |
+|---|---|---|---|---|
+| `approval` | `approval_requests` 里待处理的那一行（§7.4） | 短 ID（待处理集合内唯一，§11.3） | 这份执行计划放不放行 | `approve` / `reject`，范围按 §7.2 三种 |
+| `verify` | `tool_calls` 里那条 `uncertain` 的调用（§8.6） | Run ID | 上次那个调用**到底发生没有** | `satisfied` / `not_performed` / `abandon` |
+| `blocked` | 其余 `waiting + intervention` 的 Run（§8.4） | Run ID | 前提没了：引用损坏、旧执行者未确认、会话不可服务 | `resolve` / `abandon` |
+
+三条约束把这个清单钉死：
+
+1. **清单是派生视图，不是第四张表。** 权威仍是 `runs` 与 `approval_requests`；`GET /v1/interventions` 是这两张表的并集查询，`kind` 由"有没有一条 uncertain 调用"当场判出。多一张 `interventions` 表等于多一处会与权威漂移的状态，而这次改造的全部理由就是不要那个（§8.9）。
+2. **挡着会话的每一条都必须在清单里，而且与"后面领不走"是同一次判定。** §8.4 的"未完成"是四个非终态；其中**停在人身上的**（`waiting + approval`、`waiting + intervention`）必须逐条出现，且由同一个谓词回答"这条 Run 现在挡不挡队"——就是 `WaitReason::needs_a_person()` 与那段 `earlier` 子查询。两处判定分家就会出现"卡住但清单为空"。`waiting + retry`（等时钟）与 `waiting + dependency`（等前一条 Run）不进清单：**它们不是在等人**，但仍然挡着同 Session 后面的 Run。
+3. **结论只走一条路：核对 → 按 §8.4 行事，没有"我说它发生了"。** `satisfied` 给那次调用补一条"核对后目标已满足"的结果，原 Run 继续；`not_performed` 把那次调用标成"确定没执行"再入队（一次性授权因此按 §7.4 的原范围重放，而不是拿"已消费"当重试许可）；`resolve` 不强行放行，它只要求**重新观察并重新决策**一次；`abandon` 是终态取消。没有"我确认副作用已发生"这种结论——操作者可能看错，账本一旦这么记就再也纠不回来。
+
+出口有四个，语义相同：`komo intervention list | show | answer`、TUI 的待处理清单、聊天里的 `/pending` 与 `/answer`（§11.3）、`GET|POST /v1/interventions`。投递沿用 §11.4 那一条：**没有界面在看这个会话时进 home chat**——那是任务在问，不是在报告（§10）。批量答复不新增一套语义，沿用 §7.2 的"名单由发起方列出"。
+
 ## 8. 通用 Session 存储与自动恢复
 
 ### 8.1 三个核心对象
 
 | 对象     | 含义                                                      |
 | -------- | --------------------------------------------------------- |
-| Session  | 连续对话、工作目录和上下文的载体                          |
+| Session  | 连续对话、工作目录和上下文的载体；有生命周期状态（§8.10） |
 | Run      | 一次用户输入或一次触发引起的持久任务；重启前后保持同一 ID |
 | ToolCall | 一次有独立执行状态的具体调用                              |
 
@@ -487,23 +508,25 @@ Cron、交互聊天与 resume 都经过这一条路径。
 
 本节的“任务完成”是 Run 已有明确终态，不能根据最后一条助手消息猜测。长期 Memory、任务摘要和模型生成的计划均不能代替执行账本。
 
+**三者的权威都在 state.db，Session 目录是内容。** Run 的状态、队列与授权在数据库里，`sessions/{id}/` 里放的是消息、计划、输出与产物（§8.2）。这个分工的唯一后果是：**目录与数据库对不上时，以数据库为准，并且必须有人把对不上的那一半处置掉**——这就是 §8.9 的 reconcile，它取代"发现不一致就报损坏然后卡住"。Session 自身也只是一个可以被关掉、被逻辑删除、被回收的对象（§8.10），不是只能追加的。
+
 ### 8.2 存储分工
 
 **每个 Session 的内容集中保存在 sessions/{session_id}/ 下。** JSONL 记录调用、状态、引用和预览；大参数、大模型回复、完整结果、stdout / stderr 分别保存在该目录的子目录中。state.db 维护调度状态、索引与授权，JSONL 与数据库都不重复保存完整 tool output。
 
 | 保存位置                                                           | 内容                                                                         | 权威来源与恢复方式                                             |
 | ------------------------------------------------------------------ | ---------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| sessions/{session_id}/events.jsonl                                 | 消息、调用与准备计划、开始 / 结束事件、参数和输出引用、摘要与完成事件        | 事件顺序与调用关系的权威来源；完整内容通过引用读取             |
+| sessions/{session_id}/events.jsonl                                 | 消息、调用与准备计划、开始 / 结束事件、参数和输出引用、摘要与完成事件        | **内容**的权威来源（事件顺序与调用关系）；完整内容通过引用读取。**状态与生命周期不在这里**——那是 state.db |
 | sessions/{session_id}/payloads/                                    | 超限的模型消息或执行计划正文，包含大参数                                     | JSONL 保留引用与内容哈希；同一参数不再另存重复全文             |
 | sessions/{session_id}/tool-output/{run_id}/{call_id}/{attempt_id}/ | output.json，以及按需保存的 stdout.txt / stderr.txt                          | 每次执行的完整工具输出，包含错误详情；按尝试独立、完成后不可变 |
-| state.db（Turso，MVCC）                                            | Session / Run 元数据、任务队列、领取代次、工具状态与引用、审批、投递记录、Cron、Memory | 调度与授权权威；其中执行内容索引和派生状态可从 JSONL 补齐 |
+| state.db（Turso，MVCC）                                           | Session 生命周期、Run 元数据、任务队列、领取代次、工具状态与引用、审批、投递记录、Cron、Memory | **生命周期、调度与授权的唯一权威**；执行内容索引与派生状态可从 JSONL 补齐（§8.9） |
 | sessions/{session_id}/artifacts/                                   | 工具生成的二进制文件、脚本快照与报告                                         | 独立产物，通过工具输出中的引用定位；不重复复制到 tool-output   |
 
 state.db 中的主要表：
 
 | 表                          | 主要内容                                                                                                                           |
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| sessions                    | 标题、来源、工作目录、当前 Run、JSONL 路径、applied_seq 和已应用字节位置                                                           |
+| sessions                    | 标题、来源、工作目录、当前 Run、**生命周期状态与状态变更时刻**（§8.10）、JSONL 路径、applied_seq 和已应用字节位置                     |
 | runs                        | 请求键与输入哈希、输入 / 最终结果事件引用、状态、来源与身份、授权引用、预算、有效期、领取代次、重试时间、配置快照、Memory 处理游标 |
 | session_log_index           | event_id、Session seq、Run、事件类型、文件偏移、记录长度和完整性摘要；不存正文                                                     |
 | tool_calls                  | 逻辑调用 ID、参数 / 计划 / 结果事件引用、计划哈希、恢复方式、外部幂等键和状态                                                      |
@@ -525,13 +548,13 @@ control_outbox 只保存控制事件，例如审批请求和回答，不复制�
 
 **state.db 是 Turso，MVCC 模式，通过 toasty 访问。** 文件同步和数据库提交各自有持久化边界，不能称为跨文件原子事务；但两边都是真的落盘。**Turso 0.7.2 已核实（2026-09-16）：MVCC 与 WAL 两条提交路径都在提交内 fsync——MVCC fsync 逻辑日志 `state.db-log`，WAL fsync `state.db-wal`——同步档位是每连接状态，默认 `SyncMode::Full`（比 SQLite 在 WAL 下默认 NORMAL 更严），`PRAGMA synchronous` 可设可读回（`turso_core` 的 `mvcc/database/mod.rs:3107` / `storage/pager.rs:4297` / `translate/pragma.rs:647,1548`；strace 与 `synchronous=OFF` 对照实验见 `.scratch/komo-v08-rewrite/spikes/store.md`）。因此原先预备的「outbox 补写到 JSONL 后才确认已批准」这道保护不启用**：审批决定一经数据库提交即已落盘，客户端可以立刻得到确认，outbox 只承担审计补写与顺序，不承担耐久性。内容权威仍然是 Session 目录，每一步先 `sync_all` 再往下走，state.db 是调度与授权的权威。
 
-两条随之而来的运维事实：① `state.db-log` / `state.db-wal` 与 `state.db` 同等重要，备份和清理不能只拷主文件；② Turso 默认 `data_sync_retry = false`，此时 fsync **出错是 `panic!` 而不是返回 `Err`**（`storage/pager.rs:4330`）。Gateway 在 `Db::connect` 里显式 `PRAGMA data_sync_retry = 1`，把「磁盘写失败」变成一个可以进 `needs_attention` 的错误，而不是一个把整个进程带走的 panic。
+两条随之而来的运维事实：① `state.db-log` / `state.db-wal` 与 `state.db` 同等重要，备份和清理不能只拷主文件；② Turso 默认 `data_sync_retry = false`，此时 fsync **出错是 `panic!` 而不是返回 `Err`**（`storage/pager.rs:4330`）。Gateway 在 `Db::connect` 里显式 `PRAGMA data_sync_retry = 1`，把「磁盘写失败」变成一个可以进 `waiting + intervention` 的错误，而不是一个把整个进程带走的 panic。
 
 引擎事实与由此而来的规则：
 
 | 事实 | 规则 |
 |---|---|
-| MVCC `concurrent_writes`：**只有 `BEGIN CONCURRENT` 事务**才并发提交；冲突的提交**失败而不是等待**。toasty 只在显式 `db.transaction()` 上发 `BEGIN CONCURRENT`，autocommit 单语句走普通写事务，且驱动不设 `busy_timeout`——实测 4 个写入器并发写 200 行不同主键，autocommit 只成 6 次，包进事务 200 次全成 | **每个写操作、包括只有一条语句的，都放进 `db.transaction()`，再整个包进 `with_write_retry`**；回滚后干净重跑，绝不双重应用。重试条件是 `toasty_core::Error::is_serialization_failure()`（驱动把 `Busy` / `BusySnapshot` / 消息含 `conflict` 的错误都归到这里），不是字符串匹配。闭包只依赖入参和事务内读到的状态，里面不 `await` 模型、子进程、文件同步或用户；重试超限报 `Contended`，按 §8.4 进 `waiting_retry` |
+| MVCC `concurrent_writes`：**只有 `BEGIN CONCURRENT` 事务**才并发提交；冲突的提交**失败而不是等待**。toasty 只在显式 `db.transaction()` 上发 `BEGIN CONCURRENT`，autocommit 单语句走普通写事务，且驱动不设 `busy_timeout`——实测 4 个写入器并发写 200 行不同主键，autocommit 只成 6 次，包进事务 200 次全成 | **每个写操作、包括只有一条语句的，都放进 `db.transaction()`，再整个包进 `with_write_retry`**；回滚后干净重跑，绝不双重应用。重试条件是 `toasty_core::Error::is_serialization_failure()`（驱动把 `Busy` / `BusySnapshot` / 消息含 `conflict` 的错误都归到这里），不是字符串匹配。闭包只依赖入参和事务内读到的状态，里面不 `await` 模型、子进程、文件同步或用户；重试超限报 `Contended`，按 §8.4 进 `waiting + retry`（`cause = contended`） |
 | MVCC 支持 `AUTOINCREMENT`（原子序列，`turso_core` 的 `test_autoincrement_works_in_mvcc`，2026-09-16 实测 CREATE / INSERT / `sqlite_sequence` 正常）——但 komo 不用它 | 每个主键仍是 `String` UUIDv7：ID 要在写库之前就存在（JSONL 先写、事件里带 ID、跨进程恢复按 ID 对账），数据库生成的自增值满足不了这个顺序。Session 内的 `seq` 是 JSONL 写入器分配的整数列，不由数据库生成 |
 | MVCC 下自定义索引模块不可创建（FTS 不可用）——已实测：`CREATE INDEX … USING fts (…)` 报 `Custom index modules are not supported in MVCC mode`（`translate/index.rs:70`），`CREATE VIRTUAL TABLE … USING fts5` 报 `Virtual tables are not supported in MVCC mode`（`translate/schema.rs:1692`） | 关键词检索在索引时分词写入 `memory_terms`（§9.4） |
 | toasty 的类型化 API 能表达带条件的 `UPDATE`（`Model::filter(...)` 支持非索引列、`AND`、`IS NULL`），但**拿不到受影响行数**——查询目标的 `.exec()` 恒为 `Ok(())`，命中 0 行与 1 行不可区分；`ALTER TABLE`、`instr`、`vector_distance_cos` 也不在类型化 API 里 | 这四件事全部走 toasty 自带的 raw SQL 口子 `toasty::sql::statement(..) -> Result<u64>` / `toasty::sql::query(..) -> Vec<Value>`（占位符 `?1`、`?2`；`Db` 与 `Transaction` 上都可用，因此 raw 语句照样在事务里）。**不需要第二个 `turso::Database` 句柄**；raw SQL 仍只允许出现在 store crate 的三个模块：schema、keyword index、run claim |
@@ -540,7 +563,7 @@ control_outbox 只保存控制事件，例如审批请求和回答，不复制�
 | toasty `push_schema` 只对新文件执行，且不幂等 | 见下面的 schema 演进 |
 | 提交在 Turso 上确实 fsync（MVCC 写 `state.db-log`，WAL 写 `state.db-wal`），默认 `synchronous=FULL` | 审批决定提交即持久，不需要 outbox-先-确认；`state.db-log` 与主库同等重要；连接建立时设 `data_sync_retry=1`，让 fsync 错误可报告而非 panic |
 
-Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_TABLE_DDL` 常量；`Db::connect` 对已存在的文件逐表 `CREATE TABLE IF NOT EXISTS`、逐列 `ALTER TABLE ADD COLUMN`，对新文件让 toasty 建表。一个测试对每张表断言 toasty 为空库生成的 DDL 与常量**字节相等**——模型改了列却没改常量，测试挂。新列必须 `NOT NULL DEFAULT …` 或可空；退役的列继续写空值，不删。耐久表（`approval_requests`、`policy_grants`、`cron_jobs`、`cron_firings`、`memory_items`、`memory_evidence`、`deliveries`）只允许加法变更；可重建表（`session_log_index`、`tool_calls`、`tool_attempts`、`checkpoints`、`memory_terms`、`memory_vectors`、`memory_index_generations`）按行或按代次从 JSONL / 原文重建，从不删文件——一个文件里同时住着耐久表，"删掉重来"不存在。
+Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_TABLE_DDL` 常量；`Db::connect` 对已存在的文件逐表 `CREATE TABLE IF NOT EXISTS`、逐列 `ALTER TABLE ADD COLUMN`，对新文件让 toasty 建表。一个测试对每张表断言 toasty 为空库生成的 DDL 与常量**字节相等**——模型改了列却没改常量，测试挂。新列必须 `NOT NULL DEFAULT …` 或可空；退役的列继续写空值，不删。耐久表（`sessions`、`runs`、`approval_requests`、`policy_grants`、`cron_jobs`、`cron_firings`、`memory_items`、`memory_evidence`、`deliveries`）只允许加法变更——`sessions` 与 `runs` 也在这里，因为生命周期与队列从内容里长不出来：目录没了还能从数据库说清"它曾经是什么"，反过来不成立（§8.10）；可重建表（`session_log_index`、`tool_calls`、`tool_attempts`、`checkpoints`、`memory_terms`、`memory_vectors`、`memory_index_generations`）按行或按代次从 JSONL / 原文重建，从不删文件——一个文件里同时住着耐久表，"删掉重来"不存在。
 
 ### 8.3 JSONL 格式、写入与读取
 
@@ -573,6 +596,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 - 读取依据事件 ID / seq；字节偏移只是加速索引，校验不符时重新扫描并重建。每轮通过检查点与尾部增量读，避免反复解析完整会话。
 - 模型请求保存所用事件范围、模型 / effort、工具与记忆版本引用；摘要正文作为 JSONL 事件保存，检查点不再复制整段历史。
 - Memory 的证据引用使用 Session ID + event_id / seq，稳定定位原始消息或工具结果。
+- **读事件不得创建或修改内容。** `Ledger::read` 与 `session_log::read_events` 是只读路径：文件不在就返回空（新会话本来就没有日志，`GET /v1/sessions/{id}/events` 依赖这一点），**绝不 `create`**。写路径（受理、`conversation.boundary`、挂起、终态）才建目录与文件。少了这条界线，"内容被删掉"会被一次读**静默地补成一个空日志**——于是 §8.9 的观察永远看不到它本该报出来的那件事（线上冒烟抓过一次：对账读会话就把目录建回来了）。
 - JSONL、state.db 和引用产物均为 Gateway 的受保护状态；普通工具不能通过 write / edit / shell / python 直接修改。回放只能接受 Gateway 写入的合法记录，不能把模型生成的 JSON 当作执行事实或授权。
 
 尾部恢复时，先校验数据库已经引用的记录和检查点，再处理尚未应用的后续记录。只有末尾不完整、且不被已提交引用覆盖的行，才能先隔离保留原始字节再截断；完整有效行不能因为索引落后被删除。文件中间损坏、已提交范围缺失或哈希不匹配时停止受影响会话的自动执行，不能跳过坏行或退回旧检查点继续。
@@ -583,38 +607,88 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 
 **Gateway 自动接续能够确定恢复位置的任务。用户只处理审批、时效或结果不明等确实需要判断的情况。**
 
-| 重启前停在哪里                                        | Gateway 启动后怎么处理                                       |
-| ----------------------------------------------------- | ------------------------------------------------------------ |
-| 输入已在 JSONL 持久保存，Run 尚未开始                 | 补齐 state.db 索引后自动入队                                   |
-| 输入请求只预留了 ID，正文尚未完整写入                 | 保持 ingesting；等待同请求键重传，不能执行缺失输入           |
-| 正在请求 LLM，完整回复尚未保存                        | 丢弃未完成输出，以已保存上下文重新请求；可能再次产生模型费用 |
-| assistant 回复和调用计划已保存                        | 沿用原计划，从未完成的 ToolCall 继续                         |
-| JSONL 已有结果引用且完整输出校验通过，state.db 可能落后 | 先补齐结果索引和状态，复用原输出，不重放动作                 |
-| 调用 planned，确定尚未执行                            | 校验原计划与当前权限后自动执行                               |
-| 调用 started，没有结果                                | 先核对外部效果，按 8.6 决定是否安全继续                      |
-| 等待审批                                              | 保留原请求；已答复且仍有效的批准自动接续                     |
-| 等待临时故障重试                                      | 沿用已保存的次数与 next_retry_at，到期再尝试                 |
-| 已保存最终结果，但客户端没有收到                      | 补发或补读原结果，不重新执行任务                             |
-| completed / failed / cancelled                        | 保持终态，不因重启自动开启新一轮                             |
+**状态回答"能不能跑"，`WaitReason` 回答"为什么不能跑"。** 这两件事分开，是因为它们混在一起时的症状正是"排队二十分钟不知道在等什么"：一个 `waiting_approval`、一个 `needs_attention`，都答不出在等谁、等到什么时候。所以状态只有八个，等什么有四类：
+
+| 状态 | 含义 | 可领取 |
+|---|---|---|
+| `accepted` | 已受理：请求键预留了 ID，输入正文可能还没写完（§8.5） | 否 |
+| `queued` | **现在就能跑，只缺 worker** | 是 |
+| `running` | 正在执行。`claimed_by IS NULL` 的是刚被回收、还没判完的孤儿（§8.9） | 否 |
+| `waiting` | 当前不能跑，`WaitReason` 说得出在等什么 | 只有 `retry` 到点之后 |
+| `completed` / `failed` / `cancelled` / `abandoned` | 四个终态 | 否 |
+
+| `WaitReason` | 在等什么 | 谁放它出来 | 进 §7.5 清单 |
+|---|---|---|---|
+| `approval` | 一份执行计划的答复（§7.4） | 操作者答复；答复仍有效时自动接续 | 是 |
+| `retry` | 一次有界退避到点（`attempts` / `not_before` / `cause`） | 时钟：`wake_at <= now` | 否——不是在等人 |
+| `intervention` | 一条 Intervention 的答复（§7.5：结果不明、前提没了） | 操作者答复 | 是 |
+| `dependency` | 同 Session 里**更早**的那条 Run 进终态（本节的次序规则） | 前一条进终态，reconcile 把它放回 `queued` | 否——不是在等人 |
+
+**退避只用于可以安全重试的失败**：限流、连不上、5xx、本地写争用，`RetryCause` 把它们分得开（`RateLimited` 要尊重服务端给的 `Retry-After`，`Contended` 退几毫秒就够——混成一个数字就只能取最保守值，每次 429 都白等）。工具那一侧"结果不明"**不能**用它：那是副作用有没有发生都不知道，必须进 `intervention` 让人核对（§8.6）。两者混起来就是"重试成功"掩盖掉那个窗口，正是 §8.6 要禁止的事。
+
+**`Queued` 与 `Waiting` 是这个模型的验收口径**：`Queued` 的 Run 一定有活干，`Waiting` 的 Run 一定说得出在等什么。查"它怎么还不跑"时，这两句话各回答一半。
+
+重启后逐行：
+
+| 重启前停在哪里 | Gateway 启动后怎么处理 |
+| --- | --- |
+| 输入已在 JSONL 持久保存，Run 尚未开始（`accepted`） | 补齐 state.db 索引后自动入队 |
+| 输入请求只预留了 ID，正文尚未完整写入 | 保持 `accepted`；等待同请求键重传，不能执行缺失输入 |
+| 正在请求 LLM，完整回复尚未保存 | 丢弃未完成输出，以已保存上下文重新请求；可能再次产生模型费用 |
+| assistant 回复和调用计划已保存 | 沿用原计划，从未完成的 ToolCall 继续 |
+| JSONL 已有结果引用且完整输出校验通过，state.db 可能落后 | 先补齐结果索引和状态，复用原输出，不重放动作 |
+| 调用 planned，确定尚未执行 | 校验原计划与当前权限后自动执行 |
+| 调用 started，没有结果 | 先核对外部效果，按 §8.6 决定是否安全继续 |
+| `waiting + approval` | 保留原请求；已答复且仍有效的批准自动接续 |
+| `waiting + retry` | 沿用已保存的次数与到点时刻，到点再尝试 |
+| `waiting + intervention` | **原样保留**：它是清单里的一条，等操作者答复——恢复扫描不替人答，也不偷偷往下跑 |
+| `waiting + dependency` | 原样保留；谁放它出来由 reconcile 判（前一条进终态 → 回 `queued`） |
+| 已保存最终结果，但客户端没有收到 | 补发或补读原结果，不重新执行任务 |
+| 四个终态 | 保持终态，不因重启自动开启新一轮 |
+| Session 在 `closing` / `deleted`，Run 还没跑完 | 照跑或停在等待，但不新开；`--now` 的逻辑删除已把它们各写一条明确的取消（§8.10） |
+| Session 内容缺失或被回收（`state` 不是 `purged` 却读不出目录 / JSONL / 引用的输出） | 不许领这条 Run，停成 `waiting + intervention`，理由里说清缺什么（§8.9） |
+| 无法确认旧执行已结束 | 不许重复启动，停成 `waiting + intervention` 等人 |
 
 内部状态示意：
 
 ```text
-Run:
-ingesting → queued → running → completed / failed / cancelled
-            ├─ waiting_approval → queued
-            ├─ waiting_retry   → queued
-            ├─ interrupted     → 核对后 queued / needs_attention
-            └─ needs_attention → 操作者处理后 queued / cancelled
+Run（状态 × 理由）:
+                       ┌─────────────┐
+                       │  accepted   │  已受理；正文可能还没落全
+                       └──────┬──────┘
+                              │ 正文落盘 + queued 提交
+                       ┌──────▼──────┐
+                       │   queued    │  现在就能跑，只缺 worker
+                       └──────┬──────┘
+                              │ claim（带租约）
+                       ┌──────▼──────┐
+                  ┌────│   running   │────┐
+                  │    └──────┬──────┘    │
+              停在外因         │ 正常收尾   │ 出错 / 取消 / 放弃
+                  │           │           │
+                  ▼           ▼           ▼
+            ┌───────────┐  completed   failed / cancelled / abandoned
+            │  waiting  │
+            └─────┬─────┘
+                  │ 条件满足：答复 / 到点 / 前一条 Run 进终态
+                  ▼
+                queued
+
+WaitReason: approval · retry{attempts, not_before, cause} · intervention · dependency{run}
 
 ToolCall:
 planned → started → completed / failed
                   └─ uncertain → 核对完成 / 确定可重试 / 等待处理
+
+Session（§8.10）:
+active → closing → deleted → purged
 ```
 
-waiting_approval、waiting_retry、interrupted、needs_attention 都是未完成状态。审批或处理完成后继续原 Run；同一 Session 后续 Run 不越过它，其他 Session 正常运行。
+**四个终态各自是什么**：`completed` 正常结束；`failed` 有明确错误；`cancelled` 用户明确取消（不自动复活）；`abandoned` 是**操作者在清单上放弃**——与取消分开记："不是用户不想跑了，而是这件事不会再有下文了"，事后统计要分得开。
 
-用户明确取消的 Run 不自动复活；普通错误达到重试或执行预算后进入 failed。Gateway 关闭或系统重启属于中断，不等于用户取消。已经授权执行但有时间限制的动作，先检查有效期；过期不能按旧指令直接产生新的外部影响。
+**同一 Session 后面的 Run 不越过前面的**：前一条没进终态时，后一条是 `waiting + dependency` 而不是 `queued`——它写得出在等谁，而不是一句"排队中"。**判"谁在前"用的是输入事件的 `seq`**（§8.3：seq 在 Session 内按追加顺序严格递增），不是 Run ID 的字典序：UUIDv7 同一毫秒内的低位是随机的，拿它当先后会把两条几乎同时到达的输入排反，而次序判错意味着后一条会越过前一条（provider 400 的来源）。这条次序在三个地方用同一份判据：受理那一刻（写 `queued` 还是 `waiting + dependency`）、`due` 的候选、`claim` 的守卫。**停在人身上的那两类（`approval`、`intervention`）逐条出现在 §7.5 的清单里，而且"挡住队列"与"进清单"是同一个判定**——两处分家就会出现"卡住但清单为空"。
+
+用户明确取消的 Run 不自动复活；普通错误达到重试或执行预算后进入 `failed`。Gateway 关闭或系统重启属于中断，**不等于用户取消**，也不再留一个叫 `interrupted` 的状态：领取权交还之后，那条 Run 由 reconcile 当场判成 `queued`（安全）或 `waiting + intervention`（副作用不明）。已经授权执行但有时间限制的动作，先检查有效期；过期不能按旧指令直接产生新的外部影响。
 
 ### 8.5 JSONL 与 state.db 的写入顺序
 
@@ -622,7 +696,7 @@ waiting_approval、waiting_retry、interrupted、needs_attention 都是未完成
 
 ```text
 收到输入
-  → state.db 用请求键预留 Run ID，状态 ingesting，仅存输入哈希与来源
+  → state.db 用请求键预留 Run ID，状态 `accepted`，仅存输入哈希与来源
   → JSONL 追加 run.accepted（包含完整输入和绑定 Run ID），同步文件
   → state.db 事务写入事件引用、queued 与 applied_seq
   → 向客户端确认已接收
@@ -649,7 +723,7 @@ waiting_approval、waiting_retry、interrupted、needs_attention 都是未完成
   → 通过 SSE 通知客户端
 ```
 
-同一请求键重发时返回原 Run，内容哈希不同则拒绝。ingesting 的完整输入若已在 JSONL 中，启动修复就能补为 queued；如果正文从未写完，则等待客户端重传，不能凭输入哈希补造用户指令。Cron 在创建 firing 与预留 Run 的事务中保留不可变触发快照，可以据此完成尚未写入的触发输入。
+同一请求键重发时返回原 Run，内容哈希不同则拒绝。`accepted` 的完整输入若已在 JSONL 中，启动修复就能补为 `queued`；如果正文从未写完，则等待客户端重传，不能凭输入哈希补造用户指令。Cron 在创建 firing 与预留 Run 的事务中保留不可变触发快照，可以据此完成尚未写入的触发输入。
 
 恢复先处理已同步但未索引的 JSONL 尾部，再判断任务是否需要执行。例如 tool.result 已经完整持久保存且引用输出校验通过、数据库仍显示 started，必须先补齐为已有结果，不能直接按 uncertain 重试。若结果引用存在但对应输出缺失或哈希不符，停止受影响任务，不能重跑来掩盖数据损坏。输出文件已写完但 tool.result 尚未提交时，只有完整校验文件内的调用身份、计划、完成状态与内容后才能补记结果；仅凭路径存在不足以宣告成功。
 
@@ -665,7 +739,7 @@ state.db 事务提交审批决定与 control_outbox（固定 event_id）
 
 重启后重发同一 outbox 事件先按 event_id 去重，已写入就复用原事件位置。审批生效不依赖审计补写成功；客户端恢复时可直接查询数据库中的原决定。JSONL 中的审计副本无法反向生成新的授权，outbox 也不承载完整工具结果。
 
-**补写由写入触发，周期只是兜底。** 上面那三步是顺序，不是节拍：`control_outbox` 一有新行就叫醒补写器（请求那条在 Run 停在待审批上时叫，回答那条在决定入队后叫），否则"随后补写"会变成"最多晚一分钟补写"。**这一分钟是看得见的**：界面（TUI 的审批弹窗、任何按 SSE 待处理帧走的东西）等的正是 `approval.requested`——`run.waiting_approval` 只说"停下了"，短 ID 在补写的那一条身上；同理，别的界面知道一条请求已经答过也要靠 `approval.decided`。周期（60s）留着兜底：漏叫的、别处写进去的，一拍之内照样补上。
+**补写由写入触发，周期只是兜底。** 上面那三步是顺序，不是节拍：`control_outbox` 一有新行就叫醒补写器（请求那条在 Run 停在待审批上时叫，回答那条在决定入队后叫），否则"随后补写"会变成"最多晚一分钟补写"。**这一分钟是看得见的**：界面（TUI 的审批弹窗、任何按 SSE 待处理帧走的东西）等的正是 `approval.requested`——`run.waiting` 只说"停在审批上"，短 ID 在补写的那一条身上；同理，别的界面知道一条请求已经答过也要靠 `approval.decided`。周期（60s）留着兜底：漏叫的、别处写进去的，一拍之内照样补上。
 
 完整模型块、工具调用 ID、原始参数、结果和 provider 回放所需字段通过 JSONL 及其引用文件完整保留。未完成的流式模型输出没有执行权限；只有完整计划持久保存且执行前置状态已提交后才能调用工具。
 
@@ -682,7 +756,7 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 | 可安全重做的读取 | 例如普通文件读取；记录这次重新读取的实际时间和结果，不冒充重启前的观察   |
 | 支持外部幂等键   | 外部接口确实保证去重；所有尝试复用同一逻辑操作的键和参数，核对键的有效期 |
 | 可以核对目标状态 | 使用审核过的核对逻辑，返回已达到目标、确定未执行 / 可重试、冲突或未知    |
-| 无可靠恢复方式   | 停在 needs_attention；不自动从头执行整个脚本                             |
+| 无可靠恢复方式   | 停在 `waiting + intervention`；不自动从头执行整个脚本                    |
 
 文件 write / edit 可记录修改前后内容哈希与目标身份。若恢复时目标已是预期内容，则记录“核对后目标已满足”；仍是原内容且其他前提成立，可重新执行同一原子修改；出现第三种内容则视为冲突。不能把文件已存在当作写入成功，也不能编造丢失的 stdout 或原始返回值。
 
@@ -701,69 +775,89 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 
 ```text
 取得实例锁，校验数据库与协议版本
+  → 创建本次启动身份（旧的 running 从此都算"别人的"）
   → 校验受影响 Session 的 JSONL，修复未索引尾部和派生状态
   → 补写控制审计 outbox，核对尚未接收完整的输入
-  → 创建本次启动身份
-  → 将旧执行实例的 running 标为 interrupted
+  → **回收没有主人的 running**：交还领取权（不改状态），再按 §8.4 判成 queued 或 waiting
+  → 放掉到点的 retry、放掉依赖已终态的 dependency
   → 检查旧子进程与未完成调用
   → 按 Session 顺序恢复原 Run
   → 可继续的提交统一队列
-  → 需要审批或核对的保留待处理状态
-  → 周期扫描，补齐内存通知丢失的任务
+  → 需要人答复的保留 waiting（它们已经在 §7.5 的清单里）
+  → 周期扫描（reconcile），补齐内存通知丢失的任务
 ```
 
 **就绪（HTTP 监听起、发现文件有效）之后**才做两件不影响调度事实的事：渠道起来后按平台补发它名下积压的投递，以及启动时那一次整体补发（§11.4）。两件都在后台，就绪不等它们——它们是网络 I/O，积压多少就等多久；顺序上唯一的硬要求是**渠道登记之后**（§3）。
 
-启动扫描、Cron、审批回调和手动 resume 共用同一个领取入口。领取通过数据库条件更新与递增代次保证同一 Run 只被一个执行者接管；旧代次不能继续提交新状态。单实例使用进程锁与数据库事务即可，不引入跨机器选主或分布式队列。
+启动扫描就是 §8.9 的对账，它和 Cron、审批回调和手动 resume 共用同一个领取入口。领取通过数据库条件更新与递增代次保证同一 Run 只被一个执行者接管；旧代次不能继续提交新状态。单实例使用进程锁与数据库事务即可，不引入跨机器选主或分布式队列。
 
 领取就是下面这条语句，`rows affected == 1` 是接管成功，`== 0` 是别人先到（表名 / 列名以 store 的模型为准）：
 
 ```sql
--- RunQueue::claim
+-- RunQueue::claim：领取 = 条件更新 + 递增代次 + 起租约
 UPDATE runs
-   SET status           = 'running',
+   SET state            = 'running',
        claimed_by       = ?1,   -- 本次启动身份（执行实例 ID）
        claim_generation = claim_generation + 1,
-       claimed_at       = ?2
- WHERE id               = ?3
+       claimed_at       = ?2,
+       lease_until      = ?3    -- ?2 + 租约；跑的过程中由心跳续租
+ WHERE id               = ?4
    AND claimed_by IS NULL
-   AND status IN ('queued', 'waiting_retry')
+   AND (state = 'queued'
+        OR (state = 'waiting' AND wait_kind = 'retry' AND wake_at <= ?2))
+   AND EXISTS (SELECT 1 FROM sessions s
+                WHERE s.id = runs.session_id AND s.state IN ('active','closing'))
 ```
 
-候选由一条普通查询给出，领取一个一条：
+候选由一条普通查询给出，领取一个一条。**"现在就能跑"这件事只有一处定义**，两份查询同一个谓词；同 Session 的次序也在这里（`earlier` 那段，§8.4）：
 
 ```sql
 -- RunQueue::due
-SELECT id FROM runs
- WHERE claimed_by IS NULL
-   AND status IN ('queued', 'waiting_retry')
-   AND next_retry_at <= ?1
- ORDER BY next_retry_at
+SELECT r.id FROM runs AS r
+ WHERE r.claimed_by IS NULL
+   AND (r.state = 'queued'
+        OR (r.state = 'waiting' AND r.wait_kind = 'retry' AND r.wake_at <= ?1))
+   AND EXISTS (SELECT 1 FROM sessions s
+                WHERE s.id = r.session_id AND s.state IN ('active','closing'))
+   AND NOT EXISTS (
+       SELECT 1 FROM runs AS earlier
+        WHERE earlier.session_id = r.session_id
+          AND earlier.id         < r.id
+          AND earlier.state NOT IN ('completed','failed','cancelled','abandoned'))
+ ORDER BY r.wake_at
  LIMIT ?2
 ```
 
-领取之后，这个执行者写账本的每一条状态提交都带同一道代次围栏；`rows affected == 0` 意味着自己已经是旧代次，**停止这个任务的一切写入**，不重试、不降级：
+领取之后，这个执行者写账本的每一条状态提交都带同一道代次围栏；`rows affected == 0` 意味着自己已经是旧代次，**停止这个任务的一切写入**，不重试、不降级。状态与"在等什么"一次写完——它们本来就是同一条事实的两个维度：
 
 ```sql
--- 代次围栏（每次状态提交）
-UPDATE runs SET status = ?1, …
- WHERE id = ?2 AND claim_generation = ?3 AND claimed_by = ?4
-```
-
-启动扫描把上一代执行实例遗留的 running 释放出来，同样是一条条件更新：
-
-```sql
--- 启动回收：旧实例的 running -> interrupted，并交还领取权
+-- 代次围栏（每次状态提交；wait_kind / wait_ref / wake_at 只在 state='waiting' 时有值）
 UPDATE runs
-   SET status = 'interrupted', claimed_by = NULL
- WHERE status = 'running' AND claimed_by <> ?1
+   SET state = ?1, wait_kind = ?2, wait_ref = ?3, wake_at = ?4, updated_at = ?5
+ WHERE id = ?6 AND claim_generation = ?7 AND claimed_by = ?8
 ```
+
+回收**只交还领取权，不判状态**：
+
+```sql
+-- 启动回收：旧实例遗留的 running
+UPDATE runs SET claimed_by = NULL
+ WHERE state = 'running' AND claimed_by IS NOT NULL AND claimed_by <> ?1
+
+-- 租约过期：同一个实例里 handler 任务死了/卡住了
+UPDATE runs SET claimed_by = NULL
+ WHERE state = 'running' AND claimed_by = ?1 AND lease_until < ?2
+```
+
+交还之后那一行的形状是 **`running` 且 `claimed_by IS NULL`**——一个可查询的孤儿（§8.9 的 `unowned_running`），它**不可领取**，所以不存在"调度器抢在 reconcile 前面把它领走"的竞态；同一次对账立刻按 §8.4 把它落成 `queued`（尾部安全）或 `waiting + intervention`（副作用不明）。**判断在这里，不在 SQL 里**：那条 UPDATE 看不见 JSONL 尾部，也看不见上一条调用停在哪。
+
+**租约只用来发现"没人管了"，不用来抢活。** handler 每 `TTL/3` 续一次 `lease_until`；对账见到过期只是**信号**，还要过一道"这个持有者真的不在（`claimed_by <> self`）或我自己内存里已不再持有它"才回收。少这一道，一次二十分钟的调用会在主人还活着的时候被第二个执行者抢走——那不是恢复，那是真的重复副作用（§8.6）。
 
 四条都通过 `toasty::sql::statement(...).bind(...).exec(&mut tx).await?` 执行，`u64` 就是受影响行数。**竞争失败的第一手信号是错误而不是 0 行**：并发竞争同一行时，败者拿到 `serialization failure`（MVCC 事务里是 `Write-write conflict`，autocommit 是 `database is locked`），只有在胜负已分之后再跑才会拿到 `0`。因此 `claim` 也包在 `with_write_retry` 里——它是少数几个「可以安全重跑的写」，因为守卫写在 `WHERE` 子句里：重跑一次要么还是没人领（赢），要么已经有人领了（`0`，判为输）。实测 120 轮（raw）+ 100 轮（走 toasty）、每轮 2–4 个竞争者，恰好一个赢家，没有 0 赢家也没有多赢家（`spikes/store.md`）。
 
 JSONL 追加和状态提交都校验领取代次。领取代次只防止旧执行者写账本，不能撤销已经发出的外部动作。因此必须先确认旧执行已停止，再考虑启动替代执行。
 
-首版不承诺让 shell / Python 进程本身跨 Gateway 重启继续存活。正常停机时停止接收新执行，给正在完成的工具短暂收尾时间，持久化可用结果；超时则回收所属进程及子进程，剩余任务标为 interrupted。关键文件原子修改完成后再停，不在半次替换中主动取消。
+首版不承诺让 shell / Python 进程本身跨 Gateway 重启继续存活。正常停机时停止接收新执行，给正在完成的工具短暂收尾时间，持久化可用结果；超时则回收所属进程及子进程，剩余任务交还领取权、由对账判成 `queued` 或 `waiting + intervention`。关键文件原子修改完成后再停，不在半次替换中主动取消。
 
 异常退出可能遗留子进程，不能仅凭一个 PID 判断是否为原进程；结合平台监督信息、启动身份和进程启动时间核对。无法确认旧执行已结束时，阻止该任务重复启动并显示原因。Tokio 的 Child handle 被丢弃并不默认终止进程，因此 kill_on_drop 不能取代异常退出和进程树回收方案。[Tokio process](https://docs.rs/tokio/latest/tokio/process/index.html)
 
@@ -771,7 +865,7 @@ JSONL 追加和状态提交都校验领取代次。领取代次只防止旧执�
 
 ### 8.8 恢复所需的上下文与用户体验
 
-未完成 Run 引用的 Session 目录及其 JSONL、payloads、tool-output、产物，还有外部工作目录、代码与环境快照、审批和配置，都不可被普通清理策略删除。tool-output 不作为临时日志按天直接清扫；已结束会话清理时也先处理恢复、Memory 和审计引用，显式清理后不得将缺失输出伪装成仍可回放。目录丢失、脚本版本不可用、权限被撤销或模型协议不再可回放时，保存具体原因并等待处理，不能换到另一个目录或新版脚本自动重来。
+未完成 Run 引用的 Session 目录及其 JSONL、payloads、tool-output、产物，还有外部工作目录、代码与环境快照、审批和配置，都不可被普通清理策略删除，**也不许直接 `rm`**：删除只有 `komo session delete` / `purge` 一条路，走 §8.10 的状态阶梯。tool-output 不作为临时日志按天直接清扫；已结束会话清理时也先处理恢复、Memory 和审计引用，显式清理后不得将缺失输出伪装成仍可回放。目录丢失、脚本版本不可用、权限被撤销或模型协议不再可回放时，保存具体原因并等待处理，不能换到另一个目录或新版脚本自动重来；**目录丢了而 Session 状态不是 `purged`，是"数据库与内容对不上"的一种，由 reconcile 报出来（§8.9）**，不是让下一次运行对着空上下文说话。
 
 原始请求来源与操作者身份也要保存。Cron 恢复后仍是 Cron，不能因为重启后由本机 Gateway 发起，就取得交互操作者的额外权限。Memory 的过期、遗忘和版本检查照常进行。
 
@@ -780,6 +874,42 @@ CLI 不承担恢复调度。打开 komo 时可以看到“2 个任务已接续�
 SSE 从已同步且索引完成的 JSONL 事件补读；审批当前状态可直接查询 state.db，不依赖用户一直在线。之后接入 Telegram 等主动推送渠道时，应为待发送结果持久保存投递记录，不能为补发一条结果消息重跑任务。
 
 用户处理 uncertain 时，应先看到原操作、已有证据和待确认事项。如果决定终止，则补齐明确的取消 / 未知结果；若允许继续，也不能伪造原调用成功。任何后续模型请求都保持完整的调用与结果配对。
+
+### 8.9 reconcile：DB 是权威，其余一切都是派生
+
+权威只有一处（§8.1）：**state.db 说"应该是什么"，Session 目录说"内容是什么"**。两者之间没有跨文件事务——先 `sync_all` 再提交数据库（§8.5），所以任何时刻崩掉都可能留下"半个事实"。今天处理半个事实的办法是**报损坏、然后停下**；它对真正的损坏是对的，对**没有主人的状态**（orphan）是错的：一条 handler 任务自己 panic 掉的 `running`、一个被手工 `rm -rf` 掉的会话目录、一条永远不会有人来答的 `waiting + intervention`，都会让整个 Session 从此停在那里，而原因只落在日志里。
+
+reconcile 是一次**只读观察 + 只写状态**的对账，它回答三个问题，且只回答这三个：
+
+| 观察 | 结论 |
+|---|---|
+| 这条未完成的 Run，它的 Session 还在服务范围里吗（§8.10：只有 `active` / `closing` 服务）？内容读得出来吗（目录、JSONL、被引用的输出）？ | 能 → 交给 §8.4 决策表逐行走；不能 → **不许领**，把这条 Run 停成一个 `blocked` Intervention（§7.5），理由写清是"会话已删"还是"内容缺失" |
+| 这条 `running` 的 Run，它的 `claimed_by` 还活着吗（租约没过期，或过期了但持有者确已结束）？ | 不是 → 按 §8.7 **只交还领取权**（状态仍是 `running`、没有主人 = 一个可查询的孤儿），再由 §8.4 决定续跑还是核对 |
+| 这条停在等待上的 Run，条件满足了吗？ | `retry` 到点了 → 放回 `queued`；`dependency` 的前一条进终态了 → 放回 `queued`；都还没 → 原样不动 |
+
+**它永远不做四件事**：不调用工具、不发送外部请求、不消费授权、不改写任何内容——§8.5 对回放的限定原样适用。它写下的每一条状态都走正向顺序（先 JSONL 后数据库，或纯数据库的状态提交），并且幂等：同一批输入跑十遍与跑一遍结果相同。
+
+**触发点三个**：Gateway 启动（§8.7 那次扫描就是它）、`AUDIT_TICK` 那一拍的周期兜底（§8.5 的补写周期顺手做一次，代价是几十条 `SELECT`）、以及显式的 `POST /v1/reconcile`（`komo doctor --reconcile`）。首版**不做**异步 GC、不做引用计数、不做跨 Session 死链自动修复——那些不是当前的主要矛盾。这里要求的就是三件事：**逻辑删除可靠、不重复副作用、orphan 能被自动发现并说清**。
+
+一条硬约束顺带落在这里：**领取一个 Run 之前必须确认它的会话还在服务**。今天的 `DUE_SQL` / `CLAIM_SQL`（§8.7）只看 Run 自己的状态与同 Session 的先后次序，于是"目录被手工删掉、Run 还在队列里"会被**照常领走并按空上下文执行**——那是把一个已经不存在的对话续上一轮，比停下来更糟。两条 SQL 都要加"Session 存在且状态可服务"的守卫；reconcile 负责把这种情况**说清楚**，守卫负责让它**不发生**。
+
+### 8.10 Session 生命周期：Closing → Deleted → Purged
+
+Session 不是只能追加的对象。删掉一个会话今天等于 `rm -rf sessions/{id}`：数据库那一行还在、未完成的 Run 还在队列里、下一轮模型请求会带着空上下文跑起来，而操作者手上没有任何一条命令能做对这件事——这正是 §7.5 开头那个现象的另一种形态。给出三个状态，**删内容只能是最后一步，而且必须有人明确下令**：
+
+| 状态 | 谁能进 | 新输入 | 队列 | 内容 | 列表 / resume |
+|---|---|---|---|---|---|
+| `active` | 默认 | 接受 | 正常 | 在 | 列出，可 resume |
+| `closing` | `komo session delete`（逻辑删除的受理） | **拒绝** | 未完成的 Run 照 §8.4 跑完或停在等待；**不新开** | 原样不动 | 列出并标注"正在关闭"，可 resume 看最后一程 |
+| `deleted` | `komo session delete --now`，或 reconcile 判定"已无未完成 Run" | 拒绝 | 空 | 仍在——逻辑删除**不碰内容** | 默认不列出（`--all` 可见），resume 拒绝并说明 |
+| `purged` | `komo session purge <id>`，且前置检查全过 | 拒绝 | 空 | **已删除**，只剩墓碑行 | 不列出；`komo session show <id>` 仍答得出它曾经存在、何时被回收 |
+
+四条规则：
+
+1. **状态权威是 `sessions.state` 一列**（`ALTER TABLE ADD COLUMN`、`NOT NULL DEFAULT 'active'`，§8.2 只允许加列），外加一个"状态变更时刻"。JSONL 里追加 `session.closing` / `session.deleted` / `session.purged` 作为**审计副本**——与审批同向（§8.5 的反向补写）：数据库先提交，事件随后补写；读事件**不产生状态**。
+2. **`closing → deleted` 是 reconcile 的判定，不是时钟**：只有这个 Session 再没有非终态 Run 时才推进。在那之前它一直是 `closing`，而"还有谁没跑完"正好是 §7.5 清单答得出的。操作者要立刻走完，`komo session delete --now` 把未完成的 Run 全部按 `abandon` 处置（各写一条明确的取消），再进 `deleted`。
+3. **`purged` 之前先算引用，而且状态先落、内容后删。** `memory_evidence` 指向这个 Session 事件的行、`checkpoints`、`deliveries` 里未送出的行、`cron_firings` 的 Session 引用都要先处置——停用无法再验证的记忆条目、把投递标成终止——然后：**数据库先提交 `purged` 这个墓碑，再删内容**，最后对账把"标了 `purged` 而内容还在"的会话收尾（幂等，删一半被杀也不会留下说不清的状态，因为 `purged` 已经声明了"这个目录要没了"）。**删不掉就说清楚，不假装成功**（§8.8 的原话照旧）；引用检查不过就 409 并列出要先处置什么。`purged` 之后 `jsonl_path` 这类列保留原值，但那个目录不该再被创建或读取：任何试图往 `purged` 会话写内容的路径都是 bug，不是"重新开始"。
+4. **禁止直接 `rm`。** 三层：命令层——删除只有一条路（`komo session delete` / `purge`），没有"手工删目录"这条经验路径；Policy 层——默认规则里工具对数据目录（`sessions/`、`state.db*`、`runtime/`、`.env`）的写入是 `Deny`，shell 的灾难形状由 §7.1 的 `command_patterns` 再兜一层（**那是手滑网，不是墙**，§7.3 已经说过它认不出变量拼出来的命令）；reconcile 层——真正的保证在这里：目录没了而状态不是 `purged`，对账会把它**报出来**，而不是等下一轮模型对着空上下文说话。
 
 ## 9. Memory：自动积累、可信来源与混合检索
 
@@ -866,7 +996,7 @@ runs 中记录 pending / processing / done / error 与处理游标。进程崩�
 
 **"配了 alias 但后端还没在手上"算前一种，不算配置错误。** 维度探测（§9.5）在 Gateway 就绪之后的后台跑（§3），探测落定前 hybrid 照常退化为关键词、vector-only 照常报"后端不可用"；把这一段时间报成 `VectorUnconfigured` 会把"等一个还没回来的人"说成"你把配置写错了"，也让这一轮召回整条失败而不是降级给出关键词结果。
 
-后台刚入库但尚未生成向量的记忆仍可通过关键词命中。每次模型请求前复查被选条目的有效性，正常情况下沿用 Run 的选择，不逐轮重复请求 embedding。新用户输入或任务发生实质变化时再召回。
+后台刚入库但尚未生成向量的记忆仍可通过关键词命中。每次模型请求前复查被选条目的有效性，**同一段对话里沿用并逐字复用**那一次的注入——注入段拼在 system 消息里，而服务端的前缀缓存按**最长公共前缀**命中：每轮重新召回、重新渲染（哪怕只是条目顺序或某条的记忆 revision 数字变了），整个请求从第一条消息起就与上一次不同，对话历史那一大段前缀的缓存全部失效，钱与延迟都付在重复的前缀上。所以召回与渲染的单位是**一段对话**（`conversation.boundary` 之间，聊天里的 `/new` 划开），不是一轮：同一段里一个字节都不改，换段或这一段第一次用时才重新召回，也不逐轮重复请求 embedding。代价写在这里：本段内新记下、或本来召回到了但这一段没选中的条目，要**下一段**才进上下文；被改写的条目在本段内仍按原样注入（正文里带 `id@revision`，读的人知道引用的是哪一版）。要立刻刷新，`/new` 开一段就行。**遗忘不在这个代价里**：沿用的每一轮都要照 §9.4 核对被选条目的有效性，被遗忘或失效的条目立刻把它那一块作废重算——"立刻停用"（§9.2）优先于前缀稳定，验收项 `a_forgotten_memory_never_comes_back_into_a_turn` 钉的就是它。
 
 ### 9.5 向量索引与模型切换
 
@@ -918,14 +1048,14 @@ Cron Scheduler 只负责产生 Run，复用 AgentLoop、Policy、工具和存储
 
 ```text
 发现到期
- → state.db 事务插入 cron_firing、触发快照并预留 Session / ingesting Run
+ → state.db 事务插入 cron_firing、触发快照并预留 Session / `accepted` Run
  → JSONL 持久保存触发输入，state.db 提交 queued
  → 普通队列执行
  → 保存结果和产物
  → 更新本次触发状态
 ```
 
-每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 及版本化授权。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；Run 停在等待审批或 `needs_attention` 时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体模块版本及授权。
+每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 及版本化授权。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；Run 停在任一待处理 Intervention（审批、结果不明、阻塞，§7.5）上时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体模块版本及授权。
 
 ```bash
 komo cron add --name morning-summary \
@@ -972,7 +1102,7 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的�
                               5. 命令？→ 直接处理并 ack
                               6. 普通文本 → Ledger::accept_input → 排队
                        回复：订阅该 Session 的事件流，Run 终态时把最终 assistant 消息发回来源会话；
-                             审批请求、needs_attention 走 Notifier（§11.4）
+                             待处理 Intervention（审批、结果不明、阻塞）走 Notifier（§11.4）
 ```
 
 - `request_key`：飞书是 `feishu:{event_id}`（`header.event_id`，消息事件与卡片回调同一个字段；官方对 2.0 事件的去重建议就是「通过事件结构中的 `event_id` 字段判断事件唯一性」），Telegram 是 `telegram:{update_id}`（long polling 重投的单位是整个 `Update`，`offset` 未推进就原样再取一次，普通消息与 `callback_query` 因此共用这一个键），WeChat 是 `wechat:{from_user_id}:{client_id}`——iLink 的 wire 消息**没有 `msg_id`**，字段只有 `from_user_id` / `to_user_id` / `client_id` / `create_time_ms` / `message_type` / `message_state` / `context_token` / `item_list`，唯一的逐消息标识是 `client_id`（**发送方**微信客户端生成的 UUID，不是服务端投递 id），所以加 `from_user_id` 前缀，`client_id` 为空时回退到 `(from, 内容哈希, 60s 窗口)`；微信的重投有两个来源——拉取游标只活在进程内存里、重启从空游标开始，以及服务端回了消息却回空游标时 SDK 把同一批原样再交一次——所以微信的去重是必需的，不是以防万一。飞书 / Telegram 不带 `chat_id` 前缀：两个 id 在单个应用 / 单个 bot 内已唯一，而 Telegram inline 模式的按钮回调根本没有 chat，硬拼会逼出占位值。三个平台都是至少一次投递（飞书官方原话「即使成功接收，仍会收到重复消息」；未在 3 秒内响应会按 15s / 5min / 1h / 6h 重推最多 4 次，ws 长连接同样有超时重推），重发命中同一 Run；**命令也去重**——重发的 `/approve` 不会批准两次。这正是 §8.5 请求键的语义，不另做 inbox 表。
@@ -1035,12 +1165,13 @@ TELEGRAM_BOT_TOKEN=...
 | 命令 | 行为 |
 |---|---|
 | `y` / `n`（也认 `yes` / `no`） | 待处理只有**一条**时的最短答复：等价于 `/approve` / `/reject`，省掉抄短 ID——手机上那 4 位才是真正的摩擦。**只认单个词**（`y 7K2M` 是半懂不懂的写法，当普通消息），而且**没有待处理审批时它不是命令**：模型问"要不要…"、操作者回个 `n`，那是回话，不是"拒绝一条不存在的审批"。解析在网关，判断"真的有人在等"也在网关（§11.1 第 5 步） |
-| `/approve <short_id>` / `/reject <short_id>` | 打 `POST /v1/approvals/{id}/decision`；已决定的返回原决定，不报错 |
+| `/approve <short_id>` / `/reject <short_id>` | 打 `POST /v1/interventions/{handle}/answer`；已答复的返回原结论，不报错 |
+| `/answer <handle> <结论>` | 答复另外两类（§7.5）：`/answer <run_id> satisfied`（核对后目标已满足，原 Run 继续）、`not_performed`（确定没执行，重新入队）、`resolve`（前提已处理，重新观察并重新决策）、`abandon`（取消这个 Run）。`/approve` / `/reject` 就是审批类的两个结论，走同一条路 |
 | `/approve` / `/reject`（无 ID） | 操作者只有**一个**待处理请求时生效；多于一个则列出并要求指明 |
-| `/approve all` / `/reject all` | 打 `POST /v1/approvals/decisions`，把**此刻待处理的全部**一次答了（§7.2）；每条各自落一条决定，回执点名答了哪几条。**批量的范围是本次调用**——要范围请逐条 `/approve <短ID> run` |
+| `/approve all` / `/reject all` | 打 `POST /v1/interventions/answers`，把**此刻待处理的全部审批**一次答了（§7.2）；每条各自落一条结论，回执点名答了哪几条。**批量的范围是本次调用**——要范围请逐条 `/approve <短ID> run` |
 | `/approve <short_id> run` | 本次 Run 的范围授权（§7.2 第二种）；只对 Policy 标记为可范围化的计划生效，`Deny` 不可覆盖 |
 | `/approve <short_id> cron` | Cron Job 的范围授权（§7.2 第三种），绑定 Job 与其版本；只对来源是 Cron 的请求出现（Policy 对 Cron 来源的 Ask 自动多给这一档） |
-| `/pending` | 列出待处理审批及其短 ID |
+| `/pending` | 列出**全部**待处理 Intervention（§7.5）与各自的句柄：审批给短 ID，结果不明与阻塞给 Run ID，并写清这一条该答什么 |
 | `/new` | 当前 Session 追加 `conversation.boundary`，不切 Session |
 | `/cancel` | 取消该 Session 当前 Run |
 | `/status` | 当前 Run 状态、待审批数 |
@@ -1064,7 +1195,8 @@ TELEGRAM_BOT_TOKEN=...
 
 - `Notifier::deliver` 先在 `deliveries` 表写一行（目标、内容引用、状态 `pending`），再发送，成功后标 `sent`。重启后 `pending` 的行补发，按 `DeliveryId` 幂等。
 - **补发在就绪之后跑，而且同一时刻只跑一趟。** 就绪（§3 第 4 步）不等它：它是网络 I/O，一条一个平台往返，积压多少就等多久。三个入口——渠道起来时按平台冲刷、启动时整体冲刷、微信入站前按会话冲刷——共用一把锁：两趟并发地在同一批 `pending` 行上跑，同一行会被送两次（发送在结算之前）。
-- **审批请求的投递目标**：Run 的来源会话，**加上** home chat（若不同）。两处都能回答，第二个答复得到"已决定"。来源是 Cron 或已断开的 TUI 时只有 home chat。
+- **待处理 Intervention（§7.5）的投递目标**：Run 的来源会话，**加上** home chat（若不同）。两处都能回答，第二个答复得到"已决定"。来源是 Cron 或已断开的 TUI 时只有 home chat。审批、结果不明、阻塞三类共用这一条——"需要人判断"不该因为种类不同而有不同的到达率。
+  补充一条（2026-09-19 实现并按线上反馈收窄）：**屏幕前有人在看这个会话时（HTTP 的 SSE 订阅在）不投 home chat**。TUI / HTTP 来源的 Run 没有 chat 对端，照上面那句它只剩 home chat 一个出口，而那条卡片是一次网络往返（实测几秒到几十秒），人正盯着弹窗的时候它只会晚到、答完还多一条回写。判据是**客户端订阅数**（`EventHub::watch` 的守卫，HTTP SSE 处理器持有），不是广播的订阅者总数——Run 的看客自己也订阅同一个广播。人走掉之后仍挂着的审批由周期（与审计补写同一拍）补投，投过的不重复：§10 的"不能因为无人值守就没人知道它在等"没有被这条放松。
 - home chat 解析：只看配置——每个 enabled 渠道的 `home_chat`（§11.2），没有运行时覆盖；一个都没配时返回错误给调用方，**不静默丢弃**。多个渠道都配了时的默认顺序是**飞书 > Telegram > WeChat**：前两者能通过 API 对任意已加入的会话主动推送，微信不能（下一条）。
 - **WeChat 的平台约束**：DM 回推依赖回复令牌 `context_token`——每条入站消息自带一个，SDK 按 `user_id` 存在**进程内存**里，源码里没有过期逻辑，唯一的失效路径是会话过期（`errcode -14`）清空整张表；真正挡住主动推送的是**进程重启即全丢**，不是令牌到期。没有令牌时 `send` 直接返回 `NoContext`，不会联网去补——这就是 `Deferred` 的精确触发条件（按错误**变体**匹配，不按字符串）。因此进程启动后用户没发过消息时**无法主动推送**。对应处理：该渠道的 `deliver` 在没有令牌时把行留在 `pending` 并返回 `Deferred`；用户下一条消息到达时 Dispatcher 先冲刷该会话的 `pending` 投递（§11.1 第 4 步），再处理新消息。审批请求因此不会丢，只会晚到；`home_chat` 里排在它前面的飞书或 Telegram 会先送到。待验证：服务端是否接受跨进程的旧 `context_token`——若接受，把每个 `user_id` 的最新令牌持久化到 state.db 即可让重启后的主动推送直接成功，`Deferred` 退化为「这台机器从没收过这个人的消息」一种情形。另：SDK 的 `message_type` / `message_state` 枚举没有 unknown 兜底，服务端多一个值就整批反序列化失败并无限退避重试，渠道会静默卡死——komo 的 wechat 渠道把连续 N 次 JSON 错误升级为 home chat 告警。
 - TUI 的 SSE 是另一个 Notifier 实现，不持久化——连接断了从事件流补读。
@@ -1100,7 +1232,7 @@ TELEGRAM_BOT_TOKEN=...
 └── logs/                # Gateway 自身的运行日志
 ```
 
-Session 内容以目录为单位管理和归档，不再使用顶层 tool-output 或 artifacts 分散存放会话数据。自动 Memory 保存在 state.db，用户主动记录保存在 Memos；可复用 Python 能力继续保存在 toolbox，实际项目副本保存在 workspaces。会话 artifacts 中需要长期保留的报告和文件，不因清理聊天历史而自动删除；不能直接删除整个 Session 目录代替引用检查。会话来源需要清理时，先为仍引用它的记忆保留必要的、经脱敏的证据摘录与来源元信息，或停用无法再验证的条目，不能留下伪装有效的引用。重建内容索引不删除 JSONL；清理已结束 Session 的 JSONL 需要同时处理索引、检查点和引用关系。
+Session 内容以目录为单位管理和归档，不再使用顶层 tool-output 或 artifacts 分散存放会话数据。自动 Memory 保存在 state.db，用户主动记录保存在 Memos；可复用 Python 能力继续保存在 toolbox，实际项目副本保存在 workspaces。会话 artifacts 中需要长期保留的报告和文件，不因清理聊天历史而自动删除；不能直接删除整个 Session 目录代替引用检查。**会话的删除只有一条入口**：`komo session delete` 进 `closing`、对账判定后进 `deleted`、`komo session purge` 才真的删内容（§8.10）——`rm -rf sessions/{id}` 不在流程里，它今天造成的正是"数据库说有、内容说没有"的那种对不上（§8.9）。会话来源需要清理时，先为仍引用它的记忆保留必要的、经脱敏的证据摘录与来源元信息，或停用无法再验证的条目，不能留下伪装有效的引用。重建内容索引不删除 JSONL；清理已结束 Session 的 JSONL 需要同时处理索引、检查点和引用关系。
 
 记忆正文、来源和确认记录需要持久保留；关键词与向量索引可从原文重建，禁止为了重建索引删除整个数据库。Memos 原文由 Memos 自己的备份策略覆盖。
 
@@ -1120,18 +1252,22 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | -------------------------------- | ---------------------------------------------- |
 | GET /healthz                     | 最小健康检查与实例标识                         |
 | POST /v1/sessions                | 创建会话                                       |
-| GET /v1/sessions                 | 列出会话                                       |
+| GET /v1/sessions                 | 列出会话（默认不含已逻辑删除的，`?all=1` 才列） |
 | GET /v1/sessions/{id}            | 会话详情与运行状态                             |
 | GET /v1/sessions/{id}/events     | 按游标获取或订阅事件                           |
-| POST /v1/sessions/{id}/runs      | 提交新输入                                     |
+| POST /v1/sessions/{id}/runs      | 提交新输入；会话不在 `active` 时 409 并说清是 `closing` / `deleted` / `purged` |
 | POST /v1/sessions/{id}/resume    | 检查恢复位置，恢复可继续的运行或返回待处理状态 |
 | POST /v1/sessions/{id}/boundary  | 追加 `conversation.boundary`（聊天里的 `/new`）  |
+| POST /v1/sessions/{id}/delete    | 逻辑删除：进 `closing`（`{"now":true}` 立刻把未完成 Run 各写一条取消并进 `deleted`）。**不碰内容**（§8.10） |
+| POST /v1/sessions/{id}/purge     | 回收内容进 `purged`；引用检查不过则 409 并列出要先处置什么（§8.10） |
+| POST /v1/reconcile               | 立刻跑一次对账（§8.9）；幂等，返回这次判定了什么 |
 | GET /v1/runs/{id}                | 执行详情                                       |
 | POST /v1/runs/{id}/cancel        | 取消                                           |
-| GET /v1/approvals                | 待审核列表，列表项包含短 ID、具体动作与计划   |
-| GET /v1/approvals/{id}           | 单项审批详情                                   |
-| POST /v1/approvals/{id}/decision | 批准或拒绝                                     |
-| POST /v1/approvals/decisions     | 一次答一批（§7.2、§11.3 的 `/approve all`）：名单由发起方列出，每条各自落一条决定，各按本次调用 |
+| GET /v1/interventions            | 待处理清单：审批、结果不明、阻塞三类（§7.5）。每条带句柄、种类、问题与可答的结论 |
+| GET /v1/approvals                | **审批记录（含已决定）**，给 `komo run inspect` 答"这一步是谁放行的"（§7.4）；**不是待处理清单**——那一个走 `/v1/interventions` |
+| GET /v1/interventions/{handle}   | 单项详情；审批类的详情就是 §7.2 要展示的那一份（计划、改动、原因、范围） |
+| POST /v1/interventions/{handle}/answer | 答复：`approve` / `reject`（范围按 §7.2）、`satisfied` / `not_performed` / `abandon` / `resolve`；已答复的返回原结论，不报错 |
+| POST /v1/interventions/answers   | 一次答一批（§7.2、§11.3 的 `/approve all`）：名单由发起方列出，每条各自落一条结论 |
 | GET /v1/cron                     | 列出定时任务                                   |
 | POST /v1/cron                    | 创建定时任务                                   |
 | POST /v1/cron/{id}/run           | 手动触发                                       |
@@ -1272,8 +1408,9 @@ effort 的行为统一，取值按协议和具体模型校验：
 划分原则：按**依赖重量**和**变更频率**切，不按 DDD 层。重依赖（toasty/turso、axum、reqwest、ratatui、渠道 SDK）各自只出现在一个 crate；高频改动的代码所在的 crate 不依赖任何派生宏重的东西；被所有人依赖的 crate 不含 I/O、不含 tokio；二进制只有 clap 分发。
 
 ```text
-komo-kernel    值类型、状态机、事件与 fold、Policy 规则引擎、cron 到期计算、
-               §8.4 恢复决策表（纯函数）、协议线格式、全部 trait（§13.5）。
+komo-kernel    值类型、状态机（Run / ToolCall / Session 生命周期）、事件与 fold、Policy 规则引擎、
+               cron 到期计算、§8.4 恢复决策表与 §8.9 reconcile 的判定（都是纯函数）、
+               Intervention 的类型与派生规则、协议线格式、全部 trait（§13.5）。
                deps: serde, serde_json, uuid, time, thiserror, async-trait, sha2, croner（`default-features = false`，
                无 chrono；它自己仍拉 derive_builder / darling / strum，接受）。不依赖 tokio，不带 tzdb。
 
@@ -1387,7 +1524,7 @@ codegen-units = 16
 | `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避、审批有效期全部依赖时间 |
 | `ZoneResolver` | tzdb 实现（runtime，W3 选 crate） | `ScriptedZoneResolver`（可编脚本的假时区）/ `FixedOffsetZone`（降级） | §10 的夏令时两条规则要在无 tzdb 下测；kernel 不带时区数据库 |
 
-不是 trait 的东西：`AgentLoop`、`ToolExecutor`、`Scheduler`、`Recovery`、`MemoryManager`、`SkillRegistry`、`Coordinator`、`Dispatcher`——各只有一个实现，依赖上表的 trait 就可测。`SessionRepo`、`ToolCallRepo`、`CheckpointRepo`、`OutboxRepo` 是 store 内部的具体类型，只被 `Coordinator` 用。审批也不需要 `Approver` trait：§6 定了审批暂停 Run，`Policy` 答 `Ask` 后 executor 写 `approval_requests` 并 `Ledger::suspend`，飞书卡片按钮、Telegram / WeChat 命令、TUI 弹窗、CLI 子命令都打到 `POST /v1/approvals/{id}/decision`（一次答一批时是 `POST /v1/approvals/decisions`，逐条落决定），调度器把 Run 重新入队，executor 从 `ApprovalRepo` 消费授权再执行。渠道之间的差别只在渲染（§11.3），不在决策。
+不是 trait 的东西：`AgentLoop`、`ToolExecutor`、`Scheduler`、`Recovery`、`MemoryManager`、`SkillRegistry`、`Coordinator`、`Dispatcher`——各只有一个实现，依赖上表的 trait 就可测。`SessionRepo`、`ToolCallRepo`、`CheckpointRepo`、`OutboxRepo` 是 store 内部的具体类型，只被 `Coordinator` 用。**审批与 Intervention 都不需要 `Approver` trait**：§6 定了审批暂停 Run，`Policy` 答 `Ask` 后 executor 写 `approval_requests` 并 `Ledger::suspend`；清单（§7.5）是 `runs` 与 `approval_requests` 的并集查询，没有需要注入的第二实现。飞书卡片按钮、Telegram / WeChat 命令、TUI 弹窗、CLI 子命令都打到 `POST /v1/interventions/{handle}/answer`（一次答一批时是 `POST /v1/interventions/answers`，逐条落结论），调度器把 Run 重新入队，executor 从 `ApprovalRepo` 消费授权再执行；`satisfied` / `not_performed` 走 executor 的收尾与 `RecoveryStore::requeue`，`abandon` 走 `Ledger::complete`。渠道之间的差别只在渲染（§11.3），不在决策。
 
 关键签名（接口示意，辅助类型省略；`Tool` 见 §4）：
 
@@ -1396,7 +1533,7 @@ codegen-units = 16
 /// 方法内部完成"外置正文（如有）→ JSONL 追加并同步 → 数据库事务"的顺序。
 #[async_trait]
 pub trait Ledger: Send + Sync {
-    /// 预留 Run（ingesting）→ run.accepted → queued。同一 request_key 返回原 Run，哈希不同则拒绝。
+    /// 预留 Run（`accepted`）→ run.accepted → `queued`。同一 request_key 返回原 Run，哈希不同则拒绝。
     async fn accept_input(&self, input: AcceptInput) -> Result<Accepted, LedgerError>;
     /// 完整 assistant 回复 + 本轮全部调用计划，一个逻辑事件；返回 Runtime 分配的 ToolCallId。
     async fn record_round(&self, run: &RunId, round: AssistantRound) -> Result<Vec<ToolCallId>, LedgerError>;
@@ -1406,7 +1543,7 @@ pub trait Ledger: Send + Sync {
     async fn start_call(&self, call: &ToolCallId, plan: &ExecutionPlan, grant: Option<GrantUse>) -> Result<AttemptId, LedgerError>;
     /// 输出已由 ToolOutputStore 发布；这里只写 tool.result 元信息与引用。
     async fn finish_call(&self, attempt: &AttemptId, published: PublishedOutput) -> Result<(), LedgerError>;
-    /// waiting_approval / waiting_retry / needs_attention，释放执行名额。
+    /// 停在某个外部条件上（§8.4）：状态变 `waiting`，理由进 `WaitReason`，释放执行名额。
     async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError>;
     /// 调用前这一轮的最终回复必须已作为 message.assistant 落盘（record_round → complete）；
     /// run.completed 的 final_message 只用于补读，不进消息面。
@@ -1535,6 +1672,7 @@ pub trait Clock: Send + Sync {
 | 7. Cron | 持久调度、去重、重叠处理、人工接手 | 重启不重复创建同次触发；新危险操作等待审批；Cron 的等待在聊天里 `/approve` 后按 Cron 权限继续，不升权 |
 | 8. 模型配置与 Memory | 独立记忆 / 向量模型、effort 校验、自动提取、混合召回（`memory_terms` + 向量）与遗忘 | 不串用模型配置；推断不自行确认；过期或遗忘内容不召回；重建可恢复 |
 | 9. 场景与双平台验收 | 真实代码仓库、测试 HA 设备、Memos 主动记录；编译预算复测 | 两平台独立运行；记录从 Memos 找回；代码交付含验证证据；冷编与增量编译在预算内，或有记录在案的偏差原因 |
+| 10. 生命周期与对账 | Session 的 `closing → deleted → purged`（§8.10）、Intervention 统一清单与四种结论（§7.5）、reconcile 的三条判定与领取守卫（§8.9） | **逻辑删除可靠**：`delete` 之后新输入被拒、未完成 Run 各写一条明确取消、内容一个字节没动；`purge` 在引用未处置时 409 并列出要先处理什么；`purged` 之后没有任何路径再创建那个目录。**清单堵死漏网**：`approval list` 为空而会话被挡住这种组合构造不出来——"挡队"与"进清单"同源，且每一条 `waiting + approval` / `waiting + intervention` 都在清单里。**orphan 自动 reconcile**：目录被手工删掉而状态不是 `purged` → 对账报出来且 Run 不被领走（不出现"按空上下文执行一轮"）；handler 任务 panic 留下的 `running`（租约过期 + 存活判定）被回收；无法确认旧执行结束的那条停成清单里的一条 |
 
 存储和 Policy 的基本约束从第二阶段开始贯穿全部工具，不能在所有功能完成后才补审核。
 
@@ -1559,8 +1697,11 @@ pub trait Clock: Send + Sync {
 | 最终结果已同步到 JSONL，SSE 尚未送达                 | 客户端补读原结果，Run 保持 completed                             |
 | 旧子进程仍存活，或恢复和 resume 同时触发             | 先阻止重复执行；核实进程结束，并且只有一个领取者                 |
 | 用户取消后重启，或连续恢复失败耗尽预算               | 已取消的不复活；失败有明确终态，不无限循环                       |
+| 逻辑删除进行到一半被杀（已进 `closing`，未完成 Run 还没处置完） | 重启后仍是 `closing`：Run 照 §8.4 走完或停在等待，不推进到 `deleted`，内容一个字节没动 |
+| `purge` 进行到一半被杀（墓碑已提交、内容删了一半） | 对账把"标了 `purged` 而内容还在"的会话幂等收尾；不表现成损坏，也没有 Run 被领走 |
+| 会话目录被手工删除，而状态仍是 `active` / `closing` | Run 不被领走（不按空上下文执行一轮），对账把这条不一致报成 `blocked` Intervention |
 
-目录与引用验收：工具事件、大参数、完整输出及 stdout / stderr 都位于同一 Session 目录；改变 Gateway 当前工作目录不影响引用读取；不同 Session 或不同 attempt 不能互相覆盖。清理历史时保留未完成任务、Memory 证据和持久产物仍需引用的文件。
+目录与引用验收：工具事件、大参数、完整输出及 stdout / stderr 都位于同一 Session 目录；改变 Gateway 当前工作目录不影响引用读取；不同 Session 或不同 attempt 不能互相覆盖。清理历史时保留未完成任务、Memory 证据和持久产物仍需引用的文件。**读路径不写**：把会话目录删掉之后，`GET /v1/sessions/{id}/events`、会话详情、对账与恢复扫描都不得把它建回来，而且对账必须把这条 Run 停成 `waiting + intervention` 并说明缺内容。
 
 测试同时断言实际副作用次数、Run / ToolCall 身份、授权使用、预算和事件配对；仅检查“恢复后状态变成 running”不算通过。每个断点做进程终止测试，并单独安排操作系统重启 / 存储持久性验证。
 
@@ -1594,3 +1735,5 @@ Memory 与模型验收覆盖：
 | Telegram 把消息编辑成与现状相同内容时返回的错误（官方未文档化，且声明 `error_code` 内容会变） | §11.3 决定后去掉按钮的幂等重试 | 不匹配错误文案；编辑失败一律当非致命，决定以 Ledger 为准 |
 | 补发积压投递的真实代价（启动路径） | §3 第 4 步、§11.4 | **已核实（2026-09-18，本机实测）：它就是"重启好慢"的全部。** `komo gateway restart` 9.0s：bootout + 等待 launchctl 卸完 + bootstrap 只占 0.22s（分别 6ms / 220ms / 11ms），**约 5.1s 花在渠道起来时的按平台补发、2.9s 花在启动时的整体补发**——两者都在 "Gateway 就绪" 之前同步跑，每条 pending 一个平台往返（飞书 ~290ms），而当时积压的投递因为卡片被平台拒（下一行）永远送不出去。改成就绪之后后台跑之后：**2.7s**，其中进程启动到就绪 1.8s。剩余 1.25s 是启动时的 embedding 维度探测（本地 ollama 往返），与补发无关，**已做（2026-09-18，本机 Fedora 实测）**：探测移出就绪路径（§3「就绪也不等模型探测」）——把向量端点指向一个只收连接不回话的 socket 时，修复前发现文件与 `Gateway 就绪` **都在 120.12s**（等满模型超时），修复后 **0.16s**；探测改在后台，`docs/komo_bot.md` 的那 1.25s 同样不再落在重启上。回归测试 `komo-gateway/tests/memory/startup.rs`（预修版本 5s 超时失败） |
 | 飞书卡片 2.0 支持哪些组件 | §11.3 卡片渲染 | **已核实（2026-09-18，官方不兼容变更 + 线上报文）：2.0 不再支持 `note` 组件与 `action` 模块**，且 2.0 对不认识的组件是**整张卡打回**而不是忽略。线上表现：每一个审批请求都被拒（`http 400 / code 230099`，`ErrCode 200861 unsupported tag note`），**审批一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上——审批的主入口（§11.3）整个是死的，操作者只看得到"等待审批"的 Run。替代写法已按官方给的来：备注 = 普通文本组件 + `notation` 字号 + 灰色；按钮行 = `column_set` 每列一个 button，那一块带固定 `element_id` 供决定后整块摘掉 |
+| reconcile 一拍的真实成本（目标：1 万 Run / 1 千 Session）与它该排在哪个周期 | §8.9 的周期兜底 | 从 `AUDIT_TICK` 那一拍拆出来，按更粗的间隔跑（例如 5 分钟），或只对"启动后还没对过账的那些"跑；启动时那一次无论如何都要跑 |
+| `sessions.state` 之外是否还需要一个"回收进行中"的中间态 | §8.10 的 `purge` | 当前设计靠"墓碑先落、内容后删"取得幂等，不需要第四个状态；若实测发现"内容删到一半"无法与"内容被外部删掉"区分，再补一个状态列值（仍是加列/加值，不改 schema 形状） |

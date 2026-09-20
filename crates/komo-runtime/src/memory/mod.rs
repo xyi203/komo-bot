@@ -341,6 +341,17 @@ pub struct MemoryManager {
     /// 每个 Run 这一次选了哪些条目。「正常情况下沿用 Run 的选择，不逐轮重复请求
     /// embedding」（§9.4）——`SystemPreamble` 是同步的，正文也从这里取。
     selections: Mutex<BTreeMap<RunId, Injection>>,
+    /// 每个会话**当前这一段对话**注入的那一块（§9.4）。
+    ///
+    /// 为什么要它：注入段在 system 消息里，而服务端的前缀缓存按**最长公共前缀**命中。
+    /// 每次 Run 重新召回、重新渲染——哪怕只是条目顺序变了、某条记忆的 revision 数字变了
+    /// ——整个请求从第一条消息起就与上一次不同，缓存命中率归零，钱和延迟都付在重复的
+    /// 前缀上。所以：**同一段对话里逐字复用**，换段（`conversation.boundary`，即 `/new`）
+    /// 或者这一段第一次用时才重新召回。
+    ///
+    /// 代价写在 §9.4 里：会话进行中新召回得到的条目，要等下一段才进来；被改写的条目在
+    /// 本段内仍按原样注入（正文里带着 `id@revision`，读的人知道引用的是哪一版）。
+    pins: Mutex<BTreeMap<SessionId, Pinned>>,
     /// 正在重建的代次。`POST /v1/memory-index/rebuild` 的幂等就是它。
     building: Mutex<BTreeSet<String>>,
     /// 已经报过一次失败的 Run。**只为不刷日志**：一分钟后还失败是同一件事，每拍都
@@ -357,6 +368,21 @@ impl std::fmt::Debug for MemoryManager {
             .finish()
     }
 }
+
+/// 一个会话里**这一段对话**注入的那一块。
+#[derive(Debug, Clone)]
+struct Pinned {
+    /// 钉住时的 `Surface::boundary()`（`conversation.boundary` 的位置）。它一变就是新一段。
+    boundary: usize,
+    injection: Injection,
+    /// 最后一次用到它的时刻。表按会话攒，长时间跑着的进程要能收掉早就没人用的那些。
+    seen: OffsetDateTime,
+}
+
+/// 注入锚表超过这么多会话时，顺手收掉 [`PIN_TTL`] 没碰过的（长跑进程里它会一直攒）。
+const PIN_SOFT_LIMIT: usize = 256;
+/// 多久没碰过就可以丢：一段对话不会跨这么久还接着答。
+const PIN_TTL: time::Duration = time::Duration::hours(6);
 
 /// 一次后台处理最多领几个 Run。
 pub const WORK_BATCH: usize = 8;
@@ -377,6 +403,7 @@ impl MemoryManager {
             work: parts.work,
             clock: parts.clock,
             selections: Mutex::new(BTreeMap::new()),
+            pins: Mutex::new(BTreeMap::new()),
             building: Mutex::new(BTreeSet::new()),
             reported: Mutex::new(BTreeSet::new()),
         }
@@ -555,6 +582,122 @@ impl MemoryManager {
         }
 
         let injection = render_injection(&items, self.retrieval.max_tokens);
+        self.settle_selection(run, &injection, now).await;
+        injection
+    }
+
+    /// 这一段的注入段（§9.4）。
+    ///
+    /// **同一段对话里逐字复用**：`boundary` 没变就把上一块原样交回，一次召回、一次
+    /// embedding 都不做。变了（`/new`）或者这一段还没有过，才走 [`MemoryManager::prepare`]
+    /// 那条正常路径（重新核对带过来的引用 → 召回 → 渲染）。
+    ///
+    /// 一条都没召回出来时**也钉住**：不钉的话这个会话每一轮都要为"确实没有相关记忆"
+    /// 付一次 embedding。
+    pub async fn prepare_segment(
+        &self,
+        session: &SessionId,
+        run: &RunId,
+        text: &str,
+        carried: &[MemoryUse],
+        boundary: usize,
+    ) -> Injection {
+        if !self.enabled {
+            return Injection::default();
+        }
+        // 先取出来再判断：锁不能跨 `await` 拿着（下面的核对与写库都要 await）。
+        let now = self.clock.now();
+        let pinned = {
+            let mut pins = self.pins.lock().expect("注入锚");
+            let found = pins
+                .get(session)
+                .filter(|pinned| pinned.boundary == boundary)
+                .map(|pinned| pinned.injection.clone());
+            if found.is_some()
+                && let Some(pinned) = pins.get_mut(session)
+            {
+                pinned.seen = now;
+            }
+            found
+        };
+        // §9.4「每次模型请求前复查被选条目的有效性」+ §9.2「forget 立即停用」：沿用之前
+        // **先核对这一块现在还算不算数**。被遗忘/失效的条目还在锚里，就是让遗忘失效——
+        // 这一条是验收项（`a_forgotten_memory_never_comes_back_into_a_turn`），不是优化
+        // 可以牺牲的东西。
+        let pinned = match pinned {
+            Some(pinned) if self.pin_still_valid(&pinned, now).await => Some(pinned),
+            Some(pinned) => {
+                tracing::info!(
+                    %session,
+                    boundary,
+                    lines = pinned.uses.len(),
+                    "这一段的注入锚里有条目已被遗忘/失效，重算这一块"
+                );
+                None
+            }
+            None => None,
+        };
+        if let Some(pinned) = pinned {
+            // 使用计数照记：这一段里每用一次都算用了一次（§9.2 的度量，不影响正文）。
+            self.settle_selection(run, &pinned, now).await;
+            tracing::debug!(
+                %session,
+                boundary,
+                lines = pinned.uses.len(),
+                "这一段对话沿用上一块注入，不改动提示前缀"
+            );
+            return pinned;
+        }
+
+        let injection = self.prepare(run, text, carried).await;
+        {
+            let mut pins = self.pins.lock().expect("注入锚");
+            if pins.len() >= PIN_SOFT_LIMIT {
+                pins.retain(|_, pinned| now - pinned.seen < PIN_TTL);
+            }
+            pins.insert(
+                session.clone(),
+                Pinned {
+                    boundary,
+                    injection: injection.clone(),
+                    seen: now,
+                },
+            );
+        }
+        // 这一段就此定下来：从这里到下一次换段，system 消息逐字不变（前缀缓存的命门）。
+        tracing::info!(
+            %session,
+            boundary,
+            lines = injection.uses.len(),
+            "这一段对话的注入已定；此后逐字复用，换段（/new）才重算"
+        );
+        injection
+    }
+
+    /// 钉住的那一块**现在还算不算数**：里面的条目都还在、都还能召回。
+    ///
+    /// 只看"还在不在、还能不能召回"，**不看 revision**：`forget` 必须立刻生效（§9.2、
+    /// §9.7），而改写只影响正文文字——那一点让给提示前缀的稳定（正文里带着 `id@revision`，
+    /// 读的人知道引用的是哪一版），本段结束后自然换过来。
+    ///
+    /// 代价是每个 Run 至多 `top_k` 次按 id 的短读；不涉及 embedding，也不涉及向量检索。
+    async fn pin_still_valid(&self, injection: &Injection, now: OffsetDateTime) -> bool {
+        for use_ in &injection.uses {
+            match self.repo.get(&use_.memory).await {
+                Ok(Some(item)) if item.is_recallable_at(now) => {}
+                Ok(_) => return false,
+                Err(error) => {
+                    // 读不出来 ≠ 没问题：宁可按失效处理，下一段重算（§8.5 一贯的口径）。
+                    tracing::debug!(%error, memory = %use_.memory, "核对注入锚里的条目没读成，这一块作废重算");
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// 记使用计数 + 把这一块挂到这个 Run 上（`SystemPreamble` 从那里取正文）。
+    async fn settle_selection(&self, run: &RunId, injection: &Injection, now: OffsetDateTime) {
         let ids: Vec<MemoryId> = injection
             .uses
             .iter()
@@ -570,7 +713,6 @@ impl MemoryManager {
             .lock()
             .expect("注入表")
             .insert(run.clone(), injection.clone());
-        injection
     }
 
     /// 重新核对一批记忆引用的**当前**状态（§9.7）。过期、遗忘、改了版本的都掉出去。
@@ -684,7 +826,7 @@ impl MemoryManager {
     pub async fn process_run(&self, item: &MemoryWorkItem) -> Result<Outcome, MemoryError> {
         // 「取消、失败或结果未知的动作不能整理成成功经验」（§9.3）——取消的整个跳过：
         // 它停在用户的选择上，剩下的半截不是证据。
-        if item.status == komo_kernel::types::status::RunStatus::Cancelled {
+        if item.status == komo_kernel::types::status::RunState::Cancelled {
             return Ok(Outcome::Skipped {
                 reason: "用户取消的任务".into(),
                 cursor: item.cursor,

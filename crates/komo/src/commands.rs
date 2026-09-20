@@ -13,12 +13,12 @@ use komo_gateway::config::{LoadOptions, load_config};
 use komo_gateway::skills::{OfferContext, SkillRegistry};
 use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
-    ApprovalBatchDecisionRequest, ApprovalDecisionRequest, ApprovalListQuery, CancelRunRequest,
-    CreateCronRequest, MemoryListQuery, MemoryRevisionRequest, RebuildIndexRequest,
-    UpdateCronRequest,
+    CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionBatchAnswerRequest,
+    InterventionListQuery, InterventionVerdict, MemoryListQuery, MemoryRevisionRequest,
+    RebuildIndexRequest, SessionListQuery, UpdateCronRequest,
 };
 use komo_kernel::types::chat::ApprovalScope;
-use komo_kernel::types::ids::{ApprovalId, CronJobId, MemoryId, RunId, ShortId};
+use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{MemoryScope, MemoryState, RetrievalMode};
 use komo_kernel::types::model::Effort;
 
@@ -30,25 +30,72 @@ fn failed(error: impl std::fmt::Display) -> String {
 
 // ---------------------------------------------------------------- 会话与运行
 
-pub async fn session_list(client: &KomoClient) -> Outcome {
-    let response = client.list_sessions().await.map_err(failed)?;
-    Ok(render::session_list(&response))
+pub async fn session_list(client: &KomoClient, all: bool) -> Outcome {
+    let response = client
+        .list_sessions(&SessionListQuery { all })
+        .await
+        .map_err(failed)?;
+    Ok(render::session_list(
+        &response,
+        time::OffsetDateTime::now_utc(),
+    ))
+}
+
+/// `komo session delete`：**逻辑删除**（§8.10）。
+///
+/// 它不碰内容，也不"等一会儿再说"：数据库那一行进 `closing`（`--now` 直接进
+/// `deleted`），未完成的 Run 照 §8.4 走完或停在等待。要真的删内容得 `purge`。
+pub async fn session_delete(client: &KomoClient, session: &str, now: bool) -> Outcome {
+    let session = SessionId::from_raw(session);
+    let response = client.delete_session(&session, now).await.map_err(failed)?;
+    let mut line = format!(
+        "{} 现在是 {}（{}）",
+        response.session,
+        response.state.as_str(),
+        render::stamp(response.changed_at)
+    );
+    if !response.cancelled.is_empty() {
+        line.push_str(&format!(
+            "；已取消 {} 条未完成的 Run：{}",
+            response.cancelled.len(),
+            response
+                .cancelled
+                .iter()
+                .map(RunId::as_str)
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+    line.push_str("。内容一个字节都没动——回收要显式 `komo session purge`。");
+    Ok(line)
+}
+
+/// `komo session purge`：**回收内容**（§8.10）。引用没处置完时服务端 409 并列出
+/// 要先处理什么——这里把那句话原样交给操作者，不假装成功。
+pub async fn session_purge(client: &KomoClient, session: &str) -> Outcome {
+    let session = SessionId::from_raw(session);
+    match client.purge_session(&session).await {
+        Ok(response) => Ok(format!(
+            "{} 已回收（{}）；删掉 {} 字节，墓碑行还在",
+            response.session,
+            response.state.as_str(),
+            response.removed_bytes
+        )),
+        Err(error) => Err(failed(error)),
+    }
 }
 
 pub async fn run_inspect(client: &KomoClient, run: &str) -> Outcome {
     let run = RunId::from_raw(run);
     let detail = client.run(&run).await.map_err(failed)?;
-    // 「这一步是谁放行的」——那条审批早就不在待处理集合里了（§7.4 的审计面）。
-    let approvals = client
-        .approvals(&ApprovalListQuery {
-            run: Some(run.clone()),
-            session: None,
-            include_decided: true,
-        })
-        .await
-        .map(|response| response.approvals)
-        .unwrap_or_default();
-    Ok(render::run_inspect(&detail, &approvals))
+    // 「这一步是谁放行的」——那条审批早就不在待处理集合里了，这是审批族里唯一活着的
+    // **读**（§7.4 的审计面；答复只走 interventions）。
+    let approvals = client.approvals_of_run(&run).await.unwrap_or_default();
+    Ok(render::run_inspect(
+        &detail,
+        &approvals,
+        time::OffsetDateTime::now_utc(),
+    ))
 }
 
 pub async fn run_cancel(client: &KomoClient, run: &str) -> Outcome {
@@ -62,114 +109,149 @@ pub async fn run_cancel(client: &KomoClient, run: &str) -> Outcome {
         )
         .await
         .map_err(failed)?;
-    Ok(format!("{} 现在是 {:?}", response.run, response.status))
+    Ok(format!(
+        "{} 现在是 {}",
+        response.run,
+        response.state.as_str()
+    ))
 }
 
-// ---------------------------------------------------------------- 审批
+// ---------------------------------------------------------------- Intervention（§7.5）
 
-pub async fn approval_list(client: &KomoClient) -> Outcome {
+/// `komo intervention list`：**三类一张表**（审批 / 结果不明 / 阻塞）。
+///
+/// 它取代了 `komo approval list`——那个清单空着而会话卡住，正是这套东西要消灭的现象。
+pub async fn intervention_list(client: &KomoClient, session: Option<&str>) -> Outcome {
     let response = client
-        .approvals(&ApprovalListQuery::default())
+        .interventions(&InterventionListQuery {
+            session: session.map(SessionId::from_raw),
+            ..Default::default()
+        })
         .await
         .map_err(failed)?;
-    Ok(render::approval_list(&response))
+    Ok(render::interventions(&response))
 }
 
-pub async fn approval_show(client: &KomoClient, id: &str) -> Outcome {
-    let record = resolve_approval(client, id).await?;
-    Ok(render::approval_show(&record))
+pub async fn intervention_show(client: &KomoClient, handle: &str) -> Outcome {
+    let detail = client.intervention(handle).await.map_err(failed)?;
+    Ok(render::intervention_detail(&detail))
 }
 
-pub async fn approval_decide(client: &KomoClient, id: &str, approved: bool) -> Outcome {
-    let record = resolve_approval(client, id).await?;
+/// `komo intervention answer <handle> <结论> [--scope]`（§7.5）。
+///
+/// **结论在发请求之前按口语校验**：写错一个词就让服务端去猜种类，只会得到一句
+/// "这个结论对这一条不适用"。这里先看词表，再让服务端按权威判定（种类不符时它照样
+/// 会拒，那是最后一道）。
+pub async fn intervention_answer(
+    client: &KomoClient,
+    handle: &str,
+    verdict: &str,
+    scope: Option<&str>,
+) -> Outcome {
+    let verdict = InterventionVerdict::parse(verdict).ok_or_else(|| {
+        format!(
+            "不认识这个结论：{verdict}；能写的是 approve / reject / satisfied / not_performed / resolve / abandon"
+        )
+    })?;
+    let scope = match scope {
+        None => None,
+        Some(raw) => Some(parse_scope(raw)?),
+    };
+    if scope.is_some() && verdict != InterventionVerdict::Approve {
+        return Err("--scope 只对 approve 有意义（§7.2）".into());
+    }
     let response = client
-        .decide_approval(
-            &record.approval,
-            &ApprovalDecisionRequest {
-                approved,
-                scope: ApprovalScope::Once,
-                request_key: Some(RequestKeys::named("cli-decision", record.approval.as_str())),
+        .answer_intervention(
+            handle,
+            &InterventionAnswerRequest {
+                verdict,
+                scope,
+                request_key: Some(RequestKeys::named("cli-answer", handle)),
             },
         )
         .await
         .map_err(failed)?;
     Ok(format!(
-        "{} {}{}",
-        response.short_id,
-        if response.decision.approved {
-            "已批准"
-        } else {
-            "已拒绝"
-        },
-        if response.already_decided {
-            "（这次什么都没改，返回的是之前那个决定）"
+        "{} {}{}{}",
+        response.handle,
+        answer_word(response.verdict),
+        if response.already_answered {
+            "（这次什么都没改，返回的是之前那个结论）"
         } else {
             ""
+        },
+        match &response.run_state {
+            Some(state) => format!("；这条 Run 现在是 {}", state.as_str()),
+            None => String::new(),
         }
     ))
 }
 
-/// 一次答一批待处理（`komo approval approve --all` / `reject --all`，§11.3 的
+/// `komo intervention answer-all <结论>`：一次答一批**审批**（§7.2、§11.3 的
 /// `/approve all`）。
 ///
-/// 名单**先列出来再答复**：协议里没有"全部"这个词（见 `ApprovalBatchDecisionRequest`
-/// 的注释），而操作者按下的这一刻看到的就是 `komo approval list` 的那一份。名单进请求
-/// 键，所以同一条命令重发还是同一批、不会多答一条在这之间新出现的请求。
-pub async fn approval_decide_all(client: &KomoClient, approved: bool) -> Outcome {
+/// 名单**先列出来再答复**：协议里没有"全部"这个词（见 `InterventionBatchAnswerRequest`
+/// 的注释），而操作者按下的这一刻看到的就是 `komo intervention list` 的那一份。名单进
+/// 请求键，所以同一条命令重发还是同一批、不会多答一条在这之间新出现的请求。
+pub async fn intervention_answer_all(client: &KomoClient, verdict: &str) -> Outcome {
+    let verdict = InterventionVerdict::parse(verdict)
+        .ok_or_else(|| format!("批量只接受 approve / reject；收到：{verdict}"))?;
+    if !matches!(
+        verdict,
+        InterventionVerdict::Approve | InterventionVerdict::Reject
+    ) {
+        return Err(
+            "批量只答审批：一次答一批互不相干的计划，只能是替操作者猜一个他没看过的答复（§7.2）"
+                .into(),
+        );
+    }
     let pending = client
-        .approvals(&ApprovalListQuery::default())
+        .interventions(&InterventionListQuery::default())
         .await
         .map_err(failed)?
-        .approvals;
-    if pending.is_empty() {
+        .interventions;
+    let handles: Vec<String> = pending
+        .iter()
+        .filter(|item| item.kind == komo_kernel::protocol::http::InterventionKind::Approval)
+        .map(|item| item.handle.clone())
+        .collect();
+    if handles.is_empty() {
         return Ok("没有待处理的审批".into());
     }
-    let approvals: Vec<ApprovalId> = pending
-        .iter()
-        .map(|record| record.approval.clone())
-        .collect();
-    let verdict = if approved { "approve" } else { "reject" };
-    let names = approvals
-        .iter()
-        .map(ApprovalId::as_str)
-        .collect::<Vec<_>>()
-        .join(",");
+    let names = handles.join(",");
     let response = client
-        .decide_approvals(&ApprovalBatchDecisionRequest {
-            approvals,
-            approved,
+        .answer_interventions(&InterventionBatchAnswerRequest {
+            handles,
+            approved: verdict == InterventionVerdict::Approve,
             request_key: Some(RequestKeys::named(
-                "cli-decisions",
-                &format!("{verdict}:{names}"),
+                "cli-answers",
+                &format!("{}:{names}", verdict.as_str()),
             )),
         })
         .await
         .map_err(failed)?;
-    Ok(render::approval_batch(&response))
+    Ok(render::intervention_batch(&response))
 }
 
-/// 命令行上给的可能是 4 位短 ID，也可能是完整 ID。
-async fn resolve_approval(
-    client: &KomoClient,
-    id: &str,
-) -> Result<komo_kernel::protocol::http::ApprovalRecord, String> {
-    if let Some(short) = ShortId::parse(id) {
-        let pending = client
-            .approvals(&ApprovalListQuery::default())
-            .await
-            .map_err(failed)?;
-        if let Some(found) = pending
-            .approvals
-            .into_iter()
-            .find(|record| record.short_id == short)
-        {
-            return Ok(found);
-        }
+/// 结论词在人读的那一面是中文，在命令里是线格式词。
+fn answer_word(verdict: InterventionVerdict) -> &'static str {
+    match verdict {
+        InterventionVerdict::Approve => "已批准",
+        InterventionVerdict::Reject => "已拒绝",
+        InterventionVerdict::Satisfied => "已记下：核对后目标已满足",
+        InterventionVerdict::NotPerformed => "已记下：确定没有执行",
+        InterventionVerdict::Resolve => "已记下：前提已处理，重新核对",
+        InterventionVerdict::Abandon => "已放弃这条 Run",
     }
-    client
-        .approval(&ApprovalId::from_raw(id))
-        .await
-        .map_err(failed)
+}
+
+fn parse_scope(raw: &str) -> Result<ApprovalScope, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "once" | "call" => Ok(ApprovalScope::Once),
+        "run" => Ok(ApprovalScope::Run),
+        "cron" => Ok(ApprovalScope::CronJob),
+        other => Err(format!("--scope 只接受 once / run / cron，收到：{other}")),
+    }
 }
 
 // ---------------------------------------------------------------- Cron
@@ -470,14 +552,30 @@ pub async fn config_reload(client: &KomoClient) -> Outcome {
     }
 }
 
-pub async fn doctor(home: &Path) -> Outcome {
+pub async fn doctor(home: &Path, reconcile: bool) -> Outcome {
     let client = match crate::connect::connect(home).await {
         Ok(client) => client,
         Err(error) => return Err(format!("Gateway 没在跑：{error}")),
     };
     let health = client.health().await.map_err(failed)?;
     let config = client.config_check().await.ok();
-    Ok(render::doctor(&health, config.as_ref()))
+    let mut out = render::doctor(&health, config.as_ref());
+    if reconcile {
+        // §8.9：对账只读观察 + 只写状态。印出这一趟判定了什么——"没事"也要看得见
+        // 它看过了多少条，否则"没输出"和"没跑"分不开。
+        let report = client.reconcile().await.map_err(failed)?;
+        out.push_str(&format!(
+            "\n对账（{}）：看了 {} 条未完成 Run；{} 条继续，{} 条停在等人，{} 条没主人的 running 已回收；{} 个会话推进到 deleted，{} 个会话的内容已补齐回收",
+            render::stamp(report.finished_at),
+            report.checked,
+            report.resumed,
+            report.blocked,
+            report.reclaimed,
+            report.closed,
+            report.purged
+        ));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- 不经 Gateway
@@ -544,7 +642,15 @@ pub async fn channel_probe(home: &Path) -> Outcome {
 /// `komo skills ...`：只读文件系统，不经 Gateway（§5.6）。
 pub fn skills(home: &Path, action: SkillsAction<'_>) -> Outcome {
     let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
-    let registry = SkillRegistry::new(loaded.snapshot.paths.skill_dirs.clone());
+    // 与 Gateway 同一个搜索路径（`from_snapshot`：配置里的目录 + workspace + 家目录下
+    // 那几个共享目录）。列表要是与系统提示里的目录行对不上，人就没法回答"我的 skill
+    // 为什么没进提示"。
+    let registry = SkillRegistry::from_snapshot(
+        &loaded.snapshot,
+        Some(&loaded.snapshot.paths.workspaces_dir),
+        komo_gateway::config::user_home().ok().as_deref(),
+    );
+    let offer = offer_context();
     match action {
         SkillsAction::List => {
             let skills = registry.list();
@@ -556,16 +662,16 @@ pub fn skills(home: &Path, action: SkillsAction<'_>) -> Outcome {
             Ok(skills
                 .iter()
                 .map(|skill| {
-                    format!(
-                        "{}{}  {}",
-                        skill.name,
-                        if registry.is_disabled(&skill.name) {
-                            "（已停用）"
-                        } else {
-                            ""
-                        },
-                        skill.description
-                    )
+                    // 门控不过 / 被 disable 的也在列表里——但要说清楚它**不进系统提示**，
+                    // 否则"我明明写了它"与"模型看不见它"对不上。
+                    let mark = if registry.is_disabled(&skill.name) {
+                        "（已停用）"
+                    } else if skill.offered(&offer) {
+                        ""
+                    } else {
+                        "（不进提示：平台或工具不满足）"
+                    };
+                    format!("{}{}  {}", skill.name, mark, skill.description)
                 })
                 .collect::<Vec<_>>()
                 .join("\n"))
@@ -592,9 +698,8 @@ pub enum SkillsAction<'a> {
     Disable(&'a str),
 }
 
-/// 让编译器盯着这个没用到的导入，免得 `OfferContext` 哪天要用时找不到。
-#[allow(dead_code)]
-fn offer_context() -> OfferContext {
+/// `komo skills` 的门控上下文：与 Gateway 的目录行同一个口径（本机平台 + 5 个基础工具）。
+pub fn offer_context() -> OfferContext {
     OfferContext::here(["read", "write", "edit", "shell", "python"])
 }
 

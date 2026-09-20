@@ -22,7 +22,7 @@ use komo_kernel::types::memory::{
 };
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::PlanSource;
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{RoundInput, TurnRequest};
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -280,7 +280,7 @@ impl Transcript {
 
         // 「取消、失败或结果未知的动作不能整理成成功经验」（§9.3）。取消的 Run 整个不
         // 进来；失败的 Run 里，**经验**这一类没有成立的基础。
-        if kind == MemoryKind::Experience && item.status != RunStatus::Completed {
+        if kind == MemoryKind::Experience && item.status != RunState::Completed {
             return Err(format!("{:?} 的 Run 整理不出成功经验", item.status));
         }
         // 「Cron 只在任务授予的范围内积累有证据的事实和经验，**不能从自己的报告推断用户

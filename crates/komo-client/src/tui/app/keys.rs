@@ -2,10 +2,12 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use komo_kernel::protocol::ApprovalTarget;
+use komo_kernel::protocol::http::{InterventionKind, InterventionSummary, InterventionVerdict};
 use komo_kernel::types::chat::ApprovalScope;
-use komo_kernel::types::ids::ApprovalId;
 
-use super::{App, Effect, PendingSubmission, SubmissionState};
+use super::{
+    App, Effect, PendingSubmission, SubmissionState, intervention_kind_text, verdicts_text,
+};
 use crate::tui::approval::{ApprovalAnswer, ApprovalChoice};
 use crate::tui::command::{self, Command};
 use crate::tui::paste::InputEvent;
@@ -99,7 +101,7 @@ impl App {
     /// **Esc 的两个意思**：Run 在跑时取消它；空闲时什么都不做——一个有时会清掉草稿的
     /// 停止键，比多按一下还糟。
     fn escape(&mut self) -> Vec<Effect> {
-        match (self.current_run.clone(), self.run_status()) {
+        match (self.current_run.clone(), self.run_state()) {
             (Some(run), Some(status)) if !status.is_terminal() => {
                 let request_key = self.next_key("cancel");
                 self.note(format!("已请求取消 {run}"));
@@ -155,7 +157,7 @@ impl App {
                 self.note("已划一条回放边界");
                 vec![Effect::Boundary]
             }
-            Command::Cancel => match (self.current_run.clone(), self.run_status()) {
+            Command::Cancel => match (self.current_run.clone(), self.run_state()) {
                 (Some(run), Some(status)) if !status.is_terminal() => {
                     let request_key = self.next_key("cancel");
                     vec![Effect::Cancel { run, request_key }]
@@ -171,8 +173,14 @@ impl App {
                 self.asking_pending = true;
                 vec![Effect::FetchPending]
             }
-            Command::Approve { target, scope } => self.decide_by_target(target, true, scope),
-            Command::Reject { target } => self.decide_by_target(target, false, ApprovalScope::Once),
+            Command::Approve { target, scope } => {
+                self.decide_by_target(target, InterventionVerdict::Approve, Some(scope))
+            }
+            Command::Reject { target } => {
+                self.decide_by_target(target, InterventionVerdict::Reject, None)
+            }
+            // `/answer <句柄> <结论>`：三类共用的一条路（§11.3）。
+            Command::Answer { handle, verdict } => self.answer(handle, verdict, None),
             Command::Model { id } => match id {
                 Some(id) => {
                     self.note(format!("下一个 Run 用模型 {id}"));
@@ -248,35 +256,79 @@ impl App {
         }
     }
 
-    /// `/approve` / `/reject`：`Only` 只在**恰好一个**待处理时生效（§11.3），`All` 是
-    /// 待处理的**全部**（一次答一批，各按本次调用）。
+    /// 待处理里的**审批**（§7.5 的第一类；短 ID 是它的句柄）。
+    fn approvals(&self) -> impl Iterator<Item = &InterventionSummary> {
+        self.pending
+            .values()
+            .filter(|item| item.kind == InterventionKind::Approval)
+    }
+
+    /// 答一条：先按种类核对这个结论能不能答，再记下"是我们在答"。
+    ///
+    /// 结论按种类分派（§7.5）：给 `verify` 一条 `approve` 是操作者打错了字，或者界面推了
+    /// 一个不存在的答案——两种都要**说出来**，而不是发一个服务端只能拒绝的请求。
+    fn answer(
+        &mut self,
+        handle: String,
+        verdict: InterventionVerdict,
+        scope: Option<ApprovalScope>,
+    ) -> Vec<Effect> {
+        let Some(item) = self.pending.get(&handle) else {
+            self.fail(format!("{handle} 不在待处理清单里"));
+            return Vec::new();
+        };
+        if !verdict.allowed_for(item.kind) {
+            self.fail(format!(
+                "{handle} 是{}，答不了 {}；它现在能答：{}",
+                intervention_kind_text(item.kind),
+                verdict.as_str(),
+                verdicts_text(&item.verdicts)
+            ));
+            return Vec::new();
+        }
+        let request_key = self.next_key("answer");
+        self.mark_answering();
+        vec![Effect::Answer {
+            handle,
+            verdict,
+            scope,
+            request_key,
+        }]
+    }
+
+    /// `/approve` / `/reject`：`Only` 只在**恰好一个待处理审批**时生效（§11.3），`All` 是
+    /// 待处理审批的**全部**（一次答一批，各按本次调用）。
+    ///
+    /// 找的是**审批类**那几条：短 ID 是审批的句柄（§7.5），`/approve` 管不到另外两类——
+    /// 它们要的结论是 `satisfied` / `resolve` 这些，走 `/answer`。
     fn decide_by_target(
         &mut self,
         target: ApprovalTarget,
-        approved: bool,
-        scope: ApprovalScope,
+        verdict: InterventionVerdict,
+        scope: Option<ApprovalScope>,
     ) -> Vec<Effect> {
         if target == ApprovalTarget::All {
-            return self.decide_all(approved, scope);
+            return self.decide_all(verdict, scope);
         }
         let target = match target {
             ApprovalTarget::One(short_id) => self
                 .pending
-                .values()
-                .find(|record| record.short_id == short_id)
-                .map(|record| record.approval.clone()),
+                .get(short_id.as_str())
+                .filter(|item| item.kind == InterventionKind::Approval)
+                .map(|item| item.handle.clone()),
             ApprovalTarget::Only => {
-                let mut pending = self.pending.values();
-                match (pending.next(), pending.next()) {
-                    (Some(only), None) => Some(only.approval.clone()),
-                    (None, _) => {
+                let handles: Vec<String> =
+                    self.approvals().map(|item| item.handle.clone()).collect();
+                match handles.as_slice() {
+                    [only] => Some(only.clone()),
+                    [] => {
                         self.fail("没有待处理的审批");
                         return Vec::new();
                     }
-                    (Some(_), Some(_)) => {
+                    _ => {
+                        let list = self.pending_short_list();
                         self.fail(format!(
-                            "有多条待处理：{}。请指明短 ID，或 `/approve all` 全批",
-                            self.pending_short_list()
+                            "有多条待处理审批：{list}。请指明短 ID，或 `/approve all` 全批"
                         ));
                         return Vec::new();
                     }
@@ -285,16 +337,7 @@ impl App {
             ApprovalTarget::All => unreachable!("`all` 在上面就分流了"),
         };
         match target {
-            Some(approval) => {
-                let request_key = self.next_key("decision");
-                self.answering.insert(approval.clone());
-                vec![Effect::Decide {
-                    approval,
-                    approved,
-                    scope,
-                    request_key,
-                }]
-            }
+            Some(handle) => self.answer(handle, verdict, scope),
             None => {
                 self.fail("没有这个短 ID 的待处理审批");
                 Vec::new()
@@ -302,36 +345,41 @@ impl App {
         }
     }
 
-    /// 待处理的**全部**，一次答一批（`a` 键与 `/approve all` 共用）。
+    /// 待处理的**全部审批**，一次答一批（`a` 键与 `/approve all` 共用）。
     ///
-    /// 名单是**这一刻清单上那几条**（`GET /v1/approvals`，`App::pending`）：操作者按下键
-    /// 的那一刻看到的就是那一份，而不是服务端在答复到达时才决定的一份。
+    /// 名单是**这一刻清单上那几条**（`GET /v1/interventions`，`App::pending`）：操作者按下
+    /// 键的那一刻看到的就是那一份，而不是服务端在答复到达时才决定的一份。
     ///
-    /// 范围只按**本次调用**：一批互不相干的计划共用一个范围（本次 Run / Cron Job）只能
-    /// 是替操作者猜——`scope` 参数只用来在他说了范围却拿到本次时**告诉他**。
-    fn decide_all(&mut self, approved: bool, scope: ApprovalScope) -> Vec<Effect> {
-        let approvals: Vec<ApprovalId> = self.pending.keys().cloned().collect();
-        if approvals.is_empty() {
+    /// **只批审批**：另外两类的结论是 `satisfied` / `resolve` 这些，一批互不相干的事项共用
+    /// 一个结论只能是替操作者猜。
+    ///
+    /// 范围只按**本次调用**：一批互不相干的计划共用一个范围（本次 Run / Cron Job）只能是
+    /// 替操作者猜——`scope` 参数只用来在他说了范围却拿到本次时**告诉他**。
+    fn decide_all(
+        &mut self,
+        verdict: InterventionVerdict,
+        scope: Option<ApprovalScope>,
+    ) -> Vec<Effect> {
+        let handles: Vec<String> = self.approvals().map(|item| item.handle.clone()).collect();
+        if handles.is_empty() {
             self.fail("没有待处理的审批");
             return Vec::new();
         }
-        if scope != ApprovalScope::Once {
+        if scope.is_some_and(|scope| scope != ApprovalScope::Once) {
             self.fail("批量答复按本次调用——范围绑的是单份计划，要范围请逐条 /approve <短ID> run");
         }
-        let request_key = self.next_key("decisions");
-        self.answering.extend(approvals.iter().cloned());
-        vec![Effect::DecideMany {
-            approvals,
-            approved,
+        let request_key = self.next_key("answers");
+        vec![Effect::AnswerMany {
+            handles,
+            approved: verdict == InterventionVerdict::Approve,
             request_key,
         }]
     }
 
-    /// 待处理的那几个短 ID，一行。
+    /// 待处理审批的那几个短 ID，一行。
     fn pending_short_list(&self) -> String {
-        self.pending
-            .values()
-            .map(|record| record.short_id.to_string())
+        self.approvals()
+            .map(|item| item.handle.clone())
             .collect::<Vec<_>>()
             .join(" · ")
     }
@@ -344,11 +392,12 @@ impl App {
         if modal.answering {
             return Vec::new();
         }
-        let pending = self.pending_count();
+        // 菜单里"全部批准（N 条）"数的是**审批**的条数：批量只答审批（§11.3）。
+        let approvals = self.pending_approvals();
         let run_scope_ok = modal.allows_run_scope();
-        let approval = modal.record.approval.clone();
-        let rows = modal.rows(pending);
-        let highlighted = rows[modal.selected_index(pending)].clone();
+        let handle = modal.record.short_id.to_string();
+        let rows = modal.rows(approvals);
+        let highlighted = rows[modal.selected_index(approvals)].clone();
 
         // 菜单键：`↑` / `↓` 移动高亮，正文留给 `PgUp` / `PgDn`。两件事各有各的键——
         // 正文可能比窗口长，而高亮不该跟着正文滚走。
@@ -356,7 +405,7 @@ impl App {
             KeyCode::Up | KeyCode::Down => {
                 let delta = if key.code == KeyCode::Up { -1 } else { 1 };
                 if let Some(modal) = self.approval.as_mut() {
-                    modal.move_selection(delta, pending);
+                    modal.move_selection(delta, approvals);
                 }
                 return Vec::new();
             }
@@ -398,48 +447,56 @@ impl App {
 
         match choice {
             ApprovalChoice::This(answer) => {
-                self.mark_answering(std::slice::from_ref(&approval));
-                let request_key = self.next_key("decision");
-                vec![Effect::Decide {
-                    approval,
-                    approved: answer.approved,
-                    scope: answer.scope,
+                self.mark_answering();
+                let request_key = self.next_key("answer");
+                vec![Effect::Answer {
+                    handle,
+                    verdict: if answer.approved {
+                        InterventionVerdict::Approve
+                    } else {
+                        InterventionVerdict::Reject
+                    },
+                    // 范围是**授权**的形状，只有 `approve` 用得上（§7.2）。
+                    scope: answer.approved.then_some(answer.scope),
                     request_key,
                 }]
             }
-            ApprovalChoice::AllPending => self.decide_all_pending(approval),
+            ApprovalChoice::AllPending => self.decide_all_pending(handle),
         }
     }
 
-    /// 弹窗上的「全部批准」：一批互不相干的审批逐条按本次调用答。它答的是所有待处理，
+    /// 弹窗上的「全部批准」：一批互不相干的审批逐条按本次调用答。它答的是所有待处理**审批**，
     /// **含眼前这条**——眼前这条排在名单第一个，它就是弹窗上那一条。
-    fn decide_all_pending(&mut self, current: ApprovalId) -> Vec<Effect> {
-        let mut approvals: Vec<ApprovalId> = self
-            .pending
-            .keys()
-            .filter(|candidate| **candidate != current)
-            .cloned()
+    fn decide_all_pending(&mut self, current: String) -> Vec<Effect> {
+        let mut handles: Vec<String> = self
+            .approvals()
+            .map(|item| item.handle.clone())
+            .filter(|handle| *handle != current)
             .collect();
-        approvals.insert(0, current);
-        self.mark_answering(&approvals);
-        let request_key = self.next_key("decisions");
-        vec![Effect::DecideMany {
-            approvals,
+        handles.insert(0, current);
+        self.mark_answering();
+        let request_key = self.next_key("answers");
+        vec![Effect::AnswerMany {
+            handles,
             approved: true,
             request_key,
         }]
     }
 
-    /// 记下"这几条是**我们自己**在答"。
+    /// 记下"弹窗上这一条是**我们自己**在答"。
     ///
-    /// 决定会以 `approval_decided` 从 SSE 回来（网关每条决定推一帧），它和"别人在别处
-    /// 答的"长得一模一样。没有这张表，自己按下的那一下会在下一秒被说成「这条审批在别处
-    /// 批准了」——一句假话。
-    fn mark_answering(&mut self, approvals: &[ApprovalId]) {
-        if let Some(modal) = self.approval.as_mut() {
-            modal.answering = true;
-        }
-        self.answering.extend(approvals.iter().cloned());
+    /// 结论会以 `approval_decided` 从 SSE 回来（网关每条决定推一帧），它和"别人在别处答
+    /// 的"长得一模一样，帧里也只有审批 id、没有句柄。少了这一层区分，用户按下 `y` 的下一
+    /// 秒会看到"这条审批在别处批准了"——一句假话，刚好盖住他要看的回执。
+    ///
+    /// 只记**弹窗上那一条**：别的事项根本不在屏幕上，而 `settle_remote` 也只在看得见的那
+    /// 一条被别处答掉时才说话。
+    fn mark_answering(&mut self) {
+        let Some(modal) = self.approval.as_mut() else {
+            return;
+        };
+        modal.answering = true;
+        self.answering.insert(modal.record.approval.clone());
     }
 
     fn history_back(&mut self) {

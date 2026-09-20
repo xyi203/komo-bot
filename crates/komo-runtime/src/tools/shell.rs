@@ -6,7 +6,7 @@
 //! 进程组**里，取消时信号发给整个组，然后等回收（实现在 [`super::process`]）。
 //!
 //! 恢复方式是 [`RecoveryMode::NoSafeRecovery`]：任意命令不能仅凭名称被判定安全
-//! （§8.6）。停在 `needs_attention` 由人接手，好过把 `deploy.sh` 再跑一遍。
+//! （§8.6）。停在 `waiting + intervention` 由人接手，好过把 `deploy.sh` 再跑一遍。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -256,7 +256,7 @@ impl Tool for ShellTool {
         })
     }
 
-    // `verify` 用默认实现：任意命令没有可用的核对方式，落到 needs_attention（§8.6）。
+    // `verify` 用默认实现：任意命令没有可用的核对方式，落到 waiting + intervention（§8.6）。
 }
 
 fn environment(ctx: &ToolContext) -> BTreeMap<String, String> {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use komo_kernel::traits::LlmClient;
 use komo_kernel::types::chat::ApprovalScope;
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::WaitReason;
 
 use crate::harness::*;
 
@@ -34,9 +34,13 @@ async fn a_dangerous_action_waits_and_the_request_reaches_home_chat() {
     let tick = gw.tick().await;
     let run = tick.fired[0].run.clone();
 
-    // ① 停下来等人，**不自动放行**。
-    gw.wait_status(&run, |s| s == RunStatus::WaitingApproval, "等待审批")
-        .await;
+    // ① 停下来等人，**不自动放行**。§8.4：`waiting` 只是一个维度，理由那一维说得出是
+    // 在等一条审批，两个合起来才是旧的 `waiting_approval`。
+    let wait = gw.wait_waiting(&run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "Cron Run 停在等审批上：{wait:?}"
+    );
     assert_eq!(lines(&counter), 0, "没批准就一次都没跑");
 
     // ② 请求到了 home chat。
@@ -82,6 +86,18 @@ async fn a_dangerous_action_waits_and_the_request_reaches_home_chat() {
         record.scopes
     );
 
+    // §7.5：同一条也在统一清单上——句柄是它的短 ID，Run 就是这条 Cron Run。无人值守的
+    // 那一侧就是靠这张清单知道"有东西在等人"（另外两类也在同一张清单里，所以断言的是
+    // 那一条本身，不是清单非空）。
+    let listed = gw.interventions().await;
+    assert_eq!(listed.len(), 1, "{listed:?}");
+    assert_eq!(
+        listed[0].kind,
+        komo_kernel::protocol::http::InterventionKind::Approval
+    );
+    assert_eq!(listed[0].handle, record.short_id.to_string());
+    assert_eq!(listed[0].run.as_ref(), Some(&run));
+
     gw.stop().await;
 }
 
@@ -111,15 +127,21 @@ async fn approving_once_does_not_hand_the_job_the_operators_powers() {
     let job = gw.add_job(daily()).await;
     gw.make_due(&job.id).await;
     let run = gw.tick().await.fired[0].run.clone();
-    gw.wait_status(&run, |s| s == RunStatus::WaitingApproval, "第一次等待")
-        .await;
+    let wait = gw.wait_waiting(&run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "第一次停下就是等审批：{wait:?}"
+    );
 
     let first = gw.wait_approval().await;
     gw.approve_in_chat(first.short_id.as_str(), "").await;
 
     // 第一条跑了；**第二条同类动作又停下来问**——一次批准只是一次批准。
-    gw.wait_status(&run, |s| s == RunStatus::WaitingApproval, "第二次等待")
-        .await;
+    let wait = gw.wait_waiting(&run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "第二次停下还是等审批：{wait:?}"
+    );
     let second = gw.wait_approval().await;
     assert_ne!(second.approval, first.approval, "是新的一条请求");
     assert_eq!(lines(&counter), 1, "只跑了被批准的那一条");
@@ -163,8 +185,11 @@ async fn approving_with_cron_scope_binds_the_job_and_its_version() {
     let job = gw.add_job(daily()).await;
     gw.make_due(&job.id).await;
     let run = gw.tick().await.fired[0].run.clone();
-    gw.wait_status(&run, |s| s == RunStatus::WaitingApproval, "等待审批")
-        .await;
+    let wait = gw.wait_waiting(&run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "停在等待上的理由是等审批：{wait:?}"
+    );
 
     let record = gw.wait_approval().await;
     gw.approve_in_chat(record.short_id.as_str(), "cron").await;
@@ -184,13 +209,11 @@ async fn approving_with_cron_scope_binds_the_job_and_its_version() {
 
     // 同一条命令的第二次不再问：这个 Run 跑到终态，两次副作用都发生了，而**待处理
     // 审批一条都没有**——没有第二次提问。
-    gw.wait_status(&run, |s| s.is_terminal(), "终态").await;
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
     assert_eq!(lines(&counter), 2, "同一条命令的第二次不再问");
-    assert!(
-        gw.approvals().await.is_empty(),
-        "不该有第二条待处理审批：{:?}",
-        gw.approvals().await
-    );
+    // §7.5：在等的就是统一清单上那一些。没有第二次提问 = 清单里一条都不剩。
+    let pending = gw.interventions().await;
+    assert!(pending.is_empty(), "不该有第二条在等人的：{pending:?}");
 
     // **改定义之后旧授权失效**（§10）：版本 +1，`grants_for_job` 按新版本查不到它。
     let (status, body) = gw
@@ -225,11 +248,14 @@ async fn a_cron_grant_never_reaches_an_interactive_run() {
     let job = gw.add_job(daily()).await;
     gw.make_due(&job.id).await;
     let cron_run = gw.tick().await.fired[0].run.clone();
-    gw.wait_status(&cron_run, |s| s == RunStatus::WaitingApproval, "等待审批")
-        .await;
+    let wait = gw.wait_waiting(&cron_run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "Cron 那一侧停在等审批上：{wait:?}"
+    );
     let record = gw.wait_approval().await;
     gw.approve_in_chat(record.short_id.as_str(), "cron").await;
-    gw.wait_status(&cron_run, |s| s.is_terminal(), "终态").await;
+    gw.wait_state(&cron_run, |s| s.is_terminal(), "终态").await;
     let after_cron = lines(&counter);
 
     // 交互那一侧：同一条命令，照样要问。
@@ -246,12 +272,11 @@ async fn a_cron_grant_never_reaches_an_interactive_run() {
     let submitted: komo_kernel::protocol::http::SubmitRunResponse =
         serde_json::from_str(&body).unwrap();
 
-    gw.wait_status(
-        &submitted.run,
-        |s| s == RunStatus::WaitingApproval,
-        "交互 Run 照样要问",
-    )
-    .await;
+    let wait = gw.wait_waiting(&submitted.run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "交互 Run 照样停在等审批上：{wait:?}"
+    );
     assert_eq!(
         lines(&counter),
         after_cron,

@@ -20,7 +20,7 @@ mod defaults;
 mod grants;
 mod rules;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -129,6 +129,10 @@ pub struct PolicyContext<'a> {
     pub now: OffsetDateTime,
     /// 执行环境能不能约束任意代码（§7.3）。
     pub isolation: IsolationCapability,
+    /// **受保护路径**：komo 自己的状态（数据目录下的 `sessions/`、`state.db*`、`runtime/`、
+    /// `.env`）。工具不许写它们（§8.10 第 4 条）。名单由调用方按本机数据目录算出来，
+    /// 不写进规则表——规则表是配置，不该背着某一台机器的 home 目录。
+    pub protected: &'a [PathBuf],
 }
 
 impl PolicyContext<'_> {
@@ -138,6 +142,11 @@ impl PolicyContext<'_> {
             .iter()
             .filter(|root| path.starts_with(&root.path))
             .max_by_key(|root| root.path.as_os_str().len())
+    }
+
+    /// 这个路径碰到了受保护范围吗（§8.10）。
+    pub fn touches_protected(&self, path: &Path) -> bool {
+        self.protected.iter().any(|prefix| path.starts_with(prefix))
     }
 
     /// 计划有没有碰到已授权根之外的东西。

@@ -30,3 +30,6 @@ tokio-util = { workspace = true }
 [dev-dependencies]
 komo-kernel = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
+# 心跳的测试要拨表：`#[tokio::test(start_paused = true)]` 需要 `test-util`。它只在
+# dev 构建里开，生产的 tokio 特性集合不变（§13.4 的编译预算）。
+tokio = { workspace = true, features = ["test-util"] }

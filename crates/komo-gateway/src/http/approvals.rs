@@ -1,21 +1,24 @@
-//! `/v1/approvals`（§13.1、§11.3）。
+//! `/v1/approvals`：**审批的审计读**（§7.4）。
 //!
-//! 四个界面——飞书卡片按钮、Telegram / WeChat 命令、TUI 弹窗、CLI 子命令——都打到
-//! `POST /v1/approvals/{id}/decision`（§13.5）。渠道之间的差别只在渲染，不在决策。
+//! §7.5 把"需要人判断"的三类合成了一个入口（[`crate::http::interventions`]），审批的
+//! **答复**只走那一条路。这个端点留下的是另一半——§7.4 那句「这一步是谁放行的」：
+//! `komo run inspect` 拿它回答一份计划当时是谁、什么时候、按什么范围批的。
+//!
+//! 所以它**不是待处理清单**：默认只列待处理（那是审批自己的状态，不是"该答什么"），
+//! `include_decided` 才把已经决定过的那些一并列出来。要看"现在有什么在等人"就去
+//! `GET /v1/interventions`。
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
-use komo_kernel::protocol::http::{
-    ApprovalBatchDecisionRequest, ApprovalBatchDecisionResponse, ApprovalDecisionRequest,
-    ApprovalDecisionResponse, ApprovalListQuery, ApprovalListResponse, ApprovalRecord,
-};
-use komo_kernel::types::ids::ApprovalId;
+use axum::extract::{Query, State};
+use komo_kernel::protocol::http::{ApprovalListQuery, ApprovalListResponse, ApprovalRecord};
 
 use super::Api;
-use super::error::{ApiFailure, ApiResult};
-use super::idempotency::body_hash;
+use super::error::ApiResult;
 
 /// `GET /v1/approvals`
+///
+/// `?run=` 限定到一条 Run，`?include_decided=1` 把已决定的也列出来（按 `run` 找回来——
+/// 已决定的不在待处理集合里，只能按 Run 的事件把它们的 ID 找回来再逐条读）。
 pub async fn list(
     State(api): State<Api>,
     Query(query): Query<ApprovalListQuery>,
@@ -28,7 +31,6 @@ pub async fn list(
     if let Some(run) = &query.run {
         approvals.retain(|record| record.run.as_ref() == Some(run));
     }
-    // `include_decided` 是审计面（`komo run inspect` 要答"这一步是谁放行的"）。
     if query.include_decided
         && let Some(run) = &query.run
     {
@@ -37,75 +39,11 @@ pub async fn list(
     Ok(Json(ApprovalListResponse { approvals }))
 }
 
-/// `GET /v1/approvals/{id}`
-pub async fn show(
-    State(api): State<Api>,
-    Path(id): Path<String>,
-) -> ApiResult<Json<ApprovalRecord>> {
-    let approval = ApprovalId::from_raw(id);
-    api.state
-        .approval_repo
-        .get(&approval)
-        .await?
-        .map(Json)
-        .ok_or_else(|| ApiFailure::not_found(format!("审批 {approval}")))
-}
-
-/// `POST /v1/approvals/{id}/decision`
-///
-/// **已决定的返回原决定，不报错**（§11.3）——同一人连点两次，第二次得到的是"已决定"。
-pub async fn decide(
-    State(api): State<Api>,
-    Path(id): Path<String>,
-    Json(request): Json<ApprovalDecisionRequest>,
-) -> ApiResult<Json<ApprovalDecisionResponse>> {
-    let approval = ApprovalId::from_raw(id);
-    let hash = body_hash(&request);
-    if let Some(previous) = api
-        .idempotency
-        .lookup::<ApprovalDecisionResponse>(request.request_key.as_ref(), &hash)?
-    {
-        return Ok(Json(previous));
-    }
-    let response = api
-        .state
-        .decide_approval(&approval, request.approved, request.scope, None)
-        .await?;
-    api.idempotency
-        .remember(request.request_key.as_ref(), &hash, &response);
-    Ok(Json(response))
-}
-
-/// `POST /v1/approvals/decisions`：**一次答一批**（§11.3 的 `/approve all`）。
-///
-/// 逐条决定，逐条记审计（§7.4）——批量只是省掉 N 次按键，不是一条决定覆盖 N 个计划。
-/// 幂等按整批一个请求键：重发得到同一份回执；批里每一条各自的幂等仍由 `decide_approval`
-/// 保证（已决定的返回原决定）。
-pub async fn decide_batch(
-    State(api): State<Api>,
-    Json(request): Json<ApprovalBatchDecisionRequest>,
-) -> ApiResult<Json<ApprovalBatchDecisionResponse>> {
-    let hash = body_hash(&request);
-    if let Some(previous) = api
-        .idempotency
-        .lookup::<ApprovalBatchDecisionResponse>(request.request_key.as_ref(), &hash)?
-    {
-        return Ok(Json(previous));
-    }
-    let response = api
-        .state
-        .decide_approvals(&request.approvals, request.approved, None)
-        .await?;
-    api.idempotency
-        .remember(request.request_key.as_ref(), &hash, &response);
-    Ok(Json(response))
-}
-
 /// 这个 Run 上已经决定过的审批。
 async fn decided_of(
     api: &Api,
     run: &komo_kernel::types::ids::RunId,
-) -> Result<Vec<ApprovalRecord>, ApiFailure> {
+) -> Result<Vec<ApprovalRecord>, super::error::ApiFailure> {
     // 已决定的不在待处理集合里，只能按 Run 的事件把它们的 ID 找回来再逐条读。
     let record = komo_store::repos::runs::get(&api.state.db, run).await?;
     let Some(record) = record else {

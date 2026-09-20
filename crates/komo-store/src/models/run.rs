@@ -4,12 +4,21 @@ use super::{ColumnSpec, TableSpec};
 
 /// 一个 Run 的调度状态。
 ///
-/// `claimed_by` / `claim_generation` 是 §8.7 的领取代次围栏：领取是
-/// `claimed_by IS NULL` 上的条件更新，之后这个执行者的每一条状态提交都带
-/// `AND claim_generation = ?`，`rows affected == 0` 就是自己已成旧代次。
+/// **状态是两个维度**（§8.10 的加列规则）：`state` 一个词（`accepted` / `queued` /
+/// `running` / `waiting` / `completed` / `failed` / `cancelled` / `abandoned`），
+/// `waiting` 时由 `wait_kind` 说清**在等谁**（`approval` / `retry` / `intervention` /
+/// `dependency`），`wait_ref` 指到具体对象（审批 ID、intervention 句柄、前置 Run ID，
+/// `retry` 时是原因），`wake_at` 只有 `retry` 用。
 ///
-/// `next_retry_at` 是 `NOT NULL DEFAULT 0` 而不是可空：§8.7 的候选查询对它直接做
-/// `<= ?1`，NULL 会把"没有退避、现在就能跑"的行整行筛掉。
+/// 旧列 `status` / `next_retry_at` **退役但仍存在**（§8.2 只允许加列）：新写入一律给空值
+/// （`''` / `0`），读的一方不再看它们。两列留在那里只为了让旧库能读、旧备份能对。
+///
+/// `claimed_by` / `claim_generation` 是领取代次围栏：领取是 `claimed_by IS NULL` 上的条件
+/// 更新，之后这个执行者的每一条状态提交都带 `AND claim_generation = ?`，
+/// `rows affected == 0` 就是自己已成旧代次。
+///
+/// `lease_until` 是心跳租约（unix 纳秒，`0` = 没租约，视为立即过期）。**租约过期只是
+/// 信号，不是抢走一条活着的长调用的许可**：回收前还要过存活判定。
 #[derive(Debug, toasty::Model)]
 #[table = "runs"]
 pub struct RunRow {
@@ -21,9 +30,27 @@ pub struct RunRow {
     pub input_hash: String,
     /// 承载输入的事件（`run.accepted`）。
     pub input_event: Option<String>,
+    /// 承载输入那条事件的 `seq`（§8.3：Session 内按追加顺序严格递增）。
+    ///
+    /// **同 Session 内的次序权威是它，不是 Run ID 的字典序**：UUIDv7 同一纳秒内的低位是
+    /// 随机的，两条几乎同时受理的输入按 id 比会排反。`0` = 未知（这次改造之前受理的行），
+    /// 那种行的次序退化到按 id 比。
+    pub input_seq: i64,
     /// 承载终态的事件。
     pub final_event: Option<String>,
+    /// **退役**：读了不再用它，写入给空值。
     pub status: String,
+    /// 调度状态：`accepted` / `queued` / `running` / `waiting` / `completed` / `failed` /
+    /// `cancelled` / `abandoned`。
+    pub state: String,
+    /// `waiting` 时在等谁：`approval` / `retry` / `intervention` / `dependency`。
+    pub wait_kind: Option<String>,
+    /// `wait_kind` 指到的对象（审批 ID / intervention 句柄 / 前置 Run ID；`retry` 是原因）。
+    pub wait_ref: Option<String>,
+    /// `retry` 的 not_before；其他等待是 `0`。
+    pub wake_at: i64,
+    /// 心跳租约：`running` 的持有者在跑的时候续它。`0` = 没租约。
+    pub lease_until: i64,
     /// `PlanSource` 的 JSON。恢复后来源不变——Cron 恢复后仍是 Cron（§8.8）。
     pub source: String,
     /// 来源会话的 `{platform}:{chat_id}`。
@@ -32,6 +59,7 @@ pub struct RunRow {
     pub claimed_by: Option<String>,
     pub claim_generation: i64,
     pub claimed_at: i64,
+    /// **退役**：退避看 `wake_at`。
     pub next_retry_at: i64,
     pub retry_attempts: i64,
     pub rounds: i64,
@@ -59,7 +87,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "runs" ("id" TEXT NOT NULL, "session_id" TEXT NOT NULL, "request_key" TEXT NOT NULL, "input_hash" TEXT NOT NULL, "input_event" TEXT, "final_event" TEXT, "status" TEXT NOT NULL, "source" TEXT NOT NULL, "peer" TEXT, "claimed_by" TEXT, "claim_generation" BIGINT NOT NULL, "claimed_at" BIGINT NOT NULL, "next_retry_at" BIGINT NOT NULL, "retry_attempts" BIGINT NOT NULL, "rounds" BIGINT NOT NULL, "max_rounds" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "model_snapshot" TEXT NOT NULL, "effort" TEXT, "grants" TEXT NOT NULL, "memory_work" TEXT NOT NULL, "memory_cursor" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "ended_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "runs" ("id" TEXT NOT NULL, "session_id" TEXT NOT NULL, "request_key" TEXT NOT NULL, "input_hash" TEXT NOT NULL, "input_event" TEXT, "input_seq" BIGINT NOT NULL, "final_event" TEXT, "status" TEXT NOT NULL, "state" TEXT NOT NULL, "wait_kind" TEXT, "wait_ref" TEXT, "wake_at" BIGINT NOT NULL, "lease_until" BIGINT NOT NULL, "source" TEXT NOT NULL, "peer" TEXT, "claimed_by" TEXT, "claim_generation" BIGINT NOT NULL, "claimed_at" BIGINT NOT NULL, "next_retry_at" BIGINT NOT NULL, "retry_attempts" BIGINT NOT NULL, "rounds" BIGINT NOT NULL, "max_rounds" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "model_snapshot" TEXT NOT NULL, "effort" TEXT, "grants" TEXT NOT NULL, "memory_work" TEXT NOT NULL, "memory_cursor" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "ended_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -67,8 +95,14 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("request_key", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("input_hash", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("input_event", "TEXT"),
+    ColumnSpec::new("input_seq", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("final_event", "TEXT"),
-    ColumnSpec::new("status", "TEXT NOT NULL DEFAULT 'ingesting'"),
+    ColumnSpec::new("status", "TEXT NOT NULL DEFAULT ''"),
+    ColumnSpec::new("state", "TEXT NOT NULL DEFAULT 'accepted'"),
+    ColumnSpec::new("wait_kind", "TEXT"),
+    ColumnSpec::new("wait_ref", "TEXT"),
+    ColumnSpec::new("wake_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("lease_until", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("source", "TEXT NOT NULL DEFAULT '{}'"),
     ColumnSpec::new("peer", "TEXT"),
     ColumnSpec::new("claimed_by", "TEXT"),

@@ -50,10 +50,13 @@ impl ApprovalModal {
     /// 第一行是 `Enter` 的默认落点。顺序是刻意的：能范围化时它排第一（一次 `Enter` 就是
     /// 最常见的那一下），不能范围化时它就整个不出现，高亮自然落在「只批准本次调用」上。
     ///
-    /// `pending` 是**此刻待处理的全部条数**（含眼前这条）：批量那行答的是全部，条数得摆在
-    /// 标签里——"全部"是 1 条还是 6 条，是按下去之前唯一要看清的事；只有这一条时那行不列，
-    /// 因为此时它和「只批准本次调用」同义。
-    pub fn rows(&self, pending: usize) -> Vec<ApprovalRow> {
+    /// `approvals` 是**此刻待处理的审批条数**（含眼前这条）：批量那行答的是全部审批，
+    /// 条数得摆在标签里——"全部"是 1 条还是 6 条，是按下去之前唯一要看清的事；只有这一条
+    /// 时那行不列，因为此时它和「只批准本次调用」同义。
+    ///
+    /// 数的是审批而不是三类合计（§7.5）：批量只答审批（§11.3），把结果不明和阻塞也算进去，
+    /// 那个数字就与按下去会发生的事不符。
+    pub fn rows(&self, approvals: usize) -> Vec<ApprovalRow> {
         let mut rows = Vec::with_capacity(4);
         if self.allows_run_scope() {
             rows.push(ApprovalRow {
@@ -72,31 +75,31 @@ impl ApprovalModal {
             label: "拒绝（本次不执行）".to_string(),
             choice: ApprovalChoice::This(ApprovalAnswer::REJECT),
         });
-        if pending > 1 {
+        if approvals > 1 {
             rows.push(ApprovalRow {
                 key: 'a',
-                label: format!("全部批准（{pending} 条，各按本次调用）"),
+                label: format!("全部批准（{approvals} 条，各按本次调用）"),
                 choice: ApprovalChoice::AllPending,
             });
         }
         rows
     }
 
-    /// 高亮那一行的下标，夹在 `pending` 下菜单的行数里。
-    pub fn selected_index(&self, pending: usize) -> usize {
+    /// 高亮那一行的下标，夹在 `approvals` 下菜单的行数里。
+    pub fn selected_index(&self, approvals: usize) -> usize {
         self.selected
-            .min(self.rows(pending).len().saturating_sub(1))
+            .min(self.rows(approvals).len().saturating_sub(1))
     }
 
     /// `↑` / `↓`：移动高亮。到两头就停住，**不绕回去**——想按「拒绝」时多按一下不该跳回
     /// 「本次任务默认通过」。
-    pub fn move_selection(&mut self, delta: i16, pending: usize) {
+    pub fn move_selection(&mut self, delta: i16, approvals: usize) {
         let moved = if delta < 0 {
             self.selected.saturating_sub(delta.unsigned_abs() as usize)
         } else {
             self.selected.saturating_add(delta as usize)
         };
-        let last = self.rows(pending).len().saturating_sub(1);
+        let last = self.rows(approvals).len().saturating_sub(1);
         self.selected = moved.min(last);
     }
 

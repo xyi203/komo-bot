@@ -59,6 +59,9 @@ pub struct GatewayDiscovery {
 pub struct Discovered {
     pub discovery: GatewayDiscovery,
     pub health: HealthResponse,
+    /// 这次发现读的是哪个数据目录。带进客户端里，好让它在网关重启之后**自己按发现文件
+    /// 跟过去**（令牌每次启动都换，见 [`KomoClient::refresh`]）。
+    pub home: Option<PathBuf>,
 }
 
 impl Discovered {
@@ -66,9 +69,18 @@ impl Discovered {
         &self.discovery.base_url
     }
 
-    /// 按这次发现的结果建一个客户端（带上令牌）。
+    /// 按这次发现的结果建一个客户端（带上令牌，并记住数据目录以便刷新）。
     pub fn client(&self) -> Result<KomoClient, ClientError> {
-        KomoClient::new(&self.discovery.base_url, self.discovery.token.clone())
+        match &self.home {
+            Some(home) => KomoClient::with_home(
+                reqwest::Client::new(),
+                &self.discovery.base_url,
+                self.discovery.token.clone(),
+                home.clone(),
+                Some(self.discovery.instance_id.clone()),
+            ),
+            None => KomoClient::new(&self.discovery.base_url, self.discovery.token.clone()),
+        }
     }
 }
 
@@ -216,7 +228,11 @@ pub fn check(
             });
         }
     }
-    Ok(Discovered { discovery, health })
+    Ok(Discovered {
+        discovery,
+        health,
+        home: home.map(Path::to_path_buf),
+    })
 }
 
 /// §3 第 4 步：等服务就绪，超时给出**具体**诊断——最后一次失败的原文，不是"超时"三个字。

@@ -9,7 +9,7 @@ use komo_kernel::traits::{LlmClient, Notifier};
 use komo_kernel::types::chat::{
     ApprovalScope, ChannelPeer, ChannelPlatform, DeliveryState, DeliveryTarget, Outbound, PeerId,
 };
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::{RunState, WaitReason};
 
 use crate::harness::{
     EVENT_DEADLINE, FakeLlm, FixedFactory, GatewayBuilder, Gw, Home, MemSender, TestGateway,
@@ -504,8 +504,13 @@ async fn the_command_table_is_operator_only() {
     );
 
     let status = gateway.handle(operator_dm("/status", "telegram:2")).await;
+    // §7.5：待处理是三类合起来的一张清单，`/status` 报总数与各类的分布——那条审批算在
+    // 「审批」那一格里。
     assert!(
-        matches!(&status, InboundAck::Replied { text } if text.contains("待处理审批：1 条")),
+        matches!(
+            &status,
+            InboundAck::Replied { text } if text.contains("待处理（共 1 条）：审批 1")
+        ),
         "{status:?}"
     );
 
@@ -647,12 +652,13 @@ async fn a_waiting_run_writes_the_approval_request_into_the_session_log() {
     // **先订阅再交任务**：界面看见弹窗靠的就是这一条直播帧，而它由那次补写派生。
     let mut frames = gw.state().hub.subscribe(&session);
     let run = gw.submit(&session, "approval-1", "跑一下 echo").await.run;
-    gw.wait_status(
-        &run,
-        |status| status == RunStatus::WaitingApproval,
-        "等待审批",
-    )
-    .await;
+    // §8.4：停在审批上是 `state == waiting` 加一个说得出理由的 `wait`——两维合起来才是
+    // 旧的那一个 `waiting_approval`。
+    let wait = gw.wait_waiting(&run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "停在等待上就该说得出在等审批：{wait:?}"
+    );
 
     let event = home
         .wait_event(&session, "approval.requested", EVENT_DEADLINE)
@@ -707,27 +713,36 @@ async fn a_message_behind_a_waiting_approval_waits_instead_of_overtaking() {
     let session = gw.open_session().await;
 
     let first = gw.submit(&session, "overtake-1", "跑一下 echo").await.run;
-    gw.wait_status(
-        &first,
-        |status| status == RunStatus::WaitingApproval,
-        "等待审批",
-    )
-    .await;
+    let wait = gw.wait_waiting(&first).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "前一个 Run 停下的理由是等审批：{wait:?}"
+    );
     let turns_before = llm.turns();
 
-    // 同一个 Session 再来一条：前一个没结束，它只能排队。
+    // 同一个 Session 再来一条：前一个没结束，它不许越过。§8.4 拆成两维之后，这个形态是
+    // `waiting` + `dependency`，而且**说得出在等哪一条 Run**——旧模型里的"排队中"正好是
+    // 要消掉的那句"排队二十分钟，不知道为什么"。
     let second = gw.submit(&session, "overtake-2", "y").await.run;
+    let blocked = gw.wait_waiting(&second).await;
     assert_eq!(
-        gw.run_detail(&second).await.summary.status,
-        RunStatus::Queued,
+        blocked,
+        WaitReason::Dependency { run: first.clone() },
+        "后一条要说出在等哪一条 Run"
+    );
+    let detail = gw.run_detail(&second).await;
+    assert_eq!(
+        detail.summary.state,
+        RunState::Waiting,
         "前一个还停在等待审批，后一个不许领"
+    );
+    assert_eq!(
+        detail.summary.wait,
+        Some(WaitReason::Dependency { run: first.clone() })
     );
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert_eq!(llm.turns(), turns_before, "排队的这条不该走到模型");
-    assert_eq!(
-        gw.run_detail(&second).await.summary.status,
-        RunStatus::Queued
-    );
+    assert_eq!(gw.run_state(&second).await, RunState::Waiting);
 
     // 答复之后前一个跑完，后一个才轮到。
     let record = gw
@@ -775,12 +790,11 @@ async fn a_round_stopped_at_its_first_call_still_finishes_the_rest() {
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "two-calls", "跑两条命令").await.run;
-    gw.wait_status(
-        &run,
-        |status| status == RunStatus::WaitingApproval,
-        "第一次等待审批",
-    )
-    .await;
+    let wait = gw.wait_waiting(&run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "第一次停下就是等审批：{wait:?}"
+    );
 
     // 批准第一个。它跑掉之后，第二个必须也停下来问一次——而不是被跳过。
     let first = pending_for(&gw, &run).await;
@@ -956,7 +970,7 @@ async fn an_http_run_sends_its_approval_to_home_only() {
     );
 }
 
-/// **一次答一批**（§11.3 的 `/approve all`，`POST /v1/approvals/decisions`）。
+/// **一次答一批**（§11.3 的 `/approve all`，`POST /v1/interventions/answers`）。
 ///
 /// 两个会话各停一条 shell 审批（不同会话才谈得上"各自卡着"，同一会话里后一个 Run 不许
 /// 越过前一个）。一次请求答两条，两条 Run 都接着跑完——**每一条各自落一条决定、各自换
@@ -983,43 +997,51 @@ async fn one_batch_decision_answers_every_pending_approval() {
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
 
     let mut runs = Vec::new();
-    let mut approvals = Vec::new();
+    let mut handles = Vec::new();
     for index in 0..2 {
         let session = gw.open_session().await;
         let run = gw
             .submit(&session, &format!("batch-{index}"), "跑一下 echo")
             .await
             .run;
-        gw.wait_status(
-            &run,
-            |status| status == RunStatus::WaitingApproval,
-            "等待审批",
-        )
-        .await;
+        let wait = gw.wait_waiting(&run).await;
+        assert!(
+            matches!(wait, WaitReason::Approval { .. }),
+            "两条 Run 都停在等审批上：{wait:?}"
+        );
         let record = pending_for(&gw, &run).await;
         runs.push(run);
-        approvals.push(record.approval);
+        // 批量答复的名单列的是 §7.5 清单上的**句柄**：审批的句柄就是短 ID。
+        handles.push(record.short_id.to_string());
     }
     assert_eq!(gw.approvals().await.len(), 2, "两条都在等");
 
     let (code, body) = gw
         .post(
-            "/v1/approvals/decisions",
+            "/v1/interventions/answers",
             serde_json::json!({
-                "approvals": approvals,
+                "handles": handles,
                 "approved": true,
                 "request_key": "batch-1",
             }),
         )
         .await;
     assert_eq!(code, 200, "{body}");
-    let response: komo_kernel::protocol::http::ApprovalBatchDecisionResponse =
+    let response: komo_kernel::protocol::http::InterventionBatchAnswerResponse =
         serde_json::from_str(&body).expect("批量回执");
-    assert_eq!(response.decisions.len(), 2, "{body}");
+    assert_eq!(response.answered.len(), 2, "{body}");
     assert!(response.missing.is_empty(), "{body}");
-    for decision in &response.decisions {
-        assert!(decision.decision.approved, "{body}");
-        assert!(!decision.already_decided, "第一次答复不该是「早已决定」");
+    // **每一条各自落一条结论**，而且各自对着自己那个句柄——不是一条结论覆盖两条。
+    for (answer, handle) in response.answered.iter().zip(&handles) {
+        assert_eq!(&answer.handle, handle, "{body}");
+        assert_eq!(
+            answer.verdict,
+            komo_kernel::protocol::http::InterventionVerdict::Approve,
+            "{body}"
+        );
+        let decision = answer.decision.as_ref().expect("审批的答复带着决定");
+        assert!(decision.approved, "{body}");
+        assert!(!answer.already_answered, "第一次答复不该是「已经答过」");
     }
 
     // 两条 Run 都接着跑完。
@@ -1031,25 +1053,22 @@ async fn one_batch_decision_answers_every_pending_approval() {
     // 同样的名单再答一次：每一条都返回**它自己那个原决定**，不报错（§11.3）。
     let (code, body) = gw
         .post(
-            "/v1/approvals/decisions",
+            "/v1/interventions/answers",
             serde_json::json!({
-                "approvals": approvals,
+                "handles": handles,
                 "approved": true,
                 "request_key": "batch-2",
             }),
         )
         .await;
     assert_eq!(code, 200, "{body}");
-    let again: komo_kernel::protocol::http::ApprovalBatchDecisionResponse =
+    let again: komo_kernel::protocol::http::InterventionBatchAnswerResponse =
         serde_json::from_str(&body).expect("批量回执");
-    assert_eq!(again.decisions.len(), 2, "{body}");
-    assert!(
-        again
-            .decisions
-            .iter()
-            .all(|decision| decision.already_decided),
-        "第二次答复得到的是原决定：{body}"
-    );
+    assert_eq!(again.answered.len(), 2, "{body}");
+    for (answer, handle) in again.answered.iter().zip(&handles) {
+        assert_eq!(&answer.handle, handle, "{body}");
+        assert!(answer.already_answered, "第二次答复得到的是原决定：{body}");
+    }
 }
 
 /// 名单里夹着一条**不存在的**审批：其余照答，不存在的单独列出来（不让整批失败）。
@@ -1060,28 +1079,28 @@ async fn one_batch_decision_answers_every_pending_approval() {
 async fn a_batch_skips_the_names_that_are_not_there() {
     let (gateway, _sender) = TestGateway::start().await;
     let record = gateway.pending_approval().await;
-    let ghost = komo_kernel::types::ids::ApprovalId::from_raw("ap-nobody");
+    // 名单上的每一项都是 §7.5 清单给的**句柄**（审批 = 短 ID），不存在的那个也照写成句柄。
+    let handle = record.short_id.to_string();
 
     let (code, body) = gateway
         .post(
-            "/v1/approvals/decisions",
+            "/v1/interventions/answers",
             serde_json::json!({
-                "approvals": [record.approval.clone(), ghost],
+                "handles": [handle.clone(), "ap-nobody".to_string()],
                 "approved": true,
             }),
         )
         .await;
     assert_eq!(code, 200, "{body}");
-    let response: komo_kernel::protocol::http::ApprovalBatchDecisionResponse =
+    let response: komo_kernel::protocol::http::InterventionBatchAnswerResponse =
         serde_json::from_str(&body).expect("批量回执");
-    assert_eq!(response.decisions.len(), 1, "{body}");
+    assert_eq!(response.answered.len(), 1, "{body}");
+    assert_eq!(response.answered[0].handle, handle, "{body}");
     assert_eq!(
-        response.decisions[0].approval.as_str(),
-        record.approval.as_str(),
-        "{body}"
+        response.missing,
+        vec!["ap-nobody".to_string()],
+        "不存在的那个单独列出来：{body}"
     );
-    assert_eq!(response.missing.len(), 1, "{body}");
-    assert_eq!(response.missing[0].as_str(), "ap-nobody");
     assert!(gateway.approvals().await.is_empty(), "那一条真的答掉了");
 }
 

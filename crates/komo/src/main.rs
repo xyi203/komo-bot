@@ -49,10 +49,12 @@ enum Command {
         #[command(subcommand)]
         action: Option<GatewayCommand>,
     },
-    /// 查看和处理待审核操作；等价于聊天里的 /approve 与 /reject（§11.3）。
-    Approval {
+    /// 待处理清单与答复：审批、结果不明、阻塞三类一张表（§7.5）。
+    ///
+    /// 等价于聊天里的 `/pending` 与 `/answer`（§11.3）。
+    Intervention {
         #[command(subcommand)]
-        action: ApprovalCommand,
+        action: InterventionCommand,
     },
     /// 管理定时任务（§10）。
     Cron {
@@ -89,13 +91,36 @@ enum Command {
         action: ToolboxCommand,
     },
     /// 显示当前生效配置的加载时间与来源文件 mtime，以及上一次校验错误（§3）。
-    Doctor,
+    ///
+    /// `--reconcile` 顺带跑一次对账（§8.9：只读观察 + 只写状态，不调工具、不消费授权）。
+    Doctor {
+        /// 立刻跑一次对账，印出这一趟判定了什么。
+        #[arg(long)]
+        reconcile: bool,
+    },
 }
 
 #[derive(Subcommand)]
 enum SessionCommand {
-    /// 查看会话列表和状态。
-    List,
+    /// 查看会话列表和状态；`--all` 才列出已逻辑删除的（§8.10）。
+    List {
+        /// 把已逻辑删除（closing / deleted）的会话也列出来。
+        #[arg(long)]
+        all: bool,
+    },
+    /// 逻辑删除一个会话：进 `closing`，不再接受新输入，**内容一个字节都不动**（§8.10）。
+    Delete {
+        /// 会话 ID。
+        session_id: String,
+        /// 不等待未完成的 Run：立刻把它们各写一条明确取消，再进 `deleted`。
+        #[arg(long)]
+        now: bool,
+    },
+    /// 回收一个会话的内容（`purged`）；引用未处置完会列出要先处理什么（§8.10）。
+    Purge {
+        /// 会话 ID。
+        session_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -123,31 +148,33 @@ enum GatewayCommand {
 }
 
 #[derive(Subcommand)]
-enum ApprovalCommand {
-    /// 待审核列表，列表项包含短 ID、具体动作与计划。
-    List,
-    /// 单项审批详情。
+enum InterventionCommand {
+    /// 待处理清单：审批、结果不明、阻塞三类一张表（§7.5）。
+    List {
+        /// 只看某个会话的。
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// 单项详情；审批类是 §7.2 要展示的那一份（计划、改动、原因、范围）。
     Show {
-        /// 审批短 ID。
-        approval_id: String,
+        /// 句柄：审批是短 ID，结果不明与阻塞是 Run ID。
+        handle: String,
     },
-    /// 批准。
-    Approve {
-        /// 审批短 ID。
-        #[arg(required_unless_present = "all")]
-        approval_id: Option<String>,
-        /// 待处理的**全部**：一次答一批（等价于聊天里的 `/approve all`）。
+    /// 答复。结论按种类分派（§7.5）：审批 `approve` / `reject`（可带 `--scope`），
+    /// 结果不明 `satisfied` / `not_performed` / `abandon`，阻塞 `resolve` / `abandon`。
+    Answer {
+        /// 句柄：审批是短 ID，结果不明与阻塞是 Run ID。
+        handle: String,
+        /// 结论词。
+        verdict: String,
+        /// 只对 `approve` 有意义的范围：`once`（默认）/ `run` / `cron`（§7.2）。
         #[arg(long)]
-        all: bool,
+        scope: Option<String>,
     },
-    /// 拒绝。
-    Reject {
-        /// 审批短 ID。
-        #[arg(required_unless_present = "all")]
-        approval_id: Option<String>,
-        /// 待处理的**全部**：一次答一批（等价于聊天里的 `/reject all`）。
-        #[arg(long)]
-        all: bool,
+    /// 一次答一批**审批**（等价于聊天里的 `/approve all`）。
+    AnswerAll {
+        /// 结论词：只接受 `approve` / `reject`。
+        verdict: String,
     },
 }
 
@@ -403,11 +430,10 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
             let client = connect::connect_or_start(home).await?;
             let discovery = komo_client::discovery::read_discovery_file(home)
                 .map_err(|error| error.to_string())?;
-            let session = komo_gateway::http::fetch_home_session(
-                client.base_url(),
-                discovery.token.as_deref(),
-            )
-            .await?;
+            let base_url = client.base_url();
+            let session =
+                komo_gateway::http::fetch_home_session(&base_url, discovery.token.as_deref())
+                    .await?;
             run_tui(client, session.session, TuiMode::Home)
                 .await
                 .map_err(|error| error.to_string())?;
@@ -422,7 +448,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
             Ok(None)
         }
         Some(Command::Gateway { foreground, action }) => gateway(home, foreground, action).await,
-        Some(Command::Doctor) => commands::doctor(home).await.map(Some),
+        Some(Command::Doctor { reconcile }) => commands::doctor(home, reconcile).await.map(Some),
         // 三条不经 Gateway 的（§3）。
         Some(Command::Channel { action }) => match action {
             ChannelCommand::List => commands::channel_list(home).map(Some),
@@ -456,7 +482,8 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
             // 从发现文件读一次（`komo home` 已经是这个形状）。
             let discovery = komo_client::discovery::read_discovery_file(home)
                 .map_err(|error| error.to_string())?;
-            let at = (client.base_url(), discovery.token.as_deref());
+            let base_url = client.base_url();
+            let at = (base_url.as_str(), discovery.token.as_deref());
             match action {
                 ToolboxCommand::List => commands::toolbox_list(at).await,
                 ToolboxCommand::Inspect { module } => commands::toolbox_inspect(at, &module).await,
@@ -485,25 +512,33 @@ async fn operator(
     };
     match command {
         Command::Session { action } => match action {
-            SessionCommand::List => commands::session_list(client).await,
+            SessionCommand::List { all } => commands::session_list(client, all).await,
+            SessionCommand::Delete { session_id, now } => {
+                commands::session_delete(client, &session_id, now).await
+            }
+            SessionCommand::Purge { session_id } => {
+                commands::session_purge(client, &session_id).await
+            }
         },
         Command::Run { action } => match action {
             RunCommand::Inspect { run_id } => commands::run_inspect(client, &run_id).await,
             RunCommand::Cancel { run_id } => commands::run_cancel(client, &run_id).await,
         },
-        Command::Approval { action } => match action {
-            ApprovalCommand::List => commands::approval_list(client).await,
-            ApprovalCommand::Show { approval_id } => {
-                commands::approval_show(client, &approval_id).await
+        Command::Intervention { action } => match action {
+            InterventionCommand::List { session } => {
+                commands::intervention_list(client, session.as_deref()).await
             }
-            ApprovalCommand::Approve { approval_id, all } => match (approval_id, all) {
-                (Some(id), _) => commands::approval_decide(client, &id, true).await,
-                (None, _) => commands::approval_decide_all(client, true).await,
-            },
-            ApprovalCommand::Reject { approval_id, all } => match (approval_id, all) {
-                (Some(id), _) => commands::approval_decide(client, &id, false).await,
-                (None, _) => commands::approval_decide_all(client, false).await,
-            },
+            InterventionCommand::Show { handle } => {
+                commands::intervention_show(client, &handle).await
+            }
+            InterventionCommand::Answer {
+                handle,
+                verdict,
+                scope,
+            } => commands::intervention_answer(client, &handle, &verdict, scope.as_deref()).await,
+            InterventionCommand::AnswerAll { verdict } => {
+                commands::intervention_answer_all(client, &verdict).await
+            }
         },
         Command::Cron { action } => match action {
             CronCommand::Add(args) => {

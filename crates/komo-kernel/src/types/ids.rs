@@ -127,6 +127,55 @@ id_type!(
     ExecutorId
 );
 
+/// 一条 Intervention 的 id（§7.5）。
+///
+/// **它不是一个新实体的主键**：清单是派生视图（`runs` 与 `approval_requests` 的并集
+/// 查询，§7.5 第 1 条），这个 id 就是"用哪个句柄去答复"——审批类用短 ID（§11.3），
+/// 另外两类用 Run ID。它存在只是为了让 `runs.wait_ref` 有一个可查的值，而不是又造
+/// 一张会与权威漂移的表。
+///
+/// 它不是 UUID，所以没有 `new_at`：值由已有的事实派生出来。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct InterventionId(String);
+
+impl InterventionId {
+    /// 不校验地包装。给"从数据库读回的行"与测试用。
+    pub fn from_raw(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
+
+    /// 一个 Run 上最多停着**一条**要人判断的 Intervention——执行器在第一条结果不明的
+    /// 调用上就停下，不会带着两个悬空的调用等人。所以 Run ID 本身就是它的句柄。
+    pub fn for_run(run: &RunId) -> Self {
+        Self(run.as_str().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for InterventionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for InterventionId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for InterventionId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        Ok(Self::from_raw(raw))
+    }
+}
+
 /// 待处理集合内唯一的 4 位 base32 短 ID，聊天里用它答复审批（§11.3）。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

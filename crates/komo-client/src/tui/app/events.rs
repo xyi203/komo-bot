@@ -1,14 +1,15 @@
 //! 服务端事件：状态机的输入另一侧（[`super::App`] 的方法）。
 
 use komo_kernel::events::{Event, EventPayload};
+use komo_kernel::protocol::http::{InterventionKind, InterventionSummary};
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
 use komo_kernel::types::ids::{ApprovalId, ToolCallId};
 use komo_kernel::types::refs::ToolResultStatus;
-use komo_kernel::types::status::{RunStatus, ToolCallState};
+use komo_kernel::types::status::{RunState, ToolCallState};
 
 use super::{
-    App, Draft, Effect, Phase, ServerEvent, SubmissionState, blank_tool, resume_summary,
-    status_summary,
+    App, Draft, Effect, Phase, ServerEvent, SubmissionState, blank_tool, intervention_kind_text,
+    resume_summary, status_summary, verdicts_text, wait_text,
 };
 use crate::tui::approval::ApprovalModal;
 
@@ -82,8 +83,8 @@ impl App {
                 if record.decision.is_some() {
                     return Vec::new();
                 }
-                self.pending
-                    .insert(record.approval.clone(), (*record).clone());
+                // 清单才是权威（条数、`a` 的名单、`/pending` 都读它），这里只把弹窗支起来。
+                // 详情是**因为清单里有它**才去取的，所以那一份摘要已经在 `pending` 里。
                 if self
                     .approval
                     .as_ref()
@@ -93,51 +94,34 @@ impl App {
                 }
                 Vec::new()
             }
-            ServerEvent::ApprovalSettled {
-                approval,
-                approved,
-                already_decided,
-            } => {
-                let short = self
-                    .pending
-                    .remove(&approval)
-                    .map(|record| record.short_id.to_string())
-                    .unwrap_or_else(|| approval.to_string());
-                // 自己这条的回执到了，`answering` 里的那一格可以收了（收不掉也不会错，
-                // 只是长会话里会攒）。
-                self.answering.remove(&approval);
+            ServerEvent::Answered(response) => {
+                self.pending.remove(&response.handle);
+                // 弹窗上那一条答完了，它那份"我们自己答的"记号也可以收了；收不掉也不会错
+                // （`approval_decided` 那一路还会再收一次），只是长会话里会攒。
+                self.forget_answering_for(&response.handle);
                 self.close_modal_if_gone();
-                let verdict = if approved { "已批准" } else { "已拒绝" };
-                if already_decided {
-                    self.note(format!("{short} 早已决定（{verdict}），这次没有改变什么"));
-                } else {
-                    self.note(format!("{short} {verdict}"));
+                // 那句话由服务端给（`note`）：同一个结论的措辞不该在四个界面里各写一遍。
+                let mut text = response.note.clone();
+                if response.already_answered {
+                    text.push_str("（早已答复，这次没有改变什么）");
                 }
+                self.note(text);
                 self.open_next_pending()
             }
-            ServerEvent::BatchSettled(response) => {
-                // 每一条都单独印：批里某一条可能早就决定过了，而它**原来那个决定**说不定
-                // 与这一批相反（网关把原决定原样带回来）。只报个数就把那一条藏起来了。
-                for decision in &response.decisions {
-                    self.pending.remove(&decision.approval);
-                    self.answering.remove(&decision.approval);
-                    let verdict = if decision.decision.approved {
-                        "已批准"
-                    } else {
-                        "已拒绝"
-                    };
-                    self.note(format!(
-                        "{} {verdict}{}",
-                        decision.short_id,
-                        if decision.already_decided {
-                            "（早已决定，这次没有改变什么）"
-                        } else {
-                            ""
-                        }
-                    ));
+            ServerEvent::BatchAnswered(response) => {
+                // 每一条都单独印：批里某一条可能早就答过了，而它**原来那个结论**说不定与
+                // 这一批相反（服务端把原结论原样带回来）。只报个数就把那一条藏起来了。
+                for answer in &response.answered {
+                    self.pending.remove(&answer.handle);
+                    self.forget_answering_for(&answer.handle);
+                    let mut text = answer.note.clone();
+                    if answer.already_answered {
+                        text.push_str("（早已答复，这次没有改变什么）");
+                    }
+                    self.note(text);
                 }
                 for missing in &response.missing {
-                    self.fail(format!("{missing} 没有这条审批"));
+                    self.fail(format!("{missing} 没有这条待处理事项"));
                 }
                 self.close_modal_if_gone();
                 self.open_next_pending()
@@ -151,43 +135,34 @@ impl App {
                 self.note(status_summary(&detail, self.pending_count()));
                 Vec::new()
             }
-            ServerEvent::Pending(records) => {
-                // 这一份**替换**清单，不是往里加：它就是 `GET /v1/approvals` 的当前答案，
-                // 而"上一次问到的、这次已经不在了"那些必须跟着消失——否则状态行会一直
+            ServerEvent::Pending(items) => {
+                // 这一份**替换**清单，不是往里加：它就是 `GET /v1/interventions` 的当前
+                // 答案，而"上一次问到的、这次已经不在了"那些必须跟着消失——否则状态行会一直
                 // 挂着一条早就答过的。
-                self.pending = records
+                self.pending = items
                     .into_iter()
-                    .map(|record| (record.approval.clone(), record))
+                    .map(|item| (item.handle.clone(), item))
                     .collect();
                 // 先攒成文字再 `note`：`note` 要 `&mut self`，而这里还借着 `self.pending`。
-                let lines: Vec<String> = self
-                    .pending
-                    .values()
-                    .map(|record| {
-                        format!(
-                            "{}  {}  {}",
-                            record.short_id, record.plan.tool, record.reason
-                        )
-                    })
-                    .collect();
+                let lines: Vec<String> = self.pending.values().map(pending_line).collect();
                 let count = lines.len();
-                // **空清单只在被问到时才说**：启动、重连、每次决定之后都会问一次清单，
-                // 每次都印一句"没有待处理的审批"是噪音；而 `/pending` 问了一句就必须有
+                // **空清单只在被问到时才说**：启动、重连、每次答复之后都会问一次清单，
+                // 每次都印一句"没有待处理的事项"是噪音；而 `/pending` 问了一句就必须有
                 // 回答——那是它唯一的作用。
                 if lines.is_empty() && std::mem::take(&mut self.asking_pending) {
-                    self.note("没有待处理的审批");
+                    self.note("没有待处理的事项");
                 }
                 for line in lines {
                     self.note(line);
                 }
                 if count > 1 {
-                    // 清单是给人挑的，答案得跟着：**两条以上时**才提"全批"，一条时那句
-                    // 话是噪音。
-                    self.note(format!(
-                        "答一条：/approve <短ID>；{count} 条全答：/approve all"
-                    ));
+                    // 清单是给人挑的，答案得跟着（§11.3：每一条都要写清该答什么）。
+                    self.note(
+                        "答一条：/approve <短ID>（审批）或 /answer <句柄> <结论>；\
+                         多条审批一起答：/approve all",
+                    );
                 }
-                // 清单里有、屏幕上没有的，就弹第一条（§8.8「打开即弹」）。
+                // 清单里有、屏幕上没有的**审批**，就弹第一条（§8.8「打开即弹」）。
                 self.open_next_pending()
             }
             ServerEvent::ModelMenu(models) => {
@@ -247,7 +222,11 @@ impl App {
         }
     }
 
-    /// 清单里还有没弹出来的，就取它第一条。
+    /// 清单里还有没弹出来的**审批**，就取它第一条。
+    ///
+    /// 只挑审批（§7.5 的第一类）：弹窗是审批的主界面，而 `verify` / `blocked` 没有弹窗——
+    /// 它们的出路在状态行、提示行与 `/pending` 的每一行里。三类共用一张清单，不等于共用
+    /// 一种界面。
     ///
     /// 只在**没有弹窗**时动手：正在看的那一条不能被后面来的替换掉（§11.3 的"先把眼前
     /// 这件事答了"）。弹窗上的那一条已经在清单里，所以它不会把自己再取一次——除非详情
@@ -256,8 +235,12 @@ impl App {
         if self.approval.is_some() {
             return Vec::new();
         }
-        match self.pending.keys().next() {
-            Some(approval) => vec![Effect::FetchApproval(approval.clone())],
+        match self
+            .pending
+            .values()
+            .find(|item| item.kind == InterventionKind::Approval)
+        {
+            Some(item) => vec![Effect::FetchApproval(item.handle.clone())],
             None => Vec::new(),
         }
     }
@@ -267,9 +250,21 @@ impl App {
         if self
             .approval
             .as_ref()
-            .is_some_and(|open| !self.pending.contains_key(&open.record.approval))
+            .is_some_and(|open| !self.pending.contains_key(open.record.short_id.as_str()))
         {
             self.approval = None;
+        }
+    }
+
+    /// 刚刚答复掉的那个句柄如果正是弹窗上这一条，把它在 [`App::answering`] 里的记号收掉。
+    fn forget_answering_for(&mut self, handle: &str) {
+        let answerable = self
+            .approval
+            .as_ref()
+            .filter(|open| open.record.short_id.as_str() == handle)
+            .map(|open| open.record.approval.clone());
+        if let Some(approval) = answerable {
+            self.answering.remove(&approval);
         }
     }
 
@@ -296,24 +291,29 @@ impl App {
                 Vec::new()
             }
             // Run 状态是派生的，我们自己折；收到它只当一次提示。
-            SseEvent::RunStatus { run, status } => {
-                if status.is_terminal() && self.current_run.as_ref() == Some(&run) {
+            SseEvent::RunStatus { run, state } => {
+                if state.is_terminal() && self.current_run.as_ref() == Some(&run) {
                     self.scroll = 0;
                 }
-                // 「停在一份待审批上」这个信号来得比审计补写早：`run.waiting_approval` 走
-                // Run 自己的路径，`approval.requested` 是随后补写的审计副本（§8.5 的反向
-                // 顺序）。弹窗要的是后者，而权威清单在 `GET /v1/approvals`——顺手问一遍，
+                // 「停在等人上」这个信号来得比审计补写早：`run.waiting` 走 Run 自己的
+                // 路径，`approval.requested` 是随后补写的审计副本（§8.5 的反向顺序）。
+                // 弹窗要的是后者，而权威清单在 `GET /v1/interventions`——顺手问一遍，
                 // 于是弹窗不取决于那条审计副本什么时候落盘。
-                if status == RunStatus::WaitingApproval {
+                //
+                // 帧里没有 `WaitReason`（等时钟的 `retry` 与等人的两种共用一个 `waiting`），
+                // 所以这里分不出是哪一种：多问一次清单比漏掉一条便宜（清单只是一次
+                // 派生查询，而漏掉的那条会让界面停在"等待中"）。
+                if state == RunState::Waiting {
                     return vec![Effect::FetchPending];
                 }
                 Vec::new()
             }
-            SseEvent::ApprovalPending { approval, .. } => {
-                // **不靠这条通知传授权**（§13.1）：详情去 GET /v1/approvals/{id} 取。
-                // 清单也顺手问一遍：计数、`a` 的名单、`/pending` 都读它，而待处理可以
+            SseEvent::ApprovalPending { .. } => {
+                // **不靠这条通知传授权**（§13.1）：详情走
+                // `GET /v1/interventions/{handle}`，由清单那一份带着句柄去取。
+                // 这里只问一次清单：计数、`a` 的名单、`/pending` 都读它，而待处理可以
                 // 属于**别的会话**——本会话的事件流里没有那几条。
-                vec![Effect::FetchApproval(approval), Effect::FetchPending]
+                vec![Effect::FetchPending]
             }
             SseEvent::ApprovalDecided { approval, approved } => {
                 self.settle_remote(approval, approved)
@@ -326,17 +326,26 @@ impl App {
     ///
     /// 它**分不出是谁答的**——这个客户端自己按下的那一下也走这条路。所以分：自己正在
     /// 等的那些（[`App::answering`]）安静地把窗关掉，别人的则说出来。
+    ///
+    /// **帧里只有审批 id、没有句柄**（§7.5 的句柄是短 ID），所以只知道"有一条答掉了"时
+    /// 没法直接把它从清单里摘掉：那一条如果不是屏幕上这条，就问一次清单，让权威那一份
+    /// 说话——自己猜哪一条没了，猜错的结果是状态行的数字一直不对。
     fn settle_remote(&mut self, approval: ApprovalId, approved: bool) -> Vec<Effect> {
         let mine = self.answering.remove(&approval);
-        let shown = self
+        let open = self
             .approval
             .as_ref()
-            .is_some_and(|open| open.record.approval == approval);
-        if !mine && shown {
+            .filter(|modal| modal.record.approval == approval)
+            .map(|modal| modal.record.short_id.to_string());
+        let Some(handle) = open else {
+            return vec![Effect::FetchPending];
+        };
+        if !mine {
             let verdict = if approved { "已批准" } else { "已拒绝" };
             self.note(format!("这条审批在别处{verdict}了"));
         }
-        self.pending.remove(&approval);
+        // 有结论了，它就不该还挂在"待处理"那一份清单上。
+        self.pending.remove(&handle);
         self.close_modal_if_gone();
         self.open_next_pending()
     }
@@ -360,7 +369,9 @@ impl App {
                     meta.effort = body.effort.clone();
                 }
             }
-            EventPayload::RunCompleted(_) | EventPayload::RunCancelled(_) => {
+            EventPayload::RunCompleted(_)
+            | EventPayload::RunCancelled(_)
+            | EventPayload::RunAbandoned(_) => {
                 if let Some(run) = &event.run {
                     self.runs.entry(run.clone()).or_default().ended_at = Some(event.ts);
                     // Run 结束了就没人在打字了；留着一段孤儿草稿会一直显示"生成中"。
@@ -380,12 +391,34 @@ impl App {
                     self.fail(format!("任务失败：{}", body.reason));
                 }
             }
-            EventPayload::RunNeedsAttention(body) => {
-                if let Some(run) = &event.run {
-                    self.fail(format!("任务 {run} 需要处理：{}", body.reason));
-                } else {
-                    self.fail(format!("任务需要处理：{}", body.reason));
+            EventPayload::RunWaiting(body) => {
+                // 状态由 fold 折出来，读它的是状态行；这里只说**要人**的那两种——等审批与
+                // 等干预正是 §7.5 清单的内容，而"排队等时钟"不是（它是状态行上的一句
+                // `retry`，说了只是噪音）。
+                if body.reason.needs_a_person() {
+                    let where_ = match &event.run {
+                        Some(run) => format!("任务 {run}"),
+                        None => "有一条任务".into(),
+                    };
+                    self.note(format!(
+                        "{where_}停着等人：{}",
+                        wait_text(&body.reason, self.now)
+                    ));
                 }
+            }
+            EventPayload::RunReclaimed(body) => {
+                // 上一次执行没有收尾（§8.9）。它**不是一个状态**了，所以界面上唯一还能看见
+                // 这件事的地方就是这里——不说就等于悄悄消失。
+                let where_ = match &event.run {
+                    Some(run) => format!("任务 {run}"),
+                    None => "有一条任务".into(),
+                };
+                let reason = if body.reason.trim().is_empty() {
+                    "上一个执行实例没有收尾".to_string()
+                } else {
+                    body.reason.clone()
+                };
+                self.note(format!("{where_}的领取权已交还（{reason}）"));
             }
             EventPayload::ConfigChanged(body) => {
                 if let Some(run) = &event.run {
@@ -463,4 +496,18 @@ impl App {
             line.expanded = expand;
         }
     }
+}
+
+/// 清单上的一条：句柄、种类、问题，以及**这一条此刻能答什么**。
+///
+/// §11.3 要求 `/pending` 的每一行「写清这一条该答什么」——句柄是审批的短 ID 或另两类的
+/// Run ID，结论就是清单自带的那一份（自己推会推出一个按下去没反应的答案）。
+fn pending_line(item: &InterventionSummary) -> String {
+    format!(
+        "{}  {}  {}  可答：{}",
+        item.handle,
+        intervention_kind_text(item.kind),
+        item.question,
+        verdicts_text(&item.verdicts)
+    )
 }

@@ -326,7 +326,11 @@ async fn decide(
         }
     }
 
-    let policy = PolicyEngine::from_rules(api.state.snapshot().policy.clone());
+    let snapshot = api.state.snapshot();
+    // 与执行器、核对那两份同一个名单（§8.10 第 4 条）：toolbox 的启用是第三个判决入口。
+    let policy = PolicyEngine::from_rules(snapshot.policy.clone()).with_protection(
+        crate::service::state::protected_paths(&snapshot, &api.state.home),
+    );
     let roots = [WorkspaceRoot {
         path: toolbox.layout().root().to_path_buf(),
         writable: true,

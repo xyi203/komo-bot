@@ -450,6 +450,34 @@ fn retryability_is_decided_variant_by_variant() {
     }));
 }
 
+/// 退避**分得开是哪一种失败**（§8.5）：429 要尊重服务端的 `Retry-After`，5xx 要退得
+/// 比它久，"分不出是谁的问题"的那几种按传输算——混成一个数字就只能取最保守值。
+///
+/// 这张表是 `is_retryable` 的另一半说法：`Some(_)` 就是能重试，`None` 就是不能。
+#[test]
+fn a_retryable_failure_is_classified_by_what_failed() {
+    let rejected = |status| LlmError::Rejected {
+        status,
+        message: String::new(),
+    };
+
+    assert_eq!(retry_cause(&rejected(429)), Some(RetryCause::RateLimited));
+    assert_eq!(retry_cause(&rejected(503)), Some(RetryCause::Server));
+    assert_eq!(retry_cause(&rejected(500)), Some(RetryCause::Server));
+    assert_eq!(retry_cause(&rejected(408)), Some(RetryCause::Transport));
+    assert_eq!(retry_cause(&LlmError::Timeout), Some(RetryCause::Transport));
+    assert_eq!(
+        retry_cause(&LlmError::Incomplete),
+        Some(RetryCause::Transport)
+    );
+    assert_eq!(
+        retry_cause(&LlmError::Transport("断了".into())),
+        Some(RetryCause::Transport)
+    );
+    assert_eq!(retry_cause(&rejected(401)), None);
+    assert_eq!(retry_cause(&LlmError::Unknown("结果不明".into())), None);
+}
+
 /// §13.3：切换聊天模型或 effort 不影响独立配置的记忆模型。
 #[tokio::test]
 async fn the_router_hands_each_run_the_instance_its_own_snapshot_names() {

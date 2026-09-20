@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use komo_kernel::traits::LlmClient;
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::WaitReason;
 
 use crate::harness::*;
 
@@ -27,7 +27,7 @@ async fn always_delivers_a_good_run() {
     let job = gw.add_job(daily("always")).await;
     gw.make_due(&job.id).await;
     let run = gw.tick().await.fired[0].run.clone();
-    gw.wait_status(&run, |s| s.is_terminal(), "终态").await;
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
 
     let sender = Arc::clone(&gw.home);
     eventually("home chat 收到结果", move || {
@@ -50,7 +50,7 @@ async fn on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait() {
     let quiet = gw.add_job(daily("on_error")).await;
     gw.make_due(&quiet.id).await;
     let run = gw.tick().await.fired[0].run.clone();
-    gw.wait_status(&run, |s| s.is_terminal(), "终态").await;
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
 
     // 等触发状态记成 ok，说明盯梢已经处理完这个 Run——这时还没投才说明问题。
     let mut settled = false;
@@ -81,8 +81,12 @@ async fn on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait() {
     let asking = gw.add_job(daily("on_error")).await;
     gw.make_due(&asking.id).await;
     let run = gw.tick().await.fired[0].run.clone();
-    gw.wait_status(&run, |s| s == RunStatus::WaitingApproval, "等待审批")
-        .await;
+    // §8.4：等待是 `waiting` 加理由两维，理由说得出是在等一条审批。
+    let wait = gw.wait_waiting(&run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "停在等审批上：{wait:?}"
+    );
 
     let sender = Arc::clone(&gw.home);
     eventually("等待照样投到 home chat", move || {
@@ -103,8 +107,11 @@ async fn never_still_lets_a_wait_through() {
     let job = gw.add_job(daily("never")).await;
     gw.make_due(&job.id).await;
     let run = gw.tick().await.fired[0].run.clone();
-    gw.wait_status(&run, |s| s == RunStatus::WaitingApproval, "等待审批")
-        .await;
+    let wait = gw.wait_waiting(&run).await;
+    assert!(
+        matches!(wait, WaitReason::Approval { .. }),
+        "停在等审批上：{wait:?}"
+    );
 
     let sender = Arc::clone(&gw.home);
     eventually("never 也要投一次等待", move || {

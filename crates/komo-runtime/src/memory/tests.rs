@@ -24,7 +24,7 @@ use komo_kernel::types::model::{
 };
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultStatus};
-use komo_kernel::types::status::RunStatus;
+use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{MemoryUse, Round};
 use komo_store::{Db, TursoMemoryRepo};
 use time::OffsetDateTime;
@@ -56,6 +56,9 @@ struct ConceptEmbeddings {
     down: Mutex<bool>,
     /// 每一维一组同义词。
     concepts: Vec<Vec<&'static str>>,
+    /// 被要求嵌过几次。**"这一段有没有重新召回"的观察口**（§9.4：同一段里逐字复用，
+    /// 所以同一段里第二次请求不该让这个数动）。
+    calls: std::sync::atomic::AtomicUsize,
 }
 
 impl ConceptEmbeddings {
@@ -82,11 +85,16 @@ impl ConceptEmbeddings {
             },
             down: Mutex::new(false),
             concepts,
+            calls: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
     fn set_down(&self, down: bool) {
         *self.down.lock().expect("向量替身") = down;
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -97,6 +105,7 @@ impl EmbeddingClient for ConceptEmbeddings {
     }
 
     async fn embed(&self, _kind: InputKind, texts: &[String]) -> Result<Vec<Vector>, EmbedError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if *self.down.lock().expect("向量替身") {
             return Err(EmbedError::Unavailable("测试里把端点关掉了".into()));
         }
@@ -400,7 +409,7 @@ fn tool_event(seq: u64, run: &RunId, preview: &str) -> Event {
     )
 }
 
-fn work_item(status: RunStatus, source: PlanSource) -> MemoryWorkItem {
+fn work_item(status: RunState, source: PlanSource) -> MemoryWorkItem {
     MemoryWorkItem {
         run: RunId::from_raw("run-1"),
         session: SessionId::from_raw("sess-1"),
@@ -571,8 +580,8 @@ async fn extracting_the_same_claim_again_never_promotes_a_candidate() {
         .script(vec![round(extraction)])
         .script(vec![round(extraction)])
         .work(vec![
-            work_item(RunStatus::Completed, interactive()),
-            work_item(RunStatus::Completed, interactive()),
+            work_item(RunState::Completed, interactive()),
+            work_item(RunState::Completed, interactive()),
         ])
         .build()
         .await;
@@ -613,7 +622,7 @@ async fn the_memory_model_is_the_one_the_memory_section_names() {
                 "kind":"fact","scope":"project:komo","said_by":"user_statement",
                 "evidence":["evt-1"]}]}"#,
         )])
-        .work(vec![work_item(RunStatus::Completed, interactive())])
+        .work(vec![work_item(RunState::Completed, interactive())])
         .build()
         .await;
     harness.ledger.seed(
@@ -1042,7 +1051,7 @@ fn an_observation_that_cites_only_the_assistant_is_dropped() {
 
     let observations = transcript.validate(
         raw,
-        &work_item(RunStatus::Completed, interactive()),
+        &work_item(RunState::Completed, interactive()),
         &model("memory-model", None),
         NOW,
     );
@@ -1071,7 +1080,7 @@ fn a_claim_of_user_speech_without_a_user_event_is_demoted_to_an_inference() {
 
     let observations = transcript.validate(
         raw,
-        &work_item(RunStatus::Completed, interactive()),
+        &work_item(RunState::Completed, interactive()),
         &model("memory-model", None),
         NOW,
     );
@@ -1103,7 +1112,7 @@ fn a_failed_run_yields_no_experience_and_a_cron_run_yields_no_preference() {
 
     let failed = transcript.validate(
         raw.clone(),
-        &work_item(RunStatus::Failed, interactive()),
+        &work_item(RunState::Failed, interactive()),
         &model("memory-model", None),
         NOW,
     );
@@ -1116,7 +1125,7 @@ fn a_failed_run_yields_no_experience_and_a_cron_run_yields_no_preference() {
     let cron = transcript.validate(
         raw,
         &work_item(
-            RunStatus::Completed,
+            RunState::Completed,
             PlanSource::Cron {
                 job: komo_kernel::types::ids::CronJobId::from_raw("job-1"),
                 job_version: 1,
@@ -1152,7 +1161,7 @@ fn anything_that_looks_like_a_credential_is_dropped() {
 
     let observations = transcript.validate(
         raw,
-        &work_item(RunStatus::Completed, interactive()),
+        &work_item(RunState::Completed, interactive()),
         &model("memory-model", None),
         NOW,
     );
@@ -1164,7 +1173,7 @@ fn anything_that_looks_like_a_credential_is_dropped() {
 #[tokio::test]
 async fn a_cancelled_run_is_skipped_and_its_cursor_still_settles() {
     let harness = HarnessBuilder::new()
-        .work(vec![work_item(RunStatus::Cancelled, interactive())])
+        .work(vec![work_item(RunState::Cancelled, interactive())])
         .build()
         .await;
     let report = harness.manager.process_pending(4).await.unwrap();
@@ -1189,7 +1198,7 @@ async fn a_failed_extraction_leaves_the_cursor_where_it_was() {
         .script(vec![round("我觉得没什么好记的。")])
         .work(vec![MemoryWorkItem {
             cursor: Seq(3),
-            ..work_item(RunStatus::Completed, interactive())
+            ..work_item(RunState::Completed, interactive())
         }])
         .build()
         .await;
@@ -1219,7 +1228,7 @@ async fn an_unreadable_session_abandons_the_run_instead_of_retrying_forever() {
     let harness = HarnessBuilder::new()
         .work(vec![MemoryWorkItem {
             cursor: Seq(2),
-            ..work_item(RunStatus::Completed, interactive())
+            ..work_item(RunState::Completed, interactive())
         }])
         .build()
         .await;
@@ -1250,7 +1259,7 @@ async fn a_user_statement_lands_active_and_unconfirmed_with_its_evidence() {
               "user_confirmed":true}]}
             ```"#,
         )])
-        .work(vec![work_item(RunStatus::Completed, interactive())])
+        .work(vec![work_item(RunState::Completed, interactive())])
         .build()
         .await;
     harness.ledger.seed(
@@ -1297,7 +1306,7 @@ async fn a_contradiction_puts_both_sides_in_contested_and_out_of_recall() {
         .script(vec![round(
             r#"{"verdicts":[{"memory":"m-1","relation":"contradicts"}]}"#,
         )])
-        .work(vec![work_item(RunStatus::Completed, interactive())])
+        .work(vec![work_item(RunState::Completed, interactive())])
         .build()
         .await;
     harness
@@ -1348,7 +1357,7 @@ async fn an_inference_may_not_supersede_a_user_statement() {
         .script(vec![round(
             r#"{"verdicts":[{"memory":"m-1","relation":"supersedes"}]}"#,
         )])
-        .work(vec![work_item(RunStatus::Completed, interactive())])
+        .work(vec![work_item(RunState::Completed, interactive())])
         .build()
         .await;
     harness
@@ -1392,7 +1401,7 @@ async fn nothing_automatic_supersedes_what_the_user_confirmed() {
         .script(vec![round(
             r#"{"verdicts":[{"memory":"m-1","relation":"supersedes"}]}"#,
         )])
-        .work(vec![work_item(RunStatus::Completed, interactive())])
+        .work(vec![work_item(RunState::Completed, interactive())])
         .build()
         .await;
     harness
@@ -1437,7 +1446,7 @@ async fn an_allowed_supersede_retires_the_old_one_and_links_forward() {
         .script(vec![round(
             r#"{"verdicts":[{"memory":"m-1","relation":"supersedes"}]}"#,
         )])
-        .work(vec![work_item(RunStatus::Completed, interactive())])
+        .work(vec![work_item(RunState::Completed, interactive())])
         .build()
         .await;
     // 旧的那条是**工具观察**，不是用户陈述，也没有被确认过。
@@ -1537,7 +1546,7 @@ async fn the_preamble_serves_what_the_segment_prepared_for_that_run() {
 async fn a_disabled_memory_section_injects_nothing_and_extracts_nothing() {
     let harness = HarnessBuilder::new()
         .config(memory_config(false, RetrievalMode::Keyword))
-        .work(vec![work_item(RunStatus::Completed, interactive())])
+        .work(vec![work_item(RunState::Completed, interactive())])
         .build()
         .await;
     harness
@@ -1604,4 +1613,173 @@ fn memory(id: &str, content: &str) -> komo_kernel::types::memory::MemoryItem {
         usage: Default::default(),
         supersedes: None,
     }
+}
+
+// ---------------------------------------------------------------- 提示前缀的稳定（§9.4）
+
+/// §9.4：**同一段对话里注入段逐字复用**。
+///
+/// 记忆段拼在 system 消息里，而服务端的前缀缓存按最长公共前缀命中——每轮重新召回、
+/// 重新渲染，就等于每轮把整条前缀（连对话历史）的缓存打掉一次。这里钉两件事：第二句
+/// 话完全不同、同属一段时，注入段**一个字节都不变**，而且**没有再一次召回**。
+#[tokio::test]
+async fn the_injection_is_reused_verbatim_within_one_segment() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    let session = SessionId::from_raw("sess-1");
+
+    let first = harness
+        .manager
+        .prepare_segment(&session, &RunId::from_raw("run-1"), "空调多少度", &[], 0)
+        .await;
+    assert!(
+        !first.text.as_deref().unwrap_or_default().is_empty(),
+        "这一段召回到了东西才谈得上复用"
+    );
+    let embedded = harness.embeddings.calls();
+    assert!(embedded > 0, "第一次召回要嵌一次查询");
+
+    let second = harness
+        .manager
+        .prepare_segment(&session, &RunId::from_raw("run-2"), "那台灯呢", &[], 0)
+        .await;
+    assert_eq!(second.text, first.text, "同一段里逐字复用，前缀才稳");
+    assert_eq!(second.uses, first.uses);
+    assert_eq!(
+        harness.embeddings.calls(),
+        embedded,
+        "同一段里不该再召回一次（连 embedding 都不该发）"
+    );
+    // 每一轮照样挂在自己那个 Run 上：`SystemPreamble` 从那里取正文。
+    assert_eq!(
+        harness.manager.injection_for(&RunId::from_raw("run-2")),
+        first.text
+    );
+}
+
+/// 换段（`/new`，`conversation.boundary`）就重新召回：这一段里新记下的东西，下一段才进来。
+#[tokio::test]
+async fn a_new_segment_recalls_again() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    let session = SessionId::from_raw("sess-1");
+
+    let first = harness
+        .manager
+        .prepare_segment(&session, &RunId::from_raw("run-1"), "空调多少度", &[], 0)
+        .await;
+    let embedded = harness.embeddings.calls();
+
+    // 这一段里新记下一条：**同一段里看不见它**（换取前缀稳定）。
+    harness
+        .repo
+        .put(memory("m-2", "卧室台灯是暖光"), None)
+        .await
+        .unwrap();
+    let same = harness
+        .manager
+        .prepare_segment(&session, &RunId::from_raw("run-2"), "台灯", &[], 0)
+        .await;
+    assert_eq!(same.text, first.text, "同一段里不重算");
+
+    // 换段：重新召回，新那条进来，也确实又嵌了一次查询。
+    let next = harness
+        .manager
+        .prepare_segment(&session, &RunId::from_raw("run-3"), "台灯", &[], 9)
+        .await;
+    let text = next.text.clone().unwrap_or_default();
+    assert!(text.contains("台灯"), "{text}");
+    assert!(harness.embeddings.calls() > embedded, "换段要重新召回一次");
+}
+
+/// 一条都没召回出来时**也钉住**：不钉的话这个会话每一轮都要为"确实没有相关记忆"付一次
+/// embedding，而提示前缀还是空的——白花。
+#[tokio::test]
+async fn an_empty_segment_is_pinned_too() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    let session = SessionId::from_raw("sess-1");
+
+    let first = harness
+        .manager
+        .prepare_segment(&session, &RunId::from_raw("run-1"), "空调多少度", &[], 0)
+        .await;
+    assert_eq!(first, Injection::default(), "库里一条记忆都没有");
+    let embedded = harness.embeddings.calls();
+
+    let second = harness
+        .manager
+        .prepare_segment(&session, &RunId::from_raw("run-2"), "再说一遍", &[], 0)
+        .await;
+    assert_eq!(second, Injection::default());
+    assert_eq!(
+        harness.embeddings.calls(),
+        embedded,
+        "空的那一块也要钉住，不能每轮白嵌一次"
+    );
+}
+
+/// 钉住的那一块**不豁免遗忘**：条目被遗忘之后，同一段里的下一轮就把它清出去，重新算一块。
+///
+/// 这一条比"前缀稳定"更要紧——`forget` 就是"立刻停用"（§9.2、§9.7），验收也钉着它
+/// （`governance::a_forgotten_memory_never_comes_back_into_a_turn`）。
+#[tokio::test]
+async fn a_forgotten_item_drops_the_pin() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    let session = SessionId::from_raw("sess-1");
+
+    let first = harness
+        .manager
+        .prepare_segment(&session, &RunId::from_raw("run-1"), "空调多少度", &[], 0)
+        .await;
+    assert_eq!(first.uses.len(), 1, "先注入上了");
+
+    harness
+        .repo
+        .forget(&first.uses[0].memory, 1, NOW)
+        .await
+        .unwrap();
+
+    let second = harness
+        .manager
+        .prepare_segment(&session, &RunId::from_raw("run-2"), "空调多少度", &[], 0)
+        .await;
+    assert!(
+        second.uses.is_empty(),
+        "遗忘之后不能再注入：{:?}",
+        second.uses
+    );
+    assert!(
+        !second.text.as_deref().unwrap_or_default().contains("26 度"),
+        "{:?}",
+        second.text
+    );
 }

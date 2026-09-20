@@ -138,12 +138,11 @@ pub fn subscribe_with(
 ) -> SseHandle {
     let (frame_tx, frames) = mpsc::channel(config.buffer);
     let (state_tx, state) = watch::channel(ConnectionState::Connecting);
-    let url = client.url(&format!("/v1/sessions/{session}/events"));
-    let http = client.http().clone();
-    let token = client.token().map(str::to_string);
+    // 客户端进任务里：**每次重连先按发现文件核对当前实例**（见 `run_subscription`）。
+    let client = client.clone();
 
     let task = tokio::spawn(async move {
-        run_subscription(http, url, token, cursor, config, frame_tx, state_tx).await;
+        run_subscription(client, session, cursor, config, frame_tx, state_tx).await;
     });
 
     SseHandle {
@@ -155,9 +154,8 @@ pub fn subscribe_with(
 
 #[allow(clippy::too_many_arguments)]
 async fn run_subscription(
-    http: reqwest::Client,
-    url: String,
-    token: Option<String>,
+    client: KomoClient,
+    session: SessionId,
     mut cursor: Cursor,
     config: SseConfig,
     frames: mpsc::Sender<SseMessage>,
@@ -167,6 +165,14 @@ async fn run_subscription(
     let mut backoff = config.initial_backoff;
 
     loop {
+        // **网关重启会换令牌**（发现文件里那个每次启动重新生成），端口也可能变。每次
+        // 重连先按发现文件核对一次：实例换了就把地址与令牌一起换掉（§3 第 1–2 步）。
+        // 少了这一步，重启之后客户端会攥着上一个实例的令牌无限重连——界面永远"重连中"。
+        client.refresh().await;
+        let http = client.http().clone();
+        let url = client.url(&format!("/v1/sessions/{session}/events"));
+        let token = client.token();
+
         match connect_once(
             &http,
             &url,
@@ -397,7 +403,7 @@ mod tests {
     use super::*;
     use komo_kernel::protocol::sse::SseEvent;
     use komo_kernel::types::ids::RunId;
-    use komo_kernel::types::status::RunStatus;
+    use komo_kernel::types::status::RunState;
 
     fn frame(id: u64) -> SseFrame {
         SseFrame {
@@ -405,7 +411,7 @@ mod tests {
             session: SessionId::from_raw("sess-1"),
             event: SseEvent::RunStatus {
                 run: RunId::from_raw("run-1"),
-                status: RunStatus::Running,
+                state: RunState::Running,
             },
         }
     }
@@ -421,7 +427,7 @@ mod tests {
     #[test]
     fn a_whole_frame_parses() {
         let mut parser = FrameParser::default();
-        let out = parser.push(wire(&frame(7), "run_status").as_bytes());
+        let out = parser.push(wire(&frame(7), "run_state").as_bytes());
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].cursor(), Seq(7));
         assert_eq!(out[0], SseMessage::Frame(Box::new(frame(7))));
@@ -429,7 +435,7 @@ mod tests {
 
     #[test]
     fn a_frame_split_across_chunks_parses_once_it_is_whole() {
-        let text = wire(&frame(9), "run_status");
+        let text = wire(&frame(9), "run_state");
         let (head, tail) = text.split_at(text.len() / 2);
         let mut parser = FrameParser::default();
         assert!(parser.push(head.as_bytes()).is_empty());
@@ -442,7 +448,7 @@ mod tests {
     fn a_chunk_boundary_inside_a_multibyte_character_does_not_corrupt_it() {
         let mut frame = frame(11);
         frame.session = SessionId::from_raw("会话");
-        let text = wire(&frame, "run_status");
+        let text = wire(&frame, "run_state");
         let bytes = text.as_bytes();
         // 切在 "会" 的中间。
         let cut = text.find("会").unwrap() + 1;
@@ -490,9 +496,9 @@ mod tests {
     fn several_frames_in_one_chunk_all_come_out_in_order() {
         let text = format!(
             "{}{}{}",
-            wire(&frame(1), "run_status"),
-            wire(&frame(2), "run_status"),
-            wire(&frame(3), "run_status")
+            wire(&frame(1), "run_state"),
+            wire(&frame(2), "run_state"),
+            wire(&frame(3), "run_state")
         );
         let mut parser = FrameParser::default();
         let out = parser.push(text.as_bytes());
@@ -523,7 +529,7 @@ mod wire_tests {
     use crate::test_server::{FakeGateway, Reply};
     use komo_kernel::protocol::sse::SseEvent;
     use komo_kernel::types::ids::RunId;
-    use komo_kernel::types::status::RunStatus;
+    use komo_kernel::types::status::RunState;
 
     fn frame_chunk(id: u64) -> String {
         let frame = SseFrame {
@@ -531,11 +537,11 @@ mod wire_tests {
             session: SessionId::from_raw("sess-1"),
             event: SseEvent::RunStatus {
                 run: RunId::from_raw("run-1"),
-                status: RunStatus::Running,
+                state: RunState::Running,
             },
         };
         format!(
-            "id: {id}\nevent: run_status\ndata: {}\n\n",
+            "id: {id}\nevent: run_state\ndata: {}\n\n",
             serde_json::to_string(&frame).unwrap()
         )
     }
@@ -547,6 +553,109 @@ mod wire_tests {
             idle_timeout: Duration::from_secs(5),
             buffer: 64,
         }
+    }
+
+    /// **网关重启之后，事件订阅要自己跟过去。**
+    ///
+    /// 令牌每次启动重新生成、地址也可能变：重连时先按发现文件核对一次当前实例，否则
+    /// 界面会停在"重连中"直到人手动重开（线上就是这么卡住的）。
+    #[tokio::test]
+    async fn a_subscription_follows_a_restarted_gateway() {
+        let home = tempfile::tempdir().expect("临时数据目录");
+        let data_dir = home.path().to_string_lossy().to_string();
+
+        // 老实例：吐一帧，然后就"下线"（下面的 `drop`）。
+        //
+        // **别看序号判"第一次连接"**：`ordinal` 数的是这个假服务端收到的**所有**请求，
+        // 而 `discover` 会先打一次 `/healthz`——按 `ordinal == 0` 判的话，真正的 SSE
+        // 请求会被当成第二次，测试就卡在第一帧上。
+        let old_token = "old-token";
+        let old_dir = data_dir.clone();
+        let old = FakeGateway::spawn(move |request, _| {
+            if request.path.contains("/healthz") {
+                return Reply::ok(serde_json::json!({
+                    "instance_id": "inst-1",
+                    "version": "0.8.0",
+                    "protocol_version": komo_kernel::protocol::PROTOCOL_VERSION,
+                    "started_at": "2026-09-19T00:00:00Z",
+                    "data_dir": old_dir
+                }));
+            }
+            Reply::Sse(vec![frame_chunk(41)])
+        })
+        .await;
+
+        // 新实例：认新令牌，接着吐下一帧。`/healthz` 要报**同一个数据目录**，否则
+        // `discover` 会把它判成"不是同一个实例"，刷新永远不成功。
+        let new_dir = data_dir.clone();
+        let new = FakeGateway::spawn(move |request, _| {
+            if request.path.contains("/healthz") {
+                return Reply::ok(serde_json::json!({
+                    "instance_id": "inst-2",
+                    "version": "0.8.0",
+                    "protocol_version": komo_kernel::protocol::PROTOCOL_VERSION,
+                    "started_at": "2026-09-19T00:00:00Z",
+                    "data_dir": new_dir
+                }));
+            }
+            Reply::Sse(vec![frame_chunk(42)])
+        })
+        .await;
+
+        write_discovery(&home, &old.base_url(), "inst-1", old_token);
+        let client = crate::discovery::discover(home.path())
+            .await
+            .expect("发现得了")
+            .client()
+            .expect("建得出");
+        let mut subscription = subscribe_with(
+            &client,
+            SessionId::from_raw("sess-1"),
+            Cursor::after(Seq(40)),
+            fast(),
+        );
+        // 第一帧也带时限：接不上就**失败并说清楚**，不是把测试挂死。
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv())
+            .await
+            .expect("第一帧就该到（超时说明客户端的第一次连接没接上）")
+            .unwrap();
+        assert_eq!(first.cursor(), Seq(41));
+
+        // "重启"：老实例下线，发现文件指向新实例。
+        drop(old);
+        write_discovery(&home, &new.base_url(), "inst-2", "new-token");
+
+        // 重连时按发现文件跟过去，续读到新实例的帧。**带时限**：跟不过去时这条会
+        // 失败并说清楚卡在哪，而不是把测试挂死。
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "5 秒内没有接上新实例：客户端还指着 {}，发现文件说 {}，新实例收到 {} 条请求",
+                    client.base_url(),
+                    new.base_url(),
+                    new.requests().len()
+                )
+            });
+        assert_eq!(next.unwrap().cursor(), Seq(42));
+        assert_eq!(client.base_url(), new.base_url(), "地址跟着换");
+    }
+
+    /// 发现文件那一行的样子（`runtime/gateway.json`）——与 `api.rs` 的测试同一份形状。
+    fn write_discovery(home: &tempfile::TempDir, base_url: &str, instance: &str, token: &str) {
+        let dir = home.path().join("runtime");
+        std::fs::create_dir_all(&dir).expect("建 runtime/");
+        let body = serde_json::json!({
+            "instance_id": instance,
+            "base_url": base_url,
+            "protocol_version": komo_kernel::protocol::PROTOCOL_VERSION,
+            "version": "0.8.0",
+            "pid": 4242,
+            "data_dir": home.path().to_string_lossy(),
+            "token": token,
+            "started_at": "2026-09-19T00:00:00Z"
+        });
+        std::fs::write(dir.join("gateway.json"), body.to_string()).expect("写发现文件");
     }
 
     #[tokio::test]

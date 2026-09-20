@@ -42,8 +42,10 @@
 
 mod harness;
 
+mod approvals;
 mod cross;
 mod feishu;
+mod skills;
 mod smoke;
 mod telegram;
 mod wechat;

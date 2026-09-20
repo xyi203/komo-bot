@@ -75,6 +75,11 @@ ratatui = "0.30.2"
 crossterm = "0.29.0"
 pulldown-cmark = "0.13.4"
 
+# §13.4：仅 komo (bin) 的 `komo update`——解发布包（release.yml 打的 tar.gz）。
+# flate2 显式写 rust_backend（miniz_oxide，纯 Rust），不随上游默认后端变；两者都不带 C 工具链。
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+tar = "0.4"
+
 # §3 配置热重载：进程内唯一的 Arc<ConfigSnapshot> 原子替换。
 arc-swap = "1.9.2"
 

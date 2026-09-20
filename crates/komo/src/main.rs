@@ -6,6 +6,7 @@
 
 mod commands;
 mod connect;
+mod update;
 
 use std::path::Path;
 
@@ -98,6 +99,11 @@ enum Command {
         #[arg(long)]
         reconcile: bool,
     },
+    /// 从 GitHub release 换掉这个可执行文件（§3、§13.6）。
+    ///
+    /// 不经 Gateway：换的是**磁盘上那份二进制**，不是在跑的那个进程。最后一步是同目录
+    /// `rename`，校验和与试跑都在旧文件还在时做——失败不会留下一个跑不起来的 komo。
+    Update,
 }
 
 #[derive(Subcommand)]
@@ -449,6 +455,8 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
         }
         Some(Command::Gateway { foreground, action }) => gateway(home, foreground, action).await,
         Some(Command::Doctor { reconcile }) => commands::doctor(home, reconcile).await.map(Some),
+        // 也不经 Gateway（§3）：它换的是磁盘上那份二进制，与在跑的那个进程无关。
+        Some(Command::Update) => update::run(home).await.map(Some),
         // 三条不经 Gateway 的（§3）。
         Some(Command::Channel { action }) => match action {
             ChannelCommand::List => commands::channel_list(home).map(Some),
@@ -820,6 +828,10 @@ mod tests {
             Some(Command::Config {
                 action: ConfigCommand::Check
             })
+        ));
+        assert!(matches!(
+            Cli::parse_from(["komo", "update"]).command,
+            Some(Command::Update)
         ));
     }
 

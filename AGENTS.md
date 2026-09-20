@@ -25,6 +25,7 @@ komo config check | config reload
 komo channel list|probe | channel wechat login
 komo approval list|show|approve|reject
 komo cron … | komo memory … | komo skills … | komo doctor
+komo update                    # swap the on-disk binary from the GitHub release (§13.6)
 ```
 
 The full command table is §3 of the design.
@@ -75,6 +76,11 @@ Dependencies point downward only: `kernel ← store ← runtime ← gateway` and
 - **Channel identity lives in config, not the db** (§11.2): `allow_from` /
   `home_chat` / `groups` in `config.toml`, credentials in `.env`. No pairing
   table, no `/sethome`.
+- **The release convention is one string in three places** (§13.6): the repo
+  name, `komo-<os>-<arch>.tar.gz`, and `SHA256SUMS` appear in
+  `.github/workflows/release.yml`, `install.sh`, and
+  `crates/komo/src/update.rs` — change one, change all three. The tag must
+  equal `[workspace.package].version`, or `komo update` refuses the package.
 - **Config hot-reloads** (§3): one `Arc<ConfigSnapshot>` swapped atomically;
   readers read the current snapshot per use, running Runs keep the snapshot
   they started with. An invalid file is never installed. A short list of keys

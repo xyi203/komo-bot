@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  # 只打包与算校验和，不发布——发布那一步是 tag 门住的，方便验证打包本身。
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # `komo update` 换上去之前会试跑 `--version`，要求它报的版本**就是标签版本**
+  # （update.rs 的 probe）。标签与 Cargo.toml 的版本不一致时，谁更新到这一版谁就被挡在
+  # "版本对不上" 上——所以在打包之前先拦下来，别把这样的包发出去。
+  guard:
+    name: Tag matches Cargo.toml
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "komo") | .version')"
+          if [[ "v${version}" != "${GITHUB_REF_NAME}" ]]; then
+            echo "标签 ${GITHUB_REF_NAME} 与 [workspace.package].version ${version} 对不上。" >&2
+            echo "先把 Cargo.toml 的版本改成 ${GITHUB_REF_NAME#v}，再打这个标签——" >&2
+            echo "否则 komo update 会在试跑那一步拒绝这一版（它按标签版本核对二进制自己报的版本）。" >&2
+            exit 1
+          fi
+
+  package:
+    name: Package ${{ matrix.asset_suffix }}
+    needs: guard
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            asset_suffix: darwin-arm64
+            runner: macos-latest
+          # 用本机工具链编各平台的 C（ring 与 mimalloc），不走交叉编译。
+          # 22.04 给发布出来的 linux 包定 glibc 下限 2.35。
+          - target: x86_64-apple-darwin
+            asset_suffix: darwin-amd64
+            runner: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            asset_suffix: linux-amd64
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            asset_suffix: linux-arm64
+            runner: ubuntu-22.04-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # 资产名与包内成员名是发布约定的一部分：komo-<os>-<arch>.tar.gz 里只有一个 komo。
+      # install.sh 与 crates/komo/src/update.rs 按这两个名字取。
+      - name: Package
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/komo" "dist/komo"
+          tar -czf "dist/komo-${{ matrix.asset_suffix }}.tar.gz" -C dist komo
+          rm -f dist/komo
+          ls -lh dist
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: komo-${{ matrix.asset_suffix }}
+          path: dist/komo-${{ matrix.asset_suffix }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    name: Publish Release
+    needs: package
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 一行一个资产，格式就是 sha256sum 的默认输出——install.sh 的 awk 与 update.rs 的
+      # sum_for 都按 `<hex>  <文件名>` 读它。
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum komo-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Generate build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/komo-*.tar.gz
+            dist/SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false

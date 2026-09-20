@@ -97,6 +97,7 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo channel wechat login`                  | 终端显示二维码完成微信登录，凭证写入数据目录                                |
 | `komo skills list/inspect/enable/disable`    | Skills 目录（§5.6）；只读文件系统，不经 Gateway                             |
 | `komo toolbox list/inspect/test/enable [--version]/disable` | toolbox 模块（§5.3–5.4）；**经 Gateway**——启用是一次审批，审批只有 Gateway 打得开 |
+| `komo update`                                | 从 GitHub release 换掉当前这个可执行文件（§13.6）。**不经 Gateway**：换的是磁盘上那份二进制，不是在跑的那个进程 |
 
 聊天启动顺序：
 
@@ -1431,8 +1432,9 @@ komo-client    HTTP + SSE 客户端、发现文件读取、ratatui 聊天 TUI（
                操作子命令的输出渲染。只依赖 kernel——不认识 store / runtime。
                deps: kernel, reqwest, tokio, ratatui, crossterm, pulldown-cmark
 
-komo (bin)     clap 分发：`komo` / `komo resume` → client 的 TUI；操作子命令 → client；`komo gateway` → gateway。
-               deps: client, gateway, clap
+komo (bin)     clap 分发：`komo` / `komo resume` → client 的 TUI；操作子命令 → client；`komo gateway` → gateway；
+               `komo update`（§13.6）是 bin 里唯一自己发 HTTP 的地方。
+               deps: client, gateway, clap, reqwest, flate2, tar
 ```
 
 依赖只向下，两条支线在 bin 汇合：
@@ -1459,6 +1461,7 @@ kernel ← client ────────────────────�
 | `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
 | `arc-swap` | 默认；仅 komo-runtime（`config`） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
 | `clap` | `derive` | 仅 bin |
+| `flate2` / `tar` | `flate2` 显式 `default-features = false, features = ["rust_backend"]`（miniz_oxide），`tar 0.4` | 仅 bin：`komo update` 解发布包（§13.6）。两者都是纯 Rust（不带 C 工具链），且**不进 gateway / runtime 的图**——它们谁也不更新自己；`rust_backend` 写死是不跟上游默认后端变 |
 | `ratatui` + `crossterm` + `pulldown-cmark` | 仅 komo-client | 在 client 支线上，与 gateway 并行编译 |
 | `syntect` / `two-face`（代码高亮） | 可选，按编译预算实测再定 | 纯 UI 增强，不是需求 |
 | `openlark` | 仅 gateway，feature `feishu`（默认开），`default-features = false, features = ["websocket"]` | 只要 ws 长连接；事件负载用 `register_raw` 拿原始 JSON、自己的宽容 serde 结构解析。带来 `prost 0.13`（turso 同步引擎用 0.14）和一份 `tokio-tungstenite` 重复——接受，不再自己额外引入 tungstenite |
@@ -1658,6 +1661,22 @@ pub trait Clock: Send + Sync {
 - `Wait::Approval { approval, call: Option<ToolCallId>, attempt: Option<AttemptId> }`；`RunEnd::Completed { final_message, rounds }`。
 - `StoreError::{VersionConflict, GrantMismatch}` + `From<StoreError> for RepoError`：store 的事务闭包只有一条错误通道。
 - protocol：`ManualCronRunRequest`、`BoundaryRequest`、`ApprovalListQuery`、`MemoryScope` 的 `Display` / `FromStr`（`personal` | `project:<id>` | `environment:<id>`）、`GET /v1/models` → `ModelsResponse`、`GET /v1/config/check`、`POST /v1/config/reload`、`SseEvent::AssistantDelta`（**只在 SSE 上，永不进 JSONL**；`message.assistant` 仍是一次完整回复）。§13.1 的接口表相应多这三个端点。
+
+### 13.6 安装与升级
+
+发布产物由 `.github/workflows/release.yml` 在 `v*` 标签上构建，四个平台各一个包：`komo-darwin-arm64.tar.gz`、`komo-darwin-amd64.tar.gz`、`komo-linux-amd64.tar.gz`、`komo-linux-arm64.tar.gz`，外加一份共用的 `SHA256SUMS`（`sha256sum` 的默认两列格式）。**包内只有一个成员 `komo`**。linux 包在 Ubuntu 22.04 上原生构建（ring 与 mimalloc 编 C，不走交叉编译），glibc 下限因此是 2.35；darwin 两个架构都在 arm64 runner 上出。
+
+装与升级是同一条约定的两个入口：`install.sh`（仓库根，`curl -fsSL …/main/install.sh | bash`，认平台 → 问 `releases/latest` 或 `KOMO_VERSION` → 下包与 `SHA256SUMS` → `shasum`/`sha256sum` 核对 → `tar -xzf` → 落到 `komo.new` 再 `mv -f`）和 `komo update`（§3，用 Rust 自己走一遍同一套名字与校验，`crates/komo/src/update.rs`）。仓库名、资产名、校验和文件名三处必须一致：那两个文件加这里。
+
+`komo update` 的顺序是**下载 → 校验 sha256 → 解包 → 试跑 `--version` → 同目录 `rename`**。三条不变量：
+
+1. **换上去是最后一步，而且是一次 `rename`**。中途任何一步失败（校验和不对、包坏了、试跑不过），现在装着的那个 komo 一个字节都没动；临时文件与目标同目录，跨文件系统的 rename 会退化成复制。自我更新唯一不可接受的结局不是"没更新成"，是"更新成一个跑不起来的东西"。
+2. **试跑要求新二进制自报的版本就是标签版本**。glibc 太旧、架构不对、包被改过都在这一步挡下来。这条同时把发布流程绑住了：标签与 `[workspace.package].version` 不一致的包会被拒收，所以 `release.yml` 里那个 `guard` 作业是这条不变量的另一半，不是可选项。
+3. **只换磁盘上那份，不碰在跑的进程**。发现文件里核对得上一个在跑的 Gateway 时就打印 `komo gateway restart`，**不替操作者重启**：重启会打断正在跑的 Run 与等在那里的审批，那不该由一条更新命令决定。
+
+只报告，不降级：装着的比最新发布新（源码构建的开发机、或者刚回滚过）时只说一句"发布的比它旧"，什么都不做。
+
+已核实（2026-09-20，本机 macOS arm64）：`install.sh --prefix` 走真实 `v0.0.2` 发布包，核对与安装都通过，包内成员名就是 `komo`；`komo update` 打真实 `api.github.com`，正确判定"发布的比它旧"并停在原地；`update.rs` 的下载 → 校验 → 解包三段用真实 `v0.0.2` 资产生跑过一遍——`SHA256SUMS` 认得、GNU tar 打的包解得出来（50318240 字节，与 `install.sh` 装出来的那份一致），试跑按预期拒收了标签对不上的那个包（`v0.0.2` 的二进制自报 `0.1.0+00b23c6`，正是上面第 2 条要挡的形状）。发布流程自身（四平台构建 + 校验和 + provenance + 发布）要等 v0.8 的第一个 `v*` 标签才会真跑一次。
 
 ## 14. 实现顺序与验收
 

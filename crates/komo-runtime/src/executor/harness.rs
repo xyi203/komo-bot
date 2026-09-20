@@ -13,6 +13,7 @@ use komo_kernel::test_support::{
     MemApprovalRepo, MemLedger, MemOutputStore, TestClock, sample_model,
 };
 use komo_kernel::traits::{Clock, Ledger, Tool};
+use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::{AttemptId, OperationId, RequestKey, RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::{
     ApprovedPlan, ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode, Verification,
@@ -103,6 +104,8 @@ impl Harness {
                 peer: None,
                 model: sample_model(),
                 workdir: None,
+                // 这是一条普通 Run 的输入：不是谁派的子任务。
+                delegate: None,
                 at: self.clock.now(),
             })
             .await
@@ -182,6 +185,15 @@ impl Harness {
         self.env_with_cancel(session, run, CancelToken::new())
     }
 
+    /// 一条**子 Run** 的执行环境：`delegated` 说得出它是被谁派的——深度只有一层这条
+    /// 不变量就靠它强制。
+    pub fn child_env(&self, session: &SessionId, run: &RunId, spec: DelegateSpec) -> CallEnv {
+        CallEnv {
+            delegated: Some(spec),
+            ..self.env(session, run)
+        }
+    }
+
     /// 一个工具在这个 Run 里的上下文。`attempt` 是 `prepare` 那一刻的哨兵——那时候
     /// 一次尝试都还没有。
     pub fn tool_context(&self, session: &SessionId, run: &RunId, call: &ToolCallId) -> ToolContext {
@@ -222,6 +234,9 @@ impl Harness {
             env_version: None,
             principal: None,
             cancel,
+            model: sample_model(),
+            // 测试默认是普通 Run；子 Run 的那条路（`delegated`）由委派的验收自己填。
+            delegated: None,
         }
     }
 }

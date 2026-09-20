@@ -49,6 +49,9 @@ use time::OffsetDateTime;
 pub use consolidate::{Relation, Verdict};
 pub use extract::Transcript;
 pub use extract::{Observation, PROMPT_VERSION, RawObservation, SaidBy};
+// 从子代理最后一条回复里取 JSON 的那一步与提取共用：两边都是"模型回复里那个配平的 JSON
+// 对象"，两套括号处理迟早会有一边少一个分支（`delegate` 的复验在 executor 里）。
+pub(crate) use extract::parse_json_object;
 pub use index::{IndexBuilder, IndexOutcome, MIN_ACTIVATION_COVERAGE};
 pub use preamble::{Injection, MemoryPreamble, render_injection};
 pub use work::{DbMemoryWork, MemoryWorkItem, MemoryWorkLog};

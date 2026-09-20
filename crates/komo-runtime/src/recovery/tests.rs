@@ -275,6 +275,9 @@ impl Ledger for PoisonedLedger {
             .append_audit(session, event_id, payload, at)
             .await
     }
+    async fn run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError> {
+        self.inner.run_end(run).await
+    }
 }
 
 /// 按 attempt 交出一份已经落盘的孤儿 `output.json`。
@@ -370,6 +373,8 @@ impl World {
                 peer: None,
                 model: komo_kernel::test_support::sample_model(),
                 workdir: None,
+                // 这条输入不是委派：它的 Run 没有父。
+                delegate: None,
                 at: NOW,
             })
             .await

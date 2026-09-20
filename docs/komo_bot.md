@@ -140,6 +140,8 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 搜索通过 shell 或 Python 完成；HTTP 请求通过 Python 库或命令完成。Git、构建、测试、HA、网页搜索和记录查询都组合这些基础工具。
 
+**委派（`delegate`）不是第六个工具，是一条编排操作。** 模型可以把一个自包含子任务交给**一条子 Run**：它以 `Operation::Delegate` 进同一个决策入口（§7.1 那一行），执行时在同一个 Session 里受理一条**子 Run**，父 Run 进 `waiting + dependency` 等它——子 Run 用的是同一套五个工具，它自己的每一次调用照常过 Policy 与审批，所以"能不能做"这一层没有被放宽，放宽的只是"这一件事由谁来做"。子代理只拿得到任务本身（不继承父的消息历史、不继承父的上下文），默认 8 轮预算，**深度只有一层**（子 Run 不能再委派）。结果可以带一个契约：子代理把结构化结果放进它最后一条回复，父侧续跑时用**同一份校验器**复验（§8.6）。
+
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、Policy 判断、审批处理、执行状态保存、取消和输出限制。
 
 ```rust
@@ -372,6 +374,7 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 | 自动提取记忆与生成索引                        | 在配置的来源、模型端点和记忆范围内 Allow；推断不能自行升级为用户确认 |
 | Memos 的写入、修改或删除                      | 按 Python 模块版本、函数、参数与用户指令范围审核                     |
 | 权限扩大或修改 Policy                         | 通过操作者配置流程处理，不能由模型自行放宽                           |
+| 委派一个子任务（`Operation::Delegate`）       | 按操作者意图：strict 下 Ask（展示任务正文与结果契约），auto 下 Allow。**子代理自己的每一次调用仍各自按上面各行判断**——委派不放宽任何一层 |
 
 **两套建议，操作者选一套。** 上面那张表落成 `RuleTable::initial()`（"strict"）；另一套是
 `RuleTable::auto()`（"auto"）——**不审批**：一条 `Ask` 都不留，agent 一路跑到底，不打断人。
@@ -489,8 +492,8 @@ Cron、交互聊天与 resume 都经过这一条路径。
 
 三条约束把这个清单钉死：
 
-1. **清单是派生视图，不是第四张表。** 权威仍是 `runs` 与 `approval_requests`；`GET /v1/interventions` 是这两张表的并集查询，`kind` 由"有没有一条 uncertain 调用"当场判出。多一张 `interventions` 表等于多一处会与权威漂移的状态，而这次改造的全部理由就是不要那个（§8.9）。
-2. **挡着会话的每一条都必须在清单里，而且与"后面领不走"是同一次判定。** §8.4 的"未完成"是四个非终态；其中**停在人身上的**（`waiting + approval`、`waiting + intervention`）必须逐条出现，且由同一个谓词回答"这条 Run 现在挡不挡队"——就是 `WaitReason::needs_a_person()` 与那段 `earlier` 子查询。两处判定分家就会出现"卡住但清单为空"。`waiting + retry`（等时钟）与 `waiting + dependency`（等前一条 Run）不进清单：**它们不是在等人**，但仍然挡着同 Session 后面的 Run。
+1. **清单是派生视图，不是第四张表。** 权威仍是 `runs` 与 `approval_requests`；`GET /v1/interventions` 是这两张表的并集查询，`kind` 由"有没有一条 uncertain 调用"当场判出。多一张 `interventions` 表等于多一处会与权威漂移的状态，而这次改造的全部理由就是不要那个（§8.9）。**子代理（§4）的审批因此自动出现在同一张清单里**：子 Run 与它的调用本来就在这两张表里，"谁派的"不是清单该关心的维度——操作者批的是那一次具体的动作。
+2. **挡着会话的每一条都必须在清单里，而且与"后面领不走"是同一次判定。** §8.4 的"未完成"是四个非终态；其中**停在人身上的**（`waiting + approval`、`waiting + intervention`）必须逐条出现，且由同一个谓词回答"这条 Run 现在挡不挡队"——就是 `WaitReason::needs_a_person()` 与那段 `earlier` 子查询。两处判定分家就会出现"卡住但清单为空"。`waiting + retry`（等时钟）与 `waiting + dependency`（等另一条 Run）不进清单：**它们不是在等人**，但仍然挡着同 Session 后面的 Run——唯一的例外是父 Run 正等着它派出去了的那条子 Run，那条必须能跑，否则父子互等（§4）。
 3. **结论只走一条路：核对 → 按 §8.4 行事，没有"我说它发生了"。** `satisfied` 给那次调用补一条"核对后目标已满足"的结果，原 Run 继续；`not_performed` 把那次调用标成"确定没执行"再入队（一次性授权因此按 §7.4 的原范围重放，而不是拿"已消费"当重试许可）；`resolve` 不强行放行，它只要求**重新观察并重新决策**一次；`abandon` 是终态取消。没有"我确认副作用已发生"这种结论——操作者可能看错，账本一旦这么记就再也纠不回来。
 
 出口有四个，语义相同：`komo intervention list | show | answer`、TUI 的待处理清单、聊天里的 `/pending` 与 `/answer`（§11.3）、`GET|POST /v1/interventions`。投递沿用 §11.4 那一条：**没有界面在看这个会话时进 home chat**——那是任务在问，不是在报告（§10）。批量答复不新增一套语义，沿用 §7.2 的"名单由发起方列出"。
@@ -623,7 +626,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 | `approval` | 一份执行计划的答复（§7.4） | 操作者答复；答复仍有效时自动接续 | 是 |
 | `retry` | 一次有界退避到点（`attempts` / `not_before` / `cause`） | 时钟：`wake_at <= now` | 否——不是在等人 |
 | `intervention` | 一条 Intervention 的答复（§7.5：结果不明、前提没了） | 操作者答复 | 是 |
-| `dependency` | 同 Session 里**更早**的那条 Run 进终态（本节的次序规则） | 前一条进终态，reconcile 把它放回 `queued` | 否——不是在等人 |
+| `dependency` | **另一条 Run** 进终态：同 Session 里更早的那条输入（本节的次序规则），或者是它派出去的那条子 Run（§4 的委派） | 那条 Run 进终态，reconcile 把它放回 `queued` | 否——不是在等人 |
 
 **退避只用于可以安全重试的失败**：限流、连不上、5xx、本地写争用，`RetryCause` 把它们分得开（`RateLimited` 要尊重服务端给的 `Retry-After`，`Contended` 退几毫秒就够——混成一个数字就只能取最保守值，每次 429 都白等）。工具那一侧"结果不明"**不能**用它：那是副作用有没有发生都不知道，必须进 `intervention` 让人核对（§8.6）。两者混起来就是"重试成功"掩盖掉那个窗口，正是 §8.6 要禁止的事。
 
@@ -643,7 +646,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 | `waiting + approval` | 保留原请求；已答复且仍有效的批准自动接续 |
 | `waiting + retry` | 沿用已保存的次数与到点时刻，到点再尝试 |
 | `waiting + intervention` | **原样保留**：它是清单里的一条，等操作者答复——恢复扫描不替人答，也不偷偷往下跑 |
-| `waiting + dependency` | 原样保留；谁放它出来由 reconcile 判（前一条进终态 → 回 `queued`） |
+| `waiting + dependency` | 原样保留；谁放它出来由 reconcile 判（它等的那条 Run 进终态 → 回 `queued`） |
 | 已保存最终结果，但客户端没有收到 | 补发或补读原结果，不重新执行任务 |
 | 四个终态 | 保持终态，不因重启自动开启新一轮 |
 | Session 在 `closing` / `deleted`，Run 还没跑完 | 照跑或停在等待，但不新开；`--now` 的逻辑删除已把它们各写一条明确的取消（§8.10） |
@@ -760,6 +763,8 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 | 无可靠恢复方式   | 停在 `waiting + intervention`；不自动从头执行整个脚本                    |
 
 文件 write / edit 可记录修改前后内容哈希与目标身份。若恢复时目标已是预期内容，则记录“核对后目标已满足”；仍是原内容且其他前提成立，可重新执行同一原子修改；出现第三种内容则视为冲突。不能把文件已存在当作写入成功，也不能编造丢失的 stdout 或原始返回值。
+
+**委派用"可以核对目标状态"那一行，而它的核对对象是我们自己的账本。** 一条 `delegate` 调用的结果不在别处，就在它派出去的那条子 Run 的终态里（`Ledger::run_end`）：子 Run 正常结束 → 那次调用按已完成收尾，结果交给父 Run（有契约时按**父侧计划里那份**契约复验，与子代理自己用的是同一份校验器）；子 Run 失败 / 取消 / 放弃 → 按失败收尾，理由里写明它怎么结束的；子 Run 还没有终态 → 继续等。**这里不会出现"结果不明"**：副作用发生过没有，是我们账本里的一条事实，不是对外部世界的猜测——那张表把这种情形与"任意 shell 命令"分开的用意正在于此。子 Run 自己是普通 Run，它的恢复照 §8.4 逐行走。
 
 已保存的 Python 模块可提供与版本绑定的核对函数，由执行器通过同一 python 执行机制调用；核对本身仍经过 Policy。它不增加第六个模型工具。代码、依赖、参数以及核对逻辑都必须对应已审核的执行计划，模块自称幂等不构成证明。
 
@@ -1661,6 +1666,7 @@ pub trait Clock: Send + Sync {
 - `Wait::Approval { approval, call: Option<ToolCallId>, attempt: Option<AttemptId> }`；`RunEnd::Completed { final_message, rounds }`。
 - `StoreError::{VersionConflict, GrantMismatch}` + `From<StoreError> for RepoError`：store 的事务闭包只有一条错误通道。
 - protocol：`ManualCronRunRequest`、`BoundaryRequest`、`ApprovalListQuery`、`MemoryScope` 的 `Display` / `FromStr`（`personal` | `project:<id>` | `environment:<id>`）、`GET /v1/models` → `ModelsResponse`、`GET /v1/config/check`、`POST /v1/config/reload`、`SseEvent::AssistantDelta`（**只在 SSE 上，永不进 JSONL**；`message.assistant` 仍是一次完整回复）。§13.1 的接口表相应多这三个端点。
+- `Ledger::run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError>`：一条 Run 的终态（只读，不带消息历史）。委派的核对走它（§4、§8.6）——父 Run 续跑时用它把那次 `delegate` 调用收尾，而不是去翻会话的整段事件；"子 Run 结束了没有、怎么结束的"是调度层要知道的一件事，不该逼它自己做一遍 fold。
 
 ### 13.6 安装与升级
 
@@ -1756,3 +1762,5 @@ Memory 与模型验收覆盖：
 | 飞书卡片 2.0 支持哪些组件 | §11.3 卡片渲染 | **已核实（2026-09-18，官方不兼容变更 + 线上报文）：2.0 不再支持 `note` 组件与 `action` 模块**，且 2.0 对不认识的组件是**整张卡打回**而不是忽略。线上表现：每一个审批请求都被拒（`http 400 / code 230099`，`ErrCode 200861 unsupported tag note`），**审批一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上——审批的主入口（§11.3）整个是死的，操作者只看得到"等待审批"的 Run。替代写法已按官方给的来：备注 = 普通文本组件 + `notation` 字号 + 灰色；按钮行 = `column_set` 每列一个 button，那一块带固定 `element_id` 供决定后整块摘掉 |
 | reconcile 一拍的真实成本（目标：1 万 Run / 1 千 Session）与它该排在哪个周期 | §8.9 的周期兜底 | 从 `AUDIT_TICK` 那一拍拆出来，按更粗的间隔跑（例如 5 分钟），或只对"启动后还没对过账的那些"跑；启动时那一次无论如何都要跑 |
 | `sessions.state` 之外是否还需要一个"回收进行中"的中间态 | §8.10 的 `purge` | 当前设计靠"墓碑先落、内容后删"取得幂等，不需要第四个状态；若实测发现"内容删到一半"无法与"内容被外部删掉"区分，再补一个状态列值（仍是加列/加值，不改 schema 形状） |
+| **既有的 state.db 能不能加上新列**（§8.2 那句"schema 变化只增不改、`ensure_schema` 连上时补列"） | 升级路径：任何一个加了列的新版本在旧库上都起不来 | **已实测（2026-09-20，委派那两列 `runs.parent_run_id` / `runs.delegate`，本机 macOS + 真实 Turso MVCC 库）：补列会静默丢掉。** 现象：旧二进制建的库 → 新二进制启动 → 日志有 `补一列 table="runs" column="parent_run_id"` 两条 → 但同进程随后的每一条用到该列的语句都报 `Parse error: no such column: parent_run_id`（领取 SQL、待处理清单、对账、建会话全中），**重启也没用**；与此同时把 `state.db` 单独复制出来、由另一个进程打开时，同一段 `ensure_schema` 又能"补上"并打印出带新列的 DDL（所以库里没有落盘、那个进程看到的只是自己那份视图）。**新装的库完全正常**（真机端到端委派已验证），坏的只有"旧库 + 新列"这一条路。待办：查 Turso MVCC 下 DDL 的持久化语义（是否必须走非 MVCC 连接 / 是否要升级 turso），再决定补列是改成"用原始连接迁移"还是"表重建"。 |
+| 模型一轮里提了两个调用、其中一个没有结果时，会话后面的新 Run 会不会被毒住 | §8.3 回放窗口 | **已实测（2026-09-20，真实 provider）：会。** 旧二进制下模型一轮提了两个调用，一个被拒/没执行，那条 `message.assistant` 留在会话里；其后**同一会话的每一条新 Run** 首个模型请求都被 provider 400 拒（`No tool output found for tool call call_00_…`），且会连着重试。本次改动里"回放窗口按 Run 过滤"（`service/segment.rs` 的 `window(surface, Some(run))`）恰好挡住它——新 Run 只看得见自己那条输入，不再被别人的半轮毒住。**待办**：给这条补一个回归测试，并想清楚"同一个 Run 自己半轮里未执行的调用"是否还有别的漏法。 |

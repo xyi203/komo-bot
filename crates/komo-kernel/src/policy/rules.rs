@@ -46,6 +46,7 @@ pub enum OperationMatch {
     PythonEnvChange,
     MemoryChange,
     PolicyChange,
+    Delegate,
 }
 
 impl OperationMatch {
@@ -60,6 +61,7 @@ impl OperationMatch {
             Operation::PythonEnvChange => OperationMatch::PythonEnvChange,
             Operation::MemoryChange => OperationMatch::MemoryChange,
             Operation::PolicyChange => OperationMatch::PolicyChange,
+            Operation::Delegate { .. } => OperationMatch::Delegate,
         }
     }
 }

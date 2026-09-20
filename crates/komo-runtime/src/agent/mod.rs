@@ -353,6 +353,19 @@ impl AgentLoop {
                 self.ledger.suspend(run, wait.clone()).await?;
                 Ok(SegmentOutcome::Suspended { wait, rounds })
             }
+            // 委派：父 Run 让出执行名额，去等**自己派出去的那条子 Run**（§8.4 的
+            // `dependency`）。它同样**不是"等人"**——没有任何人要回答什么——所以不进
+            // Intervention 清单；子 Run 一进终态，父 Run 回 `Queued` 重新入队。
+            //
+            // 自由文本的理由在这里也没有地方可放（`WaitReason::Dependency` 只有句柄），
+            // 而"父这一次调用为什么在等"本来就由账本答得出：那条 delegate 调用的计划
+            // 里写着子 Run 是谁，`tool.started` 写着它已经被派出去、还没有结果。
+            RoundStop::Dependency { run: child, .. } => {
+                tracing::info!(run = %run, child = %child, "等子 Run 的终态，让出执行名额");
+                let wait = WaitReason::Dependency { run: child };
+                self.ledger.suspend(run, wait.clone()).await?;
+                Ok(SegmentOutcome::Suspended { wait, rounds })
+            }
             RoundStop::Cancelled => self.cancel(run, rounds).await,
         }
     }

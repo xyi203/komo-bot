@@ -20,6 +20,12 @@
 //! 流式输出的写入器由 `ToolOutputStore::begin` 开、**借给** `Tool::execute`、返回后
 //! 在这里 `publish`。所有权不下放，因为"先持久化输出、再追加 `tool.result`"是 §8.5
 //! 的一步，而工具不知道这一步存在。
+//!
+//! **委派不走这条流水线的后半段**（§4）。`Operation::Delegate` 在核对梯子之前就被分流：
+//! 它照样过 Policy 与审批（要审的是"允不允许把这件事派出去"），但放行之后做的事是**受理
+//! 一条子 Run**、`start_call`、然后停在 `dependency` 上——没有 `execute`、没有输出发布、
+//! 也没有这一轮的 `finish_call`。父子两端由**账本**接起来：子 Run 一进终态，父侧那次调用
+//! 的结果就是它的终态（§8.6「可以核对目标状态」）。
 
 pub mod cancel;
 #[cfg(test)]
@@ -37,18 +43,23 @@ use komo_kernel::traits::{
     Clock, Ledger, LedgerError, RepoError, StoreError, Tool, ToolOutputStore,
 };
 use komo_kernel::types::chat::Principal;
-use komo_kernel::types::ids::{ApprovalId, AttemptId, RunId, SessionId, ToolCallId};
+use komo_kernel::types::delegate::{
+    DelegateContract, DelegateSpec, SchemaMode, Validation, validate,
+};
+use komo_kernel::types::ids::{ApprovalId, AttemptId, RequestKey, RunId, SessionId, ToolCallId};
+use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::{
-    ApprovedPlan, ConsumeIntent, EnvVersion, ExecutionPlan, PlanSource, RecoveryMode, Verification,
+    ApprovedPlan, ConsumeIntent, EnvVersion, ExecutionPlan, Operation, PlanSource, RecoveryMode,
+    Verification,
 };
 use komo_kernel::types::refs::{
     AttemptRef, PREVIEW_LIMIT_BYTES, PublishedOutput, ToolResultBody, ToolResultStatus,
 };
-use komo_kernel::types::status::ToolCallState;
+use komo_kernel::types::status::{RunEnd, ToolCallState};
 use komo_kernel::types::tool::{
     CancelToken, ResumedCall, ToolContext, ToolError, ToolOutput, WorkspaceRoot,
 };
-use komo_kernel::types::turn::{GrantUse, ToolResultForModel};
+use komo_kernel::types::turn::{AcceptInput, Accepted, GrantUse, ToolResultForModel};
 
 use crate::approvals::{ApprovalGate, ApprovalOutcome, ApprovalRequest};
 use crate::policy::{DecisionEnv, PolicyEngine, grants_for};
@@ -120,6 +131,15 @@ pub struct CallEnv {
     pub env_version: Option<EnvVersion>,
     pub principal: Option<Principal>,
     pub cancel: CancelToken,
+    /// 本次 Run 固定的模型快照。委派受理子 Run 时要它：子代理不是另一个模型角色，
+    /// 只是同一个模型上的一条新 Run，而 `run.accepted` 必须带上这次 Run 用的是什么。
+    pub model: ModelConfig,
+    /// **本 Run 是被谁派的**——子 Run 才有，普通 Run 是 `None`。
+    ///
+    /// 由调用方从 fold 的 `RunView.delegate` 填。它在这里是为了让"深度只有一层"是一条
+    /// **能被强制的**不变量：只把 `delegate` 从子代理的工具表里摘掉是 UX，模型自己拼出
+    /// 这个名字就绕过去了，而能被绕过的约束等于没有。
+    pub delegated: Option<DelegateSpec>,
 }
 
 /// 这一轮为什么没跑完。
@@ -132,6 +152,11 @@ pub enum RoundStop {
     },
     /// 需要操作者判断：结果不明、核对不出结论、或者没有可靠恢复方式（§8.6）。
     Attention { reason: String, call: ToolCallId },
+    /// 在等**自己派出去的那条子 Run** 的终态（§8.4 的 `dependency`）。
+    ///
+    /// 它不是"等人"——没有任何人要回答什么——但父 Run 同样不能再跑：子代理的结果就是
+    /// 这次调用的结果，没有它就没法继续。
+    Dependency { run: RunId, call: ToolCallId },
     /// 用户取消。
     Cancelled,
 }
@@ -326,6 +351,15 @@ impl ToolExecutor {
             },
         };
 
+        // 委派不走"工具执行"那条路，也**不走核对梯子**：对一次 delegate 调用来说，
+        // "started 而无结果"的正常含义是"子 Run 还在跑"，不是"结果不明"——它的结果在
+        // 我们自己的账本里（子 Run 的终态），所以 §8.6 的核对在这里有确定答案。
+        if let Operation::Delegate { spec } = &plan.operation {
+            return self
+                .delegate(&request, env, &plan, spec, request.resumed.clone())
+                .await;
+        }
+
         // §8.4 第 6 / 7 行、§8.6：先判断是否发生，再决定是否重试。
         let mut resumed = request.resumed.clone();
         if let Some(state) = resumed.as_mut()
@@ -497,6 +531,177 @@ impl ToolExecutor {
         }
     }
 
+    /// 一次委派的编排（§4、§8.4 的 `dependency`）。
+    ///
+    /// 它不走"工具执行"那条路，理由不是省事：**父这一次调用什么时候收尾，不由工具决定**。
+    /// 子 Run 是账本里一条普通 Run——它可能被领取、被审批、被重启恢复，可能过了很久才结束
+    /// ——父侧手里唯一那份能对上的东西是随计划进了审批绑定对象的那份 [`DelegateSpec`]，
+    /// 而不是一个还活着的函数调用。
+    ///
+    /// 两条分支由**账本**分（`resumed` 的形状），不是由时间分：
+    ///
+    /// - 还没 `start_call`（首次执行，或者"受理了但还没 start 就崩了"的续跑）：先过
+    ///   Policy 与审批，再受理子 Run，再 `start_call`，然后停在 `dependency` 上。
+    ///   **先受理后 start 是刻意的**：受理按 `request_key` 幂等，所以"受理了但还没 start
+    ///   就崩了"的续跑重走一遍拿回的是同一条子 Run，不会多派一条。
+    /// - 已经 `start_call`（这次只是回来收口）：同一个键再受理一次（幂等，拿回同一条），
+    ///   然后读它的终态。终态还没来就**再等一次**，不是失败。
+    async fn delegate(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        plan: &ExecutionPlan,
+        spec: &DelegateSpec,
+        resumed: Option<ResumedCall>,
+    ) -> Result<CallSettlement, ExecError> {
+        // 深度只有一层。这条守卫在**编排里**而不是在工具表里：把 `delegate` 从子代理的
+        // 工具表摘掉是 UX，模型自己拼出这个名字就绕过去了，而能被绕过的约束等于没有。
+        if let Some(parent_of_this_run) = &env.delegated {
+            return Ok(CallSettlement::Result(error_result(
+                request,
+                format!(
+                    "子代理不能再委派：深度只有一层。你已经是被 {} 派出来跑这件事的，\
+                     把完整的任务做完或说明做不到，而不是再派一条子 Run。",
+                    parent_of_this_run.parent
+                ),
+            )));
+        }
+
+        // 已经派出去过 = 上一世 `start_call` 过。`Planned` 那种"确定没跑过"的形状与之
+        // 相反：它说的是"子 Run 可能还没被受理"，所以它走下面的首次路径，再受理一次。
+        let in_flight = resumed
+            .as_ref()
+            .is_some_and(|state| !state.is_known_not_to_have_run());
+
+        if in_flight {
+            let child = self.accept_child(env, spec).await?.run;
+            return self
+                .collect_child(request, env, spec, resumed.as_ref(), &child)
+                .await;
+        }
+
+        // "允不允许把这件事派出去"要过 Policy 与审批（§7.1）。放行在受理**之前**：
+        // 没放行的委派不该在账本里留下一条没人认领的子 Run。
+        let intent = if resumed
+            .as_ref()
+            .is_some_and(ResumedCall::is_known_not_to_have_run)
+        {
+            ConsumeIntent::KnownNotToHaveRun
+        } else {
+            ConsumeIntent::First
+        };
+        let grant = match self.authorize(request, plan, env, intent).await? {
+            Authorization::Proceed { grant, .. } => grant,
+            Authorization::Refused(message) => {
+                return Ok(CallSettlement::Result(error_result(request, message)));
+            }
+            Authorization::Waiting(approval) => {
+                return Ok(CallSettlement::Stopped {
+                    stop: RoundStop::Approval {
+                        approval,
+                        call: request.call.clone(),
+                    },
+                    result: None,
+                });
+            }
+        };
+
+        let child = self.accept_child(env, spec).await?.run;
+        // `tool.started` 之后子 Run 才可能被领取：它就是这次外派副作用的起点。
+        self.ledger.start_call(&request.call, plan, grant).await?;
+        Ok(CallSettlement::Stopped {
+            stop: RoundStop::Dependency {
+                run: child,
+                call: request.call.clone(),
+            },
+            // 这次调用**没有结果**：它在等子 Run。空结果也不是结果。
+            result: None,
+        })
+    }
+
+    /// 受理子 Run。幂等键由**父 Run + 承载它的那次调用**决定，所以同一件委派重复受理
+    /// 拿回的是同一条 Run（§8.5：受理按 `request_key` 幂等）。
+    async fn accept_child(
+        &self,
+        env: &CallEnv,
+        spec: &DelegateSpec,
+    ) -> Result<Accepted, ExecError> {
+        let accepted = self
+            .ledger
+            .accept_input(AcceptInput {
+                session: env.session.clone(),
+                request_key: RequestKey::new(format!("delegate:{}:{}", env.run, spec.call)),
+                text: spec.task.clone(),
+                // 子代理用的是**父 Run 的 source**：它不是一条新的来源，只是这次委派的
+                // 延续，所以不新增 `PlanSource` 变体。它自己的每次调用照常过 Policy。
+                source: env.source.clone(),
+                peer: None,
+                // 同一个模型快照：子代理不是另一个模型角色。
+                model: env.model.clone(),
+                workdir: None,
+                delegate: Some(spec.clone()),
+                at: self.clock.now(),
+            })
+            .await?;
+        Ok(accepted)
+    }
+
+    /// 子 Run 的终态回到父侧那次调用上。
+    ///
+    /// 这是 §8.6 里"可以核对目标状态"的那一类：结果不在别人的接口上，就在我们自己的账本
+    /// 里，所以"结果不明"在这里没有位置——要么子 Run 结束了，要么它还在跑。后者**再等
+    /// 一次**：它可能正停在一条审批上，也可能刚被别的执行实例领走。
+    async fn collect_child(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        spec: &DelegateSpec,
+        resumed: Option<&ResumedCall>,
+        child: &RunId,
+    ) -> Result<CallSettlement, ExecError> {
+        let Some(end) = self.ledger.run_end(child).await? else {
+            return Ok(CallSettlement::Stopped {
+                stop: RoundStop::Dependency {
+                    run: child.clone(),
+                    call: request.call.clone(),
+                },
+                result: None,
+            });
+        };
+
+        // 结果落回**上一世那次尝试**：父调用已经 `start_call` 过，账本里那条 `tool.started`
+        // 不能永远悬着。没有它的唯一可能是账本自相矛盾——那要人看，不编一个 attempt 出来。
+        let Some(attempt) = resumed.and_then(|state| state.previous_attempt.clone()) else {
+            return Ok(self.attention(
+                request,
+                format!(
+                    "委派调用 {} 已经派出去（子 Run {child}），但账上没有承载它的那次尝试",
+                    request.call
+                ),
+            ));
+        };
+
+        let (body, content) = child_result(spec, child, &end);
+        let is_error = body.status != ToolResultStatus::Completed;
+        self.settle_attempt(
+            AttemptRef {
+                session: env.session.clone(),
+                run: env.run.clone(),
+                call: request.call.clone(),
+                attempt,
+            },
+            body,
+            &content,
+        )
+        .await?;
+        Ok(CallSettlement::Result(ToolResultForModel {
+            provider_call_id: request.provider_call_id.clone(),
+            call_id: request.call.clone(),
+            content,
+            is_error,
+        }))
+    }
+
     /// §7.5：**操作者**对一次「结果不明」的调用下的结论，落到那次尝试上。
     ///
     /// 与 [`Self::settle_verified`] 是同一个动作（给那次尝试写一条 `tool.result`），
@@ -524,7 +729,6 @@ impl ToolExecutor {
         };
         let summary = verdict.summary();
         let status = verdict.status();
-        let writer = self.outputs.begin(&attempt_ref).await?;
         let body = ToolResultBody {
             status,
             result: serde_json::to_value(&verdict).unwrap_or(serde_json::Value::Null),
@@ -532,10 +736,7 @@ impl ToolExecutor {
             exit_code: None,
             artifacts: vec![],
         };
-        let mut published = self.outputs.publish(writer, body).await?;
-        // `elapsed_ms` 留 0：那次尝试跑了多久**我们不知道**，0 读作未知而不是"瞬间"。
-        published.preview = Some(truncate(&summary, PREVIEW_LIMIT_BYTES));
-        self.ledger.finish_call(attempt, published).await?;
+        self.settle_attempt(attempt_ref, body, &summary).await?;
         Ok(status)
     }
 
@@ -565,7 +766,6 @@ impl ToolExecutor {
             call: request.call.clone(),
             attempt: previous.clone(),
         };
-        let writer = self.outputs.begin(&attempt_ref).await?;
         let body = ToolResultBody {
             status,
             result: serde_json::to_value(verdict).unwrap_or(serde_json::Value::Null),
@@ -573,10 +773,27 @@ impl ToolExecutor {
             exit_code: None,
             artifacts: vec![],
         };
+        self.settle_attempt(attempt_ref, body, summary).await
+    }
+
+    /// 把一条结果落到**指定的那次尝试**上：发布输出 → 追加 `tool.result`。
+    ///
+    /// 三条路共用它，因为它们做的是同一件事——给某一世的尝试写下结论：工具自带核对函数的
+    /// 结论（§8.6）、操作者在清单上按的键（§7.5）、子 Run 的终态回到父侧那次调用上（§4）。
+    ///
+    /// `elapsed_ms` 一律留 0：那次跑了多久**我们不知道**，0 读作未知而不是"瞬间"。
+    async fn settle_attempt(
+        &self,
+        attempt_ref: AttemptRef,
+        body: ToolResultBody,
+        summary: &str,
+    ) -> Result<(), ExecError> {
+        let writer = self.outputs.begin(&attempt_ref).await?;
         let mut published = self.outputs.publish(writer, body).await?;
-        // `elapsed_ms` 留 0：那次尝试跑了多久**我们不知道**，0 读作未知而不是"瞬间"。
         published.preview = Some(truncate(summary, PREVIEW_LIMIT_BYTES));
-        self.ledger.finish_call(previous, published).await?;
+        self.ledger
+            .finish_call(&attempt_ref.attempt, published)
+            .await?;
         Ok(())
     }
 
@@ -845,6 +1062,175 @@ fn error_result(request: &CallRequest, message: String) -> ToolResultForModel {
         content: message,
         is_error: true,
     }
+}
+
+/// 子 Run 的终态折算成父侧那次调用的结果。
+///
+/// 三条结论都要带上"哪条子 Run、它怎么结束的"：父侧的模型只看得见这条工具结果，而它随时
+/// 可以去 `read` 那条 Run 的完整过程——**复验用的是父侧手里那份契约，过程由只读接口去取**
+/// （§8.6）。
+fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> (ToolResultBody, String) {
+    match end {
+        RunEnd::Completed { final_message, .. } => {
+            let text = final_message.as_deref().unwrap_or_default();
+            match &spec.contract {
+                // 没有契约：子代理的最后一条回复就是结果，父侧只能自己读。
+                None => {
+                    let mut result = outcome_map(child, end);
+                    result.insert("final_message".into(), serde_json::json!(text));
+                    (
+                        completed_body(result),
+                        format!("子 Run {child} 已完成。它的最后一条回复：\n{text}"),
+                    )
+                }
+                Some(contract) => contract_result(contract, child, end, text),
+            }
+        }
+        RunEnd::Failed { reason } => failed_result(
+            format!("子 Run {child} 失败了：{reason}"),
+            child,
+            end,
+            serde_json::json!({ "reason": reason }),
+        ),
+        RunEnd::Cancelled { by } => failed_result(
+            format!("子 Run {child} 被取消，这次委派不会有结果"),
+            child,
+            end,
+            serde_json::json!({ "by": by }),
+        ),
+        // 放弃与取消分开记：它不是"用户不想跑了"，而是"这件事不会再有下文了"，理由里
+        // 要把这个区别说出来，否则父侧的模型只能看到一句没头没尾的失败。
+        RunEnd::Abandoned { by, reason } => failed_result(
+            format!(
+                "子 Run {child} 被放弃，这次委派不会有结果{}",
+                reason
+                    .as_ref()
+                    .map(|reason| format!("：{reason}"))
+                    .unwrap_or_default()
+            ),
+            child,
+            end,
+            serde_json::json!({ "by": by, "reason": reason }),
+        ),
+    }
+}
+
+/// 有契约时：从**最后一条回复**里取 JSON，用 kernel 那个父子共用的校验器验一遍。
+fn contract_result(
+    contract: &DelegateContract,
+    child: &RunId,
+    end: &RunEnd,
+    text: &str,
+) -> (ToolResultBody, String) {
+    match check_contract(contract, text) {
+        Ok((value, validation)) => {
+            let mut result = outcome_map(child, end);
+            result.insert("result".into(), value.clone());
+            result.insert("final_message".into(), serde_json::json!(text));
+            let mut content = format!("子 Run {child} 已完成，结果符合契约：{value}");
+            if !validation.ignored.is_empty() {
+                // 认得但不检查的关键字要说出来：看见 `oneOf` 就当"已校验"是在撒谎，
+                // 而撒谎的校验器比没有校验器更坏。
+                result.insert(
+                    "schema_ignored".into(),
+                    serde_json::json!(validation.ignored),
+                );
+                content.push_str(&format!(
+                    "（这些关键字没有检查，别把它们当成已经过关：{}）",
+                    validation.ignored.join("、")
+                ));
+            }
+            (completed_body(result), content)
+        }
+        Err(report) => match contract.mode {
+            // permissive：不合规也把结果交给父侧，但**标记出来**——父侧要能把"子代理按
+            // 契约给了"和"我们放行了不合规的东西"分开。
+            SchemaMode::Permissive => {
+                let mut result = outcome_map(child, end);
+                result.insert("result".into(), serde_json::Value::Null);
+                result.insert("final_message".into(), serde_json::json!(text));
+                result.insert("schema_overridden".into(), serde_json::json!(true));
+                result.insert("contract_report".into(), serde_json::json!(report));
+                (
+                    completed_body(result),
+                    format!(
+                        "子 Run {child} 已完成，但结果不符合契约（permissive 放行，未按契约交付）：\
+                         {report}。它的最后一条回复：\n{text}"
+                    ),
+                )
+            }
+            // strict：这次委派就是失败的。原因写全，父侧要能决定"要不要用别的方式再试"。
+            SchemaMode::Strict => failed_result(
+                format!("子 Run {child} 的结果不符合契约（strict）：{report}"),
+                child,
+                end,
+                serde_json::json!({ "final_message": text, "contract_report": report }),
+            ),
+        },
+    }
+}
+
+/// 从子代理的最后一条回复里取 JSON 并按契约验一遍。
+///
+/// 校验器来自 kernel，**父子共用同一份代码**（§8.6）：两份实现会漂移，漂移的症状是
+/// "子代理说成功、父侧说结果不合规"，而判断只能有一个出处。取 JSON 那一步与记忆提取
+/// 共用（两边都容忍围栏与前后闲话），理由相同。
+fn check_contract(
+    contract: &DelegateContract,
+    text: &str,
+) -> Result<(serde_json::Value, Validation), String> {
+    let Some(json) = crate::memory::parse_json_object(text) else {
+        return Err("最后一条回复里找不到 JSON 对象".into());
+    };
+    let value: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("最后一条回复里的 JSON 解不开：{error}"))?;
+    let validation = validate(contract, &value);
+    if validation.is_valid() {
+        Ok((value, validation))
+    } else {
+        Err(validation.describe())
+    }
+}
+
+/// 每条结果正文都带的两格：哪条子 Run、它以什么终态结束。
+fn outcome_map(child: &RunId, end: &RunEnd) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    map.insert("run".into(), serde_json::json!(child));
+    map.insert("status".into(), serde_json::json!(end.state().as_str()));
+    map
+}
+
+fn completed_body(result: serde_json::Map<String, serde_json::Value>) -> ToolResultBody {
+    ToolResultBody {
+        status: ToolResultStatus::Completed,
+        result: serde_json::Value::Object(result),
+        error: None,
+        exit_code: None,
+        artifacts: vec![],
+    }
+}
+
+/// 子 Run 没跑成：父侧那次调用跟着失败，理由里写明**子 Run 怎么结束的**。
+fn failed_result(
+    summary: String,
+    child: &RunId,
+    end: &RunEnd,
+    extra: serde_json::Value,
+) -> (ToolResultBody, String) {
+    let mut result = outcome_map(child, end);
+    if let serde_json::Value::Object(extra) = extra {
+        result.extend(extra);
+    }
+    (
+        ToolResultBody {
+            status: ToolResultStatus::Failed,
+            result: serde_json::Value::Object(result),
+            error: Some(summary.clone()),
+            exit_code: None,
+            artifacts: vec![],
+        },
+        summary,
+    )
 }
 
 /// 这个调用现在处在哪个状态——给恢复流程组装 [`ResumedCall`] 用。

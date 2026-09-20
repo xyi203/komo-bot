@@ -169,6 +169,56 @@ async fn an_ask_suspends_the_run_instead_of_waiting_in_process() {
     assert_eq!(pending[0].plan.tool, "shell");
 }
 
+/// 委派：父 Run 停在 `dependency` 上**让出执行名额**，不在进程里等子 Run。
+///
+/// 它和"等审批"是同一件事的两种外因：停下来的形状都是 `waiting` + 一条 `WaitReason`，
+/// 而"在等谁"由理由说清楚——这里等的是那条子 Run 的终态，没有任何人要回答什么。
+#[tokio::test]
+async fn a_delegated_call_suspends_the_run_on_its_child() {
+    let wired = Wired::new(
+        vec![vec![round(
+            1,
+            None,
+            vec![call(
+                "pc-1",
+                "delegate",
+                serde_json::json!({ "task": "去查一下这个接口的超时" }),
+            )],
+        )]],
+        vec![Arc::new(crate::tools::DelegateTool::new())],
+        true,
+    );
+    let segment = wired.segment(CancelToken::new()).await;
+    let parent = segment.run.clone();
+    let outcome = wired.agent.run(segment).await.unwrap();
+
+    let SegmentOutcome::Suspended {
+        wait: WaitReason::Dependency { run: child },
+        ..
+    } = &outcome
+    else {
+        panic!("{outcome:?}")
+    };
+
+    let surface = surface(&wired.harness);
+    let view = &surface.runs[&parent];
+    assert_eq!(view.status, RunState::Waiting, "停着，不占执行名额");
+    assert_eq!(
+        view.wait,
+        Some(WaitReason::Dependency { run: child.clone() })
+    );
+    // 子 Run 是一条**普通 Run**：它已经在队列里等 worker，可领取、可审批、可取消，
+    // 而且带着那份 spec。
+    let child_view = &surface.runs[child];
+    assert_eq!(child_view.status, RunState::Queued);
+    assert_eq!(
+        child_view.delegate.as_ref().map(|spec| &spec.parent),
+        Some(&parent)
+    );
+    // 父这一次调用还没有结果：结果就是子 Run 的终态，它还没到。
+    assert!(surface.calls.values().all(|call| call.output.is_none()));
+}
+
 /// ⑧ 工具失败作为结果回给模型，模型继续；Run 正常结束。
 #[tokio::test]
 async fn a_tool_failure_is_handed_to_the_model_and_the_run_carries_on() {

@@ -545,14 +545,19 @@ pub fn python_env(
     python
 }
 
-/// 五个基础工具（§4）。`python` 要有一个跑得起来的解释器才挂。
+/// 工具名。**两处共用它**：注册（[`build_tools`]）与"子代理不再拿到它"（`segment` 里摘掉
+/// 的那一个，§4 的深度只有一层）。写在注册点旁边，另有一处测试钉住它与
+/// [`DelegateTool`] 自报的名字一致——两处各写一个字面量迟早会漂。
+pub const DELEGATE_TOOL: &str = "delegate";
+
+/// 五个基础工具（§4）与那条编排操作。`python` 要有一个跑得起来的解释器才挂。
 async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
     db: &komo_store::Db,
     clock: Arc<dyn Clock>,
 ) -> Vec<Arc<dyn Tool>> {
-    use komo_runtime::tools::{EditTool, ReadTool, ShellTool, WriteTool};
+    use komo_runtime::tools::{DelegateTool, EditTool, ReadTool, ShellTool, WriteTool};
 
     let snapshot = config.current();
     let registry = Arc::new(komo_runtime::recovery::ChildRegistry::new(
@@ -568,6 +573,10 @@ async fn build_tools(
         Arc::new(WriteTool::new()),
         Arc::new(EditTool::new()),
         Arc::new(ShellTool::new().registered(registration.clone())),
+        // 委派是**编排**，不是第六个基础能力（§4）：子代理用的是同一套五个工具，它自己的
+        // 每一次调用照常过 Policy 与审批。运行到它的那一步由 executor 接手（建子 Run、
+        // 让本 Run 等它），工具本身没有 execute。
+        Arc::new(DelegateTool::new()),
     ];
 
     let toolbox = toolbox_of(&config.current());

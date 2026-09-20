@@ -63,6 +63,7 @@ pub fn conversation() -> Vec<Event> {
                 peer: None,
                 model: Some("chat-a".into()),
                 effort: Some(EffortSetting::Explicit(Effort::new("high"))),
+                delegate: None,
             }),
         ),
         event(

@@ -39,6 +39,15 @@ use crate::repos::runs::{nearest_unfinished_predecessor, state_of, state_str};
 /// "目录被手工 `rm -rf`、Run 还留在队列里"会被照常领走并按空上下文执行；reconcile 负责
 /// 把这种情况说清楚，这条守卫负责让它不发生。领取守卫只看会话，**不看内容**：目录缺失由
 /// reconcile 观察出来并停成 `blocked`，不在这里猜。
+///
+/// **委派的父子是次序守卫唯一的例外**（§8.4 的 `dependency`）：拦住的那条 Run 恰好是
+/// 这条的父、且父正**等着它**（`waiting + dependency`，`wait_ref` 指回来）时放行。
+///
+/// 为什么必须有这一条：子 Run 以输入序排在父后面，父此刻要停下来等子的结果——两条都在
+/// 库里不动就是死锁（父等子、子等父），而这不是罕见形状，是**每一次委派**。为什么只放行
+/// 这一种形状（五个条件缺一不可）：父还在跑、或者父等的是别的东西的时候，子提前跑就等于
+/// 越过了父停住的那个半轮——回放窗口会带着一个没有输出的 `function_call` 去问模型
+/// （provider 400），与这条守卫本来要挡的是同一件事。
 const CLAIM_SQL: &str = r#"
 UPDATE runs
    SET state            = 'running',
@@ -68,6 +77,13 @@ UPDATE runs
             OR (earlier.input_seq = runs.input_seq AND earlier.id < runs.id)
           )
           AND earlier.state NOT IN ('completed', 'failed', 'cancelled', 'abandoned')
+          AND NOT (
+                runs.parent_run_id IS NOT NULL
+            AND earlier.id = runs.parent_run_id
+            AND earlier.state = 'waiting'
+            AND earlier.wait_kind = 'dependency'
+            AND earlier.wait_ref = runs.id
+          )
    )
 "#;
 
@@ -80,7 +96,8 @@ UPDATE runs
 ///
 /// **可领取的谓词只有一处定义**：这一条与 [`CLAIM_SQL`] 的 `WHERE` 逐字同源（候选是
 /// 筛掉不该领的，领取那一句才是最终守卫，而两句判断的是同一件事）。两者是否真的一致由
-/// `due_and_claim_agree_on_what_is_claimable` 逐形状断言——**别只改一处**。
+/// `due_and_claim_agree_on_what_is_claimable` 逐形状断言——**别只改一处**。委派父子那条
+/// 豁免（为什么要有它、为什么只有那五个条件）写在 [`CLAIM_SQL`] 上面。
 ///
 /// **会话守卫也两处都要有**（§8.9 最后一段）：`state IN ('active','closing')`。
 const DUE_SQL: &str = r#"
@@ -103,6 +120,13 @@ SELECT r.id FROM runs AS r
             OR (earlier.input_seq = r.input_seq AND earlier.id < r.id)
           )
           AND earlier.state NOT IN ('completed', 'failed', 'cancelled', 'abandoned')
+          AND NOT (
+                r.parent_run_id IS NOT NULL
+            AND earlier.id = r.parent_run_id
+            AND earlier.state = 'waiting'
+            AND earlier.wait_kind = 'dependency'
+            AND earlier.wait_ref = r.id
+          )
    )
  ORDER BY r.wake_at
  LIMIT ?2
@@ -854,6 +878,8 @@ mod tests {
             // 次序权威是输入事件的 seq（§8.3）；测试里要摆顺序就显式给。
             input_seq,
             final_event: None as Option<String>,
+            parent_run_id: None as Option<String>,
+            delegate: None as Option<String>,
             // 退役列：不再读，写入给空值（§8.2 只允许加列）。
             status: String::new(),
             state: state.as_str(),
@@ -1939,6 +1965,177 @@ mod tests {
                 .expect("回到 active 之后领得走")
                 .run,
             run
+        );
+    }
+
+    // ------------------------------------------------------------ 委派的次序豁免（§8.4）
+
+    /// 给一条子 Run 写下"谁派的"。`parent_run_id` 是领取语句用的**判据**那一列（`delegate`
+    /// 那一列是正文，排队不看它——这里刻意不摆，正是为了锁住这件事）。
+    async fn set_parent(db: &Db, child: &RunId, parent: &RunId) {
+        let (child, parent) = (child.to_string(), parent.to_string());
+        db.with_write_retry(move |ex| {
+            let (child, parent) = (child.clone(), parent.clone());
+            Box::pin(async move {
+                toasty::sql::statement("UPDATE runs SET parent_run_id = ?1 WHERE id = ?2")
+                    .bind(parent)
+                    .bind(child)
+                    .exec(ex)
+                    .await
+                    .map(|_| ())
+                    .map_err(map_toasty)
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+    }
+
+    /// 父还在跑（没停下来等谁）。
+    async fn set_running(db: &Db, run: &RunId) {
+        let run = run.to_string();
+        db.with_write_retry(move |ex| {
+            let run = run.clone();
+            Box::pin(async move {
+                toasty::sql::statement("UPDATE runs SET state = 'running' WHERE id = ?1")
+                    .bind(run)
+                    .exec(ex)
+                    .await
+                    .map(|_| ())
+                    .map_err(map_toasty)
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+    }
+
+    /// 父停在**等审批**上（不是等 Run）。
+    async fn wait_on_approval(db: &Db, run: &RunId) {
+        let run = run.clone();
+        db.with_write_retry(move |ex| {
+            let run = run.clone();
+            Box::pin(async move {
+                crate::repos::runs::mark_waiting_in(
+                    ex,
+                    &run,
+                    &WaitReason::Approval {
+                        approval: ApprovalId::from_raw("ap-1"),
+                    },
+                    None,
+                    OffsetDateTime::now_utc(),
+                )
+                .await
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+    }
+
+    /// 委派豁免**只对"拦住它的恰好是它的父、且父正等着它"这一种形状**放行（§8.4）。
+    ///
+    /// 五个形状逐条断言 `due` 与 `claim_run` 一致（"可领取的谓词只有一处定义"）：父还在
+    /// 排队 / 还在跑、父等的是别人、父等的是审批——子 Run 一律不许提前跑；只有父停在
+    /// **等这一次委派**上才放行。少了这一条，子 Run 会越过父停住的那个半轮，回放窗口就
+    /// 带着一个没有输出的 `function_call` 去问模型（provider 400）。
+    #[tokio::test]
+    async fn a_delegated_child_is_claimable_only_while_its_parent_waits_on_it() {
+        /// 父在哪个位置上。等待那两种由 `wait_on_*` 摆（状态与等待三列同一个提交）。
+        #[derive(Clone, Copy)]
+        enum Parent {
+            Queued,
+            Running,
+            WaitingOnSomebodyElse,
+            WaitingOnApproval,
+            WaitingOnChild,
+        }
+
+        let (db, _dir) = temp().await;
+        let queue = TursoRunQueue::new(db.clone());
+        let now = OffsetDateTime::now_utc();
+        let executor = ExecutorId::from_raw("exec-1");
+
+        // 每个形状一个会话：一条 Run 只能停在一种等待上，形状之间不能互相干扰。
+        for (session, shape, claimable) in [
+            ("sess-parent-queued", Parent::Queued, false),
+            ("sess-parent-running", Parent::Running, false),
+            ("sess-parent-other", Parent::WaitingOnSomebodyElse, false),
+            ("sess-parent-approval", Parent::WaitingOnApproval, false),
+            ("sess-parent-waits", Parent::WaitingOnChild, true),
+        ] {
+            let parent = queued_run_with_seq(&db, session, &format!("{session}-parent"), 1).await;
+            let child = queued_run_with_seq(&db, session, &format!("{session}-child"), 2).await;
+            set_parent(&db, &child, &parent).await;
+            match shape {
+                Parent::Queued => {}
+                Parent::Running => set_running(&db, &parent).await,
+                // 父等的是**别人**：那一行在不在不重要，重要的是 `wait_ref` 不是这个子 Run。
+                Parent::WaitingOnSomebodyElse => {
+                    wait_on_run(&db, &parent, &RunId::from_raw("run-somewhere-else")).await
+                }
+                Parent::WaitingOnApproval => wait_on_approval(&db, &parent).await,
+                Parent::WaitingOnChild => wait_on_run(&db, &parent, &child).await,
+            }
+
+            let in_due = queue.due(now, 100).await.unwrap().contains(&child);
+            let claimed = queue.claim_run(&child, &executor).await.unwrap().is_some();
+            assert_eq!(in_due, claimable, "{session}：候选的判据");
+            assert_eq!(claimed, claimable, "{session}：领取的判据");
+
+            if claimable {
+                // 豁免**不是**放宽次序守卫：同会话再压一条非委派的普通输入，它照样被前面
+                // 那两条未终态 Run 挡着（`parent_run_id` 为空，第一个条件就不成立）。
+                let plain = queued_run_with_seq(&db, session, &format!("{session}-plain"), 3).await;
+                assert!(
+                    !queue.due(now, 100).await.unwrap().contains(&plain),
+                    "{session}：普通输入不被豁免"
+                );
+                assert!(
+                    queue.claim_run(&plain, &executor).await.unwrap().is_none(),
+                    "{session}：普通输入领不走"
+                );
+            }
+        }
+    }
+
+    /// 子 Run 进终态之后，**父**回到 `queued`：放行那一侧的判据方向无关。
+    ///
+    /// `release_satisfied_dependencies` 本来只服务"后一条等前一条"，而委派把方向倒过来了
+    /// ——父在等子。它判的是"我等的这条终态了吗 + 还有没有更早的非终态 Run"，两件事都不看
+    /// 谁在前谁在后，所以这一侧不需要新代码；这一条测试把它锁住。
+    #[tokio::test]
+    async fn a_parent_goes_back_to_the_queue_once_its_child_ends() {
+        let (db, _dir) = temp().await;
+        let queue = TursoRunQueue::new(db.clone());
+        let now = OffsetDateTime::now_utc();
+        let executor = ExecutorId::from_raw("exec-1");
+
+        let parent = queued_run_with_seq(&db, "sess-up", "run-parent", 1).await;
+        let child = queued_run_with_seq(&db, "sess-up", "run-child", 2).await;
+        set_parent(&db, &child, &parent).await;
+        wait_on_run(&db, &parent, &child).await;
+
+        // 子还在跑：父一律等（它等的那条还没终态）。
+        assert_eq!(release_satisfied_dependencies(&db, now).await.unwrap(), 0);
+        let row = crate::repos::runs::get(&db, &parent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RunState::Waiting);
+
+        mark_terminal(&db, &child).await;
+        assert_eq!(
+            release_satisfied_dependencies(&db, now).await.unwrap(),
+            1,
+            "子终态 → 父的依赖等到了"
+        );
+        let row = crate::repos::runs::get(&db, &parent)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RunState::Queued);
+        assert!(row.wait.is_none());
+        assert!(
+            queue.claim_run(&parent, &executor).await.unwrap().is_some(),
+            "回到队列就领得走"
         );
     }
 }

@@ -125,10 +125,15 @@ async fn step(
                     )
                     .await;
                 }
-                // 等时钟（`retry`）与等前一条 Run（`dependency`）：不是在等人，不投。
+                // 等时钟（`retry`）与等另一条 Run（`dependency`）：不是在等人，不投。
                 komo_kernel::types::status::WaitReason::Retry { .. }
                 | komo_kernel::types::status::WaitReason::Dependency { .. } => {}
             }
+            // **让出名额之后立刻再看一眼队列。** 一条 Run 停在等待上就不再占并发位，
+            // 而队列里可能有本来领不走的东西：同会话次序守卫挡着的下一条，或者一条刚被
+            // 受理的子 Run——挡住它的正是它自己的父，而父此刻刚刚停下（§4、§8.4）。
+            // 不叫这一声，那些要一直等到下一次周期扫描。
+            state.waker().wake();
             if let Watcher::Cron(watched) = watcher {
                 super::cron_watch::settle(
                     state,

@@ -317,6 +317,14 @@ impl Ledger for FaultLedger {
         self.inner.read(session, from, limit).await
     }
 
+    async fn run_end(
+        &self,
+        run: &RunId,
+    ) -> Result<Option<komo_kernel::types::status::RunEnd>, LedgerError> {
+        // 也是读（§4 的委派核对用它）：不注入故障、不投毒。
+        self.inner.run_end(run).await
+    }
+
     async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError> {
         poisoned!(self);
         self.inner.boundary(session).await

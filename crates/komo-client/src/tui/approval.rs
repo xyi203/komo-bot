@@ -353,6 +353,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::PythonEnvChange => "修改 Python 环境",
         Operation::MemoryChange => "记忆内部变更",
         Operation::PolicyChange => "修改权限 / Policy",
+        Operation::Delegate { .. } => "派给子代理",
     }
 }
 
@@ -362,6 +363,8 @@ fn operation_body(operation: &Operation) -> Option<String> {
         Operation::ShellCommand { command } => Some(command.clone()),
         Operation::PythonCall { module, function } => Some(format!("{module}.{function}()")),
         Operation::ToolboxChange { module } => Some(module.clone()),
+        // 审批看的就是这一句任务正文：子代理拿到的**只有它**（§4）。
+        Operation::Delegate { spec } => Some(spec.task.clone()),
         _ => None,
     }
 }

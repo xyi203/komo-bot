@@ -292,6 +292,16 @@ pub trait Ledger: Send + Sync {
         payload: crate::events::EventPayload,
         occurred_at: OffsetDateTime,
     ) -> Result<Seq, LedgerError>;
+
+    /// 一条 Run 的终态（没有就是 `None`）。
+    ///
+    /// **委派的核对走它**（§8.6 的"可以核对目标状态"）：一条 delegate 调用的结果不在
+    /// 别的什么地方，就在它派出去的那条子 Run 的终态里——那也是我们自己的账本，所以
+    /// "结果不明"在这里根本不该发生。父 Run 续跑时用它把那次调用收尾。
+    ///
+    /// 它是**只读**的，且只回答"这条 Run 结束了没有、怎么结束的"，不返回消息历史：
+    /// 复验用的是父侧自己那份契约，子 Run 的完整过程由 `read` 去取。
+    async fn run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError>;
 }
 
 // ---------------------------------------------------------------- 输出存储

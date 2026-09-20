@@ -366,6 +366,8 @@ fn user_event(seq: u64, run: &RunId, text: &str) -> Event {
             peer: None,
             model: None,
             effort: None,
+            // 提取的夹具都是普通 Run：没有父，也没有结果契约。
+            delegate: None,
         }),
     )
 }

@@ -439,6 +439,8 @@ mod tests {
                             input_event: None as Option<String>,
                             input_seq: 0_i64,
                             final_event: None as Option<String>,
+                            parent_run_id: None as Option<String>,
+                            delegate: None as Option<String>,
                             status: String::new(),
                             state: state.as_str(),
                             wait_kind: None as Option<String>,

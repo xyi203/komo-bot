@@ -15,7 +15,7 @@ use komo_kernel::traits::{Ledger, LedgerError, StoreError};
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::refs::{INLINE_ARGUMENT_LIMIT_BYTES, PublishedOutput, ToolResultStatus};
-use komo_kernel::types::status::{AttemptState, RunEnd, WaitReason};
+use komo_kernel::types::status::{AttemptState, RunEnd, RunState, WaitReason};
 use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse};
 use time::OffsetDateTime;
 
@@ -102,6 +102,11 @@ impl Ledger for Coordinator {
                                 request_key: input.request_key.clone(),
                                 input_hash: hash.as_str().to_string(),
                                 source: input.source.clone(),
+                                // 子 Run 不继承父的消息历史，只带走这份任务；它在库里
+                                // 附属于父（`parent_run_id`）并带着父侧那份结果契约
+                                // （§8.4）。**来源仍用父那一份**（`input.source`）：委派
+                                // 不是一个新的来源，沿用父 Run 的。
+                                delegate: input.delegate.clone(),
                                 peer: input.peer.as_ref().map(|p| p.to_string()),
                                 model: input.model.clone(),
                                 effort: input.model.effort.as_ref().map(|e| e.as_str().to_string()),
@@ -159,6 +164,9 @@ impl Ledger for Coordinator {
                         .effort
                         .clone()
                         .map(komo_kernel::types::model::EffortSetting::Explicit),
+                    // 契约落在**事件**里（§8.4）：重启之后它是子代理唯一的"结果要长什么样"
+                    // 的依据，而父侧复验用的就是同一份。
+                    delegate: input.delegate.clone(),
                 }),
             )
             .await?;
@@ -662,6 +670,97 @@ impl Ledger for Coordinator {
         })
     }
 
+    /// 一条 Run 的终态（`Ledger::run_end`，§8.6 的委派核对用它）。
+    ///
+    /// **权威是终态事件的正文，行上的列只是它的派生物。** 顺着行上的 `final_event` 回到
+    /// JSONL 把那条 `run.completed` / `run.failed` / … 读回来——父 Run 续跑时要拿这个
+    /// 结果，而 `Completed.final_message` 在 `runs` 表上**没有对应的列**，照着列拼一个
+    /// 出来与 `complete` 当时给的不是一回事（大正文还可能在 `payloads/` 里）。父侧复验用
+    /// 的就是这个返回值，两次读之间不能有差。
+    ///
+    /// **非终态答 `None`**（连行都不在也答 `None`：没有这条 Run，就没有它的终态）。剩下
+    /// 两条"读不到事件"的路——`final_event` 为空、索引里查不到那条事件——退化成按行上的
+    /// 列回答，[`end_from_row`] 写清了哪些字段拿得回来、哪些拿不回来。
+    async fn run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError> {
+        let Some(row) = runs::get(&self.db, run).await.map_err(store_to_ledger)? else {
+            return Ok(None);
+        };
+        if !row.state.is_terminal() {
+            return Ok(None);
+        }
+        // 没有终态事件：`mark_final_without_event_in` 那条路（会话已经读不出来时的一次
+        // 取消）。取消是调度事实，本来就没有会话内容落在它身上，所以这里不是异常。
+        let Some(final_event) = row.final_event.clone() else {
+            return Ok(end_from_row(&row));
+        };
+        // `session_log_index` 只是**加速**索引（§8.3：它可重建），所以查不到不是损坏——
+        // 补索引是 reconcile 的事，不该让一次只读被它挡住。
+        let Some(seq) = existing_seq(&self.db, &final_event).await? else {
+            tracing::warn!(
+                %run,
+                event = %final_event,
+                "会话日志索引里没有这条终态事件，按行上的列回答"
+            );
+            return Ok(end_from_row(&row));
+        };
+        // 从 seq 的前一条起读一页，翻出这条事件；它必须**就是** `final_event` 指的那条，
+        // 否则读到的是别的东西（索引与日志漂了），一样退化成按列回答。
+        let batch = self
+            .read(&row.session, Seq(seq.0.saturating_sub(1)), 1)
+            .await?;
+        let Some(event) = batch
+            .events
+            .into_iter()
+            .find(|event| event.event_id == final_event)
+        else {
+            tracing::warn!(
+                %run,
+                event = %final_event,
+                seq = seq.0,
+                "终态事件在日志里读不回来，按行上的列回答"
+            );
+            return Ok(end_from_row(&row));
+        };
+
+        let end = match event.payload {
+            EventPayload::RunCompleted(body) => {
+                // 大正文外置过（§8.3）：按引用读回来，缺文件 / 哈希不符会在这里报
+                // `Corrupt`——那是真的读不出来，而一个"完成了、但正文丢了"的答案
+                // 不能靠少给一段正文冒充。
+                let final_message = match (body.final_message, body.final_message_ref) {
+                    (Some(text), _) => Some(text),
+                    (None, Some(reference)) => Some(self.text_of(&row.session, &reference).await?),
+                    (None, None) => None,
+                };
+                RunEnd::Completed {
+                    final_message,
+                    rounds: body.rounds,
+                }
+            }
+            EventPayload::RunFailed(body) => RunEnd::Failed {
+                reason: body.reason,
+            },
+            EventPayload::RunCancelled(body) => RunEnd::Cancelled {
+                by: body.by.map(|peer| peer.as_str().to_string()),
+            },
+            EventPayload::RunAbandoned(body) => RunEnd::Abandoned {
+                by: body.by.map(|peer| peer.as_str().to_string()),
+                reason: body.reason,
+            },
+            // 索引指到了一条不是终态的事件：与"读不到"同等处理，不猜。
+            other => {
+                tracing::warn!(
+                    %run,
+                    event = %final_event,
+                    kind = other.type_name(),
+                    "终态事件引用的不是终态载荷，按行上的列回答"
+                );
+                return Ok(end_from_row(&row));
+            }
+        };
+        Ok(Some(end))
+    }
+
     async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError> {
         if session != &self.session {
             return Err(LedgerError::Conflict(format!(
@@ -740,6 +839,35 @@ enum Reserved {
     Conflict,
 }
 
+/// 没有终态事件可读时，按行上的列回答（`RunEnd` 的两条退化路径，见
+/// [`Ledger::run_end`](komo_kernel::traits::Ledger::run_end) 的实现）。
+///
+/// **这是一次退化，不是等价替换**：`complete` 把"事件"和"行"一起写，行上有 `state` /
+/// `last_error` / `rounds`，所以失败原因、轮数拿得回来；而
+/// [`RunEnd::Completed`] 的 `final_message` 在行上**没有列**——它只存在于事件里（大正文
+/// 还可能在 `payloads/` 里），这里给 `None`，不从 `message.assistant` 里凑一句：凑出来的
+/// 那句与 `complete` 当时给的不是同一个值，而父侧复验照它判，那就等于事后替它编了一个
+/// 结果。`by` 同理，行上没记是谁取消的。
+fn end_from_row(row: &runs::RunRecord) -> Option<RunEnd> {
+    Some(match row.state {
+        RunState::Completed => RunEnd::Completed {
+            final_message: None,
+            rounds: row.rounds,
+        },
+        RunState::Failed => RunEnd::Failed {
+            reason: row.last_error.clone().unwrap_or_default(),
+        },
+        RunState::Cancelled => RunEnd::Cancelled { by: None },
+        RunState::Abandoned => RunEnd::Abandoned {
+            by: None,
+            reason: row.last_error.clone(),
+        },
+        // 非终态：调用点已经用 `is_terminal()` 挡过，这里再答一次 `None`，而不是编一个终态
+        // 出来——两处判定同源，多出来的这一道只是不让"判定漂了"变成一个假答案。
+        _ => return None,
+    })
+}
+
 async fn existing_seq(db: &Db, event_id: &EventId) -> Result<Option<Seq>, LedgerError> {
     let id = event_id.to_string();
     db.read(move |ex| {
@@ -784,6 +912,7 @@ mod tests {
     use komo_kernel::traits::RunQueue as _;
     use komo_kernel::traits::ToolOutputStore as _;
     use komo_kernel::types::chat::ApprovalScope;
+    use komo_kernel::types::delegate::{DelegateSpec, SchemaMode};
     use komo_kernel::types::ids::{ApprovalId, RequestKey};
     use komo_kernel::types::plan::PlanSource;
     use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultBody};
@@ -837,6 +966,7 @@ mod tests {
             model: sample_model(),
             workdir: None,
             at: time::macros::datetime!(2026-09-15 08:00:00 UTC),
+            delegate: None,
         }
     }
 
@@ -1672,5 +1802,428 @@ mod tests {
             .await
             .unwrap();
         assert!(store.open(&out.output).await.is_ok());
+    }
+
+    // ------------------------------------------------------------ 委派（§8.4 的 dependency）
+
+    /// 一份子任务输入：`delegate` 指着父 Run 与父侧那次调用。
+    fn delegated(
+        key: &str,
+        parent: &RunId,
+        text: &str,
+        session: &SessionId,
+        contract: Option<serde_json::Value>,
+    ) -> AcceptInput {
+        let spec = match contract {
+            Some(schema) => {
+                DelegateSpec::new(parent.clone(), ToolCallId::from_raw("call-delegate"), text)
+                    .with_contract(schema, SchemaMode::Strict)
+            }
+            None => DelegateSpec::new(parent.clone(), ToolCallId::from_raw("call-delegate"), text),
+        };
+        AcceptInput {
+            delegate: Some(spec),
+            ..input(key, text, session)
+        }
+    }
+
+    /// §8.4 的委派：子 Run **落 `queued`**（不是 `waiting + dependency`——父在跑、子若等父
+    /// 就是父子互等死锁），父停下来等它的时候它才领得走，它进终态之后父回 `queued`。
+    ///
+    /// 这一条把委派的整个调度闭环走了一遍，因为四个落点分属三处（`mark_queued_in` 的例外、
+    /// §8.7 领取语句的豁免、`release_satisfied_dependencies` 的放行），任何一处漏了都会
+    /// 停在这里。
+    #[tokio::test]
+    async fn a_delegated_child_is_claimable_exactly_while_its_parent_waits_on_it() {
+        let f = fixture().await;
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let executor = ExecutorId::from_raw("exec-1");
+        let now = f.clock.now();
+
+        let parent = f
+            .coordinator
+            .accept_input(input("api:1", "派个子任务", &f.session))
+            .await
+            .unwrap();
+        // 契约用 `DelegateSpec` 默认的那份 schema 子集：`required` 是校验器真认的关键字。
+        let schema = serde_json::json!({"type": "object", "required": ["lines"]});
+        let child = f
+            .coordinator
+            .accept_input(delegated(
+                "api:2",
+                &parent.run,
+                "数一下 a.txt 有几行",
+                &f.session,
+                Some(schema.clone()),
+            ))
+            .await
+            .unwrap();
+
+        // ① 落库形状：`queued`，附属于父，契约原样存回来（父侧复验要用的**同一份**）。
+        let row = crate::repos::runs::get(&f.db, &child.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RunState::Queued, "子 Run 不排父后面等它");
+        assert!(row.wait.is_none(), "`queued` 没有等待三列");
+        assert_eq!(row.parent, Some(parent.run.clone()));
+        assert_eq!(
+            row.delegate,
+            Some(
+                DelegateSpec::new(
+                    parent.run.clone(),
+                    ToolCallId::from_raw("call-delegate"),
+                    "数一下 a.txt 有几行",
+                )
+                .with_contract(schema, SchemaMode::Strict)
+            ),
+            "契约整份存回来（含 mode）"
+        );
+
+        // 受理事件里也带着它——重启之后那是**唯一**的"结果要长什么样"的依据。
+        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let accepted = batch
+            .events
+            .iter()
+            .filter(|event| event.run.as_ref() == Some(&child.run))
+            .find_map(|event| match &event.payload {
+                EventPayload::RunAccepted(body) => Some(body),
+                _ => None,
+            })
+            .expect("子 Run 有一条 run.accepted");
+        assert_eq!(accepted.delegate, row.delegate);
+
+        // ② 父还没停下来等它：**领不走**（`queued` 只说明"不缺 worker 以外的条件"）。
+        assert!(!queue.due(now, 10).await.unwrap().contains(&child.run));
+        assert!(
+            queue
+                .claim_run(&child.run, &executor)
+                .await
+                .unwrap()
+                .is_none(),
+            "父还在跑的这段时间里它领不走"
+        );
+
+        // ③ 父开跑、然后停下来等这次委派的结果（§8.4 的 `dependency`）。
+        queue
+            .claim_run(&parent.run, &executor)
+            .await
+            .unwrap()
+            .expect("父自己没有前置，领得到");
+        f.coordinator
+            .suspend(
+                &parent.run,
+                WaitReason::Dependency {
+                    run: child.run.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            queue.due(now, 10).await.unwrap().contains(&child.run),
+            "父正等着它 → 它是候选"
+        );
+        assert!(
+            queue
+                .claim_run(&child.run, &executor)
+                .await
+                .unwrap()
+                .is_some(),
+            "父正等着它 → 领得走（豁免的五个条件在这里全成立）"
+        );
+
+        // ④ 子 Run 终态 → 父的依赖等到了 → 父回 `queued`、又能领。
+        f.coordinator
+            .complete(
+                &child.run,
+                RunEnd::Completed {
+                    final_message: Some("3 行".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::repos::queue::release_satisfied_dependencies(&f.db, now)
+                .await
+                .unwrap(),
+            1,
+            "父是在等子，方向与「前一条 Run」相反，判据同一份"
+        );
+        let row = crate::repos::runs::get(&f.db, &parent.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RunState::Queued);
+        assert!(row.wait.is_none());
+        assert!(
+            queue
+                .claim_run(&parent.run, &executor)
+                .await
+                .unwrap()
+                .is_some(),
+            "放行之后父领得走"
+        );
+    }
+
+    /// 委派的子 Run 不继承父的消息历史：它的输入正文就是那份任务本身。
+    #[tokio::test]
+    async fn a_delegated_child_starts_from_the_task_not_the_parent_history() {
+        let f = fixture().await;
+        let parent = f
+            .coordinator
+            .accept_input(input("api:1", "先聊两句天气", &f.session))
+            .await
+            .unwrap();
+        let child = f
+            .coordinator
+            .accept_input(delegated("api:2", &parent.run, "数行数", &f.session, None))
+            .await
+            .unwrap();
+
+        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let child_types: Vec<String> = batch
+            .events
+            .iter()
+            .filter(|event| event.run.as_ref() == Some(&child.run))
+            .map(|event| event.type_name().to_string())
+            .collect();
+        assert_eq!(
+            child_types,
+            vec!["run.accepted", "run.queued"],
+            "子 Run 只有自己的受理与入队，没有父那一轮里的任何一条"
+        );
+        let text = batch
+            .events
+            .iter()
+            .filter(|event| event.run.as_ref() == Some(&child.run))
+            .find_map(|event| match &event.payload {
+                EventPayload::RunAccepted(body) => Some(body.text.clone()),
+                _ => None,
+            })
+            .expect("子 Run 有一条 run.accepted");
+        assert_eq!(text.as_deref(), Some("数行数"), "输入正文就是那份任务");
+    }
+
+    /// `runs.delegate` 写坏了（或者根本没有这一列的老行）**不算损坏**：当作"没有契约"，
+    /// 而"谁派的"是 `parent_run_id` 那一列上的判据，不受影响。
+    #[tokio::test]
+    async fn a_corrupt_delegate_column_reads_as_no_contract_and_keeps_the_parent() {
+        let f = fixture().await;
+        let parent = f
+            .coordinator
+            .accept_input(input("api:1", "派个子任务", &f.session))
+            .await
+            .unwrap();
+        let child = f
+            .coordinator
+            .accept_input(delegated("api:2", &parent.run, "数行数", &f.session, None))
+            .await
+            .unwrap();
+
+        let run = child.run.to_string();
+        f.db.with_write_retry(move |ex| {
+            let run = run.clone();
+            Box::pin(async move {
+                toasty::sql::statement("UPDATE runs SET delegate = '{ 这不是 JSON' WHERE id = ?1")
+                    .bind(run)
+                    .exec(ex)
+                    .await
+                    .map(|_| ())
+                    .map_err(crate::db::map_toasty)
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+
+        let row = crate::repos::runs::get(&f.db, &child.run)
+            .await
+            .unwrap()
+            .expect("损坏的契约不该让整行读不出来");
+        assert_eq!(row.delegate, None, "读不出来就是没有契约，不猜一个出来");
+        assert_eq!(
+            row.parent,
+            Some(parent.run.clone()),
+            "判据在 parent_run_id 那一列上"
+        );
+        assert_eq!(row.state, RunState::Queued, "调度状态一点也不受影响");
+
+        // 旧行：这一列还是 NULL。两列都缺的行与"值为 NULL"的行是同一件事（§8.2 的补列）。
+        let legacy = parent.run.to_string();
+        f.db.with_write_retry(move |ex| {
+            let legacy = legacy.clone();
+            Box::pin(async move {
+                toasty::sql::statement(
+                    "UPDATE runs SET delegate = NULL, parent_run_id = NULL WHERE id = ?1",
+                )
+                .bind(legacy)
+                .exec(ex)
+                .await
+                .map(|_| ())
+                .map_err(crate::db::map_toasty)
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+        let row = crate::repos::runs::get(&f.db, &parent.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((row.parent, row.delegate), (None, None), "顶层 Run 的老行");
+        assert_eq!(
+            crate::repos::runs::list_for_session(&f.db, &f.session)
+                .await
+                .unwrap()
+                .len(),
+            2,
+            "整份列表照样读得出来"
+        );
+    }
+
+    /// `run_end` 答的是**账本里那条终态事件**，不是照着行上的列重拼一份。
+    #[tokio::test]
+    async fn run_end_reads_the_terminal_event_back() {
+        let f = fixture().await;
+
+        let completed = f
+            .coordinator
+            .accept_input(input("api:1", "读一下 a.txt", &f.session))
+            .await
+            .unwrap();
+        f.coordinator
+            .complete(
+                &completed.run,
+                RunEnd::Completed {
+                    final_message: Some("三行".into()),
+                    rounds: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f.coordinator.run_end(&completed.run).await.unwrap(),
+            Some(RunEnd::Completed {
+                final_message: Some("三行".into()),
+                rounds: 2,
+            })
+        );
+
+        let failed = f
+            .coordinator
+            .accept_input(input("api:2", "再读一次", &f.session))
+            .await
+            .unwrap();
+        f.coordinator
+            .complete(
+                &failed.run,
+                RunEnd::Failed {
+                    reason: "read 超时".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f.coordinator.run_end(&failed.run).await.unwrap(),
+            Some(RunEnd::Failed {
+                reason: "read 超时".into(),
+            })
+        );
+
+        // 大正文外置过（§8.3）：按引用读回来，而不是答一个"没有正文"。
+        let big = "汉".repeat(INLINE_ARGUMENT_LIMIT_BYTES);
+        let externalised = f
+            .coordinator
+            .accept_input(input("api:3", "写一段长的", &f.session))
+            .await
+            .unwrap();
+        f.coordinator
+            .complete(
+                &externalised.run,
+                RunEnd::Completed {
+                    final_message: Some(big.clone()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            f.coordinator.run_end(&externalised.run).await.unwrap(),
+            Some(RunEnd::Completed {
+                final_message: Some(big),
+                rounds: 1,
+            })
+        );
+
+        // 非终态：没有终态事件，答 `None`（不是"编一个"）。
+        let open = f
+            .coordinator
+            .accept_input(input("api:4", "还没跑完", &f.session))
+            .await
+            .unwrap();
+        assert_eq!(f.coordinator.run_end(&open.run).await.unwrap(), None);
+        assert_eq!(
+            f.coordinator
+                .run_end(&RunId::from_raw("run-does-not-exist"))
+                .await
+                .unwrap(),
+            None,
+            "行不在也一样：没有这条 Run，就没有它的终态"
+        );
+    }
+
+    /// 终态**没有事件**（会话已经读不出来时的一次取消）：按行上的列回答，拿不回来的字段
+    /// 明着给 `None`，不替 `complete` 编一个。
+    #[tokio::test]
+    async fn run_end_falls_back_to_the_row_when_the_terminal_event_is_absent() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", "你好", &f.session))
+            .await
+            .unwrap();
+        crate::repos::runs::stop_without_event(
+            &f.db,
+            &f.session,
+            &accepted.run,
+            RunState::Cancelled,
+            None,
+            f.clock.now(),
+        )
+        .await
+        .unwrap();
+
+        let row = crate::repos::runs::get(&f.db, &accepted.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.final_event.is_none(), "这条终态本来就没有事件");
+        assert_eq!(
+            f.coordinator.run_end(&accepted.run).await.unwrap(),
+            Some(RunEnd::Cancelled { by: None }),
+            "取消这个事实在行上有；`by` 没有列可依，所以是 None"
+        );
+
+        // 失败也一样：原因是 `last_error` 那一列记着的。
+        let failed = f
+            .coordinator
+            .accept_input(input("api:2", "又一条", &f.session))
+            .await
+            .unwrap();
+        crate::repos::runs::stop_without_event(
+            &f.db,
+            &f.session,
+            &failed.run,
+            RunState::Failed,
+            Some("日志读不出来".into()),
+            f.clock.now(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            f.coordinator.run_end(&failed.run).await.unwrap(),
+            Some(RunEnd::Failed {
+                reason: "日志读不出来".into(),
+            })
+        );
     }
 }

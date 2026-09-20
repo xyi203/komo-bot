@@ -147,8 +147,10 @@ impl Surface {
 
         match &event.payload {
             EventPayload::RunAccepted(body) => {
-                self.run_mut(event).status = RunState::Accepted;
-                self.run_mut(event).input_event = Some(event.event_id.clone());
+                let run = self.run_mut(event);
+                run.status = RunState::Accepted;
+                run.input_event = Some(event.event_id.clone());
+                run.delegate = body.delegate.clone();
                 self.push_message(SurfaceMessage {
                     seq: event.seq,
                     event_id: event.event_id.clone(),
@@ -386,6 +388,7 @@ impl Surface {
             final_message: None,
             generation: None,
             rounds: 0,
+            delegate: None,
             calls: Vec::new(),
             first_seq: event.seq,
             last_seq: event.seq,
@@ -467,6 +470,7 @@ mod tests {
                 peer: None,
                 model: None,
                 effort: None,
+                delegate: None,
             }),
         )
     }
@@ -835,6 +839,7 @@ mod tests {
             peer: None,
             model: None,
             effort: None,
+            delegate: None,
         })
     }
 }

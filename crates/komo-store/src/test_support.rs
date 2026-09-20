@@ -116,6 +116,7 @@ mod tests {
                     model: komo_kernel::test_support::sample_model(),
                     workdir: None,
                     at: clock.now(),
+                    delegate: None,
                 })
                 .await
                 .unwrap();

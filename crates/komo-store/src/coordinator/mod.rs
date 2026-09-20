@@ -161,6 +161,32 @@ impl Coordinator {
         Ok((None, Some(reference)))
     }
 
+    /// 外置正文按引用读回来（§8.3：大正文存 `payloads/`；哈希校验由 [`PayloadStore::open`]
+    /// 负责，不符就是 [`LedgerError::Corrupt`]，**不返回内容**）。
+    ///
+    /// 别的 Session 按目录推出来——与 `Ledger::read` 推日志路径是同一个形状（一个
+    /// `Coordinator` 只握着自己那个 Session 的手边件，但读别人的是允许的）。
+    async fn text_of(
+        &self,
+        session: &SessionId,
+        reference: &PayloadRef,
+    ) -> Result<String, LedgerError> {
+        let payloads = if session == &self.session {
+            self.payloads.clone()
+        } else {
+            PayloadStore::new(SessionPaths::at(
+                self.paths
+                    .root()
+                    .parent()
+                    .unwrap_or(self.paths.root())
+                    .join(session.as_str()),
+            ))
+        };
+        let bytes = payloads.open(reference).await.map_err(store_to_ledger)?;
+        String::from_utf8(bytes)
+            .map_err(|e| LedgerError::Corrupt(format!("外置正文不是 UTF-8：{e}")))
+    }
+
     /// 外置一个调用的超限参数：**包含它的模型消息正文**存到 payloads，
     /// `arguments_ref` 指向文件内的对应字段（§8.3）。
     async fn externalize_arguments(

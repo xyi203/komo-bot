@@ -263,7 +263,13 @@ pub async fn summary_of(api: &Api, session: &SessionId) -> Result<SessionSummary
         .await
         .map_err(ApiFailure::from)?;
     let runs = komo_store::repos::runs::list_for_session(&api.state.db, session).await?;
-    let current = runs.iter().rev().find(|run| run.state.is_unfinished());
+    // **子代理不算这条会话的"当前 Run"**（§4）：父 Run 才是操作者发起的那个，而它此刻正
+    // 在等它的子 Run。取最后一条非终态的**顶层** Run——否则界面上显示的是子代理，操作者
+    // 看到"会话卡住了"，却看不到自己交给 komo 的那件事。
+    let current = runs
+        .iter()
+        .rev()
+        .find(|run| run.state.is_unfinished() && run.parent.is_none());
     let now = api.state.clock.now();
     let created = created_at(session.as_str(), now);
     Ok(SessionSummary {

@@ -4,6 +4,7 @@
 //! 从 [`crate::traits::Clock`] 取一个 `OffsetDateTime` 传进来。
 
 pub mod chat;
+pub mod delegate;
 pub mod digest;
 pub mod ids;
 pub mod memory;
@@ -17,6 +18,10 @@ pub mod turn;
 pub use chat::{
     ApprovalPresentation, ApprovalScope, ChannelPeer, ChannelPlatform, Delivery, DeliveryState,
     DeliveryTarget, Outbound, PeerId, Principal,
+};
+pub use delegate::{
+    DEFAULT_DELEGATE_ROUNDS, DELEGATE_REPAIR_ROUNDS, DelegateContract, DelegateSpec, SchemaMode,
+    Validation, Violation, validate,
 };
 pub use digest::{ContentHash, sha256};
 pub use ids::{

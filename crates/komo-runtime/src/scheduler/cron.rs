@@ -342,6 +342,8 @@ impl CronScheduler {
                 // Job 的工作目录落到这个 Session 上——创建 Job 时就核实过它存在
                 // （§10），这里只是把它带过去。
                 workdir: job.workdir.clone(),
+                // 定时 Job 不是子代理：没有父 Run，也没有结果契约。
+                delegate: None,
                 at: now,
             })
             .await?;

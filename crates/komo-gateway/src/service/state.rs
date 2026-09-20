@@ -431,6 +431,7 @@ impl GatewayState {
         let routed = Arc::new(RoutedLedger::new(
             Arc::clone(&ledgers),
             db.clone(),
+            Arc::clone(&clock),
             Arc::clone(&audit_wake),
         ));
         let outputs: Arc<dyn ToolOutputStore> = Arc::new(RoutedOutputs::new(
@@ -851,6 +852,8 @@ impl GatewayState {
                 // 「新 Run 在 `accept_input` 时抓一份模型 / effort 快照」（§3 第 2 步）。
                 model: model.unwrap_or_else(|| snapshot.model.clone()),
                 workdir: None,
+                // 交互输入不是委派：子 Run 只由 executor 在委托那一步受理（§4）。
+                delegate: None,
                 at: self.clock.now(),
             })
             .await?;

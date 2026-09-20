@@ -718,6 +718,67 @@ mod tests {
         insert(&db, "after-alter".to_string()).await.unwrap();
     }
 
+    /// 旧库补列：**这次加的那两列**在一张旧的 `runs` 表上补得回来（§8.2 的加列规则）。
+    ///
+    /// "旧形状"就是今天那份 DDL 去掉这两列。**用带引号的 DDL 摆不是形式**：老库是
+    /// `CREATE TABLE` 建出来的（带引号），而这个写法正是 turso 认表的关键——`DROP COLUMN`
+    /// 会把存下来的 DDL 重写成不带引号的形状，之后 `ALTER TABLE … ADD COLUMN` 在那个形状上
+    /// 静默不生效（实测），所以这条路只能整表换成旧形状，不能"删一列"。
+    ///
+    /// 两列都可空，所以加得上（`NOT NULL` 且没有默认值才加不上）；补完之后**按模型读一遍**
+    /// 确认 SELECT 的列清单在这张表上成立。**这里读的是空表**：往换成旧形状的表里写行再
+    /// 读回来，在 turso 上会读到空的（表被 toasty 之外的东西换过之后，新建连接看到的是另一
+    /// 个快照）——那是换表这条路的坑，不是补列的坑。"旧行（两列是 NULL）照样读得出来"由
+    /// `ledger` 那边一条测试锁着。
+    #[tokio::test]
+    async fn the_delegate_columns_are_added_to_an_existing_runs_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        {
+            let db = Db::connect(&path).await.unwrap();
+            let mut conn = db.inner.connection().await.unwrap();
+            let legacy = crate::models::run::DDL
+                .replace(r#""parent_run_id" TEXT, "#, "")
+                .replace(r#""delegate" TEXT, "#, "");
+            assert!(
+                !legacy.contains("parent_run_id") && !legacy.contains("delegate"),
+                "旧形状里不该有这两列"
+            );
+            toasty::sql::statement(r#"DROP TABLE "runs""#)
+                .exec(&mut conn)
+                .await
+                .expect("整表换成旧形状");
+            toasty::sql::statement(legacy)
+                .exec(&mut conn)
+                .await
+                .expect("建出旧形状的 runs");
+        }
+
+        let db = Db::connect(&path).await.unwrap();
+        let mut conn = db.inner.connection().await.unwrap();
+        let names: Vec<String> = toasty::sql::query("SELECT name FROM pragma_table_info('runs')")
+            .exec(&mut conn)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|row| column_string(row, 0))
+            .collect();
+        for column in ["parent_run_id", "delegate"] {
+            assert!(
+                names.iter().any(|name| name == column),
+                "{column} 补回来了：{names:?}"
+            );
+        }
+        assert!(
+            crate::repos::runs::get(&db, &komo_kernel::types::ids::RunId::from_raw("缺的"))
+                .await
+                .unwrap()
+                .is_none(),
+            "补完之后按模型读一遍不报错：SELECT 的列清单在这张表上成立"
+        );
+    }
+
     /// 时间列是 unix 纳秒，`0` 是"未设置"。
     #[test]
     fn a_timestamp_round_trips_at_full_precision() {

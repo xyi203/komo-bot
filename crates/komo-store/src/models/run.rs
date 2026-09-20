@@ -38,6 +38,19 @@ pub struct RunRow {
     pub input_seq: i64,
     /// 承载终态的事件。
     pub final_event: Option<String>,
+    /// 派它的那条 Run（§8.4 的委派子 Run）。`None` = 这是一条顶层 Run。
+    ///
+    /// **单独开一列而不是从 `delegate` 的 JSON 里取**：领取与依赖放行要在 SQL 里判"拦住
+    /// 我的那条 Run 是不是我的父"（[`crate::repos::queue`] 的两句 `NOT EXISTS`），而
+    /// "在 SQL 里被筛选的维度另开一列"是这张表的加列规则（见 [`super`]）——从 JSON 里
+    /// 查 = 每次领取都解析一遍计划。这一列是**判据**，`delegate` 那一列是**正文**。
+    pub parent_run_id: Option<String>,
+    /// 受理这条 Run 的 [`komo_kernel::types::delegate::DelegateSpec`] JSON，**父侧那一份
+    /// 计划留在子 Run 行上的副本**（授权与审批绑定的是计划，计划里就有它）。
+    ///
+    /// 它读不出来时**不猜**：当作"没有契约"（见 [`crate::repos::runs::delegate_of`]），
+    /// 旧行与损坏行都要能读——子 Run 仍然可以跑，只是父侧复验时按自由文本处理。
+    pub delegate: Option<String>,
     /// **退役**：读了不再用它，写入给空值。
     pub status: String,
     /// 调度状态：`accepted` / `queued` / `running` / `waiting` / `completed` / `failed` /
@@ -87,7 +100,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "runs" ("id" TEXT NOT NULL, "session_id" TEXT NOT NULL, "request_key" TEXT NOT NULL, "input_hash" TEXT NOT NULL, "input_event" TEXT, "input_seq" BIGINT NOT NULL, "final_event" TEXT, "status" TEXT NOT NULL, "state" TEXT NOT NULL, "wait_kind" TEXT, "wait_ref" TEXT, "wake_at" BIGINT NOT NULL, "lease_until" BIGINT NOT NULL, "source" TEXT NOT NULL, "peer" TEXT, "claimed_by" TEXT, "claim_generation" BIGINT NOT NULL, "claimed_at" BIGINT NOT NULL, "next_retry_at" BIGINT NOT NULL, "retry_attempts" BIGINT NOT NULL, "rounds" BIGINT NOT NULL, "max_rounds" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "model_snapshot" TEXT NOT NULL, "effort" TEXT, "grants" TEXT NOT NULL, "memory_work" TEXT NOT NULL, "memory_cursor" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "ended_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "runs" ("id" TEXT NOT NULL, "session_id" TEXT NOT NULL, "request_key" TEXT NOT NULL, "input_hash" TEXT NOT NULL, "input_event" TEXT, "input_seq" BIGINT NOT NULL, "final_event" TEXT, "parent_run_id" TEXT, "delegate" TEXT, "status" TEXT NOT NULL, "state" TEXT NOT NULL, "wait_kind" TEXT, "wait_ref" TEXT, "wake_at" BIGINT NOT NULL, "lease_until" BIGINT NOT NULL, "source" TEXT NOT NULL, "peer" TEXT, "claimed_by" TEXT, "claim_generation" BIGINT NOT NULL, "claimed_at" BIGINT NOT NULL, "next_retry_at" BIGINT NOT NULL, "retry_attempts" BIGINT NOT NULL, "rounds" BIGINT NOT NULL, "max_rounds" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "model_snapshot" TEXT NOT NULL, "effort" TEXT, "grants" TEXT NOT NULL, "memory_work" TEXT NOT NULL, "memory_cursor" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "ended_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -97,6 +110,9 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("input_event", "TEXT"),
     ColumnSpec::new("input_seq", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("final_event", "TEXT"),
+    // 委派的两列都**可空**：旧行本来就没有这两个值（§8.2 的补列规则里可空那一条）。
+    ColumnSpec::new("parent_run_id", "TEXT"),
+    ColumnSpec::new("delegate", "TEXT"),
     ColumnSpec::new("status", "TEXT NOT NULL DEFAULT ''"),
     ColumnSpec::new("state", "TEXT NOT NULL DEFAULT 'accepted'"),
     ColumnSpec::new("wait_kind", "TEXT"),

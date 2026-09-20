@@ -204,6 +204,7 @@ fn operation_label(operation: &Operation) -> &'static str {
         Operation::PythonEnvChange => "python_env_change",
         Operation::MemoryChange => "memory_change",
         Operation::PolicyChange => "policy_change",
+        Operation::Delegate { .. } => "delegate",
     }
 }
 

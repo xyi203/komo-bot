@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::delegate::DelegateSpec;
 use super::digest::ContentHash;
 use super::ids::{ApprovalId, GrantId, OperationId, RunId, SessionId, ToolCallId};
 
@@ -101,6 +102,15 @@ pub enum Operation {
     MemoryChange,
     /// 权限扩大或修改 Policy。模型自行放宽是不被允许的（§7.1 最后一行）。
     PolicyChange,
+    /// 把一个自包含子任务交给一条子 Run（§4）。
+    ///
+    /// **它不是第六个基础工具**：模型看不见任何新能力，子代理用的是同一套五个工具，而它
+    /// 自己的每一次调用照常过 Policy（§7.1）。所以要审的不是"模型能不能做这件事"，而是
+    /// "允不允许它把这件事派出去"——规则表按这一条匹配。
+    ///
+    /// **整份 [`DelegateSpec`] 都在计划里**（含任务正文与结果契约）：计划是审批绑定的对象，
+    /// 也是父 Run 续跑时手里唯一那份东西——它要拿同一份契约去复验子代理的结果（§8.6）。
+    Delegate { spec: DelegateSpec },
 }
 
 impl Operation {

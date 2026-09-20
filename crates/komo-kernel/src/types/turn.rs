@@ -203,6 +203,12 @@ pub struct AcceptInput {
     /// `None` = 不改（已经在的会话保留它自己的），不是"清空"。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<std::path::PathBuf>,
+    /// 这是一次**委派**：子 Run 的身份、结果契约与轮次预算（§4）。
+    ///
+    /// 它在受理那一刻就落进 `run.accepted`，因此**活得过重启**：恢复后的子代理自己读得
+    /// 到"结果要长什么样"，父 Run 续跑时也不必去问运行时。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate: Option<crate::types::delegate::DelegateSpec>,
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
 }
@@ -298,6 +304,7 @@ mod tests {
                 timeout_secs: 120,
             },
             workdir: None,
+            delegate: None,
             at: datetime!(2026-09-15 08:00:00 UTC),
         };
         let first = input.input_hash();

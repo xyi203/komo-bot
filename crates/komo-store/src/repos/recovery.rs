@@ -427,6 +427,7 @@ mod tests {
             model: sample_model(),
             workdir: None,
             at: TestClock::fixed().now(),
+            delegate: None,
         }
     }
 

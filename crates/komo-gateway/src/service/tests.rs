@@ -625,6 +625,7 @@ async fn pending_approval(gateway: &TestGateway) -> komo_kernel::protocol::http:
         .expect("写得下")
 }
 
+/// 等一条 Run 进终态（10 秒超时）。
 async fn wait_for_run(
     gateway: &TestGateway,
     run: &RunId,
@@ -1069,6 +1070,7 @@ async fn seed_queued_run(
         peer: None,
         model: state.snapshot().model.clone(),
         effort: None,
+        delegate: None,
         at: now,
     };
     let event = komo_kernel::types::ids::EventId::new_at(now);
@@ -1395,4 +1397,271 @@ async fn purging_a_session_with_unfinished_work_is_a_409_that_lists_the_blockers
     let paths =
         komo_store::SessionPaths::new(&gateway.state().snapshot().paths.sessions_dir, &session);
     assert!(paths.root().exists(), "拒绝回收之后目录要原样在");
+}
+
+// ---------------------------------------------------------------- 委派（§4）
+
+use crate::service::test_support::harness::{FakeLlm, call_round, text_round};
+
+/// 委派的脚本：父要一次委派 → 子代理一轮给出结果 → 父拿到结果之后收尾。
+fn delegation_script(task: &str, child_text: &str) -> Arc<FakeLlm> {
+    FakeLlm::new(vec![
+        vec![call_round(
+            1,
+            "pc-1",
+            crate::service::DELEGATE_TOOL,
+            serde_json::json!({
+                "task": task,
+                "output_schema": {
+                    "type": "object",
+                    "required": ["files"],
+                    "additionalProperties": false,
+                    "properties": { "files": { "type": "integer" } },
+                },
+            }),
+        )],
+        // 子代理的一条 Run：它的一轮就是它的全部——最后那条回复就是结果。
+        vec![text_round(1, child_text)],
+        // 父续跑：手里那条工具结果就是子代理的结果。
+        vec![text_round(1, "子代理数出来是 3 个文件。")],
+    ])
+}
+
+/// 委派端到端：任务变成同 Session 里的一条**子 Run**，它自己跑完，结果回到父那次调用的
+/// 工具结果上，父接着说下去（§4）。
+#[tokio::test]
+async fn a_delegated_task_becomes_a_child_run_and_its_result_reaches_the_parent() {
+    use crate::service::test_support::harness::{Home, home_config};
+
+    const TASK: &str = "只报个数：workspace 下有几个文件，用 JSON 回答";
+    const CHILD_TEXT: &str = r#"{"files": 3}"#;
+    let llm = delegation_script(TASK, CHILD_TEXT);
+
+    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let parent = gateway
+        .submit(&session, "delegate-1", "帮我把文件数一遍")
+        .await
+        .run;
+
+    let done = gateway.wait_terminal(&parent).await;
+    assert_eq!(done.summary.state, RunState::Completed, "{done:?}");
+
+    // 子 Run 就是同 Session 里的一条普通 Run，只是带着"谁派的"与那份契约。
+    let runs = komo_store::repos::runs::list_for_session(&gateway.state().db, &session)
+        .await
+        .expect("读得出会话里的 Run");
+    let child = runs
+        .iter()
+        .find(|row| row.parent.as_ref() == Some(&parent))
+        .expect("该有一条子 Run");
+    assert_eq!(child.state, RunState::Completed, "{child:?}");
+    let spec = child.delegate.as_ref().expect("子 Run 要带受理时那份 spec");
+    assert_eq!(spec.task, TASK, "任务正文跟着子 Run 走（重启后也读得到）");
+    // 幂等键从"父 + 那次调用"派生：受理子 Run 用**我们自己的 call_id**（不是 provider 给的
+    // 那个 id——它是模型写的，重试时可能被复用），所以"受理了但还没 start 就崩了"在续跑时
+    // 重上一次会拿回同一条子 Run，不会多出一条。
+    assert!(
+        child
+            .request_key
+            .as_str()
+            .starts_with(&format!("delegate:{parent}:")),
+        "{}",
+        child.request_key.as_str()
+    );
+
+    // 父拿到的是那次调用的**工具结果**，不是子代理的对话：它走**轮输入**回到父那一轮
+    // （不是回放窗口里的消息，窗口按 Run 过滤，子代理的轮次进不来）。
+    let inputs = llm.inputs.lock().expect("脚本模型");
+    let delivered = inputs
+        .iter()
+        .find_map(|input| match input {
+            komo_kernel::types::turn::RoundInput::ToolResults { results } => results
+                .iter()
+                .find(|result| result.content.contains(child.run.as_str())),
+            _ => None,
+        })
+        .expect("父那一轮要拿到子代理的结果");
+    assert!(
+        !delivered.is_error,
+        "子代理正常结束，这条结果不该是错误：{delivered:?}"
+    );
+    assert_eq!(
+        llm.requests.lock().expect("脚本模型").len(),
+        3,
+        "父一轮 + 子一轮 + 父续跑一轮"
+    );
+}
+
+/// 子代理只拿得到任务：不继承父的对话历史、不注入记忆，也**不再拿到 `delegate`**
+/// （深度只有一层）；反过来，它跑过的那几轮也不许跑进父的窗口（§4）。
+#[tokio::test]
+async fn a_child_gets_only_its_task_and_its_rounds_stay_out_of_the_parent() {
+    use crate::service::test_support::harness::{Home, home_config};
+
+    const TASK: &str = "只报个数：workspace 下有几个文件，用 JSON 回答";
+    const PARENT_INPUT: &str = "帮我把文件数一遍";
+    let llm = delegation_script(TASK, r#"{"files": 3}"#);
+
+    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let parent = gateway
+        .submit(&session, "delegate-1", PARENT_INPUT)
+        .await
+        .run;
+    gateway.wait_terminal(&parent).await;
+
+    let requests = llm.requests.lock().expect("脚本模型");
+    assert_eq!(requests.len(), 3, "父一轮 + 子一轮 + 父续跑一轮");
+
+    // ① 父那一轮：有 `delegate` 工具，窗口里只有用户那句话。
+    let parent_first = &requests[0];
+    assert!(
+        parent_first
+            .tools
+            .iter()
+            .any(|tool| tool.name == crate::service::DELEGATE_TOOL),
+        "父要看得见 delegate"
+    );
+    assert_eq!(
+        parent_first.messages.len(),
+        1,
+        "{:?}",
+        parent_first.messages
+    );
+
+    // ② 子那一轮：提示里是任务，不是父的输入；窗口里只有那条任务；没有 `delegate`。
+    let child = &requests[1];
+    assert!(
+        child.system_prompt.contains(TASK),
+        "{}",
+        child.system_prompt
+    );
+    assert!(
+        !child.system_prompt.contains(PARENT_INPUT),
+        "父的输入不该出现在子代理的提示里：{}",
+        child.system_prompt
+    );
+    assert_eq!(
+        child.messages.len(),
+        1,
+        "子代理只带任务：{:?}",
+        child.messages
+    );
+    assert_eq!(child.messages[0].text.as_deref(), Some(TASK));
+    assert!(
+        !child
+            .tools
+            .iter()
+            .any(|tool| tool.name == crate::service::DELEGATE_TOOL),
+        "深度只有一层：子代理不该再看见 delegate"
+    );
+
+    // ③ 父续跑那一轮：子代理跑过的那几轮不在父的窗口里（结果只从工具结果进来）。
+    let parent_again = &requests[2];
+    assert!(
+        !parent_again
+            .messages
+            .iter()
+            .any(|message| message.text.as_deref() == Some(r#"{"files": 3}"#)),
+        "子代理的回复不该作为消息进父的窗口：{:?}",
+        parent_again.messages
+    );
+}
+
+/// 取消父 Run 时，它派出去、还没结束的子 Run 一并被取消（§4）：操作者撤的是这件事。
+#[tokio::test]
+async fn cancelling_the_parent_cancels_its_child_run() {
+    use crate::service::test_support::harness::{FakeLlm, Home, config_toml};
+    use komo_kernel::types::delegate::DelegateSpec;
+    use komo_kernel::types::ids::{RequestKey, ToolCallId};
+    use komo_kernel::types::plan::PlanSource;
+    use komo_kernel::types::status::RunEnd;
+
+    let home = Home::with_config(&config_toml(""));
+    let gateway = home.start(FakeLlm::finisher("好。")).await;
+    let session = gateway.open_session().await;
+    let state = gateway.state();
+    let now = state.clock.now();
+    let parent = RunId::new_at(now);
+    let child = RunId::new_at(now);
+
+    // 两条行照 §8.5 的顺序落下来：父是普通 Run，子带着"谁派的"。
+    let seed = |run: RunId, key: &str, delegate: Option<DelegateSpec>| {
+        let new = komo_store::repos::runs::NewRun {
+            run,
+            session: session.clone(),
+            request_key: RequestKey::new(key),
+            input_hash: "seed".into(),
+            source: PlanSource::Interactive {
+                session: session.clone(),
+            },
+            peer: None,
+            model: state.snapshot().model.clone(),
+            effort: None,
+            delegate,
+            at: now,
+        };
+        let db = state.db.clone();
+        async move {
+            db.with_write_retry(move |ex| {
+                let new = new.clone();
+                Box::pin(async move {
+                    komo_store::repos::runs::reserve_in(ex, &new)
+                        .await
+                        .map(|_| ())
+                })
+                    as komo_store::db::BoxFuture<'_, Result<(), komo_kernel::traits::StoreError>>
+            })
+            .await
+            .expect("落一条 Run");
+        }
+    };
+    seed(parent.clone(), "p", None).await;
+    seed(
+        child.clone(),
+        "c",
+        Some(DelegateSpec::new(
+            parent.clone(),
+            ToolCallId::from_raw("pc-1"),
+            "数文件",
+        )),
+    )
+    .await;
+
+    gateway
+        .state()
+        .finish_run(&session, &parent, RunEnd::Cancelled { by: None })
+        .await
+        .expect("取消父");
+
+    let runs = komo_store::repos::runs::list_for_session(&gateway.state().db, &session)
+        .await
+        .expect("读得出会话里的 Run");
+    let child_row = runs
+        .iter()
+        .find(|row| row.run == child)
+        .expect("子 Run 还在账本里");
+    assert_eq!(
+        child_row.state,
+        RunState::Cancelled,
+        "父被取消，子代理不能继续跑：{child_row:?}"
+    );
+}
+
+/// 注册用的工具名与工具自己报的名字必须一致——「两处各写一个字面量」迟早会漂。
+#[test]
+fn the_delegate_tool_name_matches_the_registry() {
+    use komo_kernel::traits::Tool;
+
+    assert_eq!(
+        komo_runtime::tools::DelegateTool::new().definition().name,
+        crate::service::DELEGATE_TOOL
+    );
 }

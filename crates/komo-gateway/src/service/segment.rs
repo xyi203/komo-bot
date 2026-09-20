@@ -24,6 +24,7 @@ use async_trait::async_trait;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::{Surface, SurfaceMessage, fold};
 use komo_kernel::traits::{ApprovalRepo, Ledger, LedgerError};
+use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
@@ -36,6 +37,7 @@ use komo_runtime::scheduler::HandlerError;
 use komo_runtime::tools::paths;
 use komo_store::{CheckpointStore, Db, RecoveryStore};
 
+use super::DELEGATE_TOOL;
 use super::ledgers::RoutedLedger;
 
 /// 装配执行段，并持有每个 Run 的取消开关。
@@ -234,14 +236,43 @@ impl SegmentSource for GatewaySegments {
             label: "workspace".into(),
         }];
 
-        let memories = self.recall_for(&session, &run, &surface).await;
+        // 这是一条**子代理**吗？（§4）是的话，它的契约与预算跟着它走——父侧派它时给的那份，
+        // 落在它自己的 `run.accepted` 里，所以重启之后也读得到。
+        let delegate = surface
+            .runs
+            .get(&run)
+            .and_then(|view| view.delegate.clone());
+
+        // 子代理只拿得到任务本身：不注入记忆、不列 Skills、也**不带上父的对话历史**（回放
+        // 窗口按本 Run 过滤，见下）。自包含这件事是父侧的责任，提示词里对它也说了。
+        let memories = match &delegate {
+            Some(_) => Vec::new(),
+            None => self.recall_for(&session, &run, &surface).await,
+        };
+
+        let (prompt, tools) = match &delegate {
+            Some(spec) => {
+                let prompt = subagent_prompt(&cwd, &tools, spec);
+                // 深度只有一层：`delegate` 不列给它。真正的拦在 runtime 的编排里（工具表
+                // 是 UX，模型自己拼出这个名字不该能绕过不变量）。
+                let offered = tools
+                    .into_iter()
+                    .filter(|tool| tool.name != DELEGATE_TOOL)
+                    .collect();
+                (prompt, offered)
+            }
+            None => (system_prompt(&cwd, &tools, &self.skills_prompt()), tools),
+        };
 
         let request = TurnRequest {
             session: session.clone(),
             run: run.clone(),
             model: record.model.clone(),
-            system_prompt: system_prompt(&cwd, &tools, &self.skills_prompt()),
-            messages: replay(&surface),
+            system_prompt: prompt,
+            // **按本 Run 过滤**：子代理跑过的那几轮属于它自己那条 Run，父续跑时读回来的
+            // 必须是父自己的上下文——否则子代理的探索过程会跑进父的窗口，而父侧本来只
+            // 该拿到那条结果（§4）。
+            messages: replay(&surface, &run),
             tools,
             memories,
             covers: None,
@@ -255,11 +286,18 @@ impl SegmentSource for GatewaySegments {
             roots,
             env_version: None,
             principal: None,
+            // 本 Run 是被谁派的（普通 Run 是 None）。runtime 用它硬拦"子代理再委派"。
+            delegated: delegate.clone(),
+            model: record.model.clone(),
             cancel: self.token_for(&run),
         };
 
         let budget = Budget {
-            max_rounds: self.max_rounds_for(&record.source).await,
+            max_rounds: match &delegate {
+                // 子代理的轮次预算是父侧派它时给的（§4），不是全局默认值。
+                Some(spec) => spec.rounds,
+                None => self.max_rounds_for(&record.source).await,
+            },
             max_tokens: None,
             first_round: rounds_so_far + 1,
             retry: RetryBudget {
@@ -459,8 +497,8 @@ fn call_request(surface: &Surface, events: &[Event], call: &ToolCallId) -> Optio
 /// 的收尾；照搬位置发出去，provider 看到的就是"助手要了一次调用、紧接着另一个 Run 的
 /// 用户消息、最后才是那次调用的输出"，直接 400（`No tool output found for tool call …`）。
 /// 领取那一步已经保证后一个 Run 不会先跑（`DUE_SQL`），这里管的是它**还没跑**时那半句话。
-fn replay(surface: &Surface) -> Vec<ReplayMessage> {
-    window(surface)
+fn replay(surface: &Surface, only: &RunId) -> Vec<ReplayMessage> {
+    window(surface, Some(only))
         .into_iter()
         .map(|message| ReplayMessage {
             role: message.role,
@@ -500,10 +538,13 @@ fn replay(surface: &Surface) -> Vec<ReplayMessage> {
 /// 还没被领走的 Run 整个不进转写（`awaits_claim`）：它的输入已经落盘，但这一轮还没轮到
 /// 它。TUI 走的是 `Surface::replay`（原样、按日志顺序），两者不是一回事——用户在界面上要
 /// 立刻看到自己刚发的那句话，而模型不能在半轮中间读到它。
-fn window(surface: &Surface) -> Vec<&SurfaceMessage> {
+fn window<'s>(surface: &'s Surface, only: Option<&RunId>) -> Vec<&'s SurfaceMessage> {
     let kept: Vec<&SurfaceMessage> = surface
         .replay()
         .iter()
+        // `only` = 只要**本 Run 自己**的那几句。子代理与父在同一份日志里，但它们不是同一段
+        // 对话：子代理跑过的那几轮不能进父的窗口，父的也没进过子代理的（§4）。
+        .filter(|message| only.is_none_or(|run| message.run.as_ref() == Some(run)))
         .filter(|message| {
             message
                 .run
@@ -539,7 +580,7 @@ fn window(surface: &Surface) -> Vec<&SurfaceMessage> {
 
 /// 回放面上最后一条用户消息的正文。
 fn latest_user_text(surface: &Surface) -> Option<String> {
-    window(surface)
+    window(surface, None)
         .into_iter()
         .rfind(|message| message.role == komo_kernel::types::turn::Role::User)
         .and_then(|message| message.text.clone())
@@ -578,6 +619,45 @@ fn system_prompt(cwd: &std::path::Path, tools: &[ToolDefinition], skills: &str) 
     if !skills.trim().is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(skills);
+    }
+    prompt
+}
+
+/// 子代理的系统提示（§4）。
+///
+/// **它不共享父那份正文**：子代理拿不到父的对话历史、记忆与 Skills，只拿得到这一条任务。
+/// 所以提示必须自己把三件事说清：这是被派出来的、干完要交什么、以及"任务里没写的东西
+/// 就是没给你"——最后这句不是客套，它把"自包含"从一句设计口号变成对子代理可执行的要求。
+fn subagent_prompt(cwd: &std::path::Path, tools: &[ToolDefinition], spec: &DelegateSpec) -> String {
+    let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
+    let mut prompt = format!(
+        "你是 komo 派出去的子代理，只负责下面这一件事。你看不到主对话、记忆与 Skills——\
+         任务里没写的上下文就是没有给你，需要什么就用工具自己查，查不到就如实说。\n\
+         任务：{}\n\
+         工作目录：{}\n\
+         可用工具：{}\n\
+         危险操作会被拦下来等人批准；被拒绝就把它当作结果，不要绕过。\n\
+         做完之后如实报告做了什么、有什么证据；没有证据就说没有。",
+        spec.task,
+        cwd.display(),
+        if names.is_empty() {
+            "（这一段没有工具）".to_string()
+        } else {
+            names.join("、")
+        }
+    );
+    prompt.push_str("\n\n最后一条回复要**只有结果本身**（不要在那里调工具、不要寒暄）：");
+    match &spec.contract {
+        Some(contract) => {
+            prompt.push_str(
+                "\n一个 JSON 对象，满足下面这份 schema——父侧会用**同一份**校验，\
+                 不合规会被退回来让你改：\n",
+            );
+            prompt.push_str(
+                &serde_json::to_string_pretty(&contract.schema).unwrap_or_else(|_| "{}".into()),
+            );
+        }
+        None => prompt.push_str("\n一段能独立读懂的结论（父侧只会把这段文本拿走）。"),
     }
     prompt
 }

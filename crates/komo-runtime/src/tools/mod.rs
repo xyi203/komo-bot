@@ -2,7 +2,12 @@
 //!
 //! 搜索走 shell 或 Python，HTTP 走 Python 库或命令；Git、构建、测试、HA、网页搜索和
 //! 记录查询都是这五个的组合，**不新增第六个**。
+//!
+//! `delegate` 是这条规则的一个例外，而且它**不是第六个基础工具**：模型看不见任何新能力
+//! ——子代理用的还是这五个工具，它自己的每一次调用照常过 Policy。委派只是"把一件事交给
+//! 另一条 Run"的入口，而且不由工具执行（见 [`delegate`]）。
 
+pub mod delegate;
 pub mod edit;
 pub mod paths;
 pub mod process;
@@ -18,6 +23,7 @@ use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::tool::ToolError;
 use serde::{Deserialize, Serialize};
 
+pub use delegate::DelegateTool;
 pub use edit::EditTool;
 pub use python::PythonTool;
 pub use read::ReadTool;

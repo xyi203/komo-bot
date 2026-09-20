@@ -402,6 +402,12 @@ pub struct FakeLlm {
     fallback: Mutex<Vec<Result<Round, LlmError>>>,
     turns: AtomicUsize,
     pub requests: Mutex<Vec<TurnRequest>>,
+    /// 每次 `TurnDriver::next` 拿到的**轮输入**。
+    ///
+    /// `requests` 只说明"模型被问了什么"，这一条才说明"它拿到手的是什么"——工具结果是通过
+    /// 轮输入回去的（不是回放窗口里的消息），"父到底收没收到子代理的结果"（§4）只有这里
+    /// 答得出来。
+    pub inputs: Arc<Mutex<Vec<RoundInput>>>,
 }
 
 impl FakeLlm {
@@ -411,6 +417,7 @@ impl FakeLlm {
             fallback: Mutex::new(vec![text_round(99, "（没有别的要做了）")]),
             turns: AtomicUsize::new(0),
             requests: Mutex::new(Vec::new()),
+            inputs: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -458,6 +465,7 @@ impl LlmClient for FakeLlm {
         Ok(Box::new(FakeDriver {
             rounds: rounds.into_iter().collect(),
             usage: TokenUsage::default(),
+            inputs: Arc::clone(&self.inputs),
         }))
     }
 }
@@ -465,11 +473,13 @@ impl LlmClient for FakeLlm {
 struct FakeDriver {
     rounds: std::collections::VecDeque<Result<Round, LlmError>>,
     usage: TokenUsage,
+    inputs: Arc<Mutex<Vec<RoundInput>>>,
 }
 
 #[async_trait]
 impl TurnDriver for FakeDriver {
-    async fn next(&mut self, _input: RoundInput) -> Result<Round, LlmError> {
+    async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
+        self.inputs.lock().expect("脚本模型").push(input);
         match self.rounds.pop_front() {
             Some(round) => round,
             // 脚本演完：给一句收尾，而不是一个错误（理由见 `FakeLlm` 的注释）。

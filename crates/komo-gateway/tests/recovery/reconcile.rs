@@ -41,6 +41,8 @@ async fn seed_waiting_retry(
         peer: None,
         model: state.snapshot().model.clone(),
         effort: None,
+        // 这条 Run 不是被派出来的（§4）：委派那条路要带 DelegateSpec。
+        delegate: None,
         at: now,
     };
     let wait = WaitReason::Retry {

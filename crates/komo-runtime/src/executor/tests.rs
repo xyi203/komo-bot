@@ -1032,3 +1032,542 @@ async fn the_executor_publishes_the_definitions_of_what_it_holds() {
         .collect();
     assert_eq!(names, vec!["read".to_string(), "write".to_string()]);
 }
+
+/// 委派（§4、§8.4 的 `dependency`）：一次子任务怎么变成一条子 Run、父调用怎么收尾。
+///
+/// 这一组全部用 [`MemLedger`]，因为要断言的正是**账本里发生了什么**——子 Run 的受理事件、
+/// 父调用那条悬着的 `tool.started`、落回那次尝试的结果。折出来的视图与事件都查得到。
+mod delegation {
+    use super::*;
+
+    use komo_kernel::events::EventPayload;
+    use komo_kernel::traits::{Ledger, ToolOutputStore};
+    use komo_kernel::types::delegate::{DelegateSpec, SchemaMode};
+    use komo_kernel::types::ids::{RunId, ToolCallId};
+    use komo_kernel::types::plan::ExecutionPlan;
+    use komo_kernel::types::status::RunEnd;
+    use serde_json::json;
+
+    use crate::tools::DelegateTool;
+
+    /// 账本里落过盘的那份计划——续跑时调用方手里拿到的就是它（§7.4：重新 prepare 会
+    /// 换一个哈希，原授权就覆盖不到了）。
+    fn recorded_plan(harness: &Harness, call: &ToolCallId) -> ExecutionPlan {
+        harness
+            .ledger
+            .events()
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::ToolPlanned(planned) if &planned.call_id == call => {
+                    planned.plan.as_deref().cloned()
+                }
+                _ => None,
+            })
+            .expect("计划已经落过盘")
+    }
+
+    /// 账本里全部**子 Run**。派一条子 Run 恰好写一条带 `delegate` 的 `run.accepted`，
+    /// 所以它是"派出去几条"的权威答案——比数内存里的什么列表都强。
+    fn child_runs(harness: &Harness) -> Vec<RunId> {
+        harness
+            .ledger
+            .events()
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::RunAccepted(accepted) if accepted.delegate.is_some() => {
+                    event.run.clone()
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn results_for_call(harness: &Harness, call: &ToolCallId) -> usize {
+        harness
+            .ledger
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(&event.payload, EventPayload::ToolResult(result) if &result.call_id == call)
+            })
+            .count()
+    }
+
+    /// 一条父 Run + 一次 `delegate` 调用，策略全放行。
+    async fn delegate_round(
+        harness: &Harness,
+        args: serde_json::Value,
+    ) -> (komo_kernel::types::ids::SessionId, RunId, CallRequest) {
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[("delegate", args)]).await;
+        (session, run, calls.into_iter().next().expect("一个调用"))
+    }
+
+    /// 从"派出去"走到"回来收口"之间那一步：把父调用的形状补成账本会给的形状。
+    fn resumed_request(
+        harness: &Harness,
+        request: &CallRequest,
+        attempt: &AttemptId,
+    ) -> CallRequest {
+        let mut resumed = request.clone();
+        resumed.plan = Some(recorded_plan(harness, &request.call));
+        resumed.resumed = Some(resumed_from(
+            ToolCallState::Started,
+            Some(attempt.clone()),
+            1,
+        ));
+        resumed
+    }
+
+    /// 那次已经 `start_call` 过的尝试。
+    fn attempt_of(harness: &Harness, call: &ToolCallId) -> AttemptId {
+        harness.ledger.surface().calls[call]
+            .attempt
+            .clone()
+            .expect("已经 start_call 过")
+    }
+
+    /// ① 一次委派 = 一条子 Run + 父调用进入等待。**这条调用没有结果**：它在等子 Run，
+    /// 而"在等"既不是失败也不是"做完了但什么都没写"。
+    #[tokio::test]
+    async fn a_delegated_task_becomes_a_child_run_and_the_call_waits() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(
+            &harness,
+            json!({
+                "task": "把 a.txt 里的小数点都改成逗号",
+                "rounds": 3,
+                "output_schema": { "type": "object" }
+            }),
+        )
+        .await;
+
+        let outcome = executor
+            .execute_round(vec![request.clone()], &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        let Some(RoundStop::Dependency { run: child, call }) = outcome.stop.clone() else {
+            panic!("{:?}", outcome.stop)
+        };
+        assert_eq!(call, request.call);
+        assert!(
+            outcome.results.is_empty(),
+            "在等的调用没有结果：{:?}",
+            outcome.results
+        );
+        assert_eq!(
+            results_for_call(&harness, &request.call),
+            0,
+            "没有 tool.result"
+        );
+
+        // 受理事件带着**整份** spec：重启之后它是子代理唯一的"结果要长什么样"的依据。
+        let specs: Vec<DelegateSpec> = harness
+            .ledger
+            .accepted()
+            .into_iter()
+            .filter_map(|input| input.delegate)
+            .collect();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].parent, run);
+        assert_eq!(specs[0].call, request.call);
+        assert_eq!(specs[0].task, "把 a.txt 里的小数点都改成逗号");
+        assert_eq!(specs[0].rounds, 3);
+        assert!(specs[0].contract.is_some(), "契约跟着事件一起落盘");
+
+        // 折出来的视图认得出这条边：父视图靠它知道"哪些 Run 是我的子代理"，
+        // 子 Run 靠它拿到结果契约。
+        let surface = harness.ledger.surface();
+        assert_eq!(surface.runs[&child].delegate.as_ref(), Some(&specs[0]));
+        assert_eq!(child_runs(&harness), vec![child.clone()]);
+        // 调用已经 `tool.started`、还没有结果——它悬着是对的：子 Run 会把它收口。
+        assert_eq!(surface.calls[&request.call].state, ToolCallState::Started);
+        assert!(surface.calls[&request.call].output.is_none());
+    }
+
+    /// ② 子 Run 完成 + 结果合契约 → 调用按 Completed 收尾，结果里带子 Run id 与数据。
+    #[tokio::test]
+    async fn a_completed_child_settles_the_call_with_its_result() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(
+            &harness,
+            json!({
+                "task": "数一下 /tmp 下有几个文件",
+                "output_schema": {
+                    "type": "object",
+                    "required": ["count"],
+                    "properties": { "count": { "type": "integer" } }
+                }
+            }),
+        )
+        .await;
+        let env = harness.env(&session, &run);
+        let outcome = executor
+            .execute_round(vec![request.clone()], &env)
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency { run: child, .. }) = outcome.stop else {
+            panic!("{:?}", outcome.stop)
+        };
+        let attempt = attempt_of(&harness, &request.call);
+
+        // 子代理把结果放进**最后一条回复**：围栏与前后闲话都要容忍。
+        harness
+            .ledger
+            .complete(
+                &child,
+                RunEnd::Completed {
+                    final_message: Some("数完了：\n```json\n{\"count\": 3}\n```\n以上".into()),
+                    rounds: 2,
+                },
+            )
+            .await
+            .unwrap();
+
+        let done = executor
+            .execute_round(vec![resumed_request(&harness, &request, &attempt)], &env)
+            .await
+            .unwrap();
+
+        assert!(done.stop.is_none(), "{:?}", done.stop);
+        assert_eq!(done.results.len(), 1);
+        assert!(!done.results[0].is_error);
+        assert!(
+            done.results[0].content.contains(child.as_str()),
+            "父侧要看得见是哪条子 Run：{}",
+            done.results[0].content
+        );
+
+        // 结果落回**那次尝试**上：子 Run id 与数据都在正文里——父侧的模型只看得见这条
+        // 工具结果，它自己去读那条 Run 的完整过程。
+        let results = harness.results_for(&attempt);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ToolResultStatus::Completed);
+        let body = harness
+            .outputs
+            .open(&results[0].output_ref)
+            .await
+            .unwrap()
+            .body;
+        assert_eq!(body.result["run"], json!(child));
+        assert_eq!(body.result["status"], json!("completed"));
+        assert_eq!(body.result["result"]["count"], json!(3));
+        assert!(body.error.is_none());
+    }
+
+    /// ③ 结果不合契约：permissive 放行但**标记出来**，strict 判这次委派失败。
+    /// 同一份结果、同一份校验器，差的只是怎么收口。
+    #[tokio::test]
+    async fn an_off_contract_result_is_marked_in_permissive_and_fails_in_strict() {
+        for mode in [SchemaMode::Permissive, SchemaMode::Strict] {
+            let harness = Harness::new();
+            let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+            let (session, run, request) = delegate_round(
+                &harness,
+                json!({
+                    "task": "数一下 /tmp 下有几个文件",
+                    "output_schema": {
+                        "type": "object",
+                        "required": ["count"],
+                        "properties": { "count": { "type": "integer" } }
+                    },
+                    "schema_mode": mode
+                }),
+            )
+            .await;
+            let env = harness.env(&session, &run);
+            let outcome = executor
+                .execute_round(vec![request.clone()], &env)
+                .await
+                .unwrap();
+            let Some(RoundStop::Dependency { run: child, .. }) = outcome.stop else {
+                panic!("{:?}", outcome.stop)
+            };
+            let attempt = attempt_of(&harness, &request.call);
+            harness
+                .ledger
+                .complete(
+                    &child,
+                    RunEnd::Completed {
+                        final_message: Some("{\"files\": []}".into()),
+                        rounds: 1,
+                    },
+                )
+                .await
+                .unwrap();
+
+            let done = executor
+                .execute_round(vec![resumed_request(&harness, &request, &attempt)], &env)
+                .await
+                .unwrap();
+            let body = harness
+                .outputs
+                .open(&harness.results_for(&attempt)[0].output_ref)
+                .await
+                .unwrap()
+                .body;
+            let content = &done.results[0].content;
+
+            match mode {
+                SchemaMode::Permissive => {
+                    assert_eq!(body.status, ToolResultStatus::Completed, "放行");
+                    assert_eq!(body.result["schema_overridden"], json!(true), "标记出来");
+                    assert!(!done.results[0].is_error);
+                    assert!(content.contains("不符合契约"), "{content}");
+                }
+                SchemaMode::Strict => {
+                    assert_eq!(body.status, ToolResultStatus::Failed);
+                    assert!(done.results[0].is_error);
+                    assert_ne!(body.result["schema_overridden"], json!(true));
+                    assert!(
+                        body.error.as_deref().unwrap_or_default().contains("契约"),
+                        "{:?}",
+                        body.error
+                    );
+                    assert!(content.contains(child.as_str()), "{content}");
+                }
+            }
+        }
+    }
+
+    /// ④ 子 Run 没跑成 → 调用跟着失败，理由里写明子 Run 是**怎么**结束的。
+    #[tokio::test]
+    async fn a_child_that_did_not_finish_fails_the_call_with_its_ending() {
+        let endings = [
+            (
+                RunEnd::Failed {
+                    reason: "工具连续失败".into(),
+                },
+                "failed",
+            ),
+            (RunEnd::Cancelled { by: None }, "cancelled"),
+            (
+                RunEnd::Abandoned {
+                    by: None,
+                    reason: Some("没人再管它了".into()),
+                },
+                "abandoned",
+            ),
+        ];
+
+        for (end, kind) in endings {
+            let harness = Harness::new();
+            let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+            let (session, run, request) =
+                delegate_round(&harness, json!({ "task": "跑一遍检查" })).await;
+            let env = harness.env(&session, &run);
+            let outcome = executor
+                .execute_round(vec![request.clone()], &env)
+                .await
+                .unwrap();
+            let Some(RoundStop::Dependency { run: child, .. }) = outcome.stop else {
+                panic!("{:?}", outcome.stop)
+            };
+            let attempt = attempt_of(&harness, &request.call);
+            harness.ledger.complete(&child, end).await.unwrap();
+
+            let done = executor
+                .execute_round(vec![resumed_request(&harness, &request, &attempt)], &env)
+                .await
+                .unwrap();
+
+            assert!(done.stop.is_none(), "{kind}：{:?}", done.stop);
+            assert!(done.results[0].is_error, "{kind}");
+            assert!(done.results[0].content.contains(child.as_str()), "{kind}");
+            let body = harness
+                .outputs
+                .open(&harness.results_for(&attempt)[0].output_ref)
+                .await
+                .unwrap()
+                .body;
+            assert_eq!(body.status, ToolResultStatus::Failed, "{kind}");
+            assert_eq!(body.result["status"], json!(kind));
+            assert_eq!(body.result["run"], json!(child));
+            // "失败了"这三个字既不说谁失败、也不说下一步该做什么——所以原因要写全。
+            assert!(
+                body.error
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(child.as_str()),
+                "{kind}：{:?}",
+                body.error
+            );
+        }
+        // 子 Run 失败的原因要能读到（这里只看最后一条：三条路径共用同一段折算）。
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(&harness, json!({ "task": "干活" })).await;
+        let env = harness.env(&session, &run);
+        let outcome = executor
+            .execute_round(vec![request.clone()], &env)
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency { run: child, .. }) = outcome.stop else {
+            panic!()
+        };
+        let attempt = attempt_of(&harness, &request.call);
+        harness
+            .ledger
+            .complete(
+                &child,
+                RunEnd::Failed {
+                    reason: "工具连续失败".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let done = executor
+            .execute_round(vec![resumed_request(&harness, &request, &attempt)], &env)
+            .await
+            .unwrap();
+        assert!(
+            done.results[0].content.contains("工具连续失败"),
+            "{:?}",
+            done.results[0]
+        );
+    }
+
+    /// ⑤ 子 Run 还在跑 → **又一次等待**，不是失败。它可能正停在一条审批上，也可能刚被
+    /// 别的执行实例领走；这两种都不该把父侧叫醒成一个失败。
+    #[tokio::test]
+    async fn a_child_that_is_still_running_keeps_the_call_waiting() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(&harness, json!({ "task": "干活" })).await;
+        let env = harness.env(&session, &run);
+        let outcome = executor
+            .execute_round(vec![request.clone()], &env)
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency { run: child, .. }) = outcome.stop else {
+            panic!("{:?}", outcome.stop)
+        };
+        let attempt = attempt_of(&harness, &request.call);
+
+        // 子 Run 一条事件都还没有（没完成、没失败）——它还在跑。
+        let again = executor
+            .execute_round(vec![resumed_request(&harness, &request, &attempt)], &env)
+            .await
+            .unwrap();
+
+        let Some(RoundStop::Dependency { run: waiting, .. }) = again.stop else {
+            panic!("{:?}", again.stop)
+        };
+        assert_eq!(waiting, child, "等的还是同一条子 Run");
+        assert!(again.results.is_empty());
+        assert_eq!(results_for_call(&harness, &request.call), 0, "还是没有结果");
+    }
+
+    /// ⑥ 受理按 `request_key` 幂等：同一件委派再受理一次拿回的是**同一条**子 Run。
+    /// "受理了但还没 start 就崩了"的续跑走的正是这条路——账本给的形状是 `planned`
+    /// （确定没跑过），于是重走一遍首次路径。
+    #[tokio::test]
+    async fn accepting_the_same_delegation_twice_reuses_the_child_run() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) =
+            delegate_round(&harness, json!({ "task": "跑一遍检查" })).await;
+        let env = harness.env(&session, &run);
+
+        let first = executor
+            .execute_round(vec![request.clone()], &env)
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency {
+            run: first_child, ..
+        }) = first.stop
+        else {
+            panic!("{:?}", first.stop)
+        };
+
+        let mut again = request.clone();
+        again.plan = Some(recorded_plan(&harness, &request.call));
+        again.resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
+        let second = executor.execute_round(vec![again], &env).await.unwrap();
+
+        let Some(RoundStop::Dependency {
+            run: second_child, ..
+        }) = second.stop
+        else {
+            panic!("{:?}", second.stop)
+        };
+        assert_eq!(second_child, first_child, "重来一次拿回的是同一条子 Run");
+        assert_eq!(child_runs(&harness), vec![first_child], "没有多派出一条");
+    }
+
+    /// ⑦ 派出去这件事本身要过 Policy 与审批（§7.1）：没放行就不该在账本里留下一条
+    /// 没人认领的子 Run。
+    #[tokio::test]
+    async fn an_unapproved_delegation_creates_no_child_run() {
+        let harness = Harness::new();
+        // §7.1 那张初始建议表里没有 delegate 这一行——它是默认的 Ask。
+        let executor = harness.initial(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(&harness, json!({ "task": "干活" })).await;
+        let env = harness.env(&session, &run);
+
+        let stopped = executor
+            .execute_round(vec![request.clone()], &env)
+            .await
+            .unwrap();
+        let Some(RoundStop::Approval { approval, .. }) = stopped.stop.clone() else {
+            panic!("{:?}", stopped.stop)
+        };
+        assert!(
+            child_runs(&harness).is_empty(),
+            "审批之前一条子 Run 都不该有"
+        );
+
+        // 批准之后才受理。审批绑定的是那份计划，所以续跑沿用同一份（重新 prepare 会
+        // 换一个哈希，原授权就覆盖不到了）。
+        harness
+            .gate
+            .decide(&approval, true, ApprovalScope::Once, None)
+            .await
+            .unwrap();
+        let mut resumed = request.clone();
+        resumed.approval = Some(approval);
+        resumed.plan = Some(recorded_plan(&harness, &request.call));
+        resumed.resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
+
+        let done = executor.execute_round(vec![resumed], &env).await.unwrap();
+        let Some(RoundStop::Dependency { run: child, .. }) = done.stop else {
+            panic!("{:?}", done.stop)
+        };
+        assert_eq!(child_runs(&harness), vec![child]);
+    }
+
+    /// ⑧ 深度只有一层。守卫在**编排里**而不是在工具表里：把 `delegate` 从子代理的工具表
+    /// 摘掉是 UX，模型自己拼出这个名字就绕过去了，而能被绕过的约束等于没有。
+    #[tokio::test]
+    async fn a_child_run_cannot_delegate_again() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        // 这条 Run 是被派的——`delegated` 说得出它是谁派出来的。
+        let (session, run, request) =
+            delegate_round(&harness, json!({ "task": "再派一层出去" })).await;
+        let env = harness.child_env(
+            &session,
+            &run,
+            DelegateSpec::new(
+                RunId::from_raw("run-上层"),
+                ToolCallId::from_raw("call-上层"),
+                "上层任务",
+            ),
+        );
+
+        let outcome = executor.execute_round(vec![request], &env).await.unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("一层"),
+            "{}",
+            outcome.results[0].content
+        );
+        assert!(child_runs(&harness).is_empty(), "被派的 Run 不能再派一条");
+    }
+}

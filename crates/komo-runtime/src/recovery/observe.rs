@@ -224,6 +224,8 @@ mod tests {
             peer: None,
             model: Some("m".into()),
             effort: None,
+            // 这个夹具是普通 Run 的受理事件：没有父、没有契约。
+            delegate: None,
         })
     }
 

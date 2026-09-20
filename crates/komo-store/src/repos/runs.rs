@@ -4,6 +4,7 @@
 //! 一切——建行、记事件引用、记终态、按请求键去重。
 
 use komo_kernel::traits::StoreError;
+use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::{
     ApprovalId, EventId, ExecutorId, InterventionId, RequestKey, RunId, Seq, SessionId,
 };
@@ -28,6 +29,10 @@ pub struct RunRecord {
     /// 承载输入那条事件的 `seq`（§8.3）：**同 Session 内次序的权威**。`Seq(0)` = 未知。
     pub input_seq: Seq,
     pub final_event: Option<EventId>,
+    /// 派它的那条 Run；`None` = 顶层 Run（§8.4 的委派子 Run）。
+    pub parent: Option<RunId>,
+    /// 受理时那份委派计划；读不出来（旧行 / 损坏行）时是 `None`，不猜（[`delegate_of`]）。
+    pub delegate: Option<DelegateSpec>,
     /// 调度状态（§8.4）。
     pub state: RunState,
     /// `state == Waiting` 时在等什么（§8.4）。
@@ -59,6 +64,8 @@ impl RunRecord {
             input_event: row.input_event.clone().map(EventId::from_raw),
             input_seq: Seq(row.input_seq.max(0) as u64),
             final_event: row.final_event.clone().map(EventId::from_raw),
+            parent: row.parent_run_id.clone().map(RunId::from_raw),
+            delegate: delegate_of(row),
             state: state_of(row)?,
             wait: wait_of(row)?,
             source: decode(&row.source, "runs.source")?,
@@ -85,6 +92,8 @@ pub struct NewRun {
     pub request_key: RequestKey,
     pub input_hash: String,
     pub source: PlanSource,
+    /// 这条 Run 是一次委派的子 Run 时，父侧那一份计划（§8.4）。`None` = 顶层 Run。
+    pub delegate: Option<DelegateSpec>,
     pub peer: Option<String>,
     pub model: ModelConfig,
     pub effort: Option<String>,
@@ -160,6 +169,31 @@ pub fn state_str(state: RunState) -> String {
     state.as_str().to_string()
 }
 
+/// 一行身上那份委派计划（§8.4）。**读不出来不算损坏**：当作"没有契约"放行，只告警。
+///
+/// 与 [`state_of`] / [`wait_of`] 的严厉相反，这里的理由是这两列**不参与调度判定**：
+/// 能不能领、谁挡着谁看的是 `state` / `wait_*` / `parent_run_id`，而 `delegate` 那一列
+/// 只影响"父侧复验时用哪份契约"。为一份读不出来的契约把整条 Run 判成损坏，代价是这条
+/// Run 再也恢复不了（`unfinished` 扫到它就报错，恢复流程整批停摆），换来的只是把一次
+/// "按自由文本处理"升级成"停摆"——**代价大于收益**。
+///
+/// 两种来源：旧行（这一列还是 NULL，这次改造之前受理的）与损坏行（写坏了的 JSON）。
+/// 前者根本不告警——它不是异常，是历史。
+pub fn delegate_of(row: &RunRow) -> Option<DelegateSpec> {
+    let raw = row.delegate.as_deref()?;
+    match serde_json::from_str::<DelegateSpec>(raw) {
+        Ok(spec) => Some(spec),
+        Err(error) => {
+            tracing::warn!(
+                run = %row.id,
+                %error,
+                "runs.delegate 解析不出来，当作没有契约"
+            );
+            None
+        }
+    }
+}
+
 /// 写进 `runs.wait_ref` 的那一段。
 ///
 /// kernel 的 [`WaitReason::reference`] 对 `retry` 给 `None`（它认为退避的进度就是次数 +
@@ -224,6 +258,11 @@ pub async fn reserve_in(ex: &mut dyn Executor, new: &NewRun) -> Result<RunRow, S
         // 受理那一步（[`mark_queued_in`]）才拿得到输入事件的 seq（§8.3）。
         input_seq: 0_i64,
         final_event: None as Option<String>,
+        // 委派的两列在**预留**那一刻就写下来：受理与领取都要看它们（`mark_queued_in` 判
+        // "这是子 Run，直接进队列"，§8.7 的领取语句判"拦住我的那条是不是我的父"），
+        // 而这两步之间没有任何写者会再补——留到受理那一步写就是在开一个窗口。
+        parent_run_id: new.delegate.as_ref().map(|spec| spec.parent.to_string()),
+        delegate: new.delegate.as_ref().map(|spec| encode(spec)).transpose()?,
         // 退役列：不再读，写入给空值（§8.2 只允许加列）。
         status: String::new(),
         state: state_str(RunState::Accepted),
@@ -356,6 +395,12 @@ pub fn nearest_unfinished_predecessor(
 /// **先后按 `(input_seq, id)` 比**，判据与 §8.7 领取语句里那句 `NOT EXISTS`、以及
 /// [`crate::repos::queue::release_satisfied_dependencies`] 的放行判据同源。次序的权威是
 /// 输入事件的 seq（§8.3），id 只在 seq 相同时做次级比较（`input_seq = 0` 的老行）。
+///
+/// **被委派的子 Run 是这条规则唯一的例外**（§8.4 的 `dependency`）：它一律落 `queued`。
+/// 它以输入序排在父后面，而父此刻正在跑、随后要停下来等它——照搬那条规则就是父子互等
+/// 死锁（父等子、子等父，两条都在库里不动）。`queued` 在这里不等于"能领走"：§8.7 的领取
+/// 语句对它的豁免**只对"拦住它的恰好是它的父、且父正等着它"这一种形状**放行，父还在跑的
+/// 时候它照样不是候选（见 [`crate::repos::queue::CLAIM_SQL`] 的 `NOT (...)`）。
 pub async fn mark_queued_in(
     ex: &mut dyn Executor,
     run: &RunId,
@@ -367,19 +412,25 @@ pub async fn mark_queued_in(
     let (session_id, self_id) = (row.session_id.clone(), row.id.clone());
     let self_key = (i64::try_from(seq.0).unwrap_or(i64::MAX), self_id.clone());
 
-    // 紧挨着的那一条：最大的、比它早的非终态 Run（判据见
-    // [`nearest_unfinished_predecessor`]）。只取这个会话的行（`runs_session` 索引），
-    // 别为了受理一条输入扫全表。
-    let rows = RunRow::filter(RunRow::fields().session_id().eq(session_id.as_str()))
-        .exec(ex)
-        .await
-        .map_err(map_toasty)?;
-    let predecessor = nearest_unfinished_predecessor(
-        &rows,
-        &session_id,
-        (self_key.0, self_key.1.as_str()),
-        Some(&self_id),
-    )?;
+    // 子 Run 不必问"谁挡着我"：挡着它的只可能是父，而父被 §8.7 的豁免放行了（见上面）。
+    // 顺带省掉一次会话级的行扫描——子 Run 的受理每次都会走这条路。
+    let predecessor = if row.parent_run_id.is_some() {
+        None
+    } else {
+        // 紧挨着的那一条：最大的、比它早的非终态 Run（判据见
+        // [`nearest_unfinished_predecessor`]）。只取这个会话的行（`runs_session` 索引），
+        // 别为了受理一条输入扫全表。
+        let rows = RunRow::filter(RunRow::fields().session_id().eq(session_id.as_str()))
+            .exec(ex)
+            .await
+            .map_err(map_toasty)?;
+        nearest_unfinished_predecessor(
+            &rows,
+            &session_id,
+            (self_key.0, self_key.1.as_str()),
+            Some(&self_id),
+        )?
+    };
 
     match predecessor {
         Some(earlier) => {

@@ -144,6 +144,7 @@ impl Ledger for MemLedger {
                 peer: input.peer.as_ref().map(|p| p.to_string()),
                 model: Some(input.model.model.clone()),
                 effort: None,
+                delegate: input.delegate.clone(),
             }),
         );
         self.append(
@@ -382,6 +383,43 @@ impl Ledger for MemLedger {
         };
         self.append(&mut state, &session, Some(run.clone()), payload);
         Ok(())
+    }
+
+    async fn run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError> {
+        // 从写下的事件里读回来——替身"够真"的那部分就在这：终态是账本里的事实，不是
+        // 另一份内存记录（否则测试里的两处会漂）。
+        let state = self.state.lock().expect("账本");
+        for event in state.events.iter().rev() {
+            if event.run.as_ref() != Some(run) {
+                continue;
+            }
+            match &event.payload {
+                EventPayload::RunCompleted(body) => {
+                    return Ok(Some(RunEnd::Completed {
+                        final_message: body.final_message.clone(),
+                        rounds: body.rounds,
+                    }));
+                }
+                EventPayload::RunFailed(body) => {
+                    return Ok(Some(RunEnd::Failed {
+                        reason: body.reason.clone(),
+                    }));
+                }
+                EventPayload::RunCancelled(body) => {
+                    return Ok(Some(RunEnd::Cancelled {
+                        by: body.by.as_ref().map(|by| by.as_str().to_string()),
+                    }));
+                }
+                EventPayload::RunAbandoned(body) => {
+                    return Ok(Some(RunEnd::Abandoned {
+                        by: body.by.as_ref().map(|by| by.as_str().to_string()),
+                        reason: body.reason.clone(),
+                    }));
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
     }
 
     async fn read(

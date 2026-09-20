@@ -279,6 +279,12 @@ pub struct RunAccepted {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<EffortSetting>,
+    /// 这是一条**子 Run**：谁派的、结果要长什么样、它有几步预算（[`DelegateSpec`]）。
+    ///
+    /// 契约落在这里而不是 state.db，是因为重启之后它是子代理唯一的"结果要长什么样"的
+    /// 依据，而账本里的这一条正好活得过重启（§8.3：内容权威）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate: Option<crate::types::delegate::DelegateSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

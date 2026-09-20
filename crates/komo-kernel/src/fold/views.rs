@@ -73,6 +73,12 @@ pub struct RunView {
     /// 这个 Run 里到目前为止跑过的模型轮次。
     #[serde(default)]
     pub rounds: u32,
+    /// 这是一条子 Run：谁派的、父侧哪次调用、结果要长什么样（§4）。
+    ///
+    /// 父视图只靠这一条边认得出"哪些 Run 是我的子代理"；子 Run 自己靠它拿到结果契约，
+    /// 重启之后也一样（它来自 `run.accepted`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegate: Option<crate::types::delegate::DelegateSpec>,
     /// 属于它的调用，按出现顺序。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<ToolCallId>,

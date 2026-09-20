@@ -285,6 +285,11 @@ impl Ledger for PublishingLedger {
         self.inner.read(session, from, limit).await
     }
 
+    /// 读，不是写：不推 SSE，也不叫醒补写（`pumped!` 是给状态变更用的）。
+    async fn run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError> {
+        self.inner.run_end(run).await
+    }
+
     async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError> {
         pumped!(self, self.inner.boundary(session).await)
     }
@@ -309,6 +314,9 @@ impl Ledger for PublishingLedger {
 pub struct RoutedLedger {
     ledgers: Arc<SessionLedgers>,
     db: Db,
+    /// 时间从这里取（`release_satisfied_dependencies` 要一个 `at`）。**不自己 `now_utc()`**：
+    /// 判决的时间由调用方从时钟取，是这套东西贯穿全篇的规矩。
+    clock: Arc<dyn komo_kernel::traits::Clock>,
     runs: Mutex<BTreeMap<RunId, SessionId>>,
     calls: Mutex<BTreeMap<ToolCallId, SessionId>>,
     attempts: Mutex<BTreeMap<AttemptId, SessionId>>,
@@ -323,10 +331,16 @@ impl std::fmt::Debug for RoutedLedger {
 }
 
 impl RoutedLedger {
-    pub fn new(ledgers: Arc<SessionLedgers>, db: Db, audit_wake: Arc<tokio::sync::Notify>) -> Self {
+    pub fn new(
+        ledgers: Arc<SessionLedgers>,
+        db: Db,
+        clock: Arc<dyn komo_kernel::traits::Clock>,
+        audit_wake: Arc<tokio::sync::Notify>,
+    ) -> Self {
         RoutedLedger {
             ledgers,
             db,
+            clock,
             runs: Mutex::new(BTreeMap::new()),
             calls: Mutex::new(BTreeMap::new()),
             attempts: Mutex::new(BTreeMap::new()),
@@ -578,7 +592,31 @@ impl Ledger for RoutedLedger {
     }
 
     async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError> {
-        self.for_run(run).await?.ledger.complete(run, end).await
+        let outcome = self.for_run(run).await?.ledger.complete(run, end).await;
+        // **终态一落下就放行等它的那些 Run**（§8.4 的次序规则）。
+        //
+        // 放在这里而不是等观察者（`run_watch` 也做这件事），是因为终态是**账本里的事实**，
+        // 与"有没有人在看这条 Run 的事件流"无关：一条由执行器受理的子 Run（§4）根本没有
+        // 观察者，靠观察者驱动会让它的父一直等到下一次对账——"父永远在等一个已经结束的
+        // 子代理"是最不该出现的那种安静故障。
+        if outcome.is_ok() {
+            match komo_store::repos::queue::release_satisfied_dependencies(
+                &self.db,
+                self.clock.now(),
+            )
+            .await
+            {
+                Ok(0) => {}
+                Ok(released) => tracing::info!(released, "放行了等到依赖的 Run"),
+                Err(error) => tracing::warn!(%error, "放行等到依赖的 Run 失败，留到下一拍对账"),
+            }
+        }
+        outcome
+    }
+
+    /// 一条 Run 的终态：先按 run 找到它的会话，再问那一本账。
+    async fn run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError> {
+        self.for_run(run).await?.ledger.run_end(run).await
     }
 
     async fn read(
@@ -722,6 +760,7 @@ mod tests {
         let routed = Arc::new(RoutedLedger::new(
             Arc::clone(&ledgers),
             store.db().clone(),
+            Arc::new(TestClock::fixed()),
             Arc::new(tokio::sync::Notify::new()),
         ));
         (ledgers, routed, hub)
@@ -738,6 +777,7 @@ mod tests {
             peer: None,
             model: sample_model(),
             workdir: None,
+            delegate: None,
             at: time::macros::datetime!(2026-09-16 08:00:00 UTC),
         }
     }

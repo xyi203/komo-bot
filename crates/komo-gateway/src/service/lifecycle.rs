@@ -415,7 +415,38 @@ impl GatewayState {
             )
             .await?;
         }
+        // **取消要传到子代理**（§4）：操作者撤的是这件事，不是"父那一条"——父派出去的
+        // 子 Run 还在跑的话，它做的事已经没有人要了。放在父之后做：先让父进终态，免得
+        // 父在子被取消的那一瞬间又被放回队列领了起来。
+        if matches!(wanted, RunState::Cancelled | RunState::Abandoned) {
+            self.cancel_children(session, run).await;
+        }
         Ok(wanted)
+    }
+
+    /// 把这条 Run 派出去、还没结束的子 Run 一并取消（§4）。
+    ///
+    /// 与父自己那条用同一个终态语义：**明确写一条取消**，不是"让它烂在那里"（§8.10 对
+    /// 未完成 Run 的处置同源）。深度只有一层，所以不需要递归。
+    async fn cancel_children(self: &Arc<Self>, session: &SessionId, parent: &RunId) {
+        let runs = match komo_store::repos::runs::list_for_session(&self.db, session).await {
+            Ok(runs) => runs,
+            Err(error) => {
+                tracing::warn!(%error, %parent, "读不出子 Run，取消没法传下去");
+                return;
+            }
+        };
+        for child in runs
+            .into_iter()
+            .filter(|row| row.parent.as_ref() == Some(parent) && row.state.is_unfinished())
+        {
+            let end = RunEnd::Cancelled {
+                by: Some(format!("父 Run {parent} 结束了")),
+            };
+            if let Err(error) = Box::pin(self.finish_run(session, &child.run, end)).await {
+                tracing::warn!(%error, run = %child.run, "取消子 Run 失败");
+            }
+        }
     }
 
     /// 追加一条会话生命周期的审计副本（§8.10 第 1 条）。

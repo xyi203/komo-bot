@@ -657,10 +657,13 @@ mod tests {
     }
 
     /// 这一版没有本机平台的包时，说清楚它有什么，而不是 404。
+    ///
+    /// 那一份"别人的包"必须是**我们从来不出的平台**：写 `linux-amd64` 之类，在 linux
+    /// 机器上跑测试时它正好就是本机要的那一个，于是这条测试在 CI 上测的完全是另一件事。
     #[tokio::test]
     async fn a_release_without_our_asset_names_what_it_has() {
         let tag = "v99.0.0";
-        let other = "komo-linux-amd64.tar.gz";
+        let other = "komo-plan9-mips.tar.gz";
         let fake = Fake::start(
             tag,
             vec![
@@ -677,10 +680,10 @@ mod tests {
             .await
             .expect_err("没有本机平台的包");
 
-        assert!(error.contains("komo-linux-amd64.tar.gz"), "{error}");
+        assert!(error.contains(other), "要说清楚它有什么：{error}");
         assert!(
             error.contains(&format!("{BINARY}-{}", asset_suffix().expect("本机平台"))),
-            "{error}"
+            "要点名缺的是哪一个：{error}"
         );
         assert!(!dest.exists(), "没换上去就不该留下 dest");
     }

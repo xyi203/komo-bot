@@ -642,6 +642,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 | assistant 回复和调用计划已保存 | 沿用原计划，从未完成的 ToolCall 继续 |
 | JSONL 已有结果引用且完整输出校验通过，state.db 可能落后 | 先补齐结果索引和状态，复用原输出，不重放动作 |
 | 调用 planned，确定尚未执行 | 校验原计划与当前权限后自动执行 |
+| 调用有结果、**没有 started**（一次没执行过的调用：工具名不认识、参数准备不出来、放行被拒） | 按已有结果收口，不重跑；回放时把那条 `tool.started` 缺席的尝试行补上（`fail_call` 写下的就是它） |
 | 调用 started，没有结果 | 先核对外部效果，按 §8.6 决定是否安全继续 |
 | `waiting + approval` | 保留原请求；已答复且仍有效的批准自动接续 |
 | `waiting + retry` | 沿用已保存的次数与到点时刻，到点再尝试 |
@@ -1551,6 +1552,11 @@ pub trait Ledger: Send + Sync {
     async fn start_call(&self, call: &ToolCallId, plan: &ExecutionPlan, grant: Option<GrantUse>) -> Result<AttemptId, LedgerError>;
     /// 输出已由 ToolOutputStore 发布；这里只写 tool.result 元信息与引用。
     async fn finish_call(&self, attempt: &AttemptId, published: PublishedOutput) -> Result<(), LedgerError>;
+    /// 一次**没有执行过**的调用的结论（工具名不认识、参数准备不出来、放行被拒、子代理不能
+    /// 再委派）：它有结论、没有尝试，所以建的是那条 `tool.started` 缺席的尝试行。
+    /// **必须写**：`tool.result` 缺席的调用在账本上永远悬着，从账本重建的转写就会带着一个
+    /// 没有输出的 `function_call`，provider 直接 400。
+    async fn fail_call(&self, call: &ToolCallId, attempt: &AttemptId, published: PublishedOutput) -> Result<(), LedgerError>;
     /// 停在某个外部条件上（§8.4）：状态变 `waiting`，理由进 `WaitReason`，释放执行名额。
     async fn suspend(&self, run: &RunId, wait: Wait) -> Result<(), LedgerError>;
     /// 调用前这一轮的最终回复必须已作为 message.assistant 落盘（record_round → complete）；
@@ -1763,4 +1769,5 @@ Memory 与模型验收覆盖：
 | reconcile 一拍的真实成本（目标：1 万 Run / 1 千 Session）与它该排在哪个周期 | §8.9 的周期兜底 | 从 `AUDIT_TICK` 那一拍拆出来，按更粗的间隔跑（例如 5 分钟），或只对"启动后还没对过账的那些"跑；启动时那一次无论如何都要跑 |
 | `sessions.state` 之外是否还需要一个"回收进行中"的中间态 | §8.10 的 `purge` | 当前设计靠"墓碑先落、内容后删"取得幂等，不需要第四个状态；若实测发现"内容删到一半"无法与"内容被外部删掉"区分，再补一个状态列值（仍是加列/加值，不改 schema 形状） |
 | **既有的 state.db 能不能加上新列**（§8.2 那句"schema 变化只增不改、`ensure_schema` 连上时补列"） | 升级路径：任何一个加了列的新版本在旧库上都起不来 | **已实测（2026-09-20，委派那两列 `runs.parent_run_id` / `runs.delegate`，本机 macOS + 真实 Turso MVCC 库）：补列会静默丢掉。** 现象：旧二进制建的库 → 新二进制启动 → 日志有 `补一列 table="runs" column="parent_run_id"` 两条 → 但同进程随后的每一条用到该列的语句都报 `Parse error: no such column: parent_run_id`（领取 SQL、待处理清单、对账、建会话全中），**重启也没用**；与此同时把 `state.db` 单独复制出来、由另一个进程打开时，同一段 `ensure_schema` 又能"补上"并打印出带新列的 DDL（所以库里没有落盘、那个进程看到的只是自己那份视图）。**新装的库完全正常**（真机端到端委派已验证），坏的只有"旧库 + 新列"这一条路。待办：查 Turso MVCC 下 DDL 的持久化语义（是否必须走非 MVCC 连接 / 是否要升级 turso），再决定补列是改成"用原始连接迁移"还是"表重建"。 **已定位并已改（2026-09-20，同日）：MVCC 连接上的 DDL 不落盘**（`Ok` + 日志照打，重开即无），所以补列改走**建池之前**——`Db::connect` 在 `toasty::Db::builder` 之前用**普通（非 MVCC）连接**把已存在的文件补到当前 schema（`migrate_file`：建缺失表 → `ALTER TABLE ADD COLUMN` → 建缺失索引），全部幂等；`ensure_schema` 退成**守卫**：文件库再缺列就**报错**（"补列必须走建池之前的迁移"），只有内存库（没有文件）还由它补。实现上还有个坑：turso 的读游标拖着一条读事务，**同一条连接上"边读边改"会 panic**在 `vdbe/execute.rs` 的 `SetCookie`（`invalid transaction state for SetCookie: TransactionState::Read, should be write`），所以那段是"一次读清 → 丢连接 → 只用一条只写连接改"。**已验证（真库副本，本机 macOS）**：副本 `sessions` 少 `state`/`state_changed_at`、`runs` 少 8 列 → `Db::connect` 之后 12/31 列齐全、另开一条连接读得回（确实落盘），按模型读 sessions 25 行（含 `origin`）、runs 正常。回归测试两条 `a_missing_column_is_added_on_reopen` / `the_delegate_columns_are_added_to_an_existing_runs_table`：**在普通连接上造旧形状、在另一条新连接上确认落盘**，原先那两条在池连接上造形状，两边都在空转——这正是真机上漏过去的原因。未核实：断电 / 内核崩溃下的持久性，以及升级 turso 后行为是否改变。 |
-| 模型一轮里提了两个调用、其中一个没有结果时，会话后面的新 Run 会不会被毒住 | §8.3 回放窗口 | **已实测（2026-09-20，真实 provider）：会。** 旧二进制下模型一轮提了两个调用，一个被拒/没执行，那条 `message.assistant` 留在会话里；其后**同一会话的每一条新 Run** 首个模型请求都被 provider 400 拒（`No tool output found for tool call call_00_…`），且会连着重试。本次改动里"回放窗口按 Run 过滤"（`service/segment.rs` 的 `window(surface, Some(run))`）恰好挡住它——新 Run 只看得见自己那条输入，不再被别人的半轮毒住。**待办**：给这条补一个回归测试，并想清楚"同一个 Run 自己半轮里未执行的调用"是否还有别的漏法。 |
+| 模型一轮里提了两个调用、其中一个没有结果时，会话后面的新 Run 会不会被毒住 | §8.3 回放窗口 | **已实测（2026-09-20，真实 provider）：会。** 旧二进制下模型一轮提了两个调用，一个被拒/没执行，那条 `message.assistant` 留在会话里；其后**同一会话的每一条新 Run** 首个模型请求都被 provider 400 拒（`No tool output found for tool call call_00_…`），且会连着重试。本次改动里"回放窗口按 Run 过滤"（`service/segment.rs` 的 `window(surface, Some(run))`）恰好挡住它——新 Run 只看得见自己那条输入，不再被别人的半轮毒住。**已修（2026-09-20，本机真实会话复盘）**：线上那次 400 的调用是两次 `delegate`——两个漏法都补上了。①`resumed()` 重建调用时不按引用读回外置的 `arguments` / `plan`（§8.3 原话要求"读取历史或恢复调用时按引用加载需要的内容"）：委派的任务正文 6 KB 被外置，重 `prepare` 拿到的是一份 `null` 参数，当场失败。②`execute_one` 的"未知工具 / prepare 失败 / 放行被拒 / 子代理不能再委派"四条分支把结论**只交给模型、不写账本**（`Ledger::fail_call` 就是补这一笔）：那次调用于是永远悬着，父的窗口里两个 `function_call` 一前一后，provider 报的是前面那个。回归测试：`service::segment::tests::an_externalized_argument_and_plan_come_back_by_reference`、`service::tests::a_delegated_task_over_the_inline_limit_still_settles_the_parent_call`（去掉任一处的回填就失败）、`service::tests::a_call_that_cannot_run_still_gets_a_result_in_the_ledger`（去掉 `fail_call` 就失败）。 |
+| 超限的**正文**（`run.accepted.text` / `message.assistant.text` 过 4 KiB）在回放窗口里是不是也需要按引用读回 | §8.3 的"读取历史或恢复调用时按引用加载" | **已核实（2026-09-20，真实会话）**：会外置（本次会话里两条子 Run 的 `run.accepted` 与一条 `message.assistant` 都是 `text: null` + `text_ref`），而全仓**没有任何一处**读 `text_ref`——`replay()` 交给模型的用户消息因此是空的。当前没炸是因为子代理的任务正文同时也在它的系统提示里（`subagent_prompt` 拼了 `spec.task`），而正常 Run 的用户输入很少过 4 KiB。待办。 |

@@ -293,6 +293,16 @@ impl Ledger for FaultLedger {
         self.inner.finish_call(attempt, published).await
     }
 
+    async fn fail_call(
+        &self,
+        call: &komo_kernel::types::ids::ToolCallId,
+        attempt: &AttemptId,
+        published: komo_kernel::types::refs::PublishedOutput,
+    ) -> Result<(), LedgerError> {
+        poisoned!(self);
+        self.inner.fail_call(call, attempt, published).await
+    }
+
     async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
         poisoned!(self);
         self.inner.suspend(run, wait).await

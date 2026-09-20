@@ -319,6 +319,10 @@ async fn apply_event(
             .await?;
         }
         EventPayload::ToolResult(body) => {
+            // 没有 `tool.started` 的结果（一次没执行过的调用的结论）在这里也要把那条尝试
+            // 补上：`record_result_in` 按 attempt 行找 call，行不在它没法记——重建之后
+            // "这次调用结过账"就不见了。
+            calls::record_unstarted_in(ex, &body.call_id, &body.attempt_id, now).await?;
             calls::record_result_in(
                 ex,
                 &body.attempt_id,

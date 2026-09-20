@@ -528,6 +528,62 @@ impl Ledger for Coordinator {
         .await
     }
 
+    /// 一次**没有执行过**的调用的结论（工具名不认识、参数准备不出来、放行被拒）。
+    ///
+    /// 与 [`Self::finish_call`] 的差别只有一处：那条尝试**没有** `tool.started`——所以
+    /// attempt 行这里是现造的（`started_event` 留空），而 `tool.result` 该有的东西一样
+    /// 不少。少了它，这次调用在账本上永远悬着，转写里那次 `function_call` 永远没有输出
+    /// （§8.3 的回放窗口直接 400）。
+    async fn fail_call(
+        &self,
+        call: &ToolCallId,
+        attempt: &AttemptId,
+        published: PublishedOutput,
+    ) -> Result<(), LedgerError> {
+        let row = self.run_of_call(call).await?;
+        let run = RunId::from_raw(row.run_id.clone());
+
+        let appended = self
+            .append(
+                Some(run),
+                EventPayload::ToolResult(ToolResult {
+                    call_id: call.clone(),
+                    attempt_id: attempt.clone(),
+                    status: published.status,
+                    output_ref: published.output.clone(),
+                    elapsed_ms: published.elapsed_ms,
+                    preview: published.preview.clone(),
+                    stdout: published.stdout.clone(),
+                    stderr: published.stderr.clone(),
+                    // 没有跑过就没有"没跑完"这回事：结论是确定的失败。
+                    attempt_state: Some(AttemptState::Failed),
+                }),
+            )
+            .await?;
+
+        let call_id = call.clone();
+        let attempt_id = attempt.clone();
+        self.commit(&appended, move |ex, appended, now| {
+            let (call_id, attempt_id, published) =
+                (call_id.clone(), attempt_id.clone(), published.clone());
+            Box::pin(async move {
+                calls::record_unstarted_in(ex, &call_id, &attempt_id, now).await?;
+                calls::record_result_in(
+                    ex,
+                    &attempt_id,
+                    published.status,
+                    &published.output,
+                    published.preview.clone(),
+                    &appended.event.event_id,
+                    now,
+                )
+                .await
+                .map(|_| ())
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+    }
+
     async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
         // 「停在哪个调用上」**不在这条事件里**：审批的调用在 `approval_requests.call_id`
         // 上，结果不明的调用在 `tool_calls.state = 'uncertain'` 那一条上——两处各自是权威，

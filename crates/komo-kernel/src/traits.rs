@@ -251,6 +251,24 @@ pub trait Ledger: Send + Sync {
         published: PublishedOutput,
     ) -> Result<(), LedgerError>;
 
+    /// 给一次**没有执行过**的调用写下结论（没有 `tool.started`，也没有计划）：工具名
+    /// 不认识、参数准备不出来、放行被拒、子代理不能再委派——它们都有明确结论，只是没有
+    /// 产生过尝试。
+    ///
+    /// 写下来不是记账洁癖：`tool.result` 缺席的那次调用在账本上**永远悬着**，于是任何从
+    /// 账本重建的转写都带着一个没有输出的 `function_call`——provider 直接 400
+    /// （`No tool output found for tool call …`），一次参数写错的调用会把整个会话后面的
+    /// 每一段都毒住。所以"交给模型的每一条结论都必须先在账本上"是一条不变量。
+    ///
+    /// 它建的是一条 `tool.started` 缺席的尝试行（`tool_attempts.started_event` 本来就
+    /// 可空）：`result_event` 一填，这次调用就有了终态。
+    async fn fail_call(
+        &self,
+        call: &ToolCallId,
+        attempt: &AttemptId,
+        published: PublishedOutput,
+    ) -> Result<(), LedgerError>;
+
     /// 停在某个外部条件上（§8.4）：状态变 `Waiting`，理由进 `WaitReason`，释放执行名额。
     async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError>;
 

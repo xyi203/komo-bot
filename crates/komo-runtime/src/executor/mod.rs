@@ -322,14 +322,12 @@ impl ToolExecutor {
         // 未知工具名：作为错误内容交回模型，**不派发任何东西**（§14 阶段 3）。
         let Some(tool) = self.tools.get(&request.tool).cloned() else {
             let known: Vec<&str> = self.tools.keys().map(String::as_str).collect();
-            return Ok(CallSettlement::Result(error_result(
-                &request,
-                format!(
-                    "没有名为 {} 的工具；可用的是：{}",
-                    request.tool,
-                    known.join("、")
-                ),
-            )));
+            let message = format!(
+                "没有名为 {} 的工具；可用的是：{}",
+                request.tool,
+                known.join("、")
+            );
+            return self.fail_unstarted(&request, env, message).await;
         };
 
         // 计划：恢复执行沿用原来那份，首次执行现做一份。
@@ -343,10 +341,7 @@ impl ToolExecutor {
                     plan
                 }
                 Err(error) => {
-                    return Ok(CallSettlement::Result(error_result(
-                        &request,
-                        error.to_string(),
-                    )));
+                    return self.fail_unstarted(&request, env, error.to_string()).await;
                 }
             },
         };
@@ -449,8 +444,9 @@ impl ToolExecutor {
         let (proof, grant_use) = match self.authorize(&request, &plan, env, intent).await? {
             Authorization::Proceed { proof, grant } => (proof, grant),
             Authorization::Refused(message) => {
-                // 拒绝作为明确结果交回模型（§7.4）。
-                return Ok(CallSettlement::Result(error_result(&request, message)));
+                // 拒绝作为明确结果交回模型（§7.4）——**同时落盘**：被拒的调用一样有
+                // 结论，不写下来它就永远悬着。
+                return self.fail_unstarted(&request, env, message).await;
             }
             Authorization::Waiting(approval) => {
                 return Ok(CallSettlement::Stopped {
@@ -557,14 +553,12 @@ impl ToolExecutor {
         // 深度只有一层。这条守卫在**编排里**而不是在工具表里：把 `delegate` 从子代理的
         // 工具表摘掉是 UX，模型自己拼出这个名字就绕过去了，而能被绕过的约束等于没有。
         if let Some(parent_of_this_run) = &env.delegated {
-            return Ok(CallSettlement::Result(error_result(
-                request,
-                format!(
-                    "子代理不能再委派：深度只有一层。你已经是被 {} 派出来跑这件事的，\
-                     把完整的任务做完或说明做不到，而不是再派一条子 Run。",
-                    parent_of_this_run.parent
-                ),
-            )));
+            let message = format!(
+                "子代理不能再委派：深度只有一层。你已经是被 {} 派出来跑这件事的，\
+                 把完整的任务做完或说明做不到，而不是再派一条子 Run。",
+                parent_of_this_run.parent
+            );
+            return self.fail_unstarted(request, env, message).await;
         }
 
         // 已经派出去过 = 上一世 `start_call` 过。`Planned` 那种"确定没跑过"的形状与之
@@ -593,7 +587,8 @@ impl ToolExecutor {
         let grant = match self.authorize(request, plan, env, intent).await? {
             Authorization::Proceed { grant, .. } => grant,
             Authorization::Refused(message) => {
-                return Ok(CallSettlement::Result(error_result(request, message)));
+                // 与普通工具同一条规矩：结论落盘，别让这次调用悬在账本上。
+                return self.fail_unstarted(request, env, message).await;
             }
             Authorization::Waiting(approval) => {
                 return Ok(CallSettlement::Stopped {
@@ -795,6 +790,46 @@ impl ToolExecutor {
             .finish_call(&attempt_ref.attempt, published)
             .await?;
         Ok(())
+    }
+
+    /// 一次**没有执行**的调用的结论：工具名不认识、参数准备不出来、放行被拒、子代理不能
+    /// 再委派。
+    ///
+    /// 它们都有明确结论却**没有产生过尝试**，所以不走 [`Self::settle_attempt`]；但结论
+    /// **必须落盘**（`fail_call` 建那条没有 `tool.started` 的尝试行）。只交给模型、不写
+    /// 账本的话，这次调用在账本上永远悬着，而任何从账本重建的转写都带着一个没有输出的
+    /// `function_call`——provider 直接 400（`No tool output found for tool call …`）。
+    async fn fail_unstarted(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        message: String,
+    ) -> Result<CallSettlement, ExecError> {
+        let attempt_ref = AttemptRef {
+            session: env.session.clone(),
+            run: env.run.clone(),
+            call: request.call.clone(),
+            attempt: AttemptId::new_at(self.clock.now()),
+        };
+        let body = ToolResultBody {
+            status: ToolResultStatus::Failed,
+            result: serde_json::Value::Null,
+            error: Some(message.clone()),
+            exit_code: None,
+            artifacts: vec![],
+        };
+        let writer = self.outputs.begin(&attempt_ref).await?;
+        let mut published = self.outputs.publish(writer, body).await?;
+        published.preview = Some(truncate(&message, PREVIEW_LIMIT_BYTES));
+        self.ledger
+            .fail_call(&request.call, &attempt_ref.attempt, published)
+            .await?;
+        Ok(CallSettlement::Result(ToolResultForModel {
+            provider_call_id: request.provider_call_id.clone(),
+            call_id: request.call.clone(),
+            content: message,
+            is_error: true,
+        }))
     }
 
     /// 放行梯子。Deny 分支里**没有任何一次 `consume`**。
@@ -1052,15 +1087,6 @@ fn evidence_of(verdict: &Verification) -> &str {
         | Verification::Conflict { evidence } => evidence,
         Verification::Unknown { reason } => reason,
         Verification::Unavailable => "没有可用的核对方式",
-    }
-}
-
-fn error_result(request: &CallRequest, message: String) -> ToolResultForModel {
-    ToolResultForModel {
-        provider_call_id: request.provider_call_id.clone(),
-        call_id: request.call.clone(),
-        content: message,
-        is_error: true,
     }
 }
 

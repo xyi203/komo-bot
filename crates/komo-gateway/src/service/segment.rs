@@ -26,6 +26,7 @@ use komo_kernel::fold::{Surface, SurfaceMessage, fold};
 use komo_kernel::traits::{ApprovalRepo, Ledger, LedgerError};
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
 use komo_kernel::types::turn::{ReplayMessage, ToolResultForModel, TurnRequest};
@@ -35,7 +36,8 @@ use komo_runtime::executor::{CallEnv, CallRequest, resumed_from};
 use komo_runtime::memory::MemoryManager;
 use komo_runtime::scheduler::HandlerError;
 use komo_runtime::tools::paths;
-use komo_store::{CheckpointStore, Db, RecoveryStore};
+use komo_store::db::store_to_ledger;
+use komo_store::{CheckpointStore, Db, PayloadStore, RecoveryStore};
 
 use super::DELEGATE_TOOL;
 use super::ledgers::RoutedLedger;
@@ -307,7 +309,12 @@ impl SegmentSource for GatewaySegments {
             },
         };
 
-        let resume = self.resumed(&surface, &events, &run).await;
+        let resume = match self.resumed(&session, &surface, &events, &run).await {
+            Ok(resume) => resume,
+            // 外置的正文读不出来 = 会话缺内容：停下来报告（§8.3），别当成"没有可续跑的
+            // 调用"——那会让这一段的请求带着一个没有输出的 `function_call` 发出去。
+            Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
+        };
 
         Ok(Segment {
             session,
@@ -378,14 +385,21 @@ impl GatewaySegments {
     ///
     /// 有就把它们原样交回执行器：**同一份计划、同一个调用号**，加上"这是第几次"。停在
     /// 审批上的那一个还带着它的 `approval`——`/approve` 之后续跑走的就是这条路。
+    ///
+    /// 它的失败只有一种：**外置的计划或参数按引用读不出来**（§8.3 要求"读取历史或恢复
+    /// 调用时按引用加载需要的内容"）。那与日志读不出来是同一类——会话缺了内容，不能靠
+    /// 重新领取修好，所以由调用方 [`Self::halt_if_corrupt`] 停下来报告。
     async fn resumed(
         &self,
+        session: &SessionId,
         surface: &Surface,
         events: &[Event],
         run: &RunId,
-    ) -> Option<ResumedRound> {
+    ) -> Result<Option<ResumedRound>, LedgerError> {
         // 这个 Run 得在这个会话里。
-        surface.runs.get(run)?;
+        let Some(_) = surface.runs.get(run) else {
+            return Ok(None);
+        };
         let waiting = waiting_approval(events, run);
         // **停在哪一次调用上由审批行回答**（`approval_requests.call_id`）：`run.waiting`
         // 只说"停在审批上"（`RunWaiting.call` 恒为 `None`），而落点在那个权威表上——在
@@ -401,6 +415,8 @@ impl GatewaySegments {
             None => None,
         };
         let mut pending = Vec::new();
+        // 外置的正文按引用读回来（§8.3）。整段共用一个 store：它只是一份路径。
+        let payloads = self.payloads_for(session);
         // **这一轮还没有结果的调用，全部交回执行器**——不只是已经写过计划的那几个：
         // 一轮里前一个停下时，后面的调用连 `tool.planned` 都还没有（`Surface::open_calls`）。
         for call_id in &surface.open_calls(run) {
@@ -410,7 +426,12 @@ impl GatewaySegments {
                 Some(call) => (call.state, call.attempt.clone(), call.attempts),
                 None => (ToolCallState::Planned, None, 0),
             };
-            let request = call_request(surface, events, call_id)?;
+            let Some(request) = call_request(&payloads, events, call_id).await? else {
+                // 连承载它的那条 `message.assistant` 都找不到：账本自相矛盾，交回执行器
+                // 也没有意义（它会当成"没有可恢复的调用"往下走）。
+                tracing::warn!(run = %run, call = %call_id, "调用找不回原始请求，跳过续跑");
+                continue;
+            };
             let approval = waiting
                 .as_ref()
                 .filter(|_| waiting_call.as_ref() == Some(call_id))
@@ -422,7 +443,7 @@ impl GatewaySegments {
             });
         }
         if pending.is_empty() {
-            return None;
+            return Ok(None);
         }
         // 已经收尾的那些在回放窗口里（`Role::Tool` 的消息），不必再交一遍。
         let settled: Vec<ToolResultForModel> = Vec::new();
@@ -432,9 +453,14 @@ impl GatewaySegments {
             && record.decision.is_none()
         {
             tracing::debug!(run = %run, approval = %approval, "审批还没有结论，这一段不续跑");
-            return None;
+            return Ok(None);
         }
-        Some(ResumedRound { settled, pending })
+        Ok(Some(ResumedRound { settled, pending }))
+    }
+
+    /// 这个 Session 的外置正文本体（§8.3 的 `payloads/`）。
+    fn payloads_for(&self, session: &SessionId) -> PayloadStore {
+        PayloadStore::new(self.routed.ledgers().paths_for(session))
     }
 }
 
@@ -463,31 +489,61 @@ fn waiting_approval(events: &[Event], run: &RunId) -> Option<komo_kernel::types:
 }
 
 /// 从日志里把一个调用的原始请求与计划找回来。
-fn call_request(surface: &Surface, events: &[Event], call: &ToolCallId) -> Option<CallRequest> {
-    let requested = events.iter().rev().find_map(|event| match &event.payload {
+///
+/// **超限的参数与计划是外置的**（§8.3：单次参数超过 4 KiB 把包含它的模型消息正文存到
+/// `payloads/`，`arguments_ref` 指向文件内的对应字段；较大的准备计划同样外置），而
+/// §8.3 那句「读取历史或恢复调用时按引用加载需要的内容」说的就是这个函数。只读内联那
+/// 一份会拿到**空参数**：那既不是原请求，也把一次委派的完整任务描述丢成了空对象——重
+/// 新 `prepare` 必然失败，而失败的结果又是一条不落盘的结论（见 executor 的 `execute_one`）。
+///
+/// 计划的取法同理：内联那份是便宜的路径，大计划在 `plan_ref` 后头。§8.4 第 4 行的
+/// "沿用原计划"要求的就是它——重新准备会换一个 `plan_hash`，原先那份授权就覆盖不到了
+/// （§7.4）。
+async fn call_request(
+    payloads: &PayloadStore,
+    events: &[Event],
+    call: &ToolCallId,
+) -> Result<Option<CallRequest>, LedgerError> {
+    let Some(requested) = events.iter().rev().find_map(|event| match &event.payload {
         EventPayload::MessageAssistant(body) => body
             .tool_calls
             .iter()
             .find(|candidate| &candidate.call_id == call)
             .cloned(),
         _ => None,
-    })?;
-    let plan = events.iter().rev().find_map(|event| match &event.payload {
-        EventPayload::ToolPlanned(body) if &body.call_id == call => {
-            body.plan.as_ref().map(|plan| (**plan).clone())
-        }
+    }) else {
+        return Ok(None);
+    };
+    let arguments = match (&requested.arguments_ref, &requested.arguments) {
+        (Some(reference), _) => payloads
+            .open_json::<serde_json::Value>(reference)
+            .await
+            .map_err(store_to_ledger)?,
+        (None, arguments) => arguments.clone(),
+    };
+    let planned = events.iter().rev().find_map(|event| match &event.payload {
+        EventPayload::ToolPlanned(body) if &body.call_id == call => Some(body.clone()),
         _ => None,
     });
-    let _ = surface;
-    Some(CallRequest {
+    let plan = match planned.map(|body| (body.plan, body.plan_ref)) {
+        Some((Some(plan), _)) => Some(*plan),
+        Some((None, Some(reference))) => Some(
+            payloads
+                .open_json::<ExecutionPlan>(&reference)
+                .await
+                .map_err(store_to_ledger)?,
+        ),
+        _ => None,
+    };
+    Ok(Some(CallRequest {
         call: call.clone(),
         provider_call_id: requested.provider_call_id,
         tool: requested.name,
-        arguments: requested.arguments,
+        arguments,
         plan,
         resumed: None,
         approval: None,
-    })
+    }))
 }
 
 /// 回放窗口：最新一个 `conversation.boundary` 之后的消息（§13.1 的 `/new`）。
@@ -680,8 +736,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_call_request_comes_back_with_its_provider_id_and_arguments() {
+    #[tokio::test]
+    async fn a_call_request_comes_back_with_its_provider_id_and_arguments() {
         let run = RunId::from_raw("run-1");
         let call = ToolCallId::from_raw("call-1");
         let events = vec![event(
@@ -703,12 +759,84 @@ mod tests {
                 output_tokens: None,
             }),
         )];
-        let surface = fold(&events);
-        let request = call_request(&surface, &events, &call).expect("找得回来");
+        let payloads = payloads();
+        let request = call_request(&payloads, &events, &call)
+            .await
+            .expect("读得出来")
+            .expect("找得回来");
         assert_eq!(request.provider_call_id, "pc-7");
         assert_eq!(request.tool, "read");
         assert_eq!(request.arguments["path"], "a.txt");
         assert!(request.plan.is_none(), "还没有计划落盘");
+    }
+
+    /// 参数与计划超限时是**外置**的（§8.3）：找回来时按引用读回来。
+    ///
+    /// 只读内联那一份会拿到空参数——那既不是原请求，也让这次恢复的 `prepare` 必然失败。
+    #[tokio::test]
+    async fn an_externalized_argument_and_plan_come_back_by_reference() {
+        let run = RunId::from_raw("run-1");
+        let call = ToolCallId::from_raw("call-1");
+        let session = SessionId::from_raw("sess-1");
+        let payloads = payloads();
+
+        let arguments = serde_json::json!({ "task": "一段很长很长很长很长的任务".repeat(300) });
+        let arguments_ref = payloads
+            .put_json(&arguments, Some("/tool_calls/0/arguments".into()))
+            .await
+            .expect("外置得进去");
+        let plan = komo_kernel::test_support::sample_plan("delegate", &session);
+        let plan_ref = payloads
+            .put_json(&plan, Some("/plan".into()))
+            .await
+            .expect("外置得进去");
+
+        let events = vec![
+            event(
+                1,
+                &run,
+                EventPayload::MessageAssistant(MessageAssistant {
+                    round: 1,
+                    text: None,
+                    text_ref: None,
+                    tool_calls: vec![komo_kernel::types::turn::ToolCallRequest {
+                        call_id: call.clone(),
+                        provider_call_id: "pc-7".into(),
+                        name: "delegate".into(),
+                        arguments: serde_json::Value::Null,
+                        arguments_ref: Some(arguments_ref),
+                    }],
+                    provider_blocks: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                }),
+            ),
+            event(
+                2,
+                &run,
+                EventPayload::ToolPlanned(komo_kernel::events::ToolPlanned {
+                    call_id: call.clone(),
+                    plan_hash: plan.plan_hash(),
+                    plan: None,
+                    plan_ref: Some(plan_ref),
+                }),
+            ),
+        ];
+        let request = call_request(&payloads, &events, &call)
+            .await
+            .expect("读得出来")
+            .expect("找得回来");
+        assert_eq!(request.arguments, arguments, "参数要按引用读回来");
+        assert_eq!(
+            request.plan.as_ref().map(ExecutionPlan::plan_hash),
+            Some(plan.plan_hash()),
+            "计划也要按引用读回来：重新准备会换掉 plan_hash（§7.4）"
+        );
+    }
+
+    fn payloads() -> PayloadStore {
+        let dir = tempfile::tempdir().expect("临时目录");
+        PayloadStore::new(komo_store::SessionPaths::at(dir.keep()))
     }
 
     #[test]

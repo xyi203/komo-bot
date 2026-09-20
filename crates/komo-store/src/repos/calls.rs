@@ -159,6 +159,64 @@ pub async fn record_started_in(
     Ok(())
 }
 
+/// 一次**没有执行过**的调用的结论：工具名不认识、参数准备不出来、放行被拒这一类。
+///
+/// 它建的是那条 `tool.started` **缺席**的尝试行（`tool_attempts.started_event` 本来
+/// 就可空），随后由 [`record_result_in`] 把结论写上去。两件事分开是因为回放也走同一条
+/// 路：索引被丢掉之后，日志里可能只剩那条 `tool.result`，而它同样要建出**同一形状**的
+/// 尝试行——不然重建之后"这次调用结过账"这件事就丢了（`record_result_in` 按 attempt 行
+/// 找 call，行不在它没法记）。
+///
+/// 幂等：那条尝试已经记过（`tool.started` 来过、或者回放重放同一段日志）就什么都不做。
+pub async fn record_unstarted_in(
+    ex: &mut dyn Executor,
+    call: &ToolCallId,
+    attempt: &AttemptId,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    if ToolAttemptRow::filter_by_id(attempt.as_str())
+        .first()
+        .exec(ex)
+        .await
+        .map_err(map_toasty)?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let mut row = require(ex, call).await?;
+    let ordinal = row.attempts + 1;
+    let (session, run) = (row.session_id.clone(), row.run_id.clone());
+
+    row.update()
+        .attempts(ordinal)
+        .updated_at(to_ts(now))
+        .exec(ex)
+        .await
+        .map_err(map_toasty)?;
+
+    // `started_at` 与 `ended_at` 都是这一刻：**没有"跑了多久"可记**，而"这次尝试没有
+    // 执行过"这件事由 `started_event` 为空说来（配合 `tool.result` 里的 `elapsed_ms = 0`
+    // ——0 读作未知，不是"瞬间"）。
+    toasty::create!(ToolAttemptRow {
+        id: attempt.as_str(),
+        call_id: call.as_str(),
+        run_id: run,
+        session_id: session,
+        ordinal,
+        executor: None,
+        process: None,
+        state: attempt_state_str(AttemptState::Failed),
+        started_at: to_ts(now),
+        ended_at: to_ts(now),
+        started_event: None,
+        result_event: None as Option<String>,
+    })
+    .exec(ex)
+    .await
+    .map_err(map_toasty)?;
+    Ok(())
+}
+
 /// 结果引用、调用状态与尝试状态。
 ///
 /// `uncertain` 是 **ToolCall 的状态**，不是 Run 的：副作用可能已经发生而完整输出没有

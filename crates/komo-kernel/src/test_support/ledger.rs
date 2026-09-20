@@ -340,6 +340,42 @@ impl Ledger for MemLedger {
         Ok(())
     }
 
+    async fn fail_call(
+        &self,
+        call: &ToolCallId,
+        attempt: &AttemptId,
+        published: PublishedOutput,
+    ) -> Result<(), LedgerError> {
+        let mut state = self.state.lock().expect("账本");
+        // 与 `Coordinator::fail_call` 同形：**没有 `tool.started` 的那条尝试**只在结果
+        // 这一刻才存在，所以这里也当场把它记上。
+        let entry = state
+            .calls
+            .get(call)
+            .cloned()
+            .ok_or_else(|| LedgerError::NotFound {
+                what: format!("call {call}"),
+            })?;
+        state.attempts.insert(attempt.clone(), call.clone());
+        self.append(
+            &mut state,
+            &entry.session,
+            Some(entry.run),
+            EventPayload::ToolResult(ToolResult {
+                call_id: call.clone(),
+                attempt_id: attempt.clone(),
+                status: published.status,
+                output_ref: published.output,
+                elapsed_ms: published.elapsed_ms,
+                preview: published.preview,
+                stdout: published.stdout,
+                stderr: published.stderr,
+                attempt_state: Some(AttemptState::Failed),
+            }),
+        );
+        Ok(())
+    }
+
     async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
         let mut state = self.state.lock().expect("账本");
         let session = state

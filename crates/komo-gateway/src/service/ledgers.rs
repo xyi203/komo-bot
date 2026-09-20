@@ -268,6 +268,15 @@ impl Ledger for PublishingLedger {
         pumped!(self, self.inner.finish_call(attempt, published).await)
     }
 
+    async fn fail_call(
+        &self,
+        call: &ToolCallId,
+        attempt: &AttemptId,
+        published: PublishedOutput,
+    ) -> Result<(), LedgerError> {
+        pumped!(self, self.inner.fail_call(call, attempt, published).await)
+    }
+
     async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
         pumped!(self, self.inner.suspend(run, wait).await)
     }
@@ -568,6 +577,19 @@ impl Ledger for RoutedLedger {
             .await?
             .ledger
             .finish_call(attempt, published)
+            .await
+    }
+
+    async fn fail_call(
+        &self,
+        call: &ToolCallId,
+        attempt: &AttemptId,
+        published: PublishedOutput,
+    ) -> Result<(), LedgerError> {
+        self.for_call(call)
+            .await?
+            .ledger
+            .fail_call(call, attempt, published)
             .await
     }
 

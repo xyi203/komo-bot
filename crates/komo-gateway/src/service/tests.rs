@@ -1496,6 +1496,175 @@ async fn a_delegated_task_becomes_a_child_run_and_its_result_reaches_the_parent(
     );
 }
 
+/// 委派的任务正文超过 §8.3 的 4 KiB 内联上限：**参数被外置**到 `payloads/`，父续跑时
+/// 必须按引用读回来。
+///
+/// 读不回来会拿到一份空参数：重新 `prepare` 当场失败，而那条失败结论只存在于内存里
+/// （`execute_one` 的 prepare 失败分支不写账本）——父这一轮拿到的就不是子 Run 的结果，
+/// 而父的窗口里从此悬着一次**没有输出的 `function_call`**。
+#[tokio::test]
+async fn a_delegated_task_over_the_inline_limit_still_settles_the_parent_call() {
+    use crate::service::test_support::harness::{Home, home_config};
+    use komo_kernel::events::EventPayload;
+    use komo_kernel::types::ids::Seq;
+
+    // 中文按 3 字节算，这段正文远过 4 KiB。
+    let task = format!(
+        "只报个数：{}workspace 下有几个文件，用 JSON 回答",
+        "背景说明，逐条列在这里。".repeat(400)
+    );
+    assert!(
+        task.len() > 4096,
+        "这条测试要真的踩到外置：{} 字节",
+        task.len()
+    );
+    let llm = delegation_script(&task, r#"{"files": 3}"#);
+
+    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let parent = gateway
+        .submit(&session, "delegate-big", "帮我把文件数一遍")
+        .await
+        .run;
+    let done = gateway.wait_terminal(&parent).await;
+    assert_eq!(done.summary.state, RunState::Completed, "{done:?}");
+
+    // 前提：那条参数**真的**外置了，否则这条测试盯的不是同一条路。
+    let paths = gateway.state().ledgers.paths_for(&session);
+    let (events, _) = komo_store::session_log::read_events(&paths, &session, Seq::ZERO, 0)
+        .await
+        .expect("读得出会话");
+    assert!(
+        events.iter().any(|event| matches!(
+            &event.payload,
+            EventPayload::MessageAssistant(body)
+                if body.tool_calls.iter().any(|call| call.arguments_ref.is_some())
+        )),
+        "外置是这条测试的前提：参数要在 payloads/ 里"
+    );
+    // §8.4 第 4 行：**沿用原计划**。续跑重新 `prepare` 会写出第二条 `tool.planned`，
+    // 而它换了一个 `plan_hash`——原先那份授权就覆盖不到了（§7.4）。
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.run.as_ref() == Some(&parent)
+                    && matches!(&event.payload, EventPayload::ToolPlanned(_))
+            })
+            .count(),
+        1,
+        "委派调用只该有一份计划：续跑要沿用已经落盘的那份"
+    );
+
+    let runs = komo_store::repos::runs::list_for_session(&gateway.state().db, &session)
+        .await
+        .expect("读得出会话里的 Run");
+    let child = runs
+        .iter()
+        .find(|row| row.parent.as_ref() == Some(&parent))
+        .expect("该有一条子 Run");
+    let inputs = llm.inputs.lock().expect("脚本模型");
+    let delivered = inputs
+        .iter()
+        .find_map(|input| match input {
+            komo_kernel::types::turn::RoundInput::ToolResults { results } => results
+                .iter()
+                .find(|result| result.content.contains(child.run.as_str())),
+            _ => None,
+        })
+        .expect("父续跑要拿到子 Run 的结果，而不是一次 prepare 失败");
+    assert!(
+        !delivered.is_error,
+        "子 Run 正常结束，这条结果不该是错误：{delivered:?}"
+    );
+}
+
+/// 工具名不认识：那条结论**要落盘**——它没有执行过，但它有结论。
+///
+/// 只把错误交给模型、不写账本的话，这次调用在账本上永远悬着，而任何从账本重建的转写都
+/// 带着一个没有输出的 `function_call`——provider 直接 400（`No tool output found for
+/// tool call …`），一次打错工具名的调用就能把整个会话后面的每一段毒住。
+#[tokio::test]
+async fn a_call_that_cannot_run_still_gets_a_result_in_the_ledger() {
+    use crate::service::test_support::harness::{
+        FakeLlm, Home, call_round, home_config, text_round,
+    };
+    use komo_kernel::events::EventPayload;
+    use komo_kernel::types::ids::Seq;
+    use komo_kernel::types::status::ToolCallState;
+
+    let llm = FakeLlm::new(vec![
+        vec![call_round(
+            1,
+            "pc-1",
+            "rm_rf",
+            serde_json::json!({ "path": "/" }),
+        )],
+        vec![text_round(1, "没有这个工具，我换个办法。")],
+    ]);
+
+    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(&session, "unknown-tool", "把根目录删了")
+        .await
+        .run;
+    let done = gateway.wait_terminal(&run).await;
+    assert_eq!(done.summary.state, RunState::Completed, "{done:?}");
+
+    let paths = gateway.state().ledgers.paths_for(&session);
+    let (events, _) = komo_store::session_log::read_events(&paths, &session, Seq::ZERO, 0)
+        .await
+        .expect("读得出会话");
+    let surface = komo_kernel::fold::fold(&events);
+    let call = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::MessageAssistant(body) => {
+                body.tool_calls.first().map(|call| call.call_id.clone())
+            }
+            _ => None,
+        })
+        .expect("那一轮提了一次调用");
+
+    // ① 那次调用有终态，账本上没有悬着的东西。
+    assert_eq!(
+        surface.calls.get(&call).map(|view| view.state),
+        Some(ToolCallState::Failed),
+        "没执行过的调用也要有结论"
+    );
+    assert!(
+        surface.open_calls(&run).is_empty(),
+        "账本上不许有没收口的调用"
+    );
+
+    // ② 模型看到的那句话就在账本里（预览是它的摘要，正文在 tool-output 里）。
+    let preview = events
+        .iter()
+        .find_map(|event| match &event.payload {
+            EventPayload::ToolResult(body) if body.call_id == call => body.preview.clone(),
+            _ => None,
+        })
+        .expect("要有一条 tool.result");
+    assert!(preview.contains("没有名为 rm_rf 的工具"), "{preview}");
+
+    // ③ 它确实**没有执行过**：没有计划，也没有 `tool.started`。
+    assert!(!events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::ToolPlanned(body) if body.call_id == call
+    )));
+    assert!(!events.iter().any(|event| matches!(
+        &event.payload,
+        EventPayload::ToolStarted(body) if body.call_id == call
+    )));
+}
+
 /// 子代理只拿得到任务：不继承父的对话历史、不注入记忆，也**不再拿到 `delegate`**
 /// （深度只有一层）；反过来，它跑过的那几轮也不许跑进父的窗口（§4）。
 #[tokio::test]

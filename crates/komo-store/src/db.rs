@@ -17,6 +17,10 @@
 //! 句柄**；raw SQL 只出现在三个模块：这里（schema / 连接）、
 //! [`crate::repos::queue`]（§8.7 的四条领取语句）和 [`crate::repos::memory`]
 //! （关键词臂的 `instr`）。
+//!
+//! 唯一的例外是[建池之前的 schema 迁移](migrate_file)：它**必须**用一条普通（非 MVCC）
+//! turso 连接，因为 MVCC 下 DDL 不落盘（实测 2026-09-20）。那条连接在池铺开之前就已经关了，
+//! 与池不并存——所以"只有一个句柄"这条纪律在并发意义上仍然成立。
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -107,9 +111,11 @@ impl Db {
     /// 打开 `path`，带选项。
     ///
     /// **新文件让 toasty 建表**（`push_schema` 只对新文件执行，且不幂等，§8.2）；已存在
-    /// 的文件走 [`Db::ensure_schema`]：逐表 `CREATE TABLE IF NOT EXISTS`、逐列
-    /// `ALTER TABLE ADD COLUMN`。两条路之后都再跑一次 `ensure_schema`，因为它是幂等
-    /// 的，而"新建之后 schema 与常量一致"正是 DDL 字节对齐测试所断言的那件事。
+    /// 的文件走建池**之前**的 [`Db::migrate_file`]：用普通（非 MVCC）连接逐表
+    /// `CREATE TABLE IF NOT EXISTS`、逐列 `ALTER TABLE ADD COLUMN`、补建缺失索引——MVCC
+    /// 连接上的 DDL 不落盘，所以这一步必须在 `toasty::Db::builder` 之前。建池之后再跑一次
+    /// [`Db::ensure_schema`]：它现在只**核对**（文件库缺列就报错）并给内存库补列。
+    /// "新建之后 schema 与常量一致"正是 DDL 字节对齐测试所断言的那件事。
     pub async fn connect_with(path: impl AsRef<Path>, opts: DbOptions) -> Result<Db, StoreError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent()
@@ -154,6 +160,15 @@ impl Db {
         opts: DbOptions,
         fresh: bool,
     ) -> Result<Db, StoreError> {
+        // **迁移要在 MVCC 连接建起来之前做完**（[`migrate_file`] 的注释里有实测依据）：
+        // DDL 一旦走 MVCC 那条路就会静默丢掉，而补列是升级路径上唯一让旧库能用的事。
+        // 新文件不走这条——它交给下面的 `push_schema`。
+        if let Some(path) = path.as_ref()
+            && !fresh
+        {
+            Self::migrate_file(path).await?;
+        }
+
         let inner = toasty::Db::builder()
             .models(models::model_set())
             .max_pool_size(opts.pool_size)
@@ -252,6 +267,156 @@ impl Db {
     ///
     /// 幂等：重复调用什么都不做。**没有迁移脚本目录**——每张表的 DDL 常量就放在模型
     /// 旁边，一个测试断言它与 toasty 为空库生成的 DDL 字节相等（§8.2）。
+    /// 在**一条普通（非 MVCC）连接**上，把已存在的文件库补到当前 schema。
+    ///
+    /// **为什么不顺着 [`Db::ensure_schema`] 那条池连接补**：MVCC 下 DDL 不落盘。实测
+    /// （2026-09-20，真实旧库 + 委派那两列）：同一条 `ALTER TABLE … ADD COLUMN` 在普通
+    /// 连接上重开可见；在 `concurrent_writes()` 的池连接上返回 `Ok`、日志照打"补一列"，
+    /// 但重开就没了——同进程随后每条用到新列的语句都 `no such column`，重启也一样。
+    /// 于是"schema 只增不改、连上时补列"（§8.2）在旧库上等于没有，而旧库升级恰恰只能靠它。
+    /// 建池之后 [`Db::ensure_schema`] 只核对：文件库还缺列就报错，不再假装补上。
+    ///
+    /// 只处理**已存在**的文件；新文件交给 `push_schema`，内存库没有文件、由
+    /// `ensure_schema` 在池上补。全程幂等。
+    async fn migrate_file(path: &Path) -> Result<(), StoreError> {
+        let database = turso::Builder::new_local(&path.to_string_lossy())
+            .build()
+            .await
+            .map_err(|error| StoreError::Io(format!("打开 {} 失败：{error}", path.display())))?;
+        let conn = database
+            .connect()
+            .map_err(|error| StoreError::Io(format!("连上 {} 失败：{error}", path.display())))?;
+
+        // 分两段：**先一次读清**（表清单、每张表的列、索引名），把读游标连同连接一起丢掉，
+        // 再在**一条只写的连接**上改。
+        //
+        // 必须这么分：turso 的读游标拖着一条读事务，DDL 要的是写事务，同一条连接上"边读
+        // 边改"会 panic 在 `vdbe/execute.rs` 的 `SetCookie`（`invalid transaction state for
+        // SetCookie: TransactionState::Read, should be write`，实测 2026-09-20）。`ensure_schema`
+        // 那条路没炸，推测是它每句都走 toasty（`sql::query` / `sql::statement`）把语句收得
+        // 更干净；不管原因是什么，**别在裸连接上照它那写法来**。
+        let mut existing: Vec<String> = Vec::new();
+        let mut present: Vec<(&str, Vec<String>)> = Vec::new();
+        let mut indexes: Vec<String> = Vec::new();
+        {
+            let mut rows = conn
+                .query("SELECT name FROM sqlite_master WHERE type = 'table'", ())
+                .await
+                .map_err(|error| StoreError::Other(error.to_string()))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| StoreError::Other(error.to_string()))?
+            {
+                if let Some(turso::Value::Text(name)) = row
+                    .get_value(0)
+                    .map_err(|error| StoreError::Other(error.to_string()))?
+                    .into()
+                {
+                    existing.push(name);
+                }
+            }
+        }
+        for table in models::TABLES {
+            if !existing.iter().any(|name| name == table.name) {
+                continue;
+            }
+            let mut columns: Vec<String> = Vec::new();
+            {
+                let mut rows = conn
+                    .query(
+                        &format!("SELECT name FROM pragma_table_info('{}')", table.name),
+                        (),
+                    )
+                    .await
+                    .map_err(|error| StoreError::Other(error.to_string()))?;
+                while let Some(row) = rows
+                    .next()
+                    .await
+                    .map_err(|error| StoreError::Other(error.to_string()))?
+                {
+                    if let Some(turso::Value::Text(name)) = row
+                        .get_value(0)
+                        .map_err(|error| StoreError::Other(error.to_string()))?
+                        .into()
+                    {
+                        columns.push(name);
+                    }
+                }
+            }
+            present.push((table.name, columns));
+        }
+        {
+            let mut rows = conn
+                .query("SELECT name FROM sqlite_master WHERE type = 'index'", ())
+                .await
+                .map_err(|error| StoreError::Other(error.to_string()))?;
+            while let Some(row) = rows
+                .next()
+                .await
+                .map_err(|error| StoreError::Other(error.to_string()))?
+            {
+                if let turso::Value::Text(name) = row
+                    .get_value(0)
+                    .map_err(|error| StoreError::Other(error.to_string()))?
+                {
+                    indexes.push(name);
+                }
+            }
+        }
+        drop(conn);
+        drop(database);
+
+        let database = turso::Builder::new_local(&path.to_string_lossy())
+            .build()
+            .await
+            .map_err(|error| StoreError::Io(format!("打开 {} 失败：{error}", path.display())))?;
+        let conn = database
+            .connect()
+            .map_err(|error| StoreError::Io(format!("连上 {} 失败：{error}", path.display())))?;
+
+        for table in models::TABLES {
+            let Some((_, columns)) = present.iter().find(|(name, _)| *name == table.name) else {
+                let create = table
+                    .ddl
+                    .replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1);
+                conn.execute(&create, ())
+                    .await
+                    .map_err(|error| StoreError::Other(error.to_string()))?;
+                continue;
+            };
+            for column in table.columns {
+                if columns.iter().any(|name| name == column.name) {
+                    continue;
+                }
+                tracing::info!(table = table.name, column = column.name, "补一列");
+                conn.execute(
+                    &format!(
+                        "ALTER TABLE \"{}\" ADD COLUMN \"{}\" {}",
+                        table.name, column.name, column.clause
+                    ),
+                    (),
+                )
+                .await
+                .map_err(|error| StoreError::Other(error.to_string()))?;
+            }
+        }
+        for index in models::INDEXES {
+            // 与 `ensure_schema` 同一份判据：按**索引名**比对（`CREATE INDEX` 的语句文本
+            // 各版本可能不同，拿整句去比会重复建，而已存在时再建一次是错）。
+            if indexes
+                .iter()
+                .any(|name| index.contains(&format!("\"{name}\"")))
+            {
+                continue;
+            }
+            conn.execute(index, ())
+                .await
+                .map_err(|error| StoreError::Other(error.to_string()))?;
+        }
+        Ok(())
+    }
+
     pub async fn ensure_schema(&self) -> Result<(), StoreError> {
         // DDL 不进 `BEGIN CONCURRENT`：建表 / 加列是连接期的单线程动作，没有竞争者，而
         // MVCC 对 DDL 的事务语义不在 spike 的实测范围内——不拿一个没验过的东西去承担
@@ -275,6 +440,16 @@ impl Db {
                     for column in table.columns {
                         if present.iter().any(|name| name == column.name) {
                             continue;
+                        }
+                        // 文件库走到这里说明[建池之前那一次迁移](migrate_file)没做或做漏了。
+                        // **宁可报错也不假装补上**：在这条 MVCC 连接上 `ALTER` 会返回 Ok、
+                        // 然后重开就没了（实测 2026-09-20），静默丢掉比起不来更坏。
+                        if self.path.is_some() {
+                            return Err(StoreError::Io(format!(
+                                "{} 缺一列 {}：文件库的补列必须走建池之前的迁移（Db::connect），\
+                                 在已建池的连接上补会静默丢掉",
+                                table.name, column.name
+                            )));
                         }
                         tracing::info!(table = table.name, column = column.name, "补一列");
                         toasty::sql::statement(format!(
@@ -530,6 +705,63 @@ mod tests {
         (db, dir)
     }
 
+    /// 在**普通（非 MVCC）连接**上跑一句 SQL。
+    ///
+    /// 测试里造"旧形状"必须用它：在池连接上做 DDL 会静默丢掉，那样的测试两边都在空转
+    /// （`a_missing_column_is_added_in_place` 原来就是这样，真机上"旧库升级起不来"才漏过去）。
+    async fn plain_exec(path: &Path, sql: &str) {
+        let db = turso::Builder::new_local(&path.to_string_lossy())
+            .build()
+            .await
+            .expect("打开普通连接");
+        let conn = db.connect().expect("连接");
+        conn.execute(sql, ()).await.expect("执行");
+    }
+
+    /// 用**另一条新连接**问一次列清单——形状是不是真的落盘了，只有它能回答。
+    async fn plain_columns(path: &Path, table: &str) -> Vec<String> {
+        let db = turso::Builder::new_local(&path.to_string_lossy())
+            .build()
+            .await
+            .expect("打开普通连接");
+        let conn = db.connect().expect("连接");
+        let mut rows = conn
+            .query(
+                &format!("SELECT name FROM pragma_table_info('{table}')"),
+                (),
+            )
+            .await
+            .expect("查列");
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.expect("下一行") {
+            if let turso::Value::Text(name) = row.get_value(0).expect("取值") {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// 用**普通连接**把整张 schema 按"旧形状"摆出来——老库就是上一个版本这样建出来的。
+    ///
+    /// `legacy` 给"这张表用哪份 DDL"（比如去掉新列的 runs）。不先开池是必要的：池的连接
+    /// 释放得慢，普通连接上去改会 `database is locked`；而"先建池再改"正是空转测试的写法。
+    async fn plain_build_old(path: &Path, legacy: Option<(&str, String)>) {
+        for table in crate::models::TABLES {
+            let ddl = match &legacy {
+                Some((name, ddl)) if *name == table.name => ddl.clone(),
+                _ => table.ddl.to_string(),
+            };
+            plain_exec(
+                path,
+                &ddl.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1),
+            )
+            .await;
+        }
+        for index in crate::models::INDEXES {
+            plain_exec(path, index).await;
+        }
+    }
+
     async fn insert(db: &Db, id: String) -> Result<(), StoreError> {
         db.with_write_retry(move |ex| {
             let id = id.clone();
@@ -690,84 +922,67 @@ mod tests {
         assert!(found.is_some(), "重开之后行还在");
     }
 
-    /// 旧库缺一列时 `ensure_schema` 补得上，而且补完能写能读。
+    /// 旧库缺一列时，**重开**（建池之前的迁移）补得上，而且补完能写能读。
+    ///
+    /// 造"旧形状"与"确认它真的落盘"都必须在**普通连接**上做：在池连接上做 DDL 会静默丢掉，
+    /// 那样的测试两边都在空转——这一条原来就是那样写的，所以真机上"旧库升级起不来"才漏
+    /// 过去了。`plain_columns` 用**另一条新连接**问同一件事，就是为了不让这条再空转。
     #[tokio::test]
-    async fn a_missing_column_is_added_in_place() {
+    async fn a_missing_column_is_added_on_reopen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
 
-        // 先造一个"老版本"的表：故意少一列。
-        {
-            let db = Db::connect(&path).await.unwrap();
-            let mut conn = db.inner.connection().await.unwrap();
-            toasty::sql::statement(r#"ALTER TABLE "sessions" DROP COLUMN "origin""#)
-                .exec(&mut conn)
-                .await
-                .expect("turso 支持 DROP COLUMN");
-        }
+        // 旧形状：sessions 少一列。
+        let legacy = crate::models::session::DDL.replace(r#""origin" TEXT NOT NULL, "#, "");
+        assert!(!legacy.contains("origin"), "旧形状里不该有 origin");
+        plain_build_old(&path, Some(("sessions", legacy))).await;
 
+        let before = plain_columns(&path, "sessions").await;
+        assert!(
+            !before.iter().any(|name| name == "origin"),
+            "旧形状没落盘，后面的断言就没有意义：{before:?}"
+        );
+
+        // 重开：迁移在建池之前把它补回来，而且**落盘**。
         let db = Db::connect(&path).await.unwrap();
-        let ddl = db.table_ddl().await.unwrap();
-        let sessions = ddl
-            .iter()
-            .find(|(name, _)| name == "sessions")
-            .map(|(_, sql)| sql.clone())
-            .unwrap();
-        assert!(sessions.contains("\"origin\""), "补回来了：{sessions}");
+        let after = plain_columns(&path, "sessions").await;
+        assert!(
+            after.iter().any(|name| name == "origin"),
+            "补回来了，而且落盘：{after:?}"
+        );
 
         insert(&db, "after-alter".to_string()).await.unwrap();
     }
 
-    /// 旧库补列：**这次加的那两列**在一张旧的 `runs` 表上补得回来（§8.2 的加列规则）。
+    /// 委派那两列在**旧形状的 runs 表**上补得回来（§8.2 的加列规则，也是升级路径）。
     ///
-    /// "旧形状"就是今天那份 DDL 去掉这两列。**用带引号的 DDL 摆不是形式**：老库是
-    /// `CREATE TABLE` 建出来的（带引号），而这个写法正是 turso 认表的关键——`DROP COLUMN`
-    /// 会把存下来的 DDL 重写成不带引号的形状，之后 `ALTER TABLE … ADD COLUMN` 在那个形状上
-    /// 静默不生效（实测），所以这条路只能整表换成旧形状，不能"删一列"。
-    ///
-    /// 两列都可空，所以加得上（`NOT NULL` 且没有默认值才加不上）；补完之后**按模型读一遍**
-    /// 确认 SELECT 的列清单在这张表上成立。**这里读的是空表**：往换成旧形状的表里写行再
-    /// 读回来，在 turso 上会读到空的（表被 toasty 之外的东西换过之后，新建连接看到的是另一
-    /// 个快照）——那是换表这条路的坑，不是补列的坑。"旧行（两列是 NULL）照样读得出来"由
-    /// `ledger` 那边一条测试锁着。
+    /// 同上：旧形状在普通连接上造、在另一条新连接上确认，然后才重开验迁移。
     #[tokio::test]
     async fn the_delegate_columns_are_added_to_an_existing_runs_table() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
 
-        {
-            let db = Db::connect(&path).await.unwrap();
-            let mut conn = db.inner.connection().await.unwrap();
-            let legacy = crate::models::run::DDL
-                .replace(r#""parent_run_id" TEXT, "#, "")
-                .replace(r#""delegate" TEXT, "#, "");
-            assert!(
-                !legacy.contains("parent_run_id") && !legacy.contains("delegate"),
-                "旧形状里不该有这两列"
-            );
-            toasty::sql::statement(r#"DROP TABLE "runs""#)
-                .exec(&mut conn)
-                .await
-                .expect("整表换成旧形状");
-            toasty::sql::statement(legacy)
-                .exec(&mut conn)
-                .await
-                .expect("建出旧形状的 runs");
-        }
+        let legacy = crate::models::run::DDL
+            .replace(r#""parent_run_id" TEXT, "#, "")
+            .replace(r#""delegate" TEXT, "#, "");
+        assert!(
+            !legacy.contains("parent_run_id") && !legacy.contains("delegate"),
+            "旧形状里不该有这两列"
+        );
+        plain_build_old(&path, Some(("runs", legacy))).await;
+
+        let before = plain_columns(&path, "runs").await;
+        assert!(
+            !before.iter().any(|name| name == "parent_run_id"),
+            "旧形状没落盘：{before:?}"
+        );
 
         let db = Db::connect(&path).await.unwrap();
-        let mut conn = db.inner.connection().await.unwrap();
-        let names: Vec<String> = toasty::sql::query("SELECT name FROM pragma_table_info('runs')")
-            .exec(&mut conn)
-            .await
-            .unwrap()
-            .iter()
-            .filter_map(|row| column_string(row, 0))
-            .collect();
+        let after = plain_columns(&path, "runs").await;
         for column in ["parent_run_id", "delegate"] {
             assert!(
-                names.iter().any(|name| name == column),
-                "{column} 补回来了：{names:?}"
+                after.iter().any(|name| name == column),
+                "{column} 补回来了，而且落盘：{after:?}"
             );
         }
         assert!(

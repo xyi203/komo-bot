@@ -86,8 +86,11 @@ Dependencies point downward only: `kernel ← store ← runtime ← gateway` and
   they started with. An invalid file is never installed. A short list of keys
   is start-only and is *reported* as such, never ignored.
 - **Schema changes are additive.** `*_TABLE_DDL` beside each toasty model,
-  byte-parity test against what toasty generates; `ensure_schema` ALTERs
-  columns in on connect; retired columns keep being written empty (§8.2).
+  byte-parity test against what toasty generates; a file DB is migrated *before*
+  the pool is built (`Db::connect` → `migrate_file`, a plain non-MVCC connection
+  — DDL on an MVCC connection returns `Ok` and persists nothing), and
+  `ensure_schema` then only guards (errors if a file DB still misses a column)
+  and repairs memory DBs; retired columns keep being written empty (§8.2).
 - **Turso MVCC**: string UUIDv7 keys, never AUTOINCREMENT; single writes in
   `with_write_retry`, multi-write in a transaction inside it.
 

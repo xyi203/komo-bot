@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use komo_kernel::policy::RuleTable;
 use komo_kernel::protocol::config::{
-    ChannelConfig, ChannelsConfig, ConfigSnapshot, KeyPath, MemoryConfig, PathsConfig,
-    RetrievalConfig, SourceFile, StartOnly,
+    ChannelConfig, ChannelsConfig, ConfigSnapshot, ExecutionConfig, KeyPath, MemoryConfig,
+    PathsConfig, RetrievalConfig, SourceFile, StartOnly,
 };
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
 use komo_kernel::types::memory::RetrievalMode;
@@ -54,6 +54,8 @@ pub(super) struct FileConfig {
     pub models: Option<ModelsSection>,
     #[serde(default)]
     pub memory: MemorySection,
+    #[serde(default)]
+    pub execution: ExecutionSection,
     #[serde(default)]
     pub channels: ChannelsSection,
 }
@@ -127,6 +129,21 @@ pub(super) struct MemorySection {
     pub embedding: Option<String>,
     #[serde(default)]
     pub retrieval: RetrievalSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ExecutionSection {
+    pub model_result_bytes: Option<usize>,
+}
+
+impl ExecutionSection {
+    fn into_execution(self) -> ExecutionConfig {
+        let base = ExecutionConfig::default();
+        ExecutionConfig {
+            model_result_bytes: self.model_result_bytes.unwrap_or(base.model_result_bytes),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -385,6 +402,7 @@ pub(super) fn assemble(
         model_catalog,
         model,
         memory,
+        execution: file.execution.into_execution(),
         channels,
         policy,
         paths,

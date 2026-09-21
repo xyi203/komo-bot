@@ -8,7 +8,7 @@ v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；�
 
 ## 1. 已确定的范围
 
-**一个 Rust 程序、五个基础工具、一套可恢复的 Agent Runtime。**
+**一个 Rust 程序、六个基础工具、一套可恢复的 Agent Runtime。**
 
 | 项目     | 决策                                                                                             |
 | -------- | ------------------------------------------------------------------------------------------------ |
@@ -128,19 +128,22 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 默认监听回环地址。首版远程访问可通过 SSH 转发连接；直接开放网络监听时需要 HTTPS 和认证。选择远程实例时，不因连接失败而启动一个本机替代实例。`status` 与 `stop` 不隐式启动服务。
 
-## 4. 五个基础工具
+## 4. 六个基础工具
 
-| 工具     | 输入与输出重点                             | 执行约束                         |
-| -------- | ------------------------------------------ | -------------------------------- |
-| `read`   | 路径、读取范围；返回文本和文件版本         | 大文件截断，明确显示未读范围     |
-| `write`  | 路径、完整内容、可选预期版本               | 原子替换；覆盖现有文件需检查版本 |
-| `edit`   | 路径、明确匹配内容、替换内容、预期版本     | 匹配失败返回错误，不模糊猜测     |
-| `shell`  | 命令、工作目录、超时；返回退出码和输出     | 管理进程组、限制输出、支持取消   |
-| `python` | 代码或已保存模块调用；返回结果、输出和产物 | 使用受管理解释器，绑定代码版本   |
+| 工具     | 输入与输出重点                                       | 执行约束                                             |
+| -------- | ---------------------------------------------------- | ---------------------------------------------------- |
+| `read`   | 路径、读取范围；返回文本和文件版本                   | 大文件截断，明确显示未读范围                         |
+| `write`  | 路径、完整内容、可选预期版本                         | 原子替换；覆盖现有文件需检查版本                     |
+| `edit`   | 路径、明确匹配内容、替换内容、预期版本               | 匹配失败返回错误，不模糊猜测                         |
+| `rg`     | 正则、搜索路径、文件 glob；返回「路径:行号:正文」    | 只读，与 `read` 同一条判定（范围内 Allow、范围外 Ask）；这台机器上没有 ripgrep 就不挂这个工具 |
+| `shell`  | 命令、工作目录、超时；返回退出码和输出               | 管理进程组、限制输出、支持取消                       |
+| `python` | 代码或已保存模块调用；返回结果、输出和产物           | 使用受管理解释器，绑定代码版本                       |
 
-搜索通过 shell 或 Python 完成；HTTP 请求通过 Python 库或命令完成。Git、构建、测试、HA、网页搜索和记录查询都组合这些基础工具。
+**搜索走 `rg` 工具，不拼 shell 命令。** 两者结果一样，判定不一样：`rg` 的计划是一次**只读**动作（`Operation::ReadFile`，目标是搜索范围），于是"搜工作目录"是 Allow、"搜范围外"要问人，和 `read` 完全一致；而 `shell` 的任意命令一律 Ask——一次只读搜索每次都停下来等人，是把审批额度浪费在不需要判断的事情上。HTTP 请求通过 Python 库或命令完成；Git、构建、测试、HA 和记录查询都组合这些基础工具。
 
-**委派（`delegate`）不是第六个工具，是一条编排操作。** 模型可以把一个自包含子任务交给**一条子 Run**：它以 `Operation::Delegate` 进同一个决策入口（§7.1 那一行），执行时在同一个 Session 里受理一条**子 Run**，父 Run 进 `waiting + dependency` 等它——子 Run 用的是同一套五个工具，它自己的每一次调用照常过 Policy 与审批，所以"能不能做"这一层没有被放宽，放宽的只是"这一件事由谁来做"。子代理只拿得到任务本身（不继承父的消息历史、不继承父的上下文），默认 8 轮预算，**深度只有一层**（子 Run 不能再委派）。结果可以带一个契约：子代理把结构化结果放进它最后一条回复，父侧续跑时用**同一份校验器**复验（§8.6）。
+`rg` 内嵌 ripgrep 的**书库**——[`grep`](https://github.com/BurntSushi/ripgrep/tree/master/crates/grep)（匹配、搜索、打印）加 [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore)（遍历：隐藏文件、`.gitignore`、覆盖 glob）——**进程内跑**：不起子进程，机器上也不需要装 `rg`。要书库不要命令，是因为外部二进制要么没装、要么各家版本不同；而遍历规则本来就该用这套经过验证的实现，不该自己再写一遍。正则语法就是 Rust regex（只连 `grep-regex`，不带 PCRE2）。遍历与搜索是阻塞的，所以跑在 `spawn_blocking` 上、匹配经队列流式写进输出存储（§8.3），取消与超时靠一个停止标志让那边收手。
+
+**委派（`delegate`）不是第七个工具，是一条编排操作。** 模型可以把一个自包含子任务交给**一条子 Run**：它以 `Operation::Delegate` 进同一个决策入口（§7.1 那一行），执行时在同一个 Session 里受理一条**子 Run**，父 Run 进 `waiting + dependency` 等它——子 Run 用的是同一套六个工具，它自己的每一次调用照常过 Policy 与审批，所以"能不能做"这一层没有被放宽，放宽的只是"这一件事由谁来做"。子代理只拿得到任务本身（不继承父的消息历史、不继承父的上下文），默认 8 轮预算，**深度只有一层**（子 Run 不能再委派）。结果可以带一个契约：子代理把结构化结果放进它最后一条回复，父侧续跑时用**同一份校验器**复验（§8.6）。
 
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、Policy 判断、审批处理、执行状态保存、取消和输出限制。
 
@@ -249,7 +252,7 @@ toolbox/
 └── .staging/
 ```
 
-README 与模块说明提供用法。LLM 通过 read 查看说明，再通过 python 调用。保存工具不会扩张模型侧的五个工具 Schema。
+README 与模块说明提供用法。LLM 通过 read 查看说明，再通过 python 调用。保存工具不会扩张模型侧的六个工具 Schema。
 
 可见的树之外还有两处**隐藏**位置（2026-09-17 落地）：`.staging/<m>.json` 存候选元数据（版本、测试结果），`.versions/<m>/{<ver>.py, test_<ver>.py, <ver>.json, enabled.json}` 存每个版本的快照与「当前启用哪个」——§5.4 要求记录实际使用的模块版本并保存快照。版本号 = 代码哈希前 12 位 + 依赖锁哈希前 8 位。`code` 模式的解释器装了一个排在 `sys.meta_path` 最前的查找器，按解析后的落点拒绝 `.staging` / `.versions` 的导入（§7.3）；它挡的是 import 这条路，`exec(open(...).read())` 不在承诺内。
 
@@ -589,7 +592,7 @@ Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_T
 
 stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内存里积累完整输出。进程结束并收齐输出后，同步并完成文件，再原子写入 output.json；最后才能发布 JSONL 结果引用。因中断只留下的 .partial 文件可以用于诊断，不能当作完成结果。
 
-读取历史或恢复调用时按引用加载需要的内容；组装模型上下文仍遵守输出预算，超限时提供截断提示和可读取的完整文件引用。当前 Session 获授权的输出可通过 read 只读访问，不开放普通工具修改这些记录。摘要或预览不能代替恢复所需的原始参数与结果。
+读取历史或恢复调用时按引用加载需要的内容；组装模型上下文仍遵守输出预算，超限时提供截断提示和可读取的完整文件引用。**这里有两个预算，不是一个**：`tool.result` 那 ≤1 KiB 是**账本的行预算**（每条 JSONL 行都要小），交给模型多少由 `[execution] model_result_bytes` 说了算（§6），完整正文落在 `output.json` 里。模型看到的正文由**一处纯函数**投影出来（`komo-kernel` 的 `projection`）：抬头（工具、状态、耗时、stdout / stderr 大小）+ 头尾各留一段并写明省了多少 + 可直接 `read` 的完整输出路径。因此**刚跑完的那一次与重启之后回放必须逐字节相同**——投影只吃落盘的事实（事件 + `output.json`），不掺任何只活在内存里的东西。那条路径必须真能读：**当前 Session 获授权的输出（`tool-output/`、`artifacts/`）是一段只读根**，`read` 得到它、写它一律 Deny（§8.10 第 4 条），不开放普通工具修改这些记录。摘要或预览不能代替恢复所需的原始参数与结果。
 
 实现约束：
 
@@ -1389,6 +1392,12 @@ mode = "hybrid"
 candidate_limit = 40
 top_k = 8
 max_tokens = 1500
+
+[execution]
+# 交给模型的工具结果正文上限（字节）。完整输出永远在 sessions/<id>/tool-output/ 下，
+# 这里限的是"这一次给模型看多少"：超了就头尾各留一段、写明省了多少，并给出可直接 read
+# 的路径（§8.3）。改完对新起的 Run 立即生效（§3）。省略 = 8192。
+model_result_bytes = 8192
 ```
 
 `memory.model` 省略时使用默认 completion alias 的完整配置，包括 effort；它不继承某个 Session 或 Cron 的临时覆盖。显式引用时必须指向 completion，`memory.embedding` 必须指向 embedding。若明确选择 keyword 模式，可以不配置 embedding。`GET /v1/models` 只列 completion alias；选择 alias 会携带完整端点、协议和凭证引用，而不是只替换上游 model id。
@@ -1425,10 +1434,10 @@ komo-store     session_log（JSONL 写入器 / 范围读 / 尾部校验）、pay
                Turso Db + toasty 模型 + ensure_schema、repositories、Coordinator（impl Ledger）、checkpoint。
                唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync), sha2
 
-komo-runtime   agent loop、executor、tools/{read,write,edit,shell,python}、python_runtime、
+komo-runtime   agent loop、executor、tools/{read,write,edit,rg,shell,python}、python_runtime、
                policy（config → 规则）、approvals、memory（MemoryManager、索引、代次）、llm 与 embedding 适配器、
                scheduler、recovery、skills、config。日常改动落在这里；它从不重新展开 toasty 宏。
-               deps: kernel, store, reqwest, tokio
+               deps: kernel, store, reqwest, tokio, grep + ignore（`rg` 工具）、arc-swap
 
 komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件、launchd/systemd 集成、
                Dispatcher、飞书 / Telegram / WeChat 渠道、Notifier 实现、deliveries、审批消息渲染。
@@ -1465,6 +1474,7 @@ kernel ← client ────────────────────�
 | `tower-http` | `0.6`，`default-features = false, features = ["cors"]` | 与 reqwest 对齐（两个大版本都要 `^0.6`）；选 0.7 只会多一条自找的重复版本 |
 | `sha2` | `0.10` | openlark-core 用 0.10；选 0.11 会把 `digest` / `block-buffer` / `crypto-common` / `cpufeatures` 一起劈成两份 |
 | `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
+| `grep` + `ignore` | `0.4`，`default-features = false`；仅 komo-runtime（`rg` 工具） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
 | `arc-swap` | 默认；仅 komo-runtime（`config`） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
 | `clap` | `derive` | 仅 bin |
 | `flate2` / `tar` | `flate2` 显式 `default-features = false, features = ["rust_backend"]`（miniz_oxide），`tar 0.4` | 仅 bin：`komo update` 解发布包（§13.6）。两者都是纯 Rust（不带 C 工具链），且**不进 gateway / runtime 的图**——它们谁也不更新自己；`rust_backend` 写死是不跟上游默认后端变 |
@@ -1696,7 +1706,7 @@ pub trait Clock: Send + Sync {
 |---|---|---|
 | 1. 进程与会话骨架 | 六个 crate 骨架（§13.4）；komo、Gateway 自动启动、HTTP/SSE；`komo-store`：Turso 连接、`ensure_schema` + DDL 对齐测试、`with_write_retry`、统一 Session 目录与状态索引；`komo-client`：HTTP/SSE 客户端与 TUI 骨架；**编译预算首次测量** | 多个 CLI 同时启动仅产生一个实例；断线后能查看原会话；两个写入器对不同 Session 并发提交不互相阻塞，对同一行冲突时一方重试成功且只应用一次；DDL 对齐测试挂掉能定位到列；改 client 一行不重编 gateway；保存一份合法的 config.toml 后 `komo doctor` 一秒内显示新 mtime 已生效，保存一份非法的则旧配置继续生效且 home chat / 日志有具体错误 |
 | 2. AgentLoop 与 Policy | 模型往返、执行计划、Allow/Ask/Deny、审批持久化；`Ledger`、`Policy`、`ApprovedPlan` 类型状态；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测 | 危险操作批准前不执行；重复批准不重复执行；Deny 不被授权覆盖；不构造 `Proof` 就调不到 `execute`（编译期）；`Ask` 后 Run 让出名额且 TUI 弹出审批 |
-| 3. 五个工具 | 文件、进程、Python 环境与输出处理；`verify` 默认实现与 write/edit 的哈希核对 | 文件版本冲突可见；取消停止子进程；未知工具无法调用 |
+| 3. 六个工具 | 文件、搜索、进程、Python 环境与输出处理；`verify` 默认实现与 write/edit 的哈希核对 | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 与 `read` 走同一条判定（工作目录内的搜索不产生审批），且它不依赖机器上装没装 `rg` |
 | 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、审批渲染、短 ID、飞书卡片与 Telegram 内联按钮、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一人连点两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/approve` 与按钮回调重发只批准一次；来源会话与 home chat 都收到请求且第二个答复得到"已决定"；决定后卡片 / 消息原地更新；Gateway 重启后 pending 投递补发一次；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的审批请求 |
 | 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，`toasty::sql`）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的审批仍能在手机上批 |
 | 6. toolbox 迭代 + Skills | 保存模块、候选测试、版本审核与启用；`SkillRegistry`、目录行门控、`read` 只读根 | 调用使用已批准且已测试版本；模块更新使旧授权失效；新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect；toolbox 启用的审批在微信里能看到版本差异与测试结果 |
@@ -1771,3 +1781,6 @@ Memory 与模型验收覆盖：
 | **既有的 state.db 能不能加上新列**（§8.2 那句"schema 变化只增不改、`ensure_schema` 连上时补列"） | 升级路径：任何一个加了列的新版本在旧库上都起不来 | **已实测（2026-09-20，委派那两列 `runs.parent_run_id` / `runs.delegate`，本机 macOS + 真实 Turso MVCC 库）：补列会静默丢掉。** 现象：旧二进制建的库 → 新二进制启动 → 日志有 `补一列 table="runs" column="parent_run_id"` 两条 → 但同进程随后的每一条用到该列的语句都报 `Parse error: no such column: parent_run_id`（领取 SQL、待处理清单、对账、建会话全中），**重启也没用**；与此同时把 `state.db` 单独复制出来、由另一个进程打开时，同一段 `ensure_schema` 又能"补上"并打印出带新列的 DDL（所以库里没有落盘、那个进程看到的只是自己那份视图）。**新装的库完全正常**（真机端到端委派已验证），坏的只有"旧库 + 新列"这一条路。待办：查 Turso MVCC 下 DDL 的持久化语义（是否必须走非 MVCC 连接 / 是否要升级 turso），再决定补列是改成"用原始连接迁移"还是"表重建"。 **已定位并已改（2026-09-20，同日）：MVCC 连接上的 DDL 不落盘**（`Ok` + 日志照打，重开即无），所以补列改走**建池之前**——`Db::connect` 在 `toasty::Db::builder` 之前用**普通（非 MVCC）连接**把已存在的文件补到当前 schema（`migrate_file`：建缺失表 → `ALTER TABLE ADD COLUMN` → 建缺失索引），全部幂等；`ensure_schema` 退成**守卫**：文件库再缺列就**报错**（"补列必须走建池之前的迁移"），只有内存库（没有文件）还由它补。实现上还有个坑：turso 的读游标拖着一条读事务，**同一条连接上"边读边改"会 panic**在 `vdbe/execute.rs` 的 `SetCookie`（`invalid transaction state for SetCookie: TransactionState::Read, should be write`），所以那段是"一次读清 → 丢连接 → 只用一条只写连接改"。**已验证（真库副本，本机 macOS）**：副本 `sessions` 少 `state`/`state_changed_at`、`runs` 少 8 列 → `Db::connect` 之后 12/31 列齐全、另开一条连接读得回（确实落盘），按模型读 sessions 25 行（含 `origin`）、runs 正常。回归测试两条 `a_missing_column_is_added_on_reopen` / `the_delegate_columns_are_added_to_an_existing_runs_table`：**在普通连接上造旧形状、在另一条新连接上确认落盘**，原先那两条在池连接上造形状，两边都在空转——这正是真机上漏过去的原因。未核实：断电 / 内核崩溃下的持久性，以及升级 turso 后行为是否改变。 |
 | 模型一轮里提了两个调用、其中一个没有结果时，会话后面的新 Run 会不会被毒住 | §8.3 回放窗口 | **已实测（2026-09-20，真实 provider）：会。** 旧二进制下模型一轮提了两个调用，一个被拒/没执行，那条 `message.assistant` 留在会话里；其后**同一会话的每一条新 Run** 首个模型请求都被 provider 400 拒（`No tool output found for tool call call_00_…`），且会连着重试。本次改动里"回放窗口按 Run 过滤"（`service/segment.rs` 的 `window(surface, Some(run))`）恰好挡住它——新 Run 只看得见自己那条输入，不再被别人的半轮毒住。**已修（2026-09-20，本机真实会话复盘）**：线上那次 400 的调用是两次 `delegate`——两个漏法都补上了。①`resumed()` 重建调用时不按引用读回外置的 `arguments` / `plan`（§8.3 原话要求"读取历史或恢复调用时按引用加载需要的内容"）：委派的任务正文 6 KB 被外置，重 `prepare` 拿到的是一份 `null` 参数，当场失败。②`execute_one` 的"未知工具 / prepare 失败 / 放行被拒 / 子代理不能再委派"四条分支把结论**只交给模型、不写账本**（`Ledger::fail_call` 就是补这一笔）：那次调用于是永远悬着，父的窗口里两个 `function_call` 一前一后，provider 报的是前面那个。回归测试：`service::segment::tests::an_externalized_argument_and_plan_come_back_by_reference`、`service::tests::a_delegated_task_over_the_inline_limit_still_settles_the_parent_call`（去掉任一处的回填就失败）、`service::tests::a_call_that_cannot_run_still_gets_a_result_in_the_ledger`（去掉 `fail_call` 就失败）。 |
 | 超限的**正文**（`run.accepted.text` / `message.assistant.text` 过 4 KiB）在回放窗口里是不是也需要按引用读回 | §8.3 的"读取历史或恢复调用时按引用加载" | **已核实（2026-09-20，真实会话）**：会外置（本次会话里两条子 Run 的 `run.accepted` 与一条 `message.assistant` 都是 `text: null` + `text_ref`），而全仓**没有任何一处**读 `text_ref`——`replay()` 交给模型的用户消息因此是空的。当前没炸是因为子代理的任务正文同时也在它的系统提示里（`subagent_prompt` 拼了 `spec.task`），而正常 Run 的用户输入很少过 4 KiB。待办。 |
+| 内嵌 `grep` + `ignore` 之后冷编还在不在 60s 预算内 | §13.4 的编译预算 | **已实测（2026-09-21，本机 macOS M5，`cargo build --timings`、空 target 目录）：加之前 1m10s（`/tmp` 里 HEAD 的干净 worktree），加之后 1m10s——差值落在噪声里。** 新带进来的 13 个包（`globset` / `walkdir` / `termcolor` / `crossbeam-deque` / `memmap2` / `bstr` / `encoding_rs_io` 等）与 `turso_core` / `aws-lc-sys` 并行，不在关键路径上。**顺带发现：60s 这个预算当时就已经超了**（§13.4 记的 2026-09-16 是 64.2s），与这次改动无关——要么把预算调到实测值，要么回去找关键路径，待办。 |
+| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 8 KiB，热生效）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**未核实**：8 KiB 这个默认值对真实任务够不够——要等真实会话的 recall 次数（§49 的指标）出来再调，别凭感觉改。**未接**：§6 同句里的"活动执行时限"（`ExecutionLimits::call_timeout`，300s）仍是代码默认值，没进配置——要么一起接，要么在 §3 里明确它是 start-only。 |
+| `read` 一次读回来的正文够不够模型用 | §4 与 §8.3 | **已做（2026-09-21）**：`read` 交给模型的那一段从 400 字符改到 8 KiB（`read::PREVIEW_BYTES`），投影再按预算收。**未核实**：真实仓库里"读一个文件要几次 `read`"——如果还是很多次，说明该按结构切（一次给整段函数）而不是按字节。 |

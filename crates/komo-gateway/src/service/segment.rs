@@ -23,15 +23,17 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::{Surface, SurfaceMessage, fold};
-use komo_kernel::traits::{ApprovalRepo, Ledger, LedgerError};
+use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
+use komo_kernel::traits::{ApprovalRepo, Ledger, LedgerError, ToolOutputStore};
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
-use komo_kernel::types::turn::{ReplayMessage, ToolResultForModel, TurnRequest};
+use komo_kernel::types::turn::{ReplayMessage, ToolCallRequest, ToolResultForModel, TurnRequest};
 use komo_runtime::agent::handler::SegmentSource;
 use komo_runtime::agent::{Budget, ResumedRound, RetryBudget, Segment};
+use komo_runtime::config::ConfigHolder;
 use komo_runtime::executor::{CallEnv, CallRequest, resumed_from};
 use komo_runtime::memory::MemoryManager;
 use komo_runtime::scheduler::HandlerError;
@@ -50,6 +52,15 @@ pub struct GatewaySegments {
     /// 读不出来的会话要停在 `needs_attention` 上，而不是被反复领取——写那一笔要它。
     recovery: RecoveryStore,
     workspaces: PathBuf,
+    /// `sessions/` 那一层目录。**根拿它算**：`<sessions>/<session>/tool-output` 是这个
+    /// Session 自己的输出（§8.3 要求它可被 `read` 只读访问）。`None` = 精简装配。
+    session_files: Option<PathBuf>,
+    /// 回放时要读回 `output.json` 里那份完整正文（投影用），所以这里得有输出存储。
+    outputs: Option<Arc<dyn ToolOutputStore>>,
+    /// 交给模型的正文预算**每次装配时从当前配置快照读一次**（§3：读者按次读当前快照）。
+    /// 拿它填进 `CallEnv`，回放那一侧用同一个值——两处各写一个数就会让"刚跑完"和"回放"
+    /// 渲染出不一样的正文。
+    config: Option<Arc<ConfigHolder>>,
     max_rounds: u32,
     max_retries: u32,
     cancels: Mutex<BTreeMap<RunId, CancelToken>>,
@@ -88,6 +99,9 @@ impl GatewaySegments {
             approvals,
             recovery,
             workspaces,
+            session_files: None,
+            outputs: None,
+            config: None,
             max_rounds,
             max_retries,
             cancels: Mutex::new(BTreeMap::new()),
@@ -102,6 +116,38 @@ impl GatewaySegments {
     pub fn with_skills(mut self, skills: Arc<std::sync::RwLock<String>>) -> Self {
         self.skills = Some(skills);
         self
+    }
+
+    /// 接上 `sessions/` 那一层：接上之后，**这个 Session 自己的输出与产物**成为一段可以
+    /// 用的只读根（§8.3）。
+    pub fn with_session_files(mut self, sessions_dir: PathBuf) -> Self {
+        self.session_files = Some(sessions_dir);
+        self
+    }
+
+    /// 接上投影要用的输出存储（§8.3）。
+    pub fn with_projection(mut self, outputs: Arc<dyn ToolOutputStore>) -> Self {
+        self.outputs = Some(outputs);
+        self
+    }
+
+    /// 接上配置：输出预算按当前快照热生效（§3）。
+    pub fn with_config(mut self, config: Arc<ConfigHolder>) -> Self {
+        self.config = Some(config);
+        self
+    }
+
+    /// 这一次装配用多少正文预算。
+    fn model_result_bytes(&self) -> usize {
+        self.config
+            .as_ref()
+            .map(|config| config.current().execution.model_result_bytes)
+            .unwrap_or(komo_kernel::projection::DEFAULT_MODEL_RESULT_BYTES)
+    }
+
+    /// 这一段能用哪些根。见 [`run_roots`]。
+    fn roots_for(&self, session: &SessionId, cwd: PathBuf) -> Vec<WorkspaceRoot> {
+        run_roots(self.session_files.as_deref(), session, cwd)
     }
 
     /// 现在这一份 skills 目录。没接就是空的——精简装配（测试、`skills` 关掉的部署）
@@ -231,12 +277,18 @@ impl SegmentSource for GatewaySegments {
         // **根必须是真实路径**：工具解析目标时解掉符号链接（`tools::paths::resolve`），
         // 根停在字面上就会让 workspace 里的动作被判成"范围外"（macOS 的 `/tmp`、`/var`
         // 都是链接）。两边同一个口径，前缀匹配才是"在不在这个根里"。
+        let model_result_bytes = self.model_result_bytes();
         let cwd = paths::real_root(&cwd);
-        let roots = vec![WorkspaceRoot {
-            path: cwd.clone(),
-            writable: true,
-            label: "workspace".into(),
-        }];
+        let roots = self.roots_for(&session, cwd.clone());
+        // 投影要拿它把引用拼成能直接 `read` 的绝对路径。
+        let session_root = self.session_files.as_ref().map(|dir| {
+            paths::real_root(
+                komo_store::SessionPaths::new(dir, &session)
+                    .root()
+                    .to_path_buf()
+                    .as_path(),
+            )
+        });
 
         // 这是一条**子代理**吗？（§4）是的话，它的契约与预算跟着它走——父侧派它时给的那份，
         // 落在它自己的 `run.accepted` 里，所以重启之后也读得到。
@@ -274,7 +326,14 @@ impl SegmentSource for GatewaySegments {
             // **按本 Run 过滤**：子代理跑过的那几轮属于它自己那条 Run，父续跑时读回来的
             // 必须是父自己的上下文——否则子代理的探索过程会跑进父的窗口，而父侧本来只
             // 该拿到那条结果（§4）。
-            messages: replay(&surface, &run),
+            messages: replay(
+                &surface,
+                &run,
+                self.outputs.as_deref(),
+                session_root.as_deref(),
+                model_result_bytes,
+            )
+            .await,
             tools,
             memories,
             covers: None,
@@ -286,6 +345,8 @@ impl SegmentSource for GatewaySegments {
             source: record.source.clone(),
             cwd,
             roots,
+            model_result_bytes,
+            session_root: session_root.clone(),
             env_version: None,
             principal: None,
             // 本 Run 是被谁派的（普通 Run 是 None）。runtime 用它硬拦"子代理再委派"。
@@ -553,34 +614,63 @@ async fn call_request(
 /// 的收尾；照搬位置发出去，provider 看到的就是"助手要了一次调用、紧接着另一个 Run 的
 /// 用户消息、最后才是那次调用的输出"，直接 400（`No tool output found for tool call …`）。
 /// 领取那一步已经保证后一个 Run 不会先跑（`DUE_SQL`），这里管的是它**还没跑**时那半句话。
-fn replay(surface: &Surface, only: &RunId) -> Vec<ReplayMessage> {
-    window(surface, Some(only))
-        .into_iter()
-        .map(|message| ReplayMessage {
+///
+/// 每条工具结果的正文走的是**同一个投影函数**（`komo_kernel::projection`）：刚跑完那次与
+/// 重启之后回放，必须是同一段字节。所以这里要把事实凑齐——工具名从那一轮的调用里找，
+/// 完整正文与流大小从 `output.json` 读回来；读不回来时退回账本里那 1 KiB（那是"我们至少
+/// 还有这些"，不是"本该如此"）。
+async fn replay(
+    surface: &Surface,
+    only: &RunId,
+    outputs: Option<&dyn ToolOutputStore>,
+    session_root: Option<&std::path::Path>,
+    model_result_bytes: usize,
+) -> Vec<ReplayMessage> {
+    let mut out = Vec::new();
+    for message in window(surface, Some(only)) {
+        let mut tool_results = Vec::new();
+        for result in &message.tool_results {
+            // 完整正文在 `output.json` 里；没有输出存储（精简装配）时退回账本里那 1 KiB。
+            let stored = match outputs {
+                Some(outputs) => outputs.open(&result.output).await.ok(),
+                None => None,
+            };
+            let text = stored
+                .as_ref()
+                .and_then(|verified| verified.body.preview.as_deref())
+                .map(str::to_string)
+                .or_else(|| result.preview.clone());
+            let facts = ToolResultFacts {
+                tool: tool_name(surface, &result.call).unwrap_or("?"),
+                status: result.status,
+                elapsed_ms: result.elapsed_ms,
+                text: text.as_deref(),
+                output: &result.output,
+                stdout: result.stdout.as_ref(),
+                stderr: result.stderr.as_ref(),
+                session_root,
+            };
+            tool_results.push(ToolResultForModel {
+                provider_call_id: provider_call_id(surface, &result.call)
+                    .unwrap_or_else(|| result.call.to_string()),
+                call_id: result.call.clone(),
+                content: project(&facts, &ProjectionContext { model_result_bytes }),
+                is_error: !matches!(
+                    result.status,
+                    komo_kernel::types::refs::ToolResultStatus::Completed
+                ),
+            });
+        }
+        out.push(ReplayMessage {
             role: message.role,
             seq: message.seq,
             text: message.text.clone(),
             tool_calls: message.tool_calls.clone(),
-            tool_results: message
-                .tool_results
-                .iter()
-                .map(|result| ToolResultForModel {
-                    provider_call_id: provider_call_id(surface, &result.call)
-                        .unwrap_or_else(|| result.call.to_string()),
-                    call_id: result.call.clone(),
-                    content: result
-                        .preview
-                        .clone()
-                        .unwrap_or_else(|| format!("[完整输出：{}]", result.output.path())),
-                    is_error: !matches!(
-                        result.status,
-                        komo_kernel::types::refs::ToolResultStatus::Completed
-                    ),
-                })
-                .collect(),
+            tool_results,
             provider_blocks: message.provider_blocks.clone(),
-        })
-        .collect()
+        });
+    }
+    out
 }
 
 /// 回放窗口里属于**已经开跑过**的那些 Run，**按 Run 分组、Run 之间先来后到**。
@@ -642,18 +732,73 @@ fn latest_user_text(surface: &Surface) -> Option<String> {
         .and_then(|message| message.text.clone())
 }
 
+/// 一条 Run 能用哪些根。
+///
+/// 除了工作目录，还有**这个 Session 自己的输出与产物**（只读）：模型看到的每条
+/// `tool.result` 都写着"完整输出在哪"，那条路径必须真能读——否则那句提示就是一根死链
+/// （§8.3「当前 Session 获授权的输出可通过 `read` 只读访问」）。
+///
+/// **只读靠两件事**：`writable: false` 让 §7.1 的写入规则不命中；而真正拦住写的是
+/// §8.10 第 4 条——`sessions/` 在本机受保护名单里，写它一律 Deny（Deny 高于 Allow）。
+///
+/// 根与目标必须在同一套坐标系里：这里用 `real_root` 解掉符号链接，工具解析目标时走的也
+/// 是它（macOS 上 `/var` → `/private/var`，字面前缀匹配会全落空）。
+fn run_roots(
+    sessions_dir: Option<&std::path::Path>,
+    session: &SessionId,
+    cwd: PathBuf,
+) -> Vec<WorkspaceRoot> {
+    let mut roots = vec![WorkspaceRoot {
+        path: cwd,
+        writable: true,
+        label: "workspace".into(),
+    }];
+    let Some(sessions_dir) = sessions_dir else {
+        return roots;
+    };
+    let paths = komo_store::SessionPaths::new(sessions_dir, session);
+    for (path, label) in [
+        (paths.tool_output(), "session-output"),
+        (paths.artifacts(), "session-artifacts"),
+    ] {
+        roots.push(WorkspaceRoot {
+            path: paths::real_root(&path),
+            writable: false,
+            label: label.into(),
+        });
+    }
+    roots
+}
+
 /// 结果要按 provider 自己的 call_id 回传（§6）。
 fn provider_call_id(surface: &Surface, call: &ToolCallId) -> Option<String> {
+    tool_call(surface, call).map(|call| call.provider_call_id.clone())
+}
+
+/// 这个调用是哪个工具发的——投影的抬头要它，而事件里只记了调用号。
+fn tool_name<'s>(surface: &'s Surface, call: &ToolCallId) -> Option<&'s str> {
+    tool_call(surface, call).map(|call| call.name.as_str())
+}
+
+/// 这一轮里的那条调用。工具名与 provider 的 call_id 都在它上面。
+fn tool_call<'s>(surface: &'s Surface, call: &ToolCallId) -> Option<&'s ToolCallRequest> {
     surface.messages.iter().rev().find_map(|message| {
         message
             .tool_calls
             .iter()
             .find(|candidate| &candidate.call_id == call)
-            .map(|candidate| candidate.provider_call_id.clone())
     })
 }
 
-/// 系统提示的正文：身份 / 工作目录 / 挂着的工具 / §5.6 的 skills 目录 / 两条行为约束。
+/// 提示里每条 Run 都说的那几句行为约束。
+///
+/// **一处定义**：主对话与子代理两份提示各抄一份就会漂，而漂掉的那一条恰恰是模型真正照
+/// 着做的那一条。
+const RULES: &str = "找代码和文字用 rg 工具；不要用 shell 里的 grep / find / ls 拼搜索。\n\
+                     危险操作会被拦下来等人批准；被拒绝就把它当作结果，不要绕过。\n\
+                     做完之后如实报告做了什么、有什么证据；没有证据就说没有。";
+
+/// 系统提示的正文：身份 / 工作目录 / 挂着的工具 / §5.6 的 skills 目录 / 三条行为约束。
 ///
 /// `skills` 是 [`crate::service::state::skills_prompt`] 在**启动时**算好的那一块
 /// （§5.6：目录行是启动快照，为的是提示前缀稳定）；没有能露面的 skills 时它是空串。
@@ -663,8 +808,7 @@ fn system_prompt(cwd: &std::path::Path, tools: &[ToolDefinition], skills: &str) 
         "你是 komo，一个在用户自己机器上运行的助手。\n\
          工作目录：{}\n\
          可用工具：{}\n\
-         危险操作会被拦下来等人批准；被拒绝就把它当作结果，不要绕过。\n\
-         做完之后如实报告做了什么、有什么证据；没有证据就说没有。",
+         {RULES}",
         cwd.display(),
         if names.is_empty() {
             "（这一段没有工具）".to_string()
@@ -692,8 +836,7 @@ fn subagent_prompt(cwd: &std::path::Path, tools: &[ToolDefinition], spec: &Deleg
          任务：{}\n\
          工作目录：{}\n\
          可用工具：{}\n\
-         危险操作会被拦下来等人批准；被拒绝就把它当作结果，不要绕过。\n\
-         做完之后如实报告做了什么、有什么证据；没有证据就说没有。",
+         {RULES}",
         spec.task,
         cwd.display(),
         if names.is_empty() {
@@ -929,6 +1072,66 @@ mod tests {
 
         let bare = system_prompt(std::path::Path::new("/tmp/w"), &tools, "");
         assert!(!bare.contains("Skills"), "{bare}");
-        assert_eq!(bare.lines().count(), 5, "{bare}");
+        assert_eq!(bare.lines().count(), 6, "{bare}");
+    }
+
+    /// 「搜代码用 rg，不要用 shell 里的 grep / find / ls」是**两条提示共用**的一句
+    /// （[`RULES`]）：子代理也要照它做，所以它不能只写在主对话那一份里。
+    #[test]
+    fn both_prompts_tell_the_model_to_search_with_rg() {
+        let tools = [ToolDefinition {
+            name: "rg".into(),
+            description: "搜".into(),
+            parameters: serde_json::json!({}),
+        }];
+        let main = system_prompt(std::path::Path::new("/tmp/w"), &tools, "");
+        assert!(main.contains("可用工具：rg"), "{main}");
+        assert!(main.contains("不要用 shell 里的 grep"), "{main}");
+
+        let spec = komo_kernel::types::delegate::DelegateSpec::new(
+            RunId::from_raw("run-1"),
+            ToolCallId::from_raw("call-1"),
+            "查一下调用方",
+        );
+        let sub = subagent_prompt(std::path::Path::new("/tmp/w"), &tools, &spec);
+        assert!(sub.contains("不要用 shell 里的 grep"), "{sub}");
+    }
+
+    /// §8.3：这个 Session 自己的输出与产物是**只读**根——模型看到的"完整输出在哪"得真能
+    /// 读进去，而写进去不许命中"范围内写入"那条 Allow。
+    #[test]
+    fn a_run_can_read_its_own_session_output_but_not_write_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = SessionId::from_raw("sess-1");
+        let roots = run_roots(Some(dir.path()), &session, PathBuf::from("/tmp/w"));
+
+        let labels: Vec<&str> = roots.iter().map(|root| root.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["workspace", "session-output", "session-artifacts"],
+            "工作目录可写，Session 自己的两处只读"
+        );
+        assert!(roots[0].writable);
+
+        let output = roots
+            .iter()
+            .find(|root| root.label == "session-output")
+            .unwrap();
+        assert!(!output.writable);
+        assert!(
+            output.path.ends_with("sess-1/tool-output"),
+            "{}",
+            output.path.display()
+        );
+        assert!(output.path.is_absolute(), "根必须是绝对路径");
+        let artifacts = roots
+            .iter()
+            .find(|root| root.label == "session-artifacts")
+            .unwrap();
+        assert!(artifacts.path.ends_with("sess-1/artifacts"));
+
+        // 没接 `sessions/` 的精简装配只有工作目录——不该凭空多出两个根。
+        let bare = run_roots(None, &session, PathBuf::from("/tmp/w"));
+        assert_eq!(bare.len(), 1);
     }
 }

@@ -231,6 +231,10 @@ impl Harness {
                 writable: true,
                 label: "workspace".into(),
             }],
+            // 测试里没有 Session 目录：投影会退回"相对 Session 目录"那种说法。
+            session_root: None,
+            // 测试默认用同一个默认预算；要更小/更大的自己改这一格。
+            model_result_bytes: komo_kernel::projection::DEFAULT_MODEL_RESULT_BYTES,
             env_version: None,
             principal: None,
             cancel,

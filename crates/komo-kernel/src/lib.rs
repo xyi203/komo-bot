@@ -4,6 +4,7 @@ pub mod cron;
 pub mod events;
 pub mod fold;
 pub mod policy;
+pub mod projection;
 pub mod protocol;
 pub mod recovery;
 #[cfg(feature = "test-support")]

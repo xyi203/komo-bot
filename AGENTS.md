@@ -39,7 +39,7 @@ komo-kernel    value types, state machines, events + fold, Policy engine,
 komo-store     session_log (JSONL) · payloads · tool_output · Turso Db + toasty
                models + *_TABLE_DDL · repositories · Coordinator (impl Ledger).
                The only crate that sees toasty/turso.
-komo-runtime   agent loop · executor · tools/{read,write,edit,shell,python} ·
+komo-runtime   agent loop · executor · tools/{read,write,edit,rg,shell,python} ·
                python_runtime · policy · approvals · memory · llm · embedding ·
                scheduler · recovery · skills · config.
 komo-gateway   axum routes · SSE · auth · lock/discovery · launchd/systemd ·
@@ -73,6 +73,11 @@ Dependencies point downward only: `kernel ← store ← runtime ← gateway` and
 - **Recovery decides "did it happen" before "retry"** (§8.4 table, §8.6).
   `started` alone proves nothing. Unknown outcome → `uncertain`, surfaced to
   the operator, never silently re-run.
+- **Tool result 的模型视图只有一处投影**（`komo-kernel/src/projection.rs`）。输入只有落盘的
+  事实（`tool.result` 事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"重启后回放"
+  必须逐字节相同。账本里那 ≤1 KiB 是**行预算**，交给模型多少由 `[execution]
+  model_result_bytes` 定（§6）。当前 Session 的 `tool-output/` 与 `artifacts/` 是**只读根**：
+  正文里那句"完整输出在哪"必须真的能 `read`。
 - **Channel identity lives in config, not the db** (§11.2): `allow_from` /
   `home_chat` / `groups` in `config.toml`, credentials in `.env`. No pairing
   table, no `/sethome`.

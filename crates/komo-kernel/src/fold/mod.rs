@@ -284,6 +284,11 @@ impl Surface {
                         attempt: body.attempt_id.clone(),
                         status: body.status,
                         output: body.output_ref.clone(),
+                        elapsed_ms: body.elapsed_ms,
+                        // 投影要的就是这几格：有了它们，回放那一侧才渲染得出与刚跑完时
+                        // **逐字节相同**的正文（大小、尾部提示都从引用里来）。
+                        stdout: body.stdout.clone(),
+                        stderr: body.stderr.clone(),
                         preview: body.preview.clone(),
                     },
                 );

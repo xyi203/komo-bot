@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::ids::{ApprovalId, AttemptId, EventId, RunId, Seq, ShortId, ToolCallId};
 use crate::types::plan::PlanHash;
-use crate::types::refs::{OutputRef, PayloadRef, ToolResultStatus};
+use crate::types::refs::{ContentRef, OutputRef, PayloadRef, ToolResultStatus};
 use crate::types::status::{RunState, ToolCallState, WaitReason};
 use crate::types::turn::{Role, ToolCallRequest};
 
@@ -43,6 +43,17 @@ pub struct SurfaceToolResult {
     pub attempt: AttemptId,
     pub status: ToolResultStatus,
     pub output: OutputRef,
+    /// 那一次跑了多久。投影的抬头要它。
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    /// stdout / stderr 的引用。**投影按它们报大小**——"还有多少没给你"是引用里的事实，
+    /// 不该从工具正文里解析。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<ContentRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<ContentRef>,
+    /// 事件里那份 ≤1 KiB 的预览。**完整的那一份在 `output.json` 里**（`body.preview`），
+    /// 投影优先读它；读不回来时才退回这一份（账本里至少还有这些）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
 }

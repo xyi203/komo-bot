@@ -80,6 +80,12 @@ pulldown-cmark = "0.13.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = "0.4"
 
+# §13.4：`rg` 工具用的搜索库——就是 ripgrep 那个仓库拆出来的书，**不起子进程、没有外部
+# 二进制依赖**。默认特性集是空的（pcre2 / simd-accel 都不开），写出来是为了钉住这一点：
+# 换引擎（PCRE2）会改掉"正则语法 = Rust regex"这个对模型可见的契约。
+grep = { version = "0.4", default-features = false }
+ignore = { version = "0.4", default-features = false }
+
 # §3 配置热重载：进程内唯一的 Arc<ConfigSnapshot> 原子替换。
 arc-swap = "1.9.2"
 

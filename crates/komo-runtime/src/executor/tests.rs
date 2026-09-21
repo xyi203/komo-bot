@@ -657,7 +657,8 @@ async fn not_performed_closes_the_call_as_failed_so_a_retry_is_a_new_call() {
     assert_eq!(tool.ran(), 1, "结论只写账，不去重做");
 }
 
-/// ⑩ 预览 ≤ 1 KiB，完整输出走 `ToolOutputStore`。
+/// ⑩ 两个预算各管各的：账本里的预览 ≤ 1 KiB，交给模型的正文按上下文预算收；完整输出
+/// 始终在 `ToolOutputStore` 里。
 #[tokio::test]
 async fn the_preview_is_bounded_and_the_whole_output_lives_in_the_store() {
     let harness = Harness::new();
@@ -697,14 +698,19 @@ async fn the_preview_is_bounded_and_the_whole_output_lives_in_the_store() {
         preview.len()
     );
 
-    // 交给模型的正文也有界，而且指得出去哪读全的。
+    // 交给模型的正文按**上下文预算**收（默认 8 KiB），而不是账本那 1 KiB：两件事分开之后，
+    // 目录小了不再等于模型只能看见 1 KiB。
     let content = &outcome.results[0].content;
     assert!(
-        content.len() <= PREVIEW_LIMIT_BYTES + 128,
+        content.len() <= komo_kernel::projection::DEFAULT_MODEL_RESULT_BYTES + 256,
         "{}",
         content.len()
     );
-    assert!(content.contains("[完整输出："), "{content}");
+    assert!(
+        content.contains("中间省略"),
+        "截了就要说省了多少：{content}"
+    );
+    assert!(content.contains("完整输出："), "{content}");
 
     // 完整正文确实在输出存储里。
     let stored = harness

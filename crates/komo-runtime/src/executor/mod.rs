@@ -39,6 +39,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use komo_kernel::policy::PolicyDecision;
+use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
 use komo_kernel::traits::{
     Clock, Ledger, LedgerError, RepoError, StoreError, Tool, ToolOutputStore,
 };
@@ -52,9 +53,7 @@ use komo_kernel::types::plan::{
     ApprovedPlan, ConsumeIntent, EnvVersion, ExecutionPlan, Operation, PlanSource, RecoveryMode,
     Verification,
 };
-use komo_kernel::types::refs::{
-    AttemptRef, PREVIEW_LIMIT_BYTES, PublishedOutput, ToolResultBody, ToolResultStatus,
-};
+use komo_kernel::types::refs::{AttemptRef, ToolResultBody, ToolResultStatus};
 use komo_kernel::types::status::{RunEnd, ToolCallState};
 use komo_kernel::types::tool::{
     CancelToken, ResumedCall, ToolContext, ToolError, ToolOutput, WorkspaceRoot,
@@ -66,20 +65,20 @@ use crate::policy::{DecisionEnv, PolicyEngine, grants_for};
 
 use self::cancel::race;
 
-/// 一次执行的预算（§6：Gateway 设置总轮数、活动执行时限、输出长度）。
+/// 执行器自己的预算（§6：活动执行时限）。
+///
+/// **交给模型的正文上限不在这里**：它跟着每一次执行走（[`CallEnv::model_result_bytes`]），
+/// 因为配置是热生效的（§3）——写在这里就等于把它钉在装配那一刻。
 #[derive(Debug, Clone)]
 pub struct ExecutionLimits {
     /// 单次调用的活动执行时限。工具自己的超时可以更短，不能更长。
     pub call_timeout: Duration,
-    /// 交给模型的结果正文上限。完整输出永远在 `ToolOutputStore` 里。
-    pub model_result_bytes: usize,
 }
 
 impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
             call_timeout: Duration::from_secs(300),
-            model_result_bytes: PREVIEW_LIMIT_BYTES,
         }
     }
 }
@@ -128,6 +127,15 @@ pub struct CallEnv {
     pub source: PlanSource,
     pub cwd: PathBuf,
     pub roots: Vec<WorkspaceRoot>,
+    /// 交给模型的工具结果正文上限（§6）。**由 Gateway 按当前配置快照填**：配置热重载
+    /// 对新 Run 立刻生效，所以它不在执行器里，而在每一次执行的环境里（§3）。
+    pub model_result_bytes: usize,
+    /// 这个 Session 的**内容目录**（`<sessions>/<session>`）。
+    ///
+    /// 只为一件事：把工具结果投影给模型时，把引用里的 Session 相对路径拼成**模型能直接
+    /// `read` 的绝对路径**（§8.3「超限时提供截断提示和可读取的完整文件引用」）。它自己不
+    /// 是一个可用根——能以工具身份访问的是 [`Self::roots`] 里那两个只读根。
+    pub session_root: Option<PathBuf>,
     pub env_version: Option<EnvVersion>,
     pub principal: Option<Principal>,
     pub cancel: CancelToken,
@@ -496,12 +504,28 @@ impl ToolExecutor {
 
         let body = result_body(&outcome);
         let status = body.status;
+        // 工具写给模型看的那段正文：随结果一起落进 `output.json`，事件里只留它的前 1 KiB。
+        let text = body.preview.clone();
         let mut published = self.outputs.publish(writer, body).await?;
         published.elapsed_ms = elapsed_ms;
-        published.preview = Some(preview_of(&outcome, self.limits.model_result_bytes));
         self.ledger.finish_call(&attempt, published.clone()).await?;
 
-        let content = model_content(&published, &outcome, self.limits.model_result_bytes);
+        let facts = ToolResultFacts {
+            tool: &request.tool,
+            status,
+            elapsed_ms,
+            text: text.as_deref(),
+            output: &published.output,
+            stdout: published.stdout.as_ref(),
+            stderr: published.stderr.as_ref(),
+            session_root: env.session_root.as_deref(),
+        };
+        let content = project(
+            &facts,
+            &ProjectionContext {
+                model_result_bytes: env.model_result_bytes,
+            },
+        );
         let result = ToolResultForModel {
             provider_call_id: request.provider_call_id.clone(),
             call_id: request.call.clone(),
@@ -686,7 +710,6 @@ impl ToolExecutor {
                 attempt,
             },
             body,
-            &content,
         )
         .await?;
         Ok(CallSettlement::Result(ToolResultForModel {
@@ -730,8 +753,9 @@ impl ToolExecutor {
             error: (status != ToolResultStatus::Completed).then(|| summary.clone()),
             exit_code: None,
             artifacts: vec![],
+            preview: Some(summary),
         };
-        self.settle_attempt(attempt_ref, body, &summary).await?;
+        self.settle_attempt(attempt_ref, body).await?;
         Ok(status)
     }
 
@@ -767,8 +791,10 @@ impl ToolExecutor {
             error: (status != ToolResultStatus::Completed).then(|| summary.to_string()),
             exit_code: None,
             artifacts: vec![],
+            // 核对结论也是"工具结果"：事件里那 1 KiB 就取它。
+            preview: Some(summary.to_string()),
         };
-        self.settle_attempt(attempt_ref, body, summary).await
+        self.settle_attempt(attempt_ref, body).await
     }
 
     /// 把一条结果落到**指定的那次尝试**上：发布输出 → 追加 `tool.result`。
@@ -781,11 +807,9 @@ impl ToolExecutor {
         &self,
         attempt_ref: AttemptRef,
         body: ToolResultBody,
-        summary: &str,
     ) -> Result<(), ExecError> {
         let writer = self.outputs.begin(&attempt_ref).await?;
-        let mut published = self.outputs.publish(writer, body).await?;
-        published.preview = Some(truncate(summary, PREVIEW_LIMIT_BYTES));
+        let published = self.outputs.publish(writer, body).await?;
         self.ledger
             .finish_call(&attempt_ref.attempt, published)
             .await?;
@@ -817,10 +841,10 @@ impl ToolExecutor {
             error: Some(message.clone()),
             exit_code: None,
             artifacts: vec![],
+            preview: Some(message.clone()),
         };
         let writer = self.outputs.begin(&attempt_ref).await?;
-        let mut published = self.outputs.publish(writer, body).await?;
-        published.preview = Some(truncate(&message, PREVIEW_LIMIT_BYTES));
+        let published = self.outputs.publish(writer, body).await?;
         self.ledger
             .fail_call(&request.call, &attempt_ref.attempt, published)
             .await?;
@@ -1027,6 +1051,9 @@ fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
             error: None,
             exit_code: output.exit_code,
             artifacts: output.artifacts.clone(),
+            // 工具写给模型看的那段正文跟着结果一起落进 `output.json`：模型上下文的投影读
+            // 这一份，而 JSONL 里的事件只留它的前 1 KiB。
+            preview: output.preview.clone(),
         },
         Err(error) => ToolResultBody {
             status: if error.is_uncertain() {
@@ -1038,45 +1065,10 @@ fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
             error: Some(error.to_string()),
             exit_code: None,
             artifacts: vec![],
+            // 工具失败时模型必须看见那句话（"版本冲突：a.txt"）——投影读的就是这一份。
+            preview: Some(error.to_string()),
         },
     }
-}
-
-/// 预览最多 [`PREVIEW_LIMIT_BYTES`]（§8.3）。
-fn preview_of(outcome: &Result<ToolOutput, ToolError>, limit: usize) -> String {
-    let raw = match outcome {
-        Ok(output) => output.preview.clone().unwrap_or_else(|| {
-            serde_json::to_string(&output.result).unwrap_or_else(|_| "（无法序列化）".into())
-        }),
-        Err(error) => error.to_string(),
-    };
-    truncate(&raw, limit.min(PREVIEW_LIMIT_BYTES))
-}
-
-/// 交给模型的正文：预览 + 完整输出的引用。
-///
-/// 「组装模型上下文仍遵守输出预算，超限时提供截断提示和可读取的完整文件引用」
-/// （§8.3）——所以截断之后必须说得出去哪读全的。
-fn model_content(
-    published: &PublishedOutput,
-    outcome: &Result<ToolOutput, ToolError>,
-    limit: usize,
-) -> String {
-    let preview = preview_of(outcome, limit);
-    format!("{preview}\n[完整输出：{}]", published.output.path())
-}
-
-fn truncate(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let marker = "…（已截断）";
-    let room = limit.saturating_sub(marker.len());
-    let mut cut = room;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    format!("{}{marker}", &text[..cut])
 }
 
 /// 核对结论里那句证据。
@@ -1104,10 +1096,8 @@ fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> (ToolResult
                 None => {
                     let mut result = outcome_map(child, end);
                     result.insert("final_message".into(), serde_json::json!(text));
-                    (
-                        completed_body(result),
-                        format!("子 Run {child} 已完成。它的最后一条回复：\n{text}"),
-                    )
+                    let content = format!("子 Run {child} 已完成。它的最后一条回复：\n{text}");
+                    (completed_body(result, &content), content)
                 }
                 Some(contract) => contract_result(contract, child, end, text),
             }
@@ -1166,7 +1156,7 @@ fn contract_result(
                     validation.ignored.join("、")
                 ));
             }
-            (completed_body(result), content)
+            (completed_body(result, &content), content)
         }
         Err(report) => match contract.mode {
             // permissive：不合规也把结果交给父侧，但**标记出来**——父侧要能把"子代理按
@@ -1177,13 +1167,11 @@ fn contract_result(
                 result.insert("final_message".into(), serde_json::json!(text));
                 result.insert("schema_overridden".into(), serde_json::json!(true));
                 result.insert("contract_report".into(), serde_json::json!(report));
-                (
-                    completed_body(result),
-                    format!(
-                        "子 Run {child} 已完成，但结果不符合契约（permissive 放行，未按契约交付）：\
-                         {report}。它的最后一条回复：\n{text}"
-                    ),
-                )
+                let content = format!(
+                    "子 Run {child} 已完成，但结果不符合契约（permissive 放行，未按契约交付）：\
+                     {report}。它的最后一条回复：\n{text}"
+                );
+                (completed_body(result, &content), content)
             }
             // strict：这次委派就是失败的。原因写全，父侧要能决定"要不要用别的方式再试"。
             SchemaMode::Strict => failed_result(
@@ -1226,13 +1214,18 @@ fn outcome_map(child: &RunId, end: &RunEnd) -> serde_json::Map<String, serde_jso
     map
 }
 
-fn completed_body(result: serde_json::Map<String, serde_json::Value>) -> ToolResultBody {
+fn completed_body(
+    result: serde_json::Map<String, serde_json::Value>,
+    text: &str,
+) -> ToolResultBody {
     ToolResultBody {
         status: ToolResultStatus::Completed,
         result: serde_json::Value::Object(result),
         error: None,
         exit_code: None,
         artifacts: vec![],
+        // 父侧那条结果的正文：模型看见的就是它（`tool.result` 里留前 1 KiB）。
+        preview: Some(text.to_string()),
     }
 }
 
@@ -1254,6 +1247,7 @@ fn failed_result(
             error: Some(summary.clone()),
             exit_code: None,
             artifacts: vec![],
+            preview: Some(summary.clone()),
         },
         summary,
     )

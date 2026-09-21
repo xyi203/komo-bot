@@ -60,6 +60,13 @@ pub struct ToolResultBody {
     /// 产物引用（`artifacts/` 下），不重复复制到 tool-output。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ContentRef>,
+    /// 工具写给模型看的那段正文（§8.3）。
+    ///
+    /// **JSONL 里的 `tool.result` 只留它的前 1 KiB**（行要小），完整这一份在 `output.json`
+    /// 里。模型上下文的投影读的是这一份，不是那个 1 KiB 的副本——否则"给模型多少"就被
+    /// 账本的存储预算绑死了，而那是两件事。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -101,6 +108,42 @@ impl PayloadRef {
     }
 }
 
+impl ToolResultBody {
+    /// 事件里那份 ≤1 KiB 的预览（§8.3）。
+    ///
+    /// 工具自己写的那段正文（[`Self::preview`]）优先——它知道该给模型看什么；没有那一段时
+    /// 才从结构化结果里拼，恢复与核对那几条路径走的就是这里。
+    ///
+    /// **一处实现，两处读**：文件存储与内存替身都用它。各写一份的话，"刚跑完"与测试里看到
+    /// 的账本就会不一样，而那种漂只有真机上才看得出来。
+    pub fn event_preview(&self) -> Option<String> {
+        let text = match (&self.preview, &self.error, &self.result) {
+            (Some(text), _, _) => text.clone(),
+            (None, Some(error), _) => error.clone(),
+            (None, None, serde_json::Value::Null) => return None,
+            (None, None, serde_json::Value::String(text)) => text.clone(),
+            (None, None, value) => value.to_string(),
+        };
+        if text.is_empty() {
+            return None;
+        }
+        Some(truncate_chars(&text, PREVIEW_LIMIT_BYTES))
+    }
+}
+
+/// 按**字符边界**截断到最多 `limit` 字节——从中间切开一个 UTF-8 序列会产生一个读不回来的
+/// 预览。
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let mut cut = limit;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text[..cut].to_string()
+}
+
 impl OutputRef {
     pub fn path(&self) -> &str {
         &self.0.path
@@ -125,12 +168,77 @@ mod tests {
         assert_eq!(back, reference);
     }
 
+    /// 老 `output.json` 里没有 `preview` 这一格（2026-09-21 之前写的），读出来是 `None`
+    /// ——**加字段只能是加法**，旧文件照样解得开（§8.2）。
     #[test]
-    fn a_result_body_written_before_artifacts_existed_reads_with_an_empty_list() {
+    fn a_result_body_written_before_previews_existed_reads_with_none() {
         let old = r#"{"status":"completed","result":{"ok":true}}"#;
         let body: ToolResultBody = serde_json::from_str(old).unwrap();
         assert_eq!(body.status, ToolResultStatus::Completed);
         assert!(body.artifacts.is_empty());
         assert!(body.error.is_none());
+        assert!(body.preview.is_none());
+    }
+
+    #[test]
+    fn the_event_preview_prefers_what_the_tool_wrote_and_falls_back_to_the_result() {
+        let body = |preview: Option<&str>, error: Option<&str>, result: serde_json::Value| {
+            ToolResultBody {
+                status: ToolResultStatus::Completed,
+                result,
+                error: error.map(str::to_string),
+                exit_code: None,
+                artifacts: vec![],
+                preview: preview.map(str::to_string),
+            }
+        };
+
+        // 工具自己写的那段优先——它知道该给模型看什么。
+        assert_eq!(
+            body(Some("工具写的"), None, serde_json::json!("结果里的"))
+                .event_preview()
+                .as_deref(),
+            Some("工具写的")
+        );
+        // 没有那一段时：错误 → 字符串结果 → JSON。
+        assert_eq!(
+            body(None, Some("失败了"), serde_json::Value::Null)
+                .event_preview()
+                .as_deref(),
+            Some("失败了")
+        );
+        assert_eq!(
+            body(None, None, serde_json::json!("一段正文"))
+                .event_preview()
+                .as_deref(),
+            Some("一段正文")
+        );
+        assert_eq!(
+            body(None, None, serde_json::json!({ "ok": true }))
+                .event_preview()
+                .as_deref(),
+            Some("{\"ok\":true}")
+        );
+        // 什么都没有就是没有：不该凭空造一句。
+        assert_eq!(
+            body(None, None, serde_json::Value::Null).event_preview(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_preview_is_cut_on_a_character_boundary() {
+        let body = ToolResultBody {
+            status: ToolResultStatus::Completed,
+            result: serde_json::Value::Null,
+            error: None,
+            exit_code: None,
+            artifacts: vec![],
+            preview: Some("汉".repeat(500)),
+        };
+        let cut = body.event_preview().expect("有预览");
+        assert!(cut.len() <= PREVIEW_LIMIT_BYTES);
+        assert!(cut.chars().count() > 0, "切得回来才算是预览");
+        assert!("汉".repeat(500).starts_with(&cut));
     }
 }

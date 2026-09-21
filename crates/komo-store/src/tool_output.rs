@@ -18,8 +18,8 @@ use komo_kernel::traits::{OutputWriter, StoreError, ToolOutputStore};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::refs::{
-    AttemptRef, ContentRef, OutputRef, PREVIEW_LIMIT_BYTES, PublishedOutput, ToolResultBody,
-    ToolResultStatus, VerifiedOutput,
+    AttemptRef, ContentRef, OutputRef, PublishedOutput, ToolResultBody, ToolResultStatus,
+    VerifiedOutput,
 };
 use serde::{Deserialize, Serialize};
 
@@ -244,7 +244,7 @@ impl ToolOutputStore for FileToolOutputStore {
         .await?;
 
         let status = result.status;
-        let preview = preview_of(&result);
+        let preview = result.event_preview();
         let document = OutputDocument {
             v: OUTPUT_FORMAT_VERSION,
             session: attempt.session.to_string(),
@@ -363,33 +363,6 @@ async fn finish_stream(
     }))
 }
 
-/// JSONL 里只留最多 1 KiB 的预览（§8.3）。
-fn preview_of(result: &ToolResultBody) -> Option<String> {
-    let text = match (&result.error, &result.result) {
-        (Some(error), _) => error.clone(),
-        (None, serde_json::Value::Null) => return None,
-        (None, serde_json::Value::String(text)) => text.clone(),
-        (None, value) => value.to_string(),
-    };
-    if text.is_empty() {
-        return None;
-    }
-    Some(truncate_chars(&text, PREVIEW_LIMIT_BYTES))
-}
-
-/// 按**字符边界**截断到最多 `limit` 字节——从中间切开一个 UTF-8 序列会产生一个读不回
-/// 来的预览。
-fn truncate_chars(text: &str, limit: usize) -> String {
-    if text.len() <= limit {
-        return text.to_string();
-    }
-    let mut end = limit;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text[..end].to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +384,7 @@ mod tests {
             error: None,
             exit_code: Some(0),
             artifacts: vec![],
+            preview: None,
         }
     }
 
@@ -559,15 +533,5 @@ mod tests {
         let (_dir, store, _session) = store().await;
         let other = attempt(&SessionId::from_raw("sess-2"));
         assert!(store.begin(&other).await.is_err());
-    }
-
-    #[test]
-    fn a_preview_is_cut_on_a_character_boundary() {
-        let text = "汉".repeat(500);
-        let cut = truncate_chars(&text, PREVIEW_LIMIT_BYTES);
-        assert!(cut.len() <= PREVIEW_LIMIT_BYTES);
-        assert!(text.starts_with(&cut));
-        // 切得回来才算是预览。
-        assert!(cut.chars().count() > 0);
     }
 }

@@ -205,6 +205,7 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
         ]),
     };
     ConfigSnapshot {
+        execution: Default::default(),
         start_only: StartOnly {
             data_dir: home.clone(),
             listen: super::DEFAULT_LISTEN.into(),

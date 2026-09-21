@@ -74,6 +74,7 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
 
     check_channels(snapshot, &mut issues);
     check_policy(snapshot, &mut issues);
+    check_execution(snapshot, &mut issues);
 
     issues.sort_by(|a, b| a.key.cmp(&b.key).then(a.severity.cmp(&b.severity)));
     issues
@@ -274,6 +275,17 @@ fn check_retrieval(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
     }
     if retrieval.max_tokens == 0 {
         issues.push(error("memory.retrieval.max_tokens", "max_tokens 不能是 0"));
+    }
+}
+
+/// §6：Gateway 设置的输出长度。0 会让每一条工具结果都对模型空着——那不是一个配置，
+/// 是一个静默的故障。
+fn check_execution(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    if snapshot.execution.model_result_bytes == 0 {
+        issues.push(error(
+            "execution.model_result_bytes",
+            "model_result_bytes 不能是 0（模型就什么都看不到了）",
+        ));
     }
 }
 

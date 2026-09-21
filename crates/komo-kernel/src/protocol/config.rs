@@ -188,6 +188,34 @@ fn default_true() -> bool {
     true
 }
 
+/// `[execution]`：Gateway 设置的执行预算（§6）。
+///
+/// **它是热生效的**：读者每用一次就读一次当前快照（§3），改完配置新起的 Run 就用新值。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionConfig {
+    /// 交给模型的工具结果正文字节上限。**完整输出永远在 `output.json` 里**，这里限的是
+    /// 投影给模型看多少（§8.3）。
+    #[serde(default = "default_model_result_bytes")]
+    pub model_result_bytes: usize,
+}
+
+fn default_model_result_bytes() -> usize {
+    komo_kernel_model_result_bytes()
+}
+
+/// 默认值只有一处：真正渲染投影的那个常量。
+fn komo_kernel_model_result_bytes() -> usize {
+    crate::projection::DEFAULT_MODEL_RESULT_BYTES
+}
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            model_result_bytes: default_model_result_bytes(),
+        }
+    }
+}
+
 /// 数据目录下的各个位置（§12）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathsConfig {
@@ -219,6 +247,8 @@ pub struct ConfigSnapshot {
     pub model_catalog: ModelCatalog,
     pub model: ModelConfig,
     pub memory: MemoryConfig,
+    #[serde(default)]
+    pub execution: ExecutionConfig,
     pub channels: ChannelsConfig,
     pub policy: RuleTable,
     pub paths: PathsConfig,
@@ -318,6 +348,7 @@ mod tests {
 
     fn snapshot() -> ConfigSnapshot {
         ConfigSnapshot {
+            execution: ExecutionConfig::default(),
             start_only: StartOnly {
                 data_dir: PathBuf::from("/home/u/.komo"),
                 listen: "127.0.0.1:7777".into(),

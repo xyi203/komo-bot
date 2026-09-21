@@ -241,16 +241,22 @@ fn slice(
     }
 }
 
+/// 一次 `read` 交给模型多少正文。
+///
+/// **不是账本那 1 KiB**：JSONL 里那条事件只留前 1 KiB（行要小），而模型能看到多少由投影层
+/// 按 `model_result_bytes` 决定。这里给的是一个够它裁的量——400 字符那种做法会让模型每次
+/// 读文件都只看见开头一小截，而它以为那就是全部。
+pub const PREVIEW_BYTES: usize = 8 * 1024;
+
 fn preview_of(result: &ReadResult) -> String {
-    let head: String = result.text.chars().take(400).collect();
-    if result.truncated {
+    let header = if result.truncated {
         let ranges: Vec<String> = result
             .unread
             .iter()
             .map(|range| format!("{}–{}", range.from_line, range.to_line))
             .collect();
         format!(
-            "{} 行 {}–{}（共 {} 行，未读 {}）\n{head}",
+            "{} 行 {}–{}（共 {} 行，未读 {}）",
             result.path,
             result.start_line,
             result.end_line,
@@ -258,8 +264,22 @@ fn preview_of(result: &ReadResult) -> String {
             ranges.join("、")
         )
     } else {
-        format!("{} 共 {} 行\n{head}", result.path, result.total_lines)
+        format!("{} 共 {} 行", result.path, result.total_lines)
+    };
+    let room = PREVIEW_BYTES.saturating_sub(header.len() + 1);
+    format!("{header}\n{}", clip(&result.text, room))
+}
+
+/// 按字符边界截到不超过 `limit` 字节。
+fn clip(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
     }
+    let mut cut = limit;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    &text[..cut]
 }
 
 #[cfg(test)]

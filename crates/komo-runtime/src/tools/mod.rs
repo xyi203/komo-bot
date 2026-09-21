@@ -1,10 +1,10 @@
-//! 五个基础工具（§4）与它们共用的那点东西。
+//! 六个基础工具（§4）与它们共用的那点东西。
 //!
-//! 搜索走 shell 或 Python，HTTP 走 Python 库或命令；Git、构建、测试、HA、网页搜索和
-//! 记录查询都是这五个的组合，**不新增第六个**。
+//! 搜索走 `rg`，HTTP 走 Python 库或命令；Git、构建、测试、HA 和记录查询都是这六个的
+//! 组合，**不新增第七个**。
 //!
-//! `delegate` 是这条规则的一个例外，而且它**不是第六个基础工具**：模型看不见任何新能力
-//! ——子代理用的还是这五个工具，它自己的每一次调用照常过 Policy。委派只是"把一件事交给
+//! `delegate` 是这条规则的一个例外，而且它**不是第七个基础工具**：模型看不见任何新能力
+//! ——子代理用的还是这六个工具，它自己的每一次调用照常过 Policy。委派只是"把一件事交给
 //! 另一条 Run"的入口，而且不由工具执行（见 [`delegate`]）。
 
 pub mod delegate;
@@ -13,6 +13,7 @@ pub mod paths;
 pub mod process;
 pub mod python;
 pub mod read;
+pub mod rg;
 pub mod shell;
 pub mod write;
 
@@ -27,6 +28,7 @@ pub use delegate::DelegateTool;
 pub use edit::EditTool;
 pub use python::PythonTool;
 pub use read::ReadTool;
+pub use rg::RgTool;
 pub use shell::ShellTool;
 pub use write::WriteTool;
 
@@ -99,7 +101,7 @@ pub fn current(path: &Path) -> Result<Option<(Vec<u8>, FileVersion)>, ToolError>
     }
 }
 
-/// 正文必须是 UTF-8——五个基础工具处理的是文本；二进制走 shell 或 Python。
+/// 正文必须是 UTF-8——六个基础工具处理的是文本；二进制走 shell 或 Python。
 pub fn as_text(bytes: Vec<u8>, path: &Path) -> Result<String, ToolError> {
     String::from_utf8(bytes).map_err(|_| ToolError::InvalidArguments {
         message: format!(

@@ -225,7 +225,9 @@ pub struct ToolLine {
 impl ToolLine {
     /// 一行摘要：这次调用**动了什么**。参数整个印出来会把三行的界面变成三十行。
     pub fn summary(&self) -> String {
-        for key in ["command", "code", "path", "file", "module", "query", "url"] {
+        for key in [
+            "command", "code", "pattern", "path", "file", "module", "query", "url",
+        ] {
             if let Some(value) = self.args.get(key) {
                 return one_line(&value_text(value));
             }

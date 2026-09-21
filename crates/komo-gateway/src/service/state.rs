@@ -541,6 +541,11 @@ impl GatewayState {
                 max_rounds,
                 max_retries,
             )
+            // §8.3：这个 Session 自己的输出与产物是一段只读根，模型才读得到"完整输出在哪"。
+            .with_session_files(sessions_root.clone())
+            // 回放那一侧的投影：同一份输出存储；预算按当前快照现读（§3）。
+            .with_projection(Arc::clone(&outputs))
+            .with_config(Arc::clone(&config))
             // Cron Run 用它那个 Job 的执行预算（§10）。
             .with_cron(Arc::clone(&cron))
             // 每一段装配时按当前用户输入召回一次，并把用到的条目记进

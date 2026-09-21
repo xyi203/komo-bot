@@ -89,6 +89,7 @@ fn the_mem_ledger_writes_a_log_that_actually_folds() {
                     error: None,
                     exit_code: Some(0),
                     artifacts: vec![],
+                    preview: None,
                 },
             )
             .await

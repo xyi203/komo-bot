@@ -12,6 +12,9 @@ komo-store = { workspace = true }
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs", "process", "io-util"] }
 arc-swap = { workspace = true }
+# §13.4：`rg` 工具（内嵌 ripgrep 的搜索库，不起子进程）。
+grep = { workspace = true }
+ignore = { workspace = true }
 
 serde = { workspace = true }
 serde_json = { workspace = true }

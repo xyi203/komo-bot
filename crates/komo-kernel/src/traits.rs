@@ -631,7 +631,7 @@ pub trait PythonHost: Send + Sync {
 
 // ---------------------------------------------------------------- 工具
 
-/// 五个基础工具（§4）。executor 只认这个 trait。
+/// 六个基础工具（§4）。executor 只认这个 trait。
 #[async_trait]
 pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;

@@ -85,6 +85,8 @@ impl ToolOutputStore for MemOutputStore {
         );
         let body = serde_json::to_string(&result).map_err(|e| StoreError::Io(e.to_string()))?;
         let status = result.status;
+        // 与文件存储同一处推导：账本里那份预览是"事实的一部分"，替身不能自己发明一份。
+        let preview = result.event_preview();
         self.published
             .lock()
             .expect("输出存储")
@@ -98,7 +100,7 @@ impl ToolOutputStore for MemOutputStore {
             }),
             status,
             elapsed_ms: 0,
-            preview: None,
+            preview,
             stdout: None,
             stderr: None,
         })

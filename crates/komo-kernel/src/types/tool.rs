@@ -11,7 +11,7 @@ use super::plan::{EnvVersion, PlanSource, Verification};
 use super::refs::{ContentRef, ToolResultStatus};
 use super::status::ToolCallState;
 
-/// 交给模型的工具 Schema。五个基础工具的这份定义是固定的（§4）。
+/// 交给模型的工具 Schema。六个基础工具的这份定义是固定的（§4）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub name: String,

@@ -160,8 +160,9 @@ async fn a_big_tool_output_keeps_both_ends_and_the_path_it_points_at_really_read
 
 /// 同一个 Run 的第二段（第一次停在审批上）回放时，工具结果的正文必须与刚跑完那次一致。
 ///
-/// 回放窗口是**按 Run** 的（§8.4：新 Run 只看得见自己那条输入），所以要看回放，就得让
-/// 同一个 Run 再起一段——这里用"半轮停在审批上、批准之后接着跑"这条最普通的路。
+/// 回放窗口里**正跑着的那条 Run 是完整协议**（§8.3），所以要看回放，就得让同一个 Run 再起
+/// 一段——这里用"半轮停在审批上、批准之后接着跑"这条最普通的路。换成新 Run 就不成了：历史
+/// Run 只发布正文，工具结果那一轮不再进新请求。
 #[tokio::test]
 async fn the_replayed_window_renders_the_same_bytes_as_the_live_round() {
     let (home, _file) = home_with_a_big_file();

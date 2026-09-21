@@ -3,8 +3,9 @@
 //! 三样东西在这里凑齐（`agent::handler` 的模块注释列的就是它们）：
 //!
 //! - **工作目录与已授权根**：Session 的 `workdir`，没有就是 `workspaces/`。
-//! - **`TurnRequest`**：系统提示 + 回放窗口（最新一个 `conversation.boundary` 之后的
-//!   消息，`Surface::replay`）+ 执行器挂着的工具 Schema。
+//! - **`TurnRequest`**：系统提示 + 回放窗口（最新一个 `conversation.boundary` 之后、
+//!   属于这一段对话的消息——正在跑的那条 Run 带完整协议，历史 Run 只发布正文，见
+//!   [`ReplayScope`]）+ 执行器挂着的工具 Schema。
 //! - **恢复位置**：这个 Run 还有没有没收尾的调用。有就把它们原样交回执行器——**沿用
 //!   同一份计划**，因为审批绑定的是计划的哈希，重新 prepare 会换一个哈希（§7.4）。
 //!
@@ -30,7 +31,9 @@ use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
-use komo_kernel::types::turn::{ReplayMessage, ToolCallRequest, ToolResultForModel, TurnRequest};
+use komo_kernel::types::turn::{
+    ReplayMessage, Role, ToolCallRequest, ToolResultForModel, TurnRequest,
+};
 use komo_runtime::agent::handler::SegmentSource;
 use komo_runtime::agent::{Budget, ResumedRound, RetryBudget, Segment};
 use komo_runtime::config::ConfigHolder;
@@ -297,12 +300,20 @@ impl SegmentSource for GatewaySegments {
             .get(&run)
             .and_then(|view| view.delegate.clone());
 
-        // 子代理只拿得到任务本身：不注入记忆、不列 Skills、也**不带上父的对话历史**（回放
-        // 窗口按本 Run 过滤，见下）。自包含这件事是父侧的责任，提示词里对它也说了。
+        // 子代理只拿得到任务本身：不注入记忆、不列 Skills、也**不带上父的对话历史**（它的
+        // 回放窗口就是自己那条 Run，见下）。自包含这件事是父侧的责任，提示词里对它也说了。
         let memories = match &delegate {
             Some(_) => Vec::new(),
             None => self.recall_for(&session, &run, &surface).await,
         };
+
+        // 回放给模型的是**这一段对话**，不是这一条 Run（§8.3）。`payloads` 是外置正文的
+        // 来源：窗口里的用户输入与模型回复都可能超限外置（§8.3）。
+        let scope = match &delegate {
+            Some(_) => ReplayScope::Run(&run),
+            None => ReplayScope::Conversation(&run),
+        };
+        let payloads = self.payloads_for(&session);
 
         let (prompt, tools) = match &delegate {
             Some(spec) => {
@@ -323,17 +334,23 @@ impl SegmentSource for GatewaySegments {
             run: run.clone(),
             model: record.model.clone(),
             system_prompt: prompt,
-            // **按本 Run 过滤**：子代理跑过的那几轮属于它自己那条 Run，父续跑时读回来的
-            // 必须是父自己的上下文——否则子代理的探索过程会跑进父的窗口，而父侧本来只
-            // 该拿到那条结果（§4）。
-            messages: replay(
+            // **这一段对话**：上一轮说了什么、最后答了什么，下一轮必须还在。子代理是唯一
+            // 的例外——它只看得见自己那条 Run，父的窗口里也没有它的过程（§4）。
+            messages: match replay(
                 &surface,
-                &run,
+                scope,
+                &payloads,
                 self.outputs.as_deref(),
                 session_root.as_deref(),
                 model_result_bytes,
             )
-            .await,
+            .await
+            {
+                Ok(messages) => messages,
+                // 外置的正文按引用读不出来 = 会话缺内容：停下来报告（§8.3），别把一条空的
+                // 用户消息当成"用户就是这么说的"发出去。
+                Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
+            },
             tools,
             memories,
             covers: None,
@@ -607,6 +624,18 @@ async fn call_request(
     }))
 }
 
+/// 这一段回放给模型的是哪一块（§8.3）。
+#[derive(Debug, Clone, Copy)]
+enum ReplayScope<'a> {
+    /// 主对话：最新一个 `conversation.boundary` 之后**属于主 Run** 的消息，跨 Run 聚合。
+    ///
+    /// 带的是**正在跑的那条 Run**：它那几句是完整协议，其余 Run 只发布"用户说了什么、
+    /// 它最后答了什么"。
+    Conversation(&'a RunId),
+    /// 只这一条 Run（子代理，§4）：它拿不到父的对话历史，父的窗口里也没有它的过程。
+    Run(&'a RunId),
+}
+
 /// 回放窗口：最新一个 `conversation.boundary` 之后的消息（§13.1 的 `/new`）。
 ///
 /// **还没被领走的 Run 的用户消息不进窗口**（§8.4「同一 Session 后续 Run 不越过它」）。
@@ -615,19 +644,75 @@ async fn call_request(
 /// 用户消息、最后才是那次调用的输出"，直接 400（`No tool output found for tool call …`）。
 /// 领取那一步已经保证后一个 Run 不会先跑（`DUE_SQL`），这里管的是它**还没跑**时那半句话。
 ///
+/// **协议只属于正在跑的那条 Run**：历史 Run 只发布"用户说了什么（`run.accepted`）+ 它最后
+/// 答了什么"，工具调用、工具结果与原生块都不进去。三件事指着同一个做法：① 历史那半轮在
+/// 取消 / 失败时合法地停在"有调用、没结果"上，照搬进新请求就是上面那个 400；② 几十轮工具
+/// 往返会随对话长度线性涨上下文，而它们对"接着聊"没有增量；③ 子代理跑过的那几轮本来就不
+/// 属于父的对话（§4）。**上一轮说的话因此必须还在**——少了它，"去查一下"指的是哪件事就
+/// 只能靠猜。
+///
 /// 每条工具结果的正文走的是**同一个投影函数**（`komo_kernel::projection`）：刚跑完那次与
 /// 重启之后回放，必须是同一段字节。所以这里要把事实凑齐——工具名从那一轮的调用里找，
 /// 完整正文与流大小从 `output.json` 读回来；读不回来时退回账本里那 1 KiB（那是"我们至少
 /// 还有这些"，不是"本该如此"）。
+///
+/// 正文超限时是**外置**的（`text` 为 `None`，`text_ref` 指向 `payloads/`）：按引用读回来
+/// 并校验哈希，读不出来就是会话缺内容（§8.3「读取历史或恢复调用时按引用加载」）。
 async fn replay(
     surface: &Surface,
-    only: &RunId,
+    scope: ReplayScope<'_>,
+    payloads: &PayloadStore,
     outputs: Option<&dyn ToolOutputStore>,
     session_root: Option<&std::path::Path>,
     model_result_bytes: usize,
-) -> Vec<ReplayMessage> {
+) -> Result<Vec<ReplayMessage>, LedgerError> {
+    let only = match scope {
+        ReplayScope::Conversation(run) | ReplayScope::Run(run) => run,
+    };
+    let kept = window(surface, Some(scope));
+
+    // 历史 Run 的"它最后答了什么"是哪一条：同一个 Run 里**最后**一条带正文的 assistant。
+    let mut finals: BTreeMap<&RunId, Seq> = BTreeMap::new();
+    for message in &kept {
+        let (Some(run), Role::Assistant) = (&message.run, message.role) else {
+            continue;
+        };
+        if message.text.is_none() && message.text_ref.is_none() {
+            continue;
+        }
+        let entry = finals.entry(run).or_insert(message.seq);
+        *entry = (*entry).max(message.seq);
+    }
+
     let mut out = Vec::new();
-    for message in window(surface, Some(only)) {
+    for message in kept {
+        if message.run.as_ref() != Some(only) {
+            // 历史 Run：用户正文与最终回复这两句，别的都不要。
+            let last = message
+                .run
+                .as_ref()
+                .and_then(|run| finals.get(run))
+                .copied();
+            if message.role != Role::User && last != Some(message.seq) {
+                continue;
+            }
+            let Some(text) = message_text(payloads, &message).await? else {
+                continue;
+            };
+            if text.is_empty() {
+                continue;
+            }
+            out.push(ReplayMessage {
+                role: message.role,
+                seq: message.seq,
+                text: Some(text),
+                tool_calls: Vec::new(),
+                tool_results: Vec::new(),
+                provider_blocks: None,
+            });
+            continue;
+        }
+
         let mut tool_results = Vec::new();
         for result in &message.tool_results {
             // 完整正文在 `output.json` 里；没有输出存储（精简装配）时退回账本里那 1 KiB。
@@ -664,13 +749,34 @@ async fn replay(
         out.push(ReplayMessage {
             role: message.role,
             seq: message.seq,
-            text: message.text.clone(),
+            text: message_text(payloads, &message).await?,
             tool_calls: message.tool_calls.clone(),
             tool_results,
             provider_blocks: message.provider_blocks.clone(),
         });
     }
-    out
+    Ok(out)
+}
+
+/// 一条消息的正文：内联的那份优先，没有就按引用读回来（§8.3）。
+///
+/// 只读内联那份会让超限的正文在回放里变成**空消息**：用户输入过 4 KiB 时，模型看到的是
+/// 一个空的 user，而它该看到的是原话。外置正文的哈希由 `PayloadStore::open` 校验，对不上
+/// 就是会话缺内容，不返回内容。
+async fn message_text(
+    payloads: &PayloadStore,
+    message: &SurfaceMessage,
+) -> Result<Option<String>, LedgerError> {
+    if let Some(text) = &message.text {
+        return Ok(Some(text.clone()));
+    }
+    let Some(reference) = &message.text_ref else {
+        return Ok(None);
+    };
+    let bytes = payloads.open(reference).await.map_err(store_to_ledger)?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| LedgerError::Corrupt(format!("外置正文不是 UTF-8：{error}")))
 }
 
 /// 回放窗口里属于**已经开跑过**的那些 Run，**按 Run 分组、Run 之间先来后到**。
@@ -684,13 +790,24 @@ async fn replay(
 /// 还没被领走的 Run 整个不进转写（`awaits_claim`）：它的输入已经落盘，但这一轮还没轮到
 /// 它。TUI 走的是 `Surface::replay`（原样、按日志顺序），两者不是一回事——用户在界面上要
 /// 立刻看到自己刚发的那句话，而模型不能在半轮中间读到它。
-fn window<'s>(surface: &'s Surface, only: Option<&RunId>) -> Vec<&'s SurfaceMessage> {
+///
+/// `scope` 挑的是**哪些 Run**（见 [`ReplayScope`]）；`None` = 全都要，记忆召回的查询文本
+/// 用它——用户最后说的那句不该被另一个 Run 的输入顶掉。
+fn window<'s>(surface: &'s Surface, scope: Option<ReplayScope<'_>>) -> Vec<&'s SurfaceMessage> {
     let kept: Vec<&SurfaceMessage> = surface
         .replay()
         .iter()
-        // `only` = 只要**本 Run 自己**的那几句。子代理与父在同一份日志里，但它们不是同一段
-        // 对话：子代理跑过的那几轮不能进父的窗口，父的也没进过子代理的（§4）。
-        .filter(|message| only.is_none_or(|run| message.run.as_ref() == Some(run)))
+        .filter(|message| match scope {
+            None => true,
+            // 子代理与父在同一份日志里，但它们不是同一段对话：子代理跑过的那几轮不能进
+            // 父的窗口，父的也没进过子代理的（§4）。
+            Some(ReplayScope::Run(run)) => message.run.as_ref() == Some(run),
+            Some(ReplayScope::Conversation(_)) => message
+                .run
+                .as_ref()
+                .and_then(|run| surface.runs.get(run))
+                .is_none_or(|view| view.delegate.is_none()),
+        })
         .filter(|message| {
             message
                 .run
@@ -728,7 +845,7 @@ fn window<'s>(surface: &'s Surface, only: Option<&RunId>) -> Vec<&'s SurfaceMess
 fn latest_user_text(surface: &Surface) -> Option<String> {
     window(surface, None)
         .into_iter()
-        .rfind(|message| message.role == komo_kernel::types::turn::Role::User)
+        .rfind(|message| message.role == Role::User)
         .and_then(|message| message.text.clone())
 }
 
@@ -980,6 +1097,332 @@ mod tests {
     fn payloads() -> PayloadStore {
         let dir = tempfile::tempdir().expect("临时目录");
         PayloadStore::new(komo_store::SessionPaths::at(dir.keep()))
+    }
+
+    // ---------------------------------------------------------------- 回放窗口（§8.3）
+
+    use komo_kernel::types::delegate::DelegateSpec;
+    use komo_kernel::types::digest::ContentHash;
+    use komo_kernel::types::ids::{ExecutorId, RequestKey};
+    use komo_kernel::types::plan::PlanSource;
+    use komo_kernel::types::refs::PayloadRef;
+
+    fn accepted(run: &RunId, seq: u64, text: &str) -> Event {
+        accepted_as(run, seq, Some(text), None, None)
+    }
+
+    fn accepted_as(
+        run: &RunId,
+        seq: u64,
+        text: Option<&str>,
+        text_ref: Option<PayloadRef>,
+        delegate: Option<DelegateSpec>,
+    ) -> Event {
+        event(
+            seq,
+            run,
+            EventPayload::RunAccepted(komo_kernel::events::RunAccepted {
+                request_key: RequestKey::new(format!("key-{seq}")),
+                input_hash: ContentHash::of_str(text.unwrap_or_default()),
+                text: text.map(str::to_string),
+                text_ref,
+                source: PlanSource::Interactive {
+                    session: SessionId::from_raw("sess-1"),
+                },
+                peer: None,
+                model: None,
+                effort: None,
+                delegate,
+            }),
+        )
+    }
+
+    fn assistant(
+        run: &RunId,
+        seq: u64,
+        text: Option<&str>,
+        calls: Vec<ToolCallRequest>,
+        blocks: Option<serde_json::Value>,
+    ) -> Event {
+        event(
+            seq,
+            run,
+            EventPayload::MessageAssistant(MessageAssistant {
+                round: seq as u32,
+                text: text.map(str::to_string),
+                text_ref: None,
+                tool_calls: calls,
+                provider_blocks: blocks,
+                input_tokens: None,
+                output_tokens: None,
+            }),
+        )
+    }
+
+    fn started(run: &RunId, seq: u64) -> Event {
+        event(
+            seq,
+            run,
+            EventPayload::RunStarted(komo_kernel::events::RunStarted {
+                executor: ExecutorId::from_raw("exec-1"),
+                generation: 1,
+            }),
+        )
+    }
+
+    fn request(call: &ToolCallId) -> ToolCallRequest {
+        ToolCallRequest {
+            call_id: call.clone(),
+            provider_call_id: "pc-1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+            arguments_ref: None,
+        }
+    }
+
+    /// 上一轮说了什么、最后答了什么，下一轮必须还在。
+    ///
+    /// 只按本 Run 过滤时，用户那句"去查一下"落地的时候上一轮的问答已经不在窗口里了：模型
+    /// 只能靠猜（真实会话里它去读了 `config.toml`，然后答了一个没人问过的问题）。
+    #[tokio::test]
+    async fn a_later_run_still_reads_what_the_earlier_one_said() {
+        let first = RunId::from_raw("run-1");
+        let second = RunId::from_raw("run-2");
+        let call = ToolCallId::from_raw("call-1");
+        let events = vec![
+            accepted(&first, 1, "捞一下线上订单在 loong 请求了哪些接口，先查 db"),
+            started(&first, 2),
+            // 一轮工具往返：**历史 Run 里它不该再进新请求**——协议只属于正跑的那条 Run。
+            assistant(
+                &first,
+                3,
+                None,
+                vec![request(&call)],
+                Some(serde_json::json!([{"type": "reasoning"}])),
+            ),
+            assistant(
+                &first,
+                4,
+                Some("SQL 如下：SELECT 1。确认执行吗？"),
+                vec![],
+                Some(serde_json::json!([{"type": "message"}])),
+            ),
+            event(
+                5,
+                &first,
+                EventPayload::RunCompleted(komo_kernel::events::RunCompleted {
+                    final_message: None,
+                    final_message_ref: None,
+                    rounds: 2,
+                }),
+            ),
+            accepted(&second, 6, "去查一下"),
+            started(&second, 7),
+        ];
+        let surface = fold(&events);
+        let messages = replay(
+            &surface,
+            ReplayScope::Conversation(&second),
+            &payloads(),
+            None,
+            None,
+            8 * 1024,
+        )
+        .await
+        .expect("读得出来");
+
+        let seen: Vec<(Role, Option<&str>)> = messages
+            .iter()
+            .map(|message| (message.role, message.text.as_deref()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (
+                    Role::User,
+                    Some("捞一下线上订单在 loong 请求了哪些接口，先查 db")
+                ),
+                (Role::Assistant, Some("SQL 如下：SELECT 1。确认执行吗？")),
+                (Role::User, Some("去查一下")),
+            ],
+            "上一轮的问答要跟着进新 Run，而它那轮工具往返不进"
+        );
+        for message in &messages {
+            assert!(message.tool_calls.is_empty(), "{message:?}");
+            assert!(message.tool_results.is_empty(), "{message:?}");
+            assert!(message.provider_blocks.is_none(), "{message:?}");
+        }
+    }
+
+    /// 正跑着的那条 Run 仍然是**完整协议**：它自己那轮的调用、结果与原生块一个都不能少。
+    #[tokio::test]
+    async fn the_running_run_keeps_its_whole_protocol() {
+        let run = RunId::from_raw("run-1");
+        let call = ToolCallId::from_raw("call-1");
+        let events = vec![
+            accepted(&run, 1, "看一下 a.txt"),
+            started(&run, 2),
+            assistant(
+                &run,
+                3,
+                None,
+                vec![request(&call)],
+                Some(serde_json::json!([{"type": "reasoning"}])),
+            ),
+        ];
+        let surface = fold(&events);
+        let messages = replay(
+            &surface,
+            ReplayScope::Conversation(&run),
+            &payloads(),
+            None,
+            None,
+            8 * 1024,
+        )
+        .await
+        .expect("读得出来");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].tool_calls.len(), 1);
+        assert_eq!(
+            messages[1].tool_calls[0].call_id, call,
+            "调用要原样交给 provider"
+        );
+        assert_eq!(
+            messages[1].provider_blocks,
+            Some(serde_json::json!([{"type": "reasoning"}])),
+            "原生块逐字回放（§13.2）"
+        );
+    }
+
+    /// 子代理只看得见自己那条 Run，父的窗口里也没有它的过程（§4）。
+    #[tokio::test]
+    async fn a_subagent_and_its_parent_are_two_different_conversations() {
+        let parent = RunId::from_raw("run-parent");
+        let child = RunId::from_raw("run-child");
+        let call = ToolCallId::from_raw("call-1");
+        let spec = DelegateSpec::new(parent.clone(), call.clone(), "看一下这个 PR");
+        let events = vec![
+            accepted(&parent, 1, "父的输入"),
+            started(&parent, 2),
+            accepted_as(&child, 3, Some("看一下这个 PR"), None, Some(spec)),
+            started(&child, 4),
+            assistant(&child, 5, Some("子代理的过程"), vec![], None),
+            assistant(&parent, 6, Some("父的回复"), vec![], None),
+        ];
+        let surface = fold(&events);
+        let payloads = payloads();
+
+        let of = |scope| {
+            let surface = &surface;
+            let payloads = &payloads;
+            async move {
+                replay(surface, scope, payloads, None, None, 8 * 1024)
+                    .await
+                    .expect("读得出来")
+                    .into_iter()
+                    .map(|message| message.text)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        assert_eq!(
+            of(ReplayScope::Conversation(&parent)).await,
+            vec![Some("父的输入".into()), Some("父的回复".into())],
+            "父的窗口里不该有子代理的过程——它只该拿到那条结果（§4）"
+        );
+        assert_eq!(
+            of(ReplayScope::Run(&child)).await,
+            vec![Some("看一下这个 PR".into()), Some("子代理的过程".into())],
+            "子代理拿不到父的对话历史"
+        );
+    }
+
+    /// 超限的正文外置在 `payloads/` 里：回放要按引用读回来（§8.3）。
+    ///
+    /// 只读内联那份的话，用户输入过 4 KiB 时模型看到的是一个**空的 user 消息**。
+    #[tokio::test]
+    async fn an_externalized_message_comes_back_by_reference() {
+        let payloads = payloads();
+        let big = "把这段话原样带回来。".repeat(600);
+        assert!(big.len() > 4 * 1024, "要真的过内联上限");
+        let question = payloads.put(big.as_bytes()).await.expect("外置得进去");
+        let reply = payloads
+            .put(big.as_bytes())
+            .await
+            .expect("同一段正文复用一份");
+
+        let first = RunId::from_raw("run-1");
+        let second = RunId::from_raw("run-2");
+        let events = vec![
+            accepted_as(&first, 1, None, Some(question), None),
+            started(&first, 2),
+            // 一条没有正文的轮次：它不该抢走"最后答了什么"的位置。
+            assistant(&first, 3, None, vec![], None),
+            event(
+                4,
+                &first,
+                EventPayload::MessageAssistant(MessageAssistant {
+                    round: 2,
+                    text: None,
+                    text_ref: Some(reply),
+                    tool_calls: vec![],
+                    provider_blocks: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                }),
+            ),
+            accepted(&second, 5, "接着上面那句"),
+            started(&second, 6),
+        ];
+        let surface = fold(&events);
+        let messages = replay(
+            &surface,
+            ReplayScope::Conversation(&second),
+            &payloads,
+            None,
+            None,
+            8 * 1024,
+        )
+        .await
+        .expect("读得出来");
+
+        assert_eq!(
+            messages[0].text.as_deref(),
+            Some(big.as_str()),
+            "外置的用户输入要按引用读回来"
+        );
+        assert_eq!(
+            messages[1].text.as_deref(),
+            Some(big.as_str()),
+            "外置的模型回复同理（最后一条带正文的那条）"
+        );
+    }
+
+    /// 引用读不出来 = 会话缺内容：停下来报告，而不是把一条空消息发出去（§8.3）。
+    #[tokio::test]
+    async fn a_payload_that_cannot_be_read_stops_the_segment() {
+        let missing = payloads()
+            .put("这份正文不在那个目录里".as_bytes())
+            .await
+            .expect("外置得进去");
+        let run = RunId::from_raw("run-1");
+        let events = vec![
+            accepted_as(&run, 1, None, Some(missing), None),
+            started(&run, 2),
+        ];
+        let surface = fold(&events);
+        let error = replay(
+            &surface,
+            ReplayScope::Conversation(&run),
+            &payloads(),
+            None,
+            None,
+            8 * 1024,
+        )
+        .await
+        .expect_err("读不出来就不该装作读到了");
+        assert!(matches!(error, LedgerError::Corrupt(_)), "{error:?}");
     }
 
     #[test]

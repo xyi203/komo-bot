@@ -758,6 +758,22 @@ async fn a_message_behind_a_waiting_approval_waits_instead_of_overtaking() {
     // 而且交给模型的每一份转写都过得了 provider 那一关。
     let requests = llm.requests.lock().expect("脚本模型").clone();
     assert_transcripts_close_every_call(&requests);
+
+    // §8.3：后一条 Run 的窗口里要看得见前一条说了什么、最后答了什么——用户那句"接着上面
+    // 说"指的就是它，少了这两句，模型只能靠猜（真实会话里它去读了 `config.toml`）。
+    let turns: Vec<&str> = requests
+        .last()
+        .expect("脚本模型收到了请求")
+        .messages
+        .iter()
+        .filter_map(|message| message.text.as_deref())
+        .collect();
+    assert!(
+        turns.contains(&"跑一下 echo"),
+        "上一轮的用户输入：{turns:?}"
+    );
+    assert!(turns.contains(&"跑完了。"), "上一轮的最后回复：{turns:?}");
+    assert!(turns.contains(&"y"), "这一轮的输入：{turns:?}");
 }
 
 /// §8.3 / §8.4：一轮要了两次调用、**第一个就停下**时，续跑要把后面的也跑完。

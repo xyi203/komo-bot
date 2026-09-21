@@ -301,6 +301,19 @@ fn n_and_esc_both_reject() {
     }
 }
 
+/// **`Ctrl-C` 是暂停，弹窗开着也走得掉。**
+///
+/// 弹窗把按键全收走（`Esc` 在里面是拒绝），所以退出键必须在它之前处理——否则正卡在
+/// 审批上的人只剩答完这一条才能走。暂停也不许替人答这条审批。
+#[test]
+fn ctrl_c_pauses_even_with_a_modal_up() {
+    let mut app = with_modal();
+    let effects = app.handle_key(with(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(matches!(effects.as_slice(), [Effect::Quit]), "{effects:?}");
+    assert!(app.quit, "弹窗开着也要退得出去");
+    assert!(app.approval.is_some(), "暂停不是替人答了这条审批");
+}
+
 #[test]
 fn the_input_is_disabled_while_an_approval_is_open() {
     let mut app = with_modal();

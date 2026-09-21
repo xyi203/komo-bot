@@ -186,6 +186,12 @@ pub async fn run_tui(
         subscription.abort();
     }
     drop(terminal);
+    // 退出即暂停：Run 留在 Gateway 里照跑，人回来靠的是**这一行命令**。会话 Id 只在身份
+    // 行上闪过一次，退出这一刻正是需要它的时刻。会话还没铸出来（`komo` 一个字没发就退）
+    // 就没有可 resume 的东西，什么都不印——那正是"不在账本上留空壳"的同一条规矩。
+    if let Some(session) = app.session.as_ref() {
+        println!("\nkomo resume {session}");
+    }
     outcome
 }
 

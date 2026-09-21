@@ -32,15 +32,19 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Vec::new();
         }
+        // **`Ctrl-C` 是暂停，先于一切状态处理**：审批弹窗开着、正在等服务端回执、补读
+        // 历史——哪里都要走得掉。一块回答菜单不该把唯一一个"先走开"的键吞掉（`Esc` 在
+        // 弹窗里是拒绝，不是退出）。Run 留在 Gateway 里照跑，回来用 `komo resume <会话>`
+        // ——驱动在退出时把那行命令印出来。
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.quit = true;
+            return vec![Effect::Quit];
+        }
         if self.approval.is_some() {
             return self.approval_key(key);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Char('c') if ctrl => {
-                self.quit = true;
-                return vec![Effect::Quit];
-            }
             KeyCode::Char('d') if ctrl && self.input.is_empty() => {
                 self.quit = true;
                 return vec![Effect::Quit];

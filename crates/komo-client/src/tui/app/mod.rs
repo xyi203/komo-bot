@@ -537,7 +537,8 @@ impl App {
         if self.phase.is_backfilling() {
             return "正在补读历史……".to_string();
         }
-        "Enter 发送 · Shift/Alt-Enter 或 Ctrl-J 换行 · Ctrl-T 展开工具 · / 看命令".to_string()
+        "Enter 发送 · Shift/Alt-Enter 或 Ctrl-J 换行 · Ctrl-T 展开工具 · Ctrl-C 暂停 · / 看命令"
+            .to_string()
     }
 
     /// 命令面板的候选。

@@ -148,7 +148,7 @@ impl Tool for PythonTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "python".into(),
-            description: "在受管理的解释器里跑 Python：mode=code 执行任意代码（设 result 返回数据），mode=call 调用 toolbox 中已导出的函数。"
+            description: "在受管理的解释器里跑 Python：mode=code 执行任意代码（设 result 返回数据），mode=call 调用 toolbox 中已导出的函数。要交给操作者的产物写进 $KOMO_ARTIFACT_DIR（本次调用的产出目录）：那底下每个新文件都会被登记，之后可以用 artifact://files/<run>/<文件名> 读回来。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -299,8 +299,20 @@ impl Tool for PythonTool {
         // 它会重新 `prepare` → 新计划 → 新哈希 → 旧授权覆盖不到 → 重新审（§5.4）。
         self.module_still_matches(plan)?;
 
+        // 这次调用的产出目录（§4.7）：`<会话内容目录>/artifacts/<run>`。目录由运行时建，
+        // 环境变量的名字（`KOMO_ARTIFACT_DIR`）也只在那里出现——这里只把路径算出来。
+        // 精简装配（没有会话内容目录）时是 `None`：不建目录、不登记产物，按旧样子跑。
+        let artifacts = ctx
+            .mounts
+            .session_root
+            .as_ref()
+            .map(|root| root.join("artifacts").join(ctx.run.as_str()));
+
         // 拿到的 sink 原样交给宿主：脚本的 print 流进去，结构化结果走另一条路（§5.1）。
-        let outcome = self.host.run(args.job, sink, ctx.cancel.clone()).await;
+        let outcome = self
+            .host
+            .run_with_artifacts(args.job, artifacts.as_deref(), sink, ctx.cancel.clone())
+            .await;
 
         let outcome = match outcome {
             Ok(outcome) => outcome,

@@ -347,8 +347,12 @@ pub struct GatewayState {
     /// 执行器挂着的工具名。提示里的 skills 目录行按它门控（§5.6 的 `requires_tools:`），
     /// 而重载重算那一块时要用——那时执行器已经造好了，名字留在这里最省事。
     pub tool_names: Vec<String>,
-    /// §5.6 的 skills 目录行。与 [`GatewayState::segments`] 共用一个 `Arc`。
-    pub skills_prompt: Arc<std::sync::RwLock<String>>,
+    /// §5.6 那份**活的** skill 注册表。与 [`GatewayState::segments`] 共用一个 `Arc`。
+    ///
+    /// 存的是注册表而不是渲染好的那一段文本：文本按用途现渲染（系统提示一处、`skill://`
+    /// 的挂载点一处），**事实只有这一份**——存一份字符串就是第二份事实，它会和这一份
+    /// 各走各的。注册表每次查询重扫目录（§5.6），所以"人改了 SKILL.md"不必重启。
+    pub skills: Arc<std::sync::RwLock<komo_runtime::skills::SkillRegistry>>,
     pub supervisor: Arc<super::channels::ChannelSupervisor>,
     /// Dispatcher。**构造之后才填**：它握着这份状态，反过来也要被渠道拿到。
     pub inbound: std::sync::OnceLock<Arc<dyn komo_kernel::traits::Inbound>>,
@@ -511,12 +515,11 @@ impl GatewayState {
                 // `runtime/`、`.env`）。**缺省空名单 = 那条规则永不命中**。
                 .with_protection(protected_paths(&snapshot, &home)),
         );
-        // §5.6 的目录行：**启动时算一次**（提示前缀要稳），重载时按新快照重算。
-        // 工具名从执行器那一份来——目录行的门控问的就是"这套工具在不在"。
+        // §5.6 的目录行：注册表**启动时按快照造一份**，那一块文本按用途现渲染（系统提示
+        // 一处、`skill://` 的挂载点一处）——两处同源，不会有"提示里有、读不到"这种事。
         let tool_names: Vec<String> = tools.iter().map(|tool| tool.definition().name).collect();
-        let skills = Arc::new(std::sync::RwLock::new(skills_prompt(
+        let skills = Arc::new(std::sync::RwLock::new(skills_registry(
             &snapshot,
-            &tool_names,
             shared_home.as_deref(),
         )));
         let executor_tools = Arc::new(ToolExecutor::new(
@@ -631,7 +634,7 @@ impl GatewayState {
             watching: Mutex::new(std::collections::BTreeSet::new()),
             approvals_delivered: Mutex::new(std::collections::BTreeSet::new()),
             tool_names,
-            skills_prompt: skills,
+            skills,
             max_retries,
             max_rounds,
         }))
@@ -653,18 +656,26 @@ impl GatewayState {
             .install_reranker(build_reranker(&self.snapshot(), &self.config));
     }
 
+    /// 按**当前**快照重装 skill 注册表（§5.6）。
+    ///
+    /// 配置重载是唯一会动它的时刻：`paths.skill_dirs` 改了、人刚 `komo skills disable` 过，
+    /// 之后新的一段就该按新的来（注册表本身每次查询重扫目录，人改 `SKILL.md` 不必等重载）。
+    /// 换完渲染出来还是同一段就不吭声——**注册表照换**，因为目录集合本身就是新的事实。
     pub fn refresh_skills_prompt(&self) {
         let snapshot = self.snapshot();
-        let text = skills_prompt(&snapshot, &self.tool_names, self.shared_home.as_deref());
-        let mut current = self.skills_prompt.write().expect("skills 目录");
-        if *current == text {
+        let tool_names = self.tool_names.clone();
+        let fresh = skills_registry(&snapshot, self.shared_home.as_deref());
+        let mut current = self.skills.write().expect("skills 注册表");
+        let before = skills_block(&current, &tool_names);
+        let after = skills_block(&fresh, &tool_names);
+        *current = fresh;
+        if before == after {
             return;
         }
         tracing::info!(
-            skills = text.lines().count().saturating_sub(2),
+            skills = after.lines().count().saturating_sub(2),
             "系统提示里的 skills 目录行变了"
         );
-        *current = text;
     }
 
     /// 按**当前**快照造一个 Cron 调度器。
@@ -1610,7 +1621,8 @@ fn build_reranker(
     }
 }
 
-/// 系统提示里的 skills 目录行（§5.6）。
+/// 按当前快照造一份 skill 注册表（§5.6）。**这是唯一的那个来源**：系统提示里的目录行与
+/// `skill://` 的挂载点都从它来（各存一份就会出现"提示里有、读不到"）。
 ///
 /// `<workspace>` 取 Gateway 的 workspaces 目录，**不是** Session 的 `workdir`：这一块是
 /// 启动快照（§5.6 要的就是提示前缀稳定），而 `workdir` 是逐个会话变的——按它算出来的是
@@ -1619,20 +1631,29 @@ fn build_reranker(
 /// `shared_home` 是**注入**的（`~/.agents/skills`、`~/.claude/skills` 按它算）；`None`
 /// 才回落到当前用户的家目录。现场读 `$HOME` 会让"提示里有哪些 skill"取决于这台机器上
 /// 别的 agent 装过什么，测试之间因此会互相污染。
-fn skills_prompt(
+fn skills_registry(
     snapshot: &ConfigSnapshot,
-    tool_names: &[String],
     shared_home: Option<&std::path::Path>,
-) -> String {
+) -> komo_runtime::skills::SkillRegistry {
     let home = match shared_home {
         Some(home) => Some(home.to_path_buf()),
         None => komo_runtime::config::user_home().ok(),
     };
-    let registry = komo_runtime::skills::SkillRegistry::from_snapshot(
+    komo_runtime::skills::SkillRegistry::from_snapshot(
         snapshot,
         Some(&snapshot.paths.workspaces_dir),
         home.as_deref(),
-    );
+    )
+}
+
+/// 系统提示里那一块目录行（§5.6）：按**当前这套工具**从注册表现渲染。
+///
+/// 现渲染而不是存一段文本：存的字符串是第二份事实，它和注册表会各走各的——而这一块本来
+/// 就是"这一刻有哪些 skill 能露面"的答案。
+pub(crate) fn skills_block(
+    registry: &komo_runtime::skills::SkillRegistry,
+    tool_names: &[String],
+) -> String {
     registry
         .prompt_block(&komo_runtime::skills::OfferContext::here(
             tool_names.iter().cloned(),

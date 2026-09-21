@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use super::ids::{AttemptId, RunId, SessionId, ToolCallId};
 use super::plan::{EnvVersion, PlanSource, Verification};
 use super::refs::{ContentRef, ToolResultStatus};
+use super::resource::ResourceMounts;
 use super::status::ToolCallState;
 
 /// 交给模型的工具 Schema。六个基础工具的这份定义是固定的（§4）。
@@ -108,6 +109,10 @@ pub struct ToolContext {
     pub cwd: PathBuf,
     /// 已授权的根目录：workspace、artifacts、skills（只读）等。
     pub roots: Vec<WorkspaceRoot>,
+    /// 资源命名空间的挂载点（§六）：`skill://` 的根、这个会话的内容目录、这次的能力面。
+    ///
+    /// 它是**纯数据**，解析（含 I/O）在运行时；工具拿它决定一个资源 URI 指向哪里。
+    pub mounts: ResourceMounts,
     /// 当前 Python 环境版本。
     pub env_version: Option<EnvVersion>,
     /// 这次 `execute` 是不是一次**恢复执行**（§8.4 第 6 / 7 行）。`None` = 首次。
@@ -249,6 +254,7 @@ mod tests {
                 session: SessionId::from_raw("s"),
             },
             cwd: PathBuf::from("/home/u/ws"),
+            mounts: ResourceMounts::default(),
             roots: vec![
                 WorkspaceRoot {
                     path: PathBuf::from("/home/u"),

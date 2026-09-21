@@ -504,11 +504,10 @@ async fn plan_of(
             "version": change.version,
         }),
         cwd: Some(toolbox.layout().root().to_path_buf()),
-        targets: vec![PlanTarget {
-            path: toolbox.layout().enabled_code(&change.module),
-            access: TargetAccess::Write,
-            expected_version: None,
-        }],
+        targets: vec![PlanTarget::local(
+            toolbox.layout().enabled_code(&change.module),
+            TargetAccess::Write,
+        )],
         versions: PlanVersions {
             code: None,
             module: Some(change.version.to_string()),

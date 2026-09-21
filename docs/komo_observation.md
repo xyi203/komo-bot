@@ -17,11 +17,11 @@
 | 提案里的东西 | 落地成什么 |
 |---|---|
 | Observation | `tool.result` 事件 + `ToolResultBody`：事实层本来就在，改名不增值 |
-| Artifact / ArtifactStore | `output.json` + `stdout.txt` / `stderr.txt`；`ToolOutputStore` + `PayloadStore` 就是那个 store（`artifacts/` 仍是空目录，目前没有生产者） |
+| Artifact / ArtifactStore | `output.json` + `stdout.txt` / `stderr.txt`；`ToolOutputStore` + `PayloadStore` 就是那个 store。**`artifacts/` 现在有生产者了（2026-09-22）**：Python 子进程拿 `KOMO_ARTIFACT_DIR`（`<会话>/artifacts/<run>`）作产出目录，跑完把新出现的文件记进 `output.json` 的 `body.artifacts`（会话相对路径 + 字节数 + 哈希，**不复制第二份**），投影把它映射成 `artifact://files/<run>/<名字>` 交给模型（`docs/komo_bot.md` §4.7） |
 | 「完整保存、不 truncate」 | 已经如此：进程输出上限只停转发、不杀进程 |
-| ObservationView（Full / Excerpt） | `komo-kernel/src/projection.rs` 一处纯函数：抬头 + 头尾各留一段 + 省略量 + **可直接 `read` 的完整输出路径**；"刚跑完"与"回放"逐字节相同 |
+| ObservationView（Full / Excerpt） | `komo-kernel/src/projection.rs` 一处纯函数：抬头 + 头尾各留一段 + 省略量 + **可直接 `read` 的完整输出引用**（`artifact://<run>/<call>/<attempt>/…`，§4.7；从前印的是绝对路径）+ 产物入口（`artifact://files/…`）；"刚跑完"与"回放"逐字节相同 |
 | §15 的 Projection Policy（阈值） | `[execution] model_result_bytes`（默认 8 KiB，`ConfigSnapshot` 热生效）；账本里那 ≤1 KiB 是**行预算**，两件事分开 |
-| §17 的 `observation_read` | **不新增工具**（§4 不新增第七个）：§8.3 早就把恢复路径定为 `read`，这次补的是让 `tool-output/` / `artifacts/` 成为**只读根** |
+| §17 的 `observation_read` | **不新增工具**（§4 不新增第七个）：§8.3 早就把恢复路径定为 `read`，这次补的是让 `tool-output/` / `artifacts/` 成为**只读根**；现在这三条入口是 `artifact://`（工具输出与产物）、`skill://`、`tool://`（§4.7） |
 | §14 Handle 视图 / 按请求投影 | **未做**：要等真实会话的 recall 次数（§49）——模型自己写的那段正文够用时，"哪次请求用哪个视图"是过度设计。**次数现在有得数了**（2026-09-21，见下面 §47 那行），所以这道门只是"还没到调" |
 | §25 / §26 Context Compact | **未做**，而且提案里的前提不成立：komo 目前没有 compaction 这一层 |
 | §40 并行工具调用 | **已落地（2026-09-21）**：只读的（`Operation::ReadFile`，即 `read` / `rg`）且**没有上一世要接**（续跑里已经 `start` 过的那条要走核对梯子）的调用，可以和同一轮里后面的调用同时在飞，上限 4 条（`ExecutionLimits::max_parallel_reads`）；`write` / `edit` / `shell` / `python` / `delegate` 与任何要停下来的判定都是屏障——屏障之前已经在飞的先收尾。三条不变量照旧：`start_call` 之后才允许副作用、审批先收尾再落审批行（否则答复会落进 Run 还没停下的空窗）、完成事件按真实顺序落账而交给模型的那一份按原始调用顺序配对。`docs/komo_bot.md` §6 那句"首版顺序执行"已改写 |

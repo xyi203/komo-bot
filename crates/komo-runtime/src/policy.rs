@@ -279,11 +279,10 @@ mod tests {
         let now = TestClock::fixed().now();
         let p = plan(
             Operation::ReadFile,
-            vec![PlanTarget {
-                path: PathBuf::from("/home/u/.ssh/id_ed25519"),
-                access: TargetAccess::Read,
-                expected_version: None,
-            }],
+            vec![PlanTarget::local(
+                "/home/u/.ssh/id_ed25519",
+                TargetAccess::Read,
+            )],
         );
         let mut table = RuleTable::initial();
         table.rules.insert(

@@ -199,6 +199,28 @@ ToolContext 由 Gateway 创建，包含 Session / Run / ToolCall 身份、工作
 
 shell 与 Python 子进程使用明确的环境变量集合。取消时停止所属进程组并等待回收，而不仅仅是丢弃异步等待。Tokio 默认不会因为进程 handle 被丢弃就终止进程。[Tokio process](https://docs.rs/tokio/latest/tokio/process/index.html)
 
+### 资源命名空间：`skill://` / `tool://` / `artifact://`
+
+模型仍然只用现有的 `read` / `rg`，把资源 URI 当路径交给它们。**URI 不是"特殊文件路径"**：它在执行计划里是一个明确的目标类型（`TargetRef`），计划同时带着**逻辑** URI 与解析出来的**真实**目标——审批与审计回答的是"允许读哪个逻辑资源"，而规则的路径匹配看的仍是真实路径。
+
+```text
+skill://<skill>/<path…>                      → 那份 skill 的目录 + <path…>（只读）
+skill://                                     → 配置里的 skill 根（`rg` 的搜索根）
+tool://<tool>/schema|doc                     → 虚拟入口：内容由运行时按能力面现算
+tool://                                      → 这次能力面里的工具名
+artifact://files/<path…>                     → sessions/<id>/artifacts/<path…>（只读；产物按 Run 分目录，所以通常是 `files/<run>/<名字>`）
+artifact://<run>/<call>/<attempt>/<stdout|stderr|result>
+                                             → sessions/<id>/tool-output/…（只读）
+```
+
+- **`tool://` 是说明入口，不是执行入口**：读它不改任何状态；真实动作仍走 native tool call、`ExecutionPlan` 与 Policy。
+- **越权当场是错**：`..`、空段、`tool://` 里能力面之外的工具、别的会话的 `run`、没有会话目录，一律在 `prepare` 就拒绝（`ToolError::Failed` 说清原因），**不进计划就没有执行**；解析链接之后还要再核一次"仍在挂载点里面"。
+- **挂载由装配决定，不能由模型参数提升**：skill 根来自当前配置快照的 `paths.skill_dirs`，会话内容目录来自这一次的 Session，`tool://` 只认这一次的 `AgentSurface`。三者随 `ToolContext` / `CallEnv` 走。
+- **计划里的两种目标**：本地路径（序列化成 `{"path": …}`，与改造前逐字相同——旧审批计划仍按原哈希校验）与资源（`{"uri": …, "resolved": …}`）。规则表因此多一条 `paths = virtual`：**没有磁盘目标的读**（`tool://`）由它一条覆盖；路径那几条规则对虚拟目标一律**不命中**——给虚拟入口编一个假路径才是真的越权口子。
+- **首阶段不做**：memory / session 的任意写入、shell / Python 里的 URI 展开、通用 VFS。本地路径的用法一个字都不变。
+
+产物由运行时登记：Python 子进程拿 `KOMO_ARTIFACT_DIR`（= `<会话内容目录>/artifacts/<run>`）作为产出目录，跑完把这次新出现的文件记进工具结果的 `artifacts` 引用（**相对会话目录的路径**，落在 `output.json` 的 `body.artifacts` 里），投影那一处把它映射成 `artifact://files/<相对 artifacts 的那一段>`（映射函数在 kernel，落盘与投影共用同一个，§8.3）。工具输出那一条的引用直接由 §8.3 的投影给出（`artifact://<run>/<call>/<attempt>/stdout`），重启之后照样读得回来——它是**按引用回放**，不是把正文再抄一遍。
+
 ## 5. Python 执行与能力保存
 
 ### 5.1 执行环境
@@ -308,7 +330,8 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 - `SKILL.md` frontmatter：`name`、`description`，可选 `platforms:`、`requires_tools:`（对 5 个基础工具或 toolbox 模块名）。
 - 搜索路径有序，**同名先到先得**；每次查询重扫目录，编辑或新增无需重启。
 - 只有系统提示里的**目录行**（名字 + 一句描述，总量有上限）是启动时快照，为了提示前缀稳定；`platforms:` / `requires_tools:` 只门控这份目录，不门控加载。实现上这一块是两行开头加若干目录行：先给**按序的根**（只列真的出了条目的那些，顺序就是搜索顺序——"同名先到先得"因此落得下来），再给目录行；模型按这个顺序去找 `<根>/<名字>/SKILL.md` 并 `read` 它。一条能露面的都没有时这一块整个不出现（不留空标题）。启动时算一次，配置重载时按新快照重算，此外不随文件变化——目录行是提示前缀的一部分，不能每段都不一样。**整批装得下「名字 + 一句描述」就用它，装不下就只留名字**——列全比列得详细要紧：166 个 skill 的实测里，2000 字符的预算只留下字母表前 16 条，`log-diagnosis` 根本没进提示，模型为了找它去 `ls` 了整个目录；只留名字是 2752 字符、装得下全部（默认上限已按这个实测改成 4000）。名字都装不下时末尾会写「另有 N 条没列出来」：**「没有它」和「没列出来」是两件事**。
-- **没有 skill 工具。**模型通过 `read` 读 `SKILL.md`；skills 目录是 Policy 里的只读根，读取 Allow。Skill 里写的"可以直接执行"不构成授权，Policy 只看 `ExecutionPlan`。
+- **没有 skill 工具。**模型通过 `read` 读 `SKILL.md`——写本地路径，或者写 `skill://<名字>/SKILL.md`（§4.7，逻辑入口，审批与审计显示的是它）；skills 目录是 Policy 里的只读根（§4.7 的资源根也在 `ToolContext.roots` 里），读取 Allow。Skill 里写的"可以直接执行"不构成授权，Policy 只看 `ExecutionPlan`。
+- **目录行的门控按这一次装配的能力面**：某个 Agent 的面里没有 `python` 时，`requires_tools: [python]` 的 skill 不进它的目录行；而 `skill://` 仍然读得到——门控管的是"要不要摆在眼前"，不是"能不能读"。
 - Cron Job 可以声明 `skills = ["…"]`，触发时把这些 SKILL.md 正文预载进首轮上下文。
 - `komo skills list | inspect <name> | enable | disable`；`disable` 只从目录行隐藏，不删文件。没有安装 / 候选 / 治理流程——Skills 由人写、由人放进目录。
 
@@ -575,7 +598,7 @@ Cron、交互聊天与 resume 都经过这一条路径。
 | sessions/{session_id}/payloads/                                    | 超限的模型消息或执行计划正文，包含大参数                                     | JSONL 保留引用与内容哈希；同一参数不再另存重复全文             |
 | sessions/{session_id}/tool-output/{run_id}/{call_id}/{attempt_id}/ | output.json，以及按需保存的 stdout.txt / stderr.txt                          | 每次执行的完整工具输出，包含错误详情；按尝试独立、完成后不可变 |
 | state.db（Turso，MVCC）                                           | Session 生命周期、Run 元数据、任务队列、领取代次、工具状态与引用、审批、投递记录、Cron、Memory | **生命周期、调度与授权的唯一权威**；执行内容索引与派生状态可从 JSONL 补齐（§8.9） |
-| sessions/{session_id}/artifacts/                                   | 工具生成的二进制文件、脚本快照与报告                                         | 独立产物，通过工具输出中的引用定位；不重复复制到 tool-output   |
+| sessions/{session_id}/artifacts/{run_id}/                          | 工具生成的二进制文件、脚本快照与报告                                         | 独立产物，按 Run 分目录；正文里以 `artifact://files/<run>/<名字>` 给出引用（§4.7）；不重复复制到 tool-output |
 
 state.db 中的主要表：
 
@@ -640,7 +663,7 @@ Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_T
 
 stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内存里积累完整输出。进程结束并收齐输出后，同步并完成文件，再原子写入 output.json；最后才能发布 JSONL 结果引用。因中断只留下的 .partial 文件可以用于诊断，不能当作完成结果。
 
-读取历史或恢复调用时按引用加载需要的内容；组装模型上下文仍遵守输出预算，超限时提供截断提示和可读取的完整文件引用。**这里有两个预算，不是一个**：`tool.result` 那 ≤1 KiB 是**账本的行预算**（每条 JSONL 行都要小），交给模型多少由 `[execution] model_result_bytes` 说了算（§6），完整正文落在 `output.json` 里。模型看到的正文由**一处纯函数**投影出来（`komo-kernel` 的 `projection`）：抬头（工具、状态、耗时、stdout / stderr 大小）+ 头尾各留一段并写明省了多少 + 可直接 `read` 的完整输出路径。因此**刚跑完的那一次与重启之后回放必须逐字节相同**——投影只吃落盘的事实（事件 + `output.json`），不掺任何只活在内存里的东西。那条路径必须真能读：**当前 Session 获授权的输出（`tool-output/`、`artifacts/`）是一段只读根**，`read` 得到它、写它一律 Deny（§8.10 第 4 条），不开放普通工具修改这些记录。摘要或预览不能代替恢复所需的原始参数与结果。
+读取历史或恢复调用时按引用加载需要的内容；组装模型上下文仍遵守输出预算，超限时提供截断提示和可读取的完整文件引用。**这里有两个预算，不是一个**：`tool.result` 那 ≤1 KiB 是**账本的行预算**（每条 JSONL 行都要小），交给模型多少由 `[execution] model_result_bytes` 说了算（§6），完整正文落在 `output.json` 里。模型看到的正文由**一处纯函数**投影出来（`komo-kernel` 的 `projection`）：抬头（工具、状态、耗时、stdout / stderr 大小）+ 头尾各留一段并写明省了多少 + 可直接 `read` 的**引用**（`artifact://<run>/<call>/<attempt>/stdout`，§4.7）。从前这里印的是绝对路径；改成 URI 之后，「超限的正文在哪」与「允许读哪个逻辑资源」是同一句话。因此**刚跑完的那一次与重启之后回放必须逐字节相同**——投影只吃落盘的事实（事件 + `output.json`），不掺任何只活在内存里的东西。那条路径必须真能读：**当前 Session 获授权的输出（`tool-output/`、`artifacts/`）是一段只读根**，`read` 得到它、写它一律 Deny（§8.10 第 4 条），不开放普通工具修改这些记录。摘要或预览不能代替恢复所需的原始参数与结果。
 
 实现约束：
 
@@ -1456,8 +1479,8 @@ max_tokens = 1500
 
 [execution]
 # 交给模型的工具结果正文上限（字节）。完整输出永远在 sessions/<id>/tool-output/ 下，
-# 这里限的是"这一次给模型看多少"：超了就头尾各留一段、写明省了多少，并给出可直接 read
-# 的路径（§8.3）。改完对新起的 Run 立即生效（§3）。省略 = 8192。
+# 这里限的是"这一次给模型看多少"：超了就头尾各留一段、写明省了多少，并给出可直接 read 的
+# 引用（§8.3；`artifact://<run>/<call>/<attempt>/…`，§4.7）。改完对新起的 Run 立即生效（§3）。省略 = 8192。
 model_result_bytes = 8192
 ```
 
@@ -1806,6 +1829,8 @@ pub trait Clock: Send + Sync {
 | 会话目录被手工删除，而状态仍是 `active` / `closing` | Run 不被领走（不按空上下文执行一轮），对账把这条不一致报成 `blocked` Intervention |
 
 目录与引用验收：工具事件、大参数、完整输出及 stdout / stderr 都位于同一 Session 目录；改变 Gateway 当前工作目录不影响引用读取；不同 Session 或不同 attempt 不能互相覆盖。清理历史时保留未完成任务、Memory 证据和持久产物仍需引用的文件。**读路径不写**：把会话目录删掉之后，`GET /v1/sessions/{id}/events`、会话详情、对账与恢复扫描都不得把它建回来，而且对账必须把这条 Run 停成 `waiting + intervention` 并说明缺内容。
+
+**资源命名空间验收（2026-09-22）**：`read("skill://<skill>/SKILL.md")` 与 `rg(path="skill://")`（多根 → 多条目标）端到端成立，且**审批与审计里显示的是逻辑 URI**（`PlanTarget::describe()` 形如 `skill://review/SKILL.md（<真实路径>）`），读一份 skill **不产生审批**（skill 目录是只读根）；`tool://<工具>/schema|doc` 只在**这一次的能力面**里可读（面外写 `tool://write/schema` 在 `prepare` 就被拒、不进计划），`tool://` 是虚拟入口、没有磁盘目标；`..` / 空段 / 指向挂载点之外的链接 / 没有会话内容目录这几类同样在 `prepare` 被拒；超限正文给出的 `artifact://<run>/<call>/<attempt>/…` 与产物入口 `artifact://files/<run>/<名字>` **在 Gateway 重启之后仍读回同一份正文**；本地路径的用法与改造前逐字相同（计划里仍是 `{"path": …}`，旧审批计划按原哈希校验）。
 
 测试同时断言实际副作用次数、Run / ToolCall 身份、授权使用、预算和事件配对；仅检查“恢复后状态变成 running”不算通过。每个断点做进程终止测试，并单独安排操作系统重启 / 存储持久性验证。
 

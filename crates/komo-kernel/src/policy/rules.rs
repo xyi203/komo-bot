@@ -88,6 +88,11 @@ pub enum PathMatch {
     /// 名单不在规则里而在上下文里，因为它是**本机的**数据目录：写进表就等于把某一台
     /// 机器的 home 目录抄进了配置，换台机器或改 `KOMO_HOME` 就失效（§8.10 第 4 条）。
     TouchesProtected,
+    /// **所有**目标都没有磁盘目标——虚拟入口（`tool://` 的工具说明与 schema）。
+    ///
+    /// 它单独一条，是为了不把虚拟入口混进"落在根里"：那一条问的是"这个真实路径有没有
+    /// 被授权"，而虚拟入口压根没有路径，硬塞一个假路径进去才是真的越权口子。
+    Virtual,
 }
 
 /// 一条规则的匹配条件。字段都是 `Option`，`None` = 这一维不约束；给出的条件全部成立
@@ -205,14 +210,23 @@ impl Matcher {
         let Some(condition) = &self.paths else {
             return true;
         };
+        // 虚拟入口（`tool://`）没有磁盘目标：路径那几条规则对它**一律不命中**，
+        // 由 `PathMatch::Virtual` 单管。硬把"没有路径"算成"落在根里"或者"越界"都是
+        // 拿一个假事实去匹配真规则。
+        let paths = || plan.targets.iter().filter_map(|target| target.path());
         match condition {
+            PathMatch::Virtual => {
+                !plan.targets.is_empty() && plan.targets.iter().all(|target| target.is_virtual())
+            }
             PathMatch::WithinRoots { writable } => {
                 let Some(ctx) = ctx else { return false };
-                // 一个目标都没有的计划谈不上"落在根里"。
+                // 一个目标都没有的计划谈不上"落在根里"；虚拟入口也不算。
                 !plan.targets.is_empty()
                     && plan.targets.iter().all(|target| {
-                        ctx.root_for(&target.path)
-                            .is_some_and(|root| !*writable || root.writable)
+                        target.path().is_some_and(|path| {
+                            ctx.root_for(path)
+                                .is_some_and(|root| !*writable || root.writable)
+                        })
                     })
             }
             PathMatch::OutsideRoots => {
@@ -221,22 +235,20 @@ impl Matcher {
             }
             PathMatch::WithinPrefixes { prefixes } => {
                 !plan.targets.is_empty()
-                    && plan
-                        .targets
-                        .iter()
-                        .all(|t| prefixes.iter().any(|p| t.path.starts_with(p)))
+                    && plan.targets.iter().all(|target| {
+                        target
+                            .path()
+                            .is_some_and(|path| prefixes.iter().any(|p| path.starts_with(p)))
+                    })
             }
-            PathMatch::TouchesPrefixes { prefixes } => plan
-                .targets
-                .iter()
-                .any(|t| prefixes.iter().any(|p| t.path.starts_with(p))),
+            PathMatch::TouchesPrefixes { prefixes } => {
+                paths().any(|path| prefixes.iter().any(|prefix| path.starts_with(prefix)))
+            }
             // 没有上下文时**不命中**：这条规则说的是"本机数据目录"，而授权那一侧
             // （`matches_scope`）没有上下文，也就不该因为一条本机路径而变宽或变窄。
-            PathMatch::TouchesProtected => ctx.is_some_and(|ctx| {
-                plan.targets
-                    .iter()
-                    .any(|target| ctx.touches_protected(&target.path))
-            }),
+            PathMatch::TouchesProtected => {
+                ctx.is_some_and(|ctx| paths().any(|path| ctx.touches_protected(path)))
+            }
         }
     }
 }

@@ -153,7 +153,8 @@ impl PolicyContext<'_> {
     pub fn touches_outside_roots(&self, plan: &ExecutionPlan) -> bool {
         plan.targets
             .iter()
-            .any(|target| self.root_for(&target.path).is_none())
+            .filter_map(|target| target.path())
+            .any(|path| self.root_for(path).is_none())
     }
 }
 

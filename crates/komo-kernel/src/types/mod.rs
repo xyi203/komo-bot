@@ -12,6 +12,7 @@ pub mod memory;
 pub mod model;
 pub mod plan;
 pub mod refs;
+pub mod resource;
 pub mod status;
 pub mod surface;
 pub mod systemone;
@@ -49,6 +50,10 @@ pub use plan::{
 pub use refs::{
     AttemptRef, ContentRef, INLINE_ARGUMENT_LIMIT_BYTES, OutputRef, PREVIEW_LIMIT_BYTES,
     PayloadRef, PublishedOutput, ToolResultBody, ToolResultStatus, VerifiedOutput,
+};
+pub use resource::{
+    OutputFile, ResourceMounts, ResourceUri, SkillMount, TargetRef, ToolPart, UriError,
+    artifact_uri, output_file_path,
 };
 pub use status::{
     AttemptState, Claimed, FinalEventRef, RetryCause, RunEnd, RunState, SessionState,

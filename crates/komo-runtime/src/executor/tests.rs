@@ -171,6 +171,7 @@ async fn a_deny_is_not_overridden_by_a_matching_grant_and_consumes_nothing() {
                 source: env.source.clone(),
                 cwd: env.cwd.clone(),
                 roots: env.roots.clone(),
+                mounts: env.mounts.clone(),
                 env_version: None,
                 resumed: None,
                 cancel: CancelToken::new(),
@@ -1724,11 +1725,7 @@ impl Tool for Probe {
             args,
             cwd: Some(ctx.cwd.clone()),
             // 目标就是参数里那个路径——规则的路径匹配只看这里（§7.1）。
-            targets: vec![PlanTarget {
-                path: ctx.cwd.join(path),
-                access: TargetAccess::Read,
-                expected_version: None,
-            }],
+            targets: vec![PlanTarget::local(ctx.cwd.join(path), TargetAccess::Read)],
             versions: PlanVersions::default(),
             resources: vec![],
             // 读取可以安全重做：超时是失败，不是"结果不明"。
@@ -2115,7 +2112,7 @@ async fn reading_back_an_observation_counts_as_a_recall() {
         .await;
 
     let mut env = harness.env(&session, &run);
-    env.session_root = Some(observations);
+    env.mounts.session_root = Some(observations);
     let outcome = executor.execute_round(calls, &env).await.unwrap();
     assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
 
@@ -2126,6 +2123,57 @@ async fn reading_back_an_observation_counts_as_a_recall() {
     );
 }
 
+/// 一轮产出的文件要出现在交给模型的正文里：`artifact://files/…` 入口 + 大小，**正文不抄**
+/// ——模型按引用去 `read`（§4.7）。没有这一句，它不知道自己产出了什么。
+#[tokio::test]
+async fn an_artifact_of_the_round_is_named_in_what_the_model_sees() {
+    let harness = Harness::new();
+    let report = komo_kernel::types::refs::ContentRef {
+        path: "artifacts/run-1/报告.md".into(),
+        size: "产物正文\n".len() as u64,
+        hash: komo_kernel::types::digest::ContentHash::of_str("产物正文\n"),
+        pointer: None,
+    };
+    let tool = Arc::new(
+        RecordingTool::new(
+            "python",
+            Operation::PythonCall {
+                module: "main".into(),
+                function: "run".into(),
+            },
+        )
+        .with_recovery(RecoveryMode::SafeReread)
+        .with_outcome(Ok(ToolOutput {
+            status: ToolResultStatus::Completed,
+            result: serde_json::json!({ "ok": true }),
+            exit_code: Some(0),
+            artifacts: vec![report],
+            preview: Some("跑完了\n".into()),
+        })),
+    );
+    let executor = harness.permissive(vec![tool]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(&run, &[("python", serde_json::json!({ "code": "…" }))])
+        .await;
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+
+    let content = &outcome.results[0].content;
+    assert!(content.contains("跑完了"), "{content}");
+    assert!(
+        content.contains("产物：artifact://files/run-1/报告.md（13 B）"),
+        "{content}"
+    );
+    assert!(
+        !content.contains("产物正文"),
+        "产物的正文按引用去读，不抄进上下文：{content}"
+    );
+}
+
 /// recall 只在"读的是我们自己落盘的那两个子目录"时成立（§48）。
 #[tokio::test]
 async fn only_reads_of_our_own_output_are_recalls() {
@@ -2133,7 +2181,7 @@ async fn only_reads_of_our_own_output_are_recalls() {
     let (session, run) = harness.open_run().await;
     let observations = harness.dir.path().join("sessions").join(session.as_str());
     let mut env = harness.env(&session, &run);
-    env.session_root = Some(observations.clone());
+    env.mounts.session_root = Some(observations.clone());
 
     let output = observations.join("tool-output/run-1/call-1/attempt-1/output.json");
     let artifacts = observations.join("artifacts/report.md");
@@ -2160,7 +2208,7 @@ async fn only_reads_of_our_own_output_are_recalls() {
     ));
     // 没有 Session 目录（精简装配）时不算：无从判断读的是不是我们落的盘。
     let mut plain = harness.env(&session, &run);
-    plain.session_root = None;
+    plain.mounts.session_root = None;
     assert!(!is_recall(
         &plan_touching(
             &[observations.join("tool_output.json")],
@@ -2185,11 +2233,7 @@ fn plan_touching(paths: &[PathBuf], operation: Operation) -> ExecutionPlan {
         cwd: None,
         targets: paths
             .iter()
-            .map(|path| PlanTarget {
-                path: path.clone(),
-                access: TargetAccess::Read,
-                expected_version: None,
-            })
+            .map(|path| PlanTarget::local(path.clone(), TargetAccess::Read))
             .collect(),
         versions: PlanVersions::default(),
         resources: vec![],

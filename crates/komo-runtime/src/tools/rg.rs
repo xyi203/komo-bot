@@ -19,6 +19,11 @@
 //! 读到能写下东西、或者读完。
 //!
 //! 恢复方式是 [`RecoveryMode::SafeReread`]：搜索没有副作用，重做只是重新观察（§8.6）。
+//!
+//! `path` 除了本地目录/文件，还认得 §六 的**根入口**：`skill://`（全部 skill 根）与
+//! `artifact://files`（这个会话的产物目录）——**每个真实根一条计划目标**，所以范围判定与
+//! 审批看到的还是真的路径。`tool://` 那种现算的正文不是文件，搜索它没有意义（`prepare`
+//! 就拒）。
 
 use std::cell::RefCell;
 use std::io;
@@ -45,6 +50,7 @@ use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{CancelToken, ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 
+use super::resources::{self, ResolvedResource, ResourceError};
 use super::{normalized, parse_args, plan_time};
 
 /// 一次搜索默认跑多久。比 `shell` 的默认短：搜索在模型这一轮里是等着的动作。
@@ -81,7 +87,7 @@ pub struct RgArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RgResult {
     pub pattern: String,
-    /// 实际被搜的路径（已解析符号链接的绝对路径）。
+    /// 搜了哪儿：本地路径是解析后的真实路径，资源入口是**逻辑入口**（`skill://`）。
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glob: Option<String>,
@@ -146,7 +152,7 @@ impl Tool for RgTool {
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "ripgrep 语法的正则（Rust regex）；搜字面量时把 fixed_strings 打开" },
-                    "path": { "type": "string", "description": "要搜的目录或文件；缺省是工作目录" },
+                    "path": { "type": "string", "description": "要搜的目录或文件，缺省是工作目录；也可以是资源入口：`skill://`（搜全部 skill 根）、`artifact://files`（本次会话的产物目录）" },
                     "glob": { "type": "string", "description": "只搜匹配这个 glob 的文件，例如 '*.rs' 或 '!target/**'" },
                     "ignore_case": { "type": "boolean", "description": "忽略大小写；缺省区分大小写" },
                     "fixed_strings": { "type": "boolean", "description": "把 pattern 当字面量，不解释正则元字符" }
@@ -172,15 +178,11 @@ impl Tool for RgTool {
         // 改一个字重发，而不是先建计划、过审批、再拿回一条失败。（glob 不在这里验：gitignore
         // 那套 glob 是宽松的，写歪了多半只是"什么都没匹配上"，那不是错误。）
         matcher(&args).map_err(|message| ToolError::InvalidArguments { message })?;
-        let target = match &args.path {
-            Some(raw) => super::paths::resolve(raw, &ctx.cwd)?,
-            None => ctx.cwd.clone(),
+        let targets = match &args.path {
+            Some(raw) => targets_of(raw, ctx)?,
+            // 缺省是这次的工作目录（它一定在）。
+            None => vec![PlanTarget::local(ctx.cwd.clone(), TargetAccess::Read)],
         };
-        if !target.exists() {
-            return Err(ToolError::Failed {
-                message: format!("{} 不存在", target.display()),
-            });
-        }
         Ok(ExecutionPlan {
             operation_id: OperationId::new_at(plan_time()),
             source: ctx.source.clone(),
@@ -191,11 +193,7 @@ impl Tool for RgTool {
             tool_call: Some(ctx.call.clone()),
             args: normalized(&args)?,
             cwd: Some(ctx.cwd.clone()),
-            targets: vec![PlanTarget {
-                path: target,
-                access: TargetAccess::Read,
-                expected_version: None,
-            }],
+            targets,
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: RecoveryMode::SafeReread,
@@ -211,11 +209,22 @@ impl Tool for RgTool {
         let plan = plan.plan();
         let args: RgArgs = parse_args(plan.args.clone(), "rg")?;
         let cwd: PathBuf = plan.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
-        let target: PathBuf = plan
+        let targets: Vec<PathBuf> = plan
             .targets
-            .first()
-            .map(|target| target.path.clone())
-            .unwrap_or_else(|| cwd.clone());
+            .iter()
+            .filter_map(|target| target.path().map(Path::to_path_buf))
+            .collect();
+        // 计划里没有目标（手工造的、或者旧日志里的）时退回工作目录：**就地搜**总比什么都不
+        // 做好，而这不是任何一条规则判断得来的结论。
+        let targets = match targets.is_empty() {
+            true => vec![cwd.clone()],
+            false => targets,
+        };
+        let scope = match plan.targets.first().and_then(|target| target.uri()) {
+            // 资源入口印逻辑入口：模型给的就是它（真实根在计划里，审批看得到）。
+            Some(uri) => uri.to_string(),
+            None => targets[0].display().to_string(),
+        };
         let matcher = matcher(&args).map_err(|message| ToolError::Failed { message })?;
         // 已经取消的调用不该再走树：搜索本身很快就会发现停止标志，但那也要等一个文件。
         if ctx.cancel.is_cancelled() {
@@ -228,7 +237,7 @@ impl Tool for RgTool {
 
         let job = SearchJob {
             matcher,
-            target: target.clone(),
+            targets: targets.clone(),
             cwd: cwd.clone(),
             glob: args.glob.clone(),
             stop: Arc::clone(&stop),
@@ -306,7 +315,7 @@ impl Tool for RgTool {
 
         let result = RgResult {
             pattern: args.pattern,
-            path: target.display().to_string(),
+            path: scope,
             glob: args.glob,
             matched: walked.matched,
             output_truncated: truncated,
@@ -363,6 +372,49 @@ impl Tool for RgTool {
     }
 
     // `verify` 用默认实现——但这条计划本来就不需要它：`SafeReread` 是"重做即重新观察"。
+}
+
+/// 这次搜索触及的目标。
+///
+/// 本地路径一条（解析符号链接，规则只看这个）；资源入口按 §六：
+/// **根是每个真实根一条目标**（`skill://`、`artifact://files`），文件就是那一条，而
+/// `tool://` 那种现算的正文不是磁盘上的东西——搜不了，当场拒（§六：不进计划就没有执行）。
+fn targets_of(raw: &str, ctx: &ToolContext) -> Result<Vec<PlanTarget>, ToolError> {
+    let Some(uri) = resources::entry(raw).map_err(ResourceError::into_tool_error)? else {
+        let path = super::paths::resolve(raw, &ctx.cwd)?;
+        if !path.exists() {
+            return Err(ToolError::Failed {
+                message: format!("{} 不存在", path.display()),
+            });
+        }
+        return Ok(vec![PlanTarget::local(path, TargetAccess::Read)]);
+    };
+    match resources::resolve(&uri, &ctx.mounts).map_err(ResourceError::into_tool_error)? {
+        ResolvedResource::File(path) => {
+            if !path.exists() {
+                return Err(ToolError::Failed {
+                    message: format!(
+                        "{uri} 在本会话里没有对应的文件（{} 不存在）",
+                        path.display()
+                    ),
+                });
+            }
+            Ok(vec![PlanTarget::resource(
+                uri,
+                Some(path),
+                TargetAccess::Read,
+            )])
+        }
+        // 每个根一条：规则匹配、审批、审计看到的都是真的路径，而逻辑入口还是那一条。
+        ResolvedResource::Roots(roots) => Ok(roots
+            .into_iter()
+            .map(|root| PlanTarget::resource(uri.clone(), Some(root), TargetAccess::Read))
+            .collect()),
+        ResolvedResource::Virtual(_) => Err(ResourceError::Virtual {
+            uri: uri.to_string(),
+        }
+        .into_tool_error()),
+    }
 }
 
 /// 模式 + 两个开关 → 匹配器。**语法是 Rust regex**（ripgrep 的默认引擎，也就是书上这一个）：
@@ -472,7 +524,8 @@ impl Drop for StopOnDrop {
 /// 阻塞线程上要的全部东西。
 struct SearchJob {
     matcher: RegexMatcher,
-    target: PathBuf,
+    /// 这次要搜的全部真实目标：本地路径一条，`skill://` 那种根是每个根一条。
+    targets: Vec<PathBuf>,
     cwd: PathBuf,
     glob: Option<String>,
     stop: Arc<AtomicBool>,
@@ -505,15 +558,23 @@ impl SearchOutcome {
 }
 
 /// 遍历 + 搜索。**这是唯一的阻塞段**，由 [`tokio::task::spawn_blocking`] 扛着。
+///
+/// 目标可能不止一个（`skill://` 是每个 skill 根一条）：一个接一个搜，顺序就是计划里的顺序
+/// ——同一份计划两次搜索印出同样的顺序，这是可复现的一部分。
 fn search(job: &SearchJob, tx: &mpsc::Sender<Chunk>) -> SearchOutcome {
     let mut outcome = SearchOutcome::default();
-    let overrides = match build_overrides(&job.target, job.glob.as_deref()) {
-        Ok(overrides) => overrides,
-        Err(error) => {
-            outcome.note(format!("glob 不合法：{error}"), tx);
-            return outcome;
+    // glob 锚在各自的根上（越界的模式因此不会跨根误伤），**语法只验一次**：它合不合法与
+    // 锚在哪个根上无关。
+    let mut overrides: Vec<Option<Override>> = Vec::with_capacity(job.targets.len());
+    for target in &job.targets {
+        match build_overrides(target, job.glob.as_deref()) {
+            Ok(overrides_for) => overrides.push(overrides_for),
+            Err(error) => {
+                outcome.note(format!("glob 不合法：{error}"), tx);
+                return outcome;
+            }
         }
-    };
+    }
     let mut searcher = SearcherBuilder::new()
         // 行号是**搜索器**给的：打印器只负责把 `path:line:text` 拼出来。
         .line_number(true)
@@ -545,16 +606,21 @@ fn search(job: &SearchJob, tx: &mpsc::Sender<Chunk>) -> SearchOutcome {
         }
     };
 
-    // 目标本身就是个文件（含指向文件的链接）时直接搜它——`ignore` 的遍历只认目录树。
-    if job.target.is_file() {
-        let excluded = overrides
-            .as_ref()
-            .is_some_and(|overrides| overrides.matched(&job.target, false).is_ignore());
-        if !excluded {
-            search_one(&job.target, &mut outcome);
+    for (target, overrides) in job.targets.iter().zip(overrides) {
+        if job.stopped() {
+            break;
         }
-    } else {
-        let mut builder = WalkBuilder::new(&job.target);
+        // 目标本身就是个文件（含指向文件的链接）时直接搜它——`ignore` 的遍历只认目录树。
+        if target.is_file() {
+            let excluded = overrides
+                .as_ref()
+                .is_some_and(|overrides| overrides.matched(target, false).is_ignore());
+            if !excluded {
+                search_one(target, &mut outcome);
+            }
+            continue;
+        }
+        let mut builder = WalkBuilder::new(target);
         builder
             // 隐藏文件与 `.gitignore` 照 ripgrep 的**默认**走：跳过隐藏文件；`.gitignore`
             // 只在 git 仓库里生效（`require_git` 的默认就是 true）。这里不改成"哪儿都认
@@ -655,7 +721,7 @@ mod tests {
             .unwrap();
         assert_eq!(plan.operation, Operation::ReadFile);
         assert_eq!(plan.targets.len(), 1);
-        assert_eq!(plan.targets[0].path, ctx.cwd);
+        assert_eq!(plan.targets[0].path(), Some(ctx.cwd.as_path()));
         assert_eq!(plan.targets[0].access, TargetAccess::Read);
         assert_eq!(plan.recovery, RecoveryMode::SafeReread);
 
@@ -664,10 +730,146 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            plan.targets[0].path,
-            std::fs::canonicalize(dir.path().join("sub")).unwrap(),
+            plan.targets[0].path(),
+            Some(
+                std::fs::canonicalize(dir.path().join("sub"))
+                    .unwrap()
+                    .as_path()
+            ),
             "搜子目录时目标是子目录，范围判定跟着它走"
         );
+    }
+
+    /// `path` 是资源入口时**每个真实根一条目标**：规则匹配、审批、审计看到的都是真的路径，
+    /// 而逻辑入口还是那一条（`skill://`）。
+    #[tokio::test]
+    async fn a_skill_root_search_plans_one_target_per_skill_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared");
+        let home = dir.path().join("home");
+        for (root, body) in [
+            (&shared, "review: 检查清单\n"),
+            (&home, "deploy: 上线步骤\n"),
+        ] {
+            std::fs::create_dir_all(root.join("review")).unwrap();
+            std::fs::write(root.join("review/SKILL.md"), body).unwrap();
+        }
+        let shared = std::fs::canonicalize(&shared).unwrap();
+        let home = std::fs::canonicalize(&home).unwrap();
+
+        let mut ctx = context(dir.path());
+        ctx.mounts.skill_dirs = vec![shared.clone(), home.clone()];
+        let tool = RgTool::new();
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "pattern": "上线", "path": "skill://" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.targets.len(), 2, "两条根 → 两条目标");
+        assert_eq!(
+            plan.targets
+                .iter()
+                .map(|target| target.describe())
+                .collect::<Vec<_>>(),
+            vec![
+                format!("skill://（{}）", shared.display()),
+                format!("skill://（{}）", home.display()),
+            ],
+            "两条目标共用同一条逻辑入口，真实目标各是各的"
+        );
+
+        let mut sink = writer(&ctx);
+        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let printed = preview(&output);
+        let result = rg_result(&output);
+        assert_eq!(result.path, "skill://", "抬头印逻辑入口");
+        assert!(result.matched);
+        assert!(
+            printed.contains("review/SKILL.md:1:deploy: 上线步骤"),
+            "{printed}"
+        );
+    }
+
+    /// `artifact://files` 的根是本次会话的产物目录；给到具体文件时只搜那一个。
+    #[tokio::test]
+    async fn an_artifact_root_is_this_sessions_artifacts_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s1");
+        std::fs::create_dir_all(session.join("artifacts")).unwrap();
+        std::fs::write(session.join("artifacts/report.md"), "结论：foo\n").unwrap();
+
+        let mut ctx = context(dir.path());
+        ctx.mounts.session_root = Some(std::fs::canonicalize(&session).unwrap());
+        let tool = RgTool::new();
+
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "pattern": "foo", "path": "artifact://files" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(
+            plan.targets[0].describe(),
+            format!(
+                "artifact://files（{}）",
+                std::fs::canonicalize(session.join("artifacts"))
+                    .unwrap()
+                    .display()
+            )
+        );
+
+        let mut sink = writer(&ctx);
+        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        assert!(
+            preview(&output).contains("report.md:1:结论：foo"),
+            "{}",
+            preview(&output)
+        );
+
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "pattern": "foo", "path": "artifact://files/report.md" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.targets.len(), 1);
+        assert!(plan.targets[0].uri().is_some());
+        assert_eq!(
+            plan.targets[0].path(),
+            Some(
+                std::fs::canonicalize(session.join("artifacts/report.md"))
+                    .unwrap()
+                    .as_path()
+            )
+        );
+        let mut sink = writer(&ctx);
+        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        assert_eq!(rg_result(&output).path, "artifact://files/report.md");
+    }
+
+    /// 现算的正文不是磁盘上的文件：搜索它没有意义，`prepare` 就拒。
+    #[tokio::test]
+    async fn a_virtual_entry_is_not_searchable() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path());
+        ctx.mounts.tools = std::sync::Arc::from([]);
+        let error = RgTool::new()
+            .prepare(
+                serde_json::json!({ "pattern": "foo", "path": "tool://" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        let ToolError::Failed { message } = &error else {
+            panic!("{error:?}")
+        };
+        assert!(message.contains("现算出来的正文"), "{message}");
+        assert!(message.contains("read"), "{message}");
     }
 
     #[tokio::test]

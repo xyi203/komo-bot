@@ -9,19 +9,20 @@
 //!
 //! - **Full**：这段正文就是全部（流里没有更多字节）。
 //! - **Excerpt**：正文是一部分——头尾各留一段，中间写明省了多少，并给出**可直接 `read` 的
-//!   完整输出路径**。省略不等于丢失：完整事实始终在 `output.json` / `stdout.txt` 里。
+//!   完整输出引用**（`artifact://<run>/<call>/<attempt>/…`，§4.7）。省略不等于丢失：完整
+//!   事实始终在 `output.json` / `stdout.txt` 里。
 //!
 //! 第三种（Handle：连正文都不给，只留引用）是**按请求**决定的——同一份事实在不同轮次可以
 //! 有不同的视图，而当前阶段只投影一次（`docs/komo_observation.md` 的第二阶段）。
 
-use std::path::Path;
-
+use crate::types::ids::{AttemptId, RunId, ToolCallId};
 use crate::types::refs::{ContentRef, OutputRef, ToolResultStatus};
+use crate::types::resource::{OutputFile, ResourceUri};
 
 /// 投影用的全部事实。
 ///
 /// **每一格都能从落盘的东西里读回来**（`tool.result` 事件 + `output.json`），所以回放时才
-/// 渲染得出同一个字符串。工具名来自那一轮的调用计划，`session_root` 来自这次执行的环境。
+/// 渲染得出同一个字符串。工具名来自那一轮的调用计划，引用与流的大小来自那次尝试的输出。
 #[derive(Debug, Clone, Copy)]
 pub struct ToolResultFacts<'a> {
     pub tool: &'a str,
@@ -33,9 +34,9 @@ pub struct ToolResultFacts<'a> {
     pub output: &'a OutputRef,
     pub stdout: Option<&'a ContentRef>,
     pub stderr: Option<&'a ContentRef>,
-    /// 这个 Session 的内容目录。给了才印得出**可直接 `read` 的绝对路径**——模型的工作目录
-    /// 是 workspace，相对 Session 目录的路径它解析不了（§8.3）。
-    pub session_root: Option<&'a Path>,
+    /// 这一轮**产出**的文件（`output.json` 里那一格）。给模型的是入口与大小，不是正文
+    /// ——正文按引用去 `read`（§4.7）。
+    pub artifacts: &'a [ContentRef],
 }
 
 /// 这一次投影的预算：正文最多占多少字节。
@@ -69,6 +70,7 @@ pub fn project(facts: &ToolResultFacts<'_>, ctx: &ProjectionContext) -> String {
     if cut.omitted > 0 || has_more(facts, text) {
         out.push_str(&recall(facts));
     }
+    out.push_str(&artifacts(facts));
     out
 }
 
@@ -92,18 +94,77 @@ fn header(facts: &ToolResultFacts<'_>) -> String {
 }
 
 /// 「完整输出在哪」——只有在**确实还有更多**的时候才印，否则那行就是对正文的噪音。
+///
+/// 印的是 `artifact://` **入口**（§4.7）：模型把它原样交给 `read` 就拿到了完整正文，而
+/// 绝对路径既是这台机器的事、又把"这是**这个会话自己的**哪一次落盘"说漏了——一句话在两处
+/// 说同一件事，改一处就会漏一处。run / call / attempt 从**落盘事实**（引用里那个 Session
+/// 相对路径）里取，所以刚跑完与重启之后回放拿到的是同一串字节。
 fn recall(facts: &ToolResultFacts<'_>) -> String {
-    let mut out = String::new();
-    let where_to_read = match facts.session_root {
-        // 会话目录 + 引用里的相对路径，拼出来就是模型能直接 `read` 的绝对路径。
-        Some(root) => root.join(facts.output.path()).display().to_string(),
-        None => format!("{}（相对 Session 目录）", facts.output.path()),
-    };
-    out.push_str(&format!("完整输出：{where_to_read}"));
-    if facts.stdout.is_some() || facts.stderr.is_some() {
-        out.push_str("（同目录下有 stdout.txt / stderr.txt）");
+    let mut out = format!(
+        "完整输出：{}",
+        where_to_read(facts.output.path(), OutputFile::Result)
+    );
+    let mut streams: Vec<String> = Vec::new();
+    for (file, stream) in [
+        (OutputFile::Stdout, facts.stdout),
+        (OutputFile::Stderr, facts.stderr),
+    ] {
+        if let Some(stream) = stream {
+            streams.push(where_to_read(&stream.path, file));
+        }
+    }
+    if !streams.is_empty() {
+        out.push_str(&format!("（流：{}）", streams.join("、")));
     }
     out.push('\n');
+    out
+}
+
+/// 引用里那个 Session 相对路径 → 模型能直接 `read` 的入口；认不出来时如实给相对路径。
+///
+/// **不编**：`output_uri` 认不出来（形状不是 `tool-output/<run>/<call>/<attempt>/<文件>`、
+/// 或者最后那一段不是这个文件）就说明这份引用不是我们落盘的那一次，这时给一个"看起来像
+/// 资源"的 URI 才是撒谎——那会让模型拿着一个读不回来的东西去试。
+fn where_to_read(path: &str, file: OutputFile) -> String {
+    match output_uri(path, file) {
+        Some(uri) => uri.to_string(),
+        None => format!("{path}（相对 Session 目录）"),
+    }
+}
+
+/// 落盘路径 → 它对应的资源入口。**路径的形状就是事实**（`komo-store` 只写这一种：
+/// `tool-output/<run>/<call>/<attempt>/…`），所以这里做的是解读，不是猜测。
+fn output_uri(path: &str, file: OutputFile) -> Option<ResourceUri> {
+    let mut segments = path.strip_prefix("tool-output/")?.split('/');
+    let (run, call, attempt) = (segments.next()?, segments.next()?, segments.next()?);
+    let named = segments.next() == Some(file.file_name());
+    if !named || run.is_empty() || call.is_empty() || attempt.is_empty() {
+        return None;
+    }
+    Some(ResourceUri::Output {
+        run: RunId::from_raw(run),
+        call: ToolCallId::from_raw(call),
+        attempt: AttemptId::from_raw(attempt),
+        file,
+    })
+}
+
+/// 这一轮**产出**的文件：一行一个，印 `artifact://files/…` 入口与大小。
+///
+/// **不印正文**：产物多半是二进制或很大的东西，抄进上下文就是把预算花在"再说一遍"上
+/// （§8.3 的老规矩：省略不等于丢失，正文按引用去 `read`）。没有这一句，模型根本不知道
+/// 自己产出了什么——§4.7 要的正是"正文里给出那一条入口"。
+///
+/// 映射不出入口的（`artifacts/` 之外的路径）**跳过**：那不是产物引用，编一个入口出来
+/// 只会让模型去读一个不存在的文件（`artifact_uri` 是这件事唯一的那处映射）。
+fn artifacts(facts: &ToolResultFacts<'_>) -> String {
+    let mut out = String::new();
+    for artifact in facts.artifacts {
+        let Some(uri) = crate::types::artifact_uri(&artifact.path) else {
+            continue;
+        };
+        out.push_str(&format!("产物：{uri}（{}）\n", bytes(artifact.size)));
+    }
     out
 }
 
@@ -219,16 +280,16 @@ mod tests {
             output: &OUTPUT,
             stdout,
             stderr: None,
-            session_root: None,
+            artifacts: &[],
         }
     }
 
     static OUTPUT_PATH: &str = "tool-output/run-1/call-7/attempt-1/output.json";
+    static STDOUT_PATH: &str = "tool-output/run-1/call-7/attempt-1/stdout.txt";
     static OUTPUT: std::sync::LazyLock<OutputRef> =
         std::sync::LazyLock::new(|| OutputRef(reference(OUTPUT_PATH, 64)));
-    static STDOUT: std::sync::LazyLock<ContentRef> = std::sync::LazyLock::new(|| {
-        reference("tool-output/run-1/call-7/attempt-1/stdout.txt", 400)
-    });
+    static STDOUT: std::sync::LazyLock<ContentRef> =
+        std::sync::LazyLock::new(|| reference(STDOUT_PATH, 400));
 
     fn budget(model_result_bytes: usize) -> ProjectionContext {
         ProjectionContext { model_result_bytes }
@@ -251,22 +312,101 @@ mod tests {
         let printed = project(&facts(Some("ab\n"), Some(&STDOUT)), &budget(1024));
         assert!(printed.contains("stdout 400 B"), "{printed}");
         assert!(
-            printed.contains("完整输出：tool-output/run-1/call-7/attempt-1/output.json"),
+            printed.contains("完整输出：artifact://run-1/call-7/attempt-1/result"),
             "{printed}"
         );
-        assert!(printed.contains("stdout.txt / stderr.txt"), "{printed}");
+        assert!(
+            printed.contains("流：artifact://run-1/call-7/attempt-1/stdout"),
+            "{printed}"
+        );
     }
 
+    /// 引用是**入口**，不是路径：它指的正是落盘的那一份 `output.json` / `stdout.txt`。
+    ///
+    /// 从前这里印绝对路径，于是"给模型的这一句"与"允许读哪个逻辑资源"是两句话。现在它们
+    /// 是同一句——`artifact://` 入口由 Session 目录拼出来的那**一份**落盘事实说了算
+    /// （`output_file_path` 是两处共用的那一份拼法）。
     #[test]
-    fn a_session_root_turns_the_reference_into_a_path_the_model_can_read() {
-        let root = PathBuf::from("/home/yi/.komo/sessions/sess-1");
-        let mut facts = facts(Some("head\ntail\n"), Some(&STDOUT));
-        facts.session_root = Some(&root);
+    fn the_reference_names_the_output_that_is_actually_on_disk() {
+        let session_root = PathBuf::from("/home/yi/.komo/sessions/sess-1");
+        let printed = project(&facts(Some("ab\n"), Some(&STDOUT)), &budget(1024));
+
+        for (file, on_disk) in [
+            (OutputFile::Result, OUTPUT_PATH),
+            (OutputFile::Stdout, STDOUT_PATH),
+        ] {
+            let uri = ResourceUri::Output {
+                run: RunId::from_raw("run-1"),
+                call: ToolCallId::from_raw("call-7"),
+                attempt: AttemptId::from_raw("attempt-1"),
+                file,
+            };
+            assert!(printed.contains(&uri.to_string()), "{printed}");
+            assert_eq!(
+                crate::types::resource::output_file_path(&session_root, &uri),
+                Some(session_root.join(on_disk)),
+                "印出来的入口要正好指向落盘的那一份"
+            );
+        }
+    }
+
+    /// 产物：**入口 + 大小**，一行一个；正文不抄进上下文（正文按引用去读）。
+    #[test]
+    fn the_artifacts_of_a_round_are_named_so_the_model_can_read_them() {
+        let report = reference("artifacts/run-1/报告.md", 13);
+        let big = reference("artifacts/run-1/blob.bin", 3 * 1024 * 1024);
+        let odd = reference("payloads/not-an-artifact.json", 4);
+        let artifacts = [report, big, odd];
+
+        let facts = ToolResultFacts {
+            artifacts: &artifacts,
+            ..facts(Some("写完了\n"), None)
+        };
         let printed = project(&facts, &budget(1024));
+        assert!(printed.contains("写完了"), "{printed}");
         assert!(
-            printed.contains("完整输出：/home/yi/.komo/sessions/sess-1/tool-output/run-1/call-7/attempt-1/output.json"),
+            printed.contains("产物：artifact://files/run-1/报告.md（13 B）"),
             "{printed}"
         );
+        assert!(
+            printed.contains("产物：artifact://files/run-1/blob.bin（3.0 MB）"),
+            "{printed}"
+        );
+        assert!(
+            !printed.contains("not-an-artifact"),
+            "映射不出入口的路径不是产物，别编一条：{printed}"
+        );
+        // 产物那条**不受预算影响**：它说的是"这一轮产出了什么"，与正文省了多少无关。
+        assert!(!printed.contains("完整输出："), "{printed}");
+    }
+
+    /// 没有产物时一个字都不多——那段话是给"真的产出了文件"准备的。
+    #[test]
+    fn a_round_without_artifacts_says_nothing_about_them() {
+        let printed = project(&facts(Some("exit=0\n"), None), &budget(1024));
+        assert!(!printed.contains("产物："), "{printed}");
+    }
+
+    /// 认不出来源的引用**不编** URI：那会让模型拿着一个读不回来的东西去试。
+    #[test]
+    fn a_reference_we_cannot_name_as_a_resource_still_names_its_file() {
+        let foreign = OutputRef(reference("payloads/elsewhere.json", 8));
+        let foreign_stdout = reference("payloads/stdout.txt", 400);
+        let facts = ToolResultFacts {
+            output: &foreign,
+            stdout: Some(&foreign_stdout),
+            ..facts(Some("ab\n"), None)
+        };
+        let printed = project(&facts, &budget(1024));
+        assert!(
+            printed.contains("完整输出：payloads/elsewhere.json（相对 Session 目录）"),
+            "{printed}"
+        );
+        assert!(
+            printed.contains("流：payloads/stdout.txt（相对 Session 目录）"),
+            "{printed}"
+        );
+        assert!(!printed.contains("artifact://"), "{printed}");
     }
 
     #[test]
@@ -328,8 +468,24 @@ mod tests {
 
     #[test]
     fn the_same_facts_render_the_same_bytes() {
-        let one = project(&facts(Some("a\nb\n"), Some(&STDOUT)), &budget(64));
-        let two = project(&facts(Some("a\nb\n"), Some(&STDOUT)), &budget(64));
-        assert_eq!(one, two, "投影是纯函数：同一份事实两次投影必须一样");
+        let artifacts = [reference("artifacts/run-1/报告.md", 13)];
+        let one = ToolResultFacts {
+            artifacts: &artifacts,
+            ..facts(Some("a\nb\n"), Some(&STDOUT))
+        };
+        let two = ToolResultFacts {
+            artifacts: &artifacts,
+            ..facts(Some("a\nb\n"), Some(&STDOUT))
+        };
+        let printed = project(&one, &budget(64));
+        assert_eq!(
+            printed,
+            project(&two, &budget(64)),
+            "投影是纯函数：同一份事实两次投影必须一样"
+        );
+        assert!(
+            printed.contains("产物：artifact://files/run-1/报告.md"),
+            "{printed}"
+        );
     }
 }

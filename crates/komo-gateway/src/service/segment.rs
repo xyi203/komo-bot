@@ -32,6 +32,7 @@ use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::memory::MemoryScope;
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::ExecutionPlan;
+use komo_kernel::types::resource::{ResourceMounts, SkillMount};
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
@@ -77,11 +78,11 @@ pub struct GatewaySegments {
     /// Cron Job 的**执行预算**要从 Job 上读（§10：每个 Job 有自己的执行预算）。
     /// `None` = 没接 Cron 这一层，所有 Run 都用全局的 `max_rounds`。
     cron: Option<Arc<dyn komo_kernel::traits::CronRepo>>,
-    /// §5.6 的 skills 目录行。**启动时算一次**，之后只有配置重载会重算——它在一个
-    /// 前缀里，每一段都重扫目录就成了"每次都不一样的前缀"。
+    /// §5.6 那份**活的** skill 注册表。与 Gateway 共享同一个 `Arc`。
     ///
-    /// 与 Gateway 共享同一个 `Arc`：重载时换的是这里面的字符串，不必重建装配层。
-    skills: Option<Arc<std::sync::RwLock<String>>>,
+    /// 提示里的那一块目录行**每次装配现渲染**（[`Self::skills_block`]），`skill://` 的挂载点
+    /// 也从这里抄——两处同一个来源，"提示里看见的名字读不到"就不是一种可能了。
+    skills: Option<Arc<std::sync::RwLock<komo_runtime::skills::SkillRegistry>>>,
     /// 执行器。**只用来渲染交给模型的工具 Schema**（[`ToolExecutor::definitions_for`]）：
     /// 能力面已经由冻结快照（或它的兜底）给出，"这次能用哪些工具"的判据只有那一处，
     /// 这里不该再有一份。`None` = 精简装配（没有执行器的那几个单元测试）。
@@ -150,8 +151,11 @@ impl GatewaySegments {
         self
     }
 
-    /// 接上系统提示里的 skills 目录（§5.6）。
-    pub fn with_skills(mut self, skills: Arc<std::sync::RwLock<String>>) -> Self {
+    /// 接上 §5.6 那份活的 skill 注册表。
+    pub fn with_skills(
+        mut self,
+        skills: Arc<std::sync::RwLock<komo_runtime::skills::SkillRegistry>>,
+    ) -> Self {
         self.skills = Some(skills);
         self
     }
@@ -185,16 +189,30 @@ impl GatewaySegments {
 
     /// 这一段能用哪些根。见 [`run_roots`]。
     fn roots_for(&self, session: &SessionId, cwd: PathBuf) -> Vec<WorkspaceRoot> {
-        run_roots(self.session_files.as_deref(), session, cwd)
+        run_roots(
+            self.session_files.as_deref(),
+            session,
+            cwd,
+            &self.skill_dirs(),
+        )
     }
 
-    /// 现在这一份 skills 目录。没接就是空的——精简装配（测试、`skills` 关掉的部署）
-    /// 不该因为少这一块就少别的。
-    fn skills_prompt(&self) -> String {
+    /// 这次装配要认的那些 skill 根（顺序即注册表的优先级）。
+    fn skill_dirs(&self) -> Vec<PathBuf> {
         self.skills
             .as_ref()
-            .map(|skills| skills.read().expect("skills 目录").clone())
+            .map(|skills| skills.read().expect("skills 注册表").dirs().to_vec())
             .unwrap_or_default()
+    }
+
+    /// 现在这一块 skills 目录行：按注册表现渲染，工具门控按**这一次**拿到的这套工具。
+    /// 没接注册表就是空的——精简装配（测试、`skills` 关掉的部署）不该因为少这一块就少别的。
+    fn skills_block(&self, tools: &[ToolDefinition]) -> String {
+        let Some(skills) = &self.skills else {
+            return String::new();
+        };
+        let names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+        crate::service::state::skills_block(&skills.read().expect("skills 注册表"), &names)
     }
 
     /// 接上记忆这一层。
@@ -354,7 +372,7 @@ impl SegmentSource for GatewaySegments {
         // 那一刻定下来的（见 `GatewayState::freeze_run`），恢复时照用。
         let cwd = identity.workspace.clone();
         let roots = self.roots_for(&session, cwd.clone());
-        // 投影要拿它把引用拼成能直接 `read` 的绝对路径。
+        // `artifact://` 的两处都落在这个会话自己的内容目录里（`artifact://` 只认它）。
         let session_root = self.session_files.as_ref().map(|dir| {
             paths::real_root(
                 komo_store::SessionPaths::new(dir, &session)
@@ -395,13 +413,42 @@ impl SegmentSource for GatewaySegments {
         };
         let prompt = match &delegate {
             Some(spec) => subagent_prompt(&cwd, &tools, spec),
-            None => system_prompt(&cwd, &tools, &self.skills_prompt()),
+            None => system_prompt(&cwd, &tools, &self.skills_block(&tools)),
         };
         // 身份指令是系统提示里**最靠前的那一段**（§4.3），基座提示排在它后面。它从冻结
         // 快照指向的正文读回来（不是重新去读配置文件），所以恢复出来的还是当时那一版。
         let prompt = with_instructions(identity.instructions.as_deref(), prompt);
 
         let agent_surface = identity.surface.clone();
+
+        // 资源命名空间的挂载点（§六）：skill 那一份是**这一次 Run 开始时**的活注册表快照
+        // （提示目录与 `skill://` 因此同一个来源；注册表之后被重载，这一条 Run 仍按它自己
+        // 的那一份，§3），会话根来自这一次的 Session，`tool://` 只读得到这次能力面。
+        let mounts = ResourceMounts {
+            skill_dirs: self.skill_dirs(),
+            skills: self
+                .skills
+                .as_ref()
+                .map(|skills| {
+                    skills
+                        .read()
+                        .expect("skills 注册表")
+                        .list()
+                        .into_iter()
+                        .filter_map(|skill| {
+                            // `Skill.path` 是 SKILL.md 的字面路径；拿不到父目录就跳过这一份。
+                            let dir = skill.path.parent()?.to_path_buf();
+                            Some(SkillMount {
+                                name: skill.name,
+                                dir,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            session_root: session_root.clone(),
+            tools: tools.clone().into(),
+        };
 
         let request = TurnRequest {
             session: session.clone(),
@@ -418,7 +465,6 @@ impl SegmentSource for GatewaySegments {
                 scope,
                 &payloads,
                 self.outputs.as_deref(),
-                session_root.as_deref(),
                 model_result_bytes,
             )
             .await
@@ -440,8 +486,8 @@ impl SegmentSource for GatewaySegments {
             source: record.source.clone(),
             cwd,
             roots,
+            mounts,
             model_result_bytes,
-            session_root: session_root.clone(),
             env_version: None,
             principal: None,
             // 本 Run 是被谁派的（普通 Run 是 None）。runtime 用它硬拦"子代理再委派"。
@@ -885,8 +931,8 @@ enum ReplayScope<'a> {
 ///
 /// 每条工具结果的正文走的是**同一个投影函数**（`komo_kernel::projection`）：刚跑完那次与
 /// 重启之后回放，必须是同一段字节。所以这里要把事实凑齐——工具名从那一轮的调用里找，
-/// 完整正文与流大小从 `output.json` 读回来；读不回来时退回账本里那 1 KiB（那是"我们至少
-/// 还有这些"，不是"本该如此"）。
+/// 完整正文、流大小与产物入口从 `output.json` 读回来；读不回来时退回账本里那 1 KiB（那是
+/// "我们至少还有这些"，不是"本该如此"）。
 ///
 /// 正文超限时是**外置**的（`text` 为 `None`，`text_ref` 指向 `payloads/`）：按引用读回来
 /// 并校验哈希，读不出来就是会话缺内容（§8.3「读取历史或恢复调用时按引用加载」）。
@@ -895,7 +941,6 @@ async fn replay(
     scope: ReplayScope<'_>,
     payloads: &PayloadStore,
     outputs: Option<&dyn ToolOutputStore>,
-    session_root: Option<&std::path::Path>,
     model_result_bytes: usize,
 ) -> Result<Vec<ReplayMessage>, LedgerError> {
     let only = match scope {
@@ -957,6 +1002,12 @@ async fn replay(
                 .and_then(|verified| verified.body.preview.as_deref())
                 .map(str::to_string)
                 .or_else(|| result.preview.clone());
+            // 产物也在 `output.json` 里（事件那一格没有它）：同样只从落盘事实来，所以
+            // "刚跑完"与回放印出的是同一份入口清单。
+            let artifacts: &[komo_kernel::types::refs::ContentRef] = stored
+                .as_ref()
+                .map(|verified| verified.body.artifacts.as_slice())
+                .unwrap_or_default();
             let facts = ToolResultFacts {
                 tool: tool_name(surface, &result.call).unwrap_or("?"),
                 status: result.status,
@@ -965,7 +1016,7 @@ async fn replay(
                 output: &result.output,
                 stdout: result.stdout.as_ref(),
                 stderr: result.stderr.as_ref(),
-                session_root,
+                artifacts,
             };
             tool_results.push(ToolResultForModel {
                 provider_call_id: provider_call_id(surface, &result.call)
@@ -1096,12 +1147,22 @@ fn run_roots(
     sessions_dir: Option<&std::path::Path>,
     session: &SessionId,
     cwd: PathBuf,
+    skill_dirs: &[PathBuf],
 ) -> Vec<WorkspaceRoot> {
     let mut roots = vec![WorkspaceRoot {
         path: cwd,
         writable: true,
         label: "workspace".into(),
     }];
+    // §5.6：skill 目录是**只读根**——模型用 `read` 读 SKILL.md，`skill://` 那条路也要它们
+    // 落在已授权范围里，否则每一次读 skill 都会撞上 `outside-roots` 去问人。
+    for dir in skill_dirs {
+        roots.push(WorkspaceRoot {
+            path: paths::real_root(dir),
+            writable: false,
+            label: "skill".into(),
+        });
+    }
     let Some(sessions_dir) = sessions_dir else {
         return roots;
     };
@@ -1149,8 +1210,8 @@ const RULES: &str = "找代码和文字用 rg 工具；不要用 shell 里的 gr
 
 /// 系统提示的正文：身份 / 工作目录 / 挂着的工具 / §5.6 的 skills 目录 / 三条行为约束。
 ///
-/// `skills` 是 [`crate::service::state::skills_prompt`] 在**启动时**算好的那一块
-/// （§5.6：目录行是启动快照，为的是提示前缀稳定）；没有能露面的 skills 时它是空串。
+/// `skills` 是 [`GatewaySegments::skills_block`] 从**活注册表**现渲染出来的那一块
+/// （§5.6：同一份注册表，`skill://` 的挂载点也抄它）；没有能露面的 skills 时它是空串。
 fn system_prompt(cwd: &std::path::Path, tools: &[ToolDefinition], skills: &str) -> String {
     let names: Vec<&str> = tools.iter().map(|tool| tool.name.as_str()).collect();
     let mut prompt = format!(
@@ -1458,7 +1519,6 @@ mod tests {
             ReplayScope::Conversation(&second),
             &payloads(),
             None,
-            None,
             8 * 1024,
         )
         .await
@@ -1487,6 +1547,94 @@ mod tests {
         }
     }
 
+    /// 产物在**回放那一侧**同样印出来：入口与大小从 `output.json` 读回来（事件里没有那一格），
+    /// 所以"刚跑完"与"重启之后回放"给模型的是同一份入口清单（§4.7、§8.3）。
+    #[tokio::test]
+    async fn a_replayed_round_names_the_artifacts_it_produced() {
+        use komo_kernel::test_support::{MemOutputStore, MemOutputWriter};
+        use komo_kernel::types::ids::AttemptId;
+        use komo_kernel::types::refs::{AttemptRef, ContentRef, ToolResultBody};
+
+        let run = RunId::from_raw("run-1");
+        let call = ToolCallId::from_raw("call-1");
+        let attempt = AttemptId::from_raw("attempt-1");
+        let artifacts = vec![ContentRef {
+            path: "artifacts/run-1/报告.md".into(),
+            size: "产物正文\n".len() as u64,
+            hash: ContentHash::of_str("产物正文\n"),
+            pointer: None,
+        }];
+
+        let outputs = MemOutputStore::new();
+        let writer = MemOutputWriter::new(AttemptRef {
+            session: SessionId::from_raw("sess-1"),
+            run: run.clone(),
+            call: call.clone(),
+            attempt: attempt.clone(),
+        });
+        let published = outputs
+            .publish(
+                Box::new(writer),
+                ToolResultBody {
+                    status: komo_kernel::types::refs::ToolResultStatus::Completed,
+                    result: serde_json::json!({ "ok": true }),
+                    error: None,
+                    exit_code: Some(0),
+                    artifacts,
+                    preview: Some("写完了一份报告\n".into()),
+                },
+            )
+            .await
+            .expect("发布这次尝试的输出");
+
+        let events = vec![
+            accepted(&run, 1, "写一份报告"),
+            started(&run, 2),
+            assistant(&run, 3, None, vec![request(&call)], None),
+            event(
+                4,
+                &run,
+                EventPayload::ToolResult(komo_kernel::events::ToolResult {
+                    call_id: call.clone(),
+                    attempt_id: attempt,
+                    status: komo_kernel::types::refs::ToolResultStatus::Completed,
+                    output_ref: published.output.clone(),
+                    elapsed_ms: published.elapsed_ms,
+                    preview: published.preview.clone(),
+                    stdout: published.stdout.clone(),
+                    stderr: published.stderr.clone(),
+                    attempt_state: None,
+                }),
+            ),
+        ];
+        let surface = fold(&events);
+        let messages = replay(
+            &surface,
+            ReplayScope::Conversation(&run),
+            &payloads(),
+            Some(&outputs),
+            8 * 1024,
+        )
+        .await
+        .expect("读得出来");
+
+        let content = &messages
+            .iter()
+            .flat_map(|message| message.tool_results.iter())
+            .next()
+            .expect("回放里有工具结果")
+            .content;
+        assert!(content.contains("写完了一份报告"), "{content}");
+        assert!(
+            content.contains("产物：artifact://files/run-1/报告.md（13 B）"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("产物正文"),
+            "产物的正文按引用去读，回放也不抄：{content}"
+        );
+    }
+
     /// 正跑着的那条 Run 仍然是**完整协议**：它自己那轮的调用、结果与原生块一个都不能少。
     #[tokio::test]
     async fn the_running_run_keeps_its_whole_protocol() {
@@ -1508,7 +1656,6 @@ mod tests {
             &surface,
             ReplayScope::Conversation(&run),
             &payloads(),
-            None,
             None,
             8 * 1024,
         )
@@ -1550,7 +1697,7 @@ mod tests {
             let surface = &surface;
             let payloads = &payloads;
             async move {
-                replay(surface, scope, payloads, None, None, 8 * 1024)
+                replay(surface, scope, payloads, None, 8 * 1024)
                     .await
                     .expect("读得出来")
                     .into_iter()
@@ -1614,7 +1761,6 @@ mod tests {
             ReplayScope::Conversation(&second),
             &payloads,
             None,
-            None,
             8 * 1024,
         )
         .await
@@ -1649,7 +1795,6 @@ mod tests {
             &surface,
             ReplayScope::Conversation(&run),
             &payloads(),
-            None,
             None,
             8 * 1024,
         )
@@ -1774,20 +1919,31 @@ mod tests {
     }
 
     /// §8.3：这个 Session 自己的输出与产物是**只读**根——模型看到的"完整输出在哪"得真能
-    /// 读进去，而写进去不许命中"范围内写入"那条 Allow。
+    /// 读进去，而写进去不许命中"范围内写入"那条 Allow。§5.6：skill 目录同样是只读根。
     #[test]
-    fn a_run_can_read_its_own_session_output_but_not_write_it() {
+    fn a_run_can_read_its_own_session_output_and_skills_but_not_write_them() {
         let dir = tempfile::tempdir().unwrap();
         let session = SessionId::from_raw("sess-1");
-        let roots = run_roots(Some(dir.path()), &session, PathBuf::from("/tmp/w"));
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let roots = run_roots(
+            Some(dir.path()),
+            &session,
+            PathBuf::from("/tmp/w"),
+            std::slice::from_ref(&skills),
+        );
 
         let labels: Vec<&str> = roots.iter().map(|root| root.label.as_str()).collect();
         assert_eq!(
             labels,
-            vec!["workspace", "session-output", "session-artifacts"],
-            "工作目录可写，Session 自己的两处只读"
+            vec!["workspace", "skill", "session-output", "session-artifacts"],
+            "工作目录可写，skill 与 Session 自己的两处只读"
         );
         assert!(roots[0].writable);
+
+        let skill = roots.iter().find(|root| root.label == "skill").unwrap();
+        assert!(!skill.writable, "skill 目录是只读根（§5.6）");
+        assert_eq!(skill.path, std::fs::canonicalize(&skills).unwrap());
 
         let output = roots
             .iter()
@@ -1806,8 +1962,17 @@ mod tests {
             .unwrap();
         assert!(artifacts.path.ends_with("sess-1/artifacts"));
 
-        // 没接 `sessions/` 的精简装配只有工作目录——不该凭空多出两个根。
-        let bare = run_roots(None, &session, PathBuf::from("/tmp/w"));
-        assert_eq!(bare.len(), 1);
+        // 没接 `sessions/` 的精简装配只有工作目录与 skill 根——不该凭空多出两个根。
+        let bare = run_roots(None, &session, PathBuf::from("/tmp/w"), &[skills]);
+        assert_eq!(
+            bare.iter()
+                .map(|root| root.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspace", "skill"]
+        );
+
+        // 一份 skill 都没接时不多不少——工作目录一条。
+        let none = run_roots(None, &session, PathBuf::from("/tmp/w"), &[]);
+        assert_eq!(none.len(), 1);
     }
 }

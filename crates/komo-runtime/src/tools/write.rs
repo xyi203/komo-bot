@@ -15,6 +15,7 @@ use komo_kernel::types::plan::{
     Verification,
 };
 use komo_kernel::types::refs::ToolResultStatus;
+use komo_kernel::types::resource::TargetRef;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 
@@ -86,7 +87,7 @@ impl Tool for WriteTool {
             args: normalized(&args)?,
             cwd: Some(ctx.cwd.clone()),
             targets: vec![PlanTarget {
-                path,
+                target: TargetRef::local(path),
                 access: TargetAccess::Write,
                 expected_version: args.expected_version.as_ref().map(ExpectedVersion::hash),
             }],
@@ -207,7 +208,8 @@ pub fn verify_content(
 pub fn target_path(plan: &ExecutionPlan) -> Result<PathBuf, ToolError> {
     plan.targets
         .first()
-        .map(|target| target.path.clone())
+        .and_then(|target| target.path())
+        .map(Path::to_path_buf)
         .ok_or_else(|| ToolError::Failed {
             message: "计划里没有目标路径".into(),
         })

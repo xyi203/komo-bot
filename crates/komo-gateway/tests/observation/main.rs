@@ -1,7 +1,8 @@
 //! §8.3 的「工具结果正文」与 `docs/komo_observation.md` 的 M1–M3，端到端两个测试：
 //!
-//! - **投影**：超预算时头尾都留着、写明省了多少，并给出**可直接 `read` 的绝对路径**；
-//! - **恢复**：那条路径真的读得进去——Session 自己的输出是只读根，**不用审批**；
+//! - **投影**：超预算时头尾都留着、写明省了多少，并给出**可直接 `read` 的资源入口**
+//!   （`artifact://<run>/<call>/<attempt>/result`，§4.7）；
+//! - **恢复**：那条入口真的读得进去——Session 自己的输出是只读根，**不用审批**；
 //! - **预算**：`[execution] model_result_bytes` 说了算（§6），不是写死的 1 KiB；
 //! - **一份事实**：同一个 Run 的下一个执行段回放时，渲染出的字节与刚跑完那次**完全相同**。
 //!
@@ -17,6 +18,7 @@ use komo_gateway::service::test_support::harness::{
 };
 use komo_kernel::events::{Event, EventPayload, ToolResult};
 use komo_kernel::traits::LlmClient;
+use komo_kernel::types::resource::{ResourceUri, output_file_path};
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::RoundInput;
 
@@ -82,7 +84,7 @@ fn home_with_a_big_file() -> (Home, std::path::PathBuf) {
 }
 
 #[tokio::test]
-async fn a_big_tool_output_keeps_both_ends_and_the_path_it_points_at_really_reads() {
+async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads() {
     let (home, _file) = home_with_a_big_file();
     let llm = FakeLlm::new(vec![vec![
         call_round(
@@ -113,24 +115,36 @@ async fn a_big_tool_output_keeps_both_ends_and_the_path_it_points_at_really_read
         "被省略的部分不该声称给了：\n{live}"
     );
 
-    // 完整输出的引用是**能直接读的绝对路径**：Session 目录 + 引用里的相对路径。
+    // 完整输出的引用是一条**资源入口**（`artifact://<run>/<call>/<attempt>/result`），它指的
+    // 正是这次落盘的那一份 `output.json`——拼法只有一处（`output_file_path`），两边共用。
     let events = home.events(&session);
     let result = tool_results(&events).pop().expect("有结果");
     let output = home.session_dir(&session).join(result.output_ref.path());
     let readable = std::fs::canonicalize(&output).expect("output.json 真的在");
+    let entry = live
+        .lines()
+        .find_map(|line| line.strip_prefix("完整输出："))
+        .expect("正文里要给出去哪儿读")
+        .split('（')
+        .next()
+        .expect("入口")
+        .to_string();
+    let uri = ResourceUri::parse(&entry).expect("印出来的入口是合法的资源 URI");
     assert!(
-        live.contains(&format!("完整输出：{}", readable.display())),
-        "正文里要给出可以直接 read 的路径：\n{live}"
+        matches!(uri, ResourceUri::Output { .. }),
+        "印出来的该是工具输出那条入口：{entry}"
+    );
+    let pointed = output_file_path(&home.session_dir(&session), &uri).expect("那条入口有路径");
+    assert_eq!(
+        std::fs::canonicalize(&pointed).expect("入口指向的文件真的在"),
+        readable,
+        "印出来的入口要正好指向落盘的那一份"
     );
 
-    // ── 再用同一条路径发起一次 `read`：那条路径真的读得进去，而且**不用审批**（§8.3）。
+    // ── 再用**同一条入口**发起一次 `read`：模型原样交回来就真读得进去，而且**不用审批**
+    // （Session 自己的输出是只读根，§8.3）。
     let llm = FakeLlm::new(vec![vec![
-        call_round(
-            1,
-            "pc-again",
-            "read",
-            serde_json::json!({ "path": readable.display().to_string() }),
-        ),
+        call_round(1, "pc-again", "read", serde_json::json!({ "path": entry })),
         text_round(2, "打开了。"),
     ]]);
     gateway.stop().await;
@@ -146,11 +160,11 @@ async fn a_big_tool_output_keeps_both_ends_and_the_path_it_points_at_really_read
         "读 Session 自己的输出停下来等人了"
     );
 
-    // 省略不等于丢失：模型没看见的那一行，就在那条路径指向的文件里。
+    // 省略不等于丢失：模型没看见的那一行，就在那条入口指向的文件里。
     let on_disk = std::fs::read_to_string(&readable).expect("读 output.json");
     assert!(on_disk.contains("行 300"), "被省略的那一段就在完整输出里");
 
-    // 而模型确实能从那条路径读回来——**而且不用审批**（Session 自己的输出是只读根）。
+    // 而模型确实能从那条入口读回来——**而且不用审批**（Session 自己的输出是只读根）。
     let read_back = fed_back(&llm, "read");
     assert!(
         read_back.contains("\"v\":1"),

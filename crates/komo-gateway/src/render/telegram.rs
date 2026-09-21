@@ -274,7 +274,7 @@ fn plan_action(plan: &ExecutionPlan) -> String {
             TargetAccess::Read => "读",
             TargetAccess::Write => "写",
         };
-        lines.push(format!("{access}: {}", target.path.display()));
+        lines.push(format!("{access}: {}", target.describe()));
     }
     if let Some(code) = &plan.versions.code {
         lines.push(format!("版本 code: {}", code.as_str()));
@@ -472,11 +472,10 @@ mod tests {
             tool_call: None,
             args: serde_json::json!({ "command": "rm -rf /tmp/scratch" }),
             cwd: Some(PathBuf::from("/home/op/work")),
-            targets: vec![PlanTarget {
-                path: PathBuf::from("/tmp/scratch"),
-                access: TargetAccess::Write,
-                expected_version: None,
-            }],
+            targets: vec![PlanTarget::local(
+                PathBuf::from("/tmp/scratch"),
+                TargetAccess::Write,
+            )],
             versions: PlanVersions::default(),
             resources: Vec::new(),
             recovery: RecoveryMode::NoSafeRecovery,

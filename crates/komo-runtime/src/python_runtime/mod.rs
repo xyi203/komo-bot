@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, PythonHost};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::plan::EnvVersion;
-use komo_kernel::types::refs::ToolResultStatus;
+use komo_kernel::types::refs::{ContentRef, ToolResultStatus};
 use komo_kernel::types::tool::{CancelToken, PyError, PythonJob, PythonResult};
 
 use crate::tools::process::{ChildRegistration, ChildSpec, ProcessError, run_child};
@@ -212,16 +212,67 @@ impl PythonHost for PythonRuntime {
         sink: &mut dyn OutputWriter,
         cancel: CancelToken,
     ) -> Result<PythonResult, PyError> {
+        self.run_with(job, None, sink, cancel).await
+    }
+
+    /// §4.7：把**产出目录**交给这次调用。
+    ///
+    /// 目录由调用方从 `ToolContext` 算好（`<会话内容目录>/artifacts/<run>`），这里负责
+    /// 建它（父目录不存在一并建）、以 `KOMO_ARTIFACT_DIR` 交给子进程，并在跑完之后登记
+    /// **这次新出现**的文件。`artifact://files/<run>/<名字>` 读的就是这个位置——不复制
+    /// 第二份，也不把文件挪进 `tool-output`。
+    async fn run_with_artifacts(
+        &self,
+        job: PythonJob,
+        artifacts: Option<&Path>,
+        sink: &mut dyn OutputWriter,
+        cancel: CancelToken,
+    ) -> Result<PythonResult, PyError> {
+        self.run_with(job, artifacts, sink, cancel).await
+    }
+
+    fn env_version(&self) -> EnvVersion {
+        self.env_version.clone()
+    }
+}
+
+impl PythonRuntime {
+    /// [`PythonHost::run`] 与 [`PythonHost::run_with_artifacts`] 的同一份实现：唯一的差别
+    /// 就是有没有产出目录。
+    async fn run_with(
+        &self,
+        job: PythonJob,
+        artifacts: Option<&Path>,
+        sink: &mut dyn OutputWriter,
+        cancel: CancelToken,
+    ) -> Result<PythonResult, PyError> {
         // 结果文件放在一个只属于这次调用的目录里。不用 `tempfile`——它在这个 crate
         // 里只是 dev-dependency（§13.4 的依赖清单）。
         let workspace = ResultDir::create()?;
         let result_path = workspace.path().join("result.json");
+
+        // 产出目录先建好、再记下**跑之前**已经有什么：同一次 Run 里可能有好几个 python
+        // 调用，前面那几次留下的文件不该在这一次的 `artifacts` 里再报一遍。记的是相对
+        // 路径，所以脚本把一个旧文件改了名再写回来也算"新出现"。
+        let before = match artifacts {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).map_err(|error| {
+                    PyError::Failed(format!("准备产物目录 {} 失败：{error}", dir.display()))
+                })?;
+                list_files(dir)?
+            }
+            None => BTreeMap::new(),
+        };
 
         let body = serde_json::to_vec(&job)
             .map_err(|error| PyError::Protocol(format!("作业无法序列化：{error}")))?;
 
         let mut env = base_env(&self.config);
         env.insert("KOMO_RESULT_PATH".into(), result_path.display().to_string());
+        // 产出目录的**名字**留在 runtime 这一层（kernel 只传"产出目录在哪"）。
+        if let Some(dir) = artifacts {
+            env.insert("KOMO_ARTIFACT_DIR".into(), dir.display().to_string());
+        }
         // 凭证在**这一刻**解析，跟着这一个子进程走（§5.3）。
         let (credentials, missing) = credential_env(&self.config, &job);
         if !missing.is_empty() {
@@ -274,20 +325,103 @@ impl PythonHost for PythonRuntime {
         let reported: DriverResult = serde_json::from_str(&raw)
             .map_err(|error| PyError::Protocol(format!("结果文件读不动：{error}")))?;
 
+        // 跑完才登记：失败的结果也可能留下了文件（脚本先写再抛），不替它判断哪一次
+        // "算数"——**目录里新出现的东西就是这次产生的**。
+        let produced = match artifacts {
+            Some(dir) => new_artifacts(dir, &before)?,
+            None => Vec::new(),
+        };
+
         Ok(PythonResult {
             status: reported.status,
             result: reported.result,
             error: reported.error,
-            artifacts: vec![],
+            artifacts: produced,
             // 预览要用（`python` 工具的 `preview`）：脚本只 print 时，模型至少看得到尾巴。
             stdout_tail: outcome.stdout_tail,
             env_version: self.env_version.clone(),
         })
     }
+}
 
-    fn env_version(&self) -> EnvVersion {
-        self.env_version.clone()
+/// 跑完之后，把产出目录里**新出现**的文件登记成产物引用（§4.7）。
+///
+/// 引用的 `path` 相对**会话目录**（`artifacts/<run>/<…>`，§8.3 的约定），所以正文里给出的
+/// `artifact://files/<run>/<名字>` 与它对得上：读的正是这个位置，不复制第二份。
+fn new_artifacts(dir: &Path, before: &BTreeMap<PathBuf, u64>) -> Result<Vec<ContentRef>, PyError> {
+    let after = list_files(dir)?;
+    let mut produced = Vec::new();
+    for (relative, size) in &after {
+        if before.contains_key(relative) {
+            continue;
+        }
+        let bytes = std::fs::read(dir.join(relative)).map_err(|error| {
+            PyError::Failed(format!(
+                "读产物 {} 失败：{error}",
+                dir.join(relative).display()
+            ))
+        })?;
+        produced.push(ContentRef {
+            // 目录的最后一段就是 Run 号：`artifact://files/<run>/<…>` 里的 `<run>`。
+            path: Path::new("artifacts")
+                .join(run_id_of(dir))
+                .join(relative)
+                .to_string_lossy()
+                .into_owned(),
+            size: *size,
+            hash: ContentHash::of_bytes(&bytes),
+            pointer: None,
+        });
     }
+    Ok(produced)
+}
+
+/// 产出目录的最后一段（Run 号）。
+fn run_id_of(dir: &Path) -> String {
+    dir.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// 产出目录里的所有普通文件：相对路径 → 字节数，递归。
+fn list_files(dir: &Path) -> Result<BTreeMap<PathBuf, u64>, PyError> {
+    let mut files = BTreeMap::new();
+    collect_files(dir, Path::new(""), &mut files)?;
+    Ok(files)
+}
+
+fn collect_files(
+    base: &Path,
+    relative: &Path,
+    files: &mut BTreeMap<PathBuf, u64>,
+) -> Result<(), PyError> {
+    let entries = match std::fs::read_dir(base.join(relative)) {
+        Ok(entries) => entries,
+        // 目录还不存在（第一次调用）——空的就对了，不是错误。
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(PyError::Failed(format!(
+                "列产物目录 {} 失败：{error}",
+                base.join(relative).display()
+            )));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| PyError::Failed(format!("读产物目录项失败：{error}")))?;
+        let child = relative.join(entry.file_name());
+        let metadata = entry.metadata().map_err(|error| {
+            PyError::Failed(format!(
+                "读 {} 的元信息失败：{error}",
+                entry.path().display()
+            ))
+        })?;
+        if metadata.is_dir() {
+            collect_files(base, &child, files)?;
+        } else if metadata.is_file() {
+            files.insert(child, metadata.len());
+        }
+    }
+    Ok(())
 }
 
 /// 一次调用专用的结果目录，走完就删。
@@ -443,6 +577,73 @@ mod tests {
             .unwrap();
         assert_eq!(outcome.status, ToolResultStatus::Completed);
         assert_eq!(outcome.result, serde_json::json!(2));
+    }
+
+    /// 产物（§4.7）：子进程往 `KOMO_ARTIFACT_DIR` 写的每个文件都被登记，引用路径相对
+    /// **会话目录**（`artifacts/<run>/<…>`）；而同一次 Run 的第二个调用**只登记这一次
+    /// 新出现的**——前面那个调用留下的文件不该再报一遍。
+    #[tokio::test]
+    async fn files_written_to_the_artifact_dir_are_registered_once() {
+        if !have_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let artifacts = dir.path().join("sessions/s1/artifacts/run-1");
+        let mut sink = writer();
+        let first = host(dir.path())
+            .run_with_artifacts(
+                PythonJob::Code {
+                    code: "import os, pathlib\n\
+                           p = pathlib.Path(os.environ['KOMO_ARTIFACT_DIR'])\n\
+                           (p / 'report.md').write_text('报表', encoding='utf-8')\n\
+                           (p / 'sub').mkdir()\n\
+                           (p / 'sub' / 'deep.txt').write_text('x')\n\
+                           result = p.name"
+                        .into(),
+                },
+                Some(&artifacts),
+                &mut sink,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.result,
+            serde_json::json!("run-1"),
+            "KOMO_ARTIFACT_DIR 指向的是 <会话目录>/artifacts/<run>"
+        );
+        let paths: Vec<&str> = first.artifacts.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["artifacts/run-1/report.md", "artifacts/run-1/sub/deep.txt"],
+            "子目录也要递归登记"
+        );
+        let report = first
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path.ends_with("report.md"))
+            .expect("报告登记了");
+        assert_eq!(report.size, "报表".len() as u64);
+        assert_eq!(report.hash, ContentHash::of_str("报表"));
+
+        // 第二次调用：只有这次新写的那一个进 `artifacts`。
+        let mut sink = writer();
+        let second = host(dir.path())
+            .run_with_artifacts(
+                PythonJob::Code {
+                    code: "import os, pathlib\n\
+                           pathlib.Path(os.environ['KOMO_ARTIFACT_DIR'], 'second.txt').write_text('y')\n\
+                           result = 1"
+                        .into(),
+                },
+                Some(&artifacts),
+                &mut sink,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        let paths: Vec<&str> = second.artifacts.iter().map(|a| a.path.as_str()).collect();
+        assert_eq!(paths, vec!["artifacts/run-1/second.txt"]);
     }
 
     #[tokio::test]

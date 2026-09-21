@@ -57,6 +57,19 @@ impl RuleTable {
                         ..Default::default()
                     },
                 ),
+                // 第 1 行（虚拟入口那一半）：读这次的**工具说明与 schema**（`tool://`，§六）
+                // → Allow。虚拟入口没有磁盘目标，"落在哪个根里"对它不成立；真正管住它的是
+                // 计划那一刻的能力面检查：不在这次面上的工具根本进不了计划。
+                rule(
+                    "read-virtual-resource",
+                    Effect::Allow,
+                    "读取这次能力面里的工具说明与 schema（tool://）",
+                    Matcher {
+                        operations: Some(vec![OperationMatch::ReadFile]),
+                        paths: Some(PathMatch::Virtual),
+                        ..Default::default()
+                    },
+                ),
                 // 第 1 行：已授权范围内读取普通文件 → Allow。
                 rule(
                     "read-within-roots",
@@ -272,11 +285,7 @@ mod tests {
     }
 
     fn target(path: &str, access: TargetAccess) -> PlanTarget {
-        PlanTarget {
-            path: PathBuf::from(path),
-            access,
-            expected_version: None,
-        }
+        PlanTarget::local(path, access)
     }
 
     // ---- §7.1「操作 → 初始策略建议」逐行 ----

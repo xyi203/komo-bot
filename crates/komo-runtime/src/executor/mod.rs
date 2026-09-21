@@ -57,6 +57,7 @@ use komo_kernel::types::plan::{
     RecoveryMode, Verification,
 };
 use komo_kernel::types::refs::{AttemptRef, ToolResultBody, ToolResultStatus};
+use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::status::{RunEnd, ToolCallState};
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{
@@ -143,15 +144,13 @@ pub struct CallEnv {
     pub surface: AgentSurface,
     pub cwd: PathBuf,
     pub roots: Vec<WorkspaceRoot>,
+    /// 资源命名空间的挂载点（§六）：由 Gateway 装配（skill 根、会话内容目录、能力面）。
+    ///
+    /// 装配早于执行，解析在实际读到它的时候做（`tools::resources`）。
+    pub mounts: ResourceMounts,
     /// 交给模型的工具结果正文上限（§6）。**由 Gateway 按当前配置快照填**：配置热重载
     /// 对新 Run 立刻生效，所以它不在执行器里，而在每一次执行的环境里（§3）。
     pub model_result_bytes: usize,
-    /// 这个 Session 的**内容目录**（`<sessions>/<session>`）。
-    ///
-    /// 只为一件事：把工具结果投影给模型时，把引用里的 Session 相对路径拼成**模型能直接
-    /// `read` 的绝对路径**（§8.3「超限时提供截断提示和可读取的完整文件引用」）。它自己不
-    /// 是一个可用根——能以工具身份访问的是 [`Self::roots`] 里那两个只读根。
-    pub session_root: Option<PathBuf>,
     pub env_version: Option<EnvVersion>,
     pub principal: Option<Principal>,
     pub cancel: CancelToken,
@@ -661,8 +660,11 @@ impl ToolExecutor {
         let status = body.status;
         // 工具写给模型看的那段正文：随结果一起落进 `output.json`，事件里只留它的前 1 KiB。
         let text = body.preview.clone();
+        // 这一次产出的文件（`output.json` 里那一格）：投影要拿它给模型印 `artifact://files/…`
+        // 的入口。**借出去之后再 publish**，所以这里留一份（几个引用，不是正文）。
+        let artifacts = body.artifacts.clone();
         // §48 的 `artifact_bytes`：这次尝试额外产生的产物。
-        let artifact_bytes: u64 = body.artifacts.iter().map(|artifact| artifact.size).sum();
+        let artifact_bytes: u64 = artifacts.iter().map(|artifact| artifact.size).sum();
         let mut published = self.outputs.publish(writer, body).await?;
         published.elapsed_ms = elapsed_ms;
         self.ledger.finish_call(&attempt, published.clone()).await?;
@@ -675,7 +677,7 @@ impl ToolExecutor {
             output: &published.output,
             stdout: published.stdout.as_ref(),
             stderr: published.stderr.as_ref(),
-            session_root: env.session_root.as_deref(),
+            artifacts: &artifacts,
         };
         let content = project(
             &facts,
@@ -1191,6 +1193,7 @@ impl ToolExecutor {
             source: env.source.clone(),
             cwd: env.cwd.clone(),
             roots: env.roots.clone(),
+            mounts: env.mounts.clone(),
             env_version: env.env_version.clone(),
             resumed: request.resumed.clone(),
             cancel: env.cancel.clone(),
@@ -1333,7 +1336,7 @@ fn is_recall(plan: &ExecutionPlan, env: &CallEnv) -> bool {
     if !plan.operation.is_read_only() {
         return false;
     }
-    let Some(root) = env.session_root.as_deref() else {
+    let Some(root) = env.mounts.session_root.as_deref() else {
         return false;
     };
     plan.paths().any(|path| {

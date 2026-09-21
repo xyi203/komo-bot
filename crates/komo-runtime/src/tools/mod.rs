@@ -13,6 +13,7 @@ pub mod paths;
 pub mod process;
 pub mod python;
 pub mod read;
+pub mod resources;
 pub mod rg;
 pub mod shell;
 pub mod write;
@@ -178,6 +179,7 @@ pub(crate) mod test_support {
                 session: SessionId::from_raw("sess-1"),
             },
             cwd: real.clone(),
+            mounts: Default::default(),
             roots: vec![WorkspaceRoot {
                 path: real,
                 writable: true,

@@ -3,13 +3,15 @@
 //! 计划由工具的 `prepare` 填写，模型参数不能指定 `recovery`，也不能指定任何版本
 //! 字段。`plan_hash` 是计划的规范化哈希，审批绑定的就是它。
 
-use std::path::PathBuf;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::delegate::DelegateSpec;
 use super::digest::ContentHash;
 use super::ids::{ApprovalId, GrantId, OperationId, RunId, SessionId, ToolCallId};
+use super::resource::{ResourceUri, TargetRef};
 
 /// 计划的规范化哈希。审批、授权与恢复都按它核对。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -125,15 +127,78 @@ impl Operation {
     }
 }
 
-/// 计划触及的一个真实目标（已解析符号链接后的路径）。
+/// 计划触及的一个目标（§六）：**本地路径，或者一个资源 URI**。
+///
+/// 两种目标在计划里带着不同的东西：本地路径只有路径；资源入口带着**逻辑** URI（审批与
+/// 审计回答的是"允许读哪个逻辑资源"）与解析出来的**真实**目标（规则匹配看它）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanTarget {
-    /// 真实路径。规则的路径匹配只看这里，不看模型给的原始参数。
-    pub path: PathBuf,
+    /// 目标本身。**序列化上扁平**：本地路径那条仍然是 `{"path": "…"}`，与旧行逐字
+    /// 兼容——旧审批计划按原哈希校验，不会因为多了资源这一维就失效（§八）。
+    #[serde(flatten)]
+    pub target: TargetRef,
     pub access: TargetAccess,
     /// 覆盖现有文件时的预期版本（§4：`write` / `edit` 的版本检查）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<ContentHash>,
+}
+
+impl PlanTarget {
+    /// 一个本地路径目标（已解析符号链接的真实路径）。
+    pub fn local(path: impl Into<PathBuf>, access: TargetAccess) -> Self {
+        Self {
+            target: TargetRef::local(path),
+            access,
+            expected_version: None,
+        }
+    }
+
+    /// 一个资源目标：逻辑 URI + 计划那一刻解析出来的真实目标。
+    pub fn resource(uri: ResourceUri, resolved: Option<PathBuf>, access: TargetAccess) -> Self {
+        Self {
+            target: TargetRef::resource(uri, resolved),
+            access,
+            expected_version: None,
+        }
+    }
+
+    /// 解析出来的真实目标——**规则的路径匹配只看这里**，不看模型给的原始参数。
+    ///
+    /// 虚拟入口（`tool://`）没有磁盘目标，返回 `None`。
+    pub fn path(&self) -> Option<&Path> {
+        self.target.path()
+    }
+
+    /// 逻辑资源入口（本地路径没有）。
+    pub fn uri(&self) -> Option<&ResourceUri> {
+        self.target.uri()
+    }
+
+    /// 没有磁盘目标的那一类。
+    pub fn is_virtual(&self) -> bool {
+        self.target.is_virtual()
+    }
+}
+
+impl fmt::Display for PlanTarget {
+    /// 审批与日志用同一份拼法：资源印**逻辑** URI，本地印路径。
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.target)
+    }
+}
+
+impl PlanTarget {
+    /// 审批那一行：资源印逻辑 URI（有真实目标就跟在后面——"允许读哪个逻辑资源"与
+    /// "实际读的是哪个文件"是两件事，审批人要同时看到），本地路径照旧。
+    pub fn describe(&self) -> String {
+        if self.uri().is_none() {
+            return self.to_string();
+        }
+        match self.path() {
+            Some(path) => format!("{}（{}）", self, path.display()),
+            None => self.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -236,9 +301,9 @@ impl ExecutionPlan {
         PlanHash(hash)
     }
 
-    /// 计划触及的真实路径。
+    /// 计划触及的真实路径（虚拟入口没有路径，不在其中）。
     pub fn paths(&self) -> impl Iterator<Item = &std::path::Path> {
-        self.targets.iter().map(|t| t.path.as_path())
+        self.targets.iter().filter_map(|target| target.path())
     }
 }
 
@@ -424,11 +489,7 @@ mod tests {
             tool_call: Some(ToolCallId::from_raw("call-7")),
             args: serde_json::json!({"path": "a.txt", "content": "hi"}),
             cwd: Some(PathBuf::from("/tmp/ws")),
-            targets: vec![PlanTarget {
-                path: PathBuf::from("/tmp/ws/a.txt"),
-                access: TargetAccess::Write,
-                expected_version: None,
-            }],
+            targets: vec![PlanTarget::local("/tmp/ws/a.txt", TargetAccess::Write)],
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: RecoveryMode::VerifyTarget,
@@ -463,7 +524,7 @@ mod tests {
     fn changing_the_real_target_path_changes_the_hash() {
         let a = plan();
         let mut b = plan();
-        b.targets[0].path = PathBuf::from("/etc/passwd");
+        b.targets[0].target = TargetRef::local("/etc/passwd");
         assert_ne!(a.plan_hash(), b.plan_hash());
     }
 

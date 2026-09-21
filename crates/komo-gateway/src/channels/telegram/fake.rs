@@ -388,11 +388,7 @@ pub fn plan() -> ExecutionPlan {
         tool_call: None,
         args: json!({ "command": "rm -rf /tmp/scratch" }),
         cwd: Some(std::path::PathBuf::from("/home/op/work")),
-        targets: vec![PlanTarget {
-            path: std::path::PathBuf::from("/tmp/scratch"),
-            access: TargetAccess::Write,
-            expected_version: None,
-        }],
+        targets: vec![PlanTarget::local("/tmp/scratch", TargetAccess::Write)],
         versions: PlanVersions::default(),
         resources: Vec::new(),
         recovery: RecoveryMode::NoSafeRecovery,

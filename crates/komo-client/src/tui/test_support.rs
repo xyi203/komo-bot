@@ -189,11 +189,10 @@ pub fn plan() -> ExecutionPlan {
         tool_call: Some(call()),
         args: serde_json::json!({ "command": "rm -rf build" }),
         cwd: Some("/home/u/project".into()),
-        targets: vec![PlanTarget {
-            path: "/home/u/project/build".into(),
-            access: TargetAccess::Write,
-            expected_version: None,
-        }],
+        targets: vec![PlanTarget::local(
+            "/home/u/project/build",
+            TargetAccess::Write,
+        )],
         versions: PlanVersions {
             code: Some(ContentHash::of_str("rm -rf build")),
             module: None,

@@ -281,7 +281,7 @@ pub fn plan_lines(plan: &ExecutionPlan) -> Vec<Line<'static>> {
             let mut spans = vec![
                 Span::raw("    "),
                 Span::styled(access.to_string(), Style::default().fg(Color::Magenta)),
-                Span::raw(format!(" {}", target.path.display())),
+                Span::raw(format!(" {}", target.describe())),
             ];
             if let Some(version) = &target.expected_version {
                 spans.push(Span::styled(

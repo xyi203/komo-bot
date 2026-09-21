@@ -14,6 +14,8 @@
 //! 接缝上一律 `Arc<dyn Trait>` / `Box<dyn Trait>`，异步 trait 用 `async_trait`——对象
 //! 安全，一次堆分配相对模型往返可忽略。
 
+use std::path::Path;
+
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
@@ -637,6 +639,27 @@ pub trait PythonHost: Send + Sync {
         sink: &mut dyn OutputWriter,
         cancel: CancelToken,
     ) -> Result<PythonResult, PyError>;
+
+    /// 跑一次 Python，并把**产出目录**告诉它（§4.7）。
+    ///
+    /// 子进程往这个目录里写的文件会被登记成这次调用的产物，之后以
+    /// `artifact://files/<run>/<名字>` 读回来——目录本身由宿主建（父目录不存在一并建）。
+    ///
+    /// `artifacts` 是**已经算好**的那一个路径（`<会话内容目录>/artifacts/<run>`）：`host`
+    /// 看不到这次执行的上下文，路径由调用方从 `ToolContext` 取。它是环境变量名
+    /// （`KOMO_ARTIFACT_DIR`）之外的概念——kernel 只传"产出目录在哪"，命名留给 runtime。
+    ///
+    /// 默认实现忽略产出目录、转调 [`Self::run`]：没有产物概念的宿主（测试替身）因此不用改。
+    async fn run_with_artifacts(
+        &self,
+        job: PythonJob,
+        artifacts: Option<&Path>,
+        sink: &mut dyn OutputWriter,
+        cancel: CancelToken,
+    ) -> Result<PythonResult, PyError> {
+        let _ = artifacts;
+        self.run(job, sink, cancel).await
+    }
 
     fn env_version(&self) -> crate::types::plan::EnvVersion;
 }

@@ -221,6 +221,7 @@ impl Harness {
             source: env.source,
             cwd: env.cwd,
             roots: env.roots,
+            mounts: env.mounts,
             env_version: None,
             resumed: None,
             cancel: CancelToken::new(),
@@ -245,13 +246,12 @@ impl Harness {
                 self.surface.lock().expect("能力面").clone(),
             ),
             cwd: root.clone(),
+            mounts: komo_kernel::types::resource::ResourceMounts::default(),
             roots: vec![WorkspaceRoot {
                 path: root,
                 writable: true,
                 label: "workspace".into(),
             }],
-            // 测试里没有 Session 目录：投影会退回"相对 Session 目录"那种说法。
-            session_root: None,
             // 测试默认用同一个默认预算；要更小/更大的自己改这一格。
             model_result_bytes: komo_kernel::projection::DEFAULT_MODEL_RESULT_BYTES,
             env_version: None,

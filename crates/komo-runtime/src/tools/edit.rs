@@ -20,6 +20,7 @@ use komo_kernel::types::plan::{
     Verification,
 };
 use komo_kernel::types::refs::ToolResultStatus;
+use komo_kernel::types::resource::TargetRef;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 
@@ -121,7 +122,7 @@ impl Tool for EditTool {
             args: normalized(&args)?,
             cwd: Some(ctx.cwd.clone()),
             targets: vec![PlanTarget {
-                path,
+                target: TargetRef::local(path),
                 access: TargetAccess::Write,
                 // 明确给了就按它；没给就按 prepare 这一刻看到的那份内容。
                 expected_version: args

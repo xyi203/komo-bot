@@ -100,6 +100,14 @@ async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) {
     // §5.6 的目录行是启动快照，重载是唯一会动它的时刻：`paths.skill_dirs` 改了、
     // 或者人刚 `komo skills disable` 过，新的一段系统提示就该按新的来。
     state.refresh_skills_prompt();
+    // §9.4 的判断后端同理：`[typesafe]`（端点 / 模型 / 开关）或 `memory.retrieval.rerank`
+    // 一改，下一次召回就按新的来——"改了没反应"在这两个键上和在 `policy.toml` 上一样坏。
+    if changed.iter().any(|key| {
+        let key = key.as_str();
+        key.starts_with("typesafe") || key.starts_with("memory.retrieval")
+    }) {
+        state.refresh_reranker();
+    }
     for platform in [
         ChannelPlatform::Feishu,
         ChannelPlatform::Telegram,

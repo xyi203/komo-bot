@@ -38,6 +38,9 @@ dimensions = 4
     };
     format!(
         r#"
+default_agent = "assistant"
+
+[agents.assistant]
 [model.main]
 type = "completion"
 api_backend = "responses"
@@ -67,6 +70,16 @@ candidate_limit = 40
 top_k = 8
 max_tokens = 1500
 "#
+    )
+}
+
+/// 两个 Agent 各自带 `memory_scope`（§9.2）：默认那个不限作用域，`coder` 只看
+/// `project:acme`。从 [`memory_config`] 派生，好让它跟着那一份一起变（模型、检索参数
+/// 是同一套）。
+pub fn scoped_memory_config() -> String {
+    memory_config("keyword", false).replace(
+        "[agents.assistant]",
+        "[agents.assistant]\n\n[agents.coder]\nmemory_scope = \"project:acme\"",
     )
 }
 

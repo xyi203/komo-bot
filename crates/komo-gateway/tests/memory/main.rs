@@ -57,13 +57,34 @@ pub fn text_round(round: u32, text: &str) -> Round {
 
 /// 直接写进库的一条记忆（测检索与治理时不必先跑一遍提取）。
 pub fn seeded(id: &str, content: &str, provenance: Provenance, state: MemoryState) -> MemoryItem {
+    scoped_with(id, content, provenance, state, MemoryScope::Personal)
+}
+
+/// 同上，但指定作用域（§9.2 的那个过滤器：多 Agent 各自只看自己那一份）。
+pub fn scoped(id: &str, content: &str, scope: MemoryScope) -> MemoryItem {
+    scoped_with(
+        id,
+        content,
+        Provenance::UserStatement,
+        MemoryState::Active,
+        scope,
+    )
+}
+
+fn scoped_with(
+    id: &str,
+    content: &str,
+    provenance: Provenance,
+    state: MemoryState,
+    scope: MemoryScope,
+) -> MemoryItem {
     let now = OffsetDateTime::now_utc();
     MemoryItem {
         id: MemoryId::from_raw(id),
         revision: 1,
         content: content.into(),
         kind: MemoryKind::Preference,
-        scope: MemoryScope::Personal,
+        scope,
         provenance,
         confirmation: Confirmation::Unconfirmed,
         state,

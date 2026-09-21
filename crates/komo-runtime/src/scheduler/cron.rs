@@ -344,6 +344,10 @@ impl CronScheduler {
                 workdir: job.workdir.clone(),
                 // 定时 Job 不是子代理：没有父 Run，也没有结果契约。
                 delegate: None,
+                // Cron 是**没有归属的入口**（§四）：它的身份按当前配置的默认 Agent 在装配
+                // 那一步兜底（`service::segment`）。这里不编一份——`CronScheduler` 手里只有
+                // 队列与模型，没有工具目录、没有工作目录解析、也没有配置快照。
+                snapshot: None,
                 at: now,
             })
             .await?;

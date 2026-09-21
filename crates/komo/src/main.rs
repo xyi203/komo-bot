@@ -669,6 +669,9 @@ async fn gateway(
                 channels: komo_gateway::channels::factories(),
                 llm: None,
                 embeddings: None,
+                // 生产上用当前用户的家目录：`~/.agents/skills` 是与其他本地 agent 共享的
+                // 那一份（§5.6）。
+                shared_home: None,
             })
             .await
             .map_err(|error| error.to_string())?;
@@ -691,18 +694,27 @@ async fn gateway(
                 let health = client.health().await.map_err(|error| error.to_string())?;
                 let managed = units::status().unwrap_or_else(|error| format!("（{error}）"));
                 Ok(Some(format!(
-                    "在跑：{}（实例 {}，启动于 {}）\n服务管理器：{}",
+                    "在跑：{}（实例 {}，启动于 {}）\n服务管理器：{}{}",
                     client.base_url(),
                     health.instance_id,
                     health.started_at,
-                    managed.trim()
+                    managed.trim(),
+                    // 单元名是全局的：**单元在服务哪个数据目录**与"这个命令连的是哪一个"
+                    // 是两件事，不一致时正是出事时的样子（见 `units::owns_unit`）。
+                    units::installed_home(&connect::user_home())
+                        .map(|installed| if units::same_home(&installed, home) {
+                            format!("（单元服务 {}）", installed.display())
+                        } else {
+                            format!("（单元服务 {}，**不是**这个数据目录）", installed.display())
+                        })
+                        .unwrap_or_else(|| "（还没装单元）".to_string())
                 )))
             }
             // **不隐式启动服务**（§3）。
             Err(error) => Ok(Some(format!("没在跑：{error}"))),
         },
         Some(GatewayCommand::Stop) => {
-            units::stop().map_err(|error| error.to_string())?;
+            units::stop(&connect::user_home(), home).map_err(|error| error.to_string())?;
             Ok(Some("已请服务管理器停止 Gateway".into()))
         }
         Some(GatewayCommand::Restart) => {

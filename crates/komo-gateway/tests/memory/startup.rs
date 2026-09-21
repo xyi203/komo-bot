@@ -30,6 +30,9 @@ async fn a_silent_endpoint() -> u16 {
 fn config_pointing_at(port: u16) -> String {
     format!(
         r#"
+default_agent = "assistant"
+
+[agents.assistant]
 [model.main]
 type = "completion"
 api_backend = "responses"

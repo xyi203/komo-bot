@@ -31,11 +31,14 @@ pub mod cancel;
 #[cfg(test)]
 pub mod harness;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 
 use komo_kernel::policy::PolicyDecision;
@@ -50,11 +53,12 @@ use komo_kernel::types::delegate::{
 use komo_kernel::types::ids::{ApprovalId, AttemptId, RequestKey, RunId, SessionId, ToolCallId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::{
-    ApprovedPlan, ConsumeIntent, EnvVersion, ExecutionPlan, Operation, PlanSource, RecoveryMode,
-    Verification,
+    ApprovedPlan, ConsumeIntent, EnvVersion, ExecutionPlan, Operation, PlanSource, Proof,
+    RecoveryMode, Verification,
 };
 use komo_kernel::types::refs::{AttemptRef, ToolResultBody, ToolResultStatus};
 use komo_kernel::types::status::{RunEnd, ToolCallState};
+use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{
     CancelToken, ResumedCall, ToolContext, ToolError, ToolOutput, WorkspaceRoot,
 };
@@ -73,12 +77,18 @@ use self::cancel::race;
 pub struct ExecutionLimits {
     /// 单次调用的活动执行时限。工具自己的超时可以更短，不能更长。
     pub call_timeout: Duration,
+    /// 同一轮里最多几条**只读**调用同时在飞（§6）。
+    ///
+    /// 它是并发度上限，不是正确性开关：写、审批、取消照样是屏障，唯一放开的是"两条读取
+    /// 之间不必互相等"。1 = 退回一条一条跑。
+    pub max_parallel_reads: usize,
 }
 
 impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
             call_timeout: Duration::from_secs(300),
+            max_parallel_reads: 4,
         }
     }
 }
@@ -125,6 +135,12 @@ pub struct CallEnv {
     pub session: SessionId,
     pub run: RunId,
     pub source: PlanSource,
+    /// **这次运行允许调用哪些工具**（§4 末）。
+    ///
+    /// 与交给模型的 schema 是同一份：装配时由 schema 反推（`GatewaySegments::segment`），
+    /// 所以"模型看见的"与"执行器认的"不可能分家。执行器不回退到全局工具目录——模型自己
+    /// 拼出一个没露面的名字，得到的是"这次运行的工具集里没有它"。
+    pub surface: AgentSurface,
     pub cwd: PathBuf,
     pub roots: Vec<WorkspaceRoot>,
     /// 交给模型的工具结果正文上限（§6）。**由 Gateway 按当前配置快照填**：配置热重载
@@ -287,46 +303,148 @@ impl ToolExecutor {
         self
     }
 
-    /// 交给模型的工具 Schema。
-    pub fn definitions(&self) -> Vec<komo_kernel::types::tool::ToolDefinition> {
+    /// 全局工具目录：**发现与构造**用它（`komo skills` 的 `requires_tools` 门控也问它）。
+    ///
+    /// 它**不是**执行时查找的表——执行看的是 [`CallEnv::surface`]。这两件事分开正是为了
+    /// 让"目录里有"不等于"这次能用"（§4 末）。
+    pub fn catalog(&self) -> Vec<komo_kernel::types::tool::ToolDefinition> {
         self.tools.values().map(|tool| tool.definition()).collect()
     }
 
-    /// **首版顺序执行同一轮的多个调用**，减少文件操作顺序歧义（§6）。
+    /// 交给模型的工具 Schema：**按能力面的顺序**、只列能力面里真的装着的那些。
+    ///
+    /// 名字在能力面里却没有实现，是装配错误（目录与能力面不同源），这里跳过并在日志里
+    /// 说一声——把没有 schema 的工具交给模型没有意义，而静默地补一条假 schema 更坏。
+    pub fn definitions_for(
+        &self,
+        surface: &AgentSurface,
+    ) -> Vec<komo_kernel::types::tool::ToolDefinition> {
+        surface
+            .names()
+            .iter()
+            .filter_map(|name| match self.tools.get(name) {
+                Some(tool) => Some(tool.definition()),
+                None => {
+                    tracing::warn!(tool = %name, "能力面里的工具没有实现，跳过它的 schema");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// 一轮里每个调用的调度（§4 末、§6）。
+    ///
+    /// **只读的调用可以和同一轮里后面的调用同时在飞**：够格的是 `Operation::ReadFile`
+    /// 这一类计划（`read` / `rg`）里没有"上一世"要接的那条（详见
+    /// [`Authorized::parallel_with_siblings`]）。其余一切（`write` / `edit` / `shell` /
+    /// `python` / `delegate`，以及任何要停下来的判定）都是**屏障**：屏障之前已经在飞的
+    /// 先收尾，再按调用顺序做它。
+    ///
+    /// 三条不变量不因为并发而改变：
+    ///
+    /// - `start_call` 返回之后才允许产生副作用（§8.5）——在飞的每一路各自遵守；
+    /// - 遇到审批先收已启动调用的尾，而且**审批行在收尾之后才落**：它要是比 Run 的
+    ///   挂起早一整个批次出现，答复就可能落进"Run 还没停下"的空窗（§7.4）；
+    /// - 完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
     pub async fn execute_round(
         &self,
         calls: Vec<CallRequest>,
         env: &CallEnv,
     ) -> Result<RoundOutcome, ExecError> {
-        let mut outcome = RoundOutcome::default();
-        let mut queue = calls.into_iter();
+        let mut queue: VecDeque<(usize, CallRequest)> = calls.into_iter().enumerate().collect();
+        let mut in_flight: InFlight<'_> = FuturesUnordered::new();
+        let mut settled: Vec<(usize, ToolResultForModel)> = Vec::new();
 
-        while let Some(request) = queue.next() {
+        while let Some((index, request)) = queue.pop_front() {
             if env.cancel.is_cancelled() {
-                outcome.stop = Some(RoundStop::Cancelled);
-                outcome.remaining = std::iter::once(request).chain(queue).collect();
-                return Ok(outcome);
+                drain(&mut in_flight, &mut settled).await?;
+                queue.push_front((index, request));
+                return Ok(finish(Some(RoundStop::Cancelled), queue, settled));
             }
-            match self.execute_one(request.clone(), env).await? {
-                CallSettlement::Result(result) => outcome.results.push(result),
+
+            let begin = self.begin(&request, env).await?;
+
+            // 够格的那一类：放进在飞集合，接着看下一条。名额满了先把在飞的收完——收完
+            // 名额就空出来了，于是长批一直满额在跑，而不是退化成一问一答。
+            if let Begin::Ready(ready) = &begin
+                && ready.parallel_with_siblings()
+            {
+                if in_flight.len() >= self.limits.max_parallel_reads
+                    && let Some(stop) = drain(&mut in_flight, &mut settled).await?
+                {
+                    queue.push_front((index, request));
+                    return Ok(finish(Some(stop), queue, settled));
+                }
+                let Begin::Ready(ready) = begin else {
+                    unreachable!("上面刚判过它是 Ready")
+                };
+                in_flight.push(Box::pin(async move {
+                    (index, self.execute_authorized(*ready, env).await)
+                }));
+                continue;
+            }
+
+            // 屏障：在飞的先收尾，再按顺序处理这一条。
+            if let Some(stop) = drain(&mut in_flight, &mut settled).await? {
+                queue.push_front((index, request));
+                return Ok(finish(Some(stop), queue, settled));
+            }
+            let settlement = match begin {
+                Begin::Ready(ready) => self.execute_authorized(*ready, env).await?,
+                Begin::Settled(settlement) => settlement,
+                // 需要人看一眼：**审批行现在才落**（见上面的不变量）。
+                Begin::Ask(pending) => {
+                    let approval = self.raise_ask(pending, env).await?;
+                    let stop = RoundStop::Approval {
+                        approval,
+                        call: request.call.clone(),
+                    };
+                    queue.push_front((index, request));
+                    return Ok(finish(Some(stop), queue, settled));
+                }
+            };
+            match settlement {
+                CallSettlement::Result(result) => settled.push((index, result)),
                 CallSettlement::Stopped { stop, result } => {
-                    if let Some(result) = result {
-                        outcome.results.push(result);
-                    }
-                    outcome.stop = Some(stop);
-                    outcome.remaining = std::iter::once(request).chain(queue).collect();
-                    return Ok(outcome);
+                    settled.extend(result.map(|result| (index, result)));
+                    // 停在这一条自己身上：它这一轮没收尾，所以照旧算"还没轮到"的
+                    //（续跑要按账本上的形状把它重新交回来）。
+                    queue.push_front((index, request));
+                    return Ok(finish(Some(stop), queue, settled));
                 }
             }
         }
-        Ok(outcome)
+
+        // 收尾：最后一并收掉还在飞的。
+        let stop = drain(&mut in_flight, &mut settled).await?;
+        Ok(finish(stop, queue, settled))
     }
 
-    async fn execute_one(
-        &self,
-        request: CallRequest,
-        env: &CallEnv,
-    ) -> Result<CallSettlement, ExecError> {
+    /// 一个调用在**执行之前**该走完的那些步：找工具 → 生成或沿用计划 → 恢复核对梯子 →
+    /// 放行。三种去向见 [`Begin`]。
+    ///
+    /// 这几步**不和别的调用交错**：它们写账本（`plan_call`）、可能消费授权、可能要求审批。
+    /// 能被搬进在飞集合的只有执行本身（[`Self::execute_authorized`]）。
+    async fn begin(&self, request: &CallRequest, env: &CallEnv) -> Result<Begin, ExecError> {
+        // 能力边界**先于**"有没有这个工具"（§4 末）：不在这次运行的能力面里，就等于不认识
+        // 这个名字——执行器不回退到全局工具目录，所以模型自己拼出一个没露过面的名字，
+        // 拿到的也只是"这次运行的工具集里没有它"。
+        if !env.surface.allows(&request.tool) {
+            let names = env.surface.names();
+            let message = if names.is_empty() {
+                format!("这次运行没有可用的工具，{} 调不了", request.tool)
+            } else {
+                format!(
+                    "这次运行的工具集里没有 {}；可用的是：{}",
+                    request.tool,
+                    names.join("、")
+                )
+            };
+            return Ok(Begin::Settled(
+                self.fail_unstarted(request, env, message).await?,
+            ));
+        }
+
         // 未知工具名：作为错误内容交回模型，**不派发任何东西**（§14 阶段 3）。
         let Some(tool) = self.tools.get(&request.tool).cloned() else {
             let known: Vec<&str> = self.tools.keys().map(String::as_str).collect();
@@ -335,11 +453,13 @@ impl ToolExecutor {
                 request.tool,
                 known.join("、")
             );
-            return self.fail_unstarted(&request, env, message).await;
+            return Ok(Begin::Settled(
+                self.fail_unstarted(request, env, message).await?,
+            ));
         };
 
         // 计划：恢复执行沿用原来那份，首次执行现做一份。
-        let planning_ctx = self.context(&request, env, AttemptId::from_raw(PENDING_ATTEMPT));
+        let planning_ctx = self.context(request, env, AttemptId::from_raw(PENDING_ATTEMPT));
         let plan = match request.plan.clone() {
             Some(plan) => plan,
             None => match tool.prepare(request.arguments.clone(), &planning_ctx).await {
@@ -349,7 +469,9 @@ impl ToolExecutor {
                     plan
                 }
                 Err(error) => {
-                    return self.fail_unstarted(&request, env, error.to_string()).await;
+                    return Ok(Begin::Settled(
+                        self.fail_unstarted(request, env, error.to_string()).await?,
+                    ));
                 }
             },
         };
@@ -359,7 +481,7 @@ impl ToolExecutor {
         // 我们自己的账本里（子 Run 的终态），所以 §8.6 的核对在这里有确定答案。
         if let Operation::Delegate { spec } = &plan.operation {
             return self
-                .delegate(&request, env, &plan, spec, request.resumed.clone())
+                .delegate(request, env, &plan, spec, request.resumed.clone())
                 .await;
         }
 
@@ -379,7 +501,7 @@ impl ToolExecutor {
                     let summary =
                         format!("核对后目标已满足，未重新执行：{}", evidence_of(&verdict));
                     self.settle_verified(
-                        &request,
+                        request,
                         env,
                         state.previous_attempt.as_ref(),
                         ToolResultStatus::Completed,
@@ -387,12 +509,12 @@ impl ToolExecutor {
                         &summary,
                     )
                     .await?;
-                    return Ok(CallSettlement::Result(ToolResultForModel {
+                    return Ok(Begin::Settled(CallSettlement::Result(ToolResultForModel {
                         provider_call_id: request.provider_call_id.clone(),
                         call_id: request.call.clone(),
                         content: summary,
                         is_error: false,
-                    }));
+                    })));
                 }
                 // 冲突 / 不出结论 / 没有核对方式：**副作用发生没发生不知道**。那条
                 // 上一世的 `tool.started` 要配一条明确的 uncertain，然后交给人。
@@ -410,7 +532,7 @@ impl ToolExecutor {
                         other => format!("核对结论：{other:?}"),
                     };
                     self.settle_verified(
-                        &request,
+                        request,
                         env,
                         state.previous_attempt.as_ref(),
                         ToolResultStatus::Uncertain,
@@ -418,7 +540,7 @@ impl ToolExecutor {
                         &summary,
                     )
                     .await?;
-                    return Ok(self.attention(&request, summary));
+                    return Ok(Begin::Settled(self.attention(request, summary)));
                 }
                 Err(error) => {
                     // 核对本身跑不起来也是"不知道"，同样不能让 started 悬着。
@@ -427,7 +549,7 @@ impl ToolExecutor {
                         reason: error.to_string(),
                     };
                     self.settle_verified(
-                        &request,
+                        request,
                         env,
                         state.previous_attempt.as_ref(),
                         ToolResultStatus::Uncertain,
@@ -435,7 +557,7 @@ impl ToolExecutor {
                         &summary,
                     )
                     .await?;
-                    return Ok(self.attention(&request, summary));
+                    return Ok(Begin::Settled(self.attention(request, summary)));
                 }
             }
         }
@@ -449,23 +571,56 @@ impl ToolExecutor {
         } else {
             ConsumeIntent::First
         };
-        let (proof, grant_use) = match self.authorize(&request, &plan, env, intent).await? {
+        let (proof, grant_use) = match self.authorize(request, &plan, env, intent).await? {
             Authorization::Proceed { proof, grant } => (proof, grant),
             Authorization::Refused(message) => {
                 // 拒绝作为明确结果交回模型（§7.4）——**同时落盘**：被拒的调用一样有
                 // 结论，不写下来它就永远悬着。
-                return self.fail_unstarted(&request, env, message).await;
+                return Ok(Begin::Settled(
+                    self.fail_unstarted(request, env, message).await?,
+                ));
             }
+            // 需要人看一眼：**审批行还没有落**（`execute_round` 收完在飞的再落）。
+            Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
+            // 停在这条**已经存在**的审批上：`/approve` 唤醒回来、决定还没写下来。
             Authorization::Waiting(approval) => {
-                return Ok(CallSettlement::Stopped {
+                return Ok(Begin::Settled(CallSettlement::Stopped {
                     stop: RoundStop::Approval {
                         approval,
                         call: request.call.clone(),
                     },
                     result: None,
-                });
+                }));
             }
         };
+
+        Ok(Begin::Ready(Box::new(Authorized {
+            request: request.clone(),
+            tool,
+            plan,
+            proof,
+            grant: grant_use,
+            resumed,
+        })))
+    }
+
+    /// 一个**已经拿到凭据**的调用的执行。
+    ///
+    /// 只有这一段能被搬进在飞集合（[`Self::execute_round`]）：进来时放行已经结束，手里的
+    /// `Proof` 就是"允许做这件事"，中途不再问任何人。
+    async fn execute_authorized(
+        &self,
+        ready: Authorized,
+        env: &CallEnv,
+    ) -> Result<CallSettlement, ExecError> {
+        let Authorized {
+            request,
+            tool,
+            plan,
+            proof,
+            grant: grant_use,
+            resumed,
+        } = ready;
 
         // `tool.started` + 执行尝试 + 首次授权消费同一事务；**返回后才允许产生副作用**。
         let attempt = self
@@ -506,6 +661,8 @@ impl ToolExecutor {
         let status = body.status;
         // 工具写给模型看的那段正文：随结果一起落进 `output.json`，事件里只留它的前 1 KiB。
         let text = body.preview.clone();
+        // §48 的 `artifact_bytes`：这次尝试额外产生的产物。
+        let artifact_bytes: u64 = body.artifacts.iter().map(|artifact| artifact.size).sum();
         let mut published = self.outputs.publish(writer, body).await?;
         published.elapsed_ms = elapsed_ms;
         self.ledger.finish_call(&attempt, published.clone()).await?;
@@ -526,6 +683,27 @@ impl ToolExecutor {
                 model_result_bytes: env.model_result_bytes,
             },
         );
+
+        // §47 / §48：这一份观察落了多少字节、投影给模型多少。**只进 trace，不进事件流**
+        // ——它每轮都要算，而账本里那条事实只该有一条（§8.3）。投影比与 recall 次数是
+        // "要不要给模型更狠的视图（Handle）"唯一说得上的证据。
+        tracing::debug!(
+            target: "komo::observation",
+            tool = %request.tool,
+            tool_output_bytes = stored_bytes(&published),
+            artifact_bytes,
+            projected_bytes = content.len(),
+            "observation.projected"
+        );
+        // §48 的 `observation_recall_count`：这一次读取读的是**我们自己落盘的观察**。
+        if is_recall(&plan, env) {
+            tracing::info!(
+                target: "komo::observation",
+                tool = %request.tool,
+                paths = ?plan.paths().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+                "observation.recalled"
+            );
+        }
         let result = ToolResultForModel {
             provider_call_id: request.provider_call_id.clone(),
             call_id: request.call.clone(),
@@ -573,16 +751,19 @@ impl ToolExecutor {
         plan: &ExecutionPlan,
         spec: &DelegateSpec,
         resumed: Option<ResumedCall>,
-    ) -> Result<CallSettlement, ExecError> {
-        // 深度只有一层。这条守卫在**编排里**而不是在工具表里：把 `delegate` 从子代理的
-        // 工具表摘掉是 UX，模型自己拼出这个名字就绕过去了，而能被绕过的约束等于没有。
+    ) -> Result<Begin, ExecError> {
+        // 深度只有一层。**第一道拦在能力面上**（子代理的 schema 里没有 `delegate`，执行器
+        // 按同一份 schema 认名字，§4 末）；这里是第二道，管的是"有人把一份含 `delegate`
+        // 的能力面交给了子代理"——不变量不能只靠装配方记得摘掉一个名字来成立。
         if let Some(parent_of_this_run) = &env.delegated {
             let message = format!(
                 "子代理不能再委派：深度只有一层。你已经是被 {} 派出来跑这件事的，\
                  把完整的任务做完或说明做不到，而不是再派一条子 Run。",
                 parent_of_this_run.parent
             );
-            return self.fail_unstarted(request, env, message).await;
+            return Ok(Begin::Settled(
+                self.fail_unstarted(request, env, message).await?,
+            ));
         }
 
         // 已经派出去过 = 上一世 `start_call` 过。`Planned` 那种"确定没跑过"的形状与之
@@ -593,9 +774,10 @@ impl ToolExecutor {
 
         if in_flight {
             let child = self.accept_child(env, spec).await?.run;
-            return self
-                .collect_child(request, env, spec, resumed.as_ref(), &child)
-                .await;
+            return Ok(Begin::Settled(
+                self.collect_child(request, env, spec, resumed.as_ref(), &child)
+                    .await?,
+            ));
         }
 
         // "允不允许把这件事派出去"要过 Policy 与审批（§7.1）。放行在受理**之前**：
@@ -612,30 +794,33 @@ impl ToolExecutor {
             Authorization::Proceed { grant, .. } => grant,
             Authorization::Refused(message) => {
                 // 与普通工具同一条规矩：结论落盘，别让这次调用悬在账本上。
-                return self.fail_unstarted(request, env, message).await;
+                return Ok(Begin::Settled(
+                    self.fail_unstarted(request, env, message).await?,
+                ));
             }
+            Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
             Authorization::Waiting(approval) => {
-                return Ok(CallSettlement::Stopped {
+                return Ok(Begin::Settled(CallSettlement::Stopped {
                     stop: RoundStop::Approval {
                         approval,
                         call: request.call.clone(),
                     },
                     result: None,
-                });
+                }));
             }
         };
 
         let child = self.accept_child(env, spec).await?.run;
         // `tool.started` 之后子 Run 才可能被领取：它就是这次外派副作用的起点。
         self.ledger.start_call(&request.call, plan, grant).await?;
-        Ok(CallSettlement::Stopped {
+        Ok(Begin::Settled(CallSettlement::Stopped {
             stop: RoundStop::Dependency {
                 run: child,
                 call: request.call.clone(),
             },
             // 这次调用**没有结果**：它在等子 Run。空结果也不是结果。
             result: None,
-        })
+        }))
     }
 
     /// 受理子 Run。幂等键由**父 Run + 承载它的那次调用**决定，所以同一件委派重复受理
@@ -659,6 +844,11 @@ impl ToolExecutor {
                 model: env.model.clone(),
                 workdir: None,
                 delegate: Some(spec.clone()),
+                // 子 Run 的身份与能力**由父侧继承**（同一个 Agent、同一份工作目录、同样的
+                // 工具减去 `delegate`）。执行器手里只有父 Run 的 `CallEnv`，没有 Profile、
+                // 工作目录与指令正文，所以这里不编一份：装配那一步按父 Run 的快照继承
+                // （`service::segment`），与"旧行没有归属"走的是同一条兜底路。
+                snapshot: None,
                 at: self.clock.now(),
             })
             .await?;
@@ -925,7 +1115,7 @@ impl ToolExecutor {
                                 })
                             }
                             // 授权在这一瞬间不再可用：不要硬凑一个 Proof，退回去问人。
-                            _ => self.ask(request, plan, env, reason, vec![]).await,
+                            _ => Ok(self.ask(request, plan, reason, vec![])),
                         }
                     }
                     None => Ok(Authorization::Proceed {
@@ -936,34 +1126,50 @@ impl ToolExecutor {
                     }),
                 }
             }
-            PolicyDecision::Ask { reason, scopes } => {
-                self.ask(request, plan, env, reason, scopes).await
-            }
+            PolicyDecision::Ask { reason, scopes } => Ok(self.ask(request, plan, reason, scopes)),
         }
     }
 
-    async fn ask(
+    /// 需要人看一眼：**只组装，不落盘**。
+    ///
+    /// 落盘在 [`Self::raise_ask`]——调用点先收完在飞的调用再落它（[`Self::execute_round`]）。
+    /// 这一条区分不是洁癖：审批行比 Run 的挂起早出现一整个批次时，操作者可能答得比 Run
+    /// 停下还早，那条答复就落进了空窗（§7.4）。
+    fn ask(
         &self,
         request: &CallRequest,
         plan: &ExecutionPlan,
-        env: &CallEnv,
         reason: String,
         scopes: Vec<komo_kernel::types::chat::ApprovalScope>,
-    ) -> Result<Authorization, ExecError> {
+    ) -> Authorization {
+        Authorization::Ask(Box::new(AskPending {
+            call: request.call.clone(),
+            plan: plan.clone(),
+            reason,
+            scopes,
+        }))
+    }
+
+    /// 把一条待审批的请求落进 `approval_requests`：保存审批、暂停、等人（§7.4 的第一步）。
+    async fn raise_ask(
+        &self,
+        pending: Box<AskPending>,
+        env: &CallEnv,
+    ) -> Result<ApprovalId, ExecError> {
         let record = self
             .approvals
             .request(ApprovalRequest {
                 session: env.session.clone(),
                 run: Some(env.run.clone()),
-                call: Some(request.call.clone()),
-                plan: plan.clone(),
-                reason,
+                call: Some(pending.call),
+                plan: pending.plan,
+                reason: pending.reason,
                 changes: None,
                 evidence: None,
-                scopes,
+                scopes: pending.scopes,
             })
             .await?;
-        Ok(Authorization::Waiting(record.approval))
+        Ok(record.approval)
     }
 
     fn attention(&self, request: &CallRequest, reason: String) -> CallSettlement {
@@ -996,6 +1202,60 @@ impl ToolExecutor {
 /// 这样账本里的 attempt ID 与它不会混。
 const PENDING_ATTEMPT: &str = "attempt-not-started";
 
+/// 一个调用在**执行之前**的三种去向（[`ToolExecutor::begin`]）。
+enum Begin {
+    /// 放行过了，可以执行。只读的那一类允许被搬进在飞集合。
+    ///
+    /// 装箱不是洁癖：`Authorized` 里躺着一份完整的 `ExecutionPlan`（约 1.3 KB），而
+    /// 这个枚举**每个调用都要过一手**——不装箱就是每一轮把那一坨来回搬。
+    Ready(Box<Authorized>),
+    /// 已经有结论：不需要执行（工具名不认识、参数准备不出来、被拒、核对收口、委派转交）。
+    Settled(CallSettlement),
+    /// 需要人看一眼：**审批行还没有落**——`execute_round` 先收完在飞的再落它。
+    Ask(Box<AskPending>),
+}
+
+/// 一条**已经拿到凭据**、可以直接执行的调用。
+struct Authorized {
+    request: CallRequest,
+    tool: Arc<dyn Tool>,
+    plan: ExecutionPlan,
+    proof: Proof,
+    grant: Option<GrantUse>,
+    resumed: Option<ResumedCall>,
+}
+
+impl Authorized {
+    /// 能不能和同一轮里后面的调用**同时在飞**（§6）。
+    ///
+    /// 两条都要：计划是只读的（`read` / `rg`），而且这一次没有"上一世"要接——**已经
+    /// `start` 过**的调用要走核对梯子（§8.6），它的顺序由账本钉死，不能和谁抢跑道。
+    /// 续跑里"确定尚未执行"的那条（`Planned`、一次尝试都没有）与新鲜调用等价，照样算。
+    fn parallel_with_siblings(&self) -> bool {
+        self.plan.operation.is_read_only()
+            && self
+                .resumed
+                .as_ref()
+                .is_none_or(ResumedCall::is_known_not_to_have_run)
+    }
+}
+
+/// 一条还没落盘的审批请求。放行的最后一步才把它变成 `approval_requests` 里的一行。
+struct AskPending {
+    call: ToolCallId,
+    plan: ExecutionPlan,
+    reason: String,
+    scopes: Vec<komo_kernel::types::chat::ApprovalScope>,
+}
+
+/// 一轮里已经进入执行、还没收尾的调用。**只读的才允许同时在飞**（§6）。
+///
+/// 装的是 `Send` 的 boxed future：`AgentLoop` 自己被要求 `Send`，装配它的那一段不能因为
+/// 这里多了一路并发就变成不能跨线程。一次一轮，最多几条，这点装箱是它的代价。
+type InFlight<'a> = FuturesUnordered<
+    Pin<Box<dyn Future<Output = (usize, Result<CallSettlement, ExecError>)> + Send + 'a>>,
+>;
+
 enum CallSettlement {
     Result(ToolResultForModel),
     Stopped {
@@ -1006,11 +1266,81 @@ enum CallSettlement {
 
 enum Authorization {
     Proceed {
-        proof: komo_kernel::types::plan::Proof,
+        proof: Proof,
         grant: Option<GrantUse>,
     },
     Refused(String),
+    /// 需要人看一眼，而且**这一条审批还没有落盘**（`AskPending`）。
+    Ask(Box<AskPending>),
+    /// 停在这条**已经存在**的审批上（`/approve` 唤醒后回来，决定还没写下来）。
     Waiting(ApprovalId),
+}
+
+/// 把在飞的每一路都收完：结果按**原始的调用序号**进 `settled`，返回它们当中第一条
+/// 「停下来」的理由。
+///
+/// 收尾必须是全部：停在半路会让已经 `start_call` 过的那几条留在账本上，而下一世还会
+/// 再来核对它们（§8.6）。所以这里不看 stop 直接往下收，stop 只记第一条。
+async fn drain(
+    in_flight: &mut InFlight<'_>,
+    settled: &mut Vec<(usize, ToolResultForModel)>,
+) -> Result<Option<RoundStop>, ExecError> {
+    let mut stop = None;
+    while let Some((index, outcome)) = in_flight.next().await {
+        match outcome? {
+            CallSettlement::Result(result) => settled.push((index, result)),
+            CallSettlement::Stopped { stop: why, result } => {
+                settled.extend(result.map(|result| (index, result)));
+                stop.get_or_insert(why);
+            }
+        }
+    }
+    Ok(stop)
+}
+
+/// 收尾：结果按原始调用顺序交给模型，`remaining` 是还没轮到的那些（§6）。
+///
+/// 并发只改**执行**的顺序，不改交回模型的配对顺序：工具结果是按 `provider_call_id`
+/// 认领的，但同一份事实每次都以同一个顺序排出来，重放与缓存才不会有第二种样子。
+fn finish(
+    stop: Option<RoundStop>,
+    queue: VecDeque<(usize, CallRequest)>,
+    mut settled: Vec<(usize, ToolResultForModel)>,
+) -> RoundOutcome {
+    settled.sort_by_key(|(index, _)| *index);
+    RoundOutcome {
+        results: settled.into_iter().map(|(_, result)| result).collect(),
+        stop,
+        remaining: queue.into_iter().map(|(_, request)| request).collect(),
+    }
+}
+
+/// 这一次尝试落盘的字节总数：`output.json` 加两个流。
+///
+/// 它是 §48 的 `tool_output_bytes`——"完整保存"这条承诺的量。
+fn stored_bytes(published: &komo_kernel::types::refs::PublishedOutput) -> u64 {
+    published.output.0.size
+        + published.stdout.as_ref().map_or(0, |stream| stream.size)
+        + published.stderr.as_ref().map_or(0, |stream| stream.size)
+}
+
+/// 这次读取读的是不是**我们自己落盘的观察**（§48 的 `observation_recall_count`）。
+///
+/// 判据是路径落在当前 Session 的 `tool-output/` 或 `artifacts/` 底下——也就是投影省掉
+/// 正文之后，模型回头去 `read` 那一份的次数。它要是很高，说明投影太狠了（§27 的
+/// "省略不等于丢失"就是这么被检验的）。
+fn is_recall(plan: &ExecutionPlan, env: &CallEnv) -> bool {
+    if !plan.operation.is_read_only() {
+        return false;
+    }
+    let Some(root) = env.session_root.as_deref() else {
+        return false;
+    };
+    plan.paths().any(|path| {
+        ["tool-output", "artifacts"]
+            .iter()
+            .any(|dir| path.starts_with(root.join(dir)))
+    })
 }
 
 /// 这份计划的动作重做一遍是安全的吗。

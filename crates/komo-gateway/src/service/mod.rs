@@ -83,6 +83,13 @@ pub struct ServiceOptions {
     pub llm: Option<Arc<dyn LlmClient>>,
     /// 测试注入的向量后端；`None` = 按 `memory.embedding` alias 造。
     pub embeddings: Option<Arc<dyn komo_kernel::traits::EmbeddingClient>>,
+    /// 共享 agent 目录（`~/.agents/skills`、`~/.claude/skills`）按**哪个家目录**算；
+    /// `None` = 当前用户的家目录（§5.6）。
+    ///
+    /// 它是注入的，不是现场读 `$HOME`：不然"提示里有哪些 skill"取决于跑这台进程的机器，
+    /// 测试之间会互相污染（谁在 `~/.agents/skills` 里装过东西，别人的断言就变），多实例
+    /// 部署也没法把共享面钉死。
+    pub shared_home: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ServiceOptions {
@@ -174,6 +181,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         token: token.clone(),
         llm: options.llm,
         embeddings: options.embeddings,
+        shared_home: options.shared_home.clone(),
         tools: build_tools(&config, &instance_id, &db, Arc::clone(&clock)).await,
         channels: options.channels,
     })
@@ -549,6 +557,34 @@ pub fn python_env(
 /// 的那一个，§4 的深度只有一层）。写在注册点旁边，另有一处测试钉住它与
 /// [`DelegateTool`] 自报的名字一致——两处各写一个字面量迟早会漂。
 pub const DELEGATE_TOOL: &str = "delegate";
+
+/// 一份 Profile 在**这份工具目录**里挑出来的能力面（§4 末）。
+///
+/// 目录里没有的名字**不算数**，而且必须报出来：静默采纳一份写错的配置，等于让操作者以为
+/// 某个工具给了、其实没给——而这句话只有一处说得准，所以受理时（冻结快照）与没有快照时的
+/// 兜底装配共用它。
+pub fn surface_of(
+    profile: &komo_kernel::types::agent::AgentProfile,
+    catalog: &[String],
+    file: &std::path::Path,
+) -> komo_kernel::types::surface::AgentSurface {
+    let (surface, unknown) = profile.surface(catalog);
+    if !unknown.is_empty() {
+        tracing::warn!(
+            file = %file.display(),
+            agent = %profile.id,
+            unknown = %unknown.join("、"),
+            catalog = %catalog.join("、"),
+            "`[agents]` 里写了工具目录里没有的名字，它们不算数（能力面只留真的装着的那些）"
+        );
+    }
+    surface
+}
+
+/// Agent 配置在哪个文件里（`[agents.<id>]` 的出处，日志里要说清是"谁写的配置"）。
+pub fn agent_config_file(config: &ConfigHolder) -> PathBuf {
+    config.home().join("config.toml")
+}
 
 /// 六个基础工具（§4）与那条编排操作。`python` 要有一个跑得起来的解释器才挂。
 async fn build_tools(

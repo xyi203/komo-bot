@@ -299,11 +299,11 @@ async fn a_group_message_only_counts_when_it_names_the_bot() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 
-    // 群会话不是 home session（§11.2：群按 `{platform}:{chat_id}` 各自一个）。
+    // 群会话不是主会话（§11.2：群按 `{platform}:{chat_id}` 各自一个）。
     let origins = gateway_sessions().await;
     assert!(
         !origins.iter().any(|origin| origin == "home"),
-        "群消息不该落进 home session：{origins:?}"
+        "群消息不该落进主会话：{origins:?}"
     );
 }
 

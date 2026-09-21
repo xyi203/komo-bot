@@ -117,6 +117,7 @@ mod tests {
                     workdir: None,
                     at: clock.now(),
                     delegate: None,
+                    snapshot: None,
                 })
                 .await
                 .unwrap();

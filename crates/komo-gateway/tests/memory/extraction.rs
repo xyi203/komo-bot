@@ -413,6 +413,8 @@ async fn learn_with(gateway: &TestGateway, llm: ScriptedLlm) {
         config: snapshot.memory.clone(),
         repo,
         catalog,
+        // 这个测试只关心提取与写入：判断后端不参与。
+        reranker: None,
         embeddings: state.memories.space().map(|_| {
             // 复用同一个替身要拿得到它；这里只需要"有一个能用的"，概念替身即可。
             ConceptEmbeddings::new() as Arc<dyn komo_kernel::traits::EmbeddingClient>

@@ -3,6 +3,7 @@
 //! 这里没有 I/O，没有时钟，没有 tokio（§13.4）。需要"现在几点"的地方一律由调用方
 //! 从 [`crate::traits::Clock`] 取一个 `OffsetDateTime` 传进来。
 
+pub mod agent;
 pub mod chat;
 pub mod delegate;
 pub mod digest;
@@ -12,9 +13,12 @@ pub mod model;
 pub mod plan;
 pub mod refs;
 pub mod status;
+pub mod surface;
+pub mod systemone;
 pub mod tool;
 pub mod turn;
 
+pub use agent::{AgentConfig, AgentProfile, RunSnapshot};
 pub use chat::{
     ApprovalPresentation, ApprovalScope, ChannelPeer, ChannelPlatform, Delivery, DeliveryState,
     DeliveryTarget, Outbound, PeerId, Principal,
@@ -49,6 +53,11 @@ pub use refs::{
 pub use status::{
     AttemptState, Claimed, FinalEventRef, RetryCause, RunEnd, RunState, SessionState,
     ToolCallState, WaitReason,
+};
+pub use surface::AgentSurface;
+pub use systemone::{
+    Answer, NoulCriteria, Question, SystemOneError, SystemOneRequest, SystemOneResponse,
+    SystemOneUsage,
 };
 pub use tool::{
     CancelToken, PyError, PythonJob, PythonResult, ResumedCall, ToolContext, ToolDefinition,

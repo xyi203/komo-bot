@@ -4,6 +4,12 @@
 /.idea
 /.vscode
 /.claude
+# 本机 agent 工具配置：`npx skills add …` 装的 skill 落在这里（`.agents/skills/<name>/`），
+# omp / Codex 那一类会认它。它是**这台机器上的**东西，不进仓库；komo 侧靠
+# `~/.agents/skills/<name>` 那个软链看见同一份。
+/.agents
+# `npx skills add` 在同目录留下的锁（记录来源与内容哈希），同样是本机状态。
+/skills-lock.json
 .DS_Store
 
 

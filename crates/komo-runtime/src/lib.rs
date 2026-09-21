@@ -14,3 +14,4 @@ pub mod scheduler;
 pub mod skills;
 pub mod toolbox;
 pub mod tools;
+pub mod typesafe;

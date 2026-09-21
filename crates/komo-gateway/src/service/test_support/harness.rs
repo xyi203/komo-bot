@@ -47,6 +47,9 @@ use crate::service::{Running, ServiceOptions, start};
 pub fn config_toml(extra: &str) -> String {
     format!(
         r#"
+default_agent = "assistant"
+
+[agents.assistant]
 [model.main]
 type = "completion"
 api_backend = "responses"
@@ -562,6 +565,9 @@ impl GatewayBuilder {
             channels: self.factories.clone(),
             llm: self.llm,
             embeddings: self.embeddings,
+            // 共享 skill 目录也钉在这份临时数据目录上（§5.6）：否则跑测试那台机器上
+            // `~/.agents/skills` 里有什么，别的测试的断言就跟着变。
+            shared_home: Some(home.clone()),
         })
         .await
         .expect("Gateway 起得来");
@@ -716,7 +722,11 @@ impl TestGateway {
 
     /// 造一条待处理的审批（executor 真跑起来时做的就是这件事）。
     pub async fn pending_approval(&self) -> ApprovalRecord {
-        let session = self.state().home_session().await.expect("home session");
+        let session = self
+            .state()
+            .default_main_session()
+            .await
+            .expect("home session");
         self.pending_approval_in(&session, None).await
     }
 
@@ -961,6 +971,8 @@ impl Home {
             )],
             llm: Some(llm),
             embeddings: None,
+            // 共享 skill 目录钉在这份临时数据目录上（§5.6），与 `GatewayBuilder` 同一个口径。
+            shared_home: Some(self.dir.path().to_path_buf()),
         })
         .await
         .expect("Gateway 起得来");

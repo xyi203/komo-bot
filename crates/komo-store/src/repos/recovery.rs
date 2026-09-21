@@ -432,6 +432,7 @@ mod tests {
             workdir: None,
             at: TestClock::fixed().now(),
             delegate: None,
+            snapshot: None,
         }
     }
 

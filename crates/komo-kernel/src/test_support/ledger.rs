@@ -145,6 +145,7 @@ impl Ledger for MemLedger {
                 model: Some(input.model.model.clone()),
                 effort: None,
                 delegate: input.delegate.clone(),
+                snapshot: input.snapshot.clone(),
             }),
         );
         self.append(

@@ -32,6 +32,10 @@ pub async fn connect_or_start(home: &Path) -> Result<KomoClient, String> {
         Err(_) => {}
     }
 
+    // 先判"这个数据目录有没有资格碰那个全局单元"，再印"正在启动"——否则出错信息前面
+    // 会多一句不成立的话（`units::owns_unit`）。
+    komo_gateway::service::units::ensure_owns(&user_home(), home)
+        .map_err(|error| error.to_string())?;
     eprintln!("本机 Gateway 没在跑，正在启动…");
     request_start(home)?;
     wait_ready(home).await

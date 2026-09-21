@@ -124,7 +124,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
-Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台形式的 Gateway。**单元文件只设 `KOMO_HOME`（与可选的 `KOMO_LISTEN`），不加载 `.env`、不含任何凭证**：launchd 没有 `EnvironmentFile` 的等价物，只能把值抄进 plist，那是把密钥复制到第二个文件；走进程环境还会让 `.env` 的热重载失效，并让每个子进程与日志都可能看到它。`.env` 由 Gateway 自己读成 `Secrets`（§3 热重载覆盖它），需要凭证的 Python 模块按**变量名**声明（§5.3），Gateway 在起子进程时按名注入。Mac 若后续需要操作用户桌面应用，应按登录用户的执行环境配置。后台服务不会让睡眠中的电脑继续执行任务。[Fedora systemd](https://fedoraproject.org/wiki/Packaging:Systemd) · [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
+Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台形式的 Gateway。**单元名是全局的（`komo-gateway.service` / `dev.komo.gateway`），只有默认数据目录 `~/.komo` 拥有它。** 别的 `KOMO_HOME` 走 `komo gateway` / `stop` / `restart` 会被**拒绝**并告诉你去前台跑 `KOMO_HOME=… komo gateway --foreground`：那条路会把单元文件改写成指向这个数据目录，现役服务随即被换掉——2026-09-21 实测过一次，`KOMO_HOME=/tmp/… komo config check` 经 `connect_or_start` 起服务，把现役单元换成了一份 debug 构建 + 沙箱数据目录。`komo gateway status` 会印出单元实际在服务哪个数据目录，与当前 `KOMO_HOME` 不一致时明说。**单元文件只设 `KOMO_HOME`（与可选的 `KOMO_LISTEN`），不加载 `.env`、不含任何凭证**：launchd 没有 `EnvironmentFile` 的等价物，只能把值抄进 plist，那是把密钥复制到第二个文件；走进程环境还会让 `.env` 的热重载失效，并让每个子进程与日志都可能看到它。`.env` 由 Gateway 自己读成 `Secrets`（§3 热重载覆盖它），需要凭证的 Python 模块按**变量名**声明（§5.3），Gateway 在起子进程时按名注入。Mac 若后续需要操作用户桌面应用，应按登录用户的执行环境配置。后台服务不会让睡眠中的电脑继续执行任务。[Fedora systemd](https://fedoraproject.org/wiki/Packaging:Systemd) · [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
 
 默认监听回环地址。首版远程访问可通过 SSH 转发连接；直接开放网络监听时需要 HTTPS 和认证。选择远程实例时，不因连接失败而启动一个本机替代实例。`status` 与 `stop` 不隐式启动服务。
 
@@ -146,6 +146,10 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 **委派（`delegate`）不是第七个工具，是一条编排操作。** 模型可以把一个自包含子任务交给**一条子 Run**：它以 `Operation::Delegate` 进同一个决策入口（§7.1 那一行），执行时在同一个 Session 里受理一条**子 Run**，父 Run 进 `waiting + dependency` 等它——子 Run 用的是同一套六个工具，它自己的每一次调用照常过 Policy 与审批，所以"能不能做"这一层没有被放宽，放宽的只是"这一件事由谁来做"。子代理只拿得到任务本身（不继承父的消息历史、不继承父的上下文），默认 8 轮预算，**深度只有一层**（子 Run 不能再委派）。结果可以带一个契约：子代理把结构化结果放进它最后一条回复，父侧续跑时用**同一份校验器**复验（§8.6）。
 
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、Policy 判断、审批处理、执行状态保存、取消和输出限制。
+
+**每次运行有它自己的能力面（`AgentSurface`）。** 这次允许调用哪些工具是一个显式的集合：**交给模型的工具 schema 与执行时查找的表是同一份**，装配时由 schema 反推，所以两边不可能分家。schema 里没有的名字，执行器不认——模型自己拼出这个名字，拿到的是"这次运行的工具集里没有它"，而不是"进去试试看"。执行器手里那份全局工具目录只用于**发现与构造**（`komo skills` 的 `requires_tools` 门控也问它），**执行时一次都不回退到它**：能回退就等于能力边界只是一句建议。子代理已经是这条边界的第一个使用者（它的 schema 里没有 `delegate`，于是它也调不动 `delegate`）。
+
+工具**能不能**调用由能力面决定；一次**具体调用**允不允许由 Policy 决定（§7）。两者不是同一件事：`coder` 有 `write`，不代表它可以写任何路径。
 
 ```rust
 #[async_trait::async_trait]
@@ -335,7 +339,9 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 
 工具名称和参数来自 provider 原生字段，不从自然语言或代码块推断。完整 assistant 消息与每个工具结果保持调用 ID 配对，这是原生 function calling 的执行方式。[Function calling](https://developers.openai.com/api/docs/guides/function-calling)
 
-首版顺序执行同一轮的多个调用，减少文件操作顺序歧义。不同 Session 可并发，同一 Session 的 Run 顺序执行；等待审批的 Run 保留会话顺序位置，不允许后续 Run 越过它执行。等待运行排到前面时才装配上下文，避免读到过期历史。
+**同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走核对梯子（§8.6），顺序由账本钉死；`write`、`edit`、`shell`、`python`、`delegate`，以及任何会停下来的判定（审批 / 核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。并发上限是执行器自己的预算（默认 4 条）。三条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；遇到审批先收已启动调用的尾，**而且审批行在那之后才落**——它要是比 Run 的挂起早出现一整个批次，操作者答得比 Run 停下还早，那条答复就落进了空窗（§7.4）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
+
+不同 Session 可并发，同一 Session 的 Run 顺序执行；等待审批的 Run 保留会话顺序位置，不允许后续 Run 越过它执行。等待运行排到前面时才装配上下文，避免读到过期历史。
 
 Gateway 设置总轮数、活动执行时限、输出长度和子进程并发预算。等待用户时释放运行名额，保留已消耗预算。
 
@@ -344,6 +350,44 @@ Gateway 设置总轮数、活动执行时限、输出长度和子进程并发预
 普通追问可以作为 assistant 回复结束本轮；用户下一条输入开启同一 Session 的新 Run。工具审批则暂停原 Run，待决策后继续原调用，不增加第六个交互工具；决策通常来自聊天渠道（§11）。
 
 Run 完成仅表示本轮结束。测试是否通过、性能是否改善、设备是否到达目标状态，都要依据具体执行证据报告。
+
+### 6.1 Agent、Session 与 Run：三种身份
+
+| 对象 | 是什么 | 住在哪 |
+| --- | --- | --- |
+| `AgentProfile` | 一个助手的长期定义：身份指令、模型、能给的工具、允许的 Skill、工作目录、记忆作用域 | 操作者写在 `config.toml` 里 |
+| Session | 一段持续对话，**绑定一个 Agent**（`sessions.agent_id`），不随消息路由改人格 | `state.db` 的行 |
+| `RunSnapshot` | 某一次执行受理时冻结的身份与能力 | 账本里那次受理上 |
+
+**没有隐含的默认助手。** `default_agent` 指名"没有归属的入口（TUI、CLI、Cron）走谁"，`[agents.<id>]` 是唯一写法：一个都不声明就是**配置不完整**，`komo config check` / 启动会拒绝，并把该写的形状印出来。只声明一个 Agent 时它就是 `default_agent`——那不是隐含默认，是没有第二个答案。
+
+```toml
+default_agent = "assistant"
+
+[agents.assistant]
+instructions = "你是家里那个助手，回答用中文。"
+model = "chat"                     # [model.<alias>] 的 alias；省略 = [models].default
+tools = ["read", "rg", "python"]   # 省略 = 目录里全部；[] = 一个都不给
+workspace = "home"                 # 相对数据目录；省略 = [paths] workspaces_dir
+memory_scope = "personal"
+
+[agents.coder]
+instructions = "你在仓库里干活，动手前先把计划说清楚。"
+tools = ["read", "write", "edit", "rg", "shell", "python"]
+workspace = "code/komo"
+```
+
+两个字段各带一次"省略 ≠ 空"的区分，写在类型里（§4 的能力面）：`tools` 省略 = 目录里全部，`[]` = 一个都不给；写了目录里没有的工具名**不算数**，装配时 warn 出来，模型看到的 schema 里也不会出现它（`AgentProfile::surface` 把不认识的名字单独返回，就是为了不静默采纳一份写错的配置）。
+
+**Session 的归属创建后不变。** 换助手 = 路由到另一个 Session，而不是给已有会话换人格、同时留着原来是另一个助手的上下文。每个 Agent 的主会话（`kind = 'main'`）在数据库里唯一：两个入口并发地要它，只落一条。
+
+**升级路径**：`sessions.agent_id` 为空 = 升级前建的会话。它按 `default_agent` **归属一次并写下来**（只写一次，之后不随配置漂移）；归属的 Agent 在现行配置里不存在时，那条会话**拒绝执行**并进操作者清单（§7.5），不静默换成别的助手。
+
+### 6.2 冻结的是身份，不是安全策略
+
+受理一条 Run 时算出 `RunSnapshot` 落进账本：身份指令**正文进 `payloads/`（存内容，不存路径）**——审批可能一小时之后才答复，那时那个文件早被改过——连同 Agent 的 id、Profile 的内容指纹、模型、解析过的目录、这次的能力面与记忆作用域。
+
+于是两句话都成立：**审批等待期间改 Profile，在飞的 Run 不受影响**（它按自己的快照恢复），下一条 Run 用新的一版；而**撤权与 Deny 不冻结**——身份与能力来自快照，"这次调用允不允许"每次执行都按当前 Policy 判（§7）。旧快照不会变成绕过撤权的通行证。
 
 ## 7. Policy 与审核
 
@@ -998,6 +1042,7 @@ runs 中记录 pending / processing / done / error 与处理游标。进程崩�
   ├─ 关键词召回：memory_terms 的 instr 匹配 + 标签 / 精确值 / 短字符串匹配
   └─ 向量召回：独立 embedding 模型 → 当前向量空间 → 余弦相似度
        → 按排名融合（RRF），避免直接相加不同量纲的分数
+       → ［可选］判断层重排：短名单比注入条数宽，只重排、不增删
        → 去重，核对当前 revision、来源与冲突状态
        → 按条数和 token 预算选入上下文
        → 返回内容、来源、确认状态、时间与版本
@@ -1006,6 +1051,15 @@ runs 中记录 pending / processing / done / error 与处理游标。进程崩�
 默认 hybrid；同时支持 keyword 和 vector 供明确选择与诊断。每路建议最多召回 40 项，合并后最多注入 8 项、约 1500 tokens；这些是可调整的初始预算，不强行填满。没有足够相关内容时返回空；相似度只用于相关性，不授予真实性或操作权限。
 
 关键词索引不用 FTS5（Turso MVCC 下不可用，§8.2）：索引时把内容经 `lexical_terms` 切成 token 串写入 `memory_terms.terms`（首尾带空格），查询时每个 token 一个 `instr(terms, ' tok ') > 0`，命中数按 IDF 加权。`lexical_terms` 对 CJK 连续字符切 bigram、对 ASCII 切单词并小写化——"空调"本身就是一个 bigram，两字查询天然命中，不需要子串后备。IDF 在查询时用 `memory_terms` 行数和每个 token 的命中行数算；1 万条量级是一次全表 `instr`，§14 要求实测 P95，这里不预先宣称达标。
+
+**重排是可选的一步，而且是"只重排、不增删"。** 融合（RRF）能找到候选，却排不出细微的先后：两条讲同一件事的记忆可能只差一位。开着 `memory.retrieval.rerank` 时，短名单（`rerank_shortlist`，默认 20，必须比 `top_k` 宽——一样宽只是换个顺序，校验会拒绝这种组合）交给一个**判断后端**（`[typesafe]`，TypeSafe「System One」/ Jev）：一次请求、一条 `Choice`，选项是短名单里每条记忆的 id 加一个 `none`，`state` 里是这次的用户输入与各条正文的一行摘要；回来的概率表**本身就是一张排序**，代码按它排序后照旧按 `top_k` 截。四条边界写在实现里：
+
+- **候选集合与融合结果逐条相同**——这一步只决定"谁进得了 `top_k`"，丢候选是阈值的事；
+- 它挑中 `none`（都不相关）时**不采纳它的排序**，保持融合顺序；
+- 判断层不可用（连不上 / 超时 / 答复解不开）时同样保持融合顺序，只留一条 warn——**"判断不可用"绝不能变成"没有相关记忆"**，也不能让这一次召回整个失败；
+- 判据是路径与开关两件事：`rerank` 关着时**一个请求都不发**（后端装在手上也不发）。
+
+代价要写清楚：开着它，**候选记忆的正文（截到 200 字符）会被发到第三方端点**——所以它默认关，凭证据只从 `.env` 读（`TYPESAFE_API_KEY`，与模型后端同一约定：快照里只有变量名）。本机实测（2026-09-21，4 条候选、中文输入）：一次请求 0.6s、约 650 输入 token，Jev 把"热水器/空调"那两条排到了前面。
 
 首版将向量保存为带编码和维度信息的 f32 数据，由 Rust 在作用域过滤后做精确余弦检索。进程可缓存当前代次的向量，缓存按预算管理且可从数据库重建；无须部署独立向量服务。后续只有在真实数据规模与延迟测试表明必要时，才在 memory_index 内部替换为近似检索。
 
@@ -1483,6 +1537,8 @@ kernel ← client ────────────────────�
 | `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
 | `grep` + `ignore` | `0.4`，`default-features = false`；仅 komo-runtime（`rg` 工具） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
 | `arc-swap` | 默认；仅 komo-runtime（`config`） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
+| 判断后端（TypeSafe「System One」） | **不新增依赖**：走已有的 `reqwest`（`rustls-no-provider`）+ 同一个 ring provider；凭证只从 `.env` 的 `TYPESAFE_API_KEY` 读 | §9.4 的可选重排用它。默认关；开着时才会发请求，且会把候选记忆的正文（截到 200 字符）发给第三方端点 |
+| `tracing-subscriber` / `rustls`（**dev-only**） | 仅 komo-runtime 的 `[dev-dependencies]` | 前者用来抓 §47/§48 的行内指标做断言，后者让真机验收测试自己装一次 crypto provider（装 provider 是进程的事，见上面 `reqwest` 行）。**不进发布构建** |
 | `clap` | `derive` | 仅 bin |
 | `flate2` / `tar` | `flate2` 显式 `default-features = false, features = ["rust_backend"]`（miniz_oxide），`tar 0.4` | 仅 bin：`komo update` 解发布包（§13.6）。两者都是纯 Rust（不带 C 工具链），且**不进 gateway / runtime 的图**——它们谁也不更新自己；`rust_backend` 写死是不跟上游默认后端变 |
 | `ratatui` + `crossterm` + `pulldown-cmark` | 仅 komo-client | 在 client 支线上，与 gateway 并行编译 |
@@ -1712,7 +1768,7 @@ pub trait Clock: Send + Sync {
 | 阶段 | 交付 | 验证 |
 |---|---|---|
 | 1. 进程与会话骨架 | 六个 crate 骨架（§13.4）；komo、Gateway 自动启动、HTTP/SSE；`komo-store`：Turso 连接、`ensure_schema` + DDL 对齐测试、`with_write_retry`、统一 Session 目录与状态索引；`komo-client`：HTTP/SSE 客户端与 TUI 骨架；**编译预算首次测量** | 多个 CLI 同时启动仅产生一个实例；断线后能查看原会话；两个写入器对不同 Session 并发提交不互相阻塞，对同一行冲突时一方重试成功且只应用一次；DDL 对齐测试挂掉能定位到列；改 client 一行不重编 gateway；保存一份合法的 config.toml 后 `komo doctor` 一秒内显示新 mtime 已生效，保存一份非法的则旧配置继续生效且 home chat / 日志有具体错误 |
-| 2. AgentLoop 与 Policy | 模型往返、执行计划、Allow/Ask/Deny、审批持久化；`Ledger`、`Policy`、`ApprovedPlan` 类型状态；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测 | 危险操作批准前不执行；重复批准不重复执行；Deny 不被授权覆盖；不构造 `Proof` 就调不到 `execute`（编译期）；`Ask` 后 Run 让出名额且 TUI 弹出审批 |
+| 2. AgentLoop 与 Policy | 模型往返、执行计划、Allow/Ask/Deny、审批持久化；`Ledger`、`Policy`、`ApprovedPlan` 类型状态；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测 | 危险操作批准前不执行；重复批准不重复执行；Deny 不被授权覆盖；不构造 `Proof` 就调不到 `execute`（编译期）；`Ask` 后 Run 让出名额且 TUI 弹出审批；同一轮的两条只读调用同时在飞（`read` / `rg`），写与审批是屏障、取消要收齐已在飞的那些（§6）；**不在本次运行能力面里的工具，模型拼出名字也执行不了**，而交给模型的 schema 与执行时的表来自同一份（§4） |
 | 3. 六个工具 | 文件、搜索、进程、Python 环境与输出处理；`verify` 默认实现与 write/edit 的哈希核对 | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 与 `read` 走同一条判定（工作目录内的搜索不产生审批），且它不依赖机器上装没装 `rg` |
 | 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、审批渲染、短 ID、飞书卡片与 Telegram 内联按钮、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一人连点两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/approve` 与按钮回调重发只批准一次；来源会话与 home chat 都收到请求且第二个答复得到"已决定"；决定后卡片 / 消息原地更新；Gateway 重启后 pending 投递补发一次；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的审批请求 |
 | 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，`toasty::sql`）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的审批仍能在手机上批 |
@@ -1789,6 +1845,7 @@ Memory 与模型验收覆盖：
 | 模型一轮里提了两个调用、其中一个没有结果时，会话后面的新 Run 会不会被毒住 | §8.3 回放窗口 | **已实测（2026-09-20，真实 provider）：会。** 旧二进制下模型一轮提了两个调用，一个被拒/没执行，那条 `message.assistant` 留在会话里；其后**同一会话的每一条新 Run** 首个模型请求都被 provider 400 拒（`No tool output found for tool call call_00_…`），且会连着重试。当时用"回放窗口按 Run 过滤"（`service/segment.rs` 的 `window(surface, Some(run))`）挡住了它——**那是拿对话连续性换的**（见本节末与下一行）。**已改（2026-09-21）**：窗口改回"这一段对话"，毒化由两件事挡住——① 正跑的那条 Run 之外的消息**不带协议**（历史 Run 只发布用户正文与它最后答的正文），"有调用、没结果"的半轮因此进不了新请求；② `fail_call` 与按引用恢复让每一次调用都真的有个结果（下面那句）。回归测试：`service::segment::tests::a_later_run_still_reads_what_the_earlier_one_said`（历史那轮的 `tool_calls` / `provider_blocks` 一条都不出现）、`the_running_run_keeps_its_whole_protocol`（正跑的那条一个都不能少）。**已修（2026-09-20，本机真实会话复盘）**：线上那次 400 的调用是两次 `delegate`——两个漏法都补上了。①`resumed()` 重建调用时不按引用读回外置的 `arguments` / `plan`（§8.3 原话要求"读取历史或恢复调用时按引用加载需要的内容"）：委派的任务正文 6 KB 被外置，重 `prepare` 拿到的是一份 `null` 参数，当场失败。②`execute_one` 的"未知工具 / prepare 失败 / 放行被拒 / 子代理不能再委派"四条分支把结论**只交给模型、不写账本**（`Ledger::fail_call` 就是补这一笔）：那次调用于是永远悬着，父的窗口里两个 `function_call` 一前一后，provider 报的是前面那个。回归测试：`service::segment::tests::an_externalized_argument_and_plan_come_back_by_reference`、`service::tests::a_delegated_task_over_the_inline_limit_still_settles_the_parent_call`（去掉任一处的回填就失败）、`service::tests::a_call_that_cannot_run_still_gets_a_result_in_the_ledger`（去掉 `fail_call` 就失败）。 |
 | 超限的**正文**（`run.accepted.text` / `message.assistant.text` 过 4 KiB）在回放窗口里是不是也需要按引用读回 | §8.3 的"读取历史或恢复调用时按引用加载" | **已核实（2026-09-20，真实会话）**：会外置（本次会话里两条子 Run 的 `run.accepted` 与一条 `message.assistant` 都是 `text: null` + `text_ref`），而当时全仓**没有任何一处**读 `text_ref`——`replay()` 交给模型的用户消息因此是空的（没炸只是因为子代理的任务正文同时也在它的系统提示里，正常 Run 的用户输入很少过 4 KiB）。**已做（2026-09-21）**：`replay()` 现在按引用读回正文（`segment.rs` 的 `message_text`：内联优先、`text_ref` 次之，哈希由 `PayloadStore::open` 校验，读不出来或不是 UTF-8 都算会话缺内容 → 停下来报告而不是发一条空消息）。回归测试：`service::segment::tests::an_externalized_message_comes_back_by_reference`（用户输入与模型回复两条路）、`a_payload_that_cannot_be_read_stops_the_segment`。 |
 | 内嵌 `grep` + `ignore` 之后冷编还在不在 60s 预算内 | §13.4 的编译预算 | **已实测（2026-09-21，本机 macOS M5，`cargo build --timings`、空 target 目录）：加之前 1m10s（`/tmp` 里 HEAD 的干净 worktree），加之后 1m10s——差值落在噪声里。** 新带进来的 13 个包（`globset` / `walkdir` / `termcolor` / `crossbeam-deque` / `memmap2` / `bstr` / `encoding_rs_io` 等）与 `turso_core` / `aws-lc-sys` 并行，不在关键路径上。**顺带发现：60s 这个预算当时就已经超了**（§13.4 记的 2026-09-16 是 64.2s），与这次改动无关——要么把预算调到实测值，要么回去找关键路径，待办。 |
-| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 8 KiB，热生效）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**未核实**：8 KiB 这个默认值对真实任务够不够——要等真实会话的 recall 次数（§49 的指标）出来再调，别凭感觉改。**未接**：§6 同句里的"活动执行时限"（`ExecutionLimits::call_timeout`，300s）仍是代码默认值，没进配置——要么一起接，要么在 §3 里明确它是 start-only。 |
+| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 8 KiB，热生效）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**未核实**：8 KiB 这个默认值对真实任务够不够——要等真实会话的 recall 次数（§49 的指标）出来再调，别凭感觉改。**已补（2026-09-21）**：那四个数现在有得数了——每份观察落盘多少字节（`tool_output_bytes`）、产物多少（`artifact_bytes`）、投影给模型多少（`projected_bytes`），以及"模型回头 `read` 我们落盘的观察"的次数（`observation_recall_count`，判据是路径落在本 Session 的 `tool-output/` 或 `artifacts/` 底下）。四者都只进 trace（`komo::observation`），不进事件流（§47）；抓取与断言见 `komo-runtime/src/executor/tests.rs` 里那两条（`the_projection_reports_how_many_bytes_it_kept_and_stored`、`reading_back_an_observation_counts_as_a_recall`）。**未接**：§6 同句里的"活动执行时限"（`ExecutionLimits::call_timeout`，300s）仍是代码默认值，没进配置——要么一起接，要么在 §3 里明确它是 start-only。 |
 | `read` 一次读回来的正文够不够模型用 | §4 与 §8.3 | **已做（2026-09-21）**：`read` 交给模型的那一段从 400 字符改到 8 KiB（`read::PREVIEW_BYTES`），投影再按预算收。**未核实**：真实仓库里"读一个文件要几次 `read`"——如果还是很多次，说明该按结构切（一次给整段函数）而不是按字节。 |
+| 记忆召回的重排值不值（一次判断请求换来的排序） | §9.4 的可选重排 | **已做（2026-09-21）**：`[typesafe]` + `memory.retrieval.rerank` / `rerank_shortlist`——短名单（比 `top_k` 宽，校验拦「一样宽」的组合）交给一条 `Choice`，按回来的概率表排序，再照旧按 `top_k` 截；**只重排不增删**，挑中 `none` 或后端不可用都保持融合顺序。**已实测（2026-09-21，本机真机，4 条候选 / 中文输入）**：`jev-1.13.0` 一次 0.6s、约 650 输入 token，顺序 `[m-4, m-1, m-2, m-3]`——热水器与空调那两条排到了前面。离线验收在 `komo-runtime/src/memory/tests.rs`（抬高本来排不进的条目、`none` 不采纳、后端坏了照常召回、开关关着不发请求），真机那条是 `memory/rerank.rs` 里的 `mod live`（`--ignored`，要 `TYPESAFE_API_KEY`）。**未核实**：真实规模（成百上千条）下短名单取多宽、这一次请求值不值——按真实会话的命中率调，别凭感觉改 |
 | 系统提示里的 skill 目录行够不够用（166 个 skill 的机器） | §5.6 的目录行 | **已实测（2026-09-21，本机真实语料 + `komo skills list`）：不够，而且坏在两处。** ① `description: >` / `|` 这些 YAML 块标量没有解析——取值是字面量 `>`，325 份 `SKILL.md` 里 111 份的描述是这么写的，目录行长成 `- log-diagnosis：>`；② 2000 字符的预算按目录序 `continue` 丢弃，166 个不同名字里只剩 16 条进提示。真实会话里模型的第一批调用是读 `cart-loong-diff` / `ask-user`（正是那 16 条里的两条），找 `log-diagnosis` 靠的是 `ls` 整个目录，多花了好几轮。**已做（2026-09-21）**：frontmatter 支持块标量（`>` 折行 / `|` 字面，含 chomping，描述里的冒号不再被当成键）；目录改成**整批**定形状——描述装得下就是"名字 + 一句描述"，装不下就只留名字（166 条名字 2752 字符），名字都装不下时末尾写"另有 N 条没列出来"；默认上限 2000 → 4000。回归测试：`frontmatter::tests::a_folded_description_is_joined_into_one_sentence`、`skills::tests::every_skill_keeps_its_name_when_the_descriptions_do_not_fit`、`a_folded_description_becomes_one_catalog_line`。**未做**：按当前输入排序的 top-K——排序块不能进 system 前缀（§9.4 的前缀缓存），先看补全之后还错不错。 |

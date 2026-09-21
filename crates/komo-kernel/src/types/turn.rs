@@ -209,6 +209,19 @@ pub struct AcceptInput {
     /// 到"结果要长什么样"，父 Run 续跑时也不必去问运行时。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegate: Option<crate::types::delegate::DelegateSpec>,
+    /// **受理这一刻冻结下来的身份与能力**（§4.3）：哪个 Agent、哪一版 Profile、哪个模型、
+    /// 哪个工作目录、这次允许调用的工具、指向身份指令正文的引用、记忆作用域。
+    ///
+    /// 由受理方算好交下来，随 `run.accepted` 一起落账——**恢复时按它装配**：审批可能一小时
+    /// 之后才答复，而那时 Profile、工作目录与磁盘上的文件都可能已经改过，恢复出来的 Run
+    /// 不能因此换一副面孔。
+    ///
+    /// `None` = 这一条没有归属（旧行、Cron、子 Run 由父侧继承）：装配时按**当前**配置的
+    /// 默认 Agent 兜底（§八「已有 Session 归入默认 Agent；旧日志不重写」）。
+    /// 装箱的理由与 [`crate::events::RunAccepted::snapshot`] 同：它带着整份
+    /// [`crate::types::model::ModelConfig`]，而这个结构在受理路径上是按值搬的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Box<crate::types::agent::RunSnapshot>>,
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
 }
@@ -305,6 +318,7 @@ mod tests {
             },
             workdir: None,
             delegate: None,
+            snapshot: None,
             at: datetime!(2026-09-15 08:00:00 UTC),
         };
         let first = input.input_hash();

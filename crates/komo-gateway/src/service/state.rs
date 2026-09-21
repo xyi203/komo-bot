@@ -17,6 +17,7 @@ use komo_kernel::traits::{
     ApprovalRepo, Clock, CronRepo, EmbeddingClient, GatewayError, Ledger, LlmClient, MemoryRepo,
     RepoError, RunQueue, StoreError, ToolOutputStore,
 };
+use komo_kernel::types::agent::{AgentProfile, RunSnapshot};
 use komo_kernel::types::chat::{ApprovalScope, ChannelPeer, PeerId};
 use komo_kernel::types::ids::{ApprovalId, ExecutorId, RequestKey, RunId, SessionId};
 use komo_kernel::types::model::ModelConfig;
@@ -34,9 +35,10 @@ use komo_runtime::memory::{
 use komo_runtime::policy::PolicyEngine;
 use komo_runtime::recovery::{RecoveryIndex, RecoveryScan, UnfinishedRun};
 use komo_runtime::scheduler::{HandlerError, Scheduler, SchedulerConfig, Waker};
+use komo_runtime::tools::paths;
 use komo_store::{
-    Db, RecoveryStore, TursoApprovalRepo, TursoCronRepo, TursoDeliveryRepo, TursoMemoryRepo,
-    TursoRunQueue,
+    Db, PayloadStore, RecoveryStore, TursoApprovalRepo, TursoCronRepo, TursoDeliveryRepo,
+    TursoMemoryRepo, TursoRunQueue,
 };
 use time::OffsetDateTime;
 
@@ -295,6 +297,8 @@ impl komo_runtime::scheduler::RunHandler for TrackingHandler {
 /// 一次装配出来的 Gateway。
 pub struct GatewayState {
     pub home: PathBuf,
+    /// 共享 agent 目录按哪个家目录算（§5.6）。见 [`Assembly::shared_home`]。
+    pub shared_home: Option<PathBuf>,
     pub instance_id: String,
     pub token: String,
     pub started_at: OffsetDateTime,
@@ -358,13 +362,6 @@ pub struct GatewayState {
     /// 到达率，"投过一次就不再投"这条判据也只能有一个。
     pub watching: Mutex<std::collections::BTreeSet<RunId>>,
     pub approvals_delivered: Mutex<std::collections::BTreeSet<String>>,
-    /// 会话的工作目录。
-    ///
-    // TODO(decide: `sessions.workdir` 这一列 store 只在建行时写（`ensure_in` 永远写
-    // `None`），公开面上没有改它的函数，而 `POST /v1/sessions` 收 `workdir`。这里先记在
-    // 进程里——重启后会话回到"用 workspaces/"。要持久化需要 store 加一个
-    // `repos::session::set_workdir_in`，见报告。)
-    pub workdirs: Mutex<std::collections::BTreeMap<SessionId, String>>,
     /// 模型请求的有界退避预算上限（§8.5）。
     pub max_retries: u32,
     /// 一段最多跑几轮模型（§6）。
@@ -393,6 +390,10 @@ pub struct Assembly {
     pub llm: Option<Arc<dyn LlmClient>>,
     /// 测试注入的向量后端；`None` = 按 `memory.embedding` alias 造（造不出来就只有关键词臂）。
     pub embeddings: Option<Arc<dyn EmbeddingClient>>,
+    /// 共享 agent 目录（`~/.agents/skills`、`~/.claude/skills`）按哪个家目录算；
+    /// `None` = 当前用户的家目录。**注入而不是现场读 `$HOME`**（§5.6）：否则提示里有哪些
+    /// skill 取决于这台机器上别人装过什么。
+    pub shared_home: Option<PathBuf>,
     pub tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
     /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
     pub channels: Vec<Arc<dyn ChannelFactory>>,
@@ -411,6 +412,7 @@ impl GatewayState {
             token,
             llm,
             embeddings,
+            shared_home,
             tools,
             channels: factories,
         } = parts;
@@ -468,11 +470,15 @@ impl GatewayState {
         // 向量后端**注入的优先**（测试），否则这里只留空槽：探测在后台跑
         // （`spawn_embedding_probe`），不等它。
         let injected_embeddings = embeddings;
+        // 判断后端（§9.4 的可选一步）：**造它不碰网络**，所以直接装，不用像向量维度那样
+        // 后台探测。配置热重载会换掉它（`GatewayState::refresh_reranker`）。
+        let reranker = build_reranker(&snapshot, &config);
         let memories = Arc::new(MemoryManager::new(MemoryParts {
             config: snapshot.memory.clone(),
             repo: Arc::clone(&memory),
             catalog: Arc::new(TursoMemoryRepo::new(db.clone())),
             embeddings: injected_embeddings.clone(),
+            reranker,
             llm: Arc::clone(&llm_for_memory(&snapshot, &config, &caps, llm.as_ref())),
             events: Arc::new(LedgerEvents(Arc::clone(&routed) as Arc<dyn Ledger>)),
             work: Arc::new(DbMemoryWork::new(db.clone(), Arc::clone(&clock))),
@@ -511,6 +517,7 @@ impl GatewayState {
         let skills = Arc::new(std::sync::RwLock::new(skills_prompt(
             &snapshot,
             &tool_names,
+            shared_home.as_deref(),
         )));
         let executor_tools = Arc::new(ToolExecutor::new(
             tools,
@@ -555,7 +562,10 @@ impl GatewayState {
                 komo_store::CheckpointStore::new(db.clone()),
             )
             // §5.6 的目录行：与 state 共用一个 `Arc`，重载时就地换内容。
-            .with_skills(Arc::clone(&skills)),
+            .with_skills(Arc::clone(&skills))
+            // 交给模型的 Schema 由执行器按这一次的能力面渲染（§4 末）：`definitions_for`
+            // 与执行器查找工具用的是同一份实现与同一份目录。
+            .with_executor(Arc::clone(&executor_tools)),
         );
 
         let handler = Arc::new(AgentRunHandler::new(
@@ -583,6 +593,7 @@ impl GatewayState {
 
         Ok(Arc::new(GatewayState {
             home,
+            shared_home,
             instance_id,
             token,
             started_at: clock.now(),
@@ -619,7 +630,6 @@ impl GatewayState {
             inbound: std::sync::OnceLock::new(),
             watching: Mutex::new(std::collections::BTreeSet::new()),
             approvals_delivered: Mutex::new(std::collections::BTreeSet::new()),
-            workdirs: Mutex::new(std::collections::BTreeMap::new()),
             tool_names,
             skills_prompt: skills,
             max_retries,
@@ -635,9 +645,17 @@ impl GatewayState {
     ///
     /// 目录行是启动快照，配置重载是唯一会动它的时刻：`paths.skill_dirs` 改了、人刚
     /// `komo skills disable` 过，重载之后新的一段就该按新的来。算了但是没变就不吭声。
+    /// 按**当前**快照重装判断后端（§9.4）：`[typesafe]` 或 `memory.retrieval.rerank`
+    /// 一变，下一次召回就按新的来——与 `refresh_skills_prompt` 同一个理由（§3 的热重载
+    /// 不能有"改了没反应"的键）。
+    pub fn refresh_reranker(&self) {
+        self.memories
+            .install_reranker(build_reranker(&self.snapshot(), &self.config));
+    }
+
     pub fn refresh_skills_prompt(&self) {
         let snapshot = self.snapshot();
-        let text = skills_prompt(&snapshot, &self.tool_names);
+        let text = skills_prompt(&snapshot, &self.tool_names, self.shared_home.as_deref());
         let mut current = self.skills_prompt.write().expect("skills 目录");
         if *current == text {
             return;
@@ -647,22 +665,6 @@ impl GatewayState {
             "系统提示里的 skills 目录行变了"
         );
         *current = text;
-    }
-
-    /// 记下一个会话的工作目录。
-    pub fn remember_workdir(&self, session: &SessionId, workdir: &str) {
-        self.workdirs
-            .lock()
-            .expect("工作目录表")
-            .insert(session.clone(), workdir.to_string());
-    }
-
-    pub fn workdir_of(&self, session: &SessionId) -> Option<String> {
-        self.workdirs
-            .lock()
-            .expect("工作目录表")
-            .get(session)
-            .cloned()
     }
 
     /// 按**当前**快照造一个 Cron 调度器。
@@ -798,30 +800,235 @@ impl GatewayState {
         ))
     }
 
-    /// 操作者那**一个**常驻会话（§11.2 的 home session）。
+    /// 一个 Agent 的**主会话**（§11.2 的 home session，按 Agent 各一份）。
     ///
     /// 「操作者的私聊——飞书 DM、Telegram DM、WeChat、TUI——全部落到同一个 home
-    /// session」：它是 `sessions` 表里 `origin = "home"` 的那一行，第一次问的时候铸
-    /// 出来，此后一直是它。**不另存一个文件**：会话表本来就答得出这个问题。
-    pub async fn home_session(&self) -> Result<SessionId, GatewayError> {
-        if let Some(existing) = self.find_home_session().await? {
-            return Ok(existing);
+    /// session」这条规则在多 Agent 下变成**每个 Agent 一份主会话**（§4.2）：归属记在
+    /// `sessions.agent_id` + `sessions.kind = 'main'` 上，唯一性由 store 的部分唯一索引
+    /// （`sessions_main_per_agent`）保证——不是"各建一个再挑最早的"。
+    ///
+    /// 归属**在创建时定下来**，此后不随消息路由变化（§4.2）：换助手是路由到另一个会话，
+    /// 不是给已有会话换人格、换能力，同时留着原来的全部上下文。
+    pub async fn main_session(&self, agent_id: &str) -> Result<SessionId, GatewayError> {
+        if let Some(main) = komo_store::repos::session::main_for_agent(&self.db, agent_id).await? {
+            // 同一个 Agent 有多条主会话只可能是**升级过来的旧库**在说话（索引补列之后才
+            // 存在）。store 取最早的那条，这里把其余的**报出来**：两个入口各建过一个主会话
+            // 是操作者该知道的事。
+            if !main.duplicates.is_empty() {
+                tracing::warn!(
+                    agent = %agent_id,
+                    main = %main.row.id,
+                    duplicates = %main
+                        .duplicates
+                        .iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join("、"),
+                    "这个 Agent 有多条主会话，取最早的那一条"
+                );
+            }
+            return Ok(SessionId::from_raw(main.row.id));
         }
-        let session = SessionId::new_at(self.clock.now());
+
+        // 候选：**升级之前**那个全局主会话（`origin = 'home'`、还没有归属）。它按 §八
+        // 「已有 Session 归入默认 Agent」读作默认 Agent 的那一份——所以**只有默认 Agent
+        // 认它**：别的 Agent 认了它，一次升级之后操作者原来那段对话就会凭空换一个助手。
+        // 没有候选（或者不归我）就现铸一个。
+        let candidate = match self.unowned_main().await? {
+            Some(session) if agent_id == self.snapshot().agent.default_agent => session,
+            _ => SessionId::new_at(self.clock.now()),
+        };
+        let row = komo_store::repos::session::ensure_main(
+            &self.db,
+            &candidate,
+            agent_id,
+            HOME_ORIGIN,
+            &session_log_path(&candidate),
+        )
+        .await?;
+        let session = SessionId::from_raw(row.id);
+        // **建行与建目录是两件事**：上面那一句只写库（`kind` / `agent_id` / `jsonl_path`），
+        // 会话目录与 `events.jsonl` 由 Coordinator 的 `open` 落下来。它认到行已经在就原样
+        // 返回，一行归属都不动。
         self.ledgers.open(&session, HOME_ORIGIN).await?;
-        // 开的过程里可能有别人也开了一个；以表里最早的那一行为准。
-        Ok(self.find_home_session().await?.unwrap_or(session))
+        Ok(session)
     }
 
-    async fn find_home_session(&self) -> Result<Option<SessionId>, GatewayError> {
-        let mut homes: Vec<SessionId> = komo_store::repos::session::list(&self.db, true)
+    /// **没有归属的入口**（TUI / CLI / `/v1/home-session`，以及没有绑定 Agent 的私聊）
+    /// 落在哪个会话。
+    ///
+    /// §四：「`default_agent` 指名"没有归属的入口（TUI、CLI、Cron）走谁"」。这些入口答不出
+    /// "找谁"，所以它们走同一个名字，而不是各自挑一个。
+    pub async fn default_main_session(&self) -> Result<SessionId, GatewayError> {
+        self.main_session(&self.snapshot().agent.default_agent)
+            .await
+    }
+
+    /// 升级之前那个**还没有归属**的全局主会话：`origin = 'home'` + `agent_id` 为空。
+    ///
+    /// 补 `kind` 那一列时按 `origin = 'home'` 回填成主会话（store 的 `BACKFILL_KIND`），
+    /// 而 `agent_id` **故意留空**——"迁移不替路由认主"。认主是这里的事：默认 Agent 认它
+    /// （[`Self::main_session`] 的候选分支）。
+    async fn unowned_main(&self) -> Result<Option<SessionId>, GatewayError> {
+        let mut found: Vec<SessionId> = komo_store::repos::session::list(&self.db, true)
             .await?
             .into_iter()
-            .filter(|record| record.origin == HOME_ORIGIN)
+            .filter(|record| record.agent_id.is_empty() && record.origin == HOME_ORIGIN)
             .map(|record| record.session)
             .collect();
-        homes.sort();
-        Ok(homes.into_iter().next())
+        found.sort();
+        Ok(found.into_iter().next())
+    }
+
+    /// 这个会话归哪个 Agent（§4.2 的执行身份那一半）。
+    ///
+    /// 归属写在 `sessions.agent_id` 上、建会话时定下来，**不随消息路由变化**。空串 =
+    /// 还没有归属（升级前建的行）：按 `default_agent` 用它，**不改写这一行**——归属只写
+    /// 一次，写的人是建会话的那一步（`main_session` / `set_agent`）。
+    pub async fn agent_of_session(&self, session: &SessionId) -> Result<String, GatewayError> {
+        let agent_id = komo_store::repos::session::get(&self.db, session)
+            .await?
+            .map(|record| record.agent_id)
+            .unwrap_or_default();
+        Ok(self.owner_or_default(agent_id))
+    }
+
+    /// 一条记载下来的归属，或者默认 Agent（空串 = 还没有归属）。
+    fn owner_or_default(&self, agent_id: String) -> String {
+        if agent_id.is_empty() {
+            self.snapshot().agent.default_agent.clone()
+        } else {
+            agent_id
+        }
+    }
+
+    /// 把一个**刚建出来、还没有归属**的会话记在默认 Agent 名下。
+    ///
+    /// 「一个 Session 的 `agent_id` 创建后不随消息路由变化」（§4.2）：不写这一笔，一处
+    /// 会话就成了"当前谁是默认 Agent 就归谁"——操作者换一次 `default_agent`，那些群聊会
+    /// 悄悄换一个人格继续说话。写了就只写一次（store 的 `set_agent` 是条件更新），之后
+    /// 谁也改不动它。
+    ///
+    /// 写不进去**不让这次路由失败**：它最坏是回到"按当前默认 Agent 用它"，而拿不到会话是
+    /// 拿不到任务。
+    pub async fn own_session(&self, session: &SessionId) -> Result<(), GatewayError> {
+        let agent_id = self.snapshot().agent.default_agent.clone();
+        match komo_store::repos::session::set_agent(&self.db, session, &agent_id).await {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                tracing::warn!(%error, session = %session, agent = %agent_id, "归属没记到会话上");
+                Ok(())
+            }
+        }
+    }
+
+    /// **受理这一刻的身份与能力**（§4.3）。
+    ///
+    /// 算出来的 [`RunSnapshot`] 随 `run.accepted` 落账，此后就是这一条 Run 的唯一身份
+    /// 依据：恢复时按它装配，**不拿当前配置去覆盖它**。
+    ///
+    /// 落在快照里的每一样都在这一步定死，理由是它们**都可能在中途被改**：Profile 的指令、
+    /// 工具表、工作目录、模型 alias。审批可能一小时之后才答复，而那时这些文件与配置都可能
+    /// 已经变过——恢复出来的 Run 不能因此换一副面孔。
+    async fn freeze_run(
+        &self,
+        config: &ConfigSnapshot,
+        agent_id: &str,
+        session: &SessionId,
+        record: Option<&komo_store::repos::session::SessionRecord>,
+        model: Option<ModelConfig>,
+    ) -> Result<RunSnapshot, GatewayError> {
+        let profile = match config.agent.get(agent_id) {
+            Some(profile) => profile,
+            None => {
+                // 配置里已经没有这个 Agent 了（`[agents]` 被改过）。**一条配置改动不该让
+                // 输入失败**：退回默认 Agent 并把"是谁不见了"说清楚（§八：旧归属归入
+                // 默认 Agent）。
+                let fallback = config.agent.default_profile();
+                tracing::warn!(
+                    agent = %agent_id,
+                    fallback = %fallback.id,
+                    session = %session,
+                    "这个会话绑的 Agent 已经不在配置里，按默认 Agent 受理"
+                );
+                fallback
+            }
+        };
+
+        // 能力面：Profile 在**这份工具目录**里挑出来的那一份（§4 末）。名字写了、目录里
+        // 没有的名字**不算数**，而且必须报出来——静默采纳一份写错的配置，等于让操作者
+        // 以为某个工具给了而其实没给。
+        let surface = super::surface_of(
+            profile,
+            &self.tool_names,
+            &super::agent_config_file(&self.config),
+        );
+
+        // 工作目录：**会话自己的 `workdir` 优先**，其次 Profile 的 `workspace`，最后
+        // `[paths] workspaces_dir`。
+        //
+        // 为什么会话优先：`workdir` 是操作者对**这一段对话**的显式选择（`POST /v1/sessions`
+        // 写下的那一行，界面读的也是它，见 §八 那次收口），而 Profile 的 `workspace` 是
+        // "没写的时候用哪个"——一个默认值不该盖掉一个显式选择。反过来（Profile 优先）
+        // 会让界面显示的那个目录与执行实际用的那个目录重新裂成两份事实，正是 §八 已经
+        // 修掉的那件事。
+        //
+        // 冻结的是**解析完的真实路径**：符号链接在这一刻解掉，Profile / 会话之后改过
+        // 也不影响这一条 Run（`tools::paths::resolve` 与根用的是同一个口径）。
+        let workspace = record
+            .and_then(|record| record.workdir.clone())
+            .map(PathBuf::from)
+            .or_else(|| profile.workspace.clone())
+            .unwrap_or_else(|| config.paths.workspaces_dir.clone());
+        let workspace = paths::real_root(&workspace);
+
+        // 模型：这次请求里显式给的最优先（那是操作者**这一次**的选择），其次 Profile 的
+        // alias（进 `model_catalog` 解析），最后主模型。
+        let model = model.unwrap_or_else(|| self.agent_model(config, profile));
+
+        // 身份指令正文**进 `PayloadStore`**，快照里只留引用（§4.3）：存的是内容，不是
+        // 文件路径——审批期间配置文件可能已经被改过，恢复出来的 Run 不能换一副面孔。
+        // `PayloadStore` 是内容寻址的，同一段正文重复受理只写一次。
+        let instructions_ref = match &profile.instructions {
+            Some(text) => Some(
+                PayloadStore::new(self.ledgers.paths_for(session))
+                    .put(text.as_bytes())
+                    .await?,
+            ),
+            None => None,
+        };
+
+        Ok(RunSnapshot {
+            agent_id: profile.id.clone(),
+            profile_revision: profile.revision(),
+            model,
+            workspace,
+            surface,
+            instructions_ref,
+            memory_scope: profile.memory_scope.clone(),
+        })
+    }
+
+    /// Profile 指的那个模型 alias，解析不出来就用主模型。
+    ///
+    /// **不因为一个写错的 alias 让输入失败**：那会把一次配置笔误变成一条丢掉的输入。
+    /// 解析不出来时说清楚是哪个 alias，然后按主模型跑。
+    fn agent_model(&self, config: &ConfigSnapshot, profile: &AgentProfile) -> ModelConfig {
+        let Some(alias) = profile.model.as_deref() else {
+            return config.model.clone();
+        };
+        match config.model_catalog.completion(alias) {
+            Some(model) => model.clone(),
+            None => {
+                tracing::warn!(
+                    file = %super::agent_config_file(&self.config).display(),
+                    agent = %profile.id,
+                    alias,
+                    "`[agents]` 指的模型 alias 不在 model_catalog 里，这一次用主模型"
+                );
+                config.model.clone()
+            }
+        }
     }
 
     /// 提交一条输入：**HTTP 与聊天渠道共用的那一段**（§13.1）。
@@ -843,7 +1050,21 @@ impl GatewayState {
                 state.as_str()
             )));
         }
-        let snapshot = self.snapshot();
+        // **受理这一刻冻结身份与能力**（§4.3）：哪个 Agent（这个会话的归属）、哪一版
+        // Profile、哪个模型、哪个工作目录、这次允许调用的工具、身份指令正文、记忆作用域。
+        // 它随 `run.accepted` 落账，恢复时按它装配——审批期间 Profile 被改过也换不掉
+        // 这一条 Run 的面孔。
+        let config = self.snapshot();
+        let record = komo_store::repos::session::get(&self.db, session).await?;
+        let agent_id = self.owner_or_default(
+            record
+                .as_ref()
+                .map(|record| record.agent_id.clone())
+                .unwrap_or_default(),
+        );
+        let frozen = self
+            .freeze_run(&config, &agent_id, session, record.as_ref(), model)
+            .await?;
         let accepted = self
             .routed
             .accept_input(AcceptInput {
@@ -855,10 +1076,14 @@ impl GatewayState {
                 },
                 peer: peer.clone(),
                 // 「新 Run 在 `accept_input` 时抓一份模型 / effort 快照」（§3 第 2 步）。
-                model: model.unwrap_or_else(|| snapshot.model.clone()),
+                // 这一份就是快照里那一个——同一个值写两处（`runs.model_snapshot` 与
+                // `run.accepted` 的 `snapshot.model`），它们的缘分是同一个受理时刻，
+                // 不是两次各自解析。
+                model: frozen.model.clone(),
                 workdir: None,
                 // 交互输入不是委派：子 Run 只由 executor 在委托那一步受理（§4）。
                 delegate: None,
+                snapshot: Some(Box::new(frozen)),
                 at: self.clock.now(),
             })
             .await?;
@@ -1276,8 +1501,23 @@ pub fn protected_paths(snapshot: &ConfigSnapshot, home: &std::path::Path) -> Vec
     ]
 }
 
-/// `sessions.origin` 里 home session 的那个值。
+/// `sessions.origin` 里**主会话**的那个值。
+///
+/// 它是"这条会话从哪个入口来"，不是身份：身份是 `agent_id`（§4.2）。一个 Agent 的主会话
+/// 与别的 Agent 的主会话在这一列上**长得一样**，区别在归属那一列。
+///
+/// 光秃秃的 `"home"` 也是**这次改造之前**那个全局主会话的取值——升级之后它仍然能被认成
+/// 默认 Agent 的主会话（见 `GatewayState::main_session` 的候选分支），**旧行不重写**。
 pub const HOME_ORIGIN: &str = "home";
+
+/// 会话日志在库里记的那条**相对路径**（`sessions/<id>/events.jsonl`）。
+///
+/// 建一行会话时要带上它，而 `main_session` 是 Gateway 唯一自己建行的地方。这一串是
+/// **store 的约定**（`Coordinator::open` 与 `queue` / `interventions` 里写的是同一条）；
+/// 收在这一个函数里，是为了让"改口径"只有一处要跟。
+fn session_log_path(session: &SessionId) -> String {
+    format!("sessions/{session}/events.jsonl")
+}
 
 /// 一次补写最多处理多少条审计事件。
 const AUDIT_DRAIN_LIMIT: usize = 128;
@@ -1343,13 +1583,51 @@ fn spawn_embedding_probe(memories: Arc<MemoryManager>, config: Arc<ConfigHolder>
     });
 }
 
+/// 按快照造判断后端（§9.4）。
+///
+/// 没开开关、没配后端、没凭证、造不出来——**一律 `None` + 一句日志**，绝不让 Gateway
+/// 起不来：重排是加分项，没有它召回照样按关键词 + 向量的融合顺序给。
+fn build_reranker(
+    snapshot: &ConfigSnapshot,
+    config: &ConfigHolder,
+) -> Option<komo_runtime::memory::Reranker> {
+    if !snapshot.memory.retrieval.rerank {
+        return None;
+    }
+    match komo_runtime::typesafe::connect(
+        &snapshot.typesafe,
+        &config.secrets(),
+        komo_runtime::llm::default_transport(),
+    ) {
+        Ok(backend) => Some(komo_runtime::memory::Reranker {
+            backend,
+            model: snapshot.typesafe.model.clone(),
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "判断后端建不出来：记忆召回按融合顺序给（§9.4）");
+            None
+        }
+    }
+}
+
 /// 系统提示里的 skills 目录行（§5.6）。
 ///
 /// `<workspace>` 取 Gateway 的 workspaces 目录，**不是** Session 的 `workdir`：这一块是
 /// 启动快照（§5.6 要的就是提示前缀稳定），而 `workdir` 是逐个会话变的——按它算出来的是
 /// 一份每段都可能不一样的前缀。
-fn skills_prompt(snapshot: &ConfigSnapshot, tool_names: &[String]) -> String {
-    let home = komo_runtime::config::user_home().ok();
+///
+/// `shared_home` 是**注入**的（`~/.agents/skills`、`~/.claude/skills` 按它算）；`None`
+/// 才回落到当前用户的家目录。现场读 `$HOME` 会让"提示里有哪些 skill"取决于这台机器上
+/// 别的 agent 装过什么，测试之间因此会互相污染。
+fn skills_prompt(
+    snapshot: &ConfigSnapshot,
+    tool_names: &[String],
+    shared_home: Option<&std::path::Path>,
+) -> String {
+    let home = match shared_home {
+        Some(home) => Some(home.to_path_buf()),
+        None => komo_runtime::config::user_home().ok(),
+    };
     let registry = komo_runtime::skills::SkillRegistry::from_snapshot(
         snapshot,
         Some(&snapshot.paths.workspaces_dir),

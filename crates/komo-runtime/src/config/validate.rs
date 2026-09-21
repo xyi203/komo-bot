@@ -75,6 +75,8 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
     check_channels(snapshot, &mut issues);
     check_policy(snapshot, &mut issues);
     check_execution(snapshot, &mut issues);
+    check_typesafe(snapshot, &mut issues);
+    check_agents(snapshot, &mut issues);
 
     issues.sort_by(|a, b| a.key.cmp(&b.key).then(a.severity.cmp(&b.severity)));
     issues
@@ -276,6 +278,61 @@ fn check_retrieval(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
     if retrieval.max_tokens == 0 {
         issues.push(error("memory.retrieval.max_tokens", "max_tokens 不能是 0"));
     }
+    if retrieval.rerank {
+        // 重排换的是"谁进得了 top_k"。短名单和 top_k 一样宽时它只是换个顺序——写了这个
+        // 组合的人想要的是重排，拿到的却是一个空转的开关。
+        if retrieval.rerank_shortlist <= retrieval.top_k {
+            issues.push(error(
+                "memory.retrieval.rerank_shortlist",
+                format!(
+                    "重排开着，但短名单（{}）不比 top_k（{}）宽：这样重排换不出任何本来进不了 \
+                     top_k 的条目。把它调大，或者把 rerank 关掉",
+                    retrieval.rerank_shortlist, retrieval.top_k
+                ),
+            ));
+        }
+        if retrieval.rerank_shortlist > retrieval.candidate_limit {
+            issues.push(error(
+                "memory.retrieval.rerank_shortlist",
+                format!(
+                    "重排短名单（{}）比 candidate_limit（{}）还大：每条臂最多也只会给这么多候选",
+                    retrieval.rerank_shortlist, retrieval.candidate_limit
+                ),
+            ));
+        }
+        if !snapshot.typesafe.enabled {
+            issues.push(error(
+                "memory.retrieval.rerank",
+                "重排开着，但判断后端（[typesafe]）没有 enabled：那一步没有后端可用",
+            ));
+        }
+    }
+}
+
+/// `[typesafe]`（§9.4 的可选判断后端）。开着就要有端点、模型与那一条凭证。
+fn check_typesafe(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    let typesafe = &snapshot.typesafe;
+    if !typesafe.enabled {
+        return;
+    }
+    if typesafe.endpoint.trim().is_empty() {
+        issues.push(error("typesafe.endpoint", "endpoint 不能是空的"));
+    }
+    if typesafe.model.trim().is_empty() {
+        issues.push(error("typesafe.model", "model 不能是空的"));
+    }
+    if typesafe.timeout_secs == 0 {
+        issues.push(error("typesafe.timeout_secs", "超时不能是 0 秒"));
+    }
+    if typesafe.api_key.trim().is_empty() {
+        issues.push(error("typesafe.api_key", "api_key 要写凭证的变量名"));
+    } else if !snapshot.credentials.contains_key(&typesafe.api_key) {
+        // 和模型后端同一个口径：快照里只记"这个变量有没有值"，值只在 `.env` 里。
+        issues.push(error(
+            &format!("typesafe.api_key ({})", typesafe.api_key),
+            "`.env` 里没有这个名字的凭证",
+        ));
+    }
 }
 
 /// §6：Gateway 设置的输出长度。0 会让每一条工具结果都对模型空着——那不是一个配置，
@@ -285,6 +342,58 @@ fn check_execution(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
         issues.push(error(
             "execution.model_result_bytes",
             "model_result_bytes 不能是 0（模型就什么都看不到了）",
+        ));
+    }
+}
+
+/// 助手定义（§四）。**没有隐含默认**，所以"一个都没声明"与"default_agent 指了个不存在的
+/// id"都要在这里说出来——否则装配时才发现，操作者只看到一句"起不来"。
+fn check_agents(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    let agent = &snapshot.agent;
+    if agent.agents.is_empty() {
+        issues.push(error(
+            "agents",
+            "至少要声明一个 Agent：写上 default_agent 与 [agents.<id>]（没有隐含的默认助手）",
+        ));
+        return;
+    }
+    for (id, profile) in &agent.agents {
+        if profile.id != *id {
+            issues.push(error(
+                &format!("agents.{id}.id"),
+                format!(
+                    "这段的 id 是 `{}`，与它在表里的键 `{id}` 不一致",
+                    profile.id
+                ),
+            ));
+        }
+        if id.trim().is_empty() {
+            issues.push(error("agents.<id>", "Agent 的 id 不能是空的"));
+        }
+        if profile
+            .instructions
+            .as_ref()
+            .is_some_and(|text| text.trim().is_empty())
+        {
+            issues.push(error(
+                &format!("agents.{id}.instructions"),
+                "写了 instructions 就不能是空的；不想要就整行去掉",
+            ));
+        }
+    }
+    if agent.default_agent.trim().is_empty() {
+        issues.push(error(
+            "default_agent",
+            "要指名没有归属的入口（TUI / CLI / Cron）走哪个 Agent",
+        ));
+    } else if agent.get(&agent.default_agent).is_none() {
+        issues.push(error(
+            "default_agent",
+            format!(
+                "`{}` 不在 [agents.<id>] 里；现有的是：{}",
+                agent.default_agent,
+                agent.agents.keys().cloned().collect::<Vec<_>>().join("、")
+            ),
         ));
     }
 }

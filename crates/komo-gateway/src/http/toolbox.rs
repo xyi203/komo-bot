@@ -348,7 +348,7 @@ async fn decide(
         }
         komo_kernel::policy::PolicyDecision::Deny { reason } => Ok(refused(&change, reason)),
         komo_kernel::policy::PolicyDecision::Ask { reason, .. } => {
-            let session = api.state.home_session().await?;
+            let session = api.state.default_main_session().await?;
             let record = api
                 .state
                 .approvals
@@ -488,7 +488,7 @@ async fn plan_of(
     toolbox: &Arc<Toolbox>,
     change: &Change,
 ) -> Result<ExecutionPlan, ApiFailure> {
-    let session = api.state.home_session().await?;
+    let session = api.state.default_main_session().await?;
     Ok(ExecutionPlan {
         operation_id: OperationId::new_at(api.state.clock.now()),
         source: PlanSource::Interactive { session },

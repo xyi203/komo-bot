@@ -25,6 +25,7 @@ mod consolidate;
 mod extract;
 mod index;
 mod preamble;
+mod rerank;
 mod work;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,7 +36,7 @@ use komo_kernel::protocol::config::{MemoryConfig, RetrievalConfig};
 use komo_kernel::protocol::http::{IndexState, MemoryIndexStatus};
 use komo_kernel::traits::{
     Clock, EmbedError, EmbeddingClient, Ledger, LedgerError, LlmClient, MemoryRepo, RepoError,
-    StoreError,
+    StoreError, SystemOne,
 };
 use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{
@@ -314,10 +315,29 @@ pub struct MemoryParts {
     pub catalog: Arc<dyn MemoryCatalog>,
     /// `None` = 没有配置 `memory.embedding` alias，只有关键词臂。
     pub embeddings: Option<Arc<dyn EmbeddingClient>>,
+    /// 召回短名单的判断后端（§9.4）。`None` = 没配 `[typesafe]`，或者 `retrieval.rerank`
+    /// 关着——那就照融合顺序给。
+    pub reranker: Option<Reranker>,
     pub llm: Arc<dyn LlmClient>,
     pub events: Arc<dyn SessionEvents>,
     pub work: Arc<dyn MemoryWorkLog>,
     pub clock: Arc<dyn Clock>,
+}
+
+/// 记忆重排用的判断后端（§9.4）。
+#[derive(Clone)]
+pub struct Reranker {
+    pub backend: Arc<dyn SystemOne>,
+    /// 判断层的模型名（`[typesafe].model`）。**进请求体，不是凭证**，所以可以进日志。
+    pub model: String,
+}
+
+impl std::fmt::Debug for Reranker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reranker")
+            .field("model", &self.model)
+            .finish()
+    }
 }
 
 /// §9 的那一层。
@@ -333,6 +353,9 @@ pub struct MemoryManager {
     /// 「Gateway 就绪」等网络（本机实测一个只收不回话的端点 = 等满模型超时）。探到就
     /// [`MemoryManager::install_embeddings`]，探不到就一直空着，检索按 §9.4 如实降级。
     embeddings: RwLock<Option<Arc<dyn EmbeddingClient>>>,
+    /// 判断后端。与向量后端同一个形状（可以后装）：配置热重载时换成新的那一份，运行中的
+    /// 查询下一次就读到新的。
+    reranker: RwLock<Option<Reranker>>,
     /// 配了 `memory.embedding` alias 吗。**与"后端在不在手上"是两件事**：配了但探测还没
     /// 落定（或探测失败）时，§9.4 的规则是"hybrid 退化成关键词、vector-only 报不可用"，
     /// 不是"配置错误"。
@@ -400,6 +423,7 @@ impl MemoryManager {
             repo: parts.repo,
             catalog: parts.catalog,
             embeddings: RwLock::new(parts.embeddings),
+            reranker: RwLock::new(parts.reranker),
             configured,
             llm: parts.llm,
             events: parts.events,
@@ -444,6 +468,20 @@ impl MemoryManager {
     /// 检索按 §9.4 把降级如实报出去。
     pub fn install_embeddings(&self, client: Arc<dyn EmbeddingClient>) {
         *self.embeddings.write().expect("向量后端槽") = Some(client);
+    }
+
+    /// 换上（或撤掉）判断后端。配置热重载走这里：`[typesafe]` 或
+    /// `memory.retrieval.rerank` 一变，下一次召回就按新的来。
+    pub fn install_reranker(&self, reranker: Option<Reranker>) {
+        *self.reranker.write().expect("判断后端槽") = reranker;
+    }
+
+    /// 这一次查询要不要重排、用哪个后端。**两个条件都要**：开关开着，而且后端在手上。
+    fn reranker(&self) -> Option<Reranker> {
+        if !self.retrieval.rerank {
+            return None;
+        }
+        self.reranker.read().expect("判断后端槽").clone()
     }
 
     /// 手上没有向量后端时的错误。**配了 alias = 端点这一刻不可用，没配 = 配置错误**
@@ -506,7 +544,22 @@ impl MemoryManager {
             }
         }
 
-        let result = self.repo.recall(&query).await?;
+        // 重排（§9.4，可选）：**短名单要比 `top_k` 宽**——一样宽就只是换个顺序，换不出任何
+        // 本来进不了 `top_k` 的条目（配置校验也拦这个组合）。判断后端不在手上时按融合
+        // 顺序给，用户什么都不会发现（日志里有一次 warn）。
+        let reranker = self.reranker();
+        let top_k = query.top_k.max(1);
+        let shortlist = reranker.as_ref().map(|_| {
+            self.retrieval
+                .rerank_shortlist
+                .max(top_k + 1)
+                .min(query.candidate_limit.max(1))
+        });
+        if let Some(shortlist) = shortlist {
+            query.top_k = shortlist;
+        }
+
+        let mut result = self.repo.recall(&query).await?;
         if query.mode == RetrievalMode::Vector && result.degraded {
             // vector-only **明确报不可用**，不能把故障解释成"没有相关记忆"（§9.4）。
             return Err(MemoryError::VectorUnavailable(
@@ -514,6 +567,31 @@ impl MemoryManager {
                     .degraded_reason
                     .unwrap_or_else(|| "向量臂这一次没跑成".into()),
             ));
+        }
+
+        if let (Some(_), Some(reranker)) = (shortlist, reranker) {
+            match rerank::order(
+                reranker.backend.as_ref(),
+                &reranker.model,
+                &query.text,
+                &result.items,
+            )
+            .await
+            {
+                Ok(Some(order)) => {
+                    result.items = rerank::apply_order(result.items, &order);
+                    tracing::debug!(candidates = order.len(), "记忆短名单按判断重排过（§9.4）");
+                }
+                // 它说这批候选都不相关：**不采纳它的排序**，保持融合顺序。候选不因为
+                // 一次判断就被丢掉——丢候选是阈值的事，不是这一步的事。
+                Ok(None) => {
+                    tracing::debug!("判断说这批候选都不相关，保持融合顺序（§9.4）");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "判断后端这一次没给出排序，保持融合顺序（§9.4）");
+                }
+            }
+            result.items.truncate(top_k as usize);
         }
         Ok(result)
     }
@@ -557,7 +635,16 @@ impl MemoryManager {
     /// `carried` 是检查点里记下的那一批（§9.7）：**先重新核对**当前状态、有效期与版本，
     /// 活下来的就沿用——"resume 和旧检查点不能重新注入已经遗忘的内容"是这一步的全部理由，
     /// 顺带也满足"正常情况下沿用 Run 的选择，不逐轮重复请求 embedding"（§9.4）。
-    pub async fn prepare(&self, run: &RunId, text: &str, carried: &[MemoryUse]) -> Injection {
+    ///
+    /// `scopes` 是这一次放行的记忆作用域（§9.2）：空 = 不按作用域过滤。**过滤发生在检索
+    /// 里**（[`RecallQuery::scopes`]），不是拿到结果之后再遮掉别的 Agent 的记录。
+    pub async fn prepare(
+        &self,
+        run: &RunId,
+        text: &str,
+        carried: &[MemoryUse],
+        scopes: &[MemoryScope],
+    ) -> Injection {
         if !self.enabled {
             return Injection::default();
         }
@@ -565,7 +652,8 @@ impl MemoryManager {
         let mut items = self.revalidate(carried, now).await;
 
         if items.is_empty() && !text.trim().is_empty() {
-            let query = self.query(text, None);
+            let mut query = self.query(text, None);
+            query.scopes = scopes.to_vec();
             match self.search(query).await {
                 Ok(result) => {
                     if result.degraded {
@@ -604,6 +692,7 @@ impl MemoryManager {
         text: &str,
         carried: &[MemoryUse],
         boundary: usize,
+        scopes: &[MemoryScope],
     ) -> Injection {
         if !self.enabled {
             return Injection::default();
@@ -652,7 +741,7 @@ impl MemoryManager {
             return pinned;
         }
 
-        let injection = self.prepare(run, text, carried).await;
+        let injection = self.prepare(run, text, carried, scopes).await;
         {
             let mut pins = self.pins.lock().expect("注入锚");
             if pins.len() >= PIN_SOFT_LIMIT {

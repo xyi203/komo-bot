@@ -240,6 +240,8 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
             candidate_limit: 40,
             top_k: 8,
             max_tokens: 1500,
+            rerank: false,
+            rerank_shortlist: 20,
         },
     }
 }
@@ -271,6 +273,7 @@ struct HarnessBuilder {
     scripts: Vec<Vec<Round>>,
     with_embeddings: bool,
     work: Vec<MemoryWorkItem>,
+    reranker: Option<Reranker>,
 }
 
 impl HarnessBuilder {
@@ -280,7 +283,14 @@ impl HarnessBuilder {
             scripts: Vec::new(),
             with_embeddings: false,
             work: Vec::new(),
+            reranker: None,
         }
+    }
+
+    /// 装一个判断后端（§9.4 的重排）。替身记下每次问句，测试据此断言"问没问、问了什么"。
+    fn reranker(mut self, reranker: Reranker) -> Self {
+        self.reranker = Some(reranker);
+        self
     }
 
     fn config(mut self, config: MemoryConfig) -> Self {
@@ -320,6 +330,7 @@ impl HarnessBuilder {
             embeddings: self
                 .with_embeddings
                 .then(|| Arc::clone(&embeddings) as Arc<dyn EmbeddingClient>),
+            reranker: self.reranker,
             llm: Arc::new(llm.clone()) as Arc<dyn LlmClient>,
             events: Arc::clone(&ledger) as Arc<dyn SessionEvents>,
             work: Arc::clone(&work) as Arc<dyn MemoryWorkLog>,
@@ -368,6 +379,7 @@ fn user_event(seq: u64, run: &RunId, text: &str) -> Event {
             effort: None,
             // 提取的夹具都是普通 Run：没有父，也没有结果契约。
             delegate: None,
+            snapshot: None,
         }),
     )
 }
@@ -969,7 +981,7 @@ async fn an_old_checkpoint_cannot_bring_back_a_forgotten_memory() {
     // 从检查点续跑：注入段里也只剩那一条。
     let injection = harness
         .manager
-        .prepare(&RunId::from_raw("run-1"), "空调", &checkpoint)
+        .prepare(&RunId::from_raw("run-1"), "空调", &checkpoint, &[])
         .await;
     assert_eq!(injection.uses.len(), 1);
     assert_eq!(injection.uses[0].memory, kept.id);
@@ -1518,7 +1530,7 @@ async fn the_preamble_serves_what_the_segment_prepared_for_that_run() {
         .unwrap();
 
     let run = RunId::from_raw("run-1");
-    let injection = harness.manager.prepare(&run, "空调", &[]).await;
+    let injection = harness.manager.prepare(&run, "空调", &[], &[]).await;
     assert_eq!(injection.uses.len(), 1);
     assert!(harness.manager.injection_for(&run).is_some());
     assert!(
@@ -1559,7 +1571,7 @@ async fn a_disabled_memory_section_injects_nothing_and_extracts_nothing() {
 
     let injection = harness
         .manager
-        .prepare(&RunId::from_raw("run-1"), "空调", &[])
+        .prepare(&RunId::from_raw("run-1"), "空调", &[], &[])
         .await;
     assert_eq!(injection, Injection::default());
     assert_eq!(
@@ -1640,7 +1652,14 @@ async fn the_injection_is_reused_verbatim_within_one_segment() {
 
     let first = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-1"), "空调多少度", &[], 0)
+        .prepare_segment(
+            &session,
+            &RunId::from_raw("run-1"),
+            "空调多少度",
+            &[],
+            0,
+            &[],
+        )
         .await;
     assert!(
         !first.text.as_deref().unwrap_or_default().is_empty(),
@@ -1651,7 +1670,7 @@ async fn the_injection_is_reused_verbatim_within_one_segment() {
 
     let second = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-2"), "那台灯呢", &[], 0)
+        .prepare_segment(&session, &RunId::from_raw("run-2"), "那台灯呢", &[], 0, &[])
         .await;
     assert_eq!(second.text, first.text, "同一段里逐字复用，前缀才稳");
     assert_eq!(second.uses, first.uses);
@@ -1684,7 +1703,14 @@ async fn a_new_segment_recalls_again() {
 
     let first = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-1"), "空调多少度", &[], 0)
+        .prepare_segment(
+            &session,
+            &RunId::from_raw("run-1"),
+            "空调多少度",
+            &[],
+            0,
+            &[],
+        )
         .await;
     let embedded = harness.embeddings.calls();
 
@@ -1696,14 +1722,14 @@ async fn a_new_segment_recalls_again() {
         .unwrap();
     let same = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-2"), "台灯", &[], 0)
+        .prepare_segment(&session, &RunId::from_raw("run-2"), "台灯", &[], 0, &[])
         .await;
     assert_eq!(same.text, first.text, "同一段里不重算");
 
     // 换段：重新召回，新那条进来，也确实又嵌了一次查询。
     let next = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-3"), "台灯", &[], 9)
+        .prepare_segment(&session, &RunId::from_raw("run-3"), "台灯", &[], 9, &[])
         .await;
     let text = next.text.clone().unwrap_or_default();
     assert!(text.contains("台灯"), "{text}");
@@ -1723,14 +1749,21 @@ async fn an_empty_segment_is_pinned_too() {
 
     let first = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-1"), "空调多少度", &[], 0)
+        .prepare_segment(
+            &session,
+            &RunId::from_raw("run-1"),
+            "空调多少度",
+            &[],
+            0,
+            &[],
+        )
         .await;
     assert_eq!(first, Injection::default(), "库里一条记忆都没有");
     let embedded = harness.embeddings.calls();
 
     let second = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-2"), "再说一遍", &[], 0)
+        .prepare_segment(&session, &RunId::from_raw("run-2"), "再说一遍", &[], 0, &[])
         .await;
     assert_eq!(second, Injection::default());
     assert_eq!(
@@ -1760,7 +1793,14 @@ async fn a_forgotten_item_drops_the_pin() {
 
     let first = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-1"), "空调多少度", &[], 0)
+        .prepare_segment(
+            &session,
+            &RunId::from_raw("run-1"),
+            "空调多少度",
+            &[],
+            0,
+            &[],
+        )
         .await;
     assert_eq!(first.uses.len(), 1, "先注入上了");
 
@@ -1772,7 +1812,14 @@ async fn a_forgotten_item_drops_the_pin() {
 
     let second = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-2"), "空调多少度", &[], 0)
+        .prepare_segment(
+            &session,
+            &RunId::from_raw("run-2"),
+            "空调多少度",
+            &[],
+            0,
+            &[],
+        )
         .await;
     assert!(
         second.uses.is_empty(),
@@ -1784,4 +1831,251 @@ async fn a_forgotten_item_drops_the_pin() {
         "{:?}",
         second.text
     );
+}
+
+// ---------------------------------------------------------------- 重排（§9.4）
+
+/// 一个**按给定概率作答**的判断替身：把收到的问句留下来，答复取概率最高的那个。
+struct ScriptedJudge {
+    probabilities: BTreeMap<String, f64>,
+    /// 直接指定 `choice`（测"都不相关"）；`None` = 取概率最高。
+    pick: Option<&'static str>,
+    /// 让它失败（测降级）。
+    fail: Option<&'static str>,
+    seen: Mutex<Vec<komo_kernel::types::systemone::SystemOneRequest>>,
+}
+
+impl ScriptedJudge {
+    fn new(probabilities: &[(&str, f64)]) -> Arc<Self> {
+        Arc::new(ScriptedJudge {
+            probabilities: probabilities
+                .iter()
+                .map(|(id, p)| ((*id).to_string(), *p))
+                .collect(),
+            pick: None,
+            fail: None,
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn seen(&self) -> Vec<komo_kernel::types::systemone::SystemOneRequest> {
+        self.seen.lock().expect("判断替身").clone()
+    }
+}
+
+#[async_trait]
+impl komo_kernel::traits::SystemOne for ScriptedJudge {
+    async fn ask(
+        &self,
+        request: komo_kernel::types::systemone::SystemOneRequest,
+    ) -> Result<
+        komo_kernel::types::systemone::SystemOneResponse,
+        komo_kernel::types::systemone::SystemOneError,
+    > {
+        self.seen.lock().expect("判断替身").push(request);
+        if let Some(message) = self.fail {
+            return Err(komo_kernel::types::systemone::SystemOneError::Transport(
+                message.to_string(),
+            ));
+        }
+        let choice = match self.pick {
+            Some(pick) => pick.to_string(),
+            None => self
+                .probabilities
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(id, _)| id.clone())
+                .expect("替身至少要有一个选项"),
+        };
+        Ok(komo_kernel::types::systemone::SystemOneResponse {
+            model: "jev-test".into(),
+            answers: BTreeMap::from([(
+                "most_relevant".to_string(),
+                komo_kernel::types::systemone::Answer::Choice {
+                    choice,
+                    probabilities: self.probabilities.clone(),
+                    confidence: Some(0.9),
+                },
+            )]),
+            usage: Default::default(),
+        })
+    }
+}
+
+/// 判断能把融合排在后头的条目抬进 `top_k`——这正是重排存在的理由。
+#[tokio::test]
+async fn a_judgement_can_lift_an_entry_the_fusion_ranked_lower() {
+    let judge = ScriptedJudge::new(&[("m-1", 0.1), ("m-2", 0.2), ("m-3", 0.7), ("none", 0.0)]);
+    let harness = HarnessBuilder::new()
+        .config(retrieval_with_rerank(1, 3))
+        .reranker(Reranker {
+            backend: Arc::clone(&judge) as Arc<dyn komo_kernel::traits::SystemOne>,
+            model: "jev-test".into(),
+        })
+        .build()
+        .await;
+    for (id, text) in [
+        ("m-1", "空调设 26 度"),
+        ("m-2", "空调只在夏天用"),
+        ("m-3", "空调滤网三个月换一次"),
+    ] {
+        harness.repo.put(memory(id, text), None).await.unwrap();
+    }
+
+    let result = harness
+        .manager
+        .search(harness.manager.query("空调", None))
+        .await
+        .expect("查得动");
+
+    // 融合顺序是稳定的（同分按 id），所以没有重排时第一条是 m-1；判断把 m-3 抬了上来。
+    assert_eq!(result.items.len(), 1, "top_k 是 1");
+    assert_eq!(result.items[0].id.as_str(), "m-3");
+
+    // 判断看到的是**短名单**（比 top_k 宽）：三条候选加一个"都不相关"，还带着这次的输入。
+    let seen = judge.seen();
+    assert_eq!(seen.len(), 1, "一次召回问一次");
+    assert_eq!(seen[0].model, "jev-test");
+    assert_eq!(seen[0].state["input"], serde_json::json!("空调"));
+    let question = &seen[0].questions["most_relevant"];
+    let komo_kernel::types::systemone::Question::Choice { criteria, .. } = question else {
+        panic!("问的不是一个 Choice：{question:?}")
+    };
+    for id in ["m-1", "m-2", "m-3", "none"] {
+        assert!(
+            criteria.contains_key(id),
+            "候选 {id} 不在问句里：{criteria:?}"
+        );
+    }
+}
+
+/// 判断说"都不相关"时**不采纳它的排序**，保持融合顺序——候选一条都不丢。
+#[tokio::test]
+async fn a_judgement_that_says_nothing_matches_keeps_the_fusion_order() {
+    let judge = ScriptedJudge::new(&[("m-1", 0.4), ("m-2", 0.3), ("none", 0.9)]);
+    let mut judge = Arc::try_unwrap(judge).ok().expect("刚造的");
+    judge.pick = Some("none");
+    let harness = HarnessBuilder::new()
+        .config(retrieval_with_rerank(2, 3))
+        .reranker(Reranker {
+            backend: Arc::new(judge) as Arc<dyn komo_kernel::traits::SystemOne>,
+            model: "jev-test".into(),
+        })
+        .build()
+        .await;
+    for (id, text) in [("m-1", "空调设 26 度"), ("m-2", "空调只在夏天用")] {
+        harness.repo.put(memory(id, text), None).await.unwrap();
+    }
+
+    let result = harness
+        .manager
+        .search(harness.manager.query("空调", None))
+        .await
+        .expect("查得动");
+
+    assert_eq!(result.items.len(), 2, "候选一条都不丢");
+    assert_eq!(result.items[0].id.as_str(), "m-1", "保持融合顺序");
+}
+
+/// 判断后端不可用：**照融合顺序给，不把检索整个弄失败**（§9.4）。
+#[tokio::test]
+async fn a_judgement_backend_that_is_down_does_not_fail_the_recall() {
+    let judge = Arc::try_unwrap(ScriptedJudge::new(&[("m-1", 0.5)]))
+        .ok()
+        .expect("刚造的");
+    let mut judge = judge;
+    judge.pick = None;
+    judge.fail = Some("连接被拒");
+    let harness = HarnessBuilder::new()
+        .config(retrieval_with_rerank(1, 3))
+        .reranker(Reranker {
+            backend: Arc::new(judge) as Arc<dyn komo_kernel::traits::SystemOne>,
+            model: "jev-test".into(),
+        })
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "空调设 26 度"), None)
+        .await
+        .unwrap();
+
+    let result = harness
+        .manager
+        .search(harness.manager.query("空调", None))
+        .await
+        .expect("判断坏了不是检索坏了");
+
+    assert_eq!(result.items.len(), 1);
+    assert!(!result.degraded, "这不是向量臂的降级");
+}
+
+/// `rerank` 关着时**一个判断请求都不发**——即使后端装在手上。
+#[tokio::test]
+async fn a_backend_that_is_installed_is_never_asked_when_rerank_is_off() {
+    let judge = ScriptedJudge::new(&[("m-1", 0.9)]);
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Keyword))
+        .reranker(Reranker {
+            backend: Arc::clone(&judge) as Arc<dyn komo_kernel::traits::SystemOne>,
+            model: "jev-test".into(),
+        })
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "空调设 26 度"), None)
+        .await
+        .unwrap();
+
+    let result = harness
+        .manager
+        .search(harness.manager.query("空调", None))
+        .await
+        .expect("查得动");
+
+    assert_eq!(result.items.len(), 1);
+    assert!(judge.seen().is_empty(), "开关关着就不该发请求");
+}
+
+/// 开着重排的检索配置。
+fn retrieval_with_rerank(top_k: u32, shortlist: u32) -> MemoryConfig {
+    let mut config = memory_config(true, RetrievalMode::Keyword);
+    config.retrieval.rerank = true;
+    config.retrieval.top_k = top_k;
+    config.retrieval.rerank_shortlist = shortlist;
+    config
+}
+
+#[tokio::test]
+async fn the_judgement_sees_a_shortlist_wider_than_top_k() {
+    let judge = ScriptedJudge::new(&[("m-1", 0.1), ("m-2", 0.1), ("m-3", 0.9)]);
+    let harness = HarnessBuilder::new()
+        .config(retrieval_with_rerank(1, 3))
+        .reranker(Reranker {
+            backend: Arc::clone(&judge) as Arc<dyn komo_kernel::traits::SystemOne>,
+            model: "jev-test".into(),
+        })
+        .build()
+        .await;
+    for (id, text) in [
+        ("m-1", "空调设 26 度"),
+        ("m-2", "空调只在夏天用"),
+        ("m-3", "空调滤网三个月换一次"),
+    ] {
+        harness.repo.put(memory(id, text), None).await.unwrap();
+    }
+
+    harness
+        .manager
+        .search(harness.manager.query("空调", None))
+        .await
+        .expect("查得动");
+
+    let seen = judge.seen();
+    let question = &seen[0].questions["most_relevant"];
+    let komo_kernel::types::systemone::Question::Choice { criteria, .. } = question else {
+        panic!("问的不是一个 Choice：{question:?}")
+    };
+    assert_eq!(criteria.len(), 4, "三条候选 + 一个 none（top_k 只有 1）");
 }

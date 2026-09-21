@@ -26,6 +26,7 @@ fn accept(session: &SessionId, key: &str, text: &str, clock: &TestClock) -> Acce
         model: sample_model(),
         workdir: None,
         delegate: None,
+        snapshot: None,
         at: clock.now(),
     }
 }

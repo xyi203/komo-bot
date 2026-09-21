@@ -48,26 +48,52 @@ pub use memory_terms::MemoryTermsRow;
 pub use memory_vector::MemoryVectorRow;
 pub use policy_grant::PolicyGrantRow;
 pub use run::RunRow;
-pub use session::SessionRow;
+pub use session::{SessionKind, SessionRow};
 pub use session_log_index::SessionLogIndexRow;
 pub use tool_attempt::ToolAttemptRow;
 pub use tool_call::ToolCallRow;
 
-/// 一列在 `ALTER TABLE ADD COLUMN` 里的写法。
+/// 一列在 `ALTER TABLE ADD COLUMN` 里的写法，以及补完之后要跑的回填。
 ///
 /// toasty 生成的 `CREATE TABLE` 不带 `DEFAULT`，而 SQLite 拒绝为已有数据的表加一个
 /// 没有默认值的 `NOT NULL` 列——所以补列的子句必须在这里单独给出，**要么
 /// `NOT NULL DEFAULT …`，要么可空**（§8.2）。
+///
+/// 默认值答不出的那一类列（"已有的行这一列该是什么"要看别的列）由 [`Self::backfill`]
+/// 回答：回填与补列写在同一个地方，所以没有一条升级路径能漏掉它——`migrate_file`（文件
+/// 库）与 `ensure_schema`（内存库）走的是同一份材料。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ColumnSpec {
     pub name: &'static str,
     /// `ALTER TABLE "t" ADD COLUMN <name> <clause>` 里的 `<clause>`。
     pub clause: &'static str,
+    /// 补完这一列之后在同一张表上跑一次的回填语句；`None` = 默认值就是答案。
+    pub backfill: Option<&'static str>,
 }
 
 impl ColumnSpec {
     pub const fn new(name: &'static str, clause: &'static str) -> Self {
-        Self { name, clause }
+        Self {
+            name,
+            clause,
+            backfill: None,
+        }
+    }
+
+    /// 一列光有默认值不够、还要按别的列回填的写法。
+    ///
+    /// `backfill` 必须**幂等**：补列与回填没有事务包着（DDL 不进 `BEGIN CONCURRENT`），
+    /// 半途失败重跑时要能接着跑。
+    pub const fn with_backfill(
+        name: &'static str,
+        clause: &'static str,
+        backfill: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            clause,
+            backfill: Some(backfill),
+        }
     }
 }
 
@@ -103,6 +129,12 @@ pub const TABLES: &[TableSpec] = &[
 
 /// 索引由 store 自己建（见模块头），新文件与旧文件走同一条路。
 pub const INDEXES: &[&str] = &[
+    // 每个 Agent **至多一条活的主会话**（`docs/bot.md` §4.2：「数据库应保证每个 Agent 只有
+    // 一个有效主会话，创建过程也应具有并发唯一性」）。三条限定缺一不可：
+    // `kind = 'main'` 只约束主会话；`agent_id <> ''` 让升级前那些还没有归属的行（以及
+    // 普通会话）不进索引——一次迁移可能带出好几条 `origin = 'home'` 的老行，那时它们都还是
+    // 空串；`state NOT IN (…)` 说的是"**有效**"：墓碑不是主会话，删掉主会话之后要能再建一条。
+    r#"CREATE UNIQUE INDEX IF NOT EXISTS "sessions_main_per_agent" ON "sessions" ("agent_id") WHERE "kind" = 'main' AND "agent_id" <> '' AND "state" NOT IN ('deleted', 'purged')"#,
     r#"CREATE INDEX IF NOT EXISTS "runs_session" ON "runs" ("session_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "runs_claimable" ON "runs" ("state", "wait_kind", "wake_at")"#,
     r#"CREATE INDEX IF NOT EXISTS "log_index_session_seq" ON "session_log_index" ("session_id", "seq")"#,

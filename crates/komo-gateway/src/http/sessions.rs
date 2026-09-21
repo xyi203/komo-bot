@@ -66,8 +66,14 @@ pub async fn create(
 
     let session = SessionId::new_at(api.state.clock.now());
     api.state.ledgers.open(&session, "agent").await?;
+    // 归属**建的时候就记下来**（§4.2：`agent_id` 创建后不随消息路由变化）。这个入口没有
+    // "找谁"这一维，所以它落在默认 Agent 名下——而不是"当前默认是谁就归谁"。
+    api.state.own_session(&session).await?;
+    // `workdir` **只有一份事实**：`sessions.workdir` 那一行。执行装配读的是它
+    // （`service::segment`），界面也读它——不另存一份进程内的影子表，否则两者可以不一样，
+    // 而且重启就丢。
     if let Some(workdir) = &request.workdir {
-        api.state.remember_workdir(&session, workdir);
+        komo_store::repos::session::set_workdir(&api.state.db, &session, workdir).await?;
     }
     let summary = summary_of(&api, &session).await?;
     api.idempotency
@@ -276,10 +282,7 @@ pub async fn summary_of(api: &Api, session: &SessionId) -> Result<SessionSummary
         session: session.clone(),
         title: record.title.clone(),
         state: record.state,
-        workdir: record
-            .workdir
-            .clone()
-            .or_else(|| api.state.workdir_of(session)),
+        workdir: record.workdir.clone(),
         current_run: current.map(|run| run.run.clone()),
         current_state: current.map(|run| run.state),
         // 只在 `waiting` 时有值：`queued` 的 Run "一定说得出有活干"，它没有"在等什么"。

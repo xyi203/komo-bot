@@ -26,10 +26,14 @@ use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::{Surface, SurfaceMessage, fold};
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
 use komo_kernel::traits::{ApprovalRepo, Ledger, LedgerError, ToolOutputStore};
+use komo_kernel::types::agent::RunSnapshot;
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::types::memory::MemoryScope;
+use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::status::ToolCallState;
+use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
 use komo_kernel::types::turn::{
     ReplayMessage, Role, ToolCallRequest, ToolResultForModel, TurnRequest,
@@ -37,7 +41,7 @@ use komo_kernel::types::turn::{
 use komo_runtime::agent::handler::SegmentSource;
 use komo_runtime::agent::{Budget, ResumedRound, RetryBudget, Segment};
 use komo_runtime::config::ConfigHolder;
-use komo_runtime::executor::{CallEnv, CallRequest, resumed_from};
+use komo_runtime::executor::{CallEnv, CallRequest, ToolExecutor, resumed_from};
 use komo_runtime::memory::MemoryManager;
 use komo_runtime::scheduler::HandlerError;
 use komo_runtime::tools::paths;
@@ -78,12 +82,36 @@ pub struct GatewaySegments {
     ///
     /// 与 Gateway 共享同一个 `Arc`：重载时换的是这里面的字符串，不必重建装配层。
     skills: Option<Arc<std::sync::RwLock<String>>>,
+    /// 执行器。**只用来渲染交给模型的工具 Schema**（[`ToolExecutor::definitions_for`]）：
+    /// 能力面已经由冻结快照（或它的兜底）给出，"这次能用哪些工具"的判据只有那一处，
+    /// 这里不该再有一份。`None` = 精简装配（没有执行器的那几个单元测试）。
+    executor: Option<Arc<ToolExecutor>>,
 }
 
 impl std::fmt::Debug for GatewaySegments {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GatewaySegments").finish_non_exhaustive()
     }
+}
+
+/// 一段执行要用到的**身份与能力**（§4.3）。
+///
+/// 它要么来自 `run.accepted` 里冻结的那一份，要么（旧行 / Cron / 没有快照的子 Run）由
+/// 当前配置的默认 Agent 兜底算出来——见 [`GatewaySegments::identity_for`]。这里的每一格
+/// 都进这一段的装配：提示、Schema、工作目录、记忆作用域。
+struct Identity {
+    /// 这一段的 Agent（进日志；判据是下面那几样）。
+    agent_id: String,
+    /// 冻结下来的模型；`None` = 兜底路径，用 `runs.model_snapshot` 那一份。
+    model: Option<ModelConfig>,
+    /// 这次允许调用的工具。**Schema 与执行器查找用的是同一个它**（§4 末）。
+    surface: AgentSurface,
+    /// 解析过的真实工作目录。
+    workspace: PathBuf,
+    /// 身份指令正文（按引用读回来的那一份）。
+    instructions: Option<String>,
+    /// 记忆作用域（§9.2）。
+    memory_scope: Option<MemoryScope>,
 }
 
 impl GatewaySegments {
@@ -112,7 +140,14 @@ impl GatewaySegments {
             memories: None,
             checkpoints: None,
             skills: None,
+            executor: None,
         }
+    }
+
+    /// 接上执行器：交回模型的工具 Schema 由它按能力面渲染（[`ToolExecutor::definitions_for`]）。
+    pub fn with_executor(mut self, executor: Arc<ToolExecutor>) -> Self {
+        self.executor = Some(executor);
+        self
     }
 
     /// 接上系统提示里的 skills 目录（§5.6）。
@@ -240,7 +275,7 @@ impl SegmentSource for GatewaySegments {
     async fn segment(
         &self,
         claimed: &komo_kernel::types::status::Claimed,
-        tools: Vec<ToolDefinition>,
+        catalog: Vec<ToolDefinition>,
     ) -> Result<Segment, HandlerError> {
         let run = claimed.run.clone();
         let session = self
@@ -272,16 +307,52 @@ impl SegmentSource for GatewaySegments {
             .map(|view| view.rounds)
             .unwrap_or_default();
 
-        let cwd = session_record
-            .as_ref()
-            .and_then(|record| record.workdir.clone())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| self.workspaces.clone());
+        let model_result_bytes = self.model_result_bytes();
+        // 外置正文的来源：窗口里的用户输入与模型回复、以及身份指令正文都可能在这里。
+        let payloads = self.payloads_for(&session);
+
+        // **这一段的身份与能力**（§4.3）：用它自己那条 `run.accepted` 里冻结下来的那一份，
+        // 而不是当前的 Profile 与工具目录。审批可能一小时之后才答复，那时配置与磁盘都可能
+        // 已经改过——恢复出来的 Run 不能因此换一副面孔。
+        let mut identity = match self
+            .identity_for(&events, &run, &session, session_record.as_ref(), &catalog)
+            .await
+        {
+            Ok(identity) => identity,
+            // 身份指令的正文按引用读不出来 = 会话缺内容（§8.3）：停下来报告。用当前配置
+            // 编一份提示继续跑，正是"恢复出来的 Run 换了一副面孔"。
+            Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
+        };
+
+        // 这是一条**子代理**吗？（§4）是的话，它的契约与预算跟着它走——父侧派它时给的那份，
+        // 落在它自己的 `run.accepted` 里，所以重启之后也读得到。
+        let delegate = surface
+            .runs
+            .get(&run)
+            .and_then(|view| view.delegate.clone());
+
+        // 深度只有一层（§4）：子代理的能力面里**没有 `delegate`**，不管那一份能力面是从
+        // 冻结快照继承来的还是兜底算出来的。runtime 的编排里还留着第二道，管的是"有人把
+        // 含 `delegate` 的能力面硬塞给子代理"。
+        if delegate.is_some() {
+            identity.surface = without_delegate(identity.surface);
+        }
+        tracing::debug!(
+            run = %run,
+            session = %session,
+            agent = %identity.agent_id,
+            tools = ?identity.surface.names(),
+            workspace = %identity.workspace.display(),
+            "这一段按冻结的身份与能力装配"
+        );
+
         // **根必须是真实路径**：工具解析目标时解掉符号链接（`tools::paths::resolve`），
         // 根停在字面上就会让 workspace 里的动作被判成"范围外"（macOS 的 `/tmp`、`/var`
         // 都是链接）。两边同一个口径，前缀匹配才是"在不在这个根里"。
-        let model_result_bytes = self.model_result_bytes();
-        let cwd = paths::real_root(&cwd);
+        //
+        // 目录取**冻结快照里那一个**：`profile.workspace` 与会话 `workdir` 谁优先是受理
+        // 那一刻定下来的（见 `GatewayState::freeze_run`），恢复时照用。
+        let cwd = identity.workspace.clone();
         let roots = self.roots_for(&session, cwd.clone());
         // 投影要拿它把引用拼成能直接 `read` 的绝对路径。
         let session_root = self.session_files.as_ref().map(|dir| {
@@ -293,46 +364,52 @@ impl SegmentSource for GatewaySegments {
             )
         });
 
-        // 这是一条**子代理**吗？（§4）是的话，它的契约与预算跟着它走——父侧派它时给的那份，
-        // 落在它自己的 `run.accepted` 里，所以重启之后也读得到。
-        let delegate = surface
-            .runs
-            .get(&run)
-            .and_then(|view| view.delegate.clone());
-
         // 子代理只拿得到任务本身：不注入记忆、不列 Skills、也**不带上父的对话历史**（它的
         // 回放窗口就是自己那条 Run，见下）。自包含这件事是父侧的责任，提示词里对它也说了。
         let memories = match &delegate {
             Some(_) => Vec::new(),
-            None => self.recall_for(&session, &run, &surface).await,
+            // 记忆作用域来自 Profile（§9.2）：只召回这一个作用域，外加显式共享的用户资料。
+            None => {
+                let scopes = recall_scopes(identity.memory_scope.as_ref());
+                self.recall_for(&session, &run, &surface, &scopes).await
+            }
         };
 
-        // 回放给模型的是**这一段对话**，不是这一条 Run（§8.3）。`payloads` 是外置正文的
-        // 来源：窗口里的用户输入与模型回复都可能超限外置（§8.3）。
+        // 回放给模型的是**这一段对话**，不是这一条 Run（§8.3）。
         let scope = match &delegate {
             Some(_) => ReplayScope::Run(&run),
             None => ReplayScope::Conversation(&run),
         };
-        let payloads = self.payloads_for(&session);
 
-        let (prompt, tools) = match &delegate {
-            Some(spec) => {
-                let prompt = subagent_prompt(&cwd, &tools, spec);
-                // 深度只有一层：`delegate` 不列给它。真正的拦在 runtime 的编排里（工具表
-                // 是 UX，模型自己拼出这个名字不该能绕过不变量）。
-                let offered = tools
-                    .into_iter()
-                    .filter(|tool| tool.name != DELEGATE_TOOL)
-                    .collect();
-                (prompt, offered)
-            }
-            None => (system_prompt(&cwd, &tools, &self.skills_prompt()), tools),
+        // 交给模型的 Schema 是**能力面**渲染出来的（§4 末）：一个来源，两处用——执行器查的
+        // 是同一份 `AgentSurface`（`CallEnv::surface`）。两边各拿一份就会出现"schema 里没有
+        // 这个名字、执行器却查得到"。
+        let tools = match &self.executor {
+            Some(executor) => executor.definitions_for(&identity.surface),
+            // 精简装配（没有执行器）：目录里这一段允许的那些就是 Schema——判据还是那一份
+            // 能力面，不是又一句"这次能用什么"。
+            None => catalog
+                .into_iter()
+                .filter(|tool| identity.surface.allows(&tool.name))
+                .collect(),
         };
+        let prompt = match &delegate {
+            Some(spec) => subagent_prompt(&cwd, &tools, spec),
+            None => system_prompt(&cwd, &tools, &self.skills_prompt()),
+        };
+        // 身份指令是系统提示里**最靠前的那一段**（§4.3），基座提示排在它后面。它从冻结
+        // 快照指向的正文读回来（不是重新去读配置文件），所以恢复出来的还是当时那一版。
+        let prompt = with_instructions(identity.instructions.as_deref(), prompt);
+
+        let agent_surface = identity.surface.clone();
 
         let request = TurnRequest {
             session: session.clone(),
             run: run.clone(),
-            model: record.model.clone(),
+            model: identity
+                .model
+                .clone()
+                .unwrap_or_else(|| record.model.clone()),
             system_prompt: prompt,
             // **这一段对话**：上一轮说了什么、最后答了什么，下一轮必须还在。子代理是唯一
             // 的例外——它只看得见自己那条 Run，父的窗口里也没有它的过程（§4）。
@@ -357,6 +434,7 @@ impl SegmentSource for GatewaySegments {
         };
 
         let env = CallEnv {
+            surface: agent_surface,
             session: session.clone(),
             run: run.clone(),
             source: record.source.clone(),
@@ -368,7 +446,8 @@ impl SegmentSource for GatewaySegments {
             principal: None,
             // 本 Run 是被谁派的（普通 Run 是 None）。runtime 用它硬拦"子代理再委派"。
             delegated: delegate.clone(),
-            model: record.model.clone(),
+            // 同一个模型：`TurnRequest` 与这里用的是同一次解析的结果（冻结快照里那一个）。
+            model: identity.model.unwrap_or(record.model),
             cancel: self.token_for(&run),
         };
 
@@ -412,11 +491,15 @@ impl GatewaySegments {
     /// （§9.4）。续跑时先把检查点里记的那一批交给
     /// [`MemoryManager::prepare`] 重新核对：活下来的沿用（不必再问一次 embedding），
     /// 已经遗忘或改了版本的掉出去（§9.7）。
+    ///
+    /// `scopes` 来自 Profile（`memory_scope`）：**过滤发生在检索里**，不是拿到结果之后再
+    /// 遮掉别人 Agent 的记录（§五）。
     async fn recall_for(
         &self,
         session: &SessionId,
         run: &RunId,
         surface: &Surface,
+        scopes: &[MemoryScope],
     ) -> Vec<komo_kernel::types::turn::MemoryUse> {
         let Some(memories) = self.memories.as_ref() else {
             return Vec::new();
@@ -436,9 +519,101 @@ impl GatewaySegments {
         // **按"这一段对话"取**，不是按这一轮重新召回（§9.4）：注入段在 system 消息里，
         // 每轮重算一次就等于每轮把服务端前缀缓存打掉一次。
         memories
-            .prepare_segment(session, run, &text, &carried, surface.boundary())
+            .prepare_segment(session, run, &text, &carried, surface.boundary(), scopes)
             .await
             .uses
+    }
+
+    /// 这一段的**身份与能力**（§4.3）。
+    ///
+    /// 三条路，按优先级：
+    ///
+    /// 1. **自己那条 `run.accepted` 里冻结的那一份**——正常的交互 Run 都走这条。审批可能
+    ///    一小时之后才答复，那时 Profile 与磁盘都可能已经改过，恢复出来的 Run 不能因此
+    ///    换一副面孔；
+    /// 2. **父 Run 的快照**——子 Run 受理时拿不到 Profile、工作目录与指令正文（执行器手里
+    ///    只有父的 `CallEnv`），而它本来就是父那次委派的延续：同一个 Agent、同一个目录、
+    ///    同一份指令，只是不能再委派（§4 的深度只有一层，摘名字在 [`segment`] 里做）；
+    /// 3. **当前配置的默认 Agent**——旧行（这次改造之前受理的）与 Cron（没有归属的入口）。
+    ///    §八「已有 Session 归入默认 Agent；旧日志不重写」。
+    ///
+    /// **没有第四条路**：当前 Profile 不许覆盖一条已经受理的 Run。
+    async fn identity_for(
+        &self,
+        events: &[Event],
+        run: &RunId,
+        session: &SessionId,
+        record: Option<&komo_store::repos::session::SessionRecord>,
+        catalog: &[ToolDefinition],
+    ) -> Result<Identity, LedgerError> {
+        let frozen = frozen_snapshot(events, run).or_else(|| {
+            delegate_parent(events, run).and_then(|parent| frozen_snapshot(events, &parent))
+        });
+        let Some(frozen) = frozen else {
+            return Ok(self.ambient_identity(record, catalog));
+        };
+        // 身份指令按引用读回来（§4.3：存的是内容，不是文件路径）。读不出来 = 会话缺内容，
+        // 由调用方停下来报告——拿当前配置编一份提示继续跑，正是"换了一副面孔"。
+        let instructions = match &frozen.instructions_ref {
+            Some(reference) => {
+                let bytes = self
+                    .payloads_for(session)
+                    .open(reference)
+                    .await
+                    .map_err(store_to_ledger)?;
+                Some(String::from_utf8(bytes).map_err(|error| {
+                    LedgerError::Corrupt(format!("冻结的身份指令不是 UTF-8：{error}"))
+                })?)
+            }
+            None => None,
+        };
+        Ok(Identity {
+            agent_id: frozen.agent_id,
+            model: Some(frozen.model),
+            surface: frozen.surface,
+            // 快照里存的是受理那一刻解析过的真实路径；再解一次是幂等的（目录后来被删掉
+            // 也只会把还不存在的那几段按字面接回去）。
+            workspace: paths::real_root(&frozen.workspace),
+            instructions,
+            memory_scope: frozen.memory_scope,
+        })
+    }
+
+    /// 没有冻结快照时的兜底身份：**当前**配置的默认 Agent（§八）。
+    ///
+    /// 工作目录的取舍与受理那一步是**同一条规则**（会话 `workdir` → Profile `workspace`
+    /// → `workspaces/`）：同一件事在两条路上有两个答案，正是 §八 修掉的那类缺口。
+    fn ambient_identity(
+        &self,
+        record: Option<&komo_store::repos::session::SessionRecord>,
+        catalog: &[ToolDefinition],
+    ) -> Identity {
+        let names: Vec<String> = catalog.iter().map(|tool| tool.name.clone()).collect();
+        let config = self.config.as_ref().map(|config| config.current());
+        let profile = config.as_ref().map(|config| config.agent.default_profile());
+        let surface = match (profile, self.config.as_ref()) {
+            (Some(profile), Some(holder)) => {
+                super::surface_of(profile, &names, &holder.home().join("config.toml"))
+            }
+            // 精简装配（没有配置快照）：这次能用的就是目录里装着的那些。
+            _ => AgentSurface::new(names),
+        };
+        let workspace = record
+            .and_then(|record| record.workdir.clone())
+            .map(PathBuf::from)
+            .or_else(|| profile.and_then(|profile| profile.workspace.clone()))
+            .unwrap_or_else(|| self.workspaces.clone());
+        Identity {
+            agent_id: profile
+                .map(|profile| profile.id.clone())
+                .unwrap_or_default(),
+            // 模型这一格留空：调用方回落到 `runs.model_snapshot`（受理时写下的那一份）。
+            model: None,
+            surface,
+            workspace: paths::real_root(&workspace),
+            instructions: profile.and_then(|profile| profile.instructions.clone()),
+            memory_scope: profile.and_then(|profile| profile.memory_scope.clone()),
+        }
     }
 
     /// 装配读不出上下文时怎么收场。
@@ -539,6 +714,63 @@ impl GatewaySegments {
     /// 这个 Session 的外置正文本体（§8.3 的 `payloads/`）。
     fn payloads_for(&self, session: &SessionId) -> PayloadStore {
         PayloadStore::new(self.routed.ledgers().paths_for(session))
+    }
+}
+
+/// 这一条 Run 受理时冻结下来的身份与能力（§4.3）。
+///
+/// 它落在**事件**里（`run.accepted`），所以重启之后读得到——这正是"恢复时按它装配"
+/// 那句话的落点。
+fn frozen_snapshot(events: &[Event], run: &RunId) -> Option<Box<RunSnapshot>> {
+    events.iter().find_map(|event| match &event.payload {
+        EventPayload::RunAccepted(body) if event.run.as_ref() == Some(run) => body.snapshot.clone(),
+        _ => None,
+    })
+}
+
+/// 派这一条 Run 的那条 Run（§4；普通 Run 是 `None`）。
+fn delegate_parent(events: &[Event], run: &RunId) -> Option<RunId> {
+    events.iter().find_map(|event| match &event.payload {
+        EventPayload::RunAccepted(body) if event.run.as_ref() == Some(run) => {
+            body.delegate.as_ref().map(|spec| spec.parent.clone())
+        }
+        _ => None,
+    })
+}
+
+/// 去掉 `delegate` 的能力面（子代理那一份，§4 的深度只有一层）。
+fn without_delegate(surface: AgentSurface) -> AgentSurface {
+    AgentSurface::new(
+        surface
+            .names()
+            .iter()
+            .filter(|name| name.as_str() != DELEGATE_TOOL)
+            .cloned(),
+    )
+}
+
+/// 这一次召回放行哪些作用域（§9.2）。
+///
+/// `None`（Profile 没写 `memory_scope`）= **不按作用域过滤**——`RecallQuery::scopes` 空
+/// 就是"全部"，与改造之前的行为一致。写了就只召回那一个，外加 [`MemoryScope::Personal`]：
+/// 用户资料是**显式共享**的那一份，每个 Agent 都该看得见（否则"用户偏好深色主题"要为每个
+/// Agent 各记一遍，而它们本来就都是同一个操作者的事）。
+fn recall_scopes(scope: Option<&MemoryScope>) -> Vec<MemoryScope> {
+    let Some(scope) = scope else {
+        return Vec::new();
+    };
+    let mut scopes = vec![scope.clone()];
+    if *scope != MemoryScope::Personal {
+        scopes.push(MemoryScope::Personal);
+    }
+    scopes
+}
+
+/// 把身份指令放在系统提示**最前面**（§4.3），基座提示排在它后面。
+fn with_instructions(instructions: Option<&str>, prompt: String) -> String {
+    match instructions.map(str::trim).filter(|text| !text.is_empty()) {
+        Some(text) => format!("{text}\n\n{prompt}"),
+        None => prompt,
     }
 }
 
@@ -696,7 +928,7 @@ async fn replay(
             if message.role != Role::User && last != Some(message.seq) {
                 continue;
             }
-            let Some(text) = message_text(payloads, &message).await? else {
+            let Some(text) = message_text(payloads, message).await? else {
                 continue;
             };
             if text.is_empty() {
@@ -749,7 +981,7 @@ async fn replay(
         out.push(ReplayMessage {
             role: message.role,
             seq: message.seq,
-            text: message_text(payloads, &message).await?,
+            text: message_text(payloads, message).await?,
             tool_calls: message.tool_calls.clone(),
             tool_results,
             provider_blocks: message.provider_blocks.clone(),
@@ -1133,6 +1365,7 @@ mod tests {
                 model: None,
                 effort: None,
                 delegate,
+                snapshot: None,
             }),
         )
     }

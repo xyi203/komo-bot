@@ -393,6 +393,7 @@ async fn only_one_gateway_holds_a_data_directory() {
         channels: Vec::new(),
         llm: None,
         embeddings: None,
+        shared_home: None,
     })
     .await;
     let error = second.expect_err("第二台起不来");
@@ -599,14 +600,21 @@ async fn slash_new_appends_a_boundary_to_the_same_session() {
     assert!(matches!(ack, InboundAck::Replied { .. }), "{ack:?}");
 
     // 还是同一个 home session。
-    assert_eq!(gateway.state().home_session().await.unwrap(), session);
+    assert_eq!(
+        gateway.state().default_main_session().await.unwrap(),
+        session
+    );
 }
 
 // ---------------------------------------------------------------- 工具
 
 /// 造一条待处理的审批（executor 在真的跑起来时做的就是这件事）。
 async fn pending_approval(gateway: &TestGateway) -> komo_kernel::protocol::http::ApprovalRecord {
-    let session = gateway.state().home_session().await.expect("home session");
+    let session = gateway
+        .state()
+        .default_main_session()
+        .await
+        .expect("home session");
     let plan = komo_kernel::test_support::sample_plan("shell", &session);
     gateway
         .state()
@@ -1652,7 +1660,10 @@ async fn a_call_that_cannot_run_still_gets_a_result_in_the_ledger() {
             _ => None,
         })
         .expect("要有一条 tool.result");
-    assert!(preview.contains("没有名为 rm_rf 的工具"), "{preview}");
+    // 拦住它的是**能力面**（`rm_rf` 不在这次运行交给模型的那份 schema 里），所以话是
+    // "这次运行的工具集里没有它"——执行器一次都不回退到全局工具目录（§4）。
+    assert!(preview.contains("工具集里没有 rm_rf"), "{preview}");
+    assert!(preview.contains("可用的是："), "{preview}");
 
     // ③ 它确实**没有执行过**：没有计划，也没有 `tool.started`。
     assert!(!events.iter().any(|event| matches!(

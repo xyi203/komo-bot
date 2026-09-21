@@ -28,6 +28,9 @@ fn home() -> tempfile::TempDir {
     std::fs::write(
         home.path().join("config.toml"),
         r#"
+default_agent = "assistant"
+
+[agents.assistant]
 [gateway]
 listen = "127.0.0.1:0"
 

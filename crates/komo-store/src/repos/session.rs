@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use toasty::Executor;
 
 use crate::db::{BoxFuture, Db, map_toasty, to_ts};
-use crate::models::{SessionLogIndexRow, SessionRow};
+use crate::models::{SessionKind, SessionLogIndexRow, SessionRow};
 use crate::session_log::AppendedEvent;
 
 /// 一个 Session 的元数据，读出来的样子。
@@ -20,6 +20,11 @@ pub struct SessionRecord {
     pub session: SessionId,
     pub title: String,
     pub origin: String,
+    /// 归属的助手（`AgentProfile.id`）。**空串 = 还没有归属**（升级前建的行），不是
+    /// "默认 Agent"。
+    pub agent_id: String,
+    /// 用途（[`SessionKind`]）。
+    pub kind: SessionKind,
     pub workdir: Option<String>,
     pub current_run: Option<String>,
     pub jsonl_path: String,
@@ -32,13 +37,16 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
-    /// 从行读出来。**`state` 认不出就是损坏**（§8.10 第 1 条）：默认成 `active` 会把
-    /// `deleted` / `purged` 的墓碑读成活的。
+    /// 从行读出来。**`state` / `kind` 认不出就是损坏**（§8.10 第 1 条）：默认成 `active`
+    /// 会把 `deleted` / `purged` 的墓碑读成活的，默认成 `normal` 会让一条主会话看起来是
+    /// 普通会话。
     fn try_from_row(row: &SessionRow) -> Result<SessionRecord, StoreError> {
         Ok(SessionRecord {
             session: SessionId::from_raw(row.id.clone()),
             title: row.title.clone(),
             origin: row.origin.clone(),
+            agent_id: row.agent_id.clone(),
+            kind: kind_of_row(row)?,
             workdir: row.workdir.clone(),
             current_run: row.current_run.clone(),
             jsonl_path: row.jsonl_path.clone(),
@@ -53,6 +61,16 @@ impl SessionRecord {
     pub fn accepts_input(&self) -> bool {
         self.state.accepts_input()
     }
+}
+
+/// 一行里的用途。**认不出的值报错**，不挑默认值。
+pub fn kind_of_row(row: &SessionRow) -> Result<SessionKind, StoreError> {
+    SessionKind::parse(&row.kind).ok_or_else(|| {
+        StoreError::Corrupt(format!(
+            "sessions.kind 认不出的值 {:?}（会话 {}）：只认 main / normal / task",
+            row.kind, row.id
+        ))
+    })
 }
 
 /// 一行里的生命周期状态。**认不出的值报错**，不挑默认值。
@@ -105,6 +123,33 @@ pub async fn ensure_in(
     jsonl_path: &str,
     now: OffsetDateTime,
 ) -> Result<SessionRow, StoreError> {
+    ensure_owned_in(
+        ex,
+        session,
+        origin,
+        jsonl_path,
+        "",
+        SessionKind::Normal,
+        now,
+    )
+    .await
+}
+
+/// 同上，但把**归属**一起写上（`docs/bot.md` §4.2）。
+///
+/// **幂等**，而且对归属是"先到先得"：行已经在了就原样返回，`agent_id` / `kind` 都不改写
+/// ——一个会话的 `agent_id` 创建后不随消息路由变化，换助手要换会话，不是给一个会话换
+/// 人格却保留它的全部上下文。`agent_id = ""` 是"还没有归属"：只有
+/// [`set_agent_in`] / [`ensure_main_in`] 能把它认出去，而且只认一次。
+pub async fn ensure_owned_in(
+    ex: &mut dyn Executor,
+    session: &SessionId,
+    origin: &str,
+    jsonl_path: &str,
+    agent_id: &str,
+    kind: SessionKind,
+    now: OffsetDateTime,
+) -> Result<SessionRow, StoreError> {
     if let Some(row) = get_in(ex, session).await? {
         return Ok(row);
     }
@@ -112,6 +157,8 @@ pub async fn ensure_in(
         id: session.as_str(),
         title: String::new(),
         origin,
+        agent_id,
+        kind: kind.as_str(),
         workdir: None as Option<String>,
         current_run: None as Option<String>,
         jsonl_path,
@@ -126,6 +173,272 @@ pub async fn ensure_in(
     .exec(ex)
     .await
     .map_err(map_toasty)
+}
+
+/// 把一个还没有归属的会话认给一个 Agent。**只写一次**。
+///
+/// 返回 `true` = 这次调用写进去了，`false` = 它已经有主（或者给的是空 `agent_id`：空串
+/// 就是"还没有归属"，拿它当认领是调用方的错，这里当没写）。
+///
+/// §4.2 的「创建后不随消息路由变化」就落在这一条上：争的人再多，只有一个能写进去，后来
+/// 的人读回原主而不是把这条会话改写一遍。会话不在 = [`StoreError::NotFound`]。
+///
+/// **这是 raw SQL 的第五处**，理由与 [`set_state_in`] 一样：toasty 的类型化 `UPDATE`
+/// 拿不到受影响行数，而"我写进去了还是别人抢先了"只有行数答得出来（§8.2 那张表）。
+pub async fn set_agent_in(
+    ex: &mut dyn Executor,
+    session: &SessionId,
+    agent_id: &str,
+    now: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let at = to_ts(now);
+    let affected = toasty::sql::statement(
+        r#"UPDATE sessions
+              SET agent_id = ?1, updated_at = ?2
+            WHERE id = ?3 AND agent_id = '' AND ?1 <> ''"#,
+    )
+    .bind(agent_id)
+    .bind(at)
+    .bind(session.as_str())
+    .exec(ex)
+    .await
+    .map_err(map_toasty)?;
+    if affected == 1 {
+        return Ok(true);
+    }
+    // 没写进去有两种：已经有人认过了（正常），或者根本没有这一行（调用方的错）。
+    if get_in(ex, session).await?.is_none() {
+        return Err(StoreError::NotFound {
+            what: format!("session {session}"),
+        });
+    }
+    Ok(false)
+}
+
+/// 认领会话（不带事务的入口），走 [`Db::with_write_retry`]。
+pub async fn set_agent(db: &Db, session: &SessionId, agent_id: &str) -> Result<bool, StoreError> {
+    let session = session.clone();
+    let agent_id = agent_id.to_string();
+    let now = OffsetDateTime::now_utc();
+    db.with_write_retry(move |ex| {
+        let (session, agent_id) = (session.clone(), agent_id.clone());
+        Box::pin(async move { set_agent_in(ex, &session, &agent_id, now).await })
+            as BoxFuture<'_, Result<bool, StoreError>>
+    })
+    .await
+}
+
+/// 一个 Agent 的主会话（[`main_for_agent_in`] 的答案）。
+#[derive(Debug)]
+pub struct MainSession {
+    /// 那**一条**主会话。多条时是 id 最小的那条——id 是 UUIDv7，也就是最早建的那条。
+    pub row: SessionRow,
+    /// 多出来的主会话 id。索引（`models::INDEXES` 的 `sessions_main_per_agent`）建起来
+    /// 之后正常情况下是空的；不为空只可能是升级过来的旧库在说话。
+    pub duplicates: Vec<SessionId>,
+}
+
+/// 这个 Agent 的**主会话**：`kind = 'main'`、`agent_id` 相等、**未删除**（§4.2 的
+/// `main_session(agent_id)`）。
+///
+/// **多于一条时取最早的那条，并把其余的报出来**（[`MainSession::duplicates`]）——不静默
+/// 地在里面挑一条：两个不同的入口各建过一个主会话是操作者该知道的事，而不是库替它选。
+/// `deleted` / `purged` 的不算：墓碑不是"有效主会话"，删掉之后要能再建一条。
+pub async fn main_for_agent_in(
+    ex: &mut dyn Executor,
+    agent_id: &str,
+) -> Result<Option<MainSession>, StoreError> {
+    let rows = SessionRow::filter(
+        SessionRow::fields()
+            .agent_id()
+            .eq(agent_id)
+            .and(SessionRow::fields().kind().eq(SessionKind::Main.as_str())),
+    )
+    .exec(ex)
+    .await
+    .map_err(map_toasty)?;
+
+    let mut live: Vec<SessionRow> = Vec::new();
+    for row in rows {
+        if matches!(
+            state_of_row(&row)?,
+            SessionState::Deleted | SessionState::Purged
+        ) {
+            continue;
+        }
+        live.push(row);
+    }
+    live.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let mut live = live.into_iter();
+    let Some(row) = live.next() else {
+        return Ok(None);
+    };
+    let duplicates = live
+        .map(|row| SessionId::from_raw(row.id))
+        .collect::<Vec<_>>();
+    Ok(Some(MainSession { row, duplicates }))
+}
+
+/// 读这个 Agent 的主会话（不带事务的入口）。
+pub async fn main_for_agent(db: &Db, agent_id: &str) -> Result<Option<MainSession>, StoreError> {
+    let agent_id = agent_id.to_string();
+    db.read(move |ex| {
+        let agent_id = agent_id.clone();
+        Box::pin(async move { main_for_agent_in(ex, &agent_id).await })
+            as BoxFuture<'_, Result<Option<MainSession>, StoreError>>
+    })
+    .await
+}
+
+/// 这个 Agent 的主会话——没有就建一条。**并发唯一**。
+///
+/// `session` / `origin` / `jsonl_path` 是**候选**：只有真的要建、或者要把一行已经在库里的
+/// 候选认领成主会话时才用得上。库里算数的是 `kind = 'main'` 那一行，不是候选 id。
+///
+/// 唯一性有两层，它们管的是两件不同的事：
+///
+/// 1. `sessions_main_per_agent`（`models::INDEXES`，部分唯一索引）是**存储层**的保证：
+///    同一个 Agent 的第二条活主会话在库里写不进去，无论有几个入口、代码怎么写。
+/// 2. 上面那次先查是**快路**：绝大多数调用在这一步就拿到已有那条，索引只是兜底。
+///
+/// 两层都要：光靠"先查再插"只是一段谁都能绕过去的代码——`ensure_owned_in` 就直接往表里写，
+/// 丢掉索引之后同一 Agent 能留下好几条活主会话（见
+/// `the_earliest_main_session_wins_and_the_rest_are_reported` 里丢掉索引的那一手）。
+///
+/// 输掉竞争的那个不报错：索引的违反是一条普通错误（不是可以重试的序列化失败），所以插入
+/// 失败之后**再看一次后置条件**——真的存在一条活主会话就返回它，没有就原样报出去。判据是
+/// 后置条件，不是错误文本（§8.2 说过不拿字符串当判据）。
+pub async fn ensure_main_in(
+    ex: &mut dyn Executor,
+    session: &SessionId,
+    agent_id: &str,
+    origin: &str,
+    jsonl_path: &str,
+    now: OffsetDateTime,
+) -> Result<SessionRow, StoreError> {
+    if let Some(main) = main_for_agent_in(ex, agent_id).await? {
+        return Ok(main.row);
+    }
+
+    // 候选 id 已经有一行：升级路径上的那个全局主会话就是这样（它比 Agent 归属早存在）。
+    // 认领它，而不是在旁边再建一个——否则老库升级之后会同时有两个"操作者的会话"。
+    if get_in(ex, session).await?.is_some() {
+        if !claim_main_in(ex, session, agent_id, now).await? {
+            let owner = get_in(ex, session)
+                .await?
+                .map(|row| row.agent_id)
+                .unwrap_or_default();
+            return Err(StoreError::Other(format!(
+                "会话 {session} 已经属于 Agent {owner}，不能再当 {agent_id} 的主会话"
+            )));
+        }
+        return get_in(ex, session)
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                what: format!("session {session}"),
+            });
+    }
+
+    match ensure_owned_in(
+        ex,
+        session,
+        origin,
+        jsonl_path,
+        agent_id,
+        SessionKind::Main,
+        now,
+    )
+    .await
+    {
+        Ok(row) => Ok(row),
+        Err(error) => settle_on_the_main_session(ex, agent_id, error).await,
+    }
+}
+
+/// 建主会话那一步失败之后**看一眼后置条件**：这个 Agent 的主会话是不是已经有人建好了。
+///
+/// 是 → 返回它：输掉竞争**不是这次调用失败**——"这个 Agent 的主会话是哪条"已经有答案了。
+/// 不是 → 把原来的错误原样报出去，一个字的失败都不吞。
+///
+/// 判据是后置条件，**不是错误文本**（§8.2 说过不拿字符串当判据）：索引的违反是一条普通
+/// 错误（`UNIQUE constraint failed: sessions.agent_id`），[`Db::with_write_retry`] 不会重试
+/// 它——它只认序列化失败。
+async fn settle_on_the_main_session(
+    ex: &mut dyn Executor,
+    agent_id: &str,
+    error: StoreError,
+) -> Result<SessionRow, StoreError> {
+    match main_for_agent_in(ex, agent_id).await {
+        Ok(Some(main)) => Ok(main.row),
+        _ => Err(error),
+    }
+}
+
+/// 把一行已经在库里的候选**认成**这个 Agent 的主会话。
+///
+/// 返回 `false` = 它已经是**别人**的主会话（`agent_id` 是别人；空串不算，空串是"还没有
+/// 归属"，正是要认的那一种）。已经是这个 Agent 的主会话时也返回 `true`。
+async fn claim_main_in(
+    ex: &mut dyn Executor,
+    session: &SessionId,
+    agent_id: &str,
+    now: OffsetDateTime,
+) -> Result<bool, StoreError> {
+    let at = to_ts(now);
+    let affected = toasty::sql::statement(
+        r#"UPDATE sessions
+              SET agent_id = ?1, kind = ?2, updated_at = ?3
+            WHERE id = ?4 AND (agent_id = '' OR agent_id = ?1)"#,
+    )
+    .bind(agent_id)
+    .bind(SessionKind::Main.as_str())
+    .bind(at)
+    .bind(session.as_str())
+    .exec(ex)
+    .await
+    .map_err(map_toasty)?;
+    Ok(affected == 1)
+}
+
+/// 拿这个 Agent 的主会话（没有就建一条）——不带事务的入口，走 [`Db::with_write_retry`]。
+///
+/// 失败之后再看一眼后置条件（与 [`ensure_main_in`] 同一个道理，但这次是**新的一次读**：
+/// 竞争的赢家可能是在我们那个快照**之后**才提交的，事务里那一次读看不见它）。真的存在一条
+/// 活主会话就返回它，否则把原来的错误报出去。
+pub async fn ensure_main(
+    db: &Db,
+    session: &SessionId,
+    agent_id: &str,
+    origin: &str,
+    jsonl_path: &str,
+) -> Result<SessionRow, StoreError> {
+    let session = session.clone();
+    let agent_id = agent_id.to_string();
+    let origin = origin.to_string();
+    let jsonl_path = jsonl_path.to_string();
+    let now = OffsetDateTime::now_utc();
+    let for_closure = agent_id.clone();
+    let outcome = db
+        .with_write_retry(move |ex| {
+            let (session, agent_id, origin, jsonl_path) = (
+                session.clone(),
+                for_closure.clone(),
+                origin.clone(),
+                jsonl_path.clone(),
+            );
+            Box::pin(async move {
+                ensure_main_in(ex, &session, &agent_id, &origin, &jsonl_path, now).await
+            }) as BoxFuture<'_, Result<SessionRow, StoreError>>
+        })
+        .await;
+    match outcome {
+        Ok(row) => Ok(row),
+        Err(error) => match main_for_agent(db, &agent_id).await {
+            Ok(Some(main)) => Ok(main.row),
+            _ => Err(error),
+        },
+    }
 }
 
 /// 在事务里读一个 Session 的生命周期状态。行不在 = `None`。
@@ -253,6 +566,23 @@ pub async fn set_workdir_in(
         .exec(ex)
         .await
         .map_err(map_toasty)
+}
+
+/// 记一个 Session 的工作目录（不带事务的入口）。
+///
+/// 与 [`set_workdir_in`] 是同一件事，给手里只有一个 [`Db`] 的调用方用（`POST /v1/sessions`
+/// 创建会话时那一次）。它走 [`Db::with_write_retry`]，每个写都在一个 `BEGIN CONCURRENT`
+/// 事务里（§8.2），与显式事务里的那一份写法一致。
+pub async fn set_workdir(db: &Db, session: &SessionId, workdir: &str) -> Result<(), StoreError> {
+    let session = session.clone();
+    let workdir = workdir.to_string();
+    let now = OffsetDateTime::now_utc();
+    db.with_write_retry(move |ex| {
+        let (session, workdir) = (session.clone(), workdir.clone());
+        Box::pin(async move { set_workdir_in(ex, &session, &workdir, now).await })
+            as BoxFuture<'_, Result<(), StoreError>>
+    })
+    .await
 }
 
 /// 会话的标题**只写一次**：空着才写（§12 的 `sessions.title`，`komo session list` 那一列）。
@@ -744,5 +1074,421 @@ mod tests {
             vec!["sess-active", "sess-closing", "sess-deleted"],
             "墓碑行只在显式查看单个会话时可见"
         );
+    }
+
+    /// 建一条带**归属**的会话（测试用的快捷方式：`ensure_owned_in` 在一个写事务里跑）。
+    async fn ensure_owned(
+        db: &Db,
+        id: &str,
+        agent_id: &str,
+        kind: SessionKind,
+    ) -> Result<(), StoreError> {
+        let (id, agent_id) = (id.to_string(), agent_id.to_string());
+        db.with_write_retry(move |ex| {
+            let (id, agent_id) = (id.clone(), agent_id.clone());
+            Box::pin(async move {
+                ensure_owned_in(
+                    ex,
+                    &SessionId::from_raw(id),
+                    "api",
+                    "p",
+                    &agent_id,
+                    kind,
+                    NOW,
+                )
+                .await
+                .map(|_| ())
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+    }
+
+    /// 库里这个 Agent 有多少条**活的**主会话行。
+    ///
+    /// 走原始 SQL 是有意的：这里要问的正是"库里到底有几条"，经过
+    /// [`main_for_agent_in`] 就会被它自己的取舍（取最早的那条）盖过去。
+    async fn live_main_rows(db: &Db, agent_id: &str) -> Vec<String> {
+        let agent_id = agent_id.to_string();
+        db.read(move |ex| {
+            let agent_id = agent_id.clone();
+            Box::pin(async move {
+                let rows = toasty::sql::query(
+                    "SELECT id FROM sessions
+                      WHERE kind = 'main' AND agent_id = ?1 AND state NOT IN ('deleted', 'purged')
+                      ORDER BY id",
+                )
+                .bind(agent_id)
+                .exec(ex)
+                .await
+                .map_err(map_toasty)?;
+                Ok(rows
+                    .iter()
+                    .filter_map(|row| crate::db::column_string(row, 0))
+                    .collect::<Vec<_>>())
+            }) as BoxFuture<'_, Result<Vec<String>, StoreError>>
+        })
+        .await
+        .unwrap()
+    }
+
+    /// `set_agent_in` **只写一次**：认给 `a` 之后再认给 `b`，读回来还是 `a`，而且第二次
+    /// 返回 `false`（§4.2：一个会话的 `agent_id` 创建后不随消息路由变化——换助手是换会话，
+    /// 不是给一个会话换人格却留着它的全部上下文）。
+    #[tokio::test]
+    async fn set_agent_in_writes_the_owner_once() {
+        let (db, _dir) = temp().await;
+        ensure(&db, "sess-1").await;
+
+        assert!(
+            set_agent(&db, &SessionId::from_raw("sess-1"), "a")
+                .await
+                .unwrap(),
+            "还没有归属：第一次认领写进去了"
+        );
+        assert_eq!(
+            get(&db, &SessionId::from_raw("sess-1"))
+                .await
+                .unwrap()
+                .unwrap()
+                .agent_id,
+            "a"
+        );
+
+        assert!(
+            !set_agent(&db, &SessionId::from_raw("sess-1"), "b")
+                .await
+                .unwrap(),
+            "已经有主：第二次什么都没写"
+        );
+        assert_eq!(
+            get(&db, &SessionId::from_raw("sess-1"))
+                .await
+                .unwrap()
+                .unwrap()
+                .agent_id,
+            "a",
+            "后到的那个不该把这一行改写一遍"
+        );
+
+        // 空串是"还没有归属"，不是"认给谁"：拿它认领等于什么都没说。
+        ensure(&db, "sess-2").await;
+        assert!(
+            !set_agent(&db, &SessionId::from_raw("sess-2"), "")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            get(&db, &SessionId::from_raw("sess-2"))
+                .await
+                .unwrap()
+                .unwrap()
+                .agent_id,
+            ""
+        );
+
+        // 认领一个不存在的会话是调用方的错，不是"没写进去"。
+        assert!(matches!(
+            set_agent(&db, &SessionId::from_raw("没有这个会话"), "a").await,
+            Err(StoreError::NotFound { .. })
+        ));
+    }
+
+    /// 两个 Agent 各有各的主会话，互不干扰；再问一次拿到的是**同一条**（幂等），第二个
+    /// 候选 id 根本用不上。
+    #[tokio::test]
+    async fn two_agents_have_one_main_session_each() {
+        let (db, _dir) = temp().await;
+        let assistant = ensure_main(
+            &db,
+            &SessionId::from_raw("s-assistant"),
+            "assistant",
+            "home",
+            "p",
+        )
+        .await
+        .unwrap();
+        let coder = ensure_main(&db, &SessionId::from_raw("s-coder"), "coder", "home", "p")
+            .await
+            .unwrap();
+        assert_ne!(assistant.id, coder.id);
+        assert_eq!(assistant.kind, SessionKind::Main.as_str());
+        assert_eq!(assistant.agent_id, "assistant");
+        assert_eq!(coder.agent_id, "coder");
+
+        let again = ensure_main(
+            &db,
+            &SessionId::from_raw("s-别的候选"),
+            "assistant",
+            "home",
+            "p",
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.id, "s-assistant", "已经有了就不建第二条");
+
+        assert_eq!(live_main_rows(&db, "assistant").await, vec!["s-assistant"]);
+        assert_eq!(live_main_rows(&db, "coder").await, vec!["s-coder"]);
+
+        // 普通会话不是谁的主会话；空 `agent_id` 也没有隐含的"默认 Agent"。
+        ensure(&db, "s-plain").await;
+        assert!(main_for_agent(&db, "").await.unwrap().is_none());
+    }
+
+    /// 同一 Agent 的两个**并发**调用只留一条（§4.2：「创建过程也应具有并发唯一性，而不是
+    /// 多个入口各建一个，再挑最早的」）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_ensure_main_keeps_one_row() {
+        let (db, _dir) = temp().await;
+
+        let mut handles = Vec::new();
+        for round in 0..4 {
+            let db = db.clone();
+            handles.push(tokio::spawn(async move {
+                // 每个调用带自己的候选 id：赢的那个说了算。
+                ensure_main(
+                    &db,
+                    &SessionId::from_raw(format!("cand-{round}")),
+                    "assistant",
+                    "home",
+                    "p",
+                )
+                .await
+            }));
+        }
+        let mut ids = Vec::new();
+        for handle in handles {
+            ids.push(
+                handle
+                    .await
+                    .expect("并发任务没有 panic")
+                    .expect("并发建主会话"),
+            );
+        }
+        assert!(
+            ids.windows(2).all(|pair| pair[0].id == pair[1].id),
+            "几个并发调用说的必须是同一条主会话：{:?}",
+            ids.iter().map(|row| row.id.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            live_main_rows(&db, "assistant").await,
+            vec![ids[0].id.clone()],
+            "库里只有一条"
+        );
+    }
+
+    /// 唯一性不只是"调用方先查一遍"：**库里**也写不进第二条活主会话（§4.2「数据库应保证
+    /// 每个 Agent 只有一个有效主会话」）。
+    ///
+    /// 这条与上一条管的是两件事：上一条是"两个并发调用最后说同一条"，这一条是"绕过先查再建
+    /// 也塞不进第二条"——`ensure_owned_in` 不查主会话，直接把行写进去。
+    #[tokio::test]
+    async fn the_index_rejects_a_second_live_main_session() {
+        let (db, _dir) = temp().await;
+        ensure_main(&db, &SessionId::from_raw("m1"), "assistant", "home", "p")
+            .await
+            .unwrap();
+
+        let second = ensure_owned(&db, "m2", "assistant", SessionKind::Main).await;
+        assert!(
+            second.is_err(),
+            "第二条活主会话应当被 sessions_main_per_agent 挡下：{second:?}"
+        );
+        assert_eq!(live_main_rows(&db, "assistant").await, vec!["m1"]);
+    }
+
+    /// 主会话删掉之后**要能再建一条**：墓碑不是"有效主会话"（主会话索引里 `state` 那一条）。
+    #[tokio::test]
+    async fn a_deleted_main_session_does_not_block_a_new_one() {
+        let (db, _dir) = temp().await;
+        let first = ensure_main(&db, &SessionId::from_raw("m1"), "assistant", "home", "p")
+            .await
+            .unwrap();
+        assert_eq!(first.id, "m1");
+        assert!(set_state(&db, "m1", SessionState::Active, SessionState::Closing).await);
+        assert!(set_state(&db, "m1", SessionState::Closing, SessionState::Deleted).await);
+        assert!(main_for_agent(&db, "assistant").await.unwrap().is_none());
+
+        let second = ensure_main(&db, &SessionId::from_raw("m2"), "assistant", "home", "p")
+            .await
+            .unwrap();
+        assert_eq!(second.id, "m2");
+        assert_eq!(live_main_rows(&db, "assistant").await, vec!["m2"]);
+    }
+
+    /// 候选 id 已经有一行时**认领**它，而不是在旁边再建一条：升级路径上那个
+    /// `origin = 'home'` 的全局主会话就是这样（它比 Agent 归属早存在）。
+    #[tokio::test]
+    async fn ensure_main_adopts_the_session_under_the_candidate_id() {
+        let (db, _dir) = temp().await;
+        write(&db, |ex| {
+            Box::pin(async move {
+                ensure_in(ex, &SessionId::from_raw("legacy-home"), "home", "p", NOW)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .await;
+
+        let row = ensure_main(
+            &db,
+            &SessionId::from_raw("legacy-home"),
+            "assistant",
+            "home",
+            "p",
+        )
+        .await
+        .unwrap();
+        assert_eq!(row.id, "legacy-home");
+        assert_eq!(row.agent_id, "assistant");
+        assert_eq!(row.kind, SessionKind::Main.as_str(), "认领之后它就是主会话");
+        let record = get(&db, &SessionId::from_raw("legacy-home"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.kind, SessionKind::Main);
+        assert_eq!(record.origin, "home", "认领不该动来源");
+
+        // 幂等：再问一次还是它，不会又建一条。
+        let again = ensure_main(
+            &db,
+            &SessionId::from_raw("另一个候选"),
+            "assistant",
+            "home",
+            "p",
+        )
+        .await
+        .unwrap();
+        assert_eq!(again.id, "legacy-home");
+        assert!(
+            main_for_agent(&db, "assistant")
+                .await
+                .unwrap()
+                .unwrap()
+                .duplicates
+                .is_empty()
+        );
+    }
+
+    /// 候选 id 已经是**别人**的主会话时不挑一条了事，也不抢：把冲突说清楚。
+    #[tokio::test]
+    async fn ensure_main_refuses_a_candidate_that_belongs_to_another_agent() {
+        let (db, _dir) = temp().await;
+        ensure_main(
+            &db,
+            &SessionId::from_raw("coder-main"),
+            "coder",
+            "home",
+            "p",
+        )
+        .await
+        .unwrap();
+
+        let stolen = ensure_main(
+            &db,
+            &SessionId::from_raw("coder-main"),
+            "assistant",
+            "home",
+            "p",
+        )
+        .await;
+        assert!(
+            matches!(&stolen, Err(StoreError::Other(why)) if why.contains("coder")),
+            "错误要说清它归谁：{stolen:?}"
+        );
+        assert!(
+            live_main_rows(&db, "assistant").await.is_empty(),
+            "冲突归冲突，别顺手给 assistant 建一条"
+        );
+    }
+
+    /// 输掉竞争的那个不报错：插入失败之后**后置条件**成立（主会话已经有了），返回它。
+    ///
+    /// 竞争本身没法在测试里插进去：一个还没提交、又读过 `sessions` 的事务会把并发的写挤成
+    /// `Contended`（turso 的读集校验；`with_write_retry` 会重跑它），摆不出"这个事务的
+    /// 插入撞上别人刚提交的那一行"那一刻。所以这里直接喂一个"插入失败"，问那段判定该怎么
+    /// 收场——它判的是后置条件，错误长什么样无关。
+    #[tokio::test]
+    async fn a_failed_insert_settles_on_the_main_session_that_is_already_there() {
+        let (db, _dir) = temp().await;
+        ensure_main(
+            &db,
+            &SessionId::from_raw("winner"),
+            "assistant",
+            "home",
+            "p",
+        )
+        .await
+        .unwrap();
+
+        let settled = db
+            .with_write_retry(|ex| {
+                Box::pin(async move {
+                    settle_on_the_main_session(
+                        ex,
+                        "assistant",
+                        StoreError::Other("UNIQUE constraint failed: sessions.agent_id".into()),
+                    )
+                    .await
+                }) as BoxFuture<'_, Result<SessionRow, StoreError>>
+            })
+            .await
+            .expect("后置条件成立时这不是失败");
+        assert_eq!(settled.id, "winner");
+
+        // 后置条件**不**成立时原样报出去：别把真正的失败吞掉。
+        let propagated = db
+            .with_write_retry(|ex| {
+                Box::pin(async move {
+                    settle_on_the_main_session(ex, "coder", StoreError::Other("别的毛病".into()))
+                        .await
+                }) as BoxFuture<'_, Result<SessionRow, StoreError>>
+            })
+            .await;
+        assert!(
+            matches!(&propagated, Err(StoreError::Other(why)) if why == "别的毛病"),
+            "没有主会话就该原样报错：{propagated:?}"
+        );
+    }
+
+    /// 一个 Agent 的主会话多于一条时取**最早**的那条，并把其余的报出来——**不静默**地在
+    /// 里面挑一条（§4.2）。
+    ///
+    /// 正常库里到不了这里（部分唯一索引拦着），所以这个测试先把索引丢掉，造出升级前的
+    /// 那种库：`ensure_owned_in` 不经过 `ensure_main_in` 的"先查再建"，两条都写得进去。
+    /// 内存库 + `pool_size = 1`：MVCC 下 DDL 要求这个库上没有别的连接（见 `Db::build`）。
+    #[tokio::test]
+    async fn the_earliest_main_session_wins_and_the_rest_are_reported() {
+        let db = crate::db::Db::open_memory_with(crate::db::DbOptions {
+            pool_size: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        {
+            let mut conn = db.handle().connection().await.unwrap();
+            toasty::sql::statement(r#"DROP INDEX IF EXISTS "sessions_main_per_agent""#)
+                .exec(&mut conn)
+                .await
+                .unwrap();
+        }
+        ensure_owned(&db, "m-late", "assistant", SessionKind::Main)
+            .await
+            .unwrap();
+        ensure_owned(&db, "m-early", "assistant", SessionKind::Main)
+            .await
+            .unwrap();
+        ensure_owned(&db, "m-other", "coder", SessionKind::Main)
+            .await
+            .unwrap();
+
+        let main = main_for_agent(&db, "assistant")
+            .await
+            .unwrap()
+            .expect("有主会话");
+        assert_eq!(main.row.id, "m-early", "id 是 UUIDv7：最早建的那条最小");
+        assert_eq!(main.duplicates, vec![SessionId::from_raw("m-late")]);
+        let coder = main_for_agent(&db, "coder").await.unwrap().unwrap();
+        assert_eq!(coder.row.id, "m-other");
+        assert!(coder.duplicates.is_empty(), "另一个 Agent 的不算它的重复");
     }
 }

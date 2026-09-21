@@ -22,10 +22,11 @@
 | ObservationView（Full / Excerpt） | `komo-kernel/src/projection.rs` 一处纯函数：抬头 + 头尾各留一段 + 省略量 + **可直接 `read` 的完整输出路径**；"刚跑完"与"回放"逐字节相同 |
 | §15 的 Projection Policy（阈值） | `[execution] model_result_bytes`（默认 8 KiB，`ConfigSnapshot` 热生效）；账本里那 ≤1 KiB 是**行预算**，两件事分开 |
 | §17 的 `observation_read` | **不新增工具**（§4 不新增第七个）：§8.3 早就把恢复路径定为 `read`，这次补的是让 `tool-output/` / `artifacts/` 成为**只读根** |
-| §14 Handle 视图 / 按请求投影 | **未做**：要等真实会话的 recall 次数（§49）——模型自己写的那段正文够用时，"哪次请求用哪个视图"是过度设计 |
+| §14 Handle 视图 / 按请求投影 | **未做**：要等真实会话的 recall 次数（§49）——模型自己写的那段正文够用时，"哪次请求用哪个视图"是过度设计。**次数现在有得数了**（2026-09-21，见下面 §47 那行），所以这道门只是"还没到调" |
 | §25 / §26 Context Compact | **未做**，而且提案里的前提不成立：komo 目前没有 compaction 这一层 |
-| §40 并行工具调用 | **未做**：§6 明确首版顺序执行同一轮的多个调用（减少文件操作顺序歧义） |
-| §41 Action Fusion、§43 Reducer、§47 指标 | **未做**，也还没到做的时候（Reducer 要模型 + 验证 + 成本记账，收益未测量） |
+| §40 并行工具调用 | **已落地（2026-09-21）**：只读的（`Operation::ReadFile`，即 `read` / `rg`）且**没有上一世要接**（续跑里已经 `start` 过的那条要走核对梯子）的调用，可以和同一轮里后面的调用同时在飞，上限 4 条（`ExecutionLimits::max_parallel_reads`）；`write` / `edit` / `shell` / `python` / `delegate` 与任何要停下来的判定都是屏障——屏障之前已经在飞的先收尾。三条不变量照旧：`start_call` 之后才允许副作用、审批先收尾再落审批行（否则答复会落进 Run 还没停下的空窗）、完成事件按真实顺序落账而交给模型的那一份按原始调用顺序配对。`docs/komo_bot.md` §6 那句"首版顺序执行"已改写 |
+| §41 Action Fusion、§43 Reducer | **未做**，也还没到做的时候（Reducer 要模型 + 验证 + 成本记账，收益未测量） |
+| §47 事件 / §48 指标 | **已落地（2026-09-21，只做 trace 那一半）**：`komo::observation` 上四条——`observation.projected`（`tool_output_bytes` / `artifact_bytes` / `projected_bytes`）与 `observation.recalled`（`observation_recall_count`）。按 §47 的取舍，**不进 durable Session Event**；`§49 Benchmark` 的对比口径因此可以开始记 |
 
 ---
 

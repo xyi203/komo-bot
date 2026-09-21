@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use komo_kernel::policy::RuleTable;
 use komo_kernel::protocol::config::{
     ChannelConfig, ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig,
-    StartOnly,
+    StartOnly, TypesafeConfig,
 };
+use komo_kernel::types::agent::{AgentConfig, AgentProfile};
 use komo_kernel::types::chat::PeerId;
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::model::{CatalogModel, Effort, EmbeddingConfig, ModelCatalog, ModelConfig};
@@ -65,6 +66,9 @@ impl Fixture {
     pub fn config_text(model: &str, effort: &str) -> String {
         format!(
             r#"
+default_agent = "assistant"
+
+[agents.assistant]
 [model_providers.openrouter]
 base_url = "https://llm.example.com/v1"
 env_key = "KOMO_LLM_API_KEY"
@@ -220,6 +224,14 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             embedding: Some(embedding),
             retrieval: RetrievalConfig::default(),
         },
+        agent: AgentConfig {
+            default_agent: "assistant".into(),
+            agents: std::collections::BTreeMap::from([(
+                "assistant".into(),
+                AgentProfile::new("assistant"),
+            )]),
+        },
+        typesafe: TypesafeConfig::default(),
         channels: ChannelsConfig {
             feishu: ChannelConfig {
                 enabled: true,

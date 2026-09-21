@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use komo_kernel::policy::RuleTable;
 use komo_kernel::protocol::config::{
     ChannelConfig, ChannelsConfig, ConfigSnapshot, ExecutionConfig, KeyPath, MemoryConfig,
-    PathsConfig, RetrievalConfig, SourceFile, StartOnly,
+    PathsConfig, RetrievalConfig, SourceFile, StartOnly, TypesafeConfig,
 };
+use komo_kernel::types::agent::{AgentConfig, AgentProfile};
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
-use komo_kernel::types::memory::RetrievalMode;
+use komo_kernel::types::memory::{MemoryScopeParseError, RetrievalMode};
 use komo_kernel::types::model::{
     CatalogModel, Effort, EmbeddingConfig, ModelCatalog, ModelConfig, ModelType,
 };
@@ -56,6 +57,13 @@ pub(super) struct FileConfig {
     pub memory: MemorySection,
     #[serde(default)]
     pub execution: ExecutionSection,
+    #[serde(default)]
+    pub typesafe: TypesafeSection,
+    /// 没有明确归属的入口（TUI / CLI / Cron）走哪个 Agent。**必须指向一个声明过的
+    /// `[agents.<id>]`**；一个 Agent 都不声明就是配置不完整（校验会拒绝）。
+    pub default_agent: Option<String>,
+    #[serde(default)]
+    pub agents: std::collections::BTreeMap<String, AgentSection>,
     #[serde(default)]
     pub channels: ChannelsSection,
 }
@@ -153,6 +161,8 @@ pub(super) struct RetrievalSection {
     pub candidate_limit: Option<u32>,
     pub top_k: Option<u32>,
     pub max_tokens: Option<u32>,
+    pub rerank: Option<bool>,
+    pub rerank_shortlist: Option<u32>,
 }
 
 impl RetrievalSection {
@@ -163,6 +173,69 @@ impl RetrievalSection {
             candidate_limit: self.candidate_limit.unwrap_or(base.candidate_limit),
             top_k: self.top_k.unwrap_or(base.top_k),
             max_tokens: self.max_tokens.unwrap_or(base.max_tokens),
+            rerank: self.rerank.unwrap_or(base.rerank),
+            rerank_shortlist: self.rerank_shortlist.unwrap_or(base.rerank_shortlist),
+        }
+    }
+}
+
+/// `[agents.<id>]`：一个助手的长期定义（§四）。键省着写——缺的就是"用默认"。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AgentSection {
+    pub instructions: Option<String>,
+    pub model: Option<String>,
+    pub tools: Option<Vec<String>>,
+    pub skills: Option<Vec<String>>,
+    pub workspace: Option<PathBuf>,
+    pub memory_scope: Option<String>,
+}
+
+impl AgentSection {
+    fn into_profile(self, id: &str, base: &Path) -> Result<AgentProfile, ConfigError> {
+        // 作用域写成什么样是**结构**问题，在解析这一步就报出来；"这个 id 有没有意义"
+        // 属于校验。
+        let memory_scope = match self.memory_scope.as_deref() {
+            Some(raw) => Some(raw.trim().parse().map_err(|error: MemoryScopeParseError| {
+                ConfigError::Io {
+                    path: base.join("config.toml"),
+                    message: format!("[agents.{id}] memory_scope {error}"),
+                }
+            })?),
+            None => None,
+        };
+        Ok(AgentProfile {
+            id: id.to_string(),
+            instructions: self.instructions.filter(|text| !text.trim().is_empty()),
+            model: self.model,
+            tools: self.tools,
+            skills: self.skills,
+            workspace: self.workspace.map(|path| resolve(base, path)),
+            memory_scope,
+        })
+    }
+}
+
+/// `[typesafe]`：可选的判断后端（§9.4）。键省着写——默认值都在 kernel 那边。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct TypesafeSection {
+    pub enabled: Option<bool>,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub api_key: Option<String>,
+    pub timeout_secs: Option<u64>,
+}
+
+impl TypesafeSection {
+    fn into_typesafe(self) -> TypesafeConfig {
+        let base = TypesafeConfig::default();
+        TypesafeConfig {
+            enabled: self.enabled.unwrap_or(base.enabled),
+            endpoint: self.endpoint.unwrap_or(base.endpoint),
+            model: self.model.unwrap_or(base.model),
+            api_key: self.api_key.unwrap_or(base.api_key),
+            timeout_secs: self.timeout_secs.unwrap_or(base.timeout_secs),
         }
     }
 }
@@ -237,6 +310,49 @@ impl Sources {
             })
             .collect()
     }
+}
+
+/// `[agents.<id>]` → [`AgentConfig`]。
+///
+/// **没有隐含默认**：一个 Agent 都没声明时这里不编一个出来，而是报"配置不完整"；`default_agent`
+/// 指向不存在的 id 同样报错。两句话都要指出**该写什么**，否则操作者只知道"不行"。
+fn build_agents(
+    default_agent: Option<String>,
+    sections: BTreeMap<String, AgentSection>,
+    base: &Path,
+) -> Result<AgentConfig, ConfigError> {
+    let source = base.join("config.toml");
+    if sections.is_empty() {
+        return Err(ConfigError::Missing {
+            key: KeyPath::new("agents"),
+            file: source,
+            message: "至少要声明一个 Agent，而且要写在**文件最前面**（任何 `[section]` 之前——TOML 的表会把它后面的键吞进去）：\n\n  default_agent = \"assistant\"\n\n  [agents.assistant]\n  instructions = \"…\""
+                .into(),
+        });
+    }
+    let mut agents = BTreeMap::new();
+    for (id, section) in sections {
+        if id.trim().is_empty() {
+            return Err(ConfigError::Missing {
+                key: KeyPath::new("agents"),
+                file: source,
+                message: "Agent 的 id 不能是空的（`[agents.<id>]`）".into(),
+            });
+        }
+        agents.insert(id.clone(), section.into_profile(&id, base)?);
+    }
+    let default_agent = default_agent.unwrap_or_else(|| {
+        // 只有一个 Agent 时它就是默认——这不是"隐含默认"，是无歧义。
+        if agents.len() == 1 {
+            agents.keys().next().expect("刚判过非空").clone()
+        } else {
+            String::new()
+        }
+    });
+    Ok(AgentConfig {
+        default_agent,
+        agents,
+    })
 }
 
 /// 相对路径按**配置文件所在目录**解析（§12）。
@@ -402,6 +518,8 @@ pub(super) fn assemble(
         model_catalog,
         model,
         memory,
+        agent: build_agents(file.default_agent, file.agents, &base)?,
+        typesafe: file.typesafe.into_typesafe(),
         execution: file.execution.into_execution(),
         channels,
         policy,

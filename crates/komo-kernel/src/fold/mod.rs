@@ -476,6 +476,7 @@ mod tests {
                 model: None,
                 effort: None,
                 delegate: None,
+                snapshot: None,
             }),
         )
     }
@@ -845,6 +846,7 @@ mod tests {
             model: None,
             effort: None,
             delegate: None,
+            snapshot: None,
         })
     }
 }

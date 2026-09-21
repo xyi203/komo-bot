@@ -477,7 +477,7 @@ async fn slash_new_appends_a_boundary_without_switching_sessions() {
     assert!(text.contains("新的一段"), "{text}");
 
     assert_eq!(
-        gateway.state().home_session().await.unwrap(),
+        gateway.state().default_main_session().await.unwrap(),
         session,
         "还是同一个 home session"
     );

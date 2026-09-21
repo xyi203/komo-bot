@@ -21,9 +21,12 @@ use komo_kernel::policy::RuleTable;
 #[cfg(test)]
 use komo_kernel::protocol::config::{
     ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig, StartOnly,
+    TypesafeConfig,
 };
 #[cfg(test)]
 use komo_kernel::traits::LlmClient;
+#[cfg(test)]
+use komo_kernel::types::agent::{AgentConfig, AgentProfile};
 #[cfg(test)]
 use komo_kernel::types::chat::ChannelPlatform;
 #[cfg(test)]
@@ -40,6 +43,9 @@ use super::{Running, ServiceOptions, start};
 pub fn config_toml(extra: &str) -> String {
     format!(
         r#"
+default_agent = "assistant"
+
+[agents.assistant]
 [model.main]
 type = "completion"
 api_backend = "responses"
@@ -110,6 +116,14 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             embedding: None,
             retrieval: RetrievalConfig::default(),
         },
+        agent: AgentConfig {
+            default_agent: "assistant".into(),
+            agents: std::collections::BTreeMap::from([(
+                "assistant".into(),
+                AgentProfile::new("assistant"),
+            )]),
+        },
+        typesafe: TypesafeConfig::default(),
         channels: ChannelsConfig::default(),
         policy: RuleTable::initial(),
         paths: PathsConfig {
@@ -154,6 +168,8 @@ impl TestGateway {
             channels: Vec::new(),
             llm,
             embeddings: None,
+            // 共享 skill 目录钉在临时数据目录上（§5.6）：测试不受这台机器上装过什么影响。
+            shared_home: Some(home.path().to_path_buf()),
         })
         .await
         .expect("Gateway 起得来");

@@ -1,19 +1,25 @@
 //! executor 的验收（§14 阶段 2、3）。
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use komo_kernel::policy::{Grant, GrantScope, Matcher, OperationMatch, RuleTable};
 use komo_kernel::protocol::http::ApprovalDecisionRecord;
-use komo_kernel::traits::{ApprovalRepo, Clock, Tool};
+use komo_kernel::traits::{ApprovalRepo, Clock, OutputWriter, Tool};
 use komo_kernel::types::chat::ApprovalScope;
-use komo_kernel::types::ids::{ApprovalId, AttemptId, GrantId};
-use komo_kernel::types::plan::{Operation, RecoveryMode, Verification};
+use komo_kernel::types::ids::{ApprovalId, AttemptId, GrantId, OperationId, SessionId, ToolCallId};
+use komo_kernel::types::plan::{
+    ApprovedPlan, ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode,
+    TargetAccess, Verification,
+};
 use komo_kernel::types::refs::{PREVIEW_LIMIT_BYTES, ToolResultStatus};
 use komo_kernel::types::status::ToolCallState;
-use komo_kernel::types::tool::{CancelToken, ToolError, ToolOutput};
+use komo_kernel::types::surface::AgentSurface;
+use komo_kernel::types::tool::{CancelToken, ToolContext, ToolDefinition, ToolError, ToolOutput};
 
 use super::harness::{Harness, RecordingTool};
-use super::{CallRequest, OperatorVerdict, RoundStop, resumed_from};
+use super::{CallRequest, OperatorVerdict, RoundStop, is_recall, resumed_from};
 
 /// 这个调用现在这一刻的计划——`crashed_attempt` 要用它写 `tool.planned`。
 async fn plan_of(
@@ -277,11 +283,12 @@ async fn an_unknown_tool_name_cannot_be_called() {
     let calls = harness
         .record_round(&run, &[("rm_rf", serde_json::json!({}))])
         .await;
+    // 名字在能力面里、执行器手里却没有——这是**装配错误**（目录与能力面不同源），
+    // 单独一条路，报的话也不一样。正常路径上它不该出现（§4 末）。
+    let mut env = harness.env(&session, &run);
+    env.surface = AgentSurface::new(["rm_rf"]);
 
-    let outcome = executor
-        .execute_round(calls, &harness.env(&session, &run))
-        .await
-        .unwrap();
+    let outcome = executor.execute_round(calls, &env).await.unwrap();
 
     assert!(outcome.stop.is_none());
     let result = &outcome.results[0];
@@ -299,6 +306,43 @@ async fn an_unknown_tool_name_cannot_be_called() {
             komo_kernel::events::EventPayload::ToolPlanned(_)
         )),
         "未知工具不该留下 tool.planned"
+    );
+}
+
+/// **能力面之外的工具，模型自己拼出名字也调不动**（§4 末）。
+///
+/// 这是"给模型看的 schema"与"执行时允许的名字"同源的那条不变量的验收：schema 里没有
+/// 这个名字，执行器就不认它——回退到全局工具目录会让能力边界变成一句建议。
+#[tokio::test]
+async fn a_tool_outside_the_surface_cannot_be_called() {
+    let harness = Harness::new();
+    let reader = Arc::new(RecordingTool::new("read", Operation::ReadFile));
+    let search = Arc::new(RecordingTool::new("rg", Operation::ReadFile));
+    let executor = harness.permissive(vec![reader.clone(), search.clone()]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(&run, &[("rg", serde_json::json!({ "pattern": "x" }))])
+        .await;
+    let mut env = harness.env(&session, &run);
+    env.surface = AgentSurface::new(["read"]);
+
+    let outcome = executor.execute_round(calls, &env).await.unwrap();
+
+    assert!(outcome.stop.is_none());
+    let result = &outcome.results[0];
+    assert!(result.is_error, "{}", result.content);
+    assert!(
+        result.content.contains("工具集里没有 rg") && result.content.contains("可用的是：read"),
+        "{}",
+        result.content
+    );
+    assert_eq!(search.ran(), 0, "面外的工具一次都不能跑");
+    assert!(
+        harness.ledger.events().iter().all(|event| !matches!(
+            event.payload,
+            komo_kernel::events::EventPayload::ToolPlanned(_)
+        )),
+        "面外的工具不该留下 tool.planned"
     );
 }
 
@@ -748,9 +792,9 @@ async fn cancelling_leaves_the_rest_of_the_round_undispatched() {
     assert_eq!(outcome.remaining.len(), 2);
 }
 
-/// 一轮里的多个调用**顺序**执行（§6：减少文件操作顺序歧义）。
+/// 写之后的读看见写留下的东西（§6：写是屏障，它后面那条不会和它抢跑道）。
 #[tokio::test]
-async fn several_calls_in_one_round_run_in_order() {
+async fn the_read_after_a_write_sees_what_the_write_left() {
     let harness = Harness::new();
     let executor = harness.permissive(vec![Arc::new(WriteTool::new()), Arc::new(ReadTool::new())]);
     let (session, run) = harness.open_run().await;
@@ -1028,15 +1072,24 @@ async fn a_resumed_call_reuses_the_plan_it_was_approved_for() {
 }
 
 #[tokio::test]
-async fn the_executor_publishes_the_definitions_of_what_it_holds() {
+async fn the_executor_keeps_a_catalog_and_renders_a_surface_from_it() {
     let harness = Harness::new();
     let executor = harness.permissive(vec![Arc::new(ReadTool::new()), Arc::new(WriteTool::new())]);
     let names: Vec<String> = executor
-        .definitions()
+        .catalog()
         .into_iter()
         .map(|definition| definition.name)
         .collect();
     assert_eq!(names, vec!["read".to_string(), "write".to_string()]);
+
+    // 交给模型的 schema 按**能力面**来：面外的工具一个都不出现，顺序听能力面的。
+    let surface = AgentSurface::new(["write"]);
+    let rendered: Vec<String> = executor
+        .definitions_for(&surface)
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect();
+    assert_eq!(rendered, vec!["write".to_string()]);
 }
 
 /// 委派（§4、§8.4 的 `dependency`）：一次子任务怎么变成一条子 Run、父调用怎么收尾。
@@ -1576,4 +1629,605 @@ mod delegation {
         );
         assert!(child_runs(&harness).is_empty(), "被派的 Run 不能再派一条");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 同轮并发（§6 的修订）：只读的在飞，其余是屏障。
+// ---------------------------------------------------------------------------
+
+/// 一个只读的假工具：执行过程可以被观察和编排。
+///
+/// 同轮并发的**唯一**候选是 `read` / `rg` 那一类（`Operation::ReadFile`），所以"两条读
+/// 是不是真的同时在飞""写是不是屏障"都只能在它身上验。
+struct Probe {
+    name: &'static str,
+    operation: Operation,
+    /// 进入与离开各记一行，按真实发生的顺序追加。
+    log: Arc<Mutex<Vec<String>>>,
+    /// 两条调用互相等：凑齐才继续。一条一条跑的时候这里等不到。
+    barrier: Option<Arc<tokio::sync::Barrier>>,
+    /// 一进来就取消整条 Run（测"取消要收齐已经在飞的那几条"）。
+    cancel_on_entry: Option<CancelToken>,
+    /// 进入时顺手数一眼"现在有几条待审批"（测"审批行在这批收完之后才落"）。
+    approvals: Option<MemoApprovals>,
+    pending_seen: Arc<Mutex<Vec<usize>>>,
+}
+
+type MemoApprovals = komo_kernel::test_support::MemApprovalRepo;
+
+impl Probe {
+    fn new(name: &'static str, operation: Operation, log: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            name,
+            operation,
+            log,
+            barrier: None,
+            cancel_on_entry: None,
+            approvals: None,
+            pending_seen: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn with_barrier(mut self, barrier: Arc<tokio::sync::Barrier>) -> Self {
+        self.barrier = Some(barrier);
+        self
+    }
+
+    fn with_cancel(mut self, cancel: CancelToken) -> Self {
+        self.cancel_on_entry = Some(cancel);
+        self
+    }
+
+    fn counting_approvals(mut self, approvals: MemoApprovals) -> Self {
+        self.approvals = Some(approvals);
+        self
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.log.lock().expect("日志").clone()
+    }
+
+    fn pending_seen(&self) -> Vec<usize> {
+        self.pending_seen.lock().expect("待审批").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for Probe {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: self.name.into(),
+            description: "测试用".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    async fn prepare(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<ExecutionPlan, ToolError> {
+        let path = args
+            .get("path")
+            .and_then(|value| value.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| ToolError::InvalidArguments {
+                message: "probe 需要一个 path".into(),
+            })?;
+        Ok(ExecutionPlan {
+            operation_id: OperationId::from_raw(format!("op-{}", ctx.call)),
+            source: ctx.source.clone(),
+            tool: self.name.into(),
+            operation: self.operation.clone(),
+            run: Some(ctx.run.clone()),
+            tool_call: Some(ctx.call.clone()),
+            args,
+            cwd: Some(ctx.cwd.clone()),
+            // 目标就是参数里那个路径——规则的路径匹配只看这里（§7.1）。
+            targets: vec![PlanTarget {
+                path: ctx.cwd.join(path),
+                access: TargetAccess::Read,
+                expected_version: None,
+            }],
+            versions: PlanVersions::default(),
+            resources: vec![],
+            // 读取可以安全重做：超时是失败，不是"结果不明"。
+            recovery: RecoveryMode::SafeReread,
+        })
+    }
+
+    async fn execute(
+        &self,
+        plan: ApprovedPlan,
+        ctx: &ToolContext,
+        _sink: &mut dyn OutputWriter,
+    ) -> Result<ToolOutput, ToolError> {
+        let tag = format!("{}:{}", self.name, ctx.call);
+        self.log.lock().expect("日志").push(format!("{tag}:进入"));
+        if let Some(cancel) = &self.cancel_on_entry {
+            cancel.cancel();
+        }
+        if let Some(approvals) = &self.approvals {
+            let pending = approvals.list_pending(None).await.expect("待审批").len();
+            self.pending_seen.lock().expect("待审批").push(pending);
+        }
+        if let Some(barrier) = &self.barrier
+            && tokio::time::timeout(Duration::from_secs(1), barrier.wait())
+                .await
+                .is_err()
+        {
+            // 另一条读一直没进来 = 它们没在同时在飞。
+            return Err(ToolError::Timeout { after_secs: 1 });
+        }
+        let delay = plan
+            .plan()
+            .args
+            .get("delay_ms")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0);
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+        }
+        self.log.lock().expect("日志").push(format!("{tag}:离开"));
+        Ok(ToolOutput {
+            status: ToolResultStatus::Completed,
+            result: serde_json::json!({ "call": ctx.call }),
+            exit_code: None,
+            artifacts: vec![],
+            preview: Some(format!("{tag} 完成")),
+        })
+    }
+}
+
+fn read_call(path: &str) -> (&'static str, serde_json::Value) {
+    ("read", serde_json::json!({ "path": path }))
+}
+
+/// 同一轮里的两条只读调用**同时在飞**：一条一条跑的话，第二条永远进不来。
+#[tokio::test]
+async fn two_reads_in_one_round_run_at_the_same_time() {
+    let harness = Harness::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let probe = Arc::new(
+        Probe::new("read", Operation::ReadFile, Arc::clone(&log))
+            .with_barrier(Arc::new(tokio::sync::Barrier::new(2))),
+    );
+    let executor = harness.permissive(vec![probe.clone()]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(&run, &[read_call("a.txt"), read_call("b.txt")])
+        .await;
+
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+    assert_eq!(outcome.results.len(), 2);
+    let bodies: Vec<&String> = outcome.results.iter().map(|r| &r.content).collect();
+    assert!(
+        outcome.results.iter().all(|result| !result.is_error),
+        "{bodies:?}"
+    );
+    // 两条都进来之后才可能都离开：顺序正是"进入、进入、离开、离开"。
+    let log = probe.log();
+    assert_eq!(log.len(), 4, "{log:?}");
+    assert!(
+        log[0].ends_with(":进入") && log[1].ends_with(":进入"),
+        "第二条读没有和第一条同时在飞：{log:?}"
+    );
+}
+
+/// 写是屏障：它前面的读先收尾，之后的读等它跑完（§6）。
+#[tokio::test]
+async fn a_write_waits_for_the_reads_that_come_before_it() {
+    let harness = Harness::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let reader = Arc::new(Probe::new("read", Operation::ReadFile, Arc::clone(&log)));
+    let writer = Arc::new(Probe::new("write", Operation::WriteFile, Arc::clone(&log)));
+    let executor = harness.permissive(vec![reader, writer]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(
+            &run,
+            &[
+                (
+                    "read",
+                    serde_json::json!({ "path": "a.txt", "delay_ms": 40 }),
+                ),
+                ("write", serde_json::json!({ "path": "b.txt" })),
+            ],
+        )
+        .await;
+
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+    assert_eq!(outcome.results.len(), 2);
+    let log = log.lock().expect("日志").clone();
+    assert_eq!(log.len(), 4, "{log:?}");
+    assert!(
+        log[0].starts_with("read:") && log[1].ends_with(":离开"),
+        "读没有先收尾：{log:?}"
+    );
+    assert!(
+        log[2].starts_with("write:"),
+        "写在读收尾之前就开始了：{log:?}"
+    );
+}
+
+/// 要审批的调用：**后面的调用一条都不启动**，而且审批行是在这一批收完之后才落的。
+///
+/// 后半句是这次并发改动唯一需要额外小心的地方（§7.4）：审批行要是比 Run 的挂起早出现
+/// 一整个批次，操作者就可能答得比 Run 停下还早，那条答复落进空窗。
+#[tokio::test]
+async fn an_ask_stops_the_round_and_lands_only_after_the_reads_finish() {
+    let harness = Harness::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let probe = Arc::new(
+        Probe::new("read", Operation::ReadFile, log).counting_approvals(harness.approvals.clone()),
+    );
+    let executor = harness.initial(vec![probe.clone()]);
+    let (session, run) = harness.open_run().await;
+    // 第一条在 workspace 里（初始规则表 Allow），第二条在范围外（Ask）。
+    let calls = harness
+        .record_round(&run, &[read_call("a.txt"), read_call("/etc/shadow")])
+        .await;
+
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+
+    let Some(RoundStop::Approval { call, .. }) = outcome.stop.clone() else {
+        panic!("{:?}", outcome.stop)
+    };
+    assert_eq!(call, ToolCallId::from_raw("call-1"));
+    assert_eq!(outcome.results.len(), 1, "第一条已经收尾");
+    assert_eq!(
+        outcome.remaining.len(),
+        1,
+        "停在审批上的那条还在 remaining 里"
+    );
+    assert_eq!(
+        probe.pending_seen(),
+        vec![0],
+        "第一条执行时第二条的审批行就已经在了——它比 Run 的挂起还早"
+    );
+    let pending = harness
+        .approvals
+        .list_pending(Some(&session))
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "这一轮收完之后它才落下来");
+    assert_eq!(pending[0].plan.tool, "read");
+}
+
+/// 取消要收齐已经在飞的那几条：它们的结论一个都不能丢（§8.6）。
+#[tokio::test]
+async fn cancelling_collects_the_reads_that_are_already_in_flight() {
+    let harness = Harness::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let cancel = CancelToken::new();
+    let reader = Arc::new(
+        Probe::new("read", Operation::ReadFile, Arc::clone(&log)).with_cancel(cancel.clone()),
+    );
+    let writer = Arc::new(Probe::new("write", Operation::WriteFile, log));
+    let executor = harness.permissive(vec![reader, writer]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(
+            &run,
+            &[
+                (
+                    "read",
+                    serde_json::json!({ "path": "a.txt", "delay_ms": 50 }),
+                ),
+                (
+                    "read",
+                    serde_json::json!({ "path": "b.txt", "delay_ms": 50 }),
+                ),
+                ("write", serde_json::json!({ "path": "c.txt" })),
+            ],
+        )
+        .await;
+
+    let outcome = executor
+        .execute_round(calls, &harness.env_with_cancel(&session, &run, cancel))
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome.stop, Some(RoundStop::Cancelled)));
+    assert_eq!(outcome.results.len(), 2, "已经在飞的两条都要有结论");
+    assert_eq!(outcome.remaining.len(), 1);
+    assert_eq!(
+        outcome.remaining[0].call,
+        ToolCallId::from_raw("call-2"),
+        "屏障后面的那条一个字节都没派发"
+    );
+}
+
+/// 后一条先跑完也不改配对的顺序：交给模型的正文按**原始调用顺序**排（§6）。
+#[tokio::test]
+async fn a_faster_later_read_does_not_reorder_the_results() {
+    let harness = Harness::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let probe = Arc::new(Probe::new("read", Operation::ReadFile, Arc::clone(&log)));
+    let executor = harness.permissive(vec![probe.clone()]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(
+            &run,
+            &[
+                (
+                    "read",
+                    serde_json::json!({ "path": "a.txt", "delay_ms": 60 }),
+                ),
+                ("read", serde_json::json!({ "path": "b.txt" })),
+            ],
+        )
+        .await;
+
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+
+    let call_of = |index: usize| ToolCallId::from_raw(format!("call-{index}"));
+    assert_eq!(outcome.results.len(), 2);
+    assert_eq!(outcome.results[0].call_id, call_of(0));
+    assert_eq!(outcome.results[1].call_id, call_of(1));
+    assert!(outcome.results[0].content.contains("call-0"));
+    // 先完成的确实是后面那条：完成事件按真实顺序落账。
+    let finished: Vec<String> = probe
+        .log()
+        .into_iter()
+        .filter(|line| line.ends_with(":离开"))
+        .collect();
+    assert!(finished[0].contains("call-1"), "{finished:?}");
+}
+
+// ---------------------------------------------------------------------------
+// §47 / §48：投影与 recall 的字节账。
+// ---------------------------------------------------------------------------
+
+/// 掐住 trace 输出——这两条指标**只进 trace，不进事件流**（§47）。
+#[derive(Clone, Default)]
+struct TraceCapture(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for TraceCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("trace").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'w> tracing_subscriber::fmt::MakeWriter<'w> for TraceCapture {
+    type Writer = TraceCapture;
+
+    fn make_writer(&'w self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl TraceCapture {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().expect("trace")).into_owned()
+    }
+
+    /// `field=123` 里那个数。
+    fn number(&self, field: &str) -> u64 {
+        let text = self.text();
+        let rest = text
+            .split_once(&format!("{field}="))
+            .unwrap_or_else(|| panic!("trace 里没有 {field}：{text}"))
+            .1;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits
+            .parse()
+            .unwrap_or_else(|_| panic!("{field} 不是数：{rest}"))
+    }
+}
+
+/// 一次观察落了多少字节、投影给模型多少——两个数都要真的算出来（§48）。
+#[tokio::test]
+async fn the_projection_reports_how_many_bytes_it_kept_and_stored() {
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let harness = Harness::new();
+    let preview = "甲".repeat(500);
+    let tool = Arc::new(
+        RecordingTool::new("read", Operation::ReadFile).with_outcome(Ok(ToolOutput {
+            status: ToolResultStatus::Completed,
+            result: serde_json::json!({}),
+            exit_code: None,
+            artifacts: vec![],
+            preview: Some(preview.clone()),
+        })),
+    );
+    let executor = harness.permissive(vec![tool]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness.record_round(&run, &[read_call("a.txt")]).await;
+
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+
+    assert!(
+        capture.text().contains("observation.projected"),
+        "{}",
+        capture.text()
+    );
+    assert!(
+        capture.number("tool_output_bytes") >= preview.len() as u64,
+        "落盘的字节至少要装得下正文"
+    );
+    // 投影进模型的那一份**小于**完整正文：超出的部分靠"完整输出在哪"那行去读回。
+    assert!(
+        capture.number("projected_bytes") < capture.number("tool_output_bytes"),
+        "投影没有省下任何东西"
+    );
+}
+
+/// 读回我们自己落盘的观察才算 recall（§48）。
+#[tokio::test]
+async fn reading_back_an_observation_counts_as_a_recall() {
+    let capture = TraceCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(capture.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let harness = Harness::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let probe = Arc::new(Probe::new("read", Operation::ReadFile, log));
+    let executor = harness.permissive(vec![probe]);
+    let (session, run) = harness.open_run().await;
+    let observations = harness.dir.path().join("sessions").join(session.as_str());
+    let calls = harness
+        .record_round(
+            &run,
+            &[read_call(
+                &observations
+                    .join("tool-output/run-1/call-1/attempt-1/output.json")
+                    .display()
+                    .to_string(),
+            )],
+        )
+        .await;
+
+    let mut env = harness.env(&session, &run);
+    env.session_root = Some(observations);
+    let outcome = executor.execute_round(calls, &env).await.unwrap();
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+
+    assert!(
+        capture.text().contains("observation.recalled"),
+        "{}",
+        capture.text()
+    );
+}
+
+/// recall 只在"读的是我们自己落盘的那两个子目录"时成立（§48）。
+#[tokio::test]
+async fn only_reads_of_our_own_output_are_recalls() {
+    let harness = Harness::new();
+    let (session, run) = harness.open_run().await;
+    let observations = harness.dir.path().join("sessions").join(session.as_str());
+    let mut env = harness.env(&session, &run);
+    env.session_root = Some(observations.clone());
+
+    let output = observations.join("tool-output/run-1/call-1/attempt-1/output.json");
+    let artifacts = observations.join("artifacts/report.md");
+    assert!(is_recall(
+        &plan_touching(&[output], Operation::ReadFile),
+        &env
+    ));
+    assert!(is_recall(
+        &plan_touching(&[artifacts], Operation::ReadFile),
+        &env
+    ));
+    // 工作目录里的文件不是"读回观察"。
+    assert!(!is_recall(
+        &plan_touching(&[env.cwd.join("a.txt")], Operation::ReadFile),
+        &env
+    ));
+    // 写那两个目录也不是 recall——recall 说的是"读回来"。
+    assert!(!is_recall(
+        &plan_touching(
+            &[observations.join("artifacts/report.md")],
+            Operation::WriteFile
+        ),
+        &env
+    ));
+    // 没有 Session 目录（精简装配）时不算：无从判断读的是不是我们落的盘。
+    let mut plain = harness.env(&session, &run);
+    plain.session_root = None;
+    assert!(!is_recall(
+        &plan_touching(
+            &[observations.join("tool_output.json")],
+            Operation::ReadFile
+        ),
+        &plain
+    ));
+}
+
+/// 一份只用来问"路径落在哪"的计划。
+fn plan_touching(paths: &[PathBuf], operation: Operation) -> ExecutionPlan {
+    ExecutionPlan {
+        operation_id: OperationId::from_raw("op-1"),
+        source: PlanSource::Interactive {
+            session: SessionId::from_raw("sess-1"),
+        },
+        tool: "read".into(),
+        operation,
+        run: None,
+        tool_call: None,
+        args: serde_json::Value::Null,
+        cwd: None,
+        targets: paths
+            .iter()
+            .map(|path| PlanTarget {
+                path: path.clone(),
+                access: TargetAccess::Read,
+                expected_version: None,
+            })
+            .collect(),
+        versions: PlanVersions::default(),
+        resources: vec![],
+        recovery: RecoveryMode::SafeReread,
+    }
+}
+
+/// 续跑里"确定尚未执行"的只读调用照样可以和后面的同时在飞——它没有上一世要接，
+/// 顺序不由账本钉死（§8.4 第 6 行）。
+#[tokio::test]
+async fn a_resumed_read_that_never_ran_still_runs_beside_its_siblings() {
+    let harness = Harness::new();
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let probe = Arc::new(
+        Probe::new("read", Operation::ReadFile, Arc::clone(&log))
+            .with_barrier(Arc::new(tokio::sync::Barrier::new(2))),
+    );
+    let executor = harness.permissive(vec![probe.clone()]);
+    let (session, run) = harness.open_run().await;
+    let mut calls = harness
+        .record_round(&run, &[read_call("a.txt"), read_call("b.txt")])
+        .await;
+    // 上一世只是落了计划、一次尝试都没有。
+    for request in calls.iter_mut() {
+        request.resumed = Some(resumed_from(ToolCallState::Planned, None, 0));
+    }
+
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+    assert_eq!(outcome.results.len(), 2);
+    let log = probe.log();
+    assert_eq!(log.len(), 4, "{log:?}");
+    assert!(
+        log[0].ends_with(":进入") && log[1].ends_with(":进入"),
+        "续跑里那条没跑过的读没有和兄弟同时在飞：{log:?}"
+    );
 }

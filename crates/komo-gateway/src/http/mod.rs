@@ -146,7 +146,7 @@ async fn healthz(State(api): State<Api>) -> Json<HealthResponse> {
 // 而 `SessionSummary` 上没有 `origin`，按列表也筛不出来。这里加一个只读端点，类型仍是
 // 现成的 `SessionSummary`——kernel 一个字没改。见报告。)
 async fn home_session(State(api): State<Api>) -> ApiResult<Json<SessionSummary>> {
-    let session = api.state.home_session().await?;
+    let session = api.state.default_main_session().await?;
     let summary = sessions::summary_of(&api, &session).await?;
     Ok(Json(summary))
 }

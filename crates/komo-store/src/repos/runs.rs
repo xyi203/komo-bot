@@ -262,7 +262,7 @@ pub async fn reserve_in(ex: &mut dyn Executor, new: &NewRun) -> Result<RunRow, S
         // "这是子 Run，直接进队列"，§8.7 的领取语句判"拦住我的那条是不是我的父"），
         // 而这两步之间没有任何写者会再补——留到受理那一步写就是在开一个窗口。
         parent_run_id: new.delegate.as_ref().map(|spec| spec.parent.to_string()),
-        delegate: new.delegate.as_ref().map(|spec| encode(spec)).transpose()?,
+        delegate: new.delegate.as_ref().map(encode).transpose()?,
         // 退役列：不再读，写入给空值（§8.2 只允许加列）。
         status: String::new(),
         state: state_str(RunState::Accepted),

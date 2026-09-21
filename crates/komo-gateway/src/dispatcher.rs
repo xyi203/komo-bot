@@ -113,12 +113,12 @@ impl Dispatcher {
 
     /// 第 3 步：哪一个会话。
     ///
-    /// 操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）全部落到同一个 home
-    /// session；群聊按 `{platform}:{chat_id}` 各自一个，且只有 `groups` 列出的群会被
-    /// 响应（§11.2）。
+    /// 操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）落到**默认 Agent 的主会话**
+    /// ——它们没有"找谁"这一维，所以走 §四 说的 `default_agent`；群聊按
+    /// `{platform}:{chat_id}` 各自一个，且只有 `groups` 列出的群会被响应（§11.2）。
     async fn conversation(&self, msg: &InboundMessage) -> Result<Option<SessionId>, GatewayError> {
         if msg.is_private {
-            return self.state.home_session().await.map(Some);
+            return self.state.default_main_session().await.map(Some);
         }
         let snapshot = self.state.snapshot();
         let responds = snapshot
@@ -148,6 +148,7 @@ impl Dispatcher {
         }
         let session = SessionId::new_at(self.state.clock.now());
         self.state.ledgers.open(&session, &origin).await?;
+        self.state.own_session(&session).await?;
         Ok(session)
     }
 
@@ -811,7 +812,8 @@ pub fn inbound(
     }
 }
 
-/// home session 的 origin 串，给别处对照用。
+/// 主会话在 `sessions.origin` 里的前缀，给别处对照用（见
+/// [`main_origin`](crate::service::state::main_origin)）。
 pub const HOME: &str = HOME_ORIGIN;
 
 #[cfg(test)]

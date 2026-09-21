@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::policy::RuleTable;
+use crate::types::agent::AgentConfig;
 use crate::types::chat::{ChannelPlatform, PeerId};
 use crate::types::digest::ContentHash;
 use crate::types::memory::RetrievalMode;
@@ -146,6 +147,17 @@ pub struct RetrievalConfig {
     pub top_k: u32,
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u32,
+    /// 把融合后的短名单交给判断后端重排（§9.4）。默认关：开着就要发一次外部请求。
+    #[serde(default)]
+    pub rerank: bool,
+    /// 重排看多宽的短名单。**必须大于 `top_k`**——一样宽就只是换个顺序，重排换不出
+    /// 任何本来进不了 `top_k` 的条目（校验会拒绝这种组合）。
+    #[serde(default = "default_rerank_shortlist")]
+    pub rerank_shortlist: u32,
+}
+
+fn default_rerank_shortlist() -> u32 {
+    20
 }
 
 fn default_candidate_limit() -> u32 {
@@ -165,6 +177,55 @@ impl Default for RetrievalConfig {
             candidate_limit: default_candidate_limit(),
             top_k: default_top_k(),
             max_tokens: default_max_tokens(),
+            rerank: false,
+            rerank_shortlist: default_rerank_shortlist(),
+        }
+    }
+}
+
+/// `[typesafe]`：可选的判断后端（TypeSafe「System One」，§9.4 的记忆重排用它）。
+///
+/// **默认关**。它有两个代价，都要说清楚：要一份凭证；把送进 `state` 的正文（比如记忆
+/// 正文）发给第三方。关着的时候一个请求都不发，召回顺序就是关键词 + 向量的融合结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypesafeConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_typesafe_endpoint")]
+    pub endpoint: String,
+    #[serde(default = "default_typesafe_model")]
+    pub model: String,
+    /// 凭证的**变量名**：值只住在 `.env` 里（`Secrets`），快照里只有变量名。
+    #[serde(default = "default_typesafe_key")]
+    pub api_key: String,
+    #[serde(default = "default_typesafe_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_typesafe_endpoint() -> String {
+    "https://api.typesafe.ai/v1/systemone".into()
+}
+
+fn default_typesafe_model() -> String {
+    "jev-latest".into()
+}
+
+fn default_typesafe_key() -> String {
+    "TYPESAFE_API_KEY".into()
+}
+
+fn default_typesafe_timeout() -> u64 {
+    30
+}
+
+impl Default for TypesafeConfig {
+    fn default() -> Self {
+        TypesafeConfig {
+            enabled: false,
+            endpoint: default_typesafe_endpoint(),
+            model: default_typesafe_model(),
+            api_key: default_typesafe_key(),
+            timeout_secs: default_typesafe_timeout(),
         }
     }
 }
@@ -247,6 +308,12 @@ pub struct ConfigSnapshot {
     pub model_catalog: ModelCatalog,
     pub model: ModelConfig,
     pub memory: MemoryConfig,
+    /// 助手定义（§四）。**没有隐含默认**：`[agents.<id>]` 是唯一写法，
+    /// `default_agent` 指向其中一个。
+    pub agent: AgentConfig,
+    /// 可选判断后端。默认关（见 [`TypesafeConfig`]）。
+    #[serde(default)]
+    pub typesafe: TypesafeConfig,
     #[serde(default)]
     pub execution: ExecutionConfig,
     pub channels: ChannelsConfig,
@@ -334,6 +401,8 @@ mod tests {
     use crate::types::model::Effort;
     use time::macros::datetime;
 
+    use crate::types::AgentProfile;
+
     fn model(name: &str) -> ModelConfig {
         ModelConfig {
             provider: "openai_compatible".into(),
@@ -363,6 +432,11 @@ mod tests {
                 embedding: None,
                 retrieval: RetrievalConfig::default(),
             },
+            agent: AgentConfig {
+                default_agent: "assistant".into(),
+                agents: BTreeMap::from([("assistant".into(), AgentProfile::new("assistant"))]),
+            },
+            typesafe: TypesafeConfig::default(),
             channels: ChannelsConfig {
                 feishu: ChannelConfig {
                     enabled: true,

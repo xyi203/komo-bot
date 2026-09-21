@@ -64,6 +64,7 @@ pub fn conversation() -> Vec<Event> {
                 model: Some("chat-a".into()),
                 effort: Some(EffortSetting::Explicit(Effort::new("high"))),
                 delegate: None,
+                snapshot: None,
             }),
         ),
         event(

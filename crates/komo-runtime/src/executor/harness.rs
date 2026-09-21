@@ -35,6 +35,9 @@ pub struct Harness {
     pub approvals: MemApprovalRepo,
     pub gate: ApprovalGate,
     pub dir: tempfile::TempDir,
+    /// 装进执行器的工具名 = `env()` 给的**默认能力面**（§4 末）。测试要更窄的面就在拿到
+    /// 的 `CallEnv` 上盖 `surface`。
+    surface: std::sync::Mutex<Vec<String>>,
 }
 
 impl Default for Harness {
@@ -54,11 +57,22 @@ impl Harness {
             approvals,
             gate,
             dir: tempfile::tempdir().expect("临时目录"),
+            surface: std::sync::Mutex::new(Vec::new()),
             clock,
         }
     }
 
     pub fn executor(&self, tools: Vec<Arc<dyn Tool>>, policy: PolicyEngine) -> Arc<ToolExecutor> {
+        // 这一段运行的能力面 = 装进来的工具（`env()` 拿它当默认面）。
+        {
+            let mut surface = self.surface.lock().expect("能力面");
+            for tool in &tools {
+                let name = tool.definition().name;
+                if !surface.contains(&name) {
+                    surface.push(name);
+                }
+            }
+        }
         Arc::new(
             ToolExecutor::new(
                 tools,
@@ -106,6 +120,7 @@ impl Harness {
                 workdir: None,
                 // 这是一条普通 Run 的输入：不是谁派的子任务。
                 delegate: None,
+                snapshot: None,
                 at: self.clock.now(),
             })
             .await
@@ -225,6 +240,10 @@ impl Harness {
             source: PlanSource::Interactive {
                 session: session.clone(),
             },
+            // 装进执行器的那几个工具——测试要更窄的面自己盖这一格（§4 末）。
+            surface: komo_kernel::types::surface::AgentSurface::new(
+                self.surface.lock().expect("能力面").clone(),
+            ),
             cwd: root.clone(),
             roots: vec![WorkspaceRoot {
                 path: root,

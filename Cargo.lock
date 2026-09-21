@@ -2341,6 +2341,7 @@ dependencies = [
  "komo-kernel",
  "komo-store",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2351,6 +2352,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

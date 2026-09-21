@@ -45,11 +45,10 @@ pub fn origin_of(source: &PlanSource) -> &'static str {
     }
 }
 
-/// 一个 Session 的三件套。
+/// 一个 Session 的两件套。
 pub struct SessionEntry {
     pub coordinator: Arc<Coordinator>,
     pub ledger: Arc<PublishingLedger>,
-    pub outputs: Arc<FileToolOutputStore>,
 }
 
 impl std::fmt::Debug for SessionEntry {
@@ -133,7 +132,6 @@ impl SessionLedgers {
         .await?
         .with_executor(self.executor.clone());
         let coordinator = Arc::new(coordinator);
-        let outputs = Arc::new(coordinator.outputs());
         let last = coordinator.last_seq().await;
         let ledger = Arc::new(PublishingLedger::new(
             Arc::clone(&coordinator),
@@ -144,7 +142,6 @@ impl SessionLedgers {
         let entry = Arc::new(SessionEntry {
             coordinator,
             ledger,
-            outputs,
         });
         entries.insert(session.clone(), Arc::clone(&entry));
         Ok(entry)
@@ -398,15 +395,21 @@ impl RoutedLedger {
     }
 
     /// 把一个 Session 的调用与尝试补记进来。恢复装配一段之前调它。
+    ///
+    /// **读不得创建或修改内容**（§8.9）：这条读路径不走 [`SessionLedgers::open`]——它会
+    /// `ensure` 建目录、落一份日志，读一次就把搬走的会话目录又建回来了，而 §8.10 判一条
+    /// Run 能不能领靠的正是"内容在不在"。直接按路径读磁盘：目录不在就是读不出来（补记
+    /// 不到任何东西），不替它造一份空的。
     pub async fn learn(&self, session: &SessionId) -> Result<(), LedgerError> {
-        let entry = self.ledgers.open(session, "agent").await?;
+        let paths = self.ledgers.paths_for(session);
         let mut from = Seq::ZERO;
         loop {
-            let batch = entry.ledger.read(session, from, 0).await?;
-            if batch.events.is_empty() {
+            let (events, more) =
+                komo_store::session_log::read_events(&paths, session, from, 0).await?;
+            if events.is_empty() {
                 return Ok(());
             }
-            for event in &batch.events {
+            for event in &events {
                 from = from.max(event.seq);
                 if let Some(run) = &event.run {
                     self.note_run(run, session);
@@ -429,7 +432,7 @@ impl RoutedLedger {
                     _ => {}
                 }
             }
-            if batch.next.is_none() {
+            if !more {
                 return Ok(());
             }
         }
@@ -696,6 +699,10 @@ impl Ledger for RoutedLedger {
 pub struct RoutedOutputs {
     ledgers: Arc<SessionLedgers>,
     routed: Arc<RoutedLedger>,
+    /// 每个 Session 一个输出存储。**造它不碰磁盘**（只算路径），所以读路径走它不会把
+    /// 搬走的会话目录建回来（§8.9/§8.10）；同一个实例也保证 `begin` 开出来的流 `publish`
+    /// 找得回（§8.3）。
+    stores: Mutex<BTreeMap<SessionId, Arc<FileToolOutputStore>>>,
 }
 
 impl std::fmt::Debug for RoutedOutputs {
@@ -706,15 +713,26 @@ impl std::fmt::Debug for RoutedOutputs {
 
 impl RoutedOutputs {
     pub fn new(ledgers: Arc<SessionLedgers>, routed: Arc<RoutedLedger>) -> Self {
-        RoutedOutputs { ledgers, routed }
+        RoutedOutputs {
+            ledgers,
+            routed,
+            stores: Mutex::new(BTreeMap::new()),
+        }
     }
 
+    /// 这个 Session 的输出存储。**只算路径，不碰磁盘**——不走 [`SessionLedgers::open`]，
+    /// 那条路会 `ensure` 建目录、落一份日志，读一次就把搬走的会话目录又建回来了
+    /// （§8.9、§8.10）。
     async fn store_for(&self, session: &SessionId) -> Result<Arc<FileToolOutputStore>, StoreError> {
-        self.ledgers
-            .open(session, "agent")
-            .await
-            .map(|entry| Arc::clone(&entry.outputs))
-            .map_err(|error| StoreError::Other(error.to_string()))
+        let mut stores = self.stores.lock().expect("输出存储表");
+        Ok(Arc::clone(stores.entry(session.clone()).or_insert_with(
+            || {
+                Arc::new(FileToolOutputStore::new(
+                    self.ledgers.paths_for(session),
+                    session.clone(),
+                ))
+            },
+        )))
     }
 }
 
@@ -800,6 +818,7 @@ mod tests {
             model: sample_model(),
             workdir: None,
             delegate: None,
+            snapshot: None,
             at: time::macros::datetime!(2026-09-16 08:00:00 UTC),
         }
     }
@@ -851,6 +870,39 @@ mod tests {
         // 新的一层（相当于重启后的进程）：缓存是空的，只能从账本认回来。
         let (_ledgers, routed, _hub) = ledgers(&store).await;
         assert_eq!(routed.session_of_run(&run).await.unwrap(), session);
+    }
+
+    /// 读不得创建或修改内容（§8.9）：`learn` 与工具输出存储这两条被读到的路径，
+    /// 在会话目录**被搬走**之后不能把它建回来——§8.10 判一条 Run 能不能领靠的正是
+    /// "内容在不在"。
+    #[tokio::test]
+    async fn a_read_path_does_not_recreate_a_moved_session_directory() {
+        let store = TempStore::open().await.unwrap();
+        let session = SessionId::from_raw("sess-1");
+        {
+            let (_ledgers, routed, _hub) = ledgers(&store).await;
+            routed.accept_input(input(&session, "k-1")).await.unwrap();
+        }
+        // 新的一层：缓存是空的，相当于重启后的进程——读只能从磁盘来。
+        let (ledgers, routed, _hub) = ledgers(&store).await;
+        let dir = ledgers.paths_for(&session).root().to_path_buf();
+        let moved = store.sessions_root().join("搬走的会话");
+        assert!(dir.exists(), "刚受理过输入的会话目录应该在");
+
+        // `learn`：恢复装配一段之前补记调用与尝试的那条读路径。
+        std::fs::rename(&dir, &moved).expect("把会话目录搬走");
+        routed.learn(&session).await.expect("目录不在就是读不出来");
+        assert!(!dir.exists(), "`learn` 把搬走的会话目录建回来了");
+        std::fs::rename(&moved, &dir).expect("搬回来");
+
+        // `store_for`：工具输出存储的读路径（`open` 从它取）。
+        let outputs = RoutedOutputs::new(Arc::clone(&ledgers), Arc::clone(&routed));
+        std::fs::rename(&dir, &moved).expect("再搬走一次");
+        outputs
+            .store_for(&session)
+            .await
+            .expect("只算路径，不碰磁盘");
+        assert!(!dir.exists(), "`store_for` 把搬走的会话目录建回来了");
     }
 
     #[test]

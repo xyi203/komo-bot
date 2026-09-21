@@ -285,6 +285,16 @@ pub struct RunAccepted {
     /// 依据，而账本里的这一条正好活得过重启（§8.3：内容权威）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegate: Option<crate::types::delegate::DelegateSpec>,
+    /// 受理时冻结的身份与能力（§4.3，[`crate::types::agent::RunSnapshot`]）。
+    ///
+    /// 契约与 `delegate` 同理落在**事件**里：它是这一段执行唯一的身份依据，而账本里的这
+    /// 一条正好活得过重启。`None` = 旧行 / 没有归属的入口——装配时按当前配置的默认 Agent
+    /// 兜底，**不重写旧日志**（§八）。
+    /// 装箱是因为它带着整份 [`crate::types::model::ModelConfig`]：不装的话
+    /// [`EventPayload`] 这个枚举本身就有 700 多字节，而账本里绝大多数事件都用不上它。
+    /// serde 对 `Box` 透明，落盘的 JSONL 一个字节都不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Box<crate::types::agent::RunSnapshot>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

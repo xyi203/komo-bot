@@ -6,7 +6,7 @@ use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::{MemoryState, Provenance};
 
 use crate::harness::*;
-use crate::{seeded, with_memories};
+use crate::{scoped, seeded, with_memories};
 
 /// §14 ①：同一偏好换一种中文表述仍可语义召回，**同时保留原始来源**。
 #[tokio::test]
@@ -288,5 +288,84 @@ async fn a_turn_records_which_memories_reached_it() {
     assert_eq!(
         after.confirmation,
         komo_kernel::types::memory::Confirmation::Unconfirmed
+    );
+}
+
+/// §9.2 的作用域：`AgentProfile::memory_scope` 进**召回**（`RecallQuery::scopes`），
+/// 只召回那一个作用域——外加显式共享的用户资料。
+///
+/// 两个 Agent 用同一个关键词查同一个库：不限作用域的那个三条都看得到，`coder` 只看得到
+/// `project:acme` 与 `personal` 两条——`project:other` 那条**在检索里就被滤掉了**，
+/// 不是拿到结果之后再遮掉。
+#[tokio::test]
+async fn an_agent_only_recalls_its_own_scope_plus_the_shared_profile() {
+    use komo_kernel::types::memory::MemoryScope;
+
+    let llm = komo_kernel::test_support::ScriptedLlm::new(vec![
+        vec![crate::text_round(1, "知道了。")],
+        vec![crate::text_round(1, "知道了。")],
+    ]);
+    let gateway = memory_gateway(&scoped_memory_config())
+        .llm(Arc::new(llm.clone()) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .start()
+        .await;
+    for item in [
+        scoped("m-personal", "客厅空调设 26 度", MemoryScope::Personal),
+        scoped(
+            "m-acme",
+            "acme 的空调遥测在 26 度",
+            MemoryScope::Project {
+                project_id: "acme".into(),
+            },
+        ),
+        scoped(
+            "m-other",
+            "别的项目的空调日志在 26 度",
+            MemoryScope::Project {
+                project_id: "other".into(),
+            },
+        ),
+    ] {
+        gateway.state().memory.put(item, None).await.unwrap();
+    }
+
+    // 没有归属的入口 = 默认 Agent（`assistant`）：它没写 `memory_scope`，不按作用域过滤。
+    let assistant = gateway.state().default_main_session().await.unwrap();
+    let coder = gateway.state().main_session("coder").await.unwrap();
+    assert_ne!(assistant, coder);
+
+    for (session, key) in [(&assistant, "rk-assistant"), (&coder, "rk-coder")] {
+        let (status, body) = gateway
+            .post_json(
+                &format!("/v1/sessions/{session}/runs"),
+                serde_json::json!({ "request_key": key, "text": "空调现在几度来着" }),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let run: komo_kernel::types::ids::RunId =
+            serde_json::from_value(body["run"].clone()).expect("run id");
+        wait_for_terminal(&gateway, &run).await;
+    }
+
+    let seen = llm.requests.lock().expect("请求表").clone();
+    assert_eq!(seen.len(), 2, "两段各请求了一次");
+    let ids = |index: usize| {
+        let mut ids: Vec<String> = seen[index]
+            .memories
+            .iter()
+            .map(|used| used.memory.to_string())
+            .collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(
+        ids(0),
+        vec!["m-acme", "m-other", "m-personal"],
+        "没写作用域的 Agent 不按作用域过滤"
+    );
+    assert_eq!(
+        ids(1),
+        vec!["m-acme", "m-personal"],
+        "写了 `project:acme` 的 Agent 只看得到它自己那一份，外加共享的用户资料"
     );
 }

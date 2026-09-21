@@ -399,6 +399,14 @@ impl Db {
                 )
                 .await
                 .map_err(|error| StoreError::Other(error.to_string()))?;
+                if let Some(backfill) = column.backfill {
+                    // 补完之后**已有的行**是空的，默认值答不出它们该是什么——回填就写在
+                    // 列旁边（`ColumnSpec::backfill`），这条路径与 `ensure_schema` 用同一份。
+                    tracing::info!(table = table.name, column = column.name, "回填新列");
+                    conn.execute(backfill, ())
+                        .await
+                        .map_err(|error| StoreError::Other(error.to_string()))?;
+                }
             }
         }
         for index in models::INDEXES {
@@ -459,6 +467,15 @@ impl Db {
                         .exec(&mut conn)
                         .await
                         .map_err(map_toasty)?;
+                        if let Some(backfill) = column.backfill {
+                            // 与 [`Db::migrate_file`] 同一份材料：列旁边写着回填，两条升级
+                            // 路径就不会有一条漏掉（这条是内存库那条）。
+                            tracing::info!(table = table.name, column = column.name, "回填新列");
+                            toasty::sql::statement(backfill)
+                                .exec(&mut conn)
+                                .await
+                                .map_err(map_toasty)?;
+                        }
                     }
                 }
             }
@@ -695,7 +712,8 @@ pub fn decode<T: serde::de::DeserializeOwned>(raw: &str, what: &str) -> Result<T
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::SessionRow;
+    use crate::models::{SessionKind, SessionRow};
+    use komo_kernel::types::ids::SessionId;
 
     async fn temp() -> (Db, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -770,6 +788,8 @@ mod tests {
                     id,
                     title: String::new(),
                     origin: "test",
+                    agent_id: String::new(),
+                    kind: "normal",
                     workdir: None as Option<String>,
                     current_run: None as Option<String>,
                     jsonl_path: String::new(),
@@ -992,6 +1012,91 @@ mod tests {
                 .is_none(),
             "补完之后按模型读一遍不报错：SELECT 的列清单在这张表上成立"
         );
+    }
+
+    /// 把 `sessions` 退回"还没有 Agent 归属"的旧形状：**先丢掉引用了那两列的索引，再删列**
+    /// ——老库里既没有那条索引，也没有这两列。真机上老库就是这么长出来的。
+    async fn plain_roll_back_agent_columns(path: &Path) {
+        for sql in [
+            r#"DROP INDEX IF EXISTS "sessions_main_per_agent""#,
+            r#"ALTER TABLE "sessions" DROP COLUMN "kind""#,
+            r#"ALTER TABLE "sessions" DROP COLUMN "agent_id""#,
+        ] {
+            plain_exec(path, sql).await;
+        }
+    }
+
+    /// 升级之前就存在的那两行：操作者的全局主会话（`origin = home`）与一个平台会话。
+    async fn plain_insert_legacy_sessions(path: &Path) {
+        plain_exec(
+            path,
+            r#"INSERT INTO "sessions" ("id", "title", "origin", "workdir", "current_run", "jsonl_path", "applied_seq", "applied_bytes", "created_at", "updated_at", "state", "state_changed_at") VALUES ('h', '', 'home', NULL, NULL, 'p', 0, 0, 1, 1, 'active', 1), ('a', '', 'feishu:1', NULL, NULL, 'p', 0, 0, 2, 2, 'active', 2)"#,
+        )
+        .await;
+    }
+
+    /// 老库（没有 `agent_id` / `kind`）打开：两列补得上、能起，而且**已有的行**回填了
+    /// ——`origin = 'home'` 的那条是主会话，其余是普通会话；`agent_id` 留空串
+    /// （`docs/bot.md` §4.2）。
+    ///
+    /// 旧形状照旧在普通连接上造、在另一条新连接上确认（见
+    /// `a_missing_column_is_added_on_reopen`），重开才走 [`Db::migrate_file`]。
+    #[tokio::test]
+    async fn the_agent_columns_are_added_and_backfilled_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        plain_build_old(&path, None).await;
+        plain_roll_back_agent_columns(&path).await;
+        plain_insert_legacy_sessions(&path).await;
+        let before = plain_columns(&path, "sessions").await;
+        assert!(
+            !before
+                .iter()
+                .any(|name| name == "agent_id" || name == "kind"),
+            "旧形状没落盘，后面的断言就没有意义：{before:?}"
+        );
+
+        let db = Db::connect(&path).await.unwrap();
+        let after = plain_columns(&path, "sessions").await;
+        for column in ["agent_id", "kind"] {
+            assert!(
+                after.iter().any(|name| name == column),
+                "{column} 补回来了，而且落盘：{after:?}"
+            );
+        }
+
+        let home = crate::repos::session::get(&db, &SessionId::from_raw("h"))
+            .await
+            .unwrap()
+            .expect("旧行读得回来");
+        assert_eq!(
+            home.kind,
+            SessionKind::Main,
+            "origin = home 的那条按回填规则是主会话"
+        );
+        assert_eq!(home.agent_id, "", "空串 = 还没有归属，迁移不替路由认主");
+        let other = crate::repos::session::get(&db, &SessionId::from_raw("a"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(other.kind, SessionKind::Normal, "非 home 的是普通会话");
+        assert_eq!(other.agent_id, "");
+
+        // 补完之后两列能用：那条老的主会话可以被认领一次（认领 = `set_agent_in`），
+        // 认完就是 `main_session(assistant)`。
+        assert!(
+            crate::repos::session::set_agent(&db, &SessionId::from_raw("h"), "assistant")
+                .await
+                .unwrap(),
+            "升级前的主会话还没有归属，第一次认领要写进去"
+        );
+        let main = crate::repos::session::main_for_agent(&db, "assistant")
+            .await
+            .unwrap()
+            .expect("认领之后它就是这个 Agent 的主会话");
+        assert_eq!(main.row.id, "h");
+        assert!(main.duplicates.is_empty());
     }
 
     /// 时间列是 unix 纳秒，`0` 是"未设置"。

@@ -33,6 +33,7 @@ use crate::types::plan::{
 };
 use crate::types::refs::{AttemptRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput};
 use crate::types::status::{Claimed, RunEnd, WaitReason};
+use crate::types::systemone::{SystemOneError, SystemOneRequest, SystemOneResponse};
 use crate::types::tool::{
     CancelToken, PyError, PythonJob, PythonResult, ToolContext, ToolDefinition, ToolError,
     ToolOutput,
@@ -610,6 +611,17 @@ pub trait EmbeddingClient: Send + Sync {
     fn space(&self) -> &EmbeddingSpace;
 
     async fn embed(&self, kind: InputKind, texts: &[String]) -> Result<Vec<Vector>, EmbedError>;
+}
+
+/// 一个**判断后端**（TypeSafe「System One」）：给一份 `state` 与几问，回几个能直接进
+/// 代码的数（概率、分数、选择）。
+///
+/// 它不是一个模型角色：输出不是文本、不进对话历史、也不产生工具调用。首版的用处只有一处
+/// ——把融合后的记忆短名单重排一遍（§9.4）。有自己的 trait 是为了能**在没有网络、没有凭证**
+/// 的情况下把"重排怎么用这些数"测完。
+#[async_trait]
+pub trait SystemOne: Send + Sync {
+    async fn ask(&self, request: SystemOneRequest) -> Result<SystemOneResponse, SystemOneError>;
 }
 
 // ---------------------------------------------------------------- Python

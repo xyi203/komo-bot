@@ -4,7 +4,7 @@
 //! LlmClient::begin_turn
 //!   → TurnDriver::next            一回合一次 completion
 //!   → Ledger::record_round        完整 assistant 回复 + 该轮全部调用计划，一个逻辑事件
-//!   → ToolExecutor::execute_round 顺序执行本轮全部调用
+//!   → ToolExecutor::execute_round 执行本轮全部调用（只读的可以同时在飞，§6）
 //!   → 按 call_id 回传结果 → 下一轮
 //! ```
 //!

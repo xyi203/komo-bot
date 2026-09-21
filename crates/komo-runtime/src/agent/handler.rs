@@ -257,7 +257,7 @@ impl AgentRunHandler {
 
         let segment = self
             .source
-            .segment(claimed, self.executor.definitions())
+            .segment(claimed, self.executor.catalog())
             .await?;
 
         // 续租要能**取消这一段**：取消令牌在段里（`CallEnv`），先克隆一份（同一个

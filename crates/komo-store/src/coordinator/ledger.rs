@@ -167,6 +167,11 @@ impl Ledger for Coordinator {
                     // 契约落在**事件**里（§8.4）：重启之后它是子代理唯一的"结果要长什么样"
                     // 的依据，而父侧复验用的就是同一份。
                     delegate: input.delegate.clone(),
+                    // 受理时冻结的身份与能力（§4.3）也落在**事件**里：审批可能一小时之后
+                    // 才答复，恢复时按它装配，当前配置改了也换不掉这一条 Run 的面孔。
+                    // 受理方算好交下来（`AcceptInput::snapshot`）；这里是如实记录，
+                    // 不做解释、不补默认值。
+                    snapshot: input.snapshot.clone(),
                 }),
             )
             .await?;
@@ -1023,6 +1028,7 @@ mod tests {
             workdir: None,
             at: time::macros::datetime!(2026-09-15 08:00:00 UTC),
             delegate: None,
+            snapshot: None,
         }
     }
 

@@ -25,10 +25,78 @@ pub enum UnitError {
     /// 这台机器上没有服务管理器（容器、或者没跑 systemd 的 Linux）。
     #[error("这台机器上没有可用的服务管理器：请前台运行 `komo gateway --foreground`")]
     NoManager,
+    /// 这个数据目录不是默认那一个，而单元名是全局的。
+    #[error(
+        "{home} 不是默认数据目录（{default}），而单元名是全局的：拿它去装服务，改写的正是现役那一份。\
+         要手动跑就前台来：`KOMO_HOME={home} komo gateway --foreground`"
+    )]
+    NotTheDefaultHome { home: PathBuf, default: PathBuf },
     #[error("写单元文件 {path} 失败：{message}")]
     Write { path: PathBuf, message: String },
     #[error("{command} 失败：{message}")]
     Command { command: String, message: String },
+}
+
+/// 默认数据目录：`~/.komo`（§3）。**只有它拥有那个全局单元名。**
+pub fn default_home(home_dir: &Path) -> PathBuf {
+    home_dir.join(".komo")
+}
+
+/// 两个路径是不是同一个数据目录：字面相同，或者解析到同一处（软链接、结尾多一个 `/`）。
+pub fn same_home(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(given), Ok(other)) => given == other,
+        _ => false,
+    }
+}
+
+/// 这个数据目录是不是默认那一个。
+///
+/// 单元名是**全局**的（`komo-gateway.service` / `dev.komo.gateway`）：让一个非默认的
+/// `KOMO_HOME` 去写它，不是"多装一个服务"，而是**把现役服务改写成指向自己**。
+/// 2026-09-21 实测过一次——`KOMO_HOME=/tmp/komo-cfg-upgrade komo config check` 走
+/// `connect_or_start` → `units::start`，把现役单元换成了 debug 构建 + 沙箱数据目录，
+/// 现役服务随即下线。所以非默认 home 一律不碰服务管理器。
+pub fn owns_unit(home_dir: &Path, komo_home: &Path) -> bool {
+    same_home(komo_home, &default_home(home_dir))
+}
+
+/// 单元文件里那个 `KOMO_HOME`：**这个单元实际在服务哪个数据目录**。
+///
+/// `status` 要说得出这一句——"我现在连的是谁"与"现役服务在服务谁"是两件事，而单元名
+/// 是全局的（见 [`owns_unit`]），两者不一致时正是出事时的样子。
+pub fn installed_home(home_dir: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(unit_path(home_dir)).ok()?;
+    // systemd：`Environment=KOMO_HOME=<path>`；launchd：`<key>KOMO_HOME</key><string><path></string>`。
+    if let Some(rest) = text
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("Environment="))
+        .and_then(|vars| {
+            vars.split_whitespace()
+                .find_map(|var| var.strip_prefix("KOMO_HOME="))
+        })
+    {
+        return Some(PathBuf::from(rest.trim()));
+    }
+    let marker = "<key>KOMO_HOME</key><string>";
+    let start = text.find(marker)? + marker.len();
+    let rest = &text[start..];
+    let end = rest.find("</string>")?;
+    Some(PathBuf::from(rest[..end].trim()))
+}
+
+/// 非默认数据目录一律不碰服务管理器（见 [`owns_unit`]）。调用方在"要改要停"之前先问一次。
+pub fn ensure_owns(home_dir: &Path, komo_home: &Path) -> Result<(), UnitError> {
+    if owns_unit(home_dir, komo_home) {
+        return Ok(());
+    }
+    Err(UnitError::NotTheDefaultHome {
+        home: komo_home.to_path_buf(),
+        default: default_home(home_dir),
+    })
 }
 
 /// 这台机器用哪一种。
@@ -127,7 +195,11 @@ WantedBy=default.target
 }
 
 /// 把单元文件写到用户目录。
+///
+/// **只有默认数据目录能走到这里**（[`owns_unit`]）：非默认的 `KOMO_HOME` 去写这个全局
+/// 单元名，等于把现役服务改写成指向自己。
 pub fn install(home_dir: &Path, komo_home: &Path) -> Result<PathBuf, UnitError> {
+    ensure_owns(home_dir, komo_home)?;
     let manager = manager();
     if manager == Manager::None {
         return Err(UnitError::NoManager);
@@ -172,8 +244,9 @@ pub fn start(home_dir: &Path, komo_home: &Path) -> Result<(), UnitError> {
     }
 }
 
-/// 停。**不隐式启动服务。**
-pub fn stop() -> Result<(), UnitError> {
+/// 停。**不隐式启动服务。** 同样只有默认数据目录能停（停的是那个全局单元）。
+pub fn stop(home_dir: &Path, komo_home: &Path) -> Result<(), UnitError> {
+    ensure_owns(home_dir, komo_home)?;
     match manager() {
         Manager::Launchd => run("launchctl", &["bootout", &format!("gui/{}/{LABEL}", uid())]),
         Manager::Systemd => run("systemctl", &["--user", "stop", UNIT]),
@@ -183,7 +256,7 @@ pub fn stop() -> Result<(), UnitError> {
 
 /// 重启。
 pub fn restart(home_dir: &Path, komo_home: &Path) -> Result<(), UnitError> {
-    let _ = stop();
+    let _ = stop(home_dir, komo_home);
     // launchd 的 bootout 是异步的：服务还在卸的那几百毫秒里 bootstrap 会失败（被
     // `start` 吞掉），随后 kickstart 就找不到服务。等它真的消失再起。
     for _ in 0..25 {
@@ -312,5 +385,79 @@ mod tests {
         );
         assert!(text.contains("<string>--foreground</string>"), "{text}");
         assert!(text.contains(LABEL), "{text}");
+    }
+
+    /// 单元名是全局的：**只有默认数据目录**拥有它（2026-09-21 那次事故的回归靶子）。
+    #[test]
+    fn only_the_default_home_owns_the_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let default = default_home(home);
+        std::fs::create_dir_all(&default).unwrap();
+
+        assert!(owns_unit(home, &default), "默认数据目录");
+        // 软链接指到同一处也算——`KOMO_HOME` 怎么写是操作者的事。
+        std::os::unix::fs::symlink(&default, home.join("komo-link")).unwrap();
+        assert!(
+            owns_unit(home, &home.join("komo-link")),
+            "解析到同一处就该算同一个数据目录"
+        );
+        assert!(!owns_unit(home, &home.join("komo-cfg-upgrade")), "非默认");
+        assert!(
+            !owns_unit(home, Path::new("/tmp/komo-cfg-upgrade")),
+            "非默认"
+        );
+    }
+
+    /// 非默认数据目录**一个字节都不许动**那个单元文件——事故那天它是被改写了，
+    /// 然后现役服务被换成了一份 debug 构建 + 沙箱数据目录。
+    #[test]
+    fn a_non_default_home_never_rewrites_the_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let unit = unit_path(home);
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        let sentinel = "哨兵：现役那一份单元的内容\n";
+        std::fs::write(&unit, sentinel).unwrap();
+
+        let other = home.join("komo-cfg-upgrade");
+        std::fs::create_dir_all(&other).unwrap();
+        let error = install(home, &other).unwrap_err();
+        assert!(
+            matches!(error, UnitError::NotTheDefaultHome { .. }),
+            "{error}"
+        );
+        assert!(start(home, &other).is_err());
+        // 停也一并拦下：停的同样是那个全局单元，不是"这个数据目录的服务"。
+        assert!(stop(home, &other).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&unit).unwrap(),
+            sentinel,
+            "非默认数据目录改写了现役单元"
+        );
+    }
+
+    /// `status` 要说得出这个单元在服务哪个数据目录（两种服务管理器都读得出来）。
+    #[test]
+    fn the_unit_says_which_data_directory_it_serves() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let served = home.join(".komo");
+        let unit = unit_path(home);
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+
+        for manager in [Manager::Systemd, Manager::Launchd] {
+            std::fs::write(
+                &unit,
+                unit_text(manager, Path::new("/usr/local/bin/komo"), &served, &served),
+            )
+            .unwrap();
+            assert_eq!(
+                installed_home(home).as_deref(),
+                Some(served.as_path()),
+                "{manager:?}"
+            );
+        }
+        assert_eq!(installed_home(&home.join("nope")), None, "没有单元文件");
     }
 }

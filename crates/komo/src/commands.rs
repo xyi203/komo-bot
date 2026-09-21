@@ -10,7 +10,7 @@ use komo_client::api::RequestKeys;
 use komo_client::render;
 use komo_gateway::channels;
 use komo_gateway::config::{LoadOptions, load_config};
-use komo_gateway::skills::{OfferContext, SkillRegistry};
+use komo_gateway::skills::{OfferContext, SkillRegistry, one_line};
 use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
     CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionBatchAnswerRequest,
@@ -671,7 +671,7 @@ pub fn skills(home: &Path, action: SkillsAction<'_>) -> Outcome {
                     } else {
                         "（不进提示：平台或工具不满足）"
                     };
-                    format!("{}{}  {}", skill.name, mark, skill.description)
+                    format!("{}{}  {}", skill.name, mark, one_line(&skill.description))
                 })
                 .collect::<Vec<_>>()
                 .join("\n"))

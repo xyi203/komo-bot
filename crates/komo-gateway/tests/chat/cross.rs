@@ -761,13 +761,21 @@ async fn a_message_behind_a_waiting_approval_waits_instead_of_overtaking() {
 
     // §8.3：后一条 Run 的窗口里要看得见前一条说了什么、最后答了什么——用户那句"接着上面
     // 说"指的就是它，少了这两句，模型只能靠猜（真实会话里它去读了 `config.toml`）。
+    //
+    // 找的是**带 `y` 的那一份转写**，不是"最后一份"：后台的记忆整理走的是同一个模型，
+    // 最后一份是个会漂的位置。
     let turns: Vec<&str> = requests
-        .last()
-        .expect("脚本模型收到了请求")
-        .messages
         .iter()
-        .filter_map(|message| message.text.as_deref())
-        .collect();
+        .filter_map(|request| {
+            let texts: Vec<&str> = request
+                .messages
+                .iter()
+                .filter_map(|message| message.text.as_deref())
+                .collect();
+            texts.contains(&"y").then_some(texts)
+        })
+        .next_back()
+        .expect("第二条 Run 的这一轮到过模型");
     assert!(
         turns.contains(&"跑一下 echo"),
         "上一轮的用户输入：{turns:?}"

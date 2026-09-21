@@ -170,7 +170,7 @@ impl Tool for PythonTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
-        let args: PythonArgs = parse_args(args, "python")?;
+        let args: PythonArgs = parse_args(infer_mode(args), "python")?;
         // 上下文固定了环境版本就用它（一次 Run 里前后两个调用必须绑同一个环境）；
         // 没固定就问宿主。
         let env_version = ctx
@@ -324,15 +324,29 @@ impl Tool for PythonTool {
             Err(PyError::Failed(message)) => return Err(ToolError::Failed { message }),
         };
 
+        // 交给模型的那段预览（§8.3 的投影正文——抬头只有 stdout / stderr 的字节数）。
+        //
+        // 顺序有讲究：**只 print、不返回结构化结果**是最常见的一种跑法，而原先这里
+        // `to_string(&Value::Null)` 得到的是字面量 `null`——模型看到它以为工具坏了，改用
+        // `shell` + `python3` 把同一件事重跑一遍（真实会话里就这么白花了两轮）。所以没有
+        // 结构化结果时给 stdout 的尾巴，再不济也要说清"没有输出"，绝不把 `null` 当正文。
+        let preview = match (&outcome.error, outcome.result.is_null()) {
+            (Some(error), _) => format!("{:?}：{error}", outcome.status),
+            (None, false) => serde_json::to_string(&outcome.result).unwrap_or_default(),
+            (None, true) => {
+                let tail = outcome.stdout_tail.trim();
+                if tail.is_empty() {
+                    "没有返回值，也没有输出".to_string()
+                } else {
+                    format!("没有返回值；这是 stdout 的尾部：\n{tail}")
+                }
+            }
+        };
         let result = PythonToolResult {
             status: outcome.status,
             result: outcome.result,
             error: outcome.error,
             env_version: outcome.env_version,
-        };
-        let preview = match &result.error {
-            Some(error) => format!("{:?}：{error}", result.status),
-            None => serde_json::to_string(&result.result).unwrap_or_default(),
         };
         Ok(ToolOutput {
             status: result.status,
@@ -469,6 +483,33 @@ fn refusal_of(error: ToolboxError) -> ToolError {
             message: other.to_string(),
         },
     }
+}
+
+/// 模型少写了 `mode` 时按参数形状补上（§5.1）。
+///
+/// 两种形式的参数天然分得开：有 `code` 是任意代码，有 `module` / `function` 是已保存模块的
+/// 调用。**这不放松授权**——计划绑的仍是 `Operation` 与代码 / 模块版本（§5.2、§7.2），少写
+/// 一个判别字段不该换来一次失败往返（真实会话里模型就这么白跑了一轮，报错是
+/// `missing field mode`）。两个都写了或者都没写就让它照常报错——那种形状是模型自己没说清，
+/// 别替它猜。
+fn infer_mode(args: serde_json::Value) -> serde_json::Value {
+    let Some(object) = args.as_object() else {
+        return args;
+    };
+    if object.contains_key("mode") {
+        return args;
+    }
+    let mode = match (
+        object.contains_key("code"),
+        object.contains_key("module") || object.contains_key("function"),
+    ) {
+        (true, false) => "code",
+        (false, true) => "call",
+        _ => return args,
+    };
+    let mut object = object.clone();
+    object.insert("mode".into(), serde_json::Value::String(mode.into()));
+    serde_json::Value::Object(object)
 }
 
 /// 原调用的关键字参数。
@@ -774,6 +815,7 @@ def turn_off(entity_id):
             result: serde_json::json!(2),
             error: None,
             artifacts: vec![],
+            stdout_tail: String::new(),
             env_version: host.env_version(),
         });
         let plan = tool
@@ -903,6 +945,7 @@ def turn_off(entity_id):
             result: serde_json::json!({ "off": "light.living_room" }),
             error: None,
             artifacts: vec![],
+            stdout_tail: String::new(),
             env_version: host.env_version(),
         });
         let output = tool
@@ -1040,6 +1083,7 @@ def turn_off(entity_id):
                 result: answer,
                 error: None,
                 artifacts: vec![],
+                stdout_tail: String::new(),
                 env_version: host.env_version(),
             });
             assert_eq!(tool.verify(&plan, &ctx).await.unwrap(), want);
@@ -1074,6 +1118,7 @@ def turn_off(entity_id):
             result: serde_json::json!({ "idempotent": true }),
             error: None,
             artifacts: vec![],
+            stdout_tail: String::new(),
             env_version: host.env_version(),
         });
         assert!(
@@ -1137,5 +1182,126 @@ def turn_off(entity_id):
             Verification::Unavailable
         );
         assert!(host.calls().is_empty());
+    }
+
+    /// 少写 `mode` 就按参数形状补上：判别字段写漏一次，不该换来一次失败往返。
+    #[tokio::test]
+    async fn a_code_call_without_a_mode_is_still_planned_as_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let (host, tool) = wire();
+        let plan = tool
+            .prepare(serde_json::json!({ "code": "result = 1 + 1" }), &ctx)
+            .await
+            .unwrap();
+        assert!(
+            matches!(plan.operation, Operation::PythonCode),
+            "{:?}",
+            plan.operation
+        );
+        assert_eq!(plan.args["mode"], "code", "计划里补上，哈希之后才稳定");
+        assert!(host.calls().is_empty(), "prepare 一行都不执行");
+    }
+
+    #[tokio::test]
+    async fn a_module_call_without_a_mode_is_still_planned_as_a_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let (_host, _toolbox, tool) = wired(dir.path(), HA);
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "module": "toolbox.ha", "function": "turn_off", "args": {} }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(plan.operation, Operation::PythonCall { .. }),
+            "{:?}",
+            plan.operation
+        );
+        assert_eq!(plan.args["mode"], "call");
+    }
+
+    /// 两个都写或都没写：那是模型自己没说清，照常报错（**不替它猜**）。
+    #[tokio::test]
+    async fn an_ambiguous_argument_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let (_host, tool) = wire();
+        let error = tool
+            .prepare(
+                serde_json::json!({ "code": "x = 1", "module": "toolbox.ha" }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::InvalidArguments { .. }),
+            "{error:?}"
+        );
+    }
+
+    /// 只 print 的脚本：预览给 stdout 的尾巴，**不是字面量 `null`**。
+    ///
+    /// 真实会话里模型看到 `null` 以为工具坏了，改用 `shell` + `python3` 把同一件事重跑了一遍。
+    #[tokio::test]
+    async fn a_script_that_only_prints_shows_its_stdout_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let (host, tool) = wire();
+        host.push_stdout("{\"rows\": [[241653]]}\n");
+        host.push_result(PythonResult {
+            status: ToolResultStatus::Completed,
+            result: serde_json::Value::Null,
+            error: None,
+            artifacts: vec![],
+            stdout_tail: String::new(),
+            env_version: host.env_version(),
+        });
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "mode": "code", "code": "print(1)" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let output = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap();
+
+        let preview = output.preview.expect("有预览");
+        assert!(preview.contains("[[241653]]"), "{preview}");
+        assert!(!preview.contains("null"), "不要拿 `null` 当正文：{preview}");
+    }
+
+    /// 既没返回值也没输出：明说，别让模型猜。
+    #[tokio::test]
+    async fn a_script_with_neither_a_result_nor_output_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let (host, tool) = wire();
+        host.push_result(PythonResult {
+            status: ToolResultStatus::Completed,
+            result: serde_json::Value::Null,
+            error: None,
+            artifacts: vec![],
+            stdout_tail: String::new(),
+            env_version: host.env_version(),
+        });
+        let plan = tool
+            .prepare(serde_json::json!({ "mode": "code", "code": "x = 1" }), &ctx)
+            .await
+            .unwrap();
+        let output = tool
+            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .await
+            .unwrap();
+        assert_eq!(
+            output.preview.as_deref(),
+            Some("没有返回值，也没有输出"),
+            "空就是空，说清楚"
+        );
     }
 }

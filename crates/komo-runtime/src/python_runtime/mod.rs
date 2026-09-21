@@ -279,6 +279,8 @@ impl PythonHost for PythonRuntime {
             result: reported.result,
             error: reported.error,
             artifacts: vec![],
+            // 预览要用（`python` 工具的 `preview`）：脚本只 print 时，模型至少看得到尾巴。
+            stdout_tail: outcome.stdout_tail,
             env_version: self.env_version.clone(),
         })
     }

@@ -85,20 +85,29 @@ impl PythonHost for FakePythonHost {
             let env_version = state.env_version.clone();
             (response, stdout, env_version)
         };
+        let written = stdout.clone();
         if let Some(text) = stdout {
             sink.write_stdout(text.as_bytes())
                 .await
                 .map_err(|e| PyError::Protocol(e.to_string()))?;
         }
-        response.unwrap_or_else(|| {
-            Ok(PythonResult {
+        let mut result = match response {
+            Some(response) => response?,
+            None => PythonResult {
                 status: ToolResultStatus::Completed,
                 result: serde_json::Value::Null,
                 error: None,
                 artifacts: vec![],
+                stdout_tail: String::new(),
                 env_version: EnvVersion(env_version),
-            })
-        })
+            },
+        };
+        // 与真宿主**同一个事实**：写进 sink 的那段就是 stdout 的尾巴。替身自己编一份，
+        // 测出来的预览就跟真机上不是一回事。
+        if result.stdout_tail.is_empty() {
+            result.stdout_tail = written.unwrap_or_default();
+        }
+        Ok(result)
     }
 
     fn env_version(&self) -> EnvVersion {

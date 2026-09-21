@@ -21,9 +21,58 @@ pub use frontmatter::FrontMatter;
 
 /// 系统提示里那份目录的总量上限。
 ///
-// TODO(decide: §5.6 只说"总量有上限"，没有给数。2000 字符大约是几十条"名字 + 一句描述"，
-// 在一个每轮都要发的前缀里是可以接受的量级；真要定，应当按实测的前缀大小改这里。
-pub const DEFAULT_CATALOG_CHARS: usize = 2_000;
+/// **实测值（2026-09-21，本机）**：166 个 skill 只列名字是 2752 字符；带描述要 55 KB（描述
+/// 平均 261 字符）。4000 字符能装下 ~235 条名字，留了余量——原值 2000 只够 16 条"名字 +
+/// 描述"，166 个 skill 里的后 150 个**根本没进提示**，而模型不知道有它们就不会去读。
+pub const DEFAULT_CATALOG_CHARS: usize = 4_000;
+
+/// 目录行的一种形状：**整批**装得下描述就用 [`Shape::Full`]，否则只留名字。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Full,
+    NamesOnly,
+}
+
+/// 一次目录渲染：谁在里面、用哪种形状、因为装不下少了几个。
+struct Catalog {
+    skills: Vec<Skill>,
+    shape: Shape,
+    dropped: usize,
+}
+
+impl Catalog {
+    fn line(&self, skill: &Skill) -> String {
+        match self.shape {
+            Shape::Full => skill.catalog_line(),
+            Shape::NamesOnly => format!("- {}", skill.name),
+        }
+    }
+
+    /// 目录正文。装不下时说清少了几个——**"没有它"和"没列出来"是两件事**，模型不该因为
+    /// 一条没列出来就断定它不存在。
+    fn text(&self) -> String {
+        let mut lines: Vec<String> = self.skills.iter().map(|skill| self.line(skill)).collect();
+        if self.dropped > 0 {
+            lines.push(note_text(self.dropped));
+        }
+        lines.join("\n")
+    }
+}
+
+/// 一行占多少（末尾那个换行也算：每一行都要占位）。
+fn cost(line: &str) -> usize {
+    line.chars().count() + 1
+}
+
+/// 装不下时末尾那句。
+fn note_text(dropped: usize) -> String {
+    format!("（另有 {dropped} 条没列出来：目录行到上限了）")
+}
+
+/// 一段描述压成一行：折掉的换行会把一条目录行撕成两条。
+pub fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
 /// 一份 `SKILL.md` 的元信息。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +113,7 @@ impl Skill {
 
     /// 目录行：名字 + 一句描述。
     pub fn catalog_line(&self) -> String {
-        format!("- {}：{}", self.name, self.description)
+        format!("- {}：{}", self.name, one_line(&self.description))
     }
 }
 
@@ -218,39 +267,68 @@ impl SkillRegistry {
         })
     }
 
-    /// 系统提示里的那份目录：过掉被盖住的、被 `disable` 的、门控不过的，再按总量截断。
+    /// 系统提示里的那份目录：过掉被盖住的、被 `disable` 的、门控不过的，再按总量定形状。
     pub fn catalog(&self, context: &OfferContext) -> Vec<Skill> {
-        let disabled = self.disabled();
-        let mut lines = Vec::new();
-        let mut used = 0usize;
-        for skill in self.list() {
-            if skill.shadowed_by.is_some() || disabled.contains(&skill.name) {
-                continue;
-            }
-            if !skill.offered(context) {
-                continue;
-            }
-            let cost = skill.catalog_line().chars().count() + 1;
-            if used + cost > context.max_chars {
-                tracing::debug!(
-                    skill = %skill.name,
-                    "目录行已到总量上限，这一条不进系统提示"
-                );
-                continue;
-            }
-            used += cost;
-            lines.push(skill);
+        self.catalog_of(context).skills
+    }
+
+    /// 候选与形状。
+    ///
+    /// **列全比列得详细更要紧**：一条 skill 不在目录里，模型就不知道它存在（真实会话里它为
+    /// 了找 `log-diagnosis` 去 `ls` 了整个目录，然后一路找下去）。所以"名字 + 一句描述"整批
+    /// 装得下就用它，装不下就退成**只有名字**，而不是按顺序砍掉后面那些人。
+    fn catalog_of(&self, context: &OfferContext) -> Catalog {
+        let candidates = self.candidates(context);
+        let full: usize = candidates
+            .iter()
+            .map(|skill| cost(&skill.catalog_line()))
+            .sum();
+        if full <= context.max_chars {
+            return Catalog {
+                skills: candidates,
+                shape: Shape::Full,
+                dropped: 0,
+            };
         }
-        lines
+
+        let total = candidates.len();
+        let mut skills = Vec::new();
+        let mut used = 0usize;
+        for (index, skill) in candidates.iter().enumerate() {
+            // 末尾那句"另有 N 条没列出来"也要在预算里——它是**要说的那句话**，不是装饰。
+            let rest = total - index - 1;
+            let note = if rest == 0 { 0 } else { cost(&note_text(rest)) };
+            let line = cost(&format!("- {}", skill.name));
+            if used + line + note > context.max_chars {
+                break;
+            }
+            used += line;
+            skills.push(skill.clone());
+        }
+        let dropped = total - skills.len();
+        if dropped > 0 {
+            tracing::debug!(dropped, "名字都装不下：目录行到此为止");
+        }
+        Catalog {
+            skills,
+            shape: Shape::NamesOnly,
+            dropped,
+        }
+    }
+
+    /// 能进目录的候选（顺序 = 搜索顺序）：过掉被盖住的、被 `disable` 的、门控不过的。
+    fn candidates(&self, context: &OfferContext) -> Vec<Skill> {
+        let disabled = self.disabled();
+        self.list()
+            .into_iter()
+            .filter(|skill| skill.shadowed_by.is_none() && !disabled.contains(&skill.name))
+            .filter(|skill| skill.offered(context))
+            .collect()
     }
 
     /// 渲染好的目录正文。
     pub fn catalog_text(&self, context: &OfferContext) -> String {
-        self.catalog(context)
-            .iter()
-            .map(Skill::catalog_line)
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.catalog_of(context).text()
     }
 
     /// 系统提示里要拼的那一块（§5.6）：先给**按序的根**，再给目录行。
@@ -262,14 +340,19 @@ impl SkillRegistry {
     /// 一条能露面的都没有时回答 `None`：那种情况下系统提示**一个字都不多**，不因为
     /// "配置里有 skills 概念"就凭空多出一段空标题。
     pub fn prompt_block(&self, context: &OfferContext) -> Option<String> {
-        let lines = self.catalog(context);
-        if lines.is_empty() {
+        let catalog = self.catalog_of(context);
+        if catalog.skills.is_empty() {
             return None;
         }
         let roots: Vec<String> = self
             .dirs
             .iter()
-            .filter(|dir| lines.iter().any(|skill| skill.path.starts_with(dir)))
+            .filter(|dir| {
+                catalog
+                    .skills
+                    .iter()
+                    .any(|skill| skill.path.starts_with(dir))
+            })
             .map(|dir| dir.display().to_string())
             .collect();
         let mut block = String::from(
@@ -279,13 +362,7 @@ impl SkillRegistry {
         block.push_str("根：");
         block.push_str(&roots.join("、"));
         block.push('\n');
-        block.push_str(
-            &lines
-                .iter()
-                .map(Skill::catalog_line)
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
+        block.push_str(&catalog.text());
         Some(block)
     }
 

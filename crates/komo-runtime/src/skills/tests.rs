@@ -177,7 +177,67 @@ fn the_catalog_stops_at_its_total_budget() {
     let tight = context().with_max_chars(60);
     let catalog = registry.catalog(&tight);
     assert!(catalog.len() < 10, "上限是上限：{}", catalog.len());
-    assert!(registry.catalog_text(&tight).chars().count() <= 60);
+    let text = registry.catalog_text(&tight);
+    assert!(text.chars().count() <= 60, "{text}");
+    // "没有它"和"没列出来"是两件事：装不下就要说清少了几个。
+    let dropped = 10 - catalog.len();
+    assert!(
+        text.contains(&format!("另有 {dropped} 条没列出来")),
+        "{text}"
+    );
+}
+
+/// 描述整批装不下时**退成只有名字**：列全比列得详细更要紧。
+///
+/// 166 个 skill 的那次实测里，2000 字符的预算只留下了字母表前 16 条"名字 + 描述"，模型
+/// 为了找 `log-diagnosis` 去 `ls` 了整个目录、多花了好几轮（那条 skill 根本没进提示）。
+#[test]
+fn every_skill_keeps_its_name_when_the_descriptions_do_not_fit() {
+    let dir = tempfile::tempdir().unwrap();
+    let long = "一".repeat(200);
+    for n in 0..60 {
+        write_skill(
+            dir.path(),
+            &format!("skill-{n:02}"),
+            &format!("name: skill-{n:02}\ndescription: {long}\n"),
+            "",
+        );
+    }
+    let registry = SkillRegistry::new(vec![dir.path().to_path_buf()]);
+    let budget = context().with_max_chars(4_000);
+    let text = registry.catalog_text(&budget);
+
+    assert!(
+        text.chars().count() <= 4_000,
+        "上限是上限：{}",
+        text.chars().count()
+    );
+    assert!(!text.contains('：'), "装不下描述就一条都不留：{text}");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 60, "一条不多、一条不少");
+    for n in 0..60 {
+        assert!(
+            lines.contains(&format!("- skill-{n:02}").as_str()),
+            "第 {n} 条也得在：{text}"
+        );
+    }
+}
+
+/// 折行描述进了目录行，而且**只占一行**（折掉的换行会把一条目录行撕成两条）。
+#[test]
+fn a_folded_description_becomes_one_catalog_line() {
+    let dir = tempfile::tempdir().unwrap();
+    write_skill(
+        dir.path(),
+        "pr-review",
+        "name: pr-review\ndescription: >\n  怎么审一个 PR：\n  先看它改了什么。\n",
+        "",
+    );
+    let registry = SkillRegistry::new(vec![dir.path().to_path_buf()]);
+    assert_eq!(
+        registry.catalog_text(&context()),
+        "- pr-review：怎么审一个 PR： 先看它改了什么。"
+    );
 }
 
 #[test]

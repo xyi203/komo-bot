@@ -179,21 +179,25 @@ fn status_line(app: &App) -> Paragraph<'static> {
 
     match app.run_state() {
         Some(state) => {
-            // 还在跑的那一格是动的：一块静止的"运行中"分不出还在跑还是卡住了。状态词
-            // 留着——转圈说得出"它还活着"，说不出"它在排队还是在等审批"。
+            // 还在跑的那一格是动的：一块静止的文字分不出还在跑还是卡住了。
             if !state.is_terminal() {
                 parts.push(Span::styled(
                     format!(" {}", crate::tui::spinner::frame(app.now)),
                     Style::default().fg(run_colour(state)),
                 ));
             }
-            parts.push(Span::styled(
-                format!(" {} ", status_text(state)),
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(run_colour(state))
-                    .add_modifier(Modifier::BOLD),
-            ));
+            // **一切正常的两个状态不写出来**：跑着有转圈，跑完了屏幕上就是那段回答——
+            // "运行中" / "已完成" 都是让人读一件他正看着的事。剩下的几个留着，它们说的
+            // 是转圈与回答都说不出的事：在排队、在等人、失败了、被取消了。
+            if !matches!(state, RunState::Running | RunState::Completed) {
+                parts.push(Span::styled(
+                    format!(" {} ", status_text(state)),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(run_colour(state))
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             // §8.4：状态只说"能不能跑"，理由说"在等谁、等到什么时候"。**排队二十分钟
             // 不知道为什么**就是少了这一格；窄终端下行会被截，但截掉的是一句话的后半段，
             // 不是全部。
@@ -736,7 +740,6 @@ fn main() {
         assert_eq!(rows.len(), 24);
         assert_within(&rows, 80);
         let screen = rows.join("\n");
-        assert!(screen.contains("已完成"), "{screen}");
         assert!(screen.contains("chat-a"), "{screen}");
         assert!(screen.contains("high"), "{screen}");
         assert!(screen.contains("已连接"), "{screen}");
@@ -806,6 +809,32 @@ fn main() {
             crate::tui::spinner::FRAME_MS as i64 * crate::tui::spinner::FRAMES.len() as i64,
         );
         assert_eq!(first, full);
+    }
+
+    /// **一切正常的时候状态行不说话。**
+    ///
+    /// 跑着有转圈，跑完了屏幕上就是那段回答——"运行中" / "已完成" 都是让人读一件他正看
+    /// 着的事。真有事的那几个状态照旧说出来。
+    #[test]
+    fn the_status_line_keeps_quiet_while_nothing_is_wrong() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &fixture::conversation()[..3]);
+        app.apply(ServerEvent::Tick(fixture::T0));
+        let running = screen(&app, 100, 20);
+        assert!(!running.contains("运行中"), "{running}");
+        assert!(
+            crate::tui::spinner::FRAMES
+                .iter()
+                .any(|frame| running.contains(frame)),
+            "那一格得在转：{running}"
+        );
+
+        feed(&mut app, &fixture::conversation()[3..]);
+        let done = screen(&app, 100, 20);
+        assert!(!done.contains("已完成"), "{done}");
+        for frame in crate::tui::spinner::FRAMES {
+            assert!(!done.contains(frame), "跑完了就不转了：{done}");
+        }
     }
 
     /// 落进回滚区的那一行**定住**：它是终端的了，不能带着某一帧随机的样子留在那里。

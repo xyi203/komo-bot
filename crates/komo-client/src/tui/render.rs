@@ -1,248 +1,181 @@
-//! TUI 绘制与 Markdown 渲染（§13.4）。
+//! 视口绘制（§13.4）。
 //!
-//! **渲染层薄**：这里没有一个 `if` 决定业务的事。它读 [`App`] 的状态，摆四块地方——
-//! 身份行、消息面、状态行、输入框——需要时在上面盖一个审批弹窗。
+//! **这里画的不是一屏，是终端底下那一小块。** 会话正文交给终端自己的回滚区（见
+//! [`crate::tui::transcript`]），所以滚轮、选中复制、退出之后留在屏幕上的那段记录，都
+//! 是终端原本就会做的事，不是这里重新实现一遍的东西。
 //!
-//! 布局：
+//! 视口从上到下：
 //!
 //! ```text
-//! ┌ 身份行（会话 / 模式 / 工作目录）
-//! │ 消息面（用户 / 助手 Markdown / 工具调用 / 提示）
-//! ├ 状态行（Run 状态 · 本轮耗时 · 模型 · effort · 连接状态 · 待审批数）
+//! │ 还在动的那一小段（草稿 / 在跑的工具 / 刚按下 Enter 的那条）  ← 高度有上限，只画尾巴
+//! ├ 状态行（Run 状态 · 本轮耗时 · 模型 · effort · 连接 · 待处理 · 模式）
 //! │ 命令面板（只在输入以 `/` 开头时出现）
-//! └ 输入框
+//! ╰ 输入框（会折行，光标摆在它真正在的那一格上）
 //! ```
+//!
+//! 审批弹窗来的时候它**占满视口**：输入框本来就该禁用（§11.3 先把眼前这件事答了），
+//! 留一个画得出来却按不动的框只会骗人。
+//!
+//! [`viewport_height`] 与 [`draw`] 必须算出同一个高度——驱动照前者开视口、照后者画，
+//! 两边差一行，输入框就会被切掉一条边。所以两边共用底下那几个 `*_height`。
 
-use komo_kernel::fold::SurfaceMessage;
-use komo_kernel::types::status::{RunState, ToolCallState};
-use komo_kernel::types::turn::Role;
+use komo_kernel::types::status::RunState;
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 
-use crate::tui::app::{App, SubmissionState, status_text};
+use crate::tui::app::{App, status_text};
 use crate::tui::approval::{ApprovalRow, approval_lines};
-use crate::tui::markdown;
+pub(crate) use crate::tui::markdown;
 
-/// 画一帧。
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+/// 还在动的那一段最多占几行。
+///
+/// 它有上限是因为**视口高度一变，底下那块就要重开一次**：不封顶的话，模型每吐出一行
+/// 都是一次重开。封了顶之后，一轮对话里最多长这么多次，长到头就不动了。
+pub const LIVE_MAX: u16 = 8;
+/// 输入框里最多显示几行（正文再长也只滚动，不把视口顶穿）。
+pub const INPUT_MAX_ROWS: u16 = 8;
+/// 命令面板最多列几条。
+const PALETTE_MAX: u16 = 6;
+
+/// 视口要多高。`max` 是终端高度减去留给上文的那一行。
+pub fn viewport_height(app: &App, width: u16, max: u16, live_lines: usize) -> u16 {
+    let max = max.max(1);
+    if app.approval.is_some() {
+        return modal_height(app, max);
+    }
+    let live = (live_lines as u16).min(LIVE_MAX);
+    (live + 1 + palette_height(app) + input_height(app, width)).min(max)
+}
+
+/// 画一帧。`live` 是 [`crate::tui::transcript::Emitted::live`] 给的那一段。
+pub fn draw(frame: &mut Frame<'_>, app: &App, live: &[Line<'static>]) {
     let area = frame.area();
+    if app.approval.is_some() {
+        draw_modal(frame, app, area);
+        return;
+    }
+
     let palette = app.palette();
-    let palette_height = if palette.is_empty() {
-        0
-    } else {
-        (palette.len() as u16).min(6)
-    };
+    let palette_height = palette_height(app);
     let input_height = input_height(app, area.width);
+    let live_height = area
+        .height
+        .saturating_sub(1 + palette_height + input_height);
 
     let chunks = Layout::vertical([
-        Constraint::Length(1),              // 身份行
-        Constraint::Min(3),                 // 消息面
-        Constraint::Length(1),              // 状态行
-        Constraint::Length(palette_height), // 命令面板
-        Constraint::Length(input_height),   // 输入框
+        Constraint::Length(live_height),
+        Constraint::Length(1),
+        Constraint::Length(palette_height),
+        Constraint::Length(input_height),
     ])
     .split(area);
 
-    frame.render_widget(identity_line(app), chunks[0]);
-    frame.render_widget(transcript(app, chunks[1]), chunks[1]);
-    frame.render_widget(status_line(app), chunks[2]);
+    if live_height > 0 {
+        frame.render_widget(live_block(live, live_height), chunks[0]);
+    }
+    frame.render_widget(status_line(app), chunks[1]);
     if palette_height > 0 {
-        frame.render_widget(palette_block(&palette), chunks[3]);
+        frame.render_widget(palette_block(&palette), chunks[2]);
     }
-    frame.render_widget(input_block(app), chunks[4]);
-
-    if app.approval.is_some() {
-        draw_approval(frame, app, area);
-    }
+    draw_input(frame, app, chunks[3]);
 }
 
+/// 还在动的那一段：放不下就**只画尾巴**，因为在动的总是最后那几行。
+fn live_block(lines: &[Line<'static>], height: u16) -> Paragraph<'static> {
+    let start = lines.len().saturating_sub(height as usize);
+    Paragraph::new(lines[start..].to_vec()).block(Block::default().padding(Padding::horizontal(1)))
+}
+
+fn palette_height(app: &App) -> u16 {
+    (app.palette().len() as u16).min(PALETTE_MAX)
+}
+
+/// 输入框连边框一共几行。
 fn input_height(app: &App, width: u16) -> u16 {
-    let text = app.input.display();
+    (input_rows(app, width).len() as u16).clamp(1, INPUT_MAX_ROWS) + 2
+}
+
+/// 输入框里折好的每一行，附它在 [`crate::tui::paste::Input::display`] 那份文本里的起始
+/// 偏移——光标靠它落位。
+fn input_rows(app: &App, width: u16) -> Vec<(usize, String)> {
     let inner = width.saturating_sub(2).max(1) as usize;
-    let lines: usize = text
-        .split('\n')
-        .map(|line| markdown::wrap_to_width(line, inner).len())
-        .sum();
-    (lines.max(1) as u16 + 2).clamp(3, 10)
+    let text = if app.input_enabled() {
+        app.input.display()
+    } else {
+        String::new()
+    };
+    let mut rows = Vec::new();
+    let mut base = 0usize;
+    for line in text.split('\n') {
+        for (at, piece) in markdown::wrap_with_offsets(line, inner) {
+            rows.push((base + at, piece));
+        }
+        // `split` 吃掉的那个换行也占一个字节。
+        base += line.len() + 1;
+    }
+    rows
 }
 
-fn identity_line(app: &App) -> Paragraph<'static> {
-    let spans = vec![
-        Span::styled(
-            format!(" komo · {} ", app.mode.label()),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::LightBlue)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            match &app.session {
-                Some(session) => session.to_string(),
-                // `komo` 裸命令的第一条消息之前：会话还没铸出来，别在这里编一个。
-                None => "还没有会话".to_string(),
-            },
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
-    Paragraph::new(Line::from(spans))
-}
+/// 输入框，外加**把光标摆在它真正在的那一格上**。
+///
+/// 不摆这一下，ratatui 每一帧都会把光标藏起来：人在框里打字，插入符却不在框里——这就是
+/// "初始输入位置对不上"。宽字符一个占两列，所以列数按显示宽度算，不按字符数。
+fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let enabled = app.input_enabled();
+    let rows = input_rows(app, area.width);
+    let (caret_row, caret_column) = markdown::caret_at(&rows, app.input.display_cursor());
 
-/// 消息面。助手正文走 Markdown，工具调用逐条一行（可展开）。
-fn transcript(app: &App, area: Rect) -> Paragraph<'static> {
-    let width = area.width.saturating_sub(2).max(8);
-    let mut lines: Vec<Line<'static>> = Vec::new();
+    // 框里放得下几行，以及从第几行开始画——光标跑出框外时跟着滚，人不会打着打着就看不见
+    // 自己写到哪了。
+    let visible = area.height.saturating_sub(2).max(1) as usize;
+    let offset = (caret_row + 1).saturating_sub(visible);
 
-    for message in app.messages() {
-        match message.role {
-            Role::User => {
-                if let Some(text) = message.text.as_deref() {
-                    for piece in markdown::wrap_to_width(text, width.saturating_sub(3) as usize) {
-                        lines.push(Line::from(vec![
-                            Span::styled("你 ", Style::default().fg(Color::Green).bold()),
-                            Span::raw(piece),
-                        ]));
-                    }
-                } else if message.text_ref.is_some() {
-                    lines.push(dim("你 （正文已外置）"));
-                }
-                lines.push(Line::default());
-            }
-            Role::Assistant => {
-                if let Some(text) = message.text.as_deref().filter(|t| !t.trim().is_empty()) {
-                    lines.extend(markdown::render(text, width));
-                }
-                lines.extend(tool_lines_of(app, message, width));
-                lines.push(Line::default());
-            }
-            // 工具结果在调用那一行上显示，不另占一个消息节点。
-            Role::Tool => {}
-        }
-    }
+    let style = if enabled {
+        Style::default()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let body: Vec<Line<'static>> = rows
+        .iter()
+        .skip(offset)
+        .take(visible)
+        .map(|(_, line)| Line::from(Span::styled(line.clone(), style)))
+        .collect();
 
-    // Enter 后立刻显示，不等 SSE 绕一圈。权威 `run.accepted` 到达时状态机会移除对应项，
-    // 因而不会和 JSONL 折出来的用户消息重复。
-    for pending in &app.pending_submissions {
-        for piece in markdown::wrap_to_width(&pending.text, width.saturating_sub(3) as usize) {
-            lines.push(Line::from(vec![
-                Span::styled("你 ", Style::default().fg(Color::Green).bold()),
-                Span::raw(piece),
-            ]));
-        }
-        let (label, style) = match &pending.state {
-            SubmissionState::Sending => (
-                "  ↥ 发送中…".to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::DIM),
-            ),
-            SubmissionState::Submitted { deduplicated, .. } if *deduplicated => (
-                "  ✓ 已存在，等待事件同步…".to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-            ),
-            SubmissionState::Submitted { .. } => (
-                "  ✓ 已提交，等待事件同步…".to_string(),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-            ),
-            SubmissionState::Failed { error } => (
-                format!("  !! 发送失败：{error}"),
-                Style::default().fg(Color::Red),
-            ),
-        };
-        for piece in markdown::wrap_to_width(&label, width as usize) {
-            lines.push(Line::from(Span::styled(piece, style)));
-        }
-        lines.push(Line::default());
-    }
-
-    // 模型正在打字的那一段：接在历史后面，带一个「生成中」的记号，**不是历史的一部分**
-    // （`message.assistant` 到了它就被那一条替换掉）。
-    if let Some(draft) = &app.draft {
-        lines.extend(markdown::render(&draft.text, width));
-        lines.push(Line::from(Span::styled(
-            "▌生成中…",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-        )));
-        lines.push(Line::default());
-    }
-
-    if app.phase.is_backfilling() {
-        lines.push(dim("正在补读历史……"));
-    }
-    for notice in &app.notices {
-        let style = if notice.is_error {
-            Style::default().fg(Color::Red)
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .title(format!(" {} ", app.input_hint()))
+        .border_style(Style::default().fg(if enabled {
+            Color::DarkGray
         } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        for piece in markdown::wrap_to_width(&notice.text, width.saturating_sub(2) as usize) {
-            lines.push(Line::from(Span::styled(format!("· {piece}"), style)));
-        }
-    }
+            Color::Yellow
+        }));
+    let inner = block.inner(area);
+    frame.render_widget(Paragraph::new(body).block(block), area);
 
-    // 贴底显示：只画放得下的最后那些行，`scroll` 往上挪。
-    let height = area.height as usize;
-    let end = lines.len().saturating_sub(app.scroll as usize);
-    let start = end.saturating_sub(height);
-    let window = lines[start.min(lines.len())..end.min(lines.len())].to_vec();
-
-    Paragraph::new(window).block(Block::default().padding(Padding::horizontal(1)))
-}
-
-fn tool_lines_of(app: &App, message: &SurfaceMessage, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    for request in &message.tool_calls {
-        let Some(tool) = app.tool(&request.call_id) else {
-            continue;
-        };
-        let (colour, marker) = (state_colour(tool.state), tool.marker());
-        let head = format!("  {marker} {} {}", tool.tool, tool.summary());
-        lines.push(Line::from(Span::styled(
-            markdown::truncate_to_width(&head, width as usize),
-            Style::default().fg(colour),
-        )));
-        if tool.elapsed_ms > 0 && tool.state.is_terminal() {
-            lines.push(dim(&format!("     {} ms", tool.elapsed_ms)));
-        }
-        if tool.expanded {
-            let args = serde_json::to_string_pretty(&tool.args).unwrap_or_default();
-            for line in args.lines() {
-                lines.push(Line::from(Span::styled(
-                    markdown::truncate_to_width(&format!("     {line}"), width as usize),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            if let Some(preview) = &tool.preview {
-                lines.push(dim("     ── 结果预览 ──"));
-                for line in preview.lines() {
-                    lines.push(Line::from(Span::styled(
-                        markdown::truncate_to_width(&format!("     {line}"), width as usize),
-                        Style::default().fg(Color::Gray),
-                    )));
-                }
-            }
-        }
-    }
-    lines
-}
-
-fn state_colour(state: ToolCallState) -> Color {
-    match state {
-        ToolCallState::Planned => Color::DarkGray,
-        ToolCallState::Started => Color::Yellow,
-        ToolCallState::Completed => Color::Green,
-        ToolCallState::Failed => Color::Red,
-        // uncertain 不是失败的一种颜色——它是「不知道」，所以给它自己的颜色（§8.6）。
-        ToolCallState::Uncertain => Color::Magenta,
+    if enabled && inner.width > 0 && inner.height > 0 {
+        frame.set_cursor_position(Position {
+            x: inner.x + (caret_column as u16).min(inner.width - 1),
+            y: inner.y + (caret_row.saturating_sub(offset) as u16).min(inner.height - 1),
+        });
     }
 }
 
-/// 状态行：Run 状态（等什么就说出什么） · 本轮耗时 · 模型与 effort · 连接状态 · 待处理数。
+/// 状态行：Run 状态（等什么就说出什么） · 本轮耗时 · 模型与 effort · 连接状态 ·
+/// 待处理数 · 这个界面是怎么打开的。
 fn status_line(app: &App) -> Paragraph<'static> {
     let mut parts: Vec<Span<'static>> = Vec::new();
+
+    if app.phase.is_backfilling() {
+        parts.push(Span::styled(
+            " 补读历史 ",
+            Style::default().fg(Color::Black).bg(Color::LightBlue),
+        ));
+    }
 
     match app.run_state() {
         Some(state) => {
@@ -309,7 +242,39 @@ fn status_line(app: &App) -> Paragraph<'static> {
         ));
     }
 
+    // 会话 Id 只在开场那条横幅上（[`banner`]）与退出那行命令里出现，这里只留"怎么打开
+    // 的"——一行状态挤不下一个 UUID，挤进去只会把前面那些真会变的东西顶掉。
+    parts.push(Span::styled(
+        format!("· komo · {}", app.mode.label()),
+        Style::default().fg(Color::DarkGray),
+    ));
+
     Paragraph::new(Line::from(parts))
+}
+
+/// 开场横幅：进 TUI 时印一次，之后它就是终端回滚区里普通的两行。
+///
+/// 会话 Id 在这里"闪过一次"；`komo` 裸命令这时还没有会话，等第一条消息把它铸出来时由
+/// 一条提示补上。
+pub fn banner(app: &App, cwd: &str) -> Vec<Line<'static>> {
+    let mut head = vec![
+        Span::styled(
+            format!(" komo · {} ", app.mode.label()),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(cwd.to_string(), Style::default().fg(Color::DarkGray)),
+    ];
+    if let Some(session) = &app.session {
+        head.push(Span::styled(
+            format!(" · {session}"),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    vec![Line::from(head), Line::default()]
 }
 
 fn run_colour(state: RunState) -> Color {
@@ -343,7 +308,9 @@ fn palette_block(matches: &[(&'static str, &'static str)]) -> Paragraph<'static>
             Line::from(vec![
                 Span::styled(
                     format!(" {name} "),
-                    Style::default().fg(Color::LightBlue).bold(),
+                    Style::default()
+                        .fg(Color::LightBlue)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled((*blurb).to_string(), Style::default().fg(Color::DarkGray)),
             ])
@@ -352,32 +319,17 @@ fn palette_block(matches: &[(&'static str, &'static str)]) -> Paragraph<'static>
     Paragraph::new(lines).block(Block::default().padding(Padding::horizontal(1)))
 }
 
-fn input_block(app: &App) -> Paragraph<'static> {
-    let enabled = app.input_enabled();
-    let style = if enabled {
-        Style::default()
-    } else {
-        Style::default().fg(Color::DarkGray)
+/// 审批弹窗要多高：正文 + 菜单 + 边框 + 状态行，放不下就按 `max` 截。
+fn modal_height(app: &App, max: u16) -> u16 {
+    let Some(modal) = app.approval.as_ref() else {
+        return max;
     };
-    let body = if enabled {
-        app.input.display()
-    } else {
-        String::new()
-    };
-    Paragraph::new(Span::styled(body, style)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(format!(" {} ", app.input_hint()))
-            .border_style(Style::default().fg(if enabled {
-                Color::DarkGray
-            } else {
-                Color::Yellow
-            })),
-    )
+    let body = approval_lines(&modal.record).len() as u16;
+    let menu = modal.rows(app.pending_count()).len() as u16;
+    body.saturating_add(menu).saturating_add(3).min(max)
 }
 
-/// 审批弹窗：居中，盖住底下的内容（[`Clear`]），不动布局。
+/// 审批弹窗：占满视口，底下留一行状态行。
 ///
 /// 弹窗里有两块地方**不滚**：
 ///
@@ -389,12 +341,12 @@ fn input_block(app: &App) -> Paragraph<'static> {
 ///
 /// 钉住是因为正文在窄终端上几乎一定放不下，而一个滚出屏幕的「Enter 确认」等于没有提示
 /// ——这个弹窗上所有的答案都在菜单里。
-fn draw_approval(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(modal) = app.approval.as_ref() else {
         return;
     };
-    let popup = centered(area, 92, 86);
-    frame.render_widget(Clear, popup);
+    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    let popup = chunks[0];
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -463,6 +415,8 @@ fn draw_approval(frame: &mut Frame<'_>, app: &App, area: Rect) {
         );
         frame.render_widget(Paragraph::new(lines), menu);
     }
+
+    frame.render_widget(status_line(app), chunks[1]);
 }
 
 /// 菜单的每一行：高亮那一行是实心色块，其余是灰的；行尾挂着它的直通键。
@@ -510,34 +464,13 @@ fn menu_lines(
         .collect()
 }
 
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let vertical = Layout::vertical([
-        Constraint::Percentage((100 - percent_y) / 2),
-        Constraint::Percentage(percent_y),
-        Constraint::Percentage((100 - percent_y) / 2),
-    ])
-    .split(area);
-    Layout::horizontal([
-        Constraint::Percentage((100 - percent_x) / 2),
-        Constraint::Percentage(percent_x),
-        Constraint::Percentage((100 - percent_x) / 2),
-    ])
-    .split(vertical[1])[1]
-}
-
-fn dim(text: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        text.to_string(),
-        Style::default().fg(Color::DarkGray),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sse::ConnectionState;
-    use crate::tui::app::{App, Effect, ServerEvent, TuiMode};
+    use crate::tui::app::{Effect, ServerEvent, TuiMode};
     use crate::tui::test_support as fixture;
+    use crate::tui::transcript::Emitted;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use komo_kernel::events::{Event, EventPayload, MessageAssistant, RunWaiting};
     use komo_kernel::protocol::http::InterventionKind;
@@ -601,10 +534,53 @@ fn main() {
         }
     }
 
-    fn snapshot(app: &App, width: u16, height: u16) -> Buffer {
+    /// 人**看得见的那一屏**：终端回滚区上那一段（尾巴）加底下的视口。
+    ///
+    /// 驱动把正文交给终端、只画视口，所以单画视口的断言会漏掉一半界面；这个助手把两边
+    /// 按真实的高度拼回去，测试问的于是还是「屏幕上有没有这句话」。
+    fn screen_rows(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut emitted = Emitted::new();
+        let settled = emitted.take(app, width);
+        let live = emitted.live(app, width);
+        let viewport = viewport_height(app, width, height.saturating_sub(1).max(1), live.len());
+        let above = height.saturating_sub(viewport);
+
+        let mut out = Vec::new();
+        if above > 0 {
+            let start = (settled.len() as u16).saturating_sub(above);
+            let mut terminal = Terminal::new(TestBackend::new(width, above)).expect("能建终端");
+            terminal
+                .draw(|frame| {
+                    frame.render_widget(
+                        Paragraph::new(settled.clone()).scroll((start, 0)),
+                        frame.area(),
+                    )
+                })
+                .expect("能画一帧");
+            out.extend(rows(terminal.backend().buffer()));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(width, viewport)).expect("能建终端");
+        terminal
+            .draw(|frame| draw(frame, app, &live))
+            .expect("能画一帧");
+        out.extend(rows(terminal.backend().buffer()));
+        out
+    }
+
+    fn screen(app: &App, width: u16, height: u16) -> String {
+        screen_rows(app, width, height).join("\n")
+    }
+
+    /// 只画视口那一块。光标落在哪一格要问它。
+    fn viewport(app: &App, width: u16, height: u16) -> Terminal<TestBackend> {
+        let mut emitted = Emitted::new();
+        let _ = emitted.take(app, width);
+        let live = emitted.live(app, width);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("能建终端");
-        terminal.draw(|frame| draw(frame, app)).expect("能画一帧");
-        terminal.backend().buffer().clone()
+        terminal
+            .draw(|frame| draw(frame, app, &live))
+            .expect("能画一帧");
+        terminal
     }
 
     /// 缓冲区的每一行，右侧空白已去掉。
@@ -619,13 +595,70 @@ fn main() {
                 let mut x = 0u16;
                 while x < area.width {
                     let symbol = buffer[(x, y)].symbol();
-                    let width = crate::tui::markdown::display_width(symbol).max(1) as u16;
+                    let width = markdown::display_width(symbol).max(1) as u16;
                     row.push_str(symbol);
                     x += width;
                 }
                 row.trim_end().to_string()
             })
             .collect()
+    }
+
+    /// **光标要落在输入框里、落在刚打完那个字的后面。** 不摆这一下，人在框里打字、插入符
+    /// 却停在屏幕左上角——那正是"初始输入位置对不上"。
+    #[test]
+    fn the_caret_sits_where_the_next_character_will_go() {
+        let mut app = App::new(None, TuiMode::New, "seed");
+        let height = viewport_height(&app, 60, 20, 0);
+
+        // 一个字都没打：光标在框内第一格。
+        let mut terminal = viewport(&app, 60, height);
+        let empty = terminal.get_cursor_position().expect("有光标");
+        assert_eq!(empty.x, 1, "框的左边框占掉第 0 列");
+        assert_eq!(empty.y, height - 2, "框内第一行");
+
+        // 中文一个字占两列，所以四个字之后是第 8 列，不是第 4 列。
+        app.input.set("清理一下");
+        let mut terminal = viewport(&app, 60, height);
+        let typed = terminal.get_cursor_position().expect("有光标");
+        assert_eq!(typed.x, 1 + 8, "宽字符按显示宽度算");
+        assert_eq!(typed.y, empty.y);
+    }
+
+    /// 一行写不下就折到下一行，而且**光标跟着折**——框长高了却只画得下第一行，超出的那
+    /// 半句就等于没写。
+    #[test]
+    fn a_long_line_wraps_inside_the_box_and_the_caret_follows() {
+        let mut app = App::new(None, TuiMode::New, "seed");
+        let long = "这是一句很长的输入会超过一行宽度继续写下去";
+        app.input.set(long);
+
+        let height = viewport_height(&app, 30, 20, 0);
+        assert!(height > 4, "折行之后输入框要长高：{height}");
+        let mut terminal = viewport(&app, 30, height);
+        let screen = rows(terminal.backend().buffer()).join("\n");
+        assert!(screen.contains("这是一句很长的输入"), "{screen}");
+        assert!(
+            screen.contains("继续写下去"),
+            "折到下一行的那半句也要画出来：{screen}"
+        );
+
+        let caret = terminal.get_cursor_position().expect("有光标");
+        assert!(caret.y > height - 3, "光标跟着折到后面的行：{caret:?}");
+    }
+
+    /// 弹窗开着时输入框禁用，光标就不该还留在屏幕上晃。
+    #[test]
+    fn the_caret_goes_away_while_the_approval_popup_is_open() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
+        let terminal = viewport(&app, 80, 24);
+        assert_eq!(
+            terminal.backend().buffer().area().height,
+            24,
+            "弹窗占满视口"
+        );
+        assert!(!app.input_enabled());
     }
 
     #[test]
@@ -635,7 +668,7 @@ fn main() {
         let effects = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(effects.as_slice(), [Effect::Submit { .. }]));
 
-        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
+        let screen = screen(&app, 80, 24);
         assert!(screen.contains("刚发出去的消息"), "{screen}");
         assert!(screen.contains("发送中"), "{screen}");
     }
@@ -653,13 +686,13 @@ fn main() {
             error: "Gateway 不可用".into(),
         });
 
-        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
+        let screen = screen(&app, 80, 24);
         assert!(screen.contains("这条没有送到"), "{screen}");
         assert!(screen.contains("发送失败：Gateway 不可用"), "{screen}");
     }
 
     #[test]
-    fn a_run_failure_shows_its_reason_in_the_transcript() {
+    fn a_run_failure_shows_its_reason_on_screen() {
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         let events = vec![
             fixture::conversation()[0].clone(),
@@ -673,52 +706,46 @@ fn main() {
         ];
         feed(&mut app, &events);
 
-        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
+        let screen = screen(&app, 80, 24);
         assert!(screen.contains("上游拒绝了这次请求"), "{screen}");
     }
 
     /// 每一行都恰好占满缓冲区的宽度——没有一格越界，也没有一行被截短。
-    fn assert_within(buffer: &Buffer, width: u16, height: u16) {
-        let area = buffer.area();
-        assert_eq!(area.width, width);
-        assert_eq!(area.height, height);
-        for y in 0..height {
-            for x in 0..width {
-                // 越界访问会 panic；这里遍历一遍就是在断言「每一格都在里面」。
-                let _ = buffer[(x, y)].symbol();
-            }
+    fn assert_within(rows: &[String], width: u16) {
+        for (index, row) in rows.iter().enumerate() {
+            assert!(
+                markdown::display_width(row) <= width as usize,
+                "第 {index} 行宽 {}：{row}",
+                markdown::display_width(row)
+            );
         }
     }
 
     #[test]
     fn a_narrow_eighty_column_terminal_renders_within_its_bounds() {
         let app = conversation_app();
-        let buffer = snapshot(&app, 80, 24);
-        assert_within(&buffer, 80, 24);
-        let rows = rows(&buffer);
-        for (index, row) in rows.iter().enumerate() {
-            assert!(
-                crate::tui::markdown::display_width(row) <= 80,
-                "第 {index} 行宽 {}：{row}",
-                crate::tui::markdown::display_width(row)
-            );
-        }
+        let rows = screen_rows(&app, 80, 24);
+        assert_eq!(rows.len(), 24);
+        assert_within(&rows, 80);
         let screen = rows.join("\n");
-        // 身份行、状态行、输入框都在。
-        assert!(screen.contains("komo · 新会话"), "{screen}");
         assert!(screen.contains("已完成"), "{screen}");
         assert!(screen.contains("chat-a"), "{screen}");
         assert!(screen.contains("high"), "{screen}");
         assert!(screen.contains("已连接"), "{screen}");
+        assert!(
+            screen.contains("新会话"),
+            "状态行上说得出这个界面是怎么开的：{screen}"
+        );
         assert!(screen.contains("Enter 发送"), "{screen}");
     }
 
     #[test]
     fn a_wide_two_hundred_column_terminal_renders_within_its_bounds() {
         let app = conversation_app();
-        let buffer = snapshot(&app, 200, 50);
-        assert_within(&buffer, 200, 50);
-        let screen = rows(&buffer).join("\n");
+        let rows = screen_rows(&app, 200, 50);
+        assert_eq!(rows.len(), 50);
+        assert_within(&rows, 200);
+        let screen = rows.join("\n");
         assert!(screen.contains("清理结果"), "{screen}");
         // 宽屏放得下表格与代码块。
         assert!(screen.contains("build/deps"), "{screen}");
@@ -729,7 +756,7 @@ fn main() {
     #[test]
     fn the_tool_line_shows_the_tool_its_summary_and_its_state() {
         let app = conversation_app();
-        let screen = rows(&snapshot(&app, 100, 40)).join("\n");
+        let screen = screen(&app, 100, 40);
         assert!(screen.contains("shell rm -rf build"), "{screen}");
         assert!(screen.contains("ok shell"), "{screen}");
     }
@@ -742,8 +769,21 @@ fn main() {
             body.status = komo_kernel::types::refs::ToolResultStatus::Uncertain;
         }
         feed(&mut app, &events[..7]);
-        let screen = rows(&snapshot(&app, 100, 30)).join("\n");
+        let screen = screen(&app, 100, 30);
         assert!(screen.contains("?? shell"), "{screen}");
+    }
+
+    /// 开场横幅把「这是谁、在哪、哪个会话」说一次，然后它就是回滚区里普通的一行。
+    #[test]
+    fn the_banner_says_which_session_this_is() {
+        let app = App::new(Some(fixture::session()), TuiMode::Resume, "seed");
+        let text: String = banner(&app, "/home/u/project")
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(text.contains("续接会话"), "{text}");
+        assert!(text.contains("/home/u/project"), "{text}");
+        assert!(text.contains("sess-1"), "{text}");
     }
 
     #[test]
@@ -754,15 +794,8 @@ fn main() {
 
         // 够高的窗口：五项都在屏幕上。
         for (width, height) in [(80u16, 44u16), (200, 50)] {
-            let buffer = snapshot(&app, width, height);
-            assert_within(&buffer, width, height);
-            let rows = rows(&buffer);
-            for row in &rows {
-                assert!(
-                    crate::tui::markdown::display_width(row) <= width as usize,
-                    "{width} 列下有一行溢出：{row}"
-                );
-            }
+            let rows = screen_rows(&app, width, height);
+            assert_within(&rows, width);
             let screen = rows.join("\n");
             assert!(screen.contains("需要批准"), "{screen}");
             assert!(screen.contains("7K2M"), "一、短 ID：{screen}");
@@ -797,15 +830,8 @@ fn main() {
         app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
 
         // 一个放不下正文的窄窗口：菜单与底栏钉在弹窗底部，正文滚不走它们。
-        let buffer = snapshot(&app, 80, 24);
-        assert_within(&buffer, 80, 24);
-        let rows = rows(&buffer);
-        for row in &rows {
-            assert!(
-                crate::tui::markdown::display_width(row) <= 80,
-                "80 列下有一行溢出：{row}"
-            );
-        }
+        let rows = screen_rows(&app, 80, 24);
+        assert_within(&rows, 80);
         let screen = rows.join("\n");
         assert!(screen.contains("本次任务默认通过"), "菜单：{screen}");
         assert!(screen.contains("拒绝（本次不执行）"), "菜单：{screen}");
@@ -828,13 +854,13 @@ fn main() {
                 text: "我来清一".into(),
             },
         })));
-        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
-        assert!(screen.contains("我来清一"), "{screen}");
-        assert!(screen.contains("生成中"), "{screen}");
+        let drafting = screen(&app, 80, 24);
+        assert!(drafting.contains("我来清一"), "{drafting}");
+        assert!(drafting.contains("生成中"), "{drafting}");
 
         // 正式回复到了，草稿与记号一起消失，屏幕上只剩那一条。
         feed(&mut app, &fixture::conversation()[3..4]);
-        let screen = rows(&snapshot(&app, 80, 24)).join("\n");
+        let screen = screen(&app, 80, 24);
         assert!(!screen.contains("生成中"), "{screen}");
         assert_eq!(screen.matches("我来清一下。").count(), 1, "{screen}");
     }
@@ -861,7 +887,7 @@ fn main() {
         );
         app.apply(ServerEvent::Tick(fixture::T0 + time::Duration::seconds(10)));
 
-        let screen = rows(&snapshot(&app, 120, 20)).join("\n");
+        let screen = screen(&app, 120, 20);
         assert!(screen.contains("等待中"), "{screen}");
         assert!(screen.contains("20s 后重试"), "理由要印出来：{screen}");
         assert!(screen.contains("限流"), "{screen}");
@@ -885,8 +911,7 @@ fn main() {
             ),
             fixture::intervention_summary("run-2", InterventionKind::Blocked, "会话已删除"),
         ]));
-        // 弹窗盖住的是消息面，状态行还看得见。
-        let screen = rows(&snapshot(&app, 120, 20)).join("\n");
+        let screen = screen(&app, 120, 20);
         assert!(screen.contains("待处理 3"), "{screen}");
     }
 
@@ -897,7 +922,7 @@ fn main() {
             attempt: 2,
             reason: "connection reset".into(),
         }));
-        let screen = rows(&snapshot(&app, 80, 20)).join("\n");
+        let screen = screen(&app, 80, 20);
         assert!(screen.contains("重连中 #2"), "{screen}");
     }
 
@@ -905,7 +930,7 @@ fn main() {
     fn the_command_palette_appears_while_a_slash_command_is_being_typed() {
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         app.input.set("/ap");
-        let screen = rows(&snapshot(&app, 80, 20)).join("\n");
+        let screen = screen(&app, 80, 20);
         assert!(screen.contains("/approve"), "{screen}");
         assert!(screen.contains("本次 Run 范围"), "{screen}");
     }
@@ -916,7 +941,7 @@ fn main() {
         app.handle_input(crate::tui::paste::InputEvent::Paste(
             "机密第一行\n机密第二行\n机密第三行\n机密第四行".into(),
         ));
-        let screen = rows(&snapshot(&app, 80, 20)).join("\n");
+        let screen = screen(&app, 80, 20);
         assert!(screen.contains("[粘贴 4 行"), "{screen}");
         assert!(
             !screen.contains("机密第二行"),
@@ -928,7 +953,19 @@ fn main() {
     fn a_twenty_column_terminal_still_draws_without_panicking() {
         // 不是要好看，是要**不崩**。
         let app = conversation_app();
-        let buffer = snapshot(&app, 20, 10);
-        assert_within(&buffer, 20, 10);
+        let rows = screen_rows(&app, 20, 10);
+        assert_eq!(rows.len(), 10);
+        assert_within(&rows, 20);
+    }
+
+    /// 视口不许把整个终端占满：上面总要留得下前面说过的话。
+    #[test]
+    fn the_viewport_never_eats_the_whole_terminal() {
+        let mut app = conversation_app();
+        app.input.set("很长的一段草稿".repeat(40));
+        for height in [10u16, 24, 50] {
+            let want = viewport_height(&app, 80, height.saturating_sub(1), 40);
+            assert!(want < height, "{height} 行的终端要给上文留位置：{want}");
+        }
     }
 }

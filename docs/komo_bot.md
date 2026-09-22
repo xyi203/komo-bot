@@ -953,7 +953,7 @@ JSONL 追加和状态提交都校验领取代次。领取代次只防止旧执�
 
 CLI 不承担恢复调度。打开 komo 时可以看到“2 个任务已接续，1 个等待审批”；komo resume SESSION_ID 连接到原任务，多个客户端同时连接不会开启多个执行。自动恢复无需再次询问是否继续，只有新增权限、过期动作、冲突或无法核实的效果才打断用户。
 
-**退出 TUI 就是暂停（`Ctrl-C`）**：Run 留在 Gateway 里照跑，退出时印出 `komo resume <会话>`——会话 Id 平时只在身份行上闪过一次，退出这一刻正是需要它的时刻。暂停在任何界面状态下都有效，审批弹窗开着也一样（弹窗里的 `Esc` 是拒绝，不是退出）。一个字没发就退出时还没有会话，什么都不印。
+**退出 TUI 就是暂停（`Ctrl-C`）**：Run 留在 Gateway 里照跑，退出时印出 `komo resume <会话>`——会话 Id 平时只在开场那条横幅上闪过一次（裸 `komo` 那条路上会话还没铸出来，由第一条消息之后的一条提示补上），退出这一刻正是需要它的时刻。暂停在任何界面状态下都有效，审批弹窗开着也一样（弹窗里的 `Esc` 是拒绝，不是退出）。一个字没发就退出时还没有会话，什么都不印。
 
 SSE 从已同步且索引完成的 JSONL 事件补读；审批当前状态可直接查询 state.db，不依赖用户一直在线。之后接入 Telegram 等主动推送渠道时，应为待发送结果持久保存投递记录，不能为补发一条结果消息重跑任务。
 
@@ -1271,7 +1271,11 @@ TELEGRAM_BOT_TOKEN=...
 | `/status` | 当前 Run 状态、待审批数 |
 | `/id` | 回显 `{platform}:{chat_id}` 与发送者 id，供抄进 config.toml 的 `allow_from` / `home_chat` / `groups`；任何人可用，也是唯一不要求操作者身份的命令 |
 
-**TUI 是同一个决策接口的第四个界面，它的答案必须自己说出来。** 聊天里的请求自带按钮（飞书）或命令（Telegram / WeChat），TUI 只有一块弹窗，所以弹窗底部是一张**答案菜单**：一行一个答案，`↑` / `↓` 移动高亮、`Enter` 确认，行首那个字母（`r` / `y` / `n` / `a`）是这一行的直通键，习惯直接按键的人不必先移动高亮。可选的行只有 Policy 真给了的那些，顺序固定——`r` 本次任务默认通过（本次 Run 范围，只在 Policy 标了可范围化时出现，且排第一 = `Enter` 的默认落点）、`y` 只批准本次调用、`n` 拒绝本条（`Esc` 同义）、`a` 全部批准（只在待处理多于一条时出现，并写出有几条）；没有这个答案就不占一行——列一个按下去没反应的键比不列它更糟。正文会滚（`PgUp` / `PgDn`），菜单与边框底栏那一行不滚：窄终端上正文几乎一定放不下，而一个滚出屏幕的「Enter 确认」等于没有提示。待处理条数同时出现在状态行上。弹窗没打开而审批还在等（请求还没投到、详情取不回来、事件流断了）时，输入框的提示行要**说出路**（`/pending` 看清单、`/approve <短ID>`、`/approve all`），而不是只显示一句"等待审批"——那是审批的主界面之外唯一还能看见它的地方。
+**TUI 不接管整屏。** 它只占终端底下一小块**视口**（还在动的那一小段 · 状态行 · 命令面板 · 输入框），会话正文一条条**交还给终端自己的回滚区**：滚轮、选中复制、退出之后留在屏幕上的那段记录，都是终端本来就会做的事，不必在这里重做一遍，而且每条正文只画一次，不随每一帧重算。交出去的行**从此不再改**，所以"定型"要判得保守：用户那条消息、助手那段回答、跑完（或所属 Run 已结束）的一次调用、一条提示才交；还没收到 `run.accepted` 的提交、正在打字的草稿、还在跑的调用留在视口里逐帧重画。两边不重叠——定型的那一帧它从视口消失、同时出现在回滚区上。`Ctrl-T` 因此是一个**模式**而不是对某一条的展开：它管的是之后印出来的那些。
+
+视口的位置由客户端**自己记账**，不用 ratatui 的 inline 视口：后者每次定位都要向终端问一次光标位置，而 crossterm 明写着「`event::read` / `event::poll` 正在进行时这一问会阻塞并超时」——TUI 有一个常驻读键线程，两者不能共存。所以只在**读键线程起来之前**问一次，之后视口的顶边与"缩高度腾出来的那几行空档"全靠自己那两笔账；空档在下一次往回滚区写正文时正好被填回去，输入框从三行缩回一行不会在历史与它之间留下一道再也填不上的缝。整帧包在同步输出（DECSET 2026）里，支持的终端等整帧到齐才上屏。
+
+**TUI 是同一个决策接口的第四个界面，它的答案必须自己说出来。** 聊天里的请求自带按钮（飞书）或命令（Telegram / WeChat），TUI 只有一块弹窗（它占满视口，输入框本来就该禁用），所以弹窗底部是一张**答案菜单**：一行一个答案，`↑` / `↓` 移动高亮、`Enter` 确认，行首那个字母（`r` / `y` / `n` / `a`）是这一行的直通键，习惯直接按键的人不必先移动高亮。可选的行只有 Policy 真给了的那些，顺序固定——`r` 本次任务默认通过（本次 Run 范围，只在 Policy 标了可范围化时出现，且排第一 = `Enter` 的默认落点）、`y` 只批准本次调用、`n` 拒绝本条（`Esc` 同义）、`a` 全部批准（只在待处理多于一条时出现，并写出有几条）；没有这个答案就不占一行——列一个按下去没反应的键比不列它更糟。正文会滚（`PgUp` / `PgDn`），菜单与边框底栏那一行不滚：窄终端上正文几乎一定放不下，而一个滚出屏幕的「Enter 确认」等于没有提示。待处理条数同时出现在状态行上。弹窗没打开而审批还在等（请求还没投到、详情取不回来、事件流断了）时，输入框的提示行要**说出路**（`/pending` 看清单、`/approve <短ID>`、`/approve all`），而不是只显示一句"等待审批"——那是审批的主界面之外唯一还能看见它的地方。
 
 按钮回调与文本命令走同一个 `Dispatcher::handle`，**去重键与普通消息同源**（§11.1）：飞书卡片回调（`card.action.trigger`）用 `feishu:{event_id}`，Telegram `callback_query` 用 `telegram:{update_id}`——`callback_query` 是 `Update` 的一个字段，不是比 `update_id` 更细的投递单位。回调里带的 `approval_id` 是渠道回传的数据，只用来**定位**请求；批准与否仍由 Dispatcher 核对 Principal 后决定，回调负载不构成授权。
 
@@ -1404,7 +1408,7 @@ SSE 事件带 Session 内递增序号，断线后按游标补读。JSONL 事件�
 | 日志                  | tracing                                                                  |
 | Python                | 独立解释器进程和虚拟环境                                                 |
 | Cron                  | 支持指定五字段语义及时区的 Rust 调度库，落地时做语义验证                 |
-| TUI                   | ratatui + crossterm，Markdown 用 pulldown-cmark；仅 komo-client                          |
+| TUI                   | ratatui + crossterm（不进备用屏：视口只占底下几行，正文交给终端回滚区），Markdown 用 pulldown-cmark；仅 komo-client |
 | 飞书                  | openlark，仅 `websocket` 特性；事件自己解析，回复走 reqwest（feature `feishu`）           |
 | Telegram              | reqwest 手写 Bot API 长轮询，无 SDK                                                      |
 | WeChat                | wechatbot（iLink，DM）；feature `wechat`                                                 |
@@ -1536,8 +1540,9 @@ komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件
                组装 runtime 与 agent（两者互不依赖）。
                deps: kernel, runtime, agent, axum, tower-http, reqwest, openlark(feature "feishu"), wechatbot(feature "wechat")
 
-komo-client    HTTP + SSE 客户端、发现文件读取、ratatui 聊天 TUI（含审批弹窗、Markdown 渲染）、
-               操作子命令的输出渲染。只依赖 kernel——不认识 store / runtime。
+komo-client    HTTP + SSE 客户端、发现文件读取、ratatui 聊天 TUI（视口 + 终端回滚区，
+               含审批弹窗、Markdown 渲染）、操作子命令的输出渲染。
+               只依赖 kernel——不认识 store / runtime。
                deps: kernel, reqwest, tokio, ratatui, crossterm, pulldown-cmark
 
 komo (bin)     clap 分发：`komo` / `komo resume` → client 的 TUI；操作子命令 → client；`komo gateway` → gateway；

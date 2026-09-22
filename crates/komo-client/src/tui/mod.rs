@@ -10,23 +10,29 @@ pub mod command;
 pub mod markdown;
 pub mod paste;
 pub mod render;
+pub mod transcript;
 
 #[cfg(test)]
 pub mod test_support;
 
-use std::io::Stdout;
+use std::io::{Stdout, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyEventKind,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+use crossterm::style::{
+    Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
+use crossterm::terminal::{
+    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, disable_raw_mode,
+    enable_raw_mode,
+};
+use crossterm::{execute, queue};
 use komo_kernel::protocol::http::{
     BoundaryRequest, CancelRunRequest, CreateSessionRequest, EventQuery, InterventionAnswerRequest,
     InterventionBatchAnswerRequest, InterventionDetail, InterventionListQuery, ResumeRequest,
@@ -34,8 +40,11 @@ use komo_kernel::protocol::http::{
 };
 use komo_kernel::protocol::sse::Cursor;
 use komo_kernel::types::ids::{SessionId, uuid_v7_at};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{CrosstermBackend, IntoCrossterm};
+use ratatui::layout::{Rect, Size};
+use ratatui::style::{Color, Modifier};
+use ratatui::text::Line;
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::sync::mpsc;
 
 pub use app::{App, Effect, Phase, ServerEvent, TuiMode};
@@ -44,6 +53,7 @@ use crate::api::KomoClient;
 use crate::error::ClientError;
 use crate::sse::{self, ConnectionState, SseMessage};
 use crate::tui::paste::{InputEvent, TimedKey, coalesce_rapid_keys};
+use crate::tui::transcript::Emitted;
 
 /// 补读历史时一页取多少条。
 const BACKFILL_PAGE: u32 = 500;
@@ -117,10 +127,19 @@ pub async fn run_tui(
     let mut just_opened: Option<SessionId> = None;
     let mut ended = false;
 
+    // **先开终端，再起读键线程**：视口定位要问一次"光标现在在第几行"，而 crossterm 说得
+    // 很清楚——另一个线程正在 `event::read` 时这一问会被它吃掉、然后超时。开场那一问
+    // 因此必须发生在读键线程存在之前；之后的事这个界面自己记账，一次都不再问。
+    let mut terminal = TerminalGuard::enter(&app)?;
     let stop = Arc::new(AtomicBool::new(false));
     let (mut input, reader) = spawn_input_reader(stop.clone());
-
-    let mut terminal = TerminalGuard::enter()?;
+    // 开场横幅先落进终端的回滚区：它是普通的两行输出，滚上去就看不见了，这正是它该有的
+    // 分量（会话 Id 在这里闪过一次）。
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let _ = terminal.commit(render::banner(&app, &cwd));
+    let mut emitted = Emitted::new();
     let mut ticker = tokio::time::interval(TICK);
 
     let outcome = loop {
@@ -128,7 +147,7 @@ pub async fn run_tui(
             break Ok(());
         }
         app.now = Some(time::OffsetDateTime::now_utc());
-        if let Err(error) = terminal.draw(&app) {
+        if let Err(error) = terminal.render(&app, &mut emitted) {
             break Err(TuiError::Terminal(error));
         }
 
@@ -190,7 +209,7 @@ pub async fn run_tui(
     // 行上闪过一次，退出这一刻正是需要它的时刻。会话还没铸出来（`komo` 一个字没发就退）
     // 就没有可 resume 的东西，什么都不印——那正是"不在账本上留空壳"的同一条规矩。
     if let Some(session) = app.session.as_ref() {
-        println!("\nkomo resume {session}");
+        println!("komo resume {session}");
     }
     outcome
 }
@@ -243,6 +262,9 @@ async fn open_session(
         .await
     {
         Ok(summary) => {
+            // 会话 Id 在开场横幅上闪过一次（[`render::banner`]），而裸 `komo` 那条路上
+            // 横幅印出来的时候它还不存在——补在这里，否则这个界面从头到尾说不出自己是谁。
+            app.note(format!("会话 {}", summary.session));
             app.session = Some(summary.session.clone());
             (Some(summary.session), effects)
         }
@@ -505,16 +527,32 @@ fn interpret(raw: Vec<(TermEvent, u64)>) -> Vec<InputEvent> {
     out
 }
 
-/// 终端的 raw mode 与备用屏：**panic 时也要复原**。
+/// 终端这一侧：raw mode、视口、回滚区。**panic 时也要复原**。
 ///
 /// 两层保险，因为它们在不同时刻起作用：`Drop` 管正常返回与 `?` 早退，panic hook 管
-/// panic——默认 hook 会在备用屏里打印回溯，然后进程带着一个坏掉的终端退出。
+/// panic——默认 hook 会打印回溯，然后进程带着一个坏掉的终端退出。
+///
+/// **没有备用屏**。整屏接管换来的是滚轮失灵、选不中、退出之后什么也不剩；这里只占终端
+/// 底下那几行，会话正文按行交还给终端自己的回滚区（[`TerminalGuard::commit`]）。
+///
+/// 视口的位置**由这里自己记账**，不交给 ratatui 的 `Viewport::Inline`：后者每次定位都要
+/// 向终端问一次光标位置，而 crossterm 明写着「`event::read` / `event::poll` 正在进行时
+/// 这一问会阻塞并超时」——这个界面有一个常驻的读键线程，两者不能共存。所以只有开场那
+/// 一问（读键线程还没起来），之后全靠 [`TerminalGuard::view`] 与 [`TerminalGuard::gap`]
+/// 这两笔账。
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    /// 视口占住的那一块。
+    view: Rect,
+    /// 视口正上方有几行是空的——缩高度腾出来的。下一次往回滚区写从那里开始写，于是
+    /// 输入框缩回一行不会在历史与它之间留下一道再也填不上的空档。
+    gap: u16,
+    /// 上一次看到的终端尺寸。尺寸变了就把视口重新贴到底部。
+    size: Size,
 }
 
 impl TerminalGuard {
-    fn enter() -> Result<Self, std::io::Error> {
+    fn enter(app: &App) -> Result<Self, std::io::Error> {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = restore_terminal();
@@ -522,40 +560,272 @@ impl TerminalGuard {
         }));
         enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(stdout, EnableBracketedPaste)?;
         // kitty 键盘协议是 Shift-Enter / Alt-Enter **能被区分开**的唯一办法：没有它，
         // 终端把这三种回车发成同一个字节。不支持就算了，Ctrl-J 一直在。
-        if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-            let _ = execute!(
+        // **推过才弹**：没推过还发一条 pop，在不认这套协议的终端上就是屏幕上凭空多出来
+        // 的几个字符。推没推成功只有这里知道，所以记在进程里。
+        if crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+            && execute!(
                 stdout,
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            );
+            )
+            .is_ok()
+        {
+            KEYBOARD_ENHANCED.store(true, Ordering::Relaxed);
         }
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-        Ok(TerminalGuard { terminal })
+
+        let (width, height) = crossterm::terminal::size()?;
+        let size = Size::new(width, height);
+        let want = render::viewport_height(app, width, max_viewport(size), 0).max(1);
+        // 全程唯一一次问终端"光标在第几行"（见类型上的那段注释）。
+        let row = crossterm::cursor::position()?.1;
+        let view = reserve(row, want, size)?;
+
+        let terminal = Terminal::with_options(
+            CrosstermBackend::new(stdout),
+            TerminalOptions {
+                viewport: Viewport::Fixed(view),
+            },
+        )?;
+        Ok(TerminalGuard {
+            terminal,
+            view,
+            gap: 0,
+            size,
+        })
     }
 
-    fn draw(&mut self, app: &App) -> Result<(), std::io::Error> {
-        self.terminal.draw(|frame| render::draw(frame, app))?;
-        Ok(())
+    /// 一帧：先把定型的正文交给回滚区，再按还在动的那一段调整视口高度，最后画。
+    ///
+    /// 顺序不能反。先交后画，是因为交正文会把视口整块往下推，画在它前面等于画在一个
+    /// 马上要挪走的位置上。
+    fn render(&mut self, app: &App, emitted: &mut Emitted) -> Result<(), std::io::Error> {
+        self.follow_terminal_size()?;
+        self.commit(emitted.take(app, self.size.width))?;
+
+        let live = emitted.live(app, self.size.width);
+        let want =
+            render::viewport_height(app, self.size.width, max_viewport(self.size), live.len())
+                .max(1);
+        self.set_height(want)?;
+        self.draw(app, &live)
     }
+
+    /// 终端被拉大拉小了：把视口重新贴到底部。
+    ///
+    /// 上面那些历史怎么重排是终端自己的事——它们已经交出去了，这里不该、也没法再动它们。
+    fn follow_terminal_size(&mut self) -> Result<(), std::io::Error> {
+        let (width, height) = crossterm::terminal::size()?;
+        let size = Size::new(width, height);
+        if size == self.size {
+            return Ok(());
+        }
+        self.size = size;
+        let view_height = self.view.height.clamp(1, height.max(1));
+        self.view = Rect::new(0, height.saturating_sub(view_height), width, view_height);
+        self.gap = 0;
+        self.terminal.resize(self.view)
+    }
+
+    /// 把这些行交给终端的回滚区。交出去之后它们就是终端的了——谁也改不动。
+    ///
+    /// 写法是"从我们这一块的顶上开始，正常地打印"：每行一个换行，打到屏幕底部时终端自己
+    /// 往上滚，滚走的那些进它的回滚区。最后再打 `view.height` 个换行，把视口那块位置重新
+    /// 腾出来。
+    fn commit(&mut self, lines: Vec<Line<'static>>) -> Result<(), std::io::Error> {
+        if lines.is_empty() {
+            return Ok(());
+        }
+        let start = self.view.y.saturating_sub(self.gap);
+        let width = self.size.width;
+        let out = self.terminal.backend_mut();
+        queue!(out, MoveTo(0, start), Clear(ClearType::FromCursorDown))?;
+        for line in &lines {
+            write_line(out, line, width)?;
+        }
+        // **`height - 1` 个换行，不是 `height` 个**：最后一个换行会把光标推到视口下面
+        // 一行，屏幕跟着多滚一次，视口上面于是留下一条再也填不回去的空行。打到视口的
+        // 最后一行为止就够了。
+        for _ in 1..self.view.height {
+            queue!(out, Print("\r\n"))?;
+        }
+        out.flush()?;
+
+        self.gap = 0;
+        let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        self.view.y = start
+            .saturating_add(rows)
+            .min(self.size.height.saturating_sub(self.view.height));
+        // `Fixed` 的 resize 只换区域、清视口、把后备缓冲清零逼下一帧全画——**不问光标**。
+        self.terminal.resize(self.view)
+    }
+
+    /// 改视口高度。
+    ///
+    /// 长高：先用底下剩的地方，再用 [`Self::gap`] 那几行空档，都不够才让屏幕往上滚。
+    /// 变矮：视口原地下移，让出来的行记成空档，下一次往回滚区写正文时正好填回去。
+    fn set_height(&mut self, want: u16) -> Result<(), std::io::Error> {
+        let want = want.clamp(1, self.size.height.max(1));
+        if want == self.view.height {
+            return Ok(());
+        }
+        let out = self.terminal.backend_mut();
+        if want < self.view.height {
+            let shrink = self.view.height - want;
+            queue!(
+                out,
+                MoveTo(0, self.view.y),
+                Clear(ClearType::FromCursorDown)
+            )?;
+            out.flush()?;
+            self.gap += shrink;
+            self.view.y += shrink;
+        } else {
+            let grow = want - self.view.height;
+            let below = self
+                .size
+                .height
+                .saturating_sub(self.view.y + self.view.height);
+            let rest = grow.saturating_sub(below);
+            let from_gap = rest.min(self.gap);
+            self.gap -= from_gap;
+            self.view.y -= from_gap;
+            let scroll = rest - from_gap;
+            if scroll > 0 {
+                queue!(out, MoveTo(0, self.size.height.saturating_sub(1)))?;
+                for _ in 0..scroll {
+                    queue!(out, Print("\r\n"))?;
+                }
+                out.flush()?;
+                self.view.y = self.view.y.saturating_sub(scroll);
+            }
+        }
+        self.view.height = want;
+        self.terminal.resize(self.view)
+    }
+
+    /// 画一帧，整帧包在**同步输出**里（DECSET 2026）。
+    ///
+    /// 支持它的终端会等整帧到齐再上屏：光标、边框、正在打字的那一行不会各自闪一下。不
+    /// 支持的终端把这两个序列当无事发生。
+    fn draw(&mut self, app: &App, live: &[Line<'static>]) -> Result<(), std::io::Error> {
+        queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        let drawn = self
+            .terminal
+            .draw(|frame| render::draw(frame, app, live))
+            .map(|_| ());
+        queue!(self.terminal.backend_mut(), EndSynchronizedUpdate)?;
+        self.terminal.backend_mut().flush()?;
+        drawn
+    }
+}
+
+/// 视口最多占到哪：**总要给上文留一行**，否则人再也看不见刚说过的那句话。
+fn max_viewport(size: Size) -> u16 {
+    size.height.saturating_sub(1).max(1)
+}
+
+/// 从光标所在行往下留出 `height` 行，返回视口占住的那一块。
+///
+/// 下面放不下就让终端往上滚——滚走的是终端自己的历史，进它的回滚区，一行都没丢。这与
+/// ratatui 给 inline 视口算位置的做法是同一套算术，只是这里算完之后**位置归我们记**。
+fn reserve(row: u16, height: u16, size: Size) -> Result<Rect, std::io::Error> {
+    let height = height.clamp(1, size.height.max(1));
+    let mut out = std::io::stdout();
+    let after = height - 1;
+    for _ in 0..after {
+        queue!(out, Print("\r\n"))?;
+    }
+    out.flush()?;
+    let available = size.height.saturating_sub(row).saturating_sub(1);
+    let missing = after.saturating_sub(available);
+    Ok(Rect::new(
+        0,
+        row.saturating_sub(missing),
+        size.width,
+        height,
+    ))
+}
+
+/// 把一行带样式的正文写进终端。
+///
+/// 交给回滚区的行不经过 ratatui 的缓冲区（那块只管视口），所以颜色与粗细要在这里自己
+/// 发出去。**一行只占一行**：超宽先截断，否则终端自动折行，回滚区上的行数就与这里数的
+/// 对不上，视口的位置跟着算错。
+fn write_line(out: &mut impl Write, line: &Line<'_>, width: u16) -> Result<(), std::io::Error> {
+    let mut used = 0usize;
+    for span in &line.spans {
+        let room = (width as usize).saturating_sub(used);
+        if room == 0 {
+            break;
+        }
+        // 控制字符一个都不许原样发出去：一个裸换行就是一级楼梯，一个回车能把半行吞
+        // 掉，而这一段是**直接写给终端的**，没有缓冲区替它把关。
+        let clean: String = span
+            .content
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        let text = render::markdown::truncate_to_width(&clean, room);
+        if text.is_empty() {
+            continue;
+        }
+        used += render::markdown::display_width(&text);
+        let style = line.style.patch(span.style);
+        queue!(out, SetAttribute(Attribute::Reset))?;
+        for (modifier, attribute) in [
+            (Modifier::BOLD, Attribute::Bold),
+            (Modifier::DIM, Attribute::Dim),
+            (Modifier::ITALIC, Attribute::Italic),
+            (Modifier::UNDERLINED, Attribute::Underlined),
+            (Modifier::REVERSED, Attribute::Reverse),
+            (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+        ] {
+            if style.add_modifier.contains(modifier) {
+                queue!(out, SetAttribute(attribute))?;
+            }
+        }
+        queue!(
+            out,
+            SetForegroundColor(style.fg.unwrap_or(Color::Reset).into_crossterm()),
+            SetBackgroundColor(style.bg.unwrap_or(Color::Reset).into_crossterm()),
+        )?;
+        queue!(out, Print(text))?;
+    }
+    queue!(
+        out,
+        SetAttribute(Attribute::Reset),
+        ResetColor,
+        Print("\r\n")
+    )
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // 视口那一块是这个进程借来的，还回去时要擦干净：光标回到我们这一块的顶上、清掉
+        // 往下的内容，退出后那一行 `komo resume` 就印在它原来的位置上，不会留下半个输入框。
+        let mut stdout = std::io::stdout();
+        let _ = execute!(
+            stdout,
+            MoveTo(0, self.view.y.saturating_sub(self.gap)),
+            Clear(ClearType::FromCursorDown),
+            Show
+        );
         let _ = restore_terminal();
     }
 }
 
+/// 进来的时候有没有真的把 kitty 键盘协议推上去——[`restore_terminal`] 据此决定弹不弹。
+static KEYBOARD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
 fn restore_terminal() -> Result<(), std::io::Error> {
     let mut stdout = std::io::stdout();
-    // Pop 在没 Push 过时是无害的；两边都用 `let _` 因为复原路径不许因此失败。
-    let _ = execute!(
-        stdout,
-        PopKeyboardEnhancementFlags,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
+    // 复原路径不许因为其中一步失败就停下，所以每一条都 `let _`。
+    if KEYBOARD_ENHANCED.swap(false, Ordering::Relaxed) {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
+    let _ = execute!(stdout, DisableBracketedPaste, Show);
     disable_raw_mode()
 }
 
@@ -566,6 +836,62 @@ mod tests {
 
     fn key(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    /// **交给回滚区的一行，在终端上就得正好占一行。**
+    ///
+    /// 这一段不经过 ratatui 的缓冲区——是直接写给终端的字节。行里混进一个换行，屏幕上
+    /// 就是一级楼梯；超出宽度不截断，终端自己折行，于是这边数的行数与屏幕上的对不上，
+    /// 视口的位置跟着算错。
+    #[test]
+    fn a_line_handed_to_the_scrollback_occupies_exactly_one_row() {
+        use ratatui::style::{Color, Style};
+        use ratatui::text::Span;
+
+        let mut out: Vec<u8> = Vec::new();
+        let line = Line::from(vec![
+            Span::styled("头", Style::default().fg(Color::Green)),
+            // 正文里混进来的控制字符，以及一段远超宽度的文字。
+            Span::raw("一\n二\r三\t四"),
+            Span::raw("很长很长很长很长很长很长很长很长很长很长"),
+        ]);
+        write_line(&mut out, &line, 20).expect("写得出去");
+        let text = String::from_utf8(out).expect("是 UTF-8");
+
+        assert_eq!(
+            text.matches('\n').count(),
+            1,
+            "只有行尾那一个换行：{text:?}"
+        );
+        assert!(text.ends_with("\r\n"), "{text:?}");
+        // 去掉转义序列之后，可见部分不超过 20 列。
+        let visible = strip_escapes(text.trim_end_matches("\r\n"));
+        assert!(
+            crate::tui::markdown::display_width(&visible) <= 20,
+            "宽 {}：{visible:?}",
+            crate::tui::markdown::display_width(&visible)
+        );
+    }
+
+    /// 掐掉 CSI 序列，只留会占格子的那些字符。
+    fn strip_escapes(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch != '\u{1b}' {
+                out.push(ch);
+                continue;
+            }
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+        }
+        out
     }
 
     #[test]

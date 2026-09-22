@@ -3,7 +3,7 @@
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::http::{InterventionKind, InterventionSummary};
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
-use komo_kernel::types::ids::{ApprovalId, ToolCallId};
+use komo_kernel::types::ids::ApprovalId;
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::{RunState, ToolCallState};
 
@@ -291,10 +291,7 @@ impl App {
                 Vec::new()
             }
             // Run 状态是派生的，我们自己折；收到它只当一次提示。
-            SseEvent::RunStatus { run, state } => {
-                if state.is_terminal() && self.current_run.as_ref() == Some(&run) {
-                    self.scroll = 0;
-                }
+            SseEvent::RunStatus { run: _, state } => {
                 // 「停在等人上」这个信号来得比审计补写早：`run.waiting` 走 Run 自己的
                 // 路径，`approval.requested` 是随后补写的审计副本（§8.5 的反向顺序）。
                 // 弹窗要的是后者，而权威清单在 `GET /v1/interventions`——顺手问一遍，
@@ -482,19 +479,12 @@ impl App {
         }
     }
 
-    /// 展开 / 收起一次调用的完整参数与结果预览。
-    pub fn toggle_tool(&mut self, call: &ToolCallId) {
-        if let Some(line) = self.tools.get_mut(call) {
-            line.expanded = !line.expanded;
-        }
-    }
-
-    /// Ctrl-T：一次全展开或全收起。还有收着的就全展开，否则全收起。
-    pub fn toggle_all_tools(&mut self) {
-        let expand = self.tools.values().any(|line| !line.expanded);
-        for line in self.tools.values_mut() {
-            line.expanded = expand;
-        }
+    /// `Ctrl-T`：工具调用印不印参数与结果预览。
+    ///
+    /// **它管的是之后印出来的那些**——已经落进终端回滚区的那几行是终端的了，这个开关
+    /// 够不着它们（见 [`super::App::tool_detail`]）。
+    pub fn toggle_tool_detail(&mut self) {
+        self.tool_detail = !self.tool_detail;
     }
 }
 

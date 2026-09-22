@@ -162,8 +162,12 @@ pub enum Effect {
 }
 
 /// 一条提示。
+///
+/// `id` 单调递增：提示一条一条交给终端回滚区，交到哪一条要有个记号，而 `notices` 这张
+/// 表会从头裁（[`App::trim_notices`]），下标做不了这个记号。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
+    pub id: u64,
     pub text: String,
     pub is_error: bool,
 }
@@ -218,7 +222,6 @@ pub struct ToolLine {
     pub cwd: Option<String>,
     pub preview: Option<String>,
     pub elapsed_ms: u64,
-    pub expanded: bool,
     pub seq: Seq,
 }
 
@@ -324,10 +327,15 @@ pub struct App {
     /// 已经提示过"有一帧读不懂"——只说一次，之后只进日志（见
     /// [`ServerEvent::FrameSkipped`]）。
     skipped_noticed: bool,
-    /// 消息面滚动：从底部往上数多少行。0 = 贴底。
-    pub scroll: u16,
+    /// 工具调用印不印参数与结果预览（`Ctrl-T`）。
+    ///
+    /// **它是一个模式，不是对某一条的展开**：一行历史交给终端回滚区之后就是终端的了，
+    /// 谁也改不了它——所以这个开关管的是**之后**印出来的那些，以及此刻还在动的那几行。
+    pub tool_detail: bool,
     pub now: Option<OffsetDateTime>,
     pub quit: bool,
+    /// 提示的编号发到哪了。
+    notice_seq: u64,
     /// 幂等键的种子。同一次操作重发要带同一个键，所以键不是随手生成的。
     key_seed: String,
     key_counter: u64,
@@ -365,9 +373,10 @@ impl App {
             model_menu: Vec::new(),
             listing_models: false,
             skipped_noticed: false,
-            scroll: 0,
+            tool_detail: false,
             now: None,
             quit: false,
+            notice_seq: 0,
             key_seed: key_seed.into(),
             key_counter: 0,
         }
@@ -537,8 +546,7 @@ impl App {
         if self.phase.is_backfilling() {
             return "正在补读历史……".to_string();
         }
-        "Enter 发送 · Shift/Alt-Enter 或 Ctrl-J 换行 · Ctrl-T 展开工具 · Ctrl-C 暂停 · / 看命令"
-            .to_string()
+        "Enter 发送 · Ctrl-J 换行 · Ctrl-T 工具详情 · Ctrl-C 暂停 · / 看命令".to_string()
     }
 
     /// 命令面板的候选。
@@ -552,17 +560,19 @@ impl App {
     // ---- 输入 ----
 
     pub fn note(&mut self, text: impl Into<String>) {
-        self.notices.push(Notice {
-            text: text.into(),
-            is_error: false,
-        });
-        self.trim_notices();
+        self.push_notice(text.into(), false);
     }
 
     pub fn fail(&mut self, text: impl Into<String>) {
+        self.push_notice(text.into(), true);
+    }
+
+    fn push_notice(&mut self, text: String, is_error: bool) {
+        self.notice_seq += 1;
         self.notices.push(Notice {
-            text: text.into(),
-            is_error: true,
+            id: self.notice_seq,
+            text,
+            is_error,
         });
         self.trim_notices();
     }
@@ -591,7 +601,6 @@ fn blank_tool(call: ToolCallId, run: Option<RunId>, seq: Seq) -> ToolLine {
         cwd: None,
         preview: None,
         elapsed_ms: 0,
-        expanded: false,
         seq,
     }
 }

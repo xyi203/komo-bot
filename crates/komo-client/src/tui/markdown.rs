@@ -42,23 +42,47 @@ pub fn truncate_to_width(text: &str, width: usize) -> String {
 
 /// 按显示宽度折行。宽度不足以放下一个字符时不会死循环。
 pub fn wrap_to_width(text: &str, width: usize) -> Vec<String> {
+    wrap_with_offsets(text, width)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect()
+}
+
+/// 折行，并给出每一行**在原文里的起始字节偏移**。
+///
+/// 输入框把光标摆在哪一格靠它：画字的和摆光标的必须用同一套折行规则，否则中文一多，
+/// 插入符就慢慢往左漂——这正是"输入位置对不上"的另一半。
+pub fn wrap_with_offsets(text: &str, width: usize) -> Vec<(usize, String)> {
     if width == 0 {
-        return vec![String::new()];
+        return vec![(0, String::new())];
     }
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut start = 0usize;
     let mut used = 0usize;
-    for ch in text.chars() {
+    for (at, ch) in text.char_indices() {
         let w = display_width(ch.encode_utf8(&mut [0u8; 4])).max(1);
         if used + w > width && !current.is_empty() {
-            lines.push(std::mem::take(&mut current));
+            lines.push((start, std::mem::take(&mut current)));
+            start = at;
             used = 0;
         }
         current.push(ch);
         used += w;
     }
-    lines.push(current);
+    lines.push((start, current));
     lines
+}
+
+/// 折行之后，`offset` 这个字节偏移落在第几行第几列。
+pub fn caret_at(lines: &[(usize, String)], offset: usize) -> (usize, usize) {
+    let row = lines
+        .iter()
+        .rposition(|(start, _)| *start <= offset)
+        .unwrap_or(0);
+    let (start, line) = &lines[row];
+    let column = display_width(&line[..offset.saturating_sub(*start).min(line.len())]);
+    (row, column)
 }
 
 /// 把一段 Markdown 渲染成不超过 `width` 列的行。

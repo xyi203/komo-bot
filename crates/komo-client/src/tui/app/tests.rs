@@ -796,15 +796,17 @@ fn the_conversation_folds_into_messages_and_tool_lines() {
     assert_eq!(tools[0].attempts, 1);
 }
 
+/// `Ctrl-T` 是一个**模式**，不是对某一条的展开：一行落进终端回滚区之后谁也改不了它，
+/// 所以这个开关管的是之后印出来的那些。
 #[test]
-fn ctrl_t_expands_and_collapses_the_tool_calls() {
+fn ctrl_t_turns_tool_detail_on_and_off() {
     let mut app = app();
     feed(&mut app, &fixture::conversation());
-    assert!(!app.tool_lines()[0].expanded);
+    assert!(!app.tool_detail);
     app.handle_key(with(KeyCode::Char('t'), KeyModifiers::CONTROL));
-    assert!(app.tool_lines()[0].expanded, "展开看参数与结果预览");
+    assert!(app.tool_detail, "展开看参数与结果预览");
     app.handle_key(with(KeyCode::Char('t'), KeyModifiers::CONTROL));
-    assert!(!app.tool_lines()[0].expanded);
+    assert!(!app.tool_detail);
 }
 
 // ---- 打字机效果（`assistant_delta`） ----

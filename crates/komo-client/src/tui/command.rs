@@ -126,6 +126,16 @@ fn verdict_options() -> String {
 }
 
 /// 命令名与一行说明，`/help` 与命令面板共用一张表。
+/// `/help` 里那一段按键说明。**输入框的提示行挂不下这些**：窄终端上边框标题会被截，
+/// 而截掉的那半段正是人没见过、因而永远不会去按的那些。
+pub const KEYS: &[&str] = &[
+    "按键  Enter 发送 · Ctrl-J / Shift-Enter / Alt-Enter 换行",
+    "按键  Ctrl-W 删一个词 · Ctrl-U 删到行首 · Ctrl-K 删到行尾 · Delete 往后删",
+    "按键  Alt-← / Alt-→（或 Ctrl-←/→）按词移动 · Home/End 行首行尾 · Ctrl-Home/End 全文首尾",
+    "按键  ↑ / ↓ 在多行草稿里走行，走到头了才翻历史 · Tab 补全命令",
+    "按键  Ctrl-T 工具详情 · Esc 取消在跑的 Run · Ctrl-C 退出（Run 照跑）",
+];
+
 pub const COMMANDS: [(&str, &str); 11] = [
     ("/new", "在当前会话划一条回放边界（不切会话）"),
     ("/cancel", "取消本会话正在跑的 Run"),

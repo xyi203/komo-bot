@@ -44,14 +44,17 @@ impl App {
             return self.approval_key(key);
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // 按词走：Alt-← / Alt-→ 是 macOS 与 emacs 的习惯，Ctrl-← / Ctrl-→ 是别处的。
+        let word = alt || ctrl;
         match key.code {
             KeyCode::Char('d') if ctrl && self.input.is_empty() => {
                 self.quit = true;
                 return vec![Effect::Quit];
             }
-            // 展开 / 收起工具调用的完整参数与结果预览。
+            // 工具调用印不印参数与结果预览。
             KeyCode::Char('t') if ctrl => {
-                self.toggle_all_tools();
+                self.toggle_tool_detail();
                 return Vec::new();
             }
             // Ctrl-J、Shift-Enter、Alt-Enter 都是换行（后两者要终端开着 kitty 协议）。
@@ -73,6 +76,11 @@ impl App {
             }
             KeyCode::Enter => return self.submit(),
             KeyCode::Esc => return self.escape(),
+            // Alt-Backspace 往前删一个词；光秃秃的 Backspace 删一个字符。
+            KeyCode::Backspace if alt => {
+                self.edit(|input| input.delete_word_before());
+                return Vec::new();
+            }
             KeyCode::Backspace => {
                 if self.input_enabled() {
                     self.input.backspace();
@@ -80,14 +88,33 @@ impl App {
                 }
                 return Vec::new();
             }
+            // 行内编辑（readline 的那几个），都只在输入框能用时才动。
+            KeyCode::Char('w') if ctrl => self.edit(|input| input.delete_word_before()),
+            KeyCode::Char('u') if ctrl => self.edit(|input| input.delete_to_line_start()),
+            KeyCode::Char('k') if ctrl => self.edit(|input| input.delete_to_line_end()),
+            KeyCode::Char('a') if ctrl => self.input.move_home(),
+            KeyCode::Char('e') if ctrl => self.input.move_end(),
+            KeyCode::Delete => self.edit(|input| input.delete_forward()),
+            KeyCode::Left if word => self.input.move_word_left(),
+            KeyCode::Right if word => self.input.move_word_right(),
             KeyCode::Left => self.input.move_left(),
             KeyCode::Right => self.input.move_right(),
+            KeyCode::Home if ctrl => self.input.move_start_of_text(),
+            KeyCode::End if ctrl => self.input.move_end_of_text(),
             KeyCode::Home => self.input.move_home(),
             KeyCode::End => self.input.move_end(),
-            KeyCode::Up => self.history_back(),
-            KeyCode::Down => self.history_forward(),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_add(5),
-            KeyCode::PageDown => self.scroll = self.scroll.saturating_sub(5),
+            // **多行草稿里，↑ / ↓ 先是走行**：一条三行的草稿按 ↑ 就跳走翻历史，等于
+            // 这三行白写了。走不动了（已经在首行 / 末行）才轮到历史。
+            KeyCode::Up => {
+                if !self.input.move_line_up() {
+                    self.history_back();
+                }
+            }
+            KeyCode::Down => {
+                if !self.input.move_line_down() {
+                    self.history_forward();
+                }
+            }
             KeyCode::Tab => {
                 if let Some(completed) = command::complete(self.input.text()) {
                     self.input.set(completed);
@@ -100,6 +127,16 @@ impl App {
             _ => {}
         }
         Vec::new()
+    }
+
+    /// 改草稿的那一类按键共用的一道门：弹窗开着或正在补读历史时输入框是禁用的，改了
+    /// 也没人看得见（[`App::input_enabled`]），而翻历史的浏览位置一改就要复位。
+    fn edit(&mut self, change: impl FnOnce(&mut crate::tui::paste::Input)) {
+        if !self.input_enabled() {
+            return;
+        }
+        change(&mut self.input);
+        self.reset_history_browse();
     }
 
     /// **Esc 的两个意思**：Run 在跑时取消它；空闲时什么都不做——一个有时会清掉草稿的
@@ -139,7 +176,6 @@ impl App {
             text: body.clone(),
             state: SubmissionState::Sending,
         });
-        self.scroll = 0;
         vec![Effect::Submit {
             request_key,
             text: body,
@@ -224,6 +260,11 @@ impl App {
             Command::Help => {
                 for (name, blurb) in command::COMMANDS {
                     self.note(format!("{name}  {blurb}"));
+                }
+                // 输入框的提示行只挂得下最常用的那几个键（窄终端上标题会被截），剩下的
+                // 在这里说一次——一个没人说过的快捷键等于不存在。
+                for line in command::KEYS {
+                    self.note(*line);
                 }
                 Vec::new()
             }

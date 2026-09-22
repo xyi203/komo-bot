@@ -196,6 +196,237 @@ impl Input {
             .unwrap_or(self.text.len());
     }
 
+    /// 整段文本的开头 / 结尾（`Ctrl-Home` / `Ctrl-End`）。
+    pub fn move_start_of_text(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn move_end_of_text(&mut self) {
+        self.cursor = self.text.len();
+    }
+
+    /// 往左跳一个词：先吃掉左边的空白，再吃掉一整段同类字符。
+    ///
+    /// **chip 整块跳过**——一段折起来的粘贴在屏幕上是一个标签，按词走进它的内部只会让
+    /// 光标停在一个看不见的地方。
+    pub fn move_word_left(&mut self) {
+        // 光标正贴着一段折起来的粘贴（末尾或内部）：整块跳过去。
+        if let Some(chip) = self
+            .chips
+            .iter()
+            .find(|chip| chip.start < self.cursor && self.cursor <= chip.end)
+        {
+            self.cursor = chip.start;
+            return;
+        }
+        // 左边最近的那个 chip 的右沿是走不过去的地脚：越过它就走进了屏幕上根本没画出来
+        // 的字里。
+        let floor = self
+            .chips
+            .iter()
+            .filter(|chip| chip.end <= self.cursor)
+            .map(|chip| chip.end)
+            .max()
+            .unwrap_or(0);
+
+        let mut index = self.cursor;
+        while index > floor {
+            let Some((at, ch)) = self.text[..index].char_indices().next_back() else {
+                break;
+            };
+            if !ch.is_whitespace() {
+                break;
+            }
+            index = at;
+        }
+        let Some(class) = self.text[..index].chars().next_back().map(char_class) else {
+            self.cursor = index;
+            return;
+        };
+        while index > floor {
+            let Some((at, ch)) = self.text[..index].char_indices().next_back() else {
+                break;
+            };
+            if char_class(ch) != class {
+                break;
+            }
+            index = at;
+        }
+        self.cursor = index.max(floor);
+    }
+
+    /// 往右跳一个词：先吃掉一整段同类字符，再吃掉右边的空白。
+    pub fn move_word_right(&mut self) {
+        if let Some(chip) = self
+            .chips
+            .iter()
+            .find(|chip| chip.start <= self.cursor && self.cursor < chip.end)
+        {
+            self.cursor = chip.end;
+            return;
+        }
+        let ceiling = self
+            .chips
+            .iter()
+            .filter(|chip| chip.start >= self.cursor)
+            .map(|chip| chip.start)
+            .min()
+            .unwrap_or(self.text.len());
+
+        let mut index = self.cursor;
+        while index < ceiling {
+            let Some(ch) = self.text[index..].chars().next() else {
+                break;
+            };
+            if !ch.is_whitespace() {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+        let Some(class) = self.text[index..].chars().next().map(char_class) else {
+            self.cursor = index;
+            return;
+        };
+        while index < ceiling {
+            let Some(ch) = self.text[index..].chars().next() else {
+                break;
+            };
+            if char_class(ch) != class {
+                break;
+            }
+            index += ch.len_utf8();
+        }
+        self.cursor = index.min(ceiling);
+    }
+
+    /// 往前删一个词（`Ctrl-W` / `Alt-Backspace`）。
+    pub fn delete_word_before(&mut self) {
+        let end = self.cursor;
+        self.move_word_left();
+        let start = self.cursor;
+        if start < end {
+            self.cut(start, end);
+        }
+    }
+
+    /// 删到行尾（`Ctrl-K`）。已经在行尾时删掉那个换行。
+    pub fn delete_to_line_end(&mut self) {
+        let start = self.cursor;
+        let end = match self.text[start..].find('\n') {
+            Some(0) => start + 1,
+            Some(index) => start + index,
+            None => self.text.len(),
+        };
+        if start < end {
+            self.cut(start, end);
+        }
+    }
+
+    /// 删到行首（`Ctrl-U`）。
+    pub fn delete_to_line_start(&mut self) {
+        let end = self.cursor;
+        self.move_home();
+        let start = self.cursor;
+        if start < end {
+            self.cut(start, end);
+        }
+    }
+
+    /// 往后删一个字符（`Delete`）。
+    pub fn delete_forward(&mut self) {
+        if let Some(index) = self.chips.iter().position(|c| c.start == self.cursor) {
+            let chip = self.chips.remove(index);
+            self.cut_raw(chip.start, chip.end);
+            return;
+        }
+        if let Some(ch) = self.text[self.cursor..].chars().next() {
+            let end = self.cursor + ch.len_utf8();
+            self.cut(self.cursor, end);
+        }
+    }
+
+    /// 输入里有几行。
+    pub fn line_count(&self) -> usize {
+        self.text.bytes().filter(|b| *b == b'\n').count() + 1
+    }
+
+    /// 光标在第几行（从 0 数）。
+    pub fn line_index(&self) -> usize {
+        self.text[..self.cursor]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count()
+    }
+
+    /// 上下移动一个**逻辑行**，列按显示宽度尽量对齐。移动不了（已经在首行 / 末行）返回
+    /// `false`——调用方据此决定要不要改去翻历史。
+    pub fn move_line_up(&mut self) -> bool {
+        if self.line_index() == 0 {
+            return false;
+        }
+        let column = self.column();
+        let line_start = self.line_start(self.cursor);
+        let previous_start = self.line_start(line_start.saturating_sub(1));
+        self.cursor = self.offset_at_column(previous_start, column);
+        true
+    }
+
+    pub fn move_line_down(&mut self) -> bool {
+        let line_end = self.line_end(self.cursor);
+        if line_end >= self.text.len() {
+            return false;
+        }
+        let column = self.column();
+        self.cursor = self.offset_at_column(line_end + 1, column);
+        true
+    }
+
+    /// 光标离行首有几列（显示宽度）。
+    fn column(&self) -> usize {
+        let start = self.line_start(self.cursor);
+        crate::tui::markdown::display_width(&self.text[start..self.cursor])
+    }
+
+    fn line_start(&self, at: usize) -> usize {
+        self.text[..at]
+            .rfind('\n')
+            .map(|index| index + 1)
+            .unwrap_or(0)
+    }
+
+    fn line_end(&self, at: usize) -> usize {
+        self.text[at..]
+            .find('\n')
+            .map(|index| at + index)
+            .unwrap_or(self.text.len())
+    }
+
+    /// 从 `line_start` 起走到第 `column` 列（或行尾）所在的字节偏移。
+    fn offset_at_column(&self, line_start: usize, column: usize) -> usize {
+        let end = self.line_end(line_start);
+        let mut used = 0usize;
+        for (at, ch) in self.text[line_start..end].char_indices() {
+            if used >= column {
+                return line_start + at;
+            }
+            used += crate::tui::markdown::display_width(ch.encode_utf8(&mut [0u8; 4])).max(1);
+        }
+        end
+    }
+
+    /// 删掉 `[start, end)`，chip 与光标跟着挪。删之前先打散被切开的那个 chip。
+    fn cut(&mut self, start: usize, end: usize) {
+        self.dissolve_at(start);
+        self.dissolve_at(end);
+        self.cut_raw(start, end);
+    }
+
+    fn cut_raw(&mut self, start: usize, end: usize) {
+        self.text.replace_range(start..end, "");
+        self.shift(start, -((end - start) as isize));
+        self.cursor = start;
+    }
+
     /// 渲染用的文本：每个 chip 的范围换成它的标签。**这是唯一跳过折叠内容的地方。**
     pub fn display(&self) -> String {
         let mut out = String::new();
@@ -237,6 +468,18 @@ impl Input {
                 chip.end = (chip.end as isize + delta).max(0) as usize;
             }
         }
+    }
+}
+
+/// 按词移动时的字符分类：空白 / 词内 / 标点。**只分三类**——中文没有空格分词，再细分
+/// 也只是猜。
+fn char_class(ch: char) -> u8 {
+    if ch.is_whitespace() {
+        0
+    } else if ch.is_alphanumeric() || ch == '_' {
+        1
+    } else {
+        2
     }
 }
 
@@ -471,5 +714,120 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], InputEvent::Paste("aaaaaaaa".into()));
         assert!(matches!(out[1], InputEvent::Key(_)));
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+
+    fn at(text: &str, cursor: usize) -> Input {
+        let mut input = Input::new();
+        input.set(text);
+        input.cursor = cursor;
+        input
+    }
+
+    #[test]
+    fn word_motions_step_over_one_word_at_a_time() {
+        let text = "cargo test --workspace";
+        let mut input = at(text, text.len());
+        input.move_word_left();
+        assert_eq!(&text[input.cursor()..], "workspace");
+        input.move_word_left();
+        assert_eq!(&text[input.cursor()..], "--workspace", "标点自成一段");
+        input.move_word_left();
+        assert_eq!(&text[input.cursor()..], "test --workspace");
+
+        input.move_word_right();
+        assert_eq!(&text[input.cursor()..], " --workspace");
+        input.move_word_right();
+        assert_eq!(&text[input.cursor()..], "workspace");
+    }
+
+    /// 中文没有空格，按词走靠的是"同一类字符连成一段"——标点是另一类。
+    #[test]
+    fn a_chinese_clause_is_one_word() {
+        let text = "把构建目录清掉，然后跑测试";
+        let mut input = at(text, text.len());
+        input.move_word_left();
+        assert_eq!(&text[input.cursor()..], "然后跑测试");
+        input.move_word_left();
+        assert_eq!(&text[input.cursor()..], "，然后跑测试");
+    }
+
+    #[test]
+    fn ctrl_w_deletes_the_word_before_the_caret() {
+        let mut input = at("cargo test --workspace", 22);
+        input.delete_word_before();
+        assert_eq!(input.text(), "cargo test --");
+        input.delete_word_before();
+        assert_eq!(input.text(), "cargo test ");
+    }
+
+    #[test]
+    fn ctrl_k_and_ctrl_u_cut_to_the_ends_of_the_line() {
+        let mut input = at("第一行\n第二行", "第一行\n".len() + "第二".len());
+        input.delete_to_line_end();
+        assert_eq!(input.text(), "第一行\n第二");
+        input.delete_to_line_start();
+        assert_eq!(input.text(), "第一行\n");
+        // 已经在行尾了，再按一下把那个换行也吃掉。
+        input.delete_to_line_start();
+        assert_eq!(input.text(), "第一行\n");
+    }
+
+    /// **多行草稿里 ↑ 先是走行**：一条三行的草稿按一下就跳走翻历史，等于这三行白写了。
+    #[test]
+    fn the_caret_walks_lines_before_it_gives_up_to_history() {
+        let mut input = at("第一行\n第二行\n第三行", 0);
+        assert!(!input.move_line_up(), "已经在首行，交给历史");
+        assert!(input.move_line_down());
+        assert_eq!(input.line_index(), 1);
+        assert!(input.move_line_down());
+        assert_eq!(input.line_index(), 2);
+        assert!(!input.move_line_down(), "已经在末行，交给历史");
+        assert!(input.move_line_up());
+        assert_eq!(input.line_index(), 1);
+    }
+
+    /// 上下移动时列按**显示宽度**对齐：中文一个字两列，按字符数对齐会歪。
+    #[test]
+    fn moving_between_lines_keeps_the_column_by_display_width() {
+        let mut input = at("中文中文\nabcdefgh", 0);
+        input.move_end();
+        assert_eq!(input.cursor(), "中文中文".len());
+        assert!(input.move_line_down());
+        assert_eq!(&input.text()[input.cursor()..], "", "八列 = 八个半角字符");
+    }
+
+    /// 折起来的粘贴在屏幕上是一个标签：按词走、往后删，都该整块处理，不许把光标丢进
+    /// 一段看不见的文本里。
+    #[test]
+    fn a_folded_paste_is_crossed_and_deleted_as_one_block() {
+        let mut input = Input::new();
+        input.insert_str("前");
+        input.paste("一\n二\n三\n四");
+        input.insert_str("后");
+        assert_eq!(input.chips().len(), 1);
+
+        input.move_word_left();
+        assert_eq!(input.cursor(), input.chips()[0].end, "先停在 chip 的右沿");
+        input.move_word_left();
+        assert_eq!(input.cursor(), input.chips()[0].start, "整块跳过去");
+
+        input.delete_forward();
+        assert_eq!(input.text(), "前后", "往后删一下删掉整块");
+        assert!(input.chips().is_empty());
+    }
+
+    #[test]
+    fn delete_removes_the_character_after_the_caret() {
+        let mut input = at("清理一下", 0);
+        input.delete_forward();
+        assert_eq!(input.text(), "理一下");
+        input.move_end_of_text();
+        input.delete_forward();
+        assert_eq!(input.text(), "理一下", "末尾再按没有东西可删");
     }
 }

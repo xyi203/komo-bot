@@ -334,6 +334,11 @@ pub struct App {
     /// 已经提示过"有一帧读不懂"——只说一次，之后只进日志（见
     /// [`ServerEvent::FrameSkipped`]）。
     skipped_noticed: bool,
+    /// 这一段对话到此为止花掉的 token（模型每答一轮报一次，见 `message.assistant`）。
+    pub tokens_in: u64,
+    pub tokens_out: u64,
+    /// 用量算到哪一条事件为止了。**不能用 `cursor` 代替**：那一个在别处就推过了。
+    counted: Seq,
     /// 工具调用印不印参数与结果预览（`Ctrl-T`）。
     ///
     /// **它是一个模式，不是对某一条的展开**：一行历史交给终端回滚区之后就是终端的了，
@@ -380,6 +385,9 @@ impl App {
             model_menu: Vec::new(),
             listing_models: false,
             skipped_noticed: false,
+            tokens_in: 0,
+            tokens_out: 0,
+            counted: Seq::ZERO,
             tool_detail: false,
             now: None,
             quit: false,
@@ -456,6 +464,19 @@ impl App {
                 .map(|e| e.to_string())
                 .collect(),
         }
+    }
+
+    /// 状态行上印的那个模型名。
+    ///
+    /// 优先级是「这一轮真用的 → `/model` 设的 → 网关报的默认那一个」。最后一层要紧：
+    /// 没有它，第一条消息发出去之前那一格只能印"默认模型"——一句正确但没用的话，而网关
+    /// 开机时就把清单报过来了，**默认是哪个它知道**。
+    pub fn model_label(&self) -> String {
+        self.run_meta()
+            .and_then(|meta| meta.model.clone())
+            .or_else(|| self.model.clone())
+            .or_else(|| self.current_model_entry().map(|entry| entry.id.clone()))
+            .unwrap_or_else(|| "默认模型".into())
     }
 
     fn current_model_entry(&self) -> Option<&ModelMenuEntry> {

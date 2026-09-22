@@ -352,6 +352,11 @@ impl App {
 
     /// 吃进一条 JSONL 事件：折进 Surface，再补两张 Surface 说不出的边表。
     fn absorb(&mut self, event: &Event) {
+        // 补读与订阅各读各的一段（订阅从游标之后起），照理不会重叠；真重了也不能把用量
+        // 加两遍——**只有没见过的那一条才计数**。游标不能当这个记号：它在别处（`frame`）
+        // 就已经推过了，等走到这里永远是"见过"。
+        let fresh = event.seq > self.counted;
+        self.counted = self.counted.max(event.seq);
         self.surface.extend([event]);
         self.cursor = self.cursor.max(event.seq);
 
@@ -432,6 +437,13 @@ impl App {
                 }
             }
             EventPayload::MessageAssistant(body) => {
+                // 这一段对话到此为止花了多少 token：状态行上那一格读它。模型每答一轮报一
+                // 次，累加起来就是这个会话的用量（补读历史时一并算上，所以 resume 回来看
+                // 到的是整段的数，不是"这次打开之后"的数）。
+                if fresh {
+                    self.tokens_in += body.input_tokens.unwrap_or(0);
+                    self.tokens_out += body.output_tokens.unwrap_or(0);
+                }
                 // 正式回复到了，草稿让位——消息面上这一轮只留一条。
                 if self
                     .draft

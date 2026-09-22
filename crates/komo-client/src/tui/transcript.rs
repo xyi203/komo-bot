@@ -199,21 +199,21 @@ pub fn tool_lines(
         Style::default().fg(state_colour(tool.state)),
     )));
     if tool.elapsed_ms > 0 && tool.state.is_terminal() {
-        lines.push(dim(&format!("     {} ms", tool.elapsed_ms)));
+        lines.push(dim(&format!("    {} ms", tool.elapsed_ms)));
     }
     if detail {
         let args = serde_json::to_string_pretty(&tool.args).unwrap_or_default();
         for line in args.lines() {
             lines.push(Line::from(Span::styled(
-                markdown::truncate_to_width(&format!("     {line}"), width as usize),
+                markdown::truncate_to_width(&format!("    {line}"), width as usize),
                 Style::default().fg(Color::DarkGray),
             )));
         }
         if let Some(preview) = &tool.preview {
-            lines.push(dim("     ── 结果预览 ──"));
+            lines.push(dim("    ── 结果预览 ──"));
             for line in preview.lines() {
                 lines.push(Line::from(Span::styled(
-                    markdown::truncate_to_width(&format!("     {line}"), width as usize),
+                    markdown::truncate_to_width(&format!("    {line}"), width as usize),
                     Style::default().fg(Color::Gray),
                 )));
             }

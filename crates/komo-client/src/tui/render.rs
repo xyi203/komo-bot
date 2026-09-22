@@ -76,7 +76,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, live: &[Line<'static>]) {
     if live_height > 0 {
         frame.render_widget(live_block(live, live_height), chunks[0]);
     }
-    frame.render_widget(status_line(app), chunks[1]);
+    frame.render_widget(status_line(app, area.width), chunks[1]);
     if palette_height > 0 {
         frame.render_widget(palette_block(&palette), chunks[2]);
     }
@@ -165,78 +165,67 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 }
 
-/// 状态行：Run 状态（等什么就说出什么） · 本轮耗时 · 模型与 effort · 连接状态 ·
-/// 待处理数 · 这个界面是怎么打开的。
-fn status_line(app: &App) -> Paragraph<'static> {
-    let mut parts: Vec<Span<'static>> = Vec::new();
+/// 状态行。
+///
+/// **左边是"此刻在发生什么"，右边是"这一摊是什么"**，中间撑开：
+///
+/// ```text
+///  ⠋ 0.5s                          deepseek-flash · 已连接 · ↑12.3k ↓1.8k
+/// ```
+///
+/// 右边三格固定，位置不动，眼睛不用每次重新找；左边只在**真有事**的时候说话——跑着有
+/// 转圈，跑完了屏幕上就是那段回答，"空闲 / 运行中 / 已完成"都是让人读一件他正看着的事。
+/// 但停着不动的那几个要说，而且要说清在等谁（§8.4：排队二十分钟不知道为什么，就是少了
+/// 这一格）。
+fn status_line(app: &App, width: u16) -> Paragraph<'static> {
+    // 左边永远先空一格：有没有转圈，后面那句话的起点都在同一列。
+    let mut left: Vec<Span<'static>> = vec![Span::raw(" ")];
 
     if app.phase.is_backfilling() {
-        parts.push(Span::styled(
+        left.push(Span::styled(
             " 补读历史 ",
             Style::default().fg(Color::Black).bg(Color::LightBlue),
         ));
     }
 
-    match app.run_state() {
-        Some(state) => {
-            // 还在跑的那一格是动的：一块静止的文字分不出还在跑还是卡住了。
-            if !state.is_terminal() {
-                parts.push(Span::styled(
-                    format!(" {}", crate::tui::spinner::frame(app.now)),
-                    Style::default().fg(run_colour(state)),
-                ));
-            }
-            // **一切正常的两个状态不写出来**：跑着有转圈，跑完了屏幕上就是那段回答——
-            // "运行中" / "已完成" 都是让人读一件他正看着的事。剩下的几个留着，它们说的
-            // 是转圈与回答都说不出的事：在排队、在等人、失败了、被取消了。
-            if !matches!(state, RunState::Running | RunState::Completed) {
-                parts.push(Span::styled(
-                    format!(" {} ", status_text(state)),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(run_colour(state))
-                        .add_modifier(Modifier::BOLD),
-                ));
-            }
-            // §8.4：状态只说"能不能跑"，理由说"在等谁、等到什么时候"。**排队二十分钟
-            // 不知道为什么**就是少了这一格；窄终端下行会被截，但截掉的是一句话的后半段，
-            // 不是全部。
-            if let Some(reason) = app.run_wait() {
-                parts.push(Span::styled(
-                    format!("{} ", crate::tui::app::wait_text(reason, app.now)),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
+    if let Some(state) = app.run_state() {
+        if !state.is_terminal() {
+            left.push(Span::styled(
+                format!("{} ", crate::tui::spinner::frame(app.now)),
+                Style::default().fg(run_colour(state)),
+            ));
         }
-        None => parts.push(Span::styled(
-            " 空闲 ",
-            Style::default().fg(Color::Black).bg(Color::DarkGray),
-        )),
+        // 一切正常的三个状态不写出来（见函数头上那段）。
+        if !matches!(state, RunState::Running | RunState::Completed) {
+            left.push(Span::styled(
+                format!("{} ", status_text(state)),
+                Style::default()
+                    .fg(run_colour(state))
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if let Some(reason) = app.run_wait() {
+            left.push(Span::styled(
+                format!("{} ", crate::tui::app::wait_text(reason, app.now)),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        if let Some(elapsed) = app.elapsed() {
+            left.push(Span::styled(
+                pretty_duration(elapsed),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
     }
-
-    if let Some(elapsed) = app.elapsed() {
-        parts.push(Span::raw(format!(" {} ", pretty_duration(elapsed))));
-    }
-
-    let model = app
-        .run_meta()
-        .and_then(|meta| meta.model.clone())
-        .or_else(|| app.model.clone())
-        .unwrap_or_else(|| "默认模型".into());
-    let effort = app
-        .run_meta()
-        .and_then(|meta| meta.effort.as_ref().and_then(|e| e.as_option().cloned()))
-        .or_else(|| app.effort.clone())
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| "服务端默认".into());
-    parts.push(Span::styled(
-        format!("· {model} / {effort} "),
+    let mut right: Vec<Span<'static>> = Vec::new();
+    right.push(Span::styled(
+        app.model_label(),
         Style::default().fg(Color::Gray),
     ));
 
     let connection = &app.connection;
-    parts.push(Span::styled(
-        format!("· {} ", connection.label()),
+    right.push(Span::styled(
+        format!(" · {}", connection.label()),
         Style::default().fg(if connection.is_connected() {
             Color::Green
         } else {
@@ -244,24 +233,68 @@ fn status_line(app: &App) -> Paragraph<'static> {
         }),
     ));
 
-    if app.pending_count() > 0 {
-        // 三类合计（§7.5）：状态行只报"有几条在等人"，哪一种在哪一条由清单与提示行说。
-        parts.push(Span::styled(
-            format!("· 待处理 {} ", app.pending_count()),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    // 会话 Id 只在开场那条横幅上（[`banner`]）与退出那行命令里出现，这里只留"怎么打开
-    // 的"——一行状态挤不下一个 UUID，挤进去只会把前面那些真会变的东西顶掉。
-    parts.push(Span::styled(
-        format!("· komo · {}", app.mode.label()),
+    right.push(Span::styled(
+        format!(
+            " · ↑{} ↓{}",
+            compact(app.tokens_in),
+            compact(app.tokens_out)
+        ),
         Style::default().fg(Color::DarkGray),
     ));
 
-    Paragraph::new(Line::from(parts))
+    if app.pending_count() > 0 {
+        // 有人在等回答——这一格不属于"这一摊是什么"，它是此刻最要紧的事，所以顶在左边。
+        left.insert(
+            0,
+            Span::styled(
+                format!(" 待处理 {} ", app.pending_count()),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        );
+    }
+
+    Paragraph::new(Line::from(justify(left, right, width)))
+}
+
+/// 左一摞、右一摞，中间用空格撑开到 `width`。
+///
+/// 放不下就**截左边**：右边那三格是固定要看的东西，左边那句话截掉的是后半段。
+fn justify(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
+    let width = width as usize;
+    let right_width: usize = right.iter().map(|span| span.width()).sum();
+    let room = width.saturating_sub(right_width);
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in left {
+        let left_room = room.saturating_sub(used);
+        if left_room == 0 {
+            break;
+        }
+        let text = markdown::truncate_to_width(span.content.as_ref(), left_room);
+        if text.is_empty() {
+            continue;
+        }
+        used += markdown::display_width(&text);
+        out.push(Span::styled(text, span.style));
+    }
+    out.push(Span::raw(" ".repeat(room.saturating_sub(used))));
+    out.extend(right);
+    out
+}
+
+/// 一个大数写短一点：`980` · `12.3k` · `1.4M`。
+fn compact(count: u64) -> String {
+    if count < 1_000 {
+        count.to_string()
+    } else if count < 1_000_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        format!("{:.1}M", count as f64 / 1_000_000.0)
+    }
 }
 
 /// 开场横幅：进 TUI 时印一次，之后它就是终端回滚区里普通的两行。
@@ -428,7 +461,7 @@ fn draw_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(lines), menu);
     }
 
-    frame.render_widget(status_line(app), chunks[1]);
+    frame.render_widget(status_line(app, area.width), chunks[1]);
 }
 
 /// 菜单的每一行：高亮那一行是实心色块，其余是灰的；行尾挂着它的直通键。
@@ -740,13 +773,10 @@ fn main() {
         assert_eq!(rows.len(), 24);
         assert_within(&rows, 80);
         let screen = rows.join("\n");
-        assert!(screen.contains("chat-a"), "{screen}");
-        assert!(screen.contains("high"), "{screen}");
-        assert!(screen.contains("已连接"), "{screen}");
-        assert!(
-            screen.contains("新会话"),
-            "状态行上说得出这个界面是怎么开的：{screen}"
-        );
+        // 状态行右边固定这三格，别的都不占地方。
+        assert!(screen.contains("chat-a"), "模型：{screen}");
+        assert!(screen.contains("已连接"), "连接：{screen}");
+        assert!(screen.contains("↑"), "这一段花了多少 token：{screen}");
         assert!(screen.contains("Enter 发送"), "{screen}");
     }
 
@@ -809,6 +839,43 @@ fn main() {
             crate::tui::spinner::FRAME_MS as i64 * crate::tui::spinner::FRAMES.len() as i64,
         );
         assert_eq!(first, full);
+    }
+
+    /// 状态行右边那三格**贴着右边对齐**，位置不动——眼睛不用每次重新找。
+    #[test]
+    fn the_three_fields_on_the_right_stay_put() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &fixture::conversation());
+        app.apply(ServerEvent::Connection(ConnectionState::Connected));
+
+        for width in [60u16, 100, 200] {
+            let rows = screen_rows(&app, width, 20);
+            let status = rows
+                .iter()
+                .find(|row| row.contains("已连接"))
+                .unwrap_or_else(|| panic!("{width} 列下找不到状态行：{rows:?}"));
+            assert_eq!(
+                markdown::display_width(status),
+                width as usize,
+                "{width} 列：右边那三格要顶到最右边——{status:?}"
+            );
+            assert!(status.contains("chat-a"), "{status}");
+            assert!(status.contains("↑"), "{status}");
+        }
+    }
+
+    /// 这一段对话花了多少 token 是**累加**出来的：模型每答一轮报一次。
+    #[test]
+    fn the_token_count_adds_up_over_the_session() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        assert_eq!((app.tokens_in, app.tokens_out), (0, 0));
+        feed(&mut app, &fixture::conversation());
+        assert!(app.tokens_in > 0, "答过话就该有数");
+
+        // 同一条事件再来一遍（补读与订阅万一重叠）不许加两遍。
+        let before = (app.tokens_in, app.tokens_out);
+        feed(&mut app, &fixture::conversation());
+        assert_eq!((app.tokens_in, app.tokens_out), before);
     }
 
     /// **一切正常的时候状态行不说话。**

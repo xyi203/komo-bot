@@ -13,6 +13,7 @@ use crate::types::ids::{OperationId, SessionId};
 use crate::types::plan::{ExecutionPlan, Proof, RecoveryMode};
 
 mod approvals;
+mod config;
 mod cron;
 mod ledger;
 mod memory;
@@ -25,6 +26,7 @@ mod tests;
 mod zones;
 
 pub use approvals::MemApprovalRepo;
+pub use config::snapshot_fixture;
 pub use cron::MemCronRepo;
 pub use ledger::MemLedger;
 pub use memory::MemMemoryRepo;

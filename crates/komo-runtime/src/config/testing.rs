@@ -1,17 +1,6 @@
 //! 配置测试的公用夹具。
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-
-use komo_kernel::policy::RuleTable;
-use komo_kernel::protocol::config::{
-    ChannelConfig, ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig,
-    StartOnly, TypesafeConfig,
-};
-use komo_kernel::types::agent::{AgentConfig, AgentProfile};
-use komo_kernel::types::chat::PeerId;
-use komo_kernel::types::digest::ContentHash;
-use komo_kernel::types::model::{CatalogModel, Effort, EmbeddingConfig, ModelCatalog, ModelConfig};
+use std::path::Path;
 
 use super::{ConfigHolder, LoadOptions, Sources};
 
@@ -153,112 +142,6 @@ writable = false
 "#;
 }
 
-fn model(provider: &str, name: &str, key_env: &str, effort: Option<&str>) -> ModelConfig {
-    ModelConfig {
-        provider: provider.into(),
-        base_url: "https://llm.example.com/v1".into(),
-        model: name.into(),
-        api_key_env: key_env.into(),
-        effort: effort.map(Effort::new),
-        efforts: None,
-        timeout_secs: 120,
-    }
-}
-
-/// 一份**校验得过**的内存快照，给 `validate` 的测试用。
-pub fn snapshot_fixture() -> ConfigSnapshot {
-    let home = PathBuf::from("/home/u/.komo");
-    let main = model("responses", "chat-a", "KOMO_LLM_API_KEY", Some("medium"));
-    let memory_model = model("responses", "memory-a", "KOMO_MEMORY_API_KEY", Some("low"));
-    let embedding = EmbeddingConfig {
-        model: model("embeddings", "embed-a", "KOMO_EMBEDDING_API_KEY", None),
-        revision: None,
-        dimensions: Some(1024),
-        document_prefix: None,
-        query_prefix: None,
-    };
-    let model_catalog = ModelCatalog {
-        default: "chat".into(),
-        entries: BTreeMap::from([
-            (
-                "chat".into(),
-                CatalogModel::Completion {
-                    name: "chat".into(),
-                    model_provider: Some("openrouter".into()),
-                    context_window: None,
-                    config: main.clone(),
-                },
-            ),
-            (
-                "memory".into(),
-                CatalogModel::Completion {
-                    name: "memory".into(),
-                    model_provider: None,
-                    context_window: None,
-                    config: memory_model.clone(),
-                },
-            ),
-            (
-                "embedding".into(),
-                CatalogModel::Embedding {
-                    name: "embedding".into(),
-                    model_provider: None,
-                    config: embedding.clone(),
-                },
-            ),
-        ]),
-    };
-    ConfigSnapshot {
-        execution: Default::default(),
-        start_only: StartOnly {
-            data_dir: home.clone(),
-            listen: super::DEFAULT_LISTEN.into(),
-            db_path: home.join("state.db"),
-            python_env_root: home.join("python-envs"),
-        },
-        model_catalog,
-        model: main,
-        memory: MemoryConfig {
-            enabled: true,
-            model: memory_model,
-            embedding: Some(embedding),
-            retrieval: RetrievalConfig::default(),
-        },
-        agent: AgentConfig {
-            default_agent: "assistant".into(),
-            agents: std::collections::BTreeMap::from([(
-                "assistant".into(),
-                AgentProfile::new("assistant"),
-            )]),
-        },
-        typesafe: TypesafeConfig::default(),
-        channels: ChannelsConfig {
-            feishu: ChannelConfig {
-                enabled: true,
-                allow_from: vec![PeerId::new("ou_operator")],
-                home_chat: Some(PeerId::new("oc_home")),
-                groups: vec![],
-            },
-            telegram: ChannelConfig::default(),
-            wechat: ChannelConfig::default(),
-        },
-        policy: RuleTable::initial(),
-        paths: PathsConfig {
-            sessions_dir: home.join("sessions"),
-            toolbox_dir: home.join("toolbox"),
-            skill_dirs: vec![home.join("skills")],
-            runtime_dir: home.join("runtime"),
-            logs_dir: home.join("logs"),
-            workspaces_dir: home.join("workspaces"),
-        },
-        credentials: BTreeMap::from([
-            ("KOMO_LLM_API_KEY".into(), ContentHash::of_str("a")),
-            ("KOMO_MEMORY_API_KEY".into(), ContentHash::of_str("b")),
-            ("KOMO_EMBEDDING_API_KEY".into(), ContentHash::of_str("c")),
-            ("FEISHU_APP_ID".into(), ContentHash::of_str("d")),
-            ("FEISHU_APP_SECRET".into(), ContentHash::of_str("e")),
-        ]),
-        loaded_at: time::macros::datetime!(2026-09-15 08:00:00 UTC),
-        sources: vec![],
-    }
-}
+/// 跨 crate 的测试替身按 §13.4 住在 kernel 的 `test-support` 里（`komo-agent` 的测试也
+/// 要它）。这里只转一道，保持 `crate::config::testing::snapshot_fixture` 的调用点不动。
+pub use komo_kernel::test_support::snapshot_fixture;

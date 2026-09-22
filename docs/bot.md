@@ -427,6 +427,7 @@ TargetRef
 | ---------------- | ------------------------------------------------------------------ | ------------------------------------------------------ |
 | **0：固定现有行为**     | 打通会话工作目录的持久化与读取；保留现有回放、审批、恢复回归测试                                   | 指定目录创建会话后，首次执行与重启恢复使用同一目录                              |
 | **1：拆执行与能力边界**   | 引入默认 AgentSurface；工具 schema 与实际查找统一使用它；收口进程和核对授权接口；抽出 `komo-agent` | 默认行为不变；不在 Surface 的工具无法调用；Runtime 不依赖 Agent crate      |
+| **1（续，2026-09-22 已做）** | `crates/komo-agent` 新建，只依赖 kernel：`skills/`（发现与目录）自 runtime 搬入，`surface_of` + `DELEGATE_TOOL` 自 gateway 搬入；`snapshot_fixture` 归入 kernel `test-support`；值类型留 kernel（事件/协议/store 按它们落盘）；`cargo tree` 确认 runtime 不见 agent | 同左（2026-09-22 本机：全量通过，只剩 `chat::skills::the_system_prompt_lists_the_skills_the_model_can_read` 一处失败——干净 HEAD 同样挂，是测试把 `platforms: [macos]` 写死成"本机非 mac"的假设，macOS 上必然命中，与本次拆分无关） |
 | **2：支持多个 Agent** | AgentProfile、Session 归属、按 Agent 的主会话、RunSnapshot、记忆作用域和入口路由        | 两个 Agent 的提示、工具、目录、历史不串用；审批等待期间修改 Profile，旧 Run 不被静默替换 |
 | **3：资源命名空间**     | `skill/tool/artifact` 只读入口，扩展 `read/rg`，执行计划识别资源目标                 | 本地路径兼容；资源越权被拒；产物引用在重启后仍可读                              |
 | **独立批次：工具并发**    | 在第 1 批之后增加有界只读并发                                                   | 顺序屏障成立；取消能收尾；故障恢复不重复已完成调用                              |

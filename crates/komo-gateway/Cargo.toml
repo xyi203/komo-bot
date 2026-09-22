@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 komo-kernel = { workspace = true }
 komo-runtime = { workspace = true }
+komo-agent = { workspace = true }
 # 只用 store 的构造函数与 repo 类型（Db / Coordinator / Turso*Repo / RecoveryStore），不碰 toasty 类型。
 komo-store = { workspace = true }
 axum = { workspace = true }

@@ -1,0 +1,19 @@
+[package]
+name = "komo-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# §13.4：Agent 的身份、能力与上下文装配（`docs/bot.md` 批次 1）。只依赖 kernel——
+# 描述"要做什么"（能力面选择、skill 发现与目录），不执行；`runtime` 不依赖它，
+# Gateway 组装两边。值类型（`AgentProfile` / `AgentSurface` / `RunSnapshot`）留在
+# kernel：事件、协议与 store 模型都按它们落盘，搬出来会把依赖指反。
+[dependencies]
+komo-kernel = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+komo-kernel = { workspace = true, features = ["test-support"] }
+tempfile = { workspace = true }

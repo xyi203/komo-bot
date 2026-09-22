@@ -41,7 +41,10 @@ komo-store     session_log (JSONL) · payloads · tool_output · Turso Db + toas
                The only crate that sees toasty/turso.
 komo-runtime   agent loop · executor · tools/{read,write,edit,rg,shell,python} ·
                python_runtime · policy · approvals · memory · llm · embedding ·
-               scheduler · recovery · skills · config.
+               scheduler · recovery · config.
+komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名。
+               只依赖 kernel，不执行；runtime 不依赖它，Gateway 组装两边。
+               值类型（AgentProfile/AgentSurface/RunSnapshot）留在 kernel。
 komo-gateway   axum routes · SSE · auth · lock/discovery · launchd/systemd ·
                Dispatcher · channels/{feishu,telegram,wechat} (feature-gated) ·
                Notifier · deliveries · approval rendering · config reload.
@@ -50,9 +53,10 @@ komo-client    HTTP + SSE client · discovery · ratatui TUI · command output.
 komo (bin)     clap dispatch only.
 ```
 
-Dependencies point downward only: `kernel ← store ← runtime ← gateway` and
-`kernel ← client`, meeting in the bin. `gateway` never sees toasty or ratatui;
-`runtime` never sees axum; `client` knows only protocol types.
+Dependencies point downward only: `kernel ← store ← runtime ← gateway`,
+`kernel ← agent ← gateway`, and `kernel ← client`, meeting in the bin.
+`gateway` never sees toasty or ratatui; `runtime` never sees axum and never
+depends on `agent`; `client` knows only protocol types.
 
 ## Rules that are structural, not stylistic
 

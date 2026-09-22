@@ -2261,6 +2261,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "komo-agent"
+version = "0.8.0"
+dependencies = [
+ "komo-kernel",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "komo-client"
 version = "0.8.0"
 dependencies = [
@@ -2291,6 +2301,7 @@ dependencies = [
  "axum",
  "bytes",
  "futures-util",
+ "komo-agent",
  "komo-client",
  "komo-gateway",
  "komo-kernel",

@@ -13,13 +13,13 @@ pub mod render;
 pub mod service;
 pub mod sse;
 
-/// bin 要的两样**不经 Gateway** 的东西（§3 的命令表：`komo channel list|probe` 与
+/// bin 要的几样**不经 Gateway** 的东西（§3 的命令表：`komo channel list|probe` 与
 /// `komo skills *` 只读文件系统与配置）。
 ///
-/// 从这里再导一次，而不是让 bin 直接依赖 `komo-runtime`：§13.4 给 bin 的依赖是
-/// client / gateway / clap 三条，加第四条会把二进制挪到另一条依赖边上。
+/// 从这里再导一次，而不是让 bin 直接依赖 `komo-runtime` / `komo-agent`：§13.4 给 bin
+/// 的依赖是 client / gateway / clap 三条，加更多会把二进制挪到另一条依赖边上。
+pub use komo_agent::skills;
 pub use komo_runtime::config;
-pub use komo_runtime::skills;
 /// `komo toolbox` 的那几个类型（§5.3）。同一个理由：bin 的依赖是 client / gateway /
 /// clap 三条，不加第四条。
 pub use komo_runtime::toolbox;

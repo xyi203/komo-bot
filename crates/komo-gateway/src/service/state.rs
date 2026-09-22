@@ -352,7 +352,7 @@ pub struct GatewayState {
     /// 存的是注册表而不是渲染好的那一段文本：文本按用途现渲染（系统提示一处、`skill://`
     /// 的挂载点一处），**事实只有这一份**——存一份字符串就是第二份事实，它会和这一份
     /// 各走各的。注册表每次查询重扫目录（§5.6），所以"人改了 SKILL.md"不必重启。
-    pub skills: Arc<std::sync::RwLock<komo_runtime::skills::SkillRegistry>>,
+    pub skills: Arc<std::sync::RwLock<komo_agent::skills::SkillRegistry>>,
     pub supervisor: Arc<super::channels::ChannelSupervisor>,
     /// Dispatcher。**构造之后才填**：它握着这份状态，反过来也要被渠道拿到。
     pub inbound: std::sync::OnceLock<Arc<dyn komo_kernel::traits::Inbound>>,
@@ -969,7 +969,7 @@ impl GatewayState {
         // 能力面：Profile 在**这份工具目录**里挑出来的那一份（§4 末）。名字写了、目录里
         // 没有的名字**不算数**，而且必须报出来——静默采纳一份写错的配置，等于让操作者
         // 以为某个工具给了而其实没给。
-        let surface = super::surface_of(
+        let surface = komo_agent::surface_of(
             profile,
             &self.tool_names,
             &super::agent_config_file(&self.config),
@@ -1634,12 +1634,12 @@ fn build_reranker(
 fn skills_registry(
     snapshot: &ConfigSnapshot,
     shared_home: Option<&std::path::Path>,
-) -> komo_runtime::skills::SkillRegistry {
+) -> komo_agent::skills::SkillRegistry {
     let home = match shared_home {
         Some(home) => Some(home.to_path_buf()),
         None => komo_runtime::config::user_home().ok(),
     };
-    komo_runtime::skills::SkillRegistry::from_snapshot(
+    komo_agent::skills::SkillRegistry::from_snapshot(
         snapshot,
         Some(&snapshot.paths.workspaces_dir),
         home.as_deref(),
@@ -1651,11 +1651,11 @@ fn skills_registry(
 /// 现渲染而不是存一段文本：存的字符串是第二份事实，它和注册表会各走各的——而这一块本来
 /// 就是"这一刻有哪些 skill 能露面"的答案。
 pub(crate) fn skills_block(
-    registry: &komo_runtime::skills::SkillRegistry,
+    registry: &komo_agent::skills::SkillRegistry,
     tool_names: &[String],
 ) -> String {
     registry
-        .prompt_block(&komo_runtime::skills::OfferContext::here(
+        .prompt_block(&komo_agent::skills::OfferContext::here(
             tool_names.iter().cloned(),
         ))
         .unwrap_or_default()

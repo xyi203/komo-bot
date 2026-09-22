@@ -553,34 +553,6 @@ pub fn python_env(
     python
 }
 
-/// 工具名。**两处共用它**：注册（[`build_tools`]）与"子代理不再拿到它"（`segment` 里摘掉
-/// 的那一个，§4 的深度只有一层）。写在注册点旁边，另有一处测试钉住它与
-/// [`DelegateTool`] 自报的名字一致——两处各写一个字面量迟早会漂。
-pub const DELEGATE_TOOL: &str = "delegate";
-
-/// 一份 Profile 在**这份工具目录**里挑出来的能力面（§4 末）。
-///
-/// 目录里没有的名字**不算数**，而且必须报出来：静默采纳一份写错的配置，等于让操作者以为
-/// 某个工具给了、其实没给——而这句话只有一处说得准，所以受理时（冻结快照）与没有快照时的
-/// 兜底装配共用它。
-pub fn surface_of(
-    profile: &komo_kernel::types::agent::AgentProfile,
-    catalog: &[String],
-    file: &std::path::Path,
-) -> komo_kernel::types::surface::AgentSurface {
-    let (surface, unknown) = profile.surface(catalog);
-    if !unknown.is_empty() {
-        tracing::warn!(
-            file = %file.display(),
-            agent = %profile.id,
-            unknown = %unknown.join("、"),
-            catalog = %catalog.join("、"),
-            "`[agents]` 里写了工具目录里没有的名字，它们不算数（能力面只留真的装着的那些）"
-        );
-    }
-    surface
-}
-
 /// Agent 配置在哪个文件里（`[agents.<id>]` 的出处，日志里要说清是"谁写的配置"）。
 pub fn agent_config_file(config: &ConfigHolder) -> PathBuf {
     config.home().join("config.toml")

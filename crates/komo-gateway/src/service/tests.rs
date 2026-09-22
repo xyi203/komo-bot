@@ -1417,7 +1417,7 @@ fn delegation_script(task: &str, child_text: &str) -> Arc<FakeLlm> {
         vec![call_round(
             1,
             "pc-1",
-            crate::service::DELEGATE_TOOL,
+            komo_agent::DELEGATE_TOOL,
             serde_json::json!({
                 "task": task,
                 "output_schema": {
@@ -1706,7 +1706,7 @@ async fn a_child_gets_only_its_task_and_its_rounds_stay_out_of_the_parent() {
         parent_first
             .tools
             .iter()
-            .any(|tool| tool.name == crate::service::DELEGATE_TOOL),
+            .any(|tool| tool.name == komo_agent::DELEGATE_TOOL),
         "父要看得见 delegate"
     );
     assert_eq!(
@@ -1739,7 +1739,7 @@ async fn a_child_gets_only_its_task_and_its_rounds_stay_out_of_the_parent() {
         !child
             .tools
             .iter()
-            .any(|tool| tool.name == crate::service::DELEGATE_TOOL),
+            .any(|tool| tool.name == komo_agent::DELEGATE_TOOL),
         "深度只有一层：子代理不该再看见 delegate"
     );
 
@@ -1842,6 +1842,6 @@ fn the_delegate_tool_name_matches_the_registry() {
 
     assert_eq!(
         komo_runtime::tools::DelegateTool::new().definition().name,
-        crate::service::DELEGATE_TOOL
+        komo_agent::DELEGATE_TOOL
     );
 }

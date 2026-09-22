@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use komo_agent::DELEGATE_TOOL;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::{Surface, SurfaceMessage, fold};
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
@@ -49,7 +50,6 @@ use komo_runtime::tools::paths;
 use komo_store::db::store_to_ledger;
 use komo_store::{CheckpointStore, Db, PayloadStore, RecoveryStore};
 
-use super::DELEGATE_TOOL;
 use super::ledgers::RoutedLedger;
 
 /// 装配执行段，并持有每个 Run 的取消开关。
@@ -82,7 +82,7 @@ pub struct GatewaySegments {
     ///
     /// 提示里的那一块目录行**每次装配现渲染**（[`Self::skills_block`]），`skill://` 的挂载点
     /// 也从这里抄——两处同一个来源，"提示里看见的名字读不到"就不是一种可能了。
-    skills: Option<Arc<std::sync::RwLock<komo_runtime::skills::SkillRegistry>>>,
+    skills: Option<Arc<std::sync::RwLock<komo_agent::skills::SkillRegistry>>>,
     /// 执行器。**只用来渲染交给模型的工具 Schema**（[`ToolExecutor::definitions_for`]）：
     /// 能力面已经由冻结快照（或它的兜底）给出，"这次能用哪些工具"的判据只有那一处，
     /// 这里不该再有一份。`None` = 精简装配（没有执行器的那几个单元测试）。
@@ -154,7 +154,7 @@ impl GatewaySegments {
     /// 接上 §5.6 那份活的 skill 注册表。
     pub fn with_skills(
         mut self,
-        skills: Arc<std::sync::RwLock<komo_runtime::skills::SkillRegistry>>,
+        skills: Arc<std::sync::RwLock<komo_agent::skills::SkillRegistry>>,
     ) -> Self {
         self.skills = Some(skills);
         self
@@ -639,7 +639,7 @@ impl GatewaySegments {
         let profile = config.as_ref().map(|config| config.agent.default_profile());
         let surface = match (profile, self.config.as_ref()) {
             (Some(profile), Some(holder)) => {
-                super::surface_of(profile, &names, &holder.home().join("config.toml"))
+                komo_agent::surface_of(profile, &names, &holder.home().join("config.toml"))
             }
             // 精简装配（没有配置快照）：这次能用的就是目录里装着的那些。
             _ => AgentSurface::new(names),

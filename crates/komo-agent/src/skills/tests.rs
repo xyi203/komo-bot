@@ -258,7 +258,7 @@ fn a_loose_file_in_the_skills_directory_is_not_a_skill() {
 /// §5.6 的搜索路径顺序。
 #[test]
 fn the_default_search_path_follows_the_documented_order() {
-    let mut snapshot = crate::config::testing::snapshot_fixture();
+    let mut snapshot = komo_kernel::test_support::snapshot_fixture();
     snapshot.paths.skill_dirs = vec![PathBuf::from("/configured/skills")];
     snapshot.start_only.data_dir = PathBuf::from("/home/u/.komo");
 
@@ -282,7 +282,7 @@ fn the_default_search_path_follows_the_documented_order() {
 
 #[test]
 fn the_same_directory_listed_twice_is_only_searched_once() {
-    let mut snapshot = crate::config::testing::snapshot_fixture();
+    let mut snapshot = komo_kernel::test_support::snapshot_fixture();
     snapshot.start_only.data_dir = PathBuf::from("/home/u/.komo");
     snapshot.paths.skill_dirs = vec![PathBuf::from("/home/u/.komo/skills")];
     let dirs = runtime_skill_dirs(&snapshot, None, None);

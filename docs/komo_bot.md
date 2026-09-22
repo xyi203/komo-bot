@@ -4,7 +4,7 @@
 
 本文定义一个全新项目。Komo 是程序名称；架构只依据本文的需求与约束。
 
-v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；工程结构改为六个 crate，编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，审批主要在聊天里完成（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env / policy.toml 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
+v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；工程结构改为七个 crate（2026-09-22 抽出 `komo-agent`），编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，审批主要在聊天里完成（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env / policy.toml 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
 
 ## 1. 已确定的范围
 
@@ -27,7 +27,7 @@ v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；�
 | 记忆检索 | 关键词与向量混合检索，索引保存在本机，可重建                                                     |
 | 模型配置 | 主模型、记忆整理模型、记忆向量模型分别配置；统一提供 effort 并按模型能力校验                     |
 | 聊天入口 | 飞书、Telegram、WeChat 首版都在，复用 Gateway 的会话、运行与审批接口；每个渠道一个 feature       |
-| 工程结构 | 六个 crate 按依赖重量与变更频率划分；冷编与增量编译时间是验收项                                  |
+| 工程结构 | 七个 crate 按依赖重量与变更频率划分；冷编与增量编译时间是验收项                                  |
 
 代码优化、HA、网页搜索、记事是工具组合的使用场景，不成为专用的 Rust 工具或 Runtime 业务类型。
 
@@ -1520,12 +1520,21 @@ komo-store     session_log（JSONL 写入器 / 范围读 / 尾部校验）、pay
 
 komo-runtime   agent loop、executor、tools/{read,write,edit,rg,shell,python}、python_runtime、
                policy（config → 规则）、approvals、memory（MemoryManager、索引、代次）、llm 与 embedding 适配器、
-               scheduler、recovery、skills、config。日常改动落在这里；它从不重新展开 toasty 宏。
-               deps: kernel, store, reqwest, tokio, grep + ignore（`rg` 工具）、arc-swap
+               scheduler、recovery、config。日常改动落在这里；它从不重新展开 toasty 宏。
+               deps: kernel, store, reqwest, tokio, grep + ignore（`rg` 工具）、arc-swap。
+               不依赖 komo-agent。
+
+komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次 1，2026-09-22 抽出）：
+               Profile → 能力面选择（`surface_of`，目录里没有的名字不算数）、skills 发现与
+               目录行（`SkillRegistry`，§5.6）、编排操作名（`DELEGATE_TOOL`）。只描述"要做
+               什么"，不执行；值类型（`AgentProfile` / `AgentSurface` / `RunSnapshot`）留在
+               kernel（事件、协议与 store 模型按它们落盘，搬出来会把依赖指反）。
+               deps: kernel, serde_json, tracing。
 
 komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件、launchd/systemd 集成、
                Dispatcher、飞书 / Telegram / WeChat 渠道、Notifier 实现、deliveries、审批消息渲染。
-               deps: kernel, runtime, axum, tower-http, reqwest, openlark(feature "feishu"), wechatbot(feature "wechat")
+               组装 runtime 与 agent（两者互不依赖）。
+               deps: kernel, runtime, agent, axum, tower-http, reqwest, openlark(feature "feishu"), wechatbot(feature "wechat")
 
 komo-client    HTTP + SSE 客户端、发现文件读取、ratatui 聊天 TUI（含审批弹窗、Markdown 渲染）、
                操作子命令的输出渲染。只依赖 kernel——不认识 store / runtime。
@@ -1536,14 +1545,15 @@ komo (bin)     clap 分发：`komo` / `komo resume` → client 的 TUI；操作�
                deps: client, gateway, clap, reqwest, flate2, tar
 ```
 
-依赖只向下，两条支线在 bin 汇合：
+依赖只向下，三条支线在 bin 汇合：
 
 ```text
 kernel ← store ← runtime ← gateway ─┐
+kernel ← agent ←──────── gateway ───┤
 kernel ← client ────────────────────┴─ komo (bin)
 ```
 
-`gateway` 看不到 toasty 类型（store 只通过 runtime 的构造函数暴露）也看不到 ratatui；`runtime` 看不到 axum；`client` 只认协议类型。改 TUI 不重编服务端，改服务端不重编 TUI；冷编时两条支线并行。什么时候再拆：runtime 里 memory 一旦超过 8k 行或引入自己的重依赖，拆成 `komo-memory`；触发条件是编译时间实测，不是模块数。
+`gateway` 看不到 toasty 类型（store 只通过 runtime 的构造函数暴露）也看不到 ratatui；`runtime` 看不到 axum，也**不依赖 agent**（装配是 gateway 的事）；`client` 只认协议类型。改 TUI 不重编服务端，改服务端不重编 TUI；冷编时三条支线并行。什么时候再拆：runtime 里 memory 一旦超过 8k 行或引入自己的重依赖，拆成 `komo-memory`；触发条件是编译时间实测，不是模块数。
 
 依赖清单与禁用项：
 

@@ -179,6 +179,14 @@ fn status_line(app: &App) -> Paragraph<'static> {
 
     match app.run_state() {
         Some(state) => {
+            // 还在跑的那一格是动的：一块静止的"运行中"分不出还在跑还是卡住了。状态词
+            // 留着——转圈说得出"它还活着"，说不出"它在排队还是在等审批"。
+            if !state.is_terminal() {
+                parts.push(Span::styled(
+                    format!(" {}", crate::tui::spinner::frame(app.now)),
+                    Style::default().fg(run_colour(state)),
+                ));
+            }
             parts.push(Span::styled(
                 format!(" {} ", status_text(state)),
                 Style::default()
@@ -758,11 +766,11 @@ fn main() {
         let app = conversation_app();
         let screen = screen(&app, 100, 40);
         assert!(screen.contains("shell rm -rf build"), "{screen}");
-        assert!(screen.contains("ok shell"), "{screen}");
+        assert!(screen.contains("✔ shell"), "跑完了定住一个符号：{screen}");
     }
 
     #[test]
-    fn an_uncertain_call_shows_two_question_marks_on_screen() {
+    fn an_uncertain_call_gets_its_own_mark_not_the_failure_one() {
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         let mut events = fixture::conversation();
         if let EventPayload::ToolResult(body) = &mut events[6].payload {
@@ -770,7 +778,53 @@ fn main() {
         }
         feed(&mut app, &events[..7]);
         let screen = screen(&app, 100, 30);
-        assert!(screen.contains("?? shell"), "{screen}");
+        assert!(screen.contains("? shell"), "{screen}");
+        assert!(!screen.contains("✖ shell"), "uncertain 不是失败：{screen}");
+    }
+
+    /// **在跑的东西要动。** 一块静止的"运行中"分不出还在跑还是卡住了；转圈不用读就知道
+    /// 它还活着。这里断言的是"它真的会变"，不是它长什么样。
+    #[test]
+    fn a_running_turn_animates_on_the_status_line_and_the_tool_row() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        // 喂到「调用开跑」为止：Run 在跑，调用也在跑。
+        feed(&mut app, &fixture::conversation()[..5]);
+
+        let at = |app: &mut App, offset_ms: i64| {
+            app.apply(ServerEvent::Tick(
+                fixture::T0 + time::Duration::milliseconds(offset_ms),
+            ));
+            screen(app, 100, 20)
+        };
+        let first = at(&mut app, 0);
+        let next = at(&mut app, crate::tui::spinner::FRAME_MS as i64);
+        assert_ne!(first, next, "过了一帧，屏幕该变一下");
+
+        // 转一圈回到原处——变的只是那一格，不是整屏在抖。
+        let full = at(
+            &mut app,
+            crate::tui::spinner::FRAME_MS as i64 * crate::tui::spinner::FRAMES.len() as i64,
+        );
+        assert_eq!(first, full);
+    }
+
+    /// 落进回滚区的那一行**定住**：它是终端的了，不能带着某一帧随机的样子留在那里。
+    #[test]
+    fn a_finished_tool_row_stops_moving_once_it_lands() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &fixture::conversation());
+
+        let mut emitted = crate::tui::transcript::Emitted::new();
+        app.apply(ServerEvent::Tick(fixture::T0));
+        let settled = emitted.take(&app, 100);
+        let text: String = settled
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
+            .collect();
+        assert!(text.contains("✔ shell"), "跑完了是一个定住的符号：{text}");
+        for frame in crate::tui::spinner::FRAMES {
+            assert!(!text.contains(frame), "回滚区上不许有转圈的那一格：{text}");
+        }
     }
 
     /// 开场横幅把「这是谁、在哪、哪个会话」说一次，然后它就是回滚区里普通的一行。

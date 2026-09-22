@@ -790,7 +790,7 @@ fn the_conversation_folds_into_messages_and_tool_lines() {
     assert_eq!(tools[0].tool, "shell");
     assert_eq!(tools[0].summary(), "rm -rf build");
     assert_eq!(tools[0].state, ToolCallState::Completed);
-    assert_eq!(tools[0].marker(), "ok");
+    assert_eq!(tools[0].marker(None), "✔");
     assert_eq!(tools[0].preview.as_deref(), Some("removed 12 files"));
     assert_eq!(tools[0].elapsed_ms, 340);
     assert_eq!(tools[0].attempts, 1);
@@ -911,7 +911,7 @@ fn an_uncertain_call_is_marked_with_two_question_marks() {
     feed(&mut app, &events[..7]);
     let tools = app.tool_lines();
     assert_eq!(tools[0].state, ToolCallState::Uncertain);
-    assert_eq!(tools[0].marker(), "??", "既不是 ok 也不是 !!");
+    assert_eq!(tools[0].marker(None), "?", "既不是成功也不是失败那个符号");
 }
 
 #[test]
@@ -1131,7 +1131,18 @@ fn the_resume_summary_reads_like_the_design_doc_sentence() {
             "放行 rm -rf build？",
         )],
     };
-    assert_eq!(resume_summary(&response), "2 个任务已接续，1 个等待审批");
+    assert_eq!(
+        resume_summary(&response).as_deref(),
+        Some("2 个任务已接续，1 个等待审批")
+    );
+
+    // 没有未完成的任务是**默认情况**，不占一行——打开 TUI 先读一句"没事"没有意义。
+    let quiet = ResumeResponse {
+        session: fixture::session(),
+        resumed: vec![],
+        pending: vec![],
+    };
+    assert_eq!(resume_summary(&quiet), None);
 }
 
 #[test]

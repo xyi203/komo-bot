@@ -23,9 +23,10 @@ use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::turn::Role;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use time::OffsetDateTime;
 
 use crate::tui::app::{App, Notice, SubmissionState, ToolLine};
-use crate::tui::markdown;
+use crate::tui::{markdown, spinner};
 
 /// 用户那一条的行首记号。
 pub const USER_MARK: &str = "-> ";
@@ -70,7 +71,8 @@ impl Emitted {
                 continue;
             }
             self.tools.insert(tool.call.clone());
-            items.push((tool.seq, tool_lines(tool, app.tool_detail, width)));
+            // 交出去的行冻在纸上：**不给钟**，否则那一格会定格在某一帧随机的样子。
+            items.push((tool.seq, tool_lines(tool, app.tool_detail, width, None)));
         }
 
         items.sort_by_key(|(seq, _)| *seq);
@@ -127,7 +129,7 @@ impl Emitted {
         if let Some(draft) = &app.draft {
             lines.extend(markdown::render(&draft.text, width));
             lines.push(Line::from(Span::styled(
-                "▌生成中…",
+                format!("{} 生成中", spinner::frame(app.now)),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
             )));
         }
@@ -136,7 +138,7 @@ impl Emitted {
             if self.tools.contains(&tool.call) {
                 continue;
             }
-            lines.extend(tool_lines(tool, app.tool_detail, width));
+            lines.extend(tool_lines(tool, app.tool_detail, width, app.now));
         }
         lines
     }
@@ -182,9 +184,16 @@ fn message_lines(message: &SurfaceMessage, width: u16) -> Vec<Line<'static>> {
 }
 
 /// 一次工具调用的那一行（`detail` 打开时再加参数与结果预览）。
-pub fn tool_lines(tool: &ToolLine, detail: bool, width: u16) -> Vec<Line<'static>> {
+///
+/// `now` 是 `None` 就不转——那是要冻进回滚区的行。
+pub fn tool_lines(
+    tool: &ToolLine,
+    detail: bool,
+    width: u16,
+    now: Option<OffsetDateTime>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let head = format!("  {} {} {}", tool.marker(), tool.tool, tool.summary());
+    let head = format!("  {} {} {}", tool.marker(now), tool.tool, tool.summary());
     lines.push(Line::from(Span::styled(
         markdown::truncate_to_width(&head, width as usize),
         Style::default().fg(state_colour(tool.state)),

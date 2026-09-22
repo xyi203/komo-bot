@@ -241,14 +241,21 @@ impl ToolLine {
         }
     }
 
-    /// 状态标记。**`??` 是 uncertain**：副作用可能已经发生（§8.6），既不是成功也不是失败。
-    pub fn marker(&self) -> &'static str {
+    /// 行首那一格。
+    ///
+    /// **还在跑的那一格是动的**（[`crate::tui::spinner`]）：一块静止的文字只在它变的那
+    /// 一刻有信息，看久了分不清是还在跑还是卡住了。跑完了反过来——那时要的是一眼扫过去
+    /// 的结论，所以定住。
+    ///
+    /// **`?` 是 uncertain**：副作用可能已经发生（§8.6），既不是成功也不是失败，所以它
+    /// 不共用失败那个符号。
+    pub fn marker(&self, now: Option<OffsetDateTime>) -> &'static str {
         match self.state {
-            ToolCallState::Planned => "··",
-            ToolCallState::Started => "▶ ",
-            ToolCallState::Completed => "ok",
-            ToolCallState::Failed => "!!",
-            ToolCallState::Uncertain => "??",
+            ToolCallState::Planned => "·",
+            ToolCallState::Started => crate::tui::spinner::frame(now),
+            ToolCallState::Completed => "✔",
+            ToolCallState::Failed => "✖",
+            ToolCallState::Uncertain => "?",
         }
     }
 }
@@ -546,7 +553,7 @@ impl App {
         if self.phase.is_backfilling() {
             return "正在补读历史……".to_string();
         }
-        "Enter 发送 · Ctrl-J 换行 · Ctrl-T 工具详情 · Ctrl-C 暂停 · / 看命令".to_string()
+        "Enter 发送 · Shift-Enter 换行 · Esc 停当前任务 · Ctrl-C 退出 · / 看命令".to_string()
     }
 
     /// 命令面板的候选。
@@ -609,7 +616,7 @@ fn blank_tool(call: ToolCallId, run: Option<RunId>, seq: Seq) -> ToolLine {
 ///
 /// 待处理按 §7.5 的三类分开数——三类要的操作者做的是不同的事，合成一个数只说得出"有
 /// 事没完"。
-pub fn resume_summary(response: &ResumeResponse) -> String {
+pub fn resume_summary(response: &ResumeResponse) -> Option<String> {
     let resumed = response.resumed.len();
     let mut approvals = 0;
     let mut verify = 0;
@@ -634,11 +641,8 @@ pub fn resume_summary(response: &ResumeResponse) -> String {
     if blocked > 0 {
         parts.push(format!("{blocked} 个阻塞"));
     }
-    if parts.is_empty() {
-        "没有未完成的任务".to_string()
-    } else {
-        parts.join("，")
-    }
+    // 没有未完成的任务是默认情况，不说话。
+    (!parts.is_empty()).then(|| parts.join("，"))
 }
 
 /// `/status` 那一行。

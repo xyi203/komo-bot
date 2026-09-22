@@ -129,11 +129,12 @@ fn verdict_options() -> String {
 /// `/help` 里那一段按键说明。**输入框的提示行挂不下这些**：窄终端上边框标题会被截，
 /// 而截掉的那半段正是人没见过、因而永远不会去按的那些。
 pub const KEYS: &[&str] = &[
-    "按键  Enter 发送 · Ctrl-J / Shift-Enter / Alt-Enter 换行",
+    "按键  Enter 发送 · Shift-Enter / Alt-Enter 换行（终端不认就用 Ctrl-J）",
     "按键  Ctrl-W 删一个词 · Ctrl-U 删到行首 · Ctrl-K 删到行尾 · Delete 往后删",
     "按键  Alt-← / Alt-→（或 Ctrl-←/→）按词移动 · Home/End 行首行尾 · Ctrl-Home/End 全文首尾",
     "按键  ↑ / ↓ 在多行草稿里走行，走到头了才翻历史 · Tab 补全命令",
-    "按键  Ctrl-T 工具详情 · Esc 取消在跑的 Run · Ctrl-C 退出（Run 照跑）",
+    "按键  Esc 停掉当前任务 · Ctrl-C 退出 TUI（任务留在 Gateway 里照跑）",
+    "按键  Ctrl-T 工具详情（管之后印出来的那些）",
 ];
 
 pub const COMMANDS: [(&str, &str); 11] = [

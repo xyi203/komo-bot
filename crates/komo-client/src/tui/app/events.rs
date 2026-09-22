@@ -33,9 +33,8 @@ impl App {
                 Vec::new()
             }
             ServerEvent::HistoryDone => {
-                if let Phase::Backfilling { events } = self.phase {
-                    self.note(format!("补读了 {events} 条事件"));
-                }
+                // 补读了几条不用报：正在补读这件事状态行上说过了，读完了屏幕上就是那段
+                // 历史本身——再补一句「补读了 33 条事件」，是让人读一个他已经看见的事实。
                 self.phase = Phase::Interactive;
                 // §8.8：等待审批的 Run 打开即弹。清单是**问来的**——待处理审批可以属于
                 // 别的会话（定时任务、聊天里那条），本会话的事件流里没有它们。
@@ -127,7 +126,11 @@ impl App {
                 self.open_next_pending()
             }
             ServerEvent::Resumed(response) => {
-                self.note(resume_summary(&response));
+                // 「没有未完成的任务」是**默认情况**，不值得占一行：§8.8 要的是"2 个任务
+                // 已接续，1 个等待审批"那种真有事的时候说得出话。
+                if let Some(summary) = resume_summary(&response) {
+                    self.note(summary);
+                }
                 // 「1 个等待审批」——问一次清单，有的话接着就弹（§8.8）。
                 vec![Effect::FetchPending]
             }

@@ -10,6 +10,7 @@ pub mod command;
 pub mod markdown;
 pub mod paste;
 pub mod render;
+pub mod spinner;
 pub mod transcript;
 
 #[cfg(test)]
@@ -57,8 +58,11 @@ use crate::tui::transcript::Emitted;
 
 /// 补读历史时一页取多少条。
 const BACKFILL_PAGE: u32 = 500;
-/// 状态行上的耗时靠它走动。
-const TICK: Duration = Duration::from_millis(250);
+/// 状态行上的耗时与转圈靠它走动。
+///
+/// 比一帧（[`spinner::FRAME_MS`]）快一点，转圈才不会一卡一卡的。一拍只重画底下那一小块
+/// 视口，而且 ratatui 只写真的变了的格子——没在跑的时候这一拍什么字节都不发。
+const TICK: Duration = Duration::from_millis(80);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
@@ -112,6 +116,12 @@ pub async fn run_tui(
     // §13.3 要求「不支持的 effort 在请求前拒绝」——拿不到清单只是退到内建白名单，
     // 不是让人在发出请求之后才发现。
     if let Ok(models) = client.models().await {
+        // **这一问答上了就是连上了。** 事件流要有会话才订得了，而裸 `komo` 的第一条消息
+        // 之前没有会话——状态行上那句"连接中"于是会一直挂到人发出第一句话，说的却是一件
+        // 早就成立的事：网关就在那儿，刚刚还答了话。
+        let _ = events_tx
+            .send(ServerEvent::Connection(ConnectionState::Connected))
+            .await;
         let _ = events_tx.send(ServerEvent::ModelMenu(models.models)).await;
     }
 
@@ -580,7 +590,7 @@ impl TerminalGuard {
         let want = render::viewport_height(app, width, max_viewport(size), 0).max(1);
         // 全程唯一一次问终端"光标在第几行"（见类型上的那段注释）。
         let row = crossterm::cursor::position()?.1;
-        let view = reserve(row, want, size)?;
+        let (view, gap) = reserve(row, want, size)?;
 
         let terminal = Terminal::with_options(
             CrosstermBackend::new(stdout),
@@ -591,7 +601,7 @@ impl TerminalGuard {
         Ok(TerminalGuard {
             terminal,
             view,
-            gap: 0,
+            gap,
             size,
         })
     }
@@ -644,19 +654,22 @@ impl TerminalGuard {
         for line in &lines {
             write_line(out, line, width)?;
         }
-        // **`height - 1` 个换行，不是 `height` 个**：最后一个换行会把光标推到视口下面
-        // 一行，屏幕跟着多滚一次，视口上面于是留下一条再也填不回去的空行。打到视口的
-        // 最后一行为止就够了。
-        for _ in 1..self.view.height {
+        // 正文之后补到底边为止，视口于是还在它该在的地方（贴底）。正文短得够不着底时，
+        // 中间空出来的那几行记成空档——**不是丢掉**：下一段正文从空档的顶上开始写，历史
+        // 与输入框之间不会留一道越来越宽的缝。
+        //
+        // 只打到视口的**最后一行**为止（`height - 1` 个换行，不是 `height` 个）：多打
+        // 一个，光标会被推到视口下面一行，屏幕跟着多滚一次。
+        let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let top = self.size.height.saturating_sub(self.view.height);
+        let gap = top.saturating_sub(start.saturating_add(rows));
+        for _ in 1..self.view.height.saturating_add(gap) {
             queue!(out, Print("\r\n"))?;
         }
         out.flush()?;
 
-        self.gap = 0;
-        let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
-        self.view.y = start
-            .saturating_add(rows)
-            .min(self.size.height.saturating_sub(self.view.height));
+        self.gap = gap;
+        self.view.y = top;
         // `Fixed` 的 resize 只换区域、清视口、把后备缓冲清零逼下一帧全画——**不问光标**。
         self.terminal.resize(self.view)
     }
@@ -682,16 +695,13 @@ impl TerminalGuard {
             self.gap += shrink;
             self.view.y += shrink;
         } else {
+            // 视口贴着底边（[`reserve`] 与 [`Self::commit`] 都维持这一条），所以底下
+            // 没有空地可用：长高只能往上要——先要空档，空档不够才让屏幕往上滚。
             let grow = want - self.view.height;
-            let below = self
-                .size
-                .height
-                .saturating_sub(self.view.y + self.view.height);
-            let rest = grow.saturating_sub(below);
-            let from_gap = rest.min(self.gap);
+            let from_gap = grow.min(self.gap);
             self.gap -= from_gap;
             self.view.y -= from_gap;
-            let scroll = rest - from_gap;
+            let scroll = grow - from_gap;
             if scroll > 0 {
                 queue!(out, MoveTo(0, self.size.height.saturating_sub(1)))?;
                 for _ in 0..scroll {
@@ -730,22 +740,23 @@ fn max_viewport(size: Size) -> u16 {
 ///
 /// 下面放不下就让终端往上滚——滚走的是终端自己的历史，进它的回滚区，一行都没丢。这与
 /// ratatui 给 inline 视口算位置的做法是同一套算术，只是这里算完之后**位置归我们记**。
-fn reserve(row: u16, height: u16, size: Size) -> Result<Rect, std::io::Error> {
+fn reserve(row: u16, height: u16, size: Size) -> Result<(Rect, u16), std::io::Error> {
     let height = height.clamp(1, size.height.max(1));
+    let top = size.height - height;
     let mut out = std::io::stdout();
-    let after = height - 1;
-    for _ in 0..after {
-        queue!(out, Print("\r\n"))?;
-    }
-    out.flush()?;
-    let available = size.height.saturating_sub(row).saturating_sub(1);
-    let missing = after.saturating_sub(available);
-    Ok(Rect::new(
-        0,
-        row.saturating_sub(missing),
-        size.width,
-        height,
-    ))
+    let gap = if row > top {
+        // 光标已经在视口该待的地方以下了：让终端往上滚，滚走的进它的回滚区，一行不丢。
+        queue!(out, MoveTo(0, size.height.saturating_sub(1)))?;
+        for _ in 0..(row - top) {
+            queue!(out, Print("\r\n"))?;
+        }
+        out.flush()?;
+        0
+    } else {
+        // 上面的内容够不着底：中间那几行先空着，记成空档——下一段正文落地时正好填回去。
+        top - row
+    };
+    Ok((Rect::new(0, top, size.width, height), gap))
 }
 
 /// 把一行带样式的正文写进终端。

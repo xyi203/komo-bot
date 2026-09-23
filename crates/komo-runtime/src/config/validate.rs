@@ -149,9 +149,10 @@ fn check_model(
     } else if !known {
         let expected = match role {
             Role::Chat => format!(
-                "生成协议只有 `{}` 与 `{}`",
+                "生成协议只有 `{}`、`{}` 与 `{}`",
                 crate::llm::CHAT_COMPLETIONS,
                 crate::llm::RESPONSES,
+                crate::llm::ANTHROPIC_MESSAGES,
             ),
             Role::Embedding => format!(
                 "向量后端只有 `{}` 与 `{}`",
@@ -596,7 +597,8 @@ mod tests {
         assert_eq!(keys(&issues), vec!["model.chat.api_backend"]);
         assert!(
             issues[0].message.contains("chat_completions")
-                && issues[0].message.contains("responses"),
+                && issues[0].message.contains("responses")
+                && issues[0].message.contains("anthropic_messages"),
             "{}",
             issues[0].message
         );

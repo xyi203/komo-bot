@@ -414,7 +414,7 @@ fn chat_completions_is_supported_and_unimplemented_protocols_are_refused() {
         .build(&chat, ModelRole::Main)
         .expect("chat_completions 应该有独立适配器");
 
-    for provider in ["openai_compatible", "openai_chat", "anthropic_messages"] {
+    for provider in ["openai_compatible", "openai_chat"] {
         let mut config = model(None);
         config.provider = provider.into();
         let Err(error) = factory(&transport).build(&config, ModelRole::Main) else {
@@ -425,6 +425,30 @@ fn chat_completions_is_supported_and_unimplemented_protocols_are_refused() {
             "{provider}: {error:?}"
         );
     }
+}
+
+#[test]
+fn anthropic_messages_is_supported_and_rejects_auth_like_chat_completions() {
+    let transport = ScriptedTransport::new(vec![]);
+    let mut anthropic = model(None);
+    anthropic.provider = ANTHROPIC_MESSAGES.into();
+    factory(&transport)
+        .build(&anthropic, ModelRole::Main)
+        .expect("anthropic_messages 应该有独立适配器");
+
+    let mut chatgpt_auth = anthropic.clone();
+    chatgpt_auth.auth = Some(CHATGPT_AUTH.into());
+    let Err(error) = factory(&transport).build(&chatgpt_auth, ModelRole::Main) else {
+        panic!("auth = \"chatgpt\" 只支持 responses")
+    };
+    assert!(matches!(error, LlmBuildError::ChatGptRequiresResponses));
+
+    let mut other_auth = anthropic;
+    other_auth.auth = Some("basic".into());
+    let Err(error) = factory(&transport).build(&other_auth, ModelRole::Main) else {
+        panic!("不认识的 auth 要被拒绝")
+    };
+    assert!(matches!(error, LlmBuildError::UnknownAuth { .. }));
 }
 
 #[test]

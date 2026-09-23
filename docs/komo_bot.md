@@ -1503,7 +1503,7 @@ SSE 事件带 Session 内递增序号，断线后按游标补读。JSONL 事件�
 
 Axum 已提供 SSE 响应；toasty 的 turso 驱动提供连接与事务，MVCC 冲突重试由 komo 自己包（§8.2）。实现时锁定实际依赖版本并验证 Fedora/macOS 构建。[Axum SSE](https://docs.rs/axum/latest/axum/response/sse/index.html) · [toasty](https://docs.rs/toasty)
 
-生成模型有两个独立协议适配器：OpenAI Responses API（`api_backend = "responses"`）与 Chat Completions（`api_backend = "chat_completions"`）。两者分别处理请求形状、流式终态、tool call 拼接和原生历史回放；切换协议时只用标准化的文字与 tool call 历史，不把一种协议的私有块直接发给另一种协议。向量协议是 OpenAI-compatible `/embeddings`（`embeddings`）与 Ollama `/api/embed`（`ollama_embeddings`）两种。`model_provider` 只表示一组可继承的连接默认值，`api_backend` 才决定适配器；因此 OpenAI、OpenRouter 与自建网关可以复用协议实现，但不会被误认为同一个供应商。
+生成模型有三个独立协议适配器：OpenAI Responses API（`api_backend = "responses"`）、Chat Completions（`api_backend = "chat_completions"`）与 Anthropic Messages API（`api_backend = "anthropic_messages"`）。三者各自处理请求形状、流式终态、tool call 拼接和原生历史回放；切换协议时只用标准化的文字与 tool call 历史，不把一种协议的私有块直接发给另一种协议——Anthropic 的 `thinking` / `redacted_thinking` 块和 Responses 的 `reasoning.encrypted_content` 一样，只在同协议内原样回放，跨协议历史一律从文字与调用记录重建。Anthropic 一次请求 `POST {base_url}/messages`，鉴权是 `x-api-key` 请求头（不是 Bearer），`max_tokens` 必填；工具调用是 assistant 内容里的 `tool_use` 块，结果放进**下一条 user 消息**的 `tool_result` 块，同一轮多个结果并进同一条 user 消息；协议要求 user / assistant 严格交替，相邻同角色消息（例如两个历史 Run 之间缺了中间那句答复）合并成一条。向量协议是 OpenAI-compatible `/embeddings`（`embeddings`）与 Ollama `/api/embed`（`ollama_embeddings`）两种。`model_provider` 只表示一组可继承的连接默认值，`api_backend` 才决定适配器；因此 OpenAI、OpenRouter、Anthropic 官方端点与自建网关可以复用协议实现，但不会被误认为同一个供应商。
 
 ### 13.3 模型角色与统一 effort 配置
 
@@ -1598,6 +1598,36 @@ model = "gpt-5-codex"
 - `komo auth codex login`：设备码登录，终端显示配对码与网址，轮询直到确认或超时（约 10 分钟）；不经 Gateway，直接落盘（同 `komo channel wechat login` 的先例）。`komo auth codex status` 给账号、邮箱、套餐与过期时间，不打印 token。
 - 刷新：每次请求前取 token，快过期（剩余 < 5 分钟）时刷新并写回，新的 `refresh_token` 会轮换；429 是额度问题，不是登录失效；400/401（`invalid_grant` / `refresh_token_reused` 一类）需要重新登录，报错里指名 `komo auth codex login`。
 - `komo config check`：配了 `auth = "chatgpt"` 但凭证文件不存在 → 报错并指出该跑的命令；`auth` 与 `env_key` 同时配、或 `api_backend` 不是 `"responses"` → 报错。
+
+**`api_backend = "anthropic_messages"`：Anthropic 官方 Messages API 或兼容它的中转。**
+
+```toml
+[model_providers.anthropic]
+base_url = "https://api.anthropic.com/v1"
+api_backend = "anthropic_messages"
+env_key = "ANTHROPIC_API_KEY"
+
+[model.claude]
+type = "completion"
+model_provider = "anthropic"
+model = "claude-sonnet-4-6"
+effort = "medium"
+```
+
+- 鉴权是 `x-api-key` 请求头（协议原生鉴权），不是 `Authorization: Bearer`；`auth = "chatgpt"` 只支持 Responses，`anthropic_messages` 配了 `auth` 一律拒绝，和 Chat Completions 的口径一样。
+- effort → thinking 的映射是一张固定表，`budget_tokens` 之外再留一段响应预算（32000 tokens，要装得下 `write` 一整份文件的工具参数；按实际输出计费，给大不多花钱）给最终答案与工具调用 JSON，凑成必须发送的 `max_tokens`（协议要求 `max_tokens` 大于 `budget_tokens`）：
+
+  | effort | `thinking` | `budget_tokens` | `max_tokens` |
+  | --- | --- | --- | --- |
+  | 未配置 / `none` | 不发送这个字段 | — | 32000 |
+  | `low` | `{"type":"enabled"}` | 4096 | 36096 |
+  | `medium` | `{"type":"enabled"}` | 10000 | 42000 |
+  | `high` | `{"type":"enabled"}` | 24000 | 56000 |
+  | `max` | `{"type":"enabled"}` | 32000 | 64000 |
+
+  开着 thinking 时不发自定义 `temperature`（本来就不发）。同一次请求可能没有 `thinking` 块（模型判断不需要）——这不是错误，正常收尾。
+- **回放**：assistant 这一轮的全部 content 块（`text` / `tool_use` / `thinking` / `redacted_thinking`）原样存进 `Round::provider_blocks`，下一轮原样放回同一条 assistant 消息；`thinking` 块的签名有两种到达形态都要接：中转在 `content_block_start` 里就给出完整签名，官方 API 则留空、末尾用 `signature_delta` 补上。没有存过块的历史（跨协议来的，或 §8.3 只发布用户正文与最终答复的历史 Run）从文字与调用记录重建，重建出的块里不会有 `thinking`。
+- **提示缓存**：`system` 最后一块、`tools` 最后一个、当前请求最后一条 user 消息的最后一块各打一个 `cache_control: {"type":"ephemeral"}`（3 个断点，协议上限 4 个）；只加在**这一次要发**的请求体副本上，`self.messages` 自己保存的历史不带这个标记，避免它被当成正文的一部分存进 `provider_blocks`。
 
 effort 的行为统一，取值按协议和具体模型校验：
 

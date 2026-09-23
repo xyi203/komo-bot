@@ -1,12 +1,14 @@
 //! LlmClient / TurnDriver 的协议适配器（§13.3、§13.5）。
 //!
-//! 两个生成协议 adapter：OpenAI Chat Completions 与 Responses。二者共用传输与
-//! [`LlmClient`] seam，但请求、流式终态和 provider 回放各自在自己的模块里实现。
+//! 三个生成协议 adapter：OpenAI Chat Completions、Responses 与 Anthropic Messages。三者
+//! 共用传输与 [`LlmClient`] seam，但请求、流式终态和 provider 回放各自在自己的模块里
+//! 实现。
 //!
 //! 主模型与记忆模型是**同一个 trait 的两个实例**（§13.3），按各自的 [`ModelConfig`]
 //! 构造；[`RoutingLlm`] 按每个 Run 固定下来的那份配置挑实例，所以配置热重载不会在半路
 //! 换掉正在跑的那个（§3 第 2 步）。
 
+mod anthropic;
 mod chat;
 pub mod codex_auth;
 mod responses;
@@ -25,6 +27,7 @@ use komo_kernel::types::model::{ModelConfig, ModelRole};
 use komo_kernel::types::status::RetryCause;
 use komo_kernel::types::turn::{LlmError, TurnRequest};
 
+pub use anthropic::AnthropicMessagesLlm;
 pub use chat::ChatCompletionsLlm;
 pub use responses::{Credential, OpenAiResponsesLlm, SystemPreamble};
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};
@@ -34,6 +37,7 @@ use crate::config::{EffortCapabilities, Secrets};
 /// 本 crate 认识的生成协议（§13.2）。
 pub const CHAT_COMPLETIONS: &str = "chat_completions";
 pub const RESPONSES: &str = "responses";
+pub const ANTHROPIC_MESSAGES: &str = "anthropic_messages";
 const LEGACY_OPENAI_RESPONSES: &str = "openai_responses";
 
 /// `model.<alias>.auth` 唯一认识的取值：凭证来自 ChatGPT 账号 OAuth，不是 `.env`
@@ -43,7 +47,9 @@ pub const CHATGPT_AUTH: &str = "chatgpt";
 /// 构造一个后端时会出的问题。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LlmBuildError {
-    #[error("不认识 api_backend `{provider}`：生成协议只有 `{CHAT_COMPLETIONS}` 与 `{RESPONSES}`")]
+    #[error(
+        "不认识 api_backend `{provider}`：生成协议只有 `{CHAT_COMPLETIONS}`、`{RESPONSES}` 与 `{ANTHROPIC_MESSAGES}`"
+    )]
     UnknownProvider { provider: String },
     /// 档位不可用一类——在**请求前**就定得下来的那些（§13.3）。
     #[error(transparent)]
@@ -213,6 +219,29 @@ impl LlmFactory {
                 }
                 let key = self.secrets.get(&config.api_key_env).map(str::to_string);
                 let mut client = ChatCompletionsLlm::new(
+                    config.clone(),
+                    role,
+                    key,
+                    Arc::clone(&self.transport),
+                    self.caps.clone(),
+                )?;
+                if let Some(preamble) = &self.preamble {
+                    client = client.with_preamble(Arc::clone(preamble));
+                }
+                Ok(Arc::new(client))
+            }
+            ANTHROPIC_MESSAGES => {
+                // Anthropic 原生鉴权就是 `x-api-key`；`auth = "chatgpt"` 那条路只给
+                // Responses 用（同 Chat Completions 的口径）。
+                if let Some(auth) = &config.auth {
+                    return Err(if auth == CHATGPT_AUTH {
+                        LlmBuildError::ChatGptRequiresResponses
+                    } else {
+                        LlmBuildError::UnknownAuth { auth: auth.clone() }
+                    });
+                }
+                let key = self.secrets.get(&config.api_key_env).map(str::to_string);
+                let mut client = AnthropicMessagesLlm::new(
                     config.clone(),
                     role,
                     key,

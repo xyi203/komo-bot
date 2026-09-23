@@ -85,6 +85,8 @@ impl EffortCapabilities {
     ///
     /// - `responses` 与 `chat_completions` 都支持常见 effort 档位；具体模型可用
     ///   `efforts` 进一步收窄。
+    /// - `anthropic_messages`：`none / low / medium / high / max`，换算成 thinking 的
+    ///   `budget_tokens`（`llm::anthropic::thinking_budget`，§13.3）。
     /// - `deepseek-*` 模型：`none / low / high / max`，没有 `medium`。
     /// - 向量后端（下面那张表）：`/embeddings` 与 `/api/embed` 都没有 effort 参数。
     pub fn builtin() -> Self {
@@ -101,6 +103,10 @@ impl EffortCapabilities {
                 (
                     crate::llm::CHAT_COMPLETIONS.to_string(),
                     EffortSupport::new(["none", "minimal", "low", "medium", "high"]),
+                ),
+                (
+                    crate::llm::ANTHROPIC_MESSAGES.to_string(),
+                    EffortSupport::new(["none", "low", "medium", "high", "max"]),
                 ),
             ]),
             // 两个实现了的向量后端（`/embeddings` 与 `/api/embed`）都没有 effort 参数。

@@ -1079,6 +1079,7 @@ async fn seed_queued_run(
         model: state.snapshot().model.clone(),
         effort: None,
         delegate: None,
+        skip_memory: false,
         at: now,
     };
     let event = komo_kernel::types::ids::EventId::new_at(now);
@@ -1786,6 +1787,7 @@ async fn cancelling_the_parent_cancels_its_child_run() {
             model: state.snapshot().model.clone(),
             effort: None,
             delegate,
+            skip_memory: false,
             at: now,
         };
         let db = state.db.clone();

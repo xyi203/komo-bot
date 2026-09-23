@@ -141,6 +141,7 @@ impl CronRepo for TursoCronRepo {
                                 .version(i64::try_from(job.version).unwrap_or(i64::MAX))
                                 .trigger(encode(&job.trigger)?)
                                 .prompt(job.prompt.clone())
+                                .command(job.command.clone())
                                 .workdir(job.workdir.as_ref().map(|p| p.display().to_string()))
                                 .status(enum_str(&job.status))
                                 .overlap(enum_str(&job.overlap))
@@ -166,6 +167,7 @@ impl CronRepo for TursoCronRepo {
                                 version: i64::try_from(job.version.max(1)).unwrap_or(i64::MAX),
                                 trigger: encode(&job.trigger)?,
                                 prompt: job.prompt.clone(),
+                                command: job.command.clone(),
                                 workdir: job.workdir.as_ref().map(|p| p.display().to_string()),
                                 status: enum_str(&job.status),
                                 overlap: enum_str(&job.overlap),
@@ -433,6 +435,7 @@ fn job_from_row(row: &CronJobRow) -> Result<CronJob, StoreError> {
         version: row.version.max(0) as u64,
         trigger: decode(&row.trigger, "cron_jobs.trigger")?,
         prompt: row.prompt.clone(),
+        command: row.command.clone(),
         workdir: row.workdir.clone().map(std::path::PathBuf::from),
         status: decode(&format!("\"{}\"", row.status), "cron_jobs.status")?,
         overlap: decode(&format!("\"{}\"", row.overlap), "cron_jobs.overlap")?,
@@ -480,6 +483,7 @@ mod tests {
                 tz: TimeZone::new("Asia/Shanghai"),
             },
             prompt: "整理今天的动态".into(),
+            command: None,
             workdir: None,
             status: JobStatus::Active,
             overlap: OverlapPolicy::Skip,

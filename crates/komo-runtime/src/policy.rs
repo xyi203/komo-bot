@@ -299,6 +299,7 @@ mod tests {
                 },
                 scopes: vec![],
                 requires_isolation: false,
+                grant_proof: false,
             },
         );
         let grants = vec![Grant {
@@ -335,6 +336,7 @@ mod tests {
                 matcher: Matcher::operations([OperationMatch::ShellCommand]),
                 scopes: vec![],
                 requires_isolation: true,
+                grant_proof: false,
             },
         );
         let roots = roots();

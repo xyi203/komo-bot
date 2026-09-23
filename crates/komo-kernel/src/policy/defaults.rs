@@ -23,6 +23,7 @@ fn rule_maker() -> impl Fn(&str, Effect, &str, Matcher) -> PolicyRule {
         matcher,
         scopes: vec![ApprovalScope::Once],
         requires_isolation: false,
+        grant_proof: false,
     }
 }
 
@@ -133,6 +134,25 @@ impl RuleTable {
                     "任意 shell / Python 代码",
                     Matcher::operations([OperationMatch::ShellCommand, OperationMatch::PythonCode]),
                 ),
+                // 第 10 行（新增，堵口子）：`komo cron add` 会给命令 Job 自己签发一条
+                // 执行授权（§10、§7.2）——模型经 shell 调它，就是在给自己写将来能免问
+                // 的许可。**任何 Run / Cron 范围授权都不能替这一步作答**：`grant_proof`
+                // 让它排在"有效的范围授权"那一步之前，答复也永远只能是一次性的
+                // （`scopes` 不给 `offered_scopes` 留追加 Cron 范围的机会）。
+                PolicyRule {
+                    id: "cron-add-always-asks".into(),
+                    effect: Effect::Ask,
+                    reason: "`cron add` 会为命令 Job 自己签发一条执行授权，这一步必须每次都问"
+                        .into(),
+                    matcher: Matcher {
+                        operations: Some(vec![OperationMatch::ShellCommand]),
+                        command_patterns: Some(vec!["komo cron add".into()]),
+                        ..Default::default()
+                    },
+                    scopes: Vec::new(),
+                    requires_isolation: false,
+                    grant_proof: true,
+                },
                 // §8.6：恢复流程调用模块自带的核对函数。核对是只读的、绑定已审核的模块
                 // 版本、由执行器而不是模型发起（`PlanSource::Verification`），默认放行——
                 // 否则默认配置下每次核对都答 Unknown，核对函数等于没有。这条排在
@@ -430,6 +450,7 @@ mod tests {
                 },
                 scopes: vec![],
                 requires_isolation: false,
+                grant_proof: false,
             },
         );
 
@@ -713,6 +734,7 @@ mod tests {
                 matcher: Matcher::default(),
                 scopes: vec![],
                 requires_isolation: true,
+                grant_proof: false,
             },
         );
         let mut f = Fixture::new();
@@ -898,6 +920,7 @@ mod tests {
             },
             scopes: vec![ApprovalScope::Once],
             requires_isolation: false,
+            grant_proof: false,
         };
         let table = RuleTable {
             rules: vec![rule],
@@ -923,5 +946,93 @@ mod tests {
                 "{evasion} 确实在网外：{decision:?}"
             );
         }
+    }
+
+    // ---- 第 10 行（堵口子）：`komo cron add` 永远问一次，答复永远是一次性的 ----
+
+    /// strict 下 `cron add` 永远 Ask，而且只能批一次（不给 Run / Cron 范围）；
+    /// auto 基表不变——这一条只加在 `initial()` 里。
+    #[test]
+    fn cron_add_always_asks_in_strict_and_only_once() {
+        let f = Fixture::new();
+        let plan = shell(r#"komo cron add --name x --command "ls""#);
+
+        let decision = RuleTable::initial().decide(&plan, &f.ctx());
+        let PolicyDecision::Ask { reason, scopes } = &decision else {
+            panic!("{decision:?}")
+        };
+        assert!(reason.contains("cron-add-always-asks"), "{reason}");
+        assert_eq!(
+            scopes,
+            &vec![ApprovalScope::Once],
+            "范围只能一次性——不给 Run / Cron，哪怕这份计划来自 Cron"
+        );
+
+        // auto 基表不变：这一条不在 `auto()` 里，日常的 `cron add` 照样不问。
+        assert!(matches!(
+            RuleTable::auto().decide(&plan, &f.ctx()),
+            PolicyDecision::Allow { .. }
+        ));
+    }
+
+    /// **任何 Run / Cron 范围授权都盖不住它**：即便已经有一条授权的匹配器正好覆盖了
+    /// 这份 `cron add` 计划，`grant_proof` 也要它排在"有效的范围授权"那一步之前，
+    /// 结论仍然是 Ask（§7.1「cron add」那一条的存在理由）。
+    #[test]
+    fn no_run_or_cron_scope_grant_can_cover_the_cron_add_ask() {
+        let mut f = Fixture::new();
+        let plan = shell(r#"komo cron add --name x --command "ls""#);
+
+        // 先证明：按普通匹配规则，这条 Run 范围授权**确实**覆盖得到这份计划——
+        // 不是因为它凑巧覆盖不到，而是 `grant_proof` 让 Policy 压根不走到这一步。
+        let broad_grant = Grant {
+            id: GrantId::from_raw("g-1"),
+            approval: ApprovalId::from_raw("ap-1"),
+            scope: GrantScope::Run {
+                run: RunId::from_raw("run-1"),
+                matcher: Matcher {
+                    operations: Some(vec![OperationMatch::ShellCommand]),
+                    command_prefixes: Some(vec!["komo cron".into()]),
+                    ..Default::default()
+                },
+                versions: PlanVersions::default(),
+            },
+            granted_at: NOW,
+            valid_until: None,
+            consumed: false,
+            reason: "此前批准过 `komo cron`".into(),
+        };
+        assert!(
+            broad_grant.covers(&plan, NOW),
+            "这条授权按普通规则确实覆盖得到，测试才有意义"
+        );
+
+        f.grants.push(broad_grant);
+        let decision = RuleTable::initial().decide(&plan, &f.ctx());
+        assert!(
+            matches!(decision, PolicyDecision::Ask { .. }),
+            "有一条覆盖得到的范围授权，仍然要问：{decision:?}"
+        );
+    }
+
+    /// 触发的计划来自 Cron 本身（一条 prompt Job 的模型经 shell 调 `cron add` 给自己
+    /// 签发下一个命令 Job 的授权）：同样只问一次，不因为来源是 Cron 就多给一档范围。
+    #[test]
+    fn a_cron_sourced_cron_add_plan_still_only_offers_once() {
+        let f = Fixture::new();
+        let mut plan = shell(r#"komo cron add --name x --command "ls""#);
+        plan.source = PlanSource::Cron {
+            job: CronJobId::from_raw("job-1"),
+            job_version: 3,
+        };
+        let decision = RuleTable::initial().decide(&plan, &f.ctx());
+        let PolicyDecision::Ask { scopes, .. } = &decision else {
+            panic!("{decision:?}")
+        };
+        assert_eq!(
+            scopes,
+            &vec![ApprovalScope::Once],
+            "`offered_scopes` 平时会给 Cron 来源多加一档，这一条规则不吃这一套"
+        );
     }
 }

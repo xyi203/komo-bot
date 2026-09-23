@@ -45,6 +45,11 @@ pub struct Watched {
     pub notify: NotifyPolicy,
     /// 手动 run 没有触发记录，不回写状态（§10）。
     pub scheduled: bool,
+    /// 这个 Job 是不是命令直跑模式（§10）：是的话，终态的 ok / error 与投递正文不看
+    /// `run.completed.final_message`（那是 `CommandDriver` 收尾用的投影正文，不是干净
+    /// 的 stdout），改由 [`super::run_watch::command_outcome`] 现读那次 `shell` 调用的
+    /// 落盘结果。
+    pub is_command: bool,
 }
 
 impl Watched {
@@ -57,6 +62,7 @@ impl Watched {
             name: job.name.clone(),
             notify: job.notify,
             scheduled,
+            is_command: job.command.is_some(),
         }
     }
 }

@@ -74,6 +74,20 @@ impl komo_kernel::traits::LlmClient for FailingLlm {
     }
 }
 
+/// 一碰 `begin_turn` 就 panic 的 [`LlmClient`]。命令 Run 全程零模型请求（§10）是这个
+/// 断言的唯一可靠证明方式：不是"没观察到调用"，而是"调了就当场爆"。
+pub struct PanickingLlm;
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::LlmClient for PanickingLlm {
+    async fn begin_turn(
+        &self,
+        _req: TurnRequest,
+    ) -> Result<Box<dyn komo_kernel::traits::TurnDriver>, komo_kernel::types::turn::LlmError> {
+        panic!("命令 Run 不该发起任何模型请求（§10）")
+    }
+}
+
 struct FailingDriver {
     error: komo_kernel::types::turn::LlmError,
 }

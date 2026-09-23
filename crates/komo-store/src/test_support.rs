@@ -118,6 +118,7 @@ mod tests {
                     at: clock.now(),
                     delegate: None,
                     snapshot: None,
+                    skip_memory: false,
                 })
                 .await
                 .unwrap();

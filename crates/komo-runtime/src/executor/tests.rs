@@ -147,6 +147,7 @@ async fn a_deny_is_not_overridden_by_a_matching_grant_and_consumes_nothing() {
         matcher: Matcher::operations([OperationMatch::ShellCommand]),
         scopes: vec![],
         requires_isolation: false,
+        grant_proof: false,
     });
     let executor = harness.executor(vec![tool.clone()], PolicyEngine::from_rules(table));
 

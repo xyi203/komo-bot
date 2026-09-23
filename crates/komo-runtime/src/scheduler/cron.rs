@@ -326,12 +326,20 @@ impl CronScheduler {
             model.effort = Some(effort.clone());
         }
 
+        // 命令直跑模式（§10）：`text` 只是账本上"这条 Run 是为了什么"的人读记录——
+        // CommandDriver 不读它，命令本身从这条 Run 的 Job 定义（`PlanSource::Cron` 指
+        // 着的那个 Job）里查。写清楚是为了会话记录诚实，不是为了喂给模型。
+        let text = match &job.command {
+            Some(command) => format!("[命令直跑] {command}"),
+            None => job.prompt.clone(),
+        };
+
         let accepted = self
             .ledger
             .accept_input(AcceptInput {
                 session,
                 request_key,
-                text: job.prompt.clone(),
+                text,
                 // 来源仍是 Cron（§8.8）：恢复后也不会因为由本机 Gateway 发起就升权。
                 source: PlanSource::Cron {
                     job: job.id.clone(),
@@ -348,6 +356,9 @@ impl CronScheduler {
                 // 那一步兜底（`service::segment`）。这里不编一份——`CronScheduler` 手里只有
                 // 队列与模型，没有工具目录、没有工作目录解析、也没有配置快照。
                 snapshot: None,
+                // 命令 Run 全程零模型请求（§10）：记忆提取本身要发一次模型请求，跳过它
+                // 不是省一步，是不破"零模型请求"这条硬约束（§9.3）。
+                skip_memory: job.command.is_some(),
                 at: now,
             })
             .await?;
@@ -408,6 +419,7 @@ mod tests {
                 tz: TimeZone::new("Asia/Shanghai"),
             },
             prompt: "整理今天的技术动态".into(),
+            command: None,
             workdir: None,
             status: JobStatus::Active,
             overlap: OverlapPolicy::Skip,

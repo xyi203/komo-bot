@@ -1005,6 +1005,7 @@ def turn_off(entity_id):
                 },
                 scopes: vec![],
                 requires_isolation: false,
+                grant_proof: false,
             }],
             default: Effect::Ask,
         })

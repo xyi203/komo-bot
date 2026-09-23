@@ -318,6 +318,7 @@ mod tests {
                     env,
                     budget: Budget::default(),
                     resume: None,
+                    command: None,
                     session,
                     run,
                 })

@@ -851,6 +851,9 @@ impl ToolExecutor {
                 // 工作目录与指令正文，所以这里不编一份：装配那一步按父 Run 的快照继承
                 // （`service::segment`），与"旧行没有归属"走的是同一条兜底路。
                 snapshot: None,
+                // 子代理是一段真的模型对话，记忆提取照常（§9.3）；跳过只留给命令
+                // Job——那种 Run 从不发模型请求，没有对话可提取（§10）。
+                skip_memory: false,
                 at: self.clock.now(),
             })
             .await?;

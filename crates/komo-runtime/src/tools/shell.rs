@@ -17,7 +17,7 @@ use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
-    ApprovedPlan, ExecutionPlan, Operation, PlanVersions, RecoveryMode,
+    ApprovedPlan, ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
@@ -60,6 +60,37 @@ pub struct ShellResult {
     /// 尾部片段。完整 stdout / stderr 在这次尝试的输出目录里。
     pub stdout_tail: String,
     pub stderr_tail: String,
+}
+
+/// 一条 shell 命令的执行计划**形状**：工具名、操作、命令正文的版本快照、恢复方式。
+///
+/// **唯一的构造处**：[`ShellTool::prepare`] 与 Gateway 在 `cron add` 时为命令 Job 签发
+/// 授权，都调它——授权的匹配器要与触发时 CommandDriver 真正跑出来的那份计划同源，
+/// 手写第二份迟早会在这两处之间长出一条缝（§10、§7.2）。`run` / `tool_call` 不在这里
+/// 填：那两个字段来自一次具体的调用，`cron add` 时还没有这次调用。
+pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPlan {
+    ExecutionPlan {
+        operation_id: OperationId::new_at(plan_time()),
+        source,
+        tool: "shell".into(),
+        operation: Operation::ShellCommand {
+            command: command.to_string(),
+        },
+        run: None,
+        tool_call: None,
+        args: serde_json::json!({ "command": command }),
+        cwd: Some(cwd),
+        // 命令会碰哪些文件，在跑起来之前不知道——所以不编造目标。规则按
+        // `ShellCommand` 与命令正文匹配，不按路径。
+        targets: vec![],
+        versions: PlanVersions {
+            // 命令正文的快照：命令改一个字节，绑定它的授权就覆盖不到了（§5.4）。
+            code: Some(ContentHash::of_str(command)),
+            ..Default::default()
+        },
+        resources: vec![],
+        recovery: RecoveryMode::NoSafeRecovery,
+    }
 }
 
 pub struct ShellTool {
@@ -144,28 +175,12 @@ impl Tool for ShellTool {
             Some(raw) => super::paths::resolve(raw, &ctx.cwd)?,
             None => ctx.cwd.clone(),
         };
-        Ok(ExecutionPlan {
-            operation_id: OperationId::new_at(plan_time()),
-            source: ctx.source.clone(),
-            tool: "shell".into(),
-            operation: Operation::ShellCommand {
-                command: args.command.clone(),
-            },
-            run: Some(ctx.run.clone()),
-            tool_call: Some(ctx.call.clone()),
-            args: normalized(&args)?,
-            cwd: Some(cwd),
-            // 命令会碰哪些文件，在跑起来之前不知道——所以不编造目标。规则按
-            // `ShellCommand` 与命令正文匹配，不按路径。
-            targets: vec![],
-            versions: PlanVersions {
-                // 命令正文的快照：命令改一个字节，绑定它的授权就覆盖不到了（§5.4）。
-                code: Some(ContentHash::of_str(&args.command)),
-                ..Default::default()
-            },
-            resources: vec![],
-            recovery: RecoveryMode::NoSafeRecovery,
-        })
+        let mut plan = plan_for(ctx.source.clone(), cwd, &args.command);
+        plan.run = Some(ctx.run.clone());
+        plan.tool_call = Some(ctx.call.clone());
+        // 完整的原始参数（可能带 `cwd` / `timeout_secs`），不是 `plan_for` 那份精简的。
+        plan.args = normalized(&args)?;
+        Ok(plan)
     }
 
     async fn execute(

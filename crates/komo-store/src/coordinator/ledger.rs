@@ -110,6 +110,7 @@ impl Ledger for Coordinator {
                                 peer: input.peer.as_ref().map(|p| p.to_string()),
                                 model: input.model.clone(),
                                 effort: input.model.effort.as_ref().map(|e| e.as_str().to_string()),
+                                skip_memory: input.skip_memory,
                                 at: now,
                             },
                         )
@@ -1029,6 +1030,7 @@ mod tests {
             at: time::macros::datetime!(2026-09-15 08:00:00 UTC),
             delegate: None,
             snapshot: None,
+            skip_memory: false,
         }
     }
 

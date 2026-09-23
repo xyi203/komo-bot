@@ -425,7 +425,13 @@ pub struct CronJob {
     /// 定义版本。Job 改了，绑定它的授权失效（§7.2）。
     pub version: u64,
     pub trigger: Trigger,
+    /// 与 `command` 二选一（CLI / HTTP 都校验）；命令 Job 这一列写空串——退役字段照写
+    /// 空的惯例（§8.2）在这里反过来用：两种 Job 共用一张表，谁不用谁的那一列就是空。
     pub prompt: String,
+    /// **命令直跑模式**（§10）：不经模型，触发时固定跑这一条 shell 命令，工作目录是
+    /// `workdir`。`None` = 这是一条 prompt Job。与 `prompt` 二选一。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<std::path::PathBuf>,
     pub status: JobStatus,
@@ -721,6 +727,7 @@ mod tests {
             version: 1,
             trigger: parse_schedule("0 9 * * *", &shanghai(), NOW, &zone).unwrap(),
             prompt: "整理今天的动态".into(),
+            command: None,
             workdir: None,
             status: JobStatus::Active,
             overlap: OverlapPolicy::Skip,
@@ -771,6 +778,7 @@ mod tests {
                 tz: TimeZone::new("Mars/Olympus"),
             },
             prompt: String::new(),
+            command: None,
             workdir: None,
             status: JobStatus::Active,
             overlap: OverlapPolicy::Skip,
@@ -850,6 +858,7 @@ mod tests {
             version: 1,
             trigger: parse_schedule("0 9 * * *", &TimeZone::utc(), NOW, &zone).unwrap(),
             prompt: String::new(),
+            command: None,
             workdir: None,
             status: JobStatus::Active,
             overlap: OverlapPolicy::Skip,
@@ -890,6 +899,7 @@ mod tests {
             version: 7,
             trigger: parse_schedule("0 9 * * *", &TimeZone::utc(), NOW, &zone).unwrap(),
             prompt: "整理".into(),
+            command: None,
             workdir: None,
             status: JobStatus::Active,
             overlap: OverlapPolicy::Skip,

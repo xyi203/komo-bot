@@ -22,12 +22,14 @@
 //! | 模型 / effort 覆盖按完整配置解析 | `definition::a_model_override_is_a_whole_config_and_leaves_memory_alone` |
 //! | `notify` | `notify::on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait` |
 //! | 结果去原 Session 查看 | `firing::the_list_shows_the_last_firing_and_the_next_slot` |
+//! | 命令直跑：零模型请求、add 即授权、ok / error / 空输出语义 | `command::*` |
 //!
 //! **失败即缺陷**：与文档不符的地方留成 `#[ignore]` + `// BUG(n):`。
 
 mod harness;
 
 mod approval;
+mod command;
 mod definition;
 mod firing;
 mod notify;

@@ -451,6 +451,7 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 | Memos 的写入、修改或删除                      | 按 Python 模块版本、函数、参数与用户指令范围审核                     |
 | 权限扩大或修改 Policy                         | 通过操作者配置流程处理，不能由模型自行放宽                           |
 | 委派一个子任务（`Operation::Delegate`）       | 按操作者意图：strict 下 Ask（展示任务正文与结果契约），auto 下 Allow。**子代理自己的每一次调用仍各自按上面各行判断**——委派不放宽任何一层 |
+| shell 命令文本匹配 `komo cron add`            | strict 下永远 Ask，且**只能批一次**（`scopes` 固定 `[once]`，不给 Run / Cron 范围）；**任何已有的 Run / Cron 范围授权都不能替这一步作答**——`cron add` 会给命令 Job 自己签发一条执行授权（见下），模型能经 shell 调它给自己写将来能免问的许可，这一条必须每次都问人。auto 基表不变（§7.1「auto 与 strict 的差别就是要不要人看一眼」，这条也不例外） |
 
 **两套建议，操作者选一套。** 上面那张表落成 `RuleTable::initial()`（"strict"）；另一套是
 `RuleTable::auto()`（"auto"）——**不审批**：一条 `Ask` 都不留，agent 一路跑到底，不打断人。
@@ -517,7 +518,12 @@ command_patterns = [
 
 - 本次调用授权：只批准眼前的执行计划。
 - 本次 Run 的范围授权：例如指定目录的写入，或明确命令模板。
-- Cron Job 授权：绑定 Job 版本、工具或模块版本、参数范围和权限。
+- Cron Job 授权：绑定 Job 版本、工具或模块版本、参数范围和权限。**命令 Job 在 `cron add`
+  这一刻就由操作者显式请求签发**（§10）：命令直跑模式不经模型，触发时固定跑的就是创建
+  时给定的那一条命令，没有必要每次触发都停下来问同一个问题。匹配器与版本快照从触发时
+  `CommandDriver` 真正驱动出来的那份计划**同一个构造函数**派生（`shell::plan_for`），
+  不手写第二份；Job 改了命令（今天还没有 `cron edit`，只能 remove 重建）就是另一个
+  Job、另一份授权。
 - **一次答一批**：一条 Run 里连着几个命令、几个 Run 各自卡在等待上时，操作者一次答复把**此刻待处理的全部**答了（TUI 的 `a`、聊天与 CLI 的 `/approve all`）。它**不是第四条范围**：名单里的每一条各自落一条决定、各自换一份凭据、各自写一条审计事件——只是把 N 次按键变成一次。名单由发起方列出（"此刻看到的那些"），协议里没有"全部"这个词，服务端不会在答复到达时才决定名单，因而也不会把答复之后新出现的请求一起答掉。**批量的范围固定为本次调用**：范围授权绑的是一份具体的计划（shell 绑整条命令、Python 绑模块与版本），一批互不相干的计划共用一个范围，只能是替操作者猜一个他没看过的答复；他说了范围却被按本次答时，回执必须**说出来**，不静默降级。
 
 不把“同意一次 Python”解释为“今后任意脚本均可执行”。审批不覆盖显式 Deny。批准后再次校验目标和版本，变化则重新评估。
@@ -1178,6 +1184,77 @@ komo cron remove JOB_ID
 - 新增危险操作暂停等待审批，不能因无人值守而自动放行。
 - Job、模块或权限发生变化时重新匹配授权。
 - Cron 的结果去原 Session 查看，也可以用 resume 接手。
+
+### 10.1 命令直跑模式：`command` 与 `prompt` 二选一
+
+Job 加一个 `command: Option<String>` 字段，与 `prompt` 二选一——CLI（`--command`）与
+HTTP（`CreateCronRequest.command`）两处都校验：不能同时给，也不能都不给。命令 Job 的
+`prompt` 列写空串（退役字段照写空的惯例，反过来给两种 Job 共用一张表用，§8.2）。
+
+```bash
+komo cron add --name nightly-backup \
+  --schedule "0 3 * * *" \
+  --timezone Asia/Shanghai \
+  --command "tar czf /backups/$(date +%F).tgz /data" \
+  --workdir /srv/app
+
+komo cron list   # 命令 Job 那一行下面多印一行 `[命令] tar czf ...`（过长截断）
+```
+
+**不另开一条执行路径，只是把"模型"换成一个固定出牌的驱动。** `AgentLoop` 平时靠
+`LlmClient::begin_turn` 拿一个 `TurnDriver`（§6）；命令 Job 触发的 Run 用
+`CommandDriver` 代替它：第一轮固定给一个 `shell` 工具调用（命令 = Job 的
+`command`，工作目录不必显式传——它就是这个 Run 的执行环境 `cwd`，受理时已经从 Job 的
+`workdir` 落到 Session 上，§8.5），第二轮拿到工具结果后收尾。选哪个驱动在
+`AgentLoop::run` 里按 Run 的来源判：`self.llm`（真正的模型客户端）一次都不会被摸到，
+`Segment` 上的 `command: Option<CommandSpec>` 就是那个判据。于是 Policy / Proof /
+审批 / JSONL / tool-output / 恢复 / 投递全部原样复用——那一次 `shell` 调用照样要过
+`prepare` → Policy →（必要时）审批 → `execute`，跟模型发起的调用走的是同一条路。**命令
+Run 全程零模型请求**，也不触发记忆提取（`AcceptInput.skip_memory`：命令 Job 触发的
+Run 落账时直接记 `MemoryWork::Done`，不进后台处理队列——没有对话可提取，提取本身还要
+发一次模型请求，会打破"零模型请求"这条硬约束，§9.3）。
+
+**恢复安全是 `CommandDriver` 自己的责任，不是免费的。** 普通模型驱动不怕"上一次的调用
+结果已经落盘、收尾事件还没写"这种重启：它靠 `TurnRequest.messages`（这一段的回放窗口）
+里那条已经落盘的调用与结果认出"这件事做过了"。`CommandDriver` 不读 `messages`（它压根
+不构造模型请求），所以在构造时自己查一遍回放窗口：已经有那条 `shell` 调用的结果就直接
+用它收尾，没有才第一次发那个调用——不然重启一次会把同一条命令再跑一遍。
+
+语义（触发的 firing 状态与投递正文，都由 `service::cron_watch` / `run_watch` 现读那次
+`shell` 调用的落盘结果决定，不信 `CommandDriver` 收尾用的投影正文）：
+
+| 情况 | firing 状态 | 投递 |
+| --- | --- | --- |
+| 退出 0、stdout 非空 | `ok` | stdout（trim）原样作为结果投递，受 `notify` 过滤 |
+| 退出 0、stdout 为空 | `ok` | 不投递——看门狗"没事不说话" |
+| 非 0 退出 | `error` | 投错误摘要（退出码 + stderr 末尾若干行），受 `notify` 过滤（`on_error` / `always` 投，`never` 不投） |
+| 超时 | `waiting`→`intervention` | 与任意 shell 命令超时同一条路（§8.6：`NoSafeRecovery` 的调用超时是"副作用是否已经发生未知"，不是"结果"，停在 `waiting + intervention` 等人核对，不能自动判定成功或失败）——命令 Job 不为此另开一条自动归类的路径，那会绕过 §8.6 的安全不变量 |
+| 等审批（首次触发、授权还没落下或已经失效） | `waiting` | 照现有规则投 home chat |
+
+**`cron add` 时直接给这条命令签发执行授权**（§7.2 第三种范围）：创建命令 Job 的同时，
+Gateway 落一条 `GrantScope::CronJob` 授权，覆盖触发时 `CommandDriver` 会发出的那一次
+`shell` 调用——不必等第一次触发停下来问一遍。**匹配器与触发时真正跑出来的那份计划
+必须同源**：`komo_runtime::tools::shell::plan_for`（`ShellTool::prepare` 自己也调它）
+是唯一的构造处，不手写第二份，两处才不会因为各自改一点而悄悄分岔。这条授权要挂在一条
+真的、已经决定的审批记录上（`Grant.approval` 不是溯源标识那么简单——触发时
+`executor::authorize` 靠它去 `ApprovalRepo::consume`，那一步要求 `approval_requests`
+里真有这一行、`decision` 已经写着"批准"），落授权与落审批记录同一次写完；写不下不该让
+`cron add` 本身失败，只是退回"以后每次触发都要问"。`komo cron list` / HTTP 的 Job 详情
+上能看出这条授权存在（也可查 `grants_for_job`）。
+
+**堵口子**：模型能经 shell 调 `komo cron add --command X` 给自己签一条将来能免问的
+授权，所以 strict 基表（`RuleTable::initial()`）单加一条：shell 命令文本匹配
+`komo cron add` 时 `effect = Ask` 且 `scopes` 只有 `once`——**任何已有的 Run / Cron
+范围授权都不能覆盖它**。这条判定排在"有效的范围授权"那一步之前（`PolicyRule.
+grant_proof`），且不走 `offered_scopes` 的"Cron 来源多给一档"，所以即便这份计划来自
+Cron、即便已经有一条匹配得上的 Run/Cron 范围授权，结论仍然是 Ask（有测试锁住这一条，
+§7.1）。auto 基表不变——那份表本来就不留一条 `Ask`。
+
+目前没有 `cron edit`：命令改了要 remove 重建。`remove` 只删 `cron_jobs` 那一行
+（§13.1「移除后续调度，已有执行历史保留」），不去清 `policy_grants`——**这条授权因此
+不是被撤销的，而是用不上了**：`GrantScope::CronJob` 绑的这个 Job 连同它的 `due()` 判定
+一起没了，没有任何触发能再产生同一个 `job + job_version` 的计划去覆盖，那一行就静静地
+留在表里当历史，不构成风险。
 
 触发输入在 JSONL 持久保存且 queued 已提交后再通知内存队列；启动与周期扫描负责补齐未完成接收、索引落后和通知丢失的情况。
 

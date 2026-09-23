@@ -27,6 +27,7 @@ fn accept(session: &SessionId, key: &str, text: &str, clock: &TestClock) -> Acce
         workdir: None,
         delegate: None,
         snapshot: None,
+        skip_memory: false,
         at: clock.now(),
     }
 }

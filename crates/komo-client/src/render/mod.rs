@@ -447,6 +447,25 @@ pub fn cron_list(response: &CronListResponse, now: OffsetDateTime) -> String {
             job.name,
             trigger(&job.trigger)
         ));
+        // 命令直跑模式（§10）：这是判断"这个 Job 会不会经过模型"的第一眼，命令本身
+        // 也要看得见——过长截断，不然一行把整张表拉宽。授权是不是已经签发（`cron add`
+        // 即授权，§7.2）也印在这一行：操作者不必再去查 `/v1/approvals`。
+        if let Some(command) = &job.command {
+            let authorized = response
+                .status
+                .iter()
+                .find(|status| status.job == job.id)
+                .is_some_and(|status| status.authorized);
+            out.push(format!(
+                "  [命令] {}{}",
+                truncate(command, 80),
+                if authorized {
+                    " · 已授权"
+                } else {
+                    " · 未授权"
+                }
+            ));
+        }
         if let Some(last) = response
             .status
             .iter()
@@ -474,6 +493,17 @@ pub fn cron_list(response: &CronListResponse, now: OffsetDateTime) -> String {
         }
     }
     out.join("\n")
+}
+
+/// 过长截断，按字符数（不是字节数）算，免得在多字节字符中间切断。
+fn truncate(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
 }
 
 fn notify(policy: NotifyPolicy) -> &'static str {

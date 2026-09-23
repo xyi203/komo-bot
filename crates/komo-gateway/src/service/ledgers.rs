@@ -819,6 +819,7 @@ mod tests {
             workdir: None,
             delegate: None,
             snapshot: None,
+            skip_memory: false,
             at: time::macros::datetime!(2026-09-16 08:00:00 UTC),
         }
     }

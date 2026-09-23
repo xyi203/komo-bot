@@ -709,6 +709,12 @@ pub struct CronJobStatus {
     /// 最近一次触发。没有就是这个 Job 还没响过。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<CronFiring>,
+    /// 这个 Job 当前版本有没有有效的 `GrantScope::CronJob` 授权（§7.2、§10）。命令
+    /// Job 在 `cron add` 时就该有——这是操作者在 `cron list` 上能看到这条授权存在
+    /// 的地方，不必单独去查 `/v1/approvals`（那条审批不是待处理的，也没有挂在任何一
+    /// 条 Run 上，走那条查询路径反而查不到）。
+    #[serde(default)]
+    pub authorized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -718,7 +724,12 @@ pub struct CreateCronRequest {
     pub schedule: String,
     /// IANA 名字。Gateway 侧解析成偏移。
     pub timezone: String,
+    /// 与 `command` 二选一：给了 `command` 这一个必须是空串（§10）。
     pub prompt: String,
+    /// 命令直跑模式：不经模型，触发时固定跑这一条 shell 命令（§10）。与 `prompt`
+    /// 二选一——旧客户端不传这个字段就是 `None`，行为和以前一样。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

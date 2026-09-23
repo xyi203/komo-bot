@@ -230,8 +230,13 @@ struct CronAddArgs {
     /// IANA 时区名。
     #[arg(long, default_value = "UTC")]
     timezone: String,
-    #[arg(long)]
-    prompt: String,
+    /// 与 `--command` 二选一：交给模型的任务描述。
+    #[arg(long, conflicts_with = "command")]
+    prompt: Option<String>,
+    /// 命令直跑模式：不经模型，触发时固定跑这一条 shell 命令（§10）。与 `--prompt`
+    /// 二选一。
+    #[arg(long, conflicts_with = "prompt")]
+    command: Option<String>,
     /// 这个 Job 的工作目录；**创建时就核实**（§10）。
     #[arg(long)]
     workdir: Option<String>,
@@ -598,6 +603,7 @@ async fn operator(
                     schedule,
                     timezone,
                     prompt,
+                    command,
                     workdir,
                     model,
                     effort,
@@ -613,6 +619,7 @@ async fn operator(
                         schedule,
                         timezone,
                         prompt,
+                        command,
                         workdir,
                         model,
                         effort,
@@ -972,5 +979,51 @@ mod tests {
         assert_eq!(args.max_rounds, Some(12));
         assert_eq!(args.overlap, "allow");
         assert_eq!(args.notify, "on_error");
+    }
+
+    /// 命令直跑模式（§10）：`--command` 与 `--prompt` 二选一，clap 在解析这一步就挡住
+    /// "两个都给"——不必等到发请求才发现。
+    #[test]
+    fn cron_add_command_and_prompt_are_mutually_exclusive_at_parse_time() {
+        let parsed = Cli::parse_from([
+            "komo",
+            "cron",
+            "add",
+            "--name",
+            "backup",
+            "--schedule",
+            "0 3 * * *",
+            "--command",
+            "tar czf /tmp/backup.tgz /data",
+        ]);
+        let Some(Command::Cron {
+            action: CronCommand::Add(args),
+        }) = parsed.command
+        else {
+            panic!("解析不出 cron add");
+        };
+        assert_eq!(
+            args.command.as_deref(),
+            Some("tar czf /tmp/backup.tgz /data")
+        );
+        assert!(args.prompt.is_none());
+
+        assert!(
+            Cli::try_parse_from([
+                "komo",
+                "cron",
+                "add",
+                "--name",
+                "both",
+                "--schedule",
+                "0 9 * * *",
+                "--prompt",
+                "整理",
+                "--command",
+                "echo hi",
+            ])
+            .is_err(),
+            "两个都给，clap 该在解析这一步就拒绝"
+        );
     }
 }

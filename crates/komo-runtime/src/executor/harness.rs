@@ -121,6 +121,7 @@ impl Harness {
                 // 这是一条普通 Run 的输入：不是谁派的子任务。
                 delegate: None,
                 snapshot: None,
+                skip_memory: false,
                 at: self.clock.now(),
             })
             .await

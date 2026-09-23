@@ -282,6 +282,11 @@ pub struct PolicyRule {
     /// shell / Python 一律拒绝（§7.3）。
     #[serde(default)]
     pub requires_isolation: bool,
+    /// 这条 `Ask` **任何范围授权都盖不住**：判定在"有效的范围授权"那一步之前，
+    /// `scopes` 也不接受 `offered_scopes` 追加的 Cron 范围（§7.1「`cron add` 那一条」）。
+    /// 只对 `Effect::Ask` 有意义。
+    #[serde(default)]
+    pub grant_proof: bool,
 }
 
 /// 规则表 = Policy 的全部配置。
@@ -316,6 +321,18 @@ impl RuleTable {
         // 1. 明确 Deny。全表扫描，且在授权之前——**Deny 不可被任何授权覆盖**。
         if let Some(rule) = self.first_match(Effect::Deny, plan, ctx) {
             return PolicyDecision::deny(format!("{}（规则 {}）", rule.reason, rule.id));
+        }
+
+        // 1.5 `grant_proof` 的 Ask：同样排在授权检查之前，且不走 `offered_scopes`——
+        // 已有的 Run / Cron 范围授权（不管它是不是碰巧盖住了这份计划）都不能替这一步
+        // 作答，答复也只能是一次性的（§7.1「cron add」那一条）。
+        if let Some(rule) = self.rules.iter().find(|rule| {
+            rule.effect == Effect::Ask && rule.grant_proof && rule.matcher.matches(plan, ctx)
+        }) {
+            return PolicyDecision::Ask {
+                reason: format!("{}（规则 {}）", rule.reason, rule.id),
+                scopes: normalize_scopes(&rule.scopes),
+            };
         }
 
         // 2. 有效的范围授权。

@@ -22,6 +22,7 @@
 use std::sync::Arc;
 
 use komo_kernel::events::EventPayload;
+use komo_kernel::traits::Ledger;
 use komo_kernel::types::chat::{ChannelPeer, DeliveryTarget, Outbound};
 use komo_kernel::types::ids::{ApprovalId, RunId, SessionId};
 
@@ -147,6 +148,17 @@ async fn step(
             Step::Keep
         }
         EventPayload::RunCompleted(body) => {
+            // 命令 Job（§10）：ok / error 与投递正文从那次 `shell` 调用的落盘结果现读，
+            // 不信 `final_message`——`CommandDriver` 收尾用的是投影过的正文，不是干净
+            // 的 stdout，也分不出退出码是不是 0（它永远正常收尾，见 `command_driver`
+            // 模块文档「工具失败是结果，驱动失败是终止」）。
+            if let Watcher::Cron(watched) = watcher
+                && watched.is_command
+            {
+                let (status, text, deliver) = command_outcome(state, session, run).await;
+                finish(state, session, run, watcher, status, None, text, deliver).await;
+                return Step::Done;
+            }
             let text = body
                 .final_message
                 .clone()
@@ -159,6 +171,7 @@ async fn step(
                 komo_kernel::cron::FiringStatus::Ok,
                 None,
                 text,
+                true,
             )
             .await;
             Step::Done
@@ -172,6 +185,7 @@ async fn step(
                 komo_kernel::cron::FiringStatus::Error,
                 Some(body.reason.clone()),
                 format!("任务失败：{}", body.reason),
+                true,
             )
             .await;
             Step::Done
@@ -185,6 +199,7 @@ async fn step(
                 komo_kernel::cron::FiringStatus::Error,
                 Some("已取消".to_string()),
                 "任务已取消。".to_string(),
+                true,
             )
             .await;
             Step::Done
@@ -204,12 +219,95 @@ async fn step(
                 komo_kernel::cron::FiringStatus::Error,
                 Some(why.clone()),
                 format!("任务已放弃（abandoned）：{why}"),
+                true,
             )
             .await;
             Step::Done
         }
         _ => Step::Keep,
     }
+}
+
+/// 命令 Job 的 firing 结果：`(状态, 投递正文, 要不要投递)`。
+///
+/// - 退出 0、stdout 非空：`Ok`，正文是 trim 过的 stdout **原样**，要投递。
+/// - 退出 0、stdout 为空：`Ok`，不投递——看门狗"没事不说话"（§10）。
+/// - 非 0 退出：`Error`，正文是退出码 + stderr 末尾若干行，要投递（受 `notify` 过滤）。
+/// - 结果读不出来（落盘的东西对不上、还没写完）：留一句说得清出处的话，仍然投递——
+///   静默好过一句假话，但也不该真的什么都不说。
+async fn command_outcome(
+    state: &Arc<GatewayState>,
+    session: &SessionId,
+    run: &RunId,
+) -> (komo_kernel::cron::FiringStatus, String, bool) {
+    use komo_kernel::cron::FiringStatus;
+    let Some(result) = shell_result_of(state, session, run).await else {
+        return (
+            FiringStatus::Error,
+            "命令的执行结果读不出来，去原 Session 看细节（§10）".to_string(),
+            true,
+        );
+    };
+    if result.exit_code == Some(0) {
+        let stdout = result.stdout_tail.trim();
+        if stdout.is_empty() {
+            (FiringStatus::Ok, String::new(), false)
+        } else {
+            (FiringStatus::Ok, stdout.to_string(), true)
+        }
+    } else {
+        let code = result
+            .exit_code
+            .map_or_else(|| "?".to_string(), |code| code.to_string());
+        let stderr = tail_lines(&result.stderr_tail, 20);
+        (FiringStatus::Error, format!("exit={code}\n{stderr}"), true)
+    }
+}
+
+/// 这个 Run 唯一那次 `shell` 调用的落盘结果（§10：命令 Job 全程只发那一个调用）。
+///
+/// 从这一段的 Surface 里找那条工具结果的 `output` 引用，再按引用读回 `output.json`——
+/// 与 `service::segment` 的 `replay` 读法同一条路（§8.3），只是这里要的是**结构化**的
+/// `ShellResult`（`body.result`），不是投影过的模型可读正文。
+async fn shell_result_of(
+    state: &Arc<GatewayState>,
+    session: &SessionId,
+    run: &RunId,
+) -> Option<komo_runtime::tools::shell::ShellResult> {
+    let mut events = Vec::new();
+    let mut from = komo_kernel::types::ids::Seq::ZERO;
+    loop {
+        let batch = state.routed.read(session, from, 0).await.ok()?;
+        if batch.events.is_empty() {
+            break;
+        }
+        for event in batch.events {
+            from = from.max(event.seq);
+            events.push(event);
+        }
+        if batch.next.is_none() {
+            break;
+        }
+    }
+    let surface = komo_kernel::fold::fold(&events);
+    let output = surface.messages.iter().find_map(|message| {
+        if message.run.as_ref() != Some(run) {
+            return None;
+        }
+        message
+            .tool_results
+            .first()
+            .map(|result| result.output.clone())
+    })?;
+    let verified = state.outputs.open(&output).await.ok()?;
+    serde_json::from_value(verified.body.result).ok()
+}
+
+/// 正文的最后 `n` 行——错误摘要用它，别把一屏 stderr 整段糊给操作者。
+fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }
 
 /// 一条"需要人判断"的通知正文（§11.4）。
@@ -236,6 +334,10 @@ async fn question_for(state: &Arc<GatewayState>, run: &RunId, watcher: &Watcher)
 }
 
 /// 收场：回写触发状态（Cron），把结果发回去。
+///
+/// `deliver = false` 只在命令 Job 退出 0、stdout 为空时用（§10：看门狗"没事不说话"）——
+/// 触发状态仍然回写为 `Ok`，只是不经过 `notify` 的那次投递，不能让一个空结果的 Job
+/// 看起来像是没跑过。
 async fn finish(
     state: &Arc<GatewayState>,
     session: &SessionId,
@@ -244,6 +346,7 @@ async fn finish(
     status: komo_kernel::cron::FiringStatus,
     error: Option<String>,
     text: String,
+    deliver: bool,
 ) {
     // **它进终态了，后面等着的那些可以走了**（§8.4 的次序规则）：一条条件 UPDATE 把
     // `waiting + dependency` 且前置已终态的放回 `queued`。对账每一拍也会做（§8.9），但
@@ -269,8 +372,12 @@ async fn finish(
         }
         Watcher::Cron(watched) => {
             super::cron_watch::settle(state, watched, status, error).await;
-            // 取消不报告：那是人自己按下的。
-            if status != komo_kernel::cron::FiringStatus::Error || watched.notify.delivers(status) {
+            // 取消不报告：那是人自己按下的。空输出的命令 Job（`deliver = false`）同样
+            // 不报告，但理由不同——那是看门狗，不是取消。
+            if deliver
+                && (status != komo_kernel::cron::FiringStatus::Error
+                    || watched.notify.delivers(status))
+            {
                 super::cron_watch::notify(state, watched, status, session, run, &text).await;
             }
         }

@@ -437,6 +437,7 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
                 tz: TimeZone::new("Asia/Shanghai"),
             },
             prompt: "把昨天的事说一遍".into(),
+            command: None,
             workdir: None,
             status: JobStatus::Active,
             overlap: OverlapPolicy::Skip,
@@ -454,6 +455,7 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
             version: 1,
             trigger: Trigger::At { at: NOW },
             prompt: "x".into(),
+            command: None,
             workdir: None,
             status: JobStatus::Paused,
             overlap: OverlapPolicy::Allow,
@@ -482,6 +484,7 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
                     status: komo_kernel::cron::FiringStatus::Ok,
                     error: None,
                 }),
+                authorized: false,
             },
             // 上一次被跳过了，**原因在同一行**：一个天天被跳过的 Job 不该和一个天天
             // 跑成的 Job 长得一样。
@@ -498,6 +501,7 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
                     status: komo_kernel::cron::FiringStatus::Skipped,
                     error: Some("上一次触发还没结束".into()),
                 }),
+                authorized: false,
             },
         ],
         jobs,
@@ -538,6 +542,7 @@ fn a_waiting_firing_says_it_is_waiting_for_a_person() {
             tz: TimeZone::new("Europe/Berlin"),
         },
         prompt: "整理".into(),
+        command: None,
         workdir: None,
         status: JobStatus::Active,
         overlap: OverlapPolicy::Skip,
@@ -563,6 +568,7 @@ fn a_waiting_firing_says_it_is_waiting_for_a_person() {
                 status: komo_kernel::cron::FiringStatus::Waiting,
                 error: None,
             }),
+            authorized: false,
         }],
         jobs,
     };
@@ -570,6 +576,50 @@ fn a_waiting_firing_says_it_is_waiting_for_a_person() {
         &cron_list(&response, NOW),
         &["仅出错", "waiting（在等人）", "会话 sess-3"],
     );
+}
+
+/// 命令直跑模式（§10）：`cron list` 要看得出这是命令 Job、命令本身，过长截断。
+#[test]
+fn a_command_job_shows_its_command_truncated() {
+    let long_command = "x".repeat(200);
+    let jobs = vec![CronJob {
+        id: CronJobId::from_raw("job-4"),
+        name: "备份".into(),
+        version: 1,
+        trigger: Trigger::Cron {
+            expr: "0 3 * * *".into(),
+            tz: TimeZone::utc(),
+        },
+        prompt: String::new(),
+        command: Some(long_command.clone()),
+        workdir: None,
+        status: JobStatus::Active,
+        overlap: OverlapPolicy::Skip,
+        model: None,
+        effort: None,
+        skills: vec![],
+        max_rounds: None,
+        notify: Default::default(),
+        next_run_at: Some(NOW + time::Duration::hours(1)),
+        last_error: None,
+    }];
+    let response = komo_kernel::protocol::http::CronListResponse {
+        status: vec![komo_kernel::protocol::http::CronJobStatus {
+            job: CronJobId::from_raw("job-4"),
+            next_run_at: jobs[0].next_run_at,
+            last: None,
+            authorized: true,
+        }],
+        jobs,
+    };
+    let printed = cron_list(&response, NOW);
+    assert!(printed.contains("[命令]"), "{printed}");
+    assert!(
+        !printed.contains(&long_command),
+        "200 个字符不该原样印出来：{printed}"
+    );
+    // add 即授权（§10、§7.2）：这是操作者在 `cron list` 上看得出这条授权存在的地方。
+    assert!(printed.contains("已授权"), "{printed}");
 }
 
 // ---- memory ----

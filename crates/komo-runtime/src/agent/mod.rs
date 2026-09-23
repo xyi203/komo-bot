@@ -106,6 +106,11 @@ pub struct Segment {
     pub budget: Budget,
     /// 接一个已记录回合的续跑。`None` = 从模型的下一轮开始。
     pub resume: Option<ResumedRound>,
+    /// 这是一条**命令直跑**的 Run（§10）：`Some` 时这一段用
+    /// [`command_driver::CommandDriver`] 代替 `LlmClient`，`self.llm` 一次都不会被摸到
+    /// ——判据在 Run 的来源上，由组装 `Segment` 的一侧（`GatewaySegments::segment`）
+    /// 按 Job 定义算出来，这里只管按它选驱动。
+    pub command: Option<command_driver::CommandSpec>,
 }
 
 /// 一段跑完之后 Run 处在哪。
@@ -183,6 +188,7 @@ impl AgentLoop {
             env,
             budget,
             resume,
+            command,
         } = segment;
 
         let mut rounds = 0;
@@ -191,9 +197,15 @@ impl AgentLoop {
             return self.cancel(&run, rounds).await;
         }
 
-        let mut driver = match self.llm.begin_turn(request).await {
-            Ok(driver) => driver,
-            Err(error) => return self.llm_error(&run, rounds, &budget.retry, &error).await,
+        // 选驱动按 Run 的来源（§10）：命令 Job 触发的 Run 用固定出牌的
+        // `CommandDriver`，`self.llm`（真正的模型客户端）一次都不会被摸到——不是把
+        // 命令伪装成另一个 provider，是压根不经过这一层。
+        let mut driver: Box<dyn komo_kernel::traits::TurnDriver> = match command {
+            Some(spec) => Box::new(command_driver::CommandDriver::new(spec, &request.messages)),
+            None => match self.llm.begin_turn(request).await {
+                Ok(driver) => driver,
+                Err(error) => return self.llm_error(&run, rounds, &budget.retry, &error).await,
+            },
         };
 
         // 续跑：先把上一回合剩下的调用跑完，再请求下一轮模型。
@@ -451,6 +463,7 @@ fn spent(usage: &TokenUsage) -> u64 {
     usage.input.unwrap_or(0) + usage.output.unwrap_or(0) + usage.reasoning.unwrap_or(0)
 }
 
+pub mod command_driver;
 pub mod handler;
 
 #[cfg(test)]

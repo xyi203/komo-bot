@@ -385,6 +385,7 @@ impl World {
                 // 这条输入不是委派：它的 Run 没有父。
                 delegate: None,
                 snapshot: None,
+                skip_memory: false,
                 at: NOW,
             })
             .await

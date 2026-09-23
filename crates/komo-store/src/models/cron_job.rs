@@ -18,6 +18,9 @@ pub struct CronJobRow {
     /// `Trigger` 的 JSON（`cron` 表达式 + IANA 区名，或 `@at` 的瞬时）。
     pub trigger: String,
     pub prompt: String,
+    /// 命令直跑模式的那条 shell 命令（§10）。`None` = 这是一条 prompt Job，与
+    /// `prompt` 二选一。
+    pub command: Option<String>,
     pub workdir: Option<String>,
     /// `JobStatus`：active / paused / done。
     pub status: String,
@@ -46,7 +49,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "cron_jobs" ("id" TEXT NOT NULL, "name" TEXT NOT NULL, "version" BIGINT NOT NULL, "trigger" TEXT NOT NULL, "prompt" TEXT NOT NULL, "workdir" TEXT, "status" TEXT NOT NULL, "overlap" TEXT NOT NULL, "model" TEXT, "effort" TEXT, "skills" TEXT NOT NULL, "max_rounds" BIGINT NOT NULL, "notify" TEXT NOT NULL, "next_run_at" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "cron_jobs" ("id" TEXT NOT NULL, "name" TEXT NOT NULL, "version" BIGINT NOT NULL, "trigger" TEXT NOT NULL, "prompt" TEXT NOT NULL, "command" TEXT, "workdir" TEXT, "status" TEXT NOT NULL, "overlap" TEXT NOT NULL, "model" TEXT, "effort" TEXT, "skills" TEXT NOT NULL, "max_rounds" BIGINT NOT NULL, "notify" TEXT NOT NULL, "next_run_at" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -54,6 +57,7 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("version", "BIGINT NOT NULL DEFAULT 1"),
     ColumnSpec::new("trigger", "TEXT NOT NULL DEFAULT '{}'"),
     ColumnSpec::new("prompt", "TEXT NOT NULL DEFAULT ''"),
+    ColumnSpec::new("command", "TEXT"),
     ColumnSpec::new("workdir", "TEXT"),
     ColumnSpec::new("status", "TEXT NOT NULL DEFAULT 'active'"),
     ColumnSpec::new("overlap", "TEXT NOT NULL DEFAULT 'skip'"),

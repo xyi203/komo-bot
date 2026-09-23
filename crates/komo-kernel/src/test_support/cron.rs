@@ -179,6 +179,7 @@ mod tests {
                 version: 1,
                 trigger: parse_schedule("0 9 * * *", &TimeZone::utc(), now, &zones).unwrap(),
                 prompt: "整理今天的动态".into(),
+                command: None,
                 workdir: None,
                 status: JobStatus::Active,
                 overlap: OverlapPolicy::Skip,

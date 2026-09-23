@@ -273,7 +273,9 @@ pub struct CronAdd {
     pub name: String,
     pub schedule: String,
     pub timezone: String,
-    pub prompt: String,
+    /// 与 `command` 二选一（§10）。
+    pub prompt: Option<String>,
+    pub command: Option<String>,
     pub workdir: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -293,12 +295,16 @@ pub async fn cron_add(client: &KomoClient, add: CronAdd) -> Outcome {
             add.notify
         )
     })?;
+    // `--prompt` 与 `--command` 二选一——clap 的 `conflicts_with` 挡了"两个都给"，
+    // 这里补上"一个都没给"（第二道校验，HTTP 那边是第三道，两处都校验，§10）。
+    let (prompt, command) = prompt_or_command(add.prompt, add.command)?;
     let job = client
         .cron_create(&CreateCronRequest {
             name: add.name,
             schedule: add.schedule,
             timezone: add.timezone,
-            prompt: add.prompt,
+            prompt,
+            command,
             workdir: add.workdir,
             model: add.model,
             effort: add.effort.as_deref().map(Effort::new),
@@ -325,6 +331,21 @@ pub fn added_line(job: &komo_kernel::cron::CronJob) -> String {
         None => "—".to_string(),
     };
     format!("已创建 {}（{}）；下一次 {next}", job.name, job.id)
+}
+
+/// `--prompt` 与 `--command` 二选一（§10）：clap 的 `conflicts_with` 已经挡住"两个都
+/// 给"，这里补上"一个都没给"，产出发请求要的形状——`CreateCronRequest.prompt` 仍是
+/// 必填的 `String`，命令 Job 那一列写空串（§8.2 的惯例）。
+fn prompt_or_command(
+    prompt: Option<String>,
+    command: Option<String>,
+) -> Result<(String, Option<String>), String> {
+    match (prompt, command) {
+        (Some(prompt), None) => Ok((prompt, None)),
+        (None, Some(command)) => Ok((String::new(), Some(command))),
+        (None, None) => Err("--prompt 与 --command 必须给一个（§10）".into()),
+        (Some(_), Some(_)) => Err("--prompt 与 --command 二选一，不能同时给（§10）".into()),
+    }
 }
 
 fn parse_overlap(raw: &str) -> Result<OverlapPolicy, String> {
@@ -885,6 +906,7 @@ mod cron_render_tests {
                 tz: TimeZone::new("Asia/Shanghai"),
             },
             prompt: "整理".into(),
+            command: None,
             workdir: None,
             status: JobStatus::Active,
             overlap: OverlapPolicy::Skip,
@@ -975,6 +997,24 @@ mod cron_render_tests {
 
         assert!(NotifyPolicy::parse("nerver").is_none());
         assert_eq!(NotifyPolicy::parse("never"), Some(NotifyPolicy::Never));
+    }
+
+    /// `--prompt` 与 `--command` 二选一（§10）：CLI 这一侧的第二道校验（第一道是
+    /// clap 的 `conflicts_with`，见 `main.rs` 的解析测试）。
+    #[test]
+    fn prompt_and_command_are_mutually_exclusive_and_one_is_required() {
+        assert_eq!(
+            prompt_or_command(Some("整理今天的动态".into()), None).unwrap(),
+            ("整理今天的动态".to_string(), None)
+        );
+        assert_eq!(
+            prompt_or_command(None, Some("echo hi".into())).unwrap(),
+            (String::new(), Some("echo hi".to_string()))
+        );
+        let neither = prompt_or_command(None, None).unwrap_err();
+        assert!(neither.contains("必须给一个"), "{neither}");
+        let both = prompt_or_command(Some("x".into()), Some("y".into())).unwrap_err();
+        assert!(both.contains("二选一"), "{both}");
     }
 }
 

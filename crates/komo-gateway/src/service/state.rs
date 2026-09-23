@@ -1095,6 +1095,8 @@ impl GatewayState {
                 // 交互输入不是委派：子 Run 只由 executor 在委托那一步受理（§4）。
                 delegate: None,
                 snapshot: Some(Box::new(frozen)),
+                // 交互输入是真的对话，记忆提取照常（§9.3）；跳过只留给命令 Job（§10）。
+                skip_memory: false,
                 at: self.clock.now(),
             })
             .await?;

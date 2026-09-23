@@ -222,6 +222,11 @@ pub struct AcceptInput {
     /// [`crate::types::model::ModelConfig`]，而这个结构在受理路径上是按值搬的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Box<crate::types::agent::RunSnapshot>>,
+    /// 这条 Run 不必整理记忆：命令 Job 触发的 Run 没有对话可提取，记忆提取本身要发一次
+    /// 模型请求，而命令 Run 全程零模型请求（§9.3、§10）。落账时直接记
+    /// `MemoryWork::Done`，不进后台处理队列。
+    #[serde(default)]
+    pub skip_memory: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
 }
@@ -320,6 +325,7 @@ mod tests {
             workdir: None,
             delegate: None,
             snapshot: None,
+            skip_memory: false,
             at: datetime!(2026-09-15 08:00:00 UTC),
         };
         let first = input.input_hash();

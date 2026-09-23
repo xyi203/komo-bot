@@ -433,6 +433,7 @@ mod tests {
             at: TestClock::fixed().now(),
             delegate: None,
             snapshot: None,
+            skip_memory: false,
         }
     }
 

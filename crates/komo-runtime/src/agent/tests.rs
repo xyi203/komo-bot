@@ -11,7 +11,7 @@ use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
 use komo_kernel::types::tool::{CancelToken, ToolError, ToolOutput};
 use komo_kernel::types::turn::{Role, Round};
 
-use super::tests_support::{FailingLlm, call, round, turn_request};
+use super::tests_support::{FailingLlm, PanickingLlm, call, round, turn_request};
 use super::{AgentLoop, Budget, RetryBudget, Segment, SegmentOutcome};
 use crate::executor::harness::{Harness, RecordingTool};
 
@@ -26,6 +26,14 @@ impl Wired {
         tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
         permissive: bool,
     ) -> Self {
+        Self::with_llm(Arc::new(ScriptedLlm::new(scripts)), tools, permissive)
+    }
+
+    fn with_llm(
+        llm: Arc<dyn komo_kernel::traits::LlmClient>,
+        tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
+        permissive: bool,
+    ) -> Self {
         let harness = Harness::new();
         let executor = if permissive {
             harness.permissive(tools)
@@ -33,7 +41,7 @@ impl Wired {
             harness.initial(tools)
         };
         let agent = AgentLoop::new(
-            Arc::new(ScriptedLlm::new(scripts)),
+            llm,
             harness.ledger.clone(),
             executor,
             Arc::new(harness.clock.clone()),
@@ -42,12 +50,21 @@ impl Wired {
     }
 
     async fn segment(&self, cancel: CancelToken) -> Segment {
+        self.command_segment(cancel, None).await
+    }
+
+    async fn command_segment(
+        &self,
+        cancel: CancelToken,
+        command: Option<super::command_driver::CommandSpec>,
+    ) -> Segment {
         let (session, run) = self.harness.open_run().await;
         Segment {
             request: turn_request(&session, &run),
             env: self.harness.env_with_cancel(&session, &run, cancel),
             budget: Budget::default(),
             resume: None,
+            command,
             session,
             run,
         }
@@ -244,6 +261,7 @@ async fn a_tool_failure_is_handed_to_the_model_and_the_run_carries_on() {
             env: harness.env(&session, &run),
             budget: Budget::default(),
             resume: None,
+            command: None,
             session,
             run,
         })
@@ -337,6 +355,7 @@ async fn the_round_budget_ends_in_a_failure_not_a_loop() {
                 ..Budget::default()
             },
             resume: None,
+            command: None,
             session,
             run,
         })
@@ -413,6 +432,7 @@ async fn a_resumed_segment_finishes_the_round_it_came_back_to() {
                 settled: vec![],
                 pending,
             }),
+            command: None,
             session,
             run,
         })
@@ -459,6 +479,7 @@ async fn a_resumed_segment_can_suspend_again() {
                 settled: vec![],
                 pending,
             }),
+            command: None,
             session,
             run,
         })
@@ -543,6 +564,7 @@ async fn one_segment_begins_exactly_one_turn() {
             env: harness.env(&session, &run),
             budget: Budget::default(),
             resume: None,
+            command: None,
             session: session.clone(),
             run: run.clone(),
         })
@@ -585,6 +607,7 @@ async fn the_driver_is_handed_results_paired_by_provider_call_id() {
             env: harness.env(&session, &run),
             budget: Budget::default(),
             resume: None,
+            command: None,
             session,
             run,
         })
@@ -663,6 +686,7 @@ async fn a_retryable_model_error_suspends_on_a_backoff_instead_of_failing() {
             env: harness.env(&session, &run),
             budget: Budget::default(),
             resume: None,
+            command: None,
             session,
             run: run.clone(),
         })
@@ -724,6 +748,7 @@ async fn an_unknown_model_outcome_is_not_retried() {
             env: harness.env(&session, &run),
             budget: Budget::default(),
             resume: None,
+            command: None,
             session,
             run,
         })
@@ -762,6 +787,7 @@ async fn an_exhausted_retry_budget_ends_in_a_failure() {
                 ..Budget::default()
             },
             resume: None,
+            command: None,
             session,
             run: run.clone(),
         })
@@ -808,6 +834,7 @@ async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
                 ..Budget::default()
             },
             resume: None,
+            command: None,
             session,
             run: run.clone(),
         })
@@ -844,4 +871,70 @@ async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
         })
         .expect("有一条 run.waiting");
     assert_eq!(waiting, 3);
+}
+
+// ---- 命令直跑模式（§10）：选驱动按 Run 的来源，命令 Run 全程零模型请求 ----
+
+/// 选驱动的接缝在 `AgentLoop::run` 里：`segment.command` 一给，`self.llm` 一次都不会
+/// 被摸到——不是"这次没观察到调用"，而是接了一个**碰就 panic** 的假 `LlmClient` 还是
+/// 没炸。第一轮固定发那个 `shell` 调用，最终答复就是那条工具结果的正文。
+#[tokio::test]
+async fn a_command_run_never_touches_the_llm_client_and_finishes_with_the_shell_result() {
+    let tool = Arc::new(RecordingTool::shell().with_outcome(Ok(ToolOutput {
+        status: ToolResultStatus::Completed,
+        result: serde_json::json!({}),
+        exit_code: Some(0),
+        artifacts: vec![],
+        preview: Some("hi".into()),
+    })));
+    let wired = Wired::with_llm(Arc::new(PanickingLlm), vec![tool.clone()], true);
+    let segment = wired
+        .command_segment(
+            CancelToken::new(),
+            Some(super::command_driver::CommandSpec {
+                command: "echo hi".into(),
+            }),
+        )
+        .await;
+
+    let outcome = wired.agent.run(segment).await.unwrap();
+    let SegmentOutcome::Completed { final_message, .. } = &outcome else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(tool.ran(), 1, "那条 shell 调用真的执行了一次");
+    assert!(
+        final_message
+            .as_deref()
+            .is_some_and(|text| text.contains("hi")),
+        "{final_message:?}"
+    );
+}
+
+/// 命令为空输出、非 0 退出，都是**结果**，不是驱动错误——"工具失败是结果，驱动失败
+/// 是终止"（§6）对命令 Run 同样成立：`CommandDriver` 永远正常收尾，ok / error 的区分
+/// 是投递那一层的事（cron_watch），不是这里的事。
+#[tokio::test]
+async fn a_non_zero_exit_still_completes_the_run_not_fails_it() {
+    let tool = Arc::new(RecordingTool::shell().with_outcome(Ok(ToolOutput {
+        status: ToolResultStatus::Failed,
+        result: serde_json::json!({}),
+        exit_code: Some(1),
+        artifacts: vec![],
+        preview: Some("boom".into()),
+    })));
+    let wired = Wired::with_llm(Arc::new(PanickingLlm), vec![tool], true);
+    let segment = wired
+        .command_segment(
+            CancelToken::new(),
+            Some(super::command_driver::CommandSpec {
+                command: "exit 1".into(),
+            }),
+        )
+        .await;
+
+    let outcome = wired.agent.run(segment).await.unwrap();
+    assert!(
+        matches!(outcome, SegmentOutcome::Completed { .. }),
+        "{outcome:?}"
+    );
 }

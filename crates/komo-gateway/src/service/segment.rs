@@ -253,6 +253,36 @@ impl GatewaySegments {
         }
     }
 
+    /// 这一段是不是**命令直跑模式**（§10）：命令 Job 触发的 Run 不经模型，`AgentLoop`
+    /// 用 [`komo_runtime::agent::command_driver::CommandDriver`] 代替 `LlmClient`。
+    ///
+    /// 判据只看 Job 定义（`command.is_some()`），不看别的：子代理不会由命令 Job 派生
+    /// （`CommandDriver` 从不发出 `delegate` 调用），但仍然显式排掉 `delegate.is_some()`
+    /// ——这一段要装配的是父 Run 继续走模型，不是意外地换成命令驱动。
+    async fn command_for(
+        &self,
+        source: &komo_kernel::types::plan::PlanSource,
+        is_delegate: bool,
+    ) -> Option<komo_runtime::agent::command_driver::CommandSpec> {
+        if is_delegate {
+            return None;
+        }
+        let komo_kernel::types::plan::PlanSource::Cron { job, .. } = source else {
+            return None;
+        };
+        let cron = self.cron.as_ref()?;
+        match cron.get(job).await {
+            Ok(Some(job)) => job
+                .command
+                .map(|command| komo_runtime::agent::command_driver::CommandSpec { command }),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(%error, %job, "读不出这个 Job，按普通模型 Run 装配");
+                None
+            }
+        }
+    }
+
     /// 这个 Run 的取消开关。**取消通过明确操作发起**（§13.1）——CLI 退出不取消。
     pub fn cancel(&self, run: &RunId) {
         if let Some(token) = self.cancels.lock().expect("取消表").get(run) {
@@ -519,6 +549,8 @@ impl SegmentSource for GatewaySegments {
             Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
         };
 
+        let command = self.command_for(&record.source, delegate.is_some()).await;
+
         Ok(Segment {
             session,
             run,
@@ -526,6 +558,7 @@ impl SegmentSource for GatewaySegments {
             env,
             budget,
             resume,
+            command,
         })
     }
 }

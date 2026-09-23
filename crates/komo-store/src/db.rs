@@ -1014,6 +1014,65 @@ mod tests {
         );
     }
 
+    /// `cron_jobs.command`（命令直跑模式，Cron 加法字段）在**旧形状**的表上补得回来，
+    /// 旧行读成 `None`（这一列本来就没有），新写的命令 Job 逐字往返。
+    #[tokio::test]
+    async fn the_command_column_is_added_to_an_existing_cron_jobs_table_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        let legacy = crate::models::cron_job::DDL.replace(r#""command" TEXT, "#, "");
+        assert!(!legacy.contains(r#""command""#), "旧形状里不该有 command");
+        plain_build_old(&path, Some(("cron_jobs", legacy))).await;
+
+        let before = plain_columns(&path, "cron_jobs").await;
+        assert!(
+            !before.iter().any(|name| name == "command"),
+            "旧形状没落盘：{before:?}"
+        );
+
+        let db = Db::connect(&path).await.unwrap();
+        let after = plain_columns(&path, "cron_jobs").await;
+        assert!(
+            after.iter().any(|name| name == "command"),
+            "补回来了，而且落盘：{after:?}"
+        );
+
+        // 命令 Job 逐字往返：新列既补得回来，也真的读写得通。
+        use komo_kernel::cron::{CronJob, JobStatus, OverlapPolicy, TimeZone, Trigger};
+        use komo_kernel::traits::CronRepo;
+        use komo_kernel::types::ids::CronJobId;
+        let repo = crate::repos::cron::TursoCronRepo::new(db);
+        let job = CronJob {
+            id: CronJobId::from_raw("job-cmd"),
+            name: "backup".into(),
+            version: 1,
+            trigger: Trigger::Cron {
+                expr: "0 3 * * *".into(),
+                tz: TimeZone::utc(),
+            },
+            prompt: String::new(),
+            command: Some("tar czf /tmp/backup.tgz /data".into()),
+            workdir: None,
+            status: JobStatus::Active,
+            overlap: OverlapPolicy::Skip,
+            model: None,
+            effort: None,
+            skills: vec![],
+            max_rounds: None,
+            notify: Default::default(),
+            next_run_at: None,
+            last_error: None,
+        };
+        let stored = repo.put(job).await.unwrap();
+        let read = repo.get(&stored.id).await.unwrap().unwrap();
+        assert_eq!(
+            read.command.as_deref(),
+            Some("tar czf /tmp/backup.tgz /data")
+        );
+        assert_eq!(read.prompt, "", "命令 Job 的 prompt 列写空串");
+    }
+
     /// 把 `sessions` 退回"还没有 Agent 归属"的旧形状：**先丢掉引用了那两列的索引，再删列**
     /// ——老库里既没有那条索引，也没有这两列。真机上老库就是这么长出来的。
     async fn plain_roll_back_agent_columns(path: &Path) {

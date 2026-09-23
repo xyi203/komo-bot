@@ -43,6 +43,7 @@ async fn seed_waiting_retry(
         effort: None,
         // 这条 Run 不是被派出来的（§4）：委派那条路要带 DelegateSpec。
         delegate: None,
+        skip_memory: false,
         at: now,
     };
     let wait = WaitReason::Retry {

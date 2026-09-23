@@ -97,6 +97,9 @@ pub struct NewRun {
     pub peer: Option<String>,
     pub model: ModelConfig,
     pub effort: Option<String>,
+    /// 这条 Run 不必整理记忆——命令 Job 触发的 Run 没有对话可提取，也不该为它请一次
+    /// 模型（§9.3、§10）。`true` 时直接落 `MemoryWork::Done`，不进后台处理队列。
+    pub skip_memory: bool,
     pub at: OffsetDateTime,
 }
 
@@ -283,7 +286,11 @@ pub async fn reserve_in(ex: &mut dyn Executor, new: &NewRun) -> Result<RunRow, S
         model_snapshot: encode(&new.model)?,
         effort: new.effort.clone(),
         grants: "[]".to_string(),
-        memory_work: memory_work_str(MemoryWork::Pending),
+        memory_work: memory_work_str(if new.skip_memory {
+            MemoryWork::Done
+        } else {
+            MemoryWork::Pending
+        }),
         memory_cursor: 0_i64,
         last_error: None as Option<String>,
         created_at: to_ts(new.at),

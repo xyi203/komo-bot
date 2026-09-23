@@ -8,18 +8,22 @@
 //! ```
 
 use super::*;
+use komo_agent::context::history::{self, ReplayScope};
+use komo_agent::context::{ContextInput, InvocationContext, assemble};
+use komo_agent::skills::SkillRegistry;
 use komo_kernel::events::{ConversationBoundary, MessageAssistant, RunCompleted, RunStarted};
 use komo_kernel::test_support::{MemOutputStore, MemOutputWriter};
 use komo_kernel::types::delegate::{DelegateSpec, SchemaMode};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, MemoryId, RequestKey};
 use komo_kernel::types::memory::{
-    Confirmation, ExtractionMetadata, MemoryItem, MemoryKind, MemoryState, Provenance,
+    Confirmation, ExtractionMetadata, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
 };
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::refs::{
     AttemptRef, ContentRef, PayloadRef, ToolResultBody, ToolResultStatus,
 };
+use komo_kernel::types::turn::ToolCallRequest;
 
 const CWD: &str = "/work/komo";
 const NOW: time::OffsetDateTime = time::macros::datetime!(2026-09-16 08:00:00 UTC);
@@ -54,6 +58,10 @@ impl Case {
 }
 
 /// 按生产路径装配一份上下文，渲染成一段可比较的文本。
+///
+/// 这是 `segment()` 走的**同一条路**：`context_sources` 的取数函数 + 唯一的装配入口
+/// `komo_agent::context::assemble`（`docs/agent.md` §20 Phase 0 那句"场景与基线文件都
+/// 不动，只改这一个函数怎么装配"）。
 async fn render(case: &Case) -> String {
     let surface = fold(&case.events);
     let delegate = surface
@@ -64,43 +72,56 @@ async fn render(case: &Case) -> String {
         Some(_) => ReplayScope::Run(&case.run),
         None => ReplayScope::Conversation(&case.run),
     };
-    let skills_block = match &case.skills {
-        Some(dir) => {
-            let registry = komo_agent::skills::SkillRegistry::new(vec![dir.path().to_path_buf()]);
-            let names: Vec<String> = case.tools.iter().map(|tool| tool.name.clone()).collect();
-            crate::service::state::skills_block(&registry, &names)
+    let tool_names: Vec<String> = case.tools.iter().map(|tool| tool.name.clone()).collect();
+    // 子代理不看目录（§12）；主 Agent 才读一次活注册表。
+    let skills = match (&delegate, &case.skills) {
+        (None, Some(dir)) => {
+            let registry =
+                std::sync::RwLock::new(SkillRegistry::new(vec![dir.path().to_path_buf()]));
+            context_sources::skill_catalog(Some(&registry), &tool_names)
         }
-        None => String::new(),
+        _ => None,
     };
-    let cwd = std::path::Path::new(CWD);
-    let prompt = match &delegate {
-        Some(spec) => subagent_prompt(cwd, &case.tools, spec),
-        None => system_prompt(cwd, &case.tools, &skills_block),
+    let invocation = match &delegate {
+        Some(spec) => InvocationContext::Delegated(spec.clone()),
+        None => InvocationContext::Main,
     };
-    let mut prompt = with_instructions(case.instructions, prompt);
-    // 适配器在发送前追加的那一段（`SystemPreamble`）。
+
+    let selected = history::entries(&surface, scope);
+    let resolved = context_sources::resolve_history(
+        selected,
+        &case.payloads,
+        case.outputs
+            .as_ref()
+            .map(|outputs| outputs as &dyn ToolOutputStore),
+    )
+    .await
+    .expect("装配得出来");
+
+    let context = assemble(ContextInput {
+        instructions: case.instructions.map(str::to_string),
+        workspace: std::path::PathBuf::from(CWD),
+        tools: tool_names,
+        history: resolved,
+        memory: None,
+        skills,
+        invocation,
+        model_result_bytes: case.model_result_bytes,
+    });
+    let mut prompt = context.system_prompt;
+    // 适配器在发送前追加的那一段（`SystemPreamble`）。Phase 5 之前 `ContextInput.memory`
+    // 恒为 `None`，这一段仍由 Gateway 自己按适配器的方式拼在最后。
     let injection = komo_runtime::memory::render_injection(&case.memories, 1_000);
     if let Some(text) = injection.text {
         prompt.push_str("\n\n");
         prompt.push_str(&text);
     }
-    let messages = replay(
-        &surface,
-        scope,
-        &case.payloads,
-        case.outputs
-            .as_ref()
-            .map(|outputs| outputs as &dyn ToolOutputStore),
-        case.model_result_bytes,
-    )
-    .await
-    .expect("装配得出来");
 
     let mut out = String::new();
     out.push_str("=== system ===\n");
     out.push_str(&prompt);
     out.push_str("\n=== messages ===\n");
-    out.push_str(&serde_json::to_string_pretty(&messages).expect("序列化"));
+    out.push_str(&serde_json::to_string_pretty(&context.messages).expect("序列化"));
     out.push('\n');
     match &case.skills {
         Some(dir) => out.replace(&dir.path().display().to_string(), "<SKILLS>"),

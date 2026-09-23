@@ -33,14 +33,22 @@ enum Shape {
     NamesOnly,
 }
 
-/// 一次目录渲染：谁在里面、用哪种形状、因为装不下少了几个。
-struct Catalog {
+/// 一次目录渲染：谁在里面、用哪种形状、因为装不下少了几个、出了条目的那些根。
+///
+/// 这是 `docs/agent.md` §14 的那份**值**：`SkillRegistry::offer` 现读现渲染出来
+/// （discovery），`ContextInput.skills` 拿到手上之后只剩 [`Self::prompt_block`] 这一步
+/// 纯渲染（presentation）——两件事不再混在一起，以后要把目录钉住（§9 缺口 1）时，钉的
+/// 就是这一份值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillCatalog {
     skills: Vec<Skill>,
     shape: Shape,
     dropped: usize,
+    /// 按序的、真的出了条目的那些根（§5.6：目录行里的名字要能顺着这个顺序定位到文件）。
+    roots: Vec<String>,
 }
 
-impl Catalog {
+impl SkillCatalog {
     fn line(&self, skill: &Skill) -> String {
         match self.shape {
             Shape::Full => skill.catalog_line(),
@@ -56,6 +64,29 @@ impl Catalog {
             lines.push(note_text(self.dropped));
         }
         lines.join("\n")
+    }
+
+    /// 系统提示里要拼的那一块（§5.6）：先给**按序的根**，再给目录行。
+    ///
+    /// 根只列真的出了条目的那几个，顺序就是搜索顺序——目录行里的名字要能顺着这个顺序
+    /// 定位到文件（`<根>/<名字>/SKILL.md`），"同名先到先得"这件事才落得下来：模型按这个
+    /// 顺序找，先撞上的那份正是加载时生效的那一份。
+    ///
+    /// 一条能露面的都没有时回答 `None`：那种情况下系统提示**一个字都不多**，不因为
+    /// "配置里有 skills 概念"就凭空多出一段空标题。
+    pub fn prompt_block(&self) -> Option<String> {
+        if self.skills.is_empty() {
+            return None;
+        }
+        let mut block = String::from(
+            "Skills（人写的操作说明；要用的时候按下面的顺序找 <根>/<名字>/SKILL.md，\
+             用 read 读了再照做）：\n",
+        );
+        block.push_str("根：");
+        block.push_str(&self.roots.join("、"));
+        block.push('\n');
+        block.push_str(&self.text());
+        Some(block)
     }
 }
 
@@ -272,47 +303,59 @@ impl SkillRegistry {
         self.catalog_of(context).skills
     }
 
+    /// 门控后的目录（值，`docs/agent.md` §14）：Gateway 在 I/O 阶段读一次这个活注册表，
+    /// 交给 `komo-agent` 的 `ContextInput.skills`；渲染是 [`SkillCatalog::prompt_block`]
+    /// 纯做的那一步。
+    pub fn offer(&self, context: &OfferContext) -> SkillCatalog {
+        self.catalog_of(context)
+    }
+
     /// 候选与形状。
     ///
     /// **列全比列得详细更要紧**：一条 skill 不在目录里，模型就不知道它存在（真实会话里它为
     /// 了找 `log-diagnosis` 去 `ls` 了整个目录，然后一路找下去）。所以"名字 + 一句描述"整批
     /// 装得下就用它，装不下就退成**只有名字**，而不是按顺序砍掉后面那些人。
-    fn catalog_of(&self, context: &OfferContext) -> Catalog {
+    fn catalog_of(&self, context: &OfferContext) -> SkillCatalog {
         let candidates = self.candidates(context);
         let full: usize = candidates
             .iter()
             .map(|skill| cost(&skill.catalog_line()))
             .sum();
-        if full <= context.max_chars {
-            return Catalog {
-                skills: candidates,
-                shape: Shape::Full,
-                dropped: 0,
-            };
-        }
-
-        let total = candidates.len();
-        let mut skills = Vec::new();
-        let mut used = 0usize;
-        for (index, skill) in candidates.iter().enumerate() {
-            // 末尾那句"另有 N 条没列出来"也要在预算里——它是**要说的那句话**，不是装饰。
-            let rest = total - index - 1;
-            let note = if rest == 0 { 0 } else { cost(&note_text(rest)) };
-            let line = cost(&format!("- {}", skill.name));
-            if used + line + note > context.max_chars {
-                break;
+        let (skills, shape, dropped) = if full <= context.max_chars {
+            (candidates, Shape::Full, 0)
+        } else {
+            let total = candidates.len();
+            let mut skills = Vec::new();
+            let mut used = 0usize;
+            for (index, skill) in candidates.iter().enumerate() {
+                // 末尾那句"另有 N 条没列出来"也要在预算里——它是**要说的那句话**，不是装饰。
+                let rest = total - index - 1;
+                let note = if rest == 0 { 0 } else { cost(&note_text(rest)) };
+                let line = cost(&format!("- {}", skill.name));
+                if used + line + note > context.max_chars {
+                    break;
+                }
+                used += line;
+                skills.push(skill.clone());
             }
-            used += line;
-            skills.push(skill.clone());
-        }
-        let dropped = total - skills.len();
-        if dropped > 0 {
-            tracing::debug!(dropped, "名字都装不下：目录行到此为止");
-        }
-        Catalog {
+            let dropped = total - skills.len();
+            if dropped > 0 {
+                tracing::debug!(dropped, "名字都装不下：目录行到此为止");
+            }
+            (skills, Shape::NamesOnly, dropped)
+        };
+        // 根只列真的出了条目的那几个（§5.6），顺序即注册表的搜索顺序。
+        let roots: Vec<String> = self
+            .dirs
+            .iter()
+            .filter(|dir| skills.iter().any(|skill| skill.path.starts_with(dir)))
+            .map(|dir| dir.display().to_string())
+            .collect();
+        SkillCatalog {
             skills,
-            shape: Shape::NamesOnly,
+            shape,
             dropped,
+            roots,
         }
     }
 
@@ -331,39 +374,11 @@ impl SkillRegistry {
         self.catalog_of(context).text()
     }
 
-    /// 系统提示里要拼的那一块（§5.6）：先给**按序的根**，再给目录行。
-    ///
-    /// 根只列真的出了条目的那几个，顺序就是搜索顺序——目录行里的名字要能顺着这个顺序
-    /// 定位到文件（`<根>/<名字>/SKILL.md`），"同名先到先得"这件事才落得下来：模型按这个
-    /// 顺序找，先撞上的那份正是加载时生效的那一份。
-    ///
-    /// 一条能露面的都没有时回答 `None`：那种情况下系统提示**一个字都不多**，不因为
-    /// "配置里有 skills 概念"就凭空多出一段空标题。
+    /// 系统提示里要拼的那一块（§5.6）。**只是转手**：discovery（[`Self::offer`]）与
+    /// presentation（[`SkillCatalog::prompt_block`]）两步现在分开了，这个方法留给别的
+    /// 调用方——一步到位不想自己捏一份 `OfferContext` 之后又构造一次目录。
     pub fn prompt_block(&self, context: &OfferContext) -> Option<String> {
-        let catalog = self.catalog_of(context);
-        if catalog.skills.is_empty() {
-            return None;
-        }
-        let roots: Vec<String> = self
-            .dirs
-            .iter()
-            .filter(|dir| {
-                catalog
-                    .skills
-                    .iter()
-                    .any(|skill| skill.path.starts_with(dir))
-            })
-            .map(|dir| dir.display().to_string())
-            .collect();
-        let mut block = String::from(
-            "Skills（人写的操作说明；要用的时候按下面的顺序找 <根>/<名字>/SKILL.md，\
-             用 read 读了再照做）：\n",
-        );
-        block.push_str("根：");
-        block.push_str(&roots.join("、"));
-        block.push('\n');
-        block.push_str(&catalog.text());
-        Some(block)
+        self.offer(context).prompt_block()
     }
 
     /// 被 `disable` 隐藏的名字。

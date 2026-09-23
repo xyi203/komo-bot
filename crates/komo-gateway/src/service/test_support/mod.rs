@@ -85,6 +85,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
         base_url: "https://llm.example.com/v1".into(),
         model: "gpt-test".into(),
         api_key_env: "KOMO_LLM_API_KEY".into(),
+        auth: None,
         effort: None,
         efforts: None,
         timeout_secs: 120,

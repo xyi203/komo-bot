@@ -312,6 +312,7 @@ mod tests {
                 base_url: "https://x/v1".into(),
                 model: "m".into(),
                 api_key_env: "K".into(),
+                auth: None,
                 effort: None,
                 efforts: None,
                 timeout_secs: 120,

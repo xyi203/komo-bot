@@ -22,6 +22,7 @@ fn model(provider: &str, name: &str, key_env: &str, effort: Option<&str>) -> Mod
         base_url: "https://llm.example.com/v1".into(),
         model: name.into(),
         api_key_env: key_env.into(),
+        auth: None,
         effort: effort.map(Effort::new),
         efforts: None,
         timeout_secs: 120,

@@ -76,6 +76,11 @@ enum Command {
         #[command(subcommand)]
         action: ChannelCommand,
     },
+    /// 账号 OAuth 登录；不经 Gateway，凭证写入数据目录（§3、§13.3）。
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommand,
+    },
     /// Skills 目录；只读文件系统，不经 Gateway（§5.6）。
     Skills {
         #[command(subcommand)]
@@ -344,6 +349,23 @@ enum WechatCommand {
 }
 
 #[derive(Subcommand)]
+enum AuthCommand {
+    /// Codex 模型走的 ChatGPT 账号 OAuth（§13.3）。
+    Codex {
+        #[command(subcommand)]
+        action: CodexAuthCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CodexAuthCommand {
+    /// 设备码登录：显示配对码与网址，轮询直到确认或超时（约 10 分钟）。
+    Login,
+    /// 账号、邮箱、套餐与过期时间；不打印 token。
+    Status,
+}
+
+#[derive(Subcommand)]
 enum ToolboxCommand {
     /// 列出模块：已启用的、只有候选的，都算。
     List,
@@ -473,6 +495,26 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
                         .map(|_| Some(format!("微信登录成功，凭证已写入 {}", path.display())))
                         .map_err(|error| error.to_string())
                 }
+            },
+        },
+        // 不经 Gateway（§3、§13.3）：设备码登录直接落盘，同微信登录的先例。
+        Some(Command::Auth { action }) => match action {
+            AuthCommand::Codex { action } => match action {
+                CodexAuthCommand::Login => {
+                    let path = komo_gateway::codex_auth::credentials_path(home);
+                    let mut out = std::io::stderr();
+                    komo_gateway::codex_auth::login(&path, &mut out)
+                        .await
+                        .map(|creds| {
+                            Some(format!(
+                                "ChatGPT 登录成功，凭证已写入 {}（账号 {}）",
+                                path.display(),
+                                creds.account_id
+                            ))
+                        })
+                        .map_err(|error| error.to_string())
+                }
+                CodexAuthCommand::Status => commands::auth_codex_status(home).map(Some),
             },
         },
         Some(Command::Skills { action }) => {

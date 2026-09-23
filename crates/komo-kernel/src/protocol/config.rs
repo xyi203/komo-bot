@@ -409,6 +409,7 @@ mod tests {
             base_url: "https://llm.example.com/v1".into(),
             model: name.into(),
             api_key_env: "KOMO_LLM_API_KEY".into(),
+            auth: None,
             effort: Some(Effort::new("medium")),
             efforts: None,
             timeout_secs: 120,

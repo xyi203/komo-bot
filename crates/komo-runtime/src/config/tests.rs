@@ -59,6 +59,68 @@ fn a_model_overrides_its_providers_connection_defaults_as_one_unit() {
     assert_eq!(loaded.snapshot.model, *chat);
 }
 
+/// `[model_providers.codex]` 的例子（docs/komo_bot.md §13.3）：`auth = "chatgpt"`，
+/// 没有 `env_key`——那条路的凭证是 ChatGPT 账号 OAuth，不是 `.env` 变量。
+fn chatgpt_config_text() -> &'static str {
+    r#"
+default_agent = "assistant"
+
+[agents.assistant]
+
+[model_providers.codex]
+base_url = "https://chatgpt.com/backend-api/codex"
+api_backend = "responses"
+auth = "chatgpt"
+
+[model.chat]
+type = "completion"
+model = "gpt-5-codex"
+model_provider = "codex"
+
+[models]
+default = "chat"
+
+[memory]
+enabled = false
+"#
+}
+
+/// `auth = "chatgpt"` 需要凭证文件——没有就在装载阶段整体拒绝并指名该跑的命令。
+#[test]
+fn auth_chatgpt_without_its_credential_file_refuses_the_whole_load() {
+    let fixture = Fixture::valid();
+    write(&fixture.sources().config, chatgpt_config_text());
+
+    let error = load_config(&fixture.options()).unwrap_err();
+    let ConfigError::Invalid { issues } = &error else {
+        panic!("{error:?}")
+    };
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(issues[0].key.as_str(), "model.chat.auth");
+    assert!(
+        issues[0].message.contains("komo auth codex login"),
+        "{:?}",
+        issues[0]
+    );
+}
+
+/// 凭证文件在，就不需要 `.env` 里的任何变量；`api_key_env` 解成空串。
+#[test]
+fn auth_chatgpt_with_its_credential_file_present_needs_no_env_variable() {
+    let fixture = Fixture::valid();
+    write(&fixture.sources().config, chatgpt_config_text());
+    write(
+        &fixture.path().join("codex").join("auth.json"),
+        r#"{"access_token":"a","refresh_token":"r","account_id":"acct","expires_at":"2099-01-01T00:00:00Z"}"#,
+    );
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+    let chat = loaded.snapshot.model_catalog.completion("chat").unwrap();
+    assert_eq!(chat.auth.as_deref(), Some("chatgpt"));
+    assert_eq!(chat.api_key_env, "");
+}
+
 #[test]
 fn role_aliases_must_point_at_the_right_model_type() {
     let fixture = Fixture::valid();

@@ -639,6 +639,22 @@ pub async fn channel_probe(home: &Path) -> Outcome {
     Ok(lines.join("\n"))
 }
 
+/// `komo auth codex status`：账号、邮箱、套餐、过期时间——**不打印 token**，
+/// 不经 Gateway（§3、§13.3）。
+pub fn auth_codex_status(home: &Path) -> Outcome {
+    let path = komo_gateway::codex_auth::credentials_path(home);
+    let status = komo_gateway::codex_auth::status(&path).map_err(failed)?;
+    let mut line = format!("账号 {}", status.account_id);
+    if let Some(email) = &status.email {
+        line.push_str(&format!("  邮箱 {email}"));
+    }
+    if let Some(plan) = &status.plan {
+        line.push_str(&format!("  套餐 {plan}"));
+    }
+    line.push_str(&format!("  过期 {}", render::stamp(status.expires_at)));
+    Ok(line)
+}
+
 /// `komo skills ...`：只读文件系统，不经 Gateway（§5.6）。
 pub fn skills(home: &Path, action: SkillsAction<'_>) -> Outcome {
     let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;

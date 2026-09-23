@@ -844,6 +844,7 @@ mod tests {
             base_url: "https://other.example.com/v1".into(),
             model: "job-model".into(),
             api_key_env: "OTHER_KEY".into(),
+            auth: None,
             effort: None,
             efforts: None,
             timeout_secs: 60,

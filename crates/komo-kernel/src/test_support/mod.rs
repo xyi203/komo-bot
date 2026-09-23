@@ -123,6 +123,7 @@ pub fn sample_model() -> crate::types::model::ModelConfig {
         base_url: "memory://test".into(),
         model: "scripted".into(),
         api_key_env: "KOMO_TEST_KEY".into(),
+        auth: None,
         effort: None,
         efforts: None,
         timeout_secs: 30,

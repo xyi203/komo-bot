@@ -26,6 +26,14 @@ pub enum TransportError {
     Failed(String),
 }
 
+/// 请求正文：JSON 是生成 / 向量适配器的形状；`Form` 是 ChatGPT OAuth 端点要的
+/// `application/x-www-form-urlencoded`（§13.3）——两种协议各自认一种，不互相冒充。
+#[derive(Debug, Clone)]
+pub enum RequestBody {
+    Json(Value),
+    Form(Vec<(String, String)>),
+}
+
 /// 一次出站请求。
 #[derive(Clone)]
 pub struct HttpRequest {
@@ -33,7 +41,10 @@ pub struct HttpRequest {
     /// Bearer 凭证。**不进任何 Debug / 日志**——见下面的手写 `Debug`。
     pub api_key: Option<String>,
     pub timeout: Duration,
-    pub body: Value,
+    pub body: RequestBody,
+    /// `Authorization` 之外的附加请求头（ChatGPT 的 `ChatGPT-Account-ID` /
+    /// `originator` / `session_id` 之类，§13.3）。只印键名，见下面的手写 `Debug`。
+    pub headers: Vec<(String, String)>,
 }
 
 impl fmt::Debug for HttpRequest {
@@ -43,6 +54,10 @@ impl fmt::Debug for HttpRequest {
             .field("url", &self.url)
             .field("has_key", &self.api_key.is_some())
             .field("timeout", &self.timeout)
+            .field(
+                "header_names",
+                &self.headers.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            )
             .finish()
     }
 }
@@ -53,7 +68,19 @@ impl HttpRequest {
             url: url.into(),
             api_key: None,
             timeout: Duration::from_secs(120),
-            body,
+            body: RequestBody::Json(body),
+            headers: Vec::new(),
+        }
+    }
+
+    /// 表单编码的请求（OAuth 令牌端点，§13.3）。
+    pub fn form(url: impl Into<String>, fields: Vec<(String, String)>) -> Self {
+        HttpRequest {
+            url: url.into(),
+            api_key: None,
+            timeout: Duration::from_secs(120),
+            body: RequestBody::Form(fields),
+            headers: Vec::new(),
         }
     }
 
@@ -64,6 +91,11 @@ impl HttpRequest {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
         self
     }
 }
@@ -127,11 +159,14 @@ impl HttpTransport for ReqwestTransport {
     async fn post(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
         use futures_util::StreamExt;
 
-        let mut builder = self
-            .client()
-            .post(&request.url)
-            .timeout(request.timeout)
-            .json(&request.body);
+        let mut builder = self.client().post(&request.url).timeout(request.timeout);
+        builder = match &request.body {
+            RequestBody::Json(body) => builder.json(body),
+            RequestBody::Form(fields) => builder.form(fields),
+        };
+        for (name, value) in &request.headers {
+            builder = builder.header(name, value);
+        }
         if let Some(key) = &request.api_key {
             builder = builder.bearer_auth(key);
         }
@@ -213,8 +248,15 @@ pub(crate) mod testing {
             self.state.lock().expect("脚本传输").seen.clone()
         }
 
+        /// JSON 请求体——目前脚本化测试只喂生成 / 向量适配器，都走 JSON。
         pub fn bodies(&self) -> Vec<Value> {
-            self.requests().into_iter().map(|r| r.body).collect()
+            self.requests()
+                .into_iter()
+                .map(|r| match r.body {
+                    RequestBody::Json(body) => body,
+                    RequestBody::Form(_) => panic!("这一路脚本化测试只喂 JSON 请求体"),
+                })
+                .collect()
         }
     }
 
@@ -249,6 +291,32 @@ mod tests {
         let request = HttpRequest::new("http://x/v1", serde_json::json!({}))
             .with_key(Some("sk-secret".into()));
         assert!(!format!("{request:?}").contains("sk-secret"));
+    }
+
+    /// 附加请求头（ChatGPT-Account-ID 一类）只印键名，不印值——同一条纪律。
+    #[test]
+    fn a_requests_extra_headers_print_only_their_names() {
+        let request = HttpRequest::new("http://x/v1", serde_json::json!({}))
+            .with_header("ChatGPT-Account-ID", "acct_super_secret");
+        let printed = format!("{request:?}");
+        assert!(printed.contains("ChatGPT-Account-ID"), "{printed}");
+        assert!(!printed.contains("acct_super_secret"), "{printed}");
+    }
+
+    #[tokio::test]
+    async fn a_form_request_is_recorded_verbatim() {
+        let transport = ScriptedTransport::new(vec![Reply::json(200, "ok")]);
+        transport
+            .post(HttpRequest::form(
+                "u",
+                vec![("grant_type".into(), "refresh_token".into())],
+            ))
+            .await
+            .unwrap();
+        let RequestBody::Form(fields) = &transport.requests()[0].body else {
+            panic!("该是表单请求体")
+        };
+        assert_eq!(fields[0], ("grant_type".into(), "refresh_token".into()));
     }
 
     #[tokio::test]

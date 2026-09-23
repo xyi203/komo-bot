@@ -248,6 +248,7 @@ mod tests {
             base_url: "https://x/v1".into(),
             model: name.into(),
             api_key_env: "K".into(),
+            auth: None,
             effort: effort.map(Effort::new),
             efforts: None,
             timeout_secs: 120,

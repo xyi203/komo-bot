@@ -46,6 +46,8 @@ reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "stream",
     "charset",
+    # ChatGPT OAuth 的 token 端点要 `application/x-www-form-urlencoded`（§13.3、komo_bot.md）。
+    "form",
 ] }
 rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 
@@ -100,6 +102,10 @@ time = { version = "0.3.55", features = ["serde", "formatting", "parsing", "macr
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.10"
+# ChatGPT OAuth 的 access_token / id_token 是 JWT：只 base64url 解 payload，不验签
+# （§13.3）。0.22 已经是依赖树里解得最多的一份（reqwest 等间接拉入），钉住它不再添一份
+# 重复版本。
+base64 = "0.22"
 
 # W3 预声明（避免并行子代理碰同一个文件）。§13.2：配置 TOML、日志 tracing、tokio-util。
 toml = "1.1"

@@ -1546,7 +1546,10 @@ fn llm_for_memory(
     if let Some(client) = injected {
         return Arc::clone(client);
     }
-    let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone());
+    let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone())
+        .with_chatgpt_credentials_path(komo_runtime::llm::codex_auth::credentials_path(
+            &snapshot.start_only.data_dir,
+        ));
     match komo_runtime::llm::RoutingLlm::from_snapshot(snapshot, factory) {
         Ok(routing) => Arc::new(routing),
         Err(error) => Arc::new(UnconfiguredLlm::new(error.to_string())),
@@ -1670,7 +1673,10 @@ fn build_llm(
 ) -> Arc<dyn LlmClient> {
     let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone())
         // 记忆注入的位置（§9.4）：正文由 MemoryManager 给，这里只是把它放进系统提示。
-        .with_preamble(Arc::clone(preamble) as Arc<dyn komo_runtime::llm::SystemPreamble>);
+        .with_preamble(Arc::clone(preamble) as Arc<dyn komo_runtime::llm::SystemPreamble>)
+        .with_chatgpt_credentials_path(komo_runtime::llm::codex_auth::credentials_path(
+            &snapshot.start_only.data_dir,
+        ));
     match komo_runtime::llm::RoutingLlm::from_snapshot(snapshot, factory) {
         Ok(routing) => Arc::new(routing),
         Err(error) => {

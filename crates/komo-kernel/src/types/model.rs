@@ -224,8 +224,14 @@ pub struct ModelConfig {
     pub provider: String,
     pub base_url: String,
     pub model: String,
-    /// 凭证所在的环境变量名。值不在快照里。
+    /// 凭证所在的环境变量名。值不在快照里。与 `auth` 互斥：配了 `auth` 就不读这个变量
+    /// （允许留空串），凭证从 `auth` 指的那条路取（§13.3）。
     pub api_key_env: String,
+    /// 凭证来源不是 `.env` 里的一个变量，而是别的机制（目前只有 `"chatgpt"`：ChatGPT
+    /// 账号 OAuth，供 Codex 模型用）。未知取值在校验阶段报出来，不在解析阶段拒绝——
+    /// 和 `provider` 未知协议同一个口径。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
     /// 操作者显式声明这个模型支持哪些档位。
@@ -425,6 +431,7 @@ mod tests {
             base_url: "https://x/v1".into(),
             model: "m".into(),
             api_key_env: "K".into(),
+            auth: None,
             effort: None,
             efforts: None,
             timeout_secs: 120,
@@ -452,6 +459,7 @@ mod tests {
         let json = r#"{"provider":"p","base_url":"u","model":"m","api_key_env":"K"}"#;
         let config: ModelConfig = serde_json::from_str(json).unwrap();
         assert!(config.efforts.is_none());
+        assert!(config.auth.is_none());
         assert_eq!(config.timeout_secs, 120);
     }
 

@@ -29,10 +29,13 @@ jiff = { workspace = true }
 sha2 = { workspace = true }
 futures-util = { workspace = true }
 tokio-util = { workspace = true }
+# ChatGPT OAuth 凭证的 JWT payload 解码（§13.3）。
+base64 = { workspace = true }
+# ChatGPT OAuth 凭证文件的原子写（临时文件 + rename，§13.3）。
+tempfile = { workspace = true }
 
 [dev-dependencies]
 komo-kernel = { workspace = true, features = ["test-support"] }
-tempfile = { workspace = true }
 # §47 / §48 的指标只进 trace：验收要把那两行抓出来数一数。dev 构建里才有。
 tracing-subscriber = { workspace = true }
 # 真机验收（`--ignored`）要自己发 HTTPS 请求，而 `reqwest` 是 rustls-no-provider：装

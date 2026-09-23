@@ -224,6 +224,7 @@ fn model(name: &str, effort: Option<&str>) -> ModelConfig {
         base_url: format!("https://{name}.example.com/v1"),
         model: name.into(),
         api_key_env: "KOMO_LLM_API_KEY".into(),
+        auth: None,
         effort: effort.map(Effort::new),
         efforts: None,
         timeout_secs: 10,

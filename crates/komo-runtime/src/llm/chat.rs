@@ -477,6 +477,7 @@ mod tests {
             base_url: "https://openrouter.example/v1".into(),
             model: "vendor/chat".into(),
             api_key_env: "KEY".into(),
+            auth: None,
             effort: None,
             efforts: None,
             timeout_secs: 10,

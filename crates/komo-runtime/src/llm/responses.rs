@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use komo_kernel::traits::{LlmClient, TurnDriver};
+use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::model::{Effort, EffortSetting, ModelConfig, ModelRole, TokenUsage};
 use komo_kernel::types::tool::ToolDefinition;
 use komo_kernel::types::turn::{
@@ -28,10 +29,40 @@ use komo_kernel::types::turn::{
 };
 use serde_json::{Value, json};
 
+use super::codex_auth::{CodexAuthError, CodexTokenSource};
 use super::sse::SseDecoder;
 use super::transport::{HttpRequest, HttpTransport, TransportError};
 use super::wire::{self, EventPayload};
 use crate::config::EffortCapabilities;
+
+/// 这个客户端的凭证来源：`.env` 里的一个变量，或者 ChatGPT 账号 OAuth（§13.3）。
+///
+/// **每次请求都读当前的那份**——`Env` 是构造时就抓死的值（本来就来自不变的环境变量），
+/// `ChatGpt` 则在每次 `round_trip` 时才向 [`CodexTokenSource`] 要一次，快过期时它自己
+/// 刷新，不在造客户端时抓死。
+#[derive(Clone)]
+pub enum Credential {
+    Env(Option<String>),
+    ChatGpt(Arc<CodexTokenSource>),
+}
+
+fn codex_auth_error(error: CodexAuthError) -> LlmError {
+    match error {
+        CodexAuthError::NeedsLogin(message) => LlmError::Rejected {
+            status: 401,
+            message,
+        },
+        CodexAuthError::RateLimited(message) => LlmError::Rejected {
+            status: 429,
+            message,
+        },
+        CodexAuthError::Io { path, message } => LlmError::Rejected {
+            status: 401,
+            message: format!("凭证文件 {path}：{message}；跑 `komo auth codex login`"),
+        },
+        CodexAuthError::Transport(message) => LlmError::Transport(message),
+    }
+}
 
 /// 记忆注入的接口（§9.4 的注入由 MemoryManager 决定内容，这里只留位置）。
 ///
@@ -46,7 +77,7 @@ pub trait SystemPreamble: Send + Sync {
 pub struct OpenAiResponsesLlm {
     config: ModelConfig,
     role: ModelRole,
-    api_key: Option<String>,
+    credential: Credential,
     transport: Arc<dyn HttpTransport>,
     caps: EffortCapabilities,
     preamble: Option<Arc<dyn SystemPreamble>>,
@@ -60,7 +91,13 @@ impl std::fmt::Debug for OpenAiResponsesLlm {
             .field("role", &self.role)
             .field("model", &self.config.model)
             .field("base_url", &self.config.base_url)
-            .field("has_key", &self.api_key.is_some())
+            .field(
+                "has_key",
+                &matches!(
+                    &self.credential,
+                    Credential::Env(Some(_)) | Credential::ChatGpt(_)
+                ),
+            )
             .finish()
     }
 }
@@ -69,7 +106,7 @@ impl OpenAiResponsesLlm {
     pub fn new(
         config: ModelConfig,
         role: ModelRole,
-        api_key: Option<String>,
+        credential: Credential,
         transport: Arc<dyn HttpTransport>,
         caps: EffortCapabilities,
     ) -> Result<Self, LlmError> {
@@ -79,7 +116,7 @@ impl OpenAiResponsesLlm {
         Ok(OpenAiResponsesLlm {
             config,
             role,
-            api_key,
+            credential,
             transport,
             caps,
             preamble: None,
@@ -128,7 +165,9 @@ impl LlmClient for OpenAiResponsesLlm {
         // 本次 Run 固定的是 `req.model`（§6），不是构造这个客户端时那份——热重载不在
         // 半路换模型。
         check_effort(&req.model, &self.caps)?;
-        let Some(api_key) = self.api_key.clone() else {
+        // `Env(None)` 在这里就能判死——它是一个不变的环境变量，不会在下一轮变得有效。
+        // `ChatGpt` 那条路每次请求前才取（可能要刷新），留给 `round_trip`。
+        if let Credential::Env(None) = &self.credential {
             return Err(LlmError::Rejected {
                 status: 401,
                 message: format!(
@@ -136,7 +175,7 @@ impl LlmClient for OpenAiResponsesLlm {
                     req.model.api_key_env
                 ),
             });
-        };
+        }
 
         // Responses 的系统提示是 `instructions` 一个字段，所以记忆注入接在它后面，
         // 而不是再造一条 role=system 的消息。
@@ -148,10 +187,11 @@ impl LlmClient for OpenAiResponsesLlm {
 
         Ok(Box::new(ResponsesDriver {
             endpoint: self.endpoint(&req.model),
-            api_key,
+            credential: self.credential.clone(),
             transport: Arc::clone(&self.transport),
             role: self.role,
             model: req.model,
+            session: req.session,
             tools: req.tools,
             instructions,
             input: replay(&req.messages),
@@ -215,10 +255,11 @@ fn arguments_text(arguments: &Value) -> String {
 /// 一次 Run 的一个执行段。
 struct ResponsesDriver {
     endpoint: String,
-    api_key: String,
+    credential: Credential,
     transport: Arc<dyn HttpTransport>,
     role: ModelRole,
     model: ModelConfig,
+    session: SessionId,
     tools: Vec<ToolDefinition>,
     instructions: String,
     /// 到目前为止的全部 items——**回放靠它全量携带**（`store: false`）。
@@ -295,10 +336,39 @@ impl TurnDriver for ResponsesDriver {
 }
 
 impl ResponsesDriver {
+    /// 取这次要用的凭证与请求头（§13.3：每次请求前取，`ChatGpt` 那条路快过期就刷新）。
+    async fn credential(&self) -> Result<(String, Vec<(String, String)>), LlmError> {
+        match &self.credential {
+            Credential::Env(Some(key)) => Ok((key.clone(), Vec::new())),
+            Credential::Env(None) => Err(LlmError::Rejected {
+                status: 401,
+                message: format!(
+                    "没有凭证：环境里找不到 `{}`（config.toml 里写的是变量名）",
+                    self.model.api_key_env
+                ),
+            }),
+            Credential::ChatGpt(source) => {
+                let creds = source.token().await.map_err(codex_auth_error)?;
+                Ok((
+                    creds.access_token,
+                    vec![
+                        ("ChatGPT-Account-ID".to_string(), creds.account_id),
+                        ("originator".to_string(), "komo".to_string()),
+                        ("session_id".to_string(), self.session.to_string()),
+                    ],
+                ))
+            }
+        }
+    }
+
     async fn round_trip(&self, body: Value) -> Result<Round, LlmError> {
-        let request = HttpRequest::new(&self.endpoint, body)
-            .with_key(Some(self.api_key.clone()))
+        let (api_key, extra_headers) = self.credential().await?;
+        let mut request = HttpRequest::new(&self.endpoint, body)
+            .with_key(Some(api_key))
             .with_timeout(Duration::from_secs(self.model.timeout_secs.max(1)));
+        for (name, value) in extra_headers {
+            request = request.with_header(name, value);
+        }
         let response = self
             .transport
             .post(request)

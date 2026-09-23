@@ -17,6 +17,7 @@ fn config(provider: &str, dimensions: Option<u32>) -> EmbeddingConfig {
             base_url: "https://embedding.example.com/v1".into(),
             model: "embed-a".into(),
             api_key_env: "KOMO_EMBEDDING_API_KEY".into(),
+            auth: None,
             effort: None,
             efforts: None,
             timeout_secs: 10,

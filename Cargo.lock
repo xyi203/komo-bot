@@ -2344,6 +2344,7 @@ version = "0.8.0"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "dotenvy",
  "futures-util",
  "grep",

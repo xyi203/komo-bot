@@ -95,6 +95,8 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo config reload`                         | 让 Gateway 立即重载配置（等价于文件保存后的自动重载或 `SIGHUP`）；校验失败则保留旧配置并返回错误 |
 | `komo channel list/probe`                    | 渠道清单与连通性核对（飞书 tenant token、Telegram `getMe`、微信凭证文件）；不经 Gateway |
 | `komo channel wechat login`                  | 终端显示二维码完成微信登录，凭证写入数据目录                                |
+| `komo auth codex login`                      | ChatGPT 账号 OAuth 设备码登录（Codex 模型走 `auth = "chatgpt"`，§13.3）；不经 Gateway，凭证写入 `<数据目录>/codex/auth.json`（同微信登录的先例） |
+| `komo auth codex status`                     | 账号、邮箱、套餐与凭证过期时间；**不打印 token**；不经 Gateway               |
 | `komo skills list/inspect/enable/disable`    | Skills 目录（§5.6）；只读文件系统，不经 Gateway                             |
 | `komo toolbox list/inspect/test/enable [--version]/disable` | toolbox 模块（§5.3–5.4）；**经 Gateway**——启用是一次审批，审批只有 Gateway 打得开 |
 | `komo update`                                | 从 GitHub release 换掉当前这个可执行文件（§13.6）。**不经 Gateway**：换的是磁盘上那份二进制，不是在跑的那个进程 |
@@ -1434,6 +1436,7 @@ Axum 已提供 SSE 响应；toasty 的 turso 驱动提供连接与事务，MVCC 
 | ----------------------- | ---- |
 | `model_providers.<name>` | 一组可复用的 `base_url`、`api_backend`、`env_key` 与超时默认值 |
 | `model.<alias>`          | 一项模型；`type = "completion"` 或 `"embedding"`，可覆盖 provider 的任一连接字段 |
+| `auth`                   | 凭证不走 `.env` 变量，走另一种机制；目前只有 `"chatgpt"`（ChatGPT 账号 OAuth，给 Codex 模型用）。与 `env_key` 互斥，只允许 `api_backend = "responses"`（下方单独一段） |
 | `models.default`         | 默认对话模型 alias；Session / Cron 的 `model` 参数也使用 alias |
 | `memory.model`           | 记忆提取模型 alias；省略时使用 `models.default` |
 | `memory.embedding`       | 向量模型 alias；hybrid / vector 检索时必填 |
@@ -1497,6 +1500,27 @@ model_result_bytes = 8192
 ```
 
 `memory.model` 省略时使用默认 completion alias 的完整配置，包括 effort；它不继承某个 Session 或 Cron 的临时覆盖。显式引用时必须指向 completion，`memory.embedding` 必须指向 embedding。若明确选择 keyword 模式，可以不配置 embedding。`GET /v1/models` 只列 completion alias；选择 alias 会携带完整端点、协议和凭证引用，而不是只替换上游 model id。
+
+**`auth = "chatgpt"`：用 ChatGPT 账号 OAuth 调 Codex 模型，而不是 `.env` 里的一个 key。**
+
+```toml
+[model_providers.codex]
+base_url = "https://chatgpt.com/backend-api/codex"
+api_backend = "responses"
+auth = "chatgpt"
+
+[model.codex]
+type = "completion"
+model_provider = "codex"
+model = "gpt-5-codex"
+```
+
+- Codex 走的协议就是 OpenAI Responses API 的 SSE 流，复用同一个 Responses 适配器（`store: false` + `include: ["reasoning.encrypted_content"]`、原样回放 `provider_blocks`）——不是一个新协议，只是凭证来源不同。请求体不带 `max_output_tokens` / `temperature` / `top_p` / `stop` / `prompt_cache_retention`。
+- 请求头额外带 `Authorization: Bearer <access_token>`、`ChatGPT-Account-ID: <JWT 里的 chatgpt_account_id>`、`originator: komo`、`session_id: <当前 Session id>`。
+- 凭证文件是 `<数据目录>/codex/auth.json`（权限 0600，原子写），**不是** `~/.codex/auth.json`——那是 Codex CLI 自己的文件，`refresh_token` 单次有效会轮换，写它一次就可能把 Codex CLI 挤下线。
+- `komo auth codex login`：设备码登录，终端显示配对码与网址，轮询直到确认或超时（约 10 分钟）；不经 Gateway，直接落盘（同 `komo channel wechat login` 的先例）。`komo auth codex status` 给账号、邮箱、套餐与过期时间，不打印 token。
+- 刷新：每次请求前取 token，快过期（剩余 < 5 分钟）时刷新并写回，新的 `refresh_token` 会轮换；429 是额度问题，不是登录失效；400/401（`invalid_grant` / `refresh_token_reused` 一类）需要重新登录，报错里指名 `komo auth codex login`。
+- `komo config check`：配了 `auth = "chatgpt"` 但凭证文件不存在 → 报错并指出该跑的命令；`auth` 与 `env_key` 同时配、或 `api_backend` 不是 `"responses"` → 报错。
 
 effort 的行为统一，取值按协议和具体模型校验：
 
@@ -1574,8 +1598,10 @@ kernel ← client ────────────────────�
 |---|---|---|
 | `toasty` | `default-features = false, features = ["turso"]` | 去掉 `sqlite` 特性拉进来的 rusqlite / libsqlite3-sys |
 | `turso` | 与 `toasty-driver-turso` 同 major，工作区唯一 | mimalloc 全局分配器只能有一个 |
-| `reqwest` | `default-features = false, features = ["rustls-no-provider", "json", "stream", "charset"]` | `rustls` 特性 = `__rustls-aws-lc-rs`；`no-provider` 后由 komo 在 `main` 里 `rustls::crypto::ring::default_provider().install_default()`，且必须在飞书 ws 线程启动之前 |
+| `reqwest` | `default-features = false, features = ["rustls-no-provider", "json", "stream", "charset", "form"]` | `rustls` 特性 = `__rustls-aws-lc-rs`；`no-provider` 后由 komo 在 `main` 里 `rustls::crypto::ring::default_provider().install_default()`，且必须在飞书 ws 线程启动之前。`form` 是 ChatGPT OAuth 的 token 端点要的 `application/x-www-form-urlencoded`（§13.3），只多拉 `serde_urlencoded` 一个纯 Rust 包 |
 | `rustls` | `default-features = false, features = ["ring"]` | 同上 |
+| `base64` | `0.22`，仅 komo-runtime | ChatGPT OAuth 的 access_token / id_token 是 JWT：只 base64url 解 payload，不验签（§13.3）。0.22.1 已经是依赖树里被拉得最多的一份（reqwest 等间接拉入），钉住它不再添一份重复版本；reqwest 自己另拉一份 0.23.1，是既有的重复，与本次改动无关 |
+| `tempfile` | 已在工作区（此前只在各 crate 的 `[dev-dependencies]` 里）；komo-runtime 的 `[dependencies]` 新增一行 | ChatGPT 凭证文件的原子写（临时文件 + rename，§13.3）——不引新包，只是把已有的测试依赖也用到生产代码里 |
 | `tokio` | 按需特性，不用 `full` | kernel 不依赖 tokio |
 | `axum` | 默认 + `tower-http/cors` | 仅 gateway；gateway 自己直接声明 `tokio`（`rt-multi-thread`, `signal`, `fs`），不靠 axum 传递 |
 | `tower-http` | `0.6`，`default-features = false, features = ["cors"]` | 与 reqwest 对齐（两个大版本都要 `^0.6`）；选 0.7 只会多一条自找的重复版本 |

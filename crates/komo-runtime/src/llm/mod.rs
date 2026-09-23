@@ -8,12 +8,14 @@
 //! 换掉正在跑的那个（§3 第 2 步）。
 
 mod chat;
+pub mod codex_auth;
 mod responses;
 mod sse;
 pub mod transport;
 mod wire;
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -24,7 +26,7 @@ use komo_kernel::types::status::RetryCause;
 use komo_kernel::types::turn::{LlmError, TurnRequest};
 
 pub use chat::ChatCompletionsLlm;
-pub use responses::{OpenAiResponsesLlm, SystemPreamble};
+pub use responses::{Credential, OpenAiResponsesLlm, SystemPreamble};
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};
 
 use crate::config::{EffortCapabilities, Secrets};
@@ -34,6 +36,10 @@ pub const CHAT_COMPLETIONS: &str = "chat_completions";
 pub const RESPONSES: &str = "responses";
 const LEGACY_OPENAI_RESPONSES: &str = "openai_responses";
 
+/// `model.<alias>.auth` 唯一认识的取值：凭证来自 ChatGPT 账号 OAuth，不是 `.env`
+/// 变量（§13.3）。
+pub const CHATGPT_AUTH: &str = "chatgpt";
+
 /// 构造一个后端时会出的问题。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LlmBuildError {
@@ -42,6 +48,15 @@ pub enum LlmBuildError {
     /// 档位不可用一类——在**请求前**就定得下来的那些（§13.3）。
     #[error(transparent)]
     Model(#[from] LlmError),
+    /// `auth = "chatgpt"` 只支持 Responses 协议——Chat Completions 没有这条路。
+    #[error("auth = \"{CHATGPT_AUTH}\" 只支持 `{RESPONSES}`")]
+    ChatGptRequiresResponses,
+    /// 不认识的 `auth` 取值（只有 `"chatgpt"`）。
+    #[error("不认识的 auth `{auth}`：只有 \"{CHATGPT_AUTH}\"")]
+    UnknownAuth { auth: String },
+    /// `auth = "chatgpt"` 但没给凭证目录——只应该是接线漏了一步，不是操作者的配置错误。
+    #[error("auth = \"{CHATGPT_AUTH}\" 但没有配置 ChatGPT 凭证目录")]
+    ChatGptPathMissing,
 }
 
 impl From<LlmBuildError> for LlmError {
@@ -127,6 +142,10 @@ pub struct LlmFactory {
     caps: EffortCapabilities,
     transport: Arc<dyn HttpTransport>,
     preamble: Option<Arc<dyn SystemPreamble>>,
+    /// ChatGPT 凭证文件的位置（`auth = "chatgpt"` 用）；不配就造不出这一类客户端
+    /// （[`LlmBuildError::ChatGptPathMissing`]）——Gateway 装配时总会给，见
+    /// `komo-gateway::service::state::build_llm`。
+    chatgpt_credentials_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for LlmFactory {
@@ -144,6 +163,7 @@ impl LlmFactory {
             caps,
             transport: default_transport(),
             preamble: None,
+            chatgpt_credentials_path: None,
         }
     }
 
@@ -158,6 +178,11 @@ impl LlmFactory {
         self
     }
 
+    pub fn with_chatgpt_credentials_path(mut self, path: PathBuf) -> Self {
+        self.chatgpt_credentials_path = Some(path);
+        self
+    }
+
     pub fn build(
         &self,
         config: &ModelConfig,
@@ -165,11 +190,11 @@ impl LlmFactory {
     ) -> Result<Arc<dyn LlmClient>, LlmBuildError> {
         match config.provider.as_str() {
             RESPONSES | LEGACY_OPENAI_RESPONSES => {
-                let key = self.secrets.get(&config.api_key_env).map(str::to_string);
+                let credential = self.credential_for(config)?;
                 let mut client = OpenAiResponsesLlm::new(
                     config.clone(),
                     role,
-                    key,
+                    credential,
                     Arc::clone(&self.transport),
                     self.caps.clone(),
                 )?;
@@ -179,6 +204,13 @@ impl LlmFactory {
                 Ok(Arc::new(client))
             }
             CHAT_COMPLETIONS => {
+                if let Some(auth) = &config.auth {
+                    return Err(if auth == CHATGPT_AUTH {
+                        LlmBuildError::ChatGptRequiresResponses
+                    } else {
+                        LlmBuildError::UnknownAuth { auth: auth.clone() }
+                    });
+                }
                 let key = self.secrets.get(&config.api_key_env).map(str::to_string);
                 let mut client = ChatCompletionsLlm::new(
                     config.clone(),
@@ -196,6 +228,25 @@ impl LlmFactory {
                 provider: other.to_string(),
             }),
         }
+    }
+
+    /// Responses 客户端的凭证来源：`.env` 变量，或者 `auth = "chatgpt"` 那条路
+    /// （§13.3：每次请求前取当前 token，不在造客户端时抓死）。
+    fn credential_for(&self, config: &ModelConfig) -> Result<Credential, LlmBuildError> {
+        let Some(auth) = &config.auth else {
+            let key = self.secrets.get(&config.api_key_env).map(str::to_string);
+            return Ok(Credential::Env(key));
+        };
+        if auth != CHATGPT_AUTH {
+            return Err(LlmBuildError::UnknownAuth { auth: auth.clone() });
+        }
+        let path = self
+            .chatgpt_credentials_path
+            .clone()
+            .ok_or(LlmBuildError::ChatGptPathMissing)?;
+        Ok(Credential::ChatGpt(Arc::new(
+            codex_auth::CodexTokenSource::new(path, Arc::clone(&self.transport)),
+        )))
     }
 }
 

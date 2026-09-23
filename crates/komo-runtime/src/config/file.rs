@@ -97,6 +97,9 @@ pub(super) struct ModelProviderSection {
     pub api_key_env: Option<String>,
     pub api_backend: Option<String>,
     pub timeout_secs: Option<u64>,
+    /// 凭证来源不是 `.env` 变量（目前只有 `"chatgpt"`，§13.3）；与 `api_key_env` 互斥，
+    /// 校验阶段判。
+    pub auth: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +114,9 @@ pub(super) struct ModelSection {
     #[serde(alias = "env_key")]
     pub api_key_env: Option<String>,
     pub api_backend: Option<String>,
+    /// 凭证来源不是 `.env` 变量（目前只有 `"chatgpt"`，§13.3）；与 `api_key_env` 互斥，
+    /// 校验阶段判。
+    pub auth: Option<String>,
     pub effort: Option<String>,
     /// 操作者显式声明这个模型支持哪些档位（§13.3 的"显式能力声明"）。省略 = 问适配器
     /// 自己的内建表；写成空表 = 这个模型一档都不支持。
@@ -511,7 +517,7 @@ pub(super) fn assemble(
         wechat: file.channels.wechat.into_channel(),
     };
 
-    let credentials = credential_fingerprints(&model_catalog, &channels, secrets);
+    let credentials = credential_fingerprints(&model_catalog, &channels, secrets, &data_dir);
 
     Ok(ConfigSnapshot {
         start_only,
@@ -567,12 +573,28 @@ fn assemble_catalog(
             &format!("model.{alias}.api_backend"),
             config_file,
         )?;
-        let api_key_env = inherited_string(
-            section.api_key_env.as_deref(),
-            provider.and_then(|p| p.api_key_env.as_deref()),
-            &format!("model.{alias}.api_key_env"),
-            config_file,
-        )?;
+        // `auth` 与 `api_key_env` 互斥（校验阶段判，§13.3）；配了 `auth` 时凭证不从
+        // `.env` 变量取，`api_key_env` 允许留空——不在这里报"必填字段缺失"。
+        let auth = inherited_optional(
+            section.auth.as_deref(),
+            provider.and_then(|p| p.auth.as_deref()),
+        );
+        let api_key_env = if auth.is_some() {
+            section
+                .api_key_env
+                .as_deref()
+                .or_else(|| provider.and_then(|p| p.api_key_env.as_deref()))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            inherited_string(
+                section.api_key_env.as_deref(),
+                provider.and_then(|p| p.api_key_env.as_deref()),
+                &format!("model.{alias}.api_key_env"),
+                config_file,
+            )?
+        };
         let timeout_secs = section
             .timeout_secs
             .or_else(|| provider.and_then(|p| p.timeout_secs))
@@ -583,6 +605,7 @@ fn assemble_catalog(
             base_url: base_url.trim_end_matches('/').to_string(),
             model: section.model.trim().to_string(),
             api_key_env: api_key_env.trim().to_string(),
+            auth,
             effort: section.effort.map(Effort::new),
             efforts: section
                 .efforts
@@ -636,15 +659,26 @@ fn inherited_string(
         })
 }
 
-/// 快照里的凭证**指纹**：这份配置引用到的变量名，加上已启用渠道的固定变量名。
+/// 同 [`inherited_string`]，但这一项是可选的——没写就是 `None`，不报错（`auth` 用它）。
+fn inherited_optional(own: Option<&str>, inherited: Option<&str>) -> Option<String> {
+    own.or(inherited)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// 快照里的凭证**指纹**：这份配置引用到的变量名，加上已启用渠道的固定变量名，
+/// 再加上（用到了 `auth = "chatgpt"` 时）ChatGPT 凭证文件本身的指纹（§13.3）。
 fn credential_fingerprints(
     catalog: &ModelCatalog,
     channels: &ChannelsConfig,
     secrets: &Secrets,
+    data_dir: &Path,
 ) -> BTreeMap<String, komo_kernel::types::digest::ContentHash> {
     let mut names: Vec<String> = catalog
         .entries
         .values()
+        .filter(|model| model.common().auth.is_none())
         .map(|model| model.common().api_key_env.clone())
         .collect();
     for platform in [
@@ -658,5 +692,20 @@ fn credential_fingerprints(
     }
     names.sort();
     names.dedup();
-    secrets.fingerprints(names.iter().map(String::as_str))
+    let mut fingerprints = secrets.fingerprints(names.iter().map(String::as_str));
+
+    let uses_chatgpt_auth = catalog
+        .entries
+        .values()
+        .any(|model| model.common().auth.as_deref() == Some(crate::llm::CHATGPT_AUTH));
+    if uses_chatgpt_auth {
+        let path = crate::llm::codex_auth::credentials_path(data_dir);
+        if let Some(hash) = crate::llm::codex_auth::fingerprint(&path) {
+            fingerprints.insert(
+                crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.to_string(),
+                hash,
+            );
+        }
+    }
+    fingerprints
 }

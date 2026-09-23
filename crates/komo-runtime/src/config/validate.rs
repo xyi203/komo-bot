@@ -170,19 +170,62 @@ fn check_model(
         issues.push(error(&format!("{key}.model"), "模型名不能为空"));
     }
 
-    if model.api_key_env.trim().is_empty() {
-        issues.push(error(
-            &format!("{key}.api_key_env"),
-            "要写凭证所在的**变量名**（凭证本身放 .env）",
-        ));
-    } else if !snapshot.credentials.contains_key(&model.api_key_env) {
-        issues.push(error(
-            &format!("{key}.api_key_env"),
-            format!(
-                "`{}` 在 .env / 环境里没有值；凭证只放 .env，config.toml 里写变量名",
-                model.api_key_env
-            ),
-        ));
+    match model.auth.as_deref() {
+        Some(crate::llm::CHATGPT_AUTH) => {
+            if !model.api_key_env.trim().is_empty() {
+                issues.push(error(
+                    &format!("{key}.auth"),
+                    "auth = \"chatgpt\" 与 env_key / api_key_env 不能同时配置",
+                ));
+            }
+            if provider != crate::llm::RESPONSES {
+                issues.push(error(
+                    &format!("{key}.auth"),
+                    format!(
+                        "auth = \"chatgpt\" 只允许 api_backend = \"{}\"",
+                        crate::llm::RESPONSES
+                    ),
+                ));
+            }
+            if !snapshot
+                .credentials
+                .contains_key(crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY)
+            {
+                issues.push(error(
+                    &format!("{key}.auth"),
+                    format!(
+                        "找不到 ChatGPT 凭证文件（{}）；先跑 `komo auth codex login`",
+                        crate::llm::codex_auth::credentials_path(&snapshot.start_only.data_dir)
+                            .display()
+                    ),
+                ));
+            }
+        }
+        Some(other) => {
+            issues.push(error(
+                &format!("{key}.auth"),
+                format!(
+                    "不认识的 auth `{other}`：只有 \"{}\"",
+                    crate::llm::CHATGPT_AUTH
+                ),
+            ));
+        }
+        None => {
+            if model.api_key_env.trim().is_empty() {
+                issues.push(error(
+                    &format!("{key}.api_key_env"),
+                    "要写凭证所在的**变量名**（凭证本身放 .env）",
+                ));
+            } else if !snapshot.credentials.contains_key(&model.api_key_env) {
+                issues.push(error(
+                    &format!("{key}.api_key_env"),
+                    format!(
+                        "`{}` 在 .env / 环境里没有值；凭证只放 .env，config.toml 里写变量名",
+                        model.api_key_env
+                    ),
+                ));
+            }
+        }
     }
 
     if model.timeout_secs == 0 {
@@ -701,6 +744,80 @@ mod tests {
         let first = snapshot.policy.rules[0].clone();
         snapshot.policy.rules.push(first);
         assert_eq!(keys(&validate(&snapshot)), vec!["policy.rules"]);
+    }
+
+    /// `auth = "chatgpt"` 立得住：不读 `.env` 变量，只要凭证文件的指纹在快照里。
+    #[test]
+    fn a_chatgpt_auth_model_with_its_credential_file_present_has_no_issues() {
+        let mut snapshot = snapshot_fixture();
+        let model = snapshot.model_catalog.completion_mut("chat").unwrap();
+        model.auth = Some(crate::llm::CHATGPT_AUTH.into());
+        model.api_key_env = String::new();
+        snapshot.credentials.insert(
+            crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.into(),
+            komo_kernel::types::digest::ContentHash::of_str("token-file-contents"),
+        );
+        assert_eq!(validate(&snapshot), vec![]);
+    }
+
+    #[test]
+    fn a_chatgpt_auth_model_without_its_credential_file_names_the_login_command() {
+        let mut snapshot = snapshot_fixture();
+        let model = snapshot.model_catalog.completion_mut("chat").unwrap();
+        model.auth = Some(crate::llm::CHATGPT_AUTH.into());
+        model.api_key_env = String::new();
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["model.chat.auth"]);
+        assert!(
+            issues[0].message.contains("komo auth codex login"),
+            "{:?}",
+            issues[0]
+        );
+    }
+
+    #[test]
+    fn auth_and_env_key_together_is_refused() {
+        let mut snapshot = snapshot_fixture();
+        let model = snapshot.model_catalog.completion_mut("chat").unwrap();
+        model.auth = Some(crate::llm::CHATGPT_AUTH.into());
+        snapshot.credentials.insert(
+            crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.into(),
+            komo_kernel::types::digest::ContentHash::of_str("token-file-contents"),
+        );
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["model.chat.auth"]);
+        assert!(issues[0].message.contains("同时配置"), "{:?}", issues[0]);
+    }
+
+    #[test]
+    fn chatgpt_auth_only_works_with_the_responses_backend() {
+        let mut snapshot = snapshot_fixture();
+        let model = snapshot.model_catalog.completion_mut("chat").unwrap();
+        model.auth = Some(crate::llm::CHATGPT_AUTH.into());
+        model.api_key_env = String::new();
+        model.provider = crate::llm::CHAT_COMPLETIONS.into();
+        snapshot.credentials.insert(
+            crate::llm::codex_auth::CREDENTIAL_FINGERPRINT_KEY.into(),
+            komo_kernel::types::digest::ContentHash::of_str("token-file-contents"),
+        );
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["model.chat.auth"]);
+        assert!(issues[0].message.contains("responses"), "{:?}", issues[0]);
+    }
+
+    #[test]
+    fn an_unrecognized_auth_value_is_refused() {
+        let mut snapshot = snapshot_fixture();
+        let model = snapshot.model_catalog.completion_mut("chat").unwrap();
+        model.auth = Some("some-other-mechanism".into());
+        model.api_key_env = String::new();
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["model.chat.auth"]);
+        assert!(
+            issues[0].message.contains("some-other-mechanism"),
+            "{:?}",
+            issues[0]
+        );
     }
 
     #[test]

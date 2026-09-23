@@ -78,6 +78,13 @@ pub struct RunView {
     /// 最终回复正文（用于"结果已保存但客户端没收到"的补读，§8.4）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_message: Option<String>,
+    /// 非正常终态时**为什么**：`failed` 的原因、`abandoned` 的理由。`completed` /
+    /// `cancelled`（它只记"谁取消的"，不是理由）都是 `None`。
+    ///
+    /// 子代理这条线上更早的一条没能给出最终回答时，回放要能补一句"它怎么结束的"
+    /// （§4、§8.3 的续跑窗口）——这一格就是那句话的来源，不必为了一句话回去读原始事件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
     /// 领取代次，来自最后一条 `run.started`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,

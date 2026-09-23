@@ -357,6 +357,12 @@ impl SegmentSource for GatewaySegments {
             .runs
             .get(&run)
             .and_then(|view| view.delegate.clone());
+        // 子代理这条线（旧→新，含正在跑的这一条）：顺着 `resumes` 往回找。它决定回放窗口
+        // （下面的 `scope`），不在 `delegate.is_some()` 之外再多问一次账本——线是从 JSONL
+        // 里 fold 出来的（§4、§8.3）。
+        let thread = delegate
+            .as_ref()
+            .map(|_| history::delegate_thread(&surface, &run));
 
         // 深度只有一层（§4）：子代理的能力面里**没有 `delegate`**，不管那一份能力面是从
         // 冻结快照继承来的还是兜底算出来的。runtime 的编排里还留着第二道，管的是"有人把
@@ -410,9 +416,10 @@ impl SegmentSource for GatewaySegments {
             }
         };
 
-        // 回放给模型的是**这一段对话**，不是这一条 Run（§8.3）。
-        let scope = match &delegate {
-            Some(_) => ReplayScope::Run(&run),
+        // 回放给模型的是**这一段对话**，不是这一条 Run（§8.3）。子代理的"这一段对话"
+        // 就是它那条线（§4 的 `resumes` 链）。
+        let scope = match &thread {
+            Some(chain) => ReplayScope::Thread(chain),
             None => ReplayScope::Conversation(&run),
         };
 

@@ -42,6 +42,13 @@ pub struct DelegateSpec {
     /// 结果契约。不给 = 自由文本（旧 `delegate` 的形状，父侧只能自己读）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<DelegateContract>,
+    /// 续跑：这条子 Run 接着哪一条（§4）。`None` = 这条线的第一条。
+    ///
+    /// 它只决定子代理的回放窗口（§8.3 的 `resumes` 链）——不决定结果交给谁（那是
+    /// `parent`）、不决定预算（每次续跑都是自己的 `rounds`）。**旧行没有这个字段**：
+    /// `skip_serializing_if` 让它们的字节不变，`default` 让它们照旧解成"这条线的第一条"。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumes: Option<RunId>,
 }
 
 fn default_rounds() -> u32 {
@@ -56,6 +63,7 @@ impl DelegateSpec {
             task: task.into(),
             rounds: DEFAULT_DELEGATE_ROUNDS,
             contract: None,
+            resumes: None,
         }
     }
 
@@ -66,6 +74,12 @@ impl DelegateSpec {
 
     pub fn with_rounds(mut self, rounds: u32) -> Self {
         self.rounds = rounds;
+        self
+    }
+
+    /// 接着哪一条子 Run（§4）：这条线上的上一环。
+    pub fn with_resumes(mut self, target: RunId) -> Self {
+        self.resumes = Some(target);
         self
     }
 }
@@ -433,5 +447,30 @@ mod tests {
         assert_eq!(decoded.task, "看一下这个 PR");
         assert_eq!(decoded.rounds, DEFAULT_DELEGATE_ROUNDS);
         assert!(decoded.contract.is_none());
+        assert!(
+            decoded.resumes.is_none(),
+            "旧行没有 resumes，解成这条线的第一条"
+        );
+    }
+
+    /// `resumes` 缺席时不写进 JSON（旧行的字节不变），给了就原样带回来。
+    #[test]
+    fn resumes_round_trips_and_stays_absent_when_unset() {
+        let spec = DelegateSpec::new(
+            RunId::from_raw("run-1"),
+            ToolCallId::from_raw("call-1"),
+            "接着查",
+        );
+        let encoded = serde_json::to_value(&spec).unwrap();
+        assert!(
+            encoded.get("resumes").is_none(),
+            "没有续跑目标时不该多出这个键：{encoded}"
+        );
+
+        let resumed = spec.with_resumes(RunId::from_raw("run-0"));
+        let encoded = serde_json::to_value(&resumed).unwrap();
+        assert_eq!(encoded["resumes"], serde_json::json!("run-0"));
+        let decoded: DelegateSpec = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.resumes, Some(RunId::from_raw("run-0")));
     }
 }

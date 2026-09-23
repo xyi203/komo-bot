@@ -219,7 +219,7 @@ main_session("reviewer")  → session-C
 
 ### 委派仍属于 Run 语义
 
-当前 delegate 在同一个 Session 内创建子 Run，并通过 `ReplayScope::Run` 隔离上下文。
+当前 delegate 在同一个 Session 内创建子 Run，并通过 `ReplayScope::Thread`（它自己那条续跑线）隔离上下文。
 
 先保留它。不要为了增加 `SessionKind`，强行把现有每个子 Run 都迁成新 Session。
 

@@ -1164,6 +1164,67 @@ mod delegation {
         (session, run, calls.into_iter().next().expect("一个调用"))
     }
 
+    /// 在**指定 Session 里一条新的 Run**上发起一次委派（§4「同一 Session 里后面的任何
+    /// 一条 Run 都可以续跑」）。`open_run` 用的是固定请求键，两次拿到的是同一条 Run，
+    /// 续跑的验收要的是真的两条不同的 Run。
+    async fn delegate_round_on(
+        harness: &Harness,
+        session: &komo_kernel::types::ids::SessionId,
+        request_key: &str,
+        args: serde_json::Value,
+    ) -> (RunId, CallRequest) {
+        let accepted = harness
+            .ledger
+            .accept_input(komo_kernel::types::turn::AcceptInput {
+                session: session.clone(),
+                request_key: komo_kernel::types::ids::RequestKey::new(request_key),
+                text: "续跑测试的另一条 Run".into(),
+                source: PlanSource::Interactive {
+                    session: session.clone(),
+                },
+                peer: None,
+                model: komo_kernel::test_support::sample_model(),
+                workdir: None,
+                delegate: None,
+                snapshot: None,
+                skip_memory: false,
+                at: harness.clock.now(),
+            })
+            .await
+            .expect("接收输入");
+        let run = accepted.run;
+        // 调用号带上 `request_key`：默认的 `record_round` 每轮都从 "call-0" 编号，两条
+        // 不同的 Run 各自的第一次委派会撞成同一个字面量 ToolCallId，`recorded_plan` 这类
+        // 按 call_id 找计划的帮助函数会翻到别的 Run 那一条上去。
+        let call = ToolCallId::from_raw(format!("call-{request_key}"));
+        let request = CallRequest::fresh(
+            call.clone(),
+            format!("pc-{request_key}"),
+            "delegate",
+            args.clone(),
+        );
+        let round = komo_kernel::types::turn::AssistantRound {
+            round: 1,
+            text: None,
+            text_ref: None,
+            tool_calls: vec![komo_kernel::types::turn::ToolCallRequest {
+                call_id: call.clone(),
+                provider_call_id: request.provider_call_id.clone(),
+                name: "delegate".into(),
+                arguments: args,
+                arguments_ref: None,
+            }],
+            provider_blocks: None,
+            usage: Default::default(),
+        };
+        harness
+            .ledger
+            .record_round(&run, round)
+            .await
+            .expect("记录回合");
+        (run, request)
+    }
+
     /// 从"派出去"走到"回来收口"之间那一步：把父调用的形状补成账本会给的形状。
     fn resumed_request(
         harness: &Harness,
@@ -1630,6 +1691,436 @@ mod delegation {
             outcome.results[0].content
         );
         assert!(child_runs(&harness).is_empty(), "被派的 Run 不能再派一条");
+    }
+
+    // ------------------------------------------------------------ 续跑（§4）
+
+    /// ⑨ 续跑一条已经 `completed` 的子 Run：新派出去的那条带着 `resumes`，而且是**新的
+    /// 一条子 Run**（不是把旧的那条叫醒）——账本上派出去两条，`resumes` 指回第一条。
+    #[tokio::test]
+    async fn resuming_a_completed_child_spawns_a_new_child_that_points_back_to_it() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
+        let env = harness.env(&session, &run);
+        let outcome = executor
+            .execute_round(vec![request.clone()], &env)
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency {
+            run: first_child, ..
+        }) = outcome.stop
+        else {
+            panic!("{:?}", outcome.stop)
+        };
+        harness
+            .ledger
+            .complete(
+                &first_child,
+                RunEnd::Completed {
+                    final_message: Some("A 查完了".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        // 同一 Session 里**后面的任何一条 Run**都可以续跑——这里换一条全新的父 Run。
+        let (run2, resume_request) = delegate_round_on(
+            &harness,
+            &session,
+            "api:resume",
+            json!({ "task": "接着查 B", "resume": first_child.as_str() }),
+        )
+        .await;
+        let outcome = executor
+            .execute_round(vec![resume_request.clone()], &harness.env(&session, &run2))
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency {
+            run: second_child, ..
+        }) = outcome.stop
+        else {
+            panic!("{:?}", outcome.stop)
+        };
+        assert_ne!(
+            second_child, first_child,
+            "续跑是再派一条，不是叫醒旧的那条"
+        );
+
+        let surface = harness.ledger.surface();
+        let spec = surface.runs[&second_child]
+            .delegate
+            .clone()
+            .expect("子 Run 带着 spec");
+        assert_eq!(spec.resumes, Some(first_child.clone()));
+        assert_eq!(spec.task, "接着查 B", "每次续跑是自己的任务");
+        let mut children: Vec<RunId> = child_runs(&harness);
+        children.sort();
+        let mut expected = vec![first_child, second_child.clone()];
+        expected.sort();
+        assert_eq!(children, expected, "账本上是两条子 Run");
+
+        // 结果回到**第二轮那次调用**上：父侧核对的永远是这次调用派出去的那一条（§8.6）。
+        harness
+            .ledger
+            .complete(
+                &second_child,
+                RunEnd::Completed {
+                    final_message: Some("B 也查完了".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let attempt = attempt_of(&harness, &resume_request.call);
+        let env2 = harness.env(&session, &run2);
+        let done = executor
+            .execute_round(
+                vec![resumed_request(&harness, &resume_request, &attempt)],
+                &env2,
+            )
+            .await
+            .unwrap();
+        assert!(done.stop.is_none(), "{:?}", done.stop);
+        assert_eq!(done.results.len(), 1);
+        assert!(
+            done.results[0].content.contains(second_child.as_str()),
+            "{}",
+            done.results[0].content
+        );
+    }
+
+    /// ⑩ 目标不在这个 Session 里：拒绝，而且这次调用**有一条落盘的结果**，不悬着。
+    #[tokio::test]
+    async fn resuming_a_run_from_another_session_is_refused_with_a_ledger_result() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let other_session = komo_kernel::types::ids::SessionId::from_raw("sess-别处");
+        let elsewhere = harness
+            .ledger
+            .accept_input(komo_kernel::types::turn::AcceptInput {
+                session: other_session.clone(),
+                request_key: komo_kernel::types::ids::RequestKey::new("other:1"),
+                text: "别的会话里的一条 Run".into(),
+                source: komo_kernel::types::plan::PlanSource::Interactive {
+                    session: other_session.clone(),
+                },
+                peer: None,
+                model: komo_kernel::test_support::sample_model(),
+                workdir: None,
+                delegate: None,
+                snapshot: None,
+                skip_memory: false,
+                at: harness.clock.now(),
+            })
+            .await
+            .unwrap()
+            .run;
+
+        let (session, run, request) = delegate_round(
+            &harness,
+            json!({ "task": "接着做", "resume": elsewhere.as_str() }),
+        )
+        .await;
+        let outcome = executor
+            .execute_round(vec![request.clone()], &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("同一个 Session"),
+            "{}",
+            outcome.results[0].content
+        );
+        assert!(child_runs(&harness).is_empty(), "没放行就不该有子 Run");
+        assert_eq!(
+            results_for_call(&harness, &request.call),
+            1,
+            "拒绝也要有一条落盘的结果，不能悬着"
+        );
+    }
+
+    /// ⑪ 目标是主对话的 Run（不是子代理）：拒绝。
+    #[tokio::test]
+    async fn resuming_a_main_conversation_run_is_refused() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (main_session, main_run) = harness.open_run().await;
+
+        let (session, run, request) = delegate_round(
+            &harness,
+            json!({ "task": "接着做", "resume": main_run.as_str() }),
+        )
+        .await;
+        assert_eq!(session, main_session);
+        let outcome = executor
+            .execute_round(vec![request.clone()], &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("不是子代理"),
+            "{}",
+            outcome.results[0].content
+        );
+        assert!(child_runs(&harness).is_empty());
+    }
+
+    /// ⑫ 目标还在跑（没有终态）：拒绝，不是"等它"——这次调用本身还没有派出任何东西。
+    #[tokio::test]
+    async fn resuming_a_run_that_has_not_finished_is_refused() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
+        let outcome = executor
+            .execute_round(vec![request], &harness.env(&session, &run))
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency { run: child, .. }) = outcome.stop else {
+            panic!("{:?}", outcome.stop)
+        };
+        // 不完成它——它还在跑。
+
+        let (session2, run2, resume_request) = delegate_round(
+            &harness,
+            json!({ "task": "接着做", "resume": child.as_str() }),
+        )
+        .await;
+        let outcome = executor
+            .execute_round(vec![resume_request.clone()], &harness.env(&session2, &run2))
+            .await
+            .unwrap();
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("还没有结束"),
+            "{}",
+            outcome.results[0].content
+        );
+        // 唯一的子 Run 还是那条还在跑的——续跑请求没有再派出第二条。
+        assert_eq!(child_runs(&harness), vec![child]);
+    }
+
+    /// ⑬ 目标是 `cancelled` / `abandoned`：拒绝——那是操作者说过"这件事到此为止"，模型
+    /// 不能替人把它捡回来。
+    #[tokio::test]
+    async fn resuming_a_cancelled_or_abandoned_run_is_refused() {
+        for end in [
+            RunEnd::Cancelled { by: None },
+            RunEnd::Abandoned {
+                by: None,
+                reason: Some("没人再管了".into()),
+            },
+        ] {
+            let harness = Harness::new();
+            let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+            let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
+            let outcome = executor
+                .execute_round(vec![request], &harness.env(&session, &run))
+                .await
+                .unwrap();
+            let Some(RoundStop::Dependency { run: child, .. }) = outcome.stop else {
+                panic!("{:?}", outcome.stop)
+            };
+            harness.ledger.complete(&child, end).await.unwrap();
+
+            let (session2, run2, resume_request) = delegate_round(
+                &harness,
+                json!({ "task": "接着做", "resume": child.as_str() }),
+            )
+            .await;
+            let outcome = executor
+                .execute_round(vec![resume_request], &harness.env(&session2, &run2))
+                .await
+                .unwrap();
+            assert!(outcome.results[0].is_error);
+            assert!(
+                outcome.results[0].content.contains("到此为止"),
+                "{}",
+                outcome.results[0].content
+            );
+        }
+    }
+
+    /// ⑭ 目标在最新一次 `/new` 之前：拒绝——那条线属于上一段对话。
+    #[tokio::test]
+    async fn resuming_a_run_before_the_latest_boundary_is_refused() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
+        let outcome = executor
+            .execute_round(vec![request], &harness.env(&session, &run))
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency { run: child, .. }) = outcome.stop else {
+            panic!("{:?}", outcome.stop)
+        };
+        harness
+            .ledger
+            .complete(
+                &child,
+                RunEnd::Completed {
+                    final_message: Some("A 查完了".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        harness.ledger.boundary(&session).await.unwrap();
+
+        let (session2, run2, resume_request) = delegate_round(
+            &harness,
+            json!({ "task": "接着做", "resume": child.as_str() }),
+        )
+        .await;
+        let outcome = executor
+            .execute_round(vec![resume_request], &harness.env(&session2, &run2))
+            .await
+            .unwrap();
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("/new"),
+            "{}",
+            outcome.results[0].content
+        );
+    }
+
+    /// ⑮ 续跑同一条子 Run 两次：第二次被拒，理由里写出末端是哪一条——线只往后接，
+    /// 不分叉。
+    #[tokio::test]
+    async fn resuming_the_same_child_twice_is_refused_naming_the_tail() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
+        let outcome = executor
+            .execute_round(vec![request], &harness.env(&session, &run))
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency { run: target, .. }) = outcome.stop else {
+            panic!("{:?}", outcome.stop)
+        };
+        harness
+            .ledger
+            .complete(
+                &target,
+                RunEnd::Completed {
+                    final_message: Some("A 查完了".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (run2, first_resume) = delegate_round_on(
+            &harness,
+            &session,
+            "api:resume-1",
+            json!({ "task": "接着查 B", "resume": target.as_str() }),
+        )
+        .await;
+        let outcome = executor
+            .execute_round(vec![first_resume], &harness.env(&session, &run2))
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency { run: tail, .. }) = outcome.stop else {
+            panic!("{:?}", outcome.stop)
+        };
+
+        let (run3, second_resume) = delegate_round_on(
+            &harness,
+            &session,
+            "api:resume-2",
+            json!({ "task": "接着查 C", "resume": target.as_str() }),
+        )
+        .await;
+        let outcome = executor
+            .execute_round(vec![second_resume], &harness.env(&session, &run3))
+            .await
+            .unwrap();
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains(tail.as_str()),
+            "理由里要点名末端是哪一条：{}",
+            outcome.results[0].content
+        );
+        // 第二次续跑没有再派出第三条子 Run。
+        let mut children = child_runs(&harness);
+        children.sort();
+        let mut expected = vec![target, tail];
+        expected.sort();
+        assert_eq!(children, expected);
+    }
+
+    /// ⑯ 续跑出来的子 Run 一样调不动 `delegate`：深度只有一层不因为续跑而放宽。
+    #[tokio::test]
+    async fn a_resumed_child_cannot_delegate_again() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
+        let outcome = executor
+            .execute_round(vec![request], &harness.env(&session, &run))
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency { run: target, .. }) = outcome.stop else {
+            panic!("{:?}", outcome.stop)
+        };
+        harness
+            .ledger
+            .complete(
+                &target,
+                RunEnd::Completed {
+                    final_message: Some("A 查完了".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let (run2, resume_request) = delegate_round_on(
+            &harness,
+            &session,
+            "api:resume",
+            json!({ "task": "接着查 B", "resume": target.as_str() }),
+        )
+        .await;
+        let outcome = executor
+            .execute_round(vec![resume_request], &harness.env(&session, &run2))
+            .await
+            .unwrap();
+        let Some(RoundStop::Dependency {
+            run: resumed_child, ..
+        }) = outcome.stop
+        else {
+            panic!("{:?}", outcome.stop)
+        };
+        let spec = harness.ledger.surface().runs[&resumed_child]
+            .delegate
+            .clone()
+            .unwrap();
+
+        // 续跑出来的子 Run 自己发起一次 delegate：能力面上它已经没有这个名字，这里验的是
+        // 编排里的第二道（有人把含 `delegate` 的能力面塞给了它）。
+        let inner_request = harness
+            .record_round(
+                &resumed_child,
+                &[("delegate", json!({ "task": "再派一层" }))],
+            )
+            .await;
+        let child_env = harness.child_env(&session, &resumed_child, spec);
+        let outcome = executor
+            .execute_round(inner_request, &child_env)
+            .await
+            .unwrap();
+        assert!(outcome.results[0].is_error);
+        assert!(outcome.results[0].content.contains("一层"));
+        assert!(
+            !child_runs(&harness).contains(&resumed_child) || child_runs(&harness).len() == 2,
+            "没有第三条子 Run 被派出去"
+        );
     }
 }
 

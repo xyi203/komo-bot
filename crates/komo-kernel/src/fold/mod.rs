@@ -193,11 +193,13 @@ impl Surface {
                 run.final_event = Some(event_id);
                 run.final_message = body.final_message.clone();
             }
-            EventPayload::RunFailed(_) => {
+            EventPayload::RunFailed(body) => {
                 let event_id = event.event_id.clone();
+                let reason = body.reason.clone();
                 let run = self.run_mut(event);
                 run.status = RunState::Failed;
                 run.final_event = Some(event_id);
+                run.reason = Some(reason);
             }
             EventPayload::RunCancelled(_) => {
                 let event_id = event.event_id.clone();
@@ -205,11 +207,13 @@ impl Surface {
                 run.status = RunState::Cancelled;
                 run.final_event = Some(event_id);
             }
-            EventPayload::RunAbandoned(_) => {
+            EventPayload::RunAbandoned(body) => {
                 let event_id = event.event_id.clone();
+                let reason = body.reason.clone();
                 let run = self.run_mut(event);
                 run.status = RunState::Abandoned;
                 run.final_event = Some(event_id);
+                run.reason = reason;
             }
             EventPayload::MessageUser(body) => self.push_message(SurfaceMessage {
                 seq: event.seq,
@@ -391,6 +395,7 @@ impl Surface {
             input_event: None,
             final_event: None,
             final_message: None,
+            reason: None,
             generation: None,
             rounds: 0,
             delegate: None,

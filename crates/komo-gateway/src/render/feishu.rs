@@ -385,6 +385,14 @@ fn plan_action(plan: &ExecutionPlan) -> String {
                 lines.push(format!("代码:\n{code}"));
             }
         }
+        // 任务正文：子代理拿到的**只有它**（§4）。续跑（§4）多写一句"接着子 Run X"——
+        // 目标进了计划、进了计划哈希，批的是"接着这一条"，换一条要重新问。
+        Operation::Delegate { spec } => {
+            lines.push(format!("任务: {}", spec.task));
+            if let Some(target) = &spec.resumes {
+                lines.push(format!("续跑: 接着子 Run {target}"));
+            }
+        }
         _ => {}
     }
     if let Some(cwd) = &plan.cwd {
@@ -913,5 +921,39 @@ mod tests {
             reason: "工具结果不确定".into(),
         });
         assert!(messages[0].content.contains("需要你判断"));
+    }
+
+    /// 委派续跑（§4）：审批卡多写一句"接着子 Run X"，任务正文照旧在。
+    #[test]
+    fn a_delegate_resume_names_which_child_it_continues() {
+        use komo_kernel::types::delegate::DelegateSpec;
+
+        let spec = DelegateSpec::new(
+            RunId::from_raw("run-parent"),
+            komo_kernel::types::ids::ToolCallId::from_raw("call-1"),
+            "接着查 B",
+        )
+        .with_resumes(RunId::from_raw("run-child-1"));
+        let action = plan_action(&ExecutionPlan {
+            operation: Operation::Delegate { spec },
+            tool: "delegate".into(),
+            ..plan()
+        });
+        assert!(action.contains("任务: 接着查 B"), "{action}");
+        assert!(action.contains("续跑: 接着子 Run run-child-1"), "{action}");
+
+        // 不续跑的普通委派不该多出这一行。
+        let fresh_spec = DelegateSpec::new(
+            RunId::from_raw("run-parent"),
+            komo_kernel::types::ids::ToolCallId::from_raw("call-1"),
+            "查 A",
+        );
+        let fresh = plan_action(&ExecutionPlan {
+            operation: Operation::Delegate { spec: fresh_spec },
+            tool: "delegate".into(),
+            ..plan()
+        });
+        assert!(fresh.contains("任务: 查 A"), "{fresh}");
+        assert!(!fresh.contains("续跑"), "{fresh}");
     }
 }

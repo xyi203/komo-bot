@@ -363,8 +363,12 @@ fn operation_body(operation: &Operation) -> Option<String> {
         Operation::ShellCommand { command } => Some(command.clone()),
         Operation::PythonCall { module, function } => Some(format!("{module}.{function}()")),
         Operation::ToolboxChange { module } => Some(module.clone()),
-        // 审批看的就是这一句任务正文：子代理拿到的**只有它**（§4）。
-        Operation::Delegate { spec } => Some(spec.task.clone()),
+        // 审批看的就是这一句任务正文：子代理拿到的**只有它**（§4）。续跑（§4）多写一句
+        // "接着子 Run X"：目标进了计划、进了计划哈希，批的是"接着这一条"，换一条要重新问。
+        Operation::Delegate { spec } => Some(match &spec.resumes {
+            Some(target) => format!("接着子 Run {target}\n{}", spec.task),
+            None => spec.task.clone(),
+        }),
         _ => None,
     }
 }
@@ -614,5 +618,36 @@ mod tests {
         }];
         let rendered = text_of(&approval_lines(&record));
         assert!(rendered.contains("$MEMOS_TOKEN"), "{rendered}");
+    }
+
+    /// 委派续跑（§4）：弹窗多写一句"接着子 Run X"，任务正文照旧在。
+    #[test]
+    fn a_delegate_resume_names_which_child_it_continues() {
+        use komo_kernel::types::delegate::DelegateSpec;
+        use komo_kernel::types::ids::{RunId, ToolCallId};
+
+        let mut record = approval_record();
+        record.plan.operation = Operation::Delegate {
+            spec: DelegateSpec::new(
+                RunId::from_raw("run-parent"),
+                ToolCallId::from_raw("call-1"),
+                "接着查 B",
+            )
+            .with_resumes(RunId::from_raw("run-child-1")),
+        };
+        let rendered = text_of(&approval_lines(&record));
+        assert!(rendered.contains("接着子 Run run-child-1"), "{rendered}");
+        assert!(rendered.contains("接着查 B"), "{rendered}");
+
+        // 不续跑的普通委派不该多出这一句。
+        record.plan.operation = Operation::Delegate {
+            spec: DelegateSpec::new(
+                RunId::from_raw("run-parent"),
+                ToolCallId::from_raw("call-1"),
+                "查 A",
+            ),
+        };
+        let rendered = text_of(&approval_lines(&record));
+        assert!(!rendered.contains("接着子 Run"), "{rendered}");
     }
 }

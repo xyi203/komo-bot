@@ -68,8 +68,11 @@ async fn render(case: &Case) -> String {
         .runs
         .get(&case.run)
         .and_then(|view| view.delegate.clone());
-    let scope = match &delegate {
-        Some(_) => ReplayScope::Run(&case.run),
+    let thread = delegate
+        .as_ref()
+        .map(|_| history::delegate_thread(&surface, &case.run));
+    let scope = match &thread {
+        Some(chain) => ReplayScope::Thread(chain),
         None => ReplayScope::Conversation(&case.run),
     };
     let tool_names: Vec<String> = case.tools.iter().map(|tool| tool.name.clone()).collect();

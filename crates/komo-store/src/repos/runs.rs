@@ -31,6 +31,8 @@ pub struct RunRecord {
     pub final_event: Option<EventId>,
     /// 派它的那条 Run；`None` = 顶层 Run（§8.4 的委派子 Run）。
     pub parent: Option<RunId>,
+    /// 续跑（§4）：这条子 Run 接着哪一条。`None` = 这条线的第一条，或者不是委派。
+    pub resumes: Option<RunId>,
     /// 受理时那份委派计划；读不出来（旧行 / 损坏行）时是 `None`，不猜（[`delegate_of`]）。
     pub delegate: Option<DelegateSpec>,
     /// 调度状态（§8.4）。
@@ -65,6 +67,7 @@ impl RunRecord {
             input_seq: Seq(row.input_seq.max(0) as u64),
             final_event: row.final_event.clone().map(EventId::from_raw),
             parent: row.parent_run_id.clone().map(RunId::from_raw),
+            resumes: row.resumes_run_id.clone().map(RunId::from_raw),
             delegate: delegate_of(row),
             state: state_of(row)?,
             wait: wait_of(row)?,
@@ -265,6 +268,11 @@ pub async fn reserve_in(ex: &mut dyn Executor, new: &NewRun) -> Result<RunRow, S
         // "这是子 Run，直接进队列"，§8.7 的领取语句判"拦住我的那条是不是我的父"），
         // 而这两步之间没有任何写者会再补——留到受理那一步写就是在开一个窗口。
         parent_run_id: new.delegate.as_ref().map(|spec| spec.parent.to_string()),
+        resumes_run_id: new
+            .delegate
+            .as_ref()
+            .and_then(|spec| spec.resumes.as_ref())
+            .map(RunId::to_string),
         delegate: new.delegate.as_ref().map(encode).transpose()?,
         // 退役列：不再读，写入给空值（§8.2 只允许加列）。
         status: String::new(),
@@ -308,6 +316,23 @@ pub async fn find_by_request_key_in(
     key: &RequestKey,
 ) -> Result<Option<RunRow>, StoreError> {
     RunRow::filter(RunRow::fields().request_key().eq(key.as_str()))
+        .first()
+        .exec(ex)
+        .await
+        .map_err(map_toasty)
+}
+
+/// 有没有别的 Run 已经在续 `target` 这条线（§4 的末端校验，第二道：与 `run.accepted`
+/// 同一次提交里再判一次，不靠"先查后写"）。
+///
+/// **执行器已经在受理之前查过一遍**（折 JSONL 里的 `resumes` 链，§8.3 的内容权威）；这里
+/// 是狭窄的竞态窗口——两条几乎同时的续跑请求都过了那一道检查——的兜底，判据换成了
+/// SQL 上这一列，好让它能在写事务里问一次就有答案，不必再解析一遍 `delegate` 的 JSON。
+pub async fn find_resuming_in(
+    ex: &mut dyn Executor,
+    target: &RunId,
+) -> Result<Option<RunRow>, StoreError> {
+    RunRow::filter(RunRow::fields().resumes_run_id().eq(target.as_str()))
         .first()
         .exec(ex)
         .await

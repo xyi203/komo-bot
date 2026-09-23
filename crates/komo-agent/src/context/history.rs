@@ -19,6 +19,7 @@ use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
 use komo_kernel::types::ids::{RunId, Seq, ToolCallId};
 use komo_kernel::types::refs::{ContentRef, ToolResultStatus};
+use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{ReplayMessage, Role, ToolCallRequest, ToolResultForModel};
 
 /// 这一段回放给模型的是哪一块（`docs/agent.md` §8）。
@@ -29,8 +30,71 @@ pub enum ReplayScope<'a> {
     /// 带的是**正在跑的那条 Run**：它那几句是完整协议，其余 Run 只发布"用户说了什么、
     /// 它最后答了什么"。
     Conversation(&'a RunId),
-    /// 只这一条 Run（子代理）：它拿不到父的对话历史，父的窗口里也没有它的过程。
-    Run(&'a RunId),
+    /// 子代理这条线（`docs/komo_bot.md` §4 的 `resumes` 链）：旧→新排列，**最后一个元素
+    /// 是正在跑的这条**，没续跑过就只有它一条（[`delegate_thread`] 给出）。
+    ///
+    /// 它拿不到父的对话历史，父的窗口里也没有它的过程——线以外的一切都不在这个 scope
+    /// 里。线上更早的那几条只发布任务正文与最后的回答，规则与 `Conversation` 里的历史
+    /// Run 一样；差别只在这里的"历史"是续跑链，不是整个会话。
+    Thread(&'a [RunId]),
+}
+
+impl ReplayScope<'_> {
+    /// 正在跑的那一条：`Conversation` 就是它自己，`Thread` 是链上最后一个元素。
+    fn current(&self) -> &RunId {
+        match self {
+            ReplayScope::Conversation(run) => run,
+            ReplayScope::Thread(chain) => chain.last().expect("续跑线至少有正在跑的这一条"),
+        }
+    }
+}
+
+/// 子代理这条线（旧→新，含正在跑的这一条）：顺着 `delegate.resumes` 往回找。
+///
+/// 它是从 JSONL 里 fold 出来的（`run.accepted.delegate.resumes`），不查 state.db——线
+/// 决定模型看见什么，属于内容权威（`docs/komo_bot.md` §8.2、§8.3）。
+pub fn delegate_thread(surface: &Surface, run: &RunId) -> Vec<RunId> {
+    let mut chain = vec![run.clone()];
+    let mut current = run.clone();
+    while let Some(previous) = surface
+        .runs
+        .get(&current)
+        .and_then(|view| view.delegate.as_ref())
+        .and_then(|spec| spec.resumes.clone())
+    {
+        // 线只往后接（§4 的末端校验），账本里不会有环；万一有，停在第一次重复处，
+        // 不在这里死循环。
+        if chain.contains(&previous) {
+            break;
+        }
+        chain.push(previous.clone());
+        current = previous;
+    }
+    chain.reverse();
+    chain
+}
+
+/// 线上更早的一环没有最终回答时，它**怎么结束的**：回放在它那句任务正文后面补一句
+/// （`docs/komo_bot.md` §8.3）。`completed` 不在这里——它要么有最后回答，要么什么都不该编。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ending<'s> {
+    pub state: RunState,
+    pub reason: Option<&'s str>,
+}
+
+impl Ending<'_> {
+    fn sentence(&self) -> Option<String> {
+        let reason = self
+            .reason
+            .map(|reason| format!("：{reason}"))
+            .unwrap_or_default();
+        match self.state {
+            RunState::Failed => Some(format!("（这条子 Run 失败了{reason}）")),
+            RunState::Cancelled => Some("（这条子 Run 被取消了，没有留下结果）".into()),
+            RunState::Abandoned => Some(format!("（这条子 Run 被放弃了{reason}）")),
+            _ => None,
+        }
+    }
 }
 
 /// 一条消息该按哪种方式回放。
@@ -48,6 +112,9 @@ pub enum EntryKind {
 pub struct Entry<'s> {
     pub message: &'s SurfaceMessage,
     pub kind: EntryKind,
+    /// 只在子代理线上更早一环的任务正文上出现：那一环没有最终回答，投影时在这句后面补
+    /// 一句它怎么结束的（[`Ending`]）。其余条目恒为 `None`。
+    pub ending: Option<Ending<'s>>,
 }
 
 /// Gateway 读回来的东西：`entry` 选中的那条消息，正文与（`Protocol` 才有的）工具输出。
@@ -75,9 +142,7 @@ pub struct StoredOutput {
 /// 知道的事（§8 的"skipping empty transcript text"在 [`to_replay_messages`] 里做）。这里
 /// 只按**结构**（角色、seq、是不是这条 Run）判断要不要这一条。
 pub fn entries<'s>(surface: &'s Surface, scope: ReplayScope<'_>) -> Vec<Entry<'s>> {
-    let only = match scope {
-        ReplayScope::Conversation(run) | ReplayScope::Run(run) => run,
-    };
+    let only = scope.current();
     let kept = window(surface, Some(scope));
 
     // 历史 Run 的"它最后答了什么"是哪一条：同一个 Run 里**最后**一条带正文的 assistant。
@@ -105,14 +170,26 @@ pub fn entries<'s>(surface: &'s Surface, scope: ReplayScope<'_>) -> Vec<Entry<'s
                 if message.role != Role::User && last != Some(message.seq) {
                     return None;
                 }
+                // 子代理线上更早的一环、没有最终回答：任务正文后面要补一句它怎么结束的。
+                let ending = match (scope, message.role, &message.run, last) {
+                    (ReplayScope::Thread(_), Role::User, Some(run), None) => {
+                        surface.runs.get(run).map(|view| Ending {
+                            state: view.status,
+                            reason: view.reason.as_deref(),
+                        })
+                    }
+                    _ => None,
+                };
                 return Some(Entry {
                     message,
                     kind: EntryKind::Transcript,
+                    ending,
                 });
             }
             Some(Entry {
                 message,
                 kind: EntryKind::Protocol,
+                ending: None,
             })
         })
         .collect()
@@ -138,8 +215,11 @@ fn window<'s>(surface: &'s Surface, scope: Option<ReplayScope<'_>>) -> Vec<&'s S
         .filter(|message| match scope {
             None => true,
             // 子代理与父在同一份日志里，但它们不是同一段对话：子代理跑过的那几轮不能进
-            // 父的窗口，父的也没进过子代理的。
-            Some(ReplayScope::Run(run)) => message.run.as_ref() == Some(run),
+            // 父的窗口，父的也没进过子代理的。这条线以外的 Run（包括别的子代理线）同样
+            // 不进——子代理的窗口就是它自己那条线。
+            Some(ReplayScope::Thread(chain)) => {
+                message.run.as_ref().is_some_and(|run| chain.contains(run))
+            }
             Some(ReplayScope::Conversation(_)) => message
                 .run
                 .as_ref()
@@ -213,20 +293,27 @@ pub(crate) fn to_replay_messages(
         let message = resolved.entry.message;
         match resolved.entry.kind {
             EntryKind::Transcript => {
-                let Some(text) = resolved.text else {
-                    continue;
-                };
-                if text.is_empty() {
-                    continue;
+                let ending = resolved.entry.ending.and_then(|ending| ending.sentence());
+                if let Some(text) = resolved.text.filter(|text| !text.is_empty()) {
+                    out.push(ReplayMessage {
+                        role: message.role,
+                        seq: message.seq,
+                        text: Some(text),
+                        tool_calls: Vec::new(),
+                        tool_results: Vec::new(),
+                        provider_blocks: None,
+                    });
                 }
-                out.push(ReplayMessage {
-                    role: message.role,
-                    seq: message.seq,
-                    text: Some(text),
-                    tool_calls: Vec::new(),
-                    tool_results: Vec::new(),
-                    provider_blocks: None,
-                });
+                if let Some(line) = ending {
+                    out.push(ReplayMessage {
+                        role: Role::Assistant,
+                        seq: message.seq,
+                        text: Some(line),
+                        tool_calls: Vec::new(),
+                        tool_results: Vec::new(),
+                        provider_blocks: None,
+                    });
+                }
             }
             EntryKind::Protocol => {
                 let mut tool_results = Vec::new();

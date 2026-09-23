@@ -41,6 +41,8 @@ use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 
+use komo_kernel::events::Event;
+use komo_kernel::fold::fold;
 use komo_kernel::policy::PolicyDecision;
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
 use komo_kernel::traits::{
@@ -50,7 +52,9 @@ use komo_kernel::types::chat::Principal;
 use komo_kernel::types::delegate::{
     DelegateContract, DelegateSpec, SchemaMode, Validation, validate,
 };
-use komo_kernel::types::ids::{ApprovalId, AttemptId, RequestKey, RunId, SessionId, ToolCallId};
+use komo_kernel::types::ids::{
+    ApprovalId, AttemptId, RequestKey, RunId, Seq, SessionId, ToolCallId,
+};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::{
     ApprovedPlan, ConsumeIntent, EnvVersion, ExecutionPlan, Operation, PlanSource, Proof,
@@ -58,7 +62,7 @@ use komo_kernel::types::plan::{
 };
 use komo_kernel::types::refs::{AttemptRef, ToolResultBody, ToolResultStatus};
 use komo_kernel::types::resource::ResourceMounts;
-use komo_kernel::types::status::{RunEnd, ToolCallState};
+use komo_kernel::types::status::{RunEnd, RunState, ToolCallState};
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{
     CancelToken, ResumedCall, ToolContext, ToolError, ToolOutput, WorkspaceRoot,
@@ -782,6 +786,15 @@ impl ToolExecutor {
             ));
         }
 
+        // 续跑（§4）：目标在 `prepare` 里校验——但 `Tool::prepare` 没有账本，这里是第一次
+        // 真的查得到它的地方，与深度检查同理，一旦不合格就是一次**没有执行过**的调用，
+        // 按 `fail_call` 落账（不靠"先查后写"：受理那一步的 db 事务里还有第二道，§4）。
+        if let Some(message) = self.validate_resume(env, spec).await? {
+            return Ok(Begin::Settled(
+                self.fail_unstarted(request, env, message).await?,
+            ));
+        }
+
         // "允不允许把这件事派出去"要过 Policy 与审批（§7.1）。放行在受理**之前**：
         // 没放行的委派不该在账本里留下一条没人认领的子 Run。
         let intent = if resumed
@@ -823,6 +836,90 @@ impl ToolExecutor {
             // 这次调用**没有结果**：它在等子 Run。空结果也不是结果。
             result: None,
         }))
+    }
+
+    /// 续跑目标合不合格（§4）：`Some(reason)` = 不合格，理由交给模型；`None` = 可以接着
+    /// 走放行梯子。没有 `resume` 参数时直接放行（`None`）。
+    ///
+    /// 四条都在这里判：① 同一 Session、且是一条子 Run；② 已经终态，且终态是 completed
+    /// 或 failed；③ 在最新一个 `conversation.boundary` 之后；④ 是这条线的末端（没有别的
+    /// 子 Run 在 `resumes` 它，不论那条什么状态），理由里写出末端是哪一条。
+    ///
+    /// 这里要把整个 Session 的日志读一遍再 `fold`——线是从 JSONL 里折出来的
+    /// （`run.accepted.delegate.resumes`），不查 state.db（§8.3 的内容权威）。它只在**首次**
+    /// 执行这次委派时跑一遍，不在每次续跑收口时重复。
+    async fn validate_resume(
+        &self,
+        env: &CallEnv,
+        spec: &DelegateSpec,
+    ) -> Result<Option<String>, ExecError> {
+        let Some(target) = spec.resumes.clone() else {
+            return Ok(None);
+        };
+        let events = self.events_of(&env.session).await?;
+        let surface = fold(&events);
+
+        let Some(view) = surface.runs.get(&target) else {
+            return Ok(Some(format!(
+                "接不上 {target}：这条 Run 不在同一个 Session 里，或者账本里根本没有它。"
+            )));
+        };
+        if view.delegate.is_none() {
+            return Ok(Some(format!(
+                "{target} 是主对话的 Run，不是子代理，没有什么线可以接。"
+            )));
+        }
+        if !view.status.is_terminal() {
+            return Ok(Some(format!(
+                "{target} 还没有结束（现在是 {}），续不了一条还在跑的子 Run。",
+                state_word(view.status)
+            )));
+        }
+        if !matches!(view.status, RunState::Completed | RunState::Failed) {
+            return Ok(Some(format!(
+                "{target} 是 {} 结束的：cancelled / abandoned 是操作者说过\"这件事到此为止\"，\
+                 不能续。",
+                state_word(view.status)
+            )));
+        }
+        // 在最新一个 conversation.boundary 之后：`run.accepted` 那条消息进不进回放窗口
+        // 就是判据——边界之前的那条线属于上一段对话，父的窗口里已经看不到它。
+        let after_boundary = surface
+            .replay()
+            .iter()
+            .any(|message| message.run.as_ref() == Some(&target));
+        if !after_boundary {
+            return Ok(Some(format!(
+                "{target} 在最新一次 /new 之前，属于上一段对话，接不上。"
+            )));
+        }
+        if let Some(resumer) = find_resumer(&surface, &target) {
+            let tail = tail_of(&surface, &resumer);
+            return Ok(Some(format!(
+                "{target} 已经被续跑过：这条线现在的末端是 {tail}，线只往后接，续到 {tail} \
+                 才行；想另起一条就别填 resume。"
+            )));
+        }
+        Ok(None)
+    }
+
+    /// 读完一个 Session 的全部事件（分页）。`validate_resume` 用它折出这条线。
+    async fn events_of(&self, session: &SessionId) -> Result<Vec<Event>, ExecError> {
+        let mut all = Vec::new();
+        let mut from = Seq::ZERO;
+        loop {
+            let batch = self.ledger.read(session, from, 0).await?;
+            if batch.events.is_empty() {
+                return Ok(all);
+            }
+            for event in batch.events {
+                from = from.max(event.seq);
+                all.push(event);
+            }
+            if batch.next.is_none() {
+                return Ok(all);
+            }
+        }
     }
 
     /// 受理子 Run。幂等键由**父 Run + 承载它的那次调用**决定，所以同一件委派重复受理
@@ -1407,6 +1504,38 @@ fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
     }
 }
 
+/// 有没有别的子 Run 已经在续 `target` 这条线（§4 的"是不是末端"）：不论那条子 Run 现在
+/// 是什么状态——线只往后接，不分叉，已经有人接了就不能再接第二次。
+fn find_resumer(surface: &komo_kernel::fold::Surface, target: &RunId) -> Option<RunId> {
+    surface.runs.values().find_map(|view| {
+        let spec = view.delegate.as_ref()?;
+        (spec.resumes.as_ref() == Some(target)).then(|| view.run.clone())
+    })
+}
+
+/// 顺着 `resumes` 往后一路找到这条线现在的末端（拒绝续跑时要点名是哪一条）。
+fn tail_of(surface: &komo_kernel::fold::Surface, start: &RunId) -> RunId {
+    let mut current = start.clone();
+    while let Some(next) = find_resumer(surface, &current) {
+        current = next;
+    }
+    current
+}
+
+/// 状态给人看的那个词——校验失败的理由里要说清楚"现在是什么样"。
+fn state_word(state: RunState) -> &'static str {
+    match state {
+        RunState::Accepted => "accepted",
+        RunState::Queued => "queued",
+        RunState::Running => "running",
+        RunState::Waiting => "waiting",
+        RunState::Completed => "completed",
+        RunState::Failed => "failed",
+        RunState::Cancelled => "cancelled",
+        RunState::Abandoned => "abandoned",
+    }
+}
+
 /// 核对结论里那句证据。
 fn evidence_of(verdict: &Verification) -> &str {
     match verdict {
@@ -1424,7 +1553,7 @@ fn evidence_of(verdict: &Verification) -> &str {
 /// 可以去 `read` 那条 Run 的完整过程——**复验用的是父侧手里那份契约，过程由只读接口去取**
 /// （§8.6）。
 fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> (ToolResultBody, String) {
-    match end {
+    let (body, content) = match end {
         RunEnd::Completed { final_message, .. } => {
             let text = final_message.as_deref().unwrap_or_default();
             match &spec.contract {
@@ -1464,6 +1593,19 @@ fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> (ToolResult
             end,
             serde_json::json!({ "by": by, "reason": reason }),
         ),
+    };
+    // completed / failed 都能续（§4：cancelled / abandoned 不能）；给模型一句能直接照着
+    // 做的提示，而不是让它自己想起来这条 id 还能被 resume。
+    match end {
+        RunEnd::Completed { .. } | RunEnd::Failed { .. } => {
+            let hint =
+                format!("\n\n还要接着这件事，再调一次 delegate 并带上 resume: \"{child}\"。");
+            let content = format!("{content}{hint}");
+            let mut body = body;
+            body.preview = Some(content.clone());
+            (body, content)
+        }
+        _ => (body, content),
     }
 }
 

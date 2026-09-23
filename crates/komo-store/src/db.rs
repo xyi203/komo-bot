@@ -974,7 +974,7 @@ mod tests {
         insert(&db, "after-alter".to_string()).await.unwrap();
     }
 
-    /// 委派那两列在**旧形状的 runs 表**上补得回来（§8.2 的加列规则，也是升级路径）。
+    /// 委派那三列在**旧形状的 runs 表**上补得回来（§8.2 的加列规则，也是升级路径）。
     ///
     /// 同上：旧形状在普通连接上造、在另一条新连接上确认，然后才重开验迁移。
     #[tokio::test]
@@ -984,10 +984,13 @@ mod tests {
 
         let legacy = crate::models::run::DDL
             .replace(r#""parent_run_id" TEXT, "#, "")
+            .replace(r#""resumes_run_id" TEXT, "#, "")
             .replace(r#""delegate" TEXT, "#, "");
         assert!(
-            !legacy.contains("parent_run_id") && !legacy.contains("delegate"),
-            "旧形状里不该有这两列"
+            !legacy.contains("parent_run_id")
+                && !legacy.contains("resumes_run_id")
+                && !legacy.contains("delegate"),
+            "旧形状里不该有这三列"
         );
         plain_build_old(&path, Some(("runs", legacy))).await;
 
@@ -999,7 +1002,7 @@ mod tests {
 
         let db = Db::connect(&path).await.unwrap();
         let after = plain_columns(&path, "runs").await;
-        for column in ["parent_run_id", "delegate"] {
+        for column in ["parent_run_id", "resumes_run_id", "delegate"] {
             assert!(
                 after.iter().any(|name| name == column),
                 "{column} 补回来了，而且落盘：{after:?}"

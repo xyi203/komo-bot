@@ -94,6 +94,20 @@ impl Ledger for Coordinator {
                             }
                             return Ok(Reserved::Existing(Box::new(existing)));
                         }
+                        // 续跑（§4）的末端校验，第二道：执行器已经查过一遍（折 JSONL 里的
+                        // `resumes` 链），这里是与 `run.accepted` 同一次提交里的兜底——不靠
+                        // "先查后写"，两条几乎同时的续跑请求只有先落地事务的那一条能过。
+                        if let Some(target) = input
+                            .delegate
+                            .as_ref()
+                            .and_then(|spec| spec.resumes.as_ref())
+                            && let Some(resumer) = runs::find_resuming_in(ex, target).await?
+                        {
+                            return Ok(Reserved::TailTaken {
+                                target: target.clone(),
+                                by: RunId::from_raw(resumer.id),
+                            });
+                        }
                         let row = runs::reserve_in(
                             ex,
                             &runs::NewRun {
@@ -127,6 +141,11 @@ impl Ledger for Coordinator {
                 return Err(LedgerError::RequestKeyConflict {
                     key: input.request_key.to_string(),
                 });
+            }
+            Reserved::TailTaken { target, by } => {
+                return Err(LedgerError::Conflict(format!(
+                    "{target} 已经被 {by} 续跑过，这条线只往后接，不能再续第二次"
+                )));
             }
             Reserved::Existing(row) => {
                 // 重发：原 Run 原封不动返回，不再追加一条用户消息。
@@ -899,6 +918,11 @@ enum Reserved {
     Fresh(Box<crate::models::RunRow>),
     Existing(Box<crate::models::RunRow>),
     Conflict,
+    /// 续跑的目标已经被另一条 Run 续过了（§4 的末端校验，写事务里的第二道）。
+    TailTaken {
+        target: RunId,
+        by: RunId,
+    },
 }
 
 /// 没有终态事件可读时，按行上的列回答（`RunEnd` 的两条退化路径，见
@@ -2068,6 +2092,96 @@ mod tests {
             })
             .expect("子 Run 有一条 run.accepted");
         assert_eq!(text.as_deref(), Some("数行数"), "输入正文就是那份任务");
+    }
+
+    /// 续跑（§4）：`resumes` 落到 `runs.resumes_run_id` 这一列上，`RunRecord` 读得回来。
+    #[tokio::test]
+    async fn a_resuming_child_records_which_run_it_continues() {
+        let f = fixture().await;
+        let parent = f
+            .coordinator
+            .accept_input(input("api:1", "派个子任务", &f.session))
+            .await
+            .unwrap();
+        let first_child = f
+            .coordinator
+            .accept_input(delegated("api:2", &parent.run, "查 A", &f.session, None))
+            .await
+            .unwrap();
+        f.coordinator
+            .complete(
+                &first_child.run,
+                RunEnd::Completed {
+                    final_message: Some("A 查完了".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut resume_input = delegated("api:3", &parent.run, "接着查 B", &f.session, None);
+        resume_input.delegate = resume_input
+            .delegate
+            .map(|spec| spec.with_resumes(first_child.run.clone()));
+        let second_child = f.coordinator.accept_input(resume_input).await.unwrap();
+
+        let row = crate::repos::runs::get(&f.db, &second_child.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.resumes, Some(first_child.run.clone()));
+        assert_eq!(
+            row.delegate.and_then(|spec| spec.resumes),
+            Some(first_child.run)
+        );
+    }
+
+    /// 续跑的末端校验：写事务里的第二道（§4「不靠先查后写」）。执行器在这之前已经查过
+    /// JSONL 里的 `resumes` 链，这里断言的是**即使那道检查被绕过**，`accept_input` 自己
+    /// 的事务也不会受理出第二条续跑同一个目标的子 Run。
+    #[tokio::test]
+    async fn accepting_a_second_resume_of_the_same_target_is_refused() {
+        let f = fixture().await;
+        let parent = f
+            .coordinator
+            .accept_input(input("api:1", "派个子任务", &f.session))
+            .await
+            .unwrap();
+        let target = f
+            .coordinator
+            .accept_input(delegated("api:2", &parent.run, "查 A", &f.session, None))
+            .await
+            .unwrap();
+        f.coordinator
+            .complete(
+                &target.run,
+                RunEnd::Completed {
+                    final_message: Some("A 查完了".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut first_resume = delegated("api:3", &parent.run, "接着查 B", &f.session, None);
+        first_resume.delegate = first_resume
+            .delegate
+            .map(|spec| spec.with_resumes(target.run.clone()));
+        let resumer = f.coordinator.accept_input(first_resume).await.unwrap();
+
+        let mut second_resume = delegated("api:4", &parent.run, "接着查 C", &f.session, None);
+        second_resume.delegate = second_resume
+            .delegate
+            .map(|spec| spec.with_resumes(target.run.clone()));
+        let error = f.coordinator.accept_input(second_resume).await.unwrap_err();
+        let LedgerError::Conflict(message) = &error else {
+            panic!("{error:?}")
+        };
+        assert!(message.contains(target.run.as_str()), "{message}");
+        assert!(
+            message.contains(resumer.run.as_str()),
+            "理由里要写出末端是哪一条：{message}"
+        );
     }
 
     /// `runs.delegate` 写坏了（或者根本没有这一列的老行）**不算损坏**：当作"没有契约"，

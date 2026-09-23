@@ -114,7 +114,7 @@ Memory 是唯一需要碰 runtime 的地方，单独放在最后一个阶段（�
 | 记忆召回与钉住 | `komo-runtime` `MemoryManager::prepare_segment` | 按 `boundary` 钉在进程内 `pins` 表里，检查点记 `MemoryUse`。返回值 `Injection { text, uses }` **已经带着正文**，但 `segment.rs` 的 `recall_for` 只取了 `.uses` |
 | 记忆渲染 | `komo-runtime/src/memory/preamble.rs` `render_injection` | 抬头 + 每行带来源、确认状态、时间与版本 + 按渲染后的行长截断预算 |
 | 记忆进系统提示 | 各 LLM 适配器的 `SystemPreamble` 钩子 | 正文绕了一圈：`settle_selection` 写进 `selections` 表 → `MemoryPreamble` 按 run 取 → 三个适配器各自 `"\n\n"` 追加。`TurnRequest.system_prompt` **不是**最终发出去的系统提示 |
-| 子代理隔离 | `segment()` | 不召回记忆、`ReplayScope::Run`、`without_delegate`。已经在上游做了，符合 §12 |
+| 子代理隔离 | `segment()` | 不召回记忆、`ReplayScope::Thread`、`without_delegate`。已经在上游做了，符合 §12 |
 | `skill://` 挂载 | `segment()` 里的 `ResourceMounts.skills` | 用的是 `SkillRegistry::list()`（全部 skill，含被盖住、被 disable 的），**不是**提示里那份目录。两者本来就不是同一个集合 |
 
 `segment.rs` 共 2011 行，其中约 700 行是测试。
@@ -584,7 +584,8 @@ komo-agent: ResolvedMessage → ReplayMessage（工具结果调 kernel::project�
 
 pub enum ReplayScope<'a> {
     Conversation(&'a RunId),   // 主对话：跨 Run 聚合，正在跑的那条带完整协议
-    Run(&'a RunId),            // 子代理：只这一条 Run
+    Thread(&'a [RunId]),       // 子代理：它那条线（`resumes` 链，旧→新，末尾是正在跑的这条）；
+                               // 没续跑过就只有一条。规则同 Conversation（komo_bot.md §4、§8.3）
 }
 
 /// 一条要回放的消息，以及它按哪种方式回放。
@@ -820,7 +821,7 @@ subagent_prompt.rs
 Child Run：
 
 ```text
-不继承 parent history      ReplayScope::Run
+不继承 parent history      ReplayScope::Thread（只有它自己那条线）
 不继承 parent memory       delegate 存在时不调 recall_for
 不继承 parent skill context
 Surface 移除 delegate      without_delegate（runtime 编排里还有第二道）
@@ -828,7 +829,7 @@ Surface 移除 delegate      without_delegate（runtime 编排里还有第二道
 
 这些现在都已经在 `segment()` 里、`ContextInput` 构造之前做掉了。重构后它们留在 Gateway
 的 I/O 阶段：子代理的 `ContextInput` 里 `memory` 为空、`skills` 为空、`history` 只有它
-自己那条 Run。
+自己那条线（没续跑过就是那一条 Run）。
 
 不要变成：
 

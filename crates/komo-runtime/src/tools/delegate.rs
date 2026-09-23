@@ -17,7 +17,7 @@
 use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::delegate::{DelegateSpec, SchemaMode};
-use komo_kernel::types::ids::OperationId;
+use komo_kernel::types::ids::{OperationId, RunId};
 use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode};
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,11 @@ pub struct DelegateArgs {
     /// [`DEFAULT_DELEGATE_ROUNDS`]: komo_kernel::types::delegate::DEFAULT_DELEGATE_ROUNDS
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rounds: Option<u32>,
+    /// 续跑：接着一条已经结束的子 Run（§4）。它必须是同一个 Session 里的子 Run、终态是
+    /// completed 或 failed、在最新一次 `/new` 之后，而且是这条线的末端——账本里的
+    /// 校验在编排那一步做（`Tool::prepare` 没有账本），这里只负责把这个参数原样带上。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<RunId>,
 }
 
 #[derive(Debug)]
@@ -67,7 +72,9 @@ impl Tool for DelegateTool {
                           结果会回到你这里。子代理**只看得见 task 这一段正文**，看不见这次会话\
                           的历史，所以任务必须写全：要做什么、在哪个目录、做到什么算完成。\
                           它做完之后，结果放在**最后一条回复**里——给了 output_schema 就交一个\
-                          符合它的 JSON 对象（可以用 ```json 围栏包起来），没给就给自由文本。"
+                          符合它的 JSON 对象（可以用 ```json 围栏包起来），没给就给自由文本。\
+                          结果里会给出这条子 Run 的 id；同一件事还要接着做，用 resume 带上它，\
+                          子代理会带着这条线上自己说过的话接着干，而不是从头再来一遍。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -92,6 +99,13 @@ impl Tool for DelegateTool {
                         "type": "integer",
                         "minimum": 1,
                         "description": "子代理最多跑几轮模型，默认 8"
+                    },
+                    "resume": {
+                        "type": "string",
+                        "description": "接着一条已经结束的子 Run 继续（它的 id，之前某次 delegate \
+                                        的结果里给过）：必须是同一个 Session 里的子 Run、已经\
+                                        completed 或 failed、在最新一次 /new 之后、而且是这条线\
+                                        的末端（还没有别的续跑接过它）。不给就是另起一条新的线"
                     }
                 },
                 "required": ["task"],
@@ -132,6 +146,9 @@ impl Tool for DelegateTool {
         }
         if let Some(rounds) = args.rounds {
             spec = spec.with_rounds(rounds);
+        }
+        if let Some(target) = args.resume.clone() {
+            spec = spec.with_resumes(target);
         }
 
         Ok(ExecutionPlan {
@@ -271,6 +288,28 @@ mod tests {
         assert!(
             matches!(zero, ToolError::InvalidArguments { .. }),
             "{zero:?}"
+        );
+    }
+
+    /// `resume` 原样带进计划的 `DelegateSpec`：账本层面的校验（同一 Session、目标终态、
+    /// 边界之后、末端）没有账本可查，`prepare` 不做，只负责别把这个参数弄丢。
+    #[tokio::test]
+    async fn a_resume_argument_lands_on_the_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = DelegateTool::new();
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "task": "接着查一下", "resume": "run-earlier" }),
+                &context(dir.path()),
+            )
+            .await
+            .unwrap();
+        let Operation::Delegate { spec } = &plan.operation else {
+            panic!("{:?}", plan.operation)
+        };
+        assert_eq!(
+            spec.resumes,
+            Some(komo_kernel::types::ids::RunId::from_raw("run-earlier"))
         );
     }
 

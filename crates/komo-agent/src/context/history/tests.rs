@@ -240,7 +240,7 @@ fn a_subagent_and_its_parent_are_two_different_conversations() {
         "父的窗口里不该有子代理的过程——它只该拿到那条结果（§4）"
     );
     assert_eq!(
-        of(ReplayScope::Run(&child)),
+        of(ReplayScope::Thread(std::slice::from_ref(&child))),
         vec![Some("看一下这个 PR".into()), Some("子代理的过程".into())],
         "子代理拿不到父的对话历史"
     );
@@ -321,4 +321,159 @@ fn a_replayed_round_names_the_artifacts_it_produced() {
         !content.contains("产物正文"),
         "产物的正文按引用去读，回放也不抄：{content}"
     );
+}
+
+fn thread_texts(surface: &Surface, chain: &[RunId]) -> Vec<ReplayMessage> {
+    to_replay_messages(
+        resolve_inline(entries(surface, ReplayScope::Thread(chain))),
+        8 * 1024,
+    )
+}
+
+/// 续跑（`docs/komo_bot.md` §4）：正在跑的这一条子 Run 的窗口里有上一环的任务正文与最后
+/// 的回答，**没有**上一环的 `tool_calls` / `provider_blocks`，也没有父对话的任何一句。
+#[test]
+fn a_resumed_link_sees_the_earlier_links_task_and_answer_but_not_its_process() {
+    let parent = RunId::from_raw("run-parent");
+    let first = RunId::from_raw("run-child-1");
+    let second = RunId::from_raw("run-child-2");
+    let first_spec = DelegateSpec::new(parent.clone(), ToolCallId::from_raw("call-1"), "查 A");
+    let second_spec = DelegateSpec::new(parent.clone(), ToolCallId::from_raw("call-2"), "接着查 B")
+        .with_resumes(first.clone());
+
+    let events = vec![
+        accepted(&parent, 1, "父的输入"),
+        started(&parent, 2),
+        accepted_as(&first, 3, Some("查 A"), Some(first_spec)),
+        started(&first, 4),
+        // 第一环的过程：一次工具往返，**不该进第二环的窗口**。
+        assistant(
+            &first,
+            5,
+            None,
+            vec![request(&ToolCallId::from_raw("call-inner"))],
+            Some(serde_json::json!([{"type": "reasoning"}])),
+        ),
+        assistant(&first, 6, Some("A 查完了"), vec![], None),
+        completed(&first, 7),
+        accepted_as(&second, 8, Some("接着查 B"), Some(second_spec)),
+        started(&second, 9),
+    ];
+    let surface = fold(&events);
+    let chain = delegate_thread(&surface, &second);
+    assert_eq!(
+        chain,
+        vec![first.clone(), second.clone()],
+        "旧→新，含正在跑的这一条"
+    );
+
+    let messages = thread_texts(&surface, &chain);
+    let seen: Vec<(Role, Option<&str>)> = messages
+        .iter()
+        .map(|message| (message.role, message.text.as_deref()))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (Role::User, Some("查 A")),
+            (Role::Assistant, Some("A 查完了")),
+            (Role::User, Some("接着查 B")),
+        ],
+        "上一环只发布任务正文与最后的回答，父对话一句都不该在里面"
+    );
+    for message in &messages[..2] {
+        assert!(message.tool_calls.is_empty(), "{message:?}");
+        assert!(message.provider_blocks.is_none(), "{message:?}");
+    }
+}
+
+/// 续跑一条 `failed` 的上一环：它没有最终回答，窗口里只剩任务正文，外加一句它怎么
+/// 结束的（§4、§8.3）。
+#[test]
+fn a_failed_link_gets_one_sentence_about_how_it_ended_instead_of_a_final_answer() {
+    let parent = RunId::from_raw("run-parent");
+    let first = RunId::from_raw("run-child-1");
+    let second = RunId::from_raw("run-child-2");
+    let first_spec = DelegateSpec::new(parent.clone(), ToolCallId::from_raw("call-1"), "查 A");
+    let second_spec = DelegateSpec::new(parent.clone(), ToolCallId::from_raw("call-2"), "接着查 B")
+        .with_resumes(first.clone());
+
+    let events = vec![
+        accepted_as(&first, 1, Some("查 A"), Some(first_spec)),
+        started(&first, 2),
+        event(
+            3,
+            &first,
+            EventPayload::RunFailed(komo_kernel::events::RunFailed {
+                reason: "工具连续失败".into(),
+            }),
+        ),
+        accepted_as(&second, 4, Some("接着查 B"), Some(second_spec)),
+        started(&second, 5),
+    ];
+    let surface = fold(&events);
+    let chain = delegate_thread(&surface, &second);
+
+    let messages = thread_texts(&surface, &chain);
+    let seen: Vec<(Role, Option<&str>)> = messages
+        .iter()
+        .map(|message| (message.role, message.text.as_deref()))
+        .collect();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    assert_eq!(seen[0], (Role::User, Some("查 A")));
+    let (role, text) = seen[1];
+    assert_eq!(role, Role::Assistant);
+    let text = text.expect("有一句它怎么结束的");
+    assert!(text.contains("失败了"), "{text}");
+    assert!(text.contains("工具连续失败"), "{text}");
+    assert_eq!(seen[2], (Role::User, Some("接着查 B")));
+}
+
+/// 重启在续跑子 Run 跑到一半时，照 §8.4 接着跑：窗口与重启前逐字节相同——`fold` 与
+/// `entries` / `to_replay_messages` 都是纯函数，同一份事件折两遍必须给出同一份正文。
+#[test]
+fn the_thread_window_is_byte_identical_before_and_after_a_restart() {
+    let parent = RunId::from_raw("run-parent");
+    let first = RunId::from_raw("run-child-1");
+    let second = RunId::from_raw("run-child-2");
+    let first_spec = DelegateSpec::new(parent.clone(), ToolCallId::from_raw("call-1"), "查 A");
+    let second_spec = DelegateSpec::new(parent.clone(), ToolCallId::from_raw("call-2"), "接着查 B")
+        .with_resumes(first.clone());
+
+    let events = vec![
+        accepted(&parent, 1, "父的输入"),
+        started(&parent, 2),
+        accepted_as(&first, 3, Some("查 A"), Some(first_spec)),
+        started(&first, 4),
+        assistant(&first, 5, Some("A 查完了"), vec![], None),
+        completed(&first, 6),
+        accepted_as(&second, 7, Some("接着查 B"), Some(second_spec)),
+        started(&second, 8),
+        // 正在跑的这一条**跑到一半**：一次工具调用发出去了，还没有结果。
+        assistant(
+            &second,
+            9,
+            None,
+            vec![request(&ToolCallId::from_raw("call-inner"))],
+            Some(serde_json::json!([{"type": "reasoning"}])),
+        ),
+    ];
+
+    let replay_once = || {
+        let surface = fold(&events);
+        let chain = delegate_thread(&surface, &second);
+        thread_texts(&surface, &chain)
+    };
+    let before = replay_once();
+    let after = replay_once();
+
+    assert_eq!(before, after);
+    assert_eq!(
+        serde_json::to_string(&before).unwrap(),
+        serde_json::to_string(&after).unwrap(),
+        "窗口逐字节相同"
+    );
+    let running = after.last().expect("至少有正在跑的这一条");
+    assert_eq!(running.tool_calls.len(), 1, "正在跑的这一条带着完整协议");
+    assert!(running.provider_blocks.is_some());
 }

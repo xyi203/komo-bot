@@ -247,6 +247,28 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
     }
 }
 
+/// 测试用的渲染函数：一条一行，只带正文（真正的格式在 `komo-agent::context::memory`，
+/// 那边有自己的测试；这里的断言只关心"同一段逐字复用""遗忘的条目不回来"，与具体格式
+/// 无关，§13.4）。runtime 不为此加对 `komo-agent` 的 dev-dependency。
+fn test_render(items: &[MemoryItem], _max_tokens: u32) -> Injection {
+    if items.is_empty() {
+        return Injection::default();
+    }
+    let mut lines = Vec::new();
+    let mut uses = Vec::new();
+    for item in items {
+        lines.push(item.content.clone());
+        uses.push(MemoryUse {
+            memory: item.id.clone(),
+            revision: item.revision,
+        });
+    }
+    Injection {
+        text: Some(lines.join("\n")),
+        uses,
+    }
+}
+
 fn round(text: &str) -> Round {
     Round {
         round: 1,
@@ -336,6 +358,7 @@ impl HarnessBuilder {
             events: Arc::clone(&ledger) as Arc<dyn SessionEvents>,
             work: Arc::clone(&work) as Arc<dyn MemoryWorkLog>,
             clock: Arc::new(FixedClock),
+            render: test_render,
         }));
         Harness {
             manager,
@@ -520,67 +543,10 @@ async fn a_paraphrase_still_recalls_the_same_preference_and_keeps_its_provenance
 }
 
 // =========================================================== ② 四种来源分得开
-
-/// §14 ②：用户原话、工具观察、模型推断、用户确认在展示与上下文里都分得开。
-#[test]
-fn every_kind_of_provenance_reads_differently_in_the_injected_block() {
-    let base = |id: &str, provenance, confirmation, state| komo_kernel::types::memory::MemoryItem {
-        id: MemoryId::from_raw(id),
-        revision: 1,
-        content: format!("关于 {id} 的一句话"),
-        kind: komo_kernel::types::memory::MemoryKind::Fact,
-        scope: MemoryScope::Personal,
-        provenance,
-        confirmation,
-        state,
-        evidence: vec![],
-        observed_at: NOW,
-        valid_until: None,
-        created_at: NOW,
-        updated_at: NOW,
-        extraction: komo_kernel::types::memory::ExtractionMetadata::new("m", None, "v1"),
-        usage: Default::default(),
-        supersedes: None,
-    };
-    let items = vec![
-        base(
-            "m-1",
-            Provenance::UserStatement,
-            Confirmation::Unconfirmed,
-            MemoryState::Active,
-        ),
-        base(
-            "m-2",
-            Provenance::ToolObservation,
-            Confirmation::Unconfirmed,
-            MemoryState::Active,
-        ),
-        base(
-            "m-3",
-            Provenance::ModelInference,
-            Confirmation::Unconfirmed,
-            MemoryState::Candidate,
-        ),
-        base(
-            "m-4",
-            Provenance::UserStatement,
-            Confirmation::UserConfirmed,
-            MemoryState::Active,
-        ),
-    ];
-    let injection = render_injection(&items, 5_000);
-    let text = injection.text.expect("有正文");
-
-    assert!(text.contains("自动整理自用户陈述"), "{text}");
-    assert!(text.contains("来自工具结果"), "{text}");
-    assert!(text.contains("模型推断"), "{text}");
-    assert!(text.contains("候选，未确认"), "{text}");
-    assert!(text.contains("用户已确认"), "{text}");
-    // §9.7：它是数据，不是指令，也不是授权。
-    assert!(text.contains("不授权任何操作"), "{text}");
-    assert_eq!(injection.uses.len(), 4);
-    assert!(injection.uses.iter().all(|use_| use_.revision == 1));
-}
+//
+// 四种来源在展示里分得开的断言（`every_kind_of_provenance_reads_differently_in_the_
+// injected_block`）已随渲染函数搬到 `komo-agent::context::memory`（`docs/agent.md`
+// §13.4）。这里留下的是提取路径本身的行为。
 
 /// §14 ②的后半：**候选不因反复提取而升级**。
 ///
@@ -1501,28 +1467,13 @@ async fn an_allowed_supersede_retires_the_old_one_and_links_forward() {
 }
 
 // =========================================================== 注入与预算
+//
+// 注入段在 token 预算处停下的断言（`the_injected_block_stops_at_the_token_budget`）
+// 已随渲染函数搬到 `komo-agent::context::memory`（`docs/agent.md` §13.4）。
 
-/// 注入段在 token 预算处停下，**不强行填满**（§9.4）。
-#[test]
-fn the_injected_block_stops_at_the_token_budget() {
-    let items: Vec<_> = (0..20)
-        .map(|index| memory(&format!("m-{index:02}"), "客厅空调设 26 度，书房台灯用暖光"))
-        .collect();
-    let all = render_injection(&items, 5_000);
-    assert_eq!(all.uses.len(), 20);
-
-    let squeezed = render_injection(&items, 400);
-    assert!(
-        squeezed.uses.len() < 20 && !squeezed.uses.is_empty(),
-        "装得下几条就是几条：{}",
-        squeezed.uses.len()
-    );
-    assert!(squeezed.text.unwrap().chars().count() <= 400);
-}
-
-/// 注入表按 `run` 取，`SystemPreamble` 就是它的同步一面。
+/// `prepare` 返回这一次选中的条目，并记上使用计数（§9.2：只度量使用）。
 #[tokio::test]
-async fn the_preamble_serves_what_the_segment_prepared_for_that_run() {
+async fn prepare_returns_the_selected_memory_and_records_its_usage() {
     let harness = HarnessBuilder::new().build().await;
     harness
         .repo
@@ -1533,16 +1484,8 @@ async fn the_preamble_serves_what_the_segment_prepared_for_that_run() {
     let run = RunId::from_raw("run-1");
     let injection = harness.manager.prepare(&run, "空调", &[], &[]).await;
     assert_eq!(injection.uses.len(), 1);
-    assert!(harness.manager.injection_for(&run).is_some());
-    assert!(
-        harness
-            .manager
-            .injection_for(&RunId::from_raw("run-other"))
-            .is_none(),
-        "别的 Run 拿不到这一次的选择"
-    );
+    assert_eq!(injection.uses[0].memory, MemoryId::from_raw("m-1"));
 
-    // 使用计数记上了（§9.2：只度量使用）。
     let after = harness
         .repo
         .get(&MemoryId::from_raw("m-1"))
@@ -1551,9 +1494,6 @@ async fn the_preamble_serves_what_the_segment_prepared_for_that_run() {
         .unwrap();
     assert_eq!(after.usage.count, 1);
     assert_eq!(after.state, MemoryState::Active, "用一次不改状态");
-
-    harness.manager.forget_run(&run);
-    assert!(harness.manager.injection_for(&run).is_none());
 }
 
 /// `[memory] enabled = false` 时什么都不做——不注入、不提取、不报错地静静躺着。
@@ -1679,11 +1619,6 @@ async fn the_injection_is_reused_verbatim_within_one_segment() {
         harness.embeddings.calls(),
         embedded,
         "同一段里不该再召回一次（连 embedding 都不该发）"
-    );
-    // 每一轮照样挂在自己那个 Run 上：`SystemPreamble` 从那里取正文。
-    assert_eq!(
-        harness.manager.injection_for(&RunId::from_raw("run-2")),
-        first.text
     );
 }
 

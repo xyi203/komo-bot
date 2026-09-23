@@ -10,7 +10,7 @@
 //! ```text
 //! surface   Profile 在工具目录里挑出来的能力面（§4 末）+ 编排操作名
 //! skills    SkillRegistry：人写的 SKILL.md 的发现与目录行（§5.6、§14）
-//! context   ContextInput → AgentContext：系统提示与回放消息的唯一装配入口（§5、§8、§10）
+//! context   ContextInput → AgentContext：系统提示、回放消息与记忆段的唯一装配入口（§5、§8、§10、§13）
 //! ```
 
 pub mod context;

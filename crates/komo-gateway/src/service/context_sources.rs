@@ -28,11 +28,10 @@ use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::traits::{LedgerError, ToolOutputStore};
 use komo_kernel::types::agent::RunSnapshot;
 use komo_kernel::types::ids::RunId;
-use komo_kernel::types::memory::MemoryScope;
+use komo_kernel::types::memory::{Injection, MemoryScope};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::ToolDefinition;
-use komo_kernel::types::turn::MemoryUse;
 use komo_runtime::config::ConfigHolder;
 use komo_runtime::memory::MemoryManager;
 use komo_runtime::tools::paths;
@@ -203,9 +202,9 @@ pub(crate) async fn recall_for(
     run: &RunId,
     surface: &Surface,
     scopes: &[MemoryScope],
-) -> Vec<MemoryUse> {
+) -> Injection {
     let Some(memories) = memories else {
-        return Vec::new();
+        return Injection::default();
     };
     let carried = match checkpoints {
         Some(store) => match store.latest(session).await {
@@ -224,7 +223,6 @@ pub(crate) async fn recall_for(
     memories
         .prepare_segment(session, run, &text, &carried, surface.boundary(), scopes)
         .await
-        .uses
 }
 
 /// 这一次装配的 skills 目录（§14）：读一次**活注册表**，按门控算出这一份值。

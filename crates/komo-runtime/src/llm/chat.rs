@@ -15,7 +15,6 @@ use komo_kernel::types::turn::{
 };
 use serde_json::{Map, Value, json};
 
-use super::responses::SystemPreamble;
 use super::sse::SseDecoder;
 use super::transport::{HttpRequest, HttpTransport, TransportError};
 use super::wire;
@@ -27,7 +26,6 @@ pub struct ChatCompletionsLlm {
     api_key: Option<String>,
     transport: Arc<dyn HttpTransport>,
     caps: EffortCapabilities,
-    preamble: Option<Arc<dyn SystemPreamble>>,
 }
 
 impl std::fmt::Debug for ChatCompletionsLlm {
@@ -56,13 +54,7 @@ impl ChatCompletionsLlm {
             api_key,
             transport,
             caps,
-            preamble: None,
         })
-    }
-
-    pub fn with_preamble(mut self, preamble: Arc<dyn SystemPreamble>) -> Self {
-        self.preamble = Some(preamble);
-        self
     }
 }
 
@@ -81,11 +73,8 @@ fn check_effort(config: &ModelConfig, caps: &EffortCapabilities) -> Result<(), L
 impl LlmClient for ChatCompletionsLlm {
     async fn begin_turn(&self, req: TurnRequest) -> Result<Box<dyn TurnDriver>, LlmError> {
         check_effort(&req.model, &self.caps)?;
-        let mut instructions = req.system_prompt.clone();
-        if let Some(preamble) = self.preamble.as_ref().and_then(|p| p.preamble(&req)) {
-            instructions.push_str("\n\n");
-            instructions.push_str(&preamble);
-        }
+        // 记忆段已经在 `req.system_prompt` 里（Gateway 装配时拼好，§13.2）。
+        let instructions = req.system_prompt.clone();
         let mut messages = vec![json!({ "role": "system", "content": instructions })];
         messages.extend(replay(&req.messages));
         Ok(Box::new(ChatDriver {

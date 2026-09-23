@@ -42,7 +42,8 @@ komo-store     session_log (JSONL) · payloads · tool_output · Turso Db + toas
 komo-runtime   agent loop · executor · tools/{read,write,edit,rg,shell,python} ·
                python_runtime · policy · approvals · memory · llm · embedding ·
                scheduler · recovery · config.
-komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名。
+komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名 ·
+               上下文装配（context：ContextInput → AgentContext，系统提示、回放、记忆段）。
                只依赖 kernel，不执行；runtime 不依赖它，Gateway 组装两边。
                值类型（AgentProfile/AgentSurface/RunSnapshot）留在 kernel。
 komo-gateway   axum routes · SSE · auth · lock/discovery · launchd/systemd ·

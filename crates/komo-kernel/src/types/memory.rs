@@ -308,6 +308,15 @@ pub enum MemoryWork {
     Error,
 }
 
+/// 这一轮注入了什么（`docs/agent.md` §13.2：渲染搬到 `komo-agent`，这个值类型留在 kernel）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Injection {
+    /// 追加在系统提示后面的正文；`None` = 这一轮不注入。
+    pub text: Option<String>,
+    /// 注入了哪些条目的哪个版本——**审计证据**，resume 时重新核对（§9.7）。
+    pub uses: Vec<super::turn::MemoryUse>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

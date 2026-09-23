@@ -98,24 +98,19 @@ async fn render(case: &Case) -> String {
     .await
     .expect("装配得出来");
 
+    // 记忆段与生产路径同一个渲染函数（`MemoryManager` 钉住的正是它的输出，§13.2）。
+    let memory = komo_agent::context::memory::render(&case.memories, 1_000).text;
     let context = assemble(ContextInput {
         instructions: case.instructions.map(str::to_string),
         workspace: std::path::PathBuf::from(CWD),
         tools: tool_names,
         history: resolved,
-        memory: None,
+        memory,
         skills,
         invocation,
         model_result_bytes: case.model_result_bytes,
     });
-    let mut prompt = context.system_prompt;
-    // 适配器在发送前追加的那一段（`SystemPreamble`）。Phase 5 之前 `ContextInput.memory`
-    // 恒为 `None`，这一段仍由 Gateway 自己按适配器的方式拼在最后。
-    let injection = komo_runtime::memory::render_injection(&case.memories, 1_000);
-    if let Some(text) = injection.text {
-        prompt.push_str("\n\n");
-        prompt.push_str(&text);
-    }
+    let prompt = context.system_prompt;
 
     let mut out = String::new();
     out.push_str("=== system ===\n");

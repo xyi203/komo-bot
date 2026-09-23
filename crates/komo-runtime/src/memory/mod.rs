@@ -3,9 +3,11 @@
 //! 「MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_completed_run、
 //! apply_user_decision。提取、去重、证据校验、冲突处理与索引协调隐藏在该模块内部；
 //! **它不向 LLM 注册额外工具**」（§9.3）——所以这个模块没有 `Tool` 实现，一个都没有。
-//! 记忆进上下文的路只有一条：[`preamble::MemoryPreamble`] 把召回结果渲染成系统提示后
-//! 面的一段**数据**，而 §9.7 那句"不能成为系统指令、Policy 授权或自我更新工具的依据"
-//! 就写在那段正文的抬头里。
+//! 记忆进上下文只有一条路：召回结果渲染成系统提示末尾的一段**数据**，而 §9.7 那句
+//! "不能成为系统指令、Policy 授权或自我更新工具的依据"就写在那段正文的抬头里。渲染
+//! 函数本身在 `komo-agent::context::memory`（runtime 不依赖 agent），这里只按
+//! [`MemoryParts::render`] 那个函数指针调用它（`docs/agent.md` §13.2）；渲染出的
+//! [`Injection`] 经 Gateway 拼进 `TurnRequest.system_prompt`，不再绕经适配器的钩子。
 //!
 //! 模块之间：
 //!
@@ -13,7 +15,7 @@
 //! MemoryManager ─┬─ extract::LearningPass   一个已完成 Run → 结构化观察（记忆模型）
 //!                ├─ consolidate::Consolidator  去重 / 冲突 → 库里的变更
 //!                ├─ index::IndexBuilder     空间指纹 → 代次 → 批量向量 → 事务切换
-//!                └─ preamble::MemoryPreamble   召回结果 → 注入段 + 审计用的 MemoryUse
+//!                └─ render（外部函数指针）   召回结果 → 注入段 + 审计用的 MemoryUse
 //! ```
 //!
 //! **模型与仓储之间隔着这一层，是为了守住三句话**：模型返回的 `user_confirmed` 字段没
@@ -24,7 +26,6 @@
 mod consolidate;
 mod extract;
 mod index;
-mod preamble;
 mod rerank;
 mod work;
 
@@ -40,7 +41,8 @@ use komo_kernel::traits::{
 };
 use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{
-    MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallQuery, RecallResult, RetrievalMode,
+    Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallQuery, RecallResult,
+    RetrievalMode,
 };
 use komo_kernel::types::model::{EmbeddingSpace, InputKind, ModelConfig, Vector};
 use komo_kernel::types::turn::{LlmError, MemoryUse};
@@ -54,7 +56,6 @@ pub use extract::{Observation, PROMPT_VERSION, RawObservation, SaidBy};
 // 对象"，两套括号处理迟早会有一边少一个分支（`delegate` 的复验在 executor 里）。
 pub(crate) use extract::parse_json_object;
 pub use index::{IndexBuilder, IndexOutcome, MIN_ACTIVATION_COVERAGE};
-pub use preamble::{Injection, MemoryPreamble, render_injection};
 pub use work::{DbMemoryWork, MemoryWorkItem, MemoryWorkLog};
 
 /// 记忆这一层的失败。
@@ -308,6 +309,11 @@ pub struct PassReport {
     pub abandoned: usize,
 }
 
+/// 召回结果 → 注入段的渲染函数（§13.2）：实现在 `komo-agent::context::memory::render`，
+/// Gateway 装配 [`MemoryParts`] 时把它递进来。`fn` 指针而不是 trait：只有一个实现，也
+/// 不必为了传一份渲染逻辑就让 `MemoryManager` 认识 `dyn` 对象——runtime 不依赖 agent。
+pub type RenderInjection = fn(&[MemoryItem], u32) -> Injection;
+
 /// 装配一台 MemoryManager 要的东西。
 pub struct MemoryParts {
     pub config: MemoryConfig,
@@ -322,6 +328,8 @@ pub struct MemoryParts {
     pub events: Arc<dyn SessionEvents>,
     pub work: Arc<dyn MemoryWorkLog>,
     pub clock: Arc<dyn Clock>,
+    /// 召回结果怎样渲染成注入段；Gateway 装配时给 `komo_agent::context::memory::render`。
+    pub render: RenderInjection,
 }
 
 /// 记忆重排用的判断后端（§9.4）。
@@ -364,9 +372,8 @@ pub struct MemoryManager {
     events: Arc<dyn SessionEvents>,
     work: Arc<dyn MemoryWorkLog>,
     clock: Arc<dyn Clock>,
-    /// 每个 Run 这一次选了哪些条目。「正常情况下沿用 Run 的选择，不逐轮重复请求
-    /// embedding」（§9.4）——`SystemPreamble` 是同步的，正文也从这里取。
-    selections: Mutex<BTreeMap<RunId, Injection>>,
+    /// 召回结果 → 注入段（`komo-agent::context::memory::render`，§13.2）。
+    render: RenderInjection,
     /// 每个会话**当前这一段对话**注入的那一块（§9.4）。
     ///
     /// 为什么要它：注入段在 system 消息里，而服务端的前缀缓存按**最长公共前缀**命中。
@@ -429,7 +436,7 @@ impl MemoryManager {
             events: parts.events,
             work: parts.work,
             clock: parts.clock,
-            selections: Mutex::new(BTreeMap::new()),
+            render: parts.render,
             pins: Mutex::new(BTreeMap::new()),
             building: Mutex::new(BTreeSet::new()),
             reported: Mutex::new(BTreeSet::new()),
@@ -672,8 +679,8 @@ impl MemoryManager {
             }
         }
 
-        let injection = render_injection(&items, self.retrieval.max_tokens);
-        self.settle_selection(run, &injection, now).await;
+        let injection = (self.render)(&items, self.retrieval.max_tokens);
+        self.record_usage(&injection, now).await;
         injection
     }
 
@@ -731,7 +738,7 @@ impl MemoryManager {
         };
         if let Some(pinned) = pinned {
             // 使用计数照记：这一段里每用一次都算用了一次（§9.2 的度量，不影响正文）。
-            self.settle_selection(run, &pinned, now).await;
+            self.record_usage(&pinned, now).await;
             tracing::debug!(
                 %session,
                 boundary,
@@ -788,8 +795,8 @@ impl MemoryManager {
         true
     }
 
-    /// 记使用计数 + 把这一块挂到这个 Run 上（`SystemPreamble` 从那里取正文）。
-    async fn settle_selection(&self, run: &RunId, injection: &Injection, now: OffsetDateTime) {
+    /// 记使用计数（§9.2）：这一块注入里的每条记忆都算用了一次。
+    async fn record_usage(&self, injection: &Injection, now: OffsetDateTime) {
         let ids: Vec<MemoryId> = injection
             .uses
             .iter()
@@ -801,10 +808,6 @@ impl MemoryManager {
             // 使用计数只度量使用，记不上不影响这一轮（§9.2）。
             tracing::debug!(%error, "使用计数没记上");
         }
-        self.selections
-            .lock()
-            .expect("注入表")
-            .insert(run.clone(), injection.clone());
     }
 
     /// 重新核对一批记忆引用的**当前**状态（§9.7）。过期、遗忘、改了版本的都掉出去。
@@ -828,20 +831,6 @@ impl MemoryManager {
             }
         }
         alive
-    }
-
-    /// `SystemPreamble` 取正文的那一口（同步）。
-    pub fn injection_for(&self, run: &RunId) -> Option<String> {
-        self.selections
-            .lock()
-            .expect("注入表")
-            .get(run)
-            .and_then(|injection| injection.text.clone())
-    }
-
-    /// Run 结束后把它的选择丢掉——这张表是本进程的缓存，不是账本。
-    pub fn forget_run(&self, run: &RunId) {
-        self.selections.lock().expect("注入表").remove(run);
     }
 
     // ------------------------------------------------------------ 自动积累（§9.3）
@@ -971,28 +960,22 @@ impl MemoryManager {
             .await?)
     }
 
-    /// 遗忘：停用正文，并使关键词、向量与**检查点里的引用**失效（§9.6）。
+    /// 遗忘：停用正文，并使关键词与向量失效（§9.6）。
     ///
-    /// 前两样在仓储里（`forget` 删词条与向量行）；第三样在这里——注入表里挂着的选择要
-    /// 一并清掉，否则同一个 Run 的下一段还会把它渲染进提示。检查点本身不改：它是历史
+    /// 两样都在仓储里（`forget` 删词条与向量行）。会话级的注入锚不在这里特殊处理：
+    /// [`Self::pin_still_valid`] 在下一次 `prepare_segment` 时重新核对每个 id，遗忘的
+    /// 条目读不出来就让整块作废重算——这一条是验收项
+    /// （`a_forgotten_memory_never_comes_back_into_a_turn`）。检查点本身不改：它是历史
     /// 审计，而 [`Self::revalidate`] 保证它复活不了（§9.7）。
     pub async fn forget(
         &self,
         id: &MemoryId,
         expected_revision: u32,
     ) -> Result<MemoryItem, MemoryError> {
-        let item = self
+        Ok(self
             .repo
             .forget(id, expected_revision, self.clock.now())
-            .await?;
-        let mut selections = self.selections.lock().expect("注入表");
-        for injection in selections.values_mut() {
-            if injection.uses.iter().any(|use_| &use_.memory == id) {
-                injection.uses.retain(|use_| &use_.memory != id);
-                injection.text = None;
-            }
-        }
-        Ok(item)
+            .await?)
     }
 
     // ------------------------------------------------------------ 索引（§9.5）

@@ -8,6 +8,7 @@
 //! 允许出现在这个模块里。
 
 pub mod history;
+pub mod memory;
 mod prompt;
 
 use std::path::PathBuf;
@@ -36,7 +37,7 @@ pub struct ContextInput<'s> {
     /// 已解析正文的回放条目。借用 `Surface`，不复制消息。
     pub history: Vec<ResolvedMessage<'s>>,
     /// 这一段钉住的记忆注入段；`None` = 不注入（子代理、记忆关闭、没召回到）。
-    /// Phase 5 之前恒为 `None`——记忆段仍由 LLM 适配器的 `SystemPreamble` 追加。
+    /// 正文由 [`memory::render`] 渲染、由 `MemoryManager` 按段钉住，这里只决定它放在哪。
     pub memory: Option<String>,
     /// 已按 `OfferContext` 门控的 skills 目录；只有主 Agent 有。
     pub skills: Option<SkillCatalog>,

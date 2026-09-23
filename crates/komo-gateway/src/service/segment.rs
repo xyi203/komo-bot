@@ -13,11 +13,12 @@
 //! （身份、记忆召回、history 的 I/O、skills 目录读取）在 `context_sources.rs`；"模型该
 //! 看见什么"（系统提示、回放消息）在 `komo_agent::context`。
 //!
-//! **记忆在这里召回，不在提示里拼**（§9.4）：这一段装配时按最新一句用户输入召回一次，
-//! 正文交给 `LlmFactory::with_preamble` 挂到系统提示后面（Phase 5 之前，`ContextInput.memory`
-//! 恒为 `None`），而用到的条目连同它们的 revision 写进 [`TurnRequest::memories`]——那是
-//! 审计证据，resume 时要按它重新核对（§9.7）。续跑时先拿检查点里记的那一批去核对，
-//! **过期或已遗忘的复活不了**。
+//! **记忆在这里召回**（§9.4）：这一段装配时按最新一句用户输入召回一次，渲染出的正文
+//! （`komo_agent::context::memory::render`，`docs/agent.md` §13.2）经 `ContextInput.memory`
+//! 交给 `assemble`，放在系统提示的最后一段——`TurnRequest.system_prompt` 就是实际发出去
+//! 的那份，适配器不再各自追加。用到的条目连同它们的 revision 写进
+//! [`TurnRequest::memories`]——那是审计证据，resume 时要按它重新核对（§9.7）。续跑时先拿
+//! 检查点里记的那一批去核对，**过期或已遗忘的复活不了**。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -392,8 +393,8 @@ impl SegmentSource for GatewaySegments {
 
         // 子代理只拿得到任务本身：不注入记忆、不列 Skills、也**不带上父的对话历史**（它的
         // 回放窗口就是自己那条 Run，见下）。自包含这件事是父侧的责任，提示词里对它也说了。
-        let memories = match &delegate {
-            Some(_) => Vec::new(),
+        let injection = match &delegate {
+            Some(_) => komo_kernel::types::memory::Injection::default(),
             // 记忆作用域来自 Profile（§9.2）：只召回这一个作用域，外加显式共享的用户资料。
             None => {
                 let scopes = context_sources::recall_scopes(identity.memory_scope.as_ref());
@@ -456,14 +457,13 @@ impl SegmentSource for GatewaySegments {
         };
 
         // **唯一的 Context Assembly 入口**（§5）：Gateway 到这里为止只是"凑齐事实"，
-        // "模型这一刻看见什么"由它一家决定。Phase 5 之前 `memory` 恒为 `None`——记忆段
-        // 仍由 LLM 适配器的 `SystemPreamble` 追加在实际发出去的系统提示后面。
+        // "模型这一刻看见什么"由它一家决定——记忆段放在哪也是它说了算（§13.2）。
         let context = assemble(ContextInput {
             instructions: identity.instructions.clone(),
             workspace: cwd.clone(),
             tools: tool_names,
             history: resolved,
-            memory: None,
+            memory: injection.text.clone(),
             skills,
             invocation,
             model_result_bytes,
@@ -512,7 +512,7 @@ impl SegmentSource for GatewaySegments {
             // 的例外——它只看得见自己那条 Run，父的窗口里也没有它的过程（§4）。
             messages: context.messages,
             tools,
-            memories,
+            memories: injection.uses,
             covers: None,
         };
 

@@ -29,7 +29,6 @@ use komo_kernel::types::turn::{
 };
 use serde_json::{Value, json};
 
-use super::responses::SystemPreamble;
 use super::sse::SseDecoder;
 use super::transport::{HttpRequest, HttpTransport, TransportError};
 use super::wire;
@@ -77,7 +76,6 @@ pub struct AnthropicMessagesLlm {
     api_key: Option<String>,
     transport: Arc<dyn HttpTransport>,
     caps: EffortCapabilities,
-    preamble: Option<Arc<dyn SystemPreamble>>,
 }
 
 impl std::fmt::Debug for AnthropicMessagesLlm {
@@ -107,13 +105,7 @@ impl AnthropicMessagesLlm {
             api_key,
             transport,
             caps,
-            preamble: None,
         })
-    }
-
-    pub fn with_preamble(mut self, preamble: Arc<dyn SystemPreamble>) -> Self {
-        self.preamble = Some(preamble);
-        self
     }
 
     fn endpoint(&self, model: &ModelConfig) -> String {
@@ -138,11 +130,8 @@ impl LlmClient for AnthropicMessagesLlm {
         // 本次 Run 固定的是 `req.model`（§6），不是构造这个客户端时那份。
         check_effort(&req.model, &self.caps)?;
 
-        let mut system = req.system_prompt.clone();
-        if let Some(preamble) = self.preamble.as_ref().and_then(|p| p.preamble(&req)) {
-            system.push_str("\n\n");
-            system.push_str(&preamble);
-        }
+        // 记忆段已经在 `req.system_prompt` 里（Gateway 装配时拼好，§13.2）。
+        let system = req.system_prompt.clone();
 
         Ok(Box::new(AnthropicDriver {
             endpoint: self.endpoint(&req.model),

@@ -46,15 +46,6 @@ pub enum TuiMode {
 }
 
 impl TuiMode {
-    /// 身份行上的一句话。
-    pub fn label(self) -> &'static str {
-        match self {
-            TuiMode::New => "新会话",
-            TuiMode::Resume => "续接会话",
-            TuiMode::Home => "home 会话",
-        }
-    }
-
     /// 打开时要不要先补读历史。
     pub fn needs_backfill(self) -> bool {
         matches!(self, TuiMode::Resume | TuiMode::Home)

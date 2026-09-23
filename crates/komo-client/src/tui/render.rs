@@ -304,7 +304,7 @@ fn compact(count: u64) -> String {
 pub fn banner(app: &App, cwd: &str) -> Vec<Line<'static>> {
     let mut head = vec![
         Span::styled(
-            format!(" komo · {} ", app.mode.label()),
+            " komo ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::LightBlue)
@@ -923,7 +923,7 @@ fn main() {
         }
     }
 
-    /// 开场横幅把「这是谁、在哪、哪个会话」说一次，然后它就是回滚区里普通的一行。
+    /// 开场横幅把「在哪、哪个会话」说一次，然后它就是回滚区里普通的一行。
     #[test]
     fn the_banner_says_which_session_this_is() {
         let app = App::new(Some(fixture::session()), TuiMode::Resume, "seed");
@@ -931,7 +931,6 @@ fn main() {
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
             .collect();
-        assert!(text.contains("续接会话"), "{text}");
         assert!(text.contains("/home/u/project"), "{text}");
         assert!(text.contains("sess-1"), "{text}");
     }

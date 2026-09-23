@@ -34,9 +34,9 @@ pub use ids::{
     MemoryId, OperationId, RequestKey, RunId, Seq, SessionId, ShortId, ToolCallId, uuid_v7_at,
 };
 pub use memory::{
-    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryItem, MemoryKind, MemoryScope,
-    MemoryState, MemoryUsage, MemoryWork, Provenance, RecallQuery, RecallResult, RetrievalMode,
-    SupersededRef,
+    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, Injection, MemoryItem, MemoryKind,
+    MemoryScope, MemoryState, MemoryUsage, MemoryWork, Provenance, RecallQuery, RecallResult,
+    RetrievalMode, SupersededRef,
 };
 pub use model::{
     CatalogModel, DistanceRule, Effort, EffortSetting, EmbeddingConfig, EmbeddingSpace, InputKind,

@@ -29,9 +29,7 @@ use komo_runtime::agent::{AgentLoop, Budget, ResumedRound, RetryBudget, Segment}
 use komo_runtime::approvals::ApprovalGate;
 use komo_runtime::config::{ConfigHolder, EffortCapabilities};
 use komo_runtime::executor::{CallEnv, ToolExecutor};
-use komo_runtime::memory::{
-    DbMemoryWork, LedgerEvents, MemoryManager, MemoryParts, MemoryPreamble,
-};
+use komo_runtime::memory::{DbMemoryWork, LedgerEvents, MemoryManager, MemoryParts};
 use komo_runtime::policy::PolicyEngine;
 use komo_runtime::recovery::{RecoveryIndex, RecoveryScan, UnfinishedRun};
 use komo_runtime::scheduler::{HandlerError, Scheduler, SchedulerConfig, Waker};
@@ -324,8 +322,6 @@ pub struct GatewayState {
     pub memory: Arc<dyn MemoryRepo>,
     /// §9 的那一层：召回与注入、自动积累、向量索引与代次。
     pub memories: Arc<MemoryManager>,
-    /// 记忆注入接在系统提示后面的那一口。热重载重建模型后端时要把它接回去，所以留着。
-    pub preamble: Arc<MemoryPreamble>,
     pub recovery_store: RecoveryStore,
     pub deliveries: Arc<TursoDeliveryRepo>,
     pub notifier: Arc<HomeNotifier>,
@@ -468,8 +464,8 @@ impl GatewayState {
         ));
         let notifier = Arc::new(HomeNotifier::new(delivery_log, Arc::clone(&config)));
 
-        // 记忆这一层要**先于**模型后端装好：注入是系统提示的一部分，而
-        // `LlmFactory::with_preamble` 在造后端时就要拿到它（§9.4）。
+        // 记忆这一层要**先于**模型后端装好：注入是系统提示的一部分（Gateway 装配时拼进
+        // `TurnRequest.system_prompt`，§13.2），模型后端只管发送，不再自己接一段。
         //
         // 向量后端**注入的优先**（测试），否则这里只留空槽：探测在后台跑
         // （`spawn_embedding_probe`），不等它。
@@ -487,15 +483,15 @@ impl GatewayState {
             events: Arc::new(LedgerEvents(Arc::clone(&routed) as Arc<dyn Ledger>)),
             work: Arc::new(DbMemoryWork::new(db.clone(), Arc::clone(&clock))),
             clock: Arc::clone(&clock),
+            render: komo_agent::context::memory::render,
         }));
-        let preamble = Arc::new(MemoryPreamble::new(Arc::clone(&memories)));
         if injected_embeddings.is_none() {
             spawn_embedding_probe(Arc::clone(&memories), Arc::clone(&config));
         }
 
         let llm = Arc::new(SwappableLlm::new(match llm {
             Some(client) => client,
-            None => build_llm(&snapshot, &config, &caps, &preamble),
+            None => build_llm(&snapshot, &config, &caps),
         }));
 
         // 一次 Run 的三个账本写入者（执行器、AgentLoop、handler）共用这一个句柄。
@@ -617,7 +613,6 @@ impl GatewayState {
             cron,
             memory,
             memories,
-            preamble,
             recovery_store,
             deliveries,
             reload_notice: Mutex::new(None),
@@ -759,12 +754,8 @@ impl GatewayState {
     /// 模型 / 凭证变了：换掉实例。**正在跑的 Run 不换**——它握着自己那一个 driver。
     pub fn rebuild_llm(&self) {
         let snapshot = self.snapshot();
-        self.llm.swap(build_llm(
-            &snapshot,
-            &self.config,
-            &self.caps,
-            &self.preamble,
-        ));
+        self.llm
+            .swap(build_llm(&snapshot, &self.config, &self.caps));
         tracing::info!("模型后端已按新配置重建（正在跑的 Run 不受影响）");
     }
 
@@ -1538,7 +1529,8 @@ const AUDIT_DRAIN_LIMIT: usize = 128;
 /// 记忆提取 / 冲突整理用的那个后端。
 ///
 /// 测试注入了模型时就用那一个（脚本化的 driver 要同时答两种问）；否则按快照造一份自己
-/// 的 [`RoutingLlm`]——它**不带 preamble**：记忆模型不读记忆，注入只属于对话那一路。
+/// 的 [`RoutingLlm`]。记忆段只拼进对话那一路的 `TurnRequest.system_prompt`
+/// （§13.2）——记忆模型自己的请求不经过这一步，它本就不该读到记忆注入。
 fn llm_for_memory(
     snapshot: &ConfigSnapshot,
     config: &ConfigHolder,
@@ -1671,11 +1663,8 @@ fn build_llm(
     snapshot: &ConfigSnapshot,
     config: &ConfigHolder,
     caps: &EffortCapabilities,
-    preamble: &Arc<MemoryPreamble>,
 ) -> Arc<dyn LlmClient> {
     let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone())
-        // 记忆注入的位置（§9.4）：正文由 MemoryManager 给，这里只是把它放进系统提示。
-        .with_preamble(Arc::clone(preamble) as Arc<dyn komo_runtime::llm::SystemPreamble>)
         .with_chatgpt_credentials_path(komo_runtime::llm::codex_auth::credentials_path(
             &snapshot.start_only.data_dir,
         ));

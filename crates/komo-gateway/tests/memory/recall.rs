@@ -2,11 +2,13 @@
 
 use std::sync::Arc;
 
+use komo_kernel::test_support::ScriptedLlm;
+use komo_kernel::traits::LlmClient;
 use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::{MemoryState, Provenance};
 
 use crate::harness::*;
-use crate::{scoped, seeded, with_memories};
+use crate::{scoped, seeded, text_round, with_memories};
 
 /// §14 ①：同一偏好换一种中文表述仍可语义召回，**同时保留原始来源**。
 #[tokio::test]
@@ -367,5 +369,53 @@ async fn an_agent_only_recalls_its_own_scope_plus_the_shared_profile() {
         ids(1),
         vec!["m-acme", "m-personal"],
         "写了 `project:acme` 的 Agent 只看得到它自己那一份，外加共享的用户资料"
+    );
+}
+
+/// Phase 5：记忆段是 `TurnRequest.system_prompt` 自己的一部分，不再靠适配器另外拼接
+/// （`docs/agent.md` §13.2、§20 Phase 5）。开着记忆、有一条能召回的记忆时，模型收到的
+/// 系统提示要以 `[已知记忆]` 那一块收尾，且带着这条记忆的正文。
+#[tokio::test]
+async fn the_system_prompt_the_model_receives_ends_with_the_recalled_memory_block() {
+    let llm = ScriptedLlm::new(vec![vec![text_round(1, "26 度。")]]);
+    let gateway = memory_gateway(&memory_config("keyword", false))
+        .llm(Arc::new(llm.clone()) as Arc<dyn LlmClient>)
+        .start()
+        .await;
+    gateway
+        .state()
+        .memory
+        .put(
+            seeded(
+                "m-1",
+                "客厅空调设 26 度",
+                Provenance::UserStatement,
+                MemoryState::Active,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let (_session, run) = crate::a_run(&gateway, "rk-1", "空调设多少度来着").await;
+    wait_for_terminal(&gateway, &run).await;
+
+    let seen = llm.requests.lock().expect("请求表").clone();
+    assert_eq!(seen.len(), 1);
+    let prompt = seen[0].system_prompt.trim_end();
+    let block_at = prompt
+        .find("[已知记忆]")
+        .unwrap_or_else(|| panic!("系统提示里没有记忆段：{prompt}"));
+    let block = &prompt[block_at..];
+    assert!(
+        block.contains("客厅空调设 26 度"),
+        "记忆段要带着召回到的正文：{prompt}"
+    );
+    // 渲染的每一行都以 `id@revision〕` 收尾（`komo-agent::context::memory::render_line`）；
+    // 系统提示原样以它结束，说明记忆段接在最后，不是夹在中间（Gateway 在
+    // `with_instructions` 之后才追加，§13.2）。
+    assert!(
+        prompt.ends_with('〕'),
+        "记忆段要接在系统提示的最后：{prompt}"
     );
 }

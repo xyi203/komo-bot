@@ -7,8 +7,10 @@
 //! ```text
 //! surface   Profile 在工具目录里挑出来的能力面（§4 末）+ 编排操作名
 //! skills    SkillRegistry：人写的 SKILL.md 的发现与目录行（§5.6）
+//! context   上下文装配：记忆等召回结果怎样渲染进提示（`docs/agent.md` §13）
 //! ```
 
+pub mod context;
 pub mod skills;
 pub mod surface;
 

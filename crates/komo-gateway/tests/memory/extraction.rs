@@ -428,6 +428,7 @@ async fn learn_with(gateway: &TestGateway, llm: ScriptedLlm) {
             Arc::clone(&state.clock),
         )),
         clock: Arc::clone(&state.clock),
+        render: komo_agent::context::memory::render,
     });
     // 直接用这一台新的消费队列——它读写的是**同一个 state.db**。
     manager.process_pending(8).await.expect("提取跑得动");

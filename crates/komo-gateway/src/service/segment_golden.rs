@@ -78,8 +78,9 @@ async fn render(case: &Case) -> String {
         None => system_prompt(cwd, &case.tools, &skills_block),
     };
     let mut prompt = with_instructions(case.instructions, prompt);
-    // 适配器在发送前追加的那一段（`SystemPreamble`）。
-    let injection = komo_runtime::memory::render_injection(&case.memories, 1_000);
+    // 记忆段接在系统提示的最后（§13.2）：`TurnRequest.system_prompt` 就是实际发出去的
+    // 那份，这里按生产路径同样的顺序拼一遍。
+    let injection = komo_agent::context::memory::render(&case.memories, 1_000);
     if let Some(text) = injection.text {
         prompt.push_str("\n\n");
         prompt.push_str(&text);

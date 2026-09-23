@@ -9,8 +9,9 @@
 //! - **恢复位置**：这个 Run 还有没有没收尾的调用。有就把它们原样交回执行器——**沿用
 //!   同一份计划**，因为审批绑定的是计划的哈希，重新 prepare 会换一个哈希（§7.4）。
 //!
-//! **记忆在这里召回，不在提示里拼**（§9.4）：这一段装配时按最新一句用户输入召回一次，
-//! 正文交给 `LlmFactory::with_preamble` 挂到系统提示后面，而用到的条目连同它们的
+//! **记忆在这里召回**（§9.4）：这一段装配时按最新一句用户输入召回一次，渲染出的正文
+//! （`komo-agent::context::memory::render`，§13.2）拼进 `TurnRequest.system_prompt`
+//! 的最后一段——它就是实际发出去的那份，适配器不再各自追加。用到的条目连同它们的
 //! revision 写进 [`TurnRequest::memories`]——那是审计证据，resume 时要按它重新核对
 //! （§9.7）。续跑时先拿检查点里记的那一批去核对，**过期或已遗忘的复活不了**。
 //
@@ -414,8 +415,8 @@ impl SegmentSource for GatewaySegments {
 
         // 子代理只拿得到任务本身：不注入记忆、不列 Skills、也**不带上父的对话历史**（它的
         // 回放窗口就是自己那条 Run，见下）。自包含这件事是父侧的责任，提示词里对它也说了。
-        let memories = match &delegate {
-            Some(_) => Vec::new(),
+        let injection = match &delegate {
+            Some(_) => komo_kernel::types::memory::Injection::default(),
             // 记忆作用域来自 Profile（§9.2）：只召回这一个作用域，外加显式共享的用户资料。
             None => {
                 let scopes = recall_scopes(identity.memory_scope.as_ref());
@@ -448,6 +449,12 @@ impl SegmentSource for GatewaySegments {
         // 身份指令是系统提示里**最靠前的那一段**（§4.3），基座提示排在它后面。它从冻结
         // 快照指向的正文读回来（不是重新去读配置文件），所以恢复出来的还是当时那一版。
         let prompt = with_instructions(identity.instructions.as_deref(), prompt);
+        // 记忆段接在系统提示的最后（§13.2）：`TurnRequest.system_prompt` 就是实际发出去
+        // 的那份，适配器不再各自拼接一遍。
+        let prompt = match &injection.text {
+            Some(text) => format!("{prompt}\n\n{text}"),
+            None => prompt,
+        };
 
         let agent_surface = identity.surface.clone();
 
@@ -505,7 +512,7 @@ impl SegmentSource for GatewaySegments {
                 Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
             },
             tools,
-            memories,
+            memories: injection.uses,
             covers: None,
         };
 
@@ -579,9 +586,9 @@ impl GatewaySegments {
         run: &RunId,
         surface: &Surface,
         scopes: &[MemoryScope],
-    ) -> Vec<komo_kernel::types::turn::MemoryUse> {
+    ) -> komo_kernel::types::memory::Injection {
         let Some(memories) = self.memories.as_ref() else {
-            return Vec::new();
+            return komo_kernel::types::memory::Injection::default();
         };
         let carried = match &self.checkpoints {
             Some(store) => match store.latest(session).await {
@@ -600,7 +607,6 @@ impl GatewaySegments {
         memories
             .prepare_segment(session, run, &text, &carried, surface.boundary(), scopes)
             .await
-            .uses
     }
 
     /// 这一段的**身份与能力**（§4.3）。

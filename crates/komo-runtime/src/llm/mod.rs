@@ -29,7 +29,7 @@ use komo_kernel::types::turn::{LlmError, TurnRequest};
 
 pub use anthropic::AnthropicMessagesLlm;
 pub use chat::ChatCompletionsLlm;
-pub use responses::{Credential, OpenAiResponsesLlm, SystemPreamble};
+pub use responses::{Credential, OpenAiResponsesLlm};
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};
 
 use crate::config::{EffortCapabilities, Secrets};
@@ -147,7 +147,6 @@ pub struct LlmFactory {
     secrets: Arc<Secrets>,
     caps: EffortCapabilities,
     transport: Arc<dyn HttpTransport>,
-    preamble: Option<Arc<dyn SystemPreamble>>,
     /// ChatGPT 凭证文件的位置（`auth = "chatgpt"` 用）；不配就造不出这一类客户端
     /// （[`LlmBuildError::ChatGptPathMissing`]）——Gateway 装配时总会给，见
     /// `komo-gateway::service::state::build_llm`。
@@ -168,19 +167,12 @@ impl LlmFactory {
             secrets,
             caps,
             transport: default_transport(),
-            preamble: None,
             chatgpt_credentials_path: None,
         }
     }
 
     pub fn with_transport(mut self, transport: Arc<dyn HttpTransport>) -> Self {
         self.transport = transport;
-        self
-    }
-
-    /// 记忆注入的接口（§9.4）：正文由 MemoryManager 给，这里只负责把它放进系统提示。
-    pub fn with_preamble(mut self, preamble: Arc<dyn SystemPreamble>) -> Self {
-        self.preamble = Some(preamble);
         self
     }
 
@@ -197,16 +189,13 @@ impl LlmFactory {
         match config.provider.as_str() {
             RESPONSES | LEGACY_OPENAI_RESPONSES => {
                 let credential = self.credential_for(config)?;
-                let mut client = OpenAiResponsesLlm::new(
+                let client = OpenAiResponsesLlm::new(
                     config.clone(),
                     role,
                     credential,
                     Arc::clone(&self.transport),
                     self.caps.clone(),
                 )?;
-                if let Some(preamble) = &self.preamble {
-                    client = client.with_preamble(Arc::clone(preamble));
-                }
                 Ok(Arc::new(client))
             }
             CHAT_COMPLETIONS => {
@@ -218,16 +207,13 @@ impl LlmFactory {
                     });
                 }
                 let key = self.secrets.get(&config.api_key_env).map(str::to_string);
-                let mut client = ChatCompletionsLlm::new(
+                let client = ChatCompletionsLlm::new(
                     config.clone(),
                     role,
                     key,
                     Arc::clone(&self.transport),
                     self.caps.clone(),
                 )?;
-                if let Some(preamble) = &self.preamble {
-                    client = client.with_preamble(Arc::clone(preamble));
-                }
                 Ok(Arc::new(client))
             }
             ANTHROPIC_MESSAGES => {
@@ -241,16 +227,13 @@ impl LlmFactory {
                     });
                 }
                 let key = self.secrets.get(&config.api_key_env).map(str::to_string);
-                let mut client = AnthropicMessagesLlm::new(
+                let client = AnthropicMessagesLlm::new(
                     config.clone(),
                     role,
                     key,
                     Arc::clone(&self.transport),
                     self.caps.clone(),
                 )?;
-                if let Some(preamble) = &self.preamble {
-                    client = client.with_preamble(Arc::clone(preamble));
-                }
                 Ok(Arc::new(client))
             }
             other => Err(LlmBuildError::UnknownProvider {

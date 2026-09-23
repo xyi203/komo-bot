@@ -64,15 +64,6 @@ fn codex_auth_error(error: CodexAuthError) -> LlmError {
     }
 }
 
-/// 记忆注入的接口（§9.4 的注入由 MemoryManager 决定内容，这里只留位置）。
-///
-/// 它不在 [`TurnRequest`] 里自己拼：`TurnRequest::memories` 是**审计证据**（注入了哪些
-/// 条目的哪个版本，§9.7），正文该长什么样是记忆那边的事。
-pub trait SystemPreamble: Send + Sync {
-    /// 追加在系统提示（`instructions`）之后的一段注入正文；`None` = 这一轮不注入。
-    fn preamble(&self, request: &TurnRequest) -> Option<String>;
-}
-
 /// 一个讲 Responses API 的后端。
 pub struct OpenAiResponsesLlm {
     config: ModelConfig,
@@ -80,7 +71,6 @@ pub struct OpenAiResponsesLlm {
     credential: Credential,
     transport: Arc<dyn HttpTransport>,
     caps: EffortCapabilities,
-    preamble: Option<Arc<dyn SystemPreamble>>,
     max_output_tokens: Option<u32>,
 }
 
@@ -119,14 +109,8 @@ impl OpenAiResponsesLlm {
             credential,
             transport,
             caps,
-            preamble: None,
             max_output_tokens: None,
         })
-    }
-
-    pub fn with_preamble(mut self, preamble: Arc<dyn SystemPreamble>) -> Self {
-        self.preamble = Some(preamble);
-        self
     }
 
     /// 单轮输出上限。不设就由服务端决定。
@@ -177,13 +161,9 @@ impl LlmClient for OpenAiResponsesLlm {
             });
         }
 
-        // Responses 的系统提示是 `instructions` 一个字段，所以记忆注入接在它后面，
-        // 而不是再造一条 role=system 的消息。
-        let mut instructions = req.system_prompt.clone();
-        if let Some(preamble) = self.preamble.as_ref().and_then(|p| p.preamble(&req)) {
-            instructions.push_str("\n\n");
-            instructions.push_str(&preamble);
-        }
+        // Responses 的系统提示是 `instructions` 一个字段。记忆段已经在
+        // `req.system_prompt` 里（Gateway 装配时拼好，§13.2），这里原样带过去。
+        let instructions = req.system_prompt.clone();
 
         Ok(Box::new(ResponsesDriver {
             endpoint: self.endpoint(&req.model),

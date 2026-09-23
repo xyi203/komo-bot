@@ -304,12 +304,26 @@ pub struct DeviceLogin {
 struct UserCodeResponse {
     device_auth_id: String,
     user_code: String,
-    #[serde(default = "default_interval")]
+    #[serde(default = "default_interval", deserialize_with = "number_or_string")]
     interval: u64,
 }
 
 fn default_interval() -> u64 {
     5
+}
+
+/// 服务端把 `interval` 发成字符串（`"5"`），也可能是数字——两种都收。
+fn number_or_string<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Interval {
+        Number(u64),
+        Text(String),
+    }
+    match Interval::deserialize(deserializer)? {
+        Interval::Number(n) => Ok(n),
+        Interval::Text(s) => s.trim().parse().map_err(serde::de::Error::custom),
+    }
 }
 
 pub async fn start_device_login(
@@ -703,5 +717,15 @@ mod tests {
             fields.contains(&("client_id".to_string(), CLIENT_ID.to_string())),
             "{fields:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_device_code_interval_sent_as_a_string_still_parses() {
+        let transport = ScriptedTransport::new(vec![Reply::json(
+            200,
+            r#"{"device_auth_id":"d","user_code":"ABCD-1234","interval":"5"}"#,
+        )]);
+        let device = start_device_login(&transport).await.unwrap();
+        assert_eq!(device.interval_secs, 5);
     }
 }

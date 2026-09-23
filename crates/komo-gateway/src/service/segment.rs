@@ -1305,6 +1305,10 @@ fn subagent_prompt(cwd: &std::path::Path, tools: &[ToolDefinition], spec: &Deleg
 }
 
 #[cfg(test)]
+#[path = "segment_golden.rs"]
+mod golden;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use komo_kernel::events::MessageAssistant;

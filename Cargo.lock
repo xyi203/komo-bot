@@ -2279,6 +2279,7 @@ dependencies = [
  "bytes",
  "crossterm",
  "futures-util",
+ "jiff",
  "komo-kernel",
  "pulldown-cmark",
  "ratatui",

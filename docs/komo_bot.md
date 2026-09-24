@@ -1738,6 +1738,7 @@ kernel ← client ────────────────────�
 | `sha2` | `0.10` | openlark-core 用 0.10；选 0.11 会把 `digest` / `block-buffer` / `crypto-common` / `cpufeatures` 一起劈成两份 |
 | `croner` | `default-features = false`（W2 确认无 chrono 时的时刻表达） | kernel 已有 `time`，不要第二套日期时间库；croner 4 默认特性拉进 chrono + derive_builder / darling / strum |
 | `grep` + `ignore` | `0.4`，`default-features = false`；仅 komo-runtime（`rg` 工具） | 内嵌 ripgrep 的搜索与遍历，不起子进程：外部 `rg` 要么没装、要么各家版本不同，而遍历规则（隐藏文件、`.gitignore`、覆盖 glob）本来就该用这套实现。默认特性集是空的，写出来是钉住两件事：**不开 `pcre2`**（"正则语法 = Rust regex"是对模型可见的契约）与不引 SIMD 的 `avx-accel`。带进来的 13 个包（`globset`、`walkdir`、`termcolor`、`crossbeam-deque`、`encoding_rs_io`、`memmap2`、`bstr` 等）全是纯 Rust、无 C 工具链，且没有新的重复版本（2026-09-21 对 `cargo tree -d` 核过） |
+| `jiff` | `0.2`，默认特性（系统 tzdb + 系统时区）；komo-runtime 与 komo-client | runtime：cron 的 `ZoneResolver`（IANA 区名 → 偏移，§10）。client：CLI 的时刻一律印成本机墙钟 + 偏移（`2026-09-25 14:00:00 +08:00`），偏移按每个时刻各自取，夏令时两侧不同；不用 `time` 的 `local-offset`，它只能取"现在"的偏移，且在多线程进程里拒绝返回。kernel 仍只用 `time` |
 | `arc-swap` | 默认；仅 komo-runtime（`config`） | §3 热重载的唯一 `Arc<ConfigSnapshot>` 原子替换 |
 | `serde_ignored` | `0.1`，默认；仅 komo-runtime（`config`） | §3 的「不认识的键只警告」：包住 `toml::Deserializer`，把每个被忽略的键路径交给回调。只依赖 `serde`，不进别的 crate 的图 |
 | 判断后端（TypeSafe「System One」） | **不新增依赖**：走已有的 `reqwest`（`rustls-no-provider`）+ 同一个 ring provider；凭证只从 `.env` 的 `TYPESAFE_API_KEY` 读 | §9.4 的可选重排用它。默认关；开着时才会发请求，且会把候选记忆的正文（截到 200 字符）发给第三方端点 |

@@ -831,7 +831,7 @@ fn config_check_locates_every_problem_at_a_key() {
             "错误  memory.embedding.base_url: 缺少 base_url",
             "警告  channels.telegram.allow_from: 已启用但名单为空",
             "1 个错误——这份配置不会被装上",
-            "当前配置装载于 2026-09-16 08:00:00",
+            &format!("当前配置装载于 {}", stamp(NOW)),
         ],
     );
 }
@@ -955,8 +955,8 @@ fn doctor_calls_out_a_file_that_was_edited_after_the_config_was_loaded() {
         &printed,
         &[
             "实例      inst-1",
-            "配置装载  2026-09-16 08:00:00",
-            "mtime 2026-09-16 08:05:00",
+            &format!("配置装载  {}", stamp(NOW)),
+            &format!("mtime {}", stamp(NOW + time::Duration::minutes(5))),
             "⚠ 文件改了但没装上：/home/u/.komo/config.toml",
             "komo config reload",
             // 上一次校验错误一并印出来。
@@ -994,4 +994,32 @@ fn insta_like(printed: &str, fragments: &[&str]) {
             "少了「{fragment}」：\n{printed}"
         );
     }
+}
+
+// ---- stamp ----
+
+#[test]
+fn a_stamp_is_wall_clock_in_the_given_zone_with_its_offset() {
+    let shanghai = jiff::tz::TimeZone::fixed(jiff::tz::offset(8));
+    assert_eq!(
+        stamp_in(datetime!(2026-09-25 06:00:00 UTC), &shanghai),
+        "2026-09-25 14:00:00 +08:00"
+    );
+    assert_eq!(
+        stamp_in(datetime!(2026-09-25 06:00:00 UTC), &jiff::tz::TimeZone::UTC),
+        "2026-09-25 06:00:00 +00:00"
+    );
+}
+
+#[test]
+fn a_stamp_takes_the_offset_of_its_own_instant_across_dst() {
+    let new_york = jiff::tz::TimeZone::get("America/New_York").unwrap();
+    assert_eq!(
+        stamp_in(datetime!(2026-07-01 16:00:00 UTC), &new_york),
+        "2026-07-01 12:00:00 -04:00"
+    );
+    assert_eq!(
+        stamp_in(datetime!(2026-12-01 17:00:00 UTC), &new_york),
+        "2026-12-01 12:00:00 -05:00"
+    );
 }

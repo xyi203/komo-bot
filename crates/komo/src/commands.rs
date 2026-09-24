@@ -925,7 +925,7 @@ mod cron_render_tests {
         let line = added_line(&job());
         assert!(line.contains("早报"), "{line}");
         assert!(line.contains("job-1"), "后面每条命令都要这个 ID：{line}");
-        assert!(line.contains("2026-09-16 01:00:00"), "{line}");
+        assert!(line.contains(&render::stamp(NOW)), "{line}");
     }
 
     /// 一个算不出槽位的 Job（区名解析不了一类）不该印成"下一次 1970"。

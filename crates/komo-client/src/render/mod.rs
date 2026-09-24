@@ -55,12 +55,12 @@ pub fn session_list(response: &SessionListResponse, now: OffsetDateTime) -> Stri
     }
     let mut out = Vec::new();
     out.push(format!(
-        "{:<38} {:<10} {:<44} {:<22} {}",
+        "{:<38} {:<10} {:<44} {:<26} {}",
         "SESSION", "生命周期", "运行", "更新时间", "标题"
     ));
     for session in &response.sessions {
         out.push(format!(
-            "{:<38} {:<10} {:<44} {:<22} {}",
+            "{:<38} {:<10} {:<44} {:<26} {}",
             session.session,
             session_state(session.state),
             match session.current_state {
@@ -448,12 +448,12 @@ pub fn cron_list(response: &CronListResponse, now: OffsetDateTime) -> String {
         return "没有定时任务".into();
     }
     let mut out = vec![format!(
-        "{:<38} {:<10} {:<8} {:<8} {:<22} {}",
+        "{:<38} {:<10} {:<8} {:<8} {:<36} {}",
         "JOB", "状态", "重叠", "投递", "下次", "名称 / 触发"
     )];
     for job in &response.jobs {
         out.push(format!(
-            "{:<38} {:<10} {:<8} {:<8} {:<22} {} · {}",
+            "{:<38} {:<10} {:<8} {:<8} {:<36} {} · {}",
             job.id,
             job_status(job.status),
             overlap(job.overlap),
@@ -949,9 +949,24 @@ fn stale_warning(loaded_at: OffsetDateTime, sources: &[SourceFile]) -> Option<St
 
 /// 一个可读的时刻。`komo cron` 那几条回执也印它，所以它是公开的——两处各写一遍
 /// 格式，迟早有一处会和另一处不一样。
+///
+/// 本机时区的墙钟时刻，带偏移（`2026-09-25 14:00:00 +08:00`）。
+///
+/// 偏移必须印出来：这些输出也会被 agent 经 shell 读到，不带偏移的时刻会被当成本机时间。
+/// 偏移按时刻本身取（夏令时两侧不同），所以走 jiff 的系统时区，不在启动时抓一个固定偏移；
+/// `time` 的 `current_local_offset` 在多线程进程里还会直接拒绝。
 pub fn stamp(at: OffsetDateTime) -> String {
-    let format = time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
-    at.format(&format).unwrap_or_else(|_| at.to_string())
+    stamp_in(at, &jiff::tz::TimeZone::system())
+}
+
+fn stamp_in(at: OffsetDateTime, zone: &jiff::tz::TimeZone) -> String {
+    match jiff::Timestamp::from_second(at.unix_timestamp()) {
+        Ok(ts) => ts
+            .to_zoned(zone.clone())
+            .strftime("%Y-%m-%d %H:%M:%S %:z")
+            .to_string(),
+        Err(_) => at.to_string(),
+    }
 }
 
 fn relative(at: OffsetDateTime, now: OffsetDateTime) -> String {

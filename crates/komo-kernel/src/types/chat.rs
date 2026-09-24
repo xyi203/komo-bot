@@ -37,6 +37,20 @@ impl ChannelPlatform {
     pub fn supports_unsolicited_push(self) -> bool {
         !matches!(self, ChannelPlatform::Wechat)
     }
+
+    /// [`ChannelPlatform::as_str`] 的反过来：认不出的词是 `None`，不是别的渠道。
+    ///
+    /// 给 [`ChannelPeer::parse`] 用——`runs.peer` 存的就是 `{platform}:{chat_id}`
+    /// （`Display` 那份），重启后要把它解回来（`docs/home-dispatcher.md` §8）。
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "feishu" => Some(ChannelPlatform::Feishu),
+            "telegram" => Some(ChannelPlatform::Telegram),
+            "wechat" => Some(ChannelPlatform::Wechat),
+            "api" => Some(ChannelPlatform::Api),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for ChannelPlatform {
@@ -99,6 +113,21 @@ impl ChannelPeer {
             platform,
             chat_id: PeerId::new(chat_id),
         }
+    }
+
+    /// [`Display`](fmt::Display) 的反过来：把 `runs.peer` 里存的 `"{platform}:{chat_id}"`
+    /// 解回一个 [`ChannelPeer`]。重启后重挂交互 Run 的看客要用它（`docs/home-dispatcher.md`
+    /// §8 Fix 1）——`peer` 存的从来就是这个 `Display` 出来的串，这里只是原样切回去。
+    ///
+    /// 只切**第一个**冒号：`chat_id` 本身可能带冒号（不是已知渠道会这么写，但不排除），
+    /// `platform` 那几个词都不带。空的 `chat_id` 认不出来。
+    pub fn parse(raw: &str) -> Option<Self> {
+        let (platform, chat_id) = raw.split_once(':')?;
+        let platform = ChannelPlatform::parse(platform)?;
+        if chat_id.is_empty() {
+            return None;
+        }
+        Some(ChannelPeer::new(platform, chat_id))
     }
 }
 
@@ -276,6 +305,27 @@ mod tests {
     fn a_peer_renders_as_platform_colon_chat_id() {
         let peer = ChannelPeer::new(ChannelPlatform::Feishu, "oc_xxx");
         assert_eq!(peer.to_string(), "feishu:oc_xxx");
+    }
+
+    /// `parse` 是 `Display` 的反过来：`runs.peer` 存的就是这个串，重启后要能原样解回去
+    /// （§8 Fix 1）。
+    #[test]
+    fn a_peer_round_trips_through_its_display_form() {
+        for peer in [
+            ChannelPeer::new(ChannelPlatform::Feishu, "oc_xxx"),
+            ChannelPeer::new(ChannelPlatform::Telegram, "123456789"),
+            ChannelPeer::new(ChannelPlatform::Wechat, "wxid_op"),
+            ChannelPeer::new(ChannelPlatform::Api, "tui"),
+        ] {
+            assert_eq!(ChannelPeer::parse(&peer.to_string()), Some(peer));
+        }
+    }
+
+    #[test]
+    fn parse_rejects_an_unknown_platform_or_a_missing_chat_id() {
+        assert_eq!(ChannelPeer::parse("carrier-pigeon:oc_xxx"), None);
+        assert_eq!(ChannelPeer::parse("feishu:"), None);
+        assert_eq!(ChannelPeer::parse("feishu"), None);
     }
 
     #[test]

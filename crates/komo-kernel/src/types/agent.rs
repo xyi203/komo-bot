@@ -138,6 +138,26 @@ impl AgentConfig {
             .get(&self.default_agent)
             .expect("default_agent 指向一个声明过的 Agent；校验保证")
     }
+
+    /// 会话记下的归属，或者默认 Agent（空串 = 还没有归属，§4.2）。**不校验非空的那个
+    /// id 是不是配置过**——那是 [`AgentConfig::profile_of`] 的事，这里只回答"有没有
+    /// 归属"这一问。`GatewayState::owner_or_default` 与没有冻结快照时的兜底身份
+    /// （`context_sources::ambient_identity`）共用这一条规则，不各自算一遍。
+    pub fn owner_or_default<'a>(&'a self, agent_id: &'a str) -> &'a str {
+        if agent_id.is_empty() {
+            &self.default_agent
+        } else {
+            agent_id
+        }
+    }
+
+    /// [`AgentConfig::owner_or_default`] 再往下一步：兜到一份**真的存在**的 Profile——
+    /// 归属写着的那个 Agent 可能已经从 `[agents]` 里删掉了（§八「已有 Session 归入默认
+    /// Agent」）。
+    pub fn profile_of(&self, agent_id: &str) -> &AgentProfile {
+        self.get(self.owner_or_default(agent_id))
+            .unwrap_or_else(|| self.default_profile())
+    }
 }
 
 #[cfg(test)]
@@ -198,5 +218,33 @@ mod tests {
         };
         assert_eq!(config.default_profile().id, "assistant");
         assert!(config.get("coder").is_none());
+    }
+
+    fn two_agents() -> AgentConfig {
+        AgentConfig {
+            default_agent: "assistant".into(),
+            agents: BTreeMap::from([
+                ("assistant".into(), AgentProfile::new("assistant")),
+                ("coder".into(), AgentProfile::new("coder")),
+            ]),
+        }
+    }
+
+    /// 空串 = 还没有归属，退到默认 Agent（§4.2）。
+    #[test]
+    fn owner_or_default_falls_back_on_an_empty_id() {
+        let config = two_agents();
+        assert_eq!(config.owner_or_default(""), "assistant");
+        assert_eq!(config.owner_or_default("coder"), "coder");
+    }
+
+    /// `profile_of` 在 `owner_or_default` 之上再兜一层：非空但配置里已经没有的 Agent
+    /// 一样退到默认 Profile（§八）。
+    #[test]
+    fn profile_of_falls_back_when_the_named_agent_is_gone() {
+        let config = two_agents();
+        assert_eq!(config.profile_of("coder").id, "coder");
+        assert_eq!(config.profile_of("").id, "assistant");
+        assert_eq!(config.profile_of("retired-agent").id, "assistant");
     }
 }

@@ -11,6 +11,7 @@
 
 mod e2e;
 mod harness;
+mod home_dispatcher;
 mod reconcile;
 mod rows;
 mod verdicts;

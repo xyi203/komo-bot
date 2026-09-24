@@ -115,14 +115,26 @@ pub(crate) async fn identity_for(
     })
 }
 
-/// 没有冻结快照时的兜底身份：**当前**配置的默认 Agent（§八）。
+/// 没有冻结快照时的兜底身份：**当前**配置里、这个会话归属的那个 Agent（`docs/
+/// home-dispatcher.md` §8 Fix 2）。
+///
+/// 会话没有归属（空串，升级前建的行）或者归属的 Agent 已经从 `[agents]` 里删掉了，才退到
+/// 默认 Agent——与 `GatewayState::owner_or_default` / `freeze_run` 同一条规则
+/// （`AgentConfig::profile_of`），不是一条各算各的兜底：任务会话（`worker` Profile）走的
+/// 正是这条没有冻结快照的路，答错了 Agent 就是拿错误的身份跑完整个任务。
 ///
 /// 工作目录的取舍与受理那一步是**同一条规则**（会话 `workdir` → Profile `workspace`
 /// → `workspaces/`）：同一件事在两条路上有两个答案，正是 §八 修掉的那类缺口。
 fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Identity {
     let names: Vec<String> = catalog.iter().map(|tool| tool.name.clone()).collect();
     let config = fallback.config.map(|config| config.current());
-    let profile = config.as_ref().map(|config| config.agent.default_profile());
+    let agent_id = fallback
+        .record
+        .map(|record| record.agent_id.as_str())
+        .unwrap_or_default();
+    let profile = config
+        .as_ref()
+        .map(|config| config.agent.profile_of(agent_id));
     let surface = match (profile, fallback.config) {
         (Some(profile), Some(holder)) => {
             komo_agent::surface_of(profile, &names, &holder.home().join("config.toml"))
@@ -465,5 +477,112 @@ mod tests {
             .await
             .expect_err("读不出来就不该装作读到了");
         assert!(matches!(error, LedgerError::Corrupt(_)), "{error:?}");
+    }
+
+    /// Fix 2（`docs/home-dispatcher.md` §8）：没有冻结快照时，兜底身份要看会话自己的
+    /// `agent_id`——配的是哪个 Profile 就用哪个的指令与能力面，不能总是退到默认 Agent。
+    /// 任务会话（`worker` Profile）走的正是这条没有冻结快照的路，答错了 Agent 就是拿
+    /// 错误的身份跑完整个任务。
+    #[tokio::test]
+    async fn ambient_identity_uses_the_sessions_agent_when_it_names_a_configured_profile() {
+        use std::collections::BTreeMap;
+
+        use komo_kernel::types::agent::{AgentConfig, AgentProfile};
+        use komo_kernel::types::status::SessionState;
+        use komo_runtime::config::{EffortCapabilities, Loaded, Secrets, Sources};
+        use komo_store::models::SessionKind;
+        use komo_store::repos::session::SessionRecord;
+
+        let payloads = payloads();
+        let run = RunId::from_raw("run-1");
+        // `accepted_as` 定死不带快照：旧行 / 没有冻结身份的子 Run 走的都是这条路。
+        let events = vec![
+            accepted_as(&run, 1, Some("查一下 3 号房的空调"), None),
+            started(&run, 2),
+        ];
+
+        let mut snapshot = komo_kernel::test_support::snapshot_fixture();
+        snapshot.agent = AgentConfig {
+            default_agent: "assistant".into(),
+            agents: BTreeMap::from([
+                ("assistant".into(), AgentProfile::new("assistant")),
+                (
+                    "coder".into(),
+                    AgentProfile {
+                        instructions: Some("你是 coder，只管写代码。".into()),
+                        tools: Some(vec!["read".into()]),
+                        ..AgentProfile::new("coder")
+                    },
+                ),
+            ]),
+        };
+        let home = PathBuf::from("/tmp/komo-ambient-identity-test");
+        let holder = Arc::new(ConfigHolder::adopt(
+            Loaded {
+                snapshot: Arc::new(snapshot),
+                secrets: Arc::new(Secrets::new()),
+                issues: Vec::new(),
+                home: home.clone(),
+                sources: Sources::under(&home),
+            },
+            EffortCapabilities::builtin(),
+        ));
+
+        let session_record = SessionRecord {
+            session: SessionId::from_raw("sess-1"),
+            title: String::new(),
+            origin: "chat:telegram:1".into(),
+            agent_id: "coder".into(),
+            kind: SessionKind::Main,
+            workdir: None,
+            current_run: None,
+            jsonl_path: String::new(),
+            applied_seq: Seq::ZERO,
+            applied_bytes: 0,
+            state: SessionState::Active,
+            state_changed_at: time::macros::datetime!(2026-09-24 08:00:00 UTC),
+        };
+
+        let catalog = vec![
+            ToolDefinition {
+                name: "read".into(),
+                description: String::new(),
+                parameters: serde_json::Value::Null,
+            },
+            ToolDefinition {
+                name: "shell".into(),
+                description: String::new(),
+                parameters: serde_json::Value::Null,
+            },
+        ];
+        let workspaces = PathBuf::from("/workspaces");
+
+        let identity = identity_for(
+            &events,
+            &run,
+            &payloads,
+            Fallback {
+                config: Some(&holder),
+                record: Some(&session_record),
+                workspaces: &workspaces,
+            },
+            &catalog,
+        )
+        .await
+        .expect("没有冻结快照时兜底也读得出来");
+
+        assert_eq!(
+            identity.agent_id, "coder",
+            "兜底身份要按会话的归属挑 Profile"
+        );
+        assert_eq!(
+            identity.instructions.as_deref(),
+            Some("你是 coder，只管写代码。")
+        );
+        assert_eq!(
+            identity.surface.names(),
+            ["read"],
+            "coder 的能力面只留它自己写的那个工具"
+        );
     }
 }

@@ -47,6 +47,10 @@ pub enum OperationMatch {
     MemoryChange,
     PolicyChange,
     Delegate,
+    /// `docs/home-dispatcher.md` §4：建一个独立的任务会话。
+    Dispatch,
+    /// 同上：往一个已有的任务会话里再提交一句。
+    Follow,
 }
 
 impl OperationMatch {
@@ -62,6 +66,8 @@ impl OperationMatch {
             Operation::MemoryChange => OperationMatch::MemoryChange,
             Operation::PolicyChange => OperationMatch::PolicyChange,
             Operation::Delegate { .. } => OperationMatch::Delegate,
+            Operation::Dispatch { .. } => OperationMatch::Dispatch,
+            Operation::Follow { .. } => OperationMatch::Follow,
         }
     }
 }

@@ -467,6 +467,8 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 | Memos 的写入、修改或删除                      | 按 Python 模块版本、函数、参数与用户指令范围审核                     |
 | 权限扩大或修改 Policy                         | 通过操作者配置流程处理，不能由模型自行放宽                           |
 | 委派一个子任务（`Operation::Delegate`）       | 按操作者意图：strict 下 Ask（展示任务正文与结果契约），auto 下 Allow。**子代理自己的每一次调用仍各自按上面各行判断**——委派不放宽任何一层。续跑（`resume`，§4）是同一行：审批卡在这次委派的任务正文（这次续跑要接着做的那件事，就是这次 `delegate` 调用的 `task`）之外多写一句"接着子 Run X"，续跑目标进计划、进计划哈希，批的是"接着**这一条**"，换一条就要重新问。**渲染只读得到这次的计划**，不回去查目标那条子 Run 当初的任务正文——那句原话要看，去读那条子 Run 自己的记录（§8.3 的回放窗口） |
+| 派一个新任务（`Operation::Dispatch`）         | strict 与 auto 下都 Allow：它只是建一个独立的**任务会话**并提交第一条输入（`docs/home-dispatcher.md` §4），不等它跑完，**任务会话里的每一次调用仍各自按上面各行判断**——不放宽任何一层。幂等键 `dispatch:{run}:{call}` 让重放的同一次调用不会多建一个任务 |
+| 追问一个任务（`Operation::Follow`）           | 同上：strict 与 auto 下都 Allow，只是把一句话提交进一个已有的任务会话；幂等键 `follow:{run}:{call}` |
 | shell 命令文本匹配 `komo cron add`            | strict 下永远 Ask，且**只能批一次**（`scopes` 固定 `[once]`，不给 Run / Cron 范围）；**任何已有的 Run / Cron 范围授权都不能替这一步作答**——`cron add` 会给命令 Job 自己签发一条执行授权（见下），模型能经 shell 调它给自己写将来能免问的许可，这一条必须每次都问人。auto 基表不变（§7.1「auto 与 strict 的差别就是要不要人看一眼」，这条也不例外） |
 
 **两套建议，操作者选一套。** 上面那张表落成 `RuleTable::initial()`（"strict"）；另一套是

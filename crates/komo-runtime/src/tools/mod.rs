@@ -8,7 +8,9 @@
 //! 另一条 Run"的入口，而且不由工具执行（见 [`delegate`]）。
 
 pub mod delegate;
+pub mod dispatch;
 pub mod edit;
+pub mod follow;
 pub mod paths;
 pub mod process;
 pub mod python;
@@ -26,7 +28,9 @@ use komo_kernel::types::tool::ToolError;
 use serde::{Deserialize, Serialize};
 
 pub use delegate::DelegateTool;
+pub use dispatch::DispatchTool;
 pub use edit::EditTool;
+pub use follow::FollowTool;
 pub use python::PythonTool;
 pub use read::ReadTool;
 pub use rg::RgTool;

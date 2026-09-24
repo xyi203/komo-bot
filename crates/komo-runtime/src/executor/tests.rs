@@ -2767,3 +2767,354 @@ async fn a_resumed_read_that_never_ran_still_runs_beside_its_siblings() {
         "续跑里那条没跑过的读没有和兄弟同时在飞：{log:?}"
     );
 }
+
+/// `dispatch` / `follow`：`docs/home-dispatcher.md` §4.2、§9 Phase 2 的验收。
+///
+/// 与 `delegation` 那一组不同，这里不需要真的在账本里建一条子 Run——`TaskSpawner`
+/// 把"建会话、提交输入"整个封在接缝后面，测试只关心 executor 这一侧的编排：放行之后
+/// 立刻调它、立刻收尾（不是 `RoundStop::Dependency`），以及幂等重放不重复派任务。
+mod dispatch_and_follow {
+    use super::*;
+
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use komo_kernel::traits::{SpawnError, TaskSpawner};
+    use komo_kernel::types::ids::{RequestKey, RunId};
+    use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskSpec};
+
+    use crate::tools::{DispatchTool, FollowTool};
+
+    /// 一份记账的假 `TaskSpawner`：`spawn` 按 `request_key` 幂等（同一个键第二次拿回
+    /// 同一个任务句柄，不建"第二个"），`follow` 对配置过的"未知短号"答
+    /// [`SpawnError::UnknownTask`]。
+    #[derive(Default)]
+    struct FakeSpawnerState {
+        spawn_calls: Vec<(RunId, RequestKey, TaskSpec)>,
+        sessions_by_key: HashMap<RequestKey, TaskHandle>,
+        follow_calls: Vec<(RunId, RequestKey, String, String)>,
+        unknown: HashSet<String>,
+        queued_behind: HashSet<String>,
+    }
+
+    struct FakeSpawner {
+        state: Mutex<FakeSpawnerState>,
+        next_id: AtomicU32,
+    }
+
+    impl FakeSpawner {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                state: Mutex::new(FakeSpawnerState::default()),
+                next_id: AtomicU32::new(0),
+            })
+        }
+
+        fn with_unknown(self: Arc<Self>, task_id: &str) -> Arc<Self> {
+            self.state
+                .lock()
+                .expect("假分发器")
+                .unknown
+                .insert(task_id.to_string());
+            self
+        }
+
+        fn with_queued_behind(self: Arc<Self>, task_id: &str) -> Arc<Self> {
+            self.state
+                .lock()
+                .expect("假分发器")
+                .queued_behind
+                .insert(task_id.to_string());
+            self
+        }
+
+        fn spawn_calls(&self) -> usize {
+            self.state.lock().expect("假分发器").spawn_calls.len()
+        }
+
+        /// **不同的任务会话**有几个——幂等重放要的是这里恒为 1，而不是 `spawn_calls()`。
+        fn distinct_sessions(&self) -> usize {
+            self.state
+                .lock()
+                .expect("假分发器")
+                .sessions_by_key
+                .values()
+                .map(|handle| handle.session.clone())
+                .collect::<HashSet<_>>()
+                .len()
+        }
+
+        fn follow_calls(&self) -> usize {
+            self.state.lock().expect("假分发器").follow_calls.len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TaskSpawner for FakeSpawner {
+        async fn spawn(
+            &self,
+            from: &RunId,
+            request_key: RequestKey,
+            spec: TaskSpec,
+        ) -> Result<TaskHandle, SpawnError> {
+            let mut state = self.state.lock().expect("假分发器");
+            state
+                .spawn_calls
+                .push((from.clone(), request_key.clone(), spec.clone()));
+            if let Some(existing) = state.sessions_by_key.get(&request_key) {
+                return Ok(existing.clone());
+            }
+            let n = self.next_id.fetch_add(1, Ordering::SeqCst);
+            let handle = TaskHandle {
+                session: SessionId::from_raw(format!("task-session-{n}")),
+                short_id: format!("{n:04x}"),
+                title: spec.title.clone(),
+            };
+            state.sessions_by_key.insert(request_key, handle.clone());
+            Ok(handle)
+        }
+
+        async fn follow(
+            &self,
+            from: &RunId,
+            request_key: RequestKey,
+            task_id: &str,
+            text: &str,
+        ) -> Result<FollowOutcome, SpawnError> {
+            let mut state = self.state.lock().expect("假分发器");
+            state.follow_calls.push((
+                from.clone(),
+                request_key.clone(),
+                task_id.to_string(),
+                text.to_string(),
+            ));
+            if state.unknown.contains(task_id) {
+                return Err(SpawnError::UnknownTask(format!(
+                    "#{task_id} 不是这个 home 名下正在跑或最近的任务"
+                )));
+            }
+            Ok(FollowOutcome {
+                session: SessionId::from_raw(format!("task-session-{task_id}")),
+                short_id: task_id.to_string(),
+                queued_behind: state.queued_behind.contains(task_id),
+            })
+        }
+    }
+
+    /// 一条父 Run + 一次调用，策略是 §7.1 的初始建议表——dispatch / follow 在它之下也是
+    /// Allow（新增两行），不需要额外放宽。
+    async fn round(
+        harness: &Harness,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> (SessionId, komo_kernel::types::ids::RunId, CallRequest) {
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[(tool, args)]).await;
+        (session, run, calls.into_iter().next().expect("一个调用"))
+    }
+
+    /// ① dispatch 一放行就立刻收尾：不是 `RoundStop::Dependency`，结果里带着短号与标题。
+    #[tokio::test]
+    async fn dispatch_settles_immediately_with_the_returned_short_id() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new();
+        let executor = harness.initial_with_spawner(
+            vec![Arc::new(DispatchTool::new())],
+            fake.clone() as Arc<dyn TaskSpawner>,
+        );
+        let (session, run, request) = round(
+            &harness,
+            "dispatch",
+            serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+        )
+        .await;
+
+        let outcome = executor
+            .execute_round(vec![request.clone()], &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(
+            outcome.stop.is_none(),
+            "dispatch 不等任务跑完，不该停在任何等待上：{:?}",
+            outcome.stop
+        );
+        assert_eq!(outcome.results.len(), 1);
+        assert!(!outcome.results[0].is_error, "{:?}", outcome.results[0]);
+        assert!(
+            outcome.results[0].content.contains("已派出 #0000：查空调"),
+            "{}",
+            outcome.results[0].content
+        );
+        assert_eq!(fake.spawn_calls(), 1);
+    }
+
+    /// ② 幂等：上一世已经 `start_call` 过（崩在"派出去"与"写结果"之间）的续跑，不重新
+    /// 授权、不重新 `start_call`，直接把结果落回那次尝试——`spawner.spawn` 本身按
+    /// `request_key` 幂等，即便两次收到同一个键也只认得出一个任务会话。
+    #[tokio::test]
+    async fn a_replayed_dispatch_call_does_not_spawn_twice() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new();
+        let tool = DispatchTool::new();
+        let executor = harness.initial_with_spawner(
+            vec![Arc::new(DispatchTool::new())],
+            fake.clone() as Arc<dyn TaskSpawner>,
+        );
+        let (session, run, request) = round(
+            &harness,
+            "dispatch",
+            serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+        )
+        .await;
+        let env = harness.env(&session, &run);
+        let plan = plan_of(&tool, &harness, &session, &run, &request).await;
+        let attempt = harness.crashed_attempt(&request.call, &plan).await;
+
+        let resumed = {
+            let mut request = request.clone();
+            request.plan = Some(plan.clone());
+            request.resumed = Some(resumed_from(
+                ToolCallState::Started,
+                Some(attempt.clone()),
+                1,
+            ));
+            request
+        };
+
+        // 两次"回来收口"都把同一条悬着的调用交回来——恢复扫描重复触发时会是这个样子。
+        let first = executor
+            .execute_round(vec![resumed.clone()], &env)
+            .await
+            .unwrap();
+        assert!(first.stop.is_none(), "{:?}", first.stop);
+        let second = executor.execute_round(vec![resumed], &env).await.unwrap();
+        assert!(second.stop.is_none(), "{:?}", second.stop);
+
+        assert_eq!(
+            fake.spawn_calls(),
+            2,
+            "两次都调了 spawn（它自己按请求键幂等）"
+        );
+        assert_eq!(
+            fake.distinct_sessions(),
+            1,
+            "同一个请求键两次拿回的是同一个任务会话，没有多派一条"
+        );
+    }
+
+    /// ③ follow 解析不到短号：干净失败，不是"结果不明"，也不悬着。
+    #[tokio::test]
+    async fn follow_with_an_unknown_task_id_fails_cleanly() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new().with_unknown("dead");
+        let executor = harness.initial_with_spawner(
+            vec![Arc::new(FollowTool::new())],
+            fake.clone() as Arc<dyn TaskSpawner>,
+        );
+        let (session, run, request) = round(
+            &harness,
+            "follow",
+            serde_json::json!({ "task_id": "dead", "text": "再看看" }),
+        )
+        .await;
+
+        let outcome = executor
+            .execute_round(vec![request.clone()], &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.results[0].is_error, "{:?}", outcome.results[0]);
+        assert!(
+            outcome.results[0].content.contains("dead"),
+            "{}",
+            outcome.results[0].content
+        );
+        assert_eq!(fake.follow_calls(), 1, "解析只问了一次，没有悄悄重试");
+    }
+
+    /// ④ follow 命中一个正在跑的任务：措辞改成"排在后面"，不是"已转给"。
+    #[tokio::test]
+    async fn follow_into_a_busy_task_says_it_is_queued_behind() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new().with_queued_behind("3f2a");
+        let executor = harness.initial_with_spawner(
+            vec![Arc::new(FollowTool::new())],
+            fake.clone() as Arc<dyn TaskSpawner>,
+        );
+        let (session, run, request) = round(
+            &harness,
+            "follow",
+            serde_json::json!({ "task_id": "3f2a", "text": "再看看" }),
+        )
+        .await;
+
+        let outcome = executor
+            .execute_round(vec![request], &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(!outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("正在跑"),
+            "{}",
+            outcome.results[0].content
+        );
+    }
+
+    /// ⑤ 没有装配 `TaskSpawner` 时两个操作都干净失败（不悬着），不是一个悬空的调用。
+    #[tokio::test]
+    async fn without_a_spawner_dispatch_and_follow_fail_cleanly() {
+        let harness = Harness::new();
+        let executor = harness.initial(vec![
+            Arc::new(DispatchTool::new()),
+            Arc::new(FollowTool::new()),
+        ]);
+        let (session, run, request) = round(
+            &harness,
+            "dispatch",
+            serde_json::json!({ "task": "干活", "title": "标题" }),
+        )
+        .await;
+
+        let outcome = executor
+            .execute_round(vec![request], &harness.env(&session, &run))
+            .await
+            .unwrap();
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("没有接任务分发"),
+            "{}",
+            outcome.results[0].content
+        );
+    }
+
+    /// ⑥ 计划哈希覆盖任务正文：内容变了，绑在旧哈希上的审批不该覆盖到新的一次调用。
+    #[tokio::test]
+    async fn the_plan_hash_changes_when_the_task_text_changes() {
+        let harness = Harness::new();
+        let ctx = harness.tool_context(
+            &SessionId::from_raw("sess-1"),
+            &komo_kernel::types::ids::RunId::from_raw("run-1"),
+            &ToolCallId::from_raw("call-1"),
+        );
+        let tool = DispatchTool::new();
+        let a = tool
+            .prepare(
+                serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let b = tool
+            .prepare(
+                serde_json::json!({ "task": "查一下热水器状态", "title": "查空调" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_ne!(a.plan_hash(), b.plan_hash());
+    }
+}

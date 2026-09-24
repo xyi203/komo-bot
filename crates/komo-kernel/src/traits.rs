@@ -162,6 +162,20 @@ pub enum DeliverError {
     Other(String),
 }
 
+/// [`TaskSpawner`] 的失败：`dispatch` / `follow` 拿不到一个能交给模型的结论。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SpawnError {
+    /// 建任务会话或提交第一条输入没做成（store / 账本错误）。
+    #[error("{0}")]
+    Failed(String),
+    /// `follow` 的短号解析不到——不是这个 home 名下的任务，或者根本没有这个短号。
+    #[error("{0}")]
+    UnknownTask(String),
+    /// 短号在候选里不唯一：正文列出候选（延长到 6 位，§4.3）。
+    #[error("{0}")]
+    Ambiguous(String),
+}
+
 /// Dispatcher 的失败。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum GatewayError {
@@ -705,6 +719,46 @@ pub trait Tool: Send + Sync {
     }
 }
 
+// ---------------------------------------------------------------- 任务分发
+
+/// `dispatch` / `follow` 的接缝（`docs/home-dispatcher.md` §4.2）：把一个自包含任务派
+/// 进一条**独立的任务会话**，或者往已有的任务会话里再提交一句。
+///
+/// 工具只有 [`crate::types::tool::ToolContext`]，没有 Ledger 也没有 Gateway 句柄，
+/// `komo-runtime` 不依赖 Gateway——所以这条缝和 `delegate` 一样走**编排操作**
+/// （`Operation::Dispatch` / `Operation::Follow`）：executor 在放行之后调它，立即以
+/// 普通工具结果收尾，不等任务跑完（不返回 `RoundStop::Dependency`，与 `delegate` 的
+/// 最大差别）。
+///
+/// 生产实现是 Gateway 的 `GatewayTaskSpawner`（建会话、`GatewayState::submit`）；没有
+/// 装配它时（`ToolExecutor` 的这个槽是空的）两个操作按"这台 Gateway 没有接任务分发"
+/// 干净失败，不是一个悬着的调用。
+#[async_trait]
+pub trait TaskSpawner: Send + Sync {
+    /// 建一个任务会话并提交第一条输入。结果投给**派它的那条 Run 的来源渠道**
+    /// （`from` 的 `runs.peer`）。
+    ///
+    /// `request_key` 由调用方按 `dispatch:{run}:{call}` 拼好（§4.2 的幂等）：同一次
+    /// 调用重放时，它落到 [`crate::types::turn::AcceptInput::request_key`] 上，
+    /// 账本按请求键去重，所以重放拿回的是**同一个**任务会话，不会多建一个。
+    async fn spawn(
+        &self,
+        from: &crate::types::ids::RunId,
+        request_key: crate::types::ids::RequestKey,
+        spec: crate::types::task::TaskSpec,
+    ) -> Result<crate::types::task::TaskHandle, SpawnError>;
+
+    /// 往一个已有的任务会话里再提交一条输入。`task_id` 是任务短号（模型给的原文，
+    /// 解析在实现里做——只有 Gateway 查得到"这个 home 名下有哪些任务会话"）。
+    async fn follow(
+        &self,
+        from: &crate::types::ids::RunId,
+        request_key: crate::types::ids::RequestKey,
+        task_id: &str,
+        text: &str,
+    ) -> Result<crate::types::task::FollowOutcome, SpawnError>;
+}
+
 /// 同步、纯函数。授权在 [`PolicyContext`] 里传入，**不在内部查库**。
 ///
 /// 生产实现与测试实现是同一个：[`crate::policy::RuleTable`]（表驱动规则）——规则是
@@ -799,6 +853,7 @@ mod tests {
         assert_object_safe::<dyn EmbeddingClient>();
         assert_object_safe::<dyn PythonHost>();
         assert_object_safe::<dyn Tool>();
+        assert_object_safe::<dyn TaskSpawner>();
         assert_object_safe::<dyn Policy>();
         assert_object_safe::<dyn Channel>();
         assert_object_safe::<dyn Inbound>();

@@ -354,6 +354,8 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::MemoryChange => "记忆内部变更",
         Operation::PolicyChange => "修改权限 / Policy",
         Operation::Delegate { .. } => "派给子代理",
+        Operation::Dispatch { .. } => "派一个任务",
+        Operation::Follow { .. } => "追问一个任务",
     }
 }
 
@@ -369,6 +371,8 @@ fn operation_body(operation: &Operation) -> Option<String> {
             Some(target) => format!("接着子 Run {target}\n{}", spec.task),
             None => spec.task.clone(),
         }),
+        Operation::Dispatch { task, title } => Some(format!("{title}\n{task}")),
+        Operation::Follow { task_id, text } => Some(format!("#{task_id}\n{text}")),
         _ => None,
     }
 }

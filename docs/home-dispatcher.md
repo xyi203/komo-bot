@@ -95,26 +95,52 @@ home session（分发器）            一轮就结束：判断、派发、或�
 // komo-kernel/src/traits.rs（所有 trait 都在 kernel，AGENTS.md）
 #[async_trait]
 pub trait TaskSpawner: Send + Sync {
-    /// 建一个任务会话并提交第一条输入。结果投给 `origin`（父 Run 的来源渠道）。
-    async fn spawn(&self, from: &RunId, spec: TaskSpec) -> Result<TaskHandle, SpawnError>;
-    /// 往已有任务会话里再提交一条输入。
-    async fn follow(&self, from: &RunId, task: &SessionId, text: &str)
-        -> Result<FollowOutcome, SpawnError>;
+    /// 建一个任务会话并提交第一条输入。结果投给派它的那条 Run 的来源渠道
+    /// （`from` 的 `runs.peer`）。`request_key` 由 executor 按 `dispatch:{run}:{call}`
+    /// 拼好传进来——幂等键落到 `AcceptInput::request_key` 上，账本按它去重。
+    async fn spawn(
+        &self,
+        from: &RunId,
+        request_key: RequestKey,
+        spec: TaskSpec,
+    ) -> Result<TaskHandle, SpawnError>;
+    /// 往已有任务会话里再提交一条输入。`task_id` 是模型给的短号原文（不是已经解析出来
+    /// 的 `SessionId`）——只有 Gateway 查得到"这个 home 名下有哪些任务会话"，解析这一步
+    /// 因此在实现里做，不在 kernel/executor 这一侧。
+    async fn follow(
+        &self,
+        from: &RunId,
+        request_key: RequestKey,
+        task_id: &str,
+        text: &str,
+    ) -> Result<FollowOutcome, SpawnError>;
 }
 ```
 
-- `Operation::Dispatch { task, title }` / `Operation::Follow { task, text }` 进同一个决策
-  入口（§7.1），executor 在 `Operation::Delegate` 旁边分流，**授权之后**调 `TaskSpawner`，
-  立即以普通工具结果收尾（不返回 `Dependency`）。
-- Gateway 实现 `TaskSpawner`，复用已有原语：`SessionId::new_at` → `ledgers.open(&s, "task")`
-  → `ensure_owned_in(worker, Task)` → 写标题 → `GatewayState::submit(&s, key, task,
-  Some(origin_peer), None)`。`submit` 会按 `worker` 冻结身份，并挂上把结果投回
-  `origin_peer` 的 watcher（`run_watch.rs`）。`origin_peer` 读父 Run 的 `runs.peer`。
-- `request_key = "dispatch:{run}:{call}"`：重放同一次调用只建一个任务（§8.5 的幂等）。
-- Policy：两个操作在 strict / auto 下都 **Allow**——它们只是“开一个会话、提交一句话”，
+- `Operation::Dispatch { task, title }` / `Operation::Follow { task_id, text }` 进同一个
+  决策入口（§7.1），executor 在 `Operation::Delegate` 旁边分流，**授权之后**调
+  `TaskSpawner`，立即以普通工具结果收尾（不返回 `Dependency`）。
+- Gateway 实现 `TaskSpawner`（`crates/komo-gateway/src/service/tasks.rs`），复用已有原语：
+  `SessionId::new_at` → `session::ensure_owned(worker, Task)` → `ledgers.open(&s, "task:{home}")`
+  → `session::set_title_if_empty` → `GatewayState::submit(&s, key, task, Some(origin_peer),
+  None)`。`submit` 会按 `worker` 冻结身份，并挂上把结果投回 `origin_peer` 的 watcher
+  （`run_watch.rs`）。`origin_peer` 读父 Run 的 `runs.peer`，用 `ChannelPeer::parse`
+  （§8 Fix 1 加的那个反解）解回 `ChannelPeer`。
+- `request_key = "dispatch:{run}:{call}"` / `"follow:{run}:{call}"`：重放同一次调用只建
+  一个任务（§8.5 的幂等）——executor 侧不再区分"首次"与"续跑"两条分支：`spawn` /
+  `follow` 本身按请求键幂等，续跑（`start_call` 已经写过、还没写结果）时直接把结果落回
+  那次尝试，不重新授权、不重新 `start_call`。
+- Policy：两个操作在 strict / auto 下都 **Allow**——它们只是"开一个会话、提交一句话"，
   任务里的每一次调用照常各自过 Policy 与审批，不放宽任何一层。
-- 恢复：`recovery = VerifyTarget`，核对对象是账本（`request_key` 对应的 Run 在不在），
-  与 `delegate` 同类，不会出现“结果不明”。
+- 恢复：`recovery = VerifyTarget`，与 `delegate` 同类；`Operation::Dispatch` /
+  `Operation::Follow` 和 `Operation::Delegate` 一样在核对梯子之前就被分流，不会出现
+  "结果不明"。
+- `follow` 的短号解析不到 / 有歧义时，`TaskSpawner::follow` 返回
+  `SpawnError::UnknownTask` / `SpawnError::Ambiguous`，executor 按普通工具失败收尾
+  （`tool.started` + `tool.result: failed`）。这与 `delegate` 的 `resume` 校验不同——
+  `resume` 在 `prepare` 之后、`start_call` 之前就挡下去（§4），因为账本能在 kernel 侧
+  查到；短号要不要对应一个真的任务会话，只有 Gateway 的存储层答得出来，所以这一步放不
+  到 `start_call` 之前，是一次刻意的取舍。
 
 ### 4.3 任务短号
 

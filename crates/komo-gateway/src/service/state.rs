@@ -343,6 +343,10 @@ pub struct GatewayState {
     /// 执行器挂着的工具名。提示里的 skills 目录行按它门控（§5.6 的 `requires_tools:`），
     /// 而重载重算那一块时要用——那时执行器已经造好了，名字留在这里最省事。
     pub tool_names: Vec<String>,
+    /// 执行器本身。留一份具名的 `Arc`，只为了 [`Self::wire_task_spawner`]——`dispatch` /
+    /// `follow` 的接缝（`TaskSpawner`）要一份 `Arc<GatewayState>`，而执行器是在这份状态
+    /// 存在**之前**造出来的，只能在这里回头接上（`docs/home-dispatcher.md` §4.2）。
+    pub tool_executor: Arc<ToolExecutor>,
     /// §5.6 那份**活的** skill 注册表。与 [`GatewayState::segments`] 共用一个 `Arc`。
     ///
     /// 存的是注册表而不是渲染好的那一段文本：文本按用途现渲染（系统提示一处、`skill://`
@@ -629,10 +633,21 @@ impl GatewayState {
             watching: Mutex::new(std::collections::BTreeSet::new()),
             approvals_delivered: Mutex::new(std::collections::BTreeSet::new()),
             tool_names,
+            tool_executor: executor_tools,
             skills,
             max_retries,
             max_rounds,
         }))
+    }
+
+    /// 接上任务分发的实现（`docs/home-dispatcher.md` §4.2）：`GatewayTaskSpawner` 自己
+    /// 要一份 `Arc<GatewayState>`（建会话、`submit`），只能在这份状态造出来**之后**才能
+    /// 接上——与 `Dispatcher` / [`Self::inbound`] 同一个"先有整份状态才能自己引用自己"
+    /// 的接法。`service::start` 在 [`Self::assemble`] 返回之后、渠道与 HTTP 起来之前调它。
+    pub fn wire_task_spawner(self: &Arc<Self>) {
+        let spawner = super::tasks::GatewayTaskSpawner::new(Arc::clone(self))
+            as Arc<dyn komo_kernel::traits::TaskSpawner>;
+        self.tool_executor.set_spawner(spawner);
     }
 
     pub fn snapshot(&self) -> Arc<ConfigSnapshot> {

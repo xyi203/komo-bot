@@ -16,6 +16,7 @@ pub mod resource;
 pub mod status;
 pub mod surface;
 pub mod systemone;
+pub mod task;
 pub mod tool;
 pub mod turn;
 

@@ -393,6 +393,14 @@ fn plan_action(plan: &ExecutionPlan) -> String {
                 lines.push(format!("续跑: 接着子 Run {target}"));
             }
         }
+        Operation::Dispatch { task, title } => {
+            lines.push(format!("标题: {title}"));
+            lines.push(format!("任务: {task}"));
+        }
+        Operation::Follow { task_id, text } => {
+            lines.push(format!("任务: #{task_id}"));
+            lines.push(format!("追问: {text}"));
+        }
         _ => {}
     }
     if let Some(cwd) = &plan.cwd {
@@ -429,6 +437,8 @@ fn operation_label(operation: &Operation) -> &'static str {
         Operation::MemoryChange => "memory_change",
         Operation::PolicyChange => "policy_change",
         Operation::Delegate { .. } => "delegate",
+        Operation::Dispatch { .. } => "dispatch",
+        Operation::Follow { .. } => "follow",
     }
 }
 

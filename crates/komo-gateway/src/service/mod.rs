@@ -21,6 +21,7 @@ pub mod lifecycle;
 pub mod run_watch;
 pub mod segment;
 pub mod state;
+pub mod tasks;
 pub mod units;
 
 // W5 恢复故障注入验收（§14）要在集成测试里包一层故障账本，所以它也在 feature 后面。
@@ -193,6 +194,10 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     let _ = state
         .inbound
         .set(Arc::clone(&dispatcher) as Arc<dyn Inbound>);
+    // `dispatch` / `follow` 的接缝：`GatewayTaskSpawner` 自己要一份 `Arc<GatewayState>`
+    // （建会话、`submit`），与上面这行同一个"先有整份状态才能自己引用自己"的理由
+    // （`docs/home-dispatcher.md` §4.2）。
+    state.wire_task_spawner();
 
     // 5. 绑监听——发现文件里要写真实地址，所以端口必须先定下来。
     let listen = options
@@ -571,7 +576,9 @@ async fn build_tools(
     db: &komo_store::Db,
     clock: Arc<dyn Clock>,
 ) -> Vec<Arc<dyn Tool>> {
-    use komo_runtime::tools::{DelegateTool, EditTool, ReadTool, RgTool, ShellTool, WriteTool};
+    use komo_runtime::tools::{
+        DelegateTool, DispatchTool, EditTool, FollowTool, ReadTool, RgTool, ShellTool, WriteTool,
+    };
 
     let snapshot = config.current();
     let registry = Arc::new(komo_runtime::recovery::ChildRegistry::new(
@@ -595,6 +602,12 @@ async fn build_tools(
     // 每一次调用照常过 Policy 与审批。运行到它的那一步由 executor 接手（建子 Run、
     // 让本 Run 等它），工具本身没有 execute。
     tools.push(Arc::new(DelegateTool::new()));
+    // dispatch / follow：同一类编排操作，把需要工具的部分派给独立的任务会话
+    // （`docs/home-dispatcher.md` §4）。放行之后由 executor 调 `TaskSpawner`——没有
+    // 装配它时（`ToolExecutor::set_spawner` 没被叫过）两个操作按"这台 Gateway 没有接
+    // 任务分发"干净失败。
+    tools.push(Arc::new(DispatchTool::new()));
+    tools.push(Arc::new(FollowTool::new()));
 
     let toolbox = toolbox_of(&config.current());
     let python = python_env(config, &toolbox);

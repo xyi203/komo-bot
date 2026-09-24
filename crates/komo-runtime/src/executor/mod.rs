@@ -46,7 +46,8 @@ use komo_kernel::fold::fold;
 use komo_kernel::policy::PolicyDecision;
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
 use komo_kernel::traits::{
-    Clock, Ledger, LedgerError, RepoError, StoreError, Tool, ToolOutputStore,
+    Clock, Ledger, LedgerError, RepoError, SpawnError, StoreError, TaskSpawner, Tool,
+    ToolOutputStore,
 };
 use komo_kernel::types::chat::Principal;
 use komo_kernel::types::delegate::{
@@ -64,6 +65,7 @@ use komo_kernel::types::refs::{AttemptRef, ToolResultBody, ToolResultStatus};
 use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::status::{RunEnd, RunState, ToolCallState};
 use komo_kernel::types::surface::AgentSurface;
+use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskSpec};
 use komo_kernel::types::tool::{
     CancelToken, ResumedCall, ToolContext, ToolError, ToolOutput, WorkspaceRoot,
 };
@@ -267,6 +269,13 @@ pub struct ToolExecutor {
     policy: PolicyEngine,
     clock: Arc<dyn Clock>,
     limits: ExecutionLimits,
+    /// `dispatch` / `follow` 的接缝（`docs/home-dispatcher.md` §4.2）。它是
+    /// [`std::sync::OnceLock`] 而不是构造时就给的字段，理由与 `GatewayState::inbound`
+    /// 一样：Gateway 那份实现自己需要一份 `Arc<GatewayState>`（建会话、`submit`），而
+    /// 执行器要先造出来，`GatewayState` 才能存在——只能在那份状态造好之后再接上
+    /// （[`Self::set_spawner`]）。没有装配它时两个操作按"这台 Gateway 没有接任务
+    /// 分发"干净失败，不是一个悬着的调用。
+    spawner: std::sync::OnceLock<Arc<dyn TaskSpawner>>,
 }
 
 impl std::fmt::Debug for ToolExecutor {
@@ -298,12 +307,29 @@ impl ToolExecutor {
             policy,
             clock,
             limits: ExecutionLimits::default(),
+            spawner: std::sync::OnceLock::new(),
         }
     }
 
     pub fn with_limits(mut self, limits: ExecutionLimits) -> Self {
         self.limits = limits;
         self
+    }
+
+    /// 测试用的构造方式：装配时就给一个 spawner（生产走 [`Self::set_spawner`]，见
+    /// 该字段的文档）。
+    #[cfg(test)]
+    pub fn with_spawner(self, spawner: Arc<dyn TaskSpawner>) -> Self {
+        let _ = self.spawner.set(spawner);
+        self
+    }
+
+    /// 装好之后再接上任务分发的实现。只能设一次；重复设是装配错误，忽略并留一条日志
+    /// （不 panic：一次重复调用不该打断整台 Gateway 的启动）。
+    pub fn set_spawner(&self, spawner: Arc<dyn TaskSpawner>) {
+        if self.spawner.set(spawner).is_err() {
+            tracing::warn!("TaskSpawner 已经装配过一次，忽略这次重复设置");
+        }
     }
 
     /// 全局工具目录：**发现与构造**用它（`komo skills` 的 `requires_tools` 门控也问它）。
@@ -485,6 +511,20 @@ impl ToolExecutor {
         if let Operation::Delegate { spec } = &plan.operation {
             return self
                 .delegate(request, env, &plan, spec, request.resumed.clone())
+                .await;
+        }
+
+        // dispatch / follow 同样不走"工具执行"那条路，也不走核对梯子——但与 `delegate`
+        // 不同，它们**不等任何东西**：放行之后调一次 `TaskSpawner` 就立刻收尾
+        // （`docs/home-dispatcher.md` §4.2）。
+        if let Operation::Dispatch { task, title } = &plan.operation {
+            return self
+                .dispatch(request, env, &plan, task, title, request.resumed.clone())
+                .await;
+        }
+        if let Operation::Follow { task_id, text } = &plan.operation {
+            return self
+                .follow(request, env, &plan, task_id, text, request.resumed.clone())
                 .await;
         }
 
@@ -994,6 +1034,286 @@ impl ToolExecutor {
 
         let (body, content) = child_result(spec, child, &end);
         let is_error = body.status != ToolResultStatus::Completed;
+        self.settle_attempt(
+            AttemptRef {
+                session: env.session.clone(),
+                run: env.run.clone(),
+                call: request.call.clone(),
+                attempt,
+            },
+            body,
+        )
+        .await?;
+        Ok(CallSettlement::Result(ToolResultForModel {
+            provider_call_id: request.provider_call_id.clone(),
+            call_id: request.call.clone(),
+            content,
+            is_error,
+        }))
+    }
+
+    /// 一次 `dispatch` 的编排（`docs/home-dispatcher.md` §4.2）。
+    ///
+    /// 与 [`Self::delegate`] 同一个骨架（放行 → 受理 → 幂等重放拿回同一条），但**不等**
+    /// 任何东西：`TaskSpawner::spawn` 一返回就收尾——这正是 dispatch 存在的理由，等它跑完
+    /// 又会把 home 堵住（§1）。
+    ///
+    /// 幂等靠 `request_key = dispatch:{run}:{call}`：无论这是首次执行还是"上一世已经
+    /// `start_call` 过、这一世只是回来收口"的续跑，`spawner.spawn` 内部走的都是
+    /// `GatewayState::submit` 那条按请求键去重的路（§8.5），所以重放安全地拿回同一个
+    /// 任务会话，不会多派一条——不需要像 `delegate` 那样分两条分支各走一半。
+    async fn dispatch(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        plan: &ExecutionPlan,
+        task: &str,
+        title: &str,
+        resumed: Option<ResumedCall>,
+    ) -> Result<Begin, ExecError> {
+        let Some(spawner) = self.spawner.get().cloned() else {
+            return Ok(Begin::Settled(
+                self.fail_unstarted(
+                    request,
+                    env,
+                    "这台 Gateway 没有接任务分发（TaskSpawner 没有装配）".into(),
+                )
+                .await?,
+            ));
+        };
+        let request_key = RequestKey::new(format!("dispatch:{}:{}", env.run, request.call));
+        let spec = TaskSpec {
+            task: task.to_string(),
+            title: title.to_string(),
+        };
+
+        // 已经 `start_call` 过（上一世崩在"派出去"与"写结果"之间）：不重新授权、不重新
+        // `start_call`，直接把结果落回那次尝试上——`spawner.spawn` 本身按请求键幂等。
+        let in_flight = resumed
+            .as_ref()
+            .is_some_and(|state| !state.is_known_not_to_have_run());
+        if in_flight {
+            let Some(attempt) = resumed
+                .as_ref()
+                .and_then(|state| state.previous_attempt.clone())
+            else {
+                return Ok(Begin::Settled(self.attention(
+                    request,
+                    format!(
+                        "dispatch 调用 {} 已经开始过，但账上没有承载它的那次尝试",
+                        request.call
+                    ),
+                )));
+            };
+            let outcome = spawner.spawn(&env.run, request_key, spec).await;
+            return Ok(Begin::Settled(
+                self.settle_dispatch(request, env, attempt, outcome).await?,
+            ));
+        }
+
+        let intent = if resumed
+            .as_ref()
+            .is_some_and(ResumedCall::is_known_not_to_have_run)
+        {
+            ConsumeIntent::KnownNotToHaveRun
+        } else {
+            ConsumeIntent::First
+        };
+        let grant = match self.authorize(request, plan, env, intent).await? {
+            Authorization::Proceed { grant, .. } => grant,
+            Authorization::Refused(message) => {
+                return Ok(Begin::Settled(
+                    self.fail_unstarted(request, env, message).await?,
+                ));
+            }
+            Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
+            Authorization::Waiting(approval) => {
+                return Ok(Begin::Settled(CallSettlement::Stopped {
+                    stop: RoundStop::Approval {
+                        approval,
+                        call: request.call.clone(),
+                    },
+                    result: None,
+                }));
+            }
+        };
+
+        let attempt = self.ledger.start_call(&request.call, plan, grant).await?;
+        let outcome = spawner.spawn(&env.run, request_key, spec).await;
+        Ok(Begin::Settled(
+            self.settle_dispatch(request, env, attempt, outcome).await?,
+        ))
+    }
+
+    /// `dispatch` 的结论：`TaskHandle` 折成"已派出 #短号：标题"，`SpawnError` 折成一句
+    /// 失败原因。
+    async fn settle_dispatch(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        attempt: AttemptId,
+        outcome: Result<TaskHandle, SpawnError>,
+    ) -> Result<CallSettlement, ExecError> {
+        let (result, content, is_error) = match outcome {
+            Ok(handle) => {
+                let content = format!("已派出 #{}：{}", handle.short_id, handle.title);
+                (
+                    serde_json::json!({
+                        "session": handle.session.to_string(),
+                        "short_id": handle.short_id,
+                        "title": handle.title,
+                    }),
+                    content,
+                    false,
+                )
+            }
+            Err(error) => {
+                let content = format!("派任务失败：{error}");
+                (serde_json::json!({ "error": content }), content, true)
+            }
+        };
+        self.settle_orchestration(request, env, attempt, result, content, is_error)
+            .await
+    }
+
+    /// 一次 `follow` 的编排（`docs/home-dispatcher.md` §4.2）。骨架与 [`Self::dispatch`]
+    /// 完全一样，差别只在调 `TaskSpawner::follow`。
+    async fn follow(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        plan: &ExecutionPlan,
+        task_id: &str,
+        text: &str,
+        resumed: Option<ResumedCall>,
+    ) -> Result<Begin, ExecError> {
+        let Some(spawner) = self.spawner.get().cloned() else {
+            return Ok(Begin::Settled(
+                self.fail_unstarted(
+                    request,
+                    env,
+                    "这台 Gateway 没有接任务分发（TaskSpawner 没有装配）".into(),
+                )
+                .await?,
+            ));
+        };
+        let request_key = RequestKey::new(format!("follow:{}:{}", env.run, request.call));
+        let task_id = task_id.to_string();
+        let text = text.to_string();
+
+        let in_flight = resumed
+            .as_ref()
+            .is_some_and(|state| !state.is_known_not_to_have_run());
+        if in_flight {
+            let Some(attempt) = resumed
+                .as_ref()
+                .and_then(|state| state.previous_attempt.clone())
+            else {
+                return Ok(Begin::Settled(self.attention(
+                    request,
+                    format!(
+                        "follow 调用 {} 已经开始过，但账上没有承载它的那次尝试",
+                        request.call
+                    ),
+                )));
+            };
+            let outcome = spawner.follow(&env.run, request_key, &task_id, &text).await;
+            return Ok(Begin::Settled(
+                self.settle_follow(request, env, attempt, outcome).await?,
+            ));
+        }
+
+        let intent = if resumed
+            .as_ref()
+            .is_some_and(ResumedCall::is_known_not_to_have_run)
+        {
+            ConsumeIntent::KnownNotToHaveRun
+        } else {
+            ConsumeIntent::First
+        };
+        let grant = match self.authorize(request, plan, env, intent).await? {
+            Authorization::Proceed { grant, .. } => grant,
+            Authorization::Refused(message) => {
+                return Ok(Begin::Settled(
+                    self.fail_unstarted(request, env, message).await?,
+                ));
+            }
+            Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
+            Authorization::Waiting(approval) => {
+                return Ok(Begin::Settled(CallSettlement::Stopped {
+                    stop: RoundStop::Approval {
+                        approval,
+                        call: request.call.clone(),
+                    },
+                    result: None,
+                }));
+            }
+        };
+
+        let attempt = self.ledger.start_call(&request.call, plan, grant).await?;
+        let outcome = spawner.follow(&env.run, request_key, &task_id, &text).await;
+        Ok(Begin::Settled(
+            self.settle_follow(request, env, attempt, outcome).await?,
+        ))
+    }
+
+    /// `follow` 的结论：`FollowOutcome` 折成"已转给 #短号"（或"正在跑，排在后面"），
+    /// `SpawnError` 折成一句失败原因（短号解析不到 / 有歧义 / 提交失败）。
+    async fn settle_follow(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        attempt: AttemptId,
+        outcome: Result<FollowOutcome, SpawnError>,
+    ) -> Result<CallSettlement, ExecError> {
+        let (result, content, is_error) = match outcome {
+            Ok(followed) => {
+                let content = if followed.queued_behind {
+                    format!("#{} 正在跑，这句排在它后面", followed.short_id)
+                } else {
+                    format!("已转给 #{}", followed.short_id)
+                };
+                (
+                    serde_json::json!({
+                        "session": followed.session.to_string(),
+                        "short_id": followed.short_id,
+                        "queued_behind": followed.queued_behind,
+                    }),
+                    content,
+                    false,
+                )
+            }
+            Err(error) => {
+                let content = format!("转不过去：{error}");
+                (serde_json::json!({ "error": content }), content, true)
+            }
+        };
+        self.settle_orchestration(request, env, attempt, result, content, is_error)
+            .await
+    }
+
+    /// `dispatch` / `follow` 共用的收尾：给那次尝试写一条结果，交回模型一句话。
+    async fn settle_orchestration(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        attempt: AttemptId,
+        result: serde_json::Value,
+        content: String,
+        is_error: bool,
+    ) -> Result<CallSettlement, ExecError> {
+        let body = ToolResultBody {
+            status: if is_error {
+                ToolResultStatus::Failed
+            } else {
+                ToolResultStatus::Completed
+            },
+            result,
+            error: is_error.then(|| content.clone()),
+            exit_code: None,
+            artifacts: vec![],
+            preview: Some(content.clone()),
+        };
         self.settle_attempt(
             AttemptRef {
                 session: env.session.clone(),

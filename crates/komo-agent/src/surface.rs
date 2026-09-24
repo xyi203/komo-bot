@@ -11,6 +11,12 @@ use komo_kernel::types::surface::AgentSurface;
 /// `DelegateTool` 自报的名字一致——两处各写一个字面量迟早会漂。
 pub const DELEGATE_TOOL: &str = "delegate";
 
+/// `dispatch` / `follow`：home 分发器把需要工具的部分派给独立任务会话
+/// （`docs/home-dispatcher.md` §4）。与 `DELEGATE_TOOL` 同一个理由——注册与（将来的）
+/// 过滤两处共用同一个名字。
+pub const DISPATCH_TOOL: &str = "dispatch";
+pub const FOLLOW_TOOL: &str = "follow";
+
 /// 一份 Profile 在**这份工具目录**里挑出来的能力面。
 ///
 /// 目录里没有的名字**不算数**，而且必须报出来：静默采纳一份写错的配置，等于让操作者以为

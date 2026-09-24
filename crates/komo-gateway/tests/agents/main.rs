@@ -13,12 +13,16 @@
 //! 共用件在 `komo_gateway::service::test_support::harness`（真数据目录、真 `service::start`、
 //! 脚本化模型）。
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use komo_gateway::service::test_support::harness::{
-    DEFAULT_ENV, FakeLlm, Home, call_round, text_round, write_home_with,
+    DEFAULT_ENV, FakeLlm, Home, MemSender, call_round, inbound, text_round, write_home_with,
 };
-use komo_kernel::traits::LlmClient;
+use komo_kernel::protocol::InboundAck;
+use komo_kernel::traits::{Inbound, LlmClient, TurnDriver};
+use komo_kernel::types::chat::{ChannelPlatform, Outbound};
+use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{LlmError, Round, RoundInput, TurnRequest};
 
@@ -619,6 +623,315 @@ async fn a_home_run_in_flight_keeps_the_dispatcher_snapshot_across_a_mode_switch
         !fresh.system_prompt.contains("dispatcher 那一版身份"),
         "{}",
         fresh.system_prompt
+    );
+
+    gateway.stop().await;
+}
+
+// ---------------------------------------------------------------- dispatch / follow（docs/home-dispatcher.md §4、§9 Phase 2）
+
+/// `[home] mode = "dispatch"`：分发器的工具只有 `dispatch` / `follow`；任务会话用
+/// `worker` 身份跑。渠道是 Telegram（操作者 111，home chat 也是 111），DM 走真
+/// Dispatcher，不绕过它。
+fn dispatch_config() -> String {
+    r#"
+default_agent = "assistant"
+
+[agents.assistant]
+instructions = "你是助手（assistant 那一版身份）。"
+
+[agents.dispatcher]
+instructions = "你是分发器（dispatcher 那一版身份）：需要动手的事一律 dispatch，不要自己做；追问进行中或最近的任务用 follow。"
+tools = ["dispatch", "follow"]
+
+[agents.worker]
+instructions = "你是任务执行者（worker 那一版身份）：把交给你的事做完。"
+tools = ["read"]
+
+[home]
+mode = "dispatch"
+dispatcher = "dispatcher"
+worker = "worker"
+
+[channels.telegram]
+enabled = true
+allow_from = [111]
+home_chat = 111
+
+[model.main]
+type = "completion"
+api_backend = "responses"
+base_url = "https://llm.example.com/v1"
+model = "gpt-test"
+api_key_env = "KOMO_LLM_API_KEY"
+
+[models]
+default = "main"
+
+[memory]
+enabled = false
+"#
+    .to_string()
+}
+
+/// 脚本化的分发器 + worker，按**受理这一刻冻结的身份**（`request.system_prompt` 里的
+/// 那句标记）分流——这是唯一能区分"这一段是谁在跑"的信号，`begin_turn` 收到的就是
+/// 装配好的那份 `TurnRequest`。
+///
+/// 分发器每一段的第一轮都调工具，第二轮把工具结果原文说出来——分发器的指令本来就是
+/// "派出去就说已派出 #xxxx：标题，不要复述任务"（§6），这里用"原样念出工具结果"模拟
+/// 这句话，因为短号是运行时现生成的 UUID 尾巴，测试脚本没法提前写死。第一段调
+/// `dispatch`，第二段（`follow_task_id` 被测试设过之后）调 `follow`。
+///
+/// worker 不调任何工具，直接给一句收尾——用来证明它确实是以 worker 身份在跑，而不是
+/// 随便某个默认身份。
+struct DispatchScriptedLlm {
+    requests: Mutex<Vec<TurnRequest>>,
+    worker_reply: String,
+    dispatcher_segments: AtomicUsize,
+    follow_task_id: Mutex<Option<String>>,
+}
+
+impl DispatchScriptedLlm {
+    fn new(worker_reply: &str) -> Arc<Self> {
+        Arc::new(Self {
+            requests: Mutex::new(Vec::new()),
+            worker_reply: worker_reply.to_string(),
+            dispatcher_segments: AtomicUsize::new(0),
+            follow_task_id: Mutex::new(None),
+        })
+    }
+
+    fn set_follow_target(&self, short_id: &str) {
+        *self.follow_task_id.lock().expect("follow 目标") = Some(short_id.to_string());
+    }
+
+    fn request_with(&self, marker: &str) -> TurnRequest {
+        self.requests
+            .lock()
+            .expect("脚本模型")
+            .iter()
+            .find(|request| request.system_prompt.contains(marker))
+            .cloned()
+            .unwrap_or_else(|| panic!("没有哪一次请求的提示里带着 {marker}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for DispatchScriptedLlm {
+    async fn begin_turn(&self, req: TurnRequest) -> Result<Box<dyn TurnDriver>, LlmError> {
+        let is_dispatcher = req.system_prompt.contains("dispatcher 那一版身份");
+        self.requests.lock().expect("脚本模型").push(req);
+        if is_dispatcher {
+            let segment = self.dispatcher_segments.fetch_add(1, Ordering::SeqCst);
+            let follow_task_id = self.follow_task_id.lock().expect("follow 目标").clone();
+            Ok(Box::new(DispatcherDriver {
+                segment,
+                follow_task_id,
+            }))
+        } else {
+            Ok(Box::new(EchoOnceDriver {
+                text: self.worker_reply.clone(),
+            }))
+        }
+    }
+}
+
+struct DispatcherDriver {
+    /// 这是分发器的第几段：0 → 调 `dispatch`，其余 → 调 `follow`（目标短号由测试写进
+    /// `follow_task_id`）。
+    segment: usize,
+    follow_task_id: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl TurnDriver for DispatcherDriver {
+    async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
+        match input {
+            RoundInput::First if self.segment == 0 => call_round(
+                1,
+                "pc-dispatch",
+                "dispatch",
+                serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+            ),
+            RoundInput::First => {
+                let task_id = self
+                    .follow_task_id
+                    .clone()
+                    .expect("follow 目标短号该在发第二条消息之前写好");
+                call_round(
+                    1,
+                    "pc-follow",
+                    "follow",
+                    serde_json::json!({ "task_id": task_id, "text": "再看看功耗" }),
+                )
+            }
+            RoundInput::ToolResults { results } => {
+                let text = results
+                    .first()
+                    .map(|result| result.content.clone())
+                    .unwrap_or_default();
+                text_round(2, &text)
+            }
+        }
+    }
+
+    fn usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+}
+
+/// worker：不调工具，直接给一句收尾。
+struct EchoOnceDriver {
+    text: String,
+}
+
+#[async_trait::async_trait]
+impl TurnDriver for EchoOnceDriver {
+    async fn next(&mut self, _input: RoundInput) -> Result<Round, LlmError> {
+        text_round(1, &self.text)
+    }
+
+    fn usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+}
+
+/// 送到某个渠道对端的全部文本回复（`Outbound::Text`）。
+fn texts_to(sender: &MemSender, chat: &str) -> Vec<String> {
+    sender
+        .to_chat(chat)
+        .into_iter()
+        .filter_map(|message| match message.outbound {
+            Outbound::Text { text } => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 端到端：一条 Telegram DM → home Run 一轮调 `dispatch` 就收尾、把"已派出 #短号"回给
+/// 来源渠道 → 新任务会话以 `worker` 身份跑、`origin = task:{home}`、标题写死、结果投回
+/// **同一个**渠道对端 → 再发一条 `follow` 提交进同一个任务会话。
+#[tokio::test]
+async fn a_dm_dispatches_a_task_that_runs_as_worker_and_replies_to_the_same_channel() {
+    let home = Home::with_config(&dispatch_config());
+    let llm = DispatchScriptedLlm::new("空调已经关掉了。");
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    // ── 1. DM 派任务：home Run 一轮结束，不等任务跑完。
+    let ack = gateway
+        .dispatcher()
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "查一下空调状态",
+            "dm-1",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理入站消息");
+    let InboundAck::Queued {
+        session: home_session,
+        run: home_run,
+    } = ack
+    else {
+        panic!("{ack:?}")
+    };
+
+    let detail = gateway.wait_terminal(&home_run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert_eq!(
+        gateway
+            .state()
+            .agent_of_session(&home_session)
+            .await
+            .unwrap(),
+        "assistant",
+        "home session 的 agent_id 不因为 dispatch 模式而改变（§3）"
+    );
+
+    let delivered = texts_to(&sender, "111");
+    assert!(
+        delivered.iter().any(|text| text.starts_with("已派出 #")),
+        "home 一轮就该回一句已派出：{delivered:?}"
+    );
+
+    // ── 2. 新任务会话：kind = task、origin = task:{home}、agent_id = worker、标题写死。
+    let sessions = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表");
+    let task = sessions
+        .iter()
+        .find(|record| record.kind == komo_store::models::SessionKind::Task)
+        .unwrap_or_else(|| panic!("该有一条任务会话：{sessions:?}"));
+    assert_eq!(task.origin, format!("task:{home_session}"));
+    assert_eq!(task.agent_id, "worker");
+    assert_eq!(task.title, "查空调");
+
+    // ── 3. 它的 Run 用 worker 身份跑，结果投回同一个渠道对端。
+    let task_runs = komo_store::repos::runs::list_for_session(&gateway.state().db, &task.session)
+        .await
+        .expect("读得出任务会话的 Run");
+    assert_eq!(task_runs.len(), 1, "{task_runs:?}");
+    let task_run = task_runs[0].run.clone();
+    let done = gateway.wait_terminal(&task_run).await;
+    assert_eq!(done.summary.state, RunState::Completed, "{done:?}");
+
+    let worker_request = llm.request_with("worker 那一版身份");
+    assert_eq!(
+        worker_request
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["read"],
+        "任务会话用的是 worker 的能力面"
+    );
+
+    let delivered_after_task = texts_to(&sender, "111");
+    assert!(
+        delivered_after_task
+            .iter()
+            .any(|text| text == "空调已经关掉了。"),
+        "任务会话的结果要投回来源渠道：{delivered_after_task:?}"
+    );
+
+    // ── 4. follow：短号能再把一句话接进同一个任务会话。
+    let short = komo_kernel::types::task::short_id(&task.session);
+    llm.set_follow_target(&short);
+    let ack2 = gateway
+        .dispatcher()
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            &format!("#{short} 再看看功耗"),
+            "dm-2",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理入站消息");
+    let InboundAck::Queued {
+        run: home_run_2, ..
+    } = ack2
+    else {
+        panic!("{ack2:?}")
+    };
+    let detail2 = gateway.wait_terminal(&home_run_2).await;
+    assert_eq!(detail2.summary.state, RunState::Completed, "{detail2:?}");
+
+    let after_follow =
+        komo_store::repos::runs::list_for_session(&gateway.state().db, &task.session)
+            .await
+            .expect("读得出任务会话的 Run");
+    assert_eq!(
+        after_follow.len(),
+        2,
+        "follow 提交的是新的一条 Run，进的是同一个任务会话：{after_follow:?}"
     );
 
     gateway.stop().await;

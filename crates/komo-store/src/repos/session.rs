@@ -175,6 +175,38 @@ pub async fn ensure_owned_in(
     .map_err(map_toasty)
 }
 
+/// 同 [`ensure_owned_in`]，但给手里只有一个 [`Db`] 的调用方用（不带事务的入口）。
+///
+/// 任务会话（`SessionKind::Task`，`docs/home-dispatcher.md` §4.2）就是这样建的：
+/// Gateway 的 `TaskSpawner` 没有一个现成的事务可以插进去，走
+/// [`Db::with_write_retry`]，与显式事务里的那一份写法一致。
+pub async fn ensure_owned(
+    db: &Db,
+    session: &SessionId,
+    origin: &str,
+    jsonl_path: &str,
+    agent_id: &str,
+    kind: SessionKind,
+) -> Result<SessionRow, StoreError> {
+    let session = session.clone();
+    let origin = origin.to_string();
+    let jsonl_path = jsonl_path.to_string();
+    let agent_id = agent_id.to_string();
+    let now = OffsetDateTime::now_utc();
+    db.with_write_retry(move |ex| {
+        let (session, origin, jsonl_path, agent_id) = (
+            session.clone(),
+            origin.clone(),
+            jsonl_path.clone(),
+            agent_id.clone(),
+        );
+        Box::pin(async move {
+            ensure_owned_in(ex, &session, &origin, &jsonl_path, &agent_id, kind, now).await
+        }) as BoxFuture<'_, Result<SessionRow, StoreError>>
+    })
+    .await
+}
+
 /// 把一个还没有归属的会话认给一个 Agent。**只写一次**。
 ///
 /// 返回 `true` = 这次调用写进去了，`false` = 它已经有主（或者给的是空 `agent_id`：空串
@@ -609,6 +641,27 @@ pub async fn set_title_if_empty_in(
         .exec(ex)
         .await
         .map_err(map_toasty)
+}
+
+/// 同 [`set_title_if_empty_in`]（不带事务的入口）。
+///
+/// 任务会话建好、第一条输入提交**之前**要用它把 `title` 定死
+/// （`docs/home-dispatcher.md` §4.2）：`accept_input` 那条"首行当标题"的规则只填空的
+/// 会话，先写上就不会被它盖掉。
+pub async fn set_title_if_empty(
+    db: &Db,
+    session: &SessionId,
+    title: &str,
+) -> Result<(), StoreError> {
+    let session = session.clone();
+    let title = title.to_string();
+    let now = OffsetDateTime::now_utc();
+    db.with_write_retry(move |ex| {
+        let (session, title) = (session.clone(), title.clone());
+        Box::pin(async move { set_title_if_empty_in(ex, &session, &title, now).await })
+            as BoxFuture<'_, Result<(), StoreError>>
+    })
+    .await
 }
 
 /// 记一个 Session 的当前 Run。

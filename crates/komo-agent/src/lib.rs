@@ -17,4 +17,4 @@ pub mod context;
 pub mod skills;
 pub mod surface;
 
-pub use surface::{DELEGATE_TOOL, surface_of};
+pub use surface::{DELEGATE_TOOL, DISPATCH_TOOL, FOLLOW_TOOL, surface_of};

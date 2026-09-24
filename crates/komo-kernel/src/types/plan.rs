@@ -113,6 +113,18 @@ pub enum Operation {
     /// **整份 [`DelegateSpec`] 都在计划里**（含任务正文与结果契约）：计划是审批绑定的对象，
     /// 也是父 Run 续跑时手里唯一那份东西——它要拿同一份契约去复验子代理的结果（§8.6）。
     Delegate { spec: DelegateSpec },
+    /// 建一个**独立的任务会话**并提交第一条输入（`docs/home-dispatcher.md` §4）。
+    ///
+    /// 与 `Delegate` 同一类操作——不是第七个基础工具，模型看不见任何新能力，任务会话
+    /// 里的每一次调用照常过 Policy——但**不等它跑完**：executor 放行之后立刻收尾（不
+    /// 返回 `RoundStop::Dependency`），home 不会被一个慢任务堵住。`task` / `title` 都
+    /// 进计划：计划是审批绑定的对象（若有），也是幂等重放时唯一能对上的那份东西。
+    Dispatch { task: String, title: String },
+    /// 把一句话提交进一个**已有的**任务会话（`docs/home-dispatcher.md` §4）。
+    ///
+    /// `task_id` 是模型给的任务短号原文，解析成具体会话在执行侧做（只有 Gateway 查得到
+    /// "这个 home 名下有哪些任务会话"）。
+    Follow { task_id: String, text: String },
 }
 
 impl Operation {

@@ -96,6 +96,35 @@ impl Harness {
         self.executor(tools, PolicyEngine::initial())
     }
 
+    /// §7.1 那张初始建议表，外加一份 `TaskSpawner`——`dispatch` / `follow` 的验收要它
+    /// （`docs/home-dispatcher.md` §4.2）。
+    pub fn initial_with_spawner(
+        &self,
+        tools: Vec<Arc<dyn Tool>>,
+        spawner: Arc<dyn komo_kernel::traits::TaskSpawner>,
+    ) -> Arc<ToolExecutor> {
+        let executor = ToolExecutor::new(
+            tools.clone(),
+            self.ledger.clone(),
+            self.outputs.clone(),
+            self.gate.clone(),
+            PolicyEngine::initial(),
+            Arc::new(self.clock.clone()),
+        )
+        .with_limits(ExecutionLimits::default())
+        .with_spawner(spawner);
+        {
+            let mut surface = self.surface.lock().expect("能力面");
+            for tool in &tools {
+                let name = tool.definition().name;
+                if !surface.contains(&name) {
+                    surface.push(name);
+                }
+            }
+        }
+        Arc::new(executor)
+    }
+
     /// 全放行——测"执行本身"时不想被审批挡住。
     pub fn permissive(&self, tools: Vec<Arc<dyn Tool>>) -> Arc<ToolExecutor> {
         let mut table = RuleTable::empty();

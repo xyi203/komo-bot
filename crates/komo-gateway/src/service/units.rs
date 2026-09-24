@@ -6,11 +6,16 @@
 //!
 //! 「`status` 与 `stop` **不隐式启动服务**。」
 //!
-//! **单元里只有 `KOMO_HOME`，没有任何凭证。** `.env` 由 Gateway 自己读（§12），要用的
-//! 时候按名解析（`service::python_env` 的 `ToolboxSecrets`）。理由有三条，每一条单独
-//! 就够：launchd 没有 `EnvironmentFile` 的等价物，只能把值逐字抄进 plist；一旦抄进去，
+//! **单元里只有 `KOMO_HOME` 与 `PATH`，没有任何凭证。** `.env` 由 Gateway 自己读（§12），
+//! 要用的时候按名解析（`service::python_env` 的 `ToolboxSecrets`）。理由有三条，每一条
+//! 单独就够：launchd 没有 `EnvironmentFile` 的等价物，只能把值逐字抄进 plist；一旦抄进去，
 //! `.env` 的热重载就失效了，旧值活到下一次重装单元为止；而进了进程环境的东西，这台
 //! 机器上每一个子进程与每一条 `/proc/<pid>/environ` 都看得见。
+//!
+//! `PATH` 取自**写单元的那个进程**（操作者的 CLI），每次 start / restart 重写单元时随之
+//! 刷新。不写它，Gateway 与它起的每个 `shell` 子进程就只有服务管理器的默认
+//! `/usr/bin:/bin:/usr/sbin:/sbin`——2026-09-24 实测：会话里 `komo` 与 `rg` 都是
+//! `command not found`。`PATH` 不是凭证，上面三条理由不适用于它。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -73,8 +78,8 @@ pub fn installed_home(home_dir: &Path) -> Option<PathBuf> {
     // systemd：`Environment=KOMO_HOME=<path>`；launchd：`<key>KOMO_HOME</key><string><path></string>`。
     if let Some(rest) = text
         .lines()
-        .find_map(|line| line.trim().strip_prefix("Environment="))
-        .and_then(|vars| {
+        .filter_map(|line| line.trim().strip_prefix("Environment="))
+        .find_map(|vars| {
             vars.split_whitespace()
                 .find_map(|var| var.strip_prefix("KOMO_HOME="))
         })
@@ -139,8 +144,16 @@ pub fn unit_path(home_dir: &Path) -> PathBuf {
     }
 }
 
-/// 单元文件的正文。
-pub fn unit_text(manager: Manager, exe: &Path, komo_home: &Path, logs: &Path) -> String {
+/// 单元文件的正文。`path` 是写单元那个进程的 `PATH`；没有或为空就不写这一项，
+/// 不替它编一个默认值。
+pub fn unit_text(
+    manager: Manager,
+    exe: &Path,
+    komo_home: &Path,
+    logs: &Path,
+    path: Option<&str>,
+) -> String {
+    let path = path.filter(|value| !value.is_empty());
     match manager {
         Manager::Launchd => format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -154,9 +167,10 @@ pub fn unit_text(manager: Manager, exe: &Path, komo_home: &Path, logs: &Path) ->
     <string>gateway</string>
     <string>--foreground</string>
   </array>
-  <!-- 只有 KOMO_HOME。凭证在 {home}/.env，由 Gateway 自己读取，不进本文件。 -->
+  <!-- 只有 KOMO_HOME 与 PATH。凭证在 {home}/.env，由 Gateway 自己读取，不进本文件。
+       PATH 抄自写本文件的 CLI，shell 工具的子进程继承它；每次 start / restart 重写。 -->
   <key>EnvironmentVariables</key>
-  <dict><key>KOMO_HOME</key><string>{home}</string></dict>
+  <dict><key>KOMO_HOME</key><string>{home}</string>{path_entry}</dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>{logs}/gateway.out.log</string>
@@ -167,6 +181,9 @@ pub fn unit_text(manager: Manager, exe: &Path, komo_home: &Path, logs: &Path) ->
             exe = exe.display(),
             home = komo_home.display(),
             logs = logs.display(),
+            path_entry = path
+                .map(|value| format!("<key>PATH</key><string>{}</string>", xml_escape(value)))
+                .unwrap_or_default(),
         ),
         _ => format!(
             r#"[Unit]
@@ -175,9 +192,10 @@ After=network.target
 
 [Service]
 Type=simple
-# 只有 KOMO_HOME。凭证在 {home}/.env，由 Gateway 自己读取，不进本文件。
+# 只有 KOMO_HOME 与 PATH。凭证在 {home}/.env，由 Gateway 自己读取，不进本文件。
+# PATH 抄自写本文件的 CLI，shell 工具的子进程继承它；每次 start / restart 重写。
 Environment=KOMO_HOME={home}
-ExecStart={exe} gateway --foreground
+{path_line}ExecStart={exe} gateway --foreground
 Restart=on-failure
 RestartSec=3
 # 停机有界：`Running::stop` 自己的排空窗口是 10s，再久就是这个进程卡住了。systemd 默认
@@ -190,8 +208,35 @@ WantedBy=default.target
 "#,
             exe = exe.display(),
             home = komo_home.display(),
+            path_line = path
+                .map(|value| format!("Environment=\"PATH={}\"\n", systemd_quote(value)))
+                .unwrap_or_default(),
         ),
     }
+}
+
+/// plist 是 XML：`&` `<` `>` 要转义。
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// 放进 `Environment="…"` 的双引号里：`\` 与 `"` 是转义，`%` 是说明符（要写 `%%`），
+/// 换行会断开这一行。路径里的空格在引号里原样保留。
+fn systemd_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// 把单元文件写到用户目录。
@@ -214,11 +259,11 @@ pub fn install(home_dir: &Path, komo_home: &Path) -> Result<PathBuf, UnitError> 
             message: error.to_string(),
         })?;
     }
-    std::fs::write(&path, unit_text(manager, &exe, komo_home, &logs)).map_err(|error| {
-        UnitError::Write {
-            path: path.clone(),
-            message: error.to_string(),
-        }
+    let search_path = std::env::var("PATH").ok();
+    let text = unit_text(manager, &exe, komo_home, &logs, search_path.as_deref());
+    std::fs::write(&path, text).map_err(|error| UnitError::Write {
+        path: path.clone(),
+        message: error.to_string(),
     })?;
     Ok(path)
 }
@@ -323,6 +368,7 @@ mod tests {
             Path::new("/usr/local/bin/komo"),
             Path::new("/home/u/.komo"),
             Path::new("/home/u/.komo/logs"),
+            None,
         );
         assert!(
             text.contains("ExecStart=/usr/local/bin/komo gateway --foreground"),
@@ -350,6 +396,7 @@ mod tests {
                 Path::new("/usr/local/bin/komo"),
                 Path::new("/home/u/.komo"),
                 Path::new("/home/u/.komo/logs"),
+                Some("/usr/bin:/bin"),
             );
             for (name, value) in secrets {
                 assert!(
@@ -382,6 +429,7 @@ mod tests {
             Path::new("/usr/local/bin/komo"),
             Path::new("/Users/u/.komo"),
             Path::new("/Users/u/.komo/logs"),
+            None,
         );
         assert!(text.contains("<string>--foreground</string>"), "{text}");
         assert!(text.contains(LABEL), "{text}");
@@ -449,7 +497,13 @@ mod tests {
         for manager in [Manager::Systemd, Manager::Launchd] {
             std::fs::write(
                 &unit,
-                unit_text(manager, Path::new("/usr/local/bin/komo"), &served, &served),
+                unit_text(
+                    manager,
+                    Path::new("/usr/local/bin/komo"),
+                    &served,
+                    &served,
+                    Some("/opt/homebrew/bin:/usr/bin"),
+                ),
             )
             .unwrap();
             assert_eq!(
@@ -459,5 +513,84 @@ mod tests {
             );
         }
         assert_eq!(installed_home(&home.join("nope")), None, "没有单元文件");
+    }
+
+    /// 2026-09-24：单元只设 `KOMO_HOME` 时，shell 子进程只有服务管理器的默认 `PATH`，
+    /// `komo` / `rg` 都找不到。写单元的 CLI 的 `PATH` 要原样进单元。
+    #[test]
+    fn the_unit_carries_the_writers_path() {
+        let path = "/Users/u/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin";
+        let launchd = unit_text(
+            Manager::Launchd,
+            Path::new("/usr/local/bin/komo"),
+            Path::new("/Users/u/.komo"),
+            Path::new("/Users/u/.komo/logs"),
+            Some(path),
+        );
+        assert!(
+            launchd.contains(&format!("<key>PATH</key><string>{path}</string>")),
+            "{launchd}"
+        );
+        let systemd = unit_text(
+            Manager::Systemd,
+            Path::new("/usr/local/bin/komo"),
+            Path::new("/home/u/.komo"),
+            Path::new("/home/u/.komo/logs"),
+            Some(path),
+        );
+        assert!(
+            systemd.contains(&format!("Environment=\"PATH={path}\"\n")),
+            "{systemd}"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_empty_path_is_left_out_not_invented() {
+        for manager in [Manager::Systemd, Manager::Launchd] {
+            for path in [None, Some("")] {
+                let text = unit_text(
+                    manager,
+                    Path::new("/usr/local/bin/komo"),
+                    Path::new("/home/u/.komo"),
+                    Path::new("/home/u/.komo/logs"),
+                    path,
+                );
+                assert!(
+                    !text.contains("PATH=") && !text.contains("<key>PATH</key>"),
+                    "{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn path_values_are_escaped_for_each_format() {
+        let path = "/Users/u/My Tools/bin:/a&b<c>:/100%/x\\y\"z";
+        let launchd = unit_text(
+            Manager::Launchd,
+            Path::new("/usr/local/bin/komo"),
+            Path::new("/Users/u/.komo"),
+            Path::new("/Users/u/.komo/logs"),
+            Some(path),
+        );
+        assert!(
+            launchd.contains(
+                "<key>PATH</key><string>/Users/u/My Tools/bin:/a&amp;b&lt;c&gt;:/100%/x\\y\"z</string>"
+            ),
+            "{launchd}"
+        );
+        let systemd = unit_text(
+            Manager::Systemd,
+            Path::new("/usr/local/bin/komo"),
+            Path::new("/home/u/.komo"),
+            Path::new("/home/u/.komo/logs"),
+            Some(path),
+        );
+        assert!(
+            systemd.contains(
+                "Environment=\"PATH=/Users/u/My Tools/bin:/a&b<c>:/100%%/x\\\\y\\\"z\"\n"
+            ),
+            "{systemd}"
+        );
     }
 }

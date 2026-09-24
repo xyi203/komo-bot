@@ -936,3 +936,448 @@ async fn a_dm_dispatches_a_task_that_runs_as_worker_and_replies_to_the_same_chan
 
     gateway.stop().await;
 }
+
+// ---------------------------------------------------------------- 任务看板 / 确定性路由（docs/home-dispatcher.md §5、§7、§9 Phase 3）
+
+/// 同 [`dispatch_config`]，但 `worker` 多一个 `shell`——用来造一个卡在审批上的任务，
+/// 测看板里的等待原因，以及"任务还没跑完时分发器照样能答别的问题"。
+fn board_config() -> String {
+    dispatch_config().replace(
+        "[agents.worker]\ninstructions = \"你是任务执行者（worker 那一版身份）：把交给你的事做完。\"\ntools = [\"read\"]",
+        "[agents.worker]\ninstructions = \"你是任务执行者（worker 那一版身份）：把交给你的事做完。\"\ntools = [\"read\", \"shell\"]",
+    )
+}
+
+/// 同 [`dispatch_config`]，但 `[home] mode = \"session\"`——证明确定性路由只在 dispatch
+/// 模式下生效，会话模式一个字都不改（§7）。
+fn session_mode_config() -> String {
+    dispatch_config().replace("mode = \"dispatch\"", "mode = \"session\"")
+}
+
+/// 分发器 / worker 的脚本化模型（任务看板测试用）：
+/// - 分发器第 0 段：调 `dispatch`，把"查一下空调状态"派给 worker；
+/// - 分发器之后的段：不调工具，直接给一句收尾——用来读它的 `system_prompt`，断言任务
+///   看板长什么样；
+/// - worker 第 0 段：调一次 `shell`（默认规则要问，Run 停在审批上，这个测试组故意不
+///   批准它——看板与并发这两件事都不需要它跑完）；
+/// - worker 之后的段：直接收尾。
+struct BoardLlm {
+    requests: Mutex<Vec<TurnRequest>>,
+    dispatcher_segments: AtomicUsize,
+    worker_segments: AtomicUsize,
+    worker_reply: String,
+}
+
+impl BoardLlm {
+    fn new(worker_reply: &str) -> Arc<Self> {
+        Arc::new(Self {
+            requests: Mutex::new(Vec::new()),
+            dispatcher_segments: AtomicUsize::new(0),
+            worker_segments: AtomicUsize::new(0),
+            worker_reply: worker_reply.to_string(),
+        })
+    }
+
+    /// 分发器那几次请求里，`system_prompt` 带着 `needle` 的那一次。
+    fn dispatcher_request_containing(&self, needle: &str) -> TurnRequest {
+        self.requests
+            .lock()
+            .expect("脚本模型")
+            .iter()
+            .find(|request| {
+                request.system_prompt.contains("dispatcher 那一版身份")
+                    && request.system_prompt.contains(needle)
+            })
+            .cloned()
+            .unwrap_or_else(|| panic!("没有哪一次分发器请求的提示里带着 {needle}"))
+    }
+}
+
+#[async_trait::async_trait]
+impl LlmClient for BoardLlm {
+    async fn begin_turn(&self, req: TurnRequest) -> Result<Box<dyn TurnDriver>, LlmError> {
+        let is_dispatcher = req.system_prompt.contains("dispatcher 那一版身份");
+        self.requests.lock().expect("脚本模型").push(req);
+        if is_dispatcher {
+            let segment = self.dispatcher_segments.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(BoardDispatcherDriver { segment }))
+        } else {
+            let segment = self.worker_segments.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(BoardWorkerDriver {
+                segment,
+                reply: self.worker_reply.clone(),
+            }))
+        }
+    }
+}
+
+struct BoardDispatcherDriver {
+    segment: usize,
+}
+
+#[async_trait::async_trait]
+impl TurnDriver for BoardDispatcherDriver {
+    async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
+        match input {
+            RoundInput::First if self.segment == 0 => call_round(
+                1,
+                "pc-dispatch",
+                "dispatch",
+                serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+            ),
+            RoundInput::First => text_round(1, "看到了。"),
+            RoundInput::ToolResults { results } => {
+                let text = results
+                    .first()
+                    .map(|result| result.content.clone())
+                    .unwrap_or_default();
+                text_round(2, &text)
+            }
+        }
+    }
+
+    fn usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+}
+
+struct BoardWorkerDriver {
+    segment: usize,
+    reply: String,
+}
+
+#[async_trait::async_trait]
+impl TurnDriver for BoardWorkerDriver {
+    async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
+        match input {
+            RoundInput::First if self.segment == 0 => call_round(
+                1,
+                "pc-shell",
+                "shell",
+                serde_json::json!({ "command": "echo hi" }),
+            ),
+            RoundInput::First => text_round(1, &self.reply),
+            RoundInput::ToolResults { .. } => text_round(2, &self.reply),
+        }
+    }
+
+    fn usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+}
+
+/// (a) 一个任务停在审批上时，下一次分发器 Run 的系统提示里带着它的短号与等待原因
+/// （`docs/home-dispatcher.md` §5）。
+#[tokio::test]
+async fn the_board_shows_a_waiting_tasks_short_id_and_reason() {
+    let home = Home::with_config(&board_config());
+    let llm = BoardLlm::new("这个测试不会跑到这一句");
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    // 1. 派一个任务：home 一轮结束。
+    let ack = gateway
+        .dispatcher()
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "查一下空调状态",
+            "dm-1",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理入站消息");
+    let InboundAck::Queued { run: home_run, .. } = ack else {
+        panic!("{ack:?}")
+    };
+    gateway.wait_terminal(&home_run).await;
+
+    // 2. 任务会话的 Run 停在审批上。
+    let sessions = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表");
+    let task = sessions
+        .iter()
+        .find(|record| record.kind == komo_store::models::SessionKind::Task)
+        .unwrap_or_else(|| panic!("该有一条任务会话：{sessions:?}"))
+        .clone();
+    gateway.wait_approval().await;
+
+    // 3. 再发一句无关的话：新的分发器 Run 一轮就答完，不等任务。
+    let ack2 = gateway
+        .dispatcher()
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "现在怎么样了",
+            "dm-2",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理入站消息");
+    let InboundAck::Queued {
+        run: home_run_2, ..
+    } = ack2
+    else {
+        panic!("{ack2:?}")
+    };
+    let detail = gateway.wait_terminal(&home_run_2).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let short = komo_kernel::types::task::short_id(&task.session);
+    let request = llm.dispatcher_request_containing("等待审批");
+    assert!(
+        request.system_prompt.contains(&format!("#{short}")),
+        "看板里要带这个任务的短号：{}",
+        request.system_prompt
+    );
+    assert!(
+        request.system_prompt.contains("查空调"),
+        "看板里要带标题：{}",
+        request.system_prompt
+    );
+
+    gateway.stop().await;
+}
+
+/// (b) `#<短号> 正文` 的私聊直接进任务会话——不为它另起一个分发器 Run，回复投回同一个
+/// 渠道对端（`docs/home-dispatcher.md` §7）。
+#[tokio::test]
+async fn a_hash_short_id_dm_skips_the_dispatcher_and_goes_straight_to_the_task() {
+    let home = Home::with_config(&dispatch_config());
+    let llm = DispatchScriptedLlm::new("已经确认过了。");
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let ack = gateway
+        .dispatcher()
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "查一下空调状态",
+            "dm-1",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理入站消息");
+    let InboundAck::Queued {
+        session: home_session,
+        run: home_run,
+    } = ack
+    else {
+        panic!("{ack:?}")
+    };
+    gateway.wait_terminal(&home_run).await;
+
+    let sessions = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表");
+    let task = sessions
+        .iter()
+        .find(|record| record.kind == komo_store::models::SessionKind::Task)
+        .unwrap_or_else(|| panic!("该有一条任务会话：{sessions:?}"))
+        .clone();
+    let first_task_run =
+        komo_store::repos::runs::list_for_session(&gateway.state().db, &task.session)
+            .await
+            .expect("读得出任务会话的 Run")[0]
+            .run
+            .clone();
+    gateway.wait_terminal(&first_task_run).await;
+    let after_first = texts_to(&sender, "111")
+        .into_iter()
+        .filter(|text| text == "已经确认过了。")
+        .count();
+    assert_eq!(after_first, 1, "第一次任务结果投回来源渠道");
+
+    let home_runs_before =
+        komo_store::repos::runs::list_for_session(&gateway.state().db, &home_session)
+            .await
+            .expect("读得出 home 会话的 Run")
+            .len();
+    let dispatcher_segments_before = llm.dispatcher_segments.load(Ordering::SeqCst);
+
+    // `#短号 正文`：确定性路由直接进任务会话。
+    let short = komo_kernel::types::task::short_id(&task.session);
+    let ack2 = gateway
+        .dispatcher()
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            &format!("#{short} 再看看"),
+            "dm-2",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理入站消息");
+    let InboundAck::Queued {
+        session: routed_session,
+        run: follow_run,
+    } = ack2
+    else {
+        panic!("{ack2:?}")
+    };
+    assert_eq!(
+        routed_session, task.session,
+        "确定性路由直接进任务会话，不是 home（§7）"
+    );
+    gateway.wait_terminal(&follow_run).await;
+
+    // home 会话没有多出一条 Run——没有为它另起一个分发器 Run。
+    let home_runs_after =
+        komo_store::repos::runs::list_for_session(&gateway.state().db, &home_session)
+            .await
+            .expect("读得出 home 会话的 Run")
+            .len();
+    assert_eq!(
+        home_runs_after, home_runs_before,
+        "home 会话没有为这条 `#短号` 消息新起一个 Run"
+    );
+    assert_eq!(
+        llm.dispatcher_segments.load(Ordering::SeqCst),
+        dispatcher_segments_before,
+        "分发器的模型一次都没被多调用——确定性路由不经模型（§7）"
+    );
+
+    let after_follow = texts_to(&sender, "111")
+        .into_iter()
+        .filter(|text| text == "已经确认过了。")
+        .count();
+    assert_eq!(
+        after_follow, 2,
+        "第二次（follow 出来的）结果也投回了同一个渠道对端"
+    );
+
+    gateway.stop().await;
+}
+
+/// (c) 一句不需要工具就能答的话，在另一个任务卡在 shell 审批上时，分发器照样几秒内
+/// 答完——home Run 完成时任务的 Run 还没跑完，分发器没有等它
+/// （`docs/home-dispatcher.md` §1、§9 Phase 3 验收）。
+#[tokio::test]
+async fn the_dispatcher_answers_without_waiting_for_a_stuck_task() {
+    let home = Home::with_config(&board_config());
+    let llm = BoardLlm::new("这个测试不会跑到这一句");
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let ack = gateway
+        .dispatcher()
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "查一下空调状态",
+            "dm-1",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理入站消息");
+    let InboundAck::Queued { run: home_run, .. } = ack else {
+        panic!("{ack:?}")
+    };
+    gateway.wait_terminal(&home_run).await;
+
+    let sessions = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表");
+    let task = sessions
+        .iter()
+        .find(|record| record.kind == komo_store::models::SessionKind::Task)
+        .unwrap_or_else(|| panic!("该有一条任务会话：{sessions:?}"))
+        .clone();
+    gateway.wait_approval().await;
+    let task_run = komo_store::repos::runs::list_for_session(&gateway.state().db, &task.session)
+        .await
+        .expect("读得出任务会话的 Run")[0]
+        .run
+        .clone();
+    assert_eq!(
+        gateway.db_state(&task_run).await,
+        RunState::Waiting,
+        "任务卡在审批上"
+    );
+
+    // 一句不需要工具就能答的话：分发器一轮就答完，不等任务。
+    let ack2 = gateway
+        .dispatcher()
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "1+1 等于几",
+            "dm-2",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理入站消息");
+    let InboundAck::Queued {
+        run: home_run_2, ..
+    } = ack2
+    else {
+        panic!("{ack2:?}")
+    };
+    let detail = gateway.wait_terminal(&home_run_2).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    // 分发器答完的这一刻，任务还停在审批上——分发器没有等它。
+    assert_eq!(
+        gateway.db_state(&task_run).await,
+        RunState::Waiting,
+        "home 完成的时候任务还没跑完，分发器没有堵在它后面"
+    );
+
+    gateway.stop().await;
+}
+
+/// (d) 会话模式（`mode = "session"`）一个字都不改：`#abcd hello` 当普通文本提交给
+/// home（`docs/home-dispatcher.md` §7）。
+#[tokio::test]
+async fn a_hash_prefixed_dm_in_session_mode_is_plain_text() {
+    let home = Home::with_config(&session_mode_config());
+    let llm = FakeLlm::new(vec![vec![text_round(1, "好。")]]);
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let ack = gateway
+        .dispatcher()
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "#abcd hello",
+            "dm-1",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理入站消息");
+    let InboundAck::Queued { run, .. } = ack else {
+        panic!("{ack:?}")
+    };
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let request = request_of(&llm, "assistant 那一版身份");
+    assert!(
+        request
+            .messages
+            .iter()
+            .any(|message| message.text.as_deref() == Some("#abcd hello")),
+        "会话模式下 `#abcd hello` 就是普通文本，原样进对话：{:?}",
+        request.messages
+    );
+
+    gateway.stop().await;
+}

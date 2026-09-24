@@ -153,15 +153,40 @@ pub trait TaskSpawner: Send + Sync {
 
 ```text
 context_sources（Gateway，I/O）  查 home 名下的任务会话：kind = task、origin = task:{home}
-                                 → 进行中的全部 + 最近完成的 N 个（默认 10）
+                                 → 进行中的全部 + 最近完成的 N 个（默认 10、24 小时内）
                                  → 每条：短号、标题、状态、等待原因、最后一条回复的首行
 komo-agent（纯）                 ContextInput.tasks: Option<TaskBoard> → 渲染成系统提示里的一段
 ```
 
 - 渲染位置在 skills 之后、记忆之前（记忆仍在最后，保持前缀缓存，`docs/agent.md` §10）。
-- **可重建性**（`docs/agent.md` §9）：看板在这一段第一次装配时冻结成一份 payload，
-  引用写进这一段的检查点；续跑按引用读回。分发器一般一轮就结束，这条主要防“审批后续跑
-  看见另一份看板”。
+- **空看板也渲染一段**（落地决定，2026-09-24）：`## 任务看板\n（还没有任务）`，不是整段
+  消失——分发器由此知道“现在没有任何任务”，不必去猜是工具没接上还是真的没有。`tasks`
+  只在**这条 Run 用分发器 Profile 冻结**时才是 `Some`（哪怕是空看板）；其余会话恒
+  `None`，提示因此逐字不变（golden 不受影响）。
+- **状态/等待原因从 `runs` 表现读**（索引化的单行 / 按会话过滤读取），只有“最后一条回复
+  的首行”走 `Ledger::run_end`——它按 `final_event` 定位那条事件附近的一页并把外置正文
+  按引用读回来，不是 `http::sessions::summary_of` 那种“整段 JSONL fold 一遍”的读法
+  （`crates/komo-gateway/src/service/context_sources.rs` 的 `task_board`）。“最近完成”的
+  候选池先按会话 id（创建时间）截一批（`TASK_BOARD_RECENT_LIMIT * 5`），避免为一个用了
+  很久的 home 读遍它全部历史任务会话的 `runs` 表。
+- **可重建性**（`docs/agent.md` §9，落地决定，2026-09-24）：看板在**受理这一刻**（不是
+  “这一段第一次装配”）算好、序列化进 payload，冻结进 `RunSnapshot.dispatcher_tasks_ref`
+  ——与 `instructions_ref` 同一个字段、同一条理由（§4.3）：审批可能很久之后才答复，那时
+  任务会话的状态早就变了，恢复出来的 Run 不能因此看见另一份看板。是否要带看板（即“这条
+  Run 是不是分发器 Profile”）与 Profile 换成哪一份是**同一次判断**（`freeze_run` 里的
+  `is_dispatcher_run`），不是续跑时重新猜一遍 `is_home_session` + `[home] mode`——那样在
+  “校验通过之后配置又被改坏”的窗口里会算出两个不一致的答案，[home] mode 热重载也不该
+  改变一条已经在跑的 Run 看到的看板。
+  没有走**检查点**：`checkpoints` 表目前在生产代码里只有读（`recall_for` 读
+  `CheckpointStore::latest`），没有任何写者把 `CheckpointRecord` 落盘——`MemoryUse` 的
+  “记checkpoint”那条路本身还没接上。在这条基础设施补上之前，比照它验证不了“同一种机制”
+  是不是真的可靠；而分发器的两个工具（`dispatch` / `follow`）在 §4.2 定成**恒 Allow**，
+  从不产生审批等待，所以“审批很久之后才续跑、看到另一份看板”这个场景对分发器 Run 根本
+  不会发生——唯一会让同一条 Run 重新装配一次的路径是模型调用本身的可恢复重试
+  （`WaitReason::Retry`），这时候还没有任何工具调用被观察者依据旧看板做出决定，重新走
+  一次“受理时刻”的账（而不是“上一次装配”的账）已经足够。因此选**受理时冻结**而不是
+  “检查点”：机制更简单（复用已经在用、已经测过的 `RunAccepted.snapshot` + payload 引用
+  这条路），且不需要先把检查点的写路径补起来。
 - 任务会话的 origin 写成 `task:{home_session}`，看板查询只按它过滤，不需要新列。
 
 home 自己的回放窗口不变（`docs/agent.md` §8）：历史 Run 只留“用户说了什么 + 分发器最后答了
@@ -178,12 +203,53 @@ home 自己的回放窗口不变（`docs/agent.md` §8）：历史 Run 只留“
    看不到 home 的对话。
 5. 每次回复都短：派出去就说“已派出 #xxxx：标题”，不要复述任务。
 
+一份可以直接抄进 `config.toml` 的样例（`worker` 省略时会退回 `default_agent`，这里写全）：
+
+```toml
+default_agent = "assistant"
+
+[agents.assistant]
+instructions = "你是助手：先读，再答。"
+tools = ["read", "rg"]
+
+[agents.dispatcher]
+model        = "fast"                  # 便宜、低延迟的别名；具体选哪个见 §11 的待定项
+tools        = ["dispatch", "follow"]  # 没有 shell / read / python，动手的事一律派出去
+instructions = """
+你是 komo 的分发器：只做判断和派活，不自己动手。
+
+1. 需要读文件、跑命令、查设备、写东西的，一律用 dispatch 建一个新任务，不要自己做。
+2. 用户在追问某个进行中或刚完成的任务（任务看板里能看到），用 follow 接着那一条，不要
+   为同一件事另开一个任务。
+3. 闲聊、问"那个任务怎么样了"、不需要工具就能答的问题，直接答一两句，不要派任务。
+4. dispatch 的 task 参数要自包含：把用户的原话、以及任务看板里相关任务已经查到的结论都
+   写进去——任务会话看不到这段 home 对话，写漏了它就无从查起。
+5. 每次回复都短：派出去就说"已派出 #xxxx：标题"，不要复述任务内容，也不要猜任务多久
+   能跑完。
+"""
+
+[agents.worker]
+instructions = "你是任务执行者：把交给你的这一件事做完，查不到就如实说。"
+tools = ["read", "rg", "shell"]
+
+[home]
+mode       = "dispatch"
+dispatcher = "dispatcher"
+worker     = "worker"          # 省略则任务会话用 default_agent
+```
+
 ## 7. 确定性路由（不经模型）
 
-Dispatcher（`crates/komo-gateway/src/dispatcher.rs`）在 `submit` 之前先看：
+Dispatcher（`crates/komo-gateway/src/dispatcher.rs`）在 `submit` 之前先看（落地，2026-09-24）：
 
-- 文本以 `#3f2a ` 开头且短号能在看板里解析 → 直接 `follow`，不进分发器 Run。
-- 解析不到 → 照常交给分发器（它会看到看板，自己判断或问回去）。
+- 只在**私聊**（`msg.is_private`）且 `[home] mode = "dispatch"` 时生效；群聊、会话模式
+  一个字不改。
+- 文本以 `#3f2a `（4–6 位十六进制 + 空白 + 非空正文）开头 → 在这个 home 名下的任务会话里
+  按短号解析（`service::tasks::resolve_unique_task`，与 `follow` 共用同一份匹配
+  `candidates_for`，不能有第二种口径）；**唯一命中**才直接把去掉短号的正文
+  `state.submit()` 进那个任务会话，用消息的 `peer`，**不起分发器 Run**。
+- 解析不到 / 有歧义 → 一律落到正常提交（交给分发器，它会看到看板，自己判断或问回去）；
+  这一层不单独提示“有歧义”，那句话留给分发器自己接的 `follow`（模型侧的歧义提示，§4.2）。
 - 回复某条任务消息即追问（Telegram `reply_to_message`、飞书引用）需要“投递消息 id → 任务
   会话”的映射，属于后续阶段（§9 Phase 4）。
 
@@ -204,7 +270,7 @@ Dispatcher（`crates/komo-gateway/src/dispatcher.rs`）在 `submit` 之前先看
 | 0 | §8 两处修复 | 交互 Run 跑到一半重启 Gateway，完成后回复仍投到来源渠道，且只投一次；没有快照的 Run 在绑定了 `worker` 的会话里以 `worker` 身份跑 |
 | 1 | `[home]` 配置与校验、`freeze_run` 分流、`dispatcher` Profile。切换到分发器模式没有专门的 CLI 命令：用 `/new`（对话边界）另起一段，旧 home 历史保留可查、不再进上下文 | `mode = session` 时行为与现在逐字相同（沿用 context golden）；切到 `dispatch` 后 home 的新 Run 用分发器身份，工具只有两个 |
 | 2 | `TaskSpawner` 接缝、`Operation::Dispatch/Follow`、任务会话（`SessionKind::Task`、`origin = task:{home}`、标题）| 从 tg 发“查空调状态”：home Run 一轮收尾并回“已派出 #xxxx”；任务会话以 `worker` 身份跑，结果投回 tg；同一调用重放只建一个任务；任务里的审批投 tg + home chat |
-| 3 | 任务看板（context_sources 取数 + `komo-agent` 渲染 + 冻结）、`#短号` 确定性路由、`komo session list` 显示 kind / 所属 home | 一个 4 分钟的任务在跑时，从微信再发“1+1 等于几”几秒内得到回答；`#xxxx 再看看功耗` 不经模型进对应任务；看板里能看到进行中任务的等待原因 |
+| 3（已完成，2026-09-24） | 任务看板（context_sources 取数 + `komo-agent` 渲染 + 冻结）、`#短号` 确定性路由、`komo session list` 显示 kind / 所属 home | 一个 4 分钟的任务在跑时，从微信再发“1+1 等于几”几秒内得到回答；`#xxxx 再看看功耗` 不经模型进对应任务；看板里能看到进行中任务的等待原因 |
 | 4（后续）| 回复消息即追问；长任务进度提示（超过 N 秒回一句“还在查：……”）| — |
 
 ## 10. 不做的事
@@ -218,5 +284,14 @@ Dispatcher（`crates/komo-gateway/src/dispatcher.rs`）在 `submit` 之前先看
 ## 11. 待定
 
 - 分发器模型：需要一个低延迟、会用工具的别名；`config.toml` 里现有哪些别名适合，落地时实测一轮耗时再定。
-- 看板里“最近完成”的条数与保留时长（默认 10 条 / 24 小时）。
-- 任务会话多了之后 `komo session list` 是否默认隐藏已完成的任务会话（`--all` 才列）。
+- ~~看板里“最近完成”的条数与保留时长~~（Phase 3 落地，2026-09-24）：定为 10 条 / 24 小时，
+  暂不可配置——`TASK_BOARD_RECENT_LIMIT` / `task_board_recent_window()`
+  （`crates/komo-gateway/src/service/context_sources.rs`）。要做成可配置的话按
+  `[home]` 的口径加两个字段，属于后续小改动，不影响这次的边界。
+- ~~任务会话多了之后 `komo session list` 是否默认隐藏已完成的任务会话~~（Phase 3 落地，
+  2026-09-24）：**不隐藏**——`session list` 一贯的默认（§8.10）已经是“只藏逻辑删除过的”，
+  任务会话不因为“是任务”就多一层过滤；改用一个 `任务·#短号` 前缀标出哪些行是任务
+  （`crates/komo-client/src/render/mod.rs`），操作者用它跟看板对号。看板本身已经只挑
+  “进行中 + 最近 10 条”，长期堆积的旧任务会话不会出现在分发器的提示里，只会留在
+  `session list` 的完整清单中——如果这份清单将来因为任务多起来变得不好读，再单独做
+  `--all` 那道口子。

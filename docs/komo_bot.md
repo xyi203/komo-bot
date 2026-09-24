@@ -1687,10 +1687,14 @@ komo-runtime   agent loop、executor、tools/{read,write,edit,rg,shell,python}�
 
 komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次 1，2026-09-22 抽出）：
                Profile → 能力面选择（`surface_of`，目录里没有的名字不算数）、skills 发现与
-               目录行（`SkillRegistry`，§5.6）、编排操作名（`DELEGATE_TOOL`）。只描述"要做
-               什么"，不执行；值类型（`AgentProfile` / `AgentSurface` / `RunSnapshot`）留在
+               目录行（`SkillRegistry`，§5.6）、编排操作名（`DELEGATE_TOOL`）、上下文装配
+               （`context`：`ContextInput` → `AgentContext`，系统提示、回放、记忆段、
+               `docs/home-dispatcher.md` §9 Phase 3 的分发器任务看板）。只描述"要做什么"，
+               不执行；值类型（`AgentProfile` / `AgentSurface` / `RunSnapshot`）留在
                kernel（事件、协议与 store 模型按它们落盘，搬出来会把依赖指反）。
-               deps: kernel, serde_json, tracing。
+               deps: kernel, serde（`derive`，任务看板要在 komo-agent 自己 `#[derive(Serialize,
+               Deserialize)]`，Phase 3 新增；工作区已有，只是这个 crate 之前只用 serde_json），
+               serde_json, tracing。
 
 komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件、launchd/systemd 集成、
                Dispatcher、飞书 / Telegram / WeChat 渠道、Notifier 实现、deliveries、审批消息渲染。

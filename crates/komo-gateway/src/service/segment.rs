@@ -445,6 +445,15 @@ impl SegmentSource for GatewaySegments {
             None => context_sources::skill_catalog(self.skills.as_deref(), &tool_names),
         };
 
+        // 任务看板只有分发器 Run 才有（`docs/home-dispatcher.md` §5）：`identity.tasks`
+        // 已经在 `identity_for` 里按冻结快照的 `dispatcher_tasks_ref` 读回来了——分发器
+        // 从不委派（Profile 只有 `dispatch` / `follow` 两个工具），这里再挡一道子代理
+        // 只是防御性的（与 `skills` 同理，§12：能力隔离靠上游，不靠提示词）。
+        let tasks = match &delegate {
+            Some(_) => None,
+            None => identity.tasks.clone(),
+        };
+
         // history 的纯逻辑先选窗口（`komo-agent`），再对**选中的**条目读正文与
         // `output.json`（`context_sources`，§8）。
         let selected = history::entries(&surface, scope);
@@ -472,6 +481,7 @@ impl SegmentSource for GatewaySegments {
             history: resolved,
             memory: injection.text.clone(),
             skills,
+            tasks,
             invocation,
             model_result_bytes,
         });

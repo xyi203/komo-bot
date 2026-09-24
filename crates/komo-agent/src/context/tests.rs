@@ -14,6 +14,7 @@ fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput<'stat
         history: Vec::new(),
         memory: memory.map(str::to_string),
         skills: None,
+        tasks: None,
         invocation: InvocationContext::Main,
         model_result_bytes: 8 * 1024,
     }
@@ -74,4 +75,64 @@ fn no_memory_means_no_trailing_section() {
         "{}",
         context.system_prompt
     );
+}
+
+/// `tasks: None` 时不多一段——非分发器场景的提示逐字不变（golden 不受影响，
+/// `docs/home-dispatcher.md` §9 Phase 3）。
+#[test]
+fn no_tasks_means_no_board_section() {
+    let context = assemble(input(None, None));
+    assert!(
+        !context.system_prompt.contains("任务看板"),
+        "{}",
+        context.system_prompt
+    );
+}
+
+/// 任务看板排在 **skills 之后、memory 之前**（`docs/agent.md` §10、
+/// `docs/home-dispatcher.md` §5）。
+#[test]
+fn the_task_board_sits_between_skills_and_memory() {
+    use crate::skills::{OfferContext, SkillRegistry};
+    use tasks::{TaskBoard, TaskEntry, TaskState};
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("pr-review")).unwrap();
+    std::fs::write(
+        dir.path().join("pr-review").join("SKILL.md"),
+        "---\nname: pr-review\ndescription: 怎么审一个 PR\n---\n正文",
+    )
+    .unwrap();
+    let registry = SkillRegistry::new(vec![dir.path().to_path_buf()]);
+    let catalog = registry.offer(&OfferContext::here(["read".to_string()]));
+
+    let board = TaskBoard {
+        entries: vec![TaskEntry {
+            session: komo_kernel::types::ids::SessionId::from_raw(
+                "0190f000-aaaa-7000-8000-0000003f2a9c",
+            ),
+            title: "查空调状态".into(),
+            state: TaskState::Running,
+            last_reply: None,
+        }],
+    };
+
+    let context = assemble(ContextInput {
+        instructions: Some("你是 komo 的分发器。".into()),
+        workspace: PathBuf::from("/tmp/w"),
+        tools: vec!["dispatch".into(), "follow".into()],
+        history: Vec::new(),
+        memory: Some("[已知记忆]\n- 用户喜欢中文".into()),
+        skills: Some(catalog),
+        tasks: Some(board),
+        invocation: InvocationContext::Main,
+        model_result_bytes: 8 * 1024,
+    });
+
+    let prompt = &context.system_prompt;
+    let skills_at = prompt.find("Skills").expect("有 skills 目录");
+    let tasks_at = prompt.find("任务看板").expect("有任务看板");
+    let memory_at = prompt.find("已知记忆").expect("有记忆段");
+    assert!(skills_at < tasks_at, "{prompt}");
+    assert!(tasks_at < memory_at, "{prompt}");
 }

@@ -10,6 +10,7 @@
 pub mod history;
 pub mod memory;
 mod prompt;
+pub mod tasks;
 
 use std::path::PathBuf;
 
@@ -19,6 +20,7 @@ use komo_kernel::types::turn::ReplayMessage;
 pub use history::{
     Entry, EntryKind, ReplayScope, ResolvedMessage, StoredOutput, entries, latest_user_text,
 };
+pub use tasks::TaskBoard;
 
 use crate::skills::SkillCatalog;
 
@@ -41,6 +43,10 @@ pub struct ContextInput<'s> {
     pub memory: Option<String>,
     /// 已按 `OfferContext` 门控的 skills 目录；只有主 Agent 有。
     pub skills: Option<SkillCatalog>,
+    /// 分发器的任务看板（`docs/home-dispatcher.md` §5、§9 Phase 3）；`None` = 这一段不是
+    /// 分发器 Run，不渲染这一节——**其余场景的提示因此逐字不变**（golden 不动）。渲染
+    /// 位置在 [`assemble`] 里：skills 之后、memory 之前。
+    pub tasks: Option<TaskBoard>,
     pub invocation: InvocationContext,
     /// 工具结果投影的正文预算（`[execution] model_result_bytes`）。
     /// 与 `CallEnv` 用同一个值，否则"刚跑完"和"回放"渲染出来不一样。
@@ -67,7 +73,10 @@ pub struct AgentContext {
 /// 唯一的 Context Assembly 入口（`docs/agent.md` §5）。
 ///
 /// 顺序（§10）：Instructions（最前）→ Identity / Task / 工作目录 / 工具 / RULES → Skills
-/// （仅主 Agent）→ Result Contract（仅子代理）→ Memory（最后，`\n\n` + 正文）。
+/// （仅主 Agent）→ Result Contract（仅子代理）→ **任务看板**（仅分发器 Run，
+/// `docs/home-dispatcher.md` §5）→ Memory（最后，`\n\n` + 正文）。
+///
+/// `tasks: None` 时不多一段——非分发器场景的提示因此逐字不变（golden 不受影响）。
 pub fn assemble(input: ContextInput<'_>) -> AgentContext {
     let mut prompt = prompt::build(
         &input.workspace,
@@ -76,6 +85,10 @@ pub fn assemble(input: ContextInput<'_>) -> AgentContext {
         input.skills.as_ref(),
     );
     prompt = with_instructions(input.instructions.as_deref(), prompt);
+    if let Some(board) = &input.tasks {
+        prompt.push_str("\n\n");
+        prompt.push_str(&tasks::prompt_block(board));
+    }
     if let Some(memory) = &input.memory {
         prompt.push_str("\n\n");
         prompt.push_str(memory);

@@ -44,6 +44,8 @@ fn a_session_list_shows_status_and_title() {
                 applied_seq: Seq(9),
                 created_at: NOW,
                 updated_at: NOW,
+                kind: "normal".into(),
+                home: None,
             },
             SessionSummary {
                 session: SessionId::from_raw("sess-2"),
@@ -56,6 +58,8 @@ fn a_session_list_shows_status_and_title() {
                 applied_seq: Seq(0),
                 created_at: NOW,
                 updated_at: NOW,
+                kind: "normal".into(),
+                home: None,
             },
         ],
     };
@@ -74,6 +78,56 @@ fn a_session_list_shows_status_and_title() {
             "（无标题）",
         ],
     );
+}
+
+/// `komo session list`（`docs/home-dispatcher.md` §9 Phase 3）：任务会话在标题前带一个
+/// `任务·#短号` 标注，短号与看板 / `follow` 同一个口径；主 / 普通会话的输出一个字不变
+/// （不改变既有用户可见文本）。
+#[test]
+fn a_task_session_is_marked_with_its_short_id() {
+    let printed = session_list(
+        &SessionListResponse {
+            sessions: vec![
+                SessionSummary {
+                    session: SessionId::from_raw("0190f000-aaaa-7000-8000-0000003f2a9c"),
+                    title: "查空调状态".into(),
+                    state: SessionState::Active,
+                    workdir: None,
+                    current_run: None,
+                    current_state: None,
+                    current_wait: None,
+                    applied_seq: Seq(0),
+                    created_at: NOW,
+                    updated_at: NOW,
+                    kind: "task".into(),
+                    home: Some(SessionId::from_raw("sess-home")),
+                },
+                SessionSummary {
+                    session: SessionId::from_raw("sess-main"),
+                    title: "闲聊".into(),
+                    state: SessionState::Active,
+                    workdir: None,
+                    current_run: None,
+                    current_state: None,
+                    current_wait: None,
+                    applied_seq: Seq(0),
+                    created_at: NOW,
+                    updated_at: NOW,
+                    kind: "main".into(),
+                    home: None,
+                },
+            ],
+        },
+        NOW,
+    );
+    assert!(printed.contains("任务·#2a9c 查空调状态"), "{printed}");
+    // 主会话那一行不带任何标注——既有输出一个字不变。
+    let main_line = printed
+        .lines()
+        .find(|line| line.contains("sess-main"))
+        .expect("主会话那一行");
+    assert!(main_line.contains("闲聊"), "{main_line}");
+    assert!(!main_line.contains("任务·#"), "{main_line}");
 }
 
 /// §7.5：`Dependency` **不进**干预清单（等前一条 Run 不是"等人"），所以清单外的这一列
@@ -95,6 +149,8 @@ fn a_session_list_says_when_a_run_is_waiting_on_an_earlier_one() {
                 applied_seq: Seq(0),
                 created_at: NOW,
                 updated_at: NOW,
+                kind: "normal".into(),
+                home: None,
             }],
         },
         NOW,
@@ -117,6 +173,8 @@ fn a_session_list_marks_every_state_that_is_not_active() {
         applied_seq: Seq(0),
         created_at: NOW,
         updated_at: NOW,
+        kind: "normal".into(),
+        home: None,
     };
     let printed = session_list(
         &SessionListResponse {

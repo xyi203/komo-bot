@@ -133,10 +133,24 @@ pub struct SessionSummary {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// 会话用途：`main` / `normal` / `task`（`docs/home-dispatcher.md` §4.2、§9 Phase 3）。
+    /// 老客户端读到的是默认的 `"normal"`（这个字段之前不存在）。值镜像
+    /// `komo_store::models::SessionKind::as_str()` 的三个词——kernel 不依赖 store，这里
+    /// 就不定义那个枚举本身，只带它的字符串表示。
+    #[serde(default = "session_kind_default")]
+    pub kind: String,
+    /// 任务会话所属的 home（`kind == "task"` 才有值，`docs/home-dispatcher.md` §4.2）：
+    /// 从 `sessions.origin` 的 `task:{home}` 里解出来。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<SessionId>,
 }
 
 fn session_still_active() -> SessionState {
     SessionState::Active
+}
+
+fn session_kind_default() -> String {
+    "normal".to_string()
 }
 
 /// `GET /v1/sessions` 的 query。逻辑删除过的会话默认不列（§8.10）。

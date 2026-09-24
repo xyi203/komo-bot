@@ -295,6 +295,8 @@ pub async fn summary_of(api: &Api, session: &SessionId) -> Result<SessionSummary
         created_at: created,
         // 最后一条事件的时刻；没有事件就是创建时刻。
         updated_at: last_event_at(api, session).await.unwrap_or(created),
+        kind: record.kind.as_str().to_string(),
+        home: crate::service::tasks::home_of(&record.origin),
     })
 }
 

@@ -112,6 +112,12 @@ pub struct RunSnapshot {
     pub instructions_ref: Option<PayloadRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_scope: Option<MemoryScope>,
+    /// 分发器任务看板（`docs/home-dispatcher.md` §5、§9 Phase 3）：受理这一刻算好、序列化
+    /// 进 payload。`Some` = 这条 Run 用 `dispatcher` Profile 冻结；续跑原样读回这一份，
+    /// 不重新查一遍任务会话表——`[home] mode` 热重载不该改变一条已经在跑的 Run 看到的
+    /// 看板。`None` = 不是分发器 Run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatcher_tasks_ref: Option<PayloadRef>,
 }
 
 /// 配置里的一整套助手定义。

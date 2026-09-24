@@ -46,6 +46,7 @@ use crate::deliveries::DeliveryLog;
 use crate::notifier::HomeNotifier;
 use crate::sse::{EventHub, SharedHub};
 
+use super::context_sources;
 use super::ledgers::{RoutedLedger, RoutedOutputs, SessionLedgers};
 use super::segment::GatewaySegments;
 
@@ -976,6 +977,12 @@ impl GatewayState {
         // （`kind = main` 且 `origin = home`，读的是存下来的那一行，不是猜）在
         // `[home] mode = "dispatch"` 时，它的 Run 用 `dispatcher` Profile 冻结——
         // **会话的 `agent_id` 不改**，只是这一条 Run 的身份与能力换成分发器那一份。
+        //
+        // `is_dispatcher_run` 与 Profile 换成哪一份**同一次判断**：这条 Run 是不是要带
+        // 任务看板，看的正是这里真的换成了分发器 Profile，不是重新猜一遍
+        // `is_home_session` + `mode`（那样在"校验通过之后配置又被改坏"的窗口里会算出
+        // 两个不一致的答案）。
+        let mut is_dispatcher_run = false;
         let profile = if is_home_session(record) && config.home.mode == HomeMode::Dispatch {
             match config
                 .home
@@ -983,7 +990,10 @@ impl GatewayState {
                 .as_deref()
                 .and_then(|id| config.agent.get(id))
             {
-                Some(dispatcher) => dispatcher,
+                Some(dispatcher) => {
+                    is_dispatcher_run = true;
+                    dispatcher
+                }
                 None => {
                     // 校验本该挡住这种配置（`mode = "dispatch"` 必须有一个存在的
                     // `dispatcher`），这里只是防"校验通过之后又被改坏"的窗口——不让
@@ -1043,6 +1053,28 @@ impl GatewayState {
             None => None,
         };
 
+        // 任务看板（`docs/home-dispatcher.md` §5、§9 Phase 3）：**受理这一刻**算好、序列化
+        // 进 payload，冻结进这条 Run 的快照——与 `instructions_ref` 同一个理由（§4.3）：
+        // 审批可能很久之后才答复，那时任务会话的状态早就变了，恢复出来的 Run 不能因此
+        // 看见另一份看板。分发器一律走这条路受理（`submit` → `freeze_run`），所以不需要
+        // 区分"第一次装配"与"续跑"——这里就是唯一一次装配。
+        let dispatcher_tasks_ref = if is_dispatcher_run {
+            let board = context_sources::task_board(
+                &self.db,
+                self.routed.as_ref(),
+                session,
+                self.clock.now(),
+            )
+            .await?;
+            Some(
+                PayloadStore::new(self.ledgers.paths_for(session))
+                    .put_json(&board, Some("/dispatcher_tasks".into()))
+                    .await?,
+            )
+        } else {
+            None
+        };
+
         Ok(RunSnapshot {
             agent_id: profile.id.clone(),
             profile_revision: profile.revision(),
@@ -1051,6 +1083,7 @@ impl GatewayState {
             surface,
             instructions_ref,
             memory_scope: profile.memory_scope.clone(),
+            dispatcher_tasks_ref,
         })
     }
 

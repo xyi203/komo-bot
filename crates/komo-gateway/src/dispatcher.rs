@@ -24,6 +24,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use komo_kernel::protocol::config::HomeMode;
 use komo_kernel::protocol::http::{
     InterventionKind, InterventionListQuery, InterventionSummary, InterventionVerdict,
 };
@@ -528,6 +529,42 @@ impl Inbound for Dispatcher {
             }
         }
 
+        // ⑤.5 确定性路由，不经模型（`docs/home-dispatcher.md` §7）：home 分发模式下，
+        // 私聊文本以 `#3f2a ` 开头且短号能在这个 home 名下唯一解析，就直接转给那个任务
+        // 会话——**不起一个分发器 Run**。解析不到 / 有歧义就落到下面普通提交，交给分发器
+        // 自己判断或问回去。会话模式（`mode = "session"`）一个字都不改。
+        if msg.is_private
+            && self.state.snapshot().home.mode == HomeMode::Dispatch
+            && let Some((short_id, rest)) = parse_task_route(&msg.text)
+            && let Some(target) =
+                crate::service::tasks::resolve_unique_task(&self.state.db, &session, short_id)
+                    .await
+                    .map_err(GatewayError::from)?
+        {
+            let submitted = self
+                .state
+                .submit(
+                    &target,
+                    msg.request_key.clone(),
+                    rest.to_string(),
+                    Some(msg.peer.clone()),
+                    None,
+                )
+                .await?;
+            let ack = if submitted.deduplicated {
+                InboundAck::Duplicate {
+                    run: Some(submitted.run.clone()),
+                }
+            } else {
+                InboundAck::Queued {
+                    session: target,
+                    run: submitted.run.clone(),
+                }
+            };
+            self.remember(&msg.request_key, &ack);
+            return Ok(ack);
+        }
+
         // ⑥ 普通文本。
         let submitted = self
             .state
@@ -794,6 +831,26 @@ pub fn parse_command(text: &str) -> Option<ChatCommand> {
     }
 }
 
+/// `#3f2a 再看看`：home 分发模式下的确定性路由（`docs/home-dispatcher.md` §7）。
+///
+/// 短号是 4–6 位十六进制，后面必须有空白与非空正文；解析失败（不是这个形状）返回
+/// `None`，交给上层落到普通提交那条路——**这个函数只管语法**，短号解析不解析得出一个
+/// 真的任务会话是调用方的事（`tasks::resolve_unique_task`）。
+fn parse_task_route(text: &str) -> Option<(&str, &str)> {
+    let text = text.trim_start();
+    let rest = text.strip_prefix('#')?;
+    let end = rest.find(char::is_whitespace)?;
+    let (short_id, tail) = rest.split_at(end);
+    if !(4..=6).contains(&short_id.len()) || !short_id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let tail = tail.trim_start();
+    if tail.is_empty() {
+        return None;
+    }
+    Some((short_id, tail))
+}
+
 /// 一条入站消息的便捷构造（渠道与测试都用得上）。
 pub fn inbound(
     platform: ChannelPlatform,
@@ -912,5 +969,24 @@ mod tests {
     fn plain_text_is_not_a_command() {
         assert_eq!(parse_command("帮我看下这个仓库"), None);
         assert_eq!(parse_command("http://example.com/new"), None);
+    }
+
+    /// `#3f2a 正文`：4–6 位十六进制短号，后面要有空白与非空正文（§7）。
+    #[test]
+    fn a_task_route_needs_a_hex_short_id_and_trailing_text() {
+        assert_eq!(parse_task_route("#3f2a 再看看"), Some(("3f2a", "再看看")));
+        assert_eq!(
+            parse_task_route("  #91c0ab 查一下功耗  "),
+            Some(("91c0ab", "查一下功耗  "))
+        );
+        // 太短/太长/不是十六进制都不是短号。
+        assert_eq!(parse_task_route("#abc 正文"), None);
+        assert_eq!(parse_task_route("#1234567 正文"), None);
+        assert_eq!(parse_task_route("#zzzz 正文"), None);
+        // 没有空白、或者空白后面什么都没有：不是"短号 + 正文"的形状。
+        assert_eq!(parse_task_route("#3f2a"), None);
+        assert_eq!(parse_task_route("#3f2a   "), None);
+        assert_eq!(parse_task_route("3f2a 再看看"), None);
+        assert_eq!(parse_task_route("1+1 等于几"), None);
     }
 }

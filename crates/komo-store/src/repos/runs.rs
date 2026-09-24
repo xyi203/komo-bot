@@ -54,6 +54,10 @@ pub struct RunRecord {
     /// 记忆处理游标：这个 Run 的证据已经处理到哪条 seq（§9.3）。
     pub memory_cursor: Seq,
     pub last_error: Option<String>,
+    /// 进终态的时刻（`ended_at` 列的哨兵 `0` 读成 `None` = 还没到终态）。任务看板用它
+    /// 判断一个已完成的任务是不是还在"最近 N 小时"这个窗口里（`docs/home-dispatcher.md`
+    /// §5、§11）。
+    pub ended_at: Option<OffsetDateTime>,
 }
 
 impl RunRecord {
@@ -83,6 +87,7 @@ impl RunRecord {
             memory_work: decode(&format!("\"{}\"", row.memory_work), "runs.memory_work")?,
             memory_cursor: Seq(row.memory_cursor.max(0) as u64),
             last_error: row.last_error.clone(),
+            ended_at: crate::db::from_ts_opt(row.ended_at),
         })
     }
 }

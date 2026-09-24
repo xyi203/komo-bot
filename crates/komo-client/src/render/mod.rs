@@ -85,12 +85,30 @@ fn session_state(state: SessionState) -> &'static str {
 }
 
 fn session_title(session: &SessionSummary) -> String {
-    match (&session.title, &session.workdir) {
+    let title = match (&session.title, &session.workdir) {
         (title, Some(workdir)) if title.is_empty() => format!("（无标题） · {workdir}"),
         (title, Some(workdir)) => format!("{title} · {workdir}"),
         (title, None) if title.is_empty() => "（无标题）".into(),
         (title, None) => title.clone(),
+    };
+    match task_marker(session) {
+        Some(marker) => format!("{marker} {title}"),
+        None => title,
     }
+}
+
+/// 任务会话的短标注（`docs/home-dispatcher.md` §4.2、§9 Phase 3）：`任务·#3f2a`，
+/// `#3f2a` 是这条会话自己的短号——与分发器看板、`follow` 用的是同一个口径
+/// （`komo_kernel::types::task::short_id`），操作者能直接拿它对上看板里的那一行。
+///
+/// 只有 `kind == "task"` 的会话才有这个标注；`main` / `normal` 一个字都不多印
+/// （不改变现有输出，§ 约束）。
+fn task_marker(session: &SessionSummary) -> Option<String> {
+    if session.kind != "task" {
+        return None;
+    }
+    let short = komo_kernel::types::task::short_id(&session.session);
+    Some(format!("任务·#{short}"))
 }
 
 /// `komo run inspect RUN_ID`。

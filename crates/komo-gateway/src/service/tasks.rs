@@ -29,6 +29,46 @@ pub fn task_origin(home_session: &SessionId) -> String {
     format!("task:{home_session}")
 }
 
+/// [`task_origin`] 的反解：一个会话的 `origin` 是不是 `task:{home}` 的样子，是就给出
+/// `home`。`komo session list`（Phase 3 §6）与看板都用它。
+pub fn home_of(origin: &str) -> Option<SessionId> {
+    origin.strip_prefix("task:").map(SessionId::from_raw)
+}
+
+/// 同一个 home 名下、短号能匹配上 `task_id` 的任务会话（§4.3、§7）：`follow` 与
+/// `dispatcher.rs` 的 `#短号` 确定性路由**共用同一份解析**，不能有第二种口径。
+async fn candidates_for(
+    db: &komo_store::Db,
+    home_session: &SessionId,
+    task_id: &str,
+) -> Result<Vec<komo_store::repos::session::SessionRecord>, komo_kernel::traits::StoreError> {
+    let origin = task_origin(home_session);
+    let records = session::list(db, false).await?;
+    Ok(records
+        .into_iter()
+        .filter(|record| {
+            record.kind == SessionKind::Task
+                && record.origin == origin
+                && task::matches_short_id(&record.session, task_id)
+        })
+        .collect())
+}
+
+/// 确定性路由用的解析（`docs/home-dispatcher.md` §7）：唯一命中才给出会话，解析不到或
+/// 有歧义都是 `None`——那一层只关心"要不要跳过分发器"，歧义提示交给分发器自己去问。
+pub async fn resolve_unique_task(
+    db: &komo_store::Db,
+    home_session: &SessionId,
+    task_id: &str,
+) -> Result<Option<SessionId>, komo_kernel::traits::StoreError> {
+    let mut candidates = candidates_for(db, home_session, task_id).await?;
+    if candidates.len() == 1 {
+        Ok(Some(candidates.remove(0).session))
+    } else {
+        Ok(None)
+    }
+}
+
 pub struct GatewayTaskSpawner {
     state: Arc<GatewayState>,
 }
@@ -120,21 +160,12 @@ impl TaskSpawner for GatewayTaskSpawner {
         text: &str,
     ) -> Result<FollowOutcome, SpawnError> {
         let (home_session, origin_peer) = self.parent_of(from).await?;
-        let origin = task_origin(&home_session);
 
-        // 同一个 home 名下、还没被逻辑删除的任务会话；短号在这个集合里撞了才算歧义
-        // （§4.3）。全量的"进行中 + 最近 N 条"任务看板是 Phase 3 的事，这里只解析。
-        let records = session::list(&self.state.db, false)
+        // 同一个 home 名下按短号匹配的任务会话；短号在这个集合里撞了才算歧义（§4.3）。
+        // 与 `dispatcher.rs` 的 `#短号` 确定性路由共用同一份解析（[`candidates_for`]）。
+        let mut candidates = candidates_for(&self.state.db, &home_session, task_id)
             .await
             .map_err(|error| SpawnError::Failed(format!("任务会话列不出来：{error}")))?;
-        let mut candidates: Vec<_> = records
-            .into_iter()
-            .filter(|record| {
-                record.kind == SessionKind::Task
-                    && record.origin == origin
-                    && task::matches_short_id(&record.session, task_id)
-            })
-            .collect();
 
         if candidates.is_empty() {
             return Err(SpawnError::UnknownTask(format!(

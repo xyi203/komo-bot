@@ -87,9 +87,6 @@ pub struct GatewaySegments {
     /// 能力面已经由冻结快照（或它的兜底）给出，"这次能用哪些工具"的判据只有那一处，
     /// 这里不该再有一份。`None` = 精简装配（没有执行器的那几个单元测试）。
     executor: Option<Arc<ToolExecutor>>,
-    /// 正在跑的 komo 可执行文件：主 Agent 的提示里要告诉模型 komo 自己的状态用它查。
-    /// 构造时取一次，进程内不变（提示前缀稳定）。
-    komo_exe: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for GatewaySegments {
@@ -125,14 +122,7 @@ impl GatewaySegments {
             checkpoints: None,
             skills: None,
             executor: None,
-            komo_exe: None,
         }
-    }
-
-    /// 告诉模型 komo 自己的可执行文件在哪（`std::env::current_exe()`；取不到就不说）。
-    pub fn with_komo_exe(mut self, exe: Option<PathBuf>) -> Self {
-        self.komo_exe = exe;
-        self
     }
 
     /// 接上执行器：交回模型的工具 Schema 由它按能力面渲染（[`ToolExecutor::definitions_for`]）。
@@ -493,7 +483,6 @@ impl SegmentSource for GatewaySegments {
             skills,
             tasks,
             invocation,
-            komo_exe: self.komo_exe.clone(),
             model_result_bytes,
         });
 

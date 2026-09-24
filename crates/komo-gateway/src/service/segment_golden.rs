@@ -39,7 +39,6 @@ struct Case {
     instructions: Option<&'static str>,
     skills: Option<tempfile::TempDir>,
     memories: Vec<MemoryItem>,
-    komo_exe: Option<&'static str>,
 }
 
 impl Case {
@@ -54,7 +53,6 @@ impl Case {
             instructions: None,
             skills: None,
             memories: Vec::new(),
-            komo_exe: None,
         }
     }
 }
@@ -114,7 +112,6 @@ async fn render(case: &Case) -> String {
         skills,
         tasks: None,
         invocation,
-        komo_exe: case.komo_exe.map(std::path::PathBuf::from),
         model_result_bytes: case.model_result_bytes,
     });
     let prompt = context.system_prompt;
@@ -179,7 +176,6 @@ async fn golden_full_main_agent() {
     case.instructions = Some("  你是 coder。\n只改 Rust，不碰前端。\n");
     case.model_result_bytes = 96;
     case.skills = Some(skills_dir());
-    case.komo_exe = Some("/opt/komo/bin/komo");
     case.memories = vec![
         memory(
             "m-1",

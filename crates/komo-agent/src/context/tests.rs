@@ -16,7 +16,6 @@ fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput<'stat
         skills: None,
         tasks: None,
         invocation: InvocationContext::Main,
-        komo_exe: None,
         model_result_bytes: 8 * 1024,
     }
 }
@@ -127,7 +126,6 @@ fn the_task_board_sits_between_skills_and_memory() {
         skills: Some(catalog),
         tasks: Some(board),
         invocation: InvocationContext::Main,
-        komo_exe: None,
         model_result_bytes: 8 * 1024,
     });
 

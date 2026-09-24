@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use komo_kernel::policy::RuleTable;
-use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot};
+use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath};
 use time::OffsetDateTime;
 
 pub use effort::{EffortCapabilities, EffortProblem, EffortSupport};
@@ -77,7 +77,7 @@ pub fn load_config(options: &LoadOptions) -> Result<Loaded, ConfigError> {
         message: e.to_string(),
     })?;
 
-    let file = read_config(&sources.config)?;
+    let (file, unknown) = read_config(&sources.config)?;
     let policy = read_policy(&sources.policy)?;
 
     let snapshot = file::assemble(
@@ -89,10 +89,11 @@ pub fn load_config(options: &LoadOptions) -> Result<Loaded, ConfigError> {
         OffsetDateTime::now_utc(),
     )?;
 
-    let issues = validate_with(&snapshot, &options.caps);
+    let mut issues = validate_with(&snapshot, &options.caps);
     if has_errors(&issues) {
         return Err(ConfigError::Invalid { issues });
     }
+    issues.extend(unknown.iter().map(|key| unknown_key(key)));
 
     Ok(Loaded {
         snapshot: Arc::new(snapshot),
@@ -103,7 +104,17 @@ pub fn load_config(options: &LoadOptions) -> Result<Loaded, ConfigError> {
     })
 }
 
-fn read_config(path: &Path) -> Result<file::FileConfig, ConfigError> {
+/// 读 config.toml，连同**被忽略的键路径**一起返回。
+///
+/// 不认识的键不让加载失败：新旧版本之间多一个、少一个键是常态（升级后旧配置里留着已经
+/// 退役的键，或者先写好下一版才认识的键），为此整份配置装不上、连带聊天入口一起停摆，
+/// 代价远大于忽略一个键。但**忽略不等于沉默**：每个被忽略的键都变成一条警告，
+/// `komo config check` 与 `komo doctor` 都会列出来——拼错的键（或者写到了错误的表下面，
+/// 比如 `default_agent` 落进了前面那个 `[agents.x]`）照样看得见。
+///
+/// 键认识、值的类型不对仍然是解析错误：那种情况没有"忽略"这个安全的解释。policy.toml
+/// 不走这条路（见 [`read_policy`]）。
+fn read_config(path: &Path) -> Result<(file::FileConfig, Vec<String>), ConfigError> {
     if !path.exists() {
         return Err(ConfigError::Io {
             path: path.to_path_buf(),
@@ -114,14 +125,31 @@ fn read_config(path: &Path) -> Result<file::FileConfig, ConfigError> {
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
-    toml::from_str(&text).map_err(|e| ConfigError::Parse {
+    let parse_error = |e: toml::de::Error| ConfigError::Parse {
         file: path.to_path_buf(),
         message: e.to_string(),
-    })
+    };
+    let deserializer = toml::Deserializer::parse(&text).map_err(parse_error)?;
+    let mut unknown = Vec::new();
+    let file = serde_ignored::deserialize(deserializer, |key| unknown.push(key.to_string()))
+        .map_err(parse_error)?;
+    Ok((file, unknown))
+}
+
+/// 一个被忽略的键。只是警告：配置照常装上（§3）。
+fn unknown_key(key: &str) -> ConfigIssue {
+    ConfigIssue {
+        key: KeyPath::new(key),
+        severity: IssueSeverity::Warning,
+        message: "不认识这个键，已忽略（拼错了？或者写到了别的表下面？）".into(),
+    }
 }
 
 /// policy.toml 直接反序列化成 kernel 的 [`RuleTable`]——规则是**数据**（§7.1），所以
 /// 这里没有第二套形状。文件不在就用 §7.1 的初始建议。
+///
+/// 这里**仍然拒绝未知键**（与 config.toml 不同）：规则里拼错一个键被悄悄忽略，这条规则
+/// 就不再按操作者以为的样子生效——授权面上宁可装不上，也不要"看起来配了"。
 fn read_policy(path: &Path) -> Result<RuleTable, ConfigError> {
     if !path.exists() {
         return Ok(RuleTable::initial());

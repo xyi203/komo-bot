@@ -42,7 +42,6 @@ pub fn channel_credentials(platform: ChannelPlatform) -> &'static [&'static str]
 // ---------------------------------------------------------------- 文件形状
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct FileConfig {
     #[serde(default)]
     pub gateway: GatewaySection,
@@ -71,13 +70,11 @@ pub(super) struct FileConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct GatewaySection {
     pub listen: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct PathsSection {
     pub data_dir: Option<PathBuf>,
     pub db_path: Option<PathBuf>,
@@ -92,7 +89,6 @@ pub(super) struct PathsSection {
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct ModelProviderSection {
     pub base_url: Option<String>,
     #[serde(alias = "env_key")]
@@ -105,7 +101,6 @@ pub(super) struct ModelProviderSection {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct ModelSection {
     #[serde(rename = "type")]
     pub model_type: ModelType,
@@ -132,13 +127,11 @@ pub(super) struct ModelSection {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct ModelsSection {
     pub default: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct MemorySection {
     pub enabled: Option<bool>,
     pub model: Option<String>,
@@ -148,7 +141,6 @@ pub(super) struct MemorySection {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct ExecutionSection {
     pub model_result_bytes: Option<usize>,
 }
@@ -163,7 +155,6 @@ impl ExecutionSection {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct RetrievalSection {
     pub mode: Option<RetrievalMode>,
     pub candidate_limit: Option<u32>,
@@ -189,7 +180,6 @@ impl RetrievalSection {
 
 /// `[agents.<id>]`：一个助手的长期定义（§四）。键省着写——缺的就是"用默认"。
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct AgentSection {
     pub instructions: Option<String>,
     pub model: Option<String>,
@@ -227,7 +217,6 @@ impl AgentSection {
 /// `[home]`：home session 走今天的行为还是被分发器 Profile 冻结
 /// （`docs/home-dispatcher.md` §3、§9 Phase 1）。省略整段 = `mode = "session"`，不报错。
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct HomeSection {
     pub mode: Option<HomeMode>,
     pub dispatcher: Option<String>,
@@ -246,7 +235,6 @@ impl HomeSection {
 
 /// `[typesafe]`：可选的判断后端（§9.4）。键省着写——默认值都在 kernel 那边。
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct TypesafeSection {
     pub enabled: Option<bool>,
     pub endpoint: Option<String>,
@@ -269,7 +257,6 @@ impl TypesafeSection {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct ChannelsSection {
     #[serde(default)]
     pub feishu: ChannelSection,
@@ -280,7 +267,6 @@ pub(super) struct ChannelsSection {
 }
 
 #[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub(super) struct ChannelSection {
     #[serde(default)]
     pub enabled: bool,

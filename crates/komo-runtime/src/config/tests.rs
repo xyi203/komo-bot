@@ -312,19 +312,56 @@ fn a_malformed_channel_id_refuses_the_load() {
     assert_eq!(keys, vec!["channels.feishu.allow_from"]);
 }
 
+/// 不认识的键**不让加载失败**，但每一个都作为警告列出来（§3）：升级前后多一个、少一个键
+/// 是常态，为此整份配置装不上代价太大；可拼错的键也不能悄悄消失。
 #[test]
-fn an_unknown_key_is_a_parse_error_naming_the_file() {
+fn an_unknown_key_is_a_warning_naming_the_key() {
     let fixture = Fixture::valid();
     let mut text = Fixture::config_text("chat-a", "medium");
     text.push_str("\n[model_typo]\nprovider = \"x\"\n");
     write(&fixture.sources().config, &text);
 
+    let loaded = load_config(&fixture.options()).expect("未知键不挡加载");
+    let unknown: Vec<&ConfigIssue> = loaded
+        .issues
+        .iter()
+        .filter(|issue| issue.key.as_str() == "model_typo")
+        .collect();
+    assert_eq!(unknown.len(), 1, "{:?}", loaded.issues);
+    assert_eq!(unknown[0].severity, IssueSeverity::Warning);
+}
+
+/// 表里面的未知键报**完整路径**：`default_agent` 写在 `[agents.x]` 之后会被 TOML 收进那张
+/// 表，警告要能指出它落在了哪里。
+#[test]
+fn an_unknown_key_inside_a_table_is_reported_with_its_full_path() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[gateway]\nlisten_typo = \"127.0.0.1:1\"\n");
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).expect("未知键不挡加载");
+    assert!(
+        loaded
+            .issues
+            .iter()
+            .any(|issue| issue.key.as_str() == "gateway.listen_typo"
+                && issue.severity == IssueSeverity::Warning),
+        "{:?}",
+        loaded.issues
+    );
+}
+
+/// 键认识、值的类型不对仍然是解析错误：那种情况没有"忽略"这个安全的解释。
+#[test]
+fn a_known_key_with_the_wrong_type_still_refuses_the_load() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[execution]\nmodel_result_bytes = \"很多\"\n");
+    write(&fixture.sources().config, &text);
+
     let error = load_config(&fixture.options()).unwrap_err();
-    let ConfigError::Parse { file, message } = &error else {
-        panic!("{error:?}")
-    };
-    assert_eq!(file, &fixture.sources().config);
-    assert!(message.contains("model_typo"), "{message}");
+    assert!(matches!(error, ConfigError::Parse { .. }), "{error:?}");
 }
 
 #[test]

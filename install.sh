@@ -8,7 +8,7 @@
 set -euo pipefail
 
 REPO="${KOMO_REPO:-xyi203/komo-bot}"
-INSTALL_DIR="${KOMO_INSTALL_DIR:-/usr/local/bin}"
+INSTALL_DIR="${KOMO_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${KOMO_VERSION:-latest}"
 
 if [[ -n "${NO_COLOR:-}" ]]; then
@@ -35,7 +35,7 @@ usage() {
 例子：
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash
   curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- v0.8.0
-  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --prefix "\$HOME/.local/bin"
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --prefix /usr/local/bin
 
 环境变量：
   KOMO_REPO         GitHub 仓库，默认：${REPO}
@@ -156,7 +156,7 @@ sha256_file() {
     fi
 }
 
-# 装到 /usr/local/bin 这类目录时得 sudo；已经在目标目录里有写权限就不用。
+# `--prefix /usr/local/bin` 这类目录得 sudo；默认的 ~/.local/bin 与已有写权限的目录不用。
 needs_sudo() {
     if [[ -e "$INSTALL_DIR" ]]; then
         [[ ! -w "$INSTALL_DIR" ]]

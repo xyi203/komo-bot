@@ -13,6 +13,8 @@ Telegram / 微信三个聊天入口。
 curl -fsSL https://raw.githubusercontent.com/xyi203/komo-bot/main/install.sh | bash
 ```
 
+默认装到 `~/.local/bin/komo`（不用 sudo；`--prefix` 可改）。
+
 或者自己编（不需要 openssl-devel：微信渠道走 vendored rustls，见 [`docs/komo_bot.md`](docs/komo_bot.md) §13.4）：
 
 ```bash

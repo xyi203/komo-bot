@@ -276,7 +276,7 @@ async fn download(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()
         match error.kind() {
             std::io::ErrorKind::PermissionDenied => format!(
                 "写不进 {}：{error}——换二进制要往它旁边写临时文件。\
-                 装到你有写权限的目录（`install.sh --prefix ~/.local/bin`），或者用 sudo 跑这一条",
+                 装到你有写权限的目录（`install.sh` 默认就是 `~/.local/bin`），或者用 sudo 跑这一条",
                 dest.display()
             ),
             _ => format!("建不了 {}：{error}", dest.display()),

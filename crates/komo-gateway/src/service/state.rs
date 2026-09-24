@@ -569,7 +569,9 @@ impl GatewayState {
             .with_skills(Arc::clone(&skills))
             // 交给模型的 Schema 由执行器按这一次的能力面渲染（§4 末）：`definitions_for`
             // 与执行器查找工具用的是同一份实现与同一份目录。
-            .with_executor(Arc::clone(&executor_tools)),
+            .with_executor(Arc::clone(&executor_tools))
+            // 主 Agent 的提示里说 komo 自己的状态用哪个 komo 查：Gateway 进程就是它。
+            .with_komo_exe(std::env::current_exe().ok()),
         );
 
         let handler = Arc::new(AgentRunHandler::new(

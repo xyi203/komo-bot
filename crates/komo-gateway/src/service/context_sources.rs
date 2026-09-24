@@ -555,6 +555,7 @@ mod tests {
             skills: None,
             tasks: None,
             invocation: InvocationContext::Main,
+            komo_exe: None,
             model_result_bytes: 8 * 1024,
         }))
     }

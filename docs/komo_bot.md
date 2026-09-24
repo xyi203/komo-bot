@@ -382,6 +382,8 @@ Gateway 设置总轮数、活动执行时限、输出长度和子进程并发预
 
 普通追问可以作为 assistant 回复结束本轮；用户下一条输入开启同一 Session 的新 Run。工具审批则暂停原 Run，待决策后继续原调用，不增加第六个交互工具；决策通常来自聊天渠道（§11）。
 
+**系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的审批 / 介入、配置、skills、toolbox、Gateway 都是 komo 自己的状态，问到就用 shell 跑 komo CLI（给出几个常用子命令，其余看 `--help`），并给出**正在跑的 komo 可执行文件的绝对路径**——Gateway 构造 `GatewaySegments` 时取一次 `std::env::current_exe()`，经 `ContextInput.komo_exe` 递给 `komo-agent`（它不做 I/O），进程内不变，提示前缀因此稳定。只在主 Agent 且挂了 `shell` 时出现：子代理只拿任务里写的东西（与 skills 目录同理，父侧需要时把命令写进任务），分发器只有 `dispatch` / `follow`，说了也跑不了。起因是一次真实会话：问"当前有哪些 cron job"，模型不知道自己是 komo，先读了同名的共享 skill `cron-scheduler`，再翻 `crontab -l`、`/etc/cron.*`、`launchctl`、`~/.komo`，第 8 轮才跑到 `komo cron list`，9 轮 90 秒。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_the_given_exe`、`the_komo_section_needs_shell_and_the_main_agent`，golden `full_main_agent`。
+
 Run 完成仅表示本轮结束。测试是否通过、性能是否改善、设备是否到达目标状态，都要依据具体执行证据报告。
 
 ### 6.1 Agent、Session 与 Run：三种身份

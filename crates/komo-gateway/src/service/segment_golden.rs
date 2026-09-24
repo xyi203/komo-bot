@@ -39,6 +39,7 @@ struct Case {
     instructions: Option<&'static str>,
     skills: Option<tempfile::TempDir>,
     memories: Vec<MemoryItem>,
+    komo_exe: Option<&'static str>,
 }
 
 impl Case {
@@ -53,6 +54,7 @@ impl Case {
             instructions: None,
             skills: None,
             memories: Vec::new(),
+            komo_exe: None,
         }
     }
 }
@@ -112,6 +114,7 @@ async fn render(case: &Case) -> String {
         skills,
         tasks: None,
         invocation,
+        komo_exe: case.komo_exe.map(std::path::PathBuf::from),
         model_result_bytes: case.model_result_bytes,
     });
     let prompt = context.system_prompt;
@@ -167,7 +170,7 @@ async fn golden_main_agent_without_tools() {
     check("main_agent_without_tools", &render(&case).await);
 }
 
-/// 什么都有：身份指令、skills（其中一条被工具门控掉）、记忆、`/new` 之前的旧话、
+/// 什么都有：身份指令、komo 自查段、skills（其中一条被工具门控掉）、记忆、`/new` 之前的旧话、
 /// 历史 Run 的折叠、交错落盘、窗口外损坏的正文、外置的输入、截断的工具结果与产物、
 /// 读不回 `output.json` 时退回账本预览的失败结果。
 #[tokio::test]
@@ -176,6 +179,7 @@ async fn golden_full_main_agent() {
     case.instructions = Some("  你是 coder。\n只改 Rust，不碰前端。\n");
     case.model_result_bytes = 96;
     case.skills = Some(skills_dir());
+    case.komo_exe = Some("/opt/komo/bin/komo");
     case.memories = vec![
         memory(
             "m-1",

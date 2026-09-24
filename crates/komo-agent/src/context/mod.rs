@@ -48,6 +48,9 @@ pub struct ContextInput<'s> {
     /// 位置在 [`assemble`] 里：skills 之后、memory 之前。
     pub tasks: Option<TaskBoard>,
     pub invocation: InvocationContext,
+    /// 正在跑的 komo 可执行文件的绝对路径（Gateway 启动时取一次，进程内不变——提示前缀
+    /// 因此稳定）。只有主 Agent 且挂了 `shell` 时才进提示；`None` = 不说。
+    pub komo_exe: Option<PathBuf>,
     /// 工具结果投影的正文预算（`[execution] model_result_bytes`）。
     /// 与 `CallEnv` 用同一个值，否则"刚跑完"和"回放"渲染出来不一样。
     pub model_result_bytes: usize,
@@ -72,7 +75,8 @@ pub struct AgentContext {
 
 /// 唯一的 Context Assembly 入口（`docs/agent.md` §5）。
 ///
-/// 顺序（§10）：Instructions（最前）→ Identity / Task / 工作目录 / 工具 / RULES → Skills
+/// 顺序（§10）：Instructions（最前）→ Identity / Task / 工作目录 / 工具 / RULES → komo 自查
+/// （仅主 Agent 且挂了 `shell`）→ Skills
 /// （仅主 Agent）→ Result Contract（仅子代理）→ **任务看板**（仅分发器 Run，
 /// `docs/home-dispatcher.md` §5）→ Memory（最后，`\n\n` + 正文）。
 ///
@@ -83,6 +87,7 @@ pub fn assemble(input: ContextInput<'_>) -> AgentContext {
         &input.tools,
         &input.invocation,
         input.skills.as_ref(),
+        input.komo_exe.as_deref(),
     );
     prompt = with_instructions(input.instructions.as_deref(), prompt);
     if let Some(board) = &input.tasks {

@@ -60,6 +60,11 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 pub const DEFAULT_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 /// 预览里保留多少字节的匹配正文（开头那一段）。
 const PREVIEW_HEAD_BYTES: usize = 4096;
+/// 一行最多印多少列（`rg --max-columns`，带预览）：JSONL 事件一行动辄几十 KiB，
+/// 不截的话一行就能吃掉整份预算。
+const MAX_COLUMNS: u64 = 500;
+/// 超时后等搜索线程收手多久：它在下一次写入或下一个文件时就会停，这里只是不无限等。
+const STOP_GRACE: Duration = Duration::from_secs(1);
 /// 队列里一块多大、能排几块。块太小是每个匹配跳一次线程，太大则取消要等这一块写完。
 const CHUNK_BYTES: usize = 16 * 1024;
 const CHANNEL_DEPTH: usize = 4;
@@ -95,6 +100,9 @@ pub struct RgResult {
     pub matched: bool,
     #[serde(default)]
     pub output_truncated: bool,
+    /// 时限到了、树没走完：已写下的匹配照样交回，但这不是一次完整的搜索。
+    #[serde(default)]
+    pub timed_out: bool,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
     /// 读不了的目录或文件，最多 [`MAX_RECORDED_ERRORS`] 条。
@@ -295,19 +303,30 @@ impl Tool for RgTool {
         })
         .await;
 
-        match drained {
+        let timed_out = match drained {
             Err(_elapsed) => {
                 stop.store(true, Ordering::Relaxed);
-                return Err(ToolError::Timeout {
-                    after_secs: self.default_timeout.as_secs(),
-                });
+                true
             }
             Ok(Err(error)) => return Err(error),
-            Ok(Ok(())) => {}
-        }
-        let walked = walking.await.map_err(|error| ToolError::Failed {
-            message: format!("搜索线程没能收尾：{error}"),
-        })?;
+            Ok(Ok(())) => false,
+        };
+        // 关掉队列：线程若正卡在 `blocking_send` 上，这一下让它报错收手。
+        drop(rx);
+        let walked = match timed_out {
+            false => walking.await.map_err(|error| ToolError::Failed {
+                message: format!("搜索线程没能收尾：{error}"),
+            })?,
+            true => match tokio::time::timeout(STOP_GRACE, walking).await {
+                Ok(joined) => joined.map_err(|error| ToolError::Failed {
+                    message: format!("搜索线程没能收尾：{error}"),
+                })?,
+                Err(_elapsed) => SearchOutcome {
+                    matched: stdout_bytes > 0,
+                    ..SearchOutcome::default()
+                },
+            },
+        };
         // 搜索期间被取消：那一段的输出不作数（执行器的 race 通常已经先答了，这里是兜底）。
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
@@ -319,25 +338,30 @@ impl Tool for RgTool {
             glob: args.glob,
             matched: walked.matched,
             output_truncated: truncated,
+            timed_out,
             stdout_bytes,
             stderr_bytes,
             errors: walked.errors.clone(),
             error_count: walked.error_count,
         };
-        // 有读不了的东西 = 这次搜索不完整，和 `rg` 的退出码 2 是同一件事。
-        let status = if result.error_count == 0 {
+        // 有读不了的东西或没走完 = 这次搜索不完整，和 `rg` 的退出码 2 是同一件事。
+        let status = if result.error_count == 0 && !result.timed_out {
             ToolResultStatus::Completed
         } else {
             ToolResultStatus::Failed
         };
         let mut preview = format!(
-            "rg {}{} · {} · {}{} · 已写下 {}B{}\n",
+            "rg {}{} · {} · {}{}{} · 已写下 {}B{}\n",
             result.pattern,
             match &result.glob {
                 Some(glob) => format!(" --glob {glob}"),
                 None => String::new(),
             },
             result.path,
+            match result.timed_out {
+                true => format!("超时 {}s 未搜完 · ", self.default_timeout.as_secs_f64()),
+                false => String::new(),
+            },
             match result.error_count {
                 0 => String::new(),
                 count => format!("{count} 处读不了 · "),
@@ -495,8 +519,9 @@ impl io::Write for SharedWriter {
 
 impl io::Write for ChunkWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // 不能是 `Interrupted`：`write_all` 会把它当"再试一次"原地重试，线程就停不下来。
         if self.stop.load(Ordering::Relaxed) {
-            return Err(io::Error::new(io::ErrorKind::Interrupted, "搜索已停止"));
+            return Err(io::Error::other("搜索已停止"));
         }
         self.buf.extend_from_slice(bytes);
         if self.buf.len() >= CHUNK_BYTES {
@@ -589,6 +614,8 @@ fn search(job: &SearchJob, tx: &mpsc::Sender<Chunk>) -> SearchOutcome {
         // 每个匹配一行、带路径与行号，颜色永远不开：`rg --no-heading --line-number --color=never`。
         .heading(false)
         .path(true)
+        .max_columns(Some(MAX_COLUMNS))
+        .max_columns_preview(true)
         .build_no_color(SharedWriter(Rc::clone(&writer)));
 
     let mut search_one = |path: &Path, outcome: &mut SearchOutcome| {
@@ -1088,6 +1115,130 @@ mod tests {
             result.stdout_bytes
         );
         assert!(printed.contains("输出已截断"), "{printed}");
+    }
+
+    /// 匹配多到要分好几块送：上限在第一块就满了，搜索线程随后的写入被拒。那一下拒绝曾经
+    /// 用的是 `Interrupted`，而 `write_all` 碰到它会**原地重试**——线程空转、队列不关，
+    /// 这次调用只能等满时限，拿回一句"超时"（真实会话里 8 MiB 写满之后跑到 30s）。
+    #[tokio::test]
+    async fn hitting_the_output_limit_mid_search_returns_promptly_with_what_was_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = "foo match\n".repeat(20_000);
+        std::fs::write(dir.path().join("many.txt"), &line).unwrap();
+        std::fs::write(dir.path().join("more.txt"), &line).unwrap();
+        let tool = RgTool::new().with_limits(Duration::from_secs(5), 1024);
+        let started = std::time::Instant::now();
+        let (output, printed) =
+            run(&tool, dir.path(), serde_json::json!({ "pattern": "foo" })).await;
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "上限满了就该停：{:?}",
+            started.elapsed()
+        );
+        assert_eq!(output.status, ToolResultStatus::Completed);
+        let result = rg_result(&output);
+        assert!(result.output_truncated, "{printed}");
+        assert!(!result.timed_out);
+        assert_eq!(result.stdout_bytes, 1024);
+        assert!(printed.contains("many.txt:1:foo match"), "{printed}");
+    }
+
+    /// 一行 JSONL 事件动辄几十 KiB：一行不能吃掉整份预算，按 `rg --max-columns` 截成开头一段。
+    #[tokio::test]
+    async fn a_very_long_matching_line_is_cut_to_a_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let long = format!(
+            "{{\"type\":\"cron\",\"data\":\"{}\"}}\n",
+            "x".repeat(100_000)
+        );
+        std::fs::write(
+            dir.path().join("events.jsonl"),
+            format!("{long}short cron\n"),
+        )
+        .unwrap();
+        let (output, printed) = run(
+            &RgTool::new(),
+            dir.path(),
+            serde_json::json!({ "pattern": "cron" }),
+        )
+        .await;
+
+        let result = rg_result(&output);
+        assert!(
+            result.stdout_bytes < (MAX_COLUMNS as u64) * 2,
+            "长行没被截：写下 {} 字节",
+            result.stdout_bytes
+        );
+        assert!(
+            printed.contains("events.jsonl:1:{\"type\":\"cron\""),
+            "截断保留开头：{printed}"
+        );
+        assert!(printed.contains("omitted"), "说出被截了：{printed}");
+        assert!(
+            printed.contains("events.jsonl:2:short cron"),
+            "短行照常：{printed}"
+        );
+    }
+
+    /// 写得慢的输出存储：每一块都要等一会儿，搜索因此走不完时限。
+    struct SlowWriter(komo_kernel::test_support::MemOutputWriter);
+
+    #[async_trait]
+    impl OutputWriter for SlowWriter {
+        async fn write_stdout(
+            &mut self,
+            chunk: &[u8],
+        ) -> Result<(), komo_kernel::traits::StoreError> {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            self.0.write_stdout(chunk).await
+        }
+
+        async fn write_stderr(
+            &mut self,
+            chunk: &[u8],
+        ) -> Result<(), komo_kernel::traits::StoreError> {
+            self.0.write_stderr(chunk).await
+        }
+
+        fn attempt(&self) -> &komo_kernel::types::refs::AttemptRef {
+            self.0.attempt()
+        }
+
+        fn bytes_written(&self) -> u64 {
+            self.0.bytes_written()
+        }
+    }
+
+    /// 时限到了，已经找到的不扔：结果带着那部分匹配、标明超时未搜完，而不是一句光秃秃的"超时"。
+    #[tokio::test]
+    async fn a_timeout_returns_what_was_found_so_far_marked_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("many.txt"), "foo match\n".repeat(50_000)).unwrap();
+        let ctx = context(dir.path());
+        let mut sink = SlowWriter(writer(&ctx));
+        let tool = RgTool::new().with_limits(Duration::from_millis(350), DEFAULT_OUTPUT_LIMIT);
+        let plan = tool
+            .prepare(serde_json::json!({ "pattern": "foo" }), &ctx)
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(output.status, ToolResultStatus::Failed, "没搜完就不是完成");
+        let result = rg_result(&output);
+        assert!(result.timed_out);
+        assert!(result.matched);
+        assert!(result.stdout_bytes > 0);
+        assert_eq!(result.stdout_bytes, sink.0.stdout.len() as u64);
+        let printed = preview(&output);
+        assert!(printed.contains("超时"), "{printed}");
+        assert!(printed.contains("many.txt:1:foo match"), "{printed}");
     }
 
     #[tokio::test]

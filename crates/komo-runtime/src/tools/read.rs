@@ -627,9 +627,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             plan.targets[0].describe(),
+            // 规划按真实路径判范围：macOS 的临时目录在 `/var` 软链下，真身是 `/private/var`。
             format!(
                 "artifact://{run}/{call}/{attempt}/result（{}）",
-                path.display()
+                path.canonicalize().unwrap().display()
             )
         );
         let result = read_result(

@@ -55,11 +55,16 @@ async fn the_system_prompt_lists_the_skills_the_model_can_read() {
         "name: pr-review\ndescription: 怎么审一个 PR\n",
         "第一步……\n",
     );
-    // 只给 macos 的：这台机器上**不该**进提示（§5.6：`platforms:` 只门控目录行）。
+    // 只给别的平台的：这台机器上**不该**进提示（§5.6：`platforms:` 只门控目录行）。
+    let elsewhere = if std::env::consts::OS == "macos" {
+        "linux"
+    } else {
+        "macos"
+    };
     write_skill(
         skills.path(),
         "finder-tricks",
-        "name: finder-tricks\ndescription: Finder 脚本\nplatforms: [macos]\n",
+        &format!("name: finder-tricks\ndescription: Finder 脚本\nplatforms: [{elsewhere}]\n"),
         "……\n",
     );
 

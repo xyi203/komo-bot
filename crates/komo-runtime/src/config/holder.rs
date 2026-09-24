@@ -208,6 +208,34 @@ mod tests {
         assert_eq!(after.loaded_at, before.loaded_at);
     }
 
+    /// `docs/home-dispatcher.md` §9 Phase 1：`[home] mode = "dispatch"` 缺 `dispatcher`
+    /// 就是校验不过——旧快照原样保留，跟其他配置错误走同一条路。
+    #[test]
+    fn a_bad_home_section_on_reload_leaves_the_old_snapshot_in_place() {
+        let fixture = Fixture::valid();
+        let holder = fixture.holder();
+        let before = holder.current();
+        assert_eq!(
+            before.home.mode,
+            komo_kernel::protocol::config::HomeMode::Session
+        );
+
+        let mut text = Fixture::config_text("chat-a", "medium");
+        text.push_str("\n[home]\nmode = \"dispatch\"\n");
+        write(&fixture.sources().config, &text);
+
+        let error = holder.reload().unwrap_err();
+        assert!(!error.issues().is_empty(), "{error}");
+
+        let after = holder.current();
+        assert_eq!(
+            after.home.mode,
+            komo_kernel::protocol::config::HomeMode::Session,
+            "旧快照原样保留"
+        );
+        assert_eq!(after.loaded_at, before.loaded_at);
+    }
+
     #[test]
     fn a_good_edit_swaps_the_snapshot_and_reports_key_names_only() {
         let fixture = Fixture::valid();

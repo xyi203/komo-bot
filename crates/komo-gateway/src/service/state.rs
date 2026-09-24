@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use komo_kernel::protocol::config::ConfigSnapshot;
+use komo_kernel::protocol::config::{ConfigSnapshot, HomeMode};
 use komo_kernel::protocol::http::{
     ApprovalDecisionResponse, ApprovalRecord, InterventionKind, InterventionListQuery,
     InterventionSummary, SubmitRunResponse,
@@ -957,6 +957,34 @@ impl GatewayState {
             }
         };
 
+        // home 分发器（`docs/home-dispatcher.md` §3、§9 Phase 1）：home session
+        // （`kind = main` 且 `origin = home`，读的是存下来的那一行，不是猜）在
+        // `[home] mode = "dispatch"` 时，它的 Run 用 `dispatcher` Profile 冻结——
+        // **会话的 `agent_id` 不改**，只是这一条 Run 的身份与能力换成分发器那一份。
+        let profile = if is_home_session(record) && config.home.mode == HomeMode::Dispatch {
+            match config
+                .home
+                .dispatcher
+                .as_deref()
+                .and_then(|id| config.agent.get(id))
+            {
+                Some(dispatcher) => dispatcher,
+                None => {
+                    // 校验本该挡住这种配置（`mode = "dispatch"` 必须有一个存在的
+                    // `dispatcher`），这里只是防"校验通过之后又被改坏"的窗口——不让
+                    // 输入失败，仍按会话本来的 Agent 受理。
+                    tracing::warn!(
+                        session = %session,
+                        dispatcher = ?config.home.dispatcher,
+                        "[home] mode = \"dispatch\" 但 dispatcher 配置不完整，这次仍按会话原本的 Agent 受理"
+                    );
+                    profile
+                }
+            }
+        } else {
+            profile
+        };
+
         // 能力面：Profile 在**这份工具目录**里挑出来的那一份（§4 末）。名字写了、目录里
         // 没有的名字**不算数**，而且必须报出来——静默采纳一份写错的配置，等于让操作者
         // 以为某个工具给了而其实没给。
@@ -1513,6 +1541,15 @@ pub fn protected_paths(snapshot: &ConfigSnapshot, home: &std::path::Path) -> Vec
 /// 光秃秃的 `"home"` 也是**这次改造之前**那个全局主会话的取值——升级之后它仍然能被认成
 /// 默认 Agent 的主会话（见 `GatewayState::main_session` 的候选分支），**旧行不重写**。
 pub const HOME_ORIGIN: &str = "home";
+
+/// 这一行是不是 home session：`kind = main` 且 `origin = home`
+/// （`docs/home-dispatcher.md` §3）。读的是**存下来的那一行**，不是猜——普通会话哪怕
+/// 归了默认 Agent 也不是 home session。没有行（还没落库、或者调用方没查）就不是。
+fn is_home_session(record: Option<&komo_store::repos::session::SessionRecord>) -> bool {
+    record.is_some_and(|record| {
+        record.kind == komo_store::models::SessionKind::Main && record.origin == HOME_ORIGIN
+    })
+}
 
 /// 会话日志在库里记的那条**相对路径**（`sessions/<id>/events.jsonl`）。
 ///

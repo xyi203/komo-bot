@@ -400,3 +400,226 @@ async fn a_session_without_an_owner_runs_as_the_default_agent() {
 
     gateway.stop().await;
 }
+
+// ---------------------------------------------------------------- [home] mode = "dispatch"（docs/home-dispatcher.md §3、§9 Phase 1）
+
+/// `default_agent = "assistant"`、`[home] dispatcher = "dispatcher"`：home session 的
+/// Run 该用分发器身份，别的会话不受影响。
+fn home_dispatch_config() -> String {
+    r#"
+default_agent = "assistant"
+
+[agents.assistant]
+instructions = "你是助手（assistant 那一版身份）：先读，再答。"
+tools = ["read", "rg"]
+
+[agents.dispatcher]
+instructions = "你是分发器（dispatcher 那一版身份）：能答就答，需要动手就派任务。"
+tools = ["read"]
+
+[home]
+mode = "dispatch"
+dispatcher = "dispatcher"
+
+[model.main]
+type = "completion"
+api_backend = "responses"
+base_url = "https://llm.example.com/v1"
+model = "gpt-test"
+api_key_env = "KOMO_LLM_API_KEY"
+
+[models]
+default = "main"
+
+[memory]
+enabled = false
+"#
+    .to_string()
+}
+
+/// 同上，但 `dispatcher` 多一个 `shell`（用来造一次要审批的调用，测"在飞的 Run 不受
+/// 热重载影响"）。
+fn home_dispatch_config_with_shell() -> String {
+    home_dispatch_config().replace(
+        "[agents.dispatcher]\ninstructions = \"你是分发器（dispatcher 那一版身份）：能答就答，需要动手就派任务。\"\ntools = [\"read\"]",
+        "[agents.dispatcher]\ninstructions = \"你是分发器（dispatcher 那一版身份）：能答就答，需要动手就派任务。\"\ntools = [\"read\", \"shell\"]",
+    )
+}
+
+/// 同一份配置，`[home] mode = "session"`（今天的行为）——用来测热重载切回去。
+fn home_session_config() -> String {
+    home_dispatch_config().replace("mode = \"dispatch\"", "mode = \"session\"")
+}
+
+/// `mode = "dispatch"`：home session 的 Run 用 `dispatcher` 那一版身份（指令、工具表）；
+/// 同一台 Gateway 里一个普通会话仍然用它自己的 Agent——`[home]` 只管 home session。
+#[tokio::test]
+async fn a_home_session_in_dispatch_mode_uses_the_dispatcher_profile() {
+    let home = Home::with_config(&home_dispatch_config());
+    let llm = FakeLlm::new(vec![
+        // home session：分发器那一段。
+        vec![text_round(1, "好，交给我。")],
+        // 普通会话：assistant 自己的那一段。
+        vec![text_round(1, "好。")],
+    ]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+
+    // home session：`default_main_session` 就是它——`kind = main` 且 `origin = home`。
+    let home_session = gateway.state().default_main_session().await.unwrap();
+    let run = gateway
+        .submit(&home_session, "home-1", "查一下空调状态")
+        .await
+        .run;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let dispatcher_request = request_of(&llm, "dispatcher 那一版身份");
+    assert_eq!(
+        tool_names(&dispatcher_request),
+        vec!["read"],
+        "home session 冻结的是 dispatcher 的能力面：{:?}",
+        tool_names(&dispatcher_request)
+    );
+    assert!(
+        !dispatcher_request
+            .system_prompt
+            .contains("assistant 那一版身份"),
+        "home session 不该带着 assistant 的指令：{}",
+        dispatcher_request.system_prompt
+    );
+
+    // 会话的 `agent_id` 没有变：它仍然归 `assistant`（§3：「home 会话的 agent_id 不变」）。
+    assert_eq!(
+        gateway
+            .state()
+            .agent_of_session(&home_session)
+            .await
+            .unwrap(),
+        "assistant"
+    );
+
+    // 一个普通会话（`POST /v1/sessions` 建的）不受 `[home]` 影响，仍然用它自己的 Agent。
+    let normal_session = gateway.open_session().await;
+    let run = gateway
+        .submit(&normal_session, "normal-1", "在吗")
+        .await
+        .run;
+    gateway.wait_terminal(&run).await;
+    let assistant_request = request_of(&llm, "assistant 那一版身份");
+    assert_eq!(
+        tool_names(&assistant_request),
+        vec!["read", "rg"],
+        "普通会话用的是 assistant 自己的能力面"
+    );
+
+    gateway.stop().await;
+}
+
+/// 热重载把 `mode` 从 `dispatch` 切回 `session`：下一条 home Run 用回默认 Agent。
+#[tokio::test]
+async fn switching_home_mode_back_to_session_on_reload_uses_the_default_agent_next() {
+    let home = Home::with_config(&home_dispatch_config());
+    let llm = FakeLlm::new(vec![
+        // 第一段：mode = dispatch，用 dispatcher 身份。
+        vec![text_round(1, "交给我。")],
+        // 第二段：切回 session 之后，用 assistant 身份。
+        vec![text_round(1, "好。")],
+    ]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let home_session = gateway.state().default_main_session().await.unwrap();
+
+    let run = gateway
+        .submit(&home_session, "switch-1", "第一句")
+        .await
+        .run;
+    gateway.wait_terminal(&run).await;
+    let first = request_of(&llm, "dispatcher 那一版身份");
+    assert_eq!(tool_names(&first), vec!["read"]);
+
+    // 操作者把 `[home] mode` 改回 `session` 并热重载。
+    rewrite_config(&home, &home_session_config());
+    komo_gateway::reload::reload(gateway.state())
+        .await
+        .expect("新配置装得上");
+
+    let run = gateway
+        .submit(&home_session, "switch-2", "第二句")
+        .await
+        .run;
+    gateway.wait_terminal(&run).await;
+    let second = request_of(&llm, "assistant 那一版身份");
+    assert_eq!(
+        tool_names(&second),
+        vec!["read", "rg"],
+        "切回 session 之后，下一条 home Run 用默认 Agent 的能力面"
+    );
+    assert!(
+        !second.system_prompt.contains("dispatcher 那一版身份"),
+        "{}",
+        second.system_prompt
+    );
+
+    gateway.stop().await;
+}
+
+/// home session 受理时用 `dispatch` 冻结身份，之后热重载把 `mode` 改回 `session`——
+/// **在飞的那条 Run** 仍然用它受理那一刻冻结的 dispatcher 身份跑完（§4.3、§9 Phase 1
+/// 的"run 在飞时改配置不换脸"，这里换的是 `[home] mode` 而不是 Profile 本身）。
+#[tokio::test]
+async fn a_home_run_in_flight_keeps_the_dispatcher_snapshot_across_a_mode_switch() {
+    let home = Home::with_config(&home_dispatch_config_with_shell());
+    let llm = FakeLlm::new(vec![
+        // 第一段：调一次 shell（默认规则下要问），Run 停在审批上。
+        vec![call_round(
+            1,
+            "pc-sh",
+            "shell",
+            serde_json::json!({ "command": "echo hi" }),
+        )],
+        // 批准之后的续跑段。
+        vec![text_round(2, "跑完了。")],
+        // 切回 session 之后新受理的那一条。
+        vec![text_round(1, "好。")],
+    ]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let home_session = gateway.state().default_main_session().await.unwrap();
+
+    let run = gateway
+        .submit(&home_session, "inflight-1", "跑一下")
+        .await
+        .run;
+    let approval = gateway.wait_approval().await;
+
+    // Run 还在飞（停在审批上）的时候，操作者把 `[home] mode` 改回 `session`。
+    rewrite_config(&home, &home_session_config());
+    komo_gateway::reload::reload(gateway.state())
+        .await
+        .expect("新配置装得上");
+
+    gateway.decide(&approval.approval, true).await;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let resumed = request_of(&llm, "dispatcher 那一版身份");
+    assert_eq!(
+        tool_names(&resumed),
+        vec!["read", "shell"],
+        "在飞的 Run 用的是受理那一刻冻结的 dispatcher 能力面：{:?}",
+        tool_names(&resumed)
+    );
+
+    // 下一条 Run：受理时读的是新快照（`mode = session`），用默认 Agent。
+    let next = gateway
+        .submit(&home_session, "inflight-2", "再说一句")
+        .await
+        .run;
+    gateway.wait_terminal(&next).await;
+    let fresh = request_of(&llm, "assistant 那一版身份");
+    assert!(
+        !fresh.system_prompt.contains("dispatcher 那一版身份"),
+        "{}",
+        fresh.system_prompt
+    );
+
+    gateway.stop().await;
+}

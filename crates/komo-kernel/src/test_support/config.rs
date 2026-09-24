@@ -8,8 +8,8 @@ use std::path::PathBuf;
 
 use crate::policy::RuleTable;
 use crate::protocol::config::{
-    ChannelConfig, ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig,
-    StartOnly, TypesafeConfig,
+    ChannelConfig, ChannelsConfig, ConfigSnapshot, HomeConfig, MemoryConfig, PathsConfig,
+    RetrievalConfig, StartOnly, TypesafeConfig,
 };
 use crate::types::agent::{AgentConfig, AgentProfile};
 use crate::types::chat::PeerId;
@@ -97,6 +97,7 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
                 AgentProfile::new("assistant"),
             )]),
         },
+        home: HomeConfig::default(),
         typesafe: TypesafeConfig::default(),
         channels: ChannelsConfig {
             feishu: ChannelConfig {

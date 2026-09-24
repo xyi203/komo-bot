@@ -20,8 +20,8 @@ use std::sync::Arc;
 use komo_kernel::policy::RuleTable;
 #[cfg(test)]
 use komo_kernel::protocol::config::{
-    ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig, StartOnly,
-    TypesafeConfig,
+    ChannelsConfig, ConfigSnapshot, HomeConfig, MemoryConfig, PathsConfig, RetrievalConfig,
+    StartOnly, TypesafeConfig,
 };
 #[cfg(test)]
 use komo_kernel::traits::LlmClient;
@@ -124,6 +124,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
                 AgentProfile::new("assistant"),
             )]),
         },
+        home: HomeConfig::default(),
         typesafe: TypesafeConfig::default(),
         channels: ChannelsConfig::default(),
         policy: RuleTable::initial(),

@@ -419,3 +419,92 @@ fn a_warning_rides_along_with_a_config_that_still_loads() {
         komo_kernel::protocol::config::IssueSeverity::Warning
     );
 }
+
+// ---------------------------------------------------------------- [home]（docs/home-dispatcher.md §9 Phase 1）
+
+/// 没写 `[home]` 就是 `mode = "session"`，今天的行为不变。
+#[test]
+fn a_missing_home_section_defaults_to_session_mode() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(
+        loaded.snapshot.home.mode,
+        komo_kernel::protocol::config::HomeMode::Session
+    );
+    assert_eq!(loaded.snapshot.home.dispatcher, None);
+}
+
+/// `mode = "dispatch"` 要求 `dispatcher` 指向一个声明过的 `[agents.<id>]`。
+#[test]
+fn a_dispatch_mode_naming_a_declared_dispatcher_loads() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[home]\nmode = \"dispatch\"\ndispatcher = \"assistant\"\n");
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(
+        loaded.snapshot.home.mode,
+        komo_kernel::protocol::config::HomeMode::Dispatch
+    );
+    assert_eq!(
+        loaded.snapshot.home.dispatcher.as_deref(),
+        Some("assistant")
+    );
+}
+
+/// `mode = "dispatch"` 没写 `dispatcher` 就拒绝整个加载，错误指着 `home.dispatcher`。
+#[test]
+fn a_dispatch_mode_without_a_dispatcher_refuses_the_whole_load() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[home]\nmode = \"dispatch\"\n");
+    write(&fixture.sources().config, &text);
+
+    let error = load_config(&fixture.options()).unwrap_err();
+    let issues = error.issues();
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(issues[0].key.as_str(), "home.dispatcher");
+}
+
+/// `dispatcher` 指一个没声明过的 Agent 同样拒绝整个加载。
+#[test]
+fn a_dispatcher_naming_an_undeclared_agent_refuses_the_whole_load() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[home]\nmode = \"dispatch\"\ndispatcher = \"ghost\"\n");
+    write(&fixture.sources().config, &text);
+
+    let error = load_config(&fixture.options()).unwrap_err();
+    let issues = error.issues();
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(issues[0].key.as_str(), "home.dispatcher");
+    assert!(issues[0].message.contains("ghost"), "{:?}", issues[0]);
+}
+
+/// 认不出的 `mode` 值（打错字）是一条解析错误，指名文件——和 `policy.toml` 的
+/// `mode` 同一个口径。
+#[test]
+fn an_unknown_home_mode_is_a_parse_error() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[home]\nmode = \"dispatchh\"\n");
+    write(&fixture.sources().config, &text);
+
+    let error = load_config(&fixture.options()).unwrap_err().to_string();
+    assert!(error.contains("dispatchh"), "{error}");
+}
+
+/// `worker` 写了就必须指向一个声明过的 Agent（Phase 2 才用它，这里先校验）。
+#[test]
+fn a_worker_naming_an_undeclared_agent_refuses_the_whole_load() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[home]\nworker = \"ghost\"\n");
+    write(&fixture.sources().config, &text);
+
+    let error = load_config(&fixture.options()).unwrap_err();
+    let issues = error.issues();
+    assert_eq!(issues.len(), 1, "{issues:?}");
+    assert_eq!(issues[0].key.as_str(), "home.worker");
+}

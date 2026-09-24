@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use komo_kernel::policy::RuleTable;
 use komo_kernel::protocol::config::{
-    ChannelConfig, ChannelsConfig, ConfigSnapshot, ExecutionConfig, KeyPath, MemoryConfig,
-    PathsConfig, RetrievalConfig, SourceFile, StartOnly, TypesafeConfig,
+    ChannelConfig, ChannelsConfig, ConfigSnapshot, ExecutionConfig, HomeConfig, HomeMode, KeyPath,
+    MemoryConfig, PathsConfig, RetrievalConfig, SourceFile, StartOnly, TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile};
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
@@ -64,6 +64,8 @@ pub(super) struct FileConfig {
     pub default_agent: Option<String>,
     #[serde(default)]
     pub agents: std::collections::BTreeMap<String, AgentSection>,
+    #[serde(default)]
+    pub home: HomeSection,
     #[serde(default)]
     pub channels: ChannelsSection,
 }
@@ -219,6 +221,26 @@ impl AgentSection {
             workspace: self.workspace.map(|path| resolve(base, path)),
             memory_scope,
         })
+    }
+}
+
+/// `[home]`：home session 走今天的行为还是被分发器 Profile 冻结
+/// （`docs/home-dispatcher.md` §3、§9 Phase 1）。省略整段 = `mode = "session"`，不报错。
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct HomeSection {
+    pub mode: Option<HomeMode>,
+    pub dispatcher: Option<String>,
+    pub worker: Option<String>,
+}
+
+impl HomeSection {
+    fn into_home(self) -> HomeConfig {
+        HomeConfig {
+            mode: self.mode.unwrap_or_default(),
+            dispatcher: self.dispatcher,
+            worker: self.worker,
+        }
     }
 }
 
@@ -525,6 +547,7 @@ pub(super) fn assemble(
         model,
         memory,
         agent: build_agents(file.default_agent, file.agents, &base)?,
+        home: file.home.into_home(),
         typesafe: file.typesafe.into_typesafe(),
         execution: file.execution.into_execution(),
         channels,

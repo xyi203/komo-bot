@@ -8,7 +8,7 @@
 //! （装填时空值不入表），所以校验函数拿不到、也不需要凭证的值。
 
 use komo_kernel::protocol::config::{
-    ChannelConfig, ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath,
+    ChannelConfig, ConfigIssue, ConfigSnapshot, HomeMode, IssueSeverity, KeyPath,
 };
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
 use komo_kernel::types::memory::RetrievalMode;
@@ -77,6 +77,7 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
     check_execution(snapshot, &mut issues);
     check_typesafe(snapshot, &mut issues);
     check_agents(snapshot, &mut issues);
+    check_home(snapshot, &mut issues);
 
     issues.sort_by(|a, b| a.key.cmp(&b.key).then(a.severity.cmp(&b.severity)));
     issues
@@ -439,6 +440,59 @@ fn check_agents(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
                 agent.agents.keys().cloned().collect::<Vec<_>>().join("、")
             ),
         ));
+    }
+}
+
+/// `[home]`（`docs/home-dispatcher.md` §3、§9 Phase 1）。
+///
+/// `mode = "dispatch"` 时 `dispatcher` 必须写、且要指向一个声明过的 `[agents.<id>]`；
+/// `worker`（有 Phase 2 才用，这里先校验）写了就同样要指向一个声明过的 Profile。缺省
+/// 整段 = `mode = "session"`，不报错——这是今天的行为。
+fn check_home(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    let home = &snapshot.home;
+    let known_agents = || {
+        snapshot
+            .agent
+            .agents
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+
+    match home.mode {
+        HomeMode::Dispatch => match home.dispatcher.as_deref() {
+            Some(id) if !id.trim().is_empty() => {
+                if snapshot.agent.get(id).is_none() {
+                    issues.push(error(
+                        "home.dispatcher",
+                        format!("`{id}` 不在 [agents.<id>] 里；现有的是：{}", known_agents()),
+                    ));
+                }
+            }
+            _ => issues.push(error(
+                "home.dispatcher",
+                "mode = \"dispatch\" 时必须指定 dispatcher：写一个声明过的 [agents.<id>]",
+            )),
+        },
+        HomeMode::Session => {}
+    }
+
+    if let Some(worker) = home.worker.as_deref() {
+        if worker.trim().is_empty() {
+            issues.push(error(
+                "home.worker",
+                "写了 worker 就不能是空的；不想要就整行去掉",
+            ));
+        } else if snapshot.agent.get(worker).is_none() {
+            issues.push(error(
+                "home.worker",
+                format!(
+                    "`{worker}` 不在 [agents.<id>] 里；现有的是：{}",
+                    known_agents()
+                ),
+            ));
+        }
     }
 }
 
@@ -820,6 +874,52 @@ mod tests {
             "{:?}",
             issues[0]
         );
+    }
+
+    /// 缺省 `[home]` = `mode = "session"`，不报错——这是今天的行为。
+    #[test]
+    fn a_missing_home_section_is_session_mode_with_no_issues() {
+        let snapshot = snapshot_fixture();
+        assert_eq!(
+            snapshot.home.mode,
+            komo_kernel::protocol::config::HomeMode::Session
+        );
+        assert_eq!(validate(&snapshot), vec![]);
+    }
+
+    #[test]
+    fn dispatch_mode_without_a_dispatcher_is_refused() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.home.mode = komo_kernel::protocol::config::HomeMode::Dispatch;
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["home.dispatcher"]);
+    }
+
+    #[test]
+    fn a_dispatcher_naming_an_undeclared_profile_is_refused() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.home.mode = komo_kernel::protocol::config::HomeMode::Dispatch;
+        snapshot.home.dispatcher = Some("ghost".into());
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["home.dispatcher"]);
+        assert!(issues[0].message.contains("ghost"), "{:?}", issues[0]);
+    }
+
+    #[test]
+    fn a_dispatcher_naming_a_declared_profile_has_no_issues() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.home.mode = komo_kernel::protocol::config::HomeMode::Dispatch;
+        snapshot.home.dispatcher = Some("assistant".into());
+        assert_eq!(validate(&snapshot), vec![]);
+    }
+
+    #[test]
+    fn a_worker_naming_an_undeclared_profile_is_refused() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.home.worker = Some("ghost".into());
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["home.worker"]);
+        assert!(issues[0].message.contains("ghost"), "{:?}", issues[0]);
     }
 
     #[test]

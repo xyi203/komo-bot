@@ -415,6 +415,15 @@ workspace = "code/komo"
 
 **升级路径**：`sessions.agent_id` 为空 = 升级前建的会话。它按 `default_agent` **归属一次并写下来**（只写一次，之后不随配置漂移）；归属的 Agent 在现行配置里不存在时，那条会话**拒绝执行**并进操作者清单（§7.5），不静默换成别的助手。
 
+**`[home]`：home session 是不是分发器。** 缺省（`mode = "session"`）与上面的行为逐字相同；`mode = "dispatch"` 时 home session 的 Run 改用 `dispatcher` 指的那个 Profile 冻结（会话的 `agent_id` 不变），`worker` 是任务会话用的 Profile。这是任务分发器的设计，完整动机、`dispatch` / `follow` 两个操作与分阶段计划见 `docs/home-dispatcher.md`。
+
+```toml
+[home]
+mode       = "session"    # 默认；"dispatch" = home session 的 Run 用 dispatcher Profile 跑
+dispatcher = "dispatcher"  # mode = "dispatch" 时必填，必须是一个声明过的 [agents.<id>]
+worker     = "assistant"   # 任务会话用的 Profile；省略 = default_agent
+```
+
 ### 6.2 冻结的是身份，不是安全策略
 
 受理一条 Run 时算出 `RunSnapshot` 落进账本：身份指令**正文进 `payloads/`（存内容，不存路径）**——审批可能一小时之后才答复，那时那个文件早被改过——连同 Agent 的 id、Profile 的内容指纹、模型、解析过的目录、这次的能力面与记忆作用域。
@@ -1322,7 +1331,7 @@ TELEGRAM_BOT_TOKEN=...
 
 - **Principal**：发送者在该渠道 `allow_from` 里就是操作者，否则**拒绝**——回一条固定提示，带上发送者在该平台的 id（`ou_xxx` / `123456789` / `wxid_xxx`），操作者把它抄进 `allow_from` 即可；消息不进入 Run，也不留任何记录。`allow_from` 为空的渠道等于只出不进：还能作 `home_chat` 收投递，但没人能通过它下指令。**审批命令只接受操作者。**
 - **怎么知道自己的 id**：任何人对机器人说 `/id`，机器人回 `{platform}:{chat_id}` 与发送者 id——被拒绝的提示里也带着同样的信息。这是唯一的"发现"手段，没有别的准入流程。
-- **Conversation**：操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session，只有 `groups` 列出的群会被响应，群里只响应 @机器人 的消息并剥掉提及，且发送者仍须在 `allow_from` 里。WeChat 只有 DM。
+- **Conversation**：操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session，只有 `groups` 列出的群会被响应，群里只响应 @机器人 的消息并剥掉提及，且发送者仍须在 `allow_from` 里。WeChat 只有 DM。`[home] mode = "dispatch"` 时 home session 改由分发器 Profile 冻结身份，把需要工具的部分派给独立的任务会话，见 `docs/home-dispatcher.md`。
 - **改名单不改数据库，也不重启**：`allow_from` / `home_chat` / `groups` 每条消息、每次投递都从当前配置快照读（§3 热重载第 2 步），文件保存后下一条消息就按新名单判定；`komo config check` 与重载共用同一套校验（id 形态、`home_chat` 所属渠道必须 enabled 且有凭证），校验不过则旧名单继续生效并在 home chat 报错。`komo doctor` 把"某渠道 enabled 但 `allow_from` 为空"当作警告列出。
 - Cron 触发的 Run 来源仍是 Cron（§8.8）；在聊天里 `/approve` 它的等待，不会让它获得交互操作者的权限。
 

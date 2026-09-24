@@ -230,6 +230,42 @@ impl Default for TypesafeConfig {
     }
 }
 
+/// `[home]`：home session 是走今天的行为，还是被分发器 Profile 冻结
+/// （`docs/home-dispatcher.md` §3、§9 Phase 1）。**热重载**：读者按用途读当前快照，
+/// 不缓存——切换 `mode` 之后下一条 home 消息就按新模式受理。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeConfig {
+    #[serde(default)]
+    pub mode: HomeMode,
+    /// `mode = "dispatch"` 时必须指定，且要指向一个声明过的 `[agents.<id>]`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatcher: Option<String>,
+    /// 任务会话（Phase 2）用的 Profile；省略 = `default_agent`。写了就必须指向一个
+    /// 声明过的 `[agents.<id>]`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<String>,
+}
+
+impl HomeConfig {
+    /// 任务会话该用哪个 Profile：`worker` 写了就用它，否则用 `default_agent`
+    /// （Phase 2 用它；这里先只留一个访问点，不在别处提前用）。
+    pub fn worker_or<'a>(&'a self, default_agent: &'a str) -> &'a str {
+        self.worker.as_deref().unwrap_or(default_agent)
+    }
+}
+
+/// home session 的两种模式（`docs/home-dispatcher.md` §3）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeMode {
+    /// 今天的行为：home session 用它自己的 Agent 身份跑。
+    #[default]
+    Session,
+    /// home session 的 Run 一律用 `dispatcher` Profile 冻结；会话本身的 `agent_id`
+    /// 不变。
+    Dispatch,
+}
+
 /// `[memory]`（§13.3）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryConfig {
@@ -311,6 +347,10 @@ pub struct ConfigSnapshot {
     /// 助手定义（§四）。**没有隐含默认**：`[agents.<id>]` 是唯一写法，
     /// `default_agent` 指向其中一个。
     pub agent: AgentConfig,
+    /// home session 是走今天的行为还是被分发器 Profile 冻结（`docs/home-dispatcher.md`
+    /// §3）。缺省 = `mode = "session"`。
+    #[serde(default)]
+    pub home: HomeConfig,
     /// 可选判断后端。默认关（见 [`TypesafeConfig`]）。
     #[serde(default)]
     pub typesafe: TypesafeConfig,
@@ -437,6 +477,7 @@ mod tests {
                 default_agent: "assistant".into(),
                 agents: BTreeMap::from([("assistant".into(), AgentProfile::new("assistant"))]),
             },
+            home: HomeConfig::default(),
             typesafe: TypesafeConfig::default(),
             channels: ChannelsConfig {
                 feishu: ChannelConfig {

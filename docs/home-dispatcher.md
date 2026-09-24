@@ -176,7 +176,7 @@ Dispatcher（`crates/komo-gateway/src/dispatcher.rs`）在 `submit` 之前先看
 | 阶段 | 内容 | 验收 |
 |---|---|---|
 | 0 | §8 两处修复 | 交互 Run 跑到一半重启 Gateway，完成后回复仍投到来源渠道，且只投一次；没有快照的 Run 在绑定了 `worker` 的会话里以 `worker` 身份跑 |
-| 1 | `[home]` 配置与校验、`freeze_run` 分流、`dispatcher` Profile、`komo home reset`（追加 boundary）| `mode = session` 时行为与现在逐字相同（沿用 context golden）；切到 `dispatch` 后 home 的新 Run 用分发器身份，工具只有两个 |
+| 1 | `[home]` 配置与校验、`freeze_run` 分流、`dispatcher` Profile。切换到分发器模式没有专门的 CLI 命令：用 `/new`（对话边界）另起一段，旧 home 历史保留可查、不再进上下文 | `mode = session` 时行为与现在逐字相同（沿用 context golden）；切到 `dispatch` 后 home 的新 Run 用分发器身份，工具只有两个 |
 | 2 | `TaskSpawner` 接缝、`Operation::Dispatch/Follow`、任务会话（`SessionKind::Task`、`origin = task:{home}`、标题）| 从 tg 发“查空调状态”：home Run 一轮收尾并回“已派出 #xxxx”；任务会话以 `worker` 身份跑，结果投回 tg；同一调用重放只建一个任务；任务里的审批投 tg + home chat |
 | 3 | 任务看板（context_sources 取数 + `komo-agent` 渲染 + 冻结）、`#短号` 确定性路由、`komo session list` 显示 kind / 所属 home | 一个 4 分钟的任务在跑时，从微信再发“1+1 等于几”几秒内得到回答；`#xxxx 再看看功耗` 不经模型进对应任务；看板里能看到进行中任务的等待原因 |
 | 4（后续）| 回复消息即追问；长任务进度提示（超过 N 秒回一句“还在查：……”）| — |

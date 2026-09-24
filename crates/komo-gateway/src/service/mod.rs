@@ -304,6 +304,11 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         Err(error) => tracing::warn!(%error, "记忆处理队列的复位没做成"),
     }
 
+    // 8c. 把跨重启还在跑的交互 Run 重新挂上看客（`docs/home-dispatcher.md` §8
+    // Fix 1）：看客只活在内存里，重启后没人订阅就没人能把最终回复投回聊天来源。
+    // **必须在下一步调度器起来之前**：调度器一起，这些 Run 可能立刻继续往下跑。
+    run_watch::reattach_unfinished(&state).await;
+
     // 9. 后台任务：调度器、Cron、配置轮询、SIGHUP。
     spawn_background(&state, &shutdown);
 

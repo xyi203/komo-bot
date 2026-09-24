@@ -896,12 +896,12 @@ impl GatewayState {
     }
 
     /// 一条记载下来的归属，或者默认 Agent（空串 = 还没有归属）。
+    ///
+    /// 规则本身在 kernel（`AgentConfig::owner_or_default`）：没有冻结快照时的兜底身份
+    /// （`context_sources::ambient_identity`）走的是同一条，这里只是按当前快照现读一次。
     fn owner_or_default(&self, agent_id: String) -> String {
-        if agent_id.is_empty() {
-            self.snapshot().agent.default_agent.clone()
-        } else {
-            agent_id
-        }
+        let config = self.snapshot();
+        config.agent.owner_or_default(&agent_id).to_string()
     }
 
     /// 把一个**刚建出来、还没有归属**的会话记在默认 Agent 名下。

@@ -85,6 +85,107 @@ pub fn watch(state: Arc<GatewayState>, session: SessionId, run: RunId, watcher: 
     });
 }
 
+/// 重启后把未终态、且来自聊天的交互 Run 重新挂上看客（`docs/home-dispatcher.md` §8
+/// Fix 1）。
+///
+/// 看客只活在内存里：`GatewayState::watching` 与这里的 `tokio::spawn` 都在进程重启时
+/// 清空，而账本上这条 Run 该往哪投（`runs.peer`）一直都在。少了这一步，一条跨重启还在
+/// 跑的交互 Run 跑完之后没有人订阅它的终态帧，最终回复就再也投不出去——审批有周期兜底
+/// 补投（[`GatewayState::sweep_unseen_interventions`]），最终回复原来没有，这里补上。
+///
+/// **必须在调度器起来之前调用**：调度器一起，这些 Run 可能立刻继续往下跑，慢一步挂上
+/// 看客就会真的错过它的终态帧。
+pub async fn reattach_unfinished(state: &Arc<GatewayState>) {
+    let unfinished = match komo_store::repos::runs::unfinished(&state.db).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "读不出未终态 Run，重启后的看客补挂没做成");
+            return;
+        }
+    };
+    let mut reattached = 0usize;
+    for record in unfinished {
+        // 没有 peer = TUI / HTTP，或者是委派的子 Run（永远 `peer = None`）：那条路本来
+        // 就不靠这里补——TUI / HTTP 自己在看事件流，子 Run 的结果回到父 Run 自己的收尾。
+        let Some(raw) = record.peer.as_deref() else {
+            continue;
+        };
+        let Some(peer) = ChannelPeer::parse(raw) else {
+            tracing::warn!(
+                run = %record.run,
+                peer = raw,
+                "runs.peer 解析不出来，这条 Run 的看客补不上"
+            );
+            continue;
+        };
+        let watcher = Watcher::Interactive { peer: Some(peer) };
+        // 订阅之前先核对一遍权威状态：这条 Run 有没有可能在 `unfinished()` 这份名单读
+        // 出来之后、真的订阅之前，就已经落了终态——启动阶段调度器还没起来，这一步理论
+        // 上总是"还没有"，但核对本身几乎不花时间，换来的是不必靠"调用次序恰好对"这件
+        // 事成立（本函数的文档：必须在调度器起来之前调用）。
+        if deliver_if_already_finished(state, &record.session, &record.run, &watcher).await {
+            continue;
+        }
+        watch(Arc::clone(state), record.session, record.run, watcher);
+        reattached += 1;
+    }
+    if reattached > 0 {
+        tracing::info!(reattached, "重启后补挂了聊天来源的看客");
+    }
+}
+
+/// [`reattach_unfinished`] 补挂之前的核对：这条 Run 是不是已经落了终态。命中就直接按
+/// 落盘的终态收尾（复用 [`finish`]，与"跑完那一刻"同一份口径）并返回 `true`；调用方就
+/// 不必再订阅一次——那一帧广播可能已经错过了，订阅了也是白等。
+///
+/// 走的是 [`Ledger::run_end`]，不是重新扫一遍 JSONL：它已经把外置的大正文按引用读回来了
+/// （§8.3），返回 `None` 就是这条 Run 确实还没到终态。
+async fn deliver_if_already_finished(
+    state: &Arc<GatewayState>,
+    session: &SessionId,
+    run: &RunId,
+    watcher: &Watcher,
+) -> bool {
+    use komo_kernel::cron::FiringStatus;
+    use komo_kernel::types::status::RunEnd;
+
+    let end = match state.routed.run_end(run).await {
+        Ok(Some(end)) => end,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(%error, %run, "读不出这条 Run 的终态，补挂照常订阅");
+            return false;
+        }
+    };
+    let (status, error, text) = match end {
+        RunEnd::Completed { final_message, .. } => (
+            FiringStatus::Ok,
+            None,
+            final_message.unwrap_or_else(|| "（这一轮没有文字回复）".to_string()),
+        ),
+        RunEnd::Failed { reason } => (
+            FiringStatus::Error,
+            Some(reason.clone()),
+            format!("任务失败：{reason}"),
+        ),
+        RunEnd::Cancelled { .. } => (
+            FiringStatus::Error,
+            Some("已取消".to_string()),
+            "任务已取消。".to_string(),
+        ),
+        RunEnd::Abandoned { reason, .. } => {
+            let why = reason.unwrap_or_else(|| "操作者放弃".to_string());
+            (
+                FiringStatus::Error,
+                Some(why.clone()),
+                format!("任务已放弃（abandoned）：{why}"),
+            )
+        }
+    };
+    finish(state, session, run, watcher, status, error, text, true).await;
+    true
+}
+
 /// 这一条事件之后还要不要接着看。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {

@@ -1,13 +1,15 @@
 //! 飞书开放平台 REST 接口（§13.2：回复走 reqwest，不走 SDK）。
 //!
-//! openlark 只用来跑 ws 长连接；所有发出去的东西都在这里手写。四个接口：
+//! openlark 只用来跑 ws 长连接；所有发出去的东西都在这里手写：
 //!
 //! | 接口 | 用处 |
 //! |---|---|
 //! | `POST /open-apis/auth/v3/tenant_access_token/internal` | 拿 tenant token（`komo channel probe` 也是它） |
 //! | `GET /open-apis/bot/v3/info` | 机器人自己的 `open_id`——群里认 @提及 要用 |
 //! | `POST /open-apis/im/v1/messages` | 发文本 / 发卡片 |
-//! | `PATCH /open-apis/im/v1/messages/{id}` | 决定之后原地换掉审批卡（§11.3） |
+//! | `PATCH /open-apis/im/v1/messages/{id}` | 决定之后原地换掉审批卡、Run 终态时换掉处理中卡片（§11.3） |
+//! | `POST /open-apis/im/v1/messages/{id}/reply` | 回复原消息发一张处理中卡片 |
+//! | `POST /open-apis/im/v1/messages/{id}/reactions` | 给原消息加表情回复（收到了） |
 //! | `GET /open-apis/im/v1/chats/{id}` | 这个会话是不是私聊——卡片回调载荷里没有这一项 |
 //!
 //! 只解析用得到的字段，其余一律忽略：开放平台每月加字段，而一个多出来的键不应该让一
@@ -246,6 +248,50 @@ impl FeishuApi {
             return Err(FeishuError::Decode("发送成功但没有 message_id".into()));
         }
         Ok(sent.message_id)
+    }
+
+    /// 回复一条消息，返回回复那条的 `message_id`——Run 终态时要按它原地改。
+    pub async fn reply_message(
+        &self,
+        message_id: &str,
+        msg_type: &str,
+        content: &str,
+    ) -> Result<String, FeishuError> {
+        #[derive(Deserialize)]
+        struct Sent {
+            #[serde(default)]
+            message_id: String,
+        }
+        let token = self.tenant_token().await?;
+        let sent: Sent = self
+            .call_data(
+                reqwest::Method::POST,
+                &format!("/open-apis/im/v1/messages/{message_id}/reply"),
+                Some(&token),
+                Some(json!({ "msg_type": msg_type, "content": content })),
+            )
+            .await?;
+        if sent.message_id.is_empty() {
+            return Err(FeishuError::Decode("回复成功但没有 message_id".into()));
+        }
+        Ok(sent.message_id)
+    }
+
+    /// 给一条消息加一个表情回复。`emoji_type` 是飞书表情列表里的字面量（如 `Get`）。
+    pub async fn add_reaction(
+        &self,
+        message_id: &str,
+        emoji_type: &str,
+    ) -> Result<(), FeishuError> {
+        let token = self.tenant_token().await?;
+        self.call_data::<Value>(
+            reqwest::Method::POST,
+            &format!("/open-apis/im/v1/messages/{message_id}/reactions"),
+            Some(&token),
+            Some(json!({ "reaction_type": { "emoji_type": emoji_type } })),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// 原地更新一张卡片（§11.3）。
@@ -509,6 +555,35 @@ mod tests {
         let patches = fake.calls_to("patch");
         assert_eq!(patches.len(), 1);
         assert_eq!(patches[0]["content"], r#"{"schema":"2.0"}"#);
+    }
+
+    #[tokio::test]
+    async fn replying_to_a_message_targets_it_and_returns_the_new_id() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let id = fake
+            .api()
+            .reply_message("om_origin", "interactive", r#"{"schema":"2.0"}"#)
+            .await
+            .expect("回复");
+        assert!(id.starts_with("om_"), "{id}");
+        let replies = fake.calls_to("reply");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["target"], "om_origin");
+        assert_eq!(replies[0]["msg_type"], "interactive");
+        assert_eq!(replies[0]["content"], r#"{"schema":"2.0"}"#);
+    }
+
+    #[tokio::test]
+    async fn a_reaction_names_the_message_and_the_emoji() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        fake.api()
+            .add_reaction("om_origin", "Get")
+            .await
+            .expect("加表情");
+        let reactions = fake.calls_to("reactions");
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0]["target"], "om_origin");
+        assert_eq!(reactions[0]["reaction_type"]["emoji_type"], "Get");
     }
 
     #[tokio::test]

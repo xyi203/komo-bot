@@ -797,13 +797,14 @@ impl TurnDriver for EchoOnceDriver {
     }
 }
 
-/// 送到某个渠道对端的全部文本回复（`Outbound::Text`）。
+/// 送到某个渠道对端的全部文本回复：Run 的最终回复（`Outbound::RunFinished`）与其余文本。
 fn texts_to(sender: &MemSender, chat: &str) -> Vec<String> {
     sender
         .to_chat(chat)
         .into_iter()
         .filter_map(|message| match message.outbound {
             Outbound::Text { text } => Some(text),
+            Outbound::RunFinished { summary, .. } => Some(summary),
             _ => None,
         })
         .collect()

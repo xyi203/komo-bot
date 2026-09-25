@@ -101,9 +101,9 @@ async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_on
     let delivered: Vec<_> = second_sender
         .sent()
         .into_iter()
-        .filter(
-            |message| matches!(&message.outbound, Outbound::Text { text } if text == "跑完了。"),
-        )
+        .filter(|message| {
+            matches!(&message.outbound, Outbound::RunFinished { summary, .. } if summary == "跑完了。")
+        })
         .collect();
     assert_eq!(delivered.len(), 1, "最终回复只投一次：{delivered:?}");
     assert_eq!(

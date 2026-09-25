@@ -464,7 +464,11 @@ async fn finish(
                 .log()
                 .deliver(
                     &DeliveryTarget::to_peer(peer.clone()),
-                    Outbound::Text { text },
+                    Outbound::RunFinished {
+                        session: session.clone(),
+                        run: run.clone(),
+                        summary: text,
+                    },
                 )
                 .await
             {

@@ -14,6 +14,8 @@
 //! - 决定之后的那张**无按钮卡片**：PATCH 换的是整张卡（飞书没有"只改按钮"的接口），
 //!   所以它是由原卡片派生出来的，原来的五项还得读得到。
 //!
+//! 另有 Run 的那张回复卡片：收到消息时回一张"处理中"，终态时 PATCH 成结果（§11.3）。
+//!
 //! 卡片用 **JSON 2.0**（`"schema": "2.0"`）：`collapsible_panel`（折叠区）只在 2.0 里
 //! 有，而 §11.3 的飞书列写的就是"卡片折叠区"。`config.update_multi` 两个版本都有，且
 //! PATCH 要求更新前后都为 `true`（spike callbacks.md 3d）。
@@ -32,6 +34,13 @@ use komo_kernel::types::plan::{ExecutionPlan, Operation, TargetAccess};
 // TODO(decide: 官方只给了 150KB 的 content 上限，没有给"一条消息多少字合适"。3000 是
 // 保守取值，真机看过排版后再定。)
 pub const MESSAGE_LIMIT: usize = 3000;
+
+/// 结果卡片里最多放多少字符的正文，其余发成后续文本消息。
+///
+/// 飞书对卡片消息的请求体上限是 30 KB，比文本的 150 KB 紧得多；而 PATCH 时卡片 JSON
+/// 还要作为字符串再转义一层。3000 个汉字约 9 KB，转义膨胀一倍也只占上限的一半多，
+/// 留给标题和那行备注。与 [`MESSAGE_LIMIT`] 同值只是巧合，两者的约束不同。
+pub const RESULT_CARD_LIMIT: usize = 3000;
 
 /// 动作块的截断长度（字符）。
 const ACTION_LIMIT: usize = 1200;
@@ -268,6 +277,58 @@ pub fn settled_line(short_id: &ShortId, approved: bool, by: &PeerId, at: OffsetD
 
 fn verdict_word(approved: bool) -> &'static str {
     if approved { "已批准" } else { "已拒绝" }
+}
+
+// ---------------------------------------------------------------- Run 的回复卡片
+
+/// 收到一条会起 Run 的消息时，回复原消息的那张"处理中"卡片。
+pub fn run_pending_card() -> Value {
+    card(
+        "处理中…".to_string(),
+        "blue",
+        json!([note("完成后结果会更新在这张卡片上")]),
+    )
+}
+
+/// Run 终态时 PATCH 上去的结果卡片，以及卡片放不下、要接着发的文本消息。
+///
+/// `Outbound::RunFinished` 只带正文不带状态，所以标题只说"已结束"——失败、取消的话
+/// 已经写在正文里了。
+pub fn run_result_card(summary: &str) -> (Value, Vec<RenderedMessage>) {
+    // 先去掉开头的空白：否则第一段可能整段是空白、被 `split_message` 跳过，下面按前缀
+    // 切就切错了地方。
+    let summary = summary.trim_start();
+    let head = split_message(summary, RESULT_CARD_LIMIT)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    // `split_message` 只修剪段尾，所以第一段是原文的前缀。
+    let rest = summary[head.len()..].trim_start();
+    let mut elements = vec![markdown(if head.is_empty() {
+        "（空）".to_string()
+    } else {
+        head
+    })];
+    let follow = if rest.is_empty() {
+        Vec::new()
+    } else {
+        elements.push(note("正文较长，其余见下方消息"));
+        text_segments(rest)
+    };
+    (
+        card("已结束".to_string(), "grey", Value::Array(elements)),
+        follow,
+    )
+}
+
+/// 卡片晚于终态才发出去、结果已经另发成文本时，把那张卡收尾——不能让它一直停在
+/// "处理中"。
+pub fn run_moved_card() -> Value {
+    card(
+        "已结束".to_string(),
+        "grey",
+        json!([note("结果见下方消息")]),
+    )
 }
 
 /// 卡片骨架。
@@ -921,6 +982,39 @@ mod tests {
         });
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, json!({ "text": "跑完了" }).to_string());
+    }
+
+    #[test]
+    fn a_short_result_fits_in_the_card_alone() {
+        let (card, follow) = run_result_card("**跑完了**");
+        assert_eq!(card["config"]["update_multi"], json!(true));
+        assert_eq!(body(&card).len(), 1);
+        assert_eq!(body(&card)[0]["tag"], json!("markdown"));
+        assert_eq!(body(&card)[0]["content"], json!("**跑完了**"));
+        assert!(follow.is_empty());
+    }
+
+    #[test]
+    fn a_long_result_puts_the_head_in_the_card_and_the_rest_in_messages() {
+        let summary = format!("{}{}", "a".repeat(RESULT_CARD_LIMIT), "b".repeat(10));
+        let (card, follow) = run_result_card(&summary);
+        let head = body(&card)[0]["content"].as_str().unwrap();
+        assert_eq!(head, "a".repeat(RESULT_CARD_LIMIT));
+        assert!(flat(&card).contains("其余见下方消息"), "{}", flat(&card));
+        assert_eq!(follow.len(), 1);
+        assert_eq!(
+            follow[0].content,
+            json!({ "text": "b".repeat(10) }).to_string()
+        );
+    }
+
+    #[test]
+    fn run_cards_keep_update_multi_and_avoid_dropped_tags() {
+        for card in [run_pending_card(), run_moved_card(), run_result_card("x").0] {
+            assert_eq!(card["config"]["update_multi"], json!(true));
+            assert_eq!(card["schema"], json!("2.0"));
+            assert!(!flat(&card).contains(r#""tag":"note""#), "{}", flat(&card));
+        }
     }
 
     #[test]

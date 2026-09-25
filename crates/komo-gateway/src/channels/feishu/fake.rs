@@ -65,6 +65,12 @@ pub struct Behavior {
     pub refuse_chats: bool,
     /// token 的 `expire` 只给 1 秒。
     pub short_lived_token: bool,
+    /// 回复一律被拒（处理中卡片发不出去）。
+    pub refuse_replies: bool,
+    /// 加表情一律被拒。
+    pub refuse_reactions: bool,
+    /// 每次回复先睡这么久——让"终态先于卡片"变得可复现。
+    pub reply_delay: Duration,
 }
 
 impl Behavior {
@@ -99,6 +105,27 @@ impl Behavior {
     pub fn short_lived_token() -> Self {
         Self {
             short_lived_token: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn refuse_replies() -> Self {
+        Self {
+            refuse_replies: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn refuse_reactions() -> Self {
+        Self {
+            refuse_reactions: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn slow_replies(delay: Duration) -> Self {
+        Self {
+            reply_delay: delay,
             ..Self::default()
         }
     }
@@ -220,6 +247,25 @@ async fn handle(
         } else {
             json!({ "code": 0, "msg": "ok", "data": {} })
         }
+    } else if path.ends_with("/reply") {
+        // 记下来的请求体多一个 `target`：被回复的是哪一条。
+        state.record("reply", &with_target(&body, &path));
+        if !state.behavior.reply_delay.is_zero() {
+            tokio::time::sleep(state.behavior.reply_delay).await;
+        }
+        if state.behavior.refuse_replies {
+            refuse(230002, "bot can not reply this message")
+        } else {
+            let id = state.next_message_id.fetch_add(1, Ordering::SeqCst);
+            json!({ "code": 0, "msg": "ok", "data": { "message_id": format!("om_{id}") } })
+        }
+    } else if path.ends_with("/reactions") {
+        state.record("reactions", &with_target(&body, &path));
+        if state.behavior.refuse_reactions {
+            refuse(231001, "reaction type is invalid")
+        } else {
+            json!({ "code": 0, "msg": "ok", "data": { "reaction_id": "r_1" } })
+        }
     } else if path.ends_with("/im/v1/messages") {
         state.record("messages", &body);
         if state.behavior.refuse_sends {
@@ -255,6 +301,16 @@ impl FakeState {
             .push((what.to_string(), body.clone()));
         self.log.push(what);
     }
+}
+
+/// `/im/v1/messages/{id}/reply` 之类路径里的那个 `{id}`，并进请求体的 `target`。
+fn with_target(body: &Value, path: &str) -> Value {
+    let target = path.rsplit('/').nth(1).unwrap_or_default();
+    let mut body = body.clone();
+    if let Value::Object(map) = &mut body {
+        map.insert("target".into(), json!(target));
+    }
+    body
 }
 
 fn refuse(code: i64, msg: &str) -> Value {

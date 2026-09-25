@@ -46,6 +46,7 @@ use komo_kernel::protocol::InboundAck;
 use komo_kernel::protocol::config::{ChannelConfig, ConfigSnapshot};
 use komo_kernel::traits::{Channel, ChannelError, Inbound, Shutdown};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform};
+use komo_kernel::types::ids::RunId;
 use komo_runtime::config::Secrets;
 
 use crate::channels::{BuiltChannel, ChannelFactory, ChannelSender};
@@ -215,6 +216,13 @@ impl FeishuChannel {
         }
 
         let request_key = inbound::request_key(&event_id);
+        // 原消息的 id 留在渠道里：加表情、回复卡片用它。卡片回调没有"原消息"可回。
+        let origin = match &kind {
+            EventKind::Message(event) => {
+                Some(event.message.message_id.trim().to_string()).filter(|id| !id.is_empty())
+            }
+            EventKind::CardAction(_) => None,
+        };
         let message = match kind {
             EventKind::Message(event) => inbound::from_message(&event, &bot.open_id, request_key),
             EventKind::CardAction(event) => {
@@ -232,7 +240,17 @@ impl FeishuChannel {
 
         let peer = message.peer.clone();
         match inbound.handle(message).await {
-            Ok(InboundAck::Replied { text }) => self.reply(&peer, &text).await,
+            Ok(InboundAck::Queued { run, .. }) => {
+                if let Some(origin) = &origin {
+                    self.acknowledge_run(&peer, origin, &run).await;
+                }
+            }
+            Ok(InboundAck::Replied { text }) => {
+                if let Some(origin) = &origin {
+                    self.react(origin).await;
+                }
+                self.reply(&peer, &text).await
+            }
             Ok(InboundAck::Rejected { hint }) => self.reply(&peer, &hint).await,
             Ok(_) => {}
             Err(error) => {
@@ -256,6 +274,23 @@ impl FeishuChannel {
                 tracing::warn!(%error, "飞书：问不到会话类型，按群会话处理");
                 false
             }
+        }
+    }
+
+    /// 一条起了 Run 的消息：先加表情，再回复一张"处理中"卡片，终态时那张卡片换成结果
+    /// （§11.3）。两步都非致命——卡片没发出去，终态照旧发文本。
+    async fn acknowledge_run(&self, peer: &ChannelPeer, origin: &str, run: &RunId) {
+        // 先登记再联网：终态投递与这里并发，可能在卡片发出去之前就到。
+        let ticket = self.sender.expect_run_card(run, &peer.chat_id);
+        self.react(origin).await;
+        if let Err(error) = self.sender.reply_run_card(ticket, origin).await {
+            tracing::warn!(%peer, %run, %error, "飞书：处理中卡片没发出去，终态改发文本");
+        }
+    }
+
+    async fn react(&self, origin: &str) {
+        if let Err(error) = self.sender.react_received(origin).await {
+            tracing::warn!(message_id = origin, %error, "飞书：表情没加上");
         }
     }
 
@@ -734,19 +769,30 @@ mod tests {
                 .unwrap()
                 .contains("allow_from")
         );
+        assert!(fake.calls_to("reactions").is_empty(), "被拒的消息不加表情");
+        assert!(fake.calls_to("reply").is_empty());
+    }
+
+    fn queued() -> InboundAck {
+        InboundAck::Queued {
+            session: SessionId::from_raw("s-1"),
+            run: RunId::from_raw("run-1"),
+        }
+    }
+
+    fn run_finished(summary: &str) -> komo_kernel::types::chat::Outbound {
+        komo_kernel::types::chat::Outbound::RunFinished {
+            session: SessionId::from_raw("s-1"),
+            run: RunId::from_raw("run-1"),
+            summary: summary.into(),
+        }
     }
 
     #[tokio::test]
-    async fn a_queued_message_gets_no_immediate_reply() {
+    async fn a_queued_message_gets_a_reaction_then_a_card_reply() {
         let fake = FakeOpenApi::start(Behavior::default()).await;
         let harness = harness(&fake);
-        let recorder = RecordingInbound::with_ack(
-            fake.log(),
-            InboundAck::Queued {
-                session: SessionId::from_raw("s-1"),
-                run: RunId::from_raw("run-1"),
-            },
-        );
+        let recorder = RecordingInbound::with_ack(fake.log(), queued());
 
         harness
             .events
@@ -760,14 +806,158 @@ mod tests {
             ))
             .unwrap();
 
-        serve_until(harness.channel, recorder.clone(), || {
-            !recorder.received().is_empty()
+        serve_until(harness.channel, recorder, || {
+            !fake.calls_to("reply").is_empty()
         })
         .await;
 
+        let log = fake.log();
+        let reacted = log.position("reactions").expect("加了表情");
+        let replied = log.position("reply").expect("回了卡片");
+        assert!(reacted < replied, "先表情后卡片：{:?}", log.entries());
+
+        let reactions = fake.calls_to("reactions");
+        assert_eq!(reactions[0]["target"], "om_evt-62");
+        assert_eq!(reactions[0]["reaction_type"]["emoji_type"], "Get");
+        let replies = fake.calls_to("reply");
+        assert_eq!(replies[0]["target"], "om_evt-62", "回复的是原消息");
+        assert_eq!(replies[0]["msg_type"], "interactive");
         assert!(
             fake.calls_to("messages").is_empty(),
-            "排队的消息由 Run 结束时的投递回答，不在这里"
+            "结果由 Run 结束时更新卡片，不在这里另发"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_command_reply_gets_the_reaction_but_no_card() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::with_ack(
+            fake.log(),
+            InboundAck::Replied {
+                text: "没有待处理的审批".into(),
+            },
+        );
+
+        harness
+            .events
+            .send(text_event(
+                "evt-64",
+                "oc_1",
+                "p2p",
+                "ou_op",
+                "/pending",
+                &[],
+            ))
+            .unwrap();
+
+        serve_until(harness.channel, recorder, || {
+            !fake.calls_to("messages").is_empty()
+        })
+        .await;
+
+        assert_eq!(fake.calls_to("reactions")[0]["target"], "om_evt-64");
+        assert!(fake.calls_to("reply").is_empty(), "命令回执不发卡片");
+        assert_eq!(fake.calls_to("messages").len(), 1, "回执照旧是文本");
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_gets_neither_reaction_nor_card() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::with_ack(
+            fake.log(),
+            InboundAck::Duplicate {
+                run: Some(RunId::from_raw("run-1")),
+            },
+        );
+
+        harness
+            .events
+            .send(text_event("evt-65", "oc_1", "p2p", "ou_op", "在吗", &[]))
+            .unwrap();
+
+        serve_until(harness.channel, recorder.clone(), || {
+            fake.log().position("handle:end").is_some()
+        })
+        .await;
+
+        assert!(fake.calls_to("reactions").is_empty());
+        assert!(fake.calls_to("reply").is_empty());
+        assert!(fake.calls_to("messages").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_reaction_does_not_stop_the_card() {
+        let fake = FakeOpenApi::start(Behavior::refuse_reactions()).await;
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::with_ack(fake.log(), queued());
+
+        harness
+            .events
+            .send(text_event(
+                "evt-66",
+                "oc_1",
+                "p2p",
+                "ou_op",
+                "帮我查一下",
+                &[],
+            ))
+            .unwrap();
+
+        serve_until(harness.channel, recorder, || {
+            !fake.calls_to("reply").is_empty()
+        })
+        .await;
+
+        assert_eq!(fake.calls_to("reactions").len(), 1);
+        assert_eq!(fake.calls_to("reply")[0]["target"], "om_evt-66");
+    }
+
+    // 终态投递来自 Run 的看客任务，与 serve 循环并发：卡片还在路上时它就到了。
+    #[tokio::test]
+    async fn a_result_arriving_before_the_card_still_lands_on_the_card() {
+        let fake = FakeOpenApi::start(Behavior::slow_replies(Duration::from_millis(300))).await;
+        let harness = harness(&fake);
+        let sender = harness.channel.sender();
+        let recorder = RecordingInbound::with_ack(fake.log(), queued());
+
+        harness
+            .events
+            .send(text_event(
+                "evt-67",
+                "oc_1",
+                "p2p",
+                "ou_op",
+                "帮我查一下",
+                &[],
+            ))
+            .unwrap();
+
+        let finishing = {
+            let log = fake.log();
+            tokio::spawn(async move {
+                // 表情发出去时槽位已经登记，卡片还没回来。
+                while log.position("reactions").is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                sender
+                    .send(&inbound::peer_of("oc_1"), run_finished("跑完了"))
+                    .await
+            })
+        };
+
+        serve_until(harness.channel, recorder, || {
+            !fake.patched_message_ids().is_empty()
+        })
+        .await;
+        finishing.await.unwrap().expect("终态送到了");
+
+        assert_eq!(fake.calls_to("reply").len(), 1);
+        assert_eq!(fake.patched_message_ids().len(), 1);
+        assert!(
+            fake.calls_to("messages").is_empty(),
+            "不该既发文本又让卡片停在处理中"
         );
     }
 

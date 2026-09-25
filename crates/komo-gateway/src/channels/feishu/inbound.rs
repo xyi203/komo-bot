@@ -70,6 +70,10 @@ pub struct SenderId {
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct Message {
+    /// 这条消息自己的 id。加表情、回复卡片都指向它；不进 [`InboundMessage`]——那是三个
+    /// 渠道共用的类型。
+    #[serde(default)]
+    pub message_id: String,
     #[serde(default)]
     pub chat_id: String,
     /// `p2p` / `group`。
@@ -320,6 +324,7 @@ mod tests {
                 },
             },
             message: Message {
+                message_id: "om_1".into(),
                 chat_id: chat_id.into(),
                 chat_type: chat_type.into(),
                 message_type: "text".into(),
@@ -349,6 +354,7 @@ mod tests {
         };
         assert!(event.message.is_private());
         assert_eq!(event.message.chat_id, "oc_1");
+        assert_eq!(event.message.message_id, "om_evt-1");
     }
 
     #[test]

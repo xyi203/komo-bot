@@ -1295,7 +1295,8 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的�
                               4. 冲刷该会话 pending 的投递（§11.4）
                               5. 命令？→ 直接处理并 ack
                               6. 普通文本 → Ledger::accept_input → 排队
-                       回复：订阅该 Session 的事件流，Run 终态时把最终 assistant 消息发回来源会话；
+                       回复：订阅该 Session 的事件流，Run 终态时把最终 assistant 消息作为
+                             `Outbound::RunFinished` 投回来源会话（飞书更新回复卡片，§11.3）；
                              待处理 Intervention（审批、结果不明、阻塞）走 Notifier（§11.4）
 ```
 
@@ -1392,6 +1393,13 @@ TELEGRAM_BOT_TOKEN=...
 **飞书卡片是 JSON 2.0（`schema: "2.0"`），而 2.0 去掉了 `note` 组件与 `action` 模块。** 官方的不兼容变更写明：2.0 不再支持 note 与 action（`tag` 为 `action`），且 2.0 对不认识的组件是**整张卡打回**而不是忽略。所以"卡片备注"（原因、有效期、结论那一行）是普通文本组件加 `notation` 字号与灰色；一行按钮是 `column_set`，每列一个 button，那一块带固定的 `element_id`——决定之后那张无按钮的卡靠它整块摘掉。踩过的坑在 §14：带 `note` 的卡片被平台拒（`230099 / 200861 unsupported tag note`），于是审批请求**一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上。
 
 **决定后的原地更新用 `PATCH /open-apis/im/v1/messages/{message_id}`，不用回调响应体。** 飞书官方给了三条路：回调响应里直接回传新卡片（须在 3 秒内）、用回调 `token` 延时更新（30 分钟内、最多 2 次、且必须在响应回调之后）、以及无条件 PATCH（仅 `interactive` 消息、仅 14 天内发送的消息、单条 5 QPS、更新前后 `config` 均须 `update_multi:true`）。komo 取第三条：审批的决定先落 Ledger 再回写界面，这件事跨越了回调的 3 秒预算；而且 PATCH 是普通 REST 调用，与「ws 长连接还是 HTTP 回调」无关，不必赌 ws 客户端能不能回传响应帧。回调本身只需尽快返回，必要时带一个 `toast`。Telegram 侧对应 `editMessageReplyMarkup` 去掉按钮：官方的 48 小时编辑限制只约束「非机器人自己发送且不含 inline keyboard 的 business message」，机器人自己发的审批卡片不受时限；编辑失败按**非致命**处理——决定已在 Ledger 里，界面回写失败不改变结论，也不要去匹配错误文案（官方明示 `error_code` 内容将来会变）。
+
+**飞书的 Run 回复卡片（2026-09-25 实现，未真机验证）。** 一条起了 Run 的飞书消息（Dispatcher 回 `Queued`）：渠道先给原消息加一个 `Get` 表情（`POST /open-apis/im/v1/messages/{message_id}/reactions`），再**回复原消息**发一张"处理中"卡片（`POST …/{message_id}/reply`）；Run 终态（完成 / 失败 / 取消 / 放弃）时把这张卡片 PATCH 成结果——正文放在 markdown 组件里，不再另发一条文本。命令回执（`Replied`）只加表情、回执照旧是文本；`Duplicate` / `Rejected` / `Ignored` 与卡片回调什么都不加。原消息的 `message_id` 只留在飞书渠道里，不进三个渠道共用的 `InboundMessage`。
+
+- **终态投递统一用 `Outbound::RunFinished`**（不是 `Text`）：聊天来源的 Run 因此与 Cron 一样落 `deliveries` 的 `RunFinished` 行，§8.4 第 10 行"结果没送达 → 补发"对它们同样成立。Telegram / WeChat 对它与 `Text` 渲染相同。
+- **卡片在哪是进程内小账**，与审批卡片同一种性质：按 `(run, chat_id)` 记，有上限，是缓存不是权威。查不到（重启后账没了、Cron 投 home 的 `RunFinished`、卡片没发出去）就发文本；PATCH 失败也退化成发文本——那一次必须送到，`deliveries` 那一行靠它结算。表情或卡片失败都只记 WARN，不影响后续。
+- **正文过长**：卡片只放前 3000 个字符（飞书卡片请求体上限 30 KB，PATCH 时卡片 JSON 还要再转义一层，取一个保守值）并注明"其余见下方消息"，余下的按普通文本分段发。
+- **竞态**：终态投递来自 Run 的看客任务，与发卡片并发，可能先到。所以拿到 `Queued` 后、任何网络调用之前先同步登记一个 pending 槽位，卡片发出去后填上 `message_id`（或标记失败）；终态遇到 pending 槽位时最多等 5 秒。等不到就把槽位标成"已放弃"改发文本，卡片之后才到的由发卡片那一侧自己把它收尾成"结果见下方消息"——两边在同一把锁里比较并交换，谁先到都只有一方认领那张卡片，不会出现"文本发了、卡片停在处理中"。剩下的窗口只有"Dispatcher 返回 `Queued` 到登记槽位"之间（同步代码、没有 await），Run 要在那里面跑完一整轮才会漏。
 
 一条普通消息在 Run 等待审批时到达：Run 不会被越过（§6），消息排在它后面；不做"插话替换审批"这类特殊路径。
 
@@ -2049,6 +2057,7 @@ Memory 与模型验收覆盖：
 | Telegram 把消息编辑成与现状相同内容时返回的错误（官方未文档化，且声明 `error_code` 内容会变） | §11.3 决定后去掉按钮的幂等重试 | 不匹配错误文案；编辑失败一律当非致命，决定以 Ledger 为准 |
 | 补发积压投递的真实代价（启动路径） | §3 第 4 步、§11.4 | **已核实（2026-09-18，本机实测）：它就是"重启好慢"的全部。** `komo gateway restart` 9.0s：bootout + 等待 launchctl 卸完 + bootstrap 只占 0.22s（分别 6ms / 220ms / 11ms），**约 5.1s 花在渠道起来时的按平台补发、2.9s 花在启动时的整体补发**——两者都在 "Gateway 就绪" 之前同步跑，每条 pending 一个平台往返（飞书 ~290ms），而当时积压的投递因为卡片被平台拒（下一行）永远送不出去。改成就绪之后后台跑之后：**2.7s**，其中进程启动到就绪 1.8s。剩余 1.25s 是启动时的 embedding 维度探测（本地 ollama 往返），与补发无关，**已做（2026-09-18，本机 Fedora 实测）**：探测移出就绪路径（§3「就绪也不等模型探测」）——把向量端点指向一个只收连接不回话的 socket 时，修复前发现文件与 `Gateway 就绪` **都在 120.12s**（等满模型超时），修复后 **0.16s**；探测改在后台，`docs/komo_bot.md` 的那 1.25s 同样不再落在重启上。回归测试 `komo-gateway/tests/memory/startup.rs`（预修版本 5s 超时失败） |
 | 飞书卡片 2.0 支持哪些组件 | §11.3 卡片渲染 | **已核实（2026-09-18，官方不兼容变更 + 线上报文）：2.0 不再支持 `note` 组件与 `action` 模块**，且 2.0 对不认识的组件是**整张卡打回**而不是忽略。线上表现：每一个审批请求都被拒（`http 400 / code 230099`，`ErrCode 200861 unsupported tag note`），**审批一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上——审批的主入口（§11.3）整个是死的，操作者只看得到"等待审批"的 Run。替代写法已按官方给的来：备注 = 普通文本组件 + `notation` 字号 + 灰色；按钮行 = `column_set` 每列一个 button，那一块带固定 `element_id` 供决定后整块摘掉 |
+| 飞书 Run 回复卡片的真机行为（§11.3）：`Get` 表情与 reply 接口需要的权限 scope、markdown 组件对模型最终回复的排版 | §11.3 飞书的 Run 回复卡片 | **未真机验证（2026-09-25，只有假开放平台上的测试）。** 表情或回复被平台拒时按设计退化：表情失败只记 WARN，卡片没发出去则终态照旧发文本；排版不理想时改渲染，不改投递路径 |
 | reconcile 一拍的真实成本（目标：1 万 Run / 1 千 Session）与它该排在哪个周期 | §8.9 的周期兜底 | 从 `AUDIT_TICK` 那一拍拆出来，按更粗的间隔跑（例如 5 分钟），或只对"启动后还没对过账的那些"跑；启动时那一次无论如何都要跑 |
 | `sessions.state` 之外是否还需要一个"回收进行中"的中间态 | §8.10 的 `purge` | 当前设计靠"墓碑先落、内容后删"取得幂等，不需要第四个状态；若实测发现"内容删到一半"无法与"内容被外部删掉"区分，再补一个状态列值（仍是加列/加值，不改 schema 形状） |
 | **既有的 state.db 能不能加上新列**（§8.2 那句"schema 变化只增不改、`ensure_schema` 连上时补列"） | 升级路径：任何一个加了列的新版本在旧库上都起不来 | **已实测（2026-09-20，委派那两列 `runs.parent_run_id` / `runs.delegate`，本机 macOS + 真实 Turso MVCC 库）：补列会静默丢掉。** 现象：旧二进制建的库 → 新二进制启动 → 日志有 `补一列 table="runs" column="parent_run_id"` 两条 → 但同进程随后的每一条用到该列的语句都报 `Parse error: no such column: parent_run_id`（领取 SQL、待处理清单、对账、建会话全中），**重启也没用**；与此同时把 `state.db` 单独复制出来、由另一个进程打开时，同一段 `ensure_schema` 又能"补上"并打印出带新列的 DDL（所以库里没有落盘、那个进程看到的只是自己那份视图）。**新装的库完全正常**（真机端到端委派已验证），坏的只有"旧库 + 新列"这一条路。待办：查 Turso MVCC 下 DDL 的持久化语义（是否必须走非 MVCC 连接 / 是否要升级 turso），再决定补列是改成"用原始连接迁移"还是"表重建"。 **已定位并已改（2026-09-20，同日）：MVCC 连接上的 DDL 不落盘**（`Ok` + 日志照打，重开即无），所以补列改走**建池之前**——`Db::connect` 在 `toasty::Db::builder` 之前用**普通（非 MVCC）连接**把已存在的文件补到当前 schema（`migrate_file`：建缺失表 → `ALTER TABLE ADD COLUMN` → 建缺失索引），全部幂等；`ensure_schema` 退成**守卫**：文件库再缺列就**报错**（"补列必须走建池之前的迁移"），只有内存库（没有文件）还由它补。实现上还有个坑：turso 的读游标拖着一条读事务，**同一条连接上"边读边改"会 panic**在 `vdbe/execute.rs` 的 `SetCookie`（`invalid transaction state for SetCookie: TransactionState::Read, should be write`），所以那段是"一次读清 → 丢连接 → 只用一条只写连接改"。**已验证（真库副本，本机 macOS）**：副本 `sessions` 少 `state`/`state_changed_at`、`runs` 少 8 列 → `Db::connect` 之后 12/31 列齐全、另开一条连接读得回（确实落盘），按模型读 sessions 25 行（含 `origin`）、runs 正常。回归测试两条 `a_missing_column_is_added_on_reopen` / `the_delegate_columns_are_added_to_an_existing_runs_table`：**在普通连接上造旧形状、在另一条新连接上确认落盘**，原先那两条在池连接上造形状，两边都在空转——这正是真机上漏过去的原因。未核实：断电 / 内核崩溃下的持久性，以及升级 turso 后行为是否改变。 |

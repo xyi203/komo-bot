@@ -241,13 +241,13 @@ impl FeishuChannel {
         let peer = message.peer.clone();
         match inbound.handle(message).await {
             Ok(InboundAck::Queued { run, .. }) => {
-                if let Some(origin) = &origin {
-                    self.acknowledge_run(&peer, origin, &run).await;
+                if let Some(origin) = origin {
+                    self.acknowledge_run(&peer, origin, &run);
                 }
             }
             Ok(InboundAck::Replied { text }) => {
-                if let Some(origin) = &origin {
-                    self.react(origin).await;
+                if let Some(origin) = origin {
+                    tokio::spawn(react(Arc::clone(&self.sender), origin));
                 }
                 self.reply(&peer, &text).await
             }
@@ -279,25 +279,32 @@ impl FeishuChannel {
 
     /// 一条起了 Run 的消息：先加表情，再回复一张"处理中"卡片，终态时那张卡片换成结果
     /// （§11.3）。两步都非致命——卡片没发出去，终态照旧发文本。
-    async fn acknowledge_run(&self, peer: &ChannelPeer, origin: &str, run: &RunId) {
-        // 先登记再联网：终态投递与这里并发，可能在卡片发出去之前就到。
+    ///
+    /// 登记在这里同步做，联网放进后台任务：`serve` 逐条处理事件，两次平台往返不该压住
+    /// 下一条消息。
+    fn acknowledge_run(&self, peer: &ChannelPeer, origin: String, run: &RunId) {
         let ticket = self.sender.expect_run_card(run, &peer.chat_id);
-        self.react(origin).await;
-        if let Err(error) = self.sender.reply_run_card(ticket, origin).await {
-            tracing::warn!(%peer, %run, %error, "飞书：处理中卡片没发出去，终态改发文本");
-        }
-    }
-
-    async fn react(&self, origin: &str) {
-        if let Err(error) = self.sender.react_received(origin).await {
-            tracing::warn!(message_id = origin, %error, "飞书：表情没加上");
-        }
+        let sender = Arc::clone(&self.sender);
+        let peer = peer.clone();
+        let run = run.clone();
+        tokio::spawn(async move {
+            react(Arc::clone(&sender), origin.clone()).await;
+            if let Err(error) = sender.reply_run_card(ticket, &origin).await {
+                tracing::warn!(%peer, %run, %error, "飞书：处理中卡片没发出去，终态改发文本");
+            }
+        });
     }
 
     async fn reply(&self, peer: &ChannelPeer, text: &str) {
         if let Err(error) = self.sender.send_text(&peer.chat_id, text).await {
             tracing::warn!(%peer, %error, "飞书：回执没送出去");
         }
+    }
+}
+
+async fn react(sender: Arc<FeishuSender>, origin: String) {
+    if let Err(error) = sender.react_received(&origin).await {
+        tracing::warn!(message_id = %origin, %error, "飞书：表情没加上");
     }
 }
 

@@ -55,6 +55,8 @@ pub enum OperationMatch {
     McpRead,
     /// 其余 MCP 工具：副作用由服务器决定。
     McpCall,
+    /// 沙箱里的脚本（`docs/codemode.md`）。
+    Codemode,
 }
 
 impl OperationMatch {
@@ -76,6 +78,7 @@ impl OperationMatch {
                 read_only: true, ..
             } => OperationMatch::McpRead,
             Operation::McpCall { .. } => OperationMatch::McpCall,
+            Operation::Codemode { .. } => OperationMatch::Codemode,
         }
     }
 }

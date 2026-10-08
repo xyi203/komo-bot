@@ -206,6 +206,14 @@ impl RuleTable {
                     "MCP 工具调用：副作用由外部服务决定",
                     Matcher::operations([OperationMatch::McpCall]),
                 ),
+                // codemode（`docs/codemode.md`）：脚本在沙箱里碰不到外部，它里面的每一次
+                // 调用都各自过 Policy，而且只放行只读的。
+                rule(
+                    "codemode-allow",
+                    Effect::Allow,
+                    "沙箱里的脚本：自己碰不到外部，里面的调用只放行只读且各自过 Policy 的",
+                    Matcher::operations([OperationMatch::Codemode]),
+                ),
             ],
             default: Effect::Ask,
         }
@@ -805,6 +813,21 @@ mod tests {
         assert!(write.reason().contains("mcp-call"));
 
         assert!(RuleTable::auto().decide(&call(false), &f.ctx()).is_allow());
+    }
+
+    #[test]
+    fn codemode_is_allowed_under_the_strict_table() {
+        let f = Fixture::new();
+        let script = plan(
+            "codemode",
+            Operation::Codemode {
+                code: "text(1)".into(),
+            },
+            vec![],
+        );
+        let decision = RuleTable::initial().decide(&script, &f.ctx());
+        assert!(decision.is_allow(), "{decision:?}");
+        assert!(decision.reason().contains("codemode-allow"));
     }
 
     // ---- 梯子本身 ----

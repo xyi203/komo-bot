@@ -136,6 +136,11 @@ pub enum Operation {
         #[serde(default)]
         read_only: bool,
     },
+    /// 一段在操作系统沙箱里跑的 Python 脚本（`docs/codemode.md`）。
+    ///
+    /// 脚本自己碰不到文件、网络与进程；它里面的工具调用回到 executor，**只放行只读且
+    /// Policy 直接 Allow 的**。所以它整体是只读的：中断后整段重跑与重读同理。
+    Codemode { code: String },
 }
 
 impl Operation {
@@ -149,6 +154,7 @@ impl Operation {
         matches!(
             self,
             Operation::ReadFile
+                | Operation::Codemode { .. }
                 | Operation::McpCall {
                     read_only: true,
                     ..

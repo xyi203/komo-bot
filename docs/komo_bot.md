@@ -155,6 +155,8 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 `resume` 的目标在 `prepare` 里校验，不过就是一次**没有执行过**的调用，按 `fail_call` 落账并把理由交给模型（§13.5）：① 同一 Session，且是一条子 Run（主对话的 Run 不是"子代理"，没有什么可续）；② 已经进终态，且终态是 `completed` 或 `failed`——**`cancelled` / `abandoned` 不能续**：那是操作者说过"这件事到此为止"，模型不能替人把它捡回来；③ 在最新一个 `conversation.boundary` 之后——边界之前的那条线属于上一段对话，父的窗口里已经看不到它，续过去的窗口也会被边界截断成一半；④ **它是这条线的末端**：已经有别的子 Run `resumes` 它（不论那条什么状态）就拒绝，理由里写出末端是哪一条——线只往后接，不分叉，想另起炉灶就不填 `resume`。④ 不靠"先查后写"：它在受理子 Run 的那个 db 事务里再判一次（与 `run.accepted` 同一次提交，§8.5），查到了就不受理。
 
+**`codemode` 是组合，不是新能力。** 模型写一段 Python，在 macOS 的 Seatbelt 沙箱里跑（不能写文件、联网、起子进程），脚本里经 `tools.<name>()` 调其他工具——只放行只读且 Policy 直接 Allow 的，只有脚本的输出回到模型。沙箱自检不过就不注册。见 `docs/codemode.md`。
+
 **MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 Policy / 审批 / 落账的路；只读与否由操作者声明，不信服务器自报。见 `docs/mcp.md`。
 
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、Policy 判断、审批处理、执行状态保存、取消和输出限制。
@@ -468,6 +470,7 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 | 派一个新任务（`Operation::Dispatch`）         | strict 与 auto 下都 Allow：它只是建一个独立的**任务会话**并提交第一条输入（`docs/background-tasks.md`），不等它跑完，**任务会话里的每一次调用仍各自按上面各行判断**——不放宽任何一层。幂等键 `dispatch:{run}:{call}` 让重放的同一次调用不会多建一个任务 |
 | 追问一个任务（`Operation::Follow`）           | 同上：strict 与 auto 下都 Allow，只是把一句话提交进一个已有的任务会话；幂等键 `follow:{run}:{call}` |
 | 调 MCP 工具（`Operation::McpCall`）           | 操作者在 `[mcp.servers.<name>] read_only` 里声明的：strict 与 auto 下都 Allow，中断后重读；其余：strict 下 Ask（卡片上是服务器、工具与完整参数），auto 下 Allow，中断后停下问人。服务器自报的 `readOnlyHint` 不算数（`docs/mcp.md`） |
+| 沙箱脚本（`Operation::Codemode`）             | strict 与 auto 下都 Allow：脚本自己碰不到外部，里面的每次调用各自过 Policy，只放行只读且直接 Allow 的（要审批的在脚本里抛错）；中断后整段重跑（`docs/codemode.md`） |
 | shell 命令文本匹配 `komo cron add`            | strict 下永远 Ask，且**只能批一次**（`scopes` 固定 `[once]`，不给 Run / Cron 范围）；**任何已有的 Run / Cron 范围授权都不能替这一步作答**——`cron add` 会给命令 Job 自己签发一条执行授权（见下），模型能经 shell 调它给自己写将来能免问的许可，这一条必须每次都问人。auto 基表不变（§7.1「auto 与 strict 的差别就是要不要人看一眼」，这条也不例外） |
 
 **两套建议，操作者选一套。** 上面那张表落成 `RuleTable::initial()`（"strict"）；另一套是

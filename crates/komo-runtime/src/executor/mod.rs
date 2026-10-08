@@ -28,6 +28,7 @@
 //! 的结果就是它的终态（§8.6「可以核对目标状态」）。
 
 pub mod cancel;
+mod codemode;
 #[cfg(test)]
 pub mod harness;
 
@@ -276,6 +277,9 @@ pub struct ToolExecutor {
     /// （[`Self::set_spawner`]）。没有装配它时两个操作按"这台 Gateway 没有接任务
     /// 分发"干净失败，不是一个悬着的调用。
     spawner: std::sync::OnceLock<Arc<dyn TaskSpawner>>,
+    /// codemode 的沙箱（`docs/codemode.md`）。`None` = 这台机器上沙箱起不来，`codemode`
+    /// 也不会被注册。
+    codemode: Option<Arc<crate::codemode::Sandbox>>,
 }
 
 impl std::fmt::Debug for ToolExecutor {
@@ -308,7 +312,13 @@ impl ToolExecutor {
             clock,
             limits: ExecutionLimits::default(),
             spawner: std::sync::OnceLock::new(),
+            codemode: None,
         }
+    }
+
+    pub fn with_codemode(mut self, sandbox: Option<Arc<crate::codemode::Sandbox>>) -> Self {
+        self.codemode = sandbox;
+        self
     }
 
     pub fn with_limits(mut self, limits: ExecutionLimits) -> Self {
@@ -684,12 +694,18 @@ impl ToolExecutor {
         ctx.resumed = resumed;
         let started = std::time::Instant::now();
         let approved = ApprovedPlan::new(plan.clone(), proof);
+        // codemode：外层照常落账，执行这一步换成沙箱里的脚本（`docs/codemode.md` §3）。
+        let execution = async {
+            match &plan.operation {
+                Operation::Codemode { code } => {
+                    self.run_codemode(code, env, &ctx, writer.as_mut()).await
+                }
+                _ => tool.execute(approved, &ctx, writer.as_mut()).await,
+            }
+        };
         let executed = race(
             &env.cancel,
-            tokio::time::timeout(
-                env.call_timeout + REAP_GRACE,
-                tool.execute(approved, &ctx, writer.as_mut()),
-            ),
+            tokio::time::timeout(env.call_timeout + REAP_GRACE, execution),
         )
         .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;

@@ -470,6 +470,7 @@ fn plan_action(plan: &ExecutionPlan) -> String {
                 serde_json::to_string_pretty(&plan.args).unwrap_or_default()
             ));
         }
+        Operation::Codemode { code } => lines.push(format!("脚本:\n{code}")),
         _ => {}
     }
     if let Some(cwd) = &plan.cwd {
@@ -509,6 +510,7 @@ fn operation_label(operation: &Operation) -> &'static str {
         Operation::Dispatch { .. } => "dispatch",
         Operation::Follow { .. } => "follow",
         Operation::McpCall { .. } => "mcp_call",
+        Operation::Codemode { .. } => "codemode",
     }
 }
 

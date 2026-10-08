@@ -399,6 +399,8 @@ pub struct Assembly {
     /// skill 取决于这台机器上别人装过什么。
     pub shared_home: Option<PathBuf>,
     pub tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
+    /// codemode 的沙箱（`docs/codemode.md`）；`None` = 自检没过，`codemode` 也不在 `tools` 里。
+    pub codemode: Option<Arc<komo_runtime::codemode::Sandbox>>,
     /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
     pub channels: Vec<Arc<dyn ChannelFactory>>,
 }
@@ -418,6 +420,7 @@ impl GatewayState {
             embeddings,
             shared_home,
             tools,
+            codemode,
             channels: factories,
         } = parts;
 
@@ -522,14 +525,17 @@ impl GatewayState {
             &snapshot,
             shared_home.as_deref(),
         )));
-        let executor_tools = Arc::new(ToolExecutor::new(
-            tools,
-            Arc::clone(&turn_ledger),
-            Arc::clone(&outputs),
-            ApprovalGate::new(Arc::clone(&approval_repo), Arc::clone(&clock)),
-            policy.as_ref().clone(),
-            Arc::clone(&clock),
-        ));
+        let executor_tools = Arc::new(
+            ToolExecutor::new(
+                tools,
+                Arc::clone(&turn_ledger),
+                Arc::clone(&outputs),
+                ApprovalGate::new(Arc::clone(&approval_repo), Arc::clone(&clock)),
+                policy.as_ref().clone(),
+                Arc::clone(&clock),
+            )
+            .with_codemode(codemode),
+        );
 
         let agent = Arc::new(AgentLoop::new(
             Arc::clone(&llm) as Arc<dyn LlmClient>,

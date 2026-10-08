@@ -173,6 +173,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         .map_err(|error| ServiceError::Store(error.to_string()))?;
 
     // 4. 装配。
+    let (tools, codemode) = build_tools(&config, &instance_id, &db, Arc::clone(&clock)).await;
     let state = GatewayState::assemble(Assembly {
         home: home.clone(),
         config: Arc::clone(&config),
@@ -184,7 +185,8 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         llm: options.llm,
         embeddings: options.embeddings,
         shared_home: options.shared_home.clone(),
-        tools: build_tools(&config, &instance_id, &db, Arc::clone(&clock)).await,
+        tools,
+        codemode,
         channels: options.channels,
     })
     .await
@@ -568,13 +570,17 @@ pub fn agent_config_file(config: &ConfigHolder) -> PathBuf {
     config.home().join("config.toml")
 }
 
-/// 六个基础工具（§4）与那条编排操作。`python` 要有一个跑得起来的解释器才挂。
+/// 六个基础工具（§4）与那条编排操作。`python` 要有一个跑得起来的解释器才挂；
+/// `codemode` 要沙箱自检通过才挂（`docs/codemode.md` §4），沙箱随之交给执行器。
 async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
     db: &komo_store::Db,
     clock: Arc<dyn Clock>,
-) -> Vec<Arc<dyn Tool>> {
+) -> (
+    Vec<Arc<dyn Tool>>,
+    Option<Arc<komo_runtime::codemode::Sandbox>>,
+) {
     use komo_runtime::tools::{
         DelegateTool, DispatchTool, EditTool, FollowTool, ReadTool, RgTool, ShellTool, WriteTool,
     };
@@ -613,6 +619,16 @@ async fn build_tools(
 
     let toolbox = toolbox_of(&config.current());
     let python = python_env(config, &toolbox);
+    let codemode = match komo_runtime::codemode::Sandbox::probe(&python.interpreter_path()).await {
+        Ok(sandbox) => {
+            tools.push(Arc::new(komo_runtime::tools::CodemodeTool::new()));
+            Some(Arc::new(sandbox))
+        }
+        Err(reason) => {
+            tracing::warn!(%reason, "codemode 沙箱起不来：这台 Gateway 不挂 codemode");
+            None
+        }
+    };
     match komo_runtime::python_runtime::PythonRuntime::probe(python).await {
         Ok(runtime) => {
             // 核对函数的那道门（§8.6）。它自己带一份 Policy 与授权表：核对是一次**新的**
@@ -636,7 +652,7 @@ async fn build_tools(
             tracing::warn!(%error, "Python 环境探测不到：这台 Gateway 不挂 python 工具");
         }
     }
-    tools
+    (tools, codemode)
 }
 
 /// `komo gateway --foreground` 的主流程：起来，等停机信号，收尾。

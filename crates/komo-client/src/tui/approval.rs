@@ -357,6 +357,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Dispatch { .. } => "派一个任务",
         Operation::Follow { .. } => "追问一个任务",
         Operation::McpCall { .. } => "MCP 工具",
+        Operation::Codemode { .. } => "沙箱脚本",
     }
 }
 
@@ -378,6 +379,7 @@ fn operation_body(plan: &ExecutionPlan) -> Option<String> {
             "{server} · {tool}\n{}",
             serde_json::to_string_pretty(&plan.args).unwrap_or_default()
         )),
+        Operation::Codemode { code } => Some(code.clone()),
         _ => None,
     }
 }

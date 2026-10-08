@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod approvals;
+pub mod codemode;
 pub mod config;
 pub mod embedding;
 pub mod executor;

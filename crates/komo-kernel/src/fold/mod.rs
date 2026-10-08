@@ -273,6 +273,7 @@ impl Surface {
                     });
                 }
                 let call = self.call_mut(&body.call_id, event);
+                let supersedes = call.output.is_some();
                 call.state = match body.status {
                     crate::types::refs::ToolResultStatus::Completed => ToolCallState::Completed,
                     crate::types::refs::ToolResultStatus::Failed => ToolCallState::Failed,
@@ -283,6 +284,7 @@ impl Surface {
                 self.link_call(event, &body.call_id);
                 self.push_tool_result(
                     event,
+                    supersedes,
                     SurfaceToolResult {
                         call: body.call_id.clone(),
                         attempt: body.attempt_id.clone(),
@@ -363,7 +365,21 @@ impl Surface {
 
     /// 一轮里的多个结果并进**同一个**用户侧节点：provider 收到的是一条消息带几个
     /// tool_result 块，不是几条连续的用户消息。
-    fn push_tool_result(&mut self, event: &Event, result: SurfaceToolResult) {
+    ///
+    /// 同一个调用的**后一条**结果（超时落了 `uncertain`，介入裁定后再补一条）顶替前一条、
+    /// 留在原位：provider 那边一个 call_id 只能有一份输出，回放两份会被 400 拒掉。
+    fn push_tool_result(&mut self, event: &Event, supersedes: bool, result: SurfaceToolResult) {
+        if supersedes
+            && let Some(earlier) = self
+                .messages
+                .iter_mut()
+                .rev()
+                .flat_map(|message| message.tool_results.iter_mut())
+                .find(|earlier| earlier.call == result.call)
+        {
+            *earlier = result;
+            return;
+        }
         if self.last_role == Some(Role::Tool)
             && let Some(last) = self.messages.last_mut()
         {
@@ -606,6 +622,39 @@ mod tests {
         assert_eq!(call.state, ToolCallState::Completed);
         assert_eq!(call.attempts, 1);
         assert!(call.output.is_some());
+        assert!(surface.replay_alternates());
+    }
+
+    #[test]
+    fn a_later_result_for_the_same_call_replaces_the_earlier_one_in_place() {
+        let mut events = conversation();
+        events.truncate(7);
+        if let EventPayload::ToolResult(result) = &mut events[6].payload {
+            result.status = ToolResultStatus::Uncertain;
+        }
+        events.push(event(
+            8,
+            Some("run-1"),
+            EventPayload::ToolResult(ToolResult {
+                call_id: ToolCallId::from_raw("call-7"),
+                attempt_id: AttemptId::from_raw("attempt-1"),
+                status: ToolResultStatus::Completed,
+                output_ref: output_ref("tool-output/run-1/call-7/attempt-1/output.json"),
+                elapsed_ms: 0,
+                preview: Some("介入裁定：已完成".into()),
+                stdout: None,
+                stderr: None,
+                attempt_state: None,
+            }),
+        ));
+        events.push(assistant(9, "run-1", 2, "等于 2"));
+
+        let surface = fold(&events);
+        assert_eq!(surface.messages.len(), 4);
+        let results = &surface.messages[2].tool_results;
+        assert_eq!(results.len(), 1, "一个 call_id 只回放一份输出");
+        assert_eq!(results[0].status, ToolResultStatus::Completed);
+        assert_eq!(results[0].preview.as_deref(), Some("介入裁定：已完成"));
         assert!(surface.replay_alternates());
     }
 

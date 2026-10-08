@@ -1,8 +1,8 @@
-//! `follow`：把一句话追加进一个**已有的**任务会话（`docs/home-dispatcher.md` §4）。
+//! `follow`：把一句话追加进一个**已有的**任务会话（`docs/background-tasks.md`）。
 //!
 //! 与 [`super::dispatch`] 同一类编排操作，差别只在"新建"还是"追加"：`task_id` 是任务
 //! 短号（任务会话 id 末几位，[`komo_kernel::types::task::short_id`]），解析成具体会话
-//! 要查"这个 home 名下有哪些任务会话"，只有 Gateway 的 `TaskSpawner` 实现够得到，工具
+//! 要查"这个会话派出去过哪些任务"，只有 Gateway 的 `TaskSpawner` 实现够得到，工具
 //! 这一层原样把短号交给它。
 
 use async_trait::async_trait;
@@ -17,7 +17,7 @@ use super::{normalized, parse_args, plan_time};
 /// 模型给的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FollowArgs {
-    /// 任务短号（看板里那四位，或者用户话里带的 `#xxxx`）。
+    /// 任务短号（派出时给的那四位，或者用户话里带的 `#xxxx`）。
     pub task_id: String,
     /// 追加进那个任务会话的新输入。
     pub text: String,
@@ -43,17 +43,18 @@ impl Tool for FollowTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "follow".into(),
-            description: "追问一个进行中或最近完成的任务：把 text 作为新的一句话提交进它自己\
-                          的会话，不要为同一件事另开一个 dispatch。task_id 是看板里的短号\
-                          （例如 3f2a）。提交成功就回一句\"已转给 #短号\"，如果那个任务正好\
-                          在跑，会改说\"#短号 正在跑，这句排在它后面\"。"
+            description: "追问一个你派出去的后台任务：把 text 作为新的一句话提交进它自己的\
+                          会话，它带着自己查到的东西接着做，不要为同一件事另开一个 dispatch。\
+                          task_id 是派出时给的短号（例如 3f2a）。提交成功就回一句\"已转给 #短号\"，\
+                          如果那个任务正好在跑，会改说\"#短号 正在跑，这句排在它后面\"。结果\
+                          照样以 [后台任务 #短号…] 开头的消息交回给你。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "task_id": {
                         "type": "string",
-                        "description": "任务短号，看板里的那几位（例如 3f2a）"
+                        "description": "任务短号，派出时给的那几位（例如 3f2a）"
                     },
                     "text": {
                         "type": "string",
@@ -82,7 +83,7 @@ impl Tool for FollowTool {
                 message: "text 不能是空的：空输入没有什么可以提交".into(),
             });
         }
-        // `#3f2a` 这种带井号的写法也收——模型把看板上的短号原样抄过来时常带着它。
+        // `#3f2a` 这种带井号的写法也收——模型把回执里的短号原样抄过来时常带着它。
         let task_id = args.task_id.trim_start_matches('#').to_string();
 
         Ok(ExecutionPlan {

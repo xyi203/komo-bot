@@ -382,7 +382,7 @@ Gateway 设置总轮数、活动执行时限、输出长度和子进程并发预
 
 普通追问可以作为 assistant 回复结束本轮；用户下一条输入开启同一 Session 的新 Run。工具审批则暂停原 Run，待决策后继续原调用，不增加第六个交互工具；决策通常来自聊天渠道（§11）。
 
-**系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的审批 / 介入、配置、skills、toolbox、Gateway 都是 komo 自己的状态，问到就用 shell 跑 `komo <子命令>`（给出几个常用子命令，其余看 `komo --help`）。这一段是**常量**，提示前缀因此稳定；`komo` 靠 PATH 找到——服务单元写入了安装时的 PATH（§3），不在提示里另给可执行文件路径。只在主 Agent 且挂了 `shell` 时出现：子代理只拿任务里写的东西（与 skills 目录同理，父侧需要时把命令写进任务），分发器只有 `dispatch` / `follow`，说了也跑不了。起因是一次真实会话：问"当前有哪些 cron job"，模型不知道自己是 komo，先读了同名的共享 skill `cron-scheduler`，再翻 `crontab -l`、`/etc/cron.*`、`launchctl`、`~/.komo`，第 8 轮才跑到 `komo cron list`，9 轮 90 秒。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_its_cli`、`the_komo_section_needs_shell_and_the_main_agent`，golden `full_main_agent`、`plain_main_agent`。
+**系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的审批 / 介入、配置、skills、toolbox、Gateway 都是 komo 自己的状态，问到就用 shell 跑 `komo <子命令>`（给出几个常用子命令，其余看 `komo --help`）。这一段是**常量**，提示前缀因此稳定；`komo` 靠 PATH 找到——服务单元写入了安装时的 PATH（§3），不在提示里另给可执行文件路径。只在主 Agent 且挂了 `shell` 时出现：子代理只拿任务里写的东西（与 skills 目录同理，父侧需要时把命令写进任务）；没给 `shell` 的 Profile 说了也跑不了。起因是一次真实会话：问"当前有哪些 cron job"，模型不知道自己是 komo，先读了同名的共享 skill `cron-scheduler`，再翻 `crontab -l`、`/etc/cron.*`、`launchctl`、`~/.komo`，第 8 轮才跑到 `komo cron list`，9 轮 90 秒。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_its_cli`、`the_komo_section_needs_shell_and_the_main_agent`，golden `full_main_agent`、`plain_main_agent`。
 
 Run 完成仅表示本轮结束。测试是否通过、性能是否改善、设备是否到达目标状态，都要依据具体执行证据报告。
 
@@ -418,14 +418,7 @@ workspace = "code/komo"
 
 **升级路径**：`sessions.agent_id` 为空 = 升级前建的会话。它按 `default_agent` **归属一次并写下来**（只写一次，之后不随配置漂移）；归属的 Agent 在现行配置里不存在时，那条会话**拒绝执行**并进操作者清单（§7.5），不静默换成别的助手。
 
-**`[home]`：home session 是不是分发器。** 缺省（`mode = "session"`）与上面的行为逐字相同；`mode = "dispatch"` 时 home session 的 Run 改用 `dispatcher` 指的那个 Profile 冻结（会话的 `agent_id` 不变），`worker` 是任务会话用的 Profile。这是任务分发器的设计，完整动机、`dispatch` / `follow` 两个操作与分阶段计划见 `docs/home-dispatcher.md`。
-
-```toml
-[home]
-mode       = "session"    # 默认；"dispatch" = home session 的 Run 用 dispatcher Profile 跑
-dispatcher = "dispatcher"  # mode = "dispatch" 时必填，必须是一个声明过的 [agents.<id>]
-worker     = "assistant"   # 任务会话用的 Profile；省略 = default_agent
-```
+**后台任务。** home session 用它自己的 Agent 跑，不另设分发器身份；要跑很久的事由模型调 `dispatch` 派进一条独立的任务会话（同一个 Agent），结果收尾时作为一条内部输入交回派它的会话、由它转告，见 `docs/background-tasks.md`。
 
 ### 6.2 冻结的是身份，不是安全策略
 
@@ -470,7 +463,7 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 | Memos 的写入、修改或删除                      | 按 Python 模块版本、函数、参数与用户指令范围审核                     |
 | 权限扩大或修改 Policy                         | 通过操作者配置流程处理，不能由模型自行放宽                           |
 | 委派一个子任务（`Operation::Delegate`）       | 按操作者意图：strict 下 Ask（展示任务正文与结果契约），auto 下 Allow。**子代理自己的每一次调用仍各自按上面各行判断**——委派不放宽任何一层。续跑（`resume`，§4）是同一行：审批卡在这次委派的任务正文（这次续跑要接着做的那件事，就是这次 `delegate` 调用的 `task`）之外多写一句"接着子 Run X"，续跑目标进计划、进计划哈希，批的是"接着**这一条**"，换一条就要重新问。**渲染只读得到这次的计划**，不回去查目标那条子 Run 当初的任务正文——那句原话要看，去读那条子 Run 自己的记录（§8.3 的回放窗口） |
-| 派一个新任务（`Operation::Dispatch`）         | strict 与 auto 下都 Allow：它只是建一个独立的**任务会话**并提交第一条输入（`docs/home-dispatcher.md` §4），不等它跑完，**任务会话里的每一次调用仍各自按上面各行判断**——不放宽任何一层。幂等键 `dispatch:{run}:{call}` 让重放的同一次调用不会多建一个任务 |
+| 派一个新任务（`Operation::Dispatch`）         | strict 与 auto 下都 Allow：它只是建一个独立的**任务会话**并提交第一条输入（`docs/background-tasks.md`），不等它跑完，**任务会话里的每一次调用仍各自按上面各行判断**——不放宽任何一层。幂等键 `dispatch:{run}:{call}` 让重放的同一次调用不会多建一个任务 |
 | 追问一个任务（`Operation::Follow`）           | 同上：strict 与 auto 下都 Allow，只是把一句话提交进一个已有的任务会话；幂等键 `follow:{run}:{call}` |
 | shell 命令文本匹配 `komo cron add`            | strict 下永远 Ask，且**只能批一次**（`scopes` 固定 `[once]`，不给 Run / Cron 范围）；**任何已有的 Run / Cron 范围授权都不能替这一步作答**——`cron add` 会给命令 Job 自己签发一条执行授权（见下），模型能经 shell 调它给自己写将来能免问的许可，这一条必须每次都问人。auto 基表不变（§7.1「auto 与 strict 的差别就是要不要人看一眼」，这条也不例外） |
 
@@ -1337,7 +1330,7 @@ TELEGRAM_BOT_TOKEN=...
 
 - **Principal**：发送者在该渠道 `allow_from` 里就是操作者，否则**拒绝**——回一条固定提示，带上发送者在该平台的 id（`ou_xxx` / `123456789` / `wxid_xxx`），操作者把它抄进 `allow_from` 即可；消息不进入 Run，也不留任何记录。`allow_from` 为空的渠道等于只出不进：还能作 `home_chat` 收投递，但没人能通过它下指令。**审批命令只接受操作者。**
 - **怎么知道自己的 id**：任何人对机器人说 `/id`，机器人回 `{platform}:{chat_id}` 与发送者 id——被拒绝的提示里也带着同样的信息。这是唯一的"发现"手段，没有别的准入流程。
-- **Conversation**：操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session，只有 `groups` 列出的群会被响应，群里只响应 @机器人 的消息并剥掉提及，且发送者仍须在 `allow_from` 里。WeChat 只有 DM。`[home] mode = "dispatch"` 时 home session 改由分发器 Profile 冻结身份，把需要工具的部分派给独立的任务会话，见 `docs/home-dispatcher.md`。
+- **Conversation**：操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session，只有 `groups` 列出的群会被响应，群里只响应 @机器人 的消息并剥掉提及，且发送者仍须在 `allow_from` 里。WeChat 只有 DM。要跑很久的事派给独立的任务会话在后台跑，结果交回 home session 由它转告，home 不被一件慢事堵住，见 `docs/background-tasks.md`。
 - **改名单不改数据库，也不重启**：`allow_from` / `home_chat` / `groups` 每条消息、每次投递都从当前配置快照读（§3 热重载第 2 步），文件保存后下一条消息就按新名单判定；`komo config check` 与重载共用同一套校验（id 形态、`home_chat` 所属渠道必须 enabled 且有凭证），校验不过则旧名单继续生效并在 home chat 报错。`komo doctor` 把"某渠道 enabled 但 `allow_from` 为空"当作警告列出。
 - Cron 触发的 Run 来源仍是 Cron（§8.8）；在聊天里 `/approve` 它的等待，不会让它获得交互操作者的权限。
 
@@ -1703,13 +1696,11 @@ komo-runtime   agent loop、executor、tools/{read,write,edit,rg,shell,python}�
 komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次 1，2026-09-22 抽出）：
                Profile → 能力面选择（`surface_of`，目录里没有的名字不算数）、skills 发现与
                目录行（`SkillRegistry`，§5.6）、编排操作名（`DELEGATE_TOOL`）、上下文装配
-               （`context`：`ContextInput` → `AgentContext`，系统提示、回放、记忆段、
-               `docs/home-dispatcher.md` §9 Phase 3 的分发器任务看板）。只描述"要做什么"，
+               （`context`：`ContextInput` → `AgentContext`，系统提示、回放、记忆段）。
+               只描述"要做什么"，
                不执行；值类型（`AgentProfile` / `AgentSurface` / `RunSnapshot`）留在
                kernel（事件、协议与 store 模型按它们落盘，搬出来会把依赖指反）。
-               deps: kernel, serde（`derive`，任务看板要在 komo-agent 自己 `#[derive(Serialize,
-               Deserialize)]`，Phase 3 新增；工作区已有，只是这个 crate 之前只用 serde_json），
-               serde_json, tracing。
+               deps: kernel, serde_json, tracing。
 
 komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件、launchd/systemd 集成、
                Dispatcher、飞书 / Telegram / WeChat 渠道、Notifier 实现、deliveries、审批消息渲染。

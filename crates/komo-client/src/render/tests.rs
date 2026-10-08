@@ -80,8 +80,8 @@ fn a_session_list_shows_status_and_title() {
     );
 }
 
-/// `komo session list`（`docs/home-dispatcher.md` §9 Phase 3）：任务会话在标题前带一个
-/// `任务·#短号` 标注，短号与看板 / `follow` 同一个口径；主 / 普通会话的输出一个字不变
+/// `komo session list`（`docs/background-tasks.md`）：任务会话在标题前带一个
+/// `任务·#短号` 标注，短号与回执 / `follow` 同一个口径；主 / 普通会话的输出一个字不变
 /// （不改变既有用户可见文本）。
 #[test]
 fn a_task_session_is_marked_with_its_short_id() {

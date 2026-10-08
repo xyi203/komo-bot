@@ -2265,7 +2265,6 @@ name = "komo-agent"
 version = "0.8.0"
 dependencies = [
  "komo-kernel",
- "serde",
  "serde_json",
  "tempfile",
  "tracing",

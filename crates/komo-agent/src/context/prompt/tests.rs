@@ -113,7 +113,7 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
     );
 }
 
-/// 没有 `shell`（分发器只有 `dispatch` / `follow`）或是子代理时，这一段不出现：前者说了
+/// 没有 `shell`（例如只给了 `dispatch` / `follow` 的 Profile）或是子代理时，这一段不出现：前者说了
 /// 也跑不了，后者只拿任务里写的东西（§4）。
 #[test]
 fn the_komo_section_needs_shell_and_the_main_agent() {

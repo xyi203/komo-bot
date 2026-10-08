@@ -1,10 +1,10 @@
-//! `dispatch` / `follow`：home 分发器把需要工具的部分派给独立的**任务会话**
-//! （`docs/home-dispatcher.md` §4）。
+//! `dispatch` / `follow`：把耗时的事派给独立的**任务会话**在后台跑
+//! （`docs/background-tasks.md`）。
 //!
 //! 值类型放在这里，理由与 [`super::delegate`] 一样：编排操作（`Operation::Dispatch` /
 //! `Operation::Follow`）要能落进 [`super::plan::ExecutionPlan`]，而 kernel 不依赖
-//! runtime / gateway。短号那几个纯函数也放这里——Phase 2（本模块）与 Phase 3（任务看板）
-//! 共用同一份实现，撞号与解析不能有第二种口径。
+//! runtime / gateway。短号那几个纯函数也放这里——回执、`follow` 的解析与
+//! `komo session list` 共用同一份实现，撞号与解析不能有第二种口径。
 
 use serde::{Deserialize, Serialize};
 
@@ -19,7 +19,7 @@ pub struct TaskSpec {
     pub title: String,
 }
 
-/// 一次 `dispatch` 成功后的句柄：分发器把它念给操作者听。
+/// 一次 `dispatch` 成功后的句柄：模型把它念给操作者听。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskHandle {
     pub session: SessionId,
@@ -33,12 +33,12 @@ pub struct TaskHandle {
 pub struct FollowOutcome {
     pub session: SessionId,
     pub short_id: String,
-    /// 提交的这一刻，那个任务会话已经有一条没跑完的 Run——分发器据此措辞
+    /// 提交的这一刻，那个任务会话已经有一条没跑完的 Run——模型据此措辞
     /// "正在跑，这句排在它后面"而不是"已转给"（§4.1）。
     pub queued_behind: bool,
 }
 
-/// 任务短号：任务会话 id 末 4 位（UUIDv7 的随机段），看板渲染与 `follow` 解析都用它
+/// 任务短号：任务会话 id 末 4 位（UUIDv7 的随机段），回执与 `follow` 解析都用它
 /// （§4.3）。
 pub fn short_id(session: &SessionId) -> String {
     suffix(session, 4)

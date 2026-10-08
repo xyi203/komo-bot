@@ -14,6 +14,7 @@
 use komo_kernel::protocol::http::{
     InterventionAnswerResponse, InterventionKind, InterventionVerdict,
 };
+use komo_kernel::traits::Inbound;
 use komo_kernel::types::ids::{AttemptId, RunId, SessionId, ToolCallId};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::{RunState, WaitReason};
@@ -272,4 +273,86 @@ async fn the_verify_detail_names_the_uncertain_call() {
             .is_some_and(|reason| !reason.is_empty()),
         "要说得出为什么不清楚：{detail}"
     );
+}
+
+/// 聊天来源的 Run 停在 `verify` 上：看客投了一次"需要你判断"，周期兜底不能换个措辞再投
+/// 一遍——两条说的是同一件事，操作者会以为有两个问题要答。
+#[tokio::test]
+async fn a_chat_verify_is_delivered_once_even_after_the_sweep() {
+    let home = Home::new();
+    let counter = Counter::new(&home, "verdict.count");
+    let fault = home.inject(Fault::BeforeFinishCall);
+    let gateway = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(
+                1,
+                "pc-v",
+                "shell",
+                serde_json::json!({ "command": counter.append_command() }),
+            ),
+            text_round(2, "跑过了。"),
+        ]]))
+        .await;
+    let ack = gateway
+        .dispatcher()
+        .handle(inbound(
+            komo_kernel::types::chat::ChannelPlatform::Telegram,
+            "111",
+            "111",
+            "跑一条命令",
+            "verify-chat-1",
+            true,
+        ))
+        .await
+        .expect("Dispatcher 处理");
+    let komo_kernel::protocol::InboundAck::Queued { session, run } = ack else {
+        panic!("{ack:?}")
+    };
+    let record = gateway.wait_approval().await;
+    gateway.decide(&record.approval, true).await;
+    fault.wait_tripped().await;
+    gateway.stop().await;
+
+    let events = home.events(&session);
+    let started = tool_started(&events)
+        .last()
+        .map(|started| (*started).clone())
+        .expect("有这次尝试");
+    home.drop_attempt_output(&session, &run, &started);
+    home.clear_injection();
+
+    let sender = MemSender::new(komo_kernel::types::chat::ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(
+            FakeLlm::finisher("接着往下写。"),
+            std::sync::Arc::clone(&sender),
+        )
+        .await;
+    let why = gateway.wait_waiting(&run).await;
+    assert!(matches!(why, WaitReason::Intervention { .. }), "{why:?}");
+
+    let attention = || {
+        sender
+            .sent()
+            .into_iter()
+            .filter(|message| {
+                matches!(
+                    message.outbound,
+                    komo_kernel::types::chat::Outbound::NeedsAttention { .. }
+                )
+            })
+            .count()
+    };
+    let watching = std::sync::Arc::clone(&sender);
+    eventually("看客投了一次需要你判断", move || {
+        watching.sent().iter().any(|message| {
+            matches!(
+                message.outbound,
+                komo_kernel::types::chat::Outbound::NeedsAttention { .. }
+            )
+        })
+    })
+    .await;
+    gateway.state().sweep_unseen_interventions().await;
+    assert_eq!(attention(), 1, "{:?}", sender.sent());
 }

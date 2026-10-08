@@ -41,7 +41,7 @@ impl ChannelPlatform {
     /// [`ChannelPlatform::as_str`] 的反过来：认不出的词是 `None`，不是别的渠道。
     ///
     /// 给 [`ChannelPeer::parse`] 用——`runs.peer` 存的就是 `{platform}:{chat_id}`
-    /// （`Display` 那份），重启后要把它解回来（`docs/home-dispatcher.md` §8）。
+    /// （`Display` 那份），重启后要把它解回来（`docs/background-tasks.md`）。
     pub fn parse(raw: &str) -> Option<Self> {
         match raw {
             "feishu" => Some(ChannelPlatform::Feishu),
@@ -116,8 +116,7 @@ impl ChannelPeer {
     }
 
     /// [`Display`](fmt::Display) 的反过来：把 `runs.peer` 里存的 `"{platform}:{chat_id}"`
-    /// 解回一个 [`ChannelPeer`]。重启后重挂交互 Run 的看客要用它（`docs/home-dispatcher.md`
-    /// §8 Fix 1）——`peer` 存的从来就是这个 `Display` 出来的串，这里只是原样切回去。
+    /// 解回一个 [`ChannelPeer`]。重启后重挂交互 Run 的看客要用它——`peer` 存的从来就是这个 `Display` 出来的串，这里只是原样切回去。
     ///
     /// 只切**第一个**冒号：`chat_id` 本身可能带冒号（不是已知渠道会这么写，但不排除），
     /// `platform` 那几个词都不带。空的 `chat_id` 认不出来。

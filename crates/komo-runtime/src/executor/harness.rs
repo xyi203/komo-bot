@@ -97,7 +97,7 @@ impl Harness {
     }
 
     /// §7.1 那张初始建议表，外加一份 `TaskSpawner`——`dispatch` / `follow` 的验收要它
-    /// （`docs/home-dispatcher.md` §4.2）。
+    /// （`docs/background-tasks.md`）。
     pub fn initial_with_spawner(
         &self,
         tools: Vec<Arc<dyn Tool>>,

@@ -97,9 +97,9 @@ fn session_title(session: &SessionSummary) -> String {
     }
 }
 
-/// 任务会话的短标注（`docs/home-dispatcher.md` §4.2、§9 Phase 3）：`任务·#3f2a`，
-/// `#3f2a` 是这条会话自己的短号——与分发器看板、`follow` 用的是同一个口径
-/// （`komo_kernel::types::task::short_id`），操作者能直接拿它对上看板里的那一行。
+/// 任务会话的短标注（`docs/background-tasks.md`）：`任务·#3f2a`，
+/// `#3f2a` 是这条会话自己的短号——与派出回执、`follow` 用的是同一个口径
+/// （`komo_kernel::types::task::short_id`），操作者能直接拿它对上聊天里的那一条。
 ///
 /// 只有 `kind == "task"` 的会话才有这个标注；`main` / `normal` 一个字都不多印
 /// （不改变现有输出，§ 约束）。

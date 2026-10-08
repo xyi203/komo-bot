@@ -2769,7 +2769,7 @@ async fn a_resumed_read_that_never_ran_still_runs_beside_its_siblings() {
     );
 }
 
-/// `dispatch` / `follow`：`docs/home-dispatcher.md` §4.2、§9 Phase 2 的验收。
+/// `dispatch` / `follow`：`docs/background-tasks.md` 的验收。
 ///
 /// 与 `delegation` 那一组不同，这里不需要真的在账本里建一条子 Run——`TaskSpawner`
 /// 把"建会话、提交输入"整个封在接缝后面，测试只关心 executor 这一侧的编排：放行之后

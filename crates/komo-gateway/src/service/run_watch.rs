@@ -85,8 +85,7 @@ pub fn watch(state: Arc<GatewayState>, session: SessionId, run: RunId, watcher: 
     });
 }
 
-/// 重启后把未终态、且来自聊天的交互 Run 重新挂上看客（`docs/home-dispatcher.md` §8
-/// Fix 1）。
+/// 重启后把未终态、且来自聊天的交互 Run 与后台任务 Run 重新挂上看客。
 ///
 /// 看客只活在内存里：`GatewayState::watching` 与这里的 `tokio::spawn` 都在进程重启时
 /// 清空，而账本上这条 Run 该往哪投（`runs.peer`）一直都在。少了这一步，一条跨重启还在
@@ -107,18 +106,26 @@ pub async fn reattach_unfinished(state: &Arc<GatewayState>) {
     for record in unfinished {
         // 没有 peer = TUI / HTTP，或者是委派的子 Run（永远 `peer = None`）：那条路本来
         // 就不靠这里补——TUI / HTTP 自己在看事件流，子 Run 的结果回到父 Run 自己的收尾。
-        let Some(raw) = record.peer.as_deref() else {
-            continue;
+        // **后台任务例外**：它的结果要交回派它的会话（`docs/background-tasks.md`），
+        // 没有看客就没人交。
+        let peer = match record.peer.as_deref() {
+            Some(raw) => match ChannelPeer::parse(raw) {
+                Some(peer) => Some(peer),
+                None => {
+                    tracing::warn!(
+                        run = %record.run,
+                        peer = raw,
+                        "runs.peer 解析不出来，这条 Run 的看客补不上"
+                    );
+                    continue;
+                }
+            },
+            None if record.parent.is_none() && is_task_session(state, &record.session).await => {
+                None
+            }
+            None => continue,
         };
-        let Some(peer) = ChannelPeer::parse(raw) else {
-            tracing::warn!(
-                run = %record.run,
-                peer = raw,
-                "runs.peer 解析不出来，这条 Run 的看客补不上"
-            );
-            continue;
-        };
-        let watcher = Watcher::Interactive { peer: Some(peer) };
+        let watcher = Watcher::Interactive { peer };
         // 订阅之前先核对一遍权威状态：这条 Run 有没有可能在 `unfinished()` 这份名单读
         // 出来之后、真的订阅之前，就已经落了终态——启动阶段调度器还没起来，这一步理论
         // 上总是"还没有"，但核对本身几乎不花时间，换来的是不必靠"调用次序恰好对"这件
@@ -132,6 +139,13 @@ pub async fn reattach_unfinished(state: &Arc<GatewayState>) {
     if reattached > 0 {
         tracing::info!(reattached, "重启后补挂了聊天来源的看客");
     }
+}
+
+async fn is_task_session(state: &GatewayState, session: &SessionId) -> bool {
+    matches!(
+        komo_store::repos::session::get(&state.db, session).await,
+        Ok(Some(record)) if record.kind == komo_store::models::SessionKind::Task
+    )
 }
 
 /// [`reattach_unfinished`] 补挂之前的核对：这条 Run 是不是已经落了终态。命中就直接按
@@ -215,7 +229,12 @@ async fn step(
                 // 结果不明 / 前提没了（§7.5 的另外两类）：同一句话问人，投**来源会话 +
                 // home chat**。"需要人判断"不该因为种类不同而有不同的到达率（§11.4）。
                 komo_kernel::types::status::WaitReason::Intervention { .. } => {
-                    let question = question_for(state, run, watcher).await;
+                    // 占掉这一条"投过一次"的名额：不占的话，周期兜底
+                    // （`sweep_unseen_interventions`）会把同一条换个措辞再投一遍。
+                    if !state.start_delivering_intervention(run.as_str()) {
+                        return Step::Keep;
+                    }
+                    let question = question_for(state, session, run, watcher).await;
                     deliver_to_source_and_home(
                         state,
                         watcher,
@@ -417,7 +436,12 @@ fn tail_lines(text: &str, n: usize) -> String {
 /// （"有没有一条 `uncertain` 调用"、"会话还在不在服务范围里"）。所以这里按句柄回清单取
 /// 那一条——照事件编一句话，只会和权威漂移。取不到（这一条刚刚被答掉）就退回一句说得清
 /// 出处的话。
-async fn question_for(state: &Arc<GatewayState>, run: &RunId, watcher: &Watcher) -> String {
+async fn question_for(
+    state: &Arc<GatewayState>,
+    session: &SessionId,
+    run: &RunId,
+    watcher: &Watcher,
+) -> String {
     let question = match state.intervention(run.as_str()).await {
         Ok(Some(detail)) => super::interventions::question_of(&detail),
         Ok(None) => {
@@ -430,7 +454,10 @@ async fn question_for(state: &Arc<GatewayState>, run: &RunId, watcher: &Watcher)
     };
     match watcher.label() {
         Some(name) => format!("定时任务「{name}」：{question}"),
-        None => question,
+        None => match super::tasks::label_of(state, session).await {
+            Some(label) => format!("{label}：{question}"),
+            None => question,
+        },
     }
 }
 
@@ -455,6 +482,17 @@ async fn finish(
     state.release_dependents().await;
     match watcher {
         Watcher::Interactive { peer } => {
+            // 后台任务的结果交回派它的会话，由那边转告（`docs/background-tasks.md`）。
+            let outcome = if status == komo_kernel::cron::FiringStatus::Ok {
+                super::tasks::TaskOutcome::Completed
+            } else {
+                super::tasks::TaskOutcome::NotCompleted
+            };
+            if super::tasks::report_to_parent(state, session, run, peer.as_ref(), outcome, &text)
+                .await
+            {
+                return;
+            }
             let Some(peer) = peer else {
                 // TUI / HTTP 自己在看事件流（SSE），不必再投一条（§13.1）。
                 return;

@@ -196,7 +196,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         .set(Arc::clone(&dispatcher) as Arc<dyn Inbound>);
     // `dispatch` / `follow` 的接缝：`GatewayTaskSpawner` 自己要一份 `Arc<GatewayState>`
     // （建会话、`submit`），与上面这行同一个"先有整份状态才能自己引用自己"的理由
-    // （`docs/home-dispatcher.md` §4.2）。
+    // （`docs/background-tasks.md`）。
     state.wire_task_spawner();
 
     // 5. 绑监听——发现文件里要写真实地址，所以端口必须先定下来。
@@ -309,8 +309,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         Err(error) => tracing::warn!(%error, "记忆处理队列的复位没做成"),
     }
 
-    // 8c. 把跨重启还在跑的交互 Run 重新挂上看客（`docs/home-dispatcher.md` §8
-    // Fix 1）：看客只活在内存里，重启后没人订阅就没人能把最终回复投回聊天来源。
+    // 8c. 把跨重启还在跑的交互 Run 与后台任务 Run 重新挂上看客：看客只活在内存里，重启后没人订阅就没人能把最终回复投回聊天来源。
     // **必须在下一步调度器起来之前**：调度器一起，这些 Run 可能立刻继续往下跑。
     run_watch::reattach_unfinished(&state).await;
 
@@ -603,7 +602,7 @@ async fn build_tools(
     // 让本 Run 等它），工具本身没有 execute。
     tools.push(Arc::new(DelegateTool::new()));
     // dispatch / follow：同一类编排操作，把需要工具的部分派给独立的任务会话
-    // （`docs/home-dispatcher.md` §4）。放行之后由 executor 调 `TaskSpawner`——没有
+    // （`docs/background-tasks.md`）。放行之后由 executor 调 `TaskSpawner`——没有
     // 装配它时（`ToolExecutor::set_spawner` 没被叫过）两个操作按"这台 Gateway 没有接
     // 任务分发"干净失败。
     tools.push(Arc::new(DispatchTool::new()));

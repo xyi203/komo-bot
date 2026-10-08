@@ -269,7 +269,7 @@ pub struct ToolExecutor {
     policy: PolicyEngine,
     clock: Arc<dyn Clock>,
     limits: ExecutionLimits,
-    /// `dispatch` / `follow` 的接缝（`docs/home-dispatcher.md` §4.2）。它是
+    /// `dispatch` / `follow` 的接缝（`docs/background-tasks.md`）。它是
     /// [`std::sync::OnceLock`] 而不是构造时就给的字段，理由与 `GatewayState::inbound`
     /// 一样：Gateway 那份实现自己需要一份 `Arc<GatewayState>`（建会话、`submit`），而
     /// 执行器要先造出来，`GatewayState` 才能存在——只能在那份状态造好之后再接上
@@ -516,7 +516,7 @@ impl ToolExecutor {
 
         // dispatch / follow 同样不走"工具执行"那条路，也不走核对梯子——但与 `delegate`
         // 不同，它们**不等任何东西**：放行之后调一次 `TaskSpawner` 就立刻收尾
-        // （`docs/home-dispatcher.md` §4.2）。
+        // （`docs/background-tasks.md`）。
         if let Operation::Dispatch { task, title } = &plan.operation {
             return self
                 .dispatch(request, env, &plan, task, title, request.resumed.clone())
@@ -1052,11 +1052,11 @@ impl ToolExecutor {
         }))
     }
 
-    /// 一次 `dispatch` 的编排（`docs/home-dispatcher.md` §4.2）。
+    /// 一次 `dispatch` 的编排（`docs/background-tasks.md`）。
     ///
     /// 与 [`Self::delegate`] 同一个骨架（放行 → 受理 → 幂等重放拿回同一条），但**不等**
     /// 任何东西：`TaskSpawner::spawn` 一返回就收尾——这正是 dispatch 存在的理由，等它跑完
-    /// 又会把 home 堵住（§1）。
+    /// 又会把派它的会话堵住（同一会话严格串行）。
     ///
     /// 幂等靠 `request_key = dispatch:{run}:{call}`：无论这是首次执行还是"上一世已经
     /// `start_call` 过、这一世只是回来收口"的续跑，`spawner.spawn` 内部走的都是
@@ -1176,7 +1176,7 @@ impl ToolExecutor {
             .await
     }
 
-    /// 一次 `follow` 的编排（`docs/home-dispatcher.md` §4.2）。骨架与 [`Self::dispatch`]
+    /// 一次 `follow` 的编排（`docs/background-tasks.md`）。骨架与 [`Self::dispatch`]
     /// 完全一样，差别只在调 `TaskSpawner::follow`。
     async fn follow(
         &self,

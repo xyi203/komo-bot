@@ -22,26 +22,21 @@ use std::sync::{Arc, RwLock};
 use komo_agent::context::history::{
     Entry, EntryKind, ResolvedMessage, StoredOutput, latest_user_text,
 };
-use komo_agent::context::tasks::{TaskBoard, TaskEntry, TaskState};
 use komo_agent::skills::{OfferContext, SkillCatalog, SkillRegistry};
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::{Surface, SurfaceMessage};
-use komo_kernel::traits::{Ledger, LedgerError, ToolOutputStore};
+use komo_kernel::traits::{LedgerError, ToolOutputStore};
 use komo_kernel::types::agent::RunSnapshot;
-use komo_kernel::types::ids::{RunId, SessionId};
+use komo_kernel::types::ids::RunId;
 use komo_kernel::types::memory::{Injection, MemoryScope};
 use komo_kernel::types::model::ModelConfig;
-use komo_kernel::types::status::{RunEnd, RunState};
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::ToolDefinition;
 use komo_runtime::config::ConfigHolder;
 use komo_runtime::memory::MemoryManager;
 use komo_runtime::tools::paths;
 use komo_store::db::store_to_ledger;
-use komo_store::models::SessionKind;
-use komo_store::repos::runs::RunRecord;
-use komo_store::{CheckpointStore, Db, PayloadStore};
-use time::OffsetDateTime;
+use komo_store::{CheckpointStore, PayloadStore};
 
 /// 一段执行要用到的**身份与能力**（§4.3）。
 ///
@@ -61,10 +56,6 @@ pub(crate) struct Identity {
     pub instructions: Option<String>,
     /// 记忆作用域（§9.2）。
     pub memory_scope: Option<MemoryScope>,
-    /// 分发器任务看板（`docs/home-dispatcher.md` §5、§9 Phase 3）：受理这一刻冻结的那一份，
-    /// 按引用读回来。`None` = 不是分发器 Run（或者是没有冻结快照的旧行/子 Run，走
-    /// [`ambient_identity`] 那条兜底路——分发器 Run 永远走 `submit`，一定有冻结快照）。
-    pub tasks: Option<TaskBoard>,
 }
 
 /// 没有冻结快照时兜底身份要用到的那几样：当前配置、会话 workdir、`workspaces/`（§7）。
@@ -112,18 +103,6 @@ pub(crate) async fn identity_for(
         }
         None => None,
     };
-    // 分发器任务看板（`docs/home-dispatcher.md` §9 Phase 3）：受理那一刻冻结的那一份，
-    // 续跑原样读回——不重新查一遍任务会话表，`[home] mode` 热重载因此改不动一条已经在跑
-    // 的 Run 看到的看板。
-    let tasks = match &frozen.dispatcher_tasks_ref {
-        Some(reference) => Some(
-            payloads
-                .open_json::<TaskBoard>(reference)
-                .await
-                .map_err(store_to_ledger)?,
-        ),
-        None => None,
-    };
     Ok(Identity {
         agent_id: frozen.agent_id,
         model: Some(frozen.model),
@@ -133,17 +112,15 @@ pub(crate) async fn identity_for(
         workspace: paths::real_root(&frozen.workspace),
         instructions,
         memory_scope: frozen.memory_scope,
-        tasks,
     })
 }
 
-/// 没有冻结快照时的兜底身份：**当前**配置里、这个会话归属的那个 Agent（`docs/
-/// home-dispatcher.md` §8 Fix 2）。
+/// 没有冻结快照时的兜底身份：**当前**配置里、这个会话归属的那个 Agent。
 ///
 /// 会话没有归属（空串，升级前建的行）或者归属的 Agent 已经从 `[agents]` 里删掉了，才退到
 /// 默认 Agent——与 `GatewayState::owner_or_default` / `freeze_run` 同一条规则
-/// （`AgentConfig::profile_of`），不是一条各算各的兜底：任务会话（`worker` Profile）走的
-/// 正是这条没有冻结快照的路，答错了 Agent 就是拿错误的身份跑完整个任务。
+/// （`AgentConfig::profile_of`），不是一条各算各的兜底：答错了 Agent 就是拿错误的
+/// 身份跑完整个 Run。
 ///
 /// 工作目录的取舍与受理那一步是**同一条规则**（会话 `workdir` → Profile `workspace`
 /// → `workspaces/`）：同一件事在两条路上有两个答案，正是 §八 修掉的那类缺口。
@@ -180,9 +157,6 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         workspace: paths::real_root(&workspace),
         instructions: profile.and_then(|profile| profile.instructions.clone()),
         memory_scope: profile.and_then(|profile| profile.memory_scope.clone()),
-        // 没有冻结快照的路从来不会是分发器 Run（分发器永远走 `submit`/`freeze_run`，
-        // 一定有快照）；这条兜底路只服务旧行 / 没有归属的子 Run。
-        tasks: None,
     }
 }
 
@@ -272,142 +246,6 @@ pub(crate) fn skill_catalog(
 ) -> Option<SkillCatalog> {
     let registry = skills?.read().expect("skills 注册表");
     Some(registry.offer(&OfferContext::here(tool_names.iter().cloned())))
-}
-
-/// 任务看板"最近完成"那一半的条数上限（`docs/home-dispatcher.md` §5、§11：默认值，
-/// 目前不可配置）。
-pub(crate) const TASK_BOARD_RECENT_LIMIT: usize = 10;
-
-/// 只看这个窗口内结束的任务（`docs/home-dispatcher.md` §11：默认 24 小时）。
-fn task_board_recent_window() -> time::Duration {
-    time::Duration::hours(24)
-}
-
-/// 候选池上限：按创建时间只看最近这么多个**已结束**的任务会话，再从中挑
-/// [`TASK_BOARD_RECENT_LIMIT`] 个落在窗口内的——避免一个用了很久的 home 为每一次分发器
-/// Run 都读遍它全部历史任务会话的 `runs` 表（§5 的"避免 N+1"）。
-const TASK_BOARD_CANDIDATE_POOL: usize = TASK_BOARD_RECENT_LIMIT * 5;
-
-/// 分发器的任务看板取数（`docs/home-dispatcher.md` §5）：这个 home 名下的任务会话
-/// （`kind = task`、`origin = task:{home}`），进行中的全部 + 最近完成的一批。
-///
-/// **状态与等待原因从 `runs` 表读**（索引化的单行/按会话过滤读取），不重放整段 JSONL；
-/// 只有"最后一条回复的首行"要读事件正文，而这条路走的是 [`Ledger::run_end`]——它按
-/// `final_event` 定位那一条事件附近的一页并把外置的大正文按引用读回来（§8.3），不是
-/// `http::sessions::summary_of` 那种"整段 JSONL fold 一遍"的读法（那正是这里要避免的
-/// N+1）。
-pub(crate) async fn task_board(
-    db: &Db,
-    ledger: &dyn Ledger,
-    home_session: &SessionId,
-    now: OffsetDateTime,
-) -> Result<TaskBoard, LedgerError> {
-    let origin = super::tasks::task_origin(home_session);
-    let records = komo_store::repos::session::list(db, false)
-        .await
-        .map_err(store_to_ledger)?;
-
-    let mut unfinished = Vec::new();
-    let mut finished = Vec::new();
-    for record in records {
-        if record.kind != SessionKind::Task || record.origin != origin {
-            continue;
-        }
-        if record.current_run.is_some() {
-            unfinished.push(record);
-        } else {
-            finished.push(record);
-        }
-    }
-
-    let mut entries = Vec::with_capacity(unfinished.len());
-    for record in unfinished {
-        if let Some((entry, _)) = task_entry_of(db, ledger, &record).await? {
-            entries.push(entry);
-        }
-    }
-
-    // 最近**创建**的排在前面，只读这一批的 `runs` 表——真正的"最近完成"排序在下面按
-    // `ended_at` 做。
-    finished.sort_by(|a, b| b.session.as_str().cmp(a.session.as_str()));
-    finished.truncate(TASK_BOARD_CANDIDATE_POOL);
-
-    let window = task_board_recent_window();
-    let mut recent: Vec<(OffsetDateTime, TaskEntry)> = Vec::new();
-    for record in finished {
-        let Some((entry, run)) = task_entry_of(db, ledger, &record).await? else {
-            continue;
-        };
-        let Some(ended_at) = run.ended_at else {
-            continue;
-        };
-        if now - ended_at > window {
-            continue;
-        }
-        recent.push((ended_at, entry));
-    }
-    recent.sort_by(|a, b| b.0.cmp(&a.0));
-    entries.extend(
-        recent
-            .into_iter()
-            .take(TASK_BOARD_RECENT_LIMIT)
-            .map(|(_, entry)| entry),
-    );
-
-    Ok(TaskBoard { entries })
-}
-
-/// 一个任务会话渲染成看板条目：取它**最新**那条 Run（`current_run` 有值就是它，否则是
-/// `runs::list_for_session` 排出来的最后一条——同一 Session 严格串行，最新的就是最后
-/// 一条），连同那条 Run 一起返回（调用方要读它的 `ended_at` 做窗口过滤）。
-async fn task_entry_of(
-    db: &Db,
-    ledger: &dyn Ledger,
-    record: &komo_store::repos::session::SessionRecord,
-) -> Result<Option<(TaskEntry, RunRecord)>, LedgerError> {
-    let run = match &record.current_run {
-        Some(run_id) => komo_store::repos::runs::get(db, &RunId::from_raw(run_id.clone()))
-            .await
-            .map_err(store_to_ledger)?,
-        None => komo_store::repos::runs::list_for_session(db, &record.session)
-            .await
-            .map_err(store_to_ledger)?
-            .pop(),
-    };
-    let Some(run) = run else {
-        return Ok(None);
-    };
-    let state = task_state_of(&run);
-    // 只有"正常跑完"才有一句"最后回复"：失败 / 取消 / 放弃已经由状态本身说清楚了，
-    // 编一句"回复"反而是编造。
-    let last_reply = if run.state == RunState::Completed {
-        match ledger.run_end(&run.run).await? {
-            Some(RunEnd::Completed { final_message, .. }) => final_message,
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let entry = TaskEntry {
-        session: record.session.clone(),
-        title: record.title.clone(),
-        state,
-        last_reply,
-    };
-    Ok(Some((entry, run)))
-}
-
-/// `RunRecord` 的调度状态 → 看板状态（`docs/home-dispatcher.md` §5）。
-fn task_state_of(run: &RunRecord) -> TaskState {
-    match run.state {
-        RunState::Accepted | RunState::Queued => TaskState::Queued,
-        RunState::Running => TaskState::Running,
-        RunState::Waiting => TaskState::Waiting(run.wait.clone()),
-        RunState::Completed => TaskState::Completed,
-        RunState::Failed => TaskState::Failed,
-        RunState::Cancelled => TaskState::Cancelled,
-        RunState::Abandoned => TaskState::Abandoned,
-    }
 }
 
 /// 一条消息的正文：内联的那份优先，没有就按引用读回来（§8.3）。
@@ -553,7 +391,6 @@ mod tests {
             history: resolved,
             memory: None,
             skills: None,
-            tasks: None,
             invocation: InvocationContext::Main,
             model_result_bytes: 8 * 1024,
         }))
@@ -641,10 +478,8 @@ mod tests {
         assert!(matches!(error, LedgerError::Corrupt(_)), "{error:?}");
     }
 
-    /// Fix 2（`docs/home-dispatcher.md` §8）：没有冻结快照时，兜底身份要看会话自己的
-    /// `agent_id`——配的是哪个 Profile 就用哪个的指令与能力面，不能总是退到默认 Agent。
-    /// 任务会话（`worker` Profile）走的正是这条没有冻结快照的路，答错了 Agent 就是拿
-    /// 错误的身份跑完整个任务。
+    /// 没有冻结快照时，兜底身份要看会话自己的 `agent_id`——配的是哪个 Profile 就用
+    /// 哪个的指令与能力面，不能总是退到默认 Agent。
     #[tokio::test]
     async fn ambient_identity_uses_the_sessions_agent_when_it_names_a_configured_profile() {
         use std::collections::BTreeMap;

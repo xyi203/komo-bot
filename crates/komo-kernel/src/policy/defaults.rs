@@ -175,7 +175,7 @@ impl RuleTable {
                     "调用已保存模块：按已审核版本、导出函数与参数范围判断",
                     Matcher::operations([OperationMatch::PythonCall]),
                 ),
-                // 新增两行（`docs/home-dispatcher.md` §4.2、`docs/komo_bot.md` §7.1）：
+                // 新增两行（`docs/background-tasks.md`、`docs/komo_bot.md` §7.1）：
                 // dispatch / follow 只是"开一个任务会话、提交一句话"——strict 与 auto
                 // 下都 Allow，任务会话里的每一次调用仍然照常过 Policy 与审批，不放宽
                 // 任何一层。`auto()` 不必重复这两条：它的默认结论本来就是 Allow。
@@ -736,7 +736,7 @@ mod tests {
         );
     }
 
-    /// 新增两行（`docs/home-dispatcher.md` §4.2）：dispatch / follow 在 strict 下也是
+    /// 新增两行（`docs/background-tasks.md`）：dispatch / follow 在 strict 下也是
     /// Allow——它们只是"开一个任务会话、提交一句话"，不放宽任何一层。
     #[test]
     fn dispatch_and_follow_are_allowed_even_under_the_strict_table() {

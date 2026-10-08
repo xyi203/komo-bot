@@ -1,4 +1,5 @@
-//! `docs/home-dispatcher.md` §8 Fix 1：聊天来源的交互 Run 跨重启还能收到最终回复。
+//! 跨重启还在跑的 Run 重新挂上看客：聊天来源的交互 Run 照样收到最终回复，后台任务的
+//! 结果照样交回派它的会话（`docs/background-tasks.md`）。
 //!
 //! 看客只活在内存里（`service::run_watch` 的 `watch`），重启后没有代码重新订阅——
 //! `runs.peer` 一直都在，但没人拿它去挂看客，于是这条 Run 跑完之后再没有人把回复投回
@@ -119,4 +120,75 @@ async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_on
         "完成发生在重启之后：{:?}",
         first_sender.texts()
     );
+}
+
+/// 后台任务没有渠道对端（从 TUI / HTTP 派出去的，`runs.peer` 为空），补挂也不能跳过它：
+/// 它的结果要交回派它的会话，重启后没人看着就没人交。
+#[tokio::test]
+async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
+    let home = Home::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+
+    // home 那一段调 `dispatch` 后收尾；任务那一段调 shell，停在审批上。
+    let llm = FakeLlm::new(vec![
+        vec![
+            call_round(
+                1,
+                "pc-dispatch",
+                "dispatch",
+                serde_json::json!({"task": "跑一下 echo", "title": "echo"}),
+            ),
+            text_round(2, "已派出。"),
+        ],
+        vec![
+            call_round(
+                1,
+                "pc-shell",
+                "shell",
+                serde_json::json!({"command": "echo hi"}),
+            ),
+            text_round(2, "跑完了。"),
+        ],
+    ]);
+    let gw = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let home_session = gw.state().default_main_session().await.expect("home 会话");
+    let submitted = gw.submit(&home_session, "tui-1", "派个任务跑 echo").await;
+    gw.wait_terminal(&submitted.run).await;
+
+    let pending = gw.wait_approval().await;
+    let task_run = pending.run.clone().expect("审批挂在任务的 Run 上");
+    assert_eq!(gw.db_state(&task_run).await, RunState::Waiting);
+
+    gw.stop().await;
+    let gw = home
+        .start_with(
+            FakeLlm::finisher("跑完了。"),
+            MemSender::new(ChannelPlatform::Telegram),
+        )
+        .await;
+
+    gw.decide(&pending.approval, true).await;
+    let detail = gw.wait_terminal(&task_run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let key = format!("task-result:{task_run}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let report = loop {
+        let runs = komo_store::repos::runs::list_for_session(&gw.state().db, &home_session)
+            .await
+            .expect("读得出 home 的 Run");
+        if let Some(run) = runs.into_iter().find(|run| run.request_key.as_str() == key) {
+            break run.run;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "任务的结果没有交回 home"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let relayed = gw.wait_terminal(&report).await;
+    assert_eq!(relayed.summary.state, RunState::Completed, "{relayed:?}");
 }

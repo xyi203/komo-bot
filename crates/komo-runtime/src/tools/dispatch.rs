@@ -1,11 +1,10 @@
-//! `dispatch`：把一件需要工具的事派进一条**独立的任务会话**（`docs/home-dispatcher.md`
-//! §4）。
+//! `dispatch`：把一件耗时的事派进一条**独立的任务会话**在后台跑
+//! （`docs/background-tasks.md`）。
 //!
 //! 它和 [`super::delegate`] 是同一类东西——不是第七个基础工具，模型看不见任何新能力，
 //! 任务会话里的每一次调用照常过 Policy 与审批——但**目的不同**：`delegate` 是"这件事
-//! 我自己等着"，`dispatch` 是"这件事另起一个会话去跑，我不等它"。分发器（home session
-//! 冻结出来的那份身份，§3）一轮就该结束，等它跑完就又把 home 堵住了，正是这次改造要
-//! 解决的问题（§1）。
+//! 我自己等着"，`dispatch` 是"这件事另起一个会话去跑，我不等它"。同一会话严格串行，
+//! 一件要跑几分钟的事放在当前会话里跑，用户这段时间发的每一句都得排在它后面。
 //!
 //! 两件**不在这里**发生的事：
 //!
@@ -13,7 +12,7 @@
 //!   的分流），因为那要一份 [`komo_kernel::traits::TaskSpawner`]——工具只有
 //!   [`komo_kernel::types::tool::ToolContext`]，够不到它。
 //! - **不等任务跑完。** `dispatch` 提交成功就收尾（不返回 `RoundStop::Dependency`），
-//!   结果由任务会话自己的 watcher 投回消息来源的渠道。
+//!   任务收尾时 Gateway 把结果当作一条内部输入交回派它的会话。
 
 use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, Tool};
@@ -27,8 +26,8 @@ use super::{normalized, parse_args, plan_time};
 /// 模型给的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchArgs {
-    /// 自包含的任务描述：**任务会话看不到 home 的对话**，用户的原话与看板里相关任务
-    /// 的结论都要写进去（§6）。
+    /// 自包含的任务描述：**任务会话看不到派它的那段对话**，用户的原话与已知的结论都要
+    /// 写进去。
     pub task: String,
     /// 给人看的标题（建议 ≤ 30 字），建会话时写死。
     pub title: String,
@@ -54,11 +53,12 @@ impl Tool for DispatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "dispatch".into(),
-            description: "派一个新任务：建一个独立的任务会话去做需要读文件、跑命令、查设备、\
-                          写东西的事，你自己不用等它跑完。任务会话**看不到这段对话**，所以 \
-                          task 要自包含——把用户的原话和看板里相关任务的结论都写进去。\
-                          提交成功就立刻回一句\"已派出 #短号：标题\"，结果会由那个任务会话\
-                          自己投回消息来源。"
+            description: "派一个后台任务：建一个独立的任务会话去做要跑很久的事（长时间的排查、\
+                          批量操作、要等外部设备的事），你自己不用等它，这一轮可以直接回复用户。\
+                          任务会话**看不到这段对话**，所以 task 要自包含——把用户的原话和已知的\
+                          结论都写进去。提交成功就告诉用户\"已派出 #短号：标题\"。任务结束时，\
+                          结果会作为一条以 [后台任务 #短号…] 开头的消息交回给你，用户看不到\
+                          那条消息，由你把结论转告用户。几秒钟能做完的事直接做，不要派。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -93,7 +93,7 @@ impl Tool for DispatchTool {
         }
         if args.title.trim().is_empty() {
             return Err(ToolError::InvalidArguments {
-                message: "title 不能是空的：它是任务在看板与回执里的名字".into(),
+                message: "title 不能是空的：它是任务在回执与结果里的名字".into(),
             });
         }
 

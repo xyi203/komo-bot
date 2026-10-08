@@ -168,7 +168,7 @@ pub enum SpawnError {
     /// 建任务会话或提交第一条输入没做成（store / 账本错误）。
     #[error("{0}")]
     Failed(String),
-    /// `follow` 的短号解析不到——不是这个 home 名下的任务，或者根本没有这个短号。
+    /// `follow` 的短号解析不到——不是这个会话派出去的任务，或者根本没有这个短号。
     #[error("{0}")]
     UnknownTask(String),
     /// 短号在候选里不唯一：正文列出候选（延长到 6 位，§4.3）。
@@ -721,7 +721,7 @@ pub trait Tool: Send + Sync {
 
 // ---------------------------------------------------------------- 任务分发
 
-/// `dispatch` / `follow` 的接缝（`docs/home-dispatcher.md` §4.2）：把一个自包含任务派
+/// `dispatch` / `follow` 的接缝（`docs/background-tasks.md`）：把一个自包含任务派
 /// 进一条**独立的任务会话**，或者往已有的任务会话里再提交一句。
 ///
 /// 工具只有 [`crate::types::tool::ToolContext`]，没有 Ledger 也没有 Gateway 句柄，
@@ -735,8 +735,8 @@ pub trait Tool: Send + Sync {
 /// 干净失败，不是一个悬着的调用。
 #[async_trait]
 pub trait TaskSpawner: Send + Sync {
-    /// 建一个任务会话并提交第一条输入。结果投给**派它的那条 Run 的来源渠道**
-    /// （`from` 的 `runs.peer`）。
+    /// 建一个任务会话并提交第一条输入。任务收尾时结果交回**派它的那个会话**，由那边
+    /// 转告来源渠道（`from` 的 `runs.peer`）。
     ///
     /// `request_key` 由调用方按 `dispatch:{run}:{call}` 拼好（§4.2 的幂等）：同一次
     /// 调用重放时，它落到 [`crate::types::turn::AcceptInput::request_key`] 上，
@@ -749,7 +749,7 @@ pub trait TaskSpawner: Send + Sync {
     ) -> Result<crate::types::task::TaskHandle, SpawnError>;
 
     /// 往一个已有的任务会话里再提交一条输入。`task_id` 是任务短号（模型给的原文，
-    /// 解析在实现里做——只有 Gateway 查得到"这个 home 名下有哪些任务会话"）。
+    /// 解析在实现里做——只有 Gateway 查得到"这个会话派出去过哪些任务"）。
     async fn follow(
         &self,
         from: &crate::types::ids::RunId,

@@ -110,7 +110,6 @@ async fn render(case: &Case) -> String {
         history: resolved,
         memory,
         skills,
-        tasks: None,
         invocation,
         model_result_bytes: case.model_result_bytes,
     });

@@ -143,6 +143,7 @@ pub(super) struct MemorySection {
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ExecutionSection {
     pub model_result_bytes: Option<usize>,
+    pub call_timeout_secs: Option<u64>,
 }
 
 impl ExecutionSection {
@@ -150,6 +151,7 @@ impl ExecutionSection {
         let base = ExecutionConfig::default();
         ExecutionConfig {
             model_result_bytes: self.model_result_bytes.unwrap_or(base.model_result_bytes),
+            call_timeout_secs: self.call_timeout_secs.unwrap_or(base.call_timeout_secs),
         }
     }
 }

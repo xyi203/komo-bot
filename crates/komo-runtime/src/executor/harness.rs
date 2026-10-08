@@ -255,6 +255,7 @@ impl Harness {
             env_version: None,
             resumed: None,
             cancel: CancelToken::new(),
+            call_timeout: env.call_timeout,
         }
     }
 
@@ -284,6 +285,9 @@ impl Harness {
             }],
             // 测试默认用同一个默认预算；要更小/更大的自己改这一格。
             model_result_bytes: komo_kernel::projection::DEFAULT_MODEL_RESULT_BYTES,
+            call_timeout: std::time::Duration::from_secs(
+                komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS,
+            ),
             env_version: None,
             principal: None,
             cancel,

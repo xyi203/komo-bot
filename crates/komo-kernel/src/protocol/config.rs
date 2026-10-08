@@ -294,6 +294,17 @@ pub struct ExecutionConfig {
     /// 投影给模型看多少（§8.3）。
     #[serde(default = "default_model_result_bytes")]
     pub model_result_bytes: usize,
+    /// 单次工具调用的活动执行时限（秒）。工具自己的超时（如 shell 的 `timeout_secs`）
+    /// 会被收紧到它以内，所以到点时是工具自己杀进程、报超时，而不是执行器丢下一个结果不明。
+    #[serde(default = "default_call_timeout_secs")]
+    pub call_timeout_secs: u64,
+}
+
+/// 一次 `cargo build --release` 这种量级的命令要能跑完。
+pub const DEFAULT_CALL_TIMEOUT_SECS: u64 = 1800;
+
+fn default_call_timeout_secs() -> u64 {
+    DEFAULT_CALL_TIMEOUT_SECS
 }
 
 fn default_model_result_bytes() -> usize {
@@ -309,6 +320,7 @@ impl Default for ExecutionConfig {
     fn default() -> Self {
         Self {
             model_result_bytes: default_model_result_bytes(),
+            call_timeout_secs: DEFAULT_CALL_TIMEOUT_SECS,
         }
     }
 }

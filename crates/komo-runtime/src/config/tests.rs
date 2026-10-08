@@ -365,6 +365,25 @@ fn a_known_key_with_the_wrong_type_still_refuses_the_load() {
 }
 
 #[test]
+fn the_call_timeout_is_read_from_the_execution_section() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[execution]\ncall_timeout_secs = 600\n");
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.execution.call_timeout_secs, 600);
+    assert!(
+        loaded
+            .issues
+            .iter()
+            .all(|issue| !issue.key.as_str().starts_with("execution")),
+        "{:?}",
+        loaded.issues
+    );
+}
+
+#[test]
 fn a_config_without_a_model_section_says_which_key_is_missing() {
     let fixture = Fixture::valid();
     write(&fixture.sources().config, "[memory]\nenabled = false\n");

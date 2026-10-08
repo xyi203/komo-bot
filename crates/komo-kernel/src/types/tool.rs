@@ -118,6 +118,9 @@ pub struct ToolContext {
     /// 这次 `execute` 是不是一次**恢复执行**（§8.4 第 6 / 7 行）。`None` = 首次。
     pub resumed: Option<ResumedCall>,
     pub cancel: CancelToken,
+    /// 活动执行时限（`[execution] call_timeout_secs`）。自带超时的工具把自己的超时收紧到
+    /// 它以内：执行器的兜底只在工具不守时限时才触发，而那一刻只能报"结果不明"。
+    pub call_timeout: std::time::Duration,
 }
 
 /// 这次执行是在接一次没有收尾的调用（§8.4、§8.6）。
@@ -254,6 +257,7 @@ mod tests {
                 session: SessionId::from_raw("s"),
             },
             cwd: PathBuf::from("/home/u/ws"),
+            call_timeout: std::time::Duration::from_secs(60),
             mounts: ResourceMounts::default(),
             roots: vec![
                 WorkspaceRoot {

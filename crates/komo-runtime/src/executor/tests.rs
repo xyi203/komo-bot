@@ -176,6 +176,7 @@ async fn a_deny_is_not_overridden_by_a_matching_grant_and_consumes_nothing() {
                 env_version: None,
                 resumed: None,
                 cancel: CancelToken::new(),
+                call_timeout: env.call_timeout,
             },
         )
         .await

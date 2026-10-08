@@ -194,7 +194,8 @@ impl Tool for ShellTool {
         let cwd: PathBuf = plan.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
         let timeout = args
             .timeout_secs
-            .map_or(self.default_timeout, Duration::from_secs);
+            .map_or(self.default_timeout, Duration::from_secs)
+            .min(ctx.call_timeout);
 
         let spec = ChildSpec {
             program: self.shell.clone(),
@@ -444,6 +445,32 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::Timeout { .. }), "{error:?}");
+    }
+
+    /// 模型要的时限比活动执行时限长：收紧到上限，由 shell 自己杀进程报超时——否则执行器
+    /// 先到点，一条跑了一半的命令就只能报"结果不明"。
+    #[tokio::test]
+    async fn a_requested_timeout_beyond_the_call_limit_is_clamped_to_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path());
+        ctx.call_timeout = Duration::from_secs(1);
+        let tool = ShellTool::new();
+        let mut sink = writer(&ctx);
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "command": "sleep 30", "timeout_secs": 1800 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let error = tool
+            .execute(approved(plan), &ctx, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ToolError::Timeout { after_secs: 1 }),
+            "{error:?}"
+        );
     }
 
     #[tokio::test]

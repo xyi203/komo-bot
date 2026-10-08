@@ -192,6 +192,9 @@ pub(crate) mod test_support {
             env_version: None,
             resumed: None,
             cancel,
+            call_timeout: std::time::Duration::from_secs(
+                komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS,
+            ),
         }
     }
 

@@ -389,6 +389,12 @@ fn check_execution(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             "model_result_bytes 不能是 0（模型就什么都看不到了）",
         ));
     }
+    if snapshot.execution.call_timeout_secs == 0 {
+        issues.push(error(
+            "execution.call_timeout_secs",
+            "call_timeout_secs 不能是 0（每个工具调用一开始就超时）",
+        ));
+    }
 }
 
 /// 助手定义（§四）。**没有隐含默认**，所以"一个都没声明"与"default_agent 指了个不存在的

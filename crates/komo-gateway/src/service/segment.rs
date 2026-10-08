@@ -167,6 +167,16 @@ impl GatewaySegments {
             .unwrap_or(komo_kernel::projection::DEFAULT_MODEL_RESULT_BYTES)
     }
 
+    /// 这一次执行用多长的活动执行时限。
+    fn call_timeout(&self) -> std::time::Duration {
+        let secs = self
+            .config
+            .as_ref()
+            .map(|config| config.current().execution.call_timeout_secs)
+            .unwrap_or(komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS);
+        std::time::Duration::from_secs(secs)
+    }
+
     /// 这一段能用哪些根。见 [`run_roots`]。
     fn roots_for(&self, session: &SessionId, cwd: PathBuf) -> Vec<WorkspaceRoot> {
         run_roots(
@@ -542,6 +552,7 @@ impl SegmentSource for GatewaySegments {
             roots,
             mounts,
             model_result_bytes,
+            call_timeout: self.call_timeout(),
             env_version: None,
             principal: None,
             // 本 Run 是被谁派的（普通 Run 是 None）。runtime 用它硬拦"子代理再委派"。

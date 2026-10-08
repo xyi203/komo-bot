@@ -76,14 +76,13 @@ use crate::policy::{DecisionEnv, PolicyEngine, grants_for};
 
 use self::cancel::race;
 
-/// 执行器自己的预算（§6：活动执行时限）。
+/// 执行器自己的预算（§6）。
 ///
-/// **交给模型的正文上限不在这里**：它跟着每一次执行走（[`CallEnv::model_result_bytes`]），
-/// 因为配置是热生效的（§3）——写在这里就等于把它钉在装配那一刻。
+/// **交给模型的正文上限与活动执行时限不在这里**：它们跟着每一次执行走
+/// （[`CallEnv::model_result_bytes`]、[`CallEnv::call_timeout`]），因为配置是热生效的（§3）
+/// ——写在这里就等于把它们钉在装配那一刻。
 #[derive(Debug, Clone)]
 pub struct ExecutionLimits {
-    /// 单次调用的活动执行时限。工具自己的超时可以更短，不能更长。
-    pub call_timeout: Duration,
     /// 同一轮里最多几条**只读**调用同时在飞（§6）。
     ///
     /// 它是并发度上限，不是正确性开关：写、审批、取消照样是屏障，唯一放开的是"两条读取
@@ -94,7 +93,6 @@ pub struct ExecutionLimits {
 impl Default for ExecutionLimits {
     fn default() -> Self {
         Self {
-            call_timeout: Duration::from_secs(300),
             max_parallel_reads: 4,
         }
     }
@@ -157,6 +155,8 @@ pub struct CallEnv {
     /// 交给模型的工具结果正文上限（§6）。**由 Gateway 按当前配置快照填**：配置热重载
     /// 对新 Run 立刻生效，所以它不在执行器里，而在每一次执行的环境里（§3）。
     pub model_result_bytes: usize,
+    /// 单次调用的活动执行时限（§6，`[execution] call_timeout_secs`）。同上，按快照热生效。
+    pub call_timeout: Duration,
     pub env_version: Option<EnvVersion>,
     pub principal: Option<Principal>,
     pub cancel: CancelToken,
@@ -687,7 +687,7 @@ impl ToolExecutor {
         let executed = race(
             &env.cancel,
             tokio::time::timeout(
-                self.limits.call_timeout,
+                env.call_timeout + REAP_GRACE,
                 tool.execute(approved, &ctx, writer.as_mut()),
             ),
         )
@@ -696,7 +696,7 @@ impl ToolExecutor {
 
         let outcome = match executed {
             None => Err(ToolError::Cancelled),
-            Some(Err(_elapsed)) => Err(timeout_error(&plan, self.limits.call_timeout)),
+            Some(Err(_elapsed)) => Err(timeout_error(&plan, env.call_timeout)),
             Some(Ok(result)) => result,
         };
 
@@ -1617,6 +1617,7 @@ impl ToolExecutor {
             env_version: env.env_version.clone(),
             resumed: request.resumed.clone(),
             cancel: env.cancel.clone(),
+            call_timeout: env.call_timeout,
         }
     }
 }
@@ -1776,6 +1777,11 @@ fn safe_to_redo(plan: &ExecutionPlan) -> bool {
         RecoveryMode::SafeReread | RecoveryMode::IdempotencyKey { .. }
     )
 }
+
+/// 工具守着 `call_timeout` 自己超时之后，还要终止进程组、回收（TERM 与 KILL 各等 5s）、
+/// 写完输出。兜底计时器多给这么一段，否则两边同时到点，赢的总是执行器——一个本来
+/// 说得清"超时被杀"的结果就成了"结果不明"。
+const REAP_GRACE: Duration = Duration::from_secs(15);
 
 /// 活动执行时限到了。
 ///

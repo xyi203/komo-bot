@@ -51,6 +51,10 @@ pub enum OperationMatch {
     Dispatch,
     /// 同上：往一个已有的任务会话里再提交一句。
     Follow,
+    /// 操作者声明为只读的 MCP 工具（`docs/mcp.md`）。
+    McpRead,
+    /// 其余 MCP 工具：副作用由服务器决定。
+    McpCall,
 }
 
 impl OperationMatch {
@@ -68,6 +72,10 @@ impl OperationMatch {
             Operation::Delegate { .. } => OperationMatch::Delegate,
             Operation::Dispatch { .. } => OperationMatch::Dispatch,
             Operation::Follow { .. } => OperationMatch::Follow,
+            Operation::McpCall {
+                read_only: true, ..
+            } => OperationMatch::McpRead,
+            Operation::McpCall { .. } => OperationMatch::McpCall,
         }
     }
 }

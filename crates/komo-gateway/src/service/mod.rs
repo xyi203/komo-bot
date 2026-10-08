@@ -607,6 +607,9 @@ async fn build_tools(
     // 任务分发"干净失败。
     tools.push(Arc::new(DispatchTool::new()));
     tools.push(Arc::new(FollowTool::new()));
+    // MCP（`docs/mcp.md`）：启动时连上、列出工具，挂进同一份目录——之后它们与内置工具
+    // 走同一条 Policy / 审批 / 落账的路。
+    tools.extend(komo_runtime::mcp::connect_all(&snapshot.start_only.mcp, &config.secrets()).await);
 
     let toolbox = toolbox_of(&config.current());
     let python = python_env(config, &toolbox);

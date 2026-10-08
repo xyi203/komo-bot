@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 
 use komo_kernel::policy::RuleTable;
 use komo_kernel::protocol::config::{
-    ChannelConfig, ChannelsConfig, ConfigSnapshot, ExecutionConfig, KeyPath, MemoryConfig,
-    PathsConfig, RetrievalConfig, SourceFile, StartOnly, TypesafeConfig,
+    ChannelConfig, ChannelsConfig, ConfigSnapshot, ExecutionConfig, KeyPath, McpServerConfig,
+    McpTransport, MemoryConfig, PathsConfig, RetrievalConfig, SourceFile, StartOnly,
+    TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile};
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
@@ -65,6 +66,8 @@ pub(super) struct FileConfig {
     pub agents: std::collections::BTreeMap<String, AgentSection>,
     #[serde(default)]
     pub channels: ChannelsSection,
+    #[serde(default)]
+    pub mcp: McpSection,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -187,6 +190,64 @@ pub(super) struct AgentSection {
     pub skills: Option<Vec<String>>,
     pub workspace: Option<PathBuf>,
     pub memory_scope: Option<String>,
+}
+
+/// `[mcp.servers.<name>]`（`docs/mcp.md`）。`command` 与 `url` 恰好写一个。
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct McpSection {
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerSection>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct McpServerSection {
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<String>,
+    pub url: Option<String>,
+    pub bearer_token_env: Option<String>,
+    pub tools: Option<Vec<String>>,
+    #[serde(default)]
+    pub read_only: Vec<String>,
+}
+
+impl McpServerSection {
+    fn into_config(self, name: &str, base: &Path) -> Result<McpServerConfig, ConfigError> {
+        let invalid = |message: &str| ConfigError::Io {
+            path: base.join("config.toml"),
+            message: format!("[mcp.servers.{name}] {message}"),
+        };
+        let transport = match (self.command, self.url) {
+            (Some(command), None) => {
+                if self.bearer_token_env.is_some() {
+                    return Err(invalid("bearer_token_env 只用于 url"));
+                }
+                McpTransport::Stdio {
+                    command,
+                    args: self.args,
+                    env: self.env,
+                }
+            }
+            (None, Some(url)) => {
+                if !self.args.is_empty() || !self.env.is_empty() {
+                    return Err(invalid("args / env 只用于 command"));
+                }
+                McpTransport::Http {
+                    url,
+                    bearer_token_env: self.bearer_token_env,
+                }
+            }
+            _ => return Err(invalid("command 与 url 要恰好写一个")),
+        };
+        Ok(McpServerConfig {
+            transport,
+            tools: self.tools,
+            read_only: self.read_only,
+        })
+    }
 }
 
 impl AgentSection {
@@ -403,6 +464,15 @@ pub(super) fn assemble(
         ),
         data_dir: data_dir.clone(),
         listen,
+        mcp: file
+            .mcp
+            .servers
+            .into_iter()
+            .map(|(name, server)| {
+                let config = server.into_config(&name, &base)?;
+                Ok((name, config))
+            })
+            .collect::<Result<_, ConfigError>>()?,
     };
 
     let paths = PathsConfig {

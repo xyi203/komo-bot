@@ -97,6 +97,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             listen: "127.0.0.1:7777".into(),
             db_path: "/tmp/komo/state.db".into(),
             python_env_root: "/tmp/komo/python-envs".into(),
+            mcp: Default::default(),
         },
         model_catalog: ModelCatalog {
             default: "main".into(),

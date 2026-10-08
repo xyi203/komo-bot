@@ -64,6 +64,44 @@ pub struct StartOnly {
     pub listen: String,
     pub db_path: PathBuf,
     pub python_env_root: PathBuf,
+    /// MCP 服务器（`[mcp.servers.<name>]`，`docs/mcp.md`）。启动时连接、列出工具、挂进
+    /// 工具目录，改了要重启才生效。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServerConfig>,
+}
+
+/// 一个 MCP 服务器（`docs/mcp.md`）。凭证不在这里：`env` / `bearer_token_env` 写的是
+/// `.env` 里的变量名。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub transport: McpTransport,
+    /// 挂哪些工具。`None` = 服务器列出的全部。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    /// 操作者认定为只读的工具：Policy 按只读放行，中断后可以重做（`SafeReread`）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum McpTransport {
+    /// 起一个子进程，走 stdin / stdout。
+    Stdio {
+        command: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        args: Vec<String>,
+        /// 从 `.env` 带进子进程的变量名。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<String>,
+    },
+    /// Streamable HTTP。
+    Http {
+        url: String,
+        /// `Authorization: Bearer` 用的 `.env` 变量名。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bearer_token_env: Option<String>,
+    },
 }
 
 /// 一个聊天渠道的行为键（§11.2）。凭证在 .env，不在这里。
@@ -436,6 +474,7 @@ mod tests {
                 listen: "127.0.0.1:7777".into(),
                 db_path: PathBuf::from("/home/u/.komo/state.db"),
                 python_env_root: PathBuf::from("/home/u/.komo/python-envs"),
+                mcp: Default::default(),
             },
             model_catalog: ModelCatalog::default(),
             model: model("chat-a"),

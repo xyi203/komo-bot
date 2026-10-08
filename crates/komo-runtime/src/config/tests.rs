@@ -475,3 +475,49 @@ fn a_warning_rides_along_with_a_config_that_still_loads() {
         komo_kernel::protocol::config::IssueSeverity::Warning
     );
 }
+
+// ---------------------------------------------------------------- [mcp]（docs/mcp.md）
+
+#[test]
+fn mcp_servers_load_into_the_start_only_keys() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str(
+        r#"
+[mcp.servers.gh]
+command = "npx"
+args = ["-y", "server-github"]
+env = ["GITHUB_TOKEN"]
+read_only = ["search"]
+
+[mcp.servers.docs]
+url = "https://mcp.example.com/mcp"
+bearer_token_env = "DOCS_TOKEN"
+tools = ["lookup"]
+"#,
+    );
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    let mcp = &loaded.snapshot.start_only.mcp;
+    assert_eq!(
+        mcp["gh"].transport,
+        komo_kernel::protocol::config::McpTransport::Stdio {
+            command: "npx".into(),
+            args: vec!["-y".into(), "server-github".into()],
+            env: vec!["GITHUB_TOKEN".into()],
+        }
+    );
+    assert_eq!(mcp["gh"].read_only, vec!["search".to_string()]);
+    assert_eq!(mcp["docs"].tools, Some(vec!["lookup".to_string()]));
+}
+
+#[test]
+fn an_mcp_server_needs_exactly_one_of_command_and_url() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[mcp.servers.x]\ncommand = \"a\"\nurl = \"http://b\"\n");
+    write(&fixture.sources().config, &text);
+    let error = load_config(&fixture.options()).unwrap_err();
+    assert!(error.to_string().contains("[mcp.servers.x]"), "{error}");
+}

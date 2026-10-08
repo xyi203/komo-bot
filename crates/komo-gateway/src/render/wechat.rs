@@ -185,6 +185,14 @@ fn plan_action(plan: &ExecutionPlan) -> String {
             lines.push(format!("任务: #{task_id}"));
             lines.push(format!("追问: {text}"));
         }
+        // 审批批的就是这一组参数：服务器那边做什么，komo 只看得见它们。
+        Operation::McpCall { server, tool, .. } => {
+            lines.push(format!("MCP: {server} · {tool}"));
+            lines.push(format!(
+                "参数: {}",
+                serde_json::to_string_pretty(&plan.args).unwrap_or_default()
+            ));
+        }
         _ => {}
     }
     if let Some(cwd) = &plan.cwd {
@@ -223,6 +231,7 @@ fn operation_label(operation: &Operation) -> &'static str {
         Operation::Delegate { .. } => "delegate",
         Operation::Dispatch { .. } => "dispatch",
         Operation::Follow { .. } => "follow",
+        Operation::McpCall { .. } => "mcp_call",
     }
 }
 

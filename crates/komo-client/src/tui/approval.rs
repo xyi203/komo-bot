@@ -244,7 +244,7 @@ pub fn plan_lines(plan: &ExecutionPlan) -> Vec<Line<'static>> {
         Span::raw(format!("  ·  {}", operation_name(&plan.operation))),
     ])];
 
-    if let Some(body) = operation_body(&plan.operation) {
+    if let Some(body) = operation_body(plan) {
         for line in body.lines() {
             lines.push(Line::from(Span::styled(
                 format!("    {line}"),
@@ -356,12 +356,13 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Delegate { .. } => "派给子代理",
         Operation::Dispatch { .. } => "派一个任务",
         Operation::Follow { .. } => "追问一个任务",
+        Operation::McpCall { .. } => "MCP 工具",
     }
 }
 
 /// 命令或代码本身——审批看的就是这一段。
-fn operation_body(operation: &Operation) -> Option<String> {
-    match operation {
+fn operation_body(plan: &ExecutionPlan) -> Option<String> {
+    match &plan.operation {
         Operation::ShellCommand { command } => Some(command.clone()),
         Operation::PythonCall { module, function } => Some(format!("{module}.{function}()")),
         Operation::ToolboxChange { module } => Some(module.clone()),
@@ -373,6 +374,10 @@ fn operation_body(operation: &Operation) -> Option<String> {
         }),
         Operation::Dispatch { task, title } => Some(format!("{title}\n{task}")),
         Operation::Follow { task_id, text } => Some(format!("#{task_id}\n{text}")),
+        Operation::McpCall { server, tool, .. } => Some(format!(
+            "{server} · {tool}\n{}",
+            serde_json::to_string_pretty(&plan.args).unwrap_or_default()
+        )),
         _ => None,
     }
 }

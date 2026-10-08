@@ -123,8 +123,19 @@ pub enum Operation {
     /// 把一句话提交进一个**已有的**任务会话（`docs/background-tasks.md`）。
     ///
     /// `task_id` 是模型给的任务短号原文，解析成具体会话在执行侧做（只有 Gateway 查得到
-    /// "这个 home 名下有哪些任务会话"）。
+    /// "这个会话派出去过哪些任务"）。
     Follow { task_id: String, text: String },
+    /// 调一个 MCP 服务器上的工具（`docs/mcp.md`）。
+    ///
+    /// 副作用由服务器决定，komo 看不见。`read_only` 是**操作者**在配置里声明的
+    /// （`[mcp.servers.<name>] read_only`），不是服务器自报的 `readOnlyHint`——自称安全
+    /// 的东西不进 Policy（§7.1）。
+    McpCall {
+        server: String,
+        tool: String,
+        #[serde(default)]
+        read_only: bool,
+    },
 }
 
 impl Operation {
@@ -135,7 +146,14 @@ impl Operation {
 
     /// 只读动作。
     pub fn is_read_only(&self) -> bool {
-        matches!(self, Operation::ReadFile)
+        matches!(
+            self,
+            Operation::ReadFile
+                | Operation::McpCall {
+                    read_only: true,
+                    ..
+                }
+        )
     }
 }
 

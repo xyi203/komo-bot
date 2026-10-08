@@ -6,6 +6,7 @@ pub mod config;
 pub mod embedding;
 pub mod executor;
 pub mod llm;
+pub mod mcp;
 pub mod memory;
 pub mod policy;
 pub mod python_runtime;

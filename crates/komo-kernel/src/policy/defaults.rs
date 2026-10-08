@@ -191,6 +191,21 @@ impl RuleTable {
                     "follow 只是把一句话提交进已有的任务会话，任务内的调用仍照常过 Policy",
                     Matcher::operations([OperationMatch::Follow]),
                 ),
+                // MCP（`docs/mcp.md`）：操作者在配置里声明为只读的工具放行，其余要人看——
+                // 外部服务做了什么 komo 看不见。单个工具要免问，在 policy.toml 里按
+                // `tools = ["mcp__<server>__<tool>"]` 写一条 Allow。
+                rule(
+                    "mcp-read",
+                    Effect::Allow,
+                    "操作者声明为只读的 MCP 工具",
+                    Matcher::operations([OperationMatch::McpRead]),
+                ),
+                rule(
+                    "mcp-call",
+                    Effect::Ask,
+                    "MCP 工具调用：副作用由外部服务决定",
+                    Matcher::operations([OperationMatch::McpCall]),
+                ),
             ],
             default: Effect::Ask,
         }
@@ -764,6 +779,32 @@ mod tests {
         let decision = RuleTable::initial().decide(&follow, &f.ctx());
         assert!(decision.is_allow(), "{decision:?}");
         assert!(decision.reason().contains("follow-allow"));
+    }
+
+    /// MCP（`docs/mcp.md`）：strict 下只有操作者声明为只读的放行，其余要人看；auto 不问。
+    #[test]
+    fn mcp_reads_pass_and_other_mcp_calls_ask_under_strict() {
+        let f = Fixture::new();
+        let call = |read_only| {
+            plan(
+                "mcp__gh__search",
+                Operation::McpCall {
+                    server: "gh".into(),
+                    tool: "search".into(),
+                    read_only,
+                },
+                vec![],
+            )
+        };
+        let read = RuleTable::initial().decide(&call(true), &f.ctx());
+        assert!(read.is_allow(), "{read:?}");
+        assert!(read.reason().contains("mcp-read"));
+
+        let write = RuleTable::initial().decide(&call(false), &f.ctx());
+        assert!(matches!(write, PolicyDecision::Ask { .. }), "{write:?}");
+        assert!(write.reason().contains("mcp-call"));
+
+        assert!(RuleTable::auto().decide(&call(false), &f.ctx()).is_allow());
     }
 
     // ---- 梯子本身 ----

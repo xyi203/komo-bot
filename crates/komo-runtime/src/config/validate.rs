@@ -77,6 +77,7 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
     check_execution(snapshot, &mut issues);
     check_typesafe(snapshot, &mut issues);
     check_agents(snapshot, &mut issues);
+    check_mcp(snapshot, &mut issues);
 
     issues.sort_by(|a, b| a.key.cmp(&b.key).then(a.severity.cmp(&b.severity)));
     issues
@@ -396,6 +397,34 @@ fn check_execution(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
     }
 }
 
+/// `[mcp.servers.<name>]`（`docs/mcp.md`）：名字要进工具名（`mcp__<name>__<tool>`），只能是
+/// 字母、数字、`_`、`-`；`read_only` 写了白名单之外的工具是笔误，不会生效。
+fn check_mcp(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    for (name, server) in &snapshot.start_only.mcp {
+        let key = format!("mcp.servers.{name}");
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            issues.push(error(
+                &key,
+                "服务器名只能用字母、数字、_ 与 -（它要进工具名）",
+            ));
+        }
+        if let Some(tools) = &server.tools {
+            for tool in &server.read_only {
+                if !tools.contains(tool) {
+                    issues.push(warning(
+                        &format!("{key}.read_only"),
+                        format!("`{tool}` 不在 tools 里，这条只读声明不会生效"),
+                    ));
+                }
+            }
+        }
+    }
+}
+
 /// 助手定义（§四）。**没有隐含默认**，所以"一个都没声明"与"default_agent 指了个不存在的
 /// id"都要在这里说出来——否则装配时才发现，操作者只看到一句"起不来"。
 fn check_agents(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
@@ -582,10 +611,44 @@ fn check_policy(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
 mod tests {
     use super::*;
     use crate::config::testing::snapshot_fixture;
+    use komo_kernel::protocol::config::{McpServerConfig, McpTransport};
     use komo_kernel::types::model::Effort;
 
     fn keys(issues: &[ConfigIssue]) -> Vec<&str> {
         issues.iter().map(|i| i.key.as_str()).collect()
+    }
+
+    fn mcp_server(tools: Option<Vec<&str>>, read_only: Vec<&str>) -> McpServerConfig {
+        McpServerConfig {
+            transport: McpTransport::Http {
+                url: "http://127.0.0.1:1/mcp".into(),
+                bearer_token_env: None,
+            },
+            tools: tools.map(|tools| tools.into_iter().map(String::from).collect()),
+            read_only: read_only.into_iter().map(String::from).collect(),
+        }
+    }
+
+    #[test]
+    fn an_mcp_server_name_that_cannot_go_into_a_tool_name_is_refused() {
+        let mut snapshot = snapshot_fixture();
+        snapshot
+            .start_only
+            .mcp
+            .insert("my server".into(), mcp_server(None, vec![]));
+        assert_eq!(keys(&validate(&snapshot)), vec!["mcp.servers.my server"]);
+    }
+
+    #[test]
+    fn read_only_outside_the_allow_list_is_a_warning() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.start_only.mcp.insert(
+            "gh".into(),
+            mcp_server(Some(vec!["search"]), vec!["search", "push"]),
+        );
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["mcp.servers.gh.read_only"]);
+        assert_eq!(issues[0].severity, IssueSeverity::Warning);
     }
 
     #[test]

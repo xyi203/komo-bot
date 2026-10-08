@@ -155,6 +155,8 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 `resume` 的目标在 `prepare` 里校验，不过就是一次**没有执行过**的调用，按 `fail_call` 落账并把理由交给模型（§13.5）：① 同一 Session，且是一条子 Run（主对话的 Run 不是"子代理"，没有什么可续）；② 已经进终态，且终态是 `completed` 或 `failed`——**`cancelled` / `abandoned` 不能续**：那是操作者说过"这件事到此为止"，模型不能替人把它捡回来；③ 在最新一个 `conversation.boundary` 之后——边界之前的那条线属于上一段对话，父的窗口里已经看不到它，续过去的窗口也会被边界截断成一半；④ **它是这条线的末端**：已经有别的子 Run `resumes` 它（不论那条什么状态）就拒绝，理由里写出末端是哪一条——线只往后接，不分叉，想另起炉灶就不填 `resume`。④ 不靠"先查后写"：它在受理子 Run 的那个 db 事务里再判一次（与 `run.accepted` 同一次提交，§8.5），查到了就不受理。
 
+**MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 Policy / 审批 / 落账的路；只读与否由操作者声明，不信服务器自报。见 `docs/mcp.md`。
+
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、Policy 判断、审批处理、执行状态保存、取消和输出限制。
 
 **每次运行有它自己的能力面（`AgentSurface`）。** 这次允许调用哪些工具是一个显式的集合：**交给模型的工具 schema 与执行时查找的表是同一份**，装配时由 schema 反推，所以两边不可能分家。schema 里没有的名字，执行器不认——模型自己拼出这个名字，拿到的是"这次运行的工具集里没有它"，而不是"进去试试看"。执行器手里那份全局工具目录只用于**发现与构造**（`komo skills` 的 `requires_tools` 门控也问它），**执行时一次都不回退到它**：能回退就等于能力边界只是一句建议。子代理已经是这条边界的第一个使用者（它的 schema 里没有 `delegate`，于是它也调不动 `delegate`）。
@@ -465,6 +467,7 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 | 委派一个子任务（`Operation::Delegate`）       | 按操作者意图：strict 下 Ask（展示任务正文与结果契约），auto 下 Allow。**子代理自己的每一次调用仍各自按上面各行判断**——委派不放宽任何一层。续跑（`resume`，§4）是同一行：审批卡在这次委派的任务正文（这次续跑要接着做的那件事，就是这次 `delegate` 调用的 `task`）之外多写一句"接着子 Run X"，续跑目标进计划、进计划哈希，批的是"接着**这一条**"，换一条就要重新问。**渲染只读得到这次的计划**，不回去查目标那条子 Run 当初的任务正文——那句原话要看，去读那条子 Run 自己的记录（§8.3 的回放窗口） |
 | 派一个新任务（`Operation::Dispatch`）         | strict 与 auto 下都 Allow：它只是建一个独立的**任务会话**并提交第一条输入（`docs/background-tasks.md`），不等它跑完，**任务会话里的每一次调用仍各自按上面各行判断**——不放宽任何一层。幂等键 `dispatch:{run}:{call}` 让重放的同一次调用不会多建一个任务 |
 | 追问一个任务（`Operation::Follow`）           | 同上：strict 与 auto 下都 Allow，只是把一句话提交进一个已有的任务会话；幂等键 `follow:{run}:{call}` |
+| 调 MCP 工具（`Operation::McpCall`）           | 操作者在 `[mcp.servers.<name>] read_only` 里声明的：strict 与 auto 下都 Allow，中断后重读；其余：strict 下 Ask（卡片上是服务器、工具与完整参数），auto 下 Allow，中断后停下问人。服务器自报的 `readOnlyHint` 不算数（`docs/mcp.md`） |
 | shell 命令文本匹配 `komo cron add`            | strict 下永远 Ask，且**只能批一次**（`scopes` 固定 `[once]`，不给 Run / Cron 范围）；**任何已有的 Run / Cron 范围授权都不能替这一步作答**——`cron add` 会给命令 Job 自己签发一条执行授权（见下），模型能经 shell 调它给自己写将来能免问的许可，这一条必须每次都问人。auto 基表不变（§7.1「auto 与 strict 的差别就是要不要人看一眼」，这条也不例外） |
 
 **两套建议，操作者选一套。** 上面那张表落成 `RuleTable::initial()`（"strict"）；另一套是
@@ -1755,7 +1758,8 @@ kernel ← client ────────────────────�
 | `openlark` | 仅 gateway，feature `feishu`（默认开），`default-features = false, features = ["websocket"]` | 只要 ws 长连接；事件负载用 `register_raw` 拿原始 JSON、自己的宽容 serde 结构解析。带来 `prost 0.13`（turso 同步引擎用 0.14）和一份 `tokio-tungstenite` 重复——接受，不再自己额外引入 tungstenite |
 | `wechatbot` | 仅 gateway，feature `wechat`（默认开）；**`[patch.crates-io]` 指向 `vendor/wechatbot`**（0.4.0 原样复制，只改 `Cargo.toml` 一行：reqwest `0.12` 默认特性 → `0.13`，`default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"]`） | 上游所有发布版本都写 `reqwest = { version = "0.12", features = ["json"] }`，默认特性开着 = native-tls = openssl-sys，自己一个 feature 都没有；cargo 特性只加不减，工作区里无论怎么声明都关不掉。patch 后复用 komo `main` 装的同一个 ring provider，openssl / native-tls / hyper-tls 整条 C 构建链消失，**构建不再依赖任何系统库**（Fedora 不必 `openssl-devel`，Mac 不必 `brew install openssl@3`），且 reqwest 只剩 0.13 一份（wechatbot 用到的 reqwest API 面极小，0.13 全保留；2026-09-16 实测默认特性全量构建通过）。不选 vendored openssl：OpenSSL 3.6.3、1210 个 .c，`make depend` / `install_dev` 串行，估 2–3 分钟且在 wechat 关键路径起点，会取代 turso 链成为新关键路径。升级 wechatbot = 重新复制 + 重打这一行，见 `vendor/README.md` |
 | `qrcode` | `default-features = false`；微信登录二维码渲染为终端字符 | 不需要 `image` |
-| **不引入** | rmcp / image | MCP 不在首版 |
+| `rmcp` | `3.x`，`default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"]`；仅 komo-runtime | MCP 客户端（`docs/mcp.md`），官方 Rust SDK。HTTP 走工作区同一个 reqwest 0.13（rustls-no-provider），不开 OAuth、不开 server 与宏。新拉 `process-wrap`、`sse-stream`、`futures`，新增一条重复版本 `nix 0.31`（process-wrap；既有 0.29）。实测（2026-10-08，增量重编）：rmcp 2.8s + 构建脚本 0.3s + process-wrap / sse-stream 各 0.2–0.3s |
+| **不引入** | image | — |
 | `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | **已做**：`[patch.crates-io]` 一份 `toasty-driver-turso`（`vendor/toasty-driver-turso`，上游原包，只改 manifest 里 `turso` 那几行），工作区的 `turso` 也写 `default-features = false, features = ["mimalloc"]` | 实测（2026-09-16）：冷编 71.5s → 64.2s，编译单元 577 → 515，单元耗时总和 −36s CPU，`tantivy` / `zstd` / `lz4_flex` 从依赖树消失，少一条 C 工具链。墙钟只省 7s 是因为它们与 `aws-lc-sys` 并行、不在关键路径。功能零损失：turso 的 FTS 是索引方法，MVCC 直接拒绝。升级时整包替换 + 重加那几行，CI 用 `cargo tree -e features -i turso` 断言只剩 `mimalloc`；见 `vendor/README.md` |
 
 三个渠道各自一个 feature，默认全开。feature 的用处不是裁功能，是让 `cargo tree -d` 能按渠道归因重复版本，以及某家 SDK 坏掉时能单独关掉它继续构建。`cargo tree -d` 进入 CI：出现新的重复版本要有理由。

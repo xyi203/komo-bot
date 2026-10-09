@@ -184,7 +184,7 @@ impl AgentLoop {
         let Segment {
             session: _,
             run,
-            request,
+            mut request,
             env,
             budget,
             resume,
@@ -196,6 +196,9 @@ impl AgentLoop {
         if env.cancel.is_cancelled() {
             return self.cancel(&run, rounds).await;
         }
+
+        // 回放窗口里还没完整给够次数的大结果：这一段里到点就换成短视图（§8.3）。
+        let mut decay = decay::DecayTracker::seed(&mut request.messages);
 
         // 选驱动按 Run 的来源（§10）：命令 Job 触发的 Run 用固定出牌的
         // `CommandDriver`，`self.llm`（真正的模型客户端）一次都不会被摸到——不是把
@@ -213,14 +216,16 @@ impl AgentLoop {
             None => RoundInput::First,
             Some(resumed) => {
                 let mut results = resumed.settled;
+                decay.name(&resumed.pending);
                 let outcome = self.executor.execute_round(resumed.pending, &env).await?;
                 results.extend(outcome.results);
                 if let Some(stop) = outcome.stop {
                     return self.stop(&run, rounds, stop).await;
                 }
+                decay.track(&mut results);
                 RoundInput::ToolResults {
                     results,
-                    revised: Vec::new(),
+                    revised: decay.due(),
                 }
             }
         };
@@ -264,6 +269,8 @@ impl AgentLoop {
             let (assistant, calls) = self.assign_ids(number, &round);
             // 完整 assistant 回复与该轮全部调用计划，一个逻辑事件（§8.3）。
             self.ledger.record_round(&run, assistant).await?;
+            // 账本上多了一条 `message.assistant`：这次请求带着的结果都算完整给过一次。
+            decay.sent();
 
             if calls.is_empty() {
                 // 正常结束：回复已经作为 `message.assistant` 落过盘了，现在才 complete。
@@ -291,13 +298,15 @@ impl AgentLoop {
                     .await;
             }
 
-            let outcome = self.executor.execute_round(calls, &env).await?;
+            decay.name(&calls);
+            let mut outcome = self.executor.execute_round(calls, &env).await?;
             if let Some(stop) = outcome.stop {
                 return self.stop(&run, rounds, stop).await;
             }
+            decay.track(&mut outcome.results);
             input = RoundInput::ToolResults {
                 results: outcome.results,
-                revised: Vec::new(),
+                revised: decay.due(),
             };
         }
     }
@@ -468,6 +477,7 @@ fn spent(usage: &TokenUsage) -> u64 {
 }
 
 pub mod command_driver;
+mod decay;
 pub mod handler;
 
 #[cfg(test)]

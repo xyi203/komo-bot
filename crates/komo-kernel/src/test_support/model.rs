@@ -13,8 +13,9 @@ use crate::types::turn::{LlmError, Round, RoundInput, TurnRequest};
 pub struct ScriptedTurnDriver {
     rounds: std::collections::VecDeque<Result<Round, LlmError>>,
     usage: TokenUsage,
-    /// 收到过哪些输入——断言"上一轮结果按 call_id 回传了"。
-    pub seen: Vec<RoundInput>,
+    /// 收到过哪些输入——断言"上一轮结果按 call_id 回传了"。与交出它的 [`ScriptedLlm`]
+    /// 共用，driver 被 loop 拿走之后测试仍看得到。
+    pub seen: Arc<Mutex<Vec<RoundInput>>>,
 }
 
 impl ScriptedTurnDriver {
@@ -22,7 +23,7 @@ impl ScriptedTurnDriver {
         Self {
             rounds: rounds.into_iter().map(Ok).collect(),
             usage: TokenUsage::default(),
-            seen: Vec::new(),
+            seen: Arc::default(),
         }
     }
 
@@ -36,7 +37,7 @@ impl ScriptedTurnDriver {
 #[async_trait]
 impl TurnDriver for ScriptedTurnDriver {
     async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
-        self.seen.push(input);
+        self.seen.lock().expect("脚本 driver").push(input);
         self.rounds
             .pop_front()
             .unwrap_or(Err(LlmError::Unknown("脚本已经演完了".into())))?
@@ -66,6 +67,8 @@ pub struct ScriptedLlm {
     scripts: Arc<Mutex<std::collections::VecDeque<Vec<Round>>>>,
     /// 收到过的请求——断言"每个 Run 固定了自己的模型配置快照"。
     pub requests: Arc<Mutex<Vec<TurnRequest>>>,
+    /// 所有 driver 收到过的轮输入，按先后。
+    pub inputs: Arc<Mutex<Vec<RoundInput>>>,
 }
 
 impl ScriptedLlm {
@@ -74,6 +77,7 @@ impl ScriptedLlm {
         Self {
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
             requests: Arc::new(Mutex::new(Vec::new())),
+            inputs: Arc::default(),
         }
     }
 
@@ -93,7 +97,9 @@ impl LlmClient for ScriptedLlm {
             .expect("脚本模型")
             .pop_front()
             .unwrap_or_default();
-        Ok(Box::new(ScriptedTurnDriver::new(rounds)))
+        let mut driver = ScriptedTurnDriver::new(rounds);
+        driver.seen = Arc::clone(&self.inputs);
+        Ok(Box::new(driver))
     }
 }
 

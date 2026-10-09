@@ -82,7 +82,8 @@ depends on `agent`; `client` knows only protocol types.
   事实（`tool.result` 事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"重启后回放"
   必须逐字节相同。账本里那 ≤1 KiB 是**行预算**，交给模型多少由 `[execution]
   model_result_bytes` 定（§6）。当前 Session 的 `tool-output/` 与 `artifacts/` 是**只读根**：
-  正文里那句"完整输出在哪"必须真的能 `read`。
+  正文里那句"完整输出在哪"必须真的能 `read`。大结果每次请求给哪个视图由 `projection.rs` 的
+  `view_after` 按一个从日志数出来的次数（这条 Run 在它之后记了几条 `message.assistant`）选。
 - **Channel identity lives in config, not the db** (§11.2): `allow_from` /
   `home_chat` / `groups` in `config.toml`, credentials in `.env`. No pairing
   table, no `/sethome`.

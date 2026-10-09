@@ -938,3 +938,131 @@ async fn a_non_zero_exit_still_completes_the_run_not_fails_it() {
         "{outcome:?}"
     );
 }
+
+/// 一份 20 KB 的正文：投影成 full 之后远超衰减阈值（默认 4 KiB）。
+fn big_text() -> String {
+    (0..400)
+        .map(|n| format!("line {n:04}: {}\n", "x".repeat(40)))
+        .collect()
+}
+
+fn reading(name: &'static str, status: ToolResultStatus, preview: String) -> Arc<RecordingTool> {
+    Arc::new(
+        RecordingTool::new(name, komo_kernel::types::plan::Operation::ReadFile).with_outcome(Ok(
+            ToolOutput {
+                status,
+                result: serde_json::json!({}),
+                exit_code: None,
+                artifacts: vec![],
+                preview: Some(preview),
+            },
+        )),
+    )
+}
+
+/// 第一轮调 `first`（名字是 `read`），之后三轮各调一次小工具，最后收尾。返回每次 `next` 拿到的轮输入。
+async fn four_rounds_after(first: Arc<RecordingTool>) -> Vec<komo_kernel::types::turn::RoundInput> {
+    let small = reading("small", ToolResultStatus::Completed, "ok".into());
+    let llm = Arc::new(ScriptedLlm::once(vec![
+        round(
+            1,
+            None,
+            vec![call("pc-first", "read", serde_json::json!({}))],
+        ),
+        round(2, None, vec![call("pc-s1", "small", serde_json::json!({}))]),
+        round(3, None, vec![call("pc-s2", "small", serde_json::json!({}))]),
+        round(4, None, vec![call("pc-s3", "small", serde_json::json!({}))]),
+        round(5, Some("看完了。"), vec![]),
+    ]));
+    let wired = Wired::with_llm(llm.clone(), vec![first, small], true);
+    let segment = wired.segment(CancelToken::new()).await;
+    let outcome = wired.agent.run(segment).await.unwrap();
+    assert!(
+        matches!(outcome, SegmentOutcome::Completed { rounds: 5, .. }),
+        "{outcome:?}"
+    );
+    llm.inputs.lock().unwrap().clone()
+}
+
+fn revised_of(
+    input: &komo_kernel::types::turn::RoundInput,
+) -> &[komo_kernel::types::turn::ToolResultForModel] {
+    match input {
+        komo_kernel::types::turn::RoundInput::ToolResults { revised, .. } => revised,
+        komo_kernel::types::turn::RoundInput::First => &[],
+    }
+}
+
+/// 大结果完整给两次（它之后的第 1、2 次请求），第 3 次请求前换成短视图，之后不再换
+/// （§8.3）。次数就是"它之后记了几条 `message.assistant`"——回放数的是同一个数。
+#[tokio::test]
+async fn a_large_result_is_sent_whole_twice_then_revised() {
+    use komo_kernel::types::turn::RoundInput;
+
+    let inputs = four_rounds_after(reading("read", ToolResultStatus::Completed, big_text())).await;
+    assert_eq!(inputs.len(), 5, "{inputs:?}");
+
+    // 第 1 次：结果本身，完整视图；`decay` 不交给驱动。
+    let RoundInput::ToolResults { results, revised } = &inputs[1] else {
+        panic!("第二次请求带着工具结果：{:?}", inputs[1]);
+    };
+    let full = &results[0];
+    assert_eq!(full.provider_call_id, "pc-first");
+    assert!(full.content.len() > 4096, "{}", full.content.len());
+    assert!(full.decay.is_none(), "待换的视图是 loop 的事，不交给驱动");
+    assert!(revised.is_empty());
+    // 第 2 次：它还在历史里、完整的，不改。
+    assert!(revised_of(&inputs[2]).is_empty(), "{:?}", inputs[2]);
+
+    // 第 3 次：换成短视图，配对不动。
+    let revised = revised_of(&inputs[3]);
+    assert_eq!(revised.len(), 1, "{:?}", inputs[3]);
+    assert_eq!(revised[0].provider_call_id, "pc-first");
+    assert_eq!(revised[0].call_id, full.call_id);
+    assert!(!revised[0].is_error);
+    assert!(revised[0].content.len() + 1024 <= full.content.len());
+    assert!(
+        revised[0].content.starts_with("[read · 完成 · ")
+            && revised[0].content.contains("这份结果已完整给过 2 次"),
+        "{}",
+        revised[0].content
+    );
+    assert!(
+        revised[0].content.contains("完整输出："),
+        "{}",
+        revised[0].content
+    );
+
+    // 第 4 次：已经换过了，不再换一遍。
+    assert!(revised_of(&inputs[4]).is_empty(), "{:?}", inputs[4]);
+}
+
+/// 失败的正文是模型要对着改的东西：再大也不换（§8.3）。
+#[tokio::test]
+async fn an_error_result_is_never_revised() {
+    let inputs = four_rounds_after(reading("read", ToolResultStatus::Failed, big_text())).await;
+    let komo_kernel::types::turn::RoundInput::ToolResults { results, .. } = &inputs[1] else {
+        panic!("{:?}", inputs[1]);
+    };
+    assert!(results[0].is_error && results[0].content.len() > 4096);
+    assert!(
+        inputs.iter().all(|input| revised_of(input).is_empty()),
+        "{inputs:?}"
+    );
+}
+
+/// 没超阈值的结果没有短视图，也就没什么可换。
+#[tokio::test]
+async fn a_small_result_is_never_revised() {
+    let inputs = four_rounds_after(reading(
+        "read",
+        ToolResultStatus::Completed,
+        "一行\n".repeat(20),
+    ))
+    .await;
+    assert_eq!(inputs.len(), 5);
+    assert!(
+        inputs.iter().all(|input| revised_of(input).is_empty()),
+        "{inputs:?}"
+    );
+}

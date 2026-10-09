@@ -483,3 +483,115 @@ fn the_thread_window_is_byte_identical_before_and_after_a_restart() {
     assert_eq!(running.tool_calls.len(), 1, "正在跑的这一条带着完整协议");
     assert!(running.provider_blocks.is_some());
 }
+
+const DECAYING: ProjectionContext = ProjectionContext {
+    model_result_bytes: 8 * 1024,
+    decay: Some(komo_kernel::projection::DecayPolicy {
+        threshold_bytes: 4096,
+        full_sends: 2,
+        head_bytes: 2048,
+        tail_bytes: 1536,
+    }),
+};
+
+/// 正在跑的 Run：一次 `read` 拿回 20 KB，之后又记了 `later` 条 `message.assistant`。
+/// 返回回放出来的那条结果。
+fn replayed_after(later: u64) -> ToolResultForModel {
+    let run = RunId::from_raw("run-1");
+    let call = ToolCallId::from_raw("call-1");
+    let mut events = vec![
+        accepted(&run, 1, "读一遍"),
+        started(&run, 2),
+        assistant(&run, 3, None, vec![request(&call)], None),
+        event(
+            4,
+            &run,
+            EventPayload::ToolResult(komo_kernel::events::ToolResult {
+                call_id: call.clone(),
+                attempt_id: AttemptId::from_raw("attempt-1"),
+                status: ToolResultStatus::Completed,
+                output_ref: OutputRef(ContentRef {
+                    path: "tool-output/run-1/call-1/attempt-1/output.json".into(),
+                    size: 0,
+                    hash: ContentHash::of_str(""),
+                    pointer: None,
+                }),
+                elapsed_ms: 30,
+                preview: None,
+                stdout: None,
+                stderr: None,
+                attempt_state: None,
+            }),
+        ),
+    ];
+    for seq in 5..5 + later {
+        events.push(assistant(&run, seq, Some("再看看"), vec![], None));
+    }
+    let surface = fold(&events);
+    let big: String = (0..400)
+        .map(|n| format!("line {n:04}: {}\n", "x".repeat(40)))
+        .collect();
+    let resolved: Vec<ResolvedMessage<'_>> = entries(&surface, ReplayScope::Conversation(&run))
+        .into_iter()
+        .map(|entry| {
+            let outputs = if entry.message.tool_results.is_empty() {
+                Vec::new()
+            } else {
+                vec![Some(StoredOutput {
+                    preview: Some(big.clone()),
+                    artifacts: Vec::new(),
+                })]
+            };
+            ResolvedMessage {
+                text: entry.message.text.clone(),
+                outputs,
+                entry,
+            }
+        })
+        .collect();
+    to_replay_messages(resolved, &DECAYING)
+        .into_iter()
+        .flat_map(|message| message.tool_results)
+        .next()
+        .expect("回放里有那条结果")
+}
+
+/// 它之后已经有两次请求带着它完整发出去了（两条 `message.assistant`）：回放直接给短视图，
+/// 不再交给 loop 去换（§8.3）。
+#[test]
+fn a_result_two_rounds_old_replays_its_decayed_view() {
+    let full = replayed_after(0).content;
+    let result = replayed_after(2);
+    assert!(result.decay.is_none(), "{:?}", result.decay);
+    assert!(
+        result.content.contains("这份结果已完整给过 2 次"),
+        "{}",
+        result.content
+    );
+    assert!(result.content.len() + 1024 <= full.len());
+    assert_eq!(
+        replayed_after(5).content,
+        result.content,
+        "之后一直是同一份"
+    );
+}
+
+/// 只完整给过一次：回放仍是完整视图，并告诉 loop 还剩一次、之后换成哪份。
+#[test]
+fn a_result_one_round_old_replays_whole_with_one_full_send_left() {
+    let fresh = replayed_after(0);
+    assert_eq!(
+        fresh.decay.as_ref().map(|decay| decay.remaining_full_sends),
+        Some(2)
+    );
+
+    let result = replayed_after(1);
+    assert_eq!(result.content, fresh.content, "完整视图不随次数变");
+    let decay = result.decay.expect("还在完整期");
+    assert_eq!(decay.remaining_full_sends, 1);
+    assert_eq!(
+        decay.view,
+        replayed_after(2).content,
+        "到点换成的就是回放会给的那份"
+    );
+}

@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use komo_kernel::fold::{Surface, SurfaceMessage};
-use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
+use komo_kernel::projection::{ProjectionContext, ToolResultFacts, at_send, project_views};
 use komo_kernel::types::ids::{RunId, Seq, ToolCallId};
 use komo_kernel::types::refs::{ContentRef, ToolResultStatus};
 use komo_kernel::types::status::RunState;
@@ -269,7 +269,8 @@ pub fn latest_user_text(surface: &Surface) -> Option<String> {
 
 /// 纯函数：把已解析正文的回放条目投影成交给模型的消息（`docs/agent.md` §8）。
 ///
-/// **只有一处调用 `kernel::projection::project`**：工具结果的模型视图不在这里重新拼。
+/// **工具结果的模型视图不在这里重新拼**：与执行器一样经 `kernel::projection` 的
+/// `project_views` / `at_send`，只是"完整给过几次"从回放窗口里数出来。
 /// `Transcript` 条目正文为空（读不到、或者本来就是空字符串）就跳过——那句话本来就没有
 /// 值得回放的内容。
 ///
@@ -288,8 +289,22 @@ pub(crate) fn to_replay_messages(
         }
     }
 
+    // 每条消息之后，正在跑的这条 Run 还记了几条 `message.assistant`：每一条都是一次已经
+    // 带着前面那些结果发出去的请求。工具结果完整给过几次就是这个数（§8.3）——活着的 loop
+    // 按同一个定义递减，所以两边选的是同一个视图。
+    let mut later_rounds = vec![0u32; history.len()];
+    let mut seen = 0;
+    for (index, resolved) in history.iter().enumerate().rev() {
+        later_rounds[index] = seen;
+        if resolved.entry.kind == EntryKind::Protocol
+            && resolved.entry.message.role == Role::Assistant
+        {
+            seen += 1;
+        }
+    }
+
     let mut out = Vec::new();
-    for resolved in history {
+    for (resolved, sends_so_far) in history.into_iter().zip(later_rounds) {
         let message = resolved.entry.message;
         match resolved.entry.kind {
             EntryKind::Transcript => {
@@ -341,13 +356,16 @@ pub(crate) fn to_replay_messages(
                         stderr: result.stderr.as_ref(),
                         artifacts,
                     };
+                    let (content, decay) =
+                        at_send(project_views(&facts, projection), sends_so_far, projection);
                     tool_results.push(ToolResultForModel {
                         provider_call_id: request
                             .map(|call| call.provider_call_id.clone())
                             .unwrap_or_else(|| result.call.to_string()),
                         call_id: result.call.clone(),
-                        content: project(&facts, projection),
+                        content,
                         is_error: !matches!(result.status, ToolResultStatus::Completed),
+                        decay,
                     });
                 }
                 out.push(ReplayMessage {

@@ -325,6 +325,7 @@ async fn a_second_round_replays_the_output_items_and_the_tool_result() {
                 call_id: ToolCallId::from_raw("tc-1"),
                 content: "文件内容".into(),
                 is_error: false,
+                decay: None,
             }],
             revised: Vec::new(),
         })
@@ -357,6 +358,7 @@ fn result(provider_call_id: &str, content: &str) -> ToolResultForModel {
         call_id: ToolCallId::from_raw(format!("tc-{provider_call_id}")),
         content: content.into(),
         is_error: false,
+        decay: None,
     }
 }
 

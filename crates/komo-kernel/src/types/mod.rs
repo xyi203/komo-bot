@@ -70,7 +70,7 @@ pub use tool::{
     ToolError, ToolOutput, WorkspaceRoot,
 };
 pub use turn::{
-    AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse, LlmError, MemoryUse, PlannedCall,
-    ProviderToolCall, ReplayMessage, Role, Round, RoundInput, SeqRange, ToolCallRequest,
-    ToolResultForModel, TurnRequest,
+    AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse, LlmError, MemoryUse, PendingDecay,
+    PlannedCall, ProviderToolCall, ReplayMessage, Role, Round, RoundInput, SeqRange,
+    ToolCallRequest, ToolResultForModel, TurnRequest,
 };

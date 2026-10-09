@@ -319,3 +319,101 @@ async fn a_hot_reload_does_not_change_how_a_running_run_projects() {
         "这条 Run 按受理时冻结的投影设置回放，不跟着热重载变"
     );
 }
+
+/// §8.3 的衰减：大结果完整给过两次之后，活着的 loop 在第三次请求前把它换成短视图；
+/// 同一个 Run 的下一段回放时，从日志数出同一个次数，直接给出**逐字节相同**的那份短视图。
+///
+/// 读一个大文件 → 两轮小调用 → 一条要审批的 `shell`（这一轮的请求里已经换过了）→ 批准，
+/// 第二段回放。
+#[tokio::test]
+async fn the_decayed_view_is_the_same_live_and_replayed() {
+    let home = Home::with_config(&config_toml(""));
+    let lines: String = (1..=5000).map(|n| format!("行 {n}\n")).collect();
+    std::fs::create_dir_all(home.workspace()).expect("工作目录");
+    std::fs::write(home.workspace().join("大文件.txt"), &lines).expect("写文件");
+    std::fs::write(home.workspace().join("小.txt"), "一行\n").expect("写文件");
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-big",
+            "read",
+            serde_json::json!({ "path": "大文件.txt" }),
+        ),
+        call_round(2, "pc-s1", "read", serde_json::json!({ "path": "小.txt" })),
+        call_round(3, "pc-s2", "read", serde_json::json!({ "path": "小.txt" })),
+        call_round(
+            4,
+            "pc-shell",
+            "shell",
+            serde_json::json!({ "command": "echo 收尾" }),
+        ),
+        text_round(5, "都做完了。"),
+    ]]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(
+            &session,
+            "obs-6",
+            "读一遍大文件，再看两眼小文件，最后跑一条命令",
+        )
+        .await
+        .run;
+
+    let pending = gateway.wait_approval().await;
+    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
+
+    let inputs = llm.inputs.lock().expect("轮输入").clone();
+    assert_eq!(inputs.len(), 4, "停在审批上之前请求了四次：{inputs:?}");
+    let revised = |index: usize| match &inputs[index] {
+        RoundInput::ToolResults { revised, .. } => revised.clone(),
+        RoundInput::First => Vec::new(),
+    };
+    let RoundInput::ToolResults { results, .. } = &inputs[1] else {
+        panic!("第二次请求带着 read 的结果：{:?}", inputs[1]);
+    };
+    let full = results
+        .iter()
+        .find(|result| result.provider_call_id == "pc-big")
+        .expect("read 的结果")
+        .content
+        .clone();
+    assert!(full.len() > 4096, "完整视图要超过默认阈值：{}", full.len());
+    assert!(
+        revised(1).is_empty() && revised(2).is_empty(),
+        "前两次完整给"
+    );
+    let live = revised(3);
+    assert_eq!(live.len(), 1, "第三次请求前换掉：{:?}", inputs[3]);
+    assert_eq!(live[0].provider_call_id, "pc-big");
+    let live = live[0].content.clone();
+    assert!(live.contains("这份结果已完整给过 2 次"), "{live}");
+    assert!(
+        live.contains("行 1\n") && live.contains("…（中间省略 "),
+        "{live}"
+    );
+    assert!(live.contains("完整输出：artifact://"), "{live}");
+    assert!(live.len() + 1024 <= full.len());
+
+    gateway.decide(&pending.approval, true).await;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let replayed = llm
+        .requests
+        .lock()
+        .expect("请求")
+        .last()
+        .expect("第二段的请求")
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_results.iter())
+        .find(|result| result.provider_call_id == "pc-big")
+        .cloned()
+        .expect("第二段回放里有那条 read 结果");
+    assert_eq!(
+        replayed.content, live,
+        "活着时换上的短视图与下一段回放给出的必须逐字节相同"
+    );
+    assert!(replayed.decay.is_none(), "回放时已经过了完整期");
+}

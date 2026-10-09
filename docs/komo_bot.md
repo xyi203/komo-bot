@@ -693,6 +693,8 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 
 读取历史或恢复调用时按引用加载需要的内容；组装模型上下文仍遵守输出预算，超限时提供截断提示和可读取的完整文件引用。**这里有两个预算，不是一个**：`tool.result` 那 ≤1 KiB 是**账本的行预算**（每条 JSONL 行都要小），交给模型多少由 `[execution] model_result_bytes` 说了算（§6），完整正文落在 `output.json` 里。模型看到的正文由**一处纯函数**投影出来（`komo-kernel` 的 `projection`）：抬头（工具、状态、耗时、stdout / stderr 大小）+ 头尾各留一段**整行**并写明省了多少（整行留不到预算一半时——比如一整行 JSON——退到字符边界） + 可直接 `read` 的**引用**（`artifact://<run>/<call>/<attempt>/stdout`，§4.7）。从前这里印的是绝对路径；改成 URI 之后，「超限的正文在哪」与「允许读哪个逻辑资源」是同一句话。因此**刚跑完的那一次与重启之后回放必须逐字节相同**——投影只吃落盘的事实（事件 + `output.json`），不掺任何只活在内存里的东西。那条路径必须真能读：**当前 Session 获授权的输出（`tool-output/`、`artifacts/`）是一段只读根**，`read` 得到它、写它一律 Deny（§8.10 第 4 条），不开放普通工具修改这些记录。摘要或预览不能代替恢复所需的原始参数与结果。
 
+**大结果的视图按请求选（衰减）**：同一份事实投影出两个视图——full 与更短的 decayed（抬头 + 首尾各留一段**整行** + **总是**给出那条可 `read` 的完整输出引用）。一条成功结果的 full 超过 `[execution] decay_threshold_bytes`、且 decayed 至少短 1 KiB 时，它在之后的前 `decay_full_sends` 次请求里给 full，此后换成 decayed；失败与结果不明的结果**从不衰减**——那是模型要对着改的正文。"给过几次"只有一个定义：**这条 Run 在这条结果之后记了几条 `message.assistant`**（每条都是一次已经带着它发出去的请求），由 `projection::view_after` 按它选视图。回放从日志数这个数；活着的 agent loop 在 `record_round` 之后递减同一个数，到点时经 `RoundInput::ToolResults.revised` 让驱动按 `provider_call_id` 就地换掉那条结果的正文。请求失败不在同一段里重发（loop 让出名额去等退避，下一段从日志重数），所以两边数出的永远相同，换上的短视图与下一段回放给出的逐字节一致。
+
 实现约束：
 
 - Gateway 对每个 Session 使用一个串行写入器，模型、工具、审批审计与 Memory 来源标记均经过它，不能各自追加导致行内容交错。

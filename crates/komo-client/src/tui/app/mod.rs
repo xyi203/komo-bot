@@ -461,17 +461,47 @@ impl App {
         }
     }
 
-    /// 状态行上印的那个模型名。
+    /// 状态行上印的那个模型名，显式设了 effort 就跟在后面（`模型 · effort`）。
     ///
-    /// 优先级是「这一轮真用的 → `/model` 设的 → 网关报的默认那一个」。最后一层要紧：
-    /// 没有它，第一条消息发出去之前那一格只能印"默认模型"——一句正确但没用的话，而网关
-    /// 开机时就把清单报过来了，**默认是哪个它知道**。
+    /// Run 还在跑时印「这一轮真用的」；不在跑时印「下一个 Run 会用的」：`/model` 设的 →
+    /// 上一轮用的 → 网关报的默认那一个。选完模型不再另印一行，看这一格就知道选中了什么。
+    /// 最后一层要紧：没有它，第一条消息发出去之前那一格只能印"默认模型"——一句正确但没
+    /// 用的话，而网关开机时就把清单报过来了，**默认是哪个它知道**。
     pub fn model_label(&self) -> String {
-        self.run_meta()
-            .and_then(|meta| meta.model.clone())
-            .or_else(|| self.model.clone())
-            .or_else(|| self.current_model_entry().map(|entry| entry.id.clone()))
-            .unwrap_or_else(|| "默认模型".into())
+        let meta = self.run_meta();
+        let running = self.run_state().is_some_and(|state| !state.is_terminal());
+        let from_meta = || {
+            meta.and_then(|meta| {
+                let model = meta.model.clone()?;
+                let effort = meta
+                    .effort
+                    .as_ref()
+                    .and_then(|e| e.as_option())
+                    .map(|e| e.to_string());
+                Some((model, effort))
+            })
+        };
+        let chosen = || {
+            self.model
+                .clone()
+                .map(|model| (model, self.effort.as_ref().map(|e| e.to_string())))
+        };
+        let (model, effort) = if running {
+            from_meta().or_else(chosen)
+        } else {
+            chosen().or_else(from_meta)
+        }
+        .unwrap_or_else(|| {
+            let model = self
+                .current_model_entry()
+                .map(|entry| entry.id.clone())
+                .unwrap_or_else(|| "默认模型".into());
+            (model, self.effort.as_ref().map(|e| e.to_string()))
+        });
+        match effort {
+            Some(effort) => format!("{model} · {effort}"),
+            None => model,
+        }
     }
 
     fn current_model_entry(&self) -> Option<&ModelMenuEntry> {

@@ -657,8 +657,32 @@ fn the_picker_moves_and_enter_sets_the_model() {
     assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
     assert!(app.model_picker.is_none());
     assert_eq!(app.model.as_deref(), Some("claude-y"));
-    assert!(notices(&app).contains("claude-y"), "{}", notices(&app));
+    // 选中了什么看状态行，不另印一行。
+    assert_eq!(app.model_label(), "claude-y");
+    assert!(app.notices.is_empty(), "{:?}", app.notices);
     assert!(app.input_enabled());
+}
+
+#[test]
+fn the_status_line_shows_the_next_runs_model_and_effort_when_idle() {
+    let mut app = app();
+    app.apply(ServerEvent::ModelMenu(menu()));
+    // 什么都没设 ⇒ 网关的 default，effort 跟随 Gateway 就不印。
+    assert_eq!(app.model_label(), "gpt-x");
+    command(&mut app, "/effort high");
+    assert_eq!(app.model_label(), "gpt-x · high");
+    // 上一轮跑完了，再选模型 ⇒ 立刻印新选的，而不是上一轮那个。
+    feed(&mut app, &fixture::conversation());
+    command(&mut app, "/model claude-y");
+    assert_eq!(app.model_label(), "claude-y");
+}
+
+#[test]
+fn the_status_line_shows_the_running_runs_own_model() {
+    let mut app = app();
+    command(&mut app, "/model claude-y");
+    feed(&mut app, &fixture::conversation()[..3]);
+    assert_eq!(app.model_label(), "chat-a · high");
 }
 
 #[test]

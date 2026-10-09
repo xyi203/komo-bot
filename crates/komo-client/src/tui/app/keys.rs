@@ -276,8 +276,8 @@ impl App {
     }
 
     /// 设定下一个 Run 的模型（`/model <id>` 与选择菜单共用）。
+    /// 选中了什么看状态行（`model_label`），这里不另印；只有 effort 被清掉时说一句。
     fn choose_model(&mut self, id: String) {
-        self.note(format!("下一个 Run 用模型 {id}"));
         self.model = Some(id.clone());
         // 换了模型，可选的 effort 档位也就换了：手上那一档新模型不收，就别留着让下一次
         // 提交被网关拒掉——清掉，跟随 Gateway，并且说出来。
@@ -292,7 +292,6 @@ impl App {
                 self.note(format!("{id} 不收 effort {effort}，已改回跟随 Gateway"));
             }
         }
-        self.note(self.effort_blurb());
     }
 
     /// 选择菜单开着时的按键。

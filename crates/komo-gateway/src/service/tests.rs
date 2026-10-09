@@ -1488,7 +1488,7 @@ async fn a_delegated_task_becomes_a_child_run_and_its_result_reaches_the_parent(
     let delivered = inputs
         .iter()
         .find_map(|input| match input {
-            komo_kernel::types::turn::RoundInput::ToolResults { results } => results
+            komo_kernel::types::turn::RoundInput::ToolResults { results, .. } => results
                 .iter()
                 .find(|result| result.content.contains(child.run.as_str())),
             _ => None,
@@ -1579,7 +1579,7 @@ async fn a_delegated_task_over_the_inline_limit_still_settles_the_parent_call() 
     let delivered = inputs
         .iter()
         .find_map(|input| match input {
-            komo_kernel::types::turn::RoundInput::ToolResults { results } => results
+            komo_kernel::types::turn::RoundInput::ToolResults { results, .. } => results
                 .iter()
                 .find(|result| result.content.contains(child.run.as_str())),
             _ => None,

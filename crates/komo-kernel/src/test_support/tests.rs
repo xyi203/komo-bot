@@ -259,7 +259,10 @@ fn the_scripted_driver_hands_back_the_rounds_in_order() {
         let first = driver.next(RoundInput::First).await.unwrap();
         assert_eq!(first.tool_calls.len(), 1);
         let second = driver
-            .next(RoundInput::ToolResults { results: vec![] })
+            .next(RoundInput::ToolResults {
+                results: vec![],
+                revised: Vec::new(),
+            })
             .await
             .unwrap();
         assert!(second.tool_calls.is_empty());

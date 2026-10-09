@@ -103,7 +103,13 @@ pub enum RoundInput {
     /// 首轮。
     First,
     /// 按 call_id 回传上一轮的结果。
-    ToolResults { results: Vec<ToolResultForModel> },
+    ToolResults {
+        results: Vec<ToolResultForModel>,
+        /// 更早结果的新视图：driver 按 `provider_call_id` 换掉历史里那条结果的正文，
+        /// 配对（id、位置、`is_error`）不动，此后一直用新正文。
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        revised: Vec<ToolResultForModel>,
+    },
 }
 
 /// 回传给模型的一条工具结果。完整输出在 `output.json` 里，这里只给模型看得下的部分。
@@ -344,8 +350,27 @@ mod tests {
                 content: "result = 2".into(),
                 is_error: false,
             }],
+            revised: vec![ToolResultForModel {
+                provider_call_id: "pc-3".into(),
+                call_id: ToolCallId::from_raw("call-3"),
+                content: "短视图".into(),
+                is_error: true,
+            }],
         };
         let text = serde_json::to_string(&input).unwrap();
         assert_eq!(serde_json::from_str::<RoundInput>(&text).unwrap(), input);
+    }
+
+    #[test]
+    fn a_round_input_without_revised_reads_as_none_and_writes_without_the_key() {
+        let old = r#"{"kind":"tool_results","results":[{"provider_call_id":"pc-7","call_id":"call-7","content":"result = 2"}]}"#;
+        let input = serde_json::from_str::<RoundInput>(old).unwrap();
+        let RoundInput::ToolResults { results, revised } = &input else {
+            panic!("应读成 ToolResults：{input:?}");
+        };
+        assert_eq!(results.len(), 1);
+        assert!(revised.is_empty());
+        let text = serde_json::to_string(&input).unwrap();
+        assert!(!text.contains("revised"), "{text}");
     }
 }

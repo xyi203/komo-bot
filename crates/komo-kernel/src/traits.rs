@@ -614,7 +614,7 @@ pub trait LlmClient: Send + Sync {
 #[async_trait]
 pub trait TurnDriver: Send {
     /// 一次完整的 provider 往返。`First` 是首轮；`ToolResults` 按 `call_id` 回传上一轮
-    /// 结果。
+    /// 结果，`revised` 按 `provider_call_id` 就地换掉更早结果的正文。
     async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError>;
 
     fn usage(&self) -> TokenUsage;

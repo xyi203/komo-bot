@@ -29,7 +29,7 @@ fn fed_back(llm: &FakeLlm, tool: &str) -> String {
         .expect("轮输入")
         .iter()
         .find_map(|input| match input {
-            RoundInput::ToolResults { results } => results
+            RoundInput::ToolResults { results, .. } => results
                 .iter()
                 .find(|result| result.content.starts_with(&prefix))
                 .map(|result| result.content.clone()),

@@ -85,7 +85,7 @@ impl TurnDriver for CommandDriver {
                     truncated: false,
                 }),
             },
-            RoundInput::ToolResults { results } => {
+            RoundInput::ToolResults { results, .. } => {
                 let content = results
                     .into_iter()
                     .find(|result| result.provider_call_id == CALL_ID)
@@ -150,6 +150,7 @@ mod tests {
                     content: "hi".into(),
                     is_error: false,
                 }],
+                revised: Vec::new(),
             })
             .await
             .unwrap();

@@ -12,7 +12,8 @@
 //! - **API 要求 user / assistant 交替**：连续同角色消息合并成一条（[`append_message`]），
 //!   同一轮的多个工具结果并进同一条 user 消息。
 //! - **提示缓存断点是请求级的标记，不进历史**：只在发出去的那份请求体上打
-//!   `cache_control`，从不写回 `self.messages`（[`messages_with_cache`]）。
+//!   `cache_control`，从不写回 `self.messages`（[`messages_with_cache`]）。协议最多 4 个
+//!   断点：系统提示、工具表、最后一条消息，外加修订了更早工具结果的那一轮补的一个。
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -212,6 +213,40 @@ fn tool_result_block(result: &ToolResultForModel) -> Value {
     block
 }
 
+/// 把更早的工具结果换成新视图：只换 `tool_result` 块的正文，`tool_use_id`、位置、
+/// `is_error` 都不动，此后一直用新正文。返回这次改到的最早一条消息的下标——缓存断点要
+/// 补在它之前（[`messages_with_cache`]）。
+fn revise(messages: &mut [Value], revised: &[ToolResultForModel]) -> Option<usize> {
+    let mut earliest: Option<usize> = None;
+    for result in revised {
+        let found = messages
+            .iter_mut()
+            .enumerate()
+            .find_map(|(index, message)| {
+                let block = message
+                    .get_mut("content")
+                    .and_then(Value::as_array_mut)?
+                    .iter_mut()
+                    .find(|block| {
+                        block["type"] == "tool_result"
+                            && block["tool_use_id"] == result.provider_call_id.as_str()
+                    })?;
+                Some((index, block))
+            });
+        match found {
+            Some((index, block)) => {
+                block["content"] = json!(result.content);
+                earliest = Some(earliest.map_or(index, |earliest| earliest.min(index)));
+            }
+            None => tracing::warn!(
+                provider_call_id = %result.provider_call_id,
+                "要修订的工具结果不在历史里，忽略"
+            ),
+        }
+    }
+    earliest
+}
+
 /// 往消息列表里追加一条：跟上一条同角色就并进它的 `content`（协议要求交替，§13.2）——
 /// 同一轮的多个工具结果、以及两个历史 Run 之间缺了中间那句答复时留下的相邻 user 消息，
 /// 都靠它合并。
@@ -237,6 +272,7 @@ fn request_body(
     system: &str,
     messages: &[Value],
     tools: &[ToolDefinition],
+    revised_from: Option<usize>,
     thinking_tokens: Option<u32>,
     max_tokens: u32,
 ) -> Value {
@@ -253,7 +289,7 @@ fn request_body(
     );
     body.insert(
         "messages".into(),
-        Value::Array(messages_with_cache(messages)),
+        Value::Array(messages_with_cache(messages, revised_from)),
     );
     if !tools.is_empty() {
         body.insert("tools".into(), Value::Array(tools_with_cache(tools)));
@@ -291,13 +327,27 @@ fn tools_with_cache(tools: &[ToolDefinition]) -> Vec<Value> {
 
 /// 给**这一次要发**的 messages 打上最后一条 user 消息末块的缓存断点——操作的是副本，
 /// `self.messages` 自己不带这个标记，回放时才不会把它当成内容的一部分存下去。
-fn messages_with_cache(messages: &[Value]) -> Vec<Value> {
+///
+/// 这一轮修订了第 `revised_from` 条消息里的工具结果时，上一次请求的末尾断点之前的前缀
+/// 已经变了，缓存只能退回系统提示与工具表。于是在它之前最后一条 user 消息的末块补一个
+/// 断点——那正是更早某次请求的末尾断点，写过缓存。它总在最后一条消息之前，不会和末尾
+/// 断点重叠；合计不超过协议上限 4 个。
+fn messages_with_cache(messages: &[Value], revised_from: Option<usize>) -> Vec<Value> {
     let mut out = messages.to_vec();
-    if let Some(last) = out.last_mut()
-        && let Some(content) = last.get_mut("content").and_then(Value::as_array_mut)
-        && let Some(block) = content.last_mut()
-    {
-        block["cache_control"] = json!({ "type": "ephemeral" });
+    let last = out.len().checked_sub(1);
+    let before_revision = revised_from.and_then(|from| {
+        out[..from]
+            .iter()
+            .rposition(|message| message["role"] == "user")
+    });
+    for index in last.into_iter().chain(before_revision) {
+        if let Some(block) = out[index]
+            .get_mut("content")
+            .and_then(Value::as_array_mut)
+            .and_then(|content| content.last_mut())
+        {
+            block["cache_control"] = json!({ "type": "ephemeral" });
+        }
     }
     out
 }
@@ -321,7 +371,9 @@ struct AnthropicDriver {
 #[async_trait]
 impl TurnDriver for AnthropicDriver {
     async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
-        if let RoundInput::ToolResults { results } = &input {
+        let mut revised_from = None;
+        if let RoundInput::ToolResults { results, revised } = &input {
+            revised_from = revise(&mut self.messages, revised);
             append_message(&mut self.messages, tool_results_message(results));
         }
         self.round += 1;
@@ -335,6 +387,7 @@ impl TurnDriver for AnthropicDriver {
             &self.system,
             &self.messages,
             &self.tools,
+            revised_from,
             thinking_tokens,
             max_tokens,
         );
@@ -1316,6 +1369,7 @@ mod tests {
                     content: "结果1".into(),
                     is_error: false,
                 }],
+                revised: Vec::new(),
             })
             .await
             .unwrap();
@@ -1336,6 +1390,7 @@ mod tests {
                     content: "结果2".into(),
                     is_error: false,
                 }],
+                revised: Vec::new(),
             })
             .await
             .unwrap();
@@ -1350,6 +1405,180 @@ mod tests {
                 .is_none(),
             "历史消息不该带上一次请求打的缓存标记：{earlier_tool_result:?}"
         );
+    }
+
+    // ---- 修订：更早的工具结果换成新视图 ----
+
+    fn end_turn() -> Reply {
+        Reply::raw(
+            200,
+            &[
+                event(
+                    CONTENT_BLOCK_START,
+                    r#"{"index":0,"content_block":{"type":"text","text":""}}"#,
+                ),
+                event(
+                    CONTENT_BLOCK_DELTA,
+                    r#"{"index":0,"delta":{"type":"text_delta","text":"好"}}"#,
+                ),
+                event(CONTENT_BLOCK_STOP, r#"{"index":0}"#),
+                event(MESSAGE_DELTA, r#"{"delta":{"stop_reason":"end_turn"}}"#),
+                event(MESSAGE_STOP, r#"{}"#),
+            ],
+        )
+    }
+
+    fn result(provider_call_id: &str, content: &str) -> ToolResultForModel {
+        ToolResultForModel {
+            provider_call_id: provider_call_id.into(),
+            call_id: ToolCallId::from_raw(format!("tc-{provider_call_id}")),
+            content: content.into(),
+            is_error: false,
+        }
+    }
+
+    /// 请求体里的 messages，去掉请求级的缓存标记——比的是内容。
+    fn messages_without_cache(body: &Value) -> Vec<Value> {
+        let mut messages = body["messages"].as_array().unwrap().clone();
+        for message in &mut messages {
+            for block in message["content"].as_array_mut().unwrap() {
+                block.as_object_mut().unwrap().remove("cache_control");
+            }
+        }
+        messages
+    }
+
+    fn count_breakpoints(value: &Value) -> usize {
+        match value {
+            Value::Object(map) => {
+                usize::from(map.contains_key("cache_control"))
+                    + map.values().map(count_breakpoints).sum::<usize>()
+            }
+            Value::Array(items) => items.iter().map(count_breakpoints).sum(),
+            _ => 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_revised_tool_result_replaces_its_content_in_place() {
+        let transport =
+            ScriptedTransport::new(vec![end_turn(), end_turn(), end_turn(), end_turn()]);
+        let config = model(None);
+        let llm = factory(&transport).build(&config, ModelRole::Main).unwrap();
+        let mut driver = llm.begin_turn(request(&config)).await.unwrap();
+
+        driver.next(RoundInput::First).await.unwrap();
+        let mut failed = result("call_1", "完整输出");
+        failed.is_error = true;
+        driver
+            .next(RoundInput::ToolResults {
+                results: vec![failed],
+                revised: Vec::new(),
+            })
+            .await
+            .unwrap();
+        driver
+            .next(RoundInput::ToolResults {
+                results: vec![result("call_2", "二")],
+                revised: vec![result("call_1", "短视图"), result("call_9", "无主")],
+            })
+            .await
+            .unwrap();
+        driver
+            .next(RoundInput::ToolResults {
+                results: vec![result("call_3", "三")],
+                revised: vec![result("call_9", "无主")],
+            })
+            .await
+            .unwrap();
+
+        let bodies = transport.bodies();
+        let before = messages_without_cache(&bodies[1]);
+        let revised = messages_without_cache(&bodies[2]);
+        let block = &revised[1]["content"][0];
+        assert_eq!(block["tool_use_id"], json!("call_1"));
+        assert_eq!(block["content"], json!("短视图"));
+        assert_eq!(block["is_error"], json!(true), "只换正文，is_error 不动");
+        let mut expected = before.clone();
+        expected[1]["content"][0]["content"] = json!("短视图");
+        assert_eq!(revised[..before.len()], expected[..], "只有那条正文变了");
+
+        // 找不到的 id 什么都不改；上一次的修订留在历史里。
+        let after = messages_without_cache(&bodies[3]);
+        assert_eq!(after[..revised.len()], revised[..]);
+    }
+
+    #[tokio::test]
+    async fn a_revision_adds_one_breakpoint_before_the_revised_result_and_never_more_than_four() {
+        let transport = ScriptedTransport::new(vec![
+            end_turn(),
+            end_turn(),
+            end_turn(),
+            end_turn(),
+            end_turn(),
+        ]);
+        let config = model(None);
+        let llm = factory(&transport).build(&config, ModelRole::Main).unwrap();
+        let mut req = request(&config);
+        req.tools = vec![ToolDefinition {
+            name: "read".into(),
+            description: "读文件".into(),
+            parameters: json!({ "type": "object" }),
+        }];
+        // 回放窗口从一条工具结果开始：它前面没有 user 消息可以补断点。
+        req.messages = vec![ReplayMessage {
+            role: Role::Tool,
+            seq: Seq(1),
+            text: None,
+            tool_calls: vec![],
+            tool_results: vec![result("call_0", "零")],
+            provider_blocks: None,
+        }];
+        let mut driver = llm.begin_turn(req).await.unwrap();
+
+        driver.next(RoundInput::First).await.unwrap();
+        let rounds = [
+            (vec![result("call_1", "一")], vec![]),
+            (
+                vec![result("call_2", "二")],
+                vec![result("call_1", "一·短")],
+            ),
+            (
+                vec![result("call_3", "三")],
+                vec![result("call_0", "零·短")],
+            ),
+            (
+                vec![result("call_4", "四")],
+                vec![result("call_2", "二·短"), result("call_1", "一·更短")],
+            ),
+        ];
+        for (results, revised) in rounds {
+            driver
+                .next(RoundInput::ToolResults { results, revised })
+                .await
+                .unwrap();
+        }
+
+        let bodies = transport.bodies();
+        let counts: Vec<usize> = bodies.iter().map(count_breakpoints).collect();
+        // 系统提示 + 工具表 + 末尾 = 3；修订且前面有 user 消息时补 1 个。
+        assert_eq!(counts, vec![3, 3, 4, 3, 4]);
+
+        // 补的那个落在被修订结果（第 2 条）之前最后一条 user 消息的末块上。
+        let marked = |body: &Value, index: usize| {
+            body["messages"][index]["content"]
+                .as_array()
+                .unwrap()
+                .last()
+                .unwrap()
+                .get("cache_control")
+                .is_some()
+        };
+        assert!(marked(&bodies[2], 0));
+        assert!(!marked(&bodies[2], 1));
+        assert!(!marked(&bodies[2], 2));
+        // 两条修订取最早的那条之前；不因修订多就多打。
+        assert!(marked(&bodies[4], 0));
     }
 
     // ---- 回放：存过块就原样用 ----
@@ -1575,6 +1804,7 @@ mod live {
                     content: "北京时间 2026-09-23 15:00".into(),
                     is_error: false,
                 }],
+                revised: Vec::new(),
             })
             .await
             .expect("第二轮：带 thinking 回放 + tool_result 也要 200");

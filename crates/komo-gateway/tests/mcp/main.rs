@@ -44,7 +44,7 @@ fn tool_results(llm: &FakeLlm) -> Vec<String> {
         .unwrap()
         .iter()
         .filter_map(|input| match input {
-            RoundInput::ToolResults { results } => Some(
+            RoundInput::ToolResults { results, .. } => Some(
                 results
                     .iter()
                     .map(|result| result.content.clone())

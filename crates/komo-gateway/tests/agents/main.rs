@@ -130,7 +130,7 @@ fn fed_back(llm: &FakeLlm, needle: &str) -> (String, bool) {
         .expect("轮输入")
         .iter()
         .find_map(|input| match input {
-            RoundInput::ToolResults { results } => results
+            RoundInput::ToolResults { results, .. } => results
                 .iter()
                 .find(|result| result.content.contains(needle))
                 .map(|result| (result.content.clone(), result.is_error)),
@@ -531,7 +531,7 @@ impl TurnDriver for ScriptDriver {
                 call_round(1, &format!("pc-{tool}"), tool, args.clone())
             }
             // 原样念出工具结果：短号是运行时现生成的，脚本没法提前写死。
-            (Script::Call(..), RoundInput::ToolResults { results }) => {
+            (Script::Call(..), RoundInput::ToolResults { results, .. }) => {
                 let text = results
                     .first()
                     .map(|result| result.content.clone())

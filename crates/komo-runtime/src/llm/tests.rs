@@ -326,6 +326,7 @@ async fn a_second_round_replays_the_output_items_and_the_tool_result() {
                 content: "文件内容".into(),
                 is_error: false,
             }],
+            revised: Vec::new(),
         })
         .await
         .unwrap();
@@ -348,6 +349,60 @@ async fn a_second_round_replays_the_output_items_and_the_tool_result() {
     assert_eq!(driver.usage().input, Some(20));
     assert_eq!(driver.usage().output, Some(6));
     assert_eq!(driver.usage().reasoning, Some(3));
+}
+
+fn result(provider_call_id: &str, content: &str) -> ToolResultForModel {
+    ToolResultForModel {
+        provider_call_id: provider_call_id.into(),
+        call_id: ToolCallId::from_raw(format!("tc-{provider_call_id}")),
+        content: content.into(),
+        is_error: false,
+    }
+}
+
+#[tokio::test]
+async fn a_revised_tool_result_replaces_its_content_in_place() {
+    let transport = ScriptedTransport::new(vec![one_word(), one_word(), one_word(), one_word()]);
+    let config = model(None);
+    let llm = factory(&transport).build(&config, ModelRole::Main).unwrap();
+    let mut driver = llm.begin_turn(request(&config)).await.unwrap();
+
+    driver.next(RoundInput::First).await.unwrap();
+    driver
+        .next(RoundInput::ToolResults {
+            results: vec![result("call_1", "完整输出")],
+            revised: Vec::new(),
+        })
+        .await
+        .unwrap();
+    driver
+        .next(RoundInput::ToolResults {
+            results: vec![result("call_2", "二")],
+            revised: vec![result("call_1", "短视图"), result("call_9", "无主")],
+        })
+        .await
+        .unwrap();
+    driver
+        .next(RoundInput::ToolResults {
+            results: vec![result("call_3", "三")],
+            revised: vec![result("call_9", "无主")],
+        })
+        .await
+        .unwrap();
+
+    let bodies = transport.bodies();
+    let before = bodies[1]["input"].as_array().unwrap();
+    let revised = bodies[2]["input"].as_array().unwrap();
+    assert_eq!(revised[1]["type"], json!("function_call_output"));
+    assert_eq!(revised[1]["call_id"], json!("call_1"));
+    assert_eq!(revised[1]["output"], json!("短视图"));
+    let mut expected = before.clone();
+    expected[1]["output"] = json!("短视图");
+    assert_eq!(revised[..before.len()], expected[..], "只有那条正文变了");
+
+    // 找不到的 id 什么都不改；上一次的修订留在历史里。
+    let after = bodies[3]["input"].as_array().unwrap();
+    assert_eq!(after[..revised.len()], revised[..]);
 }
 
 #[tokio::test]

@@ -161,6 +161,23 @@ fn tool_message(result: &ToolResultForModel) -> Value {
     })
 }
 
+/// 把更早的工具结果换成新视图：只换那条 `role: "tool"` 消息的 `content`，
+/// `tool_call_id` 与位置不动，此后一直用新正文。
+fn revise(messages: &mut [Value], revised: &[ToolResultForModel]) {
+    for result in revised {
+        let message = messages.iter_mut().find(|message| {
+            message["role"] == "tool" && message["tool_call_id"] == result.provider_call_id.as_str()
+        });
+        match message {
+            Some(message) => message["content"] = json!(result.content),
+            None => tracing::warn!(
+                provider_call_id = %result.provider_call_id,
+                "要修订的工具结果不在历史里，忽略"
+            ),
+        }
+    }
+}
+
 struct ChatDriver {
     endpoint: String,
     api_key: Option<String>,
@@ -176,7 +193,8 @@ struct ChatDriver {
 #[async_trait]
 impl TurnDriver for ChatDriver {
     async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
-        if let RoundInput::ToolResults { results } = &input {
+        if let RoundInput::ToolResults { results, revised } = &input {
+            revise(&mut self.messages, revised);
             self.messages.extend(results.iter().map(tool_message));
         }
         self.round += 1;
@@ -537,6 +555,7 @@ mod tests {
                     content: "content".into(),
                     is_error: false,
                 }],
+                revised: Vec::new(),
             })
             .await
             .unwrap();
@@ -545,6 +564,80 @@ mod tests {
         assert_eq!(messages[1]["role"], json!("assistant"));
         assert_eq!(messages[2]["role"], json!("tool"));
         assert_eq!(messages[2]["tool_call_id"], json!("call_1"));
+    }
+
+    fn result(provider_call_id: &str, content: &str) -> ToolResultForModel {
+        ToolResultForModel {
+            provider_call_id: provider_call_id.into(),
+            call_id: ToolCallId::from_raw(format!("tc-{provider_call_id}")),
+            content: content.into(),
+            is_error: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_revised_tool_result_replaces_its_content_in_place() {
+        let done = || {
+            Reply::raw(
+                200,
+                &[
+                    frame(r#"{"choices":[{"delta":{"content":"好"},"finish_reason":"stop"}]}"#),
+                    frame("[DONE]"),
+                ],
+            )
+        };
+        let transport = ScriptedTransport::new(vec![done(), done(), done(), done()]);
+        let config = model();
+        let llm = ChatCompletionsLlm::new(
+            config.clone(),
+            ModelRole::Main,
+            Some("secret".into()),
+            Arc::new(transport.clone()),
+            EffortCapabilities::builtin(),
+        )
+        .unwrap();
+        let mut driver = llm.begin_turn(request(&config)).await.unwrap();
+
+        driver.next(RoundInput::First).await.unwrap();
+        driver
+            .next(RoundInput::ToolResults {
+                results: vec![result("call_1", "完整输出")],
+                revised: Vec::new(),
+            })
+            .await
+            .unwrap();
+        driver
+            .next(RoundInput::ToolResults {
+                results: vec![result("call_2", "二")],
+                revised: vec![result("call_1", "短视图"), result("call_9", "无主")],
+            })
+            .await
+            .unwrap();
+        driver
+            .next(RoundInput::ToolResults {
+                results: vec![result("call_3", "三")],
+                revised: vec![result("call_9", "无主")],
+            })
+            .await
+            .unwrap();
+
+        let bodies = transport.bodies();
+        let before = bodies[1]["messages"].as_array().unwrap();
+        let revised = bodies[2]["messages"].as_array().unwrap();
+        let at = before
+            .iter()
+            .position(|message| message["tool_call_id"] == json!("call_1"))
+            .unwrap();
+        assert_eq!(revised[at]["role"], json!("tool"));
+        assert_eq!(revised[at]["tool_call_id"], json!("call_1"));
+        assert_eq!(revised[at]["content"], json!("短视图"));
+        let mut expected = before.clone();
+        expected[at]["content"] = json!("短视图");
+        assert_eq!(revised[..before.len()], expected[..], "只有那条正文变了");
+
+        // 找不到的 id 什么都不改；上一次的修订留在历史里。
+        let after = bodies[3]["messages"].as_array().unwrap();
+        assert_eq!(after[..revised.len()], revised[..]);
     }
 
     #[tokio::test]

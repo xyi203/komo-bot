@@ -218,7 +218,10 @@ impl AgentLoop {
                 if let Some(stop) = outcome.stop {
                     return self.stop(&run, rounds, stop).await;
                 }
-                RoundInput::ToolResults { results }
+                RoundInput::ToolResults {
+                    results,
+                    revised: Vec::new(),
+                }
             }
         };
 
@@ -294,6 +297,7 @@ impl AgentLoop {
             }
             input = RoundInput::ToolResults {
                 results: outcome.results,
+                revised: Vec::new(),
             };
         }
     }

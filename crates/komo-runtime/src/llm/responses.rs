@@ -225,6 +225,24 @@ fn tool_output(result: &ToolResultForModel) -> Value {
     wire::function_call_output(&result.provider_call_id, &result.content)
 }
 
+/// 把更早的工具结果换成新视图：只换那条 `function_call_output` 的 `output`，`call_id`
+/// 与位置不动，此后一直用新正文。
+fn revise(input: &mut [Value], revised: &[ToolResultForModel]) {
+    for result in revised {
+        let item = input.iter_mut().find(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == result.provider_call_id.as_str()
+        });
+        match item {
+            Some(item) => item["output"] = json!(result.content),
+            None => tracing::warn!(
+                provider_call_id = %result.provider_call_id,
+                "要修订的工具结果不在历史里，忽略"
+            ),
+        }
+    }
+}
+
 fn arguments_text(arguments: &Value) -> String {
     match arguments {
         Value::String(text) => text.clone(),
@@ -252,7 +270,8 @@ struct ResponsesDriver {
 #[async_trait]
 impl TurnDriver for ResponsesDriver {
     async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
-        if let RoundInput::ToolResults { results } = &input {
+        if let RoundInput::ToolResults { results, revised } = &input {
+            revise(&mut self.input, revised);
             // 紧跟在上一轮的 output items 之后。
             self.input.extend(results.iter().map(tool_output));
         }

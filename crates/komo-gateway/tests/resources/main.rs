@@ -127,7 +127,7 @@ fn fed_back(llm: &FakeLlm) -> Vec<(String, bool)> {
         .expect("轮输入")
         .iter()
         .flat_map(|input| match input {
-            RoundInput::ToolResults { results } => results
+            RoundInput::ToolResults { results, .. } => results
                 .iter()
                 .map(|result| (result.content.clone(), result.is_error))
                 .collect::<Vec<_>>(),

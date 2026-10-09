@@ -174,12 +174,21 @@ pub const REASON_MAX_OUTPUT_TOKENS: &str = "max_output_tokens";
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
 pub struct Usage {
+    /// 整个提示，已经含 `input_tokens_details.cached_tokens`。
     #[serde(default)]
     pub input_tokens: Option<u64>,
+    #[serde(default)]
+    pub input_tokens_details: Option<InputTokenDetails>,
     #[serde(default)]
     pub output_tokens: Option<u64>,
     #[serde(default)]
     pub output_tokens_details: Option<OutputTokenDetails>,
+}
+
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+pub struct InputTokenDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -196,6 +205,11 @@ impl Usage {
             reasoning: self
                 .output_tokens_details
                 .and_then(|details| details.reasoning_tokens),
+            cache_read: self
+                .input_tokens_details
+                .and_then(|details| details.cached_tokens),
+            // OpenAI 的缓存是自动的，不单独计写入。
+            cache_write: None,
         }
     }
 }
@@ -270,6 +284,7 @@ mod tests {
             effort: effort.map(Effort::new),
             efforts: None,
             timeout_secs: 30,
+            context_window: None,
         }
     }
 
@@ -340,6 +355,29 @@ mod tests {
         .unwrap();
         assert_eq!(usage.to_kernel().reasoning, Some(7));
         assert!(Usage::default().to_kernel().is_unknown());
+    }
+
+    #[test]
+    fn cached_tokens_become_cache_read_and_input_stays_the_total() {
+        let usage = serde_json::from_value::<Usage>(json!({
+            "input_tokens": 1200,
+            "input_tokens_details": { "cached_tokens": 1024 },
+            "output_tokens": 3
+        }))
+        .unwrap()
+        .to_kernel();
+        assert_eq!(usage.input, Some(1200), "OpenAI 的 input_tokens 已经含缓存");
+        assert_eq!(usage.cache_read, Some(1024));
+        assert_eq!(usage.cache_write, None);
+
+        let usage = serde_json::from_value::<Usage>(json!({
+            "input_tokens": 10,
+            "output_tokens": 3
+        }))
+        .unwrap()
+        .to_kernel();
+        assert_eq!(usage.input, Some(10));
+        assert_eq!(usage.cache_read, None, "没报就是未知");
     }
 
     #[test]

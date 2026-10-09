@@ -516,6 +516,8 @@ mod tests {
                 provider_blocks: None,
                 input_tokens: None,
                 output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             }),
         )
     }
@@ -890,6 +892,8 @@ mod tests {
                         provider_blocks: None,
                         input_tokens: None,
                         output_tokens: None,
+                        cache_read_tokens: None,
+                        cache_write_tokens: None,
                     }),
                     4 => EventPayload::ConversationBoundary(ConversationBoundary { by: None }),
                     5 => EventPayload::ToolStarted(ToolStarted {

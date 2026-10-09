@@ -339,6 +339,7 @@ mod tests {
                 effort: None,
                 efforts: None,
                 timeout_secs: 120,
+                context_window: None,
             },
             workdir: None,
             delegate: None,

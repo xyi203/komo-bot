@@ -26,6 +26,7 @@ fn model(provider: &str, name: &str, key_env: &str, effort: Option<&str>) -> Mod
         effort: effort.map(Effort::new),
         efforts: None,
         timeout_secs: 120,
+        context_window: None,
     }
 }
 
@@ -49,7 +50,6 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
                 CatalogModel::Completion {
                     name: "chat".into(),
                     model_provider: Some("openrouter".into()),
-                    context_window: None,
                     config: main.clone(),
                 },
             ),
@@ -58,7 +58,6 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
                 CatalogModel::Completion {
                     name: "memory".into(),
                     model_provider: None,
-                    context_window: None,
                     config: memory_model.clone(),
                 },
             ),

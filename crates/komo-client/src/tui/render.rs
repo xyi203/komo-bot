@@ -652,6 +652,8 @@ fn main() {
                 provider_blocks: None,
                 input_tokens: Some(200),
                 output_tokens: Some(20),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
             };
         }
         feed(&mut app, &events);

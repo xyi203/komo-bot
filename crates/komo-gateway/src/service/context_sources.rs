@@ -435,6 +435,8 @@ mod tests {
                     provider_blocks: None,
                     input_tokens: None,
                     output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
                 }),
             ),
             event(
@@ -448,6 +450,8 @@ mod tests {
                     provider_blocks: None,
                     input_tokens: None,
                     output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
                 }),
             ),
             accepted_as(&second, 5, Some("接着上面那句"), None),

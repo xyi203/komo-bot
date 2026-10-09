@@ -228,6 +228,7 @@ fn model(name: &str, effort: Option<&str>) -> ModelConfig {
         effort: effort.map(Effort::new),
         efforts: None,
         timeout_secs: 10,
+        context_window: None,
     }
 }
 
@@ -420,6 +421,8 @@ fn assistant_event(seq: u64, run: &RunId, text: &str) -> Event {
             provider_blocks: None,
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
         }),
     )
 }

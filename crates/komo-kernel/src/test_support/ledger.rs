@@ -207,6 +207,8 @@ impl Ledger for MemLedger {
                 provider_blocks: round.provider_blocks,
                 input_tokens: round.usage.input,
                 output_tokens: round.usage.output,
+                cache_read_tokens: round.usage.cache_read,
+                cache_write_tokens: round.usage.cache_write,
             }),
         );
         Ok(calls)

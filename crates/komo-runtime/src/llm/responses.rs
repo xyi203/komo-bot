@@ -425,6 +425,8 @@ fn accumulate(total: &mut TokenUsage, round: &TokenUsage) {
     add(&mut total.input, round.input);
     add(&mut total.output, round.output);
     add(&mut total.reasoning, round.reasoning);
+    add(&mut total.cache_read, round.cache_read);
+    add(&mut total.cache_write, round.cache_write);
 }
 
 /// 逐帧拼起来的一轮回复。

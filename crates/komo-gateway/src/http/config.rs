@@ -49,17 +49,13 @@ pub async fn models(State(api): State<Api>) -> Json<ModelsResponse> {
 
 fn entry(api: &Api, alias: &str, model: &CatalogModel, default: bool) -> ModelMenuEntry {
     let config = model.completion().expect("调用方只遍历 completion 目录项");
-    let context_window = match model {
-        CatalogModel::Completion { context_window, .. } => *context_window,
-        CatalogModel::Embedding { .. } => None,
-    };
     ModelMenuEntry {
         id: alias.to_string(),
         name: model.name().to_string(),
         model: config.model.clone(),
         provider: model.model_provider().unwrap_or("standalone").to_string(),
         api_backend: config.provider.clone(),
-        context_window,
+        context_window: config.context_window,
         efforts: config
             .efforts
             .clone()

@@ -40,13 +40,9 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
             issues.push(error(&format!("{key}.name"), "显示名不能为空"));
         }
         match model {
-            CatalogModel::Completion {
-                config,
-                context_window,
-                ..
-            } => {
+            CatalogModel::Completion { config, .. } => {
                 check_model(config, &key, Role::Chat, snapshot, caps, &mut issues);
-                if *context_window == Some(0) {
+                if config.context_window == Some(0) {
                     issues.push(error(
                         &format!("{key}.context_window"),
                         "context_window 不能是 0",

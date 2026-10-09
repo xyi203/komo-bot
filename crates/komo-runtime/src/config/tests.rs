@@ -59,6 +59,27 @@ fn a_model_overrides_its_providers_connection_defaults_as_one_unit() {
     assert_eq!(loaded.snapshot.model, *chat);
 }
 
+#[test]
+fn a_completion_alias_resolves_with_its_context_window() {
+    let fixture = Fixture::valid();
+    let text = Fixture::config_text("chat-a", "medium").replacen(
+        "model_provider = \"openrouter\"\neffort = \"medium\"",
+        "model_provider = \"openrouter\"\neffort = \"medium\"\ncontext_window = 200000",
+        1,
+    );
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    let chat = loaded.snapshot.model_catalog.completion("chat").unwrap();
+    assert_eq!(chat.context_window, Some(200_000));
+    assert_eq!(
+        loaded.snapshot.model.context_window,
+        Some(200_000),
+        "主模型就是解析出来的那份配置，窗口跟着走"
+    );
+    assert_eq!(loaded.snapshot.memory.model.context_window, None);
+}
+
 /// `[model_providers.codex]` 的例子（docs/komo_bot.md §13.3）：`auth = "chatgpt"`，
 /// 没有 `env_key`——那条路的凭证是 ChatGPT 账号 OAuth，不是 `.env` 变量。
 fn chatgpt_config_text() -> &'static str {

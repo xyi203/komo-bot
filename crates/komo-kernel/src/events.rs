@@ -381,10 +381,17 @@ pub struct MessageAssistant {
     pub tool_calls: Vec<ToolCallRequest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_blocks: Option<serde_json::Value>,
+    /// 整个提示，含缓存读写的部分（见 [`TokenUsage::input`]）。
+    ///
+    /// [`TokenUsage::input`]: crate::types::model::TokenUsage::input
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -582,6 +589,35 @@ mod tests {
         assert!(body.tool_calls.is_empty());
         assert!(body.provider_blocks.is_none());
         assert!(body.input_tokens.is_none());
+    }
+
+    #[test]
+    fn assistant_cache_tokens_are_absent_on_old_lines_and_round_trip_on_new_ones() {
+        let raw = line(
+            "message.assistant",
+            r#"{"round":1,"input_tokens":120,"output_tokens":7}"#,
+        );
+        let event = Event::from_line(&raw).unwrap();
+        let EventPayload::MessageAssistant(body) = &event.payload else {
+            panic!()
+        };
+        assert_eq!(body.input_tokens, Some(120));
+        assert!(body.cache_read_tokens.is_none());
+        assert!(body.cache_write_tokens.is_none());
+        let rewritten = event.to_line().unwrap();
+        assert!(!rewritten.contains("cache_"), "没有就不写：{rewritten}");
+
+        let raw = line(
+            "message.assistant",
+            r#"{"round":2,"input_tokens":1200,"output_tokens":7,"cache_read_tokens":1000,"cache_write_tokens":150}"#,
+        );
+        let event = Event::from_line(&raw).unwrap();
+        let EventPayload::MessageAssistant(body) = &event.payload else {
+            panic!()
+        };
+        assert_eq!(body.cache_read_tokens, Some(1000));
+        assert_eq!(body.cache_write_tokens, Some(150));
+        assert_eq!(Event::from_line(&event.to_line().unwrap()).unwrap(), event);
     }
 
     #[test]

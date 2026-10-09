@@ -860,6 +860,7 @@ mod tests {
             effort: None,
             efforts: None,
             timeout_secs: 60,
+            context_window: None,
         });
         with_override.effort = Some(komo_kernel::types::model::Effort::new("high"));
         h.jobs.put(with_override).await.unwrap();

@@ -503,6 +503,8 @@ fn accumulate(total: &mut TokenUsage, round: &TokenUsage) {
     }
     add(&mut total.input, round.input);
     add(&mut total.output, round.output);
+    add(&mut total.cache_read, round.cache_read);
+    add(&mut total.cache_write, round.cache_write);
 }
 
 // ---------------------------------------------------------------- SSE 拼装
@@ -516,6 +518,8 @@ struct Assembled {
     /// 已经收尾、按 index 排好的块——这就是这一轮 `content` 数组的来源。
     items: BTreeMap<usize, Value>,
     usage: TokenUsage,
+    /// 线上的 `input_tokens`：**不含**缓存读写。`usage.input` 收尾时才合成总数。
+    uncached_input: Option<u64>,
     stop_reason: Option<String>,
     message_stop: bool,
     failure: Option<LlmError>,
@@ -586,11 +590,8 @@ impl Assembled {
 
         match name {
             MESSAGE_START => {
-                if let Some(tokens) = payload
-                    .pointer("/message/usage/input_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    self.usage.input = Some(tokens);
+                if let Some(usage) = payload.pointer("/message/usage") {
+                    self.absorb_input_usage(usage);
                 }
             }
             CONTENT_BLOCK_START => {
@@ -611,11 +612,11 @@ impl Assembled {
                 {
                     self.stop_reason = Some(reason.to_string());
                 }
-                if let Some(tokens) = payload
-                    .pointer("/usage/output_tokens")
-                    .and_then(Value::as_u64)
-                {
-                    self.usage.output = Some(tokens);
+                if let Some(usage) = payload.get("usage") {
+                    self.absorb_input_usage(usage);
+                    if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
+                        self.usage.output = Some(tokens);
+                    }
                 }
             }
             MESSAGE_STOP => self.message_stop = true,
@@ -645,6 +646,21 @@ impl Assembled {
             }
             PING => {}
             _ => {}
+        }
+    }
+
+    /// `message_start` 与 `message_delta` 的 usage 都可能带提示侧的三个数（后者是累计值），
+    /// 有就以后到的为准。
+    fn absorb_input_usage(&mut self, usage: &Value) {
+        let read = |key: &str| usage.get(key).and_then(Value::as_u64);
+        if let Some(tokens) = read("input_tokens") {
+            self.uncached_input = Some(tokens);
+        }
+        if let Some(tokens) = read("cache_read_input_tokens") {
+            self.usage.cache_read = Some(tokens);
+        }
+        if let Some(tokens) = read("cache_creation_input_tokens") {
+            self.usage.cache_write = Some(tokens);
         }
     }
 
@@ -729,6 +745,16 @@ impl Assembled {
         }
 
         let truncated = self.stop_reason.as_deref() == Some(STOP_MAX_TOKENS);
+        // Anthropic 的三个数互不包含；`input` 统一成整个提示（与 OpenAI 同口径）。
+        let parts = [
+            self.uncached_input,
+            self.usage.cache_read,
+            self.usage.cache_write,
+        ];
+        self.usage.input = parts
+            .iter()
+            .any(Option::is_some)
+            .then(|| parts.iter().flatten().sum());
         let mut content = Vec::new();
         let mut tool_calls = Vec::new();
         let mut text = String::new();
@@ -798,6 +824,7 @@ mod tests {
             effort: effort.map(Effort::new),
             efforts: None,
             timeout_secs: 10,
+            context_window: None,
         }
     }
 
@@ -833,6 +860,61 @@ mod tests {
     // ---- 纯文本 ----
 
     #[tokio::test]
+    async fn cached_prompt_tokens_are_counted_into_input_and_summed_across_rounds() {
+        let round = |start: &str, delta: &str| {
+            Reply::raw(
+                200,
+                &[
+                    event(MESSAGE_START, start),
+                    event(
+                        CONTENT_BLOCK_START,
+                        r#"{"index":0,"content_block":{"type":"text","text":""}}"#,
+                    ),
+                    event(
+                        CONTENT_BLOCK_DELTA,
+                        r#"{"index":0,"delta":{"type":"text_delta","text":"好"}}"#,
+                    ),
+                    event(CONTENT_BLOCK_STOP, r#"{"index":0}"#),
+                    event(MESSAGE_DELTA, delta),
+                    event(MESSAGE_STOP, r#"{}"#),
+                ],
+            )
+        };
+        let transport = ScriptedTransport::new(vec![
+            round(
+                r#"{"message":{"usage":{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":1500,"output_tokens":1}}}"#,
+                r#"{"delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+            ),
+            // message_delta 带的是累计值：以后到的为准。
+            round(
+                r#"{"message":{"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+                r#"{"delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":20,"cache_read_input_tokens":1500,"cache_creation_input_tokens":30,"output_tokens":2}}"#,
+            ),
+        ]);
+        let config = model(None);
+        let llm = factory(&transport).build(&config, ModelRole::Main).unwrap();
+
+        let mut first = llm.begin_turn(request(&config)).await.unwrap();
+        let round = first.next(RoundInput::First).await.unwrap();
+        assert_eq!(round.usage.input, Some(1510));
+        assert_eq!(round.usage.cache_read, Some(0));
+        assert_eq!(round.usage.cache_write, Some(1500));
+        assert_eq!(round.usage.output, Some(4));
+
+        let mut second = llm.begin_turn(request(&config)).await.unwrap();
+        let round = second.next(RoundInput::First).await.unwrap();
+        assert_eq!(round.usage.input, Some(1550));
+        assert_eq!(round.usage.cache_read, Some(1500));
+        assert_eq!(round.usage.cache_write, Some(30));
+
+        let mut total = first.usage();
+        accumulate(&mut total, &second.usage());
+        assert_eq!(total.input, Some(3060));
+        assert_eq!(total.cache_read, Some(1500));
+        assert_eq!(total.cache_write, Some(1530));
+    }
+
+    #[tokio::test]
     async fn a_plain_text_stream_is_assembled() {
         let transport = ScriptedTransport::new(vec![Reply::raw(
             200,
@@ -866,6 +948,8 @@ mod tests {
         assert!(!round.truncated);
         assert_eq!(round.usage.input, Some(12));
         assert_eq!(round.usage.output, Some(3));
+        assert_eq!(round.usage.cache_read, None, "没报缓存就是未知，不是 0");
+        assert_eq!(round.usage.cache_write, None);
 
         let body = &transport.bodies()[0];
         assert_eq!(body["max_tokens"], json!(DEFAULT_MAX_TOKENS));
@@ -1745,6 +1829,7 @@ mod live {
             effort: Some(Effort::new("low")),
             efforts: None,
             timeout_secs: 60,
+            context_window: None,
         };
         let llm = AnthropicMessagesLlm::new(
             config.clone(),

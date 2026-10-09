@@ -101,6 +101,8 @@ fn assistant(
             provider_blocks: blocks,
             input_tokens: None,
             output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
         }),
     )
 }

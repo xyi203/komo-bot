@@ -514,6 +514,7 @@ mod tests {
             effort: Some(Effort::new("medium")),
             efforts: None,
             timeout_secs: 120,
+            context_window: None,
         }
     }
 

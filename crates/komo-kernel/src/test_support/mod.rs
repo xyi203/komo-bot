@@ -127,5 +127,6 @@ pub fn sample_model() -> crate::types::model::ModelConfig {
         effort: None,
         efforts: None,
         timeout_secs: 30,
+        context_window: None,
     }
 }

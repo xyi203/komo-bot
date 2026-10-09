@@ -258,6 +258,7 @@ mod tests {
             effort: effort.map(Effort::new),
             efforts: None,
             timeout_secs: 120,
+            context_window: None,
         }
     }
 

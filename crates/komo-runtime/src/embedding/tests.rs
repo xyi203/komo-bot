@@ -21,6 +21,7 @@ fn config(provider: &str, dimensions: Option<u32>) -> EmbeddingConfig {
             effort: None,
             efforts: None,
             timeout_secs: 10,
+            context_window: None,
         },
         revision: Some("2026-09".into()),
         dimensions,

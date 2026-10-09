@@ -271,6 +271,8 @@ impl Ledger for Coordinator {
                     provider_blocks: round.provider_blocks.clone(),
                     input_tokens: round.usage.input,
                     output_tokens: round.usage.output,
+                    cache_read_tokens: round.usage.cache_read,
+                    cache_write_tokens: round.usage.cache_write,
                 }),
             )
             .await?;
@@ -1000,6 +1002,7 @@ mod tests {
     use komo_kernel::types::chat::ApprovalScope;
     use komo_kernel::types::delegate::{DelegateSpec, SchemaMode};
     use komo_kernel::types::ids::{ApprovalId, RequestKey};
+    use komo_kernel::types::model::TokenUsage;
     use komo_kernel::types::plan::PlanSource;
     use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultBody};
     use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
@@ -1476,6 +1479,41 @@ mod tests {
                 approval: ApprovalId::from_raw("ap-1"),
             }),
         );
+    }
+
+    #[tokio::test]
+    async fn a_rounds_cache_usage_is_recorded_on_its_assistant_event() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", "你好", &f.session))
+            .await
+            .unwrap();
+        let mut answered = round(1, vec![]);
+        answered.usage = TokenUsage {
+            input: Some(1210),
+            output: Some(4),
+            reasoning: None,
+            cache_read: Some(1000),
+            cache_write: Some(200),
+        };
+        f.coordinator
+            .record_round(&accepted.run, answered)
+            .await
+            .unwrap();
+
+        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let body = batch
+            .events
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::MessageAssistant(body) => Some(body),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(body.input_tokens, Some(1210));
+        assert_eq!(body.cache_read_tokens, Some(1000));
+        assert_eq!(body.cache_write_tokens, Some(200));
     }
 
     /// 轮数由调用方交进来，事件与行上是同一个数——`RunCompleted.rounds` 不再恒为 0。

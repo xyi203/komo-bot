@@ -89,6 +89,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
         effort: None,
         efforts: None,
         timeout_secs: 120,
+        context_window: None,
     };
     ConfigSnapshot {
         execution: Default::default(),
@@ -106,7 +107,6 @@ pub fn sample_snapshot() -> ConfigSnapshot {
                 CatalogModel::Completion {
                     name: "main".into(),
                     model_provider: None,
-                    context_window: None,
                     config: model.clone(),
                 },
             )]),

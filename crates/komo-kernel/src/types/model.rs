@@ -48,8 +48,6 @@ pub enum CatalogModel {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model_provider: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        context_window: Option<u64>,
         config: ModelConfig,
     },
     Embedding {
@@ -243,6 +241,10 @@ pub struct ModelConfig {
     pub efforts: Option<Vec<Effort>>,
     #[serde(default = "default_timeout_secs")]
     pub timeout_secs: u64,
+    /// 目录里 `model.<alias>.context_window`，解析 alias 时一并带上；随 `run.accepted`
+    /// 的快照冻结，Run 用它开始时的那个窗口。Embedding 永远是 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
 }
 
 impl ModelConfig {
@@ -345,24 +347,70 @@ impl Vector {
 /// 一次模型往返的用量。结果与用量都未知时保留未知标记，不能当成零（§8.5）。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
+    /// 整个提示的 token 数，**含**缓存读写的部分。各家口径不一（Anthropic 报三个互斥的
+    /// 数，OpenAI 报总数、缓存是其中一部分），driver 统一成总数，`cache_*` 才是它的子集。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u64>,
+    /// `input` 里由前缀缓存供给的部分。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    /// `input` 里这次写进前缀缓存的部分（只有 Anthropic 报）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
 }
 
 impl TokenUsage {
     /// 用量未知——不是零。
     pub fn is_unknown(&self) -> bool {
-        self.input.is_none() && self.output.is_none() && self.reasoning.is_none()
+        self.input.is_none()
+            && self.output.is_none()
+            && self.reasoning.is_none()
+            && self.cache_read.is_none()
+            && self.cache_write.is_none()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Run 行与 `run.accepted` 里存着的模型快照：没有 `context_window` 的配置写出来必须与
+    /// 加这个字段之前逐字节相同，旧快照读回来就是 `None`。
+    #[test]
+    fn a_model_config_without_a_context_window_serializes_as_before() {
+        const BEFORE: &str = r#"{"provider":"test","base_url":"memory://test","model":"m","api_key_env":"K","timeout_secs":30}"#;
+        let config = ModelConfig {
+            provider: "test".into(),
+            base_url: "memory://test".into(),
+            model: "m".into(),
+            api_key_env: "K".into(),
+            auth: None,
+            effort: None,
+            efforts: None,
+            timeout_secs: 30,
+            context_window: None,
+        };
+        assert_eq!(serde_json::to_string(&config).unwrap(), BEFORE);
+        assert_eq!(serde_json::from_str::<ModelConfig>(BEFORE).unwrap(), config);
+
+        let windowed = ModelConfig {
+            context_window: Some(200_000),
+            ..config
+        };
+        let text = serde_json::to_string(&windowed).unwrap();
+        assert!(
+            text.ends_with(r#""timeout_secs":30,"context_window":200000}"#),
+            "{text}"
+        );
+        assert_eq!(
+            serde_json::from_str::<ModelConfig>(&text).unwrap(),
+            windowed
+        );
+    }
 
     #[test]
     fn effort_is_normalized() {
@@ -435,6 +483,7 @@ mod tests {
             effort: None,
             efforts: None,
             timeout_secs: 120,
+            context_window: None,
         };
         assert_eq!(
             config.declares_effort(&Effort::new("high")),

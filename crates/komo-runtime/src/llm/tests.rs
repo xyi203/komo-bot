@@ -26,6 +26,7 @@ fn model(effort: Option<&str>) -> ModelConfig {
         effort: effort.map(Effort::new),
         efforts: None,
         timeout_secs: 10,
+        context_window: None,
     }
 }
 

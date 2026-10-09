@@ -357,6 +357,10 @@ impl ChatAssembled {
             self.usage.reasoning = usage
                 .pointer("/completion_tokens_details/reasoning_tokens")
                 .and_then(Value::as_u64);
+            // `prompt_tokens` 已经含缓存；Chat Completions 不报缓存写入。
+            self.usage.cache_read = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64);
         }
         let Some(choice) = chunk
             .get("choices")
@@ -470,6 +474,8 @@ fn accumulate(total: &mut TokenUsage, round: &TokenUsage) {
     add(&mut total.input, round.input);
     add(&mut total.output, round.output);
     add(&mut total.reasoning, round.reasoning);
+    add(&mut total.cache_read, round.cache_read);
+    add(&mut total.cache_write, round.cache_write);
 }
 
 #[cfg(test)]
@@ -488,6 +494,7 @@ mod tests {
             effort: None,
             efforts: None,
             timeout_secs: 10,
+            context_window: None,
         }
     }
 
@@ -528,6 +535,9 @@ mod tests {
                 200,
                 &[
                     frame(r#"{"choices":[{"delta":{"content":"完"},"finish_reason":"stop"}]}"#),
+                    frame(
+                        r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":1,"prompt_tokens_details":{"cached_tokens":16}}}"#,
+                    ),
                     frame("[DONE]"),
                 ],
             ),
@@ -546,8 +556,9 @@ mod tests {
         assert_eq!(first.text.as_deref(), Some("看"));
         assert_eq!(first.tool_calls[0].arguments["path"], json!("a.txt"));
         assert_eq!(first.usage.input, Some(8));
+        assert_eq!(first.usage.cache_read, None, "没报缓存就是未知");
 
-        driver
+        let second = driver
             .next(RoundInput::ToolResults {
                 results: vec![ToolResultForModel {
                     provider_call_id: "call_1".into(),
@@ -560,6 +571,11 @@ mod tests {
             })
             .await
             .unwrap();
+        assert_eq!(second.usage.input, Some(20), "prompt_tokens 已经含缓存");
+        assert_eq!(second.usage.cache_read, Some(16));
+        assert_eq!(second.usage.cache_write, None);
+        assert_eq!(driver.usage().input, Some(28));
+        assert_eq!(driver.usage().cache_read, Some(16));
         let body = &transport.bodies()[1];
         let messages = body["messages"].as_array().unwrap();
         assert_eq!(messages[1]["role"], json!("assistant"));

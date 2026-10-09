@@ -680,6 +680,7 @@ fn assemble_catalog(
                 .efforts
                 .map(|levels| levels.into_iter().map(Effort::new).collect()),
             timeout_secs,
+            context_window: None,
         };
         let name = section.name.unwrap_or_else(|| alias.clone());
         let model_provider = section.model_provider;
@@ -687,8 +688,10 @@ fn assemble_catalog(
             ModelType::Completion => CatalogModel::Completion {
                 name,
                 model_provider,
-                context_window: section.context_window,
-                config: common,
+                config: ModelConfig {
+                    context_window: section.context_window,
+                    ..common
+                },
             },
             ModelType::Embedding => CatalogModel::Embedding {
                 name,

@@ -225,6 +225,7 @@ fn the_scripted_driver_hands_back_the_rounds_in_order() {
                     input: Some(10),
                     output: Some(5),
                     reasoning: None,
+                    ..Default::default()
                 },
                 truncated: false,
             },
@@ -237,6 +238,7 @@ fn the_scripted_driver_hands_back_the_rounds_in_order() {
                     input: Some(20),
                     output: Some(3),
                     reasoning: None,
+                    ..Default::default()
                 },
                 truncated: false,
             },

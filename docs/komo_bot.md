@@ -155,6 +155,8 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 `resume` 的目标在 `prepare` 里校验，不过就是一次**没有执行过**的调用，按 `fail_call` 落账并把理由交给模型（§13.5）：① 同一 Session，且是一条子 Run（主对话的 Run 不是"子代理"，没有什么可续）；② 已经进终态，且终态是 `completed` 或 `failed`——**`cancelled` / `abandoned` 不能续**：那是操作者说过"这件事到此为止"，模型不能替人把它捡回来；③ 在最新一个 `conversation.boundary` 之后——边界之前的那条线属于上一段对话，父的窗口里已经看不到它，续过去的窗口也会被边界截断成一半；④ **它是这条线的末端**：已经有别的子 Run `resumes` 它（不论那条什么状态）就拒绝，理由里写出末端是哪一条——线只往后接，不分叉，想另起炉灶就不填 `resume`。④ 不靠"先查后写"：它在受理子 Run 的那个 db 事务里再判一次（与 `run.accepted` 同一次提交，§8.5），查到了就不受理。
 
+**`update_plan` 也不是第七个工具，是模型自己的工作计划。** 模型每次发**整份**计划（步骤 id / 目标 / `pending|in_progress|completed`，完成时可附 `progress`：改了哪些文件、怎么验证的、做了什么决定），以 `Operation::UpdatePlan` 进同一个决策入口——没有副作用，strict 与 auto 下都 Allow（§7.1）。计划不另存：它整份内联在 `tool.planned` 里（超过内联上限在 `prepare` 就拒掉），这条 Run 现在的计划是从日志按 Run 折出来的，重启之后折出来的还是同一份；结果是计划快照加几句提醒（目标改了换 id、同时最多一个 in_progress……）。它是屏障，不和并发的读交错；started 而无结果的那次再收一次尾即可，不核对。**完成一个先前登记过、当时还没完成的步骤**是一个计划边界——一上来就标 completed 的新步骤只算补记历史；在线压缩以计划步骤完成为边界。
+
 **`codemode` 是组合，不是新能力。** 模型写一段 Python，在 macOS 的 Seatbelt 沙箱里跑（不能写文件、联网、起子进程），脚本里经 `tools.<name>()` 调其他工具——只放行只读且 Policy 直接 Allow 的，只有脚本的输出回到模型。沙箱自检不过就不注册。见 `docs/codemode.md`。
 
 **MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 Policy / 审批 / 落账的路；只读与否由操作者声明，不信服务器自报。见 `docs/mcp.md`。

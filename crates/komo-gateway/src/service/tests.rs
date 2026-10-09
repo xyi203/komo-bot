@@ -1847,3 +1847,13 @@ fn the_delegate_tool_name_matches_the_registry() {
         komo_agent::DELEGATE_TOOL
     );
 }
+
+#[test]
+fn the_update_plan_tool_name_matches_the_registry() {
+    use komo_kernel::traits::Tool;
+
+    assert_eq!(
+        komo_runtime::tools::UpdatePlanTool::new().definition().name,
+        komo_agent::UPDATE_PLAN_TOOL
+    );
+}

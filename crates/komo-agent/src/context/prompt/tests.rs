@@ -81,6 +81,32 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
     assert!(sub.contains("别用 shell 拼 grep"), "{sub}");
 }
 
+/// 挂了 `update_plan` 才提计划，主对话与子代理一样。
+#[test]
+fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
+    let tools = vec!["read".to_string(), UPDATE_PLAN_TOOL.to_string()];
+    let main = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
+    assert!(main.contains("update_plan 登记计划"), "{main}");
+    let sub = build(
+        Path::new("/tmp/w"),
+        &tools,
+        &InvocationContext::Delegated(DelegateSpec::new(
+            RunId::from_raw("run-1"),
+            ToolCallId::from_raw("call-1"),
+            "查一下调用方",
+        )),
+        None,
+    );
+    assert!(sub.contains("update_plan 登记计划"), "{sub}");
+    let without = build(
+        Path::new("/tmp/w"),
+        &["read".to_string()],
+        &InvocationContext::Main,
+        None,
+    );
+    assert!(!without.contains("update_plan"), "{without}");
+}
+
 /// 主 Agent 挂了 `shell` 时，提示里说它跑在 komo 里、komo 的状态用 komo CLI 查；排在
 /// skills 目录前面。
 #[test]

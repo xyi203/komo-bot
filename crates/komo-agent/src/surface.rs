@@ -17,6 +17,10 @@ pub const DELEGATE_TOOL: &str = "delegate";
 pub const DISPATCH_TOOL: &str = "dispatch";
 pub const FOLLOW_TOOL: &str = "follow";
 
+/// `update_plan`：模型报一次工作计划。同一类编排操作——注册与提示里"挂了才说"两处
+/// 共用这个名字。
+pub const UPDATE_PLAN_TOOL: &str = "update_plan";
+
 /// 一份 Profile 在**这份工具目录**里挑出来的能力面。
 ///
 /// 目录里没有的名字**不算数**，而且必须报出来：静默采纳一份写错的配置，等于让操作者以为

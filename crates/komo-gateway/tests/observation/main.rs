@@ -6,6 +6,8 @@
 //! - **预算**：`[execution] model_result_bytes` 说了算（§6），不是写死的 1 KiB；
 //! - **一份事实**：同一个 Run 的下一个执行段回放时，渲染出的字节与刚跑完那次**完全相同**
 //!   ——跑过的调用如此，没跑起来的（工具名不认识）也如此。
+//! - **计划**：`update_plan` 的计划只在日志里，重启之后折出同一份在线状态，回放的结果
+//!   与刚跑完那次逐字节相同。
 //!
 //! 共用件在 `komo_gateway::service::test_support::harness`（真数据目录、真 `service::start`、
 //! 脚本化模型）。这里断言的是**模型收到了什么**，所以读的是 `FakeLlm` 记下的轮输入与请求。
@@ -416,4 +418,132 @@ async fn the_decayed_view_is_the_same_live_and_replayed() {
         "活着时换上的短视图与下一段回放给出的必须逐字节相同"
     );
     assert!(replayed.decay.is_none(), "回放时已经过了完整期");
+}
+
+/// `update_plan` 的计划只在日志里：两次更新（登记 → 完成一步）之后停在审批上，Gateway
+/// 重启，从日志折出的在线状态还是同一份计划、同样一个边界；第二段回放的计划结果与刚跑
+/// 完那次逐字节相同。
+#[tokio::test]
+async fn the_plan_survives_a_restart_and_replays_the_same_bytes() {
+    use komo_kernel::compaction::online_state;
+
+    let home = Home::with_config(&config_toml(""));
+    let step = |id: &str, status: &str| serde_json::json!({ "id": id, "goal": format!("做 {id}"), "status": status });
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-p1",
+            "update_plan",
+            serde_json::json!({ "steps": [step("a", "in_progress"), step("b", "pending")] }),
+        ),
+        call_round(
+            2,
+            "pc-p2",
+            "update_plan",
+            serde_json::json!({
+                "steps": [step("a", "completed"), step("b", "in_progress")],
+                "progress": {
+                    "files_changed": ["a.txt"],
+                    "verification": ["看过了"],
+                    "decisions": [],
+                },
+            }),
+        ),
+        call_round(
+            3,
+            "pc-shell",
+            "shell",
+            serde_json::json!({ "command": "echo 收尾" }),
+        ),
+    ]]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(&session, "plan-1", "分两步做，最后跑一条命令")
+        .await
+        .run;
+
+    let pending = gateway.wait_approval().await;
+    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
+    assert_eq!(pending.plan.tool, "shell", "update_plan 不该停下来等审批");
+    let live = |provider_call_id: &str| {
+        llm.inputs
+            .lock()
+            .expect("轮输入")
+            .iter()
+            .find_map(|input| match input {
+                RoundInput::ToolResults { results, .. } => results
+                    .iter()
+                    .find(|result| result.provider_call_id == provider_call_id)
+                    .map(|result| result.content.clone()),
+                RoundInput::First => None,
+            })
+            .unwrap_or_else(|| panic!("模型没拿到 {provider_call_id} 的结果"))
+    };
+    let (live_p1, live_p2) = (live("pc-p1"), live("pc-p2"));
+    assert!(live_p1.contains("<komo-plan"), "{live_p1}");
+    assert!(
+        live_p2.contains(r#""id":"a","goal":"做 a","status":"completed""#),
+        "{live_p2}"
+    );
+
+    // 计划整份内联在 `tool.planned` 里——外置了，折在线状态那一步读不到它。
+    let events = home.events(&session);
+    let planned: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::ToolPlanned(body) if body.plan_ref.is_none() => body
+                .plan
+                .as_ref()
+                .filter(|plan| plan.tool == "update_plan")
+                .map(|_| body.call_id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(planned.len(), 2, "两次更新的计划都内联：{events:?}");
+    let before = online_state(&events, &run);
+    assert_eq!(before.plan.len(), 2);
+    assert_eq!(
+        before.completed_boundary_request_counts.len(),
+        1,
+        "完成 a 是一个边界"
+    );
+
+    // 重启：在线状态只从日志来。
+    gateway.stop().await;
+    let llm = FakeLlm::finisher("都做完了。");
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    assert_eq!(
+        online_state(&home.events(&session), &run),
+        before,
+        "重启之后从日志折出的是同一份在线状态"
+    );
+
+    gateway.decide(&pending.approval, true).await;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let after = online_state(&home.events(&session), &run);
+    assert_eq!(after.plan, before.plan);
+    assert_eq!(
+        after.completed_boundary_request_counts.len(),
+        1,
+        "第二段没有新的计划更新"
+    );
+
+    let replayed = |provider_call_id: &str| {
+        llm.requests
+            .lock()
+            .expect("请求")
+            .last()
+            .expect("第二段的请求")
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_results.iter())
+            .find(|result| result.provider_call_id == provider_call_id)
+            .map(|result| result.content.clone())
+            .unwrap_or_else(|| panic!("回放窗口里没有 {provider_call_id}"))
+    };
+    assert_eq!(replayed("pc-p1"), live_p1, "登记那次回放要逐字节相同");
+    assert_eq!(replayed("pc-p2"), live_p2, "完成那次回放要逐字节相同");
 }

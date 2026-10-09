@@ -10,6 +10,7 @@ use std::path::Path;
 use komo_kernel::types::delegate::DelegateSpec;
 
 use super::{InvocationContext, SkillCatalog};
+use crate::surface::UPDATE_PLAN_TOOL;
 
 /// 提示里每条 Run 都说的那几句行为约束。
 ///
@@ -22,6 +23,9 @@ fn rules(tools: &[String]) -> String {
     let mut lines = Vec::new();
     if tools.iter().any(|tool| tool == RG_TOOL) {
         lines.push("- 找代码和文字用 rg，别用 shell 拼 grep / find / ls。");
+    }
+    if tools.iter().any(|tool| tool == UPDATE_PLAN_TOOL) {
+        lines.push("- 多步的事先用 update_plan 登记计划，每做完一步更新一次。");
     }
     lines.push("- 危险操作会被拦下等人批准；被拒绝就当作结果，不要绕过。");
     lines.push("- 如实报告做了什么、证据是什么；没有证据就说没有。");

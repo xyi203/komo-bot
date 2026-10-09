@@ -42,6 +42,7 @@ use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 
+use komo_kernel::compaction::{PlanUpdate, analyze_transition, format_snapshot, online_state};
 use komo_kernel::events::Event;
 use komo_kernel::fold::fold;
 use komo_kernel::policy::PolicyDecision;
@@ -202,6 +203,9 @@ pub struct RoundOutcome {
     pub stop: Option<RoundStop>,
     /// 停下时还没轮到的调用。续跑时原样再交回来。
     pub remaining: Vec<CallRequest>,
+    /// 这一轮里有 `update_plan` 完成了一个**先前登记过、当时还没完成**的步骤——一个计划
+    /// 边界。判据与从日志折在线状态的那一步同一个（`analyze_transition`）。
+    pub plan_boundary: bool,
 }
 
 /// 只有这些会中断一轮——工具自己的失败是**结果**，交给模型修正（§6）。
@@ -395,12 +399,13 @@ impl ToolExecutor {
         let mut queue: VecDeque<(usize, CallRequest)> = calls.into_iter().enumerate().collect();
         let mut in_flight: InFlight<'_> = FuturesUnordered::new();
         let mut settled: Vec<(usize, ToolResultForModel)> = Vec::new();
+        let mut boundary = false;
 
         while let Some((index, request)) = queue.pop_front() {
             if env.cancel.is_cancelled() {
                 drain(&mut in_flight, &mut settled).await?;
                 queue.push_front((index, request));
-                return Ok(finish(Some(RoundStop::Cancelled), queue, settled));
+                return Ok(finish(Some(RoundStop::Cancelled), queue, settled, boundary));
             }
 
             let begin = self.begin(&request, env).await?;
@@ -414,7 +419,7 @@ impl ToolExecutor {
                     && let Some(stop) = drain(&mut in_flight, &mut settled).await?
                 {
                     queue.push_front((index, request));
-                    return Ok(finish(Some(stop), queue, settled));
+                    return Ok(finish(Some(stop), queue, settled, boundary));
                 }
                 let Begin::Ready(ready) = begin else {
                     unreachable!("上面刚判过它是 Ready")
@@ -428,11 +433,17 @@ impl ToolExecutor {
             // 屏障：在飞的先收尾，再按顺序处理这一条。
             if let Some(stop) = drain(&mut in_flight, &mut settled).await? {
                 queue.push_front((index, request));
-                return Ok(finish(Some(stop), queue, settled));
+                return Ok(finish(Some(stop), queue, settled, boundary));
             }
             let settlement = match begin {
                 Begin::Ready(ready) => self.execute_authorized(*ready, env).await?,
                 Begin::Settled(settlement) => settlement,
+                // 放行过了，在飞的也收完了：这时才 `start_call`、读日志里的上一版计划。
+                Begin::Plan(call) => {
+                    let (settlement, crossed) = self.settle_plan(*call, env).await?;
+                    boundary |= crossed;
+                    settlement
+                }
                 // 需要人看一眼：**审批行现在才落**（见上面的不变量）。
                 Begin::Ask(pending) => {
                     let approval = self.raise_ask(pending, env).await?;
@@ -441,7 +452,7 @@ impl ToolExecutor {
                         call: request.call.clone(),
                     };
                     queue.push_front((index, request));
-                    return Ok(finish(Some(stop), queue, settled));
+                    return Ok(finish(Some(stop), queue, settled, boundary));
                 }
             };
             match settlement {
@@ -451,14 +462,14 @@ impl ToolExecutor {
                     // 停在这一条自己身上：它这一轮没收尾，所以照旧算"还没轮到"的
                     //（续跑要按账本上的形状把它重新交回来）。
                     queue.push_front((index, request));
-                    return Ok(finish(Some(stop), queue, settled));
+                    return Ok(finish(Some(stop), queue, settled, boundary));
                 }
             }
         }
 
         // 收尾：最后一并收掉还在飞的。
         let stop = drain(&mut in_flight, &mut settled).await?;
-        Ok(finish(stop, queue, settled))
+        Ok(finish(stop, queue, settled, boundary))
     }
 
     /// 一个调用在**执行之前**该走完的那些步：找工具 → 生成或沿用计划 → 恢复核对梯子 →
@@ -537,6 +548,13 @@ impl ToolExecutor {
         if let Operation::Follow { task_id, text } = &plan.operation {
             return self
                 .follow(request, env, &plan, task_id, text, request.resumed.clone())
+                .await;
+        }
+
+        // update_plan 同样是编排：没有工具执行，结果是前后两版计划的比较。
+        if matches!(plan.operation, Operation::UpdatePlan) {
+            return self
+                .update_plan(request, env, &plan, request.resumed.clone())
                 .await;
         }
 
@@ -1289,7 +1307,143 @@ impl ToolExecutor {
             .await
     }
 
-    /// `dispatch` / `follow` 共用的收尾：给那次尝试写一条结果，交回模型一句话。
+    /// 一次 `update_plan` 的放行（Policy 默认 Allow）。真正的收尾在 [`Self::settle_plan`]：
+    /// 它是**屏障**——放进 [`Begin::Plan`] 交回 `execute_round`，在飞的读先收完，再
+    /// `start_call`、读上一版计划，账本上的先后与调用顺序一致。
+    ///
+    /// 上一世已经 `start_call` 过的那次：没有副作用，不重新放行、不核对，把结果再落到那次
+    /// 尝试上就是了——上一版计划仍从日志里读，这次调用自己还没有结果，不会算进去。
+    async fn update_plan(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        plan: &ExecutionPlan,
+        resumed: Option<ResumedCall>,
+    ) -> Result<Begin, ExecError> {
+        let in_flight = resumed
+            .as_ref()
+            .is_some_and(|state| !state.is_known_not_to_have_run());
+        if in_flight {
+            let Some(attempt) = resumed.and_then(|state| state.previous_attempt) else {
+                return Ok(Begin::Settled(self.attention(
+                    request,
+                    format!(
+                        "update_plan 调用 {} 已经开始过，但账上没有承载它的那次尝试",
+                        request.call
+                    ),
+                )));
+            };
+            return Ok(Begin::Plan(Box::new(PlanCall {
+                request: request.clone(),
+                plan: plan.clone(),
+                start: PlanStart::Started(attempt),
+            })));
+        }
+
+        let intent = if resumed
+            .as_ref()
+            .is_some_and(ResumedCall::is_known_not_to_have_run)
+        {
+            ConsumeIntent::KnownNotToHaveRun
+        } else {
+            ConsumeIntent::First
+        };
+        let grant = match self.authorize(request, plan, env, intent).await? {
+            Authorization::Proceed { grant, .. } => grant,
+            Authorization::Refused(message) => {
+                return Ok(Begin::Settled(
+                    self.fail_unstarted(request, env, message).await?,
+                ));
+            }
+            Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
+            Authorization::Waiting(approval) => {
+                return Ok(Begin::Settled(CallSettlement::Stopped {
+                    stop: RoundStop::Approval {
+                        approval,
+                        call: request.call.clone(),
+                    },
+                    result: None,
+                }));
+            }
+        };
+        Ok(Begin::Plan(Box::new(PlanCall {
+            request: request.clone(),
+            plan: plan.clone(),
+            start: PlanStart::Fresh(grant),
+        })))
+    }
+
+    /// `update_plan` 的收尾：上一版计划从**这条 Run 的日志**折出来（与在线状态同一个
+    /// fold），和这一版比较；结果是这一版的快照加上给模型的提醒。第二个返回值是"完成了
+    /// 一个先前登记过的步骤"——计划边界。
+    async fn settle_plan(
+        &self,
+        call: PlanCall,
+        env: &CallEnv,
+    ) -> Result<(CallSettlement, bool), ExecError> {
+        let PlanCall {
+            request,
+            plan,
+            start,
+        } = call;
+        let attempt = match start {
+            PlanStart::Fresh(grant) => self.ledger.start_call(&request.call, &plan, grant).await?,
+            PlanStart::Started(attempt) => attempt,
+        };
+
+        // `prepare` 校验过；这里还解不出来只可能是一份从账本读回的旧计划，照实报失败。
+        let update = match serde_json::from_value::<PlanUpdate>(plan.args.clone()) {
+            Ok(update) => update
+                .validate()
+                .map(|()| update)
+                .map_err(|e| e.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        let update = match update {
+            Ok(update) => update,
+            Err(error) => {
+                let content = format!("update_plan 的计划不合法：{error}");
+                let settlement = self
+                    .settle_orchestration(
+                        &request,
+                        env,
+                        attempt,
+                        serde_json::json!({ "error": content }),
+                        content,
+                        true,
+                    )
+                    .await?;
+                return Ok((settlement, false));
+            }
+        };
+
+        let events = self.events_of(&env.session).await?;
+        let previous = online_state(&events, &env.run).plan;
+        let transition = analyze_transition(&previous, &update.steps);
+        let boundary = !transition.completed.is_empty();
+        let completed: Vec<&str> = transition
+            .completed
+            .iter()
+            .map(|step| step.id.as_str())
+            .collect();
+        let result = serde_json::json!({
+            "boundary": boundary,
+            "completed_step_ids": completed,
+            "progress_recorded": boundary && update.progress.is_some(),
+            "plan": update.steps,
+        });
+        let content = std::iter::once(format_snapshot(&update.steps))
+            .chain(transition.advice)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let settlement = self
+            .settle_orchestration(&request, env, attempt, result, content, false)
+            .await?;
+        Ok((settlement, boundary))
+    }
+
+    /// `dispatch` / `follow` / `update_plan` 共用的收尾：给那次尝试写一条结果，交回模型
+    /// 一句话。
     async fn settle_orchestration(
         &self,
         request: &CallRequest,
@@ -1647,6 +1801,22 @@ enum Begin {
     Settled(CallSettlement),
     /// 需要人看一眼：**审批行还没有落**——`execute_round` 先收完在飞的再落它。
     Ask(Box<AskPending>),
+    /// 放行过的 `update_plan`：屏障，`execute_round` 先收完在飞的再收它的尾。
+    Plan(Box<PlanCall>),
+}
+
+/// 一次放行过、还没收尾的 `update_plan`。
+struct PlanCall {
+    request: CallRequest,
+    plan: ExecutionPlan,
+    start: PlanStart,
+}
+
+enum PlanStart {
+    /// 首次：收尾时才 `start_call`，带着放行用掉的那条授权（若有）。
+    Fresh(Option<GrantUse>),
+    /// 上一世已经 `start_call` 过：结果落回那次尝试。
+    Started(AttemptId),
 }
 
 /// 一条**已经拿到凭据**、可以直接执行的调用。
@@ -1774,12 +1944,14 @@ fn finish(
     stop: Option<RoundStop>,
     queue: VecDeque<(usize, CallRequest)>,
     mut settled: Vec<(usize, ToolResultForModel)>,
+    plan_boundary: bool,
 ) -> RoundOutcome {
     settled.sort_by_key(|(index, _)| *index);
     RoundOutcome {
         results: settled.into_iter().map(|(_, result)| result).collect(),
         stop,
         remaining: queue.into_iter().map(|(_, request)| request).collect(),
+        plan_boundary,
     }
 }
 

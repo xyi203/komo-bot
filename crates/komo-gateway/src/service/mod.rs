@@ -588,7 +588,8 @@ async fn build_tools(
     Option<Arc<komo_runtime::codemode::Sandbox>>,
 ) {
     use komo_runtime::tools::{
-        DelegateTool, DispatchTool, EditTool, FollowTool, ReadTool, RgTool, ShellTool, WriteTool,
+        DelegateTool, DispatchTool, EditTool, FollowTool, ReadTool, RgTool, ShellTool,
+        UpdatePlanTool, WriteTool,
     };
 
     let snapshot = config.current();
@@ -619,6 +620,9 @@ async fn build_tools(
     // 任务分发"干净失败。
     tools.push(Arc::new(DispatchTool::new()));
     tools.push(Arc::new(FollowTool::new()));
+    // update_plan：模型的工作计划，同一类编排操作。没有副作用、Policy 直接放行，计划
+    // 只在日志里，按 Run 折出来。
+    tools.push(Arc::new(UpdatePlanTool::new()));
     // MCP（`docs/mcp.md`）：启动时连上、列出工具，挂进同一份目录——之后它们与内置工具
     // 走同一条 Policy / 审批 / 落账的路。
     tools.extend(komo_runtime::mcp::connect_all(&snapshot.start_only.mcp, &config.secrets()).await);

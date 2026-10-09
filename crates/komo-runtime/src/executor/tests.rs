@@ -3254,6 +3254,29 @@ mod one_projection {
             assert_one_projection(&harness, path, &outcome.results[0]).await;
         }
 
+        // update_plan：计划快照加提醒。
+        {
+            let harness = Harness::new();
+            let executor = harness.initial(vec![Arc::new(crate::tools::UpdatePlanTool::new())]);
+            let (session, run, request) = round(
+                &harness,
+                "update_plan",
+                serde_json::json!({
+                    "steps": [
+                        { "id": "a", "goal": "读代码", "status": "pending" },
+                        { "id": "b", "goal": "改代码", "status": "pending" },
+                    ],
+                }),
+            )
+            .await;
+            let outcome = executor
+                .execute_round(vec![request], &harness.env(&session, &run))
+                .await
+                .unwrap();
+            assert!(outcome.results[0].content.contains("in_progress"));
+            assert_one_projection(&harness, "update_plan", &outcome.results[0]).await;
+        }
+
         // 子 Run 的终态回到父侧那次调用上。
         {
             let harness = Harness::new();
@@ -3318,5 +3341,412 @@ mod one_projection {
             assert_eq!(tool.ran(), 0);
             assert_one_projection(&harness, "核对已满足", &outcome.results[0]).await;
         }
+    }
+}
+
+/// `update_plan`：编排操作，Policy 直接放行，结果是计划快照加提醒；完成一个先前登记过
+/// 的步骤是计划边界。
+mod update_plan {
+    use super::*;
+
+    use komo_kernel::compaction::online_state;
+    use komo_kernel::compaction::plan::{MAX_PLAN_STEPS, MAX_STEP_GOAL_BYTES};
+    use komo_kernel::events::EventPayload;
+    use komo_kernel::traits::Ledger;
+    use komo_kernel::types::ids::RunId;
+    use komo_kernel::types::turn::{AssistantRound, ToolCallRequest};
+
+    use crate::tools::UpdatePlanTool;
+
+    fn step(id: &str, status: &str) -> serde_json::Value {
+        serde_json::json!({ "id": id, "goal": format!("做 {id}"), "status": status })
+    }
+
+    fn plan_args(steps: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({ "steps": steps })
+    }
+
+    /// 记一轮：调用 ID 由测试给，几轮之间不撞。
+    async fn round(
+        harness: &Harness,
+        run: &RunId,
+        number: u32,
+        calls: &[(&str, &str, serde_json::Value)],
+    ) -> Vec<CallRequest> {
+        let requests: Vec<CallRequest> = calls
+            .iter()
+            .map(|(id, tool, args)| {
+                CallRequest::fresh(
+                    ToolCallId::from_raw(*id),
+                    format!("pc-{id}"),
+                    *tool,
+                    args.clone(),
+                )
+            })
+            .collect();
+        harness
+            .ledger
+            .record_round(
+                run,
+                AssistantRound {
+                    round: number,
+                    text: None,
+                    text_ref: None,
+                    tool_calls: requests
+                        .iter()
+                        .map(|request| ToolCallRequest {
+                            call_id: request.call.clone(),
+                            provider_call_id: request.provider_call_id.clone(),
+                            name: request.tool.clone(),
+                            arguments: request.arguments.clone(),
+                            arguments_ref: None,
+                        })
+                        .collect(),
+                    provider_blocks: None,
+                    usage: Default::default(),
+                },
+            )
+            .await
+            .expect("记录回合");
+        requests
+    }
+
+    /// 这次调用在账本上的事件，按 seq。
+    fn events_of(harness: &Harness, call: &str) -> Vec<&'static str> {
+        let call = ToolCallId::from_raw(call);
+        harness
+            .ledger
+            .events()
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::ToolPlanned(body) if body.call_id == call => Some("planned"),
+                EventPayload::ToolStarted(body) if body.call_id == call => Some("started"),
+                EventPayload::ToolResult(body) if body.call_id == call => Some("result"),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn seq_of(harness: &Harness, call: &str, kind: &str) -> u64 {
+        let call = ToolCallId::from_raw(call);
+        harness
+            .ledger
+            .events()
+            .iter()
+            .find_map(|event| match (&event.payload, kind) {
+                (EventPayload::ToolStarted(body), "started") if body.call_id == call => {
+                    Some(event.seq.0)
+                }
+                (EventPayload::ToolResult(body), "result") if body.call_id == call => {
+                    Some(event.seq.0)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{call} 没有 {kind}"))
+    }
+
+    #[tokio::test]
+    async fn update_plan_is_allowed_without_asking_and_returns_the_snapshot() {
+        let harness = Harness::new();
+        // §7.1 的 strict 表：它也直接 Allow。
+        let executor = harness.initial(vec![Arc::new(UpdatePlanTool::new())]);
+        let (session, run) = harness.open_run().await;
+        let calls = round(
+            &harness,
+            &run,
+            1,
+            &[(
+                "c1",
+                "update_plan",
+                plan_args(vec![step("a", "in_progress"), step("b", "pending")]),
+            )],
+        )
+        .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(!outcome.plan_boundary, "登记不是边界");
+        assert_eq!(outcome.results.len(), 1);
+        let result = &outcome.results[0];
+        assert!(!result.is_error, "{result:?}");
+        assert!(
+            result.content.contains(
+                r#"<komo-plan task_status="active">{"steps":[{"id":"a","goal":"做 a","status":"in_progress"},{"id":"b","goal":"做 b","status":"pending"}]}</komo-plan>"#
+            ),
+            "{}",
+            result.content
+        );
+        assert!(
+            harness
+                .approvals
+                .list_pending(Some(&session))
+                .await
+                .unwrap()
+                .is_empty(),
+            "不该有审批"
+        );
+        assert_eq!(events_of(&harness, "c1"), ["planned", "started", "result"]);
+        let state = online_state(&harness.ledger.events(), &run);
+        assert_eq!(state.plan.len(), 2, "账本上的计划折得出来");
+    }
+
+    #[tokio::test]
+    async fn completing_a_registered_step_is_a_boundary() {
+        let harness = Harness::new();
+        let executor = harness.initial(vec![Arc::new(UpdatePlanTool::new())]);
+        let (session, run) = harness.open_run().await;
+        let env = harness.env(&session, &run);
+
+        let register = round(
+            &harness,
+            &run,
+            1,
+            &[(
+                "c1",
+                "update_plan",
+                plan_args(vec![step("a", "in_progress"), step("b", "pending")]),
+            )],
+        )
+        .await;
+        let first = executor.execute_round(register, &env).await.unwrap();
+        assert!(!first.plan_boundary);
+
+        let complete = round(
+            &harness,
+            &run,
+            2,
+            &[(
+                "c2",
+                "update_plan",
+                serde_json::json!({
+                    "steps": [step("a", "completed"), step("b", "in_progress")],
+                    "progress": {
+                        "files_changed": ["src/a.rs"],
+                        "verification": ["cargo test 通过"],
+                        "decisions": [],
+                    },
+                }),
+            )],
+        )
+        .await;
+        let second = executor.execute_round(complete, &env).await.unwrap();
+
+        assert!(second.stop.is_none(), "{:?}", second.stop);
+        assert!(second.plan_boundary, "完成了先前登记过的 a");
+        assert!(!second.results[0].is_error, "{:?}", second.results[0]);
+
+        let state = online_state(&harness.ledger.events(), &run);
+        assert_eq!(state.completed_boundary_request_counts.len(), 1);
+        assert!(state.pending_boundary);
+        assert_eq!(state.pending_progress[0].step_id, "a");
+    }
+
+    #[tokio::test]
+    async fn a_newly_introduced_completed_step_is_history_not_a_boundary() {
+        let harness = Harness::new();
+        let executor = harness.initial(vec![Arc::new(UpdatePlanTool::new())]);
+        let (session, run) = harness.open_run().await;
+        let env = harness.env(&session, &run);
+
+        // 一上来就是 completed：补记历史。
+        let first = round(
+            &harness,
+            &run,
+            1,
+            &[(
+                "c1",
+                "update_plan",
+                plan_args(vec![step("old", "completed"), step("a", "in_progress")]),
+            )],
+        )
+        .await;
+        assert!(
+            !executor
+                .execute_round(first, &env)
+                .await
+                .unwrap()
+                .plan_boundary
+        );
+
+        // 中途新加一个 completed 的步骤：同样是历史。
+        let second = round(
+            &harness,
+            &run,
+            2,
+            &[(
+                "c2",
+                "update_plan",
+                plan_args(vec![
+                    step("old", "completed"),
+                    step("a", "in_progress"),
+                    step("z", "completed"),
+                ]),
+            )],
+        )
+        .await;
+        assert!(
+            !executor
+                .execute_round(second, &env)
+                .await
+                .unwrap()
+                .plan_boundary
+        );
+        let state = online_state(&harness.ledger.events(), &run);
+        assert!(state.completed_boundary_request_counts.is_empty());
+        assert_eq!(state.plan.len(), 3);
+    }
+
+    /// 被拒的计划：没有 `tool.planned`、没有 `tool.started`，只有一条失败的结论。
+    async fn assert_refused_unstarted(args: serde_json::Value, expected: &str) {
+        let harness = Harness::new();
+        let executor = harness.initial(vec![Arc::new(UpdatePlanTool::new())]);
+        let (session, run) = harness.open_run().await;
+        let calls = round(&harness, &run, 1, &[("c1", "update_plan", args)]).await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(!outcome.plan_boundary);
+        let result = &outcome.results[0];
+        assert!(result.is_error, "{result:?}");
+        assert!(result.content.contains(expected), "{}", result.content);
+        assert_eq!(events_of(&harness, "c1"), ["result"]);
+        assert!(
+            online_state(&harness.ledger.events(), &run).plan.is_empty(),
+            "拒掉的计划不进在线状态"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_plan_is_refused_unstarted() {
+        let goal = "汉".repeat(MAX_STEP_GOAL_BYTES / 3);
+        let steps = (0..MAX_PLAN_STEPS)
+            .map(|i| serde_json::json!({ "id": format!("step-{i}"), "goal": goal, "status": "pending" }))
+            .collect();
+        assert_refused_unstarted(plan_args(steps), "字节").await;
+    }
+
+    #[tokio::test]
+    async fn an_invalid_plan_is_refused_unstarted() {
+        assert_refused_unstarted(
+            plan_args(vec![step("a", "pending"), step("a", "in_progress")]),
+            "重复",
+        )
+        .await;
+        assert_refused_unstarted(plan_args(vec![step("a", "done")]), "update_plan").await;
+    }
+
+    /// 它不是只读的：前面在飞的读先收尾，它才 `start_call`；后面的读等它收完才开始。
+    #[tokio::test]
+    async fn update_plan_is_a_barrier() {
+        let harness = Harness::new();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let probe = Arc::new(Probe::new("read", Operation::ReadFile, Arc::clone(&log)));
+        let executor = harness.permissive(vec![probe.clone(), Arc::new(UpdatePlanTool::new())]);
+        let (session, run) = harness.open_run().await;
+        let calls = round(
+            &harness,
+            &run,
+            1,
+            &[
+                (
+                    "r1",
+                    "read",
+                    serde_json::json!({ "path": "a.txt", "delay_ms": 40 }),
+                ),
+                (
+                    "p1",
+                    "update_plan",
+                    plan_args(vec![step("a", "in_progress")]),
+                ),
+                ("r2", "read", serde_json::json!({ "path": "b.txt" })),
+            ],
+        )
+        .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 3);
+        assert!(
+            seq_of(&harness, "r1", "result") < seq_of(&harness, "p1", "started"),
+            "前面的读还没收尾，update_plan 就开始了"
+        );
+        assert!(
+            seq_of(&harness, "p1", "result") < seq_of(&harness, "r2", "started"),
+            "update_plan 还没收尾，后面的读就开始了"
+        );
+        assert_eq!(
+            probe.log(),
+            [
+                "read:r1:进入",
+                "read:r1:离开",
+                "read:r2:进入",
+                "read:r2:离开"
+            ]
+        );
+        let order: Vec<&str> = outcome
+            .results
+            .iter()
+            .map(|result| result.provider_call_id.as_str())
+            .collect();
+        assert_eq!(order, ["pc-r1", "pc-p1", "pc-r2"]);
+    }
+
+    /// 上一世 `start_call` 过、没留下结果：不核对、不重新放行，把结果落回那次尝试——
+    /// 不是 uncertain，也不多一次 `tool.started`。
+    #[tokio::test]
+    async fn a_resumed_started_update_plan_settles_without_uncertain() {
+        let harness = Harness::new();
+        let tool = UpdatePlanTool::new();
+        // 最保守的策略：要是重新放行，这里会停在审批上。
+        let executor = harness.conservative(vec![Arc::new(UpdatePlanTool::new())]);
+        let (session, run) = harness.open_run().await;
+        let mut calls = round(
+            &harness,
+            &run,
+            1,
+            &[(
+                "c1",
+                "update_plan",
+                plan_args(vec![step("a", "in_progress")]),
+            )],
+        )
+        .await;
+        let plan = plan_of(&tool, &harness, &session, &run, &calls[0]).await;
+        let previous = harness.crashed_attempt(&calls[0].call, &plan).await;
+        calls[0].plan = Some(plan);
+        calls[0].resumed = Some(resumed_from(
+            ToolCallState::Started,
+            Some(previous.clone()),
+            1,
+        ));
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(!outcome.results[0].is_error, "{:?}", outcome.results[0]);
+        let results = harness.results_for(&previous);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].status, ToolResultStatus::Completed);
+        assert_eq!(events_of(&harness, "c1"), ["planned", "started", "result"]);
+        assert_eq!(
+            online_state(&harness.ledger.events(), &run).plan.len(),
+            1,
+            "收尾之后这一版计划生效"
+        );
     }
 }

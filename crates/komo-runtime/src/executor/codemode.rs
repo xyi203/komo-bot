@@ -78,7 +78,7 @@ impl ToolExecutor {
             .await;
         let calls = std::mem::take(&mut *calls.lock().expect("调用摘要"));
 
-        let mut text = outcome.outputs.join("\n");
+        let mut text = join_outputs(&outcome.outputs);
         if !outcome.console.is_empty() {
             text.push_str(&format!("\n<console>\n{}</console>", outcome.console));
         }
@@ -194,6 +194,21 @@ fn summary(calls: &[NestedCall]) -> String {
     }
 }
 
+/// 多段 `text()` 拼起来：两段以上时每段前加 `==> text N/M <==`（学 pi 1.1.0）——直接用换行
+/// 拼，模型分不清一段多行输出和两段输出的边界。只有一段时原样给，不多一个字。
+fn join_outputs(outputs: &[String]) -> String {
+    if outputs.len() <= 1 {
+        return outputs.join("\n");
+    }
+    let total = outputs.len();
+    outputs
+        .iter()
+        .enumerate()
+        .map(|(index, output)| format!("==> text {}/{total} <==\n{output}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn truncate(text: &str, limit: usize) -> String {
     if text.len() <= limit {
         return text.to_string();
@@ -239,5 +254,22 @@ impl OutputWriter for Capture {
 
     fn bytes_written(&self) -> u64 {
         self.bytes.len() as u64
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::join_outputs;
+
+    #[test]
+    fn a_single_output_is_left_as_is() {
+        assert_eq!(join_outputs(&["a\nb".to_string()]), "a\nb");
+        assert_eq!(join_outputs(&[]), "");
+    }
+
+    #[test]
+    fn several_outputs_are_headed_with_their_position() {
+        let joined = join_outputs(&["a\nb".to_string(), "c".to_string()]);
+        assert_eq!(joined, "==> text 1/2 <==\na\nb\n==> text 2/2 <==\nc");
     }
 }

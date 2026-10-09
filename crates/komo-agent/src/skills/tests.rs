@@ -354,3 +354,38 @@ fn a_gated_or_disabled_skill_leaves_the_block_empty() {
         "平台不满足就不该露面"
     );
 }
+
+/// 学 pi 1.0.4：引导语里的工具跟着真挂了的走——有 read 写 read，只有 shell 写 shell，
+/// 都没有就整段不出现（说了也读不了）。
+#[test]
+fn the_prompt_block_names_only_a_tool_that_is_mounted() {
+    let dir = tempfile::tempdir().unwrap();
+    write_skill(
+        dir.path(),
+        "release-notes",
+        "name: release-notes\ndescription: 怎么写发布说明\n",
+        "……\n",
+    );
+    let registry = SkillRegistry::new(vec![dir.path().to_path_buf()]);
+
+    let with_read = registry.prompt_block(&context()).expect("有 read");
+    assert!(
+        with_read.contains("read <根>/<名字>/SKILL.md"),
+        "{with_read}"
+    );
+
+    let shell_only = registry
+        .prompt_block(&OfferContext::here(["shell"]).on("linux"))
+        .expect("有 shell 也读得了");
+    assert!(shell_only.contains("用 shell 读"), "{shell_only}");
+    assert!(
+        !shell_only.contains(" read "),
+        "没挂 read 就不提它：{shell_only}"
+    );
+
+    assert_eq!(
+        registry.prompt_block(&OfferContext::here(["write", "python"]).on("linux")),
+        None,
+        "没有能读文件的工具，目录就不该露面"
+    );
+}

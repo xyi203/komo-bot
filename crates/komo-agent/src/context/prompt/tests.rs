@@ -1,4 +1,4 @@
-//! 系统提示正文：工具名、skills 目录的位置、主 / 子代理共用的 `RULES`。
+//! 系统提示正文：工作目录、skills 目录的位置、主 / 子代理共用的 [`rules`]。
 
 use std::path::Path;
 
@@ -8,16 +8,17 @@ use komo_kernel::types::ids::{RunId, ToolCallId};
 use super::*;
 use crate::skills::{OfferContext, SkillRegistry};
 
+/// 工具名不在正文里再列一遍：API 的 tool schema 里已经有一份（学 pi）。
 #[test]
-fn the_system_prompt_names_the_tools_that_are_actually_mounted() {
+fn the_system_prompt_names_the_workspace_and_leaves_tools_to_the_schema() {
     let prompt = build(
         Path::new("/tmp/w"),
         &["read".to_string()],
         &InvocationContext::Main,
         None,
     );
-    assert!(prompt.contains("read"), "{prompt}");
     assert!(prompt.contains("/tmp/w"), "{prompt}");
+    assert!(!prompt.contains("read"), "{prompt}");
 }
 
 /// §5.6 的目录行拼在**后面**（原来那段正文一句不少），空的时候一个字都不多。
@@ -48,17 +49,23 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
 
     let bare = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
     assert!(!bare.contains("Skills"), "{bare}");
-    assert_eq!(bare.lines().count(), 6, "{bare}");
+    assert_eq!(bare.lines().count(), 4, "{bare}");
 }
 
-/// 「搜代码用 rg，不要用 shell 里的 grep / find / ls」是**两条提示共用**的一句
-/// （[`RULES`]）：子代理也要照它做，所以它不能只写在主对话那一份里。
+/// 「搜代码用 rg，别用 shell 拼 grep / find / ls」是**两条提示共用**的一句
+/// （[`rules`]）：子代理也要照它做，所以它不能只写在主对话那一份里；没挂 `rg` 时两边都不说。
 #[test]
 fn both_prompts_tell_the_model_to_search_with_rg() {
     let tools = vec!["rg".to_string()];
     let main = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
-    assert!(main.contains("可用工具：rg"), "{main}");
-    assert!(main.contains("不要用 shell 里的 grep"), "{main}");
+    assert!(main.contains("别用 shell 拼 grep"), "{main}");
+    let without_rg = build(
+        Path::new("/tmp/w"),
+        &["read".to_string()],
+        &InvocationContext::Main,
+        None,
+    );
+    assert!(!without_rg.contains("rg"), "{without_rg}");
 
     let spec = DelegateSpec::new(
         RunId::from_raw("run-1"),
@@ -71,7 +78,7 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
         &InvocationContext::Delegated(spec),
         None,
     );
-    assert!(sub.contains("不要用 shell 里的 grep"), "{sub}");
+    assert!(sub.contains("别用 shell 拼 grep"), "{sub}");
 }
 
 /// 主 Agent 挂了 `shell` 时，提示里说它跑在 komo 里、komo 的状态用 komo CLI 查；排在
@@ -95,10 +102,10 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
         &InvocationContext::Main,
         Some(&catalog),
     );
-    assert!(prompt.contains("你运行在 komo 里"), "{prompt}");
+    assert!(prompt.contains("komo 自己的状态"), "{prompt}");
     assert!(prompt.contains("`komo <子命令>`"), "{prompt}");
     assert!(prompt.contains("cron list"), "{prompt}");
-    let own = prompt.find("你运行在 komo 里").unwrap();
+    let own = prompt.find("komo 自己的状态").unwrap();
     let skills = prompt.find("cron-scheduler").unwrap();
     assert!(own < skills, "{prompt}");
     assert_eq!(
@@ -123,7 +130,7 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
         &InvocationContext::Main,
         None,
     );
-    assert!(!dispatcher.contains("你运行在 komo 里"), "{dispatcher}");
+    assert!(!dispatcher.contains("komo 自己的状态"), "{dispatcher}");
 
     let spec = DelegateSpec::new(
         RunId::from_raw("run-1"),
@@ -136,5 +143,5 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
         &InvocationContext::Delegated(spec),
         None,
     );
-    assert!(!sub.contains("你运行在 komo 里"), "{sub}");
+    assert!(!sub.contains("komo 自己的状态"), "{sub}");
 }

@@ -19,12 +19,14 @@ use komo_kernel::protocol::config::ConfigSnapshot;
 
 pub use frontmatter::FrontMatter;
 
-/// 系统提示里那份目录的总量上限。
+/// 系统提示里那份目录的总量上限——**兜底**，不是控长度的手段。
 ///
-/// **实测值（2026-09-21，本机）**：166 个 skill 只列名字是 2752 字符；带描述要 55 KB（描述
-/// 平均 261 字符）。4000 字符能装下 ~235 条名字，留了余量——原值 2000 只够 16 条"名字 +
-/// 描述"，166 个 skill 里的后 150 个**根本没进提示**，而模型不知道有它们就不会去读。
-pub const DEFAULT_CATALOG_CHARS: usize = 4_000;
+/// 照 pi 的做法：每条都带完整描述（模型靠描述判断何时该读），长度靠 `komo skills disable`
+/// 把不常用的拿出目录来控，而不是压掉描述。
+///
+/// **实测值（2026-10-09，本机）**：166 个 skill 里 disable 掉 134 个，剩下 32 个带描述是
+/// 9855 字符；12000 给新增几条留了余量。disable 名单失控、超过这条线时才退成只列名字。
+pub const DEFAULT_CATALOG_CHARS: usize = 12_000;
 
 /// 目录行的一种形状：**整批**装得下描述就用 [`Shape::Full`]，否则只留名字。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +48,37 @@ pub struct SkillCatalog {
     dropped: usize,
     /// 按序的、真的出了条目的那些根（§5.6：目录行里的名字要能顺着这个顺序定位到文件）。
     roots: Vec<String>,
+    /// 读 `SKILL.md` 用哪个工具；一个能读文件的都没挂时是 `None`，整段不出现。
+    reader: Option<Reader>,
+}
+
+/// 读 `SKILL.md` 的那个工具（学 pi 1.0.4）：引导语跟着**真挂了的工具**写，不让模型去调
+/// 一个不存在的 `read`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reader {
+    Read,
+    Shell,
+}
+
+impl Reader {
+    fn pick(tools: &BTreeSet<String>) -> Option<Self> {
+        if tools.contains("read") {
+            Some(Reader::Read)
+        } else if tools.contains("shell") {
+            Some(Reader::Shell)
+        } else {
+            None
+        }
+    }
+
+    fn header(self) -> &'static str {
+        match self {
+            Reader::Read => "Skills（用到时按根的顺序 read <根>/<名字>/SKILL.md 再照做）：\n",
+            Reader::Shell => {
+                "Skills（用到时按根的顺序用 shell 读 <根>/<名字>/SKILL.md 再照做）：\n"
+            }
+        }
+    }
 }
 
 impl SkillCatalog {
@@ -72,16 +105,14 @@ impl SkillCatalog {
     /// 定位到文件（`<根>/<名字>/SKILL.md`），"同名先到先得"这件事才落得下来：模型按这个
     /// 顺序找，先撞上的那份正是加载时生效的那一份。
     ///
-    /// 一条能露面的都没有时回答 `None`：那种情况下系统提示**一个字都不多**，不因为
-    /// "配置里有 skills 概念"就凭空多出一段空标题。
+    /// 一条能露面的都没有、或者没挂能读文件的工具时回答 `None`：那种情况下系统提示
+    /// **一个字都不多**，不因为"配置里有 skills 概念"就凭空多出一段读不了的目录。
     pub fn prompt_block(&self) -> Option<String> {
+        let reader = self.reader?;
         if self.skills.is_empty() {
             return None;
         }
-        let mut block = String::from(
-            "Skills（人写的操作说明；要用的时候按下面的顺序找 <根>/<名字>/SKILL.md，\
-             用 read 读了再照做）：\n",
-        );
+        let mut block = String::from(reader.header());
         block.push_str("根：");
         block.push_str(&self.roots.join("、"));
         block.push('\n');
@@ -356,6 +387,7 @@ impl SkillRegistry {
             shape,
             dropped,
             roots,
+            reader: Reader::pick(&context.tools),
         }
     }
 

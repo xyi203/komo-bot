@@ -191,6 +191,14 @@ impl RuleTable {
                     "follow 只是把一句话提交进已有的任务会话，任务内的调用仍照常过 Policy",
                     Matcher::operations([OperationMatch::Follow]),
                 ),
+                // update_plan 只是模型报一次进度，不碰文件、进程或外部服务——strict 下也
+                // Allow。`auto()` 的默认结论本来就是 Allow，不重复。
+                rule(
+                    "update-plan-allow",
+                    Effect::Allow,
+                    "update_plan 只是更新这条 Run 的工作计划，没有副作用",
+                    Matcher::operations([OperationMatch::UpdatePlan]),
+                ),
                 // MCP（`docs/mcp.md`）：操作者在配置里声明为只读的工具放行，其余要人看——
                 // 外部服务做了什么 komo 看不见。单个工具要免问，在 policy.toml 里按
                 // `tools = ["mcp__<server>__<tool>"]` 写一条 Allow。
@@ -815,6 +823,32 @@ mod tests {
         assert!(RuleTable::auto().decide(&call(false), &f.ctx()).is_allow());
     }
 
+    /// update_plan 没有副作用：两套建议下都 Allow；操作者追加一条 Deny 照样拦得住。
+    #[test]
+    fn update_plan_is_allowed_by_both_tables_but_a_deny_rule_still_wins() {
+        let f = Fixture::new();
+        let update = plan("update_plan", Operation::UpdatePlan, vec![]);
+        let strict = RuleTable::initial().decide(&update, &f.ctx());
+        assert!(strict.is_allow(), "{strict:?}");
+        assert!(strict.reason().contains("update-plan-allow"));
+        assert!(RuleTable::auto().decide(&update, &f.ctx()).is_allow());
+
+        for mut table in [RuleTable::initial(), RuleTable::auto()] {
+            table.rules.push(PolicyRule {
+                id: "no-plans".into(),
+                effect: Effect::Deny,
+                reason: "不要计划".into(),
+                matcher: Matcher::operations([OperationMatch::UpdatePlan]),
+                scopes: vec![],
+                requires_isolation: false,
+                grant_proof: false,
+            });
+            let decision = table.decide(&update, &f.ctx());
+            assert!(decision.is_deny(), "{decision:?}");
+            assert!(decision.reason().contains("no-plans"));
+        }
+    }
+
     #[test]
     fn codemode_is_allowed_under_the_strict_table() {
         let f = Fixture::new();
@@ -989,6 +1023,7 @@ mod tests {
                 },
                 vec![],
             ),
+            plan("update_plan", Operation::UpdatePlan, vec![]),
         ];
         for plan in plans {
             let decision = table.decide(&plan, &f.ctx());

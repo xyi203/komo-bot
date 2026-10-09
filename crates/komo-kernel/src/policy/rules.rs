@@ -51,6 +51,8 @@ pub enum OperationMatch {
     Dispatch,
     /// 同上：往一个已有的任务会话里再提交一句。
     Follow,
+    /// 更新工作计划：没有副作用。
+    UpdatePlan,
     /// 操作者声明为只读的 MCP 工具（`docs/mcp.md`）。
     McpRead,
     /// 其余 MCP 工具：副作用由服务器决定。
@@ -74,6 +76,7 @@ impl OperationMatch {
             Operation::Delegate { .. } => OperationMatch::Delegate,
             Operation::Dispatch { .. } => OperationMatch::Dispatch,
             Operation::Follow { .. } => OperationMatch::Follow,
+            Operation::UpdatePlan => OperationMatch::UpdatePlan,
             Operation::McpCall {
                 read_only: true, ..
             } => OperationMatch::McpRead,

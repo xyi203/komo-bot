@@ -232,6 +232,7 @@ fn operation_label(operation: &Operation) -> &'static str {
         Operation::Delegate { .. } => "delegate",
         Operation::Dispatch { .. } => "dispatch",
         Operation::Follow { .. } => "follow",
+        Operation::UpdatePlan => "update_plan",
         Operation::McpCall { .. } => "mcp_call",
         Operation::Codemode { .. } => "codemode",
     }

@@ -356,6 +356,7 @@ fn operation_name(operation: &Operation) -> &'static str {
         Operation::Delegate { .. } => "派给子代理",
         Operation::Dispatch { .. } => "派一个任务",
         Operation::Follow { .. } => "追问一个任务",
+        Operation::UpdatePlan => "更新工作计划",
         Operation::McpCall { .. } => "MCP 工具",
         Operation::Codemode { .. } => "沙箱脚本",
     }

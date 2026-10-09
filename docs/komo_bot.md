@@ -469,6 +469,7 @@ Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或�
 | 委派一个子任务（`Operation::Delegate`）       | 按操作者意图：strict 下 Ask（展示任务正文与结果契约），auto 下 Allow。**子代理自己的每一次调用仍各自按上面各行判断**——委派不放宽任何一层。续跑（`resume`，§4）是同一行：审批卡在这次委派的任务正文（这次续跑要接着做的那件事，就是这次 `delegate` 调用的 `task`）之外多写一句"接着子 Run X"，续跑目标进计划、进计划哈希，批的是"接着**这一条**"，换一条就要重新问。**渲染只读得到这次的计划**，不回去查目标那条子 Run 当初的任务正文——那句原话要看，去读那条子 Run 自己的记录（§8.3 的回放窗口） |
 | 派一个新任务（`Operation::Dispatch`）         | strict 与 auto 下都 Allow：它只是建一个独立的**任务会话**并提交第一条输入（`docs/background-tasks.md`），不等它跑完，**任务会话里的每一次调用仍各自按上面各行判断**——不放宽任何一层。幂等键 `dispatch:{run}:{call}` 让重放的同一次调用不会多建一个任务 |
 | 追问一个任务（`Operation::Follow`）           | 同上：strict 与 auto 下都 Allow，只是把一句话提交进一个已有的任务会话；幂等键 `follow:{run}:{call}` |
+| 更新工作计划（`Operation::UpdatePlan`）       | strict 与 auto 下都 Allow：只是模型报一次进度（整份计划只在 `args` 里），不碰文件、进程或外部服务；完成一个先前登记过的步骤是在线压缩的安全点 |
 | 调 MCP 工具（`Operation::McpCall`）           | 操作者在 `[mcp.servers.<name>] read_only` 里声明的：strict 与 auto 下都 Allow，中断后重读；其余：strict 下 Ask（卡片上是服务器、工具与完整参数），auto 下 Allow，中断后停下问人。服务器自报的 `readOnlyHint` 不算数（`docs/mcp.md`） |
 | 沙箱脚本（`Operation::Codemode`）             | strict 与 auto 下都 Allow：脚本自己碰不到外部，里面的每次调用各自过 Policy，只放行只读且直接 Allow 的（要审批的在脚本里抛错）；中断后整段重跑（`docs/codemode.md`） |
 | shell 命令文本匹配 `komo cron add`            | strict 下永远 Ask，且**只能批一次**（`scopes` 固定 `[once]`，不给 Run / Cron 范围）；**任何已有的 Run / Cron 范围授权都不能替这一步作答**——`cron add` 会给命令 Job 自己签发一条执行授权（见下），模型能经 shell 调它给自己写将来能免问的许可，这一条必须每次都问人。auto 基表不变（§7.1「auto 与 strict 的差别就是要不要人看一眼」，这条也不例外） |

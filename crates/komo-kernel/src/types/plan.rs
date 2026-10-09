@@ -125,6 +125,12 @@ pub enum Operation {
     /// `task_id` 是模型给的任务短号原文，解析成具体会话在执行侧做（只有 Gateway 查得到
     /// "这个会话派出去过哪些任务"）。
     Follow { task_id: String, text: String },
+    /// 更新这条 Run 的工作计划（`update_plan`）。
+    ///
+    /// 与 `Delegate` / `Dispatch` 同一类编排操作，不是第七个基础工具：它不碰文件、不碰
+    /// 进程、没有副作用，只是让模型报一次进度。整份计划只在 `args` 里——这里不再存一
+    /// 份，免得同一件事有两个落点。
+    UpdatePlan,
     /// 调一个 MCP 服务器上的工具（`docs/mcp.md`）。
     ///
     /// 副作用由服务器决定，komo 看不见。`read_only` 是**操作者**在配置里声明的

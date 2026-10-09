@@ -136,3 +136,89 @@ async fn auto_mode_asks_nothing_at_all() {
     );
     assert!(log.contains("\"tool.result\""), "该跑的还是跑了");
 }
+
+/// 组合调用（`edit` 带 `then_run`）投到 chat 的那一条审批：三个渠道渲染出来的正文里都有
+/// 改完要跑的那条命令、范围只有"本次"；批准一次 → 改动与命令各跑一次，不再问。
+///
+/// 人批的是两步。看不见第二步，就等于替一条没见过的命令签了字。
+#[tokio::test]
+async fn a_fused_edit_asks_in_the_chat_with_the_command_it_runs_after() {
+    use komo_kernel::types::chat::{ApprovalScope, Outbound};
+    use komo_kernel::types::status::RunState;
+
+    const COMMAND: &str = "echo ran >> ran.txt";
+
+    let sender = MemSender::new(komo_kernel::types::chat::ChannelPlatform::Telegram);
+    let home = Home::with_config(&config());
+    std::fs::create_dir_all(home.workspace()).expect("工作目录");
+    let file = home.workspace().join("app.txt");
+    std::fs::write(&file, "version = 1\n").expect("写文件");
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-edit",
+            "edit",
+            serde_json::json!({
+                "path": "app.txt",
+                "match_text": "version = 1",
+                "replace_text": "version = 2",
+                "then_run": { "command": COMMAND },
+            }),
+        ),
+        text_round(2, "改完也跑过了。"),
+    ]]);
+    let gw = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+    let session = gw.open_session().await;
+    let run = gw
+        .submit(&session, "fused-1", "改版本号然后跑一下")
+        .await
+        .run;
+
+    let watching = Arc::clone(&sender);
+    eventually("组合调用的审批投到 home chat", move || {
+        !watching.approvals().is_empty()
+    })
+    .await;
+    let asked = sender.approvals();
+    assert_eq!(asked.len(), 1, "两步只问一次：{asked:?}");
+    let presentation = asked[0].clone();
+    assert!(
+        presentation.plan.then_run.is_some(),
+        "审批绑的是整份组合计划"
+    );
+    assert_eq!(presentation.scopes, vec![ApprovalScope::Once], "只给本次");
+    assert!(
+        !home.workspace().join("ran.txt").exists(),
+        "批之前一步都不做"
+    );
+
+    let then_run = format!("然后运行：{COMMAND}（");
+    let outbound = Outbound::ApprovalRequest(Box::new(presentation.clone()));
+    let telegram: String = komo_gateway::render::telegram::render(&outbound)
+        .into_iter()
+        .map(|message| message.text)
+        .collect();
+    assert!(telegram.contains(&then_run), "{telegram}");
+    assert!(telegram.contains("app.txt"), "改动那一步也在：{telegram}");
+    let feishu: String = komo_gateway::render::feishu::render(&outbound)
+        .into_iter()
+        .map(|message| message.content)
+        .collect();
+    assert!(feishu.contains(&then_run), "{feishu}");
+    let wechat = komo_gateway::render::wechat::render(&outbound);
+    assert!(wechat.contains(&then_run), "{wechat}");
+    assert!(
+        !wechat.contains(&format!("/approve {} run", presentation.short_id)),
+        "微信的范围行也只有本次：{wechat}"
+    );
+
+    gw.decide(&presentation.approval, true).await;
+    let detail = gw.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "version = 2\n");
+    let ran = std::fs::read_to_string(home.workspace().join("ran.txt")).expect("命令跑过");
+    assert_eq!(ran.lines().count(), 1, "命令只跑了一次：{ran:?}");
+    assert_eq!(sender.approvals().len(), 1, "批过之后不再问");
+}

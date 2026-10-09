@@ -1023,3 +1023,35 @@ fn a_stamp_takes_the_offset_of_its_own_instant_across_dst() {
         "2026-12-01 12:00:00 -05:00"
     );
 }
+
+/// 单步计划的 `komo approval show` 逐字钉住：组合计划那一行加进来之后，单步的样子一个字
+/// 都不变。
+#[test]
+fn a_single_step_approval_shows_exactly_as_before() {
+    let printed = intervention_detail(&InterventionDetail::Approval(Box::new(
+        fixture::approval_record(),
+    )));
+    assert_eq!(
+        printed,
+        "短 ID   7K2M  (appr-1)\n\n动作\n  工具  shell  ·  shell 命令\n    rm -rf build\n  来源  交互请求\n  cwd  /home/u/project\n  目标\n    写 /home/u/project/build\n  版本  code 17f69ae2697b\n  恢复  无可靠恢复方式\n  计划哈希  05f92332d4c6\n\n改动\n  --- a/build.rs\n  +++ b/build.rs\n  @@ -1 +1 @@\n  -老的一行\n  +新的一行\n\n已有验证结果\n  候选模块测试：3 passed\n\n原因\n  命中 shell 规则：任意代码需要人看一眼\n\n范围\n  本次调用 · 本次 Run 范围",
+        "{printed}"
+    );
+}
+
+/// 组合计划（`then_run`）：`komo approval show` 把改动与改完要跑的命令都印出来，范围只有本次。
+#[test]
+fn an_approval_show_for_a_fused_edit_prints_the_command_it_runs_after() {
+    let printed = intervention_detail(&InterventionDetail::Approval(Box::new(
+        fixture::fused_approval_record("cargo test -p app"),
+    )));
+    insta_like(
+        &printed,
+        &[
+            "edit",
+            "写 /home/u/project/app.txt",
+            "  然后运行：cargo test -p app（/home/u/project）",
+            "+version = 2",
+        ],
+    );
+    assert!(printed.ends_with("范围\n  本次调用"), "{printed}");
+}

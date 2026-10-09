@@ -229,6 +229,38 @@ pub fn intervention_summary(
     }
 }
 
+/// 一条组合计划（`then_run`）的审批：改 `app.txt`，改完跑 `command`；Policy 只给"本次"。
+pub fn fused_approval_record(command: &str) -> ApprovalRecord {
+    let then_run = ExecutionPlan {
+        operation: Operation::ShellCommand {
+            command: command.into(),
+        },
+        args: serde_json::json!({ "command": command }),
+        targets: vec![],
+        versions: PlanVersions::default(),
+        ..plan()
+    };
+    let plan = ExecutionPlan {
+        tool: "edit".into(),
+        operation: Operation::WriteFile,
+        args: serde_json::json!({ "path": "app.txt" }),
+        targets: vec![PlanTarget::local(
+            "/home/u/project/app.txt",
+            TargetAccess::Write,
+        )],
+        versions: PlanVersions::default(),
+        then_run: Some(Box::new(then_run)),
+        ..plan()
+    };
+    ApprovalRecord {
+        plan_hash: plan.plan_hash(),
+        plan,
+        changes: Some("--- a/app.txt\n+++ b/app.txt\n-version = 1\n+version = 2".into()),
+        scopes: vec![ApprovalScope::Once],
+        ..approval_record()
+    }
+}
+
 pub fn approval_record() -> ApprovalRecord {
     ApprovalRecord {
         approval: ApprovalId::from_raw("appr-1"),

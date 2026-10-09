@@ -191,7 +191,7 @@ pub fn approval_text(presentation: &ApprovalPresentation) -> String {
     // 二、动作：工具、命令 / 代码、真实目标路径、cwd、版本。
     out.push_str(&format!(
         "\n*动作*\n{}",
-        code_block(&truncate(&plan_action(&presentation.plan), ACTION_LIMIT))
+        code_block(&plan_action(&presentation.plan))
     ));
 
     // 三、改动：write / edit 的 diff（截断）。
@@ -248,7 +248,38 @@ fn scope_line(presentation: &ApprovalPresentation) -> String {
 }
 
 /// 动作块：§11.3 的"工具、命令 / 代码、真实目标路径、cwd、版本"。
+///
+/// 组合计划（`then_run`）逐步写：改动那一步照旧，命令那一步一行"然后运行：命令（cwd）"。
+/// 每一步各按 [`ACTION_LIMIT`] 截——命令不会因为前一步长而被挤掉，过长时留着截断标记。
 fn plan_action(plan: &ExecutionPlan) -> String {
+    plan.steps()
+        .enumerate()
+        .map(|(index, step)| {
+            let text = if index == 0 {
+                step_action(step)
+            } else {
+                then_run_line(step)
+            };
+            truncate(&text, ACTION_LIMIT)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 组合计划的第二步只会是一条 shell 命令（`ExecutionPlan::validate_steps`）。
+fn then_run_line(step: &ExecutionPlan) -> String {
+    let command = match &step.operation {
+        Operation::ShellCommand { command } => command.as_str(),
+        other => operation_label(other),
+    };
+    match &step.cwd {
+        Some(cwd) => format!("然后运行：{command}（{}）", cwd.display()),
+        None => format!("然后运行：{command}"),
+    }
+}
+
+/// 一步计划自己的那几行。
+fn step_action(plan: &ExecutionPlan) -> String {
     let mut lines = vec![
         format!("工具: {}", plan.tool),
         format!("操作: {}", operation_label(&plan.operation)),
@@ -783,5 +814,98 @@ mod tests {
         });
         assert!(fresh.contains("任务: 查 A"), "{fresh}");
         assert!(!fresh.contains("续跑"), "{fresh}");
+    }
+
+    /// 单步计划的审批正文逐字钉住：组合计划那一行加进来之后，单步的样子一个字都不变。
+    #[test]
+    fn a_single_step_approval_renders_exactly_as_before() {
+        let text = approval_text(&presentation());
+        assert_eq!(
+            text,
+            "🔐 待审批 `7K2M`\n\n*动作*\n```\n工具: shell\n操作: shell_command\n命令: rm -rf /tmp/scratch\ncwd: /home/op/work\n写: /tmp/scratch\n```\n\n*改动*\n```\n--- a/x\n+++ b/x\n-1\n+2\n```\n\n*原因*\n>写入 workspace 之外的路径（第 3 条规则）\n\n*范围*\n按钮 \\= 本次调用；本次 Run：/approve 7K2M run",
+            "{text}"
+        );
+    }
+
+    /// 一份组合计划：改 `app.txt`，改完跑 `command`。
+    fn fused_plan(command: &str) -> ExecutionPlan {
+        let then_run = ExecutionPlan {
+            operation: Operation::ShellCommand {
+                command: command.into(),
+            },
+            args: serde_json::json!({ "command": command }),
+            targets: Vec::new(),
+            ..plan()
+        };
+        ExecutionPlan {
+            tool: "edit".into(),
+            operation: Operation::WriteFile,
+            args: serde_json::json!({ "path": "app.txt" }),
+            targets: vec![PlanTarget::local(
+                PathBuf::from("/home/op/work/app.txt"),
+                TargetAccess::Write,
+            )],
+            then_run: Some(Box::new(then_run)),
+            ..plan()
+        }
+    }
+
+    /// 组合计划的审批：Policy 只给"本次"（§7.2）。
+    fn fused_presentation(plan: ExecutionPlan) -> ApprovalPresentation {
+        ApprovalPresentation {
+            plan_hash: plan.plan_hash(),
+            plan,
+            changes: Some("--- a/app.txt\n+++ b/app.txt\n-version = 1\n+version = 2".into()),
+            scopes: vec![ApprovalScope::Once],
+            ..presentation()
+        }
+    }
+
+    /// 第一步长到被截断时，它自己留着截断标记，命令那一行照样在。
+    fn long_first_step(command: &str) -> ExecutionPlan {
+        let mut plan = fused_plan(command);
+        plan.targets = (0..ACTION_LIMIT)
+            .map(|n| {
+                PlanTarget::local(
+                    PathBuf::from(format!("/home/op/work/f{n}.txt")),
+                    TargetAccess::Write,
+                )
+            })
+            .collect();
+        plan
+    }
+
+    /// 组合计划（`then_run`）：动作里两步都在，改动照旧，范围只有"本次"。
+    #[test]
+    fn a_fused_edit_shows_the_change_and_the_command_it_runs_after() {
+        let messages = render(&Outbound::ApprovalRequest(Box::new(fused_presentation(
+            fused_plan("cargo test -p app"),
+        ))));
+        assert_eq!(messages.len(), 1, "这条审批不该被切段");
+        let text = &messages[0].text;
+        assert!(text.contains("工具: edit"), "{text}");
+        assert!(text.contains("写: /home/op/work/app.txt"), "{text}");
+        assert!(text.contains("+version = 2"), "改动照旧在：{text}");
+        assert!(
+            text.contains("然后运行：cargo test -p app（/home/op/work）"),
+            "{text}"
+        );
+        assert!(!text.contains("/approve 7K2M run"), "只给本次：{text}");
+        let keyboard = messages[0].keyboard.as_ref().expect("审批消息必须带按钮");
+        assert_eq!(keyboard.rows, approval_keyboard(&presentation()).rows);
+    }
+
+    /// 超长命令截断并留标记，不会整行不见——前一步再长也挤不掉它。
+    #[test]
+    fn a_long_then_run_command_is_truncated_with_a_marker_not_dropped() {
+        let command = format!("echo {}", "x".repeat(ACTION_LIMIT * 3));
+        for plan in [fused_plan(&command), long_first_step(&command)] {
+            let text = approval_text(&fused_presentation(plan));
+            let line = text
+                .lines()
+                .find(|line| line.starts_with("然后运行：echo xxx"))
+                .unwrap_or_else(|| panic!("命令那一行不见了：{text}"));
+            assert!(line.ends_with(TRUNCATION_NOTE), "{line}");
+        }
     }
 }

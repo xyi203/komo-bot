@@ -328,6 +328,18 @@ pub fn plan_lines(plan: &ExecutionPlan) -> Vec<Line<'static>> {
         ]));
     }
 
+    // 组合计划（`then_run`）的第二步：改完紧接着跑的那条命令。审批盖住两步，看不见它就
+    // 等于替它签了字。恢复与计划哈希说的是整份计划，所以排在它后面。
+    for step in plan.steps().skip(1) {
+        for (index, line) in then_run_text(step).lines().enumerate() {
+            let indent = if index == 0 { "  " } else { "    " };
+            lines.push(Line::from(Span::styled(
+                format!("{indent}{line}"),
+                Style::default().fg(Color::Cyan),
+            )));
+        }
+    }
+
     lines.push(Line::from(vec![
         field("  恢复"),
         Span::raw(recovery_text(&plan.recovery)),
@@ -382,6 +394,18 @@ fn operation_body(plan: &ExecutionPlan) -> Option<String> {
         )),
         Operation::Codemode { code } => Some(code.clone()),
         _ => None,
+    }
+}
+
+/// "然后运行：命令（cwd）"。第二步只会是一条 shell 命令（`ExecutionPlan::validate_steps`）。
+fn then_run_text(step: &ExecutionPlan) -> String {
+    let command = match &step.operation {
+        Operation::ShellCommand { command } => command.as_str(),
+        other => operation_name(other),
+    };
+    match &step.cwd {
+        Some(cwd) => format!("然后运行：{command}（{}）", cwd.display()),
+        None => format!("然后运行：{command}"),
     }
 }
 
@@ -661,5 +685,53 @@ mod tests {
         };
         let rendered = text_of(&approval_lines(&record));
         assert!(!rendered.contains("接着子 Run"), "{rendered}");
+    }
+
+    /// 单步计划的弹窗正文逐字钉住：组合计划那一行加进来之后，单步的样子一个字都不变。
+    #[test]
+    fn a_single_step_plan_renders_exactly_as_before() {
+        let text = text_of(&approval_lines(&approval_record()));
+        assert_eq!(
+            text,
+            "短 ID： 7K2M  (appr-1)\n动作：\n  工具  shell  ·  shell 命令\n    rm -rf build\n  来源  交互请求\n  cwd  /home/u/project\n  目标  \n    写 /home/u/project/build\n  版本  code 17f69ae2697b\n  恢复  无可靠恢复方式\n  计划哈希  05f92332d4c6\n改动：\n  --- a/build.rs\n  +++ b/build.rs\n  @@ -1 +1 @@\n  -老的一行\n  +新的一行\n已有验证结果：\n  候选模块测试：3 passed\n原因：\n  命中 shell 规则：任意代码需要人看一眼\n范围：\n  本次调用 · 本次 Run 范围",
+            "{text}"
+        );
+    }
+
+    /// 组合计划（`then_run`）：动作里两步都在，改动照旧，菜单只有"本次"与拒绝。
+    #[test]
+    fn a_fused_edit_shows_the_change_and_the_command_it_runs_after() {
+        let record = crate::tui::test_support::fused_approval_record("cargo test -p app");
+        let rendered = text_of(&approval_lines(&record));
+        assert!(rendered.contains("edit"), "{rendered}");
+        assert!(
+            rendered.contains("写 /home/u/project/app.txt"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("+version = 2"), "改动照旧在：{rendered}");
+        assert!(
+            rendered.contains("  然后运行：cargo test -p app（/home/u/project）"),
+            "{rendered}"
+        );
+        let keys: Vec<char> = ApprovalModal::new(record)
+            .rows(1)
+            .iter()
+            .map(|row| row.key)
+            .collect();
+        assert_eq!(keys, vec!['y', 'n'], "组合计划只给本次");
+    }
+
+    /// 弹窗不截命令：长命令与多行命令一行不少（窄屏上的按宽截断带 `…`，在 render 那一层）。
+    #[test]
+    fn a_long_then_run_command_is_shown_whole() {
+        let long = "x".repeat(4000);
+        let command = format!("cd sub &&\necho {long}");
+        let record = crate::tui::test_support::fused_approval_record(&command);
+        let rendered = text_of(&approval_lines(&record));
+        assert!(rendered.contains("  然后运行：cd sub &&\n"), "{rendered}");
+        assert!(
+            rendered.contains(&format!("    echo {long}（/home/u/project）")),
+            "{rendered}"
+        );
     }
 }

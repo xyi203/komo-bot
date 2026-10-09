@@ -1,8 +1,7 @@
 //! 委派（delegate）：一次子任务的说明、结果契约，与**父子共用的结果校验器**。
 //!
 //! 一个子代理 = 同 Session 里的一条子 Run（§4、§8.4 的 `dependency`）。这条 Run 的受理
-//! 事件带着这里的 [`DelegateSpec`]：谁派的、父侧那次调用是哪一次、结果要长什么样、它有几
-//! 轮预算。**契约必须落在事件里**——重启之后它是子代理唯一的"结果要长什么样"的依据，
+//! 事件带着这里的 [`DelegateSpec`]：谁派的、父侧那次调用是哪一次、结果要长什么样。**契约必须落在事件里**——重启之后它是子代理唯一的"结果要长什么样"的依据，
 //! 而它同时就是父侧复验时用的那一份（`Event.run` 已经有了，子代理的轮次因此认得出来）。
 //!
 //! 校验器是**父子共用的一份代码**：子代理提交结果时用它，父侧收到结果时用同一份再验一遍。
@@ -17,9 +16,6 @@
 use serde::{Deserialize, Serialize};
 
 use super::ids::{RunId, ToolCallId};
-
-/// 子代理的默认轮次预算。
-pub const DEFAULT_DELEGATE_ROUNDS: u32 = 8;
 
 /// 校验失败之后允许的修复轮次：把不合规的地方原文喂回去让它改（§8.6 的核对同理，
 /// 判断之后要给出**能行动**的下一步）。
@@ -36,23 +32,16 @@ pub struct DelegateSpec {
     /// 交给子代理的自包含任务。它就是子 Run 的输入正文（§8.5），也是审批卡上给人看的
     /// 那一句——两者是同一个值，写在 `prepare` 那一处。
     pub task: String,
-    /// 子代理能跑几轮模型。默认 [`DEFAULT_DELEGATE_ROUNDS`]。
-    #[serde(default = "default_rounds")]
-    pub rounds: u32,
     /// 结果契约。不给 = 自由文本（旧 `delegate` 的形状，父侧只能自己读）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<DelegateContract>,
     /// 续跑：这条子 Run 接着哪一条（§4）。`None` = 这条线的第一条。
     ///
     /// 它只决定子代理的回放窗口（§8.3 的 `resumes` 链）——不决定结果交给谁（那是
-    /// `parent`）、不决定预算（每次续跑都是自己的 `rounds`）。**旧行没有这个字段**：
+    /// `parent`）、不决定预算（每次续跑都是一条新 Run，轮数从零数起）。**旧行没有这个字段**：
     /// `skip_serializing_if` 让它们的字节不变，`default` 让它们照旧解成"这条线的第一条"。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumes: Option<RunId>,
-}
-
-fn default_rounds() -> u32 {
-    DEFAULT_DELEGATE_ROUNDS
 }
 
 impl DelegateSpec {
@@ -61,7 +50,6 @@ impl DelegateSpec {
             parent,
             call,
             task: task.into(),
-            rounds: DEFAULT_DELEGATE_ROUNDS,
             contract: None,
             resumes: None,
         }
@@ -69,11 +57,6 @@ impl DelegateSpec {
 
     pub fn with_contract(mut self, schema: serde_json::Value, mode: SchemaMode) -> Self {
         self.contract = Some(DelegateContract { schema, mode });
-        self
-    }
-
-    pub fn with_rounds(mut self, rounds: u32) -> Self {
-        self.rounds = rounds;
         self
     }
 
@@ -435,9 +418,9 @@ mod tests {
         assert_eq!(decoded.mode, SchemaMode::Permissive);
     }
 
-    /// 预算与契约缺席时的默认值：老事件、以及"不给 schema"都要解得开。
+    /// 契约缺席时的默认值：老事件、以及"不给 schema"都要解得开。
     #[test]
-    fn a_spec_without_rounds_or_contract_still_decodes() {
+    fn a_spec_without_a_contract_still_decodes() {
         let decoded: DelegateSpec = serde_json::from_value(json!({
             "parent": "run-1",
             "call": "call-1",
@@ -445,7 +428,6 @@ mod tests {
         }))
         .expect("解得出");
         assert_eq!(decoded.task, "看一下这个 PR");
-        assert_eq!(decoded.rounds, DEFAULT_DELEGATE_ROUNDS);
         assert!(decoded.contract.is_none());
         assert!(
             decoded.resumes.is_none(),

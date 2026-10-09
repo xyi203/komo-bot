@@ -1260,7 +1260,6 @@ mod delegation {
             &harness,
             json!({
                 "task": "把 a.txt 里的小数点都改成逗号",
-                "rounds": 3,
                 "output_schema": { "type": "object" }
             }),
         )
@@ -1297,7 +1296,6 @@ mod delegation {
         assert_eq!(specs[0].parent, run);
         assert_eq!(specs[0].call, request.call);
         assert_eq!(specs[0].task, "把 a.txt 里的小数点都改成逗号");
-        assert_eq!(specs[0].rounds, 3);
         assert!(specs[0].contract.is_some(), "契约跟着事件一起落盘");
 
         // 折出来的视图认得出这条边：父视图靠它知道"哪些 Run 是我的子代理"，

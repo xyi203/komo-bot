@@ -26,8 +26,8 @@ pub use chat::{
     DeliveryTarget, Outbound, PeerId, Principal,
 };
 pub use delegate::{
-    DEFAULT_DELEGATE_ROUNDS, DELEGATE_REPAIR_ROUNDS, DelegateContract, DelegateSpec, SchemaMode,
-    Validation, Violation, validate,
+    DELEGATE_REPAIR_ROUNDS, DelegateContract, DelegateSpec, SchemaMode, Validation, Violation,
+    validate,
 };
 pub use digest::{ContentHash, sha256};
 pub use ids::{

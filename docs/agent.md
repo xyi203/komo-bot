@@ -772,7 +772,7 @@ subagent_prompt()
 pub enum InvocationContext {
     Main,
 
-    Delegated(DelegateSpec),   // kernel 现有类型：task、rounds、contract、parent、call
+    Delegated(DelegateSpec),   // kernel 现有类型：task、contract、parent、call、resumes
 }
 ```
 
@@ -1089,7 +1089,7 @@ let request = TurnRequest {
 Segment
 ├── request   TurnRequest            ← 本次重构只改它的 system_prompt / messages 来源
 ├── env       CallEnv                ← roots、ResourceMounts、surface、delegated、cancel
-├── budget    Budget                 ← 子代理用 spec.rounds，其他按 source
+├── budget    Budget                 ← 按 source（子代理与普通 Run 同一个）
 ├── resume    续跑的那些调用          ← resumed() 读账本
 └── command   Cron 直跑命令
 ```

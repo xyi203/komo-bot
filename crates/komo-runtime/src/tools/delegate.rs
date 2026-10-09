@@ -36,11 +36,6 @@ pub struct DelegateArgs {
     /// 不合规时怎么办。缺省 permissive：父侧照样拿到结果，但**标记出来**。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_mode: Option<SchemaMode>,
-    /// 子代理能跑几轮模型。缺省用 kernel 的 [`DEFAULT_DELEGATE_ROUNDS`]。
-    ///
-    /// [`DEFAULT_DELEGATE_ROUNDS`]: komo_kernel::types::delegate::DEFAULT_DELEGATE_ROUNDS
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rounds: Option<u32>,
     /// 续跑：接着一条已经结束的子 Run（§4）。它必须是同一个 Session 里的子 Run、终态是
     /// completed 或 failed、在最新一次 `/new` 之后，而且是这条线的末端——账本里的
     /// 校验在编排那一步做（`Tool::prepare` 没有账本），这里只负责把这个参数原样带上。
@@ -95,11 +90,6 @@ impl Tool for DelegateTool {
                         "description": "结果不符合契约时怎么办：permissive（默认）放行并标记，\
                                         strict 判这次委派失败"
                     },
-                    "rounds": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "子代理最多跑几轮模型，默认 8"
-                    },
                     "resume": {
                         "type": "string",
                         "description": "接着一条已经结束的子 Run 继续（它的 id，之前某次 delegate \
@@ -127,11 +117,6 @@ impl Tool for DelegateTool {
                         .into(),
             });
         }
-        if args.rounds == Some(0) {
-            return Err(ToolError::InvalidArguments {
-                message: "rounds 至少是 1".into(),
-            });
-        }
         // 模式是"结果不合契约时怎么办"，没有契约就没有可违反的东西。静默丢掉这个参数
         // 会让模型以为它设定了什么——说出来。
         if args.schema_mode.is_some() && args.output_schema.is_none() {
@@ -143,9 +128,6 @@ impl Tool for DelegateTool {
         let mut spec = DelegateSpec::new(ctx.run.clone(), ctx.call.clone(), args.task.clone());
         if let Some(schema) = args.output_schema.clone() {
             spec = spec.with_contract(schema, args.schema_mode.unwrap_or_default());
-        }
-        if let Some(rounds) = args.rounds {
-            spec = spec.with_rounds(rounds);
         }
         if let Some(target) = args.resume.clone() {
             spec = spec.with_resumes(target);
@@ -207,8 +189,7 @@ mod tests {
                         "type": "object",
                         "required": ["changed"],
                         "properties": { "changed": { "type": "integer" } }
-                    },
-                    "rounds": 3
+                    }
                 }),
                 &ctx,
             )
@@ -221,7 +202,6 @@ mod tests {
         assert_eq!(spec.parent, ctx.run);
         assert_eq!(spec.call, ctx.call);
         assert_eq!(spec.task, "把 a.txt 里的小数点都改成逗号");
-        assert_eq!(spec.rounds, 3);
         assert_eq!(spec.contract.as_ref().unwrap().mode, SchemaMode::Permissive);
         // 派出去这件事没有路径目标；恢复方式说得出来："核对子 Run 的终态"。
         assert!(plan.targets.is_empty());
@@ -229,7 +209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn without_a_schema_the_contract_is_absent_and_the_budget_is_the_default() {
+    async fn without_a_schema_the_contract_is_absent() {
         let dir = tempfile::tempdir().unwrap();
         let tool = DelegateTool::new();
         let plan = tool
@@ -242,10 +222,6 @@ mod tests {
         let Operation::Delegate { spec } = &plan.operation else {
             panic!()
         };
-        assert_eq!(
-            spec.rounds,
-            komo_kernel::types::delegate::DEFAULT_DELEGATE_ROUNDS
-        );
         assert!(spec.contract.is_none());
     }
 
@@ -276,18 +252,6 @@ mod tests {
         assert!(
             matches!(error, ToolError::InvalidArguments { .. }),
             "{error:?}"
-        );
-
-        let zero = DelegateTool::new()
-            .prepare(
-                serde_json::json!({ "task": "干活", "rounds": 0 }),
-                &context(dir.path()),
-            )
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(zero, ToolError::InvalidArguments { .. }),
-            "{zero:?}"
         );
     }
 

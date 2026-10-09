@@ -553,11 +553,7 @@ impl SegmentSource for GatewaySegments {
         };
 
         let budget = Budget {
-            max_rounds: match &delegate {
-                // 子代理的轮次预算是父侧派它时给的（§4），不是全局默认值。
-                Some(spec) => spec.rounds,
-                None => self.max_rounds_for(&record.source).await,
-            },
+            max_rounds: self.max_rounds_for(&record.source).await,
             max_tokens: None,
             first_round: rounds_so_far + 1,
             retry: RetryBudget {

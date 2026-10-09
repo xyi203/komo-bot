@@ -364,7 +364,8 @@ impl Surface {
     }
 
     /// 一轮里的多个结果并进**同一个**用户侧节点：provider 收到的是一条消息带几个
-    /// tool_result 块，不是几条连续的用户消息。
+    /// tool_result 块，不是几条连续的用户消息。只并进**同一个 Run** 的节点：子代理与父
+    /// 在同一份日志里交错，父的结果并进子代理的节点，回放按 Run 筛掉子代理时它就跟着丢了。
     ///
     /// 同一个调用的**后一条**结果（超时落了 `uncertain`，介入裁定后再补一条）顶替前一条、
     /// 留在原位：provider 那边一个 call_id 只能有一份输出，回放两份会被 400 拒掉。
@@ -382,6 +383,7 @@ impl Surface {
         }
         if self.last_role == Some(Role::Tool)
             && let Some(last) = self.messages.last_mut()
+            && last.run == event.run
         {
             last.tool_results.push(result);
             return;
@@ -703,6 +705,45 @@ mod tests {
             partial.extend(&events[split..]);
             assert_eq!(partial, whole, "切在 {split}");
         }
+    }
+
+    #[test]
+    fn a_result_does_not_merge_into_another_runs_tool_node() {
+        let result = |seq: u64, run: &str, call: &str| {
+            event(
+                seq,
+                Some(run),
+                EventPayload::ToolResult(ToolResult {
+                    call_id: ToolCallId::from_raw(call),
+                    attempt_id: AttemptId::from_raw(format!("attempt-{seq}")),
+                    status: ToolResultStatus::Completed,
+                    output_ref: output_ref("tool-output/x/output.json"),
+                    elapsed_ms: 0,
+                    preview: None,
+                    stdout: None,
+                    stderr: None,
+                    attempt_state: None,
+                }),
+            )
+        };
+        // 父 Run 派出子代理后等着；子代理最后一步是工具结果，紧接着父的那次调用落结果。
+        let mut events = conversation();
+        events.truncate(4);
+        events.extend([
+            accepted(5, "child", "子任务"),
+            assistant(6, "child", 1, "查一下"),
+            result(7, "child", "call-9"),
+            result(8, "run-1", "call-7"),
+        ]);
+
+        let surface = fold(&events);
+        let last = surface.messages.last().unwrap();
+        assert_eq!(last.run, Some(RunId::from_raw("run-1")));
+        assert_eq!(last.tool_results.len(), 1);
+        assert_eq!(last.tool_results[0].call, ToolCallId::from_raw("call-7"));
+        let child = &surface.messages[surface.messages.len() - 2];
+        assert_eq!(child.run, Some(RunId::from_raw("child")));
+        assert_eq!(child.tool_results.len(), 1, "子代理的节点不收父的结果");
     }
 
     #[test]

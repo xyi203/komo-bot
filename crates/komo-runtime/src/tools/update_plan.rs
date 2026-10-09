@@ -124,6 +124,7 @@ impl Tool for UpdatePlanTool {
             resources: vec![],
             // 没有副作用：started 而没有结果的那次，再收一次尾就是了，不必核对。
             recovery: RecoveryMode::SafeReread,
+            then_run: None,
         };
         // 计划要整份内联进 `tool.planned`：外置了，从日志折在线状态的那一步读不到它，
         // 等于这次更新没发生。参数上限之外再按账本真正比的那个长度兜一次底。

@@ -459,6 +459,7 @@ mod tests {
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: RecoveryMode::SafeReread,
+            then_run: None,
         };
         let encoded = serde_json::to_vec(&plan).unwrap().len();
         assert!(encoded <= INLINE_ARGUMENT_LIMIT_BYTES, "{encoded}");

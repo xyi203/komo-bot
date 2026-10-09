@@ -100,6 +100,7 @@ impl Tool for McpTool {
             } else {
                 RecoveryMode::NoSafeRecovery
             },
+            then_run: None,
         })
     }
 

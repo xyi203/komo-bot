@@ -116,6 +116,7 @@ impl Tool for DispatchTool {
             // 核对对象是我们自己的账本（幂等的请求键有没有对应的 Run），与 `delegate`
             // 同一类（§8.6 的"可以核对目标状态"）。
             recovery: RecoveryMode::VerifyTarget,
+            then_run: None,
         })
     }
 

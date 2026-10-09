@@ -266,6 +266,7 @@ impl Tool for PythonTool {
             versions,
             resources,
             recovery,
+            then_run: None,
         })
     }
 
@@ -561,6 +562,7 @@ fn verification_plan(
         versions: plan.versions.clone(),
         resources: plan.resources.clone(),
         recovery: RecoveryMode::SafeReread,
+        then_run: None,
     })
 }
 

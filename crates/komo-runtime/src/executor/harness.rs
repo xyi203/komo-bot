@@ -384,6 +384,7 @@ impl Tool for RecordingTool {
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: self.recovery.clone(),
+            then_run: None,
         })
     }
 

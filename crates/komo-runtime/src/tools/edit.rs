@@ -134,6 +134,7 @@ impl Tool for EditTool {
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: RecoveryMode::VerifyTarget,
+            then_run: None,
         })
     }
 

@@ -95,6 +95,7 @@ impl Tool for WriteTool {
             resources: vec![],
             // 写入的恢复靠核对内容哈希（§8.6）。
             recovery: RecoveryMode::VerifyTarget,
+            then_run: None,
         })
     }
 

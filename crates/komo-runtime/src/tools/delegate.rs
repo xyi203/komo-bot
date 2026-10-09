@@ -150,6 +150,7 @@ impl Tool for DelegateTool {
             // 子 Run 的终态就在我们自己的账本里，所以"重做安不安全"这件事有确定答案：
             // 核对目标状态（§8.6 的第二行），而不是重派一次。
             recovery: RecoveryMode::VerifyTarget,
+            then_run: None,
         })
     }
 

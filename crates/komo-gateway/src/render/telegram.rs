@@ -509,6 +509,7 @@ mod tests {
             versions: PlanVersions::default(),
             resources: Vec::new(),
             recovery: RecoveryMode::NoSafeRecovery,
+            then_run: None,
         }
     }
 

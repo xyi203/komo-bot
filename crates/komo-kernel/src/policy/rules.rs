@@ -332,27 +332,23 @@ impl RuleTable {
     }
 
     /// **同步纯函数**（§13.5）。梯子见模块文档。
+    ///
+    /// 带 `then_run` 的组合计划两步一起判，取最严的那个（[`super::composite`]）。
     pub fn decide(&self, plan: &ExecutionPlan, ctx: &PolicyContext<'_>) -> PolicyDecision {
-        // 0. 执行环境不可突破的限制。
-        if let Some(reason) = self.isolation_hardline(plan, ctx) {
-            return PolicyDecision::deny(reason);
+        if plan.then_run.is_some() {
+            return super::composite::decide(self, plan, ctx);
         }
 
-        // 1. 明确 Deny。全表扫描，且在授权之前——**Deny 不可被任何授权覆盖**。
-        if let Some(rule) = self.first_match(Effect::Deny, plan, ctx) {
-            return PolicyDecision::deny(format!("{}（规则 {}）", rule.reason, rule.id));
+        // 0–1. 执行环境不可突破的限制，然后明确 Deny。
+        if let Some(reason) = self.hard_deny(plan, ctx) {
+            return PolicyDecision::deny(reason);
         }
 
         // 1.5 `grant_proof` 的 Ask：同样排在授权检查之前，且不走 `offered_scopes`——
         // 已有的 Run / Cron 范围授权（不管它是不是碰巧盖住了这份计划）都不能替这一步
         // 作答，答复也只能是一次性的（§7.1「cron add」那一条）。
-        if let Some(rule) = self.rules.iter().find(|rule| {
-            rule.effect == Effect::Ask && rule.grant_proof && rule.matcher.matches(plan, ctx)
-        }) {
-            return PolicyDecision::Ask {
-                reason: format!("{}（规则 {}）", rule.reason, rule.id),
-                scopes: normalize_scopes(&rule.scopes),
-            };
+        if let Some(ask) = self.grant_proof_ask(plan, ctx) {
+            return ask;
         }
 
         // 2. 有效的范围授权。
@@ -360,20 +356,56 @@ impl RuleTable {
             return PolicyDecision::allow(format!("已有授权 {}：{}", grant.id, grant.reason));
         }
 
-        // 3. 配置 Allow。
+        // 3–5. 配置 Allow、配置 Ask、默认。
+        self.configured(plan, ctx)
+    }
+
+    /// 梯子的 0 与 1：执行环境不可突破的限制，然后明确 Deny。Deny 是全表扫描，且在
+    /// 授权之前——**Deny 不可被任何授权覆盖**。
+    pub(super) fn hard_deny(
+        &self,
+        plan: &ExecutionPlan,
+        ctx: &PolicyContext<'_>,
+    ) -> Option<String> {
+        if let Some(reason) = self.isolation_hardline(plan, ctx) {
+            return Some(reason);
+        }
+        self.first_match(Effect::Deny, plan, ctx)
+            .map(|rule| format!("{}（规则 {}）", rule.reason, rule.id))
+    }
+
+    /// 命中的 `grant_proof` Ask：任何授权都盖不住它，只能一次性地问。
+    pub(super) fn grant_proof_ask(
+        &self,
+        plan: &ExecutionPlan,
+        ctx: &PolicyContext<'_>,
+    ) -> Option<PolicyDecision> {
+        self.rules
+            .iter()
+            .find(|rule| {
+                rule.effect == Effect::Ask && rule.grant_proof && rule.matcher.matches(plan, ctx)
+            })
+            .map(|rule| PolicyDecision::Ask {
+                reason: format!("{}（规则 {}）", rule.reason, rule.id),
+                scopes: normalize_scopes(&rule.scopes),
+            })
+    }
+
+    /// 梯子的 3–5：没有授权作答时，配置 Allow → 配置 Ask → 默认。
+    pub(super) fn configured(
+        &self,
+        plan: &ExecutionPlan,
+        ctx: &PolicyContext<'_>,
+    ) -> PolicyDecision {
         if let Some(rule) = self.first_match(Effect::Allow, plan, ctx) {
             return PolicyDecision::allow(format!("{}（规则 {}）", rule.reason, rule.id));
         }
-
-        // 4. 配置 Ask。
         if let Some(rule) = self.first_match(Effect::Ask, plan, ctx) {
             return PolicyDecision::Ask {
                 reason: format!("{}（规则 {}）", rule.reason, rule.id),
                 scopes: offered_scopes(&rule.scopes, plan),
             };
         }
-
-        // 5. 默认。
         match self.default {
             Effect::Allow => PolicyDecision::allow("默认 Allow"),
             Effect::Ask => PolicyDecision::ask("默认 Ask：没有规则覆盖这个操作"),

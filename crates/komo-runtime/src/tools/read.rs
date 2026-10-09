@@ -137,6 +137,7 @@ impl Tool for ReadTool {
             // 普通文件读取可以安全重做；重做时记的是**这次**读到的内容和时间，
             // 不冒充重启前的观察（§8.6）。
             recovery: RecoveryMode::SafeReread,
+            then_run: None,
         })
     }
 

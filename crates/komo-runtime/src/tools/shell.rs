@@ -90,6 +90,7 @@ pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPla
         },
         resources: vec![],
         recovery: RecoveryMode::NoSafeRecovery,
+        then_run: None,
     }
 }
 

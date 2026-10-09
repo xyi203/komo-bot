@@ -16,6 +16,7 @@
 //! **Deny 不可被任何授权覆盖**：Deny 规则是全表扫描，先于授权判定，且没有任何一条
 //! 路径能在它之后把结论改回 Allow。
 
+mod composite;
 mod defaults;
 mod grants;
 mod rules;

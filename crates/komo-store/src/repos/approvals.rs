@@ -648,6 +648,7 @@ mod tests {
             versions: Default::default(),
             resources: vec![],
             recovery: RecoveryMode::NoSafeRecovery,
+            then_run: None,
         }
     }
 

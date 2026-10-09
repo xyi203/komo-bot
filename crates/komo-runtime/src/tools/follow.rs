@@ -102,6 +102,7 @@ impl Tool for FollowTool {
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: RecoveryMode::VerifyTarget,
+            then_run: None,
         })
     }
 

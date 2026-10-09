@@ -517,6 +517,7 @@ async fn plan_of(
         // 装一份代码是个可核对的动作：目标要么已经是这一版，要么还是上一版。核对由
         // `Toolbox::enable` 自己的版本对账做，所以这里是"可以核对目标状态"。
         recovery: RecoveryMode::VerifyTarget,
+        then_run: None,
     })
 }
 

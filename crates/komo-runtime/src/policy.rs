@@ -122,6 +122,11 @@ impl PolicyEngine {
     /// approval / grant 的 [`Proof`](komo_kernel::types::plan::Proof)，所以这里再找
     /// 一次。顺序上它永远在 `decide` **之后**被问：Deny 在梯子上高于授权，先判决就
     /// 不存在"拿着授权绕过 Deny"的路径。
+    ///
+    /// 组合计划（带 `then_run`）上只认**整份计划**都盖得住的那条：绑定组合哈希的一次性
+    /// 授权，或每一步都自己盖得住的范围授权（`Grant::covers`）。两步各凭各的授权或配置
+    /// Allow 放行时没有这样一条，答 `None`——只盖住一步的授权拿去按整份计划消费，
+    /// 必然对不上。
     pub fn covering_grant<'a>(
         &self,
         plan: &ExecutionPlan,
@@ -174,6 +179,7 @@ mod tests {
     use super::*;
     use komo_kernel::policy::{Effect, Matcher, OperationMatch, PathMatch, PolicyRule};
     use komo_kernel::test_support::{MemApprovalRepo, TestClock, block_on};
+    use komo_kernel::types::chat::ApprovalScope;
     use komo_kernel::types::ids::{
         ApprovalId, CronJobId, GrantId, OperationId, RunId, SessionId, ToolCallId,
     };
@@ -198,6 +204,7 @@ mod tests {
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: RecoveryMode::NoSafeRecovery,
+            then_run: None,
         }
     }
 
@@ -271,6 +278,72 @@ mod tests {
         assert_eq!(
             engine.covering_grant(&p, &env).map(|g| g.id.as_str()),
             Some("g-1")
+        );
+    }
+
+    #[test]
+    fn a_composite_names_only_a_grant_that_covers_the_whole_plan() {
+        let now = TestClock::fixed().now();
+        let command = plan(
+            Operation::ShellCommand {
+                command: "cargo test".into(),
+            },
+            vec![],
+        );
+        let mut composite = plan(
+            Operation::WriteFile,
+            vec![PlanTarget::local("/ws/a.rs", TargetAccess::Write)],
+        );
+        composite.tool = "edit".into();
+        composite.then_run = Some(Box::new(command.clone()));
+
+        let grant = |id: &str, scope| Grant {
+            id: GrantId::from_raw(id),
+            approval: ApprovalId::from_raw("ap-1"),
+            scope,
+            granted_at: now,
+            valid_until: None,
+            consumed: false,
+            reason: "操作者批准".into(),
+        };
+        let roots = roots();
+        let engine = PolicyEngine::initial();
+
+        // 改动在根里（配置 Allow）、命令凭 Run 授权：放行，但没有哪一条授权代表整份计划。
+        let run_grant = grant(
+            "g-run",
+            komo_kernel::policy::scope_for(&command, ApprovalScope::Run).unwrap(),
+        );
+        let grants = vec![run_grant];
+        let env = DecisionEnv {
+            grants: &grants,
+            principal: None,
+            roots: &roots,
+            now,
+        };
+        assert!(engine.decide(&composite, &env).is_allow());
+        assert!(engine.covering_grant(&composite, &env).is_none());
+
+        // 绑定组合哈希的一次性授权就是那一条。
+        let grants = vec![grant(
+            "g-once",
+            komo_kernel::policy::GrantScope::Once {
+                plan_hash: composite.plan_hash(),
+                call: None,
+            },
+        )];
+        let env = DecisionEnv {
+            grants: &grants,
+            principal: None,
+            roots: &roots,
+            now,
+        };
+        assert!(engine.decide(&composite, &env).is_allow());
+        assert_eq!(
+            engine
+                .covering_grant(&composite, &env)
+                .map(|g| g.id.as_str()),
+            Some("g-once")
         );
     }
 

@@ -348,6 +348,7 @@ mod tests {
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: RecoveryMode::SafeReread,
+            then_run: None,
         }
     }
 

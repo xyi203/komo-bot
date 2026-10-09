@@ -2221,6 +2221,7 @@ impl Tool for Probe {
             resources: vec![],
             // 读取可以安全重做：超时是失败，不是"结果不明"。
             recovery: RecoveryMode::SafeReread,
+            then_run: None,
         })
     }
 
@@ -2729,6 +2730,7 @@ fn plan_touching(paths: &[PathBuf], operation: Operation) -> ExecutionPlan {
         versions: PlanVersions::default(),
         resources: vec![],
         recovery: RecoveryMode::SafeReread,
+        then_run: None,
     }
 }
 

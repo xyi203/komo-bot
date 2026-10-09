@@ -330,6 +330,26 @@ pub struct ExecutionPlan {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub resources: Vec<ResourceRef>,
     pub recovery: RecoveryMode,
+    /// 文件改动之后紧接着跑的那条命令（`edit` / `write` 的 `then_run`）。
+    ///
+    /// 两步**一起**过 Policy、一起审批：判决取两步里最严的那个，审批绑定的哈希就是这份
+    /// 计划的哈希，因而盖住两步（§7.1、§7.2）。只许一层、只能是 shell 命令——见
+    /// [`ExecutionPlan::validate_steps`]。没有它时不序列化，旧计划的哈希逐字不变。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then_run: Option<Box<ExecutionPlan>>,
+}
+
+/// 组合计划的形状不对（[`ExecutionPlan::validate_steps`]）。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum StepsError {
+    #[error("then_run 只许一层：它自己不能再带 then_run")]
+    Nested,
+    #[error("then_run 只能是一条 shell 命令")]
+    NotAShellCommand,
+    /// 第二步的来源、Run 或 ToolCall 与第一步不同：范围授权按这几样匹配，第二步换一个
+    /// Run 就能借到别的 Run 里的授权。
+    #[error("then_run 必须与改动同一来源、同一 Run、同一 ToolCall")]
+    ForeignContext,
 }
 
 impl ExecutionPlan {
@@ -346,6 +366,30 @@ impl ExecutionPlan {
     /// 计划触及的真实路径（虚拟入口没有路径，不在其中）。
     pub fn paths(&self) -> impl Iterator<Item = &std::path::Path> {
         self.targets.iter().filter_map(|target| target.path())
+    }
+
+    /// 这份计划的各步：自己，然后是 `then_run`（只有一层）。
+    pub fn steps(&self) -> impl Iterator<Item = &ExecutionPlan> {
+        std::iter::once(self).chain(self.then_run.as_deref())
+    }
+
+    /// 组合计划的形状：`then_run` 只许一层、只能是 shell 命令、与改动同一来源 / Run /
+    /// ToolCall。工具在 `prepare` 里调它；Policy 也调——形状不对的组合计划一律 Deny，
+    /// 不指望每个工具都记得。
+    pub fn validate_steps(&self) -> Result<(), StepsError> {
+        let Some(next) = self.then_run.as_deref() else {
+            return Ok(());
+        };
+        if next.then_run.is_some() {
+            return Err(StepsError::Nested);
+        }
+        if !matches!(next.operation, Operation::ShellCommand { .. }) {
+            return Err(StepsError::NotAShellCommand);
+        }
+        if next.source != self.source || next.run != self.run || next.tool_call != self.tool_call {
+            return Err(StepsError::ForeignContext);
+        }
+        Ok(())
     }
 }
 
@@ -379,6 +423,17 @@ impl ExecutionPlan {
 /// }
 /// ```
 ///
+/// 组合计划的第二步（`then_run`）也只能从同一份凭据里换出来，即
+/// [`ApprovedPlan::then_run`]。`Proof` 不能复制，所以拿一份批过的计划的凭据去配一个
+/// 自己拼的第二步，写不出来：
+///
+/// ```compile_fail
+/// # use komo_kernel::types::{ApprovedPlan, ExecutionPlan};
+/// fn forge(approved: &ApprovedPlan, step: ExecutionPlan) -> ApprovedPlan {
+///     ApprovedPlan::new(step, approved.proof().clone())
+/// }
+/// ```
+///
 /// 唯一合法的两条路都在 kernel 里换：
 ///
 /// ```
@@ -387,7 +442,10 @@ impl ExecutionPlan {
 /// assert!(PolicyDecision::ask("需要人看一眼").into_proof().is_none());
 /// assert!(PolicyDecision::deny("命中禁用规则").into_proof().is_none());
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// **不实现 `Clone`**：一份凭据只配一份计划（组合计划的第二步由 kernel 照着第一步的
+/// 凭据另造一份，见 [`ApprovedPlan::then_run`]）。
+#[derive(Debug, PartialEq, Eq)]
 pub struct Proof(ProofKind);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,7 +532,7 @@ impl ConsumedApproval {
 
 /// 允许执行的计划。`Tool::execute` 只接受它（§4），所以「没有经过 Policy 或审批就
 /// 执行」在类型上就写不出来。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ApprovedPlan {
     plan: ExecutionPlan,
     proof: Proof,
@@ -493,8 +551,13 @@ impl ApprovedPlan {
         &self.proof
     }
 
-    pub fn into_parts(self) -> (ExecutionPlan, Proof) {
-        (self.plan, self.proof)
+    /// 组合计划的第二步，带着**同一份**凭据：Policy / 审批判的是整份组合计划，两步
+    /// 共用一个结论。这是 kernel 之外拿到第二步 `ApprovedPlan` 的唯一办法。
+    pub fn then_run(&self) -> Option<ApprovedPlan> {
+        self.plan.then_run.as_deref().map(|step| ApprovedPlan {
+            plan: step.clone(),
+            proof: Proof(self.proof.0.clone()),
+        })
     }
 }
 
@@ -535,7 +598,110 @@ mod tests {
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: RecoveryMode::VerifyTarget,
+            then_run: None,
         }
+    }
+
+    fn fused(command: &str) -> ExecutionPlan {
+        let mut step = plan();
+        step.tool = "shell".into();
+        step.operation = Operation::ShellCommand {
+            command: command.into(),
+        };
+        step.args = serde_json::json!({ "command": command });
+        step.targets = vec![];
+        ExecutionPlan {
+            then_run: Some(Box::new(step)),
+            ..plan()
+        }
+    }
+
+    /// 这份计划在 `then_run` 出现之前序列化成的样子——`approval_requests.plan` 里存的
+    /// 就是这种行。
+    const OLD_ROW: &str = r#"{"args":{"content":"hi","path":"a.txt"},"cwd":"/tmp/ws","operation":{"kind":"write_file"},"operation_id":"op-1","recovery":{"kind":"verify_target"},"run":"run-1","source":{"kind":"interactive","session":"sess-1"},"targets":[{"access":"write","path":"/tmp/ws/a.txt"}],"tool":"write","tool_call":"call-7","versions":{}}"#;
+
+    #[test]
+    fn a_plan_without_then_run_hashes_exactly_as_before() {
+        assert_eq!(
+            plan().plan_hash().as_str(),
+            "b70f7d86d16c050098cc34320cb5493959931536b31366d746996e521f63aa96"
+        );
+        let canonical = serde_json::to_value(plan()).unwrap();
+        assert_eq!(serde_json::to_string(&canonical).unwrap(), OLD_ROW);
+    }
+
+    #[test]
+    fn an_old_stored_plan_reads_back_without_then_run() {
+        let read: ExecutionPlan = serde_json::from_str(OLD_ROW).unwrap();
+        assert_eq!(read.then_run, None);
+        assert_eq!(read, plan());
+    }
+
+    #[test]
+    fn the_composite_hash_covers_the_command() {
+        let a = fused("cargo test");
+        assert_ne!(a.plan_hash(), plan().plan_hash());
+        assert_ne!(a.plan_hash(), fused("cargo test --release").plan_hash());
+        assert_eq!(a.plan_hash(), fused("cargo test").plan_hash());
+    }
+
+    #[test]
+    fn steps_are_the_plan_then_its_then_run() {
+        let single = plan();
+        assert_eq!(single.steps().count(), 1);
+
+        let composite = fused("cargo test");
+        let tools: Vec<&str> = composite.steps().map(|step| step.tool.as_str()).collect();
+        assert_eq!(tools, ["write", "shell"]);
+        assert_eq!(composite.validate_steps(), Ok(()));
+    }
+
+    #[test]
+    fn then_run_is_one_shell_command_in_the_same_call() {
+        let mut nested = fused("cargo test");
+        nested.then_run.as_mut().unwrap().then_run = Some(Box::new(plan()));
+        assert_eq!(nested.validate_steps(), Err(StepsError::Nested));
+
+        let not_shell = ExecutionPlan {
+            then_run: Some(Box::new(plan())),
+            ..plan()
+        };
+        assert_eq!(
+            not_shell.validate_steps(),
+            Err(StepsError::NotAShellCommand)
+        );
+
+        let changes: [fn(&mut ExecutionPlan); 3] = [
+            |step| step.run = Some(RunId::from_raw("run-2")),
+            |step| step.tool_call = None,
+            |step| step.source = PlanSource::Memory { session: None },
+        ];
+        for change in changes {
+            let mut foreign = fused("cargo test");
+            change(foreign.then_run.as_mut().unwrap());
+            assert_eq!(foreign.validate_steps(), Err(StepsError::ForeignContext));
+        }
+    }
+
+    #[test]
+    fn the_second_step_carries_the_same_proof() {
+        assert!(
+            ApprovedPlan::new(plan(), Proof::policy_allow())
+                .then_run()
+                .is_none()
+        );
+
+        let composite = fused("cargo test");
+        let consumed =
+            ConsumedApproval::new(ApprovalId::from_raw("ap-1"), None, composite.plan_hash());
+        let approved = ApprovedPlan::new(composite.clone(), consumed.into_proof());
+        let second = approved.then_run().expect("有第二步");
+        assert_eq!(second.plan(), composite.then_run.as_deref().unwrap());
+        assert_eq!(second.proof(), approved.proof());
+        assert_eq!(
+            second.proof().approval_id().map(|a| a.as_str()),
+            Some("ap-1")
+        );
     }
 
     #[test]

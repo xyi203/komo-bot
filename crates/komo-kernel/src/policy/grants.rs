@@ -70,29 +70,47 @@ impl Grant {
     ///
     /// 三个范围的共同要求：没过期。各自的要求：
     ///
-    /// - `Once`：计划哈希逐字相同，且**还没被消费**。计划变了一个字节就不是它了。
+    /// - `Once`：计划哈希逐字相同，且**还没被消费**。计划变了一个字节就不是它了——
+    ///   组合计划的哈希含 `then_run`，所以换一条命令也不是它了。
     /// - `Run`：同一个 Run、匹配器命中、绑定的版本全部对得上。
     /// - `CronJob`：同一个 Job 的**同一个版本**——Job 改了，旧授权失效（§10）。
+    ///
+    /// 组合计划（带 `then_run`）上，范围授权要**每一步都**自己盖得住才算覆盖整份计划；
+    /// 只盖住一步的那条由 Policy 逐步判时用（[`Grant::covers_step`]），不能替另一步作答。
     pub fn covers(&self, plan: &ExecutionPlan, now: OffsetDateTime) -> bool {
-        if !self.is_valid_at(now) {
-            return false;
-        }
         match &self.scope {
             GrantScope::Once { plan_hash, call } => {
-                !self.consumed
+                self.is_valid_at(now)
+                    && !self.consumed
                     && *plan_hash == plan.plan_hash()
                     && call
                         .as_ref()
                         .is_none_or(|c| plan.tool_call.as_ref() == Some(c))
             }
+            GrantScope::Run { .. } | GrantScope::CronJob { .. } => {
+                plan.steps().all(|step| self.covers_step(step, now))
+            }
+        }
+    }
+
+    /// 这条**范围**授权盖不盖得住组合计划里的这一步（`then_run` 不看）。
+    ///
+    /// 一次性授权从不按步匹配：它绑的是整份计划的哈希，而只盖住一步的一次性授权在
+    /// 执行侧找不到可以消费它的那一份计划——一次性就不再是一次性了。
+    pub(crate) fn covers_step(&self, step: &ExecutionPlan, now: OffsetDateTime) -> bool {
+        if !self.is_valid_at(now) {
+            return false;
+        }
+        match &self.scope {
+            GrantScope::Once { .. } => false,
             GrantScope::Run {
                 run,
                 matcher,
                 versions,
             } => {
-                plan.run.as_ref() == Some(run)
-                    && versions_cover(versions, &plan.versions)
-                    && matcher.matches_scope(plan)
+                step.run.as_ref() == Some(run)
+                    && versions_cover(versions, &step.versions)
+                    && matcher.matches_scope(step)
             }
             GrantScope::CronJob {
                 job,
@@ -101,10 +119,10 @@ impl Grant {
                 versions,
             } => {
                 matches!(
-                    &plan.source,
+                    &step.source,
                     PlanSource::Cron { job: j, job_version: v } if j == job && v == job_version
-                ) && versions_cover(versions, &plan.versions)
-                    && matcher.matches_scope(plan)
+                ) && versions_cover(versions, &step.versions)
+                    && matcher.matches_scope(step)
             }
         }
     }
@@ -122,12 +140,17 @@ impl Grant {
 ///    ——改定义就失效（§10）。
 ///
 /// 答 `None` = 这份计划落不成这个范围：`Once` 本来就不需要一条授权（审批自己按哈希
-/// 绑定），而一个既没有 Run 也不是 Cron 的计划没有范围可言。
+/// 绑定），而一个既没有 Run 也不是 Cron 的计划没有范围可言。组合计划（带 `then_run`）
+/// 也落不成任何范围：把"改完跑这条命令"批到一个范围，等于替以后每一次改动预签了命令。
 pub fn scope_for(
     plan: &ExecutionPlan,
     scope: crate::types::chat::ApprovalScope,
 ) -> Option<GrantScope> {
     use crate::types::chat::ApprovalScope;
+
+    if plan.then_run.is_some() {
+        return None;
+    }
 
     let matcher = matcher_for(plan);
     let versions = plan.versions.clone();
@@ -222,6 +245,7 @@ mod tests {
             versions: PlanVersions::default(),
             resources: vec![],
             recovery: RecoveryMode::NoSafeRecovery,
+            then_run: None,
         }
     }
 

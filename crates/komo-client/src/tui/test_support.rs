@@ -204,6 +204,7 @@ pub fn plan() -> ExecutionPlan {
         },
         resources: vec![],
         recovery: RecoveryMode::NoSafeRecovery,
+        then_run: None,
     }
 }
 

@@ -85,6 +85,7 @@ impl Tool for CodemodeTool {
             resources: vec![],
             // 里面只有只读调用：中断后整段重跑与重读同理（docs/codemode.md §7）。
             recovery: RecoveryMode::SafeReread,
+            then_run: None,
         })
     }
 

@@ -47,7 +47,7 @@ use komo_kernel::fold::fold;
 use komo_kernel::policy::PolicyDecision;
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project};
 use komo_kernel::traits::{
-    Clock, Ledger, LedgerError, RepoError, SpawnError, StoreError, TaskSpawner, Tool,
+    Clock, Ledger, LedgerError, OutputWriter, RepoError, SpawnError, StoreError, TaskSpawner, Tool,
     ToolOutputStore,
 };
 use komo_kernel::types::chat::Principal;
@@ -62,7 +62,9 @@ use komo_kernel::types::plan::{
     ApprovedPlan, ConsumeIntent, EnvVersion, ExecutionPlan, Operation, PlanSource, Proof,
     RecoveryMode, Verification,
 };
-use komo_kernel::types::refs::{AttemptRef, ToolResultBody, ToolResultStatus};
+use komo_kernel::types::refs::{
+    AttemptRef, ContentRef, PublishedOutput, ToolResultBody, ToolResultStatus,
+};
 use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::status::{RunEnd, RunState, ToolCallState};
 use komo_kernel::types::surface::AgentSurface;
@@ -553,21 +555,29 @@ impl ToolExecutor {
                     // 目标已满足**不等于**又做了一次：报告核对结论，不重跑。
                     let summary =
                         format!("核对后目标已满足，未重新执行：{}", evidence_of(&verdict));
-                    self.settle_verified(
-                        request,
-                        env,
-                        state.previous_attempt.as_ref(),
-                        ToolResultStatus::Completed,
-                        &verdict,
-                        &summary,
-                    )
-                    .await?;
-                    return Ok(Begin::Settled(CallSettlement::Result(ToolResultForModel {
-                        provider_call_id: request.provider_call_id.clone(),
-                        call_id: request.call.clone(),
-                        content: summary,
-                        is_error: false,
-                    })));
+                    let recorded = self
+                        .settle_verified(
+                            request,
+                            env,
+                            state.previous_attempt.as_ref(),
+                            ToolResultStatus::Completed,
+                            &verdict,
+                            &summary,
+                        )
+                        .await?;
+                    // 没有上一世那次尝试就没有落盘的结论可投影：账本自相矛盾，交给人。
+                    let Some(recorded) = recorded else {
+                        return Ok(Begin::Settled(self.attention(
+                            request,
+                            format!(
+                                "调用 {} 核对后目标已满足，但账上没有承载它的那次尝试",
+                                request.call
+                            ),
+                        )));
+                    };
+                    return Ok(Begin::Settled(CallSettlement::Result(for_model(
+                        request, env, &recorded,
+                    ))));
                 }
                 // 冲突 / 不出结论 / 没有核对方式：**副作用发生没发生不知道**。那条
                 // 上一世的 `tool.started` 要配一条明确的 uncertain，然后交给人。
@@ -716,35 +726,19 @@ impl ToolExecutor {
             Some(Ok(result)) => result,
         };
 
-        let body = result_body(&outcome);
-        let status = body.status;
-        // 工具写给模型看的那段正文：随结果一起落进 `output.json`，事件里只留它的前 1 KiB。
-        let text = body.preview.clone();
-        // 这一次产出的文件（`output.json` 里那一格）：投影要拿它给模型印 `artifact://files/…`
-        // 的入口。**借出去之后再 publish**，所以这里留一份（几个引用，不是正文）。
-        let artifacts = body.artifacts.clone();
+        let mut recorded = self.publish(writer, result_body(&outcome)).await?;
+        recorded.published.elapsed_ms = elapsed_ms;
+        self.ledger
+            .finish_call(&attempt, recorded.published.clone())
+            .await?;
+        let result = for_model(&request, env, &recorded);
+        let published = &recorded.published;
         // §48 的 `artifact_bytes`：这次尝试额外产生的产物。
-        let artifact_bytes: u64 = artifacts.iter().map(|artifact| artifact.size).sum();
-        let mut published = self.outputs.publish(writer, body).await?;
-        published.elapsed_ms = elapsed_ms;
-        self.ledger.finish_call(&attempt, published.clone()).await?;
-
-        let facts = ToolResultFacts {
-            tool: &request.tool,
-            status,
-            elapsed_ms,
-            text: text.as_deref(),
-            output: &published.output,
-            stdout: published.stdout.as_ref(),
-            stderr: published.stderr.as_ref(),
-            artifacts: &artifacts,
-        };
-        let content = project(
-            &facts,
-            &ProjectionContext {
-                model_result_bytes: env.model_result_bytes,
-            },
-        );
+        let artifact_bytes: u64 = recorded
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.size)
+            .sum();
 
         // §47 / §48：这一份观察落了多少字节、投影给模型多少。**只进 trace，不进事件流**
         // ——它每轮都要算，而账本里那条事实只该有一条（§8.3）。投影比与 recall 次数是
@@ -752,9 +746,9 @@ impl ToolExecutor {
         tracing::debug!(
             target: "komo::observation",
             tool = %request.tool,
-            tool_output_bytes = stored_bytes(&published),
+            tool_output_bytes = stored_bytes(published),
             artifact_bytes,
-            projected_bytes = content.len(),
+            projected_bytes = result.content.len(),
             "observation.projected"
         );
         // §48 的 `observation_recall_count`：这一次读取读的是**我们自己落盘的观察**。
@@ -766,13 +760,6 @@ impl ToolExecutor {
                 "observation.recalled"
             );
         }
-        let result = ToolResultForModel {
-            provider_call_id: request.provider_call_id.clone(),
-            call_id: request.call.clone(),
-            content,
-            is_error: status != ToolResultStatus::Completed,
-        };
-
         match &outcome {
             Err(ToolError::Cancelled) => Ok(CallSettlement::Stopped {
                 stop: RoundStop::Cancelled,
@@ -1048,24 +1035,18 @@ impl ToolExecutor {
             ));
         };
 
-        let (body, content) = child_result(spec, child, &end);
-        let is_error = body.status != ToolResultStatus::Completed;
-        self.settle_attempt(
-            AttemptRef {
-                session: env.session.clone(),
-                run: env.run.clone(),
-                call: request.call.clone(),
-                attempt,
-            },
-            body,
-        )
-        .await?;
-        Ok(CallSettlement::Result(ToolResultForModel {
-            provider_call_id: request.provider_call_id.clone(),
-            call_id: request.call.clone(),
-            content,
-            is_error,
-        }))
+        let recorded = self
+            .settle_attempt(
+                AttemptRef {
+                    session: env.session.clone(),
+                    run: env.run.clone(),
+                    call: request.call.clone(),
+                    attempt,
+                },
+                child_result(spec, child, &end),
+            )
+            .await?;
+        Ok(CallSettlement::Result(for_model(request, env, &recorded)))
     }
 
     /// 一次 `dispatch` 的编排（`docs/background-tasks.md`）。
@@ -1328,24 +1309,20 @@ impl ToolExecutor {
             error: is_error.then(|| content.clone()),
             exit_code: None,
             artifacts: vec![],
-            preview: Some(content.clone()),
+            preview: Some(content),
         };
-        self.settle_attempt(
-            AttemptRef {
-                session: env.session.clone(),
-                run: env.run.clone(),
-                call: request.call.clone(),
-                attempt,
-            },
-            body,
-        )
-        .await?;
-        Ok(CallSettlement::Result(ToolResultForModel {
-            provider_call_id: request.provider_call_id.clone(),
-            call_id: request.call.clone(),
-            content,
-            is_error,
-        }))
+        let recorded = self
+            .settle_attempt(
+                AttemptRef {
+                    session: env.session.clone(),
+                    run: env.run.clone(),
+                    call: request.call.clone(),
+                    attempt,
+                },
+                body,
+            )
+            .await?;
+        Ok(CallSettlement::Result(for_model(request, env, &recorded)))
     }
 
     /// §7.5：**操作者**对一次「结果不明」的调用下的结论，落到那次尝试上。
@@ -1403,9 +1380,9 @@ impl ToolExecutor {
         status: ToolResultStatus,
         verdict: &Verification,
         summary: &str,
-    ) -> Result<(), ExecError> {
+    ) -> Result<Option<Recorded>, ExecError> {
         let Some(previous) = previous else {
-            return Ok(());
+            return Ok(None);
         };
         let attempt_ref = AttemptRef {
             session: env.session.clone(),
@@ -1422,7 +1399,7 @@ impl ToolExecutor {
             // 核对结论也是"工具结果"：事件里那 1 KiB 就取它。
             preview: Some(summary.to_string()),
         };
-        self.settle_attempt(attempt_ref, body).await
+        self.settle_attempt(attempt_ref, body).await.map(Some)
     }
 
     /// 把一条结果落到**指定的那次尝试**上：发布输出 → 追加 `tool.result`。
@@ -1430,18 +1407,36 @@ impl ToolExecutor {
     /// 三条路共用它，因为它们做的是同一件事——给某一世的尝试写下结论：工具自带核对函数的
     /// 结论（§8.6）、操作者在清单上按的键（§7.5）、子 Run 的终态回到父侧那次调用上（§4）。
     ///
-    /// `elapsed_ms` 一律留 0：那次跑了多久**我们不知道**，0 读作未知而不是"瞬间"。
+    /// `elapsed_ms` 不是那次执行跑了多久（**我们不知道**），是输出存储从 `begin` 到
+    /// `publish` 量到的那一段——账本里记的就是它，投影也只认它。
     async fn settle_attempt(
         &self,
         attempt_ref: AttemptRef,
         body: ToolResultBody,
-    ) -> Result<(), ExecError> {
+    ) -> Result<Recorded, ExecError> {
         let writer = self.outputs.begin(&attempt_ref).await?;
-        let published = self.outputs.publish(writer, body).await?;
+        let recorded = self.publish(writer, body).await?;
         self.ledger
-            .finish_call(&attempt_ref.attempt, published)
+            .finish_call(&attempt_ref.attempt, recorded.published.clone())
             .await?;
-        Ok(())
+        Ok(recorded)
+    }
+
+    /// 发布一份结果，留下投影要的那几格：工具正文与产物在 `output.json` 里，引用、大小与
+    /// 耗时在账本那条 `tool.result` 里（[`Recorded`]）。
+    async fn publish(
+        &self,
+        writer: Box<dyn OutputWriter>,
+        body: ToolResultBody,
+    ) -> Result<Recorded, ExecError> {
+        let text = body.preview.clone();
+        let artifacts = body.artifacts.clone();
+        let published = self.outputs.publish(writer, body).await?;
+        Ok(Recorded {
+            published,
+            text,
+            artifacts,
+        })
     }
 
     /// 一次**没有执行**的调用的结论：工具名不认识、参数准备不出来、放行被拒、子代理不能
@@ -1469,19 +1464,18 @@ impl ToolExecutor {
             error: Some(message.clone()),
             exit_code: None,
             artifacts: vec![],
-            preview: Some(message.clone()),
+            preview: Some(message),
         };
         let writer = self.outputs.begin(&attempt_ref).await?;
-        let published = self.outputs.publish(writer, body).await?;
+        let recorded = self.publish(writer, body).await?;
         self.ledger
-            .fail_call(&request.call, &attempt_ref.attempt, published)
+            .fail_call(
+                &request.call,
+                &attempt_ref.attempt,
+                recorded.published.clone(),
+            )
             .await?;
-        Ok(CallSettlement::Result(ToolResultForModel {
-            provider_call_id: request.provider_call_id.clone(),
-            call_id: request.call.clone(),
-            content: message,
-            is_error: true,
-        }))
+        Ok(CallSettlement::Result(for_model(request, env, &recorded)))
     }
 
     /// 放行梯子。Deny 分支里**没有任何一次 `consume`**。
@@ -1704,6 +1698,42 @@ enum CallSettlement {
     },
 }
 
+/// 一次结果落盘之后，投影要的全部事实：账本那条 `tool.result` 的元信息，加上
+/// `output.json` 里的工具正文与产物。回放从同样这几处读回来（§8.3）。
+struct Recorded {
+    published: PublishedOutput,
+    text: Option<String>,
+    artifacts: Vec<ContentRef>,
+}
+
+/// 交给模型的那一份：**每条结果都从这里过**，与回放（`komo-agent` 的
+/// `to_replay_messages`）调同一个 [`project`]、喂同样的事实，所以刚跑完与重启之后回放
+/// 逐字节相同（§8.3）。工具名取 `request.tool`——它就是落盘的那条 `tool_calls[].name`。
+fn for_model(request: &CallRequest, env: &CallEnv, recorded: &Recorded) -> ToolResultForModel {
+    let published = &recorded.published;
+    let facts = ToolResultFacts {
+        tool: &request.tool,
+        status: published.status,
+        elapsed_ms: published.elapsed_ms,
+        text: recorded.text.as_deref(),
+        output: &published.output,
+        stdout: published.stdout.as_ref(),
+        stderr: published.stderr.as_ref(),
+        artifacts: &recorded.artifacts,
+    };
+    ToolResultForModel {
+        provider_call_id: request.provider_call_id.clone(),
+        call_id: request.call.clone(),
+        content: project(
+            &facts,
+            &ProjectionContext {
+                model_result_bytes: env.model_result_bytes,
+            },
+        ),
+        is_error: published.status != ToolResultStatus::Completed,
+    }
+}
+
 enum Authorization {
     Proceed {
         proof: Proof,
@@ -1894,7 +1924,7 @@ fn evidence_of(verdict: &Verification) -> &str {
 /// 三条结论都要带上"哪条子 Run、它怎么结束的"：父侧的模型只看得见这条工具结果，而它随时
 /// 可以去 `read` 那条 Run 的完整过程——**复验用的是父侧手里那份契约，过程由只读接口去取**
 /// （§8.6）。
-fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> (ToolResultBody, String) {
+fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> ToolResultBody {
     let (body, content) = match end {
         RunEnd::Completed { final_message, .. } => {
             let text = final_message.as_deref().unwrap_or_default();
@@ -1942,12 +1972,11 @@ fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> (ToolResult
         RunEnd::Completed { .. } | RunEnd::Failed { .. } => {
             let hint =
                 format!("\n\n还要接着这件事，再调一次 delegate 并带上 resume: \"{child}\"。");
-            let content = format!("{content}{hint}");
             let mut body = body;
-            body.preview = Some(content.clone());
-            (body, content)
+            body.preview = Some(format!("{content}{hint}"));
+            body
         }
-        _ => (body, content),
+        _ => body,
     }
 }
 

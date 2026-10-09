@@ -1227,7 +1227,7 @@ mod delegation {
     }
 
     /// 从"派出去"走到"回来收口"之间那一步：把父调用的形状补成账本会给的形状。
-    fn resumed_request(
+    pub(super) fn resumed_request(
         harness: &Harness,
         request: &CallRequest,
         attempt: &AttemptId,
@@ -1243,7 +1243,7 @@ mod delegation {
     }
 
     /// 那次已经 `start_call` 过的尝试。
-    fn attempt_of(harness: &Harness, call: &ToolCallId) -> AttemptId {
+    pub(super) fn attempt_of(harness: &Harness, call: &ToolCallId) -> AttemptId {
         harness.ledger.surface().calls[call]
             .attempt
             .clone()
@@ -2796,20 +2796,20 @@ mod dispatch_and_follow {
         queued_behind: HashSet<String>,
     }
 
-    struct FakeSpawner {
+    pub(super) struct FakeSpawner {
         state: Mutex<FakeSpawnerState>,
         next_id: AtomicU32,
     }
 
     impl FakeSpawner {
-        fn new() -> Arc<Self> {
+        pub(super) fn new() -> Arc<Self> {
             Arc::new(Self {
                 state: Mutex::new(FakeSpawnerState::default()),
                 next_id: AtomicU32::new(0),
             })
         }
 
-        fn with_unknown(self: Arc<Self>, task_id: &str) -> Arc<Self> {
+        pub(super) fn with_unknown(self: Arc<Self>, task_id: &str) -> Arc<Self> {
             self.state
                 .lock()
                 .expect("假分发器")
@@ -3115,5 +3115,211 @@ mod dispatch_and_follow {
             .await
             .unwrap();
         assert_ne!(a.plan_hash(), b.plan_hash());
+    }
+}
+
+/// 「刚跑完」与「重启后回放」是同一个字符串（§8.3）：每条收尾路径交给模型的正文，都与
+/// 只从账本事件 + 输出存储读回事实、再投影一次的结果逐字节相同。
+mod one_projection {
+    use super::*;
+
+    use komo_kernel::projection::{
+        DEFAULT_MODEL_RESULT_BYTES, ProjectionContext, ToolResultFacts, project,
+    };
+    use komo_kernel::traits::{Ledger, TaskSpawner, ToolOutputStore};
+    use komo_kernel::types::status::RunEnd;
+    use komo_kernel::types::turn::ToolResultForModel;
+
+    use super::delegation::{attempt_of, resumed_request};
+    use super::dispatch_and_follow::FakeSpawner;
+    use crate::tools::{DelegateTool, DispatchTool, FollowTool};
+
+    /// 回放那一侧拿得到的全部东西：`fold` 出来的那条结果与那次调用，加上 `output.json`
+    /// 里的正文与产物——与 `komo-agent` 的 `to_replay_messages` 读的是同几格。
+    async fn replayed(harness: &Harness, live: &ToolResultForModel) -> String {
+        let surface = harness.ledger.surface();
+        let tool = surface
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_calls.iter())
+            .find(|call| call.call_id == live.call_id)
+            .map(|call| call.name.clone())
+            .expect("调用在账本上");
+        let result = surface
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_results.iter())
+            .find(|result| result.call == live.call_id)
+            .cloned()
+            .expect("结果落了盘");
+        let body = harness
+            .outputs
+            .open(&result.output)
+            .await
+            .expect("output.json 读得回来")
+            .body;
+        project(
+            &ToolResultFacts {
+                tool: &tool,
+                status: result.status,
+                elapsed_ms: result.elapsed_ms,
+                text: body.preview.as_deref(),
+                output: &result.output,
+                stdout: result.stdout.as_ref(),
+                stderr: result.stderr.as_ref(),
+                artifacts: &body.artifacts,
+            },
+            &ProjectionContext {
+                model_result_bytes: DEFAULT_MODEL_RESULT_BYTES,
+            },
+        )
+    }
+
+    async fn assert_one_projection(harness: &Harness, path: &str, live: &ToolResultForModel) {
+        assert!(
+            live.content.starts_with('['),
+            "{path} 没过投影：{}",
+            live.content
+        );
+        assert_eq!(
+            live.content,
+            replayed(harness, live).await,
+            "{path}：刚跑完与回放要逐字节相同"
+        );
+    }
+
+    /// 一条父 Run + 一个调用。
+    async fn round(
+        harness: &Harness,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> (SessionId, komo_kernel::types::ids::RunId, CallRequest) {
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[(tool, args)]).await;
+        (session, run, calls.into_iter().next().expect("一个调用"))
+    }
+
+    #[tokio::test]
+    async fn every_settlement_path_renders_through_the_one_projection() {
+        // 执行过的调用。
+        {
+            let harness = Harness::new();
+            let executor = harness.permissive(vec![Arc::new(RecordingTool::shell())]);
+            let (session, run, request) =
+                round(&harness, "shell", serde_json::json!({ "command": "x" })).await;
+            let outcome = executor
+                .execute_round(vec![request], &harness.env(&session, &run))
+                .await
+                .unwrap();
+            assert_one_projection(&harness, "执行", &outcome.results[0]).await;
+        }
+
+        // 没有执行的调用：不认识的工具名、参数准备不出来。
+        for (path, tool, args) in [
+            ("未知工具", "nope", serde_json::json!({})),
+            ("参数不对", "read", serde_json::json!({ "nope": 1 })),
+        ] {
+            let harness = Harness::new();
+            let executor = harness.permissive(vec![Arc::new(ReadTool::new())]);
+            let (session, run, request) = round(&harness, tool, args).await;
+            let outcome = executor
+                .execute_round(vec![request], &harness.env(&session, &run))
+                .await
+                .unwrap();
+            assert!(outcome.results[0].is_error, "{path}");
+            assert_one_projection(&harness, path, &outcome.results[0]).await;
+        }
+
+        // dispatch 放行即收尾；follow 转不过去也是一条落了盘的失败。
+        for (path, tool, args) in [
+            (
+                "dispatch",
+                "dispatch",
+                serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+            ),
+            (
+                "follow 失败",
+                "follow",
+                serde_json::json!({ "task_id": "beef", "text": "再看一眼" }),
+            ),
+        ] {
+            let harness = Harness::new();
+            let executor = harness.initial_with_spawner(
+                vec![Arc::new(DispatchTool::new()), Arc::new(FollowTool::new())],
+                FakeSpawner::new().with_unknown("beef") as Arc<dyn TaskSpawner>,
+            );
+            let (session, run, request) = round(&harness, tool, args).await;
+            let outcome = executor
+                .execute_round(vec![request], &harness.env(&session, &run))
+                .await
+                .unwrap();
+            assert_eq!(outcome.results.len(), 1, "{path}：{:?}", outcome.stop);
+            assert_one_projection(&harness, path, &outcome.results[0]).await;
+        }
+
+        // 子 Run 的终态回到父侧那次调用上。
+        {
+            let harness = Harness::new();
+            let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+            let (session, run, request) = round(
+                &harness,
+                "delegate",
+                serde_json::json!({ "task": "数一下 /tmp 下有几个文件" }),
+            )
+            .await;
+            let env = harness.env(&session, &run);
+            let waiting = executor
+                .execute_round(vec![request.clone()], &env)
+                .await
+                .unwrap();
+            let Some(RoundStop::Dependency { run: child, .. }) = waiting.stop else {
+                panic!("{:?}", waiting.stop)
+            };
+            let attempt = attempt_of(&harness, &request.call);
+            harness
+                .ledger
+                .complete(
+                    &child,
+                    RunEnd::Completed {
+                        final_message: Some("三个".into()),
+                        rounds: 1,
+                    },
+                )
+                .await
+                .unwrap();
+            let done = executor
+                .execute_round(vec![resumed_request(&harness, &request, &attempt)], &env)
+                .await
+                .unwrap();
+            assert_one_projection(&harness, "委派收口", &done.results[0]).await;
+        }
+
+        // 恢复时核对说目标已满足：报告结论，不重跑。
+        {
+            let harness = Harness::new();
+            let tool = Arc::new(
+                RecordingTool::shell()
+                    .with_recovery(RecoveryMode::VerifyTarget)
+                    .with_verdict(Verification::AlreadySatisfied {
+                        evidence: "内容哈希已是预期值".into(),
+                    }),
+            );
+            let executor = harness.permissive(vec![tool.clone()]);
+            let (session, run, mut request) =
+                round(&harness, "shell", serde_json::json!({ "command": "x" })).await;
+            let previous = harness
+                .crashed_attempt(
+                    &request.call,
+                    &plan_of(&*tool, &harness, &session, &run, &request).await,
+                )
+                .await;
+            request.resumed = Some(resumed_from(ToolCallState::Started, Some(previous), 1));
+            let outcome = executor
+                .execute_round(vec![request], &harness.env(&session, &run))
+                .await
+                .unwrap();
+            assert_eq!(tool.ran(), 0);
+            assert_one_projection(&harness, "核对已满足", &outcome.results[0]).await;
+        }
     }
 }

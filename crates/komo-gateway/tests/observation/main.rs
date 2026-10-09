@@ -4,7 +4,8 @@
 //!   （`artifact://<run>/<call>/<attempt>/result`，§4.7）；
 //! - **恢复**：那条入口真的读得进去——Session 自己的输出是只读根，**不用审批**；
 //! - **预算**：`[execution] model_result_bytes` 说了算（§6），不是写死的 1 KiB；
-//! - **一份事实**：同一个 Run 的下一个执行段回放时，渲染出的字节与刚跑完那次**完全相同**。
+//! - **一份事实**：同一个 Run 的下一个执行段回放时，渲染出的字节与刚跑完那次**完全相同**
+//!   ——跑过的调用如此，没跑起来的（工具名不认识）也如此。
 //!
 //! 共用件在 `komo_gateway::service::test_support::harness`（真数据目录、真 `service::start`、
 //! 脚本化模型）。这里断言的是**模型收到了什么**，所以读的是 `FakeLlm` 记下的轮输入与请求。
@@ -216,5 +217,45 @@ async fn the_replayed_window_renders_the_same_bytes_as_the_live_round() {
         replayed(&llm, "read"),
         live,
         "同一份事实在回放时渲染出的字节必须与刚跑完那次一样"
+    );
+}
+
+/// 没跑起来的调用（工具名不认识）同样只有一份投影：它的结论落了盘，同一个 Run 的下一段
+/// 回放时渲染出的字节与刚交回模型的那次一样。
+#[tokio::test]
+async fn a_refused_call_renders_the_same_bytes_live_and_replayed() {
+    let home = Home::with_config(&config_toml(""));
+    let llm = FakeLlm::new(vec![vec![
+        call_round(1, "pc-nope", "nope", serde_json::json!({})),
+        // 第二个调用要过审批：Run 停在这儿，批准之后起第二个执行段。
+        call_round(
+            2,
+            "pc-shell",
+            "shell",
+            serde_json::json!({ "command": "echo 收尾" }),
+        ),
+        text_round(3, "都做完了。"),
+    ]]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(&session, "obs-4", "调一个不存在的工具再跑一条命令")
+        .await
+        .run;
+
+    let pending = gateway.wait_approval().await;
+    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
+    let live = fed_back(&llm, "nope");
+    assert!(live.starts_with("[nope · 失败 · "), "{live}");
+    assert!(live.contains("没有 nope"), "{live}");
+
+    gateway.decide(&pending.approval, true).await;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    assert_eq!(
+        replayed(&llm, "nope"),
+        live,
+        "没跑起来的调用，回放时渲染出的字节也必须与刚交回模型的那次一样"
     );
 }

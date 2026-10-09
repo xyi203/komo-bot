@@ -618,9 +618,12 @@ async fn a_background_task_reports_back_through_home() {
     let (home_session, home_run) = dm(&gateway, "帮我查一下空调", "dm-1").await;
     let detail = gateway.wait_terminal(&home_run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    // 脚本模型原样念出的是投影过的工具结果：第一行是抬头，"已派出"在正文那一行。
     let delivered = texts_to(&sender, "111");
     assert!(
-        delivered.iter().any(|text| text.starts_with("已派出 #")),
+        delivered
+            .iter()
+            .any(|text| text.lines().any(|line| line.starts_with("已派出 #"))),
         "{delivered:?}"
     );
 

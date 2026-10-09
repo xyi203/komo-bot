@@ -91,6 +91,8 @@ impl From<LlmBuildError> for LlmError {
 /// 拦下），而是"这一次没送达"，多等一会儿再发一次是安全的。
 pub fn retry_cause(error: &LlmError) -> Option<RetryCause> {
     match error {
+        // 有些代理把参数错误包装成 HTTP 500；相同请求再发不会修好工具协议。
+        LlmError::Rejected { message, .. } if invalid_request(message) => None,
         LlmError::Rejected { status, .. } => match status {
             429 => Some(RetryCause::RateLimited),
             500..=599 => Some(RetryCause::Server),
@@ -108,6 +110,22 @@ pub fn retry_cause(error: &LlmError) -> Option<RetryCause> {
         // §8.5：结果与用量都未知时保留未知标记，不能当成零，也不能自动再来一次。
         LlmError::Unknown(_) => None,
     }
+}
+
+fn invalid_request(message: &str) -> bool {
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(message) {
+        let error = body.get("error").unwrap_or(&body);
+        if error.get("type").and_then(serde_json::Value::as_str) == Some("invalid_request_error")
+            || error.get("code").and_then(serde_json::Value::as_str)
+                == Some("invalid_request_error")
+        {
+            return true;
+        }
+    }
+    // SSE 错误有时只剩 message / code，仍可识别这两种确定的配对错误。
+    message.contains("No tool output found for")
+        || message.contains("Duplicate tool output for call_id")
+        || message.contains("code=invalid_request_error")
 }
 
 /// 这次失败可以重试吗——[`retry_cause`] 的另一种说法。

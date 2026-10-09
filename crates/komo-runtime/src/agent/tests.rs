@@ -65,6 +65,8 @@ impl Wired {
             budget: Budget::default(),
             resume: None,
             command,
+            compaction: None,
+            compactor: None,
             session,
             run,
         }
@@ -262,6 +264,8 @@ async fn a_tool_failure_is_handed_to_the_model_and_the_run_carries_on() {
             budget: Budget::default(),
             resume: None,
             command: None,
+            compaction: None,
+            compactor: None,
             session,
             run,
         })
@@ -356,6 +360,8 @@ async fn the_round_budget_ends_in_a_failure_not_a_loop() {
             },
             resume: None,
             command: None,
+            compaction: None,
+            compactor: None,
             session,
             run,
         })
@@ -433,6 +439,8 @@ async fn a_resumed_segment_finishes_the_round_it_came_back_to() {
                 pending,
             }),
             command: None,
+            compaction: None,
+            compactor: None,
             session,
             run,
         })
@@ -480,6 +488,8 @@ async fn a_resumed_segment_can_suspend_again() {
                 pending,
             }),
             command: None,
+            compaction: None,
+            compactor: None,
             session,
             run,
         })
@@ -565,6 +575,8 @@ async fn one_segment_begins_exactly_one_turn() {
             budget: Budget::default(),
             resume: None,
             command: None,
+            compaction: None,
+            compactor: None,
             session: session.clone(),
             run: run.clone(),
         })
@@ -608,6 +620,8 @@ async fn the_driver_is_handed_results_paired_by_provider_call_id() {
             budget: Budget::default(),
             resume: None,
             command: None,
+            compaction: None,
+            compactor: None,
             session,
             run,
         })
@@ -687,6 +701,8 @@ async fn a_retryable_model_error_suspends_on_a_backoff_instead_of_failing() {
             budget: Budget::default(),
             resume: None,
             command: None,
+            compaction: None,
+            compactor: None,
             session,
             run: run.clone(),
         })
@@ -749,6 +765,8 @@ async fn an_unknown_model_outcome_is_not_retried() {
             budget: Budget::default(),
             resume: None,
             command: None,
+            compaction: None,
+            compactor: None,
             session,
             run,
         })
@@ -788,6 +806,8 @@ async fn an_exhausted_retry_budget_ends_in_a_failure() {
             },
             resume: None,
             command: None,
+            compaction: None,
+            compactor: None,
             session,
             run: run.clone(),
         })
@@ -835,6 +855,8 @@ async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
             },
             resume: None,
             command: None,
+            compaction: None,
+            compactor: None,
             session,
             run: run.clone(),
         })
@@ -1065,4 +1087,275 @@ async fn a_small_result_is_never_revised() {
         inputs.iter().all(|input| revised_of(input).is_empty()),
         "{inputs:?}"
     );
+}
+
+// ---------------------------------------------------------------- 在线压缩（§6）
+
+mod compaction {
+    use super::*;
+    use crate::agent::tests_support::{FakePlanner, HangingLlm, compaction_job, compactor};
+    use crate::tools::UpdatePlanTool;
+    use komo_kernel::events::{ContextCompacted, EventPayload};
+    use komo_kernel::types::ids::Seq;
+    use komo_kernel::types::turn::RoundInput;
+
+    fn compactions(harness: &Harness) -> Vec<ContextCompacted> {
+        harness
+            .ledger
+            .events()
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                EventPayload::ContextCompacted(body) => Some(body),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assistants(harness: &Harness) -> usize {
+        harness
+            .ledger
+            .events()
+            .iter()
+            .filter(|event| matches!(event.payload, EventPayload::MessageAssistant(_)))
+            .count()
+    }
+
+    fn plan(steps: &[(&str, &str)]) -> serde_json::Value {
+        let steps: Vec<_> = steps
+            .iter()
+            .map(|(id, status)| serde_json::json!({ "id": id, "goal": format!("做 {id}"), "status": status }))
+            .collect();
+        serde_json::json!({ "steps": steps })
+    }
+
+    /// 登记两步 → 做完第一步（一个计划边界）→ 本该收尾的第三轮。
+    fn boundary_rounds() -> Vec<Round> {
+        vec![
+            round(
+                1,
+                None,
+                vec![call(
+                    "pc-1",
+                    "update_plan",
+                    plan(&[("a", "in_progress"), ("b", "pending")]),
+                )],
+            ),
+            round(
+                2,
+                None,
+                vec![call(
+                    "pc-2",
+                    "update_plan",
+                    plan(&[("a", "completed"), ("b", "in_progress")]),
+                )],
+            ),
+            round(3, Some("都做完了。"), vec![]),
+        ]
+    }
+
+    fn wired(llm: Arc<ScriptedLlm>) -> Wired {
+        Wired::with_llm(llm, vec![Arc::new(UpdatePlanTool::new())], true)
+    }
+
+    #[tokio::test]
+    async fn a_compaction_job_summarizes_records_and_recomposes() {
+        let llm = Arc::new(ScriptedLlm::new(vec![vec![round(
+            1,
+            Some("  摘要：a 做完了，cargo test 通过。  "),
+            vec![],
+        )]]));
+        let wired = wired(Arc::clone(&llm));
+        let mut segment = wired.segment(CancelToken::new()).await;
+        segment.compaction = Some(compaction_job(&segment.session, &segment.run));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Recompose { rounds: 0, .. }),
+            "{outcome:?}"
+        );
+
+        let requests = llm.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "只发了摘要请求，这一段的主请求作废了");
+        assert!(requests[0].tools.is_empty());
+        assert_eq!(requests[0].system_prompt, "压缩上下文");
+        drop(requests);
+
+        let recorded = compactions(&wired.harness);
+        let [
+            ContextCompacted::Compacted {
+                first_kept,
+                summary,
+                decision,
+                debt,
+                ..
+            },
+        ] = recorded.as_slice()
+        else {
+            panic!("{:?}", compactions(&wired.harness));
+        };
+        assert_eq!(*first_kept, Seq(2));
+        assert_eq!(
+            summary.as_deref(),
+            Some("摘要：a 做完了，cargo test 通过。")
+        );
+        assert_eq!(*debt, decision.debt());
+        assert_eq!(assistants(&wired.harness), 0, "摘要不是这条 Run 的一轮");
+    }
+
+    #[tokio::test]
+    async fn a_failed_summary_is_recorded_as_skipped_and_the_run_goes_on() {
+        let truncated = Round {
+            truncated: true,
+            ..round(1, Some("摘要写到一半"), vec![])
+        };
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            vec![truncated],
+            vec![round(1, Some("接着做完了。"), vec![])],
+        ]));
+        let wired = wired(Arc::clone(&llm));
+        let mut segment = wired.segment(CancelToken::new()).await;
+        segment.compaction = Some(compaction_job(&segment.session, &segment.run));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(&outcome, SegmentOutcome::Completed { final_message, .. }
+                if final_message.as_deref() == Some("接着做完了。")),
+            "{outcome:?}"
+        );
+        let recorded = compactions(&wired.harness);
+        let [ContextCompacted::Skipped { reason, decision }] = recorded.as_slice() else {
+            panic!("{:?}", compactions(&wired.harness));
+        };
+        assert_eq!(reason, "摘要被截断");
+        assert!(
+            decision.as_ref().is_some_and(|decision| decision.compact),
+            "带着那份决定了压的决策：在线状态据此不在窗口压力下马上重试"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_during_summary_cancels() {
+        let wired = Wired::with_llm(Arc::new(HangingLlm), vec![], true);
+        let cancel = CancelToken::new();
+        let mut segment = wired.segment(cancel.clone()).await;
+        segment.compaction = Some(compaction_job(&segment.session, &segment.run));
+
+        let pressing = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel.cancel();
+        });
+        let outcome = wired.agent.run(segment).await.unwrap();
+        pressing.await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Cancelled { .. }),
+            "{outcome:?}"
+        );
+        assert!(compactions(&wired.harness).is_empty(), "取消什么都不记");
+        let surface = surface(&wired.harness);
+        assert_eq!(
+            surface.runs.values().next().unwrap().status,
+            RunState::Cancelled
+        );
+    }
+
+    #[tokio::test]
+    async fn a_boundary_round_hands_back_for_recomposition() {
+        let llm = Arc::new(ScriptedLlm::new(vec![
+            boundary_rounds(),
+            vec![round(1, Some("摘要：a 做完了。"), vec![])],
+        ]));
+        let wired = wired(Arc::clone(&llm));
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let job = compaction_job(&segment.session, &segment.run);
+        let planner = FakePlanner::new(vec![Some(job)]);
+        segment.compactor = Some(compactor(Arc::clone(&planner)));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Recompose { rounds: 2, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(planner.asked(), 1, "登记那一轮不是边界，不问");
+        assert_eq!(assistants(&wired.harness), 2, "第三轮没发出去");
+        assert!(matches!(
+            compactions(&wired.harness).as_slice(),
+            [ContextCompacted::Compacted { .. }]
+        ));
+        // 边界那一轮的结果已经落账，下一段的回放带着它；这一段的 driver 没再拿到它。
+        let inputs = llm.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 3, "主 driver 两轮 + 摘要一轮：{inputs:?}");
+        assert!(matches!(inputs[2], RoundInput::First), "最后一次是摘要请求");
+    }
+
+    /// 决定不压：同一个 driver 接着跑，下一次请求就是没有这个功能时那一次。
+    #[tokio::test]
+    async fn a_planner_that_declines_leaves_the_driver_running() {
+        let llm = Arc::new(ScriptedLlm::new(vec![boundary_rounds()]));
+        let wired = wired(Arc::clone(&llm));
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let planner = FakePlanner::new(vec![None]);
+        segment.compactor = Some(compactor(Arc::clone(&planner)));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Completed { rounds: 3, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(planner.asked(), 1);
+        assert_eq!(
+            llm.requests.lock().unwrap().len(),
+            1,
+            "没有第二次 begin_turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_compaction_never_hands_back() {
+        let llm = Arc::new(ScriptedLlm::new(vec![boundary_rounds()]));
+        let wired = wired(Arc::clone(&llm));
+        let segment = wired.segment(CancelToken::new()).await;
+        assert!(segment.compactor.is_none() && segment.compaction.is_none());
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Completed { rounds: 3, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(llm.requests.lock().unwrap().len(), 1);
+        assert!(compactions(&wired.harness).is_empty());
+    }
+
+    /// 没有计划也要护住窗口：估计的上下文过了线就问，没过线的轮次一次都不问。
+    #[tokio::test]
+    async fn window_pressure_asks_without_a_boundary() {
+        let tool = Arc::new(RecordingTool::shell());
+        let llm = Arc::new(ScriptedLlm::new(vec![vec![
+            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+            round(
+                2,
+                None,
+                vec![call(
+                    "pc-2",
+                    "shell",
+                    serde_json::json!({ "x": "y".repeat(400) }),
+                )],
+            ),
+            round(3, Some("好了。"), vec![]),
+        ]]));
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![tool], true);
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let planner = FakePlanner::new(vec![None]);
+        segment.compactor = Some(crate::agent::Compactor {
+            pressure_tokens: Some(100),
+            estimate: 10,
+            ..compactor(Arc::clone(&planner))
+        });
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(planner.asked(), 1, "只有第二轮那一大段参数把估计推过了线");
+    }
 }

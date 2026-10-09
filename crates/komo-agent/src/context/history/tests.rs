@@ -183,6 +183,11 @@ fn a_later_run_still_reads_what_the_earlier_one_said() {
         assert!(message.tool_results.is_empty(), "{message:?}");
         assert!(message.provider_blocks.is_none(), "{message:?}");
     }
+    let (_, run_from) = super::replay_messages(
+        resolve_inline(entries(&surface, ReplayScope::Conversation(&second))),
+        &BUDGET,
+    );
+    assert_eq!(run_from, 2, "正跑的那条 Run 从它那句任务开始");
 }
 
 /// 正跑着的那条 Run 仍然是**完整协议**：它自己那轮的调用、结果与原生块一个都不能少。

@@ -7,6 +7,7 @@
 //! 指针——`MemoryManager`、`Store`、`PayloadStore`、`ToolOutputStore`、`Coordinator` 都不
 //! 允许出现在这个模块里。
 
+pub mod compaction;
 pub mod history;
 pub mod memory;
 mod prompt;
@@ -64,6 +65,9 @@ pub enum InvocationContext {
 pub struct AgentContext {
     pub system_prompt: String,
     pub messages: Vec<ReplayMessage>,
+    /// 正在跑的这条 Run 从 `messages` 的第几条开始（它开头那句任务）；之前的是别的 Run
+    /// 的转写。在线压缩只在这一段里切（[`compaction`]）。
+    pub run_from: usize,
 }
 
 /// 唯一的 Context Assembly 入口（`docs/agent.md` §5）。
@@ -83,10 +87,11 @@ pub fn assemble(input: ContextInput<'_>) -> AgentContext {
         prompt.push_str("\n\n");
         prompt.push_str(memory);
     }
-    let messages = history::to_replay_messages(input.history, &input.projection);
+    let (messages, run_from) = history::replay_messages(input.history, &input.projection);
     AgentContext {
         system_prompt: prompt,
         messages,
+        run_from,
     }
 }
 

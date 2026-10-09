@@ -105,3 +105,90 @@ impl komo_kernel::traits::TurnDriver for FailingDriver {
         Default::default()
     }
 }
+
+/// 一次压缩决定：摘要请求没有工具，切在 seq 2。决策取 kernel 替身里那组压得过来的数。
+pub fn compaction_job(session: &SessionId, run: &RunId) -> komo_kernel::compaction::CompactionJob {
+    let komo_kernel::events::ContextCompacted::Compacted { decision, .. } =
+        komo_kernel::test_support::compacted(komo_kernel::types::ids::Seq(2), "")
+    else {
+        unreachable!("替身给的是 compacted")
+    };
+    komo_kernel::compaction::CompactionJob {
+        request: TurnRequest {
+            system_prompt: "压缩上下文".into(),
+            ..turn_request(session, run)
+        },
+        first_kept: komo_kernel::types::ids::Seq(2),
+        decision,
+    }
+}
+
+/// 按脚本作答的 [`super::CompactionPlanner`]：第 n 次问给第 n 个答案，用完之后一律不压。
+pub struct FakePlanner {
+    answers: std::sync::Mutex<
+        std::collections::VecDeque<Option<komo_kernel::compaction::CompactionJob>>,
+    >,
+    pub asked: std::sync::atomic::AtomicUsize,
+}
+
+impl FakePlanner {
+    pub fn new(
+        answers: Vec<Option<komo_kernel::compaction::CompactionJob>>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            answers: std::sync::Mutex::new(answers.into_iter().collect()),
+            asked: Default::default(),
+        })
+    }
+
+    pub fn asked(&self) -> usize {
+        self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl super::CompactionPlanner for FakePlanner {
+    async fn plan(&self) -> Option<komo_kernel::compaction::CompactionJob> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.answers.lock().expect("脚本").pop_front().flatten()
+    }
+}
+
+/// 一个 [`super::Compactor`]：不知道窗口，只在计划边界上问。
+pub fn compactor(planner: std::sync::Arc<FakePlanner>) -> super::Compactor {
+    super::Compactor {
+        planner,
+        pressure_tokens: None,
+        estimate: 0,
+        pending: false,
+    }
+}
+
+/// 开口就答应、回一句却永远不来的模型：摘要请求挂在半路上，只有取消能让它停。
+pub struct HangingLlm;
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::LlmClient for HangingLlm {
+    async fn begin_turn(
+        &self,
+        _req: TurnRequest,
+    ) -> Result<Box<dyn komo_kernel::traits::TurnDriver>, komo_kernel::types::turn::LlmError> {
+        Ok(Box::new(HangingDriver))
+    }
+}
+
+struct HangingDriver;
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::TurnDriver for HangingDriver {
+    async fn next(
+        &mut self,
+        _input: komo_kernel::types::turn::RoundInput,
+    ) -> Result<Round, komo_kernel::types::turn::LlmError> {
+        std::future::pending().await
+    }
+
+    fn usage(&self) -> komo_kernel::types::model::TokenUsage {
+        Default::default()
+    }
+}

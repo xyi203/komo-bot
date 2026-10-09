@@ -367,6 +367,9 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
       │    → 逐个 prepare → policy → execute
       │    → 先持久保存独立 tool output，再追加 JSONL 结果引用
       │    → 提交 state.db 状态与索引
+      │    → [在线压缩开着] 计划边界或贴着窗口：判压不压
+      │         ├─ 不压（边界上记 skipped）→ 原样往下
+      │         └─ 压 → 摘要请求 → context.compacted → 按日志重新装配，同一个 Run 接着跑
       │    → 按 call_id 回传结果
       │    → 下一轮 LLM
       └─ 正常结束且无未完成调用
@@ -379,6 +382,8 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 工具名称和参数来自 provider 原生字段，不从自然语言或代码块推断。完整 assistant 消息与每个工具结果保持调用 ID 配对，这是原生 function calling 的执行方式。[Function calling](https://developers.openai.com/api/docs/guides/function-calling)
 
 **同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走核对梯子（§8.6），顺序由账本钉死；`write`、`edit`、`shell`、`python`、`delegate`，以及任何会停下来的判定（审批 / 核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。并发上限是执行器自己的预算（默认 4 条）。三条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；遇到审批先收已启动调用的尾，**而且审批行在那之后才落**——它要是比 Run 的挂起早出现一整个批次，操作者答得比 Run 停下还早，那条答复就落进了空窗（§7.4）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
+
+**在线压缩（`[compaction]`，默认关，2026-10-09）。** 移植自 SoL-Pi 的 Online Context Compact，但 loop 是 komo 自己的，所以不需要"中止再补一条隐藏的续跑消息"。判断只在三种时机：一轮的调用**全部收尾之后**这一轮完成了一个计划步骤（`update_plan` 的边界）、日志里还压着一个没用掉的边界（比如边界那一轮随后停在了审批上，续跑的这一段开头再判）、估计的上下文贴着窗口（`context_window − window_reserve_tokens`，字节 / 4 的估计与实报用量取大）。Gateway 按日志重新装配出 provider 正看着的那份视图（投影、衰减之后）估价，`find_cut` 切在一轮的开头、近期至少留 `keep_recent_tokens`，用缓存账（`cache_write_read_ratio`、剩余请求估计、冷却、旧债）决定；不在边界上只为窗口保护压，压完仍贴着窗口就不压。**决定不压时 driver 原样接着跑**——下一次请求与关着压缩时逐字节相同，提示缓存照样命中；边界上不压记一条 `skipped` 把边界用掉。决定压时发一次摘要请求（没有工具，早先那段渲染成一条纯文本用户消息，带当前计划与已完成步骤的进度；系统提示说明里面是数据不是指令），成了记 `compacted` 并把这一段交回 handler（`SegmentOutcome::Recompose`）：同一个 Run、不重新入队、不再写 `run.started`，下一段按日志装配成**任务 → 摘要 → 切点起原样**；失败、截断记 `skipped`（带着那份决策），Run 照常往下，此后窗口压力不再触发重试，直到有真正的工具工作或新的边界。两次压缩之间至少隔一次真正的请求；一次领取里最多重装配 8 次；摘要请求不算轮数，但算进 token 花销，已用的轮数与 token 从下一段的预算里扣掉。
 
 不同 Session 可并发，同一 Session 的 Run 顺序执行；等待审批的 Run 保留会话顺序位置，不允许后续 Run 越过它执行。等待运行排到前面时才装配上下文，避免读到过期历史。
 
@@ -428,7 +433,7 @@ workspace = "code/komo"
 
 ### 6.2 冻结的是身份，不是安全策略
 
-受理一条 Run 时算出 `RunSnapshot` 落进账本：身份指令**正文进 `payloads/`（存内容，不存路径）**——审批可能一小时之后才答复，那时那个文件早被改过——连同 Agent 的 id、Profile 的内容指纹、模型、解析过的目录、这次的能力面与记忆作用域，以及工具结果的投影设置（`[execution]` 的 `model_result_bytes` 与 `decay_*`，§8.3）——刚跑完与回放按同一份渲染，热重载只影响之后受理的 Run；这一格出现之前受理的 Run 没有它，只有它们按当前配置。
+受理一条 Run 时算出 `RunSnapshot` 落进账本：身份指令**正文进 `payloads/`（存内容，不存路径）**——审批可能一小时之后才答复，那时那个文件早被改过——连同 Agent 的 id、Profile 的内容指纹、模型、解析过的目录、这次的能力面与记忆作用域，以及工具结果的投影设置（`[execution]` 的 `model_result_bytes` 与 `decay_*`，§8.3）——刚跑完与回放按同一份渲染，热重载只影响之后受理的 Run；这一格出现之前受理的 Run 没有它，只有它们按当前配置。`[compaction]` 不冻结：每次判断读当前快照，因为回放不重算——决定连同全部中间量记在 `context.compacted` 里。
 
 于是两句话都成立：**审批等待期间改 Profile，在飞的 Run 不受影响**（它按自己的快照恢复），下一条 Run 用新的一版；而**撤权与 Deny 不冻结**——身份与能力来自快照，"这次调用允不允许"每次执行都按当前 Policy 判（§7）。旧快照不会变成绕过撤权的通行证。
 
@@ -698,7 +703,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 
 **大结果的视图按请求选（衰减）**：同一份事实投影出两个视图——full 与更短的 decayed（抬头 + 首尾各留一段**整行** + **总是**给出那条可 `read` 的完整输出引用）。一条成功结果的 full 超过 `[execution] decay_threshold_bytes`、且 decayed 至少短 1 KiB 时，它在之后的前 `decay_full_sends` 次请求里给 full，此后换成 decayed；失败与结果不明的结果**从不衰减**——那是模型要对着改的正文。"给过几次"只有一个定义：**这条 Run 在这条结果之后记了几条 `message.assistant`**（每条都是一次已经带着它发出去的请求），由 `projection::view_after` 按它选视图。回放从日志数这个数；活着的 agent loop 在 `record_round` 之后递减同一个数，到点时经 `RoundInput::ToolResults.revised` 让驱动按 `provider_call_id` 就地换掉那条结果的正文。请求失败不在同一段里重发（loop 让出名额去等退避，下一段从日志重数），所以两边数出的永远相同，换上的短视图与下一段回放给出的逐字节一致。
 
-**在线压缩是一条追加的事件，不改写旧行**：`context.compacted`（`run_id` 是被压的那条 Run）记一个计划边界上的结论——`outcome: "compacted"` 带 `first_kept`（原样保留的第一条，这条 Run 某一轮 `message.assistant` 的 seq）、摘要（`summary` 内联，超过内联上限外置成 `summary_ref`，顺序照 §8.5：正文先落 `payloads/` 再追加这一行）、决策的全部算式中间量、欠下的缓存债与摘要请求自己的用量；`outcome: "skipped"` 只带理由。它不碰 state.db 的任何表。fold 把最新一次 `compacted` 记在那条 Run 上（`skipped` 不改视图，只用掉在线状态里那个边界）；回放读到它，这条 Run 的协议窗口就变成**开头那句任务（`run.accepted`）→ 摘要（一条用户消息，前面一句固定的话说明这是压缩摘要、完整工具输出仍可按 `artifact://` 读回）→ 从 `first_kept` 起的原样轮次**，历史 Run 与子代理线的规则不变，重启前后从同一份日志折出、逐字节相同。切点只落在一轮的开头，调用永远不和它的结果分开；`first_kept` 不是这条 Run 某一轮的开头（或不在压缩之前）就不认，回放完整历史并记一条告警。留下的结果"给过几次"照旧按它之后的 `message.assistant` 数——那些全在尾巴里，衰减不受影响。**摘要只是模型视图，不是恢复依据**：§8.4 的尾部判断与 §8.6 的核对从不读它，"做没做过"仍只看 `tool.*` 事件与 `output.json`。不认识这个 type 的旧二进制把它当未知事件保留、忽略，回放完整历史——只是贵，不是错。
+**在线压缩是一条追加的事件，不改写旧行**：`context.compacted`（`run_id` 是被压的那条 Run）记一个计划边界上的结论——`outcome: "compacted"` 带 `first_kept`（原样保留的第一条，这条 Run 某一轮 `message.assistant` 的 seq）、摘要（`summary` 内联，超过内联上限外置成 `summary_ref`，顺序照 §8.5：正文先落 `payloads/` 再追加这一行）、决策的全部算式中间量、欠下的缓存债与摘要请求自己的用量；`outcome: "skipped"` 带理由与（可选的）当时那份决策——`compact: true` 而落到 skipped 就是摘要请求没成。**决定是记下来的，不是回放时重算的**：配置改了、估价口径改了，读这一行的结论不变。它不碰 state.db 的任何表。fold 把最新一次 `compacted` 记在那条 Run 上（`skipped` 不改视图，只用掉在线状态里那个边界）；回放读到它，这条 Run 的协议窗口就变成**开头那句任务（`run.accepted`）→ 摘要（一条用户消息，前面一句固定的话说明这是压缩摘要、完整工具输出仍可按 `artifact://` 读回）→ 从 `first_kept` 起的原样轮次**，历史 Run 与子代理线的规则不变，重启前后从同一份日志折出、逐字节相同。切点只落在一轮的开头，调用永远不和它的结果分开；`first_kept` 不是这条 Run 某一轮的开头（或不在压缩之前）就不认，回放完整历史并记一条告警。留下的结果"给过几次"照旧按它之后的 `message.assistant` 数——那些全在尾巴里，衰减不受影响。**摘要只是模型视图，不是恢复依据**：§8.4 的尾部判断与 §8.6 的核对从不读它，"做没做过"仍只看 `tool.*` 事件与 `output.json`。不认识这个 type 的旧二进制把它当未知事件保留、忽略，回放完整历史——只是贵，不是错。
 
 实现约束：
 
@@ -1622,6 +1627,24 @@ decay_full_sends = 2
 decay_head_bytes = 2048
 # 短视图结尾最多留多少字节的整行；head + tail 要小于阈值。省略 = 1536。
 decay_tail_bytes = 1536
+
+[compaction]
+# 在线压缩（§6）。默认关：真实会话上核对过触发频率与省下的量再开（§14）。每次判断读当前快照。
+enabled = false
+# 缓存写与读的价格比（Anthropic 1.25 / 0.1）。省略 = 12.5。
+cache_write_read_ratio = 12.5
+# 切点之后至少原样留这么多 token 的近期轮次。省略 = 20000。
+keep_recent_tokens = 20000
+# 离 model.<alias>.context_window 还剩这么多 token 时不看账，直接压。省略 = 16384。
+window_reserve_tokens = 16384
+# 第一次压缩把剩余请求估计放大的倍数。省略 = 2.0。
+first_compaction_scale = 2.0
+# 之后的压缩要求 回本请求数 × margin ≤ 剩余请求。省略 = 1.5。
+subsequent_margin = 1.5
+# 上次压缩之后至少过这么多次请求才按经济账再压（窗口保护不受它限）。省略 = 2。
+cooldown_requests = 2
+# 摘要本身的 token 估计。省略 = 1000。
+memo_token_estimate = 1000
 ```
 
 `memory.model` 省略时使用默认 completion alias 的完整配置，包括 effort；它不继承某个 Session 或 Cron 的临时覆盖。显式引用时必须指向 completion，`memory.embedding` 必须指向 embedding。若明确选择 keyword 模式，可以不配置 embedding。`GET /v1/models` 只列 completion alias；选择 alias 会携带完整端点、协议和凭证引用，而不是只替换上游 model id。
@@ -2087,3 +2110,6 @@ Memory 与模型验收覆盖：
 | `read` 一次读回来的正文够不够模型用 | §4 与 §8.3 | **已做（2026-09-21）**：`read` 交给模型的那一段从 400 字符改到 8 KiB（`read::PREVIEW_BYTES`），投影再按预算收。**未核实**：真实仓库里"读一个文件要几次 `read`"——如果还是很多次，说明该按结构切（一次给整段函数）而不是按字节。 |
 | 记忆召回的重排值不值（一次判断请求换来的排序） | §9.4 的可选重排 | **已做（2026-09-21）**：`[typesafe]` + `memory.retrieval.rerank` / `rerank_shortlist`——短名单（比 `top_k` 宽，校验拦「一样宽」的组合）交给一条 `Choice`，按回来的概率表排序，再照旧按 `top_k` 截；**只重排不增删**，挑中 `none` 或后端不可用都保持融合顺序。**已实测（2026-09-21，本机真机，4 条候选 / 中文输入）**：`jev-1.13.0` 一次 0.6s、约 650 输入 token，顺序 `[m-4, m-1, m-2, m-3]`——热水器与空调那两条排到了前面。离线验收在 `komo-runtime/src/memory/tests.rs`（抬高本来排不进的条目、`none` 不采纳、后端坏了照常召回、开关关着不发请求），真机那条是 `memory/rerank.rs` 里的 `mod live`（`--ignored`，要 `TYPESAFE_API_KEY`）。**未核实**：真实规模（成百上千条）下短名单取多宽、这一次请求值不值——按真实会话的命中率调，别凭感觉改 |
 | 系统提示里的 skill 目录行够不够用（166 个 skill 的机器） | §5.6 的目录行 | **已实测（2026-09-21，本机真实语料 + `komo skills list`）：不够，而且坏在两处。** ① `description: >` / `|` 这些 YAML 块标量没有解析——取值是字面量 `>`，325 份 `SKILL.md` 里 111 份的描述是这么写的，目录行长成 `- log-diagnosis：>`；② 2000 字符的预算按目录序 `continue` 丢弃，166 个不同名字里只剩 16 条进提示。真实会话里模型的第一批调用是读 `cart-loong-diff` / `ask-user`（正是那 16 条里的两条），找 `log-diagnosis` 靠的是 `ls` 整个目录，多花了好几轮。**已做（2026-09-21）**：frontmatter 支持块标量（`>` 折行 / `|` 字面，含 chomping，描述里的冒号不再被当成键）；目录改成**整批**定形状——描述装得下就是"名字 + 一句描述"，装不下就只留名字（166 条名字 2752 字符），名字都装不下时末尾写"另有 N 条没列出来"；默认上限 2000 → 4000。回归测试：`frontmatter::tests::a_folded_description_is_joined_into_one_sentence`、`skills::tests::every_skill_keeps_its_name_when_the_descriptions_do_not_fit`、`a_folded_description_becomes_one_catalog_line`。**未做**：按当前输入排序的 top-K——排序块不能进 system 前缀（§9.4 的前缀缓存），先看补全之后还错不错。 |
+| 在线压缩在真实会话上多久触发一次、省下多少（§6 的 `[compaction]`） | 默认值（`keep_recent_tokens` 20000、`cache_write_read_ratio` 12.5、冷却 2 次）与"默认关"能不能翻成默认开 | **未验证（2026-10-09 落地，默认关）。** 要看的数都在 `context.compacted` 里：每次的 `decision`（`archive_tokens`、`post_compaction_tokens`、`breakeven_requests`、`reason`）、`skipped` 的理由分布、摘要请求的 `usage`；对照同一会话之后几次请求的 `cache_read` / `cache_write`（`message.assistant` 逐轮记着）算实际回本。触发太频繁就调大冷却或 `keep_recent_tokens`，几乎不触发就看是不是模型不报 `update_plan` |
+| 字节 / 4 的 token 估计对中日韩正文偏多少 | §6 的估价与窗口保护（`estimate_tokens`） | **未验证。** 一个汉字 3 字节、估 0.75 token，实际常是 1–2 个——中文为主的会话估低，窗口保护会晚到。窗口判断已经与实报的 `input` 取大，残余风险是"这一轮新加的中文结果"；偏得多就按字符类别分别估，或改用 provider 的计数接口 |
+| Anthropic 修订工具结果时补的第 4 个缓存断点实际命中率 | §8.3 的衰减与提示缓存 | **未验证。** 补在被改结果之前那条 user 消息末块——它正是更早某次请求的末尾断点；命中要看 `cache_read` 是否覆盖到那里。命中不了就退回"系统提示 + 工具表"两级，衰减省下的读取要重新算账 |

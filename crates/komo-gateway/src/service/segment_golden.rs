@@ -15,6 +15,7 @@ use komo_kernel::events::{ConversationBoundary, MessageAssistant, RunCompleted, 
 use komo_kernel::test_support::{MemOutputStore, MemOutputWriter};
 use komo_kernel::types::delegate::{DelegateSpec, SchemaMode};
 use komo_kernel::types::digest::ContentHash;
+use komo_kernel::types::ids::Seq;
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, MemoryId, RequestKey};
 use komo_kernel::types::memory::{
     Confirmation, ExtractionMetadata, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,

@@ -26,12 +26,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_agent::DELEGATE_TOOL;
+use komo_agent::context::InvocationContext;
 use komo_agent::context::history::{self, ReplayScope};
-use komo_agent::context::{ContextInput, InvocationContext, assemble};
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::fold;
-use komo_kernel::traits::{ApprovalRepo, Ledger, LedgerError, ToolOutputStore};
-use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::traits::{ApprovalRepo, LedgerError, ToolOutputStore};
+use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::resource::{ResourceMounts, SkillMount};
 use komo_kernel::types::status::ToolCallState;
@@ -48,6 +48,7 @@ use komo_runtime::tools::paths;
 use komo_store::db::store_to_ledger;
 use komo_store::{CheckpointStore, Db, PayloadStore, RecoveryStore};
 
+use super::compaction;
 use super::context_sources;
 use super::ledgers::RoutedLedger;
 
@@ -283,21 +284,7 @@ impl GatewaySegments {
 
     /// 读完这个 Session 的日志。
     async fn events_of(&self, session: &SessionId) -> Result<Vec<Event>, HandlerError> {
-        let mut all = Vec::new();
-        let mut from = Seq::ZERO;
-        loop {
-            let batch = self.routed.read(session, from, 0).await?;
-            if batch.events.is_empty() {
-                return Ok(all);
-            }
-            for event in batch.events {
-                from = from.max(event.seq);
-                all.push(event);
-            }
-            if batch.next.is_none() {
-                return Ok(all);
-            }
-        }
+        Ok(compaction::read_events(self.routed.as_ref(), session).await?)
     }
 }
 
@@ -480,17 +467,18 @@ impl SegmentSource for GatewaySegments {
         };
 
         // **唯一的 Context Assembly 入口**（§5）：Gateway 到这里为止只是"凑齐事实"，
-        // "模型这一刻看见什么"由它一家决定——记忆段放在哪也是它说了算（§13.2）。
-        let context = assemble(ContextInput {
+        // "模型这一刻看见什么"由它一家决定——记忆段放在哪也是它说了算（§13.2）。历史
+        // 以外的那些留成模板：在线压缩一轮收尾之后重新装配时原样再用（§6）。
+        let template = compaction::ContextTemplate {
             instructions: identity.instructions.clone(),
             workspace: cwd.clone(),
             tools: tool_names,
-            history: resolved,
             memory: injection.text.clone(),
             skills,
             invocation,
             projection,
-        });
+        };
+        let context = template.clone().assemble(resolved);
 
         let agent_surface = identity.surface.clone();
 
@@ -523,13 +511,72 @@ impl SegmentSource for GatewaySegments {
             tools: tools.clone().into(),
         };
 
+        let resume = match self.resumed(&session, &surface, &events, &run).await {
+            Ok(resume) => resume,
+            // 外置的正文读不出来 = 会话缺内容：停下来报告（§8.3），别当成"没有可续跑的
+            // 调用"——那会让这一段的请求带着一个没有输出的 `function_call` 发出去。
+            Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
+        };
+
+        let command = self.command_for(&record.source, delegate.is_some()).await;
+
+        let model = identity
+            .model
+            .clone()
+            .unwrap_or_else(|| record.model.clone());
+
+        // 在线压缩（§6）：开着、不是命令 Run 才有。这一段开头就能判的（没有没收尾的调用）
+        // 现在判；其余交给 loop 在一轮收尾之后来问。
+        let (compaction_job, compactor) = match compaction::enabled(self.config.as_ref()) {
+            Some(config) if command.is_none() => {
+                let online = komo_kernel::compaction::online_state(&events, &run);
+                // 只在上一轮的调用全部收尾时判：切点落在轮次开头，一轮的调用与结果不分开。
+                let settled = resume.is_none() && surface.open_calls(&run).is_empty();
+                let job = if settled {
+                    compaction::decide(
+                        self.routed.as_ref(),
+                        compaction::Facts {
+                            context: &context,
+                            tools: &tools,
+                            online: &online,
+                            config: &config,
+                            model: &model,
+                            session: &session,
+                            run: &run,
+                        },
+                    )
+                    .await
+                } else {
+                    None
+                };
+                let planner = compaction::GatewayPlanner {
+                    routed: Arc::clone(&self.routed),
+                    outputs: self.outputs.clone(),
+                    config: self.config.clone(),
+                    session: session.clone(),
+                    run: run.clone(),
+                    thread: thread.clone(),
+                    template,
+                    tools: tools.clone(),
+                    model: model.clone(),
+                };
+                let compactor = komo_runtime::agent::Compactor {
+                    planner: Arc::new(planner),
+                    pressure_tokens: model
+                        .context_window
+                        .map(|window| window.saturating_sub(config.window_reserve_tokens)),
+                    estimate: komo_agent::context::compaction::price(&context, &tools).write_tokens,
+                    pending: !settled && online.pending_boundary,
+                };
+                (job, Some(compactor))
+            }
+            _ => (None, None),
+        };
+
         let request = TurnRequest {
             session: session.clone(),
             run: run.clone(),
-            model: identity
-                .model
-                .clone()
-                .unwrap_or_else(|| record.model.clone()),
+            model: model.clone(),
             system_prompt: context.system_prompt,
             // **这一段对话**：上一轮说了什么、最后答了什么，下一轮必须还在。子代理是唯一
             // 的例外——它只看得见自己那条 Run，父的窗口里也没有它的过程（§4）。
@@ -554,7 +601,7 @@ impl SegmentSource for GatewaySegments {
             // 本 Run 是被谁派的（普通 Run 是 None）。runtime 用它硬拦"子代理再委派"。
             delegated: delegate.clone(),
             // 同一个模型：`TurnRequest` 与这里用的是同一次解析的结果（冻结快照里那一个）。
-            model: identity.model.unwrap_or(record.model),
+            model,
             cancel: self.token_for(&run),
         };
 
@@ -569,15 +616,6 @@ impl SegmentSource for GatewaySegments {
             },
         };
 
-        let resume = match self.resumed(&session, &surface, &events, &run).await {
-            Ok(resume) => resume,
-            // 外置的正文读不出来 = 会话缺内容：停下来报告（§8.3），别当成"没有可续跑的
-            // 调用"——那会让这一段的请求带着一个没有输出的 `function_call` 发出去。
-            Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
-        };
-
-        let command = self.command_for(&record.source, delegate.is_some()).await;
-
         Ok(Segment {
             session,
             run,
@@ -586,6 +624,8 @@ impl SegmentSource for GatewaySegments {
             budget,
             resume,
             command,
+            compaction: compaction_job,
+            compactor,
         })
     }
 }
@@ -842,6 +882,7 @@ mod tests {
     use super::*;
     use komo_kernel::events::MessageAssistant;
     use komo_kernel::types::ids::EventId;
+    use komo_kernel::types::ids::Seq;
     use komo_kernel::types::turn::ToolCallRequest;
 
     fn event(seq: u64, run: &RunId, payload: EventPayload) -> Event {

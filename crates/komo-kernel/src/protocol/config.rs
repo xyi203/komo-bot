@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::compaction::CompactionEconomics;
 use crate::policy::RuleTable;
 use crate::projection::{DecayPolicy, ProjectionContext};
 use crate::types::agent::AgentConfig;
@@ -378,6 +379,94 @@ impl Default for ExecutionConfig {
     }
 }
 
+/// `[compaction]`：在线上下文压缩（§6）。**默认关**——要先在真实会话上核对触发频率与
+/// 省下的量（§14），再打开。
+///
+/// 每到一次决策就读当前快照，不随 Run 冻结：决定本身连同全部中间量记进
+/// `context.compacted`，回放只认那条事件，不重算。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// 缓存写与缓存读的价格比（Anthropic：1.25 / 0.1 = 12.5）。
+    #[serde(default = "default_cache_write_read_ratio")]
+    pub cache_write_read_ratio: f64,
+    /// 切点之后至少原样保留这么多 token 的近期轮次。
+    #[serde(default = "default_keep_recent_tokens")]
+    pub keep_recent_tokens: u64,
+    /// 离窗口还剩这么多 token 时不看账，直接压。
+    #[serde(default = "default_window_reserve_tokens")]
+    pub window_reserve_tokens: u64,
+    /// 第一次压缩时把剩余请求估计放大的倍数。
+    #[serde(default = "default_first_compaction_scale")]
+    pub first_compaction_scale: f64,
+    /// 之后的压缩要求 `回本请求数 × margin ≤ 剩余请求`。
+    #[serde(default = "default_subsequent_margin")]
+    pub subsequent_margin: f64,
+    /// 上次压缩之后至少过了这么多次请求，才按经济账再压。
+    #[serde(default = "default_cooldown_requests")]
+    pub cooldown_requests: u64,
+    /// 摘要本身的 token 估计。
+    #[serde(default = "default_memo_token_estimate")]
+    pub memo_token_estimate: u64,
+}
+
+impl CompactionConfig {
+    /// 决策的旋钮；没有配置项的两个（剩余请求的缩放与标准差系数）取默认。
+    pub fn economics(&self) -> CompactionEconomics {
+        CompactionEconomics {
+            window_reserve_tokens: self.window_reserve_tokens,
+            first_compaction_request_scale: self.first_compaction_scale,
+            subsequent_compaction_margin: self.subsequent_margin,
+            minimum_requests_since_compaction: self.cooldown_requests,
+            ..CompactionEconomics::default()
+        }
+    }
+}
+
+fn default_cache_write_read_ratio() -> f64 {
+    12.5
+}
+
+fn default_keep_recent_tokens() -> u64 {
+    20_000
+}
+
+fn default_window_reserve_tokens() -> u64 {
+    CompactionEconomics::default().window_reserve_tokens
+}
+
+fn default_first_compaction_scale() -> f64 {
+    CompactionEconomics::default().first_compaction_request_scale
+}
+
+fn default_subsequent_margin() -> f64 {
+    CompactionEconomics::default().subsequent_compaction_margin
+}
+
+fn default_cooldown_requests() -> u64 {
+    CompactionEconomics::default().minimum_requests_since_compaction
+}
+
+fn default_memo_token_estimate() -> u64 {
+    1_000
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cache_write_read_ratio: default_cache_write_read_ratio(),
+            keep_recent_tokens: default_keep_recent_tokens(),
+            window_reserve_tokens: default_window_reserve_tokens(),
+            first_compaction_scale: default_first_compaction_scale(),
+            subsequent_margin: default_subsequent_margin(),
+            cooldown_requests: default_cooldown_requests(),
+            memo_token_estimate: default_memo_token_estimate(),
+        }
+    }
+}
+
 /// 数据目录下的各个位置（§12）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathsConfig {
@@ -401,7 +490,7 @@ pub struct SourceFile {
 }
 
 /// 一份完整的配置快照。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub start_only: StartOnly,
     /// `model.<alias>` 解析后的完整模型目录。运行时按 alias 选择，不在调用处拼接端点。
@@ -417,6 +506,8 @@ pub struct ConfigSnapshot {
     pub typesafe: TypesafeConfig,
     #[serde(default)]
     pub execution: ExecutionConfig,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
     pub channels: ChannelsConfig,
     pub policy: RuleTable,
     pub paths: PathsConfig,
@@ -521,6 +612,7 @@ mod tests {
     fn snapshot() -> ConfigSnapshot {
         ConfigSnapshot {
             execution: ExecutionConfig::default(),
+            compaction: CompactionConfig::default(),
             start_only: StartOnly {
                 data_dir: PathBuf::from("/home/u/.komo"),
                 listen: "127.0.0.1:7777".into(),

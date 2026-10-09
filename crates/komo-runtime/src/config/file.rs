@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 
 use komo_kernel::policy::RuleTable;
 use komo_kernel::protocol::config::{
-    ChannelConfig, ChannelsConfig, ConfigSnapshot, ExecutionConfig, KeyPath, McpServerConfig,
-    McpTransport, MemoryConfig, PathsConfig, RetrievalConfig, SourceFile, StartOnly,
-    TypesafeConfig,
+    ChannelConfig, ChannelsConfig, CompactionConfig, ConfigSnapshot, ExecutionConfig, KeyPath,
+    McpServerConfig, McpTransport, MemoryConfig, PathsConfig, RetrievalConfig, SourceFile,
+    StartOnly, TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile};
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
@@ -57,6 +57,8 @@ pub(super) struct FileConfig {
     pub memory: MemorySection,
     #[serde(default)]
     pub execution: ExecutionSection,
+    #[serde(default)]
+    pub compaction: CompactionSection,
     #[serde(default)]
     pub typesafe: TypesafeSection,
     /// 没有明确归属的入口（TUI / CLI / Cron）走哪个 Agent。**必须指向一个声明过的
@@ -163,6 +165,40 @@ impl ExecutionSection {
             decay_full_sends: self.decay_full_sends.unwrap_or(base.decay_full_sends),
             decay_head_bytes: self.decay_head_bytes.unwrap_or(base.decay_head_bytes),
             decay_tail_bytes: self.decay_tail_bytes.unwrap_or(base.decay_tail_bytes),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct CompactionSection {
+    pub enabled: Option<bool>,
+    pub cache_write_read_ratio: Option<f64>,
+    pub keep_recent_tokens: Option<u64>,
+    pub window_reserve_tokens: Option<u64>,
+    pub first_compaction_scale: Option<f64>,
+    pub subsequent_margin: Option<f64>,
+    pub cooldown_requests: Option<u64>,
+    pub memo_token_estimate: Option<u64>,
+}
+
+impl CompactionSection {
+    fn into_compaction(self) -> CompactionConfig {
+        let base = CompactionConfig::default();
+        CompactionConfig {
+            enabled: self.enabled.unwrap_or(base.enabled),
+            cache_write_read_ratio: self
+                .cache_write_read_ratio
+                .unwrap_or(base.cache_write_read_ratio),
+            keep_recent_tokens: self.keep_recent_tokens.unwrap_or(base.keep_recent_tokens),
+            window_reserve_tokens: self
+                .window_reserve_tokens
+                .unwrap_or(base.window_reserve_tokens),
+            first_compaction_scale: self
+                .first_compaction_scale
+                .unwrap_or(base.first_compaction_scale),
+            subsequent_margin: self.subsequent_margin.unwrap_or(base.subsequent_margin),
+            cooldown_requests: self.cooldown_requests.unwrap_or(base.cooldown_requests),
+            memo_token_estimate: self.memo_token_estimate.unwrap_or(base.memo_token_estimate),
         }
     }
 }
@@ -596,6 +632,7 @@ pub(super) fn assemble(
         agent: build_agents(file.default_agent, file.agents, &base)?,
         typesafe: file.typesafe.into_typesafe(),
         execution: file.execution.into_execution(),
+        compaction: file.compaction.into_compaction(),
         channels,
         policy,
         paths,

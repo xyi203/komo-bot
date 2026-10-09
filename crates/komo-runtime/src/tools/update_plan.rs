@@ -47,7 +47,8 @@ impl Tool for UpdatePlanTool {
                           没有副作用，不用审批。规则：每次都发**整份**计划，不是增量；步骤 id \
                           保持不变，先登记、做完再标 completed（一上来就标 completed 的新步骤\
                           只算补记历史）；同一时间最多一个 in_progress；标 completed 时在 \
-                          progress 里写上改了哪些文件、怎么验证的、做了什么决定。"
+                          progress 里写上改了哪些文件、怎么验证的、做了什么决定——完成一步时 \
+                          harness 可能把更早的上下文收成摘要，progress 就是摘要的依据。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",

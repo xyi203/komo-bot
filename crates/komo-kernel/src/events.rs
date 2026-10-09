@@ -523,7 +523,16 @@ pub enum ContextCompacted {
         usage: TokenUsage,
     },
     /// 这个边界上没压（账算不过来、切不出、摘要请求失败……）。上下文原样还在。
-    Skipped { reason: String },
+    Skipped {
+        reason: String,
+        /// 当时的决策，供事后核对。`compact: true` 而落到这里 = 决定了压、摘要请求却没成
+        /// （失败、被截断），在线状态据此先不在窗口压力下重试（[`OnlineState`] 的
+        /// `compaction_refused`）。
+        ///
+        /// [`OnlineState`]: crate::compaction::OnlineState
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        decision: Option<CompactionDecision>,
+    },
 }
 
 #[cfg(test)]
@@ -712,6 +721,7 @@ mod tests {
             10,
             ContextCompacted::Skipped {
                 reason: "deferred_economic".into(),
+                decision: None,
             },
         );
         let line = skipped.to_line().unwrap();

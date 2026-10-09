@@ -71,6 +71,7 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
     check_channels(snapshot, &mut issues);
     check_policy(snapshot, &mut issues);
     check_execution(snapshot, &mut issues);
+    check_compaction(snapshot, &mut issues);
     check_typesafe(snapshot, &mut issues);
     check_agents(snapshot, &mut issues);
     check_mcp(snapshot, &mut issues);
@@ -405,6 +406,35 @@ fn check_execution(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
         issues.push(error(
             "execution.decay_head_bytes",
             "decay_head_bytes + decay_tail_bytes 要小于 decay_threshold_bytes（否则摘录不比原文短）",
+        ));
+    }
+}
+
+/// `[compaction]`（§6）：比率与倍数要是有限的正数，否则决策里的算式没有意义；近期
+/// 至少要留一点，切点才落得下。
+fn check_compaction(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    let compaction = &snapshot.compaction;
+    if !compaction.cache_write_read_ratio.is_finite() || compaction.cache_write_read_ratio < 0.0 {
+        issues.push(error(
+            "compaction.cache_write_read_ratio",
+            "cache_write_read_ratio 要是有限的非负数",
+        ));
+    }
+    for (key, value) in [
+        (
+            "compaction.first_compaction_scale",
+            compaction.first_compaction_scale,
+        ),
+        ("compaction.subsequent_margin", compaction.subsequent_margin),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            issues.push(error(key, "要是有限的正数"));
+        }
+    }
+    if compaction.keep_recent_tokens == 0 {
+        issues.push(error(
+            "compaction.keep_recent_tokens",
+            "keep_recent_tokens 至少是 1（近期的轮次总要原样留着）",
         ));
     }
 }

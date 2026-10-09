@@ -458,6 +458,57 @@ fn zero_full_sends_refuses_the_load() {
 }
 
 #[test]
+fn compaction_is_off_by_default_and_its_keys_map_onto_the_economics() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    let compaction = &loaded.snapshot.compaction;
+    assert!(!compaction.enabled, "默认关");
+    assert_eq!(compaction.cache_write_read_ratio, 12.5);
+    assert_eq!(compaction.keep_recent_tokens, 20_000);
+    assert_eq!(compaction.memo_token_estimate, 1_000);
+    assert_eq!(
+        compaction.economics(),
+        komo_kernel::compaction::CompactionEconomics::default()
+    );
+
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str(
+        "\n[compaction]\nenabled = true\nwindow_reserve_tokens = 8000\n\
+         first_compaction_scale = 3.0\nsubsequent_margin = 2.0\ncooldown_requests = 4\n",
+    );
+    write(&fixture.sources().config, &text);
+    let loaded = load_config(&fixture.options()).unwrap();
+    let economics = loaded.snapshot.compaction.economics();
+    assert!(loaded.snapshot.compaction.enabled);
+    assert_eq!(economics.window_reserve_tokens, 8_000);
+    assert_eq!(economics.first_compaction_request_scale, 3.0);
+    assert_eq!(economics.subsequent_compaction_margin, 2.0);
+    assert_eq!(economics.minimum_requests_since_compaction, 4);
+}
+
+#[test]
+fn nonsensical_compaction_numbers_refuse_the_load() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str(
+        "\n[compaction]\ncache_write_read_ratio = -1.0\nsubsequent_margin = 0.0\n\
+         keep_recent_tokens = 0\n",
+    );
+    write(&fixture.sources().config, &text);
+
+    let error = load_config(&fixture.options()).unwrap_err();
+    let keys: Vec<&str> = error.issues().iter().map(|i| i.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec![
+            "compaction.cache_write_read_ratio",
+            "compaction.keep_recent_tokens",
+            "compaction.subsequent_margin",
+        ]
+    );
+}
+
+#[test]
 fn a_config_without_a_model_section_says_which_key_is_missing() {
     let fixture = Fixture::valid();
     write(&fixture.sources().config, "[memory]\nenabled = false\n");

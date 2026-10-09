@@ -93,6 +93,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
     };
     ConfigSnapshot {
         execution: Default::default(),
+        compaction: Default::default(),
         start_only: StartOnly {
             data_dir: "/tmp/komo".into(),
             listen: "127.0.0.1:7777".into(),

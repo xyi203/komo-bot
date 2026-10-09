@@ -885,6 +885,7 @@ mod tests {
             seq,
             ContextCompacted::Skipped {
                 reason: "deferred_economic".into(),
+                decision: None,
             },
         )
     }
@@ -1028,6 +1029,7 @@ mod tests {
                         0 => crate::test_support::compacted(Seq(rng.below(seq + 1)), "摘要"),
                         _ => ContextCompacted::Skipped {
                             reason: "deferred_economic".into(),
+                            decision: None,
                         },
                     }),
                     _ => EventPayload::Unknown {

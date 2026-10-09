@@ -333,10 +333,20 @@ pub fn latest_user_text(surface: &Surface) -> Option<String> {
 ///
 /// `pub(crate)`：Gateway 不该绕过 [`super::assemble`] 直接拿到 `Vec<ReplayMessage>`——
 /// **唯一的 Context Assembly 入口**只有那一个（§5）。
+#[cfg(test)]
 pub(crate) fn to_replay_messages(
     history: Vec<ResolvedMessage<'_>>,
     projection: &ProjectionContext,
 ) -> Vec<ReplayMessage> {
+    replay_messages(history, projection).0
+}
+
+/// [`to_replay_messages`]，另外给出正在跑的这条 Run 从第几条消息开始（它的 `Protocol`
+/// 与 `Summary` 条目在窗口里连成一段、排在最后）；窗口里没有它就是消息条数。
+pub(crate) fn replay_messages(
+    history: Vec<ResolvedMessage<'_>>,
+    projection: &ProjectionContext,
+) -> (Vec<ReplayMessage>, usize) {
     // 结果落在**另一条**消息上（`Role::Tool` 的节点），工具名与 provider 的 call_id 要靠
     // 这份索引从原始请求里找回来——先把这一段窗口里出现过的调用都记一遍。
     let mut requests: BTreeMap<&ToolCallId, &ToolCallRequest> = BTreeMap::new();
@@ -362,8 +372,12 @@ pub(crate) fn to_replay_messages(
     }
 
     let mut out = Vec::new();
+    let mut run_from = None;
     for (resolved, sends_so_far) in history.into_iter().zip(later_rounds) {
         let message = resolved.entry.message;
+        if resolved.entry.kind != EntryKind::Transcript && run_from.is_none() {
+            run_from = Some(out.len());
+        }
         match resolved.entry.kind {
             EntryKind::Transcript => {
                 let ending = resolved.entry.ending.and_then(|ending| ending.sentence());
@@ -449,7 +463,8 @@ pub(crate) fn to_replay_messages(
             }
         }
     }
-    out
+    let run_from = run_from.unwrap_or(out.len());
+    (out, run_from)
 }
 
 #[cfg(test)]

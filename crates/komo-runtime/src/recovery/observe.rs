@@ -421,6 +421,7 @@ mod tests {
             komo_kernel::test_support::compacted(Seq(2), "摘要"),
             ContextCompacted::Skipped {
                 reason: "deferred_economic".into(),
+                decision: None,
             },
         ] {
             let mut events = base.clone();

@@ -57,6 +57,10 @@ pub struct OnlineState {
     /// 刚过了一个计划边界：此后既没有新的请求，也没有记下压缩的结果。
     /// 这一刻是做压缩决定的时机。
     pub pending_boundary: bool,
+    /// 上一次决定了压、摘要请求却没成（`skipped` 带着 `compact: true` 的决策）。此后
+    /// 窗口压力不再触发重试，直到出现真正的工具工作（`update_plan` 以外完成的调用）、
+    /// 新的计划边界或一次成功的压缩——同一段上下文再请求一次摘要，多半还是同样的结果。
+    pub compaction_refused: bool,
 }
 
 impl OnlineState {
@@ -107,6 +111,7 @@ impl OnlineState {
         self.last_boundary_request_count = self.request_count;
         self.completed_boundary_request_counts.push(interval);
         self.pending_boundary = true;
+        self.compaction_refused = false;
     }
 
     /// 压缩完成。计划和每步的样本都留着：压缩换的是上下文的写法，不是哪些步骤做完了。
@@ -119,11 +124,21 @@ impl OnlineState {
         self.cache_debt_tokens += debt.debt_tokens.max(0.0);
         self.cache_debt_repayment_tokens += debt.repayment_tokens;
         self.pending_boundary = false;
+        self.compaction_refused = false;
     }
 
     /// 在边界上决定了不压（或者压不成）。上下文原样还在，只是这个边界用掉了。
-    pub fn record_skipped(&mut self) {
+    /// `refused` = 决定了压、摘要请求却没成。
+    pub fn record_skipped(&mut self, refused: bool) {
         self.pending_boundary = false;
+        if refused {
+            self.compaction_refused = true;
+        }
+    }
+
+    /// `update_plan` 以外的一次调用完成了：上下文里有了新的工作，可以再试着压。
+    pub fn record_tool_work(&mut self) {
+        self.compaction_refused = false;
     }
 
     /// 每次请求上下文平均涨多少（只算涨的那些次）。
@@ -219,17 +234,21 @@ impl OnlineFold {
             // 只认完成的结果；同一个调用的后一条结果（先 uncertain、介入后补一条
             // completed）照样生效一次，之后的重复不再生效。
             EventPayload::ToolResult(body) => {
-                if body.status == ToolResultStatus::Completed
-                    && let Some(update) = self.planned.remove(&body.call_id)
-                {
-                    self.state.record_plan_update(&update);
+                if body.status == ToolResultStatus::Completed {
+                    match self.planned.remove(&body.call_id) {
+                        Some(update) => {
+                            self.state.record_plan_update(&update);
+                        }
+                        None => self.state.record_tool_work(),
+                    }
                 }
             }
             EventPayload::ContextCompacted(ContextCompacted::Compacted { debt, .. }) => {
                 self.state.record_compaction(*debt);
             }
-            EventPayload::ContextCompacted(ContextCompacted::Skipped { .. }) => {
-                self.state.record_skipped();
+            EventPayload::ContextCompacted(ContextCompacted::Skipped { decision, .. }) => {
+                self.state
+                    .record_skipped(decision.as_ref().is_some_and(|d| d.compact));
             }
             // 其余事件与未知词汇对在线状态没有意义（§8.3）。
             _ => {}
@@ -635,7 +654,7 @@ mod tests {
         let mut state = online_state(&log(), &RunId::from_raw(RUN));
         assert!(state.pending_boundary);
         let before = state.clone();
-        state.record_skipped();
+        state.record_skipped(false);
         assert!(!state.pending_boundary);
         assert_eq!(
             OnlineState {
@@ -655,6 +674,7 @@ mod tests {
             RUN,
             ContextCompacted::Skipped {
                 reason: "deferred_economic".into(),
+                decision: None,
             },
         )
     }
@@ -695,6 +715,69 @@ mod tests {
         let mut others = log();
         others.push(compaction(13, "child", compacted));
         assert_eq!(online_state(&others, &run), online_state(&log(), &run));
+    }
+
+    /// 决定了压、摘要却没成：先不在窗口压力下重试，直到有真正的工具工作、新的边界或
+    /// 一次成功的压缩。`update_plan` 不算工作；经济账上的 `skipped` 不算拒绝。
+    #[test]
+    fn a_refused_summary_holds_until_real_work_a_boundary_or_a_compaction() {
+        let run = RunId::from_raw(RUN);
+        let refused = |seq| {
+            let ContextCompacted::Compacted { decision, .. } =
+                crate::test_support::compacted(Seq(8), "摘要")
+            else {
+                unreachable!()
+            };
+            compaction(
+                seq,
+                RUN,
+                ContextCompacted::Skipped {
+                    reason: "摘要请求失败".into(),
+                    decision: Some(decision),
+                },
+            )
+        };
+        let mut events = log();
+        events.push(skipped(13));
+        assert!(
+            !online_state(&events, &run).compaction_refused,
+            "经济账不压不算"
+        );
+        events.push(refused(14));
+        assert!(online_state(&events, &run).compaction_refused);
+
+        // 只更新计划不算工作。
+        events.push(update_plan(
+            15,
+            "c5",
+            vec![
+                step("a", PlanStatus::Completed),
+                step("b", PlanStatus::Completed),
+            ],
+        ));
+        events.push(done(16, "c5"));
+        assert!(online_state(&events, &run).compaction_refused);
+        // 失败的调用也不算。
+        events.push(result(17, RUN, "w1", ToolResultStatus::Failed));
+        assert!(online_state(&events, &run).compaction_refused);
+        events.push(done(18, "w2"));
+        assert!(!online_state(&events, &run).compaction_refused);
+
+        events.push(refused(19));
+        let mut state = online_state(&events, &run);
+        assert!(state.compaction_refused);
+        state.record_boundary(&[], None);
+        assert!(!state.compaction_refused, "新的边界解除");
+
+        events.push(compaction(
+            20,
+            RUN,
+            crate::test_support::compacted(Seq(8), "摘要"),
+        ));
+        assert!(
+            !online_state(&events, &run).compaction_refused,
+            "压成了解除"
+        );
     }
 
     #[test]

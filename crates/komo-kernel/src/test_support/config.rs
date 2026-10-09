@@ -73,6 +73,7 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
     };
     ConfigSnapshot {
         execution: Default::default(),
+        compaction: Default::default(),
         start_only: StartOnly {
             data_dir: home.clone(),
             // 与 `komo-runtime` 的 `DEFAULT_LISTEN` 同值；夹具的监听地址没有测试断言它，

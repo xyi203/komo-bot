@@ -43,6 +43,10 @@ const RENEW_INTERVAL: Duration = Duration::from_secs(30);
 /// 每一次续租把租约推到多久之后（见 [`RENEW_INTERVAL`] 的 3 倍关系）。
 const LEASE_AHEAD: time::Duration = time::Duration::seconds(90);
 
+/// 一次领取里最多压几次再重新装配（[`SegmentOutcome::Recompose`]）。到了就不再压，
+/// 照常跑完这一段——压缩是省钱的手段，不该变成一个不前进的环。
+const MAX_RECOMPOSITIONS: u32 = 8;
+
 /// 后台续租的那个任务。**它和这一段同生共死**：`Drop` 即 `abort`。
 ///
 /// 为什么不能让它留着（哪怕一次）：一个**已经结束**的 Run 继续续租，会让对账永远看不到
@@ -255,20 +259,63 @@ impl AgentRunHandler {
             .start_run(&claimed.run, &self.executor_id, claimed.generation)
             .await?;
 
-        let segment = self
-            .source
-            .segment(claimed, self.executor.catalog())
-            .await?;
+        // 压成了就按日志重新装配、同一个 Run 接着跑（§6）：不重新入队，也不再写一次
+        // `run.started`。这一次领取里已经跑过的轮数与 token 从下一段的预算里扣掉——
+        // 不然每压一次预算就满血复活一次。
+        let mut recompositions = 0;
+        let mut used_rounds = 0u32;
+        let mut used_tokens = 0u64;
+        let mut previous_cancel: Option<CancelToken> = None;
+        let outcome = loop {
+            let mut segment = self
+                .source
+                .segment(claimed, self.executor.catalog())
+                .await?;
+            segment.budget.max_rounds = segment.budget.max_rounds.saturating_sub(used_rounds);
+            if let Some(limit) = segment.budget.max_tokens.as_mut() {
+                *limit = limit.saturating_sub(used_tokens);
+            }
+            // 取消按在上一段的令牌上、而新一段已经换了令牌：传过来，不丢。
+            if previous_cancel
+                .as_ref()
+                .is_some_and(CancelToken::is_cancelled)
+            {
+                segment.env.cancel.cancel();
+            }
+            if recompositions >= MAX_RECOMPOSITIONS
+                && (segment.compaction.is_some() || segment.compactor.is_some())
+            {
+                tracing::warn!(
+                    run = %claimed.run,
+                    recompositions,
+                    "这一次领取里压缩重装配已到上限，这一段不再压"
+                );
+                segment.compaction = None;
+                segment.compactor = None;
+            }
+            let cancel = segment.env.cancel.clone();
 
-        // 续租要能**取消这一段**：取消令牌在段里（`CallEnv`），先克隆一份（同一个
-        // `AtomicBool`）再把它交给 loop。心跳在装配之后起——装配阶段还拿不到令牌，而且
-        // 那个阶段不写账本、不产生副作用，最长的那一段（模型调用与工具执行）在它后面。
-        let heartbeat = self.heartbeat(claimed, segment.env.cancel.clone());
+            // 续租要能**取消这一段**：取消令牌在段里（`CallEnv`），先克隆一份（同一个
+            // `AtomicBool`）再把它交给 loop。心跳在装配之后起——装配阶段还拿不到令牌，
+            // 而且那个阶段不写账本、不产生副作用，最长的那一段（模型调用与工具执行）在它
+            // 后面。
+            let heartbeat = self.heartbeat(claimed, cancel.clone());
 
-        let outcome = self.agent.run(segment).await;
-        // **`attempt` 一返回，心跳就必须停**（否则一个已结束的 Run 会一直续租，对账
-        // 永远看不到它是孤儿）。`Drop` 会 abort，这里写明是为了让顺序看得见。
-        drop(heartbeat);
+            let outcome = self.agent.run(segment).await;
+            // **这一段一返回，心跳就必须停**（否则一个已结束的 Run 会一直续租，对账
+            // 永远看不到它是孤儿）。`Drop` 会 abort，这里写明是为了让顺序看得见。
+            drop(heartbeat);
+
+            match outcome {
+                Ok(SegmentOutcome::Recompose { rounds, usage }) => {
+                    recompositions += 1;
+                    used_rounds += rounds;
+                    used_tokens += super::spent(&usage);
+                    previous_cancel = Some(cancel);
+                }
+                other => break other,
+            }
+        };
 
         match outcome {
             // 终态与挂起都已经在账本上了（`AgentLoop::run` 返回前一定写过一条）。
@@ -276,6 +323,9 @@ impl AgentRunHandler {
             | Ok(SegmentOutcome::Suspended { .. })
             | Ok(SegmentOutcome::Failed { .. })
             | Ok(SegmentOutcome::Cancelled { .. }) => Ok(()),
+            Ok(SegmentOutcome::Recompose { .. }) => {
+                unreachable!("上面的循环接着跑，不会带着它出来")
+            }
             // 只有账本 / 存储写不进去才到这里：什么都没写下，调度器 release 之后
             // 下一轮重新领取。**不在这里补写一个终态**——那等于把一次写入失败说成
             // 一次执行结果。
@@ -319,6 +369,8 @@ mod tests {
                     budget: Budget::default(),
                     resume: None,
                     command: None,
+                    compaction: None,
+                    compactor: None,
                     session,
                     run,
                 })
@@ -764,5 +816,161 @@ mod tests {
             Some(lease),
             "租约表上那一次的值也不动"
         );
+    }
+
+    fn events_named(harness: &Harness, name: &str) -> usize {
+        harness
+            .ledger
+            .events()
+            .iter()
+            .filter(|event| event.payload.type_name() == name)
+            .count()
+    }
+
+    /// 压成了：handler 再要一段、再跑一次——同一个 Run，不回队列，`run.started` 只有一条。
+    /// 一次领取里最多重装配 8 次，到了就照常跑完。
+    #[tokio::test]
+    async fn recompose_reassembles_without_requeue_and_caps() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![]);
+        let mut scripts: Vec<Vec<Round>> = (0..MAX_RECOMPOSITIONS)
+            .map(|n| vec![round(1, Some(&format!("第 {n} 份摘要")), vec![])])
+            .collect();
+        scripts.push(vec![round(1, Some("好了。"), vec![])]);
+        let llm = Arc::new(ScriptedLlm::new(scripts));
+        let agent = Arc::new(AgentLoop::new(
+            Arc::clone(&llm) as Arc<dyn LlmClient>,
+            harness.ledger.clone(),
+            executor.clone(),
+            Arc::new(harness.clock.clone()),
+        ));
+        let (session, run) = harness.open_run().await;
+
+        let assembled = Arc::new(AtomicUsize::new(0));
+        let env = harness.env(&session, &run);
+        let source = {
+            let assembled = Arc::clone(&assembled);
+            let (session, run) = (session.clone(), run.clone());
+            Arc::new(from_fn(move |_claimed, _tools| {
+                assembled.fetch_add(1, Ordering::SeqCst);
+                let env = env.clone();
+                let (session, run) = (session.clone(), run.clone());
+                async move {
+                    Ok(Segment {
+                        request: turn_request(&session, &run),
+                        env,
+                        budget: Budget::default(),
+                        resume: None,
+                        command: None,
+                        // 每一段都说要压：上限之后 handler 把它摘掉。
+                        compaction: Some(compaction_job(&session, &run)),
+                        compactor: None,
+                        session,
+                        run,
+                    })
+                }
+            })) as Arc<dyn SegmentSource>
+        };
+        let queue = LeaseFake::new();
+        let claimed = claim_one(&queue, &run).await;
+        let handler = handler(
+            &harness,
+            agent,
+            executor,
+            source,
+            Arc::clone(&queue) as Arc<dyn RunQueue>,
+        );
+        handler.run(claimed).await.expect("跑完了");
+
+        assert_eq!(
+            assembled.load(Ordering::SeqCst),
+            MAX_RECOMPOSITIONS as usize + 1,
+            "压一次重新装配一次，到上限后再装配的那一段照常跑"
+        );
+        assert_eq!(events_named(&harness, "run.started"), 1, "没有第二次领取");
+        assert_eq!(
+            events_named(&harness, "context.compacted"),
+            MAX_RECOMPOSITIONS as usize
+        );
+        assert_eq!(queue.inner.depth(), 0, "没有回队列");
+        let view = harness.ledger.surface().runs.get(&run).cloned().unwrap();
+        assert_eq!(view.status, RunState::Completed);
+        assert_eq!(
+            llm.requests.lock().unwrap().len(),
+            MAX_RECOMPOSITIONS as usize + 1
+        );
+    }
+
+    /// 重新装配不让预算满血复活：这一次领取里跑过的轮数从下一段的 `max_rounds` 里扣。
+    #[tokio::test]
+    async fn recomposing_does_not_refill_the_round_budget() {
+        let harness = Harness::new();
+        let executor = harness.permissive(vec![Arc::new(
+            crate::executor::harness::RecordingTool::shell(),
+        )]);
+        let mut scripts = Vec::new();
+        for n in 0..3 {
+            scripts.push(vec![round(
+                1,
+                None,
+                vec![call(&format!("pc-{n}"), "shell", serde_json::json!({}))],
+            )]);
+            scripts.push(vec![round(1, Some("摘要"), vec![])]);
+        }
+        let llm = Arc::new(ScriptedLlm::new(scripts));
+        let agent = Arc::new(AgentLoop::new(
+            Arc::clone(&llm) as Arc<dyn LlmClient>,
+            harness.ledger.clone(),
+            executor.clone(),
+            Arc::new(harness.clock.clone()),
+        ));
+        let (session, run) = harness.open_run().await;
+        let env = harness.env(&session, &run);
+        let source = {
+            let (session, run) = (session.clone(), run.clone());
+            Arc::new(from_fn(move |_claimed, _tools| {
+                let env = env.clone();
+                let (session, run) = (session.clone(), run.clone());
+                async move {
+                    // 每轮之后都问、每次都压。
+                    let planner = FakePlanner::new(vec![Some(compaction_job(&session, &run))]);
+                    Ok(Segment {
+                        request: turn_request(&session, &run),
+                        env,
+                        budget: Budget {
+                            max_rounds: 3,
+                            ..Budget::default()
+                        },
+                        resume: None,
+                        command: None,
+                        compaction: None,
+                        compactor: Some(crate::agent::Compactor {
+                            pressure_tokens: Some(0),
+                            ..compactor(planner)
+                        }),
+                        session,
+                        run,
+                    })
+                }
+            })) as Arc<dyn SegmentSource>
+        };
+        let handler = handler(&harness, agent, executor, source, LeaseFake::new());
+        handler
+            .run(Claimed {
+                run: run.clone(),
+                generation: 1,
+            })
+            .await
+            .expect("跑完了");
+
+        let view = harness.ledger.surface().runs.get(&run).cloned().unwrap();
+        assert_eq!(view.status, RunState::Failed, "{view:?}");
+        assert!(
+            view.reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("总轮数预算")),
+            "{view:?}"
+        );
+        assert_eq!(events_named(&harness, "message.assistant"), 3);
     }
 }

@@ -5,8 +5,13 @@
 //!   → TurnDriver::next            一回合一次 completion
 //!   → Ledger::record_round        完整 assistant 回复 + 该轮全部调用计划，一个逻辑事件
 //!   → ToolExecutor::execute_round 执行本轮全部调用（只读的可以同时在飞，§6）
+//!   → [计划边界 / 贴着窗口] CompactionPlanner::plan → 摘要请求 → context.compacted → Recompose
 //!   → 按 call_id 回传结果 → 下一轮
 //! ```
+//!
+//! **在线压缩只在真的压了时才把这一段交回去**（[`SegmentOutcome::Recompose`]）。决定不压
+//! 时 driver 原样接着跑，下一次请求与没有这个功能时逐字节相同——提示缓存照样命中；
+//! 决定压时前缀本来就要换，Gateway 按日志重新装配（任务 → 摘要 → 切点起原样）。
 //!
 //! 三条硬约束写在代码的形状里：
 //!
@@ -22,6 +27,9 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
+use komo_kernel::compaction::{CompactionJob, estimate_tokens};
+use komo_kernel::events::ContextCompacted;
 use komo_kernel::traits::{Clock, Ledger, LedgerError, LlmClient};
 use komo_kernel::types::ids::{InterventionId, RunId, SessionId, ToolCallId};
 use komo_kernel::types::model::TokenUsage;
@@ -111,6 +119,73 @@ pub struct Segment {
     /// ——判据在 Run 的来源上，由组装 `Segment` 的一侧（`GatewaySegments::segment`）
     /// 按 Job 定义算出来，这里只管按它选驱动。
     pub command: Option<command_driver::CommandSpec>,
+    /// 装配时就决定了要压：这一段先发摘要请求，压成就交回去重新装配，没成记一条
+    /// `skipped` 照常往下跑（§6）。
+    pub compaction: Option<CompactionJob>,
+    /// 一轮收尾之后要不要再问一次压不压。`None` = 压缩关着（或命令 Run）。
+    pub compactor: Option<Compactor>,
+}
+
+/// 在线压缩的决策方（§6）。Gateway 实现：读日志、按模型实际看到的视图估价、按当前
+/// 配置决定压不压。
+#[async_trait]
+pub trait CompactionPlanner: Send + Sync {
+    /// 一轮的调用**全部收尾之后**、下一次请求之前问。要压就给出摘要请求；在计划边界上
+    /// 决定不压由实现记一条 `skipped`（把边界用掉）；其余情形什么都不记。
+    async fn plan(&self) -> Option<CompactionJob>;
+}
+
+/// loop 这一侧：什么时候去问 [`CompactionPlanner`]。只有三种时机——这一轮完成了一个计划
+/// 步骤、日志里还压着一个没用掉的边界、估计的上下文贴着窗口；别的轮次一次都不问（问一
+/// 次要读一遍日志）。
+pub struct Compactor {
+    pub planner: Arc<dyn CompactionPlanner>,
+    /// 估计的上下文到这么多 token（窗口 − 预留）就问一次；`None` = 不知道窗口。
+    pub pressure_tokens: Option<u64>,
+    /// 这一段开头那次请求的估计（字节 / 4，与 planner 同一把尺子）；每轮往上加。
+    pub estimate: u64,
+    /// 日志里已经有一个没用掉的边界，但这一段开头还有没收尾的调用、当时不能决定：续跑
+    /// 的那一轮收尾之后问一次。
+    pub pending: bool,
+}
+
+impl Compactor {
+    /// 这一轮收尾之后该不该问。估计按两边取大：字节估计不知道 provider 的分词，实报的
+    /// 用量又不含这一轮新加的结果。
+    fn due(
+        &mut self,
+        boundary: bool,
+        round: Option<&Round>,
+        results: &[ToolResultForModel],
+    ) -> bool {
+        let results_tokens: u64 = results
+            .iter()
+            .map(|result| estimate_tokens(&result.content))
+            .sum();
+        let round_tokens = round.map_or(0, |round| match &round.provider_blocks {
+            Some(blocks) => estimate_tokens(&blocks.to_string()),
+            None => {
+                round.text.as_deref().map_or(0, estimate_tokens)
+                    + round
+                        .tool_calls
+                        .iter()
+                        .map(|call| estimate_tokens(&call.arguments.to_string()))
+                        .sum::<u64>()
+            }
+        });
+        self.estimate += round_tokens + results_tokens;
+        let reported = round
+            .and_then(|round| round.usage.input.map(|input| (input, round.usage.output)))
+            .map_or(0, |(input, output)| {
+                input + output.unwrap_or(0) + results_tokens
+            });
+        let pressure = self
+            .pressure_tokens
+            .is_some_and(|limit| self.estimate.max(reported) >= limit);
+        let due = boundary || self.pending || pressure;
+        self.pending = false;
+        due
+    }
 }
 
 /// 一段跑完之后 Run 处在哪。
@@ -134,6 +209,19 @@ pub enum SegmentOutcome {
     Cancelled {
         rounds: u32,
     },
+    /// 压成了（`context.compacted` 已落盘）：交回去重新装配，**同一个 Run 接着跑**——
+    /// 不重新入队、不再写 `run.started`。`usage` 含摘要请求。
+    Recompose {
+        rounds: u32,
+        usage: TokenUsage,
+    },
+}
+
+/// 一次摘要请求的结局。
+enum Compaction {
+    Compacted,
+    Skipped,
+    Cancelled,
 }
 
 /// 只有账本写不进去才是错误——其余一切都有一个终态。
@@ -189,12 +277,30 @@ impl AgentLoop {
             budget,
             resume,
             command,
+            compaction,
+            mut compactor,
         } = segment;
 
         let mut rounds = 0;
+        // 摘要请求的用量：不算轮数，但算进这个 Run 的 token 花销。
+        let mut summaries = TokenUsage::default();
 
         if env.cancel.is_cancelled() {
             return self.cancel(&run, rounds).await;
+        }
+
+        // 装配时就决定了要压：先压，再开这一段的 driver——压成了这一段的请求就作废了。
+        if let Some(job) = compaction {
+            match self.compact(&run, job, &env.cancel, &mut summaries).await? {
+                Compaction::Compacted => {
+                    return Ok(SegmentOutcome::Recompose {
+                        rounds,
+                        usage: summaries,
+                    });
+                }
+                Compaction::Cancelled => return self.cancel(&run, rounds).await,
+                Compaction::Skipped => {}
+            }
         }
 
         // 回放窗口里还没完整给够次数的大结果：这一段里到点就换成短视图（§8.3）。
@@ -223,6 +329,14 @@ impl AgentLoop {
                     return self.stop(&run, rounds, stop).await;
                 }
                 decay.track(&mut results);
+                if let Some(compactor) = compactor.as_mut()
+                    && compactor.due(outcome.plan_boundary, None, &results)
+                    && let Some(done) = self
+                        .compact_now(&run, rounds, compactor, &env.cancel, &mut summaries)
+                        .await?
+                {
+                    return Ok(with_driver_usage(done, &driver.usage()));
+                }
                 RoundInput::ToolResults {
                     results,
                     revised: decay.due(),
@@ -283,15 +397,17 @@ impl AgentLoop {
                         },
                     )
                     .await?;
+                let mut usage = driver.usage();
+                add_usage(&mut usage, &summaries);
                 return Ok(SegmentOutcome::Completed {
                     final_message: round.text,
                     rounds,
-                    usage: driver.usage(),
+                    usage,
                 });
             }
 
             if let Some(limit) = budget.max_tokens
-                && spent(&driver.usage()) > limit
+                && spent(&driver.usage()) + spent(&summaries) > limit
             {
                 return self
                     .fail_with(&run, rounds, format!("超过 token 预算（{limit}）"))
@@ -304,10 +420,134 @@ impl AgentLoop {
                 return self.stop(&run, rounds, stop).await;
             }
             decay.track(&mut outcome.results);
+            // 这一轮的调用全部收尾了（没停下）：这时才可能压——切点只落在轮次开头，一轮
+            // 的调用与结果不会被分开。
+            if let Some(compactor) = compactor.as_mut()
+                && compactor.due(outcome.plan_boundary, Some(&round), &outcome.results)
+                && let Some(done) = self
+                    .compact_now(&run, rounds, compactor, &env.cancel, &mut summaries)
+                    .await?
+            {
+                return Ok(with_driver_usage(done, &driver.usage()));
+            }
             input = RoundInput::ToolResults {
                 results: outcome.results,
                 revised: decay.due(),
             };
+        }
+    }
+
+    /// 一轮收尾之后问 planner；压成了（或摘要途中被取消）返回这一段的结局，不压或没压成
+    /// 返回 `None`，driver 原样接着跑。
+    async fn compact_now(
+        &self,
+        run: &RunId,
+        rounds: u32,
+        compactor: &Compactor,
+        cancel: &komo_kernel::types::tool::CancelToken,
+        summaries: &mut TokenUsage,
+    ) -> Result<Option<SegmentOutcome>, AgentError> {
+        let Some(job) = compactor.planner.plan().await else {
+            return Ok(None);
+        };
+        Ok(match self.compact(run, job, cancel, summaries).await? {
+            Compaction::Compacted => Some(SegmentOutcome::Recompose {
+                rounds,
+                usage: *summaries,
+            }),
+            Compaction::Cancelled => Some(self.cancel(run, rounds).await?),
+            Compaction::Skipped => None,
+        })
+    }
+
+    /// 发一次摘要请求，把结论记进账本（§6、§8.3）。
+    ///
+    /// 成了记 `compacted`；失败、被截断或什么都没写记 `skipped`（带着这次的决策，在线
+    /// 状态据此先不在窗口压力下重试）——**摘要失败从不让 Run 停下**，上下文原样还在。
+    /// 取消照常取消，什么都不记。
+    async fn compact(
+        &self,
+        run: &RunId,
+        job: CompactionJob,
+        cancel: &komo_kernel::types::tool::CancelToken,
+        summaries: &mut TokenUsage,
+    ) -> Result<Compaction, AgentError> {
+        let CompactionJob {
+            request,
+            first_kept,
+            decision,
+        } = job;
+        let Some(summary) = crate::executor::cancel::race(cancel, self.summarize(request)).await
+        else {
+            return Ok(Compaction::Cancelled);
+        };
+        match summary {
+            Ok((text, usage)) => {
+                add_usage(summaries, &usage);
+                tracing::info!(
+                    run = %run,
+                    first_kept = first_kept.0,
+                    reason = ?decision.reason,
+                    archive_tokens = decision.archive_tokens,
+                    "在线压缩：早先的轮次收成了摘要"
+                );
+                self.ledger
+                    .record_compaction(
+                        run,
+                        ContextCompacted::Compacted {
+                            first_kept,
+                            summary: Some(text),
+                            summary_ref: None,
+                            debt: decision.debt(),
+                            decision,
+                            usage,
+                        },
+                    )
+                    .await?;
+                Ok(Compaction::Compacted)
+            }
+            Err((reason, usage)) => {
+                add_usage(summaries, &usage);
+                tracing::warn!(run = %run, %reason, "在线压缩的摘要没成，上下文原样接着跑");
+                self.ledger
+                    .record_compaction(
+                        run,
+                        ContextCompacted::Skipped {
+                            reason,
+                            decision: Some(decision),
+                        },
+                    )
+                    .await?;
+                Ok(Compaction::Skipped)
+            }
+        }
+    }
+
+    /// 摘要请求本身：没有工具，一轮。
+    async fn summarize(
+        &self,
+        request: TurnRequest,
+    ) -> Result<(String, TokenUsage), (String, TokenUsage)> {
+        let mut driver = self
+            .llm
+            .begin_turn(request)
+            .await
+            .map_err(|error| (format!("摘要请求失败：{error}"), TokenUsage::default()))?;
+        let round = driver
+            .next(RoundInput::First)
+            .await
+            .map_err(|error| (format!("摘要请求失败：{error}"), TokenUsage::default()))?;
+        if round.truncated {
+            return Err(("摘要被截断".into(), round.usage));
+        }
+        match round
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            Some(text) => Ok((text.to_string(), round.usage)),
+            None => Err(("摘要是空的".into(), round.usage)),
         }
     }
 
@@ -472,8 +712,33 @@ impl AgentLoop {
 
 /// 已知的用量之和。**未知不是零**（§8.5），所以 `None` 在这里贡献 0 只是因为它压根
 /// 没进预算比较——判超预算用的是"已知花掉了多少"。
-fn spent(usage: &TokenUsage) -> u64 {
+pub(crate) fn spent(usage: &TokenUsage) -> u64 {
     usage.input.unwrap_or(0) + usage.output.unwrap_or(0) + usage.reasoning.unwrap_or(0)
+}
+
+/// `Recompose` 的用量再加上这一段 driver 自己的。
+fn with_driver_usage(outcome: SegmentOutcome, driver: &TokenUsage) -> SegmentOutcome {
+    match outcome {
+        SegmentOutcome::Recompose { rounds, mut usage } => {
+            add_usage(&mut usage, driver);
+            SegmentOutcome::Recompose { rounds, usage }
+        }
+        other => other,
+    }
+}
+
+/// 把一次请求的用量加进合计；未知的不当零加。
+fn add_usage(total: &mut TokenUsage, more: &TokenUsage) {
+    fn add(total: &mut Option<u64>, more: Option<u64>) {
+        if let Some(more) = more {
+            *total = Some(total.unwrap_or(0) + more);
+        }
+    }
+    add(&mut total.input, more.input);
+    add(&mut total.output, more.output);
+    add(&mut total.reasoning, more.reasoning);
+    add(&mut total.cache_read, more.cache_read);
+    add(&mut total.cache_write, more.cache_write);
 }
 
 pub mod command_driver;

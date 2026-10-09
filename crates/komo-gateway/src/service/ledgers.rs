@@ -300,6 +300,14 @@ impl Ledger for PublishingLedger {
         pumped!(self, self.inner.boundary(session).await)
     }
 
+    async fn record_compaction(
+        &self,
+        run: &RunId,
+        compaction: komo_kernel::events::ContextCompacted,
+    ) -> Result<Seq, LedgerError> {
+        pumped!(self, self.inner.record_compaction(run, compaction).await)
+    }
+
     async fn append_audit(
         &self,
         session: &SessionId,
@@ -671,6 +679,18 @@ impl Ledger for RoutedLedger {
             .await?
             .ledger
             .boundary(session)
+            .await
+    }
+
+    async fn record_compaction(
+        &self,
+        run: &RunId,
+        compaction: komo_kernel::events::ContextCompacted,
+    ) -> Result<Seq, LedgerError> {
+        self.for_run(run)
+            .await?
+            .ledger
+            .record_compaction(run, compaction)
             .await
     }
 

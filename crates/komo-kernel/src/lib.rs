@@ -8,7 +8,7 @@ pub mod policy;
 pub mod projection;
 pub mod protocol;
 pub mod recovery;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod traits;
 pub mod types;

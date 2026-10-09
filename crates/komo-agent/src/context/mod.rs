@@ -18,7 +18,8 @@ use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::turn::ReplayMessage;
 
 pub use history::{
-    Entry, EntryKind, ReplayScope, ResolvedMessage, StoredOutput, entries, latest_user_text,
+    COMPACTION_PREFIX, Entry, EntryKind, ReplayScope, ResolvedMessage, StoredOutput, entries,
+    latest_user_text,
 };
 
 use crate::skills::SkillCatalog;

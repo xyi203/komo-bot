@@ -104,7 +104,13 @@ pub enum EntryKind {
     Transcript,
     /// 正在跑的那条 Run：完整协议。
     Protocol,
+    /// 正在跑的那条 Run 压缩过：它早先那几轮换成的摘要（`context.compacted`），作为一条
+    /// 用户消息、前面加 [`COMPACTION_PREFIX`]。
+    Summary,
 }
+
+/// 摘要前面那句固定的话：告诉模型这是什么，以及完整输出还在哪。
+pub const COMPACTION_PREFIX: &str = "[上下文压缩] 以下是这次任务早先工作的摘要，原来的轮次已从上下文里收掉；摘要里提到的 artifact:// 引用仍可用 read 读回完整工具输出。";
 
 /// 一条要回放的消息，以及它按哪种方式回放。`entries` 的输出——Gateway 只对这里出现的
 /// 消息去读正文与 `output.json`。
@@ -158,7 +164,8 @@ pub fn entries<'s>(surface: &'s Surface, scope: ReplayScope<'_>) -> Vec<Entry<'s
         *entry = (*entry).max(message.seq);
     }
 
-    kept.into_iter()
+    let selected = kept
+        .into_iter()
         .filter_map(|message| {
             if message.run.as_ref() != Some(only) {
                 // 历史 Run：用户正文与最终回复这两句，别的都不要。
@@ -192,7 +199,57 @@ pub fn entries<'s>(surface: &'s Surface, scope: ReplayScope<'_>) -> Vec<Entry<'s
                 ending: None,
             })
         })
-        .collect()
+        .collect();
+    compacted(surface, only, selected)
+}
+
+/// 正在跑的那条 Run 压缩过（`RunView.compaction`）：它的回放变成**开头那句任务 → 摘要 →
+/// 从 `first_kept` 起的原样轮次**（§8.3）。重启前后都从日志折出来，所以两边逐字节相同。
+///
+/// 切点必须是这条 Run 某一轮 `message.assistant` 的开头、且在压缩事件之前：一轮的调用与
+/// 结果都在这条回复之后，切在别处就可能把调用和它的结果分开——provider 直接 400。不合法
+/// 的切点不认，退回完整历史（只是贵，不是错）。
+fn compacted<'s>(surface: &'s Surface, run: &RunId, selected: Vec<Entry<'s>>) -> Vec<Entry<'s>> {
+    let Some(view) = surface.runs.get(run) else {
+        return selected;
+    };
+    let Some(compaction) = &view.compaction else {
+        return selected;
+    };
+    let starts_a_round = selected.iter().any(|entry| {
+        entry.kind == EntryKind::Protocol
+            && entry.message.role == Role::Assistant
+            && entry.message.seq == compaction.first_kept
+    });
+    if !starts_a_round || compaction.first_kept >= compaction.seq {
+        tracing::warn!(
+            %run,
+            first_kept = compaction.first_kept.0,
+            compaction = compaction.seq.0,
+            "压缩的切点不是这条 Run 某一轮的开头，不认它，回放完整历史"
+        );
+        return selected;
+    }
+
+    let opening = view.input_event.as_ref();
+    let mut out = Vec::with_capacity(selected.len());
+    for entry in selected {
+        if entry.kind == EntryKind::Protocol {
+            let seq = entry.message.seq;
+            if seq < compaction.first_kept && Some(&entry.message.event_id) != opening {
+                continue;
+            }
+            if seq == compaction.first_kept {
+                out.push(Entry {
+                    message: &compaction.message,
+                    kind: EntryKind::Summary,
+                    ending: None,
+                });
+            }
+        }
+        out.push(entry);
+    }
+    out
 }
 
 /// 回放窗口里属于**已经开跑过**的那些 Run，**按 Run 分组、Run 之间先来后到**。
@@ -291,7 +348,8 @@ pub(crate) fn to_replay_messages(
 
     // 每条消息之后，正在跑的这条 Run 还记了几条 `message.assistant`：每一条都是一次已经
     // 带着前面那些结果发出去的请求。工具结果完整给过几次就是这个数（§8.3）——活着的 loop
-    // 按同一个定义递减，所以两边选的是同一个视图。
+    // 按同一个定义递减，所以两边选的是同一个视图。压缩过的 Run 只剩 `first_kept` 起的
+    // 轮次，而留下的每条结果之后的 `message.assistant` 全在其中：数出来的与没压时一样。
     let mut later_rounds = vec![0u32; history.len()];
     let mut seen = 0;
     for (index, resolved) in history.iter().enumerate().rev() {
@@ -324,6 +382,18 @@ pub(crate) fn to_replay_messages(
                         role: Role::Assistant,
                         seq: message.seq,
                         text: Some(line),
+                        tool_calls: Vec::new(),
+                        tool_results: Vec::new(),
+                        provider_blocks: None,
+                    });
+                }
+            }
+            EntryKind::Summary => {
+                if let Some(text) = resolved.text.filter(|text| !text.is_empty()) {
+                    out.push(ReplayMessage {
+                        role: Role::User,
+                        seq: message.seq,
+                        text: Some(format!("{COMPACTION_PREFIX}\n\n{text}")),
                         tool_calls: Vec::new(),
                         tool_results: Vec::new(),
                         provider_blocks: None,

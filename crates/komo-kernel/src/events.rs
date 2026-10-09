@@ -19,12 +19,13 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
 
+use crate::compaction::{CompactionDebt, CompactionDecision};
 use crate::types::chat::{ApprovalScope, PeerId};
 use crate::types::digest::ContentHash;
 use crate::types::ids::{
     ApprovalId, AttemptId, EventId, GrantId, RunId, Seq, SessionId, ShortId, ToolCallId,
 };
-use crate::types::model::EffortSetting;
+use crate::types::model::{EffortSetting, TokenUsage};
 use crate::types::plan::{ExecutionPlan, PlanHash, PlanSource};
 use crate::types::refs::{ContentRef, OutputRef, PayloadRef, ToolResultStatus};
 use crate::types::status::{AttemptState, WaitReason};
@@ -251,6 +252,8 @@ event_payload! {
     Checkpoint(Checkpoint) => "checkpoint",
     /// resume 时操作者明确切换了模型 / effort（§13.3）。
     ConfigChanged(ConfigChanged) => "config.changed",
+    /// 在线压缩在一个计划边界上的结论：压了（摘要 + 从哪一轮起原样保留），或没压。
+    ContextCompacted(ContextCompacted) => "context.compacted",
 }
 
 impl EventPayload {
@@ -495,6 +498,34 @@ pub struct ConfigChanged {
     pub reason: String,
 }
 
+/// 在线压缩在一个计划边界上的结论（§8.3）。追加，不改写：被摘要覆盖的那些行一个字节
+/// 都没动，回放读到它才把这条 Run 早先的轮次换成摘要——**fold 决定它意味着什么**。
+///
+/// **摘要只是模型视图，不是恢复依据。**恢复（§8.4、§8.6）从不读它："做没做过"仍然只按
+/// `tool.*` 事件与 `output.json` 判。不认识这个 type 的旧二进制把它读成 Unknown 忽略掉，
+/// 回放的是完整历史——只是贵，不是错。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum ContextCompacted {
+    Compacted {
+        /// 原样保留的第一条：这条 Run 某一轮 `message.assistant` 的 seq。切点只落在轮次
+        /// 开头，调用永远不和它的结果分开。
+        first_kept: Seq,
+        /// 摘要正文；超过内联上限外置到 `payloads/`（`summary_ref`）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary_ref: Option<PayloadRef>,
+        decision: CompactionDecision,
+        debt: CompactionDebt,
+        /// 摘要请求自己的用量。
+        #[serde(default)]
+        usage: TokenUsage,
+    },
+    /// 这个边界上没压（账算不过来、切不出、摘要请求失败……）。上下文原样还在。
+    Skipped { reason: String },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,5 +687,35 @@ mod tests {
         assert!(!line.contains('\n'));
         assert!(line.contains("\\n"));
         assert_eq!(Event::from_line(&line).unwrap(), event);
+    }
+    #[test]
+    fn both_compaction_outcomes_round_trip_and_say_which_they_are() {
+        let event = |seq: u64, payload: ContextCompacted| Event {
+            v: EVENT_FORMAT_VERSION,
+            seq: Seq(seq),
+            event_id: EventId::from_raw(format!("evt-{seq}")),
+            session: SessionId::from_raw("sess-1"),
+            run: Some(RunId::from_raw("run-1")),
+            ts: datetime!(2026-09-15 08:00:00 UTC),
+            payload: EventPayload::ContextCompacted(payload),
+        };
+
+        let compacted = event(9, crate::test_support::compacted(Seq(4), "做完了 a"));
+        let line = compacted.to_line().unwrap();
+        assert!(line.contains(r#""type":"context.compacted""#), "{line}");
+        assert!(line.contains(r#""outcome":"compacted""#), "{line}");
+        assert!(line.contains(r#""first_kept":4"#), "{line}");
+        assert!(!line.contains("summary_ref"), "没外置就不写：{line}");
+        assert_eq!(Event::from_line(&line).unwrap(), compacted);
+
+        let skipped = event(
+            10,
+            ContextCompacted::Skipped {
+                reason: "deferred_economic".into(),
+            },
+        );
+        let line = skipped.to_line().unwrap();
+        assert!(line.contains(r#""outcome":"skipped""#), "{line}");
+        assert_eq!(Event::from_line(&line).unwrap(), skipped);
     }
 }

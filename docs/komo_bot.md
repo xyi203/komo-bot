@@ -698,6 +698,8 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 
 **大结果的视图按请求选（衰减）**：同一份事实投影出两个视图——full 与更短的 decayed（抬头 + 首尾各留一段**整行** + **总是**给出那条可 `read` 的完整输出引用）。一条成功结果的 full 超过 `[execution] decay_threshold_bytes`、且 decayed 至少短 1 KiB 时，它在之后的前 `decay_full_sends` 次请求里给 full，此后换成 decayed；失败与结果不明的结果**从不衰减**——那是模型要对着改的正文。"给过几次"只有一个定义：**这条 Run 在这条结果之后记了几条 `message.assistant`**（每条都是一次已经带着它发出去的请求），由 `projection::view_after` 按它选视图。回放从日志数这个数；活着的 agent loop 在 `record_round` 之后递减同一个数，到点时经 `RoundInput::ToolResults.revised` 让驱动按 `provider_call_id` 就地换掉那条结果的正文。请求失败不在同一段里重发（loop 让出名额去等退避，下一段从日志重数），所以两边数出的永远相同，换上的短视图与下一段回放给出的逐字节一致。
 
+**在线压缩是一条追加的事件，不改写旧行**：`context.compacted`（`run_id` 是被压的那条 Run）记一个计划边界上的结论——`outcome: "compacted"` 带 `first_kept`（原样保留的第一条，这条 Run 某一轮 `message.assistant` 的 seq）、摘要（`summary` 内联，超过内联上限外置成 `summary_ref`，顺序照 §8.5：正文先落 `payloads/` 再追加这一行）、决策的全部算式中间量、欠下的缓存债与摘要请求自己的用量；`outcome: "skipped"` 只带理由。它不碰 state.db 的任何表。fold 把最新一次 `compacted` 记在那条 Run 上（`skipped` 不改视图，只用掉在线状态里那个边界）；回放读到它，这条 Run 的协议窗口就变成**开头那句任务（`run.accepted`）→ 摘要（一条用户消息，前面一句固定的话说明这是压缩摘要、完整工具输出仍可按 `artifact://` 读回）→ 从 `first_kept` 起的原样轮次**，历史 Run 与子代理线的规则不变，重启前后从同一份日志折出、逐字节相同。切点只落在一轮的开头，调用永远不和它的结果分开；`first_kept` 不是这条 Run 某一轮的开头（或不在压缩之前）就不认，回放完整历史并记一条告警。留下的结果"给过几次"照旧按它之后的 `message.assistant` 数——那些全在尾巴里，衰减不受影响。**摘要只是模型视图，不是恢复依据**：§8.4 的尾部判断与 §8.6 的核对从不读它，"做没做过"仍只看 `tool.*` 事件与 `output.json`。不认识这个 type 的旧二进制把它当未知事件保留、忽略，回放完整历史——只是贵，不是错。
+
 实现约束：
 
 - Gateway 对每个 Session 使用一个串行写入器，模型、工具、审批审计与 Memory 来源标记均经过它，不能各自追加导致行内容交错。

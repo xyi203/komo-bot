@@ -276,6 +276,9 @@ pub(crate) async fn message_text(
 
 /// history 的 I/O 那一半：只对 `entries` 选中的条目读正文与 `output.json`（§7、§8）。
 ///
+/// 压缩摘要（`EntryKind::Summary`）也是一条这样的条目：外置的 `summary_ref` 就在它的
+/// `text_ref` 上，按同一条路读回来。
+///
 /// **只有 `Protocol` 条目才会去读工具输出**：`Transcript` 条目不带工具往返，`outputs`
 /// 恒为空。读不回来的正文（外置引用坏了）让整段装配失败——调用方按 §8.4 停下来报告，
 /// 不把一条空消息当成"用户就是这么说的"发出去；`output.json` 读不回来则不是错误，只是

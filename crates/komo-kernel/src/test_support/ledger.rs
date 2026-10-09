@@ -499,6 +499,29 @@ impl Ledger for MemLedger {
         Ok(seq)
     }
 
+    async fn record_compaction(
+        &self,
+        run: &RunId,
+        compaction: crate::events::ContextCompacted,
+    ) -> Result<Seq, LedgerError> {
+        let mut state = self.state.lock().expect("账本");
+        let session = state
+            .sessions
+            .get(run)
+            .cloned()
+            .ok_or_else(|| LedgerError::NotFound {
+                what: format!("run {run}"),
+            })?;
+        // 内存账本没有 `payloads/`：摘要原样内联。
+        let (_, seq) = self.append(
+            &mut state,
+            &session,
+            Some(run.clone()),
+            EventPayload::ContextCompacted(compaction),
+        );
+        Ok(seq)
+    }
+
     async fn append_audit(
         &self,
         session: &SessionId,

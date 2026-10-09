@@ -100,8 +100,24 @@ pub struct RunView {
     /// 属于它的调用，按出现顺序。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<ToolCallId>,
+    /// 最近一次生效的在线压缩（`context.compacted` 的 `compacted`）。没压过、或只有
+    /// `skipped` 时是 `None`。回放拿它把这条 Run 早先的轮次换成摘要；切点合不合法由回放
+    /// 那一侧判（它知道这条 Run 的消息长什么样）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<CompactionView>,
     pub first_seq: Seq,
     pub last_seq: Seq,
+}
+
+/// 一条 Run 最近一次压缩：摘要放在回放的哪里、从哪一轮起原样保留。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompactionView {
+    /// `context.compacted` 自己的 seq。
+    pub seq: Seq,
+    /// 原样保留的第一条（某一轮 `message.assistant` 的 seq）。
+    pub first_kept: Seq,
+    /// 摘要，作为一条用户侧消息：`text` 内联或 `text_ref` 外置，读法与别的消息一样。
+    pub message: SurfaceMessage,
 }
 
 impl RunView {

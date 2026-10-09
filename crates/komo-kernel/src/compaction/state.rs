@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::economics::CompactionDebt;
 use super::plan::{PlanProgress, PlanStatus, PlanStep, PlanTransition, PlanUpdate};
-use crate::events::{Event, EventPayload};
+use crate::events::{ContextCompacted, Event, EventPayload};
 use crate::types::ids::{RunId, ToolCallId};
 use crate::types::plan::Operation;
 use crate::types::refs::ToolResultStatus;
@@ -225,9 +225,12 @@ impl OnlineFold {
                     self.state.record_plan_update(&update);
                 }
             }
-            // 压缩事件（第 8 步的 `context.compacted`）在这里补一条：
-            //   压了 → `self.state.record_compaction(debt)`；
-            //   没压 / 压不成 → `self.state.record_skipped()`。
+            EventPayload::ContextCompacted(ContextCompacted::Compacted { debt, .. }) => {
+                self.state.record_compaction(*debt);
+            }
+            EventPayload::ContextCompacted(ContextCompacted::Skipped { .. }) => {
+                self.state.record_skipped();
+            }
             // 其余事件与未知词汇对在线状态没有意义（§8.3）。
             _ => {}
         }
@@ -641,5 +644,77 @@ mod tests {
             },
             before
         );
+    }
+    fn compaction(seq: u64, run: &str, payload: ContextCompacted) -> Event {
+        event(seq, run, EventPayload::ContextCompacted(payload))
+    }
+
+    fn skipped(seq: u64) -> Event {
+        compaction(
+            seq,
+            RUN,
+            ContextCompacted::Skipped {
+                reason: "deferred_economic".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn compaction_events_fold_into_the_same_state_as_recording_them() {
+        let run = RunId::from_raw(RUN);
+        let compacted = crate::test_support::compacted(Seq(8), "摘要");
+        let ContextCompacted::Compacted { debt, .. } = &compacted else {
+            unreachable!()
+        };
+        let debt = *debt;
+
+        let mut events = log();
+        events.push(compaction(13, RUN, compacted.clone()));
+        let mut expected = online_state(&log(), &run);
+        expected.record_compaction(debt);
+        assert_eq!(online_state(&events, &run), expected);
+        assert_eq!(expected.compaction_count, 1);
+
+        // 下一个边界上没压：只用掉这个边界。
+        events.push(assistant(14, RUN, Some(9_000)));
+        events.push(update_plan(
+            15,
+            "c4",
+            vec![
+                step("a", PlanStatus::Completed),
+                step("b", PlanStatus::Completed),
+            ],
+        ));
+        events.push(done(16, "c4"));
+        events.push(skipped(17));
+        let state = online_state(&events, &run);
+        assert!(!state.pending_boundary);
+        assert_eq!(state.compaction_count, 1, "没压不计数");
+
+        // 别的 Run 的压缩不算这条的。
+        let mut others = log();
+        others.push(compaction(13, "child", compacted));
+        assert_eq!(online_state(&others, &run), online_state(&log(), &run));
+    }
+
+    #[test]
+    fn folding_a_log_with_compactions_splits_the_same_way() {
+        let mut events = log();
+        events.push(compaction(
+            13,
+            RUN,
+            crate::test_support::compacted(Seq(8), "摘要"),
+        ));
+        events.push(assistant(14, RUN, Some(9_000)));
+        events.push(skipped(15));
+        let run = RunId::from_raw(RUN);
+        let mut whole = OnlineFold::new(run.clone());
+        whole.extend(&events);
+        for cut in 0..=events.len() {
+            let mut split = OnlineFold::new(run.clone());
+            split.extend(&events[..cut]);
+            split.extend(&events[cut..]);
+            assert_eq!(split, whole, "切在 {cut}");
+        }
     }
 }

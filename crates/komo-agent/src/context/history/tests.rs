@@ -597,3 +597,237 @@ fn a_result_one_round_old_replays_whole_with_one_full_send_left() {
         "到点换成的就是回放会给的那份"
     );
 }
+
+fn result(run: &RunId, seq: u64, call: &ToolCallId, preview: &str) -> Event {
+    event(
+        seq,
+        run,
+        EventPayload::ToolResult(komo_kernel::events::ToolResult {
+            call_id: call.clone(),
+            attempt_id: AttemptId::from_raw(format!("attempt-{seq}")),
+            status: ToolResultStatus::Completed,
+            output_ref: OutputRef(ContentRef {
+                path: format!("tool-output/{run}/{call}/attempt-{seq}/output.json"),
+                size: 0,
+                hash: ContentHash::of_str(""),
+                pointer: None,
+            }),
+            elapsed_ms: 5,
+            preview: Some(preview.to_string()),
+            stdout: None,
+            stderr: None,
+            attempt_state: None,
+        }),
+    )
+}
+
+fn compaction(run: &RunId, seq: u64, first_kept: u64, summary: &str) -> Event {
+    event(
+        seq,
+        run,
+        EventPayload::ContextCompacted(komo_kernel::test_support::compacted(
+            Seq(first_kept),
+            summary,
+        )),
+    )
+}
+
+fn calling(id: &str) -> ToolCallRequest {
+    ToolCallRequest {
+        provider_call_id: format!("pc-{id}"),
+        ..request(&ToolCallId::from_raw(id))
+    }
+}
+
+/// 一条历史 Run，然后正在跑的这条做了三轮工具往返。
+fn three_rounds(run: &RunId) -> Vec<Event> {
+    let earlier = RunId::from_raw("run-0");
+    let (c1, c2, c3) = (
+        ToolCallId::from_raw("c1"),
+        ToolCallId::from_raw("c2"),
+        ToolCallId::from_raw("c3"),
+    );
+    vec![
+        accepted(&earlier, 1, "上一件事"),
+        started(&earlier, 2),
+        assistant(&earlier, 3, Some("上一件事的回答"), vec![], None),
+        completed(&earlier, 4),
+        accepted(run, 5, "这次的任务"),
+        started(run, 6),
+        assistant(run, 7, Some("先看 a"), vec![calling("c1")], None),
+        result(run, 8, &c1, "a 的内容"),
+        assistant(run, 9, Some("再看 b"), vec![calling("c2")], None),
+        result(run, 10, &c2, "b 的内容"),
+        assistant(run, 11, Some("最后看 c"), vec![calling("c3")], None),
+        result(run, 12, &c3, "c 的内容"),
+    ]
+}
+
+/// 同 [`resolve_inline`]，但每条结果都"读不回 `output.json`"，退回账本里的预览。
+fn replay(events: &[Event], run: &RunId, projection: &ProjectionContext) -> Vec<ReplayMessage> {
+    let surface = fold(events);
+    let resolved = entries(&surface, ReplayScope::Conversation(run))
+        .into_iter()
+        .map(|entry| ResolvedMessage {
+            text: entry.message.text.clone(),
+            outputs: vec![None; entry.message.tool_results.len()],
+            entry,
+        })
+        .collect();
+    to_replay_messages(resolved, projection)
+}
+
+fn texts(messages: &[ReplayMessage]) -> Vec<(Role, Option<String>)> {
+    messages
+        .iter()
+        .map(|message| (message.role, message.text.clone()))
+        .collect()
+}
+
+/// 压过之后：历史 Run 照旧 → 这条 Run 开头那句任务 → 摘要 → 从 `first_kept` 起原样。
+#[test]
+fn a_compacted_run_replays_task_then_summary_then_tail() {
+    let run = RunId::from_raw("run-1");
+    let mut events = three_rounds(&run);
+    events.push(compaction(&run, 13, 11, "看过了 a 和 b，结论是……"));
+    let messages = replay(&events, &run, &BUDGET);
+
+    assert_eq!(
+        texts(&messages),
+        vec![
+            (Role::User, Some("上一件事".into())),
+            (Role::Assistant, Some("上一件事的回答".into())),
+            (Role::User, Some("这次的任务".into())),
+            (
+                Role::User,
+                Some(format!("{COMPACTION_PREFIX}\n\n看过了 a 和 b，结论是……"))
+            ),
+            (Role::Assistant, Some("最后看 c".into())),
+            (Role::Tool, None),
+        ]
+    );
+    assert_eq!(messages[4].tool_calls[0].provider_call_id, "pc-c3");
+    let results: Vec<_> = messages
+        .iter()
+        .flat_map(|message| message.tool_results.iter())
+        .map(|result| result.provider_call_id.as_str())
+        .collect();
+    assert_eq!(results, vec!["pc-c3"], "被摘要覆盖的调用与结果一起走");
+    assert!(COMPACTION_PREFIX.contains("artifact://"));
+
+    // 同一份日志折两遍：逐字节相同（重启前后）。
+    assert_eq!(
+        serde_json::to_string(&messages).unwrap(),
+        serde_json::to_string(&replay(&events, &run, &BUDGET)).unwrap()
+    );
+}
+
+/// 切点不在这条 Run 某一轮的开头（落在结果上、落在别的 Run 上、落在压缩之后）：不认，
+/// 回放完整历史。
+#[test]
+fn a_cut_not_at_a_round_start_is_ignored_and_the_full_history_replays() {
+    let run = RunId::from_raw("run-1");
+    let full = replay(&three_rounds(&run), &run, &BUDGET);
+    for first_kept in [10, 3, 5, 14] {
+        let mut events = three_rounds(&run);
+        events.push(compaction(&run, 13, first_kept, "不该出现"));
+        assert_eq!(
+            replay(&events, &run, &BUDGET),
+            full,
+            "first_kept = {first_kept}"
+        );
+    }
+}
+
+/// 子代理压缩自己那条线上的窗口，规则一样。
+#[test]
+fn a_compacted_child_replays_its_own_task_then_summary_then_tail() {
+    let parent = RunId::from_raw("run-parent");
+    let child = RunId::from_raw("run-child");
+    let spec = DelegateSpec::new(parent.clone(), ToolCallId::from_raw("call-1"), "查 A");
+    let c1 = ToolCallId::from_raw("k1");
+    let events = vec![
+        accepted(&parent, 1, "父的输入"),
+        started(&parent, 2),
+        accepted_as(&child, 3, Some("查 A"), Some(spec)),
+        started(&child, 4),
+        assistant(&child, 5, Some("先查"), vec![calling("k1")], None),
+        result(&child, 6, &c1, "查到了"),
+        assistant(&child, 7, Some("再确认"), vec![], None),
+        compaction(&child, 8, 7, "查过一轮"),
+    ];
+    let surface = fold(&events);
+    let chain = delegate_thread(&surface, &child);
+    assert_eq!(
+        texts(&thread_texts(&surface, &chain)),
+        vec![
+            (Role::User, Some("查 A".into())),
+            (Role::User, Some(format!("{COMPACTION_PREFIX}\n\n查过一轮"))),
+            (Role::Assistant, Some("再确认".into())),
+        ]
+    );
+}
+
+/// 留下来的大结果"给过几次"不随压缩变：它之后的 `message.assistant` 全在尾巴里。
+#[test]
+fn the_decay_count_on_the_kept_tail_is_unchanged() {
+    let run = RunId::from_raw("run-1");
+    let big: String = (0..400)
+        .map(|n| format!("line {n:04}: {}\n", "x".repeat(40)))
+        .collect();
+    let replay_big = |events: &[Event]| {
+        let surface = fold(events);
+        let resolved: Vec<ResolvedMessage<'_>> = entries(&surface, ReplayScope::Conversation(&run))
+            .into_iter()
+            .map(|entry| {
+                let outputs = entry
+                    .message
+                    .tool_results
+                    .iter()
+                    .map(|result| {
+                        Some(StoredOutput {
+                            preview: Some(match result.call.as_str() {
+                                "c3" => big.clone(),
+                                _ => "小".into(),
+                            }),
+                            artifacts: Vec::new(),
+                        })
+                    })
+                    .collect();
+                ResolvedMessage {
+                    text: entry.message.text.clone(),
+                    outputs,
+                    entry,
+                }
+            })
+            .collect();
+        to_replay_messages(resolved, &DECAYING)
+            .into_iter()
+            .flat_map(|message| message.tool_results)
+            .find(|result| result.provider_call_id == "pc-c3")
+            .expect("c3 的结果在尾巴里")
+    };
+
+    for later in 0..4u64 {
+        let mut plain = three_rounds(&run);
+        for seq in 13..13 + later {
+            plain.push(assistant(&run, seq, Some("再看看"), vec![], None));
+        }
+        let mut compacted = plain.clone();
+        compacted.push(compaction(&run, 13 + later, 9, "看过了 a"));
+        assert!(
+            replay(&compacted, &run, &DECAYING)
+                .iter()
+                .all(|message| message
+                    .tool_calls
+                    .iter()
+                    .all(|call| call.provider_call_id != "pc-c1")),
+            "压缩真的生效了"
+        );
+        assert_eq!(
+            replay_big(&compacted),
+            replay_big(&plain),
+            "later = {later}"
+        );
+    }
+}

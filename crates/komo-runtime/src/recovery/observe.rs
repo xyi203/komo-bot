@@ -20,6 +20,9 @@ pub fn events_of<'a>(events: &'a [Event], run: &RunId) -> Vec<&'a Event> {
 }
 
 /// JSONL 尾部最后看到什么（§8.4 的左列）。
+///
+/// `context.compacted` 和审批、等待那些事件一样不改判断：摘要只是模型视图，"做没做过"
+/// 只看 `tool.*` 事件（§8.3）。
 pub fn log_tail(events: &[Event], run: &RunId) -> LogTail {
     let events = events_of(events, run);
     if events.is_empty() {
@@ -377,5 +380,52 @@ mod tests {
             ),
         ];
         assert_eq!(waiting_on_approval(&events, &run()), None);
+    }
+    /// 压缩事件落在一轮的结果之后（计划边界上的压缩正是这个位置）：尾部照旧判成"这一轮
+    /// 已落盘、最后一条是结果"，恢复从那里接着走。
+    #[test]
+    fn a_trailing_compaction_still_reads_as_the_round_it_follows() {
+        use komo_kernel::events::{ContextCompacted, ToolResult};
+        use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultStatus};
+
+        let call = ToolCallId::from_raw("call-1");
+        let base = vec![
+            event(1, accepted()),
+            event(2, round(&["call-1"])),
+            event(
+                3,
+                EventPayload::ToolResult(ToolResult {
+                    call_id: call.clone(),
+                    attempt_id: AttemptId::from_raw("attempt-1"),
+                    status: ToolResultStatus::Completed,
+                    output_ref: OutputRef(ContentRef {
+                        path: "tool-output/run-1/call-1/attempt-1/output.json".into(),
+                        size: 2,
+                        hash: ContentHash::of_str("{}"),
+                        pointer: None,
+                    }),
+                    elapsed_ms: 1,
+                    preview: None,
+                    stdout: None,
+                    stderr: None,
+                    attempt_state: None,
+                }),
+            ),
+        ];
+        let expected = LogTail::RoundPersisted {
+            pending: PendingCall::ResultPersisted { call },
+        };
+        assert_eq!(log_tail(&base, &run()), expected);
+
+        for outcome in [
+            komo_kernel::test_support::compacted(Seq(2), "摘要"),
+            ContextCompacted::Skipped {
+                reason: "deferred_economic".into(),
+            },
+        ] {
+            let mut events = base.clone();
+            events.push(event(4, EventPayload::ContextCompacted(outcome)));
+            assert_eq!(log_tail(&events, &run()), expected);
+        }
     }
 }

@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use komo_kernel::events::{
-    ConversationBoundary, EventPayload, MessageAssistant, RunAbandoned, RunAccepted, RunCancelled,
-    RunCompleted, RunFailed, RunQueued, RunStarted, RunWaiting, ToolPlanned, ToolResult,
-    ToolStarted,
+    ContextCompacted, ConversationBoundary, EventPayload, MessageAssistant, RunAbandoned,
+    RunAccepted, RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted, RunWaiting,
+    ToolPlanned, ToolResult, ToolStarted,
 };
 use komo_kernel::traits::{Ledger, LedgerError, StoreError};
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
@@ -865,6 +865,50 @@ impl Ledger for Coordinator {
         Ok(appended.seq())
     }
 
+    async fn record_compaction(
+        &self,
+        run: &RunId,
+        compaction: ContextCompacted,
+    ) -> Result<Seq, LedgerError> {
+        // ① 超限的摘要先持久保存到 payloads（与 `record_round` 的正文同一条路）。
+        let compaction = match compaction {
+            ContextCompacted::Compacted {
+                first_kept,
+                summary: Some(summary),
+                summary_ref: None,
+                decision,
+                debt,
+                usage,
+            } => {
+                let (summary, summary_ref) = self.split_text(&summary).await?;
+                ContextCompacted::Compacted {
+                    first_kept,
+                    summary,
+                    summary_ref,
+                    decision,
+                    debt,
+                    usage,
+                }
+            }
+            other => other,
+        };
+
+        // ② JSONL 追加 context.compacted 并同步。
+        let appended = self
+            .append(
+                Some(run.clone()),
+                EventPayload::ContextCompacted(compaction),
+            )
+            .await?;
+
+        // ③ 只有事件索引与 applied_seq：摘要是模型视图，没有哪张表记它。
+        self.commit(&appended, |_ex, _appended, _now| {
+            Box::pin(async move { Ok(()) }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await?;
+        Ok(appended.seq())
+    }
+
     async fn append_audit(
         &self,
         session: &SessionId,
@@ -1606,6 +1650,82 @@ mod tests {
         let reference = body.text_ref.clone().expect("有引用");
         let bytes = f.coordinator.payloads().open(&reference).await.unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), big);
+    }
+
+    /// 超限的摘要外置到 `payloads/`，JSONL 那一行只留引用；短的照样内联（§8.3）。
+    #[tokio::test]
+    async fn a_long_summary_goes_to_payloads_and_the_line_holds_the_ref() {
+        use komo_kernel::test_support::compacted;
+        let f = fixture().await;
+        let run = f
+            .coordinator
+            .accept_input(input("api:compact", "分两步做", &f.session))
+            .await
+            .unwrap()
+            .run;
+        let big = "摘".repeat(INLINE_ARGUMENT_LIMIT_BYTES);
+        let long = f
+            .coordinator
+            .record_compaction(&run, compacted(Seq(3), big.clone()))
+            .await
+            .unwrap();
+        let short = f
+            .coordinator
+            .record_compaction(&run, compacted(Seq(3), "短摘要"))
+            .await
+            .unwrap();
+
+        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let body = |seq: Seq| {
+            let event = batch.events.iter().find(|e| e.seq == seq).expect("那一行");
+            assert_eq!(event.run.as_ref(), Some(&run));
+            match &event.payload {
+                EventPayload::ContextCompacted(ContextCompacted::Compacted {
+                    summary,
+                    summary_ref,
+                    first_kept,
+                    ..
+                }) => {
+                    assert_eq!(*first_kept, Seq(3));
+                    (summary.clone(), summary_ref.clone())
+                }
+                other => panic!("不是压缩事件：{other:?}"),
+            }
+        };
+        let (summary, reference) = body(long);
+        assert!(summary.is_none(), "大摘要不内联");
+        let bytes = f
+            .coordinator
+            .payloads()
+            .open(&reference.expect("有引用"))
+            .await
+            .unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), big);
+        assert_eq!(body(short), (Some("短摘要".into()), None));
+    }
+
+    /// 写入顺序：外置正文没落盘，那一行就不写（§8.5）。
+    #[tokio::test]
+    async fn a_summary_that_cannot_be_externalised_writes_no_line() {
+        let f = fixture().await;
+        let run = f
+            .coordinator
+            .accept_input(input("api:compact", "分两步做", &f.session))
+            .await
+            .unwrap()
+            .run;
+        let before = types(&f.coordinator, &f.session).await;
+        // `payloads` 的位置上放一个普通文件：目录建不出来，正文写不进去。
+        let payloads = f.coordinator.paths().payloads();
+        let _ = std::fs::remove_dir_all(&payloads);
+        std::fs::write(&payloads, b"").unwrap();
+
+        let big = "摘".repeat(INLINE_ARGUMENT_LIMIT_BYTES);
+        f.coordinator
+            .record_compaction(&run, komo_kernel::test_support::compacted(Seq(3), big))
+            .await
+            .expect_err("正文写不进去");
+        assert_eq!(types(&f.coordinator, &f.session).await, before);
     }
 
     /// 超限的调用参数外置，`arguments_ref` 指向文件内的对应字段（§8.3）。

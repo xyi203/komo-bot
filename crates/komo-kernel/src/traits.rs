@@ -318,6 +318,15 @@ pub trait Ledger: Send + Sync {
     /// `/new`：追加一个 `conversation.boundary`，**不切 Session**（§13.1）。
     async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError>;
 
+    /// `context.compacted`：在线压缩在一个计划边界上的结论（§8.3）。内联的摘要超过上限
+    /// 先外置到 `payloads/`（与 `record_round` 的正文同一条路），再追加并同步。它不碰
+    /// state.db 的任何表——摘要只是模型视图，调度与授权都不看它。
+    async fn record_compaction(
+        &self,
+        run: &RunId,
+        compaction: crate::events::ContextCompacted,
+    ) -> Result<Seq, LedgerError>;
+
     /// 控制审计补写：把 `control_outbox` 里的一条审批事件追加到 JSONL（§8.5 的反向
     /// 顺序）。按 `event_id` 幂等；已写入就复用原事件位置。**它不创建授权。**
     async fn append_audit(

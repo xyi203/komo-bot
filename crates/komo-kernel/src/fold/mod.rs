@@ -21,11 +21,11 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 pub use views::{
-    ApprovalView, FoldViolation, RunView, SurfaceMessage, SurfaceToolResult, ToolCallView,
-    UnknownEvent,
+    ApprovalView, CompactionView, FoldViolation, RunView, SurfaceMessage, SurfaceToolResult,
+    ToolCallView, UnknownEvent,
 };
 
-use crate::events::{Event, EventPayload};
+use crate::events::{ContextCompacted, Event, EventPayload};
 use crate::types::ids::{ApprovalId, RunId, Seq, SessionId, ToolCallId};
 use crate::types::status::{RunState, ToolCallState};
 use crate::types::turn::Role;
@@ -317,7 +317,35 @@ impl Surface {
                 // 审计副本：它只说明这条不再待处理，**不创建授权**（§7.4）。
                 self.pending_approvals.remove(&body.approval);
             }
-            EventPayload::Checkpoint(_) | EventPayload::ConfigChanged(_) => {}
+            // 压缩不动消息面：日志里被摘要覆盖的那些行照旧在 `messages` 里，回放读到
+            // `compaction` 才换（§8.3）。最新的一次生效；`skipped` 什么都不改。
+            EventPayload::ContextCompacted(ContextCompacted::Compacted {
+                first_kept,
+                summary,
+                summary_ref,
+                ..
+            }) => {
+                if let Some(run) = event.run.as_ref().and_then(|id| self.runs.get_mut(id)) {
+                    run.compaction = Some(CompactionView {
+                        seq: event.seq,
+                        first_kept: *first_kept,
+                        message: SurfaceMessage {
+                            seq: event.seq,
+                            event_id: event.event_id.clone(),
+                            role: Role::User,
+                            run: event.run.clone(),
+                            text: summary.clone(),
+                            text_ref: summary_ref.clone(),
+                            tool_calls: Vec::new(),
+                            tool_results: Vec::new(),
+                            provider_blocks: None,
+                        },
+                    });
+                }
+            }
+            EventPayload::ContextCompacted(ContextCompacted::Skipped { .. })
+            | EventPayload::Checkpoint(_)
+            | EventPayload::ConfigChanged(_) => {}
             EventPayload::Unknown { event_type, raw } => self.unknown.push(UnknownEvent {
                 seq: event.seq,
                 event_id: event.event_id.clone(),
@@ -418,6 +446,7 @@ impl Surface {
             rounds: 0,
             delegate: None,
             calls: Vec::new(),
+            compaction: None,
             first_seq: event.seq,
             last_seq: event.seq,
         })
@@ -847,6 +876,87 @@ mod tests {
         assert_eq!(surface.messages.len(), 4, "消息面不受影响");
     }
 
+    fn compaction(seq: u64, payload: ContextCompacted) -> Event {
+        event(seq, Some("run-1"), EventPayload::ContextCompacted(payload))
+    }
+
+    fn skipped(seq: u64) -> Event {
+        compaction(
+            seq,
+            ContextCompacted::Skipped {
+                reason: "deferred_economic".into(),
+            },
+        )
+    }
+
+    #[test]
+    fn the_latest_compaction_wins_and_a_skip_changes_nothing() {
+        use crate::test_support::compacted;
+        let mut events = conversation();
+        events.truncate(8);
+        events.push(compaction(9, compacted(Seq(4), "第一次摘要")));
+        events.push(compaction(10, compacted(Seq(8), "第二次摘要")));
+        let surface = fold(&events);
+        let view = surface.runs[&RunId::from_raw("run-1")]
+            .compaction
+            .clone()
+            .expect("压过");
+        assert_eq!(view.seq, Seq(10));
+        assert_eq!(view.first_kept, Seq(8));
+        assert_eq!(view.message.role, Role::User);
+        assert_eq!(view.message.text.as_deref(), Some("第二次摘要"));
+        assert_eq!(view.message.run, Some(RunId::from_raw("run-1")));
+        assert_eq!(surface.messages.len(), 4, "消息面一行不少");
+        assert!(surface.unknown.is_empty());
+
+        events.push(skipped(11));
+        let after = fold(&events);
+        assert_eq!(
+            after.runs[&RunId::from_raw("run-1")].compaction,
+            Some(view),
+            "没压不改视图"
+        );
+        assert_eq!(after.messages, surface.messages);
+    }
+
+    /// 旧二进制没有这个词：读成 Unknown，什么都不改——回放的是完整历史。
+    #[test]
+    fn a_compaction_read_as_unknown_means_nothing() {
+        let mut events = conversation();
+        let line = compaction(10, crate::test_support::compacted(Seq(4), "摘要"))
+            .to_line()
+            .unwrap();
+        let raw: serde_json::Value = serde_json::from_str(&line).unwrap();
+        events.push(event(
+            10,
+            Some("run-1"),
+            EventPayload::Unknown {
+                event_type: "context.compacted".into(),
+                raw: raw["data"].clone(),
+            },
+        ));
+        let surface = fold(&events);
+        assert!(surface.runs[&RunId::from_raw("run-1")].compaction.is_none());
+        assert_eq!(surface.unknown.len(), 1);
+        assert_eq!(surface.messages, fold(&conversation()).messages);
+    }
+
+    #[test]
+    fn compactions_split_the_same_way_wherever_you_cut() {
+        use crate::test_support::compacted;
+        let mut events = conversation();
+        events.truncate(8);
+        events.push(compaction(9, compacted(Seq(4), "摘要")));
+        events.push(skipped(10));
+        events.push(compaction(11, compacted(Seq(8), "又一次")));
+        let whole = fold(&events);
+        for split in 0..=events.len() {
+            let mut partial = fold(&events[..split]);
+            partial.extend(&events[split..]);
+            assert_eq!(partial, whole, "切在 {split}");
+        }
+    }
+
     /// 一个确定性的线性同余生成器。属性测试要可复现，而 `test-support` 之外不加
     /// dev 依赖（§13.4），所以自己写一个。
     struct Lcg(u64);
@@ -875,7 +985,7 @@ mod tests {
             for _ in 0..length {
                 seq += 1;
                 let run = format!("run-{}", rng.below(3) + 1);
-                let payload = match rng.below(8) {
+                let payload = match rng.below(9) {
                     0 => return_accepted(seq, &run),
                     1 => EventPayload::RunQueued(RunQueued {
                         input_ref: EventId::from_raw("evt-0"),
@@ -913,6 +1023,12 @@ mod tests {
                         stdout: None,
                         stderr: None,
                         attempt_state: None,
+                    }),
+                    7 => EventPayload::ContextCompacted(match rng.below(2) {
+                        0 => crate::test_support::compacted(Seq(rng.below(seq + 1)), "摘要"),
+                        _ => ContextCompacted::Skipped {
+                            reason: "deferred_economic".into(),
+                        },
                     }),
                     _ => EventPayload::Unknown {
                         event_type: "future.thing".into(),

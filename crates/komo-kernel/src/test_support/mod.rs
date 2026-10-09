@@ -44,6 +44,44 @@ pub fn proof() -> Proof {
     Proof::policy_allow()
 }
 
+/// 一条"压了"的 `context.compacted`：摘要内联，决策按一组压得过来的数算出来。
+pub fn compacted(
+    first_kept: crate::types::ids::Seq,
+    summary: impl Into<String>,
+) -> crate::events::ContextCompacted {
+    use crate::compaction::{CompactionEconomics, CompactionInput, decide};
+    let decision = decide(
+        &CompactionInput {
+            write_tokens: 10_000,
+            archive_tokens: 8_000,
+            memo_tokens: 500,
+            context_tokens: 10_000,
+            completed_boundary_request_counts: Some(vec![3]),
+            remaining_boundaries: 2,
+            average_context_token_increment: Some(500.0),
+            context_window_tokens: Some(200_000),
+            prior_compaction_count: 0,
+            requests_since_last_compaction: None,
+            carried_debt_tokens: 0.0,
+            cache_debt_repayment_tokens: 0,
+            cache_write_read_ratio: Some(12.5),
+        },
+        &CompactionEconomics::default(),
+    );
+    crate::events::ContextCompacted::Compacted {
+        first_kept,
+        summary: Some(summary.into()),
+        summary_ref: None,
+        debt: decision.debt(),
+        decision,
+        usage: crate::types::model::TokenUsage {
+            input: Some(9_000),
+            output: Some(400),
+            ..Default::default()
+        },
+    }
+}
+
 /// 跑一个立即就绪的 future。
 ///
 /// kernel 不依赖 tokio——**dev-dependency 也不加**，否则"kernel 不依赖 tokio"就成了一

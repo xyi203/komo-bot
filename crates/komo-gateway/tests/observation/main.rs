@@ -8,6 +8,8 @@
 //!   ——跑过的调用如此，没跑起来的（工具名不认识）也如此。
 //! - **计划**：`update_plan` 的计划只在日志里，重启之后折出同一份在线状态，回放的结果
 //!   与刚跑完那次逐字节相同。
+//! - **压缩**：账本里一条 `context.compacted` 之后，回放是任务 → 摘要 → 切点起的原样轮次，
+//!   外置的摘要按引用读回来，两次重启之间那一段逐字节不变。
 //!
 //! 共用件在 `komo_gateway::service::test_support::harness`（真数据目录、真 `service::start`、
 //! 脚本化模型）。这里断言的是**模型收到了什么**，所以读的是 `FakeLlm` 记下的轮输入与请求。
@@ -546,4 +548,169 @@ async fn the_plan_survives_a_restart_and_replays_the_same_bytes() {
     };
     assert_eq!(replayed("pc-p1"), live_p1, "登记那次回放要逐字节相同");
     assert_eq!(replayed("pc-p2"), live_p2, "完成那次回放要逐字节相同");
+}
+
+/// 在线压缩的回放（§8.3）：三轮 `read` 之后停在审批上，账本里补一条 `context.compacted`
+/// （切在第三轮开头，摘要长到要外置），重启再批：第二段的请求是**任务 → 摘要 → 第三轮起
+/// 的原样轮次**；再停一次、再重启，第三段回放的同一段前缀逐字节不变。
+#[tokio::test]
+async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
+    use komo_agent::context::COMPACTION_PREFIX;
+    use komo_kernel::test_support::compacted;
+    use komo_kernel::types::turn::Role;
+
+    let home = Home::with_config(&config_toml(""));
+    std::fs::create_dir_all(home.workspace()).expect("工作目录");
+    std::fs::write(home.workspace().join("小.txt"), "一行\n").expect("写文件");
+    let read = || serde_json::json!({ "path": "小.txt" });
+    let llm = FakeLlm::new(vec![vec![
+        call_round(1, "pc-r1", "read", read()),
+        call_round(2, "pc-r2", "read", read()),
+        call_round(3, "pc-r3", "read", read()),
+        call_round(
+            4,
+            "pc-s1",
+            "shell",
+            serde_json::json!({ "command": "echo 一" }),
+        ),
+    ]]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(&session, "compact-1", "读三遍小文件，再跑两条命令")
+        .await
+        .run;
+    let first = gateway.wait_approval().await;
+    assert_eq!(first.run.as_ref(), Some(&run));
+
+    let rounds: Vec<_> = home
+        .events(&session)
+        .into_iter()
+        .filter(|event| {
+            event.run.as_ref() == Some(&run)
+                && matches!(event.payload, EventPayload::MessageAssistant(_))
+        })
+        .map(|event| event.seq)
+        .collect();
+    assert_eq!(rounds.len(), 4, "四轮都落盘了");
+    let summary = "读过两遍小文件，内容都是「一行」。".repeat(200);
+    assert!(summary.len() > 4096, "要真的过内联上限");
+    gateway
+        .state()
+        .turn_ledger
+        .record_compaction(&run, compacted(rounds[2], summary.clone()))
+        .await
+        .expect("压缩事件落盘");
+    let line = home
+        .events(&session)
+        .into_iter()
+        .find_map(|event| match event.payload {
+            EventPayload::ContextCompacted(body) => Some(body),
+            _ => None,
+        })
+        .expect("日志里有 context.compacted");
+    assert!(
+        matches!(
+            line,
+            komo_kernel::events::ContextCompacted::Compacted {
+                summary: None,
+                summary_ref: Some(_),
+                ..
+            }
+        ),
+        "长摘要外置，行里只留引用：{line:?}"
+    );
+
+    // 重启 → 批 → 第二段。
+    gateway.stop().await;
+    let llm = FakeLlm::new(vec![vec![call_round(
+        5,
+        "pc-s2",
+        "shell",
+        serde_json::json!({ "command": "echo 二" }),
+    )]]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    gateway.decide(&first.approval, true).await;
+    let second = loop {
+        let pending = gateway.wait_approval().await;
+        if pending.approval != first.approval {
+            break pending;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    };
+    let segment_two = llm
+        .requests
+        .lock()
+        .expect("请求")
+        .last()
+        .expect("第二段的请求")
+        .messages
+        .clone();
+
+    let shape: Vec<(Role, Option<String>, Vec<String>)> = segment_two
+        .iter()
+        .map(|message| {
+            let ids = message
+                .tool_calls
+                .iter()
+                .map(|call| call.provider_call_id.clone())
+                .chain(
+                    message
+                        .tool_results
+                        .iter()
+                        .map(|result| result.provider_call_id.clone()),
+                )
+                .collect();
+            // 摘要正文太长，形状里只记它是不是那一句。
+            let text = match &message.text {
+                Some(text) if text == &format!("{COMPACTION_PREFIX}\n\n{summary}") => {
+                    Some("<摘要>".to_string())
+                }
+                other => other.clone(),
+            };
+            (message.role, text, ids)
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            (
+                Role::User,
+                Some("读三遍小文件，再跑两条命令".into()),
+                vec![]
+            ),
+            (Role::User, Some("<摘要>".into()), vec![]),
+            (Role::Assistant, None, vec!["pc-r3".into()]),
+            (Role::Tool, None, vec!["pc-r3".into()]),
+            // 批准的那次调用这一段才跑，结果经轮输入回去，不在开段的回放里。
+            (Role::Assistant, None, vec!["pc-s1".into()]),
+        ],
+        "任务 → 摘要（外置的正文按引用读回来）→ 第三轮起原样"
+    );
+
+    // 再重启 → 批 → 第三段：同一段前缀逐字节不变。
+    gateway.stop().await;
+    let llm = FakeLlm::finisher("都做完了。");
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    gateway.decide(&second.approval, true).await;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    let segment_three = llm
+        .requests
+        .lock()
+        .expect("请求")
+        .last()
+        .expect("第三段的请求")
+        .messages
+        .clone();
+    assert_eq!(
+        segment_three.len(),
+        segment_two.len() + 2,
+        "多了 s1 的结果与 s2 那一轮"
+    );
+    assert_eq!(
+        serde_json::to_string(&segment_three[..segment_two.len()]).unwrap(),
+        serde_json::to_string(&segment_two).unwrap(),
+        "重启之后回放的那一段逐字节相同"
+    );
 }

@@ -273,6 +273,13 @@ impl Ledger for PoisonedLedger {
     ) -> Result<komo_kernel::types::ids::Seq, LedgerError> {
         self.inner.boundary(session).await
     }
+    async fn record_compaction(
+        &self,
+        run: &RunId,
+        compaction: komo_kernel::events::ContextCompacted,
+    ) -> Result<komo_kernel::types::ids::Seq, LedgerError> {
+        self.inner.record_compaction(run, compaction).await
+    }
     async fn append_audit(
         &self,
         session: &SessionId,

@@ -15,7 +15,10 @@ fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput<'stat
         memory: memory.map(str::to_string),
         skills: None,
         invocation: InvocationContext::Main,
-        model_result_bytes: 8 * 1024,
+        projection: ProjectionContext {
+            model_result_bytes: 8 * 1024,
+            decay: None,
+        },
     }
 }
 

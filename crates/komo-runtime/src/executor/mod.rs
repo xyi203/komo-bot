@@ -82,7 +82,7 @@ use self::cancel::race;
 /// 执行器自己的预算（§6）。
 ///
 /// **交给模型的正文上限与活动执行时限不在这里**：它们跟着每一次执行走
-/// （[`CallEnv::model_result_bytes`]、[`CallEnv::call_timeout`]），因为配置是热生效的（§3）
+/// （[`CallEnv::projection`]、[`CallEnv::call_timeout`]），因为配置是热生效的（§3）
 /// ——写在这里就等于把它们钉在装配那一刻。
 #[derive(Debug, Clone)]
 pub struct ExecutionLimits {
@@ -155,9 +155,9 @@ pub struct CallEnv {
     ///
     /// 装配早于执行，解析在实际读到它的时候做（`tools::resources`）。
     pub mounts: ResourceMounts,
-    /// 交给模型的工具结果正文上限（§6）。**由 Gateway 按当前配置快照填**：配置热重载
-    /// 对新 Run 立刻生效，所以它不在执行器里，而在每一次执行的环境里（§3）。
-    pub model_result_bytes: usize,
+    /// 工具结果怎么投影给模型（§6、§8.3）。**由 Gateway 从这条 Run 冻结的快照里填**，
+    /// 与回放读的是同一份：配置热重载只影响之后受理的 Run（§3）。
+    pub projection: ProjectionContext,
     /// 单次调用的活动执行时限（§6，`[execution] call_timeout_secs`）。同上，按快照热生效。
     pub call_timeout: Duration,
     pub env_version: Option<EnvVersion>,
@@ -1724,12 +1724,7 @@ fn for_model(request: &CallRequest, env: &CallEnv, recorded: &Recorded) -> ToolR
     ToolResultForModel {
         provider_call_id: request.provider_call_id.clone(),
         call_id: request.call.clone(),
-        content: project(
-            &facts,
-            &ProjectionContext {
-                model_result_bytes: env.model_result_bytes,
-            },
-        ),
+        content: project(&facts, &env.projection),
         is_error: published.status != ToolResultStatus::Completed,
     }
 }

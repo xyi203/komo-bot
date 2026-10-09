@@ -395,6 +395,22 @@ fn check_execution(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             "call_timeout_secs 不能是 0（每个工具调用一开始就超时）",
         ));
     }
+    let execution = &snapshot.execution;
+    if execution.decay_full_sends == 0 {
+        issues.push(error(
+            "execution.decay_full_sends",
+            "decay_full_sends 至少是 1（大结果总要完整给模型看一次）",
+        ));
+    }
+    if execution.decay_threshold_bytes > 0
+        && execution.decay_head_bytes + execution.decay_tail_bytes
+            >= execution.decay_threshold_bytes
+    {
+        issues.push(error(
+            "execution.decay_head_bytes",
+            "decay_head_bytes + decay_tail_bytes 要小于 decay_threshold_bytes（否则摘录不比原文短）",
+        ));
+    }
 }
 
 /// `[mcp.servers.<name>]`（`docs/mcp.md`）：名字要进工具名（`mcp__<name>__<tool>`），只能是

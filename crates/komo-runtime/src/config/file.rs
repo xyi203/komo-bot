@@ -145,6 +145,10 @@ pub(super) struct MemorySection {
 pub(super) struct ExecutionSection {
     pub model_result_bytes: Option<usize>,
     pub call_timeout_secs: Option<u64>,
+    pub decay_threshold_bytes: Option<usize>,
+    pub decay_full_sends: Option<u32>,
+    pub decay_head_bytes: Option<usize>,
+    pub decay_tail_bytes: Option<usize>,
 }
 
 impl ExecutionSection {
@@ -153,6 +157,12 @@ impl ExecutionSection {
         ExecutionConfig {
             model_result_bytes: self.model_result_bytes.unwrap_or(base.model_result_bytes),
             call_timeout_secs: self.call_timeout_secs.unwrap_or(base.call_timeout_secs),
+            decay_threshold_bytes: self
+                .decay_threshold_bytes
+                .unwrap_or(base.decay_threshold_bytes),
+            decay_full_sends: self.decay_full_sends.unwrap_or(base.decay_full_sends),
+            decay_head_bytes: self.decay_head_bytes.unwrap_or(base.decay_head_bytes),
+            decay_tail_bytes: self.decay_tail_bytes.unwrap_or(base.decay_tail_bytes),
         }
     }
 }

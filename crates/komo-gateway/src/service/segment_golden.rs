@@ -111,7 +111,10 @@ async fn render(case: &Case) -> String {
         memory,
         skills,
         invocation,
-        model_result_bytes: case.model_result_bytes,
+        projection: komo_kernel::projection::ProjectionContext {
+            model_result_bytes: case.model_result_bytes,
+            decay: None,
+        },
     });
     let prompt = context.system_prompt;
 

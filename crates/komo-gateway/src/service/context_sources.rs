@@ -25,6 +25,7 @@ use komo_agent::context::history::{
 use komo_agent::skills::{OfferContext, SkillCatalog, SkillRegistry};
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::{Surface, SurfaceMessage};
+use komo_kernel::projection::ProjectionContext;
 use komo_kernel::traits::{LedgerError, ToolOutputStore};
 use komo_kernel::types::agent::RunSnapshot;
 use komo_kernel::types::ids::RunId;
@@ -56,6 +57,8 @@ pub(crate) struct Identity {
     pub instructions: Option<String>,
     /// 记忆作用域（§9.2）。
     pub memory_scope: Option<MemoryScope>,
+    /// 冻结的投影设置；`None` = 没有快照或快照早于这一格，调用方按当前配置。
+    pub projection: Option<ProjectionContext>,
 }
 
 /// 没有冻结快照时兜底身份要用到的那几样：当前配置、会话 workdir、`workspaces/`（§7）。
@@ -112,6 +115,7 @@ pub(crate) async fn identity_for(
         workspace: paths::real_root(&frozen.workspace),
         instructions,
         memory_scope: frozen.memory_scope,
+        projection: frozen.projection,
     })
 }
 
@@ -157,6 +161,7 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         workspace: paths::real_root(&workspace),
         instructions: profile.and_then(|profile| profile.instructions.clone()),
         memory_scope: profile.and_then(|profile| profile.memory_scope.clone()),
+        projection: None,
     }
 }
 
@@ -392,7 +397,10 @@ mod tests {
             memory: None,
             skills: None,
             invocation: InvocationContext::Main,
-            model_result_bytes: 8 * 1024,
+            projection: ProjectionContext {
+                model_result_bytes: 8 * 1024,
+                decay: None,
+            },
         }))
     }
 

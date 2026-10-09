@@ -607,6 +607,7 @@ mod tests {
             &facts,
             &ProjectionContext {
                 model_result_bytes: 64,
+                decay: None,
             },
         );
         let uri = printed

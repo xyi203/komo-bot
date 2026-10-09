@@ -13,6 +13,7 @@ mod prompt;
 
 use std::path::PathBuf;
 
+use komo_kernel::projection::ProjectionContext;
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::turn::ReplayMessage;
 
@@ -42,9 +43,9 @@ pub struct ContextInput<'s> {
     /// 已按 `OfferContext` 门控的 skills 目录；只有主 Agent 有。
     pub skills: Option<SkillCatalog>,
     pub invocation: InvocationContext,
-    /// 工具结果投影的正文预算（`[execution] model_result_bytes`）。
+    /// 工具结果的投影设置（这条 Run 冻结的那一份）。
     /// 与 `CallEnv` 用同一个值，否则"刚跑完"和"回放"渲染出来不一样。
-    pub model_result_bytes: usize,
+    pub projection: ProjectionContext,
 }
 
 /// 这一段是主 Agent 的对话，还是一次委派（`docs/agent.md` §11）。
@@ -81,7 +82,7 @@ pub fn assemble(input: ContextInput<'_>) -> AgentContext {
         prompt.push_str("\n\n");
         prompt.push_str(memory);
     }
-    let messages = history::to_replay_messages(input.history, input.model_result_bytes);
+    let messages = history::to_replay_messages(input.history, &input.projection);
     AgentContext {
         system_prompt: prompt,
         messages,

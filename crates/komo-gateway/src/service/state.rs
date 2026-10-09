@@ -1029,6 +1029,7 @@ impl GatewayState {
             surface,
             instructions_ref,
             memory_scope: profile.memory_scope.clone(),
+            projection: Some(config.execution.projection()),
         })
     }
 

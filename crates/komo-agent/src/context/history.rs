@@ -277,7 +277,7 @@ pub fn latest_user_text(surface: &Surface) -> Option<String> {
 /// **唯一的 Context Assembly 入口**只有那一个（§5）。
 pub(crate) fn to_replay_messages(
     history: Vec<ResolvedMessage<'_>>,
-    model_result_bytes: usize,
+    projection: &ProjectionContext,
 ) -> Vec<ReplayMessage> {
     // 结果落在**另一条**消息上（`Role::Tool` 的节点），工具名与 provider 的 call_id 要靠
     // 这份索引从原始请求里找回来——先把这一段窗口里出现过的调用都记一遍。
@@ -346,7 +346,7 @@ pub(crate) fn to_replay_messages(
                             .map(|call| call.provider_call_id.clone())
                             .unwrap_or_else(|| result.call.to_string()),
                         call_id: result.call.clone(),
-                        content: project(&facts, &ProjectionContext { model_result_bytes }),
+                        content: project(&facts, projection),
                         is_error: !matches!(result.status, ToolResultStatus::Completed),
                     });
                 }

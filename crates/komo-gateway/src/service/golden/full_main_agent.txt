@@ -74,7 +74,7 @@ Skills（用到时按根的顺序 read <根>/<名字>/SKILL.md 再照做）：
       {
         "provider_call_id": "pc-2",
         "call_id": "call-2",
-        "content": "[shell · 完成 · 1.2s]\n第 1 行输出\n第 2 行输出\n第\n…（中间省略 601 字节）…\n\n第 39 行输出\n第 40 行输出\n完整输出：artifact://run-2/call-2/attempt-2/result\n产物：artifact://files/run-2/报告.md（13 B）\n",
+        "content": "[shell · 完成 · 1.2s]\n第 1 行输出\n第 2 行输出\n…（中间省略 605 字节）…\n第 39 行输出\n第 40 行输出\n完整输出：artifact://run-2/call-2/attempt-2/result\n产物：artifact://files/run-2/报告.md（13 B）\n",
         "is_error": false
       },
       {

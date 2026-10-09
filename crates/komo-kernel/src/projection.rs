@@ -5,15 +5,17 @@
 //! 逐字节相同的字符串。所以输入里没有"现在几点""这是第几次请求"这类东西，也没有任何 I/O：
 //! 那些属于策略与取数，不属于渲染。
 //!
-//! 两个视图，按事实直接判得出来：
+//! 同一份事实渲染出**两个视图**（[`project_views`]）：
 //!
-//! - **Full**：这段正文就是全部（流里没有更多字节）。
-//! - **Excerpt**：正文是一部分——头尾各留一段，中间写明省了多少，并给出**可直接 `read` 的
-//!   完整输出引用**（`artifact://<run>/<call>/<attempt>/…`，§4.7）。省略不等于丢失：完整
-//!   事实始终在 `output.json` / `stdout.txt` 里。
+//! - **full**：头尾各留一段整行、中间写明省了多少；正文不够大时就是全部。还有更多时给出
+//!   **可直接 `read` 的完整输出引用**（`artifact://<run>/<call>/<attempt>/…`，§4.7）。
+//! - **decayed**：大结果完整给过几次之后换成的稳定短视图——抬头 + 首尾整行 + 那条引用。
+//!   省略不等于丢失：完整事实始终在 `output.json` / `stdout.txt` 里。
 //!
-//! 第三种（Handle：连正文都不给，只留引用）是**按请求**决定的——同一份事实在不同轮次可以
-//! 有不同的视图，而当前阶段只投影一次（`docs/komo_observation.md` 的第二阶段）。
+//! 某一次请求用哪个视图**不在这里判**：由 [`view_after`] 按"已经完整给过几次"选，那个
+//! 次数从事件日志里数出来，所以同样可以回放。
+
+use serde::{Deserialize, Serialize};
 
 use crate::types::ids::{AttemptId, RunId, ToolCallId};
 use crate::types::refs::{ContentRef, OutputRef, ToolResultStatus};
@@ -39,10 +41,29 @@ pub struct ToolResultFacts<'a> {
     pub artifacts: &'a [ContentRef],
 }
 
-/// 这一次投影的预算：正文最多占多少字节。
-#[derive(Debug, Clone, Copy)]
+/// 这一次投影的设置：正文预算与衰减策略。
+///
+/// 它冻结在 `RunSnapshot` 里（§6.2）：一条 Run 从头到尾、刚跑完与回放都按同一份投影，
+/// 配置热重载只影响之后受理的 Run。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectionContext {
     pub model_result_bytes: usize,
+    /// `None` = 不衰减（`decay_threshold_bytes = 0`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decay: Option<DecayPolicy>,
+}
+
+/// 大结果什么时候、换成多短的视图（`[execution] decay_*`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecayPolicy {
+    /// full 视图超过这么多字节才有 decayed 视图。
+    pub threshold_bytes: usize,
+    /// 完整给过几次之后换成 decayed。
+    pub full_sends: u32,
+    /// decayed 视图开头最多留多少字节的整行。
+    pub head_bytes: usize,
+    /// decayed 视图结尾最多留多少字节的整行。
+    pub tail_bytes: usize,
 }
 
 /// 交给模型的正文默认预算。
@@ -51,27 +72,97 @@ pub struct ProjectionContext {
 /// 上下文预算。默认值由配置覆盖（§6「Gateway 设置……输出长度」）。
 pub const DEFAULT_MODEL_RESULT_BYTES: usize = 8 * 1024;
 
-/// 交给模型的正文（§8.3）。
+/// decayed 视图至少要比 full 短这么多才值得换：省几十字节却让模型面对一份变了样的
+/// 结果，不划算。
+pub const MIN_DECAY_SAVING_BYTES: usize = 1024;
+
+/// 同一份事实的两个视图。`decayed` 只在值得换的时候有（见 [`project_views`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Projected {
+    pub full: String,
+    pub decayed: Option<String>,
+}
+
+/// 一次请求该用哪个视图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Full,
+    Decayed,
+}
+
+/// 已经完整给过 `sends_so_far` 次之后，下一次用哪个视图。
+pub fn view_after(sends_so_far: u32, full_sends: u32) -> View {
+    if sends_so_far < full_sends {
+        View::Full
+    } else {
+        View::Decayed
+    }
+}
+
+/// 交给模型的正文（§8.3）：full 视图。
 pub fn project(facts: &ToolResultFacts<'_>, ctx: &ProjectionContext) -> String {
     let mut out = header(facts);
     let room = ctx.model_result_bytes.saturating_sub(out.len());
 
     let text = facts.text.unwrap_or_default();
     let cut = truncate_head_tail(text, room);
-    out.push_str(cut.head);
-    if cut.omitted > 0 {
-        // 省略那条**夹在头尾之间**：读者顺着往下读，走到这里就知道中间跳了多远。
-        out.push_str(&format!("\n…（中间省略 {} 字节）…\n", cut.omitted));
-        out.push_str(cut.tail);
-    }
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
+    push_excerpt(&mut out, &cut);
     if cut.omitted > 0 || has_more(facts, text) {
         out.push_str(&recall(facts));
     }
     out.push_str(&artifacts(facts));
     out
+}
+
+/// 两个视图一起渲染（§8.3）。
+///
+/// decayed 只在三件事都成立时才有：结果是 `完成`（失败与结果不明的正文是模型要对着改的
+/// 东西，不衰减）、full 超过阈值、decayed 比 full 至少短 [`MIN_DECAY_SAVING_BYTES`]。
+pub fn project_views(facts: &ToolResultFacts<'_>, ctx: &ProjectionContext) -> Projected {
+    let full = project(facts, ctx);
+    let decayed = ctx
+        .decay
+        .filter(|_| facts.status == ToolResultStatus::Completed)
+        .filter(|policy| full.len() > policy.threshold_bytes)
+        .map(|policy| decay(facts, &policy))
+        .filter(|decayed| decayed.len() + MIN_DECAY_SAVING_BYTES <= full.len());
+    Projected { full, decayed }
+}
+
+/// decayed 视图：抬头 + 一句交代 + 首尾整行 + **总是**给出完整输出的引用。
+///
+/// 摘录取自工具的原正文（事实），不是从 full 那份已经裁过的字符串里再裁。
+fn decay(facts: &ToolResultFacts<'_>, policy: &DecayPolicy) -> String {
+    let mut out = header(facts);
+    let text = facts.text.unwrap_or_default();
+    out.push_str(&format!(
+        "（这份结果已完整给过 {} 次，此后只留首尾整行：原文 {} 字节 / {} 行）\n",
+        policy.full_sends,
+        text.len(),
+        text.lines().count()
+    ));
+    let cut = excerpt(text, policy.head_bytes, policy.tail_bytes);
+    push_excerpt(&mut out, &cut);
+    out.push_str(&recall(facts));
+    out.push_str(&artifacts(facts));
+    out
+}
+
+/// 头 → 省略那条 → 尾，结尾补齐换行。
+///
+/// 省略那条**夹在头尾之间**：读者顺着往下读，走到这里就知道中间跳了多远。
+fn push_excerpt(out: &mut String, cut: &Truncated<'_>) {
+    out.push_str(cut.head);
+    if cut.omitted > 0 {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("…（中间省略 {} 字节）…\n", cut.omitted));
+        out.push_str(cut.tail);
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
 }
 
 /// 抬头那一行：谁、什么状态、花了多久、流里有多少字节。
@@ -187,24 +278,70 @@ struct Truncated<'a> {
     omitted: u64,
 }
 
-/// 头尾各留一段，中间省略。
+/// 头尾各留一段，中间省略（full 视图）。
 ///
 /// **不是只留头**：`cargo test` 的错误在尾部，只留头等于把要找的那一行丢掉（§8.3 的
-/// "超限时提供截断提示"不该变成"信息销毁"）。切点落在字符边界上，UTF-8 不会从中间切开。
+/// "超限时提供截断提示"不该变成"信息销毁"）。头先拿一半预算，尾拿剩下的。
 fn truncate_head_tail(text: &str, room: usize) -> Truncated<'_> {
     if text.len() <= room {
-        return Truncated {
-            head: text,
-            tail: "",
-            omitted: 0,
-        };
+        return whole(text);
     }
-    let head = boundary(text, room / 2);
-    let tail_start = boundary_rev(text, text.len() - (room - head));
+    let head = head_end(text, room / 2);
+    let tail = tail_start(text, room - head);
     Truncated {
         head: &text[..head],
-        tail: &text[tail_start..],
-        omitted: (tail_start - head) as u64,
+        tail: &text[tail..],
+        omitted: (tail - head) as u64,
+    }
+}
+
+/// 头尾各留一段，预算各自固定（decayed 视图）。
+fn excerpt(text: &str, head_bytes: usize, tail_bytes: usize) -> Truncated<'_> {
+    if text.len() <= head_bytes + tail_bytes {
+        return whole(text);
+    }
+    let head = head_end(text, head_bytes);
+    let tail = tail_start(text, tail_bytes);
+    Truncated {
+        head: &text[..head],
+        tail: &text[tail..],
+        omitted: (tail - head) as u64,
+    }
+}
+
+fn whole(text: &str) -> Truncated<'_> {
+    Truncated {
+        head: text,
+        tail: "",
+        omitted: 0,
+    }
+}
+
+/// 头的终点：不超过 `limit` 字节的**整行**。整行留不到预算的一半（第一行自己就超了，
+/// 或者紧跟着一行很长的，比如一整行 JSON）时退到字符边界——有正文就不给一段空的或
+/// 白白浪费预算的摘录。
+fn head_end(text: &str, limit: usize) -> usize {
+    let cut = boundary(text, limit);
+    if cut == text.len() {
+        return cut;
+    }
+    match text[..cut].rfind('\n') {
+        Some(newline) if (newline + 1) * 2 >= cut => newline + 1,
+        _ => cut,
+    }
+}
+
+/// 尾的起点：不超过 `limit` 字节的**整行**。同样，整行留不到预算的一半时退到字符边界。
+fn tail_start(text: &str, limit: usize) -> usize {
+    let floor = boundary_rev(text, text.len().saturating_sub(limit));
+    if floor == 0 || text.as_bytes()[floor - 1] == b'\n' {
+        return floor;
+    }
+    match text[floor..].find('\n') {
+        Some(newline) if (text.len() - (floor + newline + 1)) * 2 >= text.len() - floor => {
+            floor + newline + 1
+        }
+        _ => floor,
     }
 }
 
@@ -292,7 +429,31 @@ mod tests {
         std::sync::LazyLock::new(|| reference(STDOUT_PATH, 400));
 
     fn budget(model_result_bytes: usize) -> ProjectionContext {
-        ProjectionContext { model_result_bytes }
+        ProjectionContext {
+            model_result_bytes,
+            decay: None,
+        }
+    }
+
+    const POLICY: DecayPolicy = DecayPolicy {
+        threshold_bytes: 4096,
+        full_sends: 2,
+        head_bytes: 2048,
+        tail_bytes: 1536,
+    };
+
+    fn decaying(model_result_bytes: usize) -> ProjectionContext {
+        ProjectionContext {
+            model_result_bytes,
+            decay: Some(POLICY),
+        }
+    }
+
+    /// `n` 行，每行 51 字节，行号在前——摘出来的是哪几行一眼看得出。
+    fn lines(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("line {i:04}: {}\n", "x".repeat(40)))
+            .collect()
     }
 
     #[test]
@@ -469,23 +630,161 @@ mod tests {
     #[test]
     fn the_same_facts_render_the_same_bytes() {
         let artifacts = [reference("artifacts/run-1/报告.md", 13)];
+        let text = lines(400);
         let one = ToolResultFacts {
             artifacts: &artifacts,
-            ..facts(Some("a\nb\n"), Some(&STDOUT))
+            ..facts(Some(&text), Some(&STDOUT))
         };
         let two = ToolResultFacts {
             artifacts: &artifacts,
-            ..facts(Some("a\nb\n"), Some(&STDOUT))
+            ..facts(Some(&text), Some(&STDOUT))
         };
-        let printed = project(&one, &budget(64));
+        let printed = project_views(&one, &decaying(8 * 1024));
         assert_eq!(
             printed,
-            project(&two, &budget(64)),
-            "投影是纯函数：同一份事实两次投影必须一样"
+            project_views(&two, &decaying(8 * 1024)),
+            "投影是纯函数：同一份事实两次投影，两个视图都必须一样"
+        );
+        assert_eq!(printed.full, project(&one, &decaying(8 * 1024)));
+        let decayed = printed.decayed.expect("这么大的结果要有 decayed 视图");
+        for view in [&printed.full, &decayed] {
+            assert!(
+                view.contains("产物：artifact://files/run-1/报告.md"),
+                "{view}"
+            );
+        }
+    }
+
+    #[test]
+    fn excerpts_cut_on_whole_lines() {
+        let text = lines(200);
+        for cut in [truncate_head_tail(&text, 1000), excerpt(&text, 700, 400)] {
+            assert!(cut.omitted > 0);
+            assert!(cut.head.ends_with('\n'), "头停在行尾：{:?}", cut.head);
+            assert!(cut.head.starts_with("line 0000: "), "{:?}", cut.head);
+            let tail_start = text.len() - cut.tail.len();
+            assert!(
+                text[..tail_start].ends_with('\n') && cut.tail.starts_with("line "),
+                "尾从行首开始：{:?}",
+                cut.tail
+            );
+            assert!(cut.tail.ends_with('\n'), "{:?}", cut.tail);
+        }
+        // 预算留得下几行就是几行：51 字节一行，700 字节的头是 13 行，400 字节的尾是 7 行。
+        let cut = excerpt(&text, 700, 400);
+        assert_eq!(cut.head.lines().count(), 13);
+        assert_eq!(cut.tail.lines().count(), 7);
+
+        // 投影里省略那条单独占一行，不和头尾挤在一起。
+        let printed = project(&facts(Some(&text), None), &budget(1000));
+        assert!(printed.contains("\n…（中间省略 "), "{printed}");
+        assert!(!printed.contains("\n\n…（中间省略 "), "{printed}");
+    }
+
+    #[test]
+    fn a_single_giant_line_falls_back_to_char_boundaries() {
+        // 第一行比头的预算还长：退到字符边界，头不能是空的。
+        let first = format!("{}\nshort\n", "汉".repeat(2000));
+        let cut = excerpt(&first, 100, 100);
+        assert!(!cut.head.is_empty(), "有正文就不给空摘录");
+        assert!(cut.head.len() > 90 && cut.head.len() <= 100 && cut.head.starts_with('汉'));
+        // 尾那一行只占预算的零头：整行留不到一半，同样退到字符边界，把预算用上。
+        assert!(
+            cut.tail.len() > 90 && cut.tail.len() <= 100,
+            "{:?}",
+            cut.tail
+        );
+        assert!(cut.tail.ends_with("汉\nshort\n"), "{:?}", cut.tail);
+
+        // 最后一行比尾的预算还长：同样退到字符边界。
+        let last = format!("short\n{}\n", "汉".repeat(2000));
+        let cut = excerpt(&last, 100, 100);
+        assert!(cut.head.starts_with("short\n汉") && cut.head.len() > 90);
+        assert!(
+            cut.tail.len() > 90 && cut.tail.len() <= 100,
+            "{:?}",
+            cut.tail
+        );
+        assert!(cut.tail.ends_with("汉\n"));
+
+        // 一行短抬头后面跟着一整行巨大的 JSON（`read` 一个压缩过的文件就是这样）：整行
+        // 只留得下那行抬头，连预算的一半都不到——退到字符边界，JSON 的开头要看得见。
+        let json = format!("共 1 行\n{{\"v\":1,\"body\":\"{}\"}}\n", "x".repeat(4000));
+        let cut = excerpt(&json, 200, 200);
+        assert!(cut.head.starts_with("共 1 行\n{\"v\":1,"), "{:?}", cut.head);
+        assert!(cut.head.len() > 190 && cut.head.len() <= 200);
+        assert!(cut.tail.len() > 190 && cut.tail.ends_with("\"}\n"));
+    }
+
+    #[test]
+    fn the_decayed_view_always_names_the_recall_uri() {
+        // full 视图放得下全部正文，所以它不印引用；decayed 视图省了中间，引用必须在。
+        let text = lines(400);
+        let views = project_views(&facts(Some(&text), None), &decaying(64 * 1024));
+        assert!(!views.full.contains("完整输出："), "{}", views.full);
+        let decayed = views.decayed.expect("20 KB 的结果要有 decayed 视图");
+        assert!(
+            decayed.starts_with("[shell · 完成 · 1.2s]\n（这份结果已完整给过 2 次"),
+            "{decayed}"
         );
         assert!(
-            printed.contains("产物：artifact://files/run-1/报告.md"),
-            "{printed}"
+            decayed.contains(&format!("原文 {} 字节 / 400 行", text.len())),
+            "{decayed}"
         );
+        assert!(decayed.contains("line 0000: "), "{decayed}");
+        assert!(decayed.contains("line 0399: "), "{decayed}");
+        assert!(decayed.contains("…（中间省略 "), "{decayed}");
+        assert!(
+            decayed.ends_with("完整输出：artifact://run-1/call-7/attempt-1/result\n"),
+            "{decayed}"
+        );
+    }
+
+    #[test]
+    fn an_error_result_never_decays() {
+        let text = lines(400);
+        for status in [ToolResultStatus::Failed, ToolResultStatus::Uncertain] {
+            let failed = ToolResultFacts {
+                status,
+                ..facts(Some(&text), None)
+            };
+            assert_eq!(project_views(&failed, &decaying(64 * 1024)).decayed, None);
+        }
+    }
+
+    #[test]
+    fn a_small_result_never_decays() {
+        let small = lines(60);
+        assert!(small.len() < POLICY.threshold_bytes);
+        let views = project_views(&facts(Some(&small), None), &decaying(64 * 1024));
+        assert_eq!(views.decayed, None);
+
+        // 衰减关着（阈值 0）时再大也没有。
+        let big = lines(400);
+        assert_eq!(
+            project_views(&facts(Some(&big), None), &budget(64 * 1024)).decayed,
+            None
+        );
+    }
+
+    #[test]
+    fn the_decayed_view_is_strictly_shorter() {
+        let views = project_views(&facts(Some(&lines(400)), None), &decaying(64 * 1024));
+        let decayed = views.decayed.expect("要有 decayed 视图");
+        assert!(decayed.len() + MIN_DECAY_SAVING_BYTES <= views.full.len());
+
+        // 刚过阈值、头尾几乎就是全部：省不到 1 KiB，不换。
+        let barely = lines(90);
+        let views = project_views(&facts(Some(&barely), None), &decaying(64 * 1024));
+        assert!(views.full.len() > POLICY.threshold_bytes);
+        assert_eq!(views.decayed, None, "{}", views.full.len());
+    }
+
+    #[test]
+    fn the_view_turns_after_the_full_sends() {
+        assert_eq!(view_after(0, 2), View::Full);
+        assert_eq!(view_after(1, 2), View::Full);
+        assert_eq!(view_after(2, 2), View::Decayed);
+        assert_eq!(view_after(7, 2), View::Decayed);
     }
 }

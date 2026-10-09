@@ -153,18 +153,21 @@ impl GatewaySegments {
         self
     }
 
-    /// 接上配置：输出预算按当前快照热生效（§3）。
+    /// 接上配置：执行时限按当前快照热生效（§3）；投影设置只给没有冻结快照的 Run 兜底。
     pub fn with_config(mut self, config: Arc<ConfigHolder>) -> Self {
         self.config = Some(config);
         self
     }
 
-    /// 这一次装配用多少正文预算。
-    fn model_result_bytes(&self) -> usize {
+    /// 当前配置给出的投影设置——只给**没有冻结这一格**的 Run 用（它出现之前受理的、
+    /// 没有快照的）。有快照的 Run 一律按快照里那一份（§6.2）。
+    fn current_projection(&self) -> komo_kernel::projection::ProjectionContext {
         self.config
             .as_ref()
-            .map(|config| config.current().execution.model_result_bytes)
-            .unwrap_or(komo_kernel::projection::DEFAULT_MODEL_RESULT_BYTES)
+            .map(|config| config.current().execution.projection())
+            .unwrap_or_else(|| {
+                komo_kernel::protocol::config::ExecutionConfig::default().projection()
+            })
     }
 
     /// 这一次执行用多长的活动执行时限。
@@ -335,7 +338,6 @@ impl SegmentSource for GatewaySegments {
             .map(|view| view.rounds)
             .unwrap_or_default();
 
-        let model_result_bytes = self.model_result_bytes();
         // 外置正文的来源：窗口里的用户输入与模型回复、以及身份指令正文都可能在这里。
         let payloads = self.payloads_for(&session);
 
@@ -380,6 +382,10 @@ impl SegmentSource for GatewaySegments {
         if delegate.is_some() {
             identity.surface = without_delegate(identity.surface);
         }
+        // 投影设置同样按冻结的那一份：执行器（刚跑完）与回放读同一个值，热重载改不到它。
+        let projection = identity
+            .projection
+            .unwrap_or_else(|| self.current_projection());
         tracing::debug!(
             run = %run,
             session = %session,
@@ -483,7 +489,7 @@ impl SegmentSource for GatewaySegments {
             memory: injection.text.clone(),
             skills,
             invocation,
-            model_result_bytes,
+            projection,
         });
 
         let agent_surface = identity.surface.clone();
@@ -541,7 +547,7 @@ impl SegmentSource for GatewaySegments {
             cwd,
             roots,
             mounts,
-            model_result_bytes,
+            projection,
             call_timeout: self.call_timeout(),
             env_version: None,
             principal: None,

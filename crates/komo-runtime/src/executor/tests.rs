@@ -3123,9 +3123,8 @@ mod dispatch_and_follow {
 mod one_projection {
     use super::*;
 
-    use komo_kernel::projection::{
-        DEFAULT_MODEL_RESULT_BYTES, ProjectionContext, ToolResultFacts, project,
-    };
+    use komo_kernel::projection::{ToolResultFacts, project};
+    use komo_kernel::protocol::config::ExecutionConfig;
     use komo_kernel::traits::{Ledger, TaskSpawner, ToolOutputStore};
     use komo_kernel::types::status::RunEnd;
     use komo_kernel::types::turn::ToolResultForModel;
@@ -3169,9 +3168,7 @@ mod one_projection {
                 stderr: result.stderr.as_ref(),
                 artifacts: &body.artifacts,
             },
-            &ProjectionContext {
-                model_result_bytes: DEFAULT_MODEL_RESULT_BYTES,
-            },
+            &ExecutionConfig::default().projection(),
         )
     }
 

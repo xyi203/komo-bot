@@ -8,12 +8,18 @@ use komo_kernel::events::{
     Event, EventPayload, MessageAssistant, RunAccepted, RunCompleted, RunStarted,
 };
 use komo_kernel::fold::fold;
+use komo_kernel::projection::ProjectionContext;
 use komo_kernel::traits::Clock;
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RequestKey, SessionId};
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultStatus};
+
+const BUDGET: ProjectionContext = ProjectionContext {
+    model_result_bytes: 8 * 1024,
+    decay: None,
+};
 
 /// komo-agent 不依赖 `time`（§13.4 的依赖表）：借道 `TestClock`（实现了
 /// `komo_kernel::traits::Clock`）拿一个固定时间戳，不必自己拼这个类型的路径。
@@ -152,7 +158,7 @@ fn a_later_run_still_reads_what_the_earlier_one_said() {
     ];
     let surface = fold(&events);
     let resolved = resolve_inline(entries(&surface, ReplayScope::Conversation(&second)));
-    let messages = to_replay_messages(resolved, 8 * 1024);
+    let messages = to_replay_messages(resolved, &BUDGET);
 
     let seen: Vec<(Role, Option<&str>)> = messages
         .iter()
@@ -195,7 +201,7 @@ fn the_running_run_keeps_its_whole_protocol() {
     ];
     let surface = fold(&events);
     let resolved = resolve_inline(entries(&surface, ReplayScope::Conversation(&run)));
-    let messages = to_replay_messages(resolved, 8 * 1024);
+    let messages = to_replay_messages(resolved, &BUDGET);
 
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[1].tool_calls.len(), 1);
@@ -228,7 +234,7 @@ fn a_subagent_and_its_parent_are_two_different_conversations() {
     let surface = fold(&events);
 
     let of = |scope| {
-        to_replay_messages(resolve_inline(entries(&surface, scope)), 8 * 1024)
+        to_replay_messages(resolve_inline(entries(&surface, scope)), &BUDGET)
             .into_iter()
             .map(|message| message.text)
             .collect::<Vec<_>>()
@@ -304,7 +310,7 @@ fn a_replayed_round_names_the_artifacts_it_produced() {
             }
         })
         .collect();
-    let messages = to_replay_messages(resolved, 8 * 1024);
+    let messages = to_replay_messages(resolved, &BUDGET);
 
     let content = &messages
         .iter()
@@ -326,7 +332,7 @@ fn a_replayed_round_names_the_artifacts_it_produced() {
 fn thread_texts(surface: &Surface, chain: &[RunId]) -> Vec<ReplayMessage> {
     to_replay_messages(
         resolve_inline(entries(surface, ReplayScope::Thread(chain))),
-        8 * 1024,
+        &BUDGET,
     )
 }
 

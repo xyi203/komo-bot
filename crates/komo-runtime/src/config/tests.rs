@@ -384,6 +384,59 @@ fn the_call_timeout_is_read_from_the_execution_section() {
 }
 
 #[test]
+fn the_decay_keys_default_when_the_execution_section_omits_them() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    let execution = &loaded.snapshot.execution;
+    assert_eq!(
+        (
+            execution.decay_threshold_bytes,
+            execution.decay_full_sends,
+            execution.decay_head_bytes,
+            execution.decay_tail_bytes,
+        ),
+        (4096, 2, 2048, 1536)
+    );
+    let decay = execution.projection().decay.expect("默认开着衰减");
+    assert_eq!(decay.threshold_bytes, 4096);
+}
+
+#[test]
+fn a_zero_decay_threshold_turns_decay_off() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[execution]\ndecay_threshold_bytes = 0\ndecay_head_bytes = 9000\n");
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.execution.projection().decay, None);
+}
+
+#[test]
+fn decay_excerpts_that_do_not_fit_under_the_threshold_refuse_the_load() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[execution]\ndecay_head_bytes = 3000\ndecay_tail_bytes = 1096\n");
+    write(&fixture.sources().config, &text);
+
+    let error = load_config(&fixture.options()).unwrap_err();
+    let keys: Vec<&str> = error.issues().iter().map(|i| i.key.as_str()).collect();
+    assert_eq!(keys, vec!["execution.decay_head_bytes"]);
+}
+
+#[test]
+fn zero_full_sends_refuses_the_load() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[execution]\ndecay_full_sends = 0\n");
+    write(&fixture.sources().config, &text);
+
+    let error = load_config(&fixture.options()).unwrap_err();
+    let keys: Vec<&str> = error.issues().iter().map(|i| i.key.as_str()).collect();
+    assert_eq!(keys, vec!["execution.decay_full_sends"]);
+}
+
+#[test]
 fn a_config_without_a_model_section_says_which_key_is_missing() {
     let fixture = Fixture::valid();
     write(&fixture.sources().config, "[memory]\nenabled = false\n");

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::policy::RuleTable;
+use crate::projection::{DecayPolicy, ProjectionContext};
 use crate::types::agent::AgentConfig;
 use crate::types::chat::{ChannelPlatform, PeerId};
 use crate::types::digest::ContentHash;
@@ -300,6 +301,52 @@ pub struct ExecutionConfig {
     /// 会被收紧到它以内，所以到点时是工具自己杀进程、报超时，而不是执行器丢下一个结果不明。
     #[serde(default = "default_call_timeout_secs")]
     pub call_timeout_secs: u64,
+    /// 投影超过这么多字节的结果，完整给过 `decay_full_sends` 次之后换成首尾摘录（§8.3）。
+    /// 0 = 不衰减。
+    #[serde(default = "default_decay_threshold_bytes")]
+    pub decay_threshold_bytes: usize,
+    #[serde(default = "default_decay_full_sends")]
+    pub decay_full_sends: u32,
+    #[serde(default = "default_decay_head_bytes")]
+    pub decay_head_bytes: usize,
+    #[serde(default = "default_decay_tail_bytes")]
+    pub decay_tail_bytes: usize,
+}
+
+impl ExecutionConfig {
+    /// 这份配置给出的投影设置。受理 Run 时冻结进 `RunSnapshot`（§6.2）。
+    pub fn projection(&self) -> ProjectionContext {
+        ProjectionContext {
+            model_result_bytes: self.model_result_bytes,
+            decay: (self.decay_threshold_bytes > 0).then_some(DecayPolicy {
+                threshold_bytes: self.decay_threshold_bytes,
+                full_sends: self.decay_full_sends,
+                head_bytes: self.decay_head_bytes,
+                tail_bytes: self.decay_tail_bytes,
+            }),
+        }
+    }
+}
+
+pub const DEFAULT_DECAY_THRESHOLD_BYTES: usize = 4096;
+pub const DEFAULT_DECAY_FULL_SENDS: u32 = 2;
+pub const DEFAULT_DECAY_HEAD_BYTES: usize = 2048;
+pub const DEFAULT_DECAY_TAIL_BYTES: usize = 1536;
+
+fn default_decay_threshold_bytes() -> usize {
+    DEFAULT_DECAY_THRESHOLD_BYTES
+}
+
+fn default_decay_full_sends() -> u32 {
+    DEFAULT_DECAY_FULL_SENDS
+}
+
+fn default_decay_head_bytes() -> usize {
+    DEFAULT_DECAY_HEAD_BYTES
+}
+
+fn default_decay_tail_bytes() -> usize {
+    DEFAULT_DECAY_TAIL_BYTES
 }
 
 /// 一次 `cargo build --release` 这种量级的命令要能跑完。
@@ -323,6 +370,10 @@ impl Default for ExecutionConfig {
         Self {
             model_result_bytes: default_model_result_bytes(),
             call_timeout_secs: DEFAULT_CALL_TIMEOUT_SECS,
+            decay_threshold_bytes: DEFAULT_DECAY_THRESHOLD_BYTES,
+            decay_full_sends: DEFAULT_DECAY_FULL_SENDS,
+            decay_head_bytes: DEFAULT_DECAY_HEAD_BYTES,
+            decay_tail_bytes: DEFAULT_DECAY_TAIL_BYTES,
         }
     }
 }

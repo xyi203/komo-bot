@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::projection::ProjectionContext;
 use crate::types::digest::ContentHash;
 use crate::types::memory::MemoryScope;
 use crate::types::model::ModelConfig;
@@ -112,6 +113,10 @@ pub struct RunSnapshot {
     pub instructions_ref: Option<PayloadRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_scope: Option<MemoryScope>,
+    /// 工具结果怎么投影给模型（`[execution]` 的预算与衰减，§8.3）。冻结在这里，刚跑完与
+    /// 回放才按同一份渲染，热重载改不到已经受理的 Run。`None` = 这一格出现之前受理的 Run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection: Option<ProjectionContext>,
 }
 
 /// 配置里的一整套助手定义。

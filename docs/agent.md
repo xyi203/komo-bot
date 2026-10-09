@@ -307,9 +307,9 @@ pub struct ContextInput<'s> {
 
     pub invocation: InvocationContext,
 
-    /// 工具结果投影的正文预算（`[execution] model_result_bytes`）。
+    /// 工具结果的投影设置（这条 Run 冻结在 `RunSnapshot` 里的那一份）。
     /// 与 `CallEnv` 用同一个值，否则"刚跑完"和"回放"渲染出来不一样。
-    pub model_result_bytes: usize,
+    pub projection: ProjectionContext,
 }
 ```
 

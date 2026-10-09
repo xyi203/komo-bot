@@ -259,3 +259,63 @@ async fn a_refused_call_renders_the_same_bytes_live_and_replayed() {
         "没跑起来的调用，回放时渲染出的字节也必须与刚交回模型的那次一样"
     );
 }
+
+/// 投影设置冻结在 Run 受理时的快照里（§6.2）：Run 停在审批上时改配置、热重载，批准之后
+/// 第二段回放出来的字节仍与刚跑完那次一样——热重载只影响之后受理的 Run。
+#[tokio::test]
+async fn a_hot_reload_does_not_change_how_a_running_run_projects() {
+    let (home, _file) = home_with_a_big_file();
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-read",
+            "read",
+            serde_json::json!({ "path": "大文件.txt" }),
+        ),
+        call_round(
+            2,
+            "pc-shell",
+            "shell",
+            serde_json::json!({ "command": "echo 收尾" }),
+        ),
+        text_round(3, "都做完了。"),
+    ]]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(&session, "obs-5", "读一遍再跑一条命令")
+        .await
+        .run;
+
+    let pending = gateway.wait_approval().await;
+    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
+    let live = fed_back(&llm, "read");
+    assert!(live.len() > 1500, "受理时的预算是 2 KiB：{}", live.len());
+
+    // Run 停着的时候把预算改小、衰减关掉，然后热重载。
+    std::fs::write(
+        home.path().join("config.toml"),
+        config_toml("[execution]\nmodel_result_bytes = 512\ndecay_threshold_bytes = 0\n"),
+    )
+    .expect("改 config.toml");
+    gateway.state().config.reload().expect("新配置校验得过");
+    assert_eq!(
+        gateway
+            .state()
+            .config
+            .current()
+            .execution
+            .model_result_bytes,
+        512
+    );
+
+    gateway.decide(&pending.approval, true).await;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    assert_eq!(
+        replayed(&llm, "read"),
+        live,
+        "这条 Run 按受理时冻结的投影设置回放，不跟着热重载变"
+    );
+}

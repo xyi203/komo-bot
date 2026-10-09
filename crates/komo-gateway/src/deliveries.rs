@@ -59,6 +59,7 @@ impl DeliveryLog {
         target: &DeliveryTarget,
         msg: Outbound,
     ) -> Result<Delivery, DeliverError> {
+        let _exclusive = self.flushing.lock().await;
         let now = self.clock.now();
         let id = DeliveryId::new_at(now);
         let record = self
@@ -66,11 +67,44 @@ impl DeliveryLog {
             .record(&id, target, &msg, now)
             .await
             .map_err(|error| DeliverError::Persist(error.to_string()))?;
-        self.send_recorded(&record).await
+        self.send_recorded_locked(&record).await
+    }
+
+    pub async fn deliver_once(
+        &self,
+        target: &DeliveryTarget,
+        msg: Outbound,
+        key: &str,
+    ) -> Result<Delivery, DeliverError> {
+        let _exclusive = self.flushing.lock().await;
+        let now = self.clock.now();
+        let record = self
+            .repo
+            .record_once(&DeliveryId::new_at(now), target, &msg, Some(key), now)
+            .await
+            .map_err(|error| DeliverError::Persist(error.to_string()))?;
+        self.send_recorded_locked(&record).await
     }
 
     /// 发一条**已经登记过**的投递（首次发送与补发走同一段代码）。
     pub async fn send_recorded(&self, record: &DeliveryRecord) -> Result<Delivery, DeliverError> {
+        let _exclusive = self.flushing.lock().await;
+        let current = self
+            .repo
+            .get(&record.id)
+            .await
+            .map_err(|error| DeliverError::Persist(error.to_string()))?
+            .ok_or_else(|| DeliverError::Persist(format!("投递 {} 不存在", record.id)))?;
+        self.send_recorded_locked(&current).await
+    }
+
+    async fn send_recorded_locked(
+        &self,
+        record: &DeliveryRecord,
+    ) -> Result<Delivery, DeliverError> {
+        if record.state == DeliveryState::Sent {
+            return Ok(record.delivery());
+        }
         let platform = record.target.peer.platform;
         let Some(sender) = self.channels.get(platform) else {
             // 渠道此刻不在（没起来、或者被重载停掉了）：留在 pending，下一次冲刷再试。
@@ -148,7 +182,7 @@ impl DeliveryLog {
             .into_iter()
             .filter(|record| record.target.peer.platform == platform)
         {
-            match self.send_recorded(&record).await {
+            match self.send_recorded_locked(&record).await {
                 Ok(Delivery {
                     state: DeliveryState::Sent,
                     ..
@@ -177,7 +211,7 @@ impl DeliveryLog {
         };
         let mut sent = 0;
         for record in pending {
-            match self.send_recorded(&record).await {
+            match self.send_recorded_locked(&record).await {
                 Ok(Delivery {
                     state: DeliveryState::Sent,
                     ..
@@ -289,6 +323,124 @@ mod tests {
             log.pending(None).await.unwrap().len(),
             1,
             "行留着，等渠道回来"
+        );
+    }
+    #[tokio::test]
+    async fn recovery_completion_reuses_sent_delivery_after_recreating_log() {
+        use komo_kernel::types::ids::{RunId, SessionId};
+        let store = TempStore::open().await.unwrap();
+        let channel = MemChannel::new(ChannelPlatform::Telegram);
+        let first_log = log(&store, &channel).await;
+        let peer = target(ChannelPlatform::Telegram, "123");
+        let finished = |summary: &str| Outbound::RunFinished {
+            session: SessionId::from_raw("s"),
+            run: RunId::from_raw("r"),
+            summary: summary.into(),
+        };
+        let first = first_log
+            .deliver(&peer, finished("original result"))
+            .await
+            .unwrap();
+        drop(first_log);
+        let restored = log(&store, &channel).await;
+        let resent = restored
+            .deliver(
+                &DeliveryTarget::home(peer.peer.clone()),
+                finished("这个任务在上次停机前就完成了，结果补发一次。"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.id, resent.id);
+        assert_eq!(channel.sent().len(), 1);
+        assert_eq!(restored.flush(None).await, 0);
+    }
+
+    #[tokio::test]
+    async fn repeated_intervention_reuses_deferred_record_but_a_new_call_is_delivered() {
+        use komo_kernel::types::ids::{RunId, SessionId};
+        let store = TempStore::open().await.unwrap();
+        let channel = MemChannel::new(ChannelPlatform::Wechat);
+        let first_log = log(&store, &channel).await;
+        let peer = target(ChannelPlatform::Wechat, "wxid_x");
+        let question = |reason: &str| Outbound::NeedsAttention {
+            session: SessionId::from_raw("s"),
+            run: RunId::from_raw("r"),
+            reason: reason.into(),
+        };
+        channel.defer(true);
+        let first = first_log
+            .deliver_once(
+                &peer,
+                question("event question"),
+                "intervention:verify:r:call-1",
+            )
+            .await
+            .unwrap();
+        drop(first_log);
+        let restored = log(&store, &channel).await;
+        let repeated = restored
+            .deliver_once(
+                &peer,
+                question("sweep question"),
+                "intervention:verify:r:call-1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.id, repeated.id);
+        assert_eq!(restored.pending(None).await.unwrap().len(), 1);
+        channel.defer(false);
+        assert_eq!(restored.flush(None).await, 1);
+        restored
+            .deliver_once(
+                &peer,
+                question("same call after restart"),
+                "intervention:verify:r:call-1",
+            )
+            .await
+            .unwrap();
+        assert_eq!(channel.sent().len(), 1);
+        restored
+            .deliver_once(
+                &peer,
+                question("next uncertain call"),
+                "intervention:verify:r:call-2",
+            )
+            .await
+            .unwrap();
+        assert_eq!(channel.sent().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn first_send_and_concurrent_flush_and_stale_record_send_only_once() {
+        let store = TempStore::open().await.unwrap();
+        let channel = MemChannel::new(ChannelPlatform::Telegram);
+        let log = log(&store, &channel).await;
+        let peer = target(ChannelPlatform::Telegram, "123");
+        let msg = Outbound::Text {
+            text: "once".into(),
+        };
+        let stale = log
+            .repo()
+            .record_once(
+                &DeliveryId::from_raw("pending"),
+                &peer,
+                &msg,
+                Some("key"),
+                log.clock.now(),
+            )
+            .await
+            .unwrap();
+        let (delivered, _, sent) = tokio::join!(
+            log.deliver_once(&peer, msg, "key"),
+            log.flush(None),
+            log.send_recorded(&stale)
+        );
+        assert_eq!(delivered.unwrap().id, stale.id);
+        assert_eq!(sent.unwrap().state, DeliveryState::Sent);
+        assert_eq!(channel.sent().len(), 1);
+        assert_eq!(
+            log.repo().get(&stale.id).await.unwrap().unwrap().attempts,
+            1
         );
     }
 }

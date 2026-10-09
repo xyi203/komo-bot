@@ -1424,7 +1424,8 @@ impl GatewayState {
             if self.hub.viewers(&summary.session) > 0 {
                 continue;
             }
-            if !self.start_delivering_intervention(&summary.handle) {
+            let key = crate::notifier::intervention_key(&summary);
+            if !self.start_delivering_intervention(&key) {
                 continue;
             }
             tracing::info!(
@@ -1454,11 +1455,14 @@ impl GatewayState {
                         continue;
                     };
                     self.notifier
-                        .deliver_home(komo_kernel::types::chat::Outbound::NeedsAttention {
-                            session: summary.session.clone(),
-                            run,
-                            reason: summary.question.clone(),
-                        })
+                        .deliver_home_once(
+                            komo_kernel::types::chat::Outbound::NeedsAttention {
+                                session: summary.session.clone(),
+                                run,
+                                reason: summary.question.clone(),
+                            },
+                            &key,
+                        )
                         .await
                         .err()
                         .map(|error| error.to_string())

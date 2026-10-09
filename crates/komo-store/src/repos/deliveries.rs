@@ -57,12 +57,36 @@ impl TursoDeliveryRepo {
         outbound: &Outbound,
         now: OffsetDateTime,
     ) -> Result<DeliveryRecord, RepoError> {
+        let key = match outbound {
+            Outbound::RunFinished { session, run, .. } => Some(format!("finished:{session}:{run}")),
+            Outbound::ApprovalRequest(p) => Some(format!("approval:{}", p.approval)),
+            Outbound::NeedsAttention { session, run, .. } => {
+                Some(format!("attention:{session}:{run}"))
+            }
+            Outbound::ApprovalSettled { approval, .. } => Some(format!("settled:{approval}")),
+            _ => None,
+        };
+        self.record_once(id, target, outbound, key.as_deref(), now)
+            .await
+    }
+
+    /// 同一逻辑通知在同一目标只保留一行；pending/deferred 也复用。
+    pub async fn record_once(
+        &self,
+        id: &DeliveryId,
+        target: &DeliveryTarget,
+        outbound: &Outbound,
+        key: Option<&str>,
+        now: OffsetDateTime,
+    ) -> Result<DeliveryRecord, RepoError> {
+        let key = key.map(str::to_owned);
         let id = id.clone();
         let target = target.clone();
         let outbound = outbound.clone();
         self.db
             .with_write_retry(move |ex| {
                 let (id, target, outbound) = (id.clone(), target.clone(), outbound.clone());
+                let key = key.clone();
                 Box::pin(async move {
                     if let Some(row) = DeliveryRow::filter_by_id(id.as_str())
                         .first()
@@ -72,6 +96,57 @@ impl TursoDeliveryRepo {
                     {
                         return record_from_row(&row);
                     }
+                    if let Some(key) = &key {
+                        let rows = DeliveryRow::filter(
+                            DeliveryRow::fields()
+                                .platform()
+                                .eq(target.peer.platform.as_str())
+                                .and(
+                                    DeliveryRow::fields()
+                                        .chat_id()
+                                        .eq(target.peer.chat_id.as_str()),
+                                ),
+                        )
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?;
+                        for row in rows {
+                            // 旧版记录没有 key；完成/审批通知仍按原正文里的身份识别。
+                            let legacy_matches = if row.notification_key.is_none() {
+                                match (
+                                    serde_json::from_str::<Outbound>(&row.outbound).ok(),
+                                    &outbound,
+                                ) {
+                                    (
+                                        Some(Outbound::RunFinished {
+                                            session: a, run: b, ..
+                                        }),
+                                        Outbound::RunFinished { session, run, .. },
+                                    ) => &a == session && &b == run,
+                                    (
+                                        Some(Outbound::ApprovalRequest(a)),
+                                        Outbound::ApprovalRequest(b),
+                                    ) => a.approval == b.approval,
+                                    (
+                                        Some(Outbound::NeedsAttention {
+                                            session: a, run: b, ..
+                                        }),
+                                        Outbound::NeedsAttention { session, run, .. },
+                                    ) => &a == session && &b == run,
+                                    (
+                                        Some(Outbound::ApprovalSettled { approval: a, .. }),
+                                        Outbound::ApprovalSettled { approval, .. },
+                                    ) => &a == approval,
+                                    _ => false,
+                                }
+                            } else {
+                                false
+                            };
+                            if row.notification_key.as_ref() == Some(key) || legacy_matches {
+                                return record_from_row(&row);
+                            }
+                        }
+                    }
                     toasty::create!(DeliveryRow {
                         id: id.as_str(),
                         platform: target.peer.platform.as_str(),
@@ -79,6 +154,7 @@ impl TursoDeliveryRepo {
                         is_home: target.is_home,
                         outbound: encode(&outbound)?,
                         approval_id: approval_of(&outbound).map(|a| a.to_string()),
+                        notification_key: key,
                         state: enum_str(&DeliveryState::Pending),
                         attempts: 0_i64,
                         last_error: None as Option<String>,
@@ -330,6 +406,91 @@ mod tests {
         Outbound::Text {
             text: "跑完了".into(),
         }
+    }
+
+    #[tokio::test]
+    async fn logical_notifications_survive_reopen_and_ignore_home_role_and_new_body() {
+        use komo_kernel::types::ids::{RunId, SessionId};
+        let (db, dir) = temp().await;
+        let repo = TursoDeliveryRepo::new(db);
+        let source = target(ChannelPlatform::Telegram, "42", false);
+        let messages = [
+            Outbound::RunFinished {
+                session: SessionId::from_raw("s"),
+                run: RunId::from_raw("r"),
+                summary: "done".into(),
+            },
+            approval_request(&ApprovalId::from_raw("a"), 1),
+        ];
+        // 模拟升级前没有 notification_key 的已送达记录。
+        for (index, message) in messages.iter().enumerate() {
+            let id = DeliveryId::from_raw(format!("legacy-{index}"));
+            repo.record_once(&id, &source, message, None, NOW)
+                .await
+                .unwrap();
+            repo.settle(&id, DeliveryState::Sent, None, NOW)
+                .await
+                .unwrap();
+        }
+        drop(repo);
+        let repo = TursoDeliveryRepo::new(Db::connect(dir.path().join("state.db")).await.unwrap());
+        for (index, message) in messages.iter().enumerate() {
+            let record = repo
+                .record(
+                    &DeliveryId::from_raw(format!("new-{index}")),
+                    &target(ChannelPlatform::Telegram, "42", true),
+                    message,
+                    NOW,
+                )
+                .await
+                .unwrap();
+            assert_eq!(record.id, DeliveryId::from_raw(format!("legacy-{index}")));
+            assert_eq!(record.state, DeliveryState::Sent);
+            // 另一目标仍需投递。
+            let other = repo
+                .record(
+                    &DeliveryId::from_raw(format!("other-{index}")),
+                    &target(ChannelPlatform::Telegram, "43", true),
+                    message,
+                    NOW,
+                )
+                .await
+                .unwrap();
+            assert_eq!(other.state, DeliveryState::Pending);
+        }
+        let changed = Outbound::RunFinished {
+            session: SessionId::from_raw("s"),
+            run: RunId::from_raw("r"),
+            summary: "different wording".into(),
+        };
+        assert_eq!(
+            repo.record(&DeliveryId::from_raw("changed"), &source, &changed, NOW)
+                .await
+                .unwrap()
+                .id,
+            DeliveryId::from_raw("legacy-0")
+        );
+        assert_eq!(repo.pending(None).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_logical_notification_reuses_its_record() {
+        let (db, _dir) = temp().await;
+        let repo = TursoDeliveryRepo::new(db);
+        let target = target(ChannelPlatform::Wechat, "42", false);
+        let message = approval_request(&ApprovalId::from_raw("a"), 1);
+        let id = DeliveryId::from_raw("original");
+        repo.record(&id, &target, &message, NOW).await.unwrap();
+        repo.settle(&id, DeliveryState::Deferred, Some("no token".into()), NOW)
+            .await
+            .unwrap();
+        let retry = repo
+            .record(&DeliveryId::from_raw("retry"), &target, &message, NOW)
+            .await
+            .unwrap();
+        assert_eq!(retry.id, id);
+        assert_eq!(retry.state, DeliveryState::Deferred);
+        assert_eq!(repo.pending(None).await.unwrap().len(), 1);
     }
 
     /// **先持久化投递记录再发送**（§11.4）：行先写，状态 `pending`。

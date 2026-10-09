@@ -23,6 +23,8 @@ pub struct DeliveryRow {
     /// 要把 `ApprovalSettled` 投到当初 `ApprovalRequest` 投过的**每一个**目标，那是一次
     /// 按审批 ID 的查询（§11.4）。
     pub approval_id: Option<String>,
+    /// 逻辑通知身份；与目标会话一起去重，重启后仍有效。
+    pub notification_key: Option<String>,
     /// `DeliveryState`：pending / sent / deferred。
     pub state: String,
     pub attempts: i64,
@@ -37,7 +39,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "deliveries" ("id" TEXT NOT NULL, "platform" TEXT NOT NULL, "chat_id" TEXT NOT NULL, "is_home" BOOLEAN NOT NULL, "outbound" TEXT NOT NULL, "approval_id" TEXT, "state" TEXT NOT NULL, "attempts" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "deliveries" ("id" TEXT NOT NULL, "platform" TEXT NOT NULL, "chat_id" TEXT NOT NULL, "is_home" BOOLEAN NOT NULL, "outbound" TEXT NOT NULL, "approval_id" TEXT, "notification_key" TEXT, "state" TEXT NOT NULL, "attempts" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -46,6 +48,7 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("is_home", "BOOLEAN NOT NULL DEFAULT 0"),
     ColumnSpec::new("outbound", "TEXT NOT NULL DEFAULT '{}'"),
     ColumnSpec::new("approval_id", "TEXT"),
+    ColumnSpec::new("notification_key", "TEXT"),
     ColumnSpec::new("state", "TEXT NOT NULL DEFAULT 'pending'"),
     ColumnSpec::new("attempts", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("last_error", "TEXT"),

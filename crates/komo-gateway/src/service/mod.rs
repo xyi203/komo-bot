@@ -283,15 +283,21 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
                             .join("\n")
                     )
                 };
-                let _ = state
-                    .notifier
-                    .deliver_home(Outbound::NeedsAttention {
-                        session: group.session,
-                        // Outbound 里保留一个代表 Run；正文列出这一组的全部 Run。
-                        run: group.runs[0].clone(),
-                        reason: format!("恢复时停下了：{}{affected}", group.reason),
-                    })
-                    .await;
+                // 与周期兜底共用权威 Intervention 的身份，重启不再生成另一行。
+                let key = match state.intervention(group.runs[0].as_str()).await {
+                    Ok(Some(detail)) => crate::notifier::detail_key(&detail),
+                    _ => None,
+                };
+                let message = Outbound::NeedsAttention {
+                    session: group.session,
+                    run: group.runs[0].clone(),
+                    reason: format!("恢复时停下了：{}{affected}", group.reason),
+                };
+                if let Some(key) = key {
+                    let _ = state.notifier.deliver_home_once(message, &key).await;
+                } else {
+                    let _ = state.notifier.deliver_home(message).await;
+                }
             }
             if scan.requeued() > 0 {
                 state.waker().wake();

@@ -229,12 +229,13 @@ async fn step(
                 // 结果不明 / 前提没了（§7.5 的另外两类）：同一句话问人，投**来源会话 +
                 // home chat**。"需要人判断"不该因为种类不同而有不同的到达率（§11.4）。
                 komo_kernel::types::status::WaitReason::Intervention { .. } => {
-                    // 占掉这一条"投过一次"的名额：不占的话，周期兜底
-                    // （`sweep_unseen_interventions`）会把同一条换个措辞再投一遍。
-                    if !state.start_delivering_intervention(run.as_str()) {
+                    let (question, key) = question_for(state, session, run, watcher).await;
+                    let Some(key) = key else {
+                        return Step::Keep;
+                    };
+                    if !state.start_delivering_intervention(&key) {
                         return Step::Keep;
                     }
-                    let question = question_for(state, session, run, watcher).await;
                     deliver_to_source_and_home(
                         state,
                         watcher,
@@ -243,6 +244,7 @@ async fn step(
                             run: run.clone(),
                             reason: question,
                         },
+                        &key,
                     )
                     .await;
                 }
@@ -441,9 +443,13 @@ async fn question_for(
     session: &SessionId,
     run: &RunId,
     watcher: &Watcher,
-) -> String {
+) -> (String, Option<String>) {
+    let mut key = None;
     let question = match state.intervention(run.as_str()).await {
-        Ok(Some(detail)) => super::interventions::question_of(&detail),
+        Ok(Some(detail)) => {
+            key = crate::notifier::detail_key(&detail);
+            super::interventions::question_of(&detail)
+        }
         Ok(None) => {
             "这条 Run 停在一次需要你判断的答复上（去 `GET /v1/interventions` 看这一条）".to_string()
         }
@@ -452,13 +458,14 @@ async fn question_for(
             "这条 Run 停在一次需要你判断的答复上（清单这一次没读出来）".to_string()
         }
     };
-    match watcher.label() {
+    let question = match watcher.label() {
         Some(name) => format!("定时任务「{name}」：{question}"),
         None => match super::tasks::label_of(state, session).await {
             Some(label) => format!("{label}：{question}"),
             None => question,
         },
-    }
+    };
+    (question, key)
 }
 
 /// 收场：回写触发状态（Cron），把结果发回去。
@@ -582,6 +589,7 @@ async fn deliver_to_source_and_home(
     state: &Arc<GatewayState>,
     watcher: &Watcher,
     message: Outbound,
+    key: &str,
 ) {
     let mut delivered_to_source = false;
     if let Some(peer) = watcher.peer() {
@@ -594,14 +602,14 @@ async fn deliver_to_source_and_home(
             && let Err(error) = state
                 .notifier
                 .log()
-                .deliver(&DeliveryTarget::to_peer(peer.clone()), message.clone())
+                .deliver_once(&DeliveryTarget::to_peer(peer.clone()), message.clone(), key)
                 .await
         {
             tracing::warn!(%error, "投不到来源会话");
         }
         delivered_to_source = !is_home;
     }
-    if let Err(error) = state.notifier.deliver_home(message).await {
+    if let Err(error) = state.notifier.deliver_home_once(message, key).await {
         if !delivered_to_source {
             tracing::warn!(%error, "没有 home chat 也没有来源会话，这条没人看得见");
         } else {

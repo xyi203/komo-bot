@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
+use komo_kernel::protocol::http::{InterventionDetail, InterventionSummary};
 use komo_kernel::traits::{DeliverError, Notifier};
 use komo_kernel::types::chat::{
     ApprovalPresentation, ChannelPeer, ChannelPlatform, Delivery, DeliveryTarget, Outbound,
@@ -60,6 +61,23 @@ impl HomeNotifier {
         let mut out = Vec::with_capacity(targets.len());
         for target in &targets {
             out.push(self.log.deliver(target, msg.clone()).await?);
+        }
+        Ok(out)
+    }
+
+    /// 事件看客、恢复扫描与周期兜底共用同一逻辑通知身份。
+    pub async fn deliver_home_once(
+        &self,
+        msg: Outbound,
+        key: &str,
+    ) -> Result<Vec<Delivery>, DeliverError> {
+        let targets = self.home_targets();
+        if targets.is_empty() {
+            return Err(DeliverError::NoTarget("没有配置任何 home_chat".into()));
+        }
+        let mut out = Vec::with_capacity(targets.len());
+        for target in targets {
+            out.push(self.log.deliver_once(&target, msg.clone(), key).await?);
         }
         Ok(out)
     }
@@ -115,6 +133,31 @@ impl Notifier for HomeNotifier {
         msg: Outbound,
     ) -> Result<Delivery, DeliverError> {
         self.log.deliver(target, msg).await
+    }
+}
+
+/// Verify 绑定具体调用，Blocked 绑定这一次停等；不要按 Run 永久占掉名额。
+pub(crate) fn intervention_key(summary: &InterventionSummary) -> String {
+    match &summary.call {
+        Some(call) => format!(
+            "intervention:{}:{}:{call}",
+            summary.kind.as_str(),
+            summary.handle
+        ),
+        None => format!(
+            "intervention:{}:{}:{}",
+            summary.kind.as_str(),
+            summary.handle,
+            summary.created_at.unix_timestamp_nanos()
+        ),
+    }
+}
+
+pub(crate) fn detail_key(detail: &InterventionDetail) -> Option<String> {
+    match detail {
+        InterventionDetail::Verify { summary, .. }
+        | InterventionDetail::Blocked { summary, .. } => Some(intervention_key(summary)),
+        InterventionDetail::Approval(_) => None,
     }
 }
 

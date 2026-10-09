@@ -12,6 +12,7 @@ use super::{
     resume_summary, status_summary, verdicts_text, wait_text,
 };
 use crate::tui::approval::ApprovalModal;
+use crate::tui::model_picker::ModelPicker;
 
 impl App {
     // ---- 服务端事件 ----
@@ -171,8 +172,16 @@ impl App {
             ServerEvent::ModelMenu(models) => {
                 self.model_menu = models;
                 if std::mem::take(&mut self.listing_models) {
-                    self.note(self.model_blurb());
-                    self.note(self.effort_blurb());
+                    if self.model_menu.is_empty() {
+                        // 没有清单就没有可挑的：说清楚，留 `/model <id>` 这条路。
+                        self.note(self.model_blurb());
+                        self.note(self.effort_blurb());
+                    } else {
+                        self.model_picker = Some(ModelPicker::new(
+                            self.model_menu.clone(),
+                            self.model.as_deref(),
+                        ));
+                    }
                 }
                 Vec::new()
             }

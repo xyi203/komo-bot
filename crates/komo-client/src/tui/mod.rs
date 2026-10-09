@@ -8,6 +8,7 @@ pub mod app;
 pub mod approval;
 pub mod command;
 pub mod markdown;
+pub mod model_picker;
 pub mod paste;
 pub mod render;
 pub mod spinner;

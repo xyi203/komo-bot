@@ -9,7 +9,7 @@
 //! ```text
 //! │ 还在动的那一小段（草稿 / 在跑的工具 / 刚按下 Enter 的那条）  ← 高度有上限，只画尾巴
 //! ├ 状态行（Run 状态 · 本轮耗时 · 模型 · effort · 连接 · 待处理 · 模式）
-//! │ 命令面板（只在输入以 `/` 开头时出现）
+//! │ 命令面板（只在输入以 `/` 开头时出现）/ `/model` 的选择菜单
 //! ╰ 输入框（会折行，光标摆在它真正在的那一格上）
 //! ```
 //!
@@ -29,6 +29,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 use crate::tui::app::{App, status_text};
 use crate::tui::approval::{ApprovalRow, approval_lines};
 pub(crate) use crate::tui::markdown;
+use crate::tui::model_picker::{ModelPicker, entry_detail};
 
 /// 还在动的那一段最多占几行。
 ///
@@ -39,6 +40,8 @@ pub const LIVE_MAX: u16 = 8;
 pub const INPUT_MAX_ROWS: u16 = 8;
 /// 命令面板最多列几条。
 const PALETTE_MAX: u16 = 6;
+/// 模型选择菜单最多列几行（再多就跟着高亮滚）。
+const PICKER_MAX: u16 = 8;
 
 /// 视口要多高。`max` 是终端高度减去留给上文的那一行。
 pub fn viewport_height(app: &App, width: u16, max: u16, live_lines: usize) -> u16 {
@@ -77,7 +80,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, live: &[Line<'static>]) {
         frame.render_widget(live_block(live, live_height), chunks[0]);
     }
     frame.render_widget(status_line(app, area.width), chunks[1]);
-    if palette_height > 0 {
+    if let Some(picker) = app.model_picker.as_ref() {
+        let current = app.model.as_deref();
+        frame.render_widget(picker_block(picker, current, chunks[2]), chunks[2]);
+    } else if palette_height > 0 {
         frame.render_widget(palette_block(&palette), chunks[2]);
     }
     draw_input(frame, app, chunks[3]);
@@ -90,6 +96,9 @@ fn live_block(lines: &[Line<'static>], height: u16) -> Paragraph<'static> {
 }
 
 fn palette_height(app: &App) -> u16 {
+    if let Some(picker) = app.model_picker.as_ref() {
+        return (picker.entries.len() as u16).min(PICKER_MAX);
+    }
     (app.palette().len() as u16).min(PALETTE_MAX)
 }
 
@@ -362,6 +371,88 @@ fn palette_block(matches: &[(&'static str, &'static str)]) -> Paragraph<'static>
         })
         .collect();
     Paragraph::new(lines).block(Block::default().padding(Padding::horizontal(1)))
+}
+
+/// `/model` 的选择菜单：一行一个模型，高亮那一行是实心色块。
+///
+/// ```text
+///  ▸ 1 deepseek   deepseek-flash · deepseek · effort low/high   当前
+///    2 main       stealth/union-alpha · openrouter · 无 effort   默认
+/// ```
+///
+/// 行数超过 `area` 时只画高亮附近那一段——高亮永远看得见。
+fn picker_block(picker: &ModelPicker, current: Option<&str>, area: Rect) -> Paragraph<'static> {
+    let height = area.height as usize;
+    let width = area.width as usize;
+    let start = (picker.selected + 1).saturating_sub(height.max(1));
+    let id_width = picker
+        .entries
+        .iter()
+        .map(|entry| markdown::display_width(&entry.id))
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line<'static>> = picker
+        .entries
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(height)
+        .map(|(index, entry)| {
+            let chosen = index == picker.selected;
+            let style = if chosen {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let dim = if chosen {
+                style
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            // 当前 = `/model` 设过的那个；没设过，网关的 default 就是当前。
+            let is_current = match current {
+                Some(id) => entry.id == id,
+                None => entry.default,
+            };
+            let mark = if is_current {
+                "当前"
+            } else if entry.default {
+                "默认"
+            } else {
+                ""
+            };
+            let head = format!(
+                "{}{} {}",
+                if chosen { "▸ " } else { "  " },
+                ModelPicker::shortcut(index).unwrap_or(' '),
+                entry.id
+            );
+            let pad = id_width.saturating_sub(markdown::display_width(&entry.id)) + 2;
+            // 行首 + 对齐空格 + 说明 + 标记；说明放不下就截它，id 和标记不让。
+            let used = markdown::display_width(&head) + pad + markdown::display_width(mark) + 3;
+            let detail =
+                markdown::truncate_to_width(&entry_detail(entry), width.saturating_sub(used));
+            let fill = width
+                .saturating_sub(used)
+                .saturating_sub(markdown::display_width(&detail))
+                + 1;
+            Line::from(vec![
+                Span::styled(head, style),
+                Span::styled(" ".repeat(pad), style),
+                Span::styled(detail, dim),
+                Span::styled(" ".repeat(fill), style),
+                Span::styled(
+                    mark.to_string(),
+                    style.fg(if chosen { Color::Black } else { Color::Yellow }),
+                ),
+                Span::styled("  ", style),
+            ])
+        })
+        .collect();
+    Paragraph::new(lines)
 }
 
 /// 审批弹窗要多高：正文 + 菜单 + 边框 + 状态行，放不下就按 `max` 截。
@@ -693,6 +784,42 @@ fn main() {
     }
 
     /// 弹窗开着时输入框禁用，光标就不该还留在屏幕上晃。
+    #[test]
+    fn the_model_picker_lists_every_model_and_marks_the_current_one() {
+        use komo_kernel::protocol::http::ModelMenuEntry;
+        use komo_kernel::types::model::Effort;
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        for ch in "model".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        app.apply(ServerEvent::ModelMenu(vec![
+            ModelMenuEntry {
+                id: "main".into(),
+                model: "stealth/union-alpha".into(),
+                provider: "openrouter".into(),
+                efforts: vec![Effort::new("low"), Effort::new("medium")],
+                default: true,
+                ..ModelMenuEntry::default()
+            },
+            ModelMenuEntry {
+                id: "deepseek".into(),
+                model: "deepseek-flash".into(),
+                provider: "deepseek".into(),
+                ..ModelMenuEntry::default()
+            },
+        ]));
+        let rows = screen_rows(&app, 80, 24);
+        assert_within(&rows, 80);
+        let screen = rows.join("\n");
+        assert!(screen.contains("▸ 1 main"), "{screen}");
+        assert!(screen.contains("2 deepseek"), "{screen}");
+        assert!(screen.contains("stealth/union-alpha"), "{screen}");
+        assert!(screen.contains("当前"), "{screen}");
+        assert!(screen.contains("Enter 确认"), "{screen}");
+    }
+
     #[test]
     fn the_caret_goes_away_while_the_approval_popup_is_open() {
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");

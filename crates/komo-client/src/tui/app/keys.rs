@@ -43,6 +43,9 @@ impl App {
         if self.approval.is_some() {
             return self.approval_key(key);
         }
+        if self.model_picker.is_some() {
+            return self.model_picker_key(key);
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         // 按词走：Alt-← / Alt-→ 是 macOS 与 emacs 的习惯，Ctrl-← / Ctrl-→ 是别处的。
@@ -234,10 +237,7 @@ impl App {
             Command::Answer { handle, verdict } => self.answer(handle, verdict, None),
             Command::Model { id } => match id {
                 Some(id) => {
-                    self.note(format!("下一个 Run 用模型 {id}"));
-                    self.model = Some(id);
-                    // 换了模型，可选的 effort 档位也就换了。
-                    self.note(self.effort_blurb());
+                    self.choose_model(id);
                     Vec::new()
                 }
                 // 清单是**去问来的**，不是启动时抄下来就再不更新的一份（§3：模型改完，
@@ -273,6 +273,68 @@ impl App {
                 vec![Effect::Quit]
             }
         }
+    }
+
+    /// 设定下一个 Run 的模型（`/model <id>` 与选择菜单共用）。
+    fn choose_model(&mut self, id: String) {
+        self.note(format!("下一个 Run 用模型 {id}"));
+        self.model = Some(id.clone());
+        // 换了模型，可选的 effort 档位也就换了：手上那一档新模型不收，就别留着让下一次
+        // 提交被网关拒掉——清掉，跟随 Gateway，并且说出来。
+        if let Some(effort) = self.effort.take() {
+            if self
+                .effort_options()
+                .iter()
+                .any(|option| option == effort.as_str())
+            {
+                self.effort = Some(effort);
+            } else {
+                self.note(format!("{id} 不收 effort {effort}，已改回跟随 Gateway"));
+            }
+        }
+        self.note(self.effort_blurb());
+    }
+
+    /// 选择菜单开着时的按键。
+    fn model_picker_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let Some(picker) = self.model_picker.as_mut() else {
+            return Vec::new();
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let chosen = match key.code {
+            KeyCode::Up => {
+                picker.move_selection(-1);
+                return Vec::new();
+            }
+            KeyCode::Down => {
+                picker.move_selection(1);
+                return Vec::new();
+            }
+            KeyCode::Char('p') if ctrl => {
+                picker.move_selection(-1);
+                return Vec::new();
+            }
+            KeyCode::Char('n') if ctrl => {
+                picker.move_selection(1);
+                return Vec::new();
+            }
+            KeyCode::Esc => {
+                self.model_picker = None;
+                return Vec::new();
+            }
+            KeyCode::Enter => picker.selected,
+            KeyCode::Char(ch) => match picker.index_of_shortcut(ch) {
+                Some(index) => index,
+                None => return Vec::new(),
+            },
+            _ => return Vec::new(),
+        };
+        let id = picker.entries.get(chosen).map(|entry| entry.id.clone());
+        self.model_picker = None;
+        if let Some(id) = id {
+            self.choose_model(id);
+        }
+        Vec::new()
     }
 
     /// 解析命令时用的菜单：模型 id 表 + **当前模型**支持的 effort 档位。

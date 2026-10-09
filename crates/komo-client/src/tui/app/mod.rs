@@ -32,6 +32,7 @@ use time::OffsetDateTime;
 use crate::sse::ConnectionState;
 use crate::tui::approval::ApprovalModal;
 use crate::tui::command::{self};
+use crate::tui::model_picker::ModelPicker;
 use crate::tui::paste::Input;
 
 /// TUI 打开的方式（§3 命令表）。
@@ -320,8 +321,10 @@ pub struct App {
     pub model: Option<String>,
     pub effort: Option<Effort>,
     pub model_menu: Vec<ModelMenuEntry>,
-    /// `/model` 无参时先去取一次清单；回来了才印。
+    /// `/model` 无参时先去取一次清单；回来了才打开选择菜单。
     listing_models: bool,
+    /// `/model` 的选择菜单（[`ModelPicker`]）。开着的时候按键归它，输入框禁用。
+    pub model_picker: Option<ModelPicker>,
     /// 已经提示过"有一帧读不懂"——只说一次，之后只进日志（见
     /// [`ServerEvent::FrameSkipped`]）。
     skipped_noticed: bool,
@@ -375,6 +378,7 @@ impl App {
             effort: None,
             model_menu: Vec::new(),
             listing_models: false,
+            model_picker: None,
             skipped_noticed: false,
             tokens_in: 0,
             tokens_out: 0,
@@ -512,7 +516,7 @@ impl App {
 
     /// 有弹窗时输入框禁用（§11.3：先把眼前这件事答了）。
     pub fn input_enabled(&self) -> bool {
-        self.approval.is_none() && !self.phase.is_backfilling()
+        self.approval.is_none() && self.model_picker.is_none() && !self.phase.is_backfilling()
     }
 
     pub fn input_hint(&self) -> String {
@@ -540,6 +544,9 @@ impl App {
             }
             hint.push_str(&format!(" · {}", modal.keys_hint()));
             return hint;
+        }
+        if let Some(picker) = &self.model_picker {
+            return format!("选择下一个 Run 的模型 · {}", picker.keys_hint());
         }
         if self.pending_count() > 0 {
             // 没弹窗却还有待处理：请求还没投到（断线、投递失败），或者那一条根本没有弹窗

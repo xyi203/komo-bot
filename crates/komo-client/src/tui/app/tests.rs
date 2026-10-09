@@ -634,18 +634,86 @@ fn menu() -> Vec<ModelMenuEntry> {
 }
 
 #[test]
-fn model_with_no_argument_goes_and_asks_then_lists_what_came_back() {
+fn model_with_no_argument_goes_and_asks_then_opens_a_picker() {
     let mut app = app();
     // 清单是去问来的，不是启动时抄下来就不再更新的一份。
     assert_eq!(command(&mut app, "/model"), vec![Effect::FetchModels]);
+    assert!(app.model_picker.is_none());
     app.apply(ServerEvent::ModelMenu(menu()));
-    let printed = notices(&app);
+    let picker = app.model_picker.as_ref().expect("清单回来了就该打开菜单");
+    assert_eq!(picker.entries.len(), 2);
+    // 没设过模型 ⇒ 高亮落在网关的 default 上。
+    assert_eq!(picker.selected, 0);
+    // 菜单开着，输入框让位。
+    assert!(!app.input_enabled());
+}
+
+#[test]
+fn the_picker_moves_and_enter_sets_the_model() {
+    let mut app = app();
+    command(&mut app, "/model");
+    app.apply(ServerEvent::ModelMenu(menu()));
+    assert!(app.handle_key(key(KeyCode::Down)).is_empty());
+    assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+    assert!(app.model_picker.is_none());
+    assert_eq!(app.model.as_deref(), Some("claude-y"));
+    assert!(notices(&app).contains("claude-y"), "{}", notices(&app));
+    assert!(app.input_enabled());
+}
+
+#[test]
+fn a_digit_in_the_picker_picks_that_row_directly() {
+    let mut app = app();
+    command(&mut app, "/model");
+    app.apply(ServerEvent::ModelMenu(menu()));
+    app.handle_key(key(KeyCode::Char('2')));
+    assert_eq!(app.model.as_deref(), Some("claude-y"));
+    assert!(app.model_picker.is_none());
+}
+
+#[test]
+fn escape_closes_the_picker_without_changing_anything() {
+    let mut app = app();
+    command(&mut app, "/model");
+    app.apply(ServerEvent::ModelMenu(menu()));
+    app.handle_key(key(KeyCode::Down));
+    // 菜单开着时 Esc 只关菜单，不是取消 Run。
+    assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
+    assert!(app.model_picker.is_none());
+    assert!(app.model.is_none());
+}
+
+#[test]
+fn the_picker_reopens_on_the_model_already_chosen() {
+    let mut app = app();
+    app.apply(ServerEvent::ModelMenu(menu()));
+    command(&mut app, "/model claude-y");
+    command(&mut app, "/model");
+    app.apply(ServerEvent::ModelMenu(menu()));
+    assert_eq!(app.model_picker.as_ref().map(|p| p.selected), Some(1));
+}
+
+#[test]
+fn switching_to_a_model_that_refuses_the_chosen_effort_drops_it() {
+    let mut app = app();
+    app.apply(ServerEvent::ModelMenu(menu()));
+    command(&mut app, "/effort high");
+    command(&mut app, "/model claude-y");
+    // 留着它，下一次提交就会被网关拒掉。
+    assert!(app.effort.is_none());
     assert!(
-        printed.contains("gpt-x") && printed.contains("claude-y"),
-        "{printed}"
+        notices(&app).contains("不收 effort high"),
+        "{}",
+        notices(&app)
     );
-    // 顺带把当前模型能选的 effort 也印出来。
-    assert!(printed.contains("low · high"), "{printed}");
+    // 换回一个收这一档的模型，再设的时候照常。
+    command(&mut app, "/model gpt-x");
+    command(&mut app, "/effort high");
+    command(&mut app, "/model gpt-x");
+    assert_eq!(
+        app.effort.as_ref().map(|e| e.to_string()).as_deref(),
+        Some("high")
+    );
 }
 
 #[test]

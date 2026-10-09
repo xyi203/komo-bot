@@ -8,6 +8,7 @@
 //!   ——跑过的调用如此，没跑起来的（工具名不认识）也如此。
 //! - **计划**：`update_plan` 的计划只在日志里，重启之后折出同一份在线状态，回放的结果
 //!   与刚跑完那次逐字节相同。
+//! - **组合调用**：`edit` 带 `then_run` 只问一次、两步各跑一次，结果是一条，回放逐字节相同。
 //! - **压缩**：账本里一条 `context.compacted` 之后，回放是任务 → 摘要 → 切点起的原样轮次，
 //!   外置的摘要按引用读回来，两次重启之间那一段逐字节不变。
 //!
@@ -222,6 +223,91 @@ async fn the_replayed_window_renders_the_same_bytes_as_the_live_round() {
         live,
         "同一份事实在回放时渲染出的字节必须与刚跑完那次一样"
     );
+}
+
+/// `edit` 带 `then_run`（Action Fusion）：两步只问一次，批准一次之后改动与命令各跑一次，
+/// 结果是**一条**；同一个 Run 的下一段回放时，那条结果的字节与刚交回模型的一样。
+#[tokio::test]
+async fn a_fused_edit_asks_once_runs_once_and_replays_the_same_bytes() {
+    let home = Home::with_config(&config_toml(""));
+    std::fs::create_dir_all(home.workspace()).expect("工作目录");
+    let file = home.workspace().join("app.txt");
+    std::fs::write(&file, "version = 1\n").expect("写文件");
+    // 每个执行段一段脚本：停审批 → 批准后跑组合调用、再停一次审批 → 回放、收尾。
+    let llm = FakeLlm::new(vec![
+        vec![call_round(
+            1,
+            "pc-edit",
+            "edit",
+            serde_json::json!({
+                "path": "app.txt",
+                "match_text": "version = 1",
+                "replace_text": "version = 2",
+                "then_run": { "command": "echo ran >> ran.txt; cat app.txt" },
+            }),
+        )],
+        // 第二个调用再停一次审批：批准之后同一个 Run 起下一段，回放上一条结果。
+        vec![call_round(
+            2,
+            "pc-shell",
+            "shell",
+            serde_json::json!({ "command": "echo 收尾" }),
+        )],
+        vec![text_round(3, "改完也跑过了。")],
+    ]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(&session, "obs-fused", "改版本号然后跑一下")
+        .await
+        .run;
+
+    // 改动在根里本可直接放行，命令要问：组合计划只问这一次，而且批之前一步都不做。
+    let pending = gateway.wait_approval().await;
+    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
+    assert!(pending.plan.then_run.is_some(), "审批绑的是整份组合计划");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "version = 1\n");
+    assert!(!home.workspace().join("ran.txt").exists());
+
+    gateway.decide(&pending.approval, true).await;
+    let second = gateway.wait_approval().await;
+    assert_ne!(
+        second.approval, pending.approval,
+        "第二次停在收尾那条命令上"
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "version = 2\n");
+    let ran = std::fs::read_to_string(home.workspace().join("ran.txt")).expect("命令跑过");
+    assert_eq!(ran.lines().count(), 1, "命令只跑了一次：{ran:?}");
+
+    let live = fed_back(&llm, "edit");
+    assert!(live.starts_with("[edit · 完成 · "), "{live}");
+    assert!(live.contains("[then_run:succeeded]"), "{live}");
+    assert!(
+        live.contains("version = 2"),
+        "命令的输出在同一条结果里：{live}"
+    );
+    let events = home.events(&session);
+    let fused = tool_results(&events)
+        .into_iter()
+        .find(|result| {
+            result
+                .preview
+                .as_deref()
+                .is_some_and(|p| p.contains("then_run"))
+        })
+        .expect("组合调用那条结果");
+    assert!(fused.stdout.is_some(), "命令输出落在这次尝试的 stdout 里");
+
+    gateway.decide(&second.approval, true).await;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert_eq!(
+        replayed(&llm, "edit"),
+        live,
+        "组合调用的结果回放时渲染出的字节必须与刚交回模型的那次一样"
+    );
+    let ran = std::fs::read_to_string(home.workspace().join("ran.txt")).expect("命令跑过");
+    assert_eq!(ran.lines().count(), 1, "下一段不会再跑一次：{ran:?}");
 }
 
 /// 没跑起来的调用（工具名不认识）同样只有一份投影：它的结论落了盘，同一个 Run 的下一段

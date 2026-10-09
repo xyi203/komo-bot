@@ -12,11 +12,13 @@ use komo_kernel::events::{
     ToolPlanned, ToolResult, ToolStarted,
 };
 use komo_kernel::traits::{Ledger, LedgerError, StoreError};
-use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::types::ids::{
+    AttemptId, EventId, ExecutorId, GrantId, RunId, Seq, SessionId, ToolCallId,
+};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::refs::{INLINE_ARGUMENT_LIMIT_BYTES, PublishedOutput, ToolResultStatus};
 use komo_kernel::types::status::{AttemptState, RunEnd, RunState, WaitReason};
-use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse};
+use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUses};
 use time::OffsetDateTime;
 
 use crate::db::{BoxFuture, Db, store_to_ledger};
@@ -405,7 +407,7 @@ impl Ledger for Coordinator {
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grant: Option<GrantUse>,
+        grants: GrantUses,
     ) -> Result<AttemptId, LedgerError> {
         let row = self.run_of_call(call).await?;
         let run = RunId::from_raw(row.run_id.clone());
@@ -426,7 +428,8 @@ impl Ledger for Coordinator {
                     attempt_id: attempt.clone(),
                     plan_ref: plan_event,
                     plan_hash: plan.plan_hash(),
-                    grant: grant.as_ref().and_then(|g| g.grant.clone()),
+                    grant: grants.plan.as_ref().and_then(|g| g.grant.clone()),
+                    then_run_grant: grants.then_run.as_ref().and_then(|g| g.grant.clone()),
                 }),
             )
             .await?;
@@ -437,14 +440,14 @@ impl Ledger for Coordinator {
         let attempt_id = attempt.clone();
         let plan_hash = plan.plan_hash();
         let executor = self.executor.clone();
-        let grant = grant.clone();
+        let used: Vec<GrantId> = grants.iter().filter_map(|g| g.grant.clone()).collect();
         self.commit(&appended, move |ex, appended, now| {
-            let (call_id, attempt_id, plan_hash, executor, grant) = (
+            let (call_id, attempt_id, plan_hash, executor, used) = (
                 call_id.clone(),
                 attempt_id.clone(),
                 plan_hash.clone(),
                 executor.clone(),
-                grant.clone(),
+                used.clone(),
             );
             Box::pin(async move {
                 calls::record_started_in(
@@ -459,21 +462,22 @@ impl Ledger for Coordinator {
                 )
                 .await?;
                 // 「首次授权消费」：一次性授权在这里被用掉。范围授权不因一次使用而消耗
-                // （§7.2），所以只动 `once`。
-                if let Some(grant) = grant.as_ref().and_then(|g| g.grant.clone())
-                    && let Some(mut row) = PolicyGrantRow::filter_by_id(grant.as_str())
+                // （§7.2），所以只动 `once`。组合计划按步放行时每一步的都看一遍。
+                for grant in &used {
+                    if let Some(mut row) = PolicyGrantRow::filter_by_id(grant.as_str())
                         .first()
                         .exec(ex)
                         .await
                         .map_err(crate::db::map_toasty)?
-                    && row.scope_kind == "once"
-                    && !row.consumed
-                {
-                    row.update()
-                        .consumed(true)
-                        .exec(ex)
-                        .await
-                        .map_err(crate::db::map_toasty)?;
+                        && row.scope_kind == "once"
+                        && !row.consumed
+                    {
+                        row.update()
+                            .consumed(true)
+                            .exec(ex)
+                            .await
+                            .map_err(crate::db::map_toasty)?;
+                    }
                 }
                 Ok(())
             }) as BoxFuture<'_, Result<(), StoreError>>
@@ -1209,7 +1213,7 @@ mod tests {
 
         let attempt = f
             .coordinator
-            .start_call(&ids[0], &plan, None)
+            .start_call(&ids[0], &plan, Default::default())
             .await
             .unwrap();
         f.coordinator
@@ -1950,7 +1954,7 @@ mod tests {
         f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
         let attempt = f
             .coordinator
-            .start_call(&ids[0], &plan, None)
+            .start_call(&ids[0], &plan, Default::default())
             .await
             .unwrap();
 
@@ -1985,7 +1989,7 @@ mod tests {
         let plan = sample_plan("shell", &f.session);
         let error = f
             .coordinator
-            .start_call(&ids[0], &plan, None)
+            .start_call(&ids[0], &plan, Default::default())
             .await
             .unwrap_err();
         assert!(matches!(error, LedgerError::Conflict(_)), "{error}");

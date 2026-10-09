@@ -12,6 +12,7 @@ pub mod delegate;
 pub mod dispatch;
 pub mod edit;
 pub mod follow;
+pub mod fusion;
 pub mod mcp;
 pub mod paths;
 pub mod process;

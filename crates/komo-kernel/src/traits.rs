@@ -41,7 +41,7 @@ use crate::types::tool::{
     ToolOutput,
 };
 use crate::types::turn::{
-    AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse, LlmError, Round, RoundInput,
+    AcceptInput, Accepted, AssistantRound, EventBatch, GrantUses, LlmError, Round, RoundInput,
     TurnRequest,
 };
 
@@ -253,12 +253,12 @@ pub trait Ledger: Send + Sync {
     ) -> Result<EventId, LedgerError>;
 
     /// `tool.started` + 执行尝试 + 首次授权消费，同一事务；**返回后才允许产生真实
-    /// 副作用**。
+    /// 副作用**。`grants` 按步记这次用到的每一条授权（组合计划两步各凭各的时有两条）。
     async fn start_call(
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grant: Option<GrantUse>,
+        grants: GrantUses,
     ) -> Result<AttemptId, LedgerError>;
 
     /// 输出已由 [`ToolOutputStore`] 发布；这里只写 `tool.result` 元信息与引用。

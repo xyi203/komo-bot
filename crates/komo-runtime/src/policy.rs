@@ -15,7 +15,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use komo_kernel::policy::{Grant, IsolationCapability, PolicyContext, PolicyDecision, RuleTable};
+use komo_kernel::policy::{
+    Grant, GrantScope, IsolationCapability, PolicyContext, PolicyDecision, RuleTable,
+};
 use komo_kernel::traits::{ApprovalRepo, Clock, RepoError};
 use komo_kernel::types::chat::Principal;
 use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
@@ -125,14 +127,25 @@ impl PolicyEngine {
     ///
     /// 组合计划（带 `then_run`）上只认**整份计划**都盖得住的那条：绑定组合哈希的一次性
     /// 授权，或每一步都自己盖得住的范围授权（`Grant::covers`）。两步各凭各的授权或配置
-    /// Allow 放行时没有这样一条，答 `None`——只盖住一步的授权拿去按整份计划消费，
-    /// 必然对不上。
+    /// Allow 放行时没有这样一条，答 `None`——那时 executor 逐步问 [`Self::step_grant`]。
     pub fn covering_grant<'a>(
         &self,
         plan: &ExecutionPlan,
         env: &DecisionEnv<'a>,
     ) -> Option<&'a Grant> {
         env.grants.iter().find(|grant| grant.covers(plan, env.now))
+    }
+
+    /// 组合计划里**一步**（已经去掉 `then_run` 的单步计划）由哪条范围授权盖住。
+    ///
+    /// 与 Policy 逐步判时同一个口径：只认范围授权（一次性授权绑的是整份组合计划的
+    /// 哈希，不按步匹配）。executor 拿它按**这一步**的计划去消费——单步计划的
+    /// `Grant::covers`，消费那一刻再核一次有效期与撤销。
+    pub fn step_grant<'a>(&self, step: &ExecutionPlan, env: &DecisionEnv<'a>) -> Option<&'a Grant> {
+        debug_assert!(step.then_run.is_none(), "按步消费只收单步计划");
+        env.grants.iter().find(|grant| {
+            !matches!(grant.scope, GrantScope::Once { .. }) && grant.covers(step, env.now)
+        })
     }
 }
 
@@ -323,6 +336,16 @@ mod tests {
         };
         assert!(engine.decide(&composite, &env).is_allow());
         assert!(engine.covering_grant(&composite, &env).is_none());
+        // 逐步问：命令那一步是它，改动那一步（去掉 then_run 的单步计划）没有。
+        assert_eq!(
+            engine.step_grant(&command, &env).map(|g| g.id.as_str()),
+            Some("g-run")
+        );
+        let edit_alone = ExecutionPlan {
+            then_run: None,
+            ..composite.clone()
+        };
+        assert!(engine.step_grant(&edit_alone, &env).is_none());
 
         // 绑定组合哈希的一次性授权就是那一条。
         let grants = vec![grant(
@@ -345,6 +368,8 @@ mod tests {
                 .map(|g| g.id.as_str()),
             Some("g-once")
         );
+        // 一次性授权不按步匹配。
+        assert!(engine.step_grant(&command, &env).is_none());
     }
 
     #[test]

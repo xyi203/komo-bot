@@ -3752,3 +3752,660 @@ mod update_plan {
         );
     }
 }
+
+/// `edit` / `write` 带 `then_run`（Action Fusion，§4、§7.1）：两步一次放行、一条结果，
+/// 恢复时 started 一律交给人。
+mod fused {
+    use super::*;
+
+    use komo_kernel::events::EventPayload;
+    use komo_kernel::traits::Ledger;
+    use komo_kernel::types::ids::RunId;
+    use komo_kernel::types::refs::ContentRef;
+    use komo_store::session_log::SessionPaths;
+    use komo_store::tool_output::FileToolOutputStore;
+
+    use crate::approvals::ApprovalRequest;
+    use crate::executor::ToolExecutor;
+    use crate::tools::fusion::{THEN_RUN_SKIPPED, THEN_RUN_SUCCEEDED};
+    use crate::tools::{EditTool, ShellTool};
+
+    fn tools() -> Vec<Arc<dyn Tool>> {
+        vec![
+            Arc::new(EditTool::new()),
+            Arc::new(WriteTool::new()),
+            Arc::new(ShellTool::new()),
+        ]
+    }
+
+    /// 工作目录里一份 `a.txt`，内容 `old`。
+    fn seeded(harness: &Harness) -> PathBuf {
+        let root = std::fs::canonicalize(harness.dir.path()).expect("真实路径");
+        std::fs::write(root.join("a.txt"), "old\n").expect("写 a.txt");
+        root
+    }
+
+    fn edit_then(command: &str) -> (&'static str, serde_json::Value) {
+        (
+            "edit",
+            serde_json::json!({
+                "path": "a.txt",
+                "match_text": "old",
+                "replace_text": "new",
+                "then_run": { "command": command },
+            }),
+        )
+    }
+
+    /// 每跑一次命令就往 `ran.txt` 里记一行——"跑了几次"数行数就知道。
+    const COUNTING: &str = "echo ran >> ran.txt";
+
+    fn runs(root: &std::path::Path) -> usize {
+        std::fs::read_to_string(root.join("ran.txt"))
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn content(root: &std::path::Path) -> String {
+        std::fs::read_to_string(root.join("a.txt")).expect("读 a.txt")
+    }
+
+    fn started(harness: &Harness) -> Vec<komo_kernel::events::ToolStarted> {
+        harness
+            .ledger
+            .events()
+            .iter()
+            .filter_map(|event| match &event.payload {
+                EventPayload::ToolStarted(started) => Some(started.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 一条已批准、挂着范围授权的审批，授权从 `step`（单步计划）长出来——与操作者在
+    /// 一条单步调用上点"本次 Run"落成的那条同形。
+    async fn granted(
+        harness: &Harness,
+        session: &SessionId,
+        run: &RunId,
+        id: &str,
+        step: &ExecutionPlan,
+        valid_until: Option<time::OffsetDateTime>,
+    ) -> GrantId {
+        let record = harness
+            .gate
+            .request(ApprovalRequest {
+                session: session.clone(),
+                run: Some(run.clone()),
+                call: None,
+                plan: step.clone(),
+                reason: "测试".into(),
+                changes: None,
+                evidence: None,
+                scopes: vec![ApprovalScope::Run],
+            })
+            .await
+            .expect("落审批");
+        let grant = GrantId::from_raw(id);
+        harness.approvals.add_grant(Grant {
+            id: grant.clone(),
+            approval: record.approval.clone(),
+            scope: komo_kernel::policy::scope_for(step, ApprovalScope::Run).expect("Run 范围"),
+            granted_at: harness.clock.now(),
+            valid_until,
+            consumed: false,
+            reason: format!("{id} 本次 Run"),
+        });
+        harness
+            .approvals
+            .decide(
+                &record.approval,
+                ApprovalDecisionRecord {
+                    approved: true,
+                    scope: ApprovalScope::Run,
+                    by: None,
+                    decided_at: harness.clock.now(),
+                    grant: Some(grant.clone()),
+                    consumed: false,
+                },
+            )
+            .await
+            .expect("批准");
+        grant
+    }
+
+    /// 组合计划拆成两步各自的单步计划。
+    fn split(composite: &ExecutionPlan) -> (ExecutionPlan, ExecutionPlan) {
+        let edit = ExecutionPlan {
+            then_run: None,
+            ..composite.clone()
+        };
+        let command = composite.then_run.as_deref().expect("有第二步").clone();
+        (edit, command)
+    }
+
+    #[tokio::test]
+    async fn a_successful_fused_edit_returns_one_result_with_both_outputs() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        // 能力面按这几个工具登记；执行器自己装一份真的文件输出存储，好看 stdout 落在哪。
+        let _ = harness.permissive(tools());
+        let (session, run) = harness.open_run().await;
+        let sessions = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileToolOutputStore::new(
+            SessionPaths::new(sessions.path(), &session),
+            session.clone(),
+        ));
+        let mut table = RuleTable::empty();
+        table.default = komo_kernel::policy::Effect::Allow;
+        let executor = ToolExecutor::new(
+            tools(),
+            harness.ledger.clone(),
+            store.clone(),
+            harness.gate.clone(),
+            PolicyEngine::from_rules(table),
+            Arc::new(harness.clock.clone()),
+        );
+        let calls = harness
+            .record_round(&run, &[edit_then("echo hello-from-then-run; cat a.txt")])
+            .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 1, "一个调用一条结果");
+        let result = &outcome.results[0];
+        assert!(!result.is_error, "{}", result.content);
+        let (head, tail) = result
+            .content
+            .split_once(THEN_RUN_SUCCEEDED)
+            .unwrap_or_else(|| panic!("投影里要有标记：{}", result.content));
+        assert!(head.contains("替换了 1 处"), "{}", result.content);
+        assert!(tail.contains("hello-from-then-run"), "{}", result.content);
+        assert_eq!(content(&root), "new\n");
+        assert_eq!(started(&harness).len(), 1, "一次尝试");
+
+        // 命令的输出流进了**这一次尝试**的 stdout。
+        let event = harness
+            .ledger
+            .events()
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::ToolResult(result) => Some(result.clone()),
+                _ => None,
+            })
+            .expect("有一条 tool.result");
+        let stdout: ContentRef = event.stdout.clone().expect("有 stdout 引用");
+        let on_disk = std::fs::read_to_string(store.paths().root().join(&stdout.path))
+            .expect("读 stdout.txt");
+        assert!(on_disk.contains("hello-from-then-run"), "{on_disk}");
+        assert!(on_disk.contains("new"), "命令看见的是改完的文件：{on_disk}");
+        let preview = event.preview.expect("账本里有预览");
+        assert!(preview.contains(THEN_RUN_SUCCEEDED), "{preview}");
+        assert!(preview.len() <= PREVIEW_LIMIT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn an_ask_raises_one_approval_and_runs_both_once() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.initial(tools());
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
+        let env = harness.env(&session, &run);
+
+        let stopped = executor.execute_round(calls, &env).await.unwrap();
+        let Some(RoundStop::Approval { approval, .. }) = stopped.stop.clone() else {
+            panic!("{:?}", stopped.stop)
+        };
+        let pending = harness
+            .approvals
+            .list_pending(Some(&session))
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "两步只问一次");
+        assert!(pending[0].plan.then_run.is_some(), "审批绑的是整份组合计划");
+        assert_eq!(pending[0].scopes, vec![ApprovalScope::Once], "只给 Once");
+        assert_eq!(content(&root), "old\n", "批准之前一步都不做");
+        assert_eq!(runs(&root), 0);
+
+        harness
+            .gate
+            .decide(&approval, true, ApprovalScope::Once, None)
+            .await
+            .unwrap();
+        let mut resumed = stopped.remaining;
+        resumed[0].approval = Some(approval.clone());
+        resumed[0].plan = Some(pending[0].plan.clone());
+        resumed[0].resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
+        let done = executor.execute_round(resumed.clone(), &env).await.unwrap();
+        assert!(done.stop.is_none(), "{:?}", done.stop);
+        assert!(!done.results[0].is_error, "{}", done.results[0].content);
+        assert_eq!(content(&root), "new\n");
+        assert_eq!(runs(&root), 1, "命令跑了一次");
+
+        // 同一条审批再派发一次：一次性授权用过了，两步都不再跑。
+        let mut repeated = resumed;
+        repeated[0].resumed = None;
+        let third = executor.execute_round(repeated, &env).await.unwrap();
+        assert!(
+            matches!(third.stop, Some(RoundStop::Approval { .. })),
+            "{:?}",
+            third.stop
+        );
+        assert_eq!(runs(&root), 1, "同一条审批换不来第二次");
+        assert_eq!(started(&harness).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_denied_command_runs_nothing() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let mut table = RuleTable::initial();
+        table.rules.insert(
+            0,
+            komo_kernel::policy::PolicyRule {
+                id: "no-shell".into(),
+                effect: komo_kernel::policy::Effect::Deny,
+                reason: "这台机器不跑命令".into(),
+                matcher: Matcher::operations([OperationMatch::ShellCommand]),
+                scopes: vec![],
+                requires_isolation: false,
+                grant_proof: false,
+            },
+        );
+        let executor = harness.executor(tools(), PolicyEngine::from_rules(table));
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("这台机器不跑命令"),
+            "{}",
+            outcome.results[0].content
+        );
+        assert_eq!(content(&root), "old\n", "命令被拒，改动也不做");
+        assert_eq!(runs(&root), 0);
+        assert!(started(&harness).is_empty(), "没放行就没有 tool.started");
+    }
+
+    #[tokio::test]
+    async fn a_started_fused_call_is_uncertain_on_resume_and_never_reruns() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.permissive(tools());
+        let (session, run) = harness.open_run().await;
+        let mut calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
+        let plan = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
+        let previous = harness.crashed_attempt(&calls[0].call, &plan).await;
+        calls[0].plan = Some(plan);
+        calls[0].resumed = Some(resumed_from(
+            ToolCallState::Started,
+            Some(previous.clone()),
+            1,
+        ));
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        // 文件还是原内容：要是问了 edit 自己的核对，它会答"确定未执行"并重做。
+        let Some(RoundStop::Attention { reason, .. }) = &outcome.stop else {
+            panic!("{:?}", outcome.stop)
+        };
+        assert!(reason.contains("then_run"), "{reason}");
+        assert_eq!(content(&root), "old\n", "不重做改动");
+        assert_eq!(runs(&root), 0, "不重跑命令");
+        let results = harness.results_for(&previous);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].status, ToolResultStatus::Uncertain);
+        assert_eq!(started(&harness).len(), 1, "没有新的尝试");
+    }
+
+    #[tokio::test]
+    async fn a_planned_only_fused_call_runs_once() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.permissive(tools());
+        let (session, run) = harness.open_run().await;
+        let mut calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
+        let plan = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
+        harness
+            .ledger
+            .plan_call(&calls[0].call, &plan)
+            .await
+            .unwrap();
+        calls[0].plan = Some(plan);
+        calls[0].resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(
+            !outcome.results[0].is_error,
+            "{}",
+            outcome.results[0].content
+        );
+        assert_eq!(content(&root), "new\n");
+        assert_eq!(runs(&root), 1);
+        assert_eq!(started(&harness).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fused_call_without_shell_on_the_surface_is_refused() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.permissive(tools());
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
+        let surface = AgentSurface::new(["edit", "write"]);
+        let env = super::super::CallEnv {
+            surface: surface.clone(),
+            ..harness.env(&session, &run)
+        };
+
+        let outcome = executor.execute_round(calls, &env).await.unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("没有 shell"),
+            "{}",
+            outcome.results[0].content
+        );
+        assert_eq!(content(&root), "old\n");
+        assert_eq!(runs(&root), 0);
+        assert!(started(&harness).is_empty());
+
+        // 模型在这个面上根本看不见 then_run；面上有 shell 时看得见。
+        let has_then_run = |surface: &AgentSurface| {
+            executor
+                .definitions_for(surface)
+                .iter()
+                .filter(|definition| ["edit", "write"].contains(&definition.name.as_str()))
+                .map(|definition| {
+                    definition.parameters["properties"]
+                        .get("then_run")
+                        .is_some()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(has_then_run(&surface), [false, false]);
+        assert_eq!(
+            has_then_run(&AgentSurface::new(["edit", "write", "shell"])),
+            [true, true]
+        );
+    }
+
+    /// 读一下 `marker` 在不在，进门、出门各记一次。
+    struct Peek {
+        marker: PathBuf,
+        log: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for Peek {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "read".into(),
+                description: "测试用".into(),
+                parameters: serde_json::json!({ "type": "object" }),
+            }
+        }
+
+        async fn prepare(
+            &self,
+            args: serde_json::Value,
+            ctx: &ToolContext,
+        ) -> Result<ExecutionPlan, ToolError> {
+            Ok(ExecutionPlan {
+                operation_id: OperationId::from_raw(format!("op-{}", ctx.call)),
+                source: ctx.source.clone(),
+                tool: "read".into(),
+                operation: Operation::ReadFile,
+                run: Some(ctx.run.clone()),
+                tool_call: Some(ctx.call.clone()),
+                args,
+                cwd: Some(ctx.cwd.clone()),
+                targets: vec![PlanTarget::local(ctx.cwd.join("a.txt"), TargetAccess::Read)],
+                versions: PlanVersions::default(),
+                resources: vec![],
+                recovery: RecoveryMode::SafeReread,
+                then_run: None,
+            })
+        }
+
+        async fn execute(
+            &self,
+            plan: ApprovedPlan,
+            ctx: &ToolContext,
+            _sink: &mut dyn OutputWriter,
+        ) -> Result<ToolOutput, ToolError> {
+            let seen = |when: &str| format!("{}:{when}:{}", ctx.call, self.marker.exists());
+            self.log.lock().expect("日志").push(seen("进入"));
+            let delay = plan.plan().args["delay_ms"].as_u64().unwrap_or(0);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            self.log.lock().expect("日志").push(seen("离开"));
+            Ok(ToolOutput {
+                status: ToolResultStatus::Completed,
+                result: serde_json::json!({}),
+                exit_code: None,
+                artifacts: vec![],
+                preview: Some("看过了".into()),
+            })
+        }
+    }
+
+    /// 组合调用是**屏障**：它前面在飞的读先收尾，它跑完后面的读才开始（§6）。
+    #[tokio::test]
+    async fn fused_calls_are_barriers() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let peek = Arc::new(Peek {
+            marker: root.join("marker"),
+            log: Arc::clone(&log),
+        });
+        let mut all = tools();
+        all.push(peek);
+        let executor = harness.permissive(all);
+        let (session, run) = harness.open_run().await;
+        let calls = harness
+            .record_round(
+                &run,
+                &[
+                    ("read", serde_json::json!({ "delay_ms": 150 })),
+                    edit_then("touch marker"),
+                    ("read", serde_json::json!({ "delay_ms": 0 })),
+                ],
+            )
+            .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 3);
+        assert_eq!(
+            log.lock().expect("日志").clone(),
+            [
+                "call-0:进入:false",
+                "call-0:离开:false",
+                "call-2:进入:true",
+                "call-2:离开:true",
+            ],
+            "组合调用没有和前后的读同时在飞"
+        );
+    }
+
+    /// 两步各凭各的范围授权：每一步按**它自己**的单步计划消费，两条都进账本。
+    #[tokio::test]
+    async fn each_steps_grant_is_settled_and_recorded() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        // 什么都问：两步都只能凭授权放行。
+        let executor = harness.conservative(tools());
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
+        let composite = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
+        let (edit, command) = split(&composite);
+        let edit_grant = granted(&harness, &session, &run, "g-edit", &edit, None).await;
+        let command_grant = granted(&harness, &session, &run, "g-cmd", &command, None).await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(
+            !outcome.results[0].is_error,
+            "{}",
+            outcome.results[0].content
+        );
+        assert_eq!(content(&root), "new\n");
+        assert_eq!(runs(&root), 1);
+        let started = started(&harness);
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].grant, Some(edit_grant));
+        assert_eq!(started[0].then_run_grant, Some(command_grant));
+    }
+
+    /// 改动凭配置 Allow、命令凭 Run 授权：命令那条照样消费、照样进账本。
+    #[tokio::test]
+    async fn a_config_allowed_edit_with_a_granted_command_records_the_command_grant() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.initial(tools());
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
+        let composite = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
+        let (_, command) = split(&composite);
+        let command_grant = granted(&harness, &session, &run, "g-cmd", &command, None).await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(runs(&root), 1);
+        let started = started(&harness);
+        assert_eq!(started[0].grant, None, "改动凭的是配置");
+        assert_eq!(started[0].then_run_grant, Some(command_grant));
+    }
+
+    /// 命令那一步的授权用不了——过期了，或者挂着它的审批在消费那一刻已经失效——两步都
+    /// 不跑，整份计划重新问人。
+    #[tokio::test]
+    async fn an_expired_grant_for_the_command_asks_again() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.initial(tools());
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
+        let composite = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
+        let (_, command) = split(&composite);
+        let env = harness.env(&session, &run);
+
+        // ① 授权本身过期了。
+        let expired = harness.clock.now() - time::Duration::minutes(1);
+        granted(&harness, &session, &run, "g-old", &command, Some(expired)).await;
+        let outcome = executor.execute_round(calls.clone(), &env).await.unwrap();
+        assert!(
+            matches!(outcome.stop, Some(RoundStop::Approval { .. })),
+            "{:?}",
+            outcome.stop
+        );
+        assert_eq!(content(&root), "old\n");
+        assert_eq!(runs(&root), 0);
+
+        // ② 授权还在名单上（不设期限），但挂着它的审批到消费那一刻已经过期：消费时再核
+        //    一次，用不了就退回去问人。
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.initial(tools());
+        let (session, run) = harness.open_run().await;
+        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
+        let composite = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
+        let (_, command) = split(&composite);
+        granted(&harness, &session, &run, "g-lapsed", &command, None).await;
+        harness
+            .clock
+            .advance(crate::approvals::DEFAULT_VALIDITY + time::Duration::minutes(1));
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome.stop, Some(RoundStop::Approval { .. })),
+            "{:?}",
+            outcome.stop
+        );
+        assert_eq!(content(&root), "old\n");
+        assert_eq!(runs(&root), 0);
+        assert!(started(&harness).is_empty());
+        let pending = harness
+            .approvals
+            .list_pending(Some(&session))
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].scopes, vec![ApprovalScope::Once]);
+    }
+
+    /// 一个跳过的组合调用也只有一条结果，标记在正文里。
+    #[tokio::test]
+    async fn a_failed_mutation_skips_the_command() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.permissive(tools());
+        let (session, run) = harness.open_run().await;
+        let calls = harness
+            .record_round(
+                &run,
+                &[(
+                    "edit",
+                    serde_json::json!({
+                        "path": "a.txt",
+                        "match_text": "old",
+                        "replace_text": "new",
+                        "expected_version": "not-the-hash",
+                        "then_run": { "command": COUNTING },
+                    }),
+                )],
+            )
+            .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains(THEN_RUN_SKIPPED),
+            "{}",
+            outcome.results[0].content
+        );
+        assert_eq!(content(&root), "old\n");
+        assert_eq!(runs(&root), 0, "改动失败，命令没跑");
+    }
+}

@@ -73,7 +73,7 @@ use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskSpec};
 use komo_kernel::types::tool::{
     CancelToken, ResumedCall, ToolContext, ToolError, ToolOutput, WorkspaceRoot,
 };
-use komo_kernel::types::turn::{AcceptInput, Accepted, GrantUse, ToolResultForModel};
+use komo_kernel::types::turn::{AcceptInput, Accepted, GrantUse, GrantUses, ToolResultForModel};
 
 use crate::approvals::{ApprovalGate, ApprovalOutcome, ApprovalRequest};
 use crate::policy::{DecisionEnv, PolicyEngine, grants_for};
@@ -360,21 +360,42 @@ impl ToolExecutor {
     ///
     /// 名字在能力面里却没有实现，是装配错误（目录与能力面不同源），这里跳过并在日志里
     /// 说一声——把没有 schema 的工具交给模型没有意义，而静默地补一条假 schema 更坏。
+    ///
+    /// 能力面里没有 `shell` 时，`edit` / `write` 的 `then_run` 参数一并摘掉：模型看不见
+    /// 一个注定被拒的参数（执行侧 `begin` 照样拒，不靠这里）。
     pub fn definitions_for(
         &self,
         surface: &AgentSurface,
     ) -> Vec<komo_kernel::types::tool::ToolDefinition> {
+        let commands = self.can_run_commands(surface);
         surface
             .names()
             .iter()
             .filter_map(|name| match self.tools.get(name) {
-                Some(tool) => Some(tool.definition()),
+                Some(tool) => {
+                    let mut definition = tool.definition();
+                    if !commands
+                        && let Some(properties) = definition
+                            .parameters
+                            .get_mut("properties")
+                            .and_then(serde_json::Value::as_object_mut)
+                    {
+                        properties.remove("then_run");
+                    }
+                    Some(definition)
+                }
                 None => {
                     tracing::warn!(tool = %name, "能力面里的工具没有实现，跳过它的 schema");
                     None
                 }
             })
             .collect()
+    }
+
+    /// 这次运行能不能跑命令：能力面里有 `shell`，执行器也装着它。`then_run` 的放行与
+    /// schema 都问它。
+    fn can_run_commands(&self, surface: &AgentSurface) -> bool {
+        surface.allows("shell") && self.tools.contains_key("shell")
     }
 
     /// 一轮里每个调用的调度（§4 末、§6）。
@@ -564,7 +585,14 @@ impl ToolExecutor {
             && !state.is_known_not_to_have_run()
             && !safe_to_redo(&plan)
         {
-            match tool.verify(&plan, &planning_ctx).await {
+            // 带 `then_run` 的组合调用不问改动工具的核对：命令可能又改过这份文件，内容哈希
+            // 对上对不上都不再说明改动那一步发生没有（§8.6）。started 而无结果就交给人。
+            let verdict = if plan.then_run.is_some() {
+                Ok(Verification::Unavailable)
+            } else {
+                tool.verify(&plan, &planning_ctx).await
+            };
+            match verdict {
                 Ok(verdict @ Verification::NotPerformed { .. }) => {
                     // 确定未执行且前提仍成立：可以重新执行同一原子修改。
                     state.verification = Some(verdict);
@@ -605,6 +633,11 @@ impl ToolExecutor {
                             format!("核对发现冲突：{evidence}")
                         }
                         Verification::Unknown { reason } => format!("核对不出结论：{reason}"),
+                        Verification::Unavailable if plan.then_run.is_some() => format!(
+                            "{} 带 then_run：命令可能又改过目标，改动的核对不再可信，\
+                             不能判断上一次是否已经生效",
+                            request.tool
+                        ),
                         Verification::Unavailable => format!(
                             "{} 没有可用的核对方式，不能判断上一次是否已经生效",
                             request.tool
@@ -643,6 +676,19 @@ impl ToolExecutor {
             }
         }
 
+        // 组合调用的第二步是一条 shell 命令：这次运行的能力面里没有 shell（或这台执行器
+        // 根本没装它），就不放行、不执行——能力面管的是"这次能做什么"，不是"模型叫哪个名字"。
+        if plan.then_run.is_some() && !self.can_run_commands(&env.surface) {
+            let message = format!(
+                "{} 的 then_run 要跑一条命令，但这次运行的工具集里没有 shell；\
+                 去掉 then_run 再调一次",
+                request.tool
+            );
+            return Ok(Begin::Settled(
+                self.fail_unstarted(request, env, message).await?,
+            ));
+        }
+
         // 放行判断。「确定没跑过」才允许再用一条已经消费过的一次性授权（§7.4）。
         let intent = if resumed
             .as_ref()
@@ -652,8 +698,8 @@ impl ToolExecutor {
         } else {
             ConsumeIntent::First
         };
-        let (proof, grant_use) = match self.authorize(request, &plan, env, intent).await? {
-            Authorization::Proceed { proof, grant } => (proof, grant),
+        let (proof, grants) = match self.authorize(request, &plan, env, intent).await? {
+            Authorization::Proceed { proof, grants } => (proof, grants),
             Authorization::Refused(message) => {
                 // 拒绝作为明确结果交回模型（§7.4）——**同时落盘**：被拒的调用一样有
                 // 结论，不写下来它就永远悬着。
@@ -680,7 +726,7 @@ impl ToolExecutor {
             tool,
             plan,
             proof,
-            grant: grant_use,
+            grants,
             resumed,
         })))
     }
@@ -699,15 +745,12 @@ impl ToolExecutor {
             tool,
             plan,
             proof,
-            grant: grant_use,
+            grants,
             resumed,
         } = ready;
 
         // `tool.started` + 执行尝试 + 首次授权消费同一事务；**返回后才允许产生副作用**。
-        let attempt = self
-            .ledger
-            .start_call(&request.call, &plan, grant_use)
-            .await?;
+        let attempt = self.ledger.start_call(&request.call, &plan, grants).await?;
         let attempt_ref = AttemptRef {
             session: env.session.clone(),
             run: env.run.clone(),
@@ -723,11 +766,29 @@ impl ToolExecutor {
         let started = std::time::Instant::now();
         let approved = ApprovedPlan::new(plan.clone(), proof);
         // codemode：外层照常落账，执行这一步换成沙箱里的脚本（`docs/codemode.md` §3）。
+        // 组合调用：改动 → 核对 → 命令，一条结果（`tools::fusion`）。
         let execution = async {
-            match &plan.operation {
-                Operation::Codemode { code } => {
+            match (&plan.operation, approved.then_run()) {
+                (Operation::Codemode { code }, _) => {
                     self.run_codemode(code, env, &ctx, writer.as_mut()).await
                 }
+                (_, Some(command)) => match self.tools.get("shell") {
+                    Some(shell) => {
+                        crate::tools::fusion::execute_fused(
+                            &*tool,
+                            approved,
+                            &**shell,
+                            command,
+                            &ctx,
+                            writer.as_mut(),
+                        )
+                        .await
+                    }
+                    // `begin` 已经拦过；走到这里是装配在两步之间变了。
+                    None => Err(ToolError::Failed {
+                        message: "then_run 要跑命令，但这台执行器没有 shell".into(),
+                    }),
+                },
                 _ => tool.execute(approved, &ctx, writer.as_mut()).await,
             }
         };
@@ -866,8 +927,8 @@ impl ToolExecutor {
         } else {
             ConsumeIntent::First
         };
-        let grant = match self.authorize(request, plan, env, intent).await? {
-            Authorization::Proceed { grant, .. } => grant,
+        let grants = match self.authorize(request, plan, env, intent).await? {
+            Authorization::Proceed { grants, .. } => grants,
             Authorization::Refused(message) => {
                 // 与普通工具同一条规矩：结论落盘，别让这次调用悬在账本上。
                 return Ok(Begin::Settled(
@@ -888,7 +949,7 @@ impl ToolExecutor {
 
         let child = self.accept_child(env, spec).await?.run;
         // `tool.started` 之后子 Run 才可能被领取：它就是这次外派副作用的起点。
-        self.ledger.start_call(&request.call, plan, grant).await?;
+        self.ledger.start_call(&request.call, plan, grants).await?;
         Ok(Begin::Settled(CallSettlement::Stopped {
             stop: RoundStop::Dependency {
                 run: child,
@@ -1134,8 +1195,8 @@ impl ToolExecutor {
         } else {
             ConsumeIntent::First
         };
-        let grant = match self.authorize(request, plan, env, intent).await? {
-            Authorization::Proceed { grant, .. } => grant,
+        let grants = match self.authorize(request, plan, env, intent).await? {
+            Authorization::Proceed { grants, .. } => grants,
             Authorization::Refused(message) => {
                 return Ok(Begin::Settled(
                     self.fail_unstarted(request, env, message).await?,
@@ -1153,7 +1214,7 @@ impl ToolExecutor {
             }
         };
 
-        let attempt = self.ledger.start_call(&request.call, plan, grant).await?;
+        let attempt = self.ledger.start_call(&request.call, plan, grants).await?;
         let outcome = spawner.spawn(&env.run, request_key, spec).await;
         Ok(Begin::Settled(
             self.settle_dispatch(request, env, attempt, outcome).await?,
@@ -1246,8 +1307,8 @@ impl ToolExecutor {
         } else {
             ConsumeIntent::First
         };
-        let grant = match self.authorize(request, plan, env, intent).await? {
-            Authorization::Proceed { grant, .. } => grant,
+        let grants = match self.authorize(request, plan, env, intent).await? {
+            Authorization::Proceed { grants, .. } => grants,
             Authorization::Refused(message) => {
                 return Ok(Begin::Settled(
                     self.fail_unstarted(request, env, message).await?,
@@ -1265,7 +1326,7 @@ impl ToolExecutor {
             }
         };
 
-        let attempt = self.ledger.start_call(&request.call, plan, grant).await?;
+        let attempt = self.ledger.start_call(&request.call, plan, grants).await?;
         let outcome = spawner.follow(&env.run, request_key, &task_id, &text).await;
         Ok(Begin::Settled(
             self.settle_follow(request, env, attempt, outcome).await?,
@@ -1348,8 +1409,8 @@ impl ToolExecutor {
         } else {
             ConsumeIntent::First
         };
-        let grant = match self.authorize(request, plan, env, intent).await? {
-            Authorization::Proceed { grant, .. } => grant,
+        let grants = match self.authorize(request, plan, env, intent).await? {
+            Authorization::Proceed { grants, .. } => grants,
             Authorization::Refused(message) => {
                 return Ok(Begin::Settled(
                     self.fail_unstarted(request, env, message).await?,
@@ -1369,7 +1430,7 @@ impl ToolExecutor {
         Ok(Begin::Plan(Box::new(PlanCall {
             request: request.clone(),
             plan: plan.clone(),
-            start: PlanStart::Fresh(grant),
+            start: PlanStart::Fresh(grants),
         })))
     }
 
@@ -1387,7 +1448,9 @@ impl ToolExecutor {
             start,
         } = call;
         let attempt = match start {
-            PlanStart::Fresh(grant) => self.ledger.start_call(&request.call, &plan, grant).await?,
+            PlanStart::Fresh(grants) => {
+                self.ledger.start_call(&request.call, &plan, grants).await?
+            }
             PlanStart::Started(attempt) => attempt,
         };
 
@@ -1650,12 +1713,9 @@ impl ToolExecutor {
                 .await?
             {
                 ApprovalOutcome::Approved { approval, consumed } => {
-                    let proof = consumed.into_proof();
+                    let (proof, used) = spent(approval, consumed);
                     return Ok(Authorization::Proceed {
-                        grant: Some(GrantUse {
-                            approval,
-                            grant: proof.grant_id().cloned(),
-                        }),
+                        grants: Some(used).into(),
                         proof,
                     });
                 }
@@ -1691,12 +1751,9 @@ impl ToolExecutor {
                     Some(grant) => {
                         match self.approvals.settle(&grant.approval, plan, intent).await? {
                             ApprovalOutcome::Approved { approval, consumed } => {
-                                let proof = consumed.into_proof();
+                                let (proof, used) = spent(approval, consumed);
                                 Ok(Authorization::Proceed {
-                                    grant: Some(GrantUse {
-                                        approval,
-                                        grant: proof.grant_id().cloned(),
-                                    }),
+                                    grants: Some(used).into(),
                                     proof,
                                 })
                             }
@@ -1704,16 +1761,73 @@ impl ToolExecutor {
                             _ => Ok(self.ask(request, plan, reason, vec![])),
                         }
                     }
+                    // 组合计划两步各凭各的放行：逐步消费。
+                    None if plan.then_run.is_some() => {
+                        self.authorize_steps(request, plan, &decision_env, reason, intent)
+                            .await
+                    }
                     None => Ok(Authorization::Proceed {
-                        proof: PolicyDecision::allow(reason)
-                            .into_proof()
-                            .expect("Allow 换得出 Proof"),
-                        grant: None,
+                        proof: allowed(reason),
+                        grants: GrantUses::default(),
                     }),
                 }
             }
             PolicyDecision::Ask { reason, scopes } => Ok(self.ask(request, plan, reason, scopes)),
         }
+    }
+
+    /// 组合计划的两步**各凭各的**放行（Policy 已答 Allow，但没有哪一条授权盖住整份计划）。
+    ///
+    /// 每一步按**它自己**的单步计划（去掉 `then_run`）找盖住它的范围授权，并按那份计划
+    /// 消费——与单步调用同一个 `Grant::covers`，消费那一刻再核一次有效期与撤销。没有授权
+    /// 的那一步就是配置 Allow。任何一步的授权这一刻用不了，整份计划退回去问人（只给
+    /// Once，与 Policy 对组合计划的 Ask 同一个口径）——没有半截放行。
+    ///
+    /// 用到的每一条授权按步记进 [`GrantUses`]，凭据也按步装（[`Proof::with_then_run`]）：
+    /// 第二步换出来的凭据说得出它自己凭的是哪条。
+    async fn authorize_steps(
+        &self,
+        request: &CallRequest,
+        plan: &ExecutionPlan,
+        decision_env: &DecisionEnv<'_>,
+        reason: String,
+        intent: ConsumeIntent,
+    ) -> Result<Authorization, ExecError> {
+        let mut settled: Vec<(Proof, Option<GrantUse>)> = Vec::with_capacity(2);
+        for step in plan.steps() {
+            let alone = ExecutionPlan {
+                then_run: None,
+                ..step.clone()
+            };
+            let Some(grant) = self.policy.step_grant(&alone, decision_env) else {
+                settled.push((allowed(reason.clone()), None));
+                continue;
+            };
+            match self
+                .approvals
+                .settle(&grant.approval, &alone, intent)
+                .await?
+            {
+                ApprovalOutcome::Approved { approval, consumed } => {
+                    let (proof, used) = spent(approval, consumed);
+                    settled.push((proof, Some(used)));
+                }
+                _ => return Ok(self.ask(request, plan, reason, vec![])),
+            }
+        }
+        let mut steps = settled.into_iter();
+        let (Some((first, plan_grant)), Some((second, then_run_grant)), None) =
+            (steps.next(), steps.next(), steps.next())
+        else {
+            unreachable!("组合计划正好两步（validate_steps 在 Policy 里判过）")
+        };
+        Ok(Authorization::Proceed {
+            proof: first.with_then_run(second),
+            grants: GrantUses {
+                plan: plan_grant,
+                then_run: then_run_grant,
+            },
+        })
     }
 
     /// 需要人看一眼：**只组装，不落盘**。
@@ -1814,7 +1928,7 @@ struct PlanCall {
 
 enum PlanStart {
     /// 首次：收尾时才 `start_call`，带着放行用掉的那条授权（若有）。
-    Fresh(Option<GrantUse>),
+    Fresh(GrantUses),
     /// 上一世已经 `start_call` 过：结果落回那次尝试。
     Started(AttemptId),
 }
@@ -1825,7 +1939,7 @@ struct Authorized {
     tool: Arc<dyn Tool>,
     plan: ExecutionPlan,
     proof: Proof,
-    grant: Option<GrantUse>,
+    grants: GrantUses,
     resumed: Option<ResumedCall>,
 }
 
@@ -1905,7 +2019,7 @@ fn for_model(request: &CallRequest, env: &CallEnv, recorded: &Recorded) -> ToolR
 enum Authorization {
     Proceed {
         proof: Proof,
-        grant: Option<GrantUse>,
+        grants: GrantUses,
     },
     Refused(String),
     /// 需要人看一眼，而且**这一条审批还没有落盘**（`AskPending`）。
@@ -1981,6 +2095,26 @@ fn is_recall(plan: &ExecutionPlan, env: &CallEnv) -> bool {
             .iter()
             .any(|dir| path.starts_with(root.join(dir)))
     })
+}
+
+/// 一条消费成功的审批换成凭据，外加账本要记的那条 [`GrantUse`]。
+fn spent(
+    approval: ApprovalId,
+    consumed: komo_kernel::types::plan::ConsumedApproval,
+) -> (Proof, GrantUse) {
+    let proof = consumed.into_proof();
+    let used = GrantUse {
+        approval,
+        grant: proof.grant_id().cloned(),
+    };
+    (proof, used)
+}
+
+/// 配置直接放行的凭据。
+fn allowed(reason: String) -> Proof {
+    PolicyDecision::allow(reason)
+        .into_proof()
+        .expect("Allow 换得出 Proof")
 }
 
 /// 这份计划的动作重做一遍是安全的吗。

@@ -24,6 +24,7 @@ use komo_kernel::types::resource::TargetRef;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 
+use super::fusion::{ThenRun, attach};
 use super::write::{atomic_replace, target_path, verify_content};
 use super::{ExpectedVersion, FileVersion, as_text, current, normalized, parse_args, plan_time};
 
@@ -42,6 +43,10 @@ pub struct EditArgs {
     /// **prepare 填写**：替换之后文件内容的哈希。`verify` 靠它分辨"已满足"。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_version: Option<ContentHash>,
+    /// 改完紧接着跑的命令（[`super::fusion`]）。`prepare` 把它挪进计划的 `then_run`，
+    /// 计划里的参数不再带它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then_run: Option<ThenRun>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,7 +83,8 @@ impl Tool for EditTool {
                         "description": "read 返回的 version（或它的 hash）",
                         "anyOf": [{ "type": "string" }, { "type": "object" }]
                     },
-                    "replace_all": { "type": "boolean", "description": "匹配到多处时全部替换；默认报错" }
+                    "replace_all": { "type": "boolean", "description": "匹配到多处时全部替换；默认报错" },
+                    "then_run": super::fusion::schema("编辑")
                 },
                 "required": ["path", "match_text", "replace_text"],
                 "additionalProperties": false
@@ -94,6 +100,7 @@ impl Tool for EditTool {
         let mut args: EditArgs = parse_args(args, "edit")?;
         // 模型不能自己指定结果版本——那是 prepare 从真实文件算出来的。
         args.result_version = None;
+        let then_run = args.then_run.take();
         if args.match_text.is_empty() {
             return Err(ToolError::InvalidArguments {
                 message: "match_text 不能是空串：空串在任何位置都匹配".into(),
@@ -112,7 +119,7 @@ impl Tool for EditTool {
         };
         args.result_version = result_version;
 
-        Ok(ExecutionPlan {
+        let mut plan = ExecutionPlan {
             operation_id: OperationId::new_at(plan_time()),
             source: ctx.source.clone(),
             tool: "edit".into(),
@@ -135,7 +142,9 @@ impl Tool for EditTool {
             resources: vec![],
             recovery: RecoveryMode::VerifyTarget,
             then_run: None,
-        })
+        };
+        attach(&mut plan, then_run, ctx)?;
+        Ok(plan)
     }
 
     async fn execute(

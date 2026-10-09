@@ -18,7 +18,7 @@ use crate::fold::{Surface, fold};
 use crate::types::plan::{ExecutionPlan, PlanHash};
 use crate::types::refs::{PublishedOutput, ToolResultStatus};
 use crate::types::status::{AttemptState, RunEnd, WaitReason};
-use crate::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse};
+use crate::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUses};
 
 use super::TestClock;
 
@@ -275,7 +275,7 @@ impl Ledger for MemLedger {
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grant: Option<GrantUse>,
+        grants: GrantUses,
     ) -> Result<AttemptId, LedgerError> {
         let mut state = self.state.lock().expect("账本");
         let entry = state
@@ -299,7 +299,8 @@ impl Ledger for MemLedger {
                 attempt_id: attempt.clone(),
                 plan_ref: plan_event,
                 plan_hash: plan.plan_hash(),
-                grant: grant.and_then(|g| g.grant),
+                grant: grants.plan.and_then(|g| g.grant),
+                then_run_grant: grants.then_run.and_then(|g| g.grant),
             }),
         );
         state.attempts.insert(attempt.clone(), call.clone());

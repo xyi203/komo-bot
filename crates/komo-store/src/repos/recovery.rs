@@ -469,7 +469,7 @@ mod tests {
         f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
         // 开跑了，但没有结果——上一个实例就停在这里。
         f.coordinator
-            .start_call(&ids[0], &plan, None)
+            .start_call(&ids[0], &plan, Default::default())
             .await
             .unwrap();
         (accepted.run, ids[0].clone())
@@ -506,7 +506,7 @@ mod tests {
         f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
         let attempt = f
             .coordinator
-            .start_call(&ids[0], &plan, None)
+            .start_call(&ids[0], &plan, Default::default())
             .await
             .unwrap();
         f.coordinator

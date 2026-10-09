@@ -24,7 +24,7 @@ use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, Sessio
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::refs::PublishedOutput;
 use komo_kernel::types::status::{RunEnd, WaitReason};
-use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse};
+use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUses};
 
 pub use komo_gateway::service::test_support::harness::*;
 
@@ -267,13 +267,13 @@ impl Ledger for FaultLedger {
         &self,
         call: &ToolCallId,
         plan: &komo_kernel::types::plan::ExecutionPlan,
-        grant: Option<komo_kernel::types::turn::GrantUse>,
+        grants: komo_kernel::types::turn::GrantUses,
     ) -> Result<AttemptId, LedgerError> {
         poisoned!(self);
         if self.state.fault == Fault::BeforeStartCall {
             return Err(self.state.trip());
         }
-        let attempt = self.inner.start_call(call, plan, grant).await?;
+        let attempt = self.inner.start_call(call, plan, grants).await?;
         if self.state.fault == Fault::AfterStartCall {
             // JSONL 与 state.db 两步都提交了，**真实动作还没发出**。
             return Err(self.state.trip());

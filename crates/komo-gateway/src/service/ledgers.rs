@@ -30,7 +30,7 @@ use komo_kernel::types::refs::{
     AttemptRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput,
 };
 use komo_kernel::types::status::{RunEnd, WaitReason};
-use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse};
+use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUses};
 use komo_store::{Coordinator, Db, FileToolOutputStore, SessionPaths};
 
 use crate::sse::SharedHub;
@@ -252,9 +252,9 @@ impl Ledger for PublishingLedger {
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grant: Option<GrantUse>,
+        grants: GrantUses,
     ) -> Result<AttemptId, LedgerError> {
-        pumped!(self, self.inner.start_call(call, plan, grant).await)
+        pumped!(self, self.inner.start_call(call, plan, grants).await)
     }
 
     async fn finish_call(
@@ -571,10 +571,10 @@ impl Ledger for RoutedLedger {
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grant: Option<GrantUse>,
+        grants: GrantUses,
     ) -> Result<AttemptId, LedgerError> {
         let entry = self.for_call(call).await?;
-        let attempt = entry.ledger.start_call(call, plan, grant).await?;
+        let attempt = entry.ledger.start_call(call, plan, grants).await?;
         self.note_attempt(&attempt, entry.ledger.session());
         Ok(attempt)
     }

@@ -205,7 +205,7 @@ impl Harness {
     pub async fn crashed_attempt(&self, call: &ToolCallId, plan: &ExecutionPlan) -> AttemptId {
         self.ledger.plan_call(call, plan).await.expect("落计划");
         self.ledger
-            .start_call(call, plan, None)
+            .start_call(call, plan, Default::default())
             .await
             .expect("写 tool.started")
     }

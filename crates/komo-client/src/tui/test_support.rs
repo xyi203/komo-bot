@@ -122,6 +122,7 @@ pub fn conversation() -> Vec<Event> {
                 plan_ref: EventId::from_raw("evt-5"),
                 plan_hash: plan().plan_hash(),
                 grant: None,
+                then_run_grant: None,
             }),
         ),
         event(

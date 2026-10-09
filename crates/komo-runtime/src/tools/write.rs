@@ -19,6 +19,7 @@ use komo_kernel::types::resource::TargetRef;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 
+use super::fusion::{ThenRun, attach};
 use super::{ExpectedVersion, FileVersion, current, normalized, parse_args, plan_time};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +29,10 @@ pub struct WriteArgs {
     /// 覆盖现有文件时的预期版本。文件已存在而没给它 → 版本冲突。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<ExpectedVersion>,
+    /// 写完紧接着跑的命令（[`super::fusion`]）。`prepare` 把它挪进计划的 `then_run`，
+    /// 计划里的参数不再带它。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then_run: Option<ThenRun>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +67,8 @@ impl Tool for WriteTool {
                     "expected_version": {
                         "description": "read 返回的 version（或它的 hash）。覆盖已有文件时必填",
                         "anyOf": [{ "type": "string" }, { "type": "object" }]
-                    }
+                    },
+                    "then_run": super::fusion::schema("写入")
                 },
                 "required": ["path", "content"],
                 "additionalProperties": false
@@ -75,9 +81,10 @@ impl Tool for WriteTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
-        let args: WriteArgs = parse_args(args, "write")?;
+        let mut args: WriteArgs = parse_args(args, "write")?;
+        let then_run = args.then_run.take();
         let path = super::paths::resolve(&args.path, &ctx.cwd)?;
-        Ok(ExecutionPlan {
+        let mut plan = ExecutionPlan {
             operation_id: OperationId::new_at(plan_time()),
             source: ctx.source.clone(),
             tool: "write".into(),
@@ -93,10 +100,12 @@ impl Tool for WriteTool {
             }],
             versions: PlanVersions::default(),
             resources: vec![],
-            // 写入的恢复靠核对内容哈希（§8.6）。
+            // 写入的恢复靠核对内容哈希（§8.6）。带 then_run 时 `attach` 改成 NoSafeRecovery。
             recovery: RecoveryMode::VerifyTarget,
             then_run: None,
-        })
+        };
+        attach(&mut plan, then_run, ctx)?;
+        Ok(plan)
     }
 
     async fn execute(

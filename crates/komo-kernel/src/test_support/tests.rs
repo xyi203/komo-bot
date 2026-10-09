@@ -70,7 +70,10 @@ fn the_mem_ledger_writes_a_log_that_actually_folds() {
 
         let plan = sample_plan("python", &session);
         ledger.plan_call(&call, &plan).await.unwrap();
-        let attempt = ledger.start_call(&call, &plan, None).await.unwrap();
+        let attempt = ledger
+            .start_call(&call, &plan, Default::default())
+            .await
+            .unwrap();
 
         let store = MemOutputStore::new();
         let writer = store

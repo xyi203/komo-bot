@@ -25,7 +25,8 @@
 | §14 Handle 视图 / 按请求投影 | **已落地（2026-10-09）**：照 SoL-Pi 的 ObservationPack 衰减——超过 `decay_threshold_bytes` 的成功结果在它之后的前 `decay_full_sends` 次请求里给完整视图，此后换成首尾整行 + 引用的短视图（失败的不换）；次数 = 这条 Run 在它之后记了几条 `message.assistant`，回放从日志数、loop 在 `record_round` 后递减，驱动按 `provider_call_id` 就地修订（`docs/komo_bot.md` §8.3），`komo::observation` 上多一条 `observation.decayed` |
 | §25 / §26 Context Compact | **已落地（2026-10-09，默认关）**：照 SoL-Pi 的 Online Context Compact——`update_plan` 完成一步是边界，按缓存账决定压不压，另有窗口保护；与投影是两件事：投影改一条结果的视图，压缩把一段轮次换成一条 `context.compacted` 摘要，决定连同中间量记在那条事件里，回放是任务 → 摘要 → 切点起原样（`docs/komo_bot.md` §6、§8.3） |
 | §40 并行工具调用 | **已落地（2026-09-21）**：只读的（`Operation::ReadFile`，即 `read` / `rg`）且**没有上一世要接**（续跑里已经 `start` 过的那条要走核对梯子）的调用，可以和同一轮里后面的调用同时在飞，上限 4 条（`ExecutionLimits::max_parallel_reads`）；`write` / `edit` / `shell` / `python` / `delegate` 与任何要停下来的判定都是屏障——屏障之前已经在飞的先收尾。三条不变量照旧：`start_call` 之后才允许副作用、审批先收尾再落审批行（否则答复会落进 Run 还没停下的空窗）、完成事件按真实顺序落账而交给模型的那一份按原始调用顺序配对。`docs/komo_bot.md` §6 那句"首版顺序执行"已改写 |
-| §41 Action Fusion、§43 Reducer | **未做**，也还没到做的时候（Reducer 要模型 + 验证 + 成本记账，收益未测量） |
+| §41 Action Fusion | **已落地（2026-10-10）**：`edit` / `write` 的 `then_run`——改完紧接着跑一条 shell 命令，两步合并授权（一次审批绑组合哈希、各凭各的授权则逐步消费并逐条记账）、一条结果、同一次尝试的 stdout；started 而无结果一律 uncertain（`docs/komo_bot.md` §4、§7.1、§8.6） |
+| §43 Reducer | **未做**，也还没到做的时候（要模型 + 验证 + 成本记账，收益未测量） |
 | §47 事件 / §48 指标 | **已落地（2026-09-21，只做 trace 那一半）**：`komo::observation` 上四条——`observation.projected`（`tool_output_bytes` / `artifact_bytes` / `projected_bytes`）与 `observation.recalled`（`observation_recall_count`）。按 §47 的取舍，**不进 durable Session Event**；`§49 Benchmark` 的对比口径因此可以开始记 |
 
 ---

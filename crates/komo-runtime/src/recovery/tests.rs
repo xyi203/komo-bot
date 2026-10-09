@@ -223,9 +223,9 @@ impl Ledger for PoisonedLedger {
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grant: Option<komo_kernel::types::turn::GrantUse>,
+        grants: komo_kernel::types::turn::GrantUses,
     ) -> Result<komo_kernel::types::ids::AttemptId, LedgerError> {
-        self.inner.start_call(call, plan, grant).await
+        self.inner.start_call(call, plan, grants).await
     }
     async fn finish_call(
         &self,
@@ -610,7 +610,7 @@ async fn row_5_the_result_is_on_disk_and_verified_while_the_database_lags() {
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
     let attempt = world
         .ledger
-        .start_call(&calls[0], &plan, None)
+        .start_call(&calls[0], &plan, Default::default())
         .await
         .unwrap();
 
@@ -683,7 +683,7 @@ async fn row_7_the_call_started_and_left_no_result() {
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
     world
         .ledger
-        .start_call(&calls[0], &plan, None)
+        .start_call(&calls[0], &plan, Default::default())
         .await
         .unwrap();
 
@@ -1151,7 +1151,7 @@ async fn a_missing_output_body_stops_the_task_instead_of_rerunning_it() {
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
     let attempt = world
         .ledger
-        .start_call(&calls[0], &plan, None)
+        .start_call(&calls[0], &plan, Default::default())
         .await
         .unwrap();
     world
@@ -1192,7 +1192,7 @@ async fn an_altered_output_body_stops_the_task_too() {
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
     let attempt = world
         .ledger
-        .start_call(&calls[0], &plan, None)
+        .start_call(&calls[0], &plan, Default::default())
         .await
         .unwrap();
     // 真的发布过一份，但事件里记的哈希对不上（正文被改过）。
@@ -1418,7 +1418,7 @@ async fn an_orphan_output_is_verified_and_its_result_is_backfilled() {
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
     let attempt = world
         .ledger
-        .start_call(&calls[0], &plan, None)
+        .start_call(&calls[0], &plan, Default::default())
         .await
         .unwrap();
     // 工具跑完了，output.json 完整落盘——**但 tool.result 没写就崩了**。
@@ -1476,7 +1476,7 @@ async fn an_output_from_another_attempt_is_corruption_not_evidence() {
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
     let attempt = world
         .ledger
-        .start_call(&calls[0], &plan, None)
+        .start_call(&calls[0], &plan, Default::default())
         .await
         .unwrap();
 
@@ -1524,7 +1524,7 @@ async fn without_an_orphan_output_the_call_still_goes_to_the_tools_own_verify() 
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
     world
         .ledger
-        .start_call(&calls[0], &plan, None)
+        .start_call(&calls[0], &plan, Default::default())
         .await
         .unwrap();
 
@@ -1578,7 +1578,7 @@ async fn a_backfill_that_cannot_be_written_falls_back_to_the_tools_verify() {
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
     let attempt = world
         .ledger
-        .start_call(&calls[0], &plan, None)
+        .start_call(&calls[0], &plan, Default::default())
         .await
         .unwrap();
     let published = world.publish(&run, &calls[0], &attempt).await;

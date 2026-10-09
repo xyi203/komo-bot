@@ -599,6 +599,7 @@ mod tests {
                     plan_ref: EventId::from_raw("evt-5"),
                     plan_hash: PlanHash::from_raw("h1"),
                     grant: None,
+                    then_run_grant: None,
                 }),
             ),
             event(
@@ -1013,6 +1014,7 @@ mod tests {
                         plan_ref: EventId::from_raw("evt-0"),
                         plan_hash: PlanHash::from_raw("h"),
                         grant: None,
+                        then_run_grant: None,
                     }),
                     6 => EventPayload::ToolResult(ToolResult {
                         call_id: ToolCallId::from_raw(format!("call-{}", rng.below(3))),

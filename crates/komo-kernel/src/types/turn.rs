@@ -277,6 +277,34 @@ pub struct GrantUse {
     pub grant: Option<GrantId>,
 }
 
+/// 一次执行消费的授权，**按步**记（§7.4）。
+///
+/// 普通计划只有 `plan`。组合计划（`then_run`）合并授权时也只有 `plan`；两步各凭各的
+/// 授权放行时，命令那一步的记在 `then_run`——每条真正用到的授权都进账本。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GrantUses {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<GrantUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then_run: Option<GrantUse>,
+}
+
+impl From<Option<GrantUse>> for GrantUses {
+    fn from(plan: Option<GrantUse>) -> Self {
+        Self {
+            plan,
+            then_run: None,
+        }
+    }
+}
+
+impl GrantUses {
+    /// 用到的每一条，按步。
+    pub fn iter(&self) -> impl Iterator<Item = &GrantUse> {
+        self.plan.iter().chain(self.then_run.iter())
+    }
+}
+
 /// `Ledger::read` 的返回：**一页**事件。
 ///
 /// `next` 是 `Option` 而不是"一个总是有值的游标"：`None` 就是"读完了"。用一个总有值的

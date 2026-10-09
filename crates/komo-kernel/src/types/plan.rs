@@ -405,8 +405,8 @@ impl ExecutionPlan {
 ///
 /// ```compile_fail
 /// # use komo_kernel::types::Proof;
-/// // 元组字段是私有的，构造不出来。
-/// let forged = Proof(unimplemented!());
+/// // 字段是私有的，构造不出来。
+/// let forged = Proof { step: unimplemented!(), then_run: None };
 /// ```
 ///
 /// ```compile_fail
@@ -445,8 +445,17 @@ impl ExecutionPlan {
 ///
 /// **不实现 `Clone`**：一份凭据只配一份计划（组合计划的第二步由 kernel 照着第一步的
 /// 凭据另造一份，见 [`ApprovedPlan::then_run`]）。
+///
+/// 组合计划的两步各凭各的授权（或一步凭授权、一步凭配置 Allow）放行时，凭据按步带着
+/// 各自的来源（[`Proof::with_then_run`]）：第二步换出来的那份凭据说的是**它自己**凭的
+/// 哪条授权。
 #[derive(Debug, PartialEq, Eq)]
-pub struct Proof(ProofKind);
+pub struct Proof {
+    step: ProofKind,
+    /// 第二步自己的来源。`None` = 两步共用 `step`（合并授权：一次性授权绑组合哈希，
+    /// 或一条范围授权两步都盖得住）。
+    then_run: Option<ProofKind>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProofKind {
@@ -460,25 +469,44 @@ enum ProofKind {
 }
 
 impl Proof {
+    fn of(step: ProofKind) -> Self {
+        Proof {
+            step,
+            then_run: None,
+        }
+    }
+
     pub(crate) fn policy_allow() -> Self {
-        Proof(ProofKind::PolicyAllow)
+        Proof::of(ProofKind::PolicyAllow)
     }
 
     pub(crate) fn approval(approval: ApprovalId, grant: Option<GrantId>) -> Self {
-        Proof(ProofKind::Approval { approval, grant })
+        Proof::of(ProofKind::Approval { approval, grant })
     }
 
-    /// 这次放行来自哪条审批（如果不是 Policy 直接 Allow）。写进账本用。
+    /// 组合计划按步放行：`self` 是改动那一步的凭据，`then_run` 是命令那一步的。
+    ///
+    /// 两份都得是已经换出来的凭据——这里只是把它们按步装在一起，造不出新的放行。
+    /// 第二步的凭据若自己也是按步装的，只取它的第一步：`then_run` 只有一层。
+    pub fn with_then_run(self, then_run: Proof) -> Proof {
+        Proof {
+            step: self.step,
+            then_run: Some(then_run.step),
+        }
+    }
+
+    /// 这次放行来自哪条审批（如果不是 Policy 直接 Allow）。写进账本用。按步放行的组合
+    /// 计划上说的是改动那一步；命令那一步的在 [`ApprovedPlan::then_run`] 换出来的凭据上。
     pub fn approval_id(&self) -> Option<&ApprovalId> {
-        match &self.0 {
+        match &self.step {
             ProofKind::PolicyAllow => None,
             ProofKind::Approval { approval, .. } => Some(approval),
         }
     }
 
-    /// 这次放行消费了哪条范围授权。
+    /// 这次放行消费了哪条范围授权（同上，按步放行时是改动那一步的）。
     pub fn grant_id(&self) -> Option<&GrantId> {
-        match &self.0 {
+        match &self.step {
             ProofKind::PolicyAllow => None,
             ProofKind::Approval { grant, .. } => grant.as_ref(),
         }
@@ -551,12 +579,19 @@ impl ApprovedPlan {
         &self.proof
     }
 
-    /// 组合计划的第二步，带着**同一份**凭据：Policy / 审批判的是整份组合计划，两步
-    /// 共用一个结论。这是 kernel 之外拿到第二步 `ApprovedPlan` 的唯一办法。
+    /// 组合计划的第二步：Policy / 审批判的是整份组合计划，合并授权时两步共用同一份
+    /// 凭据，按步放行时第二步拿它自己那一份（[`Proof::with_then_run`]）。这是 kernel
+    /// 之外拿到第二步 `ApprovedPlan` 的唯一办法。
     pub fn then_run(&self) -> Option<ApprovedPlan> {
         self.plan.then_run.as_deref().map(|step| ApprovedPlan {
             plan: step.clone(),
-            proof: Proof(self.proof.0.clone()),
+            proof: Proof::of(
+                self.proof
+                    .then_run
+                    .as_ref()
+                    .unwrap_or(&self.proof.step)
+                    .clone(),
+            ),
         })
     }
 }
@@ -701,6 +736,54 @@ mod tests {
         assert_eq!(
             second.proof().approval_id().map(|a| a.as_str()),
             Some("ap-1")
+        );
+    }
+
+    #[test]
+    fn a_per_step_proof_hands_the_second_step_its_own_grant() {
+        let composite = fused("cargo test");
+        let edit = ConsumedApproval::new(
+            ApprovalId::from_raw("ap-edit"),
+            Some(GrantId::from_raw("g-edit")),
+            plan().plan_hash(),
+        );
+        let command = ConsumedApproval::new(
+            ApprovalId::from_raw("ap-cmd"),
+            Some(GrantId::from_raw("g-cmd")),
+            composite.then_run.as_deref().unwrap().plan_hash(),
+        );
+        let proof = edit.into_proof().with_then_run(command.into_proof());
+        let approved = ApprovedPlan::new(composite, proof);
+        assert_eq!(
+            approved.proof().grant_id().map(|g| g.as_str()),
+            Some("g-edit")
+        );
+        let second = approved.then_run().expect("有第二步");
+        assert_eq!(second.proof().grant_id().map(|g| g.as_str()), Some("g-cmd"));
+        assert_eq!(
+            second.proof().approval_id().map(|a| a.as_str()),
+            Some("ap-cmd")
+        );
+
+        // 一步凭配置 Allow、一步凭授权：第二步说得出它凭的是授权，第一步什么都不凭。
+        let mixed = Proof::policy_allow().with_then_run(
+            ConsumedApproval::new(
+                ApprovalId::from_raw("ap-cmd"),
+                Some(GrantId::from_raw("g-cmd")),
+                plan().plan_hash(),
+            )
+            .into_proof(),
+        );
+        let approved = ApprovedPlan::new(fused("cargo test"), mixed);
+        assert!(approved.proof().grant_id().is_none());
+        assert_eq!(
+            approved
+                .then_run()
+                .unwrap()
+                .proof()
+                .grant_id()
+                .map(|g| g.as_str()),
+            Some("g-cmd")
         );
     }
 

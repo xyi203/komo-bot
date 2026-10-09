@@ -94,6 +94,28 @@ pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPla
     }
 }
 
+/// 一次具体调用的 shell 计划：[`plan_for`] 加上这次调用的 Run / ToolCall 与完整参数。
+///
+/// `shell` 自己的 `prepare` 与 `edit` / `write` 的 `then_run`（[`super::fusion`]）共用它：
+/// 第二步就是一条普通的 shell 计划，规则、授权与审批按同一个形状匹配。
+pub fn plan_for_call(args: &ShellArgs, ctx: &ToolContext) -> Result<ExecutionPlan, ToolError> {
+    if args.command.trim().is_empty() {
+        return Err(ToolError::InvalidArguments {
+            message: "command 不能是空串".into(),
+        });
+    }
+    let cwd = match &args.cwd {
+        Some(raw) => super::paths::resolve(raw, &ctx.cwd)?,
+        None => ctx.cwd.clone(),
+    };
+    let mut plan = plan_for(ctx.source.clone(), cwd, &args.command);
+    plan.run = Some(ctx.run.clone());
+    plan.tool_call = Some(ctx.call.clone());
+    // 完整的原始参数（可能带 `cwd` / `timeout_secs`），不是 `plan_for` 那份精简的。
+    plan.args = normalized(args)?;
+    Ok(plan)
+}
+
 pub struct ShellTool {
     default_timeout: Duration,
     output_limit: u64,
@@ -167,21 +189,7 @@ impl Tool for ShellTool {
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
         let args: ShellArgs = parse_args(args, "shell")?;
-        if args.command.trim().is_empty() {
-            return Err(ToolError::InvalidArguments {
-                message: "command 不能是空串".into(),
-            });
-        }
-        let cwd = match &args.cwd {
-            Some(raw) => super::paths::resolve(raw, &ctx.cwd)?,
-            None => ctx.cwd.clone(),
-        };
-        let mut plan = plan_for(ctx.source.clone(), cwd, &args.command);
-        plan.run = Some(ctx.run.clone());
-        plan.tool_call = Some(ctx.call.clone());
-        // 完整的原始参数（可能带 `cwd` / `timeout_secs`），不是 `plan_for` 那份精简的。
-        plan.args = normalized(&args)?;
-        Ok(plan)
+        plan_for_call(&args, ctx)
     }
 
     async fn execute(

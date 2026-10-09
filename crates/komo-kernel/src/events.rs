@@ -422,9 +422,12 @@ pub struct ToolStarted {
     /// 指向承载计划的事件。
     pub plan_ref: EventId,
     pub plan_hash: PlanHash,
-    /// 这次执行消费了哪条授权（如果有）。
+    /// 这次执行消费了哪条授权（如果有）。组合计划按步放行时是改动那一步的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<GrantId>,
+    /// 组合计划按步放行时，命令那一步（`then_run`）消费的那条授权。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub then_run_grant: Option<GrantId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

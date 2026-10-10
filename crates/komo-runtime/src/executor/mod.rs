@@ -1856,6 +1856,11 @@ impl ToolExecutor {
         pending: Box<AskPending>,
         env: &CallEnv,
     ) -> Result<ApprovalId, ExecError> {
+        // 组合计划的 diff 只描述改动那一步：命令那一步界面另列"然后运行"（§11.3）。
+        let changes = match self.tools.get(&pending.plan.tool) {
+            Some(tool) => tool.changes(&pending.plan).await,
+            None => None,
+        };
         let record = self
             .approvals
             .request(ApprovalRequest {
@@ -1864,7 +1869,7 @@ impl ToolExecutor {
                 call: Some(pending.call),
                 plan: pending.plan,
                 reason: pending.reason,
-                changes: None,
+                changes,
                 evidence: None,
                 scopes: pending.scopes,
             })

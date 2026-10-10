@@ -726,6 +726,14 @@ pub trait Tool: Send + Sync {
     ) -> Result<Verification, ToolError> {
         Ok(Verification::Unavailable)
     }
+
+    /// 审批界面"改动"那一节（§7.2、§11.3）：这份计划批准后会对目标做什么，给人看的
+    /// diff，已在源头截断。只读，约束同 `prepare`——不执行任何未审核代码。说不出来
+    /// （读不到、参数解析不了）就是 `None`，不报错：缺了这一节不该挡住审批本身。
+    /// 默认 `None`；`write` / `edit` 覆盖它。
+    async fn changes(&self, _plan: &ExecutionPlan) -> Option<String> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------- 任务分发

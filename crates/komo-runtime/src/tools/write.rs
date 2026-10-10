@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use super::fusion::{ThenRun, attach};
 use super::{ExpectedVersion, FileVersion, current, normalized, parse_args, plan_time};
+use crate::toolbox::diff;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteArgs {
@@ -170,6 +171,68 @@ impl Tool for WriteTool {
             .and_then(|target| target.expected_version.clone());
         verify_content(&path, &intended, expected.as_ref())
     }
+
+    /// 与 `execute` 同一道版本核对：执行时会因版本不符失败的计划不给 diff。
+    async fn changes(&self, plan: &ExecutionPlan) -> Option<String> {
+        let args: WriteArgs = parse_args(plan.args.clone(), "write").ok()?;
+        let path = target_path(plan).ok()?;
+        let existing = current(&path).ok()?;
+        if let Err(conflict) = check_version(
+            &path,
+            existing.as_ref().map(|(_, v)| v),
+            args.expected_version.as_ref(),
+        ) {
+            return Some(unrunnable(conflict));
+        }
+        let Some((bytes, _)) = existing else {
+            return proposed(&path, None, &args.content);
+        };
+        match String::from_utf8(bytes) {
+            Ok(before) => proposed(&path, Some(&before), &args.content),
+            Err(_) => Some(format!(
+                "（{} 当前不是 UTF-8 文本，列不出 diff；批准后整份替换成 {} 字节的新内容）",
+                path.display(),
+                args.content.len()
+            )),
+        }
+    }
+}
+
+/// 审批里一份改动最多带这么多字节。渠道各自再截到自己的上限；这一份是给 TUI 与
+/// `komo approval show` 看的，而且要进 state.db 的审批行，所以在源头就截。
+pub const CHANGES_LIMIT: usize = 8 * 1024;
+
+/// 给人看的改动（§11.3）。`before` 为 `None` 是新文件。两边相同就没有 diff 可列。
+pub fn proposed(path: &Path, before: Option<&str>, after: &str) -> Option<String> {
+    let diff = match before {
+        Some(before) => diff::unified(before, after),
+        None => format!("（新建 {}）\n{}", path.display(), diff::unified("", after)),
+    };
+    if diff.is_empty() {
+        return Some("（内容与当前文件相同）".into());
+    }
+    Some(clip(diff))
+}
+
+/// 执行时注定失败的计划：那份 diff 不会发生，只说一句为什么。
+pub fn unrunnable(error: ToolError) -> String {
+    format!("（不列 diff：{error}——执行时会因此失败）")
+}
+
+fn clip(diff: String) -> String {
+    if diff.len() <= CHANGES_LIMIT {
+        return diff;
+    }
+    let mut cut = CHANGES_LIMIT;
+    while !diff.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let head = &diff[..cut];
+    let newline = if head.ends_with('\n') { "" } else { "\n" };
+    format!(
+        "{head}{newline}…（diff 已截断：共 {} 字节，只列前 {cut} 字节）\n",
+        diff.len()
+    )
 }
 
 /// 三种内容，三个结论（§8.6）。
@@ -503,6 +566,114 @@ mod tests {
             matches!(verdict, Verification::Unknown { .. }),
             "{verdict:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_new_file_lists_every_line_as_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = WriteTool::new();
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "path": "new.txt", "content": "one\ntwo\n" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let changes = tool.changes(&plan).await.expect("有改动");
+        assert!(changes.starts_with("（新建 "), "{changes}");
+        assert!(changes.contains("+ one\n+ two\n"), "{changes}");
+        assert!(!dir.path().join("new.txt").exists(), "列改动不落盘");
+    }
+
+    #[tokio::test]
+    async fn an_overwrite_lists_the_diff_against_the_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        let ctx = context(dir.path());
+        let tool = WriteTool::new();
+        let plan = tool
+            .prepare(
+                serde_json::json!({
+                    "path": "a.txt",
+                    "content": "new\n",
+                    "expected_version": ContentHash::of_str("old\n").as_str()
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let changes = tool.changes(&plan).await.expect("有改动");
+        assert!(changes.contains("- old\n+ new\n"), "{changes}");
+    }
+
+    #[tokio::test]
+    async fn a_stale_version_gets_a_note_instead_of_a_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        let ctx = context(dir.path());
+        let tool = WriteTool::new();
+        let plan = tool
+            .prepare(
+                serde_json::json!({
+                    "path": "a.txt",
+                    "content": "new\n",
+                    "expected_version": ContentHash::of_str("old\n").as_str()
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        // 计划之后有人改了它：执行时会因版本不符失败，这份 diff 不会发生。
+        std::fs::write(dir.path().join("a.txt"), "somebody else\n").unwrap();
+        let changes = tool.changes(&plan).await.expect("有一句说明");
+        assert!(changes.contains("版本冲突"), "{changes}");
+        assert!(!changes.contains("+ new"), "{changes}");
+        assert_eq!(changes.lines().count(), 1, "{changes}");
+    }
+
+    #[tokio::test]
+    async fn a_non_utf8_file_gets_a_note_instead_of_a_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = [0xff, 0xfe, 0x00];
+        std::fs::write(dir.path().join("a.bin"), bytes).unwrap();
+        let ctx = context(dir.path());
+        let tool = WriteTool::new();
+        let plan = tool
+            .prepare(
+                serde_json::json!({
+                    "path": "a.bin",
+                    "content": "text\n",
+                    "expected_version": ContentHash::of_bytes(&bytes).as_str()
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let changes = tool.changes(&plan).await.expect("有一句说明");
+        assert!(changes.contains("不是 UTF-8 文本"), "{changes}");
+        assert_eq!(changes.lines().count(), 1, "{changes}");
+    }
+
+    #[tokio::test]
+    async fn a_long_diff_is_clipped_at_the_source_with_a_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = WriteTool::new();
+        // 多字节字符：截断点落不到字符中间。
+        let content = "改动行\n".repeat(CHANGES_LIMIT);
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "path": "big.txt", "content": content }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let changes = tool.changes(&plan).await.expect("有改动");
+        assert!(changes.len() < CHANGES_LIMIT + 200, "{}", changes.len());
+        assert!(changes.contains("diff 已截断"), "{changes}");
+        assert!(changes.ends_with("字节）\n"), "{changes}");
     }
 
     #[test]

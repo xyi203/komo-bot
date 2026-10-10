@@ -276,6 +276,126 @@ async fn a_file_version_conflict_comes_back_to_the_model() {
     );
 }
 
+/// 要审批的 edit：审批记录的"改动"就是这次替换的 diff（§7.2、§11.3）。
+#[tokio::test]
+async fn an_edit_waiting_for_approval_carries_its_diff() {
+    let harness = Harness::new();
+    let executor = harness.conservative(vec![Arc::new(crate::tools::EditTool::new())]);
+    let (session, run) = harness.open_run().await;
+    std::fs::write(harness.dir.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+
+    let calls = harness
+        .record_round(
+            &run,
+            &[(
+                "edit",
+                serde_json::json!({ "path": "a.txt", "match_text": "beta", "replace_text": "BETA" }),
+            )],
+        )
+        .await;
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome.stop, Some(RoundStop::Approval { .. })),
+        "{:?}",
+        outcome.stop
+    );
+
+    let pending = harness
+        .approvals
+        .list_pending(Some(&session))
+        .await
+        .unwrap();
+    let changes = pending[0].changes.as_deref().expect("审批带着改动");
+    assert!(changes.contains("- beta\n+ BETA\n"), "{changes}");
+    assert_eq!(
+        std::fs::read_to_string(harness.dir.path().join("a.txt")).unwrap(),
+        "alpha\nbeta\n",
+        "批准之前不动文件"
+    );
+}
+
+/// 要审批的 write 新文件：改动是整份新增。
+#[tokio::test]
+async fn a_new_file_write_waiting_for_approval_carries_its_content() {
+    let harness = Harness::new();
+    let executor = harness.conservative(vec![Arc::new(WriteTool::new())]);
+    let (session, run) = harness.open_run().await;
+
+    let calls = harness
+        .record_round(
+            &run,
+            &[(
+                "write",
+                serde_json::json!({ "path": "new.txt", "content": "hello\n" }),
+            )],
+        )
+        .await;
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome.stop, Some(RoundStop::Approval { .. })),
+        "{:?}",
+        outcome.stop
+    );
+
+    let pending = harness
+        .approvals
+        .list_pending(Some(&session))
+        .await
+        .unwrap();
+    let changes = pending[0].changes.as_deref().expect("审批带着改动");
+    assert!(changes.starts_with("（新建 "), "{changes}");
+    assert!(changes.contains("+ hello\n"), "{changes}");
+    assert!(!harness.dir.path().join("new.txt").exists());
+}
+
+/// 不要审批的 edit 照旧直接执行，不落审批行。
+#[tokio::test]
+async fn an_allowed_edit_runs_without_an_approval_record() {
+    let harness = Harness::new();
+    let executor = harness.permissive(vec![Arc::new(crate::tools::EditTool::new())]);
+    let (session, run) = harness.open_run().await;
+    std::fs::write(harness.dir.path().join("a.txt"), "alpha\n").unwrap();
+
+    let calls = harness
+        .record_round(
+            &run,
+            &[(
+                "edit",
+                serde_json::json!({ "path": "a.txt", "match_text": "alpha", "replace_text": "ALPHA" }),
+            )],
+        )
+        .await;
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+    assert!(
+        !outcome.results[0].is_error,
+        "{}",
+        outcome.results[0].content
+    );
+    assert_eq!(
+        std::fs::read_to_string(harness.dir.path().join("a.txt")).unwrap(),
+        "ALPHA\n"
+    );
+    assert!(
+        harness
+            .approvals
+            .list_pending(Some(&session))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
 /// ⑥ 未知工具名无法调用——作为错误内容回给模型。
 #[tokio::test]
 async fn an_unknown_tool_name_cannot_be_called() {

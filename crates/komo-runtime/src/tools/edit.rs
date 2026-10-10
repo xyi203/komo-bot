@@ -25,7 +25,7 @@ use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutpu
 use serde::{Deserialize, Serialize};
 
 use super::fusion::{ThenRun, attach};
-use super::write::{atomic_replace, target_path, verify_content};
+use super::write::{atomic_replace, proposed, target_path, unrunnable, verify_content};
 use super::{ExpectedVersion, FileVersion, as_text, current, normalized, parse_args, plan_time};
 
 /// 模型给的参数。`result_version` 是 `prepare` 补上的，模型不填。
@@ -159,37 +159,9 @@ impl Tool for EditTool {
         let path: PathBuf = target_path(plan)?;
 
         let Some((bytes, version)) = current(&path)? else {
-            return Err(ToolError::Failed {
-                message: format!("{} 不存在，没有可修改的内容", path.display()),
-            });
+            return Err(missing(&path));
         };
-        // 版本核对：参数给了就按它，没给就按**计划里那一份**——`prepare` 从真实文件
-        // 算出来的 before-hash。`edit` 与 `write` 在这里不一样：write 覆盖一个已存在
-        // 的文件必须由模型明说预期版本（它写的是整份内容，没读过也能写），而 edit 的
-        // 前提就是它刚刚匹配到的那份内容，计划已经把它钉住了。
-        let expected = args
-            .expected_version
-            .as_ref()
-            .map(ExpectedVersion::hash)
-            .or_else(|| {
-                plan.targets
-                    .first()
-                    .and_then(|t| t.expected_version.clone())
-            });
-        match &expected {
-            Some(expected) if expected != &version.hash => {
-                return Err(ToolError::VersionConflict {
-                    path: format!("{}：预期 {expected}，当前 {}", path.display(), version.hash),
-                });
-            }
-            Some(_) => {}
-            // 计划是在文件还不存在时做的，现在它存在了：那是第三种状态。
-            None => {
-                return Err(ToolError::VersionConflict {
-                    path: format!("{} 在计划生成时并不存在，现在却有内容了", path.display()),
-                });
-            }
-        }
+        check_expected(&path, &version, expected(&args, plan).as_ref())?;
 
         let text = as_text(bytes, &path)?;
         let (after, replacements) = apply(&text, &args, &path)?;
@@ -232,6 +204,59 @@ impl Tool for EditTool {
             .first()
             .and_then(|target| target.expected_version.clone());
         verify_content(&path, &intended, before.as_ref())
+    }
+
+    /// 与 `execute` 同一套核对与替换，只是不落盘：执行时会失败的计划不给 diff。
+    async fn changes(&self, plan: &ExecutionPlan) -> Option<String> {
+        let args: EditArgs = parse_args(plan.args.clone(), "edit").ok()?;
+        let path = target_path(plan).ok()?;
+        let Some((bytes, version)) = current(&path).ok()? else {
+            return Some(unrunnable(missing(&path)));
+        };
+        if let Err(conflict) = check_expected(&path, &version, expected(&args, plan).as_ref()) {
+            return Some(unrunnable(conflict));
+        }
+        let before = as_text(bytes, &path).ok()?;
+        let (after, _) = apply(&before, &args, &path).ok()?;
+        proposed(&path, Some(&before), &after)
+    }
+}
+
+fn missing(path: &std::path::Path) -> ToolError {
+    ToolError::Failed {
+        message: format!("{} 不存在，没有可修改的内容", path.display()),
+    }
+}
+
+/// 版本核对按哪一份：参数给了就按它，没给就按**计划里那一份**——`prepare` 从真实文件
+/// 算出来的 before-hash。`edit` 与 `write` 在这里不一样：write 覆盖一个已存在的文件
+/// 必须由模型明说预期版本（它写的是整份内容，没读过也能写），而 edit 的前提就是它刚刚
+/// 匹配到的那份内容，计划已经把它钉住了。
+fn expected(args: &EditArgs, plan: &ExecutionPlan) -> Option<ContentHash> {
+    args.expected_version
+        .as_ref()
+        .map(ExpectedVersion::hash)
+        .or_else(|| {
+            plan.targets
+                .first()
+                .and_then(|t| t.expected_version.clone())
+        })
+}
+
+fn check_expected(
+    path: &std::path::Path,
+    on_disk: &FileVersion,
+    expected: Option<&ContentHash>,
+) -> Result<(), ToolError> {
+    match expected {
+        Some(expected) if expected != &on_disk.hash => Err(ToolError::VersionConflict {
+            path: format!("{}：预期 {expected}，当前 {}", path.display(), on_disk.hash),
+        }),
+        Some(_) => Ok(()),
+        // 计划是在文件还不存在时做的，现在它存在了：那是第三种状态。
+        None => Err(ToolError::VersionConflict {
+            path: format!("{} 在计划生成时并不存在，现在却有内容了", path.display()),
+        }),
     }
 }
 
@@ -464,6 +489,81 @@ mod tests {
             args.result_version,
             Some(ContentHash::of_str("ALPHA\n")),
             "result_version 由 prepare 从真实文件算出"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_changes_are_the_diff_this_edit_would_make() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let ctx = context(dir.path());
+        let tool = EditTool::new();
+        let plan = plan_for(
+            &tool,
+            &ctx,
+            serde_json::json!({ "path": "a.txt", "match_text": "beta", "replace_text": "BETA" }),
+        )
+        .await
+        .unwrap();
+        let changes = tool.changes(&plan).await.expect("有改动");
+        assert!(changes.contains("- beta"), "{changes}");
+        assert!(changes.contains("+ BETA"), "{changes}");
+        assert!(changes.contains("  alpha"), "{changes}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "alpha\nbeta\ngamma\n",
+            "列改动不落盘"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_changed_after_the_plan_gets_a_note_not_a_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        let ctx = context(dir.path());
+        let tool = EditTool::new();
+        let plan = plan_for(
+            &tool,
+            &ctx,
+            serde_json::json!({ "path": "a.txt", "match_text": "alpha", "replace_text": "ALPHA" }),
+        )
+        .await
+        .unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+        let changes = tool.changes(&plan).await.expect("有一句说明");
+        assert!(changes.contains("版本冲突"), "{changes}");
+        assert!(
+            !changes.contains("+ ALPHA"),
+            "不会被执行的 diff 不列：{changes}"
+        );
+        assert_eq!(changes.lines().count(), 1, "{changes}");
+    }
+
+    #[tokio::test]
+    async fn a_fused_edit_lists_only_the_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        let ctx = context(dir.path());
+        let tool = EditTool::new();
+        let plan = plan_for(
+            &tool,
+            &ctx,
+            serde_json::json!({
+                "path": "a.txt",
+                "match_text": "alpha",
+                "replace_text": "ALPHA",
+                "then_run": { "command": "cargo test" }
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(plan.then_run.is_some());
+        let changes = tool.changes(&plan).await.expect("有改动");
+        assert!(changes.contains("+ ALPHA"), "{changes}");
+        assert!(
+            !changes.contains("cargo test"),
+            "命令那一步界面另列：{changes}"
         );
     }
 

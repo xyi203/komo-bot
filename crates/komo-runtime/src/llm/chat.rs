@@ -565,7 +565,6 @@ mod tests {
                     call_id: ToolCallId::from_raw("tc"),
                     content: "content".into(),
                     is_error: false,
-                    decay: None,
                 }],
                 revised: Vec::new(),
             })
@@ -589,7 +588,6 @@ mod tests {
             call_id: ToolCallId::from_raw(format!("tc-{provider_call_id}")),
             content: content.into(),
             is_error: false,
-            decay: None,
         }
     }
 

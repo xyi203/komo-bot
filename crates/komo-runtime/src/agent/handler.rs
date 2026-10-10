@@ -933,7 +933,9 @@ mod tests {
                 let (session, run) = (session.clone(), run.clone());
                 async move {
                     // 每轮之后都问、每次都压。
-                    let planner = FakePlanner::new(vec![Some(compaction_job(&session, &run))]);
+                    let planner = FakePlanner::new(vec![Some(
+                        komo_kernel::compaction::Reshape::Compact(compaction_job(&session, &run)),
+                    )]);
                     Ok(Segment {
                         request: turn_request(&session, &run),
                         env,

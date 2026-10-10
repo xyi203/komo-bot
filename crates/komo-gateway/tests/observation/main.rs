@@ -410,19 +410,10 @@ async fn a_hot_reload_does_not_change_how_a_running_run_projects() {
     );
 }
 
-/// §8.3 的衰减：大结果完整给过两次之后，活着的 loop 在第三次请求前把它换成短视图；
-/// 同一个 Run 的下一段回放时，从日志数出同一个次数，直接给出**逐字节相同**的那份短视图。
-///
-/// 读一个大文件 → 两轮小调用 → 一条要审批的 `shell`（这一轮的请求里已经换过了）→ 批准，
-/// 第二段回放。
-#[tokio::test]
-async fn the_decayed_view_is_the_same_live_and_replayed() {
-    let home = Home::with_config(&config_toml(""));
-    let lines: String = (1..=5000).map(|n| format!("行 {n}\n")).collect();
-    std::fs::create_dir_all(home.workspace()).expect("工作目录");
-    std::fs::write(home.workspace().join("大文件.txt"), &lines).expect("写文件");
-    std::fs::write(home.workspace().join("小.txt"), "一行\n").expect("写文件");
-    let llm = FakeLlm::new(vec![vec![
+/// 读一个大文件 → 两轮小调用 → 一条要审批的 `shell`：前四次请求之后停在审批上。
+fn decay_script()
+-> Vec<Vec<Result<komo_kernel::types::turn::Round, komo_kernel::types::turn::LlmError>>> {
+    vec![vec![
         call_round(
             1,
             "pc-big",
@@ -438,7 +429,80 @@ async fn the_decayed_view_is_the_same_live_and_replayed() {
             serde_json::json!({ "command": "echo 收尾" }),
         ),
         text_round(5, "都做完了。"),
-    ]]);
+    ]]
+}
+
+fn home_with_big_and_small(config: &str) -> Home {
+    let home = Home::with_config(config);
+    let lines: String = (1..=5000).map(|n| format!("行 {n}\n")).collect();
+    std::fs::create_dir_all(home.workspace()).expect("工作目录");
+    std::fs::write(home.workspace().join("大文件.txt"), &lines).expect("写文件");
+    std::fs::write(home.workspace().join("小.txt"), "一行\n").expect("写文件");
+    home
+}
+
+/// 这个 Session 里记下的 `decayed` 决定。
+fn decayed_decisions(events: &[Event]) -> Vec<&komo_kernel::events::ContextCompacted> {
+    events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::ContextCompacted(
+                body @ komo_kernel::events::ContextCompacted::Decayed { .. },
+            ) => Some(body),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 第 `index` 次请求带给驱动的那批就地改写。
+fn revised_at(llm: &FakeLlm, index: usize) -> Vec<komo_kernel::types::turn::ToolResultForModel> {
+    match &llm.inputs.lock().expect("轮输入")[index] {
+        RoundInput::ToolResults { revised, .. } => revised.clone(),
+        RoundInput::First => Vec::new(),
+    }
+}
+
+/// 那条 `pc-big` 在第 `index` 次请求里的完整正文。
+fn big_fed(llm: &FakeLlm, index: usize) -> String {
+    match &llm.inputs.lock().expect("轮输入")[index] {
+        RoundInput::ToolResults { results, .. } => results
+            .iter()
+            .find(|result| result.provider_call_id == "pc-big")
+            .expect("read 的结果")
+            .content
+            .clone(),
+        RoundInput::First => panic!("第一次请求没有工具结果"),
+    }
+}
+
+fn replayed_big(llm: &FakeLlm) -> String {
+    llm.requests
+        .lock()
+        .expect("请求")
+        .last()
+        .expect("第二段的请求")
+        .messages
+        .iter()
+        .flat_map(|message| message.tool_results.iter())
+        .find(|result| result.provider_call_id == "pc-big")
+        .map(|result| result.content.clone())
+        .expect("第二段回放里有那条 read 结果")
+}
+
+/// §8.3 的衰减（缓存优先）：窗口压力让一批结果换成短视图，决定落成一条 `decayed`；活着的
+/// loop 在下一次请求里把整批交给驱动，同一个 Run 的下一段回放按记下的集合给出**逐字节
+/// 相同**的那份。
+///
+/// 窗口小到上下文一直贴着线，压缩关着：读一个大文件 → 两轮小调用（大结果已完整给过两次，
+/// 有资格了）→ 一条要审批的 `shell`（这一轮的请求里已经换过了）→ 批准，第二段回放。
+#[tokio::test]
+async fn the_decayed_view_is_the_same_live_and_replayed() {
+    let config = config_toml("").replace(
+        "model = \"gpt-test\"\n",
+        "model = \"gpt-test\"\ncontext_window = 2000\n",
+    );
+    let home = home_with_big_and_small(&config);
+    let llm = FakeLlm::new(decay_script());
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gateway.open_session().await;
     let run = gateway
@@ -453,31 +517,22 @@ async fn the_decayed_view_is_the_same_live_and_replayed() {
     let pending = gateway.wait_approval().await;
     assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
 
-    let inputs = llm.inputs.lock().expect("轮输入").clone();
-    assert_eq!(inputs.len(), 4, "停在审批上之前请求了四次：{inputs:?}");
-    let revised = |index: usize| match &inputs[index] {
-        RoundInput::ToolResults { revised, .. } => revised.clone(),
-        RoundInput::First => Vec::new(),
-    };
-    let RoundInput::ToolResults { results, .. } = &inputs[1] else {
-        panic!("第二次请求带着 read 的结果：{:?}", inputs[1]);
-    };
-    let full = results
-        .iter()
-        .find(|result| result.provider_call_id == "pc-big")
-        .expect("read 的结果")
-        .content
-        .clone();
+    assert_eq!(
+        llm.inputs.lock().expect("轮输入").len(),
+        4,
+        "停在审批上之前请求了四次"
+    );
+    let full = big_fed(&llm, 1);
     assert!(full.len() > 4096, "完整视图要超过默认阈值：{}", full.len());
     assert!(
-        revised(1).is_empty() && revised(2).is_empty(),
-        "前两次完整给"
+        revised_at(&llm, 1).is_empty() && revised_at(&llm, 2).is_empty(),
+        "有资格之前不换"
     );
-    let live = revised(3);
-    assert_eq!(live.len(), 1, "第三次请求前换掉：{:?}", inputs[3]);
+    let live = revised_at(&llm, 3);
+    assert_eq!(live.len(), 1, "第三轮收尾后一次换一批");
     assert_eq!(live[0].provider_call_id, "pc-big");
     let live = live[0].content.clone();
-    assert!(live.contains("这份结果已完整给过 2 次"), "{live}");
+    assert!(live.contains("这份结果前文已完整给过"), "{live}");
     assert!(
         live.contains("行 1\n") && live.contains("…（中间省略 "),
         "{live}"
@@ -489,23 +544,131 @@ async fn the_decayed_view_is_the_same_live_and_replayed() {
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
-    let replayed = llm
-        .requests
-        .lock()
-        .expect("请求")
-        .last()
-        .expect("第二段的请求")
-        .messages
-        .iter()
-        .flat_map(|message| message.tool_results.iter())
-        .find(|result| result.provider_call_id == "pc-big")
-        .cloned()
-        .expect("第二段回放里有那条 read 结果");
     assert_eq!(
-        replayed.content, live,
+        replayed_big(&llm),
+        live,
         "活着时换上的短视图与下一段回放给出的必须逐字节相同"
     );
-    assert!(replayed.decay.is_none(), "回放时已经过了完整期");
+    let events = home.events(&session);
+    let [
+        komo_kernel::events::ContextCompacted::Decayed {
+            calls, decision, ..
+        },
+    ] = decayed_decisions(&events).as_slice()
+    else {
+        panic!("日志里恰有一条 decayed：{:?}", decayed_decisions(&events));
+    };
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        decision.reason,
+        komo_kernel::compaction::CompactionReason::WindowProtection
+    );
+}
+
+/// 本次改动要修的回归：短任务里大结果从不被改写。多轮请求都带着大结果，没有计划边界、
+/// 没有窗口压力、缓存是热的——前缀只追加：日志里没有 `decayed`，驱动从没被要求改过前面
+/// 的消息，大结果每次都是完整正文；停在审批上、重启再批，回放给出的还是同一份完整正文。
+#[tokio::test]
+async fn a_short_task_never_rewrites_a_big_result() {
+    let home = home_with_big_and_small(&config_toml(""));
+    let llm = FakeLlm::new(decay_script());
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(
+            &session,
+            "obs-7",
+            "读一遍大文件，再看两眼小文件，最后跑一条命令",
+        )
+        .await
+        .run;
+    let pending = gateway.wait_approval().await;
+    assert_eq!(pending.run.as_ref(), Some(&run));
+
+    let count = llm.inputs.lock().expect("轮输入").len();
+    assert_eq!(count, 4);
+    let full = big_fed(&llm, 1);
+    assert!(
+        full.len() > 4096 && !full.contains("这份结果前文已完整给过"),
+        "{full}"
+    );
+    for index in 0..count {
+        assert!(
+            revised_at(&llm, index).is_empty(),
+            "第 {index} 次请求不改前缀"
+        );
+    }
+
+    gateway.stop().await;
+    let llm2 = FakeLlm::finisher("都做完了。");
+    let gateway = home.start(Arc::clone(&llm2) as Arc<dyn LlmClient>).await;
+    gateway.decide(&pending.approval, true).await;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    assert_eq!(replayed_big(&llm2), full, "回放仍是活着时给过的完整正文");
+    assert!(decayed_decisions(&home.events(&session)).is_empty());
+}
+
+/// 缓存冷了就换：上一次请求已经是很久以前（等审批等过了缓存存活时间），续跑这一段开头
+/// 记下一条 `decayed`（`cache_cold`、不欠债），第一次请求带的就是短视图——不用 `revised`。
+///
+/// 日志不能改写、也不能真等 5 分钟：重启时把判缓存冷没冷的那个"现在"拨快一点。
+#[tokio::test]
+async fn resuming_after_the_cache_went_cold_decays_at_the_segment_start() {
+    let home = home_with_big_and_small(&config_toml(""));
+    let llm = FakeLlm::new(decay_script());
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(
+            &session,
+            "obs-8",
+            "读一遍大文件，再看两眼小文件，最后跑一条命令",
+        )
+        .await
+        .run;
+    let pending = gateway.wait_approval().await;
+    let full = big_fed(&llm, 1);
+    gateway.stop().await;
+
+    komo_gateway::service::test_support::install_cache_clock_skew(
+        home.path(),
+        komo_kernel::compaction::PROMPT_CACHE_TTL + std::time::Duration::from_secs(60),
+    );
+
+    let llm2 = FakeLlm::finisher("都做完了。");
+    let gateway = home.start(Arc::clone(&llm2) as Arc<dyn LlmClient>).await;
+    gateway.decide(&pending.approval, true).await;
+
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let events = home.events(&session);
+    let [
+        komo_kernel::events::ContextCompacted::Decayed {
+            calls,
+            decision,
+            debt,
+        },
+    ] = decayed_decisions(&events).as_slice()
+    else {
+        panic!("日志里恰有一条 decayed：{:?}", decayed_decisions(&events));
+    };
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        decision.reason,
+        komo_kernel::compaction::CompactionReason::CacheCold
+    );
+    assert_eq!(debt.debt_tokens, 0.0, "缓存本来就要整段重写，改写不欠债");
+
+    let first = replayed_big(&llm2);
+    assert!(first.contains("这份结果前文已完整给过"), "{first}");
+    assert!(first.len() + 1024 <= full.len());
+    assert!(
+        revised_at(&llm2, 0).is_empty(),
+        "第一次请求就带短视图，不靠 revised"
+    );
 }
 
 /// `update_plan` 的计划只在日志里：两次更新（登记 → 完成一步）之后停在审批上，Gateway

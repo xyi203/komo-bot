@@ -15,6 +15,7 @@ use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RequestKey, SessionId};
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultStatus};
+use std::collections::BTreeSet;
 
 const BUDGET: ProjectionContext = ProjectionContext {
     model_result_bytes: 8 * 1024,
@@ -160,7 +161,7 @@ fn a_later_run_still_reads_what_the_earlier_one_said() {
     ];
     let surface = fold(&events);
     let resolved = resolve_inline(entries(&surface, ReplayScope::Conversation(&second)));
-    let messages = to_replay_messages(resolved, &BUDGET);
+    let messages = to_replay_messages(resolved, &BUDGET, &BTreeSet::new());
 
     let seen: Vec<(Role, Option<&str>)> = messages
         .iter()
@@ -183,9 +184,10 @@ fn a_later_run_still_reads_what_the_earlier_one_said() {
         assert!(message.tool_results.is_empty(), "{message:?}");
         assert!(message.provider_blocks.is_none(), "{message:?}");
     }
-    let (_, run_from) = super::replay_messages(
+    let (_, run_from, _) = super::replay_messages(
         resolve_inline(entries(&surface, ReplayScope::Conversation(&second))),
         &BUDGET,
+        &BTreeSet::new(),
     );
     assert_eq!(run_from, 2, "正跑的那条 Run 从它那句任务开始");
 }
@@ -208,7 +210,7 @@ fn the_running_run_keeps_its_whole_protocol() {
     ];
     let surface = fold(&events);
     let resolved = resolve_inline(entries(&surface, ReplayScope::Conversation(&run)));
-    let messages = to_replay_messages(resolved, &BUDGET);
+    let messages = to_replay_messages(resolved, &BUDGET, &BTreeSet::new());
 
     assert_eq!(messages.len(), 2);
     assert_eq!(messages[1].tool_calls.len(), 1);
@@ -241,10 +243,14 @@ fn a_subagent_and_its_parent_are_two_different_conversations() {
     let surface = fold(&events);
 
     let of = |scope| {
-        to_replay_messages(resolve_inline(entries(&surface, scope)), &BUDGET)
-            .into_iter()
-            .map(|message| message.text)
-            .collect::<Vec<_>>()
+        to_replay_messages(
+            resolve_inline(entries(&surface, scope)),
+            &BUDGET,
+            &BTreeSet::new(),
+        )
+        .into_iter()
+        .map(|message| message.text)
+        .collect::<Vec<_>>()
     };
 
     assert_eq!(
@@ -317,7 +323,7 @@ fn a_replayed_round_names_the_artifacts_it_produced() {
             }
         })
         .collect();
-    let messages = to_replay_messages(resolved, &BUDGET);
+    let messages = to_replay_messages(resolved, &BUDGET, &BTreeSet::new());
 
     let content = &messages
         .iter()
@@ -340,6 +346,7 @@ fn thread_texts(surface: &Surface, chain: &[RunId]) -> Vec<ReplayMessage> {
     to_replay_messages(
         resolve_inline(entries(surface, ReplayScope::Thread(chain))),
         &BUDGET,
+        &BTreeSet::new(),
     )
 }
 
@@ -502,8 +509,11 @@ const DECAYING: ProjectionContext = ProjectionContext {
 };
 
 /// 正在跑的 Run：一次 `read` 拿回 20 KB，之后又记了 `later` 条 `message.assistant`。
-/// 返回回放出来的那条结果。
-fn replayed_after(later: u64) -> ToolResultForModel {
+/// 返回回放出来的那条结果与衰减候选。
+fn replayed_after(
+    later: u64,
+    decayed: &BTreeSet<ToolCallId>,
+) -> (ToolResultForModel, Vec<DecayCandidate>) {
     let run = RunId::from_raw("run-1");
     let call = ToolCallId::from_raw("call-1");
     let mut events = vec![
@@ -556,50 +566,73 @@ fn replayed_after(later: u64) -> ToolResultForModel {
             }
         })
         .collect();
-    to_replay_messages(resolved, &DECAYING)
+    let (messages, _, candidates) = replay_messages(resolved, &DECAYING, decayed);
+    let result = messages
         .into_iter()
         .flat_map(|message| message.tool_results)
         .next()
-        .expect("回放里有那条结果")
+        .expect("回放里有那条结果");
+    (result, candidates)
 }
 
-/// 它之后已经有两次请求带着它完整发出去了（两条 `message.assistant`）：回放直接给短视图，
-/// 不再交给 loop 去换（§8.3）。
+fn recorded(call: &str) -> BTreeSet<ToolCallId> {
+    BTreeSet::from([ToolCallId::from_raw(call)])
+}
+
+/// 回放只按账本里记下的已衰减集合给短视图。
 #[test]
-fn a_result_two_rounds_old_replays_its_decayed_view() {
-    let full = replayed_after(0).content;
-    let result = replayed_after(2);
-    assert!(result.decay.is_none(), "{:?}", result.decay);
+fn a_call_in_the_decayed_set_replays_its_short_view() {
+    let (full, _) = replayed_after(2, &BTreeSet::new());
+    let (result, candidates) = replayed_after(2, &recorded("call-1"));
     assert!(
-        result.content.contains("这份结果已完整给过 2 次"),
+        result.content.contains("这份结果前文已完整给过"),
         "{}",
         result.content
     );
-    assert!(result.content.len() + 1024 <= full.len());
+    assert!(result.content.len() + 1024 <= full.content.len());
+    assert!(candidates.is_empty(), "已经换过的不再是候选");
     assert_eq!(
-        replayed_after(5).content,
+        replayed_after(5, &recorded("call-1")).0.content,
         result.content,
         "之后一直是同一份"
     );
 }
 
-/// 只完整给过一次：回放仍是完整视图，并告诉 loop 还剩一次、之后换成哪份。
+/// 不在集合里，给过多少次都还是完整视图：换不换是改写决策，不是到点就换。
 #[test]
-fn a_result_one_round_old_replays_whole_with_one_full_send_left() {
-    let fresh = replayed_after(0);
-    assert_eq!(
-        fresh.decay.as_ref().map(|decay| decay.remaining_full_sends),
-        Some(2)
+fn a_call_outside_the_decayed_set_replays_whole_however_often_it_was_sent() {
+    let (fresh, _) = replayed_after(0, &BTreeSet::new());
+    for later in [1, 2, 5] {
+        assert_eq!(
+            replayed_after(later, &BTreeSet::new()).0.content,
+            fresh.content,
+            "later = {later}"
+        );
+    }
+}
+
+/// 候选只含有资格（完整给够 `full_sends` 次）且没换过的结果；带着短视图正文与完整视图的
+/// token 估计。
+#[test]
+fn candidates_are_eligible_and_not_yet_decayed() {
+    assert!(replayed_after(0, &BTreeSet::new()).1.is_empty());
+    assert!(
+        replayed_after(1, &BTreeSet::new()).1.is_empty(),
+        "只给过一次"
     );
 
-    let result = replayed_after(1);
-    assert_eq!(result.content, fresh.content, "完整视图不随次数变");
-    let decay = result.decay.expect("还在完整期");
-    assert_eq!(decay.remaining_full_sends, 1);
+    let (full, candidates) = replayed_after(2, &BTreeSet::new());
+    let [candidate] = candidates.as_slice() else {
+        panic!("{candidates:?}");
+    };
+    assert_eq!(candidate.call_id.as_str(), "call-1");
+    assert_eq!(candidate.provider_call_id, full.provider_call_id);
+    assert_eq!(candidate.message, 2, "任务、助手调用、然后才是带结果的那条");
+    assert_eq!(candidate.full_tokens, estimate_tokens(&full.content));
     assert_eq!(
-        decay.view,
-        replayed_after(2).content,
-        "到点换成的就是回放会给的那份"
+        candidate.decayed,
+        replayed_after(2, &recorded("call-1")).0.content,
+        "换上去的就是回放会给的那份"
     );
 }
 
@@ -679,7 +712,7 @@ fn replay(events: &[Event], run: &RunId, projection: &ProjectionContext) -> Vec<
             entry,
         })
         .collect();
-    to_replay_messages(resolved, projection)
+    to_replay_messages(resolved, projection, &BTreeSet::new())
 }
 
 fn texts(messages: &[ReplayMessage]) -> Vec<(Role, Option<String>)> {
@@ -773,14 +806,14 @@ fn a_compacted_child_replays_its_own_task_then_summary_then_tail() {
     );
 }
 
-/// 留下来的大结果"给过几次"不随压缩变：它之后的 `message.assistant` 全在尾巴里。
+/// 留下来的大结果有没有资格衰减不随压缩变：它之后的 `message.assistant` 全在尾巴里。
 #[test]
-fn the_decay_count_on_the_kept_tail_is_unchanged() {
+fn decay_eligibility_on_the_kept_tail_is_unchanged() {
     let run = RunId::from_raw("run-1");
     let big: String = (0..400)
         .map(|n| format!("line {n:04}: {}\n", "x".repeat(40)))
         .collect();
-    let replay_big = |events: &[Event]| {
+    let eligible = |events: &[Event]| {
         let surface = fold(events);
         let resolved: Vec<ResolvedMessage<'_>> = entries(&surface, ReplayScope::Conversation(&run))
             .into_iter()
@@ -806,11 +839,11 @@ fn the_decay_count_on_the_kept_tail_is_unchanged() {
                 }
             })
             .collect();
-        to_replay_messages(resolved, &DECAYING)
-            .into_iter()
-            .flat_map(|message| message.tool_results)
-            .find(|result| result.provider_call_id == "pc-c3")
-            .expect("c3 的结果在尾巴里")
+        replay_messages(resolved, &DECAYING, &BTreeSet::new())
+            .2
+            .iter()
+            .map(|candidate| candidate.provider_call_id.clone())
+            .collect::<Vec<_>>()
     };
 
     for later in 0..4u64 {
@@ -829,10 +862,7 @@ fn the_decay_count_on_the_kept_tail_is_unchanged() {
                     .all(|call| call.provider_call_id != "pc-c1")),
             "压缩真的生效了"
         );
-        assert_eq!(
-            replay_big(&compacted),
-            replay_big(&plain),
-            "later = {later}"
-        );
+        assert_eq!(eligible(&compacted), eligible(&plain), "later = {later}");
+        assert_eq!(eligible(&plain).is_empty(), later < 2, "later = {later}");
     }
 }

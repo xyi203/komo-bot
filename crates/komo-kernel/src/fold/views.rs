@@ -3,6 +3,8 @@
 //! 它们是 [`super::fold`] 的**输出形状**，和折叠本身分开——加一个字段不用读折叠的
 //! 状态机，改折叠也不用翻一百行结构体定义。
 
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::types::ids::{ApprovalId, AttemptId, EventId, RunId, Seq, ShortId, ToolCallId};
@@ -105,6 +107,9 @@ pub struct RunView {
     /// 那一侧判（它知道这条 Run 的消息长什么样）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<CompactionView>,
+    /// 已换成短视图的结果（`context.compacted` 的 `decayed`，累积）。回放按它选视图。
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub decayed: BTreeSet<ToolCallId>,
     pub first_seq: Seq,
     pub last_seq: Seq,
 }

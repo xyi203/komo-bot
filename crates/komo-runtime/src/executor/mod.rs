@@ -46,7 +46,7 @@ use komo_kernel::compaction::{PlanUpdate, analyze_transition, format_snapshot, o
 use komo_kernel::events::Event;
 use komo_kernel::fold::fold;
 use komo_kernel::policy::PolicyDecision;
-use komo_kernel::projection::{ProjectionContext, ToolResultFacts, at_send, project_views};
+use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project_views, select};
 use komo_kernel::traits::{
     Clock, Ledger, LedgerError, OutputWriter, RepoError, SpawnError, StoreError, TaskSpawner, Tool,
     ToolOutputStore,
@@ -1893,7 +1893,7 @@ struct Recorded {
 }
 
 /// 交给模型的那一份：**每条结果都从这里过**，与回放（`komo-agent` 的
-/// `to_replay_messages`）调同一个 [`project_views`] / [`at_send`]、喂同样的事实，所以刚跑完与重启之后回放
+/// `to_replay_messages`）调同一个 [`project_views`] / [`select`]、喂同样的事实，所以刚跑完与重启之后回放
 /// 逐字节相同（§8.3）。工具名取 `request.tool`——它就是落盘的那条 `tool_calls[].name`。
 fn for_model(request: &CallRequest, env: &CallEnv, recorded: &Recorded) -> ToolResultForModel {
     let published = &recorded.published;
@@ -1907,14 +1907,13 @@ fn for_model(request: &CallRequest, env: &CallEnv, recorded: &Recorded) -> ToolR
         stderr: published.stderr.as_ref(),
         artifacts: &recorded.artifacts,
     };
-    // 刚跑完：完整给过 0 次。还要换视图的那条带着 `decay`，由 agent loop 按次数去换。
-    let (content, decay) = at_send(project_views(&facts, &env.projection), 0, &env.projection);
+    // 刚跑完的结果从不处于已衰减状态；之后要不要换短视图是 planner 对前缀的改写决策。
+    let content = select(project_views(&facts, &env.projection), false);
     ToolResultForModel {
         provider_call_id: request.provider_call_id.clone(),
         call_id: request.call.clone(),
         content,
         is_error: published.status != ToolResultStatus::Completed,
-        decay,
     }
 }
 

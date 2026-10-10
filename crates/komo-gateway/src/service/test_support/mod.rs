@@ -329,3 +329,52 @@ pub(crate) fn wrap_ledger(
         None => ledger,
     }
 }
+
+// ---------------------------------------------------------------- 缓存时钟注入口
+//
+// 提示缓存冷没冷（`compaction::cache_cold`）按"现在"与上一次请求的时间差算，而
+// 缓存存活时间是五分钟：集成测试不能真等。同故障注入口一个办法——按数据目录索引的一张
+// 表，只拨**这一处判断**用的时钟（租约、审批等别处的"现在"不动）。表是空的时候什么都
+// 不发生。
+
+type SkewTable = std::sync::Mutex<Vec<(std::path::PathBuf, std::time::Duration)>>;
+
+fn skews() -> &'static SkewTable {
+    static TABLE: std::sync::OnceLock<SkewTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// 下一次在 `home` 起 Gateway 时，判缓存冷没冷的"现在"往后拨 `skew`。
+pub fn install_cache_clock_skew(home: &std::path::Path, skew: std::time::Duration) {
+    let mut table = skews().lock().expect("缓存时钟注入表");
+    table.retain(|(path, _)| path != home);
+    table.push((home.to_path_buf(), skew));
+}
+
+struct SkewedClock {
+    inner: std::sync::Arc<dyn komo_kernel::traits::Clock>,
+    skew: std::time::Duration,
+}
+
+impl komo_kernel::traits::Clock for SkewedClock {
+    fn now(&self) -> time::OffsetDateTime {
+        self.inner.now() + self.skew
+    }
+}
+
+/// 装配时的那一次查表。**没装过就原样返回**。
+pub(crate) fn cache_clock(
+    home: &std::path::Path,
+    clock: std::sync::Arc<dyn komo_kernel::traits::Clock>,
+) -> std::sync::Arc<dyn komo_kernel::traits::Clock> {
+    let skew = skews()
+        .lock()
+        .expect("缓存时钟注入表")
+        .iter()
+        .find(|(path, _)| path == home)
+        .map(|(_, skew)| *skew);
+    match skew {
+        Some(skew) => std::sync::Arc::new(SkewedClock { inner: clock, skew }),
+        None => clock,
+    }
+}

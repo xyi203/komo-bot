@@ -1,15 +1,18 @@
-//! 在线压缩在 Gateway 这一侧（§6）：把决策要的事实读齐，交给 `komo_agent` 的纯函数。
+//! 改写提示前缀在 Gateway 这一侧（§6）：把决策要的事实读齐，交给 `komo_agent` 的纯函数。
+//! 压成摘要与把大结果换成短视图（衰减）共用这个决策点、同一本缓存账。
 //!
 //! 两个入口，同一套事实、同一个判断：
 //!
-//! - **装配时**（`GatewaySegments::segment`）：这一段开头就在计划边界上、或者已经贴着
-//!   窗口——决定压就把摘要请求放进 `Segment.compaction`，loop 先压再跑；
+//! - **装配时**（`GatewaySegments::segment`）：这一段开头就在计划边界上、贴着窗口、或者
+//!   缓存已经冷了——决定压就把摘要请求放进 `Segment.compaction`，loop 先压再跑；决定衰减
+//!   就先落账、再重新装配（回放读到新的已衰减集合）；
 //! - **一轮收尾之后**（[`GatewayPlanner`]，loop 经 `CompactionPlanner` 来问）：重新读一遍
 //!   日志、按同一份模板装配出 provider 正看着的那份视图，再判一次。
 //!
 //! 配置每次判断时读当前快照，不随 Run 冻结：决策连同全部中间量记进 `context.compacted`，
 //! 回放只认那条事件，不会因为配置改了而换一种读法。
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,13 +21,15 @@ use komo_agent::context::compaction::{CompactionSettings, Plan, PlanInput, plan}
 use komo_agent::context::history::{self, ReplayScope, ResolvedMessage};
 use komo_agent::context::{AgentContext, ContextInput, InvocationContext, assemble};
 use komo_agent::skills::SkillCatalog;
-use komo_kernel::compaction::{CompactionDecision, CompactionJob, OnlineState, online_state};
-use komo_kernel::events::{ContextCompacted, Event};
+use komo_kernel::compaction::{
+    CompactionDecision, OnlineState, PROMPT_CACHE_TTL, Reshape, online_state,
+};
+use komo_kernel::events::{ContextCompacted, Event, EventPayload};
 use komo_kernel::fold::fold;
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::protocol::config::CompactionConfig;
-use komo_kernel::traits::{Ledger, LedgerError, ToolOutputStore};
-use komo_kernel::types::ids::{RunId, Seq, SessionId};
+use komo_kernel::traits::{Clock, Ledger, LedgerError, ToolOutputStore};
+use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::tool::ToolDefinition;
 use komo_runtime::agent::CompactionPlanner;
@@ -48,12 +53,17 @@ pub(crate) struct ContextTemplate {
 }
 
 impl ContextTemplate {
-    pub fn assemble(self, history: Vec<ResolvedMessage<'_>>) -> AgentContext {
+    pub fn assemble(
+        self,
+        history: Vec<ResolvedMessage<'_>>,
+        decayed: BTreeSet<ToolCallId>,
+    ) -> AgentContext {
         assemble(ContextInput {
             instructions: self.instructions,
             workspace: self.workspace,
             tools: self.tools,
             history,
+            decayed,
             memory: self.memory,
             skills: self.skills,
             invocation: self.invocation,
@@ -62,11 +72,45 @@ impl ContextTemplate {
     }
 }
 
-/// 当前配置里开着的 `[compaction]`；关着（或没接配置）是 `None`。
-pub(crate) fn enabled(config: Option<&Arc<ConfigHolder>>) -> Option<CompactionConfig> {
-    config
-        .map(|config| config.current().compaction.clone())
-        .filter(|compaction| compaction.enabled)
+/// 当前配置里的 `[compaction]`（没接配置是 `None`）。衰减不受 `enabled` 管，所以关着的
+/// 也要给：`enabled` 只决定要不要压成摘要。
+pub(crate) fn current(config: Option<&Arc<ConfigHolder>>) -> Option<CompactionConfig> {
+    config.map(|config| config.current().compaction.clone())
+}
+
+/// 这个 Session 的提示缓存是不是已经冷了：最后一条 `message.assistant`（上一次请求的
+/// 完成）离 `now` 超过 [`PROMPT_CACHE_TTL`]。没请求过不算冷——还没有缓存可以失效。
+pub(crate) fn cache_cold(events: &[Event], now: time::OffsetDateTime) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.payload, EventPayload::MessageAssistant(_)))
+        .is_some_and(|event| now - event.ts > PROMPT_CACHE_TTL)
+}
+
+/// 按日志装配这条 Run 此刻的上下文：回放按它自己记下的已衰减集合选视图。
+pub(crate) async fn assemble_context(
+    events: &[Event],
+    run: &RunId,
+    thread: Option<&[RunId]>,
+    template: ContextTemplate,
+    payloads: &PayloadStore,
+    outputs: Option<&dyn ToolOutputStore>,
+) -> Result<AgentContext, LedgerError> {
+    let surface = fold(events);
+    let scope = match thread {
+        Some(chain) => ReplayScope::Thread(chain),
+        None => ReplayScope::Conversation(run),
+    };
+    let resolved =
+        context_sources::resolve_history(history::entries(&surface, scope), payloads, outputs)
+            .await?;
+    let decayed = surface
+        .runs
+        .get(run)
+        .map(|view| view.decayed.clone())
+        .unwrap_or_default();
+    Ok(template.assemble(resolved, decayed))
 }
 
 /// 一次判断的事实。
@@ -78,11 +122,16 @@ pub(crate) struct Facts<'a> {
     pub model: &'a ModelConfig,
     pub session: &'a SessionId,
     pub run: &'a RunId,
+    pub cache_cold: bool,
+    /// 上一轮的调用都收尾了。没收尾时不能压（切点会把一轮的调用与结果分开），边界也先
+    /// 不用掉；换短视图只动已完成结果的正文，照常算。
+    pub settled: bool,
 }
 
-/// 判一次：要压就给出摘要请求；边界上不压就记一条 `skipped` 把边界用掉。记不下去只
-/// 留日志——压缩是省钱的手段，账本写不进去的问题会在下一次真正的写入上暴露。
-pub(crate) async fn decide(ledger: &dyn Ledger, facts: Facts<'_>) -> Option<CompactionJob> {
+/// 判一次：要改写前缀就给出整批（摘要请求，或要换短视图的那批结果）；边界上不压就记一条
+/// `skipped` 把边界用掉。记不下去只留日志——改写是省钱的手段，账本写不进去的问题会在
+/// 下一次真正的写入上暴露。
+pub(crate) async fn decide(ledger: &dyn Ledger, facts: Facts<'_>) -> Option<Reshape> {
     let settings = CompactionSettings::from(facts.config);
     let outcome = plan(PlanInput {
         context: facts.context,
@@ -92,14 +141,17 @@ pub(crate) async fn decide(ledger: &dyn Ledger, facts: Facts<'_>) -> Option<Comp
         model: facts.model,
         session: facts.session,
         run: facts.run,
+        cache_cold: facts.cache_cold,
+        compaction_enabled: facts.config.enabled,
     });
     match outcome {
-        Plan::Compact(job) => Some(job),
-        Plan::Skip { reason, decision } => {
+        Plan::Compact(job) if facts.settled => Some(Reshape::Compact(job)),
+        Plan::Decay(job) => Some(Reshape::Decay(job)),
+        Plan::Skip { reason, decision } if facts.settled => {
             skip(ledger, facts.run, reason, decision).await;
             None
         }
-        Plan::Nothing => None,
+        Plan::Compact(_) | Plan::Skip { .. } | Plan::Nothing => None,
     }
 }
 
@@ -149,30 +201,28 @@ pub(crate) struct GatewayPlanner {
     pub template: ContextTemplate,
     pub tools: Vec<ToolDefinition>,
     pub model: ModelConfig,
+    pub clock: Arc<dyn Clock>,
 }
 
 impl GatewayPlanner {
     async fn context(&self, events: &[Event]) -> Result<AgentContext, LedgerError> {
-        let surface = fold(events);
-        let scope = match &self.thread {
-            Some(chain) => ReplayScope::Thread(chain),
-            None => ReplayScope::Conversation(&self.run),
-        };
         let payloads = PayloadStore::new(self.routed.ledgers().paths_for(&self.session));
-        let resolved = context_sources::resolve_history(
-            history::entries(&surface, scope),
+        assemble_context(
+            events,
+            &self.run,
+            self.thread.as_deref(),
+            self.template.clone(),
             &payloads,
             self.outputs.as_deref(),
         )
-        .await?;
-        Ok(self.template.clone().assemble(resolved))
+        .await
     }
 }
 
 #[async_trait]
 impl CompactionPlanner for GatewayPlanner {
-    async fn plan(&self) -> Option<CompactionJob> {
-        let config = enabled(self.config.as_ref())?;
+    async fn plan(&self) -> Option<Reshape> {
+        let config = current(self.config.as_ref())?;
         let events = match read_events(self.routed.as_ref(), &self.session).await {
             Ok(events) => events,
             Err(error) => {
@@ -198,6 +248,8 @@ impl CompactionPlanner for GatewayPlanner {
                 model: &self.model,
                 session: &self.session,
                 run: &self.run,
+                cache_cold: cache_cold(&events, self.clock.now()),
+                settled: true,
             },
         )
         .await

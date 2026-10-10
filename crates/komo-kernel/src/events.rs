@@ -525,6 +525,15 @@ pub enum ContextCompacted {
         #[serde(default)]
         usage: TokenUsage,
     },
+    /// 一批大结果换成了短视图（§8.3）。和压缩一样是对上下文前缀的一次改写，所以同一个
+    /// 事件、同一本缓存账：缓存已冷、贴着窗口、或计划边界上账算得过来时才换，**一次换一批**
+    /// ——逐条到期逐条换，每一条都让它之后的缓存前缀失效一次。fold 把 `calls` 累进这条
+    /// Run 的已衰减集合，回放按集合选视图。
+    Decayed {
+        calls: Vec<ToolCallId>,
+        decision: CompactionDecision,
+        debt: CompactionDebt,
+    },
     /// 这个边界上没压（账算不过来、切不出、摘要请求失败……）。上下文原样还在。
     Skipped {
         reason: String,

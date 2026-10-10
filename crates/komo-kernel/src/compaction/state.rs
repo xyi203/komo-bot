@@ -127,6 +127,16 @@ impl OnlineState {
         self.compaction_refused = false;
     }
 
+    /// 一批结果换成了短视图：欠下的缓存债与压缩记在同一本账上，冷却也从这里算——两次
+    /// 改写挨着做，第二次又让刚写好的缓存失效。
+    pub fn record_decay(&mut self, debt: CompactionDebt) {
+        self.last_compaction_request_count = Some(self.request_count);
+        self.last_context_tokens = None;
+        self.cache_debt_tokens += debt.debt_tokens.max(0.0);
+        self.cache_debt_repayment_tokens += debt.repayment_tokens;
+        self.pending_boundary = false;
+    }
+
     /// 在边界上决定了不压（或者压不成）。上下文原样还在，只是这个边界用掉了。
     /// `refused` = 决定了压、摘要请求却没成。
     pub fn record_skipped(&mut self, refused: bool) {
@@ -245,6 +255,9 @@ impl OnlineFold {
             }
             EventPayload::ContextCompacted(ContextCompacted::Compacted { debt, .. }) => {
                 self.state.record_compaction(*debt);
+            }
+            EventPayload::ContextCompacted(ContextCompacted::Decayed { debt, .. }) => {
+                self.state.record_decay(*debt);
             }
             EventPayload::ContextCompacted(ContextCompacted::Skipped { decision, .. }) => {
                 self.state

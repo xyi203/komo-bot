@@ -71,6 +71,6 @@ pub use tool::{
 };
 pub use turn::{
     AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse, GrantUses, LlmError, MemoryUse,
-    PendingDecay, PlannedCall, ProviderToolCall, ReplayMessage, Role, Round, RoundInput, SeqRange,
+    PlannedCall, ProviderToolCall, ReplayMessage, Role, Round, RoundInput, SeqRange,
     ToolCallRequest, ToolResultForModel, TurnRequest,
 };

@@ -9,19 +9,18 @@
 //!
 //! - **full**：头尾各留一段整行、中间写明省了多少；正文不够大时就是全部。还有更多时给出
 //!   **可直接 `read` 的完整输出引用**（`artifact://<run>/<call>/<attempt>/…`，§4.7）。
-//! - **decayed**：大结果完整给过几次之后换成的稳定短视图——抬头 + 首尾整行 + 那条引用。
+//! - **decayed**：大结果换下来的稳定短视图——抬头 + 首尾整行 + 那条引用。
 //!   省略不等于丢失：完整事实始终在 `output.json` / `stdout.txt` 里。
 //!
-//! 某一次请求用哪个视图**不在这里判**：由 [`view_after`] 按"已经完整给过几次"选，那个
-//! 次数从事件日志里数出来（这条 Run 在这条结果之后记了几条 `message.assistant`），所以
-//! 同样可以回放。刚跑完与回放都经 [`at_send`] 落到同一个选择上。
+//! 某一次请求用哪个视图**不在这里判**：换不换是改写提示前缀，按缓存账决定、记成
+//! `context.compacted` 的 `decayed`（§8.3）；这里只回答"有没有资格换"（[`decay_eligible`]）
+//! 与"按那个决定给哪份正文"（[`select`]）。
 
 use serde::{Deserialize, Serialize};
 
 use crate::types::ids::{AttemptId, RunId, ToolCallId};
 use crate::types::refs::{ContentRef, OutputRef, ToolResultStatus};
 use crate::types::resource::{OutputFile, ResourceUri};
-use crate::types::turn::PendingDecay;
 
 /// 投影用的全部事实。
 ///
@@ -60,7 +59,7 @@ pub struct ProjectionContext {
 pub struct DecayPolicy {
     /// full 视图超过这么多字节才有 decayed 视图。
     pub threshold_bytes: usize,
-    /// 完整给过几次之后换成 decayed。
+    /// 完整给过几次之后才有资格换成 decayed；真换不换由缓存账决定（§8.3）。
     pub full_sends: u32,
     /// decayed 视图开头最多留多少字节的整行。
     pub head_bytes: usize,
@@ -85,43 +84,21 @@ pub struct Projected {
     pub decayed: Option<String>,
 }
 
-/// 一次请求该用哪个视图。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum View {
-    Full,
-    Decayed,
+/// 已经完整给过 `sends_so_far` 次的这条结果，有没有资格换成短视图：有 decayed 视图、
+/// 且完整给够了次数。次数 = 这条 Run 在它之后记了几条 `message.assistant`。
+pub fn decay_eligible(projected: &Projected, sends_so_far: u32, ctx: &ProjectionContext) -> bool {
+    projected.decayed.is_some()
+        && ctx
+            .decay
+            .is_some_and(|policy| sends_so_far >= policy.full_sends)
 }
 
-/// 已经完整给过 `sends_so_far` 次之后，下一次用哪个视图。
-pub fn view_after(sends_so_far: u32, full_sends: u32) -> View {
-    if sends_so_far < full_sends {
-        View::Full
-    } else {
-        View::Decayed
-    }
-}
-
-/// 已经完整给过 `sends_so_far` 次的一条结果，这一次给哪份正文；还在完整期时一并给出
-/// 还剩几次、之后换成什么（[`PendingDecay`]）。
-///
-/// 刚跑完（0 次）与回放（从日志里数出来的次数）都从这里过，所以两边选的是同一个视图。
-pub fn at_send(
-    projected: Projected,
-    sends_so_far: u32,
-    ctx: &ProjectionContext,
-) -> (String, Option<PendingDecay>) {
-    let (Some(view), Some(policy)) = (projected.decayed, ctx.decay) else {
-        return (projected.full, None);
-    };
-    match view_after(sends_so_far, policy.full_sends) {
-        View::Decayed => (view, None),
-        View::Full => (
-            projected.full,
-            Some(PendingDecay {
-                remaining_full_sends: policy.full_sends - sends_so_far,
-                view,
-            }),
-        ),
+/// 按已经记下的决定给正文：换过的给 decayed（没有 decayed 视图时仍是 full）。刚跑完与
+/// 回放都从这里过，所以两边给出同一份字节。
+pub fn select(projected: Projected, decayed: bool) -> String {
+    match projected.decayed {
+        Some(view) if decayed => view,
+        _ => projected.full,
     }
 }
 
@@ -162,8 +139,7 @@ fn decay(facts: &ToolResultFacts<'_>, policy: &DecayPolicy) -> String {
     let mut out = header(facts);
     let text = facts.text.unwrap_or_default();
     out.push_str(&format!(
-        "（这份结果已完整给过 {} 次，此后只留首尾整行：原文 {} 字节 / {} 行）\n",
-        policy.full_sends,
+        "（这份结果前文已完整给过，此后只留首尾整行：原文 {} 字节 / {} 行）\n",
         text.len(),
         text.lines().count()
     ));
@@ -750,7 +726,7 @@ mod tests {
         assert!(!views.full.contains("完整输出："), "{}", views.full);
         let decayed = views.decayed.expect("20 KB 的结果要有 decayed 视图");
         assert!(
-            decayed.starts_with("[shell · 完成 · 1.2s]\n（这份结果已完整给过 2 次"),
+            decayed.starts_with("[shell · 完成 · 1.2s]\n（这份结果前文已完整给过，"),
             "{decayed}"
         );
         assert!(
@@ -807,35 +783,27 @@ mod tests {
     }
 
     #[test]
-    fn the_view_turns_after_the_full_sends() {
-        assert_eq!(view_after(0, 2), View::Full);
-        assert_eq!(view_after(1, 2), View::Full);
-        assert_eq!(view_after(2, 2), View::Decayed);
-        assert_eq!(view_after(7, 2), View::Decayed);
+    fn a_result_is_eligible_only_after_its_full_sends() {
+        let ctx = decaying(64 * 1024);
+        let views = project_views(&facts(Some(&lines(400)), None), &ctx);
+        assert!(!decay_eligible(&views, 0, &ctx));
+        assert!(!decay_eligible(&views, 1, &ctx));
+        assert!(decay_eligible(&views, 2, &ctx));
+
+        // 没有 decayed 视图就永远没资格。
+        let small = project_views(&facts(Some(&lines(60)), None), &ctx);
+        assert!(!decay_eligible(&small, 5, &ctx));
     }
 
     #[test]
-    fn a_send_carries_the_full_view_and_how_many_full_sends_remain() {
+    fn select_follows_the_recorded_decision() {
         let ctx = decaying(64 * 1024);
         let views = project_views(&facts(Some(&lines(400)), None), &ctx);
         let decayed = views.decayed.clone().expect("要有 decayed 视图");
+        assert_eq!(select(views.clone(), false), views.full);
+        assert_eq!(select(views.clone(), true), decayed);
 
-        let (content, pending) = at_send(views.clone(), 0, &ctx);
-        assert_eq!(content, views.full);
-        assert_eq!(
-            pending,
-            Some(PendingDecay {
-                remaining_full_sends: 2,
-                view: decayed.clone(),
-            })
-        );
-        let (content, pending) = at_send(views.clone(), 1, &ctx);
-        assert_eq!(content, views.full);
-        assert_eq!(pending.map(|p| p.remaining_full_sends), Some(1));
-        assert_eq!(at_send(views.clone(), 2, &ctx), (decayed, None));
-
-        // 没有 decayed 视图就一直是 full，也没有要换的。
         let small = project_views(&facts(Some(&lines(60)), None), &ctx);
-        assert_eq!(at_send(small.clone(), 5, &ctx), (small.full, None));
+        assert_eq!(select(small.clone(), true), small.full);
     }
 }

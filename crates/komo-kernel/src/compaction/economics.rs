@@ -48,6 +48,8 @@ pub enum CompactionReason {
     Economic,
     /// 离窗口太近：不看账。
     WindowProtection,
+    /// 提示缓存已经过期：前缀反正要重写，改写不欠债。
+    CacheCold,
     /// 账算不过来。
     DeferredEconomic,
     /// 不是第一次：回本请求数乘上 margin 之后超过了剩余请求。
@@ -165,6 +167,8 @@ pub struct CompactionInput {
     pub cache_debt_repayment_tokens: u64,
     /// 缓存写与缓存读的价格比；不知道是 `None`。
     pub cache_write_read_ratio: Option<f64>,
+    /// 上次请求写下的提示缓存已经过期：这次请求无论改不改都要整段重写。
+    pub cache_cold: bool,
 }
 
 /// 一次决策的全部算式中间量与结论。它会落进事件，事后能逐项核对。
@@ -238,9 +242,14 @@ pub fn decide(input: &CompactionInput, economics: &CompactionEconomics) -> Compa
 
     let saving_tokens = input.archive_tokens as f64 - input.memo_tokens as f64;
     let post_compaction_tokens = (input.write_tokens as f64 - saving_tokens).max(0.0);
-    let incremental_cache_cost_ratio = input
-        .cache_write_read_ratio
-        .map(|ratio| (ratio - 1.0).max(0.0));
+    // 缓存已冷时改写不比不改多写一个 token。
+    let incremental_cache_cost_ratio = if input.cache_cold {
+        Some(0.0)
+    } else {
+        input
+            .cache_write_read_ratio
+            .map(|ratio| (ratio - 1.0).max(0.0))
+    };
     let new_debt_tokens = post_compaction_tokens * incremental_cache_cost_ratio.unwrap_or(0.0);
     let breakeven_requests = (saving_tokens > 0.0 && incremental_cache_cost_ratio.is_some())
         .then(|| new_debt_tokens / saving_tokens);
@@ -290,10 +299,13 @@ pub fn decide(input: &CompactionInput, economics: &CompactionEconomics) -> Compa
         .requests_since_last_compaction
         .is_some_and(|since| since < economics.minimum_requests_since_compaction);
     // 窗口保护是绝对的：贴着窗口时冷却期里也压。
-    let compact = compressible && (window_protection || (economic && !cooldown_active));
+    let compact =
+        compressible && (input.cache_cold || window_protection || (economic && !cooldown_active));
 
     let reason = if !compressible {
         CompactionReason::NonPositiveSaving
+    } else if input.cache_cold {
+        CompactionReason::CacheCold
     } else if window_protection {
         CompactionReason::WindowProtection
     } else if economic && cooldown_active {
@@ -435,6 +447,7 @@ mod tests {
             carried_debt_tokens: 0.0,
             cache_debt_repayment_tokens: 0,
             cache_write_read_ratio: Some(1.25),
+            cache_cold: false,
         }
     }
 
@@ -454,6 +467,7 @@ mod tests {
             carried_debt_tokens: 0.0,
             cache_debt_repayment_tokens: 0,
             cache_write_read_ratio: Some(1.25),
+            cache_cold: false,
         }
     }
 

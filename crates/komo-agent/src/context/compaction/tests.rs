@@ -1,4 +1,5 @@
 use super::*;
+use crate::context::DecayCandidate;
 use komo_kernel::compaction::{CompactionDebt, PlanStatus};
 use komo_kernel::test_support::sample_model;
 use komo_kernel::types::ids::ToolCallId;
@@ -37,7 +38,6 @@ fn result(seq: u64, id: &str, content: &str) -> ReplayMessage {
             call_id: ToolCallId::from_raw(id),
             content: content.into(),
             is_error: false,
-            decay: None,
         }],
         ..message(Role::Tool, seq, None)
     }
@@ -68,7 +68,24 @@ fn context() -> AgentContext {
             result(16, "c3", "<komo-plan/>"),
         ],
         run_from: 2,
+        decay_candidates: Vec::new(),
     }
+}
+
+const SHORT_VIEW: &str =
+    "[read · 完成]（前文已完整给过，只留首尾）\n完整输出：artifact://run-1/c1/a1/result";
+
+/// 那条大结果（`messages[4]`）有资格衰减。
+fn context_with_candidate() -> AgentContext {
+    let mut context = context();
+    context.decay_candidates = vec![DecayCandidate {
+        call_id: ToolCallId::from_raw("c1"),
+        provider_call_id: "p-c1".into(),
+        message: 4,
+        full_tokens: message_tokens(&context.messages[4]),
+        decayed: SHORT_VIEW.into(),
+    }];
+    context
 }
 
 fn tools() -> Vec<ToolDefinition> {
@@ -225,21 +242,55 @@ fn settings(ratio: f64) -> CompactionSettings {
     }
 }
 
+struct Scenario {
+    context: AgentContext,
+    window: Option<u64>,
+    provider: &'static str,
+    cache_cold: bool,
+    compaction_enabled: bool,
+}
+
+impl Scenario {
+    fn new(context: AgentContext) -> Self {
+        Self {
+            context,
+            window: None,
+            provider: "responses",
+            cache_cold: false,
+            compaction_enabled: true,
+        }
+    }
+
+    fn plan(&self, online: &OnlineState, settings: &CompactionSettings) -> Plan {
+        let model = ModelConfig {
+            context_window: self.window,
+            provider: self.provider.into(),
+            ..sample_model()
+        };
+        plan(PlanInput {
+            context: &self.context,
+            tools: &tools(),
+            online,
+            settings,
+            model: &model,
+            session: &SessionId::from_raw("sess-1"),
+            run: &RunId::from_raw("run-1"),
+            cache_cold: self.cache_cold,
+            compaction_enabled: self.compaction_enabled,
+        })
+    }
+}
+
 fn decide_with(online: &OnlineState, settings: &CompactionSettings, window: Option<u64>) -> Plan {
-    let model = ModelConfig {
-        context_window: window,
-        ..sample_model()
-    };
-    let context = context();
-    plan(PlanInput {
-        context: &context,
-        tools: &tools(),
-        online,
-        settings,
-        model: &model,
-        session: &SessionId::from_raw("sess-1"),
-        run: &RunId::from_raw("run-1"),
-    })
+    Scenario {
+        window,
+        ..Scenario::new(context())
+    }
+    .plan(online, settings)
+}
+
+fn tight_window() -> u64 {
+    price(&context(), &tools()).write_tokens + 16_384
 }
 
 #[test]
@@ -333,4 +384,159 @@ fn a_compaction_that_cannot_get_below_the_reserve_is_not_attempted() {
     };
     assert!(reason.starts_with("压完仍贴着窗口"), "{reason}");
     assert!(!decision.compact);
+}
+
+/// 缓存已冷：改写不欠债，有资格的全换，连计划边界与窗口都不用等。
+#[test]
+fn a_cold_cache_decays_everything_eligible_without_debt() {
+    let scenario = Scenario {
+        cache_cold: true,
+        ..Scenario::new(context_with_candidate())
+    };
+    let Plan::Decay(job) = scenario.plan(&online(false), &settings(1e9)) else {
+        panic!("冷缓存有候选就换");
+    };
+    assert_eq!(job.decision.reason, CompactionReason::CacheCold);
+    assert!(job.decision.compact);
+    assert_eq!(job.decision.debt().debt_tokens, 0.0);
+    assert_eq!(job.calls, vec![ToolCallId::from_raw("c1")]);
+    assert_eq!(job.revised.len(), 1);
+    assert_eq!(job.revised[0].provider_call_id, "p-c1");
+    assert_eq!(job.revised[0].content, SHORT_VIEW);
+    assert!(!job.revised[0].is_error);
+    assert!(job.decision.archive_tokens > 0, "saving 是两个视图的差");
+}
+
+/// 冷缓存但没有候选：没有东西可换，不在边界也不贴窗口就什么都不动。
+#[test]
+fn a_cold_cache_without_candidates_changes_nothing() {
+    let scenario = Scenario {
+        cache_cold: true,
+        ..Scenario::new(context())
+    };
+    assert!(matches!(
+        scenario.plan(&online(false), &settings(1.25)),
+        Plan::Nothing
+    ));
+}
+
+/// 短任务从不改写：缓存是热的、不在边界、不贴窗口，有候选也不动前缀。
+#[test]
+fn no_boundary_no_pressure_never_rewrites_the_prefix() {
+    for enabled in [true, false] {
+        let scenario = Scenario {
+            window: Some(1_000_000),
+            compaction_enabled: enabled,
+            ..Scenario::new(context_with_candidate())
+        };
+        assert!(matches!(
+            scenario.plan(&online(false), &settings(1.25)),
+            Plan::Nothing
+        ));
+    }
+}
+
+/// 贴着窗口：不看账（账再差也换），先换短视图——压缩开着也一样，比压缩便宜。
+#[test]
+fn window_pressure_decays_before_compacting() {
+    for enabled in [true, false] {
+        let scenario = Scenario {
+            window: Some(tight_window()),
+            compaction_enabled: enabled,
+            ..Scenario::new(context_with_candidate())
+        };
+        let Plan::Decay(job) = scenario.plan(&online(false), &settings(1e9)) else {
+            panic!("贴着窗口先衰减");
+        };
+        assert_eq!(job.decision.reason, CompactionReason::WindowProtection);
+    }
+}
+
+/// 边界上衰减划算：压缩关着就衰减。
+#[test]
+fn a_profitable_boundary_decays_when_compaction_is_off() {
+    let scenario = Scenario {
+        compaction_enabled: false,
+        ..Scenario::new(context_with_candidate())
+    };
+    let Plan::Decay(job) = scenario.plan(&online(true), &settings(1.25)) else {
+        panic!("划算的边界应当衰减");
+    };
+    assert_eq!(job.decision.reason, CompactionReason::Economic);
+    assert_eq!(job.decision.memo_tokens, 0);
+}
+
+/// 边界上压缩与衰减都划算：压缩优先。
+#[test]
+fn a_boundary_prefers_compaction_when_it_pays() {
+    let scenario = Scenario::new(context_with_candidate());
+    assert!(matches!(
+        scenario.plan(&online(true), &settings(1.25)),
+        Plan::Compact(_)
+    ));
+}
+
+/// 边界上压缩不划算、衰减也不划算：记一条 skipped，带的是压缩那份账；压缩关着就带衰减的。
+#[test]
+fn a_boundary_where_nothing_pays_is_skipped() {
+    let scenario = Scenario::new(context_with_candidate());
+    let Plan::Skip { reason, decision } = scenario.plan(&online(true), &settings(1e9)) else {
+        panic!("都算不过来的边界要记 skipped");
+    };
+    assert_eq!(reason, "deferred_economic");
+    assert!(!decision.compact);
+    assert!(decision.archive_tokens > 0);
+    let compaction_archive = decision.archive_tokens;
+
+    let scenario = Scenario {
+        compaction_enabled: false,
+        ..Scenario::new(context_with_candidate())
+    };
+    let Plan::Skip { reason, decision } = scenario.plan(&online(true), &settings(1e9)) else {
+        panic!("压缩关着也要记 skipped");
+    };
+    assert_eq!(reason, "deferred_economic");
+    assert_ne!(
+        decision.archive_tokens, compaction_archive,
+        "这是衰减的账：saving 不是压缩的 archive"
+    );
+}
+
+/// 压缩关着、边界上也没有候选：没有东西可算，不记账。
+#[test]
+fn a_boundary_with_compaction_off_and_nothing_to_decay_is_left_alone() {
+    let scenario = Scenario {
+        compaction_enabled: false,
+        ..Scenario::new(context())
+    };
+    assert!(matches!(
+        scenario.plan(&online(true), &settings(1.25)),
+        Plan::Nothing
+    ));
+}
+
+/// 改写要重写多少缓存看后端：Anthropic 有显式断点，只重写被改消息起的后半截；其它后端
+/// 改了中间一条就退回系统提示，整段重写。
+#[test]
+fn the_rewrite_cost_depends_on_the_backend() {
+    let write_tokens = |provider: &'static str| {
+        let scenario = Scenario {
+            provider,
+            cache_cold: true,
+            ..Scenario::new(context_with_candidate())
+        };
+        let Plan::Decay(job) = scenario.plan(&online(false), &settings(1.25)) else {
+            panic!("冷缓存应当衰减");
+        };
+        job.decision.write_tokens
+    };
+    let context = context_with_candidate();
+    let suffix: u64 = context.messages[4..].iter().map(message_tokens).sum();
+    let everything = price(&context, &tools()).write_tokens;
+
+    assert_eq!(write_tokens("anthropic_messages"), suffix);
+    for provider in ["responses", "chat_completions"] {
+        assert_eq!(write_tokens(provider), everything, "{provider}");
+    }
+    assert!(suffix < everything);
 }

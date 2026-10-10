@@ -1015,74 +1015,20 @@ fn revised_of(
     }
 }
 
-/// 大结果完整给两次（它之后的第 1、2 次请求），第 3 次请求前换成短视图，之后不再换
-/// （§8.3）。次数就是"它之后记了几条 `message.assistant`"——回放数的是同一个数。
+/// planner 没开口（没有 compactor）时从不换：大结果给多少次都不自动换——换不换是对前缀的
+/// 改写决策，不是按次数倒数（§8.3）。
 #[tokio::test]
-async fn a_large_result_is_sent_whole_twice_then_revised() {
-    use komo_kernel::types::turn::RoundInput;
-
+async fn a_large_result_is_never_revised_without_a_planner_decision() {
     let inputs = four_rounds_after(reading("read", ToolResultStatus::Completed, big_text())).await;
     assert_eq!(inputs.len(), 5, "{inputs:?}");
-
-    // 第 1 次：结果本身，完整视图；`decay` 不交给驱动。
-    let RoundInput::ToolResults { results, revised } = &inputs[1] else {
+    let komo_kernel::types::turn::RoundInput::ToolResults { results, .. } = &inputs[1] else {
         panic!("第二次请求带着工具结果：{:?}", inputs[1]);
     };
-    let full = &results[0];
-    assert_eq!(full.provider_call_id, "pc-first");
-    assert!(full.content.len() > 4096, "{}", full.content.len());
-    assert!(full.decay.is_none(), "待换的视图是 loop 的事，不交给驱动");
-    assert!(revised.is_empty());
-    // 第 2 次：它还在历史里、完整的，不改。
-    assert!(revised_of(&inputs[2]).is_empty(), "{:?}", inputs[2]);
-
-    // 第 3 次：换成短视图，配对不动。
-    let revised = revised_of(&inputs[3]);
-    assert_eq!(revised.len(), 1, "{:?}", inputs[3]);
-    assert_eq!(revised[0].provider_call_id, "pc-first");
-    assert_eq!(revised[0].call_id, full.call_id);
-    assert!(!revised[0].is_error);
-    assert!(revised[0].content.len() + 1024 <= full.content.len());
     assert!(
-        revised[0].content.starts_with("[read · 完成 · ")
-            && revised[0].content.contains("这份结果已完整给过 2 次"),
+        results[0].content.len() > 4096,
         "{}",
-        revised[0].content
+        results[0].content.len()
     );
-    assert!(
-        revised[0].content.contains("完整输出："),
-        "{}",
-        revised[0].content
-    );
-
-    // 第 4 次：已经换过了，不再换一遍。
-    assert!(revised_of(&inputs[4]).is_empty(), "{:?}", inputs[4]);
-}
-
-/// 失败的正文是模型要对着改的东西：再大也不换（§8.3）。
-#[tokio::test]
-async fn an_error_result_is_never_revised() {
-    let inputs = four_rounds_after(reading("read", ToolResultStatus::Failed, big_text())).await;
-    let komo_kernel::types::turn::RoundInput::ToolResults { results, .. } = &inputs[1] else {
-        panic!("{:?}", inputs[1]);
-    };
-    assert!(results[0].is_error && results[0].content.len() > 4096);
-    assert!(
-        inputs.iter().all(|input| revised_of(input).is_empty()),
-        "{inputs:?}"
-    );
-}
-
-/// 没超阈值的结果没有短视图，也就没什么可换。
-#[tokio::test]
-async fn a_small_result_is_never_revised() {
-    let inputs = four_rounds_after(reading(
-        "read",
-        ToolResultStatus::Completed,
-        "一行\n".repeat(20),
-    ))
-    .await;
-    assert_eq!(inputs.len(), 5);
     assert!(
         inputs.iter().all(|input| revised_of(input).is_empty()),
         "{inputs:?}"
@@ -1093,8 +1039,11 @@ async fn a_small_result_is_never_revised() {
 
 mod compaction {
     use super::*;
-    use crate::agent::tests_support::{FakePlanner, HangingLlm, compaction_job, compactor};
+    use crate::agent::tests_support::{
+        FakePlanner, HangingLlm, compaction_job, compactor, decay_job,
+    };
     use crate::tools::UpdatePlanTool;
+    use komo_kernel::compaction::Reshape;
     use komo_kernel::events::{ContextCompacted, EventPayload};
     use komo_kernel::types::ids::Seq;
     use komo_kernel::types::turn::RoundInput;
@@ -1267,7 +1216,7 @@ mod compaction {
         let wired = wired(Arc::clone(&llm));
         let mut segment = wired.segment(CancelToken::new()).await;
         let job = compaction_job(&segment.session, &segment.run);
-        let planner = FakePlanner::new(vec![Some(job)]);
+        let planner = FakePlanner::new(vec![Some(Reshape::Compact(job))]);
         segment.compactor = Some(compactor(Arc::clone(&planner)));
 
         let outcome = wired.agent.run(segment).await.unwrap();
@@ -1307,6 +1256,79 @@ mod compaction {
             1,
             "没有第二次 begin_turn"
         );
+    }
+
+    /// 换短视图：先落 `decayed`，整批在下一次请求里交给驱动，这一段不 Recompose、driver 不重开。
+    #[tokio::test]
+    async fn a_decay_job_is_recorded_then_revised_without_recomposing() {
+        let llm = Arc::new(ScriptedLlm::new(vec![boundary_rounds()]));
+        let wired = wired(Arc::clone(&llm));
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let job = decay_job("pc-old");
+        let expected = job.revised.clone();
+        let planner = FakePlanner::new(vec![Some(Reshape::Decay(job))]);
+        segment.compactor = Some(crate::agent::Compactor {
+            estimate: 1000,
+            ..compactor(Arc::clone(&planner))
+        });
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Completed { rounds: 3, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(planner.asked(), 1);
+        assert_eq!(llm.requests.lock().unwrap().len(), 1, "没有重新装配");
+        match compactions(&wired.harness).as_slice() {
+            [ContextCompacted::Decayed { calls, .. }] => assert_eq!(calls.len(), 1),
+            other => panic!("{other:?}"),
+        }
+        let inputs = llm.inputs.lock().unwrap();
+        assert_eq!(inputs.len(), 3, "{inputs:?}");
+        // 边界那一轮之后的请求带着整批；再下一次不重复。
+        assert_eq!(revised_of(&inputs[2]), expected.as_slice(), "{inputs:?}");
+        assert!(revised_of(&inputs[1]).is_empty(), "{inputs:?}");
+    }
+
+    /// 没有边界、没有压力：一条跑得比缓存存活时间还久的工具调用之后（缓存已冷）也要问；
+    /// 跑得快的那一轮不问。
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_slower_than_the_cache_ttl_asks_the_planner() {
+        let slow = Arc::new(RecordingTool::shell().with_delay(
+            komo_kernel::compaction::PROMPT_CACHE_TTL + std::time::Duration::from_secs(1),
+        ));
+        let llm = Arc::new(ScriptedLlm::new(vec![vec![
+            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+            round(2, None, vec![call("pc-2", "shell", serde_json::json!({}))]),
+            round(3, Some("好了。"), vec![]),
+        ]]));
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![slow], true);
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let planner = FakePlanner::new(vec![None, None]);
+        segment.compactor = Some(compactor(Arc::clone(&planner)));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(planner.asked(), 2, "两轮各跑了一条慢调用");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_tools_never_ask_the_planner_without_a_boundary() {
+        let tool = Arc::new(RecordingTool::shell());
+        let llm = Arc::new(ScriptedLlm::new(vec![vec![
+            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+            round(2, Some("好了。"), vec![]),
+        ]]));
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![tool], true);
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let planner = FakePlanner::new(vec![None]);
+        segment.compactor = Some(compactor(Arc::clone(&planner)));
+
+        wired.agent.run(segment).await.unwrap();
+        assert_eq!(planner.asked(), 0);
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@
 
 mod views;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -343,6 +343,11 @@ impl Surface {
                     });
                 }
             }
+            EventPayload::ContextCompacted(ContextCompacted::Decayed { calls, .. }) => {
+                if let Some(run) = event.run.as_ref().and_then(|id| self.runs.get_mut(id)) {
+                    run.decayed.extend(calls.iter().cloned());
+                }
+            }
             EventPayload::ContextCompacted(ContextCompacted::Skipped { .. })
             | EventPayload::Checkpoint(_)
             | EventPayload::ConfigChanged(_) => {}
@@ -447,6 +452,7 @@ impl Surface {
             delegate: None,
             calls: Vec::new(),
             compaction: None,
+            decayed: BTreeSet::new(),
             first_seq: event.seq,
             last_seq: event.seq,
         })

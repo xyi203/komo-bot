@@ -120,18 +120,6 @@ pub struct ToolResultForModel {
     pub content: String,
     #[serde(default)]
     pub is_error: bool,
-    /// 这条结果还会换成更短的视图（§8.3）：只在**完整给过的次数**还没到时才有。驱动不看
-    /// 它——agent loop 按它在第几次请求前把这条结果放进 `revised`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decay: Option<PendingDecay>,
-}
-
-/// 一条结果还要完整给几次、之后换成哪个视图。次数的唯一定义是"这条 Run 在它之后记了几条
-/// `message.assistant`"（`projection::view_after`），刚跑完与回放从同一个数出发。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingDecay {
-    pub remaining_full_sends: u32,
-    pub view: String,
 }
 
 /// `LlmClient::begin_turn` 的输入：一次 Run 的一个执行段。工具 Schema、系统提示、
@@ -390,14 +378,12 @@ mod tests {
                 call_id: ToolCallId::from_raw("call-7"),
                 content: "result = 2".into(),
                 is_error: false,
-                decay: None,
             }],
             revised: vec![ToolResultForModel {
                 provider_call_id: "pc-3".into(),
                 call_id: ToolCallId::from_raw("call-3"),
                 content: "短视图".into(),
                 is_error: true,
-                decay: None,
             }],
         };
         let text = serde_json::to_string(&input).unwrap();

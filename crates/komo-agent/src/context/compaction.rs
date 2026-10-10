@@ -10,13 +10,14 @@ use std::ops::Range;
 
 use komo_kernel::compaction::{
     CompactionDecision, CompactionEconomics, CompactionInput, CompactionJob, CompactionReason,
-    OnlineState, PlanStep, ProgressSummary, decide, estimate_tokens, find_cut, format_snapshot,
+    DecayJob, OnlineState, PlanStep, ProgressSummary, decide, estimate_tokens, find_cut,
+    format_snapshot,
 };
 use komo_kernel::protocol::config::CompactionConfig;
 use komo_kernel::types::ids::{RunId, Seq, SessionId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::tool::ToolDefinition;
-use komo_kernel::types::turn::{ReplayMessage, Role, TurnRequest};
+use komo_kernel::types::turn::{ReplayMessage, Role, ToolResultForModel, TurnRequest};
 
 use super::AgentContext;
 
@@ -28,6 +29,8 @@ pub struct Pricing {
     /// 这条 Run 开头那句任务**之后**的每条消息：`(seq, token 数, 是不是一轮助手回复的
     /// 开头)`，与 [`find_cut`] 的输入同形。开头那句任务回放时总留着，不在其中。
     pub candidates: Vec<(Seq, u64, bool)>,
+    /// `AgentContext.messages` 里每条消息的 token 数：衰减改写要从某条消息起算重写多少。
+    pub message_tokens: Vec<u64>,
     /// `candidates[i]` 是 `AgentContext.messages[from + i]`。
     from: usize,
 }
@@ -91,6 +94,7 @@ pub fn price(context: &AgentContext, tools: &[ToolDefinition]) -> Pricing {
             + tool_tokens
             + message_tokens.iter().sum::<u64>(),
         candidates,
+        message_tokens,
         from: from.min(context.messages.len()),
     }
 }
@@ -249,15 +253,28 @@ pub struct PlanInput<'a> {
     pub model: &'a ModelConfig,
     pub session: &'a SessionId,
     pub run: &'a RunId,
+    /// 上一次请求写下的提示缓存已经过期（Gateway 按上次请求的时间与缓存 TTL 判断）：
+    /// 这次请求无论改不改都要整段重写，改写不欠债。
+    pub cache_cold: bool,
+    /// 配置里在线压缩是否开着。关着时只做衰减。
+    pub compaction_enabled: bool,
 }
 
+/// Anthropic Messages 的 `provider` 名（与 runtime 的 `ANTHROPIC_MESSAGES` 同一个字符串）：
+/// 有显式缓存断点，driver 会在被改的消息之前补一个，改写只重写那之后的部分。
+const ANTHROPIC_MESSAGES: &str = "anthropic_messages";
+
 /// 这一刻压不压。
+// 每次判断只造一个、立刻消费，装箱省不了什么。
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum Plan {
     /// 不是时候：既不在计划边界上，也没贴着窗口；或者刚压过（两次压缩之间至少要有一次
     /// 真正的请求）、刚被拒过（`compaction_refused`）。什么都不记。
     Nothing,
     Compact(CompactionJob),
+    /// 把一批有资格的结果换成短视图：比压缩便宜（不用模型请求），同样是一次前缀改写。
+    Decay(DecayJob),
     /// 在边界上决定了不压：记一条 `skipped`，这个边界就用掉了——否则之后每一段都要再
     /// 算一遍。
     Skip {
@@ -266,7 +283,11 @@ pub enum Plan {
     },
 }
 
-/// 一次压缩决策：计划边界上按缓存账算；不在边界上只为窗口保护压。
+/// 一次前缀改写决策（压成摘要，或把一批结果换成短视图），同一本缓存账（§6）。
+///
+/// 判断的时机：缓存已冷（改写不欠债，有资格的全换）；贴着窗口（不看账，先换短视图——
+/// 比压缩便宜）；计划边界（压缩与衰减都算账，压缩开着且算得过来就压缩，否则衰减算得过来
+/// 就衰减，否则跳过）。其余时候什么都不动：短任务从不改写前缀。
 pub fn plan(input: PlanInput<'_>) -> Plan {
     let PlanInput {
         context,
@@ -276,6 +297,8 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
         model,
         session,
         run,
+        cache_cold,
+        compaction_enabled,
     } = input;
     let pricing = price(context, tools);
     // 估出来的与上一次请求实报的取大（SoL-Pi 同口径）：估计对中日韩文字偏低，实报又
@@ -288,21 +311,19 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
         .map(|window| window.saturating_sub(settings.economics.window_reserve_tokens));
     let pressure = threshold.is_some_and(|threshold| context_tokens >= threshold);
     let boundary = online.pending_boundary;
-    if !boundary && !pressure {
+    let decayable = !context.decay_candidates.is_empty();
+    if !(boundary || pressure || (cache_cold && decayable)) {
         return Plan::Nothing;
     }
-    if online.requests_since_last_compaction() == Some(0)
-        || (!boundary && online.compaction_refused)
-    {
+    if online.requests_since_last_compaction() == Some(0) {
         return Plan::Nothing;
     }
 
-    let cut = pricing.cut(settings.keep_recent_tokens);
-    let mut decision = decide(
-        &CompactionInput {
-            write_tokens: context_tokens,
-            archive_tokens: cut.as_ref().map_or(0, |cut| cut.archive_tokens),
-            memo_tokens: settings.memo_tokens,
+    let input_for = |write_tokens: u64, archive_tokens: u64, memo_tokens: u64, cache_cold: bool| {
+        CompactionInput {
+            write_tokens,
+            archive_tokens,
+            memo_tokens,
             context_tokens,
             completed_boundary_request_counts: Some(
                 online.completed_boundary_request_counts.clone(),
@@ -315,54 +336,145 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
             carried_debt_tokens: online.cache_debt_tokens,
             cache_debt_repayment_tokens: online.cache_debt_repayment_tokens,
             cache_write_read_ratio: settings.cache_write_read_ratio,
-        },
-        &settings.economics,
-    );
-    if cut.is_none() {
-        decision = decision.mark_not_compactable();
+            cache_cold,
+        }
+    };
+    let decay = |cold: bool| {
+        let saving: u64 = context
+            .decay_candidates
+            .iter()
+            .map(|candidate| {
+                candidate
+                    .full_tokens
+                    .saturating_sub(estimate_tokens(&candidate.decayed))
+            })
+            .sum();
+        // 改写要重写多少缓存：Anthropic 在被改的消息之前有显式断点，只重写那之后的；
+        // 其余（Responses / Chat Completions / 代理）没有断点，改了中间一条就退回到系统
+        // 提示，整段重写。
+        let write_tokens = if model.provider == ANTHROPIC_MESSAGES {
+            let earliest = context
+                .decay_candidates
+                .iter()
+                .map(|candidate| candidate.message)
+                .min()
+                .unwrap_or(0);
+            pricing.message_tokens.iter().skip(earliest).sum()
+        } else {
+            context_tokens
+        };
+        let decision = decide(
+            &input_for(write_tokens, saving, 0, cold),
+            &settings.economics,
+        );
+        DecayJob {
+            calls: context
+                .decay_candidates
+                .iter()
+                .map(|candidate| candidate.call_id.clone())
+                .collect(),
+            revised: context
+                .decay_candidates
+                .iter()
+                .map(|candidate| ToolResultForModel {
+                    provider_call_id: candidate.provider_call_id.clone(),
+                    call_id: candidate.call_id.clone(),
+                    content: candidate.decayed.clone(),
+                    is_error: false,
+                })
+                .collect(),
+            decision,
+        }
+    };
+
+    if decayable && cache_cold {
+        return Plan::Decay(decay(true));
     }
-    // 不在边界上只为窗口压：剩余请求是按"每步花几次请求"估的，边界之间那个数没有意义。
-    if !boundary && decision.reason != CompactionReason::WindowProtection {
+    if decayable && pressure {
+        return Plan::Decay(decay(false));
+    }
+
+    let mut compaction_decision = None;
+    if compaction_enabled && !(!boundary && online.compaction_refused) {
+        let cut = pricing.cut(settings.keep_recent_tokens);
+        let mut decision = decide(
+            &input_for(
+                context_tokens,
+                cut.as_ref().map_or(0, |cut| cut.archive_tokens),
+                settings.memo_tokens,
+                cache_cold,
+            ),
+            &settings.economics,
+        );
+        if cut.is_none() {
+            decision = decision.mark_not_compactable();
+        }
+        // 不在边界上只为窗口压：剩余请求是按"每步花几次请求"估的，边界之间那个数没有意义。
+        if !boundary && decision.reason != CompactionReason::WindowProtection {
+            return Plan::Nothing;
+        }
+        // 压完还贴着窗口：下一次请求又会触发，一轮一次摘要，什么都换不回来。
+        let futile = decision.compact
+            && threshold.is_some_and(|threshold| decision.post_compaction_tokens >= threshold);
+        match cut {
+            Some(cut) if decision.compact && !futile => {
+                let task = context
+                    .messages
+                    .get(context.run_from)
+                    .filter(|message| message.role == Role::User)
+                    .and_then(|message| message.text.as_deref());
+                return Plan::Compact(CompactionJob {
+                    request: summary_request(
+                        task,
+                        &context.messages[cut.archived],
+                        &online.plan,
+                        &online.pending_progress,
+                        session,
+                        run,
+                        model,
+                    ),
+                    first_kept: cut.first_kept,
+                    decision,
+                });
+            }
+            _ if boundary => {
+                let reason = if futile {
+                    decision.compact = false;
+                    format!(
+                        "压完仍贴着窗口（{} ≥ {}）",
+                        decision.post_compaction_tokens,
+                        threshold.unwrap_or_default()
+                    )
+                } else {
+                    reason_name(decision.reason)
+                };
+                compaction_decision = Some((reason, decision));
+            }
+            _ => return Plan::Nothing,
+        }
+    }
+    if !boundary {
         return Plan::Nothing;
     }
-    // 压完还贴着窗口：下一次请求又会触发，一轮一次摘要，什么都换不回来。
-    let futile = decision.compact
-        && threshold.is_some_and(|threshold| decision.post_compaction_tokens >= threshold);
-    match cut {
-        Some(cut) if decision.compact && !futile => {
-            let task = context
-                .messages
-                .get(context.run_from)
-                .filter(|message| message.role == Role::User)
-                .and_then(|message| message.text.as_deref());
-            Plan::Compact(CompactionJob {
-                request: summary_request(
-                    task,
-                    &context.messages[cut.archived],
-                    &online.plan,
-                    &online.pending_progress,
-                    session,
-                    run,
-                    model,
-                ),
-                first_kept: cut.first_kept,
-                decision,
-            })
+
+    // 压缩没压（关着、不划算、压不动）：边界上再看衰减。跳过时记压缩那份账；压缩关着就
+    // 记衰减那份。两边都没有可算的东西，边界留着，等有候选或压缩恢复再说。
+    if decayable {
+        let job = decay(false);
+        if job.decision.compact {
+            return Plan::Decay(job);
         }
-        _ if boundary => {
-            let reason = if futile {
-                decision.compact = false;
-                format!(
-                    "压完仍贴着窗口（{} ≥ {}）",
-                    decision.post_compaction_tokens,
-                    threshold.unwrap_or_default()
-                )
-            } else {
-                reason_name(decision.reason)
-            };
-            Plan::Skip { reason, decision }
-        }
-        _ => Plan::Nothing,
+        return match compaction_decision {
+            Some((reason, decision)) => Plan::Skip { reason, decision },
+            None => Plan::Skip {
+                reason: reason_name(job.decision.reason),
+                decision: job.decision,
+            },
+        };
+    }
+    match compaction_decision {
+        Some((reason, decision)) => Plan::Skip { reason, decision },
+        None => Plan::Nothing,
     }
 }
 

@@ -149,7 +149,6 @@ mod tests {
                     call_id: ToolCallId::from_raw("call-1"),
                     content: "hi".into(),
                     is_error: false,
-                    decay: None,
                 }],
                 revised: Vec::new(),
             })
@@ -173,7 +172,6 @@ mod tests {
                 call_id: ToolCallId::from_raw("call-1"),
                 content: "hi".into(),
                 is_error: false,
-                decay: None,
             }],
             provider_blocks: None,
         }];

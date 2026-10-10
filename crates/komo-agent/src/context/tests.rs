@@ -19,6 +19,7 @@ fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput<'stat
             model_result_bytes: 8 * 1024,
             decay: None,
         },
+        decayed: Default::default(),
     }
 }
 

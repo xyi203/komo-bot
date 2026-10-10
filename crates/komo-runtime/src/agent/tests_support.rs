@@ -123,18 +123,34 @@ pub fn compaction_job(session: &SessionId, run: &RunId) -> komo_kernel::compacti
     }
 }
 
+/// 一次换短视图的决定：把 `provider_call_id` 那条结果换成短视图。
+pub fn decay_job(provider_call_id: &str) -> komo_kernel::compaction::DecayJob {
+    let komo_kernel::events::ContextCompacted::Compacted { decision, .. } =
+        komo_kernel::test_support::compacted(komo_kernel::types::ids::Seq(2), "")
+    else {
+        unreachable!("替身给的是 compacted")
+    };
+    let call = komo_kernel::types::ids::ToolCallId::from_raw("decayed-call");
+    komo_kernel::compaction::DecayJob {
+        calls: vec![call.clone()],
+        revised: vec![komo_kernel::types::turn::ToolResultForModel {
+            provider_call_id: provider_call_id.into(),
+            call_id: call,
+            content: "[read · 完成 · 短视图]".into(),
+            is_error: false,
+        }],
+        decision,
+    }
+}
+
 /// 按脚本作答的 [`super::CompactionPlanner`]：第 n 次问给第 n 个答案，用完之后一律不压。
 pub struct FakePlanner {
-    answers: std::sync::Mutex<
-        std::collections::VecDeque<Option<komo_kernel::compaction::CompactionJob>>,
-    >,
+    answers: std::sync::Mutex<std::collections::VecDeque<Option<komo_kernel::compaction::Reshape>>>,
     pub asked: std::sync::atomic::AtomicUsize,
 }
 
 impl FakePlanner {
-    pub fn new(
-        answers: Vec<Option<komo_kernel::compaction::CompactionJob>>,
-    ) -> std::sync::Arc<Self> {
+    pub fn new(answers: Vec<Option<komo_kernel::compaction::Reshape>>) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             answers: std::sync::Mutex::new(answers.into_iter().collect()),
             asked: Default::default(),
@@ -148,7 +164,7 @@ impl FakePlanner {
 
 #[async_trait::async_trait]
 impl super::CompactionPlanner for FakePlanner {
-    async fn plan(&self) -> Option<komo_kernel::compaction::CompactionJob> {
+    async fn plan(&self) -> Option<komo_kernel::compaction::Reshape> {
         self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.answers.lock().expect("脚本").pop_front().flatten()
     }

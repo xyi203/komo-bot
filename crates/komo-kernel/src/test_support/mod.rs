@@ -65,6 +65,7 @@ pub fn compacted(
             carried_debt_tokens: 0.0,
             cache_debt_repayment_tokens: 0,
             cache_write_read_ratio: Some(12.5),
+            cache_cold: false,
         },
         &CompactionEconomics::default(),
     );

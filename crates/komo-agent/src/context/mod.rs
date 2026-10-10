@@ -12,15 +12,17 @@ pub mod history;
 pub mod memory;
 mod prompt;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::types::delegate::DelegateSpec;
+use komo_kernel::types::ids::ToolCallId;
 use komo_kernel::types::turn::ReplayMessage;
 
 pub use history::{
-    COMPACTION_PREFIX, Entry, EntryKind, ReplayScope, ResolvedMessage, StoredOutput, entries,
-    latest_user_text,
+    COMPACTION_PREFIX, DecayCandidate, Entry, EntryKind, ReplayScope, ResolvedMessage,
+    StoredOutput, entries, latest_user_text,
 };
 
 use crate::skills::SkillCatalog;
@@ -48,6 +50,8 @@ pub struct ContextInput<'s> {
     /// 工具结果的投影设置（这条 Run 冻结的那一份）。
     /// 与 `CallEnv` 用同一个值，否则"刚跑完"和"回放"渲染出来不一样。
     pub projection: ProjectionContext,
+    /// 这条 Run 已经决定换成短视图的结果（`RunView.decayed`）：回放只按它选视图。
+    pub decayed: BTreeSet<ToolCallId>,
 }
 
 /// 这一段是主 Agent 的对话，还是一次委派（`docs/agent.md` §11）。
@@ -68,6 +72,9 @@ pub struct AgentContext {
     /// 正在跑的这条 Run 从 `messages` 的第几条开始（它开头那句任务）；之前的是别的 Run
     /// 的转写。在线压缩只在这一段里切（[`compaction`]）。
     pub run_from: usize,
+    /// 当前 Run 里有资格换成短视图、还没换的工具结果：改写决策（[`compaction::plan`]）
+    /// 据此算账；决定换了才记 `decayed`，回放才给短视图。
+    pub decay_candidates: Vec<DecayCandidate>,
 }
 
 /// 唯一的 Context Assembly 入口（`docs/agent.md` §5）。
@@ -87,11 +94,13 @@ pub fn assemble(input: ContextInput<'_>) -> AgentContext {
         prompt.push_str("\n\n");
         prompt.push_str(memory);
     }
-    let (messages, run_from) = history::replay_messages(input.history, &input.projection);
+    let (messages, run_from, decay_candidates) =
+        history::replay_messages(input.history, &input.projection, &input.decayed);
     AgentContext {
         system_prompt: prompt,
         messages,
         run_from,
+        decay_candidates,
     }
 }
 

@@ -28,9 +28,10 @@ use async_trait::async_trait;
 use komo_agent::DELEGATE_TOOL;
 use komo_agent::context::InvocationContext;
 use komo_agent::context::history::{self, ReplayScope};
+use komo_kernel::compaction::Reshape;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::fold;
-use komo_kernel::traits::{ApprovalRepo, LedgerError, ToolOutputStore};
+use komo_kernel::traits::{ApprovalRepo, Clock, Ledger, LedgerError, ToolOutputStore};
 use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::resource::{ResourceMounts, SkillMount};
@@ -88,6 +89,8 @@ pub struct GatewaySegments {
     /// 能力面已经由冻结快照（或它的兜底）给出，"这次能用哪些工具"的判据只有那一处，
     /// 这里不该再有一份。`None` = 精简装配（没有执行器的那几个单元测试）。
     executor: Option<Arc<ToolExecutor>>,
+    /// 提示缓存冷没冷按它的"现在"算（与 Gateway 其余各处同一个时钟）。
+    clock: Arc<dyn Clock>,
 }
 
 impl std::fmt::Debug for GatewaySegments {
@@ -123,7 +126,13 @@ impl GatewaySegments {
             checkpoints: None,
             skills: None,
             executor: None,
+            clock: Arc::new(super::state::SystemClock),
         }
+    }
+
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// 接上执行器：交回模型的工具 Schema 由它按能力面渲染（[`ToolExecutor::definitions_for`]）。
@@ -478,7 +487,12 @@ impl SegmentSource for GatewaySegments {
             invocation,
             projection,
         };
-        let context = template.clone().assemble(resolved);
+        let decayed = surface
+            .runs
+            .get(&run)
+            .map(|view| view.decayed.clone())
+            .unwrap_or_default();
+        let context = template.clone().assemble(resolved, decayed);
 
         let agent_surface = identity.surface.clone();
 
@@ -525,29 +539,63 @@ impl SegmentSource for GatewaySegments {
             .clone()
             .unwrap_or_else(|| record.model.clone());
 
-        // 在线压缩（§6）：开着、不是命令 Run 才有。这一段开头就能判的（没有没收尾的调用）
-        // 现在判；其余交给 loop 在一轮收尾之后来问。
-        let (compaction_job, compactor) = match compaction::enabled(self.config.as_ref()) {
-            Some(config) if command.is_none() => {
+        // 改写前缀（§6）：压成摘要或把大结果换成短视图，共用一个决策点。压缩开着或衰减开着
+        // （冻结的投影里有 `decay`）、且不是命令 Run 才有。这一段开头就能判的现在判；其余
+        // 交给 loop 在一轮收尾之后、或缓存放冷之后来问。
+        let (compaction_job, compactor, context) = match compaction::current(self.config.as_ref()) {
+            Some(config)
+                if command.is_none() && (config.enabled || template.projection.decay.is_some()) =>
+            {
                 let online = komo_kernel::compaction::online_state(&events, &run);
-                // 只在上一轮的调用全部收尾时判：切点落在轮次开头，一轮的调用与结果不分开。
+                // 压缩只在上一轮的调用全部收尾时判：切点落在轮次开头，一轮的调用与结果不分开。
+                // 衰减不切轮次、只换已完成结果的正文，没收尾的调用（等审批之后续跑）不受影响。
                 let settled = resume.is_none() && surface.open_calls(&run).is_empty();
-                let job = if settled {
-                    compaction::decide(
-                        self.routed.as_ref(),
-                        compaction::Facts {
-                            context: &context,
-                            tools: &tools,
-                            online: &online,
-                            config: &config,
-                            model: &model,
-                            session: &session,
-                            run: &run,
-                        },
-                    )
-                    .await
-                } else {
-                    None
+                let reshape = compaction::decide(
+                    self.routed.as_ref(),
+                    compaction::Facts {
+                        context: &context,
+                        tools: &tools,
+                        online: &online,
+                        config: &config,
+                        model: &model,
+                        session: &session,
+                        run: &run,
+                        cache_cold: compaction::cache_cold(&events, self.clock.now()),
+                        settled,
+                    },
+                )
+                .await;
+                let (job, context) = match reshape {
+                    Some(Reshape::Compact(job)) => (Some(job), context),
+                    // 先落账再重新装配：回放读到新的已衰减集合，第一次请求就带短视图。
+                    Some(Reshape::Decay(job)) => {
+                        self.routed
+                            .record_compaction(&run, job.outcome())
+                            .await
+                            .map_err(HandlerError::Ledger)?;
+                        let events = match self.events_of(&session).await {
+                            Ok(events) => events,
+                            Err(HandlerError::Ledger(error)) => {
+                                return Err(self.halt_if_corrupt(&run, error).await);
+                            }
+                            Err(other) => return Err(other),
+                        };
+                        let context = match compaction::assemble_context(
+                            &events,
+                            &run,
+                            thread.as_deref(),
+                            template.clone(),
+                            &payloads,
+                            self.outputs.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(context) => context,
+                            Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
+                        };
+                        (None, context)
+                    }
+                    None => (None, context),
                 };
                 let planner = compaction::GatewayPlanner {
                     routed: Arc::clone(&self.routed),
@@ -559,6 +607,7 @@ impl SegmentSource for GatewaySegments {
                     template,
                     tools: tools.clone(),
                     model: model.clone(),
+                    clock: Arc::clone(&self.clock),
                 };
                 let compactor = komo_runtime::agent::Compactor {
                     planner: Arc::new(planner),
@@ -568,9 +617,9 @@ impl SegmentSource for GatewaySegments {
                     estimate: komo_agent::context::compaction::price(&context, &tools).write_tokens,
                     pending: !settled && online.pending_boundary,
                 };
-                (job, Some(compactor))
+                (job, Some(compactor), context)
             }
-            _ => (None, None),
+            _ => (None, None, context),
         };
 
         let request = TurnRequest {

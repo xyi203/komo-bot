@@ -397,6 +397,7 @@ mod tests {
             workspace: PathBuf::from("/work"),
             tools: Vec::new(),
             history: resolved,
+            decayed: Default::default(),
             memory: None,
             skills: None,
             invocation: InvocationContext::Main,

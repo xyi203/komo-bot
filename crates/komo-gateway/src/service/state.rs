@@ -49,6 +49,17 @@ use crate::sse::{EventHub, SharedHub};
 use super::ledgers::{RoutedLedger, RoutedOutputs, SessionLedgers};
 use super::segment::GatewaySegments;
 
+/// 判提示缓存冷没冷用的时钟：生产就是 `clock` 本身，测试可以按数据目录拨快。
+#[cfg(any(test, feature = "test-support"))]
+fn cache_clock(home: &std::path::Path, clock: Arc<dyn Clock>) -> Arc<dyn Clock> {
+    super::test_support::cache_clock(home, clock)
+}
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn cache_clock(_home: &std::path::Path, clock: Arc<dyn Clock>) -> Arc<dyn Clock> {
+    clock
+}
+
 /// 系统时钟。**进程里唯一读墙上时间的地方**（其余一切经 `Clock`）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SystemClock;
@@ -581,6 +592,7 @@ impl GatewayState {
             // 回放那一侧的投影：同一份输出存储；预算按当前快照现读（§3）。
             .with_projection(Arc::clone(&outputs))
             .with_config(Arc::clone(&config))
+            .with_clock(cache_clock(&home, Arc::clone(&clock)))
             // Cron Run 用它那个 Job 的执行预算（§10）。
             .with_cron(Arc::clone(&cron))
             // 每一段装配时按当前用户输入召回一次，并把用到的条目记进

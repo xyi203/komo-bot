@@ -153,6 +153,7 @@ fn priced(request: &TurnRequest) -> u64 {
         system_prompt: request.system_prompt.clone(),
         messages: request.messages.clone(),
         run_from: 0,
+        decay_candidates: Vec::new(),
     };
     price(&context, &request.tools).write_tokens
 }

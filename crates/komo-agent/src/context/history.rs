@@ -13,14 +13,30 @@
 //! **只对 `entries` 选中的条目读正文**：一条落在窗口外、已经损坏的 payload 不该让这一段
 //! `halt_if_corrupt`（`docs/agent.md` §8 的"为什么要先选窗口再读正文"）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use komo_kernel::compaction::estimate_tokens;
 use komo_kernel::fold::{Surface, SurfaceMessage};
-use komo_kernel::projection::{ProjectionContext, ToolResultFacts, at_send, project_views};
+use komo_kernel::projection::{
+    ProjectionContext, ToolResultFacts, decay_eligible, project_views, select,
+};
 use komo_kernel::types::ids::{RunId, Seq, ToolCallId};
 use komo_kernel::types::refs::{ContentRef, ToolResultStatus};
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{ReplayMessage, Role, ToolCallRequest, ToolResultForModel};
+
+/// 当前 Run 里一条**有资格换成短视图、但还没换**的工具结果：改写决策（§6）的原料。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecayCandidate {
+    pub call_id: ToolCallId,
+    pub provider_call_id: String,
+    /// 它所在的那条消息在回放里的下标：改写要从这里起重写缓存前缀。
+    pub message: usize,
+    /// 现在发出去的（完整）视图有多大。
+    pub full_tokens: u64,
+    /// 换上去的短视图正文。
+    pub decayed: String,
+}
 
 /// 这一段回放给模型的是哪一块（`docs/agent.md` §8）。
 #[derive(Debug, Clone, Copy)]
@@ -327,7 +343,8 @@ pub fn latest_user_text(surface: &Surface) -> Option<String> {
 /// 纯函数：把已解析正文的回放条目投影成交给模型的消息（`docs/agent.md` §8）。
 ///
 /// **工具结果的模型视图不在这里重新拼**：与执行器一样经 `kernel::projection` 的
-/// `project_views` / `at_send`，只是"完整给过几次"从回放窗口里数出来。
+/// `project_views` / `select`；给哪个视图只看账本里记下的已衰减集合（`decayed`），不看
+/// "完整给过几次"——换不换是一次对前缀的改写决策，不是每条结果各自到点就换。
 /// `Transcript` 条目正文为空（读不到、或者本来就是空字符串）就跳过——那句话本来就没有
 /// 值得回放的内容。
 ///
@@ -337,16 +354,19 @@ pub fn latest_user_text(surface: &Surface) -> Option<String> {
 pub(crate) fn to_replay_messages(
     history: Vec<ResolvedMessage<'_>>,
     projection: &ProjectionContext,
+    decayed: &BTreeSet<ToolCallId>,
 ) -> Vec<ReplayMessage> {
-    replay_messages(history, projection).0
+    replay_messages(history, projection, decayed).0
 }
 
 /// [`to_replay_messages`]，另外给出正在跑的这条 Run 从第几条消息开始（它的 `Protocol`
-/// 与 `Summary` 条目在窗口里连成一段、排在最后）；窗口里没有它就是消息条数。
+/// 与 `Summary` 条目在窗口里连成一段、排在最后；窗口里没有它就是消息条数），以及这条
+/// Run 里有资格衰减、还没衰减的结果。
 pub(crate) fn replay_messages(
     history: Vec<ResolvedMessage<'_>>,
     projection: &ProjectionContext,
-) -> (Vec<ReplayMessage>, usize) {
+    decayed: &BTreeSet<ToolCallId>,
+) -> (Vec<ReplayMessage>, usize, Vec<DecayCandidate>) {
     // 结果落在**另一条**消息上（`Role::Tool` 的节点），工具名与 provider 的 call_id 要靠
     // 这份索引从原始请求里找回来——先把这一段窗口里出现过的调用都记一遍。
     let mut requests: BTreeMap<&ToolCallId, &ToolCallRequest> = BTreeMap::new();
@@ -357,9 +377,9 @@ pub(crate) fn replay_messages(
     }
 
     // 每条消息之后，正在跑的这条 Run 还记了几条 `message.assistant`：每一条都是一次已经
-    // 带着前面那些结果发出去的请求。工具结果完整给过几次就是这个数（§8.3）——活着的 loop
-    // 按同一个定义递减，所以两边选的是同一个视图。压缩过的 Run 只剩 `first_kept` 起的
-    // 轮次，而留下的每条结果之后的 `message.assistant` 全在其中：数出来的与没压时一样。
+    // 带着前面那些结果发出去的请求。工具结果完整给过几次就是这个数（§8.3），只用来判断
+    // 有没有资格进衰减候选。压缩过的 Run 只剩 `first_kept` 起的轮次，而留下的每条结果之后
+    // 的 `message.assistant` 全在其中：数出来的与没压时一样。
     let mut later_rounds = vec![0u32; history.len()];
     let mut seen = 0;
     for (index, resolved) in history.iter().enumerate().rev() {
@@ -372,6 +392,7 @@ pub(crate) fn replay_messages(
     }
 
     let mut out = Vec::new();
+    let mut candidates = Vec::new();
     let mut run_from = None;
     for (resolved, sends_so_far) in history.into_iter().zip(later_rounds) {
         let message = resolved.entry.message;
@@ -440,16 +461,28 @@ pub(crate) fn replay_messages(
                         stderr: result.stderr.as_ref(),
                         artifacts,
                     };
-                    let (content, decay) =
-                        at_send(project_views(&facts, projection), sends_so_far, projection);
+                    let projected = project_views(&facts, projection);
+                    let provider_call_id = request
+                        .map(|call| call.provider_call_id.clone())
+                        .unwrap_or_else(|| result.call.to_string());
+                    let is_decayed = decayed.contains(&result.call);
+                    if !is_decayed
+                        && decay_eligible(&projected, sends_so_far, projection)
+                        && let Some(view) = &projected.decayed
+                    {
+                        candidates.push(DecayCandidate {
+                            call_id: result.call.clone(),
+                            provider_call_id: provider_call_id.clone(),
+                            message: out.len(),
+                            full_tokens: estimate_tokens(&projected.full),
+                            decayed: view.clone(),
+                        });
+                    }
                     tool_results.push(ToolResultForModel {
-                        provider_call_id: request
-                            .map(|call| call.provider_call_id.clone())
-                            .unwrap_or_else(|| result.call.to_string()),
+                        provider_call_id,
                         call_id: result.call.clone(),
-                        content,
+                        content: select(projected, is_decayed),
                         is_error: !matches!(result.status, ToolResultStatus::Completed),
-                        decay,
                     });
                 }
                 out.push(ReplayMessage {
@@ -464,7 +497,7 @@ pub(crate) fn replay_messages(
         }
     }
     let run_from = run_from.unwrap_or(out.len());
-    (out, run_from)
+    (out, run_from, candidates)
 }
 
 #[cfg(test)]

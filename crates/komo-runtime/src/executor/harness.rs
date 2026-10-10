@@ -305,6 +305,7 @@ pub struct RecordingTool {
     recovery: RecoveryMode,
     verdict: std::sync::Mutex<Option<Verification>>,
     outcome: std::sync::Mutex<Option<Result<ToolOutput, ToolError>>>,
+    delay: Option<std::time::Duration>,
     pub executions: AtomicU32,
     pub verifications: AtomicU32,
 }
@@ -317,6 +318,7 @@ impl RecordingTool {
             recovery: RecoveryMode::NoSafeRecovery,
             verdict: std::sync::Mutex::new(None),
             outcome: std::sync::Mutex::new(None),
+            delay: None,
             executions: AtomicU32::new(0),
             verifications: AtomicU32::new(0),
         }
@@ -344,6 +346,12 @@ impl RecordingTool {
 
     pub fn with_outcome(self, outcome: Result<ToolOutput, ToolError>) -> Self {
         *self.outcome.lock().expect("假工具") = Some(outcome);
+        self
+    }
+
+    /// 执行要这么久（配合 `start_paused` 的测试拨表）。
+    pub fn with_delay(mut self, delay: std::time::Duration) -> Self {
+        self.delay = Some(delay);
         self
     }
 
@@ -395,6 +403,9 @@ impl Tool for RecordingTool {
         _sink: &mut dyn komo_kernel::traits::OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
         self.executions.fetch_add(1, Ordering::SeqCst);
+        if let Some(delay) = self.delay {
+            tokio::time::sleep(delay).await;
+        }
         self.outcome
             .lock()
             .expect("假工具")

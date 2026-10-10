@@ -109,6 +109,7 @@ async fn render(case: &Case) -> String {
         workspace: std::path::PathBuf::from(CWD),
         tools: tool_names,
         history: resolved,
+        decayed: Default::default(),
         memory,
         skills,
         invocation,

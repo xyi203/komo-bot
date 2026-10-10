@@ -26,9 +26,10 @@
 //!   错误中止整轮（§6）。
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
-use komo_kernel::compaction::{CompactionJob, estimate_tokens};
+use komo_kernel::compaction::{CompactionJob, PROMPT_CACHE_TTL, Reshape, estimate_tokens};
 use komo_kernel::events::ContextCompacted;
 use komo_kernel::traits::{Clock, Ledger, LedgerError, LlmClient};
 use komo_kernel::types::ids::{InterventionId, RunId, SessionId, ToolCallId};
@@ -122,22 +123,26 @@ pub struct Segment {
     /// 装配时就决定了要压：这一段先发摘要请求，压成就交回去重新装配，没成记一条
     /// `skipped` 照常往下跑（§6）。
     pub compaction: Option<CompactionJob>,
-    /// 一轮收尾之后要不要再问一次压不压。`None` = 压缩关着（或命令 Run）。
+    /// 一轮收尾之后要不要再问一次改写前缀。`None` = 压缩与衰减都关着（或命令 Run）。
     pub compactor: Option<Compactor>,
 }
 
-/// 在线压缩的决策方（§6）。Gateway 实现：读日志、按模型实际看到的视图估价、按当前
-/// 配置决定压不压。
+/// 对提示前缀的改写决策方（§6）：压成摘要，或把一批大结果成批换成短视图。两者都改写
+/// 前缀、都要付一次缓存重写，所以共用这一个决策点、同一本缓存账。Gateway 实现：读日志、
+/// 按模型实际看到的视图估价、按当前配置决定改不改、改哪种。
 #[async_trait]
 pub trait CompactionPlanner: Send + Sync {
-    /// 一轮的调用**全部收尾之后**、下一次请求之前问。要压就给出摘要请求；在计划边界上
-    /// 决定不压由实现记一条 `skipped`（把边界用掉）；其余情形什么都不记。
-    async fn plan(&self) -> Option<CompactionJob>;
+    /// 一轮的调用**全部收尾之后**、下一次请求之前问。要压就给出摘要请求
+    /// （[`Reshape::Compact`]）；要换短视图就给出整批（[`Reshape::Decay`]，loop 先落账再
+    /// 交给驱动）；在计划边界上决定不压由实现记一条 `skipped`（把边界用掉）；其余情形
+    /// 什么都不记。
+    async fn plan(&self) -> Option<Reshape>;
 }
 
-/// loop 这一侧：什么时候去问 [`CompactionPlanner`]。只有三种时机——这一轮完成了一个计划
-/// 步骤、日志里还压着一个没用掉的边界、估计的上下文贴着窗口；别的轮次一次都不问（问一
-/// 次要读一遍日志）。
+/// loop 这一侧：什么时候去问 [`CompactionPlanner`]（`None` = 压缩与衰减都关着）。只有四种时机——这一轮完成了一个计划
+/// 步骤、日志里还压着一个没用掉的边界、估计的上下文贴着窗口、距上一次 provider 请求已
+/// 超过提示缓存的存活时间（长时间的工具调用把缓存放冷了）；别的轮次一次都不问（问一次
+/// 要读一遍日志）。
 pub struct Compactor {
     pub planner: Arc<dyn CompactionPlanner>,
     /// 估计的上下文到这么多 token（窗口 − 预留）就问一次；`None` = 不知道窗口。
@@ -157,6 +162,7 @@ impl Compactor {
         boundary: bool,
         round: Option<&Round>,
         results: &[ToolResultForModel],
+        idle: Duration,
     ) -> bool {
         let results_tokens: u64 = results
             .iter()
@@ -182,7 +188,7 @@ impl Compactor {
         let pressure = self
             .pressure_tokens
             .is_some_and(|limit| self.estimate.max(reported) >= limit);
-        let due = boundary || self.pending || pressure;
+        let due = boundary || self.pending || pressure || idle > PROMPT_CACHE_TTL;
         self.pending = false;
         due
     }
@@ -272,7 +278,7 @@ impl AgentLoop {
         let Segment {
             session: _,
             run,
-            mut request,
+            request,
             env,
             budget,
             resume,
@@ -303,8 +309,8 @@ impl AgentLoop {
             }
         }
 
-        // 回放窗口里还没完整给够次数的大结果：这一段里到点就换成短视图（§8.3）。
-        let mut decay = decay::DecayTracker::seed(&mut request.messages);
+        // planner 决定换短视图的那批：下一次请求带给驱动就地换。
+        let mut revised: Vec<ToolResultForModel> = Vec::new();
 
         // 选驱动按 Run 的来源（§10）：命令 Job 触发的 Run 用固定出牌的
         // `CommandDriver`，`self.llm`（真正的模型客户端）一次都不会被摸到——不是把
@@ -317,29 +323,43 @@ impl AgentLoop {
             },
         };
 
+        // 上一次 provider 请求完成的时刻（这一段还没请求过就从段开头算）：工具跑得比缓存
+        // 存活时间还久，下一次请求就是冷的，那时改写前缀不欠债。
+        let mut last_request = tokio::time::Instant::now();
+
         // 续跑：先把上一回合剩下的调用跑完，再请求下一轮模型。
         let mut input = match resume {
             None => RoundInput::First,
             Some(resumed) => {
                 let mut results = resumed.settled;
-                decay.name(&resumed.pending);
                 let outcome = self.executor.execute_round(resumed.pending, &env).await?;
                 results.extend(outcome.results);
                 if let Some(stop) = outcome.stop {
                     return self.stop(&run, rounds, stop).await;
                 }
-                decay.track(&mut results);
                 if let Some(compactor) = compactor.as_mut()
-                    && compactor.due(outcome.plan_boundary, None, &results)
+                    && compactor.due(
+                        outcome.plan_boundary,
+                        None,
+                        &results,
+                        last_request.elapsed(),
+                    )
                     && let Some(done) = self
-                        .compact_now(&run, rounds, compactor, &env.cancel, &mut summaries)
+                        .compact_now(
+                            &run,
+                            rounds,
+                            compactor,
+                            &env.cancel,
+                            &mut summaries,
+                            &mut revised,
+                        )
                         .await?
                 {
                     return Ok(with_driver_usage(done, &driver.usage()));
                 }
                 RoundInput::ToolResults {
                     results,
-                    revised: decay.due(),
+                    revised: std::mem::take(&mut revised),
                 }
             }
         };
@@ -367,6 +387,7 @@ impl AgentLoop {
                 Some(Ok(round)) => round,
             };
             rounds += 1;
+            last_request = tokio::time::Instant::now();
 
             // 「模型回复截断或调用参数未收齐时不能开始执行」（§6）。
             if round.truncated {
@@ -383,8 +404,6 @@ impl AgentLoop {
             let (assistant, calls) = self.assign_ids(number, &round);
             // 完整 assistant 回复与该轮全部调用计划，一个逻辑事件（§8.3）。
             self.ledger.record_round(&run, assistant).await?;
-            // 账本上多了一条 `message.assistant`：这次请求带着的结果都算完整给过一次。
-            decay.sent();
 
             if calls.is_empty() {
                 // 正常结束：回复已经作为 `message.assistant` 落过盘了，现在才 complete。
@@ -414,49 +433,76 @@ impl AgentLoop {
                     .await;
             }
 
-            decay.name(&calls);
-            let mut outcome = self.executor.execute_round(calls, &env).await?;
+            let outcome = self.executor.execute_round(calls, &env).await?;
             if let Some(stop) = outcome.stop {
                 return self.stop(&run, rounds, stop).await;
             }
-            decay.track(&mut outcome.results);
             // 这一轮的调用全部收尾了（没停下）：这时才可能压——切点只落在轮次开头，一轮
             // 的调用与结果不会被分开。
             if let Some(compactor) = compactor.as_mut()
-                && compactor.due(outcome.plan_boundary, Some(&round), &outcome.results)
+                && compactor.due(
+                    outcome.plan_boundary,
+                    Some(&round),
+                    &outcome.results,
+                    last_request.elapsed(),
+                )
                 && let Some(done) = self
-                    .compact_now(&run, rounds, compactor, &env.cancel, &mut summaries)
+                    .compact_now(
+                        &run,
+                        rounds,
+                        compactor,
+                        &env.cancel,
+                        &mut summaries,
+                        &mut revised,
+                    )
                     .await?
             {
                 return Ok(with_driver_usage(done, &driver.usage()));
             }
             input = RoundInput::ToolResults {
                 results: outcome.results,
-                revised: decay.due(),
+                revised: std::mem::take(&mut revised),
             };
         }
     }
 
-    /// 一轮收尾之后问 planner；压成了（或摘要途中被取消）返回这一段的结局，不压或没压成
-    /// 返回 `None`，driver 原样接着跑。
+    /// 一轮收尾之后问 planner；压成了（或摘要途中被取消）返回这一段的结局。不改、没压成、
+    /// 或换了短视图返回 `None`，driver 原样接着跑——换短视图的那批并进 `revised`，随下一次
+    /// 请求交给驱动就地换。
     async fn compact_now(
         &self,
         run: &RunId,
         rounds: u32,
-        compactor: &Compactor,
+        compactor: &mut Compactor,
         cancel: &komo_kernel::types::tool::CancelToken,
         summaries: &mut TokenUsage,
+        revised: &mut Vec<ToolResultForModel>,
     ) -> Result<Option<SegmentOutcome>, AgentError> {
-        let Some(job) = compactor.planner.plan().await else {
-            return Ok(None);
-        };
-        Ok(match self.compact(run, job, cancel, summaries).await? {
-            Compaction::Compacted => Some(SegmentOutcome::Recompose {
-                rounds,
-                usage: *summaries,
-            }),
-            Compaction::Cancelled => Some(self.cancel(run, rounds).await?),
-            Compaction::Skipped => None,
+        Ok(match compactor.planner.plan().await {
+            None => None,
+            Some(Reshape::Compact(job)) => match self.compact(run, job, cancel, summaries).await? {
+                Compaction::Compacted => Some(SegmentOutcome::Recompose {
+                    rounds,
+                    usage: *summaries,
+                }),
+                Compaction::Cancelled => Some(self.cancel(run, rounds).await?),
+                Compaction::Skipped => None,
+            },
+            Some(Reshape::Decay(job)) => {
+                // 先落账再改视图（§8.5）：崩在中间，回放按已落账的集合给短视图，不会比账本领先。
+                self.ledger.record_compaction(run, job.outcome()).await?;
+                let saved = job.decision.archive_tokens;
+                compactor.estimate = compactor.estimate.saturating_sub(saved);
+                tracing::info!(
+                    target: "komo::observation",
+                    run = %run,
+                    calls = job.calls.len(),
+                    saved_tokens = saved,
+                    "observation.decayed"
+                );
+                revised.extend(job.revised);
+                None
+            }
         })
     }
 
@@ -743,7 +789,6 @@ fn add_usage(total: &mut TokenUsage, more: &TokenUsage) {
 }
 
 pub mod command_driver;
-mod decay;
 pub mod handler;
 
 #[cfg(test)]

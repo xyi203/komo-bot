@@ -1452,7 +1452,6 @@ mod tests {
                     call_id: ToolCallId::from_raw("tc-1"),
                     content: "结果1".into(),
                     is_error: false,
-                    decay: None,
                 }],
                 revised: Vec::new(),
             })
@@ -1474,7 +1473,6 @@ mod tests {
                     call_id: ToolCallId::from_raw("tc-2"),
                     content: "结果2".into(),
                     is_error: false,
-                    decay: None,
                 }],
                 revised: Vec::new(),
             })
@@ -1520,7 +1518,6 @@ mod tests {
             call_id: ToolCallId::from_raw(format!("tc-{provider_call_id}")),
             content: content.into(),
             is_error: false,
-            decay: None,
         }
     }
 
@@ -1725,14 +1722,12 @@ mod tests {
                     call_id: ToolCallId::from_raw("tc-1"),
                     content: "文件内容".into(),
                     is_error: false,
-                    decay: None,
                 },
                 ToolResultForModel {
                     provider_call_id: "call_2".into(),
                     call_id: ToolCallId::from_raw("tc-2"),
                     content: "boom".into(),
                     is_error: true,
-                    decay: None,
                 },
             ],
             provider_blocks: None,
@@ -1893,7 +1888,6 @@ mod live {
                     call_id: komo_kernel::types::ids::ToolCallId::from_raw("live-probe-call"),
                     content: "北京时间 2026-09-23 15:00".into(),
                     is_error: false,
-                    decay: None,
                 }],
                 revised: Vec::new(),
             })

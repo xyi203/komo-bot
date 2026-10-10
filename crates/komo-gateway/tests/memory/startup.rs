@@ -64,8 +64,10 @@ mode = "hybrid"
 #[tokio::test]
 async fn a_silent_embedding_endpoint_never_holds_up_readiness() {
     let port = a_silent_endpoint().await;
+    // 期限只是兜底：探测要等满 120 秒的模型超时，60 秒照样把"等它"与"不等它"分开，又
+    // 不会把负载下一次慢装配（沙箱自检就要好几秒）错当成回归。
     let mut started = tokio::time::timeout(
-        Duration::from_secs(5),
+        Duration::from_secs(60),
         memory_gateway(&config_pointing_at(port)).start(),
     )
     .await

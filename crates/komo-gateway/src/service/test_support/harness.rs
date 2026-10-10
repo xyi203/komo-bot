@@ -168,15 +168,15 @@ pub struct SentMessage {
     pub outbound: Outbound,
 }
 
-/// 一个内存发送口：`send` 记在 `sent` 里，可以被调成"此刻推不出去"、也可以被调慢。
+/// 一个内存发送口：`send` 记在 `sent` 里，可以被调成"此刻推不出去"、也可以被扣住。
 #[derive(Debug)]
 pub struct MemSender {
     platform: ChannelPlatform,
     sent: Mutex<Vec<SentMessage>>,
     deferring: std::sync::atomic::AtomicBool,
-    /// 每条发送先睡这么久。**启动补发是网络 I/O**：这个旋钮让"积压多少就等多久"在测试
-    /// 里可复现（§11.4 的补发不得压在就绪之前）。
-    delay: Mutex<std::time::Duration>,
+    /// 扣住时每条发送都停在平台往返上，直到放开。**启动补发是网络 I/O**：扣住它，
+    /// "就绪等不等补发"就是一个确定的问题，不必拿墙钟去量（§11.4 的补发不得压在就绪之前）。
+    held: tokio::sync::watch::Sender<bool>,
 }
 
 impl MemSender {
@@ -185,7 +185,7 @@ impl MemSender {
             platform,
             sent: Mutex::new(Vec::new()),
             deferring: std::sync::atomic::AtomicBool::new(false),
-            delay: Mutex::new(std::time::Duration::ZERO),
+            held: tokio::sync::watch::Sender::new(false),
         })
     }
 
@@ -230,9 +230,13 @@ impl MemSender {
             .store(deferring, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// 每条发送先睡这么久——"跟平台往返一次"的替身。
-    pub fn slow_down(&self, delay: std::time::Duration) {
-        *self.delay.lock().expect("发送延迟") = delay;
+    /// 扣住之后的每条发送都停在"跟平台往返"上，直到 [`Self::release`]。
+    pub fn hold(&self) {
+        self.held.send_replace(true);
+    }
+
+    pub fn release(&self) {
+        self.held.send_replace(false);
     }
 }
 
@@ -243,10 +247,7 @@ impl ChannelSender for MemSender {
     }
 
     async fn send(&self, peer: &ChannelPeer, msg: Outbound) -> Result<SendOutcome, DeliverError> {
-        let delay = *self.delay.lock().expect("发送延迟");
-        if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
-        }
+        let _ = self.held.subscribe().wait_for(|held| !*held).await;
         if self.deferring.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(SendOutcome::Deferred {
                 reason: "没有回复令牌".into(),

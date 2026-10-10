@@ -35,7 +35,8 @@ fn step(id: &str, status: &str) -> serde_json::Value {
     serde_json::json!({ "id": id, "goal": format!("做 {id}"), "status": status })
 }
 
-/// 模型拿到的每一份轮输入，去掉运行时自己发的 `call_id`：两台 Gateway 之间可比。
+/// 模型拿到的每一份轮输入，去掉运行时自己发的 `call_id` 与抬头里的耗时：两台 Gateway
+/// 之间可比。
 fn fed(inputs: &[RoundInput]) -> Vec<Option<Vec<(String, String, bool)>>> {
     inputs
         .iter()
@@ -46,12 +47,34 @@ fn fed(inputs: &[RoundInput]) -> Vec<Option<Vec<(String, String, bool)>>> {
                 Some(
                     results
                         .iter()
-                        .map(|r| (r.provider_call_id.clone(), r.content.clone(), r.is_error))
+                        .map(|r| {
+                            (
+                                r.provider_call_id.clone(),
+                                without_elapsed(&r.content),
+                                r.is_error,
+                            )
+                        })
                         .collect(),
                 )
             }
         })
         .collect()
+}
+
+/// 抬头 `[工具 · 状态 · 耗时 …]` 的第三段是墙钟：两台 Gateway 各跑各的，负载下差几毫秒。
+fn without_elapsed(content: &str) -> String {
+    let Some((head, body)) = content.split_once('\n') else {
+        return content.to_string();
+    };
+    let mut fields: Vec<&str> = head.split(" · ").collect();
+    if let Some(elapsed) = fields.get_mut(2) {
+        *elapsed = if elapsed.ends_with(']') {
+            "…]"
+        } else {
+            "…"
+        };
+    }
+    format!("{}\n{body}", fields.join(" · "))
 }
 
 /// 登记两步 → 完成第一步（一个计划边界）→ 收尾。

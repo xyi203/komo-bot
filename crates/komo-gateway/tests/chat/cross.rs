@@ -332,25 +332,26 @@ async fn becoming_ready_does_not_wait_for_the_delivery_backlog() {
     }
     assert_eq!(gateway.pending_deliveries().await.len(), 3);
 
-    // 新发送口每条要 1 秒：三条就是 3 秒。同步补发的话，重启至少要 3 秒。
+    // 新发送口被扣住：每条补发都停在平台往返上，放开之前一条也发不完。同步补发的话，
+    // 重启就永远回不来。期限只是兜底，取客户端的就绪超时：负载下光装配（沙箱自检）就要
+    // 好几秒，拿墙钟去量"够不够快"量的是机器忙不忙。
     let second = MemSender::new(ChannelPlatform::Telegram);
-    second.slow_down(std::time::Duration::from_secs(1));
-    let started = std::time::Instant::now();
-    gateway
-        .restart_with(
+    second.hold();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        gateway.restart_with(
             &telegram_config("111"),
             vec![FixedFactory::sender_only(
                 Arc::clone(&second) as Arc<dyn ChannelSender>
             )],
-        )
-        .await;
-    let ready = started.elapsed();
-    assert!(
-        ready < std::time::Duration::from_millis(1500),
-        "就绪等了 {ready:?}——补发又回到就绪之前了"
-    );
+        ),
+    )
+    .await
+    .expect("补发扣着没放，就绪却在等它——补发又回到就绪之前了");
+    assert!(second.sent().is_empty(), "就绪的时候补发还一条都没发完");
 
-    // 补发照样发生，只是晚一步。等它（3 秒的往返 + 余量）。
+    // 补发照样发生，只是晚一步。放开它再等。
+    second.release();
     let watching = Arc::clone(&second);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     while watching.sent().len() < 3 && std::time::Instant::now() < deadline {

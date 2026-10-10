@@ -1,5 +1,5 @@
-//! codemode（`docs/codemode.md` §10）：真 Gateway + 真沙箱。沙箱只在 macOS 上有，
-//! 别的平台 `codemode` 不注册，这组测试跳过。
+//! codemode（`docs/codemode.md` §10）：真 Gateway + 真沙箱。沙箱在 macOS 与开了 Landlock 的
+//! Linux 上有，别处 `codemode` 不注册，这组测试跳过。
 
 use std::sync::Arc;
 
@@ -28,7 +28,15 @@ fn tool_results(llm: &FakeLlm) -> Vec<String> {
         .collect()
 }
 
-/// 跑一段脚本，交回模型看到的那条工具结果。没有沙箱（非 macOS）时是 `None`。
+/// macOS 总有 Seatbelt；Linux 看内核的 LSM 列表里有没有 landlock。
+fn sandbox_expected() -> bool {
+    cfg!(target_os = "macos")
+        || (cfg!(target_os = "linux")
+            && std::fs::read_to_string("/sys/kernel/security/lsm")
+                .is_ok_and(|lsm| lsm.split(',').any(|name| name.trim() == "landlock")))
+}
+
+/// 跑一段脚本，交回模型看到的那条工具结果。没有沙箱时是 `None`。
 async fn run_script(home: &Home, code: &str) -> Option<(Gw, Arc<FakeLlm>, String)> {
     let llm = FakeLlm::new(vec![vec![
         call_round(1, "pc-1", "codemode", serde_json::json!({ "code": code })),
@@ -36,8 +44,8 @@ async fn run_script(home: &Home, code: &str) -> Option<(Gw, Arc<FakeLlm>, String
     ]]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     if !gw.state().tool_names.iter().any(|name| name == "codemode") {
-        if cfg!(target_os = "macos") {
-            panic!("macOS 上 codemode 该挂上");
+        if sandbox_expected() {
+            panic!("这台机器上 codemode 该挂上");
         }
         return None;
     }

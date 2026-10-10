@@ -37,6 +37,10 @@ base64 = { workspace = true }
 # ChatGPT OAuth 凭证文件的原子写（临时文件 + rename，§13.3）。
 tempfile = { workspace = true }
 
+# codemode 的 Linux 沙箱：Landlock + seccomp 走裸系统调用（docs/codemode.md §4）。
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 komo-kernel = { workspace = true, features = ["test-support"] }
 # §47 / §48 的指标只进 trace：验收要把那两行抓出来数一数。dev 构建里才有。

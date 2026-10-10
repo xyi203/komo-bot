@@ -2383,6 +2383,7 @@ dependencies = [
  "jiff",
  "komo-kernel",
  "komo-store",
+ "libc",
  "reqwest",
  "rmcp",
  "rustls",

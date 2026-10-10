@@ -48,7 +48,7 @@ stdin / stdout 正常。
 
 ## 4. 沙箱
 
-### macOS（首版）
+### macOS
 
 `sandbox-exec -p <profile> <python> -I -c <driver>`，Seatbelt 配置按解释器现生成：
 
@@ -76,14 +76,50 @@ stdin / stdout 正常。
 
 ### 自检，失败就不注册
 
-启动时用同一份配置跑一段自检脚本：写一个临时文件、连一个 socket、起一个子进程，**三样都必须
-被拒**、stdin/stdout 必须通。任何一条不成立（没有 `sandbox-exec`、配置被系统拒绝、某样没拦住），
+启动时用同一份配置跑一段自检脚本：读、写一个沙箱外的探针文件（这边先写好），连一个 socket，起一个
+子进程，**四样都必须被拒**、探针文件不能被改、stdin/stdout 必须通。任何一条不成立（没有
+`sandbox-exec` / Landlock、配置被系统拒绝、某样没拦住），
 `codemode` 就不进工具目录，日志写明原因。**不退化成没有沙箱的 Python。**
 
-### Linux（后续）
+### Linux
 
-Landlock（文件只读白名单、禁写）+ seccomp（禁 `socket` / `connect` / `execve`），在 `pre_exec`
-里装上，与 Codex 的 Linux 沙箱同一路数。首版 Linux 上自检不通过 → 不注册 codemode。
+不起外部程序（不用 bubblewrap），解释器直接起，fork 之后、exec 之前在 `pre_exec` 里把自己关进去：
+`PR_SET_NO_NEW_PRIVS` → `landlock_restrict_self` → `seccomp`。规则集与 BPF 过滤器在父进程里一次建好
+（要分配、开文件），子进程里只做这三个系统调用。走裸系统调用（`libc`，原本就在依赖树里），不引
+`landlock` / `seccompiler`。
+
+**Landlock**（`codemode/landlock.rs`）——把当前 ABI 认得的文件操作全部纳入管辖，然后只放：
+
+| 路径 | 权限 |
+|---|---|
+| 解释器的真实路径、它的 ELF 加载器（读 `PT_INTERP`，如 `/usr/lib64/ld-linux-x86-64.so.2`） | 执行 + 读 |
+| `sys.prefix`、`sys.base_prefix`、`/lib`、`/lib64`、`/usr/lib`、`/usr/lib64`、`/etc/ld.so.cache`、`/dev/urandom` | 读 |
+| `/dev/null` | 读写 |
+
+- 执行权只给那两个文件：`subprocess` / `os.execv` 起别的程序一律 `EACCES`。这一条 Codex 与 Grok
+  Build 都没有做（它们只管文件与网络）；Landlock 的执行权正好补上，且共享库是 `mmap` 进来的，
+  不需要执行权。
+- ABI ≥ 4 时 TCP 的 `bind` / `connect` 也纳入管辖、一条不放；ABI ≥ 6 时信号与抽象 Unix socket
+  不出沙箱（给父进程发信号 `EPERM`）。
+- 规则集按 ABI 版本取，但**内核没有 Landlock 就不注册 codemode**（不像 Codex 旧后端那样尽力而为）。
+
+**seccomp**——先核架构（不是本机架构就杀进程；x86_64 上 x32 的调用号一律拒），然后以下 `EPERM`：
+`socket`、`socketpair`、`connect`、`bind`、`listen`、`accept(4)`、`sendto`、`sendmsg`、`sendmmsg`、
+`io_uring_*`、`ptrace`、`process_vm_readv/writev`、`bpf`、`perf_event_open`。
+
+- Landlock 管不到 UDP 与 Unix socket（Codex 正是因此改用 bubblewrap 的网络命名空间）。这里
+  `socket()` 直接拒，新 socket 一个都开不出来；`connect` 一类再拒一遍，防继承下来的 socket fd。
+  io_uring 能绕开 `socket()`，一并拒。
+- 不用 bubblewrap：要装外部二进制，Ubuntu 24.04 默认还禁了非特权用户命名空间；而 codemode 的
+  子进程只需"读解释器、走 stdin/stdout"，Landlock + seccomp 足够，且什么都不用装。
+
+2026-10-10 在 Fedora 44（内核 7.2，Landlock ABI ≥ 6）实测：自检四项全拒；另读 `~/.komo/.env`、
+列 `~/.ssh` 与 `~`、读 `/etc/passwd`、写 `/tmp`、`mkdir`、UDP `sendto`、连 D-Bus 的 Unix socket、
+`os.kill(父进程, 0)`、fork 后 `execv /usr/bin/ls` 全部被拒；`import ssl`、读 `/usr`、写 `/dev/null`
+正常；系统 `python3` 与 `python3 -m venv` 建的 venv 都能用。
+
+参考：Codex `codex-rs/linux-sandbox`（bubblewrap + seccomp，旧后端是 Landlock）、Grok Build
+`xai-grok-sandbox`（进程级 Landlock + 子进程 `pre_exec` 里手写的 seccomp 网络过滤器）。
 
 ## 5. 脚本里的工具调用
 
@@ -140,14 +176,15 @@ Landlock（文件只读白名单、禁写）+ seccomp（禁 `socket` / `connect`
 | 位置 | 内容 |
 |---|---|
 | `komo-kernel` `types/plan.rs`、`policy/rules.rs`、`policy/defaults.rs` | `Operation::Codemode`、`OperationMatch::Codemode`、`codemode-allow` |
-| `komo-runtime` `codemode/`（`mod.rs` + `driver.py`） | 解释器探测、Seatbelt 配置、自检、子进程协议 |
+| `komo-runtime` `codemode/`（`mod.rs` + `driver.py`） | 解释器探测、自检、子进程协议 |
+| `komo-runtime` `codemode/seatbelt.rs` / `landlock.rs` / `unsupported.rs` | 按平台把子进程关进去：Seatbelt 配置 / Landlock + seccomp / 没有 |
 | `komo-runtime` `tools/codemode.rs` | `CodemodeTool`：定义 + `prepare`；`execute` 不该被走到（与 `dispatch` 同一模式） |
 | `komo-runtime` `executor` | `with_codemode(sandbox)`；`execute_authorized` 里按 `Operation::Codemode` 分流到 `run_codemode`；`nested_call` |
 | `komo-gateway` `service/mod.rs` | 启动时探测 + 自检，通过才注册工具并接上执行器 |
 
 ## 10. 验收
 
-- 沙箱自检：写文件 / 联网 / 起子进程三样被拒（macOS 上跑，其他平台跳过）。
+- 沙箱自检：读写沙箱外的文件 / 联网 / 起子进程被拒（macOS 与开了 Landlock 的 Linux 上跑，其他跳过）。
 - 端到端（真 Gateway）：脚本调 `read` 两次、过滤后 `text()`，模型只看到过滤结果；脚本里调
   `write` 抛错、文件没被写；脚本里读工作区外的文件（Ask）抛错；脚本死循环到时限被杀。
 - Policy：`codemode` 在 strict 下 Allow。

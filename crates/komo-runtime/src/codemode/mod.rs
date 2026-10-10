@@ -3,8 +3,11 @@
 //! 这里只管"在沙箱里跑一段 Python、把它的工具调用交出去"。工具调用怎么判、怎么执行在
 //! executor（`run_codemode` / `nested_call`）——这里拿到的只是一个回调。
 //!
-//! **沙箱起不来就没有 codemode**：[`Sandbox::probe`] 生成配置后跑一遍自检（写文件、联网、
-//! 起子进程三样都必须被拒），不过就返回错误，调用方不注册这个工具。不退化成裸 Python。
+//! **沙箱起不来就没有 codemode**：[`Sandbox::probe`] 生成配置后跑一遍自检（读写沙箱外的文件、
+//! 联网、起子进程都必须被拒），不过就返回错误，调用方不注册这个工具。不退化成裸 Python。
+//!
+//! 怎么关进去按平台分：macOS 是 Seatbelt（`seatbelt.rs`），Linux 是 Landlock + seccomp
+//! （`landlock.rs`），别的平台没有（`unsupported.rs`）。
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -13,16 +16,30 @@ use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+#[cfg(target_os = "linux")]
+mod landlock;
+#[cfg(target_os = "macos")]
+mod seatbelt;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod unsupported;
+
+#[cfg(target_os = "linux")]
+use landlock::Jail;
+#[cfg(target_os = "macos")]
+use seatbelt::Jail;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+use unsupported::Jail;
+
 const DRIVER: &str = include_str!("driver.py");
 
 /// 脚本输出（`text()` + console）的上限。
 pub const OUTPUT_LIMIT: usize = 1024 * 1024;
 
-/// 一份可用的沙箱：解释器 + 为它生成、自检通过的 Seatbelt 配置。
+/// 一份可用的沙箱：解释器 + 为它生成、自检通过的约束（Seatbelt 配置 / Landlock + seccomp）。
 #[derive(Debug, Clone)]
 pub struct Sandbox {
     interpreter: PathBuf,
-    profile: String,
+    jail: Jail,
 }
 
 /// 一段脚本跑完的样子。
@@ -53,9 +70,6 @@ struct DoneBody {
 impl Sandbox {
     /// 探解释器、生成配置、自检。任何一步不过都是 `Err`（说得清哪一步）。
     pub async fn probe(interpreter: &Path) -> Result<Sandbox, String> {
-        if !cfg!(target_os = "macos") {
-            return Err("这个平台还没有 codemode 沙箱（docs/codemode.md §4：Linux 待做）".into());
-        }
         let output = tokio::process::Command::new(interpreter)
             .args([
                 "-I",
@@ -75,16 +89,20 @@ impl Sandbox {
         let paths: Paths = serde_json::from_slice(&output.stdout)
             .map_err(|error| format!("解释器探测结果读不懂：{error}"))?;
         let sandbox = Sandbox {
-            profile: profile(&paths),
+            jail: Jail::new(&paths)?,
             interpreter: paths.executable,
         };
         sandbox.self_test().await?;
         Ok(sandbox)
     }
 
-    /// 写文件、联网、起子进程三样都必须被拒，协议必须通。
+    /// 读写沙箱外的文件、联网、起子进程都必须被拒，协议必须通。
+    ///
+    /// 探针文件先由这边写好：脚本读得到它、或者把它改掉了，都算没拦住。
     async fn self_test(&self) -> Result<(), String> {
-        let probe_file = std::env::temp_dir().join(format!("komo-codemode-{}", std::process::id()));
+        let probe_file =
+            std::env::temp_dir().join(format!("komo-codemode-{}", uuid::Uuid::now_v7()));
+        std::fs::write(&probe_file, "komo").map_err(|error| format!("探针文件写不了：{error}"))?;
         let code = format!(
             r#"
 import os, socket, subprocess
@@ -95,7 +113,8 @@ def blocked(f):
     except Exception:
         return True
 text({{
-    "write": blocked(lambda: open({path:?}, "w").write("x")),
+    "read": blocked(lambda: open({path:?}).read()),
+    "write": blocked(lambda: open({path:?}, "a").write("x")),
     "net": blocked(lambda: socket.create_connection(("1.1.1.1", 80), timeout=2)),
     "exec": blocked(lambda: subprocess.run(["/bin/echo", "x"], check=True)),
 }})
@@ -107,7 +126,7 @@ text({{
                 Err("自检不调工具".to_string())
             })
             .await;
-        let leaked = probe_file.exists();
+        let leaked = std::fs::read_to_string(&probe_file).ok().as_deref() != Some("komo");
         let _ = std::fs::remove_file(&probe_file);
         if let Some(error) = outcome.error {
             return Err(format!("沙箱自检没跑通：{error}"));
@@ -117,7 +136,7 @@ text({{
             .first()
             .and_then(|text| serde_json::from_str(text).ok())
             .ok_or("沙箱自检没有输出")?;
-        let all_blocked = ["write", "net", "exec"]
+        let all_blocked = ["read", "write", "net", "exec"]
             .iter()
             .all(|key| verdict[key] == serde_json::Value::Bool(true));
         if !all_blocked || leaked {
@@ -140,10 +159,9 @@ text({{
         F: FnMut(String, serde_json::Value) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, String>>,
     {
-        let mut child = match tokio::process::Command::new("/usr/bin/sandbox-exec")
-            .arg("-p")
-            .arg(&self.profile)
-            .arg(&self.interpreter)
+        let mut child = match self
+            .jail
+            .command(&self.interpreter)
             .args(["-I", "-c", DRIVER])
             .env_clear()
             .env("LANG", "C.UTF-8")
@@ -240,44 +258,31 @@ async fn write_line(
     stdin.flush().await
 }
 
-/// Seatbelt 配置（`docs/codemode.md` §4）：默认全拒，只放解释器与它的安装目录。
-fn profile(paths: &Paths) -> String {
-    let quote = |path: &Path| format!("{:?}", path.display().to_string());
-    let real =
-        std::fs::canonicalize(&paths.executable).unwrap_or_else(|_| paths.executable.clone());
-    let prefix = quote(&paths.prefix);
-    let base = quote(&paths.base_prefix);
-    format!(
-        r#"(version 1)
-(deny default)
-(allow process-exec (literal {exe}) (literal {real}) (subpath {prefix}) (subpath {base}))
-(allow process-fork)
-(allow file-map-executable)
-(allow file-read-metadata)
-(allow file-read* (subpath {prefix}) (subpath {base}) (subpath "/System") (subpath "/usr/lib")
-                  (subpath "/private/var/db/dyld") (literal "/dev/null") (literal "/dev/urandom")
-                  (literal "/"))
-(allow sysctl-read)
-(allow file-write-data (literal "/dev/null"))
-"#,
-        exe = quote(&paths.executable),
-        real = quote(&real),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn python() -> Option<PathBuf> {
-        let candidate = PathBuf::from("/usr/bin/python3");
-        (cfg!(target_os = "macos") && candidate.exists()).then_some(candidate)
+    /// macOS 与开了 Landlock 的 Linux 上沙箱必须起得来；别处跳过。
+    async fn sandbox() -> Option<Sandbox> {
+        let python = PathBuf::from("/usr/bin/python3");
+        if !python.exists() {
+            return None;
+        }
+        #[cfg(target_os = "linux")]
+        if landlock::abi().is_none() {
+            return None;
+        }
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
+            return None;
+        }
+        Some(Sandbox::probe(&python).await.expect("沙箱该起得来"))
     }
 
     #[tokio::test]
     async fn the_sandbox_blocks_writes_network_and_exec_and_still_talks() {
-        let Some(python) = python() else { return };
-        let sandbox = Sandbox::probe(&python).await.expect("macOS 上沙箱该起得来");
+        let Some(sandbox) = sandbox().await else {
+            return;
+        };
         let outcome = sandbox
             .run(
                 "r = tools.read(path='a.txt')\ntext(r['text'].upper())\nprint('done')",
@@ -297,8 +302,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_call_raises_inside_the_script() {
-        let Some(python) = python() else { return };
-        let sandbox = Sandbox::probe(&python).await.unwrap();
+        let Some(sandbox) = sandbox().await else {
+            return;
+        };
         let outcome = sandbox
             .run(
                 "try:\n    tools.write(path='x')\nexcept ToolError as e:\n    text('拒了：' + str(e))",
@@ -312,8 +318,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_runaway_script_is_killed_at_the_deadline() {
-        let Some(python) = python() else { return };
-        let sandbox = Sandbox::probe(&python).await.unwrap();
+        let Some(sandbox) = sandbox().await else {
+            return;
+        };
         let started = std::time::Instant::now();
         let outcome = sandbox
             .run(
@@ -329,8 +336,9 @@ mod tests {
 
     #[tokio::test]
     async fn an_exception_keeps_the_partial_output() {
-        let Some(python) = python() else { return };
-        let sandbox = Sandbox::probe(&python).await.unwrap();
+        let Some(sandbox) = sandbox().await else {
+            return;
+        };
         let outcome = sandbox
             .run(
                 "text('前半')\nraise ValueError('坏了')",

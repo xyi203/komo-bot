@@ -268,10 +268,15 @@ async fn open_session(
     if app.session.is_some() || !submitting {
         return (None, effects);
     }
-    match client
-        .create_session(&CreateSessionRequest::default())
-        .await
-    {
+    // 在哪个目录敲的 `komo`，这个会话就在哪个目录干活；取不到才落回 Gateway 的
+    // `workspaces_dir`。
+    let request = CreateSessionRequest {
+        workdir: std::env::current_dir()
+            .ok()
+            .map(|dir| dir.display().to_string()),
+        ..Default::default()
+    };
+    match client.create_session(&request).await {
         Ok(summary) => {
             // 会话 Id 在开场横幅上闪过一次（[`render::banner`]），而裸 `komo` 那条路上
             // 横幅印出来的时候它还不存在——补在这里，否则这个界面从头到尾说不出自己是谁。

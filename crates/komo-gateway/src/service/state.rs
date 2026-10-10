@@ -413,7 +413,7 @@ pub struct Assembly {
     pub llm: Option<Arc<dyn LlmClient>>,
     /// 测试注入的向量后端；`None` = 按 `memory.embedding` alias 造（造不出来就只有关键词臂）。
     pub embeddings: Option<Arc<dyn EmbeddingClient>>,
-    /// 共享 agent 目录（`~/.agents/skills`、`~/.claude/skills`）按哪个家目录算；
+    /// 共享 agent 目录（`~/.agents/skills`）按哪个家目录算；
     /// `None` = 当前用户的家目录。**注入而不是现场读 `$HOME`**（§5.6）：否则提示里有哪些
     /// skill 取决于这台机器上别人装过什么。
     pub shared_home: Option<PathBuf>,
@@ -1666,11 +1666,7 @@ fn build_reranker(
 /// 按当前快照造一份 skill 注册表（§5.6）。**这是唯一的那个来源**：系统提示里的目录行与
 /// `skill://` 的挂载点都从它来（各存一份就会出现"提示里有、读不到"）。
 ///
-/// `<workspace>` 取 Gateway 的 workspaces 目录，**不是** Session 的 `workdir`：这一块是
-/// 启动快照（§5.6 要的就是提示前缀稳定），而 `workdir` 是逐个会话变的——按它算出来的是
-/// 一份每段都可能不一样的前缀。
-///
-/// `shared_home` 是**注入**的（`~/.agents/skills`、`~/.claude/skills` 按它算）；`None`
+/// `shared_home` 是**注入**的（`~/.agents/skills` 按它算）；`None`
 /// 才回落到当前用户的家目录。现场读 `$HOME` 会让"提示里有哪些 skill"取决于这台机器上
 /// 别的 agent 装过什么，测试之间因此会互相污染。
 fn skills_registry(
@@ -1681,11 +1677,7 @@ fn skills_registry(
         Some(home) => Some(home.to_path_buf()),
         None => komo_runtime::config::user_home().ok(),
     };
-    komo_agent::skills::SkillRegistry::from_snapshot(
-        snapshot,
-        Some(&snapshot.paths.workspaces_dir),
-        home.as_deref(),
-    )
+    komo_agent::skills::SkillRegistry::from_snapshot(snapshot, home.as_deref())
 }
 
 /// 系统提示里那一块目录行（§5.6）：按**当前这套工具**从注册表现渲染。

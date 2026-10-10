@@ -86,7 +86,7 @@ pub struct ServiceOptions {
     pub llm: Option<Arc<dyn LlmClient>>,
     /// 测试注入的向量后端；`None` = 按 `memory.embedding` alias 造。
     pub embeddings: Option<Arc<dyn komo_kernel::traits::EmbeddingClient>>,
-    /// 共享 agent 目录（`~/.agents/skills`、`~/.claude/skills`）按**哪个家目录**算；
+    /// 共享 agent 目录（`~/.agents/skills`）按**哪个家目录**算；
     /// `None` = 当前用户的家目录（§5.6）。
     ///
     /// 它是注入的，不是现场读 `$HOME`：不然"提示里有哪些 skill"取决于跑这台进程的机器，

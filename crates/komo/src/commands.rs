@@ -679,12 +679,11 @@ pub fn auth_codex_status(home: &Path) -> Outcome {
 /// `komo skills ...`：只读文件系统，不经 Gateway（§5.6）。
 pub fn skills(home: &Path, action: SkillsAction<'_>) -> Outcome {
     let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
-    // 与 Gateway 同一个搜索路径（`from_snapshot`：配置里的目录 + workspace + 家目录下
-    // 那几个共享目录）。列表要是与系统提示里的目录行对不上，人就没法回答"我的 skill
+    // 与 Gateway 同一个搜索路径（`from_snapshot`：配置里的目录 + `~/.komo/skills` +
+    // `~/.agents/skills`）。列表要是与系统提示里的目录行对不上，人就没法回答"我的 skill
     // 为什么没进提示"。
     let registry = SkillRegistry::from_snapshot(
         &loaded.snapshot,
-        Some(&loaded.snapshot.paths.workspaces_dir),
         komo_gateway::config::user_home().ok().as_deref(),
     );
     let offer = offer_context();

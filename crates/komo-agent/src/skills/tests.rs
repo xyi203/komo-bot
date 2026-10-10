@@ -262,20 +262,13 @@ fn the_default_search_path_follows_the_documented_order() {
     snapshot.paths.skill_dirs = vec![PathBuf::from("/configured/skills")];
     snapshot.start_only.data_dir = PathBuf::from("/home/u/.komo");
 
-    let dirs = runtime_skill_dirs(
-        &snapshot,
-        Some(Path::new("/work/project")),
-        Some(Path::new("/home/u")),
-    );
+    let dirs = runtime_skill_dirs(&snapshot, Some(Path::new("/home/u")));
     assert_eq!(
         dirs,
         vec![
             PathBuf::from("/configured/skills"),
-            PathBuf::from("/work/project/skills"),
-            PathBuf::from("/work/project/.claude/skills"),
             PathBuf::from("/home/u/.komo/skills"),
             PathBuf::from("/home/u/.agents/skills"),
-            PathBuf::from("/home/u/.claude/skills"),
         ]
     );
 }
@@ -285,7 +278,7 @@ fn the_same_directory_listed_twice_is_only_searched_once() {
     let mut snapshot = komo_kernel::test_support::snapshot_fixture();
     snapshot.start_only.data_dir = PathBuf::from("/home/u/.komo");
     snapshot.paths.skill_dirs = vec![PathBuf::from("/home/u/.komo/skills")];
-    let dirs = runtime_skill_dirs(&snapshot, None, None);
+    let dirs = runtime_skill_dirs(&snapshot, None);
     assert_eq!(dirs, vec![PathBuf::from("/home/u/.komo/skills")]);
 }
 

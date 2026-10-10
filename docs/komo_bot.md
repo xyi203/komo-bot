@@ -340,10 +340,11 @@ Memos 使用用户访问令牌进行 API 认证；接入时核对用户部署的
 Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几个 toolbox 函数"；toolbox 是**可执行能力**。两者互补，不合并，共同构成 §5.3 README 那一层"模型先读说明再动手"的知识面。
 
 ```text
-~/.komo/skills/<name>/SKILL.md                     主目录
-<workspace>/skills/, <workspace>/.claude/skills/   项目自带
-~/.agents/skills/, ~/.claude/skills/               与其他本地 agent 共享，只读
+~/.komo/skills/<name>/SKILL.md   主目录
+~/.agents/skills/                与其他本地 agent 共享，只读
 ```
+
+只认这两处（加上配置里显式声明的目录）。`<workspace>/skills`、`~/.claude/skills` 不扫：根多了，模型拿不准 skill 在哪个根下，会把每个根下的同名 `SKILL.md` 都读一遍（真实会话里 `~/.claude/skills/sls` 是指向 `~/.agents/skills/sls` 的链接，同一份 16 KB 正文进了两次上下文）。
 
 - `SKILL.md` frontmatter：`name`、`description`，可选 `platforms:`、`requires_tools:`（对 5 个基础工具或 toolbox 模块名）。
 - 搜索路径有序，**同名先到先得**；每次查询重扫目录，编辑或新增无需重启。

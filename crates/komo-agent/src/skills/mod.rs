@@ -229,27 +229,19 @@ fn normalize_platform(name: &str) -> String {
 ///
 /// ```text
 /// 配置里声明的目录
-/// <workspace>/skills, <workspace>/.claude/skills   项目自带
-/// ~/.komo/skills                                    主目录
-/// ~/.agents/skills, ~/.claude/skills                与其他本地 agent 共享，只读
+/// ~/.komo/skills     主目录
+/// ~/.agents/skills   与其他本地 agent 共享，只读
 /// ```
 ///
-/// `home` 是**真实家目录**（不是 `KOMO_HOME`）：`~/.agents` 与 `~/.claude` 是别的 agent
-/// 也在读的目录，跟着 komo 的数据目录搬家就找不到了。
-pub fn runtime_skill_dirs(
-    snapshot: &ConfigSnapshot,
-    workspace: Option<&Path>,
-    home: Option<&Path>,
-) -> Vec<PathBuf> {
+/// 只认一个共享目录：多一个根，模型拿不准 skill 在哪个根下，就会把每个根都 `read` 一遍。
+///
+/// `home` 是**真实家目录**（不是 `KOMO_HOME`）：`~/.agents` 是别的 agent 也在读的目录，
+/// 跟着 komo 的数据目录搬家就找不到了。
+pub fn runtime_skill_dirs(snapshot: &ConfigSnapshot, home: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = snapshot.paths.skill_dirs.clone();
-    if let Some(workspace) = workspace {
-        dirs.push(workspace.join("skills"));
-        dirs.push(workspace.join(".claude").join("skills"));
-    }
     dirs.push(snapshot.start_only.data_dir.join("skills"));
     if let Some(home) = home {
         dirs.push(home.join(".agents").join("skills"));
-        dirs.push(home.join(".claude").join("skills"));
     }
     // 同一个目录出现两次没有意义，而去重要保**第一次**出现的位置。
     let mut seen = BTreeSet::new();
@@ -273,12 +265,8 @@ impl SkillRegistry {
     }
 
     /// 从一份快照接线；`disable` 的标记落在 `runtime_dir` 下。
-    pub fn from_snapshot(
-        snapshot: &ConfigSnapshot,
-        workspace: Option<&Path>,
-        home: Option<&Path>,
-    ) -> Self {
-        SkillRegistry::new(runtime_skill_dirs(snapshot, workspace, home))
+    pub fn from_snapshot(snapshot: &ConfigSnapshot, home: Option<&Path>) -> Self {
+        SkillRegistry::new(runtime_skill_dirs(snapshot, home))
             .with_disabled_file(snapshot.paths.runtime_dir.join("skills-disabled.json"))
     }
 

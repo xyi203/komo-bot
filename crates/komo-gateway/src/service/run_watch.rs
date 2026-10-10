@@ -371,7 +371,7 @@ async fn command_outcome(
         );
     };
     if result.exit_code == Some(0) {
-        let stdout = result.stdout_tail.trim();
+        let stdout = result.stdout_excerpt.trim();
         if stdout.is_empty() {
             (FiringStatus::Ok, String::new(), false)
         } else {
@@ -381,7 +381,7 @@ async fn command_outcome(
         let code = result
             .exit_code
             .map_or_else(|| "?".to_string(), |code| code.to_string());
-        let stderr = tail_lines(&result.stderr_tail, 20);
+        let stderr = tail_lines(&result.stderr_excerpt, 20);
         (FiringStatus::Error, format!("exit={code}\n{stderr}"), true)
     }
 }

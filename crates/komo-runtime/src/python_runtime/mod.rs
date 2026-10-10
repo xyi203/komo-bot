@@ -319,7 +319,7 @@ impl PythonRuntime {
             return Err(PyError::Protocol(format!(
                 "解释器没有写下结果（退出码 {:?}）：{}",
                 outcome.exit_code,
-                outcome.stderr_tail.trim()
+                outcome.stderr_excerpt.trim()
             )));
         };
         let reported: DriverResult = serde_json::from_str(&raw)
@@ -337,8 +337,8 @@ impl PythonRuntime {
             result: reported.result,
             error: reported.error,
             artifacts: produced,
-            // 预览要用（`python` 工具的 `preview`）：脚本只 print 时，模型至少看得到尾巴。
-            stdout_tail: outcome.stdout_tail,
+            // 预览要用（`python` 工具的 `preview`）：脚本只 print 时，模型至少看得到首尾摘录。
+            stdout_excerpt: outcome.stdout_excerpt,
             env_version: self.env_version.clone(),
         })
     }

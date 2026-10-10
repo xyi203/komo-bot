@@ -23,7 +23,9 @@ use crate::executor::cancel::cancelled;
 
 /// 取消或超时后，等进程组真正消失的上限。
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
-/// 预览保留的尾部字节数。
+/// 预览保留的头、尾字节数。两段加起来要装得进模型的正文预算（8 KiB）：超出时投影会在
+/// 中间再截一次，那句"省略多少字节"就只按预览算，对不上真实输出。
+const HEAD_LIMIT: usize = 3072;
 const TAIL_LIMIT: usize = 4096;
 
 /// 谁给这次子进程登记在册（§8.7）。
@@ -68,9 +70,9 @@ pub struct ChildOutcome {
     pub truncated: bool,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
-    /// 尾部片段，仅供预览；完整正文在 `ToolOutputStore` 里。
-    pub stdout_tail: String,
-    pub stderr_tail: String,
+    /// 首尾摘录，仅供预览；完整正文在 `ToolOutputStore` 里。
+    pub stdout_excerpt: String,
+    pub stderr_excerpt: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -83,23 +85,41 @@ pub enum ProcessError {
     Sink(String),
 }
 
-/// 一个只保留尾部的缓冲：预览要的是最后几行，不是把整份输出搬进内存。
+/// 预览用的摘录：开头、结尾各留一段，不把整份输出搬进内存。
+///
+/// 只留尾巴时，分析脚本先打印的汇总、报错前的上下文都看不到，模型只能再去分页读完整
+/// 输出（真实会话里为此多跑过两轮）。
 #[derive(Debug, Default)]
-struct Tail {
-    buffer: Vec<u8>,
+struct Excerpt {
+    head: Vec<u8>,
+    tail: Vec<u8>,
+    total: usize,
 }
 
-impl Tail {
-    fn push(&mut self, chunk: &[u8]) {
-        self.buffer.extend_from_slice(chunk);
-        if self.buffer.len() > TAIL_LIMIT {
-            let cut = self.buffer.len() - TAIL_LIMIT;
-            self.buffer.drain(..cut);
+impl Excerpt {
+    fn push(&mut self, mut chunk: &[u8]) {
+        self.total += chunk.len();
+        if self.head.len() < HEAD_LIMIT {
+            let take = chunk.len().min(HEAD_LIMIT - self.head.len());
+            self.head.extend_from_slice(&chunk[..take]);
+            chunk = &chunk[take..];
+        }
+        self.tail.extend_from_slice(chunk);
+        if self.tail.len() > TAIL_LIMIT {
+            let cut = self.tail.len() - TAIL_LIMIT;
+            self.tail.drain(..cut);
         }
     }
 
     fn into_string(self) -> String {
-        String::from_utf8_lossy(&self.buffer).into_owned()
+        let head = String::from_utf8_lossy(&self.head);
+        let tail = String::from_utf8_lossy(&self.tail);
+        let omitted = self.total - self.head.len() - self.tail.len();
+        if omitted == 0 {
+            format!("{head}{tail}")
+        } else {
+            format!("{head}\n…（中间省略 {omitted} 字节）…\n{tail}")
+        }
     }
 }
 
@@ -174,8 +194,8 @@ pub async fn run_child(
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
     let mut outcome = ChildOutcome::default();
-    let mut stdout_tail = Tail::default();
-    let mut stderr_tail = Tail::default();
+    let mut stdout_excerpt = Excerpt::default();
+    let mut stderr_excerpt = Excerpt::default();
     let mut stdout_buf = vec![0u8; 8192];
     let mut stderr_buf = vec![0u8; 8192];
 
@@ -211,7 +231,7 @@ pub async fn run_child(
                     Ok(0) | Err(_) => stdout = None,
                     Ok(n) => {
                         outcome.stdout_bytes += n as u64;
-                        stdout_tail.push(&stdout_buf[..n]);
+                        stdout_excerpt.push(&stdout_buf[..n]);
                         forward(sink, &spec, &mut outcome, &stdout_buf[..n], true).await?;
                     }
                 }
@@ -223,7 +243,7 @@ pub async fn run_child(
                     Ok(0) | Err(_) => stderr = None,
                     Ok(n) => {
                         outcome.stderr_bytes += n as u64;
-                        stderr_tail.push(&stderr_buf[..n]);
+                        stderr_excerpt.push(&stderr_buf[..n]);
                         forward(sink, &spec, &mut outcome, &stderr_buf[..n], false).await?;
                     }
                 }
@@ -255,8 +275,8 @@ pub async fn run_child(
     }
 
     outcome.exit_code = exit_status.and_then(|status| status.code());
-    outcome.stdout_tail = stdout_tail.into_string();
-    outcome.stderr_tail = stderr_tail.into_string();
+    outcome.stdout_excerpt = stdout_excerpt.into_string();
+    outcome.stderr_excerpt = stderr_excerpt.into_string();
     Ok(outcome)
 }
 
@@ -386,6 +406,34 @@ mod tests {
         assert!(message.contains("工作目录不存在"), "{message}");
         assert!(message.contains("komo-没有这个目录-9f3a"), "{message}");
         assert!(!message.contains("/bin/sh"), "别把程序名当原因：{message}");
+    }
+
+    /// 长输出的预览同时留着开头的汇总与结尾，中间写明省了多少。
+    #[tokio::test]
+    async fn a_long_output_keeps_both_its_head_and_its_tail() {
+        let outcome = run_child(
+            spec("echo SUMMARY; seq 1 5000; echo LAST"),
+            &mut writer(),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+        let excerpt = &outcome.stdout_excerpt;
+        assert!(excerpt.starts_with("SUMMARY\n"), "{excerpt}");
+        assert!(excerpt.ends_with("LAST\n"), "{excerpt}");
+        let omitted = outcome.stdout_bytes as usize - HEAD_LIMIT - TAIL_LIMIT;
+        assert!(
+            excerpt.contains(&format!("…（中间省略 {omitted} 字节）…")),
+            "{excerpt}"
+        );
+    }
+
+    #[test]
+    fn a_short_output_is_kept_whole() {
+        let mut excerpt = Excerpt::default();
+        excerpt.push(b"a\n");
+        excerpt.push(b"b\n");
+        assert_eq!(excerpt.into_string(), "a\nb\n");
     }
 
     #[tokio::test]

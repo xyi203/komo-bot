@@ -98,14 +98,14 @@ impl PythonHost for FakePythonHost {
                 result: serde_json::Value::Null,
                 error: None,
                 artifacts: vec![],
-                stdout_tail: String::new(),
+                stdout_excerpt: String::new(),
                 env_version: EnvVersion(env_version),
             },
         };
-        // 与真宿主**同一个事实**：写进 sink 的那段就是 stdout 的尾巴。替身自己编一份，
+        // 与真宿主**同一个事实**：写进 sink 的那段就是 stdout 的摘录。替身自己编一份，
         // 测出来的预览就跟真机上不是一回事。
-        if result.stdout_tail.is_empty() {
-            result.stdout_tail = written.unwrap_or_default();
+        if result.stdout_excerpt.is_empty() {
+            result.stdout_excerpt = written.unwrap_or_default();
         }
         Ok(result)
     }

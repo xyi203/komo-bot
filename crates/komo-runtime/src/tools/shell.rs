@@ -57,9 +57,9 @@ pub struct ShellResult {
     pub output_truncated: bool,
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
-    /// 尾部片段。完整 stdout / stderr 在这次尝试的输出目录里。
-    pub stdout_tail: String,
-    pub stderr_tail: String,
+    /// 首尾摘录。完整 stdout / stderr 在这次尝试的输出目录里。
+    pub stdout_excerpt: String,
+    pub stderr_excerpt: String,
 }
 
 /// 一条 shell 命令的执行计划**形状**：工具名、操作、命令正文的版本快照、恢复方式。
@@ -246,8 +246,8 @@ impl Tool for ShellTool {
             output_truncated: outcome.truncated,
             stdout_bytes: outcome.stdout_bytes,
             stderr_bytes: outcome.stderr_bytes,
-            stdout_tail: outcome.stdout_tail,
-            stderr_tail: outcome.stderr_tail,
+            stdout_excerpt: outcome.stdout_excerpt,
+            stderr_excerpt: outcome.stderr_excerpt,
         };
         // 非零退出码是**结果**，不是工具失败：模型看得到退出码才改得动命令（§6）。
         let status = if outcome.exit_code == Some(0) {
@@ -267,8 +267,8 @@ impl Tool for ShellTool {
             } else {
                 ""
             },
-            result.stdout_tail,
-            result.stderr_tail
+            result.stdout_excerpt,
+            result.stderr_excerpt
         );
         Ok(ToolOutput {
             status,
@@ -334,7 +334,7 @@ mod tests {
 
         let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
         assert_eq!(output.exit_code, Some(0));
-        assert_eq!(shell_result(&output).stdout_tail.trim(), "hi");
+        assert_eq!(shell_result(&output).stdout_excerpt.trim(), "hi");
         assert!(sink.bytes_written() > 0, "输出流进了写入器");
     }
 
@@ -366,9 +366,9 @@ mod tests {
             .unwrap();
         let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
         assert!(
-            shell_result(&output).stdout_tail.trim().ends_with("sub"),
+            shell_result(&output).stdout_excerpt.trim().ends_with("sub"),
             "{:?}",
-            shell_result(&output).stdout_tail
+            shell_result(&output).stdout_excerpt
         );
     }
 
@@ -388,7 +388,7 @@ mod tests {
             .await
             .unwrap();
         let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
-        assert_eq!(shell_result(&output).stdout_tail.trim(), "[]");
+        assert_eq!(shell_result(&output).stdout_excerpt.trim(), "[]");
         unsafe { std::env::remove_var("KOMO_TEST_SECRET") };
     }
 

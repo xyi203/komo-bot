@@ -342,16 +342,16 @@ impl Tool for PythonTool {
         // 顺序有讲究：**只 print、不返回结构化结果**是最常见的一种跑法，而原先这里
         // `to_string(&Value::Null)` 得到的是字面量 `null`——模型看到它以为工具坏了，改用
         // `shell` + `python3` 把同一件事重跑一遍（真实会话里就这么白花了两轮）。所以没有
-        // 结构化结果时给 stdout 的尾巴，再不济也要说清"没有输出"，绝不把 `null` 当正文。
+        // 结构化结果时给 stdout 的首尾摘录，再不济也要说清"没有输出"，绝不把 `null` 当正文。
         let preview = match (&outcome.error, outcome.result.is_null()) {
             (Some(error), _) => format!("{:?}：{error}", outcome.status),
             (None, false) => serde_json::to_string(&outcome.result).unwrap_or_default(),
             (None, true) => {
-                let tail = outcome.stdout_tail.trim();
-                if tail.is_empty() {
+                let excerpt = outcome.stdout_excerpt.trim();
+                if excerpt.is_empty() {
                     "没有返回值，也没有输出".to_string()
                 } else {
-                    format!("没有返回值；这是 stdout 的尾部：\n{tail}")
+                    format!("没有返回值；这是 stdout 的首尾摘录：\n{excerpt}")
                 }
             }
         };
@@ -829,7 +829,7 @@ def turn_off(entity_id):
             result: serde_json::json!(2),
             error: None,
             artifacts: vec![],
-            stdout_tail: String::new(),
+            stdout_excerpt: String::new(),
             env_version: host.env_version(),
         });
         let plan = tool
@@ -959,7 +959,7 @@ def turn_off(entity_id):
             result: serde_json::json!({ "off": "light.living_room" }),
             error: None,
             artifacts: vec![],
-            stdout_tail: String::new(),
+            stdout_excerpt: String::new(),
             env_version: host.env_version(),
         });
         let output = tool
@@ -1098,7 +1098,7 @@ def turn_off(entity_id):
                 result: answer,
                 error: None,
                 artifacts: vec![],
-                stdout_tail: String::new(),
+                stdout_excerpt: String::new(),
                 env_version: host.env_version(),
             });
             assert_eq!(tool.verify(&plan, &ctx).await.unwrap(), want);
@@ -1133,7 +1133,7 @@ def turn_off(entity_id):
             result: serde_json::json!({ "idempotent": true }),
             error: None,
             artifacts: vec![],
-            stdout_tail: String::new(),
+            stdout_excerpt: String::new(),
             env_version: host.env_version(),
         });
         assert!(
@@ -1257,11 +1257,11 @@ def turn_off(entity_id):
         );
     }
 
-    /// 只 print 的脚本：预览给 stdout 的尾巴，**不是字面量 `null`**。
+    /// 只 print 的脚本：预览给 stdout 的首尾摘录，**不是字面量 `null`**。
     ///
     /// 真实会话里模型看到 `null` 以为工具坏了，改用 `shell` + `python3` 把同一件事重跑了一遍。
     #[tokio::test]
-    async fn a_script_that_only_prints_shows_its_stdout_tail() {
+    async fn a_script_that_only_prints_shows_its_stdout_excerpt() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let (host, tool) = wire();
@@ -1271,7 +1271,7 @@ def turn_off(entity_id):
             result: serde_json::Value::Null,
             error: None,
             artifacts: vec![],
-            stdout_tail: String::new(),
+            stdout_excerpt: String::new(),
             env_version: host.env_version(),
         });
         let plan = tool
@@ -1302,7 +1302,7 @@ def turn_off(entity_id):
             result: serde_json::Value::Null,
             error: None,
             artifacts: vec![],
-            stdout_tail: String::new(),
+            stdout_excerpt: String::new(),
             env_version: host.env_version(),
         });
         let plan = tool

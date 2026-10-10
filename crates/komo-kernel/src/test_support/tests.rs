@@ -311,7 +311,7 @@ fn the_fake_python_host_records_calls_and_streams_stdout() {
             result: serde_json::json!(2),
             error: None,
             artifacts: vec![],
-            stdout_tail: String::new(),
+            stdout_excerpt: String::new(),
             env_version: EnvVersion("py-test-1".into()),
         });
 
@@ -334,8 +334,8 @@ fn the_fake_python_host_records_calls_and_streams_stdout() {
         assert_eq!(result.result, serde_json::json!(2));
         assert_eq!(writer.stdout, b"hello\n");
         assert_eq!(
-            result.stdout_tail, "hello\n",
-            "写进 sink 的那段就是尾巴——替身与真宿主一个事实"
+            result.stdout_excerpt, "hello\n",
+            "写进 sink 的那段就是摘录——替身与真宿主一个事实"
         );
         assert_eq!(host.calls().len(), 1);
 

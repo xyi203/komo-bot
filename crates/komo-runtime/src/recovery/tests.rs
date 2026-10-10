@@ -1611,3 +1611,36 @@ async fn a_backfill_that_cannot_be_written_falls_back_to_the_tools_verify() {
     assert!(tool_results(&world).is_empty(), "没补上就是没补上，不假装");
     assert_eq!(index.requeued(), vec![run]);
 }
+
+/// 本进程自己领着的 Run 不进这一趟（§8.9）。调度器先在库里提交领取、再把 Run 交给
+/// handler，handler 开跑才记进 `InFlight`——这段空当里对账读到的是"`running`、领取者是我"。
+/// 拿它去问"上一个执行实例停了吗"只会答"没停"（就是我自己），于是一条正在本进程手里起跑
+/// 的 Run 被停成 `waiting + intervention`。
+#[tokio::test]
+async fn a_run_this_process_just_claimed_is_not_judged() {
+    let world = World::new();
+    let run = world.accept().await;
+    let me = ExecutorId::from_raw("exec-now");
+    let mut row = world.run_row(&run, RunState::Running);
+    row.claimed_by = Some(me.clone());
+    let children = tempfile::tempdir().unwrap();
+    let index = MemIndex::with(vec![row]);
+    let scan = RecoveryScan::new(
+        Arc::clone(&world.ledger) as Arc<dyn Ledger>,
+        Arc::clone(&index) as Arc<dyn RecoveryIndex>,
+        Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
+        Arc::clone(&world.approvals) as Arc<dyn ApprovalRepo>,
+        Arc::new(world.clock.clone()),
+        me.clone(),
+        Arc::new(LockHolderLiveness::holding_lock(
+            me,
+            ChildRegistry::new(children.path()),
+        )),
+    );
+
+    let report = scan.scan().await.unwrap();
+    assert!(report.outcomes.is_empty(), "{report:?}");
+    assert!(index.attention().is_empty(), "{:?}", index.attention());
+    assert!(index.requeued().is_empty());
+    assert!(index.backfilled().is_empty());
+}

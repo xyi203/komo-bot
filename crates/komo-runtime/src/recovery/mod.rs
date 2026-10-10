@@ -353,6 +353,16 @@ impl RecoveryScan {
             ..Default::default()
         };
         for run in self.index.unfinished_runs().await? {
+            // 本进程自己领着的不判（§8.9）：调度器先在库里提交领取、再交给 handler，这段
+            // 空当里它是"`running`、领取者是我"，而对"上一个执行实例停了吗"我只能答"没停"
+            // ——那会把一条正在本进程手里起跑的 Run 停成等人判断。领取者是我而 handler 已经
+            // 不在的，由对账在这一趟之前按租约与 `InFlight` 交还（`reclaim_orphans`），交还
+            // 之后它就不再是我的了。启动那一趟里还没有任何 Run 是这一世领的（实例身份每次
+            // 启动新生成，调度器在扫描之后才起）。
+            if run.claimed_by.as_ref() == Some(&self.executor) {
+                tracing::debug!(run = %run.run, "本进程领着的 Run，这一趟不判");
+                continue;
+            }
             let (action, orphan) = match self.observe_full(&run).await {
                 Ok(observed) => (decide(&observed.input), observed.orphan),
                 Err(error) => {

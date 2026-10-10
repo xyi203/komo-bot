@@ -1359,3 +1359,15 @@ mod compaction {
         assert_eq!(planner.asked(), 1, "只有第二轮那一大段参数把估计推过了线");
     }
 }
+
+/// OpenAI 的 `output_tokens` 已经含推理：预算只算一次。
+#[test]
+fn reasoning_is_not_counted_twice_against_the_budget() {
+    let usage = komo_kernel::types::model::TokenUsage {
+        input: Some(100),
+        output: Some(40),
+        reasoning: Some(30),
+        ..Default::default()
+    };
+    assert_eq!(super::spent(&usage), 140);
+}

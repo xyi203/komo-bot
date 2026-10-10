@@ -711,9 +711,10 @@ impl AgentLoop {
 }
 
 /// 已知的用量之和。**未知不是零**（§8.5），所以 `None` 在这里贡献 0 只是因为它压根
-/// 没进预算比较——判超预算用的是"已知花掉了多少"。
+/// 没进预算比较——判超预算用的是"已知花掉了多少"。`reasoning` 已经算在 `output` 里，
+/// 不再另加。
 pub(crate) fn spent(usage: &TokenUsage) -> u64 {
-    usage.input.unwrap_or(0) + usage.output.unwrap_or(0) + usage.reasoning.unwrap_or(0)
+    usage.input.unwrap_or(0) + usage.output.unwrap_or(0)
 }
 
 /// `Recompose` 的用量再加上这一段 driver 自己的。

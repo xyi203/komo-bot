@@ -353,6 +353,7 @@ pub struct TokenUsage {
     pub input: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<u64>,
+    /// `output` 里推理的部分（OpenAI 的 `reasoning_tokens`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<u64>,
     /// `input` 里由前缀缓存供给的部分。

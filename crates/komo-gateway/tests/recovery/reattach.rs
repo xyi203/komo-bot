@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use komo_kernel::traits::{Inbound, LlmClient};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Outbound};
-use komo_kernel::types::status::RunState;
+use komo_kernel::types::status::{RunState, WaitReason};
 
 use crate::harness::*;
 
@@ -66,9 +66,12 @@ async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_on
         Some(&run),
         "停的是这条 Run 里那次 shell 调用"
     );
+    // 审批先落库、Run 后挂起（两次写），所以看见审批不等于 Run 已经停下：等它停稳。
     assert_eq!(
-        gw.db_state(&run).await,
-        RunState::Waiting,
+        gw.wait_waiting(&run).await,
+        WaitReason::Approval {
+            approval: pending.approval.clone()
+        },
         "重启前这条 Run 还没到终态——这正是要测的那个窗口"
     );
 
@@ -160,7 +163,12 @@ async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
 
     let pending = gw.wait_approval().await;
     let task_run = pending.run.clone().expect("审批挂在任务的 Run 上");
-    assert_eq!(gw.db_state(&task_run).await, RunState::Waiting);
+    assert_eq!(
+        gw.wait_waiting(&task_run).await,
+        WaitReason::Approval {
+            approval: pending.approval.clone()
+        }
+    );
 
     gw.stop().await;
     let gw = home

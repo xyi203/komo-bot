@@ -858,8 +858,9 @@ mod tests {
             ))
             .unwrap();
 
+        // 表情在后台加、回执就地发，两者谁先到平台没有次序：两样都等到。
         serve_until(harness.channel, recorder, || {
-            !fake.calls_to("messages").is_empty()
+            !fake.calls_to("messages").is_empty() && !fake.calls_to("reactions").is_empty()
         })
         .await;
 

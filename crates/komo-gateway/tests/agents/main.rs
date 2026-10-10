@@ -16,14 +16,15 @@
 use std::sync::{Arc, Mutex};
 
 use komo_gateway::service::test_support::harness::{
-    DEFAULT_ENV, FakeLlm, Gw, Home, MemSender, call_round, inbound, text_round, write_home_with,
+    DEFAULT_ENV, FakeLlm, Gw, Home, MemSender, call_round, eventually, inbound, text_round,
+    write_home_with,
 };
 use komo_kernel::protocol::InboundAck;
 use komo_kernel::traits::{Inbound, LlmClient, TurnDriver};
 use komo_kernel::types::chat::{ChannelPlatform, Outbound};
 use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::model::TokenUsage;
-use komo_kernel::types::status::RunState;
+use komo_kernel::types::status::{RunState, WaitReason};
 use komo_kernel::types::turn::{LlmError, Round, RoundInput, TurnRequest};
 
 // ---------------------------------------------------------------- 配置
@@ -619,13 +620,13 @@ async fn a_background_task_reports_back_through_home() {
     let detail = gateway.wait_terminal(&home_run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     // 脚本模型原样念出的是投影过的工具结果：第一行是抬头，"已派出"在正文那一行。
-    let delivered = texts_to(&sender, "111");
-    assert!(
-        delivered
+    // 回复由看客在终态事件之后投出去，比库里的终态晚一步，所以要等。
+    eventually("home 的回复里说了已派出", || {
+        texts_to(&sender, "111")
             .iter()
-            .any(|text| text.lines().any(|line| line.starts_with("已派出 #"))),
-        "{delivered:?}"
-    );
+            .any(|text| text.lines().any(|line| line.starts_with("已派出 #")))
+    })
+    .await;
 
     // ── 2. 任务会话：kind = task、origin = task:{home}、与 home 同一个 Agent、标题写死。
     let sessions = komo_store::repos::session::list(&gateway.state().db, false)
@@ -648,13 +649,13 @@ async fn a_background_task_reports_back_through_home() {
     let relayed = gateway.wait_terminal(&report).await;
     assert_eq!(relayed.summary.state, RunState::Completed, "{relayed:?}");
 
-    let delivered = texts_to(&sender, "111");
-    assert!(
-        delivered
+    eventually("home 转告了任务的结果", || {
+        texts_to(&sender, "111")
             .iter()
-            .any(|text| text == "转告：空调已经关掉了。"),
-        "{delivered:?}"
-    );
+            .any(|text| text == "转告：空调已经关掉了。")
+    })
+    .await;
+    let delivered = texts_to(&sender, "111");
     assert!(
         !delivered.iter().any(|text| text == "空调已经关掉了。"),
         "任务的原话不该直接投给渠道：{delivered:?}"
@@ -668,13 +669,12 @@ async fn a_background_task_reports_back_through_home() {
     assert_eq!(task_runs.len(), 2, "{task_runs:?}");
     let report_2 = wait_report(&gateway, &home_session, &task_runs[1].run).await;
     gateway.wait_terminal(&report_2).await;
-    assert!(
+    eventually("follow 的结果照样经 home 转告", || {
         texts_to(&sender, "111")
             .iter()
-            .any(|text| text == "转告：功耗 300W。"),
-        "{:?}",
-        texts_to(&sender, "111")
-    );
+            .any(|text| text == "转告：功耗 300W。")
+    })
+    .await;
 
     gateway.stop().await;
 }
@@ -694,7 +694,13 @@ async fn home_answers_while_a_task_waits_on_approval() {
     gateway.wait_terminal(&home_run).await;
     let approval = gateway.wait_approval().await;
     let task_run = approval.run.clone().expect("审批挂在任务的 Run 上");
-    assert_eq!(gateway.db_state(&task_run).await, RunState::Waiting);
+    // 审批先落库、Run 后挂起：等它停稳在这条审批上。
+    assert_eq!(
+        gateway.wait_waiting(&task_run).await,
+        WaitReason::Approval {
+            approval: approval.approval.clone()
+        }
+    );
 
     let (_, home_run_2) = dm(&gateway, "1+1 等于几", "dm-2").await;
     let detail = gateway.wait_terminal(&home_run_2).await;

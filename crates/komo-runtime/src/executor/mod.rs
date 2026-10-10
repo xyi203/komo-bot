@@ -458,7 +458,12 @@ impl ToolExecutor {
 
             // 屏障：在飞的先收尾，再按顺序处理这一条。
             if let Some(stop) = drain(&mut in_flight, &mut settled).await? {
-                queue.push_front((index, request));
+                // 在 `begin` 里就落了结论的那条（被拒、不认识、核对收口）不是"还没轮到"：
+                // 结论照样交给模型，不放回去。
+                match begin {
+                    Begin::Settled(CallSettlement::Result(result)) => settled.push((index, result)),
+                    _ => queue.push_front((index, request)),
+                }
                 return Ok(finish(Some(stop), queue, settled, boundary));
             }
             let settlement = match begin {

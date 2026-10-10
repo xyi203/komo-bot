@@ -2584,6 +2584,67 @@ async fn an_ask_stops_the_round_and_lands_only_after_the_reads_finish() {
     assert_eq!(pending[0].plan.tool, "read");
 }
 
+/// 在 `begin` 里就落了结论的调用（这里是能力面里没有的工具名）不是"还没轮到"：前面在飞的
+/// 读停下来时，它已经落账的结果照样交给模型，不放回 `remaining`。
+#[tokio::test]
+async fn a_call_settled_before_a_stopping_read_keeps_its_result() {
+    let harness = Harness::new();
+    let cancel = CancelToken::new();
+    let reader = Arc::new(
+        Probe::new(
+            "read",
+            Operation::ReadFile,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_cancel(cancel.clone()),
+    );
+    let executor = harness.permissive(vec![reader]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(
+            &run,
+            &[
+                (
+                    "read",
+                    serde_json::json!({ "path": "a.txt", "delay_ms": 50 }),
+                ),
+                ("nope", serde_json::json!({})),
+            ],
+        )
+        .await;
+
+    let outcome = executor
+        .execute_round(calls, &harness.env_with_cancel(&session, &run, cancel))
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(outcome.stop, Some(RoundStop::Cancelled)),
+        "{:?}",
+        outcome.stop
+    );
+    assert!(
+        seq_of(&harness, "call-1", "result") > 0,
+        "不认识的工具名在账上有结论"
+    );
+    let order: Vec<&str> = outcome
+        .results
+        .iter()
+        .map(|result| result.provider_call_id.as_str())
+        .collect();
+    assert_eq!(order, ["pc-0", "pc-1"], "已经落账的结论没交给模型");
+    assert!(outcome.results[1].is_error);
+    assert!(
+        outcome.remaining.is_empty(),
+        "已经有结论的调用被放回了 remaining：{:?}",
+        outcome
+            .remaining
+            .iter()
+            .map(|request| &request.call)
+            .collect::<Vec<_>>()
+    );
+}
+
 /// 取消要收齐已经在飞的那几条：它们的结论一个都不能丢（§8.6）。
 #[tokio::test]
 async fn cancelling_collects_the_reads_that_are_already_in_flight() {

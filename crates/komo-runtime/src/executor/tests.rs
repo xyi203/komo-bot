@@ -1739,6 +1739,56 @@ mod delegation {
         assert_eq!(child_runs(&harness), vec![first_child], "没有多派出一条");
     }
 
+    /// 委派是屏障：前面在飞的读先收尾，才受理子 Run、`start_call`（§6）。
+    #[tokio::test]
+    async fn delegate_is_a_barrier() {
+        let harness = Harness::new();
+        let probe = Arc::new(Probe::new(
+            "read",
+            Operation::ReadFile,
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let executor = harness.permissive(vec![probe, Arc::new(DelegateTool::new())]);
+        let (session, run) = harness.open_run().await;
+        let calls = harness
+            .record_round(
+                &run,
+                &[
+                    ("read", json!({ "path": "a.txt", "delay_ms": 40 })),
+                    ("delegate", json!({ "task": "跑一遍检查" })),
+                ],
+            )
+            .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome.stop, Some(RoundStop::Dependency { .. })),
+            "{:?}",
+            outcome.stop
+        );
+        assert_eq!(outcome.results.len(), 1, "前面的读已经收尾");
+        let accepted = harness
+            .ledger
+            .events()
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::RunAccepted(accepted) if accepted.delegate.is_some() => {
+                    Some(event.seq.0)
+                }
+                _ => None,
+            })
+            .expect("受理了一条子 Run");
+        assert!(
+            seq_of(&harness, "call-0", "result") < accepted,
+            "前面的读还没收尾，子 Run 就受理了"
+        );
+        assert!(accepted < seq_of(&harness, "call-1", "started"));
+    }
+
     /// ⑦ 派出去这件事本身要过 Policy 与审批（§7.1）：没放行就不该在账本里留下一条
     /// 没人认领的子 Run。
     #[tokio::test]
@@ -2386,6 +2436,24 @@ impl Tool for Probe {
             preview: Some(format!("{tag} 完成")),
         })
     }
+}
+
+/// 这次调用的 `tool.started` / `tool.result` 落在账本的第几条：屏障的先后就看它。
+fn seq_of(harness: &Harness, call: &str, kind: &str) -> u64 {
+    use komo_kernel::events::EventPayload;
+    let call = ToolCallId::from_raw(call);
+    harness
+        .ledger
+        .events()
+        .iter()
+        .find_map(|event| match (&event.payload, kind) {
+            (EventPayload::ToolStarted(body), "started") if body.call_id == call => {
+                Some(event.seq.0)
+            }
+            (EventPayload::ToolResult(body), "result") if body.call_id == call => Some(event.seq.0),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("{call} 没有 {kind}"))
 }
 
 fn read_call(path: &str) -> (&'static str, serde_json::Value) {
@@ -3238,6 +3306,184 @@ mod dispatch_and_follow {
             .unwrap();
         assert_ne!(a.plan_hash(), b.plan_hash());
     }
+
+    /// ⑦ 前面在飞的读停下来（这里是取消），排在它后面的 dispatch 就是"还没轮到"：交回
+    /// `remaining` 的它不能已经派出去、也不能已经 `start_call` 过——否则续跑时交回来的是
+    /// 一条已经有结果的调用，而它的结果这一轮也没交给模型。
+    #[tokio::test]
+    async fn a_dispatch_behind_a_stopping_read_is_not_sent() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new();
+        let cancel = CancelToken::new();
+        let reader = Arc::new(
+            Probe::new(
+                "read",
+                Operation::ReadFile,
+                Arc::new(Mutex::new(Vec::new())),
+            )
+            .with_cancel(cancel.clone()),
+        );
+        let executor = harness.initial_with_spawner(
+            vec![reader, Arc::new(DispatchTool::new())],
+            fake.clone() as Arc<dyn TaskSpawner>,
+        );
+        let (session, run) = harness.open_run().await;
+        let calls = harness
+            .record_round(
+                &run,
+                &[
+                    (
+                        "read",
+                        serde_json::json!({ "path": "a.txt", "delay_ms": 50 }),
+                    ),
+                    (
+                        "dispatch",
+                        serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+                    ),
+                ],
+            )
+            .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env_with_cancel(&session, &run, cancel))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcome.stop, Some(RoundStop::Cancelled)),
+            "{:?}",
+            outcome.stop
+        );
+        let remaining: Vec<&ToolCallId> = outcome.remaining.iter().map(|r| &r.call).collect();
+        assert_eq!(remaining, [&ToolCallId::from_raw("call-1")]);
+        assert_eq!(fake.spawn_calls(), 0, "还没轮到的 dispatch 已经派出去了");
+        let started = harness.ledger.events().iter().any(|event| {
+            matches!(
+                &event.payload,
+                komo_kernel::events::EventPayload::ToolStarted(body)
+                    if body.call_id == ToolCallId::from_raw("call-1")
+            )
+        });
+        assert!(!started, "还没轮到的 dispatch 已经 start_call 过");
+    }
+
+    /// ⑧ dispatch 是屏障：前面在飞的读先收尾它才派出去，后面的读等它收完才开始（§6）。
+    #[tokio::test]
+    async fn dispatch_is_a_barrier() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new();
+        let probe = Arc::new(Probe::new(
+            "read",
+            Operation::ReadFile,
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let executor = harness.initial_with_spawner(
+            vec![probe.clone(), Arc::new(DispatchTool::new())],
+            fake.clone() as Arc<dyn TaskSpawner>,
+        );
+        let (session, run) = harness.open_run().await;
+        let calls = harness
+            .record_round(
+                &run,
+                &[
+                    (
+                        "read",
+                        serde_json::json!({ "path": "a.txt", "delay_ms": 40 }),
+                    ),
+                    (
+                        "dispatch",
+                        serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+                    ),
+                    read_call("b.txt"),
+                ],
+            )
+            .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 3);
+        assert_eq!(fake.spawn_calls(), 1);
+        assert!(
+            seq_of(&harness, "call-0", "result") < seq_of(&harness, "call-1", "started"),
+            "前面的读还没收尾，dispatch 就派出去了"
+        );
+        assert!(
+            seq_of(&harness, "call-1", "result") < seq_of(&harness, "call-2", "started"),
+            "dispatch 还没收尾，后面的读就开始了"
+        );
+        assert_eq!(
+            probe.log(),
+            [
+                "read:call-0:进入",
+                "read:call-0:离开",
+                "read:call-2:进入",
+                "read:call-2:离开"
+            ]
+        );
+    }
+
+    /// ⑨ follow 同样是屏障。
+    #[tokio::test]
+    async fn follow_is_a_barrier() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new();
+        let probe = Arc::new(Probe::new(
+            "read",
+            Operation::ReadFile,
+            Arc::new(Mutex::new(Vec::new())),
+        ));
+        let executor = harness.initial_with_spawner(
+            vec![probe.clone(), Arc::new(FollowTool::new())],
+            fake.clone() as Arc<dyn TaskSpawner>,
+        );
+        let (session, run) = harness.open_run().await;
+        let calls = harness
+            .record_round(
+                &run,
+                &[
+                    (
+                        "read",
+                        serde_json::json!({ "path": "a.txt", "delay_ms": 40 }),
+                    ),
+                    (
+                        "follow",
+                        serde_json::json!({ "task_id": "3f2a", "text": "再看看" }),
+                    ),
+                    read_call("b.txt"),
+                ],
+            )
+            .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 3);
+        assert_eq!(fake.follow_calls(), 1);
+        assert!(
+            seq_of(&harness, "call-0", "result") < seq_of(&harness, "call-1", "started"),
+            "前面的读还没收尾，follow 就转出去了"
+        );
+        assert!(
+            seq_of(&harness, "call-1", "result") < seq_of(&harness, "call-2", "started"),
+            "follow 还没收尾，后面的读就开始了"
+        );
+        assert_eq!(
+            probe.log(),
+            [
+                "read:call-0:进入",
+                "read:call-0:离开",
+                "read:call-2:进入",
+                "read:call-2:离开"
+            ]
+        );
+    }
 }
 
 /// 「刚跑完」与「重启后回放」是同一个字符串（§8.3）：每条收尾路径交给模型的正文，都与
@@ -3547,24 +3793,6 @@ mod update_plan {
                 _ => None,
             })
             .collect()
-    }
-
-    fn seq_of(harness: &Harness, call: &str, kind: &str) -> u64 {
-        let call = ToolCallId::from_raw(call);
-        harness
-            .ledger
-            .events()
-            .iter()
-            .find_map(|event| match (&event.payload, kind) {
-                (EventPayload::ToolStarted(body), "started") if body.call_id == call => {
-                    Some(event.seq.0)
-                }
-                (EventPayload::ToolResult(body), "result") if body.call_id == call => {
-                    Some(event.seq.0)
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| panic!("{call} 没有 {kind}"))
     }
 
     #[tokio::test]

@@ -22,9 +22,9 @@
 //! 的一步，而工具不知道这一步存在。
 //!
 //! **委派不走这条流水线的后半段**（§4）。`Operation::Delegate` 在核对梯子之前就被分流：
-//! 它照样过 Policy 与审批（要审的是"允不允许把这件事派出去"），但放行之后做的事是**受理
-//! 一条子 Run**、`start_call`、然后停在 `dependency` 上——没有 `execute`、没有输出发布、
-//! 也没有这一轮的 `finish_call`。父子两端由**账本**接起来：子 Run 一进终态，父侧那次调用
+//! 它照样过 Policy 与审批（要审的是"允不允许把这件事派出去"），但放行之后——同一轮前面
+//! 在飞的调用收完之后——做的事是**受理一条子 Run**、`start_call`、然后停在 `dependency`
+//! 上——没有 `execute`、没有输出发布、也没有这一轮的 `finish_call`。父子两端由**账本**接起来：子 Run 一进终态，父侧那次调用
 //! 的结果就是它的终态（§8.6「可以核对目标状态」）。
 
 pub mod cancel;
@@ -403,8 +403,13 @@ impl ToolExecutor {
     /// **只读的调用可以和同一轮里后面的调用同时在飞**：够格的是 `Operation::ReadFile`
     /// 这一类计划（`read` / `rg`）里没有"上一世"要接的那条（详见
     /// [`Authorized::parallel_with_siblings`]）。其余一切（`write` / `edit` / `shell` /
-    /// `python` / `delegate`，以及任何要停下来的判定）都是**屏障**：屏障之前已经在飞的
-    /// 先收尾，再按调用顺序做它。
+    /// `python`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何
+    /// 要停下来的判定）都是**屏障**：屏障之前已经在飞的先收尾，再按调用顺序做它。
+    ///
+    /// "做它"指的是 `start_call` 及之后的一切：`begin` 只放行（可能落 `tool.planned`、
+    /// 消费授权），或者给一条不必执行的调用落下结论（被拒、核对收口）；执行工具、受理子
+    /// Run、派任务、转话这些副作用都排在收尾之后。所以前面在飞的那条停下来时，交回
+    /// `remaining` 的屏障还没 `start_call` 过。
     ///
     /// 三条不变量不因为并发而改变：
     ///
@@ -459,9 +464,10 @@ impl ToolExecutor {
             let settlement = match begin {
                 Begin::Ready(ready) => self.execute_authorized(*ready, env).await?,
                 Begin::Settled(settlement) => settlement,
-                // 放行过了，在飞的也收完了：这时才 `start_call`、读日志里的上一版计划。
-                Begin::Plan(call) => {
-                    let (settlement, crossed) = self.settle_plan(*call, env).await?;
+                // 放行过了，在飞的也收完了：这时才 `start_call`，才受理子 Run、派任务、转话、
+                // 读日志里的上一版计划。
+                Begin::Orchestrate(call) => {
+                    let (settlement, crossed) = self.settle_orchestrated(*call, env).await?;
                     boundary |= crossed;
                     settlement
                 }
@@ -494,7 +500,7 @@ impl ToolExecutor {
     }
 
     /// 一个调用在**执行之前**该走完的那些步：找工具 → 生成或沿用计划 → 恢复核对梯子 →
-    /// 放行。三种去向见 [`Begin`]。
+    /// 放行。几种去向见 [`Begin`]。
     ///
     /// 这几步**不和别的调用交错**：它们写账本（`plan_call`）、可能消费授权、可能要求审批。
     /// 能被搬进在飞集合的只有执行本身（[`Self::execute_authorized`]）。
@@ -549,34 +555,18 @@ impl ToolExecutor {
             },
         };
 
-        // 委派不走"工具执行"那条路，也**不走核对梯子**：对一次 delegate 调用来说，
-        // "started 而无结果"的正常含义是"子 Run 还在跑"，不是"结果不明"——它的结果在
-        // 我们自己的账本里（子 Run 的终态），所以 §8.6 的核对在这里有确定答案。
-        if let Operation::Delegate { spec } = &plan.operation {
-            return self
-                .delegate(request, env, &plan, spec, request.resumed.clone())
-                .await;
-        }
-
-        // dispatch / follow 同样不走"工具执行"那条路，也不走核对梯子——但与 `delegate`
-        // 不同，它们**不等任何东西**：放行之后调一次 `TaskSpawner` 就立刻收尾
-        // （`docs/background-tasks.md`）。
-        if let Operation::Dispatch { task, title } = &plan.operation {
-            return self
-                .dispatch(request, env, &plan, task, title, request.resumed.clone())
-                .await;
-        }
-        if let Operation::Follow { task_id, text } = &plan.operation {
-            return self
-                .follow(request, env, &plan, task_id, text, request.resumed.clone())
-                .await;
-        }
-
-        // update_plan 同样是编排：没有工具执行，结果是前后两版计划的比较。
-        if matches!(plan.operation, Operation::UpdatePlan) {
-            return self
-                .update_plan(request, env, &plan, request.resumed.clone())
-                .await;
+        // 编排调用（delegate / dispatch / follow / update_plan）不走"工具执行"那条路，也
+        // **不走核对梯子**：它们 started 而无结果时该做什么都有确定答案——delegate 的结果在
+        // 我们自己的账本里（子 Run 的终态，§8.6「可以核对目标状态」），dispatch / follow 按
+        // 请求键幂等重放（`docs/background-tasks.md`），update_plan 没有副作用。
+        match self.orchestration(&plan.operation, env) {
+            Ok(None) => {}
+            Ok(Some(kind)) => return self.begin_orchestration(request, env, plan, kind).await,
+            Err(message) => {
+                return Ok(Begin::Settled(
+                    self.fail_unstarted(request, env, message).await?,
+                ));
+            }
         }
 
         // §8.4 第 6 / 7 行、§8.6：先判断是否发生，再决定是否重试。
@@ -857,7 +847,192 @@ impl ToolExecutor {
         }
     }
 
-    /// 一次委派的编排（§4、§8.4 的 `dependency`）。
+    /// 这份计划是不是一次编排调用；是的话先过只看能力的那几道（`Err` = 不合格的理由，
+    /// 按没有执行过的调用落账）。
+    fn orchestration(
+        &self,
+        operation: &Operation,
+        env: &CallEnv,
+    ) -> Result<Option<Orchestration>, String> {
+        let spawner = || {
+            self.spawner
+                .get()
+                .cloned()
+                .ok_or_else(|| "这台 Gateway 没有接任务分发（TaskSpawner 没有装配）".to_string())
+        };
+        Ok(Some(match operation {
+            Operation::Delegate { spec } => {
+                // 深度只有一层。**第一道拦在能力面上**（子代理的 schema 里没有 `delegate`，
+                // 执行器按同一份 schema 认名字，§4 末）；这里是第二道，管的是"有人把一份含
+                // `delegate` 的能力面交给了子代理"——不变量不能只靠装配方记得摘掉一个名字来
+                // 成立。
+                if let Some(parent_of_this_run) = &env.delegated {
+                    return Err(format!(
+                        "子代理不能再委派：深度只有一层。你已经是被 {} 派出来跑这件事的，\
+                         把完整的任务做完或说明做不到，而不是再派一条子 Run。",
+                        parent_of_this_run.parent
+                    ));
+                }
+                Orchestration::Delegate(spec.clone())
+            }
+            Operation::Dispatch { task, title } => Orchestration::Dispatch {
+                spawner: spawner()?,
+                spec: TaskSpec {
+                    task: task.clone(),
+                    title: title.clone(),
+                },
+            },
+            Operation::Follow { task_id, text } => Orchestration::Follow {
+                spawner: spawner()?,
+                task_id: task_id.clone(),
+                text: text.clone(),
+            },
+            Operation::UpdatePlan => Orchestration::UpdatePlan,
+            _ => return Ok(None),
+        }))
+    }
+
+    /// 一次编排调用的放行：续跑校验、Policy 与审批在这里，**副作用一个都不在**。
+    /// `start_call` 以及之后的受理子 Run、派任务、转话、比较计划都在
+    /// [`Self::settle_orchestrated`]——放进 [`Begin::Orchestrate`] 交回 `execute_round`，
+    /// 在飞的读先收完再做，账本上的先后与调用顺序一致，停在前面那条上时它也还没发生。
+    ///
+    /// 上一世已经 `start_call` 过的那次不重新放行，同样交给收尾去接。
+    async fn begin_orchestration(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        plan: ExecutionPlan,
+        kind: Orchestration,
+    ) -> Result<Begin, ExecError> {
+        // 已经开始过 = 上一世 `start_call` 过。`Planned` 那种"确定没跑过"的形状与之相反：
+        // 对委派来说它是"子 Run 可能还没被受理"，所以走下面的首次路径。
+        let started = request
+            .resumed
+            .as_ref()
+            .is_some_and(|state| !state.is_known_not_to_have_run());
+        let start = if started {
+            OrchestrationStart::Started
+        } else {
+            // 续跑（§4）：目标在 `prepare` 里校验——但 `Tool::prepare` 没有账本，这里是第一次
+            // 真的查得到它的地方，与深度检查同理，一旦不合格就是一次**没有执行过**的调用，
+            // 按 `fail_call` 落账（不靠"先查后写"：受理那一步的 db 事务里还有第二道，§4）。
+            if let Orchestration::Delegate(spec) = &kind
+                && let Some(message) = self.validate_resume(env, spec).await?
+            {
+                return Ok(Begin::Settled(
+                    self.fail_unstarted(request, env, message).await?,
+                ));
+            }
+
+            // "允不允许把这件事派出去"同样要过 Policy 与审批（§7.1）。放行在受理**之前**：
+            // 没放行的委派不该在账本里留下一条没人认领的子 Run。
+            let intent = if request
+                .resumed
+                .as_ref()
+                .is_some_and(ResumedCall::is_known_not_to_have_run)
+            {
+                ConsumeIntent::KnownNotToHaveRun
+            } else {
+                ConsumeIntent::First
+            };
+            match self.authorize(request, &plan, env, intent).await? {
+                Authorization::Proceed { grants, .. } => OrchestrationStart::Fresh(grants),
+                Authorization::Refused(message) => {
+                    // 与普通工具同一条规矩：结论落盘，别让这次调用悬在账本上。
+                    return Ok(Begin::Settled(
+                        self.fail_unstarted(request, env, message).await?,
+                    ));
+                }
+                Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
+                Authorization::Waiting(approval) => {
+                    return Ok(Begin::Settled(CallSettlement::Stopped {
+                        stop: RoundStop::Approval {
+                            approval,
+                            call: request.call.clone(),
+                        },
+                        result: None,
+                    }));
+                }
+            }
+        };
+        Ok(Begin::Orchestrate(Box::new(Orchestrated {
+            request: request.clone(),
+            plan,
+            start,
+            kind,
+        })))
+    }
+
+    /// 一次放行过的编排调用的收尾：`execute_round` 收完在飞的调用之后才走到这里。第二个
+    /// 返回值是 update_plan 的计划边界，别的编排调用恒为 `false`。
+    ///
+    /// dispatch / follow **不等**任何东西：`TaskSpawner` 一返回就收尾——这正是它们存在的
+    /// 理由，等任务跑完又会把派它的会话堵住（同一会话严格串行）。幂等靠
+    /// `request_key = dispatch|follow:{run}:{call}`：首次执行与"上一世已经 `start_call`
+    /// 过、这一世只是回来收口"的续跑调的是同一个键，`TaskSpawner` 内部走的是
+    /// `GatewayState::submit` 那条按请求键去重的路（§8.5），重放拿回同一个任务会话。
+    async fn settle_orchestrated(
+        &self,
+        call: Orchestrated,
+        env: &CallEnv,
+    ) -> Result<(CallSettlement, bool), ExecError> {
+        let Orchestrated {
+            request,
+            plan,
+            start,
+            kind,
+        } = call;
+        if let Orchestration::Delegate(spec) = &kind {
+            let settlement = self
+                .settle_delegate(&request, env, &plan, spec, start)
+                .await?;
+            return Ok((settlement, false));
+        }
+        let attempt = match start {
+            OrchestrationStart::Fresh(grants) => {
+                self.ledger.start_call(&request.call, &plan, grants).await?
+            }
+            OrchestrationStart::Started => {
+                let previous = request
+                    .resumed
+                    .as_ref()
+                    .and_then(|state| state.previous_attempt.clone());
+                let Some(attempt) = previous else {
+                    let reason = format!(
+                        "{} 调用 {} 已经开始过，但账上没有承载它的那次尝试",
+                        request.tool, request.call
+                    );
+                    return Ok((self.attention(&request, reason), false));
+                };
+                attempt
+            }
+        };
+        let settlement = match kind {
+            Orchestration::Dispatch { spawner, spec } => {
+                let key = RequestKey::new(format!("dispatch:{}:{}", env.run, request.call));
+                let outcome = spawner.spawn(&env.run, key, spec).await;
+                self.settle_dispatch(&request, env, attempt, outcome)
+                    .await?
+            }
+            Orchestration::Follow {
+                spawner,
+                task_id,
+                text,
+            } => {
+                let key = RequestKey::new(format!("follow:{}:{}", env.run, request.call));
+                let outcome = spawner.follow(&env.run, key, &task_id, &text).await;
+                self.settle_follow(&request, env, attempt, outcome).await?
+            }
+            Orchestration::UpdatePlan => {
+                return self.settle_plan(&request, env, &plan, attempt).await;
+            }
+            Orchestration::Delegate(_) => unreachable!("委派在上面已经收尾"),
+        };
+        Ok((settlement, false))
+    }
+
+    /// 一次委派的收尾（§4、§8.4 的 `dependency`）。
     ///
     /// 它不走"工具执行"那条路，理由不是省事：**父这一次调用什么时候收尾，不由工具决定**。
     /// 子 Run 是账本里一条普通 Run——它可能被领取、被审批、被重启恢复，可能过了很久才结束
@@ -866,98 +1041,39 @@ impl ToolExecutor {
     ///
     /// 两条分支由**账本**分（`resumed` 的形状），不是由时间分：
     ///
-    /// - 还没 `start_call`（首次执行，或者"受理了但还没 start 就崩了"的续跑）：先过
-    ///   Policy 与审批，再受理子 Run，再 `start_call`，然后停在 `dependency` 上。
-    ///   **先受理后 start 是刻意的**：受理按 `request_key` 幂等，所以"受理了但还没 start
-    ///   就崩了"的续跑重走一遍拿回的是同一条子 Run，不会多派一条。
+    /// - 还没 `start_call`（首次执行，或者"受理了但还没 start 就崩了"的续跑）：放行过了，
+    ///   受理子 Run，再 `start_call`，然后停在 `dependency` 上。**先受理后 start 是刻意的**：
+    ///   受理按 `request_key` 幂等，所以"受理了但还没 start 就崩了"的续跑重走一遍拿回的是
+    ///   同一条子 Run，不会多派一条。
     /// - 已经 `start_call`（这次只是回来收口）：同一个键再受理一次（幂等，拿回同一条），
     ///   然后读它的终态。终态还没来就**再等一次**，不是失败。
-    async fn delegate(
+    async fn settle_delegate(
         &self,
         request: &CallRequest,
         env: &CallEnv,
         plan: &ExecutionPlan,
         spec: &DelegateSpec,
-        resumed: Option<ResumedCall>,
-    ) -> Result<Begin, ExecError> {
-        // 深度只有一层。**第一道拦在能力面上**（子代理的 schema 里没有 `delegate`，执行器
-        // 按同一份 schema 认名字，§4 末）；这里是第二道，管的是"有人把一份含 `delegate`
-        // 的能力面交给了子代理"——不变量不能只靠装配方记得摘掉一个名字来成立。
-        if let Some(parent_of_this_run) = &env.delegated {
-            let message = format!(
-                "子代理不能再委派：深度只有一层。你已经是被 {} 派出来跑这件事的，\
-                 把完整的任务做完或说明做不到，而不是再派一条子 Run。",
-                parent_of_this_run.parent
-            );
-            return Ok(Begin::Settled(
-                self.fail_unstarted(request, env, message).await?,
-            ));
-        }
-
-        // 已经派出去过 = 上一世 `start_call` 过。`Planned` 那种"确定没跑过"的形状与之
-        // 相反：它说的是"子 Run 可能还没被受理"，所以它走下面的首次路径，再受理一次。
-        let in_flight = resumed
-            .as_ref()
-            .is_some_and(|state| !state.is_known_not_to_have_run());
-
-        if in_flight {
-            let child = self.accept_child(env, spec).await?.run;
-            return Ok(Begin::Settled(
-                self.collect_child(request, env, spec, resumed.as_ref(), &child)
-                    .await?,
-            ));
-        }
-
-        // 续跑（§4）：目标在 `prepare` 里校验——但 `Tool::prepare` 没有账本，这里是第一次
-        // 真的查得到它的地方，与深度检查同理，一旦不合格就是一次**没有执行过**的调用，
-        // 按 `fail_call` 落账（不靠"先查后写"：受理那一步的 db 事务里还有第二道，§4）。
-        if let Some(message) = self.validate_resume(env, spec).await? {
-            return Ok(Begin::Settled(
-                self.fail_unstarted(request, env, message).await?,
-            ));
-        }
-
-        // "允不允许把这件事派出去"要过 Policy 与审批（§7.1）。放行在受理**之前**：
-        // 没放行的委派不该在账本里留下一条没人认领的子 Run。
-        let intent = if resumed
-            .as_ref()
-            .is_some_and(ResumedCall::is_known_not_to_have_run)
-        {
-            ConsumeIntent::KnownNotToHaveRun
-        } else {
-            ConsumeIntent::First
-        };
-        let grants = match self.authorize(request, plan, env, intent).await? {
-            Authorization::Proceed { grants, .. } => grants,
-            Authorization::Refused(message) => {
-                // 与普通工具同一条规矩：结论落盘，别让这次调用悬在账本上。
-                return Ok(Begin::Settled(
-                    self.fail_unstarted(request, env, message).await?,
-                ));
-            }
-            Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
-            Authorization::Waiting(approval) => {
-                return Ok(Begin::Settled(CallSettlement::Stopped {
-                    stop: RoundStop::Approval {
-                        approval,
-                        call: request.call.clone(),
-                    },
-                    result: None,
-                }));
-            }
-        };
-
+        start: OrchestrationStart,
+    ) -> Result<CallSettlement, ExecError> {
         let child = self.accept_child(env, spec).await?.run;
+        let grants = match start {
+            OrchestrationStart::Started => {
+                return self
+                    .collect_child(request, env, spec, request.resumed.as_ref(), &child)
+                    .await;
+            }
+            OrchestrationStart::Fresh(grants) => grants,
+        };
         // `tool.started` 之后子 Run 才可能被领取：它就是这次外派副作用的起点。
         self.ledger.start_call(&request.call, plan, grants).await?;
-        Ok(Begin::Settled(CallSettlement::Stopped {
+        Ok(CallSettlement::Stopped {
             stop: RoundStop::Dependency {
                 run: child,
                 call: request.call.clone(),
             },
             // 这次调用**没有结果**：它在等子 Run。空结果也不是结果。
             result: None,
-        }))
+        })
     }
 
     /// 续跑目标合不合格（§4）：`Some(reason)` = 不合格，理由交给模型；`None` = 可以接着
@@ -1128,99 +1244,6 @@ impl ToolExecutor {
         Ok(CallSettlement::Result(for_model(request, env, &recorded)))
     }
 
-    /// 一次 `dispatch` 的编排（`docs/background-tasks.md`）。
-    ///
-    /// 与 [`Self::delegate`] 同一个骨架（放行 → 受理 → 幂等重放拿回同一条），但**不等**
-    /// 任何东西：`TaskSpawner::spawn` 一返回就收尾——这正是 dispatch 存在的理由，等它跑完
-    /// 又会把派它的会话堵住（同一会话严格串行）。
-    ///
-    /// 幂等靠 `request_key = dispatch:{run}:{call}`：无论这是首次执行还是"上一世已经
-    /// `start_call` 过、这一世只是回来收口"的续跑，`spawner.spawn` 内部走的都是
-    /// `GatewayState::submit` 那条按请求键去重的路（§8.5），所以重放安全地拿回同一个
-    /// 任务会话，不会多派一条——不需要像 `delegate` 那样分两条分支各走一半。
-    async fn dispatch(
-        &self,
-        request: &CallRequest,
-        env: &CallEnv,
-        plan: &ExecutionPlan,
-        task: &str,
-        title: &str,
-        resumed: Option<ResumedCall>,
-    ) -> Result<Begin, ExecError> {
-        let Some(spawner) = self.spawner.get().cloned() else {
-            return Ok(Begin::Settled(
-                self.fail_unstarted(
-                    request,
-                    env,
-                    "这台 Gateway 没有接任务分发（TaskSpawner 没有装配）".into(),
-                )
-                .await?,
-            ));
-        };
-        let request_key = RequestKey::new(format!("dispatch:{}:{}", env.run, request.call));
-        let spec = TaskSpec {
-            task: task.to_string(),
-            title: title.to_string(),
-        };
-
-        // 已经 `start_call` 过（上一世崩在"派出去"与"写结果"之间）：不重新授权、不重新
-        // `start_call`，直接把结果落回那次尝试上——`spawner.spawn` 本身按请求键幂等。
-        let in_flight = resumed
-            .as_ref()
-            .is_some_and(|state| !state.is_known_not_to_have_run());
-        if in_flight {
-            let Some(attempt) = resumed
-                .as_ref()
-                .and_then(|state| state.previous_attempt.clone())
-            else {
-                return Ok(Begin::Settled(self.attention(
-                    request,
-                    format!(
-                        "dispatch 调用 {} 已经开始过，但账上没有承载它的那次尝试",
-                        request.call
-                    ),
-                )));
-            };
-            let outcome = spawner.spawn(&env.run, request_key, spec).await;
-            return Ok(Begin::Settled(
-                self.settle_dispatch(request, env, attempt, outcome).await?,
-            ));
-        }
-
-        let intent = if resumed
-            .as_ref()
-            .is_some_and(ResumedCall::is_known_not_to_have_run)
-        {
-            ConsumeIntent::KnownNotToHaveRun
-        } else {
-            ConsumeIntent::First
-        };
-        let grants = match self.authorize(request, plan, env, intent).await? {
-            Authorization::Proceed { grants, .. } => grants,
-            Authorization::Refused(message) => {
-                return Ok(Begin::Settled(
-                    self.fail_unstarted(request, env, message).await?,
-                ));
-            }
-            Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
-            Authorization::Waiting(approval) => {
-                return Ok(Begin::Settled(CallSettlement::Stopped {
-                    stop: RoundStop::Approval {
-                        approval,
-                        call: request.call.clone(),
-                    },
-                    result: None,
-                }));
-            }
-        };
-
-        let attempt = self.ledger.start_call(&request.call, plan, grants).await?;
-        let outcome = spawner.spawn(&env.run, request_key, spec).await;
-        Ok(Begin::Settled(
-            self.settle_dispatch(request, env, attempt, outcome).await?,
-        ))
-    }
-
     /// `dispatch` 的结论：`TaskHandle` 折成"已派出 #短号：标题"，`SpawnError` 折成一句
     /// 失败原因。
     async fn settle_dispatch(
@@ -1250,87 +1273,6 @@ impl ToolExecutor {
         };
         self.settle_orchestration(request, env, attempt, result, content, is_error)
             .await
-    }
-
-    /// 一次 `follow` 的编排（`docs/background-tasks.md`）。骨架与 [`Self::dispatch`]
-    /// 完全一样，差别只在调 `TaskSpawner::follow`。
-    async fn follow(
-        &self,
-        request: &CallRequest,
-        env: &CallEnv,
-        plan: &ExecutionPlan,
-        task_id: &str,
-        text: &str,
-        resumed: Option<ResumedCall>,
-    ) -> Result<Begin, ExecError> {
-        let Some(spawner) = self.spawner.get().cloned() else {
-            return Ok(Begin::Settled(
-                self.fail_unstarted(
-                    request,
-                    env,
-                    "这台 Gateway 没有接任务分发（TaskSpawner 没有装配）".into(),
-                )
-                .await?,
-            ));
-        };
-        let request_key = RequestKey::new(format!("follow:{}:{}", env.run, request.call));
-        let task_id = task_id.to_string();
-        let text = text.to_string();
-
-        let in_flight = resumed
-            .as_ref()
-            .is_some_and(|state| !state.is_known_not_to_have_run());
-        if in_flight {
-            let Some(attempt) = resumed
-                .as_ref()
-                .and_then(|state| state.previous_attempt.clone())
-            else {
-                return Ok(Begin::Settled(self.attention(
-                    request,
-                    format!(
-                        "follow 调用 {} 已经开始过，但账上没有承载它的那次尝试",
-                        request.call
-                    ),
-                )));
-            };
-            let outcome = spawner.follow(&env.run, request_key, &task_id, &text).await;
-            return Ok(Begin::Settled(
-                self.settle_follow(request, env, attempt, outcome).await?,
-            ));
-        }
-
-        let intent = if resumed
-            .as_ref()
-            .is_some_and(ResumedCall::is_known_not_to_have_run)
-        {
-            ConsumeIntent::KnownNotToHaveRun
-        } else {
-            ConsumeIntent::First
-        };
-        let grants = match self.authorize(request, plan, env, intent).await? {
-            Authorization::Proceed { grants, .. } => grants,
-            Authorization::Refused(message) => {
-                return Ok(Begin::Settled(
-                    self.fail_unstarted(request, env, message).await?,
-                ));
-            }
-            Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
-            Authorization::Waiting(approval) => {
-                return Ok(Begin::Settled(CallSettlement::Stopped {
-                    stop: RoundStop::Approval {
-                        approval,
-                        call: request.call.clone(),
-                    },
-                    result: None,
-                }));
-            }
-        };
-
-        let attempt = self.ledger.start_call(&request.call, plan, grants).await?;
-        let outcome = spawner.follow(&env.run, request_key, &task_id, &text).await;
-        Ok(Begin::Settled(
-            self.settle_follow(request, env, attempt, outcome).await?,
-        ))
     }
 
     /// `follow` 的结论：`FollowOutcome` 折成"已转给 #短号"（或"正在跑，排在后面"），
@@ -1368,92 +1310,19 @@ impl ToolExecutor {
             .await
     }
 
-    /// 一次 `update_plan` 的放行（Policy 默认 Allow）。真正的收尾在 [`Self::settle_plan`]：
-    /// 它是**屏障**——放进 [`Begin::Plan`] 交回 `execute_round`，在飞的读先收完，再
-    /// `start_call`、读上一版计划，账本上的先后与调用顺序一致。
+    /// `update_plan` 的收尾：上一版计划从**这条 Run 的日志**折出来（与在线状态同一个
+    /// fold），和这一版比较；结果是这一版的快照加上给模型的提醒。第二个返回值是"完成了
+    /// 一个先前登记过的步骤"——计划边界。
     ///
-    /// 上一世已经 `start_call` 过的那次：没有副作用，不重新放行、不核对，把结果再落到那次
-    /// 尝试上就是了——上一版计划仍从日志里读，这次调用自己还没有结果，不会算进去。
-    async fn update_plan(
+    /// 上一世已经 `start_call` 过的那次：没有副作用，不核对，把结果再落到那次尝试上就是了
+    /// ——上一版计划仍从日志里读，这次调用自己还没有结果，不会算进去。
+    async fn settle_plan(
         &self,
         request: &CallRequest,
         env: &CallEnv,
         plan: &ExecutionPlan,
-        resumed: Option<ResumedCall>,
-    ) -> Result<Begin, ExecError> {
-        let in_flight = resumed
-            .as_ref()
-            .is_some_and(|state| !state.is_known_not_to_have_run());
-        if in_flight {
-            let Some(attempt) = resumed.and_then(|state| state.previous_attempt) else {
-                return Ok(Begin::Settled(self.attention(
-                    request,
-                    format!(
-                        "update_plan 调用 {} 已经开始过，但账上没有承载它的那次尝试",
-                        request.call
-                    ),
-                )));
-            };
-            return Ok(Begin::Plan(Box::new(PlanCall {
-                request: request.clone(),
-                plan: plan.clone(),
-                start: PlanStart::Started(attempt),
-            })));
-        }
-
-        let intent = if resumed
-            .as_ref()
-            .is_some_and(ResumedCall::is_known_not_to_have_run)
-        {
-            ConsumeIntent::KnownNotToHaveRun
-        } else {
-            ConsumeIntent::First
-        };
-        let grants = match self.authorize(request, plan, env, intent).await? {
-            Authorization::Proceed { grants, .. } => grants,
-            Authorization::Refused(message) => {
-                return Ok(Begin::Settled(
-                    self.fail_unstarted(request, env, message).await?,
-                ));
-            }
-            Authorization::Ask(pending) => return Ok(Begin::Ask(pending)),
-            Authorization::Waiting(approval) => {
-                return Ok(Begin::Settled(CallSettlement::Stopped {
-                    stop: RoundStop::Approval {
-                        approval,
-                        call: request.call.clone(),
-                    },
-                    result: None,
-                }));
-            }
-        };
-        Ok(Begin::Plan(Box::new(PlanCall {
-            request: request.clone(),
-            plan: plan.clone(),
-            start: PlanStart::Fresh(grants),
-        })))
-    }
-
-    /// `update_plan` 的收尾：上一版计划从**这条 Run 的日志**折出来（与在线状态同一个
-    /// fold），和这一版比较；结果是这一版的快照加上给模型的提醒。第二个返回值是"完成了
-    /// 一个先前登记过的步骤"——计划边界。
-    async fn settle_plan(
-        &self,
-        call: PlanCall,
-        env: &CallEnv,
+        attempt: AttemptId,
     ) -> Result<(CallSettlement, bool), ExecError> {
-        let PlanCall {
-            request,
-            plan,
-            start,
-        } = call;
-        let attempt = match start {
-            PlanStart::Fresh(grants) => {
-                self.ledger.start_call(&request.call, &plan, grants).await?
-            }
-            PlanStart::Started(attempt) => attempt,
-        };
-
         // `prepare` 校验过；这里还解不出来只可能是一份从账本读回的旧计划，照实报失败。
         let update = match serde_json::from_value::<PlanUpdate>(plan.args.clone()) {
             Ok(update) => update
@@ -1468,7 +1337,7 @@ impl ToolExecutor {
                 let content = format!("update_plan 的计划不合法：{error}");
                 let settlement = self
                     .settle_orchestration(
-                        &request,
+                        request,
                         env,
                         attempt,
                         serde_json::json!({ "error": content }),
@@ -1500,7 +1369,7 @@ impl ToolExecutor {
             .collect::<Vec<_>>()
             .join("\n");
         let settlement = self
-            .settle_orchestration(&request, env, attempt, result, content, false)
+            .settle_orchestration(request, env, attempt, result, content, false)
             .await?;
         Ok((settlement, boundary))
     }
@@ -1909,33 +1778,56 @@ impl ToolExecutor {
 /// 这样账本里的 attempt ID 与它不会混。
 const PENDING_ATTEMPT: &str = "attempt-not-started";
 
-/// 一个调用在**执行之前**的三种去向（[`ToolExecutor::begin`]）。
+/// 一个调用在**执行之前**的几种去向（[`ToolExecutor::begin`]）。
 enum Begin {
     /// 放行过了，可以执行。只读的那一类允许被搬进在飞集合。
     ///
     /// 装箱不是洁癖：`Authorized` 里躺着一份完整的 `ExecutionPlan`（约 1.3 KB），而
     /// 这个枚举**每个调用都要过一手**——不装箱就是每一轮把那一坨来回搬。
     Ready(Box<Authorized>),
-    /// 已经有结论：不需要执行（工具名不认识、参数准备不出来、被拒、核对收口、委派转交）。
+    /// 已经有结论：不需要执行（工具名不认识、参数准备不出来、被拒、核对收口），或者停在一条
+    /// 已有的审批 / 交给人的判断上。
     Settled(CallSettlement),
     /// 需要人看一眼：**审批行还没有落**——`execute_round` 先收完在飞的再落它。
     Ask(Box<AskPending>),
-    /// 放行过的 `update_plan`：屏障，`execute_round` 先收完在飞的再收它的尾。
-    Plan(Box<PlanCall>),
+    /// 放行过的编排调用（delegate / dispatch / follow / update_plan）：屏障，
+    /// `execute_round` 先收完在飞的，才 `start_call` 并做它的事（[`Orchestrated`]）。
+    Orchestrate(Box<Orchestrated>),
 }
 
-/// 一次放行过、还没收尾的 `update_plan`。
-struct PlanCall {
+/// 一次放行过、还没开始做的编排调用。
+struct Orchestrated {
     request: CallRequest,
     plan: ExecutionPlan,
-    start: PlanStart,
+    start: OrchestrationStart,
+    kind: Orchestration,
 }
 
-enum PlanStart {
+/// 编排调用的四种。只看能力的那几道（深度、有没有接任务分发）在造它之前已经过了。
+enum Orchestration {
+    /// 受理一条子 Run，停在 `dependency` 上等它的终态。
+    Delegate(DelegateSpec),
+    /// 派一条后台任务，立刻收尾。
+    Dispatch {
+        spawner: Arc<dyn TaskSpawner>,
+        spec: TaskSpec,
+    },
+    /// 往一条后台任务里转一句话，立刻收尾。
+    Follow {
+        spawner: Arc<dyn TaskSpawner>,
+        task_id: String,
+        text: String,
+    },
+    /// 记一版计划，和日志里的上一版比较。
+    UpdatePlan,
+}
+
+enum OrchestrationStart {
     /// 首次：收尾时才 `start_call`，带着放行用掉的那条授权（若有）。
     Fresh(GrantUses),
-    /// 上一世已经 `start_call` 过：结果落回那次尝试。
-    Started(AttemptId),
+    /// 上一世已经 `start_call` 过：不重新放行，结果落回那次尝试
+    /// （`request.resumed.previous_attempt`）。
+    Started,
 }
 
 /// 一条**已经拿到凭据**、可以直接执行的调用。

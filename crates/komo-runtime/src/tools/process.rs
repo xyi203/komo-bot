@@ -441,12 +441,12 @@ mod tests {
             executor: executor.clone(),
         };
 
-        // 子进程一边跑一边让我们看一眼登记文件。
-        let marker = dir.path().join("started");
+        // 子进程一直跑到我们看过登记文件、放下 `stop` 为止。由看的这一方放下标记而不是
+        // 删掉子进程自己建的：后者在负载下会赶在子进程建它之前删，子进程就一直跑到超时。
+        let stop = dir.path().join("stop");
         let mut running = spec(&format!(
-            "touch {}; while [ -e {} ]; do sleep 0.05; done",
-            marker.display(),
-            marker.display()
+            "while [ ! -e {} ]; do sleep 0.05; done",
+            stop.display()
         ));
         running.register = Some(registration);
         running.label = "测试命令".into();
@@ -454,7 +454,7 @@ mod tests {
         let mut sink = writer();
         let watcher = registry.clone();
         let watched = executor.clone();
-        let marker_path = marker.clone();
+        let stop_path = stop.clone();
         let peek = tokio::spawn(async move {
             let mut seen = Vec::new();
             for _ in 0..100 {
@@ -465,7 +465,7 @@ mod tests {
                     break;
                 }
             }
-            let _ = std::fs::remove_file(&marker_path);
+            std::fs::write(&stop_path, "").expect("放下 stop");
             seen
         });
 

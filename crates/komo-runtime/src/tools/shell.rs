@@ -410,9 +410,13 @@ mod tests {
             .await
             .unwrap();
 
+        // 等子进程写下 pid 再取消：固定睡一段的话，负载下取消会赶在 `echo $$` 之前。
         let stopper = cancel.clone();
+        let written = pid_file.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            while !std::fs::read_to_string(&written).is_ok_and(|text| text.ends_with('\n')) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             stopper.cancel();
         });
         let error = tool

@@ -40,7 +40,7 @@ pub use repos::queue::{
     DEFAULT_LEASE_WINDOW, TursoRunQueue, expired_lease_running, reclaim_expired_lease,
     reclaim_lease, reclaim_unowned, release_satisfied_dependencies, unowned_running,
 };
-pub use repos::recovery::{RecoveryStore, UnfinishedRun};
+pub use repos::recovery::{RecoveryStore, SeenRun, UnfinishedRun};
 pub use session_log::{SessionLog, SessionPaths, TailExpectation, TailRepair};
 pub use tool_output::FileToolOutputStore;
 

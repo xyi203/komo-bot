@@ -138,9 +138,10 @@ impl LlmClient for UnconfiguredLlm {
 ///   所属的会话还在不在服务范围里"，store 的 `unfinished_runs` 只带 Run 自己的列，所以
 ///   这里把它接上。行不在 = `None`，runtime 当"不服务"处置。
 /// - **正在本进程手里跑的那些不进这一趟**：一次周期对账不该去判一条活着的 Run。判据是
-///   [`InFlight`]——调度器领走时落一行、handler 返回时摘掉。少了它，周期对账会把
-///   `running` 且 `claimed_by == self` 的行当成"旧执行者没确认结束"而停成
-///   `waiting + intervention`（§8.7 那句"无法确认旧执行已结束时阻止重复启动"的另一面）。
+///   [`InFlight`]——handler 开跑时落一行、返回时摘掉，它盖住的是"已经停在等待上、领取权
+///   已交还，handler 却还没返回"那一段。领取已提交而 handler 还没开跑的那一段不在
+///   `InFlight` 里，由扫描自己按 `claimed_by == 本实例` 跳过（`RecoveryScan::scan`）；
+///   两道之外剩下的竞争由写回时的条件更新挡住（`RecoveryStore::requeue_if_unchanged`）。
 #[derive(Debug)]
 pub struct RecoveryIndexOf {
     store: RecoveryStore,
@@ -168,6 +169,7 @@ impl RecoveryIndex for RecoveryIndexOf {
                 state: run.state,
                 wait: run.wait,
                 claimed_by: run.claimed_by,
+                generation: run.generation,
                 result_delivered: run.result_delivered,
             })
             .collect())
@@ -195,12 +197,29 @@ impl RecoveryIndex for RecoveryIndexOf {
         self.store.backfill(run).await
     }
 
-    async fn requeue(&self, run: &RunId) -> Result<(), StoreError> {
-        self.store.requeue(run).await
+    async fn requeue(&self, seen: &UnfinishedRun) -> Result<bool, StoreError> {
+        self.store
+            .requeue_if_unchanged(&seen.run, &seen_row(seen))
+            .await
     }
 
-    async fn mark_needs_attention(&self, run: &RunId, reason: &str) -> Result<(), StoreError> {
-        self.store.mark_needs_attention(run, reason).await
+    async fn mark_needs_attention(
+        &self,
+        seen: &UnfinishedRun,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .mark_needs_attention_if_unchanged(&seen.run, reason, &seen_row(seen))
+            .await
+    }
+}
+
+fn seen_row(run: &UnfinishedRun) -> komo_store::SeenRun {
+    komo_store::SeenRun {
+        state: run.state,
+        wait: run.wait.clone(),
+        claimed_by: run.claimed_by.clone(),
+        generation: run.generation,
     }
 }
 

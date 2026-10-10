@@ -62,6 +62,8 @@ struct MemIndex {
     session: Mutex<Option<SessionState>>,
     /// 内容在不在（§8.9）。默认在；要验"内容缺失而状态没说不服务"就把它设成 `false`。
     content: Mutex<bool>,
+    /// 判断之后被别人改过的那些行：条件更新对它们答"没写"。
+    changed: Mutex<Vec<RunId>>,
 }
 
 #[derive(Debug, Default)]
@@ -83,7 +85,13 @@ impl MemIndex {
             // §8.9 的默认观察：会话在服务范围里、内容也在。`None` = 连会话行都不在了。
             session: Mutex::new(Some(SessionState::Active)),
             content: Mutex::new(true),
+            changed: Mutex::new(Vec::new()),
         })
+    }
+
+    /// 这一行在判断之后被别人改过了（被领走、受理落定、放行……）。
+    fn change_behind_the_scan(&self, run: &RunId) {
+        self.changed.lock().unwrap().push(run.clone());
     }
 
     /// `sessions.state` 这一列（§8.10）。`None` = 那一行都没了。
@@ -124,18 +132,28 @@ impl RecoveryIndex for MemIndex {
         Ok(())
     }
 
-    async fn requeue(&self, run: &RunId) -> Result<(), StoreError> {
-        self.state.lock().unwrap().requeued.push(run.clone());
-        Ok(())
+    async fn requeue(&self, seen: &UnfinishedRun) -> Result<bool, StoreError> {
+        if self.changed.lock().unwrap().contains(&seen.run) {
+            return Ok(false);
+        }
+        self.state.lock().unwrap().requeued.push(seen.run.clone());
+        Ok(true)
     }
 
-    async fn mark_needs_attention(&self, run: &RunId, reason: &str) -> Result<(), StoreError> {
+    async fn mark_needs_attention(
+        &self,
+        seen: &UnfinishedRun,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        if self.changed.lock().unwrap().contains(&seen.run) {
+            return Ok(false);
+        }
         self.state
             .lock()
             .unwrap()
             .attention
-            .push((run.clone(), reason.to_string()));
-        Ok(())
+            .push((seen.run.clone(), reason.to_string()));
+        Ok(true)
     }
 
     async fn session_state(
@@ -444,6 +462,7 @@ impl World {
             state,
             wait: None,
             claimed_by: None,
+            generation: 0,
             result_delivered: false,
         }
     }
@@ -1643,4 +1662,54 @@ async fn a_run_this_process_just_claimed_is_not_judged() {
     assert!(index.attention().is_empty(), "{:?}", index.attention());
     assert!(index.requeued().is_empty());
     assert!(index.backfilled().is_empty());
+}
+
+/// 判断之后那一行变了：条件更新没写，结论记成 `Superseded`，不算"已接续"也不算"需要你
+/// 处理"，损坏通知也不发（那条 Run 并没有被停下）。
+#[tokio::test]
+async fn a_judgement_the_row_moved_away_from_is_not_counted_as_applied() {
+    let world = World::new();
+    let resumed = world.accept().await;
+    let broken = RunId::from_raw("run-broken");
+    let elsewhere = SessionId::from_raw("session-broken");
+    let ledger = PoisonedLedger::corrupting(Arc::clone(&world.ledger), elsewhere.clone());
+    let (scan, index) = world.scan_with(
+        ledger as Arc<dyn Ledger>,
+        Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
+        vec![
+            world.run_row(&resumed, RunState::Accepted),
+            world.run_row_in(&broken, &elsewhere, RunState::Queued),
+        ],
+        true,
+    );
+    index.change_behind_the_scan(&resumed);
+    index.change_behind_the_scan(&broken);
+
+    let report = scan.scan().await.unwrap();
+    let actions: Vec<_> = report.outcomes.iter().map(|o| &o.action).collect();
+    assert!(
+        matches!(
+            actions.as_slice(),
+            [
+                RecoveryAction::BackfillIndexAndQueue,
+                RecoveryAction::HaltCorrupt { .. }
+            ] | [
+                RecoveryAction::HaltCorrupt { .. },
+                RecoveryAction::BackfillIndexAndQueue
+            ]
+        ),
+        "{actions:?}"
+    );
+    assert!(
+        report
+            .outcomes
+            .iter()
+            .all(|outcome| outcome.applied == Applied::Superseded),
+        "{report:?}"
+    );
+    assert_eq!(report.requeued(), 0);
+    assert_eq!(report.needs_operator(), 0);
+    assert!(report.corrupt_groups().is_empty(), "没停下的不报停下了");
+    assert!(index.requeued().is_empty());
+    assert!(index.attention().is_empty());
 }

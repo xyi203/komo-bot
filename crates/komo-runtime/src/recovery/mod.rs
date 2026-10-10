@@ -67,11 +67,20 @@ pub trait RecoveryIndex: Send + Sync {
     async fn backfill(&self, run: &RunId) -> Result<(), StoreError>;
 
     /// 放回队列，等调度器领。
-    async fn requeue(&self, run: &RunId) -> Result<(), StoreError>;
+    ///
+    /// **条件更新**（§8.9）：`seen` 是判断时看见的那一行。判断与写回之间隔着好几次
+    /// await，这一行可能已经被领走、受理落定或放行——那时不写、答 `false`，下一拍按新样子
+    /// 再判。
+    async fn requeue(&self, seen: &UnfinishedRun) -> Result<bool, StoreError>;
 
     /// 需要操作者判断：停成 `waiting + intervention`（§8.4、§9.7 的清单）。理由是给
     /// 操作者看的那一句（`runs.last_error`），因为 `WaitReason::Intervention` 只有句柄。
-    async fn mark_needs_attention(&self, run: &RunId, reason: &str) -> Result<(), StoreError>;
+    /// 与 [`Self::requeue`] 同一个条件。
+    async fn mark_needs_attention(
+        &self,
+        seen: &UnfinishedRun,
+        reason: &str,
+    ) -> Result<bool, StoreError>;
 
     /// `sessions.state`（§8.10）。**§8.9 的第一个问题就是它**：「这条未完成的 Run，
     /// 它所属的会话还在服务范围里吗」——一条 Run 自己的状态说得再清楚，也答不出这件事，
@@ -145,6 +154,8 @@ pub struct UnfinishedRun {
     pub wait: Option<WaitReason>,
     /// 还握着领取权的执行实例。
     pub claimed_by: Option<ExecutorId>,
+    /// 领取代次。与上面三样一起是写回时的条件（[`RecoveryIndex::requeue`]）。
+    pub generation: u64,
     /// 最终结果已经送达客户端了吗。
     pub result_delivered: bool,
 }
@@ -171,6 +182,9 @@ pub enum Applied {
     NeedsOperator,
     /// 结果是好的，只是没送到——调用方补发（§8.4 第 10 行）。
     Redeliver,
+    /// 判断之后这一行已经变了（被领走、受理落定、放行……）：这一拍一个字不写，下一拍按
+    /// 新样子再判。
+    Superseded,
 }
 
 /// 一次启动扫描的结果。
@@ -218,6 +232,7 @@ impl RecoveryReport {
     pub fn corrupt(&self) -> Vec<(&RunId, &str)> {
         self.outcomes
             .iter()
+            .filter(|outcome| outcome.applied == Applied::NeedsOperator)
             .filter_map(|outcome| match &outcome.action {
                 RecoveryAction::HaltCorrupt { reason } => Some((&outcome.run, reason.as_str())),
                 _ => None,
@@ -230,9 +245,13 @@ impl RecoveryReport {
     pub fn corrupt_groups(&self) -> Vec<CorruptGroup> {
         let mut groups: Vec<CorruptGroup> = Vec::new();
         for outcome in &self.outcomes {
+            // 判断之后那一行变了、这一拍没停下它的，不报"停下了"。
             let RecoveryAction::HaltCorrupt { reason } = &outcome.action else {
                 continue;
             };
+            if outcome.applied != Applied::NeedsOperator {
+                continue;
+            }
             if let Some(group) = groups
                 .iter_mut()
                 .find(|group| group.session == outcome.session && group.reason == *reason)
@@ -650,8 +669,7 @@ impl RecoveryScan {
             | RecoveryAction::BackfillResultAndContinue { .. }
             | RecoveryAction::ResumeWithDecision { .. } => {
                 self.index.backfill(&run.run).await?;
-                self.index.requeue(&run.run).await?;
-                Ok(Applied::Requeued)
+                Ok(self.requeue(run).await?)
             }
             // 「先核对外部效果，按 §8.6 决定是否安全继续」。核对在这里只有一种做法：
             // 看那次尝试的 `output.json` 在不在、对不对。**在**，就说明动作发生过而且
@@ -683,8 +701,7 @@ impl RecoveryScan {
                     }
                 }
                 self.index.backfill(&run.run).await?;
-                self.index.requeue(&run.run).await?;
-                Ok(Applied::Requeued)
+                Ok(self.requeue(run).await?)
             }
             // 等人、等钟、等重传、已经是终态：原样留着，**一个字都不写**。
             //
@@ -709,16 +726,34 @@ impl RecoveryScan {
             // 需要操作者判断：停成 `waiting + intervention`（§8.4、§7.5 的清单）。理由
             // 落在 `last_error` 上，因为 `WaitReason::Intervention` 只有句柄。
             RecoveryAction::WaitingForOperator { reason } => {
-                self.index.mark_needs_attention(&run.run, reason).await?;
-                Ok(Applied::NeedsOperator)
+                Ok(self.mark_needs_attention(run, reason).await?)
             }
             // 「停止受影响任务并报告损坏。不重跑来掩盖数据损坏。」
             RecoveryAction::HaltCorrupt { reason } => {
                 tracing::error!(run = %run.run, reason = %reason, "引用损坏，停止这个任务");
-                self.index.mark_needs_attention(&run.run, reason).await?;
-                Ok(Applied::NeedsOperator)
+                Ok(self.mark_needs_attention(run, reason).await?)
             }
         }
+    }
+
+    async fn requeue(&self, run: &UnfinishedRun) -> Result<Applied, StoreError> {
+        Ok(if self.index.requeue(run).await? {
+            Applied::Requeued
+        } else {
+            Applied::Superseded
+        })
+    }
+
+    async fn mark_needs_attention(
+        &self,
+        run: &UnfinishedRun,
+        reason: &str,
+    ) -> Result<Applied, StoreError> {
+        Ok(if self.index.mark_needs_attention(run, reason).await? {
+            Applied::NeedsOperator
+        } else {
+            Applied::Superseded
+        })
     }
 }
 

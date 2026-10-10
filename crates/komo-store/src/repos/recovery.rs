@@ -7,7 +7,8 @@
 //!
 //! 贯穿全模块的一条规则：**回放只补索引与派生执行状态**——不调用工具、不发送外部请求、
 //! 不消费授权，也不覆盖数据库里已经记下的取消或权限撤销（§8.5）。所以 [`requeue`] 与
-//! [`mark_needs_attention`] 都先看一眼终态就退。
+//! [`mark_needs_attention`] 都先看一眼终态就退；对账走的那两个（`*_if_unchanged`）还要
+//! 核对这一行仍是判断时看见的样子（[`SeenRun`]）。
 
 use std::path::{Path, PathBuf};
 
@@ -21,7 +22,7 @@ use time::OffsetDateTime;
 use toasty::Executor;
 
 use crate::db::{BoxFuture, Db, to_ts};
-use crate::models::DeliveryRow;
+use crate::models::{DeliveryRow, RunRow};
 use crate::payloads::PayloadStore;
 use crate::repos::{calls, runs, session};
 use crate::session_log::{SessionPaths, scan_records};
@@ -37,6 +38,8 @@ pub struct UnfinishedRun {
     pub wait: Option<WaitReason>,
     /// 还握着领取权的执行实例。
     pub claimed_by: Option<ExecutorId>,
+    /// 领取代次（`claim_generation`）。
+    pub generation: u64,
     /// `waiting` 时在等什么（§8.4）。**预算不在这里**：`retry_attempts` 是行上的计数器，
     /// "用完了没有"由拿着预算的那一层判。
     /// 最终结果已经送达客户端了吗（§8.4 第 10 行）。
@@ -45,6 +48,42 @@ pub struct UnfinishedRun {
     /// deferred 就算送达。TUI / HTTP 来源的 Run 从来不产生投递行——结果由客户端**补读**
     /// （§8.4：「补发或补读」），不是补发。
     pub result_delivered: bool,
+}
+
+impl UnfinishedRun {
+    /// 看见的这一行，作为写回时的条件。
+    pub fn seen(&self) -> SeenRun {
+        SeenRun {
+            state: self.state,
+            wait: self.wait.clone(),
+            claimed_by: self.claimed_by.clone(),
+            generation: self.generation,
+        }
+    }
+}
+
+/// 判断那一刻看见的这一行——对账写回时的条件（§8.9）。
+///
+/// 对账是先读、后判、再写，中间隔着好几次 await（读 JSONL、查审批）。这段时间里调度器、
+/// 受理与答复都可能已经把这一行推走：领取（代次涨一代）、受理落定（`waiting +
+/// dependency`）、依赖放行或答复（回 `queued`）。照着旧样子写下去就是拿过时的结论盖掉新
+/// 事实——把一条刚被领走的 `running` 改回 `queued` 等于让它被领两次。所以写之前核对这四样
+/// 还和看见时一样；不一样就不写，下一拍按新样子再判。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenRun {
+    pub state: RunState,
+    pub wait: Option<WaitReason>,
+    pub claimed_by: Option<ExecutorId>,
+    pub generation: u64,
+}
+
+impl SeenRun {
+    fn matches(&self, row: &RunRow) -> Result<bool, StoreError> {
+        Ok(runs::state_of(row)? == self.state
+            && runs::wait_of(row)? == self.wait
+            && row.claimed_by.as_deref() == self.claimed_by.as_ref().map(ExecutorId::as_str)
+            && row.claim_generation.max(0) as u64 == self.generation)
+    }
 }
 
 /// 恢复扫描的索引面。
@@ -93,6 +132,7 @@ impl RecoveryStore {
             .map(|record| UnfinishedRun {
                 result_delivered: !undelivered.contains(record.run.as_str()),
                 claimed_by: record.claimed_by.clone().map(ExecutorId::from_raw),
+                generation: record.claim_generation,
                 run: record.run,
                 session: record.session,
                 state: record.state,
@@ -210,19 +250,40 @@ impl RecoveryStore {
     /// **不覆盖已经记下的终态**（§8.5）：一个已取消的 Run 不会因为回放又活过来。重试
     /// 重试计数原样留着——「沿用已保存的次数，到期再尝试」（§8.4）。
     pub async fn requeue(&self, run: &RunId) -> Result<(), StoreError> {
+        self.requeue_guarded(run, None).await.map(|_| ())
+    }
+
+    /// 同 [`Self::requeue`]，但只在这一行仍是 `seen` 的样子时才写（对账用，见
+    /// [`SeenRun`]）。返回写了没有。
+    pub async fn requeue_if_unchanged(
+        &self,
+        run: &RunId,
+        seen: &SeenRun,
+    ) -> Result<bool, StoreError> {
+        self.requeue_guarded(run, Some(seen.clone())).await
+    }
+
+    async fn requeue_guarded(
+        &self,
+        run: &RunId,
+        seen: Option<SeenRun>,
+    ) -> Result<bool, StoreError> {
         let run = run.clone();
         self.db
             .with_write_retry(move |ex| {
-                let run = run.clone();
+                let (run, seen) = (run.clone(), seen.clone());
                 Box::pin(async move {
                     let Some(mut row) = runs::get_in(ex, &run).await? else {
                         return Err(StoreError::NotFound {
                             what: format!("run {run}"),
                         });
                     };
+                    if !still_as_seen(&row, seen.as_ref())? {
+                        return Ok(false);
+                    }
                     if runs::state_of(&row)?.is_terminal() {
                         tracing::debug!(run = %run, "已经是终态，回放不复活它");
-                        return Ok(());
+                        return Ok(false);
                     }
                     // 回 `queued` 就是"现在就能跑"（§8.4）：等待三列一起清掉。重试预算
                     // 留在 `retry_attempts` 上——**重启不重置**（§8.5）。
@@ -235,28 +296,52 @@ impl RecoveryStore {
                         .updated_at(to_ts(OffsetDateTime::now_utc()))
                         .exec(ex)
                         .await
-                        .map_err(crate::db::map_toasty)
-                }) as BoxFuture<'_, Result<(), StoreError>>
+                        .map_err(crate::db::map_toasty)?;
+                    Ok(true)
+                }) as BoxFuture<'_, Result<bool, StoreError>>
             })
             .await
     }
 
     /// 需要操作者判断：结果不明、引用损坏、授权失效。
     pub async fn mark_needs_attention(&self, run: &RunId, reason: &str) -> Result<(), StoreError> {
+        self.mark_guarded(run, reason, None).await.map(|_| ())
+    }
+
+    /// 同 [`Self::mark_needs_attention`]，但只在这一行仍是 `seen` 的样子时才写（对账用，
+    /// 见 [`SeenRun`]）。返回写了没有。
+    pub async fn mark_needs_attention_if_unchanged(
+        &self,
+        run: &RunId,
+        reason: &str,
+        seen: &SeenRun,
+    ) -> Result<bool, StoreError> {
+        self.mark_guarded(run, reason, Some(seen.clone())).await
+    }
+
+    async fn mark_guarded(
+        &self,
+        run: &RunId,
+        reason: &str,
+        seen: Option<SeenRun>,
+    ) -> Result<bool, StoreError> {
         let run = run.clone();
         let reason = reason.to_string();
         self.db
             .with_write_retry(move |ex| {
-                let (run, reason) = (run.clone(), reason.clone());
+                let (run, reason, seen) = (run.clone(), reason.clone(), seen.clone());
                 Box::pin(async move {
                     let Some(mut row) = runs::get_in(ex, &run).await? else {
                         return Err(StoreError::NotFound {
                             what: format!("run {run}"),
                         });
                     };
+                    if !still_as_seen(&row, seen.as_ref())? {
+                        return Ok(false);
+                    }
                     if runs::state_of(&row)?.is_terminal() {
                         tracing::debug!(run = %run, "已经是终态，不再停在等人判断上");
-                        return Ok(());
+                        return Ok(false);
                     }
                     // `waiting + intervention`，句柄就是这个 Run（§7.5：一个 Run 上最多停着
                     // 一条要人判断的 Intervention，所以 Run ID 本身就是它的句柄）。
@@ -270,11 +355,32 @@ impl RecoveryStore {
                         .updated_at(to_ts(OffsetDateTime::now_utc()))
                         .exec(ex)
                         .await
-                        .map_err(crate::db::map_toasty)
-                }) as BoxFuture<'_, Result<(), StoreError>>
+                        .map_err(crate::db::map_toasty)?;
+                    Ok(true)
+                }) as BoxFuture<'_, Result<bool, StoreError>>
             })
             .await
     }
+}
+
+/// 这一行还是判断时看见的样子吗。`seen` 为空 = 不核对（调用方自己握着这一行）。
+fn still_as_seen(row: &RunRow, seen: Option<&SeenRun>) -> Result<bool, StoreError> {
+    let Some(seen) = seen else {
+        return Ok(true);
+    };
+    if seen.matches(row)? {
+        return Ok(true);
+    }
+    tracing::info!(
+        run = %row.id,
+        seen = ?seen,
+        state = %row.state,
+        wait_kind = ?row.wait_kind,
+        claimed_by = ?row.claimed_by,
+        generation = row.claim_generation,
+        "判断之后这一行变了：这一拍不写，下一拍按新样子再判"
+    );
+    Ok(false)
 }
 
 /// 一条事件在索引上的回放。**只写派生状态**。
@@ -1078,5 +1184,118 @@ mod tests {
         );
         assert_eq!(record.last_error.as_deref(), Some("输出引用哈希不符"));
         assert!(record.claimed_by.is_none());
+    }
+
+    /// 对账先读、后判、再写：看见的是一条 `queued`、判成放回队列，写之前调度器已经把它
+    /// 领走。照旧判断写下去，一条正在别人手里跑的 `running` 会被改回 `queued`、领取权清掉
+    /// ——下一次领取就是第二个执行者。
+    #[tokio::test]
+    async fn a_stale_judgement_does_not_requeue_a_run_claimed_in_between() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", &f.session))
+            .await
+            .unwrap();
+        let seen = f
+            .store
+            .unfinished_runs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.run == accepted.run)
+            .expect("看见了它");
+        assert_eq!(seen.state, RunState::Queued);
+
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let claimed = queue
+            .claim_run(&accepted.run, &ExecutorId::from_raw("exec-2"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            !f.store
+                .requeue_if_unchanged(&accepted.run, &seen.seen())
+                .await
+                .unwrap(),
+            "这一行已经不是看见时的样子"
+        );
+        let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
+        assert_eq!(record.state, RunState::Running, "别人领走的行不被改回去");
+        assert_eq!(record.claimed_by.as_deref(), Some("exec-2"));
+        assert_eq!(record.claim_generation, claimed.generation);
+    }
+
+    /// 同一件事、不涨代次的那一种：看见的是 `waiting + dependency`，写之前前一条进了终态、
+    /// 这一条被放回 `queued`。照旧判断停成"等人判断"，就把一条现在就能跑的 Run 拦了下来。
+    #[tokio::test]
+    async fn a_stale_judgement_does_not_stop_a_run_released_in_between() {
+        let f = fixture().await;
+        let first = f
+            .coordinator
+            .accept_input(input("api:1", &f.session))
+            .await
+            .unwrap();
+        let second = f
+            .coordinator
+            .accept_input(input("api:2", &f.session))
+            .await
+            .unwrap();
+        let seen = f
+            .store
+            .unfinished_runs()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|run| run.run == second.run)
+            .expect("看见了它");
+        assert_eq!(
+            seen.wait,
+            Some(WaitReason::Dependency {
+                run: first.run.clone()
+            })
+        );
+
+        f.coordinator
+            .complete(&first.run, RunEnd::Cancelled { by: None })
+            .await
+            .unwrap();
+        crate::repos::queue::release_satisfied_dependencies(&f.db, TestClock::fixed().now())
+            .await
+            .unwrap();
+
+        assert!(
+            !f.store
+                .mark_needs_attention_if_unchanged(&second.run, "会话读不出来", &seen.seen())
+                .await
+                .unwrap(),
+            "这一行已经不是看见时的样子"
+        );
+        let record = runs::get(&f.db, &second.run).await.unwrap().unwrap();
+        assert_eq!(record.state, RunState::Queued, "放出来的行不被拦回去");
+        assert!(record.wait.is_none());
+        assert!(record.last_error.is_none());
+    }
+
+    /// 没人动过的那一行照常写：条件只挡过时的判断，不挡判断本身。
+    #[tokio::test]
+    async fn an_unchanged_row_is_written_as_judged() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:1", &f.session))
+            .await
+            .unwrap();
+        let seen = f.store.unfinished_runs().await.unwrap()[0].seen();
+        assert!(
+            f.store
+                .mark_needs_attention_if_unchanged(&accepted.run, "结果不明", &seen)
+                .await
+                .unwrap()
+        );
+        let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
+        assert_eq!(record.state, RunState::Waiting);
+        assert_eq!(record.last_error.as_deref(), Some("结果不明"));
     }
 }

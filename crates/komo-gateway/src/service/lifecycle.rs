@@ -15,7 +15,7 @@ use komo_kernel::protocol::http::{
     PurgeBlocker, PurgeSessionResponse, ReconcileResponse, SessionLifecycleResponse,
 };
 use komo_kernel::traits::{GatewayError, Ledger, StoreError};
-use komo_kernel::types::ids::{EventId, RunId, SessionId};
+use komo_kernel::types::ids::{EventId, ExecutorId, RunId, SessionId};
 use komo_kernel::types::status::{RunEnd, RunState, SessionState};
 use komo_runtime::recovery::Applied;
 use time::OffsetDateTime;
@@ -200,8 +200,21 @@ impl GatewayState {
             if !due {
                 continue;
             }
-            self.recovery_store.requeue(&run.run).await?;
-            released += 1;
+            // 到点的 `waiting + retry` 调度器自己也领得走：读到它与写回之间它可能已经在跑了，
+            // 所以只在这一行还是看见时的样子才放（§8.9 的条件更新）。
+            let seen = komo_store::SeenRun {
+                state: run.state,
+                wait: run.wait.clone(),
+                claimed_by: run.claimed_by.clone().map(ExecutorId::from_raw),
+                generation: run.claim_generation,
+            };
+            if self
+                .recovery_store
+                .requeue_if_unchanged(&run.run, &seen)
+                .await?
+            {
+                released += 1;
+            }
         }
         if released > 0 {
             self.waker().wake();

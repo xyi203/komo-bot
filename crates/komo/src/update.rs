@@ -300,9 +300,20 @@ async fn download(client: &reqwest::Client, url: &str, dest: &Path) -> Result<()
 fn sha256_hex(path: &Path) -> Result<String, String> {
     let mut file =
         std::fs::File::open(path).map_err(|error| format!("读不了 {}：{error}", path.display()))?;
+    // sha2 0.11 的 Sha256 不再实现 io::Write，自己分块喂。
     let mut hasher = Sha256::new();
-    std::io::copy(&mut file, &mut hasher)
-        .map_err(|error| format!("算 {} 的 sha256 失败：{error}", path.display()))?;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = match std::io::Read::read(&mut file, &mut buf) {
+            Ok(n) => n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("算 {} 的 sha256 失败：{error}", path.display())),
+        };
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
     Ok(hex(&hasher.finalize()))
 }
 

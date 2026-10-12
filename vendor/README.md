@@ -8,4 +8,5 @@ re-copy plus re-applying it.
 | crate | version | change | why |
 |---|---|---|---|
 | `wechatbot` | 0.4.0 (MIT) | `Cargo.toml`: reqwest `0.12` default features → `0.13`, `default-features = false`, `["json", "rustls-no-provider", "http2", "charset"]` | upstream inherits reqwest's default `native-tls`, which needs `openssl-devel` on every build host and puts an OpenSSL C build on the cold-build critical path; `-no-provider` reuses the ring provider the `komo` bin installs (`docs/komo_bot.md` §13.4, `.scratch/komo-v08-rewrite/spikes/wechat.md`) |
-| `toasty-driver-turso` | 0.10.0 (MIT) | `Cargo.toml`: its `turso` dependency gets `default-features = false, features = ["mimalloc"]` | turso's default `fts` feature pulls tantivy / zstd-sys / lz4 and a C toolchain for an index method MVCC mode refuses to create anyway; 62 fewer compile units (`spikes/store.md`). CI asserts `cargo tree -e features -i turso` shows only `mimalloc` |
+
+`toasty-driver-turso` used to be vendored here only to turn off turso's default `fts` feature; since 0.11.0 upstream declares `turso` with `default-features = false`, so the copy was dropped. The workspace `turso` must stay on the same major as the driver's pin (0.11 → `^0.7`) or two copies get linked and their C symbols collide.

@@ -20,9 +20,21 @@ use crate::surface::UPDATE_PLAN_TOOL;
 /// 学 pi（`system-prompt.ts`）：**规则跟着工具走**——没挂 `rg` 就不说"用 rg"，说了也
 /// 用不上。工具名本身不再列：API 的 tool schema 里已经有一份。
 fn rules(tools: &[String]) -> String {
+    let has = |name: &str| tools.iter().any(|tool| tool == name);
     let mut lines = Vec::new();
-    if tools.iter().any(|tool| tool == RG_TOOL) {
+    if has(RG_TOOL) {
         lines.push("- 找代码和文字用 rg，别用 shell 拼 grep / find / ls。");
+    }
+    // 2026-10 的统计：364 次 shell 里 126 次是 cat / head / ls 这类纯只读命令。
+    if has(READ_TOOL) && has(SHELL_TOOL) {
+        lines.push("- 看文件用 read，别用 shell 跑 cat / head / tail / sed。");
+    }
+    // 同一份统计：codemode 挂上了也几乎没人用，模型一轮一轮地 read → rg → read。
+    if has(CODEMODE_TOOL) {
+        lines.push(
+            "- 只读一处就直接调；要读两处以上、搜好几个词、或只想从大段输出里挑几行时，\
+             用 codemode 写一段脚本一次做完，别一轮一轮地读和搜。",
+        );
     }
     if tools.iter().any(|tool| tool == UPDATE_PLAN_TOOL) {
         lines.push("- 多步的事先用 update_plan 登记计划，每做完一步更新一次。");
@@ -33,6 +45,8 @@ fn rules(tools: &[String]) -> String {
 }
 
 const RG_TOOL: &str = "rg";
+const READ_TOOL: &str = "read";
+const CODEMODE_TOOL: &str = "codemode";
 
 /// 装配系统提示正文：身份 / 工作目录 / 行为约束，主 Agent 再加「komo 自己的状态怎么查」
 /// 与 §5.6 的 skills 目录、子代理再加任务与结果契约。

@@ -36,7 +36,12 @@ impl Tool for CodemodeTool {
             name: CODEMODE_TOOL.into(),
             description: "写一段 Python 脚本，在脚本里调其他工具、在本地过滤和汇总，只有脚本的\
                           输出回到你这里。适合：一次读很多文件或搜很多处、从大段结果里挑出要的\
-                          那几行、把几处结果拼成一张表。\n\
+                          那几行、把几处结果拼成一张表。只读一个文件、只搜一次，直接调 read / rg \
+                          更省。\n\
+                          例子（读两个文件，只留函数签名）：\n\
+                          for p in [\"src/a.rs\", \"src/b.rs\"]:\n\
+                          \x20   lines = tools.read(path=p)[\"text\"].splitlines()\n\
+                          \x20   text([l for l in lines if \"fn \" in l])\n\
                           脚本跑在沙箱里：不能写文件、不能联网、不能起子进程，只能用标准库\
                           （和受管理环境里装好的库）。\n\
                           - tools.<name>(**args)：调工具，返回 {\"status\", \"text\", \"result\"}；\

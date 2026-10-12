@@ -165,7 +165,8 @@ impl Tool for ShellTool {
         ToolDefinition {
             name: "shell".into(),
             description:
-                "在自己的进程组里跑一条 shell 命令，返回退出码与输出。搜索、git、构建、测试都走它。\
+                "在自己的进程组里跑一条 shell 命令，返回退出码与输出。git、构建、测试、跑程序走它；\
+                 只是看文件、搜代码用 read / rg，要读要搜好几处用 codemode。\
                  等一件慢事（下载、构建、部署）就在一条命令里循环轮询、每轮打印一行进度，并把 \
                  timeout_secs 给够；到点会终止进程组，到点前打印的输出照样交回，接着再发一条即可。\
                  不要每轮只 sleep 一下就交回来再问一次。"

@@ -171,3 +171,45 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
     );
     assert!(!sub.contains("komo 自己的状态"), "{sub}");
 }
+
+/// 挂了 `codemode` 才说"多处读、搜用 codemode 一次做完"；主 / 子代理都说（共用 [`rules`]）。
+#[test]
+fn both_prompts_steer_batched_reads_to_codemode_only_when_it_is_mounted() {
+    let tools = vec!["read".to_string(), "codemode".to_string()];
+    let main = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
+    assert!(main.contains("用 codemode 写一段脚本一次做完"), "{main}");
+    let sub = build(
+        Path::new("/tmp/w"),
+        &tools,
+        &InvocationContext::Delegated(DelegateSpec::new(
+            RunId::from_raw("run-1"),
+            ToolCallId::from_raw("call-1"),
+            "查一下调用方",
+        )),
+        None,
+    );
+    assert!(sub.contains("用 codemode 写一段脚本一次做完"), "{sub}");
+    let without = build(
+        Path::new("/tmp/w"),
+        &["read".to_string(), "rg".to_string()],
+        &InvocationContext::Main,
+        None,
+    );
+    assert!(!without.contains("codemode"), "{without}");
+}
+
+/// "看文件用 read 别用 cat"只在 `read` 与 `shell` 都挂着时出现：缺了哪一个这句都是空话。
+#[test]
+fn the_read_over_cat_rule_needs_both_read_and_shell() {
+    let both = build(
+        Path::new("/tmp/w"),
+        &["read".to_string(), "shell".to_string()],
+        &InvocationContext::Main,
+        None,
+    );
+    assert!(both.contains("看文件用 read"), "{both}");
+    for tools in [vec!["read".to_string()], vec!["shell".to_string()]] {
+        let prompt = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
+        assert!(!prompt.contains("看文件用 read"), "{prompt}");
+    }
+}

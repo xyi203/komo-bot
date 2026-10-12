@@ -350,6 +350,8 @@ pub struct GatewayState {
     pub notifier: Arc<HomeNotifier>,
     pub channels: Arc<ChannelRegistry>,
     pub llm: Arc<SwappableLlm>,
+    /// 首轮跑完后用记忆模型起会话标题（[`super::titles`]）。注入模型后端的测试里关着。
+    pub auto_title: bool,
     /// 上一条投到 home chat 的重载错误。同一条错误不重复投；装上之后清掉并说一声。
     pub reload_notice: Mutex<Option<String>>,
     pub scheduler: Arc<Scheduler>,
@@ -510,6 +512,8 @@ impl GatewayState {
             spawn_embedding_probe(Arc::clone(&memories), Arc::clone(&config));
         }
 
+        // 注入了模型后端（测试）就不起标题：多出来的那次请求会吃掉脚本里下一段的答复。
+        let auto_title = llm.is_none();
         let llm = Arc::new(SwappableLlm::new(match llm {
             Some(client) => client,
             None => build_llm(&snapshot, &config, &caps),
@@ -630,6 +634,7 @@ impl GatewayState {
             notifier,
             channels,
             llm,
+            auto_title,
             scheduler,
             handler,
             in_flight,
@@ -1028,6 +1033,7 @@ impl GatewayState {
             instructions_ref,
             memory_scope: profile.memory_scope.clone(),
             projection: Some(config.execution.projection()),
+            direct_command: None,
         })
     }
 
@@ -1066,6 +1072,44 @@ impl GatewayState {
         peer: Option<ChannelPeer>,
         model: Option<ModelConfig>,
     ) -> Result<SubmitRunResponse, GatewayError> {
+        self.accept(session, request_key, text, peer, model, None)
+            .await
+    }
+
+    /// TUI 的 `!`：受理一条**不经模型**直接跑的 shell 命令。
+    ///
+    /// 走的是同一条受理路：会话状态检查、冻结身份、次序规则、看客都一样。区别只在快照里
+    /// 多一格 `direct_command`——装配那一段按它换上 `CommandDriver`（与命令 Job 同一个
+    /// 驱动），于是命令照样经 `shell` 工具与执行器，调用与结果记进会话，下一轮模型看得见。
+    /// 不做记忆提取：没有对话，提取本身还要发一次模型请求。
+    ///
+    /// 只有 HTTP 调它（`SubmitRunRequest::shell`）；聊天渠道不接这条路。
+    pub async fn submit_shell(
+        self: &Arc<Self>,
+        session: &SessionId,
+        request_key: RequestKey,
+        command: String,
+    ) -> Result<SubmitRunResponse, GatewayError> {
+        let command = command.trim().to_string();
+        if command.is_empty() {
+            return Err(GatewayError::InvalidRequest(
+                "`!` 后面要跟一条命令，例如 `!ls -la`".into(),
+            ));
+        }
+        let text = format!("!{command}");
+        self.accept(session, request_key, text, None, None, Some(command))
+            .await
+    }
+
+    async fn accept(
+        self: &Arc<Self>,
+        session: &SessionId,
+        request_key: RequestKey,
+        text: String,
+        peer: Option<ChannelPeer>,
+        model: Option<ModelConfig>,
+        direct_command: Option<String>,
+    ) -> Result<SubmitRunResponse, GatewayError> {
         if let Some(state) = self.input_refusal(session).await? {
             return Err(GatewayError::InvalidRequest(format!(
                 "这个会话是 {}，不接受新输入（§8.10）",
@@ -1084,9 +1128,17 @@ impl GatewayState {
                 .map(|record| record.agent_id.clone())
                 .unwrap_or_default(),
         );
-        let frozen = self
+        let mut frozen = self
             .freeze_run(&config, &agent_id, session, record.as_ref(), model)
             .await?;
+        let skip_memory = direct_command.is_some();
+        if direct_command.is_some() && !frozen.surface.allows("shell") {
+            return Err(GatewayError::InvalidRequest(format!(
+                "这个会话的 Agent（{}）没有 shell 工具，`!` 用不了",
+                frozen.agent_id
+            )));
+        }
+        frozen.direct_command = direct_command;
         let accepted = self
             .routed
             .accept_input(AcceptInput {
@@ -1106,8 +1158,9 @@ impl GatewayState {
                 // 交互输入不是委派：子 Run 只由 executor 在委托那一步受理（§4）。
                 delegate: None,
                 snapshot: Some(Box::new(frozen)),
-                // 交互输入是真的对话，记忆提取照常（§9.3）；跳过只留给命令 Job（§10）。
-                skip_memory: false,
+                // 交互输入是真的对话，记忆提取照常（§9.3）；跳过只留给命令 Job（§10）
+                // 与 `!` 直接执行的命令。
+                skip_memory,
                 at: self.clock.now(),
             })
             .await?;

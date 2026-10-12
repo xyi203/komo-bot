@@ -14,8 +14,8 @@ use komo_gateway::skills::{OfferContext, SkillRegistry, one_line};
 use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
     CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionListQuery,
-    InterventionVerdict, MemoryListQuery, MemoryRevisionRequest, RebuildIndexRequest,
-    SessionListQuery, UpdateCronRequest,
+    InterventionVerdict, MemoryListQuery, MemoryRevisionRequest, MemorySweepRequest,
+    RebuildIndexRequest, SessionListQuery, UpdateCronRequest,
 };
 use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{MemoryScope, MemoryState, RetrievalMode};
@@ -443,18 +443,51 @@ pub async fn memory_confirm(client: &KomoClient, id: &str, revision: u32) -> Out
     Ok(render::memory_show(&detail.memory))
 }
 
+/// forget / restore 用一次一新的键：两者能来回切，`忘 → 恢复 → 再忘` 的第三步若带着与
+/// 第一步相同的命名键和相同的 revision，会命中幂等缓存、拿回旧响应而什么都不做。
 pub async fn memory_forget(client: &KomoClient, id: &str, revision: u32) -> Outcome {
     let detail = client
         .memory_forget(
             &MemoryId::from_raw(id),
             &MemoryRevisionRequest {
                 expected_revision: revision,
-                request_key: Some(RequestKeys::named("cli-forget", id)),
+                request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
             },
         )
         .await
         .map_err(failed)?;
     Ok(render::memory_show(&detail.memory))
+}
+
+pub async fn memory_restore(client: &KomoClient, id: &str, revision: u32) -> Outcome {
+    let detail = client
+        .memory_restore(
+            &MemoryId::from_raw(id),
+            &MemoryRevisionRequest {
+                expected_revision: revision,
+                request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+            },
+        )
+        .await
+        .map_err(failed)?;
+    Ok(render::memory_show(&detail.memory))
+}
+
+pub async fn memory_sweep(
+    client: &KomoClient,
+    apply: bool,
+    never_used_days: u32,
+    idle_days: u32,
+) -> Outcome {
+    let response = client
+        .memory_sweep(&MemorySweepRequest {
+            apply,
+            never_used_days,
+            idle_days,
+        })
+        .await
+        .map_err(failed)?;
+    Ok(render::memory_sweep(&response))
 }
 
 pub async fn memory_index(client: &KomoClient) -> Outcome {

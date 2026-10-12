@@ -861,9 +861,7 @@ async fn a_command_run_never_touches_the_llm_client_and_finishes_with_the_shell_
     let segment = wired
         .command_segment(
             CancelToken::new(),
-            Some(super::command_driver::CommandSpec {
-                command: "echo hi".into(),
-            }),
+            Some(super::command_driver::CommandSpec::job("echo hi".into())),
         )
         .await;
 
@@ -896,9 +894,7 @@ async fn a_non_zero_exit_still_completes_the_run_not_fails_it() {
     let segment = wired
         .command_segment(
             CancelToken::new(),
-            Some(super::command_driver::CommandSpec {
-                command: "exit 1".into(),
-            }),
+            Some(super::command_driver::CommandSpec::job("exit 1".into())),
         )
         .await;
 

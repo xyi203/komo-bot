@@ -1153,3 +1153,93 @@ fn interventions_from_other_sessions_are_visible_here() {
     let hint = app.input_hint();
     assert!(hint.contains('3'), "提示里要写清有几条：{hint}");
 }
+
+// ---- `!`：直接跑 shell ----
+
+#[test]
+fn a_bang_draft_is_shell_mode_and_backspacing_the_bang_leaves_it() {
+    let mut app = app();
+    type_text(&mut app, "!");
+    assert!(app.shell_mode());
+    assert!(
+        app.input_hint().contains("Shell 模式"),
+        "{}",
+        app.input_hint()
+    );
+    app.handle_key(key(KeyCode::Backspace));
+    assert!(!app.shell_mode(), "删掉 ! 就回到普通模式");
+    assert!(!app.input_hint().contains("Shell 模式"));
+}
+
+#[test]
+fn enter_on_a_bang_sends_the_command_without_the_model() {
+    let mut app = app();
+    type_text(&mut app, "!ls -la");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    let [
+        Effect::Submit {
+            text, shell, model, ..
+        },
+    ] = effects.as_slice()
+    else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(text, "ls -la", "发出去的是 ! 后面那条命令");
+    assert!(*shell);
+    assert!(model.is_none(), "不经模型，不带模型覆盖");
+    assert_eq!(
+        app.pending_submissions[0].text, "!ls -la",
+        "本地那条照原样显示"
+    );
+    assert_eq!(app.history.last().map(String::as_str), Some("!ls -la"));
+}
+
+#[test]
+fn a_bang_command_that_needs_a_terminal_is_refused_and_the_draft_stays() {
+    let mut app = app();
+    type_text(&mut app, "!vim notes.md");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(notices(&app).contains("没有 TTY"), "{}", notices(&app));
+    assert_eq!(app.input.text(), "!vim notes.md", "草稿留在框里改");
+
+    let mut app = super::App::new(Some(fixture::session()), TuiMode::New, "seed");
+    type_text(&mut app, "!");
+    assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+    assert!(
+        notices(&app).contains("!ls -la"),
+        "空命令给用法：{}",
+        notices(&app)
+    );
+}
+
+#[test]
+fn a_bang_result_that_hit_the_read_only_guard_is_explained() {
+    let mut app = app();
+    app.shell_runs.insert(fixture::run());
+    let mut events = fixture::conversation();
+    for event in &mut events {
+        if let EventPayload::ToolResult(body) = &mut event.payload {
+            body.status = ToolResultStatus::Failed;
+            body.preview = Some(
+                "exit=1 stdout=0B stderr=48B\nrm: cannot remove 'state.db': Read-only file system"
+                    .into(),
+            );
+        }
+    }
+    feed(&mut app, &events);
+    assert!(notices(&app).contains("只读"), "{}", notices(&app));
+}
+
+#[test]
+fn an_ordinary_runs_tool_result_gets_no_shell_hint() {
+    let mut app = app();
+    let mut events = fixture::conversation();
+    for event in &mut events {
+        if let EventPayload::ToolResult(body) = &mut event.payload {
+            body.preview = Some("exit=127 stdout=0B stderr=9B\nnope".into());
+        }
+    }
+    feed(&mut app, &events);
+    assert!(!notices(&app).contains("PATH"), "{}", notices(&app));
+}

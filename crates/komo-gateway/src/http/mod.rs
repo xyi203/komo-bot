@@ -88,6 +88,8 @@ pub fn router(api: Api) -> Router {
         .route("/v1/memories/{id}", get(memories::show))
         .route("/v1/memories/{id}/confirm", post(memories::confirm))
         .route("/v1/memories/{id}/forget", post(memories::forget))
+        .route("/v1/memories/{id}/restore", post(memories::restore))
+        .route("/v1/memory-sweep", post(memories::sweep))
         .route("/v1/memory-index", get(memories::index))
         .route("/v1/memory-index/rebuild", post(memories::rebuild))
         .route("/v1/toolbox", get(toolbox::list))

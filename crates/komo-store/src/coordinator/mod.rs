@@ -18,6 +18,8 @@
 
 mod ledger;
 
+pub use ledger::title_for;
+
 use std::sync::Arc;
 
 use komo_kernel::events::EventPayload;

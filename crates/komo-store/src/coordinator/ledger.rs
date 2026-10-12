@@ -998,7 +998,7 @@ async fn existing_seq(db: &Db, event_id: &EventId) -> Result<Option<Seq>, Ledger
 ///
 /// 空白输入没有标题可言（返回 `None`，于是空会话在列表里仍然是"无标题"，而不是一行空白）。
 /// 截断按**字符**切，不按字节——中文按字节切会切出半个字。
-fn title_for(text: &str) -> Option<String> {
+pub fn title_for(text: &str) -> Option<String> {
     let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
     let mut title: String = first.chars().take(TITLE_MAX_CHARS).collect();
     if first.chars().count() > TITLE_MAX_CHARS {

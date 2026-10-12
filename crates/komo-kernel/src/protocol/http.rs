@@ -16,6 +16,8 @@
 //! | `POST /v1/cron/{id}/run` | [`ManualCronRunRequest`] | [`ManualCronRunResponse`] |
 //! | `POST /v1/memories/{id}/confirm` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memories/{id}/forget` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
+//! | `POST /v1/memories/{id}/restore` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
+//! | `POST /v1/memory-sweep` | [`MemorySweepRequest`] | [`MemorySweepResponse`] |
 //! | `GET /v1/models` | — | [`ModelsResponse`] |
 //! | `GET /v1/config/check` | — | [`ConfigCheckResponse`] |
 //! | `POST /v1/config/reload` | — | [`ConfigReloadResponse`]，失败走 [`ErrorBody`] |
@@ -280,6 +282,11 @@ pub struct SubmitRunRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    /// `text` 是一条 shell 命令，**不经模型直接跑**（TUI 的 `!`）。命令照样走 `shell`
+    /// 工具与执行器，调用与结果记进会话，下一轮模型看得见。只有 HTTP 这一个入口——聊天
+    /// 渠道没有，拿到 bot 对话权限不等于拿到这台机器的 shell。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shell: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -779,6 +786,56 @@ pub struct MemoryRevisionRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryDetail {
     pub memory: MemoryItem,
+}
+
+/// `POST /v1/memories/sweep`：按规则遗忘。`apply = false` 只预演，什么都不改。
+///
+/// 已确认的记忆不在任何规则的射程里：操作者亲口认过的东西，不该被"很久没用"拿掉。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySweepRequest {
+    #[serde(default)]
+    pub apply: bool,
+    /// 入库超过这么多天、一次都没被用过的，遗忘。
+    pub never_used_days: u32,
+    /// 最近这么多天没被用过的，遗忘。
+    pub idle_days: u32,
+}
+
+/// sweep 按哪条规则处理了一条记忆。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SweepRule {
+    /// `valid_until` 已过。
+    Expired,
+    /// 入库很久、从没被用过。
+    NeverUsed,
+    /// 用过，但很久没再用。
+    Idle,
+    /// 正文提到的路径已经不在了：标 contested，不直接忘。
+    MissingPath,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepAction {
+    pub memory: MemoryId,
+    pub revision: u32,
+    pub rule: SweepRule,
+    /// 处理后的状态：forgotten 或 contested。
+    pub to: MemoryState,
+    pub content: String,
+    /// 给人看的一句理由（多少天没用、哪个路径不在了）。
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySweepResponse {
+    pub applied: bool,
+    /// 看过多少条（active + candidate）。
+    pub scanned: u64,
+    pub actions: Vec<SweepAction>,
+    /// 应用时失败的那些（版本冲突之类），不让一条失败拦住其余的。
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

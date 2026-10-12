@@ -5,8 +5,8 @@
 //! kernel 不读机器路径，所以它是工具的构造参数，不在 `ToolContext` 上。拒绝发生在
 //! `prepare`：计划都不成立，`then_run` 的命令自然也不会跑。
 //!
-//! **shell / python 不拦**：一条命令写到哪里，事前说不清，拦也拦不住——这里如实只管
-//! 两个文件工具。
+//! 一条 shell 命令写到哪里，事前说不清，`prepare` 拦不住；`shell` 改由 bwrap 把
+//! [`Protected::existing`] 列出的路径只读挂上（见 `shell.rs` 的 `Sandbox`）。python 不拦。
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +40,36 @@ impl Protected {
                 ),
             }),
         }
+    }
+
+    /// 名单里**此刻存在**的路径，连同 [`covers`] 认作同一份的兄弟（`state.db-wal` /
+    /// `-log` / `-shm` 这类）。只读挂载只能挂已有的东西，所以每条命令起之前现算。
+    pub fn existing(&self) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for root in &self.roots {
+            if root.exists() {
+                out.push(root.clone());
+            }
+            let (Some(parent), Some(_)) = (root.parent(), root.file_name()) else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(parent) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path != *root && covers(root, &path) {
+                    out.push(path);
+                }
+            }
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.roots.is_empty()
     }
 }
 
@@ -110,6 +140,32 @@ mod tests {
         ] {
             assert!(protected.check(&path).is_ok(), "{}", path.display());
         }
+    }
+
+    #[test]
+    fn existing_lists_the_database_siblings_but_not_lookalikes() {
+        let (dir, protected) = home();
+        let home = real_root(dir.path());
+        for name in [
+            "state.db",
+            "state.db-wal",
+            "state.db-log",
+            "state.dbx",
+            ".env",
+        ] {
+            std::fs::write(home.join(name), "").unwrap();
+        }
+        std::fs::create_dir(home.join("sessions")).unwrap();
+        assert_eq!(
+            protected.existing(),
+            vec![
+                home.join(".env"),
+                home.join("sessions"),
+                home.join("state.db"),
+                home.join("state.db-log"),
+                home.join("state.db-wal"),
+            ]
+        );
     }
 
     #[test]

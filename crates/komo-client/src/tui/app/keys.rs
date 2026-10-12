@@ -8,6 +8,7 @@ use super::{
 };
 use crate::tui::command::{self, Command};
 use crate::tui::paste::InputEvent;
+use crate::tui::shell;
 
 impl App {
     /// 一个输入事件（按键或一次粘贴）。
@@ -164,6 +165,9 @@ impl App {
             self.input.clear();
             return self.run_command(&text);
         }
+        if let Some(command) = shell::command_of(&text) {
+            return self.submit_shell(&text, command.to_string());
+        }
 
         let body = self.input.take();
         let request_key = self.next_key("run");
@@ -177,6 +181,30 @@ impl App {
             text: body,
             model: self.model.clone(),
             effort: self.effort.clone(),
+            shell: false,
+        }]
+    }
+
+    /// `!命令`：不经模型，交给 Gateway 直接跑。跑不好的（要 TTY、要提权）先说清楚，草稿
+    /// 留在框里改。
+    fn submit_shell(&mut self, text: &str, command: String) -> Vec<Effect> {
+        if let Some(reason) = shell::refuse(&command) {
+            self.fail(reason);
+            return Vec::new();
+        }
+        self.input.clear();
+        let request_key = self.next_key("shell");
+        self.pending_submissions.push(PendingSubmission {
+            request_key: request_key.clone(),
+            text: text.to_string(),
+            state: SubmissionState::Sending,
+        });
+        vec![Effect::Submit {
+            request_key,
+            text: command,
+            model: None,
+            effort: None,
+            shell: true,
         }]
     }
 

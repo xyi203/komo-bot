@@ -502,6 +502,22 @@ impl KomoClient {
             .await
     }
 
+    pub async fn memory_restore(
+        &self,
+        memory: &MemoryId,
+        request: &MemoryRevisionRequest,
+    ) -> ClientResult<MemoryDetail> {
+        self.post(&format!("/v1/memories/{memory}/restore"), request)
+            .await
+    }
+
+    pub async fn memory_sweep(
+        &self,
+        request: &MemorySweepRequest,
+    ) -> ClientResult<MemorySweepResponse> {
+        self.post("/v1/memory-sweep", request).await
+    }
+
     pub async fn memory_index(&self) -> ClientResult<MemoryIndexStatus> {
         self.get("/v1/memory-index").await
     }
@@ -1008,6 +1024,7 @@ mod wire_tests {
             text: "你好".into(),
             model: None,
             effort: None,
+            shell: false,
         };
         let response = server
             .client()

@@ -243,19 +243,29 @@ impl GatewaySegments {
         }
     }
 
-    /// 这一段是不是**命令直跑模式**（§10）：命令 Job 触发的 Run 不经模型，`AgentLoop`
-    /// 用 [`komo_runtime::agent::command_driver::CommandDriver`] 代替 `LlmClient`。
+    /// 这一段是不是**命令直跑模式**（§10）：命令 Job 触发的 Run 与 TUI 的 `!` 不经模型，
+    /// `AgentLoop` 用 [`komo_runtime::agent::command_driver::CommandDriver`] 代替 `LlmClient`。
     ///
-    /// 判据只看 Job 定义（`command.is_some()`），不看别的：子代理不会由命令 Job 派生
+    /// `!` 的判据是这条 Run 自己冻结的 `direct_command`；它的调用 id 带上 Run 号，同一会话
+    /// 里前几次 `!` 的结果不会被认成这一次的。Cron 的判据只看 Job 定义
+    /// （`command.is_some()`），不看别的：子代理不会由命令 Job 派生
     /// （`CommandDriver` 从不发出 `delegate` 调用），但仍然显式排掉 `delegate.is_some()`
     /// ——这一段要装配的是父 Run 继续走模型，不是意外地换成命令驱动。
     async fn command_for(
         &self,
+        run: &RunId,
         source: &komo_kernel::types::plan::PlanSource,
+        direct: Option<&str>,
         is_delegate: bool,
     ) -> Option<komo_runtime::agent::command_driver::CommandSpec> {
         if is_delegate {
             return None;
+        }
+        if let Some(command) = direct {
+            return Some(komo_runtime::agent::command_driver::CommandSpec {
+                command: command.to_string(),
+                call_id: format!("cmd-{run}"),
+            });
         }
         let komo_kernel::types::plan::PlanSource::Cron { job, .. } = source else {
             return None;
@@ -264,7 +274,7 @@ impl GatewaySegments {
         match cron.get(job).await {
             Ok(Some(job)) => job
                 .command
-                .map(|command| komo_runtime::agent::command_driver::CommandSpec { command }),
+                .map(komo_runtime::agent::command_driver::CommandSpec::job),
             Ok(None) => None,
             Err(error) => {
                 tracing::warn!(%error, %job, "读不出这个 Job，按普通模型 Run 装配");
@@ -529,7 +539,14 @@ impl SegmentSource for GatewaySegments {
             Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
         };
 
-        let command = self.command_for(&record.source, delegate.is_some()).await;
+        let command = self
+            .command_for(
+                &run,
+                &record.source,
+                identity.direct_command.as_deref(),
+                delegate.is_some(),
+            )
+            .await;
 
         let model = identity
             .model

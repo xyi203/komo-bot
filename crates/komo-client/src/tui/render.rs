@@ -38,6 +38,8 @@ pub const INPUT_MAX_ROWS: u16 = 8;
 const PALETTE_MAX: u16 = 6;
 /// 模型选择菜单最多列几行（再多就跟着高亮滚）。
 const PICKER_MAX: u16 = 8;
+/// Shell 模式（`!`）的强调色。
+const SHELL_COLOUR: Color = Color::Magenta;
 
 /// 视口要多高。`max` 是终端高度减去留给上文的那一行。
 pub fn viewport_height(app: &App, width: u16, max: u16, live_lines: usize) -> u16 {
@@ -136,21 +138,36 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    // Shell 模式（草稿以 `!` 开头）：那个 `!` 与边框换个颜色，一眼看得出这一条不经模型。
+    let shell = app.shell_mode();
     let body: Vec<Line<'static>> = rows
         .iter()
         .skip(offset)
         .take(visible)
-        .map(|(_, line)| Line::from(Span::styled(line.clone(), style)))
+        .map(|(at, line)| match line.strip_prefix('!') {
+            Some(rest) if shell && *at == 0 => Line::from(vec![
+                Span::styled(
+                    "!",
+                    Style::default()
+                        .fg(SHELL_COLOUR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rest.to_string(), style),
+            ]),
+            _ => Line::from(Span::styled(line.clone(), style)),
+        })
         .collect();
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .title(format!(" {} ", app.input_hint()))
-        .border_style(Style::default().fg(if enabled {
-            Color::DarkGray
-        } else {
+        .border_style(Style::default().fg(if !enabled {
             Color::Yellow
+        } else if shell {
+            SHELL_COLOUR
+        } else {
+            Color::DarkGray
         }));
     let inner = block.inner(area);
     frame.render_widget(Paragraph::new(body).block(block), area);

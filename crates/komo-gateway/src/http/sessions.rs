@@ -120,6 +120,14 @@ pub async fn submit(
     if let Some(state) = api.state.input_refusal(&session).await? {
         return Err(ApiFailure::session_not_open(state));
     }
+    // TUI 的 `!`：不经模型，模型 / effort 覆盖对它没有意义。
+    if request.shell {
+        let response = api
+            .state
+            .submit_shell(&session, request.request_key.clone(), request.text.clone())
+            .await?;
+        return Ok(Json(response));
+    }
     let model = model_override(&api, request.model.as_deref(), request.effort.as_ref())?;
     // 幂等由账本自己答（§8.5）：同一请求键返回原 Run，内容不同则 409。
     let response = api

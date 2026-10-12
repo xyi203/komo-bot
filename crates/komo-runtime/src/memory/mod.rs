@@ -27,6 +27,8 @@ mod consolidate;
 mod extract;
 mod index;
 mod rerank;
+mod stale;
+mod sweep;
 mod work;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -34,7 +36,9 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::{MemoryConfig, RetrievalConfig};
-use komo_kernel::protocol::http::{IndexState, MemoryIndexStatus};
+use komo_kernel::protocol::http::{
+    IndexState, MemoryIndexStatus, MemorySweepRequest, MemorySweepResponse,
+};
 use komo_kernel::traits::{
     Clock, EmbedError, EmbeddingClient, Ledger, LedgerError, LlmClient, MemoryRepo, RepoError,
     StoreError, SystemOne,
@@ -679,6 +683,8 @@ impl MemoryManager {
             }
         }
 
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let items = stale::mark_missing_paths(items, home.as_deref());
         let injection = (self.render)(&items, self.retrieval.max_tokens);
         self.record_usage(&injection, now).await;
         injection
@@ -976,6 +982,117 @@ impl MemoryManager {
             .repo
             .forget(id, expected_revision, self.clock.now())
             .await?)
+    }
+
+    /// 撤回一次遗忘或争议：状态回到 active，版本号不动（forget 也不动它）。
+    ///
+    /// 走 `put` 是因为它会把关键词索引跟着正文重写；向量在 forget 时删了，这里不同步补，
+    /// 交给增量索引（调用方随后提交一次 rebuild，同代次只补缺的那些）。
+    pub async fn restore(
+        &self,
+        id: &MemoryId,
+        expected_revision: u32,
+    ) -> Result<MemoryItem, MemoryError> {
+        let mut item = self
+            .repo
+            .get(id)
+            .await?
+            .ok_or_else(|| RepoError::NotFound {
+                what: format!("记忆 {id}"),
+            })?;
+        if !matches!(item.state, MemoryState::Forgotten | MemoryState::Contested) {
+            return Err(MemoryError::Invalid(format!(
+                "记忆 {id} 现在是 {:?}，只有 forgotten / contested 能恢复",
+                item.state
+            )));
+        }
+        item.state = MemoryState::Active;
+        item.updated_at = self.clock.now();
+        Ok(self.repo.put(item, Some(expected_revision)).await?)
+    }
+
+    /// 按规则遗忘（[`sweep`]）。`apply = false` 只给出会做什么。
+    ///
+    /// 逐条落库，一条失败（版本冲突：这期间被抽取改写了）记进 `errors`，不拦住其余的；
+    /// 返回的 `actions` 在应用时只含真正做成了的那些。
+    pub async fn sweep(
+        &self,
+        request: &MemorySweepRequest,
+    ) -> Result<MemorySweepResponse, MemoryError> {
+        let now = self.clock.now();
+        let mut items = self
+            .catalog
+            .list(None, Some(MemoryState::Active), usize::MAX)
+            .await?;
+        items.extend(
+            self.catalog
+                .list(None, Some(MemoryState::Candidate), usize::MAX)
+                .await?,
+        );
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let policy = sweep::SweepPolicy::from_days(request.never_used_days, request.idle_days);
+        let planned = sweep::plan(&items, now, policy, home.as_deref());
+        if !request.apply {
+            return Ok(MemorySweepResponse {
+                applied: false,
+                scanned: items.len() as u64,
+                actions: planned,
+                errors: vec![],
+            });
+        }
+
+        let mut actions = Vec::new();
+        let mut errors = Vec::new();
+        for action in planned {
+            let outcome = match action.to {
+                MemoryState::Contested => self.contest(&action.memory, action.revision, now).await,
+                _ => self
+                    .repo
+                    .forget(&action.memory, action.revision, now)
+                    .await
+                    .map(|_| ())
+                    .map_err(MemoryError::from),
+            };
+            match outcome {
+                Ok(()) => {
+                    tracing::info!(
+                        memory = %action.memory,
+                        rule = ?action.rule,
+                        to = ?action.to,
+                        detail = %action.detail,
+                        "sweep 处理了一条记忆"
+                    );
+                    actions.push(action);
+                }
+                Err(error) => errors.push(format!("{}：{error}", action.memory)),
+            }
+        }
+        Ok(MemorySweepResponse {
+            applied: true,
+            scanned: items.len() as u64,
+            actions,
+            errors,
+        })
+    }
+
+    /// 暂停召回、等人定夺（§9.6 的 contested）。版本号不动，与 forget 一致。
+    async fn contest(
+        &self,
+        id: &MemoryId,
+        expected_revision: u32,
+        at: OffsetDateTime,
+    ) -> Result<(), MemoryError> {
+        let mut item = self
+            .repo
+            .get(id)
+            .await?
+            .ok_or_else(|| RepoError::NotFound {
+                what: format!("记忆 {id}"),
+            })?;
+        item.state = MemoryState::Contested;
+        item.updated_at = at;
+        self.repo.put(item, Some(expected_revision)).await?;
+        Ok(())
     }
 
     // ------------------------------------------------------------ 索引（§9.5）

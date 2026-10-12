@@ -59,6 +59,8 @@ pub(crate) struct Identity {
     pub memory_scope: Option<MemoryScope>,
     /// 冻结的投影设置；`None` = 没有快照或快照早于这一格，调用方按当前配置。
     pub projection: Option<ProjectionContext>,
+    /// TUI `!` 直接执行的命令（快照里冻结的那一份）；有值时这一段不经模型。
+    pub direct_command: Option<String>,
 }
 
 /// 没有冻结快照时兜底身份要用到的那几样：当前配置、会话 workdir、`workspaces/`（§7）。
@@ -116,6 +118,7 @@ pub(crate) async fn identity_for(
         instructions,
         memory_scope: frozen.memory_scope,
         projection: frozen.projection,
+        direct_command: frozen.direct_command,
     })
 }
 
@@ -162,6 +165,7 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         instructions: profile.and_then(|profile| profile.instructions.clone()),
         memory_scope: profile.and_then(|profile| profile.memory_scope.clone()),
         projection: None,
+        direct_command: None,
     }
 }
 

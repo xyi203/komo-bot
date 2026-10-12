@@ -190,3 +190,112 @@ async fn an_unknown_memory_is_a_not_found_not_an_empty_answer() {
         "{body}"
     );
 }
+
+/// sweep 先预演、再应用；已确认的不动；遗忘的能 restore 回来，并且重新召回得到。
+#[tokio::test]
+async fn sweep_forgets_by_rule_and_restore_brings_it_back() {
+    let long_ago = time::OffsetDateTime::now_utc() - time::Duration::days(100);
+    let aged = |id: &str, content: &str| {
+        let mut item = seeded(
+            id,
+            content,
+            Provenance::ToolObservation,
+            MemoryState::Active,
+        );
+        item.created_at = long_ago;
+        item.observed_at = long_ago;
+        item
+    };
+    let mut confirmed = aged("m-confirmed", "书房空调设 25 度");
+    confirmed.confirmation = komo_kernel::types::memory::Confirmation::UserConfirmed;
+    let mut expired = seeded(
+        "m-expired",
+        "今天门锁没电",
+        Provenance::ToolObservation,
+        MemoryState::Active,
+    );
+    expired.valid_until = Some(long_ago);
+    let (gateway, _embeddings) = crate::with_memories(
+        "keyword",
+        vec![
+            aged("m-old", "卧室空调设 24 度"),
+            seeded(
+                "m-new",
+                "客厅空调设 26 度",
+                Provenance::ToolObservation,
+                MemoryState::Active,
+            ),
+            confirmed,
+            expired,
+        ],
+    )
+    .await;
+    let sweep = serde_json::json!({"never_used_days": 60, "idle_days": 90});
+
+    // 预演：列出来，但什么都不改。
+    let (status, body) = gateway.post_json("/v1/memory-sweep", sweep.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["applied"], serde_json::json!(false));
+    let picked: Vec<_> = body["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| (a["memory"].as_str().unwrap(), a["rule"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        picked,
+        vec![("m-expired", "expired"), ("m-old", "never_used")],
+        "{body}"
+    );
+    let (_, detail) = gateway.get_json("/v1/memories/m-old").await;
+    assert_eq!(detail["memory"]["state"], serde_json::json!("active"));
+
+    // 应用。
+    let mut apply = sweep.clone();
+    apply["apply"] = serde_json::json!(true);
+    let (status, body) = gateway.post_json("/v1/memory-sweep", apply.clone()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["actions"].as_array().unwrap().len(), 2, "{body}");
+    for (id, state) in [
+        ("m-old", "forgotten"),
+        ("m-expired", "forgotten"),
+        ("m-new", "active"),
+        ("m-confirmed", "active"),
+    ] {
+        let (_, detail) = gateway.get_json(&format!("/v1/memories/{id}")).await;
+        assert_eq!(detail["memory"]["state"], serde_json::json!(state), "{id}");
+    }
+    // 再跑一次：没有可做的了。
+    let (_, again) = gateway.post_json("/v1/memory-sweep", apply).await;
+    assert!(again["actions"].as_array().unwrap().is_empty(), "{again}");
+
+    // 生效的不能 restore。
+    let (status, body) = gateway
+        .post_json(
+            "/v1/memories/m-new/restore",
+            serde_json::json!({"expected_revision": 1}),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+
+    // 遗忘的能回来，关键词索引跟着回来。
+    let (status, body) = gateway
+        .post_json(
+            "/v1/memories/m-old/restore",
+            serde_json::json!({"expected_revision": 1}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["memory"]["state"], serde_json::json!("active"));
+    assert_eq!(body["memory"]["revision"], serde_json::json!(1));
+    let (_, found) = gateway
+        .get_json("/v1/memories?query=%E5%8D%A7%E5%AE%A4&mode=keyword")
+        .await;
+    let ids: Vec<_> = found["memories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["m-old"], "{found}");
+}

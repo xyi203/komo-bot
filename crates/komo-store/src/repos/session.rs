@@ -664,6 +664,42 @@ pub async fn set_title_if_empty(
     .await
 }
 
+/// 标题**还是 `expected`** 才换成 `title`，返回换没换。
+///
+/// 首轮跑完后生成的标题要盖掉"首行当标题"那个临时值（`komo-gateway` 的 `titles`），但不能
+/// 盖掉别处写死的标题（任务会话、以后手改的）：比对上一个值就是那道闸，不用另记一列。
+pub async fn replace_title_if(
+    db: &Db,
+    session: &SessionId,
+    expected: &str,
+    title: &str,
+) -> Result<bool, StoreError> {
+    let session = session.clone();
+    let (expected, title) = (expected.to_string(), title.to_string());
+    let now = OffsetDateTime::now_utc();
+    db.with_write_retry(move |ex| {
+        let (session, expected, title) = (session.clone(), expected.clone(), title.clone());
+        Box::pin(async move {
+            let Some(mut row) = get_in(ex, &session).await? else {
+                return Err(StoreError::NotFound {
+                    what: format!("session {session}"),
+                });
+            };
+            if row.title != expected {
+                return Ok(false);
+            }
+            row.update()
+                .title(title)
+                .updated_at(to_ts(now))
+                .exec(ex)
+                .await
+                .map_err(map_toasty)?;
+            Ok(true)
+        }) as BoxFuture<'_, Result<bool, StoreError>>
+    })
+    .await
+}
+
 /// 记一个 Session 的当前 Run。
 pub async fn set_current_run_in(
     ex: &mut dyn Executor,
@@ -849,6 +885,41 @@ mod tests {
         let all = list(&db, false).await.unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].origin, "api", "已经在了就原样返回，不改写来源");
+    }
+
+    #[tokio::test]
+    async fn a_title_is_replaced_only_while_it_is_still_the_expected_one() {
+        let (db, _dir) = temp().await;
+        let session = SessionId::from_raw("sess-1");
+        write(&db, |ex| {
+            Box::pin(async move {
+                ensure_in(ex, &SessionId::from_raw("sess-1"), "api", "p", NOW)
+                    .await
+                    .map(|_| ())
+            })
+        })
+        .await;
+        set_title_if_empty(&db, &session, "帮我看看这个报错")
+            .await
+            .unwrap();
+
+        assert!(
+            !replace_title_if(&db, &session, "别的值", "排查报错")
+                .await
+                .unwrap()
+        );
+        assert!(
+            replace_title_if(&db, &session, "帮我看看这个报错", "排查报错")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !replace_title_if(&db, &session, "帮我看看这个报错", "又一个")
+                .await
+                .unwrap(),
+            "换过一次之后临时值已经不在了"
+        );
+        assert_eq!(get(&db, &session).await.unwrap().unwrap().title, "排查报错");
     }
 
     /// `applied_seq` 只能推进连续、已校验的前缀——**不往回退**（§8.5）。

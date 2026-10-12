@@ -14,7 +14,7 @@ use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::protocol::http::{
     MemoryDetail, MemoryIndexStatus, MemoryListQuery, MemoryListResponse, MemoryRevisionRequest,
-    RebuildIndexRequest, RebuildIndexResponse,
+    MemorySweepRequest, MemorySweepResponse, RebuildIndexRequest, RebuildIndexResponse,
 };
 use komo_kernel::types::ids::MemoryId;
 use komo_runtime::memory::MemoryError;
@@ -137,6 +137,56 @@ pub async fn forget(
     Ok(Json(detail))
 }
 
+/// `POST /v1/memories/{id}/restore`：撤回一次遗忘或争议，回到 active。
+///
+/// 向量在 forget 时删了：恢复之后顺手提交一次同代次重建，它只补缺的那些。没配向量就
+/// 不提交——关键词索引已经由 `put` 重写，恢复本身不依赖它。
+pub async fn restore(
+    State(api): State<Api>,
+    Path(id): Path<String>,
+    Json(request): Json<MemoryRevisionRequest>,
+) -> ApiResult<Json<MemoryDetail>> {
+    let memory = MemoryId::from_raw(id);
+    let hash = body_hash(&request);
+    if let Some(previous) = api
+        .idempotency
+        .lookup::<MemoryDetail>(request.request_key.as_ref(), &hash)?
+    {
+        return Ok(Json(previous));
+    }
+    let item = api
+        .state
+        .memories
+        .restore(&memory, request.expected_revision)
+        .await
+        .map_err(memory_failure)?;
+    if api.state.memories.space().is_some()
+        && let Err(error) = api.state.memories.request_rebuild()
+    {
+        tracing::warn!(%error, memory = %memory, "恢复之后补向量没提交上，先只靠关键词命中");
+    }
+    let detail = MemoryDetail { memory: item };
+    api.idempotency
+        .remember(request.request_key.as_ref(), &hash, &detail);
+    Ok(Json(detail))
+}
+
+/// `POST /v1/memory-sweep`：按规则遗忘；`apply = false` 只预演。
+///
+/// 不走幂等键：预演本来就无副作用，应用一次之后再来一次，第二次自然什么都找不到。
+pub async fn sweep(
+    State(api): State<Api>,
+    Json(request): Json<MemorySweepRequest>,
+) -> ApiResult<Json<MemorySweepResponse>> {
+    Ok(Json(
+        api.state
+            .memories
+            .sweep(&request)
+            .await
+            .map_err(memory_failure)?,
+    ))
+}
+
 /// `GET /v1/memory-index`：当前空间、进度、覆盖率和错误。
 ///
 /// 配置换了向量模型时 `errors` 里会多一条"指纹对不上，需要一次重建"——**热重载不偷偷
@@ -204,6 +254,7 @@ fn memory_failure(error: MemoryError) -> ApiFailure {
             komo_kernel::protocol::http::ErrorCode::VectorUnavailable,
             reason,
         ),
+        MemoryError::Invalid(message) => ApiFailure::invalid(message),
         MemoryError::Repo(error) => ApiFailure::from(error),
         MemoryError::Store(error) => ApiFailure::from(error),
         other => ApiFailure::from(komo_kernel::traits::GatewayError::Internal(

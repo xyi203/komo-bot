@@ -14,7 +14,7 @@ mod keys;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::protocol::http::{
@@ -121,6 +121,8 @@ pub enum Effect {
         text: String,
         model: Option<String>,
         effort: Option<Effort>,
+        /// `text` 是 `!` 后面那条命令：不经模型直接跑（`SubmitRunRequest::shell`）。
+        shell: bool,
     },
     Cancel {
         run: RunId,
@@ -306,6 +308,8 @@ pub struct App {
     /// 已经提示过"有一帧读不懂"——只说一次，之后只进日志（见
     /// [`ServerEvent::FrameSkipped`]）。
     skipped_noticed: bool,
+    /// `!` 直接执行的那些 Run（`run.accepted` 的快照里认出来的）：它们的结果要补一句说明。
+    pub(crate) shell_runs: BTreeSet<RunId>,
     /// 这一段对话到此为止花掉的 token（模型每答一轮报一次，见 `message.assistant`）。
     pub tokens_in: u64,
     pub tokens_out: u64,
@@ -356,6 +360,7 @@ impl App {
             listing_models: false,
             model_picker: None,
             skipped_noticed: false,
+            shell_runs: BTreeSet::new(),
             tokens_in: 0,
             tokens_out: 0,
             counted: Seq::ZERO,
@@ -513,6 +518,15 @@ impl App {
         self.pending.get(handle)
     }
 
+    /// 输入框里是不是一条 `!` 命令（shell 模式）。
+    ///
+    /// **不另记一个开关**：模式就是草稿以 `!` 开头这件事本身。退格删掉 `!` 就回到普通
+    /// 模式，翻历史翻到 `!ls`、粘贴进来的 `!…` 也自然是 shell 模式——两份事实对不上的
+    /// 那一刻就不会出现。
+    pub fn shell_mode(&self) -> bool {
+        self.input_enabled() && self.input.text().starts_with('!')
+    }
+
     /// 模型菜单开着或正在补读历史时输入框禁用。
     pub fn input_enabled(&self) -> bool {
         self.model_picker.is_none() && !self.phase.is_backfilling()
@@ -535,7 +549,12 @@ impl App {
         if self.phase.is_backfilling() {
             return "正在补读历史……".to_string();
         }
-        "Enter 发送 · Shift-Enter 换行 · Esc 停当前任务 · Ctrl-C 退出 · / 看命令".to_string()
+        if self.shell_mode() {
+            return "Shell 模式 · Enter 直接执行（不经过模型，结果记进会话）· 删掉 ! 退出"
+                .to_string();
+        }
+        "Enter 发送 · Shift-Enter 换行 · Esc 停当前任务 · Ctrl-C 退出 · / 看命令 · ! 跑命令"
+            .to_string()
     }
 
     /// 命令面板的候选。

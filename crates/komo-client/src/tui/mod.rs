@@ -10,6 +10,7 @@ pub mod markdown;
 pub mod model_picker;
 pub mod paste;
 pub mod render;
+pub mod shell;
 pub mod spinner;
 pub mod transcript;
 
@@ -364,6 +365,7 @@ async fn run_effect(
             text,
             model,
             effort,
+            shell,
         } => {
             let reply_key = request_key.clone();
             let Some(session) = session else {
@@ -379,6 +381,7 @@ async fn run_effect(
                 text,
                 model,
                 effort,
+                shell,
             };
             match client.submit_run(session, &request).await {
                 // HTTP 回执先更新本地 pending；`run.accepted` 回来后再由权威事件替换。

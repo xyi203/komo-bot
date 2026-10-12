@@ -1847,3 +1847,88 @@ fn the_update_plan_tool_name_matches_the_registry() {
         komo_agent::UPDATE_PLAN_TOOL
     );
 }
+
+// ---------------------------------------------------------------- TUI 的 `!`
+/// **`!` 不经模型直接跑，结果记进会话**：同一会话连跑两条，两条都真的执行（不会把前
+/// 一条的结果认成这一条的），全程零模型请求；下一轮模型的回放窗口里看得见两条输出。
+#[tokio::test]
+async fn a_bang_command_runs_without_the_model_and_lands_in_the_history() {
+    use crate::service::test_support::harness::{FakeLlm, Home, text_round};
+
+    let home = Home::new();
+    let count = home.workspace().join("bang.count");
+    let llm = FakeLlm::new(vec![vec![text_round(1, "看到了。")]]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+
+    for (key, word) in [("bang-1", "first-out"), ("bang-2", "second-out")] {
+        let (status, body) = gateway
+            .post_json(
+                &format!("/v1/sessions/{session}/runs"),
+                serde_json::json!({
+                    "request_key": key,
+                    "text": format!("echo {word}; echo x >> {}", count.display()),
+                    "shell": true,
+                }),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let run = RunId::from_raw(body["run"].as_str().expect("run").to_string());
+        let detail = gateway.wait_terminal(&run).await;
+        assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+        assert!(
+            detail
+                .final_message
+                .as_deref()
+                .is_some_and(|text| text.contains(word)),
+            "最终答复就是命令输出：{detail:?}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&count)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        2,
+        "两条命令都要真的跑过"
+    );
+    assert_eq!(
+        llm.turns(),
+        0,
+        "`!` 全程不发模型请求（起标题、记忆提取也不发）"
+    );
+
+    let run = gateway
+        .submit(&session, "after-bang", "刚才输出了什么")
+        .await
+        .run;
+    gateway.wait_terminal(&run).await;
+    let requests = llm.requests.lock().expect("脚本模型");
+    let seen = format!("{:?}", requests[0].messages);
+    assert!(
+        seen.contains("first-out") && seen.contains("second-out"),
+        "下一轮模型要看得见 `!` 的输出：{seen}"
+    );
+}
+
+/// `!` 后面没有命令：说清楚怎么用，不受理。
+#[tokio::test]
+async fn an_empty_bang_command_is_refused() {
+    use crate::service::test_support::harness::{FakeLlm, Home};
+
+    let home = Home::new();
+    let gateway = home
+        .start(FakeLlm::new(vec![]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let (status, body) = gateway
+        .post(
+            &format!("/v1/sessions/{session}/runs"),
+            serde_json::json!({ "request_key": "bang-empty", "text": "  ", "shell": true }),
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("!ls"), "{body}");
+}

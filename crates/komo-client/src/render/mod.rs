@@ -11,8 +11,8 @@ use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
     ConfigCheckResponse, ConfigReloadResponse, CronListResponse, HealthResponse, IndexState,
     InterventionDetail, InterventionListResponse, InterventionSummary, MemoryIndexStatus,
-    MemoryListResponse, ModelsResponse, RunDetail, SessionListResponse, SessionSummary,
-    ToolCallSummary,
+    MemoryListResponse, MemorySweepResponse, ModelsResponse, RunDetail, SessionListResponse,
+    SessionSummary, SweepRule, ToolCallSummary,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
@@ -555,6 +555,44 @@ fn scope_text(scope: &MemoryScope) -> String {
         MemoryScope::Project { project_id } => format!("项目 {project_id}"),
         MemoryScope::Environment { instance_id } => format!("环境 {instance_id}"),
     }
+}
+
+/// `komo memory sweep`。每条都带 id@revision 与理由，撤回时照着抄 `komo memory restore`。
+pub fn memory_sweep(response: &MemorySweepResponse) -> String {
+    let verb = if response.applied {
+        "已处理"
+    } else {
+        "预演，将处理"
+    };
+    let mut out = vec![format!(
+        "看过 {} 条，{} {} 条",
+        response.scanned,
+        verb,
+        response.actions.len()
+    )];
+    for action in &response.actions {
+        out.push(format!(
+            "{}@{}  {} → {}  {}｜{}",
+            action.memory,
+            action.revision,
+            match action.rule {
+                SweepRule::Expired => "过期",
+                SweepRule::NeverUsed => "从没用过",
+                SweepRule::Idle => "久未使用",
+                SweepRule::MissingPath => "路径失效",
+            },
+            memory_state(action.to),
+            action.detail,
+            one_line(&action.content)
+        ));
+    }
+    for error in &response.errors {
+        out.push(format!("✗ {error}"));
+    }
+    if !response.applied && !response.actions.is_empty() {
+        out.push("加 --apply 才会真的执行".into());
+    }
+    out.join("\n")
 }
 
 /// `komo memory index status`。

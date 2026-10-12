@@ -31,7 +31,7 @@ use super::{MemoryError, MemoryWorkItem};
 
 /// 提示词版本。**改了提示词就改它**——它进 [`ExtractionMetadata`]，是"这条记忆是怎么来
 /// 的"里唯一能回答"按哪一版规则提的"的那一格（§9.2）。
-pub const PROMPT_VERSION: &str = "memory-extract/v1";
+pub const PROMPT_VERSION: &str = "memory-extract/v2";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
 const MAX_CONTENT_CHARS: usize = 300;
@@ -542,9 +542,12 @@ const SYSTEM_PROMPT: &str = "\
 推断出来的是 model_inference。不要把推断说成用户原话。
 3. content 是一句独立成立的陈述，短，只说一件事，不含代词指代（「他」「那个」要展开）。\
 易变的现场状态（此刻的开关、此刻的天气）不是长期事实，不要提。
-4. 不要写入任何密钥、令牌、密码或与任务无关的敏感输出。
-5. 不要报告确认状态或生命周期——那不是你的字段。
-6. 没有值得记的就交回 {\"observations\":[]}。不要编。";
+4. 只记**以后的对话还用得上**的东西。一次性的操作流水（「删除了 9 个文件」「已重启某服务」\
+「把某配置改成了 X」）、这一轮的进度与结果都不是记忆；从中得出的可复用结论（某命令怎么用、\
+某设备该怎么查）才是。
+5. 不要写入任何密钥、令牌、密码或与任务无关的敏感输出。
+6. 不要报告确认状态或生命周期——那不是你的字段。
+7. 没有值得记的就交回 {\"observations\":[]}。不要编。";
 
 fn user_prompt(transcript: &Transcript, now: OffsetDateTime) -> String {
     format!(

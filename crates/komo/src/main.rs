@@ -303,6 +303,25 @@ enum MemoryCommand {
         #[arg(long)]
         revision: u32,
     },
+    /// 撤回一次遗忘或争议，回到生效；版本号不变。
+    Restore {
+        /// 记忆 ID。
+        memory_id: String,
+        #[arg(long)]
+        revision: u32,
+    },
+    /// 按规则遗忘：过期、久未使用、从没用过；路径失效的标为有冲突。已确认的不动。默认只预演。
+    Sweep {
+        /// 真的执行；不加只列出会做什么。
+        #[arg(long)]
+        apply: bool,
+        /// 入库超过这么多天、一次都没被用过的，遗忘。
+        #[arg(long, default_value_t = 60)]
+        never_used_days: u32,
+        /// 最近这么多天没被用过的，遗忘。
+        #[arg(long, default_value_t = 90)]
+        idle_days: u32,
+    },
     /// 向量索引（§9.5）。
     Index {
         #[command(subcommand)]
@@ -674,6 +693,15 @@ async fn operator(
                 memory_id,
                 revision,
             } => commands::memory_forget(client, &memory_id, revision).await,
+            MemoryCommand::Restore {
+                memory_id,
+                revision,
+            } => commands::memory_restore(client, &memory_id, revision).await,
+            MemoryCommand::Sweep {
+                apply,
+                never_used_days,
+                idle_days,
+            } => commands::memory_sweep(client, apply, never_used_days, idle_days).await,
             MemoryCommand::Index { action } => match action {
                 MemoryIndexCommand::Status => commands::memory_index(client).await,
                 MemoryIndexCommand::Rebuild => commands::memory_rebuild(client).await,

@@ -23,6 +23,7 @@ pub mod run_watch;
 pub mod segment;
 pub mod state;
 pub mod tasks;
+pub mod titles;
 pub mod units;
 
 // W5 恢复故障注入验收（§14）要在集成测试里包一层故障账本，所以它也在 feature 后面。
@@ -603,14 +604,18 @@ async fn build_tools(
         executor: komo_kernel::types::ids::ExecutorId::from_raw(instance_id.to_string()),
     };
 
-    // §7 唯一的硬限制：komo 自己的状态不许被 write / edit 改（§8.10）。名单只依赖数据
+    // §7 唯一的硬限制：komo 自己的状态不许被 write / edit 改，shell 里只读挂载（§8.10）。名单只依赖数据
     // 目录与 start-only 的路径，启动时算一次就够——热重载换不动它们。
     let protected = state::protected_paths(&snapshot, config.home());
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadTool::new()),
         Arc::new(WriteTool::new().protecting(protected.clone())),
-        Arc::new(EditTool::new().protecting(protected)),
-        Arc::new(ShellTool::new().registered(registration.clone())),
+        Arc::new(EditTool::new().protecting(protected.clone())),
+        Arc::new(
+            ShellTool::new()
+                .registered(registration.clone())
+                .protecting(protected),
+        ),
         // 搜索是**进程内**的（`grep` + `ignore` 书库）：没有外部二进制，也就没有"这台机器
         // 上没装"这一种情况，不需要像 `python` 那样探测一遍。
         Arc::new(RgTool::new()),

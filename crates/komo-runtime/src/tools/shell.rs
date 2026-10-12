@@ -22,6 +22,7 @@ use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutpu
 use serde::{Deserialize, Serialize};
 
 use super::process::{ChildRegistration, ChildSpec, ProcessError, run_child};
+use super::protect::Protected;
 use super::{normalized, parse_args, plan_time};
 
 /// 一条命令默认跑多久。
@@ -119,6 +120,71 @@ pub struct ShellTool {
     shell: String,
     /// 在册登记（§8.7）。`None` = 不登记。
     register: Option<ChildRegistration>,
+    /// 数据目录只读挂载。`None` = 直接跑（没给名单，或这台机器上 bwrap 用不了）。
+    sandbox: Option<Sandbox>,
+}
+
+/// 用 bwrap 把 komo 自己的状态只读挂上再跑命令（§7 的硬限制延伸到 `shell`）。
+///
+/// 只防手滑，不防恶意：整棵树照旧可写（`--dev-bind / /`），只是名单里的路径换成只读挂载；
+/// 名单里还不存在的文件（比如重启前的 `state.db-wal`）挂不上，把数据目录整个改名也拦不住。
+/// bwrap 会设 no_new_privs，命令里的 `sudo` / setuid 程序因此跑不了。
+#[derive(Debug, Clone)]
+struct Sandbox {
+    bwrap: PathBuf,
+    protected: Protected,
+}
+
+impl Sandbox {
+    /// 找得到 bwrap、而且在这台机器上真起得来（内核可能关了非特权 user namespace）才用。
+    fn probe(protected: Protected) -> Option<Self> {
+        if protected.is_empty() {
+            return None;
+        }
+        let bwrap = ["/usr/bin/bwrap", "/bin/bwrap", "/usr/local/bin/bwrap"]
+            .into_iter()
+            .map(PathBuf::from)
+            .find(|path| path.is_file())?;
+        let works = std::process::Command::new(&bwrap)
+            .args(["--dev-bind", "/", "/", "--", "/bin/sh", "-c", "true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !works {
+            tracing::warn!(bwrap = %bwrap.display(), "bwrap 起不来，shell 不挂数据目录保护");
+            return None;
+        }
+        Some(Self { bwrap, protected })
+    }
+
+    /// `bwrap … -- <shell> -c <command>` 的程序与参数。
+    fn wrap(&self, shell: &str, command: &str) -> (String, Vec<String>) {
+        let mut args: Vec<String> = vec!["--dev-bind".into(), "/".into(), "/".into()];
+        for path in self.protected.existing() {
+            let path = path.display().to_string();
+            args.extend(["--ro-bind".into(), path.clone(), path]);
+        }
+        args.extend([
+            "--die-with-parent".into(),
+            "--".into(),
+            shell.into(),
+            "-c".into(),
+            command.into(),
+        ]);
+        (self.bwrap.display().to_string(), args)
+    }
+}
+
+/// 有 bash 用 bash：模型写的命令默认是 bash 的写法（`[[ ]]`、`<(…)`、数组），`/bin/sh`
+/// 在 Debian 系是 dash，这些都跑不了。
+fn default_shell() -> String {
+    ["/bin/bash", "/usr/bin/bash"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+        .unwrap_or("/bin/sh")
+        .into()
 }
 
 impl std::fmt::Debug for ShellTool {
@@ -126,6 +192,7 @@ impl std::fmt::Debug for ShellTool {
         f.debug_struct("ShellTool")
             .field("shell", &self.shell)
             .field("default_timeout", &self.default_timeout)
+            .field("sandbox", &self.sandbox)
             .finish_non_exhaustive()
     }
 }
@@ -141,14 +208,21 @@ impl ShellTool {
         Self {
             default_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
             output_limit: DEFAULT_OUTPUT_LIMIT,
-            shell: "/bin/sh".into(),
+            shell: default_shell(),
             register: None,
+            sandbox: None,
         }
     }
 
     /// 把这个工具起的子进程登记在册，恢复扫描才核实得了它们（§8.7）。
     pub fn registered(mut self, registration: ChildRegistration) -> Self {
         self.register = Some(registration);
+        self
+    }
+
+    /// 把这些路径只读挂上再跑命令；bwrap 用不了时照旧直接跑（启动时探一次）。
+    pub fn protecting(mut self, paths: Vec<PathBuf>) -> Self {
+        self.sandbox = Sandbox::probe(Protected::new(paths));
         self
     }
 
@@ -174,7 +248,7 @@ impl Tool for ShellTool {
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "要执行的命令，交给 /bin/sh -c" },
+                    "command": { "type": "string", "description": "要执行的命令，交给 bash -c（没有 bash 的机器上是 /bin/sh -c）" },
                     "cwd": { "type": "string", "description": "工作目录；相对路径按会话工作目录解析" },
                     "timeout_secs": { "type": "integer", "minimum": 1, "description": "活动执行时限，秒；省略 = 120，上限是这次调用的活动执行时限" }
                 },
@@ -207,9 +281,13 @@ impl Tool for ShellTool {
             .map_or(self.default_timeout, Duration::from_secs)
             .min(ctx.call_timeout);
 
+        let (program, child_args) = match &self.sandbox {
+            Some(sandbox) => sandbox.wrap(&self.shell, &args.command),
+            None => (self.shell.clone(), vec!["-c".into(), args.command.clone()]),
+        };
         let spec = ChildSpec {
-            program: self.shell.clone(),
-            args: vec!["-c".into(), args.command.clone()],
+            program,
+            args: child_args,
             cwd: cwd.clone(),
             env: environment(ctx),
             stdin: None,
@@ -320,6 +398,60 @@ mod tests {
 
     fn shell_result(output: &ToolOutput) -> ShellResult {
         serde_json::from_value(output.result.clone()).expect("shell 的结果")
+    }
+
+    #[tokio::test]
+    async fn the_state_is_read_only_under_the_sandbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        std::fs::create_dir(home.join("sessions")).unwrap();
+        for name in ["state.db", "state.db-log", "sessions/events.jsonl"] {
+            std::fs::write(home.join(name), "keep").unwrap();
+        }
+        let tool = ShellTool::new().protecting(vec![home.join("sessions"), home.join("state.db")]);
+        if tool.sandbox.is_none() {
+            eprintln!("这台机器上 bwrap 用不了，跳过");
+            return;
+        }
+        let ctx = context(home);
+        let mut sink = writer(&ctx);
+        let command = "rm -f state.db-log; echo x > state.db; rm -rf sessions/*; echo ok > other";
+        let plan = tool
+            .prepare(serde_json::json!({ "command": command }), &ctx)
+            .await
+            .unwrap();
+        tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        for name in ["state.db", "state.db-log", "sessions/events.jsonl"] {
+            assert_eq!(
+                std::fs::read_to_string(home.join(name)).unwrap(),
+                "keep",
+                "{name}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(home.join("other")).unwrap().trim(),
+            "ok"
+        );
+    }
+
+    #[tokio::test]
+    async fn commands_run_under_bash_when_there_is_one() {
+        if !std::path::Path::new("/bin/bash").is_file() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = ShellTool::new();
+        let mut sink = writer(&ctx);
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "command": "[[ -n $BASH_VERSION ]] && echo bash" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert_eq!(shell_result(&output).stdout_excerpt.trim(), "bash");
     }
 
     #[tokio::test]

@@ -25,9 +25,9 @@ use komo_kernel::traits::TurnDriver;
 use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::turn::{LlmError, ProviderToolCall, ReplayMessage, Round, RoundInput};
 
-/// 那次 `shell` 调用固定用这个 `provider_call_id`——回放窗口里认哪条结果是它的，靠的
-/// 就是这个常量，不是猜"最后一条工具结果"。
-const CALL_ID: &str = "cmd-1";
+/// 命令 Job 那次 `shell` 调用的 `provider_call_id`——回放窗口里认哪条结果是它的，靠的
+/// 就是这个 id，不是猜"最后一条工具结果"。
+pub const CALL_ID: &str = "cmd-1";
 
 /// 一条命令 Job 交给 `CommandDriver` 的那一条命令。工作目录不在这里：它是这一段执行
 /// 环境的 `cwd`（Session 的 workdir，受理时已经从 Job 落到会话上，§10），`shell` 工具
@@ -35,11 +35,26 @@ const CALL_ID: &str = "cmd-1";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub command: String,
+    /// 这次调用的 `provider_call_id`。命令 Job 用 [`CALL_ID`]；TUI 的 `!` 在一个会话里
+    /// 会跑很多次，每次要一个**不重复**的 id：回放窗口里有前几次的结果，同一个 id 会被
+    /// 认成"已经跑过"，而且模型协议也不接受同一段对话里两个同 id 的调用。
+    pub call_id: String,
+}
+
+impl CommandSpec {
+    /// 命令 Job 的那一份（固定 id，旧 Run 回放照样认得出）。
+    pub fn job(command: String) -> Self {
+        CommandSpec {
+            command,
+            call_id: CALL_ID.into(),
+        }
+    }
 }
 
 /// 固定出牌的 [`TurnDriver`]：第一轮发那个 `shell` 调用，第二轮把它的结果当最终答复。
 pub struct CommandDriver {
     command: String,
+    call_id: String,
     /// 回放窗口里已经有的那条结果（重启安全，见模块文档）。`Some` 时第一轮直接用它
     /// 收尾，不再发一次调用。
     already: Option<String>,
@@ -53,11 +68,12 @@ impl CommandDriver {
             message
                 .tool_results
                 .iter()
-                .find(|result| result.provider_call_id == CALL_ID)
+                .find(|result| result.provider_call_id == spec.call_id)
                 .map(|result| result.content.clone())
         });
         CommandDriver {
             command: spec.command,
+            call_id: spec.call_id,
             already,
         }
     }
@@ -75,7 +91,7 @@ impl TurnDriver for CommandDriver {
                     round: 1,
                     text: None,
                     tool_calls: vec![ProviderToolCall {
-                        provider_call_id: CALL_ID.into(),
+                        provider_call_id: self.call_id.clone(),
                         name: "shell".into(),
                         arguments: serde_json::json!({ "command": self.command }),
                     }],
@@ -87,7 +103,7 @@ impl TurnDriver for CommandDriver {
             RoundInput::ToolResults { results, .. } => {
                 let content = results
                     .into_iter()
-                    .find(|result| result.provider_call_id == CALL_ID)
+                    .find(|result| result.provider_call_id == self.call_id)
                     .map(|result| result.content)
                     .unwrap_or_default();
                 Ok(finish(content))
@@ -120,9 +136,7 @@ mod tests {
     use komo_kernel::types::turn::{Role, ToolResultForModel};
 
     fn spec(command: &str) -> CommandSpec {
-        CommandSpec {
-            command: command.into(),
-        }
+        CommandSpec::job(command.into())
     }
 
     #[tokio::test]
@@ -181,5 +195,32 @@ mod tests {
             round.tool_calls.is_empty(),
             "已经有结果了，不该再发一次调用"
         );
+    }
+
+    /// TUI 的 `!`：同一会话里前一次 `!` 的结果还在回放窗口里，用各自的 id 就不会被
+    /// 认成"已经跑过"。
+    #[tokio::test]
+    async fn an_earlier_direct_command_with_another_id_does_not_count_as_this_one() {
+        let messages = vec![ReplayMessage {
+            role: Role::Tool,
+            seq: komo_kernel::types::ids::Seq(3),
+            text: None,
+            tool_calls: vec![],
+            tool_results: vec![ToolResultForModel {
+                provider_call_id: "cmd-run-1".into(),
+                call_id: ToolCallId::from_raw("call-1"),
+                content: "上一次".into(),
+                is_error: false,
+            }],
+            provider_blocks: None,
+        }];
+        let spec = CommandSpec {
+            command: "ls".into(),
+            call_id: "cmd-run-2".into(),
+        };
+        let mut driver = CommandDriver::new(spec, &messages);
+        let round = driver.next(RoundInput::First).await.unwrap();
+        assert_eq!(round.tool_calls.len(), 1, "这一次的命令要真的跑");
+        assert_eq!(round.tool_calls[0].provider_call_id, "cmd-run-2");
     }
 }

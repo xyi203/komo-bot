@@ -490,6 +490,9 @@ async fn finish(
     state.release_dependents().await;
     match watcher {
         Watcher::Interactive { peer } => {
+            if status == komo_kernel::cron::FiringStatus::Ok {
+                super::titles::spawn(state, session, run, &text);
+            }
             // 后台任务的结果交回派它的会话，由那边转告（`docs/background-tasks.md`）。
             let outcome = if status == komo_kernel::cron::FiringStatus::Ok {
                 super::tasks::TaskOutcome::Completed

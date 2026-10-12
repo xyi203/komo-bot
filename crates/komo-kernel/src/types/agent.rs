@@ -117,6 +117,11 @@ pub struct RunSnapshot {
     /// 回放才按同一份渲染，热重载改不到已经受理的 Run。`None` = 这一格出现之前受理的 Run。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projection: Option<ProjectionContext>,
+    /// 操作者在 TUI 里用 `!` 直接执行的命令（`SubmitRunRequest::shell`）。有值时这条 Run
+    /// 不经模型，由 `CommandDriver` 固定发这一个 `shell` 调用。冻结在这里，恢复出来的
+    /// Run 也认得出自己是命令直跑。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_command: Option<String>,
 }
 
 /// 配置里的一整套助手定义。

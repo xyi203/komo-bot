@@ -11,6 +11,7 @@ use super::{
     resume_summary, status_summary, verdicts_text, wait_text,
 };
 use crate::tui::model_picker::ModelPicker;
+use crate::tui::shell;
 
 impl App {
     // ---- 服务端事件 ----
@@ -249,6 +250,13 @@ impl App {
                 self.pending_submissions
                     .retain(|pending| pending.request_key != body.request_key);
                 if let Some(run) = &event.run {
+                    if body
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot.direct_command.is_some())
+                    {
+                        self.shell_runs.insert(run.clone());
+                    }
                     let meta = self.runs.entry(run.clone()).or_default();
                     meta.started_at = Some(event.ts);
                     meta.model = body.model.clone();
@@ -370,6 +378,18 @@ impl App {
                 };
                 line.preview = body.preview.clone();
                 line.elapsed_ms = body.elapsed_ms;
+                // `!` 的结果补一句为什么（超时、截断、只读……）。补读出来的旧结果不说：
+                // 那是翻旧账，不是刚发生的事。
+                let direct = event
+                    .run
+                    .as_ref()
+                    .is_some_and(|run| self.shell_runs.contains(run));
+                if direct && fresh && !self.phase.is_backfilling() {
+                    let hints = shell::explain(body.preview.as_deref().unwrap_or_default());
+                    for hint in hints {
+                        self.note(hint);
+                    }
+                }
             }
             _ => {}
         }

@@ -320,3 +320,35 @@ async fn a_chat_verify_is_delivered_once_even_after_the_sweep() {
     gateway.state().sweep_unseen_interventions().await;
     assert_eq!(attention(), 1, "{:?}", sender.sent());
 }
+
+/// 2026-10-12 起结果不明交给模型判断。升级前已经停在 `verify` 上的 Run，Gateway 启动时放回
+/// 队列：模型在回放里看见那条 uncertain 结果自己核对，Run 跑完，清单空了，动作**不重跑**。
+#[tokio::test]
+async fn a_legacy_verify_goes_to_the_model_after_a_restart() {
+    let home = Home::new();
+    let fixture = an_uncertain_call(&home).await;
+    fixture.gateway.stop().await;
+
+    komo_gateway::service::test_support::requeue_legacy_verify_on_start(home.path());
+    let llm = FakeLlm::finisher("核对过了，接着往下。");
+    let gateway = home
+        .start(std::sync::Arc::clone(&llm) as std::sync::Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let detail = gateway.wait_terminal(&fixture.run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert_eq!(fixture.unsure.ran(), 1, "交给模型不等于重跑");
+    assert!(gateway.interventions().await.is_empty(), "清单里不再有它");
+    let seen = format!(
+        "{:?}",
+        llm.requests
+            .lock()
+            .expect("请求")
+            .last()
+            .expect("续跑的请求")
+            .messages
+    );
+    assert!(
+        seen.contains("不知道做没做成"),
+        "模型看得见那条结果不明：{seen}"
+    );
+}

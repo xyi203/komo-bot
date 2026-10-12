@@ -46,6 +46,7 @@ wechat = ["dep:wechatbot", "dep:qrcode"]
 # `service::test_support` 里的注入表，生产构建里那张表根本不存在。
 test-support = [
     "komo-kernel/test-support",
+    "komo-runtime/test-support",
     "komo-store/test-support",
     "dep:tempfile",
     "dep:rustls",

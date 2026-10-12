@@ -383,8 +383,9 @@ pub(crate) fn cache_clock(
 //
 // - [`Gate`]（工具名 `gate`）：进去之后**一直等**，直到测试放行——一个 Run 停在 `running`
 //   上占着名额（次序、取消、并发的测试要的就是它）。
-// - [`Unsure`]（工具名 `unsure`）：一调就答"结果不明"——Run 当场停在 `waiting +
-//   intervention`（`verify`）上等人核对（§7.5、§8.6），走的是生产里同一条路。
+// - [`Unsure`]（工具名 `unsure`）：一调就答"结果不明"，正文带 `TEST_PARK` 前缀——Run 当场
+//   停在 `waiting + intervention`（升级前的 `verify` 形状）上。生产里结果不明交给模型判断
+//   （§8.6），这条停法只在 `test-support` 下有；测的是清单、投递、答复与依赖等待。
 
 type ToolTable = std::sync::Mutex<
     Vec<(
@@ -396,6 +397,31 @@ type ToolTable = std::sync::Mutex<
 fn tool_table() -> &'static ToolTable {
     static TABLE: std::sync::OnceLock<ToolTable> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn legacy_table() -> &'static std::sync::Mutex<Vec<std::path::PathBuf>> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<Vec<std::path::PathBuf>>> =
+        std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// 在 `home` 起 Gateway 时照生产那样，把停在结果不明上的旧 Run 放回队列交给模型。
+///
+/// 测试构建里**默认不放**：[`Unsure`] 停住的 Run 与升级前的 `verify` 是同一个形状，而
+/// "停着的 Run 扛过重启、答复之后接着跑"那一批测试要它重启后还停着。专测迁移的那条打开它。
+pub fn requeue_legacy_verify_on_start(home: &std::path::Path) {
+    let mut table = legacy_table().lock().expect("迁移开关表");
+    if !table.iter().any(|path| path == home) {
+        table.push(home.to_path_buf());
+    }
+}
+
+pub(crate) fn requeues_legacy_verify(home: &std::path::Path) -> bool {
+    legacy_table()
+        .lock()
+        .expect("迁移开关表")
+        .iter()
+        .any(|path| path == home)
 }
 
 /// 下一次在 `home` 起 Gateway 时，多挂这几个工具。同一个 `home` 再装一次覆盖前一次。
@@ -598,7 +624,10 @@ impl komo_kernel::traits::Tool for UnsureTool {
     ) -> Result<komo_kernel::types::tool::ToolOutput, komo_kernel::types::tool::ToolError> {
         self.0.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(komo_kernel::types::tool::ToolError::Uncertain {
-            message: "测试：远端没有回话，不知道做没做成".into(),
+            message: format!(
+                "{}测试：远端没有回话，不知道做没做成",
+                komo_runtime::executor::TEST_PARK
+            ),
         })
     }
 }

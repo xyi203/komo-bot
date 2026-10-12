@@ -570,7 +570,10 @@ pub async fn reclaim_unowned_in(
         .exec(&mut *ex)
         .await
         .map_err(map_toasty)?;
-    let claimants: Vec<String> = rows.iter().filter_map(|row| column_string(row, 0)).collect();
+    let claimants: Vec<String> = rows
+        .iter()
+        .filter_map(|row| column_string(row, 0))
+        .collect();
     let mut reclaimed = 0;
     for claimant in claimants {
         if keep.iter().any(|kept| kept.as_str() == claimant) {

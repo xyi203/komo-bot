@@ -32,7 +32,7 @@ use async_trait::async_trait;
 use komo_kernel::compaction::{CompactionJob, PROMPT_CACHE_TTL, Reshape, estimate_tokens};
 use komo_kernel::events::ContextCompacted;
 use komo_kernel::traits::{Clock, Ledger, LedgerError, LlmClient};
-use komo_kernel::types::ids::{InterventionId, RunId, SessionId, ToolCallId};
+use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::status::{RunEnd, WaitReason};
 use komo_kernel::types::turn::{
@@ -637,20 +637,12 @@ impl AgentLoop {
         stop: RoundStop,
     ) -> Result<SegmentOutcome, AgentError> {
         match stop {
-            // 「结果不明」停在**一条 Intervention** 上等人核对（§7.5、§8.6）。句柄就是
-            // 这个 Run：一个 Run 上最多停着一条要人判断的干预，再编一个 ID 只会和清单
-            // 对不上。自由文本的理由没有地方可放（`WaitReason::Intervention` 只有句柄，
-            // 事件也只有 `reason`）——那条调用的 `tool.result` 已经把"为什么不明"连同
-            // 核对证据写在账上了，这里只留一条日志。
+            // 测试专用（`executor::TEST_PARK`）：停在一条 Intervention 上等人。句柄就是这个 Run。
+            #[cfg(any(test, feature = "test-support"))]
             RoundStop::Attention { reason, call } => {
-                tracing::warn!(
-                    run = %run,
-                    %call,
-                    %reason,
-                    "结果不明，停在 waiting + intervention 上等人核对"
-                );
+                tracing::warn!(run = %run, %call, %reason, "测试注入：停在 waiting + intervention 上");
                 let wait = WaitReason::Intervention {
-                    intervention: InterventionId::for_run(run),
+                    intervention: komo_kernel::types::ids::InterventionId::for_run(run),
                 };
                 self.ledger.suspend(run, wait.clone()).await?;
                 Ok(SegmentOutcome::Suspended { wait, rounds })

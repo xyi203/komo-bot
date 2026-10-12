@@ -366,7 +366,8 @@ async fn command_outcome(
     let Some(result) = shell_result_of(state, session, run).await else {
         return (
             FiringStatus::Error,
-            "命令的执行结果读不出来，去原 Session 看细节（§10）".to_string(),
+            "命令的执行结果读不出来（超时或结果不明时没有结构化结果），去原 Session 看细节（§10）"
+                .to_string(),
             true,
         );
     };

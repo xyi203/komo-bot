@@ -24,7 +24,7 @@ use toasty::Executor;
 use crate::db::{BoxFuture, Db, to_ts};
 use crate::models::{DeliveryRow, RunRow};
 use crate::payloads::PayloadStore;
-use crate::repos::{calls, runs, session};
+use crate::repos::{calls, interventions, runs, session};
 use crate::session_log::{SessionPaths, scan_records};
 
 /// 一个未终态 Run 在 state.db 里的样子。
@@ -158,6 +158,22 @@ impl RecoveryStore {
                 run.state == RunState::Waiting
                     && matches!(run.wait, Some(WaitReason::Approval { .. }))
             })
+            .collect())
+    }
+
+    /// 2026-10-12 之前停在"结果不明"上等人核对的 Run（[`interventions::is_legacy_verify`]）。
+    ///
+    /// 结果不明现在交给模型判断，不再等人。Gateway 启动对账之后把这一批 [`Self::requeue`]
+    /// 回队列：那次调用已经有一条 `uncertain` 结果，续跑时它不在待执行的调用里，模型在回放
+    /// 里看见它，自己去核对、决定重做还是往下走。
+    pub async fn legacy_verify_waits(&self) -> Result<Vec<RunId>, StoreError> {
+        Ok(interventions::blocked_runs(&self.db)
+            .await?
+            .into_iter()
+            .filter(|entry| {
+                entry.state == RunState::Waiting && interventions::is_legacy_verify(entry)
+            })
+            .map(|entry| entry.run)
             .collect())
     }
 

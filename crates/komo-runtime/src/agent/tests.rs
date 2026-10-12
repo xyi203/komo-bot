@@ -5,7 +5,6 @@ use std::sync::Arc;
 use komo_kernel::fold::Surface;
 use komo_kernel::test_support::{ScriptedLlm, sample_model};
 use komo_kernel::traits::Clock;
-use komo_kernel::types::ids::InterventionId;
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
 use komo_kernel::types::tool::{CancelToken, ToolError, ToolOutput};
@@ -400,9 +399,9 @@ async fn a_resumed_segment_finishes_the_round_it_came_back_to() {
     assert_eq!(tool.ran(), 1);
 }
 
-/// 续跑时又停下来（这次结果不明）：这一段仍然只是让出名额。
+/// 续跑时这次调用结果不明：不停下来，结果交给模型，这一段接着跑完（§8.6）。
 #[tokio::test]
-async fn a_resumed_segment_can_suspend_again() {
+async fn a_resumed_uncertain_call_goes_on_to_the_model() {
     let tool = Arc::new(
         RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
             message: "响应丢了".into(),
@@ -413,7 +412,7 @@ async fn a_resumed_segment_can_suspend_again() {
     let agent = AgentLoop::new(
         Arc::new(ScriptedLlm::once(vec![round(
             2,
-            Some("不会走到这里"),
+            Some("核对过了。"),
             vec![],
         )])),
         harness.ledger.clone(),
@@ -449,59 +448,43 @@ async fn a_resumed_segment_can_suspend_again() {
     assert!(
         matches!(
             &outcome,
-            SegmentOutcome::Suspended {
-                wait: WaitReason::Intervention { .. },
-                ..
-            }
+            SegmentOutcome::Completed { final_message: Some(text), .. } if text == "核对过了。"
         ),
         "{outcome:?}"
     );
-    assert_eq!(tool.ran(), 1, "跑了一次，结果不明就停，不重试");
+    assert_eq!(tool.ran(), 1, "跑了一次，结果不明也不自动重试");
 }
 
-/// 结果不明 → 这一段停在 `waiting + intervention`，等人（§8.6）。
+/// 结果不明 → 不停下来等人：结果连同判断方法交给模型，这一段接着跑（§8.6）。
 #[tokio::test]
-async fn an_uncertain_call_suspends_the_run_for_a_human() {
+async fn an_uncertain_call_goes_back_to_the_model() {
     let tool = Arc::new(
         RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
             message: "响应丢了".into(),
         })),
     );
     let wired = Wired::new(
-        vec![vec![round(
-            1,
-            None,
-            vec![call("pc-1", "shell", serde_json::json!({}))],
-        )]],
-        vec![tool],
+        vec![vec![
+            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+            round(2, Some("核对过了。"), vec![]),
+        ]],
+        vec![tool.clone()],
     );
     let segment = wired.segment(CancelToken::new()).await;
     let outcome = wired.agent.run(segment).await.unwrap();
 
     assert!(
-        matches!(
-            &outcome,
-            SegmentOutcome::Suspended {
-                wait: WaitReason::Intervention { .. },
-                ..
-            }
-        ),
+        matches!(&outcome, SegmentOutcome::Completed { .. }),
         "{outcome:?}"
     );
+    assert_eq!(tool.ran(), 1, "执行器不自动重跑");
     let run = surface(&wired.harness)
         .runs
         .values()
         .next()
         .cloned()
         .unwrap();
-    assert_eq!(run.status, RunState::Waiting);
-    assert_eq!(
-        run.wait,
-        Some(WaitReason::Intervention {
-            intervention: InterventionId::for_run(&run.run)
-        }),
-        "干预的句柄就是这个 Run：一个 Run 上最多停一条要人判断的干预"
-    );
+    assert_eq!(run.status, RunState::Completed);
 }
 
 /// 每个 Run 固定自己的模型配置快照，一段只 `begin_turn` 一次（§6）。

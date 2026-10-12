@@ -6,6 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 # §13.4：日常改动落在这里；它从不重新展开 toasty 宏。
+[features]
+# 测试专用的注入口（`executor::TEST_PARK`）：只给 gateway 的集成测试脚手架开，生产构建里没有。
+test-support = ["komo-kernel/test-support"]
+
 [dependencies]
 komo-kernel = { workspace = true }
 komo-store = { workspace = true }

@@ -214,8 +214,16 @@ async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
     let fed = &outcome.results[0];
     assert!(fed.is_error);
     assert!(fed.content.contains("核对不出结论"), "{}", fed.content);
-    assert!(fed.content.contains("被 Gateway 重启打断"), "{}", fed.content);
-    assert!(fed.content.contains("先核对目标的实际状态"), "{}", fed.content);
+    assert!(
+        fed.content.contains("被 Gateway 重启打断"),
+        "{}",
+        fed.content
+    );
+    assert!(
+        fed.content.contains("先核对目标的实际状态"),
+        "{}",
+        fed.content
+    );
 
     // 上一世那条 `tool.started` 配上了一条明确的 uncertain——不写下来它会永远悬着。
     let results = harness.results_for(&previous);
@@ -347,9 +355,10 @@ async fn a_safe_reread_is_redone_without_a_verification() {
     assert_eq!(tool.verified(), 0);
 }
 
-/// 结果不明不能被当成失败重试掉——它停下来交给人（§6、§8.6）。
+/// 结果不明不能被当成失败重试掉，也不停下来等人：它作为结果交给模型，正文里带着判断方法
+/// （§6、§8.6）。
 #[tokio::test]
-async fn an_uncertain_result_stops_for_a_human_instead_of_retrying() {
+async fn an_uncertain_result_goes_to_the_model_instead_of_retrying() {
     let harness = Harness::new();
     let tool = Arc::new(
         RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
@@ -367,11 +376,13 @@ async fn an_uncertain_result_stops_for_a_human_instead_of_retrying() {
         .await
         .unwrap();
 
-    assert_eq!(tool.ran(), 1, "跑过一次");
+    assert_eq!(tool.ran(), 1, "跑过一次，执行器不自动重跑");
+    assert!(outcome.stop.is_none(), "不停下来等人：{:?}", outcome.stop);
+    let result = outcome.results.first().expect("模型拿到这次调用的结果");
     assert!(
-        matches!(outcome.stop, Some(RoundStop::Attention { .. })),
-        "{:?}",
-        outcome.stop
+        result.content.contains("响应丢了") && result.content.contains("先核对"),
+        "原因与判断方法都要进模型看到的正文：{}",
+        result.content
     );
     // 这段窗口留在账本里：状态是 uncertain，不是 failed。
     let uncertain = harness.ledger.events().iter().any(|event| {
@@ -404,10 +415,15 @@ async fn an_operator_verdict_settles_the_uncertain_attempt_without_rerunning_it(
         .await
         .unwrap();
     assert_eq!(tool.ran(), 1);
-    let call = match &outcome.stop {
-        Some(RoundStop::Attention { call, .. }) => call.clone(),
-        other => panic!("{other:?}"),
-    };
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+    let call = harness
+        .ledger
+        .surface()
+        .calls
+        .keys()
+        .next()
+        .cloned()
+        .expect("这一轮只有一条调用");
     let attempt = harness.ledger.surface().calls[&call]
         .attempt
         .clone()
@@ -481,10 +497,15 @@ async fn not_performed_closes_the_call_as_failed_so_a_retry_is_a_new_call() {
         .execute_round(calls, &harness.env(&session, &run))
         .await
         .unwrap();
-    let call = match &outcome.stop {
-        Some(RoundStop::Attention { call, .. }) => call.clone(),
-        other => panic!("{other:?}"),
-    };
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+    let call = harness
+        .ledger
+        .surface()
+        .calls
+        .keys()
+        .next()
+        .cloned()
+        .expect("这一轮只有一条调用");
     let attempt = harness.ledger.surface().calls[&call]
         .attempt
         .clone()

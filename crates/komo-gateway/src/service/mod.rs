@@ -259,6 +259,9 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
                 summary = %scan.summary(),
                 "启动对账完成"
             );
+            // 2026-10-12 之前停在"结果不明"上等人核对的 Run：结果不明现在交给模型判断，
+            // 放回队列，模型在回放里看见那条 uncertain 结果，自己核对再决定（§8.6）。
+            requeue_legacy_verify(&state, &home).await;
             // §8.7：「就绪之后」才做两件不影响调度事实的事——补发与报告。这两步在这里
             // 之外没有别的入口，而它们都是网络 / 界面的事，所以对账本身不发请求。
             for outcome in scan.to_redeliver() {
@@ -696,4 +699,27 @@ async fn wait_for_signal() {
 #[cfg(not(unix))]
 async fn wait_for_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// 把升级前停在"结果不明"上等人的 Run 放回队列。失败只记日志：它们仍在清单里，人还能答。
+async fn requeue_legacy_verify(state: &GatewayState, home: &std::path::Path) {
+    #[cfg(any(test, feature = "test-support"))]
+    if !test_support::requeues_legacy_verify(home) {
+        return;
+    }
+    #[cfg(not(any(test, feature = "test-support")))]
+    let _ = home;
+    let runs = match state.recovery_store.legacy_verify_waits().await {
+        Ok(runs) => runs,
+        Err(error) => {
+            tracing::warn!(%error, "读不出停在结果不明上的旧 Run，留在清单里");
+            return;
+        }
+    };
+    for run in runs {
+        match state.wake_run(&run).await {
+            Ok(()) => tracing::info!(run = %run, "旧的结果不明交给模型判断，放回队列"),
+            Err(error) => tracing::warn!(run = %run, %error, "旧的结果不明放不回队列，留在清单里"),
+        }
+    }
 }

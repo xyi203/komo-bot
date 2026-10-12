@@ -382,9 +382,9 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 
 Gateway 设置总轮数、活动执行时限、输出长度和子进程并发预算。等待用户时释放运行名额，保留已消耗预算。
 
-普通工具失败作为结果交给模型修正；模型回复截断或调用参数未收齐时不能开始执行。远端写入结果不明时停止自动重试，转为结果核对。
+普通工具失败作为结果交给模型修正；模型回复截断或调用参数未收齐时不能开始执行。远端写入结果不明时停止自动重试，结果连同判断方法交给模型，由它核对目标后决定重做还是往下走（§8.6）。
 
-普通追问可以作为 assistant 回复结束本轮；用户下一条输入开启同一 Session 的新 Run。没有工具审批（§7）；只有结果不明的核对与阻塞会暂停原 Run，待操作者回答后继续，不增加交互工具；回答通常来自聊天渠道（§11）。
+普通追问可以作为 assistant 回复结束本轮；用户下一条输入开启同一 Session 的新 Run。没有工具审批（§7）；只有阻塞会暂停原 Run（结果不明交给模型判断，2026-10-12），待操作者回答后继续，不增加交互工具；回答通常来自聊天渠道（§11）。
 
 **系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的介入、配置、skills、toolbox、Gateway 都是 komo 自己的状态，问到就用 shell 跑 `komo <子命令>`（给出几个常用子命令，其余看 `komo --help`）。这一段是**常量**，提示前缀因此稳定；`komo` 靠 PATH 找到——服务单元写入了安装时的 PATH（§3），不在提示里另给可执行文件路径。只在主 Agent 且挂了 `shell` 时出现：子代理只拿任务里写的东西（与 skills 目录同理，父侧需要时把命令写进任务）；没给 `shell` 的 Profile 说了也跑不了。起因是一次真实会话：问"当前有哪些 cron job"，模型不知道自己是 komo，先读了同名的共享 skill `cron-scheduler`，再翻 `crontab -l`、`/etc/cron.*`、`launchctl`、`~/.komo`，第 8 轮才跑到 `komo cron list`，9 轮 90 秒。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_its_cli`、`the_komo_section_needs_shell_and_the_main_agent`，golden `full_main_agent`、`plain_main_agent`。
 
@@ -477,7 +477,7 @@ workspace = "code/komo"
 
 | 种类 | 它从哪里派生（权威） | 句柄 | 问题 | 可答的结论 |
 |---|---|---|---|---|
-| `verify` | `tool_calls` 里那条 `uncertain` 的调用（§8.6） | Run ID | 上次那个调用**到底发生没有** | `satisfied` / `not_performed` / `abandon` |
+| `verify` | 升级前（2026-10-12 之前）停在 `uncertain` 调用上、没写 `last_error` 的 Run；现在不再产生，Gateway 启动时把它们放回队列交给模型 | Run ID | 上次那个调用**到底发生没有** | `satisfied` / `not_performed` / `abandon` |
 | `blocked` | 其余 `waiting + intervention` 的 Run（§8.4） | Run ID | 前提没了：引用损坏、旧执行者未确认、会话不可服务 | `resolve` / `abandon` |
 
 三条约束把这个清单钉死：
@@ -604,7 +604,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 
 ### 8.4 重启后的默认行为
 
-**Gateway 自动接续能够确定恢复位置的任务。用户只处理时效、结果不明或阻塞等确实需要判断的情况。**
+**Gateway 自动接续能够确定恢复位置的任务。用户只处理时效或阻塞等确实需要判断的情况；结果不明交给模型核对（§8.6）。**
 
 **状态回答"能不能跑"，`WaitReason` 回答"为什么不能跑"。** 这两件事分开，是因为它们混在一起时的症状正是"排队二十分钟不知道在等什么"：一个 `waiting_approval`、一个 `needs_attention`，都答不出在等谁、等到什么时候。所以状态只有八个，等什么有三类（外加一个只为解码旧行保留的 `approval`）：
 
@@ -623,7 +623,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 | `intervention` | 一条 Intervention 的答复（§7.5：结果不明、前提没了） | 操作者答复 | 是 |
 | `dependency` | **另一条 Run** 进终态：同 Session 里更早的那条输入（本节的次序规则），或者是它派出去的那条子 Run（§4 的委派） | 那条 Run 进终态，reconcile 把它放回 `queued` | 否——不是在等人 |
 
-**退避只用于可以安全重试的失败**：限流、连不上、5xx、本地写争用，`RetryCause` 把它们分得开（`RateLimited` 要尊重服务端给的 `Retry-After`，`Contended` 退几毫秒就够——混成一个数字就只能取最保守值，每次 429 都白等）。工具那一侧"结果不明"**不能**用它：那是副作用有没有发生都不知道：执行当中报的进 `intervention` 让人核对，重启续跑时核对不出的作为 uncertain 结果交给模型判断（§8.6），都不自动重试。两者混起来就是"重试成功"掩盖掉那个窗口，正是 §8.6 要禁止的事。
+**退避只用于可以安全重试的失败**：限流、连不上、5xx、本地写争用，`RetryCause` 把它们分得开（`RateLimited` 要尊重服务端给的 `Retry-After`，`Contended` 退几毫秒就够——混成一个数字就只能取最保守值，每次 429 都白等）。工具那一侧"结果不明"**不能**用它：那是副作用有没有发生都不知道：执行当中报的与重启续跑时核对不出的，都作为 uncertain 结果交给模型判断（§8.6），都不自动重试。两者混起来就是"重试成功"掩盖掉那个窗口，正是 §8.6 要禁止的事。
 
 **`Queued` 与 `Waiting` 是这个模型的验收口径**：`Queued` 的 Run 一定有活干，`Waiting` 的 Run 一定说得出在等什么。查"它怎么还不跑"时，这两句话各回答一半。
 
@@ -749,7 +749,7 @@ state.db 事务提交控制决定与 control_outbox（固定 event_id）
 
 Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子事务。副作用已发生、完整输出与结果事件尚未持久保存时，必须保留 uncertain，而不是用“重试成功”掩盖这段窗口。
 
-**重启续跑时核对不出结论，交给模型判断，不停下来等人**（2026-10-12）。那条上一世的 `tool.started` 配一条 uncertain，正文写明"上一次执行被 Gateway 重启打断、核对结论是什么"，再附一段判断方法（先核对目标的实际状态；已生效就接着往下，没生效或只做了一半就继续或重做，只读命令直接重跑；发消息、扣款这类重复做会出问题又核对不了的先问用户）。这条结果作为这次调用的结果回到模型，Run 接着往下走。理由：停下来问人并不比模型更有把握——人多半也得去看一眼目标才答得上来，而模型手里就有 read / shell。**执行器本身仍不重跑**，重做是模型发起的新一次调用，账本里看得见。仍交给人的只剩模型修不了的：引用损坏、会话读不出来、无法确认旧执行已结束（§8.4），以及**执行当中**工具自己报"结果不明"（如 `NoSafeRecovery` 的调用超过时限）。
+**重启续跑时核对不出结论，交给模型判断，不停下来等人**（2026-10-12）。那条上一世的 `tool.started` 配一条 uncertain，正文写明"上一次执行被 Gateway 重启打断、核对结论是什么"，再附一段判断方法（先核对目标的实际状态；已生效就接着往下，没生效或只做了一半就继续或重做，只读命令直接重跑；发消息、扣款这类重复做会出问题又核对不了的先问用户）。这条结果作为这次调用的结果回到模型，Run 接着往下走。理由：停下来问人并不比模型更有把握——人多半也得去看一眼目标才答得上来，而模型手里就有 read / shell。**执行器本身仍不重跑**，重做是模型发起的新一次调用，账本里看得见。**执行当中**工具自己报"结果不明"（如 `NoSafeRecovery` 的调用超过时限、远端没回话）也一样：结果正文附同一段判断方法交给模型，Run 不停。账上找不到承载那次调用的尝试（账本自相矛盾）时补开一次 `tool.started` 记下结论，同样交给模型。仍交给人的只剩模型拿不到上下文、或放出去可能重复执行的：引用损坏、会话读不出来、无法确认旧执行已结束（§8.4）。升级前已经停在 `verify` 上的 Run（停在介入上、带 `uncertain` 调用、`last_error` 为空），Gateway 启动对账之后放回队列交给模型。
 
 执行计划包含一种经过验证的恢复方式，不能由模型随意填入“可重试”：
 
@@ -1083,7 +1083,7 @@ Cron Scheduler 只负责产生 Run，复用 AgentLoop、工具和存储。
  → 更新本次触发状态
 ```
 
-每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 与版本。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；Run 停在任一待处理 Intervention（结果不明、阻塞，§7.5）上时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体的已启用模块版本。
+每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 与版本。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；Run 停在待处理 Intervention（阻塞，§7.5）上时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体的已启用模块版本。
 
 ```bash
 komo cron add --name morning-summary \
@@ -1107,7 +1107,7 @@ komo cron remove JOB_ID
 - Gateway 停机期间错过的触发不集中补跑；停机前已经持久创建、尚未完成的 Cron Run 则按原 Run 自动恢复，这是两种不同情况。
 - 时区明确保存（IANA 名，`TimeZone` 只存名字）；同一日历时间因夏令时出现两次时，两次不同 UTC 时刻分别视为计划时间；不存在的本地时间跳过。**这两条与 croner 的内建策略相反**（它把缺口里的固定时刻抬到缺口之后、把重复的只算较早一次），所以由 kernel 的 `cron::search_from`（跳缺口）和 `cron::repeated_twin`（补后一半）自己实现，换 croner 版本时要一起看。时区解析走 `ZoneResolver` port（§13.5）：kernel 不带 tzdb，真 tzdb 实现在 runtime；没有 tzdb 时 `FixedOffsetZone` 是**明确的降级**（答不出重复与缺口，等于当这个区没有夏令时），不是默认。
 - 手动 run 使用独立请求幂等键，不冒充定时触发。
-- 无人值守不改变执行规则：Cron Run 与交互 Run 一样，没有 Policy 与审批（§7）；需要人判断的只有结果不明与阻塞，照常投 home chat。
+- 无人值守不改变执行规则：Cron Run 与交互 Run 一样，没有 Policy 与审批（§7）；需要人判断的只有阻塞，照常投 home chat；结果不明交给模型。
 - Cron 的结果去原 Session 查看，也可以用 resume 接手。
 
 ### 10.1 命令直跑模式：`command` 与 `prompt` 二选一
@@ -1153,7 +1153,7 @@ Run 落账时直接记 `MemoryWork::Done`，不进后台处理队列——没有
 | 退出 0、stdout 非空 | `ok` | stdout（trim）原样作为结果投递，受 `notify` 过滤 |
 | 退出 0、stdout 为空 | `ok` | 不投递——看门狗"没事不说话" |
 | 非 0 退出 | `error` | 投错误摘要（退出码 + stderr 末尾若干行），受 `notify` 过滤（`on_error` / `always` 投，`never` 不投） |
-| 超时 | `waiting`→`intervention` | 与任意 shell 命令超时同一条路（§8.6：`NoSafeRecovery` 的调用超时是"副作用是否已经发生未知"，不是"结果"，停在 `waiting + intervention` 等人核对，不能自动判定成功或失败）——命令 Job 不为此另开一条自动归类的路径，那会绕过 §8.6 的安全不变量 |
+| 超时 | `error` | 与任意 shell 命令超时同一条路（§8.6：`NoSafeRecovery` 的调用超时是"副作用是否已经发生未知"，执行器不自动判定成功或失败、不重跑，记一条 uncertain）。命令 Job 没有模型可交，`CommandDriver` 照常收尾，这次触发记 `error` 并投一句"结果读不出来、去原 Session 看"，不再停着等人——命令 Job 不为此另开一条自动归类的路径，那会绕过 §8.6 的安全不变量 |
 
 **`cron add` 不签授权**（2026-10-11 起，§7）：触发时那一次 `shell` 调用与任何调用一样直接执行，
 没有授权要签，也就没有"模型经 shell 调 `komo cron add` 给自己签一条将来免问的许可"这个口子要堵。
@@ -1660,7 +1660,7 @@ kernel ← client ────────────────────�
 | `libc` | `0.2`，仅 komo-runtime 的 Linux 目标 | codemode 的 Linux 沙箱（`docs/codemode.md` §4）：Landlock / seccomp 走裸系统调用，要系统调用号与 `sock_filter`。原本就被 tokio 等拉进依赖树，不新增包、不新增重复版本；不引 `landlock` / `seccompiler` |
 | `rmcp` | `3.x`，`default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider"]`；仅 komo-runtime | MCP 客户端（`docs/mcp.md`），官方 Rust SDK。HTTP 走工作区同一个 reqwest 0.13（rustls-no-provider），不开 OAuth、不开 server 与宏。新拉 `process-wrap`、`sse-stream`、`futures`，新增一条重复版本 `nix 0.31`（process-wrap；既有 0.29）。实测（2026-10-08，增量重编）：rmcp 2.8s + 构建脚本 0.3s + process-wrap / sse-stream 各 0.2–0.3s |
 | **不引入** | image | — |
-| `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | **已做**：`[patch.crates-io]` 一份 `toasty-driver-turso`（`vendor/toasty-driver-turso`，上游原包，只改 manifest 里 `turso` 那几行），工作区的 `turso` 也写 `default-features = false, features = ["mimalloc"]` | 实测（2026-09-16）：冷编 71.5s → 64.2s，编译单元 577 → 515，单元耗时总和 −36s CPU，`tantivy` / `zstd` / `lz4_flex` 从依赖树消失，少一条 C 工具链。墙钟只省 7s 是因为它们与 `aws-lc-sys` 并行、不在关键路径。功能零损失：turso 的 FTS 是索引方法，MVCC 直接拒绝。升级时整包替换 + 重加那几行，CI 用 `cargo tree -e features -i turso` 断言只剩 `mimalloc`；见 `vendor/README.md` |
+| `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | **已做**：工作区的 `turso` 写 `default-features = false, features = ["mimalloc"]`；`toasty-driver-turso` 0.11 起上游自己对 `turso` 关了默认特性，原先 `vendor/toasty-driver-turso` 那份补丁（只改 manifest 里 `turso` 那几行）已删 | 实测（2026-09-16）：冷编 71.5s → 64.2s，编译单元 577 → 515，单元耗时总和 −36s CPU，`tantivy` / `zstd` / `lz4_flex` 从依赖树消失，少一条 C 工具链。墙钟只省 7s 是因为它们与 `aws-lc-sys` 并行、不在关键路径。功能零损失：turso 的 FTS 是索引方法，MVCC 直接拒绝。升级 toasty 时核对驱动对 `turso` 的版本与特性，CI 用 `cargo tree -e features -i turso` 断言只剩 `mimalloc`；见 `vendor/README.md` |
 
 三个渠道各自一个 feature，默认全开。feature 的用处不是裁功能，是让 `cargo tree -d` 能按渠道归因重复版本，以及某家 SDK 坏掉时能单独关掉它继续构建。`cargo tree -d` 进入 CI：出现新的重复版本要有理由。
 

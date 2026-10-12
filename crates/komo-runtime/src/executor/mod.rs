@@ -166,7 +166,9 @@ pub struct CallEnv {
 /// 这一轮为什么没跑完。
 #[derive(Debug, Clone)]
 pub enum RoundStop {
-    /// 需要操作者判断：结果不明、核对不出结论、或者没有可靠恢复方式（§8.6）。
+    /// 测试专用：停在 `waiting + intervention` 上等人（[`TEST_PARK`]）。生产构建里没有这一支
+    /// ——结果不明一律交给模型判断（§8.6）。
+    #[cfg(any(test, feature = "test-support"))]
     Attention { reason: String, call: ToolCallId },
     /// 在等**自己派出去的那条子 Run** 的终态（§8.4 的 `dependency`）。
     ///
@@ -566,22 +568,13 @@ impl ToolExecutor {
                         .settle_verified(
                             request,
                             env,
+                            &plan,
                             state.previous_attempt.as_ref(),
                             ToolResultStatus::Completed,
                             &verdict,
                             &summary,
                         )
                         .await?;
-                    // 没有上一世那次尝试就没有落盘的结论可投影：账本自相矛盾，交给人。
-                    let Some(recorded) = recorded else {
-                        return Ok(Begin::Settled(self.attention(
-                            request,
-                            format!(
-                                "调用 {} 核对后目标已满足，但账上没有承载它的那次尝试",
-                                request.call
-                            ),
-                        )));
-                    };
                     return Ok(Begin::Settled(CallSettlement::Result(for_model(
                         request, env, &recorded,
                     ))));
@@ -608,7 +601,7 @@ impl ToolExecutor {
                         other => format!("核对结论：{other:?}"),
                     };
                     return self
-                        .settle_interrupted(request, env, state, &verdict, &summary)
+                        .settle_interrupted(request, env, &plan, state, &verdict, &summary)
                         .await;
                 }
                 Err(error) => {
@@ -618,7 +611,7 @@ impl ToolExecutor {
                         reason: error.to_string(),
                     };
                     return self
-                        .settle_interrupted(request, env, state, &verdict, &summary)
+                        .settle_interrupted(request, env, &plan, state, &verdict, &summary)
                         .await;
                 }
             }
@@ -754,15 +747,18 @@ impl ToolExecutor {
                 stop: RoundStop::Cancelled,
                 result: Some(result),
             }),
-            // 结果不明：**停止自动重试，转为结果核对**（§6、§8.6）。这段窗口要留着，
-            // 不能用"重试成功"盖掉。
-            Err(error) if error.is_uncertain() => Ok(CallSettlement::Stopped {
-                stop: RoundStop::Attention {
-                    reason: format!("{} 的结果不明：{error}", request.tool),
-                    call: request.call.clone(),
-                },
-                result: Some(result),
-            }),
+            #[cfg(any(test, feature = "test-support"))]
+            Err(ToolError::Uncertain { message }) if message.starts_with(TEST_PARK) => {
+                Ok(CallSettlement::Stopped {
+                    stop: RoundStop::Attention {
+                        reason: format!("{} 停下来等人：{message}", request.tool),
+                        call: request.call.clone(),
+                    },
+                    result: Some(result),
+                })
+            }
+            // 结果不明（超时、连接中途断开）也是一条结果：执行器**不自动重试**（§6、
+            // §8.6），正文里带着判断方法交给模型，由它去核对目标再决定重做还是往下走。
             _ => Ok(CallSettlement::Result(result)),
         }
     }
@@ -886,14 +882,8 @@ impl ToolExecutor {
                     .resumed
                     .as_ref()
                     .and_then(|state| state.previous_attempt.clone());
-                let Some(attempt) = previous else {
-                    let reason = format!(
-                        "{} 调用 {} 已经开始过，但账上没有承载它的那次尝试",
-                        request.tool, request.call
-                    );
-                    return Ok((self.attention(&request, reason), false));
-                };
-                attempt
+                self.previous_or_fresh(&request, &plan, previous.as_ref())
+                    .await?
             }
         };
         let settlement = match kind {
@@ -946,7 +936,7 @@ impl ToolExecutor {
         let child = self.accept_child(env, spec).await?.run;
         if let OrchestrationStart::Started = start {
             return self
-                .collect_child(request, env, spec, request.resumed.as_ref(), &child)
+                .collect_child(request, env, plan, spec, request.resumed.as_ref(), &child)
                 .await;
         }
         // `tool.started` 之后子 Run 才可能被领取：它就是这次外派副作用的起点。
@@ -1089,6 +1079,7 @@ impl ToolExecutor {
         &self,
         request: &CallRequest,
         env: &CallEnv,
+        plan: &ExecutionPlan,
         spec: &DelegateSpec,
         resumed: Option<&ResumedCall>,
         child: &RunId,
@@ -1104,16 +1095,9 @@ impl ToolExecutor {
         };
 
         // 结果落回**上一世那次尝试**：父调用已经 `start_call` 过，账本里那条 `tool.started`
-        // 不能永远悬着。没有它的唯一可能是账本自相矛盾——那要人看，不编一个 attempt 出来。
-        let Some(attempt) = resumed.and_then(|state| state.previous_attempt.clone()) else {
-            return Ok(self.attention(
-                request,
-                format!(
-                    "委派调用 {} 已经派出去（子 Run {child}），但账上没有承载它的那次尝试",
-                    request.call
-                ),
-            ));
-        };
+        // 不能永远悬着。账上找不到它就补开一次来承载子 Run 的结果，照样交给模型。
+        let previous = resumed.and_then(|state| state.previous_attempt.as_ref());
+        let attempt = self.previous_or_fresh(request, plan, previous).await?;
 
         let recorded = self
             .settle_attempt(
@@ -1342,24 +1326,24 @@ impl ToolExecutor {
     /// 着，而"悬着的 started"正是下一次恢复扫描还要再核对一遍的东西：同一次副作用会
     /// 被反复追问，却永远不落账。
     ///
-    /// `previous` 为 `None` = 只 planned 过、一次尝试都没有，没有东西要收尾。
+    /// `previous` 为 `None` = 账上找不到承载它的尝试，补开一次（[`Self::previous_or_fresh`]）。
+    #[allow(clippy::too_many_arguments)]
     async fn settle_verified(
         &self,
         request: &CallRequest,
         env: &CallEnv,
+        plan: &ExecutionPlan,
         previous: Option<&AttemptId>,
         status: ToolResultStatus,
         verdict: &Verification,
         summary: &str,
-    ) -> Result<Option<Recorded>, ExecError> {
-        let Some(previous) = previous else {
-            return Ok(None);
-        };
+    ) -> Result<Recorded, ExecError> {
+        let attempt = self.previous_or_fresh(request, plan, previous).await?;
         let attempt_ref = AttemptRef {
             session: env.session.clone(),
             run: env.run.clone(),
             call: request.call.clone(),
-            attempt: previous.clone(),
+            attempt,
         };
         let body = ToolResultBody {
             status,
@@ -1370,40 +1354,57 @@ impl ToolExecutor {
             // 核对结论也是"工具结果"：事件里那 1 KiB 就取它。
             preview: Some(summary.to_string()),
         };
-        self.settle_attempt(attempt_ref, body).await.map(Some)
+        self.settle_attempt(attempt_ref, body).await
+    }
+
+    /// 上一世那次尝试。账上没有（调用开始过，承载它的尝试却找不到——账本自相矛盾）就当场
+    /// 补开一次 `tool.started` 来承载这条结论，照样交给模型：停下来等人，人也只能去看一眼
+    /// 目标，而模型手里就有能去看的工具。补开的这次不执行任何东西，只记结论。
+    async fn previous_or_fresh(
+        &self,
+        request: &CallRequest,
+        plan: &ExecutionPlan,
+        previous: Option<&AttemptId>,
+    ) -> Result<AttemptId, ExecError> {
+        if let Some(previous) = previous {
+            return Ok(previous.clone());
+        }
+        tracing::warn!(
+            call = %request.call,
+            tool = %request.tool,
+            "账上没有承载这次调用的尝试，补开一次来记结论"
+        );
+        Ok(self.ledger.start_call(&request.call, plan).await?)
     }
 
     /// 续跑时核对不出上一世那次尝试做没做成：落一条 uncertain，**作为这次调用的结果交给
     /// 模型**，Run 接着往下走。
     ///
     /// 停下来问人并不比模型更有把握——人多半也得去看一眼目标才答得上来，而模型手里就有
-    /// read / shell 能去看。结果正文写明"被打断了、先核对再决定"，回放时逐字相同。账上没有
-    /// 上一世那次尝试是账本自相矛盾，模型修不了，仍交给人。
+    /// read / shell 能去看。结果正文写明"被打断了、先核对再决定"，回放时逐字相同。
     async fn settle_interrupted(
         &self,
         request: &CallRequest,
         env: &CallEnv,
+        plan: &ExecutionPlan,
         state: &ResumedCall,
         verdict: &Verification,
         summary: &str,
     ) -> Result<Begin, ExecError> {
-        let message = format!("上一次执行被 Gateway 重启打断，{summary}。{UNCERTAIN_ADVICE}");
+        let message = format!(
+            "上一次执行被 Gateway 重启打断，{summary}，副作用是否已经发生未知。{UNCERTAIN_ADVICE}"
+        );
         let recorded = self
             .settle_verified(
                 request,
                 env,
+                plan,
                 state.previous_attempt.as_ref(),
                 ToolResultStatus::Uncertain,
                 verdict,
                 &message,
             )
             .await?;
-        let Some(recorded) = recorded else {
-            return Ok(Begin::Settled(self.attention(
-                request,
-                format!("调用 {} 结果不明，但账上没有承载它的那次尝试", request.call),
-            )));
-        };
         Ok(Begin::Settled(CallSettlement::Result(for_model(
             request, env, &recorded,
         ))))
@@ -1483,16 +1484,6 @@ impl ToolExecutor {
             )
             .await?;
         Ok(CallSettlement::Result(for_model(request, env, &recorded)))
-    }
-
-    fn attention(&self, request: &CallRequest, reason: String) -> CallSettlement {
-        CallSettlement::Stopped {
-            stop: RoundStop::Attention {
-                reason,
-                call: request.call.clone(),
-            },
-            result: None,
-        }
     }
 
     fn context(&self, request: &CallRequest, env: &CallEnv, attempt: AttemptId) -> ToolContext {
@@ -1766,13 +1757,25 @@ fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
             exit_code: None,
             artifacts: vec![],
             // 工具失败时模型必须看见那句话（"版本冲突：a.txt"）——投影读的就是这一份。
-            preview: Some(error.to_string()),
+            // 结果不明的再附上判断方法：它不停下来等人，由模型去核对。
+            preview: Some(if error.is_uncertain() {
+                format!("{error}。{UNCERTAIN_ADVICE}")
+            } else {
+                error.to_string()
+            }),
         },
     }
 }
 
-/// 续跑时结果不明、交给模型的那段判断方法：先核对，再决定重做还是接着往下。
-const UNCERTAIN_ADVICE: &str = "副作用是否已经发生未知，执行器不会自动重做。\
+/// 测试专用：`ToolError::Uncertain` 的正文以它开头时，这一轮停在 `waiting + intervention`
+/// 上等人，而不是交给模型。介入清单、投递、依赖等待这些测试要一条确定停住的 Run，生产里
+/// 剩下的停法（会话损坏、旧实例没停）在进程内造不出来。生产构建里没有这条路。
+#[cfg(any(test, feature = "test-support"))]
+pub const TEST_PARK: &str = "[test-park] ";
+
+/// 结果不明（执行当中超时 / 断开，或续跑时核对不出）交给模型的那段判断方法：先核对，
+/// 再决定重做还是接着往下。
+const UNCERTAIN_ADVICE: &str = "执行器不会自动重做。\
 先核对目标的实际状态（读文件、查进程或服务状态、看 git、查远端），再决定：已经生效就接着往下；\
 没生效或只做了一半就继续或重新做；只读的命令直接重跑即可。\
 发消息、扣款、切换一次这类重复做会出问题、又核对不了的，先问用户";

@@ -2,9 +2,12 @@
 //!
 //! 结果不明与阻塞合成一条**派生清单**（审批在 2026-10-11 删掉了，只剩这两类）：
 //!
-//! - **清单不是第三张表**（第 1 条）。权威仍是 `runs` 与 `tool_calls`，`kind` 由
-//!   "有没有一条 `uncertain` 调用"当场判出。多一张 `interventions` 表就多一处会与权威漂移
-//!   的状态，而这次改造的全部理由就是不要那个（§8.9）。
+//! - **清单不是第三张表**（第 1 条）。权威仍是 `runs` 与 `tool_calls`，`kind` 当场判出
+//!   （[`is_legacy_verify`]）。多一张 `interventions` 表就多一处会与权威漂移的状态，而这次
+//!   改造的全部理由就是不要那个（§8.9）。
+//! - **结果不明不再等人**（2026-10-12）：执行当中报结果不明、续跑时核对不出，都作为结果交给
+//!   模型判断，不再停成 `verify`。`verify` 只剩升级前落盘的旧数据，Gateway 启动时把它们
+//!   重新入队交给模型（[`crate::repos::recovery::RecoveryStore::legacy_verify_waits`]）。
 //! - **挡队的每一条都在清单里，而且是同一次判定**（第 2 条）。[`waits_for_human`] 回答
 //!   "进清单"，[`blocks_queue`] 回答"挡不挡队"，两者都在这里，由同一份状态派生；§8.7 的
 //!   领取语句与 reconcile 的 `closing → deleted` 用的是同一份判定。
@@ -64,7 +67,8 @@ pub struct BlockedRun {
     pub wait: WaitReason,
     /// `runs.last_error`——`blocked` 的问题正文（§7.5 那张表）。
     pub reason: Option<String>,
-    /// 这条 Run 上那条 `uncertain` 的调用：有它就是 `verify`（§8.6）。
+    /// 这条 Run 上那条 `uncertain` 的调用。它在不等于 `verify`（[`is_legacy_verify`]）：
+    /// 结果不明现在交给模型，那条调用的状态会一直留在 `uncertain`。
     pub uncertain: Option<UncertainCall>,
     pub created_at: OffsetDateTime,
 }
@@ -77,7 +81,7 @@ pub async fn blocked_runs(db: &Db) -> Result<Vec<BlockedRun>, StoreError> {
 
 /// 待处理清单（§7.5）：停在人身上的 Run。
 ///
-/// `kind` 当场判：有 `uncertain` 调用 → `Verify`；否则 → `Blocked`。句柄是 Run ID。
+/// `kind` 当场判（[`classify`]）。句柄是 Run ID。
 /// 删审批之前停在审批上的 Run 不在这里（[`waits_for_human`]）。
 ///
 /// 按 `created_at` 排序。
@@ -247,12 +251,26 @@ fn detail_of(entry: &BlockedRun) -> InterventionDetail {
     }
 }
 
-/// `kind` 当场判（§7.5 第 1 条）：有 `uncertain` 调用 → `verify`；否则 → `blocked`。
+/// 升级前"停在结果不明上等人核对"的形状：停在介入上、带一条 `uncertain` 调用、**没写
+/// `last_error`**（那时执行器停下来只挂句柄，不写原因）。
+///
+/// 只看"有没有 `uncertain` 调用"不够：结果不明交给模型之后那条调用一直是 `uncertain`，
+/// 这条 Run 后来因为别的原因阻塞（`mark_needs_attention` 一定写 `last_error`）时会被错标成
+/// `verify`，答一句 `satisfied` 还会去改一条早就过去了的调用。
+pub fn is_legacy_verify(entry: &BlockedRun) -> bool {
+    matches!(entry.wait, WaitReason::Intervention { .. })
+        && entry.uncertain.is_some()
+        && entry.reason.is_none()
+}
+
+/// `kind` 当场判（§7.5 第 1 条）：旧数据里的结果不明 → `verify`；其余 → `blocked`。
 fn classify(entry: &BlockedRun) -> (InterventionKind, String) {
     match &entry.wait {
         WaitReason::Intervention { .. } => match &entry.uncertain {
-            Some(call) => (InterventionKind::Verify, verify_reason(call)),
-            None => (InterventionKind::Blocked, blocked_reason(entry)),
+            Some(call) if is_legacy_verify(entry) => {
+                (InterventionKind::Verify, verify_reason(call))
+            }
+            _ => (InterventionKind::Blocked, blocked_reason(entry)),
         },
         // 构造这个类型时已经按 `needs_a_person` 收过一遍，这三种到不了；真出现了也只能
         // 当阻塞报出去——不 pretend 它不是问题。
@@ -519,12 +537,48 @@ mod tests {
         assert!(blocked_runs(&db).await.unwrap().is_empty());
     }
 
-    /// 验收 ⑨：`waiting + intervention` 上带一条 `uncertain` 调用 → `verify`，`call` 对得上。
+    /// 结果不明交给模型之后，那条调用一直是 `uncertain`；这条 Run 后来因为别的原因阻塞
+    /// （`mark_needs_attention` 一定写 `last_error`）时是 `blocked`，不是 `verify`，也不在
+    /// 启动时要放回队列的那一批里。
+    #[tokio::test]
+    async fn an_old_uncertain_call_does_not_turn_a_later_block_into_a_verify() {
+        let (db, dir) = temp().await;
+        waiting_on_a_person(&db, "sess-1", "run-0001").await;
+        set_last_error(&db, "run-0001", "会话读不出来").await;
+        uncertain_call(&db, "call-1", "sess-1", "run-0001", "shell").await;
+
+        let pending = list_now(&db).await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].kind, InterventionKind::Blocked);
+        assert_eq!(pending[0].question, "会话读不出来");
+        let recovery =
+            crate::repos::recovery::RecoveryStore::new(db.clone(), dir.path().join("sessions"));
+        assert!(recovery.legacy_verify_waits().await.unwrap().is_empty());
+    }
+
+    /// 升级前停在结果不明上的 Run 在启动时要放回队列的那一批里。
+    #[tokio::test]
+    async fn a_legacy_verify_is_listed_for_requeue() {
+        let (db, dir) = temp().await;
+        waiting_on_a_person(&db, "sess-1", "run-0001").await;
+        uncertain_call(&db, "call-1", "sess-1", "run-0001", "shell").await;
+        waiting_on_a_person(&db, "sess-1", "run-0002").await;
+
+        let recovery =
+            crate::repos::recovery::RecoveryStore::new(db.clone(), dir.path().join("sessions"));
+        assert_eq!(
+            recovery.legacy_verify_waits().await.unwrap(),
+            vec![RunId::from_raw("run-0001")],
+            "没有 uncertain 调用的那条是 blocked，不在其中"
+        );
+    }
+
+    /// 验收 ⑨：`waiting + intervention` 上带一条 `uncertain` 调用、没写 `last_error`（升级前
+    /// 执行器停下来就是这个形状）→ `verify`，`call` 对得上。
     #[tokio::test]
     async fn an_uncertain_call_turns_an_intervention_wait_into_a_verify() {
         let (db, _dir) = temp().await;
         waiting_on_a_person(&db, "sess-1", "run-0001").await;
-        set_last_error(&db, "run-0001", "副作用可能已经发生").await;
         uncertain_call(&db, "call-1", "sess-1", "run-0001", "shell").await;
 
         let pending = list_now(&db).await;

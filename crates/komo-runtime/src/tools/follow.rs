@@ -108,7 +108,7 @@ impl Tool for FollowTool {
 
     async fn execute(
         &self,
-        _plan: komo_kernel::types::plan::ApprovedPlan,
+        _plan: komo_kernel::types::plan::ExecutionPlan,
         _ctx: &ToolContext,
         _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
@@ -123,7 +123,7 @@ impl Tool for FollowTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context, writer};
+    use crate::tools::test_support::{context, writer};
 
     #[tokio::test]
     async fn the_plan_carries_the_task_id_and_text() {
@@ -202,7 +202,7 @@ mod tests {
             .unwrap();
 
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         let ToolError::Failed { message } = &error else {

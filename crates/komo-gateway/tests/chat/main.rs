@@ -10,18 +10,20 @@
 //! | 同一 `update_id` 重发只产生一个 Run | `telegram::a_replayed_update_produces_one_run` |
 //! | 同一 `event_id` 重发只产生一个 Run | `feishu::a_replayed_event_produces_one_run` |
 //! | 同一 `client_id` 重发只产生一个 Run | `wechat::a_replayed_client_id_produces_one_run` |
-//! | 同一人连点两次第二次得到「已决定」 | `telegram::two_clicks_and_the_second_is_told_it_was_decided` |
 //! | 不在 `allow_from` 的被拒且不留记录 | `cross::a_stranger_is_refused_and_leaves_no_trace`、`feishu::a_feishu_stranger_leaves_no_delivery`、`wechat::a_wechat_stranger_is_refused_but_can_still_ask_for_its_id` |
 //! | `/id` 对被拒者仍可用 | 同上（每条的第二段） |
 //! | 加进 `allow_from` 保存后下一条即进 Run | `cross::a_reloaded_allow_list_decides_the_next_message` |
-//! | `/approve` 与按钮回调重发只批准一次 | `telegram::a_button_and_a_text_approve_decide_once`、`feishu::a_replayed_card_callback_decides_once` |
-//! | 来源会话与 home chat 都收到请求 | `cross::an_approval_reaches_both_the_source_and_home` |
-//! | 第二个答复得到「已决定」 | 同上（后半，按 `approval_id` 的那条路） |
-//! | 决定后卡片 / 消息原地更新 | `telegram::a_decision_removes_the_buttons`、`feishu::a_decision_patches_the_card`、`telegram::a_decision_updates_the_source_chat_too`（来源会话那一份） |
+//! | 来源会话与 home chat 都收到介入通知 | `cross::an_intervention_reaches_both_the_source_and_home`、`cross::a_waiting_run_sends_its_intervention_to_the_chat_and_home` |
+//! | 第二个答复得到「已经答复过了」 | `cross::an_intervention_reaches_both_the_source_and_home`（后半） |
+//! | `/approve`、`y` 不是命令 | `telegram::the_command_table_answers_every_command`（`/approve` 答帮助）；`y` 见 `service::tests` |
 //! | Gateway 重启后 pending 投递补发一次 | `cross::a_pending_delivery_is_resent_once_after_a_restart` |
 //! | 飞书 ws 断线重连不丢事件也不重跑 Run | `feishu::a_reconnect_loses_nothing_and_reruns_nothing` |
 //! | 微信在用户未发消息前 `Deferred` | `wechat::a_delivery_before_the_user_speaks_is_deferred` |
-//! | 发消息后先收到积压的审批请求 | `wechat::the_backlog_is_flushed_before_the_new_message` |
+//! | 发消息后先收到积压的投递 | `wechat::the_backlog_is_flushed_before_the_new_message` |
+//!
+//! 审批（短 ID、按钮、`/approve` 范围、批量答复、决定后原地改卡）随 Policy 一起删掉了
+//! （§7，2026-10-11），那几行验证列与它们的测试一起删。介入要停住一个 Run 时用测试工具
+//! `unsure`（结果不明 → `verify`）或 `gate`（一直等到放行）。
 //!
 //! 外加 §11.2 / §11.3 的会话与命令表：home session 的归一
 //! （`cross::every_private_chat_lands_in_one_home_session`）、群会话按
@@ -42,7 +44,6 @@
 
 mod harness;
 
-mod approvals;
 mod cross;
 mod feishu;
 mod skills;

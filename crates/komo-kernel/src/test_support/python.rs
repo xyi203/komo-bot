@@ -23,6 +23,8 @@ struct PyState {
     /// 每次调用的 job 与它写进 sink 的 stdout。
     calls: Vec<PythonJob>,
     stdout: Vec<String>,
+    /// `run_with_artifacts` 每次收到的时限。
+    timeouts: Vec<std::time::Duration>,
     env_version: String,
 }
 
@@ -59,6 +61,11 @@ impl FakePythonHost {
     /// 到目前为止收到过哪些调用。
     pub fn calls(&self) -> Vec<PythonJob> {
         self.state.lock().expect("假宿主").calls.clone()
+    }
+
+    /// `run_with_artifacts` 每次收到的时限。
+    pub fn timeouts(&self) -> Vec<std::time::Duration> {
+        self.state.lock().expect("假宿主").timeouts.clone()
     }
 
     pub fn set_env_version(&self, version: impl Into<String>) {
@@ -108,6 +115,19 @@ impl PythonHost for FakePythonHost {
             result.stdout_excerpt = written.unwrap_or_default();
         }
         Ok(result)
+    }
+
+    async fn run_with_artifacts(
+        &self,
+        job: PythonJob,
+        artifacts: Option<&std::path::Path>,
+        timeout: std::time::Duration,
+        sink: &mut dyn OutputWriter,
+        cancel: CancelToken,
+    ) -> Result<PythonResult, PyError> {
+        let _ = artifacts;
+        self.state.lock().expect("假宿主").timeouts.push(timeout);
+        self.run(job, sink, cancel).await
     }
 
     fn env_version(&self) -> EnvVersion {

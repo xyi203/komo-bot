@@ -44,16 +44,6 @@ pub enum SseEvent {
     },
     /// Run 的状态变了。派生自事件，给不想自己 fold 的客户端。
     RunStatus { run: RunId, state: RunState },
-    /// 有新的待处理审批；详情去 `GET /v1/approvals/{id}` 取，**不靠这条通知传授权**。
-    ApprovalPending {
-        approval: crate::types::ids::ApprovalId,
-        short_id: crate::types::ids::ShortId,
-    },
-    /// 一条审批有结论了。
-    ApprovalDecided {
-        approval: crate::types::ids::ApprovalId,
-        approved: bool,
-    },
     /// 心跳。只为让代理不掐连接，不带任何状态。
     Heartbeat,
 }

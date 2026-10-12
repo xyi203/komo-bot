@@ -73,7 +73,7 @@ async fn update_against(
 }
 
 /// 换二进制不等于换正在跑的那个进程。**只报告，不替你重启**：重启会打断正在跑的 Run
-/// 和等在那里的审批，那不该由一条更新命令决定。
+/// 和等在那里的介入，那不该由一条更新命令决定。
 async fn live_gateway_hint(home: &Path) -> &'static str {
     // 只凭发现文件在不在判断不了（§3 第 2 步）——它可能早就过期了，所以走一遍健康核对。
     if discovery::discover(home).await.is_ok() {

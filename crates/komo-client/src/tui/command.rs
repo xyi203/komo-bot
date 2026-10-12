@@ -4,34 +4,22 @@
 //! 值报错而不是静默取默认——打字的人还在屏幕前，把 `/effort hgih` 悄悄当成没设置，他
 //! 要到下一个 Run 的状态行才发现。
 
-use komo_kernel::protocol::ApprovalTarget;
 use komo_kernel::protocol::http::InterventionVerdict;
-use komo_kernel::types::chat::ApprovalScope;
-use komo_kernel::types::ids::ShortId;
 use komo_kernel::types::model::Effort;
 
-/// TUI 认得的命令。§11.3 的七个聊天命令里，`/id` 不在这里——它回显的是聊天平台的
-/// 身份，TUI 没有平台身份。
+/// TUI 认得的命令。§11.3 的聊天命令里，`/id` 不在这里——它回显的是聊天平台的
+/// 身份，TUI 没有平台身份。`/approve` / `/reject` 随审批在 2026-10-11 删除，走未知命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `/new`：追加 `conversation.boundary`，不切 Session。
     New,
     /// `/cancel`：取消该 Session 当前 Run。
     Cancel,
-    /// `/status`：当前 Run 状态、待审批数。
+    /// `/status`：当前 Run 状态、待处理条数。
     Status,
-    /// `/pending`：列出待处理审批及其短 ID。
+    /// `/pending`：列出待处理事项（结果不明 / 阻塞）及其句柄。
     Pending,
-    /// `/approve [short_id|all] [run]`
-    Approve {
-        target: ApprovalTarget,
-        scope: ApprovalScope,
-    },
-    /// `/reject [short_id|all]`
-    Reject {
-        target: ApprovalTarget,
-    },
-    /// `/answer <句柄> <结论>`：§11.3 里答另外两类（以及审批）的那条路。
+    /// `/answer <句柄> <结论>`：§11.3 里答一条待处理的那条路，一次答一条。
     Answer {
         handle: String,
         verdict: InterventionVerdict,
@@ -56,10 +44,6 @@ pub enum CommandError {
     Unknown { name: String },
     #[error("/{name} 不带参数，收到「{extra}」")]
     UnexpectedArgument { name: String, extra: String },
-    #[error("「{raw}」不是短 ID（4 位 base32，如 7K2M）")]
-    BadShortId { raw: String },
-    #[error("/approve 的范围只有 `run`，收到「{raw}」")]
-    BadScope { raw: String },
     #[error("「{raw}」不是可选的 effort；可选值：{options}")]
     BadEffort { raw: String, options: String },
     #[error("「{raw}」不是可答的结论；可选值：{options}")]
@@ -105,11 +89,8 @@ pub const EFFORT_LEVELS: [&str; 5] = [
 
 /// §7.5 表里那一列结论词，按种类各归各的，合起来就是 `/answer` 认的这些。
 ///
-/// 顺序与 `InterventionKind::verdicts` 一致（审批 → `verify` → `blocked`），因为报错时
-/// 印的就是它。
-pub const VERDICT_WORDS: [InterventionVerdict; 6] = [
-    InterventionVerdict::Approve,
-    InterventionVerdict::Reject,
+/// 顺序与 `InterventionKind::verdicts` 一致（`verify` → `blocked`），因为报错时印的就是它。
+pub const VERDICT_WORDS: [InterventionVerdict; 4] = [
     InterventionVerdict::Satisfied,
     InterventionVerdict::NotPerformed,
     InterventionVerdict::Resolve,
@@ -137,22 +118,17 @@ pub const KEYS: &[&str] = &[
     "按键  Ctrl-T 工具详情（管之后印出来的那些）",
 ];
 
-pub const COMMANDS: [(&str, &str); 11] = [
+pub const COMMANDS: [(&str, &str); 9] = [
     ("/new", "在当前会话划一条回放边界（不切会话）"),
     ("/cancel", "取消本会话正在跑的 Run"),
     ("/status", "当前 Run 状态与待处理条数"),
     (
         "/pending",
-        "列出全部待处理事项（审批 / 结果不明 / 阻塞）与各自的句柄",
+        "列出全部待处理事项（结果不明 / 阻塞）与各自的句柄",
     ),
-    (
-        "/approve",
-        "[短ID|all] [run] 批准；all 全批，run = 本次 Run 范围",
-    ),
-    ("/reject", "[短ID|all] 拒绝"),
     (
         "/answer",
-        "<句柄> <结论>：satisfied / not_performed / resolve / abandon",
+        "<句柄> <结论> 答一条：satisfied / not_performed / resolve / abandon",
     ),
     ("/model", "[模型] 列出或设定下一个 Run 的模型"),
     ("/effort", "[档位] 列出或设定下一个 Run 的推理强度"),
@@ -221,40 +197,6 @@ pub fn parse(text: &str, menu: &CommandMenu) -> Result<Command, CommandError> {
         "pending" => no_args(Command::Pending),
         "help" | "h" | "?" => no_args(Command::Help),
         "quit" | "exit" | "q" => no_args(Command::Quit),
-        "approve" => {
-            let mut target = ApprovalTarget::Only;
-            let mut scope = ApprovalScope::Once;
-            for arg in &args {
-                if arg.eq_ignore_ascii_case("run") {
-                    scope = ApprovalScope::Run;
-                } else if arg.eq_ignore_ascii_case("all") {
-                    target = ApprovalTarget::All;
-                } else if target == ApprovalTarget::Only {
-                    target = ApprovalTarget::One(ShortId::parse(arg).ok_or_else(|| {
-                        CommandError::BadShortId {
-                            raw: (*arg).to_string(),
-                        }
-                    })?);
-                } else {
-                    return Err(CommandError::BadScope {
-                        raw: (*arg).to_string(),
-                    });
-                }
-            }
-            Ok(Command::Approve { target, scope })
-        }
-        "reject" | "deny" => {
-            let target = match args.first() {
-                None => ApprovalTarget::Only,
-                Some(raw) if raw.eq_ignore_ascii_case("all") => ApprovalTarget::All,
-                Some(raw) => ApprovalTarget::One(ShortId::parse(raw).ok_or_else(|| {
-                    CommandError::BadShortId {
-                        raw: (*raw).to_string(),
-                    }
-                })?),
-            };
-            Ok(Command::Reject { target })
-        }
         "answer" => {
             let [handle, verdict, rest @ ..] = args.as_slice() else {
                 return Err(CommandError::AnswerNeedsTwoArguments {
@@ -324,68 +266,42 @@ mod tests {
     }
 
     #[test]
-    fn the_seven_chat_commands_parse() {
+    fn the_chat_commands_parse() {
         assert_eq!(parse("/new", &menu()).unwrap(), Command::New);
         assert_eq!(parse("/cancel", &menu()).unwrap(), Command::Cancel);
         assert_eq!(parse("/status", &menu()).unwrap(), Command::Status);
         assert_eq!(parse("/pending", &menu()).unwrap(), Command::Pending);
         assert_eq!(
-            parse("/approve", &menu()).unwrap(),
-            Command::Approve {
-                target: ApprovalTarget::Only,
-                scope: ApprovalScope::Once
-            }
-        );
-        assert_eq!(
-            parse("/reject", &menu()).unwrap(),
-            Command::Reject {
-                target: ApprovalTarget::Only
+            parse("/answer run-1 satisfied", &menu()).unwrap(),
+            Command::Answer {
+                handle: "run-1".into(),
+                verdict: InterventionVerdict::Satisfied
             }
         );
     }
 
-    /// `/approve all`：待处理的**全部**，一次答一批（§11.3）。
+    /// 审批删掉之后（2026-10-11）`/approve` `/reject` 是未知命令，不是悄悄答了什么。
     #[test]
-    fn approve_all_asks_for_every_pending_one() {
-        assert_eq!(
-            parse("/approve all", &menu()).unwrap(),
-            Command::Approve {
-                target: ApprovalTarget::All,
-                scope: ApprovalScope::Once
-            }
-        );
-        assert_eq!(
-            parse("/reject ALL", &menu()).unwrap(),
-            Command::Reject {
-                target: ApprovalTarget::All
-            }
-        );
+    fn approve_and_reject_are_no_longer_commands() {
+        for text in ["/approve", "/approve all", "/reject 7K2M"] {
+            let error = parse(text, &menu()).unwrap_err();
+            assert!(
+                matches!(error, CommandError::Unknown { .. }),
+                "{text}: {error}"
+            );
+        }
     }
 
+    /// `/answer` 报错时列的结论只有两类介入能答的那四个。
     #[test]
-    fn approve_with_a_short_id_and_a_run_scope() {
-        assert_eq!(
-            parse("/approve 7k2m run", &menu()).unwrap(),
-            Command::Approve {
-                target: ApprovalTarget::One(ShortId::parse("7K2M").expect("短 ID")),
-                scope: ApprovalScope::Run
-            }
+    fn a_bad_verdict_lists_only_the_four_answerable_words() {
+        let error = parse("/answer run-1 approve", &menu()).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("satisfied · not_performed · resolve · abandon"),
+            "{message}"
         );
-        // 顺序不重要：范围是个词，不是第二个位置。
-        assert_eq!(
-            parse("/approve run 7K2M", &menu()).unwrap(),
-            Command::Approve {
-                target: ApprovalTarget::One(ShortId::parse("7K2M").expect("短 ID")),
-                scope: ApprovalScope::Run
-            }
-        );
-    }
-
-    #[test]
-    fn a_short_id_that_is_not_one_is_refused_not_ignored() {
-        let error = parse("/approve 7K2I", &menu()).unwrap_err();
-        assert!(matches!(error, CommandError::BadShortId { .. }), "{error}");
-        assert!(error.to_string().contains("7K2I"));
+        assert!(!message.contains("reject"), "{message}");
     }
 
     #[test]
@@ -484,6 +400,6 @@ mod tests {
         // `/` 后面什么都没打时是整张表。
         assert_eq!(palette("/").len(), COMMANDS.len());
         // 已经打完一个词就不是在选命令了。
-        assert!(palette("/approve 7K2M").is_empty());
+        assert!(palette("/answer run-1").is_empty());
     }
 }

@@ -25,13 +25,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
-use komo_kernel::protocol::http::{ApprovalRecord, RunDetail, SubmitRunResponse};
+use komo_kernel::protocol::http::{InterventionSummary, RunDetail, SubmitRunResponse};
 use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::traits::{
-    Channel, ChannelError, DeliverError, EmbeddingClient, Inbound, LlmClient, TurnDriver,
+    Channel, ChannelError, DeliverError, EmbeddingClient, Inbound, LlmClient, Tool, TurnDriver,
 };
-use komo_kernel::types::chat::{ApprovalPresentation, ChannelPeer, ChannelPlatform, Outbound};
-use komo_kernel::types::ids::{ApprovalId, RunId, SessionId};
+use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Outbound};
+use komo_kernel::types::ids::{RunId, SessionId};
 use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{LlmError, ProviderToolCall, Round, RoundInput, TurnRequest};
@@ -119,8 +119,8 @@ pub fn telegram_config(allow_from: &str) -> String {
 
 /// [`Home`] 的默认配置：**配了 home chat 的** Telegram 渠道，没有群。
 ///
-/// 无人值守的那些测试（cron / recovery）要的正是这一份：审批请求有一个出口，而"群里
-/// 说话"不在它们的范围里。
+/// 无人值守的那些测试（cron / recovery）要的正是这一份：要人处理的介入有一个出口，而
+/// "群里说话"不在它们的范围里。
 pub fn home_config() -> String {
     config_toml(
         r#"
@@ -134,29 +134,14 @@ home_chat = 111
 
 pub const DEFAULT_ENV: &str = "KOMO_LLM_API_KEY=test-key\nTELEGRAM_BOT_TOKEN=test-bot-token\n";
 
-/// 写出一个数据目录。
-///
-/// `policy` 是 policy.toml 的正文；**`None` = 不写这个文件**，那样 §7.1 的初始建议生效
-/// （根内写入 Allow，任意 shell 是 Ask）——无人值守的那两组测试要的正是这一条。写
-/// `rules = []` 则是"一条规则都没有"，默认 Ask。
-pub fn write_home_with(home: &Path, config: &str, env: &str, policy: Option<&str>) {
+/// 写出一个数据目录。不写 `policy.toml`：它已经不再被读（§7，2026-10-11）。
+pub fn write_home(home: &Path, config: &str, env: &str) {
     std::fs::create_dir_all(home).expect("数据目录");
     std::fs::write(home.join("config.toml"), config).expect("写 config.toml");
     std::fs::write(home.join(".env"), env).expect("写 .env");
-    match policy {
-        Some(rules) => std::fs::write(home.join("policy.toml"), rules).expect("写 policy.toml"),
-        None => {
-            let _ = std::fs::remove_file(home.join("policy.toml"));
-        }
-    }
     // **故意不建 `workspaces/`**：它是数据目录骨架的一部分，该由 Gateway 自己在启动时
     // 建（§12）。这里替它建过，于是生产路径上少了那一步也一直看不出来——每一个 shell /
     // python 调用都在报"程序起不来"，而真正不在的是会话 cwd。
-}
-
-/// 同上，带一份空规则表（`rules = []`）。
-pub fn write_home(home: &Path, config: &str, env: &str) {
-    write_home_with(home, config, env, Some("rules = []\n"));
 }
 
 // ---------------------------------------------------------------- 渠道替身
@@ -196,22 +181,10 @@ impl MemSender {
     pub fn texts(&self) -> Vec<String> {
         self.sent()
             .into_iter()
-            .filter_map(|message| match message.outbound {
-                Outbound::Text { text } => Some(text),
-                Outbound::RunFinished { summary, .. } => Some(summary),
-                Outbound::NeedsAttention { reason, .. } => Some(reason),
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// 收到的每一条审批请求。
-    pub fn approvals(&self) -> Vec<ApprovalPresentation> {
-        self.sent()
-            .into_iter()
-            .filter_map(|message| match message.outbound {
-                Outbound::ApprovalRequest(presentation) => Some(*presentation),
-                _ => None,
+            .map(|message| match message.outbound {
+                Outbound::Text { text } => text,
+                Outbound::RunFinished { summary, .. } => summary,
+                Outbound::NeedsAttention { reason, .. } => reason,
             })
             .collect()
     }
@@ -506,6 +479,7 @@ pub struct GatewayBuilder {
     embeddings: Option<Arc<dyn EmbeddingClient>>,
     factories: Vec<Arc<dyn ChannelFactory>>,
     home: Option<PathBuf>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 impl GatewayBuilder {
@@ -517,7 +491,14 @@ impl GatewayBuilder {
             embeddings: None,
             factories: Vec::new(),
             home: None,
+            tools: Vec::new(),
         }
+    }
+
+    /// 多挂一个测试工具（[`super::Gate`] / [`super::Unsure`]）。
+    pub fn tool(mut self, tool: Arc<dyn Tool>) -> Self {
+        self.tools.push(tool);
+        self
     }
 
     pub fn env(mut self, env: &str) -> Self {
@@ -558,6 +539,7 @@ impl GatewayBuilder {
             }
         };
         write_home(&home, &self.config, &self.env);
+        super::install_test_tools(&home, self.tools);
 
         let running = start(ServiceOptions {
             home: Some(home.clone()),
@@ -721,33 +703,6 @@ impl TestGateway {
         request(self.base_url(), self.token(), method, path, body).await
     }
 
-    /// 造一条待处理的审批（executor 真跑起来时做的就是这件事）。
-    pub async fn pending_approval(&self) -> ApprovalRecord {
-        let session = self
-            .state()
-            .default_main_session()
-            .await
-            .expect("home session");
-        self.pending_approval_in(&session, None).await
-    }
-
-    /// 此刻待处理的审批。
-    pub async fn approvals(&self) -> Vec<ApprovalRecord> {
-        self.state()
-            .approval_repo
-            .list_pending(None)
-            .await
-            .expect("读得出")
-    }
-
-    pub async fn pending_approval_in(
-        &self,
-        session: &SessionId,
-        run: Option<RunId>,
-    ) -> ApprovalRecord {
-        pending_approval_in(self.state(), session, run).await
-    }
-
     /// 还没送到的投递。
     pub async fn pending_deliveries(&self) -> Vec<komo_store::DeliveryRecord> {
         self.state()
@@ -766,41 +721,21 @@ impl TestGateway {
             .expect("读得出")
     }
 
-    /// 待处理清单（三类一起，§7.5）。
-    pub async fn interventions(&self) -> Vec<komo_kernel::protocol::http::InterventionSummary> {
+    /// 待处理清单（两类一起，§7.5）。
+    pub async fn interventions(&self) -> Vec<InterventionSummary> {
         let (code, body) = self.get_json("/v1/interventions").await;
         assert_eq!(code, 200, "{body}");
         serde_json::from_value(body["interventions"].clone()).expect("清单读得出")
     }
 
-    /// 走 HTTP 那条路做决定（四个界面共用的那一个接口，§13.5）。
-    ///
-    /// 打的是 `POST /v1/interventions/{handle}/answer`（§7.5）：审批的答复**只走这一条
-    /// 路**，句柄是短 ID（§11.3）。单条的 `/v1/approvals/{id}/decision` 已经不在了。
-    pub async fn decide(&self, approval: &ApprovalId, approved: bool) -> String {
-        let handle = self.short_id_of(approval).await;
-        self.answer(&handle, if approved { "approve" } else { "reject" }, None)
-            .await
+    /// 等清单里出现这条 Run 的介入（最多 20 秒）。
+    pub async fn wait_intervention(&self, run: &RunId) -> InterventionSummary {
+        wait_intervention_in(|| self.interventions(), run).await
     }
 
-    /// 那条审批现在的短 ID（它就是 §7.5 清单里那一条的句柄）。
-    pub async fn short_id_of(&self, approval: &ApprovalId) -> String {
-        self.state()
-            .approval_repo
-            .get(approval)
-            .await
-            .expect("读得出")
-            .expect("有这条审批")
-            .short_id
-            .to_string()
-    }
-
-    /// `POST /v1/interventions/{handle}/answer`（§7.5）。`scope` 只对 `approve` 有含义。
-    pub async fn answer(&self, handle: &str, verdict: &str, scope: Option<&str>) -> String {
-        let mut body = serde_json::json!({ "verdict": verdict });
-        if let Some(scope) = scope {
-            body["scope"] = serde_json::json!(scope);
-        }
+    /// `POST /v1/interventions/{handle}/answer`（§7.5），断言 200。
+    pub async fn answer(&self, handle: &str, verdict: &str) -> String {
+        let body = serde_json::json!({ "verdict": verdict });
         let (code, body) = self
             .post(&format!("/v1/interventions/{handle}/answer"), body)
             .await;
@@ -830,18 +765,7 @@ impl TestGateway {
 /// 等一条**补写**的审计事件落盘的期限（见 [`Home::wait_event`]）。
 pub const EVENT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// 一条 `approval_pending` 直播帧的内容：界面拿它去取详情、去弹窗（§13.1：帧里只有
-/// 编号，授权与详情另外去取）。
-#[derive(Debug, Clone)]
-pub struct PendingApprovalFrame {
-    pub approval: komo_kernel::types::ids::ApprovalId,
-    pub short_id: komo_kernel::types::ids::ShortId,
-}
-
 /// 一个真实的数据目录，可以反复起落。
-///
-/// **故意写一份 `rules = []` 的 policy.toml**——那样 §7.1 的初始建议生效：根内写入是
-/// Allow，任意 shell 是 Ask，正好是恢复与 Cron 两组验收要的两种放行方式。
 pub struct Home {
     dir: tempfile::TempDir,
 }
@@ -860,18 +784,14 @@ impl Home {
     pub fn with_config(config: &str) -> Home {
         install_crypto();
         let dir = tempfile::tempdir().expect("临时数据目录");
-        // **故意不写 policy.toml**：§7.1 的初始建议生效（根内写入 Allow、任意 shell
-        // 是 Ask），正是无人值守那两组验收要的两种放行方式。
-        write_home_with(dir.path(), config, DEFAULT_ENV, None);
+        write_home(dir.path(), config, DEFAULT_ENV);
         Home { dir }
     }
 
-    /// 同 [`Home::with_config`]，但 `policy.toml` 由调用方给——测 §7.1 的模式（`mode`）用。
-    pub fn with_policy(config: &str, policy: &str) -> Home {
-        install_crypto();
-        let dir = tempfile::tempdir().expect("临时数据目录");
-        write_home_with(dir.path(), config, DEFAULT_ENV, Some(policy));
-        Home { dir }
+    /// 之后每次在这个数据目录起 Gateway 都多挂这几个测试工具（[`super::Gate`] /
+    /// [`super::Unsure`]）。
+    pub fn install_tools(&self, tools: Vec<Arc<dyn Tool>>) {
+        super::install_test_tools(self.dir.path(), tools);
     }
 
     pub fn path(&self) -> &Path {
@@ -924,31 +844,6 @@ impl Home {
                 );
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    /// 从直播帧里等一条 `approval_pending`。**先订阅再交任务**，否则这一帧已经过去了。
-    pub async fn wait_approval_frame(
-        &self,
-        frames: &mut tokio::sync::broadcast::Receiver<komo_kernel::protocol::sse::SseFrame>,
-        timeout: std::time::Duration,
-    ) -> PendingApprovalFrame {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match tokio::time::timeout(left, frames.recv()).await {
-                Ok(Ok(frame)) => {
-                    if let komo_kernel::protocol::sse::SseEvent::ApprovalPending {
-                        approval,
-                        short_id,
-                    } = frame.event
-                    {
-                        return PendingApprovalFrame { approval, short_id };
-                    }
-                }
-                Ok(Err(error)) => panic!("直播帧断了：{error}"),
-                Err(_) => panic!("等了 {timeout:?} 也没有 approval_pending 帧"),
-            }
         }
     }
 
@@ -1070,11 +965,16 @@ impl Gw {
         (code, as_json(body))
     }
 
-    /// 待处理清单（三类一起，§7.5）。
-    pub async fn interventions(&self) -> Vec<komo_kernel::protocol::http::InterventionSummary> {
+    /// 待处理清单（两类一起，§7.5）。
+    pub async fn interventions(&self) -> Vec<InterventionSummary> {
         let (code, body) = self.get_json("/v1/interventions").await;
         assert_eq!(code, 200, "{body}");
         serde_json::from_value(body["interventions"].clone()).expect("清单读得出")
+    }
+
+    /// 等清单里出现这条 Run 的介入（最多 20 秒）。
+    pub async fn wait_intervention(&self, run: &RunId) -> InterventionSummary {
+        wait_intervention_in(|| self.interventions(), run).await
     }
 
     pub async fn request(
@@ -1196,68 +1096,14 @@ impl Gw {
             .await
     }
 
-    pub async fn approvals(&self) -> Vec<ApprovalRecord> {
-        self.state()
-            .approval_repo
-            .list_pending(None)
-            .await
-            .expect("读得出")
-    }
-
-    /// 等一条待处理的审批出现。
-    pub async fn wait_approval(&self) -> ApprovalRecord {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-        while std::time::Instant::now() < deadline {
-            if let Some(record) = self.approvals().await.into_iter().next() {
-                return record;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        panic!("等了 20 秒也没有待处理的审批");
-    }
-
-    /// 走 HTTP 那条路做决定（四个界面共用的那一个接口，§13.5）。
-    ///
-    /// 打的是 `POST /v1/interventions/{handle}/answer`（§7.5）：审批的答复**只走这一条
-    /// 路**，句柄是短 ID（§11.3）。单条的 `/v1/approvals/{id}/decision` 已经不在了。
-    pub async fn decide(&self, approval: &ApprovalId, approved: bool) -> String {
-        let handle = self.short_id_of(approval).await;
-        self.answer(&handle, if approved { "approve" } else { "reject" }, None)
-            .await
-    }
-
-    /// `POST /v1/interventions/{handle}/answer`（§7.5）。`scope` 只对 `approve` 有含义。
-    pub async fn answer(&self, handle: &str, verdict: &str, scope: Option<&str>) -> String {
-        let mut body = serde_json::json!({ "verdict": verdict });
-        if let Some(scope) = scope {
-            body["scope"] = serde_json::json!(scope);
-        }
+    /// `POST /v1/interventions/{handle}/answer`（§7.5），断言 200。
+    pub async fn answer(&self, handle: &str, verdict: &str) -> String {
+        let body = serde_json::json!({ "verdict": verdict });
         let (code, body) = self
             .post(&format!("/v1/interventions/{handle}/answer"), body)
             .await;
         assert_eq!(code, 200, "{body}");
         body
-    }
-
-    /// 那条审批现在的短 ID（它是 §7.5 清单里的句柄）。
-    pub async fn short_id_of(&self, approval: &ApprovalId) -> String {
-        self.state()
-            .approval_repo
-            .get(approval)
-            .await
-            .expect("读得出")
-            .expect("有这条审批")
-            .short_id
-            .to_string()
-    }
-
-    /// 造一条待处理的审批。
-    pub async fn pending_approval_in(
-        &self,
-        session: &SessionId,
-        run: Option<RunId>,
-    ) -> ApprovalRecord {
-        pending_approval_in(self.state(), session, run).await
     }
 
     /// 停机（放锁、删发现文件）。数据目录留着。
@@ -1290,27 +1136,26 @@ fn as_json(body: String) -> serde_json::Value {
     serde_json::from_str(&body).unwrap_or(serde_json::Value::String(body))
 }
 
-/// 造一条待处理的审批（executor 真跑起来时做的就是这件事）。
-pub async fn pending_approval_in(
-    state: &Arc<GatewayState>,
-    session: &SessionId,
-    run: Option<RunId>,
-) -> ApprovalRecord {
-    let plan = komo_kernel::test_support::sample_plan("shell", session);
-    state
-        .approvals
-        .request(komo_runtime::approvals::ApprovalRequest {
-            session: session.clone(),
-            run,
-            call: None,
-            plan,
-            reason: "任意 shell 命令要人看一眼".into(),
-            changes: None,
-            evidence: None,
-            scopes: vec![komo_kernel::types::chat::ApprovalScope::Once],
-        })
-        .await
-        .expect("写得下")
+/// 等某条 Run 的介入出现在清单里（最多 20 秒）。
+async fn wait_intervention_in<F, Fut>(list: F, run: &RunId) -> InterventionSummary
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Vec<InterventionSummary>>,
+{
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(found) = list()
+            .await
+            .into_iter()
+            .find(|one| one.run.as_ref() == Some(run))
+        {
+            return found;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("等了 20 秒 run {run} 也没有出现在待处理清单里");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// reqwest 用 `rustls-no-provider`：provider 由 `komo` 的 `main` 装（§13.4）。测试进程里

@@ -9,7 +9,7 @@
 //! 另外半个职责是**租约心跳**（§8.7）：一个二十分钟的调用不该因为"十分钟没人写账本"
 //! 就被当成没人管。心跳由 [`AgentRunHandler::heartbeat`] 起，和这一段同生共死。
 //!
-//! 装配一个执行段要三样这里看不见的东西：Session 的工作目录与已授权根（在 store
+//! 装配一个执行段要三样这里看不见的东西：Session 的工作目录与工作区根（在 store
 //! 里）、`TurnRequest`（系统提示、回放窗口、记忆注入，在 `llm` / `memory` 侧）、恢复
 //! 位置（`recovery` 折出来的）。所以它们从一条缝进来：[`SegmentSource`]。
 
@@ -515,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_run_leaves_its_terminal_event_on_the_ledger_and_returns_ok() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![]);
+        let executor = harness.executor(vec![]);
         let agent = Arc::new(AgentLoop::new(
             Arc::new(ScriptedLlm::once(vec![round(1, Some("好了。"), vec![])])),
             harness.ledger.clone(),
@@ -548,7 +548,7 @@ mod tests {
     #[tokio::test]
     async fn a_source_that_cannot_assemble_fails_the_handler_without_writing_a_terminal_state() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![]);
+        let executor = harness.executor(vec![]);
         let agent = Arc::new(AgentLoop::new(
             Arc::new(ScriptedLlm::once(vec![])),
             harness.ledger.clone(),
@@ -586,7 +586,7 @@ mod tests {
     #[tokio::test]
     async fn a_corrupt_session_stops_the_run_and_never_returns_to_the_queue() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![]);
+        let executor = harness.executor(vec![]);
         let agent = Arc::new(AgentLoop::new(
             Arc::new(ScriptedLlm::once(vec![])),
             harness.ledger.clone(),
@@ -652,7 +652,7 @@ mod tests {
     #[tokio::test]
     async fn a_corrupt_output_reference_stops_the_run_too() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![]);
+        let executor = harness.executor(vec![]);
         let agent = Arc::new(AgentLoop::new(
             Arc::new(ScriptedLlm::once(vec![])),
             harness.ledger.clone(),
@@ -691,7 +691,7 @@ mod tests {
     #[tokio::test]
     async fn an_ordinary_failure_still_returns_to_the_queue() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![]);
+        let executor = harness.executor(vec![]);
         let agent = Arc::new(AgentLoop::new(
             Arc::new(ScriptedLlm::once(vec![])),
             harness.ledger.clone(),
@@ -730,7 +730,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_renewal_that_is_no_longer_ours_cancels_the_run() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![]);
+        let executor = harness.executor(vec![]);
         let agent = Arc::new(AgentLoop::new(
             Arc::new(SlowLlm {
                 think: Duration::from_secs(3600),
@@ -774,7 +774,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_heartbeat_stops_renewing_when_the_attempt_ends() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![]);
+        let executor = harness.executor(vec![]);
         // 想 45 秒：心跳（30 秒一跳）至少跳一次，然后这一段落回正常终态。
         let agent = Arc::new(AgentLoop::new(
             Arc::new(SlowLlm {
@@ -832,7 +832,7 @@ mod tests {
     #[tokio::test]
     async fn recompose_reassembles_without_requeue_and_caps() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![]);
+        let executor = harness.executor(vec![]);
         let mut scripts: Vec<Vec<Round>> = (0..MAX_RECOMPOSITIONS)
             .map(|n| vec![round(1, Some(&format!("第 {n} 份摘要")), vec![])])
             .collect();
@@ -905,7 +905,7 @@ mod tests {
     #[tokio::test]
     async fn recomposing_does_not_refill_the_round_budget() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(
+        let executor = harness.executor(vec![Arc::new(
             crate::executor::harness::RecordingTool::shell(),
         )]);
         let mut scripts = Vec::new();

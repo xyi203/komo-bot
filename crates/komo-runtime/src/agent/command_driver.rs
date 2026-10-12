@@ -7,9 +7,8 @@
 //! 里按 Run 的来源判（§10 设计的"选驱动的接缝"）：不是把命令伪装成另一个 `ModelConfig`
 //! / provider，是压根不经过 `LlmClient` 这一层——`self.llm` 一次都不会被摸到。
 //!
-//! 于是 Policy / Proof / 审批 / JSONL / tool-output / 恢复 / 投递全部原样复用：那一次
-//! `shell` 调用照样要过 `prepare` → Policy → （必要时）审批 → `execute`，跟模型发起的
-//! 调用走的是同一条路。
+//! 于是能力面 / JSONL / tool-output / 恢复 / 投递全部原样复用：那一次 `shell` 调用照样
+//! 走 `prepare` → `start_call` → `execute`，跟模型发起的调用是同一条路。
 //!
 //! **恢复安全**：如果上一次已经把这条 `shell` 调用的结果记进了账本（收到结果之后、
 //! 收尾之前进程重启了），那条调用在回放窗口里已经"收尾"了，不再进 `resumed.pending`

@@ -1,13 +1,7 @@
 //! 命令直跑模式（§10）：不经模型，触发时固定跑 Job 的 `command`。走真 Gateway——
-//! 真数据目录、真 state.db、真 Policy，`LlmClient` 是脚本模型，用
+//! 真数据目录、真 state.db，`LlmClient` 是脚本模型，用
 //! [`komo_gateway::service::test_support::harness::FakeLlm::turns`] 断言它一次都
-//! 没被问过。
-//!
-//! 默认 `Home::new()` 是 strict 策略（见 `service::tests::auto_mode_runs_...` 需要
-//! 显式 `Home::with_policy(..., "mode = \"auto\"")` 才能切到 auto）——这组测试**不**
-//! 走审批就跑到底，本身就是「`cron add` 即授权」在 strict 下生效的证据：授权没落
-//! 下来的话，这些 Run 会停在 `waiting + approval` 上，`wait_state(...is_terminal...)`
-//! 会等到超时。
+//! 没被问过。命令 Job 不再签授权（§7 删掉审批之后，触发时那次 `shell` 直接执行）。
 
 use std::sync::Arc;
 
@@ -168,29 +162,5 @@ async fn prompt_and_command_are_mutually_exclusive() {
         .await;
     assert_eq!(status, 400, "{body}");
     assert!(gw.cron_list().await.jobs.is_empty(), "一个 Job 都没留下");
-    gw.stop().await;
-}
-
-/// `cron add` 落的是 Cron Job 范围授权，不是一次性批准：第二次触发同样不经审批
-/// 跑到底。授权若被第一次触发用掉，第二个 Run 会停在 `waiting + approval` 上。
-#[tokio::test]
-async fn the_add_time_grant_covers_every_firing_not_just_the_first() {
-    let home = Home::new();
-    let llm = FakeLlm::new(vec![]);
-    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-
-    let job = gw.add_job(command_job("twice", "echo tick")).await;
-    for round in 0..2 {
-        gw.make_due(&job.id).await;
-        let run = gw.tick().await.fired[0].run.clone();
-        gw.wait_state(
-            &run,
-            |s| s.is_terminal(),
-            &format!("第 {} 次触发的终态", round + 1),
-        )
-        .await;
-    }
-
-    assert_eq!(llm.turns(), 0);
     gw.stop().await;
 }

@@ -1,8 +1,8 @@
 //! 跨 crate 的测试替身（feature `test-support`，只作为 dev-dependency 启用，§13.4）。
 //!
 //! 这些替身要**够真**：store / runtime / gateway 的测试直接拿它们当依赖，所以
-//! [`MemLedger`] 真的按 seq 追加事件、真的能 fold，[`MemApprovalRepo`] 真的幂等、真的
-//! 在消费时核对计划哈希。一个只会返回 `Ok(())` 的替身测不出任何东西。
+//! [`MemLedger`] 真的按 seq 追加事件、真的能 fold，[`MemCronRepo`] 真的按
+//! `job_id + scheduled_at` 去重。一个只会返回 `Ok(())` 的替身测不出任何东西。
 
 use std::sync::{Arc, Mutex};
 
@@ -10,9 +10,8 @@ use time::OffsetDateTime;
 
 use crate::traits::Clock;
 use crate::types::ids::{OperationId, SessionId};
-use crate::types::plan::{ExecutionPlan, Proof, RecoveryMode};
+use crate::types::plan::{ExecutionPlan, RecoveryMode};
 
-mod approvals;
 mod config;
 mod cron;
 mod ledger;
@@ -25,7 +24,6 @@ mod queue;
 mod tests;
 mod zones;
 
-pub use approvals::MemApprovalRepo;
 pub use config::snapshot_fixture;
 pub use cron::MemCronRepo;
 pub use ledger::MemLedger;
@@ -35,14 +33,6 @@ pub use output::{MemOutputStore, MemOutputWriter};
 pub use python::FakePythonHost;
 pub use queue::MemRunQueue;
 pub use zones::ScriptedZoneResolver;
-
-/// 测试用的 [`Proof`]。
-///
-/// 正式构建里 `Proof` 只有两个来源（`PolicyDecision::into_proof` 与
-/// `ConsumedApproval::into_proof`），这个后门在 feature 门后面，不进生产（§4）。
-pub fn proof() -> Proof {
-    Proof::policy_allow()
-}
 
 /// 一条"压了"的 `context.compacted`：摘要内联，决策按一组压得过来的数算出来。
 pub fn compacted(

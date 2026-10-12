@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::ids::{ApprovalId, AttemptId, EventId, RunId, Seq, ShortId, ToolCallId};
+use crate::types::ids::{AttemptId, EventId, RunId, Seq, ToolCallId};
 use crate::types::plan::PlanHash;
 use crate::types::refs::{ContentRef, OutputRef, PayloadRef, ToolResultStatus};
 use crate::types::status::{RunState, ToolCallState, WaitReason};
@@ -160,20 +160,6 @@ pub struct ToolCallView {
     #[serde(default)]
     pub attempts: u32,
     pub last_seq: Seq,
-}
-
-/// 一条还没有决定的审批。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ApprovalView {
-    pub approval: ApprovalId,
-    pub short_id: ShortId,
-    pub plan_hash: PlanHash,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call: Option<ToolCallId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<RunId>,
-    pub reason: String,
-    pub requested_seq: Seq,
 }
 
 /// 一条这个版本读不懂的事件。保留下来，不解释（§8.3）。

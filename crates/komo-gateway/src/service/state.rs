@@ -1,7 +1,7 @@
 //! Gateway 的进程状态：一次装配，所有入口共用。
 //!
-//! HTTP 与聊天渠道走的是**同一段代码**（§13.1 最后一段），所以"提交一条输入"、"记一个
-//! 审批决定"、"把等着的 Run 放回队列"这些动作都只在这里实现一次；`http` 与
+//! HTTP 与聊天渠道走的是**同一段代码**（§13.1 最后一段），所以"提交一条输入"、"答一条
+//! 介入"、"把等着的 Run 放回队列"这些动作都只在这里实现一次；`http` 与
 //! `dispatcher` 各自只做自己的那层翻译。
 
 use std::path::PathBuf;
@@ -9,34 +9,29 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
-use komo_kernel::protocol::http::{
-    ApprovalDecisionResponse, ApprovalRecord, InterventionKind, InterventionListQuery,
-    InterventionSummary, SubmitRunResponse,
-};
+use komo_kernel::protocol::http::{InterventionListQuery, SubmitRunResponse};
 use komo_kernel::traits::{
-    ApprovalRepo, Clock, CronRepo, EmbeddingClient, GatewayError, Ledger, LlmClient, MemoryRepo,
-    RepoError, RunQueue, StoreError, ToolOutputStore,
+    Clock, CronRepo, EmbeddingClient, GatewayError, Ledger, LlmClient, MemoryRepo, RepoError,
+    RunQueue, StoreError, ToolOutputStore,
 };
 use komo_kernel::types::agent::{AgentProfile, RunSnapshot};
-use komo_kernel::types::chat::{ApprovalScope, ChannelPeer, PeerId};
-use komo_kernel::types::ids::{ApprovalId, ExecutorId, RequestKey, RunId, SessionId};
+use komo_kernel::types::chat::ChannelPeer;
+use komo_kernel::types::ids::{ExecutorId, RequestKey, RunId, SessionId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::status::{RunEnd, RunState, SessionState};
 use komo_kernel::types::turn::{AcceptInput, LlmError, TurnRequest};
 use komo_runtime::agent::handler::{AgentRunHandler, SegmentSource};
 use komo_runtime::agent::{AgentLoop, Budget, ResumedRound, RetryBudget, Segment};
-use komo_runtime::approvals::ApprovalGate;
 use komo_runtime::config::{ConfigHolder, EffortCapabilities};
 use komo_runtime::executor::{CallEnv, ToolExecutor};
 use komo_runtime::memory::{DbMemoryWork, LedgerEvents, MemoryManager, MemoryParts};
-use komo_runtime::policy::PolicyEngine;
 use komo_runtime::recovery::{RecoveryIndex, RecoveryScan, UnfinishedRun};
 use komo_runtime::scheduler::{HandlerError, Scheduler, SchedulerConfig, Waker};
 use komo_runtime::tools::paths;
 use komo_store::{
-    Db, PayloadStore, RecoveryStore, TursoApprovalRepo, TursoCronRepo, TursoDeliveryRepo,
-    TursoMemoryRepo, TursoRunQueue,
+    Db, PayloadStore, RecoveryStore, TursoCronRepo, TursoDeliveryRepo, TursoMemoryRepo,
+    TursoRunQueue,
 };
 use time::OffsetDateTime;
 
@@ -113,7 +108,7 @@ impl LlmClient for SwappableLlm {
 
 /// 没有配置模型 / 配置不可用时的后端：每次调用都报同一个明确的错误。
 ///
-/// 它存在只是为了让 Gateway **起得来**——渠道、审批、恢复扫描与操作命令都不依赖模型，
+/// 它存在只是为了让 Gateway **起得来**——渠道、介入、恢复扫描与操作命令都不依赖模型，
 /// 而一个连 `komo doctor` 都跑不起来的进程什么都诊断不了。
 #[derive(Debug)]
 pub struct UnconfiguredLlm {
@@ -338,16 +333,14 @@ pub struct GatewayState {
     pub hub: SharedHub,
     pub ledgers: Arc<SessionLedgers>,
     pub routed: Arc<RoutedLedger>,
-    /// 审计补写的叫醒铃。审批请求落库之后由 [`RoutedLedger::suspend`] 按一下，周期
-    /// （`AUDIT_TICK`）只是兜底——界面等不起那一拍（§8.5 的补写顺序不变）。
+    /// 审计补写的叫醒铃。有审计事件刚排进 `control_outbox` 时按一下，周期（`AUDIT_TICK`）
+    /// 只是兜底（§8.5 的补写顺序不变）。
     pub audit_wake: Arc<tokio::sync::Notify>,
     /// 一次 Run 的三个写入者共用的那个账本句柄（测试的故障注入口包的就是它）。审计补写
     /// 也走它——补写是账本写入的一种，没有理由绕过同一条缝。
     pub turn_ledger: Arc<dyn Ledger>,
     pub outputs: Arc<dyn ToolOutputStore>,
     pub queue: Arc<TursoRunQueue>,
-    pub approvals: Arc<ApprovalGate>,
-    pub approval_repo: Arc<dyn ApprovalRepo>,
     pub cron: Arc<dyn CronRepo>,
     pub memory: Arc<dyn MemoryRepo>,
     /// §9 的那一层：召回与注入、自动积累、向量索引与代次。
@@ -366,9 +359,6 @@ pub struct GatewayState {
     pub handler: Arc<AgentRunHandler>,
     /// 本进程此刻还在手里的 Run（§8.9 的存活判定）。
     pub in_flight: Arc<InFlight>,
-    /// 判决用的那一份规则表。**热重载换的就是它**（[`Self::install_policy`] 的兄弟：
-    /// `reload::apply` 直接调 `policy.install`）。
-    pub policy: Arc<PolicyEngine>,
     pub segments: Arc<GatewaySegments>,
     /// 执行器挂着的工具名。提示里的 skills 目录行按它门控（§5.6 的 `requires_tools:`），
     /// 而重载重算那一块时要用——那时执行器已经造好了，名字留在这里最省事。
@@ -390,12 +380,12 @@ pub struct GatewayState {
     ///
     /// **一个 Run 只有一个看的人**：Cron 的看客与交互的看客都走
     /// [`run_watch::watch`](super::run_watch::watch)，登记表是它们之间唯一的约定——
-    /// 没有它，一条审批会被投两遍（去重键那一层管的是平台重投，管不到这个）。
+    /// 没有它，一条介入会被投两遍（去重键那一层管的是平台重投，管不到这个）。
     ///
-    /// 投递表按**句柄**记（审批是短 ID，另外两类是 Run ID，§7.5 那张表）：三类共用一条
-    /// 到达率，"投过一次就不再投"这条判据也只能有一个。
+    /// 投递表按**句柄**记（Run ID，§7.5 那张表）：两类共用一条到达率，"投过一次就不再投"
+    /// 这条判据也只能有一个。
     pub watching: Mutex<std::collections::BTreeSet<RunId>>,
-    pub approvals_delivered: Mutex<std::collections::BTreeSet<String>>,
+    pub interventions_delivered: Mutex<std::collections::BTreeSet<String>>,
     /// 模型请求的有界退避预算上限（§8.5）。
     pub max_retries: u32,
     /// 一段最多跑几轮模型（§6）。
@@ -471,7 +461,6 @@ impl GatewayState {
             Arc::clone(&ledgers),
             db.clone(),
             Arc::clone(&clock),
-            Arc::clone(&audit_wake),
         ));
         let outputs: Arc<dyn ToolOutputStore> = Arc::new(RoutedOutputs::new(
             Arc::clone(&ledgers),
@@ -484,11 +473,6 @@ impl GatewayState {
         let queue = Arc::new(TursoRunQueue::with_lease(
             db.clone(),
             komo_store::repos::queue::DEFAULT_LEASE_WINDOW,
-        ));
-        let approval_repo: Arc<dyn ApprovalRepo> = Arc::new(TursoApprovalRepo::new(db.clone()));
-        let approvals = Arc::new(ApprovalGate::new(
-            Arc::clone(&approval_repo),
-            Arc::clone(&clock),
         ));
         let cron: Arc<dyn CronRepo> = Arc::new(TursoCronRepo::new(db.clone()));
         let memory: Arc<dyn MemoryRepo> = Arc::new(TursoMemoryRepo::new(db.clone()));
@@ -539,15 +523,6 @@ impl GatewayState {
         #[cfg(not(any(test, feature = "test-support")))]
         let turn_ledger = Arc::clone(&routed) as Arc<dyn Ledger>;
 
-        // **一份 engine，两处用**：executor 判每一次调用，热重载换的是同一处的规则表
-        // （§3：Policy 每次决策读规则，不缓存）。各造一份的写法会让 `policy.toml` 改完
-        // 只有快照变了、判决还是旧的——"改 policy 不用重启"就成了假话。
-        let policy = Arc::new(
-            PolicyEngine::from_rules(snapshot.policy.clone())
-                // §8.10 第 4 条：komo 自己的状态不许被工具写（`sessions/`、`state.db`、
-                // `runtime/`、`.env`）。**缺省空名单 = 那条规则永不命中**。
-                .with_protection(protected_paths(&snapshot, &home)),
-        );
         // §5.6 的目录行：注册表**启动时按快照造一份**，那一块文本按用途现渲染（系统提示
         // 一处、`skill://` 的挂载点一处）——两处同源，不会有"提示里有、读不到"这种事。
         let tool_names: Vec<String> = tools.iter().map(|tool| tool.definition().name).collect();
@@ -560,8 +535,6 @@ impl GatewayState {
                 tools,
                 Arc::clone(&turn_ledger),
                 Arc::clone(&outputs),
-                ApprovalGate::new(Arc::clone(&approval_repo), Arc::clone(&clock)),
-                policy.as_ref().clone(),
                 Arc::clone(&clock),
             )
             .with_codemode(codemode),
@@ -581,7 +554,6 @@ impl GatewayState {
             GatewaySegments::new(
                 Arc::clone(&routed),
                 db.clone(),
-                Arc::clone(&approval_repo),
                 RecoveryStore::new(db.clone(), sessions_root.clone()),
                 snapshot.paths.workspaces_dir.clone(),
                 max_rounds,
@@ -649,8 +621,6 @@ impl GatewayState {
             turn_ledger,
             outputs,
             queue,
-            approvals,
-            approval_repo,
             cron,
             memory,
             memories,
@@ -663,12 +633,11 @@ impl GatewayState {
             scheduler,
             handler,
             in_flight,
-            policy,
             segments,
             supervisor: Arc::new(super::channels::ChannelSupervisor::new(factories)),
             inbound: std::sync::OnceLock::new(),
             watching: Mutex::new(std::collections::BTreeSet::new()),
-            approvals_delivered: Mutex::new(std::collections::BTreeSet::new()),
+            interventions_delivered: Mutex::new(std::collections::BTreeSet::new()),
             tool_names,
             tool_executor: executor_tools,
             skills,
@@ -742,7 +711,7 @@ impl GatewayState {
 
     /// 这一轮扫描投出去的每一次触发都找个人盯着（§10 的最后两步）。
     ///
-    /// Cron 没有来源会话，所以"等待审批"这条路只能从这里投到 home chat——不盯着，
+    /// Cron 没有来源会话，所以"需要人处理"这条路只能从这里投到 home chat——不盯着，
     /// 一个 Cron Run 会停在等待上而没有人知道它在等（§7.4 / §11.4）。
     pub async fn watch_fired(self: &Arc<Self>, fired: &[komo_runtime::scheduler::Fired]) {
         for one in fired {
@@ -767,13 +736,13 @@ impl GatewayState {
 
     /// 这个句柄的 Intervention 还没被投出去过。答 `false` = 投过了（同一条只问一次人）。
     pub fn start_delivering_intervention(&self, handle: &str) -> bool {
-        self.approvals_delivered
+        self.interventions_delivered
             .lock()
             .expect("投递表")
             .insert(handle.to_string())
     }
 
-    /// 盯一个交互 Run：终态回到来源会话，等待审批 / 需要处理投来源会话 + home chat
+    /// 盯一个交互 Run：终态回到来源会话，需要处理投来源会话 + home chat
     /// （§11.4）。`peer` 为 `None` 就是 TUI / HTTP——那时只有 home chat。
     pub fn watch_interactive_run(
         self: &Arc<Self>,
@@ -833,8 +802,6 @@ impl GatewayState {
                 Arc::clone(&self.in_flight),
             )),
             Arc::clone(&self.outputs),
-            Arc::clone(&self.approval_repo),
-            Arc::clone(&self.clock),
             self.executor.clone(),
             Arc::new(komo_runtime::recovery::LockHolderLiveness::holding_lock(
                 self.executor.clone(),
@@ -982,7 +949,7 @@ impl GatewayState {
     /// 依据：恢复时按它装配，**不拿当前配置去覆盖它**。
     ///
     /// 落在快照里的每一样都在这一步定死，理由是它们**都可能在中途被改**：Profile 的指令、
-    /// 工具表、工作目录、模型 alias。审批可能一小时之后才答复，而那时这些文件与配置都可能
+    /// 工具表、工作目录、模型 alias。介入可能一小时之后才答复，而那时这些文件与配置都可能
     /// 已经变过——恢复出来的 Run 不能因此换一副面孔。
     async fn freeze_run(
         &self,
@@ -1041,7 +1008,7 @@ impl GatewayState {
         let model = model.unwrap_or_else(|| self.agent_model(config, profile));
 
         // 身份指令正文**进 `PayloadStore`**，快照里只留引用（§4.3）：存的是内容，不是
-        // 文件路径——审批期间配置文件可能已经被改过，恢复出来的 Run 不能换一副面孔。
+        // 文件路径——等待期间配置文件可能已经被改过，恢复出来的 Run 不能换一副面孔。
         // `PayloadStore` 是内容寻址的，同一段正文重复受理只写一次。
         let instructions_ref = match &profile.instructions {
             Some(text) => Some(
@@ -1107,7 +1074,7 @@ impl GatewayState {
         }
         // **受理这一刻冻结身份与能力**（§4.3）：哪个 Agent（这个会话的归属）、哪一版
         // Profile、哪个模型、哪个工作目录、这次允许调用的工具、身份指令正文、记忆作用域。
-        // 它随 `run.accepted` 落账，恢复时按它装配——审批期间 Profile 被改过也换不掉
+        // 它随 `run.accepted` 落账，恢复时按它装配——等待期间 Profile 被改过也换不掉
         // 这一条 Run 的面孔。
         let config = self.snapshot();
         let record = komo_store::repos::session::get(&self.db, session).await?;
@@ -1152,7 +1119,7 @@ impl GatewayState {
         // 器就能把它领走，而那一步是"越过前面那条"——正是次序规则要防的事。一处事实一个
         // 写者，所以这里只**如实地把它读回来**。
         self.waker().wake();
-        // 有人看着它：终态回到来源会话，停下来等审批时把那条审批投出去（§11.4）。
+        // 有人看着它：终态回到来源会话，停下来要人处理时把那条介入投出去（§11.4）。
         // 重发命中原 Run 时不再起第二个看客——登记表也会挡住，这里先省一次 spawn。
         if !accepted.deduplicated {
             self.watch_interactive_run(&accepted.session, &accepted.run, peer);
@@ -1189,207 +1156,6 @@ impl GatewayState {
             // 放过它：这一拍的对账会补上（§8.9 的第三步）。
             Err(error) => tracing::warn!(%error, "放行依赖没做成，等下一拍对账"),
         }
-    }
-
-    /// 记一个审批决定，并把等着它的 Run 放回队列。
-    ///
-    /// **重复回答幂等**：已决定的返回原决定（§11.3）。已经决定过的那一次不再叫醒调度器
-    /// ——它早就被叫醒过了。
-    pub async fn decide_approval(
-        &self,
-        approval: &ApprovalId,
-        approved: bool,
-        scope: ApprovalScope,
-        by: Option<PeerId>,
-    ) -> Result<ApprovalDecisionResponse, GatewayError> {
-        let record =
-            self.approval_repo
-                .get(approval)
-                .await?
-                .ok_or_else(|| GatewayError::NotFound {
-                    what: format!("审批 {approval}"),
-                })?;
-        // 范围授权（§7.2 的第二、第三种）：先把**范围**落成一条授权，再把决定写下来并
-        // 指着它。顺序是这一边的：一条写不下的授权只该让这次批准**降级成 `Once`**，
-        // 不该让批准本身失败——操作者已经说了"可以"，而一条授权写不下去不改变这件事。
-        //
-        // 落不成范围的（计划里没有 Run、在交互 Run 里说 `cron`、Policy 根本没给这个
-        // 范围）一律按 `Once` 处理，**不静默放宽**：一句说错的话不该变成一条比它宽的
-        // 授权。
-        let grant = if approved && scope != ApprovalScope::Once {
-            self.mint_grant(&record, scope).await
-        } else {
-            None
-        };
-        let response = self
-            .approvals
-            .decide_with_grant(approval, approved, scope, by, grant)
-            .await
-            .map_err(GatewayError::from)?;
-
-        if !response.already_decided {
-            self.hub.publish_decision(
-                &record.session,
-                approval,
-                response.decision.approved,
-                komo_kernel::types::ids::Seq::ZERO,
-            );
-            // 界面回写：**决定先落账本，再回写界面**（§11.3）。渠道据此把卡片原地
-            // 更新成"已批准 / 已拒绝 · 谁 · 何时"；投不出去不改变结论。
-            let settled = komo_kernel::types::chat::Outbound::ApprovalSettled {
-                approval: record.approval.clone(),
-                short_id: record.short_id.clone(),
-                approved: response.decision.approved,
-                by: response
-                    .decision
-                    .by
-                    .clone()
-                    .unwrap_or_else(|| PeerId::new("operator")),
-                at: response.decision.decided_at,
-            };
-            self.settle_everywhere(approval, settled).await;
-
-            // §8.5 的**反向补写**：决定的权威是 state.db，审计事件随后补进 JSONL。这里
-            // 只**排队**——补写由启动顺序的第 3 步与后台的周期补写做（§8.7）。
-            //
-            // 不在这里当场补写，是因为审批决定与 Run 的续跑是同一瞬间的事：决定之后
-            // `wake_run` 会让这个 Run 立刻回到队列，而补写是另一次账本写入，插在中间只会
-            // 让"决定"这条路径多一个可能失败的步骤——而它一个字都不该影响决定（§8.2：
-            // 提交即 fsync，审批生效不依赖审计补写成功）。
-            self.enqueue_audit(&record, &response.decision).await;
-
-            if let Some(run) = &record.run {
-                self.wake_run(run).await?;
-            }
-        }
-        Ok(response)
-    }
-
-    /// 操作者答应的那个范围，落成一条授权。
-    ///
-    /// Policy 没在这条请求上给出这个范围就不给——`record.scopes` 是 §11.3 的
-    /// 「只对 Policy 标记为可范围化的计划生效」在代码里的样子。
-    async fn mint_grant(
-        &self,
-        record: &komo_kernel::protocol::http::ApprovalRecord,
-        scope: ApprovalScope,
-    ) -> Option<komo_kernel::policy::Grant> {
-        if !record.scopes.contains(&scope) {
-            tracing::info!(
-                approval = %record.approval,
-                ?scope,
-                "Policy 没给这个范围，按本次调用处理"
-            );
-            return None;
-        }
-        let grant_scope = komo_kernel::policy::scope_for(&record.plan, scope)?;
-        let grant = komo_kernel::policy::Grant {
-            id: komo_kernel::types::ids::GrantId::new_at(self.clock.now()),
-            approval: record.approval.clone(),
-            scope: grant_scope,
-            granted_at: self.clock.now(),
-            // 授权跟着审批本身的有效期走（§8.4：过期不能按旧指令直接产生新的外部影响）。
-            valid_until: record.valid_until,
-            consumed: false,
-            reason: record.reason.clone(),
-        };
-        match self.approval_repo.put_grant(grant).await {
-            Ok(grant) => Some(grant),
-            Err(error) => {
-                tracing::warn!(%error, approval = %record.approval, "范围授权写不下，按本次调用处理");
-                None
-            }
-        }
-    }
-
-    /// 把结论投回**当初投过这条审批的每一个会话**（§11.4）。
-    ///
-    /// 「决定过的请求不该还长着可点的按钮」（§11.3）——请求投到了来源会话**加上** home
-    /// chat，那么结论也要回到这两处，而不是只回其中一处。目标从 `deliveries` 里查：那张
-    /// 表记的正是"当初投到过哪儿"，用它就不必让决定这一侧再猜一遍路由。
-    async fn settle_everywhere(
-        &self,
-        approval: &ApprovalId,
-        settled: komo_kernel::types::chat::Outbound,
-    ) {
-        let mut targets = match self.deliveries.targets_for_approval(approval).await {
-            Ok(targets) => targets,
-            Err(error) => {
-                tracing::warn!(%error, "查不到这条审批投过哪儿，只回写 home chat");
-                Vec::new()
-            }
-        };
-        // home chat 永远补一份：它可能是在请求之后才配上的。
-        for target in self.notifier.home_targets() {
-            if !targets.contains(&target.peer) {
-                targets.push(target.peer);
-            }
-        }
-        if targets.is_empty() {
-            tracing::debug!(%approval, "没有可回写的会话，跳过界面回写");
-            return;
-        }
-        for peer in targets {
-            if let Err(error) = self
-                .notifier
-                .log()
-                .deliver(
-                    &komo_kernel::types::chat::DeliveryTarget::to_peer(peer.clone()),
-                    settled.clone(),
-                )
-                .await
-            {
-                // 界面回写失败**不改变结论**（§11.3）。
-                tracing::debug!(%error, %peer, "结论回写投不出去");
-            }
-        }
-    }
-
-    /// 把一条 `approval.decided` 排进 `control_outbox`（§8.5 的反向顺序第一步）。
-    async fn enqueue_audit(
-        &self,
-        record: &ApprovalRecord,
-        decision: &komo_kernel::protocol::http::ApprovalDecisionRecord,
-    ) {
-        let event_id = komo_kernel::types::ids::EventId::new_at(decision.decided_at);
-        let payload = komo_kernel::events::EventPayload::ApprovalDecided(
-            komo_kernel::events::ApprovalDecided {
-                approval: record.approval.clone(),
-                approved: decision.approved,
-                scope: decision.scope,
-                by: decision.by.clone(),
-                decided_at: decision.decided_at,
-                grant: decision.grant.clone(),
-            },
-        );
-        let session = record.session.clone();
-        let occurred_at = decision.decided_at;
-        let result = self
-            .db
-            .with_write_retry(move |ex| {
-                let (session, event_id, payload) =
-                    (session.clone(), event_id.clone(), payload.clone());
-                Box::pin(async move {
-                    komo_store::repos::outbox::enqueue_in(
-                        ex,
-                        &session,
-                        &event_id,
-                        payload,
-                        occurred_at,
-                    )
-                    .await
-                }) as komo_store::db::BoxFuture<'_, Result<(), StoreError>>
-            })
-            .await;
-        if let Err(error) = result {
-            // 排不进去只是**审计**补不上，决定本身已经提交了（§8.2：提交即 fsync）。
-            tracing::warn!(%error, approval = %record.approval, "审计事件排不进 outbox");
-            return;
-        }
-        // 与请求那条对称：`approval.decided` 也走补写（§8.5 的反向顺序），而别的界面
-        // （第二个 TUI、聊天里那张卡旁边的会话）正是靠它知道这条已经答过了。等周期就是
-        // 让他们最多晚一分钟才看到结论。
-        self.audit_wake.notify_one();
     }
 
     /// 把 `control_outbox` 里还没补写的审计事件追加到各自 Session 的 JSONL。
@@ -1466,59 +1232,27 @@ impl GatewayState {
                 session = %summary.session,
                 "这一条没人看着，投到 home chat"
             );
-            let failure = match summary.kind {
-                // 审批那一份要按 §11.3 的渲染表呈现：短 ID、计划、原因、范围。
-                InterventionKind::Approval => match self.approval_of(&summary).await {
-                    Ok(Some(record)) => self
-                        .notifier
-                        .deliver_approval(None, komo_runtime::approvals::presentation(&record))
-                        .await
-                        .err()
-                        .map(|error| error.to_string()),
-                    Ok(None) => {
-                        tracing::warn!(handle = %summary.handle, "这条审批读不出权威行，投不出去");
-                        continue;
-                    }
-                    Err(error) => Some(error.to_string()),
-                },
-                // 另外两类是一条"哪里不清楚"的投递（§11.4：三类共用这条到达率）。
-                InterventionKind::Verify | InterventionKind::Blocked => {
-                    let Some(run) = summary.run.clone() else {
-                        continue;
-                    };
-                    self.notifier
-                        .deliver_home_once(
-                            komo_kernel::types::chat::Outbound::NeedsAttention {
-                                session: summary.session.clone(),
-                                run,
-                                reason: summary.question.clone(),
-                            },
-                            &key,
-                        )
-                        .await
-                        .err()
-                        .map(|error| error.to_string())
-                }
+            // 两类都是一条"哪里不清楚"的投递（§11.4：共用这条到达率）。
+            let Some(run) = summary.run.clone() else {
+                continue;
             };
+            let failure = self
+                .notifier
+                .deliver_home_once(
+                    komo_kernel::types::chat::Outbound::NeedsAttention {
+                        session: summary.session.clone(),
+                        run,
+                        reason: summary.question.clone(),
+                    },
+                    &key,
+                )
+                .await
+                .err()
+                .map(|error| error.to_string());
             if let Some(error) = failure {
                 tracing::warn!(%error, handle = %summary.handle, "这条投不出去：没人能回答它");
             }
         }
-    }
-
-    /// 一个审批句柄（短 ID）对应的权威行。
-    async fn approval_of(
-        &self,
-        summary: &InterventionSummary,
-    ) -> Result<Option<ApprovalRecord>, GatewayError> {
-        let Some(short) = komo_kernel::types::ids::ShortId::parse(&summary.handle) else {
-            return Ok(None);
-        };
-        Ok(self
-            .approval_repo
-            .find_latest_by_short_id(&short)
-            .await?
-            .filter(|record| record.decision.is_none()))
     }
 
     /// 把一个等着的 Run 放回队列并叫醒调度器（答复之后、`resume` 之后都走它）。

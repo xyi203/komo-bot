@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use komo_kernel::fold::Surface;
 use komo_kernel::test_support::{ScriptedLlm, sample_model};
-use komo_kernel::traits::{ApprovalRepo, Clock};
+use komo_kernel::traits::Clock;
 use komo_kernel::types::ids::InterventionId;
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
@@ -21,25 +21,16 @@ struct Wired {
 }
 
 impl Wired {
-    fn new(
-        scripts: Vec<Vec<Round>>,
-        tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
-        permissive: bool,
-    ) -> Self {
-        Self::with_llm(Arc::new(ScriptedLlm::new(scripts)), tools, permissive)
+    fn new(scripts: Vec<Vec<Round>>, tools: Vec<Arc<dyn komo_kernel::traits::Tool>>) -> Self {
+        Self::with_llm(Arc::new(ScriptedLlm::new(scripts)), tools)
     }
 
     fn with_llm(
         llm: Arc<dyn komo_kernel::traits::LlmClient>,
         tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
-        permissive: bool,
     ) -> Self {
         let harness = Harness::new();
-        let executor = if permissive {
-            harness.permissive(tools)
-        } else {
-            harness.initial(tools)
-        };
+        let executor = harness.executor(tools);
         let agent = AgentLoop::new(
             llm,
             harness.ledger.clone(),
@@ -80,7 +71,7 @@ fn surface(harness: &Harness) -> Surface {
 /// ⑨ 先 `record_round` 再 `complete`：最终回复必须留在消息面上。
 #[tokio::test]
 async fn the_final_reply_is_recorded_before_the_run_completes() {
-    let wired = Wired::new(vec![vec![round(1, Some("写好了。"), vec![])]], vec![], true);
+    let wired = Wired::new(vec![vec![round(1, Some("写好了。"), vec![])]], vec![]);
     let segment = wired.segment(CancelToken::new()).await;
     let outcome = wired.agent.run(segment).await.unwrap();
 
@@ -121,7 +112,6 @@ async fn tool_results_go_back_to_the_model_keyed_by_call_id() {
             round(2, Some("跑完了。"), vec![]),
         ]],
         vec![tool.clone()],
-        true,
     );
     let segment = wired.segment(CancelToken::new()).await;
     let outcome = wired.agent.run(segment).await.unwrap();
@@ -147,50 +137,9 @@ async fn tool_results_go_back_to_the_model_keyed_by_call_id() {
     );
 }
 
-/// ① `Ask` 之后 Run 让出名额——**不在进程里等人**。
-#[tokio::test]
-async fn an_ask_suspends_the_run_instead_of_waiting_in_process() {
-    let tool = Arc::new(RecordingTool::shell());
-    let wired = Wired::new(
-        vec![vec![round(
-            1,
-            None,
-            vec![call(
-                "pc-1",
-                "shell",
-                serde_json::json!({ "command": "rm -rf /tmp/x" }),
-            )],
-        )]],
-        vec![tool.clone()],
-        false,
-    );
-    let segment = wired.segment(CancelToken::new()).await;
-    let outcome = wired.agent.run(segment).await.unwrap();
-
-    let SegmentOutcome::Suspended { wait, .. } = &outcome else {
-        panic!("{outcome:?}")
-    };
-    assert!(matches!(wait, WaitReason::Approval { .. }), "{wait:?}");
-    assert_eq!(tool.ran(), 0, "批准之前不执行");
-
-    let surface = surface(&wired.harness);
-    let run = surface.runs.values().next().unwrap();
-    assert_eq!(run.status, RunState::Waiting, "停着");
-    assert!(
-        matches!(run.wait, Some(WaitReason::Approval { .. })),
-        "而且说得出在等一条审批：{:?}",
-        run.wait
-    );
-    // 待处理的审批在数据库里，**不是**折出来的：JSONL 里的审批事件是审计补写
-    // （§8.5 的反向顺序），它不创建授权，也不由 executor 写。
-    let pending = wired.harness.approvals.list_pending(None).await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].plan.tool, "shell");
-}
-
 /// 委派：父 Run 停在 `dependency` 上**让出执行名额**，不在进程里等子 Run。
 ///
-/// 它和"等审批"是同一件事的两种外因：停下来的形状都是 `waiting` + 一条 `WaitReason`，
+/// 它和"等介入"是同一件事的两种外因：停下来的形状都是 `waiting` + 一条 `WaitReason`，
 /// 而"在等谁"由理由说清楚——这里等的是那条子 Run 的终态，没有任何人要回答什么。
 #[tokio::test]
 async fn a_delegated_call_suspends_the_run_on_its_child() {
@@ -205,7 +154,6 @@ async fn a_delegated_call_suspends_the_run_on_its_child() {
             )],
         )]],
         vec![Arc::new(crate::tools::DelegateTool::new())],
-        true,
     );
     let segment = wired.segment(CancelToken::new()).await;
     let parent = segment.run.clone();
@@ -226,7 +174,7 @@ async fn a_delegated_call_suspends_the_run_on_its_child() {
         view.wait,
         Some(WaitReason::Dependency { run: child.clone() })
     );
-    // 子 Run 是一条**普通 Run**：它已经在队列里等 worker，可领取、可审批、可取消，
+    // 子 Run 是一条**普通 Run**：它已经在队列里等 worker，可领取、可取消，
     // 而且带着那份 spec。
     let child_view = &surface.runs[child];
     assert_eq!(child_view.status, RunState::Queued);
@@ -249,7 +197,7 @@ async fn a_tool_failure_is_handed_to_the_model_and_the_run_carries_on() {
         round(2, Some("换个办法。"), vec![]),
     ]));
     let harness = Harness::new();
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let agent = AgentLoop::new(
         llm.clone(),
         harness.ledger.clone(),
@@ -301,7 +249,6 @@ async fn a_driver_error_fails_the_run() {
             vec![call("pc-1", "shell", serde_json::json!({}))],
         )]],
         vec![tool],
-        true,
     );
     let segment = wired.segment(CancelToken::new()).await;
     let outcome = wired.agent.run(segment).await.unwrap();
@@ -323,7 +270,7 @@ async fn a_truncated_reply_never_starts_a_call() {
     let tool = Arc::new(RecordingTool::shell());
     let mut truncated = round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]);
     truncated.truncated = true;
-    let wired = Wired::new(vec![vec![truncated]], vec![tool.clone()], true);
+    let wired = Wired::new(vec![vec![truncated]], vec![tool.clone()]);
     let segment = wired.segment(CancelToken::new()).await;
     let outcome = wired.agent.run(segment).await.unwrap();
 
@@ -342,7 +289,7 @@ async fn the_round_budget_ends_in_a_failure_not_a_loop() {
         .map(|n| round(n, None, vec![call("pc-1", "shell", serde_json::json!({}))]))
         .collect();
     let harness = Harness::new();
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let agent = AgentLoop::new(
         Arc::new(ScriptedLlm::once(script)),
         harness.ledger.clone(),
@@ -387,7 +334,6 @@ async fn cancelling_ends_the_run_as_cancelled() {
             vec![call("pc-1", "shell", serde_json::json!({}))],
         )]],
         vec![tool.clone()],
-        true,
     );
     let cancel = CancelToken::new();
     cancel.cancel();
@@ -410,7 +356,7 @@ async fn cancelling_ends_the_run_as_cancelled() {
 async fn a_resumed_segment_finishes_the_round_it_came_back_to() {
     let tool = Arc::new(RecordingTool::shell());
     let harness = Harness::new();
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let agent = AgentLoop::new(
         Arc::new(ScriptedLlm::once(vec![round(
             2,
@@ -454,12 +400,16 @@ async fn a_resumed_segment_finishes_the_round_it_came_back_to() {
     assert_eq!(tool.ran(), 1);
 }
 
-/// 续跑时停在审批上：这一段仍然只是让出名额。
+/// 续跑时又停下来（这次结果不明）：这一段仍然只是让出名额。
 #[tokio::test]
 async fn a_resumed_segment_can_suspend_again() {
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(
+        RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
+            message: "响应丢了".into(),
+        })),
+    );
     let harness = Harness::new();
-    let executor = harness.initial(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let agent = AgentLoop::new(
         Arc::new(ScriptedLlm::once(vec![round(
             2,
@@ -500,13 +450,13 @@ async fn a_resumed_segment_can_suspend_again() {
         matches!(
             &outcome,
             SegmentOutcome::Suspended {
-                wait: WaitReason::Approval { .. },
+                wait: WaitReason::Intervention { .. },
                 ..
             }
         ),
         "{outcome:?}"
     );
-    assert_eq!(tool.ran(), 0);
+    assert_eq!(tool.ran(), 1, "跑了一次，结果不明就停，不重试");
 }
 
 /// 结果不明 → 这一段停在 `waiting + intervention`，等人（§8.6）。
@@ -524,7 +474,6 @@ async fn an_uncertain_call_suspends_the_run_for_a_human() {
             vec![call("pc-1", "shell", serde_json::json!({}))],
         )]],
         vec![tool],
-        true,
     );
     let segment = wired.segment(CancelToken::new()).await;
     let outcome = wired.agent.run(segment).await.unwrap();
@@ -560,7 +509,7 @@ async fn an_uncertain_call_suspends_the_run_for_a_human() {
 async fn one_segment_begins_exactly_one_turn() {
     let llm = Arc::new(ScriptedLlm::once(vec![round(1, Some("好。"), vec![])]));
     let harness = Harness::new();
-    let executor = harness.permissive(vec![]);
+    let executor = harness.executor(vec![]);
     let agent = AgentLoop::new(
         llm.clone(),
         harness.ledger.clone(),
@@ -594,7 +543,7 @@ async fn one_segment_begins_exactly_one_turn() {
 async fn the_driver_is_handed_results_paired_by_provider_call_id() {
     let tool = Arc::new(RecordingTool::shell());
     let harness = Harness::new();
-    let executor = harness.permissive(vec![tool]);
+    let executor = harness.executor(vec![tool]);
     let llm = Arc::new(ScriptedLlm::once(vec![
         round(
             1,
@@ -664,7 +613,6 @@ async fn a_tool_output_with_no_preview_still_produces_one() {
             round(2, Some("好。"), vec![]),
         ]],
         vec![tool],
-        true,
     );
     let segment = wired.segment(CancelToken::new()).await;
     wired.agent.run(segment).await.unwrap();
@@ -684,7 +632,7 @@ async fn a_tool_output_with_no_preview_still_produces_one() {
 #[tokio::test]
 async fn a_retryable_model_error_suspends_on_a_backoff_instead_of_failing() {
     let harness = Harness::new();
-    let executor = harness.permissive(vec![]);
+    let executor = harness.executor(vec![]);
     let agent = AgentLoop::new(
         Arc::new(FailingLlm::at_round(
             komo_kernel::types::turn::LlmError::Timeout,
@@ -748,7 +696,7 @@ async fn a_retryable_model_error_suspends_on_a_backoff_instead_of_failing() {
 #[tokio::test]
 async fn an_unknown_model_outcome_is_not_retried() {
     let harness = Harness::new();
-    let executor = harness.permissive(vec![]);
+    let executor = harness.executor(vec![]);
     let agent = AgentLoop::new(
         Arc::new(FailingLlm::at_begin(
             komo_kernel::types::turn::LlmError::Unknown("结果未知".into()),
@@ -782,7 +730,7 @@ async fn an_unknown_model_outcome_is_not_retried() {
 #[tokio::test]
 async fn an_exhausted_retry_budget_ends_in_a_failure() {
     let harness = Harness::new();
-    let executor = harness.permissive(vec![]);
+    let executor = harness.executor(vec![]);
     let agent = AgentLoop::new(
         Arc::new(FailingLlm::at_round(
             komo_kernel::types::turn::LlmError::Timeout,
@@ -829,7 +777,7 @@ async fn an_exhausted_retry_budget_ends_in_a_failure() {
 #[tokio::test]
 async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
     let harness = Harness::new();
-    let executor = harness.permissive(vec![]);
+    let executor = harness.executor(vec![]);
     let agent = AgentLoop::new(
         Arc::new(FailingLlm::at_round(
             komo_kernel::types::turn::LlmError::Timeout,
@@ -909,7 +857,7 @@ async fn a_command_run_never_touches_the_llm_client_and_finishes_with_the_shell_
         artifacts: vec![],
         preview: Some("hi".into()),
     })));
-    let wired = Wired::with_llm(Arc::new(PanickingLlm), vec![tool.clone()], true);
+    let wired = Wired::with_llm(Arc::new(PanickingLlm), vec![tool.clone()]);
     let segment = wired
         .command_segment(
             CancelToken::new(),
@@ -944,7 +892,7 @@ async fn a_non_zero_exit_still_completes_the_run_not_fails_it() {
         artifacts: vec![],
         preview: Some("boom".into()),
     })));
-    let wired = Wired::with_llm(Arc::new(PanickingLlm), vec![tool], true);
+    let wired = Wired::with_llm(Arc::new(PanickingLlm), vec![tool]);
     let segment = wired
         .command_segment(
             CancelToken::new(),
@@ -996,7 +944,7 @@ async fn four_rounds_after(first: Arc<RecordingTool>) -> Vec<komo_kernel::types:
         round(4, None, vec![call("pc-s3", "small", serde_json::json!({}))]),
         round(5, Some("看完了。"), vec![]),
     ]));
-    let wired = Wired::with_llm(llm.clone(), vec![first, small], true);
+    let wired = Wired::with_llm(llm.clone(), vec![first, small]);
     let segment = wired.segment(CancelToken::new()).await;
     let outcome = wired.agent.run(segment).await.unwrap();
     assert!(
@@ -1103,7 +1051,7 @@ mod compaction {
     }
 
     fn wired(llm: Arc<ScriptedLlm>) -> Wired {
-        Wired::with_llm(llm, vec![Arc::new(UpdatePlanTool::new())], true)
+        Wired::with_llm(llm, vec![Arc::new(UpdatePlanTool::new())])
     }
 
     #[tokio::test]
@@ -1184,7 +1132,7 @@ mod compaction {
 
     #[tokio::test]
     async fn cancel_during_summary_cancels() {
-        let wired = Wired::with_llm(Arc::new(HangingLlm), vec![], true);
+        let wired = Wired::with_llm(Arc::new(HangingLlm), vec![]);
         let cancel = CancelToken::new();
         let mut segment = wired.segment(cancel.clone()).await;
         segment.compaction = Some(compaction_job(&segment.session, &segment.run));
@@ -1302,7 +1250,7 @@ mod compaction {
             round(2, None, vec![call("pc-2", "shell", serde_json::json!({}))]),
             round(3, Some("好了。"), vec![]),
         ]]));
-        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![slow], true);
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![slow]);
         let mut segment = wired.segment(CancelToken::new()).await;
         let planner = FakePlanner::new(vec![None, None]);
         segment.compactor = Some(compactor(Arc::clone(&planner)));
@@ -1322,7 +1270,7 @@ mod compaction {
             round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
             round(2, Some("好了。"), vec![]),
         ]]));
-        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![tool], true);
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![tool]);
         let mut segment = wired.segment(CancelToken::new()).await;
         let planner = FakePlanner::new(vec![None]);
         segment.compactor = Some(compactor(Arc::clone(&planner)));
@@ -1364,7 +1312,7 @@ mod compaction {
             ),
             round(3, Some("好了。"), vec![]),
         ]]));
-        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![tool], true);
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![tool]);
         let mut segment = wired.segment(CancelToken::new()).await;
         let planner = FakePlanner::new(vec![None]);
         segment.compactor = Some(crate::agent::Compactor {

@@ -6,12 +6,13 @@
 //! 发消息的那个渠道。修复是启动时对所有未终态、`peer` 非空的交互 Run 重新
 //! `watch_interactive_run`（`service::run_watch::reattach_unfinished`）。
 //!
-//! 这里钉住修复之后的行为：一条 Run 在重启前还没到终态（停在一次 shell 调用的审批上），
-//! 重启、批准、跑完之后，回复原样投到发消息的那个 Telegram 对端——**只投一次**，而且
+//! 这里钉住修复之后的行为：一条 Run 在重启前还没到终态（停在一次"结果不明"的调用上，
+//! 测试工具 `unsure`），重启、核对、跑完之后，回复原样投到发消息的那个 Telegram 对端——**只投一次**，而且
 //! 不是投给重启前那个发送口（完成发生在重启之后）。
 
 use std::sync::Arc;
 
+use komo_gateway::service::test_support::Unsure;
 use komo_kernel::traits::{Inbound, LlmClient};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Outbound};
 use komo_kernel::types::status::{RunState, WaitReason};
@@ -22,17 +23,14 @@ use crate::harness::*;
 async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_once() {
     let home = Home::new();
     let first_sender = MemSender::new(ChannelPlatform::Telegram);
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
 
-    // 第一段脚本：要跑一次 shell → 停在审批上。重启前这条 Run 必须还没到终态，否则测不出
+    // 第一段脚本：调一次 `unsure` → 停在一条 `verify` 上。重启前这条 Run 必须还没到终态，否则测不出
     // "看客只活在内存里"这条修复——已经终态的 Run 由 §11.4 的补发（`deliveries` 表）兜底，
     // 那是另一条已经有的路。
     let llm = FakeLlm::new(vec![vec![
-        call_round(
-            1,
-            "pc-1",
-            "shell",
-            serde_json::json!({"command": "echo hi"}),
-        ),
+        call_round(1, "pc-1", "unsure", serde_json::json!({})),
         text_round(2, "跑完了。"),
     ]]);
     let gw = home
@@ -60,20 +58,11 @@ async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_on
         panic!("这条消息该排进一个 Run：{ack:?}");
     };
 
-    let pending = gw.wait_approval().await;
-    assert_eq!(
-        pending.run.as_ref(),
-        Some(&run),
-        "停的是这条 Run 里那次 shell 调用"
-    );
-    // 审批先落库、Run 后挂起（两次写），所以看见审批不等于 Run 已经停下：等它停稳。
-    assert_eq!(
-        gw.wait_waiting(&run).await,
-        WaitReason::Approval {
-            approval: pending.approval.clone()
-        },
+    assert!(
+        matches!(gw.wait_waiting(&run).await, WaitReason::Intervention { .. }),
         "重启前这条 Run 还没到终态——这正是要测的那个窗口"
     );
+    let pending = gw.wait_intervention(&run).await;
 
     // "重启"：停机，同一个数据目录再起一台。看客只活在上一台的内存里，这一下就是丢掉它。
     gw.stop().await;
@@ -82,13 +71,13 @@ async fn a_chat_run_in_flight_across_a_restart_still_gets_its_reply_delivered_on
         .start_with(FakeLlm::finisher("跑完了。"), Arc::clone(&second_sender))
         .await;
 
-    // 重启后这条审批还在等——同一条、同一个短 ID，账本没有因为重启换一副面孔。
-    let still = gw.approvals().await;
+    // 重启后这条介入还在等——同一条、同一个句柄，账本没有因为重启换一副面孔。
+    let still = gw.interventions().await;
     assert_eq!(still.len(), 1, "{still:?}");
-    assert_eq!(still[0].approval, pending.approval, "还是原来那一条审批");
+    assert_eq!(still[0].handle, pending.handle, "还是原来那一条");
 
-    // 批准它，让 Run 继续跑到完成。
-    gw.decide(&pending.approval, true).await;
+    // 核对它，让 Run 继续跑到完成。
+    gw.answer(&pending.handle, "satisfied").await;
     let detail = gw.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -132,7 +121,9 @@ async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
     let home = Home::new();
     let sender = MemSender::new(ChannelPlatform::Telegram);
 
-    // home 那一段调 `dispatch` 后收尾；任务那一段调 shell，停在审批上。
+    // home 那一段调 `dispatch` 后收尾；任务那一段调 `unsure`，停在一条 `verify` 上。
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
     let llm = FakeLlm::new(vec![
         vec![
             call_round(
@@ -144,12 +135,7 @@ async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
             text_round(2, "已派出。"),
         ],
         vec![
-            call_round(
-                1,
-                "pc-shell",
-                "shell",
-                serde_json::json!({"command": "echo hi"}),
-            ),
+            call_round(1, "pc-unsure", "unsure", serde_json::json!({})),
             text_round(2, "跑完了。"),
         ],
     ]);
@@ -161,14 +147,12 @@ async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
     let submitted = gw.submit(&home_session, "tui-1", "派个任务跑 echo").await;
     gw.wait_terminal(&submitted.run).await;
 
-    let pending = gw.wait_approval().await;
-    let task_run = pending.run.clone().expect("审批挂在任务的 Run 上");
-    assert_eq!(
+    let pending = wait_any_intervention(&gw).await;
+    let task_run = pending.run.clone().expect("介入挂在任务的 Run 上");
+    assert!(matches!(
         gw.wait_waiting(&task_run).await,
-        WaitReason::Approval {
-            approval: pending.approval.clone()
-        }
-    );
+        WaitReason::Intervention { .. }
+    ));
 
     gw.stop().await;
     let gw = home
@@ -178,7 +162,7 @@ async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
         )
         .await;
 
-    gw.decide(&pending.approval, true).await;
+    gw.answer(&pending.handle, "satisfied").await;
     let detail = gw.wait_terminal(&task_run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -199,4 +183,16 @@ async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
     };
     let relayed = gw.wait_terminal(&report).await;
     assert_eq!(relayed.summary.state, RunState::Completed, "{relayed:?}");
+}
+
+/// 等清单里出现随便哪一条介入（最多 20 秒）。
+async fn wait_any_intervention(gw: &Gw) -> komo_kernel::protocol::http::InterventionSummary {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        if let Some(found) = gw.interventions().await.into_iter().next() {
+            return found;
+        }
+        assert!(std::time::Instant::now() < deadline, "等了 20 秒也没有介入");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }

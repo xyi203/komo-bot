@@ -3,7 +3,7 @@
 //! 两个持久化边界，各自是真的落盘，但**合起来不是一个跨文件原子事务**（§8.2）：
 //!
 //! - **Session 目录**是内容的权威。每一步先 `sync_all` 再往下走。
-//! - **state.db**（Turso，MVCC）是调度与授权的权威。提交即 fsync。
+//! - **state.db**（Turso，MVCC）是调度的权威。提交即 fsync。
 //!
 //! 所以写入顺序永远是 §8.5 的那条箭头：**外置正文（如有）→ JSONL 追加并同步 →
 //! 数据库事务**。[`coordinator::Coordinator`] 的每个方法内部完成这一顺序，它是
@@ -31,7 +31,6 @@ pub use checkpoint::{CheckpointRecord, CheckpointStore};
 pub use coordinator::Coordinator;
 pub use db::{Db, DbOptions, RetryConfig};
 pub use payloads::PayloadStore;
-pub use repos::approvals::TursoApprovalRepo;
 pub use repos::cron::TursoCronRepo;
 pub use repos::deliveries::{DeliveryRecord, TursoDeliveryRepo};
 pub use repos::interventions::{BlockedRun, UncertainCall};

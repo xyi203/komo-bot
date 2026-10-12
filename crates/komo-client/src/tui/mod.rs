@@ -5,7 +5,6 @@
 //! 效果打到 HTTP 上，把服务端的回答喂回去。三者之间只有值，没有互相调用。
 
 pub mod app;
-pub mod approval;
 pub mod command;
 pub mod markdown;
 pub mod model_picker;
@@ -37,8 +36,7 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use komo_kernel::protocol::http::{
     BoundaryRequest, CancelRunRequest, CreateSessionRequest, EventQuery, InterventionAnswerRequest,
-    InterventionBatchAnswerRequest, InterventionDetail, InterventionListQuery, ResumeRequest,
-    SubmitRunRequest,
+    InterventionListQuery, ResumeRequest, SubmitRunRequest,
 };
 use komo_kernel::protocol::sse::Cursor;
 use komo_kernel::types::ids::{SessionId, uuid_v7_at};
@@ -181,6 +179,9 @@ pub async fn run_tui(
                 }
                 Stream::Frame(SseMessage::Skipped { id, reason }) => {
                     app.apply(ServerEvent::FrameSkipped { id, reason });
+                }
+                Stream::Frame(SseMessage::Retired { id }) => {
+                    app.apply(ServerEvent::FrameRetired { id });
                 }
                 Stream::Connection(state) => {
                     app.apply(ServerEvent::Connection(state));
@@ -413,48 +414,18 @@ async fn run_effect(
                 "还没有会话：/new 先要有第一条消息".into(),
             )),
         },
-        Effect::FetchApproval(handle) => match client.intervention(&handle).await {
-            // 详情只有审批那一种会弹窗：另两类在清单、状态行与提示行里说得出路（§7.5）。
-            Ok(InterventionDetail::Approval(record)) => Some(ServerEvent::Approval(record)),
-            Ok(other) => Some(ServerEvent::Failed(format!(
-                "{handle} 不是一条审批（{}），没有可打开的弹窗",
-                match other {
-                    InterventionDetail::Approval(_) => unreachable!("上面已经取走了"),
-                    InterventionDetail::Verify { .. } => "结果不明",
-                    InterventionDetail::Blocked { .. } => "阻塞",
-                }
-            ))),
-            Err(error) => Some(ServerEvent::Failed(format!("取详情失败：{error}"))),
-        },
         Effect::Answer {
             handle,
             verdict,
-            scope,
             request_key,
         } => {
             let request = InterventionAnswerRequest {
                 verdict,
-                scope,
                 request_key: Some(request_key),
             };
             match client.answer_intervention(&handle, &request).await {
                 Ok(response) => Some(ServerEvent::Answered(Box::new(response))),
                 Err(error) => Some(ServerEvent::Failed(format!("答复失败：{error}"))),
-            }
-        }
-        Effect::AnswerMany {
-            handles,
-            approved,
-            request_key,
-        } => {
-            let request = InterventionBatchAnswerRequest {
-                handles,
-                approved,
-                request_key: Some(request_key),
-            };
-            match client.answer_interventions(&request).await {
-                Ok(response) => Some(ServerEvent::BatchAnswered(Box::new(response))),
-                Err(error) => Some(ServerEvent::Failed(format!("批量答复失败：{error}"))),
             }
         }
         Effect::FetchPending => match client

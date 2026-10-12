@@ -8,17 +8,16 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use komo_kernel::protocol::http::{ApprovalDecisionRecord, ApprovalRecord};
-use komo_kernel::test_support::{MemApprovalRepo, MemLedger, MemOutputStore, TestClock};
-use komo_kernel::traits::{ApprovalRepo, Ledger, OutputWriter, ToolOutputStore};
-use komo_kernel::types::chat::ApprovalScope;
-use komo_kernel::types::ids::{ApprovalId, RequestKey, ShortId, ToolCallId};
+use komo_kernel::test_support::{MemLedger, MemOutputStore, TestClock};
+use komo_kernel::traits::{Ledger, OutputWriter, ToolOutputStore};
+use komo_kernel::types::ids::{RequestKey, ToolCallId};
 use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::refs::{
     AttemptRef, ContentRef, OutputRef, ToolResultBody, ToolResultStatus,
 };
 use komo_kernel::types::status::{RetryCause, RunEnd, RunState, SessionState, WaitReason};
 use komo_kernel::types::turn::{AcceptInput, AssistantRound, ToolCallRequest};
+use time::OffsetDateTime;
 use time::macros::datetime;
 
 use super::*;
@@ -241,9 +240,8 @@ impl Ledger for PoisonedLedger {
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grants: komo_kernel::types::turn::GrantUses,
     ) -> Result<komo_kernel::types::ids::AttemptId, LedgerError> {
-        self.inner.start_call(call, plan, grants).await
+        self.inner.start_call(call, plan).await
     }
     async fn finish_call(
         &self,
@@ -372,8 +370,6 @@ impl ToolOutputStore for LostOutputs {
 struct World {
     ledger: Arc<MemLedger>,
     outputs: Arc<MemOutputStore>,
-    approvals: Arc<MemApprovalRepo>,
-    clock: TestClock,
     session: SessionId,
 }
 
@@ -383,8 +379,6 @@ impl World {
         World {
             ledger: Arc::new(MemLedger::new(clock.clone())),
             outputs: Arc::new(MemOutputStore::new()),
-            approvals: Arc::new(MemApprovalRepo::new()),
-            clock,
             session: SessionId::from_raw("01a0a414-7800-7bbd-8fa1-632b66973666"),
         }
     }
@@ -512,8 +506,6 @@ impl World {
             ledger,
             Arc::clone(&index) as Arc<dyn RecoveryIndex>,
             outputs,
-            Arc::clone(&self.approvals) as Arc<dyn ApprovalRepo>,
-            Arc::new(self.clock.clone()),
             ExecutorId::from_raw("exec-now"),
             Arc::new(FakeLiveness(previous_stopped)),
         )
@@ -627,11 +619,7 @@ async fn row_5_the_result_is_on_disk_and_verified_while_the_database_lags() {
     let calls = world.round(&run, &["call-1"]).await;
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
-    let attempt = world
-        .ledger
-        .start_call(&calls[0], &plan, Default::default())
-        .await
-        .unwrap();
+    let attempt = world.ledger.start_call(&calls[0], &plan).await.unwrap();
 
     let writer = world
         .outputs
@@ -700,11 +688,7 @@ async fn row_7_the_call_started_and_left_no_result() {
     let calls = world.round(&run, &["call-1"]).await;
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
-    world
-        .ledger
-        .start_call(&calls[0], &plan, Default::default())
-        .await
-        .unwrap();
+    world.ledger.start_call(&calls[0], &plan).await.unwrap();
 
     let (scan, _index) = world.scan(vec![world.run_row(&run, RunState::Running)]);
     let report = scan.scan().await.unwrap();
@@ -717,171 +701,30 @@ async fn row_7_the_call_started_and_left_no_result() {
     );
 }
 
-/// 第 8 行：等待审批 → 保留原请求；已答复且仍有效的自动接续，**不因重启再问一次**。
+/// 第 8 行（审批删掉之后，§7，2026-10-11）：删审批之前停在审批上的旧 Run，调用只落了
+/// 计划、没有 start——按"批准"续跑：与第 6 行同一条路径，自动执行原计划，不问任何人。
 #[tokio::test]
-async fn row_8_waiting_on_an_approval() {
-    let approval = ApprovalId::from_raw("ap-1");
-
-    // (a) 还没人答。
+async fn row_8_a_legacy_approval_wait_resumes_its_planned_call() {
     let world = World::new();
     let run = world.accept().await;
-    world
-        .ledger
-        .suspend(
-            &run,
-            WaitReason::Approval {
-                approval: approval.clone(),
-            },
-        )
-        .await
-        .unwrap();
-    world
-        .approvals
-        .create(approval_record(&approval, &world.session, &run, None))
-        .await
-        .unwrap();
+    let calls = world.round(&run, &["call-1"]).await;
+    let plan = world.plan(&calls[0]);
+    world.ledger.plan_call(&calls[0], &plan).await.unwrap();
+    let legacy = WaitReason::Approval {
+        approval: "ap-1".into(),
+    };
+    world.ledger.suspend(&run, legacy.clone()).await.unwrap();
 
-    let (scan, index) = world.scan(vec![world.waiting_row(
-        &run,
-        WaitReason::Approval {
-            approval: approval.clone(),
-        },
-    )]);
+    let (scan, index) = world.scan(vec![world.waiting_row(&run, legacy)]);
     let report = scan.scan().await.unwrap();
     assert_eq!(
         report.outcomes[0].action,
-        RecoveryAction::KeepWaiting {
-            reason: WaitReason::Approval {
-                approval: approval.clone()
-            }
+        RecoveryAction::ExecutePlannedCall {
+            call: calls[0].clone()
         }
     );
-    assert!(index.requeued().is_empty());
-    assert_eq!(report.summary(), "1 个在等待（审批 / 干预 / 退避）");
-
-    // (b) 答了，而且还有效。
-    let world = World::new();
-    let run = world.accept().await;
-    world
-        .ledger
-        .suspend(
-            &run,
-            WaitReason::Approval {
-                approval: approval.clone(),
-            },
-        )
-        .await
-        .unwrap();
-    world
-        .approvals
-        .create(approval_record(
-            &approval,
-            &world.session,
-            &run,
-            Some(ApprovalDecisionRecord {
-                approved: true,
-                scope: ApprovalScope::Once,
-                by: None,
-                decided_at: NOW,
-                grant: None,
-                consumed: false,
-            }),
-        ))
-        .await
-        .unwrap();
-
-    let (scan, index) = world.scan(vec![world.waiting_row(
-        &run,
-        WaitReason::Approval {
-            approval: approval.clone(),
-        },
-    )]);
-    let report = scan.scan().await.unwrap();
-    assert_eq!(
-        report.outcomes[0].action,
-        RecoveryAction::ResumeWithDecision {
-            approval: approval.clone(),
-            approved: true
-        },
-        "审批无需用户因重启再答一次"
-    );
     assert_eq!(index.requeued(), vec![run]);
-
-    // (c) 答了，但已经过期 → 重新审核。
-    let world = World::new();
-    let run = world.accept().await;
-    world
-        .ledger
-        .suspend(
-            &run,
-            WaitReason::Approval {
-                approval: approval.clone(),
-            },
-        )
-        .await
-        .unwrap();
-    let mut expired = approval_record(
-        &approval,
-        &world.session,
-        &run,
-        Some(ApprovalDecisionRecord {
-            approved: true,
-            scope: ApprovalScope::Once,
-            by: None,
-            decided_at: NOW - time::Duration::hours(2),
-            grant: None,
-            consumed: false,
-        }),
-    );
-    expired.valid_until = Some(NOW - time::Duration::hours(1));
-    world.approvals.create(expired).await.unwrap();
-
-    let (scan, index) = world.scan(vec![world.waiting_row(
-        &run,
-        WaitReason::Approval {
-            approval: approval.clone(),
-        },
-    )]);
-    let report = scan.scan().await.unwrap();
-    assert!(
-        matches!(
-            report.outcomes[0].action,
-            RecoveryAction::WaitingForOperator { .. }
-        ),
-        "{:?}",
-        report.outcomes[0]
-    );
-    assert_eq!(index.attention().len(), 1);
-}
-
-/// 表外但同段规定：数据库里没有这条审批 → 请操作者重答，审计副本不能创建授权。
-#[tokio::test]
-async fn an_approval_the_database_lost_asks_the_operator_again() {
-    let world = World::new();
-    let run = world.accept().await;
-    world
-        .ledger
-        .suspend(
-            &run,
-            WaitReason::Approval {
-                approval: ApprovalId::from_raw("ap-gone"),
-            },
-        )
-        .await
-        .unwrap();
-
-    let (scan, index) = world.scan(vec![world.waiting_row(
-        &run,
-        WaitReason::Approval {
-            approval: ApprovalId::from_raw("ap-gone"),
-        },
-    )]);
-    let report = scan.scan().await.unwrap();
-    let RecoveryAction::WaitingForOperator { reason } = &report.outcomes[0].action else {
-        panic!("{:?}", report.outcomes[0])
-    };
-    assert!(reason.contains("审计副本"), "{reason}");
-    assert_eq!(index.attention()[0].1, *reason);
+    assert!(index.attention().is_empty(), "不交给人：没有审批可答了");
 }
 
 /// 第 9 行：等待退避 → 沿用已保存的次数与时间，**重启不重置预算**。
@@ -1168,11 +1011,7 @@ async fn a_missing_output_body_stops_the_task_instead_of_rerunning_it() {
     let calls = world.round(&run, &["call-1"]).await;
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
-    let attempt = world
-        .ledger
-        .start_call(&calls[0], &plan, Default::default())
-        .await
-        .unwrap();
+    let attempt = world.ledger.start_call(&calls[0], &plan).await.unwrap();
     world
         .ledger
         .finish_call(
@@ -1209,11 +1048,7 @@ async fn an_altered_output_body_stops_the_task_too() {
     let calls = world.round(&run, &["call-1"]).await;
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
-    let attempt = world
-        .ledger
-        .start_call(&calls[0], &plan, Default::default())
-        .await
-        .unwrap();
+    let attempt = world.ledger.start_call(&calls[0], &plan).await.unwrap();
     // 真的发布过一份，但事件里记的哈希对不上（正文被改过）。
     let writer = world
         .outputs
@@ -1302,31 +1137,6 @@ async fn an_empty_database_reports_nothing_to_do() {
     let report = scan.scan().await.unwrap();
     assert!(report.outcomes.is_empty());
     assert_eq!(report.summary(), "没有未完成的任务");
-}
-
-fn approval_record(
-    approval: &ApprovalId,
-    session: &SessionId,
-    run: &RunId,
-    decision: Option<ApprovalDecisionRecord>,
-) -> ApprovalRecord {
-    let plan = komo_kernel::test_support::sample_plan("shell", session);
-    ApprovalRecord {
-        approval: approval.clone(),
-        short_id: ShortId::from_index(1),
-        session: session.clone(),
-        run: Some(run.clone()),
-        call: None,
-        plan_hash: plan.plan_hash(),
-        plan,
-        reason: "危险操作".into(),
-        changes: None,
-        evidence: None,
-        scopes: vec![ApprovalScope::Once],
-        requested_at: NOW,
-        valid_until: None,
-        decision,
-    }
 }
 
 fn published_pointing_at(path: &str) -> komo_kernel::types::refs::PublishedOutput {
@@ -1435,11 +1245,7 @@ async fn an_orphan_output_is_verified_and_its_result_is_backfilled() {
     let calls = world.round(&run, &["call-1"]).await;
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
-    let attempt = world
-        .ledger
-        .start_call(&calls[0], &plan, Default::default())
-        .await
-        .unwrap();
+    let attempt = world.ledger.start_call(&calls[0], &plan).await.unwrap();
     // 工具跑完了，output.json 完整落盘——**但 tool.result 没写就崩了**。
     let published = world.publish(&run, &calls[0], &attempt).await;
     assert!(tool_results(&world).is_empty(), "结果事件尚未写入");
@@ -1493,11 +1299,7 @@ async fn an_output_from_another_attempt_is_corruption_not_evidence() {
     let calls = world.round(&run, &["call-1"]).await;
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
-    let attempt = world
-        .ledger
-        .start_call(&calls[0], &plan, Default::default())
-        .await
-        .unwrap();
+    let attempt = world.ledger.start_call(&calls[0], &plan).await.unwrap();
 
     // 查到的那份 output.json 属于**另一次尝试**。
     let stranger = komo_kernel::types::ids::AttemptId::from_raw("attempt-from-another-life");
@@ -1541,11 +1343,7 @@ async fn without_an_orphan_output_the_call_still_goes_to_the_tools_own_verify() 
     let calls = world.round(&run, &["call-1"]).await;
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
-    world
-        .ledger
-        .start_call(&calls[0], &plan, Default::default())
-        .await
-        .unwrap();
+    world.ledger.start_call(&calls[0], &plan).await.unwrap();
 
     let (scan, index) = world.scan(vec![world.run_row(&run, RunState::Running)]);
     let report = scan.scan().await.unwrap();
@@ -1595,11 +1393,7 @@ async fn a_backfill_that_cannot_be_written_falls_back_to_the_tools_verify() {
     let calls = world.round(&run, &["call-1"]).await;
     let plan = world.plan(&calls[0]);
     world.ledger.plan_call(&calls[0], &plan).await.unwrap();
-    let attempt = world
-        .ledger
-        .start_call(&calls[0], &plan, Default::default())
-        .await
-        .unwrap();
+    let attempt = world.ledger.start_call(&calls[0], &plan).await.unwrap();
     let published = world.publish(&run, &calls[0], &attempt).await;
 
     let orphans = FoundOrphans::with(
@@ -1648,8 +1442,6 @@ async fn a_run_this_process_just_claimed_is_not_judged() {
         Arc::clone(&world.ledger) as Arc<dyn Ledger>,
         Arc::clone(&index) as Arc<dyn RecoveryIndex>,
         Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>,
-        Arc::clone(&world.approvals) as Arc<dyn ApprovalRepo>,
-        Arc::new(world.clock.clone()),
         me.clone(),
         Arc::new(LockHolderLiveness::holding_lock(
             me,

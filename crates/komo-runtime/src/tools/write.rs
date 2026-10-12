@@ -11,8 +11,7 @@ use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
-    ApprovedPlan, ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
-    Verification,
+    ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess, Verification,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::resource::TargetRef;
@@ -20,8 +19,8 @@ use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutpu
 use serde::{Deserialize, Serialize};
 
 use super::fusion::{ThenRun, attach};
+use super::protect::Protected;
 use super::{ExpectedVersion, FileVersion, current, normalized, parse_args, plan_time};
-use crate::toolbox::diff;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WriteArgs {
@@ -45,11 +44,21 @@ pub struct WriteResult {
 }
 
 #[derive(Debug, Default)]
-pub struct WriteTool;
+pub struct WriteTool {
+    /// komo 自己的状态（§8.10）：目标落在这里就在 `prepare` 里拒（[`super::protect`]）。
+    protected: Protected,
+}
 
 impl WriteTool {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// 装上受保护路径名单（数据目录下的 `sessions/`、`state.db`、`runtime/`、`.env`）。
+    /// 不装 = 空名单，什么都不拦。
+    pub fn protecting(mut self, paths: Vec<PathBuf>) -> Self {
+        self.protected = Protected::new(paths);
+        self
     }
 }
 
@@ -85,6 +94,9 @@ impl Tool for WriteTool {
         let mut args: WriteArgs = parse_args(args, "write")?;
         let then_run = args.then_run.take();
         let path = super::paths::resolve(&args.path, &ctx.cwd)?;
+        // 唯一的硬限制（§7）：komo 自己的状态不许改。带 `then_run` 也一样——计划不成立，
+        // 命令就不会跑。
+        self.protected.check(&path)?;
         let mut plan = ExecutionPlan {
             operation_id: OperationId::new_at(plan_time()),
             source: ctx.source.clone(),
@@ -111,12 +123,12 @@ impl Tool for WriteTool {
 
     async fn execute(
         &self,
-        plan: ApprovedPlan,
+        plan: ExecutionPlan,
         _ctx: &ToolContext,
         // 文件工具不产生流式输出：结构化结果由 executor 发布。
         _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
-        let plan = plan.plan();
+        let plan = &plan;
         let args: WriteArgs = parse_args(plan.args.clone(), "write")?;
         let path = target_path(plan)?;
 
@@ -171,68 +183,6 @@ impl Tool for WriteTool {
             .and_then(|target| target.expected_version.clone());
         verify_content(&path, &intended, expected.as_ref())
     }
-
-    /// 与 `execute` 同一道版本核对：执行时会因版本不符失败的计划不给 diff。
-    async fn changes(&self, plan: &ExecutionPlan) -> Option<String> {
-        let args: WriteArgs = parse_args(plan.args.clone(), "write").ok()?;
-        let path = target_path(plan).ok()?;
-        let existing = current(&path).ok()?;
-        if let Err(conflict) = check_version(
-            &path,
-            existing.as_ref().map(|(_, v)| v),
-            args.expected_version.as_ref(),
-        ) {
-            return Some(unrunnable(conflict));
-        }
-        let Some((bytes, _)) = existing else {
-            return proposed(&path, None, &args.content);
-        };
-        match String::from_utf8(bytes) {
-            Ok(before) => proposed(&path, Some(&before), &args.content),
-            Err(_) => Some(format!(
-                "（{} 当前不是 UTF-8 文本，列不出 diff；批准后整份替换成 {} 字节的新内容）",
-                path.display(),
-                args.content.len()
-            )),
-        }
-    }
-}
-
-/// 审批里一份改动最多带这么多字节。渠道各自再截到自己的上限；这一份是给 TUI 与
-/// `komo approval show` 看的，而且要进 state.db 的审批行，所以在源头就截。
-pub const CHANGES_LIMIT: usize = 8 * 1024;
-
-/// 给人看的改动（§11.3）。`before` 为 `None` 是新文件。两边相同就没有 diff 可列。
-pub fn proposed(path: &Path, before: Option<&str>, after: &str) -> Option<String> {
-    let diff = match before {
-        Some(before) => diff::unified(before, after),
-        None => format!("（新建 {}）\n{}", path.display(), diff::unified("", after)),
-    };
-    if diff.is_empty() {
-        return Some("（内容与当前文件相同）".into());
-    }
-    Some(clip(diff))
-}
-
-/// 执行时注定失败的计划：那份 diff 不会发生，只说一句为什么。
-pub fn unrunnable(error: ToolError) -> String {
-    format!("（不列 diff：{error}——执行时会因此失败）")
-}
-
-fn clip(diff: String) -> String {
-    if diff.len() <= CHANGES_LIMIT {
-        return diff;
-    }
-    let mut cut = CHANGES_LIMIT;
-    while !diff.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let head = &diff[..cut];
-    let newline = if head.ends_with('\n') { "" } else { "\n" };
-    format!(
-        "{head}{newline}…（diff 已截断：共 {} 字节，只列前 {cut} 字节）\n",
-        diff.len()
-    )
 }
 
 /// 三种内容，三个结论（§8.6）。
@@ -385,7 +335,7 @@ impl Drop for TempGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context, writer};
+    use crate::tools::test_support::{context, writer};
 
     fn write_result(output: &ToolOutput) -> WriteResult {
         serde_json::from_value(output.result.clone()).expect("write 的结果")
@@ -406,12 +356,7 @@ mod tests {
         assert_eq!(plan.operation, Operation::WriteFile);
         assert_eq!(plan.recovery, RecoveryMode::VerifyTarget);
 
-        let result = write_result(
-            &tool
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = write_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert!(result.created);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("new.txt")).unwrap(),
@@ -433,7 +378,7 @@ mod tests {
             .await
             .unwrap();
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         let ToolError::VersionConflict { path } = &error else {
@@ -465,7 +410,7 @@ mod tests {
             .await
             .unwrap();
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         assert!(
@@ -495,12 +440,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let result = write_result(
-            &tool
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = write_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert!(!result.created);
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
@@ -568,112 +508,86 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_new_file_lists_every_line_as_added() {
+    /// 数据目录与工作区同在一个临时目录下：`home/` 是 komo 的数据目录，`ws/` 是工作区。
+    fn komo_home() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Vec<std::path::PathBuf>,
+    ) {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let tool = WriteTool::new();
-        let plan = tool
-            .prepare(
-                serde_json::json!({ "path": "new.txt", "content": "one\ntwo\n" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let changes = tool.changes(&plan).await.expect("有改动");
-        assert!(changes.starts_with("（新建 "), "{changes}");
-        assert!(changes.contains("+ one\n+ two\n"), "{changes}");
-        assert!(!dir.path().join("new.txt").exists(), "列改动不落盘");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join("sessions")).unwrap();
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        let protected = vec![
+            home.join("sessions"),
+            home.join("state.db"),
+            home.join("runtime"),
+            home.join(".env"),
+        ];
+        (dir, home, protected)
     }
 
+    /// §7 唯一的硬限制：komo 自己的状态不许被 `write` 改，拒在 `prepare`。
     #[tokio::test]
-    async fn an_overwrite_lists_the_diff_against_the_file_on_disk() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
-        let ctx = context(dir.path());
-        let tool = WriteTool::new();
+    async fn writing_into_komos_own_state_is_refused_at_prepare() {
+        let (dir, home, protected) = komo_home();
+        let ctx = context(&dir.path().join("ws"));
+        let tool = WriteTool::new().protecting(protected);
+        for target in [
+            home.join("sessions/x"),
+            home.join("state.db-wal"),
+            home.join(".env"),
+        ] {
+            let error = tool
+                .prepare(
+                    serde_json::json!({ "path": target.display().to_string(), "content": "x" }),
+                    &ctx,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::Denied { .. }), "{error:?}");
+            let text = error.to_string();
+            assert!(text.contains("§8.10"), "{text}");
+            assert!(
+                text.contains(&target.file_name().unwrap().to_string_lossy().to_string()),
+                "理由点名路径：{text}"
+            );
+            assert!(!target.exists() || target.is_dir(), "一个字节都没写");
+        }
+
+        // 工作区照常写。
         let plan = tool
+            .prepare(serde_json::json!({ "path": "a.txt", "content": "x" }), &ctx)
+            .await
+            .unwrap();
+        tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ws/a.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    /// 带 `then_run` 的组合调用：改动那一步落在受保护路径上，整份计划不成立，命令不跑。
+    #[tokio::test]
+    async fn a_fused_write_into_komos_state_never_runs_its_command() {
+        let (dir, home, protected) = komo_home();
+        let ctx = context(&dir.path().join("ws"));
+        let marker = dir.path().join("ws/ran");
+        let error = WriteTool::new()
+            .protecting(protected)
             .prepare(
                 serde_json::json!({
-                    "path": "a.txt",
-                    "content": "new\n",
-                    "expected_version": ContentHash::of_str("old\n").as_str()
+                    "path": home.join(".env").display().to_string(),
+                    "content": "X=1\n",
+                    "then_run": { "command": format!("touch {}", marker.display()) },
                 }),
                 &ctx,
             )
             .await
-            .unwrap();
-        let changes = tool.changes(&plan).await.expect("有改动");
-        assert!(changes.contains("- old\n+ new\n"), "{changes}");
-    }
-
-    #[tokio::test]
-    async fn a_stale_version_gets_a_note_instead_of_a_diff() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
-        let ctx = context(dir.path());
-        let tool = WriteTool::new();
-        let plan = tool
-            .prepare(
-                serde_json::json!({
-                    "path": "a.txt",
-                    "content": "new\n",
-                    "expected_version": ContentHash::of_str("old\n").as_str()
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-
-        // 计划之后有人改了它：执行时会因版本不符失败，这份 diff 不会发生。
-        std::fs::write(dir.path().join("a.txt"), "somebody else\n").unwrap();
-        let changes = tool.changes(&plan).await.expect("有一句说明");
-        assert!(changes.contains("版本冲突"), "{changes}");
-        assert!(!changes.contains("+ new"), "{changes}");
-        assert_eq!(changes.lines().count(), 1, "{changes}");
-    }
-
-    #[tokio::test]
-    async fn a_non_utf8_file_gets_a_note_instead_of_a_diff() {
-        let dir = tempfile::tempdir().unwrap();
-        let bytes = [0xff, 0xfe, 0x00];
-        std::fs::write(dir.path().join("a.bin"), bytes).unwrap();
-        let ctx = context(dir.path());
-        let tool = WriteTool::new();
-        let plan = tool
-            .prepare(
-                serde_json::json!({
-                    "path": "a.bin",
-                    "content": "text\n",
-                    "expected_version": ContentHash::of_bytes(&bytes).as_str()
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let changes = tool.changes(&plan).await.expect("有一句说明");
-        assert!(changes.contains("不是 UTF-8 文本"), "{changes}");
-        assert_eq!(changes.lines().count(), 1, "{changes}");
-    }
-
-    #[tokio::test]
-    async fn a_long_diff_is_clipped_at_the_source_with_a_marker() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let tool = WriteTool::new();
-        // 多字节字符：截断点落不到字符中间。
-        let content = "改动行\n".repeat(CHANGES_LIMIT);
-        let plan = tool
-            .prepare(
-                serde_json::json!({ "path": "big.txt", "content": content }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let changes = tool.changes(&plan).await.expect("有改动");
-        assert!(changes.len() < CHANGES_LIMIT + 200, "{}", changes.len());
-        assert!(changes.contains("diff 已截断"), "{changes}");
-        assert!(changes.ends_with("字节）\n"), "{changes}");
+            .unwrap_err();
+        assert!(matches!(error, ToolError::Denied { .. }), "{error:?}");
+        assert!(!marker.exists(), "命令一次都没跑");
+        assert!(!home.join(".env").exists());
     }
 
     #[test]

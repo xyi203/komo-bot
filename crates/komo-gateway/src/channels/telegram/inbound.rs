@@ -12,13 +12,11 @@ use komo_kernel::protocol::InboundMessage;
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, PeerId};
 use komo_kernel::types::ids::RequestKey;
 
-use super::api::{BotIdentity, CallbackQuery, Message};
-use crate::render::telegram;
+use super::api::{BotIdentity, Message};
 
 /// 去重键：`telegram:{update_id}`。
 ///
-/// 普通消息与 `callback_query` **共用**这一个键：`callback_query` 是 `Update` 的一个
-/// 字段，不是比 `update_id` 更细的投递单位（§11.1、spike callbacks.md 4d）。
+/// `update_id` 就是投递单位（§11.1）：`offset` 未推进时同一个 `Update` 原样再取一次。
 pub fn request_key(update_id: i64) -> RequestKey {
     RequestKey::new(format!("telegram:{update_id}"))
 }
@@ -51,24 +49,6 @@ pub fn from_message(
     })
 }
 
-/// 一次按钮回调。
-///
-/// 负载只用来**定位**：它被映射回那条文本命令，批准与否仍由 Dispatcher 核对 Principal
-/// 后决定（§11.3）。认不出的负载返回 `None`——不编一条命令出来。
-pub fn from_callback(callback: &CallbackQuery, request_key: RequestKey) -> Option<InboundMessage> {
-    let text = telegram::command_for_callback(callback.data.as_deref()?)?;
-    // inline 模式的回调没有 message，也就没有 chat。komo 从不用 inline 模式，所以这
-    // 不是一种要兜的情形，而是一条"不该发生"——硬拼一个占位 chat 才是真的错。
-    let message = callback.message.as_ref()?;
-    Some(InboundMessage {
-        peer: peer_of(message.chat.id),
-        is_private: message.chat.is_private(),
-        sender: PeerId::new(callback.from.id.to_string()),
-        text,
-        request_key,
-    })
-}
-
 pub fn peer_of(chat_id: i64) -> ChannelPeer {
     ChannelPeer::new(ChannelPlatform::Telegram, chat_id.to_string())
 }
@@ -77,7 +57,7 @@ pub fn peer_of(chat_id: i64) -> ChannelPeer {
 ///
 /// 按文本找而不是按 `entities` 的偏移找：`entities` 的 offset 是 **UTF-16 码元**，一条
 /// 中文消息里每算错一次就是切在半个字上；而 `@用户名` 在文本里是唯一的、大小写不敏感
-/// 的 ASCII 串，直接找它不会有这个问题。`/approve@komo_bot 7K2M` 这种把用户名缀在命令
+/// 的 ASCII 串，直接找它不会有这个问题。`/status@komo_bot` 这种把用户名缀在命令
 /// 后面的写法也一并覆盖到了。
 pub fn strip_bot_mention(text: &str, username: &str) -> Option<String> {
     let handle = format!("@{}", username.trim_start_matches('@')).to_ascii_lowercase();
@@ -96,7 +76,7 @@ pub fn strip_bot_mention(text: &str, username: &str) -> Option<String> {
         let boundary_before = match text[..start].chars().next_back() {
             None => true,
             Some(ch) if !is_handle_char(ch) => true,
-            // `/approve@komo_bot`：命令后缀写法，Telegram 自己也把整串算作一个
+            // `/status@komo_bot`：命令后缀写法，Telegram 自己也把整串算作一个
             // `bot_command`，所以 `@` 紧跟在命令字母后面**是**一次提及。
             Some(_) => {
                 let prefix = &text[..start];
@@ -210,8 +190,12 @@ mod tests {
         );
         // 命令后缀写法。
         assert_eq!(
-            strip_bot_mention(&format!("/approve@{BOT_USERNAME} 7K2M"), BOT_USERNAME).as_deref(),
-            Some("/approve 7K2M")
+            strip_bot_mention(
+                &format!("/answer@{BOT_USERNAME} run-1 resolve"),
+                BOT_USERNAME
+            )
+            .as_deref(),
+            Some("/answer run-1 resolve")
         );
         // 大小写不敏感。
         assert_eq!(
@@ -249,50 +233,5 @@ mod tests {
         let mut message = message(9, "private", "");
         message.text = None;
         assert!(from_message(&message, &bot(), request_key(10)).is_none());
-    }
-
-    #[test]
-    fn a_callback_becomes_the_text_command_it_stands_for() {
-        let callback = CallbackQuery {
-            id: "cb-1".into(),
-            from: User {
-                id: 777,
-                is_bot: false,
-                username: None,
-            },
-            message: Some(message(11, "private", "待审批")),
-            data: Some("approve:7K2M".into()),
-        };
-        let inbound = from_callback(&callback, request_key(12)).expect("按钮回调");
-        assert_eq!(inbound.text, "/approve 7K2M");
-        assert_eq!(inbound.request_key.as_str(), "telegram:12");
-        assert_eq!(inbound.peer.to_string(), "telegram:11");
-        assert_eq!(inbound.sender.as_str(), "777");
-    }
-
-    #[test]
-    fn a_callback_without_a_chat_or_with_an_unknown_payload_goes_nowhere() {
-        let base = CallbackQuery {
-            id: "cb-1".into(),
-            from: User {
-                id: 777,
-                is_bot: false,
-                username: None,
-            },
-            message: Some(message(11, "private", "待审批")),
-            data: Some("approve:7K2M".into()),
-        };
-
-        let mut inline = base.clone();
-        inline.message = None;
-        assert!(from_callback(&inline, request_key(13)).is_none());
-
-        let mut unknown = base.clone();
-        unknown.data = Some("drop:everything".into());
-        assert!(from_callback(&unknown, request_key(14)).is_none());
-
-        let mut empty = base;
-        empty.data = None;
-        assert!(from_callback(&empty, request_key(15)).is_none());
     }
 }

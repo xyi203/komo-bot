@@ -69,7 +69,7 @@ pub fn resolve(raw: &str, cwd: &Path) -> Result<PathBuf, ToolError> {
     real_path(&absolute(raw, cwd)?)
 }
 
-/// 一个**已授权根**：和 [`resolve`] 同一种口径的真实路径。
+/// 一个**工作区根**：和 [`resolve`] 同一种口径的真实路径。
 ///
 /// 根是配置里写的（`workspaces/`）或 Session 的 `workdir`，两者都"没解析过"；而规则
 /// 比对的目标路径一定过 [`resolve`]。macOS 上 `/tmp`、`/var` 是指向 `/private/…` 的

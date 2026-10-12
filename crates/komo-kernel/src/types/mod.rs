@@ -22,8 +22,8 @@ pub mod turn;
 
 pub use agent::{AgentConfig, AgentProfile, RunSnapshot};
 pub use chat::{
-    ApprovalPresentation, ApprovalScope, ChannelPeer, ChannelPlatform, Delivery, DeliveryState,
-    DeliveryTarget, Outbound, PeerId, Principal,
+    ChannelPeer, ChannelPlatform, Delivery, DeliveryState, DeliveryTarget, Outbound, PeerId,
+    Principal,
 };
 pub use delegate::{
     DELEGATE_REPAIR_ROUNDS, DelegateContract, DelegateSpec, SchemaMode, Validation, Violation,
@@ -31,8 +31,8 @@ pub use delegate::{
 };
 pub use digest::{ContentHash, sha256};
 pub use ids::{
-    ApprovalId, AttemptId, CronJobId, DeliveryId, EventId, ExecutorId, GrantId, IdParseError,
-    MemoryId, OperationId, RequestKey, RunId, Seq, SessionId, ShortId, ToolCallId, uuid_v7_at,
+    AttemptId, CronJobId, DeliveryId, EventId, ExecutorId, IdParseError, MemoryId, OperationId,
+    RequestKey, RunId, Seq, SessionId, ToolCallId, uuid_v7_at,
 };
 pub use memory::{
     Confirmation, Evidence, EvidenceRef, ExtractionMetadata, Injection, MemoryItem, MemoryKind,
@@ -44,9 +44,8 @@ pub use model::{
     ModelCatalog, ModelConfig, ModelRole, ModelType, TokenUsage, Vector,
 };
 pub use plan::{
-    ApprovedPlan, ConsumeIntent, ConsumedApproval, EnvVersion, ExecutionPlan, Operation, PlanHash,
-    PlanSource, PlanTarget, PlanVersions, Proof, RecoveryMode, ResourceRef, SourceKind,
-    TargetAccess, Verification,
+    EnvVersion, ExecutionPlan, Operation, PlanHash, PlanSource, PlanTarget, PlanVersions,
+    RecoveryMode, ResourceRef, TargetAccess, Verification,
 };
 pub use refs::{
     AttemptRef, ContentRef, INLINE_ARGUMENT_LIMIT_BYTES, OutputRef, PREVIEW_LIMIT_BYTES,
@@ -70,7 +69,7 @@ pub use tool::{
     ToolError, ToolOutput, WorkspaceRoot,
 };
 pub use turn::{
-    AcceptInput, Accepted, AssistantRound, EventBatch, GrantUse, GrantUses, LlmError, MemoryUse,
-    PlannedCall, ProviderToolCall, ReplayMessage, Role, Round, RoundInput, SeqRange,
-    ToolCallRequest, ToolResultForModel, TurnRequest,
+    AcceptInput, Accepted, AssistantRound, EventBatch, LlmError, MemoryUse, PlannedCall,
+    ProviderToolCall, ReplayMessage, Role, Round, RoundInput, SeqRange, ToolCallRequest,
+    ToolResultForModel, TurnRequest,
 };

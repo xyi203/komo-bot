@@ -1,3 +1,7 @@
+> 2026-10-11 起没有 Policy 与审批（`docs/komo_bot.md` §7）：模型要的调用过了工具自己的 `prepare` 与
+> AgentSurface 就执行，唯一的硬限制是 write / edit 拒绝 komo 自己的状态目录。下文描述旧代码处（Policy、
+> 审批仓库、`VerificationGate`）是当时的事实，按建议写到 Policy / 审批的地方已改写或加注。
+
 **建议保留现有可恢复 Runtime，只新增一个 `komo-agent`，把“Agent 的身份、能力和上下文装配”与“安全执行、调度和恢复”分开。**
 
 不要为每个 Bot 复制 Runtime，也不要为了 filesystem-shaped 重做存储。真正需要改变的是：**每个 Run 都明确绑定哪个 Agent、哪份能力集合、哪个工作目录和哪些上下文，而不是依赖 Gateway 的全局配置。**
@@ -48,7 +52,7 @@ komo-store
 
 komo-runtime
     AgentLoop、ToolExecutor
-    Policy、Approval、Recovery、Scheduler
+    Recovery、Scheduler
     LLM 协议适配
     Memory 服务
     子进程管理、PythonHost
@@ -77,11 +81,12 @@ komo-gateway
 
 **工具层负责描述“要做什么”。** 包括参数解析、工具 schema、构造执行计划、解释工具特有的结果。
 
-**Runtime 负责保证“这件事怎样受控地发生”。** 包括授权、启动进程、登记进程、取消、回收、输出落盘和恢复核对的执行约束。
+**Runtime 负责保证“这件事怎样受控地发生”。** 包括启动进程、登记进程、取消、回收、输出落盘和恢复核对的执行约束。
 
-已有的 `PythonHost` 契约继续复用。进程执行和核对授权确实需要跨层时，再补窄接口；不要因此引入通用插件容器。
+已有的 `PythonHost` 契约继续复用。进程执行和核对确实需要跨层时，再补窄接口；不要因此引入通用插件容器。
 
-尤其是核对：**不能为了拆依赖，让 `verify` 变成一条不经过 Policy 的隐藏执行通道。**
+尤其是核对：**不能为了拆依赖，让 `verify` 变成一条不落账的隐藏执行通道。**（2026-10-11 起核对函数
+`__komo_verify__` 无条件跑，不再过 Policy；但照样要落账。）
 
 ## 2.2 保留现有 Loop，不急着抽象可替换 Loop
 
@@ -150,13 +155,10 @@ reviewer
 
 这三个 Agent 共用工具实现和 Runtime，只是本次运行得到的能力集合不同。
 
-## Surface 和 Policy 不承担同一个职责
+## Surface 是唯一的逻辑边界
 
-建议明确为：
-
-> **Surface 决定这个 Agent 能调用哪些接口；Policy 决定一次具体调用是否允许。**
-
-`coder` 有 `write`，不等于可以写所有路径；`assistant` 有 `python`，也不等于任意代码自动放行。
+原稿这里主张"Surface 管能调哪些接口、Policy 管一次调用是否允许"。2026-10-11 删掉 Policy 后，
+Surface 就是唯一的逻辑边界：在 Surface 里的工具，模型要了就执行。
 
 而且，启用任意 shell / Python 代码时，它仍然拥有运行账号的操作系统权限。Surface 是逻辑能力边界，不应被描述为操作系统沙箱；当前 `Operation` 的定义也明确承认了这一点。
 
@@ -177,7 +179,6 @@ AgentProfile
     skill_sources
     workspace
     memory_scope
-    policy_scope
 ```
 
 它不应该包含正在运行的任务、当前工具调用、取消令牌或“当前会话”。
@@ -245,9 +246,9 @@ RunSnapshot（拟议）
 
 这里的关键不是字段数量，而是两个约束。
 
-**第一，快照必须可恢复。** 只存 `profile_id` 或某个文件路径不够：审批期间文件可能已经修改。身份指令和能力描述要保存内容，或引用仍可读取的不可变版本；可以复用已有 PayloadStore，不必新造存储系统。
+**第一，快照必须可恢复。** 只存 `profile_id` 或某个文件路径不够：Run 挂起等人期间文件可能已经修改。身份指令和能力描述要保存内容，或引用仍可读取的不可变版本；可以复用已有 PayloadStore，不必新造存储系统。
 
-**第二，固定配置不等于冻结安全策略。** 普通 Profile 编辑影响后续 Run；但显式撤权、Deny 规则和停用状态仍应在执行时检查。旧快照不能成为绕过当前撤权的通行证。
+**第二，固定配置不等于冻结停用状态。** 普通 Profile 编辑影响后续 Run；但停用状态仍应在执行时检查。旧快照不能成为绕过当前停用的通行证。（原稿还列了撤权与 Deny 规则，2026-10-11 随 Policy 删除。）
 
 ---
 
@@ -359,13 +360,13 @@ read("artifact://.../stdout")
 rg(pattern="...", path="skill://")
 ```
 
-**`tool://` 是工具说明入口，不是通过写文件执行工具。** 真实动作仍走 native tool call、ExecutionPlan 和 Policy。
+**`tool://` 是工具说明入口，不是通过写文件执行工具。** 真实动作仍走 native tool call 与 ExecutionPlan。
 
-在归属上，AgentSurface 决定挂载哪些资源；Runtime 负责对访问计划进行授权；Store 继续保存真实内容。
+在归属上，AgentSurface 决定挂载哪些资源；Runtime 负责执行访问计划；Store 继续保存真实内容。
 
 ## 关键改动在执行计划，不在字符串替换
 
-当前 `PlanTarget` 直接保存 `PathBuf`，Policy 对真实路径判断。
+当时 `PlanTarget` 直接保存 `PathBuf`，Policy 对真实路径判断（Policy 已于 2026-10-11 删除；write / edit 的状态目录硬限制仍对真实路径判断）。
 
 不能把 `skill://...` 直接当成一种“特殊文件路径”。建议引入明确的目标类型：
 
@@ -375,7 +376,7 @@ TargetRef
     ResourceUri
 ```
 
-资源解析必须保留逻辑 URI、所属 Agent / Session、版本和实际读取目标。审批与审计应能回答“允许读取哪个逻辑资源”，而不只是“访问了哪个临时文件”。
+资源解析必须保留逻辑 URI、所属 Agent / Session、版本和实际读取目标。审计应能回答“读取了哪个逻辑资源”，而不只是“访问了哪个临时文件”。
 
 这里还要注意：当前已经有 `ResourceRef`，用途是外部服务端点和凭证引用；不要复用这个名字把两种语义混在一起。
 
@@ -407,7 +408,7 @@ TargetRef
 
 `write`、`edit`、`shell`、`python` 和 `delegate` 先作为顺序屏障。不根据模型声称“没有副作用”就并行。
 
-要守住的行为是：遇到 Ask 后不再启动后续调用；挂起前收齐已启动调用的结果；完成事件按真实发生顺序记录，交给模型时按原始调用关系配对；恢复只处理未收尾调用，不重放整批。
+要守住的行为是：遇到要停下等人的判定（原稿写的是 Ask；2026-10-11 起只剩 uncertain 之类的介入）后不再启动后续调用；挂起前收齐已启动调用的结果；完成事件按真实发生顺序记录，交给模型时按原始调用关系配对；恢复只处理未收尾调用，不重放整批。
 
 **这个改动只需要 Run Surface 和执行边界稳定，不需要先完成资源命名空间、跨 Agent 消息或群聊。**
 
@@ -425,14 +426,14 @@ TargetRef
 
 | 批次               | 修改范围                                                               | 验收                                                     |
 | ---------------- | ------------------------------------------------------------------ | ------------------------------------------------------ |
-| **0：固定现有行为**     | 打通会话工作目录的持久化与读取；保留现有回放、审批、恢复回归测试                                   | 指定目录创建会话后，首次执行与重启恢复使用同一目录                              |
-| **1：拆执行与能力边界**   | 引入默认 AgentSurface；工具 schema 与实际查找统一使用它；收口进程和核对授权接口；抽出 `komo-agent` | 默认行为不变；不在 Surface 的工具无法调用；Runtime 不依赖 Agent crate      |
+| **0：固定现有行为**     | 打通会话工作目录的持久化与读取；保留现有回放、恢复回归测试                                   | 指定目录创建会话后，首次执行与重启恢复使用同一目录                              |
+| **1：拆执行与能力边界**   | 引入默认 AgentSurface；工具 schema 与实际查找统一使用它；收口进程和核对接口；抽出 `komo-agent` | 默认行为不变；不在 Surface 的工具无法调用；Runtime 不依赖 Agent crate      |
 | **1（续，2026-09-22 已做）** | `crates/komo-agent` 新建，只依赖 kernel：`skills/`（发现与目录）自 runtime 搬入，`surface_of` + `DELEGATE_TOOL` 自 gateway 搬入；`snapshot_fixture` 归入 kernel `test-support`；值类型留 kernel（事件/协议/store 按它们落盘）；`cargo tree` 确认 runtime 不见 agent | 同左（2026-09-22 本机：全量通过，只剩 `chat::skills::the_system_prompt_lists_the_skills_the_model_can_read` 一处失败——干净 HEAD 同样挂，是测试把 `platforms: [macos]` 写死成"本机非 mac"的假设，macOS 上必然命中，与本次拆分无关） |
-| **2：支持多个 Agent** | AgentProfile、Session 归属、按 Agent 的主会话、RunSnapshot、记忆作用域和入口路由        | 两个 Agent 的提示、工具、目录、历史不串用；审批等待期间修改 Profile，旧 Run 不被静默替换 |
+| **2：支持多个 Agent** | AgentProfile、Session 归属、按 Agent 的主会话、RunSnapshot、记忆作用域和入口路由        | 两个 Agent 的提示、工具、目录、历史不串用；Run 挂起等人期间修改 Profile，旧 Run 不被静默替换 |
 | **3：资源命名空间**     | `skill/tool/artifact` 只读入口，扩展 `read/rg`，执行计划识别资源目标                 | 本地路径兼容；资源越权被拒；产物引用在重启后仍可读                              |
 | **独立批次：工具并发**    | 在第 1 批之后增加有界只读并发                                                   | 顺序屏障成立；取消能收尾；故障恢复不重复已完成调用                              |
 
-重构期间，数据库、事件和计划格式的变更需要版本化：已有 Session 归入默认 Agent；旧日志不重写；旧审批计划继续按原版本校验哈希，不能因为补了新字段就失效或被重新解释。
+重构期间，数据库、事件和计划格式的变更需要版本化：已有 Session 归入默认 Agent；旧日志不重写；旧计划继续按原版本校验哈希，不能因为补了新字段就失效或被重新解释。
 
 每批同时更新 `docs/komo_bot.md` 的对应约定，并比较修改前后的 `cargo build --timings`，不要用“拆了 crate”代替依赖边界和编译结果的验证。
 

@@ -15,9 +15,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use komo_gateway::service::test_support::Unsure;
 use komo_gateway::service::test_support::harness::{
     DEFAULT_ENV, FakeLlm, Gw, Home, MemSender, call_round, eventually, inbound, text_round,
-    write_home_with,
+    write_home,
 };
 use komo_kernel::protocol::InboundAck;
 use komo_kernel::traits::{Inbound, LlmClient, TurnDriver};
@@ -61,8 +62,8 @@ enabled = false
     .to_string()
 }
 
-/// 只差 `instructions` 的两版配置：`assistant` 有 shell（默认规则下 shell 要问，于是
-/// Run 会停在审批上——那正是"在飞"的样子）。
+/// 只差 `instructions` 的两版配置：`assistant` 有测试工具 `unsure`（一调就结果不明，于是
+/// Run 会停在一条介入上——那正是"在飞"的样子）。
 fn versioned(instructions: &str) -> String {
     format!(
         r#"
@@ -70,7 +71,7 @@ default_agent = "assistant"
 
 [agents.assistant]
 instructions = "{instructions}"
-tools = ["read", "rg", "shell"]
+tools = ["read", "rg", "shell", "unsure"]
 
 [model.main]
 type = "completion"
@@ -93,7 +94,7 @@ const SECOND: &str = "第二版身份：这一句在受理之后才写进配置�
 
 /// 停机之后改 `config.toml`（重启用的那一份）。
 fn rewrite_config(home: &Home, config: &str) {
-    write_home_with(home.path(), config, DEFAULT_ENV, None);
+    write_home(home.path(), config, DEFAULT_ENV);
     // mtime 的粒度可能是秒：把时间推一下，`changed_since` 才看得出来（与
     // `TestGateway::write_config` 同一个做法）。
     let path = home.path().join("config.toml");
@@ -260,15 +261,11 @@ async fn two_agents_keep_their_sessions_prompts_and_tools_apart() {
 #[tokio::test]
 async fn editing_a_profile_leaves_a_run_in_flight_on_its_own_version() {
     let home = Home::with_config(&versioned(FIRST));
+    home.install_tools(vec![Unsure::new().tool()]);
     let llm = FakeLlm::new(vec![
-        // 第一段：要一次 shell（默认规则下要问），于是 Run 停在审批上。
-        vec![call_round(
-            1,
-            "pc-sh",
-            "shell",
-            serde_json::json!({ "command": "echo hi" }),
-        )],
-        // 批准之后的续跑段：只说一句话收尾。
+        // 第一段：调一次 `unsure`（结果不明），于是 Run 停在一条介入上。
+        vec![call_round(1, "pc-sh", "unsure", serde_json::json!({}))],
+        // 核对之后的续跑段：只说一句话收尾。
         vec![text_round(2, "跑完了。")],
         // 改完 Profile 之后新受理的那一条：只要一句话。
         vec![text_round(1, "好。")],
@@ -277,16 +274,16 @@ async fn editing_a_profile_leaves_a_run_in_flight_on_its_own_version() {
     let session = gateway.state().default_main_session().await.unwrap();
 
     let run = gateway.submit(&session, "inflight-1", "跑一下").await.run;
-    let approval = gateway.wait_approval().await;
+    let pending = gateway.wait_intervention(&run).await;
 
-    // 操作者在这时候改了 Profile——Run 还在飞（停在审批上）。
+    // 操作者在这时候改了 Profile——Run 还在飞（停在介入上）。
     rewrite_config(&home, &versioned(SECOND));
     komo_gateway::reload::reload(gateway.state())
         .await
         .expect("新配置装得上");
 
-    // 批准：续跑那一段用的还是**受理那一刻**冻结下来的那一版身份。
-    gateway.decide(&approval.approval, true).await;
+    // 答复：续跑那一段用的还是**受理那一刻**冻结下来的那一版身份。
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -317,16 +314,17 @@ async fn editing_a_profile_leaves_a_run_in_flight_on_its_own_version() {
 #[tokio::test]
 async fn a_restart_resumes_a_run_on_its_own_frozen_identity() {
     let home = Home::with_config(&versioned(FIRST));
+    home.install_tools(vec![Unsure::new().tool()]);
     let llm = FakeLlm::new(vec![vec![call_round(
         1,
         "pc-sh",
-        "shell",
-        serde_json::json!({ "command": "echo hi" }),
+        "unsure",
+        serde_json::json!({}),
     )]]);
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gateway.state().default_main_session().await.unwrap();
     let run = gateway.submit(&session, "restart-1", "跑一下").await.run;
-    let approval = gateway.wait_approval().await;
+    let pending = gateway.wait_intervention(&run).await;
     gateway.stop().await;
 
     // 停机期间 Profile 被改过（磁盘上那一份已经不一样了）。
@@ -336,7 +334,7 @@ async fn a_restart_resumes_a_run_on_its_own_frozen_identity() {
     let gateway = home
         .start(Arc::clone(&resumed_llm) as Arc<dyn LlmClient>)
         .await;
-    gateway.decide(&approval.approval, true).await;
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -348,7 +346,7 @@ async fn a_restart_resumes_a_run_on_its_own_frozen_identity() {
     );
     assert_eq!(
         tool_names(&resumed),
-        vec!["read", "rg", "shell"],
+        vec!["read", "rg", "shell", "unsure"],
         "能力面也是冻结的那一份"
     );
 
@@ -416,7 +414,7 @@ default_agent = "assistant"
 
 [agents.assistant]
 instructions = "你是助手（assistant 那一版身份）。"
-tools = ["dispatch", "follow", "read", "shell"]
+tools = ["dispatch", "follow", "read", "shell", "unsure"]
 
 [channels.telegram]
 enabled = true
@@ -444,7 +442,7 @@ enabled = false
 ///
 /// - `帮我查一下空调`（home）→ 调 `dispatch`，再把工具结果原样念出来；
 /// - `功耗呢`（home）→ 调 `follow`（目标短号由测试写进 `follow_task_id`）；
-/// - `跑个慢命令`（home）→ 调 `dispatch`，派出去的任务会调 `shell` 停在审批上；
+/// - `跑个慢命令`（home）→ 调 `dispatch`，派出去的任务会调 `unsure` 停在一条介入上；
 /// - `[后台任务 …]`（home，任务交回的结果）→ 回一句 `转告：<结果正文那一行>`；
 /// - 任务会话收到的正文 → 各回一句固定的结论，或者调 `shell`。
 struct TasksLlm {
@@ -501,9 +499,7 @@ impl LlmClient for TasksLlm {
                     "dispatch",
                     serde_json::json!({ "task": "跑一下 echo hi", "title": "慢命令" }),
                 ),
-                "跑一下 echo hi" => {
-                    Script::Call("shell", serde_json::json!({ "command": "echo hi" }))
-                }
+                "跑一下 echo hi" => Script::Call("unsure", serde_json::json!({})),
                 "查一下空调状态" => Script::Reply("空调已经关掉了。".into()),
                 "再看看功耗" => Script::Reply("功耗 300W。".into()),
                 "1+1 等于几" => Script::Reply("2".into()),
@@ -679,11 +675,12 @@ async fn a_background_task_reports_back_through_home() {
     gateway.stop().await;
 }
 
-/// 任务卡在 shell 审批上时，home 照样几秒内答完下一句——任务在自己的会话里排队，
-/// 不占 home 的串行位。
+/// 任务停在一条要人答的介入上时（结果不明，§7.5），home 照样几秒内答完下一句——任务在
+/// 自己的会话里排队，不占 home 的串行位。
 #[tokio::test]
-async fn home_answers_while_a_task_waits_on_approval() {
+async fn home_answers_while_a_task_waits_on_a_person() {
     let home = Home::with_config(&tasks_config());
+    home.install_tools(vec![Unsure::new().tool()]);
     let llm = TasksLlm::new();
     let sender = MemSender::new(ChannelPlatform::Telegram);
     let gateway = home
@@ -692,14 +689,27 @@ async fn home_answers_while_a_task_waits_on_approval() {
 
     let (_, home_run) = dm(&gateway, "跑个慢命令", "dm-1").await;
     gateway.wait_terminal(&home_run).await;
-    let approval = gateway.wait_approval().await;
-    let task_run = approval.run.clone().expect("审批挂在任务的 Run 上");
-    // 审批先落库、Run 后挂起：等它停稳在这条审批上。
-    assert_eq!(
-        gateway.wait_waiting(&task_run).await,
-        WaitReason::Approval {
-            approval: approval.approval.clone()
+    let task_run = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(run) = gateway
+                .interventions()
+                .await
+                .into_iter()
+                .find_map(|one| one.run)
+            {
+                break run;
+            }
+            assert!(std::time::Instant::now() < deadline, "任务一直没停在介入上");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
+    };
+    assert!(
+        matches!(
+            gateway.wait_waiting(&task_run).await,
+            WaitReason::Intervention { .. }
+        ),
+        "任务停在一条介入上"
     );
 
     let (_, home_run_2) = dm(&gateway, "1+1 等于几", "dm-2").await;
@@ -708,7 +718,7 @@ async fn home_answers_while_a_task_waits_on_approval() {
     assert_eq!(
         gateway.db_state(&task_run).await,
         RunState::Waiting,
-        "home 答完的时候任务还停在审批上"
+        "home 答完的时候任务还停在介入上"
     );
 
     gateway.stop().await;

@@ -6,16 +6,32 @@
 //! `Deferred` **不是错误**：渠道此刻无法推送（微信没有回复令牌），行留在 pending，由
 //! 下一条入站消息触发冲刷。所以它和 `Pending` 一样会被 [`TursoDeliveryRepo::pending`]
 //! 捞回来。
+//!
+//! **已作废的旧行**（D3）：删审批之前落盘的 `outbound.kind = approval_request /
+//! approval_settled` 不再有意义。读到它们时状态改写成 [`RETIRED_STATE`]（不再投递）并跳过
+//! ——不当错误、不重试、不卡补发循环。`approval_id` 列留着、永远写 NULL（§8.2 退役列）。
 
 use komo_kernel::traits::{RepoError, StoreError};
 use komo_kernel::types::chat::{
     ChannelPeer, ChannelPlatform, Delivery, DeliveryState, DeliveryTarget, Outbound, PeerId,
 };
-use komo_kernel::types::ids::{ApprovalId, DeliveryId};
+use komo_kernel::types::ids::DeliveryId;
 use time::OffsetDateTime;
 
 use crate::db::{BoxFuture, Db, decode, encode, map_toasty, to_ts};
 use crate::models::DeliveryRow;
+
+/// `deliveries.state` 里 store 自己用的第四个值：这一行**不再投递**（D3）。
+///
+/// 只落在已作废的旧审批行上；不进 [`DeliveryState`]——它不是投递的结局，是"这行已经
+/// 没有可投递的正文"。[`TursoDeliveryRepo::pending`] 与 [`TursoDeliveryRepo::get`] 都不再
+/// 返回这样的行。
+pub const RETIRED_STATE: &str = "retired";
+
+/// 这一行的状态说它**不用再送**了吗：已送到，或已作废。
+pub fn is_settled_state(state: &str) -> bool {
+    state == RETIRED_STATE || state == enum_str(&DeliveryState::Sent)
+}
 
 /// 一条投递记录，读出来的样子。
 #[derive(Debug, Clone, PartialEq)]
@@ -59,12 +75,10 @@ impl TursoDeliveryRepo {
     ) -> Result<DeliveryRecord, RepoError> {
         let key = match outbound {
             Outbound::RunFinished { session, run, .. } => Some(format!("finished:{session}:{run}")),
-            Outbound::ApprovalRequest(p) => Some(format!("approval:{}", p.approval)),
             Outbound::NeedsAttention { session, run, .. } => {
                 Some(format!("attention:{session}:{run}"))
             }
-            Outbound::ApprovalSettled { approval, .. } => Some(format!("settled:{approval}")),
-            _ => None,
+            Outbound::Text { .. } => None,
         };
         self.record_once(id, target, outbound, key.as_deref(), now)
             .await
@@ -94,7 +108,9 @@ impl TursoDeliveryRepo {
                         .await
                         .map_err(map_toasty)?
                     {
-                        return record_from_row(&row);
+                        return record_from_row(&row)?.ok_or_else(|| {
+                            StoreError::Other(format!("投递 {id} 是一条已作废的旧审批行"))
+                        });
                     }
                     if let Some(key) = &key {
                         let rows = DeliveryRow::filter(
@@ -111,10 +127,11 @@ impl TursoDeliveryRepo {
                         .await
                         .map_err(map_toasty)?;
                         for row in rows {
-                            // 旧版记录没有 key；完成/审批通知仍按原正文里的身份识别。
+                            // 旧版记录没有 key；完成 / 介入通知仍按原正文里的身份识别。
+                            // 已作废的旧审批行解出来是 `None`，谁也不匹配。
                             let legacy_matches = if row.notification_key.is_none() {
                                 match (
-                                    serde_json::from_str::<Outbound>(&row.outbound).ok(),
+                                    Outbound::from_stored(&row.outbound).ok().flatten(),
                                     &outbound,
                                 ) {
                                     (
@@ -124,26 +141,22 @@ impl TursoDeliveryRepo {
                                         Outbound::RunFinished { session, run, .. },
                                     ) => &a == session && &b == run,
                                     (
-                                        Some(Outbound::ApprovalRequest(a)),
-                                        Outbound::ApprovalRequest(b),
-                                    ) => a.approval == b.approval,
-                                    (
                                         Some(Outbound::NeedsAttention {
                                             session: a, run: b, ..
                                         }),
                                         Outbound::NeedsAttention { session, run, .. },
                                     ) => &a == session && &b == run,
-                                    (
-                                        Some(Outbound::ApprovalSettled { approval: a, .. }),
-                                        Outbound::ApprovalSettled { approval, .. },
-                                    ) => &a == approval,
                                     _ => false,
                                 }
                             } else {
                                 false
                             };
                             if row.notification_key.as_ref() == Some(key) || legacy_matches {
-                                return record_from_row(&row);
+                                // 带 key 的行不会是旧审批行（它们的 key 是 `approval:` /
+                                // `settled:`，新通知生成不出来），解不出就照常往下建新行。
+                                if let Some(record) = record_from_row(&row)? {
+                                    return Ok(record);
+                                }
                             }
                         }
                     }
@@ -153,7 +166,8 @@ impl TursoDeliveryRepo {
                         chat_id: target.peer.chat_id.as_str(),
                         is_home: target.is_home,
                         outbound: encode(&outbound)?,
-                        approval_id: approval_of(&outbound).map(|a| a.to_string()),
+                        // 退役列（审批已删，D4）：永远 NULL。
+                        approval_id: None as Option<String>,
                         notification_key: key,
                         state: enum_str(&DeliveryState::Pending),
                         attempts: 0_i64,
@@ -221,18 +235,21 @@ impl TursoDeliveryRepo {
     ///
     /// `peer` 给微信那条路径用：用户下一条消息到达时，Dispatcher 先冲刷**该会话**的
     /// pending 投递，再处理新消息（§11.1 第 4 步）。
+    ///
+    /// 读到已作废的旧审批行（D3）时**顺手把它们标成 [`RETIRED_STATE`]** 并跳过：返回值里
+    /// 永远没有它们，下一次也不会再读到——一条旧行卡不住补发循环。
     pub async fn pending(
         &self,
         peer: Option<&ChannelPeer>,
     ) -> Result<Vec<DeliveryRecord>, RepoError> {
         let peer = peer.cloned();
-        self.db
+        let (out, retired) = self
+            .db
             .read(move |ex| {
                 let peer = peer.clone();
                 Box::pin(async move {
                     let mut rows = DeliveryRow::all().exec(ex).await.map_err(map_toasty)?;
-                    let sent = enum_str(&DeliveryState::Sent);
-                    rows.retain(|row| row.state != sent);
+                    rows.retain(|row| !is_settled_state(&row.state));
                     if let Some(peer) = &peer {
                         rows.retain(|row| {
                             row.platform == peer.platform.as_str()
@@ -241,63 +258,57 @@ impl TursoDeliveryRepo {
                     }
                     rows.sort_by(|a, b| a.id.cmp(&b.id));
                     let mut out = Vec::with_capacity(rows.len());
+                    let mut retired = Vec::new();
                     for row in &rows {
-                        out.push(record_from_row(row)?);
+                        match record_from_row(row)? {
+                            Some(record) => out.push(record),
+                            None => retired.push(row.id.clone()),
+                        }
                     }
-                    Ok(out)
-                }) as BoxFuture<'_, Result<Vec<DeliveryRecord>, StoreError>>
+                    Ok((out, retired))
+                })
+                    as BoxFuture<'_, Result<(Vec<DeliveryRecord>, Vec<String>), StoreError>>
             })
             .await
-            .map_err(RepoError::from)
+            .map_err(RepoError::from)?;
+        if !retired.is_empty() {
+            self.retire(retired).await?;
+        }
+        Ok(out)
     }
 
-    /// 当初把这条审批**投到过哪几个地方**。
-    ///
-    /// 「审批请求的投递目标：Run 的来源会话，**加上** home chat（若不同）」（§11.4）。
-    /// 决定之后要把 `ApprovalSettled` 投回**每一个**，否则另一头那张卡会一直停在"等你
-    /// 回答"——而那个人已经答过了。
-    ///
-    /// 只看 `ApprovalRequest` 那几行：`ApprovalSettled` 自己也带审批 ID，把它算进来会
-    /// 让第二次结算投到自己刚投过的地方。**按目标去重**，同一个会话只回一次。
-    pub async fn targets_for_approval(
-        &self,
-        approval: &ApprovalId,
-    ) -> Result<Vec<ChannelPeer>, RepoError> {
-        let approval = approval.to_string();
+    /// 把已作废的旧行标成 [`RETIRED_STATE`]。幂等：已经是终态的行不动。
+    async fn retire(&self, ids: Vec<String>) -> Result<(), RepoError> {
+        let now = to_ts(OffsetDateTime::now_utc());
         self.db
-            .read(move |ex| {
-                let approval = approval.clone();
+            .with_write_retry(move |ex| {
+                let ids = ids.clone();
                 Box::pin(async move {
-                    let mut rows = DeliveryRow::filter(
-                        DeliveryRow::fields().approval_id().eq(approval.as_str()),
-                    )
-                    .exec(ex)
-                    .await
-                    .map_err(map_toasty)?;
-                    rows.sort_by(|a, b| a.id.cmp(&b.id));
-
-                    let mut out: Vec<ChannelPeer> = Vec::new();
-                    for row in &rows {
-                        // 行里的正文是渠道写下的；解不出来就跳过，不让一行坏数据把结算
-                        // 投递整个带走。
-                        let Ok(outbound) = serde_json::from_str::<Outbound>(&row.outbound) else {
+                    for id in &ids {
+                        let Some(mut row) = DeliveryRow::filter_by_id(id.as_str())
+                            .first()
+                            .exec(ex)
+                            .await
+                            .map_err(map_toasty)?
+                        else {
                             continue;
                         };
-                        if !matches!(outbound, Outbound::ApprovalRequest(_)) {
+                        if is_settled_state(&row.state) {
                             continue;
                         }
-                        let platform: ChannelPlatform =
-                            decode(&format!("\"{}\"", row.platform), "deliveries.platform")?;
-                        let peer = ChannelPeer {
-                            platform,
-                            chat_id: PeerId::new(row.chat_id.clone()),
-                        };
-                        if !out.contains(&peer) {
-                            out.push(peer);
-                        }
+                        row.update()
+                            .state(RETIRED_STATE.to_string())
+                            .last_error(Some(
+                                "审批已删除（2026-10-11），这条旧审批投递作废，不再投递"
+                                    .to_string(),
+                            ))
+                            .updated_at(now)
+                            .exec(ex)
+                            .await
+                            .map_err(map_toasty)?;
                     }
-                    Ok(out)
-                }) as BoxFuture<'_, Result<Vec<ChannelPeer>, StoreError>>
+                    Ok(())
+                }) as BoxFuture<'_, Result<(), StoreError>>
             })
             .await
             .map_err(RepoError::from)
@@ -317,7 +328,8 @@ impl TursoDeliveryRepo {
                     else {
                         return Ok(None);
                     };
-                    Ok(Some(record_from_row(&row)?))
+                    // 已作废的旧审批行没有可投递的正文：对调用方来说等于没有这条。
+                    record_from_row(&row)
                 }) as BoxFuture<'_, Result<Option<DeliveryRecord>, StoreError>>
             })
             .await
@@ -325,19 +337,20 @@ impl TursoDeliveryRepo {
     }
 }
 
-/// 这条外发说的是哪条审批。`ApprovalRequest` 与 `ApprovalSettled` 有，其余没有。
-fn approval_of(outbound: &Outbound) -> Option<&ApprovalId> {
-    match outbound {
-        Outbound::ApprovalRequest(presentation) => Some(&presentation.approval),
-        Outbound::ApprovalSettled { approval, .. } => Some(approval),
-        _ => None,
+/// 读一行。`Ok(None)` = 已作废的旧审批行（D3），没有可投递的正文。
+fn record_from_row(row: &DeliveryRow) -> Result<Option<DeliveryRecord>, StoreError> {
+    if row.state == RETIRED_STATE {
+        return Ok(None);
     }
-}
-
-fn record_from_row(row: &DeliveryRow) -> Result<DeliveryRecord, StoreError> {
+    let Some(outbound) = Outbound::from_stored(&row.outbound).map_err(|e| {
+        StoreError::Corrupt(format!("deliveries.outbound 解不开（{}）：{e}", row.id))
+    })?
+    else {
+        return Ok(None);
+    };
     let platform: ChannelPlatform =
         decode(&format!("\"{}\"", row.platform), "deliveries.platform")?;
-    Ok(DeliveryRecord {
+    Ok(Some(DeliveryRecord {
         id: DeliveryId::from_raw(row.id.clone()),
         target: DeliveryTarget {
             peer: ChannelPeer {
@@ -346,12 +359,12 @@ fn record_from_row(row: &DeliveryRow) -> Result<DeliveryRecord, StoreError> {
             },
             is_home: row.is_home,
         },
-        outbound: decode(&row.outbound, "deliveries.outbound")?,
+        outbound,
         state: decode(&format!("\"{}\"", row.state), "deliveries.state")?,
         attempts: row.attempts.max(0) as u32,
         last_error: row.last_error.clone(),
         created_at: crate::db::from_ts(row.created_at),
-    })
+    }))
 }
 
 fn enum_str<T: serde::Serialize>(value: &T) -> String {
@@ -383,23 +396,44 @@ mod tests {
         }
     }
 
-    fn approval_request(approval: &ApprovalId, index: u32) -> Outbound {
-        use komo_kernel::types::chat::{ApprovalPresentation, ApprovalScope};
-        let plan = komo_kernel::test_support::sample_plan(
-            "shell",
-            &komo_kernel::types::ids::SessionId::from_raw("sess-1"),
-        );
-        Outbound::ApprovalRequest(Box::new(ApprovalPresentation {
-            approval: approval.clone(),
-            short_id: komo_kernel::types::ids::ShortId::from_index(index),
-            plan_hash: plan.plan_hash(),
-            plan,
-            reason: "要人看一眼".into(),
-            changes: None,
-            evidence: None,
-            scopes: vec![ApprovalScope::Once],
-            valid_until: None,
-        }))
+    fn attention(run: &str) -> Outbound {
+        Outbound::NeedsAttention {
+            session: komo_kernel::types::ids::SessionId::from_raw("sess-1"),
+            run: komo_kernel::types::ids::RunId::from_raw(run),
+            reason: "结果不明".into(),
+        }
+    }
+
+    /// 删审批之前落盘的一行：`outbound.kind = approval_request`，状态 pending。
+    async fn legacy_approval_row(db: &Db, id: &str, kind: &str) {
+        let (id, kind) = (id.to_string(), kind.to_string());
+        db.with_write_retry(move |ex| {
+            let (id, kind) = (id.clone(), kind.clone());
+            Box::pin(async move {
+                toasty::create!(DeliveryRow {
+                    id: id.as_str(),
+                    platform: "telegram",
+                    chat_id: "42",
+                    is_home: false,
+                    outbound: format!(
+                        r#"{{"kind":"{kind}","approval":"ap-1","short_id":"K7QF","reason":"x"}}"#
+                    ),
+                    approval_id: Some("ap-1".to_string()),
+                    notification_key: Some("approval:ap-1".to_string()),
+                    state: "pending",
+                    attempts: 0_i64,
+                    last_error: None as Option<String>,
+                    created_at: to_ts(NOW),
+                    updated_at: to_ts(NOW),
+                })
+                .exec(ex)
+                .await
+                .map_err(map_toasty)?;
+                Ok(())
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
     }
 
     fn text() -> Outbound {
@@ -420,7 +454,7 @@ mod tests {
                 run: RunId::from_raw("r"),
                 summary: "done".into(),
             },
-            approval_request(&ApprovalId::from_raw("a"), 1),
+            attention("r"),
         ];
         // 模拟升级前没有 notification_key 的已送达记录。
         for (index, message) in messages.iter().enumerate() {
@@ -478,7 +512,7 @@ mod tests {
         let (db, _dir) = temp().await;
         let repo = TursoDeliveryRepo::new(db);
         let target = target(ChannelPlatform::Wechat, "42", false);
-        let message = approval_request(&ApprovalId::from_raw("a"), 1);
+        let message = attention("r");
         let id = DeliveryId::from_raw("original");
         repo.record(&id, &target, &message, NOW).await.unwrap();
         repo.settle(&id, DeliveryState::Deferred, Some("no token".into()), NOW)
@@ -564,109 +598,67 @@ mod tests {
         );
     }
 
-    /// 验收 BUG(2)：决定之后要把结算投回当初投过的**每一个**目标（§11.4）。
+    /// D3：删审批之前的 pending 审批行不卡住补发——`pending()` 不返回它、把它标成作废，
+    /// 之后 `get` 也读不到；同一目标上别的投递照常补发。
     #[tokio::test]
-    async fn an_approvals_targets_are_every_place_the_request_went() {
+    async fn a_pending_legacy_approval_delivery_is_retired_instead_of_blocking_resends() {
         let (db, _dir) = temp().await;
-        let repo = TursoDeliveryRepo::new(db);
-        let approval = ApprovalId::from_raw("ap-1");
-
-        // 「Run 的来源会话，**加上** home chat（若不同）」。
-        let source = ChannelPeer::new(ChannelPlatform::Telegram, "42");
-        let home = ChannelPeer::new(ChannelPlatform::Feishu, "oc_home");
+        legacy_approval_row(&db, "d-0", "approval_request").await;
+        legacy_approval_row(&db, "d-00", "approval_settled").await;
+        let repo = TursoDeliveryRepo::new(db.clone());
+        let id = DeliveryId::from_raw("d-1");
         repo.record(
-            &DeliveryId::from_raw("d-1"),
-            &DeliveryTarget::to_peer(source.clone()),
-            &approval_request(&approval, 1),
-            NOW,
-        )
-        .await
-        .unwrap();
-        repo.record(
-            &DeliveryId::from_raw("d-2"),
-            &DeliveryTarget::home(home.clone()),
-            &approval_request(&approval, 1),
-            NOW,
-        )
-        .await
-        .unwrap();
-        // 别的审批、别的会话——不该混进来。
-        repo.record(
-            &DeliveryId::from_raw("d-3"),
-            &DeliveryTarget::to_peer(ChannelPeer::new(ChannelPlatform::Wechat, "wxid_x")),
-            &approval_request(&ApprovalId::from_raw("ap-2"), 2),
-            NOW,
-        )
-        .await
-        .unwrap();
-        // 一条普通文本，不带审批 ID。
-        repo.record(
-            &DeliveryId::from_raw("d-4"),
-            &DeliveryTarget::to_peer(ChannelPeer::new(ChannelPlatform::Wechat, "wxid_y")),
+            &id,
+            &target(ChannelPlatform::Telegram, "42", false),
             &text(),
             NOW,
         )
         .await
         .unwrap();
 
-        let targets = repo.targets_for_approval(&approval).await.unwrap();
-        assert_eq!(targets, vec![source.clone(), home.clone()]);
-
-        // 结算投出去之后再问一次：不能把自己刚投过的地方也算进来，否则第二次结算会
-        // 再投一轮。
-        repo.record(
-            &DeliveryId::from_raw("d-5"),
-            &DeliveryTarget::to_peer(source.clone()),
-            &Outbound::ApprovalSettled {
-                approval: approval.clone(),
-                short_id: komo_kernel::types::ids::ShortId::from_index(1),
-                approved: true,
-                by: PeerId::new("operator"),
-                at: NOW,
-            },
-            NOW,
-        )
-        .await
-        .unwrap();
+        let pending = repo.pending(None).await.unwrap();
         assert_eq!(
-            repo.targets_for_approval(&approval).await.unwrap(),
-            vec![source, home]
+            pending.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            vec![id.clone()]
         );
-    }
-
-    /// 同一个会话投过两次也只回一次。
-    #[tokio::test]
-    async fn a_target_that_was_written_twice_is_only_returned_once() {
-        let (db, _dir) = temp().await;
-        let repo = TursoDeliveryRepo::new(db);
-        let approval = ApprovalId::from_raw("ap-1");
         let peer = ChannelPeer::new(ChannelPlatform::Telegram, "42");
-        for id in ["d-1", "d-2"] {
-            repo.record(
-                &DeliveryId::from_raw(id),
-                &DeliveryTarget::to_peer(peer.clone()),
-                &approval_request(&approval, 1),
+        assert_eq!(repo.pending(Some(&peer)).await.unwrap().len(), 1);
+
+        // 作废落进了库：状态不再是 pending，再读也不会出现。
+        let row = db
+            .read(|ex| {
+                Box::pin(async move {
+                    DeliveryRow::filter_by_id("d-0")
+                        .first()
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)
+                }) as BoxFuture<'_, Result<Option<DeliveryRow>, StoreError>>
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RETIRED_STATE);
+        assert!(row.last_error.is_some());
+        assert!(
+            repo.get(&DeliveryId::from_raw("d-0"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // 新的介入通知不会被旧行的 key 吞掉。
+        let fresh = repo
+            .record(
+                &DeliveryId::from_raw("d-2"),
+                &target(ChannelPlatform::Telegram, "42", false),
+                &attention("r-1"),
                 NOW,
             )
             .await
             .unwrap();
-        }
-        assert_eq!(
-            repo.targets_for_approval(&approval).await.unwrap(),
-            vec![peer]
-        );
-    }
-
-    #[tokio::test]
-    async fn an_approval_nobody_delivered_has_no_targets() {
-        let (db, _dir) = temp().await;
-        let repo = TursoDeliveryRepo::new(db);
-        assert!(
-            repo.targets_for_approval(&ApprovalId::from_raw("ap-9"))
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert_eq!(fresh.id, DeliveryId::from_raw("d-2"));
+        assert_eq!(repo.pending(None).await.unwrap().len(), 2);
     }
 
     /// 内容原样读得回来——补发一条结果消息不需要重跑任务（§8.8）。

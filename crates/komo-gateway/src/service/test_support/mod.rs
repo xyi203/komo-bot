@@ -17,8 +17,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 #[cfg(test)]
-use komo_kernel::policy::RuleTable;
-#[cfg(test)]
 use komo_kernel::protocol::config::{
     ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig, StartOnly,
     TypesafeConfig,
@@ -128,7 +126,6 @@ pub fn sample_snapshot() -> ConfigSnapshot {
         },
         typesafe: TypesafeConfig::default(),
         channels: ChannelsConfig::default(),
-        policy: RuleTable::initial(),
         paths: PathsConfig {
             sessions_dir: "/tmp/komo/sessions".into(),
             toolbox_dir: "/tmp/komo/toolbox".into(),
@@ -254,7 +251,6 @@ fn write_home(home: &Path, config: &str) {
         "KOMO_LLM_API_KEY=test-key\nTELEGRAM_BOT_TOKEN=test-bot-token\n",
     )
     .expect("写 .env");
-    std::fs::write(home.join("policy.toml"), "rules = []\n").expect("写 policy.toml");
 }
 
 /// reqwest 用 `rustls-no-provider`：provider 由 `komo` 的 `main` 装（§13.4）。测试进程
@@ -334,7 +330,7 @@ pub(crate) fn wrap_ledger(
 //
 // 提示缓存冷没冷（`compaction::cache_cold`）按"现在"与上一次请求的时间差算，而
 // 缓存存活时间是五分钟：集成测试不能真等。同故障注入口一个办法——按数据目录索引的一张
-// 表，只拨**这一处判断**用的时钟（租约、审批等别处的"现在"不动）。表是空的时候什么都
+// 表，只拨**这一处判断**用的时钟（租约等别处的"现在"不动）。表是空的时候什么都
 // 不发生。
 
 type SkewTable = std::sync::Mutex<Vec<(std::path::PathBuf, std::time::Duration)>>;
@@ -376,5 +372,233 @@ pub(crate) fn cache_clock(
     match skew {
         Some(skew) => std::sync::Arc::new(SkewedClock { inner: clock, skew }),
         None => clock,
+    }
+}
+
+// ---------------------------------------------------------------- 测试工具注入口
+//
+// 审批删掉之后（§7，2026-10-11），测试再没有"默认 strict → shell 要问"这条路把一个 Run
+// 停住。停法换成两件测试专用的工具，同前两个注入口一个办法——按数据目录索引的一张表，
+// 装配时 `build_tools` 查一次，**表是空的时候什么都不挂**，生产路径上的工具目录一个不多：
+//
+// - [`Gate`]（工具名 `gate`）：进去之后**一直等**，直到测试放行——一个 Run 停在 `running`
+//   上占着名额（次序、取消、并发的测试要的就是它）。
+// - [`Unsure`]（工具名 `unsure`）：一调就答"结果不明"——Run 当场停在 `waiting +
+//   intervention`（`verify`）上等人核对（§7.5、§8.6），走的是生产里同一条路。
+
+type ToolTable = std::sync::Mutex<
+    Vec<(
+        std::path::PathBuf,
+        Vec<std::sync::Arc<dyn komo_kernel::traits::Tool>>,
+    )>,
+>;
+
+fn tool_table() -> &'static ToolTable {
+    static TABLE: std::sync::OnceLock<ToolTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// 下一次在 `home` 起 Gateway 时，多挂这几个工具。同一个 `home` 再装一次覆盖前一次。
+pub fn install_test_tools(
+    home: &std::path::Path,
+    tools: Vec<std::sync::Arc<dyn komo_kernel::traits::Tool>>,
+) {
+    let mut table = tool_table().lock().expect("测试工具表");
+    table.retain(|(path, _)| path != home);
+    table.push((home.to_path_buf(), tools));
+}
+
+/// 装配时的那一次查表。**没装过就是空的**。
+pub(crate) fn test_tools(
+    home: &std::path::Path,
+) -> Vec<std::sync::Arc<dyn komo_kernel::traits::Tool>> {
+    tool_table()
+        .lock()
+        .expect("测试工具表")
+        .iter()
+        .find(|(path, _)| path == home)
+        .map(|(_, tools)| tools.clone())
+        .unwrap_or_default()
+}
+
+/// 两件测试工具共用的计划：一条"没有安全恢复办法"的调用——重启之后 `started` 而无结果
+/// 的它只能停下来问人（§8.6），与一次真的外部写入同一个待遇。
+fn test_plan(
+    name: &str,
+    args: serde_json::Value,
+    ctx: &komo_kernel::types::tool::ToolContext,
+) -> komo_kernel::types::plan::ExecutionPlan {
+    use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode};
+    ExecutionPlan {
+        operation_id: komo_kernel::types::ids::OperationId::from_raw(format!(
+            "op-{name}-{}",
+            ctx.call
+        )),
+        source: ctx.source.clone(),
+        tool: name.into(),
+        operation: Operation::McpCall {
+            server: "test".into(),
+            tool: name.into(),
+            read_only: false,
+        },
+        run: Some(ctx.run.clone()),
+        tool_call: Some(ctx.call.clone()),
+        args,
+        cwd: Some(ctx.cwd.clone()),
+        targets: vec![],
+        versions: PlanVersions::default(),
+        resources: vec![],
+        recovery: RecoveryMode::NoSafeRecovery,
+        then_run: None,
+    }
+}
+
+fn test_definition(name: &str, description: &str) -> komo_kernel::types::tool::ToolDefinition {
+    komo_kernel::types::tool::ToolDefinition {
+        name: name.into(),
+        description: description.into(),
+        parameters: serde_json::json!({ "type": "object" }),
+    }
+}
+
+/// 一道门：`gate` 调用进去就等，直到 [`Gate::release`]。放行之后一直开着。
+///
+/// 等的时候认取消（`/cancel`、停机）：那时答 `Cancelled`，不让一次取消卡在测试的门上。
+pub struct Gate {
+    open: tokio::sync::watch::Sender<bool>,
+    entered: tokio::sync::watch::Sender<usize>,
+}
+
+impl Gate {
+    pub fn new() -> std::sync::Arc<Gate> {
+        std::sync::Arc::new(Gate {
+            open: tokio::sync::watch::Sender::new(false),
+            entered: tokio::sync::watch::Sender::new(0),
+        })
+    }
+
+    /// 当成工具挂上去（[`install_test_tools`]）。
+    pub fn tool(self: &std::sync::Arc<Self>) -> std::sync::Arc<dyn komo_kernel::traits::Tool> {
+        std::sync::Arc::new(GateTool(std::sync::Arc::clone(self)))
+    }
+
+    /// 放行：等着的、以后来的，都直接过去。
+    pub fn release(&self) {
+        self.open.send_replace(true);
+    }
+
+    /// 进过门几次（= `gate` 真的开始执行了几次）。
+    pub fn entered(&self) -> usize {
+        *self.entered.borrow()
+    }
+
+    /// 等到至少有 `n` 次进门（最多 20 秒）。
+    pub async fn wait_entered(&self, n: usize) {
+        let mut entered = self.entered.subscribe();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            entered.wait_for(|count| *count >= n),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("等了 20 秒也没有第 {n} 次进门"))
+        .expect("门还在");
+    }
+}
+
+struct GateTool(std::sync::Arc<Gate>);
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::Tool for GateTool {
+    fn definition(&self) -> komo_kernel::types::tool::ToolDefinition {
+        test_definition("gate", "测试用：等测试放行再返回")
+    }
+
+    async fn prepare(
+        &self,
+        args: serde_json::Value,
+        ctx: &komo_kernel::types::tool::ToolContext,
+    ) -> Result<komo_kernel::types::plan::ExecutionPlan, komo_kernel::types::tool::ToolError> {
+        Ok(test_plan("gate", args, ctx))
+    }
+
+    async fn execute(
+        &self,
+        _plan: komo_kernel::types::plan::ExecutionPlan,
+        ctx: &komo_kernel::types::tool::ToolContext,
+        _sink: &mut dyn komo_kernel::traits::OutputWriter,
+    ) -> Result<komo_kernel::types::tool::ToolOutput, komo_kernel::types::tool::ToolError> {
+        self.0.entered.send_modify(|count| *count += 1);
+        let mut open = self.0.open.subscribe();
+        // `CancelToken` 只能问不能等：一小拍一小拍地看。
+        loop {
+            if ctx.cancel.is_cancelled() {
+                return Err(komo_kernel::types::tool::ToolError::Cancelled);
+            }
+            let tick = std::time::Duration::from_millis(20);
+            if tokio::time::timeout(tick, open.wait_for(|open| *open))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+        }
+        Ok(komo_kernel::types::tool::ToolOutput {
+            status: komo_kernel::types::refs::ToolResultStatus::Completed,
+            result: serde_json::json!({ "gate": "open" }),
+            exit_code: Some(0),
+            artifacts: vec![],
+            preview: Some("门开了".into()),
+        })
+    }
+}
+
+/// 一调就"结果不明"的工具：Run 停在 `verify` 上等人核对（§7.5）。
+pub struct Unsure {
+    ran: std::sync::atomic::AtomicUsize,
+}
+
+impl Unsure {
+    pub fn new() -> std::sync::Arc<Unsure> {
+        std::sync::Arc::new(Unsure {
+            ran: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    pub fn tool(self: &std::sync::Arc<Self>) -> std::sync::Arc<dyn komo_kernel::traits::Tool> {
+        std::sync::Arc::new(UnsureTool(std::sync::Arc::clone(self)))
+    }
+
+    /// 真的执行了几次——"核对之后不重跑"的判据。
+    pub fn ran(&self) -> usize {
+        self.ran.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+struct UnsureTool(std::sync::Arc<Unsure>);
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::Tool for UnsureTool {
+    fn definition(&self) -> komo_kernel::types::tool::ToolDefinition {
+        test_definition("unsure", "测试用：一调就结果不明")
+    }
+
+    async fn prepare(
+        &self,
+        args: serde_json::Value,
+        ctx: &komo_kernel::types::tool::ToolContext,
+    ) -> Result<komo_kernel::types::plan::ExecutionPlan, komo_kernel::types::tool::ToolError> {
+        Ok(test_plan("unsure", args, ctx))
+    }
+
+    async fn execute(
+        &self,
+        _plan: komo_kernel::types::plan::ExecutionPlan,
+        _ctx: &komo_kernel::types::tool::ToolContext,
+        _sink: &mut dyn komo_kernel::traits::OutputWriter,
+    ) -> Result<komo_kernel::types::tool::ToolOutput, komo_kernel::types::tool::ToolError> {
+        self.0.ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(komo_kernel::types::tool::ToolError::Uncertain {
+            message: "测试：远端没有回话，不知道做没做成".into(),
+        })
     }
 }

@@ -12,17 +12,14 @@ use komo_kernel::events::{
     ToolPlanned, ToolResult, ToolStarted,
 };
 use komo_kernel::traits::{Ledger, LedgerError, StoreError};
-use komo_kernel::types::ids::{
-    AttemptId, EventId, ExecutorId, GrantId, RunId, Seq, SessionId, ToolCallId,
-};
+use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::refs::{INLINE_ARGUMENT_LIMIT_BYTES, PublishedOutput, ToolResultStatus};
 use komo_kernel::types::status::{AttemptState, RunEnd, RunState, WaitReason};
-use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUses};
+use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch};
 use time::OffsetDateTime;
 
 use crate::db::{BoxFuture, Db, store_to_ledger};
-use crate::models::PolicyGrantRow;
 use crate::repos::{calls, outbox, runs, session};
 use crate::session_log::{PendingEvent, SessionPaths};
 
@@ -189,8 +186,8 @@ impl Ledger for Coordinator {
                     // 契约落在**事件**里（§8.4）：重启之后它是子代理唯一的"结果要长什么样"
                     // 的依据，而父侧复验用的就是同一份。
                     delegate: input.delegate.clone(),
-                    // 受理时冻结的身份与能力（§4.3）也落在**事件**里：审批可能一小时之后
-                    // 才答复，恢复时按它装配，当前配置改了也换不掉这一条 Run 的面孔。
+                    // 受理时冻结的身份与能力（§4.3）也落在**事件**里：Run 可能停很久
+                    // 才续跑，恢复时按它装配，当前配置改了也换不掉这一条 Run 的面孔。
                     // 受理方算好交下来（`AcceptInput::snapshot`）；这里是如实记录，
                     // 不做解释、不补默认值。
                     snapshot: input.snapshot.clone(),
@@ -407,7 +404,6 @@ impl Ledger for Coordinator {
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grants: GrantUses,
     ) -> Result<AttemptId, LedgerError> {
         let row = self.run_of_call(call).await?;
         let run = RunId::from_raw(row.run_id.clone());
@@ -428,26 +424,22 @@ impl Ledger for Coordinator {
                     attempt_id: attempt.clone(),
                     plan_ref: plan_event,
                     plan_hash: plan.plan_hash(),
-                    grant: grants.plan.as_ref().and_then(|g| g.grant.clone()),
-                    then_run_grant: grants.then_run.as_ref().and_then(|g| g.grant.clone()),
                 }),
             )
             .await?;
 
-        // ② state.db 事务提交 started、执行尝试、事件索引和首次授权消费——**同一事务**。
+        // ② state.db 事务提交 started、执行尝试与事件索引——**同一事务**。
         //    返回之后才允许产生真实副作用（§8.5）。
         let call_id = call.clone();
         let attempt_id = attempt.clone();
         let plan_hash = plan.plan_hash();
         let executor = self.executor.clone();
-        let used: Vec<GrantId> = grants.iter().filter_map(|g| g.grant.clone()).collect();
         self.commit(&appended, move |ex, appended, now| {
-            let (call_id, attempt_id, plan_hash, executor, used) = (
+            let (call_id, attempt_id, plan_hash, executor) = (
                 call_id.clone(),
                 attempt_id.clone(),
                 plan_hash.clone(),
                 executor.clone(),
-                used.clone(),
             );
             Box::pin(async move {
                 calls::record_started_in(
@@ -460,26 +452,7 @@ impl Ledger for Coordinator {
                     None,
                     now,
                 )
-                .await?;
-                // 「首次授权消费」：一次性授权在这里被用掉。范围授权不因一次使用而消耗
-                // （§7.2），所以只动 `once`。组合计划按步放行时每一步的都看一遍。
-                for grant in &used {
-                    if let Some(mut row) = PolicyGrantRow::filter_by_id(grant.as_str())
-                        .first()
-                        .exec(ex)
-                        .await
-                        .map_err(crate::db::map_toasty)?
-                        && row.scope_kind == "once"
-                        && !row.consumed
-                    {
-                        row.update()
-                            .consumed(true)
-                            .exec(ex)
-                            .await
-                            .map_err(crate::db::map_toasty)?;
-                    }
-                }
-                Ok(())
+                .await
             }) as BoxFuture<'_, Result<(), StoreError>>
         })
         .await?;
@@ -616,9 +589,9 @@ impl Ledger for Coordinator {
     }
 
     async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
-        // 「停在哪个调用上」**不在这条事件里**：审批的调用在 `approval_requests.call_id`
-        // 上，结果不明的调用在 `tool_calls.state = 'uncertain'` 那一条上——两处各自是权威，
-        // 事件里再存一份只会和它们漂移（§7.5）。
+        // 「停在哪个调用上」**不在这条事件里**：结果不明的调用在
+        // `tool_calls.state = 'uncertain'` 那一条上，那里是权威，事件里再存一份只会和它
+        // 漂移（§7.5）。
         let payload = EventPayload::RunWaiting(RunWaiting {
             reason: wait.clone(),
         });
@@ -942,7 +915,7 @@ impl Ledger for Coordinator {
             log.append(PendingEvent::new(
                 event_id.clone(),
                 None,
-                // 补写保留**原始发生时间**，不凭日志行相邻推断审批关系（§8.3）。
+                // 补写保留**原始发生时间**，不凭日志行相邻推断事件关系（§8.3）。
                 occurred_at,
                 payload,
             ))
@@ -1042,14 +1015,12 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
-    use komo_kernel::events::ApprovalDecided;
     use komo_kernel::test_support::{MemLedger, TestClock, sample_model, sample_plan};
     use komo_kernel::traits::Clock as _;
     use komo_kernel::traits::RunQueue as _;
     use komo_kernel::traits::ToolOutputStore as _;
-    use komo_kernel::types::chat::ApprovalScope;
     use komo_kernel::types::delegate::{DelegateSpec, SchemaMode};
-    use komo_kernel::types::ids::{ApprovalId, RequestKey};
+    use komo_kernel::types::ids::RequestKey;
     use komo_kernel::types::model::TokenUsage;
     use komo_kernel::types::plan::PlanSource;
     use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultBody};
@@ -1211,11 +1182,7 @@ mod tests {
         let plan = sample_plan("read", &f.session);
         let plan_event = f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
 
-        let attempt = f
-            .coordinator
-            .start_call(&ids[0], &plan, Default::default())
-            .await
-            .unwrap();
+        let attempt = f.coordinator.start_call(&ids[0], &plan).await.unwrap();
         f.coordinator
             .finish_call(&attempt, published())
             .await
@@ -1487,45 +1454,6 @@ mod tests {
                 held: 1,
                 current: 2
             }
-        );
-    }
-
-    /// 停在一条审批上：事件里带的是**等什么**（`WaitReason`），行上是 `waiting` + 三列。
-    #[tokio::test]
-    async fn waiting_for_approval_writes_the_reason_both_to_the_event_and_the_row() {
-        let f = fixture().await;
-        let accepted = f
-            .coordinator
-            .accept_input(input("api:1", "跑一下", &f.session))
-            .await
-            .unwrap();
-        f.coordinator
-            .suspend(
-                &accepted.run,
-                WaitReason::Approval {
-                    approval: ApprovalId::from_raw("ap-1"),
-                },
-            )
-            .await
-            .unwrap();
-
-        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
-        let EventPayload::RunWaiting(body) = &batch.events.last().unwrap().payload else {
-            panic!()
-        };
-        assert_eq!(body.reason.kind(), "approval");
-        assert_eq!(body.reason.reference().as_deref(), Some("ap-1"));
-
-        let record = crate::repos::runs::get(&f.db, &accepted.run)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(record.state, RunState::Waiting);
-        assert_eq!(
-            record.wait,
-            Some(WaitReason::Approval {
-                approval: ApprovalId::from_raw("ap-1"),
-            }),
         );
     }
 
@@ -1825,14 +1753,11 @@ mod tests {
 
         let event_id = EventId::from_raw("00000000-0000-7000-8000-0000000000aa");
         let decided_at = time::macros::datetime!(2026-09-14 20:30:00 UTC);
-        let payload = EventPayload::ApprovalDecided(ApprovalDecided {
-            approval: ApprovalId::from_raw("ap-1"),
-            approved: true,
-            scope: ApprovalScope::Once,
-            by: Some(komo_kernel::types::chat::PeerId::new("operator")),
-            decided_at,
-            grant: None,
-        });
+        // 删审批之前排进 control_outbox 的那种行：词汇里没有了，按 Unknown 补写（D3）。
+        let payload = EventPayload::Unknown {
+            event_type: "approval.decided".into(),
+            raw: serde_json::json!({"approval": "ap-1", "approved": true}),
+        };
 
         let first = f
             .coordinator
@@ -1952,11 +1877,7 @@ mod tests {
             .unwrap();
         let plan = sample_plan("shell", &f.session);
         f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
-        let attempt = f
-            .coordinator
-            .start_call(&ids[0], &plan, Default::default())
-            .await
-            .unwrap();
+        let attempt = f.coordinator.start_call(&ids[0], &plan).await.unwrap();
 
         let mut result = published();
         result.status = ToolResultStatus::Uncertain;
@@ -1987,11 +1908,7 @@ mod tests {
             .await
             .unwrap();
         let plan = sample_plan("shell", &f.session);
-        let error = f
-            .coordinator
-            .start_call(&ids[0], &plan, Default::default())
-            .await
-            .unwrap_err();
+        let error = f.coordinator.start_call(&ids[0], &plan).await.unwrap_err();
         assert!(matches!(error, LedgerError::Conflict(_)), "{error}");
     }
 

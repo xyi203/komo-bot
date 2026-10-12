@@ -30,7 +30,7 @@ use komo_kernel::types::refs::{
     AttemptRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput,
 };
 use komo_kernel::types::status::{RunEnd, WaitReason};
-use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUses};
+use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch};
 use komo_store::{Coordinator, Db, FileToolOutputStore, SessionPaths};
 
 use crate::sse::SharedHub;
@@ -252,9 +252,8 @@ impl Ledger for PublishingLedger {
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grants: GrantUses,
     ) -> Result<AttemptId, LedgerError> {
-        pumped!(self, self.inner.start_call(call, plan, grants).await)
+        pumped!(self, self.inner.start_call(call, plan).await)
     }
 
     async fn finish_call(
@@ -334,8 +333,6 @@ pub struct RoutedLedger {
     runs: Mutex<BTreeMap<RunId, SessionId>>,
     calls: Mutex<BTreeMap<ToolCallId, SessionId>>,
     attempts: Mutex<BTreeMap<AttemptId, SessionId>>,
-    /// 「有人刚停在一份**待审批**上」的信号（见 [`Self::suspend`]）。
-    audit_wake: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for RoutedLedger {
@@ -349,7 +346,6 @@ impl RoutedLedger {
         ledgers: Arc<SessionLedgers>,
         db: Db,
         clock: Arc<dyn komo_kernel::traits::Clock>,
-        audit_wake: Arc<tokio::sync::Notify>,
     ) -> Self {
         RoutedLedger {
             ledgers,
@@ -358,7 +354,6 @@ impl RoutedLedger {
             runs: Mutex::new(BTreeMap::new()),
             calls: Mutex::new(BTreeMap::new()),
             attempts: Mutex::new(BTreeMap::new()),
-            audit_wake,
         }
     }
 
@@ -571,10 +566,9 @@ impl Ledger for RoutedLedger {
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grants: GrantUses,
     ) -> Result<AttemptId, LedgerError> {
         let entry = self.for_call(call).await?;
-        let attempt = entry.ledger.start_call(call, plan, grants).await?;
+        let attempt = entry.ledger.start_call(call, plan).await?;
         self.note_attempt(&attempt, entry.ledger.session());
         Ok(attempt)
     }
@@ -605,23 +599,7 @@ impl Ledger for RoutedLedger {
     }
 
     async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {
-        let outcome = self
-            .for_run(run)
-            .await?
-            .ledger
-            .suspend(run, wait.clone())
-            .await;
-        // 停在**待审批**上：`approval.requested` 那条审计事件还在 `control_outbox` 里
-        // （§8.5 的反向顺序：state.db 权威先提交，JSONL 那一条随后补写），而界面正是靠
-        // 它才知道有人等着回答——`run.waiting` 只说"停在审批上"，短 ID 在它身上。
-        // 等周期（`AUDIT_TICK`）就是让操作者的弹窗晚到一分钟，所以这里立刻叫醒补写。
-        //
-        // 审批请求此刻**已经提交**（`ApprovalGate::request` 在 `suspend` 之前跑完），
-        // 所以醒来一定能读到那一行；拿不到时补写留到下一拍，不影响权威。
-        if outcome.is_ok() && matches!(wait, WaitReason::Approval { .. }) {
-            self.audit_wake.notify_one();
-        }
-        outcome
+        self.for_run(run).await?.ledger.suspend(run, wait).await
     }
 
     async fn complete(&self, run: &RunId, end: RunEnd) -> Result<(), LedgerError> {
@@ -821,7 +799,6 @@ mod tests {
             Arc::clone(&ledgers),
             store.db().clone(),
             Arc::new(TestClock::fixed()),
-            Arc::new(tokio::sync::Notify::new()),
         ));
         (ledgers, routed, hub)
     }

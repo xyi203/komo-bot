@@ -1,4 +1,4 @@
-//! `cron_jobs`：定时任务定义、版本与授权（§10）。耐久表。
+//! `cron_jobs`：定时任务定义与版本（§10）。耐久表。
 
 use super::{ColumnSpec, TableSpec};
 
@@ -13,7 +13,7 @@ pub struct CronJobRow {
     #[key]
     pub id: String,
     pub name: String,
-    /// 定义版本。Job 改了，绑定它的授权失效（§7.2）。
+    /// 定义版本。Job 改了定义就 +1（§10）。
     pub version: i64,
     /// `Trigger` 的 JSON（`cron` 表达式 + IANA 区名，或 `@at` 的瞬时）。
     pub trigger: String,

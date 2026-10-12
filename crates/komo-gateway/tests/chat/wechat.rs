@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use komo_gateway::channels::ChannelSender;
 use komo_kernel::traits::Channel;
-use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, DeliveryState};
+use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, DeliveryState, Outbound};
 
 use crate::harness::{
     FixedFactory, GatewayBuilder, TestGateway, config_toml, eventually, wechat_block,
@@ -88,13 +88,14 @@ async fn a_replayed_client_id_produces_one_run() {
 async fn a_delivery_before_the_user_speaks_is_deferred() {
     let wired = wire(Behavior::default(), Vec::new()).await;
     wired.polled_at_least(1).await;
-    let record = wired.gateway.pending_approval().await;
 
     let deliveries = wired
         .gateway
         .state()
         .notifier
-        .deliver_approval(None, komo_runtime::approvals::presentation(&record))
+        .deliver_home(Outbound::Text {
+            text: "要你看一眼".into(),
+        })
         .await
         .expect("登记得上");
     assert_eq!(deliveries.len(), 1, "只有 home chat 一个目标");
@@ -118,18 +119,19 @@ async fn a_delivery_before_the_user_speaks_is_deferred() {
 async fn the_backlog_is_flushed_before_the_new_message() {
     let wired = wire(Behavior::default(), Vec::new()).await;
     wired.polled_at_least(1).await;
-    let record = wired.gateway.pending_approval().await;
 
     wired
         .gateway
         .state()
         .notifier
-        .deliver_approval(None, komo_runtime::approvals::presentation(&record))
+        .deliver_home(Outbound::Text {
+            text: "积压的那一条".into(),
+        })
         .await
         .expect("登记得上");
     assert!(wired.fake.sent_texts().is_empty(), "此刻还推不出去");
 
-    // 用户说话了：令牌有了，积压的审批先送到，然后才是这条 `/status` 的回执。
+    // 用户说话了：令牌有了，积压的那条先送到，然后才是这条 `/status` 的回执。
     wired.fake.push(&text_wire("wxid_op", "cid-2", "/status"));
 
     let fake = Arc::clone(&wired.fake);
@@ -140,11 +142,11 @@ async fn the_backlog_is_flushed_before_the_new_message() {
 
     let texts = wired.fake.sent_texts();
     assert!(
-        texts[0].contains(record.short_id.as_str()) && texts[0].contains("shell"),
-        "第一条要是积压的审批请求：{texts:?}"
+        texts[0].contains("积压的那一条"),
+        "第一条要是积压的那条投递：{texts:?}"
     );
     assert!(
-        texts[1].contains("待处理（共 1 条）：审批 1"),
+        texts[1].contains("待处理（共 0 条）"),
         "第二条才是 `/status` 的回执：{texts:?}"
     );
     assert!(

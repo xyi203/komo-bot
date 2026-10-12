@@ -1,22 +1,19 @@
 //! executor / agent 测试共用的装配（只在 `cfg(test)` 下编译）。
 //!
-//! 替身全部来自 kernel 的 `test_support`：账本真的按 seq 追加、审批真的幂等、输出
-//! 存储真的能把发布过的正文读回来。所以这些测试断言的是**实际发生了什么**，不是
+//! 替身全部来自 kernel 的 `test_support`：账本真的按 seq 追加、输出存储真的能把发布
+//! 过的正文读回来。所以这些测试断言的是**实际发生了什么**，不是
 //! "状态变成了 running"。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use async_trait::async_trait;
-use komo_kernel::policy::RuleTable;
-use komo_kernel::test_support::{
-    MemApprovalRepo, MemLedger, MemOutputStore, TestClock, sample_model,
-};
+use komo_kernel::test_support::{MemLedger, MemOutputStore, TestClock, sample_model};
 use komo_kernel::traits::{Clock, Ledger, Tool};
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::{AttemptId, OperationId, RequestKey, RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::{
-    ApprovedPlan, ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode, Verification,
+    ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode, Verification,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{
@@ -24,16 +21,12 @@ use komo_kernel::types::tool::{
 };
 use komo_kernel::types::turn::{AcceptInput, AssistantRound, ToolCallRequest};
 
-use crate::approvals::ApprovalGate;
 use crate::executor::{CallEnv, CallRequest, ExecutionLimits, ToolExecutor};
-use crate::policy::PolicyEngine;
 
 pub struct Harness {
     pub clock: TestClock,
     pub ledger: Arc<MemLedger>,
     pub outputs: Arc<MemOutputStore>,
-    pub approvals: MemApprovalRepo,
-    pub gate: ApprovalGate,
     pub dir: tempfile::TempDir,
     /// 装进执行器的工具名 = `env()` 给的**默认能力面**（§4 末）。测试要更窄的面就在拿到
     /// 的 `CallEnv` 上盖 `surface`。
@@ -49,20 +42,30 @@ impl Default for Harness {
 impl Harness {
     pub fn new() -> Self {
         let clock = TestClock::fixed();
-        let approvals = MemApprovalRepo::new();
-        let gate = ApprovalGate::new(Arc::new(approvals.clone()), Arc::new(clock.clone()));
         Self {
             ledger: Arc::new(MemLedger::new(clock.clone())),
             outputs: Arc::new(MemOutputStore::new()),
-            approvals,
-            gate,
             dir: tempfile::tempdir().expect("临时目录"),
             surface: std::sync::Mutex::new(Vec::new()),
             clock,
         }
     }
 
-    pub fn executor(&self, tools: Vec<Arc<dyn Tool>>, policy: PolicyEngine) -> Arc<ToolExecutor> {
+    pub fn executor(&self, tools: Vec<Arc<dyn Tool>>) -> Arc<ToolExecutor> {
+        Arc::new(self.build(tools))
+    }
+
+    /// 外加一份 `TaskSpawner`——`dispatch` / `follow` 的验收要它
+    /// （`docs/background-tasks.md`）。
+    pub fn executor_with_spawner(
+        &self,
+        tools: Vec<Arc<dyn Tool>>,
+        spawner: Arc<dyn komo_kernel::traits::TaskSpawner>,
+    ) -> Arc<ToolExecutor> {
+        Arc::new(self.build(tools).with_spawner(spawner))
+    }
+
+    fn build(&self, tools: Vec<Arc<dyn Tool>>) -> ToolExecutor {
         // 这一段运行的能力面 = 装进来的工具（`env()` 拿它当默认面）。
         {
             let mut surface = self.surface.lock().expect("能力面");
@@ -73,63 +76,13 @@ impl Harness {
                 }
             }
         }
-        Arc::new(
-            ToolExecutor::new(
-                tools,
-                self.ledger.clone(),
-                self.outputs.clone(),
-                self.gate.clone(),
-                policy,
-                Arc::new(self.clock.clone()),
-            )
-            .with_limits(ExecutionLimits::default()),
-        )
-    }
-
-    /// 什么都要问的最保守策略。
-    pub fn conservative(&self, tools: Vec<Arc<dyn Tool>>) -> Arc<ToolExecutor> {
-        self.executor(tools, PolicyEngine::conservative())
-    }
-
-    /// §7.1 那张初始建议表。
-    pub fn initial(&self, tools: Vec<Arc<dyn Tool>>) -> Arc<ToolExecutor> {
-        self.executor(tools, PolicyEngine::initial())
-    }
-
-    /// §7.1 那张初始建议表，外加一份 `TaskSpawner`——`dispatch` / `follow` 的验收要它
-    /// （`docs/background-tasks.md`）。
-    pub fn initial_with_spawner(
-        &self,
-        tools: Vec<Arc<dyn Tool>>,
-        spawner: Arc<dyn komo_kernel::traits::TaskSpawner>,
-    ) -> Arc<ToolExecutor> {
-        let executor = ToolExecutor::new(
-            tools.clone(),
+        ToolExecutor::new(
+            tools,
             self.ledger.clone(),
             self.outputs.clone(),
-            self.gate.clone(),
-            PolicyEngine::initial(),
             Arc::new(self.clock.clone()),
         )
         .with_limits(ExecutionLimits::default())
-        .with_spawner(spawner);
-        {
-            let mut surface = self.surface.lock().expect("能力面");
-            for tool in &tools {
-                let name = tool.definition().name;
-                if !surface.contains(&name) {
-                    surface.push(name);
-                }
-            }
-        }
-        Arc::new(executor)
-    }
-
-    /// 全放行——测"执行本身"时不想被审批挡住。
-    pub fn permissive(&self, tools: Vec<Arc<dyn Tool>>) -> Arc<ToolExecutor> {
-        let mut table = RuleTable::empty();
-        table.default = komo_kernel::policy::Effect::Allow;
-        self.executor(tools, PolicyEngine::from_rules(table))
     }
 
     /// 开一个 Run，走真实的 `accept_input`。
@@ -205,7 +158,7 @@ impl Harness {
     pub async fn crashed_attempt(&self, call: &ToolCallId, plan: &ExecutionPlan) -> AttemptId {
         self.ledger.plan_call(call, plan).await.expect("落计划");
         self.ledger
-            .start_call(call, plan, Default::default())
+            .start_call(call, plan)
             .await
             .expect("写 tool.started")
     }
@@ -324,7 +277,7 @@ impl RecordingTool {
         }
     }
 
-    /// 一个"任意 shell 命令"形状的工具：初始规则表对它答 Ask。
+    /// 一个"任意 shell 命令"形状的工具。
     pub fn shell() -> Self {
         Self::new(
             "shell",
@@ -398,7 +351,7 @@ impl Tool for RecordingTool {
 
     async fn execute(
         &self,
-        _plan: ApprovedPlan,
+        _plan: ExecutionPlan,
         _ctx: &ToolContext,
         _sink: &mut dyn komo_kernel::traits::OutputWriter,
     ) -> Result<ToolOutput, ToolError> {

@@ -6,7 +6,7 @@
 use komo_kernel::traits::StoreError;
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::{
-    ApprovalId, EventId, ExecutorId, InterventionId, RequestKey, RunId, Seq, SessionId,
+    EventId, ExecutorId, InterventionId, RequestKey, RunId, Seq, SessionId,
 };
 use komo_kernel::types::memory::MemoryWork;
 use komo_kernel::types::model::ModelConfig;
@@ -138,8 +138,10 @@ pub fn wait_of(row: &RunRow) -> Result<Option<WaitReason>, StoreError> {
         })
     };
     Ok(Some(match kind {
+        // 删审批之前落盘的行（D2）：只解码，不再产生。旧审批 ID 缺了也不算损坏——
+        // Gateway 启动时按"调用确定尚未执行"续跑它，不看审批行。
         "approval" => WaitReason::Approval {
-            approval: ApprovalId::from_raw(reference("approval")?),
+            approval: row.wait_ref.clone().unwrap_or_default(),
         },
         "intervention" => WaitReason::Intervention {
             intervention: InterventionId::from_raw(reference("intervention")?),
@@ -165,7 +167,7 @@ pub fn wait_of(row: &RunRow) -> Result<Option<WaitReason>, StoreError> {
         },
         other => {
             return Err(StoreError::Corrupt(format!(
-                "runs.wait_kind 认不出的值 {other:?}（Run {}）：只认 approval / retry / \
+                "runs.wait_kind 认不出的值 {other:?}（Run {}）：只认 approval（旧行）/ retry / \
                  intervention / dependency",
                 row.id
             )));
@@ -218,9 +220,9 @@ pub fn wait_ref_str(wait: &WaitReason) -> Option<String> {
 
 /// 把一条 Run 写进等待：状态、等待三列、重试计数、原因，与**交还领取权**同一个提交。
 ///
-/// 交还领取权是这一条的一部分（§7.4「停在一条审批上，已释放执行名额」）：不清
-/// `claimed_by`，§8.7 的候选查询里那个 `claimed_by IS NULL` 永远筛不到这一行——审批答复
-/// 了、退避到期了，它也再没有人领得走，一个"等一会儿"就变成了永久停摆。
+/// 交还领取权是这一条的一部分（停着等就要释放执行名额）：不清 `claimed_by`，§8.7 的
+/// 候选查询里那个 `claimed_by IS NULL` 永远筛不到这一行——核对答复了、退避到期了，它也
+/// 再没有人领得走，一个"等一会儿"就变成了永久停摆。
 async fn write_wait_in(
     ex: &mut dyn Executor,
     row: &mut RunRow,

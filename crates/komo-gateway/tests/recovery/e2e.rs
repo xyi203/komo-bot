@@ -10,8 +10,8 @@ use crate::harness::*;
 ///
 /// > 启动 komo 自动拉起 Gateway，通过模型调用 write 生成工作文件，在任务的后续步骤前重启
 /// > Gateway；**不打开 CLI 也应自动接续原 Run**，随后 resume 原会话查看结果，再读出原
-/// > 文件。随后验证一次待审批 shell 在重启后仍等待，在飞书或 Telegram 里批准后**只执行
-/// > 一次**已确认的调用；若模拟执行结果丢失，则进入未知状态核对而不是自动重跑。
+/// > 文件。随后验证一次要人核对的调用在重启后仍等待，在飞书或 Telegram 里答复后**只收尾
+/// > 一次**；若模拟执行结果丢失，则进入未知状态核对而不是自动重跑。
 ///
 /// 这里的"CLI"就是 `komo-client` 的那条 HTTP 路——`resume` 这一步用**真的 `KomoClient`**
 /// 发（它是 gateway 的 dev-dependency，不成环）。关键是**顺序**：先什么客户端都不开地让
@@ -117,68 +117,53 @@ async fn the_first_end_to_end_acceptance() {
         "read 读回来的就是原文件：{body}"
     );
 
-    // ── 5. 一次待审批 shell 在重启后仍等待，批准后只执行一次。
-    let counter = Counter::new(&home, "e2e.count");
+    // ── 5. 一次要人核对的调用（结果不明，测试工具 `unsure`）在重启后仍等待，核对之后
+    //    只收尾一次。审批 2026-10-11 删掉之后（§7），"停下来等人"只剩介入这一类。
     gw.stop().await;
+    let unsure = komo_gateway::service::test_support::Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
     let gw = home
         .start(FakeLlm::new(vec![vec![
-            call_round(
-                1,
-                "pc-shell",
-                "shell",
-                serde_json::json!({"command": counter.append_command()}),
-            ),
+            call_round(1, "pc-unsure", "unsure", serde_json::json!({})),
             text_round(2, "跑过了。"),
         ]]))
         .await;
-    let shell_run = gw.submit(&session, "e2e-3", "跑一条命令").await.run;
-    let pending = gw.wait_approval().await;
-    assert_eq!(pending.run.as_ref(), Some(&shell_run));
+    let unsure_run = gw.submit(&session, "e2e-3", "跑一条命令").await.run;
+    let pending = gw.wait_intervention(&unsure_run).await;
     gw.stop().await;
-    assert_eq!(counter.count(), 0, "没批准就不执行");
 
-    let gw = home.start(FakeLlm::finisher("批准之后跑过了。")).await;
-    // 重启后仍然等待——同一条审批，同一个短 ID，没有第二条。
-    let still = gw.approvals().await;
+    let gw = home.start(FakeLlm::finisher("核对之后跑过了。")).await;
+    // 重启后仍然等待——同一条介入，同一个句柄，没有第二条。
+    let still = gw.interventions().await;
     assert_eq!(still.len(), 1, "重启后仍等待：{still:?}");
-    assert_eq!(still[0].approval, pending.approval, "还是原来那一条");
-    assert_eq!(still[0].short_id, pending.short_id, "短 ID 也没变");
+    assert_eq!(still[0].handle, pending.handle, "还是原来那一条");
     // §8.4 把"停"拆成两维：状态是 `Waiting`，**在等什么**另说。只断言状态等于弱化——
     // 退避、依赖那些"不是在等人"的等待也是 `Waiting`，所以第二维必须一起断言。
     assert_eq!(
-        gw.db_state(&shell_run).await,
+        gw.db_state(&unsure_run).await,
         RunState::Waiting,
         "Run 还停在等待上"
     );
-    assert_eq!(
-        gw.wait_waiting(&shell_run).await,
-        WaitReason::Approval {
-            approval: pending.approval.clone()
-        },
-        "等的是原来那一条审批，不是别的理由"
+    assert!(
+        matches!(
+            gw.wait_waiting(&unsure_run).await,
+            WaitReason::Intervention { .. }
+        ),
+        "等的是原来那一条介入，不是别的理由"
     );
 
-    // 在"聊天里"批准（HTTP 与聊天走的是同一段代码，§13.1）。
-    gw.decide(&pending.approval, true).await;
-    let detail = gw.wait_terminal(&shell_run).await;
+    // 在"聊天里"答复（HTTP 与聊天走的是同一段代码，§13.1）。
+    gw.answer(&pending.handle, "satisfied").await;
+    let detail = gw.wait_terminal(&unsure_run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
-    assert_eq!(counter.count(), 1, "**只执行一次**已确认的调用");
+    assert_eq!(unsure.ran(), 1, "核对之后**不重跑**");
 
-    // 授权消费：一次性授权用掉了，重复批准不再放行第二次执行。
-    let consumed = gw
-        .running
-        .state
-        .approval_repo
-        .get(&pending.approval)
-        .await
-        .expect("读得到")
-        .expect("有这条");
-    let decision = consumed.decision.as_ref().expect("有结论");
-    assert!(decision.approved);
-    assert!(decision.consumed, "一次性授权被消费掉了");
-    gw.decide(&pending.approval, true).await;
+    // 重复答复回原结论，不重复执行。
+    let again: komo_kernel::protocol::http::InterventionAnswerResponse =
+        serde_json::from_str(&gw.answer(&pending.handle, "satisfied").await).expect("回执");
+    assert!(again.already_answered, "{again:?}");
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-    assert_eq!(counter.count(), 1, "重复批准不重复执行");
+    assert_eq!(unsure.ran(), 1, "重复答复不重复执行");
 
     // ── 6. 模拟执行结果丢失。§8.6 的规矩是「**先判断是否发生**，再决定是否重试」，所以
     //    "丢了结果"有两种结局，取决于这个工具核对不核对得出来。两种各断言一次。
@@ -266,8 +251,6 @@ async fn the_first_end_to_end_acceptance() {
         ]]))
         .await;
     let lost_run = gw.submit(&session, "e2e-5", "再跑一条命令").await.run;
-    let record = gw.wait_approval().await;
-    gw.decide(&record.approval, true).await;
     fault.wait_tripped().await;
     gw.stop().await;
     assert_eq!(counter2.count(), 1, "动作发出去了，结果丢了");
@@ -339,9 +322,7 @@ async fn directories_and_references() {
                 ),
                 text_round(2, "A 跑过了。"),
             ],
-            // 第 2 段：批准之后的**续跑**也是一次 `begin_turn`，它不该再要求任何调用。
-            vec![text_round(2, "A 跑过了。")],
-            // 第 3 段：B 会话。
+            // 第 2 段：B 会话。
             vec![
                 call_round(
                     1,
@@ -356,14 +337,10 @@ async fn directories_and_references() {
 
     let session_a = gw.open_session().await;
     let run_a = gw.submit(&session_a, "dir-a", "跑 A").await.run;
-    let approval = gw.wait_approval().await;
-    gw.decide(&approval.approval, true).await;
     gw.wait_terminal(&run_a).await;
 
     let session_b = gw.open_session().await;
     let run_b = gw.submit(&session_b, "dir-b", "跑 B").await.run;
-    let approval = gw.wait_approval().await;
-    gw.decide(&approval.approval, true).await;
     gw.wait_terminal(&run_b).await;
 
     // ① 事件、输出与 stdout / stderr 都在**同一个 Session 目录**下，引用是相对路径。

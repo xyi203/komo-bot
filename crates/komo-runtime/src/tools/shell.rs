@@ -16,9 +16,7 @@ use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
-use komo_kernel::types::plan::{
-    ApprovedPlan, ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode,
-};
+use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
@@ -64,10 +62,9 @@ pub struct ShellResult {
 
 /// 一条 shell 命令的执行计划**形状**：工具名、操作、命令正文的版本快照、恢复方式。
 ///
-/// **唯一的构造处**：[`ShellTool::prepare`] 与 Gateway 在 `cron add` 时为命令 Job 签发
-/// 授权，都调它——授权的匹配器要与触发时 CommandDriver 真正跑出来的那份计划同源，
-/// 手写第二份迟早会在这两处之间长出一条缝（§10、§7.2）。`run` / `tool_call` 不在这里
-/// 填：那两个字段来自一次具体的调用，`cron add` 时还没有这次调用。
+/// **唯一的构造处**：[`ShellTool::prepare`] 与 `then_run`（经 [`plan_for_call`]）都调它
+/// ——手写第二份迟早会在几处之间长出一条缝（§10）。`run` / `tool_call` 不在这里填：那两个
+/// 字段来自一次具体的调用。
 pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPlan {
     ExecutionPlan {
         operation_id: OperationId::new_at(plan_time()),
@@ -84,7 +81,7 @@ pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPla
         // `ShellCommand` 与命令正文匹配，不按路径。
         targets: vec![],
         versions: PlanVersions {
-            // 命令正文的快照：命令改一个字节，绑定它的授权就覆盖不到了（§5.4）。
+            // 命令正文的快照：命令改一个字节，计划就是另一份（§5.4）。
             code: Some(ContentHash::of_str(command)),
             ..Default::default()
         },
@@ -97,7 +94,7 @@ pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPla
 /// 一次具体调用的 shell 计划：[`plan_for`] 加上这次调用的 Run / ToolCall 与完整参数。
 ///
 /// `shell` 自己的 `prepare` 与 `edit` / `write` 的 `then_run`（[`super::fusion`]）共用它：
-/// 第二步就是一条普通的 shell 计划，规则、授权与审批按同一个形状匹配。
+/// 第二步就是一条普通的 shell 计划，账本里与单独一次 `shell` 同一个形状。
 pub fn plan_for_call(args: &ShellArgs, ctx: &ToolContext) -> Result<ExecutionPlan, ToolError> {
     if args.command.trim().is_empty() {
         return Err(ToolError::InvalidArguments {
@@ -168,14 +165,17 @@ impl Tool for ShellTool {
         ToolDefinition {
             name: "shell".into(),
             description:
-                "在自己的进程组里跑一条 shell 命令，返回退出码与输出。搜索、git、构建、测试都走它。"
+                "在自己的进程组里跑一条 shell 命令，返回退出码与输出。搜索、git、构建、测试都走它。\
+                 等一件慢事（下载、构建、部署）就在一条命令里循环轮询、每轮打印一行进度，并把 \
+                 timeout_secs 给够；到点会终止进程组，到点前打印的输出照样交回，接着再发一条即可。\
+                 不要每轮只 sleep 一下就交回来再问一次。"
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "要执行的命令，交给 /bin/sh -c" },
                     "cwd": { "type": "string", "description": "工作目录；相对路径按会话工作目录解析" },
-                    "timeout_secs": { "type": "integer", "minimum": 1, "description": "活动执行时限，秒" }
+                    "timeout_secs": { "type": "integer", "minimum": 1, "description": "活动执行时限，秒；省略 = 120，上限是这次调用的活动执行时限" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -194,11 +194,11 @@ impl Tool for ShellTool {
 
     async fn execute(
         &self,
-        plan: ApprovedPlan,
+        plan: ExecutionPlan,
         ctx: &ToolContext,
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
-        let plan = plan.plan();
+        let plan = &plan;
         let args: ShellArgs = parse_args(plan.args.clone(), "shell")?;
         let cwd: PathBuf = plan.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
         let timeout = args
@@ -232,17 +232,15 @@ impl Tool for ShellTool {
         if outcome.cancelled {
             return Err(ToolError::Cancelled);
         }
-        if outcome.timed_out {
-            return Err(ToolError::Timeout {
-                after_secs: timeout.as_secs(),
-            });
-        }
 
+        // 超时**不是一句光秃秃的"超时"**：到点前打印的输出照样交回（与 `rg` 同一条，§4）。
+        // 轮询循环跑满时限时，模型要看得到最后一次查到的进度，才知道接着等还是换个做法；
+        // 只给一句"超时：600s"，它只能把同一个循环从头再跑一遍。状态是失败——命令没跑完。
         let result = ShellResult {
             command: args.command,
             cwd: cwd.display().to_string(),
             exit_code: outcome.exit_code,
-            timed_out: false,
+            timed_out: outcome.timed_out,
             output_truncated: outcome.truncated,
             stdout_bytes: outcome.stdout_bytes,
             stderr_bytes: outcome.stderr_bytes,
@@ -250,16 +248,26 @@ impl Tool for ShellTool {
             stderr_excerpt: outcome.stderr_excerpt,
         };
         // 非零退出码是**结果**，不是工具失败：模型看得到退出码才改得动命令（§6）。
-        let status = if outcome.exit_code == Some(0) {
+        let status = if outcome.exit_code == Some(0) && !outcome.timed_out {
             ToolResultStatus::Completed
         } else {
             ToolResultStatus::Failed
         };
+        let head = if outcome.timed_out {
+            format!(
+                "timeout={}s（进程组已终止，下面是到点前的输出）",
+                timeout.as_secs()
+            )
+        } else {
+            format!(
+                "exit={}",
+                result
+                    .exit_code
+                    .map_or_else(|| "?".to_string(), |code| code.to_string())
+            )
+        };
         let preview = format!(
-            "exit={} stdout={}B stderr={}B{}\n{}{}",
-            result
-                .exit_code
-                .map_or_else(|| "?".to_string(), |code| code.to_string()),
+            "{head} stdout={}B stderr={}B{}\n{}{}",
             result.stdout_bytes,
             result.stderr_bytes,
             if result.output_truncated {
@@ -306,7 +314,7 @@ fn environment(ctx: &ToolContext) -> BTreeMap<String, String> {
 mod tests {
     use super::*;
     use crate::tools::process::process_group_alive;
-    use crate::tools::test_support::{approved, context, context_with_cancel, writer};
+    use crate::tools::test_support::{context, context_with_cancel, writer};
     use komo_kernel::types::tool::CancelToken;
 
     fn shell_result(output: &ToolOutput) -> ShellResult {
@@ -332,7 +340,7 @@ mod tests {
         assert_eq!(plan.recovery, RecoveryMode::NoSafeRecovery);
         assert_eq!(plan.versions.code, Some(ContentHash::of_str("echo hi")));
 
-        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(shell_result(&output).stdout_excerpt.trim(), "hi");
         assert!(sink.bytes_written() > 0, "输出流进了写入器");
@@ -348,7 +356,7 @@ mod tests {
             .prepare(serde_json::json!({ "command": "exit 3" }), &ctx)
             .await
             .unwrap();
-        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
         assert_eq!(output.status, ToolResultStatus::Failed);
         assert_eq!(output.exit_code, Some(3));
     }
@@ -364,7 +372,7 @@ mod tests {
             .prepare(serde_json::json!({ "command": "pwd", "cwd": "sub" }), &ctx)
             .await
             .unwrap();
-        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
         assert!(
             shell_result(&output).stdout_excerpt.trim().ends_with("sub"),
             "{:?}",
@@ -387,7 +395,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
         assert_eq!(shell_result(&output).stdout_excerpt.trim(), "[]");
         unsafe { std::env::remove_var("KOMO_TEST_SECRET") };
     }
@@ -419,10 +427,7 @@ mod tests {
             }
             stopper.cancel();
         });
-        let error = tool
-            .execute(approved(plan), &ctx, &mut sink)
-            .await
-            .unwrap_err();
+        let error = tool.execute(plan, &ctx, &mut sink).await.unwrap_err();
         assert!(matches!(error, ToolError::Cancelled), "{error:?}");
 
         let pgid: u32 = std::fs::read_to_string(&pid_file)
@@ -441,23 +446,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_timeout_is_reported_as_a_timeout() {
+    async fn a_timeout_hands_back_what_was_printed_before_it() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let tool = ShellTool::new();
         let mut sink = writer(&ctx);
         let plan = tool
             .prepare(
-                serde_json::json!({ "command": "sleep 30", "timeout_secs": 1 }),
+                serde_json::json!({
+                    "command": "echo 'poll 1: 3/23 layers'; sleep 30",
+                    "timeout_secs": 1
+                }),
                 &ctx,
             )
             .await
             .unwrap();
-        let error = tool
-            .execute(approved(plan), &ctx, &mut sink)
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ToolError::Timeout { .. }), "{error:?}");
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert_eq!(output.status, ToolResultStatus::Failed);
+        assert_eq!(output.result["timed_out"], true);
+        let preview = output.preview.unwrap();
+        assert!(preview.starts_with("timeout=1s"), "{preview}");
+        assert!(
+            preview.contains("poll 1: 3/23 layers"),
+            "到点前打印的进度要交回模型：{preview}"
+        );
     }
 
     /// 模型要的时限比活动执行时限长：收紧到上限，由 shell 自己杀进程报超时——否则执行器
@@ -476,13 +488,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = tool
-            .execute(approved(plan), &ctx, &mut sink)
-            .await
-            .unwrap_err();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert_eq!(output.result["timed_out"], true);
         assert!(
-            matches!(error, ToolError::Timeout { after_secs: 1 }),
-            "{error:?}"
+            output.preview.unwrap().starts_with("timeout=1s"),
+            "收紧到活动执行时限 1s"
         );
     }
 

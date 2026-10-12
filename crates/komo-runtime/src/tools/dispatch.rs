@@ -1,8 +1,8 @@
 //! `dispatch`：把一件耗时的事派进一条**独立的任务会话**在后台跑
 //! （`docs/background-tasks.md`）。
 //!
-//! 它和 [`super::delegate`] 是同一类东西——不是第七个基础工具，模型看不见任何新能力，
-//! 任务会话里的每一次调用照常过 Policy 与审批——但**目的不同**：`delegate` 是"这件事
+//! 它和 [`super::delegate`] 是同一类东西——不是第七个基础工具，模型看不见任何新能力
+//! ——但**目的不同**：`delegate` 是"这件事
 //! 我自己等着"，`dispatch` 是"这件事另起一个会话去跑，我不等它"。同一会话严格串行，
 //! 一件要跑几分钟的事放在当前会话里跑，用户这段时间发的每一句都得排在它后面。
 //!
@@ -122,7 +122,7 @@ impl Tool for DispatchTool {
 
     async fn execute(
         &self,
-        _plan: komo_kernel::types::plan::ApprovedPlan,
+        _plan: komo_kernel::types::plan::ExecutionPlan,
         _ctx: &ToolContext,
         _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
@@ -139,7 +139,7 @@ impl Tool for DispatchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context, writer};
+    use crate::tools::test_support::{context, writer};
 
     #[tokio::test]
     async fn the_plan_carries_the_task_and_title() {
@@ -195,7 +195,7 @@ mod tests {
             .unwrap();
 
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         let ToolError::Failed { message } = &error else {
@@ -204,7 +204,7 @@ mod tests {
         assert!(message.contains("dispatch"), "{message}");
     }
 
-    /// 计划哈希覆盖 task / title：内容变了，审批（若有）不能绑定到旧哈希上。
+    /// 计划哈希覆盖 task / title：内容变了，就是另一份计划。
     #[tokio::test]
     async fn the_plan_hash_changes_when_the_task_text_changes() {
         let dir = tempfile::tempdir().unwrap();

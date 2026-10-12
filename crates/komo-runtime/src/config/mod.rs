@@ -1,8 +1,8 @@
-//! ConfigSnapshot：config.toml / .env / policy.toml 的解析与校验（§3、§11.2）。
+//! ConfigSnapshot：config.toml / .env 的解析与校验（§3、§11.2）。
 //!
 //! 三件事，一个入口：
 //!
-//! - [`load_config`]：三个文件 → 一份 kernel [`ConfigSnapshot`] + 一份留在进程里的
+//! - [`load_config`]：两个文件 → 一份 kernel [`ConfigSnapshot`] + 一份留在进程里的
 //!   [`Secrets`]。凭证只以**变量名**出现在快照里，值不进快照（§3）。
 //! - [`validate`]：`komo config check` 与热重载共用的**同一个**校验函数。
 //! - [`ConfigHolder`]：进程内唯一的 `Arc<ConfigSnapshot>`，arc-swap 原子替换；
@@ -22,7 +22,6 @@ mod validate;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use komo_kernel::policy::RuleTable;
 use komo_kernel::protocol::config::{ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath};
 use time::OffsetDateTime;
 
@@ -65,7 +64,7 @@ pub struct Loaded {
     pub sources: Sources,
 }
 
-/// 解析三个文件并校验。
+/// 解析两个文件并校验。
 ///
 /// 相对路径按**配置文件所在目录**解析（§12）。`KOMO_HOME` 是唯一直接读的环境变量；
 /// `KOMO_LISTEN` 是另一个被认识的 `KOMO_*` 覆盖，优先级是 默认 < 文件 < 环境。
@@ -78,22 +77,15 @@ pub fn load_config(options: &LoadOptions) -> Result<Loaded, ConfigError> {
     })?;
 
     let (file, unknown) = read_config(&sources.config)?;
-    let policy = read_policy(&sources.policy)?;
 
-    let snapshot = file::assemble(
-        file,
-        &home,
-        &sources,
-        policy,
-        &secrets,
-        OffsetDateTime::now_utc(),
-    )?;
+    let snapshot = file::assemble(file, &home, &sources, &secrets, OffsetDateTime::now_utc())?;
 
     let mut issues = validate_with(&snapshot, &options.caps);
     if has_errors(&issues) {
         return Err(ConfigError::Invalid { issues });
     }
     issues.extend(unknown.iter().map(|key| unknown_key(key)));
+    issues.extend(retired_policy(&home));
 
     Ok(Loaded {
         snapshot: Arc::new(snapshot),
@@ -112,8 +104,7 @@ pub fn load_config(options: &LoadOptions) -> Result<Loaded, ConfigError> {
 /// `komo config check` 与 `komo doctor` 都会列出来——拼错的键（或者写到了错误的表下面，
 /// 比如 `default_agent` 落进了前面那个 `[agents.x]`）照样看得见。
 ///
-/// 键认识、值的类型不对仍然是解析错误：那种情况没有"忽略"这个安全的解释。policy.toml
-/// 不走这条路（见 [`read_policy`]）。
+/// 键认识、值的类型不对仍然是解析错误：那种情况没有"忽略"这个安全的解释。
 fn read_config(path: &Path) -> Result<(file::FileConfig, Vec<String>), ConfigError> {
     if !path.exists() {
         return Err(ConfigError::Io {
@@ -145,86 +136,22 @@ fn unknown_key(key: &str) -> ConfigIssue {
     }
 }
 
-/// policy.toml 直接反序列化成 kernel 的 [`RuleTable`]——规则是**数据**（§7.1），所以
-/// 这里没有第二套形状。文件不在就用 §7.1 的初始建议。
-///
-/// 这里**仍然拒绝未知键**（与 config.toml 不同）：规则里拼错一个键被悄悄忽略，这条规则
-/// 就不再按操作者以为的样子生效——授权面上宁可装不上，也不要"看起来配了"。
-fn read_policy(path: &Path) -> Result<RuleTable, ConfigError> {
-    if !path.exists() {
-        return Ok(RuleTable::initial());
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| ConfigError::Io {
-        path: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    let file: PolicyFile = toml::from_str(&text).map_err(|e| ConfigError::Parse {
-        file: path.to_path_buf(),
-        message: e.to_string(),
-    })?;
-    file.resolve().map_err(|message| ConfigError::Parse {
-        file: path.to_path_buf(),
-        message,
+/// 已经退役的 `policy.toml`（§7，2026-10-11 删除 Policy 与审批）。
+pub const RETIRED_POLICY_FILE: &str = "policy.toml";
+
+/// 文件还在就报一句（警告，配置照常装上）：不读它，但也**不静默忽略**——操作者以为它还
+/// 管着什么，就得有地方告诉他不管了。与被忽略的键走同一条路，`komo config check`、
+/// 启动日志与热重载报告都看得见。
+fn retired_policy(home: &Path) -> Option<ConfigIssue> {
+    let path = home.join(RETIRED_POLICY_FILE);
+    path.exists().then(|| ConfigIssue {
+        key: KeyPath::new(RETIRED_POLICY_FILE),
+        severity: IssueSeverity::Warning,
+        message: format!(
+            "{} 已不再使用（§7，2026-10-11 删除），可以删掉",
+            path.display()
+        ),
     })
-}
-
-/// `policy.toml` 的**文件形状**：比 [`RuleTable`] 多一个可选的 `mode`。
-///
-/// 两条路二选一，不允许同时写：
-///
-/// - `mode = "strict" | "auto"`：选一张**基表**（§7.1 的两套建议），文件里的
-///   `[[rules]]` **追加在基表之后**。基表自带默认结论，所以这条路里不许再写 `default`。
-/// - 不写 `mode`：文件本身就是整张表（`default` + `[[rules]]`），与 §7.1 的内建建议
-///   无关——"我全都要自己写"那条路，也是这个键出现之前唯一的行为。
-///
-/// 规则本身的形状还是 kernel 的 [`PolicyRule`]，这里多出来的只有"选哪张基表"这一个决定。
-#[derive(Debug, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PolicyFile {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    mode: Option<PolicyMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    default: Option<komo_kernel::policy::Effect>,
-    #[serde(default)]
-    rules: Vec<komo_kernel::policy::PolicyRule>,
-}
-
-/// 一张**基表**（§7.1）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum PolicyMode {
-    /// §7.1 的初始建议：任意 shell / Python 都要人看一眼。
-    Strict,
-    /// 只问危险形状（`RuleTable::auto`）：日常命令不再打扰。
-    Auto,
-}
-
-impl PolicyFile {
-    fn resolve(self) -> Result<RuleTable, String> {
-        match (self.mode, self.default) {
-            // 基表自带默认结论，再写一个就是两个互相打架的答案。
-            (Some(mode), Some(_)) => Err(format!(
-                "`mode = \"{}\"` 与 `default` 只能留一个：`mode` 选一张基表（默认结论跟着基表走），\
-                 `default` 是自己写整张表时的默认结论",
-                match mode {
-                    PolicyMode::Strict => "strict",
-                    PolicyMode::Auto => "auto",
-                }
-            )),
-            (Some(mode), None) => {
-                let mut base = match mode {
-                    PolicyMode::Strict => RuleTable::initial(),
-                    PolicyMode::Auto => RuleTable::auto(),
-                };
-                base.rules.extend(self.rules);
-                Ok(base)
-            }
-            (None, default) => Ok(RuleTable {
-                rules: self.rules,
-                default: default.unwrap_or(komo_kernel::policy::Effect::Ask),
-            }),
-        }
-    }
 }
 
 #[cfg(test)]

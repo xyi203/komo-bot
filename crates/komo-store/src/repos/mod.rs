@@ -1,4 +1,4 @@
-//! 各仓储实现：ApprovalRepo / CronRepo / MemoryRepo / RunQueue 等（§13.5）。
+//! 各仓储实现：CronRepo / MemoryRepo / RunQueue 等（§13.5）。
 //!
 //! 一个 trait 一个模块。**写一律走 [`crate::db::Db::with_write_retry`]**（每个写，包括
 //! 只有一条语句的，都在一个 `BEGIN CONCURRENT` 事务里，§8.2）；读走
@@ -14,7 +14,6 @@
 //! [`reconcile`] 也不是 trait 实现：它们是 §7.5 / §8.9 的**派生查询与判定**，由 runtime
 //! 的清单接口与对账扫描直接调。
 
-pub mod approvals;
 pub mod calls;
 pub mod cron;
 pub mod deliveries;

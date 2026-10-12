@@ -67,7 +67,7 @@ pub async fn stream(
 
     // **先订阅再补读**：中间新写进来的事件才不会掉在两者之间。
     let live = api.state.hub.subscribe(&session);
-    // 而且**记一笔"有人在看"**：审批投递靠它判断要不要投 home chat（没人看着才投）。
+    // 而且**记一笔"有人在看"**：介入的周期兜底靠它判断要不要投 home chat（没人看着才投）。
     // 守卫跟着这条响应体走，连接断了就自动减一。
     let watching = api.state.hub.watch(&session);
     let history = backfill(&api, &session, from).await?;
@@ -127,12 +127,10 @@ fn frames(
                     Ok(frame) => {
                         // 补读已经给过的那些不再给一遍——**这条只对原始事件成立**。补读
                         // 只发 `SseEvent::Event`（`backfill` 造的那些），而派生帧
-                        // （`run_state` / `approval_pending` / `approval_decided` /
-                        // `assistant_delta`）与它们的源事件**同号**（`EventHub::publish_event`
-                        // 一对多推），一帧都没被补读过。按号一律丢的话这四类**永远到不了
-                        // 客户端**：原始帧先把号推上去，紧接着的派生帧就被当成重复吃掉。
-                        // 后果之一是 `approval_pending` 到不了 TUI——它停在"等待审批"
-                        // 不弹窗，审批在别处答完也不收窗。
+                        // （`run_status` / `assistant_delta`）与它们的源事件**同号**
+                        // （`EventHub::publish_event` 一对多推），一帧都没被补读过。按号一律
+                        // 丢的话它们**永远到不了客户端**：原始帧先把号推上去，紧接着的派生帧
+                        // 就被当成重复吃掉——TUI 就看不见 Run 停下了。
                         if frame.id <= last && matches!(frame.event, SseEvent::Event(_)) {
                             continue;
                         }
@@ -164,7 +162,8 @@ mod tests {
     use super::*;
     use futures_util::StreamExt;
     use komo_kernel::events::{Event, EventPayload, RunCompleted};
-    use komo_kernel::types::ids::{ApprovalId, EventId, RunId, ShortId};
+    use komo_kernel::types::ids::{EventId, RunId};
+    use komo_kernel::types::status::RunState;
     use time::macros::datetime;
 
     const SESSION: &str = "sess-1";
@@ -196,8 +195,8 @@ mod tests {
     /// 补读与直播的重叠只吃掉**重复的那一条原始事件**，不连它的派生帧一起吃掉。
     ///
     /// 派生帧与源事件同号（`EventHub::publish_event` 一对多推）。按号一律去重的话，
-    /// 原始帧先把号推上去，紧随其后的派生帧就被当成重复——四类派生帧**一帧都到不了
-    /// 客户端**：`approval_pending` 到不了 TUI，它就停在"等待审批"不弹窗。
+    /// 原始帧先把号推上去，紧随其后的派生帧就被当成重复——派生帧**一帧都到不了
+    /// 客户端**：`run_status` 到不了 TUI，它就看不见 Run 停下了。
     #[tokio::test]
     async fn a_derived_frame_is_not_deduped_away_by_its_own_event() {
         let (live, rx) = tokio::sync::broadcast::channel(8);
@@ -207,9 +206,9 @@ mod tests {
         live.send(SseFrame {
             id: Seq(7),
             session: SessionId::from_raw(SESSION),
-            event: SseEvent::ApprovalPending {
-                approval: ApprovalId::from_raw("ap-1"),
-                short_id: ShortId::from_index(3),
+            event: SseEvent::RunStatus {
+                run: RunId::from_raw("run-1"),
+                state: RunState::Waiting,
             },
         })
         .expect("推得进去");
@@ -222,11 +221,11 @@ mod tests {
             .await;
         assert!(out[0].starts_with("id: 7\nevent: event\n"), "{}", out[0]);
         assert!(
-            out[1].starts_with("id: 7\nevent: approval_pending\n"),
+            out[1].starts_with("id: 7\nevent: run_status\n"),
             "派生帧被自己的事件吃掉了：{}",
             out[1]
         );
-        assert!(out[1].contains(r#""short_id":"0003""#), "{}", out[1]);
+        assert!(out[1].contains(r#""state":"waiting""#), "{}", out[1]);
         assert!(out[2].starts_with("id: 8\nevent: event\n"), "{}", out[2]);
     }
 }

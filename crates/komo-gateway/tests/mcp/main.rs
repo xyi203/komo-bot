@@ -1,7 +1,8 @@
 //! MCP（`docs/mcp.md`）：真 Gateway + 一个真的 stdio MCP 服务器（`server.py`）。
 //!
-//! 钉住的是"MCP 工具走与内置工具同一条路"：操作者声明为只读的直接放行，其余要审批、
-//! 批了才真的执行；子进程只拿到声明过的 `.env` 变量；一个起不来的服务器不拖垮启动。
+//! 钉住的是"MCP 工具走与内置工具同一条路"：模型要的就执行（§7 没有 Policy，声明只读与否
+//! 只影响 codemode 里能不能调它），而且只执行一次；子进程只拿到声明过的 `.env` 变量；一个
+//! 起不来的服务器不拖垮启动。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -56,9 +57,9 @@ fn tool_results(llm: &FakeLlm) -> Vec<String> {
         .collect()
 }
 
-/// 声明为只读的工具不问人；子进程拿到了声明的 `DEMO_TOKEN`，没有继承 Gateway 的环境。
+/// 声明为只读的工具直接跑；子进程拿到了声明的 `DEMO_TOKEN`，没有继承 Gateway 的环境。
 #[tokio::test]
-async fn a_read_only_mcp_tool_runs_without_approval_and_sees_only_declared_env() {
+async fn a_read_only_mcp_tool_runs_and_sees_only_declared_env() {
     assert!(std::env::var("CARGO_MANIFEST_DIR").is_ok());
     let (home, _) = home_with_demo("");
     let llm = FakeLlm::new(vec![vec![
@@ -84,7 +85,7 @@ async fn a_read_only_mcp_tool_runs_without_approval_and_sees_only_declared_env()
     let run = gw.submit(&session, "mcp-1", "回显一下").await.run;
     let detail = gw.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
-    assert!(gw.approvals().await.is_empty(), "只读工具不该问人");
+    assert!(gw.interventions().await.is_empty(), "不该停下来问人");
 
     let results = tool_results(&llm);
     assert!(
@@ -95,9 +96,9 @@ async fn a_read_only_mcp_tool_runs_without_approval_and_sees_only_declared_env()
     );
 }
 
-/// 没声明只读的工具要审批；批了才真的执行一次。
+/// 没声明只读的工具同样直接执行（§7 没有审批），而且只执行一次。
 #[tokio::test]
-async fn a_side_effecting_mcp_tool_waits_for_approval_then_runs_once() {
+async fn a_side_effecting_mcp_tool_runs_directly_and_once() {
     let (home, counter) = home_with_demo("");
     let llm = FakeLlm::new(vec![vec![
         call_round(1, "pc-1", "mcp__demo__bump", serde_json::json!({})),
@@ -107,14 +108,10 @@ async fn a_side_effecting_mcp_tool_waits_for_approval_then_runs_once() {
 
     let session = gw.open_session().await;
     let run = gw.submit(&session, "mcp-2", "加一").await.run;
-    let approval = gw.wait_approval().await;
-    assert_eq!(approval.plan.tool, "mcp__demo__bump");
-    assert!(!counter.exists(), "批之前不该执行");
-
-    gw.decide(&approval.approval, true).await;
     let detail = gw.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     assert_eq!(std::fs::read_to_string(&counter).unwrap(), "bump\n");
+    assert!(gw.interventions().await.is_empty(), "不该停下来问人");
 }
 
 /// 起不来的服务器记 warn 跳过，Gateway 照常起来，别的服务器的工具照常挂。

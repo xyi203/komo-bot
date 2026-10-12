@@ -256,18 +256,18 @@ fn only_what_the_module_exports_resolves() {
     assert!(matches!(error, ToolboxError::NoExports { .. }), "{error:?}");
 }
 
-/// 「校验候选哈希与已测版本一致」（§5.4）：审批时看到的是哪一版，装的就得是哪一版。
+/// 「校验候选哈希与已测版本一致」（§5.4）：操作者看到的是哪一版，装的就得是哪一版。
 #[test]
-fn a_candidate_changed_during_the_approval_window_refuses_to_be_installed() {
+fn a_candidate_changed_after_it_was_shown_refuses_to_be_installed() {
     let dir = tempfile::tempdir().unwrap();
     let toolbox = toolbox(dir.path());
     toolbox
         .save_candidate("adder", GOOD, Some(GOOD_TEST), NOW)
         .unwrap();
     pass_tests(&toolbox, "adder");
-    let approved = toolbox.candidate("adder").unwrap().unwrap().version;
+    let shown = toolbox.candidate("adder").unwrap().unwrap().version;
 
-    // 审批还在等着的时候有人又改了候选。
+    // 看完预览、还没启用的时候有人又改了候选。
     toolbox
         .save_candidate(
             "adder",
@@ -277,7 +277,7 @@ fn a_candidate_changed_during_the_approval_window_refuses_to_be_installed() {
         )
         .unwrap();
 
-    let error = toolbox.enable("adder", Some(&approved), NOW).unwrap_err();
+    let error = toolbox.enable("adder", Some(&shown), NOW).unwrap_err();
     assert!(
         matches!(error, ToolboxError::VersionMismatch { .. }),
         "{error:?}"
@@ -301,10 +301,10 @@ fn disabling_keeps_the_snapshot_so_old_calls_stay_answerable() {
     ));
 }
 
-// ---------------------------------------------------------------- 审批要展示的东西
+// ---------------------------------------------------------------- 启用前要展示的东西
 
-/// §14 阶段 6：「toolbox 启用的审批在微信里能看到版本差异与测试结果」——这里是它的
-/// 前一半：那两样**存在**且说的是这一版。渲染那一半在 gateway 的集成测试里。
+/// §14 阶段 6：「toolbox 启用时能看到版本差异与测试结果」——这里是它的前一半：那两样
+/// **存在**且说的是这一版。渲染那一半在 gateway / CLI 里。
 #[test]
 fn the_enable_preview_carries_the_version_diff_and_the_test_result() {
     let dir = tempfile::tempdir().unwrap();

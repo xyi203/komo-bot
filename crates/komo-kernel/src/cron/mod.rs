@@ -321,7 +321,7 @@ pub fn matches(
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlapPolicy {
-    /// 跳过本次并记录原因。默认——「含等待审批、重试或结果核对」都算没结束。
+    /// 跳过本次并记录原因。默认——「含等待重试或结果核对」都算没结束。
     #[default]
     Skip,
     /// 照常再起一个。
@@ -389,7 +389,7 @@ pub enum FiringStatus {
     Queued,
     Ok,
     Error,
-    /// 停在等待审批 / 需要操作者处理上——**既不是跑成也不是失败**。
+    /// 停在需要操作者处理上——**既不是跑成也不是失败**。
     Waiting,
     /// 这一槽没有跑，原因记在 `error` 里。
     Skipped,
@@ -422,7 +422,7 @@ pub enum JobStatus {
 pub struct CronJob {
     pub id: CronJobId,
     pub name: String,
-    /// 定义版本。Job 改了，绑定它的授权失效（§7.2）。
+    /// 定义版本。Job 定义改了就 +1（§10）。
     pub version: u64,
     pub trigger: Trigger,
     /// 与 `command` 二选一（CLI / HTTP 都校验）；命令 Job 这一列写空串——退役字段照写

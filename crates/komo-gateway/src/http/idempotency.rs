@@ -1,15 +1,15 @@
-//! 幂等请求键（§13.1「提交输入、审批、Cron 与 Memory 变更都支持幂等请求键；同一键
+//! 幂等请求键（§13.1「提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键
 //! 对应不同内容则拒绝」）。
 //!
 //! **提交输入那一路不在这里**：它的幂等是持久的，由 `Ledger::accept_input` 按
-//! `runs.request_key` 答（§8.5），重启也认。这里管的是另外三路——审批、Cron、Memory
-//! 变更——它们在 state.db 里没有一张"请求键 → 结果"的表。
+//! `runs.request_key` 答（§8.5），重启也认。这里管的是另外三路——介入答复、Cron、
+//! Memory 变更——它们在 state.db 里没有一张"请求键 → 结果"的表。
 //!
-// TODO(decide: 文档要求这三路也支持幂等键，但没有给它们一张表；`approval_requests`、
-// `cron_jobs`、`memory_items` 都是按自己的主键幂等的，而不是按请求键。这里先用一个
+// TODO(decide: 文档要求这三路也支持幂等键，但没有给它们一张表；介入答复按 Run 的状态、
+// `cron_jobs`、`memory_items` 按自己的主键幂等，而不是按请求键。这里先用一个
 // **进程内**的有界表：同键同内容返回原结果，同键不同内容 409。它挡得住客户端重发与
 // 网络重试，挡不住跨重启的重发——那一种退化成"再执行一次"，而这三个动作本身都是幂等
-// 的（已决定的审批返回原决定、Cron 按 id 覆盖、memory 的 confirm/forget 按 revision），
+// 的（已答过的介入返回原结论、Cron 按 id 覆盖、memory 的 confirm/forget 按 revision），
 // 所以不会产生第二次副作用。要做成持久的需要一张表 → 见报告"需要编排者做"。)
 
 use std::collections::VecDeque;

@@ -1,6 +1,6 @@
 //! Cron 到期检查（§10）。
 //!
-//! 「Cron Scheduler 只负责产生 Run，复用 AgentLoop、Policy、工具和存储」——所以这个
+//! 「Cron Scheduler 只负责产生 Run，复用 AgentLoop、工具和存储」——所以这个
 //! 文件到 `accept_input` 为止就结束了：到期 → 重叠判定 → `claim_firing` 占位 → 把触发
 //! 输入交给账本 → 推进下一个槽位。**执行是普通队列的事**，这里不碰。
 //!
@@ -55,7 +55,7 @@ pub struct Skipped {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {
-    /// 上一次触发还没结束（含等待审批、重试或结果核对）。
+    /// 上一次触发还没结束（含等待重试或结果核对）。
     Overlap,
     /// 这个计划时间已经有一条触发记录了。
     AlreadyFired,
@@ -71,7 +71,7 @@ impl SkipReason {
     /// 说得出为什么。
     pub fn note(&self) -> String {
         match self {
-            SkipReason::Overlap => "上一次触发还没结束（含等待审批、重试或结果核对）".into(),
+            SkipReason::Overlap => "上一次触发还没结束（含等待重试或结果核对）".into(),
             SkipReason::AlreadyFired => "这个计划时间已经有一条触发记录了".into(),
             SkipReason::Schedule(reason) => format!("算不出槽位：{reason}"),
             SkipReason::TooLate => "错过得超过这个 Job 自己的间隔，不补跑".into(),
@@ -194,7 +194,7 @@ impl CronScheduler {
             return self.skip(job, slot, now, SkipReason::TooLate).await;
         }
 
-        // 「同一 Job 上一次仍未结束（含等待审批、重试或结果核对）时，跳过本次并记录
+        // 「同一 Job 上一次仍未结束（含等待重试或结果核对）时，跳过本次并记录
         // 原因」。
         if job.overlap == OverlapPolicy::Skip && self.jobs.has_unfinished_firing(&job.id).await? {
             tracing::info!(job = %job.id, scheduled_at = %slot, "上一次触发还没结束，跳过本次");
@@ -368,8 +368,7 @@ impl CronScheduler {
     /// 推进到下一个槽位并落库。
     ///
     /// 走 [`CronRepo::advance`] 而不是 `put`：推进槽位不是定义变更，**版本一个字都不能
-    /// 动**——`put` 会递增版本，而绑定这个 Job 的授权是按版本绑的（§7.2 / §10），每触发
-    /// 一次就作废一次授权是说不通的。
+    /// 动**——`put` 会递增版本，而版本说的是"定义改过几次"（§10），触发一次不是改一次定义。
     ///
     /// 一次性触发在这里**完成**（§10：`@at` 是一次性，claim 时完成）；算不出下一槽的
     /// Job 把原因写进 `last_error` 并留在清单里——安静地再也不响是最糟的结果。

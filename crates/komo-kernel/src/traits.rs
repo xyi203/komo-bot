@@ -6,10 +6,9 @@
 //!
 //! 不是 trait 的东西，记在这里免得有人再造一个：`AgentLoop`、`ToolExecutor`、
 //! `Scheduler`、`Recovery`、`MemoryManager`、`SkillRegistry`、`Coordinator`、
-//! `Dispatcher` —— 各只有一个实现，依赖下面这些 trait 就可测。**审批也不需要
-//! `Approver` trait**：`Policy` 答 `Ask` 后 executor 写 `approval_requests` 并
-//! `Ledger::suspend`，四个界面都打到 `POST /v1/approvals/{id}/decision`，渠道之间的
-//! 差别只在渲染（§11.3），不在决策。
+//! `Dispatcher` —— 各只有一个实现，依赖下面这些 trait 就可测。**也没有 `Policy`**：
+//! 2026-10-11 起 komo 不再在执行前做判决（§7）——模型要的就执行，唯一的硬限制是
+//! `write` / `edit` 在 `prepare` 里拒绝写 komo 自己的状态，那是工具的事，不是一个接缝。
 //!
 //! 接缝上一律 `Arc<dyn Trait>` / `Box<dyn Trait>`，异步 trait 用 `async_trait`——对象
 //! 安全，一次堆分配相对模型往返可忽略。
@@ -20,19 +19,14 @@ use async_trait::async_trait;
 use time::OffsetDateTime;
 
 use crate::cron::{CronFiring, CronJob, JobStatus, ZoneError, ZoneResolution};
-use crate::policy::{Grant, PolicyContext, PolicyDecision};
-use crate::protocol::http::{ApprovalDecisionRecord, ApprovalDecisionResponse, ApprovalRecord};
 use crate::protocol::{InboundAck, InboundMessage};
 use crate::types::chat::{Delivery, DeliveryTarget, Outbound};
 use crate::types::ids::{
-    ApprovalId, AttemptId, CronJobId, EventId, ExecutorId, MemoryId, RunId, Seq, SessionId,
-    ShortId, ToolCallId,
+    AttemptId, CronJobId, EventId, ExecutorId, MemoryId, RunId, Seq, SessionId, ToolCallId,
 };
 use crate::types::memory::{MemoryItem, RecallQuery, RecallResult};
 use crate::types::model::{EmbeddingSpace, InputKind, TokenUsage, Vector};
-use crate::types::plan::{
-    ApprovedPlan, ConsumeIntent, ConsumedApproval, ExecutionPlan, Verification,
-};
+use crate::types::plan::{ExecutionPlan, Verification};
 use crate::types::refs::{AttemptRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput};
 use crate::types::status::{Claimed, RunEnd, WaitReason};
 use crate::types::systemone::{SystemOneError, SystemOneRequest, SystemOneResponse};
@@ -41,8 +35,7 @@ use crate::types::tool::{
     ToolOutput,
 };
 use crate::types::turn::{
-    AcceptInput, Accepted, AssistantRound, EventBatch, GrantUses, LlmError, Round, RoundInput,
-    TurnRequest,
+    AcceptInput, Accepted, AssistantRound, EventBatch, LlmError, Round, RoundInput, TurnRequest,
 };
 
 // ---------------------------------------------------------------- 错误
@@ -75,8 +68,8 @@ pub enum LedgerError {
 /// 存储层失败。
 ///
 /// 它比"IO 出错了"宽一点：store 的 `with_write_retry` 闭包只有这一条错误通道
-/// （§8.2），而闭包里跑的正是那些要报**领域性**失败的事务——预期 revision 不符、这条
-/// 授权覆盖不到这份计划。没有对应的变体，那些失败只能塞进 `Other(String)` 再靠字符串
+/// （§8.2），而闭包里跑的正是那些要报**领域性**失败的事务——比如预期 revision
+/// 不符。没有对应的变体，那些失败只能塞进 `Other(String)` 再靠字符串
 /// 前缀在上层认回来，而字符串前缀不是类型。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
@@ -88,9 +81,6 @@ pub enum StoreError {
     /// 预期 revision / 版本不符。与 [`RepoError::VersionConflict`] 一一对应。
     #[error("版本冲突：预期 {expected}，当前 {actual}")]
     VersionConflict { expected: u32, actual: u32 },
-    /// 这条授权不能用来执行这份计划。与 [`RepoError::GrantMismatch`] 一一对应。
-    #[error("授权不匹配：{0}")]
-    GrantMismatch(String),
     #[error("IO 失败：{0}")]
     Io(String),
     #[error("写入争用，重试超限")]
@@ -107,9 +97,6 @@ pub enum RepoError {
     /// 预期 revision / 版本不符。
     #[error("版本冲突：预期 {expected}，当前 {actual}")]
     VersionConflict { expected: u32, actual: u32 },
-    /// 这条授权不能用来执行这份计划。
-    #[error("授权不匹配：{0}")]
-    GrantMismatch(String),
     #[error("写入争用，重试超限")]
     Contended,
     #[error("{0}")]
@@ -118,7 +105,7 @@ pub enum RepoError {
 
 /// store 的事务错误通道抬到仓储接口上。
 ///
-/// 两个领域性变体**逐个对上**，不经字符串；其余的按语义收进最接近的那个。
+/// 领域性变体**逐个对上**，不经字符串；其余的按语义收进最接近的那个。
 impl From<StoreError> for RepoError {
     fn from(error: StoreError) -> Self {
         match error {
@@ -126,7 +113,6 @@ impl From<StoreError> for RepoError {
             StoreError::VersionConflict { expected, actual } => {
                 RepoError::VersionConflict { expected, actual }
             }
-            StoreError::GrantMismatch(message) => RepoError::GrantMismatch(message),
             StoreError::Contended => RepoError::Contended,
             StoreError::Corrupt(message) => RepoError::Other(format!("引用损坏：{message}")),
             StoreError::Io(message) => RepoError::Other(format!("IO 失败：{message}")),
@@ -252,13 +238,11 @@ pub trait Ledger: Send + Sync {
         plan: &ExecutionPlan,
     ) -> Result<EventId, LedgerError>;
 
-    /// `tool.started` + 执行尝试 + 首次授权消费，同一事务；**返回后才允许产生真实
-    /// 副作用**。`grants` 按步记这次用到的每一条授权（组合计划两步各凭各的时有两条）。
+    /// `tool.started` + 执行尝试，同一事务；**返回后才允许产生真实副作用**。
     async fn start_call(
         &self,
         call: &ToolCallId,
         plan: &ExecutionPlan,
-        grants: GrantUses,
     ) -> Result<AttemptId, LedgerError>;
 
     /// 输出已由 [`ToolOutputStore`] 发布；这里只写 `tool.result` 元信息与引用。
@@ -269,8 +253,8 @@ pub trait Ledger: Send + Sync {
     ) -> Result<(), LedgerError>;
 
     /// 给一次**没有执行过**的调用写下结论（没有 `tool.started`，也没有计划）：工具名
-    /// 不认识、参数准备不出来、放行被拒、子代理不能再委派——它们都有明确结论，只是没有
-    /// 产生过尝试。
+    /// 不认识、参数准备不出来、`prepare` 拒绝（例如写 komo 自己的状态）、子代理不能再
+    /// 委派——它们都有明确结论，只是没有产生过尝试。
     ///
     /// 写下来不是记账洁癖：`tool.result` 缺席的那次调用在账本上**永远悬着**，于是任何从
     /// 账本重建的转写都带着一个没有输出的 `function_call`——provider 直接 400
@@ -320,15 +304,19 @@ pub trait Ledger: Send + Sync {
 
     /// `context.compacted`：在线压缩在一个计划边界上的结论（§8.3）。内联的摘要超过上限
     /// 先外置到 `payloads/`（与 `record_round` 的正文同一条路），再追加并同步。它不碰
-    /// state.db 的任何表——摘要只是模型视图，调度与授权都不看它。
+    /// state.db 的任何表——摘要只是模型视图，调度不看它。
     async fn record_compaction(
         &self,
         run: &RunId,
         compaction: crate::events::ContextCompacted,
     ) -> Result<Seq, LedgerError>;
 
-    /// 控制审计补写：把 `control_outbox` 里的一条审批事件追加到 JSONL（§8.5 的反向
-    /// 顺序）。按 `event_id` 幂等；已写入就复用原事件位置。**它不创建授权。**
+    /// 控制审计补写：把 `control_outbox` 里的一条审计事件追加到 JSONL（§8.5 的反向
+    /// 顺序）。按 `event_id` 幂等；已写入就复用原事件位置。它只写审计副本，不改变任何
+    /// 调度状态。
+    ///
+    /// 审批删掉之后已经没有新事件走这条路；它留着，是为了老库 `control_outbox` 里还没
+    /// 补写的旧 `approval.*` 行能照原样补进 JSONL（读回来是 Unknown，什么都不表示，D3）。
     async fn append_audit(
         &self,
         session: &SessionId,
@@ -398,7 +386,7 @@ pub trait RunQueue: Send + Sync {
         executor: &ExecutorId,
     ) -> Result<Option<Claimed>, StoreError>;
 
-    /// 交还名额：Run 让出执行（等审批 / 等重试）或执行者退出时调用。代次不对就什么
+    /// 交还名额：Run 让出执行（等重试 / 等干预）或执行者退出时调用。代次不对就什么
     /// 都不做。
     async fn release(&self, claimed: &Claimed) -> Result<(), StoreError>;
 
@@ -419,97 +407,6 @@ pub trait RunQueue: Send + Sync {
     ) -> Result<bool, StoreError>;
 }
 
-// ---------------------------------------------------------------- 审批
-
-/// executor 等待、聊天 / TUI 答复、outbox 补写三方共用。
-#[async_trait]
-pub trait ApprovalRepo: Send + Sync {
-    async fn create(&self, request: ApprovalRecord) -> Result<ApprovalRecord, RepoError>;
-
-    async fn get(&self, id: &ApprovalId) -> Result<Option<ApprovalRecord>, RepoError>;
-
-    /// 短 ID 在**待处理集合内**唯一，所以这个查找只在待处理集合里做（§11.3）。
-    async fn find_by_short_id(&self, short: &ShortId) -> Result<Option<ApprovalRecord>, RepoError>;
-
-    /// 聊天里的 `/approve <short_id>` 第二次到达时用：**待处理的优先**，没有就取**最近一条
-    /// 已决定的**同短 ID 记录，让 Dispatcher 能回「已决定：原决定」而不是「没有这条」
-    /// （§11.3「已决定的返回原决定，不报错」）。短 ID 的重用窗口是「下一条审批产生之前」，
-    /// 所以待处理那条才是用户正看着的那张卡。
-    async fn find_latest_by_short_id(
-        &self,
-        short: &ShortId,
-    ) -> Result<Option<ApprovalRecord>, RepoError>;
-
-    async fn list_pending(
-        &self,
-        session: Option<&SessionId>,
-    ) -> Result<Vec<ApprovalRecord>, RepoError>;
-
-    /// 记录决定。**重复回答幂等**：已决定的返回原决定并把
-    /// [`ApprovalDecisionResponse::already_decided`] 置位，不报错（§11.3）。
-    async fn decide(
-        &self,
-        id: &ApprovalId,
-        decision: ApprovalDecisionRecord,
-    ) -> Result<ApprovalDecisionResponse, RepoError>;
-
-    /// 消费一条已批准的审批，换一张可以执行这份计划的凭据。
-    ///
-    /// 参数是**整份计划**而不是它的哈希，因为三种范围核对的不是同一件事（§7.2）：
-    ///
-    /// - **本次调用授权**（`GrantScope::Once`）：计划哈希逐字相同，且这条授权还没被
-    ///   消费过；消费成功后标记 `consumed`。
-    /// - **本次 Run / Cron Job 的范围授权**：按 [`Grant::covers`] 判定——匹配器命中、
-    ///   绑定的版本全部对得上、没过期。范围授权**不因一次使用而消耗**，它本来就是给
-    ///   这个范围里的多次调用用的；但返回的 [`ConsumedApproval`] 仍然记下用的是哪一条
-    ///   `grant`，于是 `GrantUse` 进账本，事后答得出"这次是凭哪条授权跑的"。
-    ///
-    /// 只有哈希是不够的：一条"本次 Run 内可以跑 cargo test"的授权，按定义覆盖的是一族
-    /// 计划，每个都有自己的哈希。
-    ///
-    /// `intent` 是 §7.4 那两句话的分界线：「已取消或**已完成调用不能再次执行**」与
-    /// 「恢复时**若确定原动作未发生**……可在原授权范围内继续；**已经消费授权本身不是
-    /// 重试依据**」。一条已经用掉的一次性授权，对
-    /// [`ConsumeIntent::First`] 必须是 [`RepoError::GrantMismatch`]——一个可分辨的失败，
-    /// 而不是悄悄放行第二次副作用；只有恢复流程核对过、拿着
-    /// [`ConsumeIntent::KnownNotToHaveRun`] 来，才准重用它。
-    ///
-    /// **[`PolicyDecision::Deny`] 时不会走到这里**——executor 在 Deny 上直接返回拒绝，
-    /// 根本不去消费任何授权，这就是"审批不覆盖显式 Deny"在执行侧成立的方式。
-    async fn consume(
-        &self,
-        id: &ApprovalId,
-        plan: &ExecutionPlan,
-        intent: ConsumeIntent,
-        now: OffsetDateTime,
-    ) -> Result<ConsumedApproval, RepoError>;
-
-    /// 写下一条范围授权（§7.2 的第二、第三种）。
-    ///
-    /// **它不是"批准"**：批准是 [`ApprovalRepo::decide`] 那一行，这里只是把操作者答应
-    /// 的那个**范围**落成一条可以被 [`Grant::covers`](crate::policy::Grant::covers) 查到
-    /// 的记录。两步分开，是因为一条 `Once` 的批准根本不产生授权（审批自己按计划哈希
-    /// 绑定），而把两者合在一起就得让"没有授权"和"写不下授权"长成同一个样子。
-    ///
-    /// 幂等：同一个 [`GrantId`](crate::types::ids::GrantId) 重写覆盖原行。
-    async fn put_grant(&self, grant: Grant) -> Result<Grant, RepoError>;
-
-    /// 这个 Run 当前有效的范围授权。
-    async fn grants_for_run(
-        &self,
-        run: &RunId,
-        now: OffsetDateTime,
-    ) -> Result<Vec<Grant>, RepoError>;
-
-    /// 这个 Job 当前有效的范围授权。Job 版本变了就不该再返回旧的（§10）。
-    async fn grants_for_job(
-        &self,
-        job: &CronJobId,
-        job_version: u64,
-        now: OffsetDateTime,
-    ) -> Result<Vec<Grant>, RepoError>;
-}
-
 // ---------------------------------------------------------------- Cron
 
 /// 调度器 + CLI + Gateway API 三方共用。
@@ -519,15 +416,14 @@ pub trait CronRepo: Send + Sync {
 
     async fn get(&self, id: &CronJobId) -> Result<Option<CronJob>, RepoError>;
 
-    /// 创建或整体替换一个 Job。**版本递增**——Job 改了，绑定它的授权失效。
+    /// 创建或整体替换一个 Job。**版本递增**。
     async fn put(&self, job: CronJob) -> Result<CronJob, RepoError>;
 
     /// 只写调度状态：下一个槽位、生命周期、触发层面的错误。
     ///
     /// **它不递增版本**，这是它与 [`CronRepo::put`] 的全部区别，也是它存在的全部理由：
-    /// 推进槽位不是定义变更。走 `put` 的话每次触发都会让版本 +1，而 `GrantScope::CronJob`
-    /// 绑的正是版本（§7.2、§10「Job 版本变了就不该再返回旧的」）——于是一个每天跑的
-    /// Job 的授权活不过第一次触发，操作者每天早上都要重新批一遍。
+    /// 推进槽位不是定义变更。走 `put` 的话每次触发都会让版本 +1，而版本回答的是"Job
+    /// 定义改没改过"（§10）——每次触发都 +1，这个数就什么都说明不了。
     async fn advance(
         &self,
         id: &CronJobId,
@@ -555,7 +451,7 @@ pub trait CronRepo: Send + Sync {
     /// 行不在时答 `false`，不是错误：一次手动 run 本来就没有触发记录。
     async fn update_firing(&self, firing: CronFiring) -> Result<bool, RepoError>;
 
-    /// 这个 Job 上一次触发还没结束吗（含等待审批、重试或结果核对）。
+    /// 这个 Job 上一次触发还没结束吗（含等待重试或结果核对）。
     async fn has_unfinished_firing(&self, id: &CronJobId) -> Result<bool, RepoError>;
 
     async fn firings(&self, id: &CronJobId, limit: u32) -> Result<Vec<CronFiring>, RepoError>;
@@ -672,15 +568,21 @@ pub trait PythonHost: Send + Sync {
     /// 看不到这次执行的上下文，路径由调用方从 `ToolContext` 取。它是环境变量名
     /// （`KOMO_ARTIFACT_DIR`）之外的概念——kernel 只传"产出目录在哪"，命名留给 runtime。
     ///
-    /// 默认实现忽略产出目录、转调 [`Self::run`]：没有产物概念的宿主（测试替身）因此不用改。
+    /// `timeout` 是这一次的时限：`python` 工具传本次调用的活动执行时限（`call_timeout`），
+    /// 到点由宿主自己终止进程组、报 `Timeout`，而不是落到执行器的兜底计时器上成了"结果
+    /// 不明"。[`Self::run`]（toolbox 启用、核对调用）仍用宿主自己的默认时限。
+    ///
+    /// 默认实现忽略产出目录与时限、转调 [`Self::run`]：没有产物概念的宿主（测试替身）因此
+    /// 不用改。
     async fn run_with_artifacts(
         &self,
         job: PythonJob,
         artifacts: Option<&Path>,
+        timeout: std::time::Duration,
         sink: &mut dyn OutputWriter,
         cancel: CancelToken,
     ) -> Result<PythonResult, PyError> {
-        let _ = artifacts;
+        let _ = (artifacts, timeout);
         self.run(job, sink, cancel).await
     }
 
@@ -695,15 +597,18 @@ pub trait Tool: Send + Sync {
     fn definition(&self) -> ToolDefinition;
 
     /// 解析参数、检查元信息、生成执行计划。**不能通过导入未知 Python 模块、运行命令
-    /// 等方式提前执行未审核代码。**
+    /// 等方式提前执行代码**——计划先落盘（`tool.planned`），副作用才能发生（§8.5）。
+    ///
+    /// 唯一的硬限制也在这里：`write` / `edit` 拒绝目标落在 komo 自己的状态里，返回
+    /// [`ToolError::Denied`]（§7、§8.10）。
     async fn prepare(
         &self,
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError>;
 
-    /// 真正执行。只接受 [`ApprovedPlan`]——"没经过 Policy 或审批就执行"在类型上写不
-    /// 出来。
+    /// 真正执行。`plan` 按值交进来：executor 在 [`Ledger::start_call`] 返回之后才调它
+    /// （§8.5），组合计划的第二步从 `plan.then_run` 取。
     ///
     /// `sink` 是本次尝试的流式写入器，**借用**：工具把子进程的 stdout / stderr 流进去，
     /// 但关不掉也发布不了——executor 在返回后收回所有权去 `ToolOutputStore::publish`，
@@ -711,7 +616,7 @@ pub trait Tool: Send + Sync {
     /// `edit` 不产生流式输出，忽略它即可。
     async fn execute(
         &self,
-        plan: ApprovedPlan,
+        plan: ExecutionPlan,
         ctx: &ToolContext,
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError>;
@@ -725,14 +630,6 @@ pub trait Tool: Send + Sync {
         _ctx: &ToolContext,
     ) -> Result<Verification, ToolError> {
         Ok(Verification::Unavailable)
-    }
-
-    /// 审批界面"改动"那一节（§7.2、§11.3）：这份计划批准后会对目标做什么，给人看的
-    /// diff，已在源头截断。只读，约束同 `prepare`——不执行任何未审核代码。说不出来
-    /// （读不到、参数解析不了）就是 `None`，不报错：缺了这一节不该挡住审批本身。
-    /// 默认 `None`；`write` / `edit` 覆盖它。
-    async fn changes(&self, _plan: &ExecutionPlan) -> Option<String> {
-        None
     }
 }
 
@@ -776,14 +673,6 @@ pub trait TaskSpawner: Send + Sync {
     ) -> Result<crate::types::task::FollowOutcome, SpawnError>;
 }
 
-/// 同步、纯函数。授权在 [`PolicyContext`] 里传入，**不在内部查库**。
-///
-/// 生产实现与测试实现是同一个：[`crate::policy::RuleTable`]（表驱动规则）——规则是
-/// 数据，所以"换一张表"就是换实现，不需要第二份代码。
-pub trait Policy: Send + Sync {
-    fn decide(&self, plan: &ExecutionPlan, ctx: &PolicyContext<'_>) -> PolicyDecision;
-}
-
 // ---------------------------------------------------------------- 渠道
 
 /// 首版就有三个真实现（飞书、Telegram、WeChat），加上 HTTP API 与 SSE。
@@ -804,7 +693,7 @@ pub trait Inbound: Send + Sync {
     async fn handle(&self, msg: InboundMessage) -> Result<InboundAck, GatewayError>;
 }
 
-/// 主动投递。审批请求的渲染是各渠道实现的事（§11.3）。
+/// 主动投递。各类消息的渲染是各渠道实现的事（§11.3）。
 #[async_trait]
 pub trait Notifier: Send + Sync {
     /// **先持久化投递记录再发送。**`Sent` = 已送达；`Deferred` = 渠道此刻无法推送
@@ -818,7 +707,7 @@ pub trait Notifier: Send + Sync {
 
 // ---------------------------------------------------------------- 时钟与时区
 
-/// Cron 到期、`valid_until`、重试退避、审批有效期全部依赖时间，所以它必须可拨。
+/// Cron 到期、`valid_until`、重试退避全部依赖时间，所以它必须可拨。
 /// **kernel 里没有第二个读时钟的地方。**
 pub trait Clock: Send + Sync {
     fn now(&self) -> OffsetDateTime;
@@ -862,7 +751,6 @@ mod tests {
         assert_object_safe::<dyn ToolOutputStore>();
         assert_object_safe::<dyn OutputWriter>();
         assert_object_safe::<dyn RunQueue>();
-        assert_object_safe::<dyn ApprovalRepo>();
         assert_object_safe::<dyn CronRepo>();
         assert_object_safe::<dyn MemoryRepo>();
         assert_object_safe::<dyn LlmClient>();
@@ -871,7 +759,6 @@ mod tests {
         assert_object_safe::<dyn PythonHost>();
         assert_object_safe::<dyn Tool>();
         assert_object_safe::<dyn TaskSpawner>();
-        assert_object_safe::<dyn Policy>();
         assert_object_safe::<dyn Channel>();
         assert_object_safe::<dyn Inbound>();
         assert_object_safe::<dyn Notifier>();
@@ -880,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn the_two_domain_store_errors_map_across_one_for_one() {
+    fn the_domain_store_errors_map_across_one_for_one() {
         assert_eq!(
             RepoError::from(StoreError::VersionConflict {
                 expected: 3,
@@ -891,10 +778,6 @@ mod tests {
                 actual: 4
             },
             "预期 revision 不符不该在跨层时退化成一句字符串"
-        );
-        assert_eq!(
-            RepoError::from(StoreError::GrantMismatch("覆盖不到这份计划".into())),
-            RepoError::GrantMismatch("覆盖不到这份计划".into())
         );
         assert_eq!(
             RepoError::from(StoreError::NotFound {
@@ -910,13 +793,5 @@ mod tests {
             RepoError::from(StoreError::Corrupt("哈希不符".into())),
             RepoError::Other(message) if message.contains("引用损坏")
         ));
-    }
-
-    #[test]
-    fn a_rule_table_is_usable_as_a_policy_object() {
-        let policy: std::sync::Arc<dyn Policy> =
-            std::sync::Arc::new(crate::policy::RuleTable::initial());
-        // 只是要它编译得过；决策本身在 policy::rules 的测试里。
-        assert!(std::sync::Arc::strong_count(&policy) == 1);
     }
 }

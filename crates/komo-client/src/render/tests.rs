@@ -6,10 +6,8 @@ use komo_kernel::cron::{CronJob, TimeZone, Trigger};
 use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::config::{KeyPath, SourceFile};
 use komo_kernel::protocol::http::{
-    ApprovalDecisionRecord, InterventionAnswerResponse, InterventionKind, InterventionVerdict,
-    ModelMenuEntry, RunSummary, SessionSummary, ToolCallSummary,
+    InterventionKind, ModelMenuEntry, RunSummary, SessionSummary, ToolCallSummary,
 };
-use komo_kernel::types::chat::{ApprovalScope, PeerId};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{Evidence, EvidenceRef, ExtractionMetadata, MemoryUsage};
@@ -242,7 +240,7 @@ fn run_detail(state: ToolCallState) -> RunDetail {
 
 #[test]
 fn run_inspect_prints_two_question_marks_for_an_uncertain_call() {
-    let printed = run_inspect(&run_detail(ToolCallState::Uncertain), &[], NOW);
+    let printed = run_inspect(&run_detail(ToolCallState::Uncertain), NOW);
     assert!(printed.contains("?? shell"), "{printed}");
     // §8.6：不能装成失败，也不能用重试成功盖掉。
     assert!(printed.contains("结果不明"), "{printed}");
@@ -265,32 +263,6 @@ fn run_inspect_marks_each_call_state_differently() {
     assert_eq!(markers, vec!["··", "▶ ", "ok", "!!", "??"]);
 }
 
-#[test]
-fn run_inspect_says_who_allowed_a_call_when_the_record_is_at_hand() {
-    let mut record = fixture::approval_record();
-    record.decision = Some(ApprovalDecisionRecord {
-        approved: true,
-        scope: ApprovalScope::Run,
-        by: Some(PeerId::new("ou_xxx")),
-        decided_at: NOW,
-        grant: None,
-        consumed: true,
-    });
-    let printed = run_inspect(&run_detail(ToolCallState::Completed), &[record], NOW);
-    assert!(printed.contains("allowed by ou_xxx"), "{printed}");
-    assert!(printed.contains("本次 Run 范围"), "{printed}");
-    assert!(printed.contains("7K2M"), "{printed}");
-}
-
-#[test]
-fn run_inspect_says_nothing_about_provenance_when_it_has_no_record() {
-    let printed = run_inspect(&run_detail(ToolCallState::Completed), &[], NOW);
-    assert!(
-        !printed.contains("allowed by"),
-        "猜的放行来源不如不印：{printed}"
-    );
-}
-
 /// §8.4：`waiting` 一个词说不出"在等什么"——摘要里那一格（`wait`）现在有了，就要印出来。
 #[test]
 fn run_inspect_says_what_a_waiting_run_is_waiting_for() {
@@ -301,35 +273,30 @@ fn run_inspect_says_what_a_waiting_run_is_waiting_for() {
     detail.summary.wait = Some(WaitReason::Dependency {
         run: RunId::from_raw("run-9"),
     });
-    let printed = run_inspect(&detail, &[], NOW);
+    let printed = run_inspect(&detail, NOW);
     assert!(printed.contains("等待中 · 在等 Run run-9"), "{printed}");
 
     // 退了休的 `Interrupted` 不再是状态，而"上一次执行没收尾"仍然说得出来。
     let mut detail = run_detail(ToolCallState::Started);
     detail.summary.state = RunState::Abandoned;
-    let printed = run_inspect(&detail, &[], NOW);
+    let printed = run_inspect(&detail, NOW);
     assert!(printed.contains("不等于用户取消"), "{printed}");
 
     // 理由缺了（老数据）也不许编一个：只说"停着，不是结束"。
     let mut detail = run_detail(ToolCallState::Started);
     detail.summary.state = RunState::Waiting;
-    let printed = run_inspect(&detail, &[], NOW);
+    let printed = run_inspect(&detail, NOW);
     assert!(printed.contains("停着，不是结束"), "{printed}");
     assert!(!printed.contains("在等 Run"), "{printed}");
 }
 
 // ---- intervention ----
 
-/// §7.5：一张表列出三类，每一条都带句柄、种类、问题与**它此刻能答什么**。
+/// §7.5：一张表列出两类，每一条都带句柄、种类、问题与**它此刻能答什么**。
 #[test]
-fn an_intervention_list_names_all_three_kinds_and_what_they_take() {
+fn an_intervention_list_names_both_kinds_and_what_they_take() {
     let printed = interventions(&InterventionListResponse {
         interventions: vec![
-            fixture::intervention_summary(
-                "7K2M",
-                InterventionKind::Approval,
-                "放行 rm -rf build？",
-            ),
             fixture::intervention_summary(
                 "run-1",
                 InterventionKind::Verify,
@@ -350,9 +317,6 @@ fn an_intervention_list_names_all_three_kinds_and_what_they_take() {
             "会话",
             "问题",
             "可答结论",
-            "7K2M",
-            "审批",
-            "approve / reject",
             "run-1",
             "结果不明",
             "satisfied / not_performed / abandon",
@@ -360,8 +324,10 @@ fn an_intervention_list_names_all_three_kinds_and_what_they_take() {
             "阻塞",
             "resolve / abandon",
             "komo intervention answer",
+            "一次答一条",
         ],
     );
+    assert!(!printed.contains("approve"), "{printed}");
 }
 
 /// 没有待处理时也要说清楚"没有"——空清单是 `/pending` 唯一的回答。
@@ -407,77 +373,6 @@ fn an_intervention_detail_says_what_to_check_and_what_it_takes() {
             "不许领这条 Run",
             "resolve / abandon",
         ],
-    );
-}
-
-#[test]
-fn an_intervention_detail_for_an_approval_carries_the_same_five_items_as_the_tui_popup() {
-    let printed = intervention_detail(&InterventionDetail::Approval(Box::new(
-        fixture::approval_record(),
-    )));
-    insta_like(
-        &printed,
-        &[
-            "短 ID",
-            "7K2M",
-            "动作",
-            "shell",
-            "rm -rf build",
-            "/home/u/project/build",
-            "cwd",
-            "版本",
-            "改动",
-            "+新的一行",
-            "已有验证结果",
-            "原因",
-            "范围",
-            "本次 Run 范围",
-        ],
-    );
-}
-
-/// 一批答复逐条印：某一条可能早就答过了，而它原来那个结论说不定与这一批相反。
-#[test]
-fn an_intervention_batch_prints_each_answer_including_the_stale_one() {
-    let printed = intervention_batch(&InterventionBatchAnswerResponse {
-        answered: vec![
-            InterventionAnswerResponse {
-                handle: "7K2M".into(),
-                kind: InterventionKind::Approval,
-                verdict: InterventionVerdict::Approve,
-                decision: None,
-                run_state: None,
-                note: "已批准（本次调用）".into(),
-                already_answered: false,
-            },
-            InterventionAnswerResponse {
-                handle: "9QRS".into(),
-                kind: InterventionKind::Approval,
-                verdict: InterventionVerdict::Reject,
-                decision: None,
-                run_state: None,
-                note: "早已答复：拒绝".into(),
-                already_answered: true,
-            },
-        ],
-        missing: vec!["3TVW".into()],
-    });
-    insta_like(
-        &printed,
-        &[
-            "7K2M approve· 已批准（本次调用）",
-            "9QRS reject· 早已答复：拒绝（早已答复，这次没有改变什么）",
-            "3TVW 没有这条待处理事项",
-            "本次调用",
-        ],
-    );
-}
-
-#[test]
-fn an_empty_intervention_batch_says_there_was_nothing_to_answer() {
-    assert_eq!(
-        intervention_batch(&InterventionBatchAnswerResponse::default()),
-        "没有待处理的审批"
     );
 }
 
@@ -542,7 +437,6 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
                     status: komo_kernel::cron::FiringStatus::Ok,
                     error: None,
                 }),
-                authorized: false,
             },
             // 上一次被跳过了，**原因在同一行**：一个天天被跳过的 Job 不该和一个天天
             // 跑成的 Job 长得一样。
@@ -559,7 +453,6 @@ fn a_cron_list_shows_the_next_slot_and_how_far_off_it_is() {
                     status: komo_kernel::cron::FiringStatus::Skipped,
                     error: Some("上一次触发还没结束".into()),
                 }),
-                authorized: false,
             },
         ],
         jobs,
@@ -626,7 +519,6 @@ fn a_waiting_firing_says_it_is_waiting_for_a_person() {
                 status: komo_kernel::cron::FiringStatus::Waiting,
                 error: None,
             }),
-            authorized: false,
         }],
         jobs,
     };
@@ -666,7 +558,6 @@ fn a_command_job_shows_its_command_truncated() {
             job: CronJobId::from_raw("job-4"),
             next_run_at: jobs[0].next_run_at,
             last: None,
-            authorized: true,
         }],
         jobs,
     };
@@ -676,8 +567,8 @@ fn a_command_job_shows_its_command_truncated() {
         !printed.contains(&long_command),
         "200 个字符不该原样印出来：{printed}"
     );
-    // add 即授权（§10、§7.2）：这是操作者在 `cron list` 上看得出这条授权存在的地方。
-    assert!(printed.contains("已授权"), "{printed}");
+    // 命令 Job 不再签授权（2026-10-11 删除审批）：这一行不该再说"已授权 / 未授权"。
+    assert!(!printed.contains("授权"), "{printed}");
 }
 
 // ---- memory ----
@@ -1022,36 +913,4 @@ fn a_stamp_takes_the_offset_of_its_own_instant_across_dst() {
         stamp_in(datetime!(2026-12-01 17:00:00 UTC), &new_york),
         "2026-12-01 12:00:00 -05:00"
     );
-}
-
-/// 单步计划的 `komo approval show` 逐字钉住：组合计划那一行加进来之后，单步的样子一个字
-/// 都不变。
-#[test]
-fn a_single_step_approval_shows_exactly_as_before() {
-    let printed = intervention_detail(&InterventionDetail::Approval(Box::new(
-        fixture::approval_record(),
-    )));
-    assert_eq!(
-        printed,
-        "短 ID   7K2M  (appr-1)\n\n动作\n  工具  shell  ·  shell 命令\n    rm -rf build\n  来源  交互请求\n  cwd  /home/u/project\n  目标\n    写 /home/u/project/build\n  版本  code 17f69ae2697b\n  恢复  无可靠恢复方式\n  计划哈希  05f92332d4c6\n\n改动\n  --- a/build.rs\n  +++ b/build.rs\n  @@ -1 +1 @@\n  -老的一行\n  +新的一行\n\n已有验证结果\n  候选模块测试：3 passed\n\n原因\n  命中 shell 规则：任意代码需要人看一眼\n\n范围\n  本次调用 · 本次 Run 范围",
-        "{printed}"
-    );
-}
-
-/// 组合计划（`then_run`）：`komo approval show` 把改动与改完要跑的命令都印出来，范围只有本次。
-#[test]
-fn an_approval_show_for_a_fused_edit_prints_the_command_it_runs_after() {
-    let printed = intervention_detail(&InterventionDetail::Approval(Box::new(
-        fixture::fused_approval_record("cargo test -p app"),
-    )));
-    insta_like(
-        &printed,
-        &[
-            "edit",
-            "写 /home/u/project/app.txt",
-            "  然后运行：cargo test -p app（/home/u/project）",
-            "+version = 2",
-        ],
-    );
-    assert!(printed.ends_with("范围\n  本次调用"), "{printed}");
 }

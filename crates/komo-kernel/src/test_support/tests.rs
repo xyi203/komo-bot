@@ -70,10 +70,7 @@ fn the_mem_ledger_writes_a_log_that_actually_folds() {
 
         let plan = sample_plan("python", &session);
         ledger.plan_call(&call, &plan).await.unwrap();
-        let attempt = ledger
-            .start_call(&call, &plan, Default::default())
-            .await
-            .unwrap();
+        let attempt = ledger.start_call(&call, &plan).await.unwrap();
 
         let store = MemOutputStore::new();
         let writer = store
@@ -187,14 +184,12 @@ fn an_audit_backfill_is_idempotent_and_keeps_the_original_time() {
         let session = SessionId::from_raw("sess-1");
         let event_id = EventId::from_raw("outbox-1");
         let decided_at = time::macros::datetime!(2026-09-15 07:30:00 UTC);
-        let payload = EventPayload::ApprovalDecided(crate::events::ApprovalDecided {
-            approval: ApprovalId::from_raw("ap-1"),
-            approved: true,
-            scope: crate::types::chat::ApprovalScope::Once,
-            by: None,
-            decided_at,
-            grant: None,
-        });
+        // 老库 `control_outbox` 里没补写的旧审批审计行：词汇已经没了，照原样作为
+        // Unknown 补进去（D3）。
+        let payload = EventPayload::Unknown {
+            event_type: "approval.decided".into(),
+            raw: serde_json::json!({"approval": "ap-1", "approved": true, "scope": "once"}),
+        };
 
         clock.advance(time::Duration::hours(1));
         let first = ledger

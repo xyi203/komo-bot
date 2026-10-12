@@ -1,7 +1,7 @@
-//! `ExecutionPlan` 与它的类型状态封印（§4、§7.2）。
+//! `ExecutionPlan`：一次工具调用要做什么（§4、§7.2）。
 //!
 //! 计划由工具的 `prepare` 填写，模型参数不能指定 `recovery`，也不能指定任何版本
-//! 字段。`plan_hash` 是计划的规范化哈希，审批绑定的就是它。
+//! 字段。`plan_hash` 是计划的规范化哈希，账本与恢复按它核对。
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 
 use super::delegate::DelegateSpec;
 use super::digest::ContentHash;
-use super::ids::{ApprovalId, GrantId, OperationId, RunId, SessionId, ToolCallId};
+use super::ids::{OperationId, RunId, SessionId, ToolCallId};
 use super::resource::{ResourceUri, TargetRef};
 
-/// 计划的规范化哈希。审批、授权与恢复都按它核对。
+/// 计划的规范化哈希。账本与恢复都按它核对。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PlanHash(ContentHash);
@@ -35,7 +35,7 @@ impl std::fmt::Display for PlanHash {
 }
 
 /// 请求这次执行的是谁。恢复后来源不变——Cron 恢复后仍是 Cron，不会因为重启由本机
-/// Gateway 发起就取得交互操作者的权限（§8.8）。
+/// Gateway 发起就变成交互请求（§8.8）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanSource {
@@ -44,45 +44,18 @@ pub enum PlanSource {
     /// 定时任务触发。
     Cron {
         job: super::ids::CronJobId,
-        /// Job 定义的版本；Job 改了，旧授权失效（§10）。
+        /// Job 定义的版本（§10）。
         job_version: u64,
     },
-    /// MemoryManager 的内部变更：走同一决策入口，但不是第六个 LLM 工具（§7.1）。
+    /// MemoryManager 的内部变更：走同一执行入口，但不是第六个 LLM 工具（§7.1）。
     Memory { session: Option<SessionId> },
-    /// 恢复流程发起的核对调用（§8.6）。核对本身仍经过 Policy。
+    /// 恢复流程发起的核对调用（§8.6）。
     Verification { of: ToolCallId },
 }
 
-impl PlanSource {
-    /// 无人值守：没有操作者在等着回答。新增危险操作不能因为无人值守自动放行（§10）。
-    pub fn is_unattended(&self) -> bool {
-        matches!(self, PlanSource::Cron { .. } | PlanSource::Memory { .. })
-    }
-
-    pub fn kind(&self) -> SourceKind {
-        match self {
-            PlanSource::Interactive { .. } => SourceKind::Interactive,
-            PlanSource::Cron { .. } => SourceKind::Cron,
-            PlanSource::Memory { .. } => SourceKind::Memory,
-            PlanSource::Verification { .. } => SourceKind::Verification,
-        }
-    }
-}
-
-/// [`PlanSource`] 去掉负载后的判别式，规则表用它匹配。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceKind {
-    Interactive,
-    Cron,
-    Memory,
-    Verification,
-}
-
-/// 这次执行**做的是什么**——§7.1 那张表逐行要分辨的那个维度。
+/// 这次执行**做的是什么**。
 ///
-/// 它由 `prepare` 归类，不是模型给的字符串：规则表按它匹配，所以让模型来命名它就
-/// 等于让模型给自己定风险等级。
+/// 它由 `prepare` 归类，不是模型给的字符串：恢复方式、只读判断与界面文案都按它分辨。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Operation {
@@ -96,29 +69,23 @@ pub enum Operation {
     PythonCode,
     /// 调用 toolbox 中已导出的函数（`mode = "call"`）。
     PythonCall { module: String, function: String },
-    /// 修改启用中的 toolbox（写候选、启用新版本）。
-    ToolboxChange { module: String },
     /// 修改 Python 环境（依赖安装、环境版本切换）。
     PythonEnvChange,
     /// 自动记忆的内部变更与索引生成。
     MemoryChange,
-    /// 权限扩大或修改 Policy。模型自行放宽是不被允许的（§7.1 最后一行）。
-    PolicyChange,
     /// 把一个自包含子任务交给一条子 Run（§4）。
     ///
     /// **它不是第七个基础工具**：模型看不见任何新能力，子代理用的是同一套六个工具，而它
-    /// 自己的每一次调用照常过 Policy（§7.1）。所以要审的不是"模型能不能做这件事"，而是
-    /// "允不允许它把这件事派出去"——规则表按这一条匹配。
+    /// 自己的每一次调用照常走 executor。
     ///
-    /// **整份 [`DelegateSpec`] 都在计划里**（含任务正文与结果契约）：计划是审批绑定的对象，
-    /// 也是父 Run 续跑时手里唯一那份东西——它要拿同一份契约去复验子代理的结果（§8.6）。
+    /// **整份 [`DelegateSpec`] 都在计划里**（含任务正文与结果契约）：计划是父 Run 续跑时手里唯一那份东西——它要拿同一份契约去复验子代理的结果（§8.6）。
     Delegate { spec: DelegateSpec },
     /// 建一个**独立的任务会话**并提交第一条输入（`docs/background-tasks.md`）。
     ///
     /// 与 `Delegate` 同一类操作——不是第七个基础工具，模型看不见任何新能力，任务会话
-    /// 里的每一次调用照常过 Policy——但**不等它跑完**：executor 放行之后立刻收尾（不
+    /// 里的每一次调用照常走 executor——但**不等它跑完**：executor 放行之后立刻收尾（不
     /// 返回 `RoundStop::Dependency`），home 不会被一个慢任务堵住。`task` / `title` 都
-    /// 进计划：计划是审批绑定的对象（若有），也是幂等重放时唯一能对上的那份东西。
+    /// 进计划：计划是幂等重放时唯一能对上的那份东西。
     Dispatch { task: String, title: String },
     /// 把一句话提交进一个**已有的**任务会话（`docs/background-tasks.md`）。
     ///
@@ -135,7 +102,7 @@ pub enum Operation {
     ///
     /// 副作用由服务器决定，komo 看不见。`read_only` 是**操作者**在配置里声明的
     /// （`[mcp.servers.<name>] read_only`），不是服务器自报的 `readOnlyHint`——自称安全
-    /// 的东西不进 Policy（§7.1）。
+    /// 的东西不算数。
     McpCall {
         server: String,
         tool: String,
@@ -144,17 +111,12 @@ pub enum Operation {
     },
     /// 一段在操作系统沙箱里跑的 Python 脚本（`docs/codemode.md`）。
     ///
-    /// 脚本自己碰不到文件、网络与进程；它里面的工具调用回到 executor，**只放行只读且
-    /// Policy 直接 Allow 的**。所以它整体是只读的：中断后整段重跑与重读同理。
+    /// 脚本自己碰不到文件、网络与进程；它里面的工具调用回到 executor，**只放行只读的**
+    /// （[`Operation::is_read_only`]，且不是 codemode 本身）。所以它整体是只读的：中断后整段重跑与重读同理。
     Codemode { code: String },
 }
 
 impl Operation {
-    /// 任意代码：一旦启动就具有其运行账号的操作系统权限（§7.3）。
-    pub fn is_arbitrary_code(&self) -> bool {
-        matches!(self, Operation::ShellCommand { .. } | Operation::PythonCode)
-    }
-
     /// 只读动作。
     pub fn is_read_only(&self) -> bool {
         matches!(
@@ -171,12 +133,12 @@ impl Operation {
 
 /// 计划触及的一个目标（§六）：**本地路径，或者一个资源 URI**。
 ///
-/// 两种目标在计划里带着不同的东西：本地路径只有路径；资源入口带着**逻辑** URI（审批与
-/// 审计回答的是"允许读哪个逻辑资源"）与解析出来的**真实**目标（规则匹配看它）。
+/// 两种目标在计划里带着不同的东西：本地路径只有路径；资源入口带着**逻辑** URI（界面与
+/// 审计回答的是"读的是哪个逻辑资源"）与解析出来的**真实**目标（执行看它）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanTarget {
     /// 目标本身。**序列化上扁平**：本地路径那条仍然是 `{"path": "…"}`，与旧行逐字
-    /// 兼容——旧审批计划按原哈希校验，不会因为多了资源这一维就失效（§八）。
+    /// 兼容——旧计划的哈希不会因为多了资源这一维就变（§八）。
     #[serde(flatten)]
     pub target: TargetRef,
     pub access: TargetAccess,
@@ -204,7 +166,7 @@ impl PlanTarget {
         }
     }
 
-    /// 解析出来的真实目标——**规则的路径匹配只看这里**，不看模型给的原始参数。
+    /// 解析出来的真实目标——**按路径判断只看这里**，不看模型给的原始参数。
     ///
     /// 虚拟入口（`tool://`）没有磁盘目标，返回 `None`。
     pub fn path(&self) -> Option<&Path> {
@@ -223,15 +185,15 @@ impl PlanTarget {
 }
 
 impl fmt::Display for PlanTarget {
-    /// 审批与日志用同一份拼法：资源印**逻辑** URI，本地印路径。
+    /// 界面与日志用同一份拼法：资源印**逻辑** URI，本地印路径。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.target)
     }
 }
 
 impl PlanTarget {
-    /// 审批那一行：资源印逻辑 URI（有真实目标就跟在后面——"允许读哪个逻辑资源"与
-    /// "实际读的是哪个文件"是两件事，审批人要同时看到），本地路径照旧。
+    /// 展示那一行：资源印逻辑 URI（有真实目标就跟在后面——"读哪个逻辑资源"与
+    /// "实际读的是哪个文件"是两件事，看的人要同时看到），本地路径照旧。
     pub fn describe(&self) -> String {
         if self.uri().is_none() {
             return self.to_string();
@@ -250,7 +212,7 @@ pub enum TargetAccess {
     Write,
 }
 
-/// 计划绑定的各种版本（§7.2）。版本变化使旧授权失效（§5.4）。
+/// 计划绑定的各种版本（§7.2）。版本变化改变计划哈希（§5.4）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanVersions {
     /// 代码内容哈希（任意 code 模式、shell 命令正文的快照）。
@@ -295,7 +257,7 @@ pub enum RecoveryMode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         valid_for_secs: Option<u64>,
     },
-    /// 可以核对目标状态：用审核过的核对逻辑判断已达到 / 确定未执行 / 冲突 / 未知。
+    /// 可以核对目标状态：用工具自带的核对逻辑判断已达到 / 确定未执行 / 冲突 / 未知。
     VerifyTarget,
     /// 无可靠恢复方式：停在 `needs_attention`，不自动从头执行整个脚本。
     NoSafeRecovery,
@@ -303,10 +265,10 @@ pub enum RecoveryMode {
 
 /// 一份不可变的执行计划（§7.2）。
 ///
-/// 审批绑定的就是这个对象；[`ExecutionPlan::plan_hash`] 是它的规范化哈希。
+/// `Tool::execute` 收的就是它（按值）；[`ExecutionPlan::plan_hash`] 是它的规范化哈希。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionPlan {
-    /// 这次被审核的操作的 ID。Memory 内部变更也有自己的 operation_id（§7.1）。
+    /// 这次操作的 ID。Memory 内部变更也有自己的 operation_id（§7.1）。
     pub operation_id: OperationId,
     pub source: PlanSource,
     /// 工具名。
@@ -332,8 +294,7 @@ pub struct ExecutionPlan {
     pub recovery: RecoveryMode,
     /// 文件改动之后紧接着跑的那条命令（`edit` / `write` 的 `then_run`）。
     ///
-    /// 两步**一起**过 Policy、一起审批：判决取两步里最严的那个，审批绑定的哈希就是这份
-    /// 计划的哈希，因而盖住两步（§7.1、§7.2）。只许一层、只能是 shell 命令——见
+    /// 两步是**一份**计划：计划哈希盖住两步（§7.2）。只许一层、只能是 shell 命令——见
     /// [`ExecutionPlan::validate_steps`]。没有它时不序列化，旧计划的哈希逐字不变。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub then_run: Option<Box<ExecutionPlan>>,
@@ -346,8 +307,8 @@ pub enum StepsError {
     Nested,
     #[error("then_run 只能是一条 shell 命令")]
     NotAShellCommand,
-    /// 第二步的来源、Run 或 ToolCall 与第一步不同：范围授权按这几样匹配，第二步换一个
-    /// Run 就能借到别的 Run 里的授权。
+    /// 第二步的来源、Run 或 ToolCall 与第一步不同：账本按这几样记这次调用，两步记在
+    /// 不同的 Run 下就对不上同一个 ToolCall。
     #[error("then_run 必须与改动同一来源、同一 Run、同一 ToolCall")]
     ForeignContext,
 }
@@ -374,8 +335,8 @@ impl ExecutionPlan {
     }
 
     /// 组合计划的形状：`then_run` 只许一层、只能是 shell 命令、与改动同一来源 / Run /
-    /// ToolCall。工具在 `prepare` 里调它；Policy 也调——形状不对的组合计划一律 Deny，
-    /// 不指望每个工具都记得。
+    /// ToolCall。工具在 `prepare` 里调它，executor 执行前再核
+    /// 一遍——形状不对的组合计划不执行，不指望每个工具都记得。
     pub fn validate_steps(&self) -> Result<(), StepsError> {
         let Some(next) = self.then_run.as_deref() else {
             return Ok(());
@@ -390,209 +351,6 @@ impl ExecutionPlan {
             return Err(StepsError::ForeignContext);
         }
         Ok(())
-    }
-}
-
-/// 一次执行被允许的证明。
-///
-/// **字段私有，没有公开构造函数**，所以 kernel 之外无法凭空造一个。两个来源：
-/// [`crate::policy::PolicyDecision::into_proof`]（只有 `Allow` 换得出）和
-/// [`ConsumedApproval::into_proof`]（只有消费成功的审批换得出）。测试用
-/// `test_support::proof()`，feature 门控，不进正式构建（§4）。
-///
-/// 外部 crate 造不出 `Proof`，所以也调不到 `Tool::execute`——这是**编译期**的保证，
-/// 不是约定（§14 阶段 2 的验收项）：
-///
-/// ```compile_fail
-/// # use komo_kernel::types::Proof;
-/// // 字段是私有的，构造不出来。
-/// let forged = Proof { step: unimplemented!(), then_run: None };
-/// ```
-///
-/// ```compile_fail
-/// # use komo_kernel::types::Proof;
-/// // 构造函数是 pub(crate) 的，外面看不见。
-/// let forged = Proof::policy_allow();
-/// ```
-///
-/// ```compile_fail
-/// # use komo_kernel::types::{ApprovedPlan, ExecutionPlan};
-/// // 于是 ApprovedPlan 也没法凭空造：第二个参数拿不到。
-/// fn forge(plan: ExecutionPlan) -> ApprovedPlan {
-///     ApprovedPlan::new(plan, komo_kernel::types::Proof::policy_allow())
-/// }
-/// ```
-///
-/// 组合计划的第二步（`then_run`）也只能从同一份凭据里换出来，即
-/// [`ApprovedPlan::then_run`]。`Proof` 不能复制，所以拿一份批过的计划的凭据去配一个
-/// 自己拼的第二步，写不出来：
-///
-/// ```compile_fail
-/// # use komo_kernel::types::{ApprovedPlan, ExecutionPlan};
-/// fn forge(approved: &ApprovedPlan, step: ExecutionPlan) -> ApprovedPlan {
-///     ApprovedPlan::new(step, approved.proof().clone())
-/// }
-/// ```
-///
-/// 唯一合法的两条路都在 kernel 里换：
-///
-/// ```
-/// # use komo_kernel::policy::PolicyDecision;
-/// assert!(PolicyDecision::allow("在已授权根内").into_proof().is_some());
-/// assert!(PolicyDecision::ask("需要人看一眼").into_proof().is_none());
-/// assert!(PolicyDecision::deny("命中禁用规则").into_proof().is_none());
-/// ```
-///
-/// **不实现 `Clone`**：一份凭据只配一份计划（组合计划的第二步由 kernel 照着第一步的
-/// 凭据另造一份，见 [`ApprovedPlan::then_run`]）。
-///
-/// 组合计划的两步各凭各的授权（或一步凭授权、一步凭配置 Allow）放行时，凭据按步带着
-/// 各自的来源（[`Proof::with_then_run`]）：第二步换出来的那份凭据说的是**它自己**凭的
-/// 哪条授权。
-#[derive(Debug, PartialEq, Eq)]
-pub struct Proof {
-    step: ProofKind,
-    /// 第二步自己的来源。`None` = 两步共用 `step`（合并授权：一次性授权绑组合哈希，
-    /// 或一条范围授权两步都盖得住）。
-    then_run: Option<ProofKind>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ProofKind {
-    /// Policy 直接答 Allow。
-    PolicyAllow,
-    /// 消费了一条已批准的审批 / 授权。
-    Approval {
-        approval: ApprovalId,
-        grant: Option<GrantId>,
-    },
-}
-
-impl Proof {
-    fn of(step: ProofKind) -> Self {
-        Proof {
-            step,
-            then_run: None,
-        }
-    }
-
-    pub(crate) fn policy_allow() -> Self {
-        Proof::of(ProofKind::PolicyAllow)
-    }
-
-    pub(crate) fn approval(approval: ApprovalId, grant: Option<GrantId>) -> Self {
-        Proof::of(ProofKind::Approval { approval, grant })
-    }
-
-    /// 组合计划按步放行：`self` 是改动那一步的凭据，`then_run` 是命令那一步的。
-    ///
-    /// 两份都得是已经换出来的凭据——这里只是把它们按步装在一起，造不出新的放行。
-    /// 第二步的凭据若自己也是按步装的，只取它的第一步：`then_run` 只有一层。
-    pub fn with_then_run(self, then_run: Proof) -> Proof {
-        Proof {
-            step: self.step,
-            then_run: Some(then_run.step),
-        }
-    }
-
-    /// 这次放行来自哪条审批（如果不是 Policy 直接 Allow）。写进账本用。按步放行的组合
-    /// 计划上说的是改动那一步；命令那一步的在 [`ApprovedPlan::then_run`] 换出来的凭据上。
-    pub fn approval_id(&self) -> Option<&ApprovalId> {
-        match &self.step {
-            ProofKind::PolicyAllow => None,
-            ProofKind::Approval { approval, .. } => Some(approval),
-        }
-    }
-
-    /// 这次放行消费了哪条范围授权（同上，按步放行时是改动那一步的）。
-    pub fn grant_id(&self) -> Option<&GrantId> {
-        match &self.step {
-            ProofKind::PolicyAllow => None,
-            ProofKind::Approval { grant, .. } => grant.as_ref(),
-        }
-    }
-}
-
-/// 这次消费是**第一次跑这个调用**，还是恢复流程已经核对过、确定原动作没发生。
-///
-/// §7.4 在这里分了两句话：「已取消或已完成调用不能再次执行」和「恢复时若确定原动作未
-/// 发生……可在原授权范围内继续；**已经消费授权本身不是重试依据**」。把这件事交给
-/// `ApprovalRepo` 用一个参数问出来，而不是让每个调用点自己记得判断——两个语境说的是
-/// 同一条授权，只有"这一次算不算重来"不同。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ConsumeIntent {
-    /// 这个调用的第一次执行。一次性授权已经用过了就拒绝——那意味着这个动作已经发生过。
-    #[default]
-    First,
-    /// 恢复流程核对过了：§8.4 第 6 行的"确定尚未执行"，或 §8.6 的核对给出
-    /// [`Verification::NotPerformed`]。这时候才准重用一条已消费的一次性授权。
-    KnownNotToHaveRun,
-}
-
-/// 一条被成功消费的审批。只有执行器从 `ApprovalRepo` 消费成功才拿得到它。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConsumedApproval {
-    approval: ApprovalId,
-    grant: Option<GrantId>,
-    plan_hash: PlanHash,
-}
-
-impl ConsumedApproval {
-    /// `ApprovalRepo` 的实现在确认「这条审批已批准、仍有效、绑定的正是这个计划哈希」
-    /// 之后调用它。
-    pub fn new(approval: ApprovalId, grant: Option<GrantId>, plan_hash: PlanHash) -> Self {
-        Self {
-            approval,
-            grant,
-            plan_hash,
-        }
-    }
-
-    pub fn plan_hash(&self) -> &PlanHash {
-        &self.plan_hash
-    }
-
-    pub fn into_proof(self) -> Proof {
-        Proof::approval(self.approval, self.grant)
-    }
-}
-
-/// 允许执行的计划。`Tool::execute` 只接受它（§4），所以「没有经过 Policy 或审批就
-/// 执行」在类型上就写不出来。
-#[derive(Debug, PartialEq, Eq)]
-pub struct ApprovedPlan {
-    plan: ExecutionPlan,
-    proof: Proof,
-}
-
-impl ApprovedPlan {
-    pub fn new(plan: ExecutionPlan, proof: Proof) -> Self {
-        Self { plan, proof }
-    }
-
-    pub fn plan(&self) -> &ExecutionPlan {
-        &self.plan
-    }
-
-    pub fn proof(&self) -> &Proof {
-        &self.proof
-    }
-
-    /// 组合计划的第二步：Policy / 审批判的是整份组合计划，合并授权时两步共用同一份
-    /// 凭据，按步放行时第二步拿它自己那一份（[`Proof::with_then_run`]）。这是 kernel
-    /// 之外拿到第二步 `ApprovedPlan` 的唯一办法。
-    pub fn then_run(&self) -> Option<ApprovedPlan> {
-        self.plan.then_run.as_deref().map(|step| ApprovedPlan {
-            plan: step.clone(),
-            proof: Proof::of(
-                self.proof
-                    .then_run
-                    .as_ref()
-                    .unwrap_or(&self.proof.step)
-                    .clone(),
-            ),
-        })
     }
 }
 
@@ -651,8 +409,8 @@ mod tests {
         }
     }
 
-    /// 这份计划在 `then_run` 出现之前序列化成的样子——`approval_requests.plan` 里存的
-    /// 就是这种行。
+    /// 这份计划在 `then_run` 出现之前序列化成的样子——旧 JSONL 与
+    /// 旧库里存的就是这种行。
     const OLD_ROW: &str = r#"{"args":{"content":"hi","path":"a.txt"},"cwd":"/tmp/ws","operation":{"kind":"write_file"},"operation_id":"op-1","recovery":{"kind":"verify_target"},"run":"run-1","source":{"kind":"interactive","session":"sess-1"},"targets":[{"access":"write","path":"/tmp/ws/a.txt"}],"tool":"write","tool_call":"call-7","versions":{}}"#;
 
     #[test]
@@ -719,75 +477,6 @@ mod tests {
     }
 
     #[test]
-    fn the_second_step_carries_the_same_proof() {
-        assert!(
-            ApprovedPlan::new(plan(), Proof::policy_allow())
-                .then_run()
-                .is_none()
-        );
-
-        let composite = fused("cargo test");
-        let consumed =
-            ConsumedApproval::new(ApprovalId::from_raw("ap-1"), None, composite.plan_hash());
-        let approved = ApprovedPlan::new(composite.clone(), consumed.into_proof());
-        let second = approved.then_run().expect("有第二步");
-        assert_eq!(second.plan(), composite.then_run.as_deref().unwrap());
-        assert_eq!(second.proof(), approved.proof());
-        assert_eq!(
-            second.proof().approval_id().map(|a| a.as_str()),
-            Some("ap-1")
-        );
-    }
-
-    #[test]
-    fn a_per_step_proof_hands_the_second_step_its_own_grant() {
-        let composite = fused("cargo test");
-        let edit = ConsumedApproval::new(
-            ApprovalId::from_raw("ap-edit"),
-            Some(GrantId::from_raw("g-edit")),
-            plan().plan_hash(),
-        );
-        let command = ConsumedApproval::new(
-            ApprovalId::from_raw("ap-cmd"),
-            Some(GrantId::from_raw("g-cmd")),
-            composite.then_run.as_deref().unwrap().plan_hash(),
-        );
-        let proof = edit.into_proof().with_then_run(command.into_proof());
-        let approved = ApprovedPlan::new(composite, proof);
-        assert_eq!(
-            approved.proof().grant_id().map(|g| g.as_str()),
-            Some("g-edit")
-        );
-        let second = approved.then_run().expect("有第二步");
-        assert_eq!(second.proof().grant_id().map(|g| g.as_str()), Some("g-cmd"));
-        assert_eq!(
-            second.proof().approval_id().map(|a| a.as_str()),
-            Some("ap-cmd")
-        );
-
-        // 一步凭配置 Allow、一步凭授权：第二步说得出它凭的是授权，第一步什么都不凭。
-        let mixed = Proof::policy_allow().with_then_run(
-            ConsumedApproval::new(
-                ApprovalId::from_raw("ap-cmd"),
-                Some(GrantId::from_raw("g-cmd")),
-                plan().plan_hash(),
-            )
-            .into_proof(),
-        );
-        let approved = ApprovedPlan::new(fused("cargo test"), mixed);
-        assert!(approved.proof().grant_id().is_none());
-        assert_eq!(
-            approved
-                .then_run()
-                .unwrap()
-                .proof()
-                .grant_id()
-                .map(|g| g.as_str()),
-            Some("g-cmd")
-        );
-    }
-
-    #[test]
     fn hashing_the_same_plan_twice_gives_the_same_hash() {
         let p = plan();
         assert_eq!(p.plan_hash(), p.plan_hash());
@@ -817,40 +506,5 @@ mod tests {
         let mut b = plan();
         b.targets[0].target = TargetRef::local("/etc/passwd");
         assert_ne!(a.plan_hash(), b.plan_hash());
-    }
-
-    #[test]
-    fn an_approved_plan_keeps_the_proof_it_was_built_with() {
-        let approved = ApprovedPlan::new(plan(), Proof::policy_allow());
-        assert!(approved.proof().approval_id().is_none());
-
-        let consumed = ConsumedApproval::new(
-            ApprovalId::from_raw("ap-1"),
-            Some(GrantId::from_raw("g-1")),
-            plan().plan_hash(),
-        );
-        let approved = ApprovedPlan::new(plan(), consumed.into_proof());
-        assert_eq!(
-            approved.proof().approval_id().map(|a| a.as_str()),
-            Some("ap-1")
-        );
-        assert_eq!(approved.proof().grant_id().map(|g| g.as_str()), Some("g-1"));
-    }
-
-    #[test]
-    fn cron_and_memory_plans_are_unattended() {
-        assert!(
-            PlanSource::Cron {
-                job: crate::types::ids::CronJobId::from_raw("job-1"),
-                job_version: 1
-            }
-            .is_unattended()
-        );
-        assert!(
-            !PlanSource::Interactive {
-                session: SessionId::from_raw("s")
-            }
-            .is_unattended()
-        );
     }
 }

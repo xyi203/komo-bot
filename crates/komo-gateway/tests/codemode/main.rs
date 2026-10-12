@@ -57,7 +57,7 @@ async fn run_script(home: &Home, code: &str) -> Option<(Gw, Arc<FakeLlm>, String
     Some((gw, llm, result))
 }
 
-/// 脚本读两个文件、只把过滤后的那几行交回来，不用审批。
+/// 脚本读两个文件、只把过滤后的那几行交回来，不停下来问人。
 #[tokio::test]
 async fn a_script_reads_and_filters_and_only_the_filtered_text_comes_back() {
     let home = Home::new();
@@ -74,7 +74,7 @@ text("\n".join(hits))
     let Some((gw, _, result)) = run_script(&home, code).await else {
         return;
     };
-    assert!(gw.approvals().await.is_empty());
+    assert!(gw.interventions().await.is_empty());
     assert!(result.contains("a.log: ERROR disk"), "{result}");
     assert!(result.contains("b.log: ERROR net"), "{result}");
     assert!(!result.contains("ok 1"), "过滤掉的不该回来：{result}");
@@ -94,25 +94,32 @@ except ToolError as error:
     let Some((_, _, result)) = run_script(&home, code).await else {
         return;
     };
-    assert!(result.contains("refused: write 不是只读的"), "{result}");
+    assert!(
+        result.contains("refused: ") && result.contains("write 不是只读的"),
+        "{result}"
+    );
     assert!(!home.workspace().join("x.txt").exists());
 }
 
-/// 要审批的读取（工作区外）在脚本里抛错，不会停下来等人。
+/// 工作区外的读取在脚本里照样放行（D8：内层只看计划是不是只读，与 auto 一致），不会
+/// 停下来等人。
 #[tokio::test]
-async fn a_read_that_needs_approval_raises_instead_of_waiting() {
+async fn a_read_outside_the_workspace_is_allowed_inside_a_script() {
     let home = Home::new();
-    let code = r#"
-try:
-    tools.read(path="/etc/hosts")
-except ToolError as error:
-    text("refused: " + str(error))
-"#;
-    let Some((gw, _, result)) = run_script(&home, code).await else {
+    let outside = home.path().join("outside.txt");
+    std::fs::write(&outside, "外面那一行\n").unwrap();
+    let code = format!(
+        r#"
+body = tools.read(path="{}")["text"]
+text("read: " + body.strip())
+"#,
+        outside.display()
+    );
+    let Some((gw, _, result)) = run_script(&home, &code).await else {
         return;
     };
-    assert!(result.contains("这一步要审批"), "{result}");
-    assert!(gw.approvals().await.is_empty(), "脚本里不建审批");
+    assert!(result.contains("read: 外面那一行"), "{result}");
+    assert!(gw.interventions().await.is_empty(), "脚本里不停下来问人");
 }
 
 /// 死循环到 `call_timeout_secs` 被杀，Run 照常收尾。

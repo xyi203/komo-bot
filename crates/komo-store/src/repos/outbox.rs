@@ -1,13 +1,16 @@
 //! `control_outbox`：控制事务产生、尚待补写到 JSONL 的审计事件（§8.5 的反向顺序）。
 //!
 //! ```text
-//! state.db 事务提交审批决定与 control_outbox（固定 event_id）
+//! state.db 事务提交控制决定与 control_outbox（固定 event_id）
 //!   → Session 写入器将审计事件追加到 JSONL 并同步
 //!   → state.db 标记 outbox 已交付并更新日志索引
 //! ```
 //!
-//! **审批生效不依赖审计补写成功**：Turso 的提交就是 fsync（§8.2 实测），客户端可以在
+//! **控制决定生效不依赖审计补写成功**：Turso 的提交就是 fsync（§8.2 实测），客户端可以在
 //! 数据库提交后立刻得到确认，outbox 只承担审计补写与顺序，不承担耐久性。
+//!
+//! 删审批之前排进来、还没补写的 `approval.*` 行照样取得出来：词汇里没有它们了，读成
+//! `EventPayload::Unknown`，原样补写进 JSONL（D3），不卡补写循环。
 
 use komo_kernel::events::EventPayload;
 use komo_kernel::traits::StoreError;
@@ -30,7 +33,7 @@ pub struct PendingAudit {
 /// 在控制事务里排一条审计事件。**event_id 由调用方固定**，补写按它幂等。
 ///
 /// 没有 `now` 参数：入队时间由这里读钟。`occurred_at` 才是要保留的那个——补写保留**原始
-/// 发生时间**，不凭日志行相邻推断审批关系（§8.3），而"什么时候排进队的"只是运维信息。
+/// 发生时间**，不凭日志行相邻推断事件关系（§8.3），而"什么时候排进队的"只是运维信息。
 pub async fn enqueue_in(
     ex: &mut dyn Executor,
     session: &SessionId,
@@ -167,9 +170,6 @@ fn join_payload(payload_type: &str, data: &str) -> Result<EventPayload, StoreErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_kernel::events::ApprovalDecided;
-    use komo_kernel::types::chat::{ApprovalScope, PeerId};
-    use komo_kernel::types::ids::ApprovalId;
     use time::macros::datetime;
 
     const DECIDED_AT: OffsetDateTime = datetime!(2026-09-14 20:30:00 UTC);
@@ -182,15 +182,17 @@ mod tests {
         (db, dir)
     }
 
+    /// 删审批之前排进来的那种行：`approval.decided` 现在读成 Unknown（D3）。
     fn payload() -> EventPayload {
-        EventPayload::ApprovalDecided(ApprovalDecided {
-            approval: ApprovalId::from_raw("ap-1"),
-            approved: true,
-            scope: ApprovalScope::Once,
-            by: Some(PeerId::new("operator")),
-            decided_at: DECIDED_AT,
-            grant: None,
-        })
+        EventPayload::Unknown {
+            event_type: "approval.decided".into(),
+            raw: serde_json::json!({
+                "approval": "ap-1",
+                "approved": true,
+                "scope": "once",
+                "decided_at": "2026-09-14T20:30:00Z",
+            }),
+        }
     }
 
     async fn enqueue(db: &Db, id: &str) {
@@ -212,7 +214,8 @@ mod tests {
         .unwrap();
     }
 
-    /// 排队、取出、标记已交付——§8.5 反向顺序的三步。
+    /// 排队、取出、标记已交付——§8.5 反向顺序的三步。用的是一条删审批之前的
+    /// `approval.decided`：它照样取得出来、标得掉，不卡补写。
     #[tokio::test]
     async fn an_audit_event_round_trips_with_its_original_time() {
         let (db, _dir) = temp().await;
@@ -223,7 +226,7 @@ mod tests {
         assert_eq!(waiting[0].event_id.as_str(), "evt-1");
         assert_eq!(
             waiting[0].occurred_at, DECIDED_AT,
-            "保留原始发生时间，不凭日志行相邻推断审批关系"
+            "保留原始发生时间，不凭日志行相邻推断事件关系"
         );
         assert_eq!(waiting[0].payload, payload());
 

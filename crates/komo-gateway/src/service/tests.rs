@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::traits::Inbound;
-use komo_kernel::types::chat::{
-    ApprovalScope, ChannelPeer, ChannelPlatform, DeliveryTarget, Outbound, PeerId,
-};
+use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, DeliveryTarget, Outbound, PeerId};
 use komo_kernel::types::ids::{RequestKey, RunId, SessionId};
 use komo_kernel::types::status::{RunState, WaitReason};
 
@@ -53,49 +51,50 @@ async fn a_replayed_message_produces_one_run() {
     assert_eq!(runs.len(), 1, "账本上只有一个 Run");
 }
 
-/// ① 的另一半：重发的 `/approve` 只批准一次。
+/// ① 的另一半：重发的 `/answer` 只答一次。
+///
+/// 停住 Run 的是一次"结果不明"（测试工具 `unsure`，§7.5 的 `verify`）：平台重投同一条
+/// 命令，回执相同，那次调用也只被收尾一次——核对之后不重跑。
 #[tokio::test]
-async fn a_replayed_approve_decides_once() {
-    let gateway = TestGateway::start().await;
-    let record = pending_approval(&gateway).await;
+async fn a_replayed_answer_answers_once() {
+    use crate::service::test_support::Unsure;
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round, text_round};
 
+    let home = Home::new();
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
+    let gateway = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(1, "pc-1", "unsure", serde_json::json!({})),
+            text_round(2, "好了。"),
+        ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway.submit(&session, "answer-1", "试一下").await.run;
+    let pending = gateway.wait_intervention(&run).await;
+
+    let command = format!("/answer {} satisfied", pending.handle);
     let first = gateway
         .dispatcher()
-        .handle(operator_dm(
-            &format!("/approve {}", record.short_id),
-            "telegram:7",
-        ))
+        .handle(operator_dm(&command, "telegram:7"))
         .await
         .expect("第一次");
-    let InboundAck::Replied { text } = first else {
+    let InboundAck::Replied { text } = &first else {
         panic!("命令要有回执：{first:?}");
     };
-    assert!(text.contains("已批准"), "{text}");
-    assert!(!text.contains("已经决定过"), "第一次不是重复：{text}");
+    assert!(!text.contains("已经答复过"), "第一次不是重复：{text}");
 
     // 平台重投同一条命令。
     let again = gateway
         .dispatcher()
-        .handle(operator_dm(
-            &format!("/approve {}", record.short_id),
-            "telegram:7",
-        ))
+        .handle(operator_dm(&command, "telegram:7"))
         .await
         .expect("重投");
-    assert!(
-        matches!(&again, InboundAck::Replied { text } if text.contains("已批准")),
-        "{again:?}"
-    );
+    assert_eq!(again, first, "重投拿到的是同一个回执");
 
-    let stored = gateway
-        .state()
-        .approval_repo
-        .get(&record.approval)
-        .await
-        .expect("读得到")
-        .expect("有这条");
-    let decision = stored.decision.expect("有结论");
-    assert!(decision.approved);
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed);
+    assert_eq!(unsure.ran(), 1, "核对之后不重跑");
 }
 
 /// ② 不在 `allow_from` 的发送者被拒、`/id` 对他可用、且**账本与 deliveries 无任何记录**。
@@ -275,55 +274,77 @@ listen = "这不是一个地址"
     assert_eq!(count(&gateway, "配置已装上"), 1, "没出过错就不用说");
 }
 
-/// ⑤ 审批请求投到来源会话与 home chat；第二个答复得到"已决定"。
+/// ⑤ 介入投到来源会话与 home chat；第二个答复得到"已经答复过了"。
 #[tokio::test]
-async fn an_approval_goes_to_both_the_source_and_home_and_is_decided_once() {
+async fn an_intervention_goes_to_both_the_source_and_home_and_is_answered_once() {
+    use crate::channels::ChannelSender;
+    use crate::service::test_support::Unsure;
+    use crate::service::test_support::harness::{
+        FakeLlm, FixedFactory, GatewayBuilder, MemSender, call_round, text_round,
+    };
+
     // home chat 是 111，来源会话是群 222。
-    let gateway = TestGateway::start().await;
-    let record = pending_approval(&gateway).await;
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let unsure = Unsure::new();
+    let gateway = GatewayBuilder::new(&telegram_config("111"))
+        .factory(FixedFactory::sender_only(
+            Arc::clone(&sender) as Arc<dyn ChannelSender>
+        ))
+        .llm(FakeLlm::new(vec![vec![
+            call_round(1, "pc-1", "unsure", serde_json::json!({})),
+            text_round(2, "好了。"),
+        ]]))
+        .tool(unsure.tool())
+        .start()
+        .await;
 
-    let source = ChannelPeer::new(ChannelPlatform::Telegram, "222");
-    gateway
-        .state()
-        .notifier
-        .deliver_approval(
-            Some(&source),
-            komo_runtime::approvals::presentation(&record),
-        )
-        .await
-        .expect("投得出去");
+    let ack = gateway
+        .handle(inbound(
+            ChannelPlatform::Telegram,
+            "222",
+            "111",
+            "跑一下",
+            "telegram:500",
+            false,
+        ))
+        .await;
+    let InboundAck::Queued { run, .. } = ack else {
+        panic!("群里的话要起一个 Run：{ack:?}");
+    };
+    let pending = gateway.wait_intervention(&run).await;
 
-    let sent = gateway.channel.sent();
-    let targets: Vec<String> = sent
-        .iter()
-        .filter(|message| matches!(message.outbound, Outbound::ApprovalRequest(_)))
-        .map(|message| message.peer.chat_id.to_string())
-        .collect();
-    assert!(
-        targets.contains(&"222".to_string()),
-        "来源会话：{targets:?}"
-    );
-    assert!(
-        targets.contains(&"111".to_string()),
-        "home chat：{targets:?}"
-    );
+    crate::service::test_support::harness::eventually(
+        "来源会话与 home chat 都收到",
+        || {
+            let targets: Vec<String> = sender
+                .sent()
+                .iter()
+                .filter(|message| matches!(message.outbound, Outbound::NeedsAttention { .. }))
+                .map(|message| message.peer.chat_id.to_string())
+                .collect();
+            targets.contains(&"222".to_string()) && targets.contains(&"111".to_string())
+        },
+    )
+    .await;
 
     // 第一个答复。
-    let first = gateway
-        .state()
-        .decide_approval(&record.approval, true, ApprovalScope::Once, None)
-        .await
-        .expect("决定得了");
-    assert!(!first.already_decided);
+    let first: komo_kernel::protocol::http::InterventionAnswerResponse =
+        serde_json::from_str(&gateway.answer(&pending.handle, "satisfied").await).expect("回执");
+    assert!(!first.already_answered);
 
-    // 第二个答复得到"已决定"，且不改变结论。
-    let second = gateway
-        .state()
-        .decide_approval(&record.approval, false, ApprovalScope::Once, None)
-        .await
-        .expect("决定得了");
-    assert!(second.already_decided, "第二个答复应当得到原决定");
-    assert!(second.decision.approved, "结论没有被第二次答复改写");
+    // 第二个答复得到"已经答复过了"，且不改变结论。
+    let second: komo_kernel::protocol::http::InterventionAnswerResponse =
+        serde_json::from_str(&gateway.answer(&pending.handle, "abandon").await).expect("回执");
+    assert!(
+        second.already_answered,
+        "第二个答复应当得到原结论：{second:?}"
+    );
+    assert_ne!(
+        second.run_state,
+        Some(RunState::Abandoned),
+        "结论没有被第二次答复改写"
+    );
+    assert_eq!(unsure.ran(), 1);
 }
 
 /// ⑥ `Deferred` 的投递在下一条入站消息时先被冲刷。
@@ -368,7 +389,7 @@ async fn a_deferred_delivery_is_flushed_before_the_next_message() {
         sent.iter().any(
             |message| matches!(&message.outbound, Outbound::Text { text } if text == "要批一下")
         ),
-        "积压的审批请求要先送到：{sent:?}"
+        "积压的那一条要先送到：{sent:?}"
     );
     assert!(
         gateway
@@ -608,31 +629,6 @@ async fn slash_new_appends_a_boundary_to_the_same_session() {
 
 // ---------------------------------------------------------------- 工具
 
-/// 造一条待处理的审批（executor 在真的跑起来时做的就是这件事）。
-async fn pending_approval(gateway: &TestGateway) -> komo_kernel::protocol::http::ApprovalRecord {
-    let session = gateway
-        .state()
-        .default_main_session()
-        .await
-        .expect("home session");
-    let plan = komo_kernel::test_support::sample_plan("shell", &session);
-    gateway
-        .state()
-        .approvals
-        .request(komo_runtime::approvals::ApprovalRequest {
-            session,
-            run: None,
-            call: None,
-            plan,
-            reason: "任意 shell 命令要人看一眼".into(),
-            changes: None,
-            evidence: None,
-            scopes: vec![ApprovalScope::Once],
-        })
-        .await
-        .expect("写得下")
-}
-
 /// 等一条 Run 进终态（10 秒超时）。
 async fn wait_for_run(
     gateway: &TestGateway,
@@ -652,36 +648,57 @@ async fn wait_for_run(
     panic!("等了 10 秒 run {run} 还没有终态");
 }
 
-/// 待处理只有一条时，聊天里回一个 `y` 就批了——**不用抄短 ID**（§11.3）。
-///
-/// 而且没有待处理审批时它**不是命令**：模型问"要不要…"、操作者回个 `n`，那是回话，不是
-/// "拒绝一条不存在的审批"。
+/// 审批删掉之后（§7），`y` 就是一句话：**有介入挂着也一样**，它不替人答任何东西。
+/// `/approve` 不是命令了，答一句帮助，而不是把它交给模型跑一轮。
 #[tokio::test]
-async fn a_bare_yes_decides_the_only_pending_approval() {
-    let gateway = TestGateway::start().await;
-    let record = pending_approval(&gateway).await;
+async fn a_bare_yes_is_just_a_message_even_when_something_is_pending() {
+    use crate::service::test_support::Unsure;
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round, text_round};
+
+    let home = Home::new();
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
+    let gateway = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(1, "pc-1", "unsure", serde_json::json!({})),
+            text_round(2, "好了。"),
+        ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway
+        .state()
+        .default_main_session()
+        .await
+        .expect("home session");
+    let run = gateway.submit(&session, "yes-1", "试一下").await.run;
+    gateway.wait_intervention(&run).await;
 
     let ack = gateway
         .dispatcher()
         .handle(operator_dm("y", "telegram:900"))
         .await
-        .expect("答复");
-    assert!(matches!(ack, InboundAck::Replied { .. }), "{ack:?}");
-
-    let decided = gateway
-        .state()
-        .approval_repo
-        .get(&record.approval)
-        .await
-        .expect("读得到")
-        .expect("有这条");
+        .expect("收下");
     assert!(
-        decided.decision.as_ref().is_some_and(|d| d.approved),
-        "`y` 要真的批了：{decided:?}"
+        matches!(ack, InboundAck::Queued { .. }),
+        "`y` 是回话，不是答复：{ack:?}"
     );
+    assert_eq!(
+        gateway.db_state(&run).await,
+        RunState::Waiting,
+        "挂着的那条没有被 `y` 答掉"
+    );
+
+    let ack = gateway
+        .dispatcher()
+        .handle(operator_dm("/approve", "telegram:901"))
+        .await
+        .expect("收下");
+    let InboundAck::Replied { text } = ack else {
+        panic!("`/approve` 要答一句帮助：{ack:?}");
+    };
+    assert!(text.contains("/answer"), "{text}");
 }
 
-/// 没有待处理审批时，`y` / `n` 走普通消息那条路（不是命令）。
+/// 没有介入时，`y` / `n` 同样走普通消息那条路（不是命令）。
 #[tokio::test]
 async fn a_bare_yes_with_nothing_pending_is_just_a_message() {
     let gateway = TestGateway::start().await;
@@ -692,122 +709,74 @@ async fn a_bare_yes_with_nothing_pending_is_just_a_message() {
         .expect("收下");
     assert!(
         matches!(ack, InboundAck::Queued { .. }),
-        "没有待审批时 `n` 是回话，不该被读成拒绝：{ack:?}"
+        "`n` 是回话，不该被读成拒绝：{ack:?}"
     );
 }
 
-// ---------------------------------------------------------------- §3 的 policy 热重载
+// ---------------------------------------------------------------- §7 没有 Policy
 
-/// **改 `policy.toml` 不用重启**——改完下一次判决就用新表。
-///
-/// 这条测试盯的是一个真实缺陷：executor 的 `PolicyEngine` 曾是装配时造的，热重载只换了
-/// 快照，判决仍旧按旧表走。于是 `mode = "auto"` 换上去、日志也说"配置已重载"，可每一次
-/// 调用照样问人（线上就卡在这里）。
+/// **还留着的 `policy.toml` 报一句，但不读**（§7、D13）：一份"shell 一律要问"的旧规则表
+/// 放在数据目录里，命令照样直接跑；`komo config check` 说它可以删了，删掉之后不再说。
 #[tokio::test]
-async fn a_reloaded_policy_decides_the_next_call() {
+async fn a_leftover_policy_file_is_reported_but_never_read() {
     use crate::service::test_support::harness::{FakeLlm, Home, call_round, text_round};
 
-    // 一开始不写 policy.toml：§7.1 的初始建议生效，shell 要问。
     let home = Home::new();
-    let once = home.workspace().join("reload.count");
+    std::fs::write(
+        home.path().join("policy.toml"),
+        "default = \"ask\"\n\n[[rules]]\nid = \"ask-shell\"\neffect = \"ask\"\nreason = \"要问我\"\n\n[rules.matcher]\noperations = [\"shell_command\"]\n",
+    )
+    .expect("写 policy.toml");
+    let once = home.workspace().join("leftover.count");
     let command = format!("echo once >> {}", once.display());
-
-    let first = home
-        .start(FakeLlm::new(vec![vec![
-            call_round(
-                1,
-                "pc-1",
-                "shell",
-                serde_json::json!({ "command": command }),
-            ),
-            text_round(2, "做完了。"),
-        ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
-    let session = first.open_session().await;
-    let run = first.submit(&session, "reload-1", "跑一下").await.run;
-    let approval = first.wait_approval().await;
-    assert_eq!(approval.run.as_ref(), Some(&run), "初始建议下这条要问");
-    first.decide(&approval.approval, false).await;
-    first.stop().await;
-
-    // 换成 auto（**不重启**），再来一条同样的命令。
-    std::fs::write(home.path().join("policy.toml"), "mode = \"auto\"\n").expect("写 policy.toml");
-    let second = home
-        .start(FakeLlm::new(vec![vec![
-            call_round(
-                1,
-                "pc-1",
-                "shell",
-                serde_json::json!({ "command": command }),
-            ),
-            text_round(2, "做完了。"),
-        ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
-        .await;
-    // 这条是**重启之后**的启动路径，先证明它按新表装了；再证明热重载这条路也一样。
-    let session = second.open_session().await;
-    let run = second.submit(&session, "reload-2", "跑一下").await.run;
-    second
-        .wait_state(
-            &run,
-            |status| status.is_terminal() || status == RunState::Waiting,
-            "收场",
-        )
-        .await;
-    assert!(
-        second
-            .approvals()
-            .await
-            .iter()
-            .all(|record| record.run.as_ref() != Some(&run)),
-        "auto 表下这条不该问：{:?}",
-        second.approvals().await
-    );
-}
-
-/// 同一台实例上：**热重载**（不重启）之后，判决立刻按新表走。
-#[tokio::test]
-async fn hot_reloading_the_policy_changes_the_very_next_decision() {
-    use crate::service::test_support::harness::{
-        FakeLlm, Home, call_round, home_config, text_round,
-    };
-
-    // 起点：auto —— 命令不问就跑。
-    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
     let gateway = home
         .start(FakeLlm::new(vec![vec![
             call_round(
                 1,
                 "pc-1",
                 "shell",
-                serde_json::json!({ "command": "echo hi" }),
+                serde_json::json!({ "command": command }),
             ),
             text_round(2, "做完了。"),
         ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
 
-    // 换成 strict：**同一台实例**，不重启，只重载。
-    std::fs::write(
-        home.path().join("policy.toml"),
-        "default = \"ask\"\n\n[[rules]]\nid = \"ask-shell\"\neffect = \"ask\"\nreason = \"重载之后这条要问我\"\nscopes = [\"once\"]\nrequires_isolation = false\n\n[rules.matcher]\noperations = [\"shell_command\"]\n",
-    )
-    .expect("写 policy.toml");
-    crate::reload::reload(gateway.state())
-        .await
-        .expect("新配置装得上");
+    let (code, body) = gateway.get_json("/v1/config/check").await;
+    assert_eq!(code, 200, "{body}");
+    let keys = |body: &serde_json::Value| -> Vec<String> {
+        body["issues"]
+            .as_array()
+            .map(|issues| {
+                issues
+                    .iter()
+                    .filter_map(|issue| issue["key"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        keys(&body).contains(&"policy.toml".to_string()),
+        "要报出来：{body}"
+    );
 
     let session = gateway.open_session().await;
-    let run = gateway.submit(&session, "reload-3", "跑一下").await.run;
-    let approval = gateway.wait_approval().await;
+    let run = gateway.submit(&session, "leftover-1", "跑一下").await.run;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed);
     assert_eq!(
-        approval.run.as_ref(),
-        Some(&run),
-        "重载之后必须按新表问：{:?}",
-        approval.reason
+        std::fs::read_to_string(&once)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        1,
+        "旧规则表不拦：命令真的跑了"
     );
+
+    std::fs::remove_file(home.path().join("policy.toml")).expect("删掉");
+    let (_, body) = gateway.get_json("/v1/config/check").await;
     assert!(
-        approval.reason.contains("重载之后这条要问我"),
-        "理由要来自新表：{}",
-        approval.reason
+        !keys(&body).contains(&"policy.toml".to_string()),
+        "删掉之后不再报：{body}"
     );
 }
 
@@ -847,18 +816,13 @@ async fn the_session_list_shows_the_first_message_as_its_title() {
     assert!(!body.contains("热水器呢"), "后来的消息不该改标题：{body}");
 }
 
-// ---------------------------------------------------------------- §7.1 的 auto 模式
-/// `policy.toml` 写 `mode = "auto"`：**日常命令不问就跑**（§7.1）。
-///
-/// 这是这个模式存在的全部理由——`mode = "strict"`（以及不写 `policy.toml` 时的初始建议）
-/// 对每一条 shell 都问一次，于是 agent 干任何活都要人去点一下。
+// ---------------------------------------------------------------- 模型要的就执行
+/// **日常命令不问就跑**（§7）：没有 Policy，模型要的、komo 就执行。
 #[tokio::test]
-async fn auto_mode_runs_an_ordinary_shell_command_without_asking() {
-    use crate::service::test_support::harness::{
-        FakeLlm, Home, call_round, home_config, text_round,
-    };
+async fn an_ordinary_shell_command_runs_without_asking() {
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round, text_round};
 
-    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let home = Home::new();
     let once = home.workspace().join("auto.count");
     let command = format!("echo once >> {}", once.display());
     let llm = FakeLlm::new(vec![vec![
@@ -875,19 +839,10 @@ async fn auto_mode_runs_an_ordinary_shell_command_without_asking() {
         .await;
     let session = gateway.open_session().await;
     let run = gateway.submit(&session, "auto-1", "跑一下 echo").await.run;
-    gateway
-        .wait_state(
-            &run,
-            |status| status.is_terminal() || status == RunState::Waiting,
-            "收场",
-        )
-        .await;
+    let detail = gateway.wait_terminal(&run).await;
 
-    assert!(
-        gateway.approvals().await.is_empty(),
-        "auto 模式下这条命令不该问：{:?}",
-        gateway.approvals().await
-    );
+    assert_eq!(detail.summary.state, RunState::Completed);
+    assert!(gateway.interventions().await.is_empty(), "没有要人答的");
     assert_eq!(
         std::fs::read_to_string(&once)
             .unwrap_or_default()
@@ -898,17 +853,14 @@ async fn auto_mode_runs_an_ordinary_shell_command_without_asking() {
     );
 }
 
-/// 同一个文件里，**危险形状也不问**：auto 是"不审批"，不是"少问几条"。
+/// **危险形状也不问**：边界只能来自执行环境（§7），不来自对命令长相的猜测。
 ///
-/// 靶子是一条不存在的路径（`rm -rf <workspace>/never`）：即使放行也删不掉别的东西，
-/// 但可以断言"一条审批都没产生"且"命令真的执行了"——先建文件，再看它没了。
+/// 靶子是工作区里的一个文件（`rm -rf <workspace>/never-touched`）：先建文件，再看它没了。
 #[tokio::test]
-async fn auto_mode_runs_even_a_dangerous_command_without_asking() {
-    use crate::service::test_support::harness::{
-        FakeLlm, Home, call_round, home_config, text_round,
-    };
+async fn even_a_dangerous_command_runs_without_asking() {
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round, text_round};
 
-    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let home = Home::new();
     let doom = home.workspace().join("never-touched");
     let command = format!("rm -rf {}", doom.display());
     let llm = FakeLlm::new(vec![vec![
@@ -931,28 +883,60 @@ async fn auto_mode_runs_even_a_dangerous_command_without_asking() {
         .submit(&session, "auto-2", "把这个文件删了")
         .await
         .run;
-    gateway
-        .wait_state(
-            &run,
-            |status| status.is_terminal() || status == RunState::Waiting,
-            "收场",
-        )
-        .await;
+    let detail = gateway.wait_terminal(&run).await;
 
-    assert!(
-        gateway.approvals().await.is_empty(),
-        "auto 模式一条都不该问：{:?}",
-        gateway.approvals().await
-    );
+    assert_eq!(detail.summary.state, RunState::Completed);
+    assert!(gateway.interventions().await.is_empty(), "一条都不该问");
     assert!(!doom.exists(), "命令要真的执行过");
+}
+
+/// §7 唯一的硬限制（D7）：`write` 不能改 komo 自己的状态——数据目录下的 `.env` 被拒，
+/// 理由点名路径；Run 照常收尾，拒绝是交回模型的一个结果。
+#[tokio::test]
+async fn write_refuses_komo_s_own_state() {
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round, text_round};
+
+    let home = Home::new();
+    let env = home.path().join(".env");
+    let before = std::fs::read_to_string(&env).expect(".env");
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-1",
+            "write",
+            serde_json::json!({ "path": env.display().to_string(), "content": "X=1\n" }),
+        ),
+        text_round(2, "写不了。"),
+    ]]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway.submit(&session, "d7-1", "改一下 .env").await.run;
+    let detail = gateway.wait_terminal(&run).await;
+
+    assert_eq!(detail.summary.state, RunState::Completed);
+    assert_eq!(
+        std::fs::read_to_string(&env).expect(".env"),
+        before,
+        ".env 一个字都没变"
+    );
+    // 拒绝是交回模型的一个失败结果，理由点名 komo 自己的状态（§8.10）。
+    let refused = llm
+        .inputs
+        .lock()
+        .expect("轮输入")
+        .iter()
+        .any(|input| format!("{input:?}").contains("komo 自己的状态"));
+    assert!(refused, "模型要看到拒绝的理由");
 }
 
 // ---------------------------------------------------------------- §8.4 / §7.5 / §8.10
 
 /// §7.5 第 2 条 / §8.4：**等前一条 Run 的那一类不进清单，但说得出在等谁。**
 ///
-/// 「挡着会话的每一条都必须在清单里」说的是**停在人身上**的那两类（`approval`、
-/// `intervention`）。`dependency` 在等前一条 Run 跑完，那件事不需要人回答——把它塞进清单
+/// 「挡着会话的每一条都必须在清单里」说的是**停在人身上**的那一类（`intervention`：
+/// `verify` / `blocked`）。`dependency` 在等前一条 Run 跑完，那件事不需要人回答——把它塞进清单
 /// 等于让操作者去答一个他答不了的问题；反过来把它藏起来（旧模型里的"排队中"），就正好是
 /// §8.4 要消掉的那个"排队二十分钟不知道在等什么"。所以它只在这两格露面：
 /// `RunSummary.wait` 与 `SessionSummary.current_wait`。
@@ -961,12 +945,15 @@ async fn a_dependency_wait_is_not_an_intervention_but_says_which_run_it_waits_fo
     use crate::service::test_support::harness::{FakeLlm, Home, call_round};
 
     let home = Home::with_config(&config_toml(""));
-    // 前一条 Run 停在审批上——**确定性**地占住队列；批复之后两段脚本都用默认的收尾。
+    // 前一条 Run 停在一次"结果不明"上（测试工具 `unsure`）——**确定性**地占住队列；
+    // 答复之后两段脚本都用默认的收尾。
+    let unsure = crate::service::test_support::Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
     let llm = FakeLlm::new(vec![vec![call_round(
         1,
         "a-1",
-        "shell",
-        serde_json::json!({ "command": "echo 一" }),
+        "unsure",
+        serde_json::json!({}),
     )]]);
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
@@ -975,8 +962,8 @@ async fn a_dependency_wait_is_not_an_intervention_but_says_which_run_it_waits_fo
     let first = gateway.submit(&session, "dep-1", "先跑这个").await.run;
     let first_wait = gateway.wait_waiting(&first).await;
     assert!(
-        matches!(first_wait, WaitReason::Approval { .. }),
-        "前一条该停在审批上：{first_wait:?}"
+        matches!(first_wait, WaitReason::Intervention { .. }),
+        "前一条该停在一条介入上：{first_wait:?}"
     );
 
     let second = gateway.submit(&session, "dep-2", "再跑这个").await.run;
@@ -1014,7 +1001,7 @@ async fn a_dependency_wait_is_not_an_intervention_but_says_which_run_it_waits_fo
     assert_eq!(
         pending.len(),
         1,
-        "这个会话上停着的是前一条那条审批：{pending:?}"
+        "这个会话上停着的是前一条那条介入：{pending:?}"
     );
     assert!(
         pending.iter().all(|one| one.run.as_ref() != Some(&second)),
@@ -1041,8 +1028,7 @@ async fn a_dependency_wait_is_not_an_intervention_but_says_which_run_it_waits_fo
     );
 
     // 前一条进终态 → 这一条自己回队列、跑完（§8.9 第三步，以及终态那一刻的放行）。
-    let record = gateway.wait_approval().await;
-    gateway.decide(&record.approval, true).await;
+    gateway.answer(first.as_str(), "satisfied").await;
     assert_eq!(
         gateway.wait_terminal(&first).await.summary.state,
         RunState::Completed
@@ -1203,13 +1189,15 @@ async fn a_logically_deleted_session_refuses_new_input_and_names_the_state() {
     use crate::service::test_support::harness::{FakeLlm, Home, call_round};
 
     let home = Home::with_config(&config_toml(""));
-    // 前一条停在审批上：这样 `closing` 期间**手里还有活**——§8.10 说 `closing` 仍然服务，
-    // 而未完成 Run 在的时候对账不会把它推进到 `deleted`（那一步是判定，不是时钟）。
+    // 前一条停在一次"结果不明"上：这样 `closing` 期间**手里还有活**——§8.10 说 `closing`
+    // 仍然服务，而未完成 Run 在的时候对账不会把它推进到 `deleted`（那一步是判定，不是时钟）。
+    let unsure = crate::service::test_support::Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
     let llm = FakeLlm::new(vec![vec![call_round(
         1,
         "life-1",
-        "shell",
-        serde_json::json!({ "command": "echo 一" }),
+        "unsure",
+        serde_json::json!({}),
     )]]);
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
@@ -1253,8 +1241,7 @@ async fn a_logically_deleted_session_refuses_new_input_and_names_the_state() {
     );
 
     // `closing` 仍然服务（§8.10）：手里那条 Run 照常答复、跑完。
-    let record = gateway.wait_approval().await;
-    gateway.decide(&record.approval, true).await;
+    gateway.answer(first.as_str(), "satisfied").await;
     assert_eq!(
         gateway.wait_terminal(&first).await.summary.state,
         RunState::Completed,
@@ -1367,18 +1354,21 @@ async fn purging_a_session_with_unfinished_work_is_a_409_that_lists_the_blockers
     use crate::service::test_support::harness::{FakeLlm, Home, call_round};
 
     let home = Home::with_config(&config_toml(""));
+    // 停在一次"结果不明"上（测试工具 `unsure`）：未完成、要人答。
+    let unsure = crate::service::test_support::Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
     let llm = FakeLlm::new(vec![vec![call_round(
         1,
         "p-1",
-        "shell",
-        serde_json::json!({ "command": "echo 一" }),
+        "unsure",
+        serde_json::json!({}),
     )]]);
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
     let session = gateway.open_session().await;
     let run = gateway
-        .submit(&session, "purge-2", "跑一条等着批")
+        .submit(&session, "purge-2", "跑一条等着人答")
         .await
         .run;
     gateway.wait_waiting(&run).await;
@@ -1446,7 +1436,7 @@ async fn a_delegated_task_becomes_a_child_run_and_its_result_reaches_the_parent(
     const CHILD_TEXT: &str = r#"{"files": 3}"#;
     let llm = delegation_script(TASK, CHILD_TEXT);
 
-    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let home = Home::with_config(&home_config());
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
@@ -1529,7 +1519,7 @@ async fn a_delegated_task_over_the_inline_limit_still_settles_the_parent_call() 
     );
     let llm = delegation_script(&task, r#"{"files": 3}"#);
 
-    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let home = Home::with_config(&home_config());
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
@@ -1615,7 +1605,7 @@ async fn a_call_that_cannot_run_still_gets_a_result_in_the_ledger() {
         vec![text_round(1, "没有这个工具，我换个办法。")],
     ]);
 
-    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let home = Home::with_config(&home_config());
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
@@ -1687,7 +1677,7 @@ async fn a_child_gets_only_its_task_and_its_rounds_stay_out_of_the_parent() {
     const PARENT_INPUT: &str = "帮我把文件数一遍";
     let llm = delegation_script(TASK, r#"{"files": 3}"#);
 
-    let home = Home::with_policy(&home_config(), "mode = \"auto\"\n");
+    let home = Home::with_config(&home_config());
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;

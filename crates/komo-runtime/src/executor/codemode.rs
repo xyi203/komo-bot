@@ -1,24 +1,22 @@
 //! codemode 在执行器里的那一半（`docs/codemode.md` §3、§5）：跑脚本，回答脚本里的工具调用。
 //!
-//! 外层是一次普通调用（Policy、`start_call`、输出落盘都在 `execute_authorized`）；这里
-//! 只替换"执行"那一步。脚本里的每一次调用走 [`ToolExecutor::nested_call`]：能力面 →
-//! `prepare` → 只读 → Policy 直接 Allow → 执行。内层调用不单独落账，只在外层结果里留摘要
-//! ——成立的前提是它们全是只读的，整段重跑没有副作用。
+//! 外层是一次普通调用（`start_call`、输出落盘都在 `execute_ready`）；这里只替换"执行"
+//! 那一步。脚本里的每一次调用走 [`ToolExecutor::nested_call`]：能力面 → `prepare` →
+//! 只读才放行 → 执行。内层调用不单独落账，只在外层结果里留摘要——成立的前提是它们全是
+//! 只读的，整段重跑没有副作用。范围外的读同样放行：边界来自沙箱，不来自名单（§7）。
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
-use komo_kernel::policy::PolicyDecision;
 use komo_kernel::traits::{OutputWriter, StoreError};
-use komo_kernel::types::plan::{ApprovedPlan, Operation};
+use komo_kernel::types::plan::Operation;
 use komo_kernel::types::refs::{AttemptRef, ToolResultStatus};
 use komo_kernel::types::tool::{ToolContext, ToolError, ToolOutput};
 use serde::Serialize;
 
 use super::{CallEnv, ToolExecutor};
 use crate::codemode::OUTPUT_LIMIT;
-use crate::policy::DecisionEnv;
 
 /// 脚本里调不了的：编排操作与脚本自己。
 const NOT_IN_SCRIPTS: &[&str] = &["codemode", "delegate", "dispatch", "follow"];
@@ -127,30 +125,16 @@ impl ToolExecutor {
             .prepare(args, ctx)
             .await
             .map_err(|error| error.to_string())?;
+        // 只放行只读计划，且不是 codemode 自己（§7 的 D8）：内层调用不落账，整段重跑
+        // 必须没有副作用。
         if !plan.operation.is_read_only() || matches!(plan.operation, Operation::Codemode { .. }) {
-            return Err(format!(
-                "{name} 不是只读的，脚本里只能调只读工具；请在脚本外直接调用"
-            ));
-        }
-        // 不查授权表：脚本里只认配置直接放行的那些，授权的消费要落账，内层调用不落账。
-        let decision = self.policy.decide(
-            &plan,
-            &DecisionEnv {
-                grants: &[],
-                principal: env.principal.as_ref(),
-                roots: &env.roots,
-                now: self.clock.now(),
-            },
-        );
-        let proof = match decision {
-            PolicyDecision::Ask { reason, .. } => {
-                return Err(format!(
-                    "这一步要审批（{reason}），脚本里不能停下来等人；请在脚本外直接调用 {name}"
-                ));
+            return Err(ToolError::Denied {
+                reason: format!(
+                    "{name} 不是只读的，脚本里只能调只读工具；请在脚本外直接调用 {name}"
+                ),
             }
-            PolicyDecision::Deny { reason } => return Err(format!("被拒绝：{reason}")),
-            allow => allow.into_proof().expect("Allow 换得出 Proof"),
-        };
+            .to_string());
+        }
         let mut capture = Capture::new(AttemptRef {
             session: ctx.session.clone(),
             run: ctx.run.clone(),
@@ -158,7 +142,7 @@ impl ToolExecutor {
             attempt: ctx.attempt.clone(),
         });
         let output = tool
-            .execute(ApprovedPlan::new(plan, proof), ctx, &mut capture)
+            .execute(plan, ctx, &mut capture)
             .await
             .map_err(|error| error.to_string())?;
         let text = match output.result.get("text").and_then(|text| text.as_str()) {

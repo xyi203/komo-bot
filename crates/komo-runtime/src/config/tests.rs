@@ -201,93 +201,52 @@ fn an_omitted_memory_model_inherits_the_whole_main_model_including_effort() {
     assert_eq!(loaded.snapshot.memory.model, loaded.snapshot.model);
 }
 
+/// `policy.toml` 已经退役（§7）：还在就报一句警告，配置照常装上，规则一条都不读——
+/// 连写坏了的旧文件也不让加载失败。
 #[test]
-fn policy_toml_becomes_the_rule_table_and_its_absence_is_the_initial_one() {
+fn a_leftover_policy_toml_is_reported_not_read() {
     let fixture = Fixture::valid();
+    let quiet = load_config(&fixture.options()).unwrap();
+    assert!(
+        quiet
+            .issues
+            .iter()
+            .all(|issue| issue.key.as_str() != "policy.toml"),
+        "{:?}",
+        quiet.issues
+    );
+
+    write(
+        &fixture.path().join("policy.toml"),
+        "mode = \"aut\"\n[[rules\n",
+    );
     let loaded = load_config(&fixture.options()).unwrap();
-    let ids: Vec<&str> = loaded
-        .snapshot
-        .policy
-        .rules
+    let issue = loaded
+        .issues
         .iter()
-        .map(|r| r.id.as_str())
-        .collect();
-    assert_eq!(ids, vec!["deny-policy-change", "allow-read-in-roots"]);
-
-    let bare = Fixture::without_policy();
-    let loaded = load_config(&bare.options()).unwrap();
+        .find(|issue| issue.key.as_str() == "policy.toml")
+        .expect("报出来了");
     assert_eq!(
-        loaded.snapshot.policy,
-        komo_kernel::policy::RuleTable::initial()
+        issue.severity,
+        komo_kernel::protocol::config::IssueSeverity::Warning
     );
-}
+    assert!(issue.message.contains("已不再使用"), "{}", issue.message);
+    assert!(issue.message.contains("可以删掉"), "{}", issue.message);
 
-/// `mode = "auto"` 选的是 auto 基表，文件里的规则**追加在它之后**（§7.1）。
-#[test]
-fn a_policy_mode_picks_a_base_table_and_appends_the_files_own_rules() {
-    let fixture = Fixture::valid();
-    write(
-        &fixture.sources().policy,
-        r#"
-mode = "auto"
-
-[[rules]]
-id = "my-own-allow"
-effect = "allow"
-reason = "我自己放的"
-scopes = ["once"]
-requires_isolation = false
-
-[rules.matcher]
-operations = ["read_file"]
-"#,
-    );
-    let loaded = load_config(&fixture.options()).unwrap();
-    let table = &loaded.snapshot.policy;
-
-    // 基表在：auto 唯一留下的那条 Deny，以及它自己的默认结论。
-    let ids: Vec<&str> = table.rules.iter().map(|r| r.id.as_str()).collect();
-    assert!(ids.contains(&"policy-change"), "{ids:?}");
+    // 热重载的报告带着同一句，而且这个文件的改动不算配置变化。
+    let holder = fixture.holder();
+    assert!(!holder.changed_since());
+    write(&fixture.path().join("policy.toml"), "default = \"allow\"\n");
+    assert!(!holder.changed_since(), "热重载不再看 policy.toml");
+    let report = holder.reload().unwrap();
     assert!(
-        !ids.contains(&"arbitrary-code"),
-        "auto 是「不审批」，不该还留着 Ask 规则：{ids:?}"
+        report
+            .warnings
+            .iter()
+            .any(|issue| issue.key.as_str() == "policy.toml"),
+        "{:?}",
+        report.warnings
     );
-    assert_eq!(ids.last(), Some(&"my-own-allow"), "追加在基表之后：{ids:?}");
-    assert_eq!(table.default, komo_kernel::policy::Effect::Allow);
-    assert_eq!(table.rules.len(), RuleTable::auto().rules.len() + 1);
-}
-
-/// `mode = "strict"` 是 §7.1 的初始建议，一字不差。
-#[test]
-fn a_strict_mode_is_exactly_the_initial_suggestion() {
-    let fixture = Fixture::valid();
-    write(&fixture.sources().policy, "mode = \"strict\"\n");
-    let loaded = load_config(&fixture.options()).unwrap();
-    assert_eq!(loaded.snapshot.policy, RuleTable::initial());
-}
-
-/// `mode` 与 `default` 同时写是**两个互相打架的答案**，宁可起不来也不猜。
-#[test]
-fn a_policy_mode_with_its_own_default_is_refused() {
-    let fixture = Fixture::valid();
-    write(
-        &fixture.sources().policy,
-        "mode = \"auto\"\ndefault = \"ask\"\n",
-    );
-    let error = load_config(&fixture.options()).unwrap_err().to_string();
-    assert!(
-        error.contains("mode") && error.contains("default"),
-        "{error}"
-    );
-}
-
-/// 认不出的 `mode` 值（打错字）不是"没有 mode"。
-#[test]
-fn an_unknown_policy_mode_is_refused_instead_of_falling_back() {
-    let fixture = Fixture::valid();
-    write(&fixture.sources().policy, "mode = \"aut\"\n");
-    let error = load_config(&fixture.options()).unwrap_err().to_string();
-    assert!(error.contains("aut"), "{error}");
 }
 
 #[test]
@@ -583,7 +542,6 @@ fn the_snapshot_records_the_source_files_it_was_built_from() {
         .collect();
     assert!(paths.contains(&fixture.sources().config));
     assert!(paths.contains(&fixture.sources().env));
-    assert!(paths.contains(&fixture.sources().policy));
 }
 
 #[test]

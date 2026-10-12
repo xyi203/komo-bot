@@ -58,7 +58,7 @@ pub enum ResourceError {
     /// URI 的路径段里有 `..`、`.`、空段或反斜杠——拼进真实路径之前再过一遍。
     #[error(
         "{uri} 的路径段不许有 `..`、`.`、空段或反斜杠；要读挂载点外面的东西请给绝对路径，\
-         让它照常过一遍 Policy"
+         走普通读取那条路"
     )]
     Traversal { uri: String },
 
@@ -69,7 +69,7 @@ pub enum ResourceError {
     /// 解析出来的真实目标跳出了挂载点（多半是个指向外面的符号链接）。
     #[error(
         "{uri} 解析之后落在 {resolved}，已经跳出「{kind}」{root} 了——指向挂载点之外的链接一律\
-         拒绝；要读那份内容请给它绝对路径，走普通读取那条路（照常过 Policy）"
+         拒绝；要读那份内容请给它绝对路径，走普通读取那条路"
     )]
     Escapes {
         uri: String,

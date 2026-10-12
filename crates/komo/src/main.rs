@@ -49,7 +49,7 @@ enum Command {
         #[command(subcommand)]
         action: Option<GatewayCommand>,
     },
-    /// 待处理清单与答复：审批、结果不明、阻塞三类一张表（§7.5）。
+    /// 待处理清单与答复：结果不明、阻塞两类一张表，一次答一条（§7.5）。
     ///
     /// 等价于聊天里的 `/pending` 与 `/answer`（§11.3）。
     Intervention {
@@ -88,16 +88,16 @@ enum Command {
     },
     /// 已保存的 Python 能力：候选、测试、启用与停用（§5.3、§5.4）。
     ///
-    // TODO(decide: §3 的命令表里没有它。toolbox 是文件系统上的东西，但**启用要审批**，
-    // 而审批在 state.db 里、只有 Gateway 打得开（§12）——所以整组走 Gateway，不像
-    // `komo skills` 那样直接读盘。见报告。)
+    // TODO(decide: §3 的命令表里没有它。toolbox 是文件系统上的东西，启用要换掉正在服务的
+    // 那一版（运行中的 Python 运行时、Run 的能力面都在 Gateway 里）——所以整组走 Gateway，
+    // 不像 `komo skills` 那样直接读盘。见报告。)
     Toolbox {
         #[command(subcommand)]
         action: ToolboxCommand,
     },
     /// 显示当前生效配置的加载时间与来源文件 mtime，以及上一次校验错误（§3）。
     ///
-    /// `--reconcile` 顺带跑一次对账（§8.9：只读观察 + 只写状态，不调工具、不消费授权）。
+    /// `--reconcile` 顺带跑一次对账（§8.9：只读观察 + 只写状态，不调工具）。
     Doctor {
         /// 立刻跑一次对账，印出这一趟判定了什么。
         #[arg(long)]
@@ -159,31 +159,23 @@ enum GatewayCommand {
 
 #[derive(Subcommand)]
 enum InterventionCommand {
-    /// 待处理清单：审批、结果不明、阻塞三类一张表（§7.5）。
+    /// 待处理清单：结果不明、阻塞两类一张表（§7.5）。
     List {
         /// 只看某个会话的。
         #[arg(long)]
         session: Option<String>,
     },
-    /// 单项详情；审批类是 §7.2 要展示的那一份（计划、改动、原因、范围）。
+    /// 单项详情：结果不明多一次调用的名字与计划哈希，阻塞印前提为什么没了。
     Show {
-        /// 句柄：审批是短 ID，结果不明与阻塞是 Run ID。
+        /// 句柄：Run ID。
         handle: String,
     },
-    /// 答复。结论按种类分派（§7.5）：审批 `approve` / `reject`（可带 `--scope`），
-    /// 结果不明 `satisfied` / `not_performed` / `abandon`，阻塞 `resolve` / `abandon`。
+    /// 答复一条。结论按种类分派（§7.5）：结果不明 `satisfied` / `not_performed` /
+    /// `abandon`，阻塞 `resolve` / `abandon`。没有批量。
     Answer {
-        /// 句柄：审批是短 ID，结果不明与阻塞是 Run ID。
+        /// 句柄：Run ID。
         handle: String,
         /// 结论词。
-        verdict: String,
-        /// 只对 `approve` 有意义的范围：`once`（默认）/ `run` / `cron`（§7.2）。
-        #[arg(long)]
-        scope: Option<String>,
-    },
-    /// 一次答一批**审批**（等价于聊天里的 `/approve all`）。
-    AnswerAll {
-        /// 结论词：只接受 `approve` / `reject`。
         verdict: String,
     },
 }
@@ -256,7 +248,7 @@ struct CronAddArgs {
     /// 上一次还没结束时：skip（默认）/ allow。
     #[arg(long, default_value = "skip")]
     overlap: String,
-    /// 结果投递：always（默认）/ on_error / never。等待审批**不受它约束**。
+    /// 结果投递：always（默认）/ on_error / never。停着等人（结果不明 / 阻塞）**不受它约束**。
     #[arg(long, default_value = "always")]
     notify: String,
 }
@@ -381,7 +373,7 @@ enum ToolboxCommand {
     },
     /// 跑候选自带的测试，结果记进候选的元数据（§5.4）。
     Test { module: String },
-    /// 启用候选版本。**产生一条审批**，消息里带版本差异与测试结果（§7.1 第 4 行）。
+    /// 启用候选版本，直接生效（没有审批，§7）。
     Enable {
         module: String,
         /// 只启用这一版；与当前候选对不上就拒绝（§5.4「校验候选哈希与已测版本一致」）。
@@ -587,13 +579,8 @@ async fn operator(
             InterventionCommand::Show { handle } => {
                 commands::intervention_show(client, &handle).await
             }
-            InterventionCommand::Answer {
-                handle,
-                verdict,
-                scope,
-            } => commands::intervention_answer(client, &handle, &verdict, scope.as_deref()).await,
-            InterventionCommand::AnswerAll { verdict } => {
-                commands::intervention_answer_all(client, &verdict).await
+            InterventionCommand::Answer { handle, verdict } => {
+                commands::intervention_answer(client, &handle, &verdict).await
             }
         },
         Command::Cron { action } => match action {

@@ -1,5 +1,5 @@
-//! 一个 MCP 工具（`docs/mcp.md`）：走与内置工具同一条路——`prepare` 出计划、Policy /
-//! 审批、`start_call`、执行、落账。
+//! 一个 MCP 工具（`docs/mcp.md`）：走与内置工具同一条路——`prepare` 出计划、
+//! `start_call`、执行、落账。
 //!
 //! 它不是第七个基础工具，而是操作者接进来的外部能力：副作用由服务器决定，komo 看不见。
 //! 所以计划是 [`Operation::McpCall`]，只读与否由操作者在配置里声明（`read_only`），不信
@@ -106,11 +106,11 @@ impl Tool for McpTool {
 
     async fn execute(
         &self,
-        plan: komo_kernel::types::plan::ApprovedPlan,
+        plan: komo_kernel::types::plan::ExecutionPlan,
         _ctx: &ToolContext,
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
-        let arguments = match &plan.plan().args {
+        let arguments = match &plan.args {
             serde_json::Value::Object(map) => map.clone(),
             _ => Default::default(),
         };

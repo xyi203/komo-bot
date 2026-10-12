@@ -5,8 +5,8 @@
 //! newtype 包住 [`RecoveryStore`] 来做。五个签名逐字对齐那张 trait，包在外面的那层是
 //! 一行一个。
 //!
-//! 贯穿全模块的一条规则：**回放只补索引与派生执行状态**——不调用工具、不发送外部请求、
-//! 不消费授权，也不覆盖数据库里已经记下的取消或权限撤销（§8.5）。所以 [`requeue`] 与
+//! 贯穿全模块的一条规则：**回放只补索引与派生执行状态**——不调用工具、不发送外部请求，
+//! 也不覆盖数据库里已经记下的取消（§8.5）。所以 [`requeue`] 与
 //! [`mark_needs_attention`] 都先看一眼终态就退；对账走的那两个（`*_if_unchanged`）还要
 //! 核对这一行仍是判断时看见的样子（[`SeenRun`]）。
 
@@ -64,7 +64,7 @@ impl UnfinishedRun {
 
 /// 判断那一刻看见的这一行——对账写回时的条件（§8.9）。
 ///
-/// 对账是先读、后判、再写，中间隔着好几次 await（读 JSONL、查审批）。这段时间里调度器、
+/// 对账是先读、后判、再写，中间隔着好几次 await（读 JSONL、查调用）。这段时间里调度器、
 /// 受理与答复都可能已经把这一行推走：领取（代次涨一代）、受理落定（`waiting +
 /// dependency`）、依赖放行或答复（回 `queued`）。照着旧样子写下去就是拿过时的结论盖掉新
 /// 事实——把一条刚被领走的 `running` 改回 `queued` 等于让它被领两次。所以写之前核对这四样
@@ -137,6 +137,26 @@ impl RecoveryStore {
                 session: record.session,
                 state: record.state,
                 wait: record.wait,
+            })
+            .collect())
+    }
+
+    /// 删审批之前停在审批上的 Run（`waiting + wait_kind = 'approval'`，D2）。
+    ///
+    /// 它们**也在 [`Self::unfinished_runs`] 里**，kernel 的 `recovery::decide` 对
+    /// `WaitReason::Approval` 按 JSONL 尾判：那次调用 planned 而没 started →
+    /// `ExecutePlannedCall`，Gateway 用 [`Self::requeue_if_unchanged`]（或
+    /// [`Self::requeue`]）把它放回队列——与"审批批准后重新入队"是同一个转换，只是不再看
+    /// 审批行。这个函数只是把那一批单独点出来，给启动日志与测试用；它们不进
+    /// Intervention 清单（`WaitReason::needs_a_person` 为 false）。
+    pub async fn legacy_approval_waits(&self) -> Result<Vec<UnfinishedRun>, StoreError> {
+        Ok(self
+            .unfinished_runs()
+            .await?
+            .into_iter()
+            .filter(|run| {
+                run.state == RunState::Waiting
+                    && matches!(run.wait, Some(WaitReason::Approval { .. }))
             })
             .collect())
     }
@@ -303,7 +323,7 @@ impl RecoveryStore {
             .await
     }
 
-    /// 需要操作者判断：结果不明、引用损坏、授权失效。
+    /// 需要操作者判断：结果不明、引用损坏。
     pub async fn mark_needs_attention(&self, run: &RunId, reason: &str) -> Result<(), StoreError> {
         self.mark_guarded(run, reason, None).await.map(|_| ())
     }
@@ -574,10 +594,7 @@ mod tests {
         let plan = sample_plan("shell", &f.session);
         f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
         // 开跑了，但没有结果——上一个实例就停在这里。
-        f.coordinator
-            .start_call(&ids[0], &plan, Default::default())
-            .await
-            .unwrap();
+        f.coordinator.start_call(&ids[0], &plan).await.unwrap();
         (accepted.run, ids[0].clone())
     }
 
@@ -610,11 +627,7 @@ mod tests {
             .unwrap();
         let plan = sample_plan("read", &f.session);
         f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
-        let attempt = f
-            .coordinator
-            .start_call(&ids[0], &plan, Default::default())
-            .await
-            .unwrap();
+        let attempt = f.coordinator.start_call(&ids[0], &plan).await.unwrap();
         f.coordinator
             .finish_call(
                 &attempt,

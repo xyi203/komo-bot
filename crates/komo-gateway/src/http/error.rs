@@ -148,7 +148,6 @@ impl From<StoreError> for ApiFailure {
         let code = match &error {
             StoreError::NotFound { .. } => ErrorCode::NotFound,
             StoreError::VersionConflict { .. } => ErrorCode::VersionConflict,
-            StoreError::GrantMismatch(_) => ErrorCode::Denied,
             StoreError::Corrupt(_) => ErrorCode::Corrupt,
             StoreError::Io(_) | StoreError::Contended | StoreError::Other(_) => ErrorCode::Internal,
         };
@@ -161,7 +160,6 @@ impl From<RepoError> for ApiFailure {
         let code = match &error {
             RepoError::NotFound { .. } => ErrorCode::NotFound,
             RepoError::VersionConflict { .. } => ErrorCode::VersionConflict,
-            RepoError::GrantMismatch(_) => ErrorCode::Denied,
             RepoError::Contended | RepoError::Other(_) => ErrorCode::Internal,
         };
         ApiFailure::new(code, error.to_string())

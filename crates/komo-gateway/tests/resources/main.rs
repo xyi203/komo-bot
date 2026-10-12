@@ -6,8 +6,8 @@
 //! - **本地路径照旧**：`read` 一个 workspace 里的真文件，正文回来，计划里还是普通路径——
 //!   兼容性就是"不出现资源语义"；
 //! - **`skill://`**：数据目录里一份真 skill 读到正文，且审计里的计划目标是**逻辑 URI**
-//!   （审批 / 审计回答的是"允许读哪个逻辑资源"，不是它落在哪个文件）；
-//! - **`tool://`**：能力面之外的工具**在 `prepare` 就拒绝**（不是 Ask），面内的读到
+//!   （审计回答的是"读了哪个逻辑资源"，不是它落在哪个文件）；
+//! - **`tool://`**：能力面之外的工具**在 `prepare` 就拒绝**，面内的读到
 //!   JSON Schema；
 //! - **`artifact://`**：python 写进 `$KOMO_ARTIFACT_DIR` 的文件登记成这次调用的产物，
 //!   **重启 Gateway 之后**按同一条 URI 读到的正文与第一次一致；
@@ -20,7 +20,7 @@
 use std::sync::Arc;
 
 use komo_gateway::service::test_support::harness::{
-    DEFAULT_ENV, FakeLlm, Home, call_round, text_round, write_home_with,
+    DEFAULT_ENV, FakeLlm, Home, call_round, text_round, write_home,
 };
 use komo_kernel::events::{Event, EventPayload, ToolResult};
 use komo_kernel::traits::LlmClient;
@@ -76,7 +76,7 @@ fn tools(list: &str) -> String {
 /// 路径（skills 根），而 `Home::with_config` 建临时目录时那个路径还不知道。
 fn home_with(config: &str) -> Home {
     let home = Home::new();
-    write_home_with(home.path(), config, DEFAULT_ENV, None);
+    write_home(home.path(), config, DEFAULT_ENV);
     home
 }
 
@@ -238,14 +238,14 @@ async fn a_local_path_reads_as_plain_content_without_resource_semantics() {
     let described = plan.targets[0].describe();
     assert!(
         described.ends_with("笔记.txt") && !described.contains("://"),
-        "审批/审计里印的就是路径本身：{described}"
+        "审计里印的就是路径本身：{described}"
     );
 }
 
 // ---------------------------------------------------------------- skill://
 
 /// 数据目录里一份真 skill：`read("skill://review/SKILL.md")` 读到正文，且审计里的计划
-/// 目标是**逻辑 URI**（`skill://review/SKILL.md（真实路径）`）——不产生审批。
+/// 目标是**逻辑 URI**（`skill://review/SKILL.md（真实路径）`）。
 #[tokio::test]
 async fn a_skill_uri_reads_and_the_plan_names_the_logical_uri() {
     let home = Home::new();
@@ -257,7 +257,7 @@ async fn a_skill_uri_reads_and_the_plan_names_the_logical_uri() {
         "---\nname: review\ndescription: 怎么审一个 PR\n---\n# 审查步骤\n先看 diff。\n",
     )
     .expect("写 SKILL.md");
-    write_home_with(
+    write_home(
         home.path(),
         &config(&format!(
             "[paths]\nskill_dirs = [\"{}\"]\n\n{}",
@@ -265,7 +265,6 @@ async fn a_skill_uri_reads_and_the_plan_names_the_logical_uri() {
             tools("\"read\", \"rg\"")
         )),
         DEFAULT_ENV,
-        None,
     );
 
     let llm = FakeLlm::new(vec![vec![
@@ -307,7 +306,7 @@ async fn a_skill_uri_reads_and_the_plan_names_the_logical_uri() {
     let described = target.describe();
     assert!(
         described.starts_with("skill://review/SKILL.md（"),
-        "审批/审计那一行印逻辑 URI，真实路径跟在后面：{described}"
+        "审计那一行印逻辑 URI，真实路径跟在后面：{described}"
     );
     assert!(
         described.ends_with("SKILL.md）"),
@@ -320,7 +319,7 @@ async fn a_skill_uri_reads_and_the_plan_names_the_logical_uri() {
 // ---------------------------------------------------------------- tool://
 
 /// `tool://` 是**虚拟入口**：面内的读到 JSON Schema；面外的（`write` 不在这次能力面上）
-/// **在 `prepare` 就拒绝**——不是 Ask，也不是先试一下再说。
+/// **在 `prepare` 就拒绝**——不是先试一下再说。
 #[tokio::test]
 async fn tool_uris_read_schema_inside_the_surface_and_are_refused_outside_it() {
     let home = home_with(&config(&tools("\"read\", \"rg\"")));
@@ -346,7 +345,7 @@ async fn tool_uris_read_schema_inside_the_surface_and_are_refused_outside_it() {
         results[0].0
     );
 
-    // 面外：拒绝，而且是一句说清原因的话——不进计划就没有执行（**不是** Ask）。
+    // 面外：拒绝，而且是一句说清原因的话——不进计划就没有执行。
     assert!(results[1].1, "面外的工具是错误结果：{}", results[1].0);
     assert!(
         !results[1].0.contains("\"properties\""),
@@ -374,10 +373,11 @@ async fn python_artifacts_are_registered_and_readable_after_a_restart() {
     }
     let home = home_with(&config(&tools("\"read\", \"rg\", \"python\"")));
     let llm = FakeLlm::new(vec![
-        // Run A：调一次 python（任意 code 默认停审批，§7.1 第 5 行）。
-        vec![python_writes(1, "报告.md", "产物正文\n")],
-        // 批准之后的续跑段：说一句话收尾。
-        vec![text_round(2, "写好了。")],
+        // Run A：调一次 python，然后说一句话收尾。
+        vec![
+            python_writes(1, "报告.md", "产物正文\n"),
+            text_round(2, "写好了。"),
+        ],
     ]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gw.open_session().await;
@@ -386,8 +386,6 @@ async fn python_artifacts_are_registered_and_readable_after_a_restart() {
         .submit(&session, "res-art", "把报告写到产物目录")
         .await
         .run;
-    let approval = gw.wait_approval().await;
-    gw.decide(&approval.approval, true).await;
     let detail = gw.wait_terminal(&run_a).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -520,7 +518,7 @@ async fn another_sessions_run_is_out_of_reach() {
         "另一个会话的输出一个字都不该漏：{}",
         results[0].0
     );
-    // 它不是"越权"：目标仍在本会话的只读根里，只是那儿没有这份文件——所以不经过审批。
+    // 它不是"越权"：目标仍在本会话的只读根里，只是那儿没有这份文件。
     assert!(
         gw_b.interventions().await.is_empty(),
         "这条读不该停在任何需要操作者的东西上"

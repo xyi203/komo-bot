@@ -3,12 +3,12 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use super::ids::{ApprovalId, EventId, InterventionId, RunId};
+use super::ids::{EventId, InterventionId, RunId};
 
 /// Run 的生命周期状态（§8.4）。
 ///
 /// **状态回答"能不能跑"，[`WaitReason`] 回答"为什么不能跑"。** 两个维度分开，是因为它们
-/// 混在一起时的症状正是"排队 20 分钟不知道为什么"：一个 `waiting_approval`、一个
+/// 混在一起时的症状正是"排队 20 分钟不知道为什么"：一个 `waiting_xxx`、一个
 /// `needs_attention`，都答不出"它在等什么、等到什么时候"。
 ///
 /// ```text
@@ -29,7 +29,7 @@ use super::ids::{ApprovalId, EventId, InterventionId, RunId};
 ///            ┌───────────┐  Completed   Failed / Cancelled / Abandoned
 ///            │  Waiting  │  （+ `WaitReason` 说出在等什么）
 ///            └─────┬─────┘
-///                  │ 条件满足：审批答复 / 到点 / 干预答复 / 前一条 Run 终态
+///                  │ 条件满足：到点 / 干预答复 / 前一条 Run 终态
 ///                  ▼
 ///                Queued
 /// ```
@@ -233,9 +233,16 @@ impl AttemptState {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WaitReason {
-    /// 等一份执行计划的答复（§7.4、§7.5）。**释放执行名额，不挂着 future 等人**——
-    /// 挂在内存里等，进程一重启这次的等待就没了，还会白占一个并发槽。
-    Approval { approval: ApprovalId },
+    /// **不再产生**：审批在 2026-10-11 删掉了，这个变体只为解码删之前落盘的
+    /// `run.waiting {"kind":"approval"}` 行与 `runs.wait_kind = 'approval'`（D2）。
+    ///
+    /// 那时停在审批上的调用是 planned 而没 started，Gateway 启动时把这些 Run 当作
+    /// "调用确定尚未执行"续跑（§8.4），不再看审批行。它**不要人**——见
+    /// [`WaitReason::needs_a_person`]。`approval` 是旧审批 ID 的原文，只留作审计。
+    Approval {
+        #[serde(default)]
+        approval: String,
+    },
     /// 等一次有界退避到期。
     ///
     /// **只用于模型 / 驱动侧那些可以安全重试的失败**（限流、连不上、5xx、写争用）。
@@ -311,7 +318,7 @@ impl WaitReason {
     /// `runs.wait_ref` 的那一段：`retry` 没有引用（它的进度是次数 + 到点时刻）。
     pub fn reference(&self) -> Option<String> {
         match self {
-            WaitReason::Approval { approval } => Some(approval.to_string()),
+            WaitReason::Approval { approval } => Some(approval.clone()),
             WaitReason::Intervention { intervention } => Some(intervention.to_string()),
             WaitReason::Dependency { run } => Some(run.to_string()),
             WaitReason::Retry { .. } => None,
@@ -326,17 +333,15 @@ impl WaitReason {
         }
     }
 
-    /// 这一种等待**要不要人**。它决定这条 Run 进不进 §7.5 的清单：`Approval` 与
-    /// `Intervention` 进，`Retry`（等时钟）与 `Dependency`（等前一条 Run）不进。
+    /// 这一种等待**要不要人**。它决定这条 Run 进不进 §7.5 的清单：只有 `Intervention`
+    /// 进；`Retry`（等时钟）、`Dependency`（等前一条 Run）与旧的 `Approval`（启动时自动
+    /// 续跑，D2）都不进。
     pub fn needs_a_person(&self) -> bool {
-        matches!(
-            self,
-            WaitReason::Approval { .. } | WaitReason::Intervention { .. }
-        )
+        matches!(self, WaitReason::Intervention { .. })
     }
 
     /// 它把 Run 放进哪个状态。**永远只有一个答案**——这正是把它拆出来的意义：状态机
-    /// 那一层不必再枚举"等审批 / 等重试 / 等干预"三种停法。
+    /// 那一层不必再枚举"等重试 / 等干预 / 等前一条"几种停法。
     pub fn state(&self) -> RunState {
         RunState::Waiting
     }
@@ -440,18 +445,9 @@ mod tests {
     }
 
     /// §8.4：`Queued` = 现在就能跑；`Waiting` = 现在不能跑**且说得出在等什么**。
-    /// 两种等待不进清单（等时钟、等前一条 Run），两种进（等人）。
+    /// 只有等干预进清单（等人）；等时钟、等前一条 Run 不进。
     #[test]
     fn a_wait_reason_says_who_is_being_waited_on() {
-        let approval = WaitReason::Approval {
-            approval: ApprovalId::from_raw("ap-1"),
-        };
-        assert_eq!(approval.state(), RunState::Waiting);
-        assert_eq!(approval.kind(), "approval");
-        assert_eq!(approval.reference().as_deref(), Some("ap-1"));
-        assert!(approval.wake_at().is_none(), "审批没有到点时刻，只有答复");
-        assert!(approval.needs_a_person());
-
         let retry = WaitReason::Retry {
             attempts: 2,
             not_before: datetime!(2026-09-15 08:05:00 UTC),
@@ -477,6 +473,25 @@ mod tests {
 
     /// 一次退避是**哪一种**失败要说得出来——`RateLimited` 该尊重服务端给的时刻，
     /// 本地写争用退几毫秒就够（§8.5）。
+    /// D2：删掉审批之前落盘的"停在审批上"仍然读得回来，但它不再要人——Gateway 启动时
+    /// 把它当作"调用确定尚未执行"续跑。
+    #[test]
+    fn an_old_approval_wait_still_decodes_and_needs_no_person() {
+        let old: WaitReason =
+            serde_json::from_str(r#"{"kind":"approval","approval":"ap-1"}"#).unwrap();
+        assert_eq!(
+            old,
+            WaitReason::Approval {
+                approval: "ap-1".into()
+            }
+        );
+        assert_eq!(old.kind(), "approval");
+        assert_eq!(old.reference().as_deref(), Some("ap-1"));
+        assert_eq!(old.state(), RunState::Waiting);
+        assert!(old.wake_at().is_none());
+        assert!(!old.needs_a_person(), "旧审批启动时自动续跑，不进清单");
+    }
+
     #[test]
     fn a_retry_cause_survives_the_round_trip() {
         let retry = WaitReason::Retry {
@@ -537,11 +552,6 @@ mod tests {
     fn an_intervention_handle_falls_back_to_its_run() {
         let run = RunId::from_raw("run-9");
         assert_eq!(InterventionId::for_run(&run).as_str(), "run-9");
-        assert_eq!(
-            InterventionId::from_raw("7K2M").as_str(),
-            "7K2M",
-            "审批类用短 ID"
-        );
         let _ = ToolCallId::from_raw("call-1");
     }
 

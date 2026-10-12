@@ -6,8 +6,8 @@
 //!
 //! [`PythonHost::env_version`] = **解释器版本 + 依赖清单哈希**。它进
 //! [`ExecutionPlan::versions`](komo_kernel::types::plan::ExecutionPlan)，所以依赖一
-//! 升级，绑定旧环境的授权就覆盖不到新计划了（§5.4）。环境本身的变更（装依赖、切
-//! 版本）是 `Operation::PythonEnvChange`，走 Policy，**不在这个模块里做**。
+//! 升级，账本里看得出新计划跑在另一个环境上（§5.4）。环境本身的变更（装依赖、切
+//! 版本）是 `Operation::PythonEnvChange`，**不在这个模块里做**。
 //!
 //! toolbox 的保存、候选测试与启用在 [`crate::toolbox`]，这里只有"跑"——外加一件
 //! **执行边界**的事（§7.3）：`denied_imports` 里的目录（候选与历史快照）经
@@ -31,7 +31,8 @@ use crate::tools::process::{ChildRegistration, ChildSpec, ProcessError, run_chil
 /// 解释器驱动。脚本输出与控制协议分开就靠它。
 const DRIVER: &str = include_str!("driver.py");
 
-/// 一次 Python 调用默认跑多久。
+/// [`PythonHost::run`] 那一路（toolbox 启用、核对调用）默认跑多久。模型发起的 `python`
+/// 调用不用它：时限跟本次调用的活动执行时限走（[`PythonHost::run_with_artifacts`]）。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// 默认最多往输出存储里写多少字节。
 pub const DEFAULT_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
@@ -80,6 +81,7 @@ pub struct PythonEnvConfig {
     pub secrets: Option<Arc<dyn SecretResolver>>,
     /// 子进程的工作目录。
     pub cwd: PathBuf,
+    /// [`PythonHost::run`] 的时限；`run_with_artifacts` 由调用方给。
     pub timeout: Duration,
     pub output_limit: u64,
 }
@@ -212,7 +214,8 @@ impl PythonHost for PythonRuntime {
         sink: &mut dyn OutputWriter,
         cancel: CancelToken,
     ) -> Result<PythonResult, PyError> {
-        self.run_with(job, None, sink, cancel).await
+        self.run_with(job, None, self.config.timeout, sink, cancel)
+            .await
     }
 
     /// §4.7：把**产出目录**交给这次调用。
@@ -225,10 +228,11 @@ impl PythonHost for PythonRuntime {
         &self,
         job: PythonJob,
         artifacts: Option<&Path>,
+        timeout: Duration,
         sink: &mut dyn OutputWriter,
         cancel: CancelToken,
     ) -> Result<PythonResult, PyError> {
-        self.run_with(job, artifacts, sink, cancel).await
+        self.run_with(job, artifacts, timeout, sink, cancel).await
     }
 
     fn env_version(&self) -> EnvVersion {
@@ -237,12 +241,13 @@ impl PythonHost for PythonRuntime {
 }
 
 impl PythonRuntime {
-    /// [`PythonHost::run`] 与 [`PythonHost::run_with_artifacts`] 的同一份实现：唯一的差别
-    /// 就是有没有产出目录。
+    /// [`PythonHost::run`] 与 [`PythonHost::run_with_artifacts`] 的同一份实现：差别只在
+    /// 有没有产出目录、时限由谁给。
     async fn run_with(
         &self,
         job: PythonJob,
         artifacts: Option<&Path>,
+        timeout: Duration,
         sink: &mut dyn OutputWriter,
         cancel: CancelToken,
     ) -> Result<PythonResult, PyError> {
@@ -291,7 +296,7 @@ impl PythonRuntime {
             cwd: self.config.cwd.clone(),
             env,
             stdin: Some(body),
-            timeout: self.config.timeout,
+            timeout,
             output_limit: self.config.output_limit,
             register: self.register.clone(),
             label: format!("python · {}", self.config.interpreter_path().display()),
@@ -309,7 +314,7 @@ impl PythonRuntime {
         }
         if outcome.timed_out {
             return Err(PyError::Timeout {
-                after_secs: self.config.timeout.as_secs(),
+                after_secs: timeout.as_secs(),
             });
         }
 
@@ -491,8 +496,8 @@ fn base_env(config: &PythonEnvConfig) -> BTreeMap<String, String> {
 ///
 /// 两条边界：
 ///
-/// - **只有 `call` 模式有凭证。** 任意 `code` 一个都拿不到——「任意 code 模式不会因为
-///   import 了已审核模块而自动获得同样授权」（§5.2），那么它也不该拿到那个模块的钥匙。
+/// - **只有 `call` 模式有凭证。** 任意 `code` 一个都拿不到——import 了已启用的
+///   模块不等于就是那个模块（§5.2），所以它也不该拿到那个模块的钥匙。
 /// - **基础变量不许被模块声明覆盖**：一个声明了 `PATH` 的模块不能借此换掉解释器要走的
 ///   那条路径。
 ///
@@ -559,6 +564,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_with_artifacts_stops_at_the_timeout_it_is_given() {
+        if !have_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = writer();
+        // 宿主自己的默认是 20s；这次给 1s，到点报的就是 1s。
+        let error = host(dir.path())
+            .run_with_artifacts(
+                PythonJob::Code {
+                    code: "import time\ntime.sleep(10)".into(),
+                },
+                None,
+                Duration::from_secs(1),
+                &mut sink,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, PyError::Timeout { after_secs: 1 }),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn code_mode_returns_what_the_script_set_as_result() {
         if !have_python() {
             return;
@@ -602,6 +633,7 @@ mod tests {
                         .into(),
                 },
                 Some(&artifacts),
+                Duration::from_secs(20),
                 &mut sink,
                 CancelToken::new(),
             )
@@ -637,6 +669,7 @@ mod tests {
                         .into(),
                 },
                 Some(&artifacts),
+                Duration::from_secs(20),
                 &mut sink,
                 CancelToken::new(),
             )
@@ -1094,8 +1127,8 @@ def ping():
         );
     }
 
-    /// 任意 `code` 一个凭证都拿不到（§5.2：import 了已审核模块也不获得同样授权，
-    /// 那么也不该拿到它的钥匙）。
+    /// 任意 `code` 一个凭证都拿不到（§5.2：import 了已启用的模块不等于就是那个模块，
+    /// 所以也不该拿到它的钥匙）。
     #[tokio::test]
     async fn arbitrary_code_gets_no_credentials_at_all() {
         let dir = tempfile::tempdir().unwrap();

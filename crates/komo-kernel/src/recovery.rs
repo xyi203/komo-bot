@@ -1,20 +1,20 @@
 //! §8.4 的恢复决策表，一个纯函数。
 //!
-//! 「**Gateway 自动接续能够确定恢复位置的任务。用户只处理审批、时效或结果不明等确实
-//! 需要判断的情况。**」
+//! 「**Gateway 自动接续能够确定恢复位置的任务。用户只处理时效或结果不明等确实需要
+//! 判断的情况。**」
 //!
 //! 输入是三样观察的并置：JSONL 尾部最后看到什么、state.db 最后看到什么、以及被引用
 //! 的输出文件校验成不成立。输出是那张表右列的动作。这里**不做任何 I/O**——观察由
 //! runtime 采集，决定在这里，于是"重启后会怎样"可以被穷举成单元测试，而不是靠在真
 //! 机器上拔电源来验证。
 //!
-//! 一条贯穿全表的规则：**回放只补索引与派生执行状态**，不调用工具、不发送外部请求、
-//! 不消费授权，也不能覆盖 state.db 已记录的用户取消或权限撤销（§8.5）。
+//! 一条贯穿全表的规则：**回放只补索引与派生执行状态**，不调用工具、不发送外部请求，
+//! 也不能覆盖 state.db 已记录的用户取消（§8.5）。
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::types::ids::{ApprovalId, ToolCallId};
+use crate::types::ids::ToolCallId;
 use crate::types::status::{RunState, SessionState, WaitReason};
 
 /// JSONL 尾部最后看到的东西。
@@ -59,25 +59,6 @@ pub enum OutputCheck {
     Missing,
     /// 引用存在，正文在，哈希对不上。
     HashMismatch,
-}
-
-/// 审批的观察。**权威是 state.db**——JSONL 里的审计副本不能自行创建授权（§7.4）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ApprovalObservation {
-    /// 这个 Run 没有停在审批上。
-    None,
-    /// 请求还在，没人答。
-    Pending { approval: ApprovalId },
-    /// 有答复了。
-    Decided {
-        approval: ApprovalId,
-        approved: bool,
-        /// 范围、计划、版本与有效期都还成立。
-        still_valid: bool,
-    },
-    /// JSONL 说在等审批，state.db 里却没有这一行——拒绝执行，要求操作者重答（§8.2）。
-    MissingFromDatabase,
 }
 
 /// Session 侧的观察（§8.9）。**这一维是 reconcile 存在的理由**：Run 自己的状态说得再
@@ -132,17 +113,15 @@ pub struct RecoveryInput {
     /// state.db 里的状态。
     pub state: RunState,
     /// 停在什么上（`state == Waiting` 时有值）。**决策表按它分派等待中的那几行**——
-    /// 这正是把状态与理由拆开之后，恢复侧要做的那一点改动：以前靠
-    /// `waiting_approval` / `waiting_retry` / `needs_attention` 三个状态名分派，
-    /// 现在靠一个 `WaitReason`。
+    /// 这正是把状态与理由拆开之后，恢复侧要做的那一点改动：以前靠几个
+    /// `waiting_*` / `needs_attention` 状态名分派，现在靠一个 `WaitReason`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<WaitReason>,
     /// JSONL 尾部。
     pub log_tail: LogTail,
     /// 输出文件校验。
     pub output_check: OutputCheck,
-    #[serde(default = "no_approval")]
-    pub approval: ApprovalObservation,
+    // 审批删掉之前这里还有 `approval`（审批的观察）。旧线格式带着它也解得出来。
     /// 最终结果已经送达客户端了吗。
     #[serde(default)]
     pub result_delivered: bool,
@@ -152,10 +131,6 @@ pub struct RecoveryInput {
     /// 会话还在不在服务范围里（§8.9）。
     #[serde(default)]
     pub session: SessionObservation,
-}
-
-fn no_approval() -> ApprovalObservation {
-    ApprovalObservation::None
 }
 
 fn yes() -> bool {
@@ -174,21 +149,16 @@ pub enum RecoveryAction {
     DiscardPartialAndRerequestModel,
     /// 沿用原计划继续这一轮——这一轮的调用都有结果了，接着请求下一轮模型。
     ResumeFromPlan,
-    /// 校验原计划与当前权限后自动执行这个调用。
+    /// 校验原计划后自动执行这个调用。
     ExecutePlannedCall { call: ToolCallId },
     /// 先核对外部效果，按 §8.6 决定是否安全继续。
     VerifyEffect { call: ToolCallId },
     /// 补齐结果索引和状态，**复用原输出，不重放动作**。
     BackfillResultAndContinue { call: ToolCallId },
-    /// **原样停着，这一趟什么都不做**：它在等审批答复、等操作者在清单上答、或者等前
-    /// 一条 Run 进终态。判断"什么时候能再跑"是 reconcile 的事（审批回答 / 到点 / 前一条
-    /// 终态），不是恢复决策的事。
+    /// **原样停着，这一趟什么都不做**：它在等操作者在清单上答，或者等前一条 Run 进
+    /// 终态。判断"什么时候能再跑"是 reconcile 的事（到点 / 前一条终态），不是恢复决策的
+    /// 事。
     KeepWaiting { reason: WaitReason },
-    /// 已答复且仍有效：按原决定继续，**不因重启再问一次**。
-    ResumeWithDecision {
-        approval: ApprovalId,
-        approved: bool,
-    },
     /// 沿用已保存的次数与到点时刻，到期再尝试。
     WaitUntilRetry {
         #[serde(with = "time::serde::rfc3339")]
@@ -261,31 +231,10 @@ pub fn decide(observed: &RecoveryInput) -> RecoveryAction {
 
 fn decide_while_waiting(observed: &RecoveryInput) -> RecoveryAction {
     match &observed.wait {
-        // 第 8 行：等审批 → 保留原请求；已答复且仍有效的批准自动接续。
-        Some(WaitReason::Approval { approval }) => match &observed.approval {
-            ApprovalObservation::Pending { .. } => RecoveryAction::KeepWaiting {
-                reason: observed.wait.clone().expect("刚刚匹配过"),
-            },
-            ApprovalObservation::Decided {
-                approval,
-                approved,
-                still_valid: true,
-            } => RecoveryAction::ResumeWithDecision {
-                approval: approval.clone(),
-                approved: *approved,
-            },
-            ApprovalObservation::Decided {
-                still_valid: false, ..
-            } => RecoveryAction::WaitingForOperator {
-                reason: "授权的范围、计划、版本或有效期已经变化，需要重新审核".into(),
-            },
-            ApprovalObservation::MissingFromDatabase => RecoveryAction::WaitingForOperator {
-                reason: "数据库里没有这条审批记录；JSONL 的审计副本不能创建授权，请重答".into(),
-            },
-            ApprovalObservation::None => RecoveryAction::WaitingForOperator {
-                reason: format!("状态说在等审批 {approval}，却找不到对应的请求"),
-            },
-        },
+        // 原第 8 行（等审批）随审批一起删了。删之前落盘的"停在审批上"（D2）：那次调用
+        // 是 planned 而没 started，**按 JSONL 尾部判**——尾部是 planned 就走第 6 行"确定
+        // 尚未执行 → 自动执行"，与别的 planned 调用同一条路，不再看审批行。
+        Some(WaitReason::Approval { .. }) => decide_by_log_tail(observed),
         // 第 9 行：等退避 → 沿用已保存的次数与到点时刻，到期再尝试（重启不重置预算）。
         Some(WaitReason::Retry {
             attempts,
@@ -355,7 +304,6 @@ mod tests {
             wait: None,
             log_tail,
             output_check: OutputCheck::NotApplicable,
-            approval: ApprovalObservation::None,
             result_delivered: false,
             previous_executor_stopped: true,
             session: SessionObservation::default(),
@@ -426,7 +374,7 @@ mod tests {
         );
     }
 
-    /// 第 6 行：调用 planned，确定尚未执行 → 校验原计划与当前权限后自动执行。
+    /// 第 6 行：调用 planned，确定尚未执行 → 校验原计划后自动执行。
     #[test]
     fn row_6_the_call_is_planned_and_certainly_never_ran() {
         let observed = input(
@@ -457,55 +405,28 @@ mod tests {
         );
     }
 
-    /// 第 8 行：等待审批 → 保留原请求；已答复且仍有效的批准自动接续。
+    /// 原第 8 行（等审批）删了。D2：删之前停在审批上的 Run 按 JSONL 尾部判——那次调用
+    /// planned 而没 started，于是走第 6 行，自动执行，不进清单。
     #[test]
-    fn row_8_waiting_on_an_approval() {
-        let approval = ApprovalId::from_raw("ap-1");
-
-        let mut pending = waiting(
+    fn an_old_approval_wait_resumes_as_a_planned_call() {
+        let observed = waiting(
             WaitReason::Approval {
-                approval: approval.clone(),
+                approval: "ap-1".into(),
             },
-            LogTail::AwaitingModelReply,
+            LogTail::RoundPersisted {
+                pending: PendingCall::Planned { call: call() },
+            },
         );
-        pending.approval = ApprovalObservation::Pending {
-            approval: approval.clone(),
-        };
         assert_eq!(
-            decide(&pending),
-            RecoveryAction::KeepWaiting {
-                reason: WaitReason::Approval {
-                    approval: approval.clone()
-                }
-            },
-            "保留原请求，等答复"
+            decide(&observed),
+            RecoveryAction::ExecutePlannedCall { call: call() }
         );
 
-        let mut answered = pending.clone();
-        answered.approval = ApprovalObservation::Decided {
-            approval: approval.clone(),
-            approved: true,
-            still_valid: true,
-        };
-        assert_eq!(
-            decide(&answered),
-            RecoveryAction::ResumeWithDecision {
-                approval: approval.clone(),
-                approved: true
-            },
-            "审批无需用户因重启再答一次"
-        );
-
-        let mut stale = pending.clone();
-        stale.approval = ApprovalObservation::Decided {
-            approval,
-            approved: true,
-            still_valid: false,
-        };
-        assert!(
-            matches!(decide(&stale), RecoveryAction::WaitingForOperator { .. }),
-            "范围、计划、版本或有效期变化就重新审核"
-        );
+        // 旧线格式里还带着 `approval` 观察：解得出来，被忽略。
+        let mut old = serde_json::to_value(&observed).unwrap();
+        old["approval"] = serde_json::json!({"kind": "pending", "approval": "ap-1"});
+        let read: RecoveryInput = serde_json::from_value(old).unwrap();
+        assert_eq!(read, observed);
     }
 
     /// 第 9 行：等待临时故障重试 → 沿用已保存的次数与 next_retry_at，到期再尝试。
@@ -692,22 +613,6 @@ mod tests {
             decide(&observed),
             RecoveryAction::WaitingForOperator { .. }
         ));
-    }
-
-    #[test]
-    fn an_approval_the_database_lost_asks_the_operator_again() {
-        let mut observed = waiting(
-            WaitReason::Approval {
-                approval: ApprovalId::from_raw("ap-1"),
-            },
-            LogTail::AwaitingModelReply,
-        );
-        observed.approval = ApprovalObservation::MissingFromDatabase;
-        let action = decide(&observed);
-        let RecoveryAction::WaitingForOperator { reason } = &action else {
-            panic!("{action:?}")
-        };
-        assert!(reason.contains("审计副本"), "{reason}");
     }
 
     /// 状态说在等，却说不清在等什么——这是损坏，不是"没关系"。退避预算用完那种情形

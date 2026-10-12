@@ -13,9 +13,6 @@
 //! ╰ 输入框（会折行，光标摆在它真正在的那一格上）
 //! ```
 //!
-//! 审批弹窗来的时候它**占满视口**：输入框本来就该禁用（§11.3 先把眼前这件事答了），
-//! 留一个画得出来却按不动的框只会骗人。
-//!
 //! [`viewport_height`] 与 [`draw`] 必须算出同一个高度——驱动照前者开视口、照后者画，
 //! 两边差一行，输入框就会被切掉一条边。所以两边共用底下那几个 `*_height`。
 
@@ -27,7 +24,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 
 use crate::tui::app::{App, status_text};
-use crate::tui::approval::{ApprovalRow, approval_lines};
 pub(crate) use crate::tui::markdown;
 use crate::tui::model_picker::{ModelPicker, entry_detail};
 
@@ -46,9 +42,6 @@ const PICKER_MAX: u16 = 8;
 /// 视口要多高。`max` 是终端高度减去留给上文的那一行。
 pub fn viewport_height(app: &App, width: u16, max: u16, live_lines: usize) -> u16 {
     let max = max.max(1);
-    if app.approval.is_some() {
-        return modal_height(app, max);
-    }
     let live = (live_lines as u16).min(LIVE_MAX);
     (live + 1 + palette_height(app) + input_height(app, width)).min(max)
 }
@@ -56,10 +49,6 @@ pub fn viewport_height(app: &App, width: u16, max: u16, live_lines: usize) -> u1
 /// 画一帧。`live` 是 [`crate::tui::transcript::Emitted::live`] 给的那一段。
 pub fn draw(frame: &mut Frame<'_>, app: &App, live: &[Line<'static>]) {
     let area = frame.area();
-    if app.approval.is_some() {
-        draw_modal(frame, app, area);
-        return;
-    }
 
     let palette = app.palette();
     let palette_height = palette_height(app);
@@ -455,151 +444,6 @@ fn picker_block(picker: &ModelPicker, current: Option<&str>, area: Rect) -> Para
     Paragraph::new(lines)
 }
 
-/// 审批弹窗要多高：正文 + 菜单 + 边框 + 状态行，放不下就按 `max` 截。
-fn modal_height(app: &App, max: u16) -> u16 {
-    let Some(modal) = app.approval.as_ref() else {
-        return max;
-    };
-    let body = approval_lines(&modal.record).len() as u16;
-    let menu = modal.rows(app.pending_count()).len() as u16;
-    body.saturating_add(menu).saturating_add(3).min(max)
-}
-
-/// 审批弹窗：占满视口，底下留一行状态行。
-///
-/// 弹窗里有两块地方**不滚**：
-///
-/// ```text
-/// ├ 正文（五项：短 ID / 动作 / 改动 / 原因 / 范围）   ← 会滚，PgUp / PgDn
-/// ├ 答案菜单（每一行是一个答案，↑ / ↓ 选、Enter 确认） ← 钉在底部
-/// └ 边框底栏（怎么开这张菜单）
-/// ```
-///
-/// 钉住是因为正文在窄终端上几乎一定放不下，而一个滚出屏幕的「Enter 确认」等于没有提示
-/// ——这个弹窗上所有的答案都在菜单里。
-fn draw_modal(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(modal) = app.approval.as_ref() else {
-        return;
-    };
-    let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
-    let popup = chunks[0];
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .title(" 需要批准 ")
-        .title_bottom(Line::from(Span::styled(
-            format!(" {} ", modal.keys_hint()),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )))
-        .border_style(Style::default().fg(Color::Yellow));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    // 菜单钉在底部：正文多长都不许把它挤出窗口。这里手工切 `Rect` 而不是用 `Layout`
-    // ——窗口矮到装不下菜单时，`Length` 约束怎么取舍是布局库的事，而这里要的是"菜单
-    // 优先，正文归零"这一条明确的规矩。
-    let pending = app.pending_count();
-    let rows = modal.rows(pending);
-    let menu_height = (rows.len() as u16).min(inner.height);
-    let menu = Rect {
-        y: inner.y + inner.height - menu_height,
-        height: menu_height,
-        ..inner
-    };
-    let body = Rect {
-        height: inner.height - menu_height,
-        ..inner
-    };
-
-    if body.height > 0 {
-        let mut lines = approval_lines(&modal.record);
-        // 弹窗里也不许有一行比它宽。
-        for line in &mut lines {
-            if line.width() > body.width as usize {
-                let flat: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-                let style = line.spans.first().map(|s| s.style).unwrap_or_default();
-                *line = Line::from(Span::styled(
-                    markdown::truncate_to_width(&flat, body.width as usize),
-                    style,
-                ));
-            }
-        }
-        // 放不下就说还有多少行——滚动条之外最起码的一句话。
-        let hidden = lines.len().saturating_sub(body.height as usize);
-        if hidden > 0 {
-            let scrolled = (modal.scroll as usize).min(hidden);
-            lines.insert(
-                0,
-                Line::from(Span::styled(
-                    format!("（还有 {} 行，PgUp/PgDn 滚动）", hidden - scrolled),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            );
-        }
-        frame.render_widget(Paragraph::new(lines).scroll((modal.scroll, 0)), body);
-    }
-
-    if menu_height > 0 {
-        let lines = menu_lines(
-            &rows,
-            modal.selected_index(pending),
-            modal.answering,
-            menu.width,
-        );
-        frame.render_widget(Paragraph::new(lines), menu);
-    }
-
-    frame.render_widget(status_line(app, area.width), chunks[1]);
-}
-
-/// 菜单的每一行：高亮那一行是实心色块，其余是灰的；行尾挂着它的直通键。
-///
-/// 每一行按 `width` 自己裁、自己补空格——高亮要是一条通到底的色块，而"超宽就截断"那
-/// 套循环作用在正文的 `Vec<Line>` 上，够不着这里。
-fn menu_lines(
-    rows: &[ApprovalRow],
-    selected: usize,
-    answering: bool,
-    width: u16,
-) -> Vec<Line<'static>> {
-    // "▸ " + 标签 + 标签到直通键之间的空格 + 直通键。
-    let label_width = (width as usize).saturating_sub(4);
-    rows.iter()
-        .enumerate()
-        .map(|(index, row)| {
-            let chosen = index == selected && !answering;
-            let row_style = if answering {
-                Style::default().fg(Color::DarkGray)
-            } else if chosen {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Gray)
-            };
-            let label = markdown::truncate_to_width(&row.label, label_width);
-            let fill = label_width.saturating_sub(markdown::display_width(&label)) + 1;
-            Line::from(vec![
-                Span::styled(if chosen { "▸ " } else { "  " }, row_style),
-                Span::styled(label, row_style),
-                Span::styled(" ".repeat(fill), row_style),
-                Span::styled(
-                    row.key.to_string(),
-                    if chosen {
-                        row_style
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
-                ),
-            ])
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,7 +629,6 @@ fn main() {
         assert!(caret.y > height - 3, "光标跟着折到后面的行：{caret:?}");
     }
 
-    /// 弹窗开着时输入框禁用，光标就不该还留在屏幕上晃。
     #[test]
     fn the_model_picker_lists_every_model_and_marks_the_current_one() {
         use komo_kernel::protocol::http::ModelMenuEntry;
@@ -820,19 +663,6 @@ fn main() {
         assert!(screen.contains("stealth/union-alpha"), "{screen}");
         assert!(screen.contains("当前"), "{screen}");
         assert!(screen.contains("Enter 确认"), "{screen}");
-    }
-
-    #[test]
-    fn the_caret_goes_away_while_the_approval_popup_is_open() {
-        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
-        app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
-        let terminal = viewport(&app, 80, 24);
-        assert_eq!(
-            terminal.backend().buffer().area().height,
-            24,
-            "弹窗占满视口"
-        );
-        assert!(!app.input_enabled());
     }
 
     #[test]
@@ -1065,61 +895,6 @@ fn main() {
     }
 
     #[test]
-    fn the_approval_popup_shows_the_five_items_and_does_not_overflow() {
-        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
-        feed(&mut app, &fixture::conversation()[..4]);
-        app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
-
-        // 够高的窗口：五项都在屏幕上。
-        for (width, height) in [(80u16, 44u16), (200, 50)] {
-            let rows = screen_rows(&app, width, height);
-            assert_within(&rows, width);
-            let screen = rows.join("\n");
-            assert!(screen.contains("需要批准"), "{screen}");
-            assert!(screen.contains("7K2M"), "一、短 ID：{screen}");
-            assert!(screen.contains("动作"), "二、动作：{screen}");
-            assert!(screen.contains("shell"), "工具：{screen}");
-            assert!(screen.contains("rm -rf build"), "命令：{screen}");
-            assert!(
-                screen.contains("/home/u/project/build"),
-                "真实目标路径：{screen}"
-            );
-            assert!(screen.contains("cwd"), "cwd：{screen}");
-            assert!(screen.contains("版本"), "版本：{screen}");
-            assert!(screen.contains("改动"), "三、改动：{screen}");
-            assert!(screen.contains("+新的一行"), "diff：{screen}");
-            assert!(screen.contains("原因"), "四、原因：{screen}");
-            assert!(screen.contains("范围"), "五、范围：{screen}");
-            // 答案一行行列在弹窗底部的菜单里，行的尾巴上挂着它的直通键。
-            assert!(
-                screen.contains("本次任务默认通过（本次 Run 范围）"),
-                "菜单：{screen}"
-            );
-            assert!(screen.contains("只批准本次调用"), "菜单：{screen}");
-            assert!(screen.contains("拒绝（本次不执行）"), "菜单：{screen}");
-            assert!(screen.contains("Enter 确认"), "底栏：{screen}");
-        }
-    }
-
-    #[test]
-    fn the_popup_keys_stay_visible_even_when_the_body_does_not_fit() {
-        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
-        feed(&mut app, &fixture::conversation()[..4]);
-        app.apply(ServerEvent::Approval(Box::new(fixture::approval_record())));
-
-        // 一个放不下正文的窄窗口：菜单与底栏钉在弹窗底部，正文滚不走它们。
-        let rows = screen_rows(&app, 80, 24);
-        assert_within(&rows, 80);
-        let screen = rows.join("\n");
-        assert!(screen.contains("本次任务默认通过"), "菜单：{screen}");
-        assert!(screen.contains("拒绝（本次不执行）"), "菜单：{screen}");
-        assert!(screen.contains("Enter 确认"), "底栏：{screen}");
-        assert!(screen.contains("滚动"), "放不下要说还有多少行：{screen}");
-        // 输入框在这么窄的窗口里被弹窗盖住了；它禁用这件事由状态说了算。
-        assert!(!app.input_enabled());
-    }
-
-    #[test]
     fn a_draft_shows_on_screen_with_a_generating_marker_and_then_goes_away() {
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         feed(&mut app, &fixture::conversation()[..3]);
@@ -1172,16 +947,11 @@ fn main() {
         assert!(screen.contains("第 2 次"), "{screen}");
     }
 
-    /// 状态行上的条数是**三类合计**（§7.5）：只有审批那一种会被漏掉另外两条的等待。
+    /// 状态行上的条数是**两类合计**（§7.5）：结果不明与阻塞都在等人。
     #[test]
     fn the_status_line_counts_every_kind_waiting_on_a_person() {
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         app.apply(ServerEvent::Pending(vec![
-            fixture::intervention_summary(
-                "7K2M",
-                InterventionKind::Approval,
-                "放行 rm -rf build？",
-            ),
             fixture::intervention_summary(
                 "run-1",
                 InterventionKind::Verify,
@@ -1190,7 +960,7 @@ fn main() {
             fixture::intervention_summary("run-2", InterventionKind::Blocked, "会话已删除"),
         ]));
         let screen = screen(&app, 120, 20);
-        assert!(screen.contains("待处理 3"), "{screen}");
+        assert!(screen.contains("待处理 2"), "{screen}");
     }
 
     #[test]
@@ -1207,10 +977,10 @@ fn main() {
     #[test]
     fn the_command_palette_appears_while_a_slash_command_is_being_typed() {
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
-        app.input.set("/ap");
+        app.input.set("/pe");
         let screen = screen(&app, 80, 20);
-        assert!(screen.contains("/approve"), "{screen}");
-        assert!(screen.contains("本次 Run 范围"), "{screen}");
+        assert!(screen.contains("/pending"), "{screen}");
+        assert!(screen.contains("结果不明 / 阻塞"), "{screen}");
     }
 
     #[test]

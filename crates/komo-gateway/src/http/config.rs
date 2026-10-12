@@ -73,8 +73,23 @@ fn entry(api: &Api, alias: &str, model: &CatalogModel, default: bool) -> ModelMe
 /// `GET /v1/config/check`：只读，**不改变运行中的 Gateway**（§3 的命令表）。
 pub async fn check(State(api): State<Api>) -> Json<ConfigCheckResponse> {
     let snapshot = api.state.snapshot();
+    let mut issues = komo_runtime::config::validate_with(&snapshot, &api.state.caps);
+    // 加载时的警告也要看得见（被忽略的键、还留着的 `policy.toml`，§3 / §7）：它们不在快照
+    // 上，校验那一步看不到。`policy.toml` 那一条按文件**此刻**在不在：删掉之后不必等一次
+    // 重载才不报。
+    let retired = api
+        .state
+        .home
+        .join(komo_runtime::config::RETIRED_POLICY_FILE);
+    for warning in api.state.config.warnings() {
+        let stale =
+            warning.key.as_str() == komo_runtime::config::RETIRED_POLICY_FILE && !retired.exists();
+        if !stale && !issues.contains(&warning) {
+            issues.push(warning);
+        }
+    }
     Json(ConfigCheckResponse {
-        issues: komo_runtime::config::validate_with(&snapshot, &api.state.caps),
+        issues,
         loaded_at: snapshot.loaded_at,
         // 「`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是
         // "文件改了但没装上"」——所以这里给的是**文件此刻**的 mtime。

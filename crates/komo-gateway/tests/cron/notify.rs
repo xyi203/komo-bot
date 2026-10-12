@@ -5,6 +5,9 @@ use std::sync::Arc;
 use komo_kernel::traits::LlmClient;
 use komo_kernel::types::status::WaitReason;
 
+use komo_gateway::service::test_support::Unsure;
+use komo_kernel::types::chat::Outbound;
+
 use crate::harness::*;
 
 fn daily(notify: &str) -> serde_json::Value {
@@ -41,8 +44,6 @@ async fn always_delivers_a_good_run() {
 #[tokio::test]
 async fn on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait() {
     let home = Home::new();
-    let counter = home.workspace().join("ran.log");
-
     // ── 前半：一个顺利跑完的 Job，`on_error` 下不投。
     let gw = home
         .start(FakeLlm::always(vec![text_round(1, "整理好了")]) as Arc<dyn LlmClient>)
@@ -76,21 +77,26 @@ async fn on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait() {
     gw.stop().await;
 
     // ── 后半：同一份配置，一个停在等待上的 Job。**一律投**。
-    let llm = FakeLlm::always(vec![shell_append(1, "pc-1", &counter, "one")]);
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
+    let llm = FakeLlm::always(vec![unsure_round(1, "pc-1")]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let asking = gw.add_job(daily("on_error")).await;
     gw.make_due(&asking.id).await;
     let run = gw.tick().await.fired[0].run.clone();
-    // §8.4：等待是 `waiting` 加理由两维，理由说得出是在等一条审批。
+    // §8.4：等待是 `waiting` 加理由两维，理由说得出是在等人核对。
     let wait = gw.wait_waiting(&run).await;
     assert!(
-        matches!(wait, WaitReason::Approval { .. }),
-        "停在等审批上：{wait:?}"
+        matches!(wait, WaitReason::Intervention { .. }),
+        "停在等人核对上：{wait:?}"
     );
 
     let sender = Arc::clone(&gw.home);
     eventually("等待照样投到 home chat", move || {
-        !sender.approvals().is_empty()
+        sender
+            .sent()
+            .iter()
+            .any(|message| matches!(message.outbound, Outbound::NeedsAttention { .. }))
     })
     .await;
     gw.stop().await;
@@ -100,8 +106,9 @@ async fn on_error_keeps_quiet_about_a_good_run_but_never_about_a_wait() {
 #[tokio::test]
 async fn never_still_lets_a_wait_through() {
     let home = Home::new();
-    let counter = home.workspace().join("ran.log");
-    let llm = FakeLlm::always(vec![shell_append(1, "pc-1", &counter, "one")]);
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
+    let llm = FakeLlm::always(vec![unsure_round(1, "pc-1")]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
 
     let job = gw.add_job(daily("never")).await;
@@ -109,13 +116,16 @@ async fn never_still_lets_a_wait_through() {
     let run = gw.tick().await.fired[0].run.clone();
     let wait = gw.wait_waiting(&run).await;
     assert!(
-        matches!(wait, WaitReason::Approval { .. }),
-        "停在等审批上：{wait:?}"
+        matches!(wait, WaitReason::Intervention { .. }),
+        "停在等人核对上：{wait:?}"
     );
 
     let sender = Arc::clone(&gw.home);
     eventually("never 也要投一次等待", move || {
-        !sender.approvals().is_empty()
+        sender
+            .sent()
+            .iter()
+            .any(|message| matches!(message.outbound, Outbound::NeedsAttention { .. }))
     })
     .await;
     gw.stop().await;

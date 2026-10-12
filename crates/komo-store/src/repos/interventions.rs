@@ -1,10 +1,8 @@
 //! §7.5 Intervention：一切"需要人判断"的同一个入口。
 //!
-//! 审批、结果不明、阻塞今天本该是三套互不相干的出口——审批有短 ID、有清单，`needs_attention`
-//! 只有一条事件与一句投递。操作者因此撞上最难解释的现象：**会话停着不动，而 `komo approval
-//! list` 是空的**。这里把它们合成一条**派生清单**：
+//! 结果不明与阻塞合成一条**派生清单**（审批在 2026-10-11 删掉了，只剩这两类）：
 //!
-//! - **清单不是第四张表**（第 1 条）。权威仍是 `runs` 与 `approval_requests`，`kind` 由
+//! - **清单不是第三张表**（第 1 条）。权威仍是 `runs` 与 `tool_calls`，`kind` 由
 //!   "有没有一条 `uncertain` 调用"当场判出。多一张 `interventions` 表就多一处会与权威漂移
 //!   的状态，而这次改造的全部理由就是不要那个（§8.9）。
 //! - **挡队的每一条都在清单里，而且是同一次判定**（第 2 条）。[`waits_for_human`] 回答
@@ -13,27 +11,28 @@
 //! - **结论只走一条路：核对 → 按 §8.4 行事**（第 3 条）。这个模块只回答"有什么在等人"，
 //!   答复的副作用由 runtime 落地。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use komo_kernel::protocol::http::{
     InterventionDetail, InterventionKind, InterventionListQuery, InterventionSummary,
 };
 use komo_kernel::traits::StoreError;
-use komo_kernel::types::ids::{RunId, SessionId, ShortId, ToolCallId};
+use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::PlanHash;
 use komo_kernel::types::status::{RunState, WaitReason};
 use time::OffsetDateTime;
 use toasty::Executor;
 
 use crate::db::{BoxFuture, Db, from_ts, map_toasty};
-use crate::models::{ApprovalRequestRow, RunRow, ToolCallRow};
-use crate::repos::approvals::record_from_row;
+use crate::models::{RunRow, ToolCallRow};
 use crate::repos::runs::{state_of, wait_of};
 
 /// §7.5 第 2 条：这条 Run **停在人身上**吗——清单列的就是它，不需要第二个条件。
 ///
 /// 等时钟（`wait_kind = 'retry'`）不算：它在等时钟，不是等人。等依赖
 /// （`wait_kind = 'dependency'`）也不算：它在等前一条 Run 跑完，那件事不需要人回答。
+/// 删审批之前停在审批上的（`wait_kind = 'approval'`，D2）也不算：Gateway 启动时把它们
+/// 续跑（[`crate::repos::recovery::RecoveryStore::legacy_approval_waits`]），不问人。
 pub fn waits_for_human(wait: &WaitReason) -> bool {
     wait.needs_a_person()
 }
@@ -76,13 +75,10 @@ pub async fn blocked_runs(db: &Db) -> Result<Vec<BlockedRun>, StoreError> {
         .await
 }
 
-/// 待处理清单（§7.5）：`approval_requests` 与"停在人身上的 Run"的并集查询。
+/// 待处理清单（§7.5）：停在人身上的 Run。
 ///
-/// `kind` 当场判：有 `uncertain` 调用 → `Verify`；否则 → `Blocked`。**审批类由权威行表达**
-/// ——`wait_kind = 'approval'` 的 Run，如果 `approval_requests` 里有待处理行，那一条以短 ID
-/// 出现在清单里（Run 那一侧跳过，所以同一条 Run 不会既以短 ID 又以 Run ID 出现两次）；
-/// 权威行缺失时**照样列出来**（它确实挡着队），但记成 `Blocked` 并写清"没有这条审批请求"
-/// ——§7.5 第 3 条那句"没有'我说它发生了'"的另一面就是"没有权威行就不能造一条答复出来"。
+/// `kind` 当场判：有 `uncertain` 调用 → `Verify`；否则 → `Blocked`。句柄是 Run ID。
+/// 删审批之前停在审批上的 Run 不在这里（[`waits_for_human`]）。
 ///
 /// 按 `created_at` 排序。
 pub async fn list(
@@ -93,26 +89,8 @@ pub async fn list(
     db.read(move |ex| {
         let query = query.clone();
         Box::pin(async move {
-            let approvals = pending_approvals_in(ex).await?;
-            let blocked = blocked_runs_in(ex).await?;
-
-            let mut out = Vec::with_capacity(approvals.len() + blocked.len());
-            // 已经被审批那一条表达过的 Run：正文与句柄都在审批行上（短 ID 才是它的句柄），
-            // 所以 Run 那一侧不再重复列。
-            let mut expressed: BTreeSet<String> = BTreeSet::new();
-            for row in &approvals {
-                if let Some(run) = &row.run_id {
-                    expressed.insert(run.clone());
-                }
-                out.push(approval_summary(row));
-            }
-            for entry in &blocked {
-                if expressed.contains(entry.run.as_str()) {
-                    continue;
-                }
-                out.push(run_summary(entry));
-            }
-
+            let mut out: Vec<InterventionSummary> =
+                blocked_runs_in(ex).await?.iter().map(run_summary).collect();
             out.retain(|summary| {
                 query
                     .session
@@ -135,31 +113,15 @@ pub async fn list(
     .await
 }
 
-/// 按句柄取一条：先按短 ID 找**待处理**审批（§11.3），再按 Run ID 找 `verify` / `blocked`。
+/// 按句柄（Run ID）取一条 `verify` / `blocked`。
 ///
-/// `None` = 这个句柄此刻没有任何东西在等人（已经答过的审批、已经跑完的 Run 都是这样）。
+/// `None` = 这个句柄此刻没有任何东西在等人（已经跑完的 Run、等时钟 / 依赖的 Run、
+/// 删审批之前停在审批上的 Run 都是这样）。
 pub async fn find(db: &Db, handle: &str) -> Result<Option<InterventionDetail>, StoreError> {
     let handle = handle.to_string();
     db.read(move |ex| {
         let handle = handle.clone();
         Box::pin(async move {
-            if let Some(short) = ShortId::parse(&handle) {
-                let rows = ApprovalRequestRow::filter(
-                    ApprovalRequestRow::fields()
-                        .decided()
-                        .eq(false)
-                        .and(ApprovalRequestRow::fields().short_id().eq(short.as_str())),
-                )
-                .exec(ex)
-                .await
-                .map_err(map_toasty)?;
-                if let Some(row) = rows.first() {
-                    return Ok(Some(InterventionDetail::Approval(Box::new(
-                        record_from_row(row)?,
-                    ))));
-                }
-            }
-
             let Some(row) = RunRow::filter_by_id(&handle)
                 .first()
                 .exec(ex)
@@ -174,16 +136,6 @@ pub async fn find(db: &Db, handle: &str) -> Result<Option<InterventionDetail>, S
             };
             if !waits_for_human(&wait) {
                 return Ok(None);
-            }
-            // 等审批的 Run 用 Run ID 来找也一样：**权威是审批行**，有那一条就把它交出去
-            // （句柄仍是短 ID）。少了这一步，同一个问题会按句柄给出两种答案——短 ID 说
-            // "批这份计划"，Run ID 却说"没有那条审批请求"。
-            if matches!(wait, WaitReason::Approval { .. })
-                && let Some(approval) = pending_approval_for_run_in(ex, &row.id).await?
-            {
-                return Ok(Some(InterventionDetail::Approval(Box::new(
-                    record_from_row(&approval)?,
-                ))));
             }
             let uncertain = uncertain_by_run(ex).await?.remove(&row.id);
             let entry = BlockedRun {
@@ -255,49 +207,6 @@ async fn uncertain_by_run(
     Ok(out)
 }
 
-async fn pending_approvals_in(
-    ex: &mut dyn Executor,
-) -> Result<Vec<ApprovalRequestRow>, StoreError> {
-    let mut rows = ApprovalRequestRow::filter(ApprovalRequestRow::fields().decided().eq(false))
-        .exec(ex)
-        .await
-        .map_err(map_toasty)?;
-    rows.sort_by(|a, b| a.requested_at.cmp(&b.requested_at).then(a.id.cmp(&b.id)));
-    Ok(rows)
-}
-
-/// 这条 Run 上**待处理**的那条审批（权威行）。`None` = 没有——那是损坏的形状。
-async fn pending_approval_for_run_in(
-    ex: &mut dyn Executor,
-    run: &str,
-) -> Result<Option<ApprovalRequestRow>, StoreError> {
-    let mut rows = ApprovalRequestRow::filter(
-        ApprovalRequestRow::fields()
-            .decided()
-            .eq(false)
-            .and(ApprovalRequestRow::fields().run_id().eq(run)),
-    )
-    .exec(ex)
-    .await
-    .map_err(map_toasty)?;
-    rows.sort_by(|a, b| a.requested_at.cmp(&b.requested_at).then(a.id.cmp(&b.id)));
-    Ok(rows.into_iter().next())
-}
-
-/// 审批那一类的清单项：句柄是短 ID，问题是这份计划要放行什么（§7.5）。
-fn approval_summary(row: &ApprovalRequestRow) -> InterventionSummary {
-    InterventionSummary {
-        handle: row.short_id.clone(),
-        kind: InterventionKind::Approval,
-        session: SessionId::from_raw(row.session_id.clone()),
-        run: row.run_id.clone().map(RunId::from_raw),
-        call: row.call_id.clone().map(ToolCallId::from_raw),
-        question: row.reason.clone(),
-        verdicts: InterventionKind::Approval.verdicts(),
-        created_at: from_ts(row.requested_at),
-    }
-}
-
 /// `verify` / `blocked` 那一类的清单项：句柄是 Run ID。
 fn run_summary(entry: &BlockedRun) -> InterventionSummary {
     let (kind, question) = classify(entry);
@@ -345,19 +254,9 @@ fn classify(entry: &BlockedRun) -> (InterventionKind, String) {
             Some(call) => (InterventionKind::Verify, verify_reason(call)),
             None => (InterventionKind::Blocked, blocked_reason(entry)),
         },
-        // 状态说在等审批，而权威行不在：**它确实挡着队**，所以列出来；但答复没有着落，
-        // 只能记成阻塞并说清缺了什么（§7.5 第 3 条）。
-        WaitReason::Approval { approval } => (
-            InterventionKind::Blocked,
-            format!(
-                "状态说这条 Run 在等审批，但数据库里没有待处理的那条审批请求（{}）：\
-                 先查它为什么丢了，再决定怎么处置",
-                approval
-            ),
-        ),
-        // 构造这个类型时已经按 `needs_a_person` 收过一遍，这两种到不了；真出现了也只能
+        // 构造这个类型时已经按 `needs_a_person` 收过一遍，这三种到不了；真出现了也只能
         // 当阻塞报出去——不 pretend 它不是问题。
-        WaitReason::Retry { .. } | WaitReason::Dependency { .. } => {
+        WaitReason::Approval { .. } | WaitReason::Retry { .. } | WaitReason::Dependency { .. } => {
             (InterventionKind::Blocked, blocked_reason(entry))
         }
     }
@@ -480,15 +379,15 @@ mod tests {
         .await;
     }
 
-    /// 一条停在审批上的 Run（`waiting + approval`，权威行另建）。
-    async fn waiting_on_approval(db: &Db, session: &str, run: &str, approval: &str) {
+    /// 删审批之前停在审批上的 Run（`waiting + approval`，D2）。
+    async fn waiting_on_legacy_approval(db: &Db, session: &str, run: &str, approval: &str) {
         run_row(
             db,
             session,
             run,
             RunState::Waiting,
             Some(WaitReason::Approval {
-                approval: komo_kernel::types::ids::ApprovalId::from_raw(approval),
+                approval: approval.to_string(),
             }),
         )
         .await;
@@ -521,55 +420,6 @@ mod tests {
                     .exec(ex)
                     .await
                     .map_err(map_toasty)
-            }) as BoxFuture<'_, Result<(), StoreError>>
-        })
-        .await;
-    }
-
-    /// 一条待处理审批：句柄是短 ID。正文是**一份真的执行计划**——`find` 要把整份
-    /// `ApprovalRecord` 交给界面（§7.2），计划解不出来就是损坏。
-    async fn pending_approval(db: &Db, id: &str, short: &str, session: &str, run: &str) {
-        let plan = serde_json::to_string(&komo_kernel::test_support::sample_plan(
-            "shell",
-            &SessionId::from_raw(session),
-        ))
-        .expect("计划序列化得出来");
-        let (id, short, session, run) = (
-            id.to_string(),
-            short.to_string(),
-            session.to_string(),
-            run.to_string(),
-        );
-        write(db, move |ex| {
-            let (id, short, session, run, plan) = (
-                id.clone(),
-                short.clone(),
-                session.clone(),
-                run.clone(),
-                plan.clone(),
-            );
-            Box::pin(async move {
-                toasty::create!(ApprovalRequestRow {
-                    id,
-                    short_id: short,
-                    session_id: session,
-                    run_id: Some(run),
-                    call_id: None as Option<String>,
-                    plan_hash: "ph",
-                    plan,
-                    reason: "要放行一条 shell 命令",
-                    changes: None as Option<String>,
-                    evidence: None as Option<String>,
-                    scopes: "[]",
-                    requested_at: 1_i64,
-                    valid_until: 0_i64,
-                    decided: false,
-                    decision: None as Option<String>,
-                })
-                .exec(ex)
-                .await
-                .map_err(map_toasty)?;
-                Ok(())
             }) as BoxFuture<'_, Result<(), StoreError>>
         })
         .await;
@@ -621,34 +471,23 @@ mod tests {
 
     /// 验收 ⑨（关键）：**停在人身上的每一条 Run 恰好出现一次**。
     ///
-    /// 一条等审批的（由待处理审批行表达，句柄是短 ID）、一条停在人身上的（Run ID 做句柄）、
-    /// 一条同 Session 的 `queued`——正好两条在清单里，而且"挡队"与"进清单"同源：那个被
-    /// 挡住的 `queued` Run 领不走，挡住它的那两条都在清单里。
+    /// 一条停在人身上的（Run ID 做句柄）、一条删审批之前停在审批上的（D2：不进清单，
+    /// Gateway 启动时续跑它）、一条同 Session 的 `queued`——清单里正好一条；那个
+    /// `queued` Run 照样领不走：前面的 Run 还没跑完。
     #[tokio::test]
     async fn every_run_stopped_on_a_human_appears_exactly_once() {
         let (db, _dir) = temp().await;
-        waiting_on_approval(&db, "sess-1", "run-0001", "appr-1").await;
+        waiting_on_legacy_approval(&db, "sess-1", "run-0001", "appr-1").await;
         waiting_on_a_person(&db, "sess-1", "run-0002").await;
         set_last_error(&db, "run-0002", "引用的计划文件已经是另一份了").await;
         run_row(&db, "sess-1", "run-0003", RunState::Queued, None).await;
-        pending_approval(&db, "appr-1", "AAAA", "sess-1", "run-0001").await;
 
         let pending = list_now(&db).await;
-        assert_eq!(pending.len(), 2, "审批一条 + 停滞一条：{pending:#?}");
+        assert_eq!(pending.len(), 1, "只有停滞那一条：{pending:#?}");
 
-        let approval = pending
-            .iter()
-            .find(|entry| entry.kind == InterventionKind::Approval)
-            .expect("审批那一条在");
-        assert_eq!(approval.handle, "AAAA", "审批的句柄是短 ID");
-        assert_eq!(approval.run, Some(RunId::from_raw("run-0001")));
-        assert_eq!(approval.question, "要放行一条 shell 命令");
-
-        let blocked = pending
-            .iter()
-            .find(|entry| entry.kind == InterventionKind::Blocked)
-            .expect("阻塞那一条在");
-        assert_eq!(blocked.handle, "run-0002", "另外两类的句柄是 Run ID");
+        let blocked = &pending[0];
+        assert_eq!(blocked.kind, InterventionKind::Blocked);
+        assert_eq!(blocked.handle, "run-0002", "句柄是 Run ID");
         assert_eq!(blocked.question, "引用的计划文件已经是另一份了");
         assert_eq!(
             blocked.verdicts,
@@ -657,16 +496,7 @@ mod tests {
         );
         assert!(blocked.verdicts.contains(&InterventionVerdict::Resolve));
 
-        // 每一条 Run 在清单里恰好出现一次（`run-0003` 是排队中，不在清单里）。
-        for run in ["run-0001", "run-0002"] {
-            let seen = pending
-                .iter()
-                .filter(|entry| entry.run.as_ref().map(RunId::as_str) == Some(run))
-                .count();
-            assert_eq!(seen, 1, "{run} 恰好出现一次");
-        }
-
-        // 挡队与进清单同源：`run-0003` 领不走，而挡住它的两条都在清单里。
+        // 挡队与进清单是两个问题：`run-0003` 领不走（前面两条都没跑完）。
         let queue = queue::TursoRunQueue::new(db.clone());
         assert!(
             queue
@@ -674,8 +504,19 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "前面的 Run 停止等人，后面的不许领"
+            "前面的 Run 没跑完，后面的不许领"
         );
+    }
+
+    /// D2：删审批之前停在审批上的 Run 不要人——清单里没有它，按 Run ID 也取不到。
+    #[tokio::test]
+    async fn a_legacy_approval_wait_is_not_an_intervention() {
+        let (db, _dir) = temp().await;
+        waiting_on_legacy_approval(&db, "sess-1", "run-0001", "appr-1").await;
+
+        assert!(list_now(&db).await.is_empty());
+        assert!(find(&db, "run-0001").await.unwrap().is_none());
+        assert!(blocked_runs(&db).await.unwrap().is_empty());
     }
 
     /// 验收 ⑨：`waiting + intervention` 上带一条 `uncertain` 调用 → `verify`，`call` 对得上。
@@ -717,62 +558,6 @@ mod tests {
         }
     }
 
-    /// §7.5 第 3 条：**审批的权威是审批行。** 状态说在等审批而权威行不在时，仍然列出来
-    /// （它挡着队），但记成 `blocked`、句柄是 Run ID——不许凭空造一条答复。
-    #[tokio::test]
-    async fn an_approval_wait_without_the_authority_row_is_blocked_not_approved() {
-        let (db, _dir) = temp().await;
-        waiting_on_approval(&db, "sess-1", "run-0001", "appr-1").await;
-
-        let pending = list_now(&db).await;
-        assert_eq!(pending.len(), 1, "缺权威行也要列出来：它挡着队");
-        assert_eq!(pending[0].kind, InterventionKind::Blocked);
-        assert_eq!(pending[0].handle, "run-0001");
-        assert!(
-            pending[0].question.contains("没有待处理的那条审批请求"),
-            "说清缺了什么：{}",
-            pending[0].question
-        );
-        assert!(
-            !pending[0].verdicts.contains(&InterventionVerdict::Approve),
-            "没有权威行就没有可批准的对象"
-        );
-        // 按 Run ID 取也一样：没有权威行，绝不编一条"审批"出来。
-        match find(&db, "run-0001").await.unwrap() {
-            Some(InterventionDetail::Blocked { reason, .. }) => {
-                assert!(reason.contains("没有待处理的那条审批请求"), "{reason}");
-            }
-            other => panic!("该是 blocked：{other:?}"),
-        }
-    }
-
-    /// 按短 ID 取详情拿到整份审批记录（§7.2 要界面显示的全部内容）。
-    #[tokio::test]
-    async fn finding_an_approval_by_short_id_returns_the_record() {
-        let (db, _dir) = temp().await;
-        waiting_on_approval(&db, "sess-1", "run-0001", "appr-1").await;
-        pending_approval(&db, "appr-1", "AAAA", "sess-1", "run-0001").await;
-
-        match find(&db, "aaaa").await.unwrap() {
-            Some(InterventionDetail::Approval(record)) => {
-                assert_eq!(record.short_id, ShortId::parse("AAAA").unwrap());
-                assert_eq!(record.session, SessionId::from_raw("sess-1"));
-                assert_eq!(record.run, Some(RunId::from_raw("run-0001")));
-                assert_eq!(record.reason, "要放行一条 shell 命令");
-            }
-            other => panic!("该是审批：{other:?}"),
-        }
-        // **两个句柄指向同一条**：按 Run ID 找回来的还是那份权威审批，而不是"缺行"。
-        match find(&db, "run-0001").await.unwrap() {
-            Some(InterventionDetail::Approval(record)) => {
-                assert_eq!(record.short_id, ShortId::parse("AAAA").unwrap());
-            }
-            other => panic!("按 Run ID 也该拿到那次审批：{other:?}"),
-        }
-        // 句柄不是审批也不在等人 → 没有这一条。
-        assert!(find(&db, "ZZZZ").await.unwrap().is_none());
-    }
-
     /// §7.5 第 2 条：等时钟（`retry`）与等依赖（`dependency`）**不进清单**，但照样挡队
     /// ——这就是"挡队"与"进清单"的分界。终态的 Run 两样都不是。
     #[tokio::test]
@@ -807,8 +592,8 @@ mod tests {
         assert!(blocks_queue(RunState::Queued));
         assert!(!blocks_queue(RunState::Completed));
         assert!(!blocks_queue(RunState::Abandoned));
-        assert!(waits_for_human(&WaitReason::Approval {
-            approval: komo_kernel::types::ids::ApprovalId::from_raw("ap-1"),
+        assert!(!waits_for_human(&WaitReason::Approval {
+            approval: "ap-1".into(),
         }));
         assert!(!waits_for_human(&WaitReason::Dependency {
             run: RunId::from_raw("run-0001"),
@@ -845,15 +630,15 @@ mod tests {
         .unwrap();
         assert_eq!(only_run.len(), 1);
 
-        let only_approval = list(
+        let only_verify = list(
             &db,
             &InterventionListQuery {
-                kind: Some(InterventionKind::Approval),
+                kind: Some(InterventionKind::Verify),
                 ..Default::default()
             },
         )
         .await
         .unwrap();
-        assert!(only_approval.is_empty());
+        assert!(only_verify.is_empty());
     }
 }

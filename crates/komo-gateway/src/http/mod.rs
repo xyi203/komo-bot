@@ -6,7 +6,6 @@
 //!
 //! **除 `GET /healthz` 外统一认证**，由 [`crate::auth`] 的 layer 一次性挡住。
 
-pub mod approvals;
 pub mod config;
 pub mod cron;
 pub mod error;
@@ -40,8 +39,6 @@ use idempotency::Idempotency;
 pub struct Api {
     pub state: Arc<GatewayState>,
     pub idempotency: Arc<Idempotency>,
-    /// 已经问出去、还没答复的 toolbox 启用（`http::toolbox`）。
-    pub toolbox: Arc<toolbox::PendingEnables>,
 }
 
 impl std::fmt::Debug for Api {
@@ -55,7 +52,6 @@ impl Api {
         Api {
             state,
             idempotency: Arc::new(Idempotency::new()),
-            toolbox: Arc::new(toolbox::PendingEnables::new()),
         }
     }
 }
@@ -78,21 +74,13 @@ pub fn router(api: Api) -> Router {
         .route("/v1/reconcile", post(reconcile))
         .route("/v1/runs/{id}", get(runs::detail))
         .route("/v1/runs/{id}/cancel", post(runs::cancel))
-        // §7.5：三个回答面。`/v1/interventions/answers` 是**批量**（§11.3 的 `/approve all`），
-        // 静态段优先于 `{handle}`，两条不冲突。
+        // §7.5：清单、详情、答复。一次答一条——批量答复随审批一起删了（§7）。
         .route("/v1/interventions", get(interventions::list))
-        .route(
-            "/v1/interventions/answers",
-            post(interventions::answer_batch),
-        )
         .route("/v1/interventions/{handle}", get(interventions::show))
         .route(
             "/v1/interventions/{handle}/answer",
             post(interventions::answer),
         )
-        // 审批只留**审计读**（§7.4：这一步是谁放行的）。答复只走 interventions——单条与
-        // 批量的决定端点都删了，留着它们就是第二套语义。
-        .route("/v1/approvals", get(approvals::list))
         .route("/v1/cron", get(cron::list).post(cron::create))
         .route("/v1/cron/{id}", patch(cron::update).delete(cron::remove))
         .route("/v1/cron/{id}/run", post(cron::run_now))

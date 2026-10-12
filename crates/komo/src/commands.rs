@@ -13,11 +13,10 @@ use komo_gateway::config::{LoadOptions, load_config};
 use komo_gateway::skills::{OfferContext, SkillRegistry, one_line};
 use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
-    CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionBatchAnswerRequest,
-    InterventionListQuery, InterventionVerdict, MemoryListQuery, MemoryRevisionRequest,
-    RebuildIndexRequest, SessionListQuery, UpdateCronRequest,
+    CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionListQuery,
+    InterventionVerdict, MemoryListQuery, MemoryRevisionRequest, RebuildIndexRequest,
+    SessionListQuery, UpdateCronRequest,
 };
-use komo_kernel::types::chat::ApprovalScope;
 use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{MemoryScope, MemoryState, RetrievalMode};
 use komo_kernel::types::model::Effort;
@@ -88,12 +87,8 @@ pub async fn session_purge(client: &KomoClient, session: &str) -> Outcome {
 pub async fn run_inspect(client: &KomoClient, run: &str) -> Outcome {
     let run = RunId::from_raw(run);
     let detail = client.run(&run).await.map_err(failed)?;
-    // 「这一步是谁放行的」——那条审批早就不在待处理集合里了，这是审批族里唯一活着的
-    // **读**（§7.4 的审计面；答复只走 interventions）。
-    let approvals = client.approvals_of_run(&run).await.unwrap_or_default();
     Ok(render::run_inspect(
         &detail,
-        &approvals,
         time::OffsetDateTime::now_utc(),
     ))
 }
@@ -118,7 +113,7 @@ pub async fn run_cancel(client: &KomoClient, run: &str) -> Outcome {
 
 // ---------------------------------------------------------------- Intervention（§7.5）
 
-/// `komo intervention list`：**三类一张表**（审批 / 结果不明 / 阻塞）。
+/// `komo intervention list`：**两类一张表**（结果不明 / 阻塞）。
 ///
 /// 它取代了 `komo approval list`——那个清单空着而会话卡住，正是这套东西要消灭的现象。
 pub async fn intervention_list(client: &KomoClient, session: Option<&str>) -> Outcome {
@@ -137,35 +132,20 @@ pub async fn intervention_show(client: &KomoClient, handle: &str) -> Outcome {
     Ok(render::intervention_detail(&detail))
 }
 
-/// `komo intervention answer <handle> <结论> [--scope]`（§7.5）。
+/// `komo intervention answer <handle> <结论>`（§7.5）。一次答一条。
 ///
 /// **结论在发请求之前按口语校验**：写错一个词就让服务端去猜种类，只会得到一句
 /// "这个结论对这一条不适用"。这里先看词表，再让服务端按权威判定（种类不符时它照样
 /// 会拒，那是最后一道）。
-pub async fn intervention_answer(
-    client: &KomoClient,
-    handle: &str,
-    verdict: &str,
-    scope: Option<&str>,
-) -> Outcome {
+pub async fn intervention_answer(client: &KomoClient, handle: &str, verdict: &str) -> Outcome {
     let verdict = InterventionVerdict::parse(verdict).ok_or_else(|| {
-        format!(
-            "不认识这个结论：{verdict}；能写的是 approve / reject / satisfied / not_performed / resolve / abandon"
-        )
+        format!("不认识这个结论：{verdict}；能写的是 satisfied / not_performed / resolve / abandon")
     })?;
-    let scope = match scope {
-        None => None,
-        Some(raw) => Some(parse_scope(raw)?),
-    };
-    if scope.is_some() && verdict != InterventionVerdict::Approve {
-        return Err("--scope 只对 approve 有意义（§7.2）".into());
-    }
     let response = client
         .answer_intervention(
             handle,
             &InterventionAnswerRequest {
                 verdict,
-                scope,
                 request_key: Some(RequestKeys::named("cli-answer", handle)),
             },
         )
@@ -187,70 +167,13 @@ pub async fn intervention_answer(
     ))
 }
 
-/// `komo intervention answer-all <结论>`：一次答一批**审批**（§7.2、§11.3 的
-/// `/approve all`）。
-///
-/// 名单**先列出来再答复**：协议里没有"全部"这个词（见 `InterventionBatchAnswerRequest`
-/// 的注释），而操作者按下的这一刻看到的就是 `komo intervention list` 的那一份。名单进
-/// 请求键，所以同一条命令重发还是同一批、不会多答一条在这之间新出现的请求。
-pub async fn intervention_answer_all(client: &KomoClient, verdict: &str) -> Outcome {
-    let verdict = InterventionVerdict::parse(verdict)
-        .ok_or_else(|| format!("批量只接受 approve / reject；收到：{verdict}"))?;
-    if !matches!(
-        verdict,
-        InterventionVerdict::Approve | InterventionVerdict::Reject
-    ) {
-        return Err(
-            "批量只答审批：一次答一批互不相干的计划，只能是替操作者猜一个他没看过的答复（§7.2）"
-                .into(),
-        );
-    }
-    let pending = client
-        .interventions(&InterventionListQuery::default())
-        .await
-        .map_err(failed)?
-        .interventions;
-    let handles: Vec<String> = pending
-        .iter()
-        .filter(|item| item.kind == komo_kernel::protocol::http::InterventionKind::Approval)
-        .map(|item| item.handle.clone())
-        .collect();
-    if handles.is_empty() {
-        return Ok("没有待处理的审批".into());
-    }
-    let names = handles.join(",");
-    let response = client
-        .answer_interventions(&InterventionBatchAnswerRequest {
-            handles,
-            approved: verdict == InterventionVerdict::Approve,
-            request_key: Some(RequestKeys::named(
-                "cli-answers",
-                &format!("{}:{names}", verdict.as_str()),
-            )),
-        })
-        .await
-        .map_err(failed)?;
-    Ok(render::intervention_batch(&response))
-}
-
 /// 结论词在人读的那一面是中文，在命令里是线格式词。
 fn answer_word(verdict: InterventionVerdict) -> &'static str {
     match verdict {
-        InterventionVerdict::Approve => "已批准",
-        InterventionVerdict::Reject => "已拒绝",
         InterventionVerdict::Satisfied => "已记下：核对后目标已满足",
         InterventionVerdict::NotPerformed => "已记下：确定没有执行",
         InterventionVerdict::Resolve => "已记下：前提已处理，重新核对",
         InterventionVerdict::Abandon => "已放弃这条 Run",
-    }
-}
-
-fn parse_scope(raw: &str) -> Result<ApprovalScope, String> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "once" | "call" => Ok(ApprovalScope::Once),
-        "run" => Ok(ApprovalScope::Run),
-        "cron" => Ok(ApprovalScope::CronJob),
-        other => Err(format!("--scope 只接受 once / run / cron，收到：{other}")),
     }
 }
 
@@ -394,8 +317,7 @@ pub async fn cron_status(client: &KomoClient, job: &str, status: JobStatus) -> O
 
 /// `komo cron pause` / `resume` 的回执。
 ///
-/// 印出版本号，因为这条命令**不递增它**（§7.2 / §10：暂停不是定义变更，绑定这个 Job
-/// 的授权不该因为暂停一次就失效）——看得见才说得清。
+/// 印出版本号，因为这条命令**不递增它**（§10：暂停不是定义变更）——看得见才说得清。
 pub fn status_line(job: &komo_kernel::cron::CronJob) -> String {
     let state = match job.status {
         JobStatus::Active => "启用",
@@ -866,19 +788,7 @@ fn change_line(response: &komo_gateway::http::toolbox::ToolboxChangeResponse) ->
                 .map(ToString::to_string)
                 .unwrap_or_default()
         ),
-        // 短 ID 在**待处理集合内**唯一（§11.3），所以印它而不是那个 uuid。
-        ChangeStatus::Pending => {
-            let short = response
-                .short_id
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            format!(
-                "已提交审批：{}\n在聊天里回 /approve {short} 或 /reject {short}；\
-                 也可以 komo approval show {short}",
-                response.reason
-            )
-        }
+        // 没有"等审批"这一种去向：启用 / 停用直接生效（D9，审批 2026-10-11 删除）。
         ChangeStatus::Refused => format!("没有执行：{}", response.reason),
     }
 }
@@ -1112,34 +1022,21 @@ mod toolbox_render_tests {
         assert!(text.contains("还没跑过测试"), "{text}");
     }
 
-    /// 三种去向各说各的话——**等审批时要印那个 4 位短 ID**，那是回答它的钥匙（§11.3）。
+    /// 两种去向各说各的话：切过去了，或者为什么没切（启用直接生效，没有"等审批"）。
     #[test]
-    fn the_three_outcomes_each_say_what_to_do_next() {
+    fn each_outcome_says_what_happened() {
         let applied = ToolboxChangeResponse {
             module: "memos".into(),
             status: ChangeStatus::Applied,
             version: Some(version("v2")),
             enabled: None,
-            approval: None,
-            short_id: None,
-            reason: "配置 Allow".into(),
+            reason: "已启用".into(),
         };
         assert!(change_line(&applied).contains("已切换到 v2"));
 
-        let pending = ToolboxChangeResponse {
-            status: ChangeStatus::Pending,
-            short_id: Some(komo_kernel::types::ids::ShortId::from_index(0)),
-            reason: "等操作者批准".into(),
-            ..applied.clone()
-        };
-        let line = change_line(&pending);
-        assert!(line.contains("/approve 0000"), "{line}");
-        assert!(line.contains("/reject 0000"), "{line}");
-
         let refused = ToolboxChangeResponse {
             status: ChangeStatus::Refused,
-            short_id: None,
-            reason: "操作者拒绝了这次执行".into(),
+            reason: "候选版本与测过的那一版不一致".into(),
             ..applied
         };
         assert!(change_line(&refused).contains("没有执行"), "{refused:?}");

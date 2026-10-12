@@ -12,20 +12,15 @@
 //!    （spike callbacks.md 1b/1c/1f），而 ack 已经先发了，所以同一条事件在同一个进程里
 //!    还是可能来两次。durable 的那一层在 Dispatcher（§8.5 的请求键），这里这一层只挡
 //!    同进程重投，让 `Inbound` 只看见一次。
-//! 3. **去重键只管平台重投**。同一个人连点两次「批准」是两条合法输入、两个不同的
-//!    `event_id`；挡住它的是审批按 `approval_id` 的幂等，不是这里（spike callbacks.md §2）。
+//! 3. **去重键只管平台重投**。同一个人把同一条 `/answer` 发两次是两条合法输入、两个
+//!    不同的 `event_id`；挡住它的是答复本身的幂等（已答过的返回原结论），不是这里。
 //!
 //! 渠道只依赖 kernel 的类型与 `Channel` / `Inbound` 两个 trait（§11.5）：它不知道
 //! Session 是什么，也不读环境变量——`app_id` / `app_secret` 由 [`FeishuFactory`] 从
 //! secrets 取出来传进构造函数。
 //!
-//! **未在真机验证**（本机没有飞书凭证）：ws 上卡片回调的投递形态。openlark 0.20.0 的
-//! `FrameHandler::handle_data_frame` 对 `type: "card"` 的数据帧是 `debug!("Card frame
-//! received, skipping")` 后直接丢弃，**不进事件分发**；只有 `type: "event"` 的帧会到
-//! 我们手里。所以按钮回调能不能通过 ws 到达，取决于飞书把 `card.action.trigger` 归到哪
-//! 一种帧。本模块的解析对两条路都成立（它只看负载里的 `header.event_type`），但若飞书
-//! 走的是 `card` 帧，那就要 openlark 先支持——见报告的"需要编排者做"。文本命令
-//! `/approve <short_id>` 不受影响，它走的是 `im.message.receive_v1`。
+//! 卡片按钮回调（`card.action.trigger`）随审批卡片一起删掉了（§7，2026-10-11）：komo 发
+//! 出去的卡片上没有按钮，平台还推来的回调落进"不处理这个事件类型"。
 
 pub mod api;
 pub mod inbound;
@@ -147,7 +142,7 @@ impl FeishuChannel {
     }
 
     /// 出站的那一半。Notifier 用它主动投递（§11.4）；它与入站共用同一个 [`FeishuApi`]，
-    /// 所以也共用那份 tenant token 缓存与"审批落在哪条消息上"的进程内小账。
+    /// 所以也共用那份 tenant token 缓存与 Run 回复卡片的进程内小账。
     pub fn sender(&self) -> Arc<FeishuSender> {
         Arc::clone(&self.sender)
     }
@@ -216,24 +211,13 @@ impl FeishuChannel {
         }
 
         let request_key = inbound::request_key(&event_id);
-        // 原消息的 id 留在渠道里：加表情、回复卡片用它。卡片回调没有"原消息"可回。
-        let origin = match &kind {
-            EventKind::Message(event) => {
-                Some(event.message.message_id.trim().to_string()).filter(|id| !id.is_empty())
-            }
-            EventKind::CardAction(_) => None,
-        };
-        let message = match kind {
-            EventKind::Message(event) => inbound::from_message(&event, &bot.open_id, request_key),
-            EventKind::CardAction(event) => {
-                // 回调载荷里没有会话类型，只能问一次平台（见 `api::chat_is_private`）。
-                let is_private = self.chat_is_private(&event.context.open_chat_id).await;
-                inbound::from_card_action(&event, is_private, request_key)
-            }
-        };
+        let EventKind::Message(event) = kind;
+        // 原消息的 id 留在渠道里：加表情、回复卡片用它。
+        let origin = Some(event.message.message_id.trim().to_string()).filter(|id| !id.is_empty());
+        let message = inbound::from_message(&event, &bot.open_id, request_key);
 
         let Some(message) = message else {
-            // 群里没 @机器人、非文本消息、认不出的回调负载：`Ignored`，不进 Dispatcher。
+            // 群里没 @机器人、非文本消息：`Ignored`，不进 Dispatcher。
             tracing::debug!(%event_id, "飞书：忽略");
             return;
         };
@@ -258,21 +242,6 @@ impl FeishuChannel {
                 // TODO(decide: 出错时这条 event_id 照样留在去重集合里——否则一个确定性的
                 // 错误会让同一条消息在重推时无限重跑。代价是这条消息只剩这句回执。)
                 self.reply(&peer, INTERNAL_ERROR_HINT).await;
-            }
-        }
-    }
-
-    /// 这个会话是不是私聊。查不到时按**群**算。
-    ///
-    /// 猜"私聊"会让一个没有列进 `groups` 的群里的按钮也能下命令（§11.2 要求群必须在
-    /// 名单里），那是准入被绕过；猜"群"最坏只是这次按钮不生效，而同一条审批还能用
-    /// `/approve <short_id>` 回答——一条普通消息带着真正的 `chat_type`。
-    async fn chat_is_private(&self, chat_id: &str) -> bool {
-        match self.api().chat_is_private(chat_id).await {
-            Ok(is_private) => is_private,
-            Err(error) => {
-                tracing::warn!(%error, "飞书：问不到会话类型，按群会话处理");
-                false
             }
         }
     }
@@ -560,18 +529,20 @@ mod tests {
         assert!(received[0].is_private);
     }
 
-    // ② card.action.trigger 转成 /approve <id> 且 request_key = feishu:{event_id}。
+    // ② 卡片按钮随审批一起删掉了（§7）：平台还推来的回调不进 Dispatcher，也不问平台。
     #[tokio::test]
-    async fn a_button_press_becomes_the_same_command_a_message_would() {
+    async fn a_card_callback_never_reaches_the_dispatcher() {
         let fake = FakeOpenApi::start(Behavior::default()).await;
         let harness = harness(&fake);
         let recorder = RecordingInbound::new(fake.log());
 
         harness
             .events
-            .send(card_action_event(
-                "evt-31", "oc_dm", "ou_op", "approve", "7K2M",
-            ))
+            .send(card_action_event("evt-31", "oc_dm", "ou_op"))
+            .unwrap();
+        harness
+            .events
+            .send(text_event("evt-32", "oc_dm", "p2p", "ou_op", "在吗", &[]))
             .unwrap();
 
         serve_until(harness.channel, recorder.clone(), || {
@@ -580,39 +551,8 @@ mod tests {
         .await;
 
         let received = recorder.received();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].text, "/approve 7K2M");
-        // 去重键与普通消息同源：`feishu:{event_id}`（§11.1）。
-        assert_eq!(received[0].request_key.as_str(), "feishu:evt-31");
-        assert_eq!(received[0].peer.to_string(), "feishu:oc_dm");
-        assert_eq!(received[0].sender.as_str(), "ou_op");
-        // 回调载荷里没有会话类型，所以问了一次平台。
-        assert!(received[0].is_private, "oc_dm 在假平台上是单聊");
-        assert_eq!(fake.calls_to("chats").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_button_press_in_a_chat_we_cannot_classify_counts_as_a_group() {
-        let fake = FakeOpenApi::start(Behavior::refuse_chats()).await;
-        let harness = harness(&fake);
-        let recorder = RecordingInbound::new(fake.log());
-
-        harness
-            .events
-            .send(card_action_event(
-                "evt-32", "oc_dm", "ou_op", "approve", "7K2M",
-            ))
-            .unwrap();
-
-        serve_until(harness.channel, recorder.clone(), || {
-            !recorder.received().is_empty()
-        })
-        .await;
-
-        assert!(
-            !recorder.received()[0].is_private,
-            "猜不出来时按群算：准入宁可严一点"
-        );
+        assert_eq!(received.len(), 1, "只有那条文本：{received:?}");
+        assert_eq!(received[0].text, "在吗");
     }
 
     // ③ 群里非 @机器人 的消息 Ignored、@机器人 的消息剥掉占位。
@@ -674,7 +614,7 @@ mod tests {
             log.clone(),
             Duration::from_millis(150),
             InboundAck::Replied {
-                text: "没有待处理的审批".into(),
+                text: "现在没有待处理的 Intervention。".into(),
             },
         );
 
@@ -711,7 +651,7 @@ mod tests {
         let recorder = RecordingInbound::with_ack(
             fake.log(),
             InboundAck::Replied {
-                text: "没有待处理的审批".into(),
+                text: "现在没有待处理的 Intervention。".into(),
             },
         );
 
@@ -738,7 +678,7 @@ mod tests {
             sends[0]["content"]
                 .as_str()
                 .unwrap()
-                .contains("没有待处理的审批")
+                .contains("现在没有待处理的 Intervention。")
         );
     }
 
@@ -842,7 +782,7 @@ mod tests {
         let recorder = RecordingInbound::with_ack(
             fake.log(),
             InboundAck::Replied {
-                text: "没有待处理的审批".into(),
+                text: "现在没有待处理的 Intervention。".into(),
             },
         );
 

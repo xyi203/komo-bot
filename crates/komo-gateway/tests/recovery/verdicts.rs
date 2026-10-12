@@ -5,7 +5,7 @@
 //! - `satisfied`：给那次调用补一条"核对后目标已满足"的结果（`completed`），原 Run 继续
 //!   ——**动作不重跑**（副作用次数就是判据）；
 //! - `not_performed`：把那次调用按**失败**收尾，Run 重新入队（重做是**新的一次调用**，
-//!   照常过 Policy，§7.4）；
+//!   §8.4）；
 //! - `abandon`：终态 `abandoned`（§8.4：与 `cancelled` 分开记）。
 //!
 //! 衬里是 §14 故障注入表第 6 行那一段：副作用已经发生、完整输出还没落盘，重启之后
@@ -31,7 +31,7 @@ struct Uncertain {
     gateway: Gw,
 }
 
-/// 造一条 `verify`：审批放行 → shell 真的跑一次 → 拉掉那次尝试的输出 → 重启。
+/// 造一条 `verify`：shell 真的跑一次 → 拉掉那次尝试的输出 → 重启。
 ///
 /// 与端到端验收里 6b 那一段同一个做法：**外部副作用已经发生，而完整输出没有落盘**，
 /// 这是 §8.6 说的那段窗口——它只能由人来核对，不能靠重跑掩盖。
@@ -54,8 +54,6 @@ async fn an_uncertain_call(home: &Home) -> Uncertain {
         .submit(&session, "verdict-1", "跑一条命令")
         .await
         .run;
-    let record = gateway.wait_approval().await;
-    gateway.decide(&record.approval, true).await;
     fault.wait_tripped().await;
     gateway.stop().await;
     assert_eq!(counter.count(), 1, "动作发出去了，结果丢了");
@@ -112,7 +110,7 @@ async fn satisfied_writes_a_result_and_requeues_without_rerunning() {
         .gateway
         .post_json(
             &format!("/v1/interventions/{handle}/answer"),
-            serde_json::json!({ "verdict": "approve" }),
+            serde_json::json!({ "verdict": "resolve" }),
         )
         .await;
     assert_eq!(code, 422, "{body}");
@@ -123,7 +121,7 @@ async fn satisfied_writes_a_result_and_requeues_without_rerunning() {
         "答不上的结论不该动这条 Run"
     );
 
-    let body = fixture.gateway.answer(&handle, "satisfied", None).await;
+    let body = fixture.gateway.answer(&handle, "satisfied").await;
     let answered: InterventionAnswerResponse = serde_json::from_str(&body).expect("回执");
     assert_eq!(answered.verdict, InterventionVerdict::Satisfied, "{body}");
     assert!(!answered.already_answered, "{body}");
@@ -163,7 +161,7 @@ async fn satisfied_writes_a_result_and_requeues_without_rerunning() {
     );
 
     // 再答一次：**已答复的返回原结论，不报错**（§11.3）。
-    let body = fixture.gateway.answer(&handle, "satisfied", None).await;
+    let body = fixture.gateway.answer(&handle, "satisfied").await;
     let again: InterventionAnswerResponse = serde_json::from_str(&body).expect("回执");
     assert!(again.already_answered, "{body}");
     assert_eq!(again.verdict, InterventionVerdict::Satisfied, "{body}");
@@ -176,7 +174,7 @@ async fn not_performed_closes_the_call_as_failed_and_requeues() {
     let fixture = an_uncertain_call(&home).await;
     let handle = pending_verify(&fixture.gateway, &fixture.run).await;
 
-    let body = fixture.gateway.answer(&handle, "not_performed", None).await;
+    let body = fixture.gateway.answer(&handle, "not_performed").await;
     let answered: InterventionAnswerResponse = serde_json::from_str(&body).expect("回执");
     assert_eq!(
         answered.verdict,
@@ -184,7 +182,7 @@ async fn not_performed_closes_the_call_as_failed_and_requeues() {
         "{body}"
     );
 
-    // 「确定没执行」写成一条**失败**结果：重做是一次新调用，照常过 Policy（§7.4）。
+    // 「确定没执行」写成一条**失败**结果：重做是一次新调用（§8.4）。
     let events = home.events(&fixture.session);
     assert!(
         unpaired_attempts(&events).is_empty(),
@@ -217,7 +215,7 @@ async fn abandon_is_its_own_terminal_state() {
     let fixture = an_uncertain_call(&home).await;
     let handle = pending_verify(&fixture.gateway, &fixture.run).await;
 
-    let body = fixture.gateway.answer(&handle, "abandon", None).await;
+    let body = fixture.gateway.answer(&handle, "abandon").await;
     let answered: InterventionAnswerResponse = serde_json::from_str(&body).expect("回执");
     assert_eq!(answered.verdict, InterventionVerdict::Abandon, "{body}");
     assert_eq!(answered.run_state, Some(RunState::Abandoned), "{body}");
@@ -308,8 +306,6 @@ async fn a_chat_verify_is_delivered_once_even_after_the_sweep() {
     let komo_kernel::protocol::InboundAck::Queued { session, run } = ack else {
         panic!("{ack:?}")
     };
-    let record = gateway.wait_approval().await;
-    gateway.decide(&record.approval, true).await;
     fault.wait_tripped().await;
     gateway.stop().await;
 

@@ -1,6 +1,7 @@
 # codemode：沙箱里的 Python 脚本
 
-> 状态：设计 + 首版落地（2026-10-08）。借鉴 pi 的 codemode（`packages/coding-agent/docs/codemode.md`），
+> 状态：设计 + 首版落地（2026-10-08）。2026-10-11 起没有 Policy 与审批（`docs/komo_bot.md` §7），codemode 的边界只来自
+> 沙箱与"内层只读"这一条（§5）。借鉴 pi 的 codemode（`packages/coding-agent/docs/codemode.md`），
 > 引擎换成 komo 已有的 Python，隔离交给操作系统沙箱。与 `docs/komo_bot.md` 冲突处以本文为准。
 
 ## 1. 要解决什么
@@ -12,12 +13,12 @@ codemode 让模型写**一段脚本**：脚本里调工具、在本地过滤和�
 
 ## 2. 为什么是"沙箱里的 Python"，不是 QuickJS
 
-脚本能不能**免审批**、中断后能不能**整段重跑**，取决于脚本本身能不能碰外部世界。
+脚本能不能**放心地自动跑**、中断后能不能**整段重跑**，取决于脚本本身能不能碰外部世界。
 
 | 方案 | 隔离 | 结论 |
 |---|---|---|
 | QuickJS（pi 的做法） | 引擎里没有文件 / 网络 / 进程 | 可行，新依赖 `rquickjs`，要写一层 Rust↔JS 桥 |
-| 裸 Python（komo 已有的 `python` 工具） | 无：脚本就是任意代码 | 每段都要审批，失去意义 |
+| 裸 Python（komo 已有的 `python` 工具） | 无：脚本就是任意代码 | 内层调用再只读也没用，脚本自己就能改东西、联网，也不能整段重跑 |
 | **Python + 操作系统沙箱** | 进程级：不能写文件、不能联网、不能起子进程、只能读解释器自己 | **采用**：零新依赖，模型写 Python 最顺，还能用托管环境里装好的库 |
 
 2026-10-08 在 macOS 27 上实测（`sandbox-exec` + 下面 §4 的配置）：写 `~` 下的文件、连
@@ -27,7 +28,7 @@ stdin / stdout 正常。
 ## 3. 形状
 
 ```text
-模型 ── codemode({"code": "..."}) ──▶ executor（与其他工具同一条路：Policy → start_call）
+模型 ── codemode({"code": "..."}) ──▶ executor（与其他工具同一条路：能力面 → start_call）
                                          │ Operation::Codemode → 不调 Tool::execute，
                                          │ 交给 executor 自己的 run_codemode
                                          ▼
@@ -130,9 +131,8 @@ stdin / stdout 正常。
 2. `tool.prepare(args)` 出计划。
 3. **只读**：`plan.operation.is_read_only()` 必须成立——`read`、`rg`、`[mcp.servers] read_only`
    里的 MCP 工具。否则抛 `ToolError`："`<name>` 会改东西，请在脚本外直接调用"。
-4. **Policy 必须直接 Allow**（不查授权表）。`Ask` → 抛错："这一步要审批（原因），脚本里不能停下
-   来等人，请在脚本外直接调用"；`Deny` → 抛错带原因。
-5. 用 Policy 的 `Proof` 执行；输出收进内存（上限 1 MiB）。
+4. 执行；输出收进内存（上限 1 MiB）。不再过 Policy（2026-10-11 删除）：第 3 步是最后一道门，工作区
+   外的读因此也放行，与原来的 auto 一致。
 
 返回给脚本的是一个 dict：
 
@@ -141,7 +141,7 @@ stdin / stdout 正常。
 ```
 
 `read` 的 `text` 是文件内容，`rg` 是匹配行，MCP 是渲染过的文本，`result` 是完整 `CallToolResult`。
-调用失败（含第 3、4 步）抛 `ToolError`，`try/except` 接得住。
+调用失败（含第 1、3 步）抛 `ToolError`，`try/except` 接得住。
 
 ## 6. 模型看到的接口
 
@@ -157,11 +157,11 @@ stdin / stdout 正常。
 结果正文：`text()` 各段按顺序，`<console>` 段随后，失败时附 `脚本出错：` 与 traceback，最后一行
 是调用摘要（`调用了 3 次工具：read×2、rg×1`）。超长照常由投影截头尾。
 
-## 7. Policy 与恢复
+## 7. 计划与恢复
 
 - 计划：`Operation::Codemode { code }`，代码进计划哈希。
-- `OperationMatch::Codemode`：strict 与 auto 下都 Allow（`codemode-allow`）——脚本自己碰不到外部，
-  它里面的每一次调用都各自过 Policy。
+- 没有 Policy 要过（2026-10-11 删除，原来的 `codemode-allow` 规则随之消失）：脚本自己碰不到外部，
+  它里面的每一次调用都要过 §5 的能力面与只读两道门。
 - 恢复：`SafeReread`。中断后整段重跑：内层只有只读调用，重跑看到的是"现在"的状态，与重读同理。
 - `is_read_only()` 为真：可以和同一轮的其他只读调用并行。
 
@@ -175,16 +175,16 @@ stdin / stdout 正常。
 
 | 位置 | 内容 |
 |---|---|
-| `komo-kernel` `types/plan.rs`、`policy/rules.rs`、`policy/defaults.rs` | `Operation::Codemode`、`OperationMatch::Codemode`、`codemode-allow` |
+| `komo-kernel` `types/plan.rs` | `Operation::Codemode` |
 | `komo-runtime` `codemode/`（`mod.rs` + `driver.py`） | 解释器探测、自检、子进程协议 |
 | `komo-runtime` `codemode/seatbelt.rs` / `landlock.rs` / `unsupported.rs` | 按平台把子进程关进去：Seatbelt 配置 / Landlock + seccomp / 没有 |
 | `komo-runtime` `tools/codemode.rs` | `CodemodeTool`：定义 + `prepare`；`execute` 不该被走到（与 `dispatch` 同一模式） |
-| `komo-runtime` `executor` | `with_codemode(sandbox)`；`execute_authorized` 里按 `Operation::Codemode` 分流到 `run_codemode`；`nested_call` |
+| `komo-runtime` `executor` | `with_codemode(sandbox)`；执行入口里按 `Operation::Codemode` 分流到 `run_codemode`；`nested_call` |
 | `komo-gateway` `service/mod.rs` | 启动时探测 + 自检，通过才注册工具并接上执行器 |
 
 ## 10. 验收
 
 - 沙箱自检：读写沙箱外的文件 / 联网 / 起子进程被拒（macOS 与开了 Landlock 的 Linux 上跑，其他跳过）。
 - 端到端（真 Gateway）：脚本调 `read` 两次、过滤后 `text()`，模型只看到过滤结果；脚本里调
-  `write` 抛错、文件没被写；脚本里读工作区外的文件（Ask）抛错；脚本死循环到时限被杀。
-- Policy：`codemode` 在 strict 下 Allow。
+  `write` 抛错、文件没被写；脚本死循环到时限被杀。（原来的"脚本里读工作区外的文件（Ask）抛错"与"`codemode` 在 strict 下 Allow"随
+  Policy 于 2026-10-11 删除。）

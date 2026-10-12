@@ -90,18 +90,11 @@ async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) {
     }) {
         state.rebuild_llm();
     }
-    // 判决用的规则表：executor 手里与这里**是同一份**（`GatewayState::policy`），换上
-    // 就走（§3：Policy 每次决策读规则，不缓存）。线上踩到过它的缺席：`policy.toml`
-    // 换成了 `mode = "auto"`，快照确实变了、日志也说重载成功，但每一次调用仍然按旧表
-    // 问人——因为 executor 那份 engine 是装配时造的，没人动它。
-    if changed.iter().any(|key| key.as_str().starts_with("policy")) {
-        state.policy.install(state.snapshot().policy.clone());
-    }
     // §5.6 的目录行是启动快照，重载是唯一会动它的时刻：`paths.skill_dirs` 改了、
     // 或者人刚 `komo skills disable` 过，新的一段系统提示就该按新的来。
     state.refresh_skills_prompt();
     // §9.4 的判断后端同理：`[typesafe]`（端点 / 模型 / 开关）或 `memory.retrieval.rerank`
-    // 一改，下一次召回就按新的来——"改了没反应"在这两个键上和在 `policy.toml` 上一样坏。
+    // 一改，下一次召回就按新的来——这两个键上不能有"改了没反应"。
     if changed.iter().any(|key| {
         let key = key.as_str();
         key.starts_with("typesafe") || key.starts_with("memory.retrieval")

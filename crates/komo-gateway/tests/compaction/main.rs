@@ -2,7 +2,7 @@
 //!
 //! - **窗口保护**：`context_window` 调得很小、没有计划边界，几次大 `read` 把估计的上下文
 //!   推过线——摘要请求没有工具、带着计划；同一个 Run 接着跑，下一次主请求是任务 → 摘要 →
-//!   切点起原样；中途停在审批上、重启再批，回放的那一段逐字节不变。
+//!   切点起原样；中途停在一条介入上、重启再答，回放的那一段逐字节不变。
 //! - **决定不压**：开着压缩、但账算不过来——不多发任何请求，driver 原样接着跑，模型拿到
 //!   的轮输入与关着压缩时一模一样；边界上记一条 `skipped`。
 //!
@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use komo_agent::context::COMPACTION_PREFIX;
 use komo_agent::context::compaction::price;
+use komo_gateway::service::test_support::Unsure;
 use komo_gateway::service::test_support::harness::{
     FakeLlm, Home, call_round, config_toml, text_round,
 };
@@ -167,8 +168,8 @@ const READS: u32 = 5;
 const RESERVE: u64 = 1_000;
 
 /// 没有计划边界、窗口很小：第五次大 `read` 之后估计过线，压；摘要请求没有工具、带着
-/// 计划；同一个 Run 接着跑，下一次主请求是任务 → 摘要 → 切点起原样；停在审批上、重启
-/// 再批，那一段逐字节不变。
+/// 计划；同一个 Run 接着跑，下一次主请求是任务 → 摘要 → 切点起原样；停在一条介入上
+/// （测试工具 `unsure`）、重启再答，那一段逐字节不变。
 #[tokio::test]
 async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail() {
     let window = BASE_TOKENS + READ_TOKENS * (2 * READS as u64 - 1) / 2 + RESERVE;
@@ -182,6 +183,7 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
         &format!("model = \"gpt-test\"\ncontext_window = {window}\n"),
     );
     let home = Home::with_config(&config);
+    home.install_tools(vec![Unsure::new().tool()]);
     std::fs::create_dir_all(home.workspace()).expect("工作目录");
     for n in 1..=READS {
         let lines: String = (0..600)
@@ -204,19 +206,13 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
     let llm = FakeLlm::new(vec![
         first,
         vec![text_round(1, summary)],
-        vec![call_round(
-            5,
-            "pc-s1",
-            "shell",
-            serde_json::json!({ "command": "echo 收尾" }),
-        )],
+        vec![call_round(5, "pc-s1", "unsure", serde_json::json!({}))],
     ]);
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gateway.open_session().await;
     let task = "把五个大文件读一遍，最后跑一条命令";
     let run = gateway.submit(&session, "window-1", task).await.run;
-    let pending = gateway.wait_approval().await;
-    assert_eq!(pending.run.as_ref(), Some(&run));
+    let pending = gateway.wait_intervention(&run).await;
 
     let requests: Vec<TurnRequest> = llm.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 3, "主请求、摘要请求、重新装配后的主请求");
@@ -324,18 +320,18 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
     );
     assert!(priced(after) < window - RESERVE, "压完离开了窗口");
 
-    // 重启 → 批 → 下一段：同一段前缀逐字节不变。
+    // 重启 → 答 → 下一段：同一段前缀逐字节不变。
     gateway.stop().await;
     let llm = FakeLlm::finisher("都做完了。");
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    gateway.decide(&pending.approval, true).await;
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     let replayed = llm.requests.lock().unwrap().last().cloned().unwrap();
     assert_eq!(
         replayed.messages.len(),
-        after.messages.len() + 1,
-        "多了 s1 那一轮"
+        after.messages.len() + 2,
+        "多了 s1 那一轮与它核对后的结果"
     );
     assert_eq!(
         serde_json::to_string(&replayed.messages[..after.messages.len()]).unwrap(),

@@ -182,8 +182,8 @@ def delete(identifier):
 def verify(function=None, args=None):
     """与版本绑定的核对函数（§8.6）。
 
-    执行器在"started 了却没有结果"时通过同一套 python 机制调它，**核对本身仍经过
-    Policy**。它回答四种结论之一，绝不回答"大概吧"：
+    执行器在"started 了却没有结果"时通过同一套 python 机制调它。它回答四种结论之一，
+    绝不回答"大概吧"：
 
         already_satisfied  目标已达到，附证据（ID / 链接）
         not_performed      确定未执行，且前提仍成立，可以重做同一次调用

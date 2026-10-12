@@ -141,10 +141,10 @@ impl ConfigHolder {
         &self.home
     }
 
-    /// 三个来源文件的 mtime 和上一次重载（成功或失败）时看到的不一样吗。
+    /// 来源文件的 mtime 和上一次重载（成功或失败）时看到的不一样吗。
     ///
     /// Gateway 每秒调一次它（§3：mtime 轮询，不引入 inotify）。文件**消失**也算变化：
-    /// 删掉 policy.toml 是一次真实的配置改动。
+    /// 删掉 .env 是一次真实的配置改动。
     pub fn changed_since(&self) -> bool {
         let recorded = self.seen.lock().expect("锁没中毒");
         let now = self.sources.stamps();

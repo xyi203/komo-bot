@@ -1,15 +1,14 @@
 //! `delegate`：把一件自包含的子任务交给**同 Session 里的一条子 Run**（§4）。
 //!
-//! 它长得像第七个工具，其实不是：模型看不见任何新能力，子代理用的是同一套六个工具，它
-//! 自己的每一次调用照常过 Policy 与审批。所以这里要审的不是"模型能不能做这件事"，而是
-//! "允不允许把这件事派出去"——计划因此是 `Operation::Delegate`，规则表按它匹配。
+//! 它长得像第七个工具，其实不是：模型看不见任何新能力，子代理用的是同一套六个工具。
+//! 这里记下的是"把这件事派出去"这个动作——计划因此是 `Operation::Delegate`。
 //!
 //! 两件**不在这里**发生的事，写下来是为了让读的人不必去别处确认：
 //!
 //! - **执行不在工具里。** 受理子 Run、父调用停在 `dependency` 上、子 Run 终态回来后
 //!   复验，全在 executor（§8.4 的 `dependency`）。理由不是省事：父这一次调用什么时候
-//!   算收尾，只有账本说得清——子 Run 可能正在等审批、可能被重启恢复、可能过了很久才
-//!   结束，而父侧手里唯一那份能对上的东西是随计划进了审批绑定对象的那份 [`DelegateSpec`]。
+//!   算收尾，只有账本说得清——子 Run 可能正在等介入、可能被重启恢复、可能过了很久才
+//!   结束，而父侧手里唯一那份能对上的东西是随计划落进账本的那份 [`DelegateSpec`]。
 //!   所以 [`DelegateTool::execute`] 一旦被走到就是一条不该存在的路径，它返回硬错误。
 //! - **子代理看不见父的消息历史。** 它的输入就是 `task` 这一条正文——描述里那句"子代理
 //!   只看得见 task"是契约的一部分，不是修辞。
@@ -27,8 +26,8 @@ use super::{normalized, parse_args, plan_time};
 /// 模型给的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DelegateArgs {
-    /// 交给子代理的自包含任务。**它就是子 Run 的输入正文**，也是审批卡上给人看的那一
-    /// 句——两者是同一个值，所以这里不能是"见上文"。
+    /// 交给子代理的自包含任务。**它就是子 Run 的输入正文**——子代理只看得见它，所以
+    /// 这里不能是"见上文"。
     pub task: String,
     /// 结果契约：子代理要交回来的 JSON 长什么样（kernel 认得的那个 Schema 子集）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -142,8 +141,8 @@ impl Tool for DelegateTool {
             tool_call: Some(ctx.call.clone()),
             args: normalized(&args)?,
             cwd: Some(ctx.cwd.clone()),
-            // 委派不碰任何文件：它触及的目标是"一条子 Run"，而 Run 不是路径。审批绑定
-            // 的是这份计划（含整份 spec），不是某个文件版本。
+            // 委派不碰任何文件：它触及的目标是"一条子 Run"，而 Run 不是路径。计划哈希
+            // 覆盖的是整份 spec，不是某个文件版本。
             targets: vec![],
             versions: PlanVersions::default(),
             resources: vec![],
@@ -156,7 +155,7 @@ impl Tool for DelegateTool {
 
     async fn execute(
         &self,
-        _plan: komo_kernel::types::plan::ApprovedPlan,
+        _plan: komo_kernel::types::plan::ExecutionPlan,
         _ctx: &ToolContext,
         _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
@@ -174,7 +173,7 @@ impl Tool for DelegateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context, writer};
+    use crate::tools::test_support::{context, writer};
 
     #[tokio::test]
     async fn the_plan_carries_who_delegated_and_what_the_result_looks_like() {
@@ -291,7 +290,7 @@ mod tests {
             .unwrap();
 
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         let ToolError::Failed { message } = &error else {

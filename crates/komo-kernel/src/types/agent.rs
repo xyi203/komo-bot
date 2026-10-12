@@ -2,7 +2,7 @@
 //!
 //! 三者分得很清（`docs/bot.md` §四）：**Profile** 是操作者写在配置文件里的长期定义，
 //! **Session** 绑定一个 Profile 并承载一段持续对话，**RunSnapshot** 是某一次执行受理时
-//! 冻结的身份与能力——它必须**可恢复**：审批可能一小时之后才答复，而那时 Profile 与
+//! 冻结的身份与能力——它必须**可恢复**：一条 Run 可能停一小时才续跑，而那时 Profile 与
 //! 磁盘上的文件都可能已经改过，恢复出来的 Run 不能因此换一副面孔。
 
 use std::collections::BTreeMap;
@@ -95,9 +95,9 @@ impl AgentProfile {
 /// 两个约束写在字段里：
 ///
 /// - **可恢复**：`instructions` 存的是**内容引用**（`payloads/` 里的正文），不是文件路径
-///   ——审批期间那个文件可能已经被改过，恢复出来的 Run 不能换一副面孔；
-/// - **固定配置不等于冻结安全策略**：这里冻结的是身份与能力，撤权、Deny 规则与停用状态
-///   仍然在执行时读当前配置（§7）。
+///   ——停着的这段时间里那个文件可能已经被改过，恢复出来的 Run 不能换一副面孔；
+/// - **固定配置不等于冻结一切**：这里冻结的是身份与能力，停用状态等仍然在执行时读
+///   当前配置。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunSnapshot {
     pub agent_id: String,

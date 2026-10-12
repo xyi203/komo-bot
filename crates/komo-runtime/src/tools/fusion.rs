@@ -1,6 +1,6 @@
 //! `edit` / `write` 的 `then_run`：改完文件紧接着跑一条命令，一次调用、一条结果（§4）。
 //!
-//! 两步**合并授权、没有半截**（kernel 的组合计划，§7.1）。执行上照 SoL-Pi 的 Action Fusion：
+//! 两步是**一份计划、没有半截**（kernel 的组合计划）。执行上照 SoL-Pi 的 Action Fusion：
 //!
 //! - 改动失败 → 命令不跑，结果里写 `[then_run:skipped]`；
 //! - 改动之后目标的内容哈希必须还是改动的结果版本——中间被别人动过，命令同样不跑；
@@ -13,7 +13,7 @@
 
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
-use komo_kernel::types::plan::{ApprovedPlan, ExecutionPlan, RecoveryMode};
+use komo_kernel::types::plan::{ExecutionPlan, RecoveryMode};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{ToolContext, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
@@ -83,18 +83,22 @@ pub fn attach(
 
 /// 改动 → 核对目标没被动过 → 命令，交回**一条**结果。
 ///
-/// `mutation` 是整份组合计划（改动工具只读它自己的参数与目标），`command` 是
-/// [`ApprovedPlan::then_run`] 换出来的第二步。取消与"结果不明"原样往上抛：前者要停下这一轮，
-/// 后者要交给人——它们不是"命令失败了"。
+/// `mutation` 是整份组合计划（改动工具只读它自己的参数与目标），命令是它的
+/// `then_run` 那一步。取消与"结果不明"原样往上抛：前者要停下这一轮，后者要交给人——它们
+/// 不是"命令失败了"。
 pub async fn execute_fused(
     mutator: &dyn Tool,
-    mutation: ApprovedPlan,
+    mutation: ExecutionPlan,
     shell: &dyn Tool,
-    command: ApprovedPlan,
     ctx: &ToolContext,
     sink: &mut dyn OutputWriter,
 ) -> Result<ToolOutput, ToolError> {
-    let target = target_path(mutation.plan())?;
+    let Some(command) = mutation.then_run.as_deref().cloned() else {
+        return Err(ToolError::Failed {
+            message: "组合调用没有 then_run 那一步".into(),
+        });
+    };
+    let target = target_path(&mutation)?;
 
     let mutated = match mutator.execute(mutation, ctx, sink).await {
         Ok(output) if output.status == ToolResultStatus::Completed => output,
@@ -294,12 +298,6 @@ mod tests {
     use async_trait::async_trait;
     use komo_kernel::types::tool::ToolDefinition;
 
-    fn approve(plan: ExecutionPlan) -> (ApprovedPlan, ApprovedPlan) {
-        let approved = ApprovedPlan::new(plan, komo_kernel::test_support::proof());
-        let command = approved.then_run().expect("组合计划有第二步");
-        (approved, command)
-    }
-
     fn edit_args(command: &str) -> serde_json::Value {
         serde_json::json!({
             "path": "a.txt",
@@ -373,19 +371,11 @@ mod tests {
             .unwrap();
         // 计划之后、执行之前文件被人改了：改动按版本冲突失败。
         std::fs::write(dir.path().join("a.txt"), "someone else\n").unwrap();
-        let (mutation, command) = approve(plan);
         let mut sink = writer(&ctx);
 
-        let output = execute_fused(
-            &EditTool::new(),
-            mutation,
-            &ShellTool::new(),
-            command,
-            &ctx,
-            &mut sink,
-        )
-        .await
-        .unwrap();
+        let output = execute_fused(&EditTool::new(), plan, &ShellTool::new(), &ctx, &mut sink)
+            .await
+            .unwrap();
 
         assert_eq!(output.status, ToolResultStatus::Failed);
         assert!(!marker.exists(), "改动失败，命令不该跑");
@@ -416,11 +406,11 @@ mod tests {
 
         async fn execute(
             &self,
-            plan: ApprovedPlan,
+            plan: ExecutionPlan,
             ctx: &ToolContext,
             sink: &mut dyn OutputWriter,
         ) -> Result<ToolOutput, ToolError> {
-            let path = target_path(plan.plan())?;
+            let path = target_path(&plan)?;
             let output = EditTool::new().execute(plan, ctx, sink).await?;
             std::fs::write(&path, "meddled\n").unwrap();
             Ok(output)
@@ -437,13 +427,11 @@ mod tests {
             .prepare(edit_args(&format!("touch {}", marker.display())), &ctx)
             .await
             .unwrap();
-        let (mutation, command) = approve(plan);
 
         let output = execute_fused(
             &MeddledEdit,
-            mutation,
+            plan,
             &ShellTool::new(),
-            command,
             &ctx,
             &mut writer(&ctx),
         )
@@ -469,19 +457,11 @@ mod tests {
             .prepare(edit_args("echo boom >&2; exit 3"), &ctx)
             .await
             .unwrap();
-        let (mutation, command) = approve(plan);
         let mut sink = writer(&ctx);
 
-        let output = execute_fused(
-            &EditTool::new(),
-            mutation,
-            &ShellTool::new(),
-            command,
-            &ctx,
-            &mut sink,
-        )
-        .await
-        .unwrap();
+        let output = execute_fused(&EditTool::new(), plan, &ShellTool::new(), &ctx, &mut sink)
+            .await
+            .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
@@ -512,19 +492,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let (mutation, command) = approve(plan);
         let mut sink = writer(&ctx);
 
-        let output = execute_fused(
-            &WriteTool::new(),
-            mutation,
-            &ShellTool::new(),
-            command,
-            &ctx,
-            &mut sink,
-        )
-        .await
-        .unwrap();
+        let output = execute_fused(&WriteTool::new(), plan, &ShellTool::new(), &ctx, &mut sink)
+            .await
+            .unwrap();
 
         assert_eq!(output.status, ToolResultStatus::Completed);
         assert_eq!(output.exit_code, Some(0));

@@ -5,9 +5,7 @@ use time::OffsetDateTime;
 
 use super::chat::ChannelPeer;
 use super::digest::ContentHash;
-use super::ids::{
-    ApprovalId, EventId, GrantId, MemoryId, RequestKey, RunId, Seq, SessionId, ToolCallId,
-};
+use super::ids::{EventId, MemoryId, RequestKey, RunId, Seq, SessionId, ToolCallId};
 use super::model::{ModelConfig, TokenUsage};
 use super::plan::{ExecutionPlan, PlanSource};
 use super::refs::PayloadRef;
@@ -218,8 +216,8 @@ pub struct AcceptInput {
     /// **受理这一刻冻结下来的身份与能力**（§4.3）：哪个 Agent、哪一版 Profile、哪个模型、
     /// 哪个工作目录、这次允许调用的工具、指向身份指令正文的引用、记忆作用域。
     ///
-    /// 由受理方算好交下来，随 `run.accepted` 一起落账——**恢复时按它装配**：审批可能一小时
-    /// 之后才答复，而那时 Profile、工作目录与磁盘上的文件都可能已经改过，恢复出来的 Run
+    /// 由受理方算好交下来，随 `run.accepted` 一起落账——**恢复时按它装配**：一条 Run 可能停
+    /// 一小时才续跑，而那时 Profile、工作目录与磁盘上的文件都可能已经改过，恢复出来的 Run
     /// 不能因此换一副面孔。
     ///
     /// `None` = 这一条没有归属（旧行、Cron、子 Run 由父侧继承）：装配时按**当前**配置的
@@ -254,43 +252,6 @@ pub struct Accepted {
     /// 这次是不是命中了同一请求键的原 Run（重发）。
     #[serde(default)]
     pub deduplicated: bool,
-}
-
-/// `Ledger::start_call` 的授权消费记录：首次授权消费与 `tool.started` 在同一事务里
-/// 提交（§7.4）。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GrantUse {
-    pub approval: ApprovalId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant: Option<GrantId>,
-}
-
-/// 一次执行消费的授权，**按步**记（§7.4）。
-///
-/// 普通计划只有 `plan`。组合计划（`then_run`）合并授权时也只有 `plan`；两步各凭各的
-/// 授权放行时，命令那一步的记在 `then_run`——每条真正用到的授权都进账本。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GrantUses {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub plan: Option<GrantUse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub then_run: Option<GrantUse>,
-}
-
-impl From<Option<GrantUse>> for GrantUses {
-    fn from(plan: Option<GrantUse>) -> Self {
-        Self {
-            plan,
-            then_run: None,
-        }
-    }
-}
-
-impl GrantUses {
-    /// 用到的每一条，按步。
-    pub fn iter(&self) -> impl Iterator<Item = &GrantUse> {
-        self.plan.iter().chain(self.then_run.iter())
-    }
 }
 
 /// `Ledger::read` 的返回：**一页**事件。

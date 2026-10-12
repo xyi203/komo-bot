@@ -20,13 +20,10 @@ use komo_kernel::protocol::InboundMessage;
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, PeerId};
 use komo_kernel::types::ids::RequestKey;
 
-use crate::render::feishu;
-
 /// 去重键：`feishu:{event_id}`。
 ///
-/// 消息事件与卡片回调**共用**这一个字段（`header.event_id`）：官方对 2.0 事件的去重
-/// 建议就是"通过事件结构中的 `event_id` 字段判断事件唯一性"，而卡片回调的 header 里
-/// 那个 `event_id` 的定义正是"回调的唯一标识"（§11.1、spike callbacks.md 1a/1d）。
+/// 官方对 2.0 事件的去重建议就是"通过事件结构中的 `event_id` 字段判断事件唯一性"
+/// （§11.1）。
 pub fn request_key(event_id: &str) -> RequestKey {
     RequestKey::new(format!("feishu:{event_id}"))
 }
@@ -39,13 +36,14 @@ pub struct ParsedEvent {
     pub kind: EventKind,
 }
 
-/// komo 认识的两种事件。**别的类型一律不解析**——订阅里多出来的东西不该变成一条消息。
+/// komo 认识的事件。**别的类型一律不解析**——订阅里多出来的东西不该变成一条消息。
+///
+/// `card.action.trigger`（卡片按钮）随审批卡片一起删掉了（§7，2026-10-11）：komo 发出去
+/// 的卡片上没有按钮，平台还推来的回调落进"不处理这个事件类型"。
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventKind {
     /// `im.message.receive_v1`
     Message(MessageEvent),
-    /// `card.action.trigger`：审批卡片上的按钮。
-    CardAction(CardActionEvent),
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -114,37 +112,6 @@ pub struct MentionId {
     pub open_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-pub struct CardActionEvent {
-    #[serde(default)]
-    pub operator: Operator,
-    #[serde(default)]
-    pub action: CardAction,
-    #[serde(default)]
-    pub context: CardContext,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-pub struct Operator {
-    #[serde(default)]
-    pub open_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-pub struct CardAction {
-    /// 按钮上挂的那份 JSON。对象或字符串，两种都收（见 `render::feishu`）。
-    #[serde(default)]
-    pub value: Value,
-}
-
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-pub struct CardContext {
-    #[serde(default)]
-    pub open_chat_id: String,
-    #[serde(default)]
-    pub open_message_id: String,
-}
-
 /// 原始负载 → 一条认识的事件。认不出返回 `None`。
 pub fn parse(payload: &[u8]) -> Option<ParsedEvent> {
     #[derive(Deserialize)]
@@ -177,9 +144,6 @@ pub fn parse(payload: &[u8]) -> Option<ParsedEvent> {
     let kind = match envelope.header.event_type.as_str() {
         "im.message.receive_v1" => {
             EventKind::Message(decode(envelope.event, "im.message.receive_v1")?)
-        }
-        "card.action.trigger" => {
-            EventKind::CardAction(decode(envelope.event, "card.action.trigger")?)
         }
         other => {
             tracing::debug!(event_type = other, "飞书：不处理这个事件类型");
@@ -226,32 +190,6 @@ pub fn from_message(
         return None;
     }
 
-    Some(InboundMessage {
-        peer: peer_of(chat_id),
-        is_private,
-        sender: PeerId::new(sender),
-        text,
-        request_key,
-    })
-}
-
-/// 一次按钮回调。
-///
-/// 负载只用来**定位**：它被映射回那条文本命令，批准与否仍由 Dispatcher 核对 Principal
-/// 后决定（§11.3）。认不出的负载返回 `None`——不编一条命令出来。
-///
-/// `is_private` 不在载荷里（回调只给 `open_chat_id`），由调用方查出来后传进来。
-pub fn from_card_action(
-    event: &CardActionEvent,
-    is_private: bool,
-    request_key: RequestKey,
-) -> Option<InboundMessage> {
-    let text = feishu::command_for_action(&event.action.value)?;
-    let sender = event.operator.open_id.trim();
-    let chat_id = event.context.open_chat_id.trim();
-    if sender.is_empty() || chat_id.is_empty() {
-        return None;
-    }
     Some(InboundMessage {
         peer: peer_of(chat_id),
         is_private,
@@ -349,9 +287,7 @@ mod tests {
         let payload = text_event("evt-1", "oc_1", "p2p", "ou_op", "在吗", &[]);
         let parsed = parse(&payload).expect("认得出");
         assert_eq!(parsed.event_id, "evt-1");
-        let EventKind::Message(event) = parsed.kind else {
-            panic!("应当是消息事件");
-        };
+        let EventKind::Message(event) = parsed.kind;
         assert!(event.message.is_private());
         assert_eq!(event.message.chat_id, "oc_1");
         assert_eq!(event.message.message_id, "om_evt-1");
@@ -509,52 +445,9 @@ mod tests {
         assert!(from_message(&bad_content, BOT_OPEN_ID, request_key("evt-13")).is_none());
     }
 
-    // ② card.action.trigger 转成 /approve <id>。
+    /// 卡片按钮随审批一起删掉了（§7）：平台推来的 `card.action.trigger` 不再是一条消息。
     #[test]
-    fn a_button_press_becomes_the_same_command_a_message_would() {
-        let payload = card_action_event("evt-20", "oc_1", "ou_op", "approve", "7K2M");
-        let parsed = parse(&payload).expect("认得出");
-        assert_eq!(parsed.event_id, "evt-20");
-        let EventKind::CardAction(event) = parsed.kind else {
-            panic!("应当是卡片回调");
-        };
-        let inbound = from_card_action(&event, true, request_key(&parsed.event_id)).expect("回调");
-        assert_eq!(inbound.text, "/approve 7K2M");
-        assert_eq!(inbound.request_key.as_str(), "feishu:evt-20");
-        assert_eq!(inbound.peer.to_string(), "feishu:oc_1");
-        assert_eq!(inbound.sender.as_str(), "ou_op");
-        assert!(inbound.is_private);
-    }
-
-    #[test]
-    fn a_reject_button_becomes_the_reject_command() {
-        let payload = card_action_event("evt-21", "oc_g", "ou_op", "reject", "7K2M");
-        let EventKind::CardAction(event) = parse(&payload).unwrap().kind else {
-            panic!()
-        };
-        let inbound = from_card_action(&event, false, request_key("evt-21")).unwrap();
-        assert_eq!(inbound.text, "/reject 7K2M");
-        assert!(!inbound.is_private);
-    }
-
-    #[test]
-    fn a_callback_with_an_unknown_payload_or_no_chat_goes_nowhere() {
-        let mut event = CardActionEvent {
-            operator: Operator {
-                open_id: "ou_op".into(),
-            },
-            action: CardAction {
-                value: serde_json::json!({ "action": "drop", "short_id": "7K2M" }),
-            },
-            context: CardContext {
-                open_chat_id: "oc_1".into(),
-                open_message_id: "om_1".into(),
-            },
-        };
-        assert!(from_card_action(&event, true, request_key("evt-22")).is_none());
-
-        event.action.value = serde_json::json!({ "action": "approve", "short_id": "7K2M" });
-        event.context.open_chat_id = String::new();
-        assert!(from_card_action(&event, true, request_key("evt-23")).is_none());
+    fn a_card_callback_is_no_longer_an_event_we_handle() {
+        assert_eq!(parse(&card_action_event("evt-20", "oc_1", "ou_op")), None);
     }
 }

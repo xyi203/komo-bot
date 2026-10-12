@@ -14,7 +14,7 @@ pub fn write(path: &Path, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-/// 一个真实的数据目录：config.toml + .env + policy.toml。
+/// 一个真实的数据目录：config.toml + .env。
 pub struct Fixture {
     home: tempfile::TempDir,
 }
@@ -25,15 +25,7 @@ impl Fixture {
         let sources = Sources::under(home.path());
         write(&sources.config, &Self::config_text("chat-a", "medium"));
         write(&sources.env, &Self::env_text());
-        write(&sources.policy, Self::POLICY_TEXT);
         Fixture { home }
-    }
-
-    /// 只有 config.toml 与 .env，没有 policy.toml——这时用 §7.1 的初始建议。
-    pub fn without_policy() -> Self {
-        let fixture = Self::valid();
-        std::fs::remove_file(&fixture.sources().policy).unwrap();
-        fixture
     }
 
     pub fn path(&self) -> &Path {
@@ -116,30 +108,6 @@ home_chat = "oc_home"
              FEISHU_APP_SECRET={SECRET_VALUE}-feishu\n"
         )
     }
-
-    pub const POLICY_TEXT: &'static str = r#"
-default = "ask"
-
-[[rules]]
-id = "deny-policy-change"
-effect = "deny"
-reason = "权限扩大只能走操作者的配置流程"
-
-[rules.matcher]
-operations = ["policy_change"]
-
-[[rules]]
-id = "allow-read-in-roots"
-effect = "allow"
-reason = "已授权范围内读取普通文件"
-
-[rules.matcher]
-operations = ["read_file"]
-
-[rules.matcher.paths]
-kind = "within_roots"
-writable = false
-"#;
 }
 
 /// 跨 crate 的测试替身按 §13.4 住在 kernel 的 `test-support` 里（`komo-agent` 的测试也

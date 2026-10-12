@@ -99,10 +99,6 @@ id_type!(
     AttemptId
 );
 id_type!(
-    /// 一条审批请求。短 ID 另见 [`ShortId`]。
-    ApprovalId
-);
-id_type!(
     /// 一条主动投递记录（§11.4），补发按它幂等。
     DeliveryId
 );
@@ -115,12 +111,8 @@ id_type!(
     MemoryId
 );
 id_type!(
-    /// 一次被审核的操作（§7.1 的 `operation_id`）。
+    /// 一次操作（计划的 `operation_id`，§7.2）。
     OperationId
-);
-id_type!(
-    /// 一条已生效的范围授权（`policy_grants`）。
-    GrantId
 );
 id_type!(
     /// 一个执行者实例；领取代次绑定它（§8.7）。
@@ -129,9 +121,8 @@ id_type!(
 
 /// 一条 Intervention 的 id（§7.5）。
 ///
-/// **它不是一个新实体的主键**：清单是派生视图（`runs` 与 `approval_requests` 的并集
-/// 查询，§7.5 第 1 条），这个 id 就是"用哪个句柄去答复"——审批类用短 ID（§11.3），
-/// 另外两类用 Run ID。它存在只是为了让 `runs.wait_ref` 有一个可查的值，而不是又造
+/// **它不是一个新实体的主键**：清单是派生视图（`runs` 上的查询，§7.5 第 1 条），这个
+/// id 就是"用哪个句柄去答复"——`verify` 与 `blocked` 都用 Run ID。它存在只是为了让 `runs.wait_ref` 有一个可查的值，而不是又造
 /// 一张会与权威漂移的表。
 ///
 /// 它不是 UUID，所以没有 `new_at`：值由已有的事实派生出来。
@@ -173,47 +164,6 @@ impl FromStr for InterventionId {
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         Ok(Self::from_raw(raw))
-    }
-}
-
-/// 待处理集合内唯一的 4 位 base32 短 ID，聊天里用它答复审批（§11.3）。
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ShortId(String);
-
-impl ShortId {
-    /// Crockford base32 的字母表，去掉了容易混淆的 I / L / O / U。
-    const ALPHABET: &'static [u8] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
-
-    /// 由一个 20 位整数渲染出 4 位短 ID。调用方负责在待处理集合内保证唯一。
-    pub fn from_index(index: u32) -> Self {
-        let mut out = [0u8; 4];
-        let mut value = index;
-        for slot in out.iter_mut().rev() {
-            *slot = Self::ALPHABET[(value % 32) as usize];
-            value /= 32;
-        }
-        Self(String::from_utf8(out.to_vec()).expect("字母表是 ASCII"))
-    }
-
-    /// 规范化用户输入（大写、去空白）后包装。
-    pub fn parse(raw: &str) -> Option<Self> {
-        let normalized: String = raw.trim().to_ascii_uppercase();
-        if normalized.len() == 4 && normalized.bytes().all(|b| Self::ALPHABET.contains(&b)) {
-            Some(Self(normalized))
-        } else {
-            None
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ShortId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
     }
 }
 
@@ -315,15 +265,5 @@ mod tests {
     #[test]
     fn parse_rejects_a_non_uuid() {
         assert!(SessionId::parse("not-a-uuid").is_err());
-    }
-
-    #[test]
-    fn short_id_is_four_base32_characters() {
-        assert_eq!(ShortId::from_index(0).as_str(), "0000");
-        assert_eq!(ShortId::from_index(1).as_str(), "0001");
-        assert_eq!(ShortId::from_index(32).as_str(), "0010");
-        assert_eq!(ShortId::parse(" 7k2m ").unwrap().as_str(), "7K2M");
-        assert!(ShortId::parse("7K2").is_none());
-        assert!(ShortId::parse("7K2I").is_none(), "I 不在字母表里");
     }
 }

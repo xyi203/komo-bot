@@ -21,12 +21,12 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 pub use views::{
-    ApprovalView, CompactionView, FoldViolation, RunView, SurfaceMessage, SurfaceToolResult,
-    ToolCallView, UnknownEvent,
+    CompactionView, FoldViolation, RunView, SurfaceMessage, SurfaceToolResult, ToolCallView,
+    UnknownEvent,
 };
 
 use crate::events::{ContextCompacted, Event, EventPayload};
-use crate::types::ids::{ApprovalId, RunId, Seq, SessionId, ToolCallId};
+use crate::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use crate::types::status::{RunState, ToolCallState};
 use crate::types::turn::Role;
 
@@ -51,9 +51,6 @@ pub struct Surface {
     pub runs: BTreeMap<RunId, RunView>,
     #[serde(default)]
     pub calls: BTreeMap<ToolCallId, ToolCallView>,
-    /// 还没有决定的审批。
-    #[serde(default)]
-    pub pending_approvals: BTreeMap<ApprovalId, ApprovalView>,
     #[serde(default)]
     pub unknown: Vec<UnknownEvent>,
     #[serde(default)]
@@ -299,24 +296,6 @@ impl Surface {
                     },
                 );
             }
-            EventPayload::ApprovalRequested(body) => {
-                self.pending_approvals.insert(
-                    body.approval.clone(),
-                    ApprovalView {
-                        approval: body.approval.clone(),
-                        short_id: body.short_id.clone(),
-                        plan_hash: body.plan_hash.clone(),
-                        call: body.call_id.clone(),
-                        run: event.run.clone(),
-                        reason: body.reason.clone(),
-                        requested_seq: event.seq,
-                    },
-                );
-            }
-            EventPayload::ApprovalDecided(body) => {
-                // 审计副本：它只说明这条不再待处理，**不创建授权**（§7.4）。
-                self.pending_approvals.remove(&body.approval);
-            }
             // 压缩不动消息面：日志里被摘要覆盖的那些行照旧在 `messages` 里，回放读到
             // `compaction` 才换（§8.3）。最新的一次生效；`skipped` 什么都不改。
             EventPayload::ContextCompacted(ContextCompacted::Compacted {
@@ -500,7 +479,7 @@ mod tests {
         RunCompleted, RunQueued, RunStarted, ToolPlanned, ToolResult, ToolStarted,
     };
     use crate::types::digest::ContentHash;
-    use crate::types::ids::{AttemptId, EventId, ExecutorId, RequestKey, ShortId};
+    use crate::types::ids::{AttemptId, EventId, ExecutorId, RequestKey};
     use crate::types::plan::PlanHash;
     use crate::types::plan::PlanSource;
     use crate::types::refs::{ContentRef, OutputRef, ToolResultStatus};
@@ -604,8 +583,6 @@ mod tests {
                     attempt_id: AttemptId::from_raw("attempt-1"),
                     plan_ref: EventId::from_raw("evt-5"),
                     plan_hash: PlanHash::from_raw("h1"),
-                    grant: None,
-                    then_run_grant: None,
                 }),
             ),
             event(
@@ -824,43 +801,28 @@ mod tests {
         );
     }
 
+    /// 审批删掉之后，旧会话里的 `approval.*` 行读成 Unknown：进 `unknown`，别的什么都
+    /// 不动（§8.3）。
     #[test]
-    fn a_pending_approval_disappears_when_it_is_decided() {
-        use crate::events::{ApprovalDecided, ApprovalRequested};
-        use crate::types::chat::ApprovalScope;
-
-        let mut events = vec![
+    fn an_old_approval_line_is_kept_as_unknown_and_means_nothing() {
+        let old = r#"{"v":1,"seq":2,"event_id":"evt-2","session_id":"sess-1","run_id":"run-1","at":"2026-09-15T08:00:02Z","type":"approval.requested","data":{"approval":"ap-1","short_id":"0007","plan_hash":"h1","call_id":"call-1","reason":"任意 shell","scopes":["once"]}}"#;
+        let decided = r#"{"v":1,"seq":3,"event_id":"evt-3","session_id":"sess-1","run_id":"run-1","at":"2026-09-15T08:05:00Z","type":"approval.decided","data":{"approval":"ap-1","approved":true,"scope":"once","decided_at":"2026-09-15T08:05:00Z"}}"#;
+        let events = vec![
             accepted(1, "run-1", "删掉那个目录"),
-            event(
-                2,
-                Some("run-1"),
-                EventPayload::ApprovalRequested(ApprovalRequested {
-                    approval: ApprovalId::from_raw("ap-1"),
-                    short_id: ShortId::from_index(7),
-                    plan_hash: PlanHash::from_raw("h1"),
-                    call_id: Some(ToolCallId::from_raw("call-1")),
-                    reason: "任意 shell".into(),
-                    scopes: vec![ApprovalScope::Once],
-                }),
-            ),
+            Event::from_line(old).unwrap(),
+            Event::from_line(decided).unwrap(),
         ];
         let surface = fold(&events);
-        assert_eq!(surface.pending_approvals.len(), 1);
-
-        events.push(event(
-            3,
-            Some("run-1"),
-            EventPayload::ApprovalDecided(ApprovalDecided {
-                approval: ApprovalId::from_raw("ap-1"),
-                approved: true,
-                scope: ApprovalScope::Once,
-                by: None,
-                decided_at: datetime!(2026-09-15 08:05:00 UTC),
-                grant: None,
-            }),
-        ));
-        let surface = fold(&events);
-        assert!(surface.pending_approvals.is_empty());
+        assert_eq!(surface.applied_seq, Seq(3), "seq 照样连续");
+        assert_eq!(surface.unknown.len(), 2);
+        assert_eq!(surface.unknown[0].event_type, "approval.requested");
+        assert_eq!(surface.messages.len(), 1, "消息面不受影响");
+        assert!(surface.calls.is_empty(), "不凭审计行造调用");
+        assert!(surface.violations.is_empty());
+        let run = &surface.runs[&RunId::from_raw("run-1")];
+        assert_eq!(run.status, RunState::Accepted, "Run 的状态不受影响");
+        assert_eq!(run.wait, None, "不凭审计行造一个等待");
+        assert!(run.calls.is_empty());
     }
 
     #[test]
@@ -1019,8 +981,6 @@ mod tests {
                         attempt_id: AttemptId::from_raw("attempt-1"),
                         plan_ref: EventId::from_raw("evt-0"),
                         plan_hash: PlanHash::from_raw("h"),
-                        grant: None,
-                        then_run_grant: None,
                     }),
                     6 => EventPayload::ToolResult(ToolResult {
                         call_id: ToolCallId::from_raw(format!("call-{}", rng.below(3))),

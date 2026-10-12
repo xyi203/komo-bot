@@ -4,14 +4,10 @@ use komo_kernel::events::{
     EVENT_FORMAT_VERSION, Event, EventPayload, MessageAssistant, RunAccepted, RunCompleted,
     RunQueued, RunStarted, ToolPlanned, ToolResult, ToolStarted,
 };
-use komo_kernel::protocol::http::{
-    ApprovalRecord, EventPage, InterventionKind, InterventionSummary,
-};
-use komo_kernel::types::chat::ApprovalScope;
+use komo_kernel::protocol::http::{EventPage, InterventionKind, InterventionSummary};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{
-    ApprovalId, AttemptId, EventId, ExecutorId, OperationId, RequestKey, RunId, Seq, SessionId,
-    ShortId, ToolCallId,
+    AttemptId, EventId, ExecutorId, OperationId, RequestKey, RunId, Seq, SessionId, ToolCallId,
 };
 use komo_kernel::types::model::{Effort, EffortSetting};
 use komo_kernel::types::plan::{
@@ -121,8 +117,6 @@ pub fn conversation() -> Vec<Event> {
                 attempt_id: AttemptId::from_raw("attempt-1"),
                 plan_ref: EventId::from_raw("evt-5"),
                 plan_hash: plan().plan_hash(),
-                grant: None,
-                then_run_grant: None,
             }),
         ),
         event(
@@ -226,56 +220,5 @@ pub fn intervention_summary(
         question: question.to_string(),
         verdicts: kind.verdicts(),
         created_at: T0,
-    }
-}
-
-/// 一条组合计划（`then_run`）的审批：改 `app.txt`，改完跑 `command`；Policy 只给"本次"。
-pub fn fused_approval_record(command: &str) -> ApprovalRecord {
-    let then_run = ExecutionPlan {
-        operation: Operation::ShellCommand {
-            command: command.into(),
-        },
-        args: serde_json::json!({ "command": command }),
-        targets: vec![],
-        versions: PlanVersions::default(),
-        ..plan()
-    };
-    let plan = ExecutionPlan {
-        tool: "edit".into(),
-        operation: Operation::WriteFile,
-        args: serde_json::json!({ "path": "app.txt" }),
-        targets: vec![PlanTarget::local(
-            "/home/u/project/app.txt",
-            TargetAccess::Write,
-        )],
-        versions: PlanVersions::default(),
-        then_run: Some(Box::new(then_run)),
-        ..plan()
-    };
-    ApprovalRecord {
-        plan_hash: plan.plan_hash(),
-        plan,
-        changes: Some("--- a/app.txt\n+++ b/app.txt\n-version = 1\n+version = 2".into()),
-        scopes: vec![ApprovalScope::Once],
-        ..approval_record()
-    }
-}
-
-pub fn approval_record() -> ApprovalRecord {
-    ApprovalRecord {
-        approval: ApprovalId::from_raw("appr-1"),
-        short_id: ShortId::parse("7K2M").unwrap(),
-        session: session(),
-        run: Some(run()),
-        call: Some(call()),
-        plan_hash: plan().plan_hash(),
-        plan: plan(),
-        reason: "命中 shell 规则：任意代码需要人看一眼".into(),
-        changes: Some("--- a/build.rs\n+++ b/build.rs\n@@ -1 +1 @@\n-老的一行\n+新的一行".into()),
-        evidence: Some("候选模块测试：3 passed".into()),
-        scopes: vec![ApprovalScope::Once, ApprovalScope::Run],
-        requested_at: T0,
-        valid_until: None,
-        decision: None,
     }
 }

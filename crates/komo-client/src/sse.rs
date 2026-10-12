@@ -64,7 +64,16 @@ pub enum SseMessage {
         id: Seq,
         reason: String,
     },
+    /// 旧 Gateway 还会推的**退役**帧（[`RETIRED_EVENTS`]）。游标照走，内容不必解释，也不必
+    /// 提示——它不是"两端格式对不上"，而是这一种帧已经没有意义了。
+    Retired {
+        id: Seq,
+    },
 }
+
+/// 已经退役的 SSE `event:` 名。2026-10-11 审批删除时去掉了 `approval_pending` /
+/// `approval_decided`；新客户端连旧 Gateway 时还会收到它们，安静地跳过。
+pub const RETIRED_EVENTS: &[&str] = &["approval_pending", "approval_decided"];
 
 impl SseMessage {
     /// 这一帧把游标推到哪里。
@@ -72,6 +81,7 @@ impl SseMessage {
         match self {
             SseMessage::Frame(frame) => frame.id,
             SseMessage::Skipped { id, .. } => *id,
+            SseMessage::Retired { id } => *id,
         }
     }
 }
@@ -386,6 +396,12 @@ impl FrameParser {
                 // 读不懂就跳过，**但游标要走**。没有 `id:` 行就真的什么也做不了：
                 // 那一帧既不能解释也不能定位，只能丢掉。
                 let id = id?;
+                if event
+                    .as_deref()
+                    .is_some_and(|name| RETIRED_EVENTS.contains(&name))
+                {
+                    return Some(SseMessage::Retired { id: Seq(id) });
+                }
                 Some(SseMessage::Skipped {
                     id: Seq(id),
                     reason: match event {
@@ -472,6 +488,25 @@ mod tests {
         assert!(matches!(out[0], SseMessage::Skipped { id: Seq(12), .. }));
         // 游标照常前进——不然重连会把这一帧再取一遍，永远卡在这里。
         assert_eq!(out[0].cursor(), Seq(12));
+    }
+
+    /// 旧 Gateway 的审批帧（2026-10-11 删除）：游标照走，但不算"读不懂"——界面不该为它
+    /// 提示一句"格式对不上"。
+    #[test]
+    fn a_retired_approval_frame_from_an_old_gateway_is_dropped_quietly() {
+        let mut parser = FrameParser::default();
+        let out = parser.push(
+            b"id: 21\nevent: approval_pending\ndata: {\"id\":21,\"session\":\"s\",\"event\":\"approval_pending\",\"data\":{\"approval\":\"appr-1\"}}\n\n\
+              id: 22\nevent: approval_decided\ndata: {\"id\":22,\"session\":\"s\",\"event\":\"approval_decided\",\"data\":{\"approval\":\"appr-1\",\"approved\":true}}\n\n",
+        );
+        assert_eq!(
+            out,
+            vec![
+                SseMessage::Retired { id: Seq(21) },
+                SseMessage::Retired { id: Seq(22) }
+            ]
+        );
+        assert_eq!(out[1].cursor(), Seq(22));
     }
 
     #[test]

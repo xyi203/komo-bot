@@ -1,8 +1,8 @@
 //! `/model` 的选择菜单：`↑` / `↓` 移动高亮、`Enter` 选定、`Esc` 不改。
 //!
 //! 清单是 `/model` 那一下**去问来的**那一份（`GET /v1/models`），打开时抄一份进来：
-//! 人正在挑的时候清单在底下换了，高亮就会悄悄指到另一个模型上。行首的数字是直通键，
-//! 和审批菜单行首的字母一个意思——知道自己要第几个的人不必先移动高亮。
+//! 人正在挑的时候清单在底下换了，高亮就会悄悄指到另一个模型上。行首的数字是直通键
+//! ——知道自己要第几个的人不必先移动高亮。
 
 use komo_kernel::protocol::http::ModelMenuEntry;
 
@@ -25,7 +25,7 @@ impl ModelPicker {
         ModelPicker { entries, selected }
     }
 
-    /// 移动高亮。到两头就停住，**不绕回去**（与审批菜单同一条规矩）。
+    /// 移动高亮。到两头就停住，**不绕回去**（想停在最后一行时多按一下不该跳回第一行）。
     pub fn move_selection(&mut self, delta: i16) {
         let moved = if delta < 0 {
             self.selected.saturating_sub(delta.unsigned_abs() as usize)

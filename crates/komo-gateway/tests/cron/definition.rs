@@ -202,9 +202,7 @@ async fn a_six_field_expression_is_refused_rather_than_read_as_seconds() {
     gw.stop().await;
 }
 
-/// **改定义 → 版本 +1（授权失效）；`pause` / `resume` 不动版本**（§7.2 / §10）。
-///
-/// 混成一条路的代价是具体的：操作者每暂停一次就要把这个 Job 的授权重批一遍。
+/// **改定义 → 版本 +1；`pause` / `resume` 不动版本**（§10）：暂停一个 Job 不是改它的定义。
 #[tokio::test]
 async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
     let home = Home::new();
@@ -237,7 +235,7 @@ async fn changing_the_definition_bumps_the_version_but_pausing_does_not() {
     assert_eq!(resumed.version, 1, "恢复也不是");
     assert!(resumed.next_run_at.is_some(), "恢复之后重新算上了槽位");
 
-    // 改 prompt：这是定义变更，绑定这个 Job 的授权在这一刻失效。
+    // 改 prompt：这是定义变更。
     let (_, body) = gw
         .patch(
             &format!("/v1/cron/{}", job.id),
@@ -418,8 +416,7 @@ async fn removing_a_job_keeps_its_firings() {
 #[tokio::test]
 async fn a_job_runs_on_its_own_round_budget() {
     let home = Home::new();
-    // 根内读取是 Allow（§7.1 第一行），所以这一串调用不会停在审批上——停住它的只能
-    // 是预算。
+    // 没有 Policy（§7），这一串调用不会停在任何人身上——停住它的只能是预算。
     //
     // 先放一份文件进去：数据目录里已经有东西，这个目录当然也在（Gateway 起过一次就有
     // 它了，§12 的骨架）。

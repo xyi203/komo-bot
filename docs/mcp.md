@@ -6,8 +6,8 @@
 ## 1. 形状
 
 MCP 服务器是**操作者接进来的工具来源**，不是第七个基础工具。每个 MCP 工具注册成一个普通的
-`Tool`（`komo-runtime/src/tools/mcp.rs`），与内置工具走同一条路：`prepare` 出计划 → Policy /
-审批 → `start_call` → 执行 → 落账。没有第二条执行路径。
+`Tool`（`komo-runtime/src/tools/mcp.rs`），与内置工具走同一条路：`prepare` 出计划 → 能力面核对 →
+`start_call` → 执行 → 落账（2026-10-11 起没有 Policy 与审批，见 `docs/komo_bot.md` §7）。没有第二条执行路径。
 
 ```text
 config.toml [mcp.servers.<name>]
@@ -43,17 +43,17 @@ tools            = ["lookup"]          # 白名单；省略 = 服务器列出的
 - 校验：服务器名只能是字母、数字、`_`、`-`（它要进工具名）；`read_only` 写了 `tools` 白名单
   之外的名字是警告。
 
-## 3. Policy 与恢复
+## 3. 只读与恢复
 
 计划是 `Operation::McpCall { server, tool, read_only }`。`read_only` 来自**操作者**的
-`read_only` 列表，不信服务器自报的 `readOnlyHint`（§7.1：自称安全的东西不进 Policy）。
+`read_only` 列表，不信服务器自报的 `readOnlyHint`：自称安全的东西决定不了恢复方式，也进不了
+codemode。调用一律执行（2026-10-11 起没有 Policy 与审批，原来 strict 下的 `mcp-call` Ask 与
+`policy.toml` 里的按工具免问一并删掉）；`read_only` 只决定两件事：
 
-| | strict | auto | 恢复 |
-|---|---|---|---|
-| `read_only` 里的工具（`OperationMatch::McpRead`） | Allow（`mcp-read`） | Allow | `SafeReread`：中断后重读 |
-| 其余（`OperationMatch::McpCall`） | Ask（`mcp-call`），卡片上是服务器、工具与完整参数 | Allow | `NoSafeRecovery`：中断后停下问人 |
-
-单个工具要免问，在 `policy.toml` 按工具名写一条：`tools = ["mcp__github__create_issue"]`。
+| | 恢复 | codemode 内层 |
+|---|---|---|
+| `read_only` 里的工具 | `SafeReread`：中断后重读 | 可调 |
+| 其余 | `NoSafeRecovery`：中断后停下问人（`verify` 介入） | 不可调 |
 
 调用失败：只读工具当普通失败；其余工具在传输层断掉时报"结果不明"（`ToolError::Uncertain`）
 ——请求可能已经到了服务器。超时由执行器的 `call_timeout` 兜底。
@@ -77,8 +77,9 @@ tools            = ["lookup"]          # 白名单；省略 = 服务器列出的
 ## 6. 验收
 
 - `komo-gateway/tests/mcp`（真 Gateway + `tests/mcp/server.py` 这个真 stdio 服务器）：
-  只读工具不问人、子进程只拿到声明的变量；有副作用的工具批了才执行、只执行一次；起不来的
+  子进程只拿到声明的变量；有副作用的工具只执行一次；起不来的
   服务器不影响别的。
 - `komo-runtime`：`mcp::tests`（命名、白名单）、`config::tests`（解析、`command`/`url` 互斥）、
   `config::validate::tests`（服务器名、`read_only` 越界）。
-- `komo-kernel`：`policy::defaults::tests::mcp_reads_pass_and_other_mcp_calls_ask_under_strict`。
+- （`komo-kernel` 的 `policy::defaults::tests::mcp_reads_pass_and_other_mcp_calls_ask_under_strict`
+  随 Policy 于 2026-10-11 删除。）

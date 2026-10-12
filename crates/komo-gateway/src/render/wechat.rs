@@ -1,26 +1,15 @@
-//! 微信纯文本审批渲染与短 ID 命令（§11.3）。
+//! 微信纯文本渲染与入站去重键（§11.3）。
 //!
 //! 微信这一列与另外两个渠道的差别不在内容，在**能力**：iLink 只有纯文本，没有卡片、
-//! 没有按钮、也没有"编辑已发出的那一条"。于是 §11.3 的表在这一列落成三条规矩：
-//!
-//! - **五项照发，但用纯文本**：短 ID / 动作 / 改动 / 原因 / 范围，没有代码块与引用块的
-//!   标记——微信会把 ``` 原样显示出来，那只是噪音。
-//! - **超长截断，并提示到 TUI 看全文**（§11.3 微信列的原话）。截断在**正文**上做，
-//!   命令提示行在截断**之后**拼上去：一条被截断的审批仍然必须是可回答的，否则截断就
-//!   把这条请求变成了死信。
-//! - **范围只能用命令**：没有按钮，所以 `/approve <短 ID>` / `/reject <短 ID>` 这两条
-//!   写在每条审批的末尾。`ApprovalSettled` 因此是**补发一行**结论，不是原地更新。
+//! 没有按钮、也没有"编辑已发出的那一条"。**超长截断，并提示到 TUI 看全文**（§11.3
+//! 微信列的原话）。审批的纯文本请求与短 ID 命令随审批一起删掉了（§7，2026-10-11）。
 //!
 //! 这里还住着入站去重键的回退哈希（[`fallback_request_key`]）。它和渲染放在一起不是
 //! 凑巧：两者都是"把一条消息变成一段确定的文本"的纯函数，都要能在没有网络、没有
 //! SDK 的情况下逐字断言。
 
-use time::OffsetDateTime;
-
-use komo_kernel::types::chat::{ApprovalPresentation, ApprovalScope, Outbound, PeerId};
+use komo_kernel::types::chat::Outbound;
 use komo_kernel::types::digest::ContentHash;
-use komo_kernel::types::ids::ShortId;
-use komo_kernel::types::plan::{ExecutionPlan, Operation, TargetAccess};
 
 /// 一条微信消息的正文上限，按**字符**计。
 ///
@@ -29,15 +18,6 @@ use komo_kernel::types::plan::{ExecutionPlan, Operation, TargetAccess};
 // 这里取 1800 字符，对全中文正文约 5.4KB、对全 ASCII 约 1.8KB——比 4000 字节保守，
 // 因为 §11.3 微信列要的是"截断并提示到 TUI"，宁可早截也不要发出去被服务端整条拒掉。)
 pub const MESSAGE_LIMIT: usize = 1800;
-
-/// 动作块的截断长度（字符）。
-const ACTION_LIMIT: usize = 600;
-/// 改动块的截断长度（字符）。§11.3：write / edit 的 diff **截断**。
-const CHANGES_LIMIT: usize = 600;
-/// 原因的截断长度（字符）。
-const REASON_LIMIT: usize = 300;
-/// 已有验证结果的截断长度（字符）。
-const EVIDENCE_LIMIT: usize = 300;
 
 /// 截断处留下的那句话。§11.3 微信列：**提示到 TUI 看全文**。
 pub const TRUNCATION_NOTE: &str = "…（已截断，全文到 TUI 看）";
@@ -50,8 +30,7 @@ const FALLBACK_HASH_PREFIX: usize = 16;
 
 /// 一个 [`Outbound`] 渲染成的那一段纯文本。
 ///
-/// **只有一段**：微信这一列是截断，不是分段（§11.3）。分段会把一条审批拆成几条消息，
-/// 而回答它的人只会看见最后一条。
+/// **只有一段**：微信这一列是截断，不是分段（§11.3）。
 pub fn render(outbound: &Outbound) -> String {
     match outbound {
         Outbound::Text { text } => truncate(text, MESSAGE_LIMIT),
@@ -59,210 +38,6 @@ pub fn render(outbound: &Outbound) -> String {
         Outbound::NeedsAttention { reason, .. } => {
             truncate(&format!("⚠️ 需要你判断\n\n{reason}"), MESSAGE_LIMIT)
         }
-        Outbound::ApprovalRequest(presentation) => approval_text(presentation),
-        Outbound::ApprovalSettled {
-            short_id,
-            approved,
-            by,
-            at,
-            ..
-        } => settled_line(short_id, *approved, by, *at),
-    }
-}
-
-/// 决定之后**补发**的那一行："已批准 / 已拒绝 · 谁 · 何时"（§11.3）。
-///
-/// 飞书原地更新卡片、Telegram 编辑原消息；微信两样都没有，所以它只能再说一句。旧消息
-/// 上没有按钮可点，所以"决定过的请求还长着可点的按钮"这个问题在这里不存在。
-pub fn settled_line(short_id: &ShortId, approved: bool, by: &PeerId, at: OffsetDateTime) -> String {
-    let verdict = if approved { "已批准" } else { "已拒绝" };
-    format!("{verdict} · {short_id} · {by} · {}", format_time(at))
-}
-
-/// 一条审批请求的全文：五项 + 两条命令提示。
-///
-/// **命令提示在截断之后拼**：正文可以被截掉，回答它的那两条命令不能。
-pub fn approval_text(presentation: &ApprovalPresentation) -> String {
-    let body = truncate(&approval_body(presentation), MESSAGE_LIMIT);
-    format!("{body}\n\n{}", command_hint(&presentation.short_id))
-}
-
-/// 回答这条审批的路。§11.3 微信列：没有按钮，范围授权**用命令**。
-///
-/// **最短的那条放最前面**：待处理只有一条时，一个 `y` 就够了——手机上抄那 4 位短 ID
-/// 才是真正的摩擦。短 ID 仍然写在里面：多条待处理、或者这条已经不在眼前时要用它。
-pub fn command_hint(short_id: &ShortId) -> String {
-    format!("回复 y 批准 · n 拒绝（要指明哪一条：/approve {short_id} · /reject {short_id}）")
-}
-
-/// 五项正文，未截断。
-fn approval_body(presentation: &ApprovalPresentation) -> String {
-    let mut out = String::new();
-
-    // 一、短 ID。
-    out.push_str(&format!("🔐 待审批 {}\n", presentation.short_id));
-
-    // 二、动作：工具、命令 / 代码、真实目标路径、cwd、版本。
-    out.push_str(&format!("\n动作\n{}\n", plan_action(&presentation.plan)));
-
-    // 三、改动：write / edit 的 diff（截断）。
-    if let Some(changes) = &presentation.changes {
-        out.push_str(&format!("\n改动\n{}\n", truncate(changes, CHANGES_LIMIT)));
-    }
-
-    // 已有验证结果（§7.2 要求界面显示它）。
-    if let Some(evidence) = &presentation.evidence {
-        out.push_str(&format!(
-            "\n已有验证\n{}\n",
-            truncate(evidence, EVIDENCE_LIMIT)
-        ));
-    }
-
-    // 四、原因：`PolicyDecision::Ask { reason }`。
-    out.push_str(&format!(
-        "\n原因\n{}\n",
-        truncate(&presentation.reason, REASON_LIMIT)
-    ));
-
-    // 五、范围。
-    out.push_str(&format!("\n范围\n{}", scope_line(presentation)));
-
-    if let Some(valid_until) = presentation.valid_until {
-        out.push_str(&format!("\n\n有效期至 {}", format_time(valid_until)));
-    }
-
-    out
-}
-
-/// 范围那一行。微信没有按钮，**每一种范围都是一条命令**（§11.3）。
-fn scope_line(presentation: &ApprovalPresentation) -> String {
-    let short_id = &presentation.short_id;
-    let mut parts = vec![format!("本次调用：/approve {short_id}")];
-    for scope in &presentation.scopes {
-        match scope {
-            ApprovalScope::Once => {}
-            ApprovalScope::Run => parts.push(format!("本次 Run：/approve {short_id} run")),
-            // TODO(decide: Cron 范围授权在聊天里的写法文档没给，暂按 `run` 的形状推一个)
-            ApprovalScope::CronJob => parts.push(format!("Cron Job：/approve {short_id} cron")),
-        }
-    }
-    parts.join("；")
-}
-
-/// 动作块：§11.3 的"工具、命令 / 代码、真实目标路径、cwd、版本"。
-///
-/// 组合计划（`then_run`）逐步写：改动那一步照旧，命令那一步一行"然后运行：命令（cwd）"。
-/// 每一步各按 [`ACTION_LIMIT`] 截——命令不会因为前一步长而被挤掉，过长时留着截断标记。
-fn plan_action(plan: &ExecutionPlan) -> String {
-    plan.steps()
-        .enumerate()
-        .map(|(index, step)| {
-            let text = if index == 0 {
-                step_action(step)
-            } else {
-                then_run_line(step)
-            };
-            truncate(&text, ACTION_LIMIT)
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// 组合计划的第二步只会是一条 shell 命令（`ExecutionPlan::validate_steps`）。
-fn then_run_line(step: &ExecutionPlan) -> String {
-    let command = match &step.operation {
-        Operation::ShellCommand { command } => command.as_str(),
-        other => operation_label(other),
-    };
-    match &step.cwd {
-        Some(cwd) => format!("然后运行：{command}（{}）", cwd.display()),
-        None => format!("然后运行：{command}"),
-    }
-}
-
-/// 一步计划自己的那几行。
-fn step_action(plan: &ExecutionPlan) -> String {
-    let mut lines = vec![
-        format!("工具: {}", plan.tool),
-        format!("操作: {}", operation_label(&plan.operation)),
-    ];
-    match &plan.operation {
-        Operation::ShellCommand { command } => lines.push(format!("命令: {command}")),
-        Operation::PythonCall { module, function } => {
-            lines.push(format!("调用: {module}.{function}"))
-        }
-        Operation::ToolboxChange { module } => lines.push(format!("模块: {module}")),
-        Operation::PythonCode => {
-            if let Some(code) = plan.args.get("code").and_then(|v| v.as_str()) {
-                lines.push(format!("代码:\n{code}"));
-            }
-        }
-        // 任务正文：子代理拿到的**只有它**（§4）。续跑（§4）多写一句"接着子 Run X"——
-        // 目标进了计划、进了计划哈希，批的是"接着这一条"，换一条要重新问。
-        Operation::Delegate { spec } => {
-            lines.push(format!("任务: {}", spec.task));
-            if let Some(target) = &spec.resumes {
-                lines.push(format!("续跑: 接着子 Run {target}"));
-            }
-        }
-        Operation::Dispatch { task, title } => {
-            lines.push(format!("标题: {title}"));
-            lines.push(format!("任务: {task}"));
-        }
-        Operation::Follow { task_id, text } => {
-            lines.push(format!("任务: #{task_id}"));
-            lines.push(format!("追问: {text}"));
-        }
-        // 审批批的就是这一组参数：服务器那边做什么，komo 只看得见它们。
-        Operation::McpCall { server, tool, .. } => {
-            lines.push(format!("MCP: {server} · {tool}"));
-            lines.push(format!(
-                "参数: {}",
-                serde_json::to_string_pretty(&plan.args).unwrap_or_default()
-            ));
-        }
-        Operation::Codemode { code } => lines.push(format!("脚本:\n{code}")),
-        _ => {}
-    }
-    if let Some(cwd) = &plan.cwd {
-        lines.push(format!("cwd: {}", cwd.display()));
-    }
-    for target in &plan.targets {
-        let access = match target.access {
-            TargetAccess::Read => "读",
-            TargetAccess::Write => "写",
-        };
-        lines.push(format!("{access}: {}", target.describe()));
-    }
-    if let Some(code) = &plan.versions.code {
-        lines.push(format!("版本 code: {}", code.as_str()));
-    }
-    if let Some(module) = &plan.versions.module {
-        lines.push(format!("版本 module: {module}"));
-    }
-    if let Some(env) = &plan.versions.env {
-        lines.push(format!("版本 env: {}", env.0));
-    }
-    lines.join("\n")
-}
-
-fn operation_label(operation: &Operation) -> &'static str {
-    match operation {
-        Operation::ReadFile => "read_file",
-        Operation::WriteFile => "write_file",
-        Operation::ShellCommand { .. } => "shell_command",
-        Operation::PythonCode => "python_code",
-        Operation::PythonCall { .. } => "python_call",
-        Operation::ToolboxChange { .. } => "toolbox_change",
-        Operation::PythonEnvChange => "python_env_change",
-        Operation::MemoryChange => "memory_change",
-        Operation::PolicyChange => "policy_change",
-        Operation::Delegate { .. } => "delegate",
-        Operation::Dispatch { .. } => "dispatch",
-        Operation::Follow { .. } => "follow",
-        Operation::UpdatePlan => "update_plan",
-        Operation::McpCall { .. } => "mcp_call",
-        Operation::Codemode { .. } => "codemode",
     }
 }
 
@@ -316,105 +91,12 @@ pub fn primary_request_key(from: &str, client_id: &str) -> String {
     format!("wechat:{from}:{client_id}")
 }
 
-fn format_time(at: OffsetDateTime) -> String {
-    let format = time::macros::format_description!(
-        "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour sign:mandatory]:[offset_minute]"
-    );
-    at.format(format)
-        .unwrap_or_else(|_| at.unix_timestamp().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use std::path::PathBuf;
-
     use komo_kernel::types::chat::ChannelPlatform;
-    use komo_kernel::types::ids::{ApprovalId, OperationId, RunId, SessionId};
-    use komo_kernel::types::plan::{
-        PlanSource, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
-    };
-
-    fn plan() -> ExecutionPlan {
-        ExecutionPlan {
-            operation_id: OperationId::from_raw("op-1"),
-            source: PlanSource::Interactive {
-                session: SessionId::from_raw("s-1"),
-            },
-            tool: "shell".into(),
-            operation: Operation::ShellCommand {
-                command: "rm -rf /tmp/scratch".into(),
-            },
-            run: Some(RunId::from_raw("run-1")),
-            tool_call: None,
-            args: serde_json::json!({ "command": "rm -rf /tmp/scratch" }),
-            cwd: Some(PathBuf::from("/home/op/work")),
-            targets: vec![PlanTarget::local(
-                PathBuf::from("/tmp/scratch"),
-                TargetAccess::Write,
-            )],
-            versions: PlanVersions::default(),
-            resources: Vec::new(),
-            recovery: RecoveryMode::NoSafeRecovery,
-            then_run: None,
-        }
-    }
-
-    fn presentation() -> ApprovalPresentation {
-        ApprovalPresentation {
-            approval: ApprovalId::from_raw("ap-1"),
-            short_id: ShortId::parse("7K2M").expect("短 ID"),
-            plan_hash: plan().plan_hash(),
-            plan: plan(),
-            reason: "这条命令会删掉目录".into(),
-            changes: Some("- old\n+ new".into()),
-            evidence: Some("cargo test 通过".into()),
-            scopes: vec![ApprovalScope::Once, ApprovalScope::Run],
-            valid_until: None,
-        }
-    }
-
-    // ④ 审批请求纯文本含五项与两条命令提示。
-    #[test]
-    fn an_approval_request_carries_five_items_and_the_two_commands() {
-        let text = approval_text(&presentation());
-        for item in ["7K2M", "动作", "改动", "原因", "范围"] {
-            assert!(text.contains(item), "少了 {item}：{text}");
-        }
-        assert!(text.contains("已有验证"), "§7.2 要求显示已有验证：{text}");
-        assert!(text.contains("/approve 7K2M"), "{text}");
-        assert!(text.contains("/reject 7K2M"), "{text}");
-        // 范围里的 Run 授权也是一条命令，不是按钮（§11.3 微信列）。
-        assert!(text.contains("/approve 7K2M run"), "{text}");
-        // 纯文本：不带 markdown 的代码块与转义。
-        assert!(!text.contains("```"), "微信会把 ``` 原样显示：{text}");
-        assert!(!text.contains('\\'), "纯文本里不该有转义反斜杠：{text}");
-    }
-
-    // ④（后半）ApprovalSettled 补发一行结论。
-    #[test]
-    fn a_decision_comes_back_as_one_more_line() {
-        let settled = Outbound::ApprovalSettled {
-            approval: ApprovalId::from_raw("ap-1"),
-            short_id: ShortId::parse("7K2M").expect("短 ID"),
-            approved: true,
-            by: PeerId::new("wxid_op"),
-            at: OffsetDateTime::from_unix_timestamp(1_760_000_000).expect("时间"),
-        };
-        let text = render(&settled);
-        assert!(text.starts_with("已批准 · 7K2M · wxid_op · "), "{text}");
-        assert_eq!(text.lines().count(), 1, "补发的是一行，不是一条新审批");
-
-        let rejected = Outbound::ApprovalSettled {
-            approval: ApprovalId::from_raw("ap-1"),
-            short_id: ShortId::parse("7K2M").expect("短 ID"),
-            approved: false,
-            by: PeerId::new("wxid_op"),
-            at: OffsetDateTime::from_unix_timestamp(1_760_000_000).expect("时间"),
-        };
-        assert!(render(&rejected).starts_with("已拒绝 · 7K2M · "));
-    }
+    use komo_kernel::types::ids::{RunId, SessionId};
 
     // ⑤ 超长截断 + 「到 TUI 看全文」提示。
     #[test]
@@ -427,24 +109,6 @@ mod tests {
             text.chars().count(),
             MESSAGE_LIMIT + TRUNCATION_NOTE.chars().count()
         );
-    }
-
-    // ⑤（后半）被截断的审批仍然是可回答的：命令提示在截断之后拼。
-    #[test]
-    fn a_truncated_approval_is_still_answerable() {
-        let mut presentation = presentation();
-        presentation.reason = "很".repeat(MESSAGE_LIMIT * 3);
-        presentation.changes = Some("差".repeat(MESSAGE_LIMIT * 3));
-        let text = approval_text(&presentation);
-        assert!(text.contains(TRUNCATION_NOTE), "该截断了：{text}");
-        // 提示行本身就带短 ID 与两条短答复；这里断言它是**按原样**落在末尾的那一段。
-        let short = ShortId::parse("7K2M").expect("短 ID");
-        assert!(
-            text.ends_with(&command_hint(&short)),
-            "截断不能把这条请求变成死信：{}",
-            &text[text.len().saturating_sub(120)..]
-        );
-        assert!(text.ends_with('）'), "{text}");
     }
 
     #[test]
@@ -470,15 +134,6 @@ mod tests {
         };
         assert!(render(&attention).contains("磁盘满了"));
         assert!(render(&attention).contains("需要你判断"));
-    }
-
-    #[test]
-    fn the_action_block_names_tool_command_cwd_and_targets() {
-        let text = approval_text(&presentation());
-        assert!(text.contains("工具: shell"), "{text}");
-        assert!(text.contains("命令: rm -rf /tmp/scratch"), "{text}");
-        assert!(text.contains("cwd: /home/op/work"), "{text}");
-        assert!(text.contains("写: /tmp/scratch"), "{text}");
     }
 
     // ② 回退键：含 from + 内容哈希 + 60s 窗口；同一分钟内同文本同键、跨分钟不同键。
@@ -529,130 +184,5 @@ mod tests {
         // 微信只有 DM：会话就是那个人（§11.2）。
         let peer = komo_kernel::types::chat::ChannelPeer::new(ChannelPlatform::Wechat, "wxid_op");
         assert_eq!(peer.to_string(), "wechat:wxid_op");
-    }
-
-    /// 委派续跑（§4）：动作块多写一句"接着子 Run X"，任务正文照旧在。
-    #[test]
-    fn a_delegate_resume_names_which_child_it_continues() {
-        use komo_kernel::types::delegate::DelegateSpec;
-
-        let spec = DelegateSpec::new(
-            RunId::from_raw("run-parent"),
-            komo_kernel::types::ids::ToolCallId::from_raw("call-1"),
-            "接着查 B",
-        )
-        .with_resumes(RunId::from_raw("run-child-1"));
-        let action = plan_action(&ExecutionPlan {
-            operation: Operation::Delegate { spec },
-            tool: "delegate".into(),
-            ..plan()
-        });
-        assert!(action.contains("任务: 接着查 B"), "{action}");
-        assert!(action.contains("续跑: 接着子 Run run-child-1"), "{action}");
-
-        let fresh_spec = DelegateSpec::new(
-            RunId::from_raw("run-parent"),
-            komo_kernel::types::ids::ToolCallId::from_raw("call-1"),
-            "查 A",
-        );
-        let fresh = plan_action(&ExecutionPlan {
-            operation: Operation::Delegate { spec: fresh_spec },
-            tool: "delegate".into(),
-            ..plan()
-        });
-        assert!(fresh.contains("任务: 查 A"), "{fresh}");
-        assert!(!fresh.contains("续跑"), "{fresh}");
-    }
-
-    /// 单步计划的审批正文逐字钉住：组合计划那一行加进来之后，单步的样子一个字都不变。
-    #[test]
-    fn a_single_step_approval_renders_exactly_as_before() {
-        let text = approval_text(&presentation());
-        assert_eq!(
-            text,
-            "🔐 待审批 7K2M\n\n动作\n工具: shell\n操作: shell_command\n命令: rm -rf /tmp/scratch\ncwd: /home/op/work\n写: /tmp/scratch\n\n改动\n- old\n+ new\n\n已有验证\ncargo test 通过\n\n原因\n这条命令会删掉目录\n\n范围\n本次调用：/approve 7K2M；本次 Run：/approve 7K2M run\n\n回复 y 批准 · n 拒绝（要指明哪一条：/approve 7K2M · /reject 7K2M）",
-            "{text}"
-        );
-    }
-
-    /// 一份组合计划：改 `app.txt`，改完跑 `command`。
-    fn fused_plan(command: &str) -> ExecutionPlan {
-        let then_run = ExecutionPlan {
-            operation: Operation::ShellCommand {
-                command: command.into(),
-            },
-            args: serde_json::json!({ "command": command }),
-            targets: Vec::new(),
-            ..plan()
-        };
-        ExecutionPlan {
-            tool: "edit".into(),
-            operation: Operation::WriteFile,
-            args: serde_json::json!({ "path": "app.txt" }),
-            targets: vec![PlanTarget::local(
-                PathBuf::from("/home/op/work/app.txt"),
-                TargetAccess::Write,
-            )],
-            then_run: Some(Box::new(then_run)),
-            ..plan()
-        }
-    }
-
-    /// 组合计划的审批：Policy 只给"本次"（§7.2）。
-    fn fused_presentation(plan: ExecutionPlan) -> ApprovalPresentation {
-        ApprovalPresentation {
-            plan_hash: plan.plan_hash(),
-            plan,
-            changes: Some("--- a/app.txt\n+++ b/app.txt\n-version = 1\n+version = 2".into()),
-            scopes: vec![ApprovalScope::Once],
-            ..presentation()
-        }
-    }
-
-    /// 第一步长到被截断时，它自己留着截断标记，命令那一行照样在。
-    fn long_first_step(command: &str) -> ExecutionPlan {
-        let mut plan = fused_plan(command);
-        plan.targets = (0..ACTION_LIMIT)
-            .map(|n| {
-                PlanTarget::local(
-                    PathBuf::from(format!("/home/op/work/f{n}.txt")),
-                    TargetAccess::Write,
-                )
-            })
-            .collect();
-        plan
-    }
-
-    /// 组合计划（`then_run`）：动作里两步都在，改动照旧，范围只有"本次"。
-    #[test]
-    fn a_fused_edit_shows_the_change_and_the_command_it_runs_after() {
-        let text = approval_text(&fused_presentation(fused_plan("cargo test -p app")));
-        assert!(text.contains("工具: edit"), "{text}");
-        assert!(text.contains("写: /home/op/work/app.txt"), "{text}");
-        assert!(text.contains("+version = 2"), "改动照旧在：{text}");
-        assert!(
-            text.contains("然后运行：cargo test -p app（/home/op/work）"),
-            "{text}"
-        );
-        assert!(text.contains("本次调用：/approve 7K2M"), "{text}");
-        assert!(!text.contains("/approve 7K2M run"), "只给本次：{text}");
-    }
-
-    /// 超长命令截断并留标记，不会整行不见——前一步再长也挤不掉它；回答它的命令也还在。
-    #[test]
-    fn a_long_then_run_command_is_truncated_with_a_marker_not_dropped() {
-        let command = format!("echo {}", "x".repeat(ACTION_LIMIT * 3));
-        for plan in [fused_plan(&command), long_first_step(&command)] {
-            let text = approval_text(&fused_presentation(plan));
-            let line = text
-                .lines()
-                .find(|line| line.starts_with("然后运行：echo xxx"))
-                .unwrap_or_else(|| panic!("命令那一行不见了：{text}"));
-            assert!(line.ends_with(TRUNCATION_NOTE), "{line}");
-            assert!(
-                text.ends_with(&command_hint(&presentation().short_id)),
-                "{text}"
-            );
-        }
     }
 }

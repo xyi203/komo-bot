@@ -84,7 +84,7 @@ pub async fn create(
 /// `GET /v1/sessions/{id}`
 ///
 /// `unfinished` 逐条带 `state` 与 `wait`（§8.4 的两维），`pending` 是这个会话上**待处理的
-/// Intervention**（§7.5 的**三类**）——不是只列审批。少了后面这一条，"卡住但清单为空"
+/// Intervention**（§7.5 的两类）。少了后面这一条，"卡住但清单为空"
 /// 会从详情这个入口重新长出来。
 pub async fn detail(
     State(api): State<Api>,
@@ -141,8 +141,9 @@ pub async fn submit(
 /// 顺手把**现在就能跑**的放回队列。所以：
 ///
 /// - `accepted` / `queued` / 没主人的 `running` → 叫醒调度器，列进 `resumed`；
-/// - 停在人身上的（`approval` / `intervention`）→ **不叫醒**，它们在 `pending` 里，
-///   等操作者答复（§7.5）；
+/// - 停在人身上的（`intervention`）→ **不叫醒**，它们在 `pending` 里，等操作者答复
+///   （§7.5）；2026-10-11 之前停在审批上的（`approval`，只在旧数据里）也不在这里叫醒：
+///   启动恢复按 §8.4 续跑它们；
 /// - 等时钟（`retry`）与等前一条 Run（`dependency`）→ 也**不叫醒**：它们不是在等人，
 ///   但也没有"现在就继续"这回事——到点由对账放回队列（§8.9），强行 requeue 前者会绕过
 ///   退避、后者会越过前面那条 Run。

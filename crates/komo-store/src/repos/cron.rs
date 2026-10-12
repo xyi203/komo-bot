@@ -134,7 +134,7 @@ impl CronRepo for TursoCronRepo {
                     let mut job = job;
                     match existing {
                         Some(mut row) => {
-                            // **版本递增**——Job 改了，绑定它的授权失效（§7.2）。
+                            // **版本递增**——Job 改了定义就是新的一版（§10）。
                             job.version = (row.version.max(0) as u64) + 1;
                             row.update()
                                 .name(job.name.clone())
@@ -222,8 +222,7 @@ impl CronRepo for TursoCronRepo {
                         });
                     };
                     // **`version` 一个字都不动**：推进槽位不是定义变更。走 `put` 的话
-                    // 每次触发都会让版本 +1，而 `GrantScope::CronJob` 绑的正是版本
-                    // （§7.2、§10），于是一个每天跑的 Job 的授权活不过第一次触发。
+                    // 每次触发都会让版本 +1，版本就不再说明"定义改过几次"（§10）。
                     row.update()
                         .next_run_at(to_ts_opt(next_run_at))
                         .status(enum_str(&status))
@@ -362,7 +361,7 @@ impl CronRepo for TursoCronRepo {
                         else {
                             return Ok(true);
                         };
-                        // 「含等待审批、重试或结果核对」都算没结束（§10）——判据就是
+                        // 「含等待重试或结果核对」都算没结束（§10）——判据就是
                         // §8.4 的"非终态"，与领取语句、reconcile 同一份。
                         if crate::repos::runs::state_of(&run)?.is_unfinished() {
                             return Ok(true);
@@ -526,7 +525,7 @@ mod tests {
         assert_eq!(read.next_run_at, job("job-1").next_run_at);
     }
 
-    /// **版本递增**——Job 改了，绑定它的授权失效（§7.2）。
+    /// **版本递增**——Job 改了定义就是新的一版（§10）。
     #[tokio::test]
     async fn every_put_bumps_the_version() {
         let (db, _dir) = temp().await;
@@ -538,10 +537,9 @@ mod tests {
 
     /// 验收 ⑤：`advance` **不碰 version**，`put` 才递增。
     ///
-    /// 走 `put` 推进槽位的话，每次触发都会让版本 +1，而 `GrantScope::CronJob` 绑的正是
-    /// 版本（§7.2、§10）——于是一个每天跑的 Job 的授权活不过第一次触发。
+    /// 走 `put` 推进槽位的话，每次触发都会让版本 +1，版本就不再说明"定义改过几次"（§10）。
     #[tokio::test]
-    async fn advancing_a_slot_does_not_invalidate_the_jobs_grants() {
+    async fn advancing_a_slot_does_not_bump_the_jobs_version() {
         let (db, _dir) = temp().await;
         let repo = TursoCronRepo::new(db);
         let stored = repo.put(job("job-1")).await.unwrap();
@@ -578,7 +576,7 @@ mod tests {
         assert_eq!(broken.last_error.as_deref(), Some("时区解析不了"));
         assert_eq!(broken.version, 1);
 
-        // 改定义才递增——旧授权就该在这一刻失效。
+        // 改定义才递增。
         assert_eq!(repo.put(broken).await.unwrap().version, 2);
     }
 
@@ -633,7 +631,7 @@ mod tests {
                     session: Some(SessionId::from_raw("sess-1")),
                     run: Some(RunId::from_raw("run-1")),
                     status: FiringStatus::Waiting,
-                    error: Some("停在审批上".into()),
+                    error: Some("停在核对上".into()),
                     ..firing(&id, NOW)
                 })
                 .await
@@ -651,7 +649,7 @@ mod tests {
         let firings = repo.firings(&id, 10).await.unwrap();
         assert_eq!(firings.len(), 1);
         assert_eq!(firings[0].status, FiringStatus::Waiting);
-        assert_eq!(firings[0].error.as_deref(), Some("停在审批上"));
+        assert_eq!(firings[0].error.as_deref(), Some("停在核对上"));
         assert_eq!(firings[0].run, Some(RunId::from_raw("run-1")));
 
         // **重启不重复创建同次触发**（§14 阶段 7 第一句）：同一个 `scheduled_at`
@@ -698,7 +696,7 @@ mod tests {
         assert_eq!(repo.firings(&id, 10).await.unwrap().len(), 1);
     }
 
-    /// 「含等待审批、重试或结果核对」都算没结束（§10）。
+    /// 「含等待重试或结果核对」都算没结束（§10）。
     #[tokio::test]
     async fn a_firing_without_a_finished_run_counts_as_unfinished() {
         let (db, _dir) = temp().await;

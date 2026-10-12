@@ -1,6 +1,6 @@
 //! §13.1 最小接口的请求 / 响应类型与统一错误体。
 //!
-//! 「除最小健康检查外统一认证。提交输入、审批、Cron 与 Memory 变更都支持幂等请求键；
+//! 「除最小健康检查外统一认证。提交输入、Cron 与 Memory 变更都支持幂等请求键；
 //! 同一键对应不同内容则拒绝。」——所以每个**写**接口都带一个可选的
 //! [`crate::types::ids::RequestKey`]，而 [`ErrorCode::RequestKeyConflict`] 是它对应的
 //! 那个明确失败。
@@ -28,13 +28,11 @@ use time::OffsetDateTime;
 
 use super::config::{ConfigIssue, KeyPath, SourceFile};
 use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
-use crate::types::chat::{ApprovalScope, PeerId};
-use crate::types::ids::{
-    ApprovalId, CronJobId, MemoryId, RequestKey, RunId, Seq, SessionId, ShortId,
-};
+use crate::types::chat::PeerId;
+use crate::types::ids::{CronJobId, MemoryId, RequestKey, RunId, Seq, SessionId};
 use crate::types::memory::{MemoryItem, MemoryScope, MemoryState, RetrievalMode};
 use crate::types::model::{Effort, EmbeddingSpace, ModelConfig};
-use crate::types::plan::{ExecutionPlan, PlanHash, PlanSource};
+use crate::types::plan::{PlanHash, PlanSource};
 use crate::types::status::{RunState, SessionState, WaitReason};
 
 /// 统一错误体。
@@ -73,7 +71,7 @@ pub enum ErrorCode {
     VersionConflict,
     /// 请求本身不合法。
     InvalidRequest,
-    /// 被 Policy 拒绝。
+    /// 被拒绝（例如 `write` / `edit` 要写 komo 自己的状态，§7、§8.10）。
     Denied,
     /// 这个状态下做不了这件事（例如对已终态的 Run 取消）。
     Conflict,
@@ -173,8 +171,7 @@ pub struct SessionDetail {
     /// 未完成的 Run。
     #[serde(default)]
     pub unfinished: Vec<RunSummary>,
-    /// 这个会话上待处理的 Intervention（§7.5）。**不是**只列审批：结果不明与阻塞也在
-    /// 这里，否则"卡住但清单为空"会从这一个入口重新长出来。
+    /// 这个会话上待处理的 Intervention（§7.5）。结果不明与阻塞都在这里，否则"卡住但清单为空"会从这一个入口重新长出来。
     #[serde(default)]
     pub pending: Vec<InterventionSummary>,
 }
@@ -314,7 +311,7 @@ pub struct ResumeResponse {
     /// 已经在跑或刚被接续的 Run。
     #[serde(default)]
     pub resumed: Vec<RunSummary>,
-    /// 需要人处理的（§7.5）：审批、结果不明、阻塞。**三类一起列**。
+    /// 需要人处理的（§7.5）：结果不明、阻塞。**两类一起列**。
     #[serde(default)]
     pub pending: Vec<InterventionSummary>,
 }
@@ -344,7 +341,7 @@ pub struct RunSummary {
     pub state: RunState,
     /// **在等什么**（`state == Waiting` 时有值，§8.4）。
     ///
-    /// 少了这一格，"排队二十分钟"就只是一个状态：答不出在等审批、等一个到点时刻、还是
+    /// 少了这一格，"排队二十分钟"就只是一个状态：答不出在等人、等一个到点时刻、还是
     /// 在等同会话里更早的那条 Run。它是界面唯一的依据，也是 `/v1/interventions` 之外
     /// 唯一能看到 `Dependency` 的地方（依赖不进清单——那不是"等人"）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -402,110 +399,23 @@ pub struct CancelRunResponse {
     pub state: RunState,
 }
 
-// ---- /v1/approvals ----
-
-/// 一条审批请求（`approval_requests`）。也是 `GET /v1/approvals/{id}` 的响应体。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalRecord {
-    pub approval: ApprovalId,
-    /// 待处理集合内唯一的 4 位短 ID。
-    pub short_id: ShortId,
-    pub session: SessionId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<RunId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call: Option<crate::types::ids::ToolCallId>,
-    pub plan_hash: PlanHash,
-    /// 具体动作。§7.2 要求界面显示它。
-    pub plan: ExecutionPlan,
-    pub reason: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub changes: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<String>,
-    #[serde(default)]
-    pub scopes: Vec<ApprovalScope>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub requested_at: OffsetDateTime,
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub valid_until: Option<OffsetDateTime>,
-    /// 已经决定过的话，决定本身。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decision: Option<ApprovalDecisionRecord>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalDecisionRecord {
-    pub approved: bool,
-    pub scope: ApprovalScope,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub by: Option<PeerId>,
-    #[serde(with = "time::serde::rfc3339")]
-    pub decided_at: OffsetDateTime,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant: Option<crate::types::ids::GrantId>,
-    /// 这条授权有没有被消费过。
-    #[serde(default)]
-    pub consumed: bool,
-}
-
-/// `GET /v1/approvals` 的 query。
-///
-/// `include_decided` 存在是因为 `komo run inspect` 要答「这一步是谁放行的」——那条审批
-/// 早就不在待处理集合里了，按默认的 pending 过滤永远查不到它（§7.4 的审计面）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalListQuery {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<RunId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<SessionId>,
-    /// 默认 `false` = 只列待处理。
-    #[serde(default)]
-    pub include_decided: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalListResponse {
-    pub approvals: Vec<ApprovalRecord>,
-}
-
-/// 落一条审批决定的返回。**已决定的返回原决定，不报错**（§11.3）——同一人连点两次，
-/// 第二次得到的是"已决定"。
-///
-/// 它是**审批层**的结果（`ApprovalRepo::decide` 的返回，也是回执要渲染的那一份）；
-/// 统一清单上的答复是 [`InterventionAnswerResponse`]，里面带着同样的
-/// [`ApprovalDecisionRecord`]。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalDecisionResponse {
-    pub approval: ApprovalId,
-    pub short_id: ShortId,
-    pub decision: ApprovalDecisionRecord,
-    /// 这次请求没有改变任何东西，返回的是之前那个决定。
-    #[serde(default)]
-    pub already_decided: bool,
-}
-
 // ---- /v1/interventions（§7.5）----
 
-/// 一条待处理的 Intervention。**清单是派生视图**：它是 `runs` 与 `approval_requests` 的
-/// 并集查询，没有自己的表——多一张表就多一处会与权威漂移的状态，而这次改造的全部理由
+/// 一条待处理的 Intervention。**清单是派生视图**：它是 `runs` 上的查询，没有自己的
+/// 表——多一张表就多一处会与权威漂移的状态，而这次改造的全部理由
 /// 就是不要那个（§8.9）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterventionSummary {
-    /// 答复时用的句柄：审批是短 ID（§11.3），`verify` / `blocked` 是 Run ID。
+    /// 答复时用的句柄：`verify` / `blocked` 都是 Run ID。
     pub handle: String,
     pub kind: InterventionKind,
     pub session: SessionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<RunId>,
-    /// 停在哪一次逻辑调用上（`verify` 一定有；审批可能有）。
+    /// 停在哪一次逻辑调用上（`verify` 一定有）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<crate::types::ids::ToolCallId>,
-    /// 一句话：审批是"要你放行什么"，另外两类是"哪里不清楚"。
+    /// 一句话："哪里不清楚"。
     pub question: String,
     /// 这一条**此刻**允许答复什么。列表项自带答案菜单，界面不必自己推——推错一个
     /// 界面就会给出一个按下去没反应的答案（§11.3 的 TUI 菜单是同一条理由）。
@@ -518,8 +428,6 @@ pub struct InterventionSummary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterventionKind {
-    /// 一份执行计划等人放行（§7.4）。
-    Approval,
     /// 一次调用的结果不明，等人核对（§8.6）。
     Verify,
     /// 前提没了：引用损坏、旧执行者未确认、会话不可服务（§8.9）。
@@ -530,9 +438,6 @@ impl InterventionKind {
     /// 这一类能答什么，按固定顺序（界面直接照抄）。
     pub fn verdicts(self) -> Vec<InterventionVerdict> {
         match self {
-            InterventionKind::Approval => {
-                vec![InterventionVerdict::Approve, InterventionVerdict::Reject]
-            }
             InterventionKind::Verify => vec![
                 InterventionVerdict::Satisfied,
                 InterventionVerdict::NotPerformed,
@@ -546,7 +451,6 @@ impl InterventionKind {
 
     pub fn as_str(self) -> &'static str {
         match self {
-            InterventionKind::Approval => "approval",
             InterventionKind::Verify => "verify",
             InterventionKind::Blocked => "blocked",
         }
@@ -559,24 +463,19 @@ impl InterventionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InterventionVerdict {
-    /// 审批：放行这份计划（范围由 `scope` 另给）。
-    Approve,
-    Reject,
     /// `verify`：核对后目标已满足——给那次调用补一条结果，原 Run 继续。
     Satisfied,
-    /// `verify`：确定没执行——标记后重新入队（一次性授权按 §7.4 的原范围重放）。
+    /// `verify`：确定没执行——标记后重新入队，那次调用按原计划重放（§8.4）。
     NotPerformed,
     /// `blocked`：前提已处理，**重新观察并重新决策**（不强行放行）。
     Resolve,
-    /// 三类共有：这条 Run 到此为止。
+    /// 两类共有：这条 Run 到此为止。
     Abandon,
 }
 
 impl InterventionVerdict {
     pub fn as_str(self) -> &'static str {
         match self {
-            InterventionVerdict::Approve => "approve",
-            InterventionVerdict::Reject => "reject",
             InterventionVerdict::Satisfied => "satisfied",
             InterventionVerdict::NotPerformed => "not_performed",
             InterventionVerdict::Resolve => "resolve",
@@ -587,8 +486,6 @@ impl InterventionVerdict {
     /// CLI / 聊天的写法。也认几个手滑得不算离谱的拼法（`not-performed`、`notperformed`）。
     pub fn parse(raw: &str) -> Option<InterventionVerdict> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "approve" | "y" | "yes" => Some(InterventionVerdict::Approve),
-            "reject" | "n" | "no" => Some(InterventionVerdict::Reject),
             "satisfied" | "done" => Some(InterventionVerdict::Satisfied),
             "not_performed" | "not-performed" | "notperformed" => {
                 Some(InterventionVerdict::NotPerformed)
@@ -620,12 +517,10 @@ pub struct InterventionListResponse {
     pub interventions: Vec<InterventionSummary>,
 }
 
-/// 单项详情。审批类的那一份就是 §7.2 要求界面展示的全部内容。
+/// 单项详情。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InterventionDetail {
-    /// `ApprovalRecord` 里带着整份 `ExecutionPlan`，比别的变体大一个数量级，所以装箱。
-    Approval(Box<ApprovalRecord>),
     Verify {
         summary: InterventionSummary,
         tool: String,
@@ -642,9 +537,6 @@ pub enum InterventionDetail {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterventionAnswerRequest {
     pub verdict: InterventionVerdict,
-    /// 只有 `Approve` 用得上（§7.2 的三种范围）。不给 = `Once`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub scope: Option<ApprovalScope>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_key: Option<RequestKey>,
 }
@@ -656,9 +548,6 @@ pub struct InterventionAnswerResponse {
     pub handle: String,
     pub kind: InterventionKind,
     pub verdict: InterventionVerdict,
-    /// 审批类才有：这次（或之前那次）决定本身。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub decision: Option<ApprovalDecisionRecord>,
     /// 这条 Run 现在的状态（`abandon` 之后是 `cancelled`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_state: Option<RunState>,
@@ -667,35 +556,6 @@ pub struct InterventionAnswerResponse {
     /// 这次请求没有改变任何东西，返回的是之前那个结论。
     #[serde(default)]
     pub already_answered: bool,
-}
-
-/// `POST /v1/interventions/answers`：**一次答一批**（§11.3 的 `/approve all`）。
-///
-/// 一条 Run 里连着几个 shell 命令、几个 Run 各自卡在等待上——一次按键答一批是操作者
-/// 真正要的那件事。它**不是**一条结论覆盖多个计划：名单里每一条各自落一条结论、各自排
-/// 一条审计事件（§7.4），与逐条答完全等价，只是不必按 N 次键。
-///
-/// 名单由**发起方列出**（TUI 拿手上的待处理集合、CLI 与聊天先列一次），协议里没有
-/// "全部"这个词：服务端不替操作者决定"哪些算全部"——那会把答复到达之后新出现的请求
-/// 也一起答掉。
-///
-/// **只答审批，而且范围固定为本次调用**：范围授权绑的是一份具体的计划（shell 绑整条
-/// 命令、Python 绑模块与版本），一批互不相干的计划共用一个范围，只能是替操作者猜一个
-/// 他没看过的答复。要范围就逐条答。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InterventionBatchAnswerRequest {
-    pub handles: Vec<String>,
-    pub approved: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub request_key: Option<RequestKey>,
-}
-
-/// 一批答复的结果。`answered` 与请求同序；点了名却已经不在的那些单独列出，不让整批失败。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InterventionBatchAnswerResponse {
-    pub answered: Vec<InterventionAnswerResponse>,
-    #[serde(default)]
-    pub missing: Vec<String>,
 }
 
 // ---- /v1/cron ----
@@ -723,12 +583,8 @@ pub struct CronJobStatus {
     /// 最近一次触发。没有就是这个 Job 还没响过。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last: Option<CronFiring>,
-    /// 这个 Job 当前版本有没有有效的 `GrantScope::CronJob` 授权（§7.2、§10）。命令
-    /// Job 在 `cron add` 时就该有——这是操作者在 `cron list` 上能看到这条授权存在
-    /// 的地方，不必单独去查 `/v1/approvals`（那条审批不是待处理的，也没有挂在任何一
-    /// 条 Run 上，走那条查询路径反而查不到）。
-    #[serde(default)]
-    pub authorized: bool,
+    // 审批删掉之前这里还有 `authorized`（命令 Job 有没有 Cron 授权）。旧客户端读不到
+    // 它时按默认值走，新客户端读到旧响应里的它会忽略。
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -803,11 +659,10 @@ pub struct UpdateCronRequest {
 }
 
 impl UpdateCronRequest {
-    /// 这次 PATCH 改的是**定义**吗（§7.2 / §10：改定义 → 版本 +1，绑定这个 Job 的授权
-    /// 失效）。
+    /// 这次 PATCH 改的是**定义**吗（§10：改定义 → 版本 +1）。
     ///
-    /// `status` 单独一个不算：`pause` / `resume` 不是定义变更，让它递增版本等于让操作者
-    /// 每暂停一次就重批一遍授权。
+    /// `status` 单独一个不算：`pause` / `resume` 不是定义变更，版本回答的是"定义改没
+    /// 改过"。
     pub fn changes_definition(&self) -> bool {
         self.name.is_some()
             || self.schedule.is_some()
@@ -1062,18 +917,21 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_without_a_scope_is_this_call_only() {
-        // 不给 `scope` 就是本次调用——`scope` 只在 `Approve` 上有意义（§7.2）。
+    fn a_verdict_belongs_to_its_kind() {
+        // 旧客户端可能还带着 `scope`：忽略，不报错。
         let request: InterventionAnswerRequest =
-            serde_json::from_str(r#"{"verdict":"approve"}"#).unwrap();
-        assert_eq!(request.verdict, InterventionVerdict::Approve);
-        assert_eq!(request.scope, None);
+            serde_json::from_str(r#"{"verdict":"satisfied","scope":"once"}"#).unwrap();
+        assert_eq!(request.verdict, InterventionVerdict::Satisfied);
 
         // 结论按种类分派，不混用（§7.5）：
         assert!(InterventionVerdict::Satisfied.allowed_for(InterventionKind::Verify));
-        assert!(!InterventionVerdict::Satisfied.allowed_for(InterventionKind::Approval));
+        assert!(!InterventionVerdict::Satisfied.allowed_for(InterventionKind::Blocked));
         assert!(InterventionVerdict::Resolve.allowed_for(InterventionKind::Blocked));
-        assert!(!InterventionVerdict::Approve.allowed_for(InterventionKind::Blocked));
+        assert!(!InterventionVerdict::Resolve.allowed_for(InterventionKind::Verify));
+
+        // 审批那一类已经删掉：旧的 `approve` / `reject` 不再是结论。
+        assert!(serde_json::from_str::<InterventionVerdict>(r#""approve""#).is_err());
+        assert!(serde_json::from_str::<InterventionKind>(r#""approval""#).is_err());
     }
 
     #[test]
@@ -1083,8 +941,13 @@ mod tests {
             Some(InterventionVerdict::NotPerformed)
         );
         assert_eq!(
-            InterventionVerdict::parse(" YES "),
-            Some(InterventionVerdict::Approve)
+            InterventionVerdict::parse(" DONE "),
+            Some(InterventionVerdict::Satisfied)
+        );
+        assert_eq!(
+            InterventionVerdict::parse("yes"),
+            None,
+            "y / yes 是审批的写法，已经删了"
         );
         assert_eq!(InterventionVerdict::parse("maybe"), None);
         assert_eq!(InterventionKind::Verify.as_str(), "verify");

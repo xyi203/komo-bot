@@ -6,9 +6,8 @@
 //!    把"用一个更大的 offset 再调一次 `getUpdates`"当作确认（官方原文），所以提前推进
 //!    就等于在还没处理时先签收。进程死在中间时那条 `Update` 会原样再来一次，由
 //!    Dispatcher 按 `telegram:{update_id}` 去重（§11.1）。
-//! 2. **去重键只管平台重投**。同一个人连点两次「批准」是两条合法输入、两个不同的
-//!    `update_id`；挡住它的是审批按 `approval_id` 的幂等，不是这里
-//!    （spike callbacks.md §2）。
+//! 2. **去重键只管平台重投**。同一个人把同一条 `/answer` 发两次是两条合法输入、两个
+//!    不同的 `update_id`；挡住它的是答复本身的幂等（已答过的返回原结论），不是这里。
 //! 3. **`update_id` 不保证连续**。闲置一周后下一个 id 是随机选的（官方明文），所以这
 //!    里只用 `offset = 最后处理的 + 1`，从不假设步长是 1。
 //!
@@ -94,8 +93,7 @@ impl TelegramChannel {
         }
     }
 
-    /// 出站的那一半。Notifier 用它主动投递（§11.4）；它与入站共用同一个
-    /// [`BotApi`]，所以也共用那份"审批落在哪条消息上"的进程内小账。
+    /// 出站的那一半。Notifier 用它主动投递（§11.4）；它与入站共用同一个 [`BotApi`]。
     pub fn sender(&self) -> Arc<TelegramSender> {
         Arc::clone(&self.sender)
     }
@@ -141,21 +139,13 @@ impl TelegramChannel {
 
     async fn handle_update(&self, inbound: &dyn Inbound, identity: &BotIdentity, update: Update) {
         let request_key = inbound::request_key(update.update_id);
-        let message = if let Some(callback) = &update.callback_query {
-            // 先答一声：不调用 `answerCallbackQuery` 客户端会一直转圈
-            // （spike callbacks.md 4e）。失败非致命——转圈比丢一次决定轻。
-            if let Err(error) = self.api().answer_callback_query(&callback.id).await {
-                tracing::warn!(%error, "telegram：answerCallbackQuery 失败，继续处理回调");
-            }
-            inbound::from_callback(callback, request_key)
-        } else if let Some(message) = &update.message {
-            inbound::from_message(message, identity, request_key)
-        } else {
-            None
-        };
+        let message = update
+            .message
+            .as_ref()
+            .and_then(|message| inbound::from_message(message, identity, request_key));
 
         let Some(message) = message else {
-            // 群里没 @机器人、非文本消息、认不出的回调负载：`Ignored`，不进 Dispatcher。
+            // 群里没 @机器人、非文本消息：`Ignored`，不进 Dispatcher。
             tracing::debug!(update_id = update.update_id, "telegram：忽略");
             return;
         };
@@ -300,9 +290,7 @@ mod tests {
 
     use komo_kernel::types::ids::{RunId, SessionId};
 
-    use super::fake::{
-        BOT_USERNAME, Behavior, FakeBotApi, RecordingInbound, callback_update, text_update,
-    };
+    use super::fake::{BOT_USERNAME, Behavior, FakeBotApi, RecordingInbound, text_update};
 
     fn channel(fake: &FakeBotApi) -> TelegramChannel {
         TelegramChannel::with_api(fake.api(), ChannelConfig::default())
@@ -355,34 +343,6 @@ mod tests {
         let received = recorder.received();
         assert_eq!(received.len(), 1, "重投的那几次都被跳过了：{received:?}");
         assert_eq!(received[0].request_key.as_str(), "telegram:7");
-    }
-
-    // ② callback_query 转成 /approve <id>，request_key 同源，answerCallbackQuery 被调。
-    #[tokio::test]
-    async fn a_button_press_becomes_the_same_command_a_message_would() {
-        let fake = FakeBotApi::start_with(
-            Behavior::default(),
-            vec![callback_update(31, 11, 777, "approve:7K2M")],
-        )
-        .await;
-        let recorder = RecordingInbound::new(fake.log());
-
-        serve_until(channel(&fake), recorder.clone(), || {
-            !recorder.received().is_empty()
-        })
-        .await;
-
-        let received = recorder.received();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].text, "/approve 7K2M");
-        // 去重键与普通消息同源：`telegram:{update_id}`（§11.1）。
-        assert_eq!(received[0].request_key.as_str(), "telegram:31");
-        assert_eq!(received[0].peer.to_string(), "telegram:11");
-        assert_eq!(received[0].sender.as_str(), "777");
-
-        let answered = fake.calls_to("answerCallbackQuery");
-        assert_eq!(answered.len(), 1, "不调用它客户端会一直转圈");
-        assert_eq!(answered[0]["callback_query_id"], "cb-31");
     }
 
     // ③ 群里非 @机器人 的消息 Ignored，@机器人 的剥掉提及。
@@ -464,7 +424,7 @@ mod tests {
         let recorder = RecordingInbound::with_ack(
             fake.log(),
             InboundAck::Replied {
-                text: "没有待处理的审批".into(),
+                text: "现在没有待处理的 Intervention。".into(),
             },
         );
 
@@ -475,7 +435,7 @@ mod tests {
 
         let sends = fake.calls_to("sendMessage");
         assert_eq!(sends[0]["chat_id"], "11");
-        assert_eq!(sends[0]["text"], "没有待处理的审批");
+        assert_eq!(sends[0]["text"], "现在没有待处理的 Intervention。");
     }
 
     #[tokio::test]
@@ -541,10 +501,7 @@ mod tests {
         .await;
 
         let polls = fake.calls_to("getUpdates");
-        assert_eq!(
-            polls[0]["allowed_updates"],
-            serde_json::json!(["message", "callback_query"])
-        );
+        assert_eq!(polls[0]["allowed_updates"], serde_json::json!(["message"]));
         assert!(polls[0].get("offset").is_none(), "第一次不带 offset");
     }
 

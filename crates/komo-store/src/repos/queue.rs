@@ -25,9 +25,9 @@ use crate::repos::runs::{nearest_unfinished_predecessor, state_of, state_str};
 
 /// §8.7：领取一个 Run。`rows affected == 1` 是接管成功。
 ///
-/// **同一 Session 里更早的那个没结束就不领**（§8.4）：`waiting`（等审批 / 等时钟 / 等人
-/// 判断）与 `accepted` / `running` 都是没结束。少了这一条，后一个 Run 会越到前一个头上，
-/// 而前一个停在的半轮里**那次调用还没有结果**——回放窗口就会带着一个没有输出的
+/// **同一 Session 里更早的那个没结束就不领**（§8.4）：`waiting`（等时钟 / 等人判断 /
+/// 等依赖，以及删审批之前留下的等审批）与 `accepted` / `running` 都是没结束。少了这一条，
+/// 后一个 Run 会越到前一个头上，而前一个停在的半轮里**那次调用还没有结果**——回放窗口就会带着一个没有输出的
 /// `function_call` 发给模型，provider 直接 400（`No tool output found for tool call …`）。
 /// 序号用 id 比：UUIDv7 的字典序就是创建序，而且是全序，不会出现两个 Run 互相挡住的死结。
 ///
@@ -91,8 +91,10 @@ UPDATE runs
 /// 同源，两处都要有：候选筛选会把不该领的排掉，领取那一句才是最终守卫。
 ///
 /// 候选只有两种形状：`queued`，以及**等时钟**的 `waiting + retry`（`wake_at` 到了）。
-/// 等人（`wait_kind IN ('approval','intervention')`）与等依赖（`dependency`）都不在
-/// 候选里——它们在等人来处置，不是调度器能解决的。
+/// 等人（`wait_kind = 'intervention'`）与等依赖（`dependency`）都不在候选里——它们在等
+/// 人来处置或等前一条跑完，不是调度器能解决的。删审批之前留下的 `wait_kind = 'approval'`
+/// 也不在：Gateway 启动时按 §8.4 把它们 `requeue` 回 `queued`（D2，
+/// [`crate::repos::recovery::RecoveryStore::legacy_approval_waits`]），之后才是候选。
 ///
 /// **可领取的谓词只有一处定义**：这一条与 [`CLAIM_SQL`] 的 `WHERE` 逐字同源（候选是
 /// 筛掉不该领的，领取那一句才是最终守卫，而两句判断的是同一件事）。两者是否真的一致由
@@ -769,7 +771,7 @@ mod tests {
     use super::*;
     use crate::db::DbOptions;
     use crate::models::RunRow;
-    use komo_kernel::types::ids::{ApprovalId, SessionId};
+    use komo_kernel::types::ids::{InterventionId, SessionId};
     use komo_kernel::types::status::{RetryCause, SessionState};
 
     async fn temp() -> (Db, tempfile::TempDir) {
@@ -1026,8 +1028,8 @@ mod tests {
     ///
     /// 少了这条约束，后一个 Run 会踩在前一个停住的半轮上：那次调用还没有结果，回放窗口
     /// 只能带着一个没有输出的 `function_call` 发给模型，provider 直接 400
-    /// （`No tool output found for tool call …`）。停在哪一种等待上都算——这里用用户那条
-    /// 路径上的"等审批"。
+    /// （`No tool output found for tool call …`）。停在哪一种等待上都算——这里用停在人身上
+    /// 的那一种。
     #[tokio::test]
     async fn a_later_run_in_the_same_session_waits_for_the_unfinished_one() {
         let (db, _dir) = temp().await;
@@ -1041,18 +1043,12 @@ mod tests {
         assert_eq!(claimed.run, first, "先来的先领");
 
         queue
-            .commit_status(
-                &claimed,
-                &executor,
-                RunState::Waiting,
-                Some(&approval()),
-                now,
-            )
+            .commit_status(&claimed, &executor, RunState::Waiting, Some(&person()), now)
             .await
             .unwrap();
         assert!(
             queue.claim(&executor).await.unwrap().is_none(),
-            "前一个还停在等审批，后一个不许领"
+            "前一个还停在等人，后一个不许领"
         );
 
         // 前一个收尾之后才轮到后一个。
@@ -1308,7 +1304,7 @@ mod tests {
     /// 验收 B1：**让出执行名额就是交还领取权**。
     ///
     /// 挂起时不清 `claimed_by` 的话，§8.7 那两条语句里的 `claimed_by IS NULL` 永远筛不
-    /// 到这一行——退避到期了、审批答复了，它也再没有人领得走。
+    /// 到这一行——退避到期了、核对答复了，它也再没有人领得走。
     #[tokio::test]
     async fn a_run_waiting_for_its_backoff_can_be_claimed_again_when_it_is_due() {
         let (db, _dir) = temp().await;
@@ -1347,13 +1343,12 @@ mod tests {
         assert_eq!(again.generation, 2, "换人接管，代次要涨");
     }
 
-    /// 等审批的那一行同样交还领取权。
-    ///
-    /// 它**不进**候选查询——候选只有 `queued` 与"到点的 `waiting + retry`"，等人回答的
-    /// 那一行要等决定到达后被重新入队（§13.5）。所以这里断言的是"重新入队之后领得走"，
-    /// 而不是"现在就领得走"：领取权有没有交还，正是这两者的分界。
+    /// 删审批之前停在审批上的那一行（D2）：交还了领取权，**不进**候选查询——候选只有
+    /// `queued` 与"到点的 `waiting + retry`"。Gateway 启动时从
+    /// `RecoveryStore::legacy_approval_waits` 里点出它、`requeue` 回队列，之后领得走：
+    /// 与当初"批准后重新入队"是同一个转换。
     #[tokio::test]
-    async fn a_run_waiting_for_an_approval_also_hands_back_its_claim() {
+    async fn a_legacy_approval_wait_is_claimable_once_requeued() {
         let (db, _dir) = temp().await;
         let queue = TursoRunQueue::new(db.clone());
         let run = queued_run(&db, "sess-approval", "run-approval").await;
@@ -1363,10 +1358,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        suspend(&db, &run, &approval()).await;
+        suspend(&db, &run, &legacy_approval()).await;
         let record = crate::repos::runs::get(&db, &run).await.unwrap().unwrap();
         assert_eq!(record.state, RunState::Waiting);
-        assert_eq!(record.wait, Some(approval()));
+        assert_eq!(record.wait, Some(legacy_approval()));
         assert!(record.claimed_by.is_none());
         assert!(
             queue
@@ -1374,14 +1369,24 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty(),
-            "等人回答的行不该被调度器捡走"
+            "没续跑之前调度器不捡它"
         );
 
-        // 决定到了 → 重新入队 → 领得走。
-        crate::repos::recovery::RecoveryStore::new(db.clone(), std::path::PathBuf::from("."))
-            .requeue(&run)
-            .await
-            .unwrap();
+        // 启动时点得出来 → 重新入队 → 领得走。
+        let recovery =
+            crate::repos::recovery::RecoveryStore::new(db.clone(), std::path::PathBuf::from("."));
+        let legacy = recovery.legacy_approval_waits().await.unwrap();
+        assert_eq!(
+            legacy.iter().map(|r| r.run.clone()).collect::<Vec<_>>(),
+            vec![run.clone()]
+        );
+        assert!(
+            recovery
+                .requeue_if_unchanged(&run, &legacy[0].seen())
+                .await
+                .unwrap()
+        );
+        assert!(recovery.legacy_approval_waits().await.unwrap().is_empty());
         let again = queue
             .claim(&ExecutorId::from_raw("exec-2"))
             .await
@@ -1391,10 +1396,17 @@ mod tests {
         assert_eq!(again.generation, 2);
     }
 
-    /// 等一条审批（句柄是短 ID，这里只用它的 id）。
-    fn approval() -> WaitReason {
+    /// 删审批之前落盘的"等审批"（D2，只解码、不再产生；测试里用它摆出旧行）。
+    fn legacy_approval() -> WaitReason {
         WaitReason::Approval {
-            approval: ApprovalId::from_raw("ap-1"),
+            approval: "ap-1".into(),
+        }
+    }
+
+    /// 停在一条 Intervention 上等人。
+    fn person() -> WaitReason {
+        WaitReason::Intervention {
+            intervention: InterventionId::from_raw("iv-1"),
         }
     }
 
@@ -1550,7 +1562,7 @@ mod tests {
         .await
         .unwrap();
 
-        // 不该领的：退避没到点、等人（审批 / 待判断）、等依赖、已终态。
+        // 不该领的：退避没到点、删审批之前的等审批（D2，要先 requeue）、等人、等依赖、已终态。
         for (id, kind, at) in [
             ("run-retry-later", "retry", later),
             ("run-approval", "approval", now),
@@ -2008,7 +2020,7 @@ mod tests {
         .unwrap();
     }
 
-    /// 父停在**等审批**上（不是等 Run）。
+    /// 父停在删审批之前的**等审批**上（D2 的旧行，不是等 Run）。
     async fn wait_on_approval(db: &Db, run: &RunId) {
         let run = run.clone();
         db.with_write_retry(move |ex| {
@@ -2017,9 +2029,7 @@ mod tests {
                 crate::repos::runs::mark_waiting_in(
                     ex,
                     &run,
-                    &WaitReason::Approval {
-                        approval: ApprovalId::from_raw("ap-1"),
-                    },
+                    &legacy_approval(),
                     None,
                     OffsetDateTime::now_utc(),
                 )
@@ -2033,7 +2043,7 @@ mod tests {
     /// 委派豁免**只对"拦住它的恰好是它的父、且父正等着它"这一种形状**放行（§8.4）。
     ///
     /// 五个形状逐条断言 `due` 与 `claim_run` 一致（"可领取的谓词只有一处定义"）：父还在
-    /// 排队 / 还在跑、父等的是别人、父等的是审批——子 Run 一律不许提前跑；只有父停在
+    /// 排队 / 还在跑、父等的是别人、父停在旧的等审批上——子 Run 一律不许提前跑；只有父停在
     /// **等这一次委派**上才放行。少了这一条，子 Run 会越过父停住的那个半轮，回放窗口就
     /// 带着一个没有输出的 `function_call` 去问模型（provider 400）。
     #[tokio::test]

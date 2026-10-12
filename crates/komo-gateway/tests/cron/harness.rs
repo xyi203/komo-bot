@@ -1,10 +1,10 @@
 //! 这一组测试要的那一台 Gateway：共用件在
 //! `komo_gateway::service::test_support::harness`（真数据目录、真 `service::start`、内存
 //! 发送口、脚本化模型），这里只留 Cron 特有的那几个——扫一轮、把槽位拨到过去、读触发
-//! 记录、在聊天里答审批。
+//! 记录、停住一次触发。
 //!
-//! 数据目录的默认配置（[`Home`]）里 Telegram 是**配了 home chat 的**：无人值守的审批
-//! 请求只有这一个出口（§11.4）。
+//! 数据目录的默认配置（[`Home`]）里 Telegram 是**配了 home chat 的**：无人值守的介入
+//! 只有这一个出口（§11.4）。
 
 #![allow(dead_code, unused_imports)]
 
@@ -37,6 +37,12 @@ pub fn shell_append(
     )
 }
 
+/// 一次"结果不明"的调用（测试工具 `unsure`）：Run 当场停在 `verify` 上等人核对
+/// （§7.5）——审批删掉之后（§7），"一次触发一直没结束"靠的就是它。
+pub fn unsure_round(n: u32, provider_id: &str) -> Result<Round, LlmError> {
+    call_round(n, provider_id, "unsure", serde_json::json!({}))
+}
+
 /// 计数文件里有几行 = 副作用发生了几次。
 pub fn lines(path: &Path) -> usize {
     std::fs::read_to_string(path)
@@ -53,7 +59,6 @@ pub trait CronOps {
     async fn firings(&self, id: &CronJobId) -> Vec<komo_kernel::cron::CronFiring>;
     async fn make_due(&self, id: &CronJobId);
     async fn tick(&self) -> komo_runtime::scheduler::CronTick;
-    async fn approve_in_chat(&self, short_id: &str, scope: &str) -> String;
 }
 
 #[async_trait]
@@ -86,8 +91,7 @@ impl CronOps for Gw {
 
     /// 把一个 Job 的槽位拨到过去，再扫一轮——"到点了"在测试里就是这个意思。
     ///
-    /// 走 `advance` 而不是 `put`：**推进槽位不是定义变更**，用 `put` 会让版本 +1，
-    /// 把「授权按版本绑」那几条测试的前提悄悄改掉（§10）。
+    /// 走 `advance` 而不是 `put`：**推进槽位不是定义变更**，用 `put` 会让版本 +1（§10）。
     async fn make_due(&self, id: &CronJobId) {
         let job = self.job(id).await;
         self.state()
@@ -110,31 +114,4 @@ impl CronOps for Gw {
         self.state().waker().wake();
         tick
     }
-
-    /// 在聊天里答一条审批（`/approve <short_id> [run|cron]` 那条路，§11.3）。
-    async fn approve_in_chat(&self, short_id: &str, scope: &str) -> String {
-        let text = if scope.is_empty() {
-            format!("/approve {short_id}")
-        } else {
-            format!("/approve {short_id} {scope}")
-        };
-        let ack = self
-            .dispatcher()
-            .handle(inbound(
-                ChannelPlatform::Telegram,
-                "111",
-                "111",
-                &text,
-                &format!("telegram:{}", uuid_like()),
-                true,
-            ))
-            .await
-            .expect("Dispatcher 处理");
-        format!("{ack:?}")
-    }
-}
-
-fn uuid_like() -> String {
-    static N: AtomicUsize = AtomicUsize::new(1);
-    format!("k{}", N.fetch_add(1, Ordering::SeqCst))
 }

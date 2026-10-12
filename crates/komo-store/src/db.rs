@@ -677,11 +677,11 @@ pub fn map_toasty(error: toasty::Error) -> StoreError {
 /// [`StoreError`] → [`LedgerError`]。
 ///
 /// `StoreError` → `RepoError` 的方向**不在这里**：kernel 有
-/// `impl From<StoreError> for RepoError`，两个领域性变体在那儿逐个对上，仓储直接
+/// `impl From<StoreError> for RepoError`，领域性变体在那儿逐个对上，仓储直接
 /// `?` 或 `.map_err(RepoError::from)` 就行。
 ///
-/// 账本这边没有对应的变体：预期 revision 不符、授权覆盖不到这份计划，对
-/// [`LedgerError`] 来说都是"这个状态下做不了这件事"，所以并进 [`LedgerError::Conflict`]
+/// 账本这边没有对应的变体：预期 revision 不符，对
+/// [`LedgerError`] 来说是"这个状态下做不了这件事"，所以并进 [`LedgerError::Conflict`]
 /// ——**并进去的是文本，不是沉默**。
 pub fn store_to_ledger(error: StoreError) -> LedgerError {
     match error {
@@ -690,9 +690,6 @@ pub fn store_to_ledger(error: StoreError) -> LedgerError {
         StoreError::Corrupt(message) => LedgerError::Corrupt(message),
         StoreError::VersionConflict { expected, actual } => {
             LedgerError::Conflict(format!("版本冲突：预期 {expected}，当前 {actual}"))
-        }
-        StoreError::GrantMismatch(message) => {
-            LedgerError::Conflict(format!("授权不匹配：{message}"))
         }
         StoreError::Io(message) => LedgerError::Persist(message),
         StoreError::Other(message) => LedgerError::Conflict(message),
@@ -1176,6 +1173,85 @@ mod tests {
         let retry = RetryConfig::default();
         assert!(retry.delay_for(0) < retry.delay_for(3));
         assert_eq!(retry.delay_for(30), retry.max_delay);
+    }
+
+    /// 删 Policy 与审批之前的老库（D2 / D4）：多出来的 `approval_requests` /
+    /// `policy_grants` 两张表、它们的索引与 `deliveries_approval` 都还在，`Db::connect`
+    /// 照样起得来、不碰它们；停在审批上的 Run 读回来是 `WaitReason::Approval`（旧审批
+    /// ID 缺了读成空串，不当损坏），而且不进 Intervention 清单。
+    #[tokio::test]
+    async fn an_old_file_with_the_approval_tables_still_opens_and_its_waits_decode() {
+        use komo_kernel::types::ids::RunId;
+        use komo_kernel::types::status::{RunState, WaitReason};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        plain_build_old(&path, None).await;
+        for sql in [
+            r#"CREATE TABLE "approval_requests" ("id" TEXT NOT NULL, "short_id" TEXT NOT NULL, "session_id" TEXT NOT NULL, "run_id" TEXT, "call_id" TEXT, "plan_hash" TEXT NOT NULL, "plan" TEXT NOT NULL, "reason" TEXT NOT NULL, "changes" TEXT, "evidence" TEXT, "scopes" TEXT NOT NULL, "requested_at" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "decided" BOOLEAN NOT NULL, "decision" TEXT, PRIMARY KEY ("id"))"#,
+            r#"CREATE TABLE "policy_grants" ("id" TEXT NOT NULL, "approval_id" TEXT NOT NULL, "scope_kind" TEXT NOT NULL, "run_id" TEXT, "job_id" TEXT, "job_version" BIGINT NOT NULL, "scope" TEXT NOT NULL, "granted_at" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "consumed" BOOLEAN NOT NULL, "reason" TEXT NOT NULL, PRIMARY KEY ("id"))"#,
+            r#"CREATE INDEX IF NOT EXISTS "approvals_pending" ON "approval_requests" ("decided", "short_id")"#,
+            r#"CREATE INDEX IF NOT EXISTS "grants_run" ON "policy_grants" ("run_id")"#,
+            r#"CREATE INDEX IF NOT EXISTS "grants_job" ON "policy_grants" ("job_id", "job_version")"#,
+            r#"CREATE INDEX IF NOT EXISTS "deliveries_approval" ON "deliveries" ("approval_id")"#,
+            r#"INSERT INTO "approval_requests" VALUES ('ap-1', 'K7QF', 's', 'run-a', 'call-1', 'ph', '{}', 'shell', NULL, NULL, '["once"]', 1, 0, 0, NULL)"#,
+            r#"INSERT INTO "policy_grants" VALUES ('g-1', 'ap-1', 'once', 'run-a', NULL, 0, '{}', 1, 0, 0, 'ok')"#,
+            r#"INSERT INTO "sessions" ("id", "title", "origin", "agent_id", "kind", "workdir", "current_run", "jsonl_path", "applied_seq", "applied_bytes", "created_at", "updated_at", "state", "state_changed_at") VALUES ('s', '', 'api', '', 'normal', NULL, NULL, 'p', 0, 0, 1, 1, 'active', 1)"#,
+        ] {
+            plain_exec(&path, sql).await;
+        }
+        let run_insert = |id: &str, wait_ref: &str| {
+            format!(
+                r#"INSERT INTO "runs" ("id", "session_id", "request_key", "input_hash", "input_event", "input_seq", "final_event", "parent_run_id", "resumes_run_id", "delegate", "status", "state", "wait_kind", "wait_ref", "wake_at", "lease_until", "source", "peer", "claimed_by", "claim_generation", "claimed_at", "next_retry_at", "retry_attempts", "rounds", "max_rounds", "valid_until", "model_snapshot", "effort", "grants", "memory_work", "memory_cursor", "last_error", "created_at", "updated_at", "ended_at") VALUES ('{id}', 's', 'k-{id}', 'h', NULL, 0, NULL, NULL, NULL, NULL, '', 'waiting', 'approval', {wait_ref}, 0, 0, '{{"kind":"interactive","session":"s"}}', NULL, NULL, 1, 0, 0, 0, 0, 0, 0, '{{"provider":"test","base_url":"memory://test","model":"m","api_key_env":"K","timeout_secs":30}}', NULL, '["g-1"]', 'pending', 0, NULL, 1, 1, 0)"#
+            )
+        };
+        plain_exec(&path, &run_insert("run-a", "'ap-1'")).await;
+        plain_exec(&path, &run_insert("run-b", "NULL")).await;
+
+        let db = Db::connect(&path).await.expect("老库照样打得开");
+        db.ensure_schema()
+            .await
+            .expect("多出来的表不挡 ensure_schema");
+
+        let a = crate::repos::runs::get(&db, &RunId::from_raw("run-a"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.state, RunState::Waiting);
+        assert_eq!(
+            a.wait,
+            Some(WaitReason::Approval {
+                approval: "ap-1".into()
+            })
+        );
+        let b = crate::repos::runs::get(&db, &RunId::from_raw("run-b"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            b.wait,
+            Some(WaitReason::Approval {
+                approval: String::new()
+            }),
+            "旧审批 ID 缺了不算损坏"
+        );
+
+        // 不要人：清单里没有它们；Gateway 启动时从这里点出来续跑。
+        assert!(
+            crate::repos::interventions::list(&db, &Default::default())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let legacy = crate::repos::recovery::RecoveryStore::new(db.clone(), dir.path())
+            .legacy_approval_waits()
+            .await
+            .unwrap();
+        assert_eq!(
+            legacy.iter().map(|r| r.run.as_str()).collect::<Vec<_>>(),
+            vec!["run-a", "run-b"]
+        );
     }
 
     /// `models::INDEXES` 真的建出来了。

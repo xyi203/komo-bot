@@ -21,8 +21,8 @@
 //! 恢复方式是 [`RecoveryMode::SafeReread`]：搜索没有副作用，重做只是重新观察（§8.6）。
 //!
 //! `path` 除了本地目录/文件，还认得 §六 的**根入口**：`skill://`（全部 skill 根）与
-//! `artifact://files`（这个会话的产物目录）——**每个真实根一条计划目标**，所以范围判定与
-//! 审批看到的还是真的路径。`tool://` 那种现算的正文不是文件，搜索它没有意义（`prepare`
+//! `artifact://files`（这个会话的产物目录）——**每个真实根一条计划目标**，所以账本与
+//! 审计看到的还是真的路径。`tool://` 那种现算的正文不是文件，搜索它没有意义（`prepare`
 //! 就拒）。
 
 use std::cell::RefCell;
@@ -44,7 +44,7 @@ use tokio::sync::mpsc;
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
-    ApprovedPlan, ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
+    ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{CancelToken, ToolContext, ToolDefinition, ToolError, ToolOutput};
@@ -183,7 +183,7 @@ impl Tool for RgTool {
             });
         }
         // 正则在这里编一次：**它是参数，不是运行结果**。语法错的模式先撞在这里，模型当场
-        // 改一个字重发，而不是先建计划、过审批、再拿回一条失败。（glob 不在这里验：gitignore
+        // 改一个字重发，而不是先建计划、再拿回一条失败。（glob 不在这里验：gitignore
         // 那套 glob 是宽松的，写歪了多半只是"什么都没匹配上"，那不是错误。）
         matcher(&args).map_err(|message| ToolError::InvalidArguments { message })?;
         let targets = match &args.path {
@@ -211,11 +211,11 @@ impl Tool for RgTool {
 
     async fn execute(
         &self,
-        plan: ApprovedPlan,
+        plan: ExecutionPlan,
         ctx: &ToolContext,
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
-        let plan = plan.plan();
+        let plan = &plan;
         let args: RgArgs = parse_args(plan.args.clone(), "rg")?;
         let cwd: PathBuf = plan.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
         let targets: Vec<PathBuf> = plan
@@ -230,7 +230,7 @@ impl Tool for RgTool {
             false => targets,
         };
         let scope = match plan.targets.first().and_then(|target| target.uri()) {
-            // 资源入口印逻辑入口：模型给的就是它（真实根在计划里，审批看得到）。
+            // 资源入口印逻辑入口：模型给的就是它（真实根在计划里，账本看得到）。
             Some(uri) => uri.to_string(),
             None => targets[0].display().to_string(),
         };
@@ -430,7 +430,7 @@ fn targets_of(raw: &str, ctx: &ToolContext) -> Result<Vec<PlanTarget>, ToolError
                 TargetAccess::Read,
             )])
         }
-        // 每个根一条：规则匹配、审批、审计看到的都是真的路径，而逻辑入口还是那一条。
+        // 每个根一条：账本与审计看到的都是真的路径，而逻辑入口还是那一条。
         ResolvedResource::Roots(roots) => Ok(roots
             .into_iter()
             .map(|root| PlanTarget::resource(uri.clone(), Some(root), TargetAccess::Read))
@@ -710,7 +710,7 @@ fn build_overrides(root: &Path, glob: Option<&str>) -> Result<Option<Override>, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context, writer};
+    use crate::tools::test_support::{context, writer};
 
     fn rg_result(output: &ToolOutput) -> RgResult {
         serde_json::from_value(output.result.clone()).expect("rg 的结果")
@@ -734,7 +734,7 @@ mod tests {
         let ctx = context(dir);
         let mut sink = writer(&ctx);
         let plan = tool.prepare(args, &ctx).await.unwrap();
-        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
         let preview = preview(&output);
         (output, preview)
     }
@@ -768,7 +768,7 @@ mod tests {
         );
     }
 
-    /// `path` 是资源入口时**每个真实根一条目标**：规则匹配、审批、审计看到的都是真的路径，
+    /// `path` 是资源入口时**每个真实根一条目标**：账本与审计看到的都是真的路径，
     /// 而逻辑入口还是那一条（`skill://`）。
     #[tokio::test]
     async fn a_skill_root_search_plans_one_target_per_skill_root() {
@@ -809,7 +809,7 @@ mod tests {
         );
 
         let mut sink = writer(&ctx);
-        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
         let printed = preview(&output);
         let result = rg_result(&output);
         assert_eq!(result.path, "skill://", "抬头印逻辑入口");
@@ -851,7 +851,7 @@ mod tests {
         );
 
         let mut sink = writer(&ctx);
-        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
         assert!(
             preview(&output).contains("report.md:1:结论：foo"),
             "{}",
@@ -876,7 +876,7 @@ mod tests {
             )
         );
         let mut sink = writer(&ctx);
-        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
         assert_eq!(rg_result(&output).path, "artifact://files/report.md");
     }
 
@@ -956,7 +956,7 @@ mod tests {
     }
 
     /// 正则的语法错误是**参数错误**：它撞在 prepare 上，模型改一个字就能重发，不用先建
-    /// 计划、过审批、再拿回一条失败。
+    /// 计划、再拿回一条失败。
     #[tokio::test]
     async fn a_bad_pattern_is_rejected_before_any_plan() {
         let dir = workspace();
@@ -1167,7 +1167,7 @@ mod tests {
 
         let result = rg_result(&output);
         assert!(
-            result.stdout_bytes < (MAX_COLUMNS as u64) * 2,
+            result.stdout_bytes < MAX_COLUMNS * 2,
             "长行没被截：写下 {} 字节",
             result.stdout_bytes
         );
@@ -1224,7 +1224,7 @@ mod tests {
             .await
             .unwrap();
         let started = std::time::Instant::now();
-        let output = tool.execute(approved(plan), &ctx, &mut sink).await.unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
 
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -1254,10 +1254,7 @@ mod tests {
             .prepare(serde_json::json!({ "pattern": "foo" }), &ctx)
             .await
             .unwrap();
-        let error = tool
-            .execute(approved(plan), &ctx, &mut sink)
-            .await
-            .unwrap_err();
+        let error = tool.execute(plan, &ctx, &mut sink).await.unwrap_err();
         assert!(matches!(error, ToolError::Cancelled), "{error:?}");
     }
 }

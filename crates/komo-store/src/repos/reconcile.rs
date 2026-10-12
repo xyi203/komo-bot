@@ -1,7 +1,7 @@
 //! §8.9 reconcile 与 §8.10 的 Session 生命周期查询。
 //!
 //! reconcile 是一次**只读观察 + 只写状态**的对账（§8.9）：它不调用工具、不发送外部请求、
-//! 不消费授权、不改写任何内容。这个模块只提供它要的**观察与判定**，以及 §8.10 那三步里
+//! 不改写任何内容。这个模块只提供它要的**观察与判定**，以及 §8.10 那三步里
 //! 落库与删内容的两步：
 //!
 //! - 观察：`sessions.state` 与内容读不读得出来（[`session_observation`]）；
@@ -27,11 +27,10 @@ use toasty::Executor;
 
 use crate::db::{BoxFuture, Db, map_toasty};
 use crate::models::{
-    ApprovalRequestRow, CheckpointRow, CronFiringRow, DeliveryRow, MemoryEvidenceRow, RunRow,
-    SessionRow,
+    CheckpointRow, CronFiringRow, DeliveryRow, MemoryEvidenceRow, RunRow, SessionRow,
 };
 use crate::repos::interventions::blocks_queue;
-use crate::repos::{runs, session};
+use crate::repos::{deliveries, runs, session};
 use crate::session_log::SessionPaths;
 
 /// 一条会话此刻的观察（§8.9 的第一问）：数据库说什么状态，内容读不读得出来。
@@ -228,7 +227,7 @@ pub async fn purge_blockers(db: &Db, session: &SessionId) -> Result<Vec<PurgeBlo
 /// 这个会话名下、**不是 `sent`** 的投递条数。
 ///
 /// `deliveries` 没有 `session_id` 列，归属只能从 `outbound` 里读：两种带会话的（Run 结束、
-/// 需要判断）直接比；审批类按审批 ID 归到会话；纯文本按目标 peer 等于会话来源判断。认不出
+/// 需要判断）直接比；纯文本按目标 peer 等于会话来源判断。认不出
 /// 的一条不算这个会话的——它是别人的投递，删内容不该把它算进来。
 async fn deliveries_blocking(ex: &mut dyn Executor, session: &str) -> Result<usize, StoreError> {
     let origin = SessionRow::filter_by_id(session)
@@ -237,36 +236,21 @@ async fn deliveries_blocking(ex: &mut dyn Executor, session: &str) -> Result<usi
         .await
         .map_err(map_toasty)?
         .map(|row| row.origin);
-    let approvals: BTreeSet<String> =
-        ApprovalRequestRow::filter(ApprovalRequestRow::fields().session_id().eq(session))
-            .exec(ex)
-            .await
-            .map_err(map_toasty)?
-            .into_iter()
-            .map(|row| row.id)
-            .collect();
-
     let rows = DeliveryRow::all().exec(ex).await.map_err(map_toasty)?;
     Ok(rows
         .iter()
-        .filter(|row| row.state != "sent")
+        .filter(|row| !deliveries::is_settled_state(&row.state))
         .filter(|row| {
-            let outbound = serde_json::from_str::<Outbound>(&row.outbound);
-            match outbound {
-                Ok(Outbound::RunFinished { session: s, .. })
-                | Ok(Outbound::NeedsAttention { session: s, .. }) => s.as_str() == session,
-                Ok(Outbound::ApprovalRequest(presentation)) => {
-                    approvals.contains(presentation.approval.as_str())
-                }
-                Ok(Outbound::ApprovalSettled { approval, .. }) => {
-                    approvals.contains(approval.as_str())
-                }
-                Ok(Outbound::Text { .. }) => origin.as_deref().is_some_and(|origin| {
+            match Outbound::from_stored(&row.outbound) {
+                Ok(Some(Outbound::RunFinished { session: s, .. }))
+                | Ok(Some(Outbound::NeedsAttention { session: s, .. })) => s.as_str() == session,
+                Ok(Some(Outbound::Text { .. })) => origin.as_deref().is_some_and(|origin| {
                     origin.split_once(':').is_some_and(|(platform, chat)| {
                         platform == row.platform && chat == row.chat_id
                     })
                 }),
-                Err(_) => false,
+                // 已作废的旧审批行（D3）不再投递，不挡回收；坏行认不出归属，同样不算。
+                Ok(None) | Err(_) => false,
             }
         })
         .count())

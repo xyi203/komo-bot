@@ -18,9 +18,9 @@
 //! - **`record_round` 在 `complete` 之前。**会话消息面只认 `message.assistant`，
 //!   `run.completed` 里的 `final_message` 是补读用的副本。倒过来这一轮的回答会从历史
 //!   里消失，而账本看上去一切正常。
-//! - **`Ask` 让出名额。**executor 报「需审批」时这一段就结束：`Ledger::suspend` 之后
-//!   返回，**不在进程里等人**。审批可能一天后才从手机上来，等着的进程只是占着一个
-//!   执行名额（§6、§7.4）。停下来的形状是 `waiting` + 一条 `WaitReason`——"在等谁、
+//! - **等人让出名额。**executor 报「结果不明，要人核对」或「等子 Run」时这一段就结束：
+//!   `Ledger::suspend` 之后返回，**不在进程里等**。答复可能一天后才从手机上来，等着的
+//!   进程只是占着一个执行名额（§6、§7.5）。停下来的形状是 `waiting` + 一条 `WaitReason`——"在等谁、
 //!   等到什么时候"是另一个问题，答案不在状态里。
 //! - **工具失败是结果，驱动失败是终止。**普通工具失败交给模型修正；只有驱动 / LLM
 //!   错误中止整轮（§6）。
@@ -202,7 +202,7 @@ pub enum SegmentOutcome {
         rounds: u32,
         usage: TokenUsage,
     },
-    /// 让出了执行名额，等审批 / 等人处理 / 等退避到点（§8.4）。**状态只有一个
+    /// 让出了执行名额，等人处理 / 等子 Run / 等退避到点（§8.4）。**状态只有一个
     /// `waiting`**，是 [`WaitReason`] 说得出在等什么。
     Suspended {
         wait: WaitReason,
@@ -637,15 +637,6 @@ impl AgentLoop {
         stop: RoundStop,
     ) -> Result<SegmentOutcome, AgentError> {
         match stop {
-            // 停在哪条调用上是**事件**的落点（`RunWaiting.call`），而这里交给
-            // `Ledger::suspend` 的只有"在等一条审批"这件事：调用 ID 在 `approval_requests
-            // .call_id` 上，那是权威，`suspend` 不替它猜（见 store 的实现）。
-            RoundStop::Approval { approval, call } => {
-                tracing::info!(run = %run, %approval, %call, "停在审批上，让出执行名额");
-                let wait = WaitReason::Approval { approval };
-                self.ledger.suspend(run, wait.clone()).await?;
-                Ok(SegmentOutcome::Suspended { wait, rounds })
-            }
             // 「结果不明」停在**一条 Intervention** 上等人核对（§7.5、§8.6）。句柄就是
             // 这个 Run：一个 Run 上最多停着一条要人判断的干预，再编一个 ID 只会和清单
             // 对不上。自由文本的理由没有地方可放（`WaitReason::Intervention` 只有句柄，

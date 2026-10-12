@@ -25,11 +25,7 @@ use wechatbot::types::{
 
 use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::traits::{GatewayError, Inbound};
-use komo_kernel::types::chat::{ApprovalPresentation, ApprovalScope};
-use komo_kernel::types::ids::{ApprovalId, OperationId, RunId, SessionId, ShortId};
-use komo_kernel::types::plan::{
-    ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
-};
+use komo_kernel::types::ids::{RunId, SessionId};
 
 use super::send::{Auth, ContextTokens, WeChatSender};
 use super::{AlertSink, WeChatChannel};
@@ -459,43 +455,5 @@ impl RecordingAlerts {
 impl AlertSink for RecordingAlerts {
     async fn alert(&self, text: String) {
         self.alerts.lock().expect("告警记录").push(text);
-    }
-}
-
-// ---------------------------------------------------------------- 审批样例
-
-pub fn plan() -> ExecutionPlan {
-    ExecutionPlan {
-        operation_id: OperationId::from_raw("op-1"),
-        source: PlanSource::Interactive {
-            session: SessionId::from_raw("s-1"),
-        },
-        tool: "shell".into(),
-        operation: Operation::ShellCommand {
-            command: "rm -rf /tmp/scratch".into(),
-        },
-        run: Some(RunId::from_raw("run-1")),
-        tool_call: None,
-        args: json!({ "command": "rm -rf /tmp/scratch" }),
-        cwd: Some(std::path::PathBuf::from("/home/op/work")),
-        targets: vec![PlanTarget::local("/tmp/scratch", TargetAccess::Write)],
-        versions: PlanVersions::default(),
-        resources: Vec::new(),
-        recovery: RecoveryMode::NoSafeRecovery,
-        then_run: None,
-    }
-}
-
-pub fn presentation() -> ApprovalPresentation {
-    ApprovalPresentation {
-        approval: ApprovalId::from_raw("ap-1"),
-        short_id: ShortId::parse("7K2M").expect("短 ID"),
-        plan_hash: plan().plan_hash(),
-        plan: plan(),
-        reason: "写入 workspace 之外的路径（第 3 条规则）".into(),
-        changes: Some("--- a/x\n+++ b/x\n-1\n+2".into()),
-        evidence: None,
-        scopes: vec![ApprovalScope::Once, ApprovalScope::Run],
-        valid_until: None,
     }
 }

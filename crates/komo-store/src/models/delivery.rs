@@ -17,11 +17,8 @@ pub struct DeliveryRow {
     pub is_home: bool,
     /// `Outbound` 的 JSON。
     pub outbound: String,
-    /// 这条投递说的是哪条审批（只有 `ApprovalRequest` / `ApprovalSettled` 有）。
-    ///
-    /// 它是从 `outbound` 里提出来的**同一个值**，另开一列只为了能在 SQL 里筛：决定之后
-    /// 要把 `ApprovalSettled` 投到当初 `ApprovalRequest` 投过的**每一个**目标，那是一次
-    /// 按审批 ID 的查询（§11.4）。
+    /// **退役列**（审批在 2026-10-11 删掉了，D4）：永远写 NULL，不再读。老库里那些审批
+    /// 投递行这里还有审批 ID；它们读到时作废（[`crate::repos::deliveries::RETIRED_STATE`]）。
     pub approval_id: Option<String>,
     /// 逻辑通知身份；与目标会话一起去重，重启后仍有效。
     pub notification_key: Option<String>,

@@ -7,10 +7,9 @@
 //! | `POST /open-apis/auth/v3/tenant_access_token/internal` | 拿 tenant token（`komo channel probe` 也是它） |
 //! | `GET /open-apis/bot/v3/info` | 机器人自己的 `open_id`——群里认 @提及 要用 |
 //! | `POST /open-apis/im/v1/messages` | 发文本 / 发卡片 |
-//! | `PATCH /open-apis/im/v1/messages/{id}` | 决定之后原地换掉审批卡、Run 终态时换掉处理中卡片（§11.3） |
+//! | `PATCH /open-apis/im/v1/messages/{id}` | Run 终态时换掉处理中卡片（§11.3） |
 //! | `POST /open-apis/im/v1/messages/{id}/reply` | 回复原消息发一张处理中卡片 |
 //! | `POST /open-apis/im/v1/messages/{id}/reactions` | 给原消息加表情回复（收到了） |
-//! | `GET /open-apis/im/v1/chats/{id}` | 这个会话是不是私聊——卡片回调载荷里没有这一项 |
 //!
 //! 只解析用得到的字段，其余一律忽略：开放平台每月加字段，而一个多出来的键不应该让一
 //! 条事件或一次回复整体失败。
@@ -34,7 +33,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 /// 提前多久换一张新 token。
 ///
 /// 服务端给的是有效期，不是"还能用多久"：一张只剩几秒的 token 会在网络慢一点的那次
-/// 调用上过期，而那一次正是要把审批送出去的那一次。
+/// 调用上过期，而那一次可能正是要把介入送出去的那一次。
 const TOKEN_SKEW: Duration = Duration::from_secs(300);
 
 /// token 至少缓存这么久。服务端给出一个荒唐的小有效期时不至于变成每次调用取一次。
@@ -312,29 +311,6 @@ impl FeishuApi {
         .map(|_| ())
     }
 
-    /// 这个会话是不是单聊。
-    ///
-    /// 卡片回调的载荷里只有 `open_chat_id`，没有会话类型（spike callbacks.md 2a），而
-    /// Dispatcher 要靠 `is_private` 决定这条命令落到 home session 还是群会话
-    /// （§11.2）。所以只能问一次平台。
-    pub async fn chat_is_private(&self, chat_id: &str) -> Result<bool, FeishuError> {
-        #[derive(Deserialize)]
-        struct Chat {
-            #[serde(default)]
-            chat_mode: String,
-        }
-        let token = self.tenant_token().await?;
-        let chat: Chat = self
-            .call_data(
-                reqwest::Method::GET,
-                &format!("/open-apis/im/v1/chats/{chat_id}"),
-                Some(&token),
-                None,
-            )
-            .await?;
-        Ok(chat.chat_mode == "p2p")
-    }
-
     #[cfg(test)]
     fn cached_token_deadline(&self) -> Option<Instant> {
         self.token
@@ -584,13 +560,6 @@ mod tests {
         assert_eq!(reactions.len(), 1);
         assert_eq!(reactions[0]["target"], "om_origin");
         assert_eq!(reactions[0]["reaction_type"]["emoji_type"], "Get");
-    }
-
-    #[tokio::test]
-    async fn a_chat_reports_whether_it_is_a_dm() {
-        let fake = FakeOpenApi::start(Behavior::default()).await;
-        assert!(fake.api().chat_is_private("oc_dm").await.unwrap());
-        assert!(!fake.api().chat_is_private("oc_group").await.unwrap());
     }
 
     #[test]

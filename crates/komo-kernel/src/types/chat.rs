@@ -7,10 +7,8 @@
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
-use time::OffsetDateTime;
 
-use super::ids::{ApprovalId, DeliveryId, RunId, SessionId, ShortId};
-use super::plan::{ExecutionPlan, PlanHash};
+use super::ids::{DeliveryId, RunId, SessionId};
 
 /// 三个聊天渠道，加上 TUI / CLI 走的 HTTP API。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -143,7 +141,7 @@ impl fmt::Display for ChannelPeer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Principal {
-    /// 在 `allow_from` 里。**审批命令只接受它。**
+    /// 在 `allow_from` 里。**下指令的命令只接受它。**
     Operator {
         platform: ChannelPlatform,
         id: PeerId,
@@ -175,68 +173,17 @@ impl Principal {
     }
 }
 
-/// 一条审批可以被批到多大范围（§7.2）。
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalScope {
-    /// 只批准眼前这一份执行计划。聊天里的按钮只给这一种（§11.3）。**默认**：把一个
-    /// 动作预批到更大范围，等于替一个还没人看过的后续动作签字。
-    #[default]
-    Once,
-    /// 本次 Run 的范围授权。
-    Run,
-    /// 绑定 Job 版本的 Cron 授权。
-    CronJob,
-}
-
-/// 一条审批请求在界面上要显示的东西（§7.2 / §11.3）。正文由 executor 组装，**渲染**
-/// 由各渠道实现。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApprovalPresentation {
-    pub approval: ApprovalId,
-    pub short_id: ShortId,
-    pub plan_hash: PlanHash,
-    /// 具体动作：工具、命令 / 代码、真实目标路径、cwd、版本。
-    pub plan: ExecutionPlan,
-    /// `PolicyDecision::Ask` 给出的原因。
-    pub reason: String,
-    /// 改动：write / edit 的 diff（已截断），或 toolbox 启用的版本差异。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub changes: Option<String>,
-    /// 已有验证结果：例如候选模块的测试输出。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence: Option<String>,
-    /// 这条请求可以被批到哪些范围。总是包含 [`ApprovalScope::Once`]。
-    #[serde(default)]
-    pub scopes: Vec<ApprovalScope>,
-    /// 审批本身的有效期。过期不能按旧指令直接产生新的外部影响（§8.4）。
-    #[serde(
-        default,
-        with = "time::serde::rfc3339::option",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub valid_until: Option<OffsetDateTime>,
-}
-
 /// 主动投递的内容（§11.4）。
+///
+/// `deliveries.outbound` 里存的就是它的 JSON。**读回库里的行用 [`Outbound::from_stored`]**，
+/// 不要直接 `serde_json::from_str`：2026-10-11 删掉审批之前写下的
+/// `approval_request` / `approval_settled` 两类行还在老库里（D3），直接解码会报错，一条
+/// 旧行就能卡死补发循环。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Outbound {
     /// 一段纯文本：Run 的最终回复、命令的回执、被拒绝的提示。
     Text { text: String },
-    /// 一条待处理的审批（§11.3 渲染表）。
-    ApprovalRequest(Box<ApprovalPresentation>),
-    /// 审批已经有结论了——用来把原消息原地更新成"已批准 / 已拒绝 · 谁 · 何时"。
-    ApprovalSettled {
-        approval: ApprovalId,
-        short_id: ShortId,
-        approved: bool,
-        by: PeerId,
-        #[serde(with = "time::serde::rfc3339")]
-        at: OffsetDateTime,
-    },
     /// Run 结束了。
     RunFinished {
         session: SessionId,
@@ -251,12 +198,33 @@ pub enum Outbound {
     },
 }
 
+impl Outbound {
+    /// 已经不再产生、但老库里还可能读到的 `kind`（审批在 2026-10-11 删掉了）。
+    pub const RETIRED_KINDS: [&'static str; 2] = ["approval_request", "approval_settled"];
+
+    /// 解码一条落盘的投递正文。
+    ///
+    /// `Ok(None)` = 这是一条**已作废**的旧行（`kind` 在 [`Self::RETIRED_KINDS`] 里）：正文
+    /// 不再有意义，调用方把它标成不再投递、跳过，不能当错误重试。真正坏掉的 JSON 仍然是
+    /// `Err`。
+    pub fn from_stored(json: &str) -> Result<Option<Outbound>, serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(json)?;
+        let retired = value
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|kind| Self::RETIRED_KINDS.contains(&kind));
+        if retired {
+            return Ok(None);
+        }
+        serde_json::from_value(value).map(Some)
+    }
+}
+
 /// 投递目标。home chat 的解析只看配置（§11.4），所以这里是一个已解析出来的会话。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryTarget {
     pub peer: ChannelPeer,
-    /// 这条投递是不是"补送到 home chat 的那一份"。来源会话与 home chat 都会收到审批
-    /// 请求，第二个答复得到"已决定"（§11.4）。
+    /// 这条投递是不是"补送到 home chat 的那一份"（§11.4）。
     #[serde(default)]
     pub is_home: bool,
 }
@@ -346,6 +314,23 @@ mod tests {
         };
         assert!(operator.is_operator());
         assert!(!stranger.is_operator());
+    }
+
+    #[test]
+    fn an_old_approval_delivery_reads_back_as_retired() {
+        // 删掉审批之前落盘的两类行：正文照旧，读回来是"已作废"，不是错误。
+        let request = r#"{"kind":"approval_request","approval":"ap-1","short_id":"7K2M","plan_hash":"abc","plan":{},"reason":"shell","scopes":["once"]}"#;
+        let settled = r#"{"kind":"approval_settled","approval":"ap-1","short_id":"7K2M","approved":true,"by":"ou_1","at":"2026-09-18T08:00:00Z"}"#;
+        assert_eq!(Outbound::from_stored(request).unwrap(), None);
+        assert_eq!(Outbound::from_stored(settled).unwrap(), None);
+
+        let text = serde_json::to_string(&Outbound::Text { text: "hi".into() }).unwrap();
+        assert_eq!(
+            Outbound::from_stored(&text).unwrap(),
+            Some(Outbound::Text { text: "hi".into() })
+        );
+        assert!(Outbound::from_stored(r#"{"kind":"carrier_pigeon"}"#).is_err());
+        assert!(Outbound::from_stored("not json").is_err());
     }
 
     #[test]

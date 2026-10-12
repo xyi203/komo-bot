@@ -6,10 +6,9 @@
 //!
 //! 两条 §10 的语句在这个文件里各只有一处实现：
 //!
-//! - **「Job、模块或权限发生变化时重新匹配授权」**：改**定义**走
-//!   [`CronRepo::put`]（版本 +1，`GrantScope::CronJob` 绑的那个版本随之失效），只改
-//!   `status`（`pause` / `resume`）走 [`CronRepo::advance`]（版本一个字不动）。把两者
-//!   混成一条路的代价是具体的：操作者每暂停一次就要把这个 Job 的授权重批一遍。
+//! - **改定义与改状态分开**：改**定义**走 [`CronRepo::put`]（版本 +1），只改
+//!   `status`（`pause` / `resume`）走 [`CronRepo::advance`]（版本一个字不动）——暂停
+//!   一个 Job 不是改它的定义。
 //! - **「可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析」**：
 //!   [`resolve_model`] 要么整份用请求给的 `model_config`，要么把 `model` 当作目录 alias
 //!   解析——两种都产出一份**完整**配置，而且都不碰记忆与向量模型（那两个
@@ -40,7 +39,6 @@ use super::idempotency::body_hash;
 pub async fn list(State(api): State<Api>) -> ApiResult<Json<CronListResponse>> {
     let jobs = api.state.cron.list().await?;
     let mut status = Vec::with_capacity(jobs.len());
-    let now = api.state.clock.now();
     for job in &jobs {
         // 一条也读不出来不该让整张清单报错：这是个运行面，不是权威。
         let last = api
@@ -51,20 +49,10 @@ pub async fn list(State(api): State<Api>) -> ApiResult<Json<CronListResponse>> {
             .unwrap_or_default()
             .into_iter()
             .next();
-        // **这条授权存在**在这里看得见（§10「add 即授权」）：命令 Job 一创建就该有，
-        // 读不出来（网络/存储抖动）时宁可答"没有"也不该让整张清单报错。
-        let authorized = !api
-            .state
-            .approval_repo
-            .grants_for_job(&job.id, job.version, now)
-            .await
-            .unwrap_or_default()
-            .is_empty();
         status.push(CronJobStatus {
             job: job.id.clone(),
             next_run_at: job.next_run_at,
             last,
-            authorized,
         });
     }
     Ok(Json(CronListResponse { jobs, status }))
@@ -142,110 +130,11 @@ pub async fn create(
         return Err(ApiFailure::invalid(error.to_string()));
     }
 
+    // 命令 Job 不再签授权（§7 删掉审批之后，触发时那次 `shell` 调用直接执行）。
     let stored = api.state.cron.put(job).await?;
-    // **add 即授权**（§10、§7.2）：命令 Job 一创建，触发时 CommandDriver 会发出的那次
-    // `shell` 调用就已经有一条覆盖得到它的授权——不必等第一次触发停下来问一遍。写不下
-    // 授权不该让这次创建失败：Job 已经建成了，缺一条授权只是退回"以后每次都要问"。
-    grant_command_job(&api, &stored).await;
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &stored);
     Ok(Json(stored))
-}
-
-/// `cron add` 时给命令 Job 同时签发一条执行授权。
-///
-/// 匹配器必须与触发时 `CommandDriver` 真正驱动出来的那份计划同源——用
-/// [`komo_runtime::tools::shell::plan_for`]（`ShellTool::prepare` 自己也调它）而不是
-/// 在这里手写第二份 `ExecutionPlan`，两处才不会因为各自改一点而悄悄分岔。
-///
-/// `plan.cwd` 在这里只是记录性质：`GrantScope::CronJob` 覆不覆盖一份计划，看的是
-/// 工具、命令正文与命令版本快照（[`komo_kernel::policy::Grant::covers`]），不看
-/// 工作目录——所以 Job 没写 `workdir` 时给一个占位值不影响这条授权将来覆盖得到谁。
-///
-/// **授权要挂在一条真的、已决定的审批上，不是装饰**：`Grant.approval` 不是溯源标识
-/// 那么简单——触发时 `executor::authorize` 靠 `covering_grant` 拿到这条授权就去
-/// `ApprovalRepo::consume` 它，那一步要求 `approval_requests` 里真有这一行、`decision`
-/// 已经写着"批准"、`decision.grant` 指着这条 `Grant` 自己（见 `repos::approvals::
-/// consume_in`）。所以这里落两行：一条**创建时就带着决定**的 `ApprovalRecord`，和
-/// 它指着的那条 `Grant`。这条审批从不出现在待处理清单里（`decision` 从一开始就不是
-/// `None`），也从不投给任何人——它只是"触发时结账"要翻到的那一页。
-///
-/// `session` 是这条审批记录里唯一没有天然答案的字段：`cron add` 这一刻还没有任何一次
-/// 触发，也就没有真的 Session。这里用这个 Job 自己派生出一个稳定的占位 Session
-/// ID——它不出现在任何人的会话列表里（没有人会去 `resume` 它），只在这条记录需要
-/// "属于哪个会话"时给一个诚实的答案："这条命令 Job 自己的审批记账"。
-async fn grant_command_job(api: &Api, job: &CronJob) {
-    let Some(command) = &job.command else {
-        return;
-    };
-    let cwd = job
-        .workdir
-        .clone()
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let source = komo_kernel::types::plan::PlanSource::Cron {
-        job: job.id.clone(),
-        job_version: job.version,
-    };
-    let plan = komo_runtime::tools::shell::plan_for(source, cwd, command);
-    let Some(scope) =
-        komo_kernel::policy::scope_for(&plan, komo_kernel::types::chat::ApprovalScope::CronJob)
-    else {
-        tracing::warn!(job = %job.id, "命令 Job 的计划落不成一条 Cron 范围授权，跳过签发");
-        return;
-    };
-    let now = api.state.clock.now();
-    let approval = komo_kernel::types::ids::ApprovalId::new_at(now);
-    let grant_id = komo_kernel::types::ids::GrantId::new_at(now);
-    let reason = format!("`cron add` 创建命令 Job 「{}」时签发", job.name);
-
-    let record = komo_kernel::protocol::http::ApprovalRecord {
-        approval: approval.clone(),
-        short_id: komo_kernel::types::ids::ShortId::from_index(0),
-        session: komo_kernel::types::ids::SessionId::from_raw(format!("cron-grant:{}", job.id)),
-        run: None,
-        call: None,
-        plan_hash: plan.plan_hash(),
-        plan: plan.clone(),
-        reason: reason.clone(),
-        changes: None,
-        evidence: None,
-        scopes: vec![komo_kernel::types::chat::ApprovalScope::CronJob],
-        requested_at: now,
-        valid_until: None,
-        decision: Some(komo_kernel::protocol::http::ApprovalDecisionRecord {
-            approved: true,
-            scope: komo_kernel::types::chat::ApprovalScope::CronJob,
-            by: None,
-            decided_at: now,
-            grant: Some(grant_id.clone()),
-            consumed: false,
-        }),
-    };
-    if let Err(error) = api.state.approval_repo.create(record).await {
-        tracing::warn!(%error, job = %job.id, "命令 Job 的授权记录写不下，以后每次触发都要重新问一遍");
-        return;
-    }
-
-    let grant = komo_kernel::policy::Grant {
-        id: grant_id,
-        approval,
-        scope,
-        granted_at: now,
-        valid_until: None,
-        consumed: false,
-        reason,
-    };
-    match api.state.approval_repo.put_grant(grant).await {
-        Ok(grant) => {
-            tracing::info!(job = %job.id, grant = %grant.id, "命令 Job 的执行授权已签发");
-        }
-        Err(error) => {
-            tracing::warn!(
-                %error, job = %job.id,
-                "命令 Job 的执行授权写不下，以后每次触发都要重新问一遍"
-            );
-        }
-    }
 }
 
 /// `PATCH /v1/cron/{id}`：给出的字段才改。`pause` / `resume` 就是改 `status`。
@@ -329,7 +218,7 @@ pub async fn update(
         return Err(ApiFailure::invalid(error.to_string()));
     }
 
-    // **改定义走 `put`**：版本递增，绑定这个 Job 的授权随之失效（§7.2 / §10）。
+    // **改定义走 `put`**：版本递增（§10）。
     // 只改 `status` 走 `advance`：暂停一个 Job 不是改它的定义，版本一个字都不动。
     let stored = if request.changes_definition() {
         api.state.cron.put(job).await?

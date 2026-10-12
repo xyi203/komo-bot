@@ -69,7 +69,6 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
     }
 
     check_channels(snapshot, &mut issues);
-    check_policy(snapshot, &mut issues);
     check_execution(snapshot, &mut issues);
     check_compaction(snapshot, &mut issues);
     check_typesafe(snapshot, &mut issues);
@@ -629,26 +628,6 @@ fn check_peer_id(platform: ChannelPlatform, peer: &PeerId) -> Result<(), String>
     }
 }
 
-fn check_policy(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
-    let mut seen: Vec<&str> = Vec::new();
-    for rule in &snapshot.policy.rules {
-        if rule.id.trim().is_empty() {
-            issues.push(error(
-                "policy.rules",
-                "规则要有 id——决策理由里要指得出是哪一条放的行",
-            ));
-            continue;
-        }
-        if seen.contains(&rule.id.as_str()) {
-            issues.push(error(
-                "policy.rules",
-                format!("规则 id `{}` 重复了", rule.id),
-            ));
-        }
-        seen.push(&rule.id);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,14 +828,6 @@ mod tests {
         let mut snapshot = snapshot_fixture();
         snapshot.memory.retrieval.top_k = 99;
         assert_eq!(keys(&validate(&snapshot)), vec!["memory.retrieval.top_k"]);
-    }
-
-    #[test]
-    fn a_duplicate_policy_rule_id_is_refused() {
-        let mut snapshot = snapshot_fixture();
-        let first = snapshot.policy.rules[0].clone();
-        snapshot.policy.rules.push(first);
-        assert_eq!(keys(&validate(&snapshot)), vec!["policy.rules"]);
     }
 
     /// `auth = "chatgpt"` 立得住：不读 `.env` 变量，只要凭证文件的指纹在快照里。

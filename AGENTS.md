@@ -23,7 +23,7 @@ komo resume SESSION_ID
 komo gateway [--foreground] | gateway status|stop|restart
 komo config check | config reload
 komo channel list|probe | channel wechat login
-komo approval list|show|approve|reject
+komo intervention list|show|answer
 komo cron … | komo memory … | komo skills … | komo doctor
 komo update                    # swap the on-disk binary from the GitHub release (§13.6)
 ```
@@ -33,14 +33,14 @@ The full command table is §3 of the design.
 ## Crate layout (§13.4)
 
 ```text
-komo-kernel    value types, state machines, events + fold, Policy engine,
-               cron math, §8.4 recovery decision table, wire protocol, ALL traits.
+komo-kernel    value types, state machines, events + fold, cron math,
+               §8.4 recovery decision table, wire protocol, ALL traits.
                No tokio, no I/O. lib.rs is module declarations only.
 komo-store     session_log (JSONL) · payloads · tool_output · Turso Db + toasty
                models + *_TABLE_DDL · repositories · Coordinator (impl Ledger).
                The only crate that sees toasty/turso.
 komo-runtime   agent loop · executor · tools/{read,write,edit,rg,shell,python} ·
-               python_runtime · policy · approvals · memory · llm · embedding ·
+               python_runtime · memory · llm · embedding ·
                scheduler · recovery · config.
 komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名 ·
                上下文装配（context：ContextInput → AgentContext，系统提示、回放、记忆段）。
@@ -48,7 +48,7 @@ komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编
                值类型（AgentProfile/AgentSurface/RunSnapshot）留在 kernel。
 komo-gateway   axum routes · SSE · auth · lock/discovery · launchd/systemd ·
                Dispatcher · channels/{feishu,telegram,wechat} (feature-gated) ·
-               Notifier · deliveries · approval rendering · config reload.
+               Notifier · deliveries · intervention rendering · config reload.
 komo-client    HTTP + SSE client · discovery · ratatui TUI · command output.
                Depends on kernel only.
 komo (bin)     clap dispatch only.
@@ -63,18 +63,22 @@ depends on `agent`; `client` knows only protocol types.
 
 - **Gateway is the only process that opens state.** CLI and TUI go over
   HTTP/SSE; there is no direct-db path (§3).
-- **Content authority is the Session directory, scheduling/authorization
-  authority is state.db** (§8.2). Write order per §8.5: external body → JSONL
+- **Content authority is the Session directory, scheduling authority
+  is state.db** (§8.2). Write order per §8.5: external body → JSONL
   append + `sync_all` → db transaction. Never the other way round.
 - **Nothing rewrites a JSONL line.** Cancellation, interjection, compaction are
   appended events; `fold` decides what they mean. Unknown event types keep
   their seq and mean nothing (§8.3).
-- **Policy is a pure function** on an `ExecutionPlan` + `PolicyContext`. Grants
-  are passed in, never looked up inside. `Ask` suspends the Run; `Deny` cannot
-  be overridden by any grant. You cannot reach `execute` without a `Proof`
-  (type state, §7).
-- **Approvals bind a plan hash.** Repeated answers are idempotent; a consumed
-  approval is not a retry license (§7.4).
+- **There is no Policy and no approval** (§7, removed 2026-10-11). What the
+  model asks, komo executes once the tool's own `prepare` and the capability
+  surface accept it; `Tool::execute` takes the `ExecutionPlan`. Old approval
+  traces must still decode (§7.4): `approval.*` events mean nothing, a Run left
+  `waiting + approval` resumes as approved, retired delivery/outbox rows are
+  skipped and never block a flush.
+- **The only hard limit lives in the tools:** `write`/`edit` refuse komo's own
+  state (`sessions/`, `state.db*`, `runtime/`, `.env` under the data dir).
+  shell/python cannot be stopped; real boundaries come only from an execution
+  environment (codemode's sandbox).
 - **Recovery decides "did it happen" before "retry"** (§8.4 table, §8.6).
   `started` alone proves nothing. Unknown outcome → `uncertain`, surfaced to
   the operator, never silently re-run.

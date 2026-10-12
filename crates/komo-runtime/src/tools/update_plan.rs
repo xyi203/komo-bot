@@ -44,7 +44,7 @@ impl Tool for UpdatePlanTool {
         ToolDefinition {
             name: NAME.into(),
             description: "更新这次任务的工作计划。多步的事先登记计划，之后每推进一步再调一次；\
-                          没有副作用，不用审批。规则：每次都发**整份**计划，不是增量；步骤 id \
+                          没有副作用。规则：每次都发**整份**计划，不是增量；步骤 id \
                           保持不变，先登记、做完再标 completed（一上来就标 completed 的新步骤\
                           只算补记历史）；同一时间最多一个 in_progress；标 completed 时在 \
                           progress 里写上改了哪些文件、怎么验证的、做了什么决定——完成一步时 \
@@ -142,7 +142,7 @@ impl Tool for UpdatePlanTool {
 
     async fn execute(
         &self,
-        _plan: komo_kernel::types::plan::ApprovedPlan,
+        _plan: komo_kernel::types::plan::ExecutionPlan,
         _ctx: &ToolContext,
         _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
@@ -156,7 +156,7 @@ impl Tool for UpdatePlanTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context, writer};
+    use crate::tools::test_support::{context, writer};
 
     #[tokio::test]
     async fn the_plan_is_inline_args_with_a_safe_recovery() {
@@ -216,7 +216,7 @@ mod tests {
             .await
             .unwrap();
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::Failed { .. }), "{error:?}");

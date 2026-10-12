@@ -643,7 +643,7 @@ mod tests {
         let recorder = RecordingInbound::with_ack(
             fake.log(),
             InboundAck::Replied {
-                text: "没有待处理的审批".into(),
+                text: "现在没有待处理的 Intervention。".into(),
             },
         );
 
@@ -658,7 +658,7 @@ mod tests {
         assert_eq!(sends[0]["msg"]["to_user_id"], "wxid_op");
         assert_eq!(
             sends[0]["msg"]["item_list"][0]["text_item"]["text"],
-            "没有待处理的审批"
+            "现在没有待处理的 Intervention。"
         );
         // 回执用的是这条消息自带的令牌——入站与出站共用同一张表。
         assert_eq!(sends[0]["msg"]["context_token"], "ct-wxid_op");

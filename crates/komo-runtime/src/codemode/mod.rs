@@ -269,9 +269,7 @@ mod tests {
             return None;
         }
         #[cfg(target_os = "linux")]
-        if landlock::abi().is_none() {
-            return None;
-        }
+        landlock::abi()?;
         if !cfg!(any(target_os = "linux", target_os = "macos")) {
             return None;
         }

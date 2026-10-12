@@ -1,4 +1,4 @@
-//! `config.toml` / `policy.toml` 的文件形状 → 一份 kernel [`ConfigSnapshot`]（§3、§13.3）。
+//! `config.toml` 的文件形状 → 一份 kernel [`ConfigSnapshot`]（§3、§13.3）。
 //!
 //! 文件结构在这里单独写一遍，不直接 `Deserialize` 快照本身：`model_providers` 只是
 //! 连接默认值，`model.<alias>` 才是模型目录项，角色最后解析成完整配置。运行时不再做
@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use komo_kernel::policy::RuleTable;
 use komo_kernel::protocol::config::{
     ChannelConfig, ChannelsConfig, CompactionConfig, ConfigSnapshot, ExecutionConfig, KeyPath,
     McpServerConfig, McpTransport, MemoryConfig, PathsConfig, RetrievalConfig, SourceFile,
@@ -378,12 +377,12 @@ impl ChannelSection {
 
 // ---------------------------------------------------------------- 装配
 
-/// 三个来源文件的位置。
+/// 两个来源文件的位置。退役的 `policy.toml` 不在这里：热重载不看它（§7），它还在时
+/// 只在加载时报一句警告（`config::retired_policy`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sources {
     pub config: PathBuf,
     pub env: PathBuf,
-    pub policy: PathBuf,
 }
 
 impl Sources {
@@ -391,12 +390,11 @@ impl Sources {
         Sources {
             config: home.join("config.toml"),
             env: home.join(".env"),
-            policy: home.join("policy.toml"),
         }
     }
 
-    pub fn all(&self) -> [&Path; 3] {
-        [&self.config, &self.env, &self.policy]
+    pub fn all(&self) -> [&Path; 2] {
+        [&self.config, &self.env]
     }
 
     /// 存在的那些文件的 mtime——`komo doctor` 与 `changed_since` 比的就是它（§3）。
@@ -472,7 +470,6 @@ pub(super) fn assemble(
     file: FileConfig,
     home: &Path,
     sources: &Sources,
-    policy: RuleTable,
     secrets: &Secrets,
     now: OffsetDateTime,
 ) -> Result<ConfigSnapshot, ConfigError> {
@@ -634,7 +631,6 @@ pub(super) fn assemble(
         execution: file.execution.into_execution(),
         compaction: file.compaction.into_compaction(),
         channels,
-        policy,
         paths,
         credentials,
         loaded_at: now,

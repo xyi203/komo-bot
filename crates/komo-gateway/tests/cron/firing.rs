@@ -6,6 +6,8 @@ use komo_kernel::cron::FiringStatus;
 use komo_kernel::traits::LlmClient;
 use komo_kernel::types::status::WaitReason;
 
+use komo_gateway::service::test_support::Unsure;
+
 use crate::harness::*;
 
 fn daily() -> serde_json::Value {
@@ -28,8 +30,7 @@ async fn a_restart_does_not_create_the_same_firing_twice() {
     let home = Home::new();
     let counter = home.workspace().join("ran.log");
 
-    // 第一台：投出这一槽。模型让它跑一条 shell——但 shell 要审批，所以它会停在等待上，
-    // 这正好让这一次触发**一直没结束**，重启之后还在。
+    // 第一台：投出这一槽。
     let gw = home
         .start(FakeLlm::always(vec![text_round(1, "做完了")]) as Arc<dyn LlmClient>)
         .await;
@@ -94,11 +95,12 @@ async fn a_restart_does_not_create_the_same_firing_twice() {
 #[tokio::test]
 async fn an_overlapping_slot_is_skipped_and_leaves_a_trace() {
     let home = Home::new();
-    let counter = home.workspace().join("ran.log");
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
 
-    // 模型每一段都要跑一条 shell：shell 要审批，于是第一次触发**停在等待上**——
-    // §10 说的"含等待审批"就是这一种"还没结束"。
-    let llm = FakeLlm::always(vec![shell_append(1, "pc-1", &counter, "one")]);
+    // 模型每一段都调一次 `unsure`：结果不明，于是第一次触发**停在等人核对上**——
+    // §10 说的"还没结束"就是这一种。
+    let llm = FakeLlm::always(vec![unsure_round(1, "pc-1")]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
 
     let job = gw.add_job(daily()).await;
@@ -107,8 +109,8 @@ async fn an_overlapping_slot_is_skipped_and_leaves_a_trace() {
     assert_eq!(first.fired.len(), 1);
     let wait = gw.wait_waiting(&first.fired[0].run).await;
     assert!(
-        matches!(wait, WaitReason::Approval { .. }),
-        "「还没结束」就是这条：停在等审批上：{wait:?}"
+        matches!(wait, WaitReason::Intervention { .. }),
+        "「还没结束」就是这条：停在等人核对上：{wait:?}"
     );
 
     // 下一槽到了，而上一次还在等人。
@@ -131,8 +133,8 @@ async fn an_overlapping_slot_is_skipped_and_leaves_a_trace() {
         "说得出为什么：{skipped:?}"
     );
 
-    // 副作用只发生了……零次：shell 还卡在审批上（这正是"未结束"）。
-    assert_eq!(lines(&counter), 0, "没批准就没跑");
+    // 动作只发生了一次：第二槽没有再起一个 Run。
+    assert_eq!(unsure.ran(), 1, "跳过的那一槽什么都没跑");
     gw.stop().await;
 }
 
@@ -140,8 +142,9 @@ async fn an_overlapping_slot_is_skipped_and_leaves_a_trace() {
 #[tokio::test]
 async fn an_allow_policy_fires_even_when_the_last_one_is_still_waiting() {
     let home = Home::new();
-    let counter = home.workspace().join("ran.log");
-    let llm = FakeLlm::always(vec![shell_append(1, "pc-1", &counter, "one")]);
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
+    let llm = FakeLlm::always(vec![unsure_round(1, "pc-1")]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
 
     let mut body = daily();
@@ -152,8 +155,8 @@ async fn an_allow_policy_fires_even_when_the_last_one_is_still_waiting() {
     let first = gw.tick().await;
     let wait = gw.wait_waiting(&first.fired[0].run).await;
     assert!(
-        matches!(wait, WaitReason::Approval { .. }),
-        "停在等审批上：{wait:?}"
+        matches!(wait, WaitReason::Intervention { .. }),
+        "停在等人核对上：{wait:?}"
     );
 
     gw.make_due(&job.id).await;

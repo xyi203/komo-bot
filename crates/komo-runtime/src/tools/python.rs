@@ -1,23 +1,20 @@
 //! `python`：代码或已保存模块调用；使用受管理解释器，**绑定代码版本**（§4、§5.2）。
 //!
 //! 两种形式属于**同一个工具**：`mode = "code"` 是任意代码，`mode = "call"` 是 toolbox
-//! 里明确导出的函数。它们的 [`Operation`] 不同，所以 Policy 分得开——「同意一次
-//! Python」不会变成「今后任意脚本均可执行」。任意 code 也不会因为 import 了已审核模块
-//! 就自动获得同样授权：授权匹配的是操作与版本，不是它引用了谁。
+//! 里明确导出的函数。它们的 [`Operation`] 不同：`call` 只调已启用模块里导出的名字，
+//! 执行前核对模块版本还是计划绑的那一版。
 //!
 //! 计划绑定两个版本：代码内容哈希（或模块名与版本）与**环境版本**。依赖一升级，
-//! `env_version` 就变，绑定旧环境的授权覆盖不到新计划（§5.4）。
+//! `env_version` 就变，账本里看得出这次跑在哪个环境上（§5.4）。
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_kernel::policy::PolicyDecision;
-use komo_kernel::traits::{ApprovalRepo, Clock, OutputWriter, PythonHost, Tool};
+use komo_kernel::traits::{OutputWriter, PythonHost, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
-    ApprovedPlan, EnvVersion, ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode,
-    ResourceRef, Verification,
+    EnvVersion, ExecutionPlan, Operation, PlanVersions, RecoveryMode, ResourceRef, Verification,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{
@@ -25,7 +22,6 @@ use komo_kernel::types::tool::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::policy::{DecisionEnv, PolicyEngine, grants_for};
 use crate::toolbox::{Toolbox, ToolboxError, dotted};
 
 use super::{normalized, parse_args, plan_time};
@@ -47,30 +43,11 @@ pub struct PythonToolResult {
     pub env_version: EnvVersion,
 }
 
-/// 跑核对函数要的那三样（§8.6「核对本身仍经过 Policy」）。
-///
-/// 没有它，[`PythonTool::verify`] 一律答 [`Verification::Unavailable`]——那是"这个工具
-/// 没有可用的核对方式"，executor 会停在 `waiting + intervention`。**不装这个门就没有核对**，
-/// 而不是"核对不过 Policy 也照跑"。
-#[derive(Clone)]
-pub struct VerificationGate {
-    pub policy: PolicyEngine,
-    pub approvals: Arc<dyn ApprovalRepo>,
-    pub clock: Arc<dyn Clock>,
-}
-
-impl std::fmt::Debug for VerificationGate {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VerificationGate").finish_non_exhaustive()
-    }
-}
-
 pub struct PythonTool {
     host: Arc<dyn PythonHost>,
     /// 已保存的能力。`None` = 这台 Gateway 没有 toolbox，于是 `call` 模式无从解析
     /// 版本，只能拒绝——**不退化成"不绑版本地调一下试试"**（§5.4）。
     toolbox: Option<Arc<Toolbox>>,
-    verification: Option<VerificationGate>,
 }
 
 impl std::fmt::Debug for PythonTool {
@@ -84,7 +61,6 @@ impl std::fmt::Debug for PythonTool {
                     .as_ref()
                     .map(|t| t.layout().root().to_path_buf()),
             )
-            .field("verifies", &self.verification.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -94,7 +70,6 @@ impl PythonTool {
         Self {
             host,
             toolbox: None,
-            verification: None,
         }
     }
 
@@ -103,16 +78,10 @@ impl PythonTool {
         self
     }
 
-    /// 装上核对这条路（§8.6）。
-    pub fn with_verification(mut self, gate: VerificationGate) -> Self {
-        self.verification = Some(gate);
-        self
-    }
-
     /// 这份计划绑的模块版本还是**现在已启用的那一版**吗（§7.2）。
     ///
     /// `code` 模式没有模块可言，直接过。`call` 模式有三种不通过，**都是版本冲突**：
-    /// 没有 toolbox（证不出这是已审核的那一版）、模块解析不出来了（停用 / 删掉 / 不再
+    /// 没有 toolbox（证不出这是已启用的那一版）、模块解析不出来了（停用 / 删掉 / 不再
     /// 导出这个函数）、以及版本真的变了。一律**在 spawn 之前**返回，所以子进程一个都
     /// 不起。
     fn module_still_matches(&self, plan: &ExecutionPlan) -> Result<(), ToolError> {
@@ -125,7 +94,7 @@ impl PythonTool {
             })
         };
         let Some(toolbox) = &self.toolbox else {
-            return conflict("这台 Gateway 没有 toolbox，证不出这是已审核的那一版".into());
+            return conflict("这台 Gateway 没有 toolbox，证不出这是已启用的那一版".into());
         };
         match toolbox.resolve_call(module, function) {
             Ok(resolved) if plan.versions.module.as_deref() == Some(resolved.version.as_str()) => {
@@ -136,7 +105,7 @@ impl PythonTool {
                 plan.versions.module.as_deref().unwrap_or("（未绑定）"),
                 resolved.version
             )),
-            // 模块在审批期间被停用 / 删掉 / 改得不再导出这个函数。原因原样转述——
+            // 模块在计划之后被停用 / 删掉 / 改得不再导出这个函数。原因原样转述——
             // 模型下一步要做什么取决于是哪一种。
             Err(error) => conflict(error.to_string()),
         }
@@ -215,21 +184,20 @@ impl Tool for PythonTool {
                 // 通过 import 提前跑未审核的代码（§7.3）。候选、停用、没声明 `__all__`、
                 // 没导出这个名字——四种都在这里被挡下来，一行 Python 都没跑过。
                 let toolbox = self.toolbox.as_ref().ok_or_else(|| ToolError::Denied {
-                    reason: "这台 Gateway 没有 toolbox：call 模式无从确定已审核版本".into(),
+                    reason: "这台 Gateway 没有 toolbox：call 模式无从确定已启用的版本".into(),
                 })?;
                 let resolved = toolbox.resolve_call(module, function).map_err(refusal_of)?;
                 (
                     Operation::PythonCall {
-                        // 规范化成 `toolbox.<module>`：Policy 的 `modules` 匹配器与授权
-                        // 里的模块名必须是同一种写法，否则 `toolbox.memos` 与 `memos`
-                        // 会是两条互不覆盖的授权。
+                        // 规范化成 `toolbox.<module>`：账本里同一个模块只有一种写法，
+                        // `toolbox.memos` 与 `memos` 不会被当成两个模块。
                         module: dotted(&resolved.module),
                         function: function.clone(),
                     },
                     PlanVersions {
                         code: None,
-                        // 授权绑定的就是它（§7.2）：模块一升级，版本就变，
-                        // `versions_cover` 让绑旧版本的授权覆盖不到新计划（§5.4）。
+                        // 计划绑定的就是它（§7.2）：模块一升级，版本就变，绑旧版本的
+                        // 计划执行前按版本冲突拒（§5.4）。
                         module: Some(resolved.version.to_string()),
                         env: Some(env_version),
                     },
@@ -272,14 +240,14 @@ impl Tool for PythonTool {
 
     async fn execute(
         &self,
-        plan: ApprovedPlan,
+        plan: ExecutionPlan,
         ctx: &ToolContext,
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
-        let plan = plan.plan();
+        let plan = &plan;
         let args: PythonArgs = parse_args(plan.args.clone(), "python")?;
 
-        // 计划绑定的环境版本必须还是当前那个：依赖在审批期间换过，就不是这份计划了。
+        // 计划绑定的环境版本必须还是当前那个：依赖在计划之后换过，就不是这份计划了。
         let current = self.host.env_version();
         if let Some(planned) = &plan.versions.env
             && planned != &current
@@ -289,15 +257,15 @@ impl Tool for PythonTool {
             });
         }
 
-        // 模块版本也一样（§7.2「**批准后再次校验目标和版本**，变化则重新评估」）。
+        // 模块版本也一样：执行前再校验一次目标和版本（§7.2）。
         //
-        // 审批可以停在那里一天，而 `komo toolbox enable` 在那期间可以把模块换掉。换过
-        // 之后，这份计划里的一切——导出的函数、参数的含义、`resources` 里那串凭证引用
-        // ——说的都是**上一版**的事；照着跑一遍等于拿一份对旧代码的批准去执行新代码。
-        // `verify` 那一路已经这么判了（"模块升级过 → Unknown"），执行这一路没有理由更松。
+        // 计划与执行之间（恢复续跑时可能隔得很久）`komo toolbox enable` 可以把模块换掉。
+        // 换过之后，这份计划里的一切——导出的函数、参数的含义、`resources` 里那串凭证
+        // 引用——说的都是**上一版**的事。`verify` 那一路已经这么判了（"模块升级过 →
+        // Unknown"），执行这一路没有理由更松。
         //
         // 交回模型的是一个**版本冲突**，和 `write` / `edit` 覆盖到别人改过的文件是同一类：
-        // 它会重新 `prepare` → 新计划 → 新哈希 → 旧授权覆盖不到 → 重新审（§5.4）。
+        // 它会重新 `prepare` → 新计划绑新版本（§5.4）。
         self.module_still_matches(plan)?;
 
         // 这次调用的产出目录（§4.7）：`<会话内容目录>/artifacts/<run>`。目录由运行时建，
@@ -312,7 +280,14 @@ impl Tool for PythonTool {
         // 拿到的 sink 原样交给宿主：脚本的 print 流进去，结构化结果走另一条路（§5.1）。
         let outcome = self
             .host
-            .run_with_artifacts(args.job, artifacts.as_deref(), sink, ctx.cancel.clone())
+            .run_with_artifacts(
+                args.job,
+                artifacts.as_deref(),
+                // 时限就是这次调用的活动执行时限，python 自己不另设上限。
+                ctx.call_timeout,
+                sink,
+                ctx.cancel.clone(),
+            )
             .await;
 
         let outcome = match outcome {
@@ -375,15 +350,11 @@ impl Tool for PythonTool {
     /// §8.6：用**模块自带的、与版本绑定的**核对函数判断上一次到底发生了没有。
     ///
     /// 「已保存的 Python 模块可提供与版本绑定的核对函数，由执行器通过同一 python 执行
-    /// 机制调用；核对本身仍经过 Policy。它不增加第六个模型工具。」——所以这里做的是：
-    ///
-    /// 1. 另做一份计划，来源是 [`PlanSource::Verification`]，**操作是调那个核对函数**。
-    /// 2. 让它过一遍 [`PolicyEngine`]。过不去就是"核对不出结论"
-    ///    （[`Verification::Unknown`]），executor 于是交给人——**不是**"过不去也照跑"。
-    /// 3. 过得去就用同一个 [`PythonHost`] 调它，把它的答复映射成四种结论之一。
+    /// 机制调用。它不增加第六个模型工具。」——所以这里用同一个 [`PythonHost`] 调它
+    /// （没有 Policy 可过，§7），把它的答复映射成四种结论之一。
     ///
     /// 三种情况直接答 [`Verification::Unavailable`]（= 没有可用的核对方式 →
-    /// `waiting + intervention`）：`code` 模式、模块没声明核对函数、这台 Gateway 没装核对门。
+    /// `waiting + intervention`）：`code` 模式、模块没声明核对函数、这台 Gateway 没有 toolbox。
     /// **模块自称幂等不构成证明**：这里只认核对函数真的跑出来的那个答案。
     async fn verify(
         &self,
@@ -393,12 +364,12 @@ impl Tool for PythonTool {
         let Operation::PythonCall { module, function } = &plan.operation else {
             return Ok(Verification::Unavailable);
         };
-        let (Some(toolbox), Some(gate)) = (&self.toolbox, &self.verification) else {
+        let Some(toolbox) = &self.toolbox else {
             return Ok(Verification::Unavailable);
         };
         let resolved = match toolbox.resolve_call(module, function) {
             Ok(resolved) => resolved,
-            // 模块被停用 / 改没了：核对逻辑对不上那份已审核的计划，这是"不知道"。
+            // 模块被停用 / 改没了：核对逻辑对不上计划绑的那一版，这是"不知道"。
             Err(error) => {
                 return Ok(Verification::Unknown {
                     reason: format!("{module} 的核对逻辑取不到：{error}"),
@@ -408,13 +379,13 @@ impl Tool for PythonTool {
         let Some(verifier) = resolved.verifier else {
             return Ok(Verification::Unavailable);
         };
-        // 「代码、依赖、参数以及核对逻辑都必须对应已审核的执行计划」（§8.6）：模块在这
+        // 「代码、依赖、参数以及核对逻辑都必须对应那份执行计划」（§8.6）：模块在这
         // 之后升级过，现在这份核对逻辑就不是那份计划的核对逻辑。
         let planned = plan.versions.module.as_deref();
         if planned != Some(resolved.version.as_str()) {
             return Ok(Verification::Unknown {
                 reason: format!(
-                    "{module} 现在是 {}，而这份计划绑的是 {}：核对逻辑与已审核计划对不上",
+                    "{module} 现在是 {}，而这份计划绑的是 {}：核对逻辑与计划对不上",
                     resolved.version,
                     planned.unwrap_or("（未绑定）")
                 ),
@@ -427,38 +398,6 @@ impl Tool for PythonTool {
             // 核对函数拿到的是**原调用**的身份与参数，不是一堆自由参数。
             args: serde_json::json!({ "function": function, "args": call_args(plan) }),
         };
-        let check = verification_plan(plan, ctx, &resolved.module, &verifier, &job)?;
-
-        // 核对本身仍经过 Policy（§8.6）。
-        let now = gate.clock.now();
-        let grants = grants_for(gate.approvals.as_ref(), &check, now)
-            .await
-            .map_err(|error| ToolError::Failed {
-                message: error.to_string(),
-            })?;
-        let env = DecisionEnv {
-            grants: &grants,
-            principal: None,
-            roots: &ctx.roots,
-            now,
-        };
-        match gate.policy.decide(&check, &env) {
-            PolicyDecision::Allow { .. } => {}
-            // Ask 在这里**不能**变成"问一次人"：核对是恢复流程里的一步，不是一次新的
-            // 模型动作。答不出结论就说答不出结论，executor 会停在 waiting + intervention，
-            // 由操作者决定——那正是"交给人"的正确形状。
-            PolicyDecision::Ask { reason, .. } => {
-                return Ok(Verification::Unknown {
-                    reason: format!("核对调用需要审批，未自动执行：{reason}"),
-                });
-            }
-            PolicyDecision::Deny { reason } => {
-                return Ok(Verification::Unknown {
-                    reason: format!("核对调用被拒绝：{reason}"),
-                });
-            }
-        }
-
         let mut sink = crate::toolbox::NullWriter::new(ctx);
         let outcome = match self.host.run(job, &mut sink, ctx.cancel.clone()).await {
             Ok(outcome) => outcome,
@@ -501,7 +440,7 @@ fn refusal_of(error: ToolboxError) -> ToolError {
 /// 模型少写了 `mode` 时按参数形状补上（§5.1）。
 ///
 /// 两种形式的参数天然分得开：有 `code` 是任意代码，有 `module` / `function` 是已保存模块的
-/// 调用。**这不放松授权**——计划绑的仍是 `Operation` 与代码 / 模块版本（§5.2、§7.2），少写
+/// 调用。**这不放松绑定**——计划绑的仍是 `Operation` 与代码 / 模块版本（§5.2、§7.2），少写
 /// 一个判别字段不该换来一次失败往返（真实会话里模型就这么白跑了一轮，报错是
 /// `missing field mode`）。两个都写了或者都没写就让它照常报错——那种形状是模型自己没说清，
 /// 别替它猜。
@@ -531,39 +470,6 @@ fn call_args(plan: &ExecutionPlan) -> serde_json::Value {
         .get("args")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}))
-}
-
-/// 核对用的那份计划（§8.6：`PlanSource::Verification { of }`）。
-///
-/// 它与被核对的那份计划共享 **run / tool_call / 模块版本 / 环境版本**——"核对逻辑必须
-/// 对应已审核的执行计划"就是这几样；来源换成 `Verification`，操作换成调核对函数本身，
-/// 恢复方式是 `SafeReread`（核对是只读的，重做安全）。
-fn verification_plan(
-    plan: &ExecutionPlan,
-    ctx: &ToolContext,
-    module: &str,
-    verifier: &str,
-    job: &PythonJob,
-) -> Result<ExecutionPlan, ToolError> {
-    let of = plan.tool_call.clone().unwrap_or_else(|| ctx.call.clone());
-    Ok(ExecutionPlan {
-        operation_id: OperationId::new_at(plan_time()),
-        source: PlanSource::Verification { of },
-        tool: "python".into(),
-        operation: Operation::PythonCall {
-            module: dotted(module),
-            function: verifier.to_string(),
-        },
-        run: plan.run.clone(),
-        tool_call: plan.tool_call.clone(),
-        args: normalized(&PythonArgs { job: job.clone() })?,
-        cwd: plan.cwd.clone(),
-        targets: vec![],
-        versions: plan.versions.clone(),
-        resources: plan.resources.clone(),
-        recovery: RecoveryMode::SafeReread,
-        then_run: None,
-    })
 }
 
 /// 核对函数的答复 → 四种结论。
@@ -602,13 +508,9 @@ fn verdict_of(value: serde_json::Value) -> Verification {
 mod tests {
     use super::*;
     use crate::toolbox::{ModuleVersion, Toolbox};
-    use crate::tools::test_support::{approved, context, writer};
-    use komo_kernel::policy::{
-        Effect, Grant, GrantScope, Matcher, OperationMatch, PolicyRule, RuleTable,
-    };
-    use komo_kernel::test_support::{FakePythonHost, MemApprovalRepo, TestClock};
-    use komo_kernel::types::ids::{ApprovalId, GrantId, RunId};
-    use komo_kernel::types::plan::SourceKind;
+    use crate::tools::test_support::{context, writer};
+    use komo_kernel::test_support::{FakePythonHost, TestClock};
+    use komo_kernel::traits::Clock;
     use komo_kernel::types::tool::PythonResult;
 
     /// 一个导出 `turn_off`、并且**带核对函数**的模块。
@@ -683,7 +585,28 @@ def turn_off(entity_id):
     }
 
     #[tokio::test]
-    async fn call_mode_is_a_different_operation_so_policy_can_tell_them_apart() {
+    async fn a_python_call_runs_under_the_call_timeout_not_a_fixed_limit_of_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path());
+        ctx.call_timeout = std::time::Duration::from_secs(3600);
+        let (host, tool) = wire();
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "mode": "code", "code": "result = 1" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
+        assert_eq!(
+            host.timeouts(),
+            vec![std::time::Duration::from_secs(3600)],
+            "python 的时限就是这次调用的活动执行时限，没有自己的 120s"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_mode_is_a_different_operation_from_code_mode() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let (_host, _toolbox, tool) = wired(dir.path(), HA);
@@ -698,7 +621,7 @@ def turn_off(entity_id):
         assert!(plan.versions.code.is_none(), "call 模式没有代码正文");
     }
 
-    /// §14 阶段 6 第一条：**调用使用已批准且已测试版本**——计划绑的就是已启用的那一版。
+    /// §14 阶段 6 第一条：**调用使用已启用且已测试版本**——计划绑的就是已启用的那一版。
     #[tokio::test]
     async fn a_call_binds_the_enabled_module_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -711,38 +634,18 @@ def turn_off(entity_id):
         );
     }
 
-    /// §14 阶段 6 第二条：**模块更新使旧授权失效**。
-    ///
-    /// 判断在 kernel 的 `Grant::covers` 里（那里有它自己的测试）；这里测的是这条链子
-    /// 真的接上了——`prepare` 填的版本换了，同一条授权就覆盖不到新计划。
+    /// 模块更新之后，新计划绑的是新版本（§5.4）：旧计划因此对不上，执行前按版本冲突拒。
     #[tokio::test]
-    async fn updating_the_module_invalidates_a_grant_bound_to_the_old_version() {
+    async fn updating_the_module_changes_the_bound_version() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let now = TestClock::fixed().now();
         let (_host, toolbox, tool) = wired(dir.path(), HA);
 
         let before = tool.prepare(call_args(), &ctx).await.unwrap();
-        let grant = Grant {
-            id: GrantId::from_raw("g-1"),
-            approval: ApprovalId::from_raw("ap-1"),
-            scope: GrantScope::Run {
-                run: RunId::from_raw("run-1"),
-                matcher: Matcher::modules(["toolbox.ha"]),
-                versions: before.versions.clone(),
-            },
-            granted_at: now,
-            valid_until: None,
-            consumed: false,
-            reason: "操作者批准了这一版".into(),
-        };
-        assert!(grant.covers(&before, now), "刚批的当然覆盖得到");
-
         // 模块升级：换一份正文启用。
         std::fs::write(toolbox.layout().enabled_code("ha"), HA_NO_CHECK).unwrap();
         let after = tool.prepare(call_args(), &ctx).await.unwrap();
         assert_ne!(after.versions.module, before.versions.module);
-        assert!(!grant.covers(&after, now), "模块更新使旧授权失效（§5.4）");
     }
 
     /// 候选调不到：`.staging` 里那一份不是"已启用版本"（§5.2、§5.4）。
@@ -839,10 +742,7 @@ def turn_off(entity_id):
             )
             .await
             .unwrap();
-        let output = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
-            .await
-            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
         assert_eq!(output.status, ToolResultStatus::Completed);
         assert_eq!(
             host.calls(),
@@ -867,7 +767,7 @@ def turn_off(entity_id):
 
         host.set_env_version("py-test-2");
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         assert!(
@@ -877,13 +777,13 @@ def turn_off(entity_id):
         assert!(host.calls().is_empty(), "版本对不上就根本不执行");
     }
 
-    /// §7.2「**批准后再次校验目标和版本，变化则重新评估**」。
+    /// 执行前再校验一次模块版本（§7.2）。
     ///
-    /// 审批可以停一天，而这期间模块可以被换掉——换掉之后，这份计划里的导出函数、参数
+    /// 计划与执行之间模块可以被换掉（恢复续跑时隔得更久）——换掉之后，这份计划里的导出函数、参数
     /// 含义与凭证引用说的都是上一版的事。这里换的是**声明了不同 `__komo_env__`** 的
     /// 一版：它正好是那条"计划里写着要 X、子进程拿到的是 Y"的缝。
     #[tokio::test]
-    async fn a_module_swapped_during_the_approval_window_is_a_version_conflict_not_a_run() {
+    async fn a_module_swapped_after_planning_is_a_version_conflict_not_a_run() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let (host, toolbox, tool) = wired(dir.path(), HA);
@@ -897,8 +797,8 @@ def turn_off(entity_id):
             "这一版没有声明任何凭证引用"
         );
 
-        // 审批还等着的时候，模块被换成了声明 `HA_TOKEN` 的一版——快照与指针都跟着
-        // 走，这一版在 toolbox 眼里是**正正当当的当前版本**，只是不是被批准的那一版。
+        // 计划之后、执行之前，模块被换成了声明 `HA_TOKEN` 的一版——快照与指针都跟着
+        // 走，这一版在 toolbox 眼里是**正正当当的当前版本**，只是不是计划绑的那一版。
         let next = format!("{HA}\n__komo_env__ = [\"HA_TOKEN\"]\n");
         toolbox.disable("ha").unwrap();
         toolbox
@@ -912,7 +812,7 @@ def turn_off(entity_id):
         );
 
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         assert!(
@@ -926,9 +826,9 @@ def turn_off(entity_id):
         assert!(host.calls().is_empty(), "**一个子进程都不该起**");
     }
 
-    /// 模块在审批期间被停用 / 删掉，同样是版本冲突——而且说得出是哪一种。
+    /// 模块在计划之后被停用 / 删掉，同样是版本冲突——而且说得出是哪一种。
     #[tokio::test]
-    async fn a_module_disabled_during_the_approval_window_is_a_version_conflict_too() {
+    async fn a_module_disabled_after_planning_is_a_version_conflict_too() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let (host, toolbox, tool) = wired(dir.path(), HA);
@@ -937,7 +837,7 @@ def turn_off(entity_id):
         toolbox.disable("ha").unwrap();
 
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         assert!(
@@ -962,10 +862,7 @@ def turn_off(entity_id):
             stdout_excerpt: String::new(),
             env_version: host.env_version(),
         });
-        let output = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
-            .await
-            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
         assert_eq!(output.status, ToolResultStatus::Completed);
         assert_eq!(host.calls().len(), 1);
     }
@@ -984,42 +881,13 @@ def turn_off(entity_id):
             .await
             .unwrap();
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         assert!(error.is_uncertain(), "{error:?}");
     }
 
     // ------------------------------------------------------------ 核对（§8.6）
-
-    /// 一张只放行**核对来源**的 `python_call` 的规则表。核对是恢复流程里的一步，
-    /// 它与模型自己发起的调用是两种来源，规则分得开。
-    fn verification_allowed() -> PolicyEngine {
-        PolicyEngine::from_rules(RuleTable {
-            rules: vec![PolicyRule {
-                id: "verification-call".into(),
-                effect: Effect::Allow,
-                reason: "恢复流程的核对调用".into(),
-                matcher: Matcher {
-                    sources: Some(vec![SourceKind::Verification]),
-                    operations: Some(vec![OperationMatch::PythonCall]),
-                    ..Default::default()
-                },
-                scopes: vec![],
-                requires_isolation: false,
-                grant_proof: false,
-            }],
-            default: Effect::Ask,
-        })
-    }
-
-    fn gate(policy: PolicyEngine) -> VerificationGate {
-        VerificationGate {
-            policy,
-            approvals: Arc::new(MemApprovalRepo::new()),
-            clock: Arc::new(TestClock::fixed()),
-        }
-    }
 
     /// 任意 code 没有核对方式：停在 `waiting + intervention`，不自动从头跑整个脚本（§8.6）。
     #[tokio::test]
@@ -1047,7 +915,6 @@ def turn_off(entity_id):
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let (_host, _toolbox, tool) = wired(dir.path(), HA_NO_CHECK);
-        let tool = tool.with_verification(gate(verification_allowed()));
         let plan = tool.prepare(call_args(), &ctx).await.unwrap();
         assert_eq!(plan.recovery, RecoveryMode::NoSafeRecovery);
         assert_eq!(
@@ -1059,11 +926,10 @@ def turn_off(entity_id):
     /// 有核对函数 → 计划的恢复方式是"可以核对目标状态"，核对真的跑起来，四种结论
     /// 逐个映射。
     #[tokio::test]
-    async fn a_verifier_runs_through_policy_and_its_four_answers_all_map() {
+    async fn a_verifier_runs_and_its_four_answers_all_map() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let (host, _toolbox, tool) = wired(dir.path(), HA);
-        let tool = tool.with_verification(gate(verification_allowed()));
         let plan = tool.prepare(call_args(), &ctx).await.unwrap();
         assert_eq!(plan.recovery, RecoveryMode::VerifyTarget);
 
@@ -1125,7 +991,6 @@ def turn_off(entity_id):
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let (host, _toolbox, tool) = wired(dir.path(), HA);
-        let tool = tool.with_verification(gate(verification_allowed()));
         let plan = tool.prepare(call_args(), &ctx).await.unwrap();
 
         host.push_result(PythonResult {
@@ -1145,31 +1010,13 @@ def turn_off(entity_id):
         );
     }
 
-    /// **核对本身仍经过 Policy**：一张什么都问的表下，核对不自动执行，答"不出结论"。
-    #[tokio::test]
-    async fn a_verification_policy_refuses_and_the_verdict_is_unknown_not_a_silent_run() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let (host, _toolbox, tool) = wired(dir.path(), HA);
-        let tool = tool.with_verification(gate(PolicyEngine::conservative()));
-        let plan = tool.prepare(call_args(), &ctx).await.unwrap();
-
-        let verdict = tool.verify(&plan, &ctx).await.unwrap();
-        assert!(
-            matches!(verdict, Verification::Unknown { .. }),
-            "{verdict:?}"
-        );
-        assert!(host.calls().is_empty(), "没过 Policy 就一次都没跑");
-    }
-
-    /// 「核对逻辑必须对应已审核的执行计划」（§8.6）：模块在审批之后升级过，
+    /// 「核对逻辑必须对应那份执行计划」（§8.6）：模块在计划之后升级过，
     /// 现在这份核对逻辑不是那份计划的核对逻辑。
     #[tokio::test]
     async fn a_verifier_from_a_newer_module_version_is_not_this_plans_verifier() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let (host, toolbox, tool) = wired(dir.path(), HA);
-        let tool = tool.with_verification(gate(verification_allowed()));
         let plan = tool.prepare(call_args(), &ctx).await.unwrap();
 
         std::fs::write(
@@ -1185,15 +1032,16 @@ def turn_off(entity_id):
         assert!(host.calls().is_empty());
     }
 
-    /// 没装核对门的 Gateway 一律答"没有核对方式"，**不是**"照跑"。
+    /// 没有 toolbox 的 Gateway 取不到核对函数，一律答"没有核对方式"，**不是**"照跑"。
     #[tokio::test]
-    async fn without_a_verification_gate_nothing_is_verified() {
+    async fn without_a_toolbox_nothing_is_verified() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let (host, _toolbox, tool) = wired(dir.path(), HA);
         let plan = tool.prepare(call_args(), &ctx).await.unwrap();
+        let bare = PythonTool::new(host.clone());
         assert_eq!(
-            tool.verify(&plan, &ctx).await.unwrap(),
+            bare.verify(&plan, &ctx).await.unwrap(),
             Verification::Unavailable
         );
         assert!(host.calls().is_empty());
@@ -1281,10 +1129,7 @@ def turn_off(entity_id):
             )
             .await
             .unwrap();
-        let output = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
-            .await
-            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
 
         let preview = output.preview.expect("有预览");
         assert!(preview.contains("[[241653]]"), "{preview}");
@@ -1309,10 +1154,7 @@ def turn_off(entity_id):
             .prepare(serde_json::json!({ "mode": "code", "code": "x = 1" }), &ctx)
             .await
             .unwrap();
-        let output = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
-            .await
-            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
         assert_eq!(
             output.preview.as_deref(),
             Some("没有返回值，也没有输出"),

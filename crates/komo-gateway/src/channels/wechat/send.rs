@@ -15,10 +15,6 @@
 //!    `is_session_expired()` 是 SDK 自己给的谓词。两者都不经 `to_string()`。
 //! 2. **`Deferred` 不联网补**。它把投递记录留在 `pending`，由下一条入站消息触发冲刷
 //!    （§11.1 第 4 步）——那是 Dispatcher 的事，这里只要如实答"此刻推不出去"。
-//!
-//! `ApprovalSettled` 在这里是**补发一行**结论文本，不是原地更新：微信没有可编辑的卡片
-//! （§11.3）。旧消息上也没有按钮可点，所以"决定过的请求还长着可点的按钮"这个问题在这
-//! 个渠道不存在。
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -186,8 +182,6 @@ impl WeChatSender {
         peer: &ChannelPeer,
         message: Outbound,
     ) -> Result<SendOutcome, WeChatBotError> {
-        // `ApprovalSettled` 与别的没有分支：微信没有可编辑的卡片，结论就是再说一句话
-        //（§11.3）。渲染层已经把它渲染成那一行。
         let text = wechat::render(&message);
         self.send_text(&peer.chat_id, &text).await?;
         Ok(SendOutcome::Sent)
@@ -241,9 +235,7 @@ pub fn deferred_reason(user_id: &str) -> String {
 mod tests {
     use super::*;
 
-    use super::super::fake::{FakeILink, presentation, text_wire};
-    use komo_kernel::types::ids::{ApprovalId, ShortId};
-    use time::OffsetDateTime;
+    use super::super::fake::{FakeILink, text_wire};
 
     fn peer(user: &str) -> ChannelPeer {
         ChannelPeer::new(ChannelPlatform::Wechat, user)
@@ -307,66 +299,6 @@ mod tests {
         assert_eq!(sends[0]["msg"]["to_user_id"], "wxid_op");
         assert_eq!(sends[0]["msg"]["item_list"][0]["text_item"]["text"], "收到");
         assert_eq!(sender.platform(), ChannelPlatform::Wechat);
-    }
-
-    // ④ 审批请求纯文本含五项与两条命令提示（走到线上的那一份）。
-    #[tokio::test]
-    async fn an_approval_request_goes_out_as_plain_text() {
-        let fake = FakeILink::start(Default::default()).await;
-        let sender = fake.sender();
-        sender
-            .contexts()
-            .remember_wire(&text_wire("wxid_op", "cid-1", "在吗"));
-
-        sender
-            .deliver(
-                &peer("wxid_op"),
-                Outbound::ApprovalRequest(Box::new(presentation())),
-            )
-            .await
-            .expect("发得出去");
-
-        let sends = fake.calls_to("/ilink/bot/sendmessage");
-        assert_eq!(sends.len(), 1);
-        let text = sends[0]["msg"]["item_list"][0]["text_item"]["text"]
-            .as_str()
-            .expect("纯文本");
-        for item in ["7K2M", "动作", "改动", "原因", "范围"] {
-            assert!(text.contains(item), "少了 {item}：{text}");
-        }
-        assert!(text.contains("/approve 7K2M"), "{text}");
-        assert!(text.contains("/reject 7K2M"), "{text}");
-    }
-
-    // ④（后半）ApprovalSettled 补发一行结论文本。
-    #[tokio::test]
-    async fn a_decision_is_one_more_message_not_an_edit() {
-        let fake = FakeILink::start(Default::default()).await;
-        let sender = fake.sender();
-        sender
-            .contexts()
-            .remember_wire(&text_wire("wxid_op", "cid-1", "在吗"));
-
-        sender
-            .deliver(
-                &peer("wxid_op"),
-                Outbound::ApprovalSettled {
-                    approval: ApprovalId::from_raw("ap-1"),
-                    short_id: ShortId::parse("7K2M").expect("短 ID"),
-                    approved: true,
-                    by: PeerId::new("wxid_op"),
-                    at: OffsetDateTime::from_unix_timestamp(1_760_000_000).expect("时间"),
-                },
-            )
-            .await
-            .expect("发得出去");
-
-        let sends = fake.calls_to("/ilink/bot/sendmessage");
-        assert_eq!(sends.len(), 1, "微信没有可编辑的卡片，只能再说一句");
-        let text = sends[0]["msg"]["item_list"][0]["text_item"]["text"]
-            .as_str()
-            .expect("纯文本");
-        assert!(text.starts_with("已批准 · 7K2M · wxid_op · "), "{text}");
     }
 
     // ⑤ 超长正文截断（走到线上的那一份）。

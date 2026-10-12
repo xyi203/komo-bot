@@ -174,7 +174,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         .map_err(|error| ServiceError::Store(error.to_string()))?;
 
     // 4. 装配。
-    let (tools, codemode) = build_tools(&config, &instance_id, &db, Arc::clone(&clock)).await;
+    let (tools, codemode) = build_tools(&config, &instance_id).await;
     let state = GatewayState::assemble(Assembly {
         home: home.clone(),
         config: Arc::clone(&config),
@@ -241,6 +241,11 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     //    工具、不发外部请求**（§8.5）。它同时把"输入已在 JSONL 里而索引落后"的补齐、
     //    把没主人的 `running` 判成 `queued` 或 `waiting + intervention`、把 `closing`
     //    且已无未完成 Run 的会话推进到 `deleted`、把墓碑已落而内容还在的补齐回收。
+    //
+    //    2026-10-11 之前停在审批上的 Run（§7 删掉审批之后不再产生）走同一条恢复路径：
+    //    那次调用 planned 而没 started，按 §8.4 自动执行，不另做什么。
+    //    （**不要**在这一步之前另读一遍 `legacy_approval_waits()`：实测那一次读会让同一个
+    //    池里随后的读拿到旧快照——Run 行读成 `None`、新会话 404。见报告。）
     match state.reconcile_reporting().await {
         Ok((report, scan)) => {
             tracing::info!(
@@ -391,7 +396,7 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
                             tracing::info!(fired = tick.fired.len(), "定时任务已入队");
                         }
                         // 投出去之后要有人盯着（§10 的最后两步 + §7.4 的"投递到 home
-                        // chat"）：Cron 没有来源会话，等待审批就只能从这里投出去。
+                        // chat"）：Cron 没有来源会话，要人处理的就只能从这里投出去。
                         state.watch_fired(&tick.fired).await;
                     }
                     Err(error) => tracing::warn!(%error, "Cron 这一轮扫描失败"),
@@ -403,10 +408,8 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
         // 控制审计的周期补写（§8.5 的反向顺序）。启动时补过一次；这一遍管的是运行期
         // 产生的那些——补写按 `event_id` 幂等，补不上的留在 outbox 里下次再来。
         //
-        // **不只靠这一拍**：停在待审批上的 Run 会按 `audit_wake` 立刻叫它（`RoutedLedger`
-        // 的 `suspend`）。界面（TUI 的弹窗、任何按 `approval.requested` 帧走的东西）等的
-        // 就是这条补写，60 秒一拍等于让操作者的弹窗晚到一分钟。周期留下当兜底：漏掉的、
-        // 别处写进去的，一拍之内照样会补上。
+        // **不只靠这一拍**：刚排进 outbox 的审计事件（会话生命周期）会按 `audit_wake`
+        // 立刻叫它。周期留下当兜底：漏掉的、别处写进去的，一拍之内照样会补上。
         let state = Arc::clone(state);
         let shutdown = shutdown.clone();
         let wake = Arc::clone(&state.audit_wake);
@@ -420,8 +423,8 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
                     return;
                 }
                 state.drain_audit().await;
-                // 同一拍里顺手兜底：有人看着的审批只弹在他面前，而看着的人可能已经
-                // 关掉界面走了——挂着没人知道的审批是 §10 明确要挡的状态。
+                // 同一拍里顺手兜底：有人看着的介入只弹在他面前，而看着的人可能已经
+                // 关掉界面走了——挂着没人知道的介入是 §10 明确要挡的状态。
                 state.sweep_unseen_interventions().await;
                 // §8.9 的第三个触发点：`AUDIT_TICK` 那一拍的周期对账（另外两个是启动与
                 // `POST /v1/reconcile`）。「它可以比补写粗一点，比如每拍最多干一次」——
@@ -582,8 +585,6 @@ pub fn agent_config_file(config: &ConfigHolder) -> PathBuf {
 async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
-    db: &komo_store::Db,
-    clock: Arc<dyn Clock>,
 ) -> (
     Vec<Arc<dyn Tool>>,
     Option<Arc<komo_runtime::codemode::Sandbox>>,
@@ -602,17 +603,20 @@ async fn build_tools(
         executor: komo_kernel::types::ids::ExecutorId::from_raw(instance_id.to_string()),
     };
 
+    // §7 唯一的硬限制：komo 自己的状态不许被 write / edit 改（§8.10）。名单只依赖数据
+    // 目录与 start-only 的路径，启动时算一次就够——热重载换不动它们。
+    let protected = state::protected_paths(&snapshot, config.home());
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadTool::new()),
-        Arc::new(WriteTool::new()),
-        Arc::new(EditTool::new()),
+        Arc::new(WriteTool::new().protecting(protected.clone())),
+        Arc::new(EditTool::new().protecting(protected)),
         Arc::new(ShellTool::new().registered(registration.clone())),
         // 搜索是**进程内**的（`grep` + `ignore` 书库）：没有外部二进制，也就没有"这台机器
         // 上没装"这一种情况，不需要像 `python` 那样探测一遍。
         Arc::new(RgTool::new()),
     ];
     // 委派是**编排**，不是第七个基础能力（§4）：子代理用的是同一套六个工具，它自己的
-    // 每一次调用照常过 Policy 与审批。运行到它的那一步由 executor 接手（建子 Run、
+    // 每一次调用照常落账。运行到它的那一步由 executor 接手（建子 Run、
     // 让本 Run 等它），工具本身没有 execute。
     tools.push(Arc::new(DelegateTool::new()));
     // dispatch / follow：同一类编排操作，把需要工具的部分派给独立的任务会话
@@ -621,12 +625,16 @@ async fn build_tools(
     // 任务分发"干净失败。
     tools.push(Arc::new(DispatchTool::new()));
     tools.push(Arc::new(FollowTool::new()));
-    // update_plan：模型的工作计划，同一类编排操作。没有副作用、Policy 直接放行，计划
-    // 只在日志里，按 Run 折出来。
+    // update_plan：模型的工作计划，同一类编排操作。没有副作用，计划只在日志里，按 Run
+    // 折出来。
     tools.push(Arc::new(UpdatePlanTool::new()));
     // MCP（`docs/mcp.md`）：启动时连上、列出工具，挂进同一份目录——之后它们与内置工具
-    // 走同一条 Policy / 审批 / 落账的路。
+    // 走同一条落账的路。
     tools.extend(komo_runtime::mcp::connect_all(&snapshot.start_only.mcp, &config.secrets()).await);
+    // 测试专用的工具（`gate` / `unsure`，见 `test_support`）：只在测试为这个数据目录装过
+    // 时才有，生产构建里这一行不存在。
+    #[cfg(any(test, feature = "test-support"))]
+    tools.extend(test_support::test_tools(config.home()));
 
     let toolbox = toolbox_of(&config.current());
     let python = python_env(config, &toolbox);
@@ -642,20 +650,9 @@ async fn build_tools(
     };
     match komo_runtime::python_runtime::PythonRuntime::probe(python).await {
         Ok(runtime) => {
-            // 核对函数的那道门（§8.6）。它自己带一份 Policy 与授权表：核对是一次**新的**
-            // 执行计划（`PlanSource::Verification`），要按当时的规则重新判一次。
-            let gate = komo_runtime::tools::python::VerificationGate {
-                policy: komo_runtime::policy::PolicyEngine::from_rules(snapshot.policy.clone())
-                    // 同一条 §8.10 第 4 条的名单：核对也是一次执行计划，写 komo 自己的
-                    // 状态同样要拦。
-                    .with_protection(state::protected_paths(&snapshot, config.home())),
-                approvals: Arc::new(komo_store::TursoApprovalRepo::new(db.clone())),
-                clock,
-            };
             tools.push(Arc::new(
                 komo_runtime::tools::PythonTool::new(Arc::new(runtime.registered(registration)))
-                    .with_toolbox(toolbox)
-                    .with_verification(gate),
+                    .with_toolbox(toolbox),
             ));
         }
         Err(error) => {

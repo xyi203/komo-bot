@@ -24,7 +24,7 @@ use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, Sessio
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::refs::PublishedOutput;
 use komo_kernel::types::status::{RunEnd, WaitReason};
-use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch, GrantUses};
+use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch};
 
 pub use komo_gateway::service::test_support::harness::*;
 
@@ -136,8 +136,12 @@ pub enum Fault {
     BeforeFinishCall,
     /// 第 n 次 `record_round` 之前（n 从 1 数）。用来在一轮工具收尾之后停住。
     BeforeRecordRound(u32),
-    /// `append_audit` 之前——审批决定已在 state.db，审计事件补写不进 JSONL（表第 10 行）。
+    /// `append_audit` 之前——权威已在 state.db，审计事件补写不进 JSONL（表第 10 行）。
     BeforeAppendAudit,
+    /// `start_call` 时**照旧 Gateway 的样子停在审批上**：写一条 `run.waiting`
+    /// `{"kind":"approval"}`（db 里 `wait_kind = 'approval'`），然后进程"死掉"。审批
+    /// 2026-10-11 删除之后新代码不再产生它，这一步只为造出升级前留下的现场（§7、D2）。
+    LegacyApprovalAtStartCall,
     /// 不注入任何故障（只为了拿一个可观察的账本）。
     None,
 }
@@ -267,13 +271,24 @@ impl Ledger for FaultLedger {
         &self,
         call: &ToolCallId,
         plan: &komo_kernel::types::plan::ExecutionPlan,
-        grants: komo_kernel::types::turn::GrantUses,
     ) -> Result<AttemptId, LedgerError> {
         poisoned!(self);
         if self.state.fault == Fault::BeforeStartCall {
             return Err(self.state.trip());
         }
-        let attempt = self.inner.start_call(call, plan, grants).await?;
+        if self.state.fault == Fault::LegacyApprovalAtStartCall {
+            let run = plan.run.clone().expect("计划带着 Run");
+            self.inner
+                .suspend(
+                    &run,
+                    WaitReason::Approval {
+                        approval: "ap-legacy".into(),
+                    },
+                )
+                .await?;
+            return Err(self.state.trip());
+        }
+        let attempt = self.inner.start_call(call, plan).await?;
         if self.state.fault == Fault::AfterStartCall {
             // JSONL 与 state.db 两步都提交了，**真实动作还没发出**。
             return Err(self.state.trip());

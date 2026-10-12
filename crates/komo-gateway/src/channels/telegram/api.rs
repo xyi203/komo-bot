@@ -12,7 +12,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::render::telegram::{InlineKeyboard, RenderedMessage};
+use crate::render::telegram::RenderedMessage;
 
 /// 官方端点。
 const DEFAULT_ENDPOINT: &str = "https://api.telegram.org";
@@ -69,14 +69,13 @@ pub struct BotIdentity {
 }
 
 /// 一个 `Update`。**投递与去重的单位就是它**：`offset` 未推进时同一个 `Update`
-/// 原样再取一次，`callback_query` 是它的一个字段而不是更细的粒度（§11.1）。
+/// 原样再取一次（§11.1）。只订阅 `message`——按钮回调（`callback_query`）随审批按钮
+/// 一起删掉了（§7）。
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Update {
     pub update_id: i64,
     #[serde(default)]
     pub message: Option<Message>,
-    #[serde(default)]
-    pub callback_query: Option<CallbackQuery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -112,17 +111,6 @@ pub struct User {
     pub is_bot: bool,
     #[serde(default)]
     pub username: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct CallbackQuery {
-    pub id: String,
-    pub from: User,
-    /// inline 模式的回调没有 message（也就没有 chat）。komo 不用 inline 模式。
-    #[serde(default)]
-    pub message: Option<Message>,
-    #[serde(default)]
-    pub data: Option<String>,
 }
 
 /// Bot API 的 HTTP 客户端。
@@ -200,7 +188,7 @@ impl BotApi {
     ) -> Result<Vec<Update>, TelegramError> {
         let mut body = json!({
             "timeout": timeout_secs,
-            "allowed_updates": ["message", "callback_query"],
+            "allowed_updates": ["message"],
         });
         if let Some(offset) = offset {
             body["offset"] = json!(offset);
@@ -223,7 +211,6 @@ impl BotApi {
                         Some(Update {
                             update_id,
                             message: None,
-                            callback_query: None,
                         })
                     }
                 },
@@ -231,7 +218,7 @@ impl BotApi {
             .collect())
     }
 
-    /// `sendMessage`，返回新消息的 `message_id`——决定之后要按它原地改（§11.3）。
+    /// `sendMessage`，返回新消息的 `message_id`。
     pub async fn send_message(
         &self,
         chat_id: &str,
@@ -241,62 +228,8 @@ impl BotApi {
         if let Some(parse_mode) = message.parse_mode {
             body["parse_mode"] = json!(parse_mode.as_str());
         }
-        if let Some(keyboard) = &message.keyboard {
-            body["reply_markup"] = serde_json::to_value(keyboard)
-                .map_err(|err| TelegramError::Decode(err.to_string()))?;
-        }
         let sent: Message = self.call("sendMessage", body, CALL_TIMEOUT).await?;
         Ok(sent.message_id)
-    }
-
-    /// `editMessageText`。
-    pub async fn edit_message_text(
-        &self,
-        chat_id: &str,
-        message_id: i64,
-        message: &RenderedMessage,
-    ) -> Result<(), TelegramError> {
-        let mut body = json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": message.text,
-        });
-        if let Some(parse_mode) = message.parse_mode {
-            body["parse_mode"] = json!(parse_mode.as_str());
-        }
-        self.call::<Value>("editMessageText", body, CALL_TIMEOUT)
-            .await
-            .map(|_| ())
-    }
-
-    /// `editMessageReplyMarkup`。传空键盘 = 去掉按钮（§11.3：决定过的请求不该还长着
-    /// 可点的按钮）。
-    pub async fn edit_message_reply_markup(
-        &self,
-        chat_id: &str,
-        message_id: i64,
-        keyboard: &InlineKeyboard,
-    ) -> Result<(), TelegramError> {
-        let body = json!({
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "reply_markup": serde_json::to_value(keyboard)
-                .map_err(|err| TelegramError::Decode(err.to_string()))?,
-        });
-        self.call::<Value>("editMessageReplyMarkup", body, CALL_TIMEOUT)
-            .await
-            .map(|_| ())
-    }
-
-    /// `answerCallbackQuery`，无参。不调用客户端会一直转圈（spike callbacks.md 4e）。
-    pub async fn answer_callback_query(&self, query_id: &str) -> Result<(), TelegramError> {
-        self.call::<Value>(
-            "answerCallbackQuery",
-            json!({ "callback_query_id": query_id }),
-            CALL_TIMEOUT,
-        )
-        .await
-        .map(|_| ())
     }
 }
 
@@ -342,26 +275,8 @@ mod tests {
     }
 
     #[test]
-    fn a_callback_query_without_a_message_still_parses() {
-        // inline 模式：`message` 是 Optional（spike callbacks.md 4d）。
-        let update: Update = serde_json::from_value(json!({
-            "update_id": 9,
-            "callback_query": {
-                "id": "cb-1",
-                "from": { "id": 5, "is_bot": false, "first_name": "op" },
-                "data": "approve:7K2M",
-                "inline_message_id": "inline-1",
-            },
-        }))
-        .unwrap();
-        let callback = update.callback_query.unwrap();
-        assert!(callback.message.is_none());
-        assert_eq!(callback.data.as_deref(), Some("approve:7K2M"));
-    }
-
-    #[test]
-    fn a_stale_callback_message_without_from_or_text_still_parses() {
-        // 太老的消息在回调里退化成 MaybeInaccessibleMessage：只剩 chat 与 message_id。
+    fn a_message_without_from_or_text_still_parses() {
+        // 服务消息、太老的消息：只剩 chat 与 message_id。
         let message: Message = serde_json::from_value(json!({
             "message_id": 3,
             "date": 0,

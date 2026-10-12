@@ -1,5 +1,5 @@
-//! §5.4 的迭代流程，一步一个测试：候选 → 跑测试 → 审核 → 启用 → 之后的 `call` 用
-//! **已启用且已测试**的那一版。
+//! §5.4 的迭代流程，一步一个测试：候选 → 跑测试 → 启用 → 之后的 `call` 用
+//! **已启用且已测试**的那一版。启用 / 停用直接生效（§7 删掉审批之后没有 Pending）。
 
 use komo_gateway::service::test_support::harness::{FakeLlm, Home};
 use serde_json::json;
@@ -25,10 +25,10 @@ class AddTest(unittest.TestCase):
         self.assertEqual(add(2, 3), 5)
 "#;
 
-/// §14 阶段 6：**调用使用已批准且已测试版本**。走完整条路：写候选 → 跑测试 →
-/// 启用（产生审批）→ 批准 → 装上 → `python` 的 `call` 计划绑的就是这一版。
+/// §14 阶段 6：**调用使用已测试版本**。走完整条路：写候选 → 跑测试 → 启用（当场
+/// 装上）→ 清单里的当前版本就是测过的那一版。
 #[tokio::test]
-async fn a_candidate_becomes_callable_only_after_it_is_tested_and_approved() {
+async fn a_candidate_becomes_callable_only_after_it_is_tested() {
     if !have_python() {
         return;
     }
@@ -52,39 +52,25 @@ async fn a_candidate_becomes_callable_only_after_it_is_tested_and_approved() {
     assert!(report.passed, "{report:?}");
     assert_eq!(report.ran, 1);
 
-    // 4. 启用 → 一条审批。**不是**直接装上。
+    // 4. 启用 → 当场装上，回执里就是装上的那一版。
     let (code, body) = gw.post("/v1/toolbox/adder/enable", json!({})).await;
     assert_eq!(code, 200, "{body}");
     let change: serde_json::Value = serde_json::from_str(&body).expect("响应");
-    assert_eq!(change["status"], "pending", "{body}");
-    assert!(
-        toolbox_show(&gw, "adder").await.enabled.is_none(),
-        "没批准之前一秒钟都不该是当前版本"
-    );
-
-    // 5. 批准 → 后台把它装上。
-    // 审批的答复**只走** `POST /v1/interventions/{handle}/answer`（§7.5），句柄是短 ID；
-    // 发起方手上只有审批号，`decide` 顺手把短 ID 查出来（它内部断言 200）。
-    let approval =
-        komo_kernel::types::ids::ApprovalId::from_raw(change["approval"].as_str().expect("审批号"));
-    gw.decide(&approval, true).await;
-
-    eventually("adder 装上", || async {
-        toolbox_show(&gw, "adder").await.enabled.is_some()
-    })
-    .await;
+    assert_eq!(change["status"], "applied", "{body}");
+    assert_eq!(change["version"], json!(report.version), "{body}");
+    assert!(change.get("approval").is_none(), "没有审批号：{body}");
 
     let info = toolbox_show(&gw, "adder").await;
     let enabled = info.enabled.expect("已启用");
     assert_eq!(enabled.version, report.version, "装上的就是测过的那一版");
     assert_eq!(info.exports, vec!["add"]);
     // 候选已经成为当前版本，`.staging` 清空。
-    assert!(toolbox_show(&gw, "adder").await.candidate.is_none());
+    assert!(info.candidate.is_none());
 }
 
-/// 拒绝就是拒绝：模块不装，`.staging` 里的候选原样留着（改完再问一次是下一步）。
+/// 装上之后没有新候选，再启用一次是一句说得清的 400，不是把当前版本再装一遍。
 #[tokio::test]
-async fn a_rejected_enable_leaves_the_module_alone_and_keeps_the_candidate() {
+async fn enabling_again_without_a_new_candidate_is_refused_cleanly() {
     if !have_python() {
         return;
     }
@@ -92,46 +78,30 @@ async fn a_rejected_enable_leaves_the_module_alone_and_keeps_the_candidate() {
     let gw = home.start(FakeLlm::finisher("好")).await;
     write_candidate(home.path(), "adder", ADDER, Some(ADDER_TEST));
     assert!(toolbox_test(&gw, "adder").await.passed);
-
-    let (_, body) = gw.post("/v1/toolbox/adder/enable", json!({})).await;
-    let change: serde_json::Value = serde_json::from_str(&body).expect("响应");
-    let approval =
-        komo_kernel::types::ids::ApprovalId::from_raw(change["approval"].as_str().expect("审批号"));
-    gw.decide(&approval, false).await;
-
-    // 给后台任务一点时间去看见那个"拒绝"。
-    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-    let info = toolbox_show(&gw, "adder").await;
-    assert!(info.enabled.is_none(), "拒绝了就不该装上");
-    assert!(info.candidate.is_some(), "候选留着，改完可以再问一次");
-
-    // 再问一次：拿到一条**新的**审批，不是把上一条的"拒绝"当答案。
     let (code, body) = gw.post("/v1/toolbox/adder/enable", json!({})).await;
     assert_eq!(code, 200, "{body}");
-    let again: serde_json::Value = serde_json::from_str(&body).expect("响应");
-    assert_eq!(again["status"], "pending", "{body}");
-    assert_ne!(again["approval"], change["approval"]);
+
+    let (code, body) = gw.post("/v1/toolbox/adder/enable", json!({})).await;
+    assert_eq!(code, 400, "{body}");
+    assert!(
+        toolbox_show(&gw, "adder").await.enabled.is_some(),
+        "已经装上的那一版不受影响"
+    );
 }
 
-/// 「校验候选哈希与已测版本一致」（§5.4）：审批还等着的时候有人改了候选，批准之后
-/// 装不上去——**批准的是那一版，不是"这个模块的下一版"**。
+/// 「校验候选哈希与已测版本一致」（§5.4）：测完之后有人改了候选，**测过的是那一版，
+/// 不是"这个模块的下一版"**——点名旧版本是 409，不点名是 422（先去测），都不装。
 #[tokio::test]
-async fn a_candidate_edited_during_the_approval_window_does_not_ride_in_on_the_old_approval() {
+async fn a_candidate_edited_after_its_test_does_not_ride_in_on_the_old_test() {
     if !have_python() {
         return;
     }
     let home = Home::new();
     let gw = home.start(FakeLlm::finisher("好")).await;
     write_candidate(home.path(), "adder", ADDER, Some(ADDER_TEST));
-    let approved_version = toolbox_test(&gw, "adder").await.version;
+    let tested_version = toolbox_test(&gw, "adder").await.version;
 
-    let (_, body) = gw.post("/v1/toolbox/adder/enable", json!({})).await;
-    let change: serde_json::Value = serde_json::from_str(&body).expect("响应");
-    assert_eq!(change["version"], json!(approved_version));
-    let approval =
-        komo_kernel::types::ids::ApprovalId::from_raw(change["approval"].as_str().expect("审批号"));
-
-    // 审批窗口里又改了一版（而且这一版没测过）。
+    // 测完之后又改了一版（而且这一版没测过）。
     write_candidate(
         home.path(),
         "adder",
@@ -139,16 +109,20 @@ async fn a_candidate_edited_during_the_approval_window_does_not_ride_in_on_the_o
         Some(ADDER_TEST),
     );
 
-    gw.decide(&approval, true).await;
-    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+    let (code, body) = gw
+        .post(
+            "/v1/toolbox/adder/enable",
+            json!({ "version": tested_version }),
+        )
+        .await;
+    assert_eq!(code, 409, "点名的那一版已经不是候选：{body}");
 
+    let (code, body) = gw.post("/v1/toolbox/adder/enable", json!({})).await;
+    assert_eq!(code, 422, "新的这一版没测过：{body}");
     assert!(
         toolbox_show(&gw, "adder").await.enabled.is_none(),
-        "批准的那一版已经不在了，什么都不该装上"
+        "什么都不该装上"
     );
-    // 操作者在 home chat 里看得见"没能装上"，不是一片安静。
-    let said = gw.home.texts().join("\n");
-    assert!(said.contains("没能装上"), "{said}");
 }
 
 /// 内置的 memos 随 Gateway 装进 toolbox 并**已启用**（§5.5）。
@@ -175,20 +149,29 @@ async fn the_builtin_memos_module_is_there_on_first_boot() {
     assert!(!printed.contains(MEMOS_TOKEN), "{printed}");
 }
 
-/// 停用也要过同一道门：它一样是"修改启用中的 toolbox"。
+/// 停用同样当场生效：回执是 `applied`，清单里它不再是已启用。
+///
+/// 用一个自己写的模块而不是内置的 memos：内置模块缺了就会在下一次打开 toolbox 时被重新
+/// 装回去（`service::toolbox_of`，见报告）。
 #[tokio::test]
-async fn disabling_a_module_asks_too() {
+async fn disabling_a_module_applies_at_once() {
+    if !have_python() {
+        return;
+    }
     let home = Home::new();
     let gw = home.start(FakeLlm::finisher("好")).await;
+    write_candidate(home.path(), "adder", ADDER, Some(ADDER_TEST));
+    assert!(toolbox_test(&gw, "adder").await.passed);
+    let (code, body) = gw.post("/v1/toolbox/adder/enable", json!({})).await;
+    assert_eq!(code, 200, "{body}");
 
-    let (code, body) = gw.post("/v1/toolbox/memos/disable", json!({})).await;
+    let (code, body) = gw.post("/v1/toolbox/adder/disable", json!({})).await;
     assert_eq!(code, 200, "{body}");
     let change: serde_json::Value = serde_json::from_str(&body).expect("响应");
-    assert_eq!(change["status"], "pending", "{body}");
-    assert!(
-        toolbox_show(&gw, "memos").await.enabled.is_some(),
-        "没批准之前它还在"
-    );
+    assert_eq!(change["status"], "applied", "{body}");
+    // 正文移出了 toolbox/，又没有候选：这个名字此刻什么都指不到。
+    let (code, body) = gw.get("/v1/toolbox/adder").await;
+    assert_eq!(code, 404, "停用之后它不再是已启用：{body}");
 }
 
 /// 说不出名字的模块给一个说得清的 404，不是 500。

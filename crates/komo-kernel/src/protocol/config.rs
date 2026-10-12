@@ -1,4 +1,7 @@
-//! `ConfigSnapshot`：config.toml + .env + policy.toml 解析出来的**一份完整快照**（§3）。
+//! `ConfigSnapshot`：config.toml + .env 解析出来的**一份完整快照**（§3）。
+//!
+//! `policy.toml` 在 2026-10-11 删掉 Policy 之后不再读；文件还在时由 runtime 报一句
+//! "已不再使用"，不静默忽略（D13）。
 //!
 //! 进程里只有一个 `Arc<ConfigSnapshot>`，热重载时原子替换。读配置的地方按用途读当前
 //! 快照、不缓存——名单改完下一条消息就按新名单判。
@@ -20,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::compaction::CompactionEconomics;
-use crate::policy::RuleTable;
 use crate::projection::{DecayPolicy, ProjectionContext};
 use crate::types::agent::AgentConfig;
 use crate::types::chat::{ChannelPlatform, PeerId};
@@ -80,7 +82,7 @@ pub struct McpServerConfig {
     /// 挂哪些工具。`None` = 服务器列出的全部。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
-    /// 操作者认定为只读的工具：Policy 按只读放行，中断后可以重做（`SafeReread`）。
+    /// 操作者认定为只读的工具：codemode 脚本里可以调，中断后可以重做（`SafeReread`）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only: Vec<String>,
 }
@@ -115,7 +117,7 @@ pub struct ChannelConfig {
     /// 下指令。
     #[serde(default)]
     pub allow_from: Vec<PeerId>,
-    /// 主动投递（审批请求等）的目标会话。
+    /// 主动投递（Run 结束、需要人判断等）的目标会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_chat: Option<PeerId>,
     /// 允许响应的群。缺省 = 只响应 `allow_from` 的私聊。
@@ -509,7 +511,6 @@ pub struct ConfigSnapshot {
     #[serde(default)]
     pub compaction: CompactionConfig,
     pub channels: ChannelsConfig,
-    pub policy: RuleTable,
     pub paths: PathsConfig,
     /// 每个凭证**值**的哈希，按变量名索引。值本身不在快照里，这里只够回答"它变了
     /// 没有"。
@@ -643,7 +644,6 @@ mod tests {
                 telegram: ChannelConfig::default(),
                 wechat: ChannelConfig::default(),
             },
-            policy: RuleTable::initial(),
             paths: PathsConfig {
                 sessions_dir: PathBuf::from("/home/u/.komo/sessions"),
                 toolbox_dir: PathBuf::from("/home/u/.komo/toolbox"),

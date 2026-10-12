@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::policy::RuleTable;
 use crate::protocol::config::{
     ChannelConfig, ChannelsConfig, ConfigSnapshot, MemoryConfig, PathsConfig, RetrievalConfig,
     StartOnly, TypesafeConfig,
@@ -109,7 +108,6 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             telegram: ChannelConfig::default(),
             wechat: ChannelConfig::default(),
         },
-        policy: RuleTable::initial(),
         paths: PathsConfig {
             sessions_dir: home.join("sessions"),
             toolbox_dir: home.join("toolbox"),

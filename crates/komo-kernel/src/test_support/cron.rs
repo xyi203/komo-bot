@@ -164,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn advancing_a_slot_does_not_invalidate_the_jobs_grants() {
+    fn advancing_a_slot_does_not_bump_the_job_version() {
         block_on(async {
             use crate::cron::{
                 CronJob, FixedOffsetZone, JobStatus, OverlapPolicy, TimeZone, parse_schedule,
@@ -194,7 +194,7 @@ mod tests {
             let stored = repo.put(job.clone()).await.unwrap();
             assert_eq!(stored.version, 1, "第一次写就是第一版");
 
-            // 推进槽位：版本一个字不动，否则 GrantScope::CronJob 绑的那个版本每天作废一次。
+            // 推进槽位：版本一个字不动——版本回答的是"定义改没改过"。
             let next = time::macros::datetime!(2026-09-16 09:00:00 UTC);
             repo.advance(&stored.id, Some(next), JobStatus::Active, None)
                 .await
@@ -212,7 +212,7 @@ mod tests {
             assert_eq!(done.status, JobStatus::Done);
             assert!(done.next_run_at.is_none());
 
-            // 改定义才递增——旧授权就该在这一刻失效。
+            // 改定义才递增。
             let bumped = repo.put(after).await.unwrap();
             assert_eq!(bumped.version, 2);
 

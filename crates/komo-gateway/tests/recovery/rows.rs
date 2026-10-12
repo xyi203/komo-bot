@@ -1,7 +1,7 @@
 //! §14「恢复故障注入验收」十五行，逐行一个测试。
 //!
 //! 命名是 `row_<行号>_<行文>`。每个测试都断言**副作用次数**、Run / ToolCall 身份、
-//! 授权消费与事件配对，而不是"状态变成了 running"。
+//! 与事件配对，而不是"状态变成了 running"。
 
 use std::sync::Arc;
 
@@ -370,11 +370,6 @@ async fn row_6_an_external_write_without_evidence_waits_instead_of_writing_twice
     let session = gw.open_session().await;
     let run = gw.submit(&session, "row-6", "跑一条命令").await.run;
 
-    // 任意 shell 是 Ask（§7.1 第 5 行）：先批一次。
-    let record = gw.wait_approval().await;
-    assert_eq!(record.run.as_ref(), Some(&run));
-    gw.decide(&record.approval, true).await;
-
     fault.wait_tripped().await;
     gw.stop().await;
     assert_eq!(counter.count(), 1, "外部写入成功了一次");
@@ -457,8 +452,6 @@ async fn row_7_a_result_the_database_never_indexed_is_backfilled_not_rerun() {
     let gw = home.start(shell_then_done(&counter.append_command())).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "row-7", "跑一条命令").await.run;
-    let record = gw.wait_approval().await;
-    gw.decide(&record.approval, true).await;
     fault.wait_tripped().await;
     gw.stop().await;
     assert_eq!(counter.count(), 1);
@@ -585,8 +578,6 @@ async fn row_9_a_missing_or_altered_output_body_halts_the_task() {
         let gw = home.start(shell_then_done(&counter.append_command())).await;
         let session = gw.open_session().await;
         let run = gw.submit(&session, "row-9", "跑一条命令").await.run;
-        let record = gw.wait_approval().await;
-        gw.decide(&record.approval, true).await;
         fault.wait_tripped().await;
         gw.stop().await;
         assert_eq!(counter.count(), 1, "{label}");
@@ -647,69 +638,77 @@ async fn row_9_a_missing_or_altered_output_body_halts_the_task() {
 
 // ---------------------------------------------------------------- 第 10 行
 
-/// 第 10 行：**用户批准已保存，审计 JSONL 尚未补写** → 从 state.db 读取有效授权，outbox
-/// 幂等补写，**不重新询问**。
+/// 第 10 行原先是"用户批准已保存、审计尚未补写"。审批 2026-10-11 删掉之后（§7），这一行
+/// 剩下的是**升级前留下的现场**：一条 Run 停在旧审批上（JSONL `run.waiting`
+/// `{"kind":"approval"}`、db `wait_kind = 'approval'`），那次调用 planned 而没有 started。
+///
+/// 新 Gateway 起来时按 §8.4"调用 planned，确定尚未执行 → 自动执行"续跑（D2）：不问人、
+/// 不进介入清单，**那次调用只执行一次**，Run 走到终态。
 #[tokio::test]
-async fn row_10_a_saved_approval_is_reused_and_its_audit_event_is_backfilled_once() {
+async fn row_10_a_run_left_waiting_on_a_retired_approval_resumes_and_runs_its_call_once() {
     let home = Home::new();
     let counter = Counter::new(&home, "row10.count");
 
-    let fault = home.inject(Fault::BeforeAppendAudit);
+    // 照旧 Gateway 的样子：计划落盘之后停在审批上，然后进程"死掉"。
+    let fault = home.inject(Fault::LegacyApprovalAtStartCall);
     let gw = home.start(shell_then_done(&counter.append_command())).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "row-10", "跑一条命令").await.run;
-    let record = gw.wait_approval().await;
-    gw.decide(&record.approval, true).await;
-
-    // 决定已经在 state.db 里。
-    let stored = gw
-        .running
-        .state
-        .approval_repo
-        .get(&record.approval)
-        .await
-        .expect("读得到")
-        .expect("有这条");
-    assert!(stored.decision.as_ref().expect("有结论").approved);
-
-    // 只等终态：这一条 Run 一开始就停在审批上（`waiting + approval`），把 `Waiting`
-    // 也算成"收场"会在决定生效之前就返回。
-    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
+    fault.wait_tripped().await;
     gw.stop().await;
-    let _ = fault;
+    assert_eq!(counter.count(), 0, "旧现场里那次调用还没执行");
 
-    // 审计事件没写进 JSONL。
-    let types_before = home.event_types(&session);
+    // 现场核对：JSONL 尾巴是 planned + 停在审批上，没有 started；db 认得出这一批。
+    let events = home.events(&session);
+    let planned = planned_calls(&events);
+    assert_eq!(planned.len(), 1, "{:?}", home.event_types(&session));
+    assert!(tool_started(&events).is_empty(), "调用还没 started");
     assert!(
-        !types_before.iter().any(|t| t == "approval.decided"),
-        "审计事件还没补写：{types_before:?}"
+        events.iter().any(|event| matches!(
+            &event.payload,
+            komo_kernel::events::EventPayload::RunWaiting(body)
+                if matches!(body.reason, WaitReason::Approval { .. })
+        )),
+        "JSONL 里有那条旧的 `run.waiting` approval：{:?}",
+        home.event_types(&session)
     );
+    {
+        let db = home.open_db().await;
+        let legacy = komo_store::RecoveryStore::new(db, home.sessions_dir())
+            .legacy_approval_waits()
+            .await
+            .expect("读得出");
+        assert_eq!(
+            legacy.iter().map(|one| one.run.clone()).collect::<Vec<_>>(),
+            vec![run.clone()],
+            "db 里 `wait_kind = 'approval'` 认得出来"
+        );
+    }
 
+    // 新 Gateway：启动恢复按 §8.4 续跑。
     home.clear_injection();
     let gw = home.start(FakeLlm::finisher("做完了。")).await;
-    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
-    // 给 outbox 补写一点时间（启动那一步就补过一次；这一拍是兜底）。
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    // 不重新询问：待处理审批里没有新的一条。
-    let pending = gw.approvals().await;
-    assert!(
-        pending.iter().all(|r| r.approval == record.approval),
-        "不该为同一个动作再问一次：{pending:?}"
-    );
-    assert_eq!(counter.count(), 1, "已批准的动作只执行一次");
-
-    // §8.5 的反向补写：决定先落 state.db 与 `control_outbox`，审计那条随后（也叫醒
-    // 补写器）按 `event_id` 幂等补进 JSONL——重启补一次，还只补一条。
-    let types = home.event_types(&session);
-    assert!(
-        types.iter().any(|t| t == "approval.decided"),
-        "重启后 outbox 幂等补写一条审计事件：{types:?}"
-    );
+    let detail = gw.wait_terminal(&run).await;
     assert_eq!(
-        types.iter().filter(|t| *t == "approval.decided").count(),
-        1,
-        "**幂等**：只补一条"
+        detail.summary.state,
+        RunState::Completed,
+        "旧审批不再挡路：{detail:?}"
+    );
+    assert_eq!(counter.count(), 1, "那次调用**只执行一次**");
+    assert!(
+        pending_intervention(&gw, &run).await.is_none(),
+        "不问人：旧审批不进介入清单"
+    );
+
+    let events = home.events(&session);
+    let started = tool_started(&events);
+    assert_eq!(started.len(), 1, "一次尝试");
+    assert_eq!(started[0].call_id, planned[0], "沿用原来那个调用号");
+    assert_eq!(tool_results(&events).len(), 1, "一条结果");
+    assert!(unpaired_attempts(&events).is_empty());
+    assert_eq!(
+        result_statuses(&events),
+        vec![komo_kernel::types::refs::ToolResultStatus::Completed]
     );
     gw.stop().await;
 }
@@ -727,8 +726,6 @@ async fn row_11_a_half_written_tail_is_quarantined_and_recovery_continues() {
     let gw = home.start(shell_then_done(&counter.append_command())).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "row-11", "跑一条命令").await.run;
-    let record = gw.wait_approval().await;
-    gw.decide(&record.approval, true).await;
     fault.wait_tripped().await;
     gw.stop().await;
     assert_eq!(counter.count(), 1);
@@ -784,8 +781,6 @@ async fn row_12_a_corrupt_middle_stops_only_the_affected_session() {
         .submit(&broken_session, "row-12-a", "跑一条命令")
         .await
         .run;
-    let record = gw.wait_approval().await;
-    gw.decide(&record.approval, true).await;
     fault.wait_tripped().await;
     gw.stop().await;
     assert_eq!(broken_counter.count(), 1);
@@ -884,18 +879,21 @@ async fn row_12_a_corrupt_middle_stops_only_the_affected_session() {
 #[tokio::test]
 async fn a_run_in_a_session_whose_log_is_gone_can_still_be_cancelled() {
     let home = Home::new();
+    // 停在一次"结果不明"上（测试工具 `unsure`）：重启前这条 Run 必须还没到终态。
+    let unsure = komo_gateway::service::test_support::Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
     let llm = FakeLlm::new(vec![vec![call_round(
         1,
         "pc-1",
-        "shell",
-        serde_json::json!({"command": "echo hi"}),
+        "unsure",
+        serde_json::json!({}),
     )]]);
     let gw = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "gone-1", "跑一条命令").await.run;
-    gw.wait_approval().await;
+    gw.wait_intervention(&run).await;
     gw.stop().await;
 
     // 日志没了：state.db 说应用到了 seq N，文件只有 0。
@@ -1014,8 +1012,6 @@ async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_c
     let gw = home.start(shell_then_done(&counter.append_command())).await;
     let session = gw.open_session().await;
     let run = gw.submit(&session, "row-14", "跑一条命令").await.run;
-    let record = gw.wait_approval().await;
-    gw.decide(&record.approval, true).await;
     fault.wait_tripped().await;
     let old_executor = gw.executor_id();
     gw.stop().await;
@@ -1107,12 +1103,21 @@ async fn row_15_a_cancelled_run_never_revives_and_an_exhausted_budget_ends() {
     let home = Home::new();
     let target = home.workspace().join("row15.txt");
 
-    // ① 取消：停在审批上的 Run 被用户取消。
+    // ① 取消：一条还在跑的 Run（卡在测试工具 `gate` 上）被用户取消；排在后面的那条
+    //    命令一次都不该跑。
     let counter = Counter::new(&home, "row15.count");
-    let gw = home.start(shell_then_done(&counter.append_command())).await;
+    let gate = komo_gateway::service::test_support::Gate::new();
+    home.install_tools(vec![gate.tool()]);
+    let gw = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(1, "pc-gate", "gate", serde_json::json!({})),
+            call_round(2, "pc-1", "shell", shell_args(&counter.append_command())),
+            text_round(3, "跑过了。"),
+        ]]))
+        .await;
     let session = gw.open_session().await;
     let cancelled_run = gw.submit(&session, "row-15-a", "跑一条命令").await.run;
-    gw.wait_approval().await;
+    gate.wait_entered(1).await;
     let (status, body) = gw
         .post(
             &format!("/v1/runs/{cancelled_run}/cancel"),
@@ -1194,7 +1199,7 @@ async fn db_record(home: &Home, run: &RunId) -> komo_store::repos::runs::RunReco
 
 /// §7.5 的清单里这条 Run 现在等人的那一条（没有就是 `None`）。
 ///
-/// 它是**派生视图**（`runs` 与 `approval_requests` 的并集查询），所以断言它就是在断言
+/// 它是**派生视图**（从 `runs` 查出来），所以断言它就是在断言
 /// "这条 Run 挡着队、而且操作者看得见"——§8.4 的那句"卡住但清单为空"正好是它的反面。
 async fn pending_intervention(gw: &Gw, run: &RunId) -> Option<InterventionSummary> {
     gw.state()

@@ -6,9 +6,9 @@ use super::{ColumnSpec, TableSpec};
 ///
 /// **状态是两个维度**（§8.10 的加列规则）：`state` 一个词（`accepted` / `queued` /
 /// `running` / `waiting` / `completed` / `failed` / `cancelled` / `abandoned`），
-/// `waiting` 时由 `wait_kind` 说清**在等谁**（`approval` / `retry` / `intervention` /
-/// `dependency`），`wait_ref` 指到具体对象（审批 ID、intervention 句柄、前置 Run ID，
-/// `retry` 时是原因），`wake_at` 只有 `retry` 用。
+/// `waiting` 时由 `wait_kind` 说清**在等谁**（`retry` / `intervention` / `dependency`；
+/// 删审批之前的旧行还有 `approval`，只解码、不再写，D2），`wait_ref` 指到具体对象
+/// （intervention 句柄、前置 Run ID、旧审批 ID，`retry` 时是原因），`wake_at` 只有 `retry` 用。
 ///
 /// 旧列 `status` / `next_retry_at` **退役但仍存在**（§8.2 只允许加列）：新写入一律给空值
 /// （`''` / `0`），读的一方不再看它们。两列留在那里只为了让旧库能读、旧备份能对。
@@ -54,7 +54,7 @@ pub struct RunRow {
     /// 是**判据**，`delegate` 那一列仍然是**正文**。
     pub resumes_run_id: Option<String>,
     /// 受理这条 Run 的 [`komo_kernel::types::delegate::DelegateSpec`] JSON，**父侧那一份
-    /// 计划留在子 Run 行上的副本**（授权与审批绑定的是计划，计划里就有它）。
+    /// 计划留在子 Run 行上的副本**。
     ///
     /// 它读不出来时**不猜**：当作"没有契约"（见 [`crate::repos::runs::delegate_of`]），
     /// 旧行与损坏行都要能读——子 Run 仍然可以跑，只是父侧复验时按自由文本处理。
@@ -64,9 +64,9 @@ pub struct RunRow {
     /// 调度状态：`accepted` / `queued` / `running` / `waiting` / `completed` / `failed` /
     /// `cancelled` / `abandoned`。
     pub state: String,
-    /// `waiting` 时在等谁：`approval` / `retry` / `intervention` / `dependency`。
+    /// `waiting` 时在等谁：`retry` / `intervention` / `dependency`（旧行还有 `approval`）。
     pub wait_kind: Option<String>,
-    /// `wait_kind` 指到的对象（审批 ID / intervention 句柄 / 前置 Run ID；`retry` 是原因）。
+    /// `wait_kind` 指到的对象（intervention 句柄 / 前置 Run ID / 旧审批 ID；`retry` 是原因）。
     pub wait_ref: Option<String>,
     /// `retry` 的 not_before；其他等待是 `0`。
     pub wake_at: i64,
@@ -85,12 +85,13 @@ pub struct RunRow {
     pub retry_attempts: i64,
     pub rounds: i64,
     pub max_rounds: i64,
-    /// 审批有效期；`0` = 不限。
+    /// 有效期；`0` = 不限。
     pub valid_until: i64,
     /// 本次 Run 固定的 `ModelConfig` 快照，只记身份不记凭证。
     pub model_snapshot: String,
     pub effort: Option<String>,
-    /// 这个 Run 上的范围授权 ID 列表（JSON）。权威仍在 `policy_grants`。
+    /// **退役列**（Policy 与审批在 2026-10-11 删掉了）：永远写 `"[]"`，不再读（§8.2 只允许
+    /// 加列）。老库里这里可能还留着旧授权 ID。
     pub grants: String,
     /// `MemoryWork`：pending / processing / done / error（§9.3）。
     pub memory_work: String,

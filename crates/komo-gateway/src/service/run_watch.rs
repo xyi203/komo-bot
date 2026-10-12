@@ -3,17 +3,17 @@
 //! 每个 Run 一个订阅者，按来源分流：
 //!
 //! ```text
-//! 交互（聊天 / TUI / HTTP）  终态 → 回来源会话；等待审批 / 需要处理 → 来源会话 + home chat
-//! Cron（一次触发）          终态 → 按 notify 投 home chat 并回写触发状态；等待审批 → home chat
+//! 交互（聊天 / TUI / HTTP）  终态 → 回来源会话；需要处理 → 来源会话 + home chat
+//! Cron（一次触发）          终态 → 按 notify 投 home chat 并回写触发状态；需要处理 → home chat
 //! ```
 //!
 //! **两种来源共用这一个循环**，因为它们的分别只有一条：谁是"来源会话"。§11.4 把这条
-//! 写成了一句话——「审批请求的投递目标：Run 的来源会话，**加上** home chat（若不同）。
+//! 写成了一句话——「介入的投递目标：Run 的来源会话，**加上** home chat（若不同）。
 //! 来源是 Cron 或已断开的 TUI 时只有 home chat」——所以来源是 `Option<ChannelPeer>`，
 //! 不是两条代码路径。
 //!
 //! **一个 Run 只有一个看的人**：`GatewayState::watching` 是那张登记表。没有它，Cron 的
-//! 看客与交互的看客会各投一遍同一条审批，操作者收到两张一模一样的卡（去重键那一层管
+//! 看客与交互的看客会各投一遍同一条介入，操作者收到两条一模一样的消息（去重键那一层管
 //! 的是平台重投，管不到这个）。
 //!
 //! 它**不是**恢复机制：进程活着的时候订阅事件流，重启后靠 `deliveries` 表里那一行
@@ -24,7 +24,7 @@ use std::sync::Arc;
 use komo_kernel::events::EventPayload;
 use komo_kernel::traits::Ledger;
 use komo_kernel::types::chat::{ChannelPeer, DeliveryTarget, Outbound};
-use komo_kernel::types::ids::{ApprovalId, RunId, SessionId};
+use komo_kernel::types::ids::{RunId, SessionId};
 
 use super::cron_watch::Watched;
 use super::state::GatewayState;
@@ -89,7 +89,7 @@ pub fn watch(state: Arc<GatewayState>, session: SessionId, run: RunId, watcher: 
 ///
 /// 看客只活在内存里：`GatewayState::watching` 与这里的 `tokio::spawn` 都在进程重启时
 /// 清空，而账本上这条 Run 该往哪投（`runs.peer`）一直都在。少了这一步，一条跨重启还在
-/// 跑的交互 Run 跑完之后没有人订阅它的终态帧，最终回复就再也投不出去——审批有周期兜底
+/// 跑的交互 Run 跑完之后没有人订阅它的终态帧，最终回复就再也投不出去——介入有周期兜底
 /// 补投（[`GatewayState::sweep_unseen_interventions`]），最终回复原来没有，这里补上。
 ///
 /// **必须在调度器起来之前调用**：调度器一起，这些 Run 可能立刻继续往下跑，慢一步挂上
@@ -219,13 +219,13 @@ async fn step(
         // 投到哪儿，由理由决定——"需要人判断"的那两类要投（§11.4），等时钟与等前一条
         // Run 不投（那不是问人）。
         //
-        // 「新增危险操作暂停等待审批，不能因无人值守而自动放行」（§10）——少了投递这一步，
-        // Run 会停在等待上而**没有人知道它在等**。
+        // 「不能因无人值守就没人知道它在等」（§10）——少了投递这一步，Run 会停在等待上而
+        // **没有人知道它在等**。
         EventPayload::RunWaiting(body) => {
             match &body.reason {
-                komo_kernel::types::status::WaitReason::Approval { approval } => {
-                    deliver_approval(state, watcher, approval).await;
-                }
+                // 只在旧日志里（审批 2026-10-11 删除，§7）：新代码不产生它，启动恢复会把
+                // 这种 Run 按 §8.4 续跑，不问人。
+                komo_kernel::types::status::WaitReason::Approval { .. } => {}
                 // 结果不明 / 前提没了（§7.5 的另外两类）：同一句话问人，投**来源会话 +
                 // home chat**。"需要人判断"不该因为种类不同而有不同的到达率（§11.4）。
                 komo_kernel::types::status::WaitReason::Intervention { .. } => {
@@ -473,6 +473,7 @@ async fn question_for(
 /// `deliver = false` 只在命令 Job 退出 0、stdout 为空时用（§10：看门狗"没事不说话"）——
 /// 触发状态仍然回写为 `Ok`，只是不经过 `notify` 的那次投递，不能让一个空结果的 Job
 /// 看起来像是没跑过。
+#[allow(clippy::too_many_arguments)]
 async fn finish(
     state: &Arc<GatewayState>,
     session: &SessionId,
@@ -531,56 +532,6 @@ async fn finish(
                 super::cron_watch::notify(state, watched, status, session, run, &text).await;
             }
         }
-    }
-}
-
-/// 把这条审批投到**来源会话 + home chat**（§11.4）。
-///
-/// 已经决定过的不再问一次；投不出去（一个 home_chat 都没配、来源会话也没有）**报到
-/// 日志**，不静默丢弃——一个没人能回答的等待会让这个 Run 从此停在那里。
-async fn deliver_approval(state: &Arc<GatewayState>, watcher: &Watcher, approval: &ApprovalId) {
-    let record = match state.approval_repo.get(approval).await {
-        Ok(Some(record)) => record,
-        Ok(None) => return,
-        Err(error) => {
-            tracing::warn!(%error, %approval, "读不出这条审批，投不出去");
-            return;
-        }
-    };
-    if record.decision.is_some() {
-        return; // 已经决定过了，不必再问一次。
-    }
-    // **屏幕前有人在看的时候不投 chat 那份。** TUI / HTTP 来源的 Run 没有 chat 对端
-    // （`peer` 是 `None`），照 §11.4 那份卡片就只剩 home chat 一个出口——而它是一次
-    // 网络往返（实测几秒到几十秒，渠道不通时更久），人在看着这一条的时候它只会晚到，
-    // 顺带多一份噪音（另外它还会在原地回写一条"已批准 · 短ID"，人刚在弹窗里答过）。
-    //
-    // 弹窗走的是 SSE 那一帧（`approval.requested` 一到就推，TUI 见 `run.waiting` 就自己
-    // 去问清单），所以"有人在看"= 这条审批已经有人看见了。
-    //
-    // **没人在看就一定投**：Cron、`komo run` 脚本、TUI 关掉之后都落在那一支上——
-    // §10 的底线是"不能因为无人值守就没人知道它在等"。TUI 关上而审批还挂着的那种，
-    // 由周期兜底（[`GatewayState::sweep_unseen_interventions`]）在下一拍补投。
-    //
-    // 这一条**不占** `start_delivering_intervention` 那个"投过一次"的名额：看见的人走了
-    // 之后兜底还要能补投。
-    if watcher.peer().is_none() && state.hub.viewers(&record.session) > 0 {
-        tracing::debug!(%approval, session = %record.session, "有人在看着这个会话，审批只弹在他面前");
-        return;
-    }
-    if !state.start_delivering_intervention(record.short_id.as_str()) {
-        tracing::debug!(%approval, "这条审批已经投过了");
-        return;
-    }
-    if let Err(error) = state
-        .notifier
-        .deliver_approval(
-            watcher.peer(),
-            komo_runtime::approvals::presentation(&record),
-        )
-        .await
-    {
-        tracing::warn!(%error, %approval, "审批请求投不出去：没人能回答它");
     }
 }
 

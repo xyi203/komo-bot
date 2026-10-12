@@ -465,7 +465,7 @@ impl GatewayState {
     /// 追加一条会话生命周期的审计副本（§8.10 第 1 条）。
     ///
     /// **它不产生状态**：权威是 `sessions.state` 那一列，数据库先提交、事件随后补写
-    /// （与审批同向）。写不进去只影响审计，状态已经落库了。
+    /// （§8.5 的反向顺序）。写不进去只影响审计，状态已经落库了。
     async fn audit_session(
         &self,
         session: &SessionId,

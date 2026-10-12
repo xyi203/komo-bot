@@ -143,12 +143,12 @@ impl Tool for ReadTool {
 
     async fn execute(
         &self,
-        plan: komo_kernel::types::plan::ApprovedPlan,
+        plan: komo_kernel::types::plan::ExecutionPlan,
         ctx: &ToolContext,
         // 文件工具不产生流式输出：结构化结果由 executor 发布。
         _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
-        let plan = plan.plan();
+        let plan = &plan;
         let args: ReadArgs = parse_args(plan.args.clone(), "read")?;
         let target = plan.targets.first().ok_or_else(|| ToolError::Failed {
             message: "计划里没有目标".into(),
@@ -197,7 +197,7 @@ impl Tool for ReadTool {
 /// 这次读取触及的目标。
 ///
 /// 本地路径照旧（符号链接解析掉，规则只看这个）；资源入口按 §六 解析：磁盘上的那条把
-/// **逻辑 URI 与真实目标**都放进计划（审批看前者、规则匹配看后者），`tool://` 那条没有
+/// **逻辑 URI 与真实目标**都放进计划（给人看前者、核对与回放看后者），`tool://` 那条没有
 /// 真实目标。`read` 要的是一份文件——给了一组根（`skill://`）是错的，那是 `rg` 的 path。
 fn target_of(raw: &str, ctx: &ToolContext) -> Result<PlanTarget, ToolError> {
     let Some(uri) = resources::entry(raw).map_err(ResourceError::into_tool_error)? else {
@@ -339,7 +339,7 @@ fn clip(text: &str, limit: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context, writer};
+    use crate::tools::test_support::{context, writer};
     use komo_kernel::types::resource::{ResourceMounts, SkillMount};
     use std::path::PathBuf;
 
@@ -419,16 +419,11 @@ mod tests {
                 "skill://review/SKILL.md（{}）",
                 scene.skill_file().display()
             ),
-            "审批那一行：逻辑入口 + 真实目标"
+            "计划那一行：逻辑入口 + 真实目标"
         );
         assert_eq!(plan.targets[0].access, TargetAccess::Read);
 
-        let result = read_result(
-            &tool
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert_eq!(result.path, "skill://review/SKILL.md", "抬头印逻辑入口");
         assert!(result.text.contains("照着做"), "{}", result.text);
         assert_eq!(result.total_lines, 4);
@@ -448,12 +443,7 @@ mod tests {
         assert!(plan.targets[0].is_virtual());
         assert_eq!(plan.targets[0].path(), None, "虚拟入口不给它编路径");
         assert_eq!(plan.targets[0].describe(), "tool://read/schema");
-        let result = read_result(
-            &tool
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert_eq!(result.path, "tool://read/schema");
         assert!(result.text.contains("\"required\""), "{}", result.text);
         assert_eq!(
@@ -468,12 +458,7 @@ mod tests {
                 .prepare(serde_json::json!({ "path": raw }), &ctx)
                 .await
                 .unwrap();
-            let result = read_result(
-                &tool
-                    .execute(approved(plan), &ctx, &mut writer(&ctx))
-                    .await
-                    .unwrap(),
-            );
+            let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
             assert!(result.text.contains(needle), "{raw}: {}", result.text);
         }
 
@@ -483,12 +468,7 @@ mod tests {
             .prepare(serde_json::json!({ "path": "tool://read/schema" }), &ctx)
             .await
             .unwrap();
-        let result = read_result(
-            &small
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = read_result(&small.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert!(result.truncated);
         assert!(!result.unread.is_empty());
     }
@@ -558,12 +538,7 @@ mod tests {
                     .as_path()
             )
         );
-        let result = read_result(
-            &tool
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert_eq!(result.path, "a.txt", "本地路径印的还是模型给的那个字符串");
     }
 
@@ -635,12 +610,7 @@ mod tests {
                 path.canonicalize().unwrap().display()
             )
         );
-        let result = read_result(
-            &tool
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert_eq!(result.text, body, "投影指的那一份就是读到的那一份");
         assert_eq!(result.path, uri);
     }
@@ -664,10 +634,7 @@ mod tests {
             Some(std::fs::canonicalize(&file).unwrap().as_path())
         );
 
-        let output = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
-            .await
-            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
         let result = read_result(&output);
         assert_eq!(result.text, "one\ntwo\n");
         assert_eq!(result.total_lines, 2);
@@ -690,12 +657,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let result = read_result(
-            &tool
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
 
         assert_eq!(result.text, "line 3\nline 4\n");
         assert_eq!((result.start_line, result.end_line), (3, 4));
@@ -722,12 +684,7 @@ mod tests {
             .prepare(serde_json::json!({ "path": "big.txt" }), &ctx)
             .await
             .unwrap();
-        let result = read_result(
-            &tool
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert!(result.truncated);
         assert!(result.text.len() <= 28, "{:?}", result.text);
         assert!(!result.unread.is_empty());
@@ -746,12 +703,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let result = read_result(
-            &tool
-                .execute(approved(plan), &ctx, &mut writer(&ctx))
-                .await
-                .unwrap(),
-        );
+        let result = read_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert!(result.text.is_empty());
         assert_eq!(
             result.unread[0],
@@ -773,7 +725,7 @@ mod tests {
             .await
             .unwrap();
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         assert!(matches!(error, ToolError::Failed { .. }), "{error:?}");

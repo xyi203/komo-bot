@@ -2,9 +2,11 @@
 //!
 //! | §14 验证列 | 测试 |
 //! |---|---|
-//! | 调用使用已批准且已测试版本 | `lifecycle::a_candidate_becomes_callable_only_after_it_is_tested_and_approved`、`komo-runtime` 的 `tools::python::tests::a_call_binds_the_enabled_module_version` |
-//! | 模块更新使旧授权失效 | `komo-runtime` 的 `tools::python::tests::updating_the_module_invalidates_a_grant_bound_to_the_old_version` |
-//! | toolbox 启用的审批在微信里能看到版本差异与测试结果 | `approval::the_wechat_message_shows_the_version_diff_and_the_test_result`（另两个渠道各一条） |
+//! | 调用使用已测试版本 | `lifecycle::a_candidate_becomes_callable_only_after_it_is_tested`、`komo-runtime` 的 `tools::python::tests::a_call_binds_the_enabled_module_version` |
+//! | 测完又改的候选装不上 | `lifecycle::a_candidate_edited_after_its_test_does_not_ride_in_on_the_old_test` |
+//!
+//! 启用 / 停用直接生效（§7，2026-10-11 删掉审批）：原先"启用的审批在微信里能看到版本
+//! 差异与测试结果"那一行随审批一起没了。
 //!
 //! | §14 Memory 覆盖 | 测试 |
 //! |---|---|
@@ -18,6 +20,5 @@
 
 mod harness;
 
-mod approval;
 mod lifecycle;
 mod memos;

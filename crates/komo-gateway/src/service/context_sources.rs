@@ -11,8 +11,8 @@
 //!   `output.json`，§8.3）
 //! - [`skill_catalog`]（skills 目录的读取：注册表 → `SkillCatalog`，§14）
 //!
-//! 留在 `segment.rs` 的是"为执行取数"的那一半：`resumed` / `call_request` /
-//! `waiting_approval`（续跑位置）、`run_roots` / `ResourceMounts`（`CallEnv` 的根与
+//! 留在 `segment.rs` 的是"为执行取数"的那一半：`resumed` / `call_request`
+//! （续跑位置）、`run_roots` / `ResourceMounts`（`CallEnv` 的根与
 //! 挂载）、`halt_if_corrupt`（失败收场）、`without_delegate`（能力收窄）——它们改的是
 //! 执行环境，不是"模型看见什么"。
 
@@ -72,7 +72,7 @@ pub(crate) struct Fallback<'a> {
 ///
 /// 三条路，按优先级：
 ///
-/// 1. **自己那条 `run.accepted` 里冻结的那一份**——正常的交互 Run 都走这条。审批可能
+/// 1. **自己那条 `run.accepted` 里冻结的那一份**——正常的交互 Run 都走这条。介入可能
 ///    一小时之后才答复，那时 Profile 与磁盘都可能已经改过，恢复出来的 Run 不能因此
 ///    换一副面孔；
 /// 2. **父 Run 的快照**——子 Run 受理时拿不到 Profile、工作目录与指令正文（执行器手里

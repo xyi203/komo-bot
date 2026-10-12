@@ -20,11 +20,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
 
 use crate::compaction::{CompactionDebt, CompactionDecision};
-use crate::types::chat::{ApprovalScope, PeerId};
+use crate::types::chat::PeerId;
 use crate::types::digest::ContentHash;
-use crate::types::ids::{
-    ApprovalId, AttemptId, EventId, GrantId, RunId, Seq, SessionId, ShortId, ToolCallId,
-};
+use crate::types::ids::{AttemptId, EventId, RunId, Seq, SessionId, ToolCallId};
 use crate::types::model::{EffortSetting, TokenUsage};
 use crate::types::plan::{ExecutionPlan, PlanHash, PlanSource};
 use crate::types::refs::{ContentRef, OutputRef, PayloadRef, ToolResultStatus};
@@ -217,8 +215,8 @@ event_payload! {
     RunQueued(RunQueued) => "run.queued",
     /// 某个执行实例领取了它。
     RunStarted(RunStarted) => "run.started",
-    /// 停在某个外部条件上，已释放执行名额（§8.4）：审批答复、退避到点、干预答复、
-    /// 前一条 Run 进终态。`reason` 说清是哪一种——**状态只有一个 `waiting`**，
+    /// 停在某个外部条件上，已释放执行名额（§8.4）：退避到点、干预答复、前一条 Run
+    /// 进终态。`reason` 说清是哪一种——**状态只有一个 `waiting`**，
     /// "为什么停着"在这一条事件里。
     RunWaiting(RunWaiting) => "run.waiting",
     /// 上一次执行没有收尾，领取权已交还（§8.9）。**它不是状态**：那条 Run 由 reconcile
@@ -244,10 +242,8 @@ event_payload! {
     ToolStarted(ToolStarted) => "tool.started",
     /// 只有状态、耗时等元信息、`output_ref` 和最多 1 KiB 预览（§8.3）。
     ToolResult(ToolResult) => "tool.result",
-    /// 审批请求的**审计副本**。它不能自行创建授权——权威在 state.db（§7.4）。
-    ApprovalRequested(ApprovalRequested) => "approval.requested",
-    /// 审批决定的审计补写，保留原始发生时间（§8.5 的反向 outbox）。
-    ApprovalDecided(ApprovalDecided) => "approval.decided",
+    // 2026-10-11 之前还有 `approval.requested` / `approval.decided`（审批的审计副本）。
+    // 审批删掉之后它们不再有词汇：旧行读成 `Unknown`，保留 seq、什么都不表示（§8.3）。
     /// 已覆盖的 seq、上下文与记忆版本引用、执行游标（§8.2）。
     Checkpoint(Checkpoint) => "checkpoint",
     /// resume 时操作者明确切换了模型 / effort（§13.3）。
@@ -315,9 +311,8 @@ pub struct RunStarted {
 
 /// 停在某个外部条件上（§8.4）。
 ///
-/// **只记"在等什么"，不记"停在哪个调用上"**：后者是派生的——等审批时它在审批行上
-/// （`approval_requests.call_id`），结果不明时它在 `tool_calls.state = 'uncertain'` 那一条上
-/// （§7.5）。事件里再存一份就是同一个事实的第三个落点，而它会漂。
+/// **只记"在等什么"，不记"停在哪个调用上"**：后者是派生的——结果不明时它在
+/// `tool_calls.state = 'uncertain'` 那一条上（§7.5）。事件里再存一份就是同一个事实的第三个落点，而它会漂。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunWaiting {
     pub reason: WaitReason,
@@ -422,12 +417,8 @@ pub struct ToolStarted {
     /// 指向承载计划的事件。
     pub plan_ref: EventId,
     pub plan_hash: PlanHash,
-    /// 这次执行消费了哪条授权（如果有）。组合计划按步放行时是改动那一步的。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant: Option<GrantId>,
-    /// 组合计划按步放行时，命令那一步（`then_run`）消费的那条授权。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub then_run_grant: Option<GrantId>,
+    // 审批删掉之前这里还有 `grant` / `then_run_grant`（这次消费了哪条授权）。旧行带着
+    // 它们照样解得出来：serde 忽略多出来的字段。
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -447,33 +438,6 @@ pub struct ToolResult {
     pub stderr: Option<ContentRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_state: Option<AttemptState>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ApprovalRequested {
-    pub approval: ApprovalId,
-    pub short_id: ShortId,
-    pub plan_hash: PlanHash,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub call_id: Option<ToolCallId>,
-    pub reason: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub scopes: Vec<ApprovalScope>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ApprovalDecided {
-    pub approval: ApprovalId,
-    pub approved: bool,
-    pub scope: ApprovalScope,
-    /// 决定人。**审计副本**，权威是 state.db 里经过操作者认证的那一行（§7.4）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub by: Option<PeerId>,
-    /// 原始决定时间。补写保留它，不凭日志行相邻推断审批关系（§8.3）。
-    #[serde(with = "time::serde::rfc3339")]
-    pub decided_at: OffsetDateTime,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub grant: Option<GrantId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -590,6 +554,55 @@ mod tests {
         // 原样写回去：未知事件保留原始内容（§8.3）。
         let round_tripped = Event::from_line(&event.to_line().unwrap()).unwrap();
         assert_eq!(round_tripped, event);
+    }
+
+    /// 审批删掉之后，旧会话里的 `approval.*` 行没有词汇了：读成 Unknown、保留 seq。
+    #[test]
+    fn an_old_approval_line_reads_as_unknown() {
+        let raw = line(
+            "approval.requested",
+            r#"{"approval":"ap-1","short_id":"7K2M","plan_hash":"abc","call_id":"call-7","reason":"shell","scopes":["once"]}"#,
+        );
+        let event = Event::from_line(&raw).unwrap();
+        assert_eq!(event.seq, Seq(41));
+        assert!(event.payload.is_unknown());
+        assert_eq!(event.type_name(), "approval.requested");
+
+        let raw = line(
+            "approval.decided",
+            r#"{"approval":"ap-1","approved":true,"scope":"once","decided_at":"2026-09-18T08:00:00Z"}"#,
+        );
+        assert!(Event::from_line(&raw).unwrap().payload.is_unknown());
+    }
+
+    /// 审批删掉之前的 `tool.started` 带着 `grant` / `then_run_grant`：照样解得出来。
+    #[test]
+    fn an_old_tool_started_with_a_grant_still_decodes() {
+        let raw = line(
+            "tool.started",
+            r#"{"call_id":"call-7","attempt_id":"attempt-1","plan_ref":"evt-40","plan_hash":"abc","grant":"g-1","then_run_grant":"g-2"}"#,
+        );
+        let event = Event::from_line(&raw).unwrap();
+        let EventPayload::ToolStarted(body) = &event.payload else {
+            panic!("解成了 {:?}", event.payload);
+        };
+        assert_eq!(body.call_id.as_str(), "call-7");
+        assert_eq!(body.plan_hash.as_str(), "abc");
+    }
+
+    /// D2：旧的"停在审批上"那一行仍然解得出来。
+    #[test]
+    fn an_old_run_waiting_on_an_approval_still_decodes() {
+        let raw = line(
+            "run.waiting",
+            r#"{"reason":{"kind":"approval","approval":"ap-1"}}"#,
+        );
+        let event = Event::from_line(&raw).unwrap();
+        let EventPayload::RunWaiting(body) = &event.payload else {
+            panic!("解成了 {:?}", event.payload);
+        };
+        assert!(matches!(body.reason, WaitReason::Approval { .. }));
+        assert!(!body.reason.needs_a_person());
     }
 
     #[test]

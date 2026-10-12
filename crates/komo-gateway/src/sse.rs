@@ -89,8 +89,8 @@ impl EventHub {
 
     /// 这个 Session 现在有几个客户端在看（TUI / HTTP 的 SSE 连接）。
     ///
-    /// 审批投递要问它：屏幕前有人看着时，审批只弹在他面前——home chat 那条卡片是一次
-    /// 网络往返（实测几秒到几十秒），人在看着的时候它只会**晚到**，还多一份噪音。
+    /// 介入的周期兜底要问它：屏幕前有人看着时，介入只弹在他面前——home chat 那条消息
+    /// 是一次网络往返（实测几秒到几十秒），人在看着的时候它只会**晚到**，还多一份噪音。
     pub fn viewers(&self, session: &SessionId) -> usize {
         self.viewers
             .lock()
@@ -121,27 +121,9 @@ impl EventHub {
             });
         }
     }
-
-    /// 一条审批有结论了（决定不落在会话日志的同一条路径上，所以单独推）。
-    pub fn publish_decision(
-        &self,
-        session: &SessionId,
-        approval: &komo_kernel::types::ids::ApprovalId,
-        approved: bool,
-        at: Seq,
-    ) {
-        self.publish(SseFrame {
-            id: at,
-            session: session.clone(),
-            event: SseEvent::ApprovalDecided {
-                approval: approval.clone(),
-                approved,
-            },
-        });
-    }
 }
 
-/// 从一条事件派生出的附加帧：Run 状态与待处理审批。
+/// 从一条事件派生出的附加帧：Run 状态。
 ///
 /// 「派生自事件，给不想自己 fold 的客户端。」
 ///
@@ -168,16 +150,6 @@ fn derived_frames(event: &Event) -> Vec<SseEvent> {
         EventPayload::RunFailed(_) => run(RunState::Failed).into_iter().collect(),
         EventPayload::RunCancelled(_) => run(RunState::Cancelled).into_iter().collect(),
         EventPayload::RunReclaimed(_) => Vec::new(),
-        // 待审批的那一帧由 `approval.requested` 推——短 ID 在它身上，而伪造一个短 ID 会让
-        // 客户端拿着一个答不了的编号去回复。
-        EventPayload::ApprovalRequested(body) => vec![SseEvent::ApprovalPending {
-            approval: body.approval.clone(),
-            short_id: body.short_id.clone(),
-        }],
-        EventPayload::ApprovalDecided(body) => vec![SseEvent::ApprovalDecided {
-            approval: body.approval.clone(),
-            approved: body.approved,
-        }],
         _ => Vec::new(),
     }
 }
@@ -351,8 +323,9 @@ mod tests {
             payload: EventPayload::RunWaiting(komo_kernel::events::RunWaiting { reason }),
         };
         for reason in [
+            // 只解码旧数据的那一类（审批已删除，§7）同样只是一帧 waiting。
             komo_kernel::types::status::WaitReason::Approval {
-                approval: komo_kernel::types::ids::ApprovalId::from_raw("ap-1"),
+                approval: "ap-1".into(),
             },
             komo_kernel::types::status::WaitReason::Intervention {
                 intervention: komo_kernel::types::ids::InterventionId::from_raw("run-1"),

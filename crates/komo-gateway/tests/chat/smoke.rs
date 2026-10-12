@@ -22,7 +22,7 @@ fn binary() -> PathBuf {
         .expect("先 `cargo build -p komo`")
 }
 
-/// 一个临时数据目录：config.toml + .env + policy.toml，监听端口交给内核挑。
+/// 一个临时数据目录：config.toml + .env，监听端口交给内核挑。
 fn home() -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("临时数据目录");
     std::fs::write(
@@ -53,7 +53,6 @@ enabled = false
     )
     .expect("写 config.toml");
     std::fs::write(home.path().join(".env"), "KOMO_LLM_API_KEY=test-key\n").expect("写 .env");
-    std::fs::write(home.path().join("policy.toml"), "rules = []\n").expect("写 policy.toml");
     home
 }
 

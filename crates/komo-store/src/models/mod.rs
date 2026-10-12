@@ -17,7 +17,6 @@
 //!   `CREATE INDEX IF NOT EXISTS` 统一建，新文件和旧文件走同一条路；让 toasty 建一半、
 //!   自己建一半会分叉。
 
-pub mod approval_request;
 pub mod checkpoint;
 pub mod control_outbox;
 pub mod cron_firing;
@@ -28,14 +27,12 @@ pub mod memory_index_generation;
 pub mod memory_item;
 pub mod memory_terms;
 pub mod memory_vector;
-pub mod policy_grant;
 pub mod run;
 pub mod session;
 pub mod session_log_index;
 pub mod tool_attempt;
 pub mod tool_call;
 
-pub use approval_request::ApprovalRequestRow;
 pub use checkpoint::CheckpointRow;
 pub use control_outbox::ControlOutboxRow;
 pub use cron_firing::CronFiringRow;
@@ -46,7 +43,6 @@ pub use memory_index_generation::MemoryIndexGenerationRow;
 pub use memory_item::MemoryItemRow;
 pub use memory_terms::MemoryTermsRow;
 pub use memory_vector::MemoryVectorRow;
-pub use policy_grant::PolicyGrantRow;
 pub use run::RunRow;
 pub use session::{SessionKind, SessionRow};
 pub use session_log_index::SessionLogIndexRow;
@@ -106,7 +102,10 @@ pub struct TableSpec {
     pub columns: &'static [ColumnSpec],
 }
 
-/// §8.2 表清单里的全部 17 张表，按建表顺序。
+/// §8.2 表清单里的全部 15 张表，按建表顺序。
+///
+/// `approval_requests` / `policy_grants` 随 Policy 与审批一起删了（2026-10-11）：老库里那两张表
+/// 与它们的索引留着、没人读；`ensure_schema` 不管多出来的表。
 pub const TABLES: &[TableSpec] = &[
     session::SPEC,
     run::SPEC,
@@ -114,8 +113,6 @@ pub const TABLES: &[TableSpec] = &[
     tool_call::SPEC,
     tool_attempt::SPEC,
     checkpoint::SPEC,
-    approval_request::SPEC,
-    policy_grant::SPEC,
     control_outbox::SPEC,
     delivery::SPEC,
     cron_job::SPEC,
@@ -141,12 +138,8 @@ pub const INDEXES: &[&str] = &[
     r#"CREATE INDEX IF NOT EXISTS "tool_calls_run" ON "tool_calls" ("run_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "tool_attempts_call" ON "tool_attempts" ("call_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "checkpoints_session" ON "checkpoints" ("session_id", "covers_to")"#,
-    r#"CREATE INDEX IF NOT EXISTS "approvals_pending" ON "approval_requests" ("decided", "short_id")"#,
-    r#"CREATE INDEX IF NOT EXISTS "grants_run" ON "policy_grants" ("run_id")"#,
-    r#"CREATE INDEX IF NOT EXISTS "grants_job" ON "policy_grants" ("job_id", "job_version")"#,
     r#"CREATE INDEX IF NOT EXISTS "outbox_undelivered" ON "control_outbox" ("delivered")"#,
     r#"CREATE INDEX IF NOT EXISTS "deliveries_state" ON "deliveries" ("state")"#,
-    r#"CREATE INDEX IF NOT EXISTS "deliveries_approval" ON "deliveries" ("approval_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "cron_firings_job" ON "cron_firings" ("job_id", "scheduled_at")"#,
     r#"CREATE INDEX IF NOT EXISTS "memory_evidence_memory" ON "memory_evidence" ("memory_id")"#,
     r#"CREATE INDEX IF NOT EXISTS "memory_vectors_memory" ON "memory_vectors" ("memory_id", "generation")"#,
@@ -161,8 +154,6 @@ pub fn model_set() -> toasty::ModelSet {
         ToolCallRow,
         ToolAttemptRow,
         CheckpointRow,
-        ApprovalRequestRow,
-        PolicyGrantRow,
         ControlOutboxRow,
         DeliveryRow,
         CronJobRow,

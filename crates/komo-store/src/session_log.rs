@@ -167,7 +167,7 @@ pub enum TailRepair {
 
 /// 一个 Session 的 JSONL 写入器兼读取器。
 ///
-/// **每个 Session 一个实例，串行**：模型、工具、审批审计与 Memory 来源标记都经过它，
+/// **每个 Session 一个实例，串行**：模型、工具、控制审计与 Memory 来源标记都经过它，
 /// 不能各自追加导致行内容交错（§8.3）。串行由 [`crate::coordinator::Coordinator`] 的
 /// mutex 保证。
 #[derive(Debug)]

@@ -4,14 +4,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use komo_kernel::policy::{Grant, GrantScope, Matcher, OperationMatch, RuleTable};
-use komo_kernel::protocol::http::ApprovalDecisionRecord;
-use komo_kernel::traits::{ApprovalRepo, Clock, OutputWriter, Tool};
-use komo_kernel::types::chat::ApprovalScope;
-use komo_kernel::types::ids::{ApprovalId, AttemptId, GrantId, OperationId, SessionId, ToolCallId};
+use komo_kernel::traits::{Clock, Ledger, OutputWriter, Tool};
+use komo_kernel::types::ids::{AttemptId, OperationId, SessionId, ToolCallId};
 use komo_kernel::types::plan::{
-    ApprovedPlan, ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode,
-    TargetAccess, Verification,
+    ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
+    Verification,
 };
 use komo_kernel::types::refs::{PREVIEW_LIMIT_BYTES, ToolResultStatus};
 use komo_kernel::types::status::ToolCallState;
@@ -36,220 +33,13 @@ async fn plan_of(
     .await
     .expect("现做一份计划")
 }
-use crate::policy::PolicyEngine;
 use crate::tools::{ReadTool, WriteTool};
-
-/// ① 危险操作在批准前不执行。
-#[tokio::test]
-async fn a_dangerous_action_does_not_run_before_it_is_approved() {
-    let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
-    let executor = harness.initial(vec![tool.clone()]);
-    let (session, run) = harness.open_run().await;
-    let calls = harness
-        .record_round(
-            &run,
-            &[("shell", serde_json::json!({ "command": "rm -rf /tmp/x" }))],
-        )
-        .await;
-
-    let outcome = executor
-        .execute_round(calls, &harness.env(&session, &run))
-        .await
-        .unwrap();
-
-    assert!(
-        matches!(outcome.stop, Some(RoundStop::Approval { .. })),
-        "{:?}",
-        outcome.stop
-    );
-    assert_eq!(tool.ran(), 0, "批准之前一次都不能跑");
-    assert!(outcome.results.is_empty());
-
-    // 审批请求真的写下来了，而且绑定的是那份计划。
-    let pending = harness
-        .approvals
-        .list_pending(Some(&session))
-        .await
-        .unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].plan.tool, "shell");
-    assert_eq!(pending[0].plan_hash, pending[0].plan.plan_hash());
-}
-
-/// ② 批准之后执行一次；重复批准不重复执行。
-#[tokio::test]
-async fn approving_twice_still_executes_exactly_once() {
-    let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
-    let executor = harness.initial(vec![tool.clone()]);
-    let (session, run) = harness.open_run().await;
-    let calls = harness
-        .record_round(
-            &run,
-            &[("shell", serde_json::json!({ "command": "rm -rf /tmp/x" }))],
-        )
-        .await;
-    let env = harness.env(&session, &run);
-
-    let stopped = executor.execute_round(calls, &env).await.unwrap();
-    let Some(RoundStop::Approval { approval, call }) = stopped.stop.clone() else {
-        panic!("{:?}", stopped.stop)
-    };
-
-    // 操作者连点两次。第二次是"已决定"，不产生第二条决定。
-    harness
-        .gate
-        .decide(&approval, true, ApprovalScope::Once, None)
-        .await
-        .unwrap();
-    let again = harness
-        .gate
-        .decide(&approval, true, ApprovalScope::Once, None)
-        .await
-        .unwrap();
-    assert!(again.already_decided);
-
-    // 续跑：同一个调用，带上它停在的那条审批。
-    let mut resumed = stopped.remaining;
-    resumed[0].approval = Some(approval.clone());
-    resumed[0].resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
-    let done = executor.execute_round(resumed.clone(), &env).await.unwrap();
-    assert!(done.stop.is_none(), "{:?}", done.stop);
-    assert_eq!(tool.ran(), 1);
-    assert_eq!(done.results[0].call_id, call);
-
-    // 同一条审批被再派发一次（唤醒重投、两个界面同时答）——它不是一次"确定没跑过"的
-    // 续跑，所以用过的一次性授权换不来第二次执行，只会重新问人。
-    let mut repeated = resumed;
-    repeated[0].resumed = None;
-    let third = executor.execute_round(repeated, &env).await.unwrap();
-    assert_eq!(tool.ran(), 1, "同一条审批不能换来第二次执行");
-    assert!(
-        matches!(third.stop, Some(RoundStop::Approval { .. })),
-        "用过的审批要重新问人：{:?}",
-        third.stop
-    );
-}
-
-/// ③ Deny 不被授权覆盖，而且**不消费任何授权**。
-#[tokio::test]
-async fn a_deny_is_not_overridden_by_a_matching_grant_and_consumes_nothing() {
-    let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
-
-    // 一张对任意 shell 明确 Deny 的表。
-    let mut table = RuleTable::empty();
-    table.rules.push(komo_kernel::policy::PolicyRule {
-        id: "no-shell".into(),
-        effect: komo_kernel::policy::Effect::Deny,
-        reason: "这台机器上不允许跑 shell".into(),
-        matcher: Matcher::operations([OperationMatch::ShellCommand]),
-        scopes: vec![],
-        requires_isolation: false,
-        grant_proof: false,
-    });
-    let executor = harness.executor(vec![tool.clone()], PolicyEngine::from_rules(table));
-
-    let (session, run) = harness.open_run().await;
-    let calls = harness
-        .record_round(
-            &run,
-            &[("shell", serde_json::json!({ "command": "rm -rf /tmp/x" }))],
-        )
-        .await;
-    let env = harness.env(&session, &run);
-
-    // 先造一条**正好覆盖这份计划**的 Run 授权，外加一条已批准的审批。
-    let plan = tool
-        .prepare(
-            serde_json::json!({ "command": "rm -rf /tmp/x" }),
-            &komo_kernel::types::tool::ToolContext {
-                session: session.clone(),
-                run: run.clone(),
-                call: calls[0].call.clone(),
-                attempt: AttemptId::from_raw("x"),
-                source: env.source.clone(),
-                cwd: env.cwd.clone(),
-                roots: env.roots.clone(),
-                mounts: env.mounts.clone(),
-                env_version: None,
-                resumed: None,
-                cancel: CancelToken::new(),
-                call_timeout: env.call_timeout,
-            },
-        )
-        .await
-        .unwrap();
-    let approval = ApprovalId::from_raw("ap-1");
-    harness
-        .approvals
-        .create(komo_kernel::protocol::http::ApprovalRecord {
-            approval: approval.clone(),
-            short_id: komo_kernel::types::ids::ShortId::from_index(1),
-            session: session.clone(),
-            run: Some(run.clone()),
-            call: Some(calls[0].call.clone()),
-            plan_hash: plan.plan_hash(),
-            plan: plan.clone(),
-            reason: "人已经批过了".into(),
-            changes: None,
-            evidence: None,
-            scopes: vec![ApprovalScope::Run],
-            requested_at: harness.clock.now(),
-            valid_until: None,
-            decision: Some(ApprovalDecisionRecord {
-                approved: true,
-                scope: ApprovalScope::Run,
-                by: None,
-                decided_at: harness.clock.now(),
-                grant: Some(GrantId::from_raw("g-1")),
-                consumed: false,
-            }),
-        })
-        .await
-        .unwrap();
-    harness.approvals.add_grant(Grant {
-        id: GrantId::from_raw("g-1"),
-        approval: approval.clone(),
-        scope: GrantScope::Run {
-            run: run.clone(),
-            matcher: Matcher::operations([OperationMatch::ShellCommand]),
-            versions: Default::default(),
-        },
-        granted_at: harness.clock.now(),
-        valid_until: None,
-        consumed: false,
-        reason: "本次 Run 内可以跑 shell".into(),
-    });
-
-    let outcome = executor.execute_round(calls, &env).await.unwrap();
-
-    assert!(outcome.stop.is_none(), "拒绝是结果，不是暂停");
-    assert_eq!(tool.ran(), 0);
-    let result = &outcome.results[0];
-    assert!(result.is_error);
-    assert!(result.content.contains("被拒绝"), "{}", result.content);
-
-    // 一条授权都没被消费：授权仍然未用，审批的决定也没被标记消费过。
-    let grants = harness
-        .approvals
-        .grants_for_run(&run, harness.clock.now())
-        .await
-        .unwrap();
-    assert!(grants.iter().all(|grant| !grant.consumed), "{grants:?}");
-    let record = harness.approvals.get(&approval).await.unwrap().unwrap();
-    assert!(
-        !record.decision.unwrap().consumed,
-        "Deny 之后不该有任何一次 consume"
-    );
-}
 
 /// ④ 文件版本冲突作为结果看得见。
 #[tokio::test]
 async fn a_file_version_conflict_comes_back_to_the_model() {
     let harness = Harness::new();
-    let executor = harness.permissive(vec![Arc::new(WriteTool::new())]);
+    let executor = harness.executor(vec![Arc::new(WriteTool::new())]);
     let (session, run) = harness.open_run().await;
     std::fs::write(harness.dir.path().join("a.txt"), "old\n").unwrap();
 
@@ -276,89 +66,11 @@ async fn a_file_version_conflict_comes_back_to_the_model() {
     );
 }
 
-/// 要审批的 edit：审批记录的"改动"就是这次替换的 diff（§7.2、§11.3）。
+/// edit 直接执行：没有 Policy、没有审批（§7）。
 #[tokio::test]
-async fn an_edit_waiting_for_approval_carries_its_diff() {
+async fn an_edit_runs_directly() {
     let harness = Harness::new();
-    let executor = harness.conservative(vec![Arc::new(crate::tools::EditTool::new())]);
-    let (session, run) = harness.open_run().await;
-    std::fs::write(harness.dir.path().join("a.txt"), "alpha\nbeta\n").unwrap();
-
-    let calls = harness
-        .record_round(
-            &run,
-            &[(
-                "edit",
-                serde_json::json!({ "path": "a.txt", "match_text": "beta", "replace_text": "BETA" }),
-            )],
-        )
-        .await;
-    let outcome = executor
-        .execute_round(calls, &harness.env(&session, &run))
-        .await
-        .unwrap();
-    assert!(
-        matches!(outcome.stop, Some(RoundStop::Approval { .. })),
-        "{:?}",
-        outcome.stop
-    );
-
-    let pending = harness
-        .approvals
-        .list_pending(Some(&session))
-        .await
-        .unwrap();
-    let changes = pending[0].changes.as_deref().expect("审批带着改动");
-    assert!(changes.contains("- beta\n+ BETA\n"), "{changes}");
-    assert_eq!(
-        std::fs::read_to_string(harness.dir.path().join("a.txt")).unwrap(),
-        "alpha\nbeta\n",
-        "批准之前不动文件"
-    );
-}
-
-/// 要审批的 write 新文件：改动是整份新增。
-#[tokio::test]
-async fn a_new_file_write_waiting_for_approval_carries_its_content() {
-    let harness = Harness::new();
-    let executor = harness.conservative(vec![Arc::new(WriteTool::new())]);
-    let (session, run) = harness.open_run().await;
-
-    let calls = harness
-        .record_round(
-            &run,
-            &[(
-                "write",
-                serde_json::json!({ "path": "new.txt", "content": "hello\n" }),
-            )],
-        )
-        .await;
-    let outcome = executor
-        .execute_round(calls, &harness.env(&session, &run))
-        .await
-        .unwrap();
-    assert!(
-        matches!(outcome.stop, Some(RoundStop::Approval { .. })),
-        "{:?}",
-        outcome.stop
-    );
-
-    let pending = harness
-        .approvals
-        .list_pending(Some(&session))
-        .await
-        .unwrap();
-    let changes = pending[0].changes.as_deref().expect("审批带着改动");
-    assert!(changes.starts_with("（新建 "), "{changes}");
-    assert!(changes.contains("+ hello\n"), "{changes}");
-    assert!(!harness.dir.path().join("new.txt").exists());
-}
-
-/// 不要审批的 edit 照旧直接执行，不落审批行。
-#[tokio::test]
-async fn an_allowed_edit_runs_without_an_approval_record() {
-    let harness = Harness::new();
-    let executor = harness.permissive(vec![Arc::new(crate::tools::EditTool::new())]);
+    let executor = harness.executor(vec![Arc::new(crate::tools::EditTool::new())]);
     let (session, run) = harness.open_run().await;
     std::fs::write(harness.dir.path().join("a.txt"), "alpha\n").unwrap();
 
@@ -386,14 +98,6 @@ async fn an_allowed_edit_runs_without_an_approval_record() {
         std::fs::read_to_string(harness.dir.path().join("a.txt")).unwrap(),
         "ALPHA\n"
     );
-    assert!(
-        harness
-            .approvals
-            .list_pending(Some(&session))
-            .await
-            .unwrap()
-            .is_empty()
-    );
 }
 
 /// ⑥ 未知工具名无法调用——作为错误内容回给模型。
@@ -401,7 +105,7 @@ async fn an_allowed_edit_runs_without_an_approval_record() {
 async fn an_unknown_tool_name_cannot_be_called() {
     let harness = Harness::new();
     let tool = Arc::new(RecordingTool::shell());
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("rm_rf", serde_json::json!({}))])
@@ -441,7 +145,7 @@ async fn a_tool_outside_the_surface_cannot_be_called() {
     let harness = Harness::new();
     let reader = Arc::new(RecordingTool::new("read", Operation::ReadFile));
     let search = Arc::new(RecordingTool::new("rg", Operation::ReadFile));
-    let executor = harness.permissive(vec![reader.clone(), search.clone()]);
+    let executor = harness.executor(vec![reader.clone(), search.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("rg", serde_json::json!({ "pattern": "x" }))])
@@ -480,7 +184,7 @@ async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
                 reason: "远端没给幂等键".into(),
             }),
     );
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
@@ -524,7 +228,7 @@ async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
 async fn a_planned_call_is_known_not_to_have_run_and_executes_once() {
     let harness = Harness::new();
     let tool = Arc::new(RecordingTool::shell().with_recovery(RecoveryMode::VerifyTarget));
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
@@ -567,7 +271,7 @@ async fn a_satisfied_target_is_reported_not_redone() {
                 evidence: "内容哈希已是预期值".into(),
             }),
     );
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
@@ -613,7 +317,7 @@ async fn a_safe_reread_is_redone_without_a_verification() {
     let tool = Arc::new(
         RecordingTool::new("read", Operation::ReadFile).with_recovery(RecoveryMode::SafeReread),
     );
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
         .record_round(&run, &[("read", serde_json::json!({ "path": "a.txt" }))])
@@ -648,7 +352,7 @@ async fn an_uncertain_result_stops_for_a_human_instead_of_retrying() {
             message: "请求已发出，响应丢了".into(),
         })),
     );
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
@@ -685,7 +389,7 @@ async fn an_operator_verdict_settles_the_uncertain_attempt_without_rerunning_it(
             message: "解释器没有写下结果".into(),
         })),
     );
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
@@ -755,8 +459,7 @@ async fn an_operator_verdict_settles_the_uncertain_attempt_without_rerunning_it(
     );
 }
 
-/// 「确定没执行」是**失败**收尾：重做要走新的一次调用，因此照常过 Policy——旧的一次性
-/// 授权不会被当成重试许可（§7.4）。
+/// 「确定没执行」是**失败**收尾：重做是模型发起的新的一次调用，不是这一次的重跑。
 #[tokio::test]
 async fn not_performed_closes_the_call_as_failed_so_a_retry_is_a_new_call() {
     let harness = Harness::new();
@@ -765,7 +468,7 @@ async fn not_performed_closes_the_call_as_failed_so_a_retry_is_a_new_call() {
             message: "结果不明".into(),
         })),
     );
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
@@ -837,7 +540,7 @@ async fn the_preview_is_bounded_and_the_whole_output_lives_in_the_store() {
         artifacts: vec![],
         preview: Some(body.clone()),
     })));
-    let executor = harness.permissive(vec![tool]);
+    let executor = harness.executor(vec![tool]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
@@ -892,7 +595,7 @@ async fn the_preview_is_bounded_and_the_whole_output_lives_in_the_store() {
 async fn cancelling_leaves_the_rest_of_the_round_undispatched() {
     let harness = Harness::new();
     let tool = Arc::new(RecordingTool::shell());
-    let executor = harness.permissive(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(
@@ -919,7 +622,7 @@ async fn cancelling_leaves_the_rest_of_the_round_undispatched() {
 #[tokio::test]
 async fn the_read_after_a_write_sees_what_the_write_left() {
     let harness = Harness::new();
-    let executor = harness.permissive(vec![Arc::new(WriteTool::new()), Arc::new(ReadTool::new())]);
+    let executor = harness.executor(vec![Arc::new(WriteTool::new()), Arc::new(ReadTool::new())]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(
@@ -951,72 +654,6 @@ async fn the_read_after_a_write_sees_what_the_write_left() {
     );
 }
 
-/// 放行是**哪一条授权**给的，要记进账本——事后答得出"这次凭什么跑的"。
-#[tokio::test]
-async fn the_grant_that_allowed_a_call_is_recorded_on_the_attempt() {
-    let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
-    let executor = harness.initial(vec![tool.clone()]);
-    let (session, run) = harness.open_run().await;
-    let calls = harness
-        .record_round(
-            &run,
-            &[("shell", serde_json::json!({ "command": "rm -rf /tmp/x" }))],
-        )
-        .await;
-    let env = harness.env(&session, &run);
-
-    let stopped = executor.execute_round(calls, &env).await.unwrap();
-    let Some(RoundStop::Approval { approval, .. }) = stopped.stop.clone() else {
-        panic!()
-    };
-    // 批准，并挂一条 Run 范围授权。
-    let grant = GrantId::from_raw("g-1");
-    harness.approvals.add_grant(Grant {
-        id: grant.clone(),
-        approval: approval.clone(),
-        scope: GrantScope::Run {
-            run: run.clone(),
-            matcher: Matcher::operations([OperationMatch::ShellCommand]),
-            versions: Default::default(),
-        },
-        granted_at: harness.clock.now(),
-        valid_until: None,
-        consumed: false,
-        reason: "本次 Run".into(),
-    });
-    harness
-        .approvals
-        .decide(
-            &approval,
-            ApprovalDecisionRecord {
-                approved: true,
-                scope: ApprovalScope::Run,
-                by: None,
-                decided_at: harness.clock.now(),
-                grant: Some(grant.clone()),
-                consumed: false,
-            },
-        )
-        .await
-        .unwrap();
-
-    let mut resumed = stopped.remaining;
-    resumed[0].approval = Some(approval);
-    resumed[0].resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
-    executor.execute_round(resumed, &env).await.unwrap();
-
-    let recorded = harness
-        .ledger
-        .events()
-        .iter()
-        .find_map(|event| match &event.payload {
-            komo_kernel::events::EventPayload::ToolStarted(started) => started.grant.clone(),
-            _ => None,
-        });
-    assert_eq!(recorded, Some(grant));
-}
-
 /// 工具的普通失败是**结果**，不是执行器的错误。
 #[tokio::test]
 async fn an_ordinary_tool_failure_is_a_result_the_model_can_act_on() {
@@ -1024,7 +661,7 @@ async fn an_ordinary_tool_failure_is_a_result_the_model_can_act_on() {
     let tool = Arc::new(RecordingTool::shell().with_outcome(Err(ToolError::Failed {
         message: "命令不存在".into(),
     })));
-    let executor = harness.permissive(vec![tool]);
+    let executor = harness.executor(vec![tool]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "nope" }))])
@@ -1043,7 +680,7 @@ async fn an_ordinary_tool_failure_is_a_result_the_model_can_act_on() {
 #[tokio::test]
 async fn bad_arguments_come_back_as_a_result_without_touching_the_ledger() {
     let harness = Harness::new();
-    let executor = harness.permissive(vec![Arc::new(ReadTool::new())]);
+    let executor = harness.executor(vec![Arc::new(ReadTool::new())]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("read", serde_json::json!({ "nope": 1 }))])
@@ -1074,7 +711,7 @@ async fn bad_arguments_come_back_as_a_result_without_touching_the_ledger() {
 #[tokio::test]
 async fn the_ledger_sees_planned_then_started_then_result() {
     let harness = Harness::new();
-    let executor = harness.permissive(vec![Arc::new(RecordingTool::shell())]);
+    let executor = harness.executor(vec![Arc::new(RecordingTool::shell())]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
@@ -1113,56 +750,29 @@ fn tool_executions(harness: &Harness) -> usize {
         .count()
 }
 
-/// 计划在 `start_call` 之前就已落盘——"确定尚未执行"是一个可分辨的状态（§8.4 第 6 行）。
+/// 恢复执行沿用**同一份**计划：重新 prepare 会换掉计划哈希，账本上的 `tool.planned` 就
+/// 对不上 `tool.started` 了（§8.4）。
 #[tokio::test]
-async fn an_ask_leaves_a_planned_call_behind_with_no_attempt() {
-    let harness = Harness::new();
-    let executor = harness.initial(vec![Arc::new(RecordingTool::shell())]);
-    let (session, run) = harness.open_run().await;
-    let calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
-        .await;
-    executor
-        .execute_round(calls, &harness.env(&session, &run))
-        .await
-        .unwrap();
-
-    let surface = harness.ledger.surface();
-    let call = surface.calls.values().next().expect("有一个调用");
-    assert_eq!(call.state, ToolCallState::Planned);
-    assert!(call.attempt.is_none());
-    assert_eq!(call.attempts, 0, "停在审批上的调用一次尝试都没有过");
-}
-
-/// 恢复执行沿用**同一份**计划：重新 prepare 会换掉计划哈希，原授权就覆盖不到了。
-#[tokio::test]
-async fn a_resumed_call_reuses_the_plan_it_was_approved_for() {
+async fn a_resumed_call_reuses_the_plan_it_was_planned_with() {
     let harness = Harness::new();
     let tool = Arc::new(RecordingTool::shell());
-    let executor = harness.initial(vec![tool.clone()]);
+    let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
-    let calls = harness
+    let mut resumed = harness
         .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
         .await;
     let env = harness.env(&session, &run);
 
-    let stopped = executor.execute_round(calls, &env).await.unwrap();
-    let pending = harness
-        .approvals
-        .list_pending(Some(&session))
-        .await
-        .unwrap();
-    let approved_hash = pending[0].plan_hash.clone();
-
+    // 上一世只落了计划就停了（停在旧的审批上，或者崩在 start 之前）。
+    let plan = plan_of(&*tool, &harness, &session, &run, &resumed[0]).await;
+    let approved_hash = plan.plan_hash();
     harness
-        .gate
-        .decide(&pending[0].approval, true, ApprovalScope::Once, None)
+        .ledger
+        .plan_call(&resumed[0].call, &plan)
         .await
         .unwrap();
 
-    let mut resumed = stopped.remaining;
-    resumed[0].approval = Some(pending[0].approval.clone());
-    resumed[0].plan = Some(pending[0].plan.clone());
+    resumed[0].plan = Some(plan);
     resumed[0].resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
     executor.execute_round(resumed, &env).await.unwrap();
 
@@ -1178,7 +788,7 @@ async fn a_resumed_call_reuses_the_plan_it_was_approved_for() {
             _ => None,
         })
         .expect("有 tool.started");
-    assert_eq!(started_hash, approved_hash, "跑的就是批过的那份计划");
+    assert_eq!(started_hash, approved_hash, "跑的就是落过盘的那份计划");
     assert_eq!(
         harness
             .ledger
@@ -1197,7 +807,7 @@ async fn a_resumed_call_reuses_the_plan_it_was_approved_for() {
 #[tokio::test]
 async fn the_executor_keeps_a_catalog_and_renders_a_surface_from_it() {
     let harness = Harness::new();
-    let executor = harness.permissive(vec![Arc::new(ReadTool::new()), Arc::new(WriteTool::new())]);
+    let executor = harness.executor(vec![Arc::new(ReadTool::new()), Arc::new(WriteTool::new())]);
     let names: Vec<String> = executor
         .catalog()
         .into_iter()
@@ -1232,8 +842,8 @@ mod delegation {
 
     use crate::tools::DelegateTool;
 
-    /// 账本里落过盘的那份计划——续跑时调用方手里拿到的就是它（§7.4：重新 prepare 会
-    /// 换一个哈希，原授权就覆盖不到了）。
+    /// 账本里落过盘的那份计划——续跑时调用方手里拿到的就是它（§8.4：重新 prepare 会
+    /// 换一个哈希，就不是账本上那次调用了）。
     fn recorded_plan(harness: &Harness, call: &ToolCallId) -> ExecutionPlan {
         harness
             .ledger
@@ -1375,7 +985,7 @@ mod delegation {
     #[tokio::test]
     async fn a_delegated_task_becomes_a_child_run_and_the_call_waits() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) = delegate_round(
             &harness,
             json!({
@@ -1432,7 +1042,7 @@ mod delegation {
     #[tokio::test]
     async fn a_completed_child_settles_the_call_with_its_result() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) = delegate_round(
             &harness,
             json!({
@@ -1505,7 +1115,7 @@ mod delegation {
     async fn an_off_contract_result_is_marked_in_permissive_and_fails_in_strict() {
         for mode in [SchemaMode::Permissive, SchemaMode::Strict] {
             let harness = Harness::new();
-            let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+            let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
             let (session, run, request) = delegate_round(
                 &harness,
                 json!({
@@ -1596,7 +1206,7 @@ mod delegation {
 
         for (end, kind) in endings {
             let harness = Harness::new();
-            let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+            let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
             let (session, run, request) =
                 delegate_round(&harness, json!({ "task": "跑一遍检查" })).await;
             let env = harness.env(&session, &run);
@@ -1639,7 +1249,7 @@ mod delegation {
         }
         // 子 Run 失败的原因要能读到（这里只看最后一条：三条路径共用同一段折算）。
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "干活" })).await;
         let env = harness.env(&session, &run);
         let outcome = executor
@@ -1671,12 +1281,12 @@ mod delegation {
         );
     }
 
-    /// ⑤ 子 Run 还在跑 → **又一次等待**，不是失败。它可能正停在一条审批上，也可能刚被
+    /// ⑤ 子 Run 还在跑 → **又一次等待**，不是失败。它可能正停在一条介入上，也可能刚被
     /// 别的执行实例领走；这两种都不该把父侧叫醒成一个失败。
     #[tokio::test]
     async fn a_child_that_is_still_running_keeps_the_call_waiting() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "干活" })).await;
         let env = harness.env(&session, &run);
         let outcome = executor
@@ -1708,7 +1318,7 @@ mod delegation {
     #[tokio::test]
     async fn accepting_the_same_delegation_twice_reuses_the_child_run() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) =
             delegate_round(&harness, json!({ "task": "跑一遍检查" })).await;
         let env = harness.env(&session, &run);
@@ -1748,7 +1358,7 @@ mod delegation {
             Operation::ReadFile,
             Arc::new(Mutex::new(Vec::new())),
         ));
-        let executor = harness.permissive(vec![probe, Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![probe, Arc::new(DelegateTool::new())]);
         let (session, run) = harness.open_run().await;
         let calls = harness
             .record_round(
@@ -1789,53 +1399,12 @@ mod delegation {
         assert!(accepted < seq_of(&harness, "call-1", "started"));
     }
 
-    /// ⑦ 派出去这件事本身要过 Policy 与审批（§7.1）：没放行就不该在账本里留下一条
-    /// 没人认领的子 Run。
-    #[tokio::test]
-    async fn an_unapproved_delegation_creates_no_child_run() {
-        let harness = Harness::new();
-        // §7.1 那张初始建议表里没有 delegate 这一行——它是默认的 Ask。
-        let executor = harness.initial(vec![Arc::new(DelegateTool::new())]);
-        let (session, run, request) = delegate_round(&harness, json!({ "task": "干活" })).await;
-        let env = harness.env(&session, &run);
-
-        let stopped = executor
-            .execute_round(vec![request.clone()], &env)
-            .await
-            .unwrap();
-        let Some(RoundStop::Approval { approval, .. }) = stopped.stop.clone() else {
-            panic!("{:?}", stopped.stop)
-        };
-        assert!(
-            child_runs(&harness).is_empty(),
-            "审批之前一条子 Run 都不该有"
-        );
-
-        // 批准之后才受理。审批绑定的是那份计划，所以续跑沿用同一份（重新 prepare 会
-        // 换一个哈希，原授权就覆盖不到了）。
-        harness
-            .gate
-            .decide(&approval, true, ApprovalScope::Once, None)
-            .await
-            .unwrap();
-        let mut resumed = request.clone();
-        resumed.approval = Some(approval);
-        resumed.plan = Some(recorded_plan(&harness, &request.call));
-        resumed.resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
-
-        let done = executor.execute_round(vec![resumed], &env).await.unwrap();
-        let Some(RoundStop::Dependency { run: child, .. }) = done.stop else {
-            panic!("{:?}", done.stop)
-        };
-        assert_eq!(child_runs(&harness), vec![child]);
-    }
-
     /// ⑧ 深度只有一层。守卫在**编排里**而不是在工具表里：把 `delegate` 从子代理的工具表
     /// 摘掉是 UX，模型自己拼出这个名字就绕过去了，而能被绕过的约束等于没有。
     #[tokio::test]
     async fn a_child_run_cannot_delegate_again() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         // 这条 Run 是被派的——`delegated` 说得出它是谁派出来的。
         let (session, run, request) =
             delegate_round(&harness, json!({ "task": "再派一层出去" })).await;
@@ -1869,7 +1438,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_completed_child_spawns_a_new_child_that_points_back_to_it() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let env = harness.env(&session, &run);
         let outcome = executor
@@ -1964,7 +1533,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_run_from_another_session_is_refused_with_a_ledger_result() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let other_session = komo_kernel::types::ids::SessionId::from_raw("sess-别处");
         let elsewhere = harness
             .ledger
@@ -2017,7 +1586,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_main_conversation_run_is_refused() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (main_session, main_run) = harness.open_run().await;
 
         let (session, run, request) = delegate_round(
@@ -2044,7 +1613,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_run_that_has_not_finished_is_refused() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let outcome = executor
             .execute_round(vec![request], &harness.env(&session, &run))
@@ -2086,7 +1655,7 @@ mod delegation {
             },
         ] {
             let harness = Harness::new();
-            let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+            let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
             let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
             let outcome = executor
                 .execute_round(vec![request], &harness.env(&session, &run))
@@ -2119,7 +1688,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_run_before_the_latest_boundary_is_refused() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let outcome = executor
             .execute_round(vec![request], &harness.env(&session, &run))
@@ -2164,7 +1733,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_the_same_child_twice_is_refused_naming_the_tail() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let outcome = executor
             .execute_round(vec![request], &harness.env(&session, &run))
@@ -2229,7 +1798,7 @@ mod delegation {
     #[tokio::test]
     async fn a_resumed_child_cannot_delegate_again() {
         let harness = Harness::new();
-        let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let outcome = executor
             .execute_round(vec![request], &harness.env(&session, &run))
@@ -2310,12 +1879,7 @@ struct Probe {
     barrier: Option<Arc<tokio::sync::Barrier>>,
     /// 一进来就取消整条 Run（测"取消要收齐已经在飞的那几条"）。
     cancel_on_entry: Option<CancelToken>,
-    /// 进入时顺手数一眼"现在有几条待审批"（测"审批行在这批收完之后才落"）。
-    approvals: Option<MemoApprovals>,
-    pending_seen: Arc<Mutex<Vec<usize>>>,
 }
-
-type MemoApprovals = komo_kernel::test_support::MemApprovalRepo;
 
 impl Probe {
     fn new(name: &'static str, operation: Operation, log: Arc<Mutex<Vec<String>>>) -> Self {
@@ -2325,8 +1889,6 @@ impl Probe {
             log,
             barrier: None,
             cancel_on_entry: None,
-            approvals: None,
-            pending_seen: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -2340,17 +1902,8 @@ impl Probe {
         self
     }
 
-    fn counting_approvals(mut self, approvals: MemoApprovals) -> Self {
-        self.approvals = Some(approvals);
-        self
-    }
-
     fn log(&self) -> Vec<String> {
         self.log.lock().expect("日志").clone()
-    }
-
-    fn pending_seen(&self) -> Vec<usize> {
-        self.pending_seen.lock().expect("待审批").clone()
     }
 }
 
@@ -2397,7 +1950,7 @@ impl Tool for Probe {
 
     async fn execute(
         &self,
-        plan: ApprovedPlan,
+        plan: ExecutionPlan,
         ctx: &ToolContext,
         _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
@@ -2405,10 +1958,6 @@ impl Tool for Probe {
         self.log.lock().expect("日志").push(format!("{tag}:进入"));
         if let Some(cancel) = &self.cancel_on_entry {
             cancel.cancel();
-        }
-        if let Some(approvals) = &self.approvals {
-            let pending = approvals.list_pending(None).await.expect("待审批").len();
-            self.pending_seen.lock().expect("待审批").push(pending);
         }
         if let Some(barrier) = &self.barrier
             && tokio::time::timeout(Duration::from_secs(1), barrier.wait())
@@ -2419,7 +1968,6 @@ impl Tool for Probe {
             return Err(ToolError::Timeout { after_secs: 1 });
         }
         let delay = plan
-            .plan()
             .args
             .get("delay_ms")
             .and_then(|value| value.as_u64())
@@ -2469,7 +2017,7 @@ async fn two_reads_in_one_round_run_at_the_same_time() {
         Probe::new("read", Operation::ReadFile, Arc::clone(&log))
             .with_barrier(Arc::new(tokio::sync::Barrier::new(2))),
     );
-    let executor = harness.permissive(vec![probe.clone()]);
+    let executor = harness.executor(vec![probe.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[read_call("a.txt"), read_call("b.txt")])
@@ -2503,7 +2051,7 @@ async fn a_write_waits_for_the_reads_that_come_before_it() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let reader = Arc::new(Probe::new("read", Operation::ReadFile, Arc::clone(&log)));
     let writer = Arc::new(Probe::new("write", Operation::WriteFile, Arc::clone(&log)));
-    let executor = harness.permissive(vec![reader, writer]);
+    let executor = harness.executor(vec![reader, writer]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(
@@ -2537,53 +2085,6 @@ async fn a_write_waits_for_the_reads_that_come_before_it() {
     );
 }
 
-/// 要审批的调用：**后面的调用一条都不启动**，而且审批行是在这一批收完之后才落的。
-///
-/// 后半句是这次并发改动唯一需要额外小心的地方（§7.4）：审批行要是比 Run 的挂起早出现
-/// 一整个批次，操作者就可能答得比 Run 停下还早，那条答复落进空窗。
-#[tokio::test]
-async fn an_ask_stops_the_round_and_lands_only_after_the_reads_finish() {
-    let harness = Harness::new();
-    let log = Arc::new(Mutex::new(Vec::new()));
-    let probe = Arc::new(
-        Probe::new("read", Operation::ReadFile, log).counting_approvals(harness.approvals.clone()),
-    );
-    let executor = harness.initial(vec![probe.clone()]);
-    let (session, run) = harness.open_run().await;
-    // 第一条在 workspace 里（初始规则表 Allow），第二条在范围外（Ask）。
-    let calls = harness
-        .record_round(&run, &[read_call("a.txt"), read_call("/etc/shadow")])
-        .await;
-
-    let outcome = executor
-        .execute_round(calls, &harness.env(&session, &run))
-        .await
-        .unwrap();
-
-    let Some(RoundStop::Approval { call, .. }) = outcome.stop.clone() else {
-        panic!("{:?}", outcome.stop)
-    };
-    assert_eq!(call, ToolCallId::from_raw("call-1"));
-    assert_eq!(outcome.results.len(), 1, "第一条已经收尾");
-    assert_eq!(
-        outcome.remaining.len(),
-        1,
-        "停在审批上的那条还在 remaining 里"
-    );
-    assert_eq!(
-        probe.pending_seen(),
-        vec![0],
-        "第一条执行时第二条的审批行就已经在了——它比 Run 的挂起还早"
-    );
-    let pending = harness
-        .approvals
-        .list_pending(Some(&session))
-        .await
-        .unwrap();
-    assert_eq!(pending.len(), 1, "这一轮收完之后它才落下来");
-    assert_eq!(pending[0].plan.tool, "read");
-}
-
 /// 在 `begin` 里就落了结论的调用（这里是能力面里没有的工具名）不是"还没轮到"：前面在飞的
 /// 读停下来时，它已经落账的结果照样交给模型，不放回 `remaining`。
 #[tokio::test]
@@ -2598,7 +2099,7 @@ async fn a_call_settled_before_a_stopping_read_keeps_its_result() {
         )
         .with_cancel(cancel.clone()),
     );
-    let executor = harness.permissive(vec![reader]);
+    let executor = harness.executor(vec![reader]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(
@@ -2655,7 +2156,7 @@ async fn cancelling_collects_the_reads_that_are_already_in_flight() {
         Probe::new("read", Operation::ReadFile, Arc::clone(&log)).with_cancel(cancel.clone()),
     );
     let writer = Arc::new(Probe::new("write", Operation::WriteFile, log));
-    let executor = harness.permissive(vec![reader, writer]);
+    let executor = harness.executor(vec![reader, writer]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(
@@ -2695,7 +2196,7 @@ async fn a_faster_later_read_does_not_reorder_the_results() {
     let harness = Harness::new();
     let log = Arc::new(Mutex::new(Vec::new()));
     let probe = Arc::new(Probe::new("read", Operation::ReadFile, Arc::clone(&log)));
-    let executor = harness.permissive(vec![probe.clone()]);
+    let executor = harness.executor(vec![probe.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(
@@ -2797,7 +2298,7 @@ async fn the_projection_reports_how_many_bytes_it_kept_and_stored() {
             preview: Some(preview.clone()),
         })),
     );
-    let executor = harness.permissive(vec![tool]);
+    let executor = harness.executor(vec![tool]);
     let (session, run) = harness.open_run().await;
     let calls = harness.record_round(&run, &[read_call("a.txt")]).await;
 
@@ -2837,7 +2338,7 @@ async fn reading_back_an_observation_counts_as_a_recall() {
     let harness = Harness::new();
     let log = Arc::new(Mutex::new(Vec::new()));
     let probe = Arc::new(Probe::new("read", Operation::ReadFile, log));
-    let executor = harness.permissive(vec![probe]);
+    let executor = harness.executor(vec![probe]);
     let (session, run) = harness.open_run().await;
     let observations = harness.dir.path().join("sessions").join(session.as_str());
     let calls = harness
@@ -2892,7 +2393,7 @@ async fn an_artifact_of_the_round_is_named_in_what_the_model_sees() {
             preview: Some("跑完了\n".into()),
         })),
     );
-    let executor = harness.permissive(vec![tool]);
+    let executor = harness.executor(vec![tool]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(&run, &[("python", serde_json::json!({ "code": "…" }))])
@@ -2993,7 +2494,7 @@ async fn a_resumed_read_that_never_ran_still_runs_beside_its_siblings() {
         Probe::new("read", Operation::ReadFile, Arc::clone(&log))
             .with_barrier(Arc::new(tokio::sync::Barrier::new(2))),
     );
-    let executor = harness.permissive(vec![probe.clone()]);
+    let executor = harness.executor(vec![probe.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
         .record_round(&run, &[read_call("a.txt"), read_call("b.txt")])
@@ -3168,7 +2669,7 @@ mod dispatch_and_follow {
     async fn dispatch_settles_immediately_with_the_returned_short_id() {
         let harness = Harness::new();
         let fake = FakeSpawner::new();
-        let executor = harness.initial_with_spawner(
+        let executor = harness.executor_with_spawner(
             vec![Arc::new(DispatchTool::new())],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
@@ -3200,14 +2701,14 @@ mod dispatch_and_follow {
     }
 
     /// ② 幂等：上一世已经 `start_call` 过（崩在"派出去"与"写结果"之间）的续跑，不重新
-    /// 授权、不重新 `start_call`，直接把结果落回那次尝试——`spawner.spawn` 本身按
+    /// 放行、不重新 `start_call`，直接把结果落回那次尝试——`spawner.spawn` 本身按
     /// `request_key` 幂等，即便两次收到同一个键也只认得出一个任务会话。
     #[tokio::test]
     async fn a_replayed_dispatch_call_does_not_spawn_twice() {
         let harness = Harness::new();
         let fake = FakeSpawner::new();
         let tool = DispatchTool::new();
-        let executor = harness.initial_with_spawner(
+        let executor = harness.executor_with_spawner(
             vec![Arc::new(DispatchTool::new())],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
@@ -3258,7 +2759,7 @@ mod dispatch_and_follow {
     async fn follow_with_an_unknown_task_id_fails_cleanly() {
         let harness = Harness::new();
         let fake = FakeSpawner::new().with_unknown("dead");
-        let executor = harness.initial_with_spawner(
+        let executor = harness.executor_with_spawner(
             vec![Arc::new(FollowTool::new())],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
@@ -3290,7 +2791,7 @@ mod dispatch_and_follow {
     async fn follow_into_a_busy_task_says_it_is_queued_behind() {
         let harness = Harness::new();
         let fake = FakeSpawner::new().with_queued_behind("3f2a");
-        let executor = harness.initial_with_spawner(
+        let executor = harness.executor_with_spawner(
             vec![Arc::new(FollowTool::new())],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
@@ -3318,7 +2819,7 @@ mod dispatch_and_follow {
     #[tokio::test]
     async fn without_a_spawner_dispatch_and_follow_fail_cleanly() {
         let harness = Harness::new();
-        let executor = harness.initial(vec![
+        let executor = harness.executor(vec![
             Arc::new(DispatchTool::new()),
             Arc::new(FollowTool::new()),
         ]);
@@ -3341,7 +2842,7 @@ mod dispatch_and_follow {
         );
     }
 
-    /// ⑥ 计划哈希覆盖任务正文：内容变了，绑在旧哈希上的审批不该覆盖到新的一次调用。
+    /// ⑥ 计划哈希覆盖任务正文：内容变了，就是另一次调用。
     #[tokio::test]
     async fn the_plan_hash_changes_when_the_task_text_changes() {
         let harness = Harness::new();
@@ -3384,7 +2885,7 @@ mod dispatch_and_follow {
             )
             .with_cancel(cancel.clone()),
         );
-        let executor = harness.initial_with_spawner(
+        let executor = harness.executor_with_spawner(
             vec![reader, Arc::new(DispatchTool::new())],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
@@ -3438,7 +2939,7 @@ mod dispatch_and_follow {
             Operation::ReadFile,
             Arc::new(Mutex::new(Vec::new())),
         ));
-        let executor = harness.initial_with_spawner(
+        let executor = harness.executor_with_spawner(
             vec![probe.clone(), Arc::new(DispatchTool::new())],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
@@ -3497,7 +2998,7 @@ mod dispatch_and_follow {
             Operation::ReadFile,
             Arc::new(Mutex::new(Vec::new())),
         ));
-        let executor = harness.initial_with_spawner(
+        let executor = harness.executor_with_spawner(
             vec![probe.clone(), Arc::new(FollowTool::new())],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
@@ -3630,7 +3131,7 @@ mod one_projection {
         // 执行过的调用。
         {
             let harness = Harness::new();
-            let executor = harness.permissive(vec![Arc::new(RecordingTool::shell())]);
+            let executor = harness.executor(vec![Arc::new(RecordingTool::shell())]);
             let (session, run, request) =
                 round(&harness, "shell", serde_json::json!({ "command": "x" })).await;
             let outcome = executor
@@ -3646,7 +3147,7 @@ mod one_projection {
             ("参数不对", "read", serde_json::json!({ "nope": 1 })),
         ] {
             let harness = Harness::new();
-            let executor = harness.permissive(vec![Arc::new(ReadTool::new())]);
+            let executor = harness.executor(vec![Arc::new(ReadTool::new())]);
             let (session, run, request) = round(&harness, tool, args).await;
             let outcome = executor
                 .execute_round(vec![request], &harness.env(&session, &run))
@@ -3670,7 +3171,7 @@ mod one_projection {
             ),
         ] {
             let harness = Harness::new();
-            let executor = harness.initial_with_spawner(
+            let executor = harness.executor_with_spawner(
                 vec![Arc::new(DispatchTool::new()), Arc::new(FollowTool::new())],
                 FakeSpawner::new().with_unknown("beef") as Arc<dyn TaskSpawner>,
             );
@@ -3686,7 +3187,7 @@ mod one_projection {
         // update_plan：计划快照加提醒。
         {
             let harness = Harness::new();
-            let executor = harness.initial(vec![Arc::new(crate::tools::UpdatePlanTool::new())]);
+            let executor = harness.executor(vec![Arc::new(crate::tools::UpdatePlanTool::new())]);
             let (session, run, request) = round(
                 &harness,
                 "update_plan",
@@ -3709,7 +3210,7 @@ mod one_projection {
         // 子 Run 的终态回到父侧那次调用上。
         {
             let harness = Harness::new();
-            let executor = harness.permissive(vec![Arc::new(DelegateTool::new())]);
+            let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
             let (session, run, request) = round(
                 &harness,
                 "delegate",
@@ -3753,7 +3254,7 @@ mod one_projection {
                         evidence: "内容哈希已是预期值".into(),
                     }),
             );
-            let executor = harness.permissive(vec![tool.clone()]);
+            let executor = harness.executor(vec![tool.clone()]);
             let (session, run, mut request) =
                 round(&harness, "shell", serde_json::json!({ "command": "x" })).await;
             let previous = harness
@@ -3773,7 +3274,7 @@ mod one_projection {
     }
 }
 
-/// `update_plan`：编排操作，Policy 直接放行，结果是计划快照加提醒；完成一个先前登记过
+/// `update_plan`：编排操作，直接收尾，结果是计划快照加提醒；完成一个先前登记过
 /// 的步骤是计划边界。
 mod update_plan {
     use super::*;
@@ -3857,10 +3358,9 @@ mod update_plan {
     }
 
     #[tokio::test]
-    async fn update_plan_is_allowed_without_asking_and_returns_the_snapshot() {
+    async fn update_plan_settles_at_once_and_returns_the_snapshot() {
         let harness = Harness::new();
-        // §7.1 的 strict 表：它也直接 Allow。
-        let executor = harness.initial(vec![Arc::new(UpdatePlanTool::new())]);
+        let executor = harness.executor(vec![Arc::new(UpdatePlanTool::new())]);
         let (session, run) = harness.open_run().await;
         let calls = round(
             &harness,
@@ -3891,15 +3391,6 @@ mod update_plan {
             "{}",
             result.content
         );
-        assert!(
-            harness
-                .approvals
-                .list_pending(Some(&session))
-                .await
-                .unwrap()
-                .is_empty(),
-            "不该有审批"
-        );
         assert_eq!(events_of(&harness, "c1"), ["planned", "started", "result"]);
         let state = online_state(&harness.ledger.events(), &run);
         assert_eq!(state.plan.len(), 2, "账本上的计划折得出来");
@@ -3908,7 +3399,7 @@ mod update_plan {
     #[tokio::test]
     async fn completing_a_registered_step_is_a_boundary() {
         let harness = Harness::new();
-        let executor = harness.initial(vec![Arc::new(UpdatePlanTool::new())]);
+        let executor = harness.executor(vec![Arc::new(UpdatePlanTool::new())]);
         let (session, run) = harness.open_run().await;
         let env = harness.env(&session, &run);
 
@@ -3959,7 +3450,7 @@ mod update_plan {
     #[tokio::test]
     async fn a_newly_introduced_completed_step_is_history_not_a_boundary() {
         let harness = Harness::new();
-        let executor = harness.initial(vec![Arc::new(UpdatePlanTool::new())]);
+        let executor = harness.executor(vec![Arc::new(UpdatePlanTool::new())]);
         let (session, run) = harness.open_run().await;
         let env = harness.env(&session, &run);
 
@@ -4014,7 +3505,7 @@ mod update_plan {
     /// 被拒的计划：没有 `tool.planned`、没有 `tool.started`，只有一条失败的结论。
     async fn assert_refused_unstarted(args: serde_json::Value, expected: &str) {
         let harness = Harness::new();
-        let executor = harness.initial(vec![Arc::new(UpdatePlanTool::new())]);
+        let executor = harness.executor(vec![Arc::new(UpdatePlanTool::new())]);
         let (session, run) = harness.open_run().await;
         let calls = round(&harness, &run, 1, &[("c1", "update_plan", args)]).await;
 
@@ -4060,7 +3551,7 @@ mod update_plan {
         let harness = Harness::new();
         let log = Arc::new(Mutex::new(Vec::new()));
         let probe = Arc::new(Probe::new("read", Operation::ReadFile, Arc::clone(&log)));
-        let executor = harness.permissive(vec![probe.clone(), Arc::new(UpdatePlanTool::new())]);
+        let executor = harness.executor(vec![probe.clone(), Arc::new(UpdatePlanTool::new())]);
         let (session, run) = harness.open_run().await;
         let calls = round(
             &harness,
@@ -4120,8 +3611,8 @@ mod update_plan {
     async fn a_resumed_started_update_plan_settles_without_uncertain() {
         let harness = Harness::new();
         let tool = UpdatePlanTool::new();
-        // 最保守的策略：要是重新放行，这里会停在审批上。
-        let executor = harness.conservative(vec![Arc::new(UpdatePlanTool::new())]);
+        // 已经 start 过的那次不重新放行、不重新 start：结果落回那次尝试。
+        let executor = harness.executor(vec![Arc::new(UpdatePlanTool::new())]);
         let (session, run) = harness.open_run().await;
         let mut calls = round(
             &harness,
@@ -4169,12 +3660,10 @@ mod fused {
 
     use komo_kernel::events::EventPayload;
     use komo_kernel::traits::Ledger;
-    use komo_kernel::types::ids::RunId;
     use komo_kernel::types::refs::ContentRef;
     use komo_store::session_log::SessionPaths;
     use komo_store::tool_output::FileToolOutputStore;
 
-    use crate::approvals::ApprovalRequest;
     use crate::executor::ToolExecutor;
     use crate::tools::fusion::{THEN_RUN_SKIPPED, THEN_RUN_SUCCEEDED};
     use crate::tools::{EditTool, ShellTool};
@@ -4231,88 +3720,22 @@ mod fused {
             .collect()
     }
 
-    /// 一条已批准、挂着范围授权的审批，授权从 `step`（单步计划）长出来——与操作者在
-    /// 一条单步调用上点"本次 Run"落成的那条同形。
-    async fn granted(
-        harness: &Harness,
-        session: &SessionId,
-        run: &RunId,
-        id: &str,
-        step: &ExecutionPlan,
-        valid_until: Option<time::OffsetDateTime>,
-    ) -> GrantId {
-        let record = harness
-            .gate
-            .request(ApprovalRequest {
-                session: session.clone(),
-                run: Some(run.clone()),
-                call: None,
-                plan: step.clone(),
-                reason: "测试".into(),
-                changes: None,
-                evidence: None,
-                scopes: vec![ApprovalScope::Run],
-            })
-            .await
-            .expect("落审批");
-        let grant = GrantId::from_raw(id);
-        harness.approvals.add_grant(Grant {
-            id: grant.clone(),
-            approval: record.approval.clone(),
-            scope: komo_kernel::policy::scope_for(step, ApprovalScope::Run).expect("Run 范围"),
-            granted_at: harness.clock.now(),
-            valid_until,
-            consumed: false,
-            reason: format!("{id} 本次 Run"),
-        });
-        harness
-            .approvals
-            .decide(
-                &record.approval,
-                ApprovalDecisionRecord {
-                    approved: true,
-                    scope: ApprovalScope::Run,
-                    by: None,
-                    decided_at: harness.clock.now(),
-                    grant: Some(grant.clone()),
-                    consumed: false,
-                },
-            )
-            .await
-            .expect("批准");
-        grant
-    }
-
-    /// 组合计划拆成两步各自的单步计划。
-    fn split(composite: &ExecutionPlan) -> (ExecutionPlan, ExecutionPlan) {
-        let edit = ExecutionPlan {
-            then_run: None,
-            ..composite.clone()
-        };
-        let command = composite.then_run.as_deref().expect("有第二步").clone();
-        (edit, command)
-    }
-
     #[tokio::test]
     async fn a_successful_fused_edit_returns_one_result_with_both_outputs() {
         let harness = Harness::new();
         let root = seeded(&harness);
         // 能力面按这几个工具登记；执行器自己装一份真的文件输出存储，好看 stdout 落在哪。
-        let _ = harness.permissive(tools());
+        let _ = harness.executor(tools());
         let (session, run) = harness.open_run().await;
         let sessions = tempfile::tempdir().unwrap();
         let store = Arc::new(FileToolOutputStore::new(
             SessionPaths::new(sessions.path(), &session),
             session.clone(),
         ));
-        let mut table = RuleTable::empty();
-        table.default = komo_kernel::policy::Effect::Allow;
         let executor = ToolExecutor::new(
             tools(),
             harness.ledger.clone(),
             store.clone(),
-            harness.gate.clone(),
-            PolicyEngine::from_rules(table),
             Arc::new(harness.clock.clone()),
         );
         let calls = harness
@@ -4358,100 +3781,10 @@ mod fused {
     }
 
     #[tokio::test]
-    async fn an_ask_raises_one_approval_and_runs_both_once() {
-        let harness = Harness::new();
-        let root = seeded(&harness);
-        let executor = harness.initial(tools());
-        let (session, run) = harness.open_run().await;
-        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
-        let env = harness.env(&session, &run);
-
-        let stopped = executor.execute_round(calls, &env).await.unwrap();
-        let Some(RoundStop::Approval { approval, .. }) = stopped.stop.clone() else {
-            panic!("{:?}", stopped.stop)
-        };
-        let pending = harness
-            .approvals
-            .list_pending(Some(&session))
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1, "两步只问一次");
-        assert!(pending[0].plan.then_run.is_some(), "审批绑的是整份组合计划");
-        assert_eq!(pending[0].scopes, vec![ApprovalScope::Once], "只给 Once");
-        assert_eq!(content(&root), "old\n", "批准之前一步都不做");
-        assert_eq!(runs(&root), 0);
-
-        harness
-            .gate
-            .decide(&approval, true, ApprovalScope::Once, None)
-            .await
-            .unwrap();
-        let mut resumed = stopped.remaining;
-        resumed[0].approval = Some(approval.clone());
-        resumed[0].plan = Some(pending[0].plan.clone());
-        resumed[0].resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
-        let done = executor.execute_round(resumed.clone(), &env).await.unwrap();
-        assert!(done.stop.is_none(), "{:?}", done.stop);
-        assert!(!done.results[0].is_error, "{}", done.results[0].content);
-        assert_eq!(content(&root), "new\n");
-        assert_eq!(runs(&root), 1, "命令跑了一次");
-
-        // 同一条审批再派发一次：一次性授权用过了，两步都不再跑。
-        let mut repeated = resumed;
-        repeated[0].resumed = None;
-        let third = executor.execute_round(repeated, &env).await.unwrap();
-        assert!(
-            matches!(third.stop, Some(RoundStop::Approval { .. })),
-            "{:?}",
-            third.stop
-        );
-        assert_eq!(runs(&root), 1, "同一条审批换不来第二次");
-        assert_eq!(started(&harness).len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_denied_command_runs_nothing() {
-        let harness = Harness::new();
-        let root = seeded(&harness);
-        let mut table = RuleTable::initial();
-        table.rules.insert(
-            0,
-            komo_kernel::policy::PolicyRule {
-                id: "no-shell".into(),
-                effect: komo_kernel::policy::Effect::Deny,
-                reason: "这台机器不跑命令".into(),
-                matcher: Matcher::operations([OperationMatch::ShellCommand]),
-                scopes: vec![],
-                requires_isolation: false,
-                grant_proof: false,
-            },
-        );
-        let executor = harness.executor(tools(), PolicyEngine::from_rules(table));
-        let (session, run) = harness.open_run().await;
-        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
-
-        let outcome = executor
-            .execute_round(calls, &harness.env(&session, &run))
-            .await
-            .unwrap();
-
-        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
-        assert!(outcome.results[0].is_error);
-        assert!(
-            outcome.results[0].content.contains("这台机器不跑命令"),
-            "{}",
-            outcome.results[0].content
-        );
-        assert_eq!(content(&root), "old\n", "命令被拒，改动也不做");
-        assert_eq!(runs(&root), 0);
-        assert!(started(&harness).is_empty(), "没放行就没有 tool.started");
-    }
-
-    #[tokio::test]
     async fn a_started_fused_call_is_uncertain_on_resume_and_never_reruns() {
         let harness = Harness::new();
         let root = seeded(&harness);
-        let executor = harness.permissive(tools());
+        let executor = harness.executor(tools());
         let (session, run) = harness.open_run().await;
         let mut calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
         let plan = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
@@ -4485,7 +3818,7 @@ mod fused {
     async fn a_planned_only_fused_call_runs_once() {
         let harness = Harness::new();
         let root = seeded(&harness);
-        let executor = harness.permissive(tools());
+        let executor = harness.executor(tools());
         let (session, run) = harness.open_run().await;
         let mut calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
         let plan = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
@@ -4517,7 +3850,7 @@ mod fused {
     async fn a_fused_call_without_shell_on_the_surface_is_refused() {
         let harness = Harness::new();
         let root = seeded(&harness);
-        let executor = harness.permissive(tools());
+        let executor = harness.executor(tools());
         let (session, run) = harness.open_run().await;
         let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
         let surface = AgentSurface::new(["edit", "write"]);
@@ -4599,13 +3932,13 @@ mod fused {
 
         async fn execute(
             &self,
-            plan: ApprovedPlan,
+            plan: ExecutionPlan,
             ctx: &ToolContext,
             _sink: &mut dyn OutputWriter,
         ) -> Result<ToolOutput, ToolError> {
             let seen = |when: &str| format!("{}:{when}:{}", ctx.call, self.marker.exists());
             self.log.lock().expect("日志").push(seen("进入"));
-            let delay = plan.plan().args["delay_ms"].as_u64().unwrap_or(0);
+            let delay = plan.args["delay_ms"].as_u64().unwrap_or(0);
             tokio::time::sleep(Duration::from_millis(delay)).await;
             self.log.lock().expect("日志").push(seen("离开"));
             Ok(ToolOutput {
@@ -4630,7 +3963,7 @@ mod fused {
         });
         let mut all = tools();
         all.push(peek);
-        let executor = harness.permissive(all);
+        let executor = harness.executor(all);
         let (session, run) = harness.open_run().await;
         let calls = harness
             .record_round(
@@ -4662,129 +3995,12 @@ mod fused {
         );
     }
 
-    /// 两步各凭各的范围授权：每一步按**它自己**的单步计划消费，两条都进账本。
-    #[tokio::test]
-    async fn each_steps_grant_is_settled_and_recorded() {
-        let harness = Harness::new();
-        let root = seeded(&harness);
-        // 什么都问：两步都只能凭授权放行。
-        let executor = harness.conservative(tools());
-        let (session, run) = harness.open_run().await;
-        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
-        let composite = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
-        let (edit, command) = split(&composite);
-        let edit_grant = granted(&harness, &session, &run, "g-edit", &edit, None).await;
-        let command_grant = granted(&harness, &session, &run, "g-cmd", &command, None).await;
-
-        let outcome = executor
-            .execute_round(calls, &harness.env(&session, &run))
-            .await
-            .unwrap();
-
-        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
-        assert!(
-            !outcome.results[0].is_error,
-            "{}",
-            outcome.results[0].content
-        );
-        assert_eq!(content(&root), "new\n");
-        assert_eq!(runs(&root), 1);
-        let started = started(&harness);
-        assert_eq!(started.len(), 1);
-        assert_eq!(started[0].grant, Some(edit_grant));
-        assert_eq!(started[0].then_run_grant, Some(command_grant));
-    }
-
-    /// 改动凭配置 Allow、命令凭 Run 授权：命令那条照样消费、照样进账本。
-    #[tokio::test]
-    async fn a_config_allowed_edit_with_a_granted_command_records_the_command_grant() {
-        let harness = Harness::new();
-        let root = seeded(&harness);
-        let executor = harness.initial(tools());
-        let (session, run) = harness.open_run().await;
-        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
-        let composite = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
-        let (_, command) = split(&composite);
-        let command_grant = granted(&harness, &session, &run, "g-cmd", &command, None).await;
-
-        let outcome = executor
-            .execute_round(calls, &harness.env(&session, &run))
-            .await
-            .unwrap();
-
-        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
-        assert_eq!(runs(&root), 1);
-        let started = started(&harness);
-        assert_eq!(started[0].grant, None, "改动凭的是配置");
-        assert_eq!(started[0].then_run_grant, Some(command_grant));
-    }
-
-    /// 命令那一步的授权用不了——过期了，或者挂着它的审批在消费那一刻已经失效——两步都
-    /// 不跑，整份计划重新问人。
-    #[tokio::test]
-    async fn an_expired_grant_for_the_command_asks_again() {
-        let harness = Harness::new();
-        let root = seeded(&harness);
-        let executor = harness.initial(tools());
-        let (session, run) = harness.open_run().await;
-        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
-        let composite = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
-        let (_, command) = split(&composite);
-        let env = harness.env(&session, &run);
-
-        // ① 授权本身过期了。
-        let expired = harness.clock.now() - time::Duration::minutes(1);
-        granted(&harness, &session, &run, "g-old", &command, Some(expired)).await;
-        let outcome = executor.execute_round(calls.clone(), &env).await.unwrap();
-        assert!(
-            matches!(outcome.stop, Some(RoundStop::Approval { .. })),
-            "{:?}",
-            outcome.stop
-        );
-        assert_eq!(content(&root), "old\n");
-        assert_eq!(runs(&root), 0);
-
-        // ② 授权还在名单上（不设期限），但挂着它的审批到消费那一刻已经过期：消费时再核
-        //    一次，用不了就退回去问人。
-        let harness = Harness::new();
-        let root = seeded(&harness);
-        let executor = harness.initial(tools());
-        let (session, run) = harness.open_run().await;
-        let calls = harness.record_round(&run, &[edit_then(COUNTING)]).await;
-        let composite = plan_of(&EditTool::new(), &harness, &session, &run, &calls[0]).await;
-        let (_, command) = split(&composite);
-        granted(&harness, &session, &run, "g-lapsed", &command, None).await;
-        harness
-            .clock
-            .advance(crate::approvals::DEFAULT_VALIDITY + time::Duration::minutes(1));
-
-        let outcome = executor
-            .execute_round(calls, &harness.env(&session, &run))
-            .await
-            .unwrap();
-        assert!(
-            matches!(outcome.stop, Some(RoundStop::Approval { .. })),
-            "{:?}",
-            outcome.stop
-        );
-        assert_eq!(content(&root), "old\n");
-        assert_eq!(runs(&root), 0);
-        assert!(started(&harness).is_empty());
-        let pending = harness
-            .approvals
-            .list_pending(Some(&session))
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].scopes, vec![ApprovalScope::Once]);
-    }
-
     /// 一个跳过的组合调用也只有一条结果，标记在正文里。
     #[tokio::test]
     async fn a_failed_mutation_skips_the_command() {
         let harness = Harness::new();
         let root = seeded(&harness);
-        let executor = harness.permissive(tools());
+        let executor = harness.executor(tools());
         let (session, run) = harness.open_run().await;
         let calls = harness
             .record_round(

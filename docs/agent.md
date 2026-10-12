@@ -154,7 +154,6 @@ Delegation Context
 ```text
 调用模型
 执行 Tool
-审批
 恢复
 持久化
 Memory 检索
@@ -471,7 +470,7 @@ skills 目录的读取（registry.offer(OfferContext) → SkillCatalog，§14）
 留在 `segment.rs` 的（为执行取数的，不属于“模型看见什么”）：
 
 ```text
-resumed / call_request / waiting_approval    续跑位置
+resumed / call_request                      续跑位置
 run_roots / ResourceMounts                   CallEnv 的根与挂载
 halt_if_corrupt                              失败收场
 without_delegate                             能力收窄（它改的是 surface，不是上下文）
@@ -687,7 +686,7 @@ Memory
 
 **现有的两个缺口**（本次记录下来，不在本次修）：
 
-1. **Skills 目录块没有钉住。** `skills_block` 每一段都从**活注册表**现渲染。审批一小时后
+1. **Skills 目录块没有钉住。** `skills_block` 每一段都从**活注册表**现渲染。介入一小时后
    才答复、期间 skills 被重载，续跑出来的系统提示就变了。`ResourceMounts` 的注释说
    “skill 挂载是这一次 Run 开始时的快照”，但续跑也是一次新的 `segment()`，同样读活
    注册表。要满足上面的 invariant，目录需要进 `RunSnapshot`，或者像记忆那样钉住。
@@ -1139,8 +1138,6 @@ Phase 1–4 明确不动：
 ```text
 AgentLoop
 ToolExecutor
-Policy
-Approval
 Tool concurrency
 Coordinator
 Recovery
@@ -1240,13 +1237,13 @@ Anthropic 的缓存按前缀逐字节匹配（tools → system → messages）�
 | 因素 | 在哪一层 | 现状 |
 |---|---|---|
 | 前缀是否逐字节稳定 | 上下文装配（本次收进 agent） | skills 目录每段现渲染（§9 缺口 1）；历史 Run 折叠成“用户原话 + 最终回复”，工具往返在下一个 Run 里消失，前缀从上一句用户消息之后就变了 |
-| 断点位置与 TTL | 适配器（`anthropic.rs`） | system、最后一个工具、最后一条 user 各一个断点，默认 5 分钟 TTL；审批后续跑时前缀多半已过期 |
+| 断点位置与 TTL | 适配器（`anthropic.rs`） | system、最后一个工具、最后一条 user 各一个断点，默认 5 分钟 TTL；等人（介入）后续跑时前缀多半已过期 |
 | 记忆段位置 | Phase 5 后在 assembler | 系统提示末尾、同段逐字复用——已经是对的 |
 | 能否观测命中率 | `TokenUsage` | 没有 `cache_read` / `cache_creation` 字段，量不出来 |
 
-`AgentLoop` 做的是 `driver.next` → `record_round` → 执行工具 → Ask 挂起 → 按预算重试，
+`AgentLoop` 做的是 `driver.next` → `record_round` → 执行工具 → 等人时挂起 → 按预算重试，
 不影响请求体长什么样；而它承载的正是 §7、§8 那几条硬约束（`record_round` 先于
-`complete`、Ask 让出名额、重启不重置预算）。多一个 loop 实现就要在两处把它们各做对一遍，
+`complete`、等人时让出名额、重启不重置预算）。多一个 loop 实现就要在两处把它们各做对一遍，
 缓存问题却没有因此解决。与 provider 相关的差异已经有接口：`TurnDriver`（kernel 里的
 trait），`AnthropicDriver` 自己维护 messages 与断点。
 
@@ -1697,7 +1694,7 @@ Claude 提示缓存（§19.1），按这个顺序，每一步都等上一步的�
 
 ```text
 1. TokenUsage 加 cache_read / cache_creation（只加字段），Anthropic 适配器从 usage 里读出来
-2. system 与 tools 的断点加 1 小时 TTL：对应“审批后再续跑”；写缓存更贵，用第 1 步的数据权衡
+2. system 与 tools 的断点加 1 小时 TTL：对应“等人答复后再续跑”；写缓存更贵，用第 1 步的数据权衡
 3. assemble 按模型选择历史策略：对 Claude 保留历史 Run 的完整协议（含 provider_blocks），
    前缀一直稳定，代价是上下文更长；其他模型维持现在的折叠
 4. skills 目录进 RunSnapshot 或像记忆那样按段钉住（同时补上 §9 缺口 1）

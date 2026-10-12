@@ -4,7 +4,9 @@
 
 本文定义一个全新项目。Komo 是程序名称；架构只依据本文的需求与约束。
 
-v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；工程结构改为七个 crate（2026-09-22 抽出 `komo-agent`），编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，审批主要在聊天里完成（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env / policy.toml 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
+v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；工程结构改为七个 crate（2026-09-22 抽出 `komo-agent`），编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，需要人判断的事主要在聊天里回答（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
+
+2026-10-11：删掉整套 Policy 与审批（§7）。单操作者、一直跑 `mode = "auto"`，审批不在做判断；之后模型要的 komo 就执行，唯一的硬限制是 `write` / `edit` 不碰 komo 自己的状态，真正的边界只来自执行环境（codemode 沙箱）。旧会话与旧库里的审批痕迹照常能读，不再生效。
 
 ## 1. 已确定的范围
 
@@ -15,18 +17,18 @@ v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；�
 | 部署     | Fedora Server 与 macOS 均可独立运行，每个实例保存自己的数据                                      |
 | 进程入口 | 单个可执行程序 `komo`，包含 TUI 聊天客户端和 Gateway                                            |
 | 聊天     | `komo` 直接进入 TUI 聊天；Gateway 未运行时自动启动                                                |
-| 执行方式 | LLM 原生 tool call，由 Rust 校验、审核和执行                                                     |
+| 执行方式 | LLM 原生 tool call，由 Rust 校验和执行；没有 Policy 与审批（§7）                                 |
 | 基础工具 | 严格保留 `read`、`write`、`edit`、`shell`、`python`                                              |
 | 能力扩展 | Python 模块保存到 toolbox，AI 可以编写、测试和迭代                                               |
 | 程序性说明 | Skills：人写的 `SKILL.md`，模型用 `read` 读取，不增加工具                                       |
 | 定时任务 | Cron 触发同一套 Agent Runtime                                                                    |
-| 持久化   | 每个 Session 一个数据目录，集中保存 JSONL、大正文、tool output 和产物；Turso（MVCC）保存调度状态、授权与索引 |
-| 操作审核 | 统一 Policy；需要人工审核时在飞书 / Telegram / WeChat 里回答，TUI 与 CLI 为辅                    |
+| 持久化   | 每个 Session 一个数据目录，集中保存 JSONL、大正文、tool output 和产物；Turso（MVCC）保存调度状态与索引 |
+| 人工介入 | 没有 Policy 与审批（2026-10-11 删除，§7）；结果不明与阻塞在飞书 / Telegram / WeChat 里回答，TUI 与 CLI 为辅 |
 | 自动记忆 | 自动积累偏好、事实和经验，区分用户陈述、工具观察、模型推断与用户确认                             |
 | 主动记录 | 用户明确要求保存的内容写入现有 Memos，原文以 Memos 为准                                          |
 | 记忆检索 | 关键词与向量混合检索，索引保存在本机，可重建                                                     |
 | 模型配置 | 主模型、记忆整理模型、记忆向量模型分别配置；统一提供 effort 并按模型能力校验                     |
-| 聊天入口 | 飞书、Telegram、WeChat 首版都在，复用 Gateway 的会话、运行与审批接口；每个渠道一个 feature       |
+| 聊天入口 | 飞书、Telegram、WeChat 首版都在，复用 Gateway 的会话、运行与介入接口；每个渠道一个 feature       |
 | 工程结构 | 七个 crate 按依赖重量与变更频率划分；冷编与增量编译时间是验收项                                  |
 
 代码优化、HA、网页搜索、记事是工具组合的使用场景，不成为专用的 Rust 工具或 Runtime 业务类型。
@@ -54,20 +56,18 @@ komo TUI / resume / 操作命令          飞书 ws · Telegram 轮询 · WeChat
                     │
                Tool Executor
                     │
-                 Policy
-             ┌──────┼──────┐
-           Allow   Ask     Deny
-             │      │       └── 明确的拒绝结果
-             │      └── 保存审批，暂停，等待回答
+           prepare（参数 / 版本校验）
+             ┌──────┴──────┐
+           执行           拒绝（明确的拒绝结果）
              │
       read / write / edit / shell / python
                                       │
                                已保存的 toolbox
 ```
 
-MemoryManager 在 Run 开始时装配相关记忆，在 Run 完成后异步整理新证据。它管理本机记忆与检索索引；访问 Memos 仍通过已审核的 Python 模块，不新增模型工具。
+MemoryManager 在 Run 开始时装配相关记忆，在 Run 完成后异步整理新证据。它管理本机记忆与检索索引；访问 Memos 仍通过已启用的 Python 模块，不新增模型工具。
 
-Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境、运行状态和三个聊天渠道。TUI 负责提交输入、显示进度、回答审批和恢复会话；聊天渠道做同样的事，并且是审批的主入口（§11）。
+Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境、运行状态和三个聊天渠道。TUI 负责提交输入、显示进度、回答介入和恢复会话；聊天渠道做同样的事，并且是介入的主入口（§11）。
 
 每个实例的 Gateway 自己执行任务。CLI 从 Mac 连接 NAS 的 Gateway 时，命令与 Python 都在 NAS 虚拟机中执行。
 
@@ -86,19 +86,19 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo gateway`                               | 启动后台 Gateway，等待就绪后返回                                            |
 | `komo gateway --foreground`                  | 前台运行 Gateway，供服务管理器及调试使用                                    |
 | `komo gateway status/stop/restart`           | 管理后台进程                                                                |
-| `komo intervention list/show/answer`         | 待处理清单：审批、结果不明、阻塞三类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
+| `komo intervention list/show/answer`         | 待处理清单：结果不明、阻塞两类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
 | `komo cron add/list/run/pause/resume/remove` | 管理定时任务                                                                |
 | `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector         |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |
-| `komo config check`                          | 校验各模型、effort、向量参数、渠道名单及其他配置；只读，不改变运行中的 Gateway |
+| `komo config check`                          | 校验各模型、effort、向量参数、渠道名单及其他配置；只读，不改变运行中的 Gateway。数据目录里还留着 `policy.toml` 时报一句"已不再使用，可以删掉"（§7） |
 | `komo config reload`                         | 让 Gateway 立即重载配置（等价于文件保存后的自动重载或 `SIGHUP`）；校验失败则保留旧配置并返回错误 |
 | `komo channel list/probe`                    | 渠道清单与连通性核对（飞书 tenant token、Telegram `getMe`、微信凭证文件）；不经 Gateway |
 | `komo channel wechat login`                  | 终端显示二维码完成微信登录，凭证写入数据目录                                |
 | `komo auth codex login`                      | ChatGPT 账号 OAuth 设备码登录（Codex 模型走 `auth = "chatgpt"`，§13.3）；不经 Gateway，凭证写入 `<数据目录>/codex/auth.json`（同微信登录的先例） |
 | `komo auth codex status`                     | 账号、邮箱、套餐与凭证过期时间；**不打印 token**；不经 Gateway               |
 | `komo skills list/inspect/enable/disable`    | Skills 目录（§5.6）；只读文件系统，不经 Gateway                             |
-| `komo toolbox list/inspect/test/enable [--version]/disable` | toolbox 模块（§5.3–5.4）；**经 Gateway**——启用是一次审批，审批只有 Gateway 打得开 |
+| `komo toolbox list/inspect/test/enable [--version]/disable` | toolbox 模块（§5.3–5.4）；**经 Gateway**——启用改的是 state.db，只有 Gateway 打得开；启用 / 停用直接生效（§5.4） |
 | `komo update`                                | 从 GitHub release 换掉当前这个可执行文件（§13.6）。**不经 Gateway**：换的是磁盘上那份二进制，不是在跑的那个进程 |
 
 聊天启动顺序：
@@ -117,11 +117,11 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 **就绪也不等模型探测。** §9.5 那一次"省略 `dimensions` 时先探一次维度"同样是网络 I/O，同样排在"Gateway 就绪"**之后**的后台：端点慢、或者在收连接却不回话时，这一次探测要等满模型超时（本机实测一个只收不回话的端点 = 120s），压在就绪前面就是 `komo gateway restart` 看上去卡住。探测落定前检索这一侧按 §9.4 如实降级——hybrid 走关键词并带降级说明，vector-only 报**不可用**；**不是** `VectorUnconfigured`：配了 alias 只是后端还没在手上，那是"这一刻不通"，不是"配置错了"。探到维度就把向量后端装上，同一台实例的向量臂立刻可用；探不到就一直空着，与端点本来就不通时同一个行为。
 
-**配置热重载。** `config.toml`、`.env`、`policy.toml` 改了不用重启 Gateway。三个触发方式落到同一个函数：文件 mtime 变化（每秒轮询一次，不引入 inotify 依赖，编辑器的临时文件与原子替换都覆盖到）、`komo config reload`、`SIGHUP`。流程固定：
+**配置热重载。** `config.toml`、`.env` 改了不用重启 Gateway（`policy.toml` 2026-10-11 起不再读，文件还在时启动日志与 `komo config check` 报一句，§7）。三个触发方式落到同一个函数：文件 mtime 变化（每秒轮询一次，不引入 inotify 依赖，编辑器的临时文件与原子替换都覆盖到）、`komo config reload`、`SIGHUP`。流程固定：
 
-1. 重新解析三个文件成一份**完整的**新快照，跑与 `komo config check` 相同的校验；任何错误 → 旧快照原样保留，错误写日志并投递到 home chat，重载命令返回该错误。**校验不过的配置永远不会被装上**，哪怕只错一个键。
-   **不认识的键不算错**（2026-09-24）：`config.toml` 里多出来的键——升级后留下的退役键、拼错的键、写到了别的表下面的键（`default_agent` 落进前一个 `[agents.x]` 是最常见的一种）——被忽略，配置照常装上，但每一个都以完整路径（如 `gateway.listen_typo`）作为**警告**出现在 `komo config check`、`komo doctor` 与重载日志里。键认识、值的类型不对仍然是错误。`policy.toml` 例外，**仍然拒绝未知键**：授权规则里拼错一个键被悄悄忽略，这条规则就不按操作者以为的样子生效，宁可装不上。
-2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（arc-swap）。**读配置的地方按用途读当前快照，不缓存**：Dispatcher 判定 Principal 时读 `allow_from` / `groups`，Notifier 解析 home chat 时读 `home_chat`，Policy 每次决策读规则，新 Run 在 `accept_input` 时抓一份模型 / effort 快照存进 `runs.config_snapshot`——所以名单改完，下一条消息就按新名单判；策略改完，下一次决策就按新规则；模型改完，下一个 Run 用新模型，**正在跑的 Run 与后台记忆任务继续用它们各自开始时抓的快照**（§13.3），不在半路换模型。
+1. 重新解析两个文件成一份**完整的**新快照，跑与 `komo config check` 相同的校验；任何错误 → 旧快照原样保留，错误写日志并投递到 home chat，重载命令返回该错误。**校验不过的配置永远不会被装上**，哪怕只错一个键。
+   **不认识的键不算错**（2026-09-24）：`config.toml` 里多出来的键——升级后留下的退役键、拼错的键、写到了别的表下面的键（`default_agent` 落进前一个 `[agents.x]` 是最常见的一种）——被忽略，配置照常装上，但每一个都以完整路径（如 `gateway.listen_typo`）作为**警告**出现在 `komo config check`、`komo doctor` 与重载日志里。键认识、值的类型不对仍然是错误。
+2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（arc-swap）。**读配置的地方按用途读当前快照，不缓存**：Dispatcher 判定 Principal 时读 `allow_from` / `groups`，Notifier 解析 home chat 时读 `home_chat`，新 Run 在 `accept_input` 时抓一份模型 / effort 快照存进 `runs.config_snapshot`——所以名单改完，下一条消息就按新名单判；模型改完，下一个 Run 用新模型，**正在跑的 Run 与后台记忆任务继续用它们各自开始时抓的快照**（§13.3），不在半路换模型。
 3. 逐段比对新旧快照，只重建变化了的东西：某个 `[channels.*]` 的 `enabled` 或凭证变了 → 只停掉并重启那个渠道的 `serve`（飞书重连 ws、Telegram 重新起轮询），其他渠道不受影响，未 ack 的入站消息按平台的至少一次投递重来；模型 `base_url` / 凭证变了 → 换掉对应 `LlmClient` 实例；向量模型变了 → 走 §9.5 的空间指纹与索引代次流程，不在重载里偷偷重建索引。
 4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径、Python 环境根目录。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
 
@@ -138,36 +138,38 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 | `read`   | 路径、读取范围；返回文本和文件版本                   | 大文件截断，明确显示未读范围                         |
 | `write`  | 路径、完整内容、可选预期版本；可选 `then_run`（写完紧接着跑的命令） | 原子替换；覆盖现有文件需检查版本。带 `then_run` 见下文 |
 | `edit`   | 路径、明确匹配内容、替换内容、预期版本；可选 `then_run` | 匹配失败返回错误，不模糊猜测。带 `then_run` 见下文 |
-| `rg`     | 正则、搜索路径、文件 glob；返回「路径:行号:正文」    | 只读，与 `read` 同一条判定（范围内 Allow、范围外 Ask）；这台机器上没有 ripgrep 就不挂这个工具 |
-| `shell`  | 命令、工作目录、超时；返回退出码和输出               | 管理进程组、限制输出、支持取消                       |
+| `rg`     | 正则、搜索路径、文件 glob；返回「路径:行号:正文」    | 只读（`Operation::ReadFile`，与 `read` 同属可并发的一类）；这台机器上没有 ripgrep 就不挂这个工具 |
+| `shell`  | 命令、工作目录、超时；返回退出码和输出               | 管理进程组、限制输出、支持取消；超时也交回到点前的输出 |
 | `python` | 代码或已保存模块调用；返回结果、输出和产物           | 使用受管理解释器，绑定代码版本                       |
 
-**`then_run`：改完紧接着跑一条命令，一次调用、一条结果**（照 SoL-Pi 的 Action Fusion，省掉"改 → 模型 → 跑"中间那一次往返）。`edit` / `write` 的参数可以带 `then_run: { command, timeout_secs? }`；`prepare` 用 `shell` 自己的计划构造把它做成第二步，挂在计划的 `then_run` 上，两步一起过 Policy、一起审批（§7.1 组合计划那一行）。执行（`tools::fusion`）：改动失败 → 命令不跑，结果里写 `[then_run:skipped]`；改动之后目标的内容哈希必须仍是改动留下的那一份，否则同样跳过；命令走 `shell` 的正常执行（进程组、时限收紧到活动执行时限、取消），输出流进**同一次尝试**的 stdout / stderr；非零退出照实报（`exit_code`），改动不回滚。结果是 `{ mutation, then_run: { status: succeeded|failed|skipped, result } }`，状态只有"改动成功且退出码 0"才是完成；正文依次是改动的结论、`[then_run:…]` 标记、命令的输出。这次运行的能力面里没有 `shell`（或执行器没装它）时，带 `then_run` 的调用不放行、不执行，交回一句原因；交给模型的 schema 也一并摘掉 `then_run`。组合调用是写，所以是并发调度里的屏障（§6）。恢复见 §8.6。
+**`then_run`：改完紧接着跑一条命令，一次调用、一条结果**（照 SoL-Pi 的 Action Fusion，省掉"改 → 模型 → 跑"中间那一次往返）。`edit` / `write` 的参数可以带 `then_run: { command, timeout_secs? }`；`prepare` 用 `shell` 自己的计划构造把它做成第二步，挂在计划的 `then_run` 上，`execute` 从 `plan.then_run` 取它；改动那一步照样受 §7 那条硬限制（不写 komo 自己的状态）。执行（`tools::fusion`）：改动失败 → 命令不跑，结果里写 `[then_run:skipped]`；改动之后目标的内容哈希必须仍是改动留下的那一份，否则同样跳过；命令走 `shell` 的正常执行（进程组、时限收紧到活动执行时限、取消），输出流进**同一次尝试**的 stdout / stderr；非零退出照实报（`exit_code`），改动不回滚。结果是 `{ mutation, then_run: { status: succeeded|failed|skipped, result } }`，状态只有"改动成功且退出码 0"才是完成；正文依次是改动的结论、`[then_run:…]` 标记、命令的输出。这次运行的能力面里没有 `shell`（或执行器没装它）时，带 `then_run` 的调用不放行、不执行，交回一句原因；交给模型的 schema 也一并摘掉 `then_run`。组合调用是写，所以是并发调度里的屏障（§6）。恢复见 §8.6。
 
-**搜索走 `rg` 工具，不拼 shell 命令。** 两者结果一样，判定不一样：`rg` 的计划是一次**只读**动作（`Operation::ReadFile`，目标是搜索范围），于是"搜工作目录"是 Allow、"搜范围外"要问人，和 `read` 完全一致；而 `shell` 的任意命令一律 Ask——一次只读搜索每次都停下来等人，是把审批额度浪费在不需要判断的事情上。HTTP 请求通过 Python 库或命令完成；Git、构建、测试、HA 和记录查询都组合这些基础工具。
+**搜索走 `rg` 工具，不拼 shell 命令。** 两者结果一样，计划不一样：`rg` 的计划是一次**只读**动作（`Operation::ReadFile`，目标是搜索范围），所以它能和别的读同时在飞（§6）、能被 codemode 脚本调用（只放行只读，§4）、恢复时可以直接重读（§8.6）；`shell` 的任意命令三样都不是。（2026-10-11 之前还有一条理由：`shell` 一律 Ask，只读搜索每次都停下来等人；审批删掉之后这条不再成立，§7。）HTTP 请求通过 Python 库或命令完成；Git、构建、测试、HA 和记录查询都组合这些基础工具。
 
 `rg` 内嵌 ripgrep 的**书库**——[`grep`](https://github.com/BurntSushi/ripgrep/tree/master/crates/grep)（匹配、搜索、打印）加 [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore)（遍历：隐藏文件、`.gitignore`、覆盖 glob）——**进程内跑**：不起子进程，机器上也不需要装 `rg`。要书库不要命令，是因为外部二进制要么没装、要么各家版本不同；而遍历规则本来就该用这套经过验证的实现，不该自己再写一遍。正则语法就是 Rust regex（只连 `grep-regex`，不带 PCRE2）。遍历与搜索是阻塞的，所以跑在 `spawn_blocking` 上、匹配经队列流式写进输出存储（§8.3），取消与超时靠一个停止标志让那边收手。**碰到输出上限（8 MiB）就停下，交回已写下的匹配并标 `output_truncated`**，仍是完成；**超时（默认 30s）也交回已找到的部分**，标 `timed_out`、状态记失败（没搜完和"有读不了的"一样是不完整的搜索），不是一句光秃秃的"超时"。一行最多印 500 列（`rg --max-columns 500 --max-columns-preview`）：JSONL 事件一行动辄几十 KiB，不截的话一行就吃掉整份预算，要看全行就 `read` 那一行。停止标志被写入器看见时报的错**不能是 `Interrupted`**——`write_all` 会把它当成"再试一次"原地重试，搜索线程空转、队列不关（2026-09-24 实测：`cron|schedule` 搜 `~/.komo` 的副本，写满 8 MiB 后线程在 `write_all` 里空转，跑满 30s 只拿回"超时"、线程也不退出；修后 debug 构建 4.2s 完成，截到 500 列后只写下 2.9 MiB；把上限压到 1 MiB 时 3.3s 返回截断结果）。
 
-**委派（`delegate`）不是第七个工具，是一条编排操作。** 模型可以把一个自包含子任务交给**一条子 Run**：它以 `Operation::Delegate` 进同一个决策入口（§7.1 那一行），执行时在同一个 Session 里受理一条**子 Run**，父 Run 进 `waiting + dependency` 等它——子 Run 用的是同一套六个工具，它自己的每一次调用照常过 Policy 与审批，所以"能不能做"这一层没有被放宽，放宽的只是"这一件事由谁来做"。子代理只拿得到任务本身（不继承父的消息历史、不继承父的上下文），轮数预算与普通 Run 同一个（`[execution] max_rounds`，cron 派生的按 Job 的 `max_rounds`），**深度只有一层**（子 Run 不能再委派）。结果可以带一个契约：子代理把结构化结果放进它最后一条回复，父侧续跑时用**同一份校验器**复验（§8.6）。
+**`shell` 超时也交回已有的输出**（2026-10-11）：到点终止进程组之后，结果是 `timed_out: true` 的失败、正文抬头 `timeout=<N>s`，后面照常是到点前 stdout / stderr 的首尾摘录——与 `rg` 超时交回已找到的部分同一条。起因是真实会话里的轮询循环：`for … sleep 15` 跑满时限只换回一句"超时"，模型看不到最后一次查到的进度，只能把整个循环重跑。工具描述也写明了等慢事的做法：一条命令里循环轮询、每轮打印一行进度、`timeout_secs` 给够，到点再发一条接着等。回归测试：`tools::shell::tests::a_timeout_hands_back_what_was_printed_before_it`。
+
+**委派（`delegate`）不是第七个工具，是一条编排操作。** 模型可以把一个自包含子任务交给**一条子 Run**：它以 `Operation::Delegate` 进同一条执行路径，执行时在同一个 Session 里受理一条**子 Run**，父 Run 进 `waiting + dependency` 等它——子 Run 用的是同一套六个工具，它自己的每一次调用照常过 `prepare` 与它的能力面，所以"能做什么"这一层没有被放宽，放宽的只是"这一件事由谁来做"。子代理只拿得到任务本身（不继承父的消息历史、不继承父的上下文），轮数预算与普通 Run 同一个（`[execution] max_rounds`，cron 派生的按 Job 的 `max_rounds`），**深度只有一层**（子 Run 不能再委派）。结果可以带一个契约：子代理把结构化结果放进它最后一条回复，父侧续跑时用**同一份校验器**复验（§8.6）。
 
 **一个子代理可以被续跑，续跑是再派一条子 Run，不是把旧的那条叫醒。** `delegate` 多一个可选参数 `resume`：填一条已经结束的子 Run 的 ID（委派结果里本来就写着它），新派出去的子 Run 在 `DelegateSpec.resumes` 里记下"我接着哪一条"，于是同一件事的几次委派连成一条**线**，子代理带着这条线上自己说过的话接着做。三个身份各管一件事，不因为续跑而混起来：
 - **`parent` 仍然是"谁在等它"**——发起这次续跑的 Run，结果回到**它**的那次调用上；它不必是最初派出这条线的那条 Run。**同一 Session 里后面的任何一条 Run 都可以续跑**（用户下一轮说"让刚才那个再查一下"，cron 的下一次触发接着上次的那条线），因为子代理的记录本来就在这个 Session 的目录里。
-- **`resumes` 只是"接着哪一条"**：它决定子代理的回放窗口（§8.3），不决定结果交给谁、不决定预算。每次续跑是一条全新的 Run：自己从零数起的轮数预算、自己的契约（不给就是自由文本，不继承上一次的）、自己的 Policy 与审批。
+- **`resumes` 只是"接着哪一条"**：它决定子代理的回放窗口（§8.3），不决定结果交给谁、不决定预算。每次续跑是一条全新的 Run：自己从零数起的轮数预算、自己的契约（不给就是自由文本，不继承上一次的）、自己的能力面。
 - **深度仍然只有一层**：续跑出来的子 Run 能力面里照样没有 `delegate`，续跑不是"子代理派子代理"。
 
 `resume` 的目标在 `prepare` 里校验，不过就是一次**没有执行过**的调用，按 `fail_call` 落账并把理由交给模型（§13.5）：① 同一 Session，且是一条子 Run（主对话的 Run 不是"子代理"，没有什么可续）；② 已经进终态，且终态是 `completed` 或 `failed`——**`cancelled` / `abandoned` 不能续**：那是操作者说过"这件事到此为止"，模型不能替人把它捡回来；③ 在最新一个 `conversation.boundary` 之后——边界之前的那条线属于上一段对话，父的窗口里已经看不到它，续过去的窗口也会被边界截断成一半；④ **它是这条线的末端**：已经有别的子 Run `resumes` 它（不论那条什么状态）就拒绝，理由里写出末端是哪一条——线只往后接，不分叉，想另起炉灶就不填 `resume`。④ 不靠"先查后写"：它在受理子 Run 的那个 db 事务里再判一次（与 `run.accepted` 同一次提交，§8.5），查到了就不受理。
 
-**`update_plan` 也不是第七个工具，是模型自己的工作计划。** 模型每次发**整份**计划（步骤 id / 目标 / `pending|in_progress|completed`，完成时可附 `progress`：改了哪些文件、怎么验证的、做了什么决定），以 `Operation::UpdatePlan` 进同一个决策入口——没有副作用，strict 与 auto 下都 Allow（§7.1）。计划不另存：它整份内联在 `tool.planned` 里（超过内联上限在 `prepare` 就拒掉），这条 Run 现在的计划是从日志按 Run 折出来的，重启之后折出来的还是同一份；结果是计划快照加几句提醒（目标改了换 id、同时最多一个 in_progress……）。它是屏障，不和并发的读交错；started 而无结果的那次再收一次尾即可，不核对。**完成一个先前登记过、当时还没完成的步骤**是一个计划边界——一上来就标 completed 的新步骤只算补记历史；在线压缩以计划步骤完成为边界。
+**`update_plan` 也不是第七个工具，是模型自己的工作计划。** 模型每次发**整份**计划（步骤 id / 目标 / `pending|in_progress|completed`，完成时可附 `progress`：改了哪些文件、怎么验证的、做了什么决定），以 `Operation::UpdatePlan` 进同一条执行路径——没有副作用。计划不另存：它整份内联在 `tool.planned` 里（超过内联上限在 `prepare` 就拒掉），这条 Run 现在的计划是从日志按 Run 折出来的，重启之后折出来的还是同一份；结果是计划快照加几句提醒（目标改了换 id、同时最多一个 in_progress……）。它是屏障，不和并发的读交错；started 而无结果的那次再收一次尾即可，不核对。**完成一个先前登记过、当时还没完成的步骤**是一个计划边界——一上来就标 completed 的新步骤只算补记历史；在线压缩以计划步骤完成为边界。
 
-**`codemode` 是组合，不是新能力。** 模型写一段 Python，在操作系统沙箱里跑（macOS 是 Seatbelt，Linux 是 Landlock + seccomp；不能写文件、联网、起子进程），脚本里经 `tools.<name>()` 调其他工具——只放行只读且 Policy 直接 Allow 的，只有脚本的输出回到模型。沙箱自检不过就不注册。见 `docs/codemode.md`。
+**`codemode` 是组合，不是新能力。** 模型写一段 Python，在操作系统沙箱里跑（macOS 是 Seatbelt，Linux 是 Landlock + seccomp；不能写文件、联网、起子进程），脚本里经 `tools.<name>()` 调其他工具——只放行 `is_read_only()` 的计划（codemode 自己除外），只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是沙箱本身（§7）。沙箱自检不过就不注册。见 `docs/codemode.md`。
 
-**MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 Policy / 审批 / 落账的路；只读与否由操作者声明，不信服务器自报。见 `docs/mcp.md`。
+**MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）与 codemode 能不能调它。见 `docs/mcp.md`。
 
-工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、Policy 判断、审批处理、执行状态保存、取消和输出限制。
+工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、执行状态保存、取消和输出限制。
 
 **每次运行有它自己的能力面（`AgentSurface`）。** 这次允许调用哪些工具是一个显式的集合：**交给模型的工具 schema 与执行时查找的表是同一份**，装配时由 schema 反推，所以两边不可能分家。schema 里没有的名字，执行器不认——模型自己拼出这个名字，拿到的是"这次运行的工具集里没有它"，而不是"进去试试看"。执行器手里那份全局工具目录只用于**发现与构造**（`komo skills` 的 `requires_tools` 门控也问它），**执行时一次都不回退到它**：能回退就等于能力边界只是一句建议。子代理已经是这条边界的第一个使用者（它的 schema 里没有 `delegate`，于是它也调不动 `delegate`）。
 
-工具**能不能**调用由能力面决定；一次**具体调用**允不允许由 Policy 决定（§7）。两者不是同一件事：`coder` 有 `write`，不代表它可以写任何路径。
+工具**能不能**调用由能力面决定；一次**具体调用**能不能做由工具自己的 `prepare` 决定（参数、版本、目标；§7 那条硬限制也在这里）。没有第三层：能力面给了、`prepare` 过了，就执行（§7）。
 
 ```rust
 #[async_trait::async_trait]
@@ -182,7 +184,7 @@ pub trait Tool: Send + Sync {
 
     async fn execute(
         &self,
-        plan: ApprovedPlan,
+        plan: ExecutionPlan,
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ToolError>;
 
@@ -198,28 +200,17 @@ pub trait Tool: Send + Sync {
 }
 ```
 
-这是接口示意，辅助类型省略。`ApprovedPlan` 只能由执行器在策略允许或有效审批后构造，字段不对外开放。prepare 可以解析参数和检查元信息，但不能通过导入未知 Python 模块、运行命令等方式提前执行未审核代码。
+这是接口示意，辅助类型省略。prepare 可以解析参数和检查元信息，但不能通过导入未知 Python 模块、运行命令等方式提前执行代码——`prepare` 没有副作用，副作用只在 `start_call` 之后（§8.5）。
 
-`ExecutionPlan` 带 `recovery: RecoveryMode`（§8.6 四种恢复方式之一）与 `plan_hash`，由 `prepare` 填写，模型参数不能指定。`ApprovedPlan` 的封闭要跨 crate 成立（类型定义在 kernel，执行器在 runtime，见 §13.4），所以靠类型状态而不是可见性：
+`ExecutionPlan` 带 `recovery: RecoveryMode`（§8.6 四种恢复方式之一）与 `plan_hash`，由 `prepare` 填写，模型参数不能指定。`execute` 按值收 `ExecutionPlan`（2026-10-11 之前收的是只能凭 Policy 允许或审批换来的 `ApprovedPlan` / `Proof`，随 Policy 一起删掉，§7）。
 
-```rust
-pub struct ApprovedPlan { plan: ExecutionPlan, proof: Proof }
-pub struct Proof(ProofKind);                     // 字段私有，无公开构造函数
-
-impl PolicyDecision   { pub fn into_proof(self) -> Option<Proof> { … } }   // 只有 Allow 换得出
-impl ConsumedApproval { pub fn into_proof(self) -> Proof { … } }           // 只有消费成功的审批换得出
-impl ApprovedPlan     { pub fn new(plan: ExecutionPlan, proof: Proof) -> Self { … } }
-```
-
-`Proof` 只有这两个来源。测试通过 `test_support::proof()` 拿替身，feature 门控，不进正式构建。
-
-ToolContext 由 Gateway 创建，包含 Session / Run / ToolCall 身份、工作目录、权限和取消信号，不能由模型参数提升。
+ToolContext 由 Gateway 创建，包含 Session / Run / ToolCall 身份、工作目录、只读根、受保护路径名单（§7）和取消信号，不能由模型参数提升。
 
 shell 与 Python 子进程使用明确的环境变量集合。取消时停止所属进程组并等待回收，而不仅仅是丢弃异步等待。Tokio 默认不会因为进程 handle 被丢弃就终止进程。[Tokio process](https://docs.rs/tokio/latest/tokio/process/index.html)
 
 ### 资源命名空间：`skill://` / `tool://` / `artifact://`
 
-模型仍然只用现有的 `read` / `rg`，把资源 URI 当路径交给它们。**URI 不是"特殊文件路径"**：它在执行计划里是一个明确的目标类型（`TargetRef`），计划同时带着**逻辑** URI 与解析出来的**真实**目标——审批与审计回答的是"允许读哪个逻辑资源"，而规则的路径匹配看的仍是真实路径。
+模型仍然只用现有的 `read` / `rg`，把资源 URI 当路径交给它们。**URI 不是"特殊文件路径"**：它在执行计划里是一个明确的目标类型（`TargetRef`），计划同时带着**逻辑** URI 与解析出来的**真实**目标——审计与界面显示的是"读了哪个逻辑资源"，越界与只读根的判断看的仍是真实路径。
 
 ```text
 skill://<skill>/<path…>                      → 那份 skill 的目录 + <path…>（只读）
@@ -231,10 +222,10 @@ artifact://<run>/<call>/<attempt>/<stdout|stderr|result>
                                              → sessions/<id>/tool-output/…（只读）
 ```
 
-- **`tool://` 是说明入口，不是执行入口**：读它不改任何状态；真实动作仍走 native tool call、`ExecutionPlan` 与 Policy。
+- **`tool://` 是说明入口，不是执行入口**：读它不改任何状态；真实动作仍走 native tool call 与 `ExecutionPlan`。
 - **越权当场是错**：`..`、空段、`tool://` 里能力面之外的工具、别的会话的 `run`、没有会话目录，一律在 `prepare` 就拒绝（`ToolError::Failed` 说清原因），**不进计划就没有执行**；解析链接之后还要再核一次"仍在挂载点里面"。
 - **挂载由装配决定，不能由模型参数提升**：skill 根来自当前配置快照的 `paths.skill_dirs`，会话内容目录来自这一次的 Session，`tool://` 只认这一次的 `AgentSurface`。三者随 `ToolContext` / `CallEnv` 走。
-- **计划里的两种目标**：本地路径（序列化成 `{"path": …}`，与改造前逐字相同——旧审批计划仍按原哈希校验）与资源（`{"uri": …, "resolved": …}`）。规则表因此多一条 `paths = virtual`：**没有磁盘目标的读**（`tool://`）由它一条覆盖；路径那几条规则对虚拟目标一律**不命中**——给虚拟入口编一个假路径才是真的越权口子。
+- **计划里的两种目标**：本地路径（序列化成 `{"path": …}`，与改造前逐字相同——旧计划的哈希不变）与资源（`{"uri": …, "resolved": …}`）。**没有磁盘目标的读**（`tool://`）不编假路径——给虚拟入口编一个假路径才是真的越权口子。
 - **首阶段不做**：memory / session 的任意写入、shell / Python 里的 URI 展开、通用 VFS。本地路径的用法一个字都不变。
 
 产物由运行时登记：Python 子进程拿 `KOMO_ARTIFACT_DIR`（= `<会话内容目录>/artifacts/<run>`）作为产出目录，跑完把这次新出现的文件记进工具结果的 `artifacts` 引用（**相对会话目录的路径**，落在 `output.json` 的 `body.artifacts` 里），投影那一处把它映射成 `artifact://files/<相对 artifacts 的那一段>`（映射函数在 kernel，落盘与投影共用同一个，§8.3）。工具输出那一条的引用直接由 §8.3 的投影给出（`artifact://<run>/<call>/<attempt>/stdout`），重启之后照样读得回来——它是**按引用回放**，不是把正文再抄一遍。
@@ -253,7 +244,7 @@ status / result / stdout / stderr / artifacts
 
 脚本可以设置 `result` 返回 JSON 可表达的数据；普通 print 输出单独收集。解释器驱动的协议使用独立通道或明确封装，脚本输出不能混入控制协议。
 
-长期状态写入文件；依赖按锁定清单安装。环境变更经过 Policy 并串行进行，正在使用的环境版本保持不变。依赖升级需要新的环境版本，成功后再切换后续调用。
+长期状态写入文件；依赖按锁定清单安装。环境变更串行进行，正在使用的环境版本保持不变。依赖升级需要新的环境版本，成功后再切换后续调用。
 
 ### 5.2 两种 Python 调用形式
 
@@ -279,11 +270,9 @@ status / result / stdout / stderr / artifacts
 }
 ```
 
-两种形式都属于同一个 `python` 工具。`call` 模式只加载 toolbox 中明确导出的函数，依据已审核版本、参数定义和授权范围执行。它不是直接开放 Python 任意属性查找。
+两种形式都属于同一个 `python` 工具。`call` 模式只加载 toolbox 中明确导出的函数，依据已启用版本与参数定义执行。它不是直接开放 Python 任意属性查找。
 
-任意 code 模式不会因为 import 了已审核模块而自动获得同样授权。
-
-`mode` 是参数里的判别字段，但**模型偶尔会漏写**（真实会话里报的是 `missing field mode`，白跑一轮）。所以 Runtime 按参数形状补上：有 `code` 就是 `code`、有 `module` / `function` 就是 `call`，两个都写或都没写才报错。补进去的值落在 `plan.args` 里，**授权与计划哈希看的是补完之后的那份**——少一个判别字段不该换来一次失败往返，也不该让策略看到两种形状。
+`mode` 是参数里的判别字段，但**模型偶尔会漏写**（真实会话里报的是 `missing field mode`，白跑一轮）。所以 Runtime 按参数形状补上：有 `code` 就是 `code`、有 `module` / `function` 就是 `call`，两个都写或都没写才报错。补进去的值落在 `plan.args` 里，**计划哈希看的是补完之后的那份**——少一个判别字段不该换来一次失败往返，也不该让同一次调用有两种形状。
 
 `python` 交给模型的那段正文（§8.3 的投影）按这个顺序取：错误 → 结构化结果 → **stdout 的首尾摘录** → "没有返回值，也没有输出"。脚本只 `print` 是常见跑法，而字面量 `null` 会让模型以为工具坏了、改用 `shell` + `python3` 把同一件事重跑一遍（真实会话里就这么白花了两轮）。完整 stdout 照旧在 `stdout.txt` 里，抬头写着它的字节数。
 
@@ -302,32 +291,31 @@ toolbox/
 
 README 与模块说明提供用法。LLM 通过 read 查看说明，再通过 python 调用。保存工具不会扩张模型侧的六个工具 Schema。
 
-可见的树之外还有两处**隐藏**位置（2026-09-17 落地）：`.staging/<m>.json` 存候选元数据（版本、测试结果），`.versions/<m>/{<ver>.py, test_<ver>.py, <ver>.json, enabled.json}` 存每个版本的快照与「当前启用哪个」——§5.4 要求记录实际使用的模块版本并保存快照。版本号 = 代码哈希前 12 位 + 依赖锁哈希前 8 位。`code` 模式的解释器装了一个排在 `sys.meta_path` 最前的查找器，按解析后的落点拒绝 `.staging` / `.versions` 的导入（§7.3）；它挡的是 import 这条路，`exec(open(...).read())` 不在承诺内。
+可见的树之外还有两处**隐藏**位置（2026-09-17 落地）：`.staging/<m>.json` 存候选元数据（版本、测试结果），`.versions/<m>/{<ver>.py, test_<ver>.py, <ver>.json, enabled.json}` 存每个版本的快照与「当前启用哪个」——§5.4 要求记录实际使用的模块版本并保存快照。版本号 = 代码哈希前 12 位 + 依赖锁哈希前 8 位。`code` 模式的解释器装了一个排在 `sys.meta_path` 最前的查找器，按解析后的落点拒绝 `.staging` / `.versions` 的导入；它挡的是 import 这条路，`exec(open(...).read())` 不在承诺内。
 
-HA、Memos、搜索服务地址和凭证引用通过配置传给已授权模块：模块用 `__komo_env__ = ["MEMOS_TOKEN", …]` 声明它要哪些**变量名**，变量名进执行计划（`ResourceRef`），Gateway 起子进程时从 `Secrets`（`.env`）按名解析注入，`.env` 改了下一次调用即生效；解析不到就不设置并告警一次，由模块自己报「未配置」。原始凭证不放进模型提示词、不进计划、不进事件、不打印到对话或日志，也不进服务单元文件（§3）。Memos 是随 komo 安装的首个内置已启用模块（同名模块已存在则不覆盖）。
+HA、Memos、搜索服务地址和凭证引用通过配置传给已启用模块：模块用 `__komo_env__ = ["MEMOS_TOKEN", …]` 声明它要哪些**变量名**，变量名进执行计划（`ResourceRef`），Gateway 起子进程时从 `Secrets`（`.env`）按名解析注入，`.env` 改了下一次调用即生效；解析不到就不设置并告警一次，由模块自己报「未配置」。原始凭证不放进模型提示词、不进计划、不进事件、不打印到对话或日志，也不进服务单元文件（§3）。Memos 是随 komo 安装的首个内置已启用模块（同名模块已存在则不覆盖）。
 
 ### 5.4 AI 迭代流程
 
 ```text
 读取模块和使用说明
   → write/edit 写入候选版本
-  → Policy 审核候选代码的执行
   → 运行测试并保存结果
   → 展示差异、依赖变化和验证证据
-  → Policy 审核启用操作
+  → 启用（直接生效）
   → 校验候选哈希与已测版本一致
   → 原子替换当前版本
 ```
 
-候选文件可以在授予的 staging 范围内修改。候选执行、依赖安装和启用新版本分别按真实权限评估，不能用“正在测试”跳过审核。
+启用 / 停用直接生效，没有 Pending、没有后台等答复（2026-10-11 之前启用是一次审批，§7）。启用前仍要求候选哈希与已测版本一致——这是版本校验，不是授权。
 
-每次调用记录代码内容哈希、实际使用的自定义模块版本和 Python 环境版本，相关代码保存快照。版本变化使旧版本授权失效。首版不支持无法确定所执行版本的动态代码下载后自动调用。
+每次调用记录代码内容哈希、实际使用的自定义模块版本和 Python 环境版本，相关代码保存快照。首版不支持无法确定所执行版本的动态代码下载后自动调用。
 
-旧调用的恢复使用已保存结果；需要执行尚未开始的调用时，使用绑定版本并重新检查当前策略。
+旧调用的恢复使用已保存结果；需要执行尚未开始的调用时，使用绑定版本。
 
 ### 5.5 Memos 作为主动记录的原文来源
 
-用户说“记一下”“保存这段内容”时，Agent 调用 `python → toolbox.memos`，沿用同一 Policy 审核后写入 Memos。模块提供创建、查询、读取、修改等导出函数，具体函数按需要保存与审核；成功后返回记录 ID 和原文链接。
+用户说“记一下”“保存这段内容”时，Agent 调用 `python → toolbox.memos`，写入 Memos。模块提供创建、查询、读取、修改等导出函数，具体函数按需要保存与启用；成功后返回记录 ID 和原文链接。
 
 查询用户主动保存的记录时，通过模块查询 Memos 并读取原文。自动 Memory 可以保留相关摘要与 Memos 引用，但不建立第二份完整笔记库，也不把模型对笔记的推断视为用户确认。
 
@@ -349,7 +337,7 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 - `SKILL.md` frontmatter：`name`、`description`，可选 `platforms:`、`requires_tools:`（对 5 个基础工具或 toolbox 模块名）。
 - 搜索路径有序，**同名先到先得**；每次查询重扫目录，编辑或新增无需重启。
 - 只有系统提示里的**目录行**（名字 + 一句描述，总量有上限）是启动时快照，为了提示前缀稳定；`platforms:` / `requires_tools:` 只门控这份目录，不门控加载。实现上这一块是两行开头加若干目录行：先给**按序的根**（只列真的出了条目的那些，顺序就是搜索顺序——"同名先到先得"因此落得下来），再给目录行；模型按这个顺序去找 `<根>/<名字>/SKILL.md` 并 `read` 它。一条能露面的都没有时这一块整个不出现（不留空标题）。启动时算一次，配置重载时按新快照重算，此外不随文件变化——目录行是提示前缀的一部分，不能每段都不一样。**整批装得下「名字 + 一句描述」就用它，装不下就只留名字**——列全比列得详细要紧：166 个 skill 的实测里，2000 字符的预算只留下字母表前 16 条，`log-diagnosis` 根本没进提示，模型为了找它去 `ls` 了整个目录；只留名字是 2752 字符、装得下全部（默认上限已按这个实测改成 4000）。名字都装不下时末尾会写「另有 N 条没列出来」：**「没有它」和「没列出来」是两件事**。
-- **没有 skill 工具。**模型通过 `read` 读 `SKILL.md`——写本地路径，或者写 `skill://<名字>/SKILL.md`（§4.7，逻辑入口，审批与审计显示的是它）；skills 目录是 Policy 里的只读根（§4.7 的资源根也在 `ToolContext.roots` 里），读取 Allow。Skill 里写的"可以直接执行"不构成授权，Policy 只看 `ExecutionPlan`。
+- **没有 skill 工具。**模型通过 `read` 读 `SKILL.md`——写本地路径，或者写 `skill://<名字>/SKILL.md`（§4.7，逻辑入口，审计显示的是它）；skills 目录是只读根（§4.7 的资源根也在 `ToolContext.roots` 里）。
 - **目录行的门控按这一次装配的能力面**：某个 Agent 的面里没有 `python` 时，`requires_tools: [python]` 的 skill 不进它的目录行；而 `skill://` 仍然读得到——门控管的是"要不要摆在眼前"，不是"能不能读"。
 - Cron Job 可以声明 `skills = ["…"]`，触发时把这些 SKILL.md 正文预载进首轮上下文。
 - `komo skills list | inspect <name> | enable | disable`；`disable` 只从目录行隐藏，不删文件。没有安装 / 候选 / 治理流程——Skills 由人写、由人放进目录。
@@ -367,7 +355,7 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
   → 接收完整一轮回复
       ├─ 有 tool calls
       │    → 将完整 assistant 回复和调用计划追加到 JSONL 并同步落盘
-      │    → 逐个 prepare → policy → execute
+      │    → 逐个 prepare → execute
       │    → 先持久保存独立 tool output，再追加 JSONL 结果引用
       │    → 提交 state.db 状态与索引
       │    → [在线压缩开着] 计划边界或贴着窗口：判压不压
@@ -384,21 +372,21 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 
 工具名称和参数来自 provider 原生字段，不从自然语言或代码块推断。完整 assistant 消息与每个工具结果保持调用 ID 配对，这是原生 function calling 的执行方式。[Function calling](https://developers.openai.com/api/docs/guides/function-calling)
 
-**同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走核对梯子（§8.6），顺序由账本钉死；`write`、`edit`、`shell`、`python`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何会停下来的判定（审批 / 核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。"做它"是 `start_call` 及之后的一切：放行（Policy、审批、消费授权）可以先判，执行工具、受理子 Run、派任务、转话都等收尾之后；前面在飞的那条停下来时，屏障还没开始过，原样留在没轮到的那些里。并发上限是执行器自己的预算（默认 4 条）。三条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；遇到审批先收已启动调用的尾，**而且审批行在那之后才落**——它要是比 Run 的挂起早出现一整个批次，操作者答得比 Run 停下还早，那条答复就落进了空窗（§7.4）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
+**同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走核对梯子（§8.6），顺序由账本钉死；`write`、`edit`、`shell`、`python`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何会停下来的判定（核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。"做它"是 `start_call` 及之后的一切：执行工具、受理子 Run、派任务、转话都等收尾之后；前面在飞的那条停下来时，屏障还没开始过，原样留在没轮到的那些里。并发上限是执行器自己的预算（默认 4 条）。两条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
 
-**在线压缩（`[compaction]`，默认关，2026-10-09）。** 移植自 SoL-Pi 的 Online Context Compact，但 loop 是 komo 自己的，所以不需要"中止再补一条隐藏的续跑消息"。判断只在三种时机：一轮的调用**全部收尾之后**这一轮完成了一个计划步骤（`update_plan` 的边界）、日志里还压着一个没用掉的边界（比如边界那一轮随后停在了审批上，续跑的这一段开头再判）、估计的上下文贴着窗口（`context_window − window_reserve_tokens`，字节 / 4 的估计与实报用量取大）。Gateway 按日志重新装配出 provider 正看着的那份视图（投影、衰减之后）估价，`find_cut` 切在一轮的开头、近期至少留 `keep_recent_tokens`，用缓存账（`cache_write_read_ratio`、剩余请求估计、冷却、旧债）决定；不在边界上只为窗口保护压，压完仍贴着窗口就不压。**决定不压时 driver 原样接着跑**——下一次请求与关着压缩时逐字节相同，提示缓存照样命中；边界上不压记一条 `skipped` 把边界用掉。决定压时发一次摘要请求（没有工具，早先那段渲染成一条纯文本用户消息，带当前计划与已完成步骤的进度；系统提示说明里面是数据不是指令），成了记 `compacted` 并把这一段交回 handler（`SegmentOutcome::Recompose`）：同一个 Run、不重新入队、不再写 `run.started`，下一段按日志装配成**任务 → 摘要 → 切点起原样**；失败、截断记 `skipped`（带着那份决策），Run 照常往下，此后窗口压力不再触发重试，直到有真正的工具工作或新的边界。两次压缩之间至少隔一次真正的请求；一次领取里最多重装配 8 次；摘要请求不算轮数，但算进 token 花销，已用的轮数与 token 从下一段的预算里扣掉。
+**在线压缩（`[compaction]`，默认关，2026-10-09）。** 移植自 SoL-Pi 的 Online Context Compact，但 loop 是 komo 自己的，所以不需要"中止再补一条隐藏的续跑消息"。判断只在三种时机：一轮的调用**全部收尾之后**这一轮完成了一个计划步骤（`update_plan` 的边界）、日志里还压着一个没用掉的边界（比如边界那一轮随后停在了等待上，续跑的这一段开头再判）、估计的上下文贴着窗口（`context_window − window_reserve_tokens`，字节 / 4 的估计与实报用量取大）。Gateway 按日志重新装配出 provider 正看着的那份视图（投影、衰减之后）估价，`find_cut` 切在一轮的开头、近期至少留 `keep_recent_tokens`，用缓存账（`cache_write_read_ratio`、剩余请求估计、冷却、旧债）决定；不在边界上只为窗口保护压，压完仍贴着窗口就不压。**决定不压时 driver 原样接着跑**——下一次请求与关着压缩时逐字节相同，提示缓存照样命中；边界上不压记一条 `skipped` 把边界用掉。决定压时发一次摘要请求（没有工具，早先那段渲染成一条纯文本用户消息，带当前计划与已完成步骤的进度；系统提示说明里面是数据不是指令），成了记 `compacted` 并把这一段交回 handler（`SegmentOutcome::Recompose`）：同一个 Run、不重新入队、不再写 `run.started`，下一段按日志装配成**任务 → 摘要 → 切点起原样**；失败、截断记 `skipped`（带着那份决策），Run 照常往下，此后窗口压力不再触发重试，直到有真正的工具工作或新的边界。两次压缩之间至少隔一次真正的请求；一次领取里最多重装配 8 次；摘要请求不算轮数，但算进 token 花销，已用的轮数与 token 从下一段的预算里扣掉。
 
 **衰减共用这个决策点（2026-10-10）。**工具结果换短视图（§8.3）是对前缀的改写，与压缩同一本缓存账，由 `compaction::decide` 一并判断，时机的优先级：**缓存已冷**（距上一次 provider 请求超过 5 分钟，改写不欠债，有资格的全换）> **贴着窗口**（先换短视图，还贴着才压缩）> **计划边界**（压缩开着且账算得过来压缩，否则衰减账算得过来衰减，否则 `skipped`）。其余时候前缀只追加。
 
-不同 Session 可并发，同一 Session 的 Run 顺序执行；等待审批的 Run 保留会话顺序位置，不允许后续 Run 越过它执行。等待运行排到前面时才装配上下文，避免读到过期历史。
+不同 Session 可并发，同一 Session 的 Run 顺序执行；停在等待上（核对、依赖）的 Run 保留会话顺序位置，不允许后续 Run 越过它执行。等待运行排到前面时才装配上下文，避免读到过期历史。
 
 Gateway 设置总轮数、活动执行时限、输出长度和子进程并发预算。等待用户时释放运行名额，保留已消耗预算。
 
 普通工具失败作为结果交给模型修正；模型回复截断或调用参数未收齐时不能开始执行。远端写入结果不明时停止自动重试，转为结果核对。
 
-普通追问可以作为 assistant 回复结束本轮；用户下一条输入开启同一 Session 的新 Run。工具审批则暂停原 Run，待决策后继续原调用，不增加第六个交互工具；决策通常来自聊天渠道（§11）。
+普通追问可以作为 assistant 回复结束本轮；用户下一条输入开启同一 Session 的新 Run。没有工具审批（§7）；只有结果不明的核对与阻塞会暂停原 Run，待操作者回答后继续，不增加交互工具；回答通常来自聊天渠道（§11）。
 
-**系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的审批 / 介入、配置、skills、toolbox、Gateway 都是 komo 自己的状态，问到就用 shell 跑 `komo <子命令>`（给出几个常用子命令，其余看 `komo --help`）。这一段是**常量**，提示前缀因此稳定；`komo` 靠 PATH 找到——服务单元写入了安装时的 PATH（§3），不在提示里另给可执行文件路径。只在主 Agent 且挂了 `shell` 时出现：子代理只拿任务里写的东西（与 skills 目录同理，父侧需要时把命令写进任务）；没给 `shell` 的 Profile 说了也跑不了。起因是一次真实会话：问"当前有哪些 cron job"，模型不知道自己是 komo，先读了同名的共享 skill `cron-scheduler`，再翻 `crontab -l`、`/etc/cron.*`、`launchctl`、`~/.komo`，第 8 轮才跑到 `komo cron list`，9 轮 90 秒。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_its_cli`、`the_komo_section_needs_shell_and_the_main_agent`，golden `full_main_agent`、`plain_main_agent`。
+**系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的介入、配置、skills、toolbox、Gateway 都是 komo 自己的状态，问到就用 shell 跑 `komo <子命令>`（给出几个常用子命令，其余看 `komo --help`）。这一段是**常量**，提示前缀因此稳定；`komo` 靠 PATH 找到——服务单元写入了安装时的 PATH（§3），不在提示里另给可执行文件路径。只在主 Agent 且挂了 `shell` 时出现：子代理只拿任务里写的东西（与 skills 目录同理，父侧需要时把命令写进任务）；没给 `shell` 的 Profile 说了也跑不了。起因是一次真实会话：问"当前有哪些 cron job"，模型不知道自己是 komo，先读了同名的共享 skill `cron-scheduler`，再翻 `crontab -l`、`/etc/cron.*`、`launchctl`、`~/.komo`，第 8 轮才跑到 `komo cron list`，9 轮 90 秒。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_its_cli`、`the_komo_section_needs_shell_and_the_main_agent`，golden `full_main_agent`、`plain_main_agent`。
 
 Run 完成仅表示本轮结束。测试是否通过、性能是否改善、设备是否到达目标状态，都要依据具体执行证据报告。
 
@@ -436,185 +424,69 @@ workspace = "code/komo"
 
 **后台任务。** home session 用它自己的 Agent 跑，不另设分发器身份；要跑很久的事由模型调 `dispatch` 派进一条独立的任务会话（同一个 Agent），结果收尾时作为一条内部输入交回派它的会话、由它转告，见 `docs/background-tasks.md`。
 
-### 6.2 冻结的是身份，不是安全策略
+### 6.2 冻结的是身份
 
-受理一条 Run 时算出 `RunSnapshot` 落进账本：身份指令**正文进 `payloads/`（存内容，不存路径）**——审批可能一小时之后才答复，那时那个文件早被改过——连同 Agent 的 id、Profile 的内容指纹、模型、解析过的目录、这次的能力面与记忆作用域，以及工具结果的投影设置（`[execution]` 的 `model_result_bytes` 与 `decay_*`，§8.3）——刚跑完与回放按同一份渲染，热重载只影响之后受理的 Run；这一格出现之前受理的 Run 没有它，只有它们按当前配置。`[compaction]` 不冻结：每次判断读当前快照，因为回放不重算——决定连同全部中间量记在 `context.compacted` 里。
+受理一条 Run 时算出 `RunSnapshot` 落进账本：身份指令**正文进 `payloads/`（存内容，不存路径）**——一条停在核对上的 Run 可能一小时之后才续跑，那时那个文件早被改过——连同 Agent 的 id、Profile 的内容指纹、模型、解析过的目录、这次的能力面与记忆作用域，以及工具结果的投影设置（`[execution]` 的 `model_result_bytes` 与 `decay_*`，§8.3）——刚跑完与回放按同一份渲染，热重载只影响之后受理的 Run；这一格出现之前受理的 Run 没有它，只有它们按当前配置。`[compaction]` 不冻结：每次判断读当前快照，因为回放不重算——决定连同全部中间量记在 `context.compacted` 里。
 
-于是两句话都成立：**审批等待期间改 Profile，在飞的 Run 不受影响**（它按自己的快照恢复），下一条 Run 用新的一版；而**撤权与 Deny 不冻结**——身份与能力来自快照，"这次调用允不允许"每次执行都按当前 Policy 判（§7）。旧快照不会变成绕过撤权的通行证。
+于是**等待期间改 Profile，在飞的 Run 不受影响**（它按自己的快照恢复），下一条 Run 用新的一版。（2026-10-11 之前这里还有后半句"撤权与 Deny 不冻结，每次执行按当前 Policy 判"；Policy 删掉之后没有要每次重判的东西，§7 那条硬限制由工具在 `prepare` 里判，本来就不进快照。）
 
-## 7. Policy 与审核
+## 7. 执行与介入：没有 Policy
 
-### 7.1 统一决策
+**2026-10-11 删掉了整套 Policy 与审批**：规则表（strict / auto 两套基表、`policy.toml`、`command_patterns` 那张网）、范围授权（本次调用 / 本次 Run / Cron Job）、绑计划哈希的审批与它的状态机、批量答复、`Proof` / `ApprovedPlan` 类型状态，全部不再存在。理由是数据，不是偏好：komo 是单操作者实例，操作者一直跑 `mode = "auto"`（`~/.komo/policy.toml` 一条 `Ask` 都没有）；账本里 152 次审批**全部**落在 2026-09-18 一天（auto 出现之前），148 次批准、4 次拒绝，等待中位 3.2 秒、p90 65 秒——审批没有在判断什么，只是一次按键。而 auto 之下本来就什么都不拦，连写 `state.db` 都放行；删掉之后的行为与当时的 auto 等价，只多一条挪进工具里的硬限制（§7.2）。
 
-```rust
-pub enum PolicyDecision {
-    Allow { reason: String },
-    Ask { reason: String },
-    Deny { reason: String },
-}
-```
+### 7.1 规则：模型要的，komo 就执行
 
-Policy 检查准备好的 ExecutionPlan：来源、操作、工具、代码或命令、参数、真实目标路径、工作目录、版本、凭证引用与已有授权。除工具调用外，Memory 内部变更使用独立 operation_id 和来源引用走同一决策入口；它不是第六个 LLM 工具。LLM 提供的“风险低”或 Python 模块自称“安全”均不构成授权。
+一次调用只过两道，过了就执行：
 
-优先级：
+1. **能力面**（`AgentSurface`，§4）：这次运行的工具集里没有这个名字，执行器不认。
+2. **工具自己的 `prepare`**：参数校验、目标解析、版本检查（覆盖已有文件要对得上版本，`call` 模式只认已启用版本的导出函数）、资源 URI 越界（§4.7）——这些是"这次调用说得通吗"，不是"允不允许"。不过就是一次没有执行过的调用，按 `fail_call` 落账，理由交给模型。
 
-```text
-执行环境不可突破的限制
-  > 明确 Deny
-  > 有效的范围授权
-  > 配置 Allow
-  > 默认 Ask
-```
+没有第三层。委派、派任务、追问、更新计划、MCP 调用、codemode、Memory 内部变更、恢复流程发起的核对调用（`__komo_verify__` 无条件跑，§8.6）都走同一条路。toolbox 启用 / 停用直接生效（§5.4）；cron 命令 Job 不再在 `cron add` 时签授权（§10.1）。
 
-| 操作                                          | 初始策略建议                                                         |
-| --------------------------------------------- | -------------------------------------------------------------------- |
-| 已授权范围内读取普通文件                      | Allow                                                                |
-| 已授权 workspace / artifacts 范围内写入和修改 | Allow，覆盖时检查版本                                                |
-| 访问范围外文件或敏感内容                      | Ask；命中显式禁用规则则 Deny                                         |
-| 修改启用中的 toolbox 或 Python 环境           | Ask，展示具体差异                                                    |
-| 任意 shell / Python code                      | Ask；有匹配的明确执行授权时允许                                      |
-| 恢复流程发起的核对调用（`PlanSource::Verification` + Python call） | Allow；核对只读、绑定已审核的模块版本、由执行器而非模型发起——不放行则默认配置下每次核对都答 Unknown，核对函数等于没有（§8.6） |
-| Python call                                   | 按已审核版本、导出函数、参数与授权范围判断                           |
-| 自动提取记忆与生成索引                        | 在配置的来源、模型端点和记忆范围内 Allow；推断不能自行升级为用户确认 |
-| Memos 的写入、修改或删除                      | 按 Python 模块版本、函数、参数与用户指令范围审核                     |
-| 权限扩大或修改 Policy                         | 通过操作者配置流程处理，不能由模型自行放宽                           |
-| 委派一个子任务（`Operation::Delegate`）       | 按操作者意图：strict 下 Ask（展示任务正文与结果契约），auto 下 Allow。**子代理自己的每一次调用仍各自按上面各行判断**——委派不放宽任何一层。续跑（`resume`，§4）是同一行：审批卡在这次委派的任务正文（这次续跑要接着做的那件事，就是这次 `delegate` 调用的 `task`）之外多写一句"接着子 Run X"，续跑目标进计划、进计划哈希，批的是"接着**这一条**"，换一条就要重新问。**渲染只读得到这次的计划**，不回去查目标那条子 Run 当初的任务正文——那句原话要看，去读那条子 Run 自己的记录（§8.3 的回放窗口） |
-| 派一个新任务（`Operation::Dispatch`）         | strict 与 auto 下都 Allow：它只是建一个独立的**任务会话**并提交第一条输入（`docs/background-tasks.md`），不等它跑完，**任务会话里的每一次调用仍各自按上面各行判断**——不放宽任何一层。幂等键 `dispatch:{run}:{call}` 让重放的同一次调用不会多建一个任务 |
-| 追问一个任务（`Operation::Follow`）           | 同上：strict 与 auto 下都 Allow，只是把一句话提交进一个已有的任务会话；幂等键 `follow:{run}:{call}` |
-| 更新工作计划（`Operation::UpdatePlan`）       | strict 与 auto 下都 Allow：只是模型报一次进度（整份计划只在 `args` 里），不碰文件、进程或外部服务；完成一个先前登记过的步骤是在线压缩的安全点 |
-| 调 MCP 工具（`Operation::McpCall`）           | 操作者在 `[mcp.servers.<name>] read_only` 里声明的：strict 与 auto 下都 Allow，中断后重读；其余：strict 下 Ask（卡片上是服务器、工具与完整参数），auto 下 Allow，中断后停下问人。服务器自报的 `readOnlyHint` 不算数（`docs/mcp.md`） |
-| 沙箱脚本（`Operation::Codemode`）             | strict 与 auto 下都 Allow：脚本自己碰不到外部，里面的每次调用各自过 Policy，只放行只读且直接 Allow 的（要审批的在脚本里抛错）；中断后整段重跑（`docs/codemode.md`） |
-| shell 命令文本匹配 `komo cron add`            | strict 下永远 Ask，且**只能批一次**（`scopes` 固定 `[once]`，不给 Run / Cron 范围）；**任何已有的 Run / Cron 范围授权都不能替这一步作答**——`cron add` 会给命令 Job 自己签发一条执行授权（见下），模型能经 shell 调它给自己写将来能免问的许可，这一条必须每次都问人。auto 基表不变（§7.1「auto 与 strict 的差别就是要不要人看一眼」，这条也不例外） |
-| 改动后接着跑一条命令（`edit` / `write` 的 `then_run`，组合计划） | 两步合并判，取最严（Deny > Ask > Allow）：每一步先过执行环境限制与 Deny 全表扫描，任一步 Deny 即 Deny（理由点名那一步）；绑定**组合计划哈希**的一次性授权盖住两步；否则每一步各自走"范围授权 → 配置 Allow → 配置 Ask → 默认"，理由写成"改动：…；然后运行：…"。范围授权**逐步**匹配，一步的授权替不了另一步。任何一步不放行，两步都不跑 |
+`policy.toml` 不再读：文件还在时 `komo config check` 与 Gateway 启动日志**报一句**"policy.toml 已不再使用，可以删掉"——与 start-only 键同一条规则（§3），报出来，不静默忽略。
 
-**两套建议，操作者选一套。** 上面那张表落成 `RuleTable::initial()`（"strict"）；另一套是
-`RuleTable::auto()`（"auto"）——**不审批**：一条 `Ask` 都不留，agent 一路跑到底，不打断人。
-`policy.toml` 顶层用 `mode` 选基表，文件里的 `[[rules]]` 追加在基表之后；不写 `mode` 时
-文件本身就是整张表（"我全都要自己写"，也是这个键出现之前唯一的行为）。`mode` 与 `default`
-不能同时写：默认结论跟着基表走，两个答案放在一起是矛盾，宁可起不来也不猜。
+### 7.2 唯一的硬限制：不写 komo 自己的状态
 
-```toml
-mode = "auto"          # 或 "strict"；省略 = 下面自己写整张表（这时才写 default）
-```
+`write` / `edit`（含 `then_run` 的改动那一步）在 `prepare` 里拒绝目标落在 komo 自己的状态里：数据目录下的 `sessions/`、`state.db*`、`runtime/`、`.env`。拒绝是 `ToolError::Denied`，结果状态 `denied`，理由点名那条路径并指向 §8.10（会话只有 `komo session delete/purge` 一条删法）。名单由 Gateway 算好经 `ToolContext` 传入，kernel 不读机器路径。
 
-auto 只有两个动作：默认结论 `Allow`，**没有一条 `Ask` 规则**；剩下的唯一一条 `Deny` 是
-`policy-change`（§7.1 第 9 行）。那条不是操作者设的边界，而是设计里那句"模型不能自行放宽
-自己的权限"——今天没有哪个工具产生这个操作，留着是为了那天它出现时不必再想一遍。
+这条留下来的理由：Session 目录是内容权威、`state.db` 是调度权威（§8.2），模型一次手滑改了它们，坏的是 komo 自己的恢复能力——账本与 JSONL 对不上之后，§8.4 那张表只能把会话判成 `blocked`。别的写入坏了是用户的文件，这一类坏了是 komo 自己失忆。
 
-**auto 与 strict 的差别就是"要不要人看一眼"这一件事，别的什么都没动**：范围外的文件、
-toolbox / Python 环境变更、模型发起的模块调用，在 strict 里都要问，在 auto 里都直接放行。
-不审批模式不能只在顺手的命令上成立——名字叫什么就得是什么。
+**它只拦得住 `write` / `edit`。** `shell` 与 `python` 跑的是任意代码，`rm sessions/…`、`sqlite3 state.db` 都在它外面；读也不拦（线上见过一条 WeChat 会话找不到数据时去读 `runtime/gateway.json` 与 `.env`）。这里如实写：这条限制挡的是手滑，不是有意绕过。
 
-**代价必须说清楚：不审批 = 这个进程能做的事，agent 都能做。** 首版没有能约束任意代码的
-执行环境（`confines_arbitrary_code = false`，§7.3），所以 auto 之下 agent 可以读 `.env`、
-`rm -rf`、把数据发出去，一个都不问；§7.3 那句话的另一面正是这一条：**没有沙箱时，"别
-打扰我"和"这里有真正的禁区"不可能同时成立**。所以 auto 是操作者在文件里**显式选择**的，
-不是默认；默认那份 strict 至少让人每一次都看见。
+### 7.3 执行边界：只来自执行环境
 
-**想要一张网，只能自己加规则——并且要知道那只是网。** `Matcher::command_patterns` 是给
-这件事用的：命中形状的规则可以 `deny`（不问、直接不许）或 `ask`（仍然问一下）。匹配是
-**归一后的子串**（连续空白压成一个空格、两边降为小写，所以 `RM   -RF /` 与 `rm -rf /` 是
-同一件事）：
+内置文件工具可以在 Rust 里执行路径与版本限制；任意 shell / Python 代码一旦启动，就有它运行账号的全部操作系统权限，cwd 和参数检查不是进程沙箱。所以**真正的边界只能来自执行环境**，不能来自对命令文本的判断——2026-10-11 之前那张 `command_patterns` 网就是例子：`rm -r -f /`、`find -delete`、变量拼出来的命令全在网外。
 
-```toml
-mode = "auto"
+今天唯一的执行环境边界是 codemode（`docs/codemode.md`）：脚本跑在 macOS Seatbelt / Linux Landlock + seccomp 里，不能写文件、联网、起子进程；脚本里经 `tools.<name>()` 的内层调用只放行 `is_read_only()` 的计划（codemode 自己除外）。沙箱自检不过就不注册这个工具。要给 shell / python 也立边界，路只有一条：把它们放进同类的执行环境，而不是加回规则。
 
-# 想拦住的形状自己写：下面是那三类里最不会误伤的一批（一次手滑就没了 / 把控制权交出去 /
-# 把密钥念进模型上下文），删掉哪条就少拦哪条。
-[[rules]]
-id = "catastrophic-shapes"
-effect = "deny"
-reason = "这几类形状不问你，直接不许"
-scopes = ["once"]
-requires_isolation = false
+### 7.4 旧数据里的审批痕迹
 
-[rules.matcher]
-operations = ["shell_command"]
-command_patterns = [
-  "rm -rf /", "rm -rf ~", "rm -rf *", "--no-preserve-root",  # 递归删除的灾难形状
-  "mkfs", "dd of=/dev/", "shred ", "> /dev/sd",              # 磁盘
-  "sudo ", "chown -r", "chmod -r 777",                        # 提权
-  "| sh", "| bash", "|sh", "|bash",                           # 管道进解释器
-  ".env", "gateway.json", "credentials.json", ".ssh", "id_rsa", "printenv",  # 凭据
-]
-```
+审批删掉了，旧会话与旧库里它留下的东西照样读得出来，只是不再生效：
 
-**它不是边界，别当成边界用。** 形状清单认的是命令文本：`rm -r -f /`、`find -delete`、
-变量拼出来的命令全在网外，真正的边界只有 §7.3 的执行环境。上面那份清单来自线上证据——
-一条 WeChat 会话在找不到数据时去读 `runtime/gateway.json`（里面有 API 的 Bearer token）与
-`.env`——它挡的是手滑，不是有意绕过。
-
-### 7.2 审批对象与范围
-
-审批绑定一份不可变的执行计划，包括 operation_id、来源、关联 Run / ToolCall（如有）、规范化参数、工作目录、目标版本、脚本或模块版本、环境版本及相关资源引用。界面——聊天里的审批消息或 TUI 弹窗——显示具体动作、原因、改动和已有验证结果，渲染见 §11.3。
-
-首版提供：
-
-- 本次调用授权：只批准眼前的执行计划。
-- 本次 Run 的范围授权：例如指定目录的写入，或明确命令模板。
-- Cron Job 授权：绑定 Job 版本、工具或模块版本、参数范围和权限。**命令 Job 在 `cron add`
-  这一刻就由操作者显式请求签发**（§10）：命令直跑模式不经模型，触发时固定跑的就是创建
-  时给定的那一条命令，没有必要每次触发都停下来问同一个问题。匹配器与版本快照从触发时
-  `CommandDriver` 真正驱动出来的那份计划**同一个构造函数**派生（`shell::plan_for`），
-  不手写第二份；Job 改了命令（今天还没有 `cron edit`，只能 remove 重建）就是另一个
-  Job、另一份授权。
-- **一次答一批**：一条 Run 里连着几个命令、几个 Run 各自卡在等待上时，操作者一次答复把**此刻待处理的全部**答了（TUI 的 `a`、聊天与 CLI 的 `/approve all`）。它**不是第四条范围**：名单里的每一条各自落一条决定、各自换一份凭据、各自写一条审计事件——只是把 N 次按键变成一次。名单由发起方列出（"此刻看到的那些"），协议里没有"全部"这个词，服务端不会在答复到达时才决定名单，因而也不会把答复之后新出现的请求一起答掉。**批量的范围固定为本次调用**：范围授权绑的是一份具体的计划（shell 绑整条命令、Python 绑模块与版本），一批互不相干的计划共用一个范围，只能是替操作者猜一个他没看过的答复；他说了范围却被按本次答时，回执必须**说出来**，不静默降级。
-
-**组合计划**（`then_run`）只有一条审批：审批对象是带着第二步的整份计划，绑定的哈希覆盖两步——模型改了命令就是另一份计划，要重新问。范围固定为本次调用：把"改完跑这条命令"批到 Run 或 Cron 范围，等于替以后每一次改动预签了这条命令。两步不靠同一条授权、而是**各凭各的**放行时（例如改动凭配置 Allow、命令凭一条 Run 授权，或两步各有一条范围授权），执行器按**每一步自己的单步计划**消费盖住它的那条范围授权——与单步调用同一个 `Grant::covers`，消费那一刻再核一次有效期与撤销；任何一步那一刻用不了，整份计划重新问人（只给 Once）。用到的每一条都进账本：`tool.started` 的 `grant` 记改动那一步（合并授权时就是那一条），`then_run_grant` 记命令那一步；凭据（`Proof`）也按步装，第二步换出来的那份说得出它自己凭的是哪条。
-
-不把“同意一次 Python”解释为“今后任意脚本均可执行”。审批不覆盖显式 Deny。批准后再次校验目标和版本，变化则重新评估。
-
-### 7.3 执行边界
-
-内置文件工具可以在 Rust 中执行路径与版本限制。任意 shell / Python 代码一旦启动，则具有其运行账号的操作系统权限；cwd 和参数检查不是完整进程沙箱。
-
-因此，首版的人工作用是批准具体代码执行或明确信任范围。若配置要求强制禁止某类文件或网络访问，而当前执行环境无法约束任意代码，Policy 必须拒绝不受约束的 shell / Python，直到提供相应隔离。不能一面声明绝对禁止，一面让脚本任意访问。
-
-已审核模块可按明确版本与参数信任其实现，但模块的权限声明本身不能证明隔离有效。
-
-### 7.4 审批状态与恢复
-
-```text
-Ask
- → 先持久保存待审核计划的 JSONL 引用
- → 审批请求、`waiting + approval` 与审计待写事件在 state.db 事务提交
- → 释放执行名额
- → 投递到 Run 的来源会话与 home chat（§11.4），TUI 同时可见（TUI 的弹窗读的是补写进 JSONL 的 `approval.requested`，补写在请求落库后**立即**触发，§8.5；`run.waiting` 只说"停在审批上"，短 ID 不在这条事件里）
- → 用户在聊天里或 TUI 中批准或拒绝
- → state.db 原子记录决策及审计待写事件
- → 继续前重新校验并消费授权
- → 执行或返回拒绝结果
-```
-
-审批记录保存在数据库。重复回答幂等，已取消或已完成调用不能再次执行。tool.started 先写入 JSONL 并同步，首次授权消费与调用 started 索引随后在同一 state.db 事务内提交；此后进程崩溃可能产生结果未知，不能凭批准记录推断操作已经完成。
-
-审批决定以 state.db 中经过操作者认证的记录为准；JSONL 中的审批事件用于展示与审计，不能自行创建授权。审计待写事件按 8.5 的方式补写。
-
-一次性授权绑定逻辑 ToolCall 和具体计划，重启不清除它。恢复时若确定原动作未发生，或同一操作具备经过验证的幂等重试条件，可在原授权范围内继续；已经消费授权本身不是重试依据。范围、计划、版本或有效期变化才重新审核，审批无需用户因重启再答一次。
-
-拒绝作为明确结果交回模型。后续换一个基础工具仍要检查同一权限目标，不能自动绕过禁止规则。
-
-Cron、交互聊天与 resume 都经过这一条路径。
+- **JSONL**：`approval.*` 事件按未知事件解码——保留 seq，不表示任何东西（§8.3）。`run.waiting` 的 `WaitReason::Approval` 只为解码旧行保留，新代码不产生它。
+- **停在审批上的旧 Run**（`runs.wait_kind = 'approval'`）：Gateway 启动时按"批准"续跑。那次调用是 planned 而没 started，按 §8.4"调用 planned，确定尚未执行 → 自动执行"那一行走，同一条恢复路径、同一个重新入队的状态转换（JSONL → db 顺序照旧），不再看审批行。`needs_a_person()` 对 `Approval` 返回 false，它不进介入清单。
+- **表与列**：`approval_requests` / `policy_grants` 的模型与 DDL 删掉，老库里的两张表留着没人读，`ensure_schema` 不管多出来的表；`runs.grants` 永远写 `"[]"`，`deliveries.approval_id` 永远 NULL（退役列照写空值，§8.2）。
+- **投递**：`deliveries.outbound` 里 `kind = approval_request | approval_settled` 的旧行当作已作废跳过，`control_outbox` 里旧的 `approval.*` 审计行照原样补写或丢弃——**不能让一条旧行卡死补发循环**。
+- `ToolError::Denied` 保留：§7.2 与 codemode 还在用，落账时是一条 `failed` 结果（`ToolResultStatus` 只有 completed / failed / uncertain，从来没有 denied）。
 
 ### 7.5 Intervention：一切"需要人判断"的同一个入口
 
-审批只是"需要人判断"的一种。§8.4 / §8.6 还会产出另外两类：**结果不明**（副作用可能已经发生、没有可靠恢复方式）与**阻塞**（引用损坏、无法确认旧执行已结束、会话内容与账本对不上）。今天它们是三套互不相干的出口——审批有短 ID、有清单、有四个界面；结果不明只有一条事件与一句投递；而"上一次执行没收尾"在 `resume` 里被直接续跑。操作者因此会撞上最难解释的现象：**会话停着不动，而 `komo approval list` 是空的**。
+§8.4 / §8.6 会产出两类只有人能回答的问题：**结果不明**（副作用可能已经发生、没有可靠恢复方式）与**阻塞**（引用损坏、无法确认旧执行已结束、会话内容与账本对不上）。它们曾经各走各的出口——结果不明只有一条事件与一句投递，"上一次执行没收尾"在 `resume` 里被直接续跑；操作者因此会撞上最难解释的现象：**会话停着不动，而待处理清单是空的**。（2026-10-11 之前这里还有第三类 `approval`，随审批一起删掉。）
 
 统一成一个概念：**Intervention = 一条未完成的 Run 停在某个只有人能回答的问题上**。
 
 | 种类 | 它从哪里派生（权威） | 句柄 | 问题 | 可答的结论 |
 |---|---|---|---|---|
-| `approval` | `approval_requests` 里待处理的那一行（§7.4） | 短 ID（待处理集合内唯一，§11.3） | 这份执行计划放不放行 | `approve` / `reject`，范围按 §7.2 三种 |
 | `verify` | `tool_calls` 里那条 `uncertain` 的调用（§8.6） | Run ID | 上次那个调用**到底发生没有** | `satisfied` / `not_performed` / `abandon` |
 | `blocked` | 其余 `waiting + intervention` 的 Run（§8.4） | Run ID | 前提没了：引用损坏、旧执行者未确认、会话不可服务 | `resolve` / `abandon` |
 
 三条约束把这个清单钉死：
 
-1. **清单是派生视图，不是第四张表。** 权威仍是 `runs` 与 `approval_requests`；`GET /v1/interventions` 是这两张表的并集查询，`kind` 由"有没有一条 uncertain 调用"当场判出。多一张 `interventions` 表等于多一处会与权威漂移的状态，而这次改造的全部理由就是不要那个（§8.9）。**子代理（§4）的审批因此自动出现在同一张清单里**：子 Run 与它的调用本来就在这两张表里，"谁派的"不是清单该关心的维度——操作者批的是那一次具体的动作。
-2. **挡着会话的每一条都必须在清单里，而且与"后面领不走"是同一次判定。** §8.4 的"未完成"是四个非终态；其中**停在人身上的**（`waiting + approval`、`waiting + intervention`）必须逐条出现，且由同一个谓词回答"这条 Run 现在挡不挡队"——就是 `WaitReason::needs_a_person()` 与那段 `earlier` 子查询。两处判定分家就会出现"卡住但清单为空"。`waiting + retry`（等时钟）与 `waiting + dependency`（等另一条 Run）不进清单：**它们不是在等人**，但仍然挡着同 Session 后面的 Run——唯一的例外是父 Run 正等着它派出去了的那条子 Run，那条必须能跑，否则父子互等（§4）。
-3. **结论只走一条路：核对 → 按 §8.4 行事，没有"我说它发生了"。** `satisfied` 给那次调用补一条"核对后目标已满足"的结果，原 Run 继续；`not_performed` 把那次调用标成"确定没执行"再入队（一次性授权因此按 §7.4 的原范围重放，而不是拿"已消费"当重试许可）；`resolve` 不强行放行，它只要求**重新观察并重新决策**一次；`abandon` 是终态取消。没有"我确认副作用已发生"这种结论——操作者可能看错，账本一旦这么记就再也纠不回来。
+1. **清单是派生视图，不是另一张表。** 权威仍是 `runs` 与 `tool_calls`；`GET /v1/interventions` 是对它们的查询，`kind` 由"有没有一条 uncertain 调用"当场判出。多一张 `interventions` 表等于多一处会与权威漂移的状态（§8.9）。**子代理（§4）的介入因此自动出现在同一张清单里**：子 Run 与它的调用本来就在这些表里，"谁派的"不是清单该关心的维度。
+2. **挡着会话的每一条都必须在清单里，而且与"后面领不走"是同一次判定。** §8.4 的"未完成"是四个非终态；其中**停在人身上的**（`waiting + intervention`）必须逐条出现，且由同一个谓词回答"这条 Run 现在挡不挡队"——就是 `WaitReason::needs_a_person()` 与那段 `earlier` 子查询。两处判定分家就会出现"卡住但清单为空"。`waiting + retry`（等时钟）与 `waiting + dependency`（等另一条 Run）不进清单：**它们不是在等人**，但仍然挡着同 Session 后面的 Run——唯一的例外是父 Run 正等着它派出去了的那条子 Run，那条必须能跑，否则父子互等（§4）。旧的 `waiting + approval` 不在等人，按 §7.4 续跑。
+3. **结论只走一条路：核对 → 按 §8.4 行事，没有"我说它发生了"。** `satisfied` 给那次调用补一条"核对后目标已满足"的结果，原 Run 继续；`not_performed` 把那次调用标成"确定没执行"再入队，按原计划重放；`resolve` 不强行放行，它只要求**重新观察并重新决策**一次；`abandon` 是终态取消。没有"我确认副作用已发生"这种结论——操作者可能看错，账本一旦这么记就再也纠不回来。
 
-出口有四个，语义相同：`komo intervention list | show | answer`、TUI 的待处理清单、聊天里的 `/pending` 与 `/answer`（§11.3）、`GET|POST /v1/interventions`。投递沿用 §11.4 那一条：**没有界面在看这个会话时进 home chat**——那是任务在问，不是在报告（§10）。批量答复不新增一套语义，沿用 §7.2 的"名单由发起方列出"。
+出口有四个，语义相同：`komo intervention list | show | answer`、TUI 的待处理清单、聊天里的 `/pending` 与 `/answer`（§11.3）、`GET|POST /v1/interventions`。一次答一条，没有批量答复。投递沿用 §11.4 那一条：**没有界面在看这个会话时进 home chat**——那是任务在问，不是在报告（§10）。
 
 ## 8. 通用 Session 存储与自动恢复
 
@@ -630,18 +502,18 @@ Cron、交互聊天与 resume 都经过这一条路径。
 
 本节的“任务完成”是 Run 已有明确终态，不能根据最后一条助手消息猜测。长期 Memory、任务摘要和模型生成的计划均不能代替执行账本。
 
-**三者的权威都在 state.db，Session 目录是内容。** Run 的状态、队列与授权在数据库里，`sessions/{id}/` 里放的是消息、计划、输出与产物（§8.2）。这个分工的唯一后果是：**目录与数据库对不上时，以数据库为准，并且必须有人把对不上的那一半处置掉**——这就是 §8.9 的 reconcile，它取代"发现不一致就报损坏然后卡住"。Session 自身也只是一个可以被关掉、被逻辑删除、被回收的对象（§8.10），不是只能追加的。
+**三者的权威都在 state.db，Session 目录是内容。** Run 的状态与队列在数据库里，`sessions/{id}/` 里放的是消息、计划、输出与产物（§8.2）。这个分工的唯一后果是：**目录与数据库对不上时，以数据库为准，并且必须有人把对不上的那一半处置掉**——这就是 §8.9 的 reconcile，它取代"发现不一致就报损坏然后卡住"。Session 自身也只是一个可以被关掉、被逻辑删除、被回收的对象（§8.10），不是只能追加的。
 
 ### 8.2 存储分工
 
-**每个 Session 的内容集中保存在 sessions/{session_id}/ 下。** JSONL 记录调用、状态、引用和预览；大参数、大模型回复、完整结果、stdout / stderr 分别保存在该目录的子目录中。state.db 维护调度状态、索引与授权，JSONL 与数据库都不重复保存完整 tool output。
+**每个 Session 的内容集中保存在 sessions/{session_id}/ 下。** JSONL 记录调用、状态、引用和预览；大参数、大模型回复、完整结果、stdout / stderr 分别保存在该目录的子目录中。state.db 维护调度状态与索引，JSONL 与数据库都不重复保存完整 tool output。
 
 | 保存位置                                                           | 内容                                                                         | 权威来源与恢复方式                                             |
 | ------------------------------------------------------------------ | ---------------------------------------------------------------------------- | -------------------------------------------------------------- |
 | sessions/{session_id}/events.jsonl                                 | 消息、调用与准备计划、开始 / 结束事件、参数和输出引用、摘要与完成事件        | **内容**的权威来源（事件顺序与调用关系）；完整内容通过引用读取。**状态与生命周期不在这里**——那是 state.db |
 | sessions/{session_id}/payloads/                                    | 超限的模型消息或执行计划正文，包含大参数                                     | JSONL 保留引用与内容哈希；同一参数不再另存重复全文             |
 | sessions/{session_id}/tool-output/{run_id}/{call_id}/{attempt_id}/ | output.json，以及按需保存的 stdout.txt / stderr.txt                          | 每次执行的完整工具输出，包含错误详情；按尝试独立、完成后不可变 |
-| state.db（Turso，MVCC）                                           | Session 生命周期、Run 元数据、任务队列、领取代次、工具状态与引用、审批、投递记录、Cron、Memory | **生命周期、调度与授权的唯一权威**；执行内容索引与派生状态可从 JSONL 补齐（§8.9） |
+| state.db（Turso，MVCC）                                           | Session 生命周期、Run 元数据、任务队列、领取代次、工具状态与引用、投递记录、Cron、Memory | **生命周期与调度的唯一权威**；执行内容索引与派生状态可从 JSONL 补齐（§8.9） |
 | sessions/{session_id}/artifacts/{run_id}/                          | 工具生成的二进制文件、脚本快照与报告                                         | 独立产物，按 Run 分目录；正文里以 `artifact://files/<run>/<名字>` 给出引用（§4.7）；不重复复制到 tool-output |
 
 state.db 中的主要表：
@@ -649,16 +521,14 @@ state.db 中的主要表：
 | 表                          | 主要内容                                                                                                                           |
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
 | sessions                    | 标题、来源、工作目录、当前 Run、**生命周期状态与状态变更时刻**（§8.10）、JSONL 路径、applied_seq 和已应用字节位置                     |
-| runs                        | 请求键与输入哈希、输入 / 最终结果事件引用、状态、来源与身份、授权引用、预算、有效期、领取代次、重试时间、配置快照、Memory 处理游标 |
+| runs                        | 请求键与输入哈希、输入 / 最终结果事件引用、状态、来源与身份、预算、有效期、领取代次、重试时间、配置快照、Memory 处理游标 |
 | session_log_index           | event_id、Session seq、Run、事件类型、文件偏移、记录长度和完整性摘要；不存正文                                                     |
 | tool_calls                  | 逻辑调用 ID、参数 / 计划 / 结果事件引用、计划哈希、恢复方式、外部幂等键和状态                                                      |
 | tool_attempts               | 调用 ID、尝试序号、执行实例、进程身份、状态、时间与事件引用                                                                        |
 | checkpoints                 | 已覆盖的 seq、JSONL 字节位置、格式版本、上下文与记忆版本引用、执行游标                                                             |
-| approval_requests           | 短 ID（待处理集合内唯一）、计划引用与哈希、操作者决策、有效范围与消费状态                                                          |
-| policy_grants               | 有范围、来源、版本及有效条件的授权                                                                                                 |
 | control_outbox              | state.db 控制事务产生、尚待补写到 JSONL 的审计事件                                                                                   |
 | deliveries                  | 主动投递记录：目标、内容引用、pending / sent / deferred（§11.4）                                                                   |
-| cron_jobs                   | 定时任务定义、版本与授权                                                                                                           |
+| cron_jobs                   | 定时任务定义与版本                                                                                                                 |
 | cron_firings                | 唯一触发记录、不可变触发快照及 Session / Run 引用                                                                                  |
 | memory_items                | 自动记忆内容、作用域、确认状态、生命周期、revision 与时间信息                                                                      |
 | memory_evidence             | 来源事件或外部记录引用、提取与确认依据                                                                                             |
@@ -666,9 +536,11 @@ state.db 中的主要表：
 | memory_vectors              | f32 BLOB + 维度 + 代次，可重建                                                                                                     |
 | memory_index_generations    | 向量空间指纹、构建状态、进度与生效代次                                                                                             |
 
-control_outbox 只保存控制事件，例如审批请求和回答，不复制消息或工具结果。它和队列表都在同一个 state.db 中，不增加外部消息服务。
+control_outbox 只保存控制事件，例如会话生命周期的 `session.closing` / `deleted` / `purged`，不复制消息或工具结果。它和队列表都在同一个 state.db 中，不增加外部消息服务。
 
-**state.db 是 Turso，MVCC 模式，通过 toasty 访问。** 文件同步和数据库提交各自有持久化边界，不能称为跨文件原子事务；但两边都是真的落盘。**Turso 0.7.2 已核实（2026-09-16）：MVCC 与 WAL 两条提交路径都在提交内 fsync——MVCC fsync 逻辑日志 `state.db-log`，WAL fsync `state.db-wal`——同步档位是每连接状态，默认 `SyncMode::Full`（比 SQLite 在 WAL 下默认 NORMAL 更严），`PRAGMA synchronous` 可设可读回（`turso_core` 的 `mvcc/database/mod.rs:3107` / `storage/pager.rs:4297` / `translate/pragma.rs:647,1548`；strace 与 `synchronous=OFF` 对照实验见 `.scratch/komo-v08-rewrite/spikes/store.md`）。因此原先预备的「outbox 补写到 JSONL 后才确认已批准」这道保护不启用**：审批决定一经数据库提交即已落盘，客户端可以立刻得到确认，outbox 只承担审计补写与顺序，不承担耐久性。内容权威仍然是 Session 目录，每一步先 `sync_all` 再往下走，state.db 是调度与授权的权威。
+**2026-10-11 退役的表与列**（§7.4）：`approval_requests` 与 `policy_grants` 不再有模型与 DDL，老库里的两张表留着没人读；`runs.grants` 留在模型里、永远写 `"[]"`；`deliveries.approval_id` 留着、永远 NULL。
+
+**state.db 是 Turso，MVCC 模式，通过 toasty 访问。** 文件同步和数据库提交各自有持久化边界，不能称为跨文件原子事务；但两边都是真的落盘。**Turso 0.7.2 已核实（2026-09-16）：MVCC 与 WAL 两条提交路径都在提交内 fsync——MVCC fsync 逻辑日志 `state.db-log`，WAL fsync `state.db-wal`——同步档位是每连接状态，默认 `SyncMode::Full`（比 SQLite 在 WAL 下默认 NORMAL 更严），`PRAGMA synchronous` 可设可读回（`turso_core` 的 `mvcc/database/mod.rs:3107` / `storage/pager.rs:4297` / `translate/pragma.rs:647,1548`；strace 与 `synchronous=OFF` 对照实验见 `.scratch/komo-v08-rewrite/spikes/store.md`）。因此原先预备的「outbox 补写到 JSONL 后才确认」这道保护不启用**：控制决定一经数据库提交即已落盘，客户端可以立刻得到确认，outbox 只承担审计补写与顺序，不承担耐久性。内容权威仍然是 Session 目录，每一步先 `sync_all` 再往下走，state.db 是调度的权威。
 
 两条随之而来的运维事实：① `state.db-log` / `state.db-wal` 与 `state.db` 同等重要，备份和清理不能只拷主文件；② Turso 默认 `data_sync_retry = false`，此时 fsync **出错是 `panic!` 而不是返回 `Err`**（`storage/pager.rs:4330`）。Gateway 在 `Db::connect` 里显式 `PRAGMA data_sync_retry = 1`，把「磁盘写失败」变成一个可以进 `waiting + intervention` 的错误，而不是一个把整个进程带走的 panic。
 
@@ -683,15 +555,15 @@ control_outbox 只保存控制事件，例如审批请求和回答，不复制�
 | 每个 db 文件由进程独占锁定 | Gateway 是唯一打开 state.db 的进程，CLI 与 TUI 永远走 HTTP（§3） |
 | `turso` 的 `mimalloc` 特性是全局分配器 | 工作区只能有一个 turso 版本，且与 `toasty-driver-turso` 的 pin 同 major；其他 crate 不得声明 `#[global_allocator]`。工作区把 turso 写成 `default-features = false, features = ["mimalloc"]`，关掉 `fts`（§13.4） |
 | toasty `push_schema` 只对新文件执行，且不幂等 | 见下面的 schema 演进 |
-| 提交在 Turso 上确实 fsync（MVCC 写 `state.db-log`，WAL 写 `state.db-wal`），默认 `synchronous=FULL` | 审批决定提交即持久，不需要 outbox-先-确认；`state.db-log` 与主库同等重要；连接建立时设 `data_sync_retry=1`，让 fsync 错误可报告而非 panic |
+| 提交在 Turso 上确实 fsync（MVCC 写 `state.db-log`，WAL 写 `state.db-wal`），默认 `synchronous=FULL` | 控制决定（当时是审批，2026-10-11 删除）提交即持久，不需要 outbox-先-确认；`state.db-log` 与主库同等重要；连接建立时设 `data_sync_retry=1`，让 fsync 错误可报告而非 panic |
 
-Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_TABLE_DDL` 常量；`Db::connect` 对已存在的文件逐表 `CREATE TABLE IF NOT EXISTS`、逐列 `ALTER TABLE ADD COLUMN`，对新文件让 toasty 建表。**这一趟补列必须在连接池建起来之前、用一条普通（非 MVCC）连接做完**（实测 2026-09-20：MVCC 连接上的 `ALTER TABLE` 返回 `Ok`、日志照打，重开即无——旧库升级会静静地起不来）；建池之后 `ensure_schema` 只做核对，文件库缺列就**报错**，内存库才由它补。同一个坑还有一条：turso 的读游标拖着一条读事务，**同一条连接上"边读边改"会 panic**在 `SetCookie`，所以那趟迁移是"先读清、丢掉连接、只用一条只写连接改"。一个测试对每张表断言 toasty 为空库生成的 DDL 与常量**字节相等**——模型改了列却没改常量，测试挂。新列必须 `NOT NULL DEFAULT …` 或可空；退役的列继续写空值，不删。耐久表（`sessions`、`runs`、`approval_requests`、`policy_grants`、`cron_jobs`、`cron_firings`、`memory_items`、`memory_evidence`、`deliveries`）只允许加法变更——`sessions` 与 `runs` 也在这里，因为生命周期与队列从内容里长不出来：目录没了还能从数据库说清"它曾经是什么"，反过来不成立（§8.10）；可重建表（`session_log_index`、`tool_calls`、`tool_attempts`、`checkpoints`、`memory_terms`、`memory_vectors`、`memory_index_generations`）按行或按代次从 JSONL / 原文重建，从不删文件——一个文件里同时住着耐久表，"删掉重来"不存在。
+Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_TABLE_DDL` 常量；`Db::connect` 对已存在的文件逐表 `CREATE TABLE IF NOT EXISTS`、逐列 `ALTER TABLE ADD COLUMN`，对新文件让 toasty 建表。**这一趟补列必须在连接池建起来之前、用一条普通（非 MVCC）连接做完**（实测 2026-09-20：MVCC 连接上的 `ALTER TABLE` 返回 `Ok`、日志照打，重开即无——旧库升级会静静地起不来）；建池之后 `ensure_schema` 只做核对，文件库缺列就**报错**，内存库才由它补。同一个坑还有一条：turso 的读游标拖着一条读事务，**同一条连接上"边读边改"会 panic**在 `SetCookie`，所以那趟迁移是"先读清、丢掉连接、只用一条只写连接改"。一个测试对每张表断言 toasty 为空库生成的 DDL 与常量**字节相等**——模型改了列却没改常量，测试挂。新列必须 `NOT NULL DEFAULT …` 或可空；退役的列继续写空值，不删。耐久表（`sessions`、`runs`、`cron_jobs`、`cron_firings`、`memory_items`、`memory_evidence`、`deliveries`）只允许加法变更——`sessions` 与 `runs` 也在这里，因为生命周期与队列从内容里长不出来：目录没了还能从数据库说清"它曾经是什么"，反过来不成立（§8.10）；可重建表（`session_log_index`、`tool_calls`、`tool_attempts`、`checkpoints`、`memory_terms`、`memory_vectors`、`memory_index_generations`）按行或按代次从 JSONL / 原文重建，从不删文件——一个文件里同时住着耐久表，"删掉重来"不存在。
 
 ### 8.3 JSONL 格式、写入与读取
 
 首版每个 Session 目录下一个 events.jsonl，payloads、tool-output 和 artifacts 均位于旁边的子目录。UTF-8 编码，每条事件占一个物理行；内容中的换行由 JSON 序列化转义，禁止多行美化输出。Komo 要求每条完整记录以换行结束，便于识别写到一半的末尾。[JSON Lines 格式](https://jsonlines.org/)
 
-每行包括 v、seq、event_id、session_id、run_id、at、type 和 data。涉及工具时带 Runtime call_id 和 attempt_id，并保留 provider call_id 与轮次。seq 在 Session 内按追加顺序严格递增；event_id 标识一次逻辑事件，重复提交同一 ID 必须幂等，内容不同则报错。控制审计补写保留原始发生时间和操作引用，不凭日志行相邻推断审批关系。
+每行包括 v、seq、event_id、session_id、run_id、at、type 和 data。涉及工具时带 Runtime call_id 和 attempt_id，并保留 provider call_id 与轮次。seq 在 Session 内按追加顺序严格递增；event_id 标识一次逻辑事件，重复提交同一 ID 必须幂等，内容不同则报错。控制审计补写保留原始发生时间和操作引用，不凭日志行相邻推断控制关系。
 
 以下是简化的调用片段；输出正文不在事件中，示例省略引用大小和哈希，实际准备计划还包含资源版本、代码快照和权限引用：
 
@@ -707,7 +579,7 @@ Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_T
 
 stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内存里积累完整输出。进程结束并收齐输出后，同步并完成文件，再原子写入 output.json；最后才能发布 JSONL 结果引用。因中断只留下的 .partial 文件可以用于诊断，不能当作完成结果。
 
-读取历史或恢复调用时按引用加载需要的内容；组装模型上下文仍遵守输出预算，超限时提供截断提示和可读取的完整文件引用。**这里有两个预算，不是一个**：`tool.result` 那 ≤1 KiB 是**账本的行预算**（每条 JSONL 行都要小），交给模型多少由 `[execution] model_result_bytes` 说了算（§6），完整正文落在 `output.json` 里。模型看到的正文由**一处纯函数**投影出来（`komo-kernel` 的 `projection`）：抬头（工具、状态、耗时、stdout / stderr 大小）+ 头尾各留一段**整行**并写明省了多少（整行留不到预算一半时——比如一整行 JSON——退到字符边界） + 可直接 `read` 的**引用**（`artifact://<run>/<call>/<attempt>/stdout`，§4.7）。从前这里印的是绝对路径；改成 URI 之后，「超限的正文在哪」与「允许读哪个逻辑资源」是同一句话。因此**刚跑完的那一次与重启之后回放必须逐字节相同**——投影只吃落盘的事实（事件 + `output.json`），不掺任何只活在内存里的东西。那条路径必须真能读：**当前 Session 获授权的输出（`tool-output/`、`artifacts/`）是一段只读根**，`read` 得到它、写它一律 Deny（§8.10 第 4 条），不开放普通工具修改这些记录。shell / python 的输出预览是**开头 3 KiB + 结尾 4 KiB，中间写明省略字节数**（两段加起来装得进 8 KiB 的模型正文预算，投影不再二次截断）；早先只留最后 4 KiB 时，模型为看开头多跑了两轮 `read artifact://`。摘要或预览不能代替恢复所需的原始参数与结果。
+读取历史或恢复调用时按引用加载需要的内容；组装模型上下文仍遵守输出预算，超限时提供截断提示和可读取的完整文件引用。**这里有两个预算，不是一个**：`tool.result` 那 ≤1 KiB 是**账本的行预算**（每条 JSONL 行都要小），交给模型多少由 `[execution] model_result_bytes` 说了算（§6），完整正文落在 `output.json` 里。模型看到的正文由**一处纯函数**投影出来（`komo-kernel` 的 `projection`）：抬头（工具、状态、耗时、stdout / stderr 大小）+ 头尾各留一段**整行**并写明省了多少（整行留不到预算一半时——比如一整行 JSON——退到字符边界） + 可直接 `read` 的**引用**（`artifact://<run>/<call>/<attempt>/stdout`，§4.7）。从前这里印的是绝对路径；改成 URI 之后，「超限的正文在哪」与「允许读哪个逻辑资源」是同一句话。因此**刚跑完的那一次与重启之后回放必须逐字节相同**——投影只吃落盘的事实（事件 + `output.json`），不掺任何只活在内存里的东西。那条路径必须真能读：**当前 Session 的输出（`tool-output/`、`artifacts/`）是一段只读根**，`read` 得到它、`write` / `edit` 写它一律拒绝（§7.2），不开放普通工具修改这些记录。shell / python 的输出预览是**开头 3 KiB + 结尾 4 KiB，中间写明省略字节数**（两段加起来装得进 8 KiB 的模型正文预算，投影不再二次截断）；早先只留最后 4 KiB 时，模型为看开头多跑了两轮 `read artifact://`。摘要或预览不能代替恢复所需的原始参数与结果。
 
 **大结果的视图按请求选（衰减，2026-10-10 改为缓存优先）**：同一份事实投影出两个视图——full 与更短的 decayed（抬头 + 首尾各留一段**整行** + **总是**给出那条可 `read` 的完整输出引用；正文不带"给过几次"之类的数字，换不换由日志里的决定说了算）。**前缀默认只追加。**换短视图是对前缀的改写：被改处之后的提示缓存整段失效、按写价重写。2026-10-09 的首版照 SoL-Pi ObservationPack 按次数各自到期各自换，实测（2026-10-10，会话 01a12475-3ec2-71e3-a787-a527ab549d9a，magpie Responses 后端、claude-opus-5-5）10 轮的 run 里 `cache_read` 四次退回 13317（只剩系统提示 + 工具表），全价输入 85k（约 53k 是失效重写），折算成本与 Claude Code 持平，尽管上下文只有它的 1/3。算账：替换省下的是"完整 − 短视图"按读价算的 token，代价是被改处之后整段按写价重写，写读比 12.5，回本要几十次后续请求，短任务永远亏。SoL-Pi 的 ObservationPack 本身不算缓存账（它的测评是长任务），它的缓存账只在 Online Context Compact 里——所以 komo 把衰减并进那本账。**资格**（沿用 SoL-Pi，`projection::decay_eligible`）：成功、full 超过 `[execution] decay_threshold_bytes`、短视图至少省 1 KiB、且已完整给过 `decay_full_sends` 次（这条 Run 在它之后记了几条 `message.assistant`）；失败与结果不明的结果**从不衰减**——那是模型要对着改的正文。**资格不等于换。****换不换只在三种时机判断，与在线压缩是同一个决策点（`compaction::decide`）、同一本缓存账，一次换一批（所有有资格的），一次改写只失效一次**：①**缓存已冷**——距这个会话上一次 provider 请求超过提示缓存存活期 5 分钟（等审批、resume、cron 接续）：改写不欠债，有资格的全换，reason `cache_cold`（Claude Code microcompact 的做法）；②**贴着窗口**——不看账，先换短视图（不用模型请求，比压缩便宜），还贴着才压缩；③**计划边界**——压缩开着且账算得过来就压缩，否则衰减的账算得过来就衰减，否则 `skipped`。其余时候一个字节都不改；短任务没有计划、估不出剩余请求，就从不改写。**改写代价按后端算**：Anthropic Messages 有显式断点（driver 在被改消息前补一个），代价 = 从最早被改那条消息到末尾；Responses / Chat Completions / 代理是自动前缀缓存，按全部消息算（实测 magpie Responses 退回到系统提示）。估高只会少换，符合缓存优先。**决定记成追加事件**：`context.compacted` 的 `outcome: "decayed"`（`calls`、`decision`、`debt`）；fold 把 `calls` 累进 `RunView.decayed`，**回放按这个集合选视图**（`projection::select`），不再按次数数——刚跑完与回放仍逐字节相同，因为决定是记下来的、不是重算的。缓存债与冷却同压缩共用（`OnlineState::record_decay`）。**活的 loop**：planner 返回 `Reshape::Decay` 时先落账、再把短视图经 `RoundInput::ToolResults.revised` 交给驱动按 `provider_call_id` 就地换；段开头的冷缓存衰减由 Gateway 在装配前落账，装配时回放自然给短视图。
 
@@ -715,7 +587,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 
 实现约束：
 
-- Gateway 对每个 Session 使用一个串行写入器，模型、工具、审批审计与 Memory 来源标记均经过它，不能各自追加导致行内容交错。
+- Gateway 对每个 Session 使用一个串行写入器，模型、工具、控制审计与 Memory 来源标记均经过它，不能各自追加导致行内容交错。
 - 完整记录写入后清空用户态缓冲，再同步文件；同步失败就停止该步骤，不能执行后续副作用或向客户端确认持久完成。新建文件和目录还要处理目录持久化。Rust 的 File::sync_all 提供文件同步接口，关闭文件不等于已验证同步成功。[Rust File](https://doc.rust-lang.org/std/fs/struct.File.html#method.sync_all)
 - 完整模型回复和该轮调用计划保持为一个逻辑 assistant 事件：正文小则内联，大则引用已经完整持久化的 payload 文件，避免只恢复出半轮调用。工具输出先独立持久化，再一次提交对应结果事件，不按流式 token 写 JSONL。
 - 正常修改只追加新事件；纠正、取消和摘要覆盖关系通过新记录表达，不重写旧行。
@@ -724,17 +596,17 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 - **回放给模型的是"这一段对话"，不是"这一条 Run"**：最新一个 `conversation.boundary` 之后的消息按 Run 分组、Run 之间先来后到；**正在跑的那条 Run 带完整协议**（`provider_blocks`、工具调用与结果），**历史 Run 只发布两件事——用户说了什么（`run.accepted`）、它最后答了什么**。三条理由：① 历史那半轮在取消 / 失败时合法地停在"有调用、没结果"上（§8.4），照搬进新请求就是 provider 400；② 几十轮工具往返会随对话长度线性涨上下文，而对"接着聊"没有增量；③ 子代理跑过的那几轮不属于父的对话，父的窗口里没有它的过程，子代理也拿不到父的历史（§4）。**子代理的"这一段对话"就是它那条线**（§4 的 `resumes` 链）：顺着 `resumes` 往回找到的那几条子 Run 加上正在跑的这条，规则与主对话一字不差——正在跑的带完整协议，线上更早的那几条只发布任务正文与最后的回答（`failed` 的那条没有最后回答，就只剩任务正文，外加一句它怎么结束的）。续跑因此不会把上一次停在半轮的调用带进新请求，而过程细节要的时候按引用 `read` 回来（`tool-output/` 是只读根）。线是从 JSONL 里 fold 出来的（`run.accepted.delegate.resumes`），不查 state.db：它决定模型看见什么，属于内容权威（§8.2）。还没被领走的 Run 整个不进（§8.4 的不越过）。**上一轮说的话因此必须还在**：少了它，"去查一下"指的是哪件事就只能靠猜。正文超限外置时按引用读回来——少读一次，模型看到的就是一条空的 user 消息，而它该看到的是原话。
 - Memory 的证据引用使用 Session ID + event_id / seq，稳定定位原始消息或工具结果。
 - **读事件不得创建或修改内容。** `Ledger::read` 与 `session_log::read_events` 是只读路径：文件不在就返回空（新会话本来就没有日志，`GET /v1/sessions/{id}/events` 依赖这一点），**绝不 `create`**。写路径（受理、`conversation.boundary`、挂起、终态）才建目录与文件。少了这条界线，"内容被删掉"会被一次读**静默地补成一个空日志**——于是 §8.9 的观察永远看不到它本该报出来的那件事（线上冒烟抓过一次：对账读会话就把目录建回来了）。
-- JSONL、state.db 和引用产物均为 Gateway 的受保护状态；普通工具不能通过 write / edit / shell / python 直接修改。回放只能接受 Gateway 写入的合法记录，不能把模型生成的 JSON 当作执行事实或授权。
+- JSONL、state.db 和引用产物均为 Gateway 的受保护状态；`write` / `edit` 拒绝修改它们（§7.2）；shell / python 拦不住，§8.9 的 reconcile 把改坏的那一半报出来。回放只能接受 Gateway 写入的合法记录，不能把模型生成的 JSON 当作执行事实。
 
 尾部恢复时，先校验数据库已经引用的记录和检查点，再处理尚未应用的后续记录。只有末尾不完整、且不被已提交引用覆盖的行，才能先隔离保留原始字节再截断；完整有效行不能因为索引落后被删除。文件中间损坏、已提交范围缺失或哈希不匹配时停止受影响会话的自动执行，不能跳过坏行或退回旧检查点继续。
 
-未知事件保留原始内容与序号；影响执行、权限或调用配对的未知版本必须暂停恢复并要求兼容版本，不能按无关日志忽略。
+未知事件保留原始内容与序号；影响执行或调用配对的未知版本必须暂停恢复并要求兼容版本，不能按无关日志忽略。2026-10-11 退役的 `approval.requested` / `approval.decided` 等审批事件不在此列：它们是已知的**退役**类型，按未知事件解码、保留 seq、不表示任何东西，也不暂停恢复（§7.4）——那些会话照常加载与续聊。
 
 ### 8.4 重启后的默认行为
 
-**Gateway 自动接续能够确定恢复位置的任务。用户只处理审批、时效或结果不明等确实需要判断的情况。**
+**Gateway 自动接续能够确定恢复位置的任务。用户只处理时效、结果不明或阻塞等确实需要判断的情况。**
 
-**状态回答"能不能跑"，`WaitReason` 回答"为什么不能跑"。** 这两件事分开，是因为它们混在一起时的症状正是"排队二十分钟不知道在等什么"：一个 `waiting_approval`、一个 `needs_attention`，都答不出在等谁、等到什么时候。所以状态只有八个，等什么有四类：
+**状态回答"能不能跑"，`WaitReason` 回答"为什么不能跑"。** 这两件事分开，是因为它们混在一起时的症状正是"排队二十分钟不知道在等什么"：一个 `waiting_approval`、一个 `needs_attention`，都答不出在等谁、等到什么时候。所以状态只有八个，等什么有三类（外加一个只为解码旧行保留的 `approval`）：
 
 | 状态 | 含义 | 可领取 |
 |---|---|---|
@@ -746,7 +618,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 
 | `WaitReason` | 在等什么 | 谁放它出来 | 进 §7.5 清单 |
 |---|---|---|---|
-| `approval` | 一份执行计划的答复（§7.4） | 操作者答复；答复仍有效时自动接续 | 是 |
+| `approval` | **2026-10-11 起不再产生**，只为解码旧行（§7.4） | Gateway 启动时按"批准"续跑 | 否 |
 | `retry` | 一次有界退避到点（`attempts` / `not_before` / `cause`） | 时钟：`wake_at <= now` | 否——不是在等人 |
 | `intervention` | 一条 Intervention 的答复（§7.5：结果不明、前提没了） | 操作者答复 | 是 |
 | `dependency` | **另一条 Run** 进终态：同 Session 里更早的那条输入（本节的次序规则），或者是它派出去的那条子 Run（§4 的委派） | 那条 Run 进终态，reconcile 把它放回 `queued` | 否——不是在等人 |
@@ -764,10 +636,10 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 | 正在请求 LLM，完整回复尚未保存 | 丢弃未完成输出，以已保存上下文重新请求；可能再次产生模型费用 |
 | assistant 回复和调用计划已保存 | 沿用原计划，从未完成的 ToolCall 继续 |
 | JSONL 已有结果引用且完整输出校验通过，state.db 可能落后 | 先补齐结果索引和状态，复用原输出，不重放动作 |
-| 调用 planned，确定尚未执行 | 校验原计划与当前权限后自动执行 |
-| 调用有结果、**没有 started**（一次没执行过的调用：工具名不认识、参数准备不出来、放行被拒） | 按已有结果收口，不重跑；回放时把那条 `tool.started` 缺席的尝试行补上（`fail_call` 写下的就是它） |
+| 调用 planned，确定尚未执行 | 校验原计划（`prepare` 那一层）后自动执行 |
+| 调用有结果、**没有 started**（一次没执行过的调用：工具名不认识、参数准备不出来、`prepare` 拒绝） | 按已有结果收口，不重跑；回放时把那条 `tool.started` 缺席的尝试行补上（`fail_call` 写下的就是它） |
 | 调用 started，没有结果 | 先核对外部效果，按 §8.6 决定是否安全继续；带 `then_run` 的组合调用**一律** uncertain、交给人（§8.6） |
-| `waiting + approval` | 保留原请求；已答复且仍有效的批准自动接续 |
+| `waiting + approval`（2026-10-11 之前的旧 Run） | 按"批准"续跑：那次调用 planned 而没 started，走"调用 planned，确定尚未执行"那一行，同一个重新入队的状态转换，不看审批行（§7.4） |
 | `waiting + retry` | 沿用已保存的次数与到点时刻，到点再尝试 |
 | `waiting + intervention` | **原样保留**：它是清单里的一条，等操作者答复——恢复扫描不替人答，也不偷偷往下跑 |
 | `waiting + dependency` | 原样保留；谁放它出来由 reconcile 判（它等的那条 Run 进终态 → 回 `queued`） |
@@ -802,7 +674,7 @@ Run（状态 × 理由）:
                   ▼
                 queued
 
-WaitReason: approval · retry{attempts, not_before, cause} · intervention · dependency{run}
+WaitReason: retry{attempts, not_before, cause} · intervention · dependency{run}   （approval 只解码旧行）
 
 ToolCall:
 planned → started → completed / failed
@@ -814,9 +686,9 @@ active → closing → deleted → purged
 
 **四个终态各自是什么**：`completed` 正常结束；`failed` 有明确错误；`cancelled` 用户明确取消（不自动复活）；`abandoned` 是**操作者在清单上放弃**——与取消分开记："不是用户不想跑了，而是这件事不会再有下文了"，事后统计要分得开。
 
-**同一 Session 后面的 Run 不越过前面的**：前一条没进终态时，后一条是 `waiting + dependency` 而不是 `queued`——它写得出在等谁，而不是一句"排队中"。**判"谁在前"用的是输入事件的 `seq`**（§8.3：seq 在 Session 内按追加顺序严格递增），不是 Run ID 的字典序：UUIDv7 同一毫秒内的低位是随机的，拿它当先后会把两条几乎同时到达的输入排反，而次序判错意味着后一条会越过前一条（provider 400 的来源）。这条次序在三个地方用同一份判据：受理那一刻（写 `queued` 还是 `waiting + dependency`）、`due` 的候选、`claim` 的守卫。**停在人身上的那两类（`approval`、`intervention`）逐条出现在 §7.5 的清单里，而且"挡住队列"与"进清单"是同一个判定**——两处分家就会出现"卡住但清单为空"。
+**同一 Session 后面的 Run 不越过前面的**：前一条没进终态时，后一条是 `waiting + dependency` 而不是 `queued`——它写得出在等谁，而不是一句"排队中"。**判"谁在前"用的是输入事件的 `seq`**（§8.3：seq 在 Session 内按追加顺序严格递增），不是 Run ID 的字典序：UUIDv7 同一毫秒内的低位是随机的，拿它当先后会把两条几乎同时到达的输入排反，而次序判错意味着后一条会越过前一条（provider 400 的来源）。这条次序在三个地方用同一份判据：受理那一刻（写 `queued` 还是 `waiting + dependency`）、`due` 的候选、`claim` 的守卫。**停在人身上的那一类（`intervention`）逐条出现在 §7.5 的清单里，而且"挡住队列"与"进清单"是同一个判定**——两处分家就会出现"卡住但清单为空"。
 
-用户明确取消的 Run 不自动复活；普通错误达到重试或执行预算后进入 `failed`。Gateway 关闭或系统重启属于中断，**不等于用户取消**，也不再留一个叫 `interrupted` 的状态：领取权交还之后，那条 Run 由 reconcile 当场判成 `queued`（安全）或 `waiting + intervention`（副作用不明）。已经授权执行但有时间限制的动作，先检查有效期；过期不能按旧指令直接产生新的外部影响。
+用户明确取消的 Run 不自动复活；普通错误达到重试或执行预算后进入 `failed`。Gateway 关闭或系统重启属于中断，**不等于用户取消**，也不再留一个叫 `interrupted` 的状态：领取权交还之后，那条 Run 由 reconcile 当场判成 `queued`（安全）或 `waiting + intervention`（副作用不明）。有时间限制的动作，先检查有效期；过期不能按旧指令直接产生新的外部影响。
 
 ### 8.5 JSONL 与 state.db 的写入顺序
 
@@ -836,9 +708,9 @@ active → closing → deleted → purged
   → state.db 事务建立该轮 planned 调用与事件索引
 
 执行一个调用
-  → 校验计划、代码、权限与资源当前状态
+  → 校验计划、代码与资源当前状态
   → 需要外置的准备计划先持久保存，再将计划引用与 tool.started 追加到 JSONL 并同步
-  → state.db 事务提交 started、执行尝试、事件索引和首次授权消费
+  → state.db 事务提交 started、执行尝试与事件索引
   → 确认文件与数据库两步都完成后，才执行真实动作
   → 持久保存 stdout / stderr（如有）、结果正文和 output.json，完成文件与目录同步
   → JSONL 追加只含元信息与 output_ref 的 tool.result 并同步
@@ -855,19 +727,19 @@ active → closing → deleted → purged
 
 恢复先处理已同步但未索引的 JSONL 尾部，再判断任务是否需要执行。例如 tool.result 已经完整持久保存且引用输出校验通过、数据库仍显示 started，必须先补齐为已有结果，不能直接按 uncertain 重试。若结果引用存在但对应输出缺失或哈希不符，停止受影响任务，不能重跑来掩盖数据损坏。输出文件已写完但 tool.result 尚未提交时，只有完整校验文件内的调用身份、计划、完成状态与内容后才能补记结果；仅凭路径存在不足以宣告成功。
 
-回放只补索引与派生执行状态，不调用工具、不发送外部请求、不消费授权，也不能覆盖 state.db 已记录的用户取消或权限撤销。tool.started 本身不能证明已产生副作用或已经通过授权消费；缺少 tool.result 的调用仍进入核对流程。
+回放只补索引与派生执行状态，不调用工具、不发送外部请求，也不能覆盖 state.db 已记录的用户取消。tool.started 本身不能证明已产生副作用；缺少 tool.result 的调用仍进入核对流程。
 
-审批等控制操作的权威在 state.db，采用相反方向的审计补写：
+会话生命周期等控制操作的权威在 state.db，采用相反方向的审计补写：
 
 ```text
-state.db 事务提交审批决定与 control_outbox（固定 event_id）
+state.db 事务提交控制决定与 control_outbox（固定 event_id）
   → Session 写入器将审计事件追加到 JSONL 并同步
   → state.db 标记 outbox 已交付并更新日志索引
 ```
 
-重启后重发同一 outbox 事件先按 event_id 去重，已写入就复用原事件位置。审批生效不依赖审计补写成功；客户端恢复时可直接查询数据库中的原决定。JSONL 中的审计副本无法反向生成新的授权，outbox 也不承载完整工具结果。
+重启后重发同一 outbox 事件先按 event_id 去重，已写入就复用原事件位置。控制决定生效不依赖审计补写成功；客户端恢复时可直接查询数据库中的原决定。JSONL 中的审计副本无法反向生成状态，outbox 也不承载完整工具结果。旧库里残留的 `approval.*` 审计行照原样补写或丢弃，不能卡住补写器（§7.4）。
 
-**补写由写入触发，周期只是兜底。** 上面那三步是顺序，不是节拍：`control_outbox` 一有新行就叫醒补写器（请求那条在 Run 停在待审批上时叫，回答那条在决定入队后叫），否则"随后补写"会变成"最多晚一分钟补写"。**这一分钟是看得见的**：界面（TUI 的审批弹窗、任何按 SSE 待处理帧走的东西）等的正是 `approval.requested`——`run.waiting` 只说"停在审批上"，短 ID 在补写的那一条身上；同理，别的界面知道一条请求已经答过也要靠 `approval.decided`。周期（60s）留着兜底：漏叫的、别处写进去的，一拍之内照样补上。
+**补写由写入触发，周期只是兜底。** 上面那三步是顺序，不是节拍：`control_outbox` 一有新行就叫醒补写器，否则"随后补写"会变成"最多晚一分钟补写"——**这一分钟是看得见的**（当时的实例是 TUI 的审批弹窗等 `approval.requested` 补写进来才弹，审批 2026-10-11 删除，道理照旧）。周期（60s）留着兜底：漏叫的、别处写进去的，一拍之内照样补上。
 
 完整模型块、工具调用 ID、原始参数、结果和 provider 回放所需字段通过 JSONL 及其引用文件完整保留。未完成的流式模型输出没有执行权限；只有完整计划持久保存且执行前置状态已提交后才能调用工具。
 
@@ -883,7 +755,7 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 | ---------------- | ------------------------------------------------------------------------ |
 | 可安全重做的读取 | 例如普通文件读取；记录这次重新读取的实际时间和结果，不冒充重启前的观察   |
 | 支持外部幂等键   | 外部接口确实保证去重；所有尝试复用同一逻辑操作的键和参数，核对键的有效期 |
-| 可以核对目标状态 | 使用审核过的核对逻辑，返回已达到目标、确定未执行 / 可重试、冲突或未知    |
+| 可以核对目标状态 | 使用绑定版本的核对逻辑，返回已达到目标、确定未执行 / 可重试、冲突或未知    |
 | 无可靠恢复方式   | 停在 `waiting + intervention`；不自动从头执行整个脚本                    |
 
 文件 write / edit 可记录修改前后内容哈希与目标身份。若恢复时目标已是预期内容，则记录“核对后目标已满足”；仍是原内容且其他前提成立，可重新执行同一原子修改；出现第三种内容则视为冲突。不能把文件已存在当作写入成功，也不能编造丢失的 stdout 或原始返回值。
@@ -892,7 +764,7 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 
 **委派用"可以核对目标状态"那一行，而它的核对对象是我们自己的账本。** 一条 `delegate` 调用的结果不在别处，就在它派出去的那条子 Run 的终态里（`Ledger::run_end`）：子 Run 正常结束 → 那次调用按已完成收尾，结果交给父 Run（有契约时按**父侧计划里那份**契约复验，与子代理自己用的是同一份校验器）；子 Run 失败 / 取消 / 放弃 → 按失败收尾，理由里写明它怎么结束的；子 Run 还没有终态 → 继续等。**这里不会出现"结果不明"**：副作用发生过没有，是我们账本里的一条事实，不是对外部世界的猜测——那张表把这种情形与"任意 shell 命令"分开的用意正在于此。子 Run 自己是普通 Run，它的恢复照 §8.4 逐行走。续跑（§4）不改这一段：父侧核对的永远是**这次调用派出去的那一条**，线上更早的几条早已各自收过尾，不再看它们。
 
-已保存的 Python 模块可提供与版本绑定的核对函数，由执行器通过同一 python 执行机制调用；核对本身仍经过 Policy。它不增加第六个模型工具。代码、依赖、参数以及核对逻辑都必须对应已审核的执行计划，模块自称幂等不构成证明。
+已保存的 Python 模块可提供与版本绑定的核对函数，由执行器通过同一 python 执行机制调用；核对函数（`__komo_verify__`）无条件跑，它是执行器发起的、只读的、绑定原计划里那个模块版本（2026-10-11 之前要先过 Policy 那一行放行，§7）。它不增加第六个模型工具。代码、依赖、参数以及核对逻辑都必须对应原执行计划，模块自称幂等不构成证明。
 
 典型情况：
 
@@ -909,7 +781,8 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 取得实例锁，校验数据库与协议版本
   → 创建本次启动身份（旧的 running 从此都算"别人的"）
   → 校验受影响 Session 的 JSONL，修复未索引尾部和派生状态
-  → 补写控制审计 outbox，核对尚未接收完整的输入
+  → 补写控制审计 outbox（旧的 `approval.*` 行不卡住，§7.4），核对尚未接收完整的输入
+  → 2026-10-11 之前停在审批上的旧 Run 按"批准"放回队列（§7.4）
   → **回收没有主人的 running**：交还领取权（不改状态），再按 §8.4 判成 queued 或 waiting
   → 放掉到点的 retry、放掉依赖已终态的 dependency
   → 检查旧子进程与未完成调用
@@ -921,7 +794,7 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 
 **就绪（HTTP 监听起、发现文件有效）之后**才做两件不影响调度事实的事：渠道起来后按平台补发它名下积压的投递，以及启动时那一次整体补发（§11.4）。两件都在后台，就绪不等它们——它们是网络 I/O，积压多少就等多久；顺序上唯一的硬要求是**渠道登记之后**（§3）。
 
-启动扫描就是 §8.9 的对账，它和 Cron、审批回调和手动 resume 共用同一个领取入口。领取通过数据库条件更新与递增代次保证同一 Run 只被一个执行者接管；旧代次不能继续提交新状态。单实例使用进程锁与数据库事务即可，不引入跨机器选主或分布式队列。
+启动扫描就是 §8.9 的对账，它和 Cron、介入答复和手动 resume 共用同一个领取入口。领取通过数据库条件更新与递增代次保证同一 Run 只被一个执行者接管；旧代次不能继续提交新状态。单实例使用进程锁与数据库事务即可，不引入跨机器选主或分布式队列。
 
 领取就是下面这条语句，`rows affected == 1` 是接管成功，`== 0` 是别人先到（表名 / 列名以 store 的模型为准）：
 
@@ -993,19 +866,19 @@ JSONL 追加和状态提交都校验领取代次。领取代次只防止旧执�
 
 异常退出可能遗留子进程，不能仅凭一个 PID 判断是否为原进程；结合平台监督信息、启动身份和进程启动时间核对。无法确认旧执行已结束时，阻止该任务重复启动并显示原因。Tokio 的 Child handle 被丢弃并不默认终止进程，因此 kill_on_drop 不能取代异常退出和进程树回收方案。[Tokio process](https://docs.rs/tokio/latest/tokio/process/index.html)
 
-长脚本要拆成多个可观察的工具步骤，或由已审核脚本保存阶段进度。首版恢复到工具调用边界，不恢复 Python 内存、调用栈或某一行。脚本只有“进度标记”而没有副作用核对，仍不足以保证安全续跑。
+长脚本要拆成多个可观察的工具步骤，或由已启用的 toolbox 脚本保存阶段进度。首版恢复到工具调用边界，不恢复 Python 内存、调用栈或某一行。脚本只有“进度标记”而没有副作用核对，仍不足以保证安全续跑。
 
 ### 8.8 恢复所需的上下文与用户体验
 
-未完成 Run 引用的 Session 目录及其 JSONL、payloads、tool-output、产物，还有外部工作目录、代码与环境快照、审批和配置，都不可被普通清理策略删除，**也不许直接 `rm`**：删除只有 `komo session delete` / `purge` 一条路，走 §8.10 的状态阶梯。tool-output 不作为临时日志按天直接清扫；已结束会话清理时也先处理恢复、Memory 和审计引用，显式清理后不得将缺失输出伪装成仍可回放。目录丢失、脚本版本不可用、权限被撤销或模型协议不再可回放时，保存具体原因并等待处理，不能换到另一个目录或新版脚本自动重来；**目录丢了而 Session 状态不是 `purged`，是"数据库与内容对不上"的一种，由 reconcile 报出来（§8.9）**，不是让下一次运行对着空上下文说话。
+未完成 Run 引用的 Session 目录及其 JSONL、payloads、tool-output、产物，还有外部工作目录、代码与环境快照和配置，都不可被普通清理策略删除，**也不许直接 `rm`**：删除只有 `komo session delete` / `purge` 一条路，走 §8.10 的状态阶梯。tool-output 不作为临时日志按天直接清扫；已结束会话清理时也先处理恢复、Memory 和审计引用，显式清理后不得将缺失输出伪装成仍可回放。目录丢失、脚本版本不可用、权限被撤销或模型协议不再可回放时，保存具体原因并等待处理，不能换到另一个目录或新版脚本自动重来；**目录丢了而 Session 状态不是 `purged`，是"数据库与内容对不上"的一种，由 reconcile 报出来（§8.9）**，不是让下一次运行对着空上下文说话。
 
 原始请求来源与操作者身份也要保存。Cron 恢复后仍是 Cron，不能因为重启后由本机 Gateway 发起，就取得交互操作者的额外权限。Memory 的过期、遗忘和版本检查照常进行。
 
-CLI 不承担恢复调度。打开 komo 时可以看到“2 个任务已接续，1 个等待审批”——**真有事才说这一句**，没有未完成的任务是默认情况，不占一行（同理，补读了几条事件不用报：正在补读状态行上说过了，读完屏幕上就是那段历史本身）；komo resume SESSION_ID 连接到原任务，多个客户端同时连接不会开启多个执行。自动恢复无需再次询问是否继续，只有新增权限、过期动作、冲突或无法核实的效果才打断用户。
+CLI 不承担恢复调度。打开 komo 时可以看到“2 个任务已接续，1 个等你核对”——**真有事才说这一句**，没有未完成的任务是默认情况，不占一行（同理，补读了几条事件不用报：正在补读状态行上说过了，读完屏幕上就是那段历史本身）；komo resume SESSION_ID 连接到原任务，多个客户端同时连接不会开启多个执行。自动恢复无需再次询问是否继续，只有过期动作、冲突或无法核实的效果才打断用户。
 
-**退出 TUI 就是暂停（`Ctrl-C`）**：Run 留在 Gateway 里照跑，退出时印出 `komo resume <会话>`——会话 Id 平时只在开场那条横幅上闪过一次（裸 `komo` 那条路上会话还没铸出来，由第一条消息之后的一条提示补上），退出这一刻正是需要它的时刻。暂停在任何界面状态下都有效，审批弹窗开着也一样（弹窗里的 `Esc` 是拒绝，不是退出）。一个字没发就退出时还没有会话，什么都不印。
+**退出 TUI 就是暂停（`Ctrl-C`）**：Run 留在 Gateway 里照跑，退出时印出 `komo resume <会话>`——会话 Id 平时只在开场那条横幅上闪过一次（裸 `komo` 那条路上会话还没铸出来，由第一条消息之后的一条提示补上），退出这一刻正是需要它的时刻。暂停在任何界面状态下都有效，模型菜单开着也一样（菜单里的 `Esc` 是关掉菜单，不是退出）。一个字没发就退出时还没有会话，什么都不印。
 
-SSE 从已同步且索引完成的 JSONL 事件补读；审批当前状态可直接查询 state.db，不依赖用户一直在线。之后接入 Telegram 等主动推送渠道时，应为待发送结果持久保存投递记录，不能为补发一条结果消息重跑任务。
+SSE 从已同步且索引完成的 JSONL 事件补读；介入当前状态可直接查询 state.db，不依赖用户一直在线。之后接入 Telegram 等主动推送渠道时，应为待发送结果持久保存投递记录，不能为补发一条结果消息重跑任务。
 
 用户处理 uncertain 时，应先看到原操作、已有证据和待确认事项。如果决定终止，则补齐明确的取消 / 未知结果；若允许继续，也不能伪造原调用成功。任何后续模型请求都保持完整的调用与结果配对。
 
@@ -1021,7 +894,7 @@ reconcile 是一次**只读观察 + 只写状态**的对账，它回答三个问
 | 这条 `running` 的 Run，它的 `claimed_by` 还活着吗（租约没过期，或过期了但持有者确已结束）？ | 不是 → 按 §8.7 **只交还领取权**（状态仍是 `running`、没有主人 = 一个可查询的孤儿），再由 §8.4 决定续跑还是核对 |
 | 这条停在等待上的 Run，条件满足了吗？ | `retry` 到点了 → 放回 `queued`；`dependency` 的前一条进终态了 → 放回 `queued`；都还没 → 原样不动 |
 
-**它永远不做四件事**：不调用工具、不发送外部请求、不消费授权、不改写任何内容——§8.5 对回放的限定原样适用。它写下的每一条状态都走正向顺序（先 JSONL 后数据库，或纯数据库的状态提交），并且幂等：同一批输入跑十遍与跑一遍结果相同。
+**它永远不做三件事**：不调用工具、不发送外部请求、不改写任何内容——§8.5 对回放的限定原样适用。它写下的每一条状态都走正向顺序（先 JSONL 后数据库，或纯数据库的状态提交），并且幂等：同一批输入跑十遍与跑一遍结果相同。
 
 **本进程自己领着的 Run 不进这一趟**：`claimed_by` 是当前实例（实例身份每次启动新生成）的行，要么正在本进程手里跑，要么 handler 已经不在；后者先由上表第二问按租约与存活判定交还领取权、再判。对"上一个执行实例停了吗"它只能答"没停"，拿它去判会把一条刚领走、handler 还没开跑的 Run 停成 `blocked`。
 
@@ -1044,10 +917,10 @@ Session 不是只能追加的对象。删掉一个会话今天等于 `rm -rf ses
 
 四条规则：
 
-1. **状态权威是 `sessions.state` 一列**（`ALTER TABLE ADD COLUMN`、`NOT NULL DEFAULT 'active'`，§8.2 只允许加列），外加一个"状态变更时刻"。JSONL 里追加 `session.closing` / `session.deleted` / `session.purged` 作为**审计副本**——与审批同向（§8.5 的反向补写）：数据库先提交，事件随后补写；读事件**不产生状态**。
+1. **状态权威是 `sessions.state` 一列**（`ALTER TABLE ADD COLUMN`、`NOT NULL DEFAULT 'active'`，§8.2 只允许加列），外加一个"状态变更时刻"。JSONL 里追加 `session.closing` / `session.deleted` / `session.purged` 作为**审计副本**——走 §8.5 的反向补写：数据库先提交，事件随后补写；读事件**不产生状态**。
 2. **`closing → deleted` 是 reconcile 的判定，不是时钟**：只有这个 Session 再没有非终态 Run 时才推进。在那之前它一直是 `closing`，而"还有谁没跑完"正好是 §7.5 清单答得出的。操作者要立刻走完，`komo session delete --now` 把未完成的 Run 全部按 `abandon` 处置（各写一条明确的取消），再进 `deleted`。
 3. **`purged` 之前先算引用，而且状态先落、内容后删。** `memory_evidence` 指向这个 Session 事件的行、`checkpoints`、`deliveries` 里未送出的行、`cron_firings` 的 Session 引用都要先处置——停用无法再验证的记忆条目、把投递标成终止——然后：**数据库先提交 `purged` 这个墓碑，再删内容**，最后对账把"标了 `purged` 而内容还在"的会话收尾（幂等，删一半被杀也不会留下说不清的状态，因为 `purged` 已经声明了"这个目录要没了"）。**删不掉就说清楚，不假装成功**（§8.8 的原话照旧）；引用检查不过就 409 并列出要先处置什么。`purged` 之后 `jsonl_path` 这类列保留原值，但那个目录不该再被创建或读取：任何试图往 `purged` 会话写内容的路径都是 bug，不是"重新开始"。
-4. **禁止直接 `rm`。** 三层：命令层——删除只有一条路（`komo session delete` / `purge`），没有"手工删目录"这条经验路径；Policy 层——默认规则里工具对数据目录（`sessions/`、`state.db*`、`runtime/`、`.env`）的写入是 `Deny`，shell 的灾难形状由 §7.1 的 `command_patterns` 再兜一层（**那是手滑网，不是墙**，§7.3 已经说过它认不出变量拼出来的命令）；reconcile 层——真正的保证在这里：目录没了而状态不是 `purged`，对账会把它**报出来**，而不是等下一轮模型对着空上下文说话。
+4. **禁止直接 `rm`。** 三层：命令层——删除只有一条路（`komo session delete` / `purge`），没有"手工删目录"这条经验路径；工具层——`write` / `edit` 拒绝写数据目录下的 `sessions/`、`state.db*`、`runtime/`、`.env`（§7.2，komo 唯一的硬限制），shell / python 拦不住（2026-10-11 之前还有一层 `command_patterns` 手滑网，随 Policy 删掉，§7.3）；reconcile 层——真正的保证在这里：目录没了而状态不是 `purged`，对账会把它**报出来**，而不是等下一轮模型对着空上下文说话。
 
 ## 9. Memory：自动积累、可信来源与混合检索
 
@@ -1055,7 +928,7 @@ Session 不是只能追加的对象。删掉一个会话今天等于 `rm -rf ses
 
 | 内容                               | 保存位置                                      | 使用方式                                                  |
 | ---------------------------------- | --------------------------------------------- | --------------------------------------------------------- |
-| 用户主动要求保存的笔记、想法和记录 | 现有 Memos                                    | 通过已审核的 toolbox.memos 保存、搜索和读取，返回原文链接 |
+| 用户主动要求保存的笔记、想法和记录 | 现有 Memos                                    | 通过已启用的 toolbox.memos 保存、搜索和读取，返回原文链接 |
 | 自动积累的偏好、项目事实和执行经验 | 本机 state.db 的 memory_items / memory_evidence | MemoryManager 提取、校验、召回、更新和遗忘                |
 | 本次任务的工作状态                 | Session / Run / ToolCall                      | 用于上下文与 resume，不自动等同于长期事实                 |
 | 关键词与向量索引                   | 同一个 state.db                                 | 从有效记忆重建，不能取代原文与来源                        |
@@ -1099,7 +972,7 @@ run.completed 在 JSONL 持久保存后，state.db 提交终态与 memory_work =
   → 后台领取该 Run 尚未处理的新证据
   → 记忆模型提取结构化候选，不提供执行工具
   → Rust 校验来源角色、引用位置、作用域与内容
-  → 准备内部 Memory 变更计划并检查 Policy
+  → 准备内部 Memory 变更计划
   → 按来源游标与预期 revision 事务提交
   → 标记相关索引待更新
   → 后台生成向量，确认版本未变后入库
@@ -1109,7 +982,7 @@ runs 中记录 pending / processing / done / error 与处理游标。进程崩�
 
 提取来源限定为新发生的用户陈述和可验证工具结果；已有记忆注入、助手摘要、模型生成报告和维护任务自己的输出不算新的独立证据。取消、失败或结果未知的动作不能整理成成功经验。Cron 只在任务授予的范围内积累有证据的事实和经验，不能从自己的报告推断用户偏好。
 
-自动整理不保存原始密钥、令牌或无关敏感输出。HA 当前开关状态等易变信息应在执行前实时查询，不当作长期设备事实。发送给记忆模型或向量端点的文本仍受来源与端点授权约束，不因“内部维护”自动绕过 Policy。
+自动整理不保存原始密钥、令牌或无关敏感输出。HA 当前开关状态等易变信息应在执行前实时查询，不当作长期设备事实。发送给记忆模型或向量端点的文本仍受配置的来源与端点约束。
 
 ### 9.4 关键词与向量混合检索
 
@@ -1182,17 +1055,17 @@ komo memory confirm / forget 携带预期 revision。confirm 必须来自受信�
 
 forget 立即停用内容，并使关键词、向量缓存与检查点中的引用失效。保留最小排除标记，阻止同一来源被后台重提取；后来出现相同主张也先进入候选，不能自动恢复为有效记忆。
 
-遗忘自动 Memory 不等于删除 Session 原文或 Memos 笔记。原对话仍可能出现在用户主动恢复的历史中，界面必须说明遗忘范围；删除原始记录另行按 Policy 操作。
+遗忘自动 Memory 不等于删除 Session 原文或 Memos 笔记。原对话仍可能出现在用户主动恢复的历史中，界面必须说明遗忘范围；删除原始记录另行操作（会话走 §8.10）。
 
 ### 9.7 与 resume 和权限的关系
 
 模型请求与检查点保存记忆 ID / revision 和检索配置版本；resume 重新核对当前状态、有效期与来源，过期检查点不能恢复已经遗忘的记忆。历史请求保留当时用了哪些条目的审计证据，但新请求只重新激活当前允许的版本。
 
-Memory 内容以带来源的数据进入上下文，不能成为系统指令、Policy 授权或自我更新工具的依据。“用户偏好自动执行”这样的记忆也不能替代有效审批。
+Memory 内容以带来源的数据进入上下文，不能成为系统指令或自我更新工具的依据。
 
 ## 10. Cron
 
-Cron Scheduler 只负责产生 Run，复用 AgentLoop、Policy、工具和存储。
+Cron Scheduler 只负责产生 Run，复用 AgentLoop、工具和存储。
 
 ```text
 发现到期
@@ -1203,7 +1076,7 @@ Cron Scheduler 只负责产生 Run，复用 AgentLoop、Policy、工具和存储
  → 更新本次触发状态
 ```
 
-每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 及版本化授权。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；Run 停在任一待处理 Intervention（审批、结果不明、阻塞，§7.5）上时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体模块版本及授权。
+每个 Job 包含名称、五字段 cron 表达式、时区、prompt、工作目录、enabled、执行预算、重叠策略、`notify` 与版本。`notify` 三档 `always`（默认）/ `on_error` / `never` **只过滤结果的投递**；Run 停在任一待处理 Intervention（结果不明、阻塞，§7.5）上时三档都投 home chat——那是任务在问，不是在报告，一条没人看见的提问等于这个 Job 从此停在那里。每次触发是一条带状态的记录（`queued` / `running` / `ok` / `error` / `waiting` / `skipped`），重叠跳过与错过太久（超过 Job 自己的间隔）都留一条 `skipped`，`@at` 一次性永不过期。可指定该 Job 的主模型与 effort；覆盖按完整模型配置解析，不能影响记忆整理或向量模型。下面示例所需的搜索与 Memos 操作仍须匹配具体的已启用模块版本。
 
 ```bash
 komo cron add --name morning-summary \
@@ -1218,17 +1091,16 @@ komo cron resume JOB_ID
 komo cron remove JOB_ID
 ```
 
-模型需要管理 Cron 时通过 shell 调用这些命令；CLI 连接 Gateway，不直接访问数据库，也不增加专用 cron tool。修改调度属于持久副作用，执行计划展示完整调度与指令，并经过 Policy。
+模型需要管理 Cron 时通过 shell 调用这些命令；CLI 连接 Gateway，不直接访问数据库，也不增加专用 cron tool。修改调度属于持久副作用，执行计划展示完整调度与指令。
 
 默认行为：
 
 - 唯一键 `job_id + scheduled_at_utc` 防止同一计划时间重复创建运行。
-- 同一 Job 上一次仍未结束（含等待审批、重试或结果核对）时，跳过本次并记录原因。
+- 同一 Job 上一次仍未结束（含等待重试或结果核对）时，跳过本次并记录原因。
 - Gateway 停机期间错过的触发不集中补跑；停机前已经持久创建、尚未完成的 Cron Run 则按原 Run 自动恢复，这是两种不同情况。
 - 时区明确保存（IANA 名，`TimeZone` 只存名字）；同一日历时间因夏令时出现两次时，两次不同 UTC 时刻分别视为计划时间；不存在的本地时间跳过。**这两条与 croner 的内建策略相反**（它把缺口里的固定时刻抬到缺口之后、把重复的只算较早一次），所以由 kernel 的 `cron::search_from`（跳缺口）和 `cron::repeated_twin`（补后一半）自己实现，换 croner 版本时要一起看。时区解析走 `ZoneResolver` port（§13.5）：kernel 不带 tzdb，真 tzdb 实现在 runtime；没有 tzdb 时 `FixedOffsetZone` 是**明确的降级**（答不出重复与缺口，等于当这个区没有夏令时），不是默认。
 - 手动 run 使用独立请求幂等键，不冒充定时触发。
-- 新增危险操作暂停等待审批，不能因无人值守而自动放行。
-- Job、模块或权限发生变化时重新匹配授权。
+- 无人值守不改变执行规则：Cron Run 与交互 Run 一样，没有 Policy 与审批（§7）；需要人判断的只有结果不明与阻塞，照常投 home chat。
 - Cron 的结果去原 Session 查看，也可以用 resume 接手。
 
 ### 10.1 命令直跑模式：`command` 与 `prompt` 二选一
@@ -1253,9 +1125,9 @@ komo cron list   # 命令 Job 那一行下面多印一行 `[命令] tar czf ...`
 `command`，工作目录不必显式传——它就是这个 Run 的执行环境 `cwd`，受理时已经从 Job 的
 `workdir` 落到 Session 上，§8.5），第二轮拿到工具结果后收尾。选哪个驱动在
 `AgentLoop::run` 里按 Run 的来源判：`self.llm`（真正的模型客户端）一次都不会被摸到，
-`Segment` 上的 `command: Option<CommandSpec>` 就是那个判据。于是 Policy / Proof /
-审批 / JSONL / tool-output / 恢复 / 投递全部原样复用——那一次 `shell` 调用照样要过
-`prepare` → Policy →（必要时）审批 → `execute`，跟模型发起的调用走的是同一条路。**命令
+`Segment` 上的 `command: Option<CommandSpec>` 就是那个判据。于是 JSONL / tool-output /
+恢复 / 投递全部原样复用——那一次 `shell` 调用照样要过 `prepare` → `execute`，跟模型
+发起的调用走的是同一条路。**命令
 Run 全程零模型请求**，也不触发记忆提取（`AcceptInput.skip_memory`：命令 Job 触发的
 Run 落账时直接记 `MemoryWork::Done`，不进后台处理队列——没有对话可提取，提取本身还要
 发一次模型请求，会打破"零模型请求"这条硬约束，§9.3）。
@@ -1275,38 +1147,21 @@ Run 落账时直接记 `MemoryWork::Done`，不进后台处理队列——没有
 | 退出 0、stdout 为空 | `ok` | 不投递——看门狗"没事不说话" |
 | 非 0 退出 | `error` | 投错误摘要（退出码 + stderr 末尾若干行），受 `notify` 过滤（`on_error` / `always` 投，`never` 不投） |
 | 超时 | `waiting`→`intervention` | 与任意 shell 命令超时同一条路（§8.6：`NoSafeRecovery` 的调用超时是"副作用是否已经发生未知"，不是"结果"，停在 `waiting + intervention` 等人核对，不能自动判定成功或失败）——命令 Job 不为此另开一条自动归类的路径，那会绕过 §8.6 的安全不变量 |
-| 等审批（首次触发、授权还没落下或已经失效） | `waiting` | 照现有规则投 home chat |
 
-**`cron add` 时直接给这条命令签发执行授权**（§7.2 第三种范围）：创建命令 Job 的同时，
-Gateway 落一条 `GrantScope::CronJob` 授权，覆盖触发时 `CommandDriver` 会发出的那一次
-`shell` 调用——不必等第一次触发停下来问一遍。**匹配器与触发时真正跑出来的那份计划
-必须同源**：`komo_runtime::tools::shell::plan_for`（`ShellTool::prepare` 自己也调它）
-是唯一的构造处，不手写第二份，两处才不会因为各自改一点而悄悄分岔。这条授权要挂在一条
-真的、已经决定的审批记录上（`Grant.approval` 不是溯源标识那么简单——触发时
-`executor::authorize` 靠它去 `ApprovalRepo::consume`，那一步要求 `approval_requests`
-里真有这一行、`decision` 已经写着"批准"），落授权与落审批记录同一次写完；写不下不该让
-`cron add` 本身失败，只是退回"以后每次触发都要问"。`komo cron list` / HTTP 的 Job 详情
-上能看出这条授权存在（也可查 `grants_for_job`）。
-
-**堵口子**：模型能经 shell 调 `komo cron add --command X` 给自己签一条将来能免问的
-授权，所以 strict 基表（`RuleTable::initial()`）单加一条：shell 命令文本匹配
-`komo cron add` 时 `effect = Ask` 且 `scopes` 只有 `once`——**任何已有的 Run / Cron
-范围授权都不能覆盖它**。这条判定排在"有效的范围授权"那一步之前（`PolicyRule.
-grant_proof`），且不走 `offered_scopes` 的"Cron 来源多给一档"，所以即便这份计划来自
-Cron、即便已经有一条匹配得上的 Run/Cron 范围授权，结论仍然是 Ask（有测试锁住这一条，
-§7.1）。auto 基表不变——那份表本来就不留一条 `Ask`。
+**`cron add` 不签授权**（2026-10-11 起，§7）：触发时那一次 `shell` 调用与任何调用一样直接执行，
+没有授权要签，也就没有"模型经 shell 调 `komo cron add` 给自己签一条将来免问的许可"这个口子要堵。
+此前那套（`cron add` 落一条 `GrantScope::CronJob` 授权并挂一条已决定的审批记录、strict
+基表对 `komo cron add` 单加一条只能批一次的 Ask、`komo cron list` 的授权列）随 Policy 一起删掉；
+老库 `policy_grants` 里那些行留着没人读（§7.4）。
 
 目前没有 `cron edit`：命令改了要 remove 重建。`remove` 只删 `cron_jobs` 那一行
-（§13.1「移除后续调度，已有执行历史保留」），不去清 `policy_grants`——**这条授权因此
-不是被撤销的，而是用不上了**：`GrantScope::CronJob` 绑的这个 Job 连同它的 `due()` 判定
-一起没了，没有任何触发能再产生同一个 `job + job_version` 的计划去覆盖，那一行就静静地
-留在表里当历史，不构成风险。
+（§13.1「移除后续调度，已有执行历史保留」）。
 
 触发输入在 JSONL 持久保存且 queued 已提交后再通知内存队列；启动与周期扫描负责补齐未完成接收、索引落后和通知丢失的情况。
 
-## 11. 聊天入口与审批
+## 11. 聊天入口与介入
 
-聊天渠道复用 Gateway 的会话、运行和审批接口，并且是**审批的主入口**——操作者大多不在终端前。TUI 与 CLI 是人在终端前时的辅助入口。三个渠道首版都在。
+聊天渠道复用 Gateway 的会话、运行和介入接口，并且是**介入的主入口**——操作者大多不在终端前。TUI 与 CLI 是人在终端前时的辅助入口。三个渠道首版都在。
 
 ### 11.1 渠道与分发
 
@@ -1322,24 +1177,24 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的�
                               6. 普通文本 → Ledger::accept_input → 排队
                        回复：订阅该 Session 的事件流，Run 终态时把最终 assistant 消息作为
                              `Outbound::RunFinished` 投回来源会话（飞书更新回复卡片，§11.3）；
-                             待处理 Intervention（审批、结果不明、阻塞）走 Notifier（§11.4）
+                             待处理 Intervention（结果不明、阻塞）走 Notifier（§11.4）
 ```
 
 - `request_key`：飞书是 `feishu:{event_id}`（`header.event_id`，消息事件与卡片回调同一个字段；官方对 2.0 事件的去重建议就是「通过事件结构中的 `event_id` 字段判断事件唯一性」），Telegram 是 `telegram:{update_id}`（long polling 重投的单位是整个 `Update`，`offset` 未推进就原样再取一次，普通消息与 `callback_query` 因此共用这一个键），WeChat 是 `wechat:{from_user_id}:{client_id}`——iLink 的 wire 消息**没有 `msg_id`**，字段只有 `from_user_id` / `to_user_id` / `client_id` / `create_time_ms` / `message_type` / `message_state` / `context_token` / `item_list`，唯一的逐消息标识是 `client_id`（**发送方**微信客户端生成的 UUID，不是服务端投递 id），所以加 `from_user_id` 前缀，`client_id` 为空时回退到 `(from, 内容哈希, 60s 窗口)`；微信的重投有两个来源——拉取游标只活在进程内存里、重启从空游标开始，以及服务端回了消息却回空游标时 SDK 把同一批原样再交一次——所以微信的去重是必需的，不是以防万一。飞书 / Telegram 不带 `chat_id` 前缀：两个 id 在单个应用 / 单个 bot 内已唯一，而 Telegram inline 模式的按钮回调根本没有 chat，硬拼会逼出占位值。三个平台都是至少一次投递（飞书官方原话「即使成功接收，仍会收到重复消息」；未在 3 秒内响应会按 15s / 5min / 1h / 6h 重推最多 4 次，ws 长连接同样有超时重推），重发命中同一 Run；**命令也去重**——重发的 `/approve` 不会批准两次。这正是 §8.5 请求键的语义，不另做 inbox 表。
-- **去重键只管平台重投，不管用户连点**：两次真实点击带着两个不同的 `event_id` / `update_id`，是两条合法输入。挡住它的是审批本身的幂等（§11.3：已决定的返回原决定）。两层分开，不要用组合键去兼职。
+- **去重键只管平台重投，不管用户连点**：两次真实点击带着两个不同的 `event_id` / `update_id`，是两条合法输入。挡住它的是介入答复本身的幂等（§11.3：已决定的返回原决定）。两层分开，不要用组合键去兼职。
 - 飞书 ws 在独立线程上跑 openlark 的运行时，事件通过 channel 交给 tokio 侧的 `Channel::serve`；ack 在 Dispatcher 返回 `InboundAck` 之后发，不是收到就 ack。
 - 渠道交给 Dispatcher 的是 `InboundMessage { peer: ChannelPeer, is_private, sender, text, request_key }`，**不是 Session ID**。哪个会话属于 Dispatcher 与存储。
 
 ### 11.2 身份与会话
 
-**渠道的身份匹配信息全部在配置文件里，不进 state.db。** 谁是操作者、哪些会话可以说话、哪个会话是 home chat，都是操作者对自己机器的一次性声明——和模型、策略规则是同一类东西，改动就是编辑文件，Gateway 热重载（§3）后立即生效，没有配对码、没有 `komo pair`、没有 `/sethome`，也没有对应的表和 HTTP 接口。原因：这份信息只有操作者一个人写，写它的场合一定是人在终端前；放进数据库只会多出一套 CLI、一组接口和一张耐久表来维护一个本来就该是静态的名单，而数据库丢了还要靠这张表决定谁能审批。
+**渠道的身份匹配信息全部在配置文件里，不进 state.db。** 谁是操作者、哪些会话可以说话、哪个会话是 home chat，都是操作者对自己机器的一次性声明——和模型配置是同一类东西，改动就是编辑文件，Gateway 热重载（§3）后立即生效，没有配对码、没有 `komo pair`、没有 `/sethome`，也没有对应的表和 HTTP 接口。原因：这份信息只有操作者一个人写，写它的场合一定是人在终端前；放进数据库只会多出一套 CLI、一组接口和一张耐久表来维护一个本来就该是静态的名单，而数据库丢了还要靠这张表决定谁能下指令。
 
 ```toml
 # ~/.komo/config.toml —— 行为键
 [channels.feishu]
 enabled    = true
 allow_from = ["ou_xxx"]            # 操作者的 open_id；为空则没人能说话
-home_chat  = "oc_xxx"              # 主动投递（审批请求等）的目标会话
+home_chat  = "oc_xxx"              # 主动投递（介入通知、Cron 结果等）的目标会话
 groups     = ["oc_yyy"]            # 允许响应的群；缺省 = 只响应 allow_from 的私聊
 
 [channels.telegram]
@@ -1360,45 +1215,27 @@ TELEGRAM_BOT_TOKEN=...
 # 微信凭证由 `komo channel wechat login` 写到 ~/.komo/wechat/credentials.json，不在 .env
 ```
 
-- **Principal**：发送者在该渠道 `allow_from` 里就是操作者，否则**拒绝**——回一条固定提示，带上发送者在该平台的 id（`ou_xxx` / `123456789` / `wxid_xxx`），操作者把它抄进 `allow_from` 即可；消息不进入 Run，也不留任何记录。`allow_from` 为空的渠道等于只出不进：还能作 `home_chat` 收投递，但没人能通过它下指令。**审批命令只接受操作者。**
+- **Principal**：发送者在该渠道 `allow_from` 里就是操作者，否则**拒绝**——回一条固定提示，带上发送者在该平台的 id（`ou_xxx` / `123456789` / `wxid_xxx`），操作者把它抄进 `allow_from` 即可；消息不进入 Run，也不留任何记录。`allow_from` 为空的渠道等于只出不进：还能作 `home_chat` 收投递，但没人能通过它下指令。**`/answer` 等命令只接受操作者。**
 - **怎么知道自己的 id**：任何人对机器人说 `/id`，机器人回 `{platform}:{chat_id}` 与发送者 id——被拒绝的提示里也带着同样的信息。这是唯一的"发现"手段，没有别的准入流程。
 - **Conversation**：操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session，只有 `groups` 列出的群会被响应，群里只响应 @机器人 的消息并剥掉提及，且发送者仍须在 `allow_from` 里。WeChat 只有 DM。要跑很久的事派给独立的任务会话在后台跑，结果交回 home session 由它转告，home 不被一件慢事堵住，见 `docs/background-tasks.md`。
 - **改名单不改数据库，也不重启**：`allow_from` / `home_chat` / `groups` 每条消息、每次投递都从当前配置快照读（§3 热重载第 2 步），文件保存后下一条消息就按新名单判定；`komo config check` 与重载共用同一套校验（id 形态、`home_chat` 所属渠道必须 enabled 且有凭证），校验不过则旧名单继续生效并在 home chat 报错。`komo doctor` 把"某渠道 enabled 但 `allow_from` 为空"当作警告列出。
-- Cron 触发的 Run 来源仍是 Cron（§8.8）；在聊天里 `/approve` 它的等待，不会让它获得交互操作者的权限。
+- Cron 触发的 Run 来源仍是 Cron（§8.8）；在聊天里 `/answer` 它的介入，不会让它获得交互操作者的身份。
 
-### 11.3 审批在聊天里
+### 11.3 介入在聊天里
 
-§7.2 要求界面显示"具体动作、原因、改动和已有验证结果"。聊天里的一条审批请求是一个 `Outbound::ApprovalRequest`，内容由 executor 组装，**渲染**由各渠道实现：
+聊天里需要人回答的只有 §7.5 的两类：**结果不明**（`verify`）与**阻塞**（`blocked`）。2026-10-11 之前这里的主角是审批——短 ID、批准 / 拒绝按钮的交互卡片、`/approve` 的三种范围、`y` / `n` 快捷答复、`/approve all` 批量——随 Policy 一起删掉（§7）；`/approve`、`/reject`、`y`、`n` 现在不是命令，`/approve`、`/reject`、`/deny` 得到一句固定的帮助（"已经不是命令了"，并列出 `/pending` · `/answer` · `/status` · `/cancel` · `/new` · `/id`），其余未知斜杠命令照旧交给模型；`y` / `n` 就是普通消息，哪怕此刻有待处理的介入。
 
-| 内容 | 来源 | 飞书 | Telegram | WeChat |
-|---|---|---|---|---|
-| 短 ID | `approval_requests.short_id`，待处理集合内唯一，4 位 base32 | 交互卡片标题 + 按钮"批准 / 拒绝" | 文本 + 内联按钮"批准 / 拒绝" | 文本 |
-| 动作 | `ExecutionPlan`：工具、命令 / 代码、真实目标路径、cwd、版本 | 卡片 markdown 代码块 | 代码块 | 纯文本；超长截断并提示到 TUI 看全文 |
-| 改动 | write / edit 的 diff（截断）；toolbox 启用的版本差异与测试结果 | 卡片折叠区 | 代码块 | 同上 |
-| 原因 | `PolicyDecision::Ask { reason }` | 卡片备注 | 引用块 | 纯文本 |
-| 范围 | 本次调用 / 本次 Run 范围 / Cron Job（§7.2） | 按钮只给"本次"；范围授权用命令 | 同左 | 命令 |
-
-按钮回答后，飞书卡片原地更新为"已批准 / 已拒绝 · 谁 · 何时"，Telegram 编辑原消息去掉按钮——决定过的请求不该还长着可点的按钮。
-
-`edit` / `write` 带 `then_run` 的组合计划（§4）只有一条审批，每个界面（三个渠道、TUI 弹窗、`komo approval show`）的"动作"都把两步列出来：改动那一步照旧，下一行"然后运行：<命令>（<cwd>）"；命令超长时按该界面的截断规则截并留截断标记，不会整行不见；范围只有"本次调用"（§7.2）。
-
-write / edit 的"改动"由工具在落审批时给出（`Tool::changes`，只读，与 `execute` 同一道版本核对与替换，只是不落盘）：新文件整份列为新增；目标的内容哈希与计划的预期版本已对不上（执行时注定因版本冲突失败）就不列 diff，只给一行说明；当前内容不是 UTF-8 文本也只给一行。diff 在源头截到 8 KiB（按字符边界、带截断标记）再进 `approval_requests`，各界面再按自己的上限截。组合计划的 diff 只描述改动那一步。
+一条介入通知是 `Outbound::NeedsAttention`（会话、Run、理由），三个渠道都渲染成文本：写清是哪条 Run、为什么停、这一条该怎么答（`/answer <run_id> <结论>`）。没有按钮：结论里有"确定没执行 → 重跑"这种分量的选项，打一行命令不是摩擦。
 
 命令（三个渠道相同）：
 
 | 命令 | 行为 |
 |---|---|
-| `y` / `n`（也认 `yes` / `no`） | 待处理只有**一条**时的最短答复：等价于 `/approve` / `/reject`，省掉抄短 ID——手机上那 4 位才是真正的摩擦。**只认单个词**（`y 7K2M` 是半懂不懂的写法，当普通消息），而且**没有待处理审批时它不是命令**：模型问"要不要…"、操作者回个 `n`，那是回话，不是"拒绝一条不存在的审批"。解析在网关，判断"真的有人在等"也在网关（§11.1 第 5 步） |
-| `/approve <short_id>` / `/reject <short_id>` | 打 `POST /v1/interventions/{handle}/answer`；已答复的返回原结论，不报错 |
-| `/answer <handle> <结论>` | 答复另外两类（§7.5）：`/answer <run_id> satisfied`（核对后目标已满足，原 Run 继续）、`not_performed`（确定没执行，重新入队）、`resolve`（前提已处理，重新观察并重新决策）、`abandon`（取消这个 Run）。`/approve` / `/reject` 就是审批类的两个结论，走同一条路 |
-| `/approve` / `/reject`（无 ID） | 操作者只有**一个**待处理请求时生效；多于一个则列出并要求指明 |
-| `/approve all` / `/reject all` | 打 `POST /v1/interventions/answers`，把**此刻待处理的全部审批**一次答了（§7.2）；每条各自落一条结论，回执点名答了哪几条。**批量的范围是本次调用**——要范围请逐条 `/approve <短ID> run` |
-| `/approve <short_id> run` | 本次 Run 的范围授权（§7.2 第二种）；只对 Policy 标记为可范围化的计划生效，`Deny` 不可覆盖 |
-| `/approve <short_id> cron` | Cron Job 的范围授权（§7.2 第三种），绑定 Job 与其版本；只对来源是 Cron 的请求出现（Policy 对 Cron 来源的 Ask 自动多给这一档） |
-| `/pending` | 列出**全部**待处理 Intervention（§7.5）与各自的句柄：审批给短 ID，结果不明与阻塞给 Run ID，并写清这一条该答什么 |
+| `/answer <handle> <结论>` | 打 `POST /v1/interventions/{handle}/answer`，答复 §7.5 的两类：`/answer <run_id> satisfied`（核对后目标已满足，原 Run 继续）、`not_performed`（确定没执行，重新入队）、`resolve`（前提已处理，重新观察并重新决策）、`abandon`（取消这个 Run）；已答复的返回原结论，不报错 |
+| `/pending` | 列出**全部**待处理 Intervention（§7.5）与各自的句柄（Run ID），并写清这一条该答什么 |
 | `/new` | 当前 Session 追加 `conversation.boundary`，不切 Session |
 | `/cancel` | 取消该 Session 当前 Run |
-| `/status` | 当前 Run 状态、待审批数 |
+| `/status` | 当前 Run 状态、待处理介入数 |
 | `/id` | 回显 `{platform}:{chat_id}` 与发送者 id，供抄进 config.toml 的 `allow_from` / `home_chat` / `groups`；任何人可用，也是唯一不要求操作者身份的命令 |
 
 **TUI 不接管整屏。** 它只占终端**最底下**那一小块**视口**（还在动的那一小段 · 状态行 · 命令面板 · 输入框），会话正文一条条**交还给终端自己的回滚区**：滚轮、选中复制、退出之后留在屏幕上的那段记录，都是终端本来就会做的事，不必在这里重做一遍，而且每条正文只画一次，不随每一帧重算。交出去的行**从此不再改**，所以"定型"要判得保守：用户那条消息、助手那段回答、跑完（或所属 Run 已结束）的一次调用、一条提示才交；还没收到 `run.accepted` 的提交、正在打字的草稿、还在跑的调用留在视口里逐帧重画。两边不重叠——定型的那一帧它从视口消失、同时出现在回滚区上。`Ctrl-T` 因此是一个**模式**而不是对某一条的展开：它管的是之后印出来的那些。
@@ -1413,24 +1250,22 @@ write / edit 的"改动"由工具在落审批时给出（`Tool::changes`，只�
 
 **状态行上的"已连接"说的是网关可达**，不是"事件流开着"。事件流要有会话才订得了，而裸 `komo` 在第一条消息之前没有会话——启动时问模型清单那一问答上了，就已经证明网关在那儿，没有理由让状态行挂着"连接中"直到人开口。会话铸出来之后，订阅自己的状态接管这一格。
 
-**TUI 是同一个决策接口的第四个界面，它的答案必须自己说出来。** 聊天里的请求自带按钮（飞书）或命令（Telegram / WeChat），TUI 只有一块弹窗（它占满视口，输入框本来就该禁用），所以弹窗底部是一张**答案菜单**：一行一个答案，`↑` / `↓` 移动高亮、`Enter` 确认，行首那个字母（`r` / `y` / `n` / `a`）是这一行的直通键，习惯直接按键的人不必先移动高亮。可选的行只有 Policy 真给了的那些，顺序固定——`r` 本次任务默认通过（本次 Run 范围，只在 Policy 标了可范围化时出现，且排第一 = `Enter` 的默认落点）、`y` 只批准本次调用、`n` 拒绝本条（`Esc` 同义）、`a` 全部批准（只在待处理多于一条时出现，并写出有几条）；没有这个答案就不占一行——列一个按下去没反应的键比不列它更糟。正文会滚（`PgUp` / `PgDn`），菜单与边框底栏那一行不滚：窄终端上正文几乎一定放不下，而一个滚出屏幕的「Enter 确认」等于没有提示。待处理条数同时出现在状态行上。弹窗没打开而审批还在等（请求还没投到、详情取不回来、事件流断了）时，输入框的提示行要**说出路**（`/pending` 看清单、`/approve <短ID>`、`/approve all`），而不是只显示一句"等待审批"——那是审批的主界面之外唯一还能看见它的地方。
+**TUI 是同一个介入接口的第四个界面。** `/pending` 印出的待处理清单列出每一条、它的问题与可答的结论（`verify`：`satisfied` / `not_performed` / `abandon`；`blocked`：`resolve` / `abandon`），用 `/answer <句柄> <结论>` 一次答一条；待处理条数同时出现在状态行上，输入框从不因介入而锁住。2026-10-11 之前这里是一块审批弹窗加一张答案菜单（`r` 本次任务默认通过 / `y` / `n` / `a` 全部批准），随审批删掉。
 
-按钮回调与文本命令走同一个 `Dispatcher::handle`，**去重键与普通消息同源**（§11.1）：飞书卡片回调（`card.action.trigger`）用 `feishu:{event_id}`，Telegram `callback_query` 用 `telegram:{update_id}`——`callback_query` 是 `Update` 的一个字段，不是比 `update_id` 更细的投递单位。回调里带的 `approval_id` 是渠道回传的数据，只用来**定位**请求；批准与否仍由 Dispatcher 核对 Principal 后决定，回调负载不构成授权。
+聊天里的答复是普通的文本命令，走 `Dispatcher::handle`，去重键与普通消息同源（§11.1）；同一条介入被答两次（两条真实消息、两个不同的 `event_id` / `update_id`）由介入答复自己的幂等挡住——第二次得到"已决定"。两层各管一件事：去重键挡平台重投，幂等挡人重复回答，不用组合键去兼职。（审批卡片的按钮回调 `card.action.trigger` / `callback_query` 已经不再产生。）
 
-**去重之外还有一层幂等，两层各管一件事。** 去重键挡平台重投（飞书至少一次投递，ws 断线重连与 3 秒超时都会重推；Telegram 的 `offset` 未推进就重取同一个 `Update`），幂等键挡用户连点——同一人连点「批准」两次是两条合法输入、两个不同的 `event_id` / `update_id`，只有按 `approval_id` 幂等才能让第二次得到「已决定」而不是第二次执行。因此**不**把去重键换成 `(open_message_id, action.value, operator.open_id)` 这类组合键：那是个幂等键，用作投递键会把语义不同的两次点击也静默吞掉。
+**飞书卡片是 JSON 2.0（`schema: "2.0"`），而 2.0 去掉了 `note` 组件与 `action` 模块。** 官方的不兼容变更写明：2.0 不再支持 note 与 action（`tag` 为 `action`），且 2.0 对不认识的组件是**整张卡打回**而不是忽略。所以"卡片备注"（原因、有效期、结论那一行）是普通文本组件加 `notation` 字号与灰色；一行按钮是 `column_set`，每列一个 button，那一块带固定的 `element_id`——决定之后那张无按钮的卡靠它整块摘掉。踩过的坑在 §14：带 `note` 的卡片被平台拒（`230099 / 200861 unsupported tag note`），于是当时的审批请求**一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上。今天发卡片的只剩 Run 回复卡片（下文），这条约束照旧。
 
-**飞书卡片是 JSON 2.0（`schema: "2.0"`），而 2.0 去掉了 `note` 组件与 `action` 模块。** 官方的不兼容变更写明：2.0 不再支持 note 与 action（`tag` 为 `action`），且 2.0 对不认识的组件是**整张卡打回**而不是忽略。所以"卡片备注"（原因、有效期、结论那一行）是普通文本组件加 `notation` 字号与灰色；一行按钮是 `column_set`，每列一个 button，那一块带固定的 `element_id`——决定之后那张无按钮的卡靠它整块摘掉。踩过的坑在 §14：带 `note` 的卡片被平台拒（`230099 / 200861 unsupported tag note`），于是审批请求**一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上。
-
-**决定后的原地更新用 `PATCH /open-apis/im/v1/messages/{message_id}`，不用回调响应体。** 飞书官方给了三条路：回调响应里直接回传新卡片（须在 3 秒内）、用回调 `token` 延时更新（30 分钟内、最多 2 次、且必须在响应回调之后）、以及无条件 PATCH（仅 `interactive` 消息、仅 14 天内发送的消息、单条 5 QPS、更新前后 `config` 均须 `update_multi:true`）。komo 取第三条：审批的决定先落 Ledger 再回写界面，这件事跨越了回调的 3 秒预算；而且 PATCH 是普通 REST 调用，与「ws 长连接还是 HTTP 回调」无关，不必赌 ws 客户端能不能回传响应帧。回调本身只需尽快返回，必要时带一个 `toast`。Telegram 侧对应 `editMessageReplyMarkup` 去掉按钮：官方的 48 小时编辑限制只约束「非机器人自己发送且不含 inline keyboard 的 business message」，机器人自己发的审批卡片不受时限；编辑失败按**非致命**处理——决定已在 Ledger 里，界面回写失败不改变结论，也不要去匹配错误文案（官方明示 `error_code` 内容将来会变）。
+**决定后的原地更新用 `PATCH /open-apis/im/v1/messages/{message_id}`，不用回调响应体。** 飞书官方给了三条路：回调响应里直接回传新卡片（须在 3 秒内）、用回调 `token` 延时更新（30 分钟内、最多 2 次、且必须在响应回调之后）、以及无条件 PATCH（仅 `interactive` 消息、仅 14 天内发送的消息、单条 5 QPS、更新前后 `config` 均须 `update_multi:true`）。komo 取第三条：结果先落 Ledger 再回写界面（当初是审批的决定，今天是 Run 回复卡片的终态），这件事跨越了回调的 3 秒预算；而且 PATCH 是普通 REST 调用，与「ws 长连接还是 HTTP 回调」无关，不必赌 ws 客户端能不能回传响应帧。回调本身只需尽快返回，必要时带一个 `toast`。Telegram 侧对应 `editMessageReplyMarkup` 去掉按钮：官方的 48 小时编辑限制只约束「非机器人自己发送且不含 inline keyboard 的 business message」，机器人自己发的卡片不受时限；编辑失败按**非致命**处理——决定已在 Ledger 里，界面回写失败不改变结论，也不要去匹配错误文案（官方明示 `error_code` 内容将来会变）。
 
 **飞书的 Run 回复卡片（2026-09-25 实现，未真机验证）。** 一条起了 Run 的飞书消息（Dispatcher 回 `Queued`）：渠道先给原消息加一个 `Get` 表情（`POST /open-apis/im/v1/messages/{message_id}/reactions`），再**回复原消息**发一张"处理中"卡片（`POST …/{message_id}/reply`）；Run 终态（完成 / 失败 / 取消 / 放弃）时把这张卡片 PATCH 成结果——正文放在 markdown 组件里，不再另发一条文本。命令回执（`Replied`）只加表情、回执照旧是文本；`Duplicate` / `Rejected` / `Ignored` 与卡片回调什么都不加。原消息的 `message_id` 只留在飞书渠道里，不进三个渠道共用的 `InboundMessage`。
 
 - **终态投递统一用 `Outbound::RunFinished`**（不是 `Text`）：聊天来源的 Run 因此与 Cron 一样落 `deliveries` 的 `RunFinished` 行，§8.4 第 10 行"结果没送达 → 补发"对它们同样成立。Telegram / WeChat 对它与 `Text` 渲染相同。
-- **卡片在哪是进程内小账**，与审批卡片同一种性质：按 `(run, chat_id)` 记，有上限，是缓存不是权威。查不到（重启后账没了、Cron 投 home 的 `RunFinished`、卡片没发出去）就发文本；PATCH 失败也退化成发文本——那一次必须送到，`deliveries` 那一行靠它结算。表情或卡片失败都只记 WARN，不影响后续。
+- **卡片在哪是进程内小账**，与当初的审批卡片同一种性质：按 `(run, chat_id)` 记，有上限，是缓存不是权威。查不到（重启后账没了、Cron 投 home 的 `RunFinished`、卡片没发出去）就发文本；PATCH 失败也退化成发文本——那一次必须送到，`deliveries` 那一行靠它结算。表情或卡片失败都只记 WARN，不影响后续。
 - **正文过长**：卡片只放前 3000 个字符（飞书卡片请求体上限 30 KB，PATCH 时卡片 JSON 还要再转义一层，取一个保守值）并注明"其余见下方消息"，余下的按普通文本分段发。
 - **竞态**：终态投递来自 Run 的看客任务，与发卡片并发，可能先到。所以拿到 `Queued` 后、任何网络调用之前先同步登记一个 pending 槽位，卡片发出去后填上 `message_id`（或标记失败）；终态遇到 pending 槽位时最多等 5 秒。等不到就把槽位标成"已放弃"改发文本，卡片之后才到的由发卡片那一侧自己把它收尾成"结果见下方消息"——两边在同一把锁里比较并交换，谁先到都只有一方认领那张卡片，不会出现"文本发了、卡片停在处理中"。剩下的窗口只有"Dispatcher 返回 `Queued` 到登记槽位"之间（同步代码、没有 await），Run 要在那里面跑完一整轮才会漏。
 
-一条普通消息在 Run 等待审批时到达：Run 不会被越过（§6），消息排在它后面；不做"插话替换审批"这类特殊路径。
+一条普通消息在 Run 停在介入上时到达：Run 不会被越过（§6），消息排在它后面；不做"插话替换答复"这类特殊路径。
 
 ### 11.4 主动投递
 
@@ -1438,10 +1273,10 @@ write / edit 的"改动"由工具在落审批时给出（`Tool::changes`，只�
 
 - `Notifier::deliver` 先在 `deliveries` 表写一行（目标、内容引用、状态 `pending`），再发送，成功后标 `sent`。重启后 `pending` 的行补发，按 `DeliveryId` 幂等。
 - **补发在就绪之后跑，而且同一时刻只跑一趟。** 就绪（§3 第 4 步）不等它：它是网络 I/O，一条一个平台往返，积压多少就等多久。三个入口——渠道起来时按平台冲刷、启动时整体冲刷、微信入站前按会话冲刷——共用一把锁：两趟并发地在同一批 `pending` 行上跑，同一行会被送两次（发送在结算之前）。
-- **待处理 Intervention（§7.5）的投递目标**：Run 的来源会话，**加上** home chat（若不同）。两处都能回答，第二个答复得到"已决定"。来源是 Cron 或已断开的 TUI 时只有 home chat。审批、结果不明、阻塞三类共用这一条——"需要人判断"不该因为种类不同而有不同的到达率。
-  补充一条（2026-09-19 实现并按线上反馈收窄）：**屏幕前有人在看这个会话时（HTTP 的 SSE 订阅在）不投 home chat**。TUI / HTTP 来源的 Run 没有 chat 对端，照上面那句它只剩 home chat 一个出口，而那条卡片是一次网络往返（实测几秒到几十秒），人正盯着弹窗的时候它只会晚到、答完还多一条回写。判据是**客户端订阅数**（`EventHub::watch` 的守卫，HTTP SSE 处理器持有），不是广播的订阅者总数——Run 的看客自己也订阅同一个广播。人走掉之后仍挂着的审批由周期（与审计补写同一拍）补投，投过的不重复：§10 的"不能因为无人值守就没人知道它在等"没有被这条放松。
+- **待处理 Intervention（§7.5）的投递目标**：Run 的来源会话，**加上** home chat（若不同）。两处都能回答，第二个答复得到"已决定"。来源是 Cron 或已断开的 TUI 时只有 home chat。结果不明、阻塞两类共用这一条——"需要人判断"不该因为种类不同而有不同的到达率。
+  补充一条（2026-09-19 实现并按线上反馈收窄）：**屏幕前有人在看这个会话时（HTTP 的 SSE 订阅在）不投 home chat**。TUI / HTTP 来源的 Run 没有 chat 对端，照上面那句它只剩 home chat 一个出口，而那条卡片是一次网络往返（实测几秒到几十秒），人正盯着屏幕的时候它只会晚到、答完还多一条回写。判据是**客户端订阅数**（`EventHub::watch` 的守卫，HTTP SSE 处理器持有），不是广播的订阅者总数——Run 的看客自己也订阅同一个广播。人走掉之后仍挂着的介入由周期（与审计补写同一拍）补投，投过的不重复：§10 的"不能因为无人值守就没人知道它在等"没有被这条放松。
 - home chat 解析：只看配置——每个 enabled 渠道的 `home_chat`（§11.2），没有运行时覆盖；一个都没配时返回错误给调用方，**不静默丢弃**。多个渠道都配了时的默认顺序是**飞书 > Telegram > WeChat**：前两者能通过 API 对任意已加入的会话主动推送，微信不能（下一条）。
-- **WeChat 的平台约束**：DM 回推依赖回复令牌 `context_token`——每条入站消息自带一个，SDK 按 `user_id` 存在**进程内存**里，源码里没有过期逻辑，唯一的失效路径是会话过期（`errcode -14`）清空整张表；真正挡住主动推送的是**进程重启即全丢**，不是令牌到期。没有令牌时 `send` 直接返回 `NoContext`，不会联网去补——这就是 `Deferred` 的精确触发条件（按错误**变体**匹配，不按字符串）。因此进程启动后用户没发过消息时**无法主动推送**。对应处理：该渠道的 `deliver` 在没有令牌时把行留在 `pending` 并返回 `Deferred`；用户下一条消息到达时 Dispatcher 先冲刷该会话的 `pending` 投递（§11.1 第 4 步），再处理新消息。审批请求因此不会丢，只会晚到；`home_chat` 里排在它前面的飞书或 Telegram 会先送到。待验证：服务端是否接受跨进程的旧 `context_token`——若接受，把每个 `user_id` 的最新令牌持久化到 state.db 即可让重启后的主动推送直接成功，`Deferred` 退化为「这台机器从没收过这个人的消息」一种情形。另：SDK 的 `message_type` / `message_state` 枚举没有 unknown 兜底，服务端多一个值就整批反序列化失败并无限退避重试，渠道会静默卡死——komo 的 wechat 渠道把连续 N 次 JSON 错误升级为 home chat 告警。
+- **WeChat 的平台约束**：DM 回推依赖回复令牌 `context_token`——每条入站消息自带一个，SDK 按 `user_id` 存在**进程内存**里，源码里没有过期逻辑，唯一的失效路径是会话过期（`errcode -14`）清空整张表；真正挡住主动推送的是**进程重启即全丢**，不是令牌到期。没有令牌时 `send` 直接返回 `NoContext`，不会联网去补——这就是 `Deferred` 的精确触发条件（按错误**变体**匹配，不按字符串）。因此进程启动后用户没发过消息时**无法主动推送**。对应处理：该渠道的 `deliver` 在没有令牌时把行留在 `pending` 并返回 `Deferred`；用户下一条消息到达时 Dispatcher 先冲刷该会话的 `pending` 投递（§11.1 第 4 步），再处理新消息。介入通知因此不会丢，只会晚到；`home_chat` 里排在它前面的飞书或 Telegram 会先送到。待验证：服务端是否接受跨进程的旧 `context_token`——若接受，把每个 `user_id` 的最新令牌持久化到 state.db 即可让重启后的主动推送直接成功，`Deferred` 退化为「这台机器从没收过这个人的消息」一种情形。另：SDK 的 `message_type` / `message_state` 枚举没有 unknown 兜底，服务端多一个值就整批反序列化失败并无限退避重试，渠道会静默卡死——komo 的 wechat 渠道把连续 N 次 JSON 错误升级为 home chat 告警。
 - TUI 的 SSE 是另一个 Notifier 实现，不持久化——连接断了从事件流补读。
 
 ### 11.5 渠道实现的约束
@@ -1454,8 +1289,7 @@ write / edit 的"改动"由工具在落审批时给出（`Tool::changes`，只�
 ~/.komo/
 ├── config.toml          # 行为配置：模型、渠道的 allow_from / home_chat / groups 等
 ├── .env                 # 凭证：飞书 app secret、Telegram bot token、模型 key
-├── policy.toml
-├── state.db             # Turso；调度状态、审批、投递记录、Cron、Memory 与内容索引
+├── state.db             # Turso；调度状态、投递记录、Cron、Memory 与内容索引
 ├── sessions/
 │   └── <session-id>/
 │       ├── events.jsonl # 调用、状态、输出引用、简短预览与消息
@@ -1481,7 +1315,7 @@ Session 内容以目录为单位管理和归档，不再使用顶层 tool-output
 
 数据目录可通过配置或 KOMO_HOME 改变。配置项中的相对路径按配置文件所在目录解析；JSONL、payloads 与 output.json 中的正文 / 输出引用统一按对应 Session 目录解析。每个实例独占自己的数据库；Turso 对 db 文件持进程独占锁，文件放在运行机器的本地磁盘，不能作为多机器共享数据库。
 
-备份在明确的一致性水位上取得数据库快照，以及各 Session 目录内的 JSONL 已同步前缀、payloads、tool-output 和被引用产物。可短暂暂停持久化协调入口来建立水位，再按固定长度复制追加文件；不能只备份 state.db，也不能把不同时间点的 JSONL 和数据库随意拼接。state.db 的授权数据不能单靠会话 JSONL 重建；渠道的身份匹配（`allow_from` / `home_chat`）不在 state.db，备份 config.toml 与 .env 即可。
+备份在明确的一致性水位上取得数据库快照，以及各 Session 目录内的 JSONL 已同步前缀、payloads、tool-output 和被引用产物。可短暂暂停持久化协调入口来建立水位，再按固定长度复制追加文件；不能只备份 state.db，也不能把不同时间点的 JSONL 和数据库随意拼接。state.db 的调度与投递数据不能单靠会话 JSONL 重建；渠道的身份匹配（`allow_from` / `home_chat`）不在 state.db，备份 config.toml 与 .env 即可。
 
 ## 13. 通信、技术栈与项目结构
 
@@ -1506,11 +1340,9 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | POST /v1/reconcile               | 立刻跑一次对账（§8.9）；幂等，返回这次判定了什么 |
 | GET /v1/runs/{id}                | 执行详情                                       |
 | POST /v1/runs/{id}/cancel        | 取消                                           |
-| GET /v1/interventions            | 待处理清单：审批、结果不明、阻塞三类（§7.5）。每条带句柄、种类、问题与可答的结论 |
-| GET /v1/approvals                | **审批记录（含已决定）**，给 `komo run inspect` 答"这一步是谁放行的"（§7.4）；**不是待处理清单**——那一个走 `/v1/interventions` |
-| GET /v1/interventions/{handle}   | 单项详情；审批类的详情就是 §7.2 要展示的那一份（计划、改动、原因、范围） |
-| POST /v1/interventions/{handle}/answer | 答复：`approve` / `reject`（范围按 §7.2）、`satisfied` / `not_performed` / `abandon` / `resolve`；已答复的返回原结论，不报错 |
-| POST /v1/interventions/answers   | 一次答一批（§7.2、§11.3 的 `/approve all`）：名单由发起方列出，每条各自落一条结论 |
+| GET /v1/interventions            | 待处理清单：结果不明、阻塞两类（§7.5）。每条带句柄、种类、问题与可答的结论 |
+| GET /v1/interventions/{handle}   | 单项详情：问题、理由、那次调用的计划与可答的结论 |
+| POST /v1/interventions/{handle}/answer | 答复：`satisfied` / `not_performed` / `abandon` / `resolve`；已答复的返回原结论，不报错 |
 | GET /v1/cron                     | 列出定时任务                                   |
 | POST /v1/cron                    | 创建定时任务                                   |
 | POST /v1/cron/{id}/run           | 手动触发                                       |
@@ -1526,9 +1358,9 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/config/check             | 当前配置的校验结果（与热重载同一个函数）       |
 | POST /v1/config/reload           | 热重载；校验不过 422 并保留原配置               |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
-| GET /v1/toolbox · GET /v1/toolbox/{m} · POST /v1/toolbox/{m}/test · POST /v1/toolbox/{m}/enable · POST /v1/toolbox/{m}/disable | toolbox 模块清单、详情、候选测试、启用（产生一次审批）、停用（§5.4） |
+| GET /v1/toolbox · GET /v1/toolbox/{m} · POST /v1/toolbox/{m}/test · POST /v1/toolbox/{m}/enable · POST /v1/toolbox/{m}/disable | toolbox 模块清单、详情、候选测试、启用、停用（直接生效，§5.4） |
 
-除最小健康检查外统一认证。提交输入、审批、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。
+除最小健康检查外统一认证。提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。
 
 聊天渠道不经 HTTP：它们在 Gateway 进程内通过 `Inbound` / `Notifier`（§13.5）调用与这些接口相同的函数，Dispatcher 是两边共用的入口（§11.1）。
 
@@ -1740,7 +1572,7 @@ effort 的行为统一，取值按协议和具体模型校验：
 划分原则：按**依赖重量**和**变更频率**切，不按 DDD 层。重依赖（toasty/turso、axum、reqwest、ratatui、渠道 SDK）各自只出现在一个 crate；高频改动的代码所在的 crate 不依赖任何派生宏重的东西；被所有人依赖的 crate 不含 I/O、不含 tokio；二进制只有 clap 分发。
 
 ```text
-komo-kernel    值类型、状态机（Run / ToolCall / Session 生命周期）、事件与 fold、Policy 规则引擎、
+komo-kernel    值类型、状态机（Run / ToolCall / Session 生命周期）、事件与 fold、
                cron 到期计算、§8.4 恢复决策表与 §8.9 reconcile 的判定（都是纯函数）、
                Intervention 的类型与派生规则、协议线格式、全部 trait（§13.5）。
                deps: serde, serde_json, uuid, time, thiserror, async-trait, sha2, croner（`default-features = false`，
@@ -1751,7 +1583,7 @@ komo-store     session_log（JSONL 写入器 / 范围读 / 尾部校验）、pay
                唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync), sha2
 
 komo-runtime   agent loop、executor、tools/{read,write,edit,rg,shell,python}、python_runtime、
-               policy（config → 规则）、approvals、memory（MemoryManager、索引、代次）、llm 与 embedding 适配器、
+               memory（MemoryManager、索引、代次）、llm 与 embedding 适配器、
                scheduler、recovery、config。日常改动落在这里；它从不重新展开 toasty 宏。
                deps: kernel, store, reqwest, tokio, grep + ignore（`rg` 工具）、arc-swap。
                不依赖 komo-agent。
@@ -1766,12 +1598,12 @@ komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次
                deps: kernel, serde_json, tracing。
 
 komo-gateway   axum 路由（§13.1）、SSE、认证、进程锁与发现文件、launchd/systemd 集成、
-               Dispatcher、飞书 / Telegram / WeChat 渠道、Notifier 实现、deliveries、审批消息渲染。
+               Dispatcher、飞书 / Telegram / WeChat 渠道、Notifier 实现、deliveries、介入通知渲染。
                组装 runtime 与 agent（两者互不依赖）。
                deps: kernel, runtime, agent, axum, tower-http, reqwest, openlark(feature "feishu"), wechatbot(feature "wechat")
 
 komo-client    HTTP + SSE 客户端、发现文件读取、ratatui 聊天 TUI（视口 + 终端回滚区，
-               含审批弹窗、Markdown 渲染）、操作子命令的输出渲染。
+               含介入清单、Markdown 渲染）、操作子命令的输出渲染。
                只依赖 kernel——不认识 store / runtime。
                deps: kernel, reqwest, tokio, ratatui, crossterm, pulldown-cmark
 
@@ -1868,19 +1700,17 @@ codegen-units = 16
 | `Ledger` | `Coordinator`（store）：正文 → JSONL → 数据库 | `MemLedger` | Agent Loop 的唯一写入口；让 loop 和 executor 的测试不碰文件与 Turso |
 | `ToolOutputStore` | 文件流式写入 + 原子发布（store） | 内存 | 子进程 stdout/stderr 流式落盘，`shell` / `python` 测试需要替身 |
 | `RunQueue` | `toasty::sql::statement` 条件更新 + 代次（store，无第二个 turso 句柄） | 内存 | 调度器、恢复扫描、Cron、手动 resume 共用的领取入口；并发领取测试 |
-| `ApprovalRepo` | toasty（store） | 内存 | executor 等待、聊天 / TUI 答复、outbox 补写三方共用 |
 | `CronRepo` | toasty（store） | 内存 | 调度器 + CLI + Gateway API |
 | `MemoryRepo` | toasty + `memory_terms`（store） | 内存 | `MemoryManager` 的全部状态读写；召回排序逻辑要在无数据库下测 |
 | `LlmClient` / `TurnDriver` | 每种协议一个适配器（runtime） | 脚本化 driver | 主模型、记忆模型是同一 trait 的两个实例；loop 测试用脚本化回合 |
 | `EmbeddingClient` | OpenAI-compatible / Ollama（runtime） | 固定向量 | 空间指纹与维度校验要在无网络下测 |
-| `PythonHost` | 子进程 + venv 版本（runtime） | 假宿主 | `python` 工具、toolbox 启用流程、核对函数调用都经它 |
+| `PythonHost` | 子进程 + venv 版本（runtime） | 假宿主 | `python` 工具、toolbox 测试、核对函数调用都经它 |
 | `Tool` | 5 个（runtime） | — | §4 已定；executor 只认 trait |
-| `Policy` | 规则引擎（runtime） | 表驱动规则 | 同步、纯函数；授权在 `PolicyContext` 里传入，不在内部查库 |
-| `Channel` / `Inbound` / `Notifier` | 飞书、Telegram、WeChat、HTTP API、SSE（gateway） | 内存渠道 | 首版就有三个真实现；审批请求的渲染是各渠道实现的事 |
-| `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避、审批有效期全部依赖时间 |
+| `Channel` / `Inbound` / `Notifier` | 飞书、Telegram、WeChat、HTTP API、SSE（gateway） | 内存渠道 | 首版就有三个真实现；介入通知的渲染是各渠道实现的事 |
+| `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避全部依赖时间 |
 | `ZoneResolver` | tzdb 实现（runtime，W3 选 crate） | `ScriptedZoneResolver`（可编脚本的假时区）/ `FixedOffsetZone`（降级） | §10 的夏令时两条规则要在无 tzdb 下测；kernel 不带时区数据库 |
 
-不是 trait 的东西：`AgentLoop`、`ToolExecutor`、`Scheduler`、`Recovery`、`MemoryManager`、`SkillRegistry`、`Coordinator`、`Dispatcher`——各只有一个实现，依赖上表的 trait 就可测。`SessionRepo`、`ToolCallRepo`、`CheckpointRepo`、`OutboxRepo` 是 store 内部的具体类型，只被 `Coordinator` 用。**审批与 Intervention 都不需要 `Approver` trait**：§6 定了审批暂停 Run，`Policy` 答 `Ask` 后 executor 写 `approval_requests` 并 `Ledger::suspend`；清单（§7.5）是 `runs` 与 `approval_requests` 的并集查询，没有需要注入的第二实现。飞书卡片按钮、Telegram / WeChat 命令、TUI 弹窗、CLI 子命令都打到 `POST /v1/interventions/{handle}/answer`（一次答一批时是 `POST /v1/interventions/answers`，逐条落结论），调度器把 Run 重新入队，executor 从 `ApprovalRepo` 消费授权再执行；`satisfied` / `not_performed` 走 executor 的收尾与 `RecoveryStore::requeue`，`abandon` 走 `Ledger::complete`。渠道之间的差别只在渲染（§11.3），不在决策。
+不是 trait 的东西：`AgentLoop`、`ToolExecutor`、`Scheduler`、`Recovery`、`MemoryManager`、`SkillRegistry`、`Coordinator`、`Dispatcher`——各只有一个实现，依赖上表的 trait 就可测。`SessionRepo`、`ToolCallRepo`、`CheckpointRepo`、`OutboxRepo` 是 store 内部的具体类型，只被 `Coordinator` 用。**Intervention 不需要 `Approver` trait**：清单（§7.5）是 `runs` 与 `tool_calls` 上的查询，没有需要注入的第二实现。Telegram / WeChat / 飞书的 `/answer`、TUI 的待处理清单、CLI 子命令都打到 `POST /v1/interventions/{handle}/answer`；`satisfied` / `not_performed` 走 executor 的收尾与 `RecoveryStore::requeue`，`resolve` 重新入队再观察，`abandon` 走 `Ledger::complete`。渠道之间的差别只在渲染（§11.3），不在决策。（2026-10-11 之前这里还有 `Policy` trait 与 `ApprovalRepo`，随 Policy 删掉，§7。）
 
 关键签名（接口示意，辅助类型省略；`Tool` 见 §4）：
 
@@ -1895,11 +1725,11 @@ pub trait Ledger: Send + Sync {
     async fn record_round(&self, run: &RunId, round: AssistantRound) -> Result<Vec<ToolCallId>, LedgerError>;
     /// tool.planned：准备好的执行计划落盘（§8.4 第 6 行要求"planned 而未执行"是可分辨的状态）。
     async fn plan_call(&self, call: &ToolCallId, plan: &ExecutionPlan) -> Result<EventId, LedgerError>;
-    /// tool.started + 执行尝试 + 首次授权消费，同一事务；返回后才允许产生真实副作用。
-    async fn start_call(&self, call: &ToolCallId, plan: &ExecutionPlan, grant: Option<GrantUse>) -> Result<AttemptId, LedgerError>;
+    /// tool.started + 执行尝试，同一事务；返回后才允许产生真实副作用。
+    async fn start_call(&self, call: &ToolCallId, plan: &ExecutionPlan) -> Result<AttemptId, LedgerError>;
     /// 输出已由 ToolOutputStore 发布；这里只写 tool.result 元信息与引用。
     async fn finish_call(&self, attempt: &AttemptId, published: PublishedOutput) -> Result<(), LedgerError>;
-    /// 一次**没有执行过**的调用的结论（工具名不认识、参数准备不出来、放行被拒、子代理不能
+    /// 一次**没有执行过**的调用的结论（工具名不认识、参数准备不出来、`prepare` 拒绝、子代理不能
     /// 再委派）：它有结论、没有尝试，所以建的是那条 `tool.started` 缺席的尝试行。
     /// **必须写**：`tool.result` 缺席的调用在账本上永远悬着，从账本重建的转写就会带着一个
     /// 没有输出的 `function_call`，provider 直接 400。
@@ -1913,7 +1743,7 @@ pub trait Ledger: Send + Sync {
     async fn read(&self, session: &SessionId, from: Seq, limit: u32) -> Result<EventBatch, LedgerError>;
     /// `/new`：追加 conversation.boundary，不切 Session。
     async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError>;
-    /// control_outbox 审计补写，按 event_id 幂等；不创建授权。
+    /// control_outbox 审计补写，按 event_id 幂等；不产生状态。
     async fn append_audit(&self, session: &SessionId, event_id: &EventId, payload: EventPayload, occurred_at: OffsetDateTime) -> Result<Seq, LedgerError>;
 }
 
@@ -1925,11 +1755,6 @@ pub trait ToolOutputStore: Send + Sync {
     async fn publish(&self, writer: Box<dyn OutputWriter>, result: ToolResultBody) -> Result<PublishedOutput, StoreError>;
     /// 按引用读取并校验哈希；不匹配返回 Corrupt，不返回内容。
     async fn open(&self, output: &OutputRef) -> Result<VerifiedOutput, StoreError>;
-}
-
-/// 同步、纯函数。授权、来源、当前有效范围都通过 ctx 传入。
-pub trait Policy: Send + Sync {
-    fn decide(&self, plan: &ExecutionPlan, ctx: &PolicyContext) -> PolicyDecision;
 }
 
 #[async_trait]
@@ -1966,18 +1791,8 @@ pub trait RunQueue: Send + Sync {
     async fn claim(&self, executor: &ExecutorId) -> Result<Option<Claimed>, StoreError>;
     /// 领取指定 Run（手动 resume、恢复扫描）；同样的条件更新，两个执行者只一个成功。
     async fn claim_run(&self, run: &RunId, executor: &ExecutorId) -> Result<Option<Claimed>, StoreError>;
-    /// 交还名额（等审批 / 等重试 / 执行者退出）；代次不对就什么都不做。
+    /// 交还名额（等人 / 等重试 / 执行者退出）；代次不对就什么都不做。
     async fn release(&self, claimed: &Claimed) -> Result<(), StoreError>;
-}
-
-#[async_trait]
-pub trait ApprovalRepo: Send + Sync {
-    /// 决定幂等：已决定的返回原决定。
-    async fn decide(&self, id: &ApprovalId, decision: ApprovalDecisionRecord) -> Result<ApprovalDecisionResponse, RepoError>;
-    /// 消费授权换 Proof：Once 比计划哈希并标记 consumed；Run / CronJob 范围走 Grant::covers(plan)，
-    /// 不因一次使用作废，但 ConsumedApproval 记下用的是哪条 grant。Deny 上 executor 根本不来这里。
-    async fn consume(&self, id: &ApprovalId, plan: &ExecutionPlan, now: OffsetDateTime) -> Result<ConsumedApproval, RepoError>;
-    // create / get / find_by_short_id / list_pending / grants_for_run / grants_for_job 略
 }
 
 /// kernel 不带 tzdb；两个方向都要，cron 的搜索两头都走。
@@ -2013,13 +1828,12 @@ pub trait Clock: Send + Sync {
 
 **W3 落地后的契约修订**（2026-09-16；实现见 `crates/komo-kernel/src/traits.rs`，与上面的示意不一致时以代码为准）：
 
-- `Tool::execute(&self, plan: ApprovedPlan, ctx: &ToolContext, sink: &mut dyn OutputWriter)`：工具**借用**本次尝试的流式写入器，发布仍在 executor 手里（§8.5 的下一步）。
-- `ApprovalRepo::consume(&self, id, plan: &ExecutionPlan, intent: ConsumeIntent, now)`，`ConsumeIntent::{First, KnownNotToHaveRun}`：已消费的一次性授权对 `First` 是可分辨失败（`GrantMismatch`），只有核对确认「原动作未发生」才允许重用——§7.4 的两句话各落一处。
+- `Tool::execute(&self, plan: ExecutionPlan, ctx: &ToolContext, sink: &mut dyn OutputWriter)`（2026-10-11 起按值收 `ExecutionPlan`，此前是 `ApprovedPlan`）：工具**借用**本次尝试的流式写入器，发布仍在 executor 手里（§8.5 的下一步）。
 - `Ledger::start_run(&self, run, executor, generation)` 写 `run.started`；领取（`RunQueue::claim` / `claim_run`）只改行，`rows affected` 是胜负的唯一信号。
-- `CronRepo::advance(&self, id, next_run_at, status, last_error)`：推进槽位**不递增版本**，否则每次触发都作废绑定该 Job 的授权。
-- `Wait::Approval { approval, call: Option<ToolCallId>, attempt: Option<AttemptId> }`；`RunEnd::Completed { final_message, rounds }`。
-- `StoreError::{VersionConflict, GrantMismatch}` + `From<StoreError> for RepoError`：store 的事务闭包只有一条错误通道。
-- protocol：`ManualCronRunRequest`、`BoundaryRequest`、`ApprovalListQuery`、`MemoryScope` 的 `Display` / `FromStr`（`personal` | `project:<id>` | `environment:<id>`）、`GET /v1/models` → `ModelsResponse`、`GET /v1/config/check`、`POST /v1/config/reload`、`SseEvent::AssistantDelta`（**只在 SSE 上，永不进 JSONL**；`message.assistant` 仍是一次完整回复）。§13.1 的接口表相应多这三个端点。
+- `CronRepo::advance(&self, id, next_run_at, status, last_error)`：推进槽位**不递增版本**：版本只在定义变了时才变（当初的理由是不作废绑定该 Job 的授权，授权 2026-10-11 删掉）。
+- `RunEnd::Completed { final_message, rounds }`。（`Wait::Approval` 2026-10-11 删掉；JSONL 里 `WaitReason::Approval` 只为解码旧行保留，§7.4。）
+- `StoreError::VersionConflict` + `From<StoreError> for RepoError`（`GrantMismatch` 随授权删掉）：store 的事务闭包只有一条错误通道。
+- protocol：`ManualCronRunRequest`、`BoundaryRequest`、`MemoryScope` 的 `Display` / `FromStr`（`personal` | `project:<id>` | `environment:<id>`）、`GET /v1/models` → `ModelsResponse`、`GET /v1/config/check`、`POST /v1/config/reload`、`SseEvent::AssistantDelta`（**只在 SSE 上，永不进 JSONL**；`message.assistant` 仍是一次完整回复）。§13.1 的接口表相应多这三个端点。
 - `Ledger::run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError>`：一条 Run 的终态（只读，不带消息历史）。委派的核对走它（§4、§8.6）——父 Run 续跑时用它把那次 `delegate` 调用收尾，而不是去翻会话的整段事件；"子 Run 结束了没有、怎么结束的"是调度层要知道的一件事，不该逼它自己做一遍 fold。
 
 ### 13.6 安装与升级
@@ -2032,7 +1846,7 @@ pub trait Clock: Send + Sync {
 
 1. **换上去是最后一步，而且是一次 `rename`**。中途任何一步失败（校验和不对、包坏了、试跑不过），现在装着的那个 komo 一个字节都没动；临时文件与目标同目录，跨文件系统的 rename 会退化成复制。自我更新唯一不可接受的结局不是"没更新成"，是"更新成一个跑不起来的东西"。
 2. **试跑要求新二进制自报的版本就是标签版本**。glibc 太旧、架构不对、包被改过都在这一步挡下来。这条同时把发布流程绑住了：标签与 `[workspace.package].version` 不一致的包会被拒收，所以 `release.yml` 里那个 `guard` 作业是这条不变量的另一半，不是可选项。
-3. **只换磁盘上那份，不碰在跑的进程**。发现文件里核对得上一个在跑的 Gateway 时就打印 `komo gateway restart`，**不替操作者重启**：重启会打断正在跑的 Run 与等在那里的审批，那不该由一条更新命令决定。
+3. **只换磁盘上那份，不碰在跑的进程**。发现文件里核对得上一个在跑的 Gateway 时就打印 `komo gateway restart`，**不替操作者重启**：重启会打断正在跑的 Run，那不该由一条更新命令决定。
 
 只报告，不降级：装着的比最新发布新（源码构建的开发机、或者刚回滚过）时只说一句"发布的比它旧"，什么都不做。
 
@@ -2043,19 +1857,19 @@ pub trait Clock: Send + Sync {
 | 阶段 | 交付 | 验证 |
 |---|---|---|
 | 1. 进程与会话骨架 | 六个 crate 骨架（§13.4）；komo、Gateway 自动启动、HTTP/SSE；`komo-store`：Turso 连接、`ensure_schema` + DDL 对齐测试、`with_write_retry`、统一 Session 目录与状态索引；`komo-client`：HTTP/SSE 客户端与 TUI 骨架；**编译预算首次测量** | 多个 CLI 同时启动仅产生一个实例；断线后能查看原会话；两个写入器对不同 Session 并发提交不互相阻塞，对同一行冲突时一方重试成功且只应用一次；DDL 对齐测试挂掉能定位到列；改 client 一行不重编 gateway；保存一份合法的 config.toml 后 `komo doctor` 一秒内显示新 mtime 已生效，保存一份非法的则旧配置继续生效且 home chat / 日志有具体错误 |
-| 2. AgentLoop 与 Policy | 模型往返、执行计划、Allow/Ask/Deny、审批持久化；`Ledger`、`Policy`、`ApprovedPlan` 类型状态；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测 | 危险操作批准前不执行；重复批准不重复执行；Deny 不被授权覆盖；不构造 `Proof` 就调不到 `execute`（编译期）；`Ask` 后 Run 让出名额且 TUI 弹出审批；同一轮的两条只读调用同时在飞（`read` / `rg`），写与审批是屏障、取消要收齐已在飞的那些（§6）；**不在本次运行能力面里的工具，模型拼出名字也执行不了**，而交给模型的 schema 与执行时的表来自同一份（§4） |
-| 3. 六个工具 | 文件、搜索、进程、Python 环境与输出处理；`verify` 默认实现与 write/edit 的哈希核对 | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 与 `read` 走同一条判定（工作目录内的搜索不产生审批），且它不依赖机器上装没装 `rg` |
-| 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、审批渲染、短 ID、飞书卡片与 Telegram 内联按钮、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一人连点两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/approve` 与按钮回调重发只批准一次；来源会话与 home chat 都收到请求且第二个答复得到"已决定"；决定后卡片 / 消息原地更新；Gateway 重启后 pending 投递补发一次；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的审批请求 |
-| 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，`toasty::sql`）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的审批仍能在手机上批 |
-| 6. toolbox 迭代 + Skills | 保存模块、候选测试、版本审核与启用；`SkillRegistry`、目录行门控、`read` 只读根 | 调用使用已批准且已测试版本；模块更新使旧授权失效；新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect；toolbox 启用的审批在微信里能看到版本差异与测试结果 |
-| 7. Cron | 持久调度、去重、重叠处理、人工接手 | 重启不重复创建同次触发；新危险操作等待审批；Cron 的等待在聊天里 `/approve` 后按 Cron 权限继续，不升权 |
+| 2. AgentLoop 与执行 | 模型往返、执行计划、`prepare` → `start_call` → `execute`；`Ledger`；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测（2026-10-11 之前这一阶段还有 Policy、Allow/Ask/Deny、审批持久化与 `ApprovedPlan` 类型状态，§7） | `start_call` 返回之前没有副作用；同一轮的两条只读调用同时在飞（`read` / `rg`），写是屏障、取消要收齐已在飞的那些（§6）；**不在本次运行能力面里的工具，模型拼出名字也执行不了**，而交给模型的 schema 与执行时的表来自同一份（§4）；**`write` / `edit`（含 `then_run` 的改动那一步）写数据目录下的 `sessions/`、`state.db*`、`runtime/`、`.env` 在 `prepare` 被拒**，结果 `denied`、理由点名路径，账上有结果不悬着（§7.2） |
+| 3. 六个工具 | 文件、搜索、进程、Python 环境与输出处理；`verify` 默认实现与 write/edit 的哈希核对 | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 是只读计划（可并发、codemode 可调），且它不依赖机器上装没装 `rg` |
+| 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、介入通知渲染、飞书 Run 回复卡片、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一条介入被答两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/answer` 重发只答一次；来源会话与 home chat 都收到介入通知且第二个答复得到"已决定"；`/approve`、`y` 不是命令；Gateway 重启后 pending 投递补发一次，老库里 `approval_request` / `approval_settled` 的 pending 行被跳过而不卡住补发；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的介入通知 |
+| 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，`toasty::sql`）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的介入仍能在手机上 `/answer`；**旧数据照常起来**：带 `approval.*` 事件的旧会话能加载、回放与续聊（那些事件按未知事件解码），停在 `waiting + approval` 的旧 Run 在 Gateway 启动后按"批准"续跑、那次调用只执行一次，老库里多出来的 `approval_requests` / `policy_grants` 表不妨碍启动（§7.4） |
+| 6. toolbox 迭代 + Skills | 保存模块、候选测试、版本校验与启用；`SkillRegistry`、目录行门控、`read` 只读根 | 调用使用已启用且已测试版本；候选哈希与已测版本不一致时拒绝启用；启用 / 停用直接生效，没有 Pending；新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect |
+| 7. Cron | 持久调度、去重、重叠处理、人工接手 | 重启不重复创建同次触发；命令 Job 触发时直接执行、全程零模型请求，`cron add` 不签任何授权；Cron Run 的介入在聊天里 `/answer` 后继续，不获得交互操作者身份 |
 | 8. 模型配置与 Memory | 独立记忆 / 向量模型、effort 校验、自动提取、混合召回（`memory_terms` + 向量）与遗忘 | 不串用模型配置；推断不自行确认；过期或遗忘内容不召回；重建可恢复 |
 | 9. 场景与双平台验收 | 真实代码仓库、测试 HA 设备、Memos 主动记录；编译预算复测 | 两平台独立运行；记录从 Memos 找回；代码交付含验证证据；冷编与增量编译在预算内，或有记录在案的偏差原因 |
-| 10. 生命周期与对账 | Session 的 `closing → deleted → purged`（§8.10）、Intervention 统一清单与四种结论（§7.5）、reconcile 的三条判定与领取守卫（§8.9） | **逻辑删除可靠**：`delete` 之后新输入被拒、未完成 Run 各写一条明确取消、内容一个字节没动；`purge` 在引用未处置时 409 并列出要先处理什么；`purged` 之后没有任何路径再创建那个目录。**清单堵死漏网**：`approval list` 为空而会话被挡住这种组合构造不出来——"挡队"与"进清单"同源，且每一条 `waiting + approval` / `waiting + intervention` 都在清单里。**orphan 自动 reconcile**：目录被手工删掉而状态不是 `purged` → 对账报出来且 Run 不被领走（不出现"按空上下文执行一轮"）；handler 任务 panic 留下的 `running`（租约过期 + 存活判定）被回收；无法确认旧执行结束的那条停成清单里的一条 |
+| 10. 生命周期与对账 | Session 的 `closing → deleted → purged`（§8.10）、Intervention 统一清单与四种结论（§7.5）、reconcile 的三条判定与领取守卫（§8.9） | **逻辑删除可靠**：`delete` 之后新输入被拒、未完成 Run 各写一条明确取消、内容一个字节没动；`purge` 在引用未处置时 409 并列出要先处理什么；`purged` 之后没有任何路径再创建那个目录。**清单堵死漏网**：`intervention list` 为空而会话被挡住这种组合构造不出来——"挡队"与"进清单"同源，且每一条 `waiting + intervention` 都在清单里（旧的 `waiting + approval` 不进清单，启动时按 §7.4 续跑）。**orphan 自动 reconcile**：目录被手工删掉而状态不是 `purged` → 对账报出来且 Run 不被领走（不出现"按空上下文执行一轮"）；handler 任务 panic 留下的 `running`（租约过期 + 存活判定）被回收；无法确认旧执行结束的那条停成清单里的一条 |
 
-存储和 Policy 的基本约束从第二阶段开始贯穿全部工具，不能在所有功能完成后才补审核。
+存储的基本约束（§8.5 的写入顺序、§7.2 的硬限制）从第二阶段开始贯穿全部工具，不能在所有功能完成后才补。
 
-首个端到端验收：启动 komo 自动拉起 Gateway，通过模型调用 write 生成工作文件，在任务的后续步骤前重启 Gateway；不打开 CLI 也应自动接续原 Run，随后 resume 原会话查看结果，再读出原文件。随后验证一次待审批 shell 在重启后仍等待，在飞书或 Telegram 里批准后只执行一次已确认的调用；若模拟执行结果丢失，则进入未知状态核对而不是自动重跑。
+首个端到端验收：启动 komo 自动拉起 Gateway，通过模型调用 write 生成工作文件，在任务的后续步骤前重启 Gateway；不打开 CLI 也应自动接续原 Run，随后 resume 原会话查看结果，再读出原文件。随后验证一次 shell 调用在 started 之后、结果落盘之前被杀：重启后进入未知状态核对而不是自动重跑，在飞书或 Telegram 里 `/answer` 之后按结论只处理一次。
 
 恢复故障注入验收：
 
@@ -2070,7 +1884,7 @@ pub trait Clock: Send + Sync {
 | 输出文件和 JSONL 引用已持久保存，state.db 尚未更新     | 校验输出后补结果索引，复用原输出，工具不重做                     |
 | output.json 已完成但 JSONL 结果事件尚未写入          | 校验身份、计划及完成状态后补记结果；不能只凭文件存在判断         |
 | 输出文件引用已提交，但正文缺失或被修改               | 停止受影响任务，报告引用损坏，不通过重跑补造旧结果               |
-| 用户批准已保存，审计 JSONL 尚未补写                  | 从 state.db 读取有效授权，outbox 幂等补写，不重新询问              |
+| 控制决定（如 `session.closing`）已提交，审计 JSONL 尚未补写 | 从 state.db 读取原决定，outbox 幂等补写；旧库里残留的 `approval.*` 审计行不卡住补写器 |
 | JSONL 最后半行未被任何提交引用                       | 隔离尾部后修复；按最后完整记录恢复，未知副作用仍须核对           |
 | JSONL 已提交范围缺失或中间损坏                       | 停止受影响会话，报告损坏，不跳过记录或重做动作                   |
 | 最终结果已同步到 JSONL，SSE 尚未送达                 | 客户端补读原结果，Run 保持 completed                             |
@@ -2084,9 +1898,9 @@ pub trait Clock: Send + Sync {
 
 **委派续跑验收（§4，待做）**：主对话第一轮派一条子 Run 查 A，第二轮（另一条 Run）用 `resume` 让它接着查 B——第二条子 Run 的首个模型请求里有第一条的任务正文与最后回答、**没有**它的 `tool_calls` / `provider_blocks`，也没有父对话的任何一句；结果回到第二轮那次调用上。对同一条子 Run 续跑两次，第二次被拒且理由里写着末端是哪一条；续一条 `cancelled` 的、主对话的、边界之前的、别的 Session 的，都在 `prepare` 被拒并在账上有结果（不悬着）。续跑出来的子 Run 调不动 `delegate`。重启在续跑子 Run 跑到一半时，照 §8.4 接着跑，窗口与重启前逐字节相同。
 
-**资源命名空间验收（2026-09-22）**：`read("skill://<skill>/SKILL.md")` 与 `rg(path="skill://")`（多根 → 多条目标）端到端成立，且**审批与审计里显示的是逻辑 URI**（`PlanTarget::describe()` 形如 `skill://review/SKILL.md（<真实路径>）`），读一份 skill **不产生审批**（skill 目录是只读根）；`tool://<工具>/schema|doc` 只在**这一次的能力面**里可读（面外写 `tool://write/schema` 在 `prepare` 就被拒、不进计划），`tool://` 是虚拟入口、没有磁盘目标；`..` / 空段 / 指向挂载点之外的链接 / 没有会话内容目录这几类同样在 `prepare` 被拒；超限正文给出的 `artifact://<run>/<call>/<attempt>/…` 与产物入口 `artifact://files/<run>/<名字>` **在 Gateway 重启之后仍读回同一份正文**；本地路径的用法与改造前逐字相同（计划里仍是 `{"path": …}`，旧审批计划按原哈希校验）。
+**资源命名空间验收（2026-09-22）**：`read("skill://<skill>/SKILL.md")` 与 `rg(path="skill://")`（多根 → 多条目标）端到端成立，且**审计里显示的是逻辑 URI**（`PlanTarget::describe()` 形如 `skill://review/SKILL.md（<真实路径>）`），当时读一份 skill **不产生审批**（skill 目录是只读根；审批 2026-10-11 删掉）；`tool://<工具>/schema|doc` 只在**这一次的能力面**里可读（面外写 `tool://write/schema` 在 `prepare` 就被拒、不进计划），`tool://` 是虚拟入口、没有磁盘目标；`..` / 空段 / 指向挂载点之外的链接 / 没有会话内容目录这几类同样在 `prepare` 被拒；超限正文给出的 `artifact://<run>/<call>/<attempt>/…` 与产物入口 `artifact://files/<run>/<名字>` **在 Gateway 重启之后仍读回同一份正文**；本地路径的用法与改造前逐字相同（计划里仍是 `{"path": …}`，旧计划的哈希不变）。
 
-测试同时断言实际副作用次数、Run / ToolCall 身份、授权使用、预算和事件配对；仅检查“恢复后状态变成 running”不算通过。每个断点做进程终止测试，并单独安排操作系统重启 / 存储持久性验证。
+测试同时断言实际副作用次数、Run / ToolCall 身份、预算和事件配对；仅检查“恢复后状态变成 running”不算通过。每个断点做进程终止测试，并单独安排操作系统重启 / 存储持久性验证。
 
 Memory 与模型验收覆盖：
 
@@ -2113,11 +1927,11 @@ Memory 与模型验收覆盖：
 | iLink 消息是否带稳定 `msg_id` 可作 `request_key` | §11.1 微信去重 | **已核实（2026-09-16，wechatbot 0.4.0 源码）：没有 `msg_id`。** 逐消息的唯一候选是 `client_id`——发送方客户端生成的 UUID，`String` 非 Option。**键改为 `wechat:{from_user_id}:{client_id}`**，`(from, 内容哈希, 60s 窗口)` 降级为 `client_id` 为空时的回退。已确认两条重投来源：拉取游标不持久化（重启从空游标开始）、「回了消息却回空游标」时 SDK 原地重取。**剩余未核实（需真机登录，步骤见 `spikes/wechat.md` §5）**：① 入站 `client_id` 的形态与是否恒非空；② 空游标对服务端意味着「重发未确认」还是「从现在开始」——后者是丢消息，比重复严重，会要求把游标持久化进 state.db；③ 重投时 `client_id` 是否不变；④ 旧 `context_token` 能否跨进程使用 |
 | `wechatbot` 的 native-tls 在 Fedora 上链系统 openssl 是否顺利；与 `rustls-no-provider` 的 reqwest 0.13 共存 | §13.4 | **已核实（2026-09-16，源码 + 实测）：共存没有问题，但 native-tls 这条路整个不走了。** 共存侧：native-tls 走 openssl 自己的 `Once`，与 rustls 无共享状态，`CryptoProvider::install_default()` 仍只由 `main` 调一次；原文「一份 reqwest / hyper 重复」里 hyper 是错的，锁文件里 hyper / hyper-util / rustls / hyper-rustls 各只有一份。TLS 侧：上游让 reqwest 0.12 默认特性开着且自己没有 feature，工作区无法关掉。**决定并已做：`vendor/wechatbot` + `[patch.crates-io]`，reqwest 升 0.13 走 rustls**，openssl 整条链消失，reqwest 重复也消失，默认特性全量构建通过，Fedora 不必装 `openssl-devel`。vendored openssl 作为退路而非首选（估 2–3 分钟且在关键路径起点） |
 | `lark-websocket-protobuf` 是否需要 `protoc` | 构建工具链要求 | **已核实（2026-09-16）：不需要。** 0.1.2 无 `build.rs`，依赖树里没有 prost-build / tonic-build / protobuf-codegen，本机无 protoc 编译通过。安装说明不加 `protobuf` |
-| 飞书卡片回调的 `event_id`、Telegram `callback_query_id` 在重推时是否保持不变 | §11.3 按钮去重 | **已核实（2026-09-16，官方文档）**：飞书对 2.0 事件与回调的官方去重建议就是「通过 `event_id` 字段判断事件唯一性」，配合「至少发送一次」与 15s/5min/1h/6h 最多 4 次重推，等价于保证重推携带同一 `event_id`；Telegram long polling 重投的单位是整个 `Update`（`offset` 未推进即原样再取），`update_id` 与其中的 `callback_query.id` 一并不变。**两个键都稳定，组合键退路作废**；去重键只挡平台重投，用户连点由 `approval_id` 幂等承担（已写入 §11.3）。剩余未核实：① 卡片回调自身的重推间隔 / 次数（官方只在「事件」侧给表）；② ws 模式下卡片回调载荷与 HTTP 是否逐字段一致；③ openlark 的 ws 客户端能否回传卡片响应帧——设计已改用 PATCH 绕开，不阻塞 |
-| ws 上 `card.action.trigger` 能不能到 komo（按钮回调） | §11.3 卡片按钮 | **源码核实（2026-09-18，`openlark-client 0.20.0/src/ws_client/frame_handler.rs:106`）：不能。** 数据帧按 header 的 `type` 分发，`"event" \| ""` 进事件分发，**`"card"` 是 `debug!("Card frame received, skipping")` 后返回 `None`——丢掉，连 ack 都不回**；`"card"` 这个分支的存在本身就说明飞书把卡片回调归成 `card` 帧。所以按钮要么等上游支持，要么 vendored openlark 自己接上（`[patch.crates-io]` 已有 wechatbot / toasty 的先例）。**未定：** 是否值得为此维护一个 patch——在那之前，答复的路是文本命令（`/approve <短ID>`、`/approve all`），卡片正文已写出命令；卡片回调仍需在开放平台的事件订阅里配置，否则连 `card` 帧都不会来 |
-| Telegram 把消息编辑成与现状相同内容时返回的错误（官方未文档化，且声明 `error_code` 内容会变） | §11.3 决定后去掉按钮的幂等重试 | 不匹配错误文案；编辑失败一律当非致命，决定以 Ledger 为准 |
+| 飞书卡片回调的 `event_id`、Telegram `callback_query_id` 在重推时是否保持不变 | §11.3 按钮去重（2026-10-11 审批删掉，按钮不再产生，这一行留作记录） | **已核实（2026-09-16，官方文档）**：飞书对 2.0 事件与回调的官方去重建议就是「通过 `event_id` 字段判断事件唯一性」，配合「至少发送一次」与 15s/5min/1h/6h 最多 4 次重推，等价于保证重推携带同一 `event_id`；Telegram long polling 重投的单位是整个 `Update`（`offset` 未推进即原样再取），`update_id` 与其中的 `callback_query.id` 一并不变。**两个键都稳定，组合键退路作废**；去重键只挡平台重投，用户连点由当时的 `approval_id` 幂等承担（今天是介入答复的幂等，§11.3）。剩余未核实：① 卡片回调自身的重推间隔 / 次数（官方只在「事件」侧给表）；② ws 模式下卡片回调载荷与 HTTP 是否逐字段一致；③ openlark 的 ws 客户端能否回传卡片响应帧——设计已改用 PATCH 绕开，不阻塞 |
+| ws 上 `card.action.trigger` 能不能到 komo（按钮回调） | §11.3 卡片按钮（2026-10-11 审批删掉，按钮不再产生，这一行留作记录） | **源码核实（2026-09-18，`openlark-client 0.20.0/src/ws_client/frame_handler.rs:106`）：不能。** 数据帧按 header 的 `type` 分发，`"event" \| ""` 进事件分发，**`"card"` 是 `debug!("Card frame received, skipping")` 后返回 `None`——丢掉，连 ack 都不回**；`"card"` 这个分支的存在本身就说明飞书把卡片回调归成 `card` 帧。所以按钮要么等上游支持，要么 vendored openlark 自己接上（`[patch.crates-io]` 已有 wechatbot / toasty 的先例）。**未定：** 是否值得为此维护一个 patch——在那之前，答复的路是文本命令（当时是 `/approve <短ID>`、`/approve all`，今天是 `/answer`），卡片正文已写出命令；卡片回调仍需在开放平台的事件订阅里配置，否则连 `card` 帧都不会来 |
+| Telegram 把消息编辑成与现状相同内容时返回的错误（官方未文档化，且声明 `error_code` 内容会变） | §11.3 决定后去掉按钮的幂等重试（2026-10-11 审批删掉，按钮不再产生，这一行留作记录） | 不匹配错误文案；编辑失败一律当非致命，决定以 Ledger 为准 |
 | 补发积压投递的真实代价（启动路径） | §3 第 4 步、§11.4 | **已核实（2026-09-18，本机实测）：它就是"重启好慢"的全部。** `komo gateway restart` 9.0s：bootout + 等待 launchctl 卸完 + bootstrap 只占 0.22s（分别 6ms / 220ms / 11ms），**约 5.1s 花在渠道起来时的按平台补发、2.9s 花在启动时的整体补发**——两者都在 "Gateway 就绪" 之前同步跑，每条 pending 一个平台往返（飞书 ~290ms），而当时积压的投递因为卡片被平台拒（下一行）永远送不出去。改成就绪之后后台跑之后：**2.7s**，其中进程启动到就绪 1.8s。剩余 1.25s 是启动时的 embedding 维度探测（本地 ollama 往返），与补发无关，**已做（2026-09-18，本机 Fedora 实测）**：探测移出就绪路径（§3「就绪也不等模型探测」）——把向量端点指向一个只收连接不回话的 socket 时，修复前发现文件与 `Gateway 就绪` **都在 120.12s**（等满模型超时），修复后 **0.16s**；探测改在后台，`docs/komo_bot.md` 的那 1.25s 同样不再落在重启上。回归测试 `komo-gateway/tests/memory/startup.rs`（预修版本 5s 超时失败） |
-| 飞书卡片 2.0 支持哪些组件 | §11.3 卡片渲染 | **已核实（2026-09-18，官方不兼容变更 + 线上报文）：2.0 不再支持 `note` 组件与 `action` 模块**，且 2.0 对不认识的组件是**整张卡打回**而不是忽略。线上表现：每一个审批请求都被拒（`http 400 / code 230099`，`ErrCode 200861 unsupported tag note`），**审批一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上——审批的主入口（§11.3）整个是死的，操作者只看得到"等待审批"的 Run。替代写法已按官方给的来：备注 = 普通文本组件 + `notation` 字号 + 灰色；按钮行 = `column_set` 每列一个 button，那一块带固定 `element_id` 供决定后整块摘掉 |
+| 飞书卡片 2.0 支持哪些组件 | §11.3 卡片渲染 | **已核实（2026-09-18，官方不兼容变更 + 线上报文）：2.0 不再支持 `note` 组件与 `action` 模块**，且 2.0 对不认识的组件是**整张卡打回**而不是忽略。线上表现（当时）：每一个审批请求都被拒（`http 400 / code 230099`，`ErrCode 200861 unsupported tag note`），**审批一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上——审批的主入口（§11.3）整个是死的，操作者只看得到"等待审批"的 Run。今天这条约束管的是 Run 回复卡片。替代写法已按官方给的来：备注 = 普通文本组件 + `notation` 字号 + 灰色；按钮行 = `column_set` 每列一个 button，那一块带固定 `element_id` 供决定后整块摘掉 |
 | 飞书 Run 回复卡片的真机行为（§11.3）：`Get` 表情与 reply 接口需要的权限 scope、markdown 组件对模型最终回复的排版 | §11.3 飞书的 Run 回复卡片 | **未真机验证（2026-09-25，只有假开放平台上的测试）。** 表情或回复被平台拒时按设计退化：表情失败只记 WARN，卡片没发出去则终态照旧发文本；排版不理想时改渲染，不改投递路径 |
 | reconcile 一拍的真实成本（目标：1 万 Run / 1 千 Session）与它该排在哪个周期 | §8.9 的周期兜底 | 从 `AUDIT_TICK` 那一拍拆出来，按更粗的间隔跑（例如 5 分钟），或只对"启动后还没对过账的那些"跑；启动时那一次无论如何都要跑 |
 | `sessions.state` 之外是否还需要一个"回收进行中"的中间态 | §8.10 的 `purge` | 当前设计靠"墓碑先落、内容后删"取得幂等，不需要第四个状态；若实测发现"内容删到一半"无法与"内容被外部删掉"区分，再补一个状态列值（仍是加列/加值，不改 schema 形状） |
@@ -2125,10 +1939,10 @@ Memory 与模型验收覆盖：
 | 模型一轮里提了两个调用、其中一个没有结果时，会话后面的新 Run 会不会被毒住 | §8.3 回放窗口 | **已实测（2026-09-20，真实 provider）：会。** 旧二进制下模型一轮提了两个调用，一个被拒/没执行，那条 `message.assistant` 留在会话里；其后**同一会话的每一条新 Run** 首个模型请求都被 provider 400 拒（`No tool output found for tool call call_00_…`），且会连着重试。当时用"回放窗口按 Run 过滤"（`service/segment.rs` 的 `window(surface, Some(run))`）挡住了它——**那是拿对话连续性换的**（见本节末与下一行）。**已改（2026-09-21）**：窗口改回"这一段对话"，毒化由两件事挡住——① 正跑的那条 Run 之外的消息**不带协议**（历史 Run 只发布用户正文与它最后答的正文），"有调用、没结果"的半轮因此进不了新请求；② `fail_call` 与按引用恢复让每一次调用都真的有个结果（下面那句）。回归测试：`service::segment::tests::a_later_run_still_reads_what_the_earlier_one_said`（历史那轮的 `tool_calls` / `provider_blocks` 一条都不出现）、`the_running_run_keeps_its_whole_protocol`（正跑的那条一个都不能少）。**已修（2026-09-20，本机真实会话复盘）**：线上那次 400 的调用是两次 `delegate`——两个漏法都补上了。①`resumed()` 重建调用时不按引用读回外置的 `arguments` / `plan`（§8.3 原话要求"读取历史或恢复调用时按引用加载需要的内容"）：委派的任务正文 6 KB 被外置，重 `prepare` 拿到的是一份 `null` 参数，当场失败。②`execute_one` 的"未知工具 / prepare 失败 / 放行被拒 / 子代理不能再委派"四条分支把结论**只交给模型、不写账本**（`Ledger::fail_call` 就是补这一笔）：那次调用于是永远悬着，父的窗口里两个 `function_call` 一前一后，provider 报的是前面那个。回归测试：`service::segment::tests::an_externalized_argument_and_plan_come_back_by_reference`、`service::tests::a_delegated_task_over_the_inline_limit_still_settles_the_parent_call`（去掉任一处的回填就失败）、`service::tests::a_call_that_cannot_run_still_gets_a_result_in_the_ledger`（去掉 `fail_call` 就失败）。 |
 | 超限的**正文**（`run.accepted.text` / `message.assistant.text` 过 4 KiB）在回放窗口里是不是也需要按引用读回 | §8.3 的"读取历史或恢复调用时按引用加载" | **已核实（2026-09-20，真实会话）**：会外置（本次会话里两条子 Run 的 `run.accepted` 与一条 `message.assistant` 都是 `text: null` + `text_ref`），而当时全仓**没有任何一处**读 `text_ref`——`replay()` 交给模型的用户消息因此是空的（没炸只是因为子代理的任务正文同时也在它的系统提示里，正常 Run 的用户输入很少过 4 KiB）。**已做（2026-09-21）**：`replay()` 现在按引用读回正文（`segment.rs` 的 `message_text`：内联优先、`text_ref` 次之，哈希由 `PayloadStore::open` 校验，读不出来或不是 UTF-8 都算会话缺内容 → 停下来报告而不是发一条空消息）。回归测试：`service::segment::tests::an_externalized_message_comes_back_by_reference`（用户输入与模型回复两条路）、`a_payload_that_cannot_be_read_stops_the_segment`。 |
 | 内嵌 `grep` + `ignore` 之后冷编还在不在 60s 预算内 | §13.4 的编译预算 | **已实测（2026-09-21，本机 macOS M5，`cargo build --timings`、空 target 目录）：加之前 1m10s（`/tmp` 里 HEAD 的干净 worktree），加之后 1m10s——差值落在噪声里。** 新带进来的 13 个包（`globset` / `walkdir` / `termcolor` / `crossbeam-deque` / `memmap2` / `bstr` / `encoding_rs_io` 等）与 `turso_core` / `aws-lc-sys` 并行，不在关键路径上。**顺带发现：60s 这个预算当时就已经超了**（§13.4 记的 2026-09-16 是 64.2s），与这次改动无关——要么把预算调到实测值，要么回去找关键路径，待办。 |
-| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 8 KiB，热生效）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**未核实**：8 KiB 这个默认值对真实任务够不够——要等真实会话的 recall 次数（§49 的指标）出来再调，别凭感觉改。**已补（2026-09-21）**：那四个数现在有得数了——每份观察落盘多少字节（`tool_output_bytes`）、产物多少（`artifact_bytes`）、投影给模型多少（`projected_bytes`），以及"模型回头 `read` 我们落盘的观察"的次数（`observation_recall_count`，判据是路径落在本 Session 的 `tool-output/` 或 `artifacts/` 底下）。四者都只进 trace（`komo::observation`），不进事件流（§47）；抓取与断言见 `komo-runtime/src/executor/tests.rs` 里那两条（`the_projection_reports_how_many_bytes_it_kept_and_stored`、`reading_back_an_observation_counts_as_a_recall`）。**已接（2026-09-24）**：§6 同句里的"活动执行时限"进了配置——`[execution] call_timeout_secs`（默认 1800，热生效，走 `CallEnv` / `ToolContext`）。起因是一次真实会话：模型给 `cargo test --workspace && cargo build --release` 传了 `timeout_secs: 1800`，执行器写死的 300s 先到点，shell 判成 `uncertain`，Run 停下等人核对。现在 shell 的超时取 `min(请求, 上限)`，由工具自己杀进程组报 `Timeout`；执行器的兜底计时器在上限之外多等 15s（进程组 TERM/KILL 回收各 5s），不再与工具抢同一个时刻。回归测试：`tools::shell::tests::a_requested_timeout_beyond_the_call_limit_is_clamped_to_it`、`config::tests::the_call_timeout_is_read_from_the_execution_section`。**未做**：python 的 120s 是 `PythonRuntimeConfig.timeout`，没跟这个上限取小——上限配得比 120s 还短时 python 仍会落到兜底。 |
+| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 8 KiB，热生效）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**未核实**：8 KiB 这个默认值对真实任务够不够——要等真实会话的 recall 次数（§49 的指标）出来再调，别凭感觉改。**已补（2026-09-21）**：那四个数现在有得数了——每份观察落盘多少字节（`tool_output_bytes`）、产物多少（`artifact_bytes`）、投影给模型多少（`projected_bytes`），以及"模型回头 `read` 我们落盘的观察"的次数（`observation_recall_count`，判据是路径落在本 Session 的 `tool-output/` 或 `artifacts/` 底下）。四者都只进 trace（`komo::observation`），不进事件流（§47）；抓取与断言见 `komo-runtime/src/executor/tests.rs` 里那两条（`the_projection_reports_how_many_bytes_it_kept_and_stored`、`reading_back_an_observation_counts_as_a_recall`）。**已接（2026-09-24）**：§6 同句里的"活动执行时限"进了配置——`[execution] call_timeout_secs`（默认 1800，热生效，走 `CallEnv` / `ToolContext`）。起因是一次真实会话：模型给 `cargo test --workspace && cargo build --release` 传了 `timeout_secs: 1800`，执行器写死的 300s 先到点，shell 判成 `uncertain`，Run 停下等人核对。现在 shell 的超时取 `min(请求, 上限)`，由工具自己杀进程组报 `Timeout`；执行器的兜底计时器在上限之外多等 15s（进程组 TERM/KILL 回收各 5s），不再与工具抢同一个时刻。回归测试：`tools::shell::tests::a_requested_timeout_beyond_the_call_limit_is_clamped_to_it`、`config::tests::the_call_timeout_is_read_from_the_execution_section`。**已做（2026-10-11）**：模型发起的 `python` 不再有自己的 120s——时限就是这次调用的 `call_timeout`（`PythonHost::run_with_artifacts` 多一个 `timeout` 参数），到点由宿主终止进程组报 `Timeout`，不落到兜底成"结果不明"；`PythonEnvConfig.timeout`（120s）只剩 toolbox 启用与核对调用那一路（`PythonHost::run`）在用。回归测试：`tools::python::tests::a_python_call_runs_under_the_call_timeout_not_a_fixed_limit_of_its_own`、`python_runtime::tests::run_with_artifacts_stops_at_the_timeout_it_is_given`。 |
 | `read` 一次读回来的正文够不够模型用 | §4 与 §8.3 | **已做（2026-09-21）**：`read` 交给模型的那一段从 400 字符改到 8 KiB（`read::PREVIEW_BYTES`），投影再按预算收。**未核实**：真实仓库里"读一个文件要几次 `read`"——如果还是很多次，说明该按结构切（一次给整段函数）而不是按字节。 |
 | 记忆召回的重排值不值（一次判断请求换来的排序） | §9.4 的可选重排 | **已做（2026-09-21）**：`[typesafe]` + `memory.retrieval.rerank` / `rerank_shortlist`——短名单（比 `top_k` 宽，校验拦「一样宽」的组合）交给一条 `Choice`，按回来的概率表排序，再照旧按 `top_k` 截；**只重排不增删**，挑中 `none` 或后端不可用都保持融合顺序。**已实测（2026-09-21，本机真机，4 条候选 / 中文输入）**：`jev-1.13.0` 一次 0.6s、约 650 输入 token，顺序 `[m-4, m-1, m-2, m-3]`——热水器与空调那两条排到了前面。离线验收在 `komo-runtime/src/memory/tests.rs`（抬高本来排不进的条目、`none` 不采纳、后端坏了照常召回、开关关着不发请求），真机那条是 `memory/rerank.rs` 里的 `mod live`（`--ignored`，要 `TYPESAFE_API_KEY`）。**未核实**：真实规模（成百上千条）下短名单取多宽、这一次请求值不值——按真实会话的命中率调，别凭感觉改 |
 | 系统提示里的 skill 目录行够不够用（166 个 skill 的机器） | §5.6 的目录行 | **已实测（2026-09-21，本机真实语料 + `komo skills list`）：不够，而且坏在两处。** ① `description: >` / `|` 这些 YAML 块标量没有解析——取值是字面量 `>`，325 份 `SKILL.md` 里 111 份的描述是这么写的，目录行长成 `- log-diagnosis：>`；② 2000 字符的预算按目录序 `continue` 丢弃，166 个不同名字里只剩 16 条进提示。真实会话里模型的第一批调用是读 `cart-loong-diff` / `ask-user`（正是那 16 条里的两条），找 `log-diagnosis` 靠的是 `ls` 整个目录，多花了好几轮。**已做（2026-09-21）**：frontmatter 支持块标量（`>` 折行 / `|` 字面，含 chomping，描述里的冒号不再被当成键）；目录改成**整批**定形状——描述装得下就是"名字 + 一句描述"，装不下就只留名字（166 条名字 2752 字符），名字都装不下时末尾写"另有 N 条没列出来"；默认上限 2000 → 4000。回归测试：`frontmatter::tests::a_folded_description_is_joined_into_one_sentence`、`skills::tests::every_skill_keeps_its_name_when_the_descriptions_do_not_fit`、`a_folded_description_becomes_one_catalog_line`。**未做**：按当前输入排序的 top-K——排序块不能进 system 前缀（§9.4 的前缀缓存），先看补全之后还错不错。 |
-| 在线压缩在真实会话上多久触发一次、省下多少（§6 的 `[compaction]`） | 默认值（`keep_recent_tokens` 20000、`cache_write_read_ratio` 12.5、冷却 2 次）与"默认关"能不能翻成默认开 | **未验证（2026-10-09 落地，默认关）。** 要看的数都在 `context.compacted` 里：每次的 `decision`（`archive_tokens`、`post_compaction_tokens`、`breakeven_requests`、`reason`）、`skipped` 的理由分布、摘要请求的 `usage`；对照同一会话之后几次请求的 `cache_read` / `cache_write`（`message.assistant` 逐轮记着）算实际回本。触发太频繁就调大冷却或 `keep_recent_tokens`，几乎不触发就看是不是模型不报 `update_plan` |
+| 在线压缩在真实会话上多久触发一次、省下多少（§6 的 `[compaction]`） | 默认值（`keep_recent_tokens` 20000、`cache_write_read_ratio` 12.5、冷却 2 次）与"默认关"能不能翻成默认开 | **未验证（2026-10-09 落地，默认关）。** 要看的数都在 `context.compacted` 里：每次的 `decision`（`archive_tokens`、`post_compaction_tokens`、`breakeven_requests`、`reason`）、`skipped` 的理由分布、摘要请求的 `usage`；对照同一会话之后几次请求的 `cache_read` / `cache_write`（`message.assistant` 逐轮记着）算实际回本。触发太频繁就调大冷却或 `keep_recent_tokens`，几乎不触发就看是不是模型不报 `update_plan`。**缓存读数在主力模型上拿得到（2026-10-11 实测）**：DeepSeek 的 Responses（`input_tokens_details.cached_tokens`）与 Chat Completions（`prompt_tokens_details.cached_tokens`，另有 `prompt_cache_hit_tokens` 同值）都报，同一前缀第二次请求命中 1280/1479，现有解析两条路都读得到；10-09 之前的会话没有这一格只是因为字段那天才加 |
 | 字节 / 4 的 token 估计对中日韩正文偏多少 | §6 的估价与窗口保护（`estimate_tokens`） | **未验证。** 一个汉字 3 字节、估 0.75 token，实际常是 1–2 个——中文为主的会话估低，窗口保护会晚到。窗口判断已经与实报的 `input` 取大，残余风险是"这一轮新加的中文结果"；偏得多就按字符类别分别估，或改用 provider 的计数接口 |
 | Anthropic 修订工具结果时补的第 4 个缓存断点实际命中率 | §8.3 的衰减与提示缓存 | **Responses 后端已有实测（2026-10-10，会话 01a12475-…，magpie、claude-opus-5-5）**：首版按次数逐条改写，10 轮 run 里 `cache_read` 四次退回 13317（只剩系统提示 + 工具表），全价输入 85k（约 53k 是失效重写），折算成本与 Claude Code 持平——自动前缀缓存下改写中间一条就是整段失效，由此改成缓存优先（§8.3）。**Anthropic 的未验证。** 补在被改结果之前那条 user 消息末块——它正是更早某次请求的末尾断点；命中要看 `cache_read` 是否覆盖到那里。命中不了就退回"系统提示 + 工具表"两级，衰减省下的读取要重新算账 |

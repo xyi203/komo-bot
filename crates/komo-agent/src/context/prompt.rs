@@ -27,7 +27,7 @@ fn rules(tools: &[String]) -> String {
     if tools.iter().any(|tool| tool == UPDATE_PLAN_TOOL) {
         lines.push("- 多步的事先用 update_plan 登记计划，每做完一步更新一次。");
     }
-    lines.push("- 危险操作会被拦下等人批准；被拒绝就当作结果，不要绕过。");
+    lines.push("- 调用被拒绝就当作结果，不要换个工具绕过。");
     lines.push("- 如实报告做了什么、证据是什么；没有证据就说没有。");
     lines.join("\n")
 }
@@ -84,7 +84,7 @@ const SHELL_TOOL: &str = "shell";
 /// 想到 `komo cron list`）。`komo` 靠 PATH 找到：服务单元写入了安装时的 PATH（§3）。
 ///
 /// 学 pi 的 docs 段：只给入口（`komo --help`）和一个例子，子命令清单不抄进提示。
-const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、审批 / 介入、配置、skills、\
+const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、\
                           toolbox、Gateway）用 shell 跑 `komo <子命令>` 查，例如 `komo cron list`，\
                           其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。";
 

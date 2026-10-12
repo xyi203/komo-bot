@@ -2,7 +2,7 @@
 //!
 //! 模型仍然只用现有的 `read` / `rg`，把资源 URI 当路径交给它们。**URI 不是"特殊文件
 //! 路径"**：它在执行计划里是一个明确的目标类型（[`TargetRef`]），计划同时带着**逻辑**
-//! URI 与解析出来的真实目标——所以审批与审计回答的是"允许读哪个逻辑资源"，而规则匹配的
+//! URI 与解析出来的真实目标——所以界面与审计回答的是"读的是哪个逻辑资源"，而执行碰的
 //! 仍然是真实路径。
 //!
 //! ```text
@@ -165,7 +165,7 @@ impl ResourceUri {
         }
     }
 
-    /// 这个 scheme 是什么（日志与审批用）。
+    /// 这个 scheme 是什么（日志与界面用）。
     pub fn scheme(&self) -> &'static str {
         match self {
             Self::Skill { .. } | Self::SkillRoot => "skill",
@@ -278,7 +278,7 @@ fn parse_artifact(segments: Vec<&str>, raw: &str) -> Result<ResourceUri, UriErro
 }
 
 impl fmt::Display for ResourceUri {
-    /// **规范化**的拼法：审批、投影正文、日志用的是同一份，改一处就全改。
+    /// **规范化**的拼法：界面、投影正文、日志用的是同一份，改一处就全改。
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Skill { name, path } => write!(f, "skill://{name}/{path}"),
@@ -300,8 +300,8 @@ impl fmt::Display for ResourceUri {
 /// 执行计划触及的一个目标（§六）。
 ///
 /// 序列化上**与改造前逐字兼容**：本地路径那条写成 `{"path": "…"}`，与旧的
-/// `PlanTarget` 一模一样——所以旧审批计划仍按原哈希校验，不会因为多了资源这一维失效
-/// （§八）。资源那条多出 `uri`（逻辑入口，审批与审计看它）与 `resolved`（计划那一刻
+/// `PlanTarget` 一模一样——所以旧计划的哈希不会因为多了资源这一维而变
+/// （§八）。资源那条多出 `uri`（逻辑入口，界面与审计看它）与 `resolved`（计划那一刻
 /// 解析出来的真实目标；`tool://` 这类虚拟入口没有）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -353,7 +353,7 @@ impl fmt::Display for TargetRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LocalPath { path } => write!(f, "{}", path.display()),
-            // 审批要回答的是"允许读哪个**逻辑**资源"，所以印 URI；真实目标在它后面
+            // 界面要回答的是"读的是哪个**逻辑**资源"，所以印 URI；真实目标在它后面
             // 已经有了（`PlanTarget` 里），需要时由渲染方补。
             Self::Resource { uri, .. } => write!(f, "{uri}"),
         }
@@ -580,7 +580,7 @@ mod tests {
         ));
     }
 
-    /// 本地路径那一条**与旧行逐字兼容**：旧审批计划里存的就是 `{"path": …}`。
+    /// 本地路径那一条**与旧行逐字兼容**：旧计划里存的就是 `{"path": …}`。
     #[test]
     fn a_local_target_still_reads_and_writes_the_old_shape() {
         let old = serde_json::json!({

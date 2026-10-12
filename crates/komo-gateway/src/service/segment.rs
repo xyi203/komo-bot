@@ -5,7 +5,7 @@
 //!
 //! - **工作目录与已授权根**：Session 的 `workdir`，没有就是 `workspaces/`。
 //! - **恢复位置**：这个 Run 还有没有没收尾的调用。有就把它们原样交回执行器——**沿用
-//!   同一份计划**，因为审批绑定的是计划的哈希，重新 prepare 会换一个哈希（§7.4）。
+//!   同一份计划**：落账的是那份计划的哈希，重新 prepare 会换一个哈希（§8.4）。
 //! - **`CallEnv` 的根与挂载**（`ResourceMounts`）。
 //!
 //! `segment()` 自己的形状是 §17 那五步：`load → identity → tools → resolve ContextInput
@@ -31,7 +31,7 @@ use komo_agent::context::history::{self, ReplayScope};
 use komo_kernel::compaction::Reshape;
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::fold;
-use komo_kernel::traits::{ApprovalRepo, Clock, Ledger, LedgerError, ToolOutputStore};
+use komo_kernel::traits::{Clock, Ledger, LedgerError, ToolOutputStore};
 use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::resource::{ResourceMounts, SkillMount};
@@ -57,7 +57,6 @@ use super::ledgers::RoutedLedger;
 pub struct GatewaySegments {
     routed: Arc<RoutedLedger>,
     db: Db,
-    approvals: Arc<dyn ApprovalRepo>,
     /// 读不出来的会话要停在 `needs_attention` 上，而不是被反复领取——写那一笔要它。
     recovery: RecoveryStore,
     workspaces: PathBuf,
@@ -103,7 +102,6 @@ impl GatewaySegments {
     pub fn new(
         routed: Arc<RoutedLedger>,
         db: Db,
-        approvals: Arc<dyn ApprovalRepo>,
         recovery: RecoveryStore,
         workspaces: PathBuf,
         max_rounds: u32,
@@ -112,7 +110,6 @@ impl GatewaySegments {
         GatewaySegments {
             routed,
             db,
-            approvals,
             recovery,
             workspaces,
             session_files: None,
@@ -338,7 +335,7 @@ impl SegmentSource for GatewaySegments {
         let payloads = self.payloads_for(&session);
 
         // **这一段的身份与能力**（§4.3）：用它自己那条 `run.accepted` 里冻结下来的那一份，
-        // 而不是当前的 Profile 与工具目录。审批可能一小时之后才答复，那时配置与磁盘都可能
+        // 而不是当前的 Profile 与工具目录。介入可能一小时之后才答复，那时配置与磁盘都可能
         // 已经改过——恢复出来的 Run 不能因此换一副面孔。
         let mut identity = match context_sources::identity_for(
             &events,
@@ -548,7 +545,7 @@ impl SegmentSource for GatewaySegments {
             {
                 let online = komo_kernel::compaction::online_state(&events, &run);
                 // 压缩只在上一轮的调用全部收尾时判：切点落在轮次开头，一轮的调用与结果不分开。
-                // 衰减不切轮次、只换已完成结果的正文，没收尾的调用（等审批之后续跑）不受影响。
+                // 衰减不切轮次、只换已完成结果的正文，没收尾的调用（恢复之后续跑）不受影响。
                 let settled = resume.is_none() && surface.open_calls(&run).is_empty();
                 let reshape = compaction::decide(
                     self.routed.as_ref(),
@@ -700,8 +697,9 @@ impl GatewaySegments {
 
     /// 这个 Run 还有没有没收尾的调用（§8.4 第 4 / 6 / 7 行）。
     ///
-    /// 有就把它们原样交回执行器：**同一份计划、同一个调用号**，加上"这是第几次"。停在
-    /// 审批上的那一个还带着它的 `approval`——`/approve` 之后续跑走的就是这条路。
+    /// 有就把它们原样交回执行器：**同一份计划、同一个调用号**，加上"这是第几次"。
+    /// 2026-10-11 之前停在审批上的 Run 也走这条路：那次调用 planned 而没 started，按
+    /// §8.4"确定尚未执行 → 自动执行"续跑（审批已删除，§7）。
     ///
     /// 它的失败只有一种：**外置的计划或参数按引用读不出来**（§8.3 要求"读取历史或恢复
     /// 调用时按引用加载需要的内容"）。那与日志读不出来是同一类——会话缺了内容，不能靠
@@ -716,20 +714,6 @@ impl GatewaySegments {
         // 这个 Run 得在这个会话里。
         let Some(_) = surface.runs.get(run) else {
             return Ok(None);
-        };
-        let waiting = waiting_approval(events, run);
-        // **停在哪一次调用上由审批行回答**（`approval_requests.call_id`）：`run.waiting`
-        // 只说"停在审批上"（`RunWaiting.call` 恒为 `None`），而落点在那个权威表上——在
-        // 事件里编一个只会和它漂移。
-        let waiting_call = match &waiting {
-            Some(approval) => self
-                .approvals
-                .get(approval)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|record| record.call),
-            None => None,
         };
         let mut pending = Vec::new();
         // 外置的正文按引用读回来（§8.3）。整段共用一个 store：它只是一份路径。
@@ -749,13 +733,8 @@ impl GatewaySegments {
                 tracing::warn!(run = %run, call = %call_id, "调用找不回原始请求，跳过续跑");
                 continue;
             };
-            let approval = waiting
-                .as_ref()
-                .filter(|_| waiting_call.as_ref() == Some(call_id))
-                .cloned();
             pending.push(CallRequest {
                 resumed: Some(resumed_from(state, attempt, attempts)),
-                approval,
                 ..request
             });
         }
@@ -764,14 +743,6 @@ impl GatewaySegments {
         }
         // 已经收尾的那些在回放窗口里（`Role::Tool` 的消息），不必再交一遍。
         let settled: Vec<ToolResultForModel> = Vec::new();
-        // 停在审批上的调用，决定还没写下来就别再跑一遍——那会把同一个问题问第二次。
-        if let Some(approval) = &waiting
-            && let Ok(Some(record)) = self.approvals.get(approval).await
-            && record.decision.is_none()
-        {
-            tracing::debug!(run = %run, approval = %approval, "审批还没有结论，这一段不续跑");
-            return Ok(None);
-        }
         Ok(Some(ResumedRound { settled, pending }))
     }
 
@@ -792,30 +763,6 @@ fn without_delegate(surface: AgentSurface) -> AgentSurface {
     )
 }
 
-/// 这个 Run 停在哪条审批上。
-///
-/// §8.4 把"停"收成一个事件（`run.waiting`）加一个理由：审批是四类等待里的一类，所以这里
-/// 按 `WaitReason::Approval` 挑——`retry` / `intervention` / `dependency` 那三类不是审批，
-/// 续跑这一段要它们各自的条件成立（到点、答复、前一条终态），所以一律当"没停在审批上"。
-///
-/// **只答"哪条审批"**：停在哪个调用上是审批行自己的事（`approval_requests.call_id`），
-/// 这里返不回来——调用方去查那一行。
-fn waiting_approval(events: &[Event], run: &RunId) -> Option<komo_kernel::types::ids::ApprovalId> {
-    events
-        .iter()
-        .rev()
-        .filter(|event| event.run.as_ref() == Some(run))
-        .find_map(|event| match &event.payload {
-            EventPayload::RunWaiting(body) => match &body.reason {
-                komo_kernel::types::status::WaitReason::Approval { approval } => {
-                    Some(approval.clone())
-                }
-                _ => None,
-            },
-            _ => None,
-        })
-}
-
 /// 从日志里把一个调用的原始请求与计划找回来。
 ///
 /// **超限的参数与计划是外置的**（§8.3：单次参数超过 4 KiB 把包含它的模型消息正文存到
@@ -825,8 +772,7 @@ fn waiting_approval(events: &[Event], run: &RunId) -> Option<komo_kernel::types:
 /// 新 `prepare` 必然失败，而失败的结果又是一条不落盘的结论（见 executor 的 `execute_one`）。
 ///
 /// 计划的取法同理：内联那份是便宜的路径，大计划在 `plan_ref` 后头。§8.4 第 4 行的
-/// "沿用原计划"要求的就是它——重新准备会换一个 `plan_hash`，原先那份授权就覆盖不到了
-/// （§7.4）。
+/// "沿用原计划"要求的就是它——重新准备会换一个 `plan_hash`，落账的那份就对不上了。
 async fn call_request(
     payloads: &PayloadStore,
     events: &[Event],
@@ -870,7 +816,6 @@ async fn call_request(
         arguments,
         plan,
         resumed: None,
-        approval: None,
     }))
 }
 
@@ -880,8 +825,8 @@ async fn call_request(
 /// `tool.result` 都写着"完整输出在哪"，那条路径必须真能读——否则那句提示就是一根死链
 /// （§8.3「当前 Session 获授权的输出可通过 `read` 只读访问」）。
 ///
-/// **只读靠两件事**：`writable: false` 让 §7.1 的写入规则不命中；而真正拦住写的是
-/// §8.10 第 4 条——`sessions/` 在本机受保护名单里，写它一律 Deny（Deny 高于 Allow）。
+/// **只读**是标注（`writable: false`）；真正拦住写的是 §8.10 第 4 条——`sessions/` 在
+/// `write` / `edit` 的受保护名单里，写它一律 `Denied`（§7 唯一的硬限制）。
 ///
 /// 根与目标必须在同一套坐标系里：这里用 `real_root` 解掉符号链接，工具解析目标时走的也
 /// 是它（macOS 上 `/var` → `/private/var`，字面前缀匹配会全落空）。
@@ -897,7 +842,7 @@ fn run_roots(
         label: "workspace".into(),
     }];
     // §5.6：skill 目录是**只读根**——模型用 `read` 读 SKILL.md，`skill://` 那条路也要它们
-    // 落在已授权范围里，否则每一次读 skill 都会撞上 `outside-roots` 去问人。
+    // 落在根里，挂载点才解析得出来。
     for dir in skill_dirs {
         roots.push(WorkspaceRoot {
             path: paths::real_root(dir),
@@ -1051,66 +996,6 @@ mod tests {
             Some(plan.plan_hash()),
             "计划也要按引用读回来：重新准备会换掉 plan_hash（§7.4）"
         );
-    }
-
-    #[test]
-    fn the_waiting_approval_is_the_latest_one() {
-        let run = RunId::from_raw("run-1");
-        let waiting = |approval: &str| {
-            EventPayload::RunWaiting(komo_kernel::events::RunWaiting {
-                reason: komo_kernel::types::status::WaitReason::Approval {
-                    approval: komo_kernel::types::ids::ApprovalId::from_raw(approval),
-                },
-            })
-        };
-        let events = vec![
-            event(1, &run, waiting("ap-1")),
-            event(2, &run, waiting("ap-2")),
-        ];
-        // 最后一条说了算：中途答过的那一条不是"现在停在哪儿"。
-        assert_eq!(
-            waiting_approval(&events, &run)
-                .expect("停在审批上")
-                .as_str(),
-            "ap-2"
-        );
-    }
-
-    /// **另外三类等待不是审批**：`retry` / `intervention` / `dependency` 停在同一个
-    /// `run.waiting` 上，但各自的放行条件完全不是"有人批了这份计划"——把它们读成审批，
-    /// 续跑那一段就会拿着一条不存在的授权往下跑（§8.4、§7.5 第 3 条）。
-    #[test]
-    fn waiting_on_a_clock_or_a_person_is_not_a_waiting_approval() {
-        let run = RunId::from_raw("run-1");
-        let reason = |reason: komo_kernel::types::status::WaitReason| {
-            EventPayload::RunWaiting(komo_kernel::events::RunWaiting { reason })
-        };
-        let events = vec![
-            event(
-                1,
-                &run,
-                reason(komo_kernel::types::status::WaitReason::Retry {
-                    attempts: 2,
-                    not_before: time::macros::datetime!(2026-09-16 08:00:00 UTC),
-                    cause: komo_kernel::types::status::RetryCause::RateLimited,
-                }),
-            ),
-            event(
-                2,
-                &run,
-                reason(komo_kernel::types::status::WaitReason::Dependency {
-                    run: RunId::from_raw("run-0"),
-                }),
-            ),
-            event(
-                3,
-                &run,
-                reason(komo_kernel::types::status::WaitReason::Intervention {
-                    intervention: komo_kernel::types::ids::InterventionId::from_raw("run-1"),
-                }),
-            ),
-        ];
-        assert_eq!(waiting_approval(&events, &run), None);
     }
 
     /// §8.3：这个 Session 自己的输出与产物是**只读**根——模型看到的"完整输出在哪"得真能

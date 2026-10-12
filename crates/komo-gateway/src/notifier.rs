@@ -5,8 +5,8 @@
 //! - **home chat 只看配置**：每个 enabled 渠道的 `home_chat`，顺序是飞书 > Telegram >
 //!   WeChat（[`ChannelsConfig::home_chats`]）。没有运行时覆盖，没有 `/sethome`。
 //! - **一个都没配时返回错误给调用方，不静默丢弃**（[`DeliverError::NoTarget`]）。
-//! - **审批请求投到来源会话，加上 home chat（若不同）**：两处都能回答，第二个答复得到
-//!   "已决定"——那是审批本身的幂等，不是这里的事（§11.3）。
+//! - **介入投到来源会话，加上 home chat（若不同）**：两处都能回答，第二个答复得到
+//!   "已经答复过了"——那是答复本身的幂等，不是这里的事（§11.3）。
 //!
 //! 名单**每次投递现读**当前快照（§3 第 2 步）：改了 home_chat 保存后，下一条投递就按
 //! 新的走。
@@ -17,9 +17,7 @@ use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
 use komo_kernel::protocol::http::{InterventionDetail, InterventionSummary};
 use komo_kernel::traits::{DeliverError, Notifier};
-use komo_kernel::types::chat::{
-    ApprovalPresentation, ChannelPeer, ChannelPlatform, Delivery, DeliveryTarget, Outbound,
-};
+use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Delivery, DeliveryTarget, Outbound};
 use komo_runtime::config::ConfigHolder;
 
 use crate::deliveries::DeliveryLog;
@@ -82,37 +80,6 @@ impl HomeNotifier {
         Ok(out)
     }
 
-    /// 审批请求：**来源会话 + home chat**（若不同）。
-    ///
-    /// 来源是 Cron 或已断开的 TUI 时只有 home chat；两处都没有就报错，不静默丢弃。
-    pub async fn deliver_approval(
-        &self,
-        origin: Option<&ChannelPeer>,
-        presentation: ApprovalPresentation,
-    ) -> Result<Vec<Delivery>, DeliverError> {
-        let msg = Outbound::ApprovalRequest(Box::new(presentation));
-        let mut out = Vec::new();
-        if let Some(peer) = origin {
-            out.push(
-                self.log
-                    .deliver(&DeliveryTarget::to_peer(peer.clone()), msg.clone())
-                    .await?,
-            );
-        }
-        for target in self.home_targets() {
-            if origin.is_some_and(|peer| peer == &target.peer) {
-                continue; // 同一个会话不发两遍。
-            }
-            out.push(self.log.deliver(&target, msg.clone()).await?);
-        }
-        if out.is_empty() {
-            return Err(DeliverError::NoTarget(
-                "这条审批既没有来源会话也没有 home_chat，没人能回答它".into(),
-            ));
-        }
-        Ok(out)
-    }
-
     /// 冲刷某个会话（或全部）还没送到的投递。
     pub async fn flush(&self, peer: Option<&ChannelPeer>) -> usize {
         self.log.flush(peer).await
@@ -157,7 +124,6 @@ pub(crate) fn detail_key(detail: &InterventionDetail) -> Option<String> {
     match detail {
         InterventionDetail::Verify { summary, .. }
         | InterventionDetail::Blocked { summary, .. } => Some(intervention_key(summary)),
-        InterventionDetail::Approval(_) => None,
     }
 }
 

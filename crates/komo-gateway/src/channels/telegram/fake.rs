@@ -20,11 +20,7 @@ use tokio::task::JoinHandle;
 
 use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::traits::{GatewayError, Inbound};
-use komo_kernel::types::chat::{ApprovalPresentation, ApprovalScope};
-use komo_kernel::types::ids::{ApprovalId, OperationId, RunId, SessionId, ShortId};
-use komo_kernel::types::plan::{
-    ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
-};
+use komo_kernel::types::ids::{RunId, SessionId};
 
 use super::api::BotApi;
 
@@ -57,8 +53,6 @@ pub struct Behavior {
     pub refuse_markdown: bool,
     /// 所有 `sendMessage` 都 400。
     pub refuse_sends: bool,
-    /// 两个 `editMessage*` 都 400（决定后的界面回写失败）。
-    pub refuse_edits: bool,
     /// 无视 `offset`，永远把整个队列原样再给一次——模拟平台重投。
     pub ignore_offset: bool,
     /// `getMe` 一律 401（token 不对）。
@@ -76,13 +70,6 @@ impl Behavior {
     pub fn refuse_everything() -> Self {
         Self {
             refuse_sends: true,
-            ..Self::default()
-        }
-    }
-
-    pub fn refuse_edits() -> Self {
-        Self {
-            refuse_edits: true,
             ..Self::default()
         }
     }
@@ -259,14 +246,6 @@ async fn handle(State(state): State<Arc<FakeState>>, uri: Uri, body: Bytes) -> J
                 }))
             }
         }
-        "editMessageText" | "editMessageReplyMarkup" => {
-            if state.behavior.refuse_edits {
-                refuse(400, "Bad Request: message is not modified")
-            } else {
-                ok(json!(true))
-            }
-        }
-        "answerCallbackQuery" => ok(json!(true)),
         other => refuse(404, &format!("Not Found: {other}")),
     };
     Json(reply)
@@ -291,22 +270,6 @@ pub fn text_update(update_id: i64, chat_id: i64, chat_type: &str, from: i64, tex
             "chat": { "id": chat_id, "type": chat_type },
             "from": { "id": from, "is_bot": false, "first_name": "op" },
             "text": text,
-        },
-    })
-}
-
-pub fn callback_update(update_id: i64, chat_id: i64, from: i64, data: &str) -> Value {
-    json!({
-        "update_id": update_id,
-        "callback_query": {
-            "id": format!("cb-{update_id}"),
-            "from": { "id": from, "is_bot": false, "first_name": "op" },
-            "data": data,
-            "message": {
-                "message_id": update_id * 10,
-                "date": 1,
-                "chat": { "id": chat_id, "type": "private" },
-            },
         },
     })
 }
@@ -369,43 +332,5 @@ impl Inbound for RecordingInbound {
         self.received.lock().expect("入站记录").push(msg);
         self.log.push("handle:end");
         Ok(self.ack.clone())
-    }
-}
-
-// ---------------------------------------------------------------- 审批样例
-
-pub fn plan() -> ExecutionPlan {
-    ExecutionPlan {
-        operation_id: OperationId::from_raw("op-1"),
-        source: PlanSource::Interactive {
-            session: SessionId::from_raw("s-1"),
-        },
-        tool: "shell".into(),
-        operation: Operation::ShellCommand {
-            command: "rm -rf /tmp/scratch".into(),
-        },
-        run: Some(RunId::from_raw("run-1")),
-        tool_call: None,
-        args: json!({ "command": "rm -rf /tmp/scratch" }),
-        cwd: Some(std::path::PathBuf::from("/home/op/work")),
-        targets: vec![PlanTarget::local("/tmp/scratch", TargetAccess::Write)],
-        versions: PlanVersions::default(),
-        resources: Vec::new(),
-        recovery: RecoveryMode::NoSafeRecovery,
-        then_run: None,
-    }
-}
-
-pub fn presentation() -> ApprovalPresentation {
-    ApprovalPresentation {
-        approval: ApprovalId::from_raw("ap-1"),
-        short_id: ShortId::parse("7K2M").unwrap(),
-        plan_hash: plan().plan_hash(),
-        plan: plan(),
-        reason: "写入 workspace 之外的路径".into(),
-        changes: Some("--- a/x\n+++ b/x".into()),
-        evidence: None,
-        scopes: vec![ApprovalScope::Once, ApprovalScope::Run],
-        valid_until: None,
     }
 }

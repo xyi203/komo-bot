@@ -4,7 +4,7 @@
 //! 组合，**不新增第七个**。
 //!
 //! `delegate` 是这条规则的一个例外，而且它**不是第七个基础工具**：模型看不见任何新能力
-//! ——子代理用的还是这六个工具，它自己的每一次调用照常过 Policy。委派只是"把一件事交给
+//! ——子代理用的还是这六个工具。委派只是"把一件事交给
 //! 另一条 Run"的入口，而且不由工具执行（见 [`delegate`]）。
 
 pub mod codemode;
@@ -16,6 +16,7 @@ pub mod fusion;
 pub mod mcp;
 pub mod paths;
 pub mod process;
+pub mod protect;
 pub mod python;
 pub mod read;
 pub mod resources;
@@ -133,7 +134,7 @@ pub fn parse_args<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// 规范化后的参数：计划里存的是它，审批绑定的也是它，所以它必须来自结构体而不是
+/// 规范化后的参数：计划里存的是它、计划哈希算的也是它，所以它必须来自结构体而不是
 /// 模型给的原始 JSON（多一个未知字段就会改哈希）。
 pub fn normalized<T: Serialize>(args: &T) -> Result<serde_json::Value, ToolError> {
     serde_json::to_value(args).map_err(|error| ToolError::InvalidArguments {
@@ -170,7 +171,7 @@ pub fn plan_time() -> time::OffsetDateTime {
 #[cfg(test)]
 pub(crate) mod test_support {
     use komo_kernel::types::ids::{AttemptId, RunId, SessionId, ToolCallId};
-    use komo_kernel::types::plan::{ApprovedPlan, ExecutionPlan, PlanSource};
+    use komo_kernel::types::plan::PlanSource;
     use komo_kernel::types::tool::{CancelToken, ToolContext, WorkspaceRoot};
     use std::path::Path;
 
@@ -203,12 +204,6 @@ pub(crate) mod test_support {
                 komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS,
             ),
         }
-    }
-
-    /// 只在工具自己的单元测试里用：这里测的是**执行**，不是放行——放行在 executor
-    /// 的测试里。
-    pub fn approved(plan: ExecutionPlan) -> ApprovedPlan {
-        ApprovedPlan::new(plan, komo_kernel::test_support::proof())
     }
 
     /// 这次尝试的流式写入器。生产里由 `ToolOutputStore::begin` 开、executor 借给

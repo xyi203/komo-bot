@@ -22,11 +22,7 @@ use tokio::task::JoinHandle;
 
 use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::traits::{GatewayError, Inbound};
-use komo_kernel::types::chat::{ApprovalPresentation, ApprovalScope};
-use komo_kernel::types::ids::{ApprovalId, OperationId, RunId, SessionId, ShortId};
-use komo_kernel::types::plan::{
-    ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
-};
+use komo_kernel::types::ids::{RunId, SessionId};
 
 use super::api::FeishuApi;
 
@@ -59,10 +55,8 @@ pub struct Behavior {
     pub refuse_token: bool,
     /// 发消息一律被拒。
     pub refuse_sends: bool,
-    /// PATCH 一律被拒（决定之后的界面回写失败）。
+    /// PATCH 一律被拒（Run 卡片换不成结果）。
     pub refuse_patch: bool,
-    /// 问不到会话类型。
-    pub refuse_chats: bool,
     /// token 的 `expire` 只给 1 秒。
     pub short_lived_token: bool,
     /// 回复一律被拒（处理中卡片发不出去）。
@@ -91,13 +85,6 @@ impl Behavior {
     pub fn refuse_patch() -> Self {
         Self {
             refuse_patch: true,
-            ..Self::default()
-        }
-    }
-
-    pub fn refuse_chats() -> Self {
-        Self {
-            refuse_chats: true,
             ..Self::default()
         }
     }
@@ -274,19 +261,6 @@ async fn handle(
             let id = state.next_message_id.fetch_add(1, Ordering::SeqCst);
             json!({ "code": 0, "msg": "ok", "data": { "message_id": format!("om_{id}") } })
         }
-    } else if path.contains("/im/v1/chats/") {
-        state.record("chats", &json!({ "chat_id": last }));
-        if state.behavior.refuse_chats {
-            refuse(232000, "chat not found")
-        } else {
-            // 约定：`oc_dm` 与 `oc_1` 是单聊，别的是群。
-            let mode = if last == "oc_dm" || last == "oc_1" {
-                "p2p"
-            } else {
-                "group"
-            };
-            json!({ "code": 0, "msg": "ok", "data": { "chat_mode": mode } })
-        }
     } else {
         refuse(404, "no such fake endpoint")
     };
@@ -356,14 +330,9 @@ pub fn text_event(
     .into_bytes()
 }
 
-/// 一条 `card.action.trigger` 的原始负载。
-pub fn card_action_event(
-    event_id: &str,
-    chat_id: &str,
-    operator: &str,
-    action: &str,
-    short_id: &str,
-) -> Vec<u8> {
+/// 一条 `card.action.trigger` 的原始负载。komo 已经不发带按钮的卡片（§7），留着它只为
+/// 断言"平台还推来的回调不会变成一条消息"。
+pub fn card_action_event(event_id: &str, chat_id: &str, operator: &str) -> Vec<u8> {
     json!({
         "schema": "2.0",
         "header": {
@@ -377,7 +346,7 @@ pub fn card_action_event(
             "token": "c-callback-token",
             "action": {
                 "tag": "button",
-                "value": { "action": action, "short_id": short_id },
+                "value": { "action": "approve", "short_id": "7K2M" },
             },
             "host": "im_message",
             "context": {
@@ -463,43 +432,5 @@ impl Inbound for RecordingInbound {
             return Err(GatewayError::Internal("测试".into()));
         }
         Ok(self.ack.clone())
-    }
-}
-
-// ---------------------------------------------------------------- 审批样例
-
-pub fn plan() -> ExecutionPlan {
-    ExecutionPlan {
-        operation_id: OperationId::from_raw("op-1"),
-        source: PlanSource::Interactive {
-            session: SessionId::from_raw("s-1"),
-        },
-        tool: "shell".into(),
-        operation: Operation::ShellCommand {
-            command: "rm -rf /tmp/scratch".into(),
-        },
-        run: Some(RunId::from_raw("run-1")),
-        tool_call: None,
-        args: json!({ "command": "rm -rf /tmp/scratch" }),
-        cwd: Some(std::path::PathBuf::from("/home/op/work")),
-        targets: vec![PlanTarget::local("/tmp/scratch", TargetAccess::Write)],
-        versions: PlanVersions::default(),
-        resources: Vec::new(),
-        recovery: RecoveryMode::NoSafeRecovery,
-        then_run: None,
-    }
-}
-
-pub fn presentation() -> ApprovalPresentation {
-    ApprovalPresentation {
-        approval: ApprovalId::from_raw("ap-1"),
-        short_id: ShortId::parse("7K2M").unwrap(),
-        plan_hash: plan().plan_hash(),
-        plan: plan(),
-        reason: "写入 workspace 之外的路径".into(),
-        changes: Some("--- a/x\n+++ b/x".into()),
-        evidence: None,
-        scopes: vec![ApprovalScope::Once, ApprovalScope::Run],
-        valid_until: None,
     }
 }

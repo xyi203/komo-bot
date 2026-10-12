@@ -3,7 +3,7 @@
 //! 一个接口一个方法，请求与响应**就是** `komo_kernel::protocol::http` 里的类型——这样
 //! 客户端与 Gateway 不可能各自演化出一个形状。
 //!
-//! **幂等请求键由调用方给。**提交输入、审批、Cron 与 Memory 变更的请求类型里都有
+//! **幂等请求键由调用方给。**提交输入、介入答复、Cron 与 Memory 变更的请求类型里都有
 //! `request_key` 字段（§13.1），这里不代生成：客户端重发同一次操作要带同一个键，而
 //! "同一次操作"是调用方才知道的事。[`RequestKeys`] 是给调用方用的构造器，不是默认值。
 
@@ -370,9 +370,9 @@ impl KomoClient {
 
     // ---- /v1/interventions（§7.5）----
 
-    /// 待处理清单：**审批、结果不明、阻塞三类一张表**（§7.5）。
+    /// 待处理清单：**结果不明、阻塞两类一张表**（§7.5）。
     ///
-    /// 它是 `runs` 与 `approval_requests` 的并集查询——派生视图，不是第四张表。所以这里
+    /// 它是 `runs` 上的查询——派生视图，不是另一张表。所以这里
     /// 每一个查询条件都只是过滤，不改变"权威在哪"。
     pub async fn interventions(
         &self,
@@ -391,8 +391,8 @@ impl KomoClient {
         self.get_with("/v1/interventions", &params).await
     }
 
-    /// 单项详情。`handle` 就是 [`InterventionSummary::handle`]：审批是短 ID（§11.3），
-    /// `verify` / `blocked` 是 Run ID。
+    /// 单项详情。`handle` 就是 [`InterventionSummary::handle`]：`verify` / `blocked` 都是
+    /// Run ID。
     pub async fn intervention(&self, handle: &str) -> ClientResult<InterventionDetail> {
         self.get(&format!("/v1/interventions/{}", path_segment(handle)))
             .await
@@ -401,9 +401,8 @@ impl KomoClient {
     /// 答复一条。**已答复的返回原结论，不报错**（§11.3）——`already_answered` 说明这次
     /// 什么都没改。
     ///
-    /// 结论按种类分派（§7.5）：`approve` / `reject` 是审批的，`satisfied` /
-    /// `not_performed` 是 `verify` 的，`resolve` 是 `blocked` 的，`abandon` 三类共有。
-    /// 范围（`scope`）只有 `approve` 用得上。
+    /// 结论按种类分派（§7.5）：`satisfied` / `not_performed` 是 `verify` 的，`resolve` 是
+    /// `blocked` 的，`abandon` 两类共有。一次答一条，没有批量。
     pub async fn answer_intervention(
         &self,
         handle: &str,
@@ -414,39 +413,6 @@ impl KomoClient {
             request,
         )
         .await
-    }
-
-    /// 一次答一批（§11.3 的 `/approve all`）。名单由**发起方**列出——协议里没有"全部"，
-    /// 服务端不替操作者决定哪些算全部。
-    ///
-    /// **只答审批，而且范围固定为本次调用**：范围授权绑的是一份具体的计划，一批互不相干
-    /// 的计划共用一个范围，只能是替操作者猜一个他没看过的答复。
-    pub async fn answer_interventions(
-        &self,
-        request: &InterventionBatchAnswerRequest,
-    ) -> ClientResult<InterventionBatchAnswerResponse> {
-        self.post("/v1/interventions/answers", request).await
-    }
-
-    // ---- /v1/approvals（只有审计这一个用途）----
-
-    /// 与这个 Run 相关的审批记录，**含已经决定过的**（§7.4 的审计面）。
-    ///
-    /// 这是审批这一族里**唯一还活着的读**，而它存在的理由只有一个：`komo run inspect`
-    /// 要答「这一步是谁放行的」——那条审批早就不在待处理集合里了，§7.5 的统一清单
-    /// （只列待处理）按定义查不到它。
-    ///
-    /// 答复不在这里：`approve` / `reject` 走 [`KomoClient::answer_intervention`]，与另外两类
-    /// 同一条路。也没有单条 `GET /v1/approvals/{id}`——详情走
-    /// [`KomoClient::intervention`]。
-    pub async fn approvals_of_run(&self, run: &RunId) -> ClientResult<Vec<ApprovalRecord>> {
-        let response: ApprovalListResponse = self
-            .get_with(
-                "/v1/approvals",
-                &[("run", run.to_string()), ("include_decided", "true".into())],
-            )
-            .await?;
-        Ok(response.approvals)
     }
 
     // ---- /v1/cron ----
@@ -731,7 +697,6 @@ mod wire_tests {
     use crate::error::ClientError;
     use crate::test_server::{FakeGateway, Reply};
     use komo_kernel::protocol::PROTOCOL_VERSION;
-    use komo_kernel::types::chat::ApprovalScope;
     use komo_kernel::types::ids::Seq;
 
     fn health_body() -> serde_json::Value {
@@ -1111,7 +1076,7 @@ mod wire_tests {
             .interventions(&InterventionListQuery::default())
             .await
             .unwrap();
-        // 不带 `kind`：三类一起要——清单不是"审批清单"（§7.5）。
+        // 不带 `kind`：两类一起要——结果不明与阻塞是同一张清单（§7.5）。
         assert_eq!(server.requests()[0].query, "");
     }
 
@@ -1224,16 +1189,11 @@ mod wire_tests {
         // §11.3：已答复的返回原结论，不报错。
         let server = FakeGateway::spawn(|_, _| {
             Reply::ok(serde_json::json!({
-                "handle": "7K2M",
-                "kind": "approval",
-                "verdict": "approve",
-                "decision": {
-                    "approved": true,
-                    "scope": "once",
-                    "decided_at": "2026-09-16T08:00:00Z",
-                    "consumed": false
-                },
-                "note": "已批准（本次调用）",
+                "handle": "run-1",
+                "kind": "verify",
+                "verdict": "satisfied",
+                "run_state": "queued",
+                "note": "已补一条结果，原 Run 继续",
                 "already_answered": true
             }))
         })
@@ -1241,10 +1201,9 @@ mod wire_tests {
         let response = server
             .client()
             .answer_intervention(
-                "7K2M",
+                "run-1",
                 &InterventionAnswerRequest {
-                    verdict: InterventionVerdict::Approve,
-                    scope: Some(ApprovalScope::Once),
+                    verdict: InterventionVerdict::Satisfied,
                     request_key: None,
                 },
             )
@@ -1252,80 +1211,41 @@ mod wire_tests {
             .unwrap();
         assert!(response.already_answered);
         // 回执那句话由服务端给，界面直接用它（`note`）。
-        assert_eq!(response.note, "已批准（本次调用）");
+        assert_eq!(response.note, "已补一条结果，原 Run 继续");
         let sent = &server.requests()[0];
         assert_eq!(sent.method, "POST");
-        assert_eq!(sent.path, "/v1/interventions/7K2M/answer");
+        assert_eq!(sent.path, "/v1/interventions/run-1/answer");
     }
 
+    /// 旧 Gateway 的回执还带着 `decision`（2026-10-11 之前的审批字段）：多出来的字段不该
+    /// 让解码失败，请求体里也不再有 `scope`。
     #[tokio::test]
-    async fn a_verify_answer_carries_no_scope() {
-        // §7.5：范围只有审批用得上；`satisfied` 之类的结论不带它。
+    async fn an_answer_from_an_old_gateway_with_extra_fields_still_decodes() {
         let server = FakeGateway::spawn(|_, _| {
             Reply::ok(serde_json::json!({
-                "handle": "run-1", "kind": "verify", "verdict": "satisfied",
-                "note": "已补一条结果", "already_answered": false
+                "handle": "run-1", "kind": "blocked", "verdict": "abandon",
+                "decision": null,
+                "note": "已放弃", "already_answered": false
             }))
         })
         .await;
-        server
+        let response = server
             .client()
             .answer_intervention(
                 "run-1",
                 &InterventionAnswerRequest {
-                    verdict: InterventionVerdict::Satisfied,
-                    scope: None,
+                    verdict: InterventionVerdict::Abandon,
                     request_key: None,
                 },
             )
             .await
             .unwrap();
+        assert_eq!(response.note, "已放弃");
         assert!(
             !server.requests()[0].body.contains("scope"),
             "{}",
             server.requests()[0].body
         );
-    }
-
-    #[tokio::test]
-    async fn a_batch_answer_names_every_handle_it_was_told_to() {
-        let server = FakeGateway::spawn(|_, _| {
-            Reply::ok(serde_json::json!({"answered": [], "missing": ["9QRS"]}))
-        })
-        .await;
-        let response = server
-            .client()
-            .answer_interventions(&InterventionBatchAnswerRequest {
-                handles: vec!["7K2M".into(), "9QRS".into()],
-                approved: true,
-                request_key: None,
-            })
-            .await
-            .unwrap();
-        // 点了名却已经不在的那些单独列出，不让整批失败（§11.3）。
-        assert_eq!(response.missing, vec!["9QRS".to_string()]);
-        let sent = &server.requests()[0];
-        assert_eq!(sent.path, "/v1/interventions/answers");
-        assert!(sent.body.contains("7K2M"), "{}", sent.body);
-    }
-
-    #[tokio::test]
-    async fn the_run_scoped_approval_read_is_only_for_audit() {
-        // §7.4：`komo run inspect` 要答「这一步是谁放行的」，而那条审批早就不在待处理
-        // 集合里了——所以这一读必须带 `include_decided`，否则永远查不到它。
-        let server =
-            FakeGateway::spawn(|_, _| Reply::ok(serde_json::json!({"approvals": []}))).await;
-        let records = server
-            .client()
-            .approvals_of_run(&RunId::from_raw("run-1"))
-            .await
-            .unwrap();
-        assert!(records.is_empty());
-        let sent = &server.requests()[0];
-        assert_eq!(sent.method, "GET");
-        assert_eq!(sent.path, "/v1/approvals");
-        assert_eq!(sent.param("run").as_deref(), Some("run-1"));
-        assert_eq!(sent.param("include_decided").as_deref(), Some("true"));
     }
 
     #[tokio::test]

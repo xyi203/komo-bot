@@ -1,15 +1,16 @@
-//! toolbox：保存下来的 Python 能力，以及它们的**候选 → 测试 → 审核 → 启用**（§5.3、§5.4）。
+//! toolbox：保存下来的 Python 能力，以及它们的**候选 → 测试 → 启用**（§5.3、§5.4）。
 //!
 //! ```text
 //! 读取模块和使用说明
 //!   → write/edit 写入候选版本          Toolbox::save_candidate
-//!   → Policy 审核候选代码的执行         （候选执行走 python 的 code 模式，照常过 Policy）
 //!   → 运行测试并保存结果                Toolbox::run_candidate_tests
-//!   → 展示差异、依赖变化和验证证据      Toolbox::enable_plan → ApprovalPresentation
-//!   → Policy 审核启用操作               Operation::ToolboxChange
+//!   → 展示差异、依赖变化和验证证据      Toolbox::enable_preview
 //!   → 校验候选哈希与已测版本一致        Toolbox::enable 的第一件事
 //!   → 原子替换当前版本                  写临时文件 + rename
 //! ```
+//!
+//! 启用 / 停用**直接生效**：操作者在 CLI 里说了启用就启用，没有待审批的中间态，也没有
+//! 后台等答复（§7，2026-10-11 删除审批）。
 //!
 //! 三条边界在这个模块里各只有一处实现：
 //!
@@ -18,11 +19,10 @@
 //!   就 import 不到（`layout` 的模块文档）。
 //! - **未测过的版本启用不了**（§5.4「校验候选哈希与已测版本一致」）。测试结果记在候选
 //!   的元数据里并**绑定版本**：改一个字节，版本就变，那份结果立刻对不上号。
-//! - **版本变化使旧授权失效**（§5.4、§7.2）。启用写进
+//! - **版本变化使旧计划对不上**（§5.4、§7.2）。启用写进
 //!   [`ModuleVersion`]，`python` 的 `call` 计划把它填进
-//!   [`PlanVersions::module`](komo_kernel::types::plan::PlanVersions)，于是
-//!   `Grant::covers` 的 `versions_cover` 自动把绑旧版本的授权挡在外面——kernel 里已经
-//!   有那条测试，这里不重复实现判断。
+//!   [`PlanVersions::module`](komo_kernel::types::plan::PlanVersions)，执行前再核一次：
+//!   绑旧版本的计划按版本冲突拒（`PythonTool::module_still_matches`）。
 
 pub mod builtin;
 pub mod diff;
@@ -111,7 +111,7 @@ pub struct TestReport {
 }
 
 impl TestReport {
-    /// 一行话，够放进审批消息的"已有验证"那一项。
+    /// 一行话，够放进启用回执的"已有验证"那一项。
     pub fn headline(&self) -> String {
         let verdict = if self.passed { "通过" } else { "未通过" };
         format!(
@@ -120,7 +120,7 @@ impl TestReport {
         )
     }
 
-    /// 审批里那一整块"已有验证结果"。
+    /// 启用回执里那一整块"已有验证结果"。
     pub fn evidence(&self) -> String {
         if self.output.trim().is_empty() {
             self.headline()
@@ -173,7 +173,7 @@ pub struct Enabled {
     pub version: ModuleVersion,
     #[serde(with = "time::serde::rfc3339")]
     pub enabled_at: OffsetDateTime,
-    /// 启用时那份验证证据。审批之后它就是这一版的档案。
+    /// 启用时那份验证证据。启用之后它就是这一版的档案。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tests: Option<TestReport>,
     /// 随 komo 装进来的内置模块（§5.5 的 memos）。
@@ -509,7 +509,7 @@ impl Toolbox {
 
     /// 启用中的版本与候选之间的那份改动，加上候选的测试结果。
     ///
-    /// 审批消息的「改动」与「已有验证」两项就是它（§7.2、§14 阶段 6 的验收列）。
+    /// 启用前给操作者看的「改动」与「已有验证」两项就是它（§7.2、§14 阶段 6 的验收列）。
     pub fn enable_preview(&self, module: &str) -> Result<EnablePreview, ToolboxError> {
         let module = self.name(module)?;
         let Some(candidate) = self.candidate(&module)? else {
@@ -541,8 +541,8 @@ impl Toolbox {
     /// 顺序是定死的：**先校验候选哈希与已测版本一致，再原子替换**。反过来做的话，一个
     /// 没通过测试的版本会先成为"当前版本"，再被拒绝——而在那之间它是可调用的。
     ///
-    /// `wanted` 给出时必须与候选当前的版本逐字相同：这是"批准的是哪一版"与"现在要装的
-    /// 是哪一版"的对账，审批期间有人改过候选就在这里被挡下来。
+    /// `wanted` 给出时必须与候选当前的版本逐字相同：这是"看过的是哪一版"与"现在要装的
+    /// 是哪一版"的对账，看完之后有人改过候选就在这里被挡下来。
     pub fn enable(
         &self,
         module: &str,
@@ -692,7 +692,7 @@ pub struct ResolvedCall {
     pub env: Vec<String>,
 }
 
-/// 启用审批要展示的那两项。
+/// 启用前要展示的那两项。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnablePreview {
     pub module: String,
@@ -975,8 +975,8 @@ const README: &str = r#"# toolbox
 
 1. `write` 到 `.staging/<module>.py`（需要的话再写 `.staging/test_<module>.py`）。
 2. `komo toolbox test <module>` 跑候选测试。
-3. `komo toolbox enable <module>` ——这一步产生一条审批，消息里带**版本差异**与
-   **测试结果**；批准之后候选才成为当前版本。
+3. `komo toolbox enable <module>` ——列出**版本差异**与**测试结果**，候选直接成为当前
+   版本（测试没通过的候选启用不了）。
 
 模块约定：
 

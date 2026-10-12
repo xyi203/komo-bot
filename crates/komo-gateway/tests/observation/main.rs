@@ -2,13 +2,13 @@
 //!
 //! - **投影**：超预算时头尾都留着、写明省了多少，并给出**可直接 `read` 的资源入口**
 //!   （`artifact://<run>/<call>/<attempt>/result`，§4.7）；
-//! - **恢复**：那条入口真的读得进去——Session 自己的输出是只读根，**不用审批**；
+//! - **恢复**：那条入口真的读得进去——Session 自己的输出是只读根，不停下来问人；
 //! - **预算**：`[execution] model_result_bytes` 说了算（§6），不是写死的 1 KiB；
 //! - **一份事实**：同一个 Run 的下一个执行段回放时，渲染出的字节与刚跑完那次**完全相同**
 //!   ——跑过的调用如此，没跑起来的（工具名不认识）也如此。
 //! - **计划**：`update_plan` 的计划只在日志里，重启之后折出同一份在线状态，回放的结果
 //!   与刚跑完那次逐字节相同。
-//! - **组合调用**：`edit` 带 `then_run` 只问一次、两步各跑一次，结果是一条，回放逐字节相同。
+//! - **组合调用**：`edit` 带 `then_run` 两步各跑一次，结果是一条，回放逐字节相同。
 //! - **压缩**：账本里一条 `context.compacted` 之后，回放是任务 → 摘要 → 切点起的原样轮次，
 //!   外置的摘要按引用读回来，两次重启之间那一段逐字节不变。
 //!
@@ -19,6 +19,7 @@
 
 use std::sync::Arc;
 
+use komo_gateway::service::test_support::Unsure;
 use komo_gateway::service::test_support::harness::{
     FakeLlm, Home, call_round, config_toml, text_round,
 };
@@ -27,6 +28,22 @@ use komo_kernel::traits::LlmClient;
 use komo_kernel::types::resource::{ResourceUri, output_file_path};
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::RoundInput;
+
+/// 停住一个 Run 的那次调用：测试工具 `unsure` 一调就"结果不明"，Run 停在 `verify` 上等人
+/// 核对；答 `satisfied` 之后同一个 Run 起下一段（§7.5）。审批删掉之前这一步是"停在审批上"。
+fn park_call(
+    n: u32,
+    provider_id: &str,
+) -> Result<komo_kernel::types::turn::Round, komo_kernel::types::turn::LlmError> {
+    call_round(n, provider_id, "unsure", serde_json::json!({}))
+}
+
+/// 一个挂了 `unsure` 的数据目录。
+fn parking_home(config: &str) -> Home {
+    let home = Home::with_config(config);
+    home.install_tools(vec![Unsure::new().tool()]);
+    home
+}
 
 /// 这个 Session 里所有 `tool.result`，按顺序。
 fn tool_results(events: &[Event]) -> Vec<&ToolResult> {
@@ -78,7 +95,7 @@ fn replayed(llm: &FakeLlm, tool: &str) -> String {
 
 /// 一个 5000 行的文件 + 一条 `read`：正文远超 2 KiB 的预算。
 fn home_with_a_big_file() -> (Home, std::path::PathBuf) {
-    let home = Home::with_config(&config_toml(
+    let home = parking_home(&config_toml(
         // 上下文预算调到 2 KiB：这条测试要看的就是"超了预算会怎样"（§6）。
         "[execution]\nmodel_result_bytes = 2048\n",
     ));
@@ -147,7 +164,7 @@ async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads
         "印出来的入口要正好指向落盘的那一份"
     );
 
-    // ── 再用**同一条入口**发起一次 `read`：模型原样交回来就真读得进去，而且**不用审批**
+    // ── 再用**同一条入口**发起一次 `read`：模型原样交回来就真读得进去，而且不停下来问人
     // （Session 自己的输出是只读根，§8.3）。
     let llm = FakeLlm::new(vec![vec![
         call_round(1, "pc-again", "read", serde_json::json!({ "path": entry })),
@@ -170,7 +187,7 @@ async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads
     let on_disk = std::fs::read_to_string(&readable).expect("读 output.json");
     assert!(on_disk.contains("行 300"), "被省略的那一段就在完整输出里");
 
-    // 而模型确实能从那条入口读回来——**而且不用审批**（Session 自己的输出是只读根）。
+    // 而模型确实能从那条入口读回来——不停下来问人（Session 自己的输出是只读根）。
     let read_back = fed_back(&llm, "read");
     assert!(
         read_back.contains("\"v\":1"),
@@ -178,10 +195,10 @@ async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads
     );
 }
 
-/// 同一个 Run 的第二段（第一次停在审批上）回放时，工具结果的正文必须与刚跑完那次一致。
+/// 同一个 Run 的第二段（第一次停在一条介入上）回放时，工具结果的正文必须与刚跑完那次一致。
 ///
 /// 回放窗口里**正跑着的那条 Run 是完整协议**（§8.3），所以要看回放，就得让同一个 Run 再起
-/// 一段——这里用"半轮停在审批上、批准之后接着跑"这条最普通的路。换成新 Run 就不成了：历史
+/// 一段——这里用"半轮停在结果不明上、答 `satisfied` 之后接着跑"这条路。换成新 Run 就不成了：历史
 /// Run 只发布正文，工具结果那一轮不再进新请求。
 #[tokio::test]
 async fn the_replayed_window_renders_the_same_bytes_as_the_live_round() {
@@ -193,13 +210,8 @@ async fn the_replayed_window_renders_the_same_bytes_as_the_live_round() {
             "read",
             serde_json::json!({ "path": "大文件.txt" }),
         ),
-        // 第二个调用要过审批：这一轮就停在这儿，Run 让出名额。
-        call_round(
-            2,
-            "pc-shell",
-            "shell",
-            serde_json::json!({ "command": "echo 收尾" }),
-        ),
+        // 第二个调用结果不明：这一轮就停在这儿，Run 让出名额。
+        park_call(2, "pc-shell"),
         text_round(3, "都做完了。"),
     ]]);
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
@@ -209,12 +221,11 @@ async fn the_replayed_window_renders_the_same_bytes_as_the_live_round() {
         .await
         .run;
 
-    let pending = gateway.wait_approval().await;
-    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
+    let pending = gateway.wait_intervention(&run).await;
     let live = fed_back(&llm, "read");
 
-    // 批准 → 这条 Run 重新入队、起**第二个执行段**；它装配上下文时要回放那一轮。
-    gateway.decide(&pending.approval, true).await;
+    // 答复 → 这条 Run 重新入队、起**第二个执行段**；它装配上下文时要回放那一轮。
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -225,34 +236,30 @@ async fn the_replayed_window_renders_the_same_bytes_as_the_live_round() {
     );
 }
 
-/// `edit` 带 `then_run`（Action Fusion）：两步只问一次，批准一次之后改动与命令各跑一次，
-/// 结果是**一条**；同一个 Run 的下一段回放时，那条结果的字节与刚交回模型的一样。
+/// `edit` 带 `then_run`（Action Fusion）：改动与命令各跑一次，结果是**一条**；同一个 Run
+/// 的下一段回放时，那条结果的字节与刚交回模型的一样。
 #[tokio::test]
-async fn a_fused_edit_asks_once_runs_once_and_replays_the_same_bytes() {
-    let home = Home::with_config(&config_toml(""));
+async fn a_fused_edit_runs_once_and_replays_the_same_bytes() {
+    let home = parking_home(&config_toml(""));
     std::fs::create_dir_all(home.workspace()).expect("工作目录");
     let file = home.workspace().join("app.txt");
     std::fs::write(&file, "version = 1\n").expect("写文件");
-    // 每个执行段一段脚本：停审批 → 批准后跑组合调用、再停一次审批 → 回放、收尾。
+    // 第一段：组合调用直接跑，然后停在一次结果不明上；答复之后同一个 Run 起下一段、回放、收尾。
     let llm = FakeLlm::new(vec![
-        vec![call_round(
-            1,
-            "pc-edit",
-            "edit",
-            serde_json::json!({
-                "path": "app.txt",
-                "match_text": "version = 1",
-                "replace_text": "version = 2",
-                "then_run": { "command": "echo ran >> ran.txt; cat app.txt" },
-            }),
-        )],
-        // 第二个调用再停一次审批：批准之后同一个 Run 起下一段，回放上一条结果。
-        vec![call_round(
-            2,
-            "pc-shell",
-            "shell",
-            serde_json::json!({ "command": "echo 收尾" }),
-        )],
+        vec![
+            call_round(
+                1,
+                "pc-edit",
+                "edit",
+                serde_json::json!({
+                    "path": "app.txt",
+                    "match_text": "version = 1",
+                    "replace_text": "version = 2",
+                    "then_run": { "command": "echo ran >> ran.txt; cat app.txt" },
+                }),
+            ),
+            park_call(2, "pc-park"),
+        ],
         vec![text_round(3, "改完也跑过了。")],
     ]);
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
@@ -262,19 +269,7 @@ async fn a_fused_edit_asks_once_runs_once_and_replays_the_same_bytes() {
         .await
         .run;
 
-    // 改动在根里本可直接放行，命令要问：组合计划只问这一次，而且批之前一步都不做。
-    let pending = gateway.wait_approval().await;
-    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
-    assert!(pending.plan.then_run.is_some(), "审批绑的是整份组合计划");
-    assert_eq!(std::fs::read_to_string(&file).unwrap(), "version = 1\n");
-    assert!(!home.workspace().join("ran.txt").exists());
-
-    gateway.decide(&pending.approval, true).await;
-    let second = gateway.wait_approval().await;
-    assert_ne!(
-        second.approval, pending.approval,
-        "第二次停在收尾那条命令上"
-    );
+    let pending = gateway.wait_intervention(&run).await;
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "version = 2\n");
     let ran = std::fs::read_to_string(home.workspace().join("ran.txt")).expect("命令跑过");
     assert_eq!(ran.lines().count(), 1, "命令只跑了一次：{ran:?}");
@@ -298,7 +293,7 @@ async fn a_fused_edit_asks_once_runs_once_and_replays_the_same_bytes() {
         .expect("组合调用那条结果");
     assert!(fused.stdout.is_some(), "命令输出落在这次尝试的 stdout 里");
 
-    gateway.decide(&second.approval, true).await;
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     assert_eq!(
@@ -314,16 +309,11 @@ async fn a_fused_edit_asks_once_runs_once_and_replays_the_same_bytes() {
 /// 回放时渲染出的字节与刚交回模型的那次一样。
 #[tokio::test]
 async fn a_refused_call_renders_the_same_bytes_live_and_replayed() {
-    let home = Home::with_config(&config_toml(""));
+    let home = parking_home(&config_toml(""));
     let llm = FakeLlm::new(vec![vec![
         call_round(1, "pc-nope", "nope", serde_json::json!({})),
-        // 第二个调用要过审批：Run 停在这儿，批准之后起第二个执行段。
-        call_round(
-            2,
-            "pc-shell",
-            "shell",
-            serde_json::json!({ "command": "echo 收尾" }),
-        ),
+        // 第二个调用结果不明：Run 停在这儿，答复之后起第二个执行段。
+        park_call(2, "pc-shell"),
         text_round(3, "都做完了。"),
     ]]);
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
@@ -333,13 +323,12 @@ async fn a_refused_call_renders_the_same_bytes_live_and_replayed() {
         .await
         .run;
 
-    let pending = gateway.wait_approval().await;
-    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
+    let pending = gateway.wait_intervention(&run).await;
     let live = fed_back(&llm, "nope");
     assert!(live.starts_with("[nope · 失败 · "), "{live}");
     assert!(live.contains("没有 nope"), "{live}");
 
-    gateway.decide(&pending.approval, true).await;
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -350,7 +339,7 @@ async fn a_refused_call_renders_the_same_bytes_live_and_replayed() {
     );
 }
 
-/// 投影设置冻结在 Run 受理时的快照里（§6.2）：Run 停在审批上时改配置、热重载，批准之后
+/// 投影设置冻结在 Run 受理时的快照里（§6.2）：Run 停在介入上时改配置、热重载，答复之后
 /// 第二段回放出来的字节仍与刚跑完那次一样——热重载只影响之后受理的 Run。
 #[tokio::test]
 async fn a_hot_reload_does_not_change_how_a_running_run_projects() {
@@ -362,12 +351,7 @@ async fn a_hot_reload_does_not_change_how_a_running_run_projects() {
             "read",
             serde_json::json!({ "path": "大文件.txt" }),
         ),
-        call_round(
-            2,
-            "pc-shell",
-            "shell",
-            serde_json::json!({ "command": "echo 收尾" }),
-        ),
+        park_call(2, "pc-shell"),
         text_round(3, "都做完了。"),
     ]]);
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
@@ -377,8 +361,7 @@ async fn a_hot_reload_does_not_change_how_a_running_run_projects() {
         .await
         .run;
 
-    let pending = gateway.wait_approval().await;
-    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
+    let pending = gateway.wait_intervention(&run).await;
     let live = fed_back(&llm, "read");
     assert!(live.len() > 1500, "受理时的预算是 2 KiB：{}", live.len());
 
@@ -399,7 +382,7 @@ async fn a_hot_reload_does_not_change_how_a_running_run_projects() {
         512
     );
 
-    gateway.decide(&pending.approval, true).await;
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -410,7 +393,7 @@ async fn a_hot_reload_does_not_change_how_a_running_run_projects() {
     );
 }
 
-/// 读一个大文件 → 两轮小调用 → 一条要审批的 `shell`：前四次请求之后停在审批上。
+/// 读一个大文件 → 两轮小调用 → 一条结果不明的调用：前四次请求之后停在介入上。
 fn decay_script()
 -> Vec<Vec<Result<komo_kernel::types::turn::Round, komo_kernel::types::turn::LlmError>>> {
     vec![vec![
@@ -422,18 +405,13 @@ fn decay_script()
         ),
         call_round(2, "pc-s1", "read", serde_json::json!({ "path": "小.txt" })),
         call_round(3, "pc-s2", "read", serde_json::json!({ "path": "小.txt" })),
-        call_round(
-            4,
-            "pc-shell",
-            "shell",
-            serde_json::json!({ "command": "echo 收尾" }),
-        ),
+        park_call(4, "pc-shell"),
         text_round(5, "都做完了。"),
     ]]
 }
 
 fn home_with_big_and_small(config: &str) -> Home {
-    let home = Home::with_config(config);
+    let home = parking_home(config);
     let lines: String = (1..=5000).map(|n| format!("行 {n}\n")).collect();
     std::fs::create_dir_all(home.workspace()).expect("工作目录");
     std::fs::write(home.workspace().join("大文件.txt"), &lines).expect("写文件");
@@ -494,7 +472,7 @@ fn replayed_big(llm: &FakeLlm) -> String {
 /// 相同**的那份。
 ///
 /// 窗口小到上下文一直贴着线，压缩关着：读一个大文件 → 两轮小调用（大结果已完整给过两次，
-/// 有资格了）→ 一条要审批的 `shell`（这一轮的请求里已经换过了）→ 批准，第二段回放。
+/// 有资格了）→ 一条结果不明的调用（这一轮的请求里已经换过了）→ 答复，第二段回放。
 #[tokio::test]
 async fn the_decayed_view_is_the_same_live_and_replayed() {
     let config = config_toml("").replace(
@@ -514,13 +492,12 @@ async fn the_decayed_view_is_the_same_live_and_replayed() {
         .await
         .run;
 
-    let pending = gateway.wait_approval().await;
-    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
+    let pending = gateway.wait_intervention(&run).await;
 
     assert_eq!(
         llm.inputs.lock().expect("轮输入").len(),
         4,
-        "停在审批上之前请求了四次"
+        "停下来之前请求了四次"
     );
     let full = big_fed(&llm, 1);
     assert!(full.len() > 4096, "完整视图要超过默认阈值：{}", full.len());
@@ -540,7 +517,7 @@ async fn the_decayed_view_is_the_same_live_and_replayed() {
     assert!(live.contains("完整输出：artifact://"), "{live}");
     assert!(live.len() + 1024 <= full.len());
 
-    gateway.decide(&pending.approval, true).await;
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -567,7 +544,7 @@ async fn the_decayed_view_is_the_same_live_and_replayed() {
 
 /// 本次改动要修的回归：短任务里大结果从不被改写。多轮请求都带着大结果，没有计划边界、
 /// 没有窗口压力、缓存是热的——前缀只追加：日志里没有 `decayed`，驱动从没被要求改过前面
-/// 的消息，大结果每次都是完整正文；停在审批上、重启再批，回放给出的还是同一份完整正文。
+/// 的消息，大结果每次都是完整正文；停在介入上、重启再答，回放给出的还是同一份完整正文。
 #[tokio::test]
 async fn a_short_task_never_rewrites_a_big_result() {
     let home = home_with_big_and_small(&config_toml(""));
@@ -582,8 +559,7 @@ async fn a_short_task_never_rewrites_a_big_result() {
         )
         .await
         .run;
-    let pending = gateway.wait_approval().await;
-    assert_eq!(pending.run.as_ref(), Some(&run));
+    let pending = gateway.wait_intervention(&run).await;
 
     let count = llm.inputs.lock().expect("轮输入").len();
     assert_eq!(count, 4);
@@ -602,7 +578,7 @@ async fn a_short_task_never_rewrites_a_big_result() {
     gateway.stop().await;
     let llm2 = FakeLlm::finisher("都做完了。");
     let gateway = home.start(Arc::clone(&llm2) as Arc<dyn LlmClient>).await;
-    gateway.decide(&pending.approval, true).await;
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -610,7 +586,7 @@ async fn a_short_task_never_rewrites_a_big_result() {
     assert!(decayed_decisions(&home.events(&session)).is_empty());
 }
 
-/// 缓存冷了就换：上一次请求已经是很久以前（等审批等过了缓存存活时间），续跑这一段开头
+/// 缓存冷了就换：上一次请求已经是很久以前（等人等过了缓存存活时间），续跑这一段开头
 /// 记下一条 `decayed`（`cache_cold`、不欠债），第一次请求带的就是短视图——不用 `revised`。
 ///
 /// 日志不能改写、也不能真等 5 分钟：重启时把判缓存冷没冷的那个"现在"拨快一点。
@@ -628,7 +604,7 @@ async fn resuming_after_the_cache_went_cold_decays_at_the_segment_start() {
         )
         .await
         .run;
-    let pending = gateway.wait_approval().await;
+    let pending = gateway.wait_intervention(&run).await;
     let full = big_fed(&llm, 1);
     gateway.stop().await;
 
@@ -639,7 +615,7 @@ async fn resuming_after_the_cache_went_cold_decays_at_the_segment_start() {
 
     let llm2 = FakeLlm::finisher("都做完了。");
     let gateway = home.start(Arc::clone(&llm2) as Arc<dyn LlmClient>).await;
-    gateway.decide(&pending.approval, true).await;
+    gateway.answer(&pending.handle, "satisfied").await;
 
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
@@ -671,14 +647,14 @@ async fn resuming_after_the_cache_went_cold_decays_at_the_segment_start() {
     );
 }
 
-/// `update_plan` 的计划只在日志里：两次更新（登记 → 完成一步）之后停在审批上，Gateway
+/// `update_plan` 的计划只在日志里：两次更新（登记 → 完成一步）之后停在介入上，Gateway
 /// 重启，从日志折出的在线状态还是同一份计划、同样一个边界；第二段回放的计划结果与刚跑
 /// 完那次逐字节相同。
 #[tokio::test]
 async fn the_plan_survives_a_restart_and_replays_the_same_bytes() {
     use komo_kernel::compaction::online_state;
 
-    let home = Home::with_config(&config_toml(""));
+    let home = parking_home(&config_toml(""));
     let step = |id: &str, status: &str| serde_json::json!({ "id": id, "goal": format!("做 {id}"), "status": status });
     let llm = FakeLlm::new(vec![vec![
         call_round(
@@ -700,12 +676,7 @@ async fn the_plan_survives_a_restart_and_replays_the_same_bytes() {
                 },
             }),
         ),
-        call_round(
-            3,
-            "pc-shell",
-            "shell",
-            serde_json::json!({ "command": "echo 收尾" }),
-        ),
+        park_call(3, "pc-shell"),
     ]]);
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gateway.open_session().await;
@@ -714,9 +685,12 @@ async fn the_plan_survives_a_restart_and_replays_the_same_bytes() {
         .await
         .run;
 
-    let pending = gateway.wait_approval().await;
-    assert_eq!(pending.run.as_ref(), Some(&run), "停的是这条 Run");
-    assert_eq!(pending.plan.tool, "shell", "update_plan 不该停下来等审批");
+    let pending = gateway.wait_intervention(&run).await;
+    assert!(
+        pending.question.contains("unsure"),
+        "停在那次结果不明的调用上，update_plan 不停：{}",
+        pending.question
+    );
     let live = |provider_call_id: &str| {
         llm.inputs
             .lock()
@@ -770,7 +744,7 @@ async fn the_plan_survives_a_restart_and_replays_the_same_bytes() {
         "重启之后从日志折出的是同一份在线状态"
     );
 
-    gateway.decide(&pending.approval, true).await;
+    gateway.answer(&pending.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 
@@ -799,8 +773,8 @@ async fn the_plan_survives_a_restart_and_replays_the_same_bytes() {
     assert_eq!(replayed("pc-p2"), live_p2, "完成那次回放要逐字节相同");
 }
 
-/// 在线压缩的回放（§8.3）：三轮 `read` 之后停在审批上，账本里补一条 `context.compacted`
-/// （切在第三轮开头，摘要长到要外置），重启再批：第二段的请求是**任务 → 摘要 → 第三轮起
+/// 在线压缩的回放（§8.3）：三轮 `read` 之后停在介入上，账本里补一条 `context.compacted`
+/// （切在第三轮开头，摘要长到要外置），重启再答：第二段的请求是**任务 → 摘要 → 第三轮起
 /// 的原样轮次**；再停一次、再重启，第三段回放的同一段前缀逐字节不变。
 #[tokio::test]
 async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
@@ -808,7 +782,7 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
     use komo_kernel::test_support::compacted;
     use komo_kernel::types::turn::Role;
 
-    let home = Home::with_config(&config_toml(""));
+    let home = parking_home(&config_toml(""));
     std::fs::create_dir_all(home.workspace()).expect("工作目录");
     std::fs::write(home.workspace().join("小.txt"), "一行\n").expect("写文件");
     let read = || serde_json::json!({ "path": "小.txt" });
@@ -816,12 +790,7 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
         call_round(1, "pc-r1", "read", read()),
         call_round(2, "pc-r2", "read", read()),
         call_round(3, "pc-r3", "read", read()),
-        call_round(
-            4,
-            "pc-s1",
-            "shell",
-            serde_json::json!({ "command": "echo 一" }),
-        ),
+        park_call(4, "pc-s1"),
     ]]);
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gateway.open_session().await;
@@ -829,8 +798,7 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
         .submit(&session, "compact-1", "读三遍小文件，再跑两条命令")
         .await
         .run;
-    let first = gateway.wait_approval().await;
-    assert_eq!(first.run.as_ref(), Some(&run));
+    let first = gateway.wait_intervention(&run).await;
 
     let rounds: Vec<_> = home
         .events(&session)
@@ -870,19 +838,14 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
         "长摘要外置，行里只留引用：{line:?}"
     );
 
-    // 重启 → 批 → 第二段。
+    // 重启 → 答 → 第二段。
     gateway.stop().await;
-    let llm = FakeLlm::new(vec![vec![call_round(
-        5,
-        "pc-s2",
-        "shell",
-        serde_json::json!({ "command": "echo 二" }),
-    )]]);
+    let llm = FakeLlm::new(vec![vec![park_call(5, "pc-s2")]]);
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    gateway.decide(&first.approval, true).await;
+    gateway.answer(&first.handle, "satisfied").await;
     let second = loop {
-        let pending = gateway.wait_approval().await;
-        if pending.approval != first.approval {
+        let pending = gateway.wait_intervention(&run).await;
+        if pending.call != first.call {
             break pending;
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -931,17 +894,18 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
             (Role::User, Some("<摘要>".into()), vec![]),
             (Role::Assistant, None, vec!["pc-r3".into()]),
             (Role::Tool, None, vec!["pc-r3".into()]),
-            // 批准的那次调用这一段才跑，结果经轮输入回去，不在开段的回放里。
+            // 结果不明的那次调用由操作者核对收尾（`satisfied`），结果已在账上，开段就回放。
             (Role::Assistant, None, vec!["pc-s1".into()]),
+            (Role::Tool, None, vec!["pc-s1".into()]),
         ],
         "任务 → 摘要（外置的正文按引用读回来）→ 第三轮起原样"
     );
 
-    // 再重启 → 批 → 第三段：同一段前缀逐字节不变。
+    // 再重启 → 答 → 第三段：同一段前缀逐字节不变。
     gateway.stop().await;
     let llm = FakeLlm::finisher("都做完了。");
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    gateway.decide(&second.approval, true).await;
+    gateway.answer(&second.handle, "satisfied").await;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     let segment_three = llm
@@ -955,7 +919,7 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
     assert_eq!(
         segment_three.len(),
         segment_two.len() + 2,
-        "多了 s1 的结果与 s2 那一轮"
+        "多了 s2 那一轮与它的结果"
     );
     assert_eq!(
         serde_json::to_string(&segment_three[..segment_two.len()]).unwrap(),

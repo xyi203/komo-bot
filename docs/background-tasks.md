@@ -47,7 +47,7 @@
   `kind = task` 就拒绝，结果只交回一层。
 - **follow**：`follow(task_id, text)` 把一句话提交进已有的任务会话，它带着自己的历史接着做；
   结果同样交回 home。短号来自派出回执与交回消息。
-- **审批与"需要你判断"**：任务里的审批照 §11.4 投来源 + home chat；"需要你判断"的消息前面
+- **"需要你判断"**（2026-10-11 起没有审批，介入只剩 `verify` / `blocked`）：消息前面
   挂上 `后台任务 #短号「标题」：`，同时看着几个任务时分得清是哪一个在问。
 
 同步的 `delegate`（子 Run 在同一 Session 里、父等它）不变：那是"这件事我自己等着"，
@@ -66,7 +66,7 @@ HTTP 派出去的任务没有渠道对端，但结果仍要交回 home）。委�
 
 "需要你判断"（`verify` / `blocked`）重复投递：看客投过一次，周期兜底
 （`sweep_unseen_interventions`）没看到"投过"的记号，换成清单里的措辞再投一遍。现在看客投之前
-先占 `start_delivering_intervention(run)`，与审批同一个名额。
+先占 `start_delivering_intervention(run)`，与周期兜底同一个名额。
 
 ## 5. 删掉的
 
@@ -79,7 +79,8 @@ HTTP 派出去的任务没有渠道对端，但结果仍要交回 home）。委�
 
 - `tests/agents`：`a_background_task_reports_back_through_home`（派出 → 任务以 home 的 Agent
   跑完 → 结果经 home 转告、任务原话不直接投 → follow 进同一任务、结果再经 home 转告）、
-  `home_answers_while_a_task_waits_on_approval`。
+  `home_answers_while_a_task_waits_on_a_person`（任务停在一条等人核对的介入上时 home 照样答话；
+  2026-10-11 之前靠审批把任务停住，审批删除后改用测试专用工具 `unsure` 让它停在 verify 上）。
 - `tests/recovery`：`reattach::a_background_task_in_flight_across_a_restart_still_reports_back`、
   `verdicts::a_chat_verify_is_delivered_once_even_after_the_sweep`。
 
@@ -87,4 +88,3 @@ HTTP 派出去的任务没有渠道对端，但结果仍要交回 home）。委�
 
 - 长任务的进度提示（hermes 每 180 s 一句"还在跑"）。
 - 交回的那一轮允许模型不说话（hermes 的 NO_REPLY，只对内部输入开放）。
-- 审批卡片也带上 `#短号「标题」`。

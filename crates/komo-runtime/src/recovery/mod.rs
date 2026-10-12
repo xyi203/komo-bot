@@ -1,12 +1,11 @@
 //! Recovery：启动扫描与调用核对，决策表在 kernel（§8.4、§8.6、§8.7）。
 //!
-//! 「Gateway 自动接续能够确定恢复位置的任务。用户只处理审批、时效或结果不明等确实需要
-//! 判断的情况。」这个模块做的是那句话里"确定恢复位置"的那一半：**采集三样观察，交给
+//! 「Gateway 自动接续能够确定恢复位置的任务。用户只处理时效或结果不明等确实需要判断的
+//! 情况。」这个模块做的是那句话里"确定恢复位置"的那一半：**采集三样观察，交给
 //! kernel 的纯函数决定，然后执行那个决定**。
 //!
 //! 一条贯穿全表的规则写在这里的每一个分支上：**回放只补索引与派生执行状态**——不调用
-//! 工具、不发送外部请求、不消费授权，也不覆盖数据库里已经记下的取消或权限撤销
-//! （§8.5）。"继续执行"在这里一律等于"把 Run 放回队列"，真正接着跑是 AgentLoop 领走
+//! 工具、不发送外部请求，也不覆盖数据库里已经记下的取消（§8.5）。"继续执行"在这里一律等于"把 Run 放回队列"，真正接着跑是 AgentLoop 领走
 //! 它以后的事，而它读的是同一份日志。
 
 mod observe;
@@ -18,20 +17,14 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use komo_kernel::events::Event;
 use komo_kernel::recovery::{
-    ApprovalObservation, LogTail, OutputCheck, PendingCall, RecoveryAction, RecoveryInput,
-    SessionObservation, decide,
+    LogTail, OutputCheck, PendingCall, RecoveryAction, RecoveryInput, SessionObservation, decide,
 };
-use komo_kernel::traits::{
-    ApprovalRepo, Clock, Ledger, LedgerError, RepoError, StoreError, ToolOutputStore,
-};
+use komo_kernel::traits::{Ledger, LedgerError, RepoError, StoreError, ToolOutputStore};
 use komo_kernel::types::ids::{AttemptId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::refs::{AttemptRef, PublishedOutput};
 use komo_kernel::types::status::{RunState, SessionState, WaitReason};
-use time::OffsetDateTime;
 
-pub use observe::{
-    StartedCall, events_of, log_tail, output_ref_of, started_call, waiting_on_approval,
-};
+pub use observe::{StartedCall, events_of, log_tail, output_ref_of, started_call};
 pub use orphan::SessionDirOrphanOutputs;
 pub use processes::{
     ChildProcess, ChildRegistry, ExecutorLiveness, Liveness, LockHolderLiveness, ProcessProbe,
@@ -50,7 +43,7 @@ pub enum RecoveryError {
 
 /// state.db 里那些**未终态 Run** 的样子，以及恢复要在索引上做的几件事。
 ///
-/// 它不在 kernel 的 trait 表里，因为 kernel 那张表只列了"账本、队列、审批、Cron……"这
+/// 它不在 kernel 的 trait 表里，因为 kernel 那张表只列了"账本、队列、Cron……"这
 /// 几个跨层接缝；"未完成 Run 的索引"是 store 的派生状态，恢复扫描是它唯一的读者。
 /// **生产实现在 store**（§8.7 的四条 SQL 就在那里），这里只要一个能替身的形状。
 #[async_trait]
@@ -174,7 +167,7 @@ pub struct RecoveryOutcome {
 pub enum Applied {
     /// 补齐索引后放回队列，由 AgentLoop 接着跑。
     Requeued,
-    /// 保持原状：还在等审批 / 等干预 / 等退避 / 等前一条 Run / 已经是终态 / 等同一请求键
+    /// 保持原状：还在等干预 / 等退避 / 等前一条 Run / 已经是终态 / 等同一请求键
     /// 重传。**放它出来不是恢复扫描的事**——等退避的看时钟、等依赖的看前一条的终态
     /// （§8.9）。
     LeftAsIs,
@@ -282,14 +275,14 @@ impl RecoveryReport {
             .count()
     }
 
-    /// 「打开 komo 时可以看到"2 个任务已接续，1 个等待审批"」（§8.8）。
+    /// 「打开 komo 时可以看到"2 个任务已接续，1 个等待处理"」（§8.8）。
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         if self.requeued() > 0 {
             parts.push(format!("{} 个任务已接续", self.requeued()));
         }
         if self.waiting() > 0 {
-            parts.push(format!("{} 个在等待（审批 / 干预 / 退避）", self.waiting()));
+            parts.push(format!("{} 个在等待（干预 / 退避）", self.waiting()));
         }
         if self.needs_operator() > 0 {
             parts.push(format!("{} 个需要你处理", self.needs_operator()));
@@ -311,8 +304,6 @@ pub struct RecoveryScan {
     ledger: Arc<dyn Ledger>,
     index: Arc<dyn RecoveryIndex>,
     outputs: Arc<dyn ToolOutputStore>,
-    approvals: Arc<dyn ApprovalRepo>,
-    clock: Arc<dyn Clock>,
     executor: ExecutorId,
     liveness: Arc<dyn ExecutorLiveness>,
     orphans: Arc<dyn OrphanOutputs>,
@@ -331,8 +322,6 @@ impl RecoveryScan {
         ledger: Arc<dyn Ledger>,
         index: Arc<dyn RecoveryIndex>,
         outputs: Arc<dyn ToolOutputStore>,
-        approvals: Arc<dyn ApprovalRepo>,
-        clock: Arc<dyn Clock>,
         executor: ExecutorId,
         liveness: Arc<dyn ExecutorLiveness>,
     ) -> Self {
@@ -340,8 +329,6 @@ impl RecoveryScan {
             ledger,
             index,
             outputs,
-            approvals,
-            clock,
             executor,
             liveness,
             // 默认不查孤儿输出：行为与接这条能力之前一致。
@@ -457,7 +444,6 @@ impl RecoveryScan {
 
         let log_tail = log_tail(&events, &run.run);
         let (output_check, orphan) = self.check_output(&events, run, &log_tail).await;
-        let approval = self.observe_approval(&events, run).await?;
 
         Ok(Observed {
             input: RecoveryInput {
@@ -465,7 +451,6 @@ impl RecoveryScan {
                 wait: run.wait.clone(),
                 log_tail,
                 output_check,
-                approval,
                 result_delivered: run.result_delivered,
                 // 「无法确认旧执行已结束时，阻止该任务重复启动并显示原因」（§8.7）。
                 previous_executor_stopped: self.liveness.stopped(run.claimed_by.as_ref()),
@@ -621,35 +606,7 @@ impl RecoveryScan {
         }
     }
 
-    /// 审批的观察。**权威是 state.db**——JSONL 里的审计副本不能自行创建授权（§7.4）。
-    ///
-    /// 只有**真的停在审批上**才去问数据库：停在退避、干预或前一条 Run 上的 Run 问不出
-    /// 审批来，硬问只会把"找不到"当成损坏。
-    async fn observe_approval(
-        &self,
-        events: &[Event],
-        run: &UnfinishedRun,
-    ) -> Result<ApprovalObservation, RecoveryError> {
-        if !matches!(run.wait, Some(WaitReason::Approval { .. })) {
-            return Ok(ApprovalObservation::None);
-        }
-        let Some(id) = waiting_on_approval(events, &run.run) else {
-            return Ok(ApprovalObservation::None);
-        };
-        let Some(record) = self.approvals.get(&id).await? else {
-            return Ok(ApprovalObservation::MissingFromDatabase);
-        };
-        Ok(match &record.decision {
-            None => ApprovalObservation::Pending { approval: id },
-            Some(decision) => ApprovalObservation::Decided {
-                approval: id,
-                approved: decision.approved,
-                still_valid: still_valid(&record, decision, self.clock.now()),
-            },
-        })
-    }
-
-    /// 执行一个决定。**这里没有任何一条路径会调用工具、发请求或消费授权。**
+    /// 执行一个决定。**这里没有任何一条路径会调用工具或发请求。**
     ///
     /// 唯一"写"到账本上的是补记一条已经完整落盘的结果（`VerifyEffect` 那一支），而那是
     /// **复用原输出**，不是重放动作。
@@ -662,12 +619,15 @@ impl RecoveryScan {
         match action {
             // 能确定恢复位置的：补索引 → 放回队列。接着跑是 AgentLoop 的事，它读的是
             // 同一份日志，所以"从哪儿接着跑"不需要在这里再说一遍。
+            //
+            // 删审批之前停在审批上的旧 Run（`WaitReason::Approval`，只解码旧数据）也走这里：
+            // kernel 按日志尾判出那次调用 planned 而没 started → `ExecutePlannedCall`，按
+            // "批准"续跑（§7，2026-10-11）。
             RecoveryAction::BackfillIndexAndQueue
             | RecoveryAction::DiscardPartialAndRerequestModel
             | RecoveryAction::ResumeFromPlan
             | RecoveryAction::ExecutePlannedCall { .. }
-            | RecoveryAction::BackfillResultAndContinue { .. }
-            | RecoveryAction::ResumeWithDecision { .. } => {
+            | RecoveryAction::BackfillResultAndContinue { .. } => {
                 self.index.backfill(&run.run).await?;
                 Ok(self.requeue(run).await?)
             }
@@ -755,27 +715,6 @@ impl RecoveryScan {
             Applied::Superseded
         })
     }
-}
-
-/// 这条决定现在还成立吗（§8.4 第 8 行的 `still_valid`）。
-///
-/// 这里判得了的只有两条：**没过期**，以及**只批一次的授权还没被用掉**。范围、计划哈希
-/// 与 Job 版本的核对在消费那一刻由 [`ApprovalRepo::consume`] 做——那是权威，这里不重
-/// 复一份可能和它不一致的判断。
-fn still_valid(
-    record: &komo_kernel::protocol::http::ApprovalRecord,
-    decision: &komo_kernel::protocol::http::ApprovalDecisionRecord,
-    now: OffsetDateTime,
-) -> bool {
-    use komo_kernel::types::chat::ApprovalScope;
-
-    if record.valid_until.is_some_and(|until| until <= now) {
-        return false;
-    }
-    if decision.scope == ApprovalScope::Once && decision.consumed {
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]

@@ -49,7 +49,8 @@ pub enum ToolError {
     /// `edit` 的匹配内容没找到——不做模糊猜测。
     #[error("没有找到要替换的内容：{path}")]
     NoMatch { path: String },
-    /// 被 Policy 拒绝。作为明确结果交回模型（§7.4）。
+    /// 被拒绝：`write` / `edit` 要写 komo 自己的状态（§7、§8.10），或 codemode 脚本里调
+    /// 了不是只读的工具。作为明确结果交回模型。旧事件里的 Policy 拒绝也是它。
     #[error("被拒绝：{reason}")]
     Denied { reason: String },
     /// 超过活动执行时限。
@@ -107,7 +108,7 @@ pub struct ToolContext {
     pub source: PlanSource,
     /// 本次执行的工作目录。
     pub cwd: PathBuf,
-    /// 已授权的根目录：workspace、artifacts、skills（只读）等。
+    /// 已知的根目录：workspace、artifacts、skills（只读）等。
     pub roots: Vec<WorkspaceRoot>,
     /// 资源命名空间的挂载点（§六）：`skill://` 的根、这个会话的内容目录、这次的能力面。
     ///
@@ -125,10 +126,9 @@ pub struct ToolContext {
 
 /// 这次执行是在接一次没有收尾的调用（§8.4、§8.6）。
 ///
-/// **它在 `ToolContext` 上，不在 `ExecutionPlan` 里**，理由是硬的：审批绑定的是计划的
-/// 哈希，而恢复执行用的必须是**同一份**计划——把"这是第二次"写进计划，哈希就变了，原
-/// 来那条授权立刻覆盖不到它，重启之后每个等过审批的调用都要重新问一遍人（§7.4 明说
-/// "审批无需用户因重启再答一次"）。计划回答"这个动作是什么、它可以怎样恢复"
+/// **它在 `ToolContext` 上，不在 `ExecutionPlan` 里**，理由是硬的：账本按计划哈希核对
+/// `tool.planned` 与 `tool.started`，而恢复执行用的必须是**同一份**计划——把"这是第二
+/// 次"写进计划，哈希就变了，同一个调用前后对不上。计划回答"这个动作是什么、它可以怎样恢复"
 /// （[`RecoveryMode`](super::plan::RecoveryMode)），上下文回答"这一次是第几次"。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumedCall {
@@ -164,8 +164,8 @@ impl ResumedCall {
 }
 
 impl ToolContext {
-    /// 这个路径落在哪个已授权的根里。落不进任何一个 → None（由 Policy 决定是 Ask
-    /// 还是 Deny，工具自己不放行）。
+    /// 这个路径落在哪个已知的根里。落不进任何一个 → None（工具按需决定怎么说，例如
+    /// 标成"根外"）。
     pub fn root_for(&self, path: &std::path::Path) -> Option<&WorkspaceRoot> {
         self.roots
             .iter()
@@ -174,12 +174,12 @@ impl ToolContext {
     }
 }
 
-/// 一个已授权的根目录。
+/// 一个已知的根目录。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceRoot {
     pub path: PathBuf,
     pub writable: bool,
-    /// 这个根是干什么的，只为界面和规则可读。
+    /// 这个根是干什么的，只为界面可读。
     pub label: String,
 }
 
@@ -187,9 +187,9 @@ pub struct WorkspaceRoot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum PythonJob {
-    /// 任意代码。不会因为 import 了已审核模块而自动获得同样授权。
+    /// 任意代码。
     Code { code: String },
-    /// 已保存模块中**明确导出**的函数，按已审核版本执行；不是任意属性查找。
+    /// 已保存模块中**明确导出**的函数，按已保存的版本执行；不是任意属性查找。
     Call {
         module: String,
         function: String,

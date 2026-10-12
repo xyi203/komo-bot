@@ -6,8 +6,8 @@
 //!
 //! `verify` 与 `write` 同源（内容哈希），但它需要**替换之后**那份内容的哈希，而那要
 //! 读文件才算得出来——所以 `prepare` 把它算好写进规范化参数（`result_version`）。计划
-//! 因此绑定了"从这一份内容出发"：文件在审批期间被人动过，重新 prepare 得到的哈希就
-//! 不同，旧授权自然覆盖不到（§7.2「批准后再次校验目标和版本，变化则重新评估」）。
+//! 因此绑定了"从这一份内容出发"：文件在计划之后被人动过，执行时版本对不上就
+//! 按版本冲突失败（§7.2「执行前再次校验目标和版本」）。
 
 use std::path::PathBuf;
 
@@ -16,8 +16,7 @@ use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
-    ApprovedPlan, ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
-    Verification,
+    ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess, Verification,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::resource::TargetRef;
@@ -25,7 +24,8 @@ use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutpu
 use serde::{Deserialize, Serialize};
 
 use super::fusion::{ThenRun, attach};
-use super::write::{atomic_replace, proposed, target_path, unrunnable, verify_content};
+use super::protect::Protected;
+use super::write::{atomic_replace, target_path, verify_content};
 use super::{ExpectedVersion, FileVersion, as_text, current, normalized, parse_args, plan_time};
 
 /// 模型给的参数。`result_version` 是 `prepare` 补上的，模型不填。
@@ -57,11 +57,21 @@ pub struct EditResult {
 }
 
 #[derive(Debug, Default)]
-pub struct EditTool;
+pub struct EditTool {
+    /// komo 自己的状态（§8.10）：目标落在这里就在 `prepare` 里拒（[`super::protect`]）。
+    protected: Protected,
+}
 
 impl EditTool {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// 装上受保护路径名单（数据目录下的 `sessions/`、`state.db`、`runtime/`、`.env`）。
+    /// 不装 = 空名单，什么都不拦。
+    pub fn protecting(mut self, paths: Vec<PathBuf>) -> Self {
+        self.protected = Protected::new(paths);
+        self
     }
 }
 
@@ -107,6 +117,9 @@ impl Tool for EditTool {
             });
         }
         let path = super::paths::resolve(&args.path, &ctx.cwd)?;
+        // 唯一的硬限制（§7）：komo 自己的状态不许改。带 `then_run` 也一样——计划不成立，
+        // 命令就不会跑。
+        self.protected.check(&path)?;
 
         // 读元信息与正文是允许的（prepare 不得执行未审核代码，读文件不是执行）。
         let (before_hash, result_version) = match current(&path)? {
@@ -149,12 +162,12 @@ impl Tool for EditTool {
 
     async fn execute(
         &self,
-        plan: ApprovedPlan,
+        plan: ExecutionPlan,
         _ctx: &ToolContext,
         // 文件工具不产生流式输出：结构化结果由 executor 发布。
         _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
-        let plan = plan.plan();
+        let plan = &plan;
         let args: EditArgs = parse_args(plan.args.clone(), "edit")?;
         let path: PathBuf = target_path(plan)?;
 
@@ -204,21 +217,6 @@ impl Tool for EditTool {
             .first()
             .and_then(|target| target.expected_version.clone());
         verify_content(&path, &intended, before.as_ref())
-    }
-
-    /// 与 `execute` 同一套核对与替换，只是不落盘：执行时会失败的计划不给 diff。
-    async fn changes(&self, plan: &ExecutionPlan) -> Option<String> {
-        let args: EditArgs = parse_args(plan.args.clone(), "edit").ok()?;
-        let path = target_path(plan).ok()?;
-        let Some((bytes, version)) = current(&path).ok()? else {
-            return Some(unrunnable(missing(&path)));
-        };
-        if let Err(conflict) = check_expected(&path, &version, expected(&args, plan).as_ref()) {
-            return Some(unrunnable(conflict));
-        }
-        let before = as_text(bytes, &path).ok()?;
-        let (after, _) = apply(&before, &args, &path).ok()?;
-        proposed(&path, Some(&before), &after)
     }
 }
 
@@ -287,7 +285,7 @@ fn apply(text: &str, args: &EditArgs, path: &std::path::Path) -> Result<(String,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::test_support::{approved, context, writer};
+    use crate::tools::test_support::{context, writer};
 
     async fn plan_for(
         tool: &EditTool,
@@ -310,9 +308,7 @@ mod tests {
         )
         .await
         .unwrap();
-        tool.execute(approved(plan), &ctx, &mut writer(&ctx))
-            .await
-            .unwrap();
+        tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "alpha\nBETA\ngamma\n"
@@ -366,9 +362,7 @@ mod tests {
         )
         .await
         .unwrap();
-        tool.execute(approved(plan), &ctx, &mut writer(&ctx))
-            .await
-            .unwrap();
+        tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "y\ny\n"
@@ -394,7 +388,7 @@ mod tests {
         .await
         .unwrap();
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         assert!(
@@ -421,10 +415,10 @@ mod tests {
         .await
         .unwrap();
 
-        // 审批期间别人改了这个文件。
+        // 计划之后、执行之前别人改了这个文件。
         std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\n").unwrap();
         let error = tool
-            .execute(approved(plan), &ctx, &mut writer(&ctx))
+            .execute(plan, &ctx, &mut writer(&ctx))
             .await
             .unwrap_err();
         assert!(
@@ -452,7 +446,7 @@ mod tests {
             Verification::NotPerformed { .. }
         ));
 
-        tool.execute(approved(plan.clone()), &ctx, &mut writer(&ctx))
+        tool.execute(plan.clone(), &ctx, &mut writer(&ctx))
             .await
             .unwrap();
         assert!(matches!(
@@ -492,78 +486,31 @@ mod tests {
         );
     }
 
+    /// §7 唯一的硬限制同样管 `edit`：`state.db` 一族与 `.env` 都拒在 `prepare`。
     #[tokio::test]
-    async fn the_changes_are_the_diff_this_edit_would_make() {
+    async fn editing_komos_own_state_is_refused_at_prepare() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
-        let ctx = context(dir.path());
-        let tool = EditTool::new();
-        let plan = plan_for(
-            &tool,
-            &ctx,
-            serde_json::json!({ "path": "a.txt", "match_text": "beta", "replace_text": "BETA" }),
-        )
-        .await
-        .unwrap();
-        let changes = tool.changes(&plan).await.expect("有改动");
-        assert!(changes.contains("- beta"), "{changes}");
-        assert!(changes.contains("+ BETA"), "{changes}");
-        assert!(changes.contains("  alpha"), "{changes}");
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(dir.path().join("ws")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join(".env"), "KEY=old\n").unwrap();
+        let ctx = context(&dir.path().join("ws"));
+        let tool = EditTool::new().protecting(vec![home.join("state.db"), home.join(".env")]);
+        let error = tool
+            .prepare(
+                serde_json::json!({
+                    "path": home.join(".env").display().to_string(),
+                    "match_text": "old",
+                    "replace_text": "new",
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::Denied { .. }), "{error:?}");
         assert_eq!(
-            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "alpha\nbeta\ngamma\n",
-            "列改动不落盘"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_file_changed_after_the_plan_gets_a_note_not_a_diff() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
-        let ctx = context(dir.path());
-        let tool = EditTool::new();
-        let plan = plan_for(
-            &tool,
-            &ctx,
-            serde_json::json!({ "path": "a.txt", "match_text": "alpha", "replace_text": "ALPHA" }),
-        )
-        .await
-        .unwrap();
-
-        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\n").unwrap();
-        let changes = tool.changes(&plan).await.expect("有一句说明");
-        assert!(changes.contains("版本冲突"), "{changes}");
-        assert!(
-            !changes.contains("+ ALPHA"),
-            "不会被执行的 diff 不列：{changes}"
-        );
-        assert_eq!(changes.lines().count(), 1, "{changes}");
-    }
-
-    #[tokio::test]
-    async fn a_fused_edit_lists_only_the_mutation() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
-        let ctx = context(dir.path());
-        let tool = EditTool::new();
-        let plan = plan_for(
-            &tool,
-            &ctx,
-            serde_json::json!({
-                "path": "a.txt",
-                "match_text": "alpha",
-                "replace_text": "ALPHA",
-                "then_run": { "command": "cargo test" }
-            }),
-        )
-        .await
-        .unwrap();
-        assert!(plan.then_run.is_some());
-        let changes = tool.changes(&plan).await.expect("有改动");
-        assert!(changes.contains("+ ALPHA"), "{changes}");
-        assert!(
-            !changes.contains("cargo test"),
-            "命令那一步界面另列：{changes}"
+            std::fs::read_to_string(home.join(".env")).unwrap(),
+            "KEY=old\n"
         );
     }
 

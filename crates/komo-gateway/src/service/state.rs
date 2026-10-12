@@ -195,8 +195,12 @@ impl RecoveryIndex for RecoveryIndexOf {
         )
     }
 
-    async fn reclaim_running(&self, executor: &ExecutorId) -> Result<u64, StoreError> {
-        self.store.reclaim_running(executor).await
+    async fn reclaim_running(
+        &self,
+        executor: &ExecutorId,
+        keep: &[ExecutorId],
+    ) -> Result<u64, StoreError> {
+        self.store.reclaim_running(executor, keep).await
     }
 
     async fn backfill(&self, run: &RunId) -> Result<(), StoreError> {
@@ -798,6 +802,16 @@ impl GatewayState {
         self.scheduler.waker()
     }
 
+    /// 上一代执行实例停没停（§8.7）：按 `runtime/children` 里的子进程登记判。
+    pub fn liveness(&self) -> komo_runtime::recovery::LockHolderLiveness {
+        komo_runtime::recovery::LockHolderLiveness::holding_lock(
+            self.executor.clone(),
+            komo_runtime::recovery::ChildRegistry::new(
+                self.snapshot().paths.runtime_dir.join("children"),
+            ),
+        )
+    }
+
     /// 恢复扫描（§8.7）。观察与决策在 runtime，索引在 store，这一层只把它俩接上。
     pub fn recovery(&self) -> RecoveryScan {
         RecoveryScan::new(
@@ -808,12 +822,7 @@ impl GatewayState {
             )),
             Arc::clone(&self.outputs),
             self.executor.clone(),
-            Arc::new(komo_runtime::recovery::LockHolderLiveness::holding_lock(
-                self.executor.clone(),
-                komo_runtime::recovery::ChildRegistry::new(
-                    self.snapshot().paths.runtime_dir.join("children"),
-                ),
-            )),
+            Arc::new(self.liveness()),
         )
         // 「output.json 已完成但 JSONL 结果事件尚未写入 → 校验身份、计划及完成状态后补记
         // 结果；**不能只凭文件存在判断**」（§14 故障注入表）。没有这一口时恢复只能把

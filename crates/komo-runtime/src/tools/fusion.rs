@@ -9,7 +9,7 @@
 //! - 命令非零退出是结果、不是回滚：改动留着，整次调用记 Failed，退出码照实给。
 //!
 //! 恢复：带 `then_run` 的计划是 `NoSafeRecovery`。命令可能又改过这份文件，改动自己的
-//! 内容哈希核对因此不再证明什么——started 而无结果一律交给人（§8.6）。
+//! 内容哈希核对因此不再证明什么——started 而无结果一律记结果不明、交给模型判断（§8.6）。
 
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;

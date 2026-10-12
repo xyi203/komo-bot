@@ -206,12 +206,16 @@ async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
         .await
         .unwrap();
 
-    assert_eq!(tool.ran(), 0, "核对不出结论就不能重跑");
+    assert_eq!(tool.ran(), 0, "核对不出结论，执行器就不重跑");
     assert_eq!(tool.verified(), 1);
-    let Some(RoundStop::Attention { reason, .. }) = &outcome.stop else {
-        panic!("{:?}", outcome.stop)
-    };
-    assert!(reason.contains("核对不出结论"), "{reason}");
+    // 不停下来等人：结果不明作为这次调用的结果交给模型，由它核对之后决定（§8.6）。
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+    assert_eq!(outcome.results.len(), 1);
+    let fed = &outcome.results[0];
+    assert!(fed.is_error);
+    assert!(fed.content.contains("核对不出结论"), "{}", fed.content);
+    assert!(fed.content.contains("被 Gateway 重启打断"), "{}", fed.content);
+    assert!(fed.content.contains("先核对目标的实际状态"), "{}", fed.content);
 
     // 上一世那条 `tool.started` 配上了一条明确的 uncertain——不写下来它会永远悬着。
     let results = harness.results_for(&previous);
@@ -3801,11 +3805,15 @@ mod fused {
             .await
             .unwrap();
 
-        // 文件还是原内容：要是问了 edit 自己的核对，它会答"确定未执行"并重做。
-        let Some(RoundStop::Attention { reason, .. }) = &outcome.stop else {
-            panic!("{:?}", outcome.stop)
-        };
-        assert!(reason.contains("then_run"), "{reason}");
+        // 文件还是原内容：要是问了 edit 自己的核对，它会答"确定未执行"并重做。结果不明
+        // 交给模型，Run 不停。
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 1);
+        assert!(
+            outcome.results[0].content.contains("then_run"),
+            "{}",
+            outcome.results[0].content
+        );
         assert_eq!(content(&root), "old\n", "不重做改动");
         assert_eq!(runs(&root), 0, "不重跑命令");
         let results = harness.results_for(&previous);

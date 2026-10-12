@@ -176,7 +176,14 @@ UPDATE runs
 const RECLAIM_UNOWNED_SQL: &str = r#"
 UPDATE runs
    SET claimed_by = NULL
+ WHERE state = 'running' AND claimed_by = ?1
+"#;
+
+/// 还握着 `running` 的别的执行实例——启动回收按它们**逐个**交还，好让存活判定插得进来。
+const FOREIGN_CLAIMANTS_SQL: &str = r#"
+SELECT DISTINCT claimed_by FROM runs
  WHERE state = 'running' AND claimed_by IS NOT NULL AND claimed_by <> ?1
+ ORDER BY claimed_by
 "#;
 
 /// 租约过期：只交还**自己**持有的那一批（§8.7）。
@@ -533,26 +540,74 @@ impl RunQueue for TursoRunQueue {
 /// store 判不了"旧执行者停在哪一步"，也不该判。
 ///
 /// 返回回收了几行。
-pub async fn reclaim_unowned(db: &Db, executor: &ExecutorId) -> Result<u64, StoreError> {
+pub async fn reclaim_unowned(
+    db: &Db,
+    executor: &ExecutorId,
+    keep: &[ExecutorId],
+) -> Result<u64, StoreError> {
     let who = executor.to_string();
+    let keep = keep.to_vec();
     db.with_write_retry(move |ex| {
-        let who = who.clone();
-        Box::pin(async move { reclaim_unowned_in(ex, &ExecutorId::from_raw(who)).await })
+        let (who, keep) = (who.clone(), keep.clone());
+        Box::pin(async move { reclaim_unowned_in(ex, &ExecutorId::from_raw(who), &keep).await })
             as BoxFuture<'_, Result<u64, StoreError>>
     })
     .await
 }
 
 /// 同上，但在调用方已经打开的事务里跑——恢复要把它和"收拾遗留的尝试"放在一起提交。
+///
+/// `keep` 是**核实不了已经停下**的那些旧执行实例（§8.7：在册子进程还活着或探不清）：它们
+/// 名下的 `running` 不交还，领取权留在原主手里，恢复扫描才看得见"上一个执行实例还没停"
+/// 而把它停成等人确认。先交还再判的话，扫描读到的 `claimed_by` 已经是空的，那道闸形同虚设。
 pub async fn reclaim_unowned_in(
     ex: &mut dyn Executor,
     executor: &ExecutorId,
+    keep: &[ExecutorId],
 ) -> Result<u64, StoreError> {
-    toasty::sql::statement(RECLAIM_UNOWNED_SQL)
+    let rows = toasty::sql::query(FOREIGN_CLAIMANTS_SQL)
         .bind(executor.to_string())
-        .exec(ex)
+        .exec(&mut *ex)
         .await
-        .map_err(map_toasty)
+        .map_err(map_toasty)?;
+    let claimants: Vec<String> = rows.iter().filter_map(|row| column_string(row, 0)).collect();
+    let mut reclaimed = 0;
+    for claimant in claimants {
+        if keep.iter().any(|kept| kept.as_str() == claimant) {
+            continue;
+        }
+        reclaimed += toasty::sql::statement(RECLAIM_UNOWNED_SQL)
+            .bind(claimant)
+            .exec(&mut *ex)
+            .await
+            .map_err(map_toasty)?;
+    }
+    Ok(reclaimed)
+}
+
+/// 还握着 `running` 的别的执行实例（不含 `executor` 自己）。启动扫描拿它去过存活判定，
+/// 判出来停不下的那些作为 [`reclaim_unowned`] 的 `keep`。
+pub async fn foreign_claimants(
+    db: &Db,
+    executor: &ExecutorId,
+) -> Result<Vec<ExecutorId>, StoreError> {
+    let who = executor.to_string();
+    db.read(move |ex| {
+        let who = who.clone();
+        Box::pin(async move {
+            let rows = toasty::sql::query(FOREIGN_CLAIMANTS_SQL)
+                .bind(who)
+                .exec(ex)
+                .await
+                .map_err(map_toasty)?;
+            Ok(rows
+                .iter()
+                .filter_map(|row| column_string(row, 0))
+                .map(ExecutorId::from_raw)
+                .collect::<Vec<_>>())
+        }) as BoxFuture<'_, Result<Vec<ExecutorId>, StoreError>>
+    })
+    .await
 }
 
 /// 租约过期：交还**自己**持有的那一批（§8.7）。
@@ -1196,6 +1251,39 @@ mod tests {
         );
     }
 
+    /// 核实不了已经停下的旧实例（`keep`）名下的不交还：领取权留在原主手里，恢复扫描才判得
+    /// 出"上一个执行实例还没停"（§8.7）。别的旧实例照常交还。
+    #[tokio::test]
+    async fn startup_keeps_the_claim_of_an_instance_not_known_to_have_stopped() {
+        let (db, _dir) = temp().await;
+        let queue = TursoRunQueue::new(db.clone());
+        let alive = queued_run(&db, "sess-alive", "run-alive").await;
+        let gone = queued_run(&db, "sess-gone", "run-gone").await;
+
+        let survivor = ExecutorId::from_raw("exec-survivor");
+        queue.claim_run(&alive, &survivor).await.unwrap().unwrap();
+        queue
+            .claim_run(&gone, &ExecutorId::from_raw("exec-gone"))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let now = ExecutorId::from_raw("exec-now");
+        assert_eq!(
+            foreign_claimants(&db, &now).await.unwrap(),
+            vec![ExecutorId::from_raw("exec-gone"), survivor.clone()]
+        );
+        let reclaimed = reclaim_unowned(&db, &now, std::slice::from_ref(&survivor))
+            .await
+            .unwrap();
+        assert_eq!(reclaimed, 1, "只交还停下了的那一代");
+
+        let kept = crate::repos::runs::get(&db, &alive).await.unwrap().unwrap();
+        assert_eq!(kept.claimed_by.as_deref(), Some(survivor.as_str()));
+        let released = crate::repos::runs::get(&db, &gone).await.unwrap().unwrap();
+        assert!(released.claimed_by.is_none());
+    }
+
     /// 验收：启动回收只把**别的**实例遗留的 `running` 交还领取权——状态一个字不改。
     ///
     /// 交还之后那一行是"`running` 且没人领"的孤儿：它**领不走**（候选只有 `queued` 与
@@ -1213,7 +1301,7 @@ mod tests {
         queue.claim_run(&theirs, &old).await.unwrap().unwrap();
         queue.claim_run(&mine, &now).await.unwrap().unwrap();
 
-        let reclaimed = reclaim_unowned(&db, &now).await.unwrap();
+        let reclaimed = reclaim_unowned(&db, &now, &[]).await.unwrap();
         assert_eq!(reclaimed, 1, "只回收别人的那一个");
 
         let record = crate::repos::runs::get(&db, &theirs)

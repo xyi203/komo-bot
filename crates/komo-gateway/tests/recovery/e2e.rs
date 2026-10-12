@@ -235,7 +235,7 @@ async fn the_first_end_to_end_acceptance() {
     );
 
     //    6b. `shell`：默认 `verify` 是 `Unavailable`，**核对不出来**。同样丢了结果，这一
-    //        次只能进未知状态等人，且不能把命令再跑一遍。
+    //        次记成 uncertain、交给模型判断；执行器不把命令再跑一遍，也不停下来等人。
     let counter2 = Counter::new(&home, "e2e-lost.count");
     gw.stop().await;
     let fault = home.inject(Fault::BeforeFinishCall);
@@ -262,27 +262,20 @@ async fn the_first_end_to_end_acceptance() {
     home.drop_attempt_output(&session, &lost_run, &lost_started);
 
     home.clear_injection();
-    let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
+    let gw = home.start(FakeLlm::finisher("核对过了，不重做。")).await;
     let status = gw
         .wait_db_state(
             &lost_run,
             |s| s == RunState::Waiting || s.is_terminal(),
-            "等人",
+            "收场",
         )
         .await;
     assert_eq!(
         status,
-        RunState::Waiting,
-        "核对不出结论就进未知状态等人，而不是自动重跑"
+        RunState::Completed,
+        "核对不出结论就把 uncertain 交给模型，Run 接着往下走，不停下来等人"
     );
-    // 第二维：这个 `waiting` 停在**要人判断**的那一类上，不是退避到点或等同会话前一条
-    // Run（§8.4、§8.6）——只断言状态名等于弱化。
-    let why = gw.wait_waiting(&lost_run).await;
-    assert!(
-        matches!(why, WaitReason::Intervention { .. }),
-        "等的是「要人判断」那一条 Intervention：{why:?}"
-    );
-    assert_eq!(counter2.count(), 1, "**没有自动重跑**");
+    assert_eq!(counter2.count(), 1, "**执行器没有自动重跑**");
     let events = home.events(&session);
     assert!(
         unpaired_attempts(&events).is_empty(),

@@ -58,8 +58,8 @@ impl GatewayState {
     ///
     /// 六个动作，对应 §8.9 那张表与 §8.10 的两步状态推进：
     ///
-    /// 1. **回收没有主人的 `running`**（只交还领取权，不判状态）：别的实例遗留的一次性
-    ///    交还；自己手里的那一批必须先过**存活判定**——租约过期只是信号，`InFlight` 里
+    /// 1. **回收没有主人的 `running`**（只交还领取权，不判状态）：别的实例遗留的先过子进程
+    ///    存活判定再交还（§8.7）；自己手里的那一批必须先过**存活判定**——租约过期只是信号，`InFlight` 里
     ///    还在的那些（一次二十分钟的调用）一条都不动，否则那不是恢复，是重复副作用（§8.6）。
     /// 2. **会话可服务 + 内容可读**：不行的不许领，停成 `waiting + intervention`。这一维由
     ///    恢复扫描的观察给出（`RecoveryIndex::session_state` + 扫描自己读 JSONL），决策仍
@@ -159,14 +159,19 @@ impl GatewayState {
     ///
     /// 两个来源，一个判据：
     ///
-    /// - 别的实例遗留的（`claimed_by <> 我`）：交还领取权即可——那个实例已经不在（数据
-    ///   目录的进程锁是我们拿着的，§3）。
+    /// - 别的实例遗留的（`claimed_by <> 我`）：交还领取权——但名下还有子进程活着（或核实
+    ///   不了）的那几个实例**不交还**（§8.7）。一刀全交还的话，紧接着的恢复扫描读到的
+    ///   `claimed_by` 已经是空的，"旧子进程还活着"就拦不住重复执行。
     /// - 自己持有的而租约过期了：**逐条过存活判定**——还在 [`InFlight`] 里的那些（一次
     ///   二十分钟的调用）一条都不动。少这一道，对账会把一个活着的长调用当成孤儿，那不是
     ///   恢复，是真的重复副作用（§8.6）。
     async fn reclaim_orphans(&self, now: OffsetDateTime) -> Result<u32, GatewayError> {
+        // 这一步是对账的第一个库操作，而且得是写：先读一遍会让同一个池里随后的读拿到旧
+        // 快照（见 `service::start` 第 7 步的注释）。存活名单取自子进程登记，不读库。
+        let keep = komo_runtime::recovery::ExecutorLiveness::unstopped(&self.liveness());
         let mut reclaimed =
-            komo_store::repos::queue::reclaim_unowned(&self.db, &self.executor).await? as u32;
+            komo_store::repos::queue::reclaim_unowned(&self.db, &self.executor, &keep).await?
+                as u32;
 
         let expired = komo_store::repos::queue::expired_lease_running(&self.db, now).await?;
         for run in expired {

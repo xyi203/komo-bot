@@ -169,14 +169,22 @@ impl RecoveryStore {
     ///
     /// **`tool_calls` 的状态一个字不动**：`started` 而无结果的调用仍要走核对流程——把它
     /// 改成 failed 就等于宣布副作用没发生，而那正是不知道的事。
-    pub async fn reclaim_running(&self, executor: &ExecutorId) -> Result<u64, StoreError> {
+    ///
+    /// `keep`：核实不了已经停下的旧执行实例，它们名下的 `running` 不交还（见
+    /// [`super::queue::reclaim_unowned_in`]）。
+    pub async fn reclaim_running(
+        &self,
+        executor: &ExecutorId,
+        keep: &[ExecutorId],
+    ) -> Result<u64, StoreError> {
         let executor = executor.clone();
+        let keep = keep.to_vec();
         let now = OffsetDateTime::now_utc();
         self.db
             .with_write_retry(move |ex| {
-                let executor = executor.clone();
+                let (executor, keep) = (executor.clone(), keep.clone());
                 Box::pin(async move {
-                    let reclaimed = super::queue::reclaim_unowned_in(ex, &executor).await?;
+                    let reclaimed = super::queue::reclaim_unowned_in(ex, &executor, &keep).await?;
                     // **按执行实例收拾，不按被回收的那几行**：正常停机时
                     // `RunQueue::release` 已经把 Run 从 `running` 放回 `queued`，于是它
                     // 根本不在回收集合里——可它的尝试还停在 `started`。一个 db 文件只有
@@ -862,7 +870,7 @@ mod tests {
 
         let reclaimed = f
             .store
-            .reclaim_running(&ExecutorId::from_raw("exec-now"))
+            .reclaim_running(&ExecutorId::from_raw("exec-now"), &[])
             .await
             .unwrap();
         assert_eq!(reclaimed, 1);
@@ -894,7 +902,7 @@ mod tests {
 
         assert_eq!(
             f.store
-                .reclaim_running(&ExecutorId::from_raw("exec-now"))
+                .reclaim_running(&ExecutorId::from_raw("exec-now"), &[])
                 .await
                 .unwrap(),
             1
@@ -932,7 +940,7 @@ mod tests {
 
         let reclaimed = f
             .store
-            .reclaim_running(&ExecutorId::from_raw("exec-now"))
+            .reclaim_running(&ExecutorId::from_raw("exec-now"), &[])
             .await
             .unwrap();
         assert_eq!(reclaimed, 0, "没有 running 行要回收");
@@ -960,7 +968,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(f.store.reclaim_running(&mine).await.unwrap(), 0);
+        assert_eq!(f.store.reclaim_running(&mine, &[]).await.unwrap(), 0);
         let record = runs::get(&f.db, &accepted.run).await.unwrap().unwrap();
         assert_eq!(record.state, RunState::Running);
         assert_eq!(record.claimed_by.as_deref(), Some("exec-now"));

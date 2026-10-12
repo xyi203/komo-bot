@@ -54,7 +54,14 @@ pub trait RecoveryIndex: Send + Sync {
     /// 「启动回收：旧实例遗留的 running，**只交还领取权、不判状态**」（§8.7）。返回
     /// 影响行数。交还之后那一行是 `running` 且没有主人——一个可查询的孤儿，由 §8.4
     /// 判成 `queued` 或 `waiting + intervention`。
-    async fn reclaim_running(&self, executor: &ExecutorId) -> Result<u64, StoreError>;
+    ///
+    /// `keep` 里的旧执行实例**核实不了已经停下**：它们名下的不交还，扫描才判得出"上一个
+    /// 执行实例还没停"（§8.7）。
+    async fn reclaim_running(
+        &self,
+        executor: &ExecutorId,
+        keep: &[ExecutorId],
+    ) -> Result<u64, StoreError>;
 
     /// 用 JSONL 已有的事件补齐 state.db 的索引与派生执行状态。**不重放动作。**
     async fn backfill(&self, run: &RunId) -> Result<(), StoreError>;
@@ -349,7 +356,12 @@ impl RecoveryScan {
     /// `waiting + intervention` 并记下原因，然后继续判下一个。会一路冒上去的只有索引层
     /// 的失败——那是数据库级的问题，不是某一个会话的。
     pub async fn scan(&self) -> Result<RecoveryReport, RecoveryError> {
-        let reclaimed = self.index.reclaim_running(&self.executor).await?;
+        // 先过存活判定再交还：交还之后 `claimed_by` 就空了，`decide` 再问"上一个执行实例
+        // 停了吗"只能答"没人握着、停了"——旧子进程还活着也拦不住重复执行（§8.7）。名单
+        // 取自子进程登记，**不在交还之前另读一遍库**：那一次读会让同一个池里随后的读拿到
+        // 旧快照（见 `service::start` 第 7 步的注释）。
+        let keep = self.liveness.unstopped();
+        let reclaimed = self.index.reclaim_running(&self.executor, &keep).await?;
         if reclaimed > 0 {
             tracing::info!(reclaimed, "上一代遗留的 running 已交还领取权");
         }

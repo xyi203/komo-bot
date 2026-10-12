@@ -348,7 +348,7 @@ async fn row_5_a_started_call_is_verified_rather_than_assumed() {
 // ---------------------------------------------------------------- 第 6 行
 
 /// 第 6 行：**外部写入成功，完整输出与结果事件尚未持久保存** → 借助可靠幂等或关联信息
-/// 核对；没有证据则等待处理，**不产生第二条记录**。
+/// 核对；核对不出来就**交给模型判断**，执行器**不产生第二条记录**。
 ///
 /// 这一行的分界在 `ToolOutputStore::publish` 上：外部副作用已经发生，**输出还没落盘**。
 /// 落盘之后再中断是第 8 行（那时盘上有一份身份齐全的 `output.json`，补记结果才是对的）。
@@ -358,10 +358,10 @@ async fn row_5_a_started_call_is_verified_rather_than_assumed() {
 /// 包不到 `ToolOutputStore`，所以这一刀走"直接篡改磁盘"那条注入路）。
 ///
 /// 于是恢复手上**一点证据都没有**：`shell` 的恢复方式是 `NoSafeRecovery`、`verify` 是
-/// `Unavailable`，只能停在 `waiting + intervention`（一条 `verify` 的清单条目），而不是
-/// 再跑一次命令。
+/// `Unavailable`。执行器不再跑一遍命令，也不停下来等人：那条 started 配一条 uncertain，
+/// 作为这次调用的结果交给模型——它看得见目标，由它核对之后决定要不要重做（§8.6）。
 #[tokio::test]
-async fn row_6_an_external_write_without_evidence_waits_instead_of_writing_twice() {
+async fn row_6_an_external_write_without_evidence_goes_to_the_model_instead_of_writing_twice() {
     let home = Home::new();
     let counter = Counter::new(&home, "row6.count");
 
@@ -386,33 +386,30 @@ async fn row_6_an_external_write_without_evidence_waits_instead_of_writing_twice
     );
 
     home.clear_injection();
-    let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
-    let detail = gw
-        .wait_state(
-            &run,
-            |s| s == RunState::Waiting || s.is_terminal(),
-            "waiting",
-        )
+    let llm = FakeLlm::finisher("核对过了，命令已经跑过一次，不重做。");
+    let gw = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
+    let detail = gw.wait_terminal(&run).await;
     assert_eq!(
         detail.summary.state,
-        RunState::Waiting,
-        "没有核对证据就等人处理，而不是重跑或宣布失败：{detail:?}"
+        RunState::Completed,
+        "核对不出来不等人：结果交给模型，Run 接着往下走：{detail:?}"
     );
-    assert_eq!(
-        detail.summary.wait,
-        Some(WaitReason::Intervention {
-            intervention: InterventionId::for_run(&run),
-        }),
-        "停在 `waiting` 就要说得出在等哪一条 Intervention（§8.4）：{detail:?}"
+    assert!(
+        pending_intervention(&gw, &run).await.is_none(),
+        "不进 §7.5 的清单"
     );
-    // 等人就是等人：它必须在 §7.5 的清单里，且因为有一条 `uncertain` 的调用而是
-    // `verify`——操作者要回答的是"上次那个调用到底发生没有"。
-    let pending = pending_intervention(&gw, &run)
-        .await
-        .expect("停成这样的一条要在清单里（§7.5）");
-    assert_eq!(pending.kind, InterventionKind::Verify, "{pending:?}");
-    assert_eq!(counter.count(), 1, "**不产生第二条记录**");
+    assert_eq!(counter.count(), 1, "**执行器不产生第二条记录**");
+
+    // 模型拿到的就是那条 uncertain，正文说清楚被打断了、先核对再决定。
+    let fed = format!(
+        "{:?}{:?}",
+        llm.inputs.lock().expect("轮输入"),
+        llm.requests.lock().expect("请求")
+    );
+    assert!(fed.contains("被 Gateway 重启打断"), "{fed}");
+    assert!(fed.contains("先核对目标的实际状态"), "{fed}");
 
     // 那条上一世的 `tool.started` 要配一条**明确的 uncertain**，不能悬着（§14 事件配对）。
     let events = home.events(&session);
@@ -1047,13 +1044,13 @@ async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_c
     let pending = pending_intervention(&gw, &run)
         .await
         .expect("核实不了旧执行已结束的那条要在清单里");
-    // 具体进哪一类由权威当场判（§7.5 第 1 条）：这条 Run 上还挂着一次 `uncertain` 的
-    // 调用，所以它是 `verify`（"这次调用到底发生没有"），而不是 `blocked`——操作者要核
-    // 的就是那一次调用。
-    assert_eq!(pending.kind, InterventionKind::Verify, "{pending:?}");
+    // 是 `blocked`（"旧执行还没确认结束"），不是 `verify`：恢复扫描在执行器碰到那次调用
+    // **之前**就拦下了，那次调用还停在 started，没人去核对它。领取权留在旧实例手里正是
+    // 为了这个——先交还再判，扫描读到的 `claimed_by` 是空的，这道闸就拦不住了。
+    assert_eq!(pending.kind, InterventionKind::Blocked, "{pending:?}");
     assert!(
-        pending.call.is_some(),
-        "`verify` 一定说得出停在哪一次调用上：{pending:?}"
+        pending.question.contains("上一个执行实例"),
+        "说得出为什么不重复启动：{pending:?}"
     );
     assert_eq!(counter.count(), 0, "没有重复执行");
     gw.stop().await;

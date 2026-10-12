@@ -14,7 +14,7 @@
 //! `execute` 永远排在它后面。
 //!
 //! **恢复执行**（`ToolContext::resumed` 为 `Some`）走 §8.4 第 6 / 7 行：确定尚未执行
-//! 的直接跑，started 而无结果的**先核对**，核对不出结论就交给人——不盲目重跑。
+//! 的直接跑，started 而无结果的**先核对**，核对不出结论就把"结果不明"交给模型判断——执行器不盲目重跑。
 //!
 //! 流式输出的写入器由 `ToolOutputStore::begin` 开、**借给** `Tool::execute`、返回后
 //! 在这里 `publish`。所有权不下放，因为"先持久化输出、再追加 `tool.result`"是 §8.5
@@ -547,7 +547,7 @@ impl ToolExecutor {
             && !safe_to_redo(&plan)
         {
             // 带 `then_run` 的组合调用不问改动工具的核对：命令可能又改过这份文件，内容哈希
-            // 对上对不上都不再说明改动那一步发生没有（§8.6）。started 而无结果就交给人。
+            // 对上对不上都不再说明改动那一步发生没有（§8.6）。started 而无结果就交给模型判断。
             let verdict = if plan.then_run.is_some() {
                 Ok(Verification::Unavailable)
             } else {
@@ -587,7 +587,8 @@ impl ToolExecutor {
                     ))));
                 }
                 // 冲突 / 不出结论 / 没有核对方式：**副作用发生没发生不知道**。那条
-                // 上一世的 `tool.started` 要配一条明确的 uncertain，然后交给人。
+                // 上一世的 `tool.started` 要配一条明确的 uncertain，然后作为这次调用的结果
+                // 交给模型：它看得见目标、能去核对，由它判断要不要重做（§8.6）。
                 Ok(verdict) => {
                     let summary = match &verdict {
                         Verification::Conflict { evidence } => {
@@ -606,16 +607,9 @@ impl ToolExecutor {
                         // NotPerformed 与 AlreadySatisfied 在上面两个分支里已经答过。
                         other => format!("核对结论：{other:?}"),
                     };
-                    self.settle_verified(
-                        request,
-                        env,
-                        state.previous_attempt.as_ref(),
-                        ToolResultStatus::Uncertain,
-                        &verdict,
-                        &summary,
-                    )
-                    .await?;
-                    return Ok(Begin::Settled(self.attention(request, summary)));
+                    return self
+                        .settle_interrupted(request, env, state, &verdict, &summary)
+                        .await;
                 }
                 Err(error) => {
                     // 核对本身跑不起来也是"不知道"，同样不能让 started 悬着。
@@ -623,16 +617,9 @@ impl ToolExecutor {
                     let verdict = Verification::Unknown {
                         reason: error.to_string(),
                     };
-                    self.settle_verified(
-                        request,
-                        env,
-                        state.previous_attempt.as_ref(),
-                        ToolResultStatus::Uncertain,
-                        &verdict,
-                        &summary,
-                    )
-                    .await?;
-                    return Ok(Begin::Settled(self.attention(request, summary)));
+                    return self
+                        .settle_interrupted(request, env, state, &verdict, &summary)
+                        .await;
                 }
             }
         }
@@ -1386,6 +1373,42 @@ impl ToolExecutor {
         self.settle_attempt(attempt_ref, body).await.map(Some)
     }
 
+    /// 续跑时核对不出上一世那次尝试做没做成：落一条 uncertain，**作为这次调用的结果交给
+    /// 模型**，Run 接着往下走。
+    ///
+    /// 停下来问人并不比模型更有把握——人多半也得去看一眼目标才答得上来，而模型手里就有
+    /// read / shell 能去看。结果正文写明"被打断了、先核对再决定"，回放时逐字相同。账上没有
+    /// 上一世那次尝试是账本自相矛盾，模型修不了，仍交给人。
+    async fn settle_interrupted(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        state: &ResumedCall,
+        verdict: &Verification,
+        summary: &str,
+    ) -> Result<Begin, ExecError> {
+        let message = format!("上一次执行被 Gateway 重启打断，{summary}。{UNCERTAIN_ADVICE}");
+        let recorded = self
+            .settle_verified(
+                request,
+                env,
+                state.previous_attempt.as_ref(),
+                ToolResultStatus::Uncertain,
+                verdict,
+                &message,
+            )
+            .await?;
+        let Some(recorded) = recorded else {
+            return Ok(Begin::Settled(self.attention(
+                request,
+                format!("调用 {} 结果不明，但账上没有承载它的那次尝试", request.call),
+            )));
+        };
+        Ok(Begin::Settled(CallSettlement::Result(for_model(
+            request, env, &recorded,
+        ))))
+    }
+
     /// 把一条结果落到**指定的那次尝试**上：发布输出 → 追加 `tool.result`。
     ///
     /// 三条路共用它，因为它们做的是同一件事——给某一世的尝试写下结论：工具自带核对函数的
@@ -1747,6 +1770,12 @@ fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
         },
     }
 }
+
+/// 续跑时结果不明、交给模型的那段判断方法：先核对，再决定重做还是接着往下。
+const UNCERTAIN_ADVICE: &str = "副作用是否已经发生未知，执行器不会自动重做。\
+先核对目标的实际状态（读文件、查进程或服务状态、看 git、查远端），再决定：已经生效就接着往下；\
+没生效或只做了一半就继续或重新做；只读的命令直接重跑即可。\
+发消息、扣款、切换一次这类重复做会出问题、又核对不了的，先问用户";
 
 /// 有没有别的子 Run 已经在续 `target` 这条线（§4 的"是不是末端"）：不论那条子 Run 现在
 /// 是什么状态——线只往后接，不分叉，已经有人接了就不能再接第二次。

@@ -8,9 +8,11 @@
 //!   §8.4）；
 //! - `abandon`：终态 `abandoned`（§8.4：与 `cancelled` 分开记）。
 //!
-//! 衬里是 §14 故障注入表第 6 行那一段：副作用已经发生、完整输出还没落盘，重启之后
-//! `tool.started` 没有配对的结果——于是它停在一条 `verify` 上等人核对（§8.6）。
+//! 衬里是执行当中报"结果不明"的一次调用（测试工具 `unsure`）：执行器不自动重试，停在一条
+//! `verify` 上等人核对（§8.6）。重启续跑时核对不出来的那种**不再走这里**——它作为一条
+//! uncertain 结果交给模型判断（见 `rows.rs` 第 6 行与端到端 6b）。
 
+use komo_gateway::service::test_support::Unsure;
 use komo_kernel::protocol::http::{
     InterventionAnswerResponse, InterventionKind, InterventionVerdict,
 };
@@ -27,26 +29,18 @@ struct Uncertain {
     run: RunId,
     call: ToolCallId,
     attempt: AttemptId,
-    counter: Counter,
+    unsure: std::sync::Arc<Unsure>,
     gateway: Gw,
 }
 
-/// 造一条 `verify`：shell 真的跑一次 → 拉掉那次尝试的输出 → 重启。
-///
-/// 与端到端验收里 6b 那一段同一个做法：**外部副作用已经发生，而完整输出没有落盘**，
-/// 这是 §8.6 说的那段窗口——它只能由人来核对，不能靠重跑掩盖。
+/// 造一条 `verify`：`unsure` 一调就答"结果不明"，Run 当场停在 `waiting + intervention`。
 async fn an_uncertain_call(home: &Home) -> Uncertain {
-    let counter = Counter::new(home, "verdict.count");
-    let fault = home.inject(Fault::BeforeFinishCall);
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
     let gateway = home
         .start(FakeLlm::new(vec![vec![
-            call_round(
-                1,
-                "pc-v",
-                "shell",
-                serde_json::json!({ "command": counter.append_command() }),
-            ),
-            text_round(2, "跑过了。"),
+            call_round(1, "pc-v", "unsure", serde_json::json!({})),
+            text_round(2, "接着往下写。"),
         ]]))
         .await;
     let session = gateway.open_session().await;
@@ -54,31 +48,24 @@ async fn an_uncertain_call(home: &Home) -> Uncertain {
         .submit(&session, "verdict-1", "跑一条命令")
         .await
         .run;
-    fault.wait_tripped().await;
-    gateway.stop().await;
-    assert_eq!(counter.count(), 1, "动作发出去了，结果丢了");
+    let why = gateway.wait_waiting(&run).await;
+    assert!(
+        matches!(why, WaitReason::Intervention { .. }),
+        "结果不明要人核对：{why:?}"
+    );
+    assert_eq!(unsure.ran(), 1, "动作发出去了，结果不明");
 
     let events = home.events(&session);
     let started = tool_started(&events)
         .last()
         .map(|started| (*started).clone())
         .expect("有这次尝试");
-    home.drop_attempt_output(&session, &run, &started);
-    home.clear_injection();
-
-    let gateway = home.start(FakeLlm::finisher("接着往下写。")).await;
-    let why = gateway.wait_waiting(&run).await;
-    assert!(
-        matches!(why, WaitReason::Intervention { .. }),
-        "结果不明要人核对：{why:?}"
-    );
-
     Uncertain {
         session,
         run,
         call: started.call_id.clone(),
         attempt: started.attempt_id.clone(),
-        counter,
+        unsure,
         gateway,
     }
 }
@@ -140,7 +127,7 @@ async fn satisfied_writes_a_result_and_requeues_without_rerunning() {
         .rfind(|result| result.attempt_id == fixture.attempt)
         .expect("配上了");
     assert_eq!(settled.status, ToolResultStatus::Completed);
-    assert_eq!(fixture.counter.count(), 1, "核对不是重跑");
+    assert_eq!(fixture.unsure.ran(), 1, "核对不是重跑");
 
     // 回到队列，接着往下跑；答过之后它不在清单里了。
     assert_eq!(
@@ -194,7 +181,7 @@ async fn not_performed_closes_the_call_as_failed_and_requeues() {
         .rfind(|result| result.attempt_id == fixture.attempt)
         .expect("配上了");
     assert_eq!(settled.status, ToolResultStatus::Failed);
-    assert_eq!(fixture.counter.count(), 1, "它确实没有执行过第二次");
+    assert_eq!(fixture.unsure.ran(), 1, "它确实没有执行过第二次");
 
     // 回到队列接着跑：模型拿到的是那次调用的失败结果。
     assert_eq!(
@@ -206,7 +193,7 @@ async fn not_performed_closes_the_call_as_failed_and_requeues() {
             .state,
         RunState::Completed
     );
-    assert_eq!(fixture.counter.count(), 1);
+    assert_eq!(fixture.unsure.ran(), 1);
 }
 
 #[tokio::test]
@@ -242,7 +229,7 @@ async fn abandon_is_its_own_terminal_state() {
             .all(|one| one.run.as_ref() != Some(&fixture.run)),
         "{listed:?}"
     );
-    assert_eq!(fixture.counter.count(), 1);
+    assert_eq!(fixture.unsure.ran(), 1);
 }
 
 /// 这条 Run 上那条 `uncertain` 的调用就是 `verify` 的落点（§8.6 的窗口在**调用**上，
@@ -259,7 +246,7 @@ async fn the_verify_detail_names_the_uncertain_call() {
         .await;
     assert_eq!(code, 200, "{detail}");
     assert_eq!(detail["kind"], "verify", "{detail}");
-    assert_eq!(detail["tool"], "shell", "{detail}");
+    assert_eq!(detail["tool"], "unsure", "{detail}");
     assert_eq!(
         detail["summary"]["call"],
         serde_json::json!(fixture.call.to_string()),
@@ -278,18 +265,17 @@ async fn the_verify_detail_names_the_uncertain_call() {
 #[tokio::test]
 async fn a_chat_verify_is_delivered_once_even_after_the_sweep() {
     let home = Home::new();
-    let counter = Counter::new(&home, "verdict.count");
-    let fault = home.inject(Fault::BeforeFinishCall);
+    let unsure = Unsure::new();
+    home.install_tools(vec![unsure.tool()]);
+    let sender = MemSender::new(komo_kernel::types::chat::ChannelPlatform::Telegram);
     let gateway = home
-        .start(FakeLlm::new(vec![vec![
-            call_round(
-                1,
-                "pc-v",
-                "shell",
-                serde_json::json!({ "command": counter.append_command() }),
-            ),
-            text_round(2, "跑过了。"),
-        ]]))
+        .start_with(
+            FakeLlm::new(vec![vec![
+                call_round(1, "pc-v", "unsure", serde_json::json!({})),
+                text_round(2, "接着往下写。"),
+            ]]),
+            std::sync::Arc::clone(&sender),
+        )
         .await;
     let ack = gateway
         .dispatcher()
@@ -303,27 +289,9 @@ async fn a_chat_verify_is_delivered_once_even_after_the_sweep() {
         ))
         .await
         .expect("Dispatcher 处理");
-    let komo_kernel::protocol::InboundAck::Queued { session, run } = ack else {
+    let komo_kernel::protocol::InboundAck::Queued { run, .. } = ack else {
         panic!("{ack:?}")
     };
-    fault.wait_tripped().await;
-    gateway.stop().await;
-
-    let events = home.events(&session);
-    let started = tool_started(&events)
-        .last()
-        .map(|started| (*started).clone())
-        .expect("有这次尝试");
-    home.drop_attempt_output(&session, &run, &started);
-    home.clear_injection();
-
-    let sender = MemSender::new(komo_kernel::types::chat::ChannelPlatform::Telegram);
-    let gateway = home
-        .start_with(
-            FakeLlm::finisher("接着往下写。"),
-            std::sync::Arc::clone(&sender),
-        )
-        .await;
     let why = gateway.wait_waiting(&run).await;
     assert!(matches!(why, WaitReason::Intervention { .. }), "{why:?}");
 

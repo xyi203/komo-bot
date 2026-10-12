@@ -141,6 +141,10 @@ pub trait ExecutorLiveness: Send + Sync + std::fmt::Debug {
     ///
     /// **无法确认时答 `false`**：§8.7 要的是"阻止该任务重复启动并显示原因"。
     fn stopped(&self, previous: Option<&ExecutorId>) -> bool;
+
+    /// 名下还有子进程活着（或核实不了）的那些**上一代**执行实例。启动回收不交还它们握着的
+    /// `running`，好让扫描判得出"上一个执行实例还没停"。
+    fn unstopped(&self) -> Vec<ExecutorId>;
 }
 
 /// 拿到了数据目录进程锁的那个实例的判断。
@@ -193,6 +197,25 @@ impl ExecutorLiveness for LockHolderLiveness {
             }
         }
         true
+    }
+
+    fn unstopped(&self) -> Vec<ExecutorId> {
+        let Ok(entries) = std::fs::read_dir(self.registry.dir()) else {
+            return Vec::new();
+        };
+        let mut previous: Vec<ExecutorId> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension()? != "json" {
+                    return None;
+                }
+                Some(ExecutorId::from_raw(path.file_stem()?.to_str()?))
+            })
+            .filter(|executor| executor != &self.current && !self.stopped(Some(executor)))
+            .collect();
+        previous.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        previous
     }
 }
 
@@ -250,6 +273,42 @@ mod tests {
             "核实不了就当它还在"
         );
         assert!(liveness(registry, Liveness::Gone).stopped(Some(&old)));
+    }
+
+    /// 启动回收不交还的名单：只列**上一代**、且名下有子进程活着或核实不了的实例。
+    #[test]
+    fn unstopped_lists_only_previous_instances_with_live_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ChildRegistry::new(dir.path());
+        registry
+            .record(&ExecutorId::from_raw("exec-old"), child(4242))
+            .unwrap();
+        registry
+            .record(&ExecutorId::from_raw("exec-now"), child(4343))
+            .unwrap();
+        // 子进程都收尾了的那一代：登记文件还在，但一行都没有。
+        let done = ExecutorId::from_raw("exec-done");
+        registry.record(&done, child(1)).unwrap();
+        registry.forget(&done, 1).unwrap();
+
+        assert_eq!(
+            liveness(registry.clone(), Liveness::Alive).unstopped(),
+            vec![ExecutorId::from_raw("exec-old")],
+            "自己与子进程都收尾了的那一代都不在名单里"
+        );
+        assert_eq!(
+            liveness(registry.clone(), Liveness::Unknown).unstopped(),
+            vec![ExecutorId::from_raw("exec-old")],
+            "核实不了就当它还在"
+        );
+        assert!(liveness(registry, Liveness::Gone).unstopped().is_empty());
+    }
+
+    #[test]
+    fn no_registry_directory_means_nobody_to_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ChildRegistry::new(dir.path().join("children"));
+        assert!(liveness(registry, Liveness::Alive).unstopped().is_empty());
     }
 
     #[test]

@@ -122,7 +122,11 @@ impl RecoveryIndex for MemIndex {
         Ok(self.runs.lock().unwrap().clone())
     }
 
-    async fn reclaim_running(&self, _executor: &ExecutorId) -> Result<u64, StoreError> {
+    async fn reclaim_running(
+        &self,
+        _executor: &ExecutorId,
+        _keep: &[ExecutorId],
+    ) -> Result<u64, StoreError> {
         Ok(self.state.lock().unwrap().reclaimed)
     }
 
@@ -173,6 +177,10 @@ struct FakeLiveness(bool);
 impl ExecutorLiveness for FakeLiveness {
     fn stopped(&self, _previous: Option<&ExecutorId>) -> bool {
         self.0
+    }
+
+    fn unstopped(&self) -> Vec<ExecutorId> {
+        Vec::new()
     }
 }
 

@@ -17,7 +17,11 @@ pub mod transcript;
 #[cfg(test)]
 pub mod test_support;
 
-use std::io::{Stdout, Write};
+use std::cell::Cell;
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::AsFd;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -61,7 +65,8 @@ const BACKFILL_PAGE: u32 = 500;
 /// 状态行上的耗时与转圈靠它走动。
 ///
 /// 比一帧（[`spinner::FRAME_MS`]）快一点，转圈才不会一卡一卡的。一拍只重画底下那一小块
-/// 视口，而且 ratatui 只写真的变了的格子——没在跑的时候这一拍什么字节都不发。
+/// 视口，而且 ratatui 只写真的变了的格子——没在跑的时候这一拍只发同步标记与光标定位那
+/// 几十个字节，屏幕上什么都不变。
 const TICK: Duration = Duration::from_millis(80);
 /// 清单上挂着东西时多久再问一次（[`App::poll_pending`]）：别处答掉的那条最多挂这么久。
 const PENDING_POLL: Duration = Duration::from_secs(5);
@@ -150,6 +155,7 @@ pub async fn run_tui(
     let cwd = std::env::current_dir()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
+    // 只排进这一帧，跟着下面第一次 `render` 一起写出去。
     let _ = terminal.commit(render::banner(&app, &cwd));
     let mut emitted = Emitted::new();
     let mut ticker = tokio::time::interval(TICK);
@@ -551,7 +557,7 @@ fn interpret(raw: Vec<(TermEvent, u64)>) -> Vec<InputEvent> {
 /// 一问（读键线程还没起来），之后全靠 [`TerminalGuard::view`] 与 [`TerminalGuard::gap`]
 /// 这两笔账。
 struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
+    terminal: Terminal<CrosstermBackend<FrameWriter>>,
     /// 视口占住的那一块。
     view: Rect,
     /// 视口正上方有几行是空的——缩高度腾出来的。下一次往回滚区写从那里开始写，于是
@@ -559,6 +565,8 @@ struct TerminalGuard {
     gap: u16,
     /// 上一次看到的终端尺寸。尺寸变了就把视口重新贴到底部。
     size: Size,
+    /// 与 [`FrameWriter`] 共用的那个开关：只有 [`TerminalGuard::present`] 的冲刷才真写。
+    present: Rc<Cell<bool>>,
 }
 
 impl TerminalGuard {
@@ -592,8 +600,9 @@ impl TerminalGuard {
         let row = crossterm::cursor::position()?.1;
         let (view, gap) = reserve(row, want, size)?;
 
+        let present = Rc::new(Cell::new(false));
         let terminal = Terminal::with_options(
-            CrosstermBackend::new(stdout),
+            CrosstermBackend::new(FrameWriter::new(&stdout, present.clone())?),
             TerminalOptions {
                 viewport: Viewport::Fixed(view),
             },
@@ -603,6 +612,7 @@ impl TerminalGuard {
             view,
             gap,
             size,
+            present,
         })
     }
 
@@ -610,7 +620,29 @@ impl TerminalGuard {
     ///
     /// 顺序不能反。先交后画，是因为交正文会把视口整块往下推，画在它前面等于画在一个
     /// 马上要挪走的位置上。
+    ///
+    /// **这三步是同一帧**：整段包在同步输出里（DECSET 2026），字节攒在 [`FrameWriter`]
+    /// 里到最后一次写给终端。交正文与改高度都会先擦掉视口再整块重画——擦与画要是分几次
+    /// 写出去，本机上快得看不见，隔着 SSH 就是每交一行正文输入框闪一下空白。支持同步
+    /// 输出的终端等整帧到齐再上屏；不支持的终端也只收到一次写，擦和画落在同一次读里。
     fn render(&mut self, app: &App, emitted: &mut Emitted) -> Result<(), std::io::Error> {
+        queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        let drawn = self.frame(app, emitted);
+        // 出错也要把同步标记收回去：不收，支持它的终端会冻在这一帧上直到它自己超时。
+        let ended = queue!(self.terminal.backend_mut(), EndSynchronizedUpdate);
+        let presented = self.present();
+        drawn.and(ended).and(presented)
+    }
+
+    /// 把攒下的一帧一次写给终端（见 [`FrameWriter`]）。
+    fn present(&mut self) -> Result<(), std::io::Error> {
+        self.present.set(true);
+        let written = self.terminal.backend_mut().flush();
+        self.present.set(false);
+        written
+    }
+
+    fn frame(&mut self, app: &App, emitted: &mut Emitted) -> Result<(), std::io::Error> {
         self.follow_terminal_size()?;
         self.commit(emitted.take(app, self.size.width))?;
 
@@ -619,7 +651,9 @@ impl TerminalGuard {
             render::viewport_height(app, self.size.width, max_viewport(self.size), live.len())
                 .max(1);
         self.set_height(want)?;
-        self.draw(app, &live)
+        self.terminal
+            .draw(|frame| render::draw(frame, app, &live))
+            .map(|_| ())
     }
 
     /// 终端被拉大拉小了：把视口重新贴到底部。
@@ -639,6 +673,8 @@ impl TerminalGuard {
     }
 
     /// 把这些行交给终端的回滚区。交出去之后它们就是终端的了——谁也改不动。
+    ///
+    /// 只排进 [`FrameWriter`]，跟着下一帧一起写出去。
     ///
     /// 写法是"从我们这一块的顶上开始，正常地打印"：每行一个换行，打到屏幕底部时终端自己
     /// 往上滚，滚走的那些进它的回滚区。最后再打 `view.height` 个换行，把视口那块位置重新
@@ -666,7 +702,6 @@ impl TerminalGuard {
         for _ in 1..self.view.height.saturating_add(gap) {
             queue!(out, Print("\r\n"))?;
         }
-        out.flush()?;
 
         self.gap = gap;
         self.view.y = top;
@@ -691,7 +726,6 @@ impl TerminalGuard {
                 MoveTo(0, self.view.y),
                 Clear(ClearType::FromCursorDown)
             )?;
-            out.flush()?;
             self.gap += shrink;
             self.view.y += shrink;
         } else {
@@ -707,27 +741,11 @@ impl TerminalGuard {
                 for _ in 0..scroll {
                     queue!(out, Print("\r\n"))?;
                 }
-                out.flush()?;
                 self.view.y = self.view.y.saturating_sub(scroll);
             }
         }
         self.view.height = want;
         self.terminal.resize(self.view)
-    }
-
-    /// 画一帧，整帧包在**同步输出**里（DECSET 2026）。
-    ///
-    /// 支持它的终端会等整帧到齐再上屏：光标、边框、正在打字的那一行不会各自闪一下。不
-    /// 支持的终端把这两个序列当无事发生。
-    fn draw(&mut self, app: &App, live: &[Line<'static>]) -> Result<(), std::io::Error> {
-        queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let drawn = self
-            .terminal
-            .draw(|frame| render::draw(frame, app, live))
-            .map(|_| ());
-        queue!(self.terminal.backend_mut(), EndSynchronizedUpdate)?;
-        self.terminal.backend_mut().flush()?;
-        drawn
     }
 }
 
@@ -814,6 +832,8 @@ fn write_line(out: &mut impl Write, line: &Line<'_>, width: u16) -> Result<(), s
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // 还没写出去的那一帧先写完，下面直接写 stdout 的几条才排在它后面。
+        let _ = self.present();
         // 视口那一块是这个进程借来的，还回去时要擦干净：光标回到我们这一块的顶上、清掉
         // 往下的内容，退出后那一行 `komo resume` 就印在它原来的位置上，不会留下半个输入框。
         let mut stdout = std::io::stdout();
@@ -824,6 +844,47 @@ impl Drop for TerminalGuard {
             Show
         );
         let _ = restore_terminal();
+    }
+}
+
+/// 视口这一侧的字节先攒着，[`FrameWriter::present`] 时一次写给终端。
+///
+/// 不能直接用 `Stdout`：它是按行缓冲的，交给回滚区的每一行一个换行就是一次写，一帧被
+/// 切成几十段；`BufWriter` 套在它外面也没用，冲刷时照样在最后一个换行处断成两次。这里
+/// 写的是 stdout 的一个 dup，不经过那层行缓冲。
+///
+/// 平常的 `flush` 什么都不做：ratatui 画完一帧就会冲刷，那时同步输出的结束标记还没排
+/// 进来。只有 `present` 开关打开时的那次冲刷才真写——开关由 [`TerminalGuard::present`]
+/// 拨（ratatui 不给稳定的办法从后端里取回 writer，所以靠这个共用的开关）。
+struct FrameWriter {
+    pending: Vec<u8>,
+    out: File,
+    present: Rc<Cell<bool>>,
+}
+
+impl FrameWriter {
+    fn new(stdout: &std::io::Stdout, present: Rc<Cell<bool>>) -> Result<Self, std::io::Error> {
+        Ok(FrameWriter {
+            pending: Vec::with_capacity(16 * 1024),
+            out: File::from(stdout.as_fd().try_clone_to_owned()?),
+            present,
+        })
+    }
+}
+
+impl Write for FrameWriter {
+    fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error> {
+        self.pending.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> Result<(), std::io::Error> {
+        if !self.present.get() || self.pending.is_empty() {
+            return Ok(());
+        }
+        let written = self.out.write_all(&self.pending);
+        self.pending.clear();
+        written
     }
 }
 
@@ -847,6 +908,31 @@ mod tests {
 
     fn key(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    /// **一帧只写一次。** ratatui 自己的冲刷、正文行里的换行都不许把半帧送出去——隔着
+    /// SSH，擦掉视口与重画它分成两次到达，就是一次闪烁。
+    #[test]
+    fn a_frame_reaches_the_terminal_in_one_write_only_when_presented() {
+        let file = tempfile::NamedTempFile::new().expect("能建临时文件");
+        let present = Rc::new(Cell::new(false));
+        let mut writer = FrameWriter {
+            pending: Vec::new(),
+            out: file.reopen().expect("能打开"),
+            present: present.clone(),
+        };
+        let written = || std::fs::read(file.path()).expect("能读");
+
+        writer.write_all(b"\x1b[J line one\r\n").expect("能写");
+        writer.flush().expect("能冲刷");
+        writer.write_all(b"redraw").expect("能写");
+        writer.flush().expect("能冲刷");
+        assert!(written().is_empty(), "开关没开，冲刷不该写出任何东西");
+
+        present.set(true);
+        writer.flush().expect("能冲刷");
+        assert_eq!(written(), b"\x1b[J line one\r\nredraw");
+        assert!(writer.pending.is_empty());
     }
 
     /// **交给回滚区的一行，在终端上就得正好占一行。**

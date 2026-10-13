@@ -82,6 +82,15 @@ pub trait RecoveryIndex: Send + Sync {
         reason: &str,
     ) -> Result<bool, StoreError>;
 
+    /// 上一个执行实例没确认停下（§8.7）：同样停成 `waiting + intervention`，但**领取者留在
+    /// 行上**——对账每一拍拿它重新探一次（[`RecoveryAction::WaitForPreviousExecutor`]）。
+    /// 与 [`Self::requeue`] 同一个条件。
+    async fn hold_for_previous_executor(
+        &self,
+        seen: &UnfinishedRun,
+        reason: &str,
+    ) -> Result<bool, StoreError>;
+
     /// `sessions.state`（§8.10）。**§8.9 的第一个问题就是它**：「这条未完成的 Run，
     /// 它所属的会话还在服务范围里吗」——一条 Run 自己的状态说得再清楚，也答不出这件事，
     /// 而按空上下文继续一轮比停下来更糟。
@@ -216,6 +225,12 @@ impl RecoveryReport {
                 matches!(
                     o.action,
                     RecoveryAction::KeepWaiting { .. } | RecoveryAction::WaitUntilRetry { .. }
+                ) || matches!(
+                    (&o.action, o.applied),
+                    (
+                        RecoveryAction::WaitForPreviousExecutor { .. },
+                        Applied::LeftAsIs
+                    )
                 )
             })
             .count()
@@ -314,6 +329,8 @@ pub struct RecoveryScan {
     executor: ExecutorId,
     liveness: Arc<dyn ExecutorLiveness>,
     orphans: Arc<dyn OrphanOutputs>,
+    /// 操作者答了 `resolve` 的那几条：这一趟把它们的阻塞前提重新看一遍（§7.5）。
+    recheck: Vec<RunId>,
 }
 
 impl std::fmt::Debug for RecoveryScan {
@@ -340,7 +357,16 @@ impl RecoveryScan {
             liveness,
             // 默认不查孤儿输出：行为与接这条能力之前一致。
             orphans: Arc::new(NoOrphanLookup),
+            recheck: Vec::new(),
         }
+    }
+
+    /// 这一趟把 `run` 的阻塞前提重新看一遍——`resolve` 的那条路（§7.5：「不强行放行，只要求
+    /// 重新观察并重新决策一次」）。不加这一条，停在等人上的 Run 只会被判成"原样停着"，
+    /// `resolve` 就什么也没做。
+    pub fn rechecking(mut self, run: RunId) -> Self {
+        self.recheck.push(run);
+        self
     }
 
     /// 接上孤儿 `output.json` 的查找（§14 故障注入表那一行）。不接就一律答"找不到"。
@@ -470,9 +496,18 @@ impl RecoveryScan {
                     state,
                     content_available,
                 },
+                recheck_block: self.recheck_block(run),
             },
             orphan,
         })
+    }
+
+    /// 停在等人上的这一条，前提要不要重新看：领取者还留在行上（上一个执行实例没确认停下，
+    /// 见 [`RecoveryIndex::hold_for_previous_executor`]），或者操作者刚答了 `resolve`。
+    fn recheck_block(&self, run: &UnfinishedRun) -> bool {
+        run.state == RunState::Waiting
+            && matches!(run.wait, Some(WaitReason::Intervention { .. }))
+            && (run.claimed_by.is_some() || self.recheck.contains(&run.run))
     }
 
     /// 取这个会话的全部事件。**只负责取事件**：读不到就是空列表，不在这里判"内容在不在"
@@ -699,6 +734,20 @@ impl RecoveryScan {
             // 落在 `last_error` 上，因为 `WaitReason::Intervention` 只有句柄。
             RecoveryAction::WaitingForOperator { reason } => {
                 Ok(self.mark_needs_attention(run, reason).await?)
+            }
+            // 上一个执行实例还没确认停下。已经这样停着的（领取者还在行上）**一个字不写**：
+            // 对账每一拍都会走到这里，前提没变就没有新事实。
+            RecoveryAction::WaitForPreviousExecutor { reason } => {
+                if self.recheck_block(run) && run.claimed_by.is_some() {
+                    return Ok(Applied::LeftAsIs);
+                }
+                Ok(
+                    if self.index.hold_for_previous_executor(run, reason).await? {
+                        Applied::NeedsOperator
+                    } else {
+                        Applied::Superseded
+                    },
+                )
             }
             // 「停止受影响任务并报告损坏。不重跑来掩盖数据损坏。」
             RecoveryAction::HaltCorrupt { reason } => {

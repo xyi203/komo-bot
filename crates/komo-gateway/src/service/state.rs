@@ -222,6 +222,16 @@ impl RecoveryIndex for RecoveryIndexOf {
             .mark_needs_attention_if_unchanged(&seen.run, reason, &seen_row(seen))
             .await
     }
+
+    async fn hold_for_previous_executor(
+        &self,
+        seen: &UnfinishedRun,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        self.store
+            .hold_for_previous_executor_if_unchanged(&seen.run, reason, &seen_row(seen))
+            .await
+    }
 }
 
 fn seen_row(run: &UnfinishedRun) -> komo_store::SeenRun {

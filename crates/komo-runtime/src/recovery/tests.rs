@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use komo_kernel::test_support::{MemLedger, MemOutputStore, TestClock};
 use komo_kernel::traits::{Ledger, OutputWriter, ToolOutputStore};
-use komo_kernel::types::ids::{RequestKey, ToolCallId};
+use komo_kernel::types::ids::{InterventionId, RequestKey, ToolCallId};
 use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::refs::{
     AttemptRef, ContentRef, OutputRef, ToolResultBody, ToolResultStatus,
@@ -71,6 +71,8 @@ struct IndexState {
     backfilled: Vec<RunId>,
     requeued: Vec<RunId>,
     attention: Vec<(RunId, String)>,
+    /// 停住而领取者留在行上的那些（上一个执行实例没确认停下）。
+    held: Vec<RunId>,
 }
 
 impl MemIndex {
@@ -114,6 +116,10 @@ impl MemIndex {
     fn attention(&self) -> Vec<(RunId, String)> {
         self.state.lock().unwrap().attention.clone()
     }
+
+    fn held(&self) -> Vec<RunId> {
+        self.state.lock().unwrap().held.clone()
+    }
 }
 
 #[async_trait]
@@ -156,6 +162,17 @@ impl RecoveryIndex for MemIndex {
             .unwrap()
             .attention
             .push((seen.run.clone(), reason.to_string()));
+        Ok(true)
+    }
+
+    async fn hold_for_previous_executor(
+        &self,
+        seen: &UnfinishedRun,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        let mut state = self.state.lock().unwrap();
+        state.attention.push((seen.run.clone(), reason.to_string()));
+        state.held.push(seen.run.clone());
         Ok(true)
     }
 
@@ -1126,12 +1143,91 @@ async fn a_surviving_previous_executor_blocks_a_second_start() {
     assert!(
         matches!(
             report.outcomes[0].action,
-            RecoveryAction::WaitingForOperator { .. }
+            RecoveryAction::WaitForPreviousExecutor { .. }
         ),
         "{:?}",
         report.outcomes[0]
     );
     assert!(index.requeued().is_empty());
+    assert_eq!(
+        index.held(),
+        vec![run.clone()],
+        "领取者留在行上，对账下一拍还能再探"
+    );
+}
+
+/// 上一次停住时领取者留在了行上（旧执行实例没确认停下）。它还没停 → 这一拍一个字不写；
+/// 它停了 → 不必等人，补索引、放回队列，那次 started 而无结果的调用交给执行器按 §8.6 收尾。
+#[tokio::test]
+async fn a_run_held_for_the_previous_executor_resumes_by_itself_once_it_stops() {
+    let world = World::new();
+    let run = world.accept().await;
+    let calls = world.round(&run, &["call-1"]).await;
+    let plan = world.plan(&calls[0]);
+    world.ledger.plan_call(&calls[0], &plan).await.unwrap();
+    world.ledger.start_call(&calls[0], &plan).await.unwrap();
+
+    let mut row = world.waiting_row(
+        &run,
+        WaitReason::Intervention {
+            intervention: InterventionId::for_run(&run),
+        },
+    );
+    row.claimed_by = Some(ExecutorId::from_raw("exec-old"));
+
+    let ledger = || Arc::clone(&world.ledger) as Arc<dyn Ledger>;
+    let outputs = || Arc::clone(&world.outputs) as Arc<dyn ToolOutputStore>;
+
+    let (scan, index) = world.scan_with(ledger(), outputs(), vec![row.clone()], false);
+    let report = scan.scan().await.unwrap();
+    assert_eq!(
+        report.outcomes[0].applied,
+        Applied::LeftAsIs,
+        "{:?}",
+        report.outcomes[0]
+    );
+    assert!(index.attention().is_empty(), "前提没变就没有新事实");
+    assert_eq!(report.waiting(), 1);
+
+    let (scan, index) = world.scan_with(ledger(), outputs(), vec![row], true);
+    let report = scan.scan().await.unwrap();
+    assert_eq!(
+        report.outcomes[0].action,
+        RecoveryAction::VerifyEffect {
+            call: calls[0].clone()
+        }
+    );
+    assert_eq!(index.requeued(), vec![run]);
+}
+
+/// `resolve`（§7.5）：停在等人上的 Run 重新观察一次——前提已经回来了就接着判，不再原样停着。
+/// 没人答 `resolve` 的那一拍照旧不动。
+#[tokio::test]
+async fn resolve_rechecks_a_blocked_run_instead_of_leaving_it_as_it_was() {
+    let world = World::new();
+    let run = world.accept().await;
+    let row = world.waiting_row(
+        &run,
+        WaitReason::Intervention {
+            intervention: InterventionId::for_run(&run),
+        },
+    );
+
+    let (scan, index) = world.scan(vec![row.clone()]);
+    let report = scan.scan().await.unwrap();
+    assert!(matches!(
+        report.outcomes[0].action,
+        RecoveryAction::KeepWaiting { .. }
+    ));
+    assert!(index.requeued().is_empty());
+
+    let (scan, index) = world.scan(vec![row]);
+    let report = scan.rechecking(run.clone()).scan().await.unwrap();
+    assert_eq!(
+        report.outcomes[0].action,
+        RecoveryAction::BackfillIndexAndQueue
+    );
+    assert_eq!(index.requeued(), vec![run]);
 }
 
 /// 启动扫描先把上一代的 running 交还，再逐个判断（§8.7 的顺序）。

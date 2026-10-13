@@ -77,6 +77,14 @@ impl App {
                     crate::sse::ConnectionState::Closed { reason } => {
                         self.fail(format!("事件订阅已关闭：{reason}"));
                     }
+                    // 断过又连上：多半是 Gateway 重启了。重启时的恢复扫描可能把一条 Run 停在
+                    // 等人上——那一笔只落在 state.db 里，事件流里没有它（§8.8：介入的当前状态
+                    // 直接查）。不问一次清单，界面会一直以为那条 Run 还在跑。
+                    crate::sse::ConnectionState::Connected if was_reconnecting => {
+                        self.connection = state;
+                        self.note("事件订阅已恢复");
+                        return vec![Effect::FetchPending];
+                    }
                     _ => {}
                 }
                 self.connection = state;
@@ -215,7 +223,7 @@ impl App {
                 Vec::new()
             }
             // Run 状态是派生的，我们自己折；收到它只当一次提示。
-            SseEvent::RunStatus { run: _, state } => {
+            SseEvent::RunStatus { run, state } => {
                 // 「停在等人上」：权威清单在 `GET /v1/interventions`——顺手问一遍，于是状态行
                 // 的待处理条数跟得上。
                 //
@@ -223,6 +231,15 @@ impl App {
                 // 所以这里分不出是哪一种：多问一次清单比漏掉一条便宜（清单只是一次
                 // 派生查询，而漏掉的那条会让界面停在"等待中"）。
                 if state == RunState::Waiting {
+                    return vec![Effect::FetchPending];
+                }
+                // 清单上挂着的那条动起来了（前提回来、自己接着跑了）：清单该换一份，否则状态
+                // 行上会一直挂着一条已经不在的待处理。
+                if self
+                    .pending
+                    .values()
+                    .any(|item| item.run.as_ref() == Some(&run))
+                {
                     return vec![Effect::FetchPending];
                 }
                 Vec::new()

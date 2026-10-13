@@ -152,9 +152,17 @@ enum GatewayCommand {
     /// 查询后台进程状态；不隐式启动服务（§3）。
     Status,
     /// 停止后台进程；不隐式启动服务（§3）。
-    Stop,
+    Stop {
+        /// 先等这个进程退出再动手（Gateway 自己的 shell 里跑 stop 时由它起的后台进程用）。
+        #[arg(long, hide = true)]
+        after_pid: Option<u32>,
+    },
     /// 重启后台进程。
-    Restart,
+    Restart {
+        /// 同 `stop --after-pid`。
+        #[arg(long, hide = true)]
+        after_pid: Option<u32>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -777,15 +785,42 @@ async fn gateway(
             // **不隐式启动服务**（§3）。
             Err(error) => Ok(Some(format!("没在跑：{error}"))),
         },
-        Some(GatewayCommand::Stop) => {
+        Some(GatewayCommand::Stop { after_pid }) => {
+            if after_pid.is_none() && units::inside_gateway() {
+                let by = units::defer(&connect::user_home(), home, units::Deferred::Stop)
+                    .map_err(|error| error.to_string())?;
+                return Ok(Some(format!(
+                    "这条命令跑在 Gateway 自己里面：等它结束、结果记进会话之后再停（{by}）。\
+                     停下之后要在终端里跑 `komo gateway` 才会再起来"
+                )));
+            }
+            wait_for_caller(after_pid);
             units::stop(&connect::user_home(), home).map_err(|error| error.to_string())?;
             Ok(Some("已请服务管理器停止 Gateway".into()))
         }
-        Some(GatewayCommand::Restart) => {
+        Some(GatewayCommand::Restart { after_pid }) => {
+            if after_pid.is_none() && units::inside_gateway() {
+                let by = units::defer(&connect::user_home(), home, units::Deferred::Restart)
+                    .map_err(|error| error.to_string())?;
+                return Ok(Some(format!(
+                    "这条命令跑在 Gateway 自己里面：等它结束、结果记进会话之后再重启（{by}）。\
+                     重启时事件订阅会断开几秒，之后自己重连"
+                )));
+            }
+            wait_for_caller(after_pid);
             units::restart(&connect::user_home(), home).map_err(|error| error.to_string())?;
             let client = connect::wait_ready(home).await?;
             Ok(Some(format!("Gateway 已重启：{}", client.base_url())))
         }
+    }
+}
+
+/// `--after-pid`：先等发起的那条命令退出，再留一点时间让 Gateway 把那次调用的结果落盘、
+/// 把那条 Run 收尾——这正是推迟的目的（`units::defer`）。
+fn wait_for_caller(after_pid: Option<u32>) {
+    if let Some(pid) = after_pid {
+        komo_gateway::service::units::wait_for_exit(pid, std::time::Duration::from_secs(30));
+        std::thread::sleep(std::time::Duration::from_millis(1500));
     }
 }
 
@@ -829,6 +864,28 @@ mod tests {
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
+    }
+
+    /// `stop` / `restart` 的 `--after-pid` 只给 Gateway 自己的 shell 里起的后台进程用：
+    /// 不带它就是平常那一条。
+    #[test]
+    fn restart_and_stop_take_a_hidden_after_pid() {
+        let Some(Command::Gateway {
+            action: Some(GatewayCommand::Restart { after_pid }),
+            ..
+        }) = Cli::parse_from(["komo", "gateway", "restart"]).command
+        else {
+            panic!("解析不出 restart");
+        };
+        assert_eq!(after_pid, None);
+        let Some(Command::Gateway {
+            action: Some(GatewayCommand::Stop { after_pid }),
+            ..
+        }) = Cli::parse_from(["komo", "gateway", "stop", "--after-pid", "42"]).command
+        else {
+            panic!("解析不出 stop --after-pid");
+        };
+        assert_eq!(after_pid, Some(42));
     }
 
     /// `komo toolbox ...` 的五条（§5.3、§5.4；**不在 §3 的命令表里**，见上面的 TODO）。

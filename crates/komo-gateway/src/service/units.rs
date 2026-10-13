@@ -313,6 +313,125 @@ pub fn restart(home_dir: &Path, komo_home: &Path) -> Result<(), UnitError> {
     start(home_dir, komo_home)
 }
 
+/// 这条命令是不是 Gateway 自己的 `shell` 工具起的：`KOMO_RUN` 只有那里会设（§4）。
+///
+/// 在那里面同步地 `stop` / `restart` 等于让 Gateway 停掉正在跑这条命令的自己：停机要等
+/// 手上的调用收尾，而那个调用正等着 Gateway 停下——互相等到服务管理器动手杀，这次调用的
+/// 结果永远落不了盘；新 Gateway 起来时这条命令还在等它就绪，于是恢复扫描看见"上一代的
+/// 子进程还活着"，把这条 Run 停在等人上（2026-10-13 实测，TUI 里 `!komo gateway restart`
+/// 转了两分钟）。所以这里要改走 [`defer`]。
+pub fn inside_gateway() -> bool {
+    std::env::var_os("KOMO_RUN").is_some()
+}
+
+/// 推迟到这条命令结束之后才做的那件事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deferred {
+    Stop,
+    Restart,
+}
+
+impl Deferred {
+    fn verb(self) -> &'static str {
+        match self {
+            Deferred::Stop => "stop",
+            Deferred::Restart => "restart",
+        }
+    }
+}
+
+/// 交给这条命令之外的人、在它结束之后再停 / 重启（见 [`inside_gateway`]）。返回交给了谁。
+///
+/// - launchd：起一个**脱离进程组**的 `komo gateway <verb> --after-pid <本进程>`，它等本进程
+///   退出、调用结果落盘之后再动手。自己的进程组 = `bootout` 不连它一起带走（实测：shell
+///   工具起的进程组在 Gateway 停下之后还活着）；输出写 `logs/gateway-restart.log`，不占
+///   shell 工具的管道（占着的话那次调用要等它结束才收得了尾）。
+/// - systemd：后台进程躲不过 `stop`——它在 Gateway 的 cgroup 里，一起被杀。所以让 systemd
+///   自己做：单元先按本进程的环境重写（与 [`start`] 一样刷新 `PATH`），再用
+///   `systemd-run --on-active` 挂一个两秒后执行的 `systemctl --user <verb>`。
+pub fn defer(home_dir: &Path, komo_home: &Path, what: Deferred) -> Result<String, UnitError> {
+    ensure_owns(home_dir, komo_home)?;
+    match manager() {
+        Manager::Launchd => spawn_after_exit(komo_home, what),
+        Manager::Systemd => {
+            if what == Deferred::Restart {
+                install(home_dir, komo_home)?;
+                run("systemctl", &["--user", "daemon-reload"])?;
+            }
+            let unit = format!("{UNIT}-{}-{}", what.verb(), std::process::id());
+            run(
+                "systemd-run",
+                &[
+                    "--user",
+                    "--collect",
+                    "--on-active=2",
+                    &format!("--unit={unit}"),
+                    "systemctl",
+                    "--user",
+                    what.verb(),
+                    &format!("{UNIT}.service"),
+                ],
+            )?;
+            Ok(format!("systemd 定时器 {unit}"))
+        }
+        Manager::None => Err(UnitError::NoManager),
+    }
+}
+
+#[cfg(unix)]
+fn spawn_after_exit(komo_home: &Path, what: Deferred) -> Result<String, UnitError> {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("komo"));
+    let log = komo_home.join("logs").join("gateway-restart.log");
+    let output = || -> Stdio {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+            .map(Stdio::from)
+            .unwrap_or_else(|_| Stdio::null())
+    };
+    let child = Command::new(&exe)
+        .args(["gateway", what.verb(), "--after-pid"])
+        .arg(std::process::id().to_string())
+        .env_remove("KOMO_RUN")
+        .env_remove("KOMO_SESSION")
+        .stdin(Stdio::null())
+        .stdout(output())
+        .stderr(output())
+        .process_group(0)
+        .spawn()
+        .map_err(|error| UnitError::Command {
+            command: format!("{} gateway {}", exe.display(), what.verb()),
+            message: error.to_string(),
+        })?;
+    Ok(format!("后台进程 {}，输出在 {}", child.id(), log.display()))
+}
+
+#[cfg(not(unix))]
+fn spawn_after_exit(_komo_home: &Path, _what: Deferred) -> Result<String, UnitError> {
+    Err(UnitError::NoManager)
+}
+
+/// 等 `pid` 退出（[`defer`] 起的那个后台进程用）：最多等 `limit`，等不到也照常往下做——
+/// 一条卡住的命令不该让 `restart` 永远不发生。`kill -0` 而不是 libc：依赖清单里没有 libc。
+pub fn wait_for_exit(pid: u32, limit: std::time::Duration) {
+    let deadline = std::time::Instant::now() + limit;
+    while std::time::Instant::now() < deadline {
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if !alive {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 /// 服务管理器眼里它是什么状态。**不隐式启动。**
 pub fn status() -> Result<String, UnitError> {
     match manager() {
@@ -360,6 +479,25 @@ fn output(program: &str, args: &[&str]) -> Result<String, UnitError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 后台进程等发起命令退出：退出了就往下走，不等满时限；等不到也不会永远挂着。
+    #[test]
+    fn waiting_for_the_caller_returns_when_it_exits_and_gives_up_at_the_limit() {
+        let mut child = Command::new("sleep").arg("0.3").spawn().unwrap();
+        let pid = child.id();
+        let reaper = std::thread::spawn(move || child.wait());
+        let started = std::time::Instant::now();
+        wait_for_exit(pid, std::time::Duration::from_secs(10));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        reaper.join().unwrap().unwrap();
+
+        let mut stuck = Command::new("sleep").arg("30").spawn().unwrap();
+        let started = std::time::Instant::now();
+        wait_for_exit(stuck.id(), std::time::Duration::from_millis(300));
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        stuck.kill().unwrap();
+        stuck.wait().unwrap();
+    }
 
     #[test]
     fn a_systemd_unit_runs_the_foreground_form() {

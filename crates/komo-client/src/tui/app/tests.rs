@@ -258,6 +258,65 @@ fn a_subscription_failure_shows_its_reason_once_while_retrying() {
     assert!(errors[0].text.contains("connection reset"));
 }
 
+/// 断过又连上（多半是 Gateway 重启了）：说一句已恢复，并且问一次清单——重启时恢复扫描
+/// 停下的 Run 只落在 state.db 里，不问就看不见。
+#[test]
+fn reconnecting_after_a_drop_asks_for_the_pending_list() {
+    let mut app = app();
+    app.apply(ServerEvent::Connection(ConnectionState::Connected));
+    app.apply(ServerEvent::Connection(ConnectionState::Reconnecting {
+        attempt: 1,
+        reason: "Gateway 断开了连接".into(),
+    }));
+    let effects = app.apply(ServerEvent::Connection(ConnectionState::Connected));
+    assert_eq!(effects, vec![Effect::FetchPending]);
+    assert!(
+        notices(&app).contains("事件订阅已恢复"),
+        "{}",
+        notices(&app)
+    );
+    assert!(app.connection.is_connected());
+
+    // 第一次连上不算"恢复"。
+    let mut fresh = self::app();
+    assert!(
+        fresh
+            .apply(ServerEvent::Connection(ConnectionState::Connected))
+            .is_empty()
+    );
+}
+
+/// 事件流里那条 Run 还"在跑"，清单上却有它：它是停在等人上的，状态行照清单说。它动起来
+/// 之后（任何状态帧）再问一次清单，免得那一条一直挂着。
+#[test]
+fn a_run_on_the_pending_list_reads_as_waiting_and_its_next_status_refreshes_the_list() {
+    let mut app = app();
+    // 只到 run.started：事件折出来是"在跑"。
+    feed(&mut app, &fixture::conversation()[..3]);
+    assert_eq!(app.run_state(), Some(RunState::Running));
+    let run = app.current_run.clone().expect("有一条 Run");
+    let mut item = fixture::intervention_summary("h", InterventionKind::Blocked, "旧执行者还在");
+    item.run = Some(run.clone());
+    app.apply(ServerEvent::Pending(vec![item.clone()]));
+    assert_eq!(app.run_state(), Some(RunState::Waiting));
+
+    // 已经结束的 Run 不被清单改写。
+    let mut done = self::app();
+    feed(&mut done, &fixture::conversation());
+    done.apply(ServerEvent::Pending(vec![item]));
+    assert_eq!(done.run_state(), Some(RunState::Completed));
+
+    let effects = app.apply(ServerEvent::Frame(Box::new(SseFrame {
+        id: Seq(40),
+        session: fixture::session(),
+        event: SseEvent::RunStatus {
+            run,
+            state: RunState::Queued,
+        },
+    })));
+    assert_eq!(effects, vec![Effect::FetchPending]);
+}
+
 /// 旧 Gateway 还会推审批帧（2026-10-11 删除）：游标照走，但**不提示**——它不是
 /// "格式对不上"，也不该换来一次清单查询。
 #[test]

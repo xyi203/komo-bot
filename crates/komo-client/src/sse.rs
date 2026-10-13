@@ -281,10 +281,12 @@ async fn connect_once(
         let chunk = tokio::time::timeout(config.idle_timeout, stream.next()).await;
         let chunk = match chunk {
             Ok(Some(Ok(chunk))) => chunk,
+            // 流读到一半断了：对端进程没了的样子（reqwest 报的是一句 `error decoding response
+            // body`，读的人猜不出是什么）。最常见的来由是 Gateway 在重启，就这么说，原话留在括号里。
             Ok(Some(Err(e))) => {
                 return Err(StreamStop::Failed {
                     at: cursor,
-                    reason: e.to_string(),
+                    reason: format!("Gateway 断开了连接，可能正在重启（{e}）"),
                 });
             }
             // 流正常结束。

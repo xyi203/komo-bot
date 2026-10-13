@@ -104,6 +104,10 @@ impl GatewayState {
             .iter()
             .filter(|outcome| outcome.applied == Applied::Requeued)
             .count() as u32;
+        // 放回队列的（比如上一个执行实例刚刚停下、停着等它的那条）不必等调度器下一次轮询。
+        if report.resumed > 0 {
+            self.waker().wake();
+        }
 
         // 到点的退避与放得开的依赖。
         report.resumed += self.release_due_waits(now).await?;

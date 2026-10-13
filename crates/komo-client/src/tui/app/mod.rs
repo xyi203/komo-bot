@@ -389,7 +389,19 @@ impl App {
 
     pub fn run_state(&self) -> Option<RunState> {
         let run = self.current_run.as_ref()?;
-        self.surface.runs.get(run).map(|view| view.status)
+        let status = self.surface.runs.get(run).map(|view| view.status)?;
+        // 恢复扫描把它停在等人上，这一笔只在 state.db 里、不在事件流里（§8.8）：事件折出来
+        // 的还是"在跑"。清单上有它就是在等人——状态行照这个说，不让它对着一条停住的
+        // Run 一直转"在跑"。
+        if !status.is_terminal()
+            && self
+                .pending
+                .values()
+                .any(|item| item.run.as_ref() == Some(run))
+        {
+            return Some(RunState::Waiting);
+        }
+        Some(status)
     }
 
     /// 这条 Run **在等什么**（§8.4 的第二个维度）。

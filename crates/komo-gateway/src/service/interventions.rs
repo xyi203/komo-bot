@@ -189,11 +189,18 @@ impl GatewayState {
         // 「`resolve` 不强行放行，它只要求**重新观察并重新决策**一次」（§7.5 第 3 条）。
         // 这里就是那条路：跑一遍恢复扫描——同一个观察、同一张决策表，只是"我处理过了"
         // 这件事落到了事实那一侧。事实没变，它就还停在等人上，这是对的。
+        //
+        // `rechecking`：不加它，扫描见到 `waiting + intervention` 只会判"原样停着"——那是
+        // 上一次决策的结果，不是这一次的观察，`resolve` 就成了一句什么也没做的答复。
         let scan = self
             .recovery()
+            .rechecking(run.clone())
             .scan()
             .await
             .map_err(|error| GatewayError::Internal(error.to_string()))?;
+        if scan.requeued() > 0 {
+            self.waker().wake();
+        }
         tracing::info!(handle = %summary.handle, runs = scan.outcomes.len(), "按操作者的要求重新观察并重新决策了一次");
         let state = self.run_state_of(Some(&run)).await?;
         let note = match state {

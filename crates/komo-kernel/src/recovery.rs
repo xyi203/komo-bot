@@ -131,6 +131,15 @@ pub struct RecoveryInput {
     /// 会话还在不在服务范围里（§8.9）。
     #[serde(default)]
     pub session: SessionObservation,
+    /// 这条停在 `waiting + intervention` 上的 Run，那个前提要不要**重新看一遍**。
+    ///
+    /// 两种情形为真：它停下是因为上一个执行实例没确认停下（领取者还记在行上，见
+    /// [`RecoveryAction::WaitForPreviousExecutor`]）——这个前提会自己消失，每一拍都该再看；
+    /// 或者操作者答了 `resolve`（§7.5：重新观察并重新决策一次）。为真时等人那一行不再
+    /// 原样保留，按日志尾重新判——上面那几道前提（会话、输出、旧执行者）这一趟已经重新
+    /// 看过；还不成立的，照旧停回等人上。
+    #[serde(default)]
+    pub recheck_block: bool,
 }
 
 fn yes() -> bool {
@@ -174,7 +183,15 @@ pub enum RecoveryAction {
     /// 需要操作者判断：把这条 Run 停成 `waiting + intervention`，它会出现在 §7.5 的
     /// 清单里等人答复。**不是"卡住"**——是这条 Run 确实有一个只有人能回答的问题。
     WaitingForOperator { reason: String },
+    /// 上一个执行实例还没确认停下（它留下的子进程还在，§8.7）：同样停成
+    /// `waiting + intervention` 进清单，但**领取者留在行上**——这个前提会自己消失（子进程
+    /// 跑完就没了），对账每一拍拿它重新探一次，探到停了就按日志尾接着判，不必等人答。
+    WaitForPreviousExecutor { reason: String },
 }
+
+/// 上一个执行实例没确认停下时给操作者看的那一句（§7.5 的 `blocked` 正文）。
+pub const PREVIOUS_EXECUTOR_RUNNING: &str = "上一个执行实例留下的子进程还在跑，暂不重复启动；它退出后会自动接续\
+     （不想等就结束那个进程，或答 abandon）";
 
 /// §8.4 的决策表。
 pub fn decide(observed: &RecoveryInput) -> RecoveryAction {
@@ -205,8 +222,8 @@ pub fn decide(observed: &RecoveryInput) -> RecoveryAction {
 
     // 「无法确认旧执行已结束时，阻止该任务重复启动并显示原因」（§8.7）。
     if !observed.previous_executor_stopped && !observed.state.is_terminal() {
-        return RecoveryAction::WaitingForOperator {
-            reason: "无法确认上一个执行实例已经结束，暂不重复启动".into(),
+        return RecoveryAction::WaitForPreviousExecutor {
+            reason: PREVIOUS_EXECUTOR_RUNNING.into(),
         };
     }
 
@@ -244,6 +261,11 @@ fn decide_while_waiting(observed: &RecoveryInput) -> RecoveryAction {
             at: *not_before,
             attempts: *attempts,
         },
+        // 前提要重新看一遍（旧执行者那一种，或操作者答了 `resolve`）：走到这里说明会话、
+        // 输出、旧执行者这几道这一趟都过了——按日志尾接着判。
+        Some(WaitReason::Intervention { .. }) if observed.recheck_block => {
+            decide_by_log_tail(observed)
+        }
         // 停在需要人判断上：**原样保留**。它不是"卡住"，是清单里的一条，等操作者答复
         // （§7.5）。恢复扫描不替人答，也不偷偷往下跑。
         Some(WaitReason::Intervention { .. }) => RecoveryAction::KeepWaiting {
@@ -307,6 +329,7 @@ mod tests {
             result_delivered: false,
             previous_executor_stopped: true,
             session: SessionObservation::default(),
+            recheck_block: false,
         }
     }
 
@@ -609,6 +632,54 @@ mod tests {
             },
         );
         observed.previous_executor_stopped = false;
+        assert!(matches!(
+            decide(&observed),
+            RecoveryAction::WaitForPreviousExecutor { .. }
+        ));
+    }
+
+    fn blocked_on_a_person(log_tail: LogTail) -> RecoveryInput {
+        waiting(
+            WaitReason::Intervention {
+                intervention: InterventionId::for_run(&RunId::from_raw("run-1")),
+            },
+            log_tail,
+        )
+    }
+
+    /// 停下是因为旧执行者没确认停下：它还在 → 原样停着（仍是那一种，领取者留在行上）；
+    /// 它停了 → 按日志尾接着判，不必等人答。
+    #[test]
+    fn a_run_held_for_the_previous_executor_continues_once_it_has_stopped() {
+        let tail = LogTail::RoundPersisted {
+            pending: PendingCall::Started { call: call() },
+        };
+        let mut observed = blocked_on_a_person(tail);
+        observed.recheck_block = true;
+        observed.previous_executor_stopped = false;
+        assert!(matches!(
+            decide(&observed),
+            RecoveryAction::WaitForPreviousExecutor { .. }
+        ));
+
+        observed.previous_executor_stopped = true;
+        assert_eq!(
+            decide(&observed),
+            RecoveryAction::VerifyEffect { call: call() }
+        );
+    }
+
+    /// `resolve` 是重新观察 + 重新决策：前提回来了就接着判，没回来就照旧停着等人。
+    #[test]
+    fn a_recheck_reapplies_the_preconditions_before_continuing() {
+        let mut observed = blocked_on_a_person(LogTail::AwaitingModelReply);
+        observed.recheck_block = true;
+        assert_eq!(
+            decide(&observed),
+            RecoveryAction::DiscardPartialAndRerequestModel
+        );
+
+        observed.session.content_available = false;
         assert!(matches!(
             decide(&observed),
             RecoveryAction::WaitingForOperator { .. }

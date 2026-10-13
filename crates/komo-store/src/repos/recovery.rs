@@ -356,7 +356,9 @@ impl RecoveryStore {
 
     /// 需要操作者判断：结果不明、引用损坏。
     pub async fn mark_needs_attention(&self, run: &RunId, reason: &str) -> Result<(), StoreError> {
-        self.mark_guarded(run, reason, None).await.map(|_| ())
+        self.mark_guarded(run, reason, None, false)
+            .await
+            .map(|_| ())
     }
 
     /// 同 [`Self::mark_needs_attention`]，但只在这一行仍是 `seen` 的样子时才写（对账用，
@@ -367,7 +369,24 @@ impl RecoveryStore {
         reason: &str,
         seen: &SeenRun,
     ) -> Result<bool, StoreError> {
-        self.mark_guarded(run, reason, Some(seen.clone())).await
+        self.mark_guarded(run, reason, Some(seen.clone()), false)
+            .await
+    }
+
+    /// 上一个执行实例没确认停下（§8.7）：同样停成 `waiting + intervention` 进清单，但
+    /// **`claimed_by` 留着**——它就是那个没停下的实例。对账每一拍拿它再探一次子进程，
+    /// 停了就按日志尾接着判；清掉的话就再也答不出"它停了没有"，只能等人。
+    ///
+    /// 留着领取者不会让它被领走：等人的行本来就不在领取谓词里；放回队列的
+    /// [`Self::requeue_if_unchanged`] 会一并清掉它。
+    pub async fn hold_for_previous_executor_if_unchanged(
+        &self,
+        run: &RunId,
+        reason: &str,
+        seen: &SeenRun,
+    ) -> Result<bool, StoreError> {
+        self.mark_guarded(run, reason, Some(seen.clone()), true)
+            .await
     }
 
     async fn mark_guarded(
@@ -375,6 +394,7 @@ impl RecoveryStore {
         run: &RunId,
         reason: &str,
         seen: Option<SeenRun>,
+        keep_claim: bool,
     ) -> Result<bool, StoreError> {
         let run = run.clone();
         let reason = reason.to_string();
@@ -396,12 +416,17 @@ impl RecoveryStore {
                     }
                     // `waiting + intervention`，句柄就是这个 Run（§7.5：一个 Run 上最多停着
                     // 一条要人判断的 Intervention，所以 Run ID 本身就是它的句柄）。
+                    let claimed_by = if keep_claim {
+                        row.claimed_by.clone()
+                    } else {
+                        None
+                    };
                     row.update()
                         .state(runs::state_str(RunState::Waiting))
                         .wait_kind(Some("intervention".to_string()))
                         .wait_ref(Some(InterventionId::for_run(&run).to_string()))
                         .wake_at(0_i64)
-                        .claimed_by(None as Option<String>)
+                        .claimed_by(claimed_by)
                         .last_error(Some(reason))
                         .updated_at(to_ts(OffsetDateTime::now_utc()))
                         .exec(ex)

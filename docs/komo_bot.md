@@ -85,7 +85,7 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo run cancel RUN_ID`                     | 请求取消运行                                                                |
 | `komo gateway`                               | 启动后台 Gateway，等待就绪后返回                                            |
 | `komo gateway --foreground`                  | 前台运行 Gateway，供服务管理器及调试使用                                    |
-| `komo gateway status/stop/restart`           | 管理后台进程                                                                |
+| `komo gateway status/stop/restart`           | 管理后台进程。在 Gateway 自己的 `shell` 里跑 `stop` / `restart`（TUI 的 `!`、模型发起的都算）不当场做，推迟到这条命令结束、结果记进会话之后（见下文"在 Gateway 里重启自己"） |
 | `komo intervention list/show/answer`         | 待处理清单：结果不明、阻塞两类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
 | `komo cron add/list/run/pause/resume/remove` | 管理定时任务                                                                |
 | `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector         |
@@ -128,6 +128,8 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
 Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台形式的 Gateway。**单元名是全局的（`komo-gateway.service` / `dev.komo.gateway`），只有默认数据目录 `~/.komo` 拥有它。** 别的 `KOMO_HOME` 走 `komo gateway` / `stop` / `restart` 会被**拒绝**并告诉你去前台跑 `KOMO_HOME=… komo gateway --foreground`：那条路会把单元文件改写成指向这个数据目录，现役服务随即被换掉——2026-09-21 实测过一次，`KOMO_HOME=/tmp/… komo config check` 经 `connect_or_start` 起服务，把现役单元换成了一份 debug 构建 + 沙箱数据目录。`komo gateway status` 会印出单元实际在服务哪个数据目录，与当前 `KOMO_HOME` 不一致时明说。**单元文件只设 `KOMO_HOME`（与可选的 `KOMO_LISTEN`）和 `PATH`，不加载 `.env`、不含任何凭证**。`PATH` 取自写单元的那个进程（操作者的 CLI），单元在每次 start / restart 时重写，`PATH` 随之刷新；写单元的进程没有 `PATH` 或为空就不写这一项，不编默认值。写它的原因（2026-09-24）：`shell` 工具的子进程继承 Gateway 的环境，而 launchd / systemd 默认只给 `/usr/bin:/bin:/usr/sbin:/sbin`——实测一次会话里 `komo`（`~/.cargo/bin`）与 `rg`（`/opt/homebrew/bin`）都是 `command not found`，白白耗掉几轮。`PATH` 不是凭证，下面几条理由都不适用于它。凭证不进单元的理由：launchd 没有 `EnvironmentFile` 的等价物，只能把值抄进 plist，那是把密钥复制到第二个文件；走进程环境还会让 `.env` 的热重载失效，并让每个子进程与日志都可能看到它。`.env` 由 Gateway 自己读成 `Secrets`（§3 热重载覆盖它），需要凭证的 Python 模块按**变量名**声明（§5.3），Gateway 在起子进程时按名注入。Mac 若后续需要操作用户桌面应用，应按登录用户的执行环境配置。后台服务不会让睡眠中的电脑继续执行任务。[Fedora systemd](https://fedoraproject.org/wiki/Packaging:Systemd) · [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
+
+**在 Gateway 里重启自己**（2026-10-13）。`shell` 工具的子进程带着 `KOMO_RUN`，`komo gateway stop` / `restart` 见到它就不当场做：同步做等于让 Gateway 停掉正在跑这条命令的自己——停机要等手上的调用收尾，那个调用正等着 Gateway 停下，互相等到服务管理器动手杀，这次调用的结果永远落不了盘；新 Gateway 起来时这条命令还在等它就绪，恢复扫描看见"上一代的子进程还活着"，把这条 Run 停在等人上（实测：TUI 里 `!komo gateway restart` 转了两分钟，事件订阅报 `error decoding response body`）。现在交给这条命令之外的人在它结束之后做：launchd 下起一个**自己进程组**的 `komo gateway <stop|restart> --after-pid <pid>`（`bootout` 不连它一起带走），等发起的命令退出再留 1.5 秒让结果落盘、Run 收尾，输出写 `logs/gateway-restart.log`；systemd 下后台进程躲不过 `stop`（同一个 cgroup），所以先按当前环境重写单元，再用 `systemd-run --user --on-active=2` 挂一次 `systemctl --user <verb>`。命令本身立刻返回一句"等它结束之后再重启"。`--after-pid` 是隐藏参数，只给那个后台进程用。只认 `shell`：`python` 的子进程没有 `KOMO_RUN`。systemd 这一支没有在真机上跑过（§14）。
 
 默认监听回环地址。首版远程访问可通过 SSH 转发连接；直接开放网络监听时需要 HTTPS 和认证。选择远程实例时，不因连接失败而启动一个本机替代实例。`status` 与 `stop` 不隐式启动服务。
 
@@ -481,7 +483,7 @@ workspace = "code/komo"
 
 1. **清单是派生视图，不是另一张表。** 权威仍是 `runs` 与 `tool_calls`；`GET /v1/interventions` 是对它们的查询，`kind` 由"有没有一条 uncertain 调用"当场判出。多一张 `interventions` 表等于多一处会与权威漂移的状态（§8.9）。**子代理（§4）的介入因此自动出现在同一张清单里**：子 Run 与它的调用本来就在这些表里，"谁派的"不是清单该关心的维度。
 2. **挡着会话的每一条都必须在清单里，而且与"后面领不走"是同一次判定。** §8.4 的"未完成"是四个非终态；其中**停在人身上的**（`waiting + intervention`）必须逐条出现，且由同一个谓词回答"这条 Run 现在挡不挡队"——就是 `WaitReason::needs_a_person()` 与那段 `earlier` 子查询。两处判定分家就会出现"卡住但清单为空"。`waiting + retry`（等时钟）与 `waiting + dependency`（等另一条 Run）不进清单：**它们不是在等人**，但仍然挡着同 Session 后面的 Run——唯一的例外是父 Run 正等着它派出去了的那条子 Run，那条必须能跑，否则父子互等（§4）。旧的 `waiting + approval` 不在等人，按 §7.4 续跑。
-3. **结论只走一条路：核对 → 按 §8.4 行事，没有"我说它发生了"。** `satisfied` 给那次调用补一条"核对后目标已满足"的结果（completed），原 Run 回到队列接着跑；`not_performed` 给那次调用补一条"确定没有执行"的结果（failed），原 Run 回到队列，模型拿到这次明确的失败——**重做是模型发起的新一次调用**，执行器不按原计划重放；`resolve` 不强行放行，它只要求**重新观察并重新决策**一次；`abandon` 是终态取消。没有"我确认副作用已发生"这种结论——操作者可能看错，账本一旦这么记就再也纠不回来。
+3. **结论只走一条路：核对 → 按 §8.4 行事，没有"我说它发生了"。** `satisfied` 给那次调用补一条"核对后目标已满足"的结果（completed），原 Run 回到队列接着跑；`not_performed` 给那次调用补一条"确定没有执行"的结果（failed），原 Run 回到队列，模型拿到这次明确的失败——**重做是模型发起的新一次调用**，执行器不按原计划重放；`resolve` 不强行放行，它只要求**重新观察并重新决策**一次——会话、输出、旧执行者这几道前提重新看，都过了就按 JSONL 尾部接着判（2026-10-13 之前扫描见到 `waiting + intervention` 只会判"原样停着"，那是上一次决策的结果而不是这一次的观察，`resolve` 实际什么也没做）；`abandon` 是终态取消。没有"我确认副作用已发生"这种结论——操作者可能看错，账本一旦这么记就再也纠不回来。
 
 出口有四个，语义相同：`komo intervention list | show | answer`、TUI 的待处理清单、聊天里的 `/pending` 与 `/answer`（§11.3）、`GET|POST /v1/interventions`。一次答一条，没有批量答复。投递沿用 §11.4 那一条：**没有界面在看这个会话时进 home chat**——那是任务在问，不是在报告（§10）。
 
@@ -640,13 +642,13 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 | 调用 started，没有结果 | 按 §8.6 的重放策略：计划与工具现在的声明都是 safe 才带原计划重跑一次（新的尝试）；否则记 uncertain，连同中断前已落盘的部分输出作为这次调用的结果**交给模型判断**，Run 接着往下走 |
 | `waiting + approval`（2026-10-11 之前的旧 Run） | 按"批准"续跑：那次调用 planned 而没 started，走"调用 planned，确定尚未执行"那一行，同一个重新入队的状态转换，不看审批行（§7.4） |
 | `waiting + retry` | 沿用已保存的次数与到点时刻，到点再尝试 |
-| `waiting + intervention` | **原样保留**：它是清单里的一条，等操作者答复——恢复扫描不替人答，也不偷偷往下跑 |
+| `waiting + intervention` | **原样保留**：它是清单里的一条，等操作者答复——恢复扫描不替人答，也不偷偷往下跑。两个例外都是"重新看前提"：操作者答了 `resolve`（§7.5），或它停下是因为旧执行者没确认结束（最后一行） |
 | `waiting + dependency` | 原样保留；谁放它出来由 reconcile 判（它等的那条 Run 进终态 → 回 `queued`） |
 | 已保存最终结果，但客户端没有收到 | 补发或补读原结果，不重新执行任务 |
 | 四个终态 | 保持终态，不因重启自动开启新一轮 |
 | Session 在 `closing` / `deleted`，Run 还没跑完 | 照跑或停在等待，但不新开；`--now` 的逻辑删除已把它们各写一条明确的取消（§8.10） |
 | Session 内容缺失或被回收（`state` 不是 `purged` 却读不出目录 / JSONL / 引用的输出） | 不许领这条 Run，停成 `waiting + intervention`，理由里说清缺什么（§8.9） |
-| 无法确认旧执行已结束 | 不许重复启动，停成 `waiting + intervention` 等人 |
+| 无法确认旧执行已结束 | 不许重复启动，停成 `waiting + intervention` 进清单，**领取者留在行上**；对账每一拍拿它重新探一次子进程，结束了就按 JSONL 尾部接着判，不必等人答（§8.7） |
 
 内部状态示意：
 
@@ -872,6 +874,8 @@ UPDATE runs SET claimed_by = NULL
 
 **存活判定在交还之前**（2026-10-12 修）：旧实现先一刀交还、再由扫描问"上一个执行实例停了吗"，可那时 `claimed_by` 已经是空的，答案永远是"停了"——旧子进程还活着也拦不住重复执行。现在按 `runtime/children` 的子进程登记先判出停不下的旧实例，它们名下的不交还，扫描看见领取者还在，停成 `blocked`。名单只读登记文件、不读库：对账的第一个库操作得是写（见 `service::start` 第 7 步那条旧快照的注释）。
 
+**停在旧执行者上的会自己接着跑**（2026-10-13）。"旧子进程还在"多半是暂时的——它跑完就没了（实测那一次是 `komo gateway restart` 自己：它在等新 Gateway 就绪，新 Gateway 的恢复扫描看见它还活着，§3）。以前停成 `blocked` 时一并清掉 `claimed_by`，之后谁也答不出"它停了没有"，周期对账只会判原样停着，`resolve` 也一样（§7.5），只剩 `abandon`。现在这一种单独一个动作（`RecoveryAction::WaitForPreviousExecutor`）：停成 `waiting + intervention` 进清单，理由写明"它退出后会自动接续"，**`claimed_by` 留着**——等人的行本来就不在领取谓词里，留着不会被领走，放回队列时一并清掉。对账每一拍见到"等人 + 领取者还在"就重新探那个实例的子进程：还在 → 一个字不写；停了 → 按 JSONL 尾部接着判（多半是 started 而无结果，按 §8.6 交给模型），并叫醒调度器。
+
 **租约只用来发现"没人管了"，不用来抢活。** handler 每 `TTL/3` 续一次 `lease_until`；对账见到过期只是**信号**，还要过一道"这个持有者真的不在（`claimed_by <> self`）或我自己内存里已不再持有它"才回收。少这一道，一次二十分钟的调用会在主人还活着的时候被第二个执行者抢走——那不是恢复，那是真的重复副作用（§8.6）。
 
 四条都通过 `toasty::sql::statement(...).bind(...).exec(&mut tx).await?` 执行，`u64` 就是受影响行数。**竞争失败的第一手信号是错误而不是 0 行**：并发竞争同一行时，败者拿到 `serialization failure`（MVCC 事务里是 `Write-write conflict`，autocommit 是 `database is locked`），只有在胜负已分之后再跑才会拿到 `0`。因此 `claim` 也包在 `with_write_retry` 里——它是少数几个「可以安全重跑的写」，因为守卫写在 `WHERE` 子句里：重跑一次要么还是没人领（赢），要么已经有人领了（`0`，判为输）。实测 120 轮（raw）+ 100 轮（走 toasty）、每轮 2–4 个竞争者，恰好一个赢家，没有 0 赢家也没有多赢家（`spikes/store.md`）。
@@ -894,7 +898,7 @@ CLI 不承担恢复调度。打开 komo 时可以看到“2 个任务已接续�
 
 **退出 TUI 就是暂停（`Ctrl-C`）**：Run 留在 Gateway 里照跑，退出时印出 `komo resume <会话>`——会话 Id 平时只在开场那条横幅上闪过一次（裸 `komo` 那条路上会话还没铸出来，由第一条消息之后的一条提示补上），退出这一刻正是需要它的时刻。暂停在任何界面状态下都有效，模型菜单开着也一样（菜单里的 `Esc` 是关掉菜单，不是退出）。一个字没发就退出时还没有会话，什么都不印。
 
-SSE 从已同步且索引完成的 JSONL 事件补读；介入当前状态可直接查询 state.db，不依赖用户一直在线。之后接入 Telegram 等主动推送渠道时，应为待发送结果持久保存投递记录，不能为补发一条结果消息重跑任务。
+SSE 从已同步且索引完成的 JSONL 事件补读；介入当前状态可直接查询 state.db，不依赖用户一直在线。所以**事件流里看不见恢复扫描停下的 Run**（那一笔只在 state.db 上）：TUI 断线重连成功时说一句"事件订阅已恢复"并问一次待处理清单；清单上有当前那条 Run 而事件折出来还没结束，状态行按"等待中"说，不对着一条停住的 Run 一直转；清单上那条 Run 再来任何状态帧就再问一次清单，免得已经接着跑的那条一直挂在状态行上（2026-10-13）。事件流读到一半断掉（对端进程没了）报"Gateway 断开了连接，可能正在重启"，原话留在括号里。之后接入 Telegram 等主动推送渠道时，应为待发送结果持久保存投递记录，不能为补发一条结果消息重跑任务。
 
 用户处理 uncertain 时，应先看到原操作、已有证据和待确认事项。如果决定终止，则补齐明确的取消 / 未知结果；若允许继续，也不能伪造原调用成功。任何后续模型请求都保持完整的调用与结果配对。
 
@@ -1966,3 +1970,4 @@ Memory 与模型验收覆盖：
 | 字节 / 4 的 token 估计对中日韩正文偏多少 | §6 的估价与窗口保护（`estimate_tokens`） | **未验证。** 一个汉字 3 字节、估 0.75 token，实际常是 1–2 个——中文为主的会话估低，窗口保护会晚到。窗口判断已经与实报的 `input` 取大，残余风险是"这一轮新加的中文结果"；偏得多就按字符类别分别估，或改用 provider 的计数接口 |
 | Anthropic 修订工具结果时补的第 4 个缓存断点实际命中率 | §8.3 的衰减与提示缓存 | **Responses 后端已有实测（2026-10-10，会话 01a12475-…，magpie、claude-opus-5-5）**：首版按次数逐条改写，10 轮 run 里 `cache_read` 四次退回 13317（只剩系统提示 + 工具表），全价输入 85k（约 53k 是失效重写），折算成本与 Claude Code 持平——自动前缀缓存下改写中间一条就是整段失效，由此改成缓存优先（§8.3）。**Anthropic 的未验证。** 补在被改结果之前那条 user 消息末块——它正是更早某次请求的末尾断点；命中要看 `cache_read` 是否覆盖到那里。命中不了就退回"系统提示 + 工具表"两级，衰减省下的读取要重新算账 |
 | 工作目录里的项目规范（`AGENTS.md` / `CLAUDE.md`）进不进提示、怎么找 | §4.3 冻结、`docs/agent.md` §10 的提示顺序 | **已做（2026-10-13），真实会话未验证。** 起因：pi 会话 01a132e5 在 komo-bot 目录里启动，第一轮就带着 `AGENTS.md`；komo 会话 01a11fda 的工作目录是 `workspaces/`，前 3 轮花在找源码、之后手动 `cat AGENTS.md`。规则照 pi 的 `loadProjectContextFiles`：从工作目录一直往上走到 `/`（不停在 git 根或家目录），每层按 `AGENTS.override.md` → `AGENTS.md` → `AGENTS.MD` → `CLAUDE.md` → `CLAUDE.MD` 取第一个读得出来的普通文件，外层在前、提示里说明冲突以靠后的为准；不加全局文件（Profile 的 `instructions` 就是那一份），不做 git worktree 去重。每条 Run 受理时找一次，正文冻结进 `payloads/`（`RunSnapshot.project_files_ref`），续跑按引用读回、读不出来按会话缺内容停下；Cron 与旧行没有快照，兜底身份现场找。只进主 Agent 的提示（komo 自查之后、Skills 之前）；子代理继承父快照但不渲染。**没有大小上限**（pi 也没有）：大文件整份进每一段的提示前缀，改了文件下一条 Run 的前缀缓存从这一块起失效——真实会话的 token 代价待看。测试：`service::project_files::tests`、`context::prompt::tests` 的两条 project_files、e2e `project_files_are_frozen_at_acceptance_like_the_profile` |
+| 在 Gateway 自己的 `shell` 里 `komo gateway restart` / `stop` 推迟执行（§3） | TUI 的 `!` 与模型发起的重启不再卡住、不再把那条 Run 停在等人上 | **单元测试已过，真机未验证（2026-10-13）。** launchd 一支要在 Mac 上装新二进制后跑一次 `!komo gateway restart`：命令立刻返回、Run 正常结束、约 1.5 秒后 Gateway 换了实例、TUI 说"事件订阅已恢复"，`logs/gateway-restart.log` 里是"Gateway 已重启"。systemd 一支（`systemd-run --user --on-active=2`）要在 Fedora 上同样跑一次；`systemd-run` 起不来时命令直接报错，不会退回同步重启 |

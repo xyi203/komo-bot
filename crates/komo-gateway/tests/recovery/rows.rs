@@ -1011,7 +1011,7 @@ async fn row_13_a_final_result_nobody_received_is_re_read_not_re_run() {
 // ---------------------------------------------------------------- 第 14 行
 
 /// 第 14 行：**旧子进程仍存活，或恢复和 resume 同时触发** → 先阻止重复执行；核实进程
-/// 结束，并且只有一个领取者。
+/// 结束（对账每一拍重新探，结束了就自己接着跑），并且只有一个领取者。
 #[tokio::test]
 async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_claim() {
     let home = Home::new();
@@ -1032,7 +1032,7 @@ async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_c
     force_claimed_by(&home, &run, &old_executor).await;
 
     home.clear_injection();
-    let gw = home.start(FakeLlm::finisher("不该走到这里。")).await;
+    let gw = home.start(FakeLlm::finisher("核对之后收场。")).await;
     let detail = gw
         .wait_state(
             &run,
@@ -1066,9 +1066,10 @@ async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_c
         "说得出为什么不重复启动：{pending:?}"
     );
     assert_eq!(counter.count(), 0, "没有重复执行");
-    gw.stop().await;
 
-    // ② 子进程收尾之后：恢复与 resume 同时触发，只有一个领取者。
+    // ② 子进程收尾之后：**不用重启、也不用人答**——领取者留在行上，对账下一拍重新探一次
+    // 就接着判（§8.7）。同时从外面踢一次 resume：两条路进的是同一个领取入口，只有一个
+    // 领取者。
     std::fs::remove_file(
         home.path()
             .join("runtime")
@@ -1077,23 +1078,27 @@ async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_c
     )
     .expect("销掉那一行");
 
-    let gw = home.start(FakeLlm::finisher("核对之后收场。")).await;
-    // 启动扫描已经跑过；再从外面踢一次 resume，两条路进的是同一个领取入口（§8.7）。
-    let (status, body) = gw
-        .post(
-            &format!("/v1/sessions/{session}/resume"),
-            serde_json::json!({}),
-        )
+    let resume = format!("/v1/sessions/{session}/resume");
+    let ((code, body), (status, resumed)) = tokio::join!(
+        gw.post_json("/v1/reconcile", serde_json::json!({})),
+        gw.post(&resume, serde_json::json!({})),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(status == 200 || status == 409, "{status} {resumed}");
+    let detail = gw
+        .wait_state(&run, |s| s.is_terminal(), "旧子进程收尾之后自己接着跑完")
         .await;
-    assert!(status == 200 || status == 409, "{status} {body}");
-    gw.wait_state(&run, |s| s.is_terminal() || s == RunState::Waiting, "收场")
-        .await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert!(
+        pending_intervention(&gw, &run).await.is_none(),
+        "前提回来了，清单上就不该再挂着它"
+    );
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
     assert_eq!(
         counter.count(),
         0,
-        "`shell` 没有可靠恢复方式，核对不出结论就不重跑——更不能跑两次"
+        "`shell` 没有可靠恢复方式：started 而无结果按结果不明交给模型，不重跑——更不能跑两次"
     );
     let events = home.events(&session);
     assert_eq!(
@@ -1101,6 +1106,40 @@ async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_c
         1,
         "只有一个领取者，所以只有那一次尝试"
     );
+    gw.stop().await;
+}
+
+/// `resolve`（§7.5）：**重新观察并重新决策一次**。会话内容读不出来而停下的 Run，内容放回
+/// 原处之后答一句 `resolve` 就接着跑——不是"重新看过一遍、还停着"（那是上一次决策的结果，
+/// 不是这一次的观察）。
+#[tokio::test]
+async fn resolve_lets_a_blocked_run_continue_once_its_premise_is_back() {
+    let home = Home::new();
+    let counter = Counter::new(&home, "resolve.count");
+
+    let fault = home.inject(Fault::AfterStartCall);
+    let gw = home.start(shell_then_done(&counter.append_command())).await;
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "resolve", "跑一条命令").await.run;
+    fault.wait_tripped().await;
+    gw.stop().await;
+
+    // 会话目录搬走：重启后对账判成"内容读不出来"，停在等人上。
+    let aside = home.path().join("moved-aside");
+    std::fs::rename(home.session_dir(&session), &aside).expect("搬走会话目录");
+    home.clear_injection();
+    let gw = home.start(FakeLlm::finisher("核对之后收场。")).await;
+    let pending = gw.wait_intervention(&run).await;
+    assert_eq!(pending.kind, InterventionKind::Blocked, "{pending:?}");
+    assert!(pending.question.contains("内容"), "{pending:?}");
+
+    // 内容放回去，答 `resolve`。
+    std::fs::rename(&aside, home.session_dir(&session)).expect("放回会话目录");
+    let body = gw.answer(&pending.handle, "resolve").await;
+    assert!(body.contains("回到队列"), "{body}");
+    let detail = gw.wait_state(&run, |s| s.is_terminal(), "接着跑完").await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert_eq!(counter.count(), 0, "started 而无结果的 shell 不重跑");
     gw.stop().await;
 }
 

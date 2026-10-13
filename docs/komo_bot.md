@@ -88,7 +88,7 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo gateway status/stop/restart`           | 管理后台进程。在 Gateway 自己的 `shell` 里跑 `stop` / `restart`（TUI 的 `!`、模型发起的都算）不当场做，推迟到这条命令结束、结果记进会话之后（见下文"在 Gateway 里重启自己"） |
 | `komo intervention list/show/answer`         | 待处理清单：结果不明、阻塞两类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
 | `komo cron add/list/run/pause/resume/remove` | 管理定时任务                                                                |
-| `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector         |
+| `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector；list --full 一条一行不截断 |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |
 | `komo config check`                          | 校验各模型、effort、向量参数、渠道名单及其他配置；只读，不改变运行中的 Gateway。数据目录里还留着 `policy.toml` 时报一句"已不再使用，可以删掉"（§7） |

@@ -371,6 +371,8 @@ pub struct MemoryFilter {
     pub scope: Option<String>,
     pub state: Option<String>,
     pub limit: Option<u32>,
+    /// 正文不截断、一条一行（[`render::memory_list_full`]）。
+    pub full: bool,
 }
 
 pub async fn memory_list(client: &KomoClient, filter: MemoryFilter) -> Outcome {
@@ -418,6 +420,9 @@ pub async fn memory_list(client: &KomoClient, filter: MemoryFilter) -> Outcome {
         })
         .await
         .map_err(failed)?;
+    if filter.full {
+        return Ok(render::memory_list_full(&response));
+    }
     Ok(render::memory_list(&response))
 }
 

@@ -433,6 +433,43 @@ pub fn memory_list(response: &MemoryListResponse) -> String {
     out.join("\n")
 }
 
+/// `komo memory list --full`：一条一行、制表符分隔、正文不截断，给模型一次读完。
+///
+/// 列是 `id@版本  状态  来源  确认  正文`；没有表头和对齐空格，正文里的换行与制表符压成空格，
+/// 所以"一行一条"始终成立。
+pub fn memory_list_full(response: &MemoryListResponse) -> String {
+    let mut out = Vec::new();
+    if response.degraded {
+        out.push(format!(
+            "⚠ 检索已降级为关键词{}",
+            response
+                .degraded_reason
+                .as_deref()
+                .map(|r| format!("：{r}"))
+                .unwrap_or_default()
+        ));
+    }
+    for item in &response.memories {
+        let content = item
+            .content
+            .split(['\n', '\r', '\t'])
+            .filter(|part| !part.trim().is_empty())
+            .map(str::trim)
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push(format!(
+            "{}@{}\t{}\t{}\t{}\t{}",
+            item.id,
+            item.revision,
+            memory_state(item.state),
+            provenance(item.provenance),
+            confirmation(item.confirmation),
+            content
+        ));
+    }
+    out.join("\n")
+}
+
 /// `komo memory show <id>`。
 pub fn memory_show(item: &MemoryItem) -> String {
     let mut out = vec![

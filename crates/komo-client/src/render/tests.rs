@@ -623,6 +623,29 @@ fn a_memory_list_keeps_provenance_and_confirmation_apart() {
 }
 
 #[test]
+fn a_full_memory_list_is_one_untruncated_line_per_memory() {
+    let long = "很长的一条记忆".repeat(20);
+    let mut multiline = memory_item();
+    multiline.id = MemoryId::from_raw("mem-2");
+    multiline.content = "第一行\n\t第二行".into();
+    let mut wide = memory_item();
+    wide.content = long.clone();
+    let printed = memory_list_full(&MemoryListResponse {
+        memories: vec![wide, multiline],
+        degraded: false,
+        degraded_reason: None,
+    });
+    let lines: Vec<&str> = printed.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            format!("mem-1@3\t候选\t模型推断\t未确认\t{long}").as_str(),
+            "mem-2@3\t候选\t模型推断\t未确认\t第一行 第二行",
+        ]
+    );
+}
+
+#[test]
 fn a_degraded_retrieval_says_so_out_loud() {
     let printed = memory_list(&MemoryListResponse {
         memories: vec![],

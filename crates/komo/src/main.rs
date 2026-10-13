@@ -274,6 +274,9 @@ enum MemoryCommand {
         /// 最多列多少条。
         #[arg(long)]
         limit: Option<u32>,
+        /// 一条一行、制表符分隔、正文不截断：`id@版本 状态 来源 确认 正文`。
+        #[arg(long)]
+        full: bool,
     },
     /// 检索；支持 hybrid / keyword / vector（§9.4）。
     Search {
@@ -660,6 +663,7 @@ async fn operator(
                 scope,
                 state,
                 limit,
+                full,
             } => {
                 commands::memory_list(
                     client,
@@ -669,6 +673,7 @@ async fn operator(
                         scope,
                         state,
                         limit,
+                        full,
                     },
                 )
                 .await
@@ -688,6 +693,7 @@ async fn operator(
                         scope,
                         state,
                         limit,
+                        full: false,
                     },
                 )
                 .await

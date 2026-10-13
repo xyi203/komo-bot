@@ -26,8 +26,10 @@ use crate::types::ids::{
 };
 use crate::types::memory::{MemoryItem, RecallQuery, RecallResult};
 use crate::types::model::{EmbeddingSpace, InputKind, TokenUsage, Vector};
-use crate::types::plan::{ExecutionPlan, Verification};
-use crate::types::refs::{AttemptRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput};
+use crate::types::plan::{ExecutionPlan, Replay};
+use crate::types::refs::{
+    AttemptRef, InterruptedOutput, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput,
+};
 use crate::types::status::{Claimed, RunEnd, WaitReason};
 use crate::types::systemone::{SystemOneError, SystemOneRequest, SystemOneResponse};
 use crate::types::tool::{
@@ -353,6 +355,14 @@ pub trait ToolOutputStore: Send + Sync {
 
     /// 按引用读取并校验哈希；不匹配返回 [`StoreError::Corrupt`]，**不返回内容**。
     async fn open(&self, output: &OutputRef) -> Result<VerifiedOutput, StoreError>;
+
+    /// 一次被打断的尝试留下的部分输出，各取末尾至多 `tail_bytes`（§8.6）。没有留下就是
+    /// [`InterruptedOutput::default`]。只读：接管它的是之后对同一尝试的 [`Self::begin`]。
+    async fn interrupted(
+        &self,
+        attempt: &AttemptRef,
+        tail_bytes: usize,
+    ) -> Result<InterruptedOutput, StoreError>;
 }
 
 /// 一次尝试的流式写入器。
@@ -621,15 +631,11 @@ pub trait Tool: Send + Sync {
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError>;
 
-    /// §8.6：对 started 而无结果的调用核对目标状态。默认 `Unavailable` →
-    /// `needs_attention`。`write` / `edit` 用内容哈希覆盖它；`python` 交给模块自带的
-    /// 核对函数。
-    async fn verify(
-        &self,
-        _plan: &ExecutionPlan,
-        _ctx: &ToolContext,
-    ) -> Result<Verification, ToolError> {
-        Ok(Verification::Unavailable)
+    /// §8.6：这个工具**现在**声明的重放策略。重启后一次 started 而没有结果的调用，
+    /// 只有计划里记下的与这里的都是 [`Replay::Safe`] 才带原计划重跑；否则中断结果交给
+    /// 模型。默认 `Unsafe`：只有重跑一遍确实无害的工具（读、搜索）才覆盖它。
+    fn replay(&self) -> Replay {
+        Replay::Unsafe
     }
 }
 

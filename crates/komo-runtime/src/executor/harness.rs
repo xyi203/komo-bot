@@ -13,7 +13,7 @@ use komo_kernel::traits::{Clock, Ledger, Tool};
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::{AttemptId, OperationId, RequestKey, RunId, SessionId, ToolCallId};
 use komo_kernel::types::plan::{
-    ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode, Verification,
+    ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode, Replay,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{
@@ -251,16 +251,16 @@ impl Harness {
     }
 }
 
-/// 一个记账的假工具：跑过几次、每次拿到的计划、`verify` 答什么，都可以断言和编排。
+/// 一个记账的假工具：跑过几次、每次拿到的计划、现在声明的重放策略，都可以断言和编排。
 pub struct RecordingTool {
     name: &'static str,
     operation: Operation,
     recovery: RecoveryMode,
-    verdict: std::sync::Mutex<Option<Verification>>,
+    /// 工具**现在**声明的重放策略；`None` = 与它写进计划的那份一致。
+    replay: Option<Replay>,
     outcome: std::sync::Mutex<Option<Result<ToolOutput, ToolError>>>,
     delay: Option<std::time::Duration>,
     pub executions: AtomicU32,
-    pub verifications: AtomicU32,
 }
 
 impl RecordingTool {
@@ -269,11 +269,10 @@ impl RecordingTool {
             name,
             operation,
             recovery: RecoveryMode::NoSafeRecovery,
-            verdict: std::sync::Mutex::new(None),
+            replay: None,
             outcome: std::sync::Mutex::new(None),
             delay: None,
             executions: AtomicU32::new(0),
-            verifications: AtomicU32::new(0),
         }
     }
 
@@ -292,8 +291,9 @@ impl RecordingTool {
         self
     }
 
-    pub fn with_verdict(self, verdict: Verification) -> Self {
-        *self.verdict.lock().expect("假工具") = Some(verdict);
+    /// 工具现在声明的重放策略与写进计划的那份不同（升级改了声明）。
+    pub fn with_replay(mut self, replay: Replay) -> Self {
+        self.replay = Some(replay);
         self
     }
 
@@ -310,10 +310,6 @@ impl RecordingTool {
 
     pub fn ran(&self) -> u32 {
         self.executions.load(Ordering::SeqCst)
-    }
-
-    pub fn verified(&self) -> u32 {
-        self.verifications.load(Ordering::SeqCst)
     }
 }
 
@@ -374,17 +370,7 @@ impl Tool for RecordingTool {
             })
     }
 
-    async fn verify(
-        &self,
-        _plan: &ExecutionPlan,
-        _ctx: &ToolContext,
-    ) -> Result<Verification, ToolError> {
-        self.verifications.fetch_add(1, Ordering::SeqCst);
-        Ok(self
-            .verdict
-            .lock()
-            .expect("假工具")
-            .clone()
-            .unwrap_or(Verification::Unavailable))
+    fn replay(&self) -> Replay {
+        self.replay.unwrap_or_else(|| self.recovery.replay())
     }
 }

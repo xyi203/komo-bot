@@ -27,7 +27,7 @@ use komo_kernel::traits::{Clock, Ledger, LedgerError, OutputWriter, StoreError, 
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::refs::{
-    AttemptRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput,
+    AttemptRef, InterruptedOutput, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput,
 };
 use komo_kernel::types::status::{RunEnd, WaitReason};
 use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch};
@@ -771,6 +771,17 @@ impl ToolOutputStore for RoutedOutputs {
             .await
             .map_err(|error| StoreError::Corrupt(error.to_string()))?;
         self.store_for(&session).await?.open(output).await
+    }
+
+    async fn interrupted(
+        &self,
+        attempt: &AttemptRef,
+        tail_bytes: usize,
+    ) -> Result<InterruptedOutput, StoreError> {
+        self.store_for(&attempt.session)
+            .await?
+            .interrupted(attempt, tail_bytes)
+            .await
     }
 }
 

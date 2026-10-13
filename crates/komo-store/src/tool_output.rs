@@ -18,8 +18,8 @@ use komo_kernel::traits::{OutputWriter, StoreError, ToolOutputStore};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::refs::{
-    AttemptRef, ContentRef, OutputRef, PublishedOutput, ToolResultBody, ToolResultStatus,
-    VerifiedOutput,
+    AttemptRef, ContentRef, InterruptedOutput, OutputRef, PublishedOutput, ToolResultBody,
+    ToolResultStatus, VerifiedOutput,
 };
 use serde::{Deserialize, Serialize};
 
@@ -187,13 +187,18 @@ impl ToolOutputStore for FileToolOutputStore {
         }
         let dir = self.attempt_dir(attempt);
         create_dir_all_synced(&dir).await?;
+        // 上一个进程被打断时留下的 `.partial` 由这次接管：接着往里追加，发布时与新写的
+        // 一起成为这次尝试的 stdout / stderr。不接管的话它永远是个没人引用的孤儿，而那
+        // 正是"中断前做到哪儿了"的唯一证据（§8.6）。
+        let (stdout, stdout_bytes) = adopt_partial(&dir, "stdout.txt").await?;
+        let (stderr, stderr_bytes) = adopt_partial(&dir, "stderr.txt").await?;
         self.streams.lock().await.insert(
             attempt.attempt.to_string(),
             Streams {
-                stdout: None,
-                stderr: None,
-                stdout_bytes: 0,
-                stderr_bytes: 0,
+                stdout,
+                stderr,
+                stdout_bytes,
+                stderr_bytes,
                 started: std::time::Instant::now(),
             },
         );
@@ -324,6 +329,78 @@ impl ToolOutputStore for FileToolOutputStore {
             body: document.body,
         })
     }
+
+    async fn interrupted(
+        &self,
+        attempt: &AttemptRef,
+        tail_bytes: usize,
+    ) -> Result<InterruptedOutput, StoreError> {
+        let dir = self.attempt_dir(attempt);
+        let (stdout_bytes, stdout_tail) = partial_tail(&dir, "stdout.txt", tail_bytes).await?;
+        let (stderr_bytes, stderr_tail) = partial_tail(&dir, "stderr.txt", tail_bytes).await?;
+        Ok(InterruptedOutput {
+            stdout_bytes,
+            stdout_tail,
+            stderr_bytes,
+            stderr_tail,
+        })
+    }
+}
+
+/// 打开一份遗留的 `.partial` 接着追加；没有就是 `(None, 0)`。
+async fn adopt_partial(
+    dir: &std::path::Path,
+    name: &str,
+) -> Result<(Option<tokio::fs::File>, u64), StoreError> {
+    let path = dir.join(format!("{name}.partial"));
+    let len = match tokio::fs::metadata(&path).await {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, 0)),
+        Err(e) => return Err(StoreError::Io(format!("看 {} 失败：{e}", path.display()))),
+    };
+    let file = tokio::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .await
+        .map_err(|e| StoreError::Io(format!("接管 {} 失败：{e}", path.display())))?;
+    Ok((Some(file), len))
+}
+
+/// 一份遗留 `.partial` 的总字节数与末尾至多 `limit` 字节。从中间截开时丢掉第一段残行，
+/// 让片段从行首开始；字节按 UTF-8 宽松解码。
+async fn partial_tail(
+    dir: &std::path::Path,
+    name: &str,
+    limit: usize,
+) -> Result<(u64, String), StoreError> {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    let path = dir.join(format!("{name}.partial"));
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, String::new())),
+        Err(e) => return Err(StoreError::Io(format!("读 {} 失败：{e}", path.display()))),
+    };
+    let len = file
+        .metadata()
+        .await
+        .map_err(|e| StoreError::Io(format!("看 {} 失败：{e}", path.display())))?
+        .len();
+    let start = len.saturating_sub(limit as u64);
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|e| StoreError::Io(format!("读 {} 失败：{e}", path.display())))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .await
+        .map_err(|e| StoreError::Io(format!("读 {} 失败：{e}", path.display())))?;
+    let mut tail = bytes.as_slice();
+    if start > 0
+        && let Some(newline) = tail.iter().position(|&b| b == b'\n')
+        && newline + 1 < tail.len()
+    {
+        tail = &tail[newline + 1..];
+    }
+    Ok((len, String::from_utf8_lossy(tail).into_owned()))
 }
 
 async fn finish_stream(
@@ -397,6 +474,53 @@ mod tests {
             FileToolOutputStore::new(paths, session.clone()),
             session,
         )
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_attempts_partial_output_is_reported_and_then_published_with_it() {
+        let (_dir, store, session) = store().await;
+        let attempt = attempt(&session);
+
+        // 上一个进程写到一半就没了：只留下 .partial，内存里的流随进程一起没了。
+        let mut writer = store.begin(&attempt).await.unwrap();
+        writer
+            .write_stdout(b"step 1 done\nstep 2 done\nstep 3 ")
+            .await
+            .unwrap();
+        drop(writer);
+        let restarted = FileToolOutputStore::new(store.paths().clone(), session.clone());
+
+        let left = restarted.interrupted(&attempt, 16).await.unwrap();
+        assert_eq!(left.stdout_bytes, 31);
+        // 从中间截开时从行首开始。
+        assert_eq!(left.stdout_tail, "step 3 ");
+        assert_eq!(left.stderr_bytes, 0);
+        assert!(!left.is_empty());
+
+        // 对同一尝试再 begin 就是接管：发布出来的 stdout 就是那份部分输出。
+        let writer = restarted.begin(&attempt).await.unwrap();
+        let published = restarted
+            .publish(writer, body(ToolResultStatus::Uncertain))
+            .await
+            .unwrap();
+        let stdout = published.stdout.expect("接管的 stdout");
+        assert_eq!(stdout.size, 31);
+        let dir = store
+            .paths()
+            .resolve("tool-output/run-1/call-7/attempt-1")
+            .unwrap();
+        assert_eq!(
+            std::fs::read(dir.join("stdout.txt")).unwrap(),
+            b"step 1 done\nstep 2 done\nstep 3 "
+        );
+        assert!(!dir.join("stdout.txt.partial").exists());
+        assert!(
+            restarted
+                .interrupted(&attempt, 16)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

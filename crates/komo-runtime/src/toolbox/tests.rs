@@ -231,7 +231,6 @@ fn a_candidate_is_never_callable_only_the_enabled_version_is() {
     let resolved = toolbox.resolve_call("toolbox.adder", "add").unwrap();
     assert_eq!(resolved.module, "adder");
     assert_eq!(resolved.version, ModuleVersion::of(GOOD, None));
-    assert!(resolved.verifier.is_none());
 }
 
 #[test]
@@ -432,7 +431,6 @@ fn the_builtin_memos_module_is_callable_the_moment_it_is_installed() {
 
     let resolved = toolbox.resolve_call("toolbox.memos", "create").unwrap();
     assert_eq!(resolved.version, ModuleVersion::of(builtin::MEMOS, None));
-    assert_eq!(resolved.verifier.as_deref(), Some("verify"));
 
     let info = toolbox.inspect("memos").unwrap();
     assert!(info.enabled.unwrap().builtin);

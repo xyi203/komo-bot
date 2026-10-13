@@ -371,6 +371,13 @@ impl ToolOutputStore for LostOutputs {
             what: output.0.path.clone(),
         })
     }
+    async fn interrupted(
+        &self,
+        _attempt: &AttemptRef,
+        _tail_bytes: usize,
+    ) -> Result<komo_kernel::types::refs::InterruptedOutput, StoreError> {
+        unimplemented!("恢复扫描只读")
+    }
 }
 
 // ---------------------------------------------------------------- 夹具

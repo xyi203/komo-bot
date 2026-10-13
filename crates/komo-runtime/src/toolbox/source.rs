@@ -1,13 +1,13 @@
-//! 从模块正文里**静态**读出它声明了什么（§5.2、§8.6）。
+//! 从模块正文里**静态**读出它声明了什么（§5.2）。
 //!
 //! 为什么不 import 一下问 Python：`Tool::prepare` 的契约写着「**不能通过导入未知
 //! Python 模块、运行命令等方式提前执行未审核代码**」。`prepare` 要回答"这个函数导出了
 //! 吗"，而 import 一次就已经把模块顶层的代码跑过了——那正是 §7.3 要挡的东西。
 //!
-//! 所以这里是一个**很小的**解析器，只认三样写在顶层的字面量：
+//! 所以这里是一个**很小的**解析器，只认写在顶层的这几样字面量（2026-10-13 之前还有
+//! `__komo_verify__`，随核对梯子删掉，写了也不再读）：
 //!
 //! - `__all__ = ["create", "get"]`：导出清单（§5.2「明确导出」）。
-//! - `__komo_verify__ = "verify"`：与版本绑定的核对函数名（§8.6）。
 //! - `__komo_env__ = ["MEMOS_TOKEN"]`：这个模块要的**凭证引用**——变量名，不是值
 //!   （§5.3「地址和凭证引用通过配置传给已授权模块」；§7.2「凭证引用」进计划，
 //!   凭证的值不进）。
@@ -22,8 +22,6 @@
 pub struct Declarations {
     /// `__all__` 里列出的名字。空 = 没有声明导出。
     pub exports: Vec<String>,
-    /// `__komo_verify__` 指的那个核对函数。
-    pub verifier: Option<String>,
     /// `__komo_env__` 里的**变量名**。凭证的值一个都不在这里。
     pub env: Vec<String>,
     /// 模块开头的 docstring（第一段）。
@@ -40,7 +38,6 @@ impl Declarations {
 pub fn declarations(code: &str) -> Declarations {
     Declarations {
         exports: string_list(code, "__all__"),
-        verifier: string_value(code, "__komo_verify__"),
         env: string_list(code, "__komo_env__"),
         doc: docstring(code),
     }
@@ -87,13 +84,6 @@ fn only_literals(text: &str) -> bool {
         }
     }
     true
-}
-
-/// `NAME = "..."` 里的那个字符串。
-fn string_value(code: &str, name: &str) -> Option<String> {
-    let rest = assignment(code, name)?;
-    let line = rest.lines().next()?;
-    literals(line).into_iter().next()
 }
 
 /// 顶层（不缩进）`name = ` 之后的那一段。
@@ -165,7 +155,6 @@ mod tests {
 """
 
 __all__ = ["create", "get", "verify"]
-__komo_verify__ = "verify"
 __komo_env__ = ["MEMOS_BASE_URL", "MEMOS_TOKEN"]
 
 
@@ -179,10 +168,9 @@ def _private():
 "#;
 
     #[test]
-    fn the_exports_and_the_verifier_are_read_without_importing_anything() {
+    fn the_declarations_are_read_without_importing_anything() {
         let read = declarations(MODULE);
         assert_eq!(read.exports, vec!["create", "get", "verify"]);
-        assert_eq!(read.verifier.as_deref(), Some("verify"));
         assert_eq!(read.env, vec!["MEMOS_BASE_URL", "MEMOS_TOKEN"]);
         assert!(read.doc.as_deref().unwrap().starts_with("Memos 客户端。"));
         assert!(read.exports("create"));
@@ -207,9 +195,9 @@ def _private():
     /// 缩进的赋值是函数体里的局部变量，不是模块的声明。
     #[test]
     fn an_indented_assignment_is_not_a_module_declaration() {
-        let read = declarations("def f():\n    __all__ = ['sneaky']\n    __komo_verify__ = 'x'\n");
+        let read = declarations("def f():\n    __all__ = ['sneaky']\n    __komo_env__ = ['X']\n");
         assert!(read.exports.is_empty());
-        assert!(read.verifier.is_none());
+        assert!(read.env.is_empty());
     }
 
     #[test]

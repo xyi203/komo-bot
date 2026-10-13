@@ -28,7 +28,6 @@ import urllib.parse
 import urllib.request
 
 __all__ = ["create", "get", "search", "update", "delete", "verify"]
-__komo_verify__ = "verify"
 __komo_env__ = ["MEMOS_BASE_URL", "MEMOS_TOKEN"]
 
 TIMEOUT = 20
@@ -180,15 +179,15 @@ def delete(identifier):
 
 
 def verify(function=None, args=None):
-    """与版本绑定的核对函数（§8.6）。
+    """核对一次 Memos 调用做没做成（§8.6）。
 
-    执行器在"started 了却没有结果"时通过同一套 python 机制调它。它回答四种结论之一，
-    绝不回答"大概吧"：
+    一次调用被 Gateway 重启打断、结果不明时，由模型调它去看目标，再决定重做还是往下走。
+    它回答四种结论之一，绝不回答"大概吧"：
 
         already_satisfied  目标已达到，附证据（ID / 链接）
         not_performed      确定未执行，且前提仍成立，可以重做同一次调用
         conflict           出现了第三种状态
-        unknown            核对不出结论 → 交给人
+        unknown            核对不出结论 → 问用户
 
     `create` 是这里唯一真正难的一个：Memos 没有幂等键，所以只能按**内容逐字相同**去
     找。找到恰好一条才算"已达到"；找到多条就是 unknown——"内容相似、时间接近"不能证明

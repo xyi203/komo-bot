@@ -45,8 +45,7 @@ mod tests {
             read.exports,
             vec!["create", "get", "search", "update", "delete", "verify"]
         );
-        assert_eq!(read.verifier.as_deref(), Some("verify"));
-        // 核对函数自己也要是导出的——driver 只调 `__all__` 里的名字。
+        // 核对函数是给模型调的普通导出函数（§8.6）。
         assert!(read.exports("verify"));
         assert!(read.doc.is_some(), "模块说明是模型先读的那一层（§5.3）");
     }

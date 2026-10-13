@@ -399,27 +399,29 @@ async fn directories_and_references() {
     // ④ 不同 attempt 不互相覆盖：同一个调用被中断之后**真的重做一次**，两次尝试各写各的
     //    目录，第二次不许碰第一次那一份。
     //
-    // 造法三步：① `finish_call` 之前跳闸——第一次尝试已经把 output.json 发布出去了，结果
+    // 造法两步：① `finish_call` 之前跳闸——第一次尝试已经把 output.json 发布出去了，结果
     // 事件没写；② 停机之后把第一次那份 output.json **改名**存到旁边（`orphan::find` 于是
-    // 读不到"这次动作确实发生过"的证据，恢复退回工具自己的核对；改名而不是删除，是为了在
-    // 那个目录里留下一份第二次尝试**不许动**的真文件）；③ 把写好的目标文件删掉，于是
-    // `write` 的核对给出"确定未执行"，第二次尝试真的跑起来并发布自己那一份输出。
+    // 读不到"这次动作确实发生过"的证据，恢复退回重放策略；改名而不是删除，是为了在那个
+    // 目录里留下一份第二次尝试**不许动**的真文件）。`read` 的重放策略是 safe（§8.6），
+    // 于是第二次尝试真的跑起来并发布自己那一份输出。
     let home2 = Home::new();
     let target = home2.workspace().join("attempts.txt");
+    std::fs::create_dir_all(home2.workspace()).expect("工作区");
+    std::fs::write(&target, "两次尝试").expect("要读的文件");
     let fault = home2.inject(Fault::BeforeFinishCall);
     let gw = home2
         .start(FakeLlm::new(vec![vec![
             call_round(
                 1,
                 "pc-1",
-                "write",
-                serde_json::json!({"path": target.display().to_string(), "content": "两次尝试"}),
+                "read",
+                serde_json::json!({"path": target.display().to_string()}),
             ),
-            text_round(2, "写好了。"),
+            text_round(2, "读好了。"),
         ]]))
         .await;
     let session = gw.open_session().await;
-    let run = gw.submit(&session, "attempts", "写个文件").await.run;
+    let run = gw.submit(&session, "attempts", "读个文件").await.run;
     fault.wait_tripped().await;
     gw.stop().await;
 
@@ -431,10 +433,9 @@ async fn directories_and_references() {
     let kept = first_dir.join("output.json.kept");
     std::fs::rename(first_dir.join("output.json"), &kept).expect("把第一次那份挪到旁边");
     let kept_bytes = std::fs::read(&kept).expect("读得到");
-    std::fs::remove_file(&target).expect("把写好的文件删掉");
 
     home2.clear_injection();
-    let gw = home2.start(FakeLlm::finisher("核对之后重做了一次。")).await;
+    let gw = home2.start(FakeLlm::finisher("重读了一次。")).await;
     gw.wait_terminal(&run).await;
 
     let events = home2.events(&session);
@@ -488,11 +489,6 @@ async fn directories_and_references() {
             started[1].call_id, started[1].attempt_id
         ),
         "结果引用指的是第二次那一份"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&target).unwrap_or_default(),
-        "两次尝试",
-        "核对出「确定未执行」之后重做的那一次生效了"
     );
     gw.stop().await;
 }

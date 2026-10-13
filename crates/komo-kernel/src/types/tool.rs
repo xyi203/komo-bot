@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AttemptId, RunId, SessionId, ToolCallId};
-use super::plan::{EnvVersion, PlanSource, Verification};
+use super::plan::{EnvVersion, PlanSource};
 use super::refs::{ContentRef, ToolResultStatus};
 use super::resource::ResourceMounts;
 use super::status::ToolCallState;
@@ -128,7 +128,7 @@ pub struct ToolContext {
 ///
 /// **它在 `ToolContext` 上，不在 `ExecutionPlan` 里**，理由是硬的：账本按计划哈希核对
 /// `tool.planned` 与 `tool.started`，而恢复执行用的必须是**同一份**计划——把"这是第二
-/// 次"写进计划，哈希就变了，同一个调用前后对不上。计划回答"这个动作是什么、它可以怎样恢复"
+/// 次"写进计划，哈希就变了，同一个调用前后对不上。计划回答"这个动作是什么、重启后能不能重跑"
 /// （[`RecoveryMode`](super::plan::RecoveryMode)），上下文回答"这一次是第几次"。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResumedCall {
@@ -143,23 +143,13 @@ pub struct ResumedCall {
     /// 不是一个布尔。
     #[serde(default)]
     pub attempts_so_far: u32,
-    /// 已经做过的核对的结论。
-    ///
-    /// `None` 表示还没核对过。工具**只有在这里读到
-    /// [`Verification::NotPerformed`] 时**才可以把一个有副作用的动作重做一遍；读到
-    /// [`Verification::AlreadySatisfied`] 就报告"核对后目标已满足"而不是重跑，读到
-    /// `Conflict` / `Unknown` / `Unavailable` 就交给人（§8.6）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verification: Option<Verification>,
+    // 2026-10-13 之前这里还有 `verification`（核对梯子的结论）。旧线格式带着它也解得出来。
 }
 
 impl ResumedCall {
-    /// 确定这次动作还没发生过——§8.4 第 6 行，或核对给出了 `NotPerformed`。
+    /// 确定这次动作还没发生过——§8.4 第 6 行（planned 而没有 started）。
     pub fn is_known_not_to_have_run(&self) -> bool {
-        matches!(
-            (&self.previous_state, &self.verification),
-            (ToolCallState::Planned, _) | (_, Some(Verification::NotPerformed { .. }))
-        )
+        self.previous_state == ToolCallState::Planned
     }
 }
 
@@ -288,7 +278,6 @@ mod tests {
         let resumed: ResumedCall = serde_json::from_str(json).unwrap();
         assert_eq!(resumed.attempts_so_far, 0);
         assert!(resumed.previous_attempt.is_none());
-        assert!(resumed.verification.is_none());
         assert!(
             resumed.is_known_not_to_have_run(),
             "planned 就是 §8.4 第 6 行的「确定尚未执行」"
@@ -296,32 +285,19 @@ mod tests {
     }
 
     #[test]
-    fn a_started_call_is_only_safe_to_redo_after_a_verification_says_so() {
-        let mut resumed = ResumedCall {
-            previous_attempt: Some(AttemptId::from_raw("attempt-1")),
-            previous_state: ToolCallState::Started,
-            attempts_so_far: 1,
-            verification: None,
-        };
-        assert!(!resumed.is_known_not_to_have_run(), "还没核对，不能重做");
-
-        resumed.verification = Some(Verification::AlreadySatisfied {
-            evidence: "内容哈希已是预期值".into(),
-        });
+    fn a_started_call_is_never_known_not_to_have_run() {
+        // 旧线格式带着已经退役的 `verification` 也解得出来，而且它不再改变判断。
+        let json = r#"{"previous_attempt":"attempt-1","previous_state":"started",
+            "attempts_so_far":1,"verification":{"kind":"not_performed","evidence":"x"}}"#;
+        let resumed: ResumedCall = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resumed.previous_attempt,
+            Some(AttemptId::from_raw("attempt-1"))
+        );
         assert!(
             !resumed.is_known_not_to_have_run(),
-            "目标已满足不等于没发生过"
+            "started 本身证明不了什么"
         );
-
-        resumed.verification = Some(Verification::Unknown {
-            reason: "远端没给幂等键".into(),
-        });
-        assert!(!resumed.is_known_not_to_have_run());
-
-        resumed.verification = Some(Verification::NotPerformed {
-            evidence: "文件仍是原内容".into(),
-        });
-        assert!(resumed.is_known_not_to_have_run());
     }
 
     #[test]

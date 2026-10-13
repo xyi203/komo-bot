@@ -11,7 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::ids::OperationId;
-use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode};
+use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode, Replay};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -59,6 +59,15 @@ impl McpTool {
 impl Tool for McpTool {
     fn definition(&self) -> ToolDefinition {
         self.definition.clone()
+    }
+
+    /// 服务器标了只读的工具重启后可以重跑；其余的说不清发生没有，不重跑（§8.6）。
+    fn replay(&self) -> Replay {
+        if self.read_only {
+            Replay::Safe
+        } else {
+            Replay::Unsafe
+        }
     }
 
     async fn prepare(

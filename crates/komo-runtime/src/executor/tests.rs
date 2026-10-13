@@ -7,10 +7,10 @@ use std::time::Duration;
 use komo_kernel::traits::{Clock, Ledger, OutputWriter, Tool};
 use komo_kernel::types::ids::{AttemptId, OperationId, SessionId, ToolCallId};
 use komo_kernel::types::plan::{
-    ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
-    Verification,
+    ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode, Replay,
+    TargetAccess,
 };
-use komo_kernel::types::refs::{PREVIEW_LIMIT_BYTES, ToolResultStatus};
+use komo_kernel::types::refs::{InterruptedOutput, PREVIEW_LIMIT_BYTES, ToolResultStatus};
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::{CancelToken, ToolContext, ToolDefinition, ToolError, ToolOutput};
@@ -173,17 +173,12 @@ async fn a_tool_outside_the_surface_cannot_be_called() {
     );
 }
 
-/// ⑦ 恢复执行：started 而无结果 + 核对答不上来 → **不重跑**，交人。
+/// ⑦ 恢复执行：started 而无结果、重放策略是 unsafe → **不重跑**，中断结果连同中断前已落盘
+/// 的部分输出交给模型（§8.6，pi-durable 的 `interrupted`）。
 #[tokio::test]
-async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
+async fn an_unsafe_started_call_is_not_rerun_and_the_model_gets_its_partial_output() {
     let harness = Harness::new();
-    let tool = Arc::new(
-        RecordingTool::shell()
-            .with_recovery(RecoveryMode::VerifyTarget)
-            .with_verdict(Verification::Unknown {
-                reason: "远端没给幂等键".into(),
-            }),
-    );
+    let tool = Arc::new(RecordingTool::shell());
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
@@ -195,6 +190,15 @@ async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
             &plan_of(&*tool, &harness, &session, &run, &calls[0]).await,
         )
         .await;
+    harness.outputs.leave_interrupted(
+        previous.as_str(),
+        InterruptedOutput {
+            stdout_bytes: 4096,
+            stdout_tail: "step 2 done\nstep 3 ".into(),
+            stderr_bytes: 0,
+            stderr_tail: String::new(),
+        },
+    );
     calls[0].resumed = Some(resumed_from(
         ToolCallState::Started,
         Some(previous.clone()),
@@ -206,24 +210,25 @@ async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
         .await
         .unwrap();
 
-    assert_eq!(tool.ran(), 0, "核对不出结论，执行器就不重跑");
-    assert_eq!(tool.verified(), 1);
+    assert_eq!(tool.ran(), 0, "unsafe 的调用重启后执行器不重跑");
     // 不停下来等人：结果不明作为这次调用的结果交给模型，由它核对之后决定（§8.6）。
     assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
     assert_eq!(outcome.results.len(), 1);
     let fed = &outcome.results[0];
     assert!(fed.is_error);
-    assert!(fed.content.contains("核对不出结论"), "{}", fed.content);
-    assert!(
-        fed.content.contains("被 Gateway 重启打断"),
-        "{}",
-        fed.content
-    );
-    assert!(
-        fed.content.contains("先核对目标的实际状态"),
-        "{}",
-        fed.content
-    );
+    for expected in [
+        "被 Gateway 重启打断",
+        "先核对目标的实际状态",
+        "中断前已落盘的部分输出",
+        "[stdout 共 4096 字节，末尾 19 字节]",
+        "step 2 done\nstep 3 ",
+    ] {
+        assert!(
+            fed.content.contains(expected),
+            "缺 {expected}：{}",
+            fed.content
+        );
+    }
 
     // 上一世那条 `tool.started` 配上了一条明确的 uncertain——不写下来它会永远悬着。
     let results = harness.results_for(&previous);
@@ -235,11 +240,43 @@ async fn a_started_call_whose_verification_is_unknown_is_not_rerun() {
     );
 }
 
-/// ⑦（另一半）planned = 确定尚未执行 → 直接执行一次，不核对。
+/// 中断前什么都没落下，也要说清楚，而不是让模型以为漏看了什么。
+#[tokio::test]
+async fn an_interrupted_call_without_output_says_so() {
+    let harness = Harness::new();
+    let tool = Arc::new(RecordingTool::shell());
+    let executor = harness.executor(vec![tool.clone()]);
+    let (session, run) = harness.open_run().await;
+    let mut calls = harness
+        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .await;
+    let previous = harness
+        .crashed_attempt(
+            &calls[0].call,
+            &plan_of(&*tool, &harness, &session, &run, &calls[0]).await,
+        )
+        .await;
+    calls[0].resumed = Some(resumed_from(ToolCallState::Started, Some(previous), 1));
+
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+    assert_eq!(tool.ran(), 0);
+    assert!(
+        outcome.results[0]
+            .content
+            .contains("中断前没有落下任何输出"),
+        "{}",
+        outcome.results[0].content
+    );
+}
+
+/// ⑦（另一半）planned = 确定尚未执行 → 直接执行一次，不看重放策略。
 #[tokio::test]
 async fn a_planned_call_is_known_not_to_have_run_and_executes_once() {
     let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell().with_recovery(RecoveryMode::VerifyTarget));
+    let tool = Arc::new(RecordingTool::shell());
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
@@ -253,8 +290,7 @@ async fn a_planned_call_is_known_not_to_have_run_and_executes_once() {
         .unwrap();
 
     assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
-    assert_eq!(tool.ran(), 1);
-    assert_eq!(tool.verified(), 0, "确定没跑过就不必核对");
+    assert_eq!(tool.ran(), 1, "确定没跑过，unsafe 也照跑一次");
 
     // 只 planned 过，没有上一次尝试要收尾；这一次自己的那条结果照常落下。
     let started: Vec<AttemptId> = harness
@@ -272,21 +308,19 @@ async fn a_planned_call_is_known_not_to_have_run_and_executes_once() {
     assert_eq!(harness.results_for(&started[0]).len(), 1);
 }
 
-/// 核对说"目标已满足"→ 报告结论，**不重做**。
+/// 工具现在声明 unsafe，能否决计划里记下的 safe（升级改了声明）：不重跑。
 #[tokio::test]
-async fn a_satisfied_target_is_reported_not_redone() {
+async fn a_current_unsafe_declaration_vetoes_a_stored_safe_replay() {
     let harness = Harness::new();
     let tool = Arc::new(
-        RecordingTool::shell()
-            .with_recovery(RecoveryMode::VerifyTarget)
-            .with_verdict(Verification::AlreadySatisfied {
-                evidence: "内容哈希已是预期值".into(),
-            }),
+        RecordingTool::new("read", Operation::ReadFile)
+            .with_recovery(RecoveryMode::SafeReread)
+            .with_replay(Replay::Unsafe),
     );
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("read", serde_json::json!({ "path": "a.txt" }))])
         .await;
     let previous = harness
         .crashed_attempt(
@@ -305,26 +339,40 @@ async fn a_satisfied_target_is_reported_not_redone() {
         .await
         .unwrap();
     assert_eq!(tool.ran(), 0);
-    assert!(!outcome.results[0].is_error);
-    assert!(
-        outcome.results[0].content.contains("核对后目标已满足"),
-        "{}",
-        outcome.results[0].content
-    );
-
-    // 核对结论就是那次尝试的结果：一条，completed。
+    assert!(outcome.results[0].is_error);
     let results = harness.results_for(&previous);
-    assert_eq!(results.len(), 1, "有且只有一条结果：{results:?}");
-    assert_eq!(results[0].status, ToolResultStatus::Completed);
-    assert_eq!(
-        harness.ledger.surface().calls[&results[0].call_id].state,
-        ToolCallState::Completed
-    );
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0].status, ToolResultStatus::Uncertain);
 }
 
-/// 可安全重做的读取不必核对——§8.6 表的第一行。
+/// 反过来不行：计划里记下的是 unsafe，工具现在声明 safe 也不重跑。
 #[tokio::test]
-async fn a_safe_reread_is_redone_without_a_verification() {
+async fn a_current_safe_declaration_never_upgrades_a_stored_unsafe_one() {
+    let harness = Harness::new();
+    let tool = Arc::new(RecordingTool::shell().with_replay(Replay::Safe));
+    let executor = harness.executor(vec![tool.clone()]);
+    let (session, run) = harness.open_run().await;
+    let mut calls = harness
+        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .await;
+    let previous = harness
+        .crashed_attempt(
+            &calls[0].call,
+            &plan_of(&*tool, &harness, &session, &run, &calls[0]).await,
+        )
+        .await;
+    calls[0].resumed = Some(resumed_from(ToolCallState::Started, Some(previous), 1));
+
+    executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+    assert_eq!(tool.ran(), 0);
+}
+
+/// 计划与工具都说 safe 的读取，重启后带原计划重跑一次（§8.6）。
+#[tokio::test]
+async fn a_safe_reread_is_replayed_after_a_restart() {
     let harness = Harness::new();
     let tool = Arc::new(
         RecordingTool::new("read", Operation::ReadFile).with_recovery(RecoveryMode::SafeReread),
@@ -352,7 +400,6 @@ async fn a_safe_reread_is_redone_without_a_verification() {
         .unwrap();
     assert!(outcome.stop.is_none());
     assert_eq!(tool.ran(), 1);
-    assert_eq!(tool.verified(), 0);
 }
 
 /// 结果不明不能被当成失败重试掉，也不停下来等人：它作为结果交给模型，正文里带着判断方法
@@ -515,13 +562,6 @@ async fn not_performed_closes_the_call_as_failed_so_a_retry_is_a_new_call() {
         evidence: "远端没有这条记录".into(),
     };
     assert_eq!(verdict.status(), ToolResultStatus::Failed);
-    assert_eq!(
-        verdict.as_verification(),
-        Verification::NotPerformed {
-            evidence: "远端没有这条记录".into()
-        },
-        "续跑时它读的形状就是 §8.6 的核对结论"
-    );
 
     let status = executor
         .settle_by_operator(&session, &run, &call, &attempt, verdict)
@@ -3269,16 +3309,10 @@ mod one_projection {
             assert_one_projection(&harness, "委派收口", &done.results[0]).await;
         }
 
-        // 恢复时核对说目标已满足：报告结论，不重跑。
+        // 恢复时被重启打断、不能重跑：中断结果，带部分输出。
         {
             let harness = Harness::new();
-            let tool = Arc::new(
-                RecordingTool::shell()
-                    .with_recovery(RecoveryMode::VerifyTarget)
-                    .with_verdict(Verification::AlreadySatisfied {
-                        evidence: "内容哈希已是预期值".into(),
-                    }),
-            );
+            let tool = Arc::new(RecordingTool::shell());
             let executor = harness.executor(vec![tool.clone()]);
             let (session, run, mut request) =
                 round(&harness, "shell", serde_json::json!({ "command": "x" })).await;
@@ -3288,13 +3322,22 @@ mod one_projection {
                     &plan_of(&*tool, &harness, &session, &run, &request).await,
                 )
                 .await;
+            harness.outputs.leave_interrupted(
+                previous.as_str(),
+                InterruptedOutput {
+                    stdout_bytes: 12,
+                    stdout_tail: "step 1 done\n".into(),
+                    stderr_bytes: 0,
+                    stderr_tail: String::new(),
+                },
+            );
             request.resumed = Some(resumed_from(ToolCallState::Started, Some(previous), 1));
             let outcome = executor
                 .execute_round(vec![request], &harness.env(&session, &run))
                 .await
                 .unwrap();
             assert_eq!(tool.ran(), 0);
-            assert_one_projection(&harness, "核对已满足", &outcome.results[0]).await;
+            assert_one_projection(&harness, "重启打断", &outcome.results[0]).await;
         }
     }
 }
@@ -3826,12 +3869,11 @@ mod fused {
             .await
             .unwrap();
 
-        // 文件还是原内容：要是问了 edit 自己的核对，它会答"确定未执行"并重做。结果不明
-        // 交给模型，Run 不停。
+        // 组合调用的重放策略是 unsafe：改动与命令都不重做，结果不明交给模型，Run 不停。
         assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
         assert_eq!(outcome.results.len(), 1);
         assert!(
-            outcome.results[0].content.contains("then_run"),
+            outcome.results[0].content.contains("被 Gateway 重启打断"),
             "{}",
             outcome.results[0].content
         );

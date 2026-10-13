@@ -142,7 +142,6 @@ async fn the_builtin_memos_module_is_there_on_first_boot() {
         memos.exports,
         vec!["create", "get", "search", "update", "delete", "verify"]
     );
-    assert_eq!(memos.verifier.as_deref(), Some("verify"));
     // 凭证**引用**看得见，凭证本身一个字都不在（§5.3）。
     assert_eq!(memos.env, vec!["MEMOS_BASE_URL", "MEMOS_TOKEN"]);
     let printed = serde_json::to_string(&memos).expect("序列化");

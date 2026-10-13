@@ -14,7 +14,7 @@ use komo_kernel::traits::{OutputWriter, PythonHost, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
-    EnvVersion, ExecutionPlan, Operation, PlanVersions, RecoveryMode, ResourceRef, Verification,
+    EnvVersion, ExecutionPlan, Operation, PlanVersions, RecoveryMode, ResourceRef,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{
@@ -162,8 +162,7 @@ impl Tool for PythonTool {
                         env: Some(env_version),
                     },
                     vec![],
-                    // 任意代码没有可靠恢复方式：停在 waiting + intervention，不自动从头再跑
-                    // 整个脚本（§8.6 那张表的最后一行）。
+                    // 重启后不从头再跑整个脚本，中断结果交给模型（§8.6）。
                     RecoveryMode::NoSafeRecovery,
                 )
             }
@@ -211,12 +210,8 @@ impl Tool for PythonTool {
                             credential_env: Some(name.clone()),
                         })
                         .collect(),
-                    // §8.6：有与版本绑定的核对函数才谈得上"可以核对目标状态"。
-                    // 模块自称幂等不算——只认它**真的提供了**一个核对函数。
-                    match resolved.verifier {
-                        Some(_) => RecoveryMode::VerifyTarget,
-                        None => RecoveryMode::NoSafeRecovery,
-                    },
+                    // 模块自称幂等不算：重启后同样不重跑，中断结果交给模型（§8.6）。
+                    RecoveryMode::NoSafeRecovery,
                 )
             }
         };
@@ -261,8 +256,7 @@ impl Tool for PythonTool {
         //
         // 计划与执行之间（恢复续跑时可能隔得很久）`komo toolbox enable` 可以把模块换掉。
         // 换过之后，这份计划里的一切——导出的函数、参数的含义、`resources` 里那串凭证
-        // 引用——说的都是**上一版**的事。`verify` 那一路已经这么判了（"模块升级过 →
-        // Unknown"），执行这一路没有理由更松。
+        // 引用——说的都是**上一版**的事。
         //
         // 交回模型的是一个**版本冲突**，和 `write` / `edit` 覆盖到别人改过的文件是同一类：
         // 它会重新 `prepare` → 新计划绑新版本（§5.4）。
@@ -346,76 +340,6 @@ impl Tool for PythonTool {
             preview: Some(preview),
         })
     }
-
-    /// §8.6：用**模块自带的、与版本绑定的**核对函数判断上一次到底发生了没有。
-    ///
-    /// 「已保存的 Python 模块可提供与版本绑定的核对函数，由执行器通过同一 python 执行
-    /// 机制调用。它不增加第六个模型工具。」——所以这里用同一个 [`PythonHost`] 调它
-    /// （没有 Policy 可过，§7），把它的答复映射成四种结论之一。
-    ///
-    /// 三种情况直接答 [`Verification::Unavailable`]（= 没有可用的核对方式 →
-    /// `waiting + intervention`）：`code` 模式、模块没声明核对函数、这台 Gateway 没有 toolbox。
-    /// **模块自称幂等不构成证明**：这里只认核对函数真的跑出来的那个答案。
-    async fn verify(
-        &self,
-        plan: &ExecutionPlan,
-        ctx: &ToolContext,
-    ) -> Result<Verification, ToolError> {
-        let Operation::PythonCall { module, function } = &plan.operation else {
-            return Ok(Verification::Unavailable);
-        };
-        let Some(toolbox) = &self.toolbox else {
-            return Ok(Verification::Unavailable);
-        };
-        let resolved = match toolbox.resolve_call(module, function) {
-            Ok(resolved) => resolved,
-            // 模块被停用 / 改没了：核对逻辑对不上计划绑的那一版，这是"不知道"。
-            Err(error) => {
-                return Ok(Verification::Unknown {
-                    reason: format!("{module} 的核对逻辑取不到：{error}"),
-                });
-            }
-        };
-        let Some(verifier) = resolved.verifier else {
-            return Ok(Verification::Unavailable);
-        };
-        // 「代码、依赖、参数以及核对逻辑都必须对应那份执行计划」（§8.6）：模块在这
-        // 之后升级过，现在这份核对逻辑就不是那份计划的核对逻辑。
-        let planned = plan.versions.module.as_deref();
-        if planned != Some(resolved.version.as_str()) {
-            return Ok(Verification::Unknown {
-                reason: format!(
-                    "{module} 现在是 {}，而这份计划绑的是 {}：核对逻辑与计划对不上",
-                    resolved.version,
-                    planned.unwrap_or("（未绑定）")
-                ),
-            });
-        }
-
-        let job = PythonJob::Call {
-            module: dotted(&resolved.module),
-            function: verifier.clone(),
-            // 核对函数拿到的是**原调用**的身份与参数，不是一堆自由参数。
-            args: serde_json::json!({ "function": function, "args": call_args(plan) }),
-        };
-        let mut sink = crate::toolbox::NullWriter::new(ctx);
-        let outcome = match self.host.run(job, &mut sink, ctx.cancel.clone()).await {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Ok(Verification::Unknown {
-                    reason: format!("核对函数跑不起来：{error}"),
-                });
-            }
-        };
-        if outcome.status != ToolResultStatus::Completed {
-            return Ok(Verification::Unknown {
-                reason: outcome
-                    .error
-                    .unwrap_or_else(|| "核对函数没有给出结论".into()),
-            });
-        }
-        Ok(verdict_of(outcome.result))
-    }
 }
 
 /// toolbox 的拒绝**作为结果交回模型**（§7.4 最后一段）：名字写错了是参数问题，
@@ -464,46 +388,6 @@ fn infer_mode(args: serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(object)
 }
 
-/// 原调用的关键字参数。
-fn call_args(plan: &ExecutionPlan) -> serde_json::Value {
-    plan.args
-        .get("args")
-        .cloned()
-        .unwrap_or_else(|| serde_json::json!({}))
-}
-
-/// 核对函数的答复 → 四种结论。
-///
-/// 认不出来的形状是 [`Verification::Unknown`]，**不是** `AlreadySatisfied`：一个写坏了
-/// 的核对函数不能把"不知道"变成"已经做过了"。
-fn verdict_of(value: serde_json::Value) -> Verification {
-    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    let text = |key: &str| {
-        value
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .unwrap_or_default()
-    };
-    match kind {
-        "already_satisfied" => Verification::AlreadySatisfied {
-            evidence: text("evidence"),
-        },
-        "not_performed" => Verification::NotPerformed {
-            evidence: text("evidence"),
-        },
-        "conflict" => Verification::Conflict {
-            evidence: text("evidence"),
-        },
-        "unknown" => Verification::Unknown {
-            reason: text("reason"),
-        },
-        _ => Verification::Unknown {
-            reason: format!("核对函数的答复读不懂：{value}"),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,29 +397,24 @@ mod tests {
     use komo_kernel::traits::Clock;
     use komo_kernel::types::tool::PythonResult;
 
-    /// 一个导出 `turn_off`、并且**带核对函数**的模块。
+    /// 一个导出 `turn_off` 的模块。
     const HA: &str = r#""""假的 HA 模块。"""
-
-__all__ = ["turn_off", "check"]
-__komo_verify__ = "check"
-
-
-def turn_off(entity_id):
-    return {"off": entity_id}
-
-
-def check(function=None, args=None):
-    return {"kind": "already_satisfied", "evidence": "灯是关着的"}
-"#;
-
-    /// 同样导出 `turn_off`，但**没有**核对函数。
-    const HA_NO_CHECK: &str = r#""""没有核对函数的版本。"""
 
 __all__ = ["turn_off"]
 
 
 def turn_off(entity_id):
     return {"off": entity_id}
+"#;
+
+    /// 同样导出 `turn_off` 的下一版。
+    const HA_NEXT: &str = r#""""下一版。"""
+
+__all__ = ["turn_off"]
+
+
+def turn_off(entity_id):
+    return {"off": entity_id, "v": 2}
 "#;
 
     fn wire() -> (Arc<FakePythonHost>, PythonTool) {
@@ -643,7 +522,7 @@ def turn_off(entity_id):
 
         let before = tool.prepare(call_args(), &ctx).await.unwrap();
         // 模块升级：换一份正文启用。
-        std::fs::write(toolbox.layout().enabled_code("ha"), HA_NO_CHECK).unwrap();
+        std::fs::write(toolbox.layout().enabled_code("ha"), HA_NEXT).unwrap();
         let after = tool.prepare(call_args(), &ctx).await.unwrap();
         assert_ne!(after.versions.module, before.versions.module);
     }
@@ -885,166 +764,6 @@ def turn_off(entity_id):
             .await
             .unwrap_err();
         assert!(error.is_uncertain(), "{error:?}");
-    }
-
-    // ------------------------------------------------------------ 核对（§8.6）
-
-    /// 任意 code 没有核对方式：停在 `waiting + intervention`，不自动从头跑整个脚本（§8.6）。
-    #[tokio::test]
-    async fn code_mode_has_no_verification_so_it_lands_on_a_human() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let (_host, tool) = wire();
-        let plan = tool
-            .prepare(
-                serde_json::json!({ "mode": "code", "code": "result = 1" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        assert_eq!(plan.recovery, RecoveryMode::NoSafeRecovery);
-        assert_eq!(
-            tool.verify(&plan, &ctx).await.unwrap(),
-            Verification::Unavailable
-        );
-    }
-
-    /// 模块**没有**核对函数 → 同样是"没有可用的核对方式"。模块自称幂等不算数（§8.6）。
-    #[tokio::test]
-    async fn a_module_without_a_verifier_offers_no_recovery() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let (_host, _toolbox, tool) = wired(dir.path(), HA_NO_CHECK);
-        let plan = tool.prepare(call_args(), &ctx).await.unwrap();
-        assert_eq!(plan.recovery, RecoveryMode::NoSafeRecovery);
-        assert_eq!(
-            tool.verify(&plan, &ctx).await.unwrap(),
-            Verification::Unavailable
-        );
-    }
-
-    /// 有核对函数 → 计划的恢复方式是"可以核对目标状态"，核对真的跑起来，四种结论
-    /// 逐个映射。
-    #[tokio::test]
-    async fn a_verifier_runs_and_its_four_answers_all_map() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let (host, _toolbox, tool) = wired(dir.path(), HA);
-        let plan = tool.prepare(call_args(), &ctx).await.unwrap();
-        assert_eq!(plan.recovery, RecoveryMode::VerifyTarget);
-
-        for (answer, want) in [
-            (
-                serde_json::json!({ "kind": "already_satisfied", "evidence": "灯是关着的" }),
-                Verification::AlreadySatisfied {
-                    evidence: "灯是关着的".into(),
-                },
-            ),
-            (
-                serde_json::json!({ "kind": "not_performed", "evidence": "灯还亮着" }),
-                Verification::NotPerformed {
-                    evidence: "灯还亮着".into(),
-                },
-            ),
-            (
-                serde_json::json!({ "kind": "conflict", "evidence": "变成了第三种状态" }),
-                Verification::Conflict {
-                    evidence: "变成了第三种状态".into(),
-                },
-            ),
-            (
-                serde_json::json!({ "kind": "unknown", "reason": "读不到" }),
-                Verification::Unknown {
-                    reason: "读不到".into(),
-                },
-            ),
-        ] {
-            host.push_result(PythonResult {
-                status: ToolResultStatus::Completed,
-                result: answer,
-                error: None,
-                artifacts: vec![],
-                stdout_excerpt: String::new(),
-                env_version: host.env_version(),
-            });
-            assert_eq!(tool.verify(&plan, &ctx).await.unwrap(), want);
-        }
-
-        // 核对调的是核对函数，拿到的是**原调用**的身份与参数。
-        let last = host.calls().last().cloned().unwrap();
-        assert_eq!(
-            last,
-            PythonJob::Call {
-                module: "toolbox.ha".into(),
-                function: "check".into(),
-                args: serde_json::json!({
-                    "function": "turn_off",
-                    "args": { "entity_id": "light.living_room" }
-                }),
-            }
-        );
-    }
-
-    /// 一个写坏了的核对函数不能把"不知道"变成"已经做过了"。
-    #[tokio::test]
-    async fn an_answer_the_verifier_did_not_understand_is_unknown_not_satisfied() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let (host, _toolbox, tool) = wired(dir.path(), HA);
-        let plan = tool.prepare(call_args(), &ctx).await.unwrap();
-
-        host.push_result(PythonResult {
-            status: ToolResultStatus::Completed,
-            result: serde_json::json!({ "idempotent": true }),
-            error: None,
-            artifacts: vec![],
-            stdout_excerpt: String::new(),
-            env_version: host.env_version(),
-        });
-        assert!(
-            matches!(
-                tool.verify(&plan, &ctx).await.unwrap(),
-                Verification::Unknown { .. }
-            ),
-            "模块自称幂等不构成证明（§8.6）"
-        );
-    }
-
-    /// 「核对逻辑必须对应那份执行计划」（§8.6）：模块在计划之后升级过，
-    /// 现在这份核对逻辑不是那份计划的核对逻辑。
-    #[tokio::test]
-    async fn a_verifier_from_a_newer_module_version_is_not_this_plans_verifier() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let (host, toolbox, tool) = wired(dir.path(), HA);
-        let plan = tool.prepare(call_args(), &ctx).await.unwrap();
-
-        std::fs::write(
-            toolbox.layout().enabled_code("ha"),
-            format!("{HA}\n# 升级过了\n"),
-        )
-        .unwrap();
-        let verdict = tool.verify(&plan, &ctx).await.unwrap();
-        assert!(
-            matches!(verdict, Verification::Unknown { .. }),
-            "{verdict:?}"
-        );
-        assert!(host.calls().is_empty());
-    }
-
-    /// 没有 toolbox 的 Gateway 取不到核对函数，一律答"没有核对方式"，**不是**"照跑"。
-    #[tokio::test]
-    async fn without_a_toolbox_nothing_is_verified() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let (host, _toolbox, tool) = wired(dir.path(), HA);
-        let plan = tool.prepare(call_args(), &ctx).await.unwrap();
-        let bare = PythonTool::new(host.clone());
-        assert_eq!(
-            bare.verify(&plan, &ctx).await.unwrap(),
-            Verification::Unavailable
-        );
-        assert!(host.calls().is_empty());
     }
 
     /// 少写 `mode` 就按参数形状补上：判别字段写漏一次，不该换来一次失败往返。

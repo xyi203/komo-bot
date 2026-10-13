@@ -8,18 +8,29 @@ use async_trait::async_trait;
 use crate::traits::*;
 
 use crate::types::refs::{
-    AttemptRef, ContentRef, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput,
+    AttemptRef, ContentRef, InterruptedOutput, OutputRef, PublishedOutput, ToolResultBody,
+    VerifiedOutput,
 };
 
 /// 内存里的 [`ToolOutputStore`]。
 #[derive(Debug, Clone, Default)]
 pub struct MemOutputStore {
     published: Arc<Mutex<BTreeMap<String, ToolResultBody>>>,
+    /// 按 attempt ID：上一个进程被打断时留下的部分输出。
+    interrupted: Arc<Mutex<BTreeMap<String, InterruptedOutput>>>,
 }
 
 impl MemOutputStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// 让某次尝试看起来像是被打断过、留下了这些部分输出。
+    pub fn leave_interrupted(&self, attempt: &str, output: InterruptedOutput) {
+        self.interrupted
+            .lock()
+            .expect("输出存储")
+            .insert(attempt.to_string(), output);
     }
 
     /// 某个引用路径上已发布的正文。
@@ -122,5 +133,19 @@ impl ToolOutputStore for MemOutputStore {
             reference: output.clone(),
             body,
         })
+    }
+
+    async fn interrupted(
+        &self,
+        attempt: &AttemptRef,
+        _tail_bytes: usize,
+    ) -> Result<InterruptedOutput, StoreError> {
+        Ok(self
+            .interrupted
+            .lock()
+            .expect("输出存储")
+            .get(attempt.attempt.as_str())
+            .cloned()
+            .unwrap_or_default())
     }
 }

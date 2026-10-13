@@ -52,8 +52,8 @@ codemode。调用一律执行（2026-10-11 起没有 Policy 与审批，原来 s
 
 | | 恢复 | codemode 内层 |
 |---|---|---|
-| `read_only` 里的工具 | `SafeReread`：中断后重读 | 可调 |
-| 其余 | `NoSafeRecovery`：中断后停下问人（`verify` 介入） | 不可调 |
+| `read_only` 里的工具 | `SafeReread`，`McpTool::replay` 也是 safe：重启后重读一次 | 可调 |
+| 其余 | `NoSafeRecovery`：重启后不重跑，中断结果交给模型判断（`docs/komo_bot.md` §8.6） | 不可调 |
 
 调用失败：只读工具当普通失败；其余工具在传输层断掉时报"结果不明"（`ToolError::Uncertain`）
 ——请求可能已经到了服务器。超时由执行器的 `call_timeout` 兜底。

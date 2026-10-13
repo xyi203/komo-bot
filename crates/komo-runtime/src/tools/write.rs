@@ -1,17 +1,15 @@
 //! `write`：完整内容 + 可选预期版本；**原子替换**，覆盖现有文件必须版本匹配（§4）。
 //!
-//! `verify` 用内容哈希回答 §8.6 的那三个问题：目标已是预期内容 → 已满足；仍是原内容
-//! → 确定未执行，可以重做同一次原子修改；第三种内容 → 冲突。**文件已存在不算写入
-//! 成功**。
+//! 重启后不重跑（`Tool::replay` 用默认的 unsafe，§8.6）：started 而没有结果的一次写入，
+//! 中断结果交给模型，由它看一眼文件再决定。
 
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, Tool};
-use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
-    ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess, Verification,
+    ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::resource::TargetRef;
@@ -113,8 +111,8 @@ impl Tool for WriteTool {
             }],
             versions: PlanVersions::default(),
             resources: vec![],
-            // 写入的恢复靠核对内容哈希（§8.6）。带 then_run 时 `attach` 改成 NoSafeRecovery。
-            recovery: RecoveryMode::VerifyTarget,
+            // 重启后不重跑，中断结果交给模型（§8.6）。
+            recovery: RecoveryMode::NoSafeRecovery,
             then_run: None,
         };
         attach(&mut plan, then_run, ctx)?;
@@ -166,65 +164,6 @@ impl Tool for WriteTool {
                 result.bytes
             )),
         })
-    }
-
-    /// §8.6：started 而无结果的调用，靠内容哈希判断这次写入到底发生了没有。
-    async fn verify(
-        &self,
-        plan: &ExecutionPlan,
-        _ctx: &ToolContext,
-    ) -> Result<Verification, ToolError> {
-        let args: WriteArgs = parse_args(plan.args.clone(), "write")?;
-        let path = target_path(plan)?;
-        let intended = ContentHash::of_str(&args.content);
-        let expected = plan
-            .targets
-            .first()
-            .and_then(|target| target.expected_version.clone());
-        verify_content(&path, &intended, expected.as_ref())
-    }
-}
-
-/// 三种内容，三个结论（§8.6）。
-pub fn verify_content(
-    path: &Path,
-    intended: &ContentHash,
-    before: Option<&ContentHash>,
-) -> Result<Verification, ToolError> {
-    let Some((_, version)) = current(path)? else {
-        // 文件不在。原本就没有它 → 确定没写成；原本有它 → 出现了第三种状态。
-        return Ok(match before {
-            None => Verification::NotPerformed {
-                evidence: format!("{} 仍然不存在", path.display()),
-            },
-            Some(_) => Verification::Conflict {
-                evidence: format!("{} 在写入前存在，现在不见了", path.display()),
-            },
-        });
-    };
-    if &version.hash == intended {
-        return Ok(Verification::AlreadySatisfied {
-            evidence: format!("{} 的内容哈希已是预期值 {intended}", path.display()),
-        });
-    }
-    match before {
-        Some(before) if &version.hash == before => Ok(Verification::NotPerformed {
-            evidence: format!("{} 仍是原内容 {before}", path.display()),
-        }),
-        Some(before) => Ok(Verification::Conflict {
-            evidence: format!(
-                "{} 既不是原内容 {before} 也不是预期内容 {intended}，当前 {}",
-                path.display(),
-                version.hash
-            ),
-        }),
-        // 计划没绑定原内容（新建文件），而现在文件在、内容又不是预期的：说不清楚。
-        None => Ok(Verification::Unknown {
-            reason: format!(
-                "{} 存在但内容不是预期值，且计划没有记录写入前的版本",
-                path.display()
-            ),
-        }),
     }
 }
 
@@ -336,6 +275,7 @@ impl Drop for TempGuard {
 mod tests {
     use super::*;
     use crate::tools::test_support::{context, writer};
+    use komo_kernel::types::digest::ContentHash;
 
     fn write_result(output: &ToolOutput) -> WriteResult {
         serde_json::from_value(output.result.clone()).expect("write 的结果")
@@ -354,7 +294,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan.operation, Operation::WriteFile);
-        assert_eq!(plan.recovery, RecoveryMode::VerifyTarget);
+        assert_eq!(plan.recovery, RecoveryMode::NoSafeRecovery);
 
         let result = write_result(&tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap());
         assert!(result.created);
@@ -445,66 +385,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "new\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn verify_tells_the_three_states_apart() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
-        let ctx = context(dir.path());
-        let tool = WriteTool::new();
-        let plan = tool
-            .prepare(
-                serde_json::json!({
-                    "path": "a.txt",
-                    "content": "new\n",
-                    "expected_version": ContentHash::of_str("old\n").as_str()
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-
-        // 还没写：仍是原内容 → 确定未执行。
-        assert!(matches!(
-            tool.verify(&plan, &ctx).await.unwrap(),
-            Verification::NotPerformed { .. }
-        ));
-
-        // 写完了：已是预期内容 → 目标已满足，不是"可以再写一次"。
-        std::fs::write(dir.path().join("a.txt"), "new\n").unwrap();
-        assert!(matches!(
-            tool.verify(&plan, &ctx).await.unwrap(),
-            Verification::AlreadySatisfied { .. }
-        ));
-
-        // 第三种内容 → 冲突。
-        std::fs::write(dir.path().join("a.txt"), "somebody else\n").unwrap();
-        assert!(matches!(
-            tool.verify(&plan, &ctx).await.unwrap(),
-            Verification::Conflict { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_file_that_exists_is_not_proof_a_write_succeeded() {
-        let dir = tempfile::tempdir().unwrap();
-        let ctx = context(dir.path());
-        let tool = WriteTool::new();
-        let plan = tool
-            .prepare(
-                serde_json::json!({ "path": "new.txt", "content": "intended\n" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        // 别人建了一个同名文件，内容不是我们要写的。
-        std::fs::write(dir.path().join("new.txt"), "someone else\n").unwrap();
-        let verdict = tool.verify(&plan, &ctx).await.unwrap();
-        assert!(
-            matches!(verdict, Verification::Unknown { .. }),
-            "{verdict:?}"
         );
     }
 

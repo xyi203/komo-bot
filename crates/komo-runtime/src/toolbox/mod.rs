@@ -192,9 +192,6 @@ pub struct ModuleInfo {
     /// 已启用版本导出的函数。没有启用版本时为空。
     #[serde(default)]
     pub exports: Vec<String>,
-    /// 与版本绑定的核对函数（§8.6）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub verifier: Option<String>,
     /// 这个模块要的**凭证引用**：变量名，不是值（§5.3、§7.2）。
     #[serde(default)]
     pub env: Vec<String>,
@@ -311,7 +308,6 @@ impl Toolbox {
             enabled,
             candidate,
             exports: declarations.exports,
-            verifier: declarations.verifier,
             env: declarations.env,
             doc: declarations.doc,
         })
@@ -363,7 +359,7 @@ impl Toolbox {
         }))
     }
 
-    /// `call` 模式要的那三样：启用中的版本、导出清单、核对函数。
+    /// `call` 模式要的那几样：启用中的版本、导出清单、凭证引用。
     ///
     /// 这是 [`crate::tools::PythonTool::prepare`] 的入口，所以它**一行代码都不执行**
     /// ——声明是静态读出来的（见 [`source`]）。
@@ -390,7 +386,6 @@ impl Toolbox {
         }
         Ok(ResolvedCall {
             version: self.version_of(&code),
-            verifier: declarations.verifier,
             env: declarations.env,
             module,
         })
@@ -686,8 +681,6 @@ pub struct ResolvedCall {
     pub module: String,
     /// 已启用版本。计划绑定的就是它（§7.2）。
     pub version: ModuleVersion,
-    /// 与版本绑定的核对函数（§8.6）。没有就没有可靠恢复方式。
-    pub verifier: Option<String>,
     /// 凭证引用：**变量名**。进计划的是它，凭证的值不进（§7.2）。
     pub env: Vec<String>,
 }
@@ -835,9 +828,9 @@ impl RawReport {
 
 /// 一个**不发布**的流式写入器：留一段尾巴给报告，其余丢掉。
 ///
-/// 两个调用点都不是"一次工具调用"，所以没有 `ToolOutputStore` 那条路可走：候选测试是
-/// 操作者发起的一次执行，核对函数是恢复流程里的一步。它们的输出不该长出一份
-/// `output.json` 来——那份账是给 `tool.started` 配的，而这两次都没有 started。
+/// 候选测试不是"一次工具调用"，所以没有 `ToolOutputStore` 那条路可走：它是操作者发起的
+/// 一次执行，输出不该长出一份 `output.json` 来——那份账是给 `tool.started` 配的，而这次
+/// 没有 started。
 pub struct NullWriter {
     attempt: AttemptRef,
     buffer: Vec<u8>,
@@ -855,21 +848,7 @@ impl std::fmt::Debug for NullWriter {
 }
 
 impl NullWriter {
-    /// 挂在一次真实调用的身份上（核对函数用这个）。
-    pub fn new(ctx: &komo_kernel::types::tool::ToolContext) -> Self {
-        NullWriter {
-            attempt: AttemptRef {
-                session: ctx.session.clone(),
-                run: ctx.run.clone(),
-                call: ctx.call.clone(),
-                attempt: ctx.attempt.clone(),
-            },
-            buffer: Vec::new(),
-            written: 0,
-        }
-    }
-
-    /// 没有调用身份可言（候选测试用这个）。
+    /// 没有调用身份可言。
     pub fn detached() -> Self {
         NullWriter {
             attempt: AttemptRef {
@@ -981,10 +960,6 @@ const README: &str = r#"# toolbox
 模块约定：
 
 - `__all__ = [...]` 列出导出函数，**没有它 call 模式一个函数都调不到**。
-- `__komo_verify__ = "verify"` 指一个与版本绑定的核对函数（§8.6）。它被调用的形式是
-  `verify(function=..., args={...})`，要答
-  `{"kind": "already_satisfied" | "not_performed" | "conflict" | "unknown", ...}`。
-  核对函数自己也要写进 `__all__`。
 - `__komo_env__ = ["MEMOS_TOKEN"]` 列出这个模块要的**凭证引用**（变量名）。值写在
   `~/.komo/.env` 里，Gateway 在每次调用时按名解析、只放进那一个子进程——所以改完
   `.env` 跑一次 `komo config reload` 就生效，不必重启；解析不到的变量**不设置**，模块

@@ -49,7 +49,7 @@ pub enum PlanSource {
     },
     /// MemoryManager 的内部变更：走同一执行入口，但不是第六个 LLM 工具（§7.1）。
     Memory { session: Option<SessionId> },
-    /// 恢复流程发起的核对调用（§8.6）。
+    /// 恢复流程发起的核对调用。核对梯子 2026-10-13 删掉（§8.6），只为解码旧计划保留。
     Verification { of: ToolCallId },
 }
 
@@ -244,7 +244,10 @@ pub struct ResourceRef {
     pub credential_env: Option<String>,
 }
 
-/// §8.6 的四种恢复方式。由 `prepare` 填写，模型不能随意填"可重试"。
+/// 计划里记下的恢复方式（§8.6）。由 `prepare` 填写，模型不能随意填"可重试"。
+///
+/// 重启续跑只问它一件事：[`RecoveryMode::replay`]。四个变体都要留着——它进计划哈希，
+/// 旧 JSONL 与旧库里的计划必须照原样解码、哈希不变。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RecoveryMode {
@@ -257,10 +260,42 @@ pub enum RecoveryMode {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         valid_for_secs: Option<u64>,
     },
-    /// 可以核对目标状态：用工具自带的核对逻辑判断已达到 / 确定未执行 / 冲突 / 未知。
+    /// 2026-10-13 之前 write / edit / 带核对函数的 python 计划写的是它（那时有核对梯子）。
+    /// 只为解码旧计划保留，新计划不再产生；重启时按 [`Replay::Unsafe`]。
     VerifyTarget,
-    /// 无可靠恢复方式：停在 `needs_attention`，不自动从头执行整个脚本。
+    /// 无可靠恢复方式：重启时不重跑，中断结果交给模型判断。
     NoSafeRecovery,
+}
+
+impl RecoveryMode {
+    /// 计划受理时记下的重放策略（pi-durable 的 `replay`）。
+    pub fn replay(&self) -> Replay {
+        match self {
+            RecoveryMode::SafeReread | RecoveryMode::IdempotencyKey { .. } => Replay::Safe,
+            RecoveryMode::VerifyTarget | RecoveryMode::NoSafeRecovery => Replay::Unsafe,
+        }
+    }
+}
+
+/// 一次 started 而没有结果的调用，重启后能不能带原计划再跑一遍（§8.6）。
+///
+/// 规则借自 pi-durable：计划里记下的策略与工具**现在**声明的（[`crate::traits::Tool::replay`]）
+/// 都是 `Safe` 才重跑；现在的 `Unsafe` 能否决记下的 `Safe`，反过来不行。其余一律把中断
+/// 结果（带中断前已落盘的部分输出）交给模型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Replay {
+    Safe,
+    Unsafe,
+}
+
+impl Replay {
+    /// 两份策略都说 `Safe` 才算 `Safe`。
+    pub fn and(self, other: Replay) -> Replay {
+        match (self, other) {
+            (Replay::Safe, Replay::Safe) => Replay::Safe,
+            _ => Replay::Unsafe,
+        }
+    }
 }
 
 /// 一份不可变的执行计划（§7.2）。
@@ -354,22 +389,6 @@ impl ExecutionPlan {
     }
 }
 
-/// 核对的结论（§8.6）。默认实现返回 [`Verification::Unavailable`]。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Verification {
-    /// 目标已达到预期。
-    AlreadySatisfied { evidence: String },
-    /// 确定未执行，且前提仍成立，可以重新执行同一原子修改。
-    NotPerformed { evidence: String },
-    /// 出现了第三种状态：既不是原内容也不是预期内容。
-    Conflict { evidence: String },
-    /// 核对不出结论。
-    Unknown { reason: String },
-    /// 这个工具没有可用的核对方式 → `needs_attention`。
-    Unavailable,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +431,31 @@ mod tests {
     /// 这份计划在 `then_run` 出现之前序列化成的样子——旧 JSONL 与
     /// 旧库里存的就是这种行。
     const OLD_ROW: &str = r#"{"args":{"content":"hi","path":"a.txt"},"cwd":"/tmp/ws","operation":{"kind":"write_file"},"operation_id":"op-1","recovery":{"kind":"verify_target"},"run":"run-1","source":{"kind":"interactive","session":"sess-1"},"targets":[{"access":"write","path":"/tmp/ws/a.txt"}],"tool":"write","tool_call":"call-7","versions":{}}"#;
+
+    #[test]
+    fn only_rereads_and_idempotency_keys_are_replay_safe() {
+        assert_eq!(RecoveryMode::SafeReread.replay(), Replay::Safe);
+        let keyed = RecoveryMode::IdempotencyKey {
+            key: "k".into(),
+            valid_for_secs: None,
+        };
+        assert_eq!(keyed.replay(), Replay::Safe);
+        // 旧计划里的 verify_target 还解得出来，重启时按 unsafe。
+        assert_eq!(
+            serde_json::from_value::<RecoveryMode>(serde_json::json!({"kind": "verify_target"}))
+                .unwrap()
+                .replay(),
+            Replay::Unsafe
+        );
+        assert_eq!(RecoveryMode::NoSafeRecovery.replay(), Replay::Unsafe);
+    }
+
+    #[test]
+    fn a_current_unsafe_declaration_vetoes_a_stored_safe_one() {
+        assert_eq!(Replay::Safe.and(Replay::Safe), Replay::Safe);
+        assert_eq!(Replay::Safe.and(Replay::Unsafe), Replay::Unsafe);
+        assert_eq!(Replay::Unsafe.and(Replay::Safe), Replay::Unsafe);
+    }
 
     #[test]
     fn a_plan_without_then_run_hashes_exactly_as_before() {

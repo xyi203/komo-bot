@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::ids::OperationId;
-use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode};
+use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode, Replay};
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +61,11 @@ impl Tool for CodemodeTool {
                 "additionalProperties": false
             }),
         }
+    }
+
+    /// 脚本里只有只读调用：重启后整段重跑与重读同理（docs/codemode.md §7，§8.6）。
+    fn replay(&self) -> Replay {
+        Replay::Safe
     }
 
     async fn prepare(

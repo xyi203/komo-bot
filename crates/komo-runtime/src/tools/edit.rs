@@ -4,10 +4,12 @@
 //! 哪一处需要猜，而猜错和没找到的代价不一样，后者立刻可见，前者要等到有人读那份文件
 //! 才发现。想全改就明写 `replace_all`。
 //!
-//! `verify` 与 `write` 同源（内容哈希），但它需要**替换之后**那份内容的哈希，而那要
-//! 读文件才算得出来——所以 `prepare` 把它算好写进规范化参数（`result_version`）。计划
-//! 因此绑定了"从这一份内容出发"：文件在计划之后被人动过，执行时版本对不上就
+//! `prepare` 读一遍文件、先替换一遍：匹配不上当场失败，并把这一刻的内容哈希记成预期版本。
+//! 计划因此绑定了"从这一份内容出发"：文件在计划之后被人动过，执行时版本对不上就
 //! 按版本冲突失败（§7.2「执行前再次校验目标和版本」）。
+//!
+//! 重启后不重跑（`Tool::replay` 用默认的 unsafe，§8.6）：替换文本里含着被替换文本时，
+//! 重跑一遍会再替换一次。
 
 use std::path::PathBuf;
 
@@ -16,7 +18,7 @@ use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
-    ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess, Verification,
+    ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::resource::TargetRef;
@@ -25,10 +27,10 @@ use serde::{Deserialize, Serialize};
 
 use super::fusion::{ThenRun, attach};
 use super::protect::Protected;
-use super::write::{atomic_replace, target_path, verify_content};
+use super::write::{atomic_replace, target_path};
 use super::{ExpectedVersion, FileVersion, as_text, current, normalized, parse_args, plan_time};
 
-/// 模型给的参数。`result_version` 是 `prepare` 补上的，模型不填。
+/// 模型给的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditArgs {
     pub path: String,
@@ -40,7 +42,8 @@ pub struct EditArgs {
     /// 匹配到多处时全部替换。默认 false：多处即歧义，歧义就报错。
     #[serde(default)]
     pub replace_all: bool,
-    /// **prepare 填写**：替换之后文件内容的哈希。`verify` 靠它分辨"已满足"。
+    /// 2026-10-13 之前 `prepare` 在这里记替换之后的内容哈希，给核对梯子用。只为解码
+    /// 旧计划保留，新计划里永远是空的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_version: Option<ContentHash>,
     /// 改完紧接着跑的命令（[`super::fusion`]）。`prepare` 把它挪进计划的 `then_run`，
@@ -108,7 +111,6 @@ impl Tool for EditTool {
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
         let mut args: EditArgs = parse_args(args, "edit")?;
-        // 模型不能自己指定结果版本——那是 prepare 从真实文件算出来的。
         args.result_version = None;
         let then_run = args.then_run.take();
         if args.match_text.is_empty() {
@@ -122,15 +124,14 @@ impl Tool for EditTool {
         self.protected.check(&path)?;
 
         // 读元信息与正文是允许的（prepare 不得执行未审核代码，读文件不是执行）。
-        let (before_hash, result_version) = match current(&path)? {
+        let before_hash = match current(&path)? {
             Some((bytes, version)) => {
                 let text = as_text(bytes, &path)?;
-                let after = apply(&text, &args, &path)?;
-                (Some(version.hash), Some(ContentHash::of_str(&after.0)))
+                apply(&text, &args, &path)?;
+                Some(version.hash)
             }
-            None => (None, None),
+            None => None,
         };
-        args.result_version = result_version;
 
         let mut plan = ExecutionPlan {
             operation_id: OperationId::new_at(plan_time()),
@@ -153,7 +154,8 @@ impl Tool for EditTool {
             }],
             versions: PlanVersions::default(),
             resources: vec![],
-            recovery: RecoveryMode::VerifyTarget,
+            // 重启后不重跑，中断结果交给模型（§8.6）。
+            recovery: RecoveryMode::NoSafeRecovery,
             then_run: None,
         };
         attach(&mut plan, then_run, ctx)?;
@@ -195,28 +197,6 @@ impl Tool for EditTool {
             artifacts: vec![],
             preview: Some(format!("{} 替换了 {} 处", result.path, result.replacements)),
         })
-    }
-
-    async fn verify(
-        &self,
-        plan: &ExecutionPlan,
-        _ctx: &ToolContext,
-    ) -> Result<Verification, ToolError> {
-        let args: EditArgs = parse_args(plan.args.clone(), "edit")?;
-        let path = target_path(plan)?;
-        let Some(intended) = args.result_version.clone() else {
-            return Ok(Verification::Unknown {
-                reason: format!(
-                    "{} 的计划里没有替换后的内容哈希，核对不出结论",
-                    path.display()
-                ),
-            });
-        };
-        let before = plan
-            .targets
-            .first()
-            .and_then(|target| target.expected_version.clone());
-        verify_content(&path, &intended, before.as_ref())
     }
 }
 
@@ -428,41 +408,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verify_tells_not_performed_from_already_satisfied() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
-        let ctx = context(dir.path());
-        let tool = EditTool::new();
-        let plan = plan_for(
-            &tool,
-            &ctx,
-            serde_json::json!({ "path": "a.txt", "match_text": "alpha", "replace_text": "ALPHA" }),
-        )
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            tool.verify(&plan, &ctx).await.unwrap(),
-            Verification::NotPerformed { .. }
-        ));
-
-        tool.execute(plan.clone(), &ctx, &mut writer(&ctx))
-            .await
-            .unwrap();
-        assert!(matches!(
-            tool.verify(&plan, &ctx).await.unwrap(),
-            Verification::AlreadySatisfied { .. }
-        ));
-
-        std::fs::write(dir.path().join("a.txt"), "someone else\n").unwrap();
-        assert!(matches!(
-            tool.verify(&plan, &ctx).await.unwrap(),
-            Verification::Conflict { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn the_model_cannot_dictate_the_result_hash() {
+    async fn a_result_version_from_the_model_never_reaches_the_plan() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
         let ctx = context(dir.path());
@@ -480,9 +426,8 @@ mod tests {
         .unwrap();
         let args: EditArgs = serde_json::from_value(plan.args).unwrap();
         assert_eq!(
-            args.result_version,
-            Some(ContentHash::of_str("ALPHA\n")),
-            "result_version 由 prepare 从真实文件算出"
+            args.result_version, None,
+            "result_version 已退役，模型给了也不进计划"
         );
     }
 

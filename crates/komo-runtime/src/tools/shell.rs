@@ -6,7 +6,8 @@
 //! 进程组**里，取消时信号发给整个组，然后等回收（实现在 [`super::process`]）。
 //!
 //! 恢复方式是 [`RecoveryMode::NoSafeRecovery`]：任意命令不能仅凭名称被判定安全
-//! （§8.6）。停在 `waiting + intervention` 由人接手，好过把 `deploy.sh` 再跑一遍。
+//! （§8.6）。重启后不重跑，中断结果连同已落盘的部分输出交给模型——好过把 `deploy.sh`
+//! 再跑一遍。
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -16,6 +17,8 @@ use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::OperationId;
+#[cfg(test)]
+use komo_kernel::types::plan::Replay;
 use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanSource, PlanVersions, RecoveryMode};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
@@ -368,7 +371,7 @@ impl Tool for ShellTool {
         })
     }
 
-    // `verify` 用默认实现：任意命令没有可用的核对方式，落到 waiting + intervention（§8.6）。
+    // `replay` 用默认的 unsafe：任意命令重启后不重跑（§8.6）。
 }
 
 fn environment(ctx: &ToolContext) -> BTreeMap<String, String> {
@@ -645,7 +648,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_arbitrary_command_has_no_verification_so_it_lands_on_a_human() {
+    async fn an_arbitrary_command_is_never_replayed_after_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
         let tool = ShellTool::new();
@@ -653,9 +656,7 @@ mod tests {
             .prepare(serde_json::json!({ "command": "deploy.sh" }), &ctx)
             .await
             .unwrap();
-        assert_eq!(
-            tool.verify(&plan, &ctx).await.unwrap(),
-            komo_kernel::types::plan::Verification::Unavailable
-        );
+        assert_eq!(plan.recovery.replay(), Replay::Unsafe);
+        assert_eq!(tool.replay(), Replay::Unsafe);
     }
 }

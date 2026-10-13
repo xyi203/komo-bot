@@ -47,7 +47,8 @@
   `kind = task` 就拒绝，结果只交回一层。
 - **follow**：`follow(task_id, text)` 把一句话提交进已有的任务会话，它带着自己的历史接着做；
   结果同样交回 home。短号来自派出回执与交回消息。
-- **"需要你判断"**（2026-10-11 起没有审批，介入只剩 `verify` / `blocked`）：消息前面
+- **"需要你判断"**（2026-10-11 起没有审批；2026-10-12 起结果不明交给模型，`verify` 只剩旧 Run，
+  会产生的介入只有 `blocked`）：消息前面
   挂上 `后台任务 #短号「标题」：`，同时看着几个任务时分得清是哪一个在问。
 
 同步的 `delegate`（子 Run 在同一 Session 里、父等它）不变：那是"这件事我自己等着"，
@@ -80,7 +81,8 @@ HTTP 派出去的任务没有渠道对端，但结果仍要交回 home）。委�
 - `tests/agents`：`a_background_task_reports_back_through_home`（派出 → 任务以 home 的 Agent
   跑完 → 结果经 home 转告、任务原话不直接投 → follow 进同一任务、结果再经 home 转告）、
   `home_answers_while_a_task_waits_on_a_person`（任务停在一条等人核对的介入上时 home 照样答话；
-  2026-10-11 之前靠审批把任务停住，审批删除后改用测试专用工具 `unsure` 让它停在 verify 上）。
+  2026-10-11 之前靠审批把任务停住，审批删除后改用测试专用工具 `unsure` 让它停在 verify 上；
+  2026-10-12 起结果不明不再停 Run，`unsure` 靠 `TEST_PARK` 前缀停住，生产构建里没有这一支）。
 - `tests/recovery`：`reattach::a_background_task_in_flight_across_a_restart_still_reports_back`、
   `verdicts::a_chat_verify_is_delivered_once_even_after_the_sweep`。
 

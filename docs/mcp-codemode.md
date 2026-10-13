@@ -7,6 +7,9 @@
 > 2026-10-11 起没有 Policy 与审批（`docs/komo_bot.md` §7）：模型要的调用过了工具自己的 `prepare`
 > 与能力面（`AgentSurface`）就执行。原稿里 Policy 放行 / Deny、审批、授权消费、`Proof` 的写法已删去
 > 或改成能力面 / 只读；§8.1 的"审批中断"整段作废。
+> 2026-10-13 起重启恢复按重放策略（`docs/komo_bot.md` §8.6，规则借自 pi-durable）：started 而无结果
+> 的调用，计划与工具现在的声明都是 safe 才重跑，否则中断结果连同部分输出交给模型——没有核对
+> 函数，也不再停成 intervention。下文"进入核对""未知则 intervention"的恢复写法以 §8.6 为准。
 
 ## 1. 要解决的问题
 

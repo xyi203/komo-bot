@@ -95,6 +95,25 @@ pub struct PublishedOutput {
     pub stderr: Option<ContentRef>,
 }
 
+/// 一次被打断的尝试留在盘上的部分输出（`.partial`）：上一个进程写到一半就没了（§8.6）。
+///
+/// 只拿末尾一段，因为它只用来让模型判断"做到哪儿了"；完整的那份由下一次
+/// [`crate::traits::ToolOutputStore::begin`] 接管，随结果一起发布成这次尝试的 stdout / stderr。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InterruptedOutput {
+    /// stdout 的总字节数与末尾一段（按 UTF-8 宽松解码，截在行首）。
+    pub stdout_bytes: u64,
+    pub stdout_tail: String,
+    pub stderr_bytes: u64,
+    pub stderr_tail: String,
+}
+
+impl InterruptedOutput {
+    pub fn is_empty(&self) -> bool {
+        self.stdout_bytes == 0 && self.stderr_bytes == 0
+    }
+}
+
 /// `ToolOutputStore::open` 的返回：哈希已核对过的输出。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerifiedOutput {

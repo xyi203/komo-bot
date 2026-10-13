@@ -1,7 +1,7 @@
 //! `ToolExecutor`：一轮里每个调用的公共流程（§4 末、§7、§8.5）。
 //!
 //! ```text
-//! prepare → ExecutionPlan → Ledger::plan_call → 能力面 / 恢复核对梯子
+//! prepare → ExecutionPlan → Ledger::plan_call → 能力面 / 重放策略
 //! → Ledger::start_call
 //! → Tool::execute(ExecutionPlan)
 //! → ToolOutputStore::publish → Ledger::finish_call
@@ -14,13 +14,14 @@
 //! `execute` 永远排在它后面。
 //!
 //! **恢复执行**（`ToolContext::resumed` 为 `Some`）走 §8.4 第 6 / 7 行：确定尚未执行
-//! 的直接跑，started 而无结果的**先核对**，核对不出结论就把"结果不明"交给模型判断——执行器不盲目重跑。
+//! 的直接跑；started 而无结果的按重放策略（借自 pi-durable）——计划里记下的与工具现在
+//! 声明的都是 safe 才重跑，否则把中断结果连同已落盘的部分输出交给模型判断。
 //!
 //! 流式输出的写入器由 `ToolOutputStore::begin` 开、**借给** `Tool::execute`、返回后
 //! 在这里 `publish`。所有权不下放，因为"先持久化输出、再追加 `tool.result`"是 §8.5
 //! 的一步，而工具不知道这一步存在。
 //!
-//! **委派不走这条流水线的后半段**（§4）。`Operation::Delegate` 在核对梯子之前就被分流：
+//! **委派不走这条流水线的后半段**（§4）。`Operation::Delegate` 在重放判定之前就被分流：
 //! 同一轮前面在飞的调用收完之后，做的事是**受理一条子 Run**、`start_call`、然后停在 `dependency`
 //! 上——没有 `execute`、没有输出发布、也没有这一轮的 `finish_call`。父子两端由**账本**接起来：子 Run 一进终态，父侧那次调用
 //! 的结果就是它的终态（§8.6「可以核对目标状态」）。
@@ -54,11 +55,9 @@ use komo_kernel::types::delegate::{
 };
 use komo_kernel::types::ids::{AttemptId, RequestKey, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::model::ModelConfig;
-use komo_kernel::types::plan::{
-    EnvVersion, ExecutionPlan, Operation, PlanSource, RecoveryMode, Verification,
-};
+use komo_kernel::types::plan::{EnvVersion, ExecutionPlan, Operation, PlanSource, Replay};
 use komo_kernel::types::refs::{
-    AttemptRef, ContentRef, PublishedOutput, ToolResultBody, ToolResultStatus,
+    AttemptRef, ContentRef, InterruptedOutput, PublishedOutput, ToolResultBody, ToolResultStatus,
 };
 use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::status::{RunEnd, RunState, ToolCallState};
@@ -235,19 +234,6 @@ impl OperatorVerdict {
         match self {
             OperatorVerdict::AlreadySatisfied { .. } => ToolResultStatus::Completed,
             OperatorVerdict::NotPerformed { .. } => ToolResultStatus::Failed,
-        }
-    }
-
-    /// 折算成 §8.6 的核对结论——`ResumedCall.verification` 读的就是这个形状，所以操作者
-    /// 的结论与核对函数给出的结论在续跑时走同一条判断。
-    pub fn as_verification(&self) -> Verification {
-        match self {
-            OperatorVerdict::AlreadySatisfied { evidence } => Verification::AlreadySatisfied {
-                evidence: evidence.clone(),
-            },
-            OperatorVerdict::NotPerformed { evidence } => Verification::NotPerformed {
-                evidence: evidence.clone(),
-            },
         }
     }
 }
@@ -529,7 +515,7 @@ impl ToolExecutor {
         };
 
         // 编排调用（delegate / dispatch / follow / update_plan）不走"工具执行"那条路，也
-        // **不走核对梯子**：它们 started 而无结果时该做什么都有确定答案——delegate 的结果在
+        // **不看重放策略**：它们 started 而无结果时该做什么都有确定答案——delegate 的结果在
         // 我们自己的账本里（子 Run 的终态，§8.6「可以核对目标状态」），dispatch / follow 按
         // 请求键幂等重放（`docs/background-tasks.md`），update_plan 没有副作用。
         match self.orchestration(&plan.operation, env) {
@@ -542,79 +528,15 @@ impl ToolExecutor {
             }
         }
 
-        // §8.4 第 6 / 7 行、§8.6：先判断是否发生，再决定是否重试。
-        let mut resumed = request.resumed.clone();
-        if let Some(state) = resumed.as_mut()
+        // §8.4 第 6 / 7 行、§8.6：started 而没有结果的调用，重放策略说了算（借自 pi-durable）。
+        // 计划里记下的与工具现在声明的都是 safe 才带原计划重跑（开一次新的尝试）；工具现在
+        // 声明 unsafe 能否决计划里的 safe，反过来不行。否则把中断结果交给模型，执行器不重跑。
+        let resumed = request.resumed.clone();
+        if let Some(state) = resumed.as_ref()
             && !state.is_known_not_to_have_run()
-            && !safe_to_redo(&plan)
+            && plan.recovery.replay().and(tool.replay()) == Replay::Unsafe
         {
-            // 带 `then_run` 的组合调用不问改动工具的核对：命令可能又改过这份文件，内容哈希
-            // 对上对不上都不再说明改动那一步发生没有（§8.6）。started 而无结果就交给模型判断。
-            let verdict = if plan.then_run.is_some() {
-                Ok(Verification::Unavailable)
-            } else {
-                tool.verify(&plan, &planning_ctx).await
-            };
-            match verdict {
-                Ok(verdict @ Verification::NotPerformed { .. }) => {
-                    // 确定未执行且前提仍成立：可以重新执行同一原子修改。
-                    state.verification = Some(verdict);
-                }
-                Ok(verdict @ Verification::AlreadySatisfied { .. }) => {
-                    // 目标已满足**不等于**又做了一次：报告核对结论，不重跑。
-                    let summary =
-                        format!("核对后目标已满足，未重新执行：{}", evidence_of(&verdict));
-                    let recorded = self
-                        .settle_verified(
-                            request,
-                            env,
-                            &plan,
-                            state.previous_attempt.as_ref(),
-                            ToolResultStatus::Completed,
-                            &verdict,
-                            &summary,
-                        )
-                        .await?;
-                    return Ok(Begin::Settled(CallSettlement::Result(for_model(
-                        request, env, &recorded,
-                    ))));
-                }
-                // 冲突 / 不出结论 / 没有核对方式：**副作用发生没发生不知道**。那条
-                // 上一世的 `tool.started` 要配一条明确的 uncertain，然后作为这次调用的结果
-                // 交给模型：它看得见目标、能去核对，由它判断要不要重做（§8.6）。
-                Ok(verdict) => {
-                    let summary = match &verdict {
-                        Verification::Conflict { evidence } => {
-                            format!("核对发现冲突：{evidence}")
-                        }
-                        Verification::Unknown { reason } => format!("核对不出结论：{reason}"),
-                        Verification::Unavailable if plan.then_run.is_some() => format!(
-                            "{} 带 then_run：命令可能又改过目标，改动的核对不再可信，\
-                             不能判断上一次是否已经生效",
-                            request.tool
-                        ),
-                        Verification::Unavailable => format!(
-                            "{} 没有可用的核对方式，不能判断上一次是否已经生效",
-                            request.tool
-                        ),
-                        // NotPerformed 与 AlreadySatisfied 在上面两个分支里已经答过。
-                        other => format!("核对结论：{other:?}"),
-                    };
-                    return self
-                        .settle_interrupted(request, env, &plan, state, &verdict, &summary)
-                        .await;
-                }
-                Err(error) => {
-                    // 核对本身跑不起来也是"不知道"，同样不能让 started 悬着。
-                    let summary = format!("核对失败：{error}");
-                    let verdict = Verification::Unknown {
-                        reason: error.to_string(),
-                    };
-                    return self
-                        .settle_interrupted(request, env, &plan, state, &verdict, &summary)
-                        .await;
-                }
-            }
+            return self.settle_interrupted(request, env, &plan, state).await;
         }
 
         // 组合调用的第二步是一条 shell 命令：这次运行的能力面里没有 shell（或这台执行器
@@ -1319,44 +1241,6 @@ impl ToolExecutor {
         Ok(status)
     }
 
-    /// 为**上一世那次尝试**落一条结果。
-    ///
-    /// §14 的目录验收要求「每个 `tool.started` 都要配一个结果或一条明确的 uncertain」。
-    /// 恢复时 `verify` 给出的结论就是那次尝试的结果——不写下来，那条 started 会永远悬
-    /// 着，而"悬着的 started"正是下一次恢复扫描还要再核对一遍的东西：同一次副作用会
-    /// 被反复追问，却永远不落账。
-    ///
-    /// `previous` 为 `None` = 账上找不到承载它的尝试，补开一次（[`Self::previous_or_fresh`]）。
-    #[allow(clippy::too_many_arguments)]
-    async fn settle_verified(
-        &self,
-        request: &CallRequest,
-        env: &CallEnv,
-        plan: &ExecutionPlan,
-        previous: Option<&AttemptId>,
-        status: ToolResultStatus,
-        verdict: &Verification,
-        summary: &str,
-    ) -> Result<Recorded, ExecError> {
-        let attempt = self.previous_or_fresh(request, plan, previous).await?;
-        let attempt_ref = AttemptRef {
-            session: env.session.clone(),
-            run: env.run.clone(),
-            call: request.call.clone(),
-            attempt,
-        };
-        let body = ToolResultBody {
-            status,
-            result: serde_json::to_value(verdict).unwrap_or(serde_json::Value::Null),
-            error: (status != ToolResultStatus::Completed).then(|| summary.to_string()),
-            exit_code: None,
-            artifacts: vec![],
-            // 核对结论也是"工具结果"：事件里那 1 KiB 就取它。
-            preview: Some(summary.to_string()),
-        };
-        self.settle_attempt(attempt_ref, body).await
-    }
-
     /// 上一世那次尝试。账上没有（调用开始过，承载它的尝试却找不到——账本自相矛盾）就当场
     /// 补开一次 `tool.started` 来承载这条结论，照样交给模型：停下来等人，人也只能去看一眼
     /// 目标，而模型手里就有能去看的工具。补开的这次不执行任何东西，只记结论。
@@ -1377,34 +1261,58 @@ impl ToolExecutor {
         Ok(self.ledger.start_call(&request.call, plan).await?)
     }
 
-    /// 续跑时核对不出上一世那次尝试做没做成：落一条 uncertain，**作为这次调用的结果交给
-    /// 模型**，Run 接着往下走。
+    /// 续跑时上一世那次尝试 started 而没有结果、又不能重跑：落一条 uncertain，**作为这次
+    /// 调用的结果交给模型**，Run 接着往下走（§8.6，即 pi-durable 的 `interrupted`）。
+    ///
+    /// 正文带上那次尝试中断前已落盘的部分输出的末尾——"做到哪儿了"最直接的证据就在这里
+    /// （`git push` 已经打出 `main -> main`、脚本停在第 3/5 步）。完整的那份随这条结果
+    /// 发布成那次尝试的 stdout / stderr，模型可以 `read`。正文在这一刻固化进 `output.json`，
+    /// 回放时逐字相同。
     ///
     /// 停下来问人并不比模型更有把握——人多半也得去看一眼目标才答得上来，而模型手里就有
-    /// read / shell 能去看。结果正文写明"被打断了、先核对再决定"，回放时逐字相同。
+    /// read / shell 能去看。
     async fn settle_interrupted(
         &self,
         request: &CallRequest,
         env: &CallEnv,
         plan: &ExecutionPlan,
         state: &ResumedCall,
-        verdict: &Verification,
-        summary: &str,
     ) -> Result<Begin, ExecError> {
-        let message = format!(
-            "上一次执行被 Gateway 重启打断，{summary}，副作用是否已经发生未知。{UNCERTAIN_ADVICE}"
-        );
-        let recorded = self
-            .settle_verified(
-                request,
-                env,
-                plan,
-                state.previous_attempt.as_ref(),
-                ToolResultStatus::Uncertain,
-                verdict,
-                &message,
-            )
+        let attempt = self
+            .previous_or_fresh(request, plan, state.previous_attempt.as_ref())
             .await?;
+        let attempt_ref = AttemptRef {
+            session: env.session.clone(),
+            run: env.run.clone(),
+            call: request.call.clone(),
+            attempt,
+        };
+        // 读不出部分输出不该让这次调用悬着：没有证据也照样交给模型。
+        let left = match self
+            .outputs
+            .interrupted(&attempt_ref, INTERRUPTED_TAIL_BYTES)
+            .await
+        {
+            Ok(left) => left,
+            Err(error) => {
+                tracing::warn!(call = %request.call, %error, "读不出中断前的部分输出");
+                InterruptedOutput::default()
+            }
+        };
+        let message = interrupted_message(&request.tool, &left);
+        let body = ToolResultBody {
+            status: ToolResultStatus::Uncertain,
+            result: serde_json::json!({
+                "kind": "interrupted",
+                "stdout_bytes": left.stdout_bytes,
+                "stderr_bytes": left.stderr_bytes,
+            }),
+            error: Some(message.clone()),
+            exit_code: None,
+            artifacts: vec![],
+            preview: Some(message),
+        };
+        let recorded = self.settle_attempt(attempt_ref, body).await?;
         Ok(Begin::Settled(CallSettlement::Result(for_model(
             request, env, &recorded,
         ))))
@@ -1699,15 +1607,42 @@ fn is_recall(plan: &ExecutionPlan, env: &CallEnv) -> bool {
     })
 }
 
-/// 这份计划的动作重做一遍是安全的吗。
-///
-/// 只有两种说得上"经过验证"：可安全重做的读取，和外部接口确实保证去重的幂等键
-/// （§8.6 那张表的前两行）。其余一律先核对。
+/// 这份计划的动作重做一遍是安全的吗：可安全重做的读取，和外部接口确实保证去重的幂等键
+/// （[`Replay::Safe`]，§8.6）。
 fn safe_to_redo(plan: &ExecutionPlan) -> bool {
-    matches!(
-        plan.recovery,
-        RecoveryMode::SafeReread | RecoveryMode::IdempotencyKey { .. }
-    )
+    plan.recovery.replay() == Replay::Safe
+}
+
+/// 中断结果里每条流最多带多少字节的末尾。
+const INTERRUPTED_TAIL_BYTES: usize = 2048;
+
+/// 被重启打断、又不能重跑的那次调用交给模型的正文。
+fn interrupted_message(tool: &str, left: &InterruptedOutput) -> String {
+    let mut out = format!(
+        "上一次执行被 Gateway 重启打断，{tool} 重启后不会自动重跑，副作用是否已经发生未知。\
+         {UNCERTAIN_ADVICE}。"
+    );
+    if left.is_empty() {
+        out.push_str("\n中断前没有落下任何输出。");
+        return out;
+    }
+    out.push_str("\n中断前已落盘的部分输出（不是完成结果）：");
+    for (label, bytes, tail) in [
+        ("stdout", left.stdout_bytes, &left.stdout_tail),
+        ("stderr", left.stderr_bytes, &left.stderr_tail),
+    ] {
+        if bytes == 0 {
+            continue;
+        }
+        let shown = tail.len() as u64;
+        if shown < bytes {
+            out.push_str(&format!("\n[{label} 共 {bytes} 字节，末尾 {shown} 字节]\n"));
+        } else {
+            out.push_str(&format!("\n[{label} 共 {bytes} 字节]\n"));
+        }
+        out.push_str(tail);
+    }
+    out
 }
 
 /// 工具守着 `call_timeout` 自己超时之后，还要终止进程组、回收（TERM 与 KILL 各等 5s）、
@@ -1809,17 +1744,6 @@ fn state_word(state: RunState) -> &'static str {
         RunState::Failed => "failed",
         RunState::Cancelled => "cancelled",
         RunState::Abandoned => "abandoned",
-    }
-}
-
-/// 核对结论里那句证据。
-fn evidence_of(verdict: &Verification) -> &str {
-    match verdict {
-        Verification::AlreadySatisfied { evidence }
-        | Verification::NotPerformed { evidence }
-        | Verification::Conflict { evidence } => evidence,
-        Verification::Unknown { reason } => reason,
-        Verification::Unavailable => "没有可用的核对方式",
     }
 }
 
@@ -2016,7 +1940,6 @@ pub fn resumed_from(
         previous_attempt,
         previous_state,
         attempts_so_far,
-        verification: None,
     }
 }
 

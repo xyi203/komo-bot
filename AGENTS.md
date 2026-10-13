@@ -80,8 +80,11 @@ depends on `agent`; `client` knows only protocol types.
   shell/python cannot be stopped; real boundaries come only from an execution
   environment (codemode's sandbox).
 - **Recovery decides "did it happen" before "retry"** (§8.4 table, §8.6).
-  `started` alone proves nothing. Unknown outcome → `uncertain`, surfaced to
-  the operator, never silently re-run.
+  `started` alone proves nothing. A started call without a result reruns only
+  when both the plan's stored replay policy and the tool's current
+  `Tool::replay` are `Safe` (pi-durable's rule; default `Unsafe`); otherwise it
+  settles as `uncertain` with the partial output it left on disk and goes to
+  the model — the executor never silently re-runs it.
 - **Tool result 的模型视图只有一处投影**（`komo-kernel/src/projection.rs`）。输入只有落盘的
   事实（`tool.result` 事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"重启后回放"
   必须逐字节相同。账本里那 ≤1 KiB 是**行预算**，交给模型多少由 `[execution]

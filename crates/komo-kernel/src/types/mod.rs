@@ -45,7 +45,7 @@ pub use model::{
 };
 pub use plan::{
     EnvVersion, ExecutionPlan, Operation, PlanHash, PlanSource, PlanTarget, PlanVersions,
-    RecoveryMode, ResourceRef, TargetAccess, Verification,
+    RecoveryMode, Replay, ResourceRef, TargetAccess,
 };
 pub use refs::{
     AttemptRef, ContentRef, INLINE_ARGUMENT_LIMIT_BYTES, OutputRef, PREVIEW_LIMIT_BYTES,

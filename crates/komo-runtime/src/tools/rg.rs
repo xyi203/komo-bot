@@ -44,7 +44,7 @@ use tokio::sync::mpsc;
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{
-    ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, TargetAccess,
+    ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, Replay, TargetAccess,
 };
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{CancelToken, ToolContext, ToolDefinition, ToolError, ToolOutput};
@@ -396,7 +396,10 @@ impl Tool for RgTool {
         })
     }
 
-    // `verify` 用默认实现——但这条计划本来就不需要它：`SafeReread` 是"重做即重新观察"。
+    /// 搜索没有副作用：重启后重跑就是重新观察（§8.6）。
+    fn replay(&self) -> Replay {
+        Replay::Safe
+    }
 }
 
 /// 这次搜索触及的目标。

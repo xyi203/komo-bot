@@ -188,21 +188,18 @@ pub trait Tool: Send + Sync {
         ctx: &ToolContext,
     ) -> Result<ToolOutput, ToolError>;
 
-    /// §8.6：对 started 而无结果的调用核对目标状态。默认 Unavailable → 记 uncertain，作为结果交给模型判断。
-    /// write / edit 用内容哈希覆盖它；python 交给模块自带的核对函数。
-    async fn verify(
-        &self,
-        _plan: &ExecutionPlan,
-        _ctx: &ToolContext,
-    ) -> Result<Verification, ToolError> {
-        Ok(Verification::Unavailable)
+    /// §8.6：这个工具现在声明的重放策略。started 而无结果的调用，计划里记下的与这里的
+    /// 都是 Safe 才重跑；否则中断结果交给模型。默认 Unsafe，read / rg / codemode /
+    /// 只读 MCP 覆盖成 Safe。
+    fn replay(&self) -> Replay {
+        Replay::Unsafe
     }
 }
 ```
 
 这是接口示意，辅助类型省略。prepare 可以解析参数和检查元信息，但不能通过导入未知 Python 模块、运行命令等方式提前执行代码——`prepare` 没有副作用，副作用只在 `start_call` 之后（§8.5）。
 
-`ExecutionPlan` 带 `recovery: RecoveryMode`（§8.6 四种恢复方式之一）与 `plan_hash`，由 `prepare` 填写，模型参数不能指定。`execute` 按值收 `ExecutionPlan`（2026-10-11 之前收的是只能凭 Policy 允许或审批换来的 `ApprovedPlan` / `Proof`，随 Policy 一起删掉，§7）。
+`ExecutionPlan` 带 `recovery: RecoveryMode`（§8.6，决定计划里记下的重放策略）与 `plan_hash`，由 `prepare` 填写，模型参数不能指定。`execute` 按值收 `ExecutionPlan`（2026-10-11 之前收的是只能凭 Policy 允许或审批换来的 `ApprovedPlan` / `Proof`，随 Policy 一起删掉，§7）。
 
 ToolContext 由 Gateway 创建，包含 Session / Run / ToolCall 身份、工作目录、只读根、受保护路径名单（§7）和取消信号，不能由模型参数提升。
 
@@ -372,7 +369,7 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 
 工具名称和参数来自 provider 原生字段，不从自然语言或代码块推断。完整 assistant 消息与每个工具结果保持调用 ID 配对，这是原生 function calling 的执行方式。[Function calling](https://developers.openai.com/api/docs/guides/function-calling)
 
-**同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走核对梯子（§8.6），顺序由账本钉死；`write`、`edit`、`shell`、`python`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何会停下来的判定（核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。"做它"是 `start_call` 及之后的一切：执行工具、受理子 Run、派任务、转话都等收尾之后；前面在飞的那条停下来时，屏障还没开始过，原样留在没轮到的那些里。并发上限是执行器自己的预算（默认 4 条）。两条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
+**同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走重放判定（§8.6），顺序由账本钉死；`write`、`edit`、`shell`、`python`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何会停下来的判定（核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。"做它"是 `start_call` 及之后的一切：执行工具、受理子 Run、派任务、转话都等收尾之后；前面在飞的那条停下来时，屏障还没开始过，原样留在没轮到的那些里。并发上限是执行器自己的预算（默认 4 条）。两条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
 
 **在线压缩（`[compaction]`，默认关，2026-10-09）。** 移植自 SoL-Pi 的 Online Context Compact，但 loop 是 komo 自己的，所以不需要"中止再补一条隐藏的续跑消息"。判断只在三种时机：一轮的调用**全部收尾之后**这一轮完成了一个计划步骤（`update_plan` 的边界）、日志里还压着一个没用掉的边界（比如边界那一轮随后停在了等待上，续跑的这一段开头再判）、估计的上下文贴着窗口（`context_window − window_reserve_tokens`，字节 / 4 的估计与实报用量取大）。Gateway 按日志重新装配出 provider 正看着的那份视图（投影、衰减之后）估价，`find_cut` 切在一轮的开头、近期至少留 `keep_recent_tokens`，用缓存账（`cache_write_read_ratio`、剩余请求估计、冷却、旧债）决定；不在边界上只为窗口保护压，压完仍贴着窗口就不压。**决定不压时 driver 原样接着跑**——下一次请求与关着压缩时逐字节相同，提示缓存照样命中；边界上不压记一条 `skipped` 把边界用掉。决定压时发一次摘要请求（没有工具，早先那段渲染成一条纯文本用户消息，带当前计划与已完成步骤的进度；系统提示说明里面是数据不是指令），成了记 `compacted` 并把这一段交回 handler（`SegmentOutcome::Recompose`）：同一个 Run、不重新入队、不再写 `run.started`，下一段按日志装配成**任务 → 摘要 → 切点起原样**；失败、截断记 `skipped`（带着那份决策），Run 照常往下，此后窗口压力不再触发重试，直到有真正的工具工作或新的边界。两次压缩之间至少隔一次真正的请求；一次领取里最多重装配 8 次；摘要请求不算轮数，但算进 token 花销，已用的轮数与 token 从下一段的预算里扣掉。
 
@@ -441,7 +438,7 @@ workspace = "code/komo"
 1. **能力面**（`AgentSurface`，§4）：这次运行的工具集里没有这个名字，执行器不认。
 2. **工具自己的 `prepare`**：参数校验、目标解析、版本检查（覆盖已有文件要对得上版本，`call` 模式只认已启用版本的导出函数）、资源 URI 越界（§4.7）——这些是"这次调用说得通吗"，不是"允不允许"。不过就是一次没有执行过的调用，按 `fail_call` 落账，理由交给模型。
 
-没有第三层。委派、派任务、追问、更新计划、MCP 调用、codemode、Memory 内部变更、恢复流程发起的核对调用（`__komo_verify__` 无条件跑，§8.6）都走同一条路。toolbox 启用 / 停用直接生效（§5.4）；cron 命令 Job 不再在 `cron add` 时签授权（§10.1）。
+没有第三层。委派、派任务、追问、更新计划、MCP 调用、codemode、Memory 内部变更都走同一条路。toolbox 启用 / 停用直接生效（§5.4）；cron 命令 Job 不再在 `cron add` 时签授权（§10.1）。
 
 `policy.toml` 不再读：文件还在时 `komo config check` 与 Gateway 启动日志**报一句**"policy.toml 已不再使用，可以删掉"——与 start-only 键同一条规则（§3），报出来，不静默忽略。
 
@@ -471,7 +468,7 @@ workspace = "code/komo"
 
 ### 7.5 Intervention：一切"需要人判断"的同一个入口
 
-§8.4 / §8.6 会产出两类只有人能回答的问题：**结果不明**（副作用可能已经发生、没有可靠恢复方式）与**阻塞**（引用损坏、无法确认旧执行已结束、会话内容与账本对不上）。它们曾经各走各的出口——结果不明只有一条事件与一句投递，"上一次执行没收尾"在 `resume` 里被直接续跑；操作者因此会撞上最难解释的现象：**会话停着不动，而待处理清单是空的**。（2026-10-11 之前这里还有第三类 `approval`，随审批一起删掉。）
+§8.4 / §8.6 曾经产出两类只有人能回答的问题：**结果不明**（副作用可能已经发生、没有可靠恢复方式）与**阻塞**（引用损坏、无法确认旧执行已结束、会话内容与账本对不上）。2026-10-12 起结果不明交给模型判断、不再停下来等人（§8.6），现在会产生的只有阻塞；`verify` 留着只为升级前已经停下的旧 Run。它们曾经各走各的出口——结果不明只有一条事件与一句投递，"上一次执行没收尾"在 `resume` 里被直接续跑；操作者因此会撞上最难解释的现象：**会话停着不动，而待处理清单是空的**。（2026-10-11 之前这里还有第三类 `approval`，随审批一起删掉。）
 
 统一成一个概念：**Intervention = 一条未完成的 Run 停在某个只有人能回答的问题上**。
 
@@ -484,7 +481,7 @@ workspace = "code/komo"
 
 1. **清单是派生视图，不是另一张表。** 权威仍是 `runs` 与 `tool_calls`；`GET /v1/interventions` 是对它们的查询，`kind` 由"有没有一条 uncertain 调用"当场判出。多一张 `interventions` 表等于多一处会与权威漂移的状态（§8.9）。**子代理（§4）的介入因此自动出现在同一张清单里**：子 Run 与它的调用本来就在这些表里，"谁派的"不是清单该关心的维度。
 2. **挡着会话的每一条都必须在清单里，而且与"后面领不走"是同一次判定。** §8.4 的"未完成"是四个非终态；其中**停在人身上的**（`waiting + intervention`）必须逐条出现，且由同一个谓词回答"这条 Run 现在挡不挡队"——就是 `WaitReason::needs_a_person()` 与那段 `earlier` 子查询。两处判定分家就会出现"卡住但清单为空"。`waiting + retry`（等时钟）与 `waiting + dependency`（等另一条 Run）不进清单：**它们不是在等人**，但仍然挡着同 Session 后面的 Run——唯一的例外是父 Run 正等着它派出去了的那条子 Run，那条必须能跑，否则父子互等（§4）。旧的 `waiting + approval` 不在等人，按 §7.4 续跑。
-3. **结论只走一条路：核对 → 按 §8.4 行事，没有"我说它发生了"。** `satisfied` 给那次调用补一条"核对后目标已满足"的结果，原 Run 继续；`not_performed` 把那次调用标成"确定没执行"再入队，按原计划重放；`resolve` 不强行放行，它只要求**重新观察并重新决策**一次；`abandon` 是终态取消。没有"我确认副作用已发生"这种结论——操作者可能看错，账本一旦这么记就再也纠不回来。
+3. **结论只走一条路：核对 → 按 §8.4 行事，没有"我说它发生了"。** `satisfied` 给那次调用补一条"核对后目标已满足"的结果（completed），原 Run 回到队列接着跑；`not_performed` 给那次调用补一条"确定没有执行"的结果（failed），原 Run 回到队列，模型拿到这次明确的失败——**重做是模型发起的新一次调用**，执行器不按原计划重放；`resolve` 不强行放行，它只要求**重新观察并重新决策**一次；`abandon` 是终态取消。没有"我确认副作用已发生"这种结论——操作者可能看错，账本一旦这么记就再也纠不回来。
 
 出口有四个，语义相同：`komo intervention list | show | answer`、TUI 的待处理清单、聊天里的 `/pending` 与 `/answer`（§11.3）、`GET|POST /v1/interventions`。一次答一条，没有批量答复。投递沿用 §11.4 那一条：**没有界面在看这个会话时进 home chat**——那是任务在问，不是在报告（§10）。
 
@@ -577,7 +574,7 @@ Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_T
 
 调用参数默认小量内联；单次参数超过初始 4 KiB 限制时，将包含它的模型消息正文存到 payloads，以 arguments_ref 指向文件内的对应字段。较大的准备计划同样外置。正文和输出引用包含相对于当前 Session 目录的受控路径、文件大小、内容哈希及必要的字段定位；不在 JSONL、参数文件和原始回复中各复制一份大参数。output.json 内部引用 stdout / stderr 时也使用同一个 Session 目录作为基准，不依赖进程工作目录或 output.json 所在子目录；解析引用时禁止越出该 Session 的内容目录。
 
-stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内存里积累完整输出。进程结束并收齐输出后，同步并完成文件，再原子写入 output.json；最后才能发布 JSONL 结果引用。因中断只留下的 .partial 文件可以用于诊断，不能当作完成结果。
+stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内存里积累完整输出。进程结束并收齐输出后，同步并完成文件，再原子写入 output.json；最后才能发布 JSONL 结果引用。因中断只留下的 .partial 文件可以用于诊断，不能当作完成结果：重启后那次调用的中断结果接管它——末尾一段进正文，完整的那份随结果发布成那次尝试的 stdout / stderr（§8.6）。
 
 读取历史或恢复调用时按引用加载需要的内容；组装模型上下文仍遵守输出预算，超限时提供截断提示和可读取的完整文件引用。**这里有两个预算，不是一个**：`tool.result` 那 ≤1 KiB 是**账本的行预算**（每条 JSONL 行都要小），交给模型多少由 `[execution] model_result_bytes` 说了算（§6），完整正文落在 `output.json` 里。模型看到的正文由**一处纯函数**投影出来（`komo-kernel` 的 `projection`）：抬头（工具、状态、耗时、stdout / stderr 大小）+ 头尾各留一段**整行**并写明省了多少（整行留不到预算一半时——比如一整行 JSON——退到字符边界） + 可直接 `read` 的**引用**（`artifact://<run>/<call>/<attempt>/stdout`，§4.7）。从前这里印的是绝对路径；改成 URI 之后，「超限的正文在哪」与「允许读哪个逻辑资源」是同一句话。因此**刚跑完的那一次与重启之后回放必须逐字节相同**——投影只吃落盘的事实（事件 + `output.json`），不掺任何只活在内存里的东西。那条路径必须真能读：**当前 Session 的输出（`tool-output/`、`artifacts/`）是一段只读根**，`read` 得到它、`write` / `edit` 写它一律拒绝（§7.2），不开放普通工具修改这些记录。shell / python 的输出预览是**开头 3 KiB + 结尾 4 KiB，中间写明省略字节数**（两段加起来装得进 8 KiB 的模型正文预算，投影不再二次截断）；早先只留最后 4 KiB 时，模型为看开头多跑了两轮 `read artifact://`。摘要或预览不能代替恢复所需的原始参数与结果。
 
@@ -638,7 +635,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 | JSONL 已有结果引用且完整输出校验通过，state.db 可能落后 | 先补齐结果索引和状态，复用原输出，不重放动作 |
 | 调用 planned，确定尚未执行 | 校验原计划（`prepare` 那一层）后自动执行 |
 | 调用有结果、**没有 started**（一次没执行过的调用：工具名不认识、参数准备不出来、`prepare` 拒绝） | 按已有结果收口，不重跑；回放时把那条 `tool.started` 缺席的尝试行补上（`fail_call` 写下的就是它） |
-| 调用 started，没有结果 | 先核对外部效果，按 §8.6 决定是否安全继续；核对不出结论（含带 `then_run` 的组合调用）记 uncertain、作为这次调用的结果**交给模型判断**，Run 接着往下走（§8.6） |
+| 调用 started，没有结果 | 按 §8.6 的重放策略：计划与工具现在的声明都是 safe 才带原计划重跑一次（新的尝试）；否则记 uncertain，连同中断前已落盘的部分输出作为这次调用的结果**交给模型判断**，Run 接着往下走 |
 | `waiting + approval`（2026-10-11 之前的旧 Run） | 按"批准"续跑：那次调用 planned 而没 started，走"调用 planned，确定尚未执行"那一行，同一个重新入队的状态转换，不看审批行（§7.4） |
 | `waiting + retry` | 沿用已保存的次数与到点时刻，到点再尝试 |
 | `waiting + intervention` | **原样保留**：它是清单里的一条，等操作者答复——恢复扫描不替人答，也不偷偷往下跑 |
@@ -678,7 +675,7 @@ WaitReason: retry{attempts, not_before, cause} · intervention · dependency{run
 
 ToolCall:
 planned → started → completed / failed
-                  └─ uncertain → 核对完成 / 确定可重试 / 等待处理
+                  └─ uncertain → 交给模型（重启后 safe 的才重跑，开新尝试）
 
 Session（§8.10）:
 active → closing → deleted → purged
@@ -727,7 +724,7 @@ active → closing → deleted → purged
 
 恢复先处理已同步但未索引的 JSONL 尾部，再判断任务是否需要执行。例如 tool.result 已经完整持久保存且引用输出校验通过、数据库仍显示 started，必须先补齐为已有结果，不能直接按 uncertain 重试。若结果引用存在但对应输出缺失或哈希不符，停止受影响任务，不能重跑来掩盖数据损坏。输出文件已写完但 tool.result 尚未提交时，只有完整校验文件内的调用身份、计划、完成状态与内容后才能补记结果；仅凭路径存在不足以宣告成功。
 
-回放只补索引与派生执行状态，不调用工具、不发送外部请求，也不能覆盖 state.db 已记录的用户取消。tool.started 本身不能证明已产生副作用；缺少 tool.result 的调用仍进入核对流程。
+回放只补索引与派生执行状态，不调用工具、不发送外部请求，也不能覆盖 state.db 已记录的用户取消。tool.started 本身不能证明已产生副作用；缺少 tool.result 的调用按 §8.6 的重放策略处理。
 
 会话生命周期等控制操作的权威在 state.db，采用相反方向的审计补写：
 
@@ -749,33 +746,43 @@ state.db 事务提交控制决定与 control_outbox（固定 event_id）
 
 Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子事务。副作用已发生、完整输出与结果事件尚未持久保存时，必须保留 uncertain，而不是用“重试成功”掩盖这段窗口。
 
-**重启续跑时核对不出结论，交给模型判断，不停下来等人**（2026-10-12）。那条上一世的 `tool.started` 配一条 uncertain，正文写明"上一次执行被 Gateway 重启打断、核对结论是什么"，再附一段判断方法（先核对目标的实际状态；已生效就接着往下，没生效或只做了一半就继续或重做，只读命令直接重跑；发消息、扣款这类重复做会出问题又核对不了的先问用户）。这条结果作为这次调用的结果回到模型，Run 接着往下走。理由：停下来问人并不比模型更有把握——人多半也得去看一眼目标才答得上来，而模型手里就有 read / shell。**执行器本身仍不重跑**，重做是模型发起的新一次调用，账本里看得见。**执行当中**工具自己报"结果不明"（如 `NoSafeRecovery` 的调用超过时限、远端没回话）也一样：结果正文附同一段判断方法交给模型，Run 不停。账上找不到承载那次调用的尝试（账本自相矛盾）时补开一次 `tool.started` 记下结论，同样交给模型。仍交给人的只剩模型拿不到上下文、或放出去可能重复执行的：引用损坏、会话读不出来、无法确认旧执行已结束（§8.4）。升级前已经停在 `verify` 上的 Run（停在介入上、带 `uncertain` 调用、`last_error` 为空），Gateway 启动对账之后放回队列交给模型。
+**重启续跑时只问一件事：这次调用能不能重放**（2026-10-13，规则借自 pi-durable 的 `replay`）。一次 started 而没有结果的调用，盘上若有一份身份齐全、哈希对得上的 `output.json`，按 §8.4 补记结果、复用原输出，不重做；没有的话看两份重放策略：
 
-执行计划包含一种经过验证的恢复方式，不能由模型随意填入“可重试”：
+| 计划里记下的（`plan.recovery.replay()`） | 工具现在声明的（`Tool::replay`） | 怎么办 |
+| --- | --- | --- |
+| safe | safe | 带原计划重跑一次：同一个 ToolCall，新的一次尝试 |
+| safe | unsafe | 不重跑——现在的声明能否决记下的 safe（升级改了声明） |
+| unsafe | 任意 | 不重跑——现在的 safe 不能把记下的 unsafe 升级 |
 
-| 恢复方式         | 自动处理条件                                                             |
-| ---------------- | ------------------------------------------------------------------------ |
-| 可安全重做的读取 | 例如普通文件读取；记录这次重新读取的实际时间和结果，不冒充重启前的观察   |
-| 支持外部幂等键   | 外部接口确实保证去重；所有尝试复用同一逻辑操作的键和参数，核对键的有效期 |
-| 可以核对目标状态 | 使用绑定版本的核对逻辑，返回已达到目标、确定未执行 / 可重试、冲突或未知    |
-| 无可靠恢复方式   | 记 uncertain 交给模型核对后决定；执行器不自动从头执行整个脚本            |
+不重跑的那次给上一世的 `tool.started` 配一条 uncertain（**中断结果**），作为这次调用的结果交给模型，Run 接着往下走。正文写明"上一次执行被 Gateway 重启打断、重启后不会自动重跑"，附一段判断方法（先核对目标的实际状态；已生效就接着往下，没生效或只做了一半就继续或重做，只读命令直接重跑；发消息、扣款这类重复做会出问题又核对不了的先问用户），再附**中断前已落盘的部分输出**：stdout / stderr 在运行时流进那次尝试的 `.partial`（§8.3），这里各取末尾至多 2 KiB 放进正文；完整的那份由这条结果接管，随它发布成那次尝试的 `stdout.txt` / `stderr.txt`，模型可以按引用 `read`。一个字节都没落下也说一句。正文在收尾时固化进 `output.json`，回放逐字相同。部分输出只是"做到哪儿了"的证据，不是完成结果。
 
-文件 write / edit 可记录修改前后内容哈希与目标身份。若恢复时目标已是预期内容，则记录“核对后目标已满足”；仍是原内容且其他前提成立，可重新执行同一原子修改；出现第三种内容则视为冲突。不能把文件已存在当作写入成功，也不能编造丢失的 stdout 或原始返回值。
+理由：停下来问人并不比模型更有把握——人多半也得去看一眼目标才答得上来，而模型手里就有 read / shell。**执行器本身不重跑 unsafe 的调用**，重做是模型发起的新一次调用，账本里看得见。**执行当中**工具自己报"结果不明"（如 unsafe 的调用超过时限、远端没回话）也一样：结果正文附同一段判断方法交给模型，Run 不停。账上找不到承载那次调用的尝试（账本自相矛盾）时补开一次 `tool.started` 记下结论，同样交给模型。仍交给人的只剩模型拿不到上下文、或放出去可能重复执行的：引用损坏、会话读不出来、无法确认旧执行已结束（§8.4）。升级前已经停在 `verify` 上的 Run（停在介入上、带 `uncertain` 调用、`last_error` 为空），Gateway 启动对账之后放回队列交给模型。
 
-**带 `then_run` 的组合调用是"无可靠恢复方式"**（刻意的取舍）：命令可能又改过这份文件，改动自己的内容哈希核对对上对不上都不再说明改动发生没有，命令本身更没有核对方式。所以它一旦 `start` 过而没有结果，恢复时**不问改动工具的核对**，直接给那次尝试补一条 uncertain、作为结果交给模型判断，执行器绝不自动重跑任何一步；只 `planned` 过（确定一次都没执行）的照常跑一次。
+`RecoveryMode` 由 `prepare` 填写，模型不能随意填"可重试"。它进计划哈希，四个变体都保留，旧计划照原样解码、哈希不变：
 
-**委派用"可以核对目标状态"那一行，而它的核对对象是我们自己的账本。** 一条 `delegate` 调用的结果不在别处，就在它派出去的那条子 Run 的终态里（`Ledger::run_end`）：子 Run 正常结束 → 那次调用按已完成收尾，结果交给父 Run（有契约时按**父侧计划里那份**契约复验，与子代理自己用的是同一份校验器）；子 Run 失败 / 取消 / 放弃 → 按失败收尾，理由里写明它怎么结束的；子 Run 还没有终态 → 继续等。**这里不会出现"结果不明"**：副作用发生过没有，是我们账本里的一条事实，不是对外部世界的猜测——那张表把这种情形与"任意 shell 命令"分开的用意正在于此。子 Run 自己是普通 Run，它的恢复照 §8.4 逐行走。续跑（§4）不改这一段：父侧核对的永远是**这次调用派出去的那一条**，线上更早的几条早已各自收过尾，不再看它们。
+| `RecoveryMode` | 重放策略 | 谁写它 |
+| --- | --- | --- |
+| `SafeReread` | safe | `read`、`rg`、`codemode`（脚本里只有只读调用）、服务器标了只读的 MCP 工具 |
+| `IdempotencyKey` | safe | 外部接口确实保证去重、所有尝试复用同一逻辑操作的键；目前没有工具产出它 |
+| `VerifyTarget` | unsafe | 2026-10-13 之前的 write / edit / 带核对函数的 python 计划；新计划不再产生 |
+| `NoSafeRecovery` | unsafe | `write`、`edit`、`shell`、`python`、带 `then_run` 的组合调用、其余 MCP 工具 |
 
-已保存的 Python 模块可提供与版本绑定的核对函数，由执行器通过同一 python 执行机制调用；核对函数（`__komo_verify__`）无条件跑，它是执行器发起的、只读的、绑定原计划里那个模块版本（2026-10-11 之前要先过 Policy 那一行放行，§7）。它不增加第六个模型工具。代码、依赖、参数以及核对逻辑都必须对应原执行计划，模块自称幂等不构成证明。
+`Tool::replay` 默认 unsafe，只有重跑一遍确实无害的工具覆盖它，就是上表 safe 的那几个。
+
+**2026-10-13 之前这里是一条核对梯子**：write / edit 按修改前后的内容哈希判"已满足 / 确定未执行 / 冲突"，python 调模块用 `__komo_verify__` 声明的核对函数，判出"确定未执行"由执行器重做、"已满足"直接按完成收尾。删掉的理由：它只覆盖 write / edit 与极少数带核对函数的模块，却撑起了 `Tool::verify`、`Verification` 与一套核对函数协议；而核对判不出结论时早已交给模型（2026-10-12）。现在一律交给模型。模块里写着的 `__komo_verify__` 不再被读取；内置 `memos` 仍导出 `verify`，它是模型可调的普通函数，被打断的 Memos 写入可以用它去核对。
+
+**带 `then_run` 的组合调用是 unsafe**：计划写 `NoSafeRecovery`，与单独的改动一样，`start` 过而没有结果就补一条中断结果交给模型，执行器不重跑任何一步；只 `planned` 过（确定一次都没执行）的照常跑一次。
+
+**委派不看重放策略，它的结果在我们自己的账本里。** 一条 `delegate` 调用的结果不在别处，就在它派出去的那条子 Run 的终态里（`Ledger::run_end`）：子 Run 正常结束 → 那次调用按已完成收尾，结果交给父 Run（有契约时按**父侧计划里那份**契约复验，与子代理自己用的是同一份校验器）；子 Run 失败 / 取消 / 放弃 → 按失败收尾，理由里写明它怎么结束的；子 Run 还没有终态 → 继续等。**这里不会出现"结果不明"**：副作用发生过没有，是我们账本里的一条事实，不是对外部世界的猜测。子 Run 自己是普通 Run，它的恢复照 §8.4 逐行走。续跑（§4）不改这一段：父侧看的永远是**这次调用派出去的那一条**，线上更早的几条早已各自收过尾，不再看它们。`dispatch` / `follow` 按请求键幂等重放，`update_plan` 没有副作用。
 
 典型情况：
 
 - 已保存某次测试的完整结果：恢复后直接使用，不重复跑。
-- 测试进程中断且结果丢失：只有已确认可安全重做的测试才自动重跑；任意 shell 命令不能仅凭名称被判定安全。
-- HA 的“设为关闭”：可以读取当前状态核对目标；“切换一次”不能据此重复调用，且恢复前要检查时效。
+- 测试进程中断且结果丢失：shell 不重跑；中断结果带着已经打出来的那段测试输出交给模型，由它决定重跑。
+- HA 的“设为关闭”：模型可以读取当前状态核对目标；“切换一次”不能据此重复调用，且恢复前要检查时效。
 - 创建 Memos 记录或 PR：优先保存远端 ID，或使用接口实际支持的幂等键 / 可验证关联 ID。只有内容相似、时间接近，不能证明就是原调用创建的记录；无法确认时请用户处理。
 
-一次重试沿用 ToolCall ID，新增 tool_attempts；完成状态附带实际证据和核对方式。已完成或已失败且结果已保存的调用不重做。重复尝试、后台核对与新模型调用都计入原任务预算。
+一次重跑沿用 ToolCall ID，新增 tool_attempts。已完成或已失败且结果已保存的调用不重做。重复尝试与新模型调用都计入原任务预算。
 
 ### 8.7 Gateway 启动与进程回收
 
@@ -1230,9 +1237,9 @@ TELEGRAM_BOT_TOKEN=...
 
 ### 11.3 介入在聊天里
 
-聊天里需要人回答的只有 §7.5 的两类：**结果不明**（`verify`）与**阻塞**（`blocked`）。2026-10-11 之前这里的主角是审批——短 ID、批准 / 拒绝按钮的交互卡片、`/approve` 的三种范围、`y` / `n` 快捷答复、`/approve all` 批量——随 Policy 一起删掉（§7）；`/approve`、`/reject`、`y`、`n` 现在不是命令，`/approve`、`/reject`、`/deny` 得到一句固定的帮助（"已经不是命令了"，并列出 `/pending` · `/answer` · `/status` · `/cancel` · `/new` · `/id`），其余未知斜杠命令照旧交给模型；`y` / `n` 就是普通消息，哪怕此刻有待处理的介入。
+聊天里需要人回答的只有 §7.5 的两类：**结果不明**（`verify`，2026-10-12 起不再产生，只剩升级前停下的旧 Run）与**阻塞**（`blocked`）。2026-10-11 之前这里的主角是审批——短 ID、批准 / 拒绝按钮的交互卡片、`/approve` 的三种范围、`y` / `n` 快捷答复、`/approve all` 批量——随 Policy 一起删掉（§7）；`/approve`、`/reject`、`y`、`n` 现在不是命令，`/approve`、`/reject`、`/deny` 得到一句固定的帮助（"已经不是命令了"，并列出 `/pending` · `/answer` · `/status` · `/cancel` · `/new` · `/id`），其余未知斜杠命令照旧交给模型；`y` / `n` 就是普通消息，哪怕此刻有待处理的介入。
 
-一条介入通知是 `Outbound::NeedsAttention`（会话、Run、理由），三个渠道都渲染成文本：写清是哪条 Run、为什么停、这一条该怎么答（`/answer <run_id> <结论>`）。没有按钮：结论里有"确定没执行 → 重跑"这种分量的选项，打一行命令不是摩擦。
+一条介入通知是 `Outbound::NeedsAttention`（会话、Run、理由），三个渠道都渲染成文本：写清是哪条 Run、为什么停、这一条该怎么答（`/answer <run_id> <结论>`）。没有按钮：结论里有"确定没执行"这种分量的选项（它决定模型下一步会不会重做），打一行命令不是摩擦。
 
 命令（三个渠道相同）：
 
@@ -1711,7 +1718,7 @@ codegen-units = 16
 | `MemoryRepo` | toasty + `memory_terms`（store） | 内存 | `MemoryManager` 的全部状态读写；召回排序逻辑要在无数据库下测 |
 | `LlmClient` / `TurnDriver` | 每种协议一个适配器（runtime） | 脚本化 driver | 主模型、记忆模型是同一 trait 的两个实例；loop 测试用脚本化回合 |
 | `EmbeddingClient` | OpenAI-compatible / Ollama（runtime） | 固定向量 | 空间指纹与维度校验要在无网络下测 |
-| `PythonHost` | 子进程 + venv 版本（runtime） | 假宿主 | `python` 工具、toolbox 测试、核对函数调用都经它 |
+| `PythonHost` | 子进程 + venv 版本（runtime） | 假宿主 | `python` 工具与 toolbox 测试都经它 |
 | `Tool` | 5 个（runtime） | — | §4 已定；executor 只认 trait |
 | `Channel` / `Inbound` / `Notifier` | 飞书、Telegram、WeChat、HTTP API、SSE（gateway） | 内存渠道 | 首版就有三个真实现；介入通知的渲染是各渠道实现的事 |
 | `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避全部依赖时间 |
@@ -1756,12 +1763,14 @@ pub trait Ledger: Send + Sync {
 
 #[async_trait]
 pub trait ToolOutputStore: Send + Sync {
-    /// 为一次尝试打开流式写入器（stdout/stderr 写 .partial）。
+    /// 为一次尝试打开流式写入器（stdout/stderr 写 .partial）。上一个进程留下的 .partial 由它接管。
     async fn begin(&self, attempt: &AttemptRef) -> Result<Box<dyn OutputWriter>, StoreError>;
     /// 收齐后同步、原子写 output.json，返回带路径、大小、哈希的引用。
     async fn publish(&self, writer: Box<dyn OutputWriter>, result: ToolResultBody) -> Result<PublishedOutput, StoreError>;
     /// 按引用读取并校验哈希；不匹配返回 Corrupt，不返回内容。
     async fn open(&self, output: &OutputRef) -> Result<VerifiedOutput, StoreError>;
+    /// 一次被打断的尝试留下的部分输出，各取末尾至多 tail_bytes（§8.6 的中断结果用）。只读。
+    async fn interrupted(&self, attempt: &AttemptRef, tail_bytes: usize) -> Result<InterruptedOutput, StoreError>;
 }
 
 #[async_trait]
@@ -1865,7 +1874,7 @@ pub trait Clock: Send + Sync {
 |---|---|---|
 | 1. 进程与会话骨架 | 六个 crate 骨架（§13.4）；komo、Gateway 自动启动、HTTP/SSE；`komo-store`：Turso 连接、`ensure_schema` + DDL 对齐测试、`with_write_retry`、统一 Session 目录与状态索引；`komo-client`：HTTP/SSE 客户端与 TUI 骨架；**编译预算首次测量** | 多个 CLI 同时启动仅产生一个实例；断线后能查看原会话；两个写入器对不同 Session 并发提交不互相阻塞，对同一行冲突时一方重试成功且只应用一次；DDL 对齐测试挂掉能定位到列；改 client 一行不重编 gateway；保存一份合法的 config.toml 后 `komo doctor` 一秒内显示新 mtime 已生效，保存一份非法的则旧配置继续生效且 home chat / 日志有具体错误 |
 | 2. AgentLoop 与执行 | 模型往返、执行计划、`prepare` → `start_call` → `execute`；`Ledger`；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测（2026-10-11 之前这一阶段还有 Policy、Allow/Ask/Deny、审批持久化与 `ApprovedPlan` 类型状态，§7） | `start_call` 返回之前没有副作用；同一轮的两条只读调用同时在飞（`read` / `rg`），写是屏障、取消要收齐已在飞的那些（§6）；**不在本次运行能力面里的工具，模型拼出名字也执行不了**，而交给模型的 schema 与执行时的表来自同一份（§4）；**`write` / `edit`（含 `then_run` 的改动那一步）写数据目录下的 `sessions/`、`state.db*`、`runtime/`、`.env` 在 `prepare` 被拒**，结果 `denied`、理由点名路径，账上有结果不悬着（§7.2） |
-| 3. 六个工具 | 文件、搜索、进程、Python 环境与输出处理；`verify` 默认实现与 write/edit 的哈希核对 | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 是只读计划（可并发、codemode 可调），且它不依赖机器上装没装 `rg` |
+| 3. 六个工具 | 文件、搜索、进程、Python 环境与输出处理；重放策略声明（`Tool::replay`，默认 unsafe，§8.6） | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 是只读计划（可并发、codemode 可调），且它不依赖机器上装没装 `rg` |
 | 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、介入通知渲染、飞书 Run 回复卡片、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一条介入被答两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/answer` 重发只答一次；来源会话与 home chat 都收到介入通知且第二个答复得到"已决定"；`/approve`、`y` 不是命令；Gateway 重启后 pending 投递补发一次，老库里 `approval_request` / `approval_settled` 的 pending 行被跳过而不卡住补发；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的介入通知 |
 | 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，`toasty::sql`）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的介入仍能在手机上 `/answer`；**旧数据照常起来**：带 `approval.*` 事件的旧会话能加载、回放与续聊（那些事件按未知事件解码），停在 `waiting + approval` 的旧 Run 在 Gateway 启动后按"批准"续跑、那次调用只执行一次，老库里多出来的 `approval_requests` / `policy_grants` 表不妨碍启动（§7.4） |
 | 6. toolbox 迭代 + Skills | 保存模块、候选测试、版本校验与启用；`SkillRegistry`、目录行门控、`read` 只读根 | 调用使用已启用且已测试版本；候选哈希与已测版本不一致时拒绝启用；启用 / 停用直接生效，没有 Pending；新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect |
@@ -1876,7 +1885,7 @@ pub trait Clock: Send + Sync {
 
 存储的基本约束（§8.5 的写入顺序、§7.2 的硬限制）从第二阶段开始贯穿全部工具，不能在所有功能完成后才补。
 
-首个端到端验收：启动 komo 自动拉起 Gateway，通过模型调用 write 生成工作文件，在任务的后续步骤前重启 Gateway；不打开 CLI 也应自动接续原 Run，随后 resume 原会话查看结果，再读出原文件。随后验证一次 shell 调用在 started 之后、结果落盘之前被杀：重启后进入未知状态核对而不是自动重跑，在飞书或 Telegram 里 `/answer` 之后按结论只处理一次。
+首个端到端验收：启动 komo 自动拉起 Gateway，通过模型调用 write 生成工作文件，在任务的后续步骤前重启 Gateway；不打开 CLI 也应自动接续原 Run，随后 resume 原会话查看结果，再读出原文件。随后验证一次 shell 调用在 started 之后、结果落盘之前被杀：重启后不自动重跑，中断结果连同已经打出来的部分输出交给模型，由它核对之后决定（§8.6）。
 
 恢复故障注入验收：
 
@@ -1886,13 +1895,13 @@ pub trait Clock: Send + Sync {
 | 输入已持久保存且 queued 已提交，客户端确认响应丢失   | 客户端用同一请求键重发，仍返回原 Run                             |
 | LLM 输出尚未收齐                                     | 重试模型请求；未收齐的调用从未执行                               |
 | 完整计划已同步到 JSONL，第一个工具尚未 started       | 自动执行原计划，调用 ID 不变                                     |
-| started 已提交，真实动作还没发出                     | 保守核对，不能从 started 单独推断已执行或未执行                  |
+| started 已提交，真实动作还没发出                     | 不能从 started 单独推断已执行或未执行：unsafe 的不重跑，中断结果交给模型；safe 的带原计划重跑一次 |
 | Memos 等外部写入成功，完整输出与结果事件尚未持久保存 | 借助可靠幂等或关联信息核对；没有证据则记 uncertain 交给模型判断，执行器不产生第二条记录 |
 | 输出文件和 JSONL 引用已持久保存，state.db 尚未更新     | 校验输出后补结果索引，复用原输出，工具不重做                     |
 | output.json 已完成但 JSONL 结果事件尚未写入          | 校验身份、计划及完成状态后补记结果；不能只凭文件存在判断         |
 | 输出文件引用已提交，但正文缺失或被修改               | 停止受影响任务，报告引用损坏，不通过重跑补造旧结果               |
 | 控制决定（如 `session.closing`）已提交，审计 JSONL 尚未补写 | 从 state.db 读取原决定，outbox 幂等补写；旧库里残留的 `approval.*` 审计行不卡住补写器 |
-| JSONL 最后半行未被任何提交引用                       | 隔离尾部后修复；按最后完整记录恢复，未知副作用仍须核对           |
+| JSONL 最后半行未被任何提交引用                       | 隔离尾部后修复；按最后完整记录恢复，未知副作用仍按 §8.6 交给模型 |
 | JSONL 已提交范围缺失或中间损坏                       | 停止受影响会话，报告损坏，不跳过记录或重做动作                   |
 | 最终结果已同步到 JSONL，SSE 尚未送达                 | 客户端补读原结果，Run 保持 completed                             |
 | 旧子进程仍存活，或恢复和 resume 同时触发             | 先阻止重复执行；核实进程结束，并且只有一个领取者                 |
@@ -1946,7 +1955,7 @@ Memory 与模型验收覆盖：
 | 模型一轮里提了两个调用、其中一个没有结果时，会话后面的新 Run 会不会被毒住 | §8.3 回放窗口 | **已实测（2026-09-20，真实 provider）：会。** 旧二进制下模型一轮提了两个调用，一个被拒/没执行，那条 `message.assistant` 留在会话里；其后**同一会话的每一条新 Run** 首个模型请求都被 provider 400 拒（`No tool output found for tool call call_00_…`），且会连着重试。当时用"回放窗口按 Run 过滤"（`service/segment.rs` 的 `window(surface, Some(run))`）挡住了它——**那是拿对话连续性换的**（见本节末与下一行）。**已改（2026-09-21）**：窗口改回"这一段对话"，毒化由两件事挡住——① 正跑的那条 Run 之外的消息**不带协议**（历史 Run 只发布用户正文与它最后答的正文），"有调用、没结果"的半轮因此进不了新请求；② `fail_call` 与按引用恢复让每一次调用都真的有个结果（下面那句）。回归测试：`service::segment::tests::a_later_run_still_reads_what_the_earlier_one_said`（历史那轮的 `tool_calls` / `provider_blocks` 一条都不出现）、`the_running_run_keeps_its_whole_protocol`（正跑的那条一个都不能少）。**已修（2026-09-20，本机真实会话复盘）**：线上那次 400 的调用是两次 `delegate`——两个漏法都补上了。①`resumed()` 重建调用时不按引用读回外置的 `arguments` / `plan`（§8.3 原话要求"读取历史或恢复调用时按引用加载需要的内容"）：委派的任务正文 6 KB 被外置，重 `prepare` 拿到的是一份 `null` 参数，当场失败。②`execute_one` 的"未知工具 / prepare 失败 / 放行被拒 / 子代理不能再委派"四条分支把结论**只交给模型、不写账本**（`Ledger::fail_call` 就是补这一笔）：那次调用于是永远悬着，父的窗口里两个 `function_call` 一前一后，provider 报的是前面那个。回归测试：`service::segment::tests::an_externalized_argument_and_plan_come_back_by_reference`、`service::tests::a_delegated_task_over_the_inline_limit_still_settles_the_parent_call`（去掉任一处的回填就失败）、`service::tests::a_call_that_cannot_run_still_gets_a_result_in_the_ledger`（去掉 `fail_call` 就失败）。 |
 | 超限的**正文**（`run.accepted.text` / `message.assistant.text` 过 4 KiB）在回放窗口里是不是也需要按引用读回 | §8.3 的"读取历史或恢复调用时按引用加载" | **已核实（2026-09-20，真实会话）**：会外置（本次会话里两条子 Run 的 `run.accepted` 与一条 `message.assistant` 都是 `text: null` + `text_ref`），而当时全仓**没有任何一处**读 `text_ref`——`replay()` 交给模型的用户消息因此是空的（没炸只是因为子代理的任务正文同时也在它的系统提示里，正常 Run 的用户输入很少过 4 KiB）。**已做（2026-09-21）**：`replay()` 现在按引用读回正文（`segment.rs` 的 `message_text`：内联优先、`text_ref` 次之，哈希由 `PayloadStore::open` 校验，读不出来或不是 UTF-8 都算会话缺内容 → 停下来报告而不是发一条空消息）。回归测试：`service::segment::tests::an_externalized_message_comes_back_by_reference`（用户输入与模型回复两条路）、`a_payload_that_cannot_be_read_stops_the_segment`。 |
 | 内嵌 `grep` + `ignore` 之后冷编还在不在 60s 预算内 | §13.4 的编译预算 | **已实测（2026-09-21，本机 macOS M5，`cargo build --timings`、空 target 目录）：加之前 1m10s（`/tmp` 里 HEAD 的干净 worktree），加之后 1m10s——差值落在噪声里。** 新带进来的 13 个包（`globset` / `walkdir` / `termcolor` / `crossbeam-deque` / `memmap2` / `bstr` / `encoding_rs_io` 等）与 `turso_core` / `aws-lc-sys` 并行，不在关键路径上。**顺带发现：60s 这个预算当时就已经超了**（§13.4 记的 2026-09-16 是 64.2s），与这次改动无关——要么把预算调到实测值，要么回去找关键路径，待办。 |
-| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 8 KiB，热生效）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**未核实**：8 KiB 这个默认值对真实任务够不够——要等真实会话的 recall 次数（§49 的指标）出来再调，别凭感觉改。**已补（2026-09-21）**：那四个数现在有得数了——每份观察落盘多少字节（`tool_output_bytes`）、产物多少（`artifact_bytes`）、投影给模型多少（`projected_bytes`），以及"模型回头 `read` 我们落盘的观察"的次数（`observation_recall_count`，判据是路径落在本 Session 的 `tool-output/` 或 `artifacts/` 底下）。四者都只进 trace（`komo::observation`），不进事件流（§47）；抓取与断言见 `komo-runtime/src/executor/tests.rs` 里那两条（`the_projection_reports_how_many_bytes_it_kept_and_stored`、`reading_back_an_observation_counts_as_a_recall`）。**已接（2026-09-24）**：§6 同句里的"活动执行时限"进了配置——`[execution] call_timeout_secs`（默认 1800，热生效，走 `CallEnv` / `ToolContext`）。起因是一次真实会话：模型给 `cargo test --workspace && cargo build --release` 传了 `timeout_secs: 1800`，执行器写死的 300s 先到点，shell 判成 `uncertain`，Run 停下等人核对。现在 shell 的超时取 `min(请求, 上限)`，由工具自己杀进程组报 `Timeout`；执行器的兜底计时器在上限之外多等 15s（进程组 TERM/KILL 回收各 5s），不再与工具抢同一个时刻。回归测试：`tools::shell::tests::a_requested_timeout_beyond_the_call_limit_is_clamped_to_it`、`config::tests::the_call_timeout_is_read_from_the_execution_section`。**已做（2026-10-11）**：模型发起的 `python` 不再有自己的 120s——时限就是这次调用的 `call_timeout`（`PythonHost::run_with_artifacts` 多一个 `timeout` 参数），到点由宿主终止进程组报 `Timeout`，不落到兜底成"结果不明"；`PythonEnvConfig.timeout`（120s）只剩 toolbox 启用与核对调用那一路（`PythonHost::run`）在用。回归测试：`tools::python::tests::a_python_call_runs_under_the_call_timeout_not_a_fixed_limit_of_its_own`、`python_runtime::tests::run_with_artifacts_stops_at_the_timeout_it_is_given`。 |
+| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 8 KiB，热生效）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**未核实**：8 KiB 这个默认值对真实任务够不够——要等真实会话的 recall 次数（§49 的指标）出来再调，别凭感觉改。**已补（2026-09-21）**：那四个数现在有得数了——每份观察落盘多少字节（`tool_output_bytes`）、产物多少（`artifact_bytes`）、投影给模型多少（`projected_bytes`），以及"模型回头 `read` 我们落盘的观察"的次数（`observation_recall_count`，判据是路径落在本 Session 的 `tool-output/` 或 `artifacts/` 底下）。四者都只进 trace（`komo::observation`），不进事件流（§47）；抓取与断言见 `komo-runtime/src/executor/tests.rs` 里那两条（`the_projection_reports_how_many_bytes_it_kept_and_stored`、`reading_back_an_observation_counts_as_a_recall`）。**已接（2026-09-24）**：§6 同句里的"活动执行时限"进了配置——`[execution] call_timeout_secs`（默认 1800，热生效，走 `CallEnv` / `ToolContext`）。起因是一次真实会话：模型给 `cargo test --workspace && cargo build --release` 传了 `timeout_secs: 1800`，执行器写死的 300s 先到点，shell 判成 `uncertain`，Run 停下等人核对。现在 shell 的超时取 `min(请求, 上限)`，由工具自己杀进程组报 `Timeout`；执行器的兜底计时器在上限之外多等 15s（进程组 TERM/KILL 回收各 5s），不再与工具抢同一个时刻。回归测试：`tools::shell::tests::a_requested_timeout_beyond_the_call_limit_is_clamped_to_it`、`config::tests::the_call_timeout_is_read_from_the_execution_section`。**已做（2026-10-11）**：模型发起的 `python` 不再有自己的 120s——时限就是这次调用的 `call_timeout`（`PythonHost::run_with_artifacts` 多一个 `timeout` 参数），到点由宿主终止进程组报 `Timeout`，不落到兜底成"结果不明"；`PythonEnvConfig.timeout`（120s）只剩 toolbox 启用那一路（`PythonHost::run`）在用（核对调用随核对梯子 2026-10-13 删掉）。回归测试：`tools::python::tests::a_python_call_runs_under_the_call_timeout_not_a_fixed_limit_of_its_own`、`python_runtime::tests::run_with_artifacts_stops_at_the_timeout_it_is_given`。 |
 | `read` 一次读回来的正文够不够模型用 | §4 与 §8.3 | **已做（2026-09-21）**：`read` 交给模型的那一段从 400 字符改到 8 KiB（`read::PREVIEW_BYTES`），投影再按预算收。**未核实**：真实仓库里"读一个文件要几次 `read`"——如果还是很多次，说明该按结构切（一次给整段函数）而不是按字节。 |
 | 记忆召回的重排值不值（一次判断请求换来的排序） | §9.4 的可选重排 | **已做（2026-09-21）**：`[typesafe]` + `memory.retrieval.rerank` / `rerank_shortlist`——短名单（比 `top_k` 宽，校验拦「一样宽」的组合）交给一条 `Choice`，按回来的概率表排序，再照旧按 `top_k` 截；**只重排不增删**，挑中 `none` 或后端不可用都保持融合顺序。**已实测（2026-09-21，本机真机，4 条候选 / 中文输入）**：`jev-1.13.0` 一次 0.6s、约 650 输入 token，顺序 `[m-4, m-1, m-2, m-3]`——热水器与空调那两条排到了前面。离线验收在 `komo-runtime/src/memory/tests.rs`（抬高本来排不进的条目、`none` 不采纳、后端坏了照常召回、开关关着不发请求），真机那条是 `memory/rerank.rs` 里的 `mod live`（`--ignored`，要 `TYPESAFE_API_KEY`）。**未核实**：真实规模（成百上千条）下短名单取多宽、这一次请求值不值——按真实会话的命中率调，别凭感觉改 |
 | 系统提示里的 skill 目录行够不够用（166 个 skill 的机器） | §5.6 的目录行 | **已实测（2026-09-21，本机真实语料 + `komo skills list`）：不够，而且坏在两处。** ① `description: >` / `|` 这些 YAML 块标量没有解析——取值是字面量 `>`，325 份 `SKILL.md` 里 111 份的描述是这么写的，目录行长成 `- log-diagnosis：>`；② 2000 字符的预算按目录序 `continue` 丢弃，166 个不同名字里只剩 16 条进提示。真实会话里模型的第一批调用是读 `cart-loong-diff` / `ask-user`（正是那 16 条里的两条），找 `log-diagnosis` 靠的是 `ls` 整个目录，多花了好几轮。**已做（2026-09-21）**：frontmatter 支持块标量（`>` 折行 / `|` 字面，含 chomping，描述里的冒号不再被当成键）；目录改成**整批**定形状——描述装得下就是"名字 + 一句描述"，装不下就只留名字（166 条名字 2752 字符），名字都装不下时末尾写"另有 N 条没列出来"；默认上限 2000 → 4000。回归测试：`frontmatter::tests::a_folded_description_is_joined_into_one_sentence`、`skills::tests::every_skill_keeps_its_name_when_the_descriptions_do_not_fit`、`a_folded_description_becomes_one_catalog_line`。**未做**：按当前输入排序的 top-K——排序块不能进 system 前缀（§9.4 的前缀缓存），先看补全之后还错不错。 |

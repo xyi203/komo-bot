@@ -275,14 +275,14 @@ async fn row_4_a_persisted_plan_runs_on_restart_under_the_same_call_id() {
 
 // ---------------------------------------------------------------- 第 5 行
 
-/// 第 5 行：**started 已提交，真实动作还没发出** → 保守核对，不能从 started 单独推断已
-/// 执行或未执行。
+/// 第 5 行：**started 已提交，真实动作还没发出** → 不能从 started 单独推断已执行或未执行。
 ///
 /// 注入：`start_call` 返回之后跳闸——JSONL 与 state.db 两步都提交了 `tool.started`，工具
-/// 一个字节都没写。恢复必须走 §8.6 的核对：`write` 有可核对的目标身份，核对结论是"确定
-/// 未执行"，于是重做同一原子修改；总副作用次数仍然是一。
+/// 一个字节都没写。`write` 的重放策略是 unsafe（§8.6，借自 pi-durable）：重启后执行器不
+/// 重做，那条 started 配一条 uncertain，连同"中断前没有落下任何输出"交给模型，由它看一眼
+/// 目标再决定。总副作用次数是零，重做与否是模型发起的新一次调用。
 #[tokio::test]
-async fn row_5_a_started_call_is_verified_rather_than_assumed() {
+async fn row_5_a_started_call_is_not_assumed_either_way() {
     let home = Home::new();
     let target = home.workspace().join("row5.txt");
 
@@ -307,28 +307,34 @@ async fn row_5_a_started_call_is_verified_rather_than_assumed() {
     let attempt_before = started[0].attempt_id.clone();
 
     home.clear_injection();
-    let gw = home.start(FakeLlm::finisher("核对之后做完了。")).await;
+    let llm = FakeLlm::finisher("看了一眼，文件还没写，回头再说。");
+    let gw = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
     let detail = gw.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert!(!target.exists(), "执行器不重做 unsafe 的调用");
 
-    assert_eq!(
-        std::fs::read_to_string(&target).unwrap_or_default(),
-        "row-5",
-        "核对出「确定未执行」之后才重做，且只做一次"
+    let fed = format!(
+        "{:?}{:?}",
+        llm.inputs.lock().expect("轮输入"),
+        llm.requests.lock().expect("请求")
     );
+    assert!(fed.contains("被 Gateway 重启打断"), "{fed}");
+    assert!(fed.contains("中断前没有落下任何输出"), "{fed}");
+
     let events = home.events(&session);
     let started = tool_started(&events);
-    assert_eq!(started.len(), 2, "两次尝试：中断的那次 + 核对之后的那次");
-    assert!(
-        started.iter().all(|s| s.call_id == call_before),
-        "同一个 ToolCall，新的只是 attempt"
-    );
-    assert_ne!(started[1].attempt_id, attempt_before, "新的一次尝试");
+    assert_eq!(started.len(), 1, "没有第二次尝试");
     let results = tool_results(&events);
-    assert_eq!(results.len(), 1, "只有核对之后那一次有结果");
-    assert_eq!(results[0].attempt_id, started[1].attempt_id);
+    assert_eq!(results.len(), 1, "那次尝试配上了一条结果");
+    assert_eq!(results[0].attempt_id, attempt_before);
+    assert_eq!(
+        result_statuses(&events),
+        vec![komo_kernel::types::refs::ToolResultStatus::Uncertain]
+    );
 
-    // 中断的那次尝试在 state.db 里应当被明确标成 interrupted，而不是不了了之。
+    // 中断的那次尝试在 state.db 里也配上了那条结果，而不是不了了之。
     let attempts = komo_store::repos::calls::attempts_of(&gw.running.state.db, &call_before)
         .await
         .expect("读得到");
@@ -336,11 +342,18 @@ async fn row_5_a_started_call_is_verified_rather_than_assumed() {
         .iter()
         .find(|row| row.id == attempt_before.to_string())
         .expect("那次尝试还在账本上");
-    // 启动回收在同一个事务里收拾上一代遗留的尝试（§8.7）：`started` 在 §8.6 里的意思是
-    // "正在跑"，不标成 `interrupted` 的话，核对流程看到的就是一个永远跑不完的尝试。
+    let result_event = events
+        .iter()
+        .find(|event| {
+            matches!(
+                event.payload,
+                komo_kernel::events::EventPayload::ToolResult(_)
+            )
+        })
+        .map(|event| event.event_id.to_string());
     assert_eq!(
-        stale.state, "interrupted",
-        "上一代遗留的尝试要有一个明确结论（interrupted），不能停在 started：{stale:?}"
+        stale.result_event, result_event,
+        "那次尝试的结果事件就是交给模型的那条 uncertain：{stale:?}"
     );
     gw.stop().await;
 }

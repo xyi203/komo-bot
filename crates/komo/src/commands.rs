@@ -788,9 +788,6 @@ fn toolbox_detail(module: &komo_gateway::toolbox::ModuleInfo) -> String {
     if !module.exports.is_empty() {
         out.push_str(&format!("导出：{}\n", module.exports.join("、")));
     }
-    if let Some(verifier) = &module.verifier {
-        out.push_str(&format!("核对函数：{verifier}（§8.6）\n"));
-    }
     if !module.env.is_empty() {
         // **变量名**，不是值（§5.3）。
         out.push_str(&format!("凭证引用：{}\n", module.env.join("、")));
@@ -999,7 +996,6 @@ mod toolbox_render_tests {
             }),
             candidate: None,
             exports: vec!["create".into(), "get".into()],
-            verifier: Some("verify".into()),
             env: vec!["MEMOS_TOKEN".into()],
             doc: Some("Memos 客户端。".into()),
         }
@@ -1034,7 +1030,6 @@ mod toolbox_render_tests {
     fn inspect_names_the_credential_variables_and_prints_no_values() {
         let text = toolbox_detail(&info());
         assert!(text.contains("MEMOS_TOKEN"), "{text}");
-        assert!(text.contains("核对函数：verify"), "{text}");
         assert!(text.contains("create、get"), "{text}");
         assert!(text.contains("Memos 客户端。"), "{text}");
     }

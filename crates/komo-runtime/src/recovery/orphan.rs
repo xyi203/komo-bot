@@ -91,6 +91,7 @@ impl OrphanOutputs for SessionDirOrphanOutputs {
         }
 
         Ok(Some(PublishedOutput {
+            body: Some(Box::new(document.body.clone())),
             output: OutputRef(ContentRef {
                 path: relative,
                 size: bytes.len() as u64,

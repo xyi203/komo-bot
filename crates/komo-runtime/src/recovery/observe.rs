@@ -320,6 +320,7 @@ mod tests {
             event(
                 3,
                 EventPayload::ToolResult(ToolResult {
+                    body: None,
                     call_id: call.clone(),
                     attempt_id: AttemptId::from_raw("attempt-1"),
                     status: ToolResultStatus::Completed,

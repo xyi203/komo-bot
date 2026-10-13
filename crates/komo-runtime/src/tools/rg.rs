@@ -57,9 +57,10 @@ use super::{normalized, parse_args, plan_time};
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 /// 写进输出的字节上限。与 `shell` 同一个口径：**这是防机器资源耗尽，不是防 context 太大**
 /// （§4）。碰到它就让搜索停下——把一棵树走完再丢掉结果没有意义。
-pub const DEFAULT_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+/// 默认保存完整输出；模型视图的限制由 kernel 投影负责。
+pub const DEFAULT_OUTPUT_LIMIT: u64 = u64::MAX;
 /// 预览里保留多少字节的匹配正文（开头那一段）。
-const PREVIEW_HEAD_BYTES: usize = 4096;
+const PREVIEW_HEAD_BYTES: usize = 50 * 1024;
 /// 一行最多印多少列（`rg --max-columns`，带预览）：JSONL 事件一行动辄几十 KiB，
 /// 不截的话一行就能吃掉整份预算。
 const MAX_COLUMNS: u64 = 500;

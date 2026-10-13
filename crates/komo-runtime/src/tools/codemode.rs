@@ -50,7 +50,7 @@ impl Tool for CodemodeTool {
                           MCP 工具），会改东西的调用会抛 ToolError，那种请在脚本外直接调。\n\
                           - text(value)：加一段输出（非字符串转 JSON）。print 的内容附在最后。\n\
                           - TOOLS：能调的工具名。\n\
-                          一段脚本最多调 256 次工具，输出超过 1 MiB 会被截断。"
+                          一段脚本最多调 256 次工具；完整输出会落盘，给模型的视图统一受结果预算限制。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",

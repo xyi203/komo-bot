@@ -35,7 +35,8 @@ const DRIVER: &str = include_str!("driver.py");
 /// 调用不用它：时限跟本次调用的活动执行时限走（[`PythonHost::run_with_artifacts`]）。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// 默认最多往输出存储里写多少字节。
-pub const DEFAULT_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+/// 默认保存完整输出；模型视图的限制由 kernel 投影负责。
+pub const DEFAULT_OUTPUT_LIMIT: u64 = u64::MAX;
 
 const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ", "TMPDIR"];
 

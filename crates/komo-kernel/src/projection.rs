@@ -7,7 +7,7 @@
 //!
 //! 同一份事实渲染出**两个视图**（[`project_views`]）：
 //!
-//! - **full**：头尾各留一段整行、中间写明省了多少；正文不够大时就是全部。还有更多时给出
+//! - **full**：最多 50 KiB / 2000 行；shell 保留尾部，其他工具保留头部。还有更多时给出
 //!   **可直接 `read` 的完整输出引用**（`artifact://<run>/<call>/<attempt>/…`，§4.7）。
 //! - **decayed**：大结果换下来的稳定短视图——抬头 + 首尾整行 + 那条引用。
 //!   省略不等于丢失：完整事实始终在 `output.json` / `stdout.txt` 里。
@@ -69,9 +69,11 @@ pub struct DecayPolicy {
 
 /// 交给模型的正文默认预算。
 ///
-/// **它和 JSONL 里那 1 KiB 是两件事**：那一份是账本的行预算（每行都要小），这一份是模型
-/// 上下文预算。默认值由配置覆盖（§6「Gateway 设置……输出长度」）。
-pub const DEFAULT_MODEL_RESULT_BYTES: usize = 8 * 1024;
+/// 这只约束模型视图，不约束 JSONL 或 tool-output 中保存的完整事实。默认值可由配置覆盖，
+/// 并随 [`ProjectionContext`] 冻结进 RunSnapshot（§6「Gateway 设置……输出长度」）。
+pub const DEFAULT_MODEL_RESULT_BYTES: usize = 50 * 1024;
+/// 交给模型的工具结果正文最多保留多少行。与 pi 一样，行数与字节数谁先到就按谁截断。
+pub const MODEL_RESULT_LINES: usize = 2000;
 
 /// decayed 视图至少要比 full 短这么多才值得换：省几十字节却让模型面对一份变了样的
 /// 结果，不划算。
@@ -105,10 +107,17 @@ pub fn select(projected: Projected, decayed: bool) -> String {
 /// 交给模型的正文（§8.3）：full 视图。
 pub fn project(facts: &ToolResultFacts<'_>, ctx: &ProjectionContext) -> String {
     let mut out = header(facts);
-    let room = ctx.model_result_bytes.saturating_sub(out.len());
+    let room = ctx
+        .model_result_bytes
+        .min(DEFAULT_MODEL_RESULT_BYTES)
+        .saturating_sub(out.len());
 
     let text = facts.text.unwrap_or_default();
-    let cut = truncate_head_tail(text, room);
+    let cut = if matches!(facts.tool, "shell" | "bash") {
+        truncate_tail(text, room, MODEL_RESULT_LINES)
+    } else {
+        truncate_head(text, room, MODEL_RESULT_LINES)
+    };
     push_excerpt(&mut out, &cut);
     if cut.omitted > 0 || has_more(facts, text) {
         out.push_str(&recall(facts));
@@ -280,21 +289,68 @@ struct Truncated<'a> {
     omitted: u64,
 }
 
-/// 头尾各留一段，中间省略（full 视图）。
-///
-/// **不是只留头**：`cargo test` 的错误在尾部，只留头等于把要找的那一行丢掉（§8.3 的
-/// "超限时提供截断提示"不该变成"信息销毁"）。头先拿一半预算，尾拿剩下的。
-fn truncate_head_tail(text: &str, room: usize) -> Truncated<'_> {
-    if text.len() <= room {
+/// 普通工具保留头部；只收完整行。第一行本身超过字节预算时返回空摘录，提示模型读完整输出。
+fn truncate_head(text: &str, max_bytes: usize, max_lines: usize) -> Truncated<'_> {
+    let lines = line_ranges(text);
+    if text.len() <= max_bytes && lines.len() <= max_lines {
         return whole(text);
     }
-    let head = head_end(text, room / 2);
-    let tail = tail_start(text, room - head);
-    Truncated {
-        head: &text[..head],
-        tail: &text[tail..],
-        omitted: (tail - head) as u64,
+    let mut end = 0;
+    for &(start, line_end) in lines.iter().take(max_lines) {
+        let content_end = if line_end > start && text.as_bytes()[line_end - 1] == b'\n' {
+            line_end - 1
+        } else {
+            line_end
+        };
+        if content_end > max_bytes {
+            break;
+        }
+        end = line_end;
     }
+    Truncated {
+        head: &text[..end],
+        tail: "",
+        omitted: (text.len() - end) as u64,
+    }
+}
+
+/// shell / bash 保留尾部；末行本身超过预算时允许取其 UTF-8 安全的尾部片段。
+fn truncate_tail(text: &str, max_bytes: usize, max_lines: usize) -> Truncated<'_> {
+    let lines = line_ranges(text);
+    if text.len() <= max_bytes && lines.len() <= max_lines {
+        return whole(text);
+    }
+    let mut start = text.len();
+    for &(line_start, _) in lines.iter().rev().take(max_lines) {
+        if text.len() - line_start > max_bytes {
+            if start == text.len() {
+                start = boundary_rev(text, text.len().saturating_sub(max_bytes));
+            }
+            break;
+        }
+        start = line_start;
+    }
+    Truncated {
+        head: "",
+        tail: &text[start..],
+        omitted: start as u64,
+    }
+}
+
+/// 每个逻辑行在原字符串里的范围；末尾换行不额外制造空行。
+fn line_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        if byte == b'\n' {
+            ranges.push((start, index + 1));
+            start = index + 1;
+        }
+    }
+    if start < text.len() {
+        ranges.push((start, text.len()));
+    }
+    ranges
 }
 
 /// 头尾各留一段，预算各自固定（decayed 视图）。
@@ -573,32 +629,57 @@ mod tests {
     }
 
     #[test]
-    fn what_is_too_big_keeps_both_ends_and_says_how_much_went_missing() {
-        let text = format!("{}中间{}", "h".repeat(600), "t".repeat(600));
-        let printed = project(&facts(Some(&text), None), &budget(400));
-        let head = printed.find(&"h".repeat(64)).expect("头部要留着");
-        let marker = printed.find("…（中间省略").expect("要说省了多少");
-        let tail = printed.find(&"t".repeat(64)).expect("尾部也要留着");
-        assert!(
-            head < marker && marker < tail,
-            "顺序是头 → 省略 → 尾：\n{printed}"
-        );
+    fn shell_keeps_the_tail_while_other_tools_keep_the_head() {
+        let text = format!("HEAD\n{}TAIL\n", "middle\n".repeat(200));
+        let shell = project(&facts(Some(&text), None), &budget(400));
+        assert!(!shell.contains("HEAD"), "shell 不留头：{shell}");
+        assert!(shell.contains("TAIL"), "shell 要留末尾：{shell}");
 
-        // 省了多少不是随口说的：印出来的头尾加省略数，正好是原文。
-        let omitted: usize = printed
-            .split("省略 ")
-            .nth(1)
-            .and_then(|rest| rest.split(" 字节").next())
-            .and_then(|number| number.parse().ok())
-            .expect("省略数是个整数");
-        let shown = text.len() - omitted;
-        assert!(
-            text.starts_with(&printed[head..head + 64])
-                && text.ends_with(&printed[tail..tail + 64]),
-            "头尾都是原文里的那一段：\n{printed}"
-        );
-        assert!(shown <= text.len(), "{shown} > {}", text.len());
-        assert!(shown >= 300, "预算 400 摆在那儿，别只印几个字节：{shown}");
+        let ordinary = ToolResultFacts {
+            tool: "read",
+            ..facts(Some(&text), None)
+        };
+        let read = project(&ordinary, &budget(400));
+        assert!(read.contains("HEAD"), "普通工具要留开头：{read}");
+        assert!(!read.contains("TAIL"), "普通工具不留尾：{read}");
+        for printed in [shell, read] {
+            assert!(printed.contains("…（中间省略"), "{printed}");
+            assert!(printed.contains("完整输出：artifact://"), "{printed}");
+        }
+    }
+
+    #[test]
+    fn default_model_limits_match_pi() {
+        assert_eq!(DEFAULT_MODEL_RESULT_BYTES, 50 * 1024);
+        assert_eq!(MODEL_RESULT_LINES, 2000);
+    }
+
+    #[test]
+    fn byte_limits_keep_utf8_valid_at_a_single_long_line() {
+        let text = "汉".repeat(30_000);
+        let shell = truncate_tail(&text, DEFAULT_MODEL_RESULT_BYTES, MODEL_RESULT_LINES);
+        assert!(shell.head.is_empty());
+        assert!(!shell.tail.is_empty());
+        assert!(shell.tail.len() <= DEFAULT_MODEL_RESULT_BYTES);
+        assert!(shell.tail.chars().all(|ch| ch == '汉'));
+
+        let read = truncate_head(&text, DEFAULT_MODEL_RESULT_BYTES, MODEL_RESULT_LINES);
+        assert!(read.head.is_empty(), "pi 的 head 语义不返回半条首行");
+        assert_eq!(read.omitted, text.len() as u64);
+    }
+
+    #[test]
+    fn line_limit_is_independent_from_the_byte_limit() {
+        let text = (0..2_001).map(|n| format!("{n}\n")).collect::<String>();
+        let head = truncate_head(&text, usize::MAX, MODEL_RESULT_LINES);
+        assert_eq!(head.head.lines().count(), MODEL_RESULT_LINES);
+        assert!(!head.head.contains("2000\n"));
+        assert!(head.omitted > 0);
+
+        let tail = truncate_tail(&text, usize::MAX, MODEL_RESULT_LINES);
+        assert_eq!(tail.tail.lines().count(), MODEL_RESULT_LINES);
+        assert!(!tail.tail.starts_with("0\n"));
+        assert!(tail.tail.ends_with("2000\n"));
     }
 
     #[test]
@@ -660,27 +741,28 @@ mod tests {
     #[test]
     fn excerpts_cut_on_whole_lines() {
         let text = lines(200);
-        for cut in [truncate_head_tail(&text, 1000), excerpt(&text, 700, 400)] {
-            assert!(cut.omitted > 0);
-            assert!(cut.head.ends_with('\n'), "头停在行尾：{:?}", cut.head);
-            assert!(cut.head.starts_with("line 0000: "), "{:?}", cut.head);
-            let tail_start = text.len() - cut.tail.len();
-            assert!(
-                text[..tail_start].ends_with('\n') && cut.tail.starts_with("line "),
-                "尾从行首开始：{:?}",
-                cut.tail
-            );
-            assert!(cut.tail.ends_with('\n'), "{:?}", cut.tail);
-        }
-        // 预算留得下几行就是几行：51 字节一行，700 字节的头是 13 行，400 字节的尾是 7 行。
+        let head = truncate_head(&text, 1000, MODEL_RESULT_LINES);
+        assert!(head.omitted > 0);
+        assert!(head.head.ends_with('\n'), "头停在行尾：{:?}", head.head);
+        assert!(head.head.starts_with("line 0000: "), "{:?}", head.head);
+
+        let tail = truncate_tail(&text, 1000, MODEL_RESULT_LINES);
+        assert!(tail.omitted > 0);
+        assert!(
+            tail.tail.starts_with("line "),
+            "尾从行首开始：{:?}",
+            tail.tail
+        );
+        assert!(tail.tail.ends_with('\n'), "{:?}", tail.tail);
+
+        // decay 仍保留首尾，缓存策略不因 full 视图改成 pi 风格而改变。
         let cut = excerpt(&text, 700, 400);
         assert_eq!(cut.head.lines().count(), 13);
         assert_eq!(cut.tail.lines().count(), 7);
 
-        // 投影里省略那条单独占一行，不和头尾挤在一起。
+        // 投影里省略那条单独占一行，不和摘录挤在一起。
         let printed = project(&facts(Some(&text), None), &budget(1000));
-        assert!(printed.contains("\n…（中间省略 "), "{printed}");
-        assert!(!printed.contains("\n\n…（中间省略 "), "{printed}");
+        assert!(printed.contains("…（中间省略 "), "{printed}");
     }
 
     #[test]

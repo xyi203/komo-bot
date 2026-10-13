@@ -16,7 +16,6 @@ use komo_kernel::types::tool::{ToolContext, ToolError, ToolOutput};
 use serde::Serialize;
 
 use super::{CallEnv, ToolExecutor};
-use crate::codemode::OUTPUT_LIMIT;
 
 /// 脚本里调不了的：编排操作与脚本自己。
 const NOT_IN_SCRIPTS: &[&str] = &["codemode", "delegate", "dispatch", "follow"];
@@ -86,7 +85,7 @@ impl ToolExecutor {
         if !calls.is_empty() {
             text.push_str(&format!("\n（{}）", summary(&calls)));
         }
-        let text = truncate(text.trim_start(), OUTPUT_LIMIT);
+        let text = text.trim_start();
         sink.write_stdout(text.as_bytes())
             .await
             .map_err(|error| ToolError::Failed {
@@ -101,7 +100,7 @@ impl ToolExecutor {
             result: serde_json::json!({ "calls": calls, "error": outcome.error }),
             exit_code: None,
             artifacts: vec![],
-            preview: Some(text),
+            preview: Some(text.to_owned()),
         })
     }
 
@@ -204,7 +203,7 @@ fn truncate(text: &str, limit: usize) -> String {
     format!("{}…（截断）", &text[..end])
 }
 
-/// 内层调用的输出收进内存（上限同脚本输出）。
+/// 内层只读调用的完整输出收进内存；统一投影层负责限制给模型的视图。
 struct Capture {
     attempt: AttemptRef,
     bytes: Vec<u8>,
@@ -222,9 +221,7 @@ impl Capture {
 #[async_trait]
 impl OutputWriter for Capture {
     async fn write_stdout(&mut self, chunk: &[u8]) -> Result<(), StoreError> {
-        let room = OUTPUT_LIMIT.saturating_sub(self.bytes.len());
-        self.bytes
-            .extend_from_slice(&chunk[..chunk.len().min(room)]);
+        self.bytes.extend_from_slice(chunk);
         Ok(())
     }
 
@@ -244,6 +241,24 @@ impl OutputWriter for Capture {
 #[cfg(test)]
 mod tests {
     use super::join_outputs;
+
+    #[tokio::test]
+    async fn nested_output_above_one_mib_is_not_lost_before_projection() {
+        use komo_kernel::traits::OutputWriter;
+        use komo_kernel::types::ids::{AttemptId, RunId, SessionId, ToolCallId};
+        let mut capture = super::Capture::new(super::AttemptRef {
+            session: SessionId::from_raw("session"),
+            run: RunId::from_raw("run"),
+            call: ToolCallId::from_raw("call"),
+            attempt: AttemptId::from_raw("attempt"),
+        });
+        let chunk = vec![b'x'; 700_000];
+        capture.write_stdout(&chunk).await.unwrap();
+        capture.write_stdout(&chunk).await.unwrap();
+        capture.write_stdout(b"LAST").await.unwrap();
+        assert_eq!(capture.bytes.len(), 1_400_004);
+        assert!(capture.bytes.ends_with(b"LAST"));
+    }
 
     #[test]
     fn a_single_output_is_left_as_is() {

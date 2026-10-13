@@ -171,6 +171,9 @@ async fn a_big_tool_output_keeps_both_ends_and_the_uri_it_points_at_really_reads
         text_round(2, "打开了。"),
     ]]);
     gateway.stop().await;
+    // 首次请求刻意用 2 KiB 测截断；重新读单行 JSON 时恢复默认 50 KiB。
+    // pi 的 head 视图不切开长行，因此 2 KiB 无法展示这一整行。
+    std::fs::write(home.path().join("config.toml"), config_toml("")).expect("恢复默认模型输出预算");
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let run = gateway
         .submit(&session, "obs-2", "把完整输出读出来")
@@ -828,14 +831,14 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
         .expect("日志里有 context.compacted");
     assert!(
         matches!(
-            line,
+            &line,
             komo_kernel::events::ContextCompacted::Compacted {
-                summary: None,
-                summary_ref: Some(_),
+                summary: Some(stored),
+                summary_ref: None,
                 ..
-            }
+            } if stored == &summary
         ),
-        "长摘要外置，行里只留引用：{line:?}"
+        "长摘要完整内联：{line:?}"
     );
 
     // 重启 → 答 → 第二段。

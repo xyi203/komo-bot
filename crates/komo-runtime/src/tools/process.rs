@@ -23,10 +23,10 @@ use crate::executor::cancel::cancelled;
 
 /// 取消或超时后，等进程组真正消失的上限。
 const REAP_TIMEOUT: Duration = Duration::from_secs(5);
-/// 预览保留的头、尾字节数。两段加起来要装得进模型的正文预算（8 KiB）：超出时投影会在
-/// 中间再截一次，那句"省略多少字节"就只按预览算，对不上真实输出。
-const HEAD_LIMIT: usize = 3072;
-const TAIL_LIMIT: usize = 4096;
+/// 预览保留的头、尾字节数。kernel 最终按工具类型取最多 50 KiB；这里两端都至少保留同样
+/// 多的原始字节，避免工具在统一投影之前先把模型需要的那一端丢掉。
+const HEAD_LIMIT: usize = 50 * 1024;
+const TAIL_LIMIT: usize = 50 * 1024;
 
 /// 谁给这次子进程登记在册（§8.7）。
 ///
@@ -412,7 +412,7 @@ mod tests {
     #[tokio::test]
     async fn a_long_output_keeps_both_its_head_and_its_tail() {
         let outcome = run_child(
-            spec("echo SUMMARY; seq 1 5000; echo LAST"),
+            spec("echo SUMMARY; head -c 120000 /dev/zero | tr '\\0' x; echo; echo LAST"),
             &mut writer(),
             &CancelToken::new(),
         )

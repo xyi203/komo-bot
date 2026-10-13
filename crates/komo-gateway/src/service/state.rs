@@ -1024,14 +1024,17 @@ impl GatewayState {
         // 身份指令正文**进 `PayloadStore`**，快照里只留引用（§4.3）：存的是内容，不是
         // 文件路径——等待期间配置文件可能已经被改过，恢复出来的 Run 不能换一副面孔。
         // `PayloadStore` 是内容寻址的，同一段正文重复受理只写一次。
+        let payloads = PayloadStore::new(self.ledgers.paths_for(session));
         let instructions_ref = match &profile.instructions {
-            Some(text) => Some(
-                PayloadStore::new(self.ledgers.paths_for(session))
-                    .put(text.as_bytes())
-                    .await?,
-            ),
+            Some(text) => Some(payloads.put(text.as_bytes()).await?),
             None => None,
         };
+        // 项目规范文件（`AGENTS.md` 等）同一个理由：从**解析过的**工作目录往上找，正文进
+        // `PayloadStore`。Run 停着的时候文件被改了，恢复出来的那一段仍是受理时那一版；
+        // 下一条 Run 受理时再找，改动从那一条起生效。
+        let project_files_ref =
+            super::project_files::freeze(&payloads, &super::project_files::discover(&workspace))
+                .await?;
 
         Ok(RunSnapshot {
             agent_id: profile.id.clone(),
@@ -1040,6 +1043,7 @@ impl GatewayState {
             workspace,
             surface,
             instructions_ref,
+            project_files_ref,
             memory_scope: profile.memory_scope.clone(),
             projection: Some(config.execution.projection()),
             direct_command: None,
@@ -1126,7 +1130,8 @@ impl GatewayState {
             )));
         }
         // **受理这一刻冻结身份与能力**（§4.3）：哪个 Agent（这个会话的归属）、哪一版
-        // Profile、哪个模型、哪个工作目录、这次允许调用的工具、身份指令正文、记忆作用域。
+        // Profile、哪个模型、哪个工作目录、这次允许调用的工具、身份指令与项目规范的正文、
+        // 记忆作用域。
         // 它随 `run.accepted` 落账，恢复时按它装配——等待期间 Profile 被改过也换不掉
         // 这一条 Run 的面孔。
         let config = self.snapshot();

@@ -14,7 +14,7 @@ use komo_kernel::events::{
 use komo_kernel::traits::{Ledger, LedgerError, StoreError};
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
-use komo_kernel::types::refs::{INLINE_ARGUMENT_LIMIT_BYTES, PublishedOutput, ToolResultStatus};
+use komo_kernel::types::refs::{PublishedOutput, ToolResultStatus};
 use komo_kernel::types::status::{AttemptState, RunEnd, RunState, WaitReason};
 use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch};
 use time::OffsetDateTime;
@@ -166,7 +166,7 @@ impl Ledger for Coordinator {
         let run = RunId::from_raw(row.id.clone());
 
         // ② JSONL 追加 run.accepted（包含完整输入和绑定 Run ID），同步文件。
-        let (text, text_ref) = self.split_text(&input.text).await?;
+        let (text, text_ref) = Self::inline_text(&input.text);
         let accepted = self
             .append(
                 Some(run.clone()),
@@ -249,12 +249,12 @@ impl Ledger for Coordinator {
         run: &RunId,
         round: AssistantRound,
     ) -> Result<Vec<ToolCallId>, LedgerError> {
-        // ① 大消息或大参数先持久保存到 payloads（如有）。
+        // ① 新正文与参数完整内联；已有引用保留兼容。
         let (text, text_ref) = match (&round.text, &round.text_ref) {
-            (Some(text), None) => self.split_text(text).await?,
+            (Some(text), None) => Self::inline_text(text),
             (text, reference) => (text.clone(), reference.clone()),
         };
-        let tool_calls = self.externalize_arguments(&round.tool_calls).await?;
+        let tool_calls = Self::inline_arguments(&round.tool_calls);
         let ids: Vec<ToolCallId> = tool_calls.iter().map(|c| c.call_id.clone()).collect();
 
         // ② JSONL 写入完整 assistant 事件与全部调用计划的内联内容或引用，同步文件。
@@ -340,15 +340,9 @@ impl Ledger for Coordinator {
         let row = self.run_of_call(call).await?;
         let run = RunId::from_raw(row.run_id.clone());
 
-        // ① 需要外置的准备计划先持久保存。
-        let encoded = serde_json::to_vec(plan)
-            .map_err(|e| LedgerError::Persist(format!("计划序列化失败：{e}")))?;
-        let (inline, plan_ref) = if encoded.len() <= INLINE_ARGUMENT_LIMIT_BYTES {
-            (Some(Box::new(plan.clone())), None)
-        } else {
-            let reference = self.payloads.put(&encoded).await.map_err(store_to_ledger)?;
-            (None, Some(reference))
-        };
+        // ① 新事件完整内联准备计划；`plan_ref` 只用于读取旧日志。
+        let inline = Some(Box::new(plan.clone()));
+        let plan_ref = None;
 
         // ② JSONL 追加 tool.planned 并同步。
         let appended = self
@@ -409,8 +403,7 @@ impl Ledger for Coordinator {
         attempt: &AttemptId,
         published: PublishedOutput,
     ) -> Result<(), LedgerError> {
-        // 输出已由 ToolOutputStore 发布；这里只写元信息与引用（§8.3：JSONL 的
-        // tool.result 只保留状态、耗时等元信息、output_ref 和最多 1 KiB 的预览）。
+        // 输出已发布；JSONL 同时保存完整结构化正文与流引用，预览只是界面摘要。
         let attempt_row = {
             let id = attempt.to_string();
             self.db
@@ -438,6 +431,7 @@ impl Ledger for Coordinator {
             .append(
                 Some(run),
                 EventPayload::ToolResult(ToolResult {
+                    body: published.body.clone(),
                     call_id: call.clone(),
                     attempt_id: attempt.clone(),
                     status: published.status,
@@ -478,6 +472,7 @@ impl Ledger for Coordinator {
             .append(
                 Some(run),
                 EventPayload::ToolResult(ToolResult {
+                    body: published.body.clone(),
                     call_id: call.clone(),
                     attempt_id: attempt.clone(),
                     status: published.status,
@@ -531,7 +526,7 @@ impl Ledger for Coordinator {
                 rounds,
             } => {
                 let (text, text_ref) = match final_message {
-                    Some(text) => self.split_text(text).await?,
+                    Some(text) => Self::inline_text(text),
                     None => (None, None),
                 };
                 (
@@ -765,7 +760,7 @@ impl Ledger for Coordinator {
                 debt,
                 usage,
             } => {
-                let (summary, summary_ref) = self.split_text(&summary).await?;
+                let (summary, summary_ref) = Self::inline_text(&summary);
                 ContextCompacted::Compacted {
                     first_kept,
                     summary,
@@ -931,7 +926,9 @@ mod tests {
     use komo_kernel::types::ids::RequestKey;
     use komo_kernel::types::model::TokenUsage;
     use komo_kernel::types::plan::PlanSource;
-    use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultBody};
+    use komo_kernel::types::refs::{
+        ContentRef, INLINE_ARGUMENT_LIMIT_BYTES, OutputRef, ToolResultBody,
+    };
     use komo_kernel::types::status::{RetryCause, RunState, WaitReason};
     use komo_kernel::types::turn::ToolCallRequest;
 
@@ -1011,6 +1008,7 @@ mod tests {
 
     fn published() -> PublishedOutput {
         PublishedOutput {
+            body: None,
             output: OutputRef(ContentRef {
                 path: "tool-output/r/c/a/output.json".into(),
                 size: 2,
@@ -1470,31 +1468,39 @@ mod tests {
         );
     }
 
-    /// 超限正文外置到 `payloads/`，JSONL 里只留引用（§8.3）。
+    /// 超限正文完整留在 JSONL，重开账本仍能原样恢复。
     #[tokio::test]
-    async fn an_oversized_body_is_externalised_and_the_reference_verifies() {
-        let f = fixture().await;
+    async fn an_oversized_body_is_inline_and_survives_reopen() {
+        let Fixture {
+            _dir,
+            db,
+            clock,
+            session,
+            coordinator,
+        } = fixture().await;
         let big = "汉".repeat(INLINE_ARGUMENT_LIMIT_BYTES);
-        let accepted = f
-            .coordinator
-            .accept_input(input("api:big", &big, &f.session))
+        coordinator
+            .accept_input(input("api:big", &big, &session))
             .await
             .unwrap();
-        let _ = accepted;
+        let sessions_root = coordinator.paths().root().parent().unwrap().to_path_buf();
+        drop(coordinator);
+        let coordinator =
+            Coordinator::open(db, sessions_root, session.clone(), "api", Arc::new(clock))
+                .await
+                .unwrap();
 
-        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let batch = coordinator.read(&session, Seq::ZERO, 0).await.unwrap();
         let EventPayload::RunAccepted(body) = &batch.events[0].payload else {
             panic!()
         };
-        assert!(body.text.is_none(), "大正文不内联");
-        let reference = body.text_ref.clone().expect("有引用");
-        let bytes = f.coordinator.payloads().open(&reference).await.unwrap();
-        assert_eq!(String::from_utf8(bytes).unwrap(), big);
+        assert_eq!(body.text.as_deref(), Some(big.as_str()));
+        assert_eq!(body.text_ref, None);
     }
 
-    /// 超限的摘要外置到 `payloads/`，JSONL 那一行只留引用；短的照样内联（§8.3）。
+    /// 超限摘要与短摘要一样完整内联。
     #[tokio::test]
-    async fn a_long_summary_goes_to_payloads_and_the_line_holds_the_ref() {
+    async fn summaries_are_always_inline() {
         use komo_kernel::test_support::compacted;
         let f = fixture().await;
         let run = f
@@ -1532,45 +1538,13 @@ mod tests {
                 other => panic!("不是压缩事件：{other:?}"),
             }
         };
-        let (summary, reference) = body(long);
-        assert!(summary.is_none(), "大摘要不内联");
-        let bytes = f
-            .coordinator
-            .payloads()
-            .open(&reference.expect("有引用"))
-            .await
-            .unwrap();
-        assert_eq!(String::from_utf8(bytes).unwrap(), big);
+        assert_eq!(body(long), (Some(big), None));
         assert_eq!(body(short), (Some("短摘要".into()), None));
     }
 
-    /// 写入顺序：外置正文没落盘，那一行就不写（§8.5）。
+    /// 超限调用参数保持原始 JSON 完整内联。
     #[tokio::test]
-    async fn a_summary_that_cannot_be_externalised_writes_no_line() {
-        let f = fixture().await;
-        let run = f
-            .coordinator
-            .accept_input(input("api:compact", "分两步做", &f.session))
-            .await
-            .unwrap()
-            .run;
-        let before = types(&f.coordinator, &f.session).await;
-        // `payloads` 的位置上放一个普通文件：目录建不出来，正文写不进去。
-        let payloads = f.coordinator.paths().payloads();
-        let _ = std::fs::remove_dir_all(&payloads);
-        std::fs::write(&payloads, b"").unwrap();
-
-        let big = "摘".repeat(INLINE_ARGUMENT_LIMIT_BYTES);
-        f.coordinator
-            .record_compaction(&run, komo_kernel::test_support::compacted(Seq(3), big))
-            .await
-            .expect_err("正文写不进去");
-        assert_eq!(types(&f.coordinator, &f.session).await, before);
-    }
-
-    /// 超限的调用参数外置，`arguments_ref` 指向文件内的对应字段（§8.3）。
-    #[tokio::test]
-    async fn oversized_arguments_are_externalised_with_a_pointer() {
+    async fn oversized_arguments_are_inline() {
         let f = fixture().await;
         let accepted = f
             .coordinator
@@ -1589,17 +1563,38 @@ mod tests {
             panic!()
         };
         let stored = &body.tool_calls[0];
-        assert!(stored.arguments.is_null());
-        let reference = stored.arguments_ref.clone().expect("有引用");
-        assert_eq!(
-            reference.0.pointer.as_deref(),
-            Some("/tool_calls/0/arguments")
-        );
-        let bytes = f.coordinator.payloads().open(&reference).await.unwrap();
-        assert_eq!(
-            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
-            request.arguments
-        );
+        assert_eq!(stored.arguments, request.arguments);
+        assert_eq!(stored.arguments_ref, None);
+    }
+
+    #[tokio::test]
+    async fn oversized_execution_plans_are_inline() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:plan", "跑一下", &f.session))
+            .await
+            .unwrap();
+        let calls = f
+            .coordinator
+            .record_round(&accepted.run, round(1, vec![call("call-plan")]))
+            .await
+            .unwrap();
+        let mut plan = sample_plan("shell", &f.session);
+        plan.args = serde_json::json!({"command": "x".repeat(INLINE_ARGUMENT_LIMIT_BYTES)});
+        f.coordinator.plan_call(&calls[0], &plan).await.unwrap();
+
+        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let body = batch
+            .events
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::ToolPlanned(body) => Some(body),
+                _ => None,
+            })
+            .expect("tool.planned");
+        assert_eq!(body.plan.as_deref(), Some(&plan));
+        assert_eq!(body.plan_ref, None);
     }
 
     /// 验收 ⑧：`read` 的分页语义与 `MemLedger` 一致——`next=None` 就是读到头了。
@@ -1765,6 +1760,53 @@ mod tests {
         assert_eq!(
             types(&f.coordinator, &f.session).await.last().unwrap(),
             "run.waiting"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_result_keeps_its_complete_body_in_jsonl() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:full-body", "运行", &f.session))
+            .await
+            .unwrap();
+        let ids = f
+            .coordinator
+            .record_round(&accepted.run, round(1, vec![call("full-body")]))
+            .await
+            .unwrap();
+        let plan = sample_plan("shell", &f.session);
+        f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
+        let attempt = f.coordinator.start_call(&ids[0], &plan).await.unwrap();
+        let full_text = "汉".repeat(30_000);
+        let body = komo_kernel::types::refs::ToolResultBody {
+            status: ToolResultStatus::Completed,
+            result: serde_json::json!({"text": full_text}),
+            error: None,
+            exit_code: Some(0),
+            artifacts: vec![],
+            preview: Some(full_text.clone()),
+        };
+        let mut output = published();
+        output.body = Some(Box::new(body.clone()));
+        f.coordinator.finish_call(&attempt, output).await.unwrap();
+        let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
+        let event = batch
+            .events
+            .iter()
+            .find_map(|event| match &event.payload {
+                EventPayload::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(event.body.as_deref(), Some(&body));
+        let jsonl = tokio::fs::read_to_string(f.coordinator.paths.events())
+            .await
+            .unwrap();
+        assert!(
+            jsonl.contains(&full_text),
+            "JSONL 保留超过模型预算的完整正文"
         );
     }
 

@@ -600,6 +600,7 @@ mod tests {
             .finish_call(
                 &attempt,
                 PublishedOutput {
+                    body: None,
                     output: OutputRef(ContentRef {
                         path: "tool-output/r/c/a/output.json".into(),
                         size: 2,
@@ -1064,6 +1065,7 @@ mod tests {
                 &ids[0],
                 &unstarted,
                 PublishedOutput {
+                    body: None,
                     output: OutputRef(ContentRef {
                         path: "tool-output/r/c/b/output.json".into(),
                         size: 2,

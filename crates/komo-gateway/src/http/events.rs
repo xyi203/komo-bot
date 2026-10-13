@@ -50,11 +50,15 @@ pub async fn stream(
     );
 
     if !wants_stream {
-        let batch = api
+        let mut batch = api
             .state
             .routed
             .read(&session, from, query.limit.unwrap_or(PAGE))
             .await?;
+        let payloads = komo_store::PayloadStore::new(api.state.ledgers.paths_for(&session));
+        for event in &mut batch.events {
+            payloads.hydrate_event(event).await?;
+        }
         let next = batch.events.last().map(|event| event.seq).unwrap_or(from);
         return Ok(Json(EventPage {
             session: batch.session,
@@ -96,7 +100,9 @@ async fn backfill(api: &Api, session: &SessionId, from: Seq) -> ApiResult<Vec<Ss
         if batch.events.is_empty() {
             return Ok(out);
         }
-        for event in batch.events {
+        let payloads = komo_store::PayloadStore::new(api.state.ledgers.paths_for(session));
+        for mut event in batch.events {
+            payloads.hydrate_event(&mut event).await?;
             cursor = cursor.max(event.seq);
             out.push(SseFrame {
                 id: event.seq,

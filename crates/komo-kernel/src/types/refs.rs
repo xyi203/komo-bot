@@ -62,9 +62,8 @@ pub struct ToolResultBody {
     pub artifacts: Vec<ContentRef>,
     /// 工具写给模型看的那段正文（§8.3）。
     ///
-    /// **JSONL 里的 `tool.result` 只留它的前 1 KiB**（行要小），完整这一份在 `output.json`
-    /// 里。模型上下文的投影读的是这一份，不是那个 1 KiB 的副本——否则"给模型多少"就被
-    /// 账本的存储预算绑死了，而那是两件事。
+    /// 完整正文保存在 JSONL 的 body 与 output.json；模型上下文统一投影，
+    /// 界面摘要不限制完整事实。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
 }
@@ -82,6 +81,9 @@ pub enum ToolResultStatus {
 /// 追加 `tool.result`（§8.5）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishedOutput {
+    /// 完整结构化结果写入 JSONL；stdout/stderr 全流仍通过文件引用读取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Box<ToolResultBody>>,
     pub output: OutputRef,
     pub status: ToolResultStatus,
     /// 实际执行耗时，毫秒。

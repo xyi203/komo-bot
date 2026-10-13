@@ -307,6 +307,64 @@ async fn editing_a_profile_leaves_a_run_in_flight_on_its_own_version() {
     gateway.stop().await;
 }
 
+// ---------------------------------------------------------------- 项目规范同样受理时冻结
+
+/// 工作目录里的 `AGENTS.md` 进主 Agent 的提示；Run 在飞时它被改了，续跑那一段仍是
+/// **受理时**那一版，下一条 Run 受理时才读到新的。
+#[tokio::test]
+async fn project_files_are_frozen_at_acceptance_like_the_profile() {
+    const OLD: &str = "仓库规范第一版：先读再改。";
+    const NEW: &str = "仓库规范第二版：改完跑测试。";
+    let home = Home::with_config(&versioned(FIRST));
+    home.install_tools(vec![Unsure::new().tool()]);
+    let llm = FakeLlm::new(vec![
+        vec![call_round(1, "pc-sh", "unsure", serde_json::json!({}))],
+        vec![text_round(2, "跑完了。")],
+        vec![text_round(1, "好。")],
+    ]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    // `workspaces/` 由 Gateway 启动时建好；规范写在它里面（会话没有 workdir、Profile
+    // 没写 workspace 时就是这个目录）。
+    let agents_md = home.workspace().join("AGENTS.md");
+    std::fs::write(&agents_md, OLD).expect("写 AGENTS.md");
+    let session = gateway.state().default_main_session().await.unwrap();
+
+    let run = gateway.submit(&session, "project-1", "跑一下").await.run;
+    let pending = gateway.wait_intervention(&run).await;
+    std::fs::write(&agents_md, NEW).expect("改 AGENTS.md");
+    gateway.answer(&pending.handle, "satisfied").await;
+    let detail = gateway.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let next = gateway.submit(&session, "project-2", "再说一句").await.run;
+    gateway.wait_terminal(&next).await;
+
+    let prompts: Vec<String> = llm
+        .requests
+        .lock()
+        .expect("脚本模型")
+        .iter()
+        .map(|request| request.system_prompt.clone())
+        .collect();
+    let with_old: Vec<&String> = prompts.iter().filter(|p| p.contains(OLD)).collect();
+    let with_new: Vec<&String> = prompts.iter().filter(|p| p.contains(NEW)).collect();
+    assert_eq!(
+        with_old.len(),
+        2,
+        "第一段与续跑段都用受理时那一版：{prompts:#?}"
+    );
+    assert!(
+        with_old
+            .iter()
+            .all(|prompt| prompt.contains("<project_instructions path=")),
+        "{with_old:#?}"
+    );
+    assert_eq!(with_new.len(), 1, "新受理的那一条读到新版：{prompts:#?}");
+    assert!(!with_new[0].contains(OLD), "{}", with_new[0]);
+
+    gateway.stop().await;
+}
+
 // ---------------------------------------------------------------- 重启之后仍然用它自己那一版
 
 /// 重启 Gateway 恢复同一条 Run：身份来自**它自己的 `run.accepted`**，不是重启后磁盘上

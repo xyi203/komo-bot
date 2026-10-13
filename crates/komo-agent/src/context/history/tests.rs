@@ -280,6 +280,7 @@ fn a_replayed_round_names_the_artifacts_it_produced() {
             4,
             &run,
             EventPayload::ToolResult(komo_kernel::events::ToolResult {
+                body: None,
                 call_id: call.clone(),
                 attempt_id: AttemptId::from_raw("attempt-1"),
                 status: ToolResultStatus::Completed,
@@ -524,6 +525,7 @@ fn replayed_after(
             4,
             &run,
             EventPayload::ToolResult(komo_kernel::events::ToolResult {
+                body: None,
                 call_id: call.clone(),
                 attempt_id: AttemptId::from_raw("attempt-1"),
                 status: ToolResultStatus::Completed,
@@ -641,6 +643,7 @@ fn result(run: &RunId, seq: u64, call: &ToolCallId, preview: &str) -> Event {
         seq,
         run,
         EventPayload::ToolResult(komo_kernel::events::ToolResult {
+            body: None,
             call_id: call.clone(),
             attempt_id: AttemptId::from_raw(format!("attempt-{seq}")),
             status: ToolResultStatus::Completed,

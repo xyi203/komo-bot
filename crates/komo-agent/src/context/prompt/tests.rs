@@ -15,6 +15,7 @@ fn the_system_prompt_names_the_workspace_and_leaves_tools_to_the_schema() {
         Path::new("/tmp/w"),
         &["read".to_string()],
         &InvocationContext::Main,
+        &[],
         None,
     );
     assert!(prompt.contains("/tmp/w"), "{prompt}");
@@ -39,6 +40,7 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
         Path::new("/tmp/w"),
         &tools,
         &InvocationContext::Main,
+        &[],
         Some(&catalog),
     );
     assert!(
@@ -47,7 +49,13 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
     );
     assert!(prompt.contains("你是 komo"), "{prompt}");
 
-    let bare = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
+    let bare = build(
+        Path::new("/tmp/w"),
+        &tools,
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
     assert!(!bare.contains("Skills"), "{bare}");
     assert_eq!(bare.lines().count(), 4, "{bare}");
 }
@@ -57,12 +65,19 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
 #[test]
 fn both_prompts_tell_the_model_to_search_with_rg() {
     let tools = vec!["rg".to_string()];
-    let main = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
+    let main = build(
+        Path::new("/tmp/w"),
+        &tools,
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
     assert!(main.contains("别用 shell 拼 grep"), "{main}");
     let without_rg = build(
         Path::new("/tmp/w"),
         &["read".to_string()],
         &InvocationContext::Main,
+        &[],
         None,
     );
     assert!(!without_rg.contains("rg"), "{without_rg}");
@@ -76,6 +91,7 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
         Path::new("/tmp/w"),
         &tools,
         &InvocationContext::Delegated(spec),
+        &[],
         None,
     );
     assert!(sub.contains("别用 shell 拼 grep"), "{sub}");
@@ -85,7 +101,13 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
 #[test]
 fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
     let tools = vec!["read".to_string(), UPDATE_PLAN_TOOL.to_string()];
-    let main = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
+    let main = build(
+        Path::new("/tmp/w"),
+        &tools,
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
     assert!(main.contains("update_plan 登记计划"), "{main}");
     let sub = build(
         Path::new("/tmp/w"),
@@ -95,6 +117,7 @@ fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
             ToolCallId::from_raw("call-1"),
             "查一下调用方",
         )),
+        &[],
         None,
     );
     assert!(sub.contains("update_plan 登记计划"), "{sub}");
@@ -102,6 +125,7 @@ fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
         Path::new("/tmp/w"),
         &["read".to_string()],
         &InvocationContext::Main,
+        &[],
         None,
     );
     assert!(!without.contains("update_plan"), "{without}");
@@ -126,6 +150,7 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
         Path::new("/tmp/w"),
         &tools,
         &InvocationContext::Main,
+        &[],
         Some(&catalog),
     );
     assert!(prompt.contains("komo 自己的状态"), "{prompt}");
@@ -140,6 +165,7 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
             Path::new("/tmp/w"),
             &tools,
             &InvocationContext::Main,
+            &[],
             Some(&catalog),
         ),
         "同一份输入逐字相同（提示前缀缓存）"
@@ -154,6 +180,7 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
         Path::new("/tmp/w"),
         &["dispatch".to_string(), "follow".to_string()],
         &InvocationContext::Main,
+        &[],
         None,
     );
     assert!(!dispatcher.contains("komo 自己的状态"), "{dispatcher}");
@@ -167,6 +194,7 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
         Path::new("/tmp/w"),
         &["shell".to_string()],
         &InvocationContext::Delegated(spec),
+        &[],
         None,
     );
     assert!(!sub.contains("komo 自己的状态"), "{sub}");
@@ -176,7 +204,13 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
 #[test]
 fn both_prompts_steer_batched_reads_to_codemode_only_when_it_is_mounted() {
     let tools = vec!["read".to_string(), "codemode".to_string()];
-    let main = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
+    let main = build(
+        Path::new("/tmp/w"),
+        &tools,
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
     assert!(main.contains("用 codemode 写一段脚本一次做完"), "{main}");
     let sub = build(
         Path::new("/tmp/w"),
@@ -186,6 +220,7 @@ fn both_prompts_steer_batched_reads_to_codemode_only_when_it_is_mounted() {
             ToolCallId::from_raw("call-1"),
             "查一下调用方",
         )),
+        &[],
         None,
     );
     assert!(sub.contains("用 codemode 写一段脚本一次做完"), "{sub}");
@@ -193,6 +228,7 @@ fn both_prompts_steer_batched_reads_to_codemode_only_when_it_is_mounted() {
         Path::new("/tmp/w"),
         &["read".to_string(), "rg".to_string()],
         &InvocationContext::Main,
+        &[],
         None,
     );
     assert!(!without.contains("codemode"), "{without}");
@@ -205,11 +241,95 @@ fn the_read_over_cat_rule_needs_both_read_and_shell() {
         Path::new("/tmp/w"),
         &["read".to_string(), "shell".to_string()],
         &InvocationContext::Main,
+        &[],
         None,
     );
     assert!(both.contains("看文件用 read"), "{both}");
     for tools in [vec!["read".to_string()], vec!["shell".to_string()]] {
-        let prompt = build(Path::new("/tmp/w"), &tools, &InvocationContext::Main, None);
+        let prompt = build(
+            Path::new("/tmp/w"),
+            &tools,
+            &InvocationContext::Main,
+            &[],
+            None,
+        );
         assert!(!prompt.contains("看文件用 read"), "{prompt}");
     }
+}
+
+fn project_file(path: &str, content: &str) -> ProjectFile {
+    ProjectFile {
+        path: path.into(),
+        content: content.into(),
+    }
+}
+
+/// 项目规范排在 komo 自查之后、skills 目录之前，按给的顺序（外层在前）原样包进
+/// `<project_instructions>`；文件末尾的换行不多留一个空行。
+#[test]
+fn the_main_prompt_puts_project_files_between_the_komo_section_and_skills() {
+    let tools = vec!["read".to_string(), "shell".to_string()];
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("pr-review")).unwrap();
+    std::fs::write(
+        dir.path().join("pr-review").join("SKILL.md"),
+        "---\nname: pr-review\ndescription: 怎么审一个 PR\n---\n正文",
+    )
+    .unwrap();
+    let catalog = SkillRegistry::new(vec![dir.path().to_path_buf()])
+        .offer(&OfferContext::here(tools.clone()));
+    let files = [
+        project_file("/code/AGENTS.md", "外层规范\n"),
+        project_file("/code/repo/AGENTS.md", "仓库规范"),
+    ];
+
+    let prompt = build(
+        Path::new("/code/repo"),
+        &tools,
+        &InvocationContext::Main,
+        &files,
+        Some(&catalog),
+    );
+    let own = prompt.find("komo 自己的状态").unwrap();
+    let outer = prompt
+        .find("<project_instructions path=\"/code/AGENTS.md\">\n外层规范\n</project_instructions>")
+        .expect("外层那一份原样在提示里");
+    let inner = prompt
+        .find("<project_instructions path=\"/code/repo/AGENTS.md\">\n仓库规范\n</project_instructions>")
+        .expect("工作目录那一份原样在提示里");
+    let skills = prompt.find("pr-review").unwrap();
+    assert!(own < outer && outer < inner && inner < skills, "{prompt}");
+}
+
+/// 子代理只看得见任务（§4）：给了也不渲染。没有、或者正文全是空白时，主 Agent 的提示里
+/// 也一个字都不多。
+#[test]
+fn project_files_reach_only_the_main_prompt_and_only_when_non_blank() {
+    let tools = vec!["read".to_string()];
+    let files = [project_file("/w/AGENTS.md", "先读再改。")];
+    let spec = DelegateSpec::new(
+        RunId::from_raw("run-1"),
+        ToolCallId::from_raw("call-1"),
+        "查一下调用方",
+    );
+    let sub = build(
+        Path::new("/w"),
+        &tools,
+        &InvocationContext::Delegated(spec),
+        &files,
+        None,
+    );
+    assert!(!sub.contains("先读再改"), "{sub}");
+    assert!(!sub.contains("project_instructions"), "{sub}");
+
+    let bare = build(Path::new("/w"), &tools, &InvocationContext::Main, &[], None);
+    let blank = build(
+        Path::new("/w"),
+        &tools,
+        &InvocationContext::Main,
+        &[project_file("/w/AGENTS.md", " \n\n")],
+        None,
+    );
+    assert_eq!(blank, bare, "空白的规范文件不留空标题");
+    assert!(!bare.contains("项目规范"), "{bare}");
 }

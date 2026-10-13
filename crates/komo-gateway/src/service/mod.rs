@@ -19,6 +19,7 @@ pub mod cron_watch;
 pub mod interventions;
 pub mod ledgers;
 pub mod lifecycle;
+pub(crate) mod project_files;
 pub mod run_watch;
 pub mod segment;
 pub mod state;

@@ -444,8 +444,8 @@ impl SegmentSource for GatewaySegments {
 
         // 交给模型的 Schema 是**能力面**渲染出来的（§4 末）：一个来源，两处用——执行器查的
         // 是同一份 `AgentSurface`（`CallEnv::surface`）。两边各拿一份就会出现"schema 里没有
-        // 这个名字、执行器却查得到"。tool definitions 要先算好——系统提示要列工具名，skills
-        // 门控也按它（§16）。
+        // 这个名字、执行器却查得到"。tool definitions 要先算好——系统提示的 RULES 按它挑
+        // 规则，skills 门控也按它（§16）。
         let tools = match &self.executor {
             Some(executor) => executor.definitions_for(&identity.surface),
             // 精简装配（没有执行器）：目录里这一段允许的那些就是 Schema——判据还是那一份
@@ -462,6 +462,12 @@ impl SegmentSource for GatewaySegments {
         let skills = match &delegate {
             Some(_) => None,
             None => context_sources::skill_catalog(self.skills.as_deref(), &tool_names),
+        };
+        // 项目规范（`AGENTS.md` 等）同样只给主 Agent：子代理的快照继承自父，里面那一份
+        // 不能顺着带过去——子代理只看得见任务（§4），要规范就由父侧写进任务里。
+        let project_files = match &delegate {
+            Some(_) => Vec::new(),
+            None => identity.project_files.clone(),
         };
 
         // history 的纯逻辑先选窗口（`komo-agent`），再对**选中的**条目读正文与
@@ -487,6 +493,7 @@ impl SegmentSource for GatewaySegments {
         // 以外的那些留成模板：在线压缩一轮收尾之后重新装配时原样再用（§6）。
         let template = compaction::ContextTemplate {
             instructions: identity.instructions.clone(),
+            project_files,
             workspace: cwd.clone(),
             tools: tool_names,
             memory: injection.text.clone(),

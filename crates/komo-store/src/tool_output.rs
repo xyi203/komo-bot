@@ -278,6 +278,7 @@ impl ToolOutputStore for FileToolOutputStore {
         sync_dir(&dir).await?;
 
         Ok(PublishedOutput {
+            body: Some(Box::new(document.body.clone())),
             output: OutputRef(ContentRef {
                 path: format!("{relative}/output.json"),
                 size: bytes.len() as u64,

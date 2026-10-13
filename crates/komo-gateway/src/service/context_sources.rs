@@ -27,7 +27,7 @@ use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::traits::{LedgerError, ToolOutputStore};
-use komo_kernel::types::agent::RunSnapshot;
+use komo_kernel::types::agent::{ProjectFile, RunSnapshot};
 use komo_kernel::types::ids::RunId;
 use komo_kernel::types::memory::{Injection, MemoryScope};
 use komo_kernel::types::model::ModelConfig;
@@ -55,6 +55,9 @@ pub(crate) struct Identity {
     pub workspace: PathBuf,
     /// 身份指令正文（按引用读回来的那一份）。
     pub instructions: Option<String>,
+    /// 项目规范文件（`AGENTS.md` 等），外层在前。冻结路径按引用读回；兜底路径受理时
+    /// 没找过，现场找一遍（见 [`ambient_identity`]）。
+    pub project_files: Vec<ProjectFile>,
     /// 记忆作用域（§9.2）。
     pub memory_scope: Option<MemoryScope>,
     /// 冻结的投影设置；`None` = 没有快照或快照早于这一格，调用方按当前配置。
@@ -108,6 +111,11 @@ pub(crate) async fn identity_for(
         }
         None => None,
     };
+    // 项目规范同理：按引用读回受理时那一版，读不出来照样停下来，不现场再找。
+    let project_files = match &frozen.project_files_ref {
+        Some(reference) => super::project_files::thaw(payloads, reference).await?,
+        None => Vec::new(),
+    };
     Ok(Identity {
         agent_id: frozen.agent_id,
         model: Some(frozen.model),
@@ -116,6 +124,7 @@ pub(crate) async fn identity_for(
         // 也只会把还不存在的那几段按字面接回去）。
         workspace: paths::real_root(&frozen.workspace),
         instructions,
+        project_files,
         memory_scope: frozen.memory_scope,
         projection: frozen.projection,
         direct_command: frozen.direct_command,
@@ -154,6 +163,7 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         .map(PathBuf::from)
         .or_else(|| profile.and_then(|profile| profile.workspace.clone()))
         .unwrap_or_else(|| fallback.workspaces.to_path_buf());
+    let workspace = paths::real_root(&workspace);
     Identity {
         agent_id: profile
             .map(|profile| profile.id.clone())
@@ -161,7 +171,9 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         // 模型这一格留空：调用方回落到 `runs.model_snapshot`（受理时写下的那一份）。
         model: None,
         surface,
-        workspace: paths::real_root(&workspace),
+        // 与指令读当前配置同一个口径：没有快照就按现在的磁盘。
+        project_files: super::project_files::discover(&workspace),
+        workspace,
         instructions: profile.and_then(|profile| profile.instructions.clone()),
         memory_scope: profile.and_then(|profile| profile.memory_scope.clone()),
         projection: None,
@@ -398,6 +410,7 @@ mod tests {
         let resolved = resolve_history(selected, payloads, None).await?;
         Ok(assemble(ContextInput {
             instructions: None,
+            project_files: Vec::new(),
             workspace: PathBuf::from("/work"),
             tools: Vec::new(),
             history: resolved,

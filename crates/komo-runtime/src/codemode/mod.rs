@@ -32,9 +32,6 @@ use unsupported::Jail;
 
 const DRIVER: &str = include_str!("driver.py");
 
-/// 脚本输出（`text()` + console）的上限。
-pub const OUTPUT_LIMIT: usize = 1024 * 1024;
-
 /// 一份可用的沙箱：解释器 + 为它生成、自检通过的约束（Seatbelt 配置 / Landlock + seccomp）。
 #[derive(Debug, Clone)]
 pub struct Sandbox {

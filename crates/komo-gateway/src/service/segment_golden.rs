@@ -106,6 +106,7 @@ async fn render(case: &Case) -> String {
     let memory = komo_agent::context::memory::render(&case.memories, 1_000).text;
     let context = assemble(ContextInput {
         instructions: case.instructions.map(str::to_string),
+        project_files: Vec::new(),
         workspace: std::path::PathBuf::from(CWD),
         tools: tool_names,
         history: resolved,
@@ -601,6 +602,7 @@ fn result(
         seq,
         Some(run),
         EventPayload::ToolResult(komo_kernel::events::ToolResult {
+            body: None,
             call_id: call.clone(),
             attempt_id: AttemptId::from_raw(attempt),
             status,

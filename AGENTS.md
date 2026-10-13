@@ -86,11 +86,13 @@ depends on `agent`; `client` knows only protocol types.
   settles as `uncertain` with the partial output it left on disk and goes to
   the model — the executor never silently re-runs it.
 - **Tool result 的模型视图只有一处投影**（`komo-kernel/src/projection.rs`）。输入只有落盘的
-  事实（`tool.result` 事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"重启后回放"
-  必须逐字节相同。账本里那 ≤1 KiB 是**行预算**，交给模型多少由 `[execution]
-  model_result_bytes` 定（§6）。当前 Session 的 `tool-output/` 与 `artifacts/` 是**只读根**：
-  正文里那句"完整输出在哪"必须真的能 `read`。大结果给哪个视图由 `projection.rs` 的
-  `select` 按 `context.compacted` 的 `decayed` 记下的集合选；换不换由缓存账决定（`compaction::decide`），前缀默认只追加。
+  事实（完整 JSONL 事件 + `output.json` / stdout / stderr 引用；旧行的 `text_ref` 与 ≤1 KiB
+  `preview` 只作兼容读取），所以"刚跑完"与"重启后回放"必须逐字节相同。full 视图默认最多
+  50 KiB 或 2000 行（二者先到）：`shell` / `bash` 留尾，其他工具留头；超限时必须给出可
+  `read` 的完整 `artifact://` 引用。`[execution] model_result_bytes` 可收紧字节预算；当前
+  Session 的 `tool-output/` 与 `artifacts/` 是只读根。大结果给哪个视图由 `projection.rs` 的
+  `select` 按 `context.compacted` 的 `decayed` 记下的集合选；decay 只改模型视图，不改完整
+  记录，换不换仍由缓存账决定（`compaction::decide`），前缀默认只追加。
 - **Channel identity lives in config, not the db** (§11.2): `allow_from` /
   `home_chat` / `groups` in `config.toml`, credentials in `.env`. No pairing
   table, no `/sethome`.

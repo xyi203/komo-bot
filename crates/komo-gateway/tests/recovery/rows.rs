@@ -1296,6 +1296,7 @@ fn append_tool_result(
         run: Some(run.clone()),
         ts: time::OffsetDateTime::now_utc(),
         payload: komo_kernel::events::EventPayload::ToolResult(komo_kernel::events::ToolResult {
+            body: None,
             call_id: started.call_id.clone(),
             attempt_id: started.attempt_id.clone(),
             status: komo_kernel::types::refs::ToolResultStatus::Completed,

@@ -323,6 +323,7 @@ impl Ledger for MemLedger {
             &entry.session,
             Some(entry.run),
             EventPayload::ToolResult(ToolResult {
+                body: published.body.clone(),
                 call_id: call,
                 attempt_id: attempt.clone(),
                 status: published.status,
@@ -363,6 +364,7 @@ impl Ledger for MemLedger {
             &entry.session,
             Some(entry.run),
             EventPayload::ToolResult(ToolResult {
+                body: published.body.clone(),
                 call_id: call.clone(),
                 attempt_id: attempt.clone(),
                 status: published.status,

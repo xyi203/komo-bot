@@ -1,12 +1,11 @@
-//! `sessions/<id>/payloads/`：超限的模型消息或执行计划正文（§8.3）。
+//! `sessions/<id>/payloads/`：读取历史事件里的外置正文或执行计划。
 //!
-//! JSONL 只保留引用与内容哈希；**同一参数不再另存重复全文**——所以文件按内容哈希命名，
-//! 写第二遍就是同一个文件。
-//!
-//! 单次参数超过 [`INLINE_ARGUMENT_LIMIT_BYTES`]（4 KiB）时外置，较大的准备计划同样外置。
-//! 引用里带相对该 Session 目录的受控路径、大小、内容哈希，以及必要的字段定位
+//! 新事件把模型消息、参数和准备计划完整写进 JSONL；这里保留按内容哈希寻址的读写能力，
+//! 供旧 `text_ref` / `arguments_ref` / `plan_ref` 日志恢复与客户端出站补全使用。引用里带
+//! 相对该 Session 目录的受控路径、大小、内容哈希，以及必要的字段定位
 //! （[`ContentRef::pointer`]）。
 
+use komo_kernel::events::{ContextCompacted, Event, EventPayload};
 use komo_kernel::traits::StoreError;
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::refs::{ContentRef, INLINE_ARGUMENT_LIMIT_BYTES, PayloadRef};
@@ -124,6 +123,60 @@ impl PayloadStore {
         serde_json::from_slice(&bytes)
             .map_err(|e| StoreError::Corrupt(format!("{} 不是预期的 JSON：{e}", reference.0.path)))
     }
+
+    /// 给客户端出站的旧事件补回外置内容，不改写原 JSONL。
+    pub async fn hydrate_event(&self, event: &mut Event) -> Result<(), StoreError> {
+        match &mut event.payload {
+            EventPayload::RunAccepted(body) if body.text.is_none() => {
+                body.text = self.open_text(body.text_ref.as_ref()).await?;
+            }
+            EventPayload::MessageUser(body) if body.text.is_none() => {
+                body.text = self.open_text(body.text_ref.as_ref()).await?;
+            }
+            EventPayload::MessageAssistant(body) => {
+                if body.text.is_none() {
+                    body.text = self.open_text(body.text_ref.as_ref()).await?;
+                }
+                for call in &mut body.tool_calls {
+                    if call.arguments.is_null()
+                        && let Some(reference) = &call.arguments_ref
+                    {
+                        call.arguments = self.open_json(reference).await?;
+                    }
+                }
+            }
+            EventPayload::RunCompleted(body) if body.final_message.is_none() => {
+                body.final_message = self.open_text(body.final_message_ref.as_ref()).await?;
+            }
+            EventPayload::ToolPlanned(body) if body.plan.is_none() => {
+                if let Some(reference) = &body.plan_ref {
+                    body.plan = Some(Box::new(self.open_json(reference).await?));
+                }
+            }
+            EventPayload::ContextCompacted(ContextCompacted::Compacted {
+                summary,
+                summary_ref,
+                ..
+            }) if summary.is_none() => {
+                *summary = self.open_text(summary_ref.as_ref()).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn open_text(
+        &self,
+        reference: Option<&PayloadRef>,
+    ) -> Result<Option<String>, StoreError> {
+        let Some(reference) = reference else {
+            return Ok(None);
+        };
+        let bytes = self.open(reference).await?;
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|error| StoreError::Corrupt(format!("外置正文不是 UTF-8：{error}")))
+    }
 }
 
 pub(crate) async fn sync_file(path: &std::path::Path) -> Result<(), StoreError> {
@@ -138,7 +191,10 @@ pub(crate) async fn sync_file(path: &std::path::Path) -> Result<(), StoreError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komo_kernel::types::ids::SessionId;
+    use komo_kernel::events::MessageAssistant;
+    use komo_kernel::types::ids::{EventId, RunId, Seq, SessionId, ToolCallId};
+    use komo_kernel::types::turn::ToolCallRequest;
+    use time::macros::datetime;
 
     fn store() -> (tempfile::TempDir, PayloadStore) {
         let dir = tempfile::tempdir().expect("临时目录");
@@ -216,6 +272,46 @@ mod tests {
         let reference = store.put_json(&value, None).await.unwrap();
         let back: serde_json::Value = store.open_json(&reference).await.unwrap();
         assert_eq!(back, value);
+    }
+
+    #[tokio::test]
+    async fn old_assistant_references_are_hydrated_for_clients() {
+        let (_dir, store) = store();
+        let text_ref = store.put("旧长回复".as_bytes()).await.unwrap();
+        let arguments = serde_json::json!({"code": "x".repeat(5000)});
+        let arguments_ref = store.put_json(&arguments, None).await.unwrap();
+        let mut event = Event {
+            v: 1,
+            seq: Seq(1),
+            event_id: EventId::from_raw("evt-1"),
+            session: SessionId::from_raw("sess-1"),
+            run: Some(RunId::from_raw("run-1")),
+            ts: datetime!(2026-09-15 08:00:00 UTC),
+            payload: EventPayload::MessageAssistant(MessageAssistant {
+                round: 1,
+                text: None,
+                text_ref: Some(text_ref),
+                tool_calls: vec![ToolCallRequest {
+                    call_id: ToolCallId::from_raw("call-1"),
+                    provider_call_id: "provider-1".into(),
+                    name: "shell".into(),
+                    arguments: serde_json::Value::Null,
+                    arguments_ref: Some(arguments_ref),
+                }],
+                provider_blocks: None,
+                input_tokens: None,
+                output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            }),
+        };
+
+        store.hydrate_event(&mut event).await.unwrap();
+        let EventPayload::MessageAssistant(body) = event.payload else {
+            panic!("应是 assistant 事件")
+        };
+        assert_eq!(body.text.as_deref(), Some("旧长回复"));
+        assert_eq!(body.tool_calls[0].arguments, arguments);
     }
 
     #[test]

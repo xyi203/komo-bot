@@ -131,7 +131,7 @@ stdin / stdout 正常。
 2. `tool.prepare(args)` 出计划。
 3. **只读**：`plan.operation.is_read_only()` 必须成立——`read`、`rg`、`[mcp.servers] read_only`
    里的 MCP 工具。否则抛 `ToolError`："`<name>` 会改东西，请在脚本外直接调用"。
-4. 执行；输出收进内存（上限 1 MiB）。不再过 Policy（2026-10-11 删除）：第 3 步是最后一道门，工作区
+4. 执行；完整输出收进内存，外层结果统一落盘。不再过 Policy（2026-10-11 删除）：第 3 步是最后一道门，工作区
    外的读因此也放行，与原来的 auto 一致。
 
 返回给脚本的是一个 dict：
@@ -167,7 +167,7 @@ stdin / stdout 正常。
 
 ## 8. 限制
 
-- 时限：`[execution] call_timeout_secs`，到点杀进程组；输出上限 1 MiB；内层调用最多 256 次。
+- 时限：`[execution] call_timeout_secs`，到点杀进程组；完整输出落盘，模型视图最多 50 KiB / 2000 行；内层调用最多 256 次。
 - 脚本之间不共享状态（pi 的 `store/load` 不做）。
 - 不跑模型（pi 的 `models` 不做）。
 

@@ -101,8 +101,9 @@ impl ToolOutputStore for MemOutputStore {
         self.published
             .lock()
             .expect("输出存储")
-            .insert(path.clone(), result);
+            .insert(path.clone(), result.clone());
         Ok(PublishedOutput {
+            body: Some(Box::new(result.clone())),
             output: OutputRef(ContentRef {
                 path,
                 size: body.len() as u64,

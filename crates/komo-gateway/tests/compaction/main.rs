@@ -159,8 +159,8 @@ fn priced(request: &TurnRequest) -> u64 {
     price(&context, &request.tools).write_tokens
 }
 
-/// 每次 `read` 交回大约这么多 token（`read` 给模型的那 8 KiB 预览）。
-const READ_TOKENS: u64 = 2_050;
+/// 每次 `read` 交回约 24 KiB（600 行），50 KiB 预览能完整容纳。
+const READ_TOKENS: u64 = 6_050;
 /// 空会话第一次请求（系统提示 + 工具表 + 任务）的估价，约数：窗口按它定，差不到半次
 /// `read` 就不影响哪一轮过线。
 const BASE_TOKENS: u64 = 2_740;

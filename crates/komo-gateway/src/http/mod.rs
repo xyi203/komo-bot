@@ -150,7 +150,9 @@ pub async fn events_of(api: &Api, session: &SessionId) -> Result<Vec<Event>, Api
         if batch.events.is_empty() {
             return Ok(all);
         }
-        for event in batch.events {
+        let payloads = komo_store::PayloadStore::new(api.state.ledgers.paths_for(session));
+        for mut event in batch.events {
+            payloads.hydrate_event(&mut event).await?;
             from = from.max(event.seq);
             all.push(event);
         }

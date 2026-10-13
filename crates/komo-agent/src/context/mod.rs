@@ -16,6 +16,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use komo_kernel::projection::ProjectionContext;
+use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::ToolCallId;
 use komo_kernel::types::turn::ReplayMessage;
@@ -34,10 +35,14 @@ use crate::skills::SkillCatalog;
 pub struct ContextInput<'s> {
     /// 身份指令正文（已从冻结快照指向的 payload 读回）。
     pub instructions: Option<String>,
+    /// 项目规范文件（`AGENTS.md` 等，已从冻结快照指向的 payload 读回），外层在前。
+    /// 只渲染进主 Agent 的提示；空 = 没有（或者是子代理，调用方不给）。
+    pub project_files: Vec<ProjectFile>,
     /// 解析过的真实工作目录。
     pub workspace: PathBuf,
-    /// 这一段真正挂上的工具名，按 Schema 的顺序。系统提示要列它们，skills 门控也按它，
-    /// 所以 tool definitions 必须在 [`assemble`] 之前算好。
+    /// 这一段真正挂上的工具名，按 Schema 的顺序。RULES 按它挑规则（挂了 `rg` 才说"用
+    /// rg"），skills 门控也按它，所以 tool definitions 必须在 [`assemble`] 之前算好。
+    /// 名字本身不进提示：API 的 tool schema 里已经有一份。
     pub tools: Vec<String>,
     /// 已解析正文的回放条目。借用 `Surface`，不复制消息。
     pub history: Vec<ResolvedMessage<'s>>,
@@ -79,14 +84,15 @@ pub struct AgentContext {
 
 /// 唯一的 Context Assembly 入口（`docs/agent.md` §5）。
 ///
-/// 顺序（§10）：Instructions（最前）→ Identity / Task / 工作目录 / 工具 / RULES → komo 自查
-/// （仅主 Agent 且挂了 `shell`）→ Skills
-/// （仅主 Agent）→ Result Contract（仅子代理）→ Memory（最后，`\n\n` + 正文）。
+/// 顺序（§10）：Instructions（最前）→ Identity / Task / 工作目录 / RULES → komo 自查
+/// （仅主 Agent 且挂了 `shell`）→ 项目规范（仅主 Agent）→ Skills（仅主 Agent）→ Result
+/// Contract（仅子代理）→ Memory（最后，`\n\n` + 正文）。
 pub fn assemble(input: ContextInput<'_>) -> AgentContext {
     let mut prompt = prompt::build(
         &input.workspace,
         &input.tools,
         &input.invocation,
+        &input.project_files,
         input.skills.as_ref(),
     );
     prompt = with_instructions(input.instructions.as_deref(), prompt);

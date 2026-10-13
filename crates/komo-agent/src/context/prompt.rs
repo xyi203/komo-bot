@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::delegate::DelegateSpec;
 
 use super::{InvocationContext, SkillCatalog};
@@ -48,28 +49,31 @@ const RG_TOOL: &str = "rg";
 const READ_TOOL: &str = "read";
 const CODEMODE_TOOL: &str = "codemode";
 
-/// 装配系统提示正文：身份 / 工作目录 / 行为约束，主 Agent 再加「komo 自己的状态怎么查」
-/// 与 §5.6 的 skills 目录、子代理再加任务与结果契约。
+/// 装配系统提示正文：身份 / 工作目录 / 行为约束，主 Agent 再加「komo 自己的状态怎么查」、
+/// 项目规范与 §5.6 的 skills 目录，子代理再加任务与结果契约。
 pub(crate) fn build(
     workspace: &Path,
     tools: &[String],
     invocation: &InvocationContext,
+    project_files: &[ProjectFile],
     skills: Option<&SkillCatalog>,
 ) -> String {
     let rules = rules(tools);
     match invocation {
         InvocationContext::Main => {
             let has_shell = tools.iter().any(|tool| tool == SHELL_TOOL);
-            main_prompt(workspace, &rules, skills, has_shell)
+            main_prompt(workspace, &rules, project_files, skills, has_shell)
         }
         InvocationContext::Delegated(spec) => subagent_prompt(workspace, &rules, spec),
     }
 }
 
-/// 主 Agent 的系统提示：身份 / 工作目录 / 行为约束 / komo 自查 / §5.6 的 skills 目录。
+/// 主 Agent 的系统提示：身份 / 工作目录 / 行为约束 / komo 自查 / 项目规范 / §5.6 的
+/// skills 目录。
 fn main_prompt(
     workspace: &Path,
     rules: &str,
+    project_files: &[ProjectFile],
     skills: Option<&SkillCatalog>,
     has_shell: bool,
 ) -> String {
@@ -82,6 +86,10 @@ fn main_prompt(
     if has_shell {
         prompt.push_str("\n\n");
         prompt.push_str(SELF_BLOCK);
+    }
+    if let Some(block) = project_block(project_files) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&block);
     }
     if let Some(block) = skills.and_then(SkillCatalog::prompt_block) {
         prompt.push_str("\n\n");
@@ -101,6 +109,34 @@ const SHELL_TOOL: &str = "shell";
 const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、\
                           toolbox、Gateway）用 shell 跑 `komo <子命令>` 查，例如 `komo cron list`，\
                           其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。";
+
+/// 项目规范（`AGENTS.md` / `CLAUDE.md`）那一块：开头一句说清顺序与冲突怎么办，每份文件
+/// 原样包在 `<project_instructions path="…">` 里（标签照 pi，`system-prompt.ts`）。
+/// 正文全是空白的那份不出现；一份都不剩就整块不出现（不留空标题）。
+fn project_block(files: &[ProjectFile]) -> Option<String> {
+    let rendered: Vec<String> = files
+        .iter()
+        .filter(|file| !file.content.trim().is_empty())
+        .map(|file| {
+            format!(
+                "<project_instructions path=\"{}\">\n{}\n</project_instructions>",
+                file.path,
+                file.content.trim_end()
+            )
+        })
+        .collect();
+    if rendered.is_empty() {
+        return None;
+    }
+    let mut block = String::from(
+        "项目规范（从工作目录往上找到的 AGENTS.md / CLAUDE.md，外层在前；冲突时以靠后的为准）：",
+    );
+    for file in rendered {
+        block.push_str("\n\n");
+        block.push_str(&file);
+    }
+    Some(block)
+}
 
 /// 子代理的系统提示（§4）。
 ///

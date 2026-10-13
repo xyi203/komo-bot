@@ -423,6 +423,9 @@ pub struct ToolStarted {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolResult {
+    /// 完整结构化正文；旧事件缺此字段时按 output_ref 读取。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<Box<crate::types::refs::ToolResultBody>>,
     pub call_id: ToolCallId,
     pub attempt_id: AttemptId,
     pub status: ToolResultStatus,

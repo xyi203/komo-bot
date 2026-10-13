@@ -26,7 +26,7 @@ use komo_kernel::events::EventPayload;
 use komo_kernel::traits::{Clock, LedgerError, StoreError};
 use komo_kernel::types::ids::{EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::ExecutionPlan;
-use komo_kernel::types::refs::{INLINE_ARGUMENT_LIMIT_BYTES, PayloadRef};
+use komo_kernel::types::refs::PayloadRef;
 use komo_kernel::types::turn::ToolCallRequest;
 use time::OffsetDateTime;
 use toasty::Executor;
@@ -148,20 +148,9 @@ impl Coordinator {
         self.log.lock().await.last_seq()
     }
 
-    /// 正文小则内联，大则外置到 `payloads/`（§8.3）。
-    async fn split_text(
-        &self,
-        text: &str,
-    ) -> Result<(Option<String>, Option<PayloadRef>), LedgerError> {
-        if text.len() <= INLINE_ARGUMENT_LIMIT_BYTES {
-            return Ok((Some(text.to_string()), None));
-        }
-        let reference = self
-            .payloads
-            .put(text.as_bytes())
-            .await
-            .map_err(store_to_ledger)?;
-        Ok((None, Some(reference)))
+    /// 新事件正文完整内联；引用字段只用于读取旧日志。
+    fn inline_text(text: &str) -> (Option<String>, Option<PayloadRef>) {
+        (Some(text.to_string()), None)
     }
 
     /// 外置正文按引用读回来（§8.3：大正文存 `payloads/`；哈希校验由 [`PayloadStore::open`]
@@ -190,32 +179,20 @@ impl Coordinator {
             .map_err(|e| LedgerError::Corrupt(format!("外置正文不是 UTF-8：{e}")))
     }
 
-    /// 外置一个调用的超限参数：**包含它的模型消息正文**存到 payloads，
-    /// `arguments_ref` 指向文件内的对应字段（§8.3）。
-    async fn externalize_arguments(
-        &self,
-        calls: &[ToolCallRequest],
-    ) -> Result<Vec<ToolCallRequest>, LedgerError> {
-        let mut out = Vec::with_capacity(calls.len());
-        for (index, call) in calls.iter().enumerate() {
-            let encoded = serde_json::to_vec(&call.arguments)
-                .map_err(|e| LedgerError::Persist(format!("参数序列化失败：{e}")))?;
-            if encoded.len() <= INLINE_ARGUMENT_LIMIT_BYTES {
-                out.push(call.clone());
-                continue;
-            }
-            let reference = self
-                .payloads
-                .put_with_pointer(&encoded, Some(format!("/tool_calls/{index}/arguments")))
-                .await
-                .map_err(store_to_ledger)?;
-            out.push(ToolCallRequest {
-                arguments: serde_json::Value::Null,
-                arguments_ref: Some(reference),
-                ..call.clone()
-            });
-        }
-        Ok(out)
+    /// 新事件保留完整工具参数；`arguments_ref` 只用于读取旧日志。
+    fn inline_arguments(calls: &[ToolCallRequest]) -> Vec<ToolCallRequest> {
+        calls
+            .iter()
+            .cloned()
+            .map(|call| ToolCallRequest {
+                arguments_ref: if call.arguments.is_null() {
+                    call.arguments_ref.clone()
+                } else {
+                    None
+                },
+                ..call
+            })
+            .collect()
     }
 
     /// 追加一条事件并同步。**返回之后才允许提交数据库事务**。

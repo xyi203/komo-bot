@@ -1156,6 +1156,7 @@ async fn an_empty_database_reports_nothing_to_do() {
 
 fn published_pointing_at(path: &str) -> komo_kernel::types::refs::PublishedOutput {
     komo_kernel::types::refs::PublishedOutput {
+        body: None,
         output: OutputRef(ContentRef {
             path: path.into(),
             size: 2,

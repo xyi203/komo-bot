@@ -376,6 +376,7 @@ mod tests {
             seq,
             run,
             EventPayload::ToolResult(ToolResult {
+                body: None,
                 call_id: ToolCallId::from_raw(call),
                 attempt_id: AttemptId::from_raw(format!("attempt-{seq}")),
                 status,

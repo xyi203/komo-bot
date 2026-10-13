@@ -302,10 +302,10 @@ fn slice(
 
 /// 一次 `read` 交给模型多少正文。
 ///
-/// **不是账本那 1 KiB**：JSONL 里那条事件只留前 1 KiB（行要小），而模型能看到多少由投影层
+/// JSONL 保存完整结构化结果；模型能看到多少由投影层
 /// 按 `model_result_bytes` 决定。这里给的是一个够它裁的量——400 字符那种做法会让模型每次
 /// 读文件都只看见开头一小截，而它以为那就是全部。
-pub const PREVIEW_BYTES: usize = 8 * 1024;
+pub const PREVIEW_BYTES: usize = 50 * 1024;
 
 fn preview_of(result: &ReadResult) -> String {
     let header = if result.truncated {

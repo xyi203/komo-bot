@@ -123,6 +123,7 @@ pub fn conversation() -> Vec<Event> {
             7,
             Some(run()),
             EventPayload::ToolResult(ToolResult {
+                body: None,
                 call_id: call(),
                 attempt_id: AttemptId::from_raw("attempt-1"),
                 status: ToolResultStatus::Completed,

@@ -589,6 +589,7 @@ mod tests {
                 7,
                 Some("run-1"),
                 EventPayload::ToolResult(ToolResult {
+                    body: None,
                     call_id: ToolCallId::from_raw("call-7"),
                     attempt_id: AttemptId::from_raw("attempt-1"),
                     status: ToolResultStatus::Completed,
@@ -653,6 +654,7 @@ mod tests {
             8,
             Some("run-1"),
             EventPayload::ToolResult(ToolResult {
+                body: None,
                 call_id: ToolCallId::from_raw("call-7"),
                 attempt_id: AttemptId::from_raw("attempt-1"),
                 status: ToolResultStatus::Completed,
@@ -729,6 +731,7 @@ mod tests {
                 seq,
                 Some(run),
                 EventPayload::ToolResult(ToolResult {
+                    body: None,
                     call_id: ToolCallId::from_raw(call),
                     attempt_id: AttemptId::from_raw(format!("attempt-{seq}")),
                     status: ToolResultStatus::Completed,
@@ -983,6 +986,7 @@ mod tests {
                         plan_hash: PlanHash::from_raw("h"),
                     }),
                     6 => EventPayload::ToolResult(ToolResult {
+                        body: None,
                         call_id: ToolCallId::from_raw(format!("call-{}", rng.below(3))),
                         attempt_id: AttemptId::from_raw("attempt-1"),
                         status: ToolResultStatus::Completed,

@@ -385,8 +385,9 @@ easy to test
 ```
 
 读不出正文都发生在 I/O 阶段，处理照旧：外置 payload 哈希对不上 → Gateway
-`halt_if_corrupt`；`output.json` 打不开 → 退回账本里那 ≤1 KiB 的 `preview`（现在
-`replay` 里的 `.ok()`，不停段）。assemble 本身没有失败路径，签名里也就不带 `Result`。
+`halt_if_corrupt`；`output.json` 打不开 → 新格式使用 JSONL 内联的完整工具结果，旧格式才退回
+账本里那 ≤1 KiB 的 `preview` / `text_ref`（兼容读取，不停段）。assemble 本身没有失败路径，
+签名里也就不带 `Result`。
 
 ---
 
@@ -623,7 +624,7 @@ pub struct StoredOutput {
 }
 ```
 
-“`output.json` 没读成就退回账本里那 ≤1 KiB 的 `preview`”、“历史条目正文为空就跳过”、
+“新格式使用 JSONL 内联完整结果，旧格式读 `preview` / `text_ref`”、“历史条目正文为空就跳过”、
 `provider_call_id` 找不到时用内部 call id，这些都是**展示规则**，在 agent 里做；Gateway
 只报告读到了什么。
 
@@ -635,7 +636,10 @@ pub struct StoredOutput {
 `history::latest_user_text`：Gateway 依赖 agent，这样调没问题。
 
 工具结果只有 `kernel::projection` 一处投影，这条铁律不变。Agent 层调它，不自己拼
-“完整输出在哪”那句话。
+“完整输出在哪”那句话。full 模型视图默认最多 50 KiB 或 2000 行（二者先到）：shell / bash
+保留尾部，其他工具保留头部；UTF-8 边界不会切坏，超限结果总带可 `read` 的完整
+`artifact://` 引用。即时路径与恢复路径都用 RunSnapshot 冻结的投影设置和同一份落盘事实，
+因此逐字节相同；后续 decay 仍只换成更短的模型视图，不改 JSONL 或 tool-output 原件。
 
 ---
 
@@ -732,9 +736,14 @@ Identity            “你是 komo …” / “你是 komo 派出去的子代理
     ↓
 Delegated Task      只有子代理
     ↓
-Runtime Environment 工作目录、可用工具
+Runtime Environment 工作目录（工具名不列：API 的 tool schema 里已经有一份）
     ↓
-Rules               RULES 三条
+Rules               跟着工具走（挂了 rg 才说"用 rg"），最后两条每次都有
+    ↓
+komo 自查           只有主 Agent，且挂了 shell
+    ↓
+Project Files       只有主 Agent：受理时从工作目录往上找到的 AGENTS.md / CLAUDE.md，
+                    外层在前，正文冻结进 payloads（RunSnapshot.project_files_ref），空就不出现
     ↓
 Skills              只有主 Agent，空就不出现
     ↓
@@ -746,7 +755,8 @@ Memory              现在由适配器追加在最后；Phase 5 并进来，位�
 Memory 必须留在最后：记忆段在同一段对话里逐字复用，放在尾部是为了不打掉前面那段的
 服务端前缀缓存（`recall_for` 的注释）。
 
-分隔符也照抄：主提示内部是 `\n`，skills 前是 `\n\n`，指令后是 `\n\n`。
+分隔符也照抄：主提示内部是 `\n`，skills 前是 `\n\n`，指令后是 `\n\n`。komo 自查与
+Project Files 两块（后加的）前面同样是 `\n\n`。
 
 现在不需要公开 `PromptSection`。
 

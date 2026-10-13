@@ -1531,7 +1531,7 @@ async fn a_delegated_task_over_the_inline_limit_still_settles_the_parent_call() 
     let done = gateway.wait_terminal(&parent).await;
     assert_eq!(done.summary.state, RunState::Completed, "{done:?}");
 
-    // 前提：那条参数**真的**外置了，否则这条测试盯的不是同一条路。
+    // 超限参数完整留在事件里，委派恢复仍沿用同一份计划。
     let paths = gateway.state().ledgers.paths_for(&session);
     let (events, _) = komo_store::session_log::read_events(&paths, &session, Seq::ZERO, 0)
         .await
@@ -1540,9 +1540,12 @@ async fn a_delegated_task_over_the_inline_limit_still_settles_the_parent_call() 
         events.iter().any(|event| matches!(
             &event.payload,
             EventPayload::MessageAssistant(body)
-                if body.tool_calls.iter().any(|call| call.arguments_ref.is_some())
+                if body.tool_calls.iter().any(|call| {
+                    call.arguments_ref.is_none()
+                        && call.arguments.to_string().contains("背景说明")
+                })
         )),
-        "外置是这条测试的前提：参数要在 payloads/ 里"
+        "超限参数应完整内联在 JSONL 事件里"
     );
     // §8.4 第 4 行：**沿用原计划**。续跑重新 `prepare` 会写出第二条 `tool.planned`，
     // 而它换了一个 `plan_hash`——原先那份授权就覆盖不到了（§7.4）。

@@ -29,6 +29,7 @@ use komo_kernel::fold::fold;
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::protocol::config::CompactionConfig;
 use komo_kernel::traits::{Clock, Ledger, LedgerError, ToolOutputStore};
+use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::tool::ToolDefinition;
@@ -44,6 +45,7 @@ use super::ledgers::RoutedLedger;
 #[derive(Clone)]
 pub(crate) struct ContextTemplate {
     pub instructions: Option<String>,
+    pub project_files: Vec<ProjectFile>,
     pub workspace: PathBuf,
     pub tools: Vec<String>,
     pub memory: Option<String>,
@@ -60,6 +62,7 @@ impl ContextTemplate {
     ) -> AgentContext {
         assemble(ContextInput {
             instructions: self.instructions,
+            project_files: self.project_files,
             workspace: self.workspace,
             tools: self.tools,
             history,

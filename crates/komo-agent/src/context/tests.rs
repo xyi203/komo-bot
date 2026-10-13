@@ -9,6 +9,7 @@ use super::*;
 fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput<'static> {
     ContextInput {
         instructions: instructions.map(str::to_string),
+        project_files: Vec::new(),
         workspace: PathBuf::from("/tmp/w"),
         tools: vec!["read".into()],
         history: Vec::new(),

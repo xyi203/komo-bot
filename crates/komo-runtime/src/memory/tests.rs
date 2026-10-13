@@ -432,6 +432,7 @@ fn tool_event(seq: u64, run: &RunId, preview: &str) -> Event {
         seq,
         run,
         EventPayload::ToolResult(ToolResult {
+            body: None,
             call_id: ToolCallId::from_raw("call-1"),
             attempt_id: AttemptId::from_raw("att-1"),
             status: ToolResultStatus::Completed,

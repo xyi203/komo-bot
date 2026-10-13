@@ -1,4 +1,4 @@
-//! `shell`：命令、工作目录、超时；返回退出码和输出。**管理进程组、限制输出、支持
+//! `shell`：命令、工作目录、超时；返回退出码和输出。**管理进程组、完整落盘、支持
 //! 取消**（§4）。
 //!
 //! 取消不是"不再等它"：Tokio 不会因为 handle 被丢掉就结束进程，而 `Child::kill` 只
@@ -30,8 +30,9 @@ use super::{normalized, parse_args, plan_time};
 
 /// 一条命令默认跑多久。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
-/// 一次执行默认最多往输出存储里写多少字节。
-pub const DEFAULT_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+/// 默认把输出完整写进已有的 `tool-output`；模型视图的 50 KiB / 2000 行限制在 kernel
+/// 投影里执行。测试和嵌入方仍可通过 `with_limits` 明确设置存储上限。
+pub const DEFAULT_OUTPUT_LIMIT: u64 = u64::MAX;
 
 /// 交给子进程的**明确**环境变量。继承整个环境等于把 API key 交给任意脚本（§5.3）。
 const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ", "USER", "TMPDIR"];
@@ -54,7 +55,7 @@ pub struct ShellResult {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub timed_out: bool,
-    /// 输出超过预算，完整正文里也只有截到的那部分。
+    /// 调用方明确设置了存储上限且输出超过预算；默认不会截断落盘正文。
     #[serde(default)]
     pub output_truncated: bool,
     pub stdout_bytes: u64,
@@ -480,6 +481,30 @@ mod tests {
         assert_eq!(output.exit_code, Some(0));
         assert_eq!(shell_result(&output).stdout_excerpt.trim(), "hi");
         assert!(sink.bytes_written() > 0, "输出流进了写入器");
+    }
+
+    #[tokio::test]
+    async fn default_shell_output_is_not_cut_before_it_reaches_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = ShellTool::new();
+        let mut sink = writer(&ctx);
+        let bytes = 8 * 1024 * 1024 + 1;
+        let plan = tool
+            .prepare(
+                serde_json::json!({
+                    "command": format!("yes x | head -c {bytes}")
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert_eq!(sink.bytes_written(), bytes);
+        assert!(!shell_result(&output).output_truncated);
+        let preview = output.preview.expect("有模型预览");
+        assert!(preview.len() >= 50 * 1024, "投影前不能只剩旧的 7 KiB");
     }
 
     #[tokio::test]

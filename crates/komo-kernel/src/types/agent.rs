@@ -111,6 +111,11 @@ pub struct RunSnapshot {
     /// 身份指令正文的引用（`payloads/`）。`None` = 这份 Profile 没有额外指令。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions_ref: Option<PayloadRef>,
+    /// 项目规范文件（[`ProjectFile`] 的 JSON 数组）的引用（`payloads/`）。与指令同一个
+    /// 理由存内容不存路径：Run 停着的时候 `AGENTS.md` 可能被改过。`None` = 受理时工作
+    /// 目录往上一个都没找到，或者这一格出现之前受理的 Run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_files_ref: Option<PayloadRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_scope: Option<MemoryScope>,
     /// 工具结果怎么投影给模型（`[execution]` 的预算与衰减，§8.3）。冻结在这里，刚跑完与
@@ -122,6 +127,15 @@ pub struct RunSnapshot {
     /// Run 也认得出自己是命令直跑。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_command: Option<String>,
+}
+
+/// 一份项目规范文件（`AGENTS.md` / `CLAUDE.md`）：受理时从工作目录往上找到的，正文原样。
+///
+/// `path` 只给模型看是哪一层目录的规范，所以存成字符串，不必是合法的 UTF-8 路径。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectFile {
+    pub path: String,
+    pub content: String,
 }
 
 /// 配置里的一整套助手定义。
@@ -218,6 +232,28 @@ mod tests {
         assert_eq!(profile.revision(), before, "内容没变，指纹不变");
         profile.instructions = Some("你是 komo。".into());
         assert_ne!(profile.revision(), before, "改了指令就是另一版");
+    }
+
+    /// `project_files_ref` 是后加的一格：没有时不落键（这一格出现之前的快照 JSON 不变），
+    /// 没有这个键的旧快照读得回来、这一格是 `None`。
+    #[test]
+    fn a_snapshot_without_project_files_keeps_its_old_shape() {
+        let snapshot = RunSnapshot {
+            agent_id: "assistant".into(),
+            profile_revision: AgentProfile::new("assistant").revision(),
+            model: crate::test_support::sample_model(),
+            workspace: PathBuf::from("/w"),
+            surface: AgentSurface::new(["read"]),
+            instructions_ref: None,
+            project_files_ref: None,
+            memory_scope: None,
+            projection: None,
+            direct_command: None,
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json.get("project_files_ref").is_none(), "{json}");
+        let back: RunSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(back, snapshot);
     }
 
     #[test]

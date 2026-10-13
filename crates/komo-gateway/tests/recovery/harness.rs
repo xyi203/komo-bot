@@ -138,6 +138,10 @@ pub enum Fault {
     BeforeRecordRound(u32),
     /// `append_audit` 之前——权威已在 state.db，审计事件补写不进 JSONL（表第 10 行）。
     BeforeAppendAudit,
+    /// codemode 第 N 个子调用的输出已发布，`delivered` 还没提交进 journal。
+    BeforeCodemodeDelivery(u64),
+    /// 第 N 个子调用的 `delivered` 已提交，还没回给 Python 宿主就死了。
+    AfterCodemodeDelivery(u64),
     /// `start_call` 时**照旧 Gateway 的样子停在审批上**：写一条 `run.waiting`
     /// `{"kind":"approval"}`（db 里 `wait_kind = 'approval'`），然后进程"死掉"。审批
     /// 2026-10-11 删除之后新代码不再产生它，这一步只为造出升级前留下的现场（§7、D2）。
@@ -378,9 +382,27 @@ impl Ledger for FaultLedger {
             // 写入也一起废掉，"审计没写进去"就变成了"任务再也推不动"。
             return Err(self.state.refuse());
         }
-        self.inner
+        let delivery = match &payload {
+            EventPayload::CodemodeJournal(body) if body.record["phase"] == "delivered" => {
+                body.record["index"].as_u64()
+            }
+            _ => None,
+        };
+        if let Fault::BeforeCodemodeDelivery(index) = self.state.fault {
+            if delivery == Some(index) {
+                return Err(self.state.trip());
+            }
+        }
+        let seq = self
+            .inner
             .append_audit(session, event_id, payload, occurred_at)
-            .await
+            .await?;
+        if let Fault::AfterCodemodeDelivery(index) = self.state.fault {
+            if delivery == Some(index) {
+                return Err(self.state.trip());
+            }
+        }
+        Ok(seq)
     }
 }
 

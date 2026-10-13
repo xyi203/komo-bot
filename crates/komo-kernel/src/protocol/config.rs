@@ -82,7 +82,7 @@ pub struct McpServerConfig {
     /// 挂哪些工具。`None` = 服务器列出的全部。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<String>>,
-    /// 操作者认定为只读的工具：codemode 脚本里可以调，中断后可以重做（`SafeReread`）。
+    /// 操作者认定为只读的工具：中断后可以重做（`SafeReread`）；codemode 的 MCP 准入不取决于此声明。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only: Vec<String>,
 }

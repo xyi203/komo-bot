@@ -1,7 +1,7 @@
 //! MCP（`docs/mcp.md`）：真 Gateway + 一个真的 stdio MCP 服务器（`server.py`）。
 //!
 //! 钉住的是"MCP 工具走与内置工具同一条路"：模型要的就执行（§7 没有 Policy，声明只读与否
-//! 只影响 codemode 里能不能调它），而且只执行一次；子进程只拿到声明过的 `.env` 变量；一个
+//! 影响恢复时能不能重做），而且只执行一次；子进程只拿到声明过的 `.env` 变量；一个
 //! 起不来的服务器不拖垮启动。
 
 use std::path::Path;
@@ -133,4 +133,122 @@ command = "/nonexistent/mcp-server"
         !names.iter().any(|name| name.starts_with("mcp__broken__")),
         "{names:?}"
     );
+}
+
+#[path = "../recovery/harness.rs"]
+mod recovery;
+
+#[tokio::test]
+async fn codemode_side_effecting_mcp_is_journaled_and_only_parent_enters_model_messages() {
+    let (home, counter) = home_with_demo("");
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-cm",
+            "codemode",
+            serde_json::json!({
+                "code": "text(tools.mcp__demo__bump()['text'])"
+            }),
+        ),
+        text_round(2, "好了"),
+    ]]);
+    let gw = home.start(llm.clone()).await;
+    if !gw.state().tool_names.iter().any(|name| name == "codemode") {
+        return;
+    }
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "cm-write", "加一").await.run;
+    assert_eq!(
+        gw.wait_terminal(&run).await.summary.state,
+        RunState::Completed
+    );
+    assert_eq!(std::fs::read_to_string(counter).unwrap(), "bump\n");
+    let results = tool_results(&llm);
+    assert_eq!(results.len(), 1);
+    assert!(results[0].contains("bumped"));
+    let events = home.events(&session);
+    assert_eq!(recovery::tool_results(&events).len(), 1);
+    let phases: Vec<String> = events
+        .iter()
+        .filter_map(|event| match &event.payload {
+            komo_kernel::events::EventPayload::CodemodeJournal(body) => {
+                Some(body.record["phase"].as_str().unwrap().to_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        phases,
+        ["start", "intent", "started", "delivered", "finished"]
+    );
+    gw.stop().await;
+}
+
+async fn codemode_crash_window(delivery_committed: bool) {
+    use recovery::{Fault, Injected};
+    let (home, counter) = home_with_demo("");
+    let fault = home.inject(if delivery_committed {
+        Fault::AfterCodemodeDelivery(1)
+    } else {
+        Fault::BeforeCodemodeDelivery(1)
+    });
+    let gw = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(
+                1,
+                "pc-cm",
+                "codemode",
+                serde_json::json!({
+                    "code": "text(tools.mcp__demo__bump()['text'])"
+                }),
+            ),
+            text_round(2, "好了"),
+        ]]))
+        .await;
+    if !gw.state().tool_names.iter().any(|name| name == "codemode") {
+        home.clear_injection();
+        return;
+    }
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "cm-crash", "加一").await.run;
+    fault.wait_tripped().await;
+    gw.stop().await;
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "bump\n");
+    let events = home.events(&session);
+    let started = (*recovery::tool_started(&events).last().unwrap()).clone();
+    // 丢掉外层留下的孤儿输出，逼恢复走 journal 这条路，而不是直接收养它。
+    home.drop_attempt_output(&session, &run, &started);
+    home.clear_injection();
+    let gw = home.start(FakeLlm::finisher("已核对")).await;
+    assert_eq!(
+        gw.wait_terminal(&run).await.summary.state,
+        RunState::Completed
+    );
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap(),
+        "bump\n",
+        "写调用不能重复"
+    );
+    let events = home.events(&session);
+    let result = *recovery::tool_results(&events).last().unwrap();
+    assert_eq!(
+        result.status,
+        if delivery_committed {
+            komo_kernel::types::refs::ToolResultStatus::Completed
+        } else {
+            komo_kernel::types::refs::ToolResultStatus::Uncertain
+        }
+    );
+    assert!(gw.interventions().await.is_empty());
+    gw.stop().await;
+}
+
+#[tokio::test]
+async fn codemode_restart_delivers_completed_unsafe_mcp_result_without_repeating_write() {
+    codemode_crash_window(true).await;
+}
+
+#[tokio::test]
+async fn codemode_restart_does_not_repeat_unsafe_mcp_in_uncommitted_delivery_window() {
+    codemode_crash_window(false).await;
 }

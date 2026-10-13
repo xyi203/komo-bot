@@ -242,6 +242,8 @@ event_payload! {
     ToolStarted(ToolStarted) => "tool.started",
     /// 只有状态、耗时等元信息、`output_ref` 和最多 1 KiB 预览（§8.3）。
     ToolResult(ToolResult) => "tool.result",
+    /// Python 子调用 journal；不是顶层工具消息，不参与调度状态折叠。
+    CodemodeJournal(CodemodeJournal) => "codemode.journal",
     // 2026-10-11 之前还有 `approval.requested` / `approval.decided`（审批的审计副本）。
     // 审批删掉之后它们不再有词汇：旧行读成 `Unknown`，保留 seq、什么都不表示（§8.3）。
     /// 已覆盖的 seq、上下文与记忆版本引用、执行游标（§8.2）。
@@ -257,6 +259,15 @@ impl EventPayload {
     pub fn is_unknown(&self) -> bool {
         matches!(self, EventPayload::Unknown { .. })
     }
+}
+
+/// 子调用 journal 的信封；阶段协议由 runtime 校验。正文通过 output 引用外置，
+/// 这里仅含父身份、阶段与引用，不能投影成额外的模型工具结果。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CodemodeJournal {
+    pub run: RunId,
+    pub parent: ToolCallId,
+    pub record: serde_json::Value,
 }
 
 /// §8.5：`run.accepted` 带完整输入与绑定的 Run ID。

@@ -46,14 +46,17 @@ tools            = ["lookup"]          # 白名单；省略 = 服务器列出的
 ## 3. 只读与恢复
 
 计划是 `Operation::McpCall { server, tool, read_only }`。`read_only` 来自**操作者**的
-`read_only` 列表，不信服务器自报的 `readOnlyHint`：自称安全的东西决定不了恢复方式，也进不了
-codemode。调用一律执行（2026-10-11 起没有 Policy 与审批，原来 strict 下的 `mcp-call` Ask 与
-`policy.toml` 里的按工具免问一并删掉）；`read_only` 只决定两件事：
+`read_only` 列表，不信服务器自报的 `readOnlyHint`：自称安全的东西决定不了恢复方式。调用一律
+执行（2026-10-11 起没有 Policy 与审批，原来 strict 下的 `mcp-call` Ask 与 `policy.toml` 里的
+按工具免问一并删掉）；`read_only` 只决定恢复方式：
 
-| | 恢复 | codemode 内层 |
-|---|---|---|
-| `read_only` 里的工具 | `SafeReread`，`McpTool::replay` 也是 safe：重启后重读一次 | 可调 |
-| 其余 | `NoSafeRecovery`：重启后不重跑，中断结果交给模型判断（`docs/komo_bot.md` §8.6） | 不可调 |
+| | 恢复（顶层调用与 codemode 子调用同一条准则） |
+|---|---|
+| `read_only` 里的工具 | `SafeReread`，`McpTool::replay` 也是 safe：重启后重读一次 |
+| 其余 | `NoSafeRecovery`：重启后不重跑，中断结果交给模型判断（`docs/komo_bot.md` §8.6） |
+
+codemode 脚本里两类都能调（2026-10-13 起；之前只放行 `read_only` 里的）：子调用逐次记进
+journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` §5、§7）。
 
 调用失败：只读工具当普通失败；其余工具在传输层断掉时报"结果不明"（`ToolError::Uncertain`）
 ——请求可能已经到了服务器。超时由执行器的 `call_timeout` 兜底。

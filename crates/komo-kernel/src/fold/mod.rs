@@ -330,6 +330,7 @@ impl Surface {
             EventPayload::ContextCompacted(ContextCompacted::Skipped { .. })
             | EventPayload::Checkpoint(_)
             | EventPayload::ConfigChanged(_) => {}
+            EventPayload::CodemodeJournal(_) => {}
             EventPayload::Unknown { event_type, raw } => self.unknown.push(UnknownEvent {
                 seq: event.seq,
                 event_id: event.event_id.clone(),

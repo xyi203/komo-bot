@@ -50,7 +50,7 @@ pub enum ToolError {
     #[error("没有找到要替换的内容：{path}")]
     NoMatch { path: String },
     /// 被拒绝：`write` / `edit` 要写 komo 自己的状态（§7、§8.10），或 codemode 脚本里调
-    /// 了不是只读的工具。作为明确结果交回模型。旧事件里的 Policy 拒绝也是它。
+    /// 了不支持的本地写入或编排工具。作为明确结果交回模型。旧事件里的 Policy 拒绝也是它。
     #[error("被拒绝：{reason}")]
     Denied { reason: String },
     /// 超过活动执行时限。

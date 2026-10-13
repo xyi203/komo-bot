@@ -28,6 +28,7 @@
 
 pub mod cancel;
 mod codemode;
+mod codemode_journal;
 #[cfg(test)]
 pub mod harness;
 
@@ -624,12 +625,25 @@ impl ToolExecutor {
         .await;
         let elapsed_ms = started.elapsed().as_millis() as u64;
 
-        let outcome = match executed {
+        let was_cancelled = executed.is_none();
+        let mut outcome = match executed {
             None => Err(ToolError::Cancelled),
             Some(Err(_elapsed)) => Err(timeout_error(&plan, env.call_timeout)),
             Some(Ok(result)) => result,
         };
 
+        // 取消或超时会把宿主内存里锁住的 fatal 一起丢掉：发布外层结果之前重读 journal，
+        // started 没交付的、已交付但结果不明的都保住 uncertain；取消照样停下这一轮。
+        if matches!(plan.operation, Operation::Codemode { .. })
+            && matches!(
+                outcome,
+                Err(ToolError::Cancelled | ToolError::Timeout { .. })
+            )
+        {
+            if let Err(error) = self.codemode_check_interrupted(&ctx).await {
+                outcome = Err(error);
+            }
+        }
         let mut recorded = self.publish(writer, result_body(&outcome)).await?;
         recorded.published.elapsed_ms = elapsed_ms;
         self.ledger
@@ -665,7 +679,7 @@ impl ToolExecutor {
             );
         }
         match &outcome {
-            Err(ToolError::Cancelled) => Ok(CallSettlement::Stopped {
+            _ if was_cancelled => Ok(CallSettlement::Stopped {
                 stop: RoundStop::Cancelled,
                 result: Some(result),
             }),

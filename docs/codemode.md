@@ -1,8 +1,8 @@
 # codemode：沙箱里的 Python 脚本
 
-> 状态：设计 + 首版落地（2026-10-08）。2026-10-11 起没有 Policy 与审批（`docs/komo_bot.md` §7），codemode 的边界只来自
-> 沙箱与"内层只读"这一条（§5）。借鉴 pi 的 codemode（`packages/coding-agent/docs/codemode.md`），
-> 引擎换成 komo 已有的 Python，隔离交给操作系统沙箱。与 `docs/komo_bot.md` 冲突处以本文为准。
+> 状态：已实现沙箱与持久化子调用。Python 仍在操作系统沙箱中运行，工具调用由宿主执行；
+> 允许只读工具及有副作用 MCP。恢复借鉴 pi-durable 的子调用稳定 key、已存/当前 replay 双 Safe
+> 与结果交付 journal；Python 没有确定性 VM，所以恢复限制见 §7。设计权威为 `docs/komo_bot.md`。
 
 ## 1. 要解决什么
 
@@ -43,9 +43,10 @@ stdin / stdout 正常。
 
 - **外层是一次普通调用**：`tool.planned` / `tool.started` / `tool.result` 照常落账，输出照常
   投影（§8.3）。
-- **内层调用不单独落账**：结果只回到脚本；外层 `output.json` 的 `result.calls` 里留一份有上限
-  的摘要（工具、截断的参数、状态、耗时；最多 256 条）。这与 pi 相同——它成立的前提是 §5：
-  内层只有只读调用，重跑整段没有副作用。
+- **内层调用单独持久化**：`codemode.journal` 按父 Run / Call 隔离；完整参数、计划和交付结果
+  外置到同一 Session 的 `tool-output/`。这些事件不生成顶层 `tool.result`，kernel fold 不把它们
+  加入模型消息；父结果仍经唯一的 `projection.rs` 投影。父 `result.calls` 只保留有上限的摘要。
+- codemode 可能包含远端写操作，整体是调度屏障，不与同一轮其他只读调用并行。
 
 ## 4. 沙箱
 
@@ -124,24 +125,42 @@ stdin / stdout 正常。
 
 ## 5. 脚本里的工具调用
 
-`tools.<name>(**args)` → executor 的 `nested_call`，依次：
+`tools.<name>(**args)` → executor 的持久化子调用路径，依次：
 
-1. **能力面**：名字必须在这次 Run 的能力面里（与顶层调用同一份 `AgentSurface`）。`codemode`、
-   `delegate`、`dispatch`、`follow` 不能在脚本里调。
-2. `tool.prepare(args)` 出计划。
-3. **只读**：`plan.operation.is_read_only()` 必须成立——`read`、`rg`、`[mcp.servers] read_only`
-   里的 MCP 工具。否则抛 `ToolError`："`<name>` 会改东西，请在脚本外直接调用"。
-4. 执行；完整输出收进内存，外层结果统一落盘。不再过 Policy（2026-10-11 删除）：第 3 步是最后一道门，工作区
-   外的读因此也放行，与原来的 auto 一致。
+1. 名字必须在当前 Run 的 `AgentSurface` 及 executor 工具表里；不回退到全局目录。
+   `codemode`、`delegate`、`dispatch`、`follow`、`update_plan` 不能在脚本里调。
+2. `tool.prepare(args)` 验证参数和约束。允许 `ReadFile`（read、rg）与 `McpCall`（含写操作）；
+   本地 write / edit / shell / python、编排、`then_run` 仍在脚本外执行。
+3. 完整参数、准备计划与 `plan.recovery.replay().and(tool.replay())` 先发布外置正文，再同步追加
+   `intent` 记录。`started` 记录提交成功之后才允许执行工具。
+4. 流式 stdout / stderr 保存在子调用自己的尝试目录；工具返回后发布完整原始输出，再发布
+   脚本将接收的精确 dict 或错误。`delivered` 记录引用这些已发布内容，提交后才回送 Python。
 
-返回给脚本的是一个 dict：
+顺序复用现有 `ToolOutputStore::publish` 与 `Ledger::append_audit`：外部正文同步/原子发布 →
+JSONL append + sync → 日志索引数据库事务。这里没有子调用调度行，也没有 control_outbox 决策；
+`append_audit` 仅复用 Coordinator 的串行追加、幂等 event_id 和索引提交机制。Gateway 是唯一开 state 的进程。
+
+返回给脚本的 dict 保持原有接口：
 
 ```python
-{"status": "completed" | "failed", "text": "<工具的正文输出>", "result": <output.json 里的结构化结果>}
+{"status": "completed" | "failed", "text": "<完整工具正文>", "result": <工具的结构化结果>}
 ```
 
-`read` 的 `text` 是文件内容，`rg` 是匹配行，MCP 是渲染过的文本，`result` 是完整 `CallToolResult`。
-调用失败（含第 1、3 步）抛 `ToolError`，`try/except` 接得住。
+普通执行/参数/不支持操作的错误可被 `try/except ToolError` 捕获；这些结果也持久化。
+**uncertain、journal 读写/校验失败、恢复分歧是宿主终止条件**：宿主锁住错误，后续任何子调用都不执行，
+父结果记为 uncertain 并返回模型。脚本捕获异常或伪造 done 不能解除该状态；模型据此核对外部状态。
+stdout/stderr 底层写失败由宿主独立锁存；即使工具将其转成普通 Failed 或吞掉错误，仍禁止后续调用，
+保留 started 未交付的中断证据。取消/超时收尾会重新读取并校验已交付 Reply 及 execution 引用；
+已交付 uncertain 优先于普通 Cancelled/Failed，用户取消仍停止 Run。
+
+例如，有副作用 MCP 可以和只读查询放进同一段脚本：
+
+```python
+result = tools.mcp__demo__bump()
+text(result["text"])
+```
+
+MCP 的 `read_only` 仍由操作者声明，只决定中断后能否安全重做，不再决定 codemode 准入。
 
 ## 6. 模型看到的接口
 
@@ -157,13 +176,44 @@ stdin / stdout 正常。
 结果正文：`text()` 各段按顺序，`<console>` 段随后，失败时附 `脚本出错：` 与 traceback，最后一行
 是调用摘要（`调用了 3 次工具：read×2、rg×1`）。超长照常由投影截头尾。
 
-## 7. 计划与恢复
+## 7. 计划、journal 与恢复
 
-- 计划：`Operation::Codemode { code }`，代码进计划哈希。
-- 没有 Policy 要过（2026-10-11 删除，原来的 `codemode-allow` 规则随之消失）：脚本自己碰不到外部，
-  它里面的每一次调用都要过 §5 的能力面与只读两道门。
-- 恢复：`SafeReread`。中断后整段重跑：内层只有只读调用，重跑看到的是"现在"的状态，与重读同理。
-- `is_read_only()` 为真：可以和同一轮的其他只读调用并行。
+父计划是 `Operation::Codemode { code }`。`replay = Safe` / `SafeReread` 表示可以重新进入宿主的
+journal 协议，**不表示整段工具操作可以重做**；`is_read_only()` 为 false，父调用是调度屏障。
+
+首次启动先提交 `start`（协议版本、代码/driver 哈希、工具表、cwd、环境版本）。子调用按宿主收到的
+顺序编号 `c1..c256`，逻辑身份为父 Run / Call + 子序号；存储路径使用父 Call 与阶段/序号的 SHA-256
+组成安全的 `cm-…` Call ID。它不依赖新的父 attempt，重启仍能认回同一子调用；每次实际执行的输出
+使用父 attempt + 子身份派生的独立 Attempt ID，旧引用不会被覆盖；这也避免底层输出存储按
+Attempt ID 索引时误取父调用正在写的流。脚本不能自选 key，也不能绕过宿主的 256 次限制。
+
+| 恢复时已记录的阶段 | 处理 |
+|---|---|
+| `intent`，无 `started` | 确定未执行；当前能力面与 prepare 再核对后，用已存计划执行 |
+| `started`，无 `delivered` | 已存与当前 `Tool::replay` 都为 Safe 才用原计划重跑；否则 uncertain，绝不重做 |
+| `delivered` | 校验引用和完整工具输出，返回已存精确结果；包括 unsafe 成功、普通失败及 uncertain |
+| `finished` | 直接返回已提交的整段输出，不启动 Python |
+
+脚本每次完成后先外置整段 `ToolOutput` 并提交 `finished`，再交给父 executor 发布和 `finish_call`。
+父结果发布前后中断时可以复用这个完整结果；父子工具结果不混进顶层 LLM 消息。
+
+恢复逐次核对工具名、完整 JSON 参数与顺序；结束时检查全部记录是否被消费。代码、driver、能力表、
+cwd、环境版本改变，参数或顺序改变，提前结束，或者引用损坏，均明确返回 uncertain。普通脚本异常
+仍是 Failed；`started` 保存子尝试身份，恢复 unsafe 或时限/取消中断时读取该尝试留下的部分输出，
+将有上限的 stdout/stderr 尾部及目录存入父 uncertain 正文，仍由父结果统一投影。
+时限/取消打断正在执行的子调用时，持久化的父结果保留 uncertain（用户取消仍停止 Run）。
+升级前没有 durable `start` 的中断父调用也返回 uncertain，不能按旧的“整段只读”假设重跑。
+
+### Python 的恢复边界
+
+这不是 pi-durable 的确定性 JS VM：Python 的时间、随机数、线程、导入库等不被冻结，纯计算与输出
+也不保证字节确定。实现因此只允许恢复**已记录的调用前缀**，不允许恢复期间发出任何新子调用。
+恢复可重新取得已完成的写结果并生成汇总；需要继续未记录的工作时由模型另发调用。
+即使新调用仍是只读，超出旧前缀也会明确失败，避免动态脚本在未提交窗口制造另一个写 key。
+
+工具成功但 `delivered` 尚未提交时，不能猜测未引用的 output.json 代表可交付成功；unsafe 返回
+uncertain，Safe 才能按双 Safe 准则重做。`start` 已提交但第一个 intent 未提交时，恢复禁止新增
+调用并返回 uncertain。已提交 successful write 子结果始终复用，永不执行第二次。
 
 ## 8. 限制
 
@@ -179,7 +229,8 @@ stdin / stdout 正常。
 | `komo-runtime` `codemode/`（`mod.rs` + `driver.py`） | 解释器探测、自检、子进程协议 |
 | `komo-runtime` `codemode/seatbelt.rs` / `landlock.rs` / `unsupported.rs` | 按平台把子进程关进去：Seatbelt 配置 / Landlock + seccomp / 没有 |
 | `komo-runtime` `tools/codemode.rs` | `CodemodeTool`：定义 + `prepare`；`execute` 不该被走到（与 `dispatch` 同一模式） |
-| `komo-runtime` `executor` | `with_codemode(sandbox)`；执行入口里按 `Operation::Codemode` 分流到 `run_codemode`；`nested_call` |
+| `komo-runtime` `executor/codemode.rs` | 沙箱执行、能力与 prepare 检查、子输出发布、宿主 fatal 锁 |
+| `komo-runtime` `executor/codemode_journal.rs` | journal 阶段、稳定身份、分页读取与回放校验 |
 | `komo-gateway` `service/mod.rs` | 启动时探测 + 自检，通过才注册工具并接上执行器 |
 
 ## 10. 验收
@@ -188,3 +239,30 @@ stdin / stdout 正常。
 - 端到端（真 Gateway）：脚本调 `read` 两次、过滤后 `text()`，模型只看到过滤结果；脚本里调
   `write` 抛错、文件没被写；脚本死循环到时限被杀。（原来的"脚本里读工作区外的文件（Ask）抛错"与"`codemode` 在 strict 下 Allow"随
   Policy 于 2026-10-11 删除。）
+
+- 持久化与恢复单测：完成的 unsafe 子调用不重复、intent 无 started 可执行、stored/current 双 Safe 的
+  四种组合、参数/工具/顺序分歧、少调用/多调用、未提交交付窗口、uncertain 被捕获后仍不能续写、
+  journal 分页、当前能力面/操作变化，以及真实 Python 的前缀回放与超时中断。
+- 真 Gateway + stdio MCP：脚本调用 bump 写计数文件、内层结果不生成模型消息；在 delivered 提交前/
+  后故障停机，丢弃父 orphan 输出强制 journal 冷恢复，计数保持一次；分别得到 uncertain / completed。
+
+2026-10-13 在 macOS 当前工作树验证：
+
+- `cargo fmt --package komo-kernel --package komo-runtime --package komo-gateway`、
+  `cargo fmt --check`、`git diff --check` 均通过。
+- `ulimit -n 8192; cargo test --workspace --no-fail-fast -- --test-threads=4`：1856 passed、
+  0 failed、8 ignored；runtime 633、Gateway lib 247、codemode 集成 4、MCP 集成 6、recovery 集成 28 均通过。
+  默认并发首轮曾触发 `Too many open files`，故本轮限制测试并发并提高该进程的软上限。
+- `cargo build --timings`：exit 0，增量构建 13.25s；报告位于 `target/cargo-timings/`。
+  未做冷构建计时，未在 Linux 上验证本次变更。
+
+独立审查修复后的相关验证（macOS，以上全 workspace 数字为修复前记录）：
+
+- 新增 3 项回归：stdout/stderr 写失败后 Python 捕获仍不能续写（同时覆盖工具转为 Failed 与吞错）、
+  delivered uncertain 已提交后取消仍持久化 Uncertain 且停止回合、Reply 格式与 execution 引用校验。
+- `cargo test -p komo-runtime codemode -- --test-threads=4`：25 passed、0 failed、0 ignored。
+- `cargo test -p komo-runtime -- --test-threads=4`：636 passed、0 failed、2 ignored；doc-tests 0 passed、0 failed。
+- `cargo fmt --package komo-runtime`、`cargo fmt --check`、`git diff --check` 均通过。
+
+提交前（macOS，含上面的修复、注释整理与 `docs/komo_bot.md` 同步）：`cargo fmt --check`、`git diff --check`
+通过；`ulimit -n 8192; cargo test --workspace --no-fail-fast`（默认并发）：1857 passed、0 failed、8 ignored。

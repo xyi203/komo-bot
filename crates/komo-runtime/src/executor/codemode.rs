@@ -1,24 +1,27 @@
-//! codemode 在执行器里的那一半（`docs/codemode.md` §3、§5）：跑脚本，回答脚本里的工具调用。
+//! codemode 在执行器里的那一半（`docs/codemode.md` §3、§5、§7）：跑脚本，回答脚本里的工具调用。
 //!
 //! 外层是一次普通调用（`start_call`、输出落盘都在 `execute_ready`）；这里只替换"执行"
 //! 那一步。脚本里的每一次调用走 [`ToolExecutor::nested_call`]：能力面 → `prepare` →
-//! 只读才放行 → 执行。内层调用不单独落账，只在外层结果里留摘要——成立的前提是它们全是
-//! 只读的，整段重跑没有副作用。范围外的读同样放行：边界来自沙箱，不来自名单（§7）。
+//! 只读或 MCP 才放行 → 逐阶段记进 journal（`codemode_journal`）→ 执行。journal 不进模型
+//! 消息，模型只看见外层结果；MCP 写操作因此可以放进脚本，中断后靠 journal 认回已交付的
+//! 子结果，unsafe 的那一次绝不重做。范围外的读同样放行：边界来自沙箱，不来自名单（§7）。
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, StoreError};
-use komo_kernel::types::plan::Operation;
+use komo_kernel::types::digest::ContentHash;
+use komo_kernel::types::plan::{Operation, Replay};
 use komo_kernel::types::refs::{AttemptRef, ToolResultStatus};
 use komo_kernel::types::tool::{ToolContext, ToolError, ToolOutput};
 use serde::Serialize;
 
+use super::codemode_journal::{Intent, Journal, Record, Reply, uncertain};
 use super::{CallEnv, ToolExecutor};
 
-/// 脚本里调不了的：编排操作与脚本自己。
-const NOT_IN_SCRIPTS: &[&str] = &["codemode", "delegate", "dispatch", "follow"];
+/// 脚本里调不了的：编排操作、计划与脚本自己。
+const NOT_IN_SCRIPTS: &[&str] = &["codemode", "delegate", "dispatch", "follow", "update_plan"];
 
 /// 摘要里每次调用的参数最多留这么长。
 const ARGS_PREVIEW: usize = 512;
@@ -35,6 +38,42 @@ struct NestedCall {
 }
 
 impl ToolExecutor {
+    /// 取消或超时打断脚本之后重读一遍 journal：宿主内存里锁住的 fatal 随执行一起丢了。
+    /// 已交付但结果不明的、started 之后没交付的，都把外层结果改成 uncertain——不自动重跑。
+    pub(super) async fn codemode_check_interrupted(
+        &self,
+        ctx: &ToolContext,
+    ) -> Result<(), ToolError> {
+        let journal = self.codemode_load(ctx).await?;
+        for child in journal.children.values() {
+            if let Some(reference) = &child.delivered {
+                let reply: Reply = self.codemode_open(reference).await?;
+                if reply.value.is_some() == reply.error.is_some() {
+                    return Err(uncertain("codemode 已交付结果格式损坏"));
+                }
+                if let Some(execution) = &reply.execution {
+                    self.outputs
+                        .open(execution)
+                        .await
+                        .map_err(|e| uncertain(e.to_string()))?;
+                }
+                if reply.uncertain {
+                    return Err(uncertain(format!(
+                        "codemode 已中断，已交付子调用结果不明；不会自动重跑：{}",
+                        reply.error.as_deref().unwrap_or("uncertain")
+                    )));
+                }
+            } else if child.started {
+                let partial = self.codemode_partial(child).await;
+                return Err(uncertain(format!(
+                    "codemode 已中断，子调用 started 后未提交交付结果；不会自动重跑{partial}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// 跑一段脚本。journal 里已有 `finished` 就直接交回那份完整结果，不再起 Python。
     pub(super) async fn run_codemode(
         &self,
         code: &str,
@@ -47,21 +86,50 @@ impl ToolExecutor {
                 message: "这台 Gateway 没有可用的 codemode 沙箱".into(),
             });
         };
-        let names: Vec<String> = env
+        let mut names: Vec<String> = env
             .surface
             .names()
             .iter()
             .filter(|name| !NOT_IN_SCRIPTS.contains(&name.as_str()))
             .cloned()
             .collect();
+        names.sort();
+        let mut journal = self.codemode_load(ctx).await?;
+        let fingerprint = Self::codemode_fingerprint(code, &names, ctx);
+        match &journal.fingerprint {
+            Some(saved) if saved != &fingerprint => {
+                return Err(uncertain("codemode 回放分歧：脚本、协议或能力面改变"));
+            }
+            None => {
+                self.codemode_record(
+                    ctx,
+                    "start",
+                    Record::Start {
+                        fingerprint: fingerprint.clone(),
+                    },
+                )
+                .await?;
+                journal.fingerprint = Some(fingerprint);
+            }
+            _ => {}
+        }
+        if let Some(output) = &journal.finished {
+            let output: ToolOutput = self.codemode_open(output).await?;
+            sink.write_stdout(output.preview.as_deref().unwrap_or_default().as_bytes())
+                .await
+                .map_err(|e| uncertain(e.to_string()))?;
+            return Ok(output);
+        }
+        let journal = Arc::new(Mutex::new(journal));
         let calls: Arc<Mutex<Vec<NestedCall>>> = Arc::default();
         let outcome = sandbox
             .run(code, &names, env.call_timeout, |name, args| {
                 let calls = Arc::clone(&calls);
+                let journal = Arc::clone(&journal);
                 async move {
                     let started = Instant::now();
                     let preview = truncate(&args.to_string(), ARGS_PREVIEW);
-                    let result = self.nested_call(&name, args, env, ctx).await;
+                    let result = self.nested_call(&name, args, env, ctx, &journal).await;
                     calls.lock().expect("调用摘要").push(NestedCall {
                         tool: name,
                         args: preview,
@@ -73,6 +141,24 @@ impl ToolExecutor {
                 }
             })
             .await;
+        let (end, pending) = {
+            let journal = journal.lock().expect("journal");
+            (
+                journal.check_end(),
+                journal
+                    .children
+                    .values()
+                    .find(|c| c.started && c.delivered.is_none())
+                    .cloned(),
+            )
+        };
+        if let Err(error) = end {
+            let partial = match pending {
+                Some(child) => self.codemode_partial(&child).await,
+                None => String::new(),
+            };
+            return Err(uncertain(format!("{error}{partial}")));
+        }
         let calls = std::mem::take(&mut *calls.lock().expect("调用摘要"));
 
         let mut text = join_outputs(&outcome.outputs);
@@ -86,12 +172,7 @@ impl ToolExecutor {
             text.push_str(&format!("\n（{}）", summary(&calls)));
         }
         let text = text.trim_start();
-        sink.write_stdout(text.as_bytes())
-            .await
-            .map_err(|error| ToolError::Failed {
-                message: error.to_string(),
-            })?;
-        Ok(ToolOutput {
+        let output = ToolOutput {
             status: if outcome.error.is_some() {
                 ToolResultStatus::Failed
             } else {
@@ -101,59 +182,308 @@ impl ToolExecutor {
             exit_code: None,
             artifacts: vec![],
             preview: Some(text.to_owned()),
+        };
+        // 先把整段结果外置、提交 `finished`，再交给外层发布：两步之间崩了，恢复时直接
+        // 交回这份结果，不再起 Python。
+        let reference = self.codemode_save(ctx, "finished", &output).await?;
+        self.codemode_record(ctx, "finished", Record::Finished { output: reference })
+            .await?;
+        sink.write_stdout(text.as_bytes())
+            .await
+            .map_err(|error| ToolError::Failed {
+                message: error.to_string(),
+            })?;
+        Ok(output)
+    }
+
+    /// `start` 记下的指纹：脚本、driver、能力表、cwd、环境版本任一变了，恢复就是分歧。
+    pub(super) fn codemode_fingerprint(
+        code: &str,
+        names: &[String],
+        ctx: &ToolContext,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "version": 1,
+            "code": ContentHash::of_str(code),
+            "driver": ContentHash::of_str(include_str!("../codemode/driver.py")),
+            "tools": names,
+            "cwd": ctx.cwd,
+            "env": ctx.env_version,
         })
     }
 
-    /// 脚本里的一次工具调用（`docs/codemode.md` §5）。错误就是交给脚本的 `ToolError` 正文。
-    async fn nested_call(
+    /// 脚本里的一次工具调用（`docs/codemode.md` §5）。错误就是交给脚本的 `ToolError` 正文；
+    /// 结果不明或宿主自己出错时锁住 fatal，之后的调用一律不再执行，脚本接住异常也解不开。
+    pub(super) async fn nested_call(
         &self,
         name: &str,
         args: serde_json::Value,
         env: &CallEnv,
         ctx: &ToolContext,
+        journal: &Mutex<Journal>,
     ) -> Result<serde_json::Value, String> {
-        if NOT_IN_SCRIPTS.contains(&name) || !env.surface.allows(name) {
-            return Err(format!("脚本里不能调 {name}"));
+        let result = self
+            .durable_nested_call(name, args, env, ctx, journal)
+            .await;
+        match result {
+            Ok(reply) => {
+                if reply.uncertain {
+                    journal.lock().expect("journal").fatal =
+                        Some(uncertain(reply.error.clone().unwrap_or_else(|| {
+                            "MCP 子调用结果不明；停止脚本后续调用".into()
+                        })));
+                    return Err("MCP 子调用结果不明；停止脚本后续调用".into());
+                }
+                reply.result()
+            }
+            Err(error) => {
+                journal.lock().expect("journal").fatal = Some(error.clone());
+                Err(error.to_string())
+            }
         }
+    }
+
+    /// 一次子调用的 journal 协议（`docs/codemode.md` §7 的表）：intent → started → 执行 →
+    /// 发布输出 → delivered，每一步提交之后才走下一步；恢复时从已记录的阶段接着走。
+    pub(super) async fn durable_nested_call(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        env: &CallEnv,
+        ctx: &ToolContext,
+        journal: &Mutex<Journal>,
+    ) -> Result<Reply, ToolError> {
+        let (index, child) = journal.lock().expect("journal").next(name, &args)?;
+        // 已记下的结果也要过当前能力面；不回退到全局工具表。
         let tool = self
             .tools
             .get(name)
-            .cloned()
-            .ok_or_else(|| format!("没有名为 {name} 的工具"))?;
-        let plan = tool
-            .prepare(args, ctx)
-            .await
-            .map_err(|error| error.to_string())?;
-        // 只放行只读计划，且不是 codemode 自己（§7 的 D8）：内层调用不落账，整段重跑
-        // 必须没有副作用。
-        if !plan.operation.is_read_only() || matches!(plan.operation, Operation::Codemode { .. }) {
-            return Err(ToolError::Denied {
-                reason: format!(
-                    "{name} 不是只读的，脚本里只能调只读工具；请在脚本外直接调用 {name}"
-                ),
+            .filter(|_| env.surface.allows(name) && !NOT_IN_SCRIPTS.contains(&name));
+        let mut child_ctx = ctx.clone();
+        let attempt = Self::codemode_attempt(ctx, &format!("c{index}"));
+        child_ctx.call = attempt.call.clone();
+        child_ctx.attempt = attempt.attempt.clone();
+        child_ctx.resumed = None;
+        let intent: Intent = match child.as_ref().and_then(|c| c.intent.as_ref()) {
+            Some(reference) => {
+                let intent: Intent = self.codemode_open(reference).await?;
+                if intent.name != name || intent.args != args {
+                    return Err(uncertain(format!(
+                        "codemode 回放分歧：子调用 c{index} 的工具名或参数改变"
+                    )));
+                }
+                if tool.is_none() {
+                    return Err(uncertain(format!("codemode 恢复能力面中没有 {name}")));
+                }
+                intent
             }
-            .to_string());
-        }
-        let mut capture = Capture::new(AttemptRef {
-            session: ctx.session.clone(),
-            run: ctx.run.clone(),
-            call: ctx.call.clone(),
-            attempt: ctx.attempt.clone(),
-        });
-        let output = tool
-            .execute(plan, ctx, &mut capture)
-            .await
-            .map_err(|error| error.to_string())?;
-        let text = match output.result.get("text").and_then(|text| text.as_str()) {
-            Some(text) => text.to_string(),
-            None if !capture.bytes.is_empty() => String::from_utf8_lossy(&capture.bytes).into(),
-            None => output.preview.clone().unwrap_or_default(),
+            None => {
+                let prepared = match tool {
+                    Some(tool) => tool
+                        .prepare(args.clone(), &child_ctx)
+                        .await
+                        .and_then(|plan| {
+                            // 放行的是有副作用的 MCP，不是经 `Tool::execute` 的本地写入或编排。
+                            if plan.then_run.is_some()
+                                || !matches!(
+                                    plan.operation,
+                                    Operation::ReadFile | Operation::McpCall { .. }
+                                )
+                            {
+                                Err(ToolError::Denied {
+                                    reason: format!(
+                                        "{name} 不是只读工具或 MCP；脚本里不支持此操作"
+                                    ),
+                                })
+                            } else {
+                                Ok(plan)
+                            }
+                        }),
+                    None => Err(ToolError::Denied {
+                        reason: format!("脚本里不能调 {name}"),
+                    }),
+                };
+                let intent = match prepared {
+                    Ok(plan) => Intent {
+                        name: name.into(),
+                        args,
+                        replay: plan
+                            .recovery
+                            .replay()
+                            .and(tool.expect("prepared tool").replay()),
+                        plan: Some(plan),
+                        error: None,
+                    },
+                    Err(error) => Intent {
+                        name: name.into(),
+                        args,
+                        replay: Replay::Unsafe,
+                        plan: None,
+                        error: Some(error.to_string()),
+                    },
+                };
+                let output = self
+                    .codemode_save(ctx, &format!("intent-{index}"), &intent)
+                    .await?;
+                self.codemode_record(
+                    ctx,
+                    &format!("intent-{index}"),
+                    Record::Intent {
+                        index,
+                        output: output.clone(),
+                    },
+                )
+                .await?;
+                journal.lock().expect("journal").children.insert(
+                    index,
+                    super::codemode_journal::Child {
+                        intent: Some(output),
+                        ..Default::default()
+                    },
+                );
+                intent
+            }
         };
-        Ok(serde_json::json!({
-            "status": output.status,
-            "text": text,
-            "result": output.result,
-        }))
+        if let Some(reference) = child.as_ref().and_then(|c| c.delivered.as_ref()) {
+            let reply: Reply = self.codemode_open(reference).await?;
+            if reply.value.is_some() == reply.error.is_some() {
+                return Err(uncertain("codemode 已交付结果格式损坏"));
+            }
+            if let Some(execution) = &reply.execution {
+                self.outputs
+                    .open(execution)
+                    .await
+                    .map_err(|e| uncertain(format!("子调用输出校验失败：{e}")))?;
+            }
+            return Ok(reply);
+        }
+        let reply = if let Some(plan) = intent.plan {
+            let tool = tool.ok_or_else(|| uncertain("子调用工具已消失"))?;
+            if child.as_ref().is_some_and(|c| c.started) {
+                if intent.replay.and(tool.replay()) != Replay::Safe {
+                    let partial = self
+                        .codemode_partial(child.as_ref().expect("started child"))
+                        .await;
+                    return Err(uncertain(format!(
+                        "codemode 子调用 c{index} ({name}) 已 started 但无交付结果；unsafe 不重跑{partial}"
+                    )));
+                }
+            }
+            if child.is_some() {
+                // 提交过 intent、还没 started 的也要按当前约束再 prepare 一次；
+                // 执行的仍是原来那份计划。
+                let current = tool
+                    .prepare(intent.args, &child_ctx)
+                    .await
+                    .map_err(|e| uncertain(format!("恢复 prepare 失败：{e}")))?;
+                if current.then_run.is_some()
+                    || plan.then_run.is_some()
+                    || current.operation != plan.operation
+                    || !matches!(
+                        current.operation,
+                        Operation::ReadFile | Operation::McpCall { .. }
+                    )
+                {
+                    return Err(uncertain("恢复工具操作类型改变"));
+                }
+            }
+            self.codemode_record(
+                ctx,
+                &format!("started-{index}-{}", ctx.attempt),
+                Record::Started {
+                    index,
+                    attempt: attempt.clone(),
+                },
+            )
+            .await?;
+            {
+                let mut journal = journal.lock().expect("journal");
+                let child = journal.children.get_mut(&index).expect("intent");
+                child.started = true;
+                child.attempt = Some(attempt.clone());
+            }
+            let writer = self
+                .outputs
+                .begin(&attempt)
+                .await
+                .map_err(|e| uncertain(e.to_string()))?;
+            let mut capture = Capture::persistent(writer);
+            let result = tool.execute(plan, &child_ctx, &mut capture).await;
+            // 工具可能把流写失败转成 Failed，甚至整个吞掉；宿主不管它怎么转，自己记着结果不明。
+            if let Some(error) = &capture.write_error {
+                return Err(uncertain(format!("子调用输出写入失败：{error}")));
+            }
+            let reply = match &result {
+                Ok(output) => {
+                    let text = match output.result.get("text").and_then(|text| text.as_str()) {
+                        Some(text) => text.to_string(),
+                        None if !capture.bytes.is_empty() => {
+                            String::from_utf8_lossy(&capture.bytes).into()
+                        }
+                        None => output.preview.clone().unwrap_or_default(),
+                    };
+                    Reply {
+                        value: Some(serde_json::json!({
+                            "status": output.status,
+                            "text": text,
+                            "result": output.result,
+                        })),
+                        error: None,
+                        uncertain: output.status == ToolResultStatus::Uncertain,
+                        execution: None,
+                    }
+                }
+                Err(error) => Reply {
+                    value: None,
+                    error: Some(error.to_string()),
+                    uncertain: error.is_uncertain()
+                        || matches!(error, ToolError::Cancelled | ToolError::Timeout { .. }),
+                    execution: None,
+                },
+            };
+            // 底层输出（流与元信息）照原样发布；脚本收到的那份精确回复另存，交付不依赖重新投影。
+            let execution = self
+                .outputs
+                .publish(
+                    capture.writer.take().expect("persistent capture"),
+                    super::result_body(&result),
+                )
+                .await
+                .map_err(|e| uncertain(format!("子调用输出发布失败：{e}")))?;
+            Reply {
+                execution: Some(execution.output),
+                ..reply
+            }
+        } else {
+            Reply {
+                value: None,
+                error: intent.error,
+                uncertain: false,
+                execution: None,
+            }
+        };
+        let output = self
+            .codemode_save(ctx, &format!("reply-{index}"), &reply)
+            .await?;
+        // 交付先提交，再回给 Python。这一笔没写进去就中断的，恢复时不拿没被引用的
+        // output.json 去猜。
+        self.codemode_record(
+            ctx,
+            &format!("delivered-{index}"),
+            Record::Delivered {
+                index,
+                output: output.clone(),
+            },
+        )
+        .await?;
+        journal
+            .lock()
+            .expect("journal")
+            .children
+            .get_mut(&index)
+            .expect("intent")
+            .delivered = Some(output);
+        Ok(reply)
     }
 }
 
@@ -203,17 +533,32 @@ fn truncate(text: &str, limit: usize) -> String {
     format!("{}…（截断）", &text[..end])
 }
 
-/// 内层只读调用的完整输出收进内存；统一投影层负责限制给模型的视图。
+/// 内层调用的输出：流照样写进子调用自己的尝试目录，同时在内存里留一份给脚本的 `text`
+/// 兜底；统一投影层负责限制给模型的视图。流写失败记在 `write_error`，不随工具怎么处理而消失。
 struct Capture {
     attempt: AttemptRef,
     bytes: Vec<u8>,
+    writer: Option<Box<dyn OutputWriter>>,
+    write_error: Option<String>,
 }
 
 impl Capture {
+    #[cfg(test)]
     fn new(attempt: AttemptRef) -> Self {
         Self {
             attempt,
             bytes: Vec::new(),
+            writer: None,
+            write_error: None,
+        }
+    }
+
+    fn persistent(writer: Box<dyn OutputWriter>) -> Self {
+        Self {
+            attempt: writer.attempt().clone(),
+            bytes: Vec::new(),
+            writer: Some(writer),
+            write_error: None,
         }
     }
 }
@@ -221,11 +566,23 @@ impl Capture {
 #[async_trait]
 impl OutputWriter for Capture {
     async fn write_stdout(&mut self, chunk: &[u8]) -> Result<(), StoreError> {
+        if let Some(writer) = self.writer.as_mut() {
+            if let Err(error) = writer.write_stdout(chunk).await {
+                self.write_error.get_or_insert_with(|| error.to_string());
+                return Err(error);
+            }
+        }
         self.bytes.extend_from_slice(chunk);
         Ok(())
     }
 
-    async fn write_stderr(&mut self, _chunk: &[u8]) -> Result<(), StoreError> {
+    async fn write_stderr(&mut self, chunk: &[u8]) -> Result<(), StoreError> {
+        if let Some(writer) = self.writer.as_mut() {
+            if let Err(error) = writer.write_stderr(chunk).await {
+                self.write_error.get_or_insert_with(|| error.to_string());
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -234,7 +591,9 @@ impl OutputWriter for Capture {
     }
 
     fn bytes_written(&self) -> u64 {
-        self.bytes.len() as u64
+        self.writer
+            .as_ref()
+            .map_or(self.bytes.len() as u64, |w| w.bytes_written())
     }
 }
 

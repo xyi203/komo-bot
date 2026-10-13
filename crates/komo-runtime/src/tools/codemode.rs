@@ -46,8 +46,9 @@ impl Tool for CodemodeTool {
                           （和受管理环境里装好的库）。\n\
                           - tools.<name>(**args)：调工具，返回 {\"status\", \"text\", \"result\"}；\
                           text 是工具的正文输出（read 是文件内容，rg 是匹配行），result 是结构化\
-                          结果。工具名里的 - 写成 _。**只能调只读的工具**（read、rg、声明为只读的 \
-                          MCP 工具），会改东西的调用会抛 ToolError，那种请在脚本外直接调。\n\
+                          结果。工具名里的 - 写成 _。可调只读工具和 MCP（含写操作）；本地写入与编排\
+                          工具仍须在脚本外调用。子调用逐次持久化，unsafe 中断不重跑；恢复核对\
+                          已记录调用及参数，禁止新增调用，分歧或结果不明会终止整段脚本。\n\
                           - text(value)：加一段输出（非字符串转 JSON）。print 的内容附在最后。\n\
                           - TOOLS：能调的工具名。\n\
                           一段脚本最多调 256 次工具；完整输出会落盘，给模型的视图统一受结果预算限制。"
@@ -63,7 +64,7 @@ impl Tool for CodemodeTool {
         }
     }
 
-    /// 脚本里只有只读调用：重启后整段重跑与重读同理（docs/codemode.md §7，§8.6）。
+    /// 宿主 journal 保证已交付的子结果复用；unsafe 子调用中断与分歧停止恢复。
     fn replay(&self) -> Replay {
         Replay::Safe
     }
@@ -93,7 +94,7 @@ impl Tool for CodemodeTool {
             targets: vec![],
             versions: PlanVersions::default(),
             resources: vec![],
-            // 里面只有只读调用：中断后整段重跑与重读同理（docs/codemode.md §7）。
+            // Safe 表示可重新进入 journal 协议，不表示可重做全部子调用。
             recovery: RecoveryMode::SafeReread,
             then_run: None,
         })

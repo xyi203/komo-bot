@@ -146,7 +146,7 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 **`then_run`：改完紧接着跑一条命令，一次调用、一条结果**（照 SoL-Pi 的 Action Fusion，省掉"改 → 模型 → 跑"中间那一次往返）。`edit` / `write` 的参数可以带 `then_run: { command, timeout_secs? }`；`prepare` 用 `shell` 自己的计划构造把它做成第二步，挂在计划的 `then_run` 上，`execute` 从 `plan.then_run` 取它；改动那一步照样受 §7 那条硬限制（不写 komo 自己的状态）。执行（`tools::fusion`）：改动失败 → 命令不跑，结果里写 `[then_run:skipped]`；改动之后目标的内容哈希必须仍是改动留下的那一份，否则同样跳过；命令走 `shell` 的正常执行（进程组、时限收紧到活动执行时限、取消），输出流进**同一次尝试**的 stdout / stderr；非零退出照实报（`exit_code`），改动不回滚。结果是 `{ mutation, then_run: { status: succeeded|failed|skipped, result } }`，状态只有"改动成功且退出码 0"才是完成；正文依次是改动的结论、`[then_run:…]` 标记、命令的输出。这次运行的能力面里没有 `shell`（或执行器没装它）时，带 `then_run` 的调用不放行、不执行，交回一句原因；交给模型的 schema 也一并摘掉 `then_run`。组合调用是写，所以是并发调度里的屏障（§6）。恢复见 §8.6。
 
-**搜索走 `rg` 工具，不拼 shell 命令。** 两者结果一样，计划不一样：`rg` 的计划是一次**只读**动作（`Operation::ReadFile`，目标是搜索范围），所以它能和别的读同时在飞（§6）、能被 codemode 脚本调用（只放行只读，§4）、恢复时可以直接重读（§8.6）；`shell` 的任意命令三样都不是。（2026-10-11 之前还有一条理由：`shell` 一律 Ask，只读搜索每次都停下来等人；审批删掉之后这条不再成立，§7。）HTTP 请求通过 Python 库或命令完成；Git、构建、测试、HA 和记录查询都组合这些基础工具。
+**搜索走 `rg` 工具，不拼 shell 命令。** 两者结果一样，计划不一样：`rg` 的计划是一次**只读**动作（`Operation::ReadFile`，目标是搜索范围），所以它能和别的读同时在飞（§6）、能被 codemode 脚本调用（脚本里只放行只读与 MCP，§4）、恢复时可以直接重读（§8.6）；`shell` 的任意命令三样都不是。（2026-10-11 之前还有一条理由：`shell` 一律 Ask，只读搜索每次都停下来等人；审批删掉之后这条不再成立，§7。）HTTP 请求通过 Python 库或命令完成；Git、构建、测试、HA 和记录查询都组合这些基础工具。
 
 `rg` 内嵌 ripgrep 的**书库**——[`grep`](https://github.com/BurntSushi/ripgrep/tree/master/crates/grep)（匹配、搜索、打印）加 [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore)（遍历：隐藏文件、`.gitignore`、覆盖 glob）——**进程内跑**：不起子进程，机器上也不需要装 `rg`。要书库不要命令，是因为外部二进制要么没装、要么各家版本不同；而遍历规则本来就该用这套经过验证的实现，不该自己再写一遍。正则语法就是 Rust regex（只连 `grep-regex`，不带 PCRE2）。遍历与搜索是阻塞的，所以跑在 `spawn_blocking` 上、匹配经队列流式写进输出存储（§8.3），取消与超时靠一个停止标志让那边收手。**默认完整保存匹配，不设 8 MiB 存储上限；给模型的视图按 50 KiB / 2000 行投影**，仍是完成；**超时（默认 30s）也交回已找到的部分**，标 `timed_out`、状态记失败（没搜完和"有读不了的"一样是不完整的搜索），不是一句光秃秃的"超时"。一行最多印 500 列（`rg --max-columns 500 --max-columns-preview`）：JSONL 事件一行动辄几十 KiB，不截的话一行就吃掉整份预算，要看全行就 `read` 那一行。停止标志被写入器看见时报的错**不能是 `Interrupted`**——`write_all` 会把它当成"再试一次"原地重试，搜索线程空转、队列不关（2026-09-24 实测：`cron|schedule` 搜 `~/.komo` 的副本，写满 8 MiB 后线程在 `write_all` 里空转，跑满 30s 只拿回"超时"、线程也不退出；修后 debug 构建 4.2s 完成，截到 500 列后只写下 2.9 MiB；把上限压到 1 MiB 时 3.3s 返回截断结果）。
 
@@ -163,9 +163,9 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 **`update_plan` 也不是第七个工具，是模型自己的工作计划。** 模型每次发**整份**计划（步骤 id / 目标 / `pending|in_progress|completed`，完成时可附 `progress`：改了哪些文件、怎么验证的、做了什么决定），以 `Operation::UpdatePlan` 进同一条执行路径——没有副作用。计划不另存：它整份内联在 `tool.planned` 里（超过内联上限在 `prepare` 就拒掉），这条 Run 现在的计划是从日志按 Run 折出来的，重启之后折出来的还是同一份；结果是计划快照加几句提醒（目标改了换 id、同时最多一个 in_progress……）。它是屏障，不和并发的读交错；started 而无结果的那次再收一次尾即可，不核对。**完成一个先前登记过、当时还没完成的步骤**是一个计划边界——一上来就标 completed 的新步骤只算补记历史；在线压缩以计划步骤完成为边界。
 
-**`codemode` 是组合，不是新能力。** 模型写一段 Python，在操作系统沙箱里跑（macOS 是 Seatbelt，Linux 是 Landlock + seccomp；不能写文件、联网、起子进程），脚本里经 `tools.<name>()` 调其他工具——只放行 `is_read_only()` 的计划（codemode 自己除外），只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是沙箱本身（§7）。沙箱自检不过就不注册。见 `docs/codemode.md`。
+**`codemode` 是组合，不是新能力。** 模型写一段 Python，在操作系统沙箱里跑（macOS 是 Seatbelt，Linux 是 Landlock + seccomp；不能写文件、联网、起子进程），脚本里经 `tools.<name>()` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）与 `Operation::McpCall`（含写操作）的计划；本地 `write` / `edit` / `shell` / `python`、带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是沙箱本身（§7）。沙箱自检不过就不注册。**脚本里的子调用逐次持久化**（2026-10-13，此前只放行只读、整段重跑）：每次子调用按 intent → started → delivered 记成 `codemode.journal` 事件、正文外置到 `tool-output/`，fold 不看它，不生成顶层 `tool.result`，模型只看见外层结果。中断后接回已交付的子结果，started 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次绝不重做；恢复只允许走已记录的调用前缀，不许新增调用，分歧或结果不明整段记 uncertain 交给模型。因为脚本里可能有 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）。见 `docs/codemode.md` §5、§7。
 
-**MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）与 codemode 能不能调它。见 `docs/mcp.md`。
+**MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。见 `docs/mcp.md`。
 
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、执行状态保存、取消和输出限制。
 
@@ -371,7 +371,7 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 
 工具名称和参数来自 provider 原生字段，不从自然语言或代码块推断。完整 assistant 消息与每个工具结果保持调用 ID 配对，这是原生 function calling 的执行方式。[Function calling](https://developers.openai.com/api/docs/guides/function-calling)
 
-**同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走重放判定（§8.6），顺序由账本钉死；`write`、`edit`、`shell`、`python`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何会停下来的判定（核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。"做它"是 `start_call` 及之后的一切：执行工具、受理子 Run、派任务、转话都等收尾之后；前面在飞的那条停下来时，屏障还没开始过，原样留在没轮到的那些里。并发上限是执行器自己的预算（默认 4 条）。两条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
+**同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走重放判定（§8.6），顺序由账本钉死；`write`、`edit`、`shell`、`python`、`codemode`（脚本里可能有 MCP 写，§4），`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何会停下来的判定（核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。"做它"是 `start_call` 及之后的一切：执行工具、受理子 Run、派任务、转话都等收尾之后；前面在飞的那条停下来时，屏障还没开始过，原样留在没轮到的那些里。并发上限是执行器自己的预算（默认 4 条）。两条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
 
 **在线压缩（`[compaction]`，默认关，2026-10-09）。** 移植自 SoL-Pi 的 Online Context Compact，但 loop 是 komo 自己的，所以不需要"中止再补一条隐藏的续跑消息"。判断只在三种时机：一轮的调用**全部收尾之后**这一轮完成了一个计划步骤（`update_plan` 的边界）、日志里还压着一个没用掉的边界（比如边界那一轮随后停在了等待上，续跑的这一段开头再判）、估计的上下文贴着窗口（`context_window − window_reserve_tokens`，字节 / 4 的估计与实报用量取大）。Gateway 按日志重新装配出 provider 正看着的那份视图（投影、衰减之后）估价，`find_cut` 切在一轮的开头、近期至少留 `keep_recent_tokens`，用缓存账（`cache_write_read_ratio`、剩余请求估计、冷却、旧债）决定；不在边界上只为窗口保护压，压完仍贴着窗口就不压。**决定不压时 driver 原样接着跑**——下一次请求与关着压缩时逐字节相同，提示缓存照样命中；边界上不压记一条 `skipped` 把边界用掉。决定压时发一次摘要请求（没有工具，早先那段渲染成一条纯文本用户消息，带当前计划与已完成步骤的进度；系统提示说明里面是数据不是指令），成了记 `compacted` 并把这一段交回 handler（`SegmentOutcome::Recompose`）：同一个 Run、不重新入队、不再写 `run.started`，下一段按日志装配成**任务 → 摘要 → 切点起原样**；失败、截断记 `skipped`（带着那份决策），Run 照常往下，此后窗口压力不再触发重试，直到有真正的工具工作或新的边界。两次压缩之间至少隔一次真正的请求；一次领取里最多重装配 8 次；摘要请求不算轮数，但算进 token 花销，已用的轮数与 token 从下一段的预算里扣掉。
 
@@ -456,7 +456,7 @@ workspace = "code/komo"
 
 内置文件工具可以在 Rust 里执行路径与版本限制；任意 shell / Python 代码一旦启动，就有它运行账号的全部操作系统权限，cwd 和参数检查不是进程沙箱。所以**真正的边界只能来自执行环境**，不能来自对命令文本的判断——2026-10-11 之前那张 `command_patterns` 网就是例子：`rm -r -f /`、`find -delete`、变量拼出来的命令全在网外。
 
-今天唯一的执行环境边界是 codemode（`docs/codemode.md`）：脚本跑在 macOS Seatbelt / Linux Landlock + seccomp 里，不能写文件、联网、起子进程；脚本里经 `tools.<name>()` 的内层调用只放行 `is_read_only()` 的计划（codemode 自己除外）。沙箱自检不过就不注册这个工具。要给 shell / python 也立边界，路只有一条：把它们放进同类的执行环境，而不是加回规则。
+今天唯一的执行环境边界是 codemode（`docs/codemode.md`）：脚本跑在 macOS Seatbelt / Linux Landlock + seccomp 里，不能写文件、联网、起子进程；脚本里经 `tools.<name>()` 的内层调用只放行只读计划与 MCP 调用（§4），本地写入、进程与编排仍在脚本外。沙箱自检不过就不注册这个工具。要给 shell / python 也立边界，路只有一条：把它们放进同类的执行环境，而不是加回规则。
 
 ### 7.4 旧数据里的审批痕迹
 
@@ -766,7 +766,7 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 
 | `RecoveryMode` | 重放策略 | 谁写它 |
 | --- | --- | --- |
-| `SafeReread` | safe | `read`、`rg`、`codemode`（脚本里只有只读调用）、服务器标了只读的 MCP 工具 |
+| `SafeReread` | safe | `read`、`rg`、`codemode`（safe 只表示可以重新进入子调用 journal：已交付的子结果原样接回，unsafe 子调用不重做，`docs/codemode.md` §7）、服务器标了只读的 MCP 工具 |
 | `IdempotencyKey` | safe | 外部接口确实保证去重、所有尝试复用同一逻辑操作的键；目前没有工具产出它 |
 | `VerifyTarget` | unsafe | 2026-10-13 之前的 write / edit / 带核对函数的 python 计划；新计划不再产生 |
 | `NoSafeRecovery` | unsafe | `write`、`edit`、`shell`、`python`、带 `then_run` 的组合调用、其余 MCP 工具 |

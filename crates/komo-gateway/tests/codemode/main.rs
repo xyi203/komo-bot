@@ -95,7 +95,7 @@ except ToolError as error:
         return;
     };
     assert!(
-        result.contains("refused: ") && result.contains("write 不是只读的"),
+        result.contains("refused: ") && result.contains("write 不是只读工具或 MCP"),
         "{result}"
     );
     assert!(!home.workspace().join("x.txt").exists());

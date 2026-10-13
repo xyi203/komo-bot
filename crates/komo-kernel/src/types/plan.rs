@@ -111,8 +111,8 @@ pub enum Operation {
     },
     /// 一段在操作系统沙箱里跑的 Python 脚本（`docs/codemode.md`）。
     ///
-    /// 脚本自己碰不到文件、网络与进程；它里面的工具调用回到 executor，**只放行只读的**
-    /// （[`Operation::is_read_only`]，且不是 codemode 本身）。所以它整体是只读的：中断后整段重跑与重读同理。
+    /// 脚本自己碰不到文件、网络与进程；工具调用经 executor 的 durable journal。
+    /// 允许只读操作及 MCP（包括写操作），所以整段是调度屏障；恢复接回已记录子结果。
     Codemode { code: String },
 }
 
@@ -122,7 +122,6 @@ impl Operation {
         matches!(
             self,
             Operation::ReadFile
-                | Operation::Codemode { .. }
                 | Operation::McpCall {
                     read_only: true,
                     ..
@@ -282,7 +281,8 @@ impl RecoveryMode {
 /// 规则借自 pi-durable：计划里记下的策略与工具**现在**声明的（[`crate::traits::Tool::replay`]）
 /// 都是 `Safe` 才重跑；现在的 `Unsafe` 能否决记下的 `Safe`，反过来不行。其余一律把中断
 /// 结果（带中断前已落盘的部分输出）交给模型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Replay {
     Safe,
     Unsafe,

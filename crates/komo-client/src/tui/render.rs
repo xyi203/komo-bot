@@ -158,10 +158,15 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
         })
         .collect();
 
+    let hint = app.input_hint();
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(format!(" {} ", app.input_hint()))
+        .title(if hint.is_empty() {
+            String::new()
+        } else {
+            format!(" {hint} ")
+        })
         .border_style(Style::default().fg(if !enabled {
             Color::Yellow
         } else if shell {

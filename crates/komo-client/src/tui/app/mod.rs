@@ -14,7 +14,7 @@ mod keys;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::protocol::http::{
@@ -308,8 +308,6 @@ pub struct App {
     /// 已经提示过"有一帧读不懂"——只说一次，之后只进日志（见
     /// [`ServerEvent::FrameSkipped`]）。
     skipped_noticed: bool,
-    /// `!` 直接执行的那些 Run（`run.accepted` 的快照里认出来的）：它们的结果要补一句说明。
-    pub(crate) shell_runs: BTreeSet<RunId>,
     /// 这一段对话到此为止花掉的 token（模型每答一轮报一次，见 `message.assistant`）。
     pub tokens_in: u64,
     pub tokens_out: u64,
@@ -360,7 +358,6 @@ impl App {
             listing_models: false,
             model_picker: None,
             skipped_noticed: false,
-            shell_runs: BTreeSet::new(),
             tokens_in: 0,
             tokens_out: 0,
             counted: Seq::ZERO,
@@ -549,9 +546,9 @@ impl App {
         if self.phase.is_backfilling() {
             return "正在补读历史……".to_string();
         }
+        // 终端模式不说话：边框与那个 `!` 换了颜色，已经说清这一条不经模型。
         if self.shell_mode() {
-            return "Shell 模式 · Enter 直接执行（不经过模型，结果记进会话）· 删掉 ! 退出"
-                .to_string();
+            return String::new();
         }
         "Enter 发送 · Shift-Enter 换行 · Esc 停当前任务 · Ctrl-C 退出 · / 看命令 · ! 跑命令"
             .to_string()

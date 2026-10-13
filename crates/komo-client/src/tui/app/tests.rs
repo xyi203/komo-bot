@@ -1161,14 +1161,10 @@ fn a_bang_draft_is_shell_mode_and_backspacing_the_bang_leaves_it() {
     let mut app = app();
     type_text(&mut app, "!");
     assert!(app.shell_mode());
-    assert!(
-        app.input_hint().contains("Shell 模式"),
-        "{}",
-        app.input_hint()
-    );
+    assert_eq!(app.input_hint(), "", "终端模式不给文字提示");
     app.handle_key(key(KeyCode::Backspace));
     assert!(!app.shell_mode(), "删掉 ! 就回到普通模式");
-    assert!(!app.input_hint().contains("Shell 模式"));
+    assert!(!app.input_hint().is_empty());
 }
 
 #[test]
@@ -1213,10 +1209,10 @@ fn a_bang_command_that_needs_a_terminal_is_refused_and_the_draft_stays() {
     );
 }
 
+/// 终端模式跑完不补说明：撞上只读也只有结果本身。
 #[test]
-fn a_bang_result_that_hit_the_read_only_guard_is_explained() {
+fn a_bang_result_gets_no_hint() {
     let mut app = app();
-    app.shell_runs.insert(fixture::run());
     let mut events = fixture::conversation();
     for event in &mut events {
         if let EventPayload::ToolResult(body) = &mut event.payload {
@@ -1227,19 +1223,7 @@ fn a_bang_result_that_hit_the_read_only_guard_is_explained() {
             );
         }
     }
+    let before = notices(&app);
     feed(&mut app, &events);
-    assert!(notices(&app).contains("只读"), "{}", notices(&app));
-}
-
-#[test]
-fn an_ordinary_runs_tool_result_gets_no_shell_hint() {
-    let mut app = app();
-    let mut events = fixture::conversation();
-    for event in &mut events {
-        if let EventPayload::ToolResult(body) = &mut event.payload {
-            body.preview = Some("exit=127 stdout=0B stderr=9B\nnope".into());
-        }
-    }
-    feed(&mut app, &events);
-    assert!(!notices(&app).contains("PATH"), "{}", notices(&app));
+    assert_eq!(notices(&app), before);
 }

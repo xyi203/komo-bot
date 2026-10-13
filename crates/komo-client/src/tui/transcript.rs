@@ -9,7 +9,12 @@
 //! - **定型**（[`Emitted::take`]）：用户那条消息、助手那段回答、跑完的一次工具调用、
 //!   一条提示。交出去一次，之后再也不动——所以判「定型」要保守，宁可多在视口里待一帧。
 //! - **还在动**（[`Emitted::live`]）：还没收到 `run.accepted` 的那条提交、模型正在打字
-//!   的草稿、还没跑完的工具调用。每一帧重画，永不交出去。
+//!   的草稿里还没写完的那一段、还没跑完的工具调用。每一帧重画，永不交出去。
+//!
+//! 草稿是唯一跨在两边的：**写完的段落边生成边交出去**（[`markdown::settled_prefix`]），
+//! 视口里只留正在写的那一段。否则一段几十行的回答生成期间只露出视口里的几行尾巴，往上
+//! 滚也滚不到开头——前面那些还没交给终端。正式的 `message.assistant` 到了，只补交还没交
+//! 出去的部分。
 //!
 //! 两边**不重叠**：一条东西定型的那一帧，它从「还在动」里消失、同时出现在回滚区上，所以
 //! 屏幕上不会有两份。判重的记号在 [`Emitted`] 里，不在 [`App`] 里——那是终端这一侧的
@@ -18,14 +23,14 @@
 use std::collections::BTreeSet;
 
 use komo_kernel::fold::SurfaceMessage;
-use komo_kernel::types::ids::{Seq, ToolCallId};
+use komo_kernel::types::ids::{RunId, Seq, ToolCallId};
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::turn::Role;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use time::OffsetDateTime;
 
-use crate::tui::app::{App, Notice, SubmissionState, ToolLine};
+use crate::tui::app::{App, Draft, Notice, SubmissionState, ToolLine};
 use crate::tui::{markdown, spinner};
 
 /// 用户那一条的行首记号。
@@ -41,6 +46,17 @@ pub struct Emitted {
     tools: BTreeSet<ToolCallId>,
     /// 交出去的最后一条提示的编号。
     notices: u64,
+    /// 模型正在生成（或刚生成完、正式消息还没到）的那几段，各自交出去了多少。
+    streams: Vec<Stream>,
+}
+
+/// 一段草稿已经交给回滚区的前缀。
+#[derive(Debug)]
+struct Stream {
+    run: RunId,
+    round: u32,
+    /// 交出去的那段原文：总是停在 [`markdown::settled_prefix`] 上。
+    committed: String,
 }
 
 impl Emitted {
@@ -59,7 +75,10 @@ impl Emitted {
 
         let messages = app.messages();
         for message in messages.iter().skip(self.messages) {
-            let lines = message_lines(message, width);
+            let lines = match self.streamed(message) {
+                Some(stream) => rest_lines(message, &stream.committed, width),
+                None => message_lines(message, width),
+            };
             if !lines.is_empty() {
                 items.push((message.seq, lines));
             }
@@ -80,6 +99,38 @@ impl Emitted {
             .into_iter()
             .flat_map(|(_, lines)| lines)
             .collect::<Vec<_>>();
+
+        // Run 结束了、正式消息却没来（取消、失败）：交出去的那半段就是全部，说一声。
+        self.streams.retain(|stream| {
+            let ended = app
+                .surface
+                .runs
+                .get(&stream.run)
+                .is_some_and(|view| view.status.is_terminal());
+            let drafting = app
+                .draft
+                .as_ref()
+                .is_some_and(|draft| draft.run == stream.run && draft.round == stream.round);
+            if ended && !drafting {
+                if !stream.committed.is_empty() {
+                    out.push(dim("（这段回答没有生成完）"));
+                    out.push(Line::default());
+                }
+                return false;
+            }
+            true
+        });
+
+        // 草稿里写完的段落：最新的内容，排在这一批的最后。
+        if let Some(draft) = &app.draft {
+            let settled = markdown::settled_prefix(&draft.text);
+            let stream = self.stream_for(draft);
+            let done = stream.committed.len();
+            if settled > done && draft.text.starts_with(&stream.committed) {
+                out.extend(markdown::render(&draft.text[done..settled], width));
+                stream.committed = draft.text[..settled].to_string();
+            }
+        }
 
         for notice in &app.notices {
             if notice.id <= self.notices {
@@ -125,9 +176,11 @@ impl Emitted {
         }
 
         // 模型正在打字的那一段：**不是历史**（`assistant_delta` 只在 SSE 上，永不进
-        // JSONL）。`message.assistant` 到达时它就地清掉，正文由那一条落进回滚区。
+        // JSONL）。写完的段落已经交出去了，这里只画还在写的那一段；`message.assistant`
+        // 到达时它就地清掉，余下的正文由那一条落进回滚区。
         if let Some(draft) = &app.draft {
-            lines.extend(markdown::render(&draft.text, width));
+            let done = self.committed_len(draft);
+            lines.extend(markdown::render(&draft.text[done..], width));
             lines.push(Line::from(Span::styled(
                 format!("{} 生成中", spinner::frame(app.now)),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
@@ -141,6 +194,45 @@ impl Emitted {
             lines.extend(tool_lines(tool, app.tool_detail, width, app.now));
         }
         lines
+    }
+
+    /// 这条正式消息之前有没有边生成边交出去过：有就取走那段记账。
+    fn streamed(&mut self, message: &SurfaceMessage) -> Option<Stream> {
+        if message.role != Role::Assistant {
+            return None;
+        }
+        let run = message.run.as_ref()?;
+        let at = self.streams.iter().position(|stream| &stream.run == run)?;
+        let stream = self.streams.remove(at);
+        (!stream.committed.is_empty()).then_some(stream)
+    }
+
+    fn stream_for(&mut self, draft: &Draft) -> &mut Stream {
+        let at = match self
+            .streams
+            .iter()
+            .position(|stream| stream.run == draft.run && stream.round == draft.round)
+        {
+            Some(at) => at,
+            None => {
+                self.streams.push(Stream {
+                    run: draft.run.clone(),
+                    round: draft.round,
+                    committed: String::new(),
+                });
+                self.streams.len() - 1
+            }
+        };
+        &mut self.streams[at]
+    }
+
+    /// 这段草稿已经交出去了多少字节。
+    fn committed_len(&self, draft: &Draft) -> usize {
+        self.streams
+            .iter()
+            .find(|stream| stream.run == draft.run && stream.round == draft.round)
+            .filter(|stream| draft.text.starts_with(&stream.committed))
+            .map_or(0, |stream| stream.committed.len())
     }
 
     /// 这一次调用定型了没有。
@@ -180,6 +272,26 @@ fn message_lines(message: &SurfaceMessage, width: u16) -> Vec<Line<'static>> {
     if !lines.is_empty() {
         lines.push(Line::default());
     }
+    lines
+}
+
+/// 边生成边交出去过的那条正式消息：只补还没交出去的部分。
+///
+/// 正式正文与交出去的那段对不上（断线之后草稿接错了）就照实给出整条定稿，前面说一句；
+/// 正文外置了（`text` 为空）就只收个尾——交出去的那些是能显示的全部。
+fn rest_lines(message: &SurfaceMessage, committed: &str, width: u16) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    match message.text.as_deref() {
+        Some(text) if text.starts_with(committed) => {
+            lines.extend(markdown::render(&text[committed.len()..], width));
+        }
+        Some(text) => {
+            lines.push(dim("（定稿与上面边生成边显示的不一致，以下是定稿）"));
+            lines.extend(markdown::render(text, width));
+        }
+        None => {}
+    }
+    lines.push(Line::default());
     lines
 }
 
@@ -299,6 +411,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use komo_kernel::events::Event;
     use komo_kernel::protocol::sse::{SseEvent, SseFrame};
+    use komo_kernel::types::ids::Seq;
 
     fn feed(app: &mut App, events: &[Event]) {
         for event in events {
@@ -423,6 +536,129 @@ mod tests {
             "Run 结束了，停在半路的调用也该落地"
         );
         assert!(emitted.live(&app, 80).is_empty());
+    }
+
+    fn delta(app: &mut App, round: u32, text: &str) {
+        app.apply(ServerEvent::Frame(Box::new(SseFrame {
+            id: Seq(100),
+            session: fixture::session(),
+            event: SseEvent::AssistantDelta {
+                run: fixture::run(),
+                round,
+                text: text.into(),
+            },
+        })));
+    }
+
+    fn assistant(seq: u64, text: &str) -> Event {
+        fixture::event(
+            seq,
+            Some(fixture::run()),
+            komo_kernel::events::EventPayload::MessageAssistant(
+                komo_kernel::events::MessageAssistant {
+                    round: 1,
+                    text: Some(text.into()),
+                    text_ref: None,
+                    tool_calls: vec![],
+                    provider_blocks: None,
+                    input_tokens: None,
+                    output_tokens: None,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                },
+            ),
+        )
+    }
+
+    /// 生成中写完的段落**边写边交给回滚区**，视口只留正在写的那一段；正式消息到了只补
+    /// 余下的部分。拼起来与整条消息一次交出去逐行相同，一行不多一行不少。
+    #[test]
+    fn finished_paragraphs_reach_the_scrollback_while_the_answer_streams() {
+        let whole = "第一段写完了。\n\n```sh\nls\n\nls -la\n```\n\n第三段还在写";
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &fixture::conversation()[..3]);
+        let mut emitted = Emitted::new();
+        let mut scrollback = emitted.take(&app, 80);
+
+        delta(&mut app, 1, "第一段写");
+        assert!(emitted.take(&app, 80).is_empty(), "段落没写完不交");
+        assert!(text_of(&emitted.live(&app, 80)).contains("第一段写"));
+
+        delta(&mut app, 1, "完了。\n\n```sh\nls\n\n");
+        let first = emitted.take(&app, 80);
+        assert_eq!(
+            text_of(&first),
+            "第一段写完了。",
+            "围栏里的空行不是段落边界"
+        );
+        let live = text_of(&emitted.live(&app, 80));
+        assert!(!live.contains("第一段"), "交出去的不再画在视口里：{live}");
+        assert!(live.contains("ls"), "{live}");
+        scrollback.extend(first);
+
+        delta(&mut app, 1, "ls -la\n```\n\n第三段还在写");
+        scrollback.extend(emitted.take(&app, 80));
+        assert!(text_of(&emitted.live(&app, 80)).contains("第三段还在写"));
+
+        feed(&mut app, &[assistant(4, whole)]);
+        scrollback.extend(emitted.take(&app, 80));
+        assert!(!text_of(&emitted.live(&app, 80)).contains("第三段"));
+
+        let mut once = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut once, &fixture::conversation()[..3]);
+        feed(&mut once, &[assistant(4, whole)]);
+        assert_eq!(
+            text_of(&scrollback),
+            text_of(&Emitted::new().take(&once, 80))
+        );
+    }
+
+    /// 取消在半路：交出去的那半段留在回滚区，补一句没写完；一段都没交出去就什么都不说。
+    #[test]
+    fn a_cancelled_answer_keeps_what_streamed_and_says_it_stopped() {
+        let cancelled = fixture::event(
+            9,
+            Some(fixture::run()),
+            komo_kernel::events::EventPayload::RunCancelled(komo_kernel::events::RunCancelled {
+                by: None,
+            }),
+        );
+
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &fixture::conversation()[..3]);
+        let mut emitted = Emitted::new();
+        let _ = emitted.take(&app, 80);
+        delta(&mut app, 1, "写完的一段。\n\n没写完的");
+        assert_eq!(text_of(&emitted.take(&app, 80)), "写完的一段。");
+        feed(&mut app, std::slice::from_ref(&cancelled));
+        assert!(text_of(&emitted.take(&app, 80)).contains("没有生成完"));
+        assert!(emitted.live(&app, 80).is_empty());
+
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &fixture::conversation()[..3]);
+        let mut emitted = Emitted::new();
+        let _ = emitted.take(&app, 80);
+        delta(&mut app, 1, "一句也没写完");
+        let _ = emitted.take(&app, 80);
+        feed(&mut app, &[cancelled]);
+        assert!(!text_of(&emitted.take(&app, 80)).contains("没有生成完"));
+    }
+
+    /// 定稿与边写边交出去的对不上（断线之后草稿接错了）：照实给出整条定稿，前面说一句。
+    #[test]
+    fn a_final_message_that_disagrees_with_the_stream_is_shown_whole() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &fixture::conversation()[..3]);
+        let mut emitted = Emitted::new();
+        let _ = emitted.take(&app, 80);
+        delta(&mut app, 1, "接错的一段。\n\n");
+        let _ = emitted.take(&app, 80);
+        feed(&mut app, &[assistant(4, "真正的回答。")]);
+        let rest = text_of(&emitted.take(&app, 80));
+        assert!(
+            rest.contains("以下是定稿") && rest.contains("真正的回答。"),
+            "{rest}"
+        );
     }
 
     /// 还没收到回执的那条提交只在视口里；回执到了由折出来的那条落地，不重复。

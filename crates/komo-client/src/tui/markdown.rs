@@ -98,6 +98,52 @@ pub fn render(markdown: &str, width: u16) -> Vec<Line<'static>> {
     renderer.finish()
 }
 
+/// 一段还在生成的 Markdown 里**已经定型**的那一段前缀有多长（字节）。
+///
+/// 定型 = 停在一个代码块之外的空行之后。渲染器一块一块地出行、块与块之间不插空行，所以
+/// 这一段单独渲染出来的行，与整段渲染出来的开头那几行一样——可以先交给回滚区，后面再
+/// 来的字改不动它。段落里不能切：软换行会把上下两行接起来重新折。
+pub fn settled_prefix(markdown: &str) -> usize {
+    let mut settled = 0usize;
+    let mut offset = 0usize;
+    // 开着的代码围栏：围栏字符与长度，收尾要同一种字符、至少一样长。
+    let mut fence: Option<(char, usize)> = None;
+    for line in markdown.split_inclusive('\n') {
+        offset += line.len();
+        // 最后一行还没打完：它是什么还说不准。
+        if !line.ends_with('\n') {
+            break;
+        }
+        let body = line.trim_end_matches(['\n', '\r']);
+        let indent = body.len() - body.trim_start_matches(' ').len();
+        let marker = body.trim_start_matches(' ');
+        let run = |ch: char| marker.chars().take_while(|c| *c == ch).count();
+        if indent <= 3 {
+            match fence {
+                Some((ch, len))
+                    if run(ch) >= len && marker.trim_end_matches(ch).trim().is_empty() =>
+                {
+                    fence = None;
+                    continue;
+                }
+                None if run('`') >= 3 => {
+                    fence = Some(('`', run('`')));
+                    continue;
+                }
+                None if run('~') >= 3 => {
+                    fence = Some(('~', run('~')));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        if fence.is_none() && body.trim().is_empty() {
+            settled = offset;
+        }
+    }
+    settled
+}
+
 #[derive(Default)]
 struct Renderer {
     width: usize,
@@ -416,6 +462,49 @@ fn heading_depth(level: HeadingLevel) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plain(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_a_blank_line_outside_a_fence_settles_what_came_before() {
+        assert_eq!(settled_prefix("第一段还没完"), 0);
+        assert_eq!(settled_prefix("第一段\n第一段续行\n"), 0, "段落里不切");
+        assert_eq!(settled_prefix("第一段\n\n第二段"), "第一段\n\n".len());
+        // 围栏里的空行是代码的一部分。
+        let open = "前言\n\n```rust\nfn a() {}\n\nfn b() {}\n";
+        assert_eq!(settled_prefix(open), "前言\n\n".len());
+        let closed = format!("{open}```\n\n尾巴");
+        assert_eq!(settled_prefix(&closed), closed.len() - "尾巴".len());
+        // 四个反引号开的围栏，三个关不上。
+        let long = "````\na\n```\n\nb\n````\n\n";
+        assert_eq!(settled_prefix(long), long.len());
+        assert_eq!(settled_prefix("````\na\n```\n\nb\n"), 0);
+    }
+
+    /// 切下来的那一段单独渲染，与整段渲染的开头逐行相同——先交出去的行后来改不了。
+    #[test]
+    fn a_settled_prefix_renders_as_the_head_of_the_whole() {
+        let whole = "# 标题\n\n一段很长的中文段落，需要在窄终端里折成好几行才放得下，这样才能检验折行。\n\n\
+                     - 第一项\n- 第二项\n\n```sh\nls -la\n\necho hi\n```\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n尾巴还在写";
+        let cut = settled_prefix(whole);
+        assert!(cut > 0 && cut < whole.len());
+        let head = plain(&render(&whole[..cut], 30));
+        let full = plain(&render(whole, 30));
+        assert_eq!(full[..head.len()], head[..]);
+        let mut joined = head.clone();
+        joined.extend(plain(&render(&whole[cut..], 30)));
+        assert_eq!(joined, full, "前缀 + 余下各自渲染，拼起来就是整段");
+    }
 
     fn widths(lines: &[Line<'_>]) -> Vec<usize> {
         lines.iter().map(|line| line.width()).collect()

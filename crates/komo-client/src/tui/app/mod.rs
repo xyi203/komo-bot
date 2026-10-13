@@ -94,6 +94,8 @@ pub enum ServerEvent {
     Status(Box<SessionDetail>),
     /// 待处理清单（§7.5）：结果不明、阻塞两类一起。
     Pending(Vec<InterventionSummary>),
+    /// [`Effect::RefreshPending`] 取回来的清单：只换掉那一份，不印。
+    PendingRefreshed(Vec<InterventionSummary>),
     /// `GET /v1/models` 的结果。
     ModelMenu(Vec<ModelMenuEntry>),
     /// 一次操作失败。
@@ -137,6 +139,9 @@ pub enum Effect {
         request_key: RequestKey,
     },
     FetchPending,
+    /// 悄悄再取一次清单：别处答掉的那条要从状态行上消失（[`App::poll_pending`]）。
+    /// 回来的清单不印，取失败也不说——下一拍还会再问。
+    RefreshPending,
     FetchStatus,
     /// `GET /v1/models`：模型清单与每个模型支持的 effort 档位。
     FetchModels,
@@ -525,6 +530,21 @@ impl App {
     /// 按句柄找清单上那一条。
     pub fn pending_item(&self, handle: &str) -> Option<&InterventionSummary> {
         self.pending.get(handle)
+    }
+
+    /// 驱动每隔一段时间问一句：清单要不要再取一次。
+    ///
+    /// 答复可以来自**这个界面之外**——另一个终端的 `komo intervention answer`、聊天里的
+    /// `/answer`、模型在 shell 里替人答的那一条——而答复只改 state.db，本会话的事件流
+    /// 里没有它（§8.8）。所以清单上挂着东西时就定期再问，免得一条早已答过的一直挂在
+    /// 状态行上。清单是空的不问：那时候没有会过期的东西。连接不在（Gateway 正在重启）
+    /// 也不问：重连成功那一刻本来就会问一次。
+    pub fn poll_pending(&self) -> Vec<Effect> {
+        if !self.pending.is_empty() && self.connection.is_connected() {
+            vec![Effect::RefreshPending]
+        } else {
+            Vec::new()
+        }
     }
 
     /// 输入框里是不是一条 `!` 命令（shell 模式）。

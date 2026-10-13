@@ -355,6 +355,72 @@ fn a_run_stopping_to_wait_asks_for_the_pending_list() {
     assert!(quiet.is_empty(), "{quiet:?}");
 }
 
+/// 别处答掉的那条（另一个终端、聊天、模型在 shell 里替人答）不经过本会话的事件流：清单上
+/// 挂着东西时定期悄悄再问，答掉的那条下一拍就从状态行上消失，问回来的清单不印。
+#[test]
+fn an_answer_given_elsewhere_leaves_the_status_line_on_the_next_poll() {
+    let mut app = app();
+    app.apply(ServerEvent::Connection(ConnectionState::Connected));
+    assert!(app.poll_pending().is_empty(), "清单是空的不问");
+
+    app.apply(pending_list(&["run-1"]));
+    assert_eq!(app.poll_pending(), vec![Effect::RefreshPending]);
+
+    let printed = app.notices.len();
+    // 清单没变：照样不印。
+    app.apply(ServerEvent::PendingRefreshed(vec![
+        fixture::intervention_summary("run-1", InterventionKind::Verify, "上次那个调用发生了没有"),
+    ]));
+    assert_eq!(app.pending_count(), 1);
+    assert_eq!(app.notices.len(), printed, "{}", notices(&app));
+    // 那条在别处答掉了。
+    let effects = app.apply(ServerEvent::PendingRefreshed(Vec::new()));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(app.pending_count(), 0);
+    assert_eq!(app.notices.len(), printed, "{}", notices(&app));
+    assert!(app.poll_pending().is_empty());
+
+    // Gateway 正在重启时不问：重连成功那一刻本来就会问一次。
+    app.apply(pending_list(&["run-1"]));
+    app.apply(ServerEvent::Connection(ConnectionState::Reconnecting {
+        attempt: 1,
+        reason: "Gateway 断开了连接".into(),
+    }));
+    assert!(app.poll_pending().is_empty());
+}
+
+/// 本会话的 Run 结束、清单上挂着别的会话的：这一轮里多半答过其中一条，立刻悄悄问一次。
+#[test]
+fn a_run_ending_here_refreshes_a_pending_list_it_is_not_on() {
+    let mut app = app();
+    let here = RunId::from_raw("run-here");
+    let ended = |app: &mut App, state| {
+        app.apply(ServerEvent::Frame(Box::new(SseFrame {
+            id: Seq(30),
+            session: fixture::session(),
+            event: SseEvent::RunStatus {
+                run: here.clone(),
+                state,
+            },
+        })))
+    };
+    assert!(
+        ended(&mut app, RunState::Completed).is_empty(),
+        "清单是空的不问"
+    );
+
+    app.apply(pending_list(&["run-1"]));
+    assert_eq!(
+        ended(&mut app, RunState::Completed),
+        vec![Effect::RefreshPending]
+    );
+    assert_eq!(
+        ended(&mut app, RunState::Failed),
+        vec![Effect::RefreshPending]
+    );
+    assert!(ended(&mut app, RunState::Running).is_empty(), "还在跑不问");
+}
+
 // ---- 命令 ----
 
 fn command(app: &mut App, text: &str) -> Vec<Effect> {

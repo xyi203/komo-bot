@@ -114,13 +114,7 @@ impl App {
                 Vec::new()
             }
             ServerEvent::Pending(items) => {
-                // 这一份**替换**清单，不是往里加：它就是 `GET /v1/interventions` 的当前
-                // 答案，而"上一次问到的、这次已经不在了"那些必须跟着消失——否则状态行会一直
-                // 挂着一条早就答过的。
-                self.pending = items
-                    .into_iter()
-                    .map(|item| (item.handle.clone(), item))
-                    .collect();
+                self.replace_pending(items);
                 // 先攒成文字再 `note`：`note` 要 `&mut self`，而这里还借着 `self.pending`。
                 let lines: Vec<String> = self.pending.values().map(pending_line).collect();
                 let count = lines.len();
@@ -137,6 +131,12 @@ impl App {
                     // 清单是给人挑的，答法得跟着（§11.3：每一条都要写清该答什么；一次答一条）。
                     self.note("答一条：/answer <句柄> <结论>");
                 }
+                Vec::new()
+            }
+            ServerEvent::PendingRefreshed(items) => {
+                // 定期再问回来的（[`super::App::poll_pending`]）：清单没变时每拍印一遍是刷屏，
+                // 变了状态行的条数与提示行自己会跟着变——要看全文的人有 `/pending`。
+                self.replace_pending(items);
                 Vec::new()
             }
             ServerEvent::ModelMenu(models) => {
@@ -242,10 +242,26 @@ impl App {
                 {
                     return vec![Effect::FetchPending];
                 }
+                // 本会话的一条 Run 结束了，清单上还挂着别的：这一轮里多半有人（或模型在 shell
+                // 里）答过其中一条，立刻悄悄问一次，不等下一拍轮询。
+                if state.is_terminal() && !self.pending.is_empty() {
+                    return vec![Effect::RefreshPending];
+                }
                 Vec::new()
             }
             SseEvent::Heartbeat => Vec::new(),
         }
+    }
+
+    /// 换上一份新问到的清单。
+    ///
+    /// **替换**，不是往里加：它就是 `GET /v1/interventions` 的当前答案，而"上一次问到的、
+    /// 这次已经不在了"那些必须跟着消失——否则状态行会一直挂着一条早就答过的。
+    fn replace_pending(&mut self, items: Vec<InterventionSummary>) {
+        self.pending = items
+            .into_iter()
+            .map(|item| (item.handle.clone(), item))
+            .collect();
     }
 
     /// 吃进一条 JSONL 事件：折进 Surface，再补两张 Surface 说不出的边表。

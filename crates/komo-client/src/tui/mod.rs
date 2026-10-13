@@ -63,6 +63,8 @@ const BACKFILL_PAGE: u32 = 500;
 /// 比一帧（[`spinner::FRAME_MS`]）快一点，转圈才不会一卡一卡的。一拍只重画底下那一小块
 /// 视口，而且 ratatui 只写真的变了的格子——没在跑的时候这一拍什么字节都不发。
 const TICK: Duration = Duration::from_millis(80);
+/// 清单上挂着东西时多久再问一次（[`App::poll_pending`]）：别处答掉的那条最多挂这么久。
+const PENDING_POLL: Duration = Duration::from_secs(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
@@ -151,6 +153,9 @@ pub async fn run_tui(
     let _ = terminal.commit(render::banner(&app, &cwd));
     let mut emitted = Emitted::new();
     let mut ticker = tokio::time::interval(TICK);
+    let mut pending_poll = tokio::time::interval(PENDING_POLL);
+    // 卡住一阵之后不补拍：补回来的几次问的是同一件事。
+    pending_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let outcome = loop {
         if app.quit {
@@ -199,6 +204,10 @@ pub async fn run_tui(
                 spawn_effects(&client, app.session.as_ref(), effects, &events_tx);
             }
             _ = ticker.tick() => {}
+            _ = pending_poll.tick() => {
+                let effects = app.poll_pending();
+                spawn_effects(&client, app.session.as_ref(), effects, &events_tx);
+            }
         }
 
         // 会话刚铸出来：订阅在这里建立，`select!` 的分支体里换它借不过编译器——那一
@@ -437,6 +446,17 @@ async fn run_effect(
         {
             Ok(response) => Some(ServerEvent::Pending(response.interventions)),
             Err(error) => Some(ServerEvent::Failed(format!("取待处理清单失败：{error}"))),
+        },
+        Effect::RefreshPending => match client
+            .interventions(&InterventionListQuery::default())
+            .await
+        {
+            Ok(response) => Some(ServerEvent::PendingRefreshed(response.interventions)),
+            // 每 5 秒一条同样的失败是刷屏；下一拍还会再问，`/pending` 问的那次照样会说。
+            Err(error) => {
+                tracing::debug!(%error, "悄悄再取待处理清单失败");
+                None
+            }
         },
         Effect::FetchStatus => match session {
             Some(session) => match client.session(session).await {

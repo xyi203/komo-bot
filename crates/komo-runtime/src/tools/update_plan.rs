@@ -43,8 +43,9 @@ impl Tool for UpdatePlanTool {
         });
         ToolDefinition {
             name: NAME.into(),
-            description: "更新这次任务的工作计划。多步的事先登记计划，之后每推进一步再调一次；\
-                          没有副作用。规则：每次都发**整份**计划，不是增量；步骤 id \
+            description: "更新这次任务的工作计划。要很多轮工具调用才做得完的事先登记计划，\
+                          之后每推进一步再调一次；几次调用就能做完的不用。没有副作用，\
+                          和下一步的工具调用放在同一轮一起发。规则：每次都发**整份**计划，不是增量；步骤 id \
                           保持不变，先登记、做完再标 completed（一上来就标 completed 的新步骤\
                           只算补记历史）；同一时间最多一个 in_progress；标 completed 时在 \
                           progress 里写上改了哪些文件、怎么验证的、做了什么决定——完成一步时 \

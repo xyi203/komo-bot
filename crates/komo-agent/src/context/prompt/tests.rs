@@ -97,7 +97,8 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
     assert!(sub.contains("别用 shell 拼 grep"), "{sub}");
 }
 
-/// 挂了 `update_plan` 才提计划，主对话与子代理一样。
+/// 挂了 `update_plan` 才提计划，主对话与子代理一样；提的时候说清短任务不登记、更新
+/// 计划不单独占一轮。
 #[test]
 fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
     let tools = vec!["read".to_string(), UPDATE_PLAN_TOOL.to_string()];
@@ -109,6 +110,8 @@ fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
         None,
     );
     assert!(main.contains("update_plan 登记计划"), "{main}");
+    assert!(main.contains("几次调用就能做完的不登记"), "{main}");
+    assert!(main.contains("别单独占一轮"), "{main}");
     let sub = build(
         Path::new("/tmp/w"),
         &tools,

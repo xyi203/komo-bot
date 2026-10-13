@@ -20,7 +20,7 @@ use komo_kernel::types::turn::{AcceptInput, Accepted, AssistantRound, EventBatch
 use time::OffsetDateTime;
 
 use crate::db::{BoxFuture, Db, store_to_ledger};
-use crate::repos::{calls, outbox, runs, session};
+use crate::repos::{outbox, runs, session};
 use crate::session_log::{PendingEvent, SessionPaths};
 
 use super::Coordinator;
@@ -276,31 +276,8 @@ impl Ledger for Coordinator {
             )
             .await?;
 
-        // ③ state.db 事务建立该轮 planned 调用与事件索引。
-        let session = self.session.clone();
-        let run_id = run.clone();
-        let number = round.round;
-        self.commit(&appended, move |ex, appended, now| {
-            let (session, run_id, tool_calls) =
-                (session.clone(), run_id.clone(), tool_calls.clone());
-            Box::pin(async move {
-                for request in &tool_calls {
-                    calls::record_request_in(
-                        ex,
-                        &session,
-                        &run_id,
-                        number,
-                        &appended.event.event_id,
-                        request,
-                        now,
-                    )
-                    .await?;
-                }
-                runs::bump_rounds_in(ex, &run_id, number, now).await?;
-                Ok(())
-            }) as BoxFuture<'_, Result<(), StoreError>>
-        })
-        .await?;
+        // ③ state.db 事务建立该轮 planned 调用、轮次计数与事件索引。
+        self.commit_derived(&appended, None).await?;
 
         Ok(ids)
     }
@@ -387,15 +364,7 @@ impl Ledger for Coordinator {
             .await?;
 
         // ③ state.db 事务记下计划引用、哈希与恢复方式。
-        let call_id = call.clone();
-        let plan = plan.clone();
-        self.commit(&appended, move |ex, appended, now| {
-            let (call_id, plan) = (call_id.clone(), plan.clone());
-            Box::pin(async move {
-                calls::record_plan_in(ex, &call_id, &plan, &appended.event.event_id, now).await
-            }) as BoxFuture<'_, Result<(), StoreError>>
-        })
-        .await?;
+        self.commit_derived(&appended, Some(plan.clone())).await?;
 
         Ok(appended.event.event_id)
     }
@@ -430,32 +399,7 @@ impl Ledger for Coordinator {
 
         // ② state.db 事务提交 started、执行尝试与事件索引——**同一事务**。
         //    返回之后才允许产生真实副作用（§8.5）。
-        let call_id = call.clone();
-        let attempt_id = attempt.clone();
-        let plan_hash = plan.plan_hash();
-        let executor = self.executor.clone();
-        self.commit(&appended, move |ex, appended, now| {
-            let (call_id, attempt_id, plan_hash, executor) = (
-                call_id.clone(),
-                attempt_id.clone(),
-                plan_hash.clone(),
-                executor.clone(),
-            );
-            Box::pin(async move {
-                calls::record_started_in(
-                    ex,
-                    &call_id,
-                    &attempt_id,
-                    &plan_hash,
-                    &appended.event.event_id,
-                    executor.as_ref(),
-                    None,
-                    now,
-                )
-                .await
-            }) as BoxFuture<'_, Result<(), StoreError>>
-        })
-        .await?;
+        self.commit_derived(&appended, None).await?;
 
         Ok(attempt)
     }
@@ -512,24 +456,7 @@ impl Ledger for Coordinator {
             )
             .await?;
 
-        let attempt_id = attempt.clone();
-        self.commit(&appended, move |ex, appended, now| {
-            let (attempt_id, published) = (attempt_id.clone(), published.clone());
-            Box::pin(async move {
-                calls::record_result_in(
-                    ex,
-                    &attempt_id,
-                    published.status,
-                    &published.output,
-                    published.preview.clone(),
-                    &appended.event.event_id,
-                    now,
-                )
-                .await
-                .map(|_| ())
-            }) as BoxFuture<'_, Result<(), StoreError>>
-        })
-        .await
+        self.commit_derived(&appended, None).await
     }
 
     /// 一次**没有执行过**的调用的结论（工具名不认识、参数准备不出来、放行被拒）。
@@ -565,27 +492,8 @@ impl Ledger for Coordinator {
             )
             .await?;
 
-        let call_id = call.clone();
-        let attempt_id = attempt.clone();
-        self.commit(&appended, move |ex, appended, now| {
-            let (call_id, attempt_id, published) =
-                (call_id.clone(), attempt_id.clone(), published.clone());
-            Box::pin(async move {
-                calls::record_unstarted_in(ex, &call_id, &attempt_id, now).await?;
-                calls::record_result_in(
-                    ex,
-                    &attempt_id,
-                    published.status,
-                    &published.output,
-                    published.preview.clone(),
-                    &appended.event.event_id,
-                    now,
-                )
-                .await
-                .map(|_| ())
-            }) as BoxFuture<'_, Result<(), StoreError>>
-        })
-        .await
+        // 尝试行由投影现造（`record_unstarted_in`），`started_event` 留空。
+        self.commit_derived(&appended, None).await
     }
 
     async fn suspend(&self, run: &RunId, wait: WaitReason) -> Result<(), LedgerError> {

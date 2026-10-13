@@ -724,7 +724,7 @@ active → closing → deleted → purged
 
 恢复先处理已同步但未索引的 JSONL 尾部，再判断任务是否需要执行。例如 tool.result 已经完整持久保存且引用输出校验通过、数据库仍显示 started，必须先补齐为已有结果，不能直接按 uncertain 重试。若结果引用存在但对应输出缺失或哈希不符，停止受影响任务，不能重跑来掩盖数据损坏。输出文件已写完但 tool.result 尚未提交时，只有完整校验文件内的调用身份、计划、完成状态与内容后才能补记结果；仅凭路径存在不足以宣告成功。
 
-回放只补索引与派生执行状态，不调用工具、不发送外部请求，也不能覆盖 state.db 已记录的用户取消。tool.started 本身不能证明已产生副作用；缺少 tool.result 的调用按 §8.6 的重放策略处理。
+回放只补索引与派生执行状态，不调用工具、不发送外部请求，也不能覆盖 state.db 已记录的用户取消。**派生写入只有一处**（2026-10-13，`komo-store/src/repos/derive.rs`）：一条事件在 `tool_calls` / `tool_attempts` / `runs.rounds` 上留下什么，实时提交（上面每段的最后一步）与回放调的是同一个函数，所以"可重建表是 JSONL 的投影"由测试钉住——清掉派生行再回放，补出来的与当初写下的逐列相同，只差 JSONL 里本来没有的执行实例与时刻（`backfill_rebuilds_exactly_what_the_live_path_wrote`）。以前两边各写一份，回放漏了轮次计数。tool.started 本身不能证明已产生副作用；缺少 tool.result 的调用按 §8.6 的重放策略处理。
 
 会话生命周期等控制操作的权威在 state.db，采用相反方向的审计补写：
 

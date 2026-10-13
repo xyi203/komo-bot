@@ -17,6 +17,7 @@
 pub mod calls;
 pub mod cron;
 pub mod deliveries;
+pub mod derive;
 pub mod interventions;
 pub mod memory;
 pub mod outbox;

@@ -25,6 +25,7 @@ use std::sync::Arc;
 use komo_kernel::events::EventPayload;
 use komo_kernel::traits::{Clock, LedgerError, StoreError};
 use komo_kernel::types::ids::{EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::refs::{INLINE_ARGUMENT_LIMIT_BYTES, PayloadRef};
 use komo_kernel::types::turn::ToolCallRequest;
 use time::OffsetDateTime;
@@ -33,7 +34,7 @@ use toasty::Executor;
 use crate::db::{BoxFuture, Db, store_to_ledger};
 use crate::models::ToolCallRow;
 use crate::payloads::PayloadStore;
-use crate::repos::session;
+use crate::repos::{derive, session};
 use crate::session_log::{
     AppendedEvent, PendingEvent, SessionLog, SessionPaths, TailExpectation, TailRepair,
 };
@@ -265,6 +266,30 @@ impl Coordinator {
             })
             .await
             .map_err(store_to_ledger)
+    }
+
+    /// 已经追加到这一条了：提交它的索引与**派生状态**。派生写入走 [`derive::apply_in`]
+    /// ——与 backfill 是同一处投影，崩溃后补出来的行与此刻写下的逐列相同（§8.9）。
+    ///
+    /// `plan` 只在 `tool.planned` 外置到 `payloads/` 时要给；执行实例身份由这里带上。
+    async fn commit_derived(
+        &self,
+        appended: &AppendedEvent,
+        plan: Option<ExecutionPlan>,
+    ) -> Result<(), LedgerError> {
+        let session = self.session.clone();
+        let executor = self.executor.clone();
+        self.commit(appended, move |ex, appended, now| {
+            let (session, plan, executor) = (session.clone(), plan.clone(), executor.clone());
+            Box::pin(async move {
+                let facts = derive::Facts {
+                    plan: plan.as_ref(),
+                    executor: executor.as_ref(),
+                };
+                derive::apply_in(ex, &session, &appended, facts, now).await
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
     }
 
     async fn run_of_call(&self, call: &ToolCallId) -> Result<ToolCallRow, LedgerError> {

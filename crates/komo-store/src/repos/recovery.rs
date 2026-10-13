@@ -19,12 +19,11 @@ use komo_kernel::types::ids::{ExecutorId, InterventionId, RunId, SessionId};
 use komo_kernel::types::plan::ExecutionPlan;
 use komo_kernel::types::status::{RunState, WaitReason};
 use time::OffsetDateTime;
-use toasty::Executor;
 
 use crate::db::{BoxFuture, Db, to_ts};
 use crate::models::{DeliveryRow, RunRow};
 use crate::payloads::PayloadStore;
-use crate::repos::{calls, interventions, runs, session};
+use crate::repos::{calls, derive, interventions, runs, session};
 use crate::session_log::{SessionPaths, scan_records};
 
 /// 一个未终态 Run 在 state.db 里的样子。
@@ -222,8 +221,8 @@ impl RecoveryStore {
     /// 复用原输出，不重放动作」（§8.4）。这里做的正好是"补齐"那一半：
     ///
     /// - 每一行进 `session_log_index`（按 `event_id` 幂等）；
-    /// - `message.assistant` / `tool.planned` / `tool.started` / `tool.result` 依次
-    ///   还原 `tool_calls` 与 `tool_attempts` 的派生状态；
+    /// - 每一行经 [`derive::apply_in`] 还原 `tool_calls` / `tool_attempts` / `runs` 的派生
+    ///   状态——与实时提交是同一个函数，所以补出来的和当初写下的逐列相同；
     /// - `applied_seq` 推到这个 Session 已校验的连续前缀末端。
     ///
     /// **Run 的状态不在这里改**：改不改、改成什么，是 kernel 那张决策表的结论，由
@@ -243,15 +242,15 @@ impl RecoveryStore {
             .map_err(|e| StoreError::Corrupt(e.to_string()))?;
         let payloads = PayloadStore::new(paths);
 
-        // 外置的计划要在事务外读回来——数据库事务里不等文件（§8.5）。
+        // 外置的计划要在事务外读回来——数据库事务里不等文件（§8.5）。内联的由投影直接从
+        // 事件里取。
         let mut plans: Vec<(String, ExecutionPlan)> = Vec::new();
         for record in &records {
-            if let EventPayload::ToolPlanned(body) = &record.event.payload {
-                let plan = match (&body.plan, &body.plan_ref) {
-                    (Some(plan), _) => (**plan).clone(),
-                    (None, Some(reference)) => payloads.open_json(reference).await?,
-                    (None, None) => continue,
-                };
+            if let EventPayload::ToolPlanned(body) = &record.event.payload
+                && body.plan.is_none()
+                && let Some(reference) = &body.plan_ref
+            {
+                let plan = payloads.open_json(reference).await?;
                 plans.push((record.event.event_id.to_string(), plan));
             }
         }
@@ -280,7 +279,15 @@ impl RecoveryStore {
                         if record.event.run.as_ref() != Some(&run_id) {
                             continue;
                         }
-                        apply_event(ex, &session, &run_id, record, &plans, now).await?;
+                        let plan = plans
+                            .iter()
+                            .find(|(id, _)| id == record.event.event_id.as_str())
+                            .map(|(_, plan)| plan);
+                        let facts = derive::Facts {
+                            plan,
+                            executor: None,
+                        };
+                        derive::apply_in(ex, &session, record, facts, now).await?;
                     }
                     session::advance_applied_in(ex, &session, last_seq, bytes, now).await?;
                     Ok(())
@@ -425,69 +432,6 @@ fn still_as_seen(row: &RunRow, seen: Option<&SeenRun>) -> Result<bool, StoreErro
         "判断之后这一行变了：这一拍不写，下一拍按新样子再判"
     );
     Ok(false)
-}
-
-/// 一条事件在索引上的回放。**只写派生状态**。
-async fn apply_event(
-    ex: &mut dyn Executor,
-    session: &SessionId,
-    run: &RunId,
-    record: &crate::session_log::AppendedEvent,
-    plans: &[(String, ExecutionPlan)],
-    now: OffsetDateTime,
-) -> Result<(), StoreError> {
-    let event_id = &record.event.event_id;
-    match &record.event.payload {
-        EventPayload::RunAccepted(_) => {
-            // **只记引用，不动状态**：入不入队是决策表的结论（`RecoveryAction::Requeue`），
-            // 不是"日志里有 run.accepted"这件事的推论。推成 queued 的话，一个已取消的
-            // Run 会在补发结果那条路径上（第 10 行也走 backfill）被悄悄复活。
-            runs::set_input_event_in(ex, run, event_id, record.event.seq, now).await?;
-        }
-        EventPayload::MessageAssistant(body) => {
-            for request in &body.tool_calls {
-                calls::record_request_in(ex, session, run, body.round, event_id, request, now)
-                    .await?;
-            }
-        }
-        EventPayload::ToolPlanned(body) => {
-            if let Some((_, plan)) = plans.iter().find(|(id, _)| id == event_id.as_str()) {
-                calls::record_plan_in(ex, &body.call_id, plan, event_id, now).await?;
-            }
-        }
-        EventPayload::ToolStarted(body) => {
-            calls::record_started_in(
-                ex,
-                &body.call_id,
-                &body.attempt_id,
-                &body.plan_hash,
-                event_id,
-                None,
-                None,
-                now,
-            )
-            .await?;
-        }
-        EventPayload::ToolResult(body) => {
-            // 没有 `tool.started` 的结果（一次没执行过的调用的结论）在这里也要把那条尝试
-            // 补上：`record_result_in` 按 attempt 行找 call，行不在它没法记——重建之后
-            // "这次调用结过账"就不见了。
-            calls::record_unstarted_in(ex, &body.call_id, &body.attempt_id, now).await?;
-            calls::record_result_in(
-                ex,
-                &body.attempt_id,
-                body.status,
-                &body.output_ref,
-                body.preview.clone(),
-                event_id,
-                now,
-            )
-            .await?;
-        }
-        // Run 级别的状态由决策表定，回放不动它；其余事件在索引上没有派生状态。
-        _ => {}
-    }
-    Ok(())
 }
 
 /// 已经送达过结果的 Run。
@@ -1081,6 +1025,129 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    /// 派生行在实时提交与 backfill 两条路上是**同一处投影**（`repos::derive`）：清掉之后从
+    /// JSONL 补回来的，与当初写下的逐列相同——只差 JSONL 里本来没有的执行实例与时刻。
+    /// 一轮里三种调用都在：跑完的、一次没执行过的（`fail_call`）、开着没收尾的。
+    #[tokio::test]
+    async fn backfill_rebuilds_exactly_what_the_live_path_wrote() {
+        let f = fixture().await;
+        let run = a_run_with_one_finished_call(&f).await;
+        let ids = f
+            .coordinator
+            .record_round(
+                &run,
+                AssistantRound {
+                    round: 2,
+                    text: None,
+                    text_ref: None,
+                    tool_calls: ["call-2", "call-3"]
+                        .iter()
+                        .map(|id| ToolCallRequest {
+                            call_id: ToolCallId::from_raw(*id),
+                            provider_call_id: format!("pc-{id}"),
+                            name: "shell".into(),
+                            arguments: serde_json::json!({}),
+                            arguments_ref: None,
+                        })
+                        .collect(),
+                    provider_blocks: None,
+                    usage: Default::default(),
+                },
+            )
+            .await
+            .unwrap();
+        let unstarted = komo_kernel::types::ids::AttemptId::new_at(TestClock::fixed().now());
+        f.coordinator
+            .fail_call(
+                &ids[0],
+                &unstarted,
+                PublishedOutput {
+                    output: OutputRef(ContentRef {
+                        path: "tool-output/r/c/b/output.json".into(),
+                        size: 2,
+                        hash: komo_kernel::types::digest::ContentHash::of_str("{}"),
+                        pointer: None,
+                    }),
+                    status: ToolResultStatus::Failed,
+                    elapsed_ms: 0,
+                    preview: Some("参数不对".into()),
+                    stdout: None,
+                    stderr: None,
+                },
+            )
+            .await
+            .unwrap();
+        let plan = sample_plan("shell", &f.session);
+        f.coordinator.plan_call(&ids[1], &plan).await.unwrap();
+        f.coordinator.start_call(&ids[1], &plan).await.unwrap();
+
+        let live = derived(&f, &run).await;
+        assert!(live.contains("rounds=2"), "{live}");
+
+        // state.db 落后于 JSONL：派生行全部清掉，轮次计数归零。
+        f.db.with_write_retry(|ex| {
+            Box::pin(async move {
+                for row in crate::models::ToolAttemptRow::all()
+                    .exec(&mut *ex)
+                    .await
+                    .map_err(crate::db::map_toasty)?
+                {
+                    row.delete()
+                        .exec(&mut *ex)
+                        .await
+                        .map_err(crate::db::map_toasty)?;
+                }
+                for row in crate::models::ToolCallRow::all()
+                    .exec(&mut *ex)
+                    .await
+                    .map_err(crate::db::map_toasty)?
+                {
+                    row.delete()
+                        .exec(&mut *ex)
+                        .await
+                        .map_err(crate::db::map_toasty)?;
+                }
+                for mut row in RunRow::all()
+                    .exec(&mut *ex)
+                    .await
+                    .map_err(crate::db::map_toasty)?
+                {
+                    row.update()
+                        .rounds(0)
+                        .exec(&mut *ex)
+                        .await
+                        .map_err(crate::db::map_toasty)?;
+                }
+                Ok(())
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+        assert!(!derived(&f, &run).await.contains("rounds=2"));
+
+        f.store.backfill(&run).await.unwrap();
+        assert_eq!(derived(&f, &run).await, live);
+    }
+
+    /// 一个 Run 的全部派生行，抹掉 JSONL 里没有的那几格之后的样子。
+    async fn derived(f: &Fixture, run: &RunId) -> String {
+        let mut out = format!(
+            "rounds={}\n",
+            runs::get(&f.db, run).await.unwrap().unwrap().rounds
+        );
+        for mut call in calls::list_for_run(&f.db, run).await.unwrap() {
+            let id = ToolCallId::from_raw(call.id.clone());
+            (call.created_at, call.updated_at) = (0, 0);
+            out.push_str(&format!("{call:?}\n"));
+            for mut attempt in calls::attempts_of(&f.db, &id).await.unwrap() {
+                (attempt.executor, attempt.process) = (None, None);
+                (attempt.started_at, attempt.ended_at) = (0, 0);
+                out.push_str(&format!("  {attempt:?}\n"));
+            }
+        }
+        out
     }
 
     #[tokio::test]

@@ -641,7 +641,8 @@ pub async fn stop_without_event(
     .await
 }
 
-/// 记这一轮之后的轮次计数。
+/// 记这一轮之后的轮次计数。**只往上推**：backfill 会把整段日志重放一遍
+/// （`repos::derive`），一轮旧的 `message.assistant` 不该把数字拉回去。
 pub async fn bump_rounds_in(
     ex: &mut dyn Executor,
     run: &RunId,
@@ -649,6 +650,9 @@ pub async fn bump_rounds_in(
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
     let mut row = require(ex, run).await?;
+    if i64::from(rounds) <= row.rounds {
+        return Ok(());
+    }
     row.update()
         .rounds(i64::from(rounds))
         .updated_at(to_ts(now))

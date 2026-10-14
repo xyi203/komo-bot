@@ -92,6 +92,17 @@ pub enum Operation {
     /// `task_id` 是模型给的任务短号原文，解析成具体会话在执行侧做（只有 Gateway 查得到
     /// "这个会话派出去过哪些任务"）。
     Follow { task_id: String, text: String },
+    /// 挂一个长时间跑的监听脚本，stdout 的行交回这个会话（`docs/monitor.md`）。
+    ///
+    /// 与 `Dispatch` 同一类编排操作：执行器放行之后交给 Gateway 起进程、立刻收尾，不等
+    /// 脚本跑完。命令与时限都进计划——重放时唯一能对上的就是这份计划。
+    Monitor {
+        command: String,
+        title: String,
+        timeout_minutes: u64,
+    },
+    /// 停掉这个会话挂着的一个监听。`monitor_id` 是模型给的短号原文。
+    MonitorStop { monitor_id: String },
     /// 更新这条 Run 的工作计划（`update_plan`）。
     ///
     /// 与 `Delegate` / `Dispatch` 同一类编排操作，不是第七个基础工具：它不碰文件、不碰

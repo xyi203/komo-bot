@@ -47,8 +47,8 @@ use komo_kernel::events::Event;
 use komo_kernel::fold::fold;
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project_views, select};
 use komo_kernel::traits::{
-    Clock, Ledger, LedgerError, OutputWriter, RepoError, SpawnError, StoreError, TaskSpawner, Tool,
-    ToolOutputStore,
+    Clock, Ledger, LedgerError, MonitorError, Monitors, OutputWriter, RepoError, SpawnError,
+    StoreError, TaskSpawner, Tool, ToolOutputStore,
 };
 use komo_kernel::types::chat::Principal;
 use komo_kernel::types::delegate::{
@@ -56,6 +56,7 @@ use komo_kernel::types::delegate::{
 };
 use komo_kernel::types::ids::{AttemptId, RequestKey, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::model::ModelConfig;
+use komo_kernel::types::monitor::{MonitorHandle, MonitorSpec, MonitorStopped};
 use komo_kernel::types::plan::{EnvVersion, ExecutionPlan, Operation, PlanSource, Replay};
 use komo_kernel::types::refs::{
     AttemptRef, ContentRef, InterruptedOutput, PublishedOutput, ToolResultBody, ToolResultStatus,
@@ -252,6 +253,9 @@ pub struct ToolExecutor {
     /// （[`Self::set_spawner`]）。没有装配它时两个操作按"这台 Gateway 没有接任务
     /// 分发"干净失败，不是一个悬着的调用。
     spawner: std::sync::OnceLock<Arc<dyn TaskSpawner>>,
+    /// `monitor` / `monitor_stop` 的接缝（`docs/monitor.md`）。与 [`Self::spawner`] 同一个
+    /// 理由是 `OnceLock`：Gateway 的实现要一份 `Arc<GatewayState>`（`submit`）。
+    monitors: std::sync::OnceLock<Arc<dyn Monitors>>,
     /// codemode 的沙箱（`docs/codemode.md`）。`None` = 这台机器上沙箱起不来，`codemode`
     /// 也不会被注册。
     codemode: Option<Arc<crate::codemode::Sandbox>>,
@@ -283,6 +287,7 @@ impl ToolExecutor {
             clock,
             limits: ExecutionLimits::default(),
             spawner: std::sync::OnceLock::new(),
+            monitors: std::sync::OnceLock::new(),
             codemode: None,
         }
     }
@@ -310,6 +315,20 @@ impl ToolExecutor {
     pub fn set_spawner(&self, spawner: Arc<dyn TaskSpawner>) {
         if self.spawner.set(spawner).is_err() {
             tracing::warn!("TaskSpawner 已经装配过一次，忽略这次重复设置");
+        }
+    }
+
+    /// 测试用：装配时就给一份监听实现。
+    #[cfg(test)]
+    pub fn with_monitors(self, monitors: Arc<dyn Monitors>) -> Self {
+        let _ = self.monitors.set(monitors);
+        self
+    }
+
+    /// 装好之后再接上监听的实现，与 [`Self::set_spawner`] 同一个约定。
+    pub fn set_monitors(&self, monitors: Arc<dyn Monitors>) {
+        if self.monitors.set(monitors).is_err() {
+            tracing::warn!("Monitors 已经装配过一次，忽略这次重复设置");
         }
     }
 
@@ -712,6 +731,12 @@ impl ToolExecutor {
                 .cloned()
                 .ok_or_else(|| "这台 Gateway 没有接任务分发（TaskSpawner 没有装配）".to_string())
         };
+        let monitors = || {
+            self.monitors
+                .get()
+                .cloned()
+                .ok_or_else(|| "这台 Gateway 没有接监听（Monitors 没有装配）".to_string())
+        };
         Ok(Some(match operation {
             Operation::Delegate { spec } => {
                 // 深度只有一层。**第一道拦在能力面上**（子代理的 schema 里没有 `delegate`，
@@ -738,6 +763,23 @@ impl ToolExecutor {
                 spawner: spawner()?,
                 task_id: task_id.clone(),
                 text: text.clone(),
+            },
+            Operation::Monitor {
+                command,
+                title,
+                timeout_minutes,
+            } => Orchestration::Monitor {
+                monitors: monitors()?,
+                spec: MonitorSpec {
+                    command: command.clone(),
+                    title: title.clone(),
+                    cwd: env.cwd.clone(),
+                    timeout_minutes: *timeout_minutes,
+                },
+            },
+            Operation::MonitorStop { monitor_id } => Orchestration::MonitorStop {
+                monitors: monitors()?,
+                monitor_id: monitor_id.clone(),
             },
             Operation::UpdatePlan => Orchestration::UpdatePlan,
             _ => return Ok(None),
@@ -837,6 +879,24 @@ impl ToolExecutor {
                 let key = RequestKey::new(format!("follow:{}:{}", env.run, request.call));
                 let outcome = spawner.follow(&env.run, key, &task_id, &text).await;
                 self.settle_follow(&request, env, attempt, outcome).await?
+            }
+            Orchestration::Monitor { monitors, mut spec } => {
+                // 工作目录以计划为准（`prepare` 已经按模型给的 `cwd` 解析好）。
+                if let Some(cwd) = &plan.cwd {
+                    spec.cwd = cwd.clone();
+                }
+                let key = RequestKey::new(format!("monitor:{}:{}", env.run, request.call));
+                let fresh = matches!(start, OrchestrationStart::Fresh);
+                let outcome = monitors.start(&env.run, key, spec, fresh).await;
+                self.settle_monitor(&request, env, attempt, outcome).await?
+            }
+            Orchestration::MonitorStop {
+                monitors,
+                monitor_id,
+            } => {
+                let outcome = monitors.stop(&env.run, &monitor_id).await;
+                self.settle_monitor_stop(&request, env, attempt, outcome)
+                    .await?
             }
             Orchestration::UpdatePlan => {
                 return self.settle_plan(&request, env, &plan, attempt).await;
@@ -1073,6 +1133,71 @@ impl ToolExecutor {
             }
             Err(error) => {
                 let content = format!("派任务失败：{error}");
+                (serde_json::json!({ "error": content }), content, true)
+            }
+        };
+        self.settle_orchestration(request, env, attempt, result, content, is_error)
+            .await
+    }
+
+    /// `monitor` 的结论：`MonitorHandle` 折成"已开始监听 #短号"，`MonitorError` 折成一句
+    /// 失败原因（含"上一世挂的监听随重启中断了"）。
+    async fn settle_monitor(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        attempt: AttemptId,
+        outcome: Result<MonitorHandle, MonitorError>,
+    ) -> Result<CallSettlement, ExecError> {
+        let (result, content, is_error) = match outcome {
+            Ok(handle) => {
+                let content = format!(
+                    "已开始监听 #{}：{}（最长 {} 分钟）。事件会以 [监听 #{}…] 开头的消息交回。",
+                    handle.short_id, handle.title, handle.timeout_minutes, handle.short_id
+                );
+                (
+                    serde_json::json!({
+                        "id": handle.id,
+                        "short_id": handle.short_id,
+                        "title": handle.title,
+                        "session": handle.session.to_string(),
+                        "timeout_minutes": handle.timeout_minutes,
+                    }),
+                    content,
+                    false,
+                )
+            }
+            Err(error) => {
+                let content = format!("挂不上监听：{error}");
+                (serde_json::json!({ "error": content }), content, true)
+            }
+        };
+        self.settle_orchestration(request, env, attempt, result, content, is_error)
+            .await
+    }
+
+    /// `monitor_stop` 的结论。
+    async fn settle_monitor_stop(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        attempt: AttemptId,
+        outcome: Result<MonitorStopped, MonitorError>,
+    ) -> Result<CallSettlement, ExecError> {
+        let (result, content, is_error) = match outcome {
+            Ok(stopped) => {
+                let content = format!("已停止监听 #{}：{}", stopped.short_id, stopped.title);
+                (
+                    serde_json::json!({
+                        "short_id": stopped.short_id,
+                        "title": stopped.title,
+                    }),
+                    content,
+                    false,
+                )
+            }
+            Err(error) => {
+                let content = format!("停不了：{error}");
                 (serde_json::json!({ "error": content }), content, true)
             }
         };
@@ -1467,6 +1592,16 @@ enum Orchestration {
         spawner: Arc<dyn TaskSpawner>,
         task_id: String,
         text: String,
+    },
+    /// 挂一个监听，立刻收尾。
+    Monitor {
+        monitors: Arc<dyn Monitors>,
+        spec: MonitorSpec,
+    },
+    /// 停掉一个监听。
+    MonitorStop {
+        monitors: Arc<dyn Monitors>,
+        monitor_id: String,
     },
     /// 记一版计划，和日志里的上一版比较。
     UpdatePlan,

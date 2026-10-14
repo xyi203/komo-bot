@@ -10,6 +10,7 @@ pub mod digest;
 pub mod ids;
 pub mod memory;
 pub mod model;
+pub mod monitor;
 pub mod plan;
 pub mod refs;
 pub mod resource;

@@ -648,6 +648,54 @@ pub trait Tool: Send + Sync {
     }
 }
 
+// ---------------------------------------------------------------- 监听
+
+/// `monitor` / `monitor_stop` 的接缝（`docs/monitor.md`）：挂一个长时间跑的脚本，它的
+/// stdout 每出一行（按批合并）就作为一条内部输入交回挂它的会话。
+///
+/// 与 [`TaskSpawner`] 同一个理由走编排操作：进程要活得比这次调用、这条 Run 都久，只有
+/// Gateway 拿得住它，也只有 Gateway 能 `submit`。生产实现是 Gateway 的
+/// `GatewayMonitors`；没有装配它时两个操作按"这台 Gateway 没有接监听"干净失败。
+#[async_trait]
+pub trait Monitors: Send + Sync {
+    /// 起一个监听。事件交回 `from` 所在的会话，投给 `from` 的 `runs.peer`。
+    ///
+    /// `request_key` 由调用方按 `monitor:{run}:{call}` 拼好。`fresh = false` 是"上一世
+    /// 已经 `start_call` 过、这一世只是回来收口"：只认同一个键下还在跑的那个，认不到就答
+    /// [`MonitorError::Interrupted`]——**绝不重新起进程**（§8.6：任意命令不自动重跑）。
+    async fn start(
+        &self,
+        from: &crate::types::ids::RunId,
+        request_key: crate::types::ids::RequestKey,
+        spec: crate::types::monitor::MonitorSpec,
+        fresh: bool,
+    ) -> Result<crate::types::monitor::MonitorHandle, MonitorError>;
+
+    /// 停掉 `from` 所在会话挂着的一个监听。`monitor_id` 是短号原文。
+    async fn stop(
+        &self,
+        from: &crate::types::ids::RunId,
+        monitor_id: &str,
+    ) -> Result<crate::types::monitor::MonitorStopped, MonitorError>;
+}
+
+/// [`Monitors`] 的失败。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MonitorError {
+    /// 起不来、记不上。
+    #[error("{0}")]
+    Failed(String),
+    /// 上一世挂的监听随 Gateway 重启没了，没有自动重挂。
+    #[error("{0}")]
+    Interrupted(String),
+    /// 短号对不上这个会话正在跑的监听；正文列出还在跑的那些。
+    #[error("{0}")]
+    Unknown(String),
+    /// 短号在候选里不唯一。
+    #[error("{0}")]
+    Ambiguous(String),
+}
+
 // ---------------------------------------------------------------- 任务分发
 
 /// `dispatch` / `follow` 的接缝（`docs/background-tasks.md`）：把一个自包含任务派

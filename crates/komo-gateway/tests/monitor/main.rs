@@ -1,0 +1,332 @@
+//! 监听（`docs/monitor.md`）：`monitor` 挂上的脚本每出一行，就作为一条内部输入交回挂它的
+//! 会话；脚本收尾时交回一条结束消息；`monitor_stop` 停掉它；Gateway 重启时监听中断并
+//! 告诉会话，不自动重挂。
+//!
+//! 真数据目录、真 `service::start`、真子进程；模型是按输入分流的脚本。
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use komo_gateway::service::test_support::harness::{Gw, Home, call_round, text_round};
+use komo_kernel::traits::{LlmClient, TurnDriver};
+use komo_kernel::types::ids::SessionId;
+use komo_kernel::types::model::TokenUsage;
+use komo_kernel::types::status::RunState;
+use komo_kernel::types::turn::{LlmError, Round, RoundInput, TurnRequest};
+
+fn config() -> String {
+    r#"
+default_agent = "assistant"
+
+[agents.assistant]
+instructions = "你是助手。"
+tools = ["monitor", "monitor_stop", "shell"]
+
+[model.main]
+type = "completion"
+api_backend = "responses"
+base_url = "https://llm.example.com/v1"
+model = "gpt-test"
+api_key_env = "KOMO_LLM_API_KEY"
+
+[models]
+default = "main"
+
+[memory]
+enabled = false
+"#
+    .to_string()
+}
+
+/// 按这一段最后一条用户输入分流：
+///
+/// - `挂：<命令>` → 调 `monitor`，再把工具结果原样念出来；
+/// - `停：<短号>` → 调 `monitor_stop`；
+/// - `[监听 …` → 记下这条输入，回一句"收到"（`event_delay` 模拟模型处理得慢）；
+/// - 其他 → 原样回一句。
+struct MonitorLlm {
+    inputs: Mutex<Vec<String>>,
+    event_delay: Duration,
+}
+
+impl MonitorLlm {
+    fn new(event_delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            inputs: Mutex::new(Vec::new()),
+            event_delay,
+        })
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.inputs.lock().unwrap().clone()
+    }
+}
+
+fn last_user_text(req: &TurnRequest) -> String {
+    req.messages
+        .iter()
+        .rev()
+        .find(|message| message.role == komo_kernel::types::turn::Role::User)
+        .and_then(|message| message.text.clone())
+        .unwrap_or_default()
+}
+
+#[async_trait::async_trait]
+impl LlmClient for MonitorLlm {
+    async fn begin_turn(&self, req: TurnRequest) -> Result<Box<dyn TurnDriver>, LlmError> {
+        let input = last_user_text(&req);
+        let script = if input.starts_with("[监听") {
+            self.inputs.lock().unwrap().push(input);
+            tokio::time::sleep(self.event_delay).await;
+            Script::Reply("收到".into())
+        } else if let Some(command) = input.strip_prefix("挂：") {
+            Script::Call(
+                "monitor",
+                serde_json::json!({ "command": command, "title": "测试监听", "timeout_minutes": 2 }),
+            )
+        } else if let Some(id) = input.strip_prefix("停：") {
+            Script::Call("monitor_stop", serde_json::json!({ "monitor_id": id }))
+        } else {
+            Script::Reply(input)
+        };
+        Ok(Box::new(ScriptDriver { script }))
+    }
+}
+
+enum Script {
+    Reply(String),
+    Call(&'static str, serde_json::Value),
+}
+
+struct ScriptDriver {
+    script: Script,
+}
+
+#[async_trait::async_trait]
+impl TurnDriver for ScriptDriver {
+    async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
+        match (&self.script, input) {
+            (Script::Reply(text), _) => text_round(1, text),
+            (Script::Call(tool, args), RoundInput::First) => {
+                call_round(1, &format!("pc-{tool}"), tool, args.clone())
+            }
+            (Script::Call(..), RoundInput::ToolResults { results, .. }) => {
+                let text = results
+                    .first()
+                    .map(|result| result.content.clone())
+                    .unwrap_or_default();
+                text_round(2, &text)
+            }
+        }
+    }
+
+    fn usage(&self) -> TokenUsage {
+        TokenUsage::default()
+    }
+}
+
+/// 挂一个监听，返回会话与短号（从模型念出来的工具结果里抠）。
+async fn arm(gateway: &Gw, command: &str) -> (SessionId, String) {
+    let session = gateway.open_session().await;
+    let submitted = gateway
+        .submit(&session, "arm", &format!("挂：{command}"))
+        .await;
+    let detail = gateway.wait_terminal(&submitted.run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    let reply = detail.final_message.clone().unwrap_or_default();
+    let short = reply
+        .split("已开始监听 #")
+        .nth(1)
+        .and_then(|rest| rest.get(..4))
+        .unwrap_or_else(|| panic!("回执里没有短号：{reply}"))
+        .to_string();
+    (session, short)
+}
+
+async fn runs_of(gateway: &Gw, session: &SessionId) -> Vec<komo_store::repos::runs::RunRecord> {
+    komo_store::repos::runs::list_for_session(&gateway.state().db, session)
+        .await
+        .expect("读得出会话的 Run")
+}
+
+/// 等这个会话出现一条请求键以 `prefix` 开头、已经收尾的 Run。
+async fn wait_run_keyed(gateway: &Gw, session: &SessionId, prefix: &str, within: Duration) {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if runs_of(gateway, session)
+            .await
+            .iter()
+            .any(|run| run.request_key.as_str().starts_with(prefix) && run.state.is_terminal())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("等了 {within:?} 也没有请求键以 {prefix} 开头的 Run");
+}
+
+fn monitor_records(home: &Home) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(home.path().join("runtime/monitors"))
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 端到端：脚本的行作为 `[监听 #短号…]` 输入交回同一个会话，脚本退出后交回一条带退出码
+/// 的结束消息，登记随之删掉。
+#[tokio::test]
+async fn lines_come_back_as_inputs_and_the_exit_is_reported() {
+    let home = Home::with_config(&config());
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+
+    let (session, short) = arm(
+        &gateway,
+        "for i in 1 2 3; do echo tick $i; sleep 0.2; done; echo boom >&2; exit 3",
+    )
+    .await;
+    wait_run_keyed(&gateway, &session, "monitor-end:", Duration::from_secs(20)).await;
+
+    let events = llm.events();
+    let joined = events.join("\n");
+    for tick in ["tick 1", "tick 2", "tick 3"] {
+        assert!(joined.contains(tick), "{tick} 没有交回：{events:#?}");
+    }
+    assert!(
+        events
+            .iter()
+            .all(|event| event.starts_with(&format!("[监听 #{short}「测试监听」"))),
+        "{events:#?}"
+    );
+    let end = events.last().unwrap();
+    assert!(end.contains("exit=3"), "{end}");
+    assert!(end.contains("stderr 末尾：\nboom"), "{end}");
+    assert!(
+        !joined.contains("boom\n（这是监听脚本"),
+        "stderr 不该当成事件：{events:#?}"
+    );
+    assert!(monitor_records(&home).is_empty(), "收尾后登记该删掉");
+
+    gateway.stop().await;
+}
+
+/// 模型处理得慢时，脚本这段时间出的行合进下一条，而不是按批排一串 Run。
+#[tokio::test]
+async fn lines_printed_while_an_event_is_being_handled_are_merged_into_the_next() {
+    let home = Home::with_config(&config());
+    let llm = MonitorLlm::new(Duration::from_secs(3));
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+
+    let (session, _) = arm(
+        &gateway,
+        "for i in $(seq 1 30); do echo line $i; sleep 0.2; done",
+    )
+    .await;
+    wait_run_keyed(&gateway, &session, "monitor-end:", Duration::from_secs(40)).await;
+
+    let events = llm.events();
+    let joined = events.join("\n");
+    for i in 1..=30 {
+        assert!(
+            joined.lines().any(|line| line == format!("line {i}")),
+            "line {i} 丢了：{events:#?}"
+        );
+    }
+    let event_runs = runs_of(&gateway, &session)
+        .await
+        .into_iter()
+        .filter(|run| run.request_key.as_str().starts_with("monitor:"))
+        .count();
+    // 6 秒里出 30 行，每条事件要处理 3 秒：同时只有一条在飞时是两条左右（其余进结束
+    // 消息）；不等上一条收尾、每秒交一条的话是六条。
+    assert!(
+        event_runs <= 3,
+        "上一条没收尾时出的行该合进下一条：{event_runs} 条 {events:#?}"
+    );
+
+    gateway.stop().await;
+}
+
+/// `monitor_stop` 终止进程组，之后不再交回结束消息；给错短号时列出还在跑的那些。
+#[tokio::test]
+async fn stopping_kills_the_script_and_reports_nothing_more() {
+    let home = Home::with_config(&config());
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+
+    let marker = home.path().join("still-running");
+    let (session, short) = arm(
+        &gateway,
+        &format!("while true; do touch {}; sleep 0.2; done", marker.display()),
+    )
+    .await;
+
+    let wrong = gateway.submit(&session, "stop-wrong", "停：beef").await;
+    let detail = gateway.wait_terminal(&wrong.run).await;
+    let reply = detail.final_message.unwrap_or_default();
+    assert!(reply.contains(&format!("#{short}「测试监听」")), "{reply}");
+
+    let stop = gateway
+        .submit(&session, "stop", &format!("停：{short}"))
+        .await;
+    let detail = gateway.wait_terminal(&stop.run).await;
+    let reply = detail.final_message.unwrap_or_default();
+    assert!(reply.contains(&format!("已停止监听 #{short}")), "{reply}");
+
+    // 进程组没了：标记文件不再被刷新。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let _ = std::fs::remove_file(&marker);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!marker.exists(), "停掉之后脚本还在跑");
+
+    assert!(
+        !runs_of(&gateway, &session)
+            .await
+            .iter()
+            .any(|run| run.request_key.as_str().starts_with("monitor-end:")),
+        "模型自己停的，不该再交回结束消息"
+    );
+    assert!(monitor_records(&home).is_empty());
+
+    gateway.stop().await;
+}
+
+/// 停机终止监听但留下登记；下一代启动时告诉会话"中断了"，脚本没有被重新起来。
+#[tokio::test]
+async fn a_restart_interrupts_the_monitor_and_tells_the_session() {
+    let home = Home::with_config(&config());
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+
+    let marker = home.path().join("still-running");
+    let (session, short) = arm(
+        &gateway,
+        &format!("while true; do touch {}; sleep 0.2; done", marker.display()),
+    )
+    .await;
+    gateway.stop().await;
+    assert_eq!(monitor_records(&home).len(), 1, "停机时登记留给下一代");
+
+    let _ = std::fs::remove_file(&marker);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!marker.exists(), "停机之后脚本还在跑");
+
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    wait_run_keyed(&gateway, &session, "monitor-end:", Duration::from_secs(20)).await;
+    let end = llm.events().last().cloned().unwrap_or_default();
+    assert!(
+        end.starts_with(&format!("[监听 #{short}「测试监听」已中断")),
+        "{end}"
+    );
+    assert!(monitor_records(&home).is_empty(), "交回之后登记该删掉");
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!marker.exists(), "重启不该把脚本重新起来");
+
+    gateway.stop().await;
+}

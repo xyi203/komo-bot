@@ -19,6 +19,7 @@ pub mod cron_watch;
 pub mod interventions;
 pub mod ledgers;
 pub mod lifecycle;
+pub mod monitors;
 pub(crate) mod project_files;
 pub mod run_watch;
 pub mod segment;
@@ -129,6 +130,10 @@ impl Running {
     /// 正常停机（§8.7）：**先停止接收新执行**，给手上的收尾时间，再删发现文件、放锁。
     pub async fn stop(self) {
         self.state.supervisor.stop_all(&self.state).await;
+        // 监听的进程组不跨停机（`docs/monitor.md`）：先终止，登记留给下一代启动时收。
+        if let Some(monitors) = self.state.monitors.get() {
+            monitors.shutdown().await;
+        }
         self.shutdown.cancel();
         let _ = tokio::time::timeout(DRAIN, self.state.scheduler.wait_for_idle()).await;
         self.discovery.remove();
@@ -203,6 +208,8 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // （建会话、`submit`），与上面这行同一个"先有整份状态才能自己引用自己"的理由
     // （`docs/background-tasks.md`）。
     state.wire_task_spawner();
+    // `monitor` / `monitor_stop` 的接缝，同一个接法（`docs/monitor.md`）。
+    state.wire_monitors();
 
     // 5. 绑监听——发现文件里要写真实地址，所以端口必须先定下来。
     let listen = options
@@ -331,6 +338,12 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // 8c. 把跨重启还在跑的交互 Run 与后台任务 Run 重新挂上看客：看客只活在内存里，重启后没人订阅就没人能把最终回复投回聊天来源。
     // **必须在下一步调度器起来之前**：调度器一起，这些 Run 可能立刻继续往下跑。
     run_watch::reattach_unfinished(&state).await;
+
+    // 8d. 上一代留下的监听：遗留进程组核对身份后终止，挂它的会话各收到一条"中断了"
+    // （`docs/monitor.md`）。监听不跨重启，这里只收尾、不重挂。
+    if let Some(monitors) = state.monitors.get() {
+        monitors.recover_interrupted().await;
+    }
 
     // 9. 后台任务：调度器、Cron、配置轮询、SIGHUP。
     spawn_background(&state, &shutdown);
@@ -595,8 +608,8 @@ async fn build_tools(
     Option<Arc<komo_runtime::codemode::Sandbox>>,
 ) {
     use komo_runtime::tools::{
-        DelegateTool, DispatchTool, EditTool, FollowTool, ReadTool, RgTool, ShellTool,
-        UpdatePlanTool, WriteTool,
+        DelegateTool, DispatchTool, EditTool, FollowTool, MonitorStopTool, MonitorTool, ReadTool,
+        RgTool, ShellTool, UpdatePlanTool, WriteTool,
     };
 
     let snapshot = config.current();
@@ -634,6 +647,10 @@ async fn build_tools(
     // 任务分发"干净失败。
     tools.push(Arc::new(DispatchTool::new()));
     tools.push(Arc::new(FollowTool::new()));
+    // monitor / monitor_stop：同一类编排操作，脚本的进程归 Gateway 的 `GatewayMonitors`
+    // （`docs/monitor.md`）。
+    tools.push(Arc::new(MonitorTool::new()));
+    tools.push(Arc::new(MonitorStopTool::new()));
     // update_plan：模型的工作计划，同一类编排操作。没有副作用，计划只在日志里，按 Run
     // 折出来。
     tools.push(Arc::new(UpdatePlanTool::new()));

@@ -235,6 +235,35 @@ impl ShellTool {
         self.output_limit = output_limit;
         self
     }
+
+    /// 按 `shell` 自己的规矩（bash、数据目录只读挂载）起一条命令要的 [`ChildSpec`]。
+    ///
+    /// 不登记在册、不限输出：给 `monitor` 用（`docs/monitor.md`），它的进程不属于任何
+    /// 一次调用，在册与收尾由它自己管。
+    pub fn child_spec(
+        &self,
+        command: &str,
+        cwd: PathBuf,
+        env: BTreeMap<String, String>,
+        timeout: Duration,
+        label: String,
+    ) -> ChildSpec {
+        let (program, args) = match &self.sandbox {
+            Some(sandbox) => sandbox.wrap(&self.shell, command),
+            None => (self.shell.clone(), vec!["-c".into(), command.to_string()]),
+        };
+        ChildSpec {
+            program,
+            args,
+            cwd,
+            env,
+            stdin: None,
+            timeout,
+            output_limit: u64::MAX,
+            register: None,
+            label,
+        }
+    }
 }
 
 #[async_trait]
@@ -377,6 +406,14 @@ impl Tool for ShellTool {
 }
 
 fn environment(ctx: &ToolContext) -> BTreeMap<String, String> {
+    let mut env = base_environment();
+    env.insert("KOMO_SESSION".into(), ctx.session.to_string());
+    env.insert("KOMO_RUN".into(), ctx.run.to_string());
+    env
+}
+
+/// 交给子进程的明确环境：继承的那几个变量 + 非交互终端。不带会话与 Run。
+pub fn base_environment() -> BTreeMap<String, String> {
     let mut env: BTreeMap<String, String> = INHERITED
         .iter()
         .filter_map(|name| {
@@ -389,8 +426,6 @@ fn environment(ctx: &ToolContext) -> BTreeMap<String, String> {
         .or_insert_with(|| "/usr/local/bin:/usr/bin:/bin".into());
     // 非交互、无颜色：给管道读的输出不该带控制序列。
     env.insert("TERM".into(), "dumb".into());
-    env.insert("KOMO_SESSION".into(), ctx.session.to_string());
-    env.insert("KOMO_RUN".into(), ctx.run.to_string());
     env
 }
 

@@ -383,6 +383,9 @@ pub struct GatewayState {
     /// `follow` 的接缝（`TaskSpawner`）要一份 `Arc<GatewayState>`，而执行器是在这份状态
     /// 存在**之前**造出来的，只能在这里回头接上（`docs/background-tasks.md`）。
     pub tool_executor: Arc<ToolExecutor>,
+    /// 监听（`docs/monitor.md`）。与任务分发同一个接法：要一份 `Arc<GatewayState>`，
+    /// 只能在这份状态造好之后接上（[`Self::wire_monitors`]）。停机与启动收尾要拿到它。
+    pub monitors: std::sync::OnceLock<Arc<super::monitors::GatewayMonitors>>,
     /// §5.6 那份**活的** skill 注册表。与 [`GatewayState::segments`] 共用一个 `Arc`。
     ///
     /// 存的是注册表而不是渲染好的那一段文本：文本按用途现渲染（系统提示一处、`skill://`
@@ -659,6 +662,7 @@ impl GatewayState {
             interventions_delivered: Mutex::new(std::collections::BTreeSet::new()),
             tool_names,
             tool_executor: executor_tools,
+            monitors: std::sync::OnceLock::new(),
             skills,
             max_retries,
             max_rounds,
@@ -673,6 +677,25 @@ impl GatewayState {
         let spawner = super::tasks::GatewayTaskSpawner::new(Arc::clone(self))
             as Arc<dyn komo_kernel::traits::TaskSpawner>;
         self.tool_executor.set_spawner(spawner);
+    }
+
+    /// 接上监听的实现（`docs/monitor.md`），与 [`Self::wire_task_spawner`] 同一个接法。
+    /// 脚本按 `shell` 的规矩起：数据目录只读挂载的名单与 `shell` 工具同一份。
+    pub fn wire_monitors(self: &Arc<Self>) {
+        let snapshot = self.snapshot();
+        let shell = komo_runtime::tools::ShellTool::new()
+            .protecting(protected_paths(&snapshot, &self.home));
+        let monitors = super::monitors::GatewayMonitors::new(
+            Arc::clone(self),
+            shell,
+            &snapshot.paths.runtime_dir,
+        );
+        if self.monitors.set(Arc::clone(&monitors)).is_err() {
+            tracing::warn!("监听已经接过一次，忽略这次重复设置");
+            return;
+        }
+        self.tool_executor
+            .set_monitors(monitors as Arc<dyn komo_kernel::traits::Monitors>);
     }
 
     pub fn snapshot(&self) -> Arc<ConfigSnapshot> {

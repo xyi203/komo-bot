@@ -221,6 +221,17 @@ fn project_block(files: &[ProjectFile]) -> Option<String> {
     Some(block)
 }
 
+/// 会话里规范改过之后补在任务后面的那一块：系统提示里那份是本会话早先的版本，冲突时以
+/// 这里为准。一份都不剩就明说删掉了，不然模型会一直照着系统提示里的旧规范做。
+pub(crate) fn project_update_block(files: &[ProjectFile]) -> String {
+    let head =
+        "（项目规范在本会话中改过。系统提示里的是早先的版本，下面是现在的；冲突时以这里为准。）";
+    match project_block(files) {
+        Some(block) => format!("{head}\n\n{block}"),
+        None => format!("{head}\n\n项目规范文件现在都不在了，系统提示里那份不再适用。"),
+    }
+}
+
 /// 子代理的系统提示（§4）。
 ///
 /// **它不共享父那份正文**：子代理拿不到父的对话历史、记忆与 Skills，只拿得到这一条任务。

@@ -1077,11 +1077,20 @@ impl GatewayState {
             None => None,
         };
         // 项目规范文件（`AGENTS.md` 等）同一个理由：从**解析过的**工作目录往上找，正文进
-        // `PayloadStore`。Run 停着的时候文件被改了，恢复出来的那一段仍是受理时那一版；
-        // 下一条 Run 受理时再找，改动从那一条起生效。
-        let project_files_ref =
-            super::project_files::freeze(&payloads, &super::project_files::discover(&workspace))
-                .await?;
+        // `PayloadStore`。Run 停着的时候文件被改了，恢复出来的那一段仍是受理时那一版。
+        // 同一会话里系统提示沿用上一条主 Run 那一份；现场找到的不一样，就另存一份，回放
+        // 时补在这条 Run 的任务后面——改动从这一条起生效，前缀缓存不作废。
+        let found = super::project_files::discover(&workspace);
+        let current = super::project_files::freeze(&payloads, &found).await?;
+        let events = super::compaction::read_events(self.routed.as_ref(), session).await?;
+        let (project_files_ref, project_files_update_ref) =
+            match super::project_files::pinned(&events, &profile.id, &workspace) {
+                Some(pinned) if pinned != current => {
+                    (pinned, Some(payloads.put_json(&found, None).await?))
+                }
+                Some(pinned) => (pinned, None),
+                None => (current, None),
+            };
         // skills 目录同一个理由，冻结的是**渲染好的正文**：续跑那一段的系统提示要与受理时
         // 逐字相同（provider 的前缀缓存从系统提示起算），注册表之后被重载、`SKILL.md` 被改，
         // 从下一条 Run 起生效。门控按这条 Run 的能力面。
@@ -1099,6 +1108,7 @@ impl GatewayState {
             surface,
             instructions_ref,
             project_files_ref,
+            project_files_update_ref,
             skills_ref,
             memory_scope: profile.memory_scope.clone(),
             projection: Some(config.execution.projection()),

@@ -20,7 +20,7 @@ use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::ToolCallId;
 use komo_kernel::types::tool::ToolNamespace;
-use komo_kernel::types::turn::ReplayMessage;
+use komo_kernel::types::turn::{ReplayMessage, Role};
 
 pub use history::{
     COMPACTION_PREFIX, DecayCandidate, Entry, EntryKind, ReplayScope, ResolvedMessage,
@@ -37,6 +37,9 @@ pub struct ContextInput<'s> {
     /// 项目规范文件（`AGENTS.md` 等，已从冻结快照指向的 payload 读回），外层在前。
     /// 只渲染进主 Agent 的提示；空 = 没有（或者是子代理，调用方不给）。
     pub project_files: Vec<ProjectFile>,
+    /// 会话里规范改过之后、这条 Run 受理时的那一版：系统提示仍是会话里沿用的那份（前缀
+    /// 缓存不作废），这一版补在这条 Run 的任务后面。`None` = 没变。
+    pub project_update: Option<Vec<ProjectFile>>,
     /// 解析过的真实工作目录。
     pub workspace: PathBuf,
     /// 这一段真正挂上的工具名，按 Schema 的顺序。RULES 按它挑规则（挂了 `rg` 才说"用
@@ -106,8 +109,17 @@ pub fn assemble(input: ContextInput<'_>) -> AgentContext {
         prompt.push_str("\n\n");
         prompt.push_str(memory);
     }
-    let (messages, run_from, decay_candidates) =
+    let (mut messages, run_from, decay_candidates) =
         history::replay_messages(input.history, &input.projection, &input.decayed);
+    if let Some(files) = &input.project_update
+        && let Some(task) = messages
+            .get_mut(run_from)
+            .filter(|message| message.role == Role::User)
+    {
+        let text = task.text.get_or_insert_with(String::new);
+        text.push_str("\n\n");
+        text.push_str(&prompt::project_update_block(files));
+    }
     AgentContext {
         system_prompt: prompt,
         messages,

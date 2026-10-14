@@ -478,9 +478,12 @@ impl SegmentSource for GatewaySegments {
         };
         // 项目规范（`AGENTS.md` 等）同样只给主 Agent：子代理的快照继承自父，里面那一份
         // 不能顺着带过去——子代理只看得见任务（§4），要规范就由父侧写进任务里。
-        let project_files = match &delegate {
-            Some(_) => Vec::new(),
-            None => identity.project_files.clone(),
+        let (project_files, project_update) = match &delegate {
+            Some(_) => (Vec::new(), None),
+            None => (
+                identity.project_files.clone(),
+                identity.project_update.clone(),
+            ),
         };
 
         // history 的纯逻辑先选窗口（`komo-agent`），再对**选中的**条目读正文与
@@ -507,6 +510,7 @@ impl SegmentSource for GatewaySegments {
         let template = compaction::ContextTemplate {
             instructions: identity.instructions.clone(),
             project_files,
+            project_update,
             workspace: cwd.clone(),
             tools: tool_names,
             mcp_servers,

@@ -310,7 +310,8 @@ async fn editing_a_profile_leaves_a_run_in_flight_on_its_own_version() {
 // ---------------------------------------------------------------- 项目规范同样受理时冻结
 
 /// 工作目录里的 `AGENTS.md` 进主 Agent 的提示；Run 在飞时它被改了，续跑那一段仍是
-/// **受理时**那一版，下一条 Run 受理时才读到新的。
+/// **受理时**那一版。同一会话的下一条 Run 系统提示仍沿用那一版（前缀缓存不作废），新的
+/// 那一版补在它的任务后面。
 #[tokio::test]
 async fn project_files_are_frozen_at_acceptance_like_the_profile() {
     const OLD: &str = "仓库规范第一版：先读再改。";
@@ -339,28 +340,39 @@ async fn project_files_are_frozen_at_acceptance_like_the_profile() {
     let next = gateway.submit(&session, "project-2", "再说一句").await.run;
     gateway.wait_terminal(&next).await;
 
-    let prompts: Vec<String> = llm
-        .requests
-        .lock()
-        .expect("脚本模型")
+    let requests = llm.requests.lock().expect("脚本模型").clone();
+    let prompts: Vec<&String> = requests
         .iter()
-        .map(|request| request.system_prompt.clone())
+        .map(|request| &request.system_prompt)
         .collect();
-    let with_old: Vec<&String> = prompts.iter().filter(|p| p.contains(OLD)).collect();
-    let with_new: Vec<&String> = prompts.iter().filter(|p| p.contains(NEW)).collect();
-    assert_eq!(
-        with_old.len(),
-        2,
-        "第一段与续跑段都用受理时那一版：{prompts:#?}"
-    );
+    assert_eq!(prompts.len(), 3, "{prompts:#?}");
     assert!(
-        with_old
-            .iter()
-            .all(|prompt| prompt.contains("<project_instructions path=")),
-        "{with_old:#?}"
+        prompts.iter().all(|prompt| *prompt == prompts[0]
+            && prompt.contains(OLD)
+            && prompt.contains("<project_instructions path=")),
+        "三次请求的系统提示逐字相同，都是受理时那一版：{prompts:#?}"
     );
-    assert_eq!(with_new.len(), 1, "新受理的那一条读到新版：{prompts:#?}");
-    assert!(!with_new[0].contains(OLD), "{}", with_new[0]);
+    assert!(prompts.iter().all(|prompt| !prompt.contains(NEW)));
+
+    let task = |request: &komo_kernel::types::turn::TurnRequest| {
+        request
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.role == komo_kernel::types::turn::Role::User)
+            .and_then(|message| message.text.clone())
+            .unwrap_or_default()
+    };
+    let latest = task(&requests[2]);
+    assert!(
+        latest.starts_with("再说一句") && latest.contains("项目规范在本会话中改过"),
+        "新那一版补在新 Run 的任务后面：{latest}"
+    );
+    assert!(latest.contains(NEW) && !latest.contains(OLD), "{latest}");
+    assert!(
+        !task(&requests[0]).contains("项目规范在本会话中改过"),
+        "没改过的 Run 不补"
+    );
 
     gateway.stop().await;
 }

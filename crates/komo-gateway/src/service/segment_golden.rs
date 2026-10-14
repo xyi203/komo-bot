@@ -106,6 +106,7 @@ async fn render(case: &Case) -> String {
     let context = assemble(ContextInput {
         instructions: case.instructions.map(str::to_string),
         project_files: Vec::new(),
+        project_update: None,
         workspace: std::path::PathBuf::from(CWD),
         tools: tool_names,
         mcp_servers: Vec::new(),

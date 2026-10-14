@@ -45,6 +45,7 @@ use super::ledgers::RoutedLedger;
 pub(crate) struct ContextTemplate {
     pub instructions: Option<String>,
     pub project_files: Vec<ProjectFile>,
+    pub project_update: Option<Vec<ProjectFile>>,
     pub workspace: PathBuf,
     pub tools: Vec<String>,
     pub mcp_servers: Vec<ToolNamespace>,
@@ -63,6 +64,7 @@ impl ContextTemplate {
         assemble(ContextInput {
             instructions: self.instructions,
             project_files: self.project_files,
+            project_update: self.project_update,
             workspace: self.workspace,
             tools: self.tools,
             mcp_servers: self.mcp_servers,

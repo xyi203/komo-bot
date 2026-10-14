@@ -15,6 +15,7 @@
 
 use std::path::Path;
 
+use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::traits::{LedgerError, StoreError};
 use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::refs::PayloadRef;
@@ -80,6 +81,24 @@ pub(crate) async fn freeze(
         return Ok(None);
     }
     Ok(Some(payloads.put_json(&files, None).await?))
+}
+
+/// 这个会话里上一条主 Run（同一个 Agent、同一个工作目录）冻结的那一份规范：新 Run 沿用
+/// 它，系统提示才逐字不变（provider 的前缀缓存从系统提示起算）。外层 `None` = 没有这样的
+/// Run，现场找；`Some(None)` = 有，当时一个都没找到。子代理不带规范，不算。
+pub(crate) fn pinned(
+    events: &[Event],
+    agent_id: &str,
+    workspace: &Path,
+) -> Option<Option<PayloadRef>> {
+    events.iter().rev().find_map(|event| match &event.payload {
+        EventPayload::RunAccepted(body) if body.delegate.is_none() => body
+            .snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.agent_id == agent_id && snapshot.workspace == workspace)
+            .map(|snapshot| snapshot.project_files_ref.clone()),
+        _ => None,
+    })
 }
 
 /// 按引用读回冻结的那一份。读不出来或不是预期的 JSON = 会话缺内容，由调用方停下来

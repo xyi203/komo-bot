@@ -57,6 +57,9 @@ pub(crate) struct Identity {
     /// 项目规范文件（`AGENTS.md` 等），外层在前。冻结路径按引用读回；兜底路径受理时
     /// 没找过，现场找一遍（见 [`ambient_identity`]）。
     pub project_files: Vec<ProjectFile>,
+    /// 受理时现场找到、与 `project_files` 不一样的那一版（快照的 `project_files_update_ref`）；
+    /// `None` = 没变。兜底路径现场找的就是最新的，恒为 `None`。
+    pub project_update: Option<Vec<ProjectFile>>,
     /// 渲染好的 skills 目录块。冻结路径按引用读回受理时那一份；兜底路径现场从注册表渲染。
     /// 子代理不看目录，由调用方丢掉（§12）。
     pub skills: Option<String>,
@@ -120,6 +123,10 @@ pub(crate) async fn identity_for(
         Some(reference) => super::project_files::thaw(payloads, reference).await?,
         None => Vec::new(),
     };
+    let project_update = match &frozen.project_files_update_ref {
+        Some(reference) => Some(super::project_files::thaw(payloads, reference).await?),
+        None => None,
+    };
     // skills 目录也一样：按引用读回受理时那段正文，不读活注册表（续跑的系统提示要与受理时
     // 逐字相同）。
     let skills = match &frozen.skills_ref {
@@ -140,6 +147,7 @@ pub(crate) async fn identity_for(
         workspace: paths::real_root(&frozen.workspace),
         instructions,
         project_files,
+        project_update,
         skills,
         memory_scope: frozen.memory_scope,
         projection: frozen.projection,
@@ -193,6 +201,7 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         surface,
         // 与指令读当前配置同一个口径：没有快照就按现在的磁盘。
         project_files: super::project_files::discover(&workspace),
+        project_update: None,
         skills,
         workspace,
         instructions: profile.and_then(|profile| profile.instructions.clone()),
@@ -474,6 +483,7 @@ mod tests {
         Ok(assemble(ContextInput {
             instructions: None,
             project_files: Vec::new(),
+            project_update: None,
             workspace: PathBuf::from("/work"),
             tools: Vec::new(),
             mcp_servers: Vec::new(),

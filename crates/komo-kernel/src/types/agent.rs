@@ -116,6 +116,12 @@ pub struct RunSnapshot {
     /// 目录往上一个都没找到，或者这一格出现之前受理的 Run。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_files_ref: Option<PayloadRef>,
+    /// 同一会话里，`project_files_ref` 沿用上一条主 Run 那一份：系统提示每轮重读规范，
+    /// 文件一改就让 provider 的前缀缓存从系统提示起整段作废。受理时现场找到的与沿用的
+    /// 不一样，现场那一版（[`ProjectFile`] 的 JSON 数组，可以是空数组 = 都删了）存在这里，
+    /// 回放时补在这条 Run 的任务后面。`None` = 没变，或者这一格出现之前受理的 Run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_files_update_ref: Option<PayloadRef>,
     /// 系统提示里那块 skills 目录（渲染好的正文）的引用（`payloads/`）。冻结的是**文本**：
     /// 续跑那一段要与受理时逐字相同，不然 provider 的前缀缓存从系统提示起整段作废；注册表
     /// 之后被重载，从下一条 Run 起生效。`None` = 没有目录（没有 skill 露面、没挂能读文件的
@@ -252,6 +258,7 @@ mod tests {
             surface: AgentSurface::new(["read"]),
             instructions_ref: None,
             project_files_ref: None,
+            project_files_update_ref: None,
             skills_ref: None,
             memory_scope: None,
             projection: None,
@@ -259,6 +266,7 @@ mod tests {
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert!(json.get("project_files_ref").is_none(), "{json}");
+        assert!(json.get("project_files_update_ref").is_none(), "{json}");
         assert!(json.get("skills_ref").is_none(), "{json}");
         let back: RunSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(back, snapshot);

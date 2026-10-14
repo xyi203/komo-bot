@@ -636,6 +636,75 @@ pub fn auth_codex_status(home: &Path) -> Outcome {
     Ok(line)
 }
 
+/// `oauth = true` 的那个 MCP 服务器的地址；没配或不是 OAuth 就说清楚。
+fn oauth_server_url(home: &Path, server: &str) -> Result<String, String> {
+    use komo_kernel::protocol::config::McpTransport;
+    let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
+    match loaded
+        .snapshot
+        .start_only
+        .mcp
+        .get(server)
+        .map(|c| &c.transport)
+    {
+        Some(McpTransport::Http {
+            url, oauth: true, ..
+        }) => Ok(url.clone()),
+        Some(_) => Err(format!("[mcp.servers.{server}] 没写 oauth = true")),
+        None => Err(format!("config.toml 里没有 [mcp.servers.{server}]")),
+    }
+}
+
+/// `komo auth mcp login <server>`：浏览器授权，凭证直接落盘，不经 Gateway（同
+/// `komo auth codex login`）。
+pub async fn auth_mcp_login(home: &Path, server: &str) -> Outcome {
+    let url = oauth_server_url(home, server)?;
+    let path = komo_gateway::mcp_auth::credentials_path(home, server);
+    let mut out = std::io::stderr();
+    komo_gateway::mcp_auth::login(&url, &path, &mut out)
+        .await
+        .map_err(failed)?;
+    Ok(format!(
+        "{server} 登录成功，凭证已写入 {}；跑 `komo gateway restart` 让 Gateway 连上它",
+        path.display()
+    ))
+}
+
+/// `komo auth mcp status`：每个 `oauth = true` 的服务器一行，不打印 token。
+pub fn auth_mcp_status(home: &Path) -> Outcome {
+    use komo_kernel::protocol::config::McpTransport;
+    let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
+    let mut lines = Vec::new();
+    for (name, config) in &loaded.snapshot.start_only.mcp {
+        if !matches!(config.transport, McpTransport::Http { oauth: true, .. }) {
+            continue;
+        }
+        let path = komo_gateway::mcp_auth::credentials_path(home, name);
+        let line = match komo_gateway::mcp_auth::status(&path).map_err(failed)? {
+            None => format!("{name:<12} 未登录（komo auth mcp login {name}）"),
+            Some(status) => {
+                let expiry = status
+                    .expires_at
+                    .and_then(|secs| time::OffsetDateTime::from_unix_timestamp(secs as i64).ok())
+                    .map_or("未给过期时间".to_string(), |at| {
+                        format!("过期 {}", render::stamp(at))
+                    });
+                let refresh = if status.refreshable {
+                    "可自动刷新"
+                } else {
+                    "不能自动刷新，过期要重新登录"
+                };
+                format!("{name:<12} 已登录  {expiry}  {refresh}")
+            }
+        };
+        lines.push(line);
+    }
+    if lines.is_empty() {
+        return Ok("没有 oauth = true 的 MCP 服务器".into());
+    }
+    Ok(lines.join("\n"))
+}
+
 /// `komo skills ...`：只读文件系统，不经 Gateway（§5.6）。
 pub fn skills(home: &Path, action: SkillsAction<'_>) -> Outcome {
     let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;

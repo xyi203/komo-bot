@@ -7,6 +7,7 @@ pub mod embedding;
 pub mod executor;
 pub mod llm;
 pub mod mcp;
+pub mod mcp_auth;
 pub mod memory;
 pub mod python_runtime;
 pub mod recovery;

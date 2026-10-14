@@ -23,6 +23,9 @@ pub use komo_runtime::config;
 /// `komo auth codex login|status`（§3、§13.3）：设备码登录与凭证文件，全部实现在
 /// `komo-runtime`（不碰 axum / ratatui，只要 reqwest），这里只转一道给 bin。
 pub use komo_runtime::llm::codex_auth;
+/// `komo auth mcp login|status`（`docs/mcp.md` §2.1）：同上，OAuth 登录与凭证文件在
+/// `komo-runtime`。
+pub use komo_runtime::mcp_auth;
 /// `komo toolbox` 的那几个类型（§5.3）。同一个理由：bin 的依赖是 client / gateway /
 /// clap 三条，不加第四条。
 pub use komo_runtime::toolbox;

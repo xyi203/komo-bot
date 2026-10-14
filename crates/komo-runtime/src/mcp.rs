@@ -3,11 +3,13 @@
 //! 传输与协议都交给 `rmcp`（官方 Rust SDK），这里只管 komo 自己的三件事：
 //!
 //! - **凭证只给声明过的人。** stdio 子进程不继承 Gateway 的环境：先清空，只放回跑得起来
-//!   所需的几个变量，再加上配置里 `env` 列出的 `.env` 变量。HTTP 的 bearer token 同理。
+//!   所需的几个变量，再加上配置里 `env` 列出的 `.env` 变量。HTTP 的 bearer token 同理；
+//!   `oauth = true` 的服务器用数据目录里那份登录凭证（[`crate::mcp_auth`]）。
 //! - **工具名进 komo 的命名空间**：`mcp__<server>__<tool>`，与内置工具不会撞名。
 //! - **子进程的 stderr 进日志**，不糊在 Gateway 的终端上。
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +20,7 @@ use komo_kernel::protocol::config::{McpServerConfig, McpTransport};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
 use rmcp::service::{RoleClient, RunningService};
+use rmcp::transport::auth::AuthClient;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
 use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 
@@ -37,6 +40,10 @@ const INHERITED_ENV: &[&str] = &["PATH", "HOME", "USER", "LANG", "TMPDIR", "SHEL
 pub enum McpError {
     #[error("`.env` 里没有 {0}")]
     MissingSecret(String),
+    #[error("还没登录：跑 `komo auth mcp login {0}`，再 `komo gateway restart`")]
+    NotLoggedIn(String),
+    #[error("OAuth：{0}")]
+    Auth(String),
     #[error("起不来：{0}")]
     Spawn(String),
     #[error("握手失败：{0}")]
@@ -76,21 +83,26 @@ impl McpServer {
     }
 }
 
-/// 连上并列出工具。
+/// 连上并列出工具。`data_dir` 只给 `oauth = true` 的服务器找登录凭证。
 pub async fn connect(
     name: &str,
     config: &McpServerConfig,
     secrets: &Secrets,
+    data_dir: &Path,
 ) -> Result<(McpServer, Vec<rmcp::model::Tool>), McpError> {
-    tokio::time::timeout(CONNECT_TIMEOUT, connect_inner(name, config, secrets))
-        .await
-        .map_err(|_elapsed| McpError::Timeout)?
+    tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        connect_inner(name, config, secrets, data_dir),
+    )
+    .await
+    .map_err(|_elapsed| McpError::Timeout)?
 }
 
 async fn connect_inner(
     name: &str,
     config: &McpServerConfig,
     secrets: &Secrets,
+    data_dir: &Path,
 ) -> Result<(McpServer, Vec<rmcp::model::Tool>), McpError> {
     let service = match &config.transport {
         McpTransport::Stdio { command, args, env } => {
@@ -119,8 +131,26 @@ async fn connect_inner(
                 .map_err(|error| McpError::Handshake(error.to_string()))?
         }
         McpTransport::Http {
+            url, oauth: true, ..
+        } => {
+            let path = crate::mcp_auth::credentials_path(data_dir, name);
+            let manager = crate::mcp_auth::authorized_manager(url, &path)
+                .await
+                .map_err(|error| McpError::Auth(error.to_string()))?
+                .ok_or_else(|| McpError::NotLoggedIn(name.to_string()))?;
+            let client = AuthClient::new(reqwest::Client::new(), manager);
+            let transport_config = StreamableHttpClientTransportConfig::with_uri(url.clone());
+            ().serve(StreamableHttpClientTransport::with_client(
+                client,
+                transport_config,
+            ))
+            .await
+            .map_err(|error| McpError::Handshake(error.to_string()))?
+        }
+        McpTransport::Http {
             url,
             bearer_token_env,
+            oauth: false,
         } => {
             let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.clone());
             if let Some(key) = bearer_token_env {
@@ -200,10 +230,11 @@ pub fn select<'a>(
 pub async fn connect_all(
     servers: &BTreeMap<String, McpServerConfig>,
     secrets: &Secrets,
+    data_dir: &Path,
 ) -> Vec<Arc<dyn Tool>> {
     let connected =
         futures_util::future::join_all(servers.iter().map(|(name, config)| async move {
-            (name, config, connect(name, config, secrets).await)
+            (name, config, connect(name, config, secrets, data_dir).await)
         }))
         .await;
 
@@ -281,6 +312,7 @@ mod tests {
             transport: McpTransport::Http {
                 url: "http://x".into(),
                 bearer_token_env: None,
+                oauth: false,
             },
             tools: Some(vec!["b".into(), "ghost".into()]),
             read_only: Vec::new(),

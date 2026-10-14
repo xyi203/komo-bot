@@ -254,6 +254,8 @@ pub(super) struct McpServerSection {
     pub env: Vec<String>,
     pub url: Option<String>,
     pub bearer_token_env: Option<String>,
+    #[serde(default)]
+    pub oauth: bool,
     pub tools: Option<Vec<String>>,
     #[serde(default)]
     pub read_only: Vec<String>,
@@ -267,8 +269,8 @@ impl McpServerSection {
         };
         let transport = match (self.command, self.url) {
             (Some(command), None) => {
-                if self.bearer_token_env.is_some() {
-                    return Err(invalid("bearer_token_env 只用于 url"));
+                if self.bearer_token_env.is_some() || self.oauth {
+                    return Err(invalid("bearer_token_env / oauth 只用于 url"));
                 }
                 McpTransport::Stdio {
                     command,
@@ -280,9 +282,13 @@ impl McpServerSection {
                 if !self.args.is_empty() || !self.env.is_empty() {
                     return Err(invalid("args / env 只用于 command"));
                 }
+                if self.oauth && self.bearer_token_env.is_some() {
+                    return Err(invalid("oauth 与 bearer_token_env 只能写一个"));
+                }
                 McpTransport::Http {
                     url,
                     bearer_token_env: self.bearer_token_env,
+                    oauth: self.oauth,
                 }
             }
             _ => return Err(invalid("command 与 url 要恰好写一个")),

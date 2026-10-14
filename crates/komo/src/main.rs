@@ -382,6 +382,22 @@ enum AuthCommand {
         #[command(subcommand)]
         action: CodexAuthCommand,
     },
+    /// `oauth = true` 的 MCP 服务器（docs/mcp.md §2.1）。
+    Mcp {
+        #[command(subcommand)]
+        action: McpAuthCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpAuthCommand {
+    /// 打开浏览器授权（授权码 + PKCE），凭证写进数据目录；之后 `komo gateway restart`。
+    Login {
+        /// `[mcp.servers.<name>]` 里的名字。
+        server: String,
+    },
+    /// 各 OAuth 服务器登录了没有、token 何时到期、能否自动刷新；不打印 token。
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -542,6 +558,12 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
                         .map_err(|error| error.to_string())
                 }
                 CodexAuthCommand::Status => commands::auth_codex_status(home).map(Some),
+            },
+            AuthCommand::Mcp { action } => match action {
+                McpAuthCommand::Login { server } => {
+                    commands::auth_mcp_login(home, &server).await.map(Some)
+                }
+                McpAuthCommand::Status => commands::auth_mcp_status(home).map(Some),
             },
         },
         Some(Command::Skills { action }) => {

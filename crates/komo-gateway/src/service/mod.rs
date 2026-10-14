@@ -656,7 +656,10 @@ async fn build_tools(
     tools.push(Arc::new(UpdatePlanTool::new()));
     // MCP（`docs/mcp.md`）：启动时连上、列出工具，挂进同一份目录——之后它们与内置工具
     // 走同一条落账的路。
-    tools.extend(komo_runtime::mcp::connect_all(&snapshot.start_only.mcp, &config.secrets()).await);
+    tools.extend(
+        komo_runtime::mcp::connect_all(&snapshot.start_only.mcp, &config.secrets(), config.home())
+            .await,
+    );
     // 测试专用的工具（`gate` / `unsure`，见 `test_support`）：只在测试为这个数据目录装过
     // 时才有，生产构建里这一行不存在。
     #[cfg(any(test, feature = "test-support"))]

@@ -644,6 +644,7 @@ mod tests {
             transport: McpTransport::Http {
                 url: "http://127.0.0.1:1/mcp".into(),
                 bearer_token_env: None,
+                oauth: false,
             },
             tools: tools.map(|tools| tools.into_iter().map(String::from).collect()),
             read_only: read_only.into_iter().map(String::from).collect(),

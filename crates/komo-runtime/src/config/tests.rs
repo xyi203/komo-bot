@@ -596,6 +596,28 @@ tools = ["lookup"]
 }
 
 #[test]
+fn an_oauth_mcp_server_loads_and_refuses_a_bearer_token_beside_it() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("\n[mcp.servers.devops]\nurl = \"https://mcp.example.com/mcp\"\noauth = true\n");
+    write(&fixture.sources().config, &text);
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(
+        loaded.snapshot.start_only.mcp["devops"].transport,
+        komo_kernel::protocol::config::McpTransport::Http {
+            url: "https://mcp.example.com/mcp".into(),
+            bearer_token_env: None,
+            oauth: true,
+        }
+    );
+
+    text.push_str("bearer_token_env = \"T\"\n");
+    write(&fixture.sources().config, &text);
+    let error = load_config(&fixture.options()).unwrap_err();
+    assert!(error.to_string().contains("只能写一个"), "{error}");
+}
+
+#[test]
 fn an_mcp_server_needs_exactly_one_of_command_and_url() {
     let fixture = Fixture::valid();
     let mut text = Fixture::config_text("chat-a", "medium");

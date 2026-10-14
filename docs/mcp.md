@@ -43,6 +43,27 @@ tools            = ["lookup"]          # 白名单；省略 = 服务器列出的
 - 校验：服务器名只能是字母、数字、`_`、`-`（它要进工具名）；`read_only` 写了 `tools` 白名单
   之外的名字是警告。
 
+### 2.1 OAuth（2026-10-14）
+
+```toml
+[mcp.servers.devops-mcp-prod]
+url   = "https://devops-mcp-mdw.shoplazza.site/mcp"
+oauth = true                           # 与 bearer_token_env 只能写一个
+```
+
+- `komo auth mcp login <name>`：**不经 Gateway**（同 `komo auth codex login`），在本机发现授权
+  服务器（RFC 9728 / 8414）→ 动态注册客户端（RFC 7591，`client_name = "komo"`）→ 打开浏览器走
+  授权码 + PKCE → 回调只听 `127.0.0.1` 的一个随机端口（5 分钟超时，`/callback` 以外的路径回 404）
+  → 换 token。`client_id` 与 token 写进 `<数据目录>/mcp/<name>/credentials.json`（临时文件 +
+  rename，0600），不进 `.env`。之后 `komo gateway restart`。
+- `komo auth mcp status`：每个 `oauth = true` 的服务器一行——登录与否、过期时间、能否自动刷新；
+  不打印 token。
+- Gateway 连接时用这份文件装 rmcp 的 `AuthorizationManager`（`FileCredentialStore`，
+  `komo-runtime/src/mcp_auth.rs`）；没登录过就记 warn 跳过这个服务器，报错指名要跑的命令。
+  取用与刷新交给 rmcp：每次请求从文件取 token，快过期时用 refresh token 换新并写回；服务器拒绝
+  token 时静默刷新重试一次。服务器不发 refresh token 时，过期后要重新 `login`——新 token 写进同一
+  份文件，在跑的 Gateway 下一次请求就读到，不必重启。
+
 ## 3. 只读与恢复
 
 计划是 `Operation::McpCall { server, tool, read_only }`。`read_only` 来自**操作者**的
@@ -71,7 +92,8 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
 
 ## 5. 不做的（首版）
 
-- OAuth（只支持 `.env` 里的 bearer token）。
+- （OAuth 原在此列，2026-10-14 落地，见 §2.1。）客户端凭证（client credentials）、
+  企业托管授权等其他 OAuth 流程仍不做。
 - 断线重连：服务器进程挂了，它的工具调用会失败，重启 Gateway 才重新连。
 - 热加载：增删服务器要重启。
 - `resources` / `prompts` / 采样（sampling）/ elicitation：只用 tools。
@@ -84,5 +106,7 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
   服务器不影响别的。
 - `komo-runtime`：`mcp::tests`（命名、白名单）、`config::tests`（解析、`command`/`url` 互斥）、
   `config::validate::tests`（服务器名、`read_only` 越界）。
+- `komo-runtime`：`mcp_auth::tests`（回调跳过别的路径、`error=` 回调报错不换码、凭证文件往返与
+  0600、status 不带 token）、`config::tests::an_oauth_mcp_server_loads_and_refuses_a_bearer_token_beside_it`。
 - （`komo-kernel` 的 `policy::defaults::tests::mcp_reads_pass_and_other_mcp_calls_ask_under_strict`
   随 Policy 于 2026-10-11 删除。）

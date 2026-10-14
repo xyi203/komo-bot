@@ -14,7 +14,8 @@ test-support = ["komo-kernel/test-support"]
 komo-kernel = { workspace = true }
 komo-store = { workspace = true }
 reqwest = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "fs", "process", "io-util"] }
+# "net"：`komo auth mcp login` 的本机回调（mcp_auth）；gateway 早已把它带进图里。
+tokio = { workspace = true, features = ["rt-multi-thread", "fs", "process", "io-util", "net"] }
 arc-swap = { workspace = true }
 # §13.4：`rg` 工具（内嵌 ripgrep 的搜索库，不起子进程）。
 grep = { workspace = true }

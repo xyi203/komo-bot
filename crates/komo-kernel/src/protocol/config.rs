@@ -105,6 +105,10 @@ pub enum McpTransport {
         /// `Authorization: Bearer` 用的 `.env` 变量名。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bearer_token_env: Option<String>,
+        /// 走 MCP 的 OAuth（授权码 + PKCE）：token 由 `komo auth mcp login <name>` 写进
+        /// 数据目录，不在 `.env`。与 `bearer_token_env` 互斥。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        oauth: bool,
     },
 }
 

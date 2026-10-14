@@ -355,8 +355,7 @@ impl App {
                 // 次，累加起来就是这个会话的用量（补读历史时一并算上，所以 resume 回来看
                 // 到的是整段的数，不是"这次打开之后"的数）。
                 if fresh {
-                    self.tokens_in += body.input_tokens.unwrap_or(0);
-                    self.tokens_out += body.output_tokens.unwrap_or(0);
+                    self.tokens.add(body);
                 }
                 // 正式回复到了，草稿让位——消息面上这一轮只留一条。
                 if self

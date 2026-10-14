@@ -13,6 +13,7 @@ mod events;
 mod keys;
 #[cfg(test)]
 mod tests;
+mod tokens;
 
 use std::collections::BTreeMap;
 
@@ -31,6 +32,8 @@ use crate::sse::ConnectionState;
 use crate::tui::command::{self};
 use crate::tui::model_picker::ModelPicker;
 use crate::tui::paste::Input;
+
+pub use tokens::TokenTally;
 
 /// TUI 打开的方式（§3 命令表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,8 +317,7 @@ pub struct App {
     /// [`ServerEvent::FrameSkipped`]）。
     skipped_noticed: bool,
     /// 这一段对话到此为止花掉的 token（模型每答一轮报一次，见 `message.assistant`）。
-    pub tokens_in: u64,
-    pub tokens_out: u64,
+    pub tokens: TokenTally,
     /// 用量算到哪一条事件为止了。**不能用 `cursor` 代替**：那一个在别处就推过了。
     counted: Seq,
     /// 工具调用印不印参数与结果预览（`Ctrl-T`）。
@@ -363,8 +365,7 @@ impl App {
             listing_models: false,
             model_picker: None,
             skipped_noticed: false,
-            tokens_in: 0,
-            tokens_out: 0,
+            tokens: TokenTally::default(),
             counted: Seq::ZERO,
             tool_detail: false,
             now: None,

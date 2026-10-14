@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
 
-use crate::tui::app::{App, status_text};
+use crate::tui::app::{App, TokenTally, status_text};
 pub(crate) use crate::tui::markdown;
 use crate::tui::model_picker::{ModelPicker, entry_detail};
 
@@ -190,7 +190,7 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
 /// **左边是"此刻在发生什么"，右边是"这一摊是什么"**，中间撑开：
 ///
 /// ```text
-///  ⠋ 0.5s                          deepseek-flash · 已连接 · ↑12.3k ↓1.8k
+///  ⠋ 0.5s      opus · 已连接 · ↑38 ↓7.6k R1.4M W108k CH99.5%
 /// ```
 ///
 /// 右边三格固定，位置不动，眼睛不用每次重新找；左边只在**真有事**的时候说话——跑着有
@@ -254,11 +254,7 @@ fn status_line(app: &App, width: u16) -> Paragraph<'static> {
     ));
 
     right.push(Span::styled(
-        format!(
-            " · ↑{} ↓{}",
-            compact(app.tokens_in),
-            compact(app.tokens_out)
-        ),
+        format!(" · {}", token_cell(&app.tokens)),
         Style::default().fg(Color::DarkGray),
     ));
 
@@ -306,14 +302,37 @@ fn justify(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: u16) -> V
     out
 }
 
-/// 一个大数写短一点：`980` · `12.3k` · `1.4M`。
+/// token 那一格，照 pi 的页脚：`↑38 ↓7.6k R1.4M W108k CH99.5%`。
+///
+/// `↑` 只算没走缓存的输入，`R` / `W` 是缓存读写，四个加起来才是模型吃进去的；`CH` 是
+/// 最近一轮的缓存命中率（[`TokenTally`]）。`↑↓` 总在，缓存那几格这家模型报了才出现。
+fn token_cell(tokens: &TokenTally) -> String {
+    let mut cell = format!("↑{} ↓{}", compact(tokens.input), compact(tokens.output));
+    if tokens.cache_read > 0 {
+        cell.push_str(&format!(" R{}", compact(tokens.cache_read)));
+    }
+    if tokens.cache_write > 0 {
+        cell.push_str(&format!(" W{}", compact(tokens.cache_write)));
+    }
+    if let Some(rate) = tokens.hit_rate() {
+        cell.push_str(&format!(" CH{rate:.1}%"));
+    }
+    cell
+}
+
+/// 一个大数写短一点（同 pi）：`980` · `7.6k` · `108k` · `1.4M` · `12M`。
 fn compact(count: u64) -> String {
+    let n = count as f64;
     if count < 1_000 {
         count.to_string()
-    } else if count < 1_000_000 {
-        format!("{:.1}k", count as f64 / 1_000.0)
+    } else if count < 9_950 {
+        format!("{:.1}k", n / 1_000.0)
+    } else if count < 999_500 {
+        format!("{:.0}k", n / 1_000.0)
+    } else if count < 9_950_000 {
+        format!("{:.1}M", n / 1_000_000.0)
     } else {
-        format!("{:.1}M", count as f64 / 1_000_000.0)
+        format!("{:.0}M", n / 1_000_000.0)
     }
 }
 
@@ -849,14 +868,86 @@ fn main() {
     #[test]
     fn the_token_count_adds_up_over_the_session() {
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
-        assert_eq!((app.tokens_in, app.tokens_out), (0, 0));
+        assert_eq!(app.tokens, TokenTally::default());
         feed(&mut app, &fixture::conversation());
-        assert!(app.tokens_in > 0, "答过话就该有数");
+        assert!(app.tokens.input > 0, "答过话就该有数");
 
         // 同一条事件再来一遍（补读与订阅万一重叠）不许加两遍。
-        let before = (app.tokens_in, app.tokens_out);
+        let before = app.tokens;
         feed(&mut app, &fixture::conversation());
-        assert_eq!((app.tokens_in, app.tokens_out), before);
+        assert_eq!(app.tokens, before);
+    }
+
+    /// token 那一格照 pi 的页脚写：`↑` 只算没走缓存的输入，缓存读写与最近一轮的命中率
+    /// 各占一格。
+    #[test]
+    fn the_token_cell_reads_like_the_pi_footer() {
+        let tokens = TokenTally {
+            input: 38,
+            output: 7_600,
+            cache_read: 1_400_000,
+            cache_write: 108_000,
+            last_round: Some((199, 200)),
+        };
+        assert_eq!(token_cell(&tokens), "↑38 ↓7.6k R1.4M W108k CH99.5%");
+
+        // 没报过缓存的模型只有 ↑↓，不挂一个 0% 冒充"缓存坏了"。
+        let plain = TokenTally {
+            input: 320,
+            output: 50,
+            ..TokenTally::default()
+        };
+        assert_eq!(token_cell(&plain), "↑320 ↓50");
+    }
+
+    #[test]
+    fn big_numbers_round_like_pi() {
+        let cases = [
+            (980, "980"),
+            (7_640, "7.6k"),
+            (9_960, "10k"),
+            (108_000, "108k"),
+            (999_600, "1.0M"),
+            (1_420_000, "1.4M"),
+            (12_300_000, "12M"),
+        ];
+        for (count, want) in cases {
+            assert_eq!(compact(count), want, "{count}");
+        }
+    }
+
+    /// 模型报了缓存，状态行上就看得见：两轮各报一次，`↑` 是两轮没命中的部分之和，`CH`
+    /// 是第二轮的。
+    #[test]
+    fn the_status_line_shows_the_cache_once_the_model_reports_it() {
+        let mut events = fixture::conversation();
+        let rounds = [(1_510, 7, 0, 1_500), (1_550, 9, 1_500, 30)];
+        let mut bodies = events
+            .iter_mut()
+            .filter_map(|event| match &mut event.payload {
+                EventPayload::MessageAssistant(body) => Some(body),
+                _ => None,
+            });
+        for (input, output, read, write) in rounds {
+            let body = bodies.next().expect("fixture 里有两轮回答");
+            body.input_tokens = Some(input);
+            body.output_tokens = Some(output);
+            body.cache_read_tokens = Some(read);
+            body.cache_write_tokens = Some(write);
+        }
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &events);
+        app.apply(ServerEvent::Connection(ConnectionState::Connected));
+
+        let rows = screen_rows(&app, 100, 20);
+        let status = rows
+            .iter()
+            .find(|row| row.contains("已连接"))
+            .unwrap_or_else(|| panic!("找不到状态行：{rows:?}"));
+        assert!(
+            status.ends_with("↑30 ↓16 R1.5k W1.5k CH96.8%"),
+            "{status:?}"
+        );
     }
 
     /// **一切正常的时候状态行不说话。**

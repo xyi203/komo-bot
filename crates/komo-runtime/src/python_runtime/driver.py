@@ -135,6 +135,11 @@ def main():
         # 钩子先装：读作业之前就装上，任何一条 import 都躲不过它。
         _install_import_guard()
         job = json.load(sys.stdin)
+        # 作业读完就把 0 号描述符换成 /dev/null：脚本起的子进程会继承它，管道当 stdin 时
+        # rg 这类"没给路径就搜 stdin"的工具会去搜这条空管道，静默返回零匹配。
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, 0)
+        os.close(devnull)
         mode = job.get("mode")
         if mode == "code":
             out["result"] = _jsonable(_run_code(job))

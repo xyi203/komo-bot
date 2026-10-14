@@ -611,6 +611,29 @@ mod tests {
         assert_eq!(outcome.result, serde_json::json!(2));
     }
 
+    /// 作业经管道送进来；脚本起的子进程不能继承那条管道当 stdin，否则 rg 这类没给路径就
+    /// 搜 stdin 的工具会静默返回零匹配。
+    #[tokio::test]
+    async fn a_subprocess_started_by_the_script_does_not_inherit_the_job_pipe() {
+        if !have_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = writer();
+        let outcome = host(dir.path())
+            .run(
+                PythonJob::Code {
+                    code: "import os, stat\nresult = stat.S_ISFIFO(os.fstat(0).st_mode)".into(),
+                },
+                &mut sink,
+                CancelToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.status, ToolResultStatus::Completed);
+        assert_eq!(outcome.result, serde_json::json!(false));
+    }
+
     /// 产物（§4.7）：子进程往 `KOMO_ARTIFACT_DIR` 写的每个文件都被登记，引用路径相对
     /// **会话目录**（`artifacts/<run>/<…>`）；而同一次 Run 的第二个调用**只登记这一次
     /// 新出现的**——前面那个调用留下的文件不该再报一遍。

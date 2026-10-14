@@ -449,6 +449,19 @@ fn an_unknown_command_is_reported_not_sent_as_a_message() {
 }
 
 #[test]
+fn a_leading_path_is_sent_as_a_message() {
+    let mut app = app();
+    let effects = command(&mut app, "/api/checkout/paypal 接口逻辑");
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Submit { text, .. }] if text == "/api/checkout/paypal 接口逻辑"
+        ),
+        "{effects:?}"
+    );
+}
+
+#[test]
 fn an_illegal_effort_is_refused_with_the_options_spelled_out() {
     let mut app = app();
     assert!(command(&mut app, "/effort hgih").is_empty());

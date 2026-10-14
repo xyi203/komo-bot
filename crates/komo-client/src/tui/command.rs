@@ -138,8 +138,16 @@ pub const COMMANDS: [(&str, &str); 9] = [
 ];
 
 /// 这段输入是不是一条命令。
+///
+/// 开头那个词里还有第二个 `/` 的是**路径**，不是命令：`/api/checkout/paypal 接口逻辑`、
+/// `/Users/me/a.log 看一下` 都是要发给模型的话。只看形状、不看命令表——`/aprove` 这种
+/// 拼错的仍然算命令、报错，不会被当成消息悄悄发出去。
 pub fn is_command(text: &str) -> bool {
-    text.trim_start().starts_with('/')
+    let Some(rest) = text.trim_start().strip_prefix('/') else {
+        return false;
+    };
+    let name = rest.split_whitespace().next().unwrap_or("");
+    !name.contains('/')
 }
 
 /// 命令面板：按已经打出来的前缀过滤命令表。
@@ -314,6 +322,17 @@ mod tests {
                 name: "aprove".into()
             }
         );
+    }
+
+    #[test]
+    fn a_path_is_a_message_not_a_command() {
+        assert!(!is_command("/api/checkout/paypal 接口逻辑"));
+        assert!(!is_command("  /Users/me/a.log"));
+        assert!(!is_command("看看 /api/cart"));
+        // 拼错的命令仍是命令：报错，而不是当消息发出去。
+        assert!(is_command("/aprove"));
+        assert!(is_command("/approve 7K2M run"));
+        assert!(is_command("/"));
     }
 
     #[test]

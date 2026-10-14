@@ -426,6 +426,8 @@ impl SegmentSource for GatewaySegments {
                 context_sources::recall_for(
                     self.memories.as_ref(),
                     self.checkpoints.as_ref(),
+                    self.routed.as_ref(),
+                    &payloads,
                     &session,
                     &run,
                     &surface,

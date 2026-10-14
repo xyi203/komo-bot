@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use komo_kernel::events::{
-    ContextCompacted, ConversationBoundary, EventPayload, MessageAssistant, RunAbandoned,
-    RunAccepted, RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted, RunWaiting,
-    ToolPlanned, ToolResult, ToolStarted,
+    ContextCompacted, ConversationBoundary, EventPayload, MemoryInjected, MessageAssistant,
+    RunAbandoned, RunAccepted, RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted,
+    RunWaiting, ToolPlanned, ToolResult, ToolStarted,
 };
 use komo_kernel::traits::{Ledger, LedgerError, StoreError};
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
@@ -782,6 +782,41 @@ impl Ledger for Coordinator {
             .await?;
 
         // ③ 只有事件索引与 applied_seq：摘要是模型视图，没有哪张表记它。
+        self.commit(&appended, |_ex, _appended, _now| {
+            Box::pin(async move { Ok(()) }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await?;
+        Ok(appended.seq())
+    }
+
+    async fn record_injection(
+        &self,
+        run: &RunId,
+        injection: MemoryInjected,
+    ) -> Result<Seq, LedgerError> {
+        // ① 超限的正文先持久保存到 payloads（与摘要同一条路）。
+        let injection = match injection {
+            MemoryInjected {
+                text: Some(text),
+                text_ref: None,
+                uses,
+            } => {
+                let (text, text_ref) = Self::inline_text(&text);
+                MemoryInjected {
+                    text,
+                    text_ref,
+                    uses,
+                }
+            }
+            other => other,
+        };
+
+        // ② JSONL 追加 memory.injected 并同步。
+        let appended = self
+            .append(Some(run.clone()), EventPayload::MemoryInjected(injection))
+            .await?;
+
+        // ③ 只有事件索引与 applied_seq：注入段是模型视图，没有哪张表记它。
         self.commit(&appended, |_ex, _appended, _now| {
             Box::pin(async move { Ok(()) }) as BoxFuture<'_, Result<(), StoreError>>
         })

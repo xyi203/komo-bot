@@ -307,6 +307,14 @@ impl Ledger for PublishingLedger {
         pumped!(self, self.inner.record_compaction(run, compaction).await)
     }
 
+    async fn record_injection(
+        &self,
+        run: &RunId,
+        injection: komo_kernel::events::MemoryInjected,
+    ) -> Result<Seq, LedgerError> {
+        pumped!(self, self.inner.record_injection(run, injection).await)
+    }
+
     async fn append_audit(
         &self,
         session: &SessionId,
@@ -669,6 +677,18 @@ impl Ledger for RoutedLedger {
             .await?
             .ledger
             .record_compaction(run, compaction)
+            .await
+    }
+
+    async fn record_injection(
+        &self,
+        run: &RunId,
+        injection: komo_kernel::events::MemoryInjected,
+    ) -> Result<Seq, LedgerError> {
+        self.for_run(run)
+            .await?
+            .ledger
+            .record_injection(run, injection)
             .await
     }
 

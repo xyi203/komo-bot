@@ -368,6 +368,15 @@ impl Ledger for FaultLedger {
         self.inner.record_compaction(run, compaction).await
     }
 
+    async fn record_injection(
+        &self,
+        run: &RunId,
+        injection: komo_kernel::events::MemoryInjected,
+    ) -> Result<Seq, LedgerError> {
+        poisoned!(self);
+        self.inner.record_injection(run, injection).await
+    }
+
     async fn append_audit(
         &self,
         session: &SessionId,

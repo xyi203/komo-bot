@@ -23,10 +23,10 @@ use komo_agent::context::history::{
     Entry, EntryKind, ResolvedMessage, StoredOutput, latest_user_text,
 };
 use komo_agent::skills::{OfferContext, SkillCatalog, SkillRegistry};
-use komo_kernel::events::{Event, EventPayload};
+use komo_kernel::events::{Event, EventPayload, MemoryInjected};
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::projection::ProjectionContext;
-use komo_kernel::traits::{LedgerError, ToolOutputStore};
+use komo_kernel::traits::{Ledger, LedgerError, ToolOutputStore};
 use komo_kernel::types::agent::{ProjectFile, RunSnapshot};
 use komo_kernel::types::ids::RunId;
 use komo_kernel::types::memory::{Injection, MemoryScope};
@@ -227,9 +227,16 @@ pub(crate) fn recall_scopes(scope: Option<&MemoryScope>) -> Vec<MemoryScope> {
 ///
 /// `scopes` 来自 Profile（`memory_scope`）：**过滤发生在检索里**，不是拿到结果之后再
 /// 遮掉别人 Agent 的记录（§五）。
+///
+/// 这一段在日志里记下过注入段（`memory.injected`）就交给 `prepare_segment` 当后备：进程
+/// 里的锚重启就没了，按它逐字复用才不会换掉整段系统提示（§9.4）。这一次用的与记下的不同
+/// （第一次钉、换段、或有条目被遗忘），就记下新的一块；记不下来只留一条 warn——代价是
+/// 重启之后多召回一次，不该让这一轮失败。
 pub(crate) async fn recall_for(
     memories: Option<&Arc<MemoryManager>>,
     checkpoints: Option<&CheckpointStore>,
+    ledger: &dyn Ledger,
+    payloads: &PayloadStore,
     session: &komo_kernel::types::ids::SessionId,
     run: &RunId,
     surface: &Surface,
@@ -250,11 +257,58 @@ pub(crate) async fn recall_for(
         None => Vec::new(),
     };
     let text = latest_user_text(surface).unwrap_or_default();
+    let recorded = recorded_injection(payloads, surface).await;
     // **按"这一段对话"取**，不是按这一轮重新召回（§9.4）：注入段在 system 消息里，
     // 每轮重算一次就等于每轮把服务端前缀缓存打掉一次。
-    memories
-        .prepare_segment(session, run, &text, &carried, surface.boundary(), scopes)
-        .await
+    let injection = memories
+        .prepare_segment(
+            session,
+            run,
+            &text,
+            &carried,
+            surface.boundary(),
+            scopes,
+            recorded.clone(),
+        )
+        .await;
+    if memories.enabled() && recorded.as_ref() != Some(&injection) {
+        let event = MemoryInjected {
+            text: injection.text.clone(),
+            text_ref: None,
+            uses: injection.uses.clone(),
+        };
+        if let Err(error) = ledger.record_injection(run, event).await {
+            tracing::warn!(%error, %run, "这一段的记忆注入没记进日志，重启之后会重新召回");
+        }
+    }
+    injection
+}
+
+/// 这一段日志里记下的注入段；外置的正文按引用读回。读不回来就当没记过（重新召回只是贵，
+/// 不是错），不让整段装配失败。
+async fn recorded_injection(payloads: &PayloadStore, surface: &Surface) -> Option<Injection> {
+    let recorded = surface.injection()?;
+    let text = match (&recorded.text, &recorded.text_ref) {
+        (Some(text), _) => Some(text.clone()),
+        (None, Some(reference)) => match payloads.open(reference).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Some(text),
+                Err(error) => {
+                    tracing::warn!(%error, "记下的注入段不是 UTF-8，这一段重新召回");
+                    return None;
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "记下的注入段读不回来，这一段重新召回");
+                return None;
+            }
+        },
+        (None, None) => None,
+    };
+    Some(Injection {
+        text,
+        uses: recorded.uses.clone(),
+    })
 }
 
 /// 这一次装配的 skills 目录（§14）：读一次**活注册表**，按门控算出这一份值。

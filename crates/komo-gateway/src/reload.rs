@@ -90,6 +90,16 @@ async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) {
     }) {
         state.rebuild_llm();
     }
+    // 记忆模型按 alias 指向 `model.*`，所以那一组变了也要换；向量后端不在这里（§9.5）。
+    if changed.iter().any(|key| {
+        let key = key.as_str();
+        key.starts_with("memory.")
+            || key.starts_with("model_catalog.")
+            || key.starts_with("model.")
+            || key.starts_with("credentials.")
+    }) {
+        state.refresh_memory();
+    }
     // §5.6 的目录行是启动快照，重载是唯一会动它的时刻：`paths.skill_dirs` 改了、
     // 或者人刚 `komo skills disable` 过，新的一段系统提示就该按新的来。
     state.refresh_skills_prompt();

@@ -183,6 +183,30 @@ async fn a_reloaded_allow_list_decides_the_next_message() {
     );
 }
 
+/// 改 `[memory].model` 后重载：记忆那一层下一次用的就是新模型（不重启）。
+#[tokio::test]
+async fn a_reloaded_memory_model_reaches_the_memory_manager() {
+    let gateway = TestGateway::start().await;
+    assert_eq!(gateway.state().memories.model().model, "gpt-test");
+
+    gateway.write_config(&config_toml(
+        r#"model = "mem"
+
+[model.mem]
+type = "completion"
+api_backend = "responses"
+base_url = "https://llm.example.com/v1"
+model = "memory-next"
+api_key_env = "KOMO_LLM_API_KEY"
+"#,
+    ));
+    crate::reload::reload(gateway.state())
+        .await
+        .expect("装得上");
+
+    assert_eq!(gateway.state().memories.model().model, "memory-next");
+}
+
 /// ④ 非法配置重载失败：旧配置继续生效，home chat 收到错误。
 #[tokio::test]
 async fn an_invalid_reload_keeps_the_old_config_and_says_so() {

@@ -25,7 +25,7 @@ pub use views::{
     UnknownEvent,
 };
 
-use crate::events::{ContextCompacted, Event, EventPayload};
+use crate::events::{ContextCompacted, Event, EventPayload, MemoryInjected};
 use crate::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use crate::types::status::{RunState, ToolCallState};
 use crate::types::turn::Role;
@@ -47,6 +47,9 @@ pub struct Surface {
     /// 最新一个 `conversation.boundary` 在 `messages` 里的位置：回放窗口从这里开始。
     #[serde(default)]
     replay_from: usize,
+    /// 这一段（`replay_from` 之后）钉住的记忆注入段（`memory.injected`，§9.4）；换段就清掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    injection: Option<MemoryInjected>,
     #[serde(default)]
     pub runs: BTreeMap<RunId, RunView>,
     #[serde(default)]
@@ -89,6 +92,12 @@ impl Surface {
     /// 注入段在 system 消息里，它一变，服务端前缀缓存里**整条前缀**（连对话历史）都失效。
     pub fn boundary(&self) -> usize {
         self.replay_from
+    }
+
+    /// 这一段记下的记忆注入段：最新一条 `memory.injected`，且在最新一个
+    /// `conversation.boundary` 之后。`None` = 这一段还没钉过。
+    pub fn injection(&self) -> Option<&MemoryInjected> {
+        self.injection.as_ref()
     }
 
     pub fn replay(&self) -> &[SurfaceMessage] {
@@ -244,7 +253,9 @@ impl Surface {
                 // 回放从这一刀之后开始。日志本身一个字都没删。
                 self.replay_from = self.messages.len();
                 self.last_role = None;
+                self.injection = None;
             }
+            EventPayload::MemoryInjected(body) => self.injection = Some(body.clone()),
             EventPayload::ToolPlanned(body) => {
                 let call = self.call_mut(&body.call_id, event);
                 call.state = ToolCallState::Planned;
@@ -705,6 +716,38 @@ mod tests {
         assert_eq!(surface.replay().len(), 1, "回放只从边界之后开始");
         assert_eq!(surface.replay()[0].text.as_deref(), Some("新话题"));
         assert!(surface.replay_alternates());
+    }
+
+    fn injected(seq: u64, text: &str) -> Event {
+        event(
+            seq,
+            Some("run-1"),
+            EventPayload::MemoryInjected(MemoryInjected {
+                text: Some(text.into()),
+                text_ref: None,
+                uses: Vec::new(),
+            }),
+        )
+    }
+
+    #[test]
+    fn the_latest_injection_belongs_to_the_segment_until_a_boundary() {
+        let mut events = conversation();
+        let next = events.len() as u64 + 1;
+        events.push(injected(next, "旧的"));
+        events.push(injected(next + 1, "这一段的"));
+        let surface = fold(&events);
+        assert_eq!(
+            surface.injection().and_then(|i| i.text.as_deref()),
+            Some("这一段的")
+        );
+
+        events.push(event(
+            next + 2,
+            None,
+            EventPayload::ConversationBoundary(ConversationBoundary { by: None }),
+        ));
+        assert_eq!(fold(&events).injection(), None, "换段就不再沿用");
     }
 
     #[test]

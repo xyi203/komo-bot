@@ -653,6 +653,41 @@ async fn the_memory_model_is_the_one_the_memory_section_names() {
     assert_eq!(stored[0].extraction.prompt_version, PROMPT_VERSION);
 }
 
+/// §3 热重载：换了 `[memory].model` 之后，下一次提取问的是新模型、走的是新后端——报告说
+/// 「变了」，就不能还在问启动时那一个。
+#[tokio::test]
+async fn a_reloaded_memory_model_takes_the_next_extraction() {
+    let harness = HarnessBuilder::new()
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(
+            1,
+            &RunId::from_raw("run-1"),
+            "记一下：这个仓库要用 cargo test --workspace 跑测试",
+        )],
+    );
+    let fresh = ScriptedLlm::new(vec![vec![round(r#"{"observations":[]}"#)]]);
+    let mut config = memory_config(true, RetrievalMode::Keyword);
+    config.model = model("reloaded-model", None);
+
+    harness
+        .manager
+        .install_config(&config, Arc::new(fresh.clone()) as Arc<dyn LlmClient>);
+    harness.manager.process_pending(1).await.unwrap();
+
+    assert!(
+        harness.llm.requests.lock().expect("请求表").is_empty(),
+        "启动时的后端不该再被问"
+    );
+    let requests = fresh.requests.lock().expect("请求表").clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].model.model, "reloaded-model");
+    assert_eq!(harness.manager.model().model, "reloaded-model");
+}
+
 // =========================================================== ⑤ 代次与重建
 
 /// §14 ⑤ 的第三句：**重建中崩溃可以接续**。
@@ -1604,6 +1639,7 @@ async fn the_injection_is_reused_verbatim_within_one_segment() {
             &[],
             0,
             &[],
+            None,
         )
         .await;
     assert!(
@@ -1615,7 +1651,15 @@ async fn the_injection_is_reused_verbatim_within_one_segment() {
 
     let second = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-2"), "那台灯呢", &[], 0, &[])
+        .prepare_segment(
+            &session,
+            &RunId::from_raw("run-2"),
+            "那台灯呢",
+            &[],
+            0,
+            &[],
+            None,
+        )
         .await;
     assert_eq!(second.text, first.text, "同一段里逐字复用，前缀才稳");
     assert_eq!(second.uses, first.uses);
@@ -1650,6 +1694,7 @@ async fn a_new_segment_recalls_again() {
             &[],
             0,
             &[],
+            None,
         )
         .await;
     let embedded = harness.embeddings.calls();
@@ -1662,18 +1707,119 @@ async fn a_new_segment_recalls_again() {
         .unwrap();
     let same = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-2"), "台灯", &[], 0, &[])
+        .prepare_segment(
+            &session,
+            &RunId::from_raw("run-2"),
+            "台灯",
+            &[],
+            0,
+            &[],
+            None,
+        )
         .await;
     assert_eq!(same.text, first.text, "同一段里不重算");
 
     // 换段：重新召回，新那条进来，也确实又嵌了一次查询。
     let next = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-3"), "台灯", &[], 9, &[])
+        .prepare_segment(
+            &session,
+            &RunId::from_raw("run-3"),
+            "台灯",
+            &[],
+            9,
+            &[],
+            None,
+        )
         .await;
     let text = next.text.clone().unwrap_or_default();
     assert!(text.contains("台灯"), "{text}");
     assert!(harness.embeddings.calls() > embedded, "换段要重新召回一次");
+}
+
+/// 进程里的锚没了（Gateway 重启）时，按 Session 日志里记下的那一块**逐字**复用：不按
+/// 这一句新的用户输入重新召回，也不发 embedding——否则整段系统提示一换，前缀缓存从头失效。
+#[tokio::test]
+async fn a_recorded_injection_is_reused_verbatim_after_a_restart() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    harness
+        .repo
+        .put(memory("m-2", "卧室台灯是暖光"), None)
+        .await
+        .unwrap();
+    let recorded = harness
+        .manager
+        .prepare(&RunId::from_raw("run-1"), "空调多少度", &[], &[])
+        .await;
+    assert!(!recorded.uses.is_empty(), "先有一块可复用的");
+    let embedded = harness.embeddings.calls();
+
+    // 另一个会话 = 进程里没有它的锚，只有日志里那一块。
+    let again = harness
+        .manager
+        .prepare_segment(
+            &SessionId::from_raw("sess-restarted"),
+            &RunId::from_raw("run-2"),
+            "台灯呢",
+            &[],
+            0,
+            &[],
+            Some(recorded.clone()),
+        )
+        .await;
+    assert_eq!(again, recorded, "按日志里那一块逐字复用");
+    assert_eq!(harness.embeddings.calls(), embedded, "不该重新召回");
+}
+
+/// 日志里那一块**同样不豁免遗忘**：里面有条目被遗忘了，就重新算一块。
+#[tokio::test]
+async fn a_recorded_injection_with_a_forgotten_item_is_recalled_again() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    let recorded = harness
+        .manager
+        .prepare(&RunId::from_raw("run-1"), "空调多少度", &[], &[])
+        .await;
+    harness
+        .repo
+        .forget(&recorded.uses[0].memory, 1, NOW)
+        .await
+        .unwrap();
+
+    let again = harness
+        .manager
+        .prepare_segment(
+            &SessionId::from_raw("sess-restarted"),
+            &RunId::from_raw("run-2"),
+            "空调多少度",
+            &[],
+            0,
+            &[],
+            Some(recorded),
+        )
+        .await;
+    assert!(
+        again.uses.is_empty(),
+        "遗忘之后不能再注入：{:?}",
+        again.uses
+    );
 }
 
 /// 一条都没召回出来时**也钉住**：不钉的话这个会话每一轮都要为"确实没有相关记忆"付一次
@@ -1696,6 +1842,7 @@ async fn an_empty_segment_is_pinned_too() {
             &[],
             0,
             &[],
+            None,
         )
         .await;
     assert_eq!(first, Injection::default(), "库里一条记忆都没有");
@@ -1703,7 +1850,15 @@ async fn an_empty_segment_is_pinned_too() {
 
     let second = harness
         .manager
-        .prepare_segment(&session, &RunId::from_raw("run-2"), "再说一遍", &[], 0, &[])
+        .prepare_segment(
+            &session,
+            &RunId::from_raw("run-2"),
+            "再说一遍",
+            &[],
+            0,
+            &[],
+            None,
+        )
         .await;
     assert_eq!(second, Injection::default());
     assert_eq!(
@@ -1740,6 +1895,7 @@ async fn a_forgotten_item_drops_the_pin() {
             &[],
             0,
             &[],
+            None,
         )
         .await;
     assert_eq!(first.uses.len(), 1, "先注入上了");
@@ -1759,6 +1915,7 @@ async fn a_forgotten_item_drops_the_pin() {
             &[],
             0,
             &[],
+            None,
         )
         .await;
     assert!(

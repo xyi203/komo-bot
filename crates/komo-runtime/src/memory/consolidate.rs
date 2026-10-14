@@ -361,10 +361,11 @@ impl<'a> Consolidator<'a> {
             listing.join("\n")
         );
 
+        let (model, llm) = self.manager.backend();
         let request = TurnRequest {
             session: komo_kernel::types::ids::SessionId::from_raw("memory-consolidation"),
             run: komo_kernel::types::ids::RunId::from_raw("memory-consolidation"),
-            model: self.manager.model.clone(),
+            model,
             system_prompt: "你在整理一个个人助手的长期记忆库，判断新旧陈述之间的关系。\
                             只输出 JSON，不要解释。"
                 .to_string(),
@@ -381,7 +382,7 @@ impl<'a> Consolidator<'a> {
             covers: None,
         };
 
-        let mut driver = self.manager.llm.begin_turn(request).await?;
+        let mut driver = llm.begin_turn(request).await?;
         let round = driver.next(RoundInput::First).await?;
         parse_verdicts(&round.text.unwrap_or_default())
     }

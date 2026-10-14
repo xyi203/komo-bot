@@ -160,6 +160,9 @@ impl PayloadStore {
             }) if summary.is_none() => {
                 *summary = self.open_text(summary_ref.as_ref()).await?;
             }
+            EventPayload::MemoryInjected(body) if body.text.is_none() => {
+                body.text = self.open_text(body.text_ref.as_ref()).await?;
+            }
             _ => {}
         }
         Ok(())

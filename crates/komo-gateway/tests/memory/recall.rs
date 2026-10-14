@@ -375,6 +375,58 @@ async fn an_agent_only_recalls_its_own_scope_plus_the_shared_profile() {
 /// Phase 5：记忆段是 `TurnRequest.system_prompt` 自己的一部分，不再靠适配器另外拼接
 /// （`docs/agent.md` §13.2、§20 Phase 5）。开着记忆、有一条能召回的记忆时，模型收到的
 /// 系统提示要以 `[已知记忆]` 那一块收尾，且带着这条记忆的正文。
+/// §9.4 同一段里逐字复用，**跨 Gateway 重启也算**：重启之后第二轮问的是另一件事，系统
+/// 提示（连记忆段）仍与第一轮逐字相同——注入段按 Session 日志里记下的那一块复用，不按新的
+/// 用户输入重新召回。否则重启一次，整条前缀缓存就从头失效。
+#[tokio::test]
+async fn the_memory_block_survives_a_restart_within_one_segment() {
+    let config = memory_config("keyword", false);
+    let first = ScriptedLlm::new(vec![vec![text_round(1, "26 度。")]]);
+    let mut gateway = memory_gateway(&config)
+        .llm(Arc::new(first.clone()) as Arc<dyn LlmClient>)
+        .start()
+        .await;
+    for (id, content) in [("m-1", "客厅空调设 26 度"), ("m-2", "卧室台灯是暖光")] {
+        gateway
+            .state()
+            .memory
+            .put(
+                seeded(id, content, Provenance::UserStatement, MemoryState::Active),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    let (session, run) = crate::a_run(&gateway, "rk-1", "空调设多少度来着").await;
+    wait_for_terminal(&gateway, &run).await;
+    let before = first.requests.lock().expect("请求表")[0]
+        .system_prompt
+        .clone();
+    assert!(before.contains("客厅空调设 26 度"), "{before}");
+    assert!(!before.contains("台灯"), "第一轮只召回到空调那条：{before}");
+
+    let second = ScriptedLlm::new(vec![vec![text_round(1, "暖光。")]]);
+    gateway
+        .restart_with_llm(&config, Arc::new(second.clone()) as Arc<dyn LlmClient>)
+        .await;
+    let (status, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{session}/runs"),
+            serde_json::json!({"request_key": "rk-2", "text": "台灯是什么光"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let run: komo_kernel::types::ids::RunId =
+        serde_json::from_value(body["run"].clone()).expect("run id");
+    wait_for_terminal(&gateway, &run).await;
+
+    let after = second.requests.lock().expect("请求表")[0]
+        .system_prompt
+        .clone();
+    assert_eq!(after, before, "重启前后同一段的系统提示逐字相同");
+}
+
 #[tokio::test]
 async fn the_system_prompt_the_model_receives_ends_with_the_recalled_memory_block() {
     let llm = ScriptedLlm::new(vec![vec![text_round(1, "26 度。")]]);

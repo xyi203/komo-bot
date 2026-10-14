@@ -686,6 +686,17 @@ impl GatewayState {
     /// 按**当前**快照重装判断后端（§9.4）：`[typesafe]` 或 `memory.retrieval.rerank`
     /// 一变，下一次召回就按新的来——与 `refresh_skills_prompt` 同一个理由（§3 的热重载
     /// 不能有"改了没反应"的键）。
+    /// `[memory]` 或它指向的模型 / 凭证变了：按**当前**快照把开关、记忆模型与召回预算换进
+    /// `MemoryManager`（§3）。不换的话报告里写着「变了」，提取却还在问旧模型。
+    pub fn refresh_memory(&self) {
+        let snapshot = self.snapshot();
+        self.memories.install_config(
+            &snapshot.memory,
+            llm_for_memory(&snapshot, &self.config, &self.caps, None),
+        );
+        tracing::info!(model = %snapshot.memory.model.model, "记忆配置已按新快照换上");
+    }
+
     pub fn refresh_reranker(&self) {
         self.memories
             .install_reranker(build_reranker(&self.snapshot(), &self.config));

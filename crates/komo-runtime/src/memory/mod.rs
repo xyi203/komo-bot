@@ -354,10 +354,9 @@ impl std::fmt::Debug for Reranker {
 
 /// §9 的那一层。
 pub struct MemoryManager {
-    enabled: bool,
-    /// **记忆模型自己的那份完整配置**（§13.3）：端点、模型、effort 一起来，不拼装。
-    model: ModelConfig,
-    retrieval: RetrievalConfig,
+    /// 开关、记忆模型与召回预算：配置热重载换得掉（[`MemoryManager::install_config`]），
+    /// 每次用时读当前这一份（§3）。
+    live: RwLock<Live>,
     repo: Arc<dyn MemoryRepo>,
     catalog: Arc<dyn MemoryCatalog>,
     /// 向量后端。**可以后装**：Gateway 先把服务起来，再在后台探维度（§9.5「省略
@@ -372,7 +371,6 @@ pub struct MemoryManager {
     /// 落定（或探测失败）时，§9.4 的规则是"hybrid 退化成关键词、vector-only 报不可用"，
     /// 不是"配置错误"。
     configured: bool,
-    llm: Arc<dyn LlmClient>,
     events: Arc<dyn SessionEvents>,
     work: Arc<dyn MemoryWorkLog>,
     clock: Arc<dyn Clock>,
@@ -398,12 +396,26 @@ pub struct MemoryManager {
 
 impl std::fmt::Debug for MemoryManager {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let live = self.live();
         f.debug_struct("MemoryManager")
-            .field("enabled", &self.enabled)
-            .field("model", &self.model.model)
+            .field("enabled", &live.enabled)
+            .field("model", &live.model.model)
             .field("has_embeddings", &self.vector_backend().is_some())
             .finish()
     }
+}
+
+/// `[memory]` 里热重载换得掉的那几样。
+///
+/// 模型配置与后端实例**成对换**：`RoutingLlm` 按 `model` 挑实例，两样分开换就会有一拍
+/// 拿新模型名去问旧后端。
+#[derive(Clone)]
+struct Live {
+    enabled: bool,
+    /// **记忆模型自己的那份完整配置**（§13.3）：端点、模型、effort 一起来，不拼装。
+    model: ModelConfig,
+    retrieval: RetrievalConfig,
+    llm: Arc<dyn LlmClient>,
 }
 
 /// 一个会话里**这一段对话**注入的那一块。
@@ -428,15 +440,17 @@ impl MemoryManager {
     pub fn new(parts: MemoryParts) -> Self {
         let configured = parts.config.embedding.is_some();
         MemoryManager {
-            enabled: parts.config.enabled,
-            model: parts.config.model.clone(),
-            retrieval: parts.config.retrieval.clone(),
+            live: RwLock::new(Live {
+                enabled: parts.config.enabled,
+                model: parts.config.model.clone(),
+                retrieval: parts.config.retrieval.clone(),
+                llm: parts.llm,
+            }),
             repo: parts.repo,
             catalog: parts.catalog,
             embeddings: RwLock::new(parts.embeddings),
             reranker: RwLock::new(parts.reranker),
             configured,
-            llm: parts.llm,
             events: parts.events,
             work: parts.work,
             clock: parts.clock,
@@ -447,18 +461,42 @@ impl MemoryManager {
         }
     }
 
-    pub fn enabled(&self) -> bool {
-        self.enabled
+    /// 当前这一份。**取出就放锁**：下面的召回与模型请求都要 await。
+    fn live(&self) -> Live {
+        self.live.read().expect("记忆配置槽").clone()
     }
 
-    pub fn retrieval(&self) -> &RetrievalConfig {
-        &self.retrieval
+    /// 配置热重载的落点（§3）：开关、记忆模型（连同按新快照造的后端）与召回预算一起换。
+    /// 正在跑的那一次提取 / 召回已经拿着旧的那一份，下一次才用新的。
+    ///
+    /// 向量后端不在这里：`memory.embedding` 换了是换向量空间（§9.5），要重建索引。
+    pub fn install_config(&self, config: &MemoryConfig, llm: Arc<dyn LlmClient>) {
+        *self.live.write().expect("记忆配置槽") = Live {
+            enabled: config.enabled,
+            model: config.model.clone(),
+            retrieval: config.retrieval.clone(),
+            llm,
+        };
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.live.read().expect("记忆配置槽").enabled
+    }
+
+    pub fn retrieval(&self) -> RetrievalConfig {
+        self.live().retrieval
     }
 
     /// 记忆模型的那一份配置。**`komo model list` 之类要印它，测试要断言它没被聊天模型
     /// 串掉**（§13.3）。
-    pub fn model(&self) -> &ModelConfig {
-        &self.model
+    pub fn model(&self) -> ModelConfig {
+        self.live().model
+    }
+
+    /// 记忆模型与它的后端，同一拍取出的一对。
+    fn backend(&self) -> (ModelConfig, Arc<dyn LlmClient>) {
+        let live = self.live();
+        (live.model, live.llm)
     }
 
     pub fn repo(&self) -> &Arc<dyn MemoryRepo> {
@@ -489,7 +527,7 @@ impl MemoryManager {
 
     /// 这一次查询要不要重排、用哪个后端。**两个条件都要**：开关开着，而且后端在手上。
     fn reranker(&self) -> Option<Reranker> {
-        if !self.retrieval.rerank {
+        if !self.retrieval().rerank {
             return None;
         }
         self.reranker.read().expect("判断后端槽").clone()
@@ -523,7 +561,7 @@ impl MemoryManager {
     ///   `vector` → [`MemoryError::VectorUnavailable`]。
     /// - 两种情况都不能变成"没有相关记忆"。
     pub async fn search(&self, mut query: RecallQuery) -> Result<RecallResult, MemoryError> {
-        if !self.enabled {
+        if !self.enabled() {
             return Err(MemoryError::Disabled);
         }
         if query.mode != RetrievalMode::Keyword {
@@ -561,7 +599,7 @@ impl MemoryManager {
         let reranker = self.reranker();
         let top_k = query.top_k.max(1);
         let shortlist = reranker.as_ref().map(|_| {
-            self.retrieval
+            self.retrieval()
                 .rerank_shortlist
                 .max(top_k + 1)
                 .min(query.candidate_limit.max(1))
@@ -626,13 +664,14 @@ impl MemoryManager {
 
     /// 按配置的预算造一次检索。
     pub fn query(&self, text: impl Into<String>, mode: Option<RetrievalMode>) -> RecallQuery {
+        let retrieval = self.retrieval();
         RecallQuery {
             text: text.into(),
-            mode: mode.unwrap_or(self.retrieval.mode),
+            mode: mode.unwrap_or(retrieval.mode),
             scopes: vec![],
-            candidate_limit: self.retrieval.candidate_limit,
-            top_k: self.retrieval.top_k,
-            max_tokens: self.retrieval.max_tokens,
+            candidate_limit: retrieval.candidate_limit,
+            top_k: retrieval.top_k,
+            max_tokens: retrieval.max_tokens,
             now: self.clock.now(),
             query_vector: None,
             include_states: vec![],
@@ -656,7 +695,7 @@ impl MemoryManager {
         carried: &[MemoryUse],
         scopes: &[MemoryScope],
     ) -> Injection {
-        if !self.enabled {
+        if !self.enabled() {
             return Injection::default();
         }
         let now = self.clock.now();
@@ -685,7 +724,7 @@ impl MemoryManager {
 
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let items = stale::mark_missing_paths(items, home.as_deref());
-        let injection = (self.render)(&items, self.retrieval.max_tokens);
+        let injection = (self.render)(&items, self.retrieval().max_tokens);
         self.record_usage(&injection, now).await;
         injection
     }
@@ -698,6 +737,12 @@ impl MemoryManager {
     ///
     /// 一条都没召回出来时**也钉住**：不钉的话这个会话每一轮都要为"确实没有相关记忆"
     /// 付一次 embedding。
+    ///
+    /// `recorded` 是这一段在 Session 日志里记下的那一块（`memory.injected`）。进程里的锚
+    /// 重启就没了，那时按它逐字复用——同样先核对还算不算数；否则重启之后会按另一句用户
+    /// 输入重新召回，换掉整段系统提示（前缀缓存从头失效）。调用方拿到结果与 `recorded`
+    /// 不同时负责把新的一块记下来。
+    #[allow(clippy::too_many_arguments)]
     pub async fn prepare_segment(
         &self,
         session: &SessionId,
@@ -706,8 +751,9 @@ impl MemoryManager {
         carried: &[MemoryUse],
         boundary: usize,
         scopes: &[MemoryScope],
+        recorded: Option<Injection>,
     ) -> Injection {
-        if !self.enabled {
+        if !self.enabled() {
             return Injection::default();
         }
         // 先取出来再判断：锁不能跨 `await` 拿着（下面的核对与写库都要 await）。
@@ -725,6 +771,8 @@ impl MemoryManager {
             }
             found
         };
+        let from_log = pinned.is_none() && recorded.is_some();
+        let pinned = pinned.or(recorded);
         // §9.4「每次模型请求前复查被选条目的有效性」+ §9.2「forget 立即停用」：沿用之前
         // **先核对这一块现在还算不算数**。被遗忘/失效的条目还在锚里，就是让遗忘失效——
         // 这一条是验收项（`a_forgotten_memory_never_comes_back_into_a_turn`），不是优化
@@ -743,6 +791,15 @@ impl MemoryManager {
             None => None,
         };
         if let Some(pinned) = pinned {
+            if from_log {
+                self.pin(session, boundary, &pinned, now);
+                tracing::info!(
+                    %session,
+                    boundary,
+                    lines = pinned.uses.len(),
+                    "这一段的注入按 Session 日志里记下的那一块逐字复用"
+                );
+            }
             // 使用计数照记：这一段里每用一次都算用了一次（§9.2 的度量，不影响正文）。
             self.record_usage(&pinned, now).await;
             tracing::debug!(
@@ -755,20 +812,7 @@ impl MemoryManager {
         }
 
         let injection = self.prepare(run, text, carried, scopes).await;
-        {
-            let mut pins = self.pins.lock().expect("注入锚");
-            if pins.len() >= PIN_SOFT_LIMIT {
-                pins.retain(|_, pinned| now - pinned.seen < PIN_TTL);
-            }
-            pins.insert(
-                session.clone(),
-                Pinned {
-                    boundary,
-                    injection: injection.clone(),
-                    seen: now,
-                },
-            );
-        }
+        self.pin(session, boundary, &injection, now);
         // 这一段就此定下来：从这里到下一次换段，system 消息逐字不变（前缀缓存的命门）。
         tracing::info!(
             %session,
@@ -777,6 +821,28 @@ impl MemoryManager {
             "这一段对话的注入已定；此后逐字复用，换段（/new）才重算"
         );
         injection
+    }
+
+    /// 把这一块钉成这个会话这一段的注入锚。
+    fn pin(
+        &self,
+        session: &SessionId,
+        boundary: usize,
+        injection: &Injection,
+        now: OffsetDateTime,
+    ) {
+        let mut pins = self.pins.lock().expect("注入锚");
+        if pins.len() >= PIN_SOFT_LIMIT {
+            pins.retain(|_, pinned| now - pinned.seen < PIN_TTL);
+        }
+        pins.insert(
+            session.clone(),
+            Pinned {
+                boundary,
+                injection: injection.clone(),
+                seen: now,
+            },
+        );
     }
 
     /// 钉住的那一块**现在还算不算数**：里面的条目都还在、都还能召回。
@@ -851,7 +917,7 @@ impl MemoryManager {
     /// 损坏"——重试一万次也读不出来，所以标记翻成 `error`（§9.3 的四个状态里就是这一个
     /// 的用处），队列不再为它空转。见 [`MemoryError::is_permanent`]。
     pub async fn process_pending(&self, limit: usize) -> Result<PassReport, MemoryError> {
-        if !self.enabled {
+        if !self.enabled() {
             return Ok(PassReport::default());
         }
         let claimed = self.work.claim(limit).await?;
@@ -929,13 +995,10 @@ impl MemoryManager {
             });
         }
 
-        let pass = extract::LearningPass::new(
-            Arc::clone(&self.llm),
-            self.model.clone(),
-            Arc::clone(&self.clock),
-        );
+        let (model, llm) = self.backend();
+        let pass = extract::LearningPass::new(llm, model.clone(), Arc::clone(&self.clock));
         let raw = pass.extract(&transcript).await?;
-        let observations = transcript.validate(raw, item, &self.model, self.clock.now());
+        let observations = transcript.validate(raw, item, &model, self.clock.now());
         if observations.is_empty() {
             return Ok(Outcome::Skipped {
                 reason: "提取结果一条都没通过校验".into(),

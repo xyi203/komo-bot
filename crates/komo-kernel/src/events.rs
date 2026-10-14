@@ -252,6 +252,8 @@ event_payload! {
     ConfigChanged(ConfigChanged) => "config.changed",
     /// 在线压缩在一个计划边界上的结论：压了（摘要 + 从哪一轮起原样保留），或没压。
     ContextCompacted(ContextCompacted) => "context.compacted",
+    /// 这一段对话钉住的记忆注入段（§9.4）：渲染好的正文与选中的条目，重启之后照它逐字复用。
+    MemoryInjected(MemoryInjected) => "memory.injected",
 }
 
 impl EventPayload {
@@ -465,6 +467,24 @@ pub struct Checkpoint {
     pub memories: Vec<MemoryUse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retrieval_config_version: Option<String>,
+}
+
+/// §9.4：这一段对话（上一个 `conversation.boundary` 之后）注入系统提示的那一块。
+///
+/// 注入段在 system 消息里，它一变整条前缀缓存就失效，所以同一段里要**逐字**复用。只记在
+/// 进程内存里的话，Gateway 一重启就会按另一句用户输入重新召回、换掉整段提示；记成事件，
+/// 内容权威就在 Session 目录（§8.2），重启前后折出来是同一份。`text` 为空 = 这一段确实
+/// 没有可注入的记忆（也要钉住，不然每一轮都会重新召回一次）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryInjected {
+    /// 渲染好的注入段；超过内联上限外置到 `payloads/`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_ref: Option<PayloadRef>,
+    /// 注入段里的条目与版本：复用之前逐条核对还算不算数（遗忘立即生效，§9.2）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uses: Vec<MemoryUse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

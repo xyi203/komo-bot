@@ -675,6 +675,18 @@ impl TestGateway {
         self.running = running;
     }
 
+    /// 停机再起来，换一个模型替身（同一个数据目录）。
+    pub async fn restart_with_llm(&mut self, config: &str, llm: Arc<dyn LlmClient>) {
+        self.stop().await;
+        let TestGateway { running, .. } = GatewayBuilder::new(config)
+            .env(&self.env)
+            .at(&self.home)
+            .llm(llm)
+            .start()
+            .await;
+        self.running = running;
+    }
+
     pub async fn get(&self, path: &str) -> (u16, String) {
         self.request(reqwest::Method::GET, path, None).await
     }

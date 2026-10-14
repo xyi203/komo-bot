@@ -313,6 +313,15 @@ pub trait Ledger: Send + Sync {
         compaction: crate::events::ContextCompacted,
     ) -> Result<Seq, LedgerError>;
 
+    /// `memory.injected`：这一段对话钉住的记忆注入段（§9.4）。正文超过内联上限先外置到
+    /// `payloads/`，再追加并同步；与 `record_compaction` 一样不碰 state.db——它只是模型
+    /// 视图，调度不看它。
+    async fn record_injection(
+        &self,
+        run: &RunId,
+        injection: crate::events::MemoryInjected,
+    ) -> Result<Seq, LedgerError>;
+
     /// 控制审计补写：把 `control_outbox` 里的一条审计事件追加到 JSONL（§8.5 的反向
     /// 顺序）。按 `event_id` 幂等；已写入就复用原事件位置。它只写审计副本，不改变任何
     /// 调度状态。

@@ -522,6 +522,28 @@ impl Ledger for MemLedger {
         Ok(seq)
     }
 
+    async fn record_injection(
+        &self,
+        run: &RunId,
+        injection: crate::events::MemoryInjected,
+    ) -> Result<Seq, LedgerError> {
+        let mut state = self.state.lock().expect("账本");
+        let session = state
+            .sessions
+            .get(run)
+            .cloned()
+            .ok_or_else(|| LedgerError::NotFound {
+                what: format!("run {run}"),
+            })?;
+        let (_, seq) = self.append(
+            &mut state,
+            &session,
+            Some(run.clone()),
+            EventPayload::MemoryInjected(injection),
+        );
+        Ok(seq)
+    }
+
     async fn append_audit(
         &self,
         session: &SessionId,

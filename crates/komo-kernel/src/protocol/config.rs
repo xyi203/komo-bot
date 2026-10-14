@@ -85,6 +85,74 @@ pub struct McpServerConfig {
     /// 操作者认定为只读的工具：中断后可以重做（`SafeReread`）；codemode 的 MCP 准入不取决于此声明。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub read_only: Vec<String>,
+    /// 一句话说清这台服务器干什么，进系统提示的服务器段。没写就用服务器 instructions 的第一行。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// 模型怎么够到这台服务器的工具（`docs/mcp.md` §3）。
+    #[serde(default, skip_serializing_if = "McpExposure::is_default")]
+    pub exposure: McpExposure,
+    /// 按工具覆盖 `exposure`：键是服务器上的工具原名，或带 `*` 的模式。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tool_exposure: BTreeMap<String, McpExposure>,
+}
+
+/// MCP 工具给模型的方式（照 pi 的 `exposure`，没有 `deferred`：komo 没有 `tool_search`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpExposure {
+    /// 不声明给模型，只在 codemode 脚本里调。
+    #[default]
+    Codemode,
+    /// 像内置工具一样声明给模型，脚本里也能调。
+    Direct,
+    /// 不挂：哪里都调不到。
+    Hidden,
+}
+
+impl McpExposure {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl McpServerConfig {
+    /// 一个工具实际的 exposure：`tool_exposure` 里的原名优先；其次是匹配的模式，字面部分最长的
+    /// 那条赢（一样长按键的字典序）；都不中就是服务器的 `exposure`。
+    ///
+    /// pi 是"第一条匹配的模式赢"，靠 JSON 的键序；TOML 表读进来不保序，所以这里换成最具体的赢。
+    pub fn exposure_of(&self, tool: &str) -> McpExposure {
+        if let Some(exposure) = self.tool_exposure.get(tool) {
+            return *exposure;
+        }
+        self.tool_exposure
+            .iter()
+            .filter(|(pattern, _)| pattern.contains('*') && glob_matches(pattern, tool))
+            .max_by(|(a, _), (b, _)| {
+                let literal = |p: &str| p.chars().filter(|c| *c != '*').count();
+                literal(a).cmp(&literal(b)).then_with(|| b.cmp(a))
+            })
+            .map(|(_, exposure)| *exposure)
+            .unwrap_or(self.exposure)
+    }
+}
+
+/// `*` 匹配任意个字符，其余字面相等。
+pub fn glob_matches(pattern: &str, text: &str) -> bool {
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let [first, middle @ .., last] = parts.as_slice() else {
+        return pattern == text;
+    };
+    if !text.starts_with(first) {
+        return false;
+    }
+    let mut rest = &text[first.len()..];
+    for part in middle {
+        match rest.find(part) {
+            Some(at) => rest = &rest[at + part.len()..],
+            None => return false,
+        }
+    }
+    rest.len() >= last.len() && rest.ends_with(last)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -761,5 +829,45 @@ mod tests {
         };
         assert!(channel.is_outbound_only());
         assert!(!channel.is_operator(&PeerId::new("ou_x")));
+    }
+
+    /// `tool_exposure`：原名最优先；模式里字面部分最长的赢；都不中就是服务器的 `exposure`。
+    #[test]
+    fn tool_exposure_prefers_exact_names_then_the_most_specific_pattern() {
+        let mut server = McpServerConfig {
+            transport: McpTransport::Stdio {
+                command: "x".into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools: None,
+            read_only: vec![],
+            description: None,
+            exposure: McpExposure::Direct,
+            tool_exposure: BTreeMap::new(),
+        };
+        server
+            .tool_exposure
+            .insert("get_*".into(), McpExposure::Codemode);
+        server
+            .tool_exposure
+            .insert("get_secret*".into(), McpExposure::Hidden);
+        server
+            .tool_exposure
+            .insert("get_secret_ok".into(), McpExposure::Direct);
+        assert_eq!(server.exposure_of("get_issue"), McpExposure::Codemode);
+        assert_eq!(server.exposure_of("get_secret_key"), McpExposure::Hidden);
+        assert_eq!(server.exposure_of("get_secret_ok"), McpExposure::Direct);
+        assert_eq!(server.exposure_of("list"), McpExposure::Direct);
+    }
+
+    #[test]
+    fn glob_star_matches_any_run_of_characters() {
+        assert!(glob_matches("*", ""));
+        assert!(glob_matches("a*c", "abbc"));
+        assert!(glob_matches("*_get_*", "issue_get_info"));
+        assert!(!glob_matches("a*c", "abcd"));
+        assert!(!glob_matches("ab*ba", "aba"));
+        assert!(glob_matches("exact", "exact"));
     }
 }

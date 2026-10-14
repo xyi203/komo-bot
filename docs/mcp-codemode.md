@@ -4,6 +4,8 @@
 > 本文提出对 `docs/komo_bot.md` 的变更，不覆盖当前正式设计，也不表示已经实现。
 > 对照 pi 提交：`1cedd32724abfcb0915f76cc61b6827e2c16dbad`。
 > 后来落地的是 `docs/mcp.md` 与 `docs/codemode.md`（沙箱里的 Python，不是 QuickJS），两处冲突以那两份为准。
+> §4.2 的 exposure 于 2026-10-14 落地（`docs/mcp.md` §3），按 pi 而不是本稿：`codemode`（默认）/ `direct` /
+> `hidden`，发现走脚本里的 `search_tools` / `describe_tool` / `describe_namespace`，不扩展 `tool://` 目录分页。
 > 2026-10-11 起没有 Policy 与审批（`docs/komo_bot.md` §7）：模型要的调用过了工具自己的 `prepare`
 > 与能力面（`AgentSurface`）就执行。原稿里 Policy 放行 / Deny、审批、授权消费、`Proof` 的写法已删去
 > 或改成能力面 / 只读；§8.1 的"审批中断"整段作废。

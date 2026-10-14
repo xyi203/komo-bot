@@ -1,7 +1,7 @@
 # MCP
 
 > 状态：已落地（2026-10-08）。与 `docs/komo_bot.md` 冲突处以本文为准。codemode 见
-> `docs/codemode.md`。
+> `docs/codemode.md`。2026-10-14 起 MCP 工具默认只在 codemode 里调（§3，照 pi 的 exposure）。
 
 ## 1. 形状
 
@@ -13,11 +13,13 @@ MCP 服务器是**操作者接进来的工具来源**，不是第七个基础工
 config.toml [mcp.servers.<name>]
    │  Gateway 启动时（build_tools）并行连接，30s 超时；连不上的记 warn 跳过
    ▼
-rmcp 客户端（stdio 子进程 / Streamable HTTP）── tools/list
+rmcp 客户端（stdio 子进程 / Streamable HTTP）── initialize（取 instructions）+ tools/list
    ▼
-McpTool × N，名字 mcp__<server>__<tool>，挂进工具目录
+McpTool × N，名字 mcp__<server>__<tool>，挂进工具目录（exposure = hidden 的不挂）
    ▼
 Profile 的 tools 照常挑（省略 = 全部，含 MCP）；Run 受理时冻结进能力面
+   ▼
+exposure = codemode（默认）：不进交给模型的 schema，脚本里调；direct：照常声明
 ```
 
 ## 2. 配置
@@ -33,6 +35,9 @@ read_only = ["search_issues", "get_issue"]
 url              = "https://mcp.example.com/mcp"
 bearer_token_env = "DOCS_TOKEN"       # .env 里的变量名
 tools            = ["lookup"]          # 白名单；省略 = 服务器列出的全部
+description      = "内部文档检索"      # 系统提示里这台服务器的那一行（§3）
+exposure         = "codemode"          # 默认；direct / hidden（§3）
+tool_exposure    = { lookup = "direct", "delete_*" = "hidden" }
 ```
 
 - `command` 与 `url` 恰好写一个；`args` / `env` 只配 `command`，`bearer_token_env` 只配 `url`。
@@ -64,7 +69,36 @@ oauth = true                           # 与 bearer_token_env 只能写一个
   token 时静默刷新重试一次。服务器不发 refresh token 时，过期后要重新 `login`——新 token 写进同一
   份文件，在跑的 Gateway 下一次请求就读到，不必重启。
 
-## 3. 只读与恢复
+## 3. 暴露方式（2026-10-14，照 pi）
+
+MCP 工具默认**不声明给模型**，只在 codemode 脚本里调：一台服务器几十个工具的 schema 每次请求都带，
+大半用不上（实测 devops-mcp-prod 38 个工具、schema 约 39K 字符）。照 pi 的 `exposure`：
+
+| 值 | 模型 schema | codemode 脚本 | 用途 |
+|---|---|---|---|
+| `codemode`（默认） | 不声明 | 能调；脚本用 `search_tools` / `describe_tool` / `describe_namespace` / `ALL_TOOLS` 找 | 一般的服务器 |
+| `direct` | 像内置工具一样声明 | 能调 | 工具少、几乎每次都用 |
+| `hidden` | — | — | 不挂（不进工具目录，能力面里也就没有） |
+
+- `tool_exposure` 按工具覆盖：键是服务器上的工具原名，或带 `*` 的模式。原名优先；模式之间**字面部分
+  最长的赢**（一样长按键的字典序）。pi 是"第一条匹配的赢"，靠 JSON 键序；TOML 表读进来不保序，所以改成
+  最具体的赢。没匹配上任何工具的键在连接时记 warn。没有 pi 的 `deferred`：komo 没有 `tool_search`。
+- **隐藏 schema 不等于撤权。** `codemode` 的工具仍在 Run 的能力面里（`AgentSurface` 不变），codemode
+  子调用照常按能力面核对；顶层发来的同名调用（升级前的续跑、模型凭记忆拼出名字）也照常执行——
+  它本来就在能力面里，没有越权，旧会话的历史与恢复也不用改。`tool://` 按能力面答，读得到它们。
+- **系统提示的服务器段**（主 Agent 与子代理都有）：能力面里有 `codemode` 工具、而且这次调得到
+  codemode（Profile 给了、沙箱自检过了）时，每台服务器一行 `- mcp__<server>：<摘要>`。摘要是配置的
+  `description`，没写就是服务器 instructions 的**第一行**（pi 的 `serverSummary`）。整段 4096 字、每台
+  250 字封顶：先缩短摘要，名字都放不下时后面的只计数。codemode 调不到时这段不出现——说了"在脚本里
+  调"也调不到。内容只取决于能力面与启动时连上的服务器，Gateway 不重启就不变，不破坏前缀缓存。
+- **instructions 全文不进任何提示**（照 pi）：握手时服务器交回的 `instructions` 是外部文本，只在脚本里
+  `describe_namespace("<server>")` 读得到，系统提示只取它的第一行作摘要。
+- codemode 调不到（沙箱自检没过）时**不自动改成直接声明**（照 pi）：启动时 warn 列出这些工具，要直接
+  调就把那台服务器写成 `exposure = "direct"`。Profile 不给 codemode 时同理，这些工具这次调不到。
+
+脚本里的发现函数在沙箱里本地做完，不经宿主、不进 journal（`docs/codemode.md` §6）。
+
+## 4. 只读与恢复
 
 计划是 `Operation::McpCall { server, tool, read_only }`。`read_only` 来自**操作者**的
 `read_only` 列表，不信服务器自报的 `readOnlyHint`：自称安全的东西决定不了恢复方式。调用一律
@@ -82,7 +116,7 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
 调用失败：只读工具当普通失败；其余工具在传输层断掉时报"结果不明"（`ToolError::Uncertain`）
 ——请求可能已经到了服务器。超时由执行器的 `call_timeout` 兜底。
 
-## 4. 结果
+## 5. 结果
 
 - 模型看到的正文：文本块原样；图片 / 音频只留一句说明（不把 base64 塞进上下文）；资源给出它
   的文本或 URI；一段文本都没有时用 `structuredContent` 的 JSON。超长时照常由投影截头尾、给
@@ -90,20 +124,33 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
 - 完整的 `CallToolResult`（含 `structuredContent`、`isError`）存进 `output.json` 的 `result`。
 - `isError: true` → `tool.result` 状态 `failed`，正文照常交给模型。
 
-## 5. 不做的（首版）
+## 6. 不做的（首版）
 
 - （OAuth 原在此列，2026-10-14 落地，见 §2.1。）客户端凭证（client credentials）、
   企业托管授权等其他 OAuth 流程仍不做。
 - 断线重连：服务器进程挂了，它的工具调用会失败，重启 Gateway 才重新连。
 - 热加载：增删服务器要重启。
 - `resources` / `prompts` / 采样（sampling）/ elicitation：只用 tools。
-- `deferred` 暴露（先搜再声明）：工具多的服务器用 `tools` 白名单收窄。
+- `deferred` 暴露（先搜再声明，pi 的 `tool_search`）：默认的 `codemode` 已经不把 schema 塞进上下文，
+  而且声明从头到尾不变。tool_search 每加载一次就改一次工具声明：pi 靠 provider 原生的对话中途追加
+  （Anthropic `inline-tools` beta 的 `tool_addition` + 一个 `defer_loading` 占位工具；Responses 的
+  `additional_tools` 或客户端 `tool_search_call/output`）保住前缀缓存，Chat Completions 退回顶部完整
+  列表、整段失效。komo 三个适配器都只会发顶部完整列表，做之前要先逐个 provider 接中途追加并实测
+  `cache_read`（中转站是否转发 beta 未验证）。2026-10-14 决定暂不做。
+- 服务器 instructions 变化后在对话末尾追加新的服务器段（pi 的做法）：komo 的服务器只在启动时连，
+  段内容在 Gateway 生命周期里不变。
 
-## 6. 验收
+## 7. 验收
 
 - `komo-gateway/tests/mcp`（真 Gateway + `tests/mcp/server.py` 这个真 stdio 服务器）：
   子进程只拿到声明的变量；有副作用的工具只执行一次；起不来的
-  服务器不影响别的。
+  服务器不影响别的；默认 `codemode` 时 schema 里没有 `mcp__*`、系统提示有服务器那一行（只取
+  instructions 第一行），脚本里 `describe_namespace` 拿得到全文、`search_tools` 用中文搜得到、调用只
+  执行一次；`direct` 进 schema、`hidden` 不挂、只剩直出工具时不出服务器段。
+- `komo-kernel`：`protocol::config::tests`（`tool_exposure` 原名 > 最具体模式 > 服务器默认，`*` 匹配）。
+- `komo-agent`：`prompt::tests`（服务器段每台一行、摘要取法、主 / 子代理都有、预算内截断与计数）。
+- `komo-runtime`：`executor::tests::codemode_only_tools_stay_callable_but_out_of_the_schema`、
+  `config::tests::mcp_exposure_defaults_to_codemode_and_loads_overrides`。
 - `komo-runtime`：`mcp::tests`（命名、白名单）、`config::tests`（解析、`command`/`url` 互斥）、
   `config::validate::tests`（服务器名、`read_only` 越界）。
 - `komo-runtime`：`mcp_auth::tests`（回调跳过别的路径、`error=` 回调报错不换码、凭证文件往返与

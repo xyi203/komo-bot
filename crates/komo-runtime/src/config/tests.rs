@@ -618,6 +618,30 @@ fn an_oauth_mcp_server_loads_and_refuses_a_bearer_token_beside_it() {
 }
 
 #[test]
+fn mcp_exposure_defaults_to_codemode_and_loads_overrides() {
+    use komo_kernel::protocol::config::McpExposure;
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str(
+        "\n[mcp.servers.devops]\nurl = \"https://mcp.example.com/mcp\"\n\
+         description = \"  发布与配置  \"\n\
+         tool_exposure = { issue_get = \"direct\", \"delete_*\" = \"hidden\" }\n",
+    );
+    write(&fixture.sources().config, &text);
+    let loaded = load_config(&fixture.options()).unwrap();
+    let server = &loaded.snapshot.start_only.mcp["devops"];
+    assert_eq!(server.exposure, McpExposure::Codemode);
+    assert_eq!(server.description.as_deref(), Some("发布与配置"));
+    assert_eq!(server.exposure_of("issue_get"), McpExposure::Direct);
+    assert_eq!(server.exposure_of("delete_app"), McpExposure::Hidden);
+    assert_eq!(server.exposure_of("issue_list"), McpExposure::Codemode);
+
+    text.push_str("exposure = \"deferred\"\n");
+    write(&fixture.sources().config, &text);
+    assert!(load_config(&fixture.options()).is_err());
+}
+
+#[test]
 fn an_mcp_server_needs_exactly_one_of_command_and_url() {
     let fixture = Fixture::valid();
     let mut text = Fixture::config_text("chat-a", "medium");

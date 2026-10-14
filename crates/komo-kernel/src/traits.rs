@@ -34,7 +34,7 @@ use crate::types::status::{Claimed, RunEnd, WaitReason};
 use crate::types::systemone::{SystemOneError, SystemOneRequest, SystemOneResponse};
 use crate::types::tool::{
     CancelToken, PyError, PythonJob, PythonResult, ToolContext, ToolDefinition, ToolError,
-    ToolOutput,
+    ToolExposure, ToolNamespace, ToolOutput,
 };
 use crate::types::turn::{
     AcceptInput, Accepted, AssistantRound, EventBatch, LlmError, Round, RoundInput, TurnRequest,
@@ -645,6 +645,18 @@ pub trait Tool: Send + Sync {
     /// 模型。默认 `Unsafe`：只有重跑一遍确实无害的工具（读、搜索）才覆盖它。
     fn replay(&self) -> Replay {
         Replay::Unsafe
+    }
+
+    /// 模型怎么够到它（`docs/mcp.md` §3）：直接声明，还是只在 codemode 脚本里调。默认直接
+    /// 声明；只改 schema 给不给模型，不改能力面——codemode 里的那些照样要在能力面里。
+    fn exposure(&self) -> ToolExposure {
+        ToolExposure::Direct
+    }
+
+    /// 它属于哪一组（一台 MCP 服务器）。脚本里的 `describe_namespace` 与系统提示的服务器
+    /// 段按它列。
+    fn namespace(&self) -> Option<ToolNamespace> {
+        None
     }
 }
 

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use komo_kernel::protocol::config::{
     ChannelConfig, ChannelsConfig, CompactionConfig, ConfigSnapshot, ExecutionConfig, KeyPath,
-    McpServerConfig, McpTransport, MemoryConfig, PathsConfig, RetrievalConfig, SourceFile,
-    StartOnly, TypesafeConfig,
+    McpExposure, McpServerConfig, McpTransport, MemoryConfig, PathsConfig, RetrievalConfig,
+    SourceFile, StartOnly, TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile};
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
@@ -259,6 +259,11 @@ pub(super) struct McpServerSection {
     pub tools: Option<Vec<String>>,
     #[serde(default)]
     pub read_only: Vec<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub exposure: McpExposure,
+    #[serde(default)]
+    pub tool_exposure: BTreeMap<String, McpExposure>,
 }
 
 impl McpServerSection {
@@ -297,6 +302,12 @@ impl McpServerSection {
             transport,
             tools: self.tools,
             read_only: self.read_only,
+            description: self
+                .description
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty()),
+            exposure: self.exposure,
+            tool_exposure: self.tool_exposure,
         })
     }
 }

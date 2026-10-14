@@ -890,6 +890,68 @@ async fn the_executor_keeps_a_catalog_and_renders_a_surface_from_it() {
     assert_eq!(rendered, vec!["write".to_string()]);
 }
 
+/// 只在 codemode 里调的工具（`docs/mcp.md` §3）。
+#[derive(Debug)]
+struct CodemodeOnly;
+
+#[async_trait::async_trait]
+impl Tool for CodemodeOnly {
+    fn definition(&self) -> komo_kernel::types::tool::ToolDefinition {
+        komo_kernel::types::tool::ToolDefinition {
+            name: "mcp__demo__bump".into(),
+            description: "[MCP demo] 加一".into(),
+            parameters: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    async fn prepare(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<ExecutionPlan, ToolError> {
+        Err(ToolError::Failed {
+            message: "测试里不调".into(),
+        })
+    }
+
+    async fn execute(
+        &self,
+        _plan: ExecutionPlan,
+        _ctx: &ToolContext,
+        _sink: &mut dyn OutputWriter,
+    ) -> Result<ToolOutput, ToolError> {
+        unreachable!("测试里不调")
+    }
+
+    fn exposure(&self) -> komo_kernel::types::tool::ToolExposure {
+        komo_kernel::types::tool::ToolExposure::Codemode
+    }
+}
+
+/// codemode 里调的工具留在能力面里（`tool://` 读得到），但不进交给模型的 schema；这台执行器
+/// 没有沙箱，服务器段也就不列它。
+#[tokio::test]
+async fn codemode_only_tools_stay_callable_but_out_of_the_schema() {
+    let harness = Harness::new();
+    let executor = harness.executor(vec![Arc::new(ReadTool::new()), Arc::new(CodemodeOnly)]);
+    let surface = AgentSurface::new(["read", "mcp__demo__bump"]);
+    let names = |definitions: Vec<komo_kernel::types::tool::ToolDefinition>| -> Vec<String> {
+        definitions
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect()
+    };
+    assert_eq!(
+        names(executor.definitions_for(&surface)),
+        vec!["read".to_string()]
+    );
+    assert_eq!(
+        names(executor.callable_definitions_for(&surface)),
+        vec!["read".to_string(), "mcp__demo__bump".to_string()]
+    );
+    assert!(executor.namespaces_for(&surface).is_empty());
+}
+
 /// 委派（§4、§8.4 的 `dependency`）：一次子任务怎么变成一条子 Run、父调用怎么收尾。
 ///
 /// 这一组全部用 [`MemLedger`]，因为要断言的正是**账本里发生了什么**——子 Run 的受理事件、

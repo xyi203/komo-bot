@@ -19,6 +19,7 @@ use serde::Serialize;
 
 use super::codemode_journal::{Intent, Journal, Record, Reply, uncertain};
 use super::{CallEnv, ToolExecutor};
+use crate::codemode::{ScriptCatalog, ScriptTool};
 
 /// 脚本里调不了的：编排操作、计划与脚本自己。
 const NOT_IN_SCRIPTS: &[&str] = &[
@@ -128,10 +129,11 @@ impl ToolExecutor {
                 .map_err(|e| uncertain(e.to_string()))?;
             return Ok(output);
         }
+        let catalog = self.script_catalog(&names);
         let journal = Arc::new(Mutex::new(journal));
         let calls: Arc<Mutex<Vec<NestedCall>>> = Arc::default();
         let outcome = sandbox
-            .run(code, &names, env.call_timeout, |name, args| {
+            .run_with_catalog(code, &names, &catalog, env.call_timeout, |name, args| {
                 let calls = Arc::clone(&calls);
                 let journal = Arc::clone(&journal);
                 async move {
@@ -202,6 +204,34 @@ impl ToolExecutor {
                 message: error.to_string(),
             })?;
         Ok(output)
+    }
+
+    /// 脚本里发现工具用的说明（`docs/codemode.md` §6）：`names` 里每个工具的说明与 schema，
+    /// 以及它们所属的组。不进指纹：发现只影响脚本往哪里调，调用本身已由工具名与参数核对。
+    fn script_catalog(&self, names: &[String]) -> ScriptCatalog {
+        let mut catalog = ScriptCatalog::default();
+        for name in names {
+            let Some(tool) = self.tools.get(name) else {
+                continue;
+            };
+            let definition = tool.definition();
+            let namespace = tool.namespace();
+            if let Some(namespace) = &namespace
+                && !catalog
+                    .namespaces
+                    .iter()
+                    .any(|known| known.name == namespace.name)
+            {
+                catalog.namespaces.push(namespace.clone());
+            }
+            catalog.tools.push(ScriptTool {
+                name: definition.name,
+                description: definition.description,
+                parameters: definition.parameters,
+                namespace: namespace.map(|namespace| namespace.name),
+            });
+        }
+        catalog
     }
 
     /// `start` 记下的指纹：脚本、driver、能力表、cwd、环境版本任一变了，恢复就是分歧。

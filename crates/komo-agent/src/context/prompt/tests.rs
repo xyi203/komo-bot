@@ -14,6 +14,7 @@ fn the_system_prompt_names_the_workspace_and_leaves_tools_to_the_schema() {
     let prompt = build(
         Path::new("/tmp/w"),
         &["read".to_string()],
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -39,6 +40,7 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
     let prompt = build(
         Path::new("/tmp/w"),
         &tools,
+        &[],
         &InvocationContext::Main,
         &[],
         catalog.prompt_block().as_deref(),
@@ -52,6 +54,7 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
     let bare = build(
         Path::new("/tmp/w"),
         &tools,
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -68,6 +71,7 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
     let main = build(
         Path::new("/tmp/w"),
         &tools,
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -77,6 +81,7 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
     let without_rg = build(
         Path::new("/tmp/w"),
         &["read".to_string()],
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -91,6 +96,7 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
     let sub = build(
         Path::new("/tmp/w"),
         &tools,
+        &[],
         &InvocationContext::Delegated(spec),
         &[],
         None,
@@ -106,6 +112,7 @@ fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
     let main = build(
         Path::new("/tmp/w"),
         &tools,
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -116,6 +123,7 @@ fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
     let sub = build(
         Path::new("/tmp/w"),
         &tools,
+        &[],
         &InvocationContext::Delegated(DelegateSpec::new(
             RunId::from_raw("run-1"),
             ToolCallId::from_raw("call-1"),
@@ -128,6 +136,7 @@ fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
     let without = build(
         Path::new("/tmp/w"),
         &["read".to_string()],
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -153,6 +162,7 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
     let prompt = build(
         Path::new("/tmp/w"),
         &tools,
+        &[],
         &InvocationContext::Main,
         &[],
         catalog.prompt_block().as_deref(),
@@ -168,6 +178,7 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
         build(
             Path::new("/tmp/w"),
             &tools,
+            &[],
             &InvocationContext::Main,
             &[],
             catalog.prompt_block().as_deref(),
@@ -183,6 +194,7 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
     let dispatcher = build(
         Path::new("/tmp/w"),
         &["dispatch".to_string(), "follow".to_string()],
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -197,6 +209,7 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
     let sub = build(
         Path::new("/tmp/w"),
         &["shell".to_string()],
+        &[],
         &InvocationContext::Delegated(spec),
         &[],
         None,
@@ -211,6 +224,7 @@ fn both_prompts_steer_batched_reads_to_codemode_only_when_it_is_mounted() {
     let main = build(
         Path::new("/tmp/w"),
         &tools,
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -219,6 +233,7 @@ fn both_prompts_steer_batched_reads_to_codemode_only_when_it_is_mounted() {
     let sub = build(
         Path::new("/tmp/w"),
         &tools,
+        &[],
         &InvocationContext::Delegated(DelegateSpec::new(
             RunId::from_raw("run-1"),
             ToolCallId::from_raw("call-1"),
@@ -231,6 +246,7 @@ fn both_prompts_steer_batched_reads_to_codemode_only_when_it_is_mounted() {
     let without = build(
         Path::new("/tmp/w"),
         &["read".to_string(), "rg".to_string()],
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -244,6 +260,7 @@ fn the_read_over_cat_rule_needs_both_read_and_shell() {
     let both = build(
         Path::new("/tmp/w"),
         &["read".to_string(), "shell".to_string()],
+        &[],
         &InvocationContext::Main,
         &[],
         None,
@@ -253,6 +270,7 @@ fn the_read_over_cat_rule_needs_both_read_and_shell() {
         let prompt = build(
             Path::new("/tmp/w"),
             &tools,
+            &[],
             &InvocationContext::Main,
             &[],
             None,
@@ -290,6 +308,7 @@ fn the_main_prompt_puts_project_files_between_the_komo_section_and_skills() {
     let prompt = build(
         Path::new("/code/repo"),
         &tools,
+        &[],
         &InvocationContext::Main,
         &files,
         catalog.prompt_block().as_deref(),
@@ -319,6 +338,7 @@ fn project_files_reach_only_the_main_prompt_and_only_when_non_blank() {
     let sub = build(
         Path::new("/w"),
         &tools,
+        &[],
         &InvocationContext::Delegated(spec),
         &files,
         None,
@@ -326,14 +346,107 @@ fn project_files_reach_only_the_main_prompt_and_only_when_non_blank() {
     assert!(!sub.contains("先读再改"), "{sub}");
     assert!(!sub.contains("project_instructions"), "{sub}");
 
-    let bare = build(Path::new("/w"), &tools, &InvocationContext::Main, &[], None);
+    let bare = build(
+        Path::new("/w"),
+        &tools,
+        &[],
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
     let blank = build(
         Path::new("/w"),
         &tools,
+        &[],
         &InvocationContext::Main,
         &[project_file("/w/AGENTS.md", " \n\n")],
         None,
     );
     assert_eq!(blank, bare, "空白的规范文件不留空标题");
     assert!(!bare.contains("项目规范"), "{bare}");
+}
+
+fn namespace(name: &str, description: Option<&str>, instructions: Option<&str>) -> ToolNamespace {
+    ToolNamespace {
+        name: name.into(),
+        server: name.trim_start_matches("mcp__").into(),
+        description: description.map(str::to_string),
+        instructions: instructions.map(str::to_string),
+    }
+}
+
+/// 只在 codemode 里调的 MCP 服务器每台一行（照 pi 的 `mcp_servers` 段）：配置的说明优先，
+/// 没有就是 instructions 的第一行；主 / 子代理都说；一台都没有就不出这一段。
+#[test]
+fn codemode_mcp_servers_get_one_line_each() {
+    let tools = vec!["read".to_string(), "codemode".to_string()];
+    let servers = vec![
+        namespace("mcp__zeta", Some("发布与配置"), Some("不该出现")),
+        namespace("mcp__alpha", None, Some("先查规范。\n第二行不进提示")),
+    ];
+    let main = build(
+        Path::new("/w"),
+        &tools,
+        &servers,
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
+    assert!(main.contains("在 codemode 脚本里调用"), "{main}");
+    let alpha = main.find("- mcp__alpha：先查规范。").expect("alpha 一行");
+    let zeta = main.find("- mcp__zeta：发布与配置").expect("zeta 一行");
+    assert!(alpha < zeta, "按名字排序：{main}");
+    assert!(
+        !main.contains("第二行不进提示") && !main.contains("不该出现"),
+        "{main}"
+    );
+
+    let spec = DelegateSpec::new(
+        RunId::from_raw("run-1"),
+        ToolCallId::from_raw("call-1"),
+        "查一件事",
+    );
+    let sub = build(
+        Path::new("/w"),
+        &tools,
+        &servers,
+        &InvocationContext::Delegated(spec),
+        &[],
+        None,
+    );
+    assert!(sub.contains("- mcp__zeta：发布与配置"), "{sub}");
+
+    let none = build(
+        Path::new("/w"),
+        &tools,
+        &[],
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
+    assert!(!none.contains("MCP 服务器"), "{none}");
+}
+
+/// 整段超出预算时先缩短说明，名字都放不下时后面的服务器只计数。
+#[test]
+fn the_servers_section_stays_within_its_budget() {
+    let long = "很长的说明".repeat(200);
+    let servers: Vec<ToolNamespace> = (0..400)
+        .map(|index| namespace(&format!("mcp__server_{index:03}"), Some(&long), None))
+        .collect();
+    let block = servers_block(&servers).expect("有服务器");
+    assert!(
+        block.chars().count() <= MAX_SERVERS_SECTION_CHARS,
+        "{}",
+        block.chars().count()
+    );
+    assert!(block.contains("- …还有"), "{block}");
+
+    let few = servers_block(&servers[..2]).expect("有服务器");
+    let line = few.lines().nth(1).expect("第一台");
+    assert!(line.ends_with('…'), "{line}");
+    assert!(
+        line.chars().count()
+            <= "- mcp__server_000：".chars().count() + MAX_SERVER_DESCRIPTION_CHARS
+    );
 }

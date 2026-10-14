@@ -459,6 +459,15 @@ impl SegmentSource for GatewaySegments {
                 .collect(),
         };
         let tool_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
+        // 只在 codemode 里调的工具不进 Schema（`docs/mcp.md` §3），但能力面里有它们：`tool://` 与
+        // 系统提示的服务器段按能力面算，不按 Schema。
+        let (callable, mcp_servers) = match &self.executor {
+            Some(executor) => (
+                executor.callable_definitions_for(&identity.surface),
+                executor.namespaces_for(&identity.surface),
+            ),
+            None => (tools.clone(), Vec::new()),
+        };
 
         // §5.6 的 skills 目录只有主 Agent 有（§12：子代理不列目录，能力隔离靠上游，不靠
         // 提示词）。用受理时冻结的那一份正文，不读活注册表：续跑那一段的系统提示要与受理时
@@ -500,6 +509,7 @@ impl SegmentSource for GatewaySegments {
             project_files,
             workspace: cwd.clone(),
             tools: tool_names,
+            mcp_servers,
             memory: injection.text.clone(),
             skills,
             invocation,
@@ -540,7 +550,7 @@ impl SegmentSource for GatewaySegments {
                 })
                 .unwrap_or_default(),
             session_root: session_root.clone(),
-            tools: tools.clone().into(),
+            tools: callable.into(),
         };
 
         let resume = match self.resumed(&session, &surface, &events, &run).await {

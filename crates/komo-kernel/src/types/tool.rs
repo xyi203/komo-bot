@@ -21,6 +21,43 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
+/// 模型怎么够到一个工具（`docs/mcp.md` §3，照 pi 的 exposure）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExposure {
+    /// schema 直接交给模型。
+    Direct,
+    /// 不声明给模型，只在 codemode 脚本里调；脚本用 `search_tools` / `describe_tool` 找它。
+    Codemode,
+}
+
+/// 一组工具（一台 MCP 服务器）的说明，给系统提示的服务器段与脚本的 `describe_namespace`。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolNamespace {
+    /// 脚本里的写法，`mcp__<server>`，`-` 换成 `_`。
+    pub name: String,
+    /// 服务器原名（`[mcp.servers.<name>]`）；`describe_namespace` 也认它。
+    pub server: String,
+    /// 操作者在配置里写的一句话。
+    pub description: Option<String>,
+    /// 服务器握手时交回的 instructions（外部文本，只作说明，不进系统指令）。
+    pub instructions: Option<String>,
+}
+
+impl ToolNamespace {
+    /// 系统提示里那一行：配置的说明，没有就是 instructions 的第一行（pi 的 `serverSummary`）。
+    pub fn summary(&self) -> String {
+        let text = self
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .or(self.instructions.as_deref())
+            .unwrap_or_default();
+        text.lines().next().unwrap_or_default().trim().to_string()
+    }
+}
+
 /// 工具执行的结果正文（还没有发布成 `output.json`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutput {

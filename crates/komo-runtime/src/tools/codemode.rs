@@ -51,6 +51,10 @@ impl Tool for CodemodeTool {
                           已记录调用及参数，禁止新增调用，分歧或结果不明会终止整段脚本。\n\
                           - text(value)：加一段输出（非字符串转 JSON）。print 的内容附在最后。\n\
                           - TOOLS：能调的工具名。\n\
+                          - ALL_TOOLS（[{name, description}]）、search_tools(query, limit=8, \
+                          namespace=None)、describe_tool(name)（说明与参数 schema）、\
+                          describe_namespace(name)（一台 MCP 服务器的说明、instructions 与工具名）：\
+                          找没声明给你的工具，比如 MCP 工具。\n\
                           一段脚本最多调 256 次工具；完整输出会落盘，给模型的视图统一受结果预算限制。"
                 .into(),
             parameters: serde_json::json!({

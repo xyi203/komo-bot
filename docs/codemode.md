@@ -33,7 +33,7 @@ stdin / stdout 正常。
                                          │ 交给 executor 自己的 run_codemode
                                          ▼
                            sandbox-exec + python3 -I driver.py（子进程）
-                              stdin  ◀── 第一行：{code, tools}；之后：工具调用的结果
+                              stdin  ◀── 第一行：{code, tools, catalog}；之后：工具调用的结果
                               stdout ──▶ {"call": name, "args": {...}} / {"done": {...}}
                                          │
                        每个 call ──▶ executor.nested_call（见 §5）──▶ 结果写回 stdin
@@ -172,6 +172,15 @@ MCP 的 `read_only` 仍由操作者声明，只决定中断后能否安全重做
 | `text(value)` | 加一段输出；字符串原样，其他值转 JSON |
 | `print(...)` | 进输出末尾的 `<console>` 段 |
 | `TOOLS` | 这次脚本能调的工具名列表 |
+| `ALL_TOOLS` | 能调的工具 `[{name, description}]`，含没声明给模型的（MCP 默认如此，`docs/mcp.md` §3） |
+| `search_tools(query, limit=8, namespace=None)` | 按相关度排的 `[{name, description}]`（BM25，照 pi） |
+| `describe_tool(name)` | `{name, description, parameters, namespace?}`，没有就是 `None` |
+| `describe_namespace(name)` | 一台 MCP 服务器的 `{name, description?, instructions?, tools}`；认 `mcp__dev_radius`、`mcp__dev-radius`、`dev-radius`、`dev_radius` |
+
+发现函数照 pi 的 `searchTools` / `describeTool` / `describeNamespace`：宿主把这次能调的工具说明、
+schema 与所属服务器（含 instructions）随第一行交进沙箱（`catalog`），查找与排序都在沙箱里做完，不经
+宿主、不进 journal，也不进指纹（调用本身已按工具名与参数核对）。分词与停用词同 pi；pi 只认 a-z0-9，
+这里另把中日韩字切成单字与相邻两字，中文说明才搜得到。名字一律是脚本里的写法（`-` 换成 `_`）。
 
 结果正文：`text()` 各段按顺序，`<console>` 段随后，失败时附 `脚本出错：` 与 traceback，最后一行
 是调用摘要（`调用了 3 次工具：read×2、rg×1`）。超长照常由投影截头尾。

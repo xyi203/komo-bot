@@ -648,6 +648,9 @@ mod tests {
             },
             tools: tools.map(|tools| tools.into_iter().map(String::from).collect()),
             read_only: read_only.into_iter().map(String::from).collect(),
+            description: None,
+            exposure: Default::default(),
+            tool_exposure: Default::default(),
         }
     }
 

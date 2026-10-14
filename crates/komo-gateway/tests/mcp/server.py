@@ -38,6 +38,7 @@ for line in sys.stdin:
             "protocolVersion": msg["params"]["protocolVersion"],
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "demo", "version": "0.1"},
+            "instructions": "演示服务器：先 echo 再 bump。\nbump 往计数文件里追加一行。",
         })
     elif method == "tools/list":
         reply(msg["id"], {"tools": TOOLS})

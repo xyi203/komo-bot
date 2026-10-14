@@ -12,6 +12,7 @@ fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput<'stat
         project_files: Vec::new(),
         workspace: PathBuf::from("/tmp/w"),
         tools: vec!["read".into()],
+        mcp_servers: Vec::new(),
         history: Vec::new(),
         memory: memory.map(str::to_string),
         skills: None,

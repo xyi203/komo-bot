@@ -674,6 +674,19 @@ async fn build_tools(
         }
         Err(reason) => {
             tracing::warn!(%reason, "codemode 沙箱起不来：这台 Gateway 不挂 codemode");
+            // 照 pi：不自动改成直接声明，只说清楚哪些 MCP 工具这下调不到、怎么改。
+            let stranded: Vec<String> = tools
+                .iter()
+                .filter(|tool| tool.exposure() == komo_kernel::types::tool::ToolExposure::Codemode)
+                .map(|tool| tool.definition().name)
+                .collect();
+            if !stranded.is_empty() {
+                tracing::warn!(
+                    tools = %stranded.join("、"),
+                    "这些 MCP 工具只在 codemode 里调，没有沙箱就调不到；要直接调就在 \
+                     [mcp.servers.<name>] 写 exposure = \"direct\""
+                );
+            }
             None
         }
     };

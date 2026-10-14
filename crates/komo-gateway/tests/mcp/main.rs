@@ -135,6 +135,113 @@ command = "/nonexistent/mcp-server"
     );
 }
 
+/// macOS 总有 Seatbelt；Linux 看内核的 LSM 列表里有没有 landlock（同 `tests/codemode`）。
+fn sandbox_expected() -> bool {
+    cfg!(target_os = "macos")
+        || (cfg!(target_os = "linux")
+            && std::fs::read_to_string("/sys/kernel/security/lsm")
+                .is_ok_and(|lsm| lsm.split(',').any(|name| name.trim() == "landlock")))
+}
+
+/// 默认 `exposure = "codemode"`（`docs/mcp.md` §3）：MCP 工具不进交给模型的 Schema，系统提示列出
+/// 服务器与 instructions 的第一行；脚本里 `describe_namespace` 拿得到全文，`search_tools` 用中文
+/// 也搜得到，找到的工具照常调用、只执行一次。
+#[tokio::test]
+async fn codemode_exposure_keeps_mcp_out_of_the_schema_and_reachable_from_scripts() {
+    let (home, counter) = home_with_demo("");
+    let code = r#"
+ns = describe_namespace("demo")
+text(ns["instructions"])
+text(ns["tools"])
+hits = search_tools("计数文件")
+text(hits[0]["name"])
+text(describe_tool(hits[0]["name"])["parameters"])
+tools.mcp__demo__bump()
+"#;
+    let llm = FakeLlm::new(vec![vec![
+        call_round(1, "pc-1", "codemode", serde_json::json!({ "code": code })),
+        text_round(2, "好了"),
+    ]]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    if !gw.state().tool_names.iter().any(|name| name == "codemode") {
+        assert!(!sandbox_expected(), "这台机器上 codemode 该挂上");
+        return;
+    }
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "mcp-cm", "加一").await.run;
+    let detail = gw.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+
+    let request = llm.requests.lock().unwrap()[0].clone();
+    let declared: Vec<&str> = request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect();
+    assert!(declared.contains(&"codemode"), "{declared:?}");
+    assert!(
+        !declared.iter().any(|name| name.starts_with("mcp__")),
+        "{declared:?}"
+    );
+    assert!(
+        request
+            .system_prompt
+            .contains("- mcp__demo：演示服务器：先 echo 再 bump。"),
+        "{}",
+        request.system_prompt
+    );
+    assert!(
+        !request.system_prompt.contains("往计数文件里追加一行"),
+        "instructions 只进第一行：{}",
+        request.system_prompt
+    );
+
+    let result = tool_results(&llm).pop().expect("有一条工具结果");
+    assert!(result.contains("bump 往计数文件里追加一行。"), "{result}");
+    assert!(result.contains("mcp__demo__echo"), "{result}");
+    assert!(result.contains("mcp__demo__bump"), "{result}");
+    assert_eq!(std::fs::read_to_string(&counter).unwrap(), "bump\n");
+}
+
+/// `exposure = "direct"` 与 `tool_exposure`：直出的进 Schema，`hidden` 的不挂；服务器上只剩直出的
+/// 工具时，系统提示不出服务器段。
+#[tokio::test]
+async fn direct_and_hidden_exposure_follow_the_config() {
+    let (home, _) = home_with_demo(
+        r#"exposure = "direct"
+tool_exposure = { "b*" = "hidden" }"#,
+    );
+    let llm = FakeLlm::finisher("好");
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let names = &gw.state().tool_names;
+    assert!(
+        names.iter().any(|name| name == "mcp__demo__echo"),
+        "{names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "mcp__demo__bump"),
+        "{names:?}"
+    );
+
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "mcp-direct", "看看").await.run;
+    gw.wait_terminal(&run).await;
+    let request = llm.requests.lock().unwrap()[0].clone();
+    assert!(
+        request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "mcp__demo__echo"),
+        "{:?}",
+        request.tools
+    );
+    assert!(
+        !request.system_prompt.contains("mcp__demo"),
+        "{}",
+        request.system_prompt
+    );
+}
+
 #[path = "../recovery/harness.rs"]
 mod recovery;
 

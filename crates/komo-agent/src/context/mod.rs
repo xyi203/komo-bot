@@ -19,6 +19,7 @@ use komo_kernel::projection::ProjectionContext;
 use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::ids::ToolCallId;
+use komo_kernel::types::tool::ToolNamespace;
 use komo_kernel::types::turn::ReplayMessage;
 
 pub use history::{
@@ -42,6 +43,9 @@ pub struct ContextInput<'s> {
     /// rg"），skills 门控也按它，所以 tool definitions 必须在 [`assemble`] 之前算好。
     /// 名字本身不进提示：API 的 tool schema 里已经有一份。
     pub tools: Vec<String>,
+    /// 只在 codemode 里调的那些工具所属的组（MCP 服务器，`docs/mcp.md` §3）：工具没进 schema，
+    /// 模型从系统提示的这一段知道它们在。空 = 不出这一段。
+    pub mcp_servers: Vec<ToolNamespace>,
     /// 已解析正文的回放条目。借用 `Surface`，不复制消息。
     pub history: Vec<ResolvedMessage<'s>>,
     /// 这一段钉住的记忆注入段；`None` = 不注入（子代理、记忆关闭、没召回到）。
@@ -92,6 +96,7 @@ pub fn assemble(input: ContextInput<'_>) -> AgentContext {
     let mut prompt = prompt::build(
         &input.workspace,
         &input.tools,
+        &input.mcp_servers,
         &input.invocation,
         &input.project_files,
         input.skills.as_deref(),

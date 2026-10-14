@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use komo_kernel::traits::Tool;
 
-use komo_kernel::protocol::config::{McpServerConfig, McpTransport};
+use komo_kernel::protocol::config::{McpExposure, McpServerConfig, McpTransport};
+use komo_kernel::types::tool::{ToolExposure, ToolNamespace};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, JsonObject};
 use rmcp::service::{RoleClient, RunningService};
@@ -58,6 +59,8 @@ pub enum McpError {
 pub struct McpServer {
     name: String,
     service: RunningService<RoleClient, ()>,
+    /// 系统提示的服务器段与脚本的 `describe_namespace` 用它（`docs/mcp.md` §3）。
+    namespace: ToolNamespace,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -71,6 +74,10 @@ impl std::fmt::Debug for McpServer {
 impl McpServer {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn namespace(&self) -> &ToolNamespace {
+        &self.namespace
     }
 
     /// 调一次工具。传输层的错误原样交回：发出去之后断掉的那一种，调用方不知道副作用
@@ -168,10 +175,21 @@ async fn connect_inner(
         .list_all_tools()
         .await
         .map_err(|error| McpError::ListTools(error.to_string()))?;
+    let instructions = service
+        .peer_info()
+        .and_then(|info| info.instructions.clone())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty());
     Ok((
         McpServer {
             name: name.to_string(),
             service,
+            namespace: ToolNamespace {
+                name: namespace_name(name),
+                server: name.to_string(),
+                description: config.description.clone(),
+                instructions,
+            },
         },
         tools,
     ))
@@ -200,6 +218,28 @@ pub fn tool_name(server: &str, tool: &str) -> Option<String> {
     };
     let name = format!("mcp__{}__{}", clean(server), clean(tool));
     (name.len() <= MAX_TOOL_NAME).then_some(name)
+}
+
+/// 脚本里这台服务器的名字：`mcp__<server>`，`-` 换成 `_`（与 `tools.<name>` 的写法一致）。
+pub fn namespace_name(server: &str) -> String {
+    format!("mcp__{}", server.replace('-', "_"))
+}
+
+/// `tool_exposure` 里一条都没匹配上服务器工具的键：多半是写错了名字，报出来。
+pub fn unmatched_exposure_keys(
+    config: &McpServerConfig,
+    listed: &[rmcp::model::Tool],
+) -> Vec<String> {
+    config
+        .tool_exposure
+        .keys()
+        .filter(|key| {
+            !listed
+                .iter()
+                .any(|tool| komo_kernel::protocol::config::glob_matches(key, &tool.name))
+        })
+        .cloned()
+        .collect()
 }
 
 /// 按配置挑出要挂的工具：`tools` 白名单（没写 = 全部）。白名单里写了、服务器没有的名字
@@ -256,9 +296,22 @@ pub async fn connect_all(
                 "[mcp.servers] tools 里写了服务器没有的工具，它们不算数"
             );
         }
+        let unmatched = unmatched_exposure_keys(config, &listed);
+        if !unmatched.is_empty() {
+            tracing::warn!(
+                server = %name,
+                unmatched = %unmatched.join("、"),
+                "[mcp.servers] tool_exposure 里的键没有匹配上服务器的任何工具"
+            );
+        }
         let server = Arc::new(server);
         let mut count = 0usize;
         for remote in selected {
+            let exposure = match config.exposure_of(&remote.name) {
+                McpExposure::Hidden => continue,
+                McpExposure::Codemode => ToolExposure::Codemode,
+                McpExposure::Direct => ToolExposure::Direct,
+            };
             let Some(tool_name) = tool_name(name, &remote.name) else {
                 tracing::warn!(server = %name, tool = %remote.name, "工具名太长，放不进模型的工具表");
                 continue;
@@ -276,6 +329,7 @@ pub async fn connect_all(
                 remote,
                 tool_name,
                 read_only,
+                exposure,
             )));
             count += 1;
         }
@@ -316,6 +370,9 @@ mod tests {
             },
             tools: Some(vec!["b".into(), "ghost".into()]),
             read_only: Vec::new(),
+            description: None,
+            exposure: Default::default(),
+            tool_exposure: Default::default(),
         };
         let (kept, missing) = select(&config, &listed);
         assert_eq!(

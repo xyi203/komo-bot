@@ -167,11 +167,11 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 **`codemode` 是组合，不是新能力。** 模型写一段 Python，在操作系统沙箱里跑（macOS 是 Seatbelt，Linux 是 Landlock + seccomp；不能写文件、联网、起子进程），脚本里经 `tools.<name>()` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）与 `Operation::McpCall`（含写操作）的计划；本地 `write` / `edit` / `shell` / `python`、带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是沙箱本身（§7）。沙箱自检不过就不注册。**脚本里的子调用逐次持久化**（2026-10-13，此前只放行只读、整段重跑）：每次子调用按 intent → started → delivered 记成 `codemode.journal` 事件、正文外置到 `tool-output/`，fold 不看它，不生成顶层 `tool.result`，模型只看见外层结果。中断后接回已交付的子结果，started 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次绝不重做；恢复只允许走已记录的调用前缀，不许新增调用，分歧或结果不明整段记 uncertain 交给模型。因为脚本里可能有 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）。见 `docs/codemode.md` §5、§7。
 
-**MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。见 `docs/mcp.md`。
+**MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。**默认不声明给模型**（2026-10-14，照 pi 的 `exposure`）：`exposure = "codemode"` 的 MCP 工具不进 schema、只在 codemode 脚本里调，脚本用 `search_tools` / `describe_tool` / `describe_namespace` 找；系统提示只给每台服务器一行摘要（配置的 `description`，没写就是服务器 instructions 的第一行），instructions 全文只在脚本里读。`direct` 照常声明，`hidden` 不挂。见 `docs/mcp.md` §3。
 
 工具执行的公共能力放在 ToolExecutor：参数校验、执行计划生成、执行状态保存、取消和输出限制。
 
-**每次运行有它自己的能力面（`AgentSurface`）。** 这次允许调用哪些工具是一个显式的集合：**交给模型的工具 schema 与执行时查找的表是同一份**，装配时由 schema 反推，所以两边不可能分家。schema 里没有的名字，执行器不认——模型自己拼出这个名字，拿到的是"这次运行的工具集里没有它"，而不是"进去试试看"。执行器手里那份全局工具目录只用于**发现与构造**（`komo skills` 的 `requires_tools` 门控也问它），**执行时一次都不回退到它**：能回退就等于能力边界只是一句建议。子代理已经是这条边界的第一个使用者（它的 schema 里没有 `delegate`，于是它也调不动 `delegate`）。
+**每次运行有它自己的能力面（`AgentSurface`）。** 这次允许调用哪些工具是一个显式的集合：**交给模型的工具 schema 与执行时查找的表出自同一份能力面**，所以两边不可能分家。schema 是能力面的投影：`exposure = "codemode"` 的 MCP 工具在能力面里、不进 schema（只在 codemode 脚本里调，`docs/mcp.md` §3）——隐藏 schema 不等于撤权。能力面里没有的名字，执行器不认——模型自己拼出这个名字，拿到的是"这次运行的工具集里没有它"，而不是"进去试试看"。执行器手里那份全局工具目录只用于**发现与构造**（`komo skills` 的 `requires_tools` 门控也问它），**执行时一次都不回退到它**：能回退就等于能力边界只是一句建议。子代理已经是这条边界的第一个使用者（它的 schema 里没有 `delegate`，于是它也调不动 `delegate`）。
 
 工具**能不能**调用由能力面决定；一次**具体调用**能不能做由工具自己的 `prepare` 决定（参数、版本、目标；§7 那条硬限制也在这里）。没有第三层：能力面给了、`prepare` 过了，就执行（§7）。
 

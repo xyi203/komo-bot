@@ -39,6 +39,22 @@ pub struct Sandbox {
     jail: Jail,
 }
 
+/// 脚本里发现工具用的说明：这次能调的工具与它们所属的组。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct ScriptCatalog {
+    pub tools: Vec<ScriptTool>,
+    pub namespaces: Vec<komo_kernel::types::tool::ToolNamespace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ScriptTool {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+    /// 所属组的名字（[`komo_kernel::types::tool::ToolNamespace::name`]）。
+    pub namespace: Option<String>,
+}
+
 /// 一段脚本跑完的样子。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScriptOutcome {
@@ -150,6 +166,25 @@ text({{
         code: &str,
         tools: &[String],
         timeout: Duration,
+        on_call: F,
+    ) -> ScriptOutcome
+    where
+        F: FnMut(String, serde_json::Value) -> Fut,
+        Fut: Future<Output = Result<serde_json::Value, String>>,
+    {
+        self.run_with_catalog(code, tools, &ScriptCatalog::default(), timeout, on_call)
+            .await
+    }
+
+    /// 同 [`Self::run`]，另带上脚本里 `ALL_TOOLS` / `search_tools` / `describe_tool` /
+    /// `describe_namespace` 要的说明（`docs/codemode.md` §6）。发现在沙箱里本地做完，不经宿主、
+    /// 不进 journal。
+    pub async fn run_with_catalog<F, Fut>(
+        &self,
+        code: &str,
+        tools: &[String],
+        catalog: &ScriptCatalog,
+        timeout: Duration,
         mut on_call: F,
     ) -> ScriptOutcome
     where
@@ -177,7 +212,7 @@ text({{
         let mut stderr = child.stderr.take().expect("stderr 是 piped");
 
         let conversation = async {
-            let first = serde_json::json!({ "code": code, "tools": tools });
+            let first = serde_json::json!({ "code": code, "tools": tools, "catalog": catalog });
             if let Err(error) = write_line(&mut stdin, &first).await {
                 return Err(format!("脚本交不进沙箱：{error}"));
             }

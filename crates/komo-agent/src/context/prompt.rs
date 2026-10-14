@@ -9,6 +9,7 @@ use std::path::Path;
 
 use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::delegate::DelegateSpec;
+use komo_kernel::types::tool::ToolNamespace;
 
 use super::InvocationContext;
 use crate::surface::UPDATE_PLAN_TOOL;
@@ -60,11 +61,16 @@ const CODEMODE_TOOL: &str = "codemode";
 pub(crate) fn build(
     workspace: &Path,
     tools: &[String],
+    mcp_servers: &[ToolNamespace],
     invocation: &InvocationContext,
     project_files: &[ProjectFile],
     skills: Option<&str>,
 ) -> String {
-    let rules = rules(tools);
+    let mut rules = rules(tools);
+    if let Some(block) = servers_block(mcp_servers) {
+        rules.push_str("\n\n");
+        rules.push_str(&block);
+    }
     match invocation {
         InvocationContext::Main => {
             let has_shell = tools.iter().any(|tool| tool == SHELL_TOOL);
@@ -72,6 +78,77 @@ pub(crate) fn build(
         }
         InvocationContext::Delegated(spec) => subagent_prompt(workspace, &rules, spec),
     }
+}
+
+/// 服务器段里一台服务器的说明最多这么多字（pi 的 `MAX_SERVER_DESCRIPTION_CHARS`）。
+const MAX_SERVER_DESCRIPTION_CHARS: usize = 250;
+
+/// 整段的字数上限（pi 的 `MAX_SERVERS_SECTION_CHARS`）：说明先缩短；只列名字都放不下时，
+/// 后面的服务器不列，最后一行说还有几台。
+const MAX_SERVERS_SECTION_CHARS: usize = 4096;
+
+const SERVERS_INTRO: &str = "MCP 服务器（工具没有声明给你，在 codemode 脚本里调用；用 search_tools / \
+                             describe_tool / describe_namespace 找工具、看参数与服务器的说明）：";
+
+/// 只在 codemode 里调的工具所属的服务器，每台一行（照 pi 的 `renderServersSection`）。
+/// 一台都没有就不出这一段。
+fn servers_block(servers: &[ToolNamespace]) -> Option<String> {
+    if servers.is_empty() {
+        return None;
+    }
+    let mut listed: Vec<&ToolNamespace> = servers.iter().collect();
+    listed.sort_by(|a, b| a.name.cmp(&b.name));
+    let heads: Vec<String> = listed
+        .iter()
+        .map(|server| format!("- {}", server.name))
+        .collect();
+    let omitted = |count: usize| -> Vec<String> {
+        match count {
+            0 => Vec::new(),
+            n => vec![format!("- …还有 {n} 台，用 search_tools() 找它们的工具")],
+        }
+    };
+    let size = |kept: usize| -> usize {
+        std::iter::once(SERVERS_INTRO.to_string())
+            .chain(heads[..kept].iter().cloned())
+            .chain(omitted(listed.len() - kept))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .chars()
+            .count()
+    };
+    let mut kept = listed.len();
+    while kept > 0 && size(kept) > MAX_SERVERS_SECTION_CHARS {
+        kept -= 1;
+    }
+    // 每条说明前还有一个「：」。
+    let per_server = match kept {
+        0 => 0,
+        _ => MAX_SERVER_DESCRIPTION_CHARS
+            .min((MAX_SERVERS_SECTION_CHARS.saturating_sub(size(kept)) / kept).saturating_sub(1)),
+    };
+    let mut lines = vec![SERVERS_INTRO.to_string()];
+    for (server, head) in listed.iter().zip(&heads).take(kept) {
+        let summary = truncate(&server.summary(), per_server);
+        lines.push(match summary.is_empty() {
+            true => head.clone(),
+            false => format!("{head}：{summary}"),
+        });
+    }
+    lines.extend(omitted(listed.len() - kept));
+    Some(lines.join("\n"))
+}
+
+/// 截到 `max` 个字，截了就以「…」结尾。
+fn truncate(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    if max <= 1 {
+        return String::new();
+    }
+    let head: String = text.chars().take(max - 1).collect();
+    format!("{}…", head.trim_end())
 }
 
 /// 主 Agent 的系统提示：身份 / 工作目录 / 行为约束 / komo 自查 / 项目规范 / §5.6 的

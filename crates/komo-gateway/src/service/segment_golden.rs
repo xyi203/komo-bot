@@ -108,6 +108,7 @@ async fn render(case: &Case) -> String {
         project_files: Vec::new(),
         workspace: std::path::PathBuf::from(CWD),
         tools: tool_names,
+        mcp_servers: Vec::new(),
         history: resolved,
         decayed: Default::default(),
         memory,

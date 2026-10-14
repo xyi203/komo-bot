@@ -66,7 +66,8 @@ use komo_kernel::types::status::{RunEnd, RunState, ToolCallState};
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskSpec};
 use komo_kernel::types::tool::{
-    CancelToken, ResumedCall, ToolContext, ToolError, ToolOutput, WorkspaceRoot,
+    CancelToken, ResumedCall, ToolContext, ToolError, ToolExposure, ToolNamespace, ToolOutput,
+    WorkspaceRoot,
 };
 use komo_kernel::types::turn::{AcceptInput, Accepted, ToolResultForModel};
 
@@ -135,9 +136,10 @@ pub struct CallEnv {
     pub source: PlanSource,
     /// **这次运行允许调用哪些工具**（§4 末）。
     ///
-    /// 与交给模型的 schema 是同一份：装配时由 schema 反推（`GatewaySegments::segment`），
+    /// 交给模型的 schema 是它的投影（只在 codemode 里调的工具在面里、不进 schema，`docs/mcp.md`
+    /// §3）：装配时出自同一份能力面（`GatewaySegments::segment`），
     /// 所以"模型看见的"与"执行器认的"不可能分家。执行器不回退到全局工具目录——模型自己
-    /// 拼出一个没露面的名字，得到的是"这次运行的工具集里没有它"。
+    /// 拼出一个能力面外的名字，得到的是"这次运行的工具集里没有它"。
     pub surface: AgentSurface,
     pub cwd: PathBuf,
     pub roots: Vec<WorkspaceRoot>,
@@ -347,14 +349,73 @@ impl ToolExecutor {
     ///
     /// 能力面里没有 `shell` 时，`edit` / `write` 的 `then_run` 参数一并摘掉：模型看不见
     /// 一个注定被拒的参数（执行侧 `begin` 照样拒，不靠这里）。
+    ///
+    /// 只列直接声明的那些：`exposure = codemode` 的 MCP 工具仍在能力面里（脚本调得到），
+    /// 但不进模型的 schema（`docs/mcp.md` §3）。隐藏 schema 不等于撤权。
     pub fn definitions_for(
         &self,
         surface: &AgentSurface,
+    ) -> Vec<komo_kernel::types::tool::ToolDefinition> {
+        self.surface_definitions(surface, false)
+    }
+
+    /// 能力面里全部工具的说明，包括只在 codemode 里调的那些：`tool://` 的挂载与脚本里的
+    /// 发现函数用它。
+    pub fn callable_definitions_for(
+        &self,
+        surface: &AgentSurface,
+    ) -> Vec<komo_kernel::types::tool::ToolDefinition> {
+        self.surface_definitions(surface, true)
+    }
+
+    /// 系统提示服务器段要列的那些工具组：能力面里有 `exposure = codemode` 的工具、而且这次
+    /// 真的调得到 codemode。codemode 不在时一组都不列——说了"在脚本里调"也调不到。
+    pub fn namespaces_for(&self, surface: &AgentSurface) -> Vec<ToolNamespace> {
+        if !self.can_run_codemode(surface) {
+            return Vec::new();
+        }
+        let mut namespaces: Vec<ToolNamespace> = Vec::new();
+        for name in surface.names() {
+            let Some(tool) = self.tools.get(name) else {
+                continue;
+            };
+            if tool.exposure() != ToolExposure::Codemode {
+                continue;
+            }
+            if let Some(namespace) = tool.namespace()
+                && !namespaces.iter().any(|known| known.name == namespace.name)
+            {
+                namespaces.push(namespace);
+            }
+        }
+        namespaces
+    }
+
+    /// 这次运行调得到 codemode：能力面里有它，这台 Gateway 也有沙箱。
+    fn can_run_codemode(&self, surface: &AgentSurface) -> bool {
+        self.codemode.is_some()
+            && surface.allows(crate::tools::codemode::CODEMODE_TOOL)
+            && self
+                .tools
+                .contains_key(crate::tools::codemode::CODEMODE_TOOL)
+    }
+
+    fn surface_definitions(
+        &self,
+        surface: &AgentSurface,
+        include_codemode_only: bool,
     ) -> Vec<komo_kernel::types::tool::ToolDefinition> {
         let commands = self.can_run_commands(surface);
         surface
             .names()
             .iter()
+            .filter(|name| {
+                include_codemode_only
+                    || self
+                        .tools
+                        .get(name.as_str())
+                        .is_none_or(|tool| tool.exposure() == ToolExposure::Direct)
+            })
             .filter_map(|name| match self.tools.get(name) {
                 Some(tool) => {
                     let mut definition = tool.definition();

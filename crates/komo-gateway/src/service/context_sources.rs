@@ -476,6 +476,7 @@ mod tests {
             project_files: Vec::new(),
             workspace: PathBuf::from("/work"),
             tools: Vec::new(),
+            mcp_servers: Vec::new(),
             history: resolved,
             decayed: Default::default(),
             memory: None,

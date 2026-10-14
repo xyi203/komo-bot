@@ -3,8 +3,10 @@
 //!
 //! 它不是第七个基础工具，而是操作者接进来的外部能力：副作用由服务器决定，komo 看不见。
 //! 所以计划是 [`Operation::McpCall`]，只读与否由操作者在配置里声明（`read_only`），不信
-//! 服务器自报的 `readOnlyHint`。只读的中断后可以重读（`SafeReread`），其余的停下来问人
-//! （`NoSafeRecovery`）。
+//! 服务器自报的 `readOnlyHint`。只读的中断后可以重读（`SafeReread`），其余的不重跑、中断
+//! 结果交给模型（`NoSafeRecovery`，§8.6）。
+//!
+//! 默认不声明给模型（`exposure = "codemode"`，`docs/mcp.md` §3）：只在 codemode 脚本里调。
 
 use std::sync::Arc;
 
@@ -13,7 +15,9 @@ use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode, Replay};
 use komo_kernel::types::refs::ToolResultStatus;
-use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
+use komo_kernel::types::tool::{
+    ToolContext, ToolDefinition, ToolError, ToolExposure, ToolNamespace, ToolOutput,
+};
 use rmcp::model::{CallToolResult, ContentBlock};
 
 use super::plan_time;
@@ -26,6 +30,7 @@ pub struct McpTool {
     remote: String,
     definition: ToolDefinition,
     read_only: bool,
+    exposure: ToolExposure,
 }
 
 impl McpTool {
@@ -35,6 +40,7 @@ impl McpTool {
         remote: &rmcp::model::Tool,
         name: String,
         read_only: bool,
+        exposure: ToolExposure,
     ) -> Self {
         let description = remote
             .description
@@ -51,6 +57,7 @@ impl McpTool {
             remote: remote.name.to_string(),
             definition,
             read_only,
+            exposure,
         }
     }
 }
@@ -61,13 +68,21 @@ impl Tool for McpTool {
         self.definition.clone()
     }
 
-    /// 服务器标了只读的工具重启后可以重跑；其余的说不清发生没有，不重跑（§8.6）。
+    /// 操作者声明为只读的工具重启后可以重跑；其余的说不清发生没有，不重跑（§8.6）。
     fn replay(&self) -> Replay {
         if self.read_only {
             Replay::Safe
         } else {
             Replay::Unsafe
         }
+    }
+
+    fn exposure(&self) -> ToolExposure {
+        self.exposure
+    }
+
+    fn namespace(&self) -> Option<ToolNamespace> {
+        Some(self.server.namespace().clone())
     }
 
     async fn prepare(

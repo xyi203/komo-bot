@@ -31,7 +31,7 @@ use komo_kernel::traits::{Clock, Ledger, LedgerError, ToolOutputStore};
 use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::model::ModelConfig;
-use komo_kernel::types::tool::ToolDefinition;
+use komo_kernel::types::tool::{ToolDefinition, ToolNamespace};
 use komo_runtime::agent::CompactionPlanner;
 use komo_runtime::config::ConfigHolder;
 use komo_store::PayloadStore;
@@ -47,6 +47,7 @@ pub(crate) struct ContextTemplate {
     pub project_files: Vec<ProjectFile>,
     pub workspace: PathBuf,
     pub tools: Vec<String>,
+    pub mcp_servers: Vec<ToolNamespace>,
     pub memory: Option<String>,
     pub skills: Option<String>,
     pub invocation: InvocationContext,
@@ -64,6 +65,7 @@ impl ContextTemplate {
             project_files: self.project_files,
             workspace: self.workspace,
             tools: self.tools,
+            mcp_servers: self.mcp_servers,
             history,
             decayed,
             memory: self.memory,

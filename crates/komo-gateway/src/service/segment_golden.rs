@@ -77,13 +77,12 @@ async fn render(case: &Case) -> String {
         None => ReplayScope::Conversation(&case.run),
     };
     let tool_names: Vec<String> = case.tools.iter().map(|tool| tool.name.clone()).collect();
-    // 子代理不看目录（§12）；主 Agent 才读一次活注册表。
+    // 子代理不看目录（§12）；主 Agent 的目录与受理时冻结的是同一个渲染函数。
     let skills = match (&delegate, &case.skills) {
-        (None, Some(dir)) => {
-            let registry =
-                std::sync::RwLock::new(SkillRegistry::new(vec![dir.path().to_path_buf()]));
-            context_sources::skill_catalog(Some(&registry), &tool_names)
-        }
+        (None, Some(dir)) => crate::service::state::skills_block(
+            &SkillRegistry::new(vec![dir.path().to_path_buf()]),
+            &tool_names,
+        ),
         _ => None,
     };
     let invocation = match &delegate {

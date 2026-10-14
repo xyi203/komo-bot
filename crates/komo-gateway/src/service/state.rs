@@ -705,7 +705,8 @@ impl GatewayState {
     /// 按**当前**快照重装 skill 注册表（§5.6）。
     ///
     /// 配置重载是唯一会动它的时刻：`paths.skill_dirs` 改了、人刚 `komo skills disable` 过，
-    /// 之后新的一段就该按新的来（注册表本身每次查询重扫目录，人改 `SKILL.md` 不必等重载）。
+    /// 之后受理的 Run 就该按新的来（注册表本身每次查询重扫目录，人改 `SKILL.md` 不必等重载）；
+    /// 已经受理的 Run 用它冻结的那份目录。
     /// 换完渲染出来还是同一段就不吭声——**注册表照换**，因为目录集合本身就是新的事实。
     pub fn refresh_skills_prompt(&self) {
         let snapshot = self.snapshot();
@@ -719,7 +720,9 @@ impl GatewayState {
             return;
         }
         tracing::info!(
-            skills = after.lines().count().saturating_sub(2),
+            skills = after
+                .as_deref()
+                .map_or(0, |block| block.lines().count().saturating_sub(2)),
             "系统提示里的 skills 目录行变了"
         );
     }
@@ -1056,6 +1059,14 @@ impl GatewayState {
         let project_files_ref =
             super::project_files::freeze(&payloads, &super::project_files::discover(&workspace))
                 .await?;
+        // skills 目录同一个理由，冻结的是**渲染好的正文**：续跑那一段的系统提示要与受理时
+        // 逐字相同（provider 的前缀缓存从系统提示起算），注册表之后被重载、`SKILL.md` 被改，
+        // 从下一条 Run 起生效。门控按这条 Run 的能力面。
+        let skills = skills_block(&self.skills.read().expect("skills 注册表"), surface.names());
+        let skills_ref = match skills {
+            Some(block) => Some(payloads.put(block.as_bytes()).await?),
+            None => None,
+        };
 
         Ok(RunSnapshot {
             agent_id: profile.id.clone(),
@@ -1065,6 +1076,7 @@ impl GatewayState {
             surface,
             instructions_ref,
             project_files_ref,
+            skills_ref,
             memory_scope: profile.memory_scope.clone(),
             projection: Some(config.execution.projection()),
             direct_command: None,
@@ -1514,19 +1526,18 @@ fn skills_registry(
     komo_agent::skills::SkillRegistry::from_snapshot(snapshot, home.as_deref())
 }
 
-/// 系统提示里那一块目录行（§5.6）：按**当前这套工具**从注册表现渲染。
+/// 系统提示里那一块目录行（§5.6）：按**这套工具**从注册表现渲染。`None` = 没有一条能
+/// 露面，或者没挂能读文件的工具。
 ///
-/// 现渲染而不是存一段文本：存的字符串是第二份事实，它和注册表会各走各的——而这一块本来
-/// 就是"这一刻有哪些 skill 能露面"的答案。
+/// 受理 Run 时渲染一次、冻结进 `RunSnapshot.skills_ref`（`GatewayState::freeze_run`），
+/// 之后这条 Run 的每一段都按那份正文装配；没有快照的兜底身份才每段现渲染。
 pub(crate) fn skills_block(
     registry: &komo_agent::skills::SkillRegistry,
     tool_names: &[String],
-) -> String {
-    registry
-        .prompt_block(&komo_agent::skills::OfferContext::here(
-            tool_names.iter().cloned(),
-        ))
-        .unwrap_or_default()
+) -> Option<String> {
+    registry.prompt_block(&komo_agent::skills::OfferContext::here(
+        tool_names.iter().cloned(),
+    ))
 }
 
 /// 按快照造模型后端；造不出来就退到 [`UnconfiguredLlm`]，**不让 Gateway 起不来**。

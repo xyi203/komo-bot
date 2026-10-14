@@ -353,6 +353,7 @@ impl SegmentSource for GatewaySegments {
             &payloads,
             context_sources::Fallback {
                 config: self.config.as_ref(),
+                skills: self.skills.as_deref(),
                 record: session_record.as_ref(),
                 workspaces: &self.workspaces,
             },
@@ -460,10 +461,11 @@ impl SegmentSource for GatewaySegments {
         let tool_names: Vec<String> = tools.iter().map(|tool| tool.name.clone()).collect();
 
         // §5.6 的 skills 目录只有主 Agent 有（§12：子代理不列目录，能力隔离靠上游，不靠
-        // 提示词）。
+        // 提示词）。用受理时冻结的那一份正文，不读活注册表：续跑那一段的系统提示要与受理时
+        // 逐字相同。
         let skills = match &delegate {
             Some(_) => None,
-            None => context_sources::skill_catalog(self.skills.as_deref(), &tool_names),
+            None => identity.skills.clone(),
         };
         // 项目规范（`AGENTS.md` 等）同样只给主 Agent：子代理的快照继承自父，里面那一份
         // 不能顺着带过去——子代理只看得见任务（§4），要规范就由父侧写进任务里。
@@ -512,9 +514,9 @@ impl SegmentSource for GatewaySegments {
 
         let agent_surface = identity.surface.clone();
 
-        // 资源命名空间的挂载点（§六）：skill 那一份是**这一次 Run 开始时**的活注册表快照
-        // （提示目录与 `skill://` 因此同一个来源；注册表之后被重载，这一条 Run 仍按它自己
-        // 的那一份，§3），会话根来自这一次的 Session，`tool://` 只读得到这次能力面。
+        // 资源命名空间的挂载点（§六）：skill 那一份是**这一段装配时**的活注册表（只决定
+        // `skill://` 按名字读得到哪个目录，不进提示；提示里的目录是受理时冻结的那份），会话根
+        // 来自这一次的 Session，`tool://` 只读得到这次能力面。
         let mounts = ResourceMounts {
             skill_dirs: self.skill_dirs(),
             skills: self

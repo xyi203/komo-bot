@@ -20,7 +20,6 @@ use async_trait::async_trait;
 use komo_agent::context::compaction::{CompactionSettings, Plan, PlanInput, plan};
 use komo_agent::context::history::{self, ReplayScope, ResolvedMessage};
 use komo_agent::context::{AgentContext, ContextInput, InvocationContext, assemble};
-use komo_agent::skills::SkillCatalog;
 use komo_kernel::compaction::{
     CompactionDecision, OnlineState, PROMPT_CACHE_TTL, Reshape, online_state,
 };
@@ -49,7 +48,7 @@ pub(crate) struct ContextTemplate {
     pub workspace: PathBuf,
     pub tools: Vec<String>,
     pub memory: Option<String>,
-    pub skills: Option<SkillCatalog>,
+    pub skills: Option<String>,
     pub invocation: InvocationContext,
     pub projection: ProjectionContext,
 }

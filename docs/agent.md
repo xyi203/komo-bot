@@ -301,8 +301,8 @@ pub struct ContextInput<'s> {
     /// 正文由 `context::memory::render` 渲染（§13），这里只是交给 assembler 放位置。
     pub memory: Option<String>,
 
-    /// 已按 OfferContext 门控的 skills 目录；只有主 Agent 有。
-    pub skills: Option<SkillCatalog>,
+    /// 渲染好的 skills 目录块（受理时冻结进 RunSnapshot.skills_ref 的那段正文）；只有主 Agent 有。
+    pub skills: Option<String>,
 
     pub invocation: InvocationContext,
 
@@ -465,7 +465,7 @@ komo-gateway/src/service/context_sources.rs
 Identity / identity_for / ambient_identity / frozen_snapshot / delegate_parent
 recall_for / recall_scopes
 message_text + 工具结果的 ToolOutputStore 读取（history 的 I/O 那一半，§8）
-skills 目录的读取（registry.offer(OfferContext) → SkillCatalog，§14）
+skills 目录的读取（冻结路径按 RunSnapshot.skills_ref 读回正文；兜底身份现读注册表，§14）
 ```
 
 留在 `segment.rs` 的（为执行取数的，不属于“模型看见什么”）：
@@ -681,21 +681,30 @@ Pinned Segment Context
 Memory
 ```
 
-目前已经有 segment pin 语义：同一个 `boundary` 内逐字复用注入段；进程内表丢了（重启），
-就从检查点里的 `MemoryUse` 重新核对、再渲染。
+目前已经有 segment pin 语义：同一个 `boundary` 内逐字复用注入段。钉住的那一块记在
+Session 日志里（`memory.injected`：渲染好的正文 + `uses`，超限外置到 `payloads/`），进程内表
+丢了（重启）就按日志里最新那一条复用——同样先逐条核对还能不能召回，有被遗忘的就重算并记
+一条新的。检查点里的 `MemoryUse` 帮不上这件事：生产路径上没有人写检查点事件，`recall_for`
+从那里读到的恒为空（2026-10-14 之前重启后正是因此按最后一句用户输入重新召回，整段系统
+提示换掉）。
 
 因此不要每一轮重新 recall 后偷偷改变历史 segment。
 
 这是现在设计里非常好的点，应继续保持。
 
-**现有的两个缺口**（本次记录下来，不在本次修）：
+**原来的两个缺口**都已补上：
 
-1. **Skills 目录块没有钉住。** `skills_block` 每一段都从**活注册表**现渲染。介入一小时后
-   才答复、期间 skills 被重载，续跑出来的系统提示就变了。`ResourceMounts` 的注释说
-   “skill 挂载是这一次 Run 开始时的快照”，但续跑也是一次新的 `segment()`，同样读活
-   注册表。要满足上面的 invariant，目录需要进 `RunSnapshot`，或者像记忆那样钉住。
-2. **记忆段对 `TurnRequest` 不可见。** 它由适配器的 `SystemPreamble` 在发送前追加，
-   `TurnRequest.system_prompt` 与实际发出去的不是同一个字符串（§13）。
+1. **Skills 目录块冻结进 `RunSnapshot`（2026-10-14）。** 原来每一段都从**活注册表**现渲染：
+   介入一小时后才答复、期间 skills 被重载，续跑出来的系统提示就变了，provider 的前缀缓存
+   从系统提示起整段作废。现在受理时渲染一次，正文进 `payloads/`（`skills_ref`，与
+   `project_files_ref` 同一个做法），这条 Run 的每一段都按它装配；注册表的变化从下一条 Run
+   起生效。没选"像记忆那样按段钉住"：目录是确定性渲染的，磁盘没变它就不变，按段钉住只
+   多换来"新装的 skill 要等 `/new` 才看得到"——home 会话一开几天，这个代价不值。
+   `ResourceMounts.skills`（`skill://` 的挂载）仍按每段的活注册表算：它只决定按名字读得到
+   哪个目录，不进提示。
+2. **记忆段对 `TurnRequest` 可见。** 原来由适配器的 `SystemPreamble` 在发送前追加；Phase 5
+   之后记忆段由 `assemble` 放进系统提示末尾，`TurnRequest.system_prompt` 就是实际发出去的
+   那一份（§13）。
 
 ---
 
@@ -972,7 +981,8 @@ Registry = discovery
 Assembler = presentation
 ```
 
-互相不要混。`SkillCatalog` 是值，以后要钉住（§9 缺口 1）时，它就是被钉住的那一份。
+互相不要混。`SkillCatalog` 是值；受理 Run 时 Gateway 把它渲染成正文冻结进
+`RunSnapshot.skills_ref`（§9 缺口 1），`ContextInput.skills` 拿到的是那段正文。
 
 具体改法：现在 `prompt_block` 内部是 `catalog_of(context)` + 拼根与目录行。拆成
 
@@ -1246,7 +1256,7 @@ Anthropic 的缓存按前缀逐字节匹配（tools → system → messages）�
 
 | 因素 | 在哪一层 | 现状 |
 |---|---|---|
-| 前缀是否逐字节稳定 | 上下文装配（本次收进 agent） | skills 目录每段现渲染（§9 缺口 1）；历史 Run 折叠成“用户原话 + 最终回复”，工具往返在下一个 Run 里消失，前缀从上一句用户消息之后就变了 |
+| 前缀是否逐字节稳定 | 上下文装配（本次收进 agent） | skills 目录受理时冻结（§9 缺口 1，2026-10-14 已补）；历史 Run 折叠成“用户原话 + 最终回复”，工具往返在下一个 Run 里消失，前缀从上一句用户消息之后就变了 |
 | 断点位置与 TTL | 适配器（`anthropic.rs`） | system、最后一个工具、最后一条 user 各一个断点，默认 5 分钟 TTL；等人（介入）后续跑时前缀多半已过期 |
 | 记忆段位置 | Phase 5 后在 assembler | 系统提示末尾、同段逐字复用——已经是对的 |
 | 能否观测命中率 | `TokenUsage` | 没有 `cache_read` / `cache_creation` 字段，量不出来 |
@@ -1698,7 +1708,7 @@ peer/channel → agent routing
 两件事混在一次改动里，会大幅增加回归面。
 
 §9 的两个缺口（skills 目录钉住、记忆段对 `TurnRequest` 可见）也不在收口的 Phase 1–4 里。
-后者由 Phase 5 解决；前者是行为变化，单独做。
+后者由 Phase 5 解决；前者是行为变化，单独做（2026-10-14，目录冻结进 `RunSnapshot.skills_ref`）。
 
 Claude 提示缓存（§19.1），按这个顺序，每一步都等上一步的数据：
 
@@ -1707,7 +1717,8 @@ Claude 提示缓存（§19.1），按这个顺序，每一步都等上一步的�
 2. system 与 tools 的断点加 1 小时 TTL：对应“等人答复后再续跑”；写缓存更贵，用第 1 步的数据权衡
 3. assemble 按模型选择历史策略：对 Claude 保留历史 Run 的完整协议（含 provider_blocks），
    前缀一直稳定，代价是上下文更长；其他模型维持现在的折叠
-4. skills 目录进 RunSnapshot 或像记忆那样按段钉住（同时补上 §9 缺口 1）
+4. skills 目录进 RunSnapshot 或像记忆那样按段钉住（同时补上 §9 缺口 1）——已做（2026-10-14）：
+   进 RunSnapshot，理由见 §9
 ```
 
 ---

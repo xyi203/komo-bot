@@ -41,7 +41,7 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
         &tools,
         &InvocationContext::Main,
         &[],
-        Some(&catalog),
+        catalog.prompt_block().as_deref(),
     );
     assert!(
         prompt.ends_with(&catalog.prompt_block().expect("有目录行")),
@@ -154,7 +154,7 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
         &tools,
         &InvocationContext::Main,
         &[],
-        Some(&catalog),
+        catalog.prompt_block().as_deref(),
     );
     assert!(prompt.contains("komo 自己的状态"), "{prompt}");
     assert!(prompt.contains("`komo <子命令>`"), "{prompt}");
@@ -169,7 +169,7 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
             &tools,
             &InvocationContext::Main,
             &[],
-            Some(&catalog),
+            catalog.prompt_block().as_deref(),
         ),
         "同一份输入逐字相同（提示前缀缓存）"
     );
@@ -291,7 +291,7 @@ fn the_main_prompt_puts_project_files_between_the_komo_section_and_skills() {
         &tools,
         &InvocationContext::Main,
         &files,
-        Some(&catalog),
+        catalog.prompt_block().as_deref(),
     );
     let own = prompt.find("komo 自己的状态").unwrap();
     let outer = prompt

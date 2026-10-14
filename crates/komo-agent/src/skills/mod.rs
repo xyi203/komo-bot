@@ -38,9 +38,9 @@ enum Shape {
 /// 一次目录渲染：谁在里面、用哪种形状、因为装不下少了几个、出了条目的那些根。
 ///
 /// 这是 `docs/agent.md` §14 的那份**值**：`SkillRegistry::offer` 现读现渲染出来
-/// （discovery），`ContextInput.skills` 拿到手上之后只剩 [`Self::prompt_block`] 这一步
-/// 纯渲染（presentation）——两件事不再混在一起，以后要把目录钉住（§9 缺口 1）时，钉的
-/// 就是这一份值。
+/// （discovery），[`Self::prompt_block`] 是纯渲染（presentation）。受理一条 Run 时 Gateway
+/// 做完这两步，把渲染好的正文冻结进 `RunSnapshot.skills_ref`；`ContextInput.skills` 拿到的
+/// 就是那段正文。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillCatalog {
     skills: Vec<Skill>,

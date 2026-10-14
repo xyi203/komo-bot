@@ -10,7 +10,7 @@ use std::path::Path;
 use komo_kernel::types::agent::ProjectFile;
 use komo_kernel::types::delegate::DelegateSpec;
 
-use super::{InvocationContext, SkillCatalog};
+use super::InvocationContext;
 use crate::surface::UPDATE_PLAN_TOOL;
 
 /// 提示里每条 Run 都说的那几句行为约束。
@@ -62,7 +62,7 @@ pub(crate) fn build(
     tools: &[String],
     invocation: &InvocationContext,
     project_files: &[ProjectFile],
-    skills: Option<&SkillCatalog>,
+    skills: Option<&str>,
 ) -> String {
     let rules = rules(tools);
     match invocation {
@@ -80,7 +80,7 @@ fn main_prompt(
     workspace: &Path,
     rules: &str,
     project_files: &[ProjectFile],
-    skills: Option<&SkillCatalog>,
+    skills: Option<&str>,
     has_shell: bool,
 ) -> String {
     let mut prompt = format!(
@@ -97,9 +97,9 @@ fn main_prompt(
         prompt.push_str("\n\n");
         prompt.push_str(&block);
     }
-    if let Some(block) = skills.and_then(SkillCatalog::prompt_block) {
+    if let Some(block) = skills {
         prompt.push_str("\n\n");
-        prompt.push_str(&block);
+        prompt.push_str(block);
     }
     prompt
 }

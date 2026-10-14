@@ -9,7 +9,6 @@
 //! - [`recall_for`] / [`recall_scopes`]（记忆召回，§9.2、§9.4）
 //! - [`message_text`] / [`resolve_history`]（history 的 I/O 那一半：外置正文、
 //!   `output.json`，§8.3）
-//! - [`skill_catalog`]（skills 目录的读取：注册表 → `SkillCatalog`，§14）
 //!
 //! 留在 `segment.rs` 的是"为执行取数"的那一半：`resumed` / `call_request`
 //! （续跑位置）、`run_roots` / `ResourceMounts`（`CallEnv` 的根与
@@ -22,7 +21,7 @@ use std::sync::{Arc, RwLock};
 use komo_agent::context::history::{
     Entry, EntryKind, ResolvedMessage, StoredOutput, latest_user_text,
 };
-use komo_agent::skills::{OfferContext, SkillCatalog, SkillRegistry};
+use komo_agent::skills::SkillRegistry;
 use komo_kernel::events::{Event, EventPayload, MemoryInjected};
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::projection::ProjectionContext;
@@ -58,6 +57,9 @@ pub(crate) struct Identity {
     /// 项目规范文件（`AGENTS.md` 等），外层在前。冻结路径按引用读回；兜底路径受理时
     /// 没找过，现场找一遍（见 [`ambient_identity`]）。
     pub project_files: Vec<ProjectFile>,
+    /// 渲染好的 skills 目录块。冻结路径按引用读回受理时那一份；兜底路径现场从注册表渲染。
+    /// 子代理不看目录，由调用方丢掉（§12）。
+    pub skills: Option<String>,
     /// 记忆作用域（§9.2）。
     pub memory_scope: Option<MemoryScope>,
     /// 冻结的投影设置；`None` = 没有快照或快照早于这一格，调用方按当前配置。
@@ -69,6 +71,8 @@ pub(crate) struct Identity {
 /// 没有冻结快照时兜底身份要用到的那几样：当前配置、会话 workdir、`workspaces/`（§7）。
 pub(crate) struct Fallback<'a> {
     pub config: Option<&'a Arc<ConfigHolder>>,
+    /// skills 注册表；`None` = 没接（精简装配、关掉 skills 的部署）。
+    pub skills: Option<&'a RwLock<SkillRegistry>>,
     pub record: Option<&'a komo_store::repos::session::SessionRecord>,
     pub workspaces: &'a Path,
 }
@@ -116,6 +120,17 @@ pub(crate) async fn identity_for(
         Some(reference) => super::project_files::thaw(payloads, reference).await?,
         None => Vec::new(),
     };
+    // skills 目录也一样：按引用读回受理时那段正文，不读活注册表（续跑的系统提示要与受理时
+    // 逐字相同）。
+    let skills = match &frozen.skills_ref {
+        Some(reference) => {
+            let bytes = payloads.open(reference).await.map_err(store_to_ledger)?;
+            Some(String::from_utf8(bytes).map_err(|error| {
+                LedgerError::Corrupt(format!("冻结的 skills 目录不是 UTF-8：{error}"))
+            })?)
+        }
+        None => None,
+    };
     Ok(Identity {
         agent_id: frozen.agent_id,
         model: Some(frozen.model),
@@ -125,6 +140,7 @@ pub(crate) async fn identity_for(
         workspace: paths::real_root(&frozen.workspace),
         instructions,
         project_files,
+        skills,
         memory_scope: frozen.memory_scope,
         projection: frozen.projection,
         direct_command: frozen.direct_command,
@@ -164,6 +180,10 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         .or_else(|| profile.and_then(|profile| profile.workspace.clone()))
         .unwrap_or_else(|| fallback.workspaces.to_path_buf());
     let workspace = paths::real_root(&workspace);
+    // 没有快照就没有冻结的目录：与指令、项目规范同一个口径，按现在的注册表渲染。
+    let skills = fallback.skills.and_then(|registry| {
+        super::state::skills_block(&registry.read().expect("skills 注册表"), surface.names())
+    });
     Identity {
         agent_id: profile
             .map(|profile| profile.id.clone())
@@ -173,6 +193,7 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         surface,
         // 与指令读当前配置同一个口径：没有快照就按现在的磁盘。
         project_files: super::project_files::discover(&workspace),
+        skills,
         workspace,
         instructions: profile.and_then(|profile| profile.instructions.clone()),
         memory_scope: profile.and_then(|profile| profile.memory_scope.clone()),
@@ -309,18 +330,6 @@ async fn recorded_injection(payloads: &PayloadStore, surface: &Surface) -> Optio
         text,
         uses: recorded.uses.clone(),
     })
-}
-
-/// 这一次装配的 skills 目录（§14）：读一次**活注册表**，按门控算出这一份值。
-///
-/// `None` = 没接注册表（精简装配、`skills` 关掉的部署，或者这是子代理——子代理不看目录，
-/// 判据在调用方，§12）。
-pub(crate) fn skill_catalog(
-    skills: Option<&RwLock<SkillRegistry>>,
-    tool_names: &[String],
-) -> Option<SkillCatalog> {
-    let registry = skills?.read().expect("skills 注册表");
-    Some(registry.offer(&OfferContext::here(tool_names.iter().cloned())))
 }
 
 /// 一条消息的正文：内联的那份优先，没有就按引用读回来（§8.3）。
@@ -647,6 +656,7 @@ mod tests {
             &payloads,
             Fallback {
                 config: Some(&holder),
+                skills: None,
                 record: Some(&session_record),
                 workspaces: &workspaces,
             },

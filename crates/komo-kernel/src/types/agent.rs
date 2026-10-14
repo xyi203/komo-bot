@@ -116,6 +116,12 @@ pub struct RunSnapshot {
     /// 目录往上一个都没找到，或者这一格出现之前受理的 Run。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_files_ref: Option<PayloadRef>,
+    /// 系统提示里那块 skills 目录（渲染好的正文）的引用（`payloads/`）。冻结的是**文本**：
+    /// 续跑那一段要与受理时逐字相同，不然 provider 的前缀缓存从系统提示起整段作废；注册表
+    /// 之后被重载，从下一条 Run 起生效。`None` = 没有目录（没有 skill 露面、没挂能读文件的
+    /// 工具），或者这一格出现之前受理的 Run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills_ref: Option<PayloadRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_scope: Option<MemoryScope>,
     /// 工具结果怎么投影给模型（`[execution]` 的预算与衰减，§8.3）。冻结在这里，刚跑完与
@@ -234,8 +240,8 @@ mod tests {
         assert_ne!(profile.revision(), before, "改了指令就是另一版");
     }
 
-    /// `project_files_ref` 是后加的一格：没有时不落键（这一格出现之前的快照 JSON 不变），
-    /// 没有这个键的旧快照读得回来、这一格是 `None`。
+    /// `project_files_ref` / `skills_ref` 是后加的格：没有时不落键（这些格出现之前的快照
+    /// JSON 不变），没有这些键的旧快照读得回来、这些格是 `None`。
     #[test]
     fn a_snapshot_without_project_files_keeps_its_old_shape() {
         let snapshot = RunSnapshot {
@@ -246,12 +252,14 @@ mod tests {
             surface: AgentSurface::new(["read"]),
             instructions_ref: None,
             project_files_ref: None,
+            skills_ref: None,
             memory_scope: None,
             projection: None,
             direct_command: None,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert!(json.get("project_files_ref").is_none(), "{json}");
+        assert!(json.get("skills_ref").is_none(), "{json}");
         let back: RunSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(back, snapshot);
     }

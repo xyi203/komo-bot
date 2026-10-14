@@ -26,8 +26,6 @@ pub use history::{
     StoredOutput, entries, latest_user_text,
 };
 
-use crate::skills::SkillCatalog;
-
 /// 一次装配所需的**全部事实**（`docs/agent.md` §5）。
 ///
 /// 身份里的模型、能力面、记忆作用域不进来：它们决定的是 `TurnRequest.model`、tool
@@ -49,8 +47,11 @@ pub struct ContextInput<'s> {
     /// 这一段钉住的记忆注入段；`None` = 不注入（子代理、记忆关闭、没召回到）。
     /// 正文由 [`memory::render`] 渲染、由 `MemoryManager` 按段钉住，这里只决定它放在哪。
     pub memory: Option<String>,
-    /// 已按 `OfferContext` 门控的 skills 目录；只有主 Agent 有。
-    pub skills: Option<SkillCatalog>,
+    /// 渲染好的 skills 目录块（[`SkillCatalog::prompt_block`]）；只有主 Agent 有。是文本
+    /// 而不是目录值：这条 Run 受理时冻结下来的就是这段正文，续跑按它逐字装配。
+    ///
+    /// [`SkillCatalog::prompt_block`]: crate::skills::SkillCatalog::prompt_block
+    pub skills: Option<String>,
     pub invocation: InvocationContext,
     /// 工具结果的投影设置（这条 Run 冻结的那一份）。
     /// 与 `CallEnv` 用同一个值，否则"刚跑完"和"回放"渲染出来不一样。
@@ -93,7 +94,7 @@ pub fn assemble(input: ContextInput<'_>) -> AgentContext {
         &input.tools,
         &input.invocation,
         &input.project_files,
-        input.skills.as_ref(),
+        input.skills.as_deref(),
     );
     prompt = with_instructions(input.instructions.as_deref(), prompt);
     if let Some(memory) = &input.memory {

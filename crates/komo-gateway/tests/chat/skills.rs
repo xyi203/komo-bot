@@ -6,15 +6,18 @@
 //!
 //! 1. 适用本平台 / 这套工具的 skill 在提示里，不适用的不在；
 //! 2. 被 `disable` 的不在（一个都不在时提示里**一个字都不多**）；
-//! 3. 配置重载会按新快照重算（目录行是启动快照，重载是唯一会动它的时刻）。
+//! 3. 配置重载之后的下一条 Run 按新快照重算；
+//! 4. 一条 Run 用的是**受理时冻结**的那份目录：续跑那一段与第一段逐字相同，注册表的变化
+//!    从下一条 Run 起生效。
 
 use std::path::Path;
 use std::sync::Arc;
 
 use komo_kernel::traits::LlmClient;
 use komo_kernel::types::ids::SessionId;
+use komo_kernel::types::turn::LlmError;
 
-use crate::harness::{FakeLlm, Gw, Home, config_toml, telegram_block};
+use crate::harness::{FakeLlm, Gw, Home, config_toml, telegram_block, text_round};
 
 /// 一个 `<root>/<name>/SKILL.md`。
 fn write_skill(root: &Path, name: &str, front: &str, body: &str) {
@@ -139,7 +142,7 @@ async fn a_reload_picks_up_a_skill_written_after_startup() {
     let before = prompt_of(&gw, &llm, &session, "在吗", "skills-1").await;
     assert!(!before.contains("Skills"), "{before}");
 
-    // 人放了一个 skill 进去，然后重载：目录行是启动快照，重载是唯一会动它的时刻。
+    // 人放了一个 skill 进去，然后重载：下一条 Run 受理时按新的注册表冻结目录。
     write_skill(
         skills.path(),
         "pr-review",
@@ -152,4 +155,54 @@ async fn a_reload_picks_up_a_skill_written_after_startup() {
 
     let after = prompt_of(&gw, &llm, &session, "现在呢", "skills-2").await;
     assert!(after.contains("- pr-review：怎么审一个 PR"), "{after}");
+}
+
+/// 目录冻结在 `run.accepted` 里：Run 停在退避上时有人加了 skill 并重载，续跑那一段的系统
+/// 提示仍与第一段逐字相同——否则 provider 的前缀缓存从系统提示起整段作废，一条跑了几十轮
+/// 的 Run 一次就丢掉十几万 token 的缓存。新 skill 从下一条 Run 起出现。
+#[tokio::test]
+async fn a_resumed_segment_keeps_the_skills_catalog_it_was_accepted_with() {
+    let skills = tempfile::tempdir().expect("临时 skills 目录");
+    write_skill(
+        skills.path(),
+        "pr-review",
+        "name: pr-review\ndescription: 怎么审一个 PR\n",
+        "第一步……\n",
+    );
+
+    let home = Home::with_config(&config_with_skills(&[skills.path()]));
+    // 第一段的回复没收齐（让出名额等退避），第二段才答完。
+    let llm = FakeLlm::new(vec![
+        vec![Err(LlmError::Incomplete)],
+        vec![text_round(1, "看过了。")],
+    ]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gw.open_session().await;
+
+    let run = gw.submit(&session, "skills-1", "审一下这个 PR").await.run;
+    gw.wait_waiting(&run).await;
+    write_skill(
+        skills.path(),
+        "log-diagnosis",
+        "name: log-diagnosis\ndescription: 查日志\n",
+        "……\n",
+    );
+    komo_gateway::reload::reload(gw.state())
+        .await
+        .expect("新配置装得上");
+    gw.wait_terminal(&run).await;
+
+    let (first, resumed) = {
+        let requests = llm.requests.lock().expect("脚本模型");
+        assert_eq!(requests.len(), 2, "退避到期之后再请求一次：{requests:?}");
+        (
+            requests[0].system_prompt.clone(),
+            requests[1].system_prompt.clone(),
+        )
+    };
+    assert!(first.contains("- pr-review：怎么审一个 PR"), "{first}");
+    assert_eq!(resumed, first, "续跑那一段的系统提示要与受理时逐字相同");
+
+    let next = prompt_of(&gw, &llm, &session, "再看看", "skills-2").await;
+    assert!(next.contains("- log-diagnosis：查日志"), "{next}");
 }

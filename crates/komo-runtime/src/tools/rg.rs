@@ -26,7 +26,7 @@
 //! 就拒）。
 
 use std::cell::RefCell;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -76,7 +76,11 @@ const PREVIEW_ERROR_LINES: usize = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RgArgs {
+    #[serde(default)]
     pub pattern: String,
+    /// 只列文件路径（等价于 `rg --files`），不搜索文件内容；此时不传 pattern。
+    #[serde(default)]
+    pub list_files: bool,
     /// 要搜的目录或文件；缺省是会话工作目录。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -93,6 +97,8 @@ pub struct RgArgs {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RgResult {
     pub pattern: String,
+    #[serde(default)]
+    pub list_files: bool,
     /// 搜了哪儿：本地路径是解析后的真实路径，资源入口是**逻辑入口**（`skill://`）。
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -154,19 +160,19 @@ impl Tool for RgTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "rg".into(),
-            description: "在文件里搜正则（ripgrep），返回「路径:行号:正文」。搜代码和文字用它，\
-                 不要用 shell 里的 grep / find / ls 拼搜索。"
+            description: "搜索文件正文返回「路径:行号:正文」；list_files=true 时列出文件路径（类似 rg --files）。\
+                 搜代码、文字和列文件用它，不要用 shell 里的 rg / grep / find / ls 拼搜索。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "pattern": { "type": "string", "description": "ripgrep 语法的正则（Rust regex）；搜字面量时把 fixed_strings 打开" },
+                    "pattern": { "type": "string", "description": "搜正文时必填；ripgrep 语法的正则（Rust regex）；搜字面量时把 fixed_strings 打开；list_files=true 时不要传" },
+                    "list_files": { "type": "boolean", "description": "只列文件路径（类似 rg --files），缺省 false；为 true 时不要传 pattern" },
                     "path": { "type": "string", "description": "要搜的目录或文件，缺省是工作目录；也可以是资源入口：`skill://`（搜全部 skill 根）、`artifact://files`（本次会话的产物目录）" },
                     "glob": { "type": "string", "description": "只搜匹配这个 glob 的文件，例如 '*.rs' 或 '!target/**'" },
                     "ignore_case": { "type": "boolean", "description": "忽略大小写；缺省区分大小写" },
                     "fixed_strings": { "type": "boolean", "description": "把 pattern 当字面量，不解释正则元字符" }
                 },
-                "required": ["pattern"],
                 "additionalProperties": false
             }),
         }
@@ -178,15 +184,22 @@ impl Tool for RgTool {
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
         let args: RgArgs = parse_args(args, "rg")?;
-        if args.pattern.is_empty() {
+        if args.list_files && !args.pattern.is_empty() {
             return Err(ToolError::InvalidArguments {
-                message: "pattern 不能是空串".into(),
+                message: "list_files=true 时不能传 pattern".into(),
+            });
+        }
+        if !args.list_files && args.pattern.is_empty() {
+            return Err(ToolError::InvalidArguments {
+                message: "搜正文时 pattern 不能是空串".into(),
             });
         }
         // 正则在这里编一次：**它是参数，不是运行结果**。语法错的模式先撞在这里，模型当场
         // 改一个字重发，而不是先建计划、再拿回一条失败。（glob 不在这里验：gitignore
         // 那套 glob 是宽松的，写歪了多半只是"什么都没匹配上"，那不是错误。）
-        matcher(&args).map_err(|message| ToolError::InvalidArguments { message })?;
+        if !args.list_files {
+            matcher(&args).map_err(|message| ToolError::InvalidArguments { message })?;
+        }
         let targets = match &args.path {
             Some(raw) => targets_of(raw, ctx)?,
             // 缺省是这次的工作目录（它一定在）。
@@ -235,7 +248,11 @@ impl Tool for RgTool {
             Some(uri) => uri.to_string(),
             None => targets[0].display().to_string(),
         };
-        let matcher = matcher(&args).map_err(|message| ToolError::Failed { message })?;
+        let matcher = if args.list_files {
+            None
+        } else {
+            Some(matcher(&args).map_err(|message| ToolError::Failed { message })?)
+        };
         // 已经取消的调用不该再走树：搜索本身很快就会发现停止标志，但那也要等一个文件。
         if ctx.cancel.is_cancelled() {
             return Err(ToolError::Cancelled);
@@ -336,6 +353,7 @@ impl Tool for RgTool {
 
         let result = RgResult {
             pattern: args.pattern,
+            list_files: args.list_files,
             path: scope,
             glob: args.glob,
             matched: walked.matched,
@@ -354,7 +372,11 @@ impl Tool for RgTool {
         };
         let mut preview = format!(
             "rg {}{} · {} · {}{}{} · 已写下 {}B{}\n",
-            result.pattern,
+            if result.list_files {
+                "--files"
+            } else {
+                &result.pattern
+            },
             match &result.glob {
                 Some(glob) => format!(" --glob {glob}"),
                 None => String::new(),
@@ -553,7 +575,7 @@ impl Drop for StopOnDrop {
 
 /// 阻塞线程上要的全部东西。
 struct SearchJob {
-    matcher: RegexMatcher,
+    matcher: Option<RegexMatcher>,
     /// 这次要搜的全部真实目标：本地路径一条，`skill://` 那种根是每个根一条。
     targets: Vec<PathBuf>,
     cwd: PathBuf,
@@ -625,11 +647,17 @@ fn search(job: &SearchJob, tx: &mpsc::Sender<Chunk>) -> SearchOutcome {
 
     let mut search_one = |path: &Path, outcome: &mut SearchOutcome| {
         let display = display_path(path, &job.cwd);
-        let result = searcher.search_path(
-            &job.matcher,
-            path,
-            printer.sink_with_path(&job.matcher, &display),
-        );
+        let result = if let Some(matcher) = &job.matcher {
+            searcher.search_path(matcher, path, printer.sink_with_path(matcher, &display))
+        } else {
+            // 用同一份有背压的 writer 写路径；超时/取消/输出上限仍由调用方处理。
+            let mut writer = writer.borrow_mut();
+            let result = writeln!(writer, "{}", display.display());
+            if result.is_ok() {
+                outcome.matched = true;
+            }
+            result
+        };
         // 停下的时候（取消 / 超时 / 输出满）写入器会拒绝写入，那不是"这个文件坏了"。
         if let Err(error) = result
             && !job.stopped()
@@ -686,7 +714,7 @@ fn search(job: &SearchJob, tx: &mpsc::Sender<Chunk>) -> SearchOutcome {
     }
     // 收尾：把最后那半块送出去。打印器自己不会 flush，漏掉这一步就是**静静丢数据**。
     let _ = io::Write::flush(&mut *writer.borrow_mut());
-    outcome.matched = printer.has_written();
+    outcome.matched |= printer.has_written();
     outcome
 }
 
@@ -741,6 +769,73 @@ mod tests {
         let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
         let preview = preview(&output);
         (output, preview)
+    }
+
+    #[tokio::test]
+    async fn list_files_respects_glob_and_uses_a_read_plan() {
+        let dir = workspace();
+        std::fs::write(dir.path().join(".hidden.rs"), "hidden").unwrap();
+        let ctx = context(dir.path());
+        let tool = RgTool::new();
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "list_files": true, "glob": "*.rs" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.operation, Operation::ReadFile);
+        assert_eq!(plan.targets[0].access, TargetAccess::Read);
+        let mut sink = writer(&ctx);
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert_eq!(output.status, ToolResultStatus::Completed);
+        assert!(rg_result(&output).list_files);
+        assert!(rg_result(&output).matched);
+        assert!(
+            preview(&output).ends_with("b.rs\nsub/c.rs\n"),
+            "{}",
+            preview(&output)
+        );
+    }
+
+    #[tokio::test]
+    async fn list_files_single_file_and_empty_directory() {
+        let dir = workspace();
+        let (output, printed) = run(
+            &RgTool::new(),
+            dir.path(),
+            serde_json::json!({ "list_files": true, "path": "a.txt" }),
+        )
+        .await;
+        assert!(rg_result(&output).matched);
+        assert!(printed.ends_with("a.txt\n"), "{printed}");
+        let empty = tempfile::tempdir().unwrap();
+        let (output, printed) = run(
+            &RgTool::new(),
+            empty.path(),
+            serde_json::json!({ "list_files": true }),
+        )
+        .await;
+        assert!(!rg_result(&output).matched);
+        assert!(printed.contains("无匹配"), "{printed}");
+    }
+
+    #[tokio::test]
+    async fn list_files_rejects_pattern_and_search_requires_one() {
+        let dir = workspace();
+        let ctx = context(dir.path());
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({ "list_files": true, "pattern": "foo" }),
+        ] {
+            assert!(matches!(
+                RgTool::new().prepare(args, &ctx).await,
+                Err(ToolError::InvalidArguments { .. })
+            ));
+        }
+        let definition = RgTool::new().definition();
+        assert!(definition.description.contains("rg --files"));
+        assert!(definition.parameters["properties"]["list_files"].is_object());
     }
 
     #[tokio::test]

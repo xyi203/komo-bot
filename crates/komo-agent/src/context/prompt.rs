@@ -24,7 +24,7 @@ fn rules(tools: &[String]) -> String {
     let has = |name: &str| tools.iter().any(|tool| tool == name);
     let mut lines = Vec::new();
     if has(RG_TOOL) {
-        lines.push("- 找代码和文字用 rg，别用 shell 拼 grep / find / ls。");
+        lines.push("- 找代码、文字和列文件用 rg（列文件设 list_files=true），别用 shell 拼 rg / grep / find / ls。");
     }
     // 2026-10 的统计：364 次 shell 里 126 次是 cat / head / ls 这类纯只读命令。
     if has(READ_TOOL) && has(SHELL_TOOL) {

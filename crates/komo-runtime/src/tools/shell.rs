@@ -244,7 +244,8 @@ impl Tool for ShellTool {
             name: "shell".into(),
             description:
                 "在自己的进程组里跑一条 shell 命令，返回退出码与输出。git、构建、测试、跑程序走它；\
-                 只是看文件、搜代码用 read / rg，要读要搜好几处用 codemode。\
+                 只是看文件、搜代码、列文件用 read / rg（列文件设 list_files=true），\
+                 要读要搜好几处用 codemode。\
                  等一件慢事（下载、构建、部署）就在一条命令里循环轮询、每轮打印一行进度，并把 \
                  timeout_secs 给够；到点会终止进程组，到点前打印的输出照样交回，接着再发一条即可。\
                  不要每轮只 sleep 一下就交回来再问一次。"
@@ -399,6 +400,15 @@ mod tests {
     use crate::tools::process::process_group_alive;
     use crate::tools::test_support::{context, context_with_cancel, writer};
     use komo_kernel::types::tool::CancelToken;
+
+    /// 列文件也指到 rg 的 list_files，不在 shell 里跑 ls / find。
+    #[test]
+    fn shell_description_routes_file_listing_to_rg() {
+        use komo_kernel::traits::Tool;
+        let description = ShellTool::new().definition().description;
+        assert!(description.contains("列文件用 read / rg"), "{description}");
+        assert!(description.contains("list_files=true"), "{description}");
+    }
 
     fn shell_result(output: &ToolOutput) -> ShellResult {
         serde_json::from_value(output.result.clone()).expect("shell 的结果")

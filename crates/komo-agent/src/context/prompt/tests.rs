@@ -60,7 +60,7 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
     assert_eq!(bare.lines().count(), 4, "{bare}");
 }
 
-/// 「搜代码用 rg，别用 shell 拼 grep / find / ls」是**两条提示共用**的一句
+/// 「搜代码、列文件用 rg，别用 shell 拼 rg / grep / find / ls」是**两条提示共用**的一句
 /// （[`rules`]）：子代理也要照它做，所以它不能只写在主对话那一份里；没挂 `rg` 时两边都不说。
 #[test]
 fn both_prompts_tell_the_model_to_search_with_rg() {
@@ -72,7 +72,8 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
         &[],
         None,
     );
-    assert!(main.contains("别用 shell 拼 grep"), "{main}");
+    assert!(main.contains("别用 shell 拼 rg / grep"), "{main}");
+    assert!(main.contains("list_files=true"), "{main}");
     let without_rg = build(
         Path::new("/tmp/w"),
         &["read".to_string()],
@@ -94,7 +95,7 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
         &[],
         None,
     );
-    assert!(sub.contains("别用 shell 拼 grep"), "{sub}");
+    assert!(sub.contains("别用 shell 拼 rg / grep"), "{sub}");
 }
 
 /// 挂了 `update_plan` 才提计划，主对话与子代理一样；提的时候说清短任务不登记、更新

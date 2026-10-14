@@ -94,7 +94,7 @@ impl OnlineState {
                     .progress
                     .as_ref()
                     .map(|progress| summary(step, progress, &update.steps));
-                self.record_boundary(&update.steps, progress);
+                self.record_boundary(&update.steps, progress, transition.completed.len());
             }
             None => self.plan = update.steps.clone(),
         }
@@ -102,14 +102,25 @@ impl OnlineState {
     }
 
     /// 一个计划边界：记下这一步花了几次请求。
-    pub fn record_boundary(&mut self, plan: &[PlanStep], progress: Option<ProgressSummary>) {
+    ///
+    /// 一次更新同时完成了 `completed` 步时，这段请求平摊给它们：整段记成一步的样本，会把
+    /// 每步的均值放大 `completed` 倍，剩余请求跟着高估，压缩就在快收尾时被判成划算。
+    pub fn record_boundary(
+        &mut self,
+        plan: &[PlanStep],
+        progress: Option<ProgressSummary>,
+        completed: usize,
+    ) {
         let interval = self
             .request_count
             .saturating_sub(self.last_boundary_request_count);
         self.plan = plan.to_vec();
         self.pending_progress.extend(progress);
         self.last_boundary_request_count = self.request_count;
-        self.completed_boundary_request_counts.push(interval);
+        let steps = completed.max(1) as u64;
+        let (share, extra) = (interval / steps, interval % steps);
+        self.completed_boundary_request_counts
+            .extend((0..steps).map(|index| share + u64::from(index < extra)));
         self.pending_boundary = true;
         self.compaction_refused = false;
     }
@@ -438,6 +449,47 @@ mod tests {
         assert!(state.pending_boundary);
         assert_eq!(state.compaction_count, 0);
         assert_eq!(state.requests_since_last_compaction(), None);
+    }
+
+    #[test]
+    fn one_update_completing_several_steps_splits_the_interval_between_them() {
+        use PlanStatus::*;
+        let mut events = vec![
+            assistant(1, RUN, Some(10_000)),
+            update_plan(
+                2,
+                "c1",
+                vec![
+                    step("a", InProgress),
+                    step("b", Pending),
+                    step("c", Pending),
+                    step("d", Pending),
+                ],
+            ),
+            done(3, "c1"),
+        ];
+        for seq in 4..26 {
+            events.push(assistant(seq, RUN, Some(10_000 + seq * 1_000)));
+        }
+        events.push(update_plan(
+            26,
+            "c2",
+            vec![
+                step("a", Completed),
+                step("b", Completed),
+                step("c", Completed),
+                step("d", InProgress),
+            ],
+        ));
+        events.push(done(27, "c2"));
+        let state = online_state(&events, &RunId::from_raw(RUN));
+        assert_eq!(state.request_count, 23);
+        assert_eq!(
+            state.completed_boundary_request_counts,
+            vec![8, 8, 7],
+            "23 次请求做完三步：每步约 7.7 次，不是一步 23 次"
+        );
+        assert_eq!(state.remaining_boundaries(), 1);
     }
 
     #[test]
@@ -781,7 +833,7 @@ mod tests {
         events.push(refused(19));
         let mut state = online_state(&events, &run);
         assert!(state.compaction_refused);
-        state.record_boundary(&[], None);
+        state.record_boundary(&[], None, 1);
         assert!(!state.compaction_refused, "新的边界解除");
 
         events.push(compaction(

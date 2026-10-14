@@ -798,7 +798,7 @@ fn main() {
     fn the_tool_line_shows_the_tool_its_summary_and_its_state() {
         let app = conversation_app();
         let screen = screen(&app, 100, 40);
-        assert!(screen.contains("shell rm -rf build"), "{screen}");
+        assert!(screen.contains("shell $ rm -rf build"), "{screen}");
         assert!(screen.contains("✔ shell"), "跑完了定住一个符号：{screen}");
     }
 

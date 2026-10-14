@@ -49,7 +49,7 @@ impl App {
                 self.quit = true;
                 return vec![Effect::Quit];
             }
-            // 工具调用印不印参数与结果预览。
+            // 工具调用全部展开 / 折叠，已经印出去的一起重画。
             KeyCode::Char('t') if ctrl => {
                 self.toggle_tool_detail();
                 return Vec::new();

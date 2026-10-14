@@ -8,6 +8,7 @@
 //!
 //! - **定型**（[`Emitted::take`]）：用户那条消息、助手那段回答、跑完的一次工具调用、
 //!   一条提示。交出去一次，之后再也不动——所以判「定型」要保守，宁可多在视口里待一帧。
+//!   唯一的例外是 `Ctrl-T`：擦掉屏幕与回滚区，换一份新的 [`Emitted`] 从头整段再交一遍。
 //! - **还在动**（[`Emitted::live`]）：还没收到 `run.accepted` 的那条提交、模型正在打字
 //!   的草稿里还没写完的那一段、还没跑完的工具调用。每一帧重画，永不交出去。
 //!
@@ -28,10 +29,9 @@ use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::turn::Role;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use time::OffsetDateTime;
 
 use crate::tui::app::{App, Draft, Notice, SubmissionState, ToolLine};
-use crate::tui::{markdown, spinner};
+use crate::tui::{markdown, spinner, tool_view};
 
 /// 用户那一条的行首记号。
 pub const USER_MARK: &str = "-> ";
@@ -48,6 +48,9 @@ pub struct Emitted {
     notices: u64,
     /// 模型正在生成（或刚生成完、正式消息还没到）的那几段，各自交出去了多少。
     streams: Vec<Stream>,
+    /// 交出去的最后一块是不是一次工具调用。下一段正文要先空一行，否则它紧贴在结果下面，
+    /// 分不清哪几行是工具的输出、从哪儿起是回答。
+    after_tool: bool,
 }
 
 /// 一段草稿已经交给回滚区的前缀。
@@ -71,7 +74,9 @@ impl Emitted {
     /// `tool.result` 和下一条 `message.assistant` 在同一批里到达，回滚区上的顺序也仍是
     /// 「先答话、再跑工具、再答话」。
     pub fn take(&mut self, app: &App, width: u16) -> Vec<Line<'static>> {
-        let mut items: Vec<(Seq, Vec<Line<'static>>)> = Vec::new();
+        // 第二项：这一块是不是一条提示——同一个 seq 上提示排在后面，它说的话发生在那条
+        // 事件之后；第三项：是不是一次工具调用。
+        let mut items: Vec<(Seq, bool, bool, Vec<Line<'static>>)> = Vec::new();
 
         let messages = app.messages();
         for message in messages.iter().skip(self.messages) {
@@ -80,7 +85,7 @@ impl Emitted {
                 None => message_lines(message, width),
             };
             if !lines.is_empty() {
-                items.push((message.seq, lines));
+                items.push((message.seq, false, false, lines));
             }
         }
         self.messages = messages.len();
@@ -91,14 +96,29 @@ impl Emitted {
             }
             self.tools.insert(tool.call.clone());
             // 交出去的行冻在纸上：**不给钟**，否则那一格会定格在某一帧随机的样子。
-            items.push((tool.seq, tool_lines(tool, app.tool_detail, width, None)));
+            items.push((
+                tool.seq,
+                false,
+                true,
+                tool_view::lines(tool, app.tool_detail, width, None),
+            ));
         }
 
-        items.sort_by_key(|(seq, _)| *seq);
-        let mut out: Vec<Line<'static>> = items
-            .into_iter()
-            .flat_map(|(_, lines)| lines)
-            .collect::<Vec<_>>();
+        // 提示没有自己的 seq，排在它出现时已经收到的那条事件之后（[`Notice::at`]）：平时
+        // 它本来就排在这一批的最后；`Ctrl-T` 整段重交时它回到原来的位置，不挤到最后。
+        for notice in &app.notices {
+            if notice.id <= self.notices {
+                continue;
+            }
+            self.notices = notice.id;
+            items.push((notice.at, true, false, notice_lines(notice, width)));
+        }
+
+        items.sort_by_key(|(seq, notice, _, _)| (*seq, *notice));
+        let mut out: Vec<Line<'static>> = Vec::new();
+        for (_, _, tool, lines) in items {
+            self.hand_over(&mut out, lines, tool);
+        }
 
         // Run 结束了、正式消息却没来（取消、失败）：交出去的那半段就是全部，说一声。
         self.streams.retain(|stream| {
@@ -127,19 +147,24 @@ impl Emitted {
             let stream = self.stream_for(draft);
             let done = stream.committed.len();
             if settled > done && draft.text.starts_with(&stream.committed) {
-                out.extend(markdown::render(&draft.text[done..settled], width));
                 stream.committed = draft.text[..settled].to_string();
+                let lines = markdown::render(&draft.text[done..settled], width);
+                self.hand_over(&mut out, lines, false);
             }
-        }
-
-        for notice in &app.notices {
-            if notice.id <= self.notices {
-                continue;
-            }
-            self.notices = notice.id;
-            out.extend(notice_lines(notice, width));
         }
         out
+    }
+
+    /// 把一块交出去：工具调用之后的第一段正文先空一行。
+    fn hand_over(&mut self, out: &mut Vec<Line<'static>>, lines: Vec<Line<'static>>, tool: bool) {
+        if lines.is_empty() {
+            return;
+        }
+        if self.after_tool && !tool {
+            out.push(Line::default());
+        }
+        self.after_tool = tool;
+        out.extend(lines);
     }
 
     /// 还在动的那些，每一帧重画。
@@ -191,7 +216,7 @@ impl Emitted {
             if self.tools.contains(&tool.call) {
                 continue;
             }
-            lines.extend(tool_lines(tool, app.tool_detail, width, app.now));
+            lines.extend(tool_view::lines(tool, app.tool_detail, width, app.now));
         }
         lines
     }
@@ -292,45 +317,6 @@ fn rest_lines(message: &SurfaceMessage, committed: &str, width: u16) -> Vec<Line
         None => {}
     }
     lines.push(Line::default());
-    lines
-}
-
-/// 一次工具调用的那一行（`detail` 打开时再加参数与结果预览）。
-///
-/// `now` 是 `None` 就不转——那是要冻进回滚区的行。
-pub fn tool_lines(
-    tool: &ToolLine,
-    detail: bool,
-    width: u16,
-    now: Option<OffsetDateTime>,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let head = format!("  {} {} {}", tool.marker(now), tool.tool, tool.summary());
-    lines.push(Line::from(Span::styled(
-        markdown::truncate_to_width(&head, width as usize),
-        Style::default().fg(state_colour(tool.state)),
-    )));
-    if tool.elapsed_ms > 0 && tool.state.is_terminal() {
-        lines.push(dim(&format!("    {} ms", tool.elapsed_ms)));
-    }
-    if detail {
-        let args = serde_json::to_string_pretty(&tool.args).unwrap_or_default();
-        for line in args.lines() {
-            lines.push(Line::from(Span::styled(
-                markdown::truncate_to_width(&format!("    {line}"), width as usize),
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
-        if let Some(preview) = &tool.preview {
-            lines.push(dim("    ── 结果预览 ──"));
-            for line in preview.lines() {
-                lines.push(Line::from(Span::styled(
-                    markdown::truncate_to_width(&format!("    {line}"), width as usize),
-                    Style::default().fg(Color::Gray),
-                )));
-            }
-        }
-    }
     lines
 }
 
@@ -509,6 +495,25 @@ mod tests {
         assert!(settled.contains("shell"), "跑完了要落进回滚区：{settled}");
         let live = text_of(&emitted.live(&app, 80));
         assert!(!live.contains("shell"), "落地之后不该还在视口里：{live}");
+    }
+
+    /// 工具调用之后的回答先空一行：紧贴在结果下面就分不清哪几行是输出、从哪儿起是回答。
+    /// 分两批到达（调用先落地、回答后到）也一样。
+    #[test]
+    fn a_reply_after_a_tool_call_starts_after_a_blank_line() {
+        let events = fixture::conversation();
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &events);
+        let once = text_of(&Emitted::new().take(&app, 80));
+        assert!(once.contains("removed 12 files\n\n清完了"), "{once}");
+
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        let mut emitted = Emitted::new();
+        feed(&mut app, &events[..7]);
+        let mut split = emitted.take(&app, 80);
+        feed(&mut app, &events[7..]);
+        split.extend(emitted.take(&app, 80));
+        assert_eq!(text_of(&split), once);
     }
 
     /// 取消掉的那一轮里，停在 `started` 上的调用也要落地——否则它永远占着视口。
@@ -690,5 +695,26 @@ mod tests {
         let second = text_of(&emitted.take(&app, 80));
         assert_eq!(second.matches("再来一条").count(), 1);
         assert!(!second.contains("第 59 条"), "交过的不再交：{second}");
+    }
+
+    /// `Ctrl-T` 整段重交时，提示回到它出现时的位置：排在当时收到的最后一条事件之后，
+    /// 不挤到整段的最后。
+    #[test]
+    fn a_notice_keeps_its_place_when_everything_is_handed_over_again() {
+        let events = fixture::conversation();
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &events[..3]);
+        app.note("中途的一条提示");
+        feed(&mut app, &events[3..]);
+
+        let again = text_of(&Emitted::new().take(&app, 80));
+        let at = |what: &str| {
+            again
+                .find(what)
+                .unwrap_or_else(|| panic!("{what}：{again}"))
+        };
+        assert!(at("把 build 目录清掉") < at("中途的一条提示"), "{again}");
+        assert!(at("中途的一条提示") < at("我来清一下"), "{again}");
+        assert!(at("rm -rf build") < at("清完了"), "{again}");
     }
 }

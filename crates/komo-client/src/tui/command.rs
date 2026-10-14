@@ -115,7 +115,7 @@ pub const KEYS: &[&str] = &[
     "按键  Alt-← / Alt-→（或 Ctrl-←/→）按词移动 · Home/End 行首行尾 · Ctrl-Home/End 全文首尾",
     "按键  ↑ / ↓ 在多行草稿里走行，走到头了才翻历史 · Tab 补全命令",
     "按键  Esc 停掉当前任务 · Ctrl-C 退出 TUI（任务留在 Gateway 里照跑）",
-    "按键  Ctrl-T 工具详情（管之后印出来的那些）",
+    "按键  Ctrl-T 展开 / 折叠全部工具调用（整段重画）",
     "按键  ! 开头 = Shell 模式：Enter 在 Gateway 里直接跑这条命令，不经过模型；结果记进会话，接着问模型就能看见",
 ];
 

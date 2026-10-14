@@ -400,19 +400,25 @@ impl App {
                     ToolResultStatus::Failed => ToolCallState::Failed,
                     ToolResultStatus::Uncertain => ToolCallState::Uncertain,
                 };
-                line.preview = body.preview.clone();
+                // 顶层那份截在 1 KiB，完整正文在 body 里（SSE 原样推过来了）。
+                line.preview = body
+                    .body
+                    .as_ref()
+                    .and_then(|full| full.preview.clone().or_else(|| full.error.clone()))
+                    .or_else(|| body.preview.clone());
                 line.elapsed_ms = body.elapsed_ms;
             }
             _ => {}
         }
     }
 
-    /// `Ctrl-T`：工具调用印不印参数与结果预览。
+    /// `Ctrl-T`：工具调用全部展开 / 折叠。
     ///
-    /// **它管的是之后印出来的那些**——已经落进终端回滚区的那几行是终端的了，这个开关
-    /// 够不着它们（见 [`super::App::tool_detail`]）。
+    /// 已经落进终端回滚区的那些也要跟着变，而那几行终端不让改——所以整段重画（见
+    /// [`super::App::repaint`]）。
     pub fn toggle_tool_detail(&mut self) {
         self.tool_detail = !self.tool_detail;
+        self.repaint = true;
     }
 }
 

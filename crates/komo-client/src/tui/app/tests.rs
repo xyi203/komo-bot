@@ -726,17 +726,51 @@ fn the_conversation_folds_into_messages_and_tool_lines() {
     assert_eq!(tools[0].attempts, 1);
 }
 
-/// `Ctrl-T` 是一个**模式**，不是对某一条的展开：一行落进终端回滚区之后谁也改不了它，
-/// 所以这个开关管的是之后印出来的那些。
+/// 结果正文取 `body` 里那段完整的，不取顶层截在 1 KiB 的预览；失败时 body 只有原因也照
+/// 样取到。没有 body 的旧事件才退回顶层那份（上一个测试）。
+#[test]
+fn a_tool_result_shows_the_full_body_not_the_one_kib_preview() {
+    let full = "一行输出\n".repeat(400);
+    for (preview, error, want) in [
+        (Some(full.clone()), None, full.as_str()),
+        (None, Some("exit=2".to_string()), "exit=2"),
+    ] {
+        let mut app = app();
+        let mut events = fixture::conversation();
+        for event in &mut events {
+            if let EventPayload::ToolResult(body) = &mut event.payload {
+                body.body = Some(Box::new(komo_kernel::types::refs::ToolResultBody {
+                    status: ToolResultStatus::Completed,
+                    result: serde_json::Value::Null,
+                    error: error.clone(),
+                    exit_code: None,
+                    artifacts: vec![],
+                    preview: preview.clone(),
+                }));
+            }
+        }
+        feed(&mut app, &events);
+        assert_eq!(app.tool_lines()[0].preview.as_deref(), Some(want));
+    }
+}
+
+/// `Ctrl-T` 是一个**模式**，管的是整段会话：切一次，下一帧就整段重画——已经落进回滚区
+/// 的那些也跟着展开或收起。
 #[test]
 fn ctrl_t_turns_tool_detail_on_and_off() {
     let mut app = app();
     feed(&mut app, &fixture::conversation());
     assert!(!app.tool_detail);
+    assert!(!app.repaint);
     app.handle_key(with(KeyCode::Char('t'), KeyModifiers::CONTROL));
     assert!(app.tool_detail, "展开看参数与结果预览");
+    assert!(
+        std::mem::take(&mut app.repaint),
+        "已经印出去的那些也要跟着展开"
+    );
     app.handle_key(with(KeyCode::Char('t'), KeyModifiers::CONTROL));
     assert!(!app.tool_detail);
+    assert!(app.repaint, "收起来也一样");
 }
 
 // ---- 打字机效果（`assistant_delta`） ----

@@ -160,6 +160,9 @@ pub struct Notice {
     pub id: u64,
     pub text: String,
     pub is_error: bool,
+    /// 它出现时已经收到的最后一条事件（[`App::cursor`]）。整段重画（`Ctrl-T`）时它排回
+    /// 那条事件之后，不挤到最后。
+    pub at: Seq,
 }
 
 /// 一个 Run 在状态行上要印的东西。
@@ -210,6 +213,8 @@ pub struct ToolLine {
     pub attempts: u32,
     pub args: serde_json::Value,
     pub cwd: Option<String>,
+    /// 结果正文：`tool.result` 的 `body.preview`（工具写给模型的那段完整正文），没有就取
+    /// `body.error`；旧事件没有 body 时退回顶层那份 ≤1 KiB 的预览。
     pub preview: Option<String>,
     pub elapsed_ms: u64,
     pub seq: Seq,
@@ -218,17 +223,22 @@ pub struct ToolLine {
 impl ToolLine {
     /// 一行摘要：这次调用**动了什么**。参数整个印出来会把三行的界面变成三十行。
     pub fn summary(&self) -> String {
-        for key in [
-            "command", "code", "pattern", "path", "file", "module", "query", "url",
-        ] {
-            if let Some(value) = self.args.get(key) {
-                return one_line(&value_text(value));
-            }
+        if let Some(value) = self.summary_key().and_then(|key| self.args.get(key)) {
+            return one_line(&value_text(value));
         }
         match &self.args {
             serde_json::Value::Null => String::new(),
             other => one_line(&other.to_string()),
         }
+    }
+
+    /// 摘要取的是哪个参数；一个都认不出就是 `None`，摘要是整份参数。
+    pub fn summary_key(&self) -> Option<&'static str> {
+        [
+            "command", "code", "pattern", "path", "file", "module", "query", "url", "task",
+        ]
+        .into_iter()
+        .find(|key| self.args.get(key).is_some())
     }
 
     /// 行首那一格。
@@ -320,11 +330,13 @@ pub struct App {
     pub tokens: TokenTally,
     /// 用量算到哪一条事件为止了。**不能用 `cursor` 代替**：那一个在别处就推过了。
     counted: Seq,
-    /// 工具调用印不印参数与结果预览（`Ctrl-T`）。
+    /// 工具调用全部展开还是折叠（`Ctrl-T`）。
     ///
-    /// **它是一个模式，不是对某一条的展开**：一行历史交给终端回滚区之后就是终端的了，
-    /// 谁也改不了它——所以这个开关管的是**之后**印出来的那些，以及此刻还在动的那几行。
+    /// **它是一个模式，不是对某一条的展开**，管的是整段会话：交给回滚区的行终端不让改，
+    /// 所以切换时整段收回、按新模式重画（[`App::repaint`]），照 pi 的 Ctrl-O。
     pub tool_detail: bool,
+    /// 下一帧先擦掉屏幕与终端的回滚区，从开场横幅起整段重画。驱动取走它。
+    pub repaint: bool,
     pub now: Option<OffsetDateTime>,
     pub quit: bool,
     /// 提示的编号发到哪了。
@@ -368,6 +380,7 @@ impl App {
             tokens: TokenTally::default(),
             counted: Seq::ZERO,
             tool_detail: false,
+            repaint: false,
             now: None,
             quit: false,
             notice_seq: 0,
@@ -611,6 +624,7 @@ impl App {
             id: self.notice_seq,
             text,
             is_error,
+            at: self.cursor,
         });
         self.trim_notices();
     }

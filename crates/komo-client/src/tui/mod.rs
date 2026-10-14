@@ -12,6 +12,7 @@ pub mod paste;
 pub mod render;
 pub mod shell;
 pub mod spinner;
+pub mod tool_view;
 pub mod transcript;
 
 #[cfg(test)]
@@ -168,7 +169,12 @@ pub async fn run_tui(
             break Ok(());
         }
         app.now = Some(time::OffsetDateTime::now_utc());
-        if let Err(error) = terminal.render(&app, &mut emitted) {
+        let drawn = if std::mem::take(&mut app.repaint) {
+            terminal.repaint(&app, &mut emitted, render::banner(&app, &cwd))
+        } else {
+            terminal.render(&app, &mut emitted)
+        };
+        if let Err(error) = drawn {
             break Err(TuiError::Terminal(error));
         }
 
@@ -626,8 +632,37 @@ impl TerminalGuard {
     /// 写出去，本机上快得看不见，隔着 SSH 就是每交一行正文输入框闪一下空白。支持同步
     /// 输出的终端等整帧到齐再上屏；不支持的终端也只收到一次写，擦和画落在同一次读里。
     fn render(&mut self, app: &App, emitted: &mut Emitted) -> Result<(), std::io::Error> {
+        self.synchronized(|this| this.frame(app, emitted))
+    }
+
+    /// 整段重画（`Ctrl-T`）：擦掉屏幕与终端的回滚区，从开场横幅起把整段会话按现在的
+    /// 样子重新交一遍。
+    ///
+    /// 交出去的行终端不让改，要改只能整段收回——pi 的 Ctrl-O 也是这么做的。代价是进 TUI
+    /// 之前终端里的那些也一起擦掉了。与平常的一帧一样包在同步输出里，擦与重画一次上屏。
+    fn repaint(
+        &mut self,
+        app: &App,
+        emitted: &mut Emitted,
+        banner: Vec<Line<'static>>,
+    ) -> Result<(), std::io::Error> {
+        self.synchronized(|this| {
+            wipe(this.terminal.backend_mut())?;
+            // 视口还贴着底边，它上面整块都空了：下一次往回滚区写从第一行开始。
+            this.gap = this.view.y;
+            *emitted = Emitted::new();
+            this.commit(banner)?;
+            this.frame(app, emitted)
+        })
+    }
+
+    /// 一帧包在一对同步输出标记里，攒完一次写给终端。
+    fn synchronized(
+        &mut self,
+        draw: impl FnOnce(&mut Self) -> Result<(), std::io::Error>,
+    ) -> Result<(), std::io::Error> {
         queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
-        let drawn = self.frame(app, emitted);
+        let drawn = draw(self);
         // 出错也要把同步标记收回去：不收，支持它的终端会冻在这一帧上直到它自己超时。
         let ended = queue!(self.terminal.backend_mut(), EndSynchronizedUpdate);
         let presented = self.present();
@@ -672,7 +707,8 @@ impl TerminalGuard {
         self.terminal.resize(self.view)
     }
 
-    /// 把这些行交给终端的回滚区。交出去之后它们就是终端的了——谁也改不动。
+    /// 把这些行交给终端的回滚区。交出去之后它们就是终端的了——谁也改不动，要改只能整段
+    /// 擦掉重来（[`Self::repaint`]）。
     ///
     /// 只排进 [`FrameWriter`]，跟着下一帧一起写出去。
     ///
@@ -747,6 +783,19 @@ impl TerminalGuard {
         self.view.height = want;
         self.terminal.resize(self.view)
     }
+}
+
+/// 擦掉整屏与终端的回滚区，光标回到左上角。
+///
+/// 顺序照 pi：先擦屏、再擦回滚区——有的终端擦屏时把屏上那一页推进回滚区，反过来擦就
+/// 留下这一页。
+fn wipe(out: &mut impl Write) -> Result<(), std::io::Error> {
+    queue!(
+        out,
+        Clear(ClearType::All),
+        MoveTo(0, 0),
+        Clear(ClearType::Purge)
+    )
 }
 
 /// 视口最多占到哪：**总要给上文留一行**，否则人再也看不见刚说过的那句话。
@@ -933,6 +982,15 @@ mod tests {
         writer.flush().expect("能冲刷");
         assert_eq!(written(), b"\x1b[J line one\r\nredraw");
         assert!(writer.pending.is_empty());
+    }
+
+    /// `Ctrl-T` 的整段重画先擦屏、再擦回滚区：反过来，有的终端擦屏时推进回滚区的那一页
+    /// 就留下了。
+    #[test]
+    fn a_repaint_wipes_the_screen_before_the_scrollback() {
+        let mut out: Vec<u8> = Vec::new();
+        wipe(&mut out).expect("写得出去");
+        assert_eq!(out, b"\x1b[2J\x1b[1;1H\x1b[3J");
     }
 
     /// **交给回滚区的一行，在终端上就得正好占一行。**

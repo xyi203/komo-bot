@@ -545,7 +545,6 @@ impl Default for CompactionConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PathsConfig {
     pub sessions_dir: PathBuf,
-    pub toolbox_dir: PathBuf,
     /// Skills 的有序搜索路径，**同名先到先得**（§5.6）。
     #[serde(default)]
     pub skill_dirs: Vec<PathBuf>,
@@ -718,7 +717,6 @@ mod tests {
             },
             paths: PathsConfig {
                 sessions_dir: PathBuf::from("/home/u/.komo/sessions"),
-                toolbox_dir: PathBuf::from("/home/u/.komo/toolbox"),
                 skill_dirs: vec![PathBuf::from("/home/u/.komo/skills")],
                 runtime_dir: PathBuf::from("/home/u/.komo/runtime"),
                 logs_dir: PathBuf::from("/home/u/.komo/logs"),

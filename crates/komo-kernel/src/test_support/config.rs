@@ -110,7 +110,6 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
         },
         paths: PathsConfig {
             sessions_dir: home.join("sessions"),
-            toolbox_dir: home.join("toolbox"),
             skill_dirs: vec![home.join("skills")],
             runtime_dir: home.join("runtime"),
             logs_dir: home.join("logs"),

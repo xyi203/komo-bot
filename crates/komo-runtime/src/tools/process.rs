@@ -45,7 +45,7 @@ pub struct ChildSpec {
     pub program: String,
     pub args: Vec<String>,
     pub cwd: PathBuf,
-    /// **明确的**环境变量集合——继承整个环境等于把凭证交给任意脚本（§5.3）。
+    /// **明确的**环境变量集合——继承整个环境等于把凭证交给任意脚本。
     pub env: BTreeMap<String, String>,
     #[allow(clippy::doc_markdown)]
     /// 写进 stdin 的正文（`python` 的作业描述走这里）。

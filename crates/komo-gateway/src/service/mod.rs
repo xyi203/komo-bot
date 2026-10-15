@@ -41,9 +41,7 @@ use std::sync::Arc;
 use komo_kernel::traits::{Clock, Inbound, LlmClient, Shutdown, Tool};
 use komo_kernel::types::chat::Outbound;
 use komo_runtime::config::{ConfigHolder, EffortCapabilities, LoadOptions};
-use komo_runtime::toolbox::Toolbox;
 use komo_store::Db;
-use time::OffsetDateTime;
 
 use crate::channels::ChannelFactory;
 use crate::dispatcher::Dispatcher;
@@ -504,69 +502,8 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
     }
 }
 
-/// 这台 Gateway 的 toolbox（§5.3）。
-///
-/// 目录一定建出来，内置模块首次启动装进去（§5.5 的 memos）——「首次启动若 toolbox 里
-/// 没有就写入并标已启用」，已经有同名模块就**不动**。
-pub fn toolbox_of(snapshot: &komo_kernel::protocol::config::ConfigSnapshot) -> Arc<Toolbox> {
-    let toolbox = Arc::new(Toolbox::new(snapshot.paths.toolbox_dir.clone()));
-    if let Err(error) = toolbox.ensure_layout() {
-        tracing::warn!(%error, "toolbox 目录建不出来");
-    }
-    match komo_runtime::toolbox::builtin::install(&toolbox, OffsetDateTime::now_utc()) {
-        Ok(installed) => {
-            for module in installed {
-                tracing::info!(module = %module.module, version = %module.version, "装上内置 toolbox 模块");
-            }
-        }
-        Err(error) => tracing::warn!(%error, "内置 toolbox 模块装不进去"),
-    }
-    toolbox
-}
-
-/// 凭证引用的解析口：**名字**问 toolbox（模块的 `__komo_env__`），**值**问
-/// `ConfigHolder`（`.env`）。
-///
-/// 两边都是**每次现读**：`toolbox.inspect` 读的是磁盘上当前那一份，
-/// `ConfigHolder::secrets()` 读的是 arc-swap 里当前那一份。所以启用一个新版本、或者改
-/// 完 `.env` 跑一次 `komo config reload`，下一次调用就按新的来，不必重启（§3 第 2 步）。
-///
-/// **值到此为止**：它只在 `PythonRuntime::run` 里被放进那一次 spawn 的 env，不进
-/// Gateway 自己的进程环境、不进计划、不进日志（§5.3、§7.2）。
-struct ToolboxSecrets {
-    toolbox: Arc<Toolbox>,
-    config: Arc<ConfigHolder>,
-}
-
-impl komo_runtime::python_runtime::SecretResolver for ToolboxSecrets {
-    fn names_for(&self, module: &str) -> Vec<String> {
-        // 读不出这个模块（被停用、被删掉）就是"它没有声明任何凭证"——不猜一个名单。
-        self.toolbox
-            .inspect(module)
-            .map(|info| info.env)
-            .unwrap_or_default()
-    }
-
-    fn resolve(&self, name: &str) -> Option<String> {
-        // 空串当作没配：一个空令牌只会在第一次请求时才失败，而那时说的是"401"，
-        // 不是"没配"（`Secrets::has` 已经是这个约定）。
-        self.config
-            .secrets()
-            .get(name)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_string)
-    }
-}
-
 /// 受管理解释器的配置（§5.1）。
-///
-/// 三件与 toolbox 相关的事在这里接上：`toolbox_parent` 让 `import toolbox.x` 成立，
-/// `denied_imports` 让候选与历史快照 import 不到（§7.3），`secrets` 让已授权模块在
-/// **每次 spawn 时**按名拿到它声明的那几个变量（§5.3）。
-pub fn python_env(
-    config: &Arc<ConfigHolder>,
-    toolbox: &Arc<Toolbox>,
-) -> komo_runtime::python_runtime::PythonEnvConfig {
+pub fn python_env(config: &Arc<ConfigHolder>) -> komo_runtime::python_runtime::PythonEnvConfig {
     let snapshot = config.current();
     let mut python = komo_runtime::python_runtime::PythonEnvConfig::new(
         snapshot.start_only.python_env_root.clone(),
@@ -588,12 +525,6 @@ pub fn python_env(
         );
         python.interpreter = Some(fallback);
     }
-    python.toolbox_parent = Some(toolbox.layout().parent());
-    python.denied_imports = toolbox.layout().denied_import_roots();
-    python.secrets = Some(Arc::new(ToolboxSecrets {
-        toolbox: Arc::clone(toolbox),
-        config: Arc::clone(config),
-    }));
     python
 }
 
@@ -669,8 +600,7 @@ async fn build_tools(
     #[cfg(any(test, feature = "test-support"))]
     tools.extend(test_support::test_tools(config.home()));
 
-    let toolbox = toolbox_of(&config.current());
-    let python = python_env(config, &toolbox);
+    let python = python_env(config);
     let codemode = match komo_runtime::codemode::Sandbox::probe(&python.interpreter_path()).await {
         Ok(sandbox) => {
             tools.push(Arc::new(komo_runtime::tools::CodemodeTool::new()));
@@ -696,10 +626,9 @@ async fn build_tools(
     };
     match komo_runtime::python_runtime::PythonRuntime::probe(python).await {
         Ok(runtime) => {
-            tools.push(Arc::new(
-                komo_runtime::tools::PythonTool::new(Arc::new(runtime.registered(registration)))
-                    .with_toolbox(toolbox),
-            ));
+            tools.push(Arc::new(komo_runtime::tools::PythonTool::new(Arc::new(
+                runtime.registered(registration),
+            ))));
         }
         Err(error) => {
             // 「没有解释器」不该让整台 Gateway 起不来——别的五个工具照常。

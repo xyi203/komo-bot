@@ -1465,7 +1465,7 @@ impl GatewayState {
 /// `.env`）的写入是 `Deny`」——名单从**配置快照的 paths 与数据目录**算出来，不写死
 /// `~/.komo`：`KOMO_HOME` 可以改，写死只会让那条规则在自定义目录上完全不命中。
 ///
-/// 三个判决入口（工具执行、Python 核对、toolbox 的 HTTP 入口）共用它，所以它只有一处。
+/// 各处判决入口（工具装配、监听脚本）共用它，所以它只有一处。
 pub fn protected_paths(snapshot: &ConfigSnapshot, home: &std::path::Path) -> Vec<PathBuf> {
     vec![
         snapshot.paths.sessions_dir.clone(),

@@ -14,7 +14,7 @@ pub struct FrontMatter {
     pub description: Option<String>,
     /// 只在这些平台上进提示目录。空 = 不限。
     pub platforms: Vec<String>,
-    /// 需要这些工具（5 个基础工具或 toolbox 模块名）才进提示目录。
+    /// 需要这些工具（工具名）才进提示目录。
     pub requires_tools: Vec<String>,
 }
 

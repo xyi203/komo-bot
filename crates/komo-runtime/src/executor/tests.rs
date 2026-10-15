@@ -2504,21 +2504,15 @@ async fn an_artifact_of_the_round_is_named_in_what_the_model_sees() {
         pointer: None,
     };
     let tool = Arc::new(
-        RecordingTool::new(
-            "python",
-            Operation::PythonCall {
-                module: "main".into(),
-                function: "run".into(),
-            },
-        )
-        .with_recovery(RecoveryMode::SafeReread)
-        .with_outcome(Ok(ToolOutput {
-            status: ToolResultStatus::Completed,
-            result: serde_json::json!({ "ok": true }),
-            exit_code: Some(0),
-            artifacts: vec![report],
-            preview: Some("跑完了\n".into()),
-        })),
+        RecordingTool::new("python", Operation::PythonCode)
+            .with_recovery(RecoveryMode::SafeReread)
+            .with_outcome(Ok(ToolOutput {
+                status: ToolResultStatus::Completed,
+                result: serde_json::json!({ "ok": true }),
+                exit_code: Some(0),
+                artifacts: vec![report],
+                preview: Some("跑完了\n".into()),
+            })),
     );
     let executor = harness.executor(vec![tool]);
     let (session, run) = harness.open_run().await;

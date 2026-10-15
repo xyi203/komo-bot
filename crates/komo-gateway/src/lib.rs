@@ -26,9 +26,6 @@ pub use komo_runtime::llm::codex_auth;
 /// `komo auth mcp login|status`（`docs/mcp.md` §2.1）：同上，OAuth 登录与凭证文件在
 /// `komo-runtime`。
 pub use komo_runtime::mcp_auth;
-/// `komo toolbox` 的那几个类型（§5.3）。同一个理由：bin 的依赖是 client / gateway /
-/// clap 三条，不加第四条。
-pub use komo_runtime::toolbox;
 
 pub use dispatcher::Dispatcher;
 pub use lock::{DiscoveryFile, GatewayDiscovery, InstanceLock};

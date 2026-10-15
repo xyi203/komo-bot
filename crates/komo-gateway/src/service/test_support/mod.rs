@@ -128,7 +128,6 @@ pub fn sample_snapshot() -> ConfigSnapshot {
         channels: ChannelsConfig::default(),
         paths: PathsConfig {
             sessions_dir: "/tmp/komo/sessions".into(),
-            toolbox_dir: "/tmp/komo/toolbox".into(),
             skill_dirs: vec![],
             runtime_dir: "/tmp/komo/runtime".into(),
             logs_dir: "/tmp/komo/logs".into(),

@@ -10,8 +10,7 @@ use crate::types::plan::EnvVersion;
 use crate::types::refs::ToolResultStatus;
 use crate::types::tool::{CancelToken, PyError, PythonJob, PythonResult};
 
-/// 假的 [`PythonHost`]：按 `(module, function)` 或"任意 code"给脚本化结果，并记下每
-/// 次调用。
+/// 假的 [`PythonHost`]：按顺序给脚本化结果，并记下每次调用。
 #[derive(Debug, Clone, Default)]
 pub struct FakePythonHost {
     state: Arc<Mutex<PyState>>,
@@ -23,7 +22,7 @@ struct PyState {
     /// 每次调用的 job 与它写进 sink 的 stdout。
     calls: Vec<PythonJob>,
     stdout: Vec<String>,
-    /// `run_with_artifacts` 每次收到的时限。
+    /// 每次收到的时限。
     timeouts: Vec<std::time::Duration>,
     env_version: String,
 }
@@ -63,7 +62,7 @@ impl FakePythonHost {
         self.state.lock().expect("假宿主").calls.clone()
     }
 
-    /// `run_with_artifacts` 每次收到的时限。
+    /// 每次收到的时限。
     pub fn timeouts(&self) -> Vec<std::time::Duration> {
         self.state.lock().expect("假宿主").timeouts.clone()
     }
@@ -75,12 +74,16 @@ impl FakePythonHost {
 
 #[async_trait]
 impl PythonHost for FakePythonHost {
-    async fn run(
+    async fn run_with_artifacts(
         &self,
         job: PythonJob,
+        artifacts: Option<&std::path::Path>,
+        timeout: std::time::Duration,
         sink: &mut dyn OutputWriter,
         cancel: CancelToken,
     ) -> Result<PythonResult, PyError> {
+        let _ = artifacts;
+        self.state.lock().expect("假宿主").timeouts.push(timeout);
         if cancel.is_cancelled() {
             return Err(PyError::Cancelled);
         }
@@ -115,19 +118,6 @@ impl PythonHost for FakePythonHost {
             result.stdout_excerpt = written.unwrap_or_default();
         }
         Ok(result)
-    }
-
-    async fn run_with_artifacts(
-        &self,
-        job: PythonJob,
-        artifacts: Option<&std::path::Path>,
-        timeout: std::time::Duration,
-        sink: &mut dyn OutputWriter,
-        cancel: CancelToken,
-    ) -> Result<PythonResult, PyError> {
-        let _ = artifacts;
-        self.state.lock().expect("假宿主").timeouts.push(timeout);
-        self.run(job, sink, cancel).await
     }
 
     fn env_version(&self) -> EnvVersion {

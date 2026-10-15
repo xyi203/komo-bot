@@ -177,16 +177,6 @@ impl View {
                 used: vec!["mode", "code"],
                 result: Keep::Head,
             },
-            "python" => View {
-                head: format!(
-                    "{}.{}",
-                    text("module").unwrap_or_default(),
-                    text("function").unwrap_or_default()
-                ),
-                body: Body::None,
-                used: vec!["mode", "module", "function"],
-                result: Keep::Head,
-            },
             "codemode" => View {
                 head: String::new(),
                 body: text_body(text("code").unwrap_or_default()),

@@ -7,7 +7,7 @@
 //! 「`status` 与 `stop` **不隐式启动服务**。」
 //!
 //! **单元里只有 `KOMO_HOME` 与 `PATH`，没有任何凭证。** `.env` 由 Gateway 自己读（§12），
-//! 要用的时候按名解析（`service::python_env` 的 `ToolboxSecrets`）。理由有三条，每一条
+//! 要用的时候按名解析（`ConfigHolder::secrets`）。理由有三条，每一条
 //! 单独就够：launchd 没有 `EnvironmentFile` 的等价物，只能把值逐字抄进 plist；一旦抄进去，
 //! `.env` 的热重载就失效了，旧值活到下一次重装单元为止；而进了进程环境的东西，这台
 //! 机器上每一个子进程与每一条 `/proc/<pid>/environ` 都看得见。

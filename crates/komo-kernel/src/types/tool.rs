@@ -210,19 +210,11 @@ pub struct WorkspaceRoot {
     pub label: String,
 }
 
-/// Python 的两种调用形式（§5.2）。两者属于同一个 `python` 工具。
+/// 一次 Python 作业（§5.2）：任意代码。`mode` 判别字段留在线格式上。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum PythonJob {
-    /// 任意代码。
     Code { code: String },
-    /// 已保存模块中**明确导出**的函数，按已保存的版本执行；不是任意属性查找。
-    Call {
-        module: String,
-        function: String,
-        #[serde(default)]
-        args: serde_json::Value,
-    },
 }
 
 /// 一次 Python 执行的结构化返回（§5.1）。脚本的普通 print 单独收集，不混进控制协议。
@@ -335,17 +327,5 @@ mod tests {
             !resumed.is_known_not_to_have_run(),
             "started 本身证明不了什么"
         );
-    }
-
-    #[test]
-    fn a_python_job_round_trips_by_mode() {
-        let job = PythonJob::Call {
-            module: "toolbox.ha".into(),
-            function: "turn_off".into(),
-            args: serde_json::json!({"entity_id": "light.living_room"}),
-        };
-        let text = serde_json::to_string(&job).unwrap();
-        assert!(text.contains("\"mode\":\"call\""), "{text}");
-        assert_eq!(serde_json::from_str::<PythonJob>(&text).unwrap(), job);
     }
 }

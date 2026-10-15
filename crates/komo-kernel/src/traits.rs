@@ -566,19 +566,11 @@ pub trait SystemOne: Send + Sync {
 
 // ---------------------------------------------------------------- Python
 
-/// `python` 工具、toolbox 启用流程、核对函数调用都经它。
+/// `python` 工具经它跑解释器。
 #[async_trait]
 pub trait PythonHost: Send + Sync {
-    /// 新进程执行；stdout / stderr 流入 sink；取消时终止**进程组**并等待回收——丢掉
-    /// 异步等待不等于进程结束（§4）。
-    async fn run(
-        &self,
-        job: PythonJob,
-        sink: &mut dyn OutputWriter,
-        cancel: CancelToken,
-    ) -> Result<PythonResult, PyError>;
-
-    /// 跑一次 Python，并把**产出目录**告诉它（§4.7）。
+    /// 新进程执行，并把**产出目录**告诉它（§4.7）；stdout / stderr 流入 sink；取消时终止
+    /// **进程组**并等待回收——丢掉异步等待不等于进程结束（§4）。
     ///
     /// 子进程往这个目录里写的文件会被登记成这次调用的产物，之后以
     /// `artifact://files/<run>/<名字>` 读回来——目录本身由宿主建（父目录不存在一并建）。
@@ -589,10 +581,7 @@ pub trait PythonHost: Send + Sync {
     ///
     /// `timeout` 是这一次的时限：`python` 工具传本次调用的活动执行时限（`call_timeout`），
     /// 到点由宿主自己终止进程组、报 `Timeout`，而不是落到执行器的兜底计时器上成了"结果
-    /// 不明"。[`Self::run`]（toolbox 启用、核对调用）仍用宿主自己的默认时限。
-    ///
-    /// 默认实现忽略产出目录与时限、转调 [`Self::run`]：没有产物概念的宿主（测试替身）因此
-    /// 不用改。
+    /// 不明"。
     async fn run_with_artifacts(
         &self,
         job: PythonJob,
@@ -600,10 +589,7 @@ pub trait PythonHost: Send + Sync {
         timeout: std::time::Duration,
         sink: &mut dyn OutputWriter,
         cancel: CancelToken,
-    ) -> Result<PythonResult, PyError> {
-        let _ = (artifacts, timeout);
-        self.run(job, sink, cancel).await
-    }
+    ) -> Result<PythonResult, PyError>;
 
     fn env_version(&self) -> crate::types::plan::EnvVersion;
 }

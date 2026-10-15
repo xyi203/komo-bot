@@ -235,7 +235,7 @@ impl ToolLine {
     /// 摘要取的是哪个参数；一个都认不出就是 `None`，摘要是整份参数。
     pub fn summary_key(&self) -> Option<&'static str> {
         [
-            "command", "code", "pattern", "path", "file", "module", "query", "url", "task",
+            "command", "code", "pattern", "path", "file", "query", "url", "task",
         ]
         .into_iter()
         .find(|key| self.args.get(key).is_some())

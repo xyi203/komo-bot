@@ -10,7 +10,7 @@
 
 # 一、当前架构的问题，不是 Loop 不够抽象
 
-当前工作区仍是六个 crate，`komo-runtime` 同时包含 Agent Loop、Executor、Policy、Recovery、Memory，以及 tools、skills、toolbox、Python runtime。
+当前工作区仍是六个 crate，`komo-runtime` 同时包含 Agent Loop、Executor、Policy、Recovery、Memory，以及 tools、skills、Python runtime。
 
 **底层执行机制已经有值得保留的边界。** `AgentLoop` 通过 Ledger 记录模型轮次，通过 Executor 执行工具；遇到审批和依赖等待时挂起、让出执行名额，而不是在进程里一直等人。存储层也已经区分了内容持久化与调度、授权状态的持久化。
 
@@ -62,7 +62,7 @@ komo-agent
     AgentSurface
     PromptComposer、SkillSelector
     read / write / edit / rg / shell / python 的工具定义与参数处理
-    skills、toolbox 的发现与描述
+    skills 的发现与描述
     Resource Namespace
 
 komo-gateway

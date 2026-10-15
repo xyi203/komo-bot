@@ -190,7 +190,7 @@ const SHELL_TOOL: &str = "shell";
 ///
 /// 学 pi 的 docs 段：只给入口（`komo --help`）和一个例子，子命令清单不抄进提示。
 const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、\
-                          toolbox、Gateway）用 shell 跑 `komo <子命令>` 查，例如 `komo cron list`，\
+                          Gateway）用 shell 跑 `komo <子命令>` 查，例如 `komo cron list`，\
                           其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。";
 
 /// 项目规范（`AGENTS.md` / `CLAUDE.md`）那一块：开头一句说清顺序与冲突怎么办，每份文件

@@ -15,7 +15,6 @@ pub mod interventions;
 pub mod memories;
 pub mod runs;
 pub mod sessions;
-pub mod toolbox;
 
 use std::sync::Arc;
 
@@ -92,11 +91,6 @@ pub fn router(api: Api) -> Router {
         .route("/v1/memory-sweep", post(memories::sweep))
         .route("/v1/memory-index", get(memories::index))
         .route("/v1/memory-index/rebuild", post(memories::rebuild))
-        .route("/v1/toolbox", get(toolbox::list))
-        .route("/v1/toolbox/{module}", get(toolbox::show))
-        .route("/v1/toolbox/{module}/test", post(toolbox::test))
-        .route("/v1/toolbox/{module}/enable", post(toolbox::enable))
-        .route("/v1/toolbox/{module}/disable", post(toolbox::disable))
         .route("/v1/models", get(config::models))
         .route("/v1/config/check", get(config::check))
         .route("/v1/config/reload", post(config::reload))

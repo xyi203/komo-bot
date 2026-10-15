@@ -317,10 +317,12 @@ fn the_fake_python_host_records_calls_and_streams_stdout() {
             attempt: AttemptId::from_raw("a"),
         });
         let result = host
-            .run(
+            .run_with_artifacts(
                 PythonJob::Code {
                     code: "result = 1 + 1".into(),
                 },
+                None,
+                std::time::Duration::from_secs(1),
                 &mut writer,
                 CancelToken::new(),
             )
@@ -337,8 +339,14 @@ fn the_fake_python_host_records_calls_and_streams_stdout() {
         let cancelled = CancelToken::new();
         cancelled.cancel();
         assert!(matches!(
-            host.run(PythonJob::Code { code: "x".into() }, &mut writer, cancelled)
-                .await,
+            host.run_with_artifacts(
+                PythonJob::Code { code: "x".into() },
+                None,
+                std::time::Duration::from_secs(1),
+                &mut writer,
+                cancelled
+            )
+            .await,
             Err(PyError::Cancelled)
         ));
     });

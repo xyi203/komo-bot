@@ -195,7 +195,6 @@ pub fn plan() -> ExecutionPlan {
         )],
         versions: PlanVersions {
             code: Some(ContentHash::of_str("rm -rf build")),
-            module: None,
             env: None,
         },
         resources: vec![],

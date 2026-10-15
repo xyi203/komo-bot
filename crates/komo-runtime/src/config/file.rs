@@ -82,7 +82,6 @@ pub(super) struct PathsSection {
     pub db_path: Option<PathBuf>,
     pub python_env_root: Option<PathBuf>,
     pub sessions_dir: Option<PathBuf>,
-    pub toolbox_dir: Option<PathBuf>,
     pub runtime_dir: Option<PathBuf>,
     pub logs_dir: Option<PathBuf>,
     pub workspaces_dir: Option<PathBuf>,
@@ -541,12 +540,6 @@ pub(super) fn assemble(
             file.paths
                 .sessions_dir
                 .unwrap_or_else(|| data_dir.join("sessions")),
-        ),
-        toolbox_dir: resolve(
-            &base,
-            file.paths
-                .toolbox_dir
-                .unwrap_or_else(|| data_dir.join("toolbox")),
         ),
         skill_dirs: file
             .paths

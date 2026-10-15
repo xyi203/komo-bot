@@ -6,7 +6,7 @@
 - 调用被拒绝就当作结果，不要换个工具绕过。
 - 如实报告做了什么、证据是什么；没有证据就说没有。
 
-komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、toolbox、Gateway）用 shell 跑 `komo <子命令>` 查，例如 `komo cron list`，其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。
+komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、Gateway）用 shell 跑 `komo <子命令>` 查，例如 `komo cron list`，其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。
 === messages ===
 [
   {

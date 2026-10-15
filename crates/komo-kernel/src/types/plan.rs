@@ -67,8 +67,6 @@ pub enum Operation {
     ShellCommand { command: String },
     /// 任意 Python 代码（`mode = "code"`）。
     PythonCode,
-    /// 调用 toolbox 中已导出的函数（`mode = "call"`）。
-    PythonCall { module: String, function: String },
     /// 修改 Python 环境（依赖安装、环境版本切换）。
     PythonEnvChange,
     /// 自动记忆的内部变更与索引生成。
@@ -226,15 +224,12 @@ pub enum TargetAccess {
     Write,
 }
 
-/// 计划绑定的各种版本（§7.2）。版本变化改变计划哈希（§5.4）。
+/// 计划绑定的各种版本（§7.2）。版本变化改变计划哈希。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanVersions {
     /// 代码内容哈希（任意 code 模式、shell 命令正文的快照）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<ContentHash>,
-    /// 已保存模块的版本。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub module: Option<String>,
     /// Python 环境版本。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvVersion>,
@@ -246,7 +241,7 @@ pub struct PlanVersions {
 pub struct EnvVersion(pub String);
 
 /// 计划引用到的资源：HA / Memos / 搜索服务的端点与**凭证引用**。凭证的值不进计划、
-/// 不进提示词、不进日志（§5.3）。
+/// 不进提示词、不进日志。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceRef {
     /// 资源名，例如 `memos`、`homeassistant`。

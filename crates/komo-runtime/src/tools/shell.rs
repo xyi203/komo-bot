@@ -34,7 +34,7 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// 投影里执行。测试和嵌入方仍可通过 `with_limits` 明确设置存储上限。
 pub const DEFAULT_OUTPUT_LIMIT: u64 = u64::MAX;
 
-/// 交给子进程的**明确**环境变量。继承整个环境等于把 API key 交给任意脚本（§5.3）。
+/// 交给子进程的**明确**环境变量。继承整个环境等于把 API key 交给任意脚本。
 const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ", "USER", "TMPDIR"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +86,7 @@ pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPla
         // `ShellCommand` 与命令正文匹配，不按路径。
         targets: vec![],
         versions: PlanVersions {
-            // 命令正文的快照：命令改一个字节，计划就是另一份（§5.4）。
+            // 命令正文的快照：命令改一个字节，计划就是另一份（§7.2）。
             code: Some(ContentHash::of_str(command)),
             ..Default::default()
         },

@@ -19,7 +19,7 @@ v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；�
 | 聊天     | `komo` 直接进入 TUI 聊天；Gateway 未运行时自动启动                                                |
 | 执行方式 | LLM 原生 tool call，由 Rust 校验和执行；没有 Policy 与审批（§7）                                 |
 | 基础工具 | 严格保留 `read`、`write`、`edit`、`shell`、`python`                                              |
-| 能力扩展 | Python 模块保存到 toolbox，AI 可以编写、测试和迭代                                               |
+| 能力扩展 | 可复用能力写成 Skill（`SKILL.md` + 脚本），由 `shell` 运行；没有 toolbox（2026-10-15 删除，§5.3）   |
 | 程序性说明 | Skills：人写的 `SKILL.md`，模型用 `read` 读取，不增加工具                                       |
 | 定时任务 | Cron 触发同一套 Agent Runtime                                                                    |
 | 持久化   | 每个 Session 一个数据目录，集中保存 JSONL、大正文、tool output 和产物；Turso（MVCC）保存调度状态与索引 |
@@ -61,11 +61,9 @@ komo TUI / resume / 操作命令          飞书 ws · Telegram 轮询 · WeChat
            执行           拒绝（明确的拒绝结果）
              │
       read / write / edit / shell / python
-                                      │
-                               已保存的 toolbox
 ```
 
-MemoryManager 在 Run 开始时装配相关记忆，在 Run 完成后异步整理新证据。它管理本机记忆与检索索引；访问 Memos 仍通过已启用的 Python 模块，不新增模型工具。
+MemoryManager 在 Run 开始时装配相关记忆，在 Run 完成后异步整理新证据。它管理本机记忆与检索索引；访问 Memos 通过 Memos skill 里的脚本由 `shell` 运行，不新增模型工具。
 
 Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境、运行状态和三个聊天渠道。TUI 负责提交输入、显示进度、回答介入和恢复会话；聊天渠道做同样的事，并且是介入的主入口（§11）。
 
@@ -100,7 +98,6 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo auth mcp login SERVER`                 | `oauth = true` 的 MCP 服务器：浏览器授权码 + PKCE，回调听 `127.0.0.1` 随机端口；不经 Gateway，凭证写入 `<数据目录>/mcp/<SERVER>/credentials.json`（`docs/mcp.md` §2.1） |
 | `komo auth mcp status`                       | 各 OAuth MCP 服务器登录与否、过期时间、能否自动刷新；**不打印 token**；不经 Gateway |
 | `komo skills list/inspect/enable/disable`    | Skills 目录（§5.6）；只读文件系统，不经 Gateway                             |
-| `komo toolbox list/inspect/test/enable [--version]/disable` | toolbox 模块（§5.3–5.4）；**经 Gateway**——启用改的是 state.db，只有 Gateway 打得开；启用 / 停用直接生效（§5.4） |
 | `komo update`                                | 从 GitHub release 换掉当前这个可执行文件（§13.6）。**不经 Gateway**：换的是磁盘上那份二进制，不是在跑的那个进程 |
 
 聊天启动顺序：
@@ -249,7 +246,7 @@ status / result / stdout / stderr / artifacts
 
 虚拟环境还没建出来时，`python` 与 codemode 退回 `PATH` 里版本最高的 `python3.N`（3.10 起），一个都没有才用裸 `python3`，`env_version` 如实写成那个解释器的版本 + `no-lock`。不直接用裸 `python3` 的原因（2026-10-14）：macOS 上它是 `/usr/bin/python3`（3.9），Homebrew / uv 装的新版本只提供带版本号的名字；实测会话里模型因此缺 `tomllib`、`fromisoformat` 读不了 komo 自己小数位数不定的时间戳，白耗好几轮。
 
-### 5.2 两种 Python 调用形式
+### 5.2 Python 调用形式
 
 任意代码：
 
@@ -260,75 +257,33 @@ status / result / stdout / stderr / artifacts
 }
 ```
 
-已保存模块：
-
-```json
-{
-  "mode": "call",
-  "module": "toolbox.ha",
-  "function": "turn_off",
-  "args": {
-    "entity_id": "light.living_room"
-  }
-}
-```
-
-两种形式都属于同一个 `python` 工具。`call` 模式只加载 toolbox 中明确导出的函数，依据已启用版本与参数定义执行。它不是直接开放 Python 任意属性查找。
-
-`mode` 是参数里的判别字段，但**模型偶尔会漏写**（真实会话里报的是 `missing field mode`，白跑一轮）。所以 Runtime 按参数形状补上：有 `code` 就是 `code`、有 `module` / `function` 就是 `call`，两个都写或都没写才报错。补进去的值落在 `plan.args` 里，**计划哈希看的是补完之后的那份**——少一个判别字段不该换来一次失败往返，也不该让同一次调用有两种形状。
+`mode` 是参数里的判别字段`mode` 是参数里的判别字段，但**模型偶尔会漏写**（真实会话里报的是 `missing field mode`，白跑一轮）。所以 Runtime 按参数形状补上：有 `code` 就是 `code`。补进去的值落在 `plan.args` 里，**计划哈希看的是补完之后的那份**——少一个判别字段不该换来一次失败往返，也不该让同一次调用有两种形状。
 
 `python` 交给模型的那段正文（§8.3 的投影）按这个顺序取：错误 → 结构化结果 → **stdout 的首尾摘录** → "没有返回值，也没有输出"。脚本只 `print` 是常见跑法，而字面量 `null` 会让模型以为工具坏了、改用 `shell` + `python3` 把同一件事重跑一遍（真实会话里就这么白花了两轮）。完整 stdout 照旧在 `stdout.txt` 里，抬头写着它的字节数。
 
-### 5.3 toolbox 文件布局
+### 5.3 toolbox（已删除，2026-10-15）
 
-```text
-toolbox/
-├── __init__.py
-├── README.md
-├── ha.py
-├── web_search.py
-├── memos.py
-├── tests/
-└── .staging/
-```
+「把 Python 模块保存进 toolbox、候选测试后启用、用 `python` 的 `call` 模式调用」这一整套已删除：`toolbox/` 目录、`komo toolbox` 命令、`/v1/toolbox` 路由、`Operation::PythonCall` 与 `call` 形式的 `PythonJob`、`PlanVersions.module`、`[paths] toolbox_dir`、`python` 子进程的凭证注入与 import 禁区钩子，都不再存在，也没有迁移层。可复用的集成改写成 Skill（§5.6）：`SKILL.md` 写步骤，脚本放在 Skill 目录里，模型用 `shell` 运行。`python` 工具只剩 `mode = "code"`。
 
-README 与模块说明提供用法。LLM 通过 read 查看说明，再通过 python 调用。保存工具不会扩张模型侧的六个工具 Schema。
+凭证边界不变（别处引用 §5.3 指的就是这条）：原始凭证不放进模型提示词、不进计划、不进事件、不打印到对话或日志，也不进服务单元文件（§3）；`shell` / `python` 子进程只拿显式的环境变量集合，不继承 Gateway 的环境。
 
-可见的树之外还有两处**隐藏**位置（2026-09-17 落地）：`.staging/<m>.json` 存候选元数据（版本、测试结果），`.versions/<m>/{<ver>.py, test_<ver>.py, <ver>.json, enabled.json}` 存每个版本的快照与「当前启用哪个」——§5.4 要求记录实际使用的模块版本并保存快照。版本号 = 代码哈希前 12 位 + 依赖锁哈希前 8 位。`code` 模式的解释器装了一个排在 `sys.meta_path` 最前的查找器，按解析后的落点拒绝 `.staging` / `.versions` 的导入；它挡的是 import 这条路，`exec(open(...).read())` 不在承诺内。
+### 5.4 AI 迭代流程（已删除，2026-10-15）
 
-HA、Memos、搜索服务地址和凭证引用通过配置传给已启用模块：模块用 `__komo_env__ = ["MEMOS_TOKEN", …]` 声明它要哪些**变量名**，变量名进执行计划（`ResourceRef`），Gateway 起子进程时从 `Secrets`（`.env`）按名解析注入，`.env` 改了下一次调用即生效；解析不到就不设置并告警一次，由模块自己报「未配置」。原始凭证不放进模型提示词、不进计划、不进事件、不打印到对话或日志，也不进服务单元文件（§3）。Memos 是随 komo 安装的首个内置已启用模块（同名模块已存在则不覆盖）。
-
-### 5.4 AI 迭代流程
-
-```text
-读取模块和使用说明
-  → write/edit 写入候选版本
-  → 运行测试并保存结果
-  → 展示差异、依赖变化和验证证据
-  → 启用（直接生效）
-  → 校验候选哈希与已测版本一致
-  → 原子替换当前版本
-```
-
-启用 / 停用直接生效，没有 Pending、没有后台等答复（2026-10-11 之前启用是一次审批，§7）。启用前仍要求候选哈希与已测版本一致——这是版本校验，不是授权。
-
-每次调用记录代码内容哈希、实际使用的自定义模块版本和 Python 环境版本，相关代码保存快照。首版不支持无法确定所执行版本的动态代码下载后自动调用。
-
-旧调用的恢复使用已保存结果；需要执行尚未开始的调用时，使用绑定版本。
+随 §5.3 一并删除。章节号保留，是为了不让别处的 §5.5、§5.6 引用错位。
 
 ### 5.5 Memos 作为主动记录的原文来源
 
-用户说“记一下”“保存这段内容”时，Agent 调用 `python → toolbox.memos`，写入 Memos。模块提供创建、查询、读取、修改等导出函数，具体函数按需要保存与启用；成功后返回记录 ID 和原文链接。
+用户说“记一下”“保存这段内容”时，Agent 按 Memos skill 的说明用 `shell` 运行其中的脚本，写入 Memos。脚本提供创建、查询、读取、修改等操作；成功后返回记录 ID 和原文链接。
 
-查询用户主动保存的记录时，通过模块查询 Memos 并读取原文。自动 Memory 可以保留相关摘要与 Memos 引用，但不建立第二份完整笔记库，也不把模型对笔记的推断视为用户确认。
+查询用户主动保存的记录时，通过 Memos skill 的脚本查询 Memos 并读取原文。自动 Memory 可以保留相关摘要与 Memos 引用，但不建立第二份完整笔记库，也不把模型对笔记的推断视为用户确认。
 
 Memos 使用用户访问令牌进行 API 认证；接入时核对用户部署的具体版本，不能把 latest 文档当成该实例的接口保证。[Memos API](https://usememos.com/docs/integrations/api-access) · [查询接口](https://usememos.com/docs/api/latest/memoservice/ListMemos)
 
-写入失败要明确报告；请求已发出但响应丢失时标记 uncertain，先核对远端结果，不能直接重试导致重复记录。模块不得在 Memos 不可用时静默改存本地并声称已完成。
+写入失败要明确报告；请求已发出但响应丢失时标记 uncertain，先核对远端结果，不能直接重试导致重复记录。脚本不得在 Memos 不可用时静默改存本地并声称已完成。
 
 ### 5.6 Skills：程序性说明
 
-Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几个 toolbox 函数"；toolbox 是**可执行能力**。两者互补，不合并，共同构成 §5.3 README 那一层"模型先读说明再动手"的知识面。
+Skills 是**人写的程序性说明**——"做 X 时按这几步、跑这个脚本"。脚本放在 Skill 目录里，由 `shell` 运行；komo 不另设"已保存的可执行能力"这一层（toolbox 已于 2026-10-15 删除，§5.3）。
 
 ```text
 ~/.komo/skills/<name>/SKILL.md   主目录
@@ -337,7 +292,7 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、用这几�
 
 只认这两处（加上配置里显式声明的目录）。`<workspace>/skills`、`~/.claude/skills` 不扫：根多了，模型拿不准 skill 在哪个根下，会把每个根下的同名 `SKILL.md` 都读一遍（真实会话里 `~/.claude/skills/sls` 是指向 `~/.agents/skills/sls` 的链接，同一份 16 KB 正文进了两次上下文）。
 
-- `SKILL.md` frontmatter：`name`、`description`，可选 `platforms:`、`requires_tools:`（对 5 个基础工具或 toolbox 模块名）。
+- `SKILL.md` frontmatter：`name`、`description`，可选 `platforms:`、`requires_tools:`（对工具名）。
 - 搜索路径有序，**同名先到先得**；每次查询重扫目录，编辑或新增无需重启。
 - 只有系统提示里的**目录行**（名字 + 一句描述，总量有上限）是受理 Run 时的快照，为了提示前缀稳定；`platforms:` / `requires_tools:` 只门控这份目录，不门控加载。实现上这一块是两行开头加若干目录行：先给**按序的根**（只列真的出了条目的那些，顺序就是搜索顺序——"同名先到先得"因此落得下来），再给目录行；模型按这个顺序去找 `<根>/<名字>/SKILL.md` 并 `read` 它。一条能露面的都没有时这一块整个不出现（不留空标题）。受理一条 Run 时渲染一次，正文冻结进 `RunSnapshot.skills_ref`（§6.2），这条 Run 的每一段（包括等介入、等退避之后的续跑）都逐字用它——目录行是提示前缀的一部分，不能一段一个样；`SKILL.md` 的增删改、`disable` 名单、配置重载都从下一条 Run 起生效（2026-10-14 之前每一段都读活注册表，"启动时算一次"只是这里的说法）。**整批装得下「名字 + 一句描述」就用它，装不下就只留名字**——列全比列得详细要紧：166 个 skill 的实测里，2000 字符的预算只留下字母表前 16 条，`log-diagnosis` 根本没进提示，模型为了找它去 `ls` 了整个目录；只留名字是 2752 字符、装得下全部（默认上限已按这个实测改成 4000）。名字都装不下时末尾会写「另有 N 条没列出来」：**「没有它」和「没列出来」是两件事**。
 - **没有 skill 工具。**模型通过 `read` 读 `SKILL.md`——写本地路径，或者写 `skill://<名字>/SKILL.md`（§4.7，逻辑入口，审计显示的是它）；skills 目录是只读根（§4.7 的资源根也在 `ToolContext.roots` 里）。
@@ -389,7 +344,7 @@ Gateway 设置总轮数、活动执行时限、输出长度和子进程并发预
 
 普通追问可以作为 assistant 回复结束本轮；用户下一条输入开启同一 Session 的新 Run。没有工具审批（§7）；只有阻塞会暂停原 Run（结果不明交给模型判断，2026-10-12），待操作者回答后继续，不增加交互工具；回答通常来自聊天渠道（§11）。
 
-**系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的介入、配置、skills、toolbox、Gateway 都是 komo 自己的状态，问到就用 shell 跑 `komo <子命令>`（给出几个常用子命令，其余看 `komo --help`）。这一段是**常量**，提示前缀因此稳定；`komo` 靠 PATH 找到——服务单元写入了安装时的 PATH（§3），不在提示里另给可执行文件路径。只在主 Agent 且挂了 `shell` 时出现：子代理只拿任务里写的东西（与 skills 目录同理，父侧需要时把命令写进任务）；没给 `shell` 的 Profile 说了也跑不了。起因是一次真实会话：问"当前有哪些 cron job"，模型不知道自己是 komo，先读了同名的共享 skill `cron-scheduler`，再翻 `crontab -l`、`/etc/cron.*`、`launchctl`、`~/.komo`，第 8 轮才跑到 `komo cron list`，9 轮 90 秒。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_its_cli`、`the_komo_section_needs_shell_and_the_main_agent`，golden `full_main_agent`、`plain_main_agent`。
+**系统提示告诉模型它就跑在 komo 里（2026-09-24）。** 主 Agent 的提示在工作目录 / 工具 / 行为约束之后、skills 目录之前多一小段：cron、会话与 Run、记忆、待处理的介入、配置、skills、Gateway 都是 komo 自己的状态，问到就用 shell 跑 `komo <子命令>`（给出几个常用子命令，其余看 `komo --help`）。这一段是**常量**，提示前缀因此稳定；`komo` 靠 PATH 找到——服务单元写入了安装时的 PATH（§3），不在提示里另给可执行文件路径。只在主 Agent 且挂了 `shell` 时出现：子代理只拿任务里写的东西（与 skills 目录同理，父侧需要时把命令写进任务）；没给 `shell` 的 Profile 说了也跑不了。起因是一次真实会话：问"当前有哪些 cron job"，模型不知道自己是 komo，先读了同名的共享 skill `cron-scheduler`，再翻 `crontab -l`、`/etc/cron.*`、`launchctl`、`~/.komo`，第 8 轮才跑到 `komo cron list`，9 轮 90 秒。回归测试：`context::prompt::tests::the_main_prompt_tells_the_model_to_query_komo_with_its_cli`、`the_komo_section_needs_shell_and_the_main_agent`，golden `full_main_agent`、`plain_main_agent`。
 
 Run 完成仅表示本轮结束。测试是否通过、性能是否改善、设备是否到达目标状态，都要依据具体执行证据报告。
 
@@ -446,7 +401,7 @@ workspace = "code/komo"
 1. **能力面**（`AgentSurface`，§4）：这次运行的工具集里没有这个名字，执行器不认。
 2. **工具自己的 `prepare`**：参数校验、目标解析、版本检查（覆盖已有文件要对得上版本，`call` 模式只认已启用版本的导出函数）、资源 URI 越界（§4.7）——这些是"这次调用说得通吗"，不是"允不允许"。不过就是一次没有执行过的调用，按 `fail_call` 落账，理由交给模型。
 
-没有第三层。委派、派任务、追问、更新计划、MCP 调用、codemode、Memory 内部变更都走同一条路。toolbox 启用 / 停用直接生效（§5.4）；cron 命令 Job 不再在 `cron add` 时签授权（§10.1）。
+没有第三层。委派、派任务、追问、更新计划、MCP 调用、codemode、Memory 内部变更都走同一条路。cron 命令 Job 不再在 `cron add` 时签授权（§10.1）。
 
 `policy.toml` 不再读：文件还在时 `komo config check` 与 Gateway 启动日志**报一句**"policy.toml 已不再使用，可以删掉"——与 start-only 键同一条规则（§3），报出来，不静默忽略。
 
@@ -892,7 +847,7 @@ JSONL 追加和状态提交都校验领取代次。领取代次只防止旧执�
 
 异常退出可能遗留子进程，不能仅凭一个 PID 判断是否为原进程；结合平台监督信息、启动身份和进程启动时间核对。无法确认旧执行已结束时，阻止该任务重复启动并显示原因。Tokio 的 Child handle 被丢弃并不默认终止进程，因此 kill_on_drop 不能取代异常退出和进程树回收方案。[Tokio process](https://docs.rs/tokio/latest/tokio/process/index.html)
 
-长脚本要拆成多个可观察的工具步骤，或由已启用的 toolbox 脚本保存阶段进度。首版恢复到工具调用边界，不恢复 Python 内存、调用栈或某一行。脚本只有“进度标记”而没有副作用核对，仍不足以保证安全续跑。
+长脚本要拆成多个可观察的工具步骤，或由脚本把阶段进度写进文件。首版恢复到工具调用边界，不恢复 Python 内存、调用栈或某一行。脚本只有“进度标记”而没有副作用核对，仍不足以保证安全续跑。
 
 ### 8.8 恢复所需的上下文与用户体验
 
@@ -954,7 +909,7 @@ Session 不是只能追加的对象。删掉一个会话今天等于 `rm -rf ses
 
 | 内容                               | 保存位置                                      | 使用方式                                                  |
 | ---------------------------------- | --------------------------------------------- | --------------------------------------------------------- |
-| 用户主动要求保存的笔记、想法和记录 | 现有 Memos                                    | 通过已启用的 toolbox.memos 保存、搜索和读取，返回原文链接 |
+| 用户主动要求保存的笔记、想法和记录 | 现有 Memos                                    | 通过 Memos skill 的脚本（`shell` 运行）保存、搜索和读取，返回原文链接 |
 | 自动积累的偏好、项目事实和执行经验 | 本机 state.db 的 memory_items / memory_evidence | MemoryManager 提取、校验、召回、更新和遗忘                |
 | 本次任务的工作状态                 | Session / Run / ToolCall                      | 用于上下文与 resume，不自动等同于长期事实                 |
 | 关键词与向量索引                   | 同一个 state.db                                 | 从有效记忆重建，不能取代原文与来源                        |
@@ -1333,7 +1288,6 @@ TELEGRAM_BOT_TOKEN=...
 │       │       └── stderr.txt  # 按需保存
 │       └── artifacts/  # 当前会话的报告、脚本快照和生成文件
 ├── runtime/             # 发现文件、锁等
-├── toolbox/             # 保存的 Python 能力及说明
 ├── skills/              # 人写的 SKILL.md（§5.6）
 ├── wechat/              # 微信登录凭证
 ├── python-envs/         # 受管理的环境版本
@@ -1341,7 +1295,7 @@ TELEGRAM_BOT_TOKEN=...
 └── logs/                # Gateway 自身的运行日志
 ```
 
-Session 内容以目录为单位管理和归档，不再使用顶层 tool-output 或 artifacts 分散存放会话数据。自动 Memory 保存在 state.db，用户主动记录保存在 Memos；可复用 Python 能力继续保存在 toolbox，实际项目副本保存在 workspaces。会话 artifacts 中需要长期保留的报告和文件，不因清理聊天历史而自动删除；不能直接删除整个 Session 目录代替引用检查。**会话的删除只有一条入口**：`komo session delete` 进 `closing`、对账判定后进 `deleted`、`komo session purge` 才真的删内容（§8.10）——`rm -rf sessions/{id}` 不在流程里，它今天造成的正是"数据库说有、内容说没有"的那种对不上（§8.9）。会话来源需要清理时，先为仍引用它的记忆保留必要的、经脱敏的证据摘录与来源元信息，或停用无法再验证的条目，不能留下伪装有效的引用。重建内容索引不删除 JSONL；清理已结束 Session 的 JSONL 需要同时处理索引、检查点和引用关系。
+Session 内容以目录为单位管理和归档，不再使用顶层 tool-output 或 artifacts 分散存放会话数据。自动 Memory 保存在 state.db，用户主动记录保存在 Memos；可复用能力保存在 skills，实际项目副本保存在 workspaces。会话 artifacts 中需要长期保留的报告和文件，不因清理聊天历史而自动删除；不能直接删除整个 Session 目录代替引用检查。**会话的删除只有一条入口**：`komo session delete` 进 `closing`、对账判定后进 `deleted`、`komo session purge` 才真的删内容（§8.10）——`rm -rf sessions/{id}` 不在流程里，它今天造成的正是"数据库说有、内容说没有"的那种对不上（§8.9）。会话来源需要清理时，先为仍引用它的记忆保留必要的、经脱敏的证据摘录与来源元信息，或停用无法再验证的条目，不能留下伪装有效的引用。重建内容索引不删除 JSONL；清理已结束 Session 的 JSONL 需要同时处理索引、检查点和引用关系。
 
 记忆正文、来源和确认记录需要持久保留；关键词与向量索引可从原文重建，禁止为了重建索引删除整个数据库。Memos 原文由 Memos 自己的备份策略覆盖。
 
@@ -1390,7 +1344,6 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/config/check             | 当前配置的校验结果（与热重载同一个函数）       |
 | POST /v1/config/reload           | 热重载；校验不过 422 并保留原配置               |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
-| GET /v1/toolbox · GET /v1/toolbox/{m} · POST /v1/toolbox/{m}/test · POST /v1/toolbox/{m}/enable · POST /v1/toolbox/{m}/disable | toolbox 模块清单、详情、候选测试、启用、停用（直接生效，§5.4） |
 
 除最小健康检查外统一认证。提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。
 
@@ -1738,7 +1691,7 @@ codegen-units = 16
 | `MemoryRepo` | toasty + `memory_terms`（store） | 内存 | `MemoryManager` 的全部状态读写；召回排序逻辑要在无数据库下测 |
 | `LlmClient` / `TurnDriver` | 每种协议一个适配器（runtime） | 脚本化 driver | 主模型、记忆模型是同一 trait 的两个实例；loop 测试用脚本化回合 |
 | `EmbeddingClient` | OpenAI-compatible / Ollama（runtime） | 固定向量 | 空间指纹与维度校验要在无网络下测 |
-| `PythonHost` | 子进程 + venv 版本（runtime） | 假宿主 | `python` 工具与 toolbox 测试都经它 |
+| `PythonHost` | 子进程 + venv 版本（runtime） | 假宿主 | `python` 工具经它 |
 | `Tool` | 5 个（runtime） | — | §4 已定；executor 只认 trait |
 | `Channel` / `Inbound` / `Notifier` | 飞书、Telegram、WeChat、HTTP API、SSE（gateway） | 内存渠道 | 首版就有三个真实现；介入通知的渲染是各渠道实现的事 |
 | `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避全部依赖时间 |
@@ -1899,7 +1852,7 @@ pub trait Clock: Send + Sync {
 | 3. 六个工具 | 文件、搜索、进程、Python 环境与输出处理；重放策略声明（`Tool::replay`，默认 unsafe，§8.6） | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 是只读计划（可并发、codemode 可调），且它不依赖机器上装没装 `rg` |
 | 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、介入通知渲染、飞书 Run 回复卡片、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一条介入被答两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/answer` 重发只答一次；来源会话与 home chat 都收到介入通知且第二个答复得到"已决定"；`/approve`、`y` 不是命令；Gateway 重启后 pending 投递补发一次，老库里 `approval_request` / `approval_settled` 的 pending 行被跳过而不卡住补发；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的介入通知 |
 | 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，`toasty::sql`）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的介入仍能在手机上 `/answer`；**旧数据照常起来**：带 `approval.*` 事件的旧会话能加载、回放与续聊（那些事件按未知事件解码），停在 `waiting + approval` 的旧 Run 在 Gateway 启动后按"批准"续跑、那次调用只执行一次，老库里多出来的 `approval_requests` / `policy_grants` 表不妨碍启动（§7.4） |
-| 6. toolbox 迭代 + Skills | 保存模块、候选测试、版本校验与启用；`SkillRegistry`、目录行门控、`read` 只读根 | 调用使用已启用且已测试版本；候选哈希与已测版本不一致时拒绝启用；启用 / 停用直接生效，没有 Pending；新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect |
+| 6. Skills | `SkillRegistry`、目录行门控、`read` 只读根（toolbox 已于 2026-10-15 删除，§5.3） | 新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect |
 | 7. Cron | 持久调度、去重、重叠处理、人工接手 | 重启不重复创建同次触发；命令 Job 触发时直接执行、全程零模型请求，`cron add` 不签任何授权；Cron Run 的介入在聊天里 `/answer` 后继续，不获得交互操作者身份 |
 | 8. 模型配置与 Memory | 独立记忆 / 向量模型、effort 校验、自动提取、混合召回（`memory_terms` + 向量）与遗忘 | 不串用模型配置；推断不自行确认；过期或遗忘内容不召回；重建可恢复 |
 | 9. 场景与双平台验收 | 真实代码仓库、测试 HA 设备、Memos 主动记录；编译预算复测 | 两平台独立运行；记录从 Memos 找回；代码交付含验证证据；冷编与增量编译在预算内，或有记录在案的偏差原因 |

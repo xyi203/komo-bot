@@ -42,12 +42,12 @@ use komo_kernel::types::turn::{
 
 use crate::executor::{CallEnv, CallRequest, ExecError, RoundStop, ToolExecutor};
 
-/// 一次执行段的预算（§6：Gateway 设置总轮数）。**重启不重置预算**（§8.5）——所以
+/// 一次执行段的预算（§6；总轮数默认不设上限）。**重启不重置预算**（§8.5）——所以
 /// 它由调用方从已保存的计数算出来，而不是每段从零开始。
 #[derive(Debug, Clone)]
 pub struct Budget {
-    /// 这一段最多再跑几轮模型。
-    pub max_rounds: u32,
+    /// 这一段最多再跑几轮模型；`None` = 不设。
+    pub max_rounds: Option<u32>,
     /// token 上限；`None` = 不设。
     pub max_tokens: Option<u64>,
     /// 这一段从第几轮编号起（续跑时接着数）。
@@ -85,11 +85,10 @@ impl Default for RetryBudget {
 impl Default for Budget {
     fn default() -> Self {
         Self {
-            // 100 轮：24 在真活上太紧——一次"读几个文件、跑几次命令、再核对一遍"的活
-            // 就能撞到顶，撞上就是一次失败的 Run（线上撞过：一个抓取整理的任务在 24 轮上
-            // 停住，事情其实快做完了）。仍然是个数，不是无限；单个 Job 还能用
-            // `max_rounds` 覆盖（§10）。
-            max_rounds: 100,
+            // 不设轮数上限：任何一个数在真活上都会撞到——撞上就是一次失败的 Run，事情
+            // 往往快做完了（线上先撞过 24，又放到 100）。停一条 Run 靠取消；单个 Job 想要
+            // 上限就用自己的 `max_rounds`（§10）。
+            max_rounds: None,
             max_tokens: None,
             first_round: 1,
             retry: RetryBudget::default(),
@@ -387,13 +386,11 @@ impl AgentLoop {
             if env.cancel.is_cancelled() {
                 return self.cancel(&run, rounds).await;
             }
-            if rounds >= budget.max_rounds {
+            if let Some(max_rounds) = budget.max_rounds
+                && rounds >= max_rounds
+            {
                 return self
-                    .fail_with(
-                        &run,
-                        rounds,
-                        format!("超过总轮数预算（{}）", budget.max_rounds),
-                    )
+                    .fail_with(&run, rounds, format!("超过总轮数预算（{max_rounds}）"))
                     .await;
             }
 

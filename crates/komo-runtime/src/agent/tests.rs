@@ -301,7 +301,7 @@ async fn the_round_budget_ends_in_a_failure_not_a_loop() {
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget {
-                max_rounds: 2,
+                max_rounds: Some(2),
                 ..Budget::default()
             },
             resume: None,
@@ -320,6 +320,26 @@ async fn the_round_budget_ends_in_a_failure_not_a_loop() {
     assert_eq!(*rounds, 2);
     assert!(reason.contains("总轮数预算"), "{reason}");
     assert_eq!(tool.ran(), 2);
+}
+
+/// 默认预算不设轮数上限：跑过以前的 100 轮也照样跑到模型自己收尾。
+#[tokio::test]
+async fn the_default_budget_has_no_round_limit() {
+    let tool = Arc::new(RecordingTool::bash());
+    let mut script: Vec<Round> = (1..=120)
+        .map(|n| round(n, None, vec![call("pc-1", "bash", serde_json::json!({}))]))
+        .collect();
+    script.push(round(121, Some("跑完了。"), vec![]));
+    let wired = Wired::new(vec![script], vec![tool.clone()]);
+    let segment = wired.segment(CancelToken::new()).await;
+    assert_eq!(segment.budget.max_rounds, None);
+    let outcome = wired.agent.run(segment).await.unwrap();
+
+    assert!(
+        matches!(outcome, SegmentOutcome::Completed { rounds: 121, .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(tool.ran(), 120);
 }
 
 /// 取消：Run 明确终止在 cancelled，不留一个跑着的调用。

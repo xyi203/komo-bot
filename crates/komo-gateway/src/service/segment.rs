@@ -69,7 +69,8 @@ pub struct GatewaySegments {
     /// 拿它填进 `CallEnv`，回放那一侧用同一个值——两处各写一个数就会让"刚跑完"和"回放"
     /// 渲染出不一样的正文。
     config: Option<Arc<ConfigHolder>>,
-    max_rounds: u32,
+    /// 全局轮数上限；`None` = 不设（§6）。
+    max_rounds: Option<u32>,
     max_retries: u32,
     cancels: Mutex<BTreeMap<RunId, CancelToken>>,
     /// `None` = 这台 Gateway 没有记忆这一层（测试里的精简装配）。
@@ -104,7 +105,7 @@ impl GatewaySegments {
         db: Db,
         recovery: RecoveryStore,
         workspaces: PathBuf,
-        max_rounds: u32,
+        max_rounds: Option<u32>,
         max_retries: u32,
     ) -> Self {
         GatewaySegments {
@@ -222,11 +223,11 @@ impl GatewaySegments {
         self
     }
 
-    /// 这一段最多跑几轮。
+    /// 这一段最多跑几轮；`None` = 不设。
     ///
     /// Cron Job 可以有自己的预算；读不出那个 Job（被删了、读不出来）就回到全局值——
     /// **不要因为读不到预算就不跑**，那会把一次配置问题变成一次静默的失败。
-    async fn max_rounds_for(&self, source: &komo_kernel::types::plan::PlanSource) -> u32 {
+    async fn max_rounds_for(&self, source: &komo_kernel::types::plan::PlanSource) -> Option<u32> {
         let komo_kernel::types::plan::PlanSource::Cron { job, .. } = source else {
             return self.max_rounds;
         };
@@ -234,7 +235,7 @@ impl GatewaySegments {
             return self.max_rounds;
         };
         match cron.get(job).await {
-            Ok(Some(job)) => job.max_rounds.unwrap_or(self.max_rounds),
+            Ok(Some(job)) => job.max_rounds.or(self.max_rounds),
             Ok(None) => self.max_rounds,
             Err(error) => {
                 tracing::warn!(%error, %job, "读不出这个 Job 的执行预算，用全局的");

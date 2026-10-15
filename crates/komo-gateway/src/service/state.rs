@@ -407,8 +407,8 @@ pub struct GatewayState {
     pub interventions_delivered: Mutex<std::collections::BTreeSet<String>>,
     /// 模型请求的有界退避预算上限（§8.5）。
     pub max_retries: u32,
-    /// 一段最多跑几轮模型（§6）。
-    pub max_rounds: u32,
+    /// 一段最多跑几轮模型（§6）；`None` = 不设。
+    pub max_rounds: Option<u32>,
 }
 
 impl std::fmt::Debug for GatewayState {

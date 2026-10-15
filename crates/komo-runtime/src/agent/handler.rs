@@ -271,7 +271,9 @@ impl AgentRunHandler {
                 .source
                 .segment(claimed, self.executor.catalog())
                 .await?;
-            segment.budget.max_rounds = segment.budget.max_rounds.saturating_sub(used_rounds);
+            if let Some(limit) = segment.budget.max_rounds.as_mut() {
+                *limit = limit.saturating_sub(used_rounds);
+            }
             if let Some(limit) = segment.budget.max_tokens.as_mut() {
                 *limit = limit.saturating_sub(used_tokens);
             }
@@ -947,7 +949,7 @@ mod tests {
                         request: turn_request(&session, &run),
                         env,
                         budget: Budget {
-                            max_rounds: 3,
+                            max_rounds: Some(3),
                             ..Budget::default()
                         },
                         resume: None,

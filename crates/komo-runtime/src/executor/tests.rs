@@ -4001,6 +4001,47 @@ mod fused {
         interrupted_call_of_retired_tool("python", Some(Operation::PythonCode)).await;
     }
 
+    /// 工具后来没了、但上一世只落了计划没 `started` 的调用：确定没执行过，照旧被拒，
+    /// 不补开尝试、不记 uncertain。
+    #[tokio::test]
+    async fn a_planned_only_call_to_a_retired_tool_is_refused_not_uncertain() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.executor(tools());
+        let (session, run) = harness.open_run().await;
+        let mut calls = harness
+            .record_round(
+                &run,
+                &[("python", serde_json::json!({ "command": COUNTING }))],
+            )
+            .await;
+        let mut plan = plan_of(&BashTool::new(), &harness, &session, &run, &calls[0]).await;
+        plan.tool = "python".into();
+        plan.operation = Operation::PythonCode;
+        harness
+            .ledger
+            .plan_call(&calls[0].call, &plan)
+            .await
+            .unwrap();
+        calls[0].plan = Some(plan);
+        calls[0].resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(outcome.results[0].is_error);
+        assert!(
+            outcome.results[0].content.contains("可用的是"),
+            "{}",
+            outcome.results[0].content
+        );
+        assert_eq!(runs(&root), 0);
+        assert!(started(&harness).is_empty(), "没有补开尝试");
+    }
+
     /// 只有带着落账计划的在途调用走"结果不明"：模型这一轮新发的 `shell` / `python` 没有
     /// 计划，仍被拒，并列出这次能用的工具。
     #[tokio::test]

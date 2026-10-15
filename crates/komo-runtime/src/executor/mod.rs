@@ -550,9 +550,13 @@ impl ToolExecutor {
         //
         // 在途调用例外：已经有落账计划、上一世接着往下做的调用，工具名可能是后来才没有的
         // （改名、删除）。它也许已经动过手，不能判成"没开始"、更不能停下 Run：与别的 unsafe
-        // 中断一样记 uncertain 交给模型。模型这一轮新发的调用没有落账计划，照旧被拒。
+        // 中断一样记 uncertain 交给模型。只落了计划、没 started 的确定没执行过（§8.4 第 6 行），
+        // 与模型这一轮新发的调用一样照旧被拒。
         let known = env.surface.allows(&request.tool) && self.tools.contains_key(&request.tool);
-        if !known && let (Some(plan), Some(state)) = (&request.plan, &request.resumed) {
+        if !known
+            && let (Some(plan), Some(state)) = (&request.plan, &request.resumed)
+            && state.previous_state != ToolCallState::Planned
+        {
             return self.settle_interrupted(request, env, plan, state).await;
         }
         if !env.surface.allows(&request.tool) {

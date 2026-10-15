@@ -231,6 +231,107 @@ pub fn interjected() -> Vec<Event> {
     events
 }
 
+/// 一条 Run 东翻西找：第一轮并发读两个文件、搜一次，第二轮跑一条命令，第三轮再读一个，
+/// 第四轮回答。除了最后那轮，助手消息都只有调用、没有正文。
+pub fn explored() -> Vec<Event> {
+    type Call = (&'static str, &'static str, serde_json::Value);
+    let rounds: [(Option<&str>, &[Call]); 4] = [
+        (
+            None,
+            &[
+                ("c-1", "read", serde_json::json!({ "path": "src/a.rs" })),
+                ("c-2", "read", serde_json::json!({ "path": "src/b.rs" })),
+                ("c-3", "rg", serde_json::json!({ "pattern": "fn main" })),
+            ],
+        ),
+        (
+            None,
+            &[("c-4", "bash", serde_json::json!({ "command": "ls" }))],
+        ),
+        (
+            None,
+            &[("c-5", "read", serde_json::json!({ "path": "src/c.rs" }))],
+        ),
+        (Some("看完了。"), &[]),
+    ];
+    let mut events = conversation()[..3].to_vec();
+    let mut seq = 3;
+    let mut next = || {
+        seq += 1;
+        seq
+    };
+    for (round, (text, calls)) in rounds.into_iter().enumerate() {
+        events.push(event(
+            next(),
+            Some(run()),
+            EventPayload::MessageAssistant(MessageAssistant {
+                round: round as u32 + 1,
+                text: text.map(Into::into),
+                text_ref: None,
+                tool_calls: calls
+                    .iter()
+                    .map(|(id, name, args)| ToolCallRequest {
+                        call_id: ToolCallId::from_raw(*id),
+                        provider_call_id: format!("p{id}"),
+                        name: (*name).into(),
+                        arguments: args.clone(),
+                        arguments_ref: None,
+                    })
+                    .collect(),
+                provider_blocks: None,
+                input_tokens: Some(100),
+                output_tokens: Some(10),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            }),
+        ));
+        for (id, _, _) in calls {
+            let attempt = AttemptId::from_raw(format!("a{id}"));
+            events.push(event(
+                next(),
+                Some(run()),
+                EventPayload::ToolStarted(ToolStarted {
+                    call_id: ToolCallId::from_raw(*id),
+                    attempt_id: attempt.clone(),
+                    plan_ref: EventId::from_raw("evt-0"),
+                    plan_hash: plan().plan_hash(),
+                }),
+            ));
+            events.push(event(
+                next(),
+                Some(run()),
+                EventPayload::ToolResult(ToolResult {
+                    body: None,
+                    call_id: ToolCallId::from_raw(*id),
+                    attempt_id: attempt,
+                    status: ToolResultStatus::Completed,
+                    output_ref: OutputRef(ContentRef {
+                        path: format!("tool-output/run-1/{id}/output.json"),
+                        size: 2,
+                        hash: ContentHash::of_str("x"),
+                        pointer: None,
+                    }),
+                    elapsed_ms: 20,
+                    preview: Some(format!("{id} 的输出")),
+                    stdout: None,
+                    stderr: None,
+                    attempt_state: None,
+                }),
+            ));
+        }
+    }
+    events.push(event(
+        next(),
+        Some(run()),
+        EventPayload::RunCompleted(RunCompleted {
+            final_message: Some("看完了。".into()),
+            final_message_ref: None,
+            rounds: 4,
+        }),
+    ));
+    events
+}
+
 pub fn page(events: Vec<Event>, more: bool) -> EventPage {
     let next = events.last().map(|e| e.seq).unwrap_or(Seq::ZERO);
     EventPage {

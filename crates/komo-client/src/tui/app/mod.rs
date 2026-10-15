@@ -247,15 +247,17 @@ impl ToolLine {
     /// 行首那一格。
     ///
     /// **还在跑的那一格是动的**（[`crate::tui::spinner`]）：一块静止的文字只在它变的那
-    /// 一刻有信息，看久了分不清是还在跑还是卡住了。跑完了反过来——那时要的是一眼扫过去
-    /// 的结论，所以定住。
+    /// 一刻有信息，看久了分不清是还在跑还是卡住了。工具行是一明一暗的圆点（明暗由画的
+    /// 那边按 [`crate::tui::spinner::lit`] 给），与状态行那颗星分得开。跑完了反过来——
+    /// 那时要的是一眼扫过去的结论，所以定住。
     ///
     /// **`?` 是 uncertain**：副作用可能已经发生（§8.6），既不是成功也不是失败，所以它
     /// 不共用失败那个符号。
     pub fn marker(&self, now: Option<OffsetDateTime>) -> &'static str {
         match self.state {
             ToolCallState::Planned => "·",
-            ToolCallState::Started => crate::tui::spinner::frame(now),
+            ToolCallState::Started if now.is_some() => crate::tui::spinner::PULSE,
+            ToolCallState::Started => crate::tui::spinner::STILL,
             ToolCallState::Completed => "✔",
             ToolCallState::Failed => "✖",
             ToolCallState::Uncertain => "?",

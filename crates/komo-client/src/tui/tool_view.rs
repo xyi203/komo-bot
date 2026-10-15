@@ -10,8 +10,9 @@
 //! - **结果**以 `⎿` 起头：`bash`（旧记录叫 `shell`）留尾，其他留头。成功的 `read` / `edit` / `write` 不印——
 //!   前者就是文件本身，后两者的回执头一行已经说了；失败了照印，那是原因。
 //!
-//! 折叠时每一块最多 [`FOLDED_LINES`] 行，超出的说一句还有几行、按什么展开，每行截在一屏
-//! 宽；`Ctrl-T` 打开就全给、长行折行，并补上头一行与正文没用到的参数——已经印出去的那些
+//! 折叠时结果最多 [`RESULT_LINES`] 行、头一行与正文最多 [`BODY_LINES`] 行（照 Claude
+//! Code：一轮几次调用落进回滚区，每次只占几行），超出的说一句还有几行、按什么展开，每行
+//! 截在一屏宽；`Ctrl-T` 打开就全给、长行折行，并补上头一行与正文没用到的参数——已经印出去的那些
 //! 也一起重画（见 [`crate::tui::transcript`]）。**`edit` 的 diff 不折**：改了什么就是这次
 //! 调用的全部内容，折掉一半等于没给。
 //!
@@ -24,11 +25,14 @@ use serde_json::Value;
 use time::OffsetDateTime;
 
 use crate::tui::app::ToolLine;
-use crate::tui::markdown;
 use crate::tui::transcript::state_colour;
+use crate::tui::{markdown, spinner};
 
-/// 折叠时每一块最多几行。
-pub const FOLDED_LINES: usize = 10;
+/// 折叠时结果最多几行。
+pub const RESULT_LINES: usize = 3;
+
+/// 折叠时头一行（折出来的续行）与正文各最多几行。
+pub const BODY_LINES: usize = 4;
 
 /// 头一行以下那几块缩进多少。
 const INDENT: &str = "    ";
@@ -57,6 +61,7 @@ pub fn lines(
         Body::Text(text) => out.extend(block(
             text,
             Keep::Head,
+            BODY_LINES,
             detail,
             width,
             INDENT,
@@ -69,6 +74,69 @@ pub fn lines(
     }
     out.extend(result_lines(tool, view.result, detail, width));
     out
+}
+
+/// 这次调用是不是"看一眼"：读文件、搜一下。连着的几次在回滚区上收成一行
+/// （[`group_lines`]）。
+pub fn explores(tool: &ToolLine) -> bool {
+    matches!(tool.tool.as_str(), "read" | "rg")
+}
+
+/// 连着的读与搜收成的一行（照 Claude Code）：读了几个文件、搜了几次。一轮里并发的五六次
+/// 读文件各占一行，看的人只关心"它去翻过了"；要看翻了哪些，`Ctrl-T` 逐条展开。
+pub fn group_lines(
+    tools: &[&ToolLine],
+    width: u16,
+    now: Option<OffsetDateTime>,
+) -> Vec<Line<'static>> {
+    let running = tools.iter().any(|tool| !tool.state.is_terminal());
+    let state = if running {
+        ToolCallState::Started
+    } else {
+        ToolCallState::Completed
+    };
+    let style = Style::default().fg(state_colour(state));
+    let (mark, mark_style) = match (running, now) {
+        (false, _) => ("✔", style),
+        (true, None) => (spinner::STILL, style),
+        (true, Some(_)) if spinner::lit(now) => (spinner::PULSE, style),
+        (true, Some(_)) => (spinner::PULSE, style.add_modifier(Modifier::DIM)),
+    };
+    let files: std::collections::BTreeSet<&str> = tools
+        .iter()
+        .filter(|tool| tool.tool == "read")
+        .map(|tool| {
+            tool.args
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        })
+        .collect();
+    let searches = tools.iter().filter(|tool| tool.tool == "rg").count();
+    let (read, search) = if running {
+        ("读取", "搜索")
+    } else {
+        ("读了", "搜了")
+    };
+    let mut parts = Vec::new();
+    if !files.is_empty() {
+        parts.push(format!("{read} {} 个文件", files.len()));
+    }
+    if searches > 0 {
+        parts.push(format!("{search} {searches} 次"));
+    }
+    let mut text = format!(" {}", parts.join("、"));
+    if running {
+        text.push('…');
+    }
+    vec![fit_spans(
+        vec![
+            Span::styled(format!("  {mark}"), mark_style),
+            Span::styled(text, style),
+            Span::styled("（Ctrl-T 展开）", Style::default().fg(Color::DarkGray)),
+        ],
+        width as usize,
+    )]
 }
 
 /// 一次调用按它是哪个工具拆开的样子。
@@ -216,7 +284,7 @@ fn text_body(text: &str) -> Body {
 }
 
 /// 头一行：记号、工具名、动了什么，跑完了再在末尾补一个耗时。按宽度折行，续行缩进；
-/// 折叠时最多 [`FOLDED_LINES`] 行。
+/// 折叠时最多 [`BODY_LINES`] 行。
 fn head_lines(
     tool: &ToolLine,
     summary: &str,
@@ -225,14 +293,22 @@ fn head_lines(
     now: Option<OffsetDateTime>,
 ) -> Vec<Line<'static>> {
     let style = Style::default().fg(state_colour(tool.state));
-    let text = format!("  {} {} {}", tool.marker(now), tool.tool, clean(summary));
+    let mark = if tool.state == ToolCallState::Started && !spinner::lit(now) {
+        style.add_modifier(Modifier::DIM)
+    } else {
+        style
+    };
+    let text = format!(" {} {}", tool.tool, clean(summary));
     let mut rows = wrap_spans(
-        vec![Span::styled(text.trim_end().to_string(), style)],
+        vec![
+            Span::styled(format!("  {}", tool.marker(now)), mark),
+            Span::styled(text.trim_end().to_string(), style),
+        ],
         width,
         INDENT,
     );
-    if !detail && rows.len() > FOLDED_LINES {
-        rows.truncate(FOLDED_LINES);
+    if !detail && rows.len() > BODY_LINES {
+        rows.truncate(BODY_LINES);
         if let Some(last) = rows.pop() {
             let mut spans = last.spans;
             spans.push(Span::styled("…", style));
@@ -272,13 +348,14 @@ fn result_lines(tool: &ToolLine, keep: Keep, detail: bool, width: usize) -> Vec<
     } else {
         Style::default().fg(Color::Gray)
     };
-    block(text, keep, detail, width, RESULT_MARK, style)
+    block(text, keep, RESULT_LINES, detail, width, RESULT_MARK, style)
 }
 
 /// 一段多行正文：折叠时留一头、说一句还有几行；第一行顶 `first`，其余顶 [`INDENT`]。
 fn block(
     text: &str,
     keep: Keep,
+    limit: usize,
     detail: bool,
     width: usize,
     first: &str,
@@ -290,15 +367,15 @@ fn block(
     }
     let more = Style::default().fg(Color::DarkGray);
     let mut rows: Vec<(String, Style)> = Vec::new();
-    if detail || lines.len() <= FOLDED_LINES {
+    if detail || lines.len() <= limit {
         rows.extend(lines.into_iter().map(|line| (line, style)));
     } else if keep == Keep::Tail {
-        let hidden = lines.len() - FOLDED_LINES;
+        let hidden = lines.len() - limit;
         rows.push((format!("… 前面还有 {hidden} 行（Ctrl-T 展开）"), more));
         rows.extend(lines.drain(hidden..).map(|line| (line, style)));
     } else {
-        let hidden = lines.len() - FOLDED_LINES;
-        rows.extend(lines.drain(..FOLDED_LINES).map(|line| (line, style)));
+        let hidden = lines.len() - limit;
+        rows.extend(lines.drain(..limit).map(|line| (line, style)));
         rows.push((format!("… 还有 {hidden} 行（Ctrl-T 展开）"), more));
     }
     rows.into_iter()
@@ -765,12 +842,12 @@ mod tests {
                 Some(&output),
             );
             let text = text_of(&lines(&tool, false, 80, None));
-            assert!(text.contains("… 前面还有 5 行（Ctrl-T 展开）"), "{text}");
+            assert!(text.contains("… 前面还有 12 行（Ctrl-T 展开）"), "{text}");
             assert!(
-                text.contains("第 6 行") && text.contains("第 15 行"),
+                text.contains("第 13 行") && text.contains("第 15 行"),
                 "{text}"
             );
-            assert!(!text.contains("第 5 行"), "{text}");
+            assert!(!text.contains("第 12 行"), "{text}");
         }
     }
 
@@ -788,10 +865,10 @@ mod tests {
         assert!(text.contains("rg fn main · crates · *.rs"), "{text}");
         assert!(text.contains("  ⎿ 第 1 行"), "{text}");
         assert!(
-            text.contains("第 10 行") && !text.contains("第 11 行"),
+            text.contains("第 3 行") && !text.contains("第 4 行"),
             "{text}"
         );
-        assert!(text.contains("… 还有 4 行（Ctrl-T 展开）"), "{text}");
+        assert!(text.contains("… 还有 11 行（Ctrl-T 展开）"), "{text}");
     }
 
     /// 读到的正文就是文件本身，成功时不印；失败了要印，那是原因。
@@ -906,9 +983,10 @@ mod tests {
         );
         let folded = text_of(&lines(&tool, false, 80, None));
         assert!(
-            folded.contains("… 还有 4 行"),
+            folded.contains("… 还有 10 行"),
             "十三行脚本加一行 EOF：{folded}"
         );
+        assert!(folded.contains("… 前面还有 4 行"), "{folded}");
         assert!(!folded.contains("cwd"), "{folded}");
 
         let detail = text_of(&lines(&tool, true, 80, None));
@@ -941,6 +1019,29 @@ mod tests {
         );
         let lines = lines(&tool, false, 80, None);
         assert_eq!(text_of(&lines), "  ✔ rg x  1.2s");
+    }
+
+    /// 在跑的那一格是圆点，按钟一明一暗；冻进回滚区的没有钟，不用圆点。
+    #[test]
+    fn a_running_call_pulses_a_dot_not_the_status_spinner() {
+        let tool = call(
+            "bash",
+            json!({ "command": "sleep 5" }),
+            ToolCallState::Started,
+            None,
+        );
+        let t0 = time::macros::datetime!(2026-09-22 08:00:00 UTC);
+        let half = t0 + time::Duration::milliseconds(spinner::PULSE_MS as i64);
+        let mark = |now| lines(&tool, false, 80, Some(now))[0].spans[0].clone();
+        assert_eq!(mark(t0).content, "  ●");
+        assert_eq!(mark(half).content, "  ●");
+        assert_ne!(
+            mark(t0).style.add_modifier.contains(Modifier::DIM),
+            mark(half).style.add_modifier.contains(Modifier::DIM),
+            "一明一暗"
+        );
+        let frozen = text_of(&lines(&tool, false, 80, None));
+        assert!(!frozen.contains('●'), "{frozen}");
     }
 
     /// 认不出主参数的工具：折叠时压成一行，展开时逐个列出来。

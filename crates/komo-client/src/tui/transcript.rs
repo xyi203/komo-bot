@@ -29,6 +29,7 @@ use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::turn::Role;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use time::OffsetDateTime;
 
 use crate::tui::app::{App, Draft, Notice, SubmissionState, ToolLine};
 use crate::tui::{markdown, tool_view};
@@ -51,8 +52,9 @@ pub struct Emitted {
     notices: u64,
     /// 模型正在生成（或刚生成完、正式消息还没到）的那几段，各自交出去了多少。
     streams: Vec<Stream>,
-    /// 交出去的最后一块是不是一次工具调用。下一段正文要先空一行，否则它紧贴在结果下面，
-    /// 分不清哪几行是工具的输出、从哪儿起是回答。
+    /// 交出去的最后一块是不是一次工具调用。下一块（正文或另一次调用）要先空一行，否则它
+    /// 紧贴在结果下面，分不清哪几行是这次调用的输出、从哪儿起是下一块（照 Claude Code，
+    /// 每次调用之间都隔一行）。
     after_tool: bool,
 }
 
@@ -93,18 +95,14 @@ impl Emitted {
         }
         self.messages = messages.len();
 
-        for tool in app.tool_lines() {
-            if self.tools.contains(&tool.call) || !self.settled(app, tool) {
+        for block in blocks(app, &self.tools) {
+            if self.handed(&block) || !block.settled(app) {
                 continue;
             }
-            self.tools.insert(tool.call.clone());
+            self.tools
+                .extend(block.tools.iter().map(|tool| tool.call.clone()));
             // 交出去的行冻在纸上：**不给钟**，否则那一格会定格在某一帧随机的样子。
-            items.push((
-                tool.seq,
-                false,
-                true,
-                tool_view::lines(tool, app.tool_detail, width, None),
-            ));
+            items.push((block.seq(), false, true, block.lines(app, width, None)));
         }
 
         // 提示没有自己的 seq，排在它出现时已经收到的那条事件之后（[`Notice::at`]）：平时
@@ -159,12 +157,12 @@ impl Emitted {
         out
     }
 
-    /// 把一块交出去：工具调用之后的第一段正文先空一行。
+    /// 把一块交出去：工具调用之后的下一块先空一行。
     fn hand_over(&mut self, out: &mut Vec<Line<'static>>, lines: Vec<Line<'static>>, tool: bool) {
         if lines.is_empty() {
             return;
         }
-        if self.after_tool && !tool {
+        if self.after_tool {
             out.push(Line::default());
         }
         self.after_tool = tool;
@@ -174,11 +172,23 @@ impl Emitted {
     /// 还在动的那些，每一帧重画。
     pub fn live(&self, app: &App, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        // 与交出去时同一条空行规则，免得定型那一帧整块往下跳一行。
+        let mut after_tool = self.after_tool;
+        let mut push = |lines: &mut Vec<Line<'static>>, block: Vec<Line<'static>>, tool: bool| {
+            if block.is_empty() {
+                return;
+            }
+            if after_tool {
+                lines.push(Line::default());
+            }
+            after_tool = tool;
+            lines.extend(block);
+        };
 
         // Enter 之后立刻显示，不等 SSE 绕一圈。权威的 `run.accepted` 到达时状态机会移除
         // 对应项，那一刻它从这里消失、同时以折出来的用户消息落进回滚区。
         for pending in &app.pending_submissions {
-            lines.extend(user_lines(&pending.text, width));
+            let mut block = user_lines(&pending.text, width);
             let (label, style) = match &pending.state {
                 SubmissionState::Sending => (
                     "  ↥ 发送中…".to_string(),
@@ -200,8 +210,9 @@ impl Emitted {
                 ),
             };
             for piece in markdown::wrap_to_width(&label, width as usize) {
-                lines.push(Line::from(Span::styled(piece, style)));
+                block.push(Line::from(Span::styled(piece, style)));
             }
+            push(&mut lines, block, false);
         }
 
         // 模型正在打字的那一段：**不是历史**（`assistant_delta` 只在 SSE 上，永不进
@@ -210,20 +221,22 @@ impl Emitted {
         // 状态行那一格已经在转，两处一起动只是重复。
         if let Some(draft) = &app.draft {
             let done = self.committed_len(draft);
-            lines.extend(markdown::render_after(
-                &draft.text[..done],
-                &draft.text[done..],
-                width,
-            ));
+            let block = markdown::render_after(&draft.text[..done], &draft.text[done..], width);
+            push(&mut lines, block, false);
         }
 
-        for tool in app.tool_lines() {
-            if self.tools.contains(&tool.call) {
+        for block in blocks(app, &self.tools) {
+            if self.handed(&block) {
                 continue;
             }
-            lines.extend(tool_view::lines(tool, app.tool_detail, width, app.now));
+            push(&mut lines, block.lines(app, width, app.now), true);
         }
         lines
+    }
+
+    /// 这一块交出去了没有。一块总是整块交（[`blocks`] 不往交出去的组里接新的）。
+    fn handed(&self, block: &Block<'_>) -> bool {
+        self.tools.contains(&block.tools[0].call)
     }
 
     /// 这条正式消息之前有没有边生成边交出去过：有就取走那段记账。
@@ -264,20 +277,123 @@ impl Emitted {
             .filter(|stream| draft.text.starts_with(&stream.committed))
             .map_or(0, |stream| stream.committed.len())
     }
+}
 
-    /// 这一次调用定型了没有。
-    ///
-    /// 跑完是一种，**这条 Run 已经结束**是另一种：取消掉的那一轮里有调用会永远停在
-    /// `started` 上（§8.6 的 uncertain 也走这条），没有第二条它就永远留在视口里。
-    fn settled(&self, app: &App, tool: &ToolLine) -> bool {
-        if tool.state.is_terminal() {
-            return true;
-        }
-        tool.run
-            .as_ref()
-            .and_then(|run| app.surface.runs.get(run))
-            .is_some_and(|view| view.status.is_terminal())
+/// 回滚区上的一块调用：一次，或连着的几次读与搜（[`tool_view::explores`]）。
+struct Block<'a> {
+    tools: Vec<&'a ToolLine>,
+    /// 读与搜的一组：一次也算一组，因为后面还可能接上来。
+    group: bool,
+    /// 后面已经有东西了（说出来的话、别的调用、下一段草稿、Run 结束）：这一组不会再长。
+    closed: bool,
+}
+
+impl<'a> Block<'a> {
+    fn seq(&self) -> Seq {
+        self.tools[0].seq
     }
+
+    /// 定型了没有。一组要全部跑完、而且**不会再长**才交：交出去的那一行改不了，先交
+    /// "读了 2 个文件"、下一轮又读一个，就只能再起一行。
+    fn settled(&self, app: &App) -> bool {
+        let done = self.tools.iter().all(|tool| settled(app, tool));
+        done && (!self.group || self.closed)
+    }
+
+    fn lines(&self, app: &App, width: u16, now: Option<OffsetDateTime>) -> Vec<Line<'static>> {
+        match self.tools.as_slice() {
+            [tool] => tool_view::lines(tool, app.tool_detail, width, now),
+            tools => tool_view::group_lines(tools, width, now),
+        }
+    }
+}
+
+/// 按 seq 排好的调用切成一块一块。
+///
+/// 读与搜**连着**才收成一组：同一条 Run、中间没有说出来的话（用户的、带正文的助手消息），
+/// 也没有别的调用。失败与结果不明的不进组——那一行要印出原因。`Ctrl-T` 打开时一次一块，
+/// 逐条全给。已经交出去的一组不再接新的（`emitted`），后来的另起一组。
+fn blocks<'a>(app: &'a App, emitted: &BTreeSet<ToolCallId>) -> Vec<Block<'a>> {
+    let tools = app.tool_lines();
+    let spoken: Vec<Seq> = app
+        .messages()
+        .iter()
+        .filter(|message| match message.role {
+            Role::User => true,
+            Role::Assistant => message
+                .text
+                .as_deref()
+                .is_some_and(|t| !t.trim().is_empty()),
+            Role::Tool => false,
+        })
+        .map(|message| message.seq)
+        .collect();
+    let mut out: Vec<Block<'a>> = Vec::new();
+    let mut open: Option<usize> = None;
+    for tool in tools {
+        if app.tool_detail || !groupable(app, tool) {
+            out.push(Block {
+                tools: vec![tool],
+                group: false,
+                closed: true,
+            });
+            open = None;
+            continue;
+        }
+        let joins = open.map(|at| &out[at]).is_some_and(|block| {
+            let last = block.tools[block.tools.len() - 1];
+            last.run == tool.run
+                && !emitted.contains(&last.call)
+                // 一轮的调用与请求它们的那条消息同一个 seq：那条消息若有正文，就隔开了。
+                && !spoken.iter().any(|seq| last.seq < *seq && *seq <= tool.seq)
+        });
+        match open {
+            Some(at) if joins => out[at].tools.push(tool),
+            _ => {
+                out.push(Block {
+                    tools: vec![tool],
+                    group: true,
+                    closed: false,
+                });
+                open = Some(out.len() - 1);
+            }
+        }
+    }
+    let count = out.len();
+    let last_spoken = spoken.last().copied();
+    for (at, block) in out.iter_mut().enumerate().filter(|(_, block)| block.group) {
+        let end = block.tools[block.tools.len() - 1];
+        block.closed = at + 1 < count
+            || last_spoken.is_some_and(|seq| seq > end.seq)
+            || app.draft.is_some()
+            || run_ended(app, end);
+    }
+    out
+}
+
+/// 进得了读与搜的那一组：这一行最后会是 ✔。
+fn groupable(app: &App, tool: &ToolLine) -> bool {
+    tool_view::explores(tool)
+        && match tool.state {
+            ToolCallState::Failed | ToolCallState::Uncertain => false,
+            ToolCallState::Completed => true,
+            ToolCallState::Planned | ToolCallState::Started => !run_ended(app, tool),
+        }
+}
+
+/// 这一次调用定型了没有。
+///
+/// 跑完是一种，**这条 Run 已经结束**是另一种：取消掉的那一轮里有调用会永远停在
+/// `started` 上（§8.6 的 uncertain 也走这条），没有第二条它就永远留在视口里。
+fn settled(app: &App, tool: &ToolLine) -> bool {
+    tool.state.is_terminal() || run_ended(app, tool)
+}
+
+fn run_ended(app: &App, tool: &ToolLine) -> bool {
+    tool.run
+        .as_ref()
+        .and_then(|run| app.surface.runs.get(run))
+        .is_some_and(|view| view.status.is_terminal())
 }
 
 /// 一条消息的正文。**不含它请求的工具调用**：那些各自定型、各自落地。
@@ -796,5 +912,107 @@ mod tests {
         assert_eq!(marker.len(), 1, "{marker:?}");
         assert!(marker[0].ends_with('…'), "{marker:?}");
         assert!(markdown::display_width(&marker[0]) <= 40, "{marker:?}");
+    }
+
+    /// 照 Claude Code：连着的读与搜收成一行，命令照常单占一块，每块之间空一行。
+    #[test]
+    fn consecutive_reads_and_searches_land_as_one_line() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &fixture::explored());
+        let text = text_of(&Emitted::new().take(&app, 80));
+        assert!(
+            text.contains("  ✔ 读了 2 个文件、搜了 1 次（Ctrl-T 展开）\n\n  ✔ bash $ ls"),
+            "{text}"
+        );
+        assert!(
+            text.contains("c-4 的输出\n\n  ✔ read src/c.rs  20ms\n\n看完了。"),
+            "{text}"
+        );
+        assert!(!text.contains("src/a.rs"), "{text}");
+    }
+
+    /// 一组跑完了也先留在视口里，直到后面有了东西、它不会再长——交出去的那一行改不了。
+    #[test]
+    fn a_group_stays_live_until_nothing_more_can_join() {
+        let events = fixture::explored();
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        let mut emitted = Emitted::new();
+
+        // 读完两个，搜的那次还没跑。
+        feed(&mut app, &events[..8]);
+        assert!(!text_of(&emitted.take(&app, 80)).contains('读'));
+        let live = text_of(&emitted.live(&app, 80));
+        assert!(live.contains("读取 2 个文件、搜索 1 次…"), "{live}");
+
+        // 第一轮全跑完：还没有下文，照旧在视口里。
+        feed(&mut app, &events[8..10]);
+        assert!(!text_of(&emitted.take(&app, 80)).contains('读'));
+        let live = text_of(&emitted.live(&app, 80));
+        assert!(live.contains("✔ 读了 2 个文件、搜了 1 次"), "{live}");
+
+        // 下一轮来了一条命令：这一组到头了，落地一次，视口里不再有它。
+        feed(&mut app, &events[10..11]);
+        let settled = text_of(&emitted.take(&app, 80));
+        assert_eq!(settled.matches("读了 2 个文件").count(), 1, "{settled}");
+        assert!(!text_of(&emitted.live(&app, 80)).contains('读'));
+        feed(&mut app, &events[11..]);
+        assert!(!text_of(&emitted.take(&app, 80)).contains("读了 2"));
+    }
+
+    /// 只有调用、没有正文的几轮接着收进同一组；中间说了话就另起一组。
+    #[test]
+    fn only_spoken_text_or_another_tool_splits_a_group() {
+        let mut events = fixture::explored();
+        if let komo_kernel::events::EventPayload::MessageAssistant(body) = &mut events[10].payload {
+            body.tool_calls[0].name = "read".into();
+            body.tool_calls[0].arguments = serde_json::json!({ "path": "src/d.rs" });
+        }
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &events);
+        let text = text_of(&Emitted::new().take(&app, 80));
+        assert!(text.contains("✔ 读了 4 个文件、搜了 1 次"), "{text}");
+
+        if let komo_kernel::events::EventPayload::MessageAssistant(body) = &mut events[13].payload {
+            body.text = Some("再看一个。".into());
+        }
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &events);
+        let text = text_of(&Emitted::new().take(&app, 80));
+        assert!(
+            text.contains(
+                "✔ 读了 3 个文件、搜了 1 次（Ctrl-T 展开）\n\n再看一个。\n\n  ✔ read src/c.rs"
+            ),
+            "{text}"
+        );
+    }
+
+    /// `Ctrl-T` 打开时一次一块，逐条全给。
+    #[test]
+    fn detail_lists_every_read_on_its_own() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &fixture::explored());
+        app.tool_detail = true;
+        let text = text_of(&Emitted::new().take(&app, 80));
+        assert!(!text.contains("读了"), "{text}");
+        assert!(
+            text.contains("read src/a.rs") && text.contains("rg fn main"),
+            "{text}"
+        );
+    }
+
+    /// 失败的那次不进组：它要印出原因。
+    #[test]
+    fn a_failed_read_stands_on_its_own() {
+        let mut events = fixture::explored();
+        if let komo_kernel::events::EventPayload::ToolResult(body) = &mut events[7].payload {
+            body.status = komo_kernel::types::refs::ToolResultStatus::Failed;
+            body.preview = Some("src/b.rs 不存在".into());
+        }
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        feed(&mut app, &events);
+        let text = text_of(&Emitted::new().take(&app, 80));
+        assert!(text.contains("✖ read src/b.rs"), "{text}");
+        assert!(text.contains("src/b.rs 不存在"), "{text}");
+        assert!(!text.contains("读了"), "{text}");
     }
 }

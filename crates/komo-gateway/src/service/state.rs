@@ -364,6 +364,10 @@ pub struct GatewayState {
     pub notifier: Arc<HomeNotifier>,
     pub channels: Arc<ChannelRegistry>,
     pub llm: Arc<SwappableLlm>,
+    /// provider 报的上下文窗口（配置没写 `context_window` 的模型）。
+    pub windows: super::windows::WindowCache,
+    /// 注入了模型后端（测试）就不探：探测要走真网络。
+    probe_windows: bool,
     /// 首轮跑完后用记忆模型起会话标题（[`super::titles`]）。注入模型后端的测试里关着。
     pub auto_title: bool,
     /// 上一条投到 home chat 的重载错误。同一条错误不重复投；装上之后清掉并说一声。
@@ -531,6 +535,7 @@ impl GatewayState {
 
         // 注入了模型后端（测试）就不起标题：多出来的那次请求会吃掉脚本里下一段的答复。
         let auto_title = llm.is_none();
+        let probe_windows = llm.is_none();
         let llm = Arc::new(SwappableLlm::new(match llm {
             Some(client) => client,
             None => build_llm(&snapshot, &config, &caps),
@@ -651,6 +656,8 @@ impl GatewayState {
             notifier,
             channels,
             llm,
+            windows: super::windows::WindowCache::default(),
+            probe_windows,
             auto_title,
             scheduler,
             handler,
@@ -834,6 +841,45 @@ impl GatewayState {
         self.llm
             .swap(build_llm(&snapshot, &self.config, &self.caps));
         tracing::info!("模型后端已按新配置重建（正在跑的 Run 不受影响）");
+    }
+
+    /// 给配置里没写 `context_window` 的 completion 模型各起一次后台探测。
+    ///
+    /// 不在就绪路径上（与向量探测同一个教训）；已在探或已有结论的键不重复起，上次失败的
+    /// 会重探。启动、热重载改了模型键、受理 Run 时都调它。
+    pub fn spawn_window_probes(self: &Arc<Self>) {
+        if !self.probe_windows {
+            return;
+        }
+        let snapshot = self.snapshot();
+        for (alias, model) in snapshot.model_catalog.completions() {
+            let Some(config) = model.completion() else {
+                continue;
+            };
+            if config.context_window.is_some() {
+                continue;
+            }
+            let key = super::windows::key_of(config);
+            if !self.windows.begin(&key) {
+                continue;
+            }
+            let state = Arc::clone(self);
+            let config = config.clone();
+            let alias = alias.to_string();
+            let factory = llm_factory(&snapshot, &self.config, &self.caps);
+            tokio::spawn(async move {
+                let result = komo_runtime::llm::probe_context_window(&factory, &config).await;
+                let outcome = match result {
+                    Ok(Some(window)) => super::windows::WindowState::Found(window),
+                    Ok(None) => super::windows::WindowState::Missing,
+                    Err(error) => {
+                        tracing::warn!(alias, %error, "探测模型上下文窗口失败；可在 model.<alias>.context_window 里写明");
+                        super::windows::WindowState::Failed(error.to_string())
+                    }
+                };
+                state.windows.finish(key, outcome);
+            });
+        }
     }
 
     /// 某个 `[channels.*]` 变了：只停掉并重启那一个渠道（§3 第 3 步）。
@@ -1066,7 +1112,9 @@ impl GatewayState {
 
         // 模型：这次请求里显式给的最优先（那是操作者**这一次**的选择），其次 Profile 的
         // alias（进 `model_catalog` 解析），最后主模型。
-        let model = model.unwrap_or_else(|| self.agent_model(config, profile));
+        let mut model = model.unwrap_or_else(|| self.agent_model(config, profile));
+        // 配置没写窗口时用探到的；探测还没回来就是 None，快照冻结后照此回放。
+        model.context_window = self.windows.effective(&model);
 
         // 身份指令正文**进 `PayloadStore`**，快照里只留引用（§4.3）：存的是内容，不是
         // 文件路径——等待期间配置文件可能已经被改过，恢复出来的 Run 不能换一副面孔。
@@ -1227,6 +1275,8 @@ impl GatewayState {
         let mut frozen = self
             .freeze_run(&config, &agent_id, session, record.as_ref(), model)
             .await?;
+        // 这条 Run 的窗口若还没探到（或上次失败），顺手补一次后台探测，不等它。
+        self.spawn_window_probes();
         let skip_memory = direct_command.is_some();
         if direct_command.is_some() && !frozen.surface.allows("bash") {
             return Err(GatewayError::InvalidRequest(format!(
@@ -1513,6 +1563,18 @@ fn session_log_path(session: &SessionId) -> String {
 /// 一次补写最多处理多少条审计事件。
 const AUDIT_DRAIN_LIMIT: usize = 128;
 
+/// 模型后端与窗口探测共用的工厂：凭证、effort 能力表、ChatGPT 凭证路径只在这一处接。
+fn llm_factory(
+    snapshot: &ConfigSnapshot,
+    config: &ConfigHolder,
+    caps: &EffortCapabilities,
+) -> komo_runtime::llm::LlmFactory {
+    komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone())
+        .with_chatgpt_credentials_path(komo_runtime::llm::codex_auth::credentials_path(
+            &snapshot.start_only.data_dir,
+        ))
+}
+
 /// 记忆提取 / 冲突整理用的那个后端。
 ///
 /// 测试注入了模型时就用那一个（脚本化的 driver 要同时答两种问）；否则按快照造一份自己
@@ -1527,10 +1589,7 @@ fn llm_for_memory(
     if let Some(client) = injected {
         return Arc::clone(client);
     }
-    let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone())
-        .with_chatgpt_credentials_path(komo_runtime::llm::codex_auth::credentials_path(
-            &snapshot.start_only.data_dir,
-        ));
+    let factory = llm_factory(snapshot, config, caps);
     match komo_runtime::llm::RoutingLlm::from_snapshot(snapshot, factory) {
         Ok(routing) => Arc::new(routing),
         Err(error) => Arc::new(UnconfiguredLlm::new(error.to_string())),
@@ -1642,10 +1701,7 @@ fn build_llm(
     config: &ConfigHolder,
     caps: &EffortCapabilities,
 ) -> Arc<dyn LlmClient> {
-    let factory = komo_runtime::llm::LlmFactory::new(config.secrets(), caps.clone())
-        .with_chatgpt_credentials_path(komo_runtime::llm::codex_auth::credentials_path(
-            &snapshot.start_only.data_dir,
-        ));
+    let factory = llm_factory(snapshot, config, caps);
     match komo_runtime::llm::RoutingLlm::from_snapshot(snapshot, factory) {
         Ok(routing) => Arc::new(routing),
         Err(error) => {

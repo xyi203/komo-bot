@@ -2031,3 +2031,103 @@ async fn an_empty_bang_command_is_refused() {
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("!ls"), "{body}");
 }
+
+/// 受理 Run 时把探到的窗口补进模型快照；配置里写了的不被盖掉；没探到的保持 `None`。
+#[tokio::test]
+async fn acceptance_fills_the_probed_window_only_when_config_has_none() {
+    use crate::service::test_support::harness::{FakeLlm, Home, text_round};
+    use crate::service::windows::{WindowState, key_of};
+
+    let home = Home::new();
+    let gateway = home
+        .start(FakeLlm::new(vec![
+            vec![text_round(1, "一")],
+            vec![text_round(1, "二")],
+            vec![text_round(1, "三")],
+        ]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let state = gateway.state();
+    let model = state.snapshot().model.clone();
+    assert_eq!(model.context_window, None);
+
+    let window_of = |run: RunId| {
+        let db = state.db.clone();
+        async move {
+            komo_store::repos::runs::get(&db, &run)
+                .await
+                .expect("读得到")
+                .expect("有这个 Run")
+                .model
+                .context_window
+        }
+    };
+
+    // 没探到 / 探到但 provider 没说：None。
+    let session = gateway.open_session().await;
+    let run = gateway.submit(&session, "w-1", "一").await.run;
+    assert_eq!(window_of(run).await, None);
+    state.windows.finish(key_of(&model), WindowState::Missing);
+    let run = gateway.submit(&session, "w-2", "二").await.run;
+    assert_eq!(window_of(run).await, None);
+
+    // 探到了：补进快照。
+    state
+        .windows
+        .finish(key_of(&model), WindowState::Found(500_000));
+    let run = gateway.submit(&session, "w-3", "三").await.run;
+    assert_eq!(window_of(run).await, Some(500_000));
+}
+
+/// `/v1/config/check` 按 alias 列出窗口来源：配置写了的是 config，探到的是 provider，其余 unknown。
+#[tokio::test]
+async fn config_check_lists_window_sources_per_alias() {
+    use crate::service::windows::{WindowState, key_of};
+    use komo_kernel::protocol::http::{ConfigCheckResponse, WindowSource};
+
+    let gateway = TestGateway::with(
+        &config_toml(
+            r#"
+[model.job]
+type = "completion"
+api_backend = "responses"
+base_url = "https://jobs.example.com/v1"
+model = "job-model"
+api_key_env = "KOMO_LLM_API_KEY"
+context_window = 64000
+"#,
+        ),
+        Some(crate::service::test_support::harness::FakeLlm::new(vec![])
+            as Arc<dyn komo_kernel::traits::LlmClient>),
+    )
+    .await;
+    let main = gateway.state().snapshot().model.clone();
+    let (status, body) = gateway.get("/v1/config/check").await;
+    assert_eq!(status, 200, "{body}");
+    let response: ConfigCheckResponse = serde_json::from_str(&body).expect("能解码");
+    let source = |alias: &str| {
+        response
+            .model_windows
+            .iter()
+            .find(|w| w.alias == alias)
+            .unwrap_or_else(|| panic!("缺 {alias}"))
+            .source
+    };
+    assert_eq!(source("job"), WindowSource::Config);
+    assert_eq!(source("main"), WindowSource::Unknown);
+
+    gateway
+        .state()
+        .windows
+        .finish(key_of(&main), WindowState::Found(500_000));
+    let (_, body) = gateway.get("/v1/config/check").await;
+    let response: ConfigCheckResponse = serde_json::from_str(&body).expect("能解码");
+    let main_row = response
+        .model_windows
+        .iter()
+        .find(|w| w.alias == "main")
+        .unwrap();
+    assert_eq!(
+        (main_row.source, main_row.window),
+        (WindowSource::Provider, Some(500_000))
+    );
+}

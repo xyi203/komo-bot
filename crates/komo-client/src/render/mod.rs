@@ -11,8 +11,8 @@ use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
     ConfigCheckResponse, ConfigReloadResponse, CronListResponse, HealthResponse, IndexState,
     InterventionDetail, InterventionListResponse, InterventionSummary, MemoryIndexStatus,
-    MemoryListResponse, MemorySweepResponse, ModelsResponse, RunDetail, SessionListResponse,
-    SessionSummary, SweepRule, ToolCallSummary,
+    MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, RunDetail,
+    SessionListResponse, SessionSummary, SweepRule, ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
@@ -684,7 +684,31 @@ pub fn config_check(response: &ConfigCheckResponse) -> String {
     if let Some(warning) = stale_warning(response.loaded_at, &response.sources) {
         out.push(warning);
     }
+    out.extend(window_lines(&response.model_windows));
     out.join("\n")
+}
+
+/// 各 completion alias 的上下文窗口；未知的提示去配置里写。
+fn window_lines(windows: &[ModelWindow]) -> Vec<String> {
+    if windows.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![String::new(), "上下文窗口".into()];
+    for item in windows {
+        let line = match (item.source, item.window) {
+            (WindowSource::Config, Some(n)) => format!("{n}（配置）"),
+            (WindowSource::Provider, Some(n)) => format!("{n}（provider）"),
+            _ => format!(
+                "未知（{}）",
+                item.detail.as_deref().unwrap_or("provider 没有报告")
+            ),
+        };
+        out.push(format!("  {:<24} {line}", item.alias));
+    }
+    if windows.iter().any(|w| w.window.is_none()) {
+        out.push("  未知的窗口可在 model.<alias>.context_window 里写明".into());
+    }
+    out
 }
 
 /// `komo config reload`：**成功**的那一支。

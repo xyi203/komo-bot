@@ -27,6 +27,7 @@ pub mod state;
 pub mod tasks;
 pub mod titles;
 pub mod units;
+pub(crate) mod windows;
 
 // W5 恢复故障注入验收（§14）要在集成测试里包一层故障账本，所以它也在 feature 后面。
 #[cfg(any(test, feature = "test-support"))]
@@ -208,6 +209,8 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     state.wire_task_spawner();
     // `monitor` / `monitor_stop` 的接缝，同一个接法（`docs/monitor.md`）。
     state.wire_monitors();
+    // 窗口探测放后台，不挡 `Gateway 就绪`。
+    state.spawn_window_probes();
 
     // 5. 绑监听——发现文件里要写真实地址，所以端口必须先定下来。
     let listen = options

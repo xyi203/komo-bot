@@ -723,6 +723,7 @@ fn config_response(
             path: PathBuf::from("/home/u/.komo/config.toml"),
             mtime,
         }],
+        model_windows: Vec::new(),
     }
 }
 
@@ -935,5 +936,38 @@ fn a_stamp_takes_the_offset_of_its_own_instant_across_dst() {
     assert_eq!(
         stamp_in(datetime!(2026-12-01 17:00:00 UTC), &new_york),
         "2026-12-01 12:00:00 -05:00"
+    );
+}
+
+#[test]
+fn config_check_lists_window_sources_and_hints_for_unknown() {
+    let mut response = config_response(Vec::new(), NOW, NOW);
+    response.model_windows = vec![
+        ModelWindow {
+            alias: "a".into(),
+            window: Some(100_000),
+            source: WindowSource::Config,
+            detail: None,
+        },
+        ModelWindow {
+            alias: "b".into(),
+            window: Some(500_000),
+            source: WindowSource::Provider,
+            detail: None,
+        },
+        ModelWindow {
+            alias: "c".into(),
+            window: None,
+            source: WindowSource::Unknown,
+            detail: Some("provider 没有报告".into()),
+        },
+    ];
+    let printed = config_check(&response);
+    assert!(printed.contains("100000（配置）"), "{printed}");
+    assert!(printed.contains("500000（provider）"), "{printed}");
+    assert!(printed.contains("未知（provider 没有报告）"), "{printed}");
+    assert!(
+        printed.contains("model.<alias>.context_window"),
+        "{printed}"
     );
 }

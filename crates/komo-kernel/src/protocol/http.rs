@@ -943,6 +943,29 @@ pub struct ConfigCheckResponse {
     /// 各来源文件与它们的 mtime。和 `loaded_at` 对不上就是"文件改了但没装上"（§3）。
     #[serde(default)]
     pub sources: Vec<SourceFile>,
+    /// 每个 completion alias 的上下文窗口与来源。旧服务端不带这个字段。
+    #[serde(default)]
+    pub model_windows: Vec<ModelWindow>,
+}
+
+/// 窗口取值的来源：配置 > provider `/models` > 未知。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowSource {
+    Config,
+    Provider,
+    Unknown,
+}
+
+/// `komo config check` 里一个 completion alias 的上下文窗口。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelWindow {
+    pub alias: String,
+    pub window: Option<u64>,
+    pub source: WindowSource,
+    /// 只在 `Unknown` 时有：探测中 / provider 没报告 / 失败原因。
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// `POST /v1/config/reload`：校验通过才装，装完报告差异。

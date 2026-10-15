@@ -55,7 +55,7 @@ fn entry(api: &Api, alias: &str, model: &CatalogModel, default: bool) -> ModelMe
         model: config.model.clone(),
         provider: model.model_provider().unwrap_or("standalone").to_string(),
         api_backend: config.provider.clone(),
-        context_window: config.context_window,
+        context_window: api.state.windows.effective(config),
         efforts: config
             .efforts
             .clone()
@@ -94,6 +94,15 @@ pub async fn check(State(api): State<Api>) -> Json<ConfigCheckResponse> {
         // 「`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是
         // "文件改了但没装上"」——所以这里给的是**文件此刻**的 mtime。
         sources: api.state.config.sources().stamps(),
+        model_windows: snapshot
+            .model_catalog
+            .completions()
+            .filter_map(|(alias, model)| {
+                model
+                    .completion()
+                    .map(|config| api.state.windows.describe(alias, config))
+            })
+            .collect(),
     })
 }
 

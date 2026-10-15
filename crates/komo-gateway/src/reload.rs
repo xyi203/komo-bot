@@ -89,6 +89,7 @@ async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) {
             || key.starts_with("credentials.")
     }) {
         state.rebuild_llm();
+        state.spawn_window_probes();
     }
     // 记忆模型按 alias 指向 `model.*`，所以那一组变了也要换；向量后端不在这里（§9.5）。
     if changed.iter().any(|key| {

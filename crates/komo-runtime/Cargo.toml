@@ -44,6 +44,7 @@ tempfile = { workspace = true }
 # codemode 的脚本引擎（docs/codemode.md §2）；num-bigint 是 Monty 的大整数与 JSON 之间的桥。
 monty = { workspace = true }
 monty-types = { workspace = true }
+monty-fs = { workspace = true }
 num-bigint = { workspace = true }
 
 # Gateway 起来时抬"能开的文件数"软上限（limits.rs，launchd 默认只有 256）；codemode worker 的

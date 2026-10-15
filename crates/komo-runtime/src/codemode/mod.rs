@@ -8,8 +8,10 @@
 //! 本模块的 [`worker`]），宿主管墙钟、内存与取消，到限就 SIGKILL。
 
 use std::future::Future;
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
@@ -21,17 +23,96 @@ pub mod worker;
 /// 与根 `Cargo.toml` 里 `monty` 的精确钉版本同步（有测试守着）。
 pub const MONTY_VERSION: &str = "1.1.0";
 /// worker 协议版本：请求 / 消息 / 脚本前置代码（`prelude.py`）任一变了就加一。
-pub const WORKER_PROTOCOL: u32 = 1;
+pub const WORKER_PROTOCOL: u32 = 2;
+/// 一次 `os.urandom` / `random` 起始状态最多向宿主要这么多字节（Monty 给 `random` 起状态要 2496）。
+const MAX_URANDOM: usize = 1 << 16;
 
 /// 脚本和 worker 合计的常驻内存上限：既是 Monty 的软限，也是宿主看门狗的杀线。
 const DEFAULT_MEMORY_LIMIT: u64 = 1 << 30;
 const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
+/// worker 启动后的第一行：它是哪一版。宿主与 worker 是同一个可执行文件，但磁盘上的二进制会在
+/// Gateway 重启之前被换掉（`komo update` / `scripts/install-local.sh`），新起的 worker 就可能
+/// 不是 Gateway 的那一版，对不上就干净地失败（`docs/codemode.md` §4）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Hello {
+    pub protocol: u32,
+    pub monty: String,
+    pub komo: String,
+}
+
+impl Hello {
+    pub fn current() -> Self {
+        Self {
+            protocol: WORKER_PROTOCOL,
+            monty: MONTY_VERSION.to_string(),
+            komo: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
+/// 脚本要宿主回答的、本身不确定的读数：时钟与熵。Monty 的 `DateTimeSource::CallHost` /
+/// `RandomStart::CallHost` 把它们都交到宿主手里，宿主记进 journal，恢复时按序原样还回去
+/// （`docs/codemode.md` §7）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Nondet {
+    /// 当前时刻，答 Unix 秒（f64）；`time.*` / `datetime.now` / `date.today` 都读它。
+    Clock,
+    /// `size` 个随机字节，答小写十六进制串。
+    Urandom { size: usize },
+}
+
+/// 回答一次 [`Nondet`]。默认是真值（[`live`]）；executor 换成"先还录下来的、录完了再读真的并记账"。
+pub type NondetHandler = Arc<dyn Fn(&Nondet) -> Result<serde_json::Value, String> + Send + Sync>;
+
+/// 真实的时钟与熵。
+pub fn live(request: &Nondet) -> Result<serde_json::Value, String> {
+    match request {
+        Nondet::Clock => {
+            let micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| format!("系统时钟在 1970 年之前：{error}"))?
+                .as_micros();
+            Ok(serde_json::json!(micros as f64 / 1e6))
+        }
+        Nondet::Urandom { size } => {
+            let mut bytes = vec![0u8; (*size).min(MAX_URANDOM)];
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut file| file.read_exact(&mut bytes))
+                .map_err(|error| format!("读不到系统熵：{error}"))?;
+            Ok(serde_json::Value::String(
+                bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+            ))
+        }
+    }
+}
+
+/// 脚本前置代码（`prelude.py`）的哈希：写进 journal 的 `start` 指纹，它变了意味着同一段脚本
+/// 的行为可能变了。
+pub fn prelude_hash() -> komo_kernel::types::digest::ContentHash {
+    komo_kernel::types::digest::ContentHash::of_str(worker::PRELUDE)
+}
+
 /// 怎么起一个 worker。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Worker {
     launch: Launch,
     memory_limit: u64,
+    /// 脚本的工作目录（`os.getcwd()`，相对路径按它解析）。
+    cwd: Option<PathBuf>,
+    /// 脚本读不了的路径：komo 自己的状态，与 `write` / `edit` 同一份名单。
+    protected: Vec<PathBuf>,
+    nondet: NondetHandler,
+}
+
+impl std::fmt::Debug for Worker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Worker")
+            .field("launch", &self.launch)
+            .field("cwd", &self.cwd)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,7 +122,7 @@ enum Launch {
     /// 测试用：同进程里的一个线程，经 socketpair 说同一套协议。杀不掉，只靠 Monty 自己的
     /// 时间限制收尾，所以死循环、内存看门狗这类要杀进程的验收走真进程（`crates/komo/tests`）。
     #[cfg(any(test, feature = "test-support"))]
-    InProcess,
+    InProcess(Hello),
 }
 
 /// 脚本里发现工具用的说明：这次能调的工具与它们所属的组。
@@ -67,6 +148,20 @@ pub struct ScriptOutcome {
     pub console: String,
     /// 脚本抛出的异常（traceback）或 worker 层的失败。`None` = 正常跑完。
     pub error: Option<String>,
+    /// worker 与宿主不是同一版（[`Hello`] 对不上）：脚本一行都没跑，宿主不该把它记成脚本的结果。
+    pub incompatible: Option<String>,
+}
+
+/// 与 worker 对话中途停下的两种理由。
+enum Stop {
+    Failed(String),
+    Incompatible(String),
+}
+
+impl From<String> for Stop {
+    fn from(message: String) -> Self {
+        Self::Failed(message)
+    }
 }
 
 /// 与 worker 的两端，外加要在结束时收拾的东西。
@@ -80,7 +175,7 @@ impl Worker {
     pub fn exe(path: impl Into<PathBuf>) -> Self {
         Self {
             launch: Launch::Process(path.into()),
-            memory_limit: DEFAULT_MEMORY_LIMIT,
+            ..Self::base()
         }
     }
 
@@ -89,12 +184,46 @@ impl Worker {
         std::env::current_exe().map(Self::exe)
     }
 
+    fn base() -> Self {
+        Self {
+            launch: Launch::Process(PathBuf::new()),
+            memory_limit: DEFAULT_MEMORY_LIMIT,
+            cwd: None,
+            protected: Vec::new(),
+            nondet: Arc::new(live),
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn in_process() -> Self {
+        Self::in_process_as(Hello::current())
+    }
+
+    /// 进程内 worker，自称是另一版（握手测试用）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_process_as(hello: Hello) -> Self {
         Self {
-            launch: Launch::InProcess,
-            memory_limit: DEFAULT_MEMORY_LIMIT,
+            launch: Launch::InProcess(hello),
+            ..Self::base()
         }
+    }
+
+    /// 脚本读不了的路径（`tools::protect::Protected` 的那份名单，Gateway 装配时给）。
+    pub fn protecting(mut self, paths: Vec<PathBuf>) -> Self {
+        self.protected = paths;
+        self
+    }
+
+    /// 这一次运行的工作目录。
+    pub fn in_dir(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// 这一次运行怎么回答时钟与熵。
+    pub fn with_nondet(mut self, handler: NondetHandler) -> Self {
+        self.nondet = handler;
+        self
     }
 
     pub fn with_memory_limit(mut self, bytes: u64) -> Self {
@@ -132,29 +261,63 @@ impl Worker {
                 "code": code,
                 "tools": tools,
                 "catalog": catalog,
+                "cwd": self.cwd,
+                "protected": self.protected,
                 "limits": {
                     "max_memory": self.memory_limit,
                     "max_turn_ms": self.in_process_turn_limit(),
                 },
             });
-            if let Err(error) = write_line(&mut link.writer, &first).await {
-                return Err(format!("脚本交不进 worker：{error}"));
-            }
             let mut lines = (&mut link.reader).lines();
+            let hello = match lines.next_line().await {
+                Ok(Some(line)) => serde_json::from_str::<serde_json::Value>(&line)
+                    .ok()
+                    .and_then(|message| message.get("hello").cloned())
+                    .and_then(|hello| serde_json::from_value::<Hello>(hello).ok())
+                    .ok_or_else(|| format!("worker 第一行不是握手：{line}"))?,
+                Ok(None) => return Err("脚本进程提前退出".to_string().into()),
+                Err(error) => return Err(format!("读不到 worker 输出：{error}").into()),
+            };
+            let ours = Hello::current();
+            if hello != ours {
+                return Err(Stop::Incompatible(format!(
+                    "codemode 的 worker 与 Gateway 不是同一版（worker：协议 {} / monty {} / komo {}；Gateway：协议 {} / monty {} / komo {}）。\
+                     磁盘上的 komo 在 Gateway 启动之后被换过，需要重启 Gateway（komo gateway restart）；脚本没有运行。",
+                    hello.protocol, hello.monty, hello.komo, ours.protocol, ours.monty, ours.komo
+                )));
+            }
+            if let Err(error) = write_line(&mut link.writer, &first).await {
+                return Err(format!("脚本交不进 worker：{error}").into());
+            }
             loop {
                 let line = match lines.next_line().await {
                     Ok(Some(line)) => line,
-                    Ok(None) => return Err("脚本进程提前退出".to_string()),
-                    Err(error) => return Err(format!("读不到 worker 输出：{error}")),
+                    Ok(None) => return Err("脚本进程提前退出".to_string().into()),
+                    Err(error) => return Err(format!("读不到 worker 输出：{error}").into()),
                 };
                 let message: serde_json::Value = serde_json::from_str(&line)
                     .map_err(|error| format!("worker 输出不是协议：{error}"))?;
                 if let Some(done) = message.get("done") {
                     return serde_json::from_value::<worker::Done>(done.clone())
-                        .map_err(|error| format!("结束消息读不懂：{error}"));
+                        .map_err(|error| format!("结束消息读不懂：{error}").into());
+                }
+                if let Some(request) = message.get("os") {
+                    let reply = match serde_json::from_value::<Nondet>(request.clone()) {
+                        Ok(request) => match (self.nondet)(&request) {
+                            Ok(value) => serde_json::json!({ "ok": value }),
+                            Err(error) => serde_json::json!({ "error": error }),
+                        },
+                        Err(error) => {
+                            serde_json::json!({ "error": format!("os 请求读不懂：{error}") })
+                        }
+                    };
+                    write_line(&mut link.writer, &reply)
+                        .await
+                        .map_err(|error| format!("答复交不进 worker：{error}"))?;
+                    continue;
                 }
                 let Some(name) = message.get("call").and_then(|name| name.as_str()) else {
-                    return Err(format!("worker 输出不是协议：{line}"));
+                    return Err(format!("worker 输出不是协议：{line}").into());
                 };
                 let args = message.get("args").cloned().unwrap_or_default();
                 let reply = match on_call(name.to_string(), args).await {
@@ -170,11 +333,18 @@ impl Worker {
         let outcome = tokio::select! {
             result = tokio::time::timeout(timeout, conversation) => match result {
                 Err(_elapsed) => failed(format!("脚本超时（{}s），已终止", timeout.as_secs())),
-                Ok(Err(error)) => failed(with_stderr_tail(error, stderr.as_mut()).await),
+                Ok(Err(Stop::Failed(error))) => {
+                    failed(with_stderr_tail(error, stderr.as_mut()).await)
+                }
+                Ok(Err(Stop::Incompatible(message))) => ScriptOutcome {
+                    incompatible: Some(message),
+                    ..ScriptOutcome::default()
+                },
                 Ok(Ok(done)) => ScriptOutcome {
                     outputs: done.outputs,
                     console: done.console,
                     error: done.error,
+                    incompatible: None,
                 },
             },
             resident = over_memory(pid, self.memory_limit) => failed(format!(
@@ -211,13 +381,14 @@ impl Worker {
                 })
             }
             #[cfg(any(test, feature = "test-support"))]
-            Launch::InProcess => {
+            Launch::InProcess(hello) => {
+                let hello = hello.clone();
                 let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
                 ours.set_nonblocking(true)?;
                 let input = theirs.try_clone()?;
                 std::thread::Builder::new()
                     .stack_size(worker::STACK_SIZE)
-                    .spawn(move || worker::serve(std::io::BufReader::new(input), theirs))?;
+                    .spawn(move || worker::serve(std::io::BufReader::new(input), theirs, hello))?;
                 let (reader, writer) = tokio::io::split(tokio::net::UnixStream::from_std(ours)?);
                 Ok(Link {
                     reader: BufReader::new(Box::new(reader)),
@@ -234,7 +405,7 @@ impl Worker {
         match self.launch {
             Launch::Process(_) => None,
             #[cfg(any(test, feature = "test-support"))]
-            Launch::InProcess => Some(20_000),
+            Launch::InProcess(_) => Some(20_000),
         }
     }
 }

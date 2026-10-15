@@ -62,22 +62,85 @@ async fn a_failed_sub_call_is_a_tool_error_the_script_can_catch() {
 }
 
 #[tokio::test]
-async fn the_worker_process_has_no_files_and_no_environment() {
-    let code = r#"
+async fn the_worker_process_reads_files_but_cannot_write_them_and_has_no_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let probe = dir.path().join("probe");
+    let code = format!(
+        r#"
 import os
+from pathlib import Path
+text(open("/etc/hosts").read() != "")
 try:
-    open("/etc/passwd").read()
-    text("read")
-except Exception as e:
-    text("denied")
+    open("{probe}", "w").write("x")
+    text("wrote")
+except PermissionError:
+    text("write denied")
 text(os.getenv("HOME"))
-"#;
-    let outcome = run(&Worker::exe(exe()), code, Duration::from_secs(30)).await;
+"#,
+        probe = probe.display()
+    );
+    let outcome = run(&Worker::exe(exe()), &code, Duration::from_secs(30)).await;
     assert_eq!(outcome.error, None);
     assert_eq!(
         outcome.outputs,
-        vec!["denied".to_string(), "null".to_string()]
+        vec![
+            "true".to_string(),
+            "write denied".to_string(),
+            "null".to_string()
+        ]
     );
+    assert!(!probe.exists());
+}
+
+#[tokio::test]
+async fn the_worker_process_refuses_komo_state_even_for_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    std::fs::write(home.join(".env"), "SECRET=1").unwrap();
+    std::fs::write(home.join("state.db"), "db").unwrap();
+    std::fs::create_dir_all(home.join("workspace")).unwrap();
+    std::fs::write(home.join("workspace/ok.txt"), "fine").unwrap();
+    std::os::unix::fs::symlink(home.join(".env"), home.join("workspace/link")).unwrap();
+    let worker = Worker::exe(exe())
+        .in_dir(home.join("workspace"))
+        .protecting(vec![home.join(".env"), home.join("state.db")]);
+    let code = format!(
+        r#"
+def verdict(path):
+    try:
+        open(path).read()
+        return "read"
+    except PermissionError:
+        return "denied"
+text([verdict(p) for p in ["ok.txt", "../.env", "link", "{home}/state.db"]])
+"#,
+        home = home.display()
+    );
+    let outcome = run(&worker, &code, Duration::from_secs(30)).await;
+    assert_eq!(outcome.error, None);
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&outcome.outputs[0]).unwrap(),
+        ["read", "denied", "denied", "denied"]
+    );
+}
+
+#[tokio::test]
+async fn a_worker_from_another_build_is_refused_before_the_script_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("komo");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\necho '{\"hello\":{\"protocol\":999,\"monty\":\"0.0.0\",\"komo\":\"0.0.0\"}}'\ncat > /dev/null\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let outcome = run(&Worker::exe(&fake), "text('ran')", Duration::from_secs(30)).await;
+    let message = outcome.incompatible.expect("握手对不上");
+    assert!(message.contains("重启 Gateway"), "{message}");
+    assert!(message.contains("协议 999"), "{message}");
+    assert!(outcome.outputs.is_empty());
+    assert_eq!(outcome.error, None);
 }
 
 #[tokio::test]

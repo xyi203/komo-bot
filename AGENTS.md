@@ -83,8 +83,9 @@ depends on `agent`; `client` knows only protocol types.
 - **The only hard limit lives in the tools:** `write`/`edit` refuse komo's own
   state (`sessions/`, `state.db*`, `runtime/`, `.env` under the data dir).
   bash/python cannot be stopped; real boundaries come only from an execution
-  environment (codemode's Monty engine: the language has no files, network or
-  subprocesses; it runs in a `komo __codemode-worker` child the host can kill).
+  environment (codemode's Monty engine: no network or subprocesses, files
+  read-only with the same protected list denied even for reads; it runs in a
+  `komo __codemode-worker` child the host can kill).
 - **Recovery decides "did it happen" before "retry"** (§8.4 table, §8.6).
   `started` alone proves nothing. A started call without a result reruns only
   when both the plan's stored replay policy and the tool's current

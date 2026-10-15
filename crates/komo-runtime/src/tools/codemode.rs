@@ -61,16 +61,19 @@ impl Tool for CodemodeTool {
                           for p in [\"src/a.rs\", \"src/b.rs\"]:\n\
                           \x20   lines = tools.read(path=p)[\"text\"].splitlines()\n\
                           \x20   text([l for l in lines if \"fn \" in l])\n\
-                          脚本跑在 Monty（一个受限的 Python 解释器）里：不能读写文件、不能联网、不能起\
-                          子进程、读不到环境变量，只有 json、re、math、datetime、collections、\
-                          itertools 等少数标准库，没有第三方库；要的数据都经 tools 取。\n\
+                          脚本跑在 Monty（一个受限的 Python 子集解释器）里：用来汇总和过滤工具\
+                          结果。文件可以只读（open() / pathlib）；不能写文件、不能联网、不能起子进程、\
+                          读不到环境变量，只有 json、re、math、datetime、collections、itertools \
+                          等少数标准库，没有第三方库。要写文件用 write / edit，要完整的 Python \
+                          （第三方库、写文件、联网）用 bash 跑 python3。\n\
                           - tools.<name>(**args)：调工具，返回 {\"status\", \"text\", \"result\"}；\
                           text 是工具的正文输出（read 是文件内容，rg 是匹配行），result 是结构化\
-                          结果。工具名里的 - 写成 _。能调 read、rg 与 MCP 工具（MCP 含写操作）；\
+                          结果。工具名里的 - 写成 _，写错名字得到 AttributeError，能调的名字见 TOOLS。\
+                          能调 read、rg 与 MCP 工具（MCP 含写操作）；\
                           bash、python、edit、write 与编排工具（delegate、dispatch、monitor 等）\
                           只能在脚本外直接调，脚本里写了 tools.bash(...) 会在运行前被拒。\
-                          子调用逐次持久化，unsafe 中断不重跑；恢复核对\
-                          已记录调用及参数，禁止新增调用，分歧或结果不明会终止整段脚本。\n\
+                          子调用逐次持久化，unsafe 中断不重跑；中断后重跑脚本，已记录的调用原样\
+                          回放，之后的调用照常执行，分歧或结果不明会终止整段脚本。\n\
                           - text(value)：加一段输出（非字符串转 JSON）。print 的内容附在最后。\n\
                           - TOOLS：能调的工具名。\n\
                           - ALL_TOOLS（[{name, description}]）、search_tools(query, limit=8, \

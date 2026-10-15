@@ -244,7 +244,7 @@ async fn divergence_latches_and_blocks_all_later_calls_including_caught_errors()
 }
 
 #[tokio::test]
-async fn fewer_and_extra_calls_fail_without_new_side_effects() {
+async fn calls_past_the_recorded_prefix_run_live_exactly_once() {
     let h = Harness::new();
     let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
     let executor = h.executor(vec![tool.clone()]);
@@ -282,20 +282,21 @@ async fn fewer_and_extra_calls_fail_without_new_side_effects() {
         )
         .await
         .unwrap();
-    assert!(
-        executor
-            .nested_call(
-                "mcp__test__write",
-                json!({"value": 1}),
-                &env,
-                &ctx,
-                &recovered
-            )
-            .await
-            .unwrap_err()
-            .contains("未提交窗口")
-    );
-    assert_eq!(tool.ran(), 1);
+    assert_eq!(tool.ran(), 1, "已记录的那一次只回放，不重做");
+    executor
+        .nested_call(
+            "mcp__test__write",
+            json!({"value": 2}),
+            &env,
+            &ctx,
+            &recovered,
+        )
+        .await
+        .unwrap();
+    assert_eq!(tool.ran(), 2, "越过记录的前缀之后照常执行一次");
+    recovered.lock().unwrap().check_end().unwrap();
+    let again = Mutex::new(executor.codemode_load(&ctx).await.unwrap());
+    assert_eq!(again.lock().unwrap().children.len(), 2);
 }
 
 #[tokio::test]
@@ -518,18 +519,64 @@ async fn a_start_fingerprint_from_the_cpython_driver_settles_as_uncertain() {
     assert_eq!(tool.ran(), 0);
 }
 
+/// 4a（Monty 第一版）的指纹：worker 协议 1、没有前置代码哈希，那时时钟与随机数不进 journal。
+/// 在途的调用恢复时对不上，按分歧返回 uncertain，不起 worker、不执行任何子调用。
 #[tokio::test]
-async fn script_replays_prefix_and_caught_extra_call_cannot_write() {
+async fn a_start_fingerprint_from_before_the_clock_was_journaled_settles_as_uncertain() {
     let h = Harness::new();
     let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
+    let executor = scripted(&h, &tool);
+    let (s, r) = h.open_run().await;
+    let ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
+    let env = h.env(&s, &r);
+    let code = "text(tools.mcp__test__write(value=1)['text'])";
+    executor
+        .codemode_record(
+            &ctx,
+            "start",
+            Record::Start {
+                fingerprint: json!({
+                    "version": 2,
+                    "code": ContentHash::of_str(code),
+                    "engine": format!("monty-{}", crate::codemode::MONTY_VERSION),
+                    "worker": 1,
+                    "tools": ["mcp__test__write"],
+                    "cwd": ctx.cwd,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let mut sink = h
+        .outputs
+        .begin(&ToolExecutor::codemode_attempt(&ctx, "sink"))
+        .await
+        .unwrap();
+    let error = executor
+        .run_codemode(code, &env, &ctx, sink.as_mut())
+        .await
+        .unwrap_err();
+    assert!(error.is_uncertain(), "{error}");
+    assert!(error.to_string().contains("回放分歧"), "{error}");
+    assert_eq!(tool.ran(), 0);
+}
+
+fn scripted(h: &Harness, tool: &Arc<RecordingTool>) -> ToolExecutor {
     let _registered = h.executor(vec![tool.clone()]);
-    let executor = ToolExecutor::new(
+    ToolExecutor::new(
         vec![tool.clone()],
         h.ledger.clone(),
         h.outputs.clone(),
         Arc::new(h.clock.clone()),
     )
-    .with_codemode(Some(crate::codemode::Worker::in_process()));
+    .with_codemode(Some(crate::codemode::Worker::in_process()))
+}
+
+#[tokio::test]
+async fn a_resumed_script_replays_the_recorded_prefix_then_runs_the_rest_live() {
+    let h = Harness::new();
+    let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
+    let executor = scripted(&h, &tool);
     let (s, r) = h.open_run().await;
     let ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
     let env = h.env(&s, &r);
@@ -558,17 +605,266 @@ async fn script_replays_prefix_and_caught_extra_call_cannot_write() {
         .begin(&ToolExecutor::codemode_attempt(&ctx, "sink"))
         .await
         .unwrap();
+    let output = executor
+        .run_codemode(code, &env, &ctx, sink.as_mut())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ToolResultStatus::Completed);
+    assert_eq!(tool.ran(), 3, "第 1 次回放，第 2、3 次各执行一次");
+}
+
+fn journal_phases(h: &Harness) -> Vec<String> {
+    h.ledger
+        .events()
+        .iter()
+        .filter_map(|event| match &event.payload {
+            EventPayload::CodemodeJournal(body) => body.record["phase"].as_str().map(str::to_owned),
+            _ => None,
+        })
+        .collect()
+}
+
+/// 第一次尝试在第一次调用交付之后"崩"（脚本睡着，外层 future 被丢掉，等于进程没了）；
+/// 第二次从头重跑：时钟 / 随机数按记录还回去，已交付的调用回放，下一次调用执行一次。
+#[tokio::test]
+async fn a_crash_after_n_delivered_calls_resumes_with_the_same_clock_and_entropy() {
+    let h = Harness::new();
+    let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
+    let executor = scripted(&h, &tool);
+    let (s, r) = h.open_run().await;
+    let mut ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
+    let env = h.env(&s, &r);
+    let dir = tempfile::tempdir().unwrap();
+    let gate = dir.path().join("gate");
+    let code = format!(
+        r#"
+import time, random
+from datetime import datetime
+first = [time.time(), random.random(), str(datetime.now())]
+tools.mcp__test__write(value=first)
+if open("{gate}").read() == "crash":
+    time.sleep(8)
+tools.mcp__test__write(value=[time.time() > first[0], random.random() != first[1]])
+text(first)
+"#,
+        gate = gate.display()
+    );
+    std::fs::write(&gate, "crash").unwrap();
+    let mut sink = h
+        .outputs
+        .begin(&ToolExecutor::codemode_attempt(&ctx, "sink"))
+        .await
+        .unwrap();
+    let crashed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        executor.run_codemode(&code, &env, &ctx, sink.as_mut()),
+    )
+    .await;
+    assert!(crashed.is_err(), "第一次尝试应当卡在 sleep 里");
+    assert_eq!(tool.ran(), 1);
+
+    std::fs::write(&gate, "go").unwrap();
+    ctx.attempt = AttemptId::from_raw("after-restart");
+    let mut sink = h
+        .outputs
+        .begin(&ToolExecutor::codemode_attempt(&ctx, "sink-2"))
+        .await
+        .unwrap();
+    let output = executor
+        .run_codemode(&code, &env, &ctx, sink.as_mut())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ToolResultStatus::Completed, "{output:?}");
+    assert_eq!(tool.ran(), 2, "第 1 次回放，第 2 次执行一次");
+    let first = output.preview.unwrap();
+    let recorded: Intent = {
+        let journal = executor.codemode_load(&ctx).await.unwrap();
+        executor
+            .codemode_open(journal.children[&1].intent.as_ref().unwrap())
+            .await
+            .unwrap()
+    };
+    assert_eq!(
+        serde_json::Deserializer::from_str(&first)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .unwrap()
+            .unwrap(),
+        recorded.args["value"],
+        "时钟与随机数与崩溃前记下的一致"
+    );
+    let phases = journal_phases(&h);
+    assert_eq!(
+        phases.iter().filter(|p| *p == "nondet").count(),
+        2,
+        "{phases:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_file_that_changed_between_runs_and_changes_the_next_call_is_uncertain() {
+    let h = Harness::new();
+    let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
+    let executor = scripted(&h, &tool);
+    let (s, r) = h.open_run().await;
+    let mut ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
+    let env = h.env(&s, &r);
+    let dir = tempfile::tempdir().unwrap();
+    let (data, gate) = (dir.path().join("data"), dir.path().join("gate"));
+    let code = format!(
+        r#"
+import time
+tools.mcp__test__write(value=1)
+tools.mcp__test__write(value=open("{data}").read())
+if open("{gate}").read() == "crash":
+    time.sleep(8)
+"#,
+        data = data.display(),
+        gate = gate.display()
+    );
+    std::fs::write(&data, "A").unwrap();
+    std::fs::write(&gate, "crash").unwrap();
+    let mut sink = h
+        .outputs
+        .begin(&ToolExecutor::codemode_attempt(&ctx, "sink"))
+        .await
+        .unwrap();
+    let crashed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        executor.run_codemode(&code, &env, &ctx, sink.as_mut()),
+    )
+    .await;
+    assert!(crashed.is_err());
+    assert_eq!(tool.ran(), 2);
+
+    std::fs::write(&data, "B").unwrap();
+    std::fs::write(&gate, "go").unwrap();
+    ctx.attempt = AttemptId::from_raw("after-restart");
+    let error = executor
+        .run_codemode(&code, &env, &ctx, sink.as_mut())
+        .await
+        .unwrap_err();
+    assert!(error.is_uncertain(), "{error}");
+    assert!(error.to_string().contains("回放分歧"), "{error}");
+    assert_eq!(tool.ran(), 2, "分歧之后不再执行任何子调用");
+}
+
+#[tokio::test]
+async fn a_clock_loop_is_journaled_as_one_batch_before_the_next_call() {
+    let h = Harness::new();
+    let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
+    let executor = scripted(&h, &tool);
+    let (s, r) = h.open_run().await;
+    let ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
+    let env = h.env(&s, &r);
+    let code = "import time\nfor _ in range(500):\n    time.time()\ntools.mcp__test__write(value=1)\nfor _ in range(500):\n    time.time()";
+    let mut sink = h
+        .outputs
+        .begin(&ToolExecutor::codemode_attempt(&ctx, "sink"))
+        .await
+        .unwrap();
+    let output = executor
+        .run_codemode(code, &env, &ctx, sink.as_mut())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ToolResultStatus::Completed);
+    let phases = journal_phases(&h);
+    assert_eq!(
+        phases.iter().filter(|p| *p == "nondet").count(),
+        2,
+        "每 500 次读数一条记录，不是 1000 条：{phases:?}"
+    );
+}
+
+#[test]
+fn reads_that_do_not_match_the_recording_are_a_divergence() {
+    use crate::codemode::Nondet;
+    let mut journal = Journal {
+        replay: vec![NondetEntry {
+            request: Nondet::Clock,
+            value: json!(1.5),
+        }],
+        ..Default::default()
+    };
+    assert!(journal.read(&Nondet::Urandom { size: 4 }).is_err());
+    assert!(journal.fatal.as_ref().is_some_and(ToolError::is_uncertain));
+    let mut journal = Journal {
+        replay: vec![NondetEntry {
+            request: Nondet::Clock,
+            value: json!(1.5),
+        }],
+        ..Default::default()
+    };
+    assert_eq!(journal.read(&Nondet::Clock).unwrap(), json!(1.5));
+    assert!(journal.check_end().is_ok());
+    let journal = Journal {
+        replay: vec![NondetEntry {
+            request: Nondet::Clock,
+            value: json!(1.5),
+        }],
+        ..Default::default()
+    };
+    assert!(
+        journal
+            .check_end()
+            .unwrap_err()
+            .to_string()
+            .contains("时钟 / 随机数")
+    );
+}
+
+#[test]
+fn one_script_reads_the_clock_a_bounded_number_of_times() {
+    use crate::codemode::Nondet;
+    let mut journal = Journal::default();
+    for _ in 0..MAX_NONDET {
+        journal.read(&Nondet::Clock).unwrap();
+    }
+    assert!(journal.read(&Nondet::Clock).unwrap_err().contains("最多读"));
+}
+
+#[tokio::test]
+async fn a_worker_from_another_build_fails_the_call_cleanly_before_running_anything() {
+    let h = Harness::new();
+    let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
+    let _registered = h.executor(vec![tool.clone()]);
+    let stale = crate::codemode::Hello {
+        protocol: crate::codemode::WORKER_PROTOCOL + 1,
+        ..crate::codemode::Hello::current()
+    };
+    let executor = ToolExecutor::new(
+        vec![tool.clone()],
+        h.ledger.clone(),
+        h.outputs.clone(),
+        Arc::new(h.clock.clone()),
+    )
+    .with_codemode(Some(crate::codemode::Worker::in_process_as(stale)));
+    let (s, r) = h.open_run().await;
+    let ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
+    let env = h.env(&s, &r);
+    let code = "tools.mcp__test__write(value=1)";
+    let mut sink = h
+        .outputs
+        .begin(&ToolExecutor::codemode_attempt(&ctx, "sink"))
+        .await
+        .unwrap();
     let error = executor
         .run_codemode(code, &env, &ctx, sink.as_mut())
         .await
         .unwrap_err();
-    assert!(error.is_uncertain());
-    assert!(error.to_string().contains("回放分歧"));
-    assert_eq!(
-        tool.ran(),
-        1,
-        "Python catches host error but cannot invoke more writes"
-    );
+    assert!(!error.is_uncertain(), "{error}");
+    assert!(error.to_string().contains("重启 Gateway"), "{error}");
+    assert_eq!(tool.ran(), 0);
+    assert!(!journal_phases(&h).contains(&"finished".to_string()));
+
+    // 重启之后是同一版，同一个调用能照常跑。
+    let executor = scripted(&h, &tool);
+    let output = executor
+        .run_codemode(code, &env, &ctx, sink.as_mut())
+        .await
+        .unwrap();
+    assert_eq!(output.status, ToolResultStatus::Completed);
+    assert_eq!(tool.ran(), 1);
 }
 
 #[tokio::test]

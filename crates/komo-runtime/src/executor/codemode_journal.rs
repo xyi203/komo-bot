@@ -13,16 +13,45 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::ToolExecutor;
+use crate::codemode::{Nondet, live};
+
+/// 一段脚本最多读这么多次时钟 / 随机数（含恢复时已录下的）：journal 不能随脚本里的一个紧循环涨下去。
+const MAX_NONDET: usize = 10_000;
 
 /// journal 的一条记录（`codemode.journal` 事件的 `record`）。正文都外置，这里只有引用。
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "phase", rename_all = "snake_case")]
 pub(super) enum Record {
-    Start { fingerprint: Value },
-    Intent { index: usize, output: OutputRef },
-    Started { index: usize, attempt: AttemptRef },
-    Delivered { index: usize, output: OutputRef },
-    Finished { output: OutputRef },
+    Start {
+        fingerprint: Value,
+    },
+    Intent {
+        index: usize,
+        output: OutputRef,
+    },
+    Started {
+        index: usize,
+        attempt: AttemptRef,
+    },
+    Delivered {
+        index: usize,
+        output: OutputRef,
+    },
+    /// 一批时钟 / 熵读数（[`NondetEntry`] 的数组，外置），在下一次子调用的 `intent`（或 `finished`）
+    /// 之前一并落账。
+    Nondet {
+        output: OutputRef,
+    },
+    Finished {
+        output: OutputRef,
+    },
+}
+
+/// 脚本读过的一次时钟或熵：请求与宿主给的值。恢复时按序原样还回去（`docs/codemode.md` §7）。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(super) struct NondetEntry {
+    pub request: Nondet,
+    pub value: Value,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -65,6 +94,13 @@ pub(super) struct Journal {
     pub fingerprint: Option<Value>,
     pub children: BTreeMap<usize, Child>,
     pub finished: Option<OutputRef>,
+    /// 已落账的读数批次（引用）；`replay` 是它们展开后的内容，由 `codemode_load_nondet` 读进来。
+    pub nondet: Vec<OutputRef>,
+    pub replay: Vec<NondetEntry>,
+    pub replay_cursor: usize,
+    /// 本次运行读到、还没落账的读数：下一次新子调用的 `intent` 之前（或 `finished` 之前）才落。
+    /// 之间崩了也没关系——这些值没有被任何已提交的外部效果用过，恢复时重新读就是。
+    pub pending: Vec<NondetEntry>,
     pub cursor: usize,
     pub recovering: bool,
     /// 宿主的致命错误锁住不放：Python 接住 `ToolError` 或自己伪造 done 都解不开。
@@ -118,6 +154,12 @@ impl Journal {
                     return Err(invalid());
                 }
             }
+            Record::Nondet { output } => {
+                if self.fingerprint.is_none() {
+                    return Err(invalid());
+                }
+                self.nondet.push(output);
+            }
             Record::Finished { output } => {
                 if self.fingerprint.is_none()
                     || self.children.values().any(|c| c.delivered.is_none())
@@ -130,7 +172,7 @@ impl Journal {
         Ok(())
     }
 
-    pub fn next(&mut self, name: &str, args: &Value) -> Result<(usize, Option<Child>), ToolError> {
+    pub fn next(&mut self, name: &str) -> Result<(usize, Option<Child>), ToolError> {
         if let Some(error) = &self.fatal {
             return Err(error.clone());
         }
@@ -139,13 +181,45 @@ impl Journal {
             return Err(uncertain("codemode 子调用超过 256 次"));
         }
         let child = self.children.get(&self.cursor).cloned();
-        if self.recovering && child.is_none() {
+        // 回放到已记录的调用时，它之前的读数应当全是录下来的；读多了说明脚本走了别的路。
+        if child.is_some() && !self.pending.is_empty() {
             return Err(uncertain(format!(
-                "codemode 回放分歧/未提交窗口：子调用 {} ({name}, {args}) 超出已记录前缀；禁止新增调用",
+                "codemode 回放分歧：子调用 {} ({name}) 之前多读了时钟 / 随机数",
                 self.cursor
             )));
         }
         Ok((self.cursor, child))
+    }
+
+    /// 回答脚本的一次时钟 / 熵读取：录下来的先按序还；录完了读真值，记在 `pending`。
+    /// 请求对不上录下来的（脚本走了别的路）是恢复分歧，锁住 fatal。
+    pub fn read(&mut self, request: &Nondet) -> Result<Value, String> {
+        if let Some(error) = &self.fatal {
+            return Err(error.to_string());
+        }
+        if let Some(entry) = self.replay.get(self.replay_cursor) {
+            if entry.request != *request {
+                let error = uncertain(format!(
+                    "codemode 回放分歧：第 {} 次时钟 / 随机数读取与记录不符（记录 {:?}，现在 {:?}）",
+                    self.replay_cursor + 1,
+                    entry.request,
+                    request
+                ));
+                self.fatal = Some(error.clone());
+                return Err(error.to_string());
+            }
+            self.replay_cursor += 1;
+            return Ok(entry.value.clone());
+        }
+        if self.replay.len() + self.pending.len() >= MAX_NONDET {
+            return Err(format!("一段脚本最多读 {MAX_NONDET} 次时钟 / 随机数"));
+        }
+        let value = live(request)?;
+        self.pending.push(NondetEntry {
+            request: request.clone(),
+            value: value.clone(),
+        });
+        Ok(value)
     }
 
     pub fn check_end(&self) -> Result<(), ToolError> {
@@ -155,6 +229,11 @@ impl Journal {
         if self.recovering && self.cursor != self.children.len() {
             return Err(uncertain(
                 "codemode 回放分歧：脚本提前结束，未消费全部子调用",
+            ));
+        }
+        if self.replay_cursor != self.replay.len() {
+            return Err(uncertain(
+                "codemode 回放分歧：脚本提前结束，未消费全部时钟 / 随机数记录",
             ));
         }
         if self
@@ -205,6 +284,48 @@ impl ToolExecutor {
             ));
         }
         Ok(journal)
+    }
+
+    /// 把记录下来的读数读进 `replay`（恢复时按序还给脚本）。
+    pub(super) async fn codemode_load_nondet(
+        &self,
+        journal: &mut Journal,
+    ) -> Result<(), ToolError> {
+        for reference in journal.nondet.clone() {
+            let batch: Vec<NondetEntry> = self.codemode_open(&reference).await?;
+            journal.replay.extend(batch);
+        }
+        Ok(())
+    }
+
+    /// 把本次读到、还没落账的读数落成一条 `nondet` 记录。必须在下一次新子调用的 `intent`
+    /// 与 `finished` 之前做：之后的外部效果才可能用到这些值，恢复时它们得原样回来。
+    pub(super) async fn codemode_flush_nondet(
+        &self,
+        ctx: &ToolContext,
+        journal: &std::sync::Mutex<Journal>,
+    ) -> Result<(), ToolError> {
+        let (batch, index) = {
+            let journal = journal.lock().expect("journal");
+            if journal.pending.is_empty() {
+                return Ok(());
+            }
+            (journal.pending.clone(), journal.nondet.len() + 1)
+        };
+        let key = format!("nondet-{index}");
+        let output = self.codemode_save(ctx, &key, &batch).await?;
+        self.codemode_record(
+            ctx,
+            &key,
+            Record::Nondet {
+                output: output.clone(),
+            },
+        )
+        .await?;
+        let mut journal = journal.lock().expect("journal");
+        journal.pending.drain(..batch.len());
+        journal.nondet.push(output);
+        Ok(())
     }
 
     pub(super) async fn codemode_record(

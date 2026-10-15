@@ -28,6 +28,12 @@ impl Protected {
         }
     }
 
+    /// `path` 是真实路径（[`real_path`](super::paths::real_path)）。落在名单里就是 true；
+    /// codemode 的 worker 读写都拦，同一份名单只有这一处定义。
+    pub fn denies(&self, path: &Path) -> bool {
+        self.roots.iter().any(|root| covers(root, path))
+    }
+
     /// `path` 是计划里的真实路径。落在名单里就拒，理由点名路径。
     pub fn check(&self, path: &Path) -> Result<(), ToolError> {
         match self.roots.iter().find(|root| covers(root, path)) {

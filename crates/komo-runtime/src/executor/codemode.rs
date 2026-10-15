@@ -113,6 +113,9 @@ impl ToolExecutor {
             }
             _ => {}
         }
+        if journal.finished.is_none() {
+            self.codemode_load_nondet(&mut journal).await?;
+        }
         if let Some(output) = &journal.finished {
             let output: ToolOutput = self.codemode_open(output).await?;
             sink.write_stdout(output.preview.as_deref().unwrap_or_default().as_bytes())
@@ -123,7 +126,13 @@ impl ToolExecutor {
         let catalog = self.script_catalog(&names);
         let journal = Arc::new(Mutex::new(journal));
         let calls: Arc<Mutex<Vec<NestedCall>>> = Arc::default();
+        let reads = Arc::clone(&journal);
         let outcome = worker
+            .clone()
+            .in_dir(ctx.cwd.clone())
+            .with_nondet(Arc::new(move |request| {
+                reads.lock().expect("journal").read(request)
+            }))
             .run(code, &names, &catalog, env.call_timeout, |name, args| {
                 let calls = Arc::clone(&calls);
                 let journal = Arc::clone(&journal);
@@ -142,6 +151,14 @@ impl ToolExecutor {
                 }
             })
             .await;
+        if let Some(message) = outcome.incompatible {
+            // 脚本一行没跑；但恢复时前几次尝试可能已经做过子调用，那就不能当普通失败。
+            return Err(if journal.lock().expect("journal").children.is_empty() {
+                ToolError::Failed { message }
+            } else {
+                uncertain(message)
+            });
+        }
         let (end, pending) = {
             let journal = journal.lock().expect("journal");
             (
@@ -186,6 +203,7 @@ impl ToolExecutor {
         };
         // 先把整段结果外置、提交 `finished`，再交给外层发布：两步之间崩了，恢复时直接
         // 交回这份结果，不再起 worker。
+        self.codemode_flush_nondet(ctx, &journal).await?;
         let reference = self.codemode_save(ctx, "finished", &output).await?;
         self.codemode_record(ctx, "finished", Record::Finished { output: reference })
             .await?;
@@ -234,10 +252,11 @@ impl ToolExecutor {
         ctx: &ToolContext,
     ) -> serde_json::Value {
         serde_json::json!({
-            "version": 2,
+            "version": 3,
             "code": ContentHash::of_str(code),
             "engine": format!("monty-{}", crate::codemode::MONTY_VERSION),
             "worker": crate::codemode::WORKER_PROTOCOL,
+            "prelude": crate::codemode::prelude_hash(),
             "tools": names,
             "cwd": ctx.cwd,
         })
@@ -284,7 +303,7 @@ impl ToolExecutor {
         ctx: &ToolContext,
         journal: &Mutex<Journal>,
     ) -> Result<Reply, ToolError> {
-        let (index, child) = journal.lock().expect("journal").next(name, &args)?;
+        let (index, child) = journal.lock().expect("journal").next(name)?;
         // 已记下的结果也要过当前能力面；不回退到全局工具表。
         let tool = self
             .tools
@@ -309,6 +328,8 @@ impl ToolExecutor {
                 intent
             }
             None => {
+                // 这次新调用的参数可能用到了脚本刚读到的时钟 / 随机数：先把它们落账。
+                self.codemode_flush_nondet(ctx, journal).await?;
                 let prepared = match tool {
                     Some(tool) => tool
                         .prepare(args.clone(), &child_ctx)

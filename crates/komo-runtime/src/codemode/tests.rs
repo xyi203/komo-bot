@@ -2,6 +2,7 @@
 
 use komo_kernel::types::tool::ToolNamespace;
 use serde_json::json;
+use std::sync::Arc;
 
 use super::*;
 
@@ -129,7 +130,7 @@ async fn a_script_makes_at_most_256_tool_calls() {
 }
 
 #[tokio::test]
-async fn the_language_has_no_files_environment_network_or_subprocess() {
+async fn the_language_has_no_network_subprocess_or_environment() {
     let outcome = run(
         r#"
 def blocked(f):
@@ -141,9 +142,6 @@ def blocked(f):
 
 import os
 text({
-    "read": blocked(lambda: open("/etc/passwd").read()),
-    "write": blocked(lambda: open("/tmp/komo-codemode-probe", "w").write("x")),
-    "path": blocked(lambda: __import__("pathlib").Path("/etc/passwd").read_text()),
     "subprocess": blocked(lambda: __import__("subprocess")),
     "socket": blocked(lambda: __import__("socket")),
     "env": os.getenv("HOME"),
@@ -157,12 +155,190 @@ text({
     let verdict: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
     assert_eq!(
         verdict,
-        json!({
-            "read": true, "write": true, "path": true, "subprocess": true, "socket": true,
-            "env": null, "environ": {},
-        })
+        json!({ "subprocess": true, "socket": true, "env": null, "environ": {} })
     );
-    assert!(!std::path::Path::new("/tmp/komo-codemode-probe").exists());
+}
+
+/// 一个像数据目录的临时目录：`sessions/` `runtime/` `state.db*` `.env`，外加一个允许读的工作区。
+struct Home {
+    dir: tempfile::TempDir,
+}
+
+impl Home {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for path in ["sessions", "runtime", "workspace/sub"] {
+            std::fs::create_dir_all(root.join(path)).unwrap();
+        }
+        for (path, body) in [
+            ("sessions/x", "session"),
+            ("runtime/x", "runtime"),
+            ("state.db", "db"),
+            ("state.db-wal", "wal"),
+            (".env", "SECRET=1"),
+            ("workspace/a.txt", "alpha"),
+            ("workspace/sub/b.txt", "beta"),
+        ] {
+            std::fs::write(root.join(path), body).unwrap();
+        }
+        std::os::unix::fs::symlink(root.join(".env"), root.join("workspace/link")).unwrap();
+        std::os::unix::fs::symlink(root.join("workspace/a.txt"), root.join("workspace/alias"))
+            .unwrap();
+        Self { dir }
+    }
+
+    fn root(&self) -> std::path::PathBuf {
+        self.dir.path().canonicalize().unwrap()
+    }
+
+    fn worker(&self) -> Worker {
+        let root = self.root();
+        Worker::in_process()
+            .in_dir(root.join("workspace"))
+            .protecting(vec![
+                root.join("sessions"),
+                root.join("state.db"),
+                root.join("runtime"),
+                root.join(".env"),
+            ])
+    }
+
+    async fn run(&self, code: &str) -> ScriptOutcome {
+        self.worker()
+            .run(
+                &code.replace("{root}", &self.root().to_string_lossy()),
+                &[],
+                &ScriptCatalog::default(),
+                TIMEOUT,
+                |_, _| async { Err("本测试不调工具".to_string()) },
+            )
+            .await
+    }
+}
+
+#[tokio::test]
+async fn files_are_readable_through_open_and_pathlib() {
+    let home = Home::new();
+    let outcome = home
+        .run(
+            r#"
+import os
+from pathlib import Path
+text(open("/etc/hosts").read() != "")
+text(Path("{root}/workspace/a.txt").read_text())
+text(open("a.txt").read())
+text(open("alias").read())
+text(sorted(p.name for p in Path("{root}/workspace").iterdir()))
+text([Path("a.txt").exists(), Path("nope").exists(), Path("sub").is_dir(), Path("a.txt").stat().st_size])
+text(os.getcwd() == "{root}/workspace")
+"#,
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    assert_eq!(outcome.outputs[0], "true");
+    assert_eq!(outcome.outputs[1], "alpha");
+    assert_eq!(outcome.outputs[2], "alpha");
+    assert_eq!(outcome.outputs[3], "alpha");
+    let names: Vec<String> = serde_json::from_str(&outcome.outputs[4]).unwrap();
+    assert!(names.contains(&"a.txt".to_string()) && names.contains(&"sub".to_string()));
+    assert_eq!(outcome.outputs[5], "[\n  true,\n  false,\n  true,\n  5\n]");
+    assert_eq!(outcome.outputs[6], "true");
+}
+
+#[tokio::test]
+async fn komo_own_state_is_unreadable_even_through_dotdot_and_symlinks() {
+    let home = Home::new();
+    let outcome = home
+        .run(
+            r#"
+from pathlib import Path
+def verdict(path):
+    try:
+        Path(path).read_text()
+        return "read"
+    except PermissionError:
+        return "denied"
+    except Exception as e:
+        return "other " + type(e).__name__
+
+paths = [
+    "{root}/.env", "{root}/state.db", "{root}/state.db-wal", "{root}/sessions/x", "{root}/runtime/x",
+    "../.env", "sub/../../state.db", "{root}/workspace/../sessions/x", "link",
+]
+text({p: verdict(p) for p in paths})
+text(verdict("a.txt"))
+try:
+    open("../.env").read()
+    text("open read")
+except PermissionError:
+    text("open denied")
+"#,
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    let verdicts: std::collections::BTreeMap<String, String> =
+        serde_json::from_str(&outcome.outputs[0]).unwrap();
+    for (path, verdict) in &verdicts {
+        assert_eq!(verdict, "denied", "{path}");
+    }
+    assert_eq!(verdicts.len(), 9);
+    assert_eq!(outcome.outputs[1], "read");
+    assert_eq!(outcome.outputs[2], "open denied");
+}
+
+#[tokio::test]
+async fn every_write_form_is_refused_and_leaves_the_disk_alone() {
+    let home = Home::new();
+    let outcome = home
+        .run(
+            r#"
+from pathlib import Path
+attempts = {
+    "write_text": lambda: Path("new.txt").write_text("x"),
+    "write_bytes": lambda: Path("new.bin").write_bytes(b"x"),
+    "overwrite": lambda: Path("a.txt").write_text("x"),
+    "open_w": lambda: open("new2.txt", "w").write("x"),
+    "open_a": lambda: open("a.txt", "a").write("x"),
+    "open_rplus": lambda: open("a.txt", "r+").write("x"),
+    "mkdir": lambda: Path("d").mkdir(),
+    "unlink": lambda: Path("a.txt").unlink(),
+    "rmdir": lambda: Path("sub").rmdir(),
+    "rename": lambda: Path("a.txt").rename("c.txt"),
+}
+result = {}
+for name, attempt in attempts.items():
+    try:
+        attempt()
+        result[name] = "done"
+    except PermissionError as e:
+        result[name] = "write / edit" in str(e)
+    except Exception as e:
+        result[name] = "other " + type(e).__name__
+text(result)
+"#,
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    let result: std::collections::BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(&outcome.outputs[0]).unwrap();
+    for (name, verdict) in &result {
+        assert!(
+            *verdict == json!(true) || name == "open_rplus",
+            "{name}: {verdict}"
+        );
+    }
+    let workspace = home.root().join("workspace");
+    let mut names: Vec<_> = std::fs::read_dir(&workspace)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["a.txt", "alias", "link", "sub"]);
+    assert_eq!(
+        std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+        "alpha"
+    );
 }
 
 fn discovery_catalog() -> ScriptCatalog {
@@ -353,4 +529,60 @@ text([{"k": 1}])
     );
     assert_eq!(outcome.outputs[1], "7");
     assert_eq!(outcome.outputs[2], "[\n  {\n    \"k\": 1\n  }\n]");
+}
+
+#[tokio::test]
+async fn the_clock_and_entropy_come_from_the_host() {
+    let seen: Arc<std::sync::Mutex<Vec<Nondet>>> = Arc::default();
+    let log = Arc::clone(&seen);
+    let outcome = Worker::in_process()
+        .with_nondet(Arc::new(move |request| {
+            log.lock().unwrap().push(request.clone());
+            match request {
+                Nondet::Clock => Ok(json!(86_400.5)),
+                Nondet::Urandom { size } => Ok(json!("ab".repeat(*size))),
+            }
+        }))
+        .run(
+            "import time, os\nfrom datetime import datetime, date\ntext([time.time(), str(datetime.now()), str(date.today()), os.urandom(2).hex()])\ntime.sleep(0.01)",
+            &[],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            |_, _| async { Err(String::new()) },
+        )
+        .await;
+    assert_eq!(outcome.error, None);
+    let read: serde_json::Value = serde_json::from_str(&outcome.outputs[0]).unwrap();
+    assert_eq!(
+        read,
+        json!([86_400.5, "1970-01-02 00:00:00.500000", "1970-01-02", "abab"])
+    );
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            Nondet::Clock,
+            Nondet::Clock,
+            Nondet::Clock,
+            Nondet::Urandom { size: 2 }
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_worker_that_is_another_build_is_refused_before_the_script_runs() {
+    let stale = Hello {
+        komo: "0.0.0".into(),
+        ..Hello::current()
+    };
+    let outcome = Worker::in_process_as(stale)
+        .run(
+            "text('ran')",
+            &[],
+            &ScriptCatalog::default(),
+            TIMEOUT,
+            |_, _| async { Err(String::new()) },
+        )
+        .await;
+    assert!(outcome.incompatible.unwrap().contains("重启 Gateway"));
+    assert!(outcome.outputs.is_empty());
 }

@@ -581,7 +581,7 @@ async fn build_tools(
         Arc::new(
             BashTool::new()
                 .registered(registration.clone())
-                .protecting(protected),
+                .protecting(protected.clone()),
         ),
         // 搜索是**进程内**的（`grep` + `ignore` 书库）：没有外部二进制，也就没有"这台机器
         // 上没装"这一种情况，不需要像 `python` 那样探测一遍。
@@ -615,7 +615,8 @@ async fn build_tools(
     #[cfg(any(test, feature = "test-support"))]
     tools.extend(test_support::test_tools(config.home()));
 
-    let codemode = codemode_worker();
+    // 脚本里的文件是只读的，但 komo 自己的状态连读也不行：与 write / edit 同一份名单。
+    let codemode = codemode_worker().map(|worker| worker.protecting(protected));
     if codemode.is_some() {
         tools.push(Arc::new(komo_runtime::tools::CodemodeTool::new()));
     }

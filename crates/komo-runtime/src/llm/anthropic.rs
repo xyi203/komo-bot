@@ -35,8 +35,8 @@ use super::transport::{HttpRequest, HttpTransport, TransportError};
 use super::wire;
 use crate::config::EffortCapabilities;
 
-const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
-const ANTHROPIC_VERSION: &str = "2023-06-01";
+pub(super) const ANTHROPIC_VERSION_HEADER: &str = "anthropic-version";
+pub(super) const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 const MESSAGE_START: &str = "message_start";
 const CONTENT_BLOCK_START: &str = "content_block_start";

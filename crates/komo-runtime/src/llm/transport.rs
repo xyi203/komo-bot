@@ -84,6 +84,11 @@ impl HttpRequest {
         }
     }
 
+    /// GET 请求（探测 `/models` 之类的元数据端点）：没有请求体，`body` 只是占位，传输层忽略。
+    pub fn get(url: impl Into<String>) -> Self {
+        HttpRequest::new(url, Value::Null)
+    }
+
     pub fn with_key(mut self, api_key: Option<String>) -> Self {
         self.api_key = api_key;
         self
@@ -129,6 +134,8 @@ impl HttpResponse {
 #[async_trait]
 pub trait HttpTransport: Send + Sync + fmt::Debug {
     async fn post(&self, request: HttpRequest) -> Result<HttpResponse, TransportError>;
+    /// GET：忽略 `request.body`。
+    async fn get(&self, request: HttpRequest) -> Result<HttpResponse, TransportError>;
 }
 
 /// 生产实现。
@@ -157,27 +164,39 @@ impl ReqwestTransport {
 #[async_trait]
 impl HttpTransport for ReqwestTransport {
     async fn post(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
-        use futures_util::StreamExt;
-
-        let mut builder = self.client().post(&request.url).timeout(request.timeout);
+        let mut builder = self.client().post(&request.url);
         builder = match &request.body {
             RequestBody::Json(body) => builder.json(body),
             RequestBody::Form(fields) => builder.form(fields),
         };
-        for (name, value) in &request.headers {
-            builder = builder.header(name, value);
-        }
-        if let Some(key) = &request.api_key {
-            builder = builder.bearer_auth(key);
-        }
-        let response = builder.send().await.map_err(map_reqwest)?;
-        let status = response.status().as_u16();
-        let body = response
-            .bytes_stream()
-            .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(map_reqwest))
-            .boxed();
-        Ok(HttpResponse { status, body })
+        send(builder, &request).await
     }
+
+    async fn get(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+        send(self.client().get(&request.url), &request).await
+    }
+}
+
+async fn send(
+    mut builder: reqwest::RequestBuilder,
+    request: &HttpRequest,
+) -> Result<HttpResponse, TransportError> {
+    use futures_util::StreamExt;
+
+    builder = builder.timeout(request.timeout);
+    for (name, value) in &request.headers {
+        builder = builder.header(name, value);
+    }
+    if let Some(key) = &request.api_key {
+        builder = builder.bearer_auth(key);
+    }
+    let response = builder.send().await.map_err(map_reqwest)?;
+    let status = response.status().as_u16();
+    let body = response
+        .bytes_stream()
+        .map(|chunk| chunk.map(|bytes| bytes.to_vec()).map_err(map_reqwest))
+        .boxed();
+    Ok(HttpResponse { status, body })
 }
 
 fn map_reqwest(error: reqwest::Error) -> TransportError {
@@ -262,6 +281,10 @@ pub(crate) mod testing {
 
     #[async_trait]
     impl HttpTransport for ScriptedTransport {
+        async fn get(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            self.post(request).await
+        }
+
         async fn post(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
             use futures_util::StreamExt;
             use futures_util::stream;

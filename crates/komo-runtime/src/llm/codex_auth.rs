@@ -656,6 +656,10 @@ mod tests {
             tokio::task::yield_now().await;
             self.0.post(request).await
         }
+
+        async fn get(&self, request: HttpRequest) -> Result<HttpResponse, TransportError> {
+            self.0.get(request).await
+        }
     }
 
     #[tokio::test]

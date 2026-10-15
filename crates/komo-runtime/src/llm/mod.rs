@@ -11,6 +11,7 @@
 mod anthropic;
 mod chat;
 pub mod codex_auth;
+mod models;
 mod responses;
 mod sse;
 pub mod transport;
@@ -29,6 +30,7 @@ use komo_kernel::types::turn::{LlmError, TurnRequest};
 
 pub use anthropic::AnthropicMessagesLlm;
 pub use chat::ChatCompletionsLlm;
+pub use models::{ProbeError, probe_context_window};
 pub use responses::{Credential, OpenAiResponsesLlm};
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};
 

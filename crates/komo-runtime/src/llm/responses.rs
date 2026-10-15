@@ -46,6 +46,34 @@ pub enum Credential {
     ChatGpt(Arc<CodexTokenSource>),
 }
 
+impl Credential {
+    /// 这次请求的 bearer 与固定附加头；`/models` 探测与 Responses 请求共用这一处。
+    pub(super) async fn resolve(
+        &self,
+        api_key_env: &str,
+    ) -> Result<(String, Vec<(String, String)>), LlmError> {
+        match self {
+            Credential::Env(Some(key)) => Ok((key.clone(), Vec::new())),
+            Credential::Env(None) => Err(LlmError::Rejected {
+                status: 401,
+                message: format!(
+                    "没有凭证：环境里找不到 `{api_key_env}`（config.toml 里写的是变量名）"
+                ),
+            }),
+            Credential::ChatGpt(source) => {
+                let creds = source.token().await.map_err(codex_auth_error)?;
+                Ok((
+                    creds.access_token,
+                    vec![
+                        ("ChatGPT-Account-ID".to_string(), creds.account_id),
+                        ("originator".to_string(), "komo".to_string()),
+                    ],
+                ))
+            }
+        }
+    }
+}
+
 fn codex_auth_error(error: CodexAuthError) -> LlmError {
     match error {
         CodexAuthError::NeedsLogin(message) => LlmError::Rejected {
@@ -338,27 +366,11 @@ impl TurnDriver for ResponsesDriver {
 impl ResponsesDriver {
     /// 取这次要用的凭证与请求头（§13.3：每次请求前取，`ChatGpt` 那条路快过期就刷新）。
     async fn credential(&self) -> Result<(String, Vec<(String, String)>), LlmError> {
-        match &self.credential {
-            Credential::Env(Some(key)) => Ok((key.clone(), Vec::new())),
-            Credential::Env(None) => Err(LlmError::Rejected {
-                status: 401,
-                message: format!(
-                    "没有凭证：环境里找不到 `{}`（config.toml 里写的是变量名）",
-                    self.model.api_key_env
-                ),
-            }),
-            Credential::ChatGpt(source) => {
-                let creds = source.token().await.map_err(codex_auth_error)?;
-                Ok((
-                    creds.access_token,
-                    vec![
-                        ("ChatGPT-Account-ID".to_string(), creds.account_id),
-                        ("originator".to_string(), "komo".to_string()),
-                        ("session_id".to_string(), self.session.to_string()),
-                    ],
-                ))
-            }
+        let (key, mut headers) = self.credential.resolve(&self.model.api_key_env).await?;
+        if matches!(self.credential, Credential::ChatGpt(_)) {
+            headers.push(("session_id".to_string(), self.session.to_string()));
         }
+        Ok((key, headers))
     }
 
     async fn round_trip(&self, body: Value) -> Result<Round, LlmError> {

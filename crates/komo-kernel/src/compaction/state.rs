@@ -356,7 +356,6 @@ mod tests {
             cwd: None,
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             recovery: RecoveryMode::SafeReread,
             then_run: None,
         };

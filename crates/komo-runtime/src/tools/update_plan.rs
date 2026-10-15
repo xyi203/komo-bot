@@ -122,7 +122,6 @@ impl Tool for UpdatePlanTool {
             cwd: Some(ctx.cwd.clone()),
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             // 没有副作用：started 而没有结果的那次，再收一次尾就是了，不必核对。
             recovery: RecoveryMode::SafeReread,
             then_run: None,

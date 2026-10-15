@@ -128,7 +128,6 @@ impl Tool for CodemodeTool {
             cwd: Some(ctx.cwd.clone()),
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             // Safe 表示可重新进入 journal 协议，不表示可重做全部子调用。
             recovery: RecoveryMode::SafeReread,
             then_run: None,

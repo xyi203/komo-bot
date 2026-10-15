@@ -107,7 +107,6 @@ impl Tool for PythonTool {
             cwd: Some(ctx.cwd.clone()),
             targets: vec![],
             versions,
-            resources: vec![],
             // 重启后不从头再跑整个脚本，中断结果交给模型（§8.6）。
             recovery: RecoveryMode::NoSafeRecovery,
             then_run: None,

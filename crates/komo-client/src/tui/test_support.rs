@@ -197,7 +197,6 @@ pub fn plan() -> ExecutionPlan {
             code: Some(ContentHash::of_str("rm -rf build")),
             env: None,
         },
-        resources: vec![],
         recovery: RecoveryMode::NoSafeRecovery,
         then_run: None,
     }

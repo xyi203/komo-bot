@@ -153,7 +153,6 @@ impl Tool for EditTool {
                 expected_version: before_hash,
             }],
             versions: PlanVersions::default(),
-            resources: vec![],
             // 重启后不重跑，中断结果交给模型（§8.6）。
             recovery: RecoveryMode::NoSafeRecovery,
             then_run: None,

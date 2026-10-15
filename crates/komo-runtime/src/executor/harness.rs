@@ -339,7 +339,6 @@ impl Tool for RecordingTool {
             cwd: Some(ctx.cwd.clone()),
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             recovery: self.recovery.clone(),
             then_run: None,
         })

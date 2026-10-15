@@ -132,7 +132,6 @@ impl Tool for MonitorTool {
             cwd: Some(cwd),
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             // 核对对象是 Gateway 手里的监听登记（同一个请求键还在不在跑），与 `dispatch`
             // 同一类；认不到就如实说"中断了"，不重新起进程。
             recovery: RecoveryMode::VerifyTarget,
@@ -216,7 +215,6 @@ impl Tool for MonitorStopTool {
             cwd: Some(ctx.cwd.clone()),
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             recovery: RecoveryMode::VerifyTarget,
             then_run: None,
         })

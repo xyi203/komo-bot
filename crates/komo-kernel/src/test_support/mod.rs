@@ -140,7 +140,6 @@ pub fn sample_plan(tool: &str, session: &SessionId) -> ExecutionPlan {
         cwd: None,
         targets: vec![],
         versions: Default::default(),
-        resources: vec![],
         recovery: RecoveryMode::SafeReread,
         then_run: None,
     }

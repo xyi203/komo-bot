@@ -116,7 +116,6 @@ impl Tool for WriteTool {
                 expected_version: args.expected_version.as_ref().map(ExpectedVersion::hash),
             }],
             versions: PlanVersions::default(),
-            resources: vec![],
             // 重启后不重跑，中断结果交给模型（§8.6）。
             recovery: RecoveryMode::NoSafeRecovery,
             then_run: None,

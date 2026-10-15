@@ -100,7 +100,6 @@ impl Tool for FollowTool {
             cwd: Some(ctx.cwd.clone()),
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             recovery: RecoveryMode::VerifyTarget,
             then_run: None,
         })

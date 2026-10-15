@@ -217,7 +217,6 @@ impl Tool for RgTool {
             cwd: Some(ctx.cwd.clone()),
             targets,
             versions: PlanVersions::default(),
-            resources: vec![],
             recovery: RecoveryMode::SafeReread,
             then_run: None,
         })

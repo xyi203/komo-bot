@@ -240,19 +240,6 @@ pub struct PlanVersions {
 #[serde(transparent)]
 pub struct EnvVersion(pub String);
 
-/// 计划引用到的资源：HA / Memos / 搜索服务的端点与**凭证引用**。凭证的值不进计划、
-/// 不进提示词、不进日志。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ResourceRef {
-    /// 资源名，例如 `memos`、`homeassistant`。
-    pub name: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    /// 凭证所在的环境变量名——不是凭证本身。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential_env: Option<String>,
-}
-
 /// 计划里记下的恢复方式（§8.6）。由 `prepare` 填写，模型不能随意填"可重试"。
 ///
 /// 重启续跑只问它一件事：[`RecoveryMode::replay`]。四个变体都要留着——它进计划哈希，
@@ -334,8 +321,6 @@ pub struct ExecutionPlan {
     pub targets: Vec<PlanTarget>,
     #[serde(default)]
     pub versions: PlanVersions,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub resources: Vec<ResourceRef>,
     pub recovery: RecoveryMode,
     /// 文件改动之后紧接着跑的那条命令（`edit` / `write` 的 `then_run`）。
     ///
@@ -418,7 +403,6 @@ mod tests {
             cwd: Some(PathBuf::from("/tmp/ws")),
             targets: vec![PlanTarget::local("/tmp/ws/a.txt", TargetAccess::Write)],
             versions: PlanVersions::default(),
-            resources: vec![],
             recovery: RecoveryMode::VerifyTarget,
             then_run: None,
         }
@@ -481,6 +465,14 @@ mod tests {
     fn an_old_stored_plan_reads_back_without_then_run() {
         let read: ExecutionPlan = serde_json::from_str(OLD_ROW).unwrap();
         assert_eq!(read.then_run, None);
+        assert_eq!(read, plan());
+    }
+
+    #[test]
+    fn an_old_plan_carrying_resources_still_decodes() {
+        let mut row: serde_json::Value = serde_json::from_str(OLD_ROW).unwrap();
+        row["resources"] = serde_json::json!([{"name": "memos", "endpoint": "http://m", "credential_env": "MEMOS_TOKEN"}]);
+        let read: ExecutionPlan = serde_json::from_value(row).unwrap();
         assert_eq!(read, plan());
     }
 

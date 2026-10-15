@@ -118,7 +118,6 @@ impl Tool for McpTool {
             // 目标在服务器那边，komo 只看得见"哪个服务器的哪个工具"，已经在操作里了。
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             recovery: if self.read_only {
                 RecoveryMode::SafeReread
             } else {

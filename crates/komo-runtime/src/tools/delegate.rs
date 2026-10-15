@@ -145,7 +145,6 @@ impl Tool for DelegateTool {
             // 覆盖的是整份 spec，不是某个文件版本。
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             // 子 Run 的终态就在我们自己的账本里，所以"重做安不安全"这件事有确定答案：
             // 核对目标状态（§8.6 的第二行），而不是重派一次。
             recovery: RecoveryMode::VerifyTarget,

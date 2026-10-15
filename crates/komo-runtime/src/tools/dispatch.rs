@@ -112,7 +112,6 @@ impl Tool for DispatchTool {
             // 派任务不碰任何文件：它触及的目标是"一个新会话"，不是路径。
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             // 核对对象是我们自己的账本（幂等的请求键有没有对应的 Run），与 `delegate`
             // 同一类（§8.6 的"可以核对目标状态"）。
             recovery: RecoveryMode::VerifyTarget,

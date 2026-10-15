@@ -2068,7 +2068,6 @@ impl Tool for Probe {
             // 目标就是参数里那个路径——规则的路径匹配只看这里（§7.1）。
             targets: vec![PlanTarget::local(ctx.cwd.join(path), TargetAccess::Read)],
             versions: PlanVersions::default(),
-            resources: vec![],
             // 读取可以安全重做：超时是失败，不是"结果不明"。
             recovery: RecoveryMode::SafeReread,
             then_run: None,
@@ -2599,7 +2598,6 @@ fn plan_touching(paths: &[PathBuf], operation: Operation) -> ExecutionPlan {
             .map(|path| PlanTarget::local(path.clone(), TargetAccess::Read))
             .collect(),
         versions: PlanVersions::default(),
-        resources: vec![],
         recovery: RecoveryMode::SafeReread,
         then_run: None,
     }
@@ -4051,7 +4049,6 @@ mod fused {
                 cwd: Some(ctx.cwd.clone()),
                 targets: vec![PlanTarget::local(ctx.cwd.join("a.txt"), TargetAccess::Read)],
                 versions: PlanVersions::default(),
-                resources: vec![],
                 recovery: RecoveryMode::SafeReread,
                 then_run: None,
             })

@@ -90,7 +90,6 @@ pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPla
             code: Some(ContentHash::of_str(command)),
             ..Default::default()
         },
-        resources: vec![],
         recovery: RecoveryMode::NoSafeRecovery,
         then_run: None,
     }

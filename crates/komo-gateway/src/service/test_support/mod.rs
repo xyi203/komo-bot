@@ -472,7 +472,6 @@ fn test_plan(
         cwd: Some(ctx.cwd.clone()),
         targets: vec![],
         versions: PlanVersions::default(),
-        resources: vec![],
         recovery: RecoveryMode::NoSafeRecovery,
         then_run: None,
     }

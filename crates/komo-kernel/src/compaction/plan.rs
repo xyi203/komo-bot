@@ -457,7 +457,6 @@ mod tests {
             cwd: Some(format!("/Users/someone/.komo/workspaces/{}", "w".repeat(120)).into()),
             targets: vec![],
             versions: PlanVersions::default(),
-            resources: vec![],
             recovery: RecoveryMode::SafeReread,
             then_run: None,
         };

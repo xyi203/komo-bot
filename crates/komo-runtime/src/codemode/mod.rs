@@ -1,42 +1,47 @@
-//! codemode 的沙箱与子进程协议（`docs/codemode.md`）。
+//! codemode 的脚本引擎与 worker 协议（`docs/codemode.md`）。
 //!
-//! 这里只管"在沙箱里跑一段 Python、把它的工具调用交出去"。工具调用怎么判、怎么执行在
+//! 这里只管"在 worker 里跑一段 Python、把它的工具调用交出去"。工具调用怎么判、怎么执行在
 //! executor（`run_codemode` / `nested_call`）——这里拿到的只是一个回调。
 //!
-//! **沙箱起不来就没有 codemode**：[`Sandbox::probe`] 生成配置后跑一遍自检（读写沙箱外的文件、
-//! 联网、起子进程都必须被拒），不过就返回错误，调用方不注册这个工具。不退化成裸 Python。
-//!
-//! 怎么关进去按平台分：macOS 是 Seatbelt（`seatbelt.rs`），Linux 是 Landlock + seccomp
-//! （`landlock.rs`），别的平台没有（`unsupported.rs`）。
+//! 引擎是 pydantic Monty：语言本身没有文件、网络、子进程，所以不需要操作系统沙箱，也就没有
+//! "沙箱起不来就不注册 codemode"这回事。每次调用起一个 worker 进程（`komo __codemode-worker`，
+//! 本模块的 [`worker`]），宿主管墙钟、内存与取消，到限就 SIGKILL。
 
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
-#[cfg(target_os = "linux")]
-mod landlock;
-#[cfg(target_os = "macos")]
-mod seatbelt;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-mod unsupported;
+mod convert;
+pub mod worker;
 
-#[cfg(target_os = "linux")]
-use landlock::Jail;
-#[cfg(target_os = "macos")]
-use seatbelt::Jail;
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-use unsupported::Jail;
+/// 脚本引擎的版本：写进 journal 的 `start` 指纹，升级后在途的 codemode 调用恢复时按分歧处理。
+/// 与根 `Cargo.toml` 里 `monty` 的精确钉版本同步（有测试守着）。
+pub const MONTY_VERSION: &str = "1.1.0";
+/// worker 协议版本：请求 / 消息 / 脚本前置代码（`prelude.py`）任一变了就加一。
+pub const WORKER_PROTOCOL: u32 = 1;
 
-const DRIVER: &str = include_str!("driver.py");
+/// 脚本和 worker 合计的常驻内存上限：既是 Monty 的软限，也是宿主看门狗的杀线。
+const DEFAULT_MEMORY_LIMIT: u64 = 1 << 30;
+const WATCHDOG_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 一份可用的沙箱：解释器 + 为它生成、自检通过的约束（Seatbelt 配置 / Landlock + seccomp）。
+/// 怎么起一个 worker。
 #[derive(Debug, Clone)]
-pub struct Sandbox {
-    interpreter: PathBuf,
-    jail: Jail,
+pub struct Worker {
+    launch: Launch,
+    memory_limit: u64,
+}
+
+#[derive(Debug, Clone)]
+enum Launch {
+    /// 起 `<exe> __codemode-worker`。
+    Process(PathBuf),
+    /// 测试用：同进程里的一个线程，经 socketpair 说同一套协议。杀不掉，只靠 Monty 自己的
+    /// 时间限制收尾，所以死循环、内存看门狗这类要杀进程的验收走真进程（`crates/komo/tests`）。
+    #[cfg(any(test, feature = "test-support"))]
+    InProcess,
 }
 
 /// 脚本里发现工具用的说明：这次能调的工具与它们所属的组。
@@ -60,126 +65,50 @@ pub struct ScriptTool {
 pub struct ScriptOutcome {
     pub outputs: Vec<String>,
     pub console: String,
-    /// 脚本抛出的异常（traceback）或驱动层的失败。`None` = 正常跑完。
+    /// 脚本抛出的异常（traceback）或 worker 层的失败。`None` = 正常跑完。
     pub error: Option<String>,
 }
 
-#[derive(serde::Deserialize)]
-struct Paths {
-    executable: PathBuf,
-    prefix: PathBuf,
-    base_prefix: PathBuf,
+/// 与 worker 的两端，外加要在结束时收拾的东西。
+struct Link {
+    reader: BufReader<Box<dyn AsyncRead + Unpin + Send>>,
+    writer: Box<dyn AsyncWrite + Unpin + Send>,
+    child: Option<tokio::process::Child>,
 }
 
-#[derive(serde::Deserialize)]
-struct DoneBody {
-    #[serde(default)]
-    outputs: Vec<String>,
-    #[serde(default)]
-    console: String,
-    error: Option<String>,
-}
-
-impl Sandbox {
-    /// 探解释器、生成配置、自检。任何一步不过都是 `Err`（说得清哪一步）。
-    pub async fn probe(interpreter: &Path) -> Result<Sandbox, String> {
-        let output = tokio::process::Command::new(interpreter)
-            .args([
-                "-I",
-                "-c",
-                "import json,sys;print(json.dumps({'executable':sys.executable,'prefix':sys.prefix,'base_prefix':sys.base_prefix}))",
-            ])
-            .output()
-            .await
-            .map_err(|error| format!("{} 起不来：{error}", interpreter.display()))?;
-        if !output.status.success() {
-            return Err(format!(
-                "{} 探测失败：{}",
-                interpreter.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+impl Worker {
+    pub fn exe(path: impl Into<PathBuf>) -> Self {
+        Self {
+            launch: Launch::Process(path.into()),
+            memory_limit: DEFAULT_MEMORY_LIMIT,
         }
-        let paths: Paths = serde_json::from_slice(&output.stdout)
-            .map_err(|error| format!("解释器探测结果读不懂：{error}"))?;
-        let sandbox = Sandbox {
-            jail: Jail::new(&paths)?,
-            interpreter: paths.executable,
-        };
-        sandbox.self_test().await?;
-        Ok(sandbox)
     }
 
-    /// 读写沙箱外的文件、联网、起子进程都必须被拒，协议必须通。
-    ///
-    /// 探针文件先由这边写好：脚本读得到它、或者把它改掉了，都算没拦住。
-    async fn self_test(&self) -> Result<(), String> {
-        let probe_file =
-            std::env::temp_dir().join(format!("komo-codemode-{}", uuid::Uuid::now_v7()));
-        std::fs::write(&probe_file, "komo").map_err(|error| format!("探针文件写不了：{error}"))?;
-        let code = format!(
-            r#"
-import os, socket, subprocess
-def blocked(f):
-    try:
-        f()
-        return False
-    except Exception:
-        return True
-text({{
-    "read": blocked(lambda: open({path:?}).read()),
-    "write": blocked(lambda: open({path:?}, "a").write("x")),
-    "net": blocked(lambda: socket.create_connection(("1.1.1.1", 80), timeout=2)),
-    "exec": blocked(lambda: subprocess.run(["/bin/echo", "x"], check=True)),
-}})
-"#,
-            path = probe_file.display().to_string(),
-        );
-        let outcome = self
-            .run(&code, &[], Duration::from_secs(20), |_, _| async {
-                Err("自检不调工具".to_string())
-            })
-            .await;
-        let leaked = std::fs::read_to_string(&probe_file).ok().as_deref() != Some("komo");
-        let _ = std::fs::remove_file(&probe_file);
-        if let Some(error) = outcome.error {
-            return Err(format!("沙箱自检没跑通：{error}"));
-        }
-        let verdict: serde_json::Value = outcome
-            .outputs
-            .first()
-            .and_then(|text| serde_json::from_str(text).ok())
-            .ok_or("沙箱自检没有输出")?;
-        let all_blocked = ["read", "write", "net", "exec"]
-            .iter()
-            .all(|key| verdict[key] == serde_json::Value::Bool(true));
-        if !all_blocked || leaked {
-            return Err(format!("沙箱没拦住：{verdict}"));
-        }
-        Ok(())
+    /// 当前进程的可执行文件，Gateway 启动时解析一次。
+    pub fn current_exe() -> std::io::Result<Self> {
+        std::env::current_exe().map(Self::exe)
     }
 
-    /// 跑一段脚本。`on_call(name, args)` 回答脚本里的每一次工具调用。
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn in_process() -> Self {
+        Self {
+            launch: Launch::InProcess,
+            memory_limit: DEFAULT_MEMORY_LIMIT,
+        }
+    }
+
+    pub fn with_memory_limit(mut self, bytes: u64) -> Self {
+        self.memory_limit = bytes;
+        self
+    }
+
+    /// 跑一段脚本。`on_call(name, args)` 回答脚本里的每一次工具调用；`catalog` 是脚本里
+    /// `ALL_TOOLS` / `search_tools` / `describe_tool` / `describe_namespace` 要的说明
+    /// （`docs/codemode.md` §6），发现在 worker 里本地做完，不经宿主、不进 journal。
     ///
-    /// 时限到了杀掉进程组；外层 future 被丢掉（取消）时子进程随之被杀（`kill_on_drop`）。
+    /// 时限到了、内存超了都 SIGKILL worker；外层 future 被丢掉（取消）时进程随之被杀
+    /// （`kill_on_drop`）。
     pub async fn run<F, Fut>(
-        &self,
-        code: &str,
-        tools: &[String],
-        timeout: Duration,
-        on_call: F,
-    ) -> ScriptOutcome
-    where
-        F: FnMut(String, serde_json::Value) -> Fut,
-        Fut: Future<Output = Result<serde_json::Value, String>>,
-    {
-        self.run_with_catalog(code, tools, &ScriptCatalog::default(), timeout, on_call)
-            .await
-    }
-
-    /// 同 [`Self::run`]，另带上脚本里 `ALL_TOOLS` / `search_tools` / `describe_tool` /
-    /// `describe_namespace` 要的说明（`docs/codemode.md` §6）。发现在沙箱里本地做完，不经宿主、
-    /// 不进 journal。
-    pub async fn run_with_catalog<F, Fut>(
         &self,
         code: &str,
         tools: &[String],
@@ -191,85 +120,155 @@ text({{
         F: FnMut(String, serde_json::Value) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, String>>,
     {
-        let mut child = match self
-            .jail
-            .command(&self.interpreter)
-            .args(["-I", "-c", DRIVER])
-            .env_clear()
-            .env("LANG", "C.UTF-8")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0)
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => return failed(format!("沙箱进程起不来：{error}")),
+        let mut link = match self.spawn() {
+            Ok(link) => link,
+            Err(error) => return failed(format!("脚本进程起不来：{error}")),
         };
-        let mut stdin = child.stdin.take().expect("stdin 是 piped");
-        let mut stdout = BufReader::new(child.stdout.take().expect("stdout 是 piped")).lines();
-        let mut stderr = child.stderr.take().expect("stderr 是 piped");
+        let pid = link.child.as_ref().and_then(|child| child.id());
+        let mut stderr = link.child.as_mut().and_then(|child| child.stderr.take());
 
         let conversation = async {
-            let first = serde_json::json!({ "code": code, "tools": tools, "catalog": catalog });
-            if let Err(error) = write_line(&mut stdin, &first).await {
-                return Err(format!("脚本交不进沙箱：{error}"));
+            let first = serde_json::json!({
+                "code": code,
+                "tools": tools,
+                "catalog": catalog,
+                "limits": {
+                    "max_memory": self.memory_limit,
+                    "max_turn_ms": self.in_process_turn_limit(),
+                },
+            });
+            if let Err(error) = write_line(&mut link.writer, &first).await {
+                return Err(format!("脚本交不进 worker：{error}"));
             }
+            let mut lines = (&mut link.reader).lines();
             loop {
-                let line = match stdout.next_line().await {
+                let line = match lines.next_line().await {
                     Ok(Some(line)) => line,
-                    Ok(None) => return Err("沙箱进程提前退出".to_string()),
-                    Err(error) => return Err(format!("读不到沙箱输出：{error}")),
+                    Ok(None) => return Err("脚本进程提前退出".to_string()),
+                    Err(error) => return Err(format!("读不到 worker 输出：{error}")),
                 };
                 let message: serde_json::Value = serde_json::from_str(&line)
-                    .map_err(|error| format!("沙箱输出不是协议：{error}"))?;
+                    .map_err(|error| format!("worker 输出不是协议：{error}"))?;
                 if let Some(done) = message.get("done") {
-                    let done: DoneBody = serde_json::from_value(done.clone())
-                        .map_err(|error| format!("结束消息读不懂：{error}"))?;
-                    return Ok(done);
+                    return serde_json::from_value::<worker::Done>(done.clone())
+                        .map_err(|error| format!("结束消息读不懂：{error}"));
                 }
                 let Some(name) = message.get("call").and_then(|name| name.as_str()) else {
-                    return Err(format!("沙箱输出不是协议：{line}"));
+                    return Err(format!("worker 输出不是协议：{line}"));
                 };
                 let args = message.get("args").cloned().unwrap_or_default();
                 let reply = match on_call(name.to_string(), args).await {
                     Ok(value) => serde_json::json!({ "ok": value }),
                     Err(error) => serde_json::json!({ "error": error }),
                 };
-                write_line(&mut stdin, &reply)
+                write_line(&mut link.writer, &reply)
                     .await
-                    .map_err(|error| format!("答复交不进沙箱：{error}"))?;
+                    .map_err(|error| format!("答复交不进 worker：{error}"))?;
             }
         };
 
-        let result = tokio::time::timeout(timeout, conversation).await;
-        let outcome = match result {
-            Err(_elapsed) => {
-                let _ = child.start_kill();
-                failed(format!("脚本超时（{}s），已终止", timeout.as_secs()))
-            }
-            Ok(Err(error)) => {
-                let _ = child.start_kill();
-                let mut tail = String::new();
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(1), stderr.read_to_string(&mut tail))
-                        .await;
-                let tail = tail.trim();
-                failed(if tail.is_empty() {
-                    error
-                } else {
-                    format!("{error}\n{tail}")
+        let outcome = tokio::select! {
+            result = tokio::time::timeout(timeout, conversation) => match result {
+                Err(_elapsed) => failed(format!("脚本超时（{}s），已终止", timeout.as_secs())),
+                Ok(Err(error)) => failed(with_stderr_tail(error, stderr.as_mut()).await),
+                Ok(Ok(done)) => ScriptOutcome {
+                    outputs: done.outputs,
+                    console: done.console,
+                    error: done.error,
+                },
+            },
+            resident = over_memory(pid, self.memory_limit) => failed(format!(
+                "脚本内存超限（{} MiB > {} MiB），已终止",
+                resident >> 20,
+                self.memory_limit >> 20
+            )),
+        };
+        if let Some(child) = link.child.as_mut() {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        }
+        outcome
+    }
+
+    fn spawn(&self) -> std::io::Result<Link> {
+        match &self.launch {
+            Launch::Process(exe) => {
+                let mut child = tokio::process::Command::new(exe)
+                    .arg("__codemode-worker")
+                    .env_clear()
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .process_group(0)
+                    .spawn()?;
+                let writer = child.stdin.take().expect("stdin 是 piped");
+                let reader = child.stdout.take().expect("stdout 是 piped");
+                Ok(Link {
+                    reader: BufReader::new(Box::new(reader)),
+                    writer: Box::new(writer),
+                    child: Some(child),
                 })
             }
-            Ok(Ok(done)) => ScriptOutcome {
-                outputs: done.outputs,
-                console: done.console,
-                error: done.error,
-            },
-        };
-        let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
-        outcome
+            #[cfg(any(test, feature = "test-support"))]
+            Launch::InProcess => {
+                let (ours, theirs) = std::os::unix::net::UnixStream::pair()?;
+                ours.set_nonblocking(true)?;
+                let input = theirs.try_clone()?;
+                std::thread::Builder::new()
+                    .stack_size(worker::STACK_SIZE)
+                    .spawn(move || worker::serve(std::io::BufReader::new(input), theirs))?;
+                let (reader, writer) = tokio::io::split(tokio::net::UnixStream::from_std(ours)?);
+                Ok(Link {
+                    reader: BufReader::new(Box::new(reader)),
+                    writer: Box::new(writer),
+                    child: None,
+                })
+            }
+        }
+    }
+
+    /// 进程内的 worker 杀不掉，让 Monty 自己在时限后停下，免得死循环的线程在测试进程里
+    /// 一直占着一个核。
+    fn in_process_turn_limit(&self) -> Option<u64> {
+        match self.launch {
+            Launch::Process(_) => None,
+            #[cfg(any(test, feature = "test-support"))]
+            Launch::InProcess => Some(20_000),
+        }
+    }
+}
+
+/// worker 的常驻内存超过 `limit` 时返回读数。拿不到 pid（进程内 worker）就永远不返回。
+async fn over_memory(pid: Option<u32>, limit: u64) -> u64 {
+    let Some(pid) = pid else {
+        return std::future::pending().await;
+    };
+    let mut interval = tokio::time::interval(WATCHDOG_INTERVAL);
+    loop {
+        interval.tick().await;
+        if let Some(resident) = crate::limits::resident_bytes(pid)
+            && resident > limit
+        {
+            return resident;
+        }
+    }
+}
+
+async fn with_stderr_tail(
+    error: String,
+    stderr: Option<&mut tokio::process::ChildStderr>,
+) -> String {
+    let Some(stderr) = stderr else {
+        return error;
+    };
+    let mut tail = String::new();
+    let _ = tokio::time::timeout(Duration::from_secs(1), stderr.read_to_string(&mut tail)).await;
+    let tail = tail.trim();
+    if tail.is_empty() {
+        error
+    } else {
+        format!("{error}\n{tail}")
     }
 }
 
@@ -281,103 +280,14 @@ fn failed(error: String) -> ScriptOutcome {
 }
 
 async fn write_line(
-    stdin: &mut tokio::process::ChildStdin,
+    writer: &mut (dyn AsyncWrite + Unpin + Send),
     value: &serde_json::Value,
 ) -> std::io::Result<()> {
     let mut line = serde_json::to_string(value).unwrap_or_default();
     line.push('\n');
-    stdin.write_all(line.as_bytes()).await?;
-    stdin.flush().await
+    writer.write_all(line.as_bytes()).await?;
+    writer.flush().await
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// macOS 与开了 Landlock 的 Linux 上沙箱必须起得来；别处跳过。
-    async fn sandbox() -> Option<Sandbox> {
-        let python = PathBuf::from("/usr/bin/python3");
-        if !python.exists() {
-            return None;
-        }
-        #[cfg(target_os = "linux")]
-        landlock::abi()?;
-        if !cfg!(any(target_os = "linux", target_os = "macos")) {
-            return None;
-        }
-        Some(Sandbox::probe(&python).await.expect("沙箱该起得来"))
-    }
-
-    #[tokio::test]
-    async fn the_sandbox_blocks_writes_network_and_exec_and_still_talks() {
-        let Some(sandbox) = sandbox().await else {
-            return;
-        };
-        let outcome = sandbox
-            .run(
-                "r = tools.read(path='a.txt')\ntext(r['text'].upper())\nprint('done')",
-                &["read".to_string()],
-                Duration::from_secs(20),
-                |name, args| async move {
-                    assert_eq!(name, "read");
-                    assert_eq!(args["path"], "a.txt");
-                    Ok(serde_json::json!({ "status": "completed", "text": "hello" }))
-                },
-            )
-            .await;
-        assert_eq!(outcome.error, None);
-        assert_eq!(outcome.outputs, vec!["HELLO".to_string()]);
-        assert_eq!(outcome.console, "done\n");
-    }
-
-    #[tokio::test]
-    async fn a_refused_call_raises_inside_the_script() {
-        let Some(sandbox) = sandbox().await else {
-            return;
-        };
-        let outcome = sandbox
-            .run(
-                "try:\n    tools.write(path='x')\nexcept ToolError as e:\n    text('拒了：' + str(e))",
-                &["write".to_string()],
-                Duration::from_secs(20),
-                |_, _| async { Err("会改东西".to_string()) },
-            )
-            .await;
-        assert_eq!(outcome.outputs, vec!["拒了：会改东西".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn a_runaway_script_is_killed_at_the_deadline() {
-        let Some(sandbox) = sandbox().await else {
-            return;
-        };
-        let started = std::time::Instant::now();
-        let outcome = sandbox
-            .run(
-                "while True:\n    pass",
-                &[],
-                Duration::from_secs(1),
-                |_, _| async { Err(String::new()) },
-            )
-            .await;
-        assert!(outcome.error.unwrap().contains("超时"));
-        assert!(started.elapsed() < Duration::from_secs(10));
-    }
-
-    #[tokio::test]
-    async fn an_exception_keeps_the_partial_output() {
-        let Some(sandbox) = sandbox().await else {
-            return;
-        };
-        let outcome = sandbox
-            .run(
-                "text('前半')\nraise ValueError('坏了')",
-                &[],
-                Duration::from_secs(20),
-                |_, _| async { Err(String::new()) },
-            )
-            .await;
-        assert_eq!(outcome.outputs, vec!["前半".to_string()]);
-        assert!(outcome.error.unwrap().contains("ValueError: 坏了"));
-    }
-}
+mod tests;

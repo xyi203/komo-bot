@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use komo_kernel::events::EventPayload;
 use komo_kernel::traits::{Tool, ToolOutputStore};
+use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{AttemptId, ToolCallId};
 use komo_kernel::types::plan::{Operation, RecoveryMode, Replay};
 use komo_kernel::types::refs::ToolResultStatus;
@@ -426,13 +427,7 @@ async fn journal_reader_crosses_page_boundaries_without_skipping_a_child() {
 }
 
 #[tokio::test]
-async fn actual_python_returns_committed_outcome_without_repeating_child() {
-    let sandbox =
-        match crate::codemode::Sandbox::probe(std::path::Path::new("/usr/bin/python3")).await {
-            Ok(sandbox) => sandbox,
-            Err(error) if cfg!(target_os = "macos") => panic!("sandbox unavailable: {error}"),
-            Err(_) => return,
-        };
+async fn script_returns_committed_outcome_without_repeating_child() {
     let h = Harness::new();
     let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
     let _registered = h.executor(vec![tool.clone()]);
@@ -443,7 +438,7 @@ async fn actual_python_returns_committed_outcome_without_repeating_child() {
         h.outputs.clone(),
         Arc::new(h.clock.clone()),
     )
-    .with_codemode(Some(Arc::new(sandbox)));
+    .with_codemode(Some(crate::codemode::Worker::in_process()));
     let (s, r) = h.open_run().await;
     let ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
     let env = h.env(&s, &r);
@@ -474,14 +469,10 @@ async fn actual_python_returns_committed_outcome_without_repeating_child() {
     );
 }
 
+/// 换引擎（2026-10-15）之前在途的调用：`start` 指纹是 CPython driver 时代的形状，对不上，恢复时
+/// 按分歧返回 uncertain，不起 worker、不执行任何子调用。
 #[tokio::test]
-async fn actual_python_replays_prefix_and_caught_extra_call_cannot_write() {
-    let sandbox =
-        match crate::codemode::Sandbox::probe(std::path::Path::new("/usr/bin/python3")).await {
-            Ok(sandbox) => sandbox,
-            Err(error) if cfg!(target_os = "macos") => panic!("sandbox unavailable: {error}"),
-            Err(_) => return,
-        };
+async fn a_start_fingerprint_from_the_cpython_driver_settles_as_uncertain() {
     let h = Harness::new();
     let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
     let _registered = h.executor(vec![tool.clone()]);
@@ -491,7 +482,54 @@ async fn actual_python_replays_prefix_and_caught_extra_call_cannot_write() {
         h.outputs.clone(),
         Arc::new(h.clock.clone()),
     )
-    .with_codemode(Some(Arc::new(sandbox)));
+    .with_codemode(Some(crate::codemode::Worker::in_process()));
+    let (s, r) = h.open_run().await;
+    let ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
+    let env = h.env(&s, &r);
+    let code = "text(tools.mcp__test__write(value=1)['text'])";
+    executor
+        .codemode_record(
+            &ctx,
+            "start",
+            Record::Start {
+                fingerprint: json!({
+                    "version": 1,
+                    "code": ContentHash::of_str(code),
+                    "driver": ContentHash::of_str("# 旧 driver.py"),
+                    "tools": ["mcp__test__write"],
+                    "cwd": ctx.cwd,
+                    "env": null,
+                }),
+            },
+        )
+        .await
+        .unwrap();
+    let mut sink = h
+        .outputs
+        .begin(&ToolExecutor::codemode_attempt(&ctx, "sink"))
+        .await
+        .unwrap();
+    let error = executor
+        .run_codemode(code, &env, &ctx, sink.as_mut())
+        .await
+        .unwrap_err();
+    assert!(error.is_uncertain(), "{error}");
+    assert!(error.to_string().contains("回放分歧"), "{error}");
+    assert_eq!(tool.ran(), 0);
+}
+
+#[tokio::test]
+async fn script_replays_prefix_and_caught_extra_call_cannot_write() {
+    let h = Harness::new();
+    let tool = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
+    let _registered = h.executor(vec![tool.clone()]);
+    let executor = ToolExecutor::new(
+        vec![tool.clone()],
+        h.ledger.clone(),
+        h.outputs.clone(),
+        Arc::new(h.clock.clone()),
+    )
+    .with_codemode(Some(crate::codemode::Worker::in_process()));
     let (s, r) = h.open_run().await;
     let ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
     let env = h.env(&s, &r);
@@ -534,13 +572,7 @@ async fn actual_python_replays_prefix_and_caught_extra_call_cannot_write() {
 }
 
 #[tokio::test]
-async fn sandbox_timeout_during_unsafe_child_returns_uncertain() {
-    let sandbox =
-        match crate::codemode::Sandbox::probe(std::path::Path::new("/usr/bin/python3")).await {
-            Ok(sandbox) => sandbox,
-            Err(error) if cfg!(target_os = "macos") => panic!("sandbox unavailable: {error}"),
-            Err(_) => return,
-        };
+async fn script_timeout_during_unsafe_child_returns_uncertain() {
     let h = Harness::new();
     let tool = Arc::new(
         RecordingTool::new(
@@ -560,7 +592,7 @@ async fn sandbox_timeout_during_unsafe_child_returns_uncertain() {
         h.outputs.clone(),
         Arc::new(h.clock.clone()),
     )
-    .with_codemode(Some(Arc::new(sandbox)));
+    .with_codemode(Some(crate::codemode::Worker::in_process()));
     let (s, r) = h.open_run().await;
     let ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
     let mut env = h.env(&s, &r);

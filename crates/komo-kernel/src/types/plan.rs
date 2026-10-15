@@ -122,7 +122,7 @@ pub enum Operation {
         #[serde(default)]
         read_only: bool,
     },
-    /// 一段在操作系统沙箱里跑的 Python 脚本（`docs/codemode.md`）。
+    /// 一段在 Monty 里跑的 Python 脚本（`docs/codemode.md`）。
     ///
     /// 脚本自己碰不到文件、网络与进程；工具调用经 executor 的 durable journal。
     /// 允许只读操作及 MCP（包括写操作），所以整段是调度屏障；恢复接回已记录子结果。

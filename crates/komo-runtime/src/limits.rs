@@ -1,4 +1,4 @@
-//! 进程资源上限：Gateway 起来时把"能开几个文件"的软上限抬到够用。
+//! 进程资源：Gateway 起来时把"能开几个文件"的软上限抬到够用；codemode worker 的常驻内存读数。
 //!
 //! launchd 给后台服务的默认软上限是 256（`launchctl limit maxfiles`），systemd 是 1024。
 //! shell / python 的子进程继承 Gateway 的上限，于是 `cargo test --workspace` 这类一次
@@ -67,6 +67,38 @@ pub fn raise_open_files() -> std::io::Result<Raised> {
     })
 }
 
+/// 子进程当前的常驻内存（字节）。读不到（进程已退出、平台不支持）是 `None`。
+///
+/// macOS 用 `proc_pid_rusage`，Linux 读 `/proc/<pid>/statm`——codemode 的内存看门狗每百毫秒
+/// 问一次，不起 `ps`。
+#[cfg(target_os = "macos")]
+pub fn resident_bytes(pid: u32) -> Option<u64> {
+    // SAFETY: 全零是 rusage_info_v2 的合法值；proc_pid_rusage 只往 buffer 写这一个结构。
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            (&mut info as *mut libc::rusage_info_v2).cast::<libc::rusage_info_t>(),
+        )
+    };
+    (status == 0).then_some(info.ri_resident_size)
+}
+
+#[cfg(target_os = "linux")]
+pub fn resident_bytes(pid: u32) -> Option<u64> {
+    let statm = std::fs::read_to_string(format!("/proc/{pid}/statm")).ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    // SAFETY: sysconf 只读系统常量。
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    Some(pages * u64::try_from(page).ok()?)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub fn resident_bytes(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// 从高到低要试的几档：`min(硬上限, TARGET)`，再往下是 macOS `OPEN_MAX` 的 10240、
 /// 4096。硬上限比哪一档都低时，它自己就是唯一一档。
 fn candidates(hard: u64) -> Vec<u64> {
@@ -92,6 +124,12 @@ mod tests {
     #[test]
     fn an_unlimited_hard_limit_falls_back_through_the_macos_steps() {
         assert_eq!(candidates(u64::MAX), vec![TARGET, 10_240, 4_096]);
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_resident_size_of_this_process_is_readable() {
+        assert!(resident_bytes(std::process::id()).is_some_and(|bytes| bytes > 1 << 20));
     }
 
     #[cfg(unix)]

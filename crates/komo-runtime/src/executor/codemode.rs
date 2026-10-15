@@ -4,7 +4,8 @@
 //! 那一步。脚本里的每一次调用走 [`ToolExecutor::nested_call`]：能力面 → `prepare` →
 //! 只读或 MCP 才放行 → 逐阶段记进 journal（`codemode_journal`）→ 执行。journal 不进模型
 //! 消息，模型只看见外层结果；MCP 写操作因此可以放进脚本，中断后靠 journal 认回已交付的
-//! 子结果，unsafe 的那一次绝不重做。范围外的读同样放行：边界来自沙箱，不来自名单（§7）。
+//! 子结果，unsafe 的那一次绝不重做。范围外的读同样放行：脚本自己碰不到文件系统，
+//! 边界来自语言，不来自名单（§7）。
 
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -72,7 +73,7 @@ impl ToolExecutor {
         Ok(())
     }
 
-    /// 跑一段脚本。journal 里已有 `finished` 就直接交回那份完整结果，不再起 Python。
+    /// 跑一段脚本。journal 里已有 `finished` 就直接交回那份完整结果，不再起 worker。
     pub(super) async fn run_codemode(
         &self,
         code: &str,
@@ -80,9 +81,9 @@ impl ToolExecutor {
         ctx: &ToolContext,
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
-        let Some(sandbox) = self.codemode.as_ref() else {
+        let Some(worker) = self.codemode.as_ref() else {
             return Err(ToolError::Failed {
-                message: "这台 Gateway 没有可用的 codemode 沙箱".into(),
+                message: "这台 Gateway 没有接 codemode".into(),
             });
         };
         let mut names: Vec<String> = env
@@ -122,8 +123,8 @@ impl ToolExecutor {
         let catalog = self.script_catalog(&names);
         let journal = Arc::new(Mutex::new(journal));
         let calls: Arc<Mutex<Vec<NestedCall>>> = Arc::default();
-        let outcome = sandbox
-            .run_with_catalog(code, &names, &catalog, env.call_timeout, |name, args| {
+        let outcome = worker
+            .run(code, &names, &catalog, env.call_timeout, |name, args| {
                 let calls = Arc::clone(&calls);
                 let journal = Arc::clone(&journal);
                 async move {
@@ -184,7 +185,7 @@ impl ToolExecutor {
             preview: Some(text.to_owned()),
         };
         // 先把整段结果外置、提交 `finished`，再交给外层发布：两步之间崩了，恢复时直接
-        // 交回这份结果，不再起 Python。
+        // 交回这份结果，不再起 worker。
         let reference = self.codemode_save(ctx, "finished", &output).await?;
         self.codemode_record(ctx, "finished", Record::Finished { output: reference })
             .await?;
@@ -224,19 +225,21 @@ impl ToolExecutor {
         catalog
     }
 
-    /// `start` 记下的指纹：脚本、driver、能力表、cwd、环境版本任一变了，恢复就是分歧。
+    /// `start` 记下的指纹：脚本、引擎与 worker 协议版本、能力表、cwd 任一变了，恢复就是分歧。
+    /// 升级前（CPython driver 时代）在途的调用指纹里是 `driver` / `env`，对不上，按分歧返回
+    /// uncertain。
     pub(super) fn codemode_fingerprint(
         code: &str,
         names: &[String],
         ctx: &ToolContext,
     ) -> serde_json::Value {
         serde_json::json!({
-            "version": 1,
+            "version": 2,
             "code": ContentHash::of_str(code),
-            "driver": ContentHash::of_str(include_str!("../codemode/driver.py")),
+            "engine": format!("monty-{}", crate::codemode::MONTY_VERSION),
+            "worker": crate::codemode::WORKER_PROTOCOL,
             "tools": names,
             "cwd": ctx.cwd,
-            "env": ctx.env_version,
         })
     }
 

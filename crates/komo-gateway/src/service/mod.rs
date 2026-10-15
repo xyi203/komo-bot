@@ -533,15 +533,30 @@ pub fn agent_config_file(config: &ConfigHolder) -> PathBuf {
     config.home().join("config.toml")
 }
 
+/// codemode 的 worker：当前这个可执行文件的 `__codemode-worker` 子命令，启动时解析一次
+/// （`docs/codemode.md` §3）。测试进程自己不是 `komo`，用进程内 worker。
+#[cfg(not(any(test, feature = "test-support")))]
+fn codemode_worker() -> Option<komo_runtime::codemode::Worker> {
+    match komo_runtime::codemode::Worker::current_exe() {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            tracing::warn!(%error, "找不到自己的可执行文件：这台 Gateway 不挂 codemode");
+            None
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+fn codemode_worker() -> Option<komo_runtime::codemode::Worker> {
+    Some(komo_runtime::codemode::Worker::in_process())
+}
+
 /// 六个基础工具（§4）与那条编排操作。`python` 要有一个跑得起来的解释器才挂；
-/// `codemode` 要沙箱自检通过才挂（`docs/codemode.md` §4），沙箱随之交给执行器。
+/// `codemode` 随 worker 一起装配（`docs/codemode.md` §3），worker 交给执行器。
 async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
-) -> (
-    Vec<Arc<dyn Tool>>,
-    Option<Arc<komo_runtime::codemode::Sandbox>>,
-) {
+) -> (Vec<Arc<dyn Tool>>, Option<komo_runtime::codemode::Worker>) {
     use komo_runtime::tools::{
         BashTool, DelegateTool, DispatchTool, EditTool, FollowTool, MonitorStopTool, MonitorTool,
         ReadTool, RgTool, UpdatePlanTool, WriteTool,
@@ -600,30 +615,11 @@ async fn build_tools(
     #[cfg(any(test, feature = "test-support"))]
     tools.extend(test_support::test_tools(config.home()));
 
+    let codemode = codemode_worker();
+    if codemode.is_some() {
+        tools.push(Arc::new(komo_runtime::tools::CodemodeTool::new()));
+    }
     let python = python_env(config);
-    let codemode = match komo_runtime::codemode::Sandbox::probe(&python.interpreter_path()).await {
-        Ok(sandbox) => {
-            tools.push(Arc::new(komo_runtime::tools::CodemodeTool::new()));
-            Some(Arc::new(sandbox))
-        }
-        Err(reason) => {
-            tracing::warn!(%reason, "codemode 沙箱起不来：这台 Gateway 不挂 codemode");
-            // 照 pi：不自动改成直接声明，只说清楚哪些 MCP 工具这下调不到、怎么改。
-            let stranded: Vec<String> = tools
-                .iter()
-                .filter(|tool| tool.exposure() == komo_kernel::types::tool::ToolExposure::Codemode)
-                .map(|tool| tool.definition().name)
-                .collect();
-            if !stranded.is_empty() {
-                tracing::warn!(
-                    tools = %stranded.join("、"),
-                    "这些 MCP 工具只在 codemode 里调，没有沙箱就调不到；要直接调就在 \
-                     [mcp.servers.<name>] 写 exposure = \"direct\""
-                );
-            }
-            None
-        }
-    };
     match komo_runtime::python_runtime::PythonRuntime::probe(python).await {
         Ok(runtime) => {
             tools.push(Arc::new(komo_runtime::tools::PythonTool::new(Arc::new(

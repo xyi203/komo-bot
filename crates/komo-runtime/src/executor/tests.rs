@@ -929,7 +929,7 @@ impl Tool for CodemodeOnly {
 }
 
 /// codemode 里调的工具留在能力面里（`tool://` 读得到），但不进交给模型的 schema；这台执行器
-/// 没有沙箱，服务器段也就不列它。
+/// 没有接 codemode，服务器段也就不列它。
 #[tokio::test]
 async fn codemode_only_tools_stay_callable_but_out_of_the_schema() {
     let harness = Harness::new();

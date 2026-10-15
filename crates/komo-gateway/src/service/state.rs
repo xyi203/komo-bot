@@ -438,8 +438,8 @@ pub struct Assembly {
     /// skill 取决于这台机器上别人装过什么。
     pub shared_home: Option<PathBuf>,
     pub tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
-    /// codemode 的沙箱（`docs/codemode.md`）；`None` = 自检没过，`codemode` 也不在 `tools` 里。
-    pub codemode: Option<Arc<komo_runtime::codemode::Sandbox>>,
+    /// codemode 的 worker（`docs/codemode.md`）；`None` = 没装配，`codemode` 也不在 `tools` 里。
+    pub codemode: Option<komo_runtime::codemode::Worker>,
     /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
     pub channels: Vec<Arc<dyn ChannelFactory>>,
 }

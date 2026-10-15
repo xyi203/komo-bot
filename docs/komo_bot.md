@@ -6,7 +6,7 @@
 
 v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；工程结构改为七个 crate（2026-09-22 抽出 `komo-agent`），编译预算列为验收项（§13.4）；飞书 / Telegram / WeChat 聊天入口与 TUI 进入首版，需要人判断的事主要在聊天里回答（§11）；新增 Skills（§5.6）；补齐 trait 清单（§13.5）；渠道的身份匹配（谁是操作者、哪个会话是 home chat）只放 config.toml / .env，不进数据库（§11.2）；配置热重载，改 config.toml / .env 不重启 Gateway（§3）。全新实现，不迁移旧代码与旧数据。
 
-2026-10-11：删掉整套 Policy 与审批（§7）。单操作者、一直跑 `mode = "auto"`，审批不在做判断；之后模型要的 komo 就执行，唯一的硬限制是 `write` / `edit` 不碰 komo 自己的状态，真正的边界只来自执行环境（codemode 沙箱）。旧会话与旧库里的审批痕迹照常能读，不再生效。
+2026-10-11：删掉整套 Policy 与审批（§7）。单操作者、一直跑 `mode = "auto"`，审批不在做判断；之后模型要的 komo 就执行，唯一的硬限制是 `write` / `edit` 不碰 komo 自己的状态，真正的边界只来自执行环境（codemode 的 Monty 引擎）。旧会话与旧库里的审批痕迹照常能读，不再生效。
 
 ## 1. 已确定的范围
 
@@ -164,7 +164,7 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 **`update_plan` 也不是第七个工具，是模型自己的工作计划。** 模型每次发**整份**计划（步骤 id / 目标 / `pending|in_progress|completed`，完成时可附 `progress`：改了哪些文件、怎么验证的、做了什么决定），以 `Operation::UpdatePlan` 进同一条执行路径——没有副作用。计划不另存：它整份内联在 `tool.planned` 里（超过内联上限在 `prepare` 就拒掉），这条 Run 现在的计划是从日志按 Run 折出来的，重启之后折出来的还是同一份；结果是计划快照加几句提醒（目标改了换 id、同时最多一个 in_progress……）。它是屏障，不和并发的读交错；started 而无结果的那次再收一次尾即可，不核对。**完成一个先前登记过、当时还没完成的步骤**是一个计划边界——一上来就标 completed 的新步骤只算补记历史；在线压缩以计划步骤完成为边界。
 
-**`codemode` 是组合，不是新能力。** 模型写一段 Python，在操作系统沙箱里跑（macOS 是 Seatbelt，Linux 是 Landlock + seccomp；不能写文件、联网、起子进程），脚本里经 `tools.<name>()` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）与 `Operation::McpCall`（含写操作）的计划；本地 `write` / `edit` / `bash` / `python`、带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是沙箱本身（§7）。沙箱自检不过就不注册。**脚本里的子调用逐次持久化**（2026-10-13，此前只放行只读、整段重跑）：每次子调用按 intent → started → delivered 记成 `codemode.journal` 事件、正文外置到 `tool-output/`，fold 不看它，不生成顶层 `tool.result`，模型只看见外层结果。中断后接回已交付的子结果，started 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次绝不重做；恢复只允许走已记录的调用前缀，不许新增调用，分歧或结果不明整段记 uncertain 交给模型。因为脚本里可能有 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）。见 `docs/codemode.md` §5、§7。
+**`codemode` 是组合，不是新能力。** 模型写一段 Python，在 Monty（pydantic 的 Python 子集解释器）里跑，跑在 komo 自己起的 worker 子进程中——语言本身没有文件、网络、子进程（2026-10-15 起取代此前的 CPython + 操作系统沙箱：Seatbelt / Landlock + seccomp，以及启动自检），脚本里经 `tools.<name>()` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）与 `Operation::McpCall`（含写操作）的计划；本地 `write` / `edit` / `bash` / `python`、带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是语言本身（§7）。**脚本里的子调用逐次持久化**（2026-10-13，此前只放行只读、整段重跑）：每次子调用按 intent → started → delivered 记成 `codemode.journal` 事件、正文外置到 `tool-output/`，fold 不看它，不生成顶层 `tool.result`，模型只看见外层结果。中断后接回已交付的子结果，started 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次绝不重做；恢复只允许走已记录的调用前缀，不许新增调用，分歧或结果不明整段记 uncertain 交给模型。因为脚本里可能有 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）。见 `docs/codemode.md` §5、§7。
 
 **MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。**默认不声明给模型**（2026-10-14，照 pi 的 `exposure`）：`exposure = "codemode"` 的 MCP 工具不进 schema、只在 codemode 脚本里调，脚本用 `search_tools` / `describe_tool` / `describe_namespace` 找；系统提示只给每台服务器一行摘要（配置的 `description`，没写就是服务器 instructions 的第一行），instructions 全文只在脚本里读。`direct` 照常声明，`hidden` 不挂。见 `docs/mcp.md` §3。
 
@@ -246,7 +246,7 @@ status / result / stdout / stderr / artifacts
 
 长期状态写入文件；依赖按锁定清单安装。环境变更串行进行，正在使用的环境版本保持不变。依赖升级需要新的环境版本，成功后再切换后续调用。
 
-虚拟环境还没建出来时，`python` 与 codemode 退回 `PATH` 里版本最高的 `python3.N`（3.10 起），一个都没有才用裸 `python3`，`env_version` 如实写成那个解释器的版本 + `no-lock`。不直接用裸 `python3` 的原因（2026-10-14）：macOS 上它是 `/usr/bin/python3`（3.9），Homebrew / uv 装的新版本只提供带版本号的名字；实测会话里模型因此缺 `tomllib`、`fromisoformat` 读不了 komo 自己小数位数不定的时间戳，白耗好几轮。
+虚拟环境还没建出来时，`python` 退回 `PATH` 里版本最高的 `python3.N`（3.10 起），一个都没有才用裸 `python3`，`env_version` 如实写成那个解释器的版本 + `no-lock`。（codemode 自 2026-10-15 起不用解释器，跑在 Monty 里。）不直接用裸 `python3` 的原因（2026-10-14）：macOS 上它是 `/usr/bin/python3`（3.9），Homebrew / uv 装的新版本只提供带版本号的名字；实测会话里模型因此缺 `tomllib`、`fromisoformat` 读不了 komo 自己小数位数不定的时间戳，白耗好几轮。
 
 ### 5.2 Python 调用形式
 
@@ -419,7 +419,7 @@ workspace = "code/komo"
 
 内置文件工具可以在 Rust 里执行路径与版本限制；任意 shell / Python 代码一旦启动，就有它运行账号的全部操作系统权限，cwd 和参数检查不是进程沙箱。所以**真正的边界只能来自执行环境**，不能来自对命令文本的判断——2026-10-11 之前那张 `command_patterns` 网就是例子：`rm -r -f /`、`find -delete`、变量拼出来的命令全在网外。
 
-今天唯一的执行环境边界是 codemode（`docs/codemode.md`）：脚本跑在 macOS Seatbelt / Linux Landlock + seccomp 里，不能写文件、联网、起子进程；脚本里经 `tools.<name>()` 的内层调用只放行只读计划与 MCP 调用（§4），本地写入、进程与编排仍在脚本外。沙箱自检不过就不注册这个工具。要给 bash / python 也立边界，路只有一条：把它们放进同类的执行环境，而不是加回规则。
+今天唯一的执行环境边界是 codemode（`docs/codemode.md`）：脚本跑在 Monty 里（2026-10-15 起，此前是 macOS Seatbelt / Linux Landlock + seccomp 里的 CPython），语言没有文件、网络、子进程，文件与环境变量要经宿主放行（这个版本一个都不放行）；worker 子进程由宿主管墙钟、内存与取消，到限 SIGKILL；脚本里经 `tools.<name>()` 的内层调用只放行只读计划与 MCP 调用（§4），本地写入、进程与编排仍在脚本外。这层边界是语言层的，不是内核隔离——Monty 自身的漏洞不在它的承诺里。要给 bash / python 也立边界，路只有一条：把它们放进同类的执行环境，而不是加回规则。
 
 ### 7.4 旧数据里的审批痕迹
 
@@ -1572,9 +1572,10 @@ komo-store     session_log（JSONL 写入器 / 范围读 / 尾部校验）、pay
                唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync), sha2
 
 komo-runtime   agent loop、executor、tools/{read,write,edit,rg,bash,python}、python_runtime、
+               codemode（Monty worker 与协议，`komo __codemode-worker` 的函数体也在这里）、
                memory（MemoryManager、索引、代次）、llm 与 embedding 适配器、
                scheduler、recovery、config。日常改动落在这里；它从不重新展开 toasty 宏。
-               deps: kernel, store, reqwest, tokio, grep + ignore（`rg` 工具）、arc-swap。
+               deps: kernel, store, reqwest, tokio, grep + ignore（`rg` 工具）、arc-swap、monty（codemode 的脚本引擎）。
                不依赖 komo-agent。
 
 komo-agent     Agent 的身份、能力与上下文装配（`docs/bot.md` 批次 1，2026-09-22 抽出）：
@@ -1639,7 +1640,9 @@ kernel ← client ────────────────────�
 | `openlark` | 仅 gateway，feature `feishu`（默认开），`default-features = false, features = ["websocket"]` | 只要 ws 长连接；事件负载用 `register_raw` 拿原始 JSON、自己的宽容 serde 结构解析。带来 `prost 0.13`（turso 同步引擎用 0.14）和一份 `tokio-tungstenite` 重复——接受，不再自己额外引入 tungstenite |
 | `wechatbot` | 仅 gateway，feature `wechat`（默认开）；**`[patch.crates-io]` 指向 `vendor/wechatbot`**（0.4.0 原样复制，只改 `Cargo.toml` 一行：reqwest `0.12` 默认特性 → `0.13`，`default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"]`） | 上游所有发布版本都写 `reqwest = { version = "0.12", features = ["json"] }`，默认特性开着 = native-tls = openssl-sys，自己一个 feature 都没有；cargo 特性只加不减，工作区里无论怎么声明都关不掉。patch 后复用 komo `main` 装的同一个 ring provider，openssl / native-tls / hyper-tls 整条 C 构建链消失，**构建不再依赖任何系统库**（Fedora 不必 `openssl-devel`，Mac 不必 `brew install openssl@3`），且 reqwest 只剩 0.13 一份（wechatbot 用到的 reqwest API 面极小，0.13 全保留；2026-09-16 实测默认特性全量构建通过）。不选 vendored openssl：OpenSSL 3.6.3、1210 个 .c，`make depend` / `install_dev` 串行，估 2–3 分钟且在 wechat 关键路径起点，会取代 turso 链成为新关键路径。升级 wechatbot = 重新复制 + 重打这一行，见 `vendor/README.md` |
 | `qrcode` | `default-features = false`；微信登录二维码渲染为终端字符 | 不需要 `image` |
-| `libc` | `0.2`，仅 komo-runtime 的 unix 目标 | codemode 的 Linux 沙箱（`docs/codemode.md` §4）：Landlock / seccomp 走裸系统调用，要系统调用号与 `sock_filter`；Gateway 起来时 `setrlimit` 抬能开的文件数（`limits.rs`，launchd 默认软上限 256，子进程跑 `cargo test` 不够）。原本就被 tokio 等拉进依赖树，不新增包、不新增重复版本；不引 `landlock` / `seccompiler` |
+| `libc` | `0.2`，仅 komo-runtime 的 unix 目标 | Gateway 起来时 `setrlimit` 抬能开的文件数（`limits.rs`，launchd 默认软上限 256，子进程跑 `cargo test` 不够）；codemode worker 的内存看门狗读 RSS（macOS `proc_pid_rusage`、Linux `/proc/<pid>/statm` 的页大小）。原本就被 tokio 等拉进依赖树，不新增包、不新增重复版本。（2026-10-15 之前还用于 codemode 的 Linux 沙箱：Landlock / seccomp 的系统调用号，随沙箱删除。） |
+| `monty` / `monty-types` | `=1.1.0`（精确钉版本）；仅 komo-runtime | codemode 的脚本引擎（`docs/codemode.md` §2）：pydantic 的 Python 子集解释器，语言层没有文件 / 网络 / 子进程。精确钉：快照格式与 `monty_types::unstable`（JSON 转换用的节点访问器）没有兼容保证，升级必须重跑回放集。**不用 `monty-alloc`**：它要占 `#[global_allocator]`，与 turso 的 `mimalloc` 冲突（`the #[global_allocator] in this crate conflicts with global allocator in: turso`），内存限制改用 Monty 的 `max_memory` 软限 + 宿主的 RSS 看门狗。没用 `monty-fs`（文件挂载）与 `monty-pool`（进程池）。带进来约 76 个新包（ruff 解析栈、`unicode_names2` 等），新增重复版本见下 |
+| `num-bigint` | `0.4`；仅 komo-runtime | Monty 的大整数与 JSON 之间的转换（`codemode/convert.rs`）；已在依赖树里（Monty 与 toasty 一侧都拉），不新增包 |
 | `rmcp` | `3.x`，`default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth"]`；仅 komo-runtime | MCP 客户端（`docs/mcp.md`），官方 Rust SDK。HTTP 走工作区同一个 reqwest 0.13（rustls-no-provider），不开 server 与宏。`auth`（2026-10-14，`oauth = true` 的服务器，`docs/mcp.md` §2.1）新拉 `oauth2 5.0`（不开默认特性），它的 chrono / rand / url 等依赖图里已有，Cargo.lock 只多这一个包。新拉 `process-wrap`、`sse-stream`、`futures`，新增一条重复版本 `nix 0.31`（process-wrap；既有 0.29）。实测（2026-10-08，增量重编）：rmcp 2.8s + 构建脚本 0.3s + process-wrap / sse-stream 各 0.2–0.3s |
 | **不引入** | image | — |
 | `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | **已做**：工作区的 `turso` 写 `default-features = false, features = ["mimalloc"]`；`toasty-driver-turso` 0.11 起上游自己对 `turso` 关了默认特性，原先 `vendor/toasty-driver-turso` 那份补丁（只改 manifest 里 `turso` 那几行）已删 | 实测（2026-09-16）：冷编 71.5s → 64.2s，编译单元 577 → 515，单元耗时总和 −36s CPU，`tantivy` / `zstd` / `lz4_flex` 从依赖树消失，少一条 C 工具链。墙钟只省 7s 是因为它们与 `aws-lc-sys` 并行、不在关键路径。功能零损失：turso 的 FTS 是索引方法，MVCC 直接拒绝。升级 toasty 时核对驱动对 `turso` 的版本与特性，CI 用 `cargo tree -e features -i turso` 断言只剩 `mimalloc`；见 `vendor/README.md` |
@@ -1679,6 +1682,13 @@ codegen-units = 16
 | `cargo test --workspace` | 增量 | ≤ 30s | — |
 
 预算不达标时，先用 `--timings` 找关键路径，再决定拆 crate 或换依赖——不凭感觉拆。
+
+**2026-10-15 codemode 换 Monty 的构建账**（本机 macOS，`cargo build --timings`，空 target 目录；测量时机器满载、别的 agent 在并行编译，墙钟不可比，只记事实，**预算文字不改**——60s 的基线早已超了，见 §14 的 2026-09-21 一条）：
+
+- 编译单元 577 → 661（+84），`Cargo.lock` 583 → 647 个包（+64）。新增单元 CPU 合计 146.6s：`monty` 38.3s（在关键路径上，可与 `turso_core` 并行）、`ruff_python_ast` 10.0s、`object` 9.9s、`monty-types` 6.9s、`bitvec` 6.6s、`unicode-general-category` 构建脚本 5.5s、`itertools 0.15` 4.4s、`ruff_python_parser` 4.2s。
+- 两次整体墙钟：带 monty 3m28s、基线 4m48s（后一次撞上别的构建，顺序也不同，**不能当结论**）。POC 在较安静时测到冷构建 98s → 111s（+13s）、release 冷构建约 +8 MB。
+- `cargo tree -d` 新增的重复版本（基线 90 行 → 99 行），全部来自 monty 的依赖：`compact_str 0.10`（`ruff_python_ast`，ratatui 那边原本就有 0.9.1）、`itertools 0.15`（`ruff_python_literal`；原有 0.12 / 0.14）、`bit-set` / `bit-vec 0.8`（`fancy-regex`，Monty 的正则引擎）、`phf_shared 0.11.3` ×2 与 `rand 0.8.8` 的又一份特性集（`phf_generator` / `unicode_names2` 构建脚本）、`smallvec 1.16.1` 的另一份特性集。komo 自己直接依赖的包没有被挤成两份。
+
 
 ### 13.5 trait 边界
 

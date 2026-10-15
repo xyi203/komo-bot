@@ -44,7 +44,7 @@ komo-store     session_log (JSONL) · payloads · tool_output · Turso Db + toas
                models + *_TABLE_DDL · repositories · Coordinator (impl Ledger).
                The only crate that sees toasty/turso.
 komo-runtime   agent loop · executor · tools/{read,write,edit,rg,bash,python} ·
-               python_runtime · memory · llm · embedding ·
+               python_runtime · codemode (Monty worker) · memory · llm · embedding ·
                scheduler · recovery · config.
 komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名 ·
                上下文装配（context：ContextInput → AgentContext，系统提示、回放、记忆段）。
@@ -55,7 +55,8 @@ komo-gateway   axum routes · SSE · auth · lock/discovery · launchd/systemd �
                Notifier · deliveries · intervention rendering · config reload.
 komo-client    HTTP + SSE client · discovery · ratatui TUI · command output.
                Depends on kernel only.
-komo (bin)     clap dispatch only.
+komo (bin)     clap dispatch only (incl. the hidden `__codemode-worker`, whose
+               body is `komo_runtime::codemode::worker::run`).
 ```
 
 Dependencies point downward only: `kernel ← store ← runtime ← gateway`,
@@ -82,7 +83,8 @@ depends on `agent`; `client` knows only protocol types.
 - **The only hard limit lives in the tools:** `write`/`edit` refuse komo's own
   state (`sessions/`, `state.db*`, `runtime/`, `.env` under the data dir).
   bash/python cannot be stopped; real boundaries come only from an execution
-  environment (codemode's sandbox).
+  environment (codemode's Monty engine: the language has no files, network or
+  subprocesses; it runs in a `komo __codemode-worker` child the host can kill).
 - **Recovery decides "did it happen" before "retry"** (§8.4 table, §8.6).
   `started` alone proves nothing. A started call without a result reruns only
   when both the plan's stored replay policy and the tool's current

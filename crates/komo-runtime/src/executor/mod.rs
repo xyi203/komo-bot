@@ -258,9 +258,9 @@ pub struct ToolExecutor {
     /// `monitor` / `monitor_stop` 的接缝（`docs/monitor.md`）。与 [`Self::spawner`] 同一个
     /// 理由是 `OnceLock`：Gateway 的实现要一份 `Arc<GatewayState>`（`submit`）。
     monitors: std::sync::OnceLock<Arc<dyn Monitors>>,
-    /// codemode 的沙箱（`docs/codemode.md`）。`None` = 这台机器上沙箱起不来，`codemode`
-    /// 也不会被注册。
-    codemode: Option<Arc<crate::codemode::Sandbox>>,
+    /// codemode 的 worker 启动方式（`docs/codemode.md`）。`None` = 这台执行器没有接 codemode
+    /// （测试装配），`codemode` 也不会被注册。
+    codemode: Option<crate::codemode::Worker>,
 }
 
 impl std::fmt::Debug for ToolExecutor {
@@ -294,8 +294,8 @@ impl ToolExecutor {
         }
     }
 
-    pub fn with_codemode(mut self, sandbox: Option<Arc<crate::codemode::Sandbox>>) -> Self {
-        self.codemode = sandbox;
+    pub fn with_codemode(mut self, worker: Option<crate::codemode::Worker>) -> Self {
+        self.codemode = worker;
         self
     }
 
@@ -391,7 +391,7 @@ impl ToolExecutor {
         namespaces
     }
 
-    /// 这次运行调得到 codemode：能力面里有它，这台 Gateway 也有沙箱。
+    /// 这次运行调得到 codemode：能力面里有它，这台 Gateway 也接了 worker。
     fn can_run_codemode(&self, surface: &AgentSurface) -> bool {
         self.codemode.is_some()
             && surface.allows(crate::tools::codemode::CODEMODE_TOOL)
@@ -673,7 +673,7 @@ impl ToolExecutor {
         let mut ctx = self.context(&request, env, attempt.clone());
         ctx.resumed = resumed;
         let started = std::time::Instant::now();
-        // codemode：外层照常落账，执行这一步换成沙箱里的脚本（`docs/codemode.md` §3）。
+        // codemode：外层照常落账，执行这一步换成 worker 里的脚本（`docs/codemode.md` §3）。
         // 组合调用：改动 → 核对 → 命令，一条结果（`tools::fusion`）。
         let execution = async {
             match (&plan.operation, plan.then_run.as_deref()) {

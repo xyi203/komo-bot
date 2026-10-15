@@ -1,4 +1,4 @@
-//! `codemode`：一段在操作系统沙箱里跑的 Python 脚本（`docs/codemode.md`）。
+//! `codemode`：一段在 Monty 里跑的 Python 脚本（`docs/codemode.md`）。
 //!
 //! 与 [`super::dispatch`] 同一个模式：这里只有定义与 `prepare`，执行在 executor
 //! （`Operation::Codemode` 分流到 `run_codemode`）——脚本里的工具调用要回到执行器
@@ -61,8 +61,9 @@ impl Tool for CodemodeTool {
                           for p in [\"src/a.rs\", \"src/b.rs\"]:\n\
                           \x20   lines = tools.read(path=p)[\"text\"].splitlines()\n\
                           \x20   text([l for l in lines if \"fn \" in l])\n\
-                          脚本跑在沙箱里：不能写文件、不能联网、不能起子进程，只能用标准库\
-                          （和受管理环境里装好的库）。\n\
+                          脚本跑在 Monty（一个受限的 Python 解释器）里：不能读写文件、不能联网、不能起\
+                          子进程、读不到环境变量，只有 json、re、math、datetime、collections、\
+                          itertools 等少数标准库，没有第三方库；要的数据都经 tools 取。\n\
                           - tools.<name>(**args)：调工具，返回 {\"status\", \"text\", \"result\"}；\
                           text 是工具的正文输出（read 是文件内容，rg 是匹配行），result 是结构化\
                           结果。工具名里的 - 写成 _。能调 read、rg 与 MCP 工具（MCP 含写操作）；\
@@ -141,7 +142,7 @@ impl Tool for CodemodeTool {
         _sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
         Err(ToolError::Failed {
-            message: "codemode 由 executor 执行：这台 Gateway 没有接上沙箱".into(),
+            message: "codemode 由 executor 执行：这台 Gateway 没有接上 worker".into(),
         })
     }
 }

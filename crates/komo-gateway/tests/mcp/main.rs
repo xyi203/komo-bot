@@ -135,14 +135,6 @@ command = "/nonexistent/mcp-server"
     );
 }
 
-/// macOS 总有 Seatbelt；Linux 看内核的 LSM 列表里有没有 landlock（同 `tests/codemode`）。
-fn sandbox_expected() -> bool {
-    cfg!(target_os = "macos")
-        || (cfg!(target_os = "linux")
-            && std::fs::read_to_string("/sys/kernel/security/lsm")
-                .is_ok_and(|lsm| lsm.split(',').any(|name| name.trim() == "landlock")))
-}
-
 /// 默认 `exposure = "codemode"`（`docs/mcp.md` §3）：MCP 工具不进交给模型的 Schema，系统提示列出
 /// 服务器与 instructions 的第一行；脚本里 `describe_namespace` 拿得到全文，`search_tools` 用中文
 /// 也搜得到，找到的工具照常调用、只执行一次。
@@ -163,10 +155,7 @@ tools.mcp__demo__bump()
         text_round(2, "好了"),
     ]]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    if !gw.state().tool_names.iter().any(|name| name == "codemode") {
-        assert!(!sandbox_expected(), "这台机器上 codemode 该挂上");
-        return;
-    }
+    assert!(gw.state().tool_names.iter().any(|name| name == "codemode"));
     let session = gw.open_session().await;
     let run = gw.submit(&session, "mcp-cm", "加一").await.run;
     let detail = gw.wait_terminal(&run).await;
@@ -260,9 +249,7 @@ async fn codemode_side_effecting_mcp_is_journaled_and_only_parent_enters_model_m
         text_round(2, "好了"),
     ]]);
     let gw = home.start(llm.clone()).await;
-    if !gw.state().tool_names.iter().any(|name| name == "codemode") {
-        return;
-    }
+    assert!(gw.state().tool_names.iter().any(|name| name == "codemode"));
     let session = gw.open_session().await;
     let run = gw.submit(&session, "cm-write", "加一").await.run;
     assert_eq!(
@@ -312,10 +299,7 @@ async fn codemode_crash_window(delivery_committed: bool) {
             text_round(2, "好了"),
         ]]))
         .await;
-    if !gw.state().tool_names.iter().any(|name| name == "codemode") {
-        home.clear_injection();
-        return;
-    }
+    assert!(gw.state().tool_names.iter().any(|name| name == "codemode"));
     let session = gw.open_session().await;
     let run = gw.submit(&session, "cm-crash", "加一").await.run;
     fault.wait_tripped().await;

@@ -353,7 +353,7 @@ async fn becoming_ready_does_not_wait_for_the_delivery_backlog() {
     assert_eq!(gateway.pending_deliveries().await.len(), 3);
 
     // 新发送口被扣住：每条补发都停在平台往返上，放开之前一条也发不完。同步补发的话，
-    // 重启就永远回不来。期限只是兜底，取客户端的就绪超时：负载下光装配（沙箱自检）就要
+    // 重启就永远回不来。期限只是兜底，取客户端的就绪超时：负载下光装配就要
     // 好几秒，拿墙钟去量"够不够快"量的是机器忙不忙。
     let second = MemSender::new(ChannelPlatform::Telegram);
     second.hold();

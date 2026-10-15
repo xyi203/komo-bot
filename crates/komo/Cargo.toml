@@ -17,6 +17,8 @@ path = "src/main.rs"
 komo-kernel = { workspace = true }
 komo-client = { workspace = true }
 komo-gateway = { workspace = true }
+# 隐藏子命令 `__codemode-worker` 的函数体在 runtime（`codemode::worker::run`）；bin 只分发。
+komo-runtime = { workspace = true }
 time = { workspace = true }
 clap = { workspace = true }
 rustls = { workspace = true }

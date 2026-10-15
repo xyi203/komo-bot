@@ -87,16 +87,17 @@ MCP 工具默认**不声明给模型**，只在 codemode 脚本里调：一台�
   子调用照常按能力面核对；顶层发来的同名调用（升级前的续跑、模型凭记忆拼出名字）也照常执行——
   它本来就在能力面里，没有越权，旧会话的历史与恢复也不用改。`tool://` 按能力面答，读得到它们。
 - **系统提示的服务器段**（主 Agent 与子代理都有）：能力面里有 `codemode` 工具、而且这次调得到
-  codemode（Profile 给了、沙箱自检过了）时，每台服务器一行 `- mcp__<server>：<摘要>`。摘要是配置的
+  codemode（Profile 给了）时，每台服务器一行 `- mcp__<server>：<摘要>`。摘要是配置的
   `description`，没写就是服务器 instructions 的**第一行**（pi 的 `serverSummary`）。整段 4096 字、每台
   250 字封顶：先缩短摘要，名字都放不下时后面的只计数。codemode 调不到时这段不出现——说了"在脚本里
   调"也调不到。内容只取决于能力面与启动时连上的服务器，Gateway 不重启就不变，不破坏前缀缓存。
 - **instructions 全文不进任何提示**（照 pi）：握手时服务器交回的 `instructions` 是外部文本，只在脚本里
   `describe_namespace("<server>")` 读得到，系统提示只取它的第一行作摘要。
-- codemode 调不到（沙箱自检没过）时**不自动改成直接声明**（照 pi）：启动时 warn 列出这些工具，要直接
-  调就把那台服务器写成 `exposure = "direct"`。Profile 不给 codemode 时同理，这些工具这次调不到。
+- codemode 调不到（Profile 没给它）时**不自动改成直接声明**（照 pi）：这些工具这次调不到，要直接
+  调就把那台服务器写成 `exposure = "direct"`。（2026-10-15 之前"沙箱自检没过"也会让 codemode 不挂、启动时 warn
+  列出被搁浅的工具；Monty 没有自检，这一条随之没了。）
 
-脚本里的发现函数在沙箱里本地做完，不经宿主、不进 journal（`docs/codemode.md` §6）。
+脚本里的发现函数在 worker 里本地做完，不经宿主、不进 journal（`docs/codemode.md` §6）。
 
 ## 4. 只读与恢复
 

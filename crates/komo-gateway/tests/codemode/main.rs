@@ -1,5 +1,5 @@
-//! codemode（`docs/codemode.md` §10）：真 Gateway + 真沙箱。沙箱在 macOS 与开了 Landlock 的
-//! Linux 上有，别处 `codemode` 不注册，这组测试跳过。
+//! codemode（`docs/codemode.md` §10）：真 Gateway，worker 是进程内的（测试进程自己不是 `komo`；
+//! 真 worker 进程的验收在 `crates/komo/tests/codemode_worker.rs`）。
 
 use std::sync::Arc;
 
@@ -28,33 +28,23 @@ fn tool_results(llm: &FakeLlm) -> Vec<String> {
         .collect()
 }
 
-/// macOS 总有 Seatbelt；Linux 看内核的 LSM 列表里有没有 landlock。
-fn sandbox_expected() -> bool {
-    cfg!(target_os = "macos")
-        || (cfg!(target_os = "linux")
-            && std::fs::read_to_string("/sys/kernel/security/lsm")
-                .is_ok_and(|lsm| lsm.split(',').any(|name| name.trim() == "landlock")))
-}
-
-/// 跑一段脚本，交回模型看到的那条工具结果。没有沙箱时是 `None`。
-async fn run_script(home: &Home, code: &str) -> Option<(Gw, Arc<FakeLlm>, String)> {
+/// 跑一段脚本，交回模型看到的那条工具结果。
+async fn run_script(home: &Home, code: &str) -> (Gw, Arc<FakeLlm>, String) {
     let llm = FakeLlm::new(vec![vec![
         call_round(1, "pc-1", "codemode", serde_json::json!({ "code": code })),
         text_round(2, "好了"),
     ]]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    if !gw.state().tool_names.iter().any(|name| name == "codemode") {
-        if sandbox_expected() {
-            panic!("这台机器上 codemode 该挂上");
-        }
-        return None;
-    }
+    assert!(
+        gw.state().tool_names.iter().any(|name| name == "codemode"),
+        "codemode 该总是挂上"
+    );
     let session = gw.open_session().await;
     let run = gw.submit(&session, "cm-1", "跑脚本").await.run;
     let detail = gw.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     let result = tool_results(&llm).pop().expect("有一条工具结果");
-    Some((gw, llm, result))
+    (gw, llm, result)
 }
 
 /// 脚本读两个文件、只把过滤后的那几行交回来，不停下来问人。
@@ -71,9 +61,7 @@ for name in ["a.log", "b.log"]:
     hits += [name + ": " + line for line in body.splitlines() if "ERROR" in line]
 text("\n".join(hits))
 "#;
-    let Some((gw, _, result)) = run_script(&home, code).await else {
-        return;
-    };
+    let (gw, _, result) = run_script(&home, code).await;
     assert!(gw.interventions().await.is_empty());
     assert!(result.contains("a.log: ERROR disk"), "{result}");
     assert!(result.contains("b.log: ERROR net"), "{result}");
@@ -90,30 +78,26 @@ async fn a_write_inside_a_script_is_refused_before_the_script_runs() {
 text("started")
 tools.write(path="x.txt", content="y")
 "#;
-    let Some((_, _, result)) = run_script(&home, code).await else {
-        return;
-    };
+    let (_, _, result) = run_script(&home, code).await;
     assert!(result.contains("脚本里调不了 write"), "{result}");
     assert!(!result.contains("started"), "脚本不该跑过：{result}");
     assert!(!home.workspace().join("x.txt").exists());
 }
 
-/// 绕过字面写法（`getattr`）也调不到：`write` 不在脚本的工具表里，抛 ToolError。
+/// 绕过字面写法（`getattr`）也调不到：`write` 不在脚本的工具表里，根本没有这个属性。
 #[tokio::test]
 async fn a_write_reached_through_getattr_is_still_refused() {
     let home = Home::new();
     let code = r#"
 try:
     getattr(tools, "write")(path="x.txt", content="y")
-except ToolError as error:
+except AttributeError as error:
     text("refused: " + str(error))
 text("write" in TOOLS)
 "#;
-    let Some((_, _, result)) = run_script(&home, code).await else {
-        return;
-    };
+    let (_, _, result) = run_script(&home, code).await;
     assert!(
-        result.contains("refused: ") && result.contains("脚本里没有 write"),
+        result.contains("refused: ") && result.contains("no attribute 'write'"),
         "{result}"
     );
     assert!(result.contains("false"), "TOOLS 里不该有 write：{result}");
@@ -134,9 +118,7 @@ text("read: " + body.strip())
 "#,
         outside.display()
     );
-    let Some((gw, _, result)) = run_script(&home, &code).await else {
-        return;
-    };
+    let (gw, _, result) = run_script(&home, &code).await;
     assert!(result.contains("read: 外面那一行"), "{result}");
     assert!(gw.interventions().await.is_empty(), "脚本里不停下来问人");
 }
@@ -145,8 +127,6 @@ text("read: " + body.strip())
 #[tokio::test]
 async fn a_runaway_script_is_killed_at_the_call_timeout() {
     let home = Home::with_config(&config_toml("[execution]\ncall_timeout_secs = 2\n"));
-    let Some((_, _, result)) = run_script(&home, "while True:\n    pass\n").await else {
-        return;
-    };
+    let (_, _, result) = run_script(&home, "while True:\n    pass\n").await;
     assert!(result.contains("脚本超时"), "{result}");
 }

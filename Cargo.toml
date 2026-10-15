@@ -143,8 +143,15 @@ futures-util = { version = "0.3", default-features = false, features = [
 bytes = "1"
 tokio-util = { version = "0.7.20", features = ["io", "codec"] }
 tempfile = "3"
-# codemode 的 Linux 沙箱（docs/codemode.md §4）：Landlock / seccomp 的系统调用号与 sock_filter。
+# Gateway 起来时抬"能开的文件数"（limits.rs）；codemode worker 的内存看门狗读 RSS、超限 SIGKILL
+# （docs/codemode.md §4）。
 libc = "0.2.190"
+# codemode 的脚本引擎（docs/codemode.md §2）：pydantic Monty，精确钉版本——它的快照与
+# `unstable` 访问器没有兼容保证，升级必须重跑回放集。`monty-alloc` 不能用：它要
+# `#[global_allocator]`，与 turso 的 mimalloc 冲突（§13.4）。
+monty = "=1.1.0"
+monty-types = "=1.1.0"
+num-bigint = "0.4"
 
 # §13.4 profile：逐字照抄。
 [profile.dev.package."*"]

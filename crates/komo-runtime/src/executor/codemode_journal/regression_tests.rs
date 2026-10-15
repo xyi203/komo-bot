@@ -185,19 +185,13 @@ impl Tool for StreamingTool {
         Ok(output)
     }
 }
-async fn sandbox() -> Option<Arc<crate::codemode::Sandbox>> {
-    match crate::codemode::Sandbox::probe(std::path::Path::new("/usr/bin/python3")).await {
-        Ok(s) => Some(Arc::new(s)),
-        Err(e) if cfg!(target_os = "macos") => panic!("sandbox unavailable: {e}"),
-        Err(_) => None,
-    }
+fn worker() -> crate::codemode::Worker {
+    crate::codemode::Worker::in_process()
 }
 
 #[tokio::test]
-async fn stream_failure_caught_by_python_cannot_continue_writes() {
-    let Some(sandbox) = sandbox().await else {
-        return;
-    };
+async fn stream_failure_caught_by_the_script_cannot_continue_writes() {
+    let worker = worker();
     for (stderr, swallow) in [(false, false), (true, false), (false, true), (true, true)] {
         let h = Harness::new();
         let remote = mcp(RecoveryMode::NoSafeRecovery, Replay::Unsafe);
@@ -213,7 +207,7 @@ async fn stream_failure_caught_by_python_cannot_continue_writes() {
             Arc::new(FailingStore(h.outputs.clone())),
             Arc::new(h.clock.clone()),
         )
-        .with_codemode(Some(sandbox.clone()));
+        .with_codemode(Some(worker.clone()));
         let (s, r) = h.open_run().await;
         let ctx = h.tool_context(&s, &r, &ToolCallId::from_raw("p"));
         let code = "try:\n    tools.mcp__test__write(value=1)\nexcept ToolError:\n    pass\ntry:\n    tools.mcp__test__write(value=2)\nexcept ToolError:\n    pass\ntext('caught')";
@@ -249,9 +243,7 @@ async fn stream_failure_caught_by_python_cannot_continue_writes() {
 
 #[tokio::test]
 async fn cancellation_after_delivered_uncertain_preserves_uncertain_and_stops_round() {
-    let Some(sandbox) = sandbox().await else {
-        return;
-    };
+    let worker = worker();
     let h = Harness::new();
     let remote = Arc::new(
         RecordingTool::new(
@@ -274,7 +266,7 @@ async fn cancellation_after_delivered_uncertain_preserves_uncertain_and_stops_ro
         h.outputs.clone(),
         Arc::new(h.clock.clone()),
     )
-    .with_codemode(Some(sandbox));
+    .with_codemode(Some(worker));
     let (s, r) = h.open_run().await;
     let code = "try:\n    tools.mcp__test__write(value=1)\nexcept ToolError:\n    pass\nwhile True:\n    pass";
     let calls = h

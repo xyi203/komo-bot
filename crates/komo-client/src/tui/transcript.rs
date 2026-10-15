@@ -36,6 +36,9 @@ use crate::tui::{markdown, tool_view};
 /// 用户那一条的行首记号。
 pub const USER_MARK: &str = "-> ";
 
+/// 插话并入的那一刻（§6）。
+const ABSORBED_MARK: &str = "↳ 已并入当前回答：";
+
 /// 交到哪儿了。一次 TUI 一份，活在驱动里。
 #[derive(Debug, Default)]
 pub struct Emitted {
@@ -281,6 +284,21 @@ impl Emitted {
 fn message_lines(message: &SurfaceMessage, width: u16) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match message.role {
+        // 插话并进来的那句（§6）：原话在它受理时已经交出去了，回滚区改不了，这里不再印一遍，
+        // 只在并入的这一刻记一行——之后那段回答是连这句一起答的。
+        Role::User if message.absorbed_from.is_some() => {
+            let text = message.text.as_deref().unwrap_or("（正文已外置）");
+            let first = text.lines().next().unwrap_or_default();
+            let room = (width as usize).saturating_sub(markdown::display_width(ABSORBED_MARK));
+            let mut excerpt = markdown::wrap_to_width(first, room.saturating_sub(1))
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            if excerpt.len() < text.trim_end().len() {
+                excerpt.push('…');
+            }
+            lines.push(dim(&format!("{ABSORBED_MARK}{excerpt}")));
+        }
         Role::User => {
             if let Some(text) = message.text.as_deref() {
                 lines.extend(user_lines(text, width));
@@ -722,5 +740,61 @@ mod tests {
         assert!(at("把 build 目录清掉") < at("中途的一条提示"), "{again}");
         assert!(at("中途的一条提示") < at("我来清一下"), "{again}");
         assert!(at("rm -rf build") < at("清完了"), "{again}");
+    }
+
+    /// 插话（§6）：那句话受理时照常落进回滚区；并入的那一刻只记一行，不再印一遍原话。边到
+    /// 边交的与 `Ctrl-T` 整段重交的逐行相同。
+    #[test]
+    fn an_absorbed_input_is_marked_where_it_joined_the_answer() {
+        let events = fixture::interjected();
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        let mut emitted = Emitted::new();
+        let mut streamed = Vec::new();
+        for event in &events {
+            feed(&mut app, std::slice::from_ref(event));
+            streamed.extend(emitted.take(&app, 80));
+        }
+        let streamed = text_of(&streamed);
+        assert_eq!(streamed.matches("顺便看下 dist").count(), 2, "{streamed}");
+        assert_eq!(
+            streamed.matches("-> 顺便看下 dist").count(),
+            1,
+            "{streamed}"
+        );
+        let at = |what: &str| {
+            streamed
+                .find(what)
+                .unwrap_or_else(|| panic!("{what}：{streamed}"))
+        };
+        assert!(
+            at("removed 12 files") < at("-> 顺便看下 dist"),
+            "{streamed}"
+        );
+        assert!(
+            at("-> 顺便看下 dist") < at("↳ 已并入当前回答：顺便看下 dist"),
+            "{streamed}"
+        );
+        assert!(at("↳ 已并入当前回答") < at("build 清完了"), "{streamed}");
+        assert_eq!(text_of(&Emitted::new().take(&app, 80)), streamed);
+    }
+
+    /// 长的那句只截首行，记一个省略号：这一行是个记号，原话在上面。
+    #[test]
+    fn an_absorbed_marker_fits_on_one_line() {
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        let mut events = fixture::interjected();
+        if let komo_kernel::events::EventPayload::RunAccepted(body) = &mut events[7].payload {
+            body.text = Some(format!("{}\n第二行", "很长的一句话".repeat(20)));
+        }
+        feed(&mut app, &events);
+        let lines = Emitted::new().take(&app, 40);
+        let marker: Vec<String> = lines
+            .iter()
+            .map(|line| text_of(std::slice::from_ref(line)))
+            .filter(|line| line.starts_with("↳"))
+            .collect();
+        assert_eq!(marker.len(), 1, "{marker:?}");
+        assert!(marker[0].ends_with('…'), "{marker:?}");
+        assert!(markdown::display_width(&marker[0]) <= 40, "{marker:?}");
     }
 }

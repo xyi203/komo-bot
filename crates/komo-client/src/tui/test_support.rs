@@ -1,8 +1,8 @@
 //! 测试用的固定样本。只在 `cfg(test)` 下存在，不进任何正式构建。
 
 use komo_kernel::events::{
-    EVENT_FORMAT_VERSION, Event, EventPayload, MessageAssistant, RunAccepted, RunCompleted,
-    RunQueued, RunStarted, ToolPlanned, ToolResult, ToolStarted,
+    EVENT_FORMAT_VERSION, Event, EventPayload, MessageAssistant, RunAbsorbed, RunAccepted,
+    RunCompleted, RunQueued, RunStarted, ToolPlanned, ToolResult, ToolStarted,
 };
 use komo_kernel::protocol::http::{EventPage, InterventionKind, InterventionSummary};
 use komo_kernel::types::digest::ContentHash;
@@ -166,6 +166,69 @@ pub fn conversation() -> Vec<Event> {
             }),
         ),
     ]
+}
+
+/// 插话（§6）：`conversation()` 跑到工具结果那一刻，用户又打了一句（`run-2`，要求插话），
+/// 宿主在下一次请求之前把它并了进来，接着回答。
+pub fn interjected() -> Vec<Event> {
+    let late = RunId::from_raw("run-2");
+    let mut events: Vec<Event> = conversation().into_iter().take(7).collect();
+    events.extend([
+        event(
+            8,
+            Some(late.clone()),
+            EventPayload::RunAccepted(RunAccepted {
+                request_key: RequestKey::new("tui:2"),
+                input_hash: ContentHash::of_str("顺便看下 dist"),
+                text: Some("顺便看下 dist".into()),
+                text_ref: None,
+                source: PlanSource::Interactive { session: session() },
+                peer: None,
+                model: Some("chat-a".into()),
+                effort: Some(EffortSetting::Explicit(Effort::new("high"))),
+                delegate: None,
+                snapshot: None,
+                interject: true,
+            }),
+        ),
+        event(
+            9,
+            Some(late.clone()),
+            EventPayload::RunQueued(RunQueued {
+                input_ref: EventId::from_raw("evt-8"),
+            }),
+        ),
+        event(
+            10,
+            Some(late),
+            EventPayload::RunAbsorbed(RunAbsorbed { into: run() }),
+        ),
+        event(
+            11,
+            Some(run()),
+            EventPayload::MessageAssistant(MessageAssistant {
+                round: 2,
+                text: Some("build 清完了，dist 是空的。".into()),
+                text_ref: None,
+                tool_calls: vec![],
+                provider_blocks: None,
+                input_tokens: Some(220),
+                output_tokens: Some(20),
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            }),
+        ),
+        event(
+            12,
+            Some(run()),
+            EventPayload::RunCompleted(RunCompleted {
+                final_message: Some("build 清完了，dist 是空的。".into()),
+                final_message_ref: None,
+                rounds: 2,
+            }),
+        ),
+    ]);
+    events
 }
 
 pub fn page(events: Vec<Event>, more: bool) -> EventPage {

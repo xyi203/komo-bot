@@ -870,6 +870,73 @@ fn a_run_that_ends_without_a_final_message_still_clears_the_draft() {
     assert!(app.draft.is_none(), "没人在打字了就别一直显示生成中");
 }
 
+/// 插话（§6）：打的话一律要求插话（轮不轮得上由服务端判）；`!` 命令不对话，不要求。
+#[test]
+fn typed_text_asks_to_interject_and_a_bang_command_does_not() {
+    let mut app = app();
+    type_text(&mut app, "顺便看下 dist");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Submit {
+                interject: true,
+                ..
+            }]
+        ),
+        "{effects:?}"
+    );
+    type_text(&mut app, "!ls");
+    let effects = app.handle_key(key(KeyCode::Enter));
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::Submit {
+                interject: false,
+                shell: true,
+                ..
+            }]
+        ),
+        "{effects:?}"
+    );
+}
+
+/// 在跑的时候又来一条（打的话、监听事件）：状态行与 Esc 仍对着在跑的那条；那条被并走
+/// 之后也还是宿主——回答在宿主那里。
+#[test]
+fn a_queued_or_absorbed_run_never_takes_the_status_line_from_the_running_one() {
+    let mut app = app();
+    let events = fixture::interjected();
+    feed(&mut app, &events[..9]);
+    assert_eq!(app.current_run.as_ref(), Some(&fixture::run()));
+    assert_eq!(app.run_state(), Some(RunState::Running));
+    let cancel = app.handle_key(key(KeyCode::Esc));
+    assert!(
+        matches!(cancel.as_slice(), [Effect::Cancel { run, .. }] if *run == fixture::run()),
+        "{cancel:?}"
+    );
+
+    feed(&mut app, &events[9..10]);
+    assert_eq!(app.current_run.as_ref(), Some(&fixture::run()));
+    assert_eq!(app.run_state(), Some(RunState::Running));
+    assert_eq!(
+        app.surface.runs[&RunId::from_raw("run-2")].status,
+        RunState::Absorbed
+    );
+}
+
+/// 前面那条已经结束了，新来的就是状态行该说的那条。
+#[test]
+fn a_new_run_after_the_last_one_ended_takes_the_status_line() {
+    let mut app = app();
+    feed(&mut app, &fixture::conversation());
+    let mut next = fixture::interjected()[7].clone();
+    next.seq = Seq(10);
+    feed(&mut app, &[next]);
+    assert_eq!(app.current_run.as_ref(), Some(&RunId::from_raw("run-2")));
+    assert_eq!(app.run_state(), Some(RunState::Accepted));
+}
+
 #[test]
 fn a_delta_that_arrives_before_anything_else_still_names_the_run() {
     let mut app = app();

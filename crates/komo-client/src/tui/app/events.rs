@@ -3,6 +3,7 @@
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::http::InterventionSummary;
 use komo_kernel::protocol::sse::{SseEvent, SseFrame};
+use komo_kernel::types::ids::RunId;
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::status::{RunState, ToolCallState};
 
@@ -275,7 +276,7 @@ impl App {
         self.cursor = self.cursor.max(event.seq);
 
         if let Some(run) = &event.run {
-            self.current_run = Some(run.clone());
+            self.follow(run, &event.payload);
         }
         match &event.payload {
             EventPayload::RunAccepted(body) => {
@@ -290,7 +291,8 @@ impl App {
             }
             EventPayload::RunCompleted(_)
             | EventPayload::RunCancelled(_)
-            | EventPayload::RunAbandoned(_) => {
+            | EventPayload::RunAbandoned(_)
+            | EventPayload::RunAbsorbed(_) => {
                 if let Some(run) = &event.run {
                     self.runs.entry(run.clone()).or_default().ended_at = Some(event.ts);
                     // Run 结束了就没人在打字了；留着一段孤儿草稿会一直显示"生成中"。
@@ -410,6 +412,29 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 状态行跟着哪条 Run（[`super::App::current_run`]）：通常是最近一条事件的那条，两种例外。
+    ///
+    /// - 正跑着一条时，**排队的那条不抢**：在跑的时候打一句话（或来一条监听事件），状态行
+    ///   照旧说在跑的那条、Esc 照旧取消它；排队的那条开跑时它自己的事件会把状态行拿过去。
+    /// - 被插话并走的那条（§6）：回答在宿主那里，跟宿主。
+    fn follow(&mut self, run: &RunId, payload: &EventPayload) {
+        if let EventPayload::RunAbsorbed(body) = payload {
+            self.current_run = Some(body.into.clone());
+            return;
+        }
+        let status = |run: &RunId| self.surface.runs.get(run).map(|view| view.status);
+        let busy = self
+            .current_run
+            .as_ref()
+            .filter(|current| *current != run)
+            .and_then(status)
+            .is_some_and(|state| !state.is_terminal() && !state.awaits_claim());
+        if busy && status(run).is_some_and(RunState::awaits_claim) {
+            return;
+        }
+        self.current_run = Some(run.clone());
     }
 
     /// `Ctrl-T`：工具调用全部展开 / 折叠。

@@ -148,7 +148,8 @@ impl Emitted {
             let done = stream.committed.len();
             if settled > done && draft.text.starts_with(&stream.committed) {
                 stream.committed = draft.text[..settled].to_string();
-                let lines = markdown::render(&draft.text[done..settled], width);
+                let lines =
+                    markdown::render_after(&draft.text[..done], &draft.text[done..settled], width);
                 self.hand_over(&mut out, lines, false);
             }
         }
@@ -205,7 +206,11 @@ impl Emitted {
         // 到达时它就地清掉，余下的正文由那一条落进回滚区。
         if let Some(draft) = &app.draft {
             let done = self.committed_len(draft);
-            lines.extend(markdown::render(&draft.text[done..], width));
+            lines.extend(markdown::render_after(
+                &draft.text[..done],
+                &draft.text[done..],
+                width,
+            ));
             lines.push(Line::from(Span::styled(
                 format!("{} 生成中", spinner::frame(app.now)),
                 Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
@@ -308,7 +313,11 @@ fn rest_lines(message: &SurfaceMessage, committed: &str, width: u16) -> Vec<Line
     let mut lines = Vec::new();
     match message.text.as_deref() {
         Some(text) if text.starts_with(committed) => {
-            lines.extend(markdown::render(&text[committed.len()..], width));
+            lines.extend(markdown::render_after(
+                committed,
+                &text[committed.len()..],
+                width,
+            ));
         }
         Some(text) => {
             lines.push(dim("（定稿与上面边生成边显示的不一致，以下是定稿）"));

@@ -4,12 +4,12 @@
 
 你是 komo，跑在用户自己机器上的助手。
 工作目录：/work/komo
-- 找代码、文字和列文件用 rg（列文件设 list_files=true），别用 shell 拼 rg / grep / find / ls。
-- 看文件用 read，别用 shell 跑 cat / head / tail / sed。
+- 找代码、文字和列文件用 rg（列文件设 list_files=true），别用 bash 拼 rg / grep / find / ls。
+- 看文件用 read，别用 bash 跑 cat / head / tail / sed。
 - 调用被拒绝就当作结果，不要换个工具绕过。
 - 如实报告做了什么、证据是什么；没有证据就说没有。
 
-komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、Gateway）用 shell 跑 `komo <子命令>` 查，例如 `komo cron list`，其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。
+komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、Gateway）用 bash 跑 `komo <子命令>` 查，例如 `komo cron list`，其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。
 
 Skills（用到时按根的顺序 read <根>/<名字>/SKILL.md 再照做）：
 根：<SKILLS>
@@ -46,7 +46,7 @@ Skills（用到时按根的顺序 read <根>/<名字>/SKILL.md 再照做）：
       {
         "call_id": "call-2",
         "provider_call_id": "pc-2",
-        "name": "shell",
+        "name": "bash",
         "arguments": {
           "command": "cargo test"
         }
@@ -75,7 +75,7 @@ Skills（用到时按根的顺序 read <根>/<名字>/SKILL.md 再照做）：
       {
         "provider_call_id": "pc-2",
         "call_id": "call-2",
-        "content": "[shell · 完成 · 1.2s]\n…（中间省略 603 字节）…\n第 37 行输出\n第 38 行输出\n第 39 行输出\n第 40 行输出\n完整输出：artifact://run-2/call-2/attempt-2/result\n产物：artifact://files/run-2/报告.md（13 B）\n",
+        "content": "[bash · 完成 · 1.2s]\n…（中间省略 603 字节）…\n第 37 行输出\n第 38 行输出\n第 39 行输出\n第 40 行输出\n完整输出：artifact://run-2/call-2/attempt-2/result\n产物：artifact://files/run-2/报告.md（13 B）\n",
         "is_error": false
       },
       {

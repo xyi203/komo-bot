@@ -7,9 +7,9 @@
 //!
 //! [BurntSushi/ripgrep]: https://github.com/BurntSushi/ripgrep
 //!
-//! 之所以把它做成工具而不是让模型拼一条 `shell` 命令，为的是**判定**：一次只读搜索的操作
+//! 之所以把它做成工具而不是让模型拼一条 `bash` 命令，为的是**判定**：一次只读搜索的操作
 //! 是 [`Operation::ReadFile`]，目标就是被搜的那个路径，于是 §7.1 那两条规则（范围内读
-//! Allow、范围外 Ask）原样适用——和 `read` 完全一致。走 `shell` 做不到这一点：任意命令一
+//! Allow、范围外 Ask）原样适用——和 `read` 完全一致。走 `bash` 做不到这一点：任意命令一
 //! 律 Ask，一次只读搜索每次都要停下来等人。
 //!
 //! 遍历与搜索是**阻塞**的，所以跑在 `spawn_blocking` 上，匹配经队列流式写进 `OutputWriter`
@@ -53,9 +53,9 @@ use serde::{Deserialize, Serialize};
 use super::resources::{self, ResolvedResource, ResourceError};
 use super::{normalized, parse_args, plan_time};
 
-/// 一次搜索默认跑多久。比 `shell` 的默认短：搜索在模型这一轮里是等着的动作。
+/// 一次搜索默认跑多久。比 `bash` 的默认短：搜索在模型这一轮里是等着的动作。
 pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
-/// 写进输出的字节上限。与 `shell` 同一个口径：**这是防机器资源耗尽，不是防 context 太大**
+/// 写进输出的字节上限。与 `bash` 同一个口径：**这是防机器资源耗尽，不是防 context 太大**
 /// （§4）。碰到它就让搜索停下——把一棵树走完再丢掉结果没有意义。
 /// 默认保存完整输出；模型视图的限制由 kernel 投影负责。
 pub const DEFAULT_OUTPUT_LIMIT: u64 = u64::MAX;
@@ -161,7 +161,7 @@ impl Tool for RgTool {
         ToolDefinition {
             name: "rg".into(),
             description: "搜索文件正文返回「路径:行号:正文」；list_files=true 时列出文件路径（类似 rg --files）。\
-                 搜代码、文字和列文件用它，不要用 shell 里的 rg / grep / find / ls 拼搜索。"
+                 搜代码、文字和列文件用它，不要用 bash 里的 rg / grep / find / ls 拼搜索。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",

@@ -230,7 +230,7 @@ pub struct PythonResult {
     /// stdout 的**首尾摘录**（最多几 KiB），只给模型看的那份预览用。
     ///
     /// 脚本只 `print` 不返回结构化结果时，预览不能是字面量 `null`——模型看到它会以为工具
-    /// 坏了，转头去 `shell` + `python3` 重跑一遍。完整 stdout 照旧在 `stdout.txt` 里。
+    /// 坏了，转头去 `bash` + `python3` 重跑一遍。完整 stdout 照旧在 `stdout.txt` 里。
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub stdout_excerpt: String,
     pub env_version: EnvVersion,

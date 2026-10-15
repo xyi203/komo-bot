@@ -50,7 +50,7 @@ impl Case {
             payloads: payloads(),
             outputs: None,
             model_result_bytes: 8 * 1024,
-            tools: tools(&["read", "rg", "shell"]),
+            tools: tools(&["read", "rg", "bash"]),
             instructions: None,
             skills: None,
             memories: Vec::new(),
@@ -259,7 +259,7 @@ async fn golden_full_main_agent() {
             &first,
             8,
             None,
-            vec![call(&c1, "pc-1", "shell")],
+            vec![call(&c1, "pc-1", "bash")],
             Some(serde_json::json!([{"type": "reasoning"}])),
         ),
         // 当前 Run 的输入在历史 Run 半轮中间落盘。
@@ -289,7 +289,7 @@ async fn golden_full_main_agent() {
             &second,
             16,
             Some("我先跑一下测试。"),
-            vec![call(&c2, "pc-2", "shell"), call(&c3, "pc-3", "read")],
+            vec![call(&c2, "pc-2", "bash"), call(&c3, "pc-3", "read")],
             Some(serde_json::json!([{"type": "thinking", "thinking": "…", "signature": "sig"}])),
         ),
         result(

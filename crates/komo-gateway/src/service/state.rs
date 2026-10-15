@@ -680,11 +680,11 @@ impl GatewayState {
     }
 
     /// 接上监听的实现（`docs/monitor.md`），与 [`Self::wire_task_spawner`] 同一个接法。
-    /// 脚本按 `shell` 的规矩起：数据目录只读挂载的名单与 `shell` 工具同一份。
+    /// 脚本按 `bash` 的规矩起：数据目录只读挂载的名单与 `bash` 工具同一份。
     pub fn wire_monitors(self: &Arc<Self>) {
         let snapshot = self.snapshot();
-        let shell = komo_runtime::tools::ShellTool::new()
-            .protecting(protected_paths(&snapshot, &self.home));
+        let shell =
+            komo_runtime::tools::BashTool::new().protecting(protected_paths(&snapshot, &self.home));
         let monitors = super::monitors::GatewayMonitors::new(
             Arc::clone(self),
             shell,
@@ -873,7 +873,7 @@ impl GatewayState {
         )
         // 「output.json 已完成但 JSONL 结果事件尚未写入 → 校验身份、计划及完成状态后补记
         // 结果；**不能只凭文件存在判断**」（§14 故障注入表）。没有这一口时恢复只能把
-        // `started` 而无结果的调用交给工具核对，那条路对一次已经跑完的 `shell` 答不出
+        // `started` 而无结果的调用交给工具核对，那条路对一次已经跑完的 `bash` 答不出
         // "它到底发生了没有"。
         .with_orphan_outputs(Arc::new(
             komo_runtime::recovery::SessionDirOrphanOutputs::new(
@@ -1159,7 +1159,7 @@ impl GatewayState {
     ///
     /// 走的是同一条受理路：会话状态检查、冻结身份、次序规则、看客都一样。区别只在快照里
     /// 多一格 `direct_command`——装配那一段按它换上 `CommandDriver`（与命令 Job 同一个
-    /// 驱动），于是命令照样经 `shell` 工具与执行器，调用与结果记进会话，下一轮模型看得见。
+    /// 驱动），于是命令照样经 `bash` 工具与执行器，调用与结果记进会话，下一轮模型看得见。
     /// 不做记忆提取：没有对话，提取本身还要发一次模型请求。
     ///
     /// 只有 HTTP 调它（`SubmitRunRequest::shell`）；聊天渠道不接这条路。
@@ -1212,9 +1212,9 @@ impl GatewayState {
             .freeze_run(&config, &agent_id, session, record.as_ref(), model)
             .await?;
         let skip_memory = direct_command.is_some();
-        if direct_command.is_some() && !frozen.surface.allows("shell") {
+        if direct_command.is_some() && !frozen.surface.allows("bash") {
             return Err(GatewayError::InvalidRequest(format!(
-                "这个会话的 Agent（{}）没有 shell 工具，`!` 用不了",
+                "这个会话的 Agent（{}）没有 bash 工具，`!` 用不了",
                 frozen.agent_id
             )));
         }

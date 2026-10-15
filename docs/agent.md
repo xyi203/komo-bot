@@ -636,7 +636,7 @@ pub struct StoredOutput {
 `history::latest_user_text`：Gateway 依赖 agent，这样调没问题。
 
 工具结果只有 `kernel::projection` 一处投影，这条铁律不变。Agent 层调它，不自己拼
-“完整输出在哪”那句话。full 模型视图默认最多 50 KiB 或 2000 行（二者先到）：shell / bash
+“完整输出在哪”那句话。full 模型视图默认最多 50 KiB 或 2000 行（二者先到）：bash（旧记录里的 shell 同）
 保留尾部，其他工具保留头部；UTF-8 边界不会切坏，超限结果总带可 `read` 的完整
 `artifact://` 引用。即时路径与恢复路径都用 RunSnapshot 冻结的投影设置和同一份落盘事实，
 因此逐字节相同；后续 decay 仍只换成更短的模型视图，不改 JSONL 或 tool-output 原件。
@@ -749,7 +749,7 @@ Runtime Environment 工作目录（工具名不列：API 的 tool schema 里已�
     ↓
 Rules               跟着工具走（挂了 rg 才说"用 rg"），最后两条每次都有
     ↓
-komo 自查           只有主 Agent，且挂了 shell
+komo 自查           只有主 Agent，且挂了 bash
     ↓
 Project Files       只有主 Agent：受理时从工作目录往上找到的 AGENTS.md / CLAUDE.md，
                     外层在前，正文冻结进 payloads（RunSnapshot.project_files_ref），空就不出现

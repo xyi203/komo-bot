@@ -1,6 +1,6 @@
 //! `/v1/cron`（§13.1、§10）。
 //!
-//! 「模型需要管理 Cron 时通过 shell 调这些命令；CLI 连接 Gateway，不直接访问数据库，
+//! 「模型需要管理 Cron 时通过 bash 调这些命令；CLI 连接 Gateway，不直接访问数据库，
 //! 也不增加专用 cron tool。」——所以这组接口是 `komo cron ...` 的后端，也是唯一的写入
 //! 口。
 //!
@@ -130,7 +130,7 @@ pub async fn create(
         return Err(ApiFailure::invalid(error.to_string()));
     }
 
-    // 命令 Job 不再签授权（§7 删掉审批之后，触发时那次 `shell` 调用直接执行）。
+    // 命令 Job 不再签授权（§7 删掉审批之后，触发时那次 `bash` 调用直接执行）。
     let stored = api.state.cron.put(job).await?;
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &stored);

@@ -71,7 +71,7 @@ default_agent = "assistant"
 
 [agents.assistant]
 instructions = "{instructions}"
-tools = ["read", "rg", "shell", "unsure"]
+tools = ["read", "rg", "bash", "unsure"]
 
 [model.main]
 type = "completion"
@@ -416,7 +416,7 @@ async fn a_restart_resumes_a_run_on_its_own_frozen_identity() {
     );
     assert_eq!(
         tool_names(&resumed),
-        vec!["read", "rg", "shell", "unsure"],
+        vec!["read", "rg", "bash", "unsure"],
         "能力面也是冻结的那一份"
     );
 
@@ -484,7 +484,7 @@ default_agent = "assistant"
 
 [agents.assistant]
 instructions = "你是助手（assistant 那一版身份）。"
-tools = ["dispatch", "follow", "read", "shell", "unsure"]
+tools = ["dispatch", "follow", "read", "bash", "unsure"]
 
 [channels.telegram]
 enabled = true
@@ -514,7 +514,7 @@ enabled = false
 /// - `功耗呢`（home）→ 调 `follow`（目标短号由测试写进 `follow_task_id`）；
 /// - `跑个慢命令`（home）→ 调 `dispatch`，派出去的任务会调 `unsure` 停在一条介入上；
 /// - `[后台任务 …]`（home，任务交回的结果）→ 回一句 `转告：<结果正文那一行>`；
-/// - 任务会话收到的正文 → 各回一句固定的结论，或者调 `shell`。
+/// - 任务会话收到的正文 → 各回一句固定的结论，或者调 `bash`。
 struct TasksLlm {
     follow_task_id: Mutex<Option<String>>,
 }

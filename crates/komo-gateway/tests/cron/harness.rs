@@ -20,7 +20,7 @@ use komo_kernel::types::turn::{LlmError, Round};
 
 pub use komo_gateway::service::test_support::harness::*;
 
-/// 一条 shell 调用：往计数文件里追加一行。**断言的是次数**（§14 最后一段）。
+/// 一条 bash 调用：往计数文件里追加一行。**断言的是次数**（§14 最后一段）。
 pub fn shell_append(
     n: u32,
     provider_id: &str,
@@ -30,7 +30,7 @@ pub fn shell_append(
     call_round(
         n,
         provider_id,
-        "shell",
+        "bash",
         serde_json::json!({
             "command": format!("printf '{what}\\n' >> {}", counter.display())
         }),

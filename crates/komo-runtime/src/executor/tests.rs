@@ -104,7 +104,7 @@ async fn an_edit_runs_directly() {
 #[tokio::test]
 async fn an_unknown_tool_name_cannot_be_called() {
     let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
@@ -178,11 +178,11 @@ async fn a_tool_outside_the_surface_cannot_be_called() {
 #[tokio::test]
 async fn an_unsafe_started_call_is_not_rerun_and_the_model_gets_its_partial_output() {
     let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
     let previous = harness
         .crashed_attempt(
@@ -244,11 +244,11 @@ async fn an_unsafe_started_call_is_not_rerun_and_the_model_gets_its_partial_outp
 #[tokio::test]
 async fn an_interrupted_call_without_output_says_so() {
     let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
     let previous = harness
         .crashed_attempt(
@@ -276,11 +276,11 @@ async fn an_interrupted_call_without_output_says_so() {
 #[tokio::test]
 async fn a_planned_call_is_known_not_to_have_run_and_executes_once() {
     let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
     calls[0].resumed = Some(resumed_from(ToolCallState::Planned, None, 1));
 
@@ -349,11 +349,11 @@ async fn a_current_unsafe_declaration_vetoes_a_stored_safe_replay() {
 #[tokio::test]
 async fn a_current_safe_declaration_never_upgrades_a_stored_unsafe_one() {
     let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell().with_replay(Replay::Safe));
+    let tool = Arc::new(RecordingTool::bash().with_replay(Replay::Safe));
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
     let previous = harness
         .crashed_attempt(
@@ -408,14 +408,14 @@ async fn a_safe_reread_is_replayed_after_a_restart() {
 async fn an_uncertain_result_goes_to_the_model_instead_of_retrying() {
     let harness = Harness::new();
     let tool = Arc::new(
-        RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
+        RecordingTool::bash().with_outcome(Err(ToolError::Uncertain {
             message: "请求已发出，响应丢了".into(),
         })),
     );
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
 
     let outcome = executor
@@ -447,14 +447,14 @@ async fn an_uncertain_result_goes_to_the_model_instead_of_retrying() {
 async fn an_operator_verdict_settles_the_uncertain_attempt_without_rerunning_it() {
     let harness = Harness::new();
     let tool = Arc::new(
-        RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
+        RecordingTool::bash().with_outcome(Err(ToolError::Uncertain {
             message: "解释器没有写下结果".into(),
         })),
     );
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
 
     let outcome = executor
@@ -531,14 +531,14 @@ async fn an_operator_verdict_settles_the_uncertain_attempt_without_rerunning_it(
 async fn not_performed_closes_the_call_as_failed_so_a_retry_is_a_new_call() {
     let harness = Harness::new();
     let tool = Arc::new(
-        RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
+        RecordingTool::bash().with_outcome(Err(ToolError::Uncertain {
             message: "结果不明".into(),
         })),
     );
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
     let outcome = executor
         .execute_round(calls, &harness.env(&session, &run))
@@ -598,7 +598,7 @@ async fn not_performed_closes_the_call_as_failed_so_a_retry_is_a_new_call() {
 async fn the_preview_is_bounded_and_the_whole_output_lives_in_the_store() {
     let harness = Harness::new();
     let body = "x".repeat(100_000);
-    let tool = Arc::new(RecordingTool::shell().with_outcome(Ok(ToolOutput {
+    let tool = Arc::new(RecordingTool::bash().with_outcome(Ok(ToolOutput {
         status: ToolResultStatus::Completed,
         result: serde_json::json!({ "stdout": body.clone() }),
         exit_code: Some(0),
@@ -608,7 +608,7 @@ async fn the_preview_is_bounded_and_the_whole_output_lives_in_the_store() {
     let executor = harness.executor(vec![tool]);
     let (session, run) = harness.open_run().await;
     let calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
 
     let outcome = executor
@@ -659,15 +659,15 @@ async fn the_preview_is_bounded_and_the_whole_output_lives_in_the_store() {
 #[tokio::test]
 async fn cancelling_leaves_the_rest_of_the_round_undispatched() {
     let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let calls = harness
         .record_round(
             &run,
             &[
-                ("shell", serde_json::json!({ "command": "a" })),
-                ("shell", serde_json::json!({ "command": "b" })),
+                ("bash", serde_json::json!({ "command": "a" })),
+                ("bash", serde_json::json!({ "command": "b" })),
             ],
         )
         .await;
@@ -723,13 +723,13 @@ async fn the_read_after_a_write_sees_what_the_write_left() {
 #[tokio::test]
 async fn an_ordinary_tool_failure_is_a_result_the_model_can_act_on() {
     let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell().with_outcome(Err(ToolError::Failed {
+    let tool = Arc::new(RecordingTool::bash().with_outcome(Err(ToolError::Failed {
         message: "命令不存在".into(),
     })));
     let executor = harness.executor(vec![tool]);
     let (session, run) = harness.open_run().await;
     let calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "nope" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "nope" }))])
         .await;
 
     let outcome = executor
@@ -776,10 +776,10 @@ async fn bad_arguments_come_back_as_a_result_without_touching_the_ledger() {
 #[tokio::test]
 async fn the_ledger_sees_planned_then_started_then_result() {
     let harness = Harness::new();
-    let executor = harness.executor(vec![Arc::new(RecordingTool::shell())]);
+    let executor = harness.executor(vec![Arc::new(RecordingTool::bash())]);
     let (session, run) = harness.open_run().await;
     let calls = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
     executor
         .execute_round(calls, &harness.env(&session, &run))
@@ -820,11 +820,11 @@ fn tool_executions(harness: &Harness) -> usize {
 #[tokio::test]
 async fn a_resumed_call_reuses_the_plan_it_was_planned_with() {
     let harness = Harness::new();
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let executor = harness.executor(vec![tool.clone()]);
     let (session, run) = harness.open_run().await;
     let mut resumed = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
     let env = harness.env(&session, &run);
 
@@ -3250,9 +3250,9 @@ mod one_projection {
         // 执行过的调用。
         {
             let harness = Harness::new();
-            let executor = harness.executor(vec![Arc::new(RecordingTool::shell())]);
+            let executor = harness.executor(vec![Arc::new(RecordingTool::bash())]);
             let (session, run, request) =
-                round(&harness, "shell", serde_json::json!({ "command": "x" })).await;
+                round(&harness, "bash", serde_json::json!({ "command": "x" })).await;
             let outcome = executor
                 .execute_round(vec![request], &harness.env(&session, &run))
                 .await
@@ -3366,10 +3366,10 @@ mod one_projection {
         // 恢复时被重启打断、不能重跑：中断结果，带部分输出。
         {
             let harness = Harness::new();
-            let tool = Arc::new(RecordingTool::shell());
+            let tool = Arc::new(RecordingTool::bash());
             let executor = harness.executor(vec![tool.clone()]);
             let (session, run, mut request) =
-                round(&harness, "shell", serde_json::json!({ "command": "x" })).await;
+                round(&harness, "bash", serde_json::json!({ "command": "x" })).await;
             let previous = harness
                 .crashed_attempt(
                     &request.call,
@@ -3788,13 +3788,13 @@ mod fused {
 
     use crate::executor::ToolExecutor;
     use crate::tools::fusion::{THEN_RUN_SKIPPED, THEN_RUN_SUCCEEDED};
-    use crate::tools::{EditTool, ShellTool};
+    use crate::tools::{BashTool, EditTool};
 
     fn tools() -> Vec<Arc<dyn Tool>> {
         vec![
             Arc::new(EditTool::new()),
             Arc::new(WriteTool::new()),
-            Arc::new(ShellTool::new()),
+            Arc::new(BashTool::new()),
         ]
     }
 
@@ -3939,6 +3939,72 @@ mod fused {
         assert_eq!(started(&harness).len(), 1, "没有新的尝试");
     }
 
+    /// `shell` 改名 `bash` 之前落账的调用：`started` 而无结果，恢复时照旧认那个名字，
+    /// 按 `bash` 的 `Unsafe` 记 uncertain 交给模型，既不重跑也不报"没有这个工具"。
+    #[tokio::test]
+    async fn a_started_call_recorded_under_the_old_shell_name_settles_as_uncertain() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.executor(tools());
+        let (session, run) = harness.open_run().await;
+        let mut calls = harness
+            .record_round(
+                &run,
+                &[("shell", serde_json::json!({ "command": COUNTING }))],
+            )
+            .await;
+        let mut plan = plan_of(&BashTool::new(), &harness, &session, &run, &calls[0]).await;
+        plan.tool = "shell".into();
+        let previous = harness.crashed_attempt(&calls[0].call, &plan).await;
+        calls[0].plan = Some(plan);
+        calls[0].resumed = Some(resumed_from(
+            ToolCallState::Started,
+            Some(previous.clone()),
+            1,
+        ));
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert!(
+            outcome.results[0].content.contains("被 Gateway 重启打断"),
+            "{}",
+            outcome.results[0].content
+        );
+        assert_eq!(runs(&root), 0, "不重跑命令");
+        let results = harness.results_for(&previous);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].status, ToolResultStatus::Uncertain);
+        assert_eq!(started(&harness).len(), 1, "没有新的尝试");
+    }
+
+    /// 旧名字只给带着落账计划的调用留着：模型这一轮新发的 `shell` 仍是"没有这个工具"。
+    #[tokio::test]
+    async fn a_fresh_call_to_the_old_shell_name_is_refused() {
+        let harness = Harness::new();
+        let root = seeded(&harness);
+        let executor = harness.executor(tools());
+        let (session, run) = harness.open_run().await;
+        let calls = harness
+            .record_round(
+                &run,
+                &[("shell", serde_json::json!({ "command": COUNTING }))],
+            )
+            .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.results[0].is_error);
+        assert_eq!(runs(&root), 0);
+        assert!(started(&harness).is_empty());
+    }
+
     #[tokio::test]
     async fn a_planned_only_fused_call_runs_once() {
         let harness = Harness::new();
@@ -3972,7 +4038,7 @@ mod fused {
     }
 
     #[tokio::test]
-    async fn a_fused_call_without_shell_on_the_surface_is_refused() {
+    async fn a_fused_call_without_bash_on_the_surface_is_refused() {
         let harness = Harness::new();
         let root = seeded(&harness);
         let executor = harness.executor(tools());
@@ -3989,7 +4055,7 @@ mod fused {
         assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
         assert!(outcome.results[0].is_error);
         assert!(
-            outcome.results[0].content.contains("没有 shell"),
+            outcome.results[0].content.contains("没有 bash"),
             "{}",
             outcome.results[0].content
         );
@@ -3997,7 +4063,7 @@ mod fused {
         assert_eq!(runs(&root), 0);
         assert!(started(&harness).is_empty());
 
-        // 模型在这个面上根本看不见 then_run；面上有 shell 时看得见。
+        // 模型在这个面上根本看不见 then_run；面上有 bash 时看得见。
         let has_then_run = |surface: &AgentSurface| {
             executor
                 .definitions_for(surface)
@@ -4012,7 +4078,7 @@ mod fused {
         };
         assert_eq!(has_then_run(&surface), [false, false]);
         assert_eq!(
-            has_then_run(&AgentSurface::new(["edit", "write", "shell"])),
+            has_then_run(&AgentSurface::new(["edit", "write", "bash"])),
             [true, true]
         );
     }

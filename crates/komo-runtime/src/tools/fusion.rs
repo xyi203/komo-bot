@@ -4,7 +4,7 @@
 //!
 //! - 改动失败 → 命令不跑，结果里写 `[then_run:skipped]`；
 //! - 改动之后目标的内容哈希必须还是改动的结果版本——中间被别人动过，命令同样不跑；
-//! - 命令走 `shell` 自己的执行（进程组、时限收紧到活动执行时限、取消），输出流进**同一次
+//! - 命令走 `bash` 自己的执行（进程组、时限收紧到活动执行时限、取消），输出流进**同一次
 //!   尝试**的 stdout / stderr；
 //! - 命令非零退出是结果、不是回滚：改动留着，整次调用记 Failed，退出码照实给。
 //!
@@ -18,7 +18,7 @@ use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{ToolContext, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 
-use super::shell::{ShellArgs, plan_for_call};
+use super::bash::{BashArgs, plan_for_call};
 use super::write::target_path;
 use super::{FileVersion, current};
 
@@ -51,7 +51,7 @@ pub fn schema(what: &str) -> serde_json::Value {
     })
 }
 
-/// 把 `then_run` 接到改动的计划上：第二步是一条普通的 shell 计划（与 `shell` 的 `prepare`
+/// 把 `then_run` 接到改动的计划上：第二步是一条普通的 shell 计划（与 `bash` 的 `prepare`
 /// 同一个构造），同一来源、同一 Run、同一 ToolCall。带了它，整次调用的恢复方式就是
 /// `NoSafeRecovery`。
 pub fn attach(
@@ -63,7 +63,7 @@ pub fn attach(
         return Ok(());
     };
     let step = plan_for_call(
-        &ShellArgs {
+        &BashArgs {
             command: then_run.command,
             cwd: None,
             timeout_secs: then_run.timeout_secs,
@@ -294,7 +294,7 @@ fn fused(
 mod tests {
     use super::*;
     use crate::tools::test_support::{context, writer};
-    use crate::tools::{EditTool, ShellTool, WriteTool};
+    use crate::tools::{BashTool, EditTool, WriteTool};
     use async_trait::async_trait;
     use komo_kernel::types::tool::ToolDefinition;
 
@@ -317,12 +317,12 @@ mod tests {
             .await
             .unwrap();
         let step = plan.then_run.as_deref().expect("带着第二步");
-        assert_eq!(step.tool, "shell");
+        assert_eq!(step.tool, "bash");
         assert_eq!(step.run, plan.run);
         assert_eq!(step.tool_call, plan.tool_call);
         assert_eq!(step.source, plan.source);
-        // 与 `shell` 自己 prepare 出来的是同一个形状。
-        let alone = ShellTool::new()
+        // 与 `bash` 自己 prepare 出来的是同一个形状。
+        let alone = BashTool::new()
             .prepare(serde_json::json!({ "command": "cat a.txt" }), &ctx)
             .await
             .unwrap();
@@ -373,7 +373,7 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "someone else\n").unwrap();
         let mut sink = writer(&ctx);
 
-        let output = execute_fused(&EditTool::new(), plan, &ShellTool::new(), &ctx, &mut sink)
+        let output = execute_fused(&EditTool::new(), plan, &BashTool::new(), &ctx, &mut sink)
             .await
             .unwrap();
 
@@ -431,7 +431,7 @@ mod tests {
         let output = execute_fused(
             &MeddledEdit,
             plan,
-            &ShellTool::new(),
+            &BashTool::new(),
             &ctx,
             &mut writer(&ctx),
         )
@@ -459,7 +459,7 @@ mod tests {
             .unwrap();
         let mut sink = writer(&ctx);
 
-        let output = execute_fused(&EditTool::new(), plan, &ShellTool::new(), &ctx, &mut sink)
+        let output = execute_fused(&EditTool::new(), plan, &BashTool::new(), &ctx, &mut sink)
             .await
             .unwrap();
 
@@ -494,7 +494,7 @@ mod tests {
             .unwrap();
         let mut sink = writer(&ctx);
 
-        let output = execute_fused(&WriteTool::new(), plan, &ShellTool::new(), &ctx, &mut sink)
+        let output = execute_fused(&WriteTool::new(), plan, &BashTool::new(), &ctx, &mut sink)
             .await
             .unwrap();
 

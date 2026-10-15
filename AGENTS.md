@@ -13,8 +13,8 @@ patterns.
 
 ```bash
 cargo build                    # cold build budget ≤ 60s (§13.4)
-cargo test --workspace         # ALWAYS --workspace; ~10 min cold — from komo's shell
-                               # tool pass timeout_secs ≥ 900
+cargo test --workspace         # ALWAYS --workspace; ~10 min cold — from komo's
+                               # bash tool pass timeout_secs ≥ 900
 scripts/install-local.sh       # release build → ~/.local/bin/komo (atomic) → gateway restart;
                                # worktrees share the main checkout's target/
 
@@ -43,7 +43,7 @@ komo-kernel    value types, state machines, events + fold, cron math,
 komo-store     session_log (JSONL) · payloads · tool_output · Turso Db + toasty
                models + *_TABLE_DDL · repositories · Coordinator (impl Ledger).
                The only crate that sees toasty/turso.
-komo-runtime   agent loop · executor · tools/{read,write,edit,rg,shell,python} ·
+komo-runtime   agent loop · executor · tools/{read,write,edit,rg,bash,python} ·
                python_runtime · memory · llm · embedding ·
                scheduler · recovery · config.
 komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名 ·
@@ -81,7 +81,7 @@ depends on `agent`; `client` knows only protocol types.
   skipped and never block a flush.
 - **The only hard limit lives in the tools:** `write`/`edit` refuse komo's own
   state (`sessions/`, `state.db*`, `runtime/`, `.env` under the data dir).
-  shell/python cannot be stopped; real boundaries come only from an execution
+  bash/python cannot be stopped; real boundaries come only from an execution
   environment (codemode's sandbox).
 - **Recovery decides "did it happen" before "retry"** (§8.4 table, §8.6).
   `started` alone proves nothing. A started call without a result reruns only
@@ -92,7 +92,7 @@ depends on `agent`; `client` knows only protocol types.
 - **Tool result 的模型视图只有一处投影**（`komo-kernel/src/projection.rs`）。输入只有落盘的
   事实（完整 JSONL 事件 + `output.json` / stdout / stderr 引用；旧行的 `text_ref` 与 ≤1 KiB
   `preview` 只作兼容读取），所以"刚跑完"与"重启后回放"必须逐字节相同。full 视图默认最多
-  50 KiB 或 2000 行（二者先到）：`shell` / `bash` 留尾，其他工具留头；超限时必须给出可
+  50 KiB 或 2000 行（二者先到）：`bash` 留尾（旧记录里叫 `shell`，两个名字都认），其他工具留头；超限时必须给出可
   `read` 的完整 `artifact://` 引用。`[execution] model_result_bytes` 可收紧字节预算；当前
   Session 的 `tool-output/` 与 `artifacts/` 是只读根。大结果给哪个视图由 `projection.rs` 的
   `select` 按 `context.compacted` 的 `decayed` 记下的集合选；decay 只改模型视图，不改完整

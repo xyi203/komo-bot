@@ -297,7 +297,7 @@ mod tests {
                 tool_calls: vec![ToolCallRequest {
                     call_id: ToolCallId::from_raw("call-1"),
                     provider_call_id: "provider-1".into(),
-                    name: "shell".into(),
+                    name: "bash".into(),
                     arguments: serde_json::Value::Null,
                     arguments_ref: Some(arguments_ref),
                 }],

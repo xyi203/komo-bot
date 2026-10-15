@@ -88,7 +88,7 @@ pub fn conversation() -> Vec<Event> {
                 tool_calls: vec![ToolCallRequest {
                     call_id: call(),
                     provider_call_id: "pc-1".into(),
-                    name: "shell".into(),
+                    name: "bash".into(),
                     arguments: serde_json::json!({ "command": "rm -rf build" }),
                     arguments_ref: None,
                 }],
@@ -181,7 +181,7 @@ pub fn plan() -> ExecutionPlan {
     ExecutionPlan {
         operation_id: OperationId::from_raw("op-1"),
         source: PlanSource::Interactive { session: session() },
-        tool: "shell".into(),
+        tool: "bash".into(),
         operation: Operation::ShellCommand {
             command: "rm -rf build".into(),
         },

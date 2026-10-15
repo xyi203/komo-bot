@@ -1,6 +1,6 @@
 //! 监听（`docs/monitor.md`）：`Monitors` 的生产实现。
 //!
-//! 一个监听是 Gateway 手里的一个子进程加一个泵：脚本按 `shell` 的规矩起（bash、数据目录
+//! 一个监听是 Gateway 手里的一个子进程加一个泵：脚本按 `bash` 的规矩起（bash、数据目录
 //! 只读挂载、明确的环境），stdout 逐行进泵，泵把连着出的行合成一条，以内部输入
 //! `submit` 回挂它的会话——与后台任务交回结果同一条路（`tasks::report_to_parent`）。
 //!
@@ -31,7 +31,7 @@ use komo_kernel::types::refs::AttemptRef;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::tool::CancelToken;
 use komo_runtime::recovery::{ChildRegistry, Liveness, ProcessProbe, SysProcessProbe};
-use komo_runtime::tools::ShellTool;
+use komo_runtime::tools::BashTool;
 use komo_runtime::tools::process::{
     ChildOutcome, ChildRegistration, ChildSpec, ProcessError, kill_process_group, run_child,
 };
@@ -164,7 +164,7 @@ fn end_with(ending: &Mutex<Option<Ending>>, cancel: &CancelToken, why: Ending) {
 pub struct GatewayMonitors {
     state: Arc<GatewayState>,
     me: Weak<GatewayMonitors>,
-    shell: ShellTool,
+    shell: BashTool,
     /// `runtime/monitors`。
     dir: PathBuf,
     /// `runtime/monitors/children`：每个监听一份在册（executor 位上写监听 id）。
@@ -174,7 +174,7 @@ pub struct GatewayMonitors {
 }
 
 impl GatewayMonitors {
-    pub fn new(state: Arc<GatewayState>, shell: ShellTool, runtime_dir: &Path) -> Arc<Self> {
+    pub fn new(state: Arc<GatewayState>, shell: BashTool, runtime_dir: &Path) -> Arc<Self> {
         let dir = runtime_dir.join("monitors");
         Arc::new_cyclic(|me| Self {
             state,
@@ -480,7 +480,7 @@ impl GatewayMonitors {
         let id = record.id.clone();
         let session = record.session.clone();
 
-        let mut env: BTreeMap<String, String> = komo_runtime::tools::shell::base_environment();
+        let mut env: BTreeMap<String, String> = komo_runtime::tools::bash::base_environment();
         env.insert("KOMO_SESSION".into(), session.to_string());
         env.insert("KOMO_MONITOR".into(), id.clone());
         let mut child = self.shell.child_spec(

@@ -347,7 +347,7 @@ impl ToolExecutor {
     /// 名字在能力面里却没有实现，是装配错误（目录与能力面不同源），这里跳过并在日志里
     /// 说一声——把没有 schema 的工具交给模型没有意义，而静默地补一条假 schema 更坏。
     ///
-    /// 能力面里没有 `shell` 时，`edit` / `write` 的 `then_run` 参数一并摘掉：模型看不见
+    /// 能力面里没有 `bash` 时，`edit` / `write` 的 `then_run` 参数一并摘掉：模型看不见
     /// 一个注定被拒的参数（执行侧 `begin` 照样拒，不靠这里）。
     ///
     /// 只列直接声明的那些：`exposure = codemode` 的 MCP 工具仍在能力面里（脚本调得到），
@@ -437,17 +437,17 @@ impl ToolExecutor {
             .collect()
     }
 
-    /// 这次运行能不能跑命令：能力面里有 `shell`，执行器也装着它。`then_run` 的放行与
+    /// 这次运行能不能跑命令：能力面里有 `bash`，执行器也装着它。`then_run` 的放行与
     /// schema 都问它。
     fn can_run_commands(&self, surface: &AgentSurface) -> bool {
-        surface.allows("shell") && self.tools.contains_key("shell")
+        surface.allows("bash") && self.tools.contains_key("bash")
     }
 
     /// 一轮里每个调用的调度（§4 末、§6）。
     ///
     /// **只读的调用可以和同一轮里后面的调用同时在飞**：够格的是 `Operation::ReadFile`
     /// 这一类计划（`read` / `rg`）里没有"上一世"要接的那条（详见
-    /// [`ReadyCall::parallel_with_siblings`]）。其余一切（`write` / `edit` / `shell` /
+    /// [`ReadyCall::parallel_with_siblings`]）。其余一切（`write` / `edit` / `bash` /
     /// `python`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何
     /// 要停下来的判定）都是**屏障**：屏障之前已经在飞的先收尾，再按调用顺序做它。
     ///
@@ -548,7 +548,8 @@ impl ToolExecutor {
         // 能力边界**先于**"有没有这个工具"（§4 末）：不在这次运行的能力面里，就等于不认识
         // 这个名字——执行器不回退到全局工具目录，所以模型自己拼出一个没露过面的名字，
         // 拿到的也只是"这次运行的工具集里没有它"。
-        if !env.surface.allows(&request.tool) {
+        let name = resolved_tool_name(request);
+        if !env.surface.allows(name) {
             let names = env.surface.names();
             let message = if names.is_empty() {
                 format!("这次运行没有可用的工具，{} 调不了", request.tool)
@@ -565,7 +566,7 @@ impl ToolExecutor {
         }
 
         // 未知工具名：作为错误内容交回模型，**不派发任何东西**（§14 阶段 3）。
-        let Some(tool) = self.tools.get(&request.tool).cloned() else {
+        let Some(tool) = self.tools.get(name).cloned() else {
             let known: Vec<&str> = self.tools.keys().map(String::as_str).collect();
             let message = format!(
                 "没有名为 {} 的工具；可用的是：{}",
@@ -620,11 +621,11 @@ impl ToolExecutor {
             return self.settle_interrupted(request, env, &plan, state).await;
         }
 
-        // 组合调用的第二步是一条 shell 命令：这次运行的能力面里没有 shell（或这台执行器
+        // 组合调用的第二步是一条 shell 命令：这次运行的能力面里没有 bash（或这台执行器
         // 根本没装它），就不放行、不执行——能力面管的是"这次能做什么"，不是"模型叫哪个名字"。
         if plan.then_run.is_some() && !self.can_run_commands(&env.surface) {
             let message = format!(
-                "{} 的 then_run 要跑一条命令，但这次运行的工具集里没有 shell；\
+                "{} 的 then_run 要跑一条命令，但这次运行的工具集里没有 bash；\
                  去掉 then_run 再调一次",
                 request.tool
             );
@@ -679,7 +680,7 @@ impl ToolExecutor {
                 (Operation::Codemode { code }, _) => {
                     self.run_codemode(code, env, &ctx, writer.as_mut()).await
                 }
-                (_, Some(_)) => match self.tools.get("shell") {
+                (_, Some(_)) => match self.tools.get("bash") {
                     Some(shell) => {
                         crate::tools::fusion::execute_fused(
                             &*tool,
@@ -692,7 +693,7 @@ impl ToolExecutor {
                     }
                     // `begin` 已经拦过；走到这里是装配在两步之间变了。
                     None => Err(ToolError::Failed {
-                        message: "then_run 要跑命令，但这台执行器没有 shell".into(),
+                        message: "then_run 要跑命令，但这台执行器没有 bash".into(),
                     }),
                 },
                 _ => tool.execute(plan.clone(), &ctx, writer.as_mut()).await,
@@ -1472,7 +1473,7 @@ impl ToolExecutor {
     /// 回放时逐字相同。
     ///
     /// 停下来问人并不比模型更有把握——人多半也得去看一眼目标才答得上来，而模型手里就有
-    /// read / shell 能去看。
+    /// read / bash 能去看。
     async fn settle_interrupted(
         &self,
         request: &CallRequest,
@@ -1616,6 +1617,16 @@ impl ToolExecutor {
 
 /// `prepare` / `verify` 时还没有尝试——`start_call` 才发号。用一个认得出来的哨兵，
 /// 这样账本里的 attempt ID 与它不会混。
+/// 找工具、核对能力面用的名字。`shell` 在 2026-10-15 改名 `bash`：改名前落账的计划还叫
+/// `shell`，恢复时照旧认它（按 `bash` 的 `replay` 走，即 `Unsafe`，记 uncertain 交给模型）。
+/// 只对带着落账计划的调用生效——模型新发的 `shell` 仍是"没有这个工具"。
+fn resolved_tool_name(request: &CallRequest) -> &str {
+    match (request.tool.as_str(), request.plan.is_some()) {
+        ("shell", true) => "bash",
+        (name, _) => name,
+    }
+}
+
 const PENDING_ATTEMPT: &str = "attempt-not-started";
 
 /// 一个调用在**执行之前**的几种去向（[`ToolExecutor::begin`]）。

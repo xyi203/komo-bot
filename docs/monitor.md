@@ -7,7 +7,7 @@
 有一类等待不是"等一个结果"，而是"每出一件事就要知道"：MR 流水线里每个 job 的结果、
 发布工单的每次状态变化、日志里的每条 panic、灰度期间每次指标越线。已有的三条路都不合适：
 
-- `shell` 里写轮询循环：同步的，这一轮被它占住，中途的事件要等命令退出才一起交回；
+- `bash` 里写轮询循环：同步的，这一轮被它占住，中途的事件要等命令退出才一起交回；
 - `dispatch`：任务会话跑完才交回一次，中途不报；
 - 命令 Cron Job：最细一分钟一次，结果投给 home chat，不回到会话里让模型接着处理。
 
@@ -16,7 +16,7 @@
 ```text
 会话里的模型 ── monitor(command, title, timeout_minutes?, resume_after_restart?) ──▶ "已开始监听 #3f2a：标题"，这一轮收尾
                                         │
-                     Gateway 起脚本（bash、数据目录只读挂载，与 shell 同一套）
+                     Gateway 起脚本（bash、数据目录只读挂载，与 bash 同一套）
                                         │ stdout 逐行
                                         ▼
                      泵：连着出的行合成一条，上一条没收尾时攒着
@@ -35,8 +35,8 @@
   事件经 home 的模型转告到聊天；在 TUI 里挂的，事件在事件流里看得到。
 - **只有 stdout 的行算事件。** 空行丢掉；一行最多 1000 个字符。stderr 不当事件，结束时
   带最后 20 行。
-- **脚本按 `shell` 的规矩起**：`ShellTool::child_spec` 给出 bash（没有就 `/bin/sh`）、bwrap
-  只读挂载数据目录、明确的环境（`shell::base_environment` + `KOMO_SESSION` +
+- **脚本按 `bash` 的规矩起**：`BashTool::child_spec` 给出 bash（没有就 `/bin/sh`）、bwrap
+  只读挂载数据目录、明确的环境（`bash::base_environment` + `KOMO_SESSION` +
   `KOMO_MONITOR`，不带 `KOMO_RUN`——它不属于任何一条 Run）。
 
 ## 3. 合批与背压

@@ -277,9 +277,9 @@ impl RecordingTool {
     }
 
     /// 一个"任意 shell 命令"形状的工具。
-    pub fn shell() -> Self {
+    pub fn bash() -> Self {
         Self::new(
-            "shell",
+            "bash",
             Operation::ShellCommand {
                 command: "rm -rf /tmp/x".into(),
             },

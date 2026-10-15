@@ -80,7 +80,7 @@ fn parse(block: &str) -> FrontMatter {
         let trimmed = line.trim_end();
         let mut taken = false;
         match collecting.as_mut() {
-            // 块状列表的一项：`  - shell`
+            // 块状列表的一项：`  - bash`
             Some(Collecting::List(key)) => {
                 if let Some(item) = trimmed.trim_start().strip_prefix("- ") {
                     push(&mut front, key, clean(item));
@@ -248,12 +248,12 @@ mod tests {
 
     #[test]
     fn the_four_keys_are_read_and_the_body_starts_after_the_fence() {
-        let text = "---\nname: pr-review\ndescription: 怎么审一个 PR\nplatforms: [linux, macos]\nrequires_tools:\n  - shell\n  - read\n---\n第一步……\n";
+        let text = "---\nname: pr-review\ndescription: 怎么审一个 PR\nplatforms: [linux, macos]\nrequires_tools:\n  - bash\n  - read\n---\n第一步……\n";
         let (front, body) = split(text);
         assert_eq!(front.name.as_deref(), Some("pr-review"));
         assert_eq!(front.description.as_deref(), Some("怎么审一个 PR"));
         assert_eq!(front.platforms, vec!["linux", "macos"]);
-        assert_eq!(front.requires_tools, vec!["shell", "read"]);
+        assert_eq!(front.requires_tools, vec!["bash", "read"]);
         assert_eq!(body, "第一步……\n");
     }
 
@@ -282,10 +282,10 @@ mod tests {
 
     #[test]
     fn quotes_and_crlf_do_not_end_up_in_the_values() {
-        let text = "---\r\nname: \"a b\"\r\nrequires_tools: ['shell']\r\n---\r\n正文";
+        let text = "---\r\nname: \"a b\"\r\nrequires_tools: ['bash']\r\n---\r\n正文";
         let (front, _) = split(text);
         assert_eq!(front.name.as_deref(), Some("a b"));
-        assert_eq!(front.requires_tools, vec!["shell"]);
+        assert_eq!(front.requires_tools, vec!["bash"]);
     }
 
     #[test]

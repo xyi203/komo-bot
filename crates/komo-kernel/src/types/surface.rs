@@ -50,7 +50,7 @@ mod tests {
         let surface = AgentSurface::new(["read", "rg", "read"]);
         assert_eq!(surface.names(), ["read", "rg"]);
         assert!(surface.allows("rg"));
-        assert!(!surface.allows("shell"));
+        assert!(!surface.allows("bash"));
         // 名字是精确匹配：多一个字符、变个大小写都不是同一个工具。
         assert!(!surface.allows("r"));
         assert!(!surface.allows("Read"));

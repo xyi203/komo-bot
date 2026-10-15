@@ -93,7 +93,7 @@ pub struct AgentContext {
 /// 唯一的 Context Assembly 入口（`docs/agent.md` §5）。
 ///
 /// 顺序（§10）：Instructions（最前）→ Identity / Task / 工作目录 / RULES → komo 自查
-/// （仅主 Agent 且挂了 `shell`）→ 项目规范（仅主 Agent）→ Skills（仅主 Agent）→ Result
+/// （仅主 Agent 且挂了 `bash`）→ 项目规范（仅主 Agent）→ Skills（仅主 Agent）→ Result
 /// Contract（仅子代理）→ Memory（最后，`\n\n` + 正文）。
 pub fn assemble(input: ContextInput<'_>) -> AgentContext {
     let mut prompt = prompt::build(

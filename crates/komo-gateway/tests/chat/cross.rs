@@ -753,7 +753,7 @@ async fn a_round_stopped_at_its_first_call_still_finishes_the_rest() {
                 ("call_00_one", "unsure", serde_json::json!({})),
                 (
                     "call_01_two",
-                    "shell",
+                    "bash",
                     serde_json::json!({"command": "echo two"}),
                 ),
             ],

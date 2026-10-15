@@ -133,13 +133,13 @@ stdin / stdout 正常。
 `tools.<name>(**args)` → executor 的持久化子调用路径，依次：
 
 1. 名字必须在当前 Run 的 `AgentSurface` 及 executor 工具表里；不回退到全局目录。
-   `shell`、`python`、`edit`、`write`、`codemode`、`delegate`、`dispatch`、`follow`、`monitor`、
+   `bash`、`python`、`edit`、`write`、`codemode`、`delegate`、`dispatch`、`follow`、`monitor`、
    `monitor_stop`、`update_plan` 不能在脚本里调（`tools/codemode.rs` 的 `NOT_IN_SCRIPTS`），也不进
    `TOOLS`。脚本正文里字面写着 `tools.<这些名字>(` 的，`codemode` 的 `prepare` 就拒、脚本不运行：
-   实测模型常把 `tools.shell("git status")` 当成只读写进脚本，跑到那一行才被拒，整段作废，前面的
+   实测模型常把 `tools.bash("git status")` 当成只读写进脚本，跑到那一行才被拒，整段作废，前面的
    MCP 写也可能已经做了（2026-10-13/14 十二次）。`getattr` 之类的绕法认不出，照样在这一步与第 2 步拒。
 2. `tool.prepare(args)` 验证参数和约束。允许 `ReadFile`（read、rg）与 `McpCall`（含写操作）；
-   本地 write / edit / shell / python、编排、`then_run` 仍在脚本外执行。
+   本地 write / edit / bash / python、编排、`then_run` 仍在脚本外执行。
 3. 完整参数、准备计划与 `plan.recovery.replay().and(tool.replay())` 先发布外置正文，再同步追加
    `intent` 记录。`started` 记录提交成功之后才允许执行工具。
 4. 流式 stdout / stderr 保存在子调用自己的尝试目录；工具返回后发布完整原始输出，再发布

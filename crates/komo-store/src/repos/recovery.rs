@@ -574,7 +574,7 @@ mod tests {
                     tool_calls: vec![ToolCallRequest {
                         call_id: ToolCallId::from_raw("call-1"),
                         provider_call_id: "pc-1".into(),
-                        name: "shell".into(),
+                        name: "bash".into(),
                         arguments: serde_json::json!({}),
                         arguments_ref: None,
                     }],
@@ -584,7 +584,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let plan = sample_plan("shell", &f.session);
+        let plan = sample_plan("bash", &f.session);
         f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
         // 开跑了，但没有结果——上一个实例就停在这里。
         f.coordinator.start_call(&ids[0], &plan).await.unwrap();
@@ -1073,7 +1073,7 @@ mod tests {
                         .map(|id| ToolCallRequest {
                             call_id: ToolCallId::from_raw(*id),
                             provider_call_id: format!("pc-{id}"),
-                            name: "shell".into(),
+                            name: "bash".into(),
                             arguments: serde_json::json!({}),
                             arguments_ref: None,
                         })
@@ -1106,7 +1106,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let plan = sample_plan("shell", &f.session);
+        let plan = sample_plan("bash", &f.session);
         f.coordinator.plan_call(&ids[1], &plan).await.unwrap();
         f.coordinator.start_call(&ids[1], &plan).await.unwrap();
 

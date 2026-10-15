@@ -270,7 +270,7 @@ async fn step(
             Step::Keep
         }
         EventPayload::RunCompleted(body) => {
-            // 命令 Job（§10）：ok / error 与投递正文从那次 `shell` 调用的落盘结果现读，
+            // 命令 Job（§10）：ok / error 与投递正文从那次 `bash` 调用的落盘结果现读，
             // 不信 `final_message`——`CommandDriver` 收尾用的是投影过的正文，不是干净
             // 的 stdout，也分不出退出码是不是 0（它永远正常收尾，见 `command_driver`
             // 模块文档「工具失败是结果，驱动失败是终止」）。
@@ -387,16 +387,16 @@ async fn command_outcome(
     }
 }
 
-/// 这个 Run 唯一那次 `shell` 调用的落盘结果（§10：命令 Job 全程只发那一个调用）。
+/// 这个 Run 唯一那次 `bash` 调用的落盘结果（§10：命令 Job 全程只发那一个调用）。
 ///
 /// 从这一段的 Surface 里找那条工具结果的 `output` 引用，再按引用读回 `output.json`——
 /// 与 `service::segment` 的 `replay` 读法同一条路（§8.3），只是这里要的是**结构化**的
-/// `ShellResult`（`body.result`），不是投影过的模型可读正文。
+/// `BashResult`（`body.result`），不是投影过的模型可读正文。
 async fn shell_result_of(
     state: &Arc<GatewayState>,
     session: &SessionId,
     run: &RunId,
-) -> Option<komo_runtime::tools::shell::ShellResult> {
+) -> Option<komo_runtime::tools::bash::BashResult> {
     let mut events = Vec::new();
     let mut from = komo_kernel::types::ids::Seq::ZERO;
     loop {

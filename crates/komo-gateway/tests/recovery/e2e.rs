@@ -234,7 +234,7 @@ async fn the_first_end_to_end_acceptance() {
         unpaired_attempts(&events)
     );
 
-    //    6b. `shell`：默认 `verify` 是 `Unavailable`，**核对不出来**。同样丢了结果，这一
+    //    6b. `bash`：默认 `verify` 是 `Unavailable`，**核对不出来**。同样丢了结果，这一
     //        次记成 uncertain、交给模型判断；执行器不把命令再跑一遍，也不停下来等人。
     let counter2 = Counter::new(&home, "e2e-lost.count");
     gw.stop().await;
@@ -244,7 +244,7 @@ async fn the_first_end_to_end_acceptance() {
             call_round(
                 1,
                 "pc-lost",
-                "shell",
+                "bash",
                 serde_json::json!({"command": counter2.append_command()}),
             ),
             text_round(2, "跑过了。"),
@@ -310,7 +310,7 @@ async fn directories_and_references() {
                 call_round(
                     1,
                     "pc-a",
-                    "shell",
+                    "bash",
                     serde_json::json!({"command": format!("{}; echo 到标准错误 1>&2", counter_a.append_command())}),
                 ),
                 text_round(2, "A 跑过了。"),
@@ -320,7 +320,7 @@ async fn directories_and_references() {
                 call_round(
                     1,
                     "pc-b",
-                    "shell",
+                    "bash",
                     serde_json::json!({"command": counter_b.append_command()}),
                 ),
                 text_round(2, "B 跑过了。"),

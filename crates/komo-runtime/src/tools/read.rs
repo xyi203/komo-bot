@@ -573,7 +573,7 @@ mod tests {
             pointer: None,
         });
         let facts = ToolResultFacts {
-            tool: "shell",
+            tool: "bash",
             status: ToolResultStatus::Completed,
             elapsed_ms: 3,
             // 正文没给（超限时就是这样）：只剩引用可给。

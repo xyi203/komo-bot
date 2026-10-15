@@ -8,7 +8,7 @@
 #      target/（CARGO_TARGET_DIR 没设才这样），依赖不用每个 worktree 冷编一遍。
 #   2. 新二进制先试跑 --version，再复制成 <prefix>/komo.new、mv 换上——不覆写正在跑的
 #      Gateway 用着的那个 inode；旧的留一份 komo.bak。
-#   3. komo gateway restart。在 komo 的 shell 工具里跑时，Gateway 会等这条命令的结果记进
+#   3. komo gateway restart。在 komo 的 bash 工具里跑时，Gateway 会等这条命令的结果记进
 #      会话之后再重启；声明了 resume_after_restart 的监听重启后自动重挂（docs/monitor.md §5）。
 set -euo pipefail
 

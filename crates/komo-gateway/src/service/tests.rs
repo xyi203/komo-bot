@@ -755,12 +755,7 @@ async fn a_leftover_policy_file_is_reported_but_never_read() {
     let command = format!("echo once >> {}", once.display());
     let gateway = home
         .start(FakeLlm::new(vec![vec![
-            call_round(
-                1,
-                "pc-1",
-                "shell",
-                serde_json::json!({ "command": command }),
-            ),
+            call_round(1, "pc-1", "bash", serde_json::json!({ "command": command })),
             text_round(2, "做完了。"),
         ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
@@ -850,12 +845,7 @@ async fn an_ordinary_shell_command_runs_without_asking() {
     let once = home.workspace().join("auto.count");
     let command = format!("echo once >> {}", once.display());
     let llm = FakeLlm::new(vec![vec![
-        call_round(
-            1,
-            "pc-1",
-            "shell",
-            serde_json::json!({ "command": command }),
-        ),
+        call_round(1, "pc-1", "bash", serde_json::json!({ "command": command })),
         text_round(2, "做完了。"),
     ]]);
     let gateway = home
@@ -888,12 +878,7 @@ async fn even_a_dangerous_command_runs_without_asking() {
     let doom = home.workspace().join("never-touched");
     let command = format!("rm -rf {}", doom.display());
     let llm = FakeLlm::new(vec![vec![
-        call_round(
-            1,
-            "pc-1",
-            "shell",
-            serde_json::json!({ "command": command }),
-        ),
+        call_round(1, "pc-1", "bash", serde_json::json!({ "command": command })),
         text_round(2, "删掉了。"),
     ]]);
     let gateway = home

@@ -349,7 +349,7 @@ pub trait Ledger: Send + Sync {
 
 // ---------------------------------------------------------------- 输出存储
 
-/// 子进程 stdout / stderr 的流式落盘。`shell` / `python` 的测试需要替身。
+/// 子进程 stdout / stderr 的流式落盘。`bash` / `python` 的测试需要替身。
 #[async_trait]
 pub trait ToolOutputStore: Send + Sync {
     /// 为一次尝试打开流式写入器（stdout / stderr 写 `.partial`）。

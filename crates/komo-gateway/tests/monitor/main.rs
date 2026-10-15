@@ -20,7 +20,7 @@ default_agent = "assistant"
 
 [agents.assistant]
 instructions = "你是助手。"
-tools = ["monitor", "monitor_stop", "shell"]
+tools = ["monitor", "monitor_stop", "bash"]
 
 [model.main]
 type = "completion"

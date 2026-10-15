@@ -63,7 +63,7 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
     assert_eq!(bare.lines().count(), 4, "{bare}");
 }
 
-/// 「搜代码、列文件用 rg，别用 shell 拼 rg / grep / find / ls」是**两条提示共用**的一句
+/// 「搜代码、列文件用 rg，别用 bash 拼 rg / grep / find / ls」是**两条提示共用**的一句
 /// （[`rules`]）：子代理也要照它做，所以它不能只写在主对话那一份里；没挂 `rg` 时两边都不说。
 #[test]
 fn both_prompts_tell_the_model_to_search_with_rg() {
@@ -76,7 +76,7 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
         &[],
         None,
     );
-    assert!(main.contains("别用 shell 拼 rg / grep"), "{main}");
+    assert!(main.contains("别用 bash 拼 rg / grep"), "{main}");
     assert!(main.contains("list_files=true"), "{main}");
     let without_rg = build(
         Path::new("/tmp/w"),
@@ -101,7 +101,7 @@ fn both_prompts_tell_the_model_to_search_with_rg() {
         &[],
         None,
     );
-    assert!(sub.contains("别用 shell 拼 rg / grep"), "{sub}");
+    assert!(sub.contains("别用 bash 拼 rg / grep"), "{sub}");
 }
 
 /// 挂了 `update_plan` 才提计划，主对话与子代理一样；提的时候说清短任务不登记、更新
@@ -144,11 +144,11 @@ fn both_prompts_mention_the_plan_only_when_update_plan_is_mounted() {
     assert!(!without.contains("update_plan"), "{without}");
 }
 
-/// 主 Agent 挂了 `shell` 时，提示里说它跑在 komo 里、komo 的状态用 komo CLI 查；排在
+/// 主 Agent 挂了 `bash` 时，提示里说它跑在 komo 里、komo 的状态用 komo CLI 查；排在
 /// skills 目录前面。
 #[test]
 fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
-    let tools = vec!["read".to_string(), "shell".to_string()];
+    let tools = vec!["read".to_string(), "bash".to_string()];
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("cron-scheduler")).unwrap();
     std::fs::write(
@@ -187,7 +187,7 @@ fn the_main_prompt_tells_the_model_to_query_komo_with_its_cli() {
     );
 }
 
-/// 没有 `shell`（例如只给了 `dispatch` / `follow` 的 Profile）或是子代理时，这一段不出现：前者说了
+/// 没有 `bash`（例如只给了 `dispatch` / `follow` 的 Profile）或是子代理时，这一段不出现：前者说了
 /// 也跑不了，后者只拿任务里写的东西（§4）。
 #[test]
 fn the_komo_section_needs_shell_and_the_main_agent() {
@@ -208,7 +208,7 @@ fn the_komo_section_needs_shell_and_the_main_agent() {
     );
     let sub = build(
         Path::new("/tmp/w"),
-        &["shell".to_string()],
+        &["bash".to_string()],
         &[],
         &InvocationContext::Delegated(spec),
         &[],
@@ -254,19 +254,19 @@ fn both_prompts_steer_batched_reads_to_codemode_only_when_it_is_mounted() {
     assert!(!without.contains("codemode"), "{without}");
 }
 
-/// "看文件用 read 别用 cat"只在 `read` 与 `shell` 都挂着时出现：缺了哪一个这句都是空话。
+/// "看文件用 read 别用 cat"只在 `read` 与 `bash` 都挂着时出现：缺了哪一个这句都是空话。
 #[test]
 fn the_read_over_cat_rule_needs_both_read_and_shell() {
     let both = build(
         Path::new("/tmp/w"),
-        &["read".to_string(), "shell".to_string()],
+        &["read".to_string(), "bash".to_string()],
         &[],
         &InvocationContext::Main,
         &[],
         None,
     );
     assert!(both.contains("看文件用 read"), "{both}");
-    for tools in [vec!["read".to_string()], vec!["shell".to_string()]] {
+    for tools in [vec!["read".to_string()], vec!["bash".to_string()]] {
         let prompt = build(
             Path::new("/tmp/w"),
             &tools,
@@ -290,7 +290,7 @@ fn project_file(path: &str, content: &str) -> ProjectFile {
 /// `<project_instructions>`；文件末尾的换行不多留一个空行。
 #[test]
 fn the_main_prompt_puts_project_files_between_the_komo_section_and_skills() {
-    let tools = vec!["read".to_string(), "shell".to_string()];
+    let tools = vec!["read".to_string(), "bash".to_string()];
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("pr-review")).unwrap();
     std::fs::write(

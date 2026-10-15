@@ -654,7 +654,7 @@ mod tests {
                 parameters: serde_json::Value::Null,
             },
             ToolDefinition {
-                name: "shell".into(),
+                name: "bash".into(),
                 description: String::new(),
                 parameters: serde_json::Value::Null,
             },

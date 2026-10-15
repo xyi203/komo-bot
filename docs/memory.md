@@ -27,7 +27,7 @@
 
 | 启发 | v0.8 现状 | 位置 | 判断 |
 |---|---|---|---|
-| 记忆是重建，可多轮召回 | 自动召回一段对话一次（为前缀缓存）；主 Agent 的系统提示让它用 shell 跑 `komo <子命令>` 查 komo 状态，`komo memory search` 支持 hybrid | §9.4；`komo-agent/src/context/prompt.rs` | 路已有，被 #3 破坏 |
+| 记忆是重建，可多轮召回 | 自动召回一段对话一次（为前缀缓存）；主 Agent 的系统提示让它用 bash 跑 `komo <子命令>` 查 komo 状态，`komo memory search` 支持 hybrid | §9.4；`komo-agent/src/context/prompt.rs` | 路已有，被 #3 破坏 |
 | 经历按证据沉淀成认识 | 逐字相同或判为 `Same` 只补证据，不动 `state` / `confirmation`；独立证据只认用户 / 工具事件；失败、取消、未知的 Run 不能成为 experience | §9.3、§9.6；`consolidate.rs` `merge`；`extract.rs:283` | 防自证做到；**无晋升**（#2） |
 | 遗忘是功能 | contested / superseded / forgotten；forget 立即停用，resume 与旧检查点不能带回；`valid_until` | §9.6、§9.7；验收 `a_forgotten_memory_never_comes_back_into_a_turn` | 做到 |
 | 冲突与取代 | 模型判 same / supports / contradicts / supersedes / unrelated，`Plan::authorize` 决定能做什么：推断取代用户陈述、任何东西取代用户已确认内容 → 降级为 contested；取代留 `supersedes` 链 | `consolidate.rs` | 做到；contested 无对端链（见 #1） |
@@ -88,7 +88,7 @@ N、T 进 `[memory]` 配置，初值 3 次 / 90 天。判断放在 `merge` 之�
 
 ### 3.3 P1 · shell 子进程不带 KOMO_HOME
 
-**现象。** `komo-runtime/src/tools/shell.rs` 的 `INHERITED` 是
+**现象。** `komo-runtime/src/tools/bash.rs` 的 `INHERITED` 是
 `PATH, HOME, LANG, LC_ALL, TZ, USER, TMPDIR`，`process.rs` 先 `env_clear()`。子进程里的
 `komo` 按 `komo-client/src/discovery.rs` `komo_home()` 找数据目录：没有 `KOMO_HOME` 就用
 `$HOME/.komo`。默认实例没问题；**非默认数据目录的实例里，模型跑 `komo memory search`

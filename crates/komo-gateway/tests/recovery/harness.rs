@@ -417,7 +417,7 @@ impl Ledger for FaultLedger {
 
 // ---------------------------------------------------------------- 副作用计数
 
-/// 一个副作用计数器：`shell` 往它里面追加一行，文件里有几行就是跑了几次。
+/// 一个副作用计数器：`bash` 往它里面追加一行，文件里有几行就是跑了几次。
 pub struct Counter {
     path: PathBuf,
 }
@@ -433,7 +433,7 @@ impl Counter {
         &self.path
     }
 
-    /// 让 `shell` 追加一行的命令。
+    /// 让 `bash` 追加一行的命令。
     pub fn append_command(&self) -> String {
         format!("echo once >> {}", self.path.display())
     }

@@ -18,10 +18,10 @@ pub const CODEMODE_TOOL: &str = "codemode";
 /// 脚本里调不了的：本地命令与写入（执行器只放行读文件与 MCP）、编排操作、计划与脚本自己。
 ///
 /// 执行器用它把这些名字挡在 `TOOLS` 与子调用之外；`prepare` 用它在脚本跑起来**之前**
-/// 就拒——实测模型常把 `tools.shell("git status")` 当成只读调用写进脚本，等跑到那一行
+/// 就拒——实测模型常把 `tools.bash("git status")` 当成只读调用写进脚本，等跑到那一行
 /// 才被拒，整段脚本作废，前面的 MCP 写也可能已经做了。
 pub const NOT_IN_SCRIPTS: &[&str] = &[
-    "shell",
+    "bash",
     "python",
     "edit",
     "write",
@@ -66,8 +66,8 @@ impl Tool for CodemodeTool {
                           - tools.<name>(**args)：调工具，返回 {\"status\", \"text\", \"result\"}；\
                           text 是工具的正文输出（read 是文件内容，rg 是匹配行），result 是结构化\
                           结果。工具名里的 - 写成 _。能调 read、rg 与 MCP 工具（MCP 含写操作）；\
-                          shell、python、edit、write 与编排工具（delegate、dispatch、monitor 等）\
-                          只能在脚本外直接调，脚本里写了 tools.shell(...) 会在运行前被拒。\
+                          bash、python、edit、write 与编排工具（delegate、dispatch、monitor 等）\
+                          只能在脚本外直接调，脚本里写了 tools.bash(...) 会在运行前被拒。\
                           子调用逐次持久化，unsafe 中断不重跑；恢复核对\
                           已记录调用及参数，禁止新增调用，分歧或结果不明会终止整段脚本。\n\
                           - text(value)：加一段输出（非字符串转 JSON）。print 的内容附在最后。\n\
@@ -148,8 +148,8 @@ impl Tool for CodemodeTool {
 
 /// 脚本正文里出现的 `tools.<名字>(`，名字在 [`NOT_IN_SCRIPTS`] 里的那些（去重、按出现顺序）。
 ///
-/// 只认字面写法，不解析 Python：`getattr(tools, "shell")` 这种绕法认不出，执行器照样会在
-/// 那一次子调用上拒。前面紧挨着标识符字符的不算（`mytools.shell(` 不是我们的 `tools`）。
+/// 只认字面写法，不解析 Python：`getattr(tools, "bash")` 这种绕法认不出，执行器照样会在
+/// 那一次子调用上拒。前面紧挨着标识符字符的不算（`mytools.bash(` 不是我们的 `tools`）。
 fn refused_calls(code: &str) -> Vec<&'static str> {
     let is_ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut out: Vec<&'static str> = Vec::new();
@@ -178,15 +178,15 @@ mod tests {
 
     #[test]
     fn local_commands_and_writes_in_a_script_are_found_before_it_runs() {
-        let code = "r = tools.rg(pattern='x')\nw = tools.shell (command='git status')\n\
-                    tools.edit(path='a', match_text='b', replace_text='c')\ntools.shell(command='ls')";
-        assert_eq!(refused_calls(code), vec!["shell", "edit"]);
+        let code = "r = tools.rg(pattern='x')\nw = tools.bash (command='git status')\n\
+                    tools.edit(path='a', match_text='b', replace_text='c')\ntools.bash(command='ls')";
+        assert_eq!(refused_calls(code), vec!["bash", "edit"]);
     }
 
     #[test]
     fn reads_mcp_calls_and_lookalikes_are_not_refused() {
         let code = "tools.read(path='a')\ntools.mcp__devops_mcp_prod__issue_get_info(key='GD-1')\n\
-                    mytools.shell(command='x')\nprint(tools.shell_history)\nTOOLS";
+                    mytools.bash(command='x')\nprint(tools.bash_history)\nTOOLS";
         assert!(refused_calls(code).is_empty());
     }
 }

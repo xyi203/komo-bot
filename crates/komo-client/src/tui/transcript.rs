@@ -488,13 +488,13 @@ mod tests {
         feed(&mut app, &events[..5]);
         let _ = emitted.take(&app, 80);
         let live = text_of(&emitted.live(&app, 80));
-        assert!(live.contains("shell"), "跑着的调用要在视口里：{live}");
+        assert!(live.contains("bash"), "跑着的调用要在视口里：{live}");
 
         feed(&mut app, &events[5..]);
         let settled = text_of(&emitted.take(&app, 80));
-        assert!(settled.contains("shell"), "跑完了要落进回滚区：{settled}");
+        assert!(settled.contains("bash"), "跑完了要落进回滚区：{settled}");
         let live = text_of(&emitted.live(&app, 80));
-        assert!(!live.contains("shell"), "落地之后不该还在视口里：{live}");
+        assert!(!live.contains("bash"), "落地之后不该还在视口里：{live}");
     }
 
     /// 工具调用之后的回答先空一行：紧贴在结果下面就分不清哪几行是输出、从哪儿起是回答。

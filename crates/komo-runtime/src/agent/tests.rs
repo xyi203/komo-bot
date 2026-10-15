@@ -104,10 +104,10 @@ async fn the_final_reply_is_recorded_before_the_run_completes() {
 /// 一轮有调用 → 结果按 `call_id` 回传 → 下一轮模型 → 结束。
 #[tokio::test]
 async fn tool_results_go_back_to_the_model_keyed_by_call_id() {
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let wired = Wired::new(
         vec![vec![
-            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+            round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
             round(2, Some("跑完了。"), vec![]),
         ]],
         vec![tool.clone()],
@@ -188,11 +188,11 @@ async fn a_delegated_call_suspends_the_run_on_its_child() {
 /// ⑧ 工具失败作为结果回给模型，模型继续；Run 正常结束。
 #[tokio::test]
 async fn a_tool_failure_is_handed_to_the_model_and_the_run_carries_on() {
-    let tool = Arc::new(RecordingTool::shell().with_outcome(Err(ToolError::Failed {
+    let tool = Arc::new(RecordingTool::bash().with_outcome(Err(ToolError::Failed {
         message: "命令不存在".into(),
     })));
     let llm = Arc::new(ScriptedLlm::once(vec![
-        round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+        round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
         round(2, Some("换个办法。"), vec![]),
     ]));
     let harness = Harness::new();
@@ -240,12 +240,12 @@ async fn a_tool_failure_is_handed_to_the_model_and_the_run_carries_on() {
 #[tokio::test]
 async fn a_driver_error_fails_the_run() {
     // 脚本只有一轮，第二轮一开口就是 `Unknown("脚本已经演完了")`。
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let wired = Wired::new(
         vec![vec![round(
             1,
             None,
-            vec![call("pc-1", "shell", serde_json::json!({}))],
+            vec![call("pc-1", "bash", serde_json::json!({}))],
         )]],
         vec![tool],
     );
@@ -266,8 +266,8 @@ async fn a_driver_error_fails_the_run() {
 /// 模型回复被截断时不能开始执行（§6）。
 #[tokio::test]
 async fn a_truncated_reply_never_starts_a_call() {
-    let tool = Arc::new(RecordingTool::shell());
-    let mut truncated = round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]);
+    let tool = Arc::new(RecordingTool::bash());
+    let mut truncated = round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]);
     truncated.truncated = true;
     let wired = Wired::new(vec![vec![truncated]], vec![tool.clone()]);
     let segment = wired.segment(CancelToken::new()).await;
@@ -283,9 +283,9 @@ async fn a_truncated_reply_never_starts_a_call() {
 /// 总轮数预算用完 → failed，不是无限循环（§8.4）。
 #[tokio::test]
 async fn the_round_budget_ends_in_a_failure_not_a_loop() {
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let script: Vec<Round> = (1..=5)
-        .map(|n| round(n, None, vec![call("pc-1", "shell", serde_json::json!({}))]))
+        .map(|n| round(n, None, vec![call("pc-1", "bash", serde_json::json!({}))]))
         .collect();
     let harness = Harness::new();
     let executor = harness.executor(vec![tool.clone()]);
@@ -325,12 +325,12 @@ async fn the_round_budget_ends_in_a_failure_not_a_loop() {
 /// 取消：Run 明确终止在 cancelled，不留一个跑着的调用。
 #[tokio::test]
 async fn cancelling_ends_the_run_as_cancelled() {
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let wired = Wired::new(
         vec![vec![round(
             1,
             None,
-            vec![call("pc-1", "shell", serde_json::json!({}))],
+            vec![call("pc-1", "bash", serde_json::json!({}))],
         )]],
         vec![tool.clone()],
     );
@@ -353,7 +353,7 @@ async fn cancelling_ends_the_run_as_cancelled() {
 /// 续跑：把上一回合没收尾的调用跑完，再请求下一轮模型。
 #[tokio::test]
 async fn a_resumed_segment_finishes_the_round_it_came_back_to() {
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let harness = Harness::new();
     let executor = harness.executor(vec![tool.clone()]);
     let agent = AgentLoop::new(
@@ -368,7 +368,7 @@ async fn a_resumed_segment_finishes_the_round_it_came_back_to() {
     );
     let (session, run) = harness.open_run().await;
     let pending = harness
-        .record_round(&run, &[("shell", serde_json::json!({ "command": "x" }))])
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
         .await;
 
     let outcome = agent
@@ -403,7 +403,7 @@ async fn a_resumed_segment_finishes_the_round_it_came_back_to() {
 #[tokio::test]
 async fn a_resumed_uncertain_call_goes_on_to_the_model() {
     let tool = Arc::new(
-        RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
+        RecordingTool::bash().with_outcome(Err(ToolError::Uncertain {
             message: "响应丢了".into(),
         })),
     );
@@ -423,7 +423,7 @@ async fn a_resumed_uncertain_call_goes_on_to_the_model() {
     let pending = harness
         .record_round(
             &run,
-            &[("shell", serde_json::json!({ "command": "rm -rf /tmp/x" }))],
+            &[("bash", serde_json::json!({ "command": "rm -rf /tmp/x" }))],
         )
         .await;
 
@@ -459,13 +459,13 @@ async fn a_resumed_uncertain_call_goes_on_to_the_model() {
 #[tokio::test]
 async fn an_uncertain_call_goes_back_to_the_model() {
     let tool = Arc::new(
-        RecordingTool::shell().with_outcome(Err(ToolError::Uncertain {
+        RecordingTool::bash().with_outcome(Err(ToolError::Uncertain {
             message: "响应丢了".into(),
         })),
     );
     let wired = Wired::new(
         vec![vec![
-            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+            round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
             round(2, Some("核对过了。"), vec![]),
         ]],
         vec![tool.clone()],
@@ -524,7 +524,7 @@ async fn one_segment_begins_exactly_one_turn() {
 /// 工具结果按 `call_id` 配对回传给驱动——不是按顺序猜。
 #[tokio::test]
 async fn the_driver_is_handed_results_paired_by_provider_call_id() {
-    let tool = Arc::new(RecordingTool::shell());
+    let tool = Arc::new(RecordingTool::bash());
     let harness = Harness::new();
     let executor = harness.executor(vec![tool]);
     let llm = Arc::new(ScriptedLlm::once(vec![
@@ -532,8 +532,8 @@ async fn the_driver_is_handed_results_paired_by_provider_call_id() {
             1,
             None,
             vec![
-                call("pc-a", "shell", serde_json::json!({ "command": "a" })),
-                call("pc-b", "shell", serde_json::json!({ "command": "b" })),
+                call("pc-a", "bash", serde_json::json!({ "command": "a" })),
+                call("pc-b", "bash", serde_json::json!({ "command": "b" })),
             ],
         ),
         round(2, Some("完成。"), vec![]),
@@ -583,7 +583,7 @@ async fn the_driver_is_handed_results_paired_by_provider_call_id() {
 
 #[tokio::test]
 async fn a_tool_output_with_no_preview_still_produces_one() {
-    let tool = Arc::new(RecordingTool::shell().with_outcome(Ok(ToolOutput {
+    let tool = Arc::new(RecordingTool::bash().with_outcome(Ok(ToolOutput {
         status: ToolResultStatus::Completed,
         result: serde_json::json!({ "value": 42 }),
         exit_code: None,
@@ -592,7 +592,7 @@ async fn a_tool_output_with_no_preview_still_produces_one() {
     })));
     let wired = Wired::new(
         vec![vec![
-            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+            round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
             round(2, Some("好。"), vec![]),
         ]],
         vec![tool],
@@ -830,10 +830,10 @@ async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
 
 /// 选驱动的接缝在 `AgentLoop::run` 里：`segment.command` 一给，`self.llm` 一次都不会
 /// 被摸到——不是"这次没观察到调用"，而是接了一个**碰就 panic** 的假 `LlmClient` 还是
-/// 没炸。第一轮固定发那个 `shell` 调用，最终答复就是那条工具结果的正文。
+/// 没炸。第一轮固定发那个 `bash` 调用，最终答复就是那条工具结果的正文。
 #[tokio::test]
 async fn a_command_run_never_touches_the_llm_client_and_finishes_with_the_shell_result() {
-    let tool = Arc::new(RecordingTool::shell().with_outcome(Ok(ToolOutput {
+    let tool = Arc::new(RecordingTool::bash().with_outcome(Ok(ToolOutput {
         status: ToolResultStatus::Completed,
         result: serde_json::json!({}),
         exit_code: Some(0),
@@ -852,7 +852,7 @@ async fn a_command_run_never_touches_the_llm_client_and_finishes_with_the_shell_
     let SegmentOutcome::Completed { final_message, .. } = &outcome else {
         panic!("{outcome:?}")
     };
-    assert_eq!(tool.ran(), 1, "那条 shell 调用真的执行了一次");
+    assert_eq!(tool.ran(), 1, "那条 bash 调用真的执行了一次");
     assert!(
         final_message
             .as_deref()
@@ -866,7 +866,7 @@ async fn a_command_run_never_touches_the_llm_client_and_finishes_with_the_shell_
 /// 是投递那一层的事（cron_watch），不是这里的事。
 #[tokio::test]
 async fn a_non_zero_exit_still_completes_the_run_not_fails_it() {
-    let tool = Arc::new(RecordingTool::shell().with_outcome(Ok(ToolOutput {
+    let tool = Arc::new(RecordingTool::bash().with_outcome(Ok(ToolOutput {
         status: ToolResultStatus::Failed,
         result: serde_json::json!({}),
         exit_code: Some(1),
@@ -1221,12 +1221,12 @@ mod compaction {
     /// 跑得快的那一轮不问。
     #[tokio::test(start_paused = true)]
     async fn a_tool_slower_than_the_cache_ttl_asks_the_planner() {
-        let slow = Arc::new(RecordingTool::shell().with_delay(
+        let slow = Arc::new(RecordingTool::bash().with_delay(
             komo_kernel::compaction::PROMPT_CACHE_TTL + std::time::Duration::from_secs(1),
         ));
         let llm = Arc::new(ScriptedLlm::new(vec![vec![
-            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
-            round(2, None, vec![call("pc-2", "shell", serde_json::json!({}))]),
+            round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
+            round(2, None, vec![call("pc-2", "bash", serde_json::json!({}))]),
             round(3, Some("好了。"), vec![]),
         ]]));
         let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![slow]);
@@ -1244,9 +1244,9 @@ mod compaction {
 
     #[tokio::test(start_paused = true)]
     async fn fast_tools_never_ask_the_planner_without_a_boundary() {
-        let tool = Arc::new(RecordingTool::shell());
+        let tool = Arc::new(RecordingTool::bash());
         let llm = Arc::new(ScriptedLlm::new(vec![vec![
-            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+            round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
             round(2, Some("好了。"), vec![]),
         ]]));
         let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![tool]);
@@ -1277,15 +1277,15 @@ mod compaction {
     /// 没有计划也要护住窗口：估计的上下文过了线就问，没过线的轮次一次都不问。
     #[tokio::test]
     async fn window_pressure_asks_without_a_boundary() {
-        let tool = Arc::new(RecordingTool::shell());
+        let tool = Arc::new(RecordingTool::bash());
         let llm = Arc::new(ScriptedLlm::new(vec![vec![
-            round(1, None, vec![call("pc-1", "shell", serde_json::json!({}))]),
+            round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
             round(
                 2,
                 None,
                 vec![call(
                     "pc-2",
-                    "shell",
+                    "bash",
                     serde_json::json!({ "x": "y".repeat(400) }),
                 )],
             ),

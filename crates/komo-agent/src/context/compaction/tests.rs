@@ -60,10 +60,10 @@ fn context() -> AgentContext {
             call(
                 13,
                 "c2",
-                "shell",
+                "bash",
                 serde_json::json!({ "command": "cargo test" }),
             ),
-            result(14, "c2", "[shell · 完成]\ntest result: ok"),
+            result(14, "c2", "[bash · 完成]\ntest result: ok"),
             call(15, "c3", "update_plan", serde_json::json!({ "steps": [] })),
             result(16, "c3", "<komo-plan/>"),
         ],
@@ -216,7 +216,7 @@ fn the_summary_request_is_one_plain_text_message_without_tools() {
         assert!(text.contains(piece), "带着进度：{piece}");
     }
     assert!(text.contains(ARTIFACT), "artifact 引用原样保留");
-    assert!(text.contains(r#"[助手调用 shell]"#) && text.contains("cargo test"));
+    assert!(text.contains(r#"[助手调用 bash]"#) && text.contains("cargo test"));
     assert!(text.contains("test result: ok"));
 }
 

@@ -7,6 +7,7 @@
 //! ——子代理用的还是这六个工具。委派只是"把一件事交给
 //! 另一条 Run"的入口，而且不由工具执行（见 [`delegate`]）。
 
+pub mod bash;
 pub mod codemode;
 pub mod delegate;
 pub mod dispatch;
@@ -22,7 +23,6 @@ pub mod python;
 pub mod read;
 pub mod resources;
 pub mod rg;
-pub mod shell;
 pub mod update_plan;
 pub mod write;
 
@@ -33,6 +33,7 @@ use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::tool::ToolError;
 use serde::{Deserialize, Serialize};
 
+pub use bash::BashTool;
 pub use codemode::CodemodeTool;
 pub use delegate::DelegateTool;
 pub use dispatch::DispatchTool;
@@ -43,7 +44,6 @@ pub use monitor::{MonitorStopTool, MonitorTool};
 pub use python::PythonTool;
 pub use read::ReadTool;
 pub use rg::RgTool;
-pub use shell::ShellTool;
 pub use update_plan::UpdatePlanTool;
 pub use write::WriteTool;
 
@@ -116,11 +116,11 @@ pub fn current(path: &Path) -> Result<Option<(Vec<u8>, FileVersion)>, ToolError>
     }
 }
 
-/// 正文必须是 UTF-8——六个基础工具处理的是文本；二进制走 shell 或 Python。
+/// 正文必须是 UTF-8——六个基础工具处理的是文本；二进制走 bash 或 Python。
 pub fn as_text(bytes: Vec<u8>, path: &Path) -> Result<String, ToolError> {
     String::from_utf8(bytes).map_err(|_| ToolError::InvalidArguments {
         message: format!(
-            "{} 不是 UTF-8 文本；二进制内容请用 shell 或 python 处理",
+            "{} 不是 UTF-8 文本；二进制内容请用 bash 或 python 处理",
             path.display()
         ),
     })
@@ -255,6 +255,6 @@ mod tests {
         let ToolError::InvalidArguments { message } = &error else {
             panic!("{error:?}")
         };
-        assert!(message.contains("shell"), "{message}");
+        assert!(message.contains("bash"), "{message}");
     }
 }

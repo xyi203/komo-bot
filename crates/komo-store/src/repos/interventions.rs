@@ -545,7 +545,7 @@ mod tests {
         let (db, dir) = temp().await;
         waiting_on_a_person(&db, "sess-1", "run-0001").await;
         set_last_error(&db, "run-0001", "会话读不出来").await;
-        uncertain_call(&db, "call-1", "sess-1", "run-0001", "shell").await;
+        uncertain_call(&db, "call-1", "sess-1", "run-0001", "bash").await;
 
         let pending = list_now(&db).await;
         assert_eq!(pending.len(), 1);
@@ -561,7 +561,7 @@ mod tests {
     async fn a_legacy_verify_is_listed_for_requeue() {
         let (db, dir) = temp().await;
         waiting_on_a_person(&db, "sess-1", "run-0001").await;
-        uncertain_call(&db, "call-1", "sess-1", "run-0001", "shell").await;
+        uncertain_call(&db, "call-1", "sess-1", "run-0001", "bash").await;
         waiting_on_a_person(&db, "sess-1", "run-0002").await;
 
         let recovery =
@@ -579,7 +579,7 @@ mod tests {
     async fn an_uncertain_call_turns_an_intervention_wait_into_a_verify() {
         let (db, _dir) = temp().await;
         waiting_on_a_person(&db, "sess-1", "run-0001").await;
-        uncertain_call(&db, "call-1", "sess-1", "run-0001", "shell").await;
+        uncertain_call(&db, "call-1", "sess-1", "run-0001", "bash").await;
 
         let pending = list_now(&db).await;
         assert_eq!(pending.len(), 1);
@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(entry.handle, "run-0001");
         assert_eq!(entry.call, Some(ToolCallId::from_raw("call-1")));
         assert!(
-            entry.question.contains("shell") && entry.question.contains("call-1"),
+            entry.question.contains("bash") && entry.question.contains("call-1"),
             "问题要说清是哪次调用：{}",
             entry.question
         );
@@ -604,7 +604,7 @@ mod tests {
                 summary,
                 ..
             }) => {
-                assert_eq!(tool, "shell");
+                assert_eq!(tool, "bash");
                 assert_eq!(plan_hash, Some(PlanHash::from_raw("ph")));
                 assert_eq!(summary.call, Some(ToolCallId::from_raw("call-1")));
             }

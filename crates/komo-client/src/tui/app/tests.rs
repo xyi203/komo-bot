@@ -730,7 +730,7 @@ fn the_conversation_folds_into_messages_and_tool_lines() {
 
     let tools = app.tool_lines();
     assert_eq!(tools.len(), 1);
-    assert_eq!(tools[0].tool, "shell");
+    assert_eq!(tools[0].tool, "bash");
     assert_eq!(tools[0].summary(), "rm -rf build");
     assert_eq!(tools[0].state, ToolCallState::Completed);
     assert_eq!(tools[0].marker(None), "✔");

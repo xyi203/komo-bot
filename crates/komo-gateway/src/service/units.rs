@@ -13,7 +13,7 @@
 //! 机器上每一个子进程与每一条 `/proc/<pid>/environ` 都看得见。
 //!
 //! `PATH` 取自**写单元的那个进程**（操作者的 CLI），每次 start / restart 重写单元时随之
-//! 刷新。不写它，Gateway 与它起的每个 `shell` 子进程就只有服务管理器的默认
+//! 刷新。不写它，Gateway 与它起的每个 `bash` 子进程就只有服务管理器的默认
 //! `/usr/bin:/bin:/usr/sbin:/sbin`——2026-09-24 实测：会话里 `komo` 与 `rg` 都是
 //! `command not found`。`PATH` 不是凭证，上面三条理由不适用于它。
 
@@ -168,7 +168,7 @@ pub fn unit_text(
     <string>--foreground</string>
   </array>
   <!-- 只有 KOMO_HOME 与 PATH。凭证在 {home}/.env，由 Gateway 自己读取，不进本文件。
-       PATH 抄自写本文件的 CLI，shell 工具的子进程继承它；每次 start / restart 重写。 -->
+       PATH 抄自写本文件的 CLI，bash 工具的子进程继承它；每次 start / restart 重写。 -->
   <key>EnvironmentVariables</key>
   <dict><key>KOMO_HOME</key><string>{home}</string>{path_entry}</dict>
   <key>RunAtLoad</key><true/>
@@ -193,7 +193,7 @@ After=network.target
 [Service]
 Type=simple
 # 只有 KOMO_HOME 与 PATH。凭证在 {home}/.env，由 Gateway 自己读取，不进本文件。
-# PATH 抄自写本文件的 CLI，shell 工具的子进程继承它；每次 start / restart 重写。
+# PATH 抄自写本文件的 CLI，bash 工具的子进程继承它；每次 start / restart 重写。
 Environment=KOMO_HOME={home}
 {path_line}ExecStart={exe} gateway --foreground
 Restart=on-failure
@@ -313,7 +313,7 @@ pub fn restart(home_dir: &Path, komo_home: &Path) -> Result<(), UnitError> {
     start(home_dir, komo_home)
 }
 
-/// 这条命令是不是 Gateway 自己的 `shell` 工具起的：`KOMO_RUN` 只有那里会设（§4）。
+/// 这条命令是不是 Gateway 自己的 `bash` 工具起的：`KOMO_RUN` 只有那里会设（§4）。
 ///
 /// 在那里面同步地 `stop` / `restart` 等于让 Gateway 停掉正在跑这条命令的自己：停机要等
 /// 手上的调用收尾，而那个调用正等着 Gateway 停下——互相等到服务管理器动手杀，这次调用的
@@ -345,7 +345,7 @@ impl Deferred {
 /// - launchd：起一个**脱离进程组**的 `komo gateway <verb> --after-pid <本进程>`，它等本进程
 ///   退出、调用结果落盘之后再动手。自己的进程组 = `bootout` 不连它一起带走（实测：shell
 ///   工具起的进程组在 Gateway 停下之后还活着）；输出写 `logs/gateway-restart.log`，不占
-///   shell 工具的管道（占着的话那次调用要等它结束才收得了尾）。
+///   bash 工具的管道（占着的话那次调用要等它结束才收得了尾）。
 /// - systemd：后台进程躲不过 `stop`——它在 Gateway 的 cgroup 里，一起被杀。所以让 systemd
 ///   自己做：单元先按本进程的环境重写（与 [`start`] 一样刷新 `PATH`），再用
 ///   `systemd-run --on-active` 挂一个两秒后执行的 `systemctl --user <verb>`。

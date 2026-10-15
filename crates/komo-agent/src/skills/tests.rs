@@ -11,7 +11,7 @@ fn write_skill(dir: &Path, name: &str, front: &str, body: &str) -> PathBuf {
 }
 
 fn context() -> OfferContext {
-    OfferContext::here(["read", "write", "edit", "shell", "python"]).on("linux")
+    OfferContext::here(["read", "write", "edit", "bash", "python"]).on("linux")
 }
 
 #[test]
@@ -83,21 +83,21 @@ fn a_skill_whose_tools_are_missing_is_hidden_from_the_catalog_but_still_inspecta
     write_skill(
         dir.path(),
         "nas-backup",
-        "name: nas-backup\ndescription: 备份到 NAS\nrequires_tools: [shell, py__rsync]\n",
+        "name: nas-backup\ndescription: 备份到 NAS\nrequires_tools: [bash, py__rsync]\n",
         "先挂载……\n",
     );
     let registry = SkillRegistry::new(vec![dir.path().to_path_buf()]);
 
-    let without = OfferContext::here(["shell"]).on("linux");
+    let without = OfferContext::here(["bash"]).on("linux");
     assert!(registry.catalog(&without).is_empty(), "工具不齐就不进目录");
 
     let document = registry
         .inspect("nas-backup")
         .expect("inspect 不受门控影响");
     assert_eq!(document.body, "先挂载……\n");
-    assert_eq!(document.skill.requires_tools, vec!["shell", "py__rsync"]);
+    assert_eq!(document.skill.requires_tools, vec!["bash", "py__rsync"]);
 
-    let with = OfferContext::here(["shell", "py__rsync"]).on("linux");
+    let with = OfferContext::here(["bash", "py__rsync"]).on("linux");
     assert_eq!(registry.catalog(&with).len(), 1);
 }
 
@@ -348,7 +348,7 @@ fn a_gated_or_disabled_skill_leaves_the_block_empty() {
     );
 }
 
-/// 学 pi 1.0.4：引导语里的工具跟着真挂了的走——有 read 写 read，只有 shell 写 shell，
+/// 学 pi 1.0.4：引导语里的工具跟着真挂了的走——有 read 写 read，只有 bash 写 bash，
 /// 都没有就整段不出现（说了也读不了）。
 #[test]
 fn the_prompt_block_names_only_a_tool_that_is_mounted() {
@@ -368,9 +368,9 @@ fn the_prompt_block_names_only_a_tool_that_is_mounted() {
     );
 
     let shell_only = registry
-        .prompt_block(&OfferContext::here(["shell"]).on("linux"))
-        .expect("有 shell 也读得了");
-    assert!(shell_only.contains("用 shell 读"), "{shell_only}");
+        .prompt_block(&OfferContext::here(["bash"]).on("linux"))
+        .expect("有 bash 也读得了");
+    assert!(shell_only.contains("用 bash 读"), "{shell_only}");
     assert!(
         !shell_only.contains(" read "),
         "没挂 read 就不提它：{shell_only}"

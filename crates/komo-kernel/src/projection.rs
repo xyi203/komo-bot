@@ -7,7 +7,7 @@
 //!
 //! 同一份事实渲染出**两个视图**（[`project_views`]）：
 //!
-//! - **full**：最多 50 KiB / 2000 行；shell 保留尾部，其他工具保留头部。还有更多时给出
+//! - **full**：最多 50 KiB / 2000 行；bash 保留尾部（旧记录里叫 shell，两个名字都认），其他工具保留头部。还有更多时给出
 //!   **可直接 `read` 的完整输出引用**（`artifact://<run>/<call>/<attempt>/…`，§4.7）。
 //! - **decayed**：大结果换下来的稳定短视图——抬头 + 首尾整行 + 那条引用。
 //!   省略不等于丢失：完整事实始终在 `output.json` / `stdout.txt` 里。
@@ -468,7 +468,7 @@ mod tests {
 
     fn facts<'a>(text: Option<&'a str>, stdout: Option<&'a ContentRef>) -> ToolResultFacts<'a> {
         ToolResultFacts {
-            tool: "shell",
+            tool: "bash",
             status: ToolResultStatus::Completed,
             elapsed_ms: 1_240,
             text,
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn a_small_result_is_shown_whole_with_its_header() {
         let printed = project(&facts(Some("exit=0\n全部输出\n"), None), &budget(1024));
-        assert!(printed.starts_with("[shell · 完成 · 1.2s]\n"), "{printed}");
+        assert!(printed.starts_with("[bash · 完成 · 1.2s]\n"), "{printed}");
         assert!(printed.contains("全部输出"), "{printed}");
         assert!(
             !printed.contains("完整输出："),
@@ -629,11 +629,17 @@ mod tests {
     }
 
     #[test]
-    fn shell_keeps_the_tail_while_other_tools_keep_the_head() {
+    fn bash_keeps_the_tail_while_other_tools_keep_the_head() {
         let text = format!("HEAD\n{}TAIL\n", "middle\n".repeat(200));
         let shell = project(&facts(Some(&text), None), &budget(400));
-        assert!(!shell.contains("HEAD"), "shell 不留头：{shell}");
-        assert!(shell.contains("TAIL"), "shell 要留末尾：{shell}");
+        assert!(!shell.contains("HEAD"), "bash 不留头：{shell}");
+        assert!(shell.contains("TAIL"), "bash 要留末尾：{shell}");
+        // 改名前落账的结果叫 `shell`：回放必须与当年一样留尾。
+        let legacy = ToolResultFacts {
+            tool: "shell",
+            ..facts(Some(&text), None)
+        };
+        assert!(project(&legacy, &budget(400)).contains("TAIL"));
 
         let ordinary = ToolResultFacts {
             tool: "read",
@@ -695,7 +701,7 @@ mod tests {
     fn a_result_without_text_still_gives_the_reference() {
         let printed = project(&facts(None, Some(&STDOUT)), &budget(1024));
         assert!(
-            printed.starts_with("[shell · 完成 · 1.2s · stdout 400 B]\n"),
+            printed.starts_with("[bash · 完成 · 1.2s · stdout 400 B]\n"),
             "{printed}"
         );
         assert!(printed.contains("完整输出："), "{printed}");
@@ -808,7 +814,7 @@ mod tests {
         assert!(!views.full.contains("完整输出："), "{}", views.full);
         let decayed = views.decayed.expect("20 KB 的结果要有 decayed 视图");
         assert!(
-            decayed.starts_with("[shell · 完成 · 1.2s]\n（这份结果前文已完整给过，"),
+            decayed.starts_with("[bash · 完成 · 1.2s]\n（这份结果前文已完整给过，"),
             "{decayed}"
         );
         assert!(

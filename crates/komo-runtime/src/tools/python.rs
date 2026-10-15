@@ -180,7 +180,7 @@ impl Tool for PythonTool {
         //
         // 顺序有讲究：**只 print、不返回结构化结果**是最常见的一种跑法，而原先这里
         // `to_string(&Value::Null)` 得到的是字面量 `null`——模型看到它以为工具坏了，改用
-        // `shell` + `python3` 把同一件事重跑一遍（真实会话里就这么白花了两轮）。所以没有
+        // `bash` + `python3` 把同一件事重跑一遍（真实会话里就这么白花了两轮）。所以没有
         // 结构化结果时给 stdout 的首尾摘录，再不济也要说清"没有输出"，绝不把 `null` 当正文。
         let preview = match (&outcome.error, outcome.result.is_null()) {
             (Some(error), _) => format!("{:?}：{error}", outcome.status),
@@ -380,7 +380,7 @@ mod tests {
 
     /// 只 print 的脚本：预览给 stdout 的首尾摘录，**不是字面量 `null`**。
     ///
-    /// 真实会话里模型看到 `null` 以为工具坏了，改用 `shell` + `python3` 把同一件事重跑了一遍。
+    /// 真实会话里模型看到 `null` 以为工具坏了，改用 `bash` + `python3` 把同一件事重跑了一遍。
     #[tokio::test]
     async fn a_script_that_only_prints_shows_its_stdout_excerpt() {
         let dir = tempfile::tempdir().unwrap();

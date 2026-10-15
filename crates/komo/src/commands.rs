@@ -765,7 +765,7 @@ pub enum SkillsAction<'a> {
 
 /// `komo skills` 的门控上下文：与 Gateway 的目录行同一个口径（本机平台 + 5 个基础工具）。
 pub fn offer_context() -> OfferContext {
-    OfferContext::here(["read", "write", "edit", "shell", "python"])
+    OfferContext::here(["read", "write", "edit", "bash", "python"])
 }
 
 #[cfg(test)]

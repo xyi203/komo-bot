@@ -1,16 +1,16 @@
 //! 命令直跑模式的固定出牌驱动（§10）。
 //!
 //! Cron 的命令 Job 不经模型：`AgentLoop` 平时靠 `LlmClient::begin_turn` 拿一个
-//! `TurnDriver`，命令 Job 触发的 Run 用这个固定脚本代替它——第一轮固定给一个 `shell`
+//! `TurnDriver`，命令 Job 触发的 Run 用这个固定脚本代替它——第一轮固定给一个 `bash`
 //! 工具调用（命令 = Job 的 `command`，工作目录由这一段的执行环境给出），第二轮拿到
 //! 工具结果后收尾，最终答复就是那条工具结果的正文。选哪个驱动在 `AgentLoop::run`
 //! 里按 Run 的来源判（§10 设计的"选驱动的接缝"）：不是把命令伪装成另一个 `ModelConfig`
 //! / provider，是压根不经过 `LlmClient` 这一层——`self.llm` 一次都不会被摸到。
 //!
-//! 于是能力面 / JSONL / tool-output / 恢复 / 投递全部原样复用：那一次 `shell` 调用照样
+//! 于是能力面 / JSONL / tool-output / 恢复 / 投递全部原样复用：那一次 `bash` 调用照样
 //! 走 `prepare` → `start_call` → `execute`，跟模型发起的调用是同一条路。
 //!
-//! **恢复安全**：如果上一次已经把这条 `shell` 调用的结果记进了账本（收到结果之后、
+//! **恢复安全**：如果上一次已经把这条 `bash` 调用的结果记进了账本（收到结果之后、
 //! 收尾之前进程重启了），那条调用在回放窗口里已经"收尾"了，不再进 `resumed.pending`
 //! （`Surface::open_calls`，§8.4）——于是这一段会带着一个**空的** `resume`、从
 //! `RoundInput::First` 重新起步。普通模型驱动不怕这个：它靠 `TurnRequest.messages`
@@ -25,12 +25,12 @@ use komo_kernel::traits::TurnDriver;
 use komo_kernel::types::model::TokenUsage;
 use komo_kernel::types::turn::{LlmError, ProviderToolCall, ReplayMessage, Round, RoundInput};
 
-/// 命令 Job 那次 `shell` 调用的 `provider_call_id`——回放窗口里认哪条结果是它的，靠的
+/// 命令 Job 那次 `bash` 调用的 `provider_call_id`——回放窗口里认哪条结果是它的，靠的
 /// 就是这个 id，不是猜"最后一条工具结果"。
 pub const CALL_ID: &str = "cmd-1";
 
 /// 一条命令 Job 交给 `CommandDriver` 的那一条命令。工作目录不在这里：它是这一段执行
-/// 环境的 `cwd`（Session 的 workdir，受理时已经从 Job 落到会话上，§10），`shell` 工具
+/// 环境的 `cwd`（Session 的 workdir，受理时已经从 Job 落到会话上，§10），`bash` 工具
 /// 不给 `cwd` 参数时就用它——不必在这里重复一份。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -51,7 +51,7 @@ impl CommandSpec {
     }
 }
 
-/// 固定出牌的 [`TurnDriver`]：第一轮发那个 `shell` 调用，第二轮把它的结果当最终答复。
+/// 固定出牌的 [`TurnDriver`]：第一轮发那个 `bash` 调用，第二轮把它的结果当最终答复。
 pub struct CommandDriver {
     command: String,
     call_id: String,
@@ -92,7 +92,7 @@ impl TurnDriver for CommandDriver {
                     text: None,
                     tool_calls: vec![ProviderToolCall {
                         provider_call_id: self.call_id.clone(),
-                        name: "shell".into(),
+                        name: "bash".into(),
                         arguments: serde_json::json!({ "command": self.command }),
                     }],
                     provider_blocks: None,
@@ -146,7 +146,7 @@ mod tests {
         assert!(round.text.is_none());
         assert_eq!(round.tool_calls.len(), 1);
         let call = &round.tool_calls[0];
-        assert_eq!(call.name, "shell");
+        assert_eq!(call.name, "bash");
         assert_eq!(call.provider_call_id, CALL_ID);
         assert_eq!(call.arguments, serde_json::json!({ "command": "echo hi" }));
     }

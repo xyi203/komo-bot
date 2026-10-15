@@ -798,8 +798,8 @@ fn main() {
     fn the_tool_line_shows_the_tool_its_summary_and_its_state() {
         let app = conversation_app();
         let screen = screen(&app, 100, 40);
-        assert!(screen.contains("shell $ rm -rf build"), "{screen}");
-        assert!(screen.contains("✔ shell"), "跑完了定住一个符号：{screen}");
+        assert!(screen.contains("bash $ rm -rf build"), "{screen}");
+        assert!(screen.contains("✔ bash"), "跑完了定住一个符号：{screen}");
     }
 
     #[test]
@@ -811,8 +811,8 @@ fn main() {
         }
         feed(&mut app, &events[..7]);
         let screen = screen(&app, 100, 30);
-        assert!(screen.contains("? shell"), "{screen}");
-        assert!(!screen.contains("✖ shell"), "uncertain 不是失败：{screen}");
+        assert!(screen.contains("? bash"), "{screen}");
+        assert!(!screen.contains("✖ bash"), "uncertain 不是失败：{screen}");
     }
 
     /// **在跑的东西要动。** 一块静止的"运行中"分不出还在跑还是卡住了；转圈不用读就知道
@@ -989,7 +989,7 @@ fn main() {
             .iter()
             .flat_map(|line| line.spans.iter().map(|span| span.content.to_string()))
             .collect();
-        assert!(text.contains("✔ shell"), "跑完了是一个定住的符号：{text}");
+        assert!(text.contains("✔ bash"), "跑完了是一个定住的符号：{text}");
         for frame in crate::tui::spinner::FRAMES {
             assert!(!text.contains(frame), "回滚区上不许有转圈的那一格：{text}");
         }

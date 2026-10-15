@@ -940,7 +940,7 @@ mod tests {
     }
 
     /// §10 的 Job 字段在 CLI 上**全都有 flag**：`komo cron add` 是唯一的写入口
-    /// （「模型需要管理 Cron 时通过 shell 调这些命令」），少一个 flag 就等于那个字段
+    /// （「模型需要管理 Cron 时通过 bash 调这些命令」），少一个 flag 就等于那个字段
     /// 只能改配置文件——而它根本不在配置文件里。
     #[test]
     fn cron_add_covers_every_job_field() {

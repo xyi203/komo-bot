@@ -465,7 +465,7 @@ impl World {
                         .map(|id| ToolCallRequest {
                             call_id: ToolCallId::from_raw(*id),
                             provider_call_id: format!("p-{id}"),
-                            name: "shell".into(),
+                            name: "bash".into(),
                             arguments: serde_json::json!({ "command": "echo hi" }),
                             arguments_ref: None,
                         })
@@ -479,7 +479,7 @@ impl World {
     }
 
     fn plan(&self, call: &ToolCallId) -> ExecutionPlan {
-        let mut plan = komo_kernel::test_support::sample_plan("shell", &self.session);
+        let mut plan = komo_kernel::test_support::sample_plan("bash", &self.session);
         plan.tool_call = Some(call.clone());
         plan
     }

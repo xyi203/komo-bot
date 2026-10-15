@@ -61,7 +61,7 @@ komo-agent
     AgentProfile
     AgentSurface
     PromptComposer、SkillSelector
-    read / write / edit / rg / shell / python 的工具定义与参数处理
+    read / write / edit / rg / bash / python 的工具定义与参数处理
     skills 的发现与描述
     Resource Namespace
 
@@ -118,7 +118,7 @@ started 而无结果的调用按重放策略处理、不能重跑的交给模型
 
 ```text
 全局工具实现目录
-    read / write / edit / rg / shell / python
+    read / write / edit / rg / bash / python
                      │
               AgentProfile 选择
                      ↓
@@ -134,8 +134,8 @@ started 而无结果的调用按重放策略处理、不能重跑的交给模型
 不能这样实现：
 
 ```text
-给 researcher 的 schema 去掉 shell
-但 Executor 仍然从全局工具表查 shell
+给 researcher 的 schema 去掉 bash
+但 Executor 仍然从全局工具表查 bash
 ```
 
 否则模型只要生成这个名字，仍可能进入执行流程。
@@ -149,7 +149,7 @@ assistant
     tools = read, rg, python
 
 coder
-    tools = read, write, edit, rg, shell, python
+    tools = read, write, edit, rg, bash, python
 
 reviewer
     tools = read, rg
@@ -380,7 +380,7 @@ TargetRef
 
 资源解析必须保留逻辑 URI、所属 Agent / Session、版本和实际读取目标。审计应能回答“读取了哪个逻辑资源”，而不只是“访问了哪个临时文件”。
 
-首阶段继续保持原定范围：不开放 memory/session 的任意写入，不给 shell/Python 自动展开 URI，不实现通用 VFS。原来的本地路径用法继续兼容。
+首阶段继续保持原定范围：不开放 memory/session 的任意写入，不给 bash/Python 自动展开 URI，不实现通用 VFS。原来的本地路径用法继续兼容。
 
 ---
 
@@ -406,7 +406,7 @@ TargetRef
     read C
 ```
 
-`write`、`edit`、`shell`、`python` 和 `delegate` 先作为顺序屏障。不根据模型声称“没有副作用”就并行。
+`write`、`edit`、`bash`、`python` 和 `delegate` 先作为顺序屏障。不根据模型声称“没有副作用”就并行。
 
 要守住的行为是：遇到要停下等人的判定（原稿写的是 Ask；2026-10-11 起只剩 uncertain 之类的介入）后不再启动后续调用；挂起前收齐已启动调用的结果；完成事件按真实发生顺序记录，交给模型时按原始调用关系配对；恢复只处理未收尾调用，不重放整批。
 

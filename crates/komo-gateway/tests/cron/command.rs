@@ -1,7 +1,7 @@
 //! 命令直跑模式（§10）：不经模型，触发时固定跑 Job 的 `command`。走真 Gateway——
 //! 真数据目录、真 state.db，`LlmClient` 是脚本模型，用
 //! [`komo_gateway::service::test_support::harness::FakeLlm::turns`] 断言它一次都
-//! 没被问过。命令 Job 不再签授权（§7 删掉审批之后，触发时那次 `shell` 直接执行）。
+//! 没被问过。命令 Job 不再签授权（§7 删掉审批之后，触发时那次 `bash` 直接执行）。
 
 use std::sync::Arc;
 

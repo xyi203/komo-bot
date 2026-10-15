@@ -3,11 +3,11 @@
 //! 照 pi 的做法**按工具分开画**。原来一次调用只有一行摘要：长命令截在一屏宽，多行脚本
 //! 压成一行 JSON，结果只剩一个耗时，看不出这次调用到底动了什么、得到了什么。现在分三块：
 //!
-//! - **头一行**说这次调用动了什么：`shell` 是 `$ 命令`，`read` 是 `路径:起-止`，`rg` 是
+//! - **头一行**说这次调用动了什么：`bash` 是 `$ 命令`，`read` 是 `路径:起-止`，`rg` 是
 //!   模式与目录。按宽度折行，不截在一屏宽；
 //! - **正文**是它带的那段内容：多行命令与脚本的续行、`write` 写进去的内容、`edit` 的
 //!   diff；
-//! - **结果**以 `⎿` 起头：`shell` 留尾，其他留头。成功的 `read` / `edit` / `write` 不印——
+//! - **结果**以 `⎿` 起头：`bash`（旧记录叫 `shell`）留尾，其他留头。成功的 `read` / `edit` / `write` 不印——
 //!   前者就是文件本身，后两者的回执头一行已经说了；失败了照印，那是原因。
 //!
 //! 折叠时每一块最多 [`FOLDED_LINES`] 行，超出的说一句还有几行、按什么展开，每行截在一屏
@@ -740,7 +740,7 @@ mod tests {
     fn a_long_command_wraps_instead_of_being_cut() {
         let command = format!("cargo test --workspace {} | tail -20", "x".repeat(60));
         let tool = call(
-            "shell",
+            "bash",
             json!({ "command": command }),
             ToolCallState::Completed,
             None,
@@ -752,23 +752,25 @@ mod tests {
         assert!(joined.contains(&format!("$ {command}")), "{joined}");
     }
 
-    /// shell 的结果留尾巴：最后几行是结论，前面是过程。
+    /// bash 的结果留尾巴：最后几行是结论，前面是过程。改名前的旧记录叫 `shell`，同样处理。
     #[test]
-    fn shell_output_keeps_its_last_lines() {
+    fn bash_output_keeps_its_last_lines() {
         let output = numbered(15);
-        let tool = call(
-            "shell",
-            json!({ "command": "make" }),
-            ToolCallState::Completed,
-            Some(&output),
-        );
-        let text = text_of(&lines(&tool, false, 80, None));
-        assert!(text.contains("… 前面还有 5 行（Ctrl-T 展开）"), "{text}");
-        assert!(
-            text.contains("第 6 行") && text.contains("第 15 行"),
-            "{text}"
-        );
-        assert!(!text.contains("第 5 行"), "{text}");
+        for name in ["bash", "shell"] {
+            let tool = call(
+                name,
+                json!({ "command": "make" }),
+                ToolCallState::Completed,
+                Some(&output),
+            );
+            let text = text_of(&lines(&tool, false, 80, None));
+            assert!(text.contains("… 前面还有 5 行（Ctrl-T 展开）"), "{text}");
+            assert!(
+                text.contains("第 6 行") && text.contains("第 15 行"),
+                "{text}"
+            );
+            assert!(!text.contains("第 5 行"), "{text}");
+        }
     }
 
     /// 其他工具留头，超出的说一句还有几行、按什么展开。
@@ -896,7 +898,7 @@ mod tests {
         let code = numbered(13);
         let output = numbered(7);
         let tool = call(
-            "shell",
+            "bash",
             json!({ "command": format!("bash <<'EOF'\n{code}\nEOF"), "cwd": "/tmp/work" }),
             ToolCallState::Completed,
             Some(&output),

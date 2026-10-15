@@ -410,7 +410,7 @@ mod tests {
 
     fn fused(command: &str) -> ExecutionPlan {
         let mut step = plan();
-        step.tool = "shell".into();
+        step.tool = "bash".into();
         step.operation = Operation::ShellCommand {
             command: command.into(),
         };
@@ -491,7 +491,7 @@ mod tests {
 
         let composite = fused("cargo test");
         let tools: Vec<&str> = composite.steps().map(|step| step.tool.as_str()).collect();
-        assert_eq!(tools, ["write", "shell"]);
+        assert_eq!(tools, ["write", "bash"]);
         assert_eq!(composite.validate_steps(), Ok(()));
     }
 

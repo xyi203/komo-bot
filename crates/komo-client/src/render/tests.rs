@@ -218,7 +218,7 @@ fn run_detail(state: ToolCallState) -> RunDetail {
         },
         calls: vec![ToolCallSummary {
             call: fixture::call(),
-            tool: "shell".into(),
+            tool: "bash".into(),
             state,
             attempts: 2,
             plan_hash: Some(fixture::plan().plan_hash()),
@@ -241,7 +241,7 @@ fn run_detail(state: ToolCallState) -> RunDetail {
 #[test]
 fn run_inspect_prints_two_question_marks_for_an_uncertain_call() {
     let printed = run_inspect(&run_detail(ToolCallState::Uncertain), NOW);
-    assert!(printed.contains("?? shell"), "{printed}");
+    assert!(printed.contains("?? bash"), "{printed}");
     // §8.6：不能装成失败，也不能用重试成功盖掉。
     assert!(printed.contains("结果不明"), "{printed}");
     assert!(printed.contains("尝试 2 次"), "{printed}");

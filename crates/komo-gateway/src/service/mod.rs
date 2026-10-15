@@ -543,8 +543,8 @@ async fn build_tools(
     Option<Arc<komo_runtime::codemode::Sandbox>>,
 ) {
     use komo_runtime::tools::{
-        DelegateTool, DispatchTool, EditTool, FollowTool, MonitorStopTool, MonitorTool, ReadTool,
-        RgTool, ShellTool, UpdatePlanTool, WriteTool,
+        BashTool, DelegateTool, DispatchTool, EditTool, FollowTool, MonitorStopTool, MonitorTool,
+        ReadTool, RgTool, UpdatePlanTool, WriteTool,
     };
 
     let snapshot = config.current();
@@ -564,7 +564,7 @@ async fn build_tools(
         Arc::new(WriteTool::new().protecting(protected.clone())),
         Arc::new(EditTool::new().protecting(protected.clone())),
         Arc::new(
-            ShellTool::new()
+            BashTool::new()
                 .registered(registration.clone())
                 .protecting(protected),
         ),

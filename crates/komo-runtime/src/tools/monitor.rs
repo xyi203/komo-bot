@@ -57,7 +57,7 @@ impl Tool for MonitorTool {
                  ② 管道每一段都要逐行刷新（grep --line-buffered、awk 里 fflush()，别用 head）；\
                  ③ 失败状态也要打印（failed / canceled / Error / 进程崩溃），只打成功标志的话出事时\
                  什么也看不到；④ 盯有终点的事（流水线跑完）就让脚本到终态时自己退出；\
-                 ⑤ 轮询循环里 sleep 不要短于 15 秒。只要等一次结果的事用 shell 的轮询循环就够了，\
+                 ⑤ 轮询循环里 sleep 不要短于 15 秒。只要等一次结果的事用 bash 的轮询循环就够了，\
                  不用挂监听。timeout_minutes 省略 = 30，上限 {MAX_MONITOR_MINUTES}。\n\
                  Gateway 重启时监听会中断：脚本只读、重跑一遍没有副作用（轮询状态、查进度、\
                  tail 日志）就设 resume_after_restart = true，重启后按原短号自动重挂、剩余时限\

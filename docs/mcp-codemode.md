@@ -369,7 +369,7 @@ access = "read"                       # 操作者声明；只读才能进 codemo
 exposure = "hidden"
 
 [agents.assistant]
-tools = ["read", "write", "edit", "rg", "shell", "python", "codemode"]
+tools = ["read", "write", "edit", "rg", "bash", "python", "codemode"]
 mcp_servers = ["orders"]              # 缺省 []；不会因启用服务扩张全部 Agent
 ```
 

@@ -1615,7 +1615,7 @@ mod tests {
             .record_round(&accepted.run, round(1, vec![call("call-plan")]))
             .await
             .unwrap();
-        let mut plan = sample_plan("shell", &f.session);
+        let mut plan = sample_plan("bash", &f.session);
         plan.args = serde_json::json!({"command": "x".repeat(INLINE_ARGUMENT_LIMIT_BYTES)});
         f.coordinator.plan_call(&calls[0], &plan).await.unwrap();
 
@@ -1811,7 +1811,7 @@ mod tests {
             .record_round(&accepted.run, round(1, vec![call("full-body")]))
             .await
             .unwrap();
-        let plan = sample_plan("shell", &f.session);
+        let plan = sample_plan("bash", &f.session);
         f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
         let attempt = f.coordinator.start_call(&ids[0], &plan).await.unwrap();
         let full_text = "汉".repeat(30_000);
@@ -1860,7 +1860,7 @@ mod tests {
             .record_round(&accepted.run, round(1, vec![call("call-1")]))
             .await
             .unwrap();
-        let plan = sample_plan("shell", &f.session);
+        let plan = sample_plan("bash", &f.session);
         f.coordinator.plan_call(&ids[0], &plan).await.unwrap();
         let attempt = f.coordinator.start_call(&ids[0], &plan).await.unwrap();
 
@@ -1892,7 +1892,7 @@ mod tests {
             .record_round(&accepted.run, round(1, vec![call("call-1")]))
             .await
             .unwrap();
-        let plan = sample_plan("shell", &f.session);
+        let plan = sample_plan("bash", &f.session);
         let error = f.coordinator.start_call(&ids[0], &plan).await.unwrap_err();
         assert!(matches!(error, LedgerError::Conflict(_)), "{error}");
     }

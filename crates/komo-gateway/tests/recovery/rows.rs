@@ -33,7 +33,7 @@ fn write_then_done(path: &std::path::Path, content: &str) -> Arc<FakeLlm> {
 /// 「跑一条 shell，然后收尾」的两轮脚本。
 fn shell_then_done(command: &str) -> Arc<FakeLlm> {
     FakeLlm::new(vec![vec![
-        call_round(1, "pc-1", "shell", shell_args(command)),
+        call_round(1, "pc-1", "bash", shell_args(command)),
         text_round(2, "跑过了。"),
     ]])
 }
@@ -366,11 +366,11 @@ async fn row_5_a_started_call_is_not_assumed_either_way() {
 /// 这一行的分界在 `ToolOutputStore::publish` 上：外部副作用已经发生，**输出还没落盘**。
 /// 落盘之后再中断是第 8 行（那时盘上有一份身份齐全的 `output.json`，补记结果才是对的）。
 ///
-/// 注入两步：① `finish_call` 之前跳闸——`shell` 真的跑完，计数文件多了一行；② 停机之后
+/// 注入两步：① `finish_call` 之前跳闸——`bash` 真的跑完，计数文件多了一行；② 停机之后
 /// 把这次尝试的输出目录整棵删掉，等价于 `publish` 从未发生（故障装饰器包的是 `Ledger`，
 /// 包不到 `ToolOutputStore`，所以这一刀走"直接篡改磁盘"那条注入路）。
 ///
-/// 于是恢复手上**一点证据都没有**：`shell` 的恢复方式是 `NoSafeRecovery`、`verify` 是
+/// 于是恢复手上**一点证据都没有**：`bash` 的恢复方式是 `NoSafeRecovery`、`verify` 是
 /// `Unavailable`。执行器不再跑一遍命令，也不停下来等人：那条 started 配一条 uncertain，
 /// 作为这次调用的结果交给模型——它看得见目标，由它核对之后决定要不要重做（§8.6）。
 #[tokio::test]
@@ -1098,7 +1098,7 @@ async fn row_14_a_surviving_child_blocks_recovery_and_resume_never_doubles_the_c
     assert_eq!(
         counter.count(),
         0,
-        "`shell` 没有可靠恢复方式：started 而无结果按结果不明交给模型，不重跑——更不能跑两次"
+        "`bash` 没有可靠恢复方式：started 而无结果按结果不明交给模型，不重跑——更不能跑两次"
     );
     let events = home.events(&session);
     assert_eq!(
@@ -1160,7 +1160,7 @@ async fn row_15_a_cancelled_run_never_revives_and_an_exhausted_budget_ends() {
     let gw = home
         .start(FakeLlm::new(vec![vec![
             call_round(1, "pc-gate", "gate", serde_json::json!({})),
-            call_round(2, "pc-1", "shell", shell_args(&counter.append_command())),
+            call_round(2, "pc-1", "bash", shell_args(&counter.append_command())),
             text_round(3, "跑过了。"),
         ]]))
         .await;

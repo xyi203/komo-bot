@@ -1,4 +1,4 @@
-//! `shell`：命令、工作目录、超时；返回退出码和输出。**管理进程组、完整落盘、支持
+//! `bash`：命令、工作目录、超时；返回退出码和输出。**管理进程组、完整落盘、支持
 //! 取消**（§4）。
 //!
 //! 取消不是"不再等它"：Tokio 不会因为 handle 被丢掉就结束进程，而 `Child::kill` 只
@@ -38,7 +38,7 @@ pub const DEFAULT_OUTPUT_LIMIT: u64 = u64::MAX;
 const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ", "USER", "TMPDIR"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShellArgs {
+pub struct BashArgs {
     pub command: String,
     /// 工作目录；相对路径按上下文的 cwd 解析。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -48,7 +48,7 @@ pub struct ShellArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ShellResult {
+pub struct BashResult {
     pub command: String,
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,14 +67,14 @@ pub struct ShellResult {
 
 /// 一条 shell 命令的执行计划**形状**：工具名、操作、命令正文的版本快照、恢复方式。
 ///
-/// **唯一的构造处**：[`ShellTool::prepare`] 与 `then_run`（经 [`plan_for_call`]）都调它
+/// **唯一的构造处**：[`BashTool::prepare`] 与 `then_run`（经 [`plan_for_call`]）都调它
 /// ——手写第二份迟早会在几处之间长出一条缝（§10）。`run` / `tool_call` 不在这里填：那两个
 /// 字段来自一次具体的调用。
 pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPlan {
     ExecutionPlan {
         operation_id: OperationId::new_at(plan_time()),
         source,
-        tool: "shell".into(),
+        tool: "bash".into(),
         operation: Operation::ShellCommand {
             command: command.to_string(),
         },
@@ -97,9 +97,9 @@ pub fn plan_for(source: PlanSource, cwd: PathBuf, command: &str) -> ExecutionPla
 
 /// 一次具体调用的 shell 计划：[`plan_for`] 加上这次调用的 Run / ToolCall 与完整参数。
 ///
-/// `shell` 自己的 `prepare` 与 `edit` / `write` 的 `then_run`（[`super::fusion`]）共用它：
-/// 第二步就是一条普通的 shell 计划，账本里与单独一次 `shell` 同一个形状。
-pub fn plan_for_call(args: &ShellArgs, ctx: &ToolContext) -> Result<ExecutionPlan, ToolError> {
+/// `bash` 自己的 `prepare` 与 `edit` / `write` 的 `then_run`（[`super::fusion`]）共用它：
+/// 第二步就是一条普通的 shell 计划，账本里与单独一次 `bash` 同一个形状。
+pub fn plan_for_call(args: &BashArgs, ctx: &ToolContext) -> Result<ExecutionPlan, ToolError> {
     if args.command.trim().is_empty() {
         return Err(ToolError::InvalidArguments {
             message: "command 不能是空串".into(),
@@ -117,7 +117,7 @@ pub fn plan_for_call(args: &ShellArgs, ctx: &ToolContext) -> Result<ExecutionPla
     Ok(plan)
 }
 
-pub struct ShellTool {
+pub struct BashTool {
     default_timeout: Duration,
     output_limit: u64,
     shell: String,
@@ -127,7 +127,7 @@ pub struct ShellTool {
     sandbox: Option<Sandbox>,
 }
 
-/// 用 bwrap 把 komo 自己的状态只读挂上再跑命令（§7 的硬限制延伸到 `shell`）。
+/// 用 bwrap 把 komo 自己的状态只读挂上再跑命令（§7 的硬限制延伸到 `bash`）。
 ///
 /// 只防手滑，不防恶意：整棵树照旧可写（`--dev-bind / /`），只是名单里的路径换成只读挂载；
 /// 名单里还不存在的文件（比如重启前的 `state.db-wal`）挂不上，把数据目录整个改名也拦不住。
@@ -190,9 +190,9 @@ fn default_shell() -> String {
         .into()
 }
 
-impl std::fmt::Debug for ShellTool {
+impl std::fmt::Debug for BashTool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ShellTool")
+        f.debug_struct("BashTool")
             .field("shell", &self.shell)
             .field("default_timeout", &self.default_timeout)
             .field("sandbox", &self.sandbox)
@@ -200,13 +200,13 @@ impl std::fmt::Debug for ShellTool {
     }
 }
 
-impl Default for ShellTool {
+impl Default for BashTool {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ShellTool {
+impl BashTool {
     pub fn new() -> Self {
         Self {
             default_timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -235,7 +235,7 @@ impl ShellTool {
         self
     }
 
-    /// 按 `shell` 自己的规矩（bash、数据目录只读挂载）起一条命令要的 [`ChildSpec`]。
+    /// 按 `bash` 自己的规矩（bash、数据目录只读挂载）起一条命令要的 [`ChildSpec`]。
     ///
     /// 不登记在册、不限输出：给 `monitor` 用（`docs/monitor.md`），它的进程不属于任何
     /// 一次调用，在册与收尾由它自己管。
@@ -266,12 +266,12 @@ impl ShellTool {
 }
 
 #[async_trait]
-impl Tool for ShellTool {
+impl Tool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "shell".into(),
+            name: "bash".into(),
             description:
-                "在自己的进程组里跑一条 shell 命令，返回退出码与输出。git、构建、测试、跑程序走它；\
+                "在自己的进程组里跑一条 bash 命令，返回退出码与输出。git、构建、测试、跑程序走它；\
                  只是看文件、搜代码、列文件用 read / rg（列文件设 list_files=true），\
                  要读要搜好几处用 codemode。\
                  等一件慢事（下载、构建、部署）就在一条命令里循环轮询、每轮打印一行进度，并把 \
@@ -297,7 +297,7 @@ impl Tool for ShellTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
-        let args: ShellArgs = parse_args(args, "shell")?;
+        let args: BashArgs = parse_args(args, "bash")?;
         plan_for_call(&args, ctx)
     }
 
@@ -308,7 +308,7 @@ impl Tool for ShellTool {
         sink: &mut dyn OutputWriter,
     ) -> Result<ToolOutput, ToolError> {
         let plan = &plan;
-        let args: ShellArgs = parse_args(plan.args.clone(), "shell")?;
+        let args: BashArgs = parse_args(plan.args.clone(), "bash")?;
         let cwd: PathBuf = plan.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
         let timeout = args
             .timeout_secs
@@ -328,7 +328,7 @@ impl Tool for ShellTool {
             timeout,
             output_limit: self.output_limit,
             register: self.register.clone(),
-            label: format!("shell · run {} · call {}", ctx.run, ctx.call),
+            label: format!("bash · run {} · call {}", ctx.run, ctx.call),
         };
 
         let outcome = run_child(spec, sink, &ctx.cancel)
@@ -349,7 +349,7 @@ impl Tool for ShellTool {
         // 超时**不是一句光秃秃的"超时"**：到点前打印的输出照样交回（与 `rg` 同一条，§4）。
         // 轮询循环跑满时限时，模型要看得到最后一次查到的进度，才知道接着等还是换个做法；
         // 只给一句"超时：600s"，它只能把同一个循环从头再跑一遍。状态是失败——命令没跑完。
-        let result = ShellResult {
+        let result = BashResult {
             command: args.command,
             cwd: cwd.display().to_string(),
             exit_code: outcome.exit_code,
@@ -440,13 +440,13 @@ mod tests {
     #[test]
     fn shell_description_routes_file_listing_to_rg() {
         use komo_kernel::traits::Tool;
-        let description = ShellTool::new().definition().description;
+        let description = BashTool::new().definition().description;
         assert!(description.contains("列文件用 read / rg"), "{description}");
         assert!(description.contains("list_files=true"), "{description}");
     }
 
-    fn shell_result(output: &ToolOutput) -> ShellResult {
-        serde_json::from_value(output.result.clone()).expect("shell 的结果")
+    fn shell_result(output: &ToolOutput) -> BashResult {
+        serde_json::from_value(output.result.clone()).expect("bash 的结果")
     }
 
     #[tokio::test]
@@ -457,7 +457,7 @@ mod tests {
         for name in ["state.db", "state.db-log", "sessions/events.jsonl"] {
             std::fs::write(home.join(name), "keep").unwrap();
         }
-        let tool = ShellTool::new().protecting(vec![home.join("sessions"), home.join("state.db")]);
+        let tool = BashTool::new().protecting(vec![home.join("sessions"), home.join("state.db")]);
         if tool.sandbox.is_none() {
             eprintln!("这台机器上 bwrap 用不了，跳过");
             return;
@@ -490,7 +490,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let mut sink = writer(&ctx);
         let plan = tool
             .prepare(
@@ -507,7 +507,7 @@ mod tests {
     async fn it_returns_the_exit_code_and_the_output() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let mut sink = writer(&ctx);
         let plan = tool
             .prepare(serde_json::json!({ "command": "echo hi" }), &ctx)
@@ -532,7 +532,7 @@ mod tests {
     async fn default_shell_output_is_not_cut_before_it_reaches_the_store() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let mut sink = writer(&ctx);
         let bytes = 8 * 1024 * 1024 + 1;
         let plan = tool
@@ -556,7 +556,7 @@ mod tests {
     async fn a_non_zero_exit_is_a_result_the_model_can_read_not_a_tool_failure() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let mut sink = writer(&ctx);
         let plan = tool
             .prepare(serde_json::json!({ "command": "exit 3" }), &ctx)
@@ -572,7 +572,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("sub")).unwrap();
         let ctx = context(dir.path());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let mut sink = writer(&ctx);
         let plan = tool
             .prepare(serde_json::json!({ "command": "pwd", "cwd": "sub" }), &ctx)
@@ -592,7 +592,7 @@ mod tests {
         unsafe { std::env::set_var("KOMO_TEST_SECRET", "must-not-leak") };
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let mut sink = writer(&ctx);
         let plan = tool
             .prepare(
@@ -611,7 +611,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cancel = CancelToken::new();
         let ctx = context_with_cancel(dir.path(), cancel.clone());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let mut sink = writer(&ctx);
         let pid_file = dir.path().join("pgid");
         let plan = tool
@@ -655,7 +655,7 @@ mod tests {
     async fn a_timeout_hands_back_what_was_printed_before_it() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let mut sink = writer(&ctx);
         let plan = tool
             .prepare(
@@ -685,7 +685,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut ctx = context(dir.path());
         ctx.call_timeout = Duration::from_secs(1);
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let mut sink = writer(&ctx);
         let plan = tool
             .prepare(
@@ -706,7 +706,7 @@ mod tests {
     async fn an_empty_command_is_refused_at_prepare_time() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let error = tool
             .prepare(serde_json::json!({ "command": "   " }), &ctx)
             .await
@@ -721,7 +721,7 @@ mod tests {
     async fn an_arbitrary_command_is_never_replayed_after_a_restart() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = context(dir.path());
-        let tool = ShellTool::new();
+        let tool = BashTool::new();
         let plan = tool
             .prepare(serde_json::json!({ "command": "deploy.sh" }), &ctx)
             .await

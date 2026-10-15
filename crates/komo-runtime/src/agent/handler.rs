@@ -906,14 +906,14 @@ mod tests {
     async fn recomposing_does_not_refill_the_round_budget() {
         let harness = Harness::new();
         let executor = harness.executor(vec![Arc::new(
-            crate::executor::harness::RecordingTool::shell(),
+            crate::executor::harness::RecordingTool::bash(),
         )]);
         let mut scripts = Vec::new();
         for n in 0..3 {
             scripts.push(vec![round(
                 1,
                 None,
-                vec![call(&format!("pc-{n}"), "shell", serde_json::json!({}))],
+                vec![call(&format!("pc-{n}"), "bash", serde_json::json!({}))],
             )]);
             scripts.push(vec![round(1, Some("摘要"), vec![])]);
         }

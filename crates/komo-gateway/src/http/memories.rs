@@ -85,7 +85,7 @@ pub async fn show(State(api): State<Api>, Path(id): Path<String>) -> ApiResult<J
 /// `POST /v1/memories/{id}/confirm`：操作者确认指定 revision。
 ///
 /// **这条路是"受信任的操作者交互"那一侧**（§9.6）：`require_loopback` 与 bearer 在
-/// 路由层已经判过，Agent 通过 shell 调管理命令走不到这里——它没有令牌。
+/// 路由层已经判过，Agent 通过 bash 调管理命令走不到这里——它没有令牌。
 pub async fn confirm(
     State(api): State<Api>,
     Path(id): Path<String>,

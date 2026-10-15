@@ -25,11 +25,11 @@ fn rules(tools: &[String]) -> String {
     let has = |name: &str| tools.iter().any(|tool| tool == name);
     let mut lines = Vec::new();
     if has(RG_TOOL) {
-        lines.push("- 找代码、文字和列文件用 rg（列文件设 list_files=true），别用 shell 拼 rg / grep / find / ls。");
+        lines.push("- 找代码、文字和列文件用 rg（列文件设 list_files=true），别用 bash 拼 rg / grep / find / ls。");
     }
     // 2026-10 的统计：364 次 shell 里 126 次是 cat / head / ls 这类纯只读命令。
-    if has(READ_TOOL) && has(SHELL_TOOL) {
-        lines.push("- 看文件用 read，别用 shell 跑 cat / head / tail / sed。");
+    if has(READ_TOOL) && has(BASH_TOOL) {
+        lines.push("- 看文件用 read，别用 bash 跑 cat / head / tail / sed。");
     }
     // 同一份统计：codemode 挂上了也几乎没人用，模型一轮一轮地 read → rg → read。
     if has(CODEMODE_TOOL) {
@@ -73,7 +73,7 @@ pub(crate) fn build(
     }
     match invocation {
         InvocationContext::Main => {
-            let has_shell = tools.iter().any(|tool| tool == SHELL_TOOL);
+            let has_shell = tools.iter().any(|tool| tool == BASH_TOOL);
             main_prompt(workspace, &rules, project_files, skills, has_shell)
         }
         InvocationContext::Delegated(spec) => subagent_prompt(workspace, &rules, spec),
@@ -182,7 +182,7 @@ fn main_prompt(
 }
 
 /// 能跑 komo CLI 的那个工具；没挂它时 [`SELF_BLOCK`] 不出现——说了也跑不了。
-const SHELL_TOOL: &str = "shell";
+const BASH_TOOL: &str = "bash";
 
 /// 「你就跑在 komo 里」：komo 自己的状态用 komo CLI 查（2026-09-24 的实际会话：问
 /// "有哪些 cron job"，模型先读了同名的共享 skill、再翻系统 crontab / launchctl，第 8 轮才
@@ -190,7 +190,7 @@ const SHELL_TOOL: &str = "shell";
 ///
 /// 学 pi 的 docs 段：只给入口（`komo --help`）和一个例子，子命令清单不抄进提示。
 const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、\
-                          Gateway）用 shell 跑 `komo <子命令>` 查，例如 `komo cron list`，\
+                          Gateway）用 bash 跑 `komo <子命令>` 查，例如 `komo cron list`，\
                           其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。";
 
 /// 项目规范（`AGENTS.md` / `CLAUDE.md`）那一块：开头一句说清顺序与冲突怎么办，每份文件

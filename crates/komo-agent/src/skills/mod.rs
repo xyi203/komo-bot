@@ -64,7 +64,7 @@ impl Reader {
     fn pick(tools: &BTreeSet<String>) -> Option<Self> {
         if tools.contains("read") {
             Some(Reader::Read)
-        } else if tools.contains("shell") {
+        } else if tools.contains("bash") {
             Some(Reader::Shell)
         } else {
             None
@@ -74,9 +74,7 @@ impl Reader {
     fn header(self) -> &'static str {
         match self {
             Reader::Read => "Skills（用到时按根的顺序 read <根>/<名字>/SKILL.md 再照做）：\n",
-            Reader::Shell => {
-                "Skills（用到时按根的顺序用 shell 读 <根>/<名字>/SKILL.md 再照做）：\n"
-            }
+            Reader::Shell => "Skills（用到时按根的顺序用 bash 读 <根>/<名字>/SKILL.md 再照做）：\n",
         }
     }
 }

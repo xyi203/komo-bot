@@ -282,7 +282,7 @@ pub struct SubmitRunRequest {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
-    /// `text` 是一条 shell 命令，**不经模型直接跑**（TUI 的 `!`）。命令照样走 `shell`
+    /// `text` 是一条 shell 命令，**不经模型直接跑**（TUI 的 `!`）。命令照样走 `bash`
     /// 工具与执行器，调用与结果记进会话，下一轮模型看得见。只有 HTTP 这一个入口——聊天
     /// 渠道没有，拿到 bot 对话权限不等于拿到这台机器的 shell。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -172,6 +172,7 @@ pub(super) struct CompactionSection {
     pub cache_write_read_ratio: Option<f64>,
     pub keep_recent_tokens: Option<u64>,
     pub window_reserve_tokens: Option<u64>,
+    pub max_context_tokens: Option<u64>,
     pub first_compaction_scale: Option<f64>,
     pub subsequent_margin: Option<f64>,
     pub cooldown_requests: Option<u64>,
@@ -190,6 +191,7 @@ impl CompactionSection {
             window_reserve_tokens: self
                 .window_reserve_tokens
                 .unwrap_or(base.window_reserve_tokens),
+            max_context_tokens: self.max_context_tokens.unwrap_or(base.max_context_tokens),
             first_compaction_scale: self
                 .first_compaction_scale
                 .unwrap_or(base.first_compaction_scale),

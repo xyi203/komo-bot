@@ -270,7 +270,8 @@ impl Tool for BashTool {
         ToolDefinition {
             name: "bash".into(),
             description:
-                "在自己的进程组里跑一条 bash 命令，返回退出码与输出。git、构建、测试、跑程序走它；\
+                "在自己的进程组里跑一条 bash 命令，返回退出码与输出。默认就在会话工作目录里跑，\
+                 不用先 cd 过去；要换目录给 cwd。git、构建、测试、跑程序走它；\
                  只是看文件、搜代码、列文件用 read / rg（列文件设 list_files=true），\
                  要读要搜好几处用 codemode。\
                  等一件慢事（下载、构建、部署）就在一条命令里循环轮询、每轮打印一行进度，并把 \

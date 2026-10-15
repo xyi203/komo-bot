@@ -60,7 +60,7 @@ fn the_system_prompt_carries_the_skills_catalog_after_the_base_text() {
         None,
     );
     assert!(!bare.contains("Skills"), "{bare}");
-    assert_eq!(bare.lines().count(), 4, "{bare}");
+    assert_eq!(bare.lines().count(), 5, "{bare}");
 }
 
 /// 「搜代码、列文件用 rg，别用 bash 拼 rg / grep / find / ls」是**两条提示共用**的一句
@@ -277,6 +277,54 @@ fn the_read_over_cat_rule_needs_both_read_and_shell() {
         );
         assert!(!prompt.contains("看文件用 read"), "{prompt}");
     }
+}
+
+/// "互不依赖的调用同一轮一起发"跟着 read / rg 走：能同时跑的只有它们。
+#[test]
+fn the_parallel_calls_rule_needs_read_or_rg() {
+    for tools in [vec!["read".to_string()], vec!["rg".to_string()]] {
+        let prompt = build(
+            Path::new("/tmp/w"),
+            &tools,
+            &[],
+            &InvocationContext::Main,
+            &[],
+            None,
+        );
+        assert!(prompt.contains("放在同一轮一起发"), "{prompt}");
+    }
+    let without = build(
+        Path::new("/tmp/w"),
+        &["bash".to_string()],
+        &[],
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
+    assert!(!without.contains("放在同一轮一起发"), "{without}");
+}
+
+/// "同一个文件改好几处就连发几个 edit"只在挂了 `edit` 时出现。
+#[test]
+fn the_consecutive_edits_rule_needs_edit() {
+    let with = build(
+        Path::new("/tmp/w"),
+        &["edit".to_string()],
+        &[],
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
+    assert!(with.contains("连发几个 edit"), "{with}");
+    let without = build(
+        Path::new("/tmp/w"),
+        &["read".to_string(), "write".to_string()],
+        &[],
+        &InvocationContext::Main,
+        &[],
+        None,
+    );
+    assert!(!without.contains("连发几个 edit"), "{without}");
 }
 
 fn project_file(path: &str, content: &str) -> ProjectFile {

@@ -73,28 +73,6 @@ use komo_kernel::types::turn::{AcceptInput, Accepted, ToolResultForModel};
 
 use self::cancel::race;
 
-/// 执行器自己的预算（§6）。
-///
-/// **交给模型的正文上限与活动执行时限不在这里**：它们跟着每一次执行走
-/// （[`CallEnv::projection`]、[`CallEnv::call_timeout`]），因为配置是热生效的（§3）
-/// ——写在这里就等于把它们钉在装配那一刻。
-#[derive(Debug, Clone)]
-pub struct ExecutionLimits {
-    /// 同一轮里最多几条**只读**调用同时在飞（§6）。
-    ///
-    /// 它是并发度上限，不是正确性开关：写、编排调用、取消照样是屏障，唯一放开的是"两条读取
-    /// 之间不必互相等"。1 = 退回一条一条跑。
-    pub max_parallel_reads: usize,
-}
-
-impl Default for ExecutionLimits {
-    fn default() -> Self {
-        Self {
-            max_parallel_reads: 4,
-        }
-    }
-}
-
 /// 一轮里的一个调用。
 #[derive(Debug, Clone)]
 pub struct CallRequest {
@@ -246,7 +224,6 @@ pub struct ToolExecutor {
     ledger: Arc<dyn Ledger>,
     outputs: Arc<dyn ToolOutputStore>,
     clock: Arc<dyn Clock>,
-    limits: ExecutionLimits,
     /// `dispatch` / `follow` 的接缝（`docs/background-tasks.md`）。它是
     /// [`std::sync::OnceLock`] 而不是构造时就给的字段，理由与 `GatewayState::inbound`
     /// 一样：Gateway 那份实现自己需要一份 `Arc<GatewayState>`（建会话、`submit`），而
@@ -266,7 +243,6 @@ impl std::fmt::Debug for ToolExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolExecutor")
             .field("tools", &self.tools.keys().collect::<Vec<_>>())
-            .field("limits", &self.limits)
             .finish_non_exhaustive()
     }
 }
@@ -286,7 +262,6 @@ impl ToolExecutor {
             ledger,
             outputs,
             clock,
-            limits: ExecutionLimits::default(),
             spawner: std::sync::OnceLock::new(),
             monitors: std::sync::OnceLock::new(),
             codemode: None,
@@ -295,11 +270,6 @@ impl ToolExecutor {
 
     pub fn with_codemode(mut self, worker: Option<crate::codemode::Worker>) -> Self {
         self.codemode = worker;
-        self
-    }
-
-    pub fn with_limits(mut self, limits: ExecutionLimits) -> Self {
-        self.limits = limits;
         self
     }
 
@@ -480,17 +450,11 @@ impl ToolExecutor {
 
             let begin = self.begin(&request, env).await?;
 
-            // 够格的那一类：放进在飞集合，接着看下一条。名额满了先把在飞的收完——收完
-            // 名额就空出来了，于是长批一直满额在跑，而不是退化成一问一答。
+            // 够格的那一类：放进在飞集合，接着看下一条。同一轮的读全部同时在飞，不设上限
+            //（照 pi 与 Claude Code：一轮里有几条就并发几条）。
             if let Begin::Ready(ready) = &begin
                 && ready.parallel_with_siblings()
             {
-                if in_flight.len() >= self.limits.max_parallel_reads
-                    && let Some(stop) = drain(&mut in_flight, &mut settled).await?
-                {
-                    queue.push_front((index, request));
-                    return Ok(finish(Some(stop), queue, settled, boundary));
-                }
                 let Begin::Ready(ready) = begin else {
                     unreachable!("上面刚判过它是 Ready")
                 };

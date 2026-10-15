@@ -31,11 +31,29 @@ fn rules(tools: &[String]) -> String {
     if has(READ_TOOL) && has(BASH_TOOL) {
         lines.push("- 看文件用 read，别用 bash 跑 cat / head / tail / sed。");
     }
-    // 同一份统计：codemode 挂上了也几乎没人用，模型一轮一轮地 read → rg → read。
+    // 2026-10-15 的统计：Opus 88% 的回合只发一个调用，执行器早就能让同一轮的读同时跑。
+    // 照 Claude Code：互不依赖的调用同一轮一起发。
+    if has(READ_TOOL) || has(RG_TOOL) {
+        lines.push(
+            "- 互不依赖的调用（读几个文件、搜几个词）放在同一轮一起发，读和搜会同时执行；\
+             只有后一个要用前一个的结果时才分轮。",
+        );
+    }
+    // 2026-10-09 的统计：codemode 挂上了也几乎没人用，模型一轮一轮地 read → rg → read。
+    // 多处读改由并行调用承担，codemode 留给要在脚本里筛、拼输出的情形。
     if has(CODEMODE_TOOL) {
         lines.push(
-            "- 只读一处就直接调；要读两处以上、搜好几个词、或只想从大段输出里挑几行时，\
-             用 codemode 写一段脚本一次做完，别一轮一轮地读和搜。",
+            "- 只想从大段输出里挑几行、或要把好几处的结果合起来处理时，\
+             用 codemode 写一段脚本一次做完。",
+        );
+    }
+    // 2026-10-15 的统计：edit 一次只改一处，约四分之一的改动被模型改用 bash 跑 python
+    // 批量替换，绕过了版本核对。同一轮里的 edit 按顺序执行、各自读最新内容（executor 的
+    // 屏障），所以照 Claude Code 连发即可。
+    if has(EDIT_TOOL) {
+        lines.push(
+            "- 同一个文件要改好几处，就在同一轮里连发几个 edit：它们按顺序执行，\
+             后一个基于前一个改完的内容；别用 bash 跑脚本替换。",
         );
     }
     // 2026-10-13 的统计：长任务里约 25～30 次调用报一次计划，有用；十几次调用的短任务
@@ -55,6 +73,7 @@ fn rules(tools: &[String]) -> String {
 const RG_TOOL: &str = "rg";
 const READ_TOOL: &str = "read";
 const CODEMODE_TOOL: &str = "codemode";
+const EDIT_TOOL: &str = "edit";
 
 /// 装配系统提示正文：身份 / 工作目录 / 行为约束，主 Agent 再加「komo 自己的状态怎么查」、
 /// 项目规范与 §5.6 的 skills 目录，子代理再加任务与结果契约。
@@ -189,9 +208,15 @@ const BASH_TOOL: &str = "bash";
 /// 想到 `komo cron list`）。`komo` 靠 PATH 找到：服务单元写入了安装时的 PATH（§3）。
 ///
 /// 学 pi 的 docs 段：只给入口（`komo --help`）和一个例子，子命令清单不抄进提示。
+///
+/// 末句（2026-10-15）：会话里 6 次在 Run 里重启 Gateway，8 个调用因此记成 uncertain，
+/// 最长的一条两个多小时后才收尾。
 const SELF_BLOCK: &str = "komo 自己的状态（cron、会话 / Run、记忆、介入、配置、skills、\
                           Gateway）用 bash 跑 `komo <子命令>` 查，例如 `komo cron list`，\
-                          其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。";
+                          其余看 `komo --help`；别去翻系统 crontab、launchctl 或同名 skill。\
+                          你自己就跑在 Gateway 里：`komo gateway restart|stop` 和会重启 \
+                          Gateway 的安装脚本会打断你正在做的这件事，要跑就放在最后一步，\
+                          或者交给用户自己跑。";
 
 /// 项目规范（`AGENTS.md` / `CLAUDE.md`）那一块：开头一句说清顺序与冲突怎么办，每份文件
 /// 原样包在 `<project_instructions path="…">` 里（标签照 pi，`system-prompt.ts`）。

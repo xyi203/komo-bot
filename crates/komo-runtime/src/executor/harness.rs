@@ -21,7 +21,7 @@ use komo_kernel::types::tool::{
 };
 use komo_kernel::types::turn::{AcceptInput, AssistantRound, ToolCallRequest};
 
-use crate::executor::{CallEnv, CallRequest, ExecutionLimits, ToolExecutor};
+use crate::executor::{CallEnv, CallRequest, ToolExecutor};
 
 pub struct Harness {
     pub clock: TestClock,
@@ -82,7 +82,6 @@ impl Harness {
             self.outputs.clone(),
             Arc::new(self.clock.clone()),
         )
-        .with_limits(ExecutionLimits::default())
     }
 
     /// 开一个 Run，走真实的 `accept_input`。

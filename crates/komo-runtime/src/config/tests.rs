@@ -425,6 +425,7 @@ fn compaction_is_off_by_default_and_its_keys_map_onto_the_economics() {
     assert_eq!(compaction.cache_write_read_ratio, 12.5);
     assert_eq!(compaction.keep_recent_tokens, 20_000);
     assert_eq!(compaction.memo_token_estimate, 1_000);
+    assert_eq!(compaction.max_context_tokens, 150_000);
     assert_eq!(
         compaction.economics(),
         komo_kernel::compaction::CompactionEconomics::default()
@@ -433,7 +434,8 @@ fn compaction_is_off_by_default_and_its_keys_map_onto_the_economics() {
     let mut text = Fixture::config_text("chat-a", "medium");
     text.push_str(
         "\n[compaction]\nenabled = true\nwindow_reserve_tokens = 8000\n\
-         first_compaction_scale = 3.0\nsubsequent_margin = 2.0\ncooldown_requests = 4\n",
+         first_compaction_scale = 3.0\nsubsequent_margin = 2.0\ncooldown_requests = 4\n\
+         max_context_tokens = 200000\n",
     );
     write(&fixture.sources().config, &text);
     let loaded = load_config(&fixture.options()).unwrap();
@@ -443,6 +445,8 @@ fn compaction_is_off_by_default_and_its_keys_map_onto_the_economics() {
     assert_eq!(economics.first_compaction_request_scale, 3.0);
     assert_eq!(economics.subsequent_compaction_margin, 2.0);
     assert_eq!(economics.minimum_requests_since_compaction, 4);
+    assert_eq!(loaded.snapshot.compaction.max_context_tokens, 200_000);
+    assert_eq!(loaded.snapshot.compaction.window(Some(1_000_000)), 208_000);
 }
 
 #[test]
@@ -451,7 +455,7 @@ fn nonsensical_compaction_numbers_refuse_the_load() {
     let mut text = Fixture::config_text("chat-a", "medium");
     text.push_str(
         "\n[compaction]\ncache_write_read_ratio = -1.0\nsubsequent_margin = 0.0\n\
-         keep_recent_tokens = 0\n",
+         keep_recent_tokens = 0\nmax_context_tokens = 0\n",
     );
     write(&fixture.sources().config, &text);
 
@@ -462,6 +466,7 @@ fn nonsensical_compaction_numbers_refuse_the_load() {
         vec![
             "compaction.cache_write_read_ratio",
             "compaction.keep_recent_tokens",
+            "compaction.max_context_tokens",
             "compaction.subsequent_margin",
         ]
     );

@@ -239,6 +239,7 @@ fn settings(ratio: f64) -> CompactionSettings {
         cache_write_read_ratio: Some(ratio),
         keep_recent_tokens: 1,
         memo_tokens: 10,
+        max_context_tokens: u64::MAX,
     }
 }
 
@@ -340,6 +341,21 @@ fn off_a_boundary_only_the_window_compacts() {
         panic!("贴着窗口要压");
     };
     assert_eq!(job.decision.reason, CompactionReason::WindowProtection);
+}
+
+/// 模型窗口很大（或不知道）时，`max_context_tokens` 就是贴窗口的线：不在边界上也压。
+#[test]
+fn the_context_cap_compacts_off_a_boundary_even_with_a_huge_window() {
+    let capped = CompactionSettings {
+        max_context_tokens: price(&context(), &tools()).write_tokens,
+        ..settings(1e9)
+    };
+    for window in [None, Some(1_000_000)] {
+        let Plan::Compact(job) = decide_with(&online(false), &capped, window) else {
+            panic!("到了上限要压（窗口 {window:?}）");
+        };
+        assert_eq!(job.decision.reason, CompactionReason::WindowProtection);
+    }
 }
 
 #[test]

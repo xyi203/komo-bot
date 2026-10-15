@@ -470,6 +470,10 @@ pub struct CompactionConfig {
     /// 离窗口还剩这么多 token 时不看账，直接压。
     #[serde(default = "default_window_reserve_tokens")]
     pub window_reserve_tokens: u64,
+    /// 上下文到这么多 token 就按"贴着窗口"处理，不等计划边界（与模型的 `context_window`
+    /// 取先到的那个）。1M 窗口的模型要到 98 万才贴窗口，而模型常常几十轮不报计划进度。
+    #[serde(default = "default_max_context_tokens")]
+    pub max_context_tokens: u64,
     /// 第一次压缩时把剩余请求估计放大的倍数。
     #[serde(default = "default_first_compaction_scale")]
     pub first_compaction_scale: f64,
@@ -495,6 +499,15 @@ impl CompactionConfig {
             ..CompactionEconomics::default()
         }
     }
+
+    /// 判"贴着窗口"用的窗口（[`crate::compaction::effective_window`]）。
+    pub fn window(&self, model_window: Option<u64>) -> u64 {
+        crate::compaction::effective_window(
+            model_window,
+            self.max_context_tokens,
+            self.window_reserve_tokens,
+        )
+    }
 }
 
 fn default_cache_write_read_ratio() -> f64 {
@@ -507,6 +520,11 @@ fn default_keep_recent_tokens() -> u64 {
 
 fn default_window_reserve_tokens() -> u64 {
     CompactionEconomics::default().window_reserve_tokens
+}
+
+/// 与 Anthropic API 服务端压缩的默认触发点相同。
+fn default_max_context_tokens() -> u64 {
+    150_000
 }
 
 fn default_first_compaction_scale() -> f64 {
@@ -532,6 +550,7 @@ impl Default for CompactionConfig {
             cache_write_read_ratio: default_cache_write_read_ratio(),
             keep_recent_tokens: default_keep_recent_tokens(),
             window_reserve_tokens: default_window_reserve_tokens(),
+            max_context_tokens: default_max_context_tokens(),
             first_compaction_scale: default_first_compaction_scale(),
             subsequent_margin: default_subsequent_margin(),
             cooldown_requests: default_cooldown_requests(),

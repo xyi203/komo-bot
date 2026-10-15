@@ -436,6 +436,12 @@ fn check_compaction(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             "keep_recent_tokens 至少是 1（近期的轮次总要原样留着）",
         ));
     }
+    if compaction.max_context_tokens <= compaction.keep_recent_tokens {
+        issues.push(error(
+            "compaction.max_context_tokens",
+            "max_context_tokens 要大于 keep_recent_tokens（否则压完还在上限上，一轮一次摘要）",
+        ));
+    }
 }
 
 /// `[mcp.servers.<name>]`（`docs/mcp.md`）：名字要进工具名（`mcp__<name>__<tool>`），只能是

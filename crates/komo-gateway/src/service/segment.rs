@@ -651,9 +651,11 @@ impl SegmentSource for GatewaySegments {
                 };
                 let compactor = komo_runtime::agent::Compactor {
                     planner: Arc::new(planner),
-                    pressure_tokens: model
-                        .context_window
-                        .map(|window| window.saturating_sub(config.window_reserve_tokens)),
+                    pressure_tokens: Some(
+                        config
+                            .window(model.context_window)
+                            .saturating_sub(config.window_reserve_tokens),
+                    ),
                     estimate: komo_agent::context::compaction::price(&context, &tools).write_tokens,
                     pending: !settled && online.pending_boundary,
                 };

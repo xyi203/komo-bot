@@ -10,8 +10,8 @@ use std::ops::Range;
 
 use komo_kernel::compaction::{
     CompactionDecision, CompactionEconomics, CompactionInput, CompactionJob, CompactionReason,
-    DecayJob, OnlineState, PlanStep, ProgressSummary, decide, estimate_tokens, find_cut,
-    format_snapshot,
+    DecayJob, OnlineState, PlanStep, ProgressSummary, decide, effective_window, estimate_tokens,
+    find_cut, format_snapshot,
 };
 use komo_kernel::protocol::config::CompactionConfig;
 use komo_kernel::types::ids::{RunId, Seq, SessionId};
@@ -229,6 +229,8 @@ pub struct CompactionSettings {
     pub cache_write_read_ratio: Option<f64>,
     pub keep_recent_tokens: u64,
     pub memo_tokens: u64,
+    /// `[compaction] max_context_tokens`：到了就按贴着窗口处理（[`effective_window`]）。
+    pub max_context_tokens: u64,
 }
 
 impl From<&CompactionConfig> for CompactionSettings {
@@ -238,6 +240,7 @@ impl From<&CompactionConfig> for CompactionSettings {
             cache_write_read_ratio: Some(config.cache_write_read_ratio),
             keep_recent_tokens: config.keep_recent_tokens,
             memo_tokens: config.memo_token_estimate,
+            max_context_tokens: config.max_context_tokens,
         }
     }
 }
@@ -306,10 +309,13 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
     let context_tokens = pricing
         .write_tokens
         .max(online.last_context_tokens.unwrap_or(0));
-    let threshold = model
-        .context_window
-        .map(|window| window.saturating_sub(settings.economics.window_reserve_tokens));
-    let pressure = threshold.is_some_and(|threshold| context_tokens >= threshold);
+    let window = effective_window(
+        model.context_window,
+        settings.max_context_tokens,
+        settings.economics.window_reserve_tokens,
+    );
+    let threshold = window.saturating_sub(settings.economics.window_reserve_tokens);
+    let pressure = context_tokens >= threshold;
     let boundary = online.pending_boundary;
     let decayable = !context.decay_candidates.is_empty();
     if !(boundary || pressure || (cache_cold && decayable)) {
@@ -330,7 +336,7 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
             ),
             remaining_boundaries: online.remaining_boundaries(),
             average_context_token_increment: online.average_context_token_increment(),
-            context_window_tokens: model.context_window,
+            context_window_tokens: Some(window),
             prior_compaction_count: online.compaction_count,
             requests_since_last_compaction: online.requests_since_last_compaction(),
             carried_debt_tokens: online.cache_debt_tokens,
@@ -414,8 +420,7 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
             return Plan::Nothing;
         }
         // 压完还贴着窗口：下一次请求又会触发，一轮一次摘要，什么都换不回来。
-        let futile = decision.compact
-            && threshold.is_some_and(|threshold| decision.post_compaction_tokens >= threshold);
+        let futile = decision.compact && decision.post_compaction_tokens >= threshold;
         match cut {
             Some(cut) if decision.compact && !futile => {
                 let task = context
@@ -442,8 +447,7 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
                     decision.compact = false;
                     format!(
                         "压完仍贴着窗口（{} ≥ {}）",
-                        decision.post_compaction_tokens,
-                        threshold.unwrap_or_default()
+                        decision.post_compaction_tokens, threshold
                     )
                 } else {
                     reason_name(decision.reason)

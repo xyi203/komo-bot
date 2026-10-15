@@ -22,7 +22,7 @@ pub mod state;
 pub use cut::{estimate_tokens, find_cut};
 pub use economics::{
     CompactionDebt, CompactionDecision, CompactionEconomics, CompactionInput, CompactionReason,
-    RequestHorizon, decide, estimate_remaining_requests,
+    RequestHorizon, decide, effective_window, estimate_remaining_requests,
 };
 pub use plan::{
     PlanError, PlanProgress, PlanStatus, PlanStep, PlanTransition, PlanUpdate, analyze_transition,

@@ -40,6 +40,14 @@ impl Default for CompactionEconomics {
     }
 }
 
+/// 判"贴着窗口"用的窗口：模型的窗口与 `max_context_tokens + window_reserve` 取小，所以
+/// 上下文到 `max_context_tokens`（或真窗口 − 预留，先到的那个）就算贴着窗口。不知道
+/// 模型窗口时只按上限算。
+pub fn effective_window(model_window: Option<u64>, max_context_tokens: u64, reserve: u64) -> u64 {
+    let cap = max_context_tokens.saturating_add(reserve);
+    model_window.map_or(cap, |window| window.min(cap))
+}
+
 /// 压或不压的理由。它会落进事件，所以是线格式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -359,6 +367,14 @@ mod tests {
             context_window_tokens: None,
             average_context_token_increment: None,
         })
+    }
+
+    #[test]
+    fn the_effective_window_is_the_smaller_of_the_model_window_and_the_cap() {
+        assert_eq!(effective_window(Some(1_000_000), 150_000, 16_384), 166_384);
+        assert_eq!(effective_window(Some(100_000), 150_000, 16_384), 100_000);
+        assert_eq!(effective_window(None, 150_000, 16_384), 166_384);
+        assert_eq!(effective_window(None, u64::MAX, 16_384), u64::MAX);
     }
 
     #[test]

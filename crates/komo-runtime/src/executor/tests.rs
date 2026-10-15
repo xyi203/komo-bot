@@ -100,6 +100,45 @@ async fn an_edit_runs_directly() {
     );
 }
 
+/// 同一轮里对同一个文件连发几个 edit：后一个在前一个改完之后才做计划、绑定版本，
+/// 不会因为前一个改过文件而版本冲突（系统提示让模型这样改多处）。
+#[tokio::test]
+async fn consecutive_edits_to_one_file_in_a_round_all_apply() {
+    let harness = Harness::new();
+    let executor = harness.executor(vec![Arc::new(crate::tools::EditTool::new())]);
+    let (session, run) = harness.open_run().await;
+    std::fs::write(harness.dir.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+
+    let calls = harness
+        .record_round(
+            &run,
+            &[
+                (
+                    "edit",
+                    serde_json::json!({ "path": "a.txt", "match_text": "alpha", "replace_text": "ALPHA" }),
+                ),
+                (
+                    "edit",
+                    serde_json::json!({ "path": "a.txt", "match_text": "ALPHA\nbeta", "replace_text": "ALPHA\nBETA" }),
+                ),
+            ],
+        )
+        .await;
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+
+    assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+    for result in &outcome.results {
+        assert!(!result.is_error, "{}", result.content);
+    }
+    assert_eq!(
+        std::fs::read_to_string(harness.dir.path().join("a.txt")).unwrap(),
+        "ALPHA\nBETA\n"
+    );
+}
+
 /// ⑥ 未知工具名无法调用——作为错误内容回给模型。
 #[tokio::test]
 async fn an_unknown_tool_name_cannot_be_called() {

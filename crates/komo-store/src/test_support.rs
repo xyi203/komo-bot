@@ -119,6 +119,7 @@ mod tests {
                     delegate: None,
                     snapshot: None,
                     skip_memory: false,
+                    interject: false,
                 })
                 .await
                 .unwrap();

@@ -387,6 +387,7 @@ async fn run_effect(
             model,
             effort,
             shell,
+            interject,
         } => {
             let reply_key = request_key.clone();
             let Some(session) = session else {
@@ -403,6 +404,7 @@ async fn run_effect(
                 model,
                 effort,
                 shell,
+                interject,
             };
             match client.submit_run(session, &request).await {
                 // HTTP 回执先更新本地 pending；`run.accepted` 回来后再由权威事件替换。

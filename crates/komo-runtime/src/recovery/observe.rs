@@ -48,9 +48,11 @@ pub fn log_tail(events: &[Event], run: &RunId) -> LogTail {
             EventPayload::RunCompleted(_)
             | EventPayload::RunFailed(_)
             | EventPayload::RunCancelled(_)
-            // 操作者放弃也是终态（§7.5、§8.4：四个终态各自算数）。漏掉它，一条已经
+            // 操作者放弃也是终态（§7.5、§8.4：五个终态各自算数）。漏掉它，一条已经
             // `abandoned` 的 Run 会被当成"还在跑"，于是被放回队列再跑一次。
-            | EventPayload::RunAbandoned(_) => return LogTail::Final,
+            | EventPayload::RunAbandoned(_)
+            // 插话被并走（§6）：它自己不会再开跑，回答在宿主那里。
+            | EventPayload::RunAbsorbed(_) => return LogTail::Final,
             _ => {}
         }
     }
@@ -205,6 +207,7 @@ mod tests {
             // 这个夹具是普通 Run 的受理事件：没有父、没有契约。
             delegate: None,
             snapshot: None,
+            interject: false,
         })
     }
 

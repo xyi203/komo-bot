@@ -231,6 +231,10 @@ pub struct AcceptInput {
     /// `MemoryWork::Done`，不进后台处理队列。
     #[serde(default)]
     pub skip_memory: bool,
+    /// 发送方要求插话（§6）：同 Session 有 Run 正在跑时，由它在下一次请求模型之前把这句话
+    /// 并进去，而不是排到它后面。只有 TUI 发（`SubmitRunRequest::interject`）。
+    #[serde(default)]
+    pub interject: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub at: OffsetDateTime,
 }
@@ -323,6 +327,7 @@ mod tests {
             snapshot: None,
             skip_memory: false,
             at: datetime!(2026-09-15 08:00:00 UTC),
+            interject: false,
         };
         let first = input.input_hash();
         input.at = datetime!(2026-09-16 08:00:00 UTC);

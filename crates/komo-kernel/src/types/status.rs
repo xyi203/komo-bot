@@ -59,6 +59,9 @@ pub enum RunState {
     /// 操作者在 Intervention 清单上放弃（§7.5 的 `abandon`）。与 `Cancelled` 分开记：
     /// 它不是"用户不想跑了"，而是"这件事不会再有下文了"，事后统计要分得开。
     Abandoned,
+    /// 插话（§6）：这条输入排着队的时候，同 Session 正在跑的那条 Run 在两轮之间把它并了
+    /// 进去（`run.absorbed`），回答它的是那条 Run。它自己不会再开跑。
+    Absorbed,
 }
 
 impl RunState {
@@ -66,7 +69,11 @@ impl RunState {
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
-            RunState::Completed | RunState::Failed | RunState::Cancelled | RunState::Abandoned
+            RunState::Completed
+                | RunState::Failed
+                | RunState::Cancelled
+                | RunState::Abandoned
+                | RunState::Absorbed
         )
     }
 
@@ -105,6 +112,7 @@ impl RunState {
             RunState::Failed => "failed",
             RunState::Cancelled => "cancelled",
             RunState::Abandoned => "abandoned",
+            RunState::Absorbed => "absorbed",
         }
     }
 
@@ -120,6 +128,7 @@ impl RunState {
             "failed" => Some(RunState::Failed),
             "cancelled" => Some(RunState::Cancelled),
             "abandoned" => Some(RunState::Abandoned),
+            "absorbed" => Some(RunState::Absorbed),
             _ => None,
         }
     }
@@ -410,9 +419,9 @@ mod tests {
     use crate::types::ids::ToolCallId;
     use time::macros::datetime;
 
-    /// 终态**恰好四个**，而且状态机里没有"停在外面却说不出在等什么"的那种状态。
+    /// 终态**恰好五个**，而且状态机里没有"停在外面却说不出在等什么"的那种状态。
     #[test]
-    fn exactly_four_run_states_are_terminal_and_only_one_waits() {
+    fn exactly_five_run_states_are_terminal_and_only_one_waits() {
         let all = [
             RunState::Accepted,
             RunState::Queued,
@@ -422,6 +431,7 @@ mod tests {
             RunState::Failed,
             RunState::Cancelled,
             RunState::Abandoned,
+            RunState::Absorbed,
         ];
         let terminal: Vec<_> = all.into_iter().filter(|s| s.is_terminal()).collect();
         assert_eq!(
@@ -430,7 +440,8 @@ mod tests {
                 RunState::Completed,
                 RunState::Failed,
                 RunState::Cancelled,
-                RunState::Abandoned
+                RunState::Abandoned,
+                RunState::Absorbed
             ]
         );
         assert!(all.iter().all(|s| s.is_terminal() != s.is_unfinished()));
@@ -541,6 +552,7 @@ mod tests {
         assert_eq!(RunState::parse("needs_attention"), None);
         assert_eq!(RunState::parse(" waiting "), Some(RunState::Waiting));
         assert_eq!(RunState::Waiting.as_str(), "waiting");
+        assert_eq!(RunState::parse("absorbed"), Some(RunState::Absorbed));
         assert_eq!(
             serde_json::to_string(&RunState::Abandoned).unwrap(),
             "\"abandoned\""

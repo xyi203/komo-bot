@@ -128,6 +128,9 @@ pub enum Effect {
         effort: Option<Effort>,
         /// `text` 是 `!` 后面那条命令：不经模型直接跑（`SubmitRunRequest::shell`）。
         shell: bool,
+        /// 插话（§6，`SubmitRunRequest::interject`）：有 Run 正在跑就并进它的下一次请求。
+        /// 打的话一律带上——轮不轮得上由服务端判，没轮上就照常排队；`!` 命令不对话，不带。
+        interject: bool,
     },
     Cancel {
         run: RunId,
@@ -736,6 +739,7 @@ pub fn status_text(state: RunState) -> &'static str {
         RunState::Failed => "已失败",
         RunState::Cancelled => "已取消",
         RunState::Abandoned => "已放弃",
+        RunState::Absorbed => "已并入",
     }
 }
 

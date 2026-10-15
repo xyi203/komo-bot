@@ -275,8 +275,12 @@ impl RecoveryStore {
                     for record in &records {
                         session::index_event_in(ex, record).await?;
                         // 只还原**这个 Run** 的调用状态；同一 Session 的别的 Run 由它们
-                        // 自己那一轮 backfill 管。
-                        if record.event.run.as_ref() != Some(&run_id) {
+                        // 自己那一轮 backfill 管。插话的 `run.absorbed`（§6）例外：它落在
+                        // 被并走的那条上，而那条停在 `waiting + dependency` 上，恢复扫描
+                        // 不会替它 backfill——补宿主的时候顺手补上（条件写，幂等）。
+                        if record.event.run.as_ref() != Some(&run_id)
+                            && !matches!(record.event.payload, EventPayload::RunAbsorbed(_))
+                        {
                             continue;
                         }
                         let plan = plans
@@ -553,6 +557,7 @@ mod tests {
             delegate: None,
             snapshot: None,
             skip_memory: false,
+            interject: false,
         }
     }
 

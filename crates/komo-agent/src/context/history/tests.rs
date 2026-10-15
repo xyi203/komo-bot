@@ -57,6 +57,7 @@ fn accepted_as(run: &RunId, seq: u64, text: Option<&str>, delegate: Option<Deleg
             effort: None,
             delegate,
             snapshot: None,
+            interject: false,
         }),
     )
 }
@@ -868,4 +869,59 @@ fn decay_eligibility_on_the_kept_tail_is_unchanged() {
         assert_eq!(eligible(&compacted), eligible(&plain), "later = {later}");
         assert_eq!(eligible(&plain).is_empty(), later < 2, "later = {later}");
     }
+}
+
+/// 插话（§6）：被并进来的那句话在宿主里**就在并入的那一刻**——上一轮结果之后、下一轮回复
+/// 之前，是正跑的这条 Run 的完整协议的一部分；原来那条输入不再单独回放。
+#[test]
+fn an_absorbed_input_replays_inside_the_host_where_it_was_absorbed() {
+    let host = RunId::from_raw("run-1");
+    let late = RunId::from_raw("run-2");
+    let (c1, c3) = (ToolCallId::from_raw("c1"), ToolCallId::from_raw("c3"));
+    let mut events = vec![
+        accepted(&host, 1, "看下 a 和 b"),
+        started(&host, 2),
+        assistant(&host, 3, Some("先看 a"), vec![calling("c1")], None),
+        accepted(&late, 4, "顺便看 c"),
+        result(&host, 5, &c1, "a 的内容"),
+        event(
+            6,
+            &late,
+            EventPayload::RunAbsorbed(komo_kernel::events::RunAbsorbed { into: host.clone() }),
+        ),
+        assistant(&host, 7, Some("再看 c"), vec![calling("c3")], None),
+        result(&host, 8, &c3, "c 的内容"),
+    ];
+    let messages = replay(&events, &host, &BUDGET);
+    assert_eq!(
+        texts(&messages),
+        vec![
+            (Role::User, Some("看下 a 和 b".into())),
+            (Role::Assistant, Some("先看 a".into())),
+            (Role::Tool, None),
+            (Role::User, Some("顺便看 c".into())),
+            (Role::Assistant, Some("再看 c".into())),
+            (Role::Tool, None),
+        ],
+        "那句话在 c1 的结果之后、下一轮之前，且只出现一次"
+    );
+
+    // 宿主结束之后，它是一条历史 Run：用户说过的两句都在，然后是它最后的回答。
+    let next = RunId::from_raw("run-3");
+    events.extend([
+        assistant(&host, 9, Some("a 和 c 都看完了"), vec![], None),
+        completed(&host, 10),
+        accepted(&next, 11, "下一件"),
+        started(&next, 12),
+    ]);
+    let messages = replay(&events, &next, &BUDGET);
+    assert_eq!(
+        texts(&messages),
+        vec![
+            (Role::User, Some("看下 a 和 b".into())),
+            (Role::User, Some("顺便看 c".into())),
+            (Role::Assistant, Some("a 和 c 都看完了".into())),
+            (Role::User, Some("下一件".into())),
+        ]
+    );
 }

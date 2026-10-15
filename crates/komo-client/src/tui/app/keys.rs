@@ -182,6 +182,7 @@ impl App {
             model: self.model.clone(),
             effort: self.effort.clone(),
             shell: false,
+            interject: true,
         }]
     }
 
@@ -205,6 +206,7 @@ impl App {
             model: None,
             effort: None,
             shell: true,
+            interject: false,
         }]
     }
 

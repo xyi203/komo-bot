@@ -230,6 +230,9 @@ event_payload! {
     RunCompleted(RunCompleted) => "run.completed",
     RunFailed(RunFailed) => "run.failed",
     RunCancelled(RunCancelled) => "run.cancelled",
+    /// 插话（§6）：这条排着队的输入被同 Session 正在跑的那条 Run 在两轮之间并了进去。
+    /// 写在**被并的那条**上（`run_id` 是它）；fold 把那句话挪到宿主 Run 这一刻的位置。
+    RunAbsorbed(RunAbsorbed) => "run.absorbed",
     /// 一条不开启 Run 的用户消息。
     MessageUser(MessageUser) => "message.user",
     /// 一次完整的模型回复与该轮全部调用计划，一个逻辑事件（§8.3）。
@@ -307,6 +310,17 @@ pub struct RunAccepted {
     /// serde 对 `Box` 透明，落盘的 JSONL 一个字节都不变。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Box<crate::types::agent::RunSnapshot>>,
+    /// 发送方要求**插话**（§6，只有 TUI 发）：同 Session 有 Run 正在跑时，这句话不排到它
+    /// 后面，而是由它在下一次请求模型之前并进去（[`RunAbsorbed`]）。没轮上就照常排队。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interject: bool,
+}
+
+/// 插话（§6）：被并进了哪条 Run。日志里这一刻的位置就是那句话在宿主 Run 里的位置——
+/// 它前面是宿主上一轮的调用结果，后面是宿主的下一轮回复。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunAbsorbed {
+    pub into: RunId,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -681,6 +695,32 @@ mod tests {
             ),
             "{err}"
         );
+    }
+
+    /// 插话（§6）：`run.absorbed` 认得出来，`run.accepted` 只在要求插话时才写 `interject`。
+    #[test]
+    fn an_absorbed_line_and_an_interjecting_input_round_trip() {
+        let raw = line("run.absorbed", r#"{"into":"run-0"}"#);
+        let event = Event::from_line(&raw).unwrap();
+        let EventPayload::RunAbsorbed(body) = &event.payload else {
+            panic!("解成了 {:?}", event.payload);
+        };
+        assert_eq!(body.into.as_str(), "run-0");
+        assert_eq!(Event::from_line(&event.to_line().unwrap()).unwrap(), event);
+
+        let raw = line(
+            "run.accepted",
+            r#"{"request_key":"tui:1","input_hash":"abc","text":"顺便","source":{"kind":"interactive","session":"sess-1"},"interject":true}"#,
+        );
+        let event = Event::from_line(&raw).unwrap();
+        let EventPayload::RunAccepted(body) = &event.payload else {
+            panic!()
+        };
+        assert!(body.interject);
+        let mut quiet = body.clone();
+        quiet.interject = false;
+        let line = serde_json::to_string(&quiet).unwrap();
+        assert!(!line.contains("interject"), "不插话就不写：{line}");
     }
 
     #[test]

@@ -287,6 +287,11 @@ pub struct SubmitRunRequest {
     /// 渠道没有，拿到 bot 对话权限不等于拿到这台机器的 shell。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shell: bool,
+    /// **插话**（§6）：会话里有 Run 正在跑时，这句话不排到它后面，而是由它在下一次请求
+    /// 模型之前并进去。TUI 发；没轮上（那条 Run 已经在给最终回答、停在等待上、模型不同）
+    /// 就照常排队。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interject: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1151,7 +1151,21 @@ impl GatewayState {
         peer: Option<ChannelPeer>,
         model: Option<ModelConfig>,
     ) -> Result<SubmitRunResponse, GatewayError> {
-        self.accept(session, request_key, text, peer, model, None)
+        self.accept(session, request_key, text, peer, model, None, false)
+            .await
+    }
+
+    /// 同 [`Self::submit`]，但这句话要求**插话**（§6）：会话里有 Run 正在跑时，由它在下一次
+    /// 请求模型之前并进去，而不是排到它后面。只有 HTTP 调它（TUI 的 Enter，
+    /// `SubmitRunRequest::interject`）；聊天渠道照旧排队。
+    pub async fn submit_interjecting(
+        self: &Arc<Self>,
+        session: &SessionId,
+        request_key: RequestKey,
+        text: String,
+        model: Option<ModelConfig>,
+    ) -> Result<SubmitRunResponse, GatewayError> {
+        self.accept(session, request_key, text, None, model, None, true)
             .await
     }
 
@@ -1176,10 +1190,11 @@ impl GatewayState {
             ));
         }
         let text = format!("!{command}");
-        self.accept(session, request_key, text, None, None, Some(command))
+        self.accept(session, request_key, text, None, None, Some(command), false)
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn accept(
         self: &Arc<Self>,
         session: &SessionId,
@@ -1188,6 +1203,7 @@ impl GatewayState {
         peer: Option<ChannelPeer>,
         model: Option<ModelConfig>,
         direct_command: Option<String>,
+        interject: bool,
     ) -> Result<SubmitRunResponse, GatewayError> {
         if let Some(state) = self.input_refusal(session).await? {
             return Err(GatewayError::InvalidRequest(format!(
@@ -1241,6 +1257,7 @@ impl GatewayState {
                 // 交互输入是真的对话，记忆提取照常（§9.3）；跳过只留给命令 Job（§10）
                 // 与 `!` 直接执行的命令。
                 skip_memory,
+                interject,
                 at: self.clock.now(),
             })
             .await?;

@@ -129,6 +129,19 @@ pub async fn submit(
         return Ok(Json(response));
     }
     let model = model_override(&api, request.model.as_deref(), request.effort.as_ref())?;
+    // 插话（§6）：TUI 的 Enter。没轮上就照常排队，所以回执与普通提交一样。
+    if request.interject {
+        let response = api
+            .state
+            .submit_interjecting(
+                &session,
+                request.request_key.clone(),
+                request.text.clone(),
+                model,
+            )
+            .await?;
+        return Ok(Json(response));
+    }
     // 幂等由账本自己答（§8.5）：同一请求键返回原 Run，内容不同则 409。
     let response = api
         .state

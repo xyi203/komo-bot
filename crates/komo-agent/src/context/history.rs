@@ -299,12 +299,14 @@ fn window<'s>(surface: &'s Surface, scope: Option<ReplayScope<'_>>) -> Vec<&'s S
                 .and_then(|run| surface.runs.get(run))
                 .is_none_or(|view| view.delegate.is_none()),
         })
+        // 被插话并走的输入（§6）：那句话已经作为宿主的一条消息出现在并入的那一刻
+        // （`absorbed_from`），原来那条不再回放。
         .filter(|message| {
             message
                 .run
                 .as_ref()
                 .and_then(|run| surface.runs.get(run))
-                .is_none_or(|view| !view.status.awaits_claim())
+                .is_none_or(|view| !view.status.awaits_claim() && view.status != RunState::Absorbed)
         })
         .collect();
 

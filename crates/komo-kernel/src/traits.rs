@@ -342,6 +342,19 @@ pub trait Ledger: Send + Sync {
     /// 它是**只读**的，且只回答"这条 Run 结束了没有、怎么结束的"，不返回消息历史：
     /// 复验用的是父侧自己那份契约，子 Run 的完整过程由 `read` 去取。
     async fn run_end(&self, run: &RunId) -> Result<Option<RunEnd>, LedgerError>;
+
+    /// 插话（§6）：把同 Session 里排在 `host` 后面、要求插话的输入并进 `host`，返回并进来
+    /// 的那些 Run（按受理顺序）。runtime 在一轮的调用全部收尾、下一次请求模型之前问它；
+    /// 并进来了就按日志重新装配，那几句话出现在这一刻的位置上。
+    ///
+    /// 只并能并的：`host` 是一条正在跑的主 Run（不是子 Run），输入是顶层的、要求插话的、
+    /// 还没被领走的，且受理时冻结的模型与 `host` 相同——换了模型的那句话按它自己的快照
+    /// 另跑一条。每并一条：`run.absorbed` 追加并同步 → 那条 Run 的行提交成 `absorbed`。
+    ///
+    /// 默认一条都不并：没有这个概念的账本（测试替身）照旧排队。
+    async fn absorb_interjections(&self, _host: &RunId) -> Result<Vec<RunId>, LedgerError> {
+        Ok(Vec::new())
+    }
 }
 
 // ---------------------------------------------------------------- 输出存储

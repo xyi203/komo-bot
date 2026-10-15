@@ -157,6 +157,7 @@ impl Surface {
                 run.status = RunState::Accepted;
                 run.input_event = Some(event.event_id.clone());
                 run.delegate = body.delegate.clone();
+                run.interject = body.interject;
                 self.push_message(SurfaceMessage {
                     seq: event.seq,
                     event_id: event.event_id.clone(),
@@ -167,6 +168,7 @@ impl Surface {
                     tool_calls: Vec::new(),
                     tool_results: Vec::new(),
                     provider_blocks: None,
+                    absorbed_from: None,
                 });
             }
             EventPayload::RunQueued(_) => {
@@ -221,6 +223,43 @@ impl Surface {
                 run.final_event = Some(event_id);
                 run.reason = reason;
             }
+            // 插话（§6）：那句话**挪到这一刻**，归到宿主名下——它前面是宿主上一轮的结果，
+            // 后面是宿主的下一轮回复，回放与压缩照宿主自己的消息处理。原来那条消息留在
+            // 消息面上（只追加：TUI 按前缀长度记"交出去了多少条"），回放按这条 Run 的
+            // `Absorbed` 跳过它。
+            //
+            // 不过交替检查：它跟在一个工具结果节点后面，两边都是用户侧，provider 那头本来
+            // 就把相邻的用户侧消息并成一条（§13.2），这不是一次违例。
+            EventPayload::RunAbsorbed(body) => {
+                let into = body.into.clone();
+                let run = self.run_mut(event);
+                run.status = RunState::Absorbed;
+                run.final_event = Some(event.event_id.clone());
+                run.absorbed_into = Some(into.clone());
+                let original = event.run.as_ref().and_then(|absorbed| {
+                    self.messages.iter().rev().find(|message| {
+                        message.run.as_ref() == Some(absorbed)
+                            && message.role == Role::User
+                            && message.absorbed_from.is_none()
+                    })
+                });
+                if let Some(original) = original {
+                    let copy = SurfaceMessage {
+                        seq: event.seq,
+                        event_id: event.event_id.clone(),
+                        role: Role::User,
+                        run: Some(into),
+                        text: original.text.clone(),
+                        text_ref: original.text_ref.clone(),
+                        tool_calls: Vec::new(),
+                        tool_results: Vec::new(),
+                        provider_blocks: None,
+                        absorbed_from: event.run.clone(),
+                    };
+                    self.last_role = Some(Role::User);
+                    self.messages.push(copy);
+                }
+            }
             EventPayload::MessageUser(body) => self.push_message(SurfaceMessage {
                 seq: event.seq,
                 event_id: event.event_id.clone(),
@@ -231,6 +270,7 @@ impl Surface {
                 tool_calls: Vec::new(),
                 tool_results: Vec::new(),
                 provider_blocks: None,
+                absorbed_from: None,
             }),
             EventPayload::MessageAssistant(body) => {
                 if event.run.is_some() {
@@ -247,6 +287,7 @@ impl Surface {
                     tool_calls: body.tool_calls.clone(),
                     tool_results: Vec::new(),
                     provider_blocks: body.provider_blocks.clone(),
+                    absorbed_from: None,
                 });
             }
             EventPayload::ConversationBoundary(_) => {
@@ -329,6 +370,7 @@ impl Surface {
                             tool_calls: Vec::new(),
                             tool_results: Vec::new(),
                             provider_blocks: None,
+                            absorbed_from: None,
                         },
                     });
                 }
@@ -422,6 +464,7 @@ impl Surface {
             tool_calls: Vec::new(),
             tool_results: vec![result],
             provider_blocks: None,
+            absorbed_from: None,
         });
     }
 
@@ -441,6 +484,8 @@ impl Surface {
             generation: None,
             rounds: 0,
             delegate: None,
+            interject: false,
+            absorbed_into: None,
             calls: Vec::new(),
             compaction: None,
             decayed: BTreeSet::new(),
@@ -526,6 +571,7 @@ mod tests {
                 effort: None,
                 delegate: None,
                 snapshot: None,
+                interject: false,
             }),
         )
     }
@@ -1080,6 +1126,126 @@ mod tests {
             effort: None,
             delegate: None,
             snapshot: None,
+            interject: false,
         })
+    }
+
+    /// 插话（§6）：被并走的那句话**挪到并入的那一刻**、归到宿主名下；原来那条消息留在
+    /// 消息面上（只追加），它自己的 Run 是 `Absorbed`。
+    #[test]
+    fn an_absorbed_input_moves_into_the_host_at_the_moment_it_was_absorbed() {
+        let mut interjection = accepted(6, "run-2", "顺便看下 B");
+        if let EventPayload::RunAccepted(body) = &mut interjection.payload {
+            body.interject = true;
+        }
+        let events = vec![
+            accepted(1, "run-1", "看下 A"),
+            event(
+                2,
+                Some("run-1"),
+                EventPayload::RunQueued(RunQueued {
+                    input_ref: EventId::from_raw("evt-1"),
+                }),
+            ),
+            event(
+                3,
+                Some("run-1"),
+                EventPayload::RunStarted(RunStarted {
+                    executor: ExecutorId::from_raw("ex-1"),
+                    generation: 1,
+                }),
+            ),
+            assistant(4, "run-1", 1, "我查一下"),
+            event(
+                5,
+                Some("run-1"),
+                EventPayload::ToolPlanned(ToolPlanned {
+                    call_id: ToolCallId::from_raw("call-7"),
+                    plan_hash: PlanHash::from_raw("h1"),
+                    plan: None,
+                    plan_ref: None,
+                }),
+            ),
+            interjection,
+            event(
+                7,
+                Some("run-2"),
+                EventPayload::RunQueued(RunQueued {
+                    input_ref: EventId::from_raw("evt-6"),
+                }),
+            ),
+            event(
+                8,
+                Some("run-1"),
+                EventPayload::ToolResult(ToolResult {
+                    body: None,
+                    call_id: ToolCallId::from_raw("call-7"),
+                    attempt_id: AttemptId::from_raw("attempt-1"),
+                    status: ToolResultStatus::Completed,
+                    output_ref: output_ref("tool-output/run-1/call-7/attempt-1/output.json"),
+                    elapsed_ms: 12,
+                    preview: Some("A 没问题".into()),
+                    stdout: None,
+                    stderr: None,
+                    attempt_state: None,
+                }),
+            ),
+            event(
+                9,
+                Some("run-2"),
+                EventPayload::RunAbsorbed(crate::events::RunAbsorbed {
+                    into: RunId::from_raw("run-1"),
+                }),
+            ),
+            assistant(10, "run-1", 2, "A 和 B 都看了"),
+        ];
+        let surface = fold(&events);
+
+        let absorbed = &surface.runs[&RunId::from_raw("run-2")];
+        assert_eq!(absorbed.status, RunState::Absorbed);
+        assert!(absorbed.status.is_terminal());
+        assert!(absorbed.interject);
+        assert_eq!(absorbed.absorbed_into, Some(RunId::from_raw("run-1")));
+        assert_eq!(absorbed.final_event, Some(EventId::from_raw("evt-9")));
+
+        let order: Vec<(u64, Option<&str>, Option<&str>)> = surface
+            .messages
+            .iter()
+            .map(|message| {
+                (
+                    message.seq.0,
+                    message.run.as_ref().map(RunId::as_str),
+                    message.absorbed_from.as_ref().map(RunId::as_str),
+                )
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (1, Some("run-1"), None),
+                (4, Some("run-1"), None),
+                (6, Some("run-2"), None),
+                (8, Some("run-1"), None),
+                (9, Some("run-1"), Some("run-2")),
+                (10, Some("run-1"), None),
+            ],
+            "原来那条留在原处，副本在并入的那一刻、归宿主"
+        );
+        assert_eq!(surface.messages[4].text.as_deref(), Some("顺便看下 B"));
+        assert_eq!(surface.messages[4].role, Role::User);
+        assert!(
+            !surface
+                .violations
+                .iter()
+                .any(|violation| matches!(violation, FoldViolation::ConsecutiveRole { seq, .. } if *seq == Seq(9))),
+            "跟在工具结果后面的那句插话不是违例：{:?}",
+            surface.violations
+        );
+
+        for split in 0..=events.len() {
+            let mut partial = fold(&events[..split]);
+            partial.extend(&events[split..]);
+            assert_eq!(partial, surface, "切在 {split}");
+        }
     }
 }

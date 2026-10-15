@@ -1135,6 +1135,7 @@ impl ToolExecutor {
                 // Job——那种 Run 从不发模型请求，没有对话可提取（§10）。
                 skip_memory: false,
                 at: self.clock.now(),
+                interject: false,
             })
             .await?;
         Ok(accepted)
@@ -1966,6 +1967,7 @@ fn state_word(state: RunState) -> &'static str {
         RunState::Failed => "failed",
         RunState::Cancelled => "cancelled",
         RunState::Abandoned => "abandoned",
+        RunState::Absorbed => "absorbed",
     }
 }
 

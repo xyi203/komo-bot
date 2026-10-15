@@ -238,6 +238,10 @@ pub fn decide(observed: &RecoveryInput) -> RecoveryAction {
                 RecoveryAction::RedeliverResult
             }
         }
+        // 插话被并走的输入（§6）：它没有自己的结果可投，回答在宿主 Run 那里。
+        RunState::Absorbed => RecoveryAction::KeepTerminal {
+            state: observed.state,
+        },
         // 停在外部条件上：按"在等什么"分派。
         RunState::Waiting => decide_while_waiting(observed),
         // accepted / queued / running：位置由 JSONL 尾部决定。`running` 且没有主人的那些

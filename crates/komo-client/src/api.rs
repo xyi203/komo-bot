@@ -1025,6 +1025,7 @@ mod wire_tests {
             model: None,
             effort: None,
             shell: false,
+            interject: false,
         };
         let response = server
             .client()

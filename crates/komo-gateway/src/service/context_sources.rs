@@ -457,6 +457,7 @@ mod tests {
                 effort: None,
                 delegate: None,
                 snapshot: None,
+                interject: false,
             }),
         )
     }

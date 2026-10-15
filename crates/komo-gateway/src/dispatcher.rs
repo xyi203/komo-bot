@@ -432,6 +432,7 @@ fn state_text(state: RunState) -> &'static str {
         RunState::Failed => "失败",
         RunState::Cancelled => "已取消",
         RunState::Abandoned => "已放弃（不会再有下文）",
+        RunState::Absorbed => "已并入当时正在跑的那条",
     }
 }
 

@@ -295,6 +295,10 @@ impl Ledger for PublishingLedger {
         self.inner.run_end(run).await
     }
 
+    async fn absorb_interjections(&self, host: &RunId) -> Result<Vec<RunId>, LedgerError> {
+        pumped!(self, self.inner.absorb_interjections(host).await)
+    }
+
     async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError> {
         pumped!(self, self.inner.boundary(session).await)
     }
@@ -638,6 +642,27 @@ impl Ledger for RoutedLedger {
         self.for_run(run).await?.ledger.run_end(run).await
     }
 
+    /// 插话（§6）：并走的那几条进了终态，等它们的 Run 改指到宿主——与 `complete` 之后
+    /// 同一次放行，`/status` 上"在等谁"才不会指着一条已经并走的。
+    async fn absorb_interjections(&self, host: &RunId) -> Result<Vec<RunId>, LedgerError> {
+        let absorbed = self
+            .for_run(host)
+            .await?
+            .ledger
+            .absorb_interjections(host)
+            .await?;
+        if !absorbed.is_empty() {
+            tracing::info!(host = %host, absorbed = absorbed.len(), "插话并进了正在跑的 Run");
+            if let Err(error) =
+                komo_store::repos::queue::release_satisfied_dependencies(&self.db, self.clock.now())
+                    .await
+            {
+                tracing::warn!(%error, "并入之后改指依赖失败，留到下一拍对账");
+            }
+        }
+        Ok(absorbed)
+    }
+
     async fn read(
         &self,
         session: &SessionId,
@@ -849,6 +874,7 @@ mod tests {
             snapshot: None,
             skip_memory: false,
             at: time::macros::datetime!(2026-09-16 08:00:00 UTC),
+            interject: false,
         }
     }
 

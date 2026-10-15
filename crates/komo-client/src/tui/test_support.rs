@@ -61,6 +61,7 @@ pub fn conversation() -> Vec<Event> {
                 effort: Some(EffortSetting::Explicit(Effort::new("high"))),
                 delegate: None,
                 snapshot: None,
+                interject: false,
             }),
         ),
         event(

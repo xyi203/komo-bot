@@ -360,6 +360,7 @@ impl CronScheduler {
                 // 不是省一步，是不破"零模型请求"这条硬约束（§9.3）。
                 skip_memory: job.command.is_some(),
                 at: now,
+                interject: false,
             })
             .await?;
         Ok((accepted.run, accepted.deduplicated))

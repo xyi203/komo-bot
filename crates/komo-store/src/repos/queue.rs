@@ -76,7 +76,7 @@ UPDATE runs
                earlier.input_seq < runs.input_seq
             OR (earlier.input_seq = runs.input_seq AND earlier.id < runs.id)
           )
-          AND earlier.state NOT IN ('completed', 'failed', 'cancelled', 'abandoned')
+          AND earlier.state NOT IN ('completed', 'failed', 'cancelled', 'abandoned', 'absorbed')
           AND NOT (
                 runs.parent_run_id IS NOT NULL
             AND earlier.id = runs.parent_run_id
@@ -121,7 +121,7 @@ SELECT r.id FROM runs AS r
                earlier.input_seq < r.input_seq
             OR (earlier.input_seq = r.input_seq AND earlier.id < r.id)
           )
-          AND earlier.state NOT IN ('completed', 'failed', 'cancelled', 'abandoned')
+          AND earlier.state NOT IN ('completed', 'failed', 'cancelled', 'abandoned', 'absorbed')
           AND NOT (
                 r.parent_run_id IS NOT NULL
             AND earlier.id = r.parent_run_id

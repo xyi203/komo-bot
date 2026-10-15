@@ -8,8 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use komo_kernel::events::{
     ContextCompacted, ConversationBoundary, EventPayload, MemoryInjected, MessageAssistant,
-    RunAbandoned, RunAccepted, RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted,
-    RunWaiting, ToolPlanned, ToolResult, ToolStarted,
+    RunAbandoned, RunAbsorbed, RunAccepted, RunCancelled, RunCompleted, RunFailed, RunQueued,
+    RunStarted, RunWaiting, ToolPlanned, ToolResult, ToolStarted,
 };
 use komo_kernel::traits::{Ledger, LedgerError, StoreError};
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
@@ -191,6 +191,7 @@ impl Ledger for Coordinator {
                     // 受理方算好交下来（`AcceptInput::snapshot`）；这里是如实记录，
                     // 不做解释、不补默认值。
                     snapshot: input.snapshot.clone(),
+                    interject: input.interject,
                 }),
             )
             .await?;
@@ -873,6 +874,87 @@ impl Ledger for Coordinator {
 
         Ok(appended.seq())
     }
+
+    /// 插话（§6）。资格在 state.db 上判（宿主正在跑、是主 Run；输入是它后面的顶层 Run、
+    /// 还在排队、模型快照与宿主相同），"要不要插话"读那条输入的 `run.accepted`（它只在
+    /// JSONL 里）。每并一条走正向顺序：`run.absorbed` 追加并同步 → 派生提交成 `absorbed`。
+    ///
+    /// 一轮收尾问一次，通常一条候选都没有：那就是一次按会话索引的读，不碰日志。
+    async fn absorb_interjections(&self, host: &RunId) -> Result<Vec<RunId>, LedgerError> {
+        let session = self.session.clone();
+        let host_id = host.to_string();
+        let candidates: Vec<(RunId, Seq)> = self
+            .db
+            .read(move |ex| {
+                let (session, host_id) = (session.clone(), host_id.clone());
+                Box::pin(async move {
+                    let rows = crate::models::RunRow::filter(
+                        crate::models::RunRow::fields()
+                            .session_id()
+                            .eq(session.as_str()),
+                    )
+                    .exec(ex)
+                    .await
+                    .map_err(crate::db::map_toasty)?;
+                    let Some(host) = rows.iter().find(|row| row.id == host_id) else {
+                        return Ok(Vec::new());
+                    };
+                    if runs::state_of(host)? != RunState::Running || host.parent_run_id.is_some() {
+                        return Ok(Vec::new());
+                    }
+                    let host_key = runs::order_key(host);
+                    let mut out = Vec::new();
+                    for row in &rows {
+                        let waiting_in_line = match runs::state_of(row)? {
+                            RunState::Queued => true,
+                            RunState::Waiting => row.wait_kind.as_deref() == Some("dependency"),
+                            _ => false,
+                        };
+                        if waiting_in_line
+                            && row.parent_run_id.is_none()
+                            && row.input_seq > 0
+                            && runs::order_key(row) > host_key
+                            && row.model_snapshot == host.model_snapshot
+                            && row.effort == host.effort
+                        {
+                            out.push((runs::order_key(row), row.id.clone(), row.input_seq));
+                        }
+                    }
+                    out.sort();
+                    Ok(out
+                        .into_iter()
+                        .map(|(_, id, seq)| (RunId::from_raw(id), Seq(seq.max(0) as u64)))
+                        .collect())
+                }) as BoxFuture<'_, Result<Vec<(RunId, Seq)>, StoreError>>
+            })
+            .await
+            .map_err(store_to_ledger)?;
+
+        let mut absorbed = Vec::new();
+        for (run, input_seq) in candidates {
+            let interject = {
+                let mut log = self.log.lock().await;
+                let (events, _) = log.read(Seq(input_seq.0.saturating_sub(1)), 1).await?;
+                events.into_iter().any(|event| {
+                    event.seq == input_seq
+                        && event.run.as_ref() == Some(&run)
+                        && matches!(&event.payload, EventPayload::RunAccepted(body) if body.interject)
+                })
+            };
+            if !interject {
+                continue;
+            }
+            let appended = self
+                .append(
+                    Some(run.clone()),
+                    EventPayload::RunAbsorbed(RunAbsorbed { into: host.clone() }),
+                )
+                .await?;
+            self.commit_derived(&appended, None).await?;
+            absorbed.push(run);
+        }
+        Ok(absorbed)
+    }
 }
 
 enum Reserved {
@@ -1017,6 +1099,7 @@ mod tests {
             delegate: None,
             snapshot: None,
             skip_memory: false,
+            interject: false,
         }
     }
 
@@ -1319,6 +1402,182 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    /// 插话（§6）：宿主在跑，后面两条在排队——要求插话的那条被并走（`run.absorbed` + 行落成
+    /// `absorbed`），没要求的照旧排着；宿主结束后它照常被放行。并过的不会再并一次。
+    #[tokio::test]
+    async fn an_interjecting_input_is_absorbed_into_the_running_host_and_others_keep_waiting() {
+        let f = fixture().await;
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let executor = ExecutorId::from_raw("exec-1");
+        let host = f
+            .coordinator
+            .accept_input(input("api:1", "看下 A", &f.session))
+            .await
+            .unwrap();
+
+        // 宿主还没开跑：一条都不并。
+        let early = f
+            .coordinator
+            .accept_input(AcceptInput {
+                interject: true,
+                ..input("tui:0", "太早了", &f.session)
+            })
+            .await
+            .unwrap();
+        assert!(
+            f.coordinator
+                .absorb_interjections(&host.run)
+                .await
+                .unwrap()
+                .is_empty(),
+            "宿主不在跑就没有「下一次请求之前」"
+        );
+
+        let claimed = queue
+            .claim_run(&host.run, &executor)
+            .await
+            .unwrap()
+            .expect("领得到");
+        f.coordinator
+            .start_run(&host.run, &executor, claimed.generation)
+            .await
+            .unwrap();
+        let monitor = f
+            .coordinator
+            .accept_input(input("api:2", "监听事件", &f.session))
+            .await
+            .unwrap();
+        let other_model = f
+            .coordinator
+            .accept_input(AcceptInput {
+                interject: true,
+                model: komo_kernel::types::model::ModelConfig {
+                    model: "another-model".into(),
+                    ..sample_model()
+                },
+                ..input("tui:2", "换个模型问", &f.session)
+            })
+            .await
+            .unwrap();
+        let typed = f
+            .coordinator
+            .accept_input(AcceptInput {
+                interject: true,
+                ..input("tui:3", "顺便看下 B", &f.session)
+            })
+            .await
+            .unwrap();
+
+        let absorbed = f.coordinator.absorb_interjections(&host.run).await.unwrap();
+        assert_eq!(absorbed, vec![early.run.clone(), typed.run.clone()]);
+        let last = types(&f.coordinator, &f.session).await;
+        assert_eq!(&last[last.len() - 2..], ["run.absorbed", "run.absorbed"]);
+        for run in [&early.run, &typed.run] {
+            let row = crate::repos::runs::get(&f.db, run).await.unwrap().unwrap();
+            assert_eq!(row.state, RunState::Absorbed);
+            assert!(row.wait.is_none());
+        }
+        for run in [&monitor.run, &other_model.run] {
+            let row = crate::repos::runs::get(&f.db, run).await.unwrap().unwrap();
+            assert_eq!(
+                row.state,
+                RunState::Waiting,
+                "没要求插话、或换了模型的照旧排队"
+            );
+        }
+        assert!(
+            f.coordinator
+                .absorb_interjections(&host.run)
+                .await
+                .unwrap()
+                .is_empty(),
+            "并过的不再并"
+        );
+
+        // 宿主结束：并走的那两条不挡人，监听那条被放行。
+        f.coordinator
+            .complete(
+                &host.run,
+                RunEnd::Completed {
+                    final_message: None,
+                    rounds: 2,
+                },
+            )
+            .await
+            .unwrap();
+        crate::repos::queue::release_satisfied_dependencies(&f.db, f.clock.now())
+            .await
+            .unwrap();
+        let row = crate::repos::runs::get(&f.db, &monitor.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RunState::Queued);
+    }
+
+    /// 崩在 `run.absorbed` 已同步、库还没提交之间：backfill 走同一处派生，补出来的就是
+    /// `absorbed`，它不会在宿主之后再被领走跑一遍。
+    #[tokio::test]
+    async fn backfill_restores_an_absorption_the_db_missed() {
+        let f = fixture().await;
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let executor = ExecutorId::from_raw("exec-1");
+        let host = f
+            .coordinator
+            .accept_input(input("api:1", "看下 A", &f.session))
+            .await
+            .unwrap();
+        let claimed = queue
+            .claim_run(&host.run, &executor)
+            .await
+            .unwrap()
+            .unwrap();
+        f.coordinator
+            .start_run(&host.run, &executor, claimed.generation)
+            .await
+            .unwrap();
+        let typed = f
+            .coordinator
+            .accept_input(AcceptInput {
+                interject: true,
+                ..input("tui:1", "顺便看下 B", &f.session)
+            })
+            .await
+            .unwrap();
+        f.coordinator.absorb_interjections(&host.run).await.unwrap();
+
+        // 把库拨回到"日志写了、库没提交"那一刻。
+        let (id, host_id) = (typed.run.to_string(), host.run.to_string());
+        f.db.with_write_retry(move |ex| {
+            let (id, host_id) = (id.clone(), host_id.clone());
+            Box::pin(async move {
+                toasty::sql::statement(
+                    "UPDATE runs SET state = 'waiting', wait_kind = 'dependency', wait_ref = ?2, \
+                     final_event = NULL WHERE id = ?1",
+                )
+                .bind(id)
+                .bind(host_id)
+                .exec(ex)
+                .await
+                .map(|_| ())
+                .map_err(crate::db::map_toasty)
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .unwrap();
+
+        // 被并走的那条停在 `waiting + dependency` 上，恢复扫描不替它 backfill；补的是宿主。
+        crate::repos::recovery::RecoveryStore::new(f.db.clone(), f._dir.path().join("sessions"))
+            .backfill(&host.run)
+            .await
+            .unwrap();
+        let row = crate::repos::runs::get(&f.db, &typed.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.state, RunState::Absorbed);
     }
 
     /// 前面那条已经终态了就不挡：新 Run 照旧直接 `queued`。

@@ -36,6 +36,11 @@ pub struct SurfaceMessage {
     pub tool_results: Vec<SurfaceToolResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider_blocks: Option<serde_json::Value>,
+    /// 插话（§6）：这一条是被并进来的那句话，挪到了宿主 Run 并入它的那一刻（`run.absorbed`
+    /// 的位置），`run` 是宿主；这一格指回原来那条输入的 Run。原来那条消息还在消息面上
+    /// （消息面只追加），回放跳过它、只认这一条。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absorbed_from: Option<RunId>,
 }
 
 /// 回放面上的一条工具结果。
@@ -99,6 +104,12 @@ pub struct RunView {
     /// 重启之后也一样（它来自 `run.accepted`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delegate: Option<crate::types::delegate::DelegateSpec>,
+    /// 发送方要求插话（`run.accepted` 的 `interject`，§6）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub interject: bool,
+    /// 被并进了哪条 Run（`run.absorbed`）。只在 `status == Absorbed` 时有值。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absorbed_into: Option<RunId>,
     /// 属于它的调用，按出现顺序。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub calls: Vec<ToolCallId>,

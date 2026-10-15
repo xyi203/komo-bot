@@ -6,7 +6,8 @@
 //! "派生行是 JSONL 的投影"是一句测试钉得住的话：两条路折出来的行逐列相同，只差 JSONL 里
 //! 本来就没有的那几格（执行实例、时刻）。以前两边各写一份，backfill 漏了 `runs.rounds`。
 //!
-//! 全部幂等：同一段事件重放十遍与一遍相同。Run 的状态不在这里——那是决策表的结论（§8.4）。
+//! 全部幂等：同一段事件重放十遍与一遍相同。Run 的状态不在这里——那是决策表的结论（§8.4）；
+//! 唯一的例外是插话的 `run.absorbed`（§6），它的终态没有别的落点。
 
 use komo_kernel::events::EventPayload;
 use komo_kernel::traits::StoreError;
@@ -90,6 +91,10 @@ pub async fn apply_in(
             .await
             .map(|_| ())
         }
+        // 插话（§6）：被并走的那条输入落成 `absorbed`。和别的终态不同，它的终态只能从这条
+        // 事件里来（没有 `Ledger::complete` 那一步），所以它属于派生——崩在 JSONL 与库之间，
+        // backfill 照样补得出来。
+        EventPayload::RunAbsorbed(_) => runs::mark_absorbed_in(ex, run, event_id, now).await,
         _ => Ok(()),
     }
 }

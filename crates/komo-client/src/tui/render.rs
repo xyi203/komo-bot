@@ -368,7 +368,7 @@ fn run_colour(state: RunState) -> Color {
         RunState::Waiting => Color::Yellow,
         RunState::Completed => Color::Green,
         RunState::Failed => Color::Red,
-        RunState::Cancelled | RunState::Abandoned => Color::DarkGray,
+        RunState::Cancelled | RunState::Abandoned | RunState::Absorbed => Color::DarkGray,
     }
 }
 

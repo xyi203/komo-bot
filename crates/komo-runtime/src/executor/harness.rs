@@ -105,6 +105,7 @@ impl Harness {
                 snapshot: None,
                 skip_memory: false,
                 at: self.clock.now(),
+                interject: false,
             })
             .await
             .expect("接收输入");

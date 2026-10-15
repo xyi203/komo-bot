@@ -1047,6 +1047,7 @@ mod delegation {
                 snapshot: None,
                 skip_memory: false,
                 at: harness.clock.now(),
+                interject: false,
             })
             .await
             .expect("接收输入");
@@ -1678,6 +1679,7 @@ mod delegation {
                 snapshot: None,
                 skip_memory: false,
                 at: harness.clock.now(),
+                interject: false,
             })
             .await
             .unwrap()

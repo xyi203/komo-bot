@@ -464,6 +464,7 @@ fn accepted_with(
             effort: None,
             delegate,
             snapshot: None,
+            interject: false,
         }),
     )
 }

@@ -27,6 +27,7 @@ fn accept(session: &SessionId, key: &str, text: &str, clock: &TestClock) -> Acce
         snapshot: None,
         skip_memory: false,
         at: clock.now(),
+        interject: false,
     }
 }
 

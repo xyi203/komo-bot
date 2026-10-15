@@ -445,6 +445,7 @@ impl World {
                 snapshot: None,
                 skip_memory: false,
                 at: NOW,
+                interject: false,
             })
             .await
             .unwrap()

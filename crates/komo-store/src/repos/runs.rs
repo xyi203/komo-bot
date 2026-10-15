@@ -562,7 +562,7 @@ pub async fn mark_final_in(
     reason: Option<String>,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
-    debug_assert!(state.is_terminal(), "终态只能是那四个");
+    debug_assert!(state.is_terminal(), "终态只能是那五个");
     let mut row = require(ex, run).await?;
     row.update()
         .state(state_str(state))
@@ -574,6 +574,37 @@ pub async fn mark_final_in(
         .last_error(reason)
         // 「run.completed 在 JSONL 持久保存后，state.db 提交终态与 memory_work =
         // pending」（§9.3）。取消与失败也标：后台自己判断有没有可提取的证据。
+        .memory_work(memory_work_str(MemoryWork::Pending))
+        .ended_at(to_ts(now))
+        .updated_at(to_ts(now))
+        .exec(ex)
+        .await
+        .map_err(map_toasty)
+}
+
+/// 插话（§6）：这条输入被同 Session 正在跑的 Run 并走了（`run.absorbed`）。
+///
+/// 是 [`super::derive`] 的一支——实时提交与 backfill 走同一处，所以"JSONL 写了、库还没
+/// 提交"那一刻崩掉，重启补齐时这一行照样落成 `absorbed`。**已经是终态的不动**：并入之前
+/// 那一瞬间它要是已经被取消了，取消算数（§8.5：回放不能覆盖已记下的取消）。
+pub async fn mark_absorbed_in(
+    ex: &mut dyn Executor,
+    run: &RunId,
+    event: &EventId,
+    now: OffsetDateTime,
+) -> Result<(), StoreError> {
+    let mut row = require(ex, run).await?;
+    if state_of(&row)?.is_terminal() {
+        return Ok(());
+    }
+    row.update()
+        .state(state_str(RunState::Absorbed))
+        .wait_kind(None as Option<String>)
+        .wait_ref(None as Option<String>)
+        .wake_at(0_i64)
+        .claimed_by(None as Option<String>)
+        .final_event(Some(event.to_string()))
+        // 它自己那句话是用户陈述，照常进记忆整理（§9.3）；回答在宿主那里。
         .memory_work(memory_work_str(MemoryWork::Pending))
         .ended_at(to_ts(now))
         .updated_at(to_ts(now))
@@ -596,7 +627,7 @@ pub async fn mark_final_without_event_in(
     reason: Option<String>,
     now: OffsetDateTime,
 ) -> Result<(), StoreError> {
-    debug_assert!(state.is_terminal(), "终态只能是那四个");
+    debug_assert!(state.is_terminal(), "终态只能是那五个");
     let mut row = require(ex, run).await?;
     row.update()
         .state(state_str(state))

@@ -11,8 +11,8 @@ use crate::types::ids::*;
 
 use crate::events::{
     ConversationBoundary, EVENT_FORMAT_VERSION, Event, EventPayload, MessageAssistant,
-    RunAbandoned, RunAccepted, RunCancelled, RunCompleted, RunFailed, RunQueued, RunStarted,
-    RunWaiting, ToolPlanned, ToolResult, ToolStarted,
+    RunAbandoned, RunAbsorbed, RunAccepted, RunCancelled, RunCompleted, RunFailed, RunQueued,
+    RunStarted, RunWaiting, ToolPlanned, ToolResult, ToolStarted,
 };
 use crate::fold::{Surface, fold};
 use crate::types::plan::{ExecutionPlan, PlanHash};
@@ -146,6 +146,7 @@ impl Ledger for MemLedger {
                 effort: None,
                 delegate: input.delegate.clone(),
                 snapshot: input.snapshot.clone(),
+                interject: input.interject,
             }),
         );
         self.append(
@@ -569,5 +570,55 @@ impl Ledger for MemLedger {
             payload,
         });
         Ok(seq)
+    }
+
+    /// 与 `Coordinator` 同一套判据，只是从折出来的现状里读：宿主是正在跑的主 Run，输入
+    /// 是它后面受理的、要求插话的、还没开跑的顶层 Run，且模型与宿主相同。
+    async fn absorb_interjections(&self, host: &RunId) -> Result<Vec<RunId>, LedgerError> {
+        let mut state = self.state.lock().expect("账本");
+        let session = state
+            .sessions
+            .get(host)
+            .cloned()
+            .ok_or_else(|| LedgerError::NotFound {
+                what: format!("run {host}"),
+            })?;
+        let model_of = |run: &RunId| {
+            state.events.iter().find_map(|event| match &event.payload {
+                EventPayload::RunAccepted(body) if event.run.as_ref() == Some(run) => {
+                    Some(body.model.clone())
+                }
+                _ => None,
+            })
+        };
+        let surface = fold(state.events.iter().filter(|e| e.session == session));
+        let Some(view) = surface.runs.get(host) else {
+            return Ok(Vec::new());
+        };
+        if view.status != crate::types::status::RunState::Running || view.delegate.is_some() {
+            return Ok(Vec::new());
+        }
+        let mut candidates: Vec<&crate::fold::RunView> = surface
+            .runs
+            .values()
+            .filter(|run| {
+                run.interject
+                    && run.delegate.is_none()
+                    && run.first_seq > view.first_seq
+                    && run.status.awaits_claim()
+                    && model_of(&run.run) == model_of(host)
+            })
+            .collect();
+        candidates.sort_by_key(|run| run.first_seq);
+        let absorbed: Vec<RunId> = candidates.into_iter().map(|run| run.run.clone()).collect();
+        for run in &absorbed {
+            self.append(
+                &mut state,
+                &session,
+                Some(run.clone()),
+                EventPayload::RunAbsorbed(RunAbsorbed { into: host.clone() }),
+            );
+        }
+        Ok(absorbed)
     }
 }

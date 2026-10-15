@@ -6,7 +6,7 @@
 //! 所以校验和试跑都赶在旧文件还在的时候做。
 //!
 //! 资产名（`komo-<os>-<arch>.tar.gz`）、校验和文件名（`SHA256SUMS`）与仓库名是三处共同
-//! 约定：这里、`.github/workflows/release.yml`、`install.sh`。改一处就得改另外两处。
+//! 约定：这里、`.github/workflows/release.yml`、`scripts/install.sh`。改一处就得改另外两处。
 
 use std::path::Path;
 use std::time::Duration;
@@ -16,7 +16,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-/// 发布仓库；`install.sh` 的默认值必须与它一致。
+/// 发布仓库；`scripts/install.sh` 的默认值必须与它一致。
 const REPO: &str = "xyi203/komo-bot";
 /// 发布包里唯一的成员。
 const BINARY: &str = "komo";

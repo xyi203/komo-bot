@@ -278,7 +278,7 @@ impl TurnDriver for ResponsesDriver {
         self.round += 1;
 
         let effort = EffortSetting::from_option(self.model.effort.clone());
-        let body = wire::responses_request(
+        let mut body = wire::responses_request(
             &self.model,
             &self.instructions,
             &self.input,
@@ -286,6 +286,7 @@ impl TurnDriver for ResponsesDriver {
             effort.as_option(),
             self.max_output_tokens,
         );
+        wire::with_prompt_cache_key(&mut body, &self.session.to_string());
         let started = Instant::now();
         let outcome = self.round_trip(body).await;
         let elapsed_ms = started.elapsed().as_millis() as u64;

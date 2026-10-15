@@ -30,12 +30,12 @@ usage() {
 从 GitHub release 安装 komo。
 
 用法：
-  install.sh [版本] [--prefix 目录]
+  scripts/install.sh [版本] [--prefix 目录]
 
 例子：
-  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash
-  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- v0.8.0
-  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | bash -s -- --prefix /usr/local/bin
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | bash -s -- v0.8.0
+  curl -fsSL https://raw.githubusercontent.com/${REPO}/main/scripts/install.sh | bash -s -- --prefix /usr/local/bin
 
 环境变量：
   KOMO_REPO         GitHub 仓库，默认：${REPO}

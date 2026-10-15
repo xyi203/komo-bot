@@ -4139,11 +4139,10 @@ mod fused {
             .record_round(
                 &run,
                 &[(
-                    "edit",
+                    "write",
                     serde_json::json!({
                         "path": "a.txt",
-                        "match_text": "old",
-                        "replace_text": "new",
+                        "content": "new\n",
                         "expected_version": "not-the-hash",
                         "then_run": { "command": COUNTING },
                     }),

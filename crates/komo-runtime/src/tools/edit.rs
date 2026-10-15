@@ -8,6 +8,11 @@
 //! 计划因此绑定了"从这一份内容出发"：文件在计划之后被人动过，执行时版本对不上就
 //! 按版本冲突失败（§7.2「执行前再次校验目标和版本」）。
 //!
+//! 预期版本只有这一个来源，模型不给（2026-10-14 起 schema 里没有 `expected_version`）。
+//! 实测会话里模型给的那份几乎都是错的：空串 18 次全冲突，非空的 41 次冲突 22 次（多是
+//! 自己上一次 edit 之前的版本），不给的 282 次一次没冲突——prepare 刚读过的那份比模型
+//! 记得的任何一份都新。旧参数里带着的照常解码，`prepare` 把它丢掉。
+//!
 //! 重启后不重跑（`Tool::replay` 用默认的 unsafe，§8.6）：替换文本里含着被替换文本时，
 //! 重跑一遍会再替换一次。
 
@@ -37,6 +42,8 @@ pub struct EditArgs {
     /// 要被替换掉的那段内容，逐字匹配。
     pub match_text: String,
     pub replace_text: String,
+    /// 2026-10-14 之前 schema 里有它、由模型给。只为解码旧参数保留：`prepare` 丢掉它，
+    /// 新计划里永远是空的，预期版本只认 `prepare` 读到的那份。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<ExpectedVersion>,
     /// 匹配到多处时全部替换。默认 false：多处即歧义，歧义就报错。
@@ -92,10 +99,6 @@ impl Tool for EditTool {
                     "path": { "type": "string", "description": "文件路径；相对路径按工作目录解析" },
                     "match_text": { "type": "string", "description": "要替换掉的原文，逐字匹配" },
                     "replace_text": { "type": "string", "description": "替换成什么" },
-                    "expected_version": {
-                        "description": "read 返回的 version（或它的 hash）",
-                        "anyOf": [{ "type": "string" }, { "type": "object" }]
-                    },
                     "replace_all": { "type": "boolean", "description": "匹配到多处时全部替换；默认报错" },
                     "then_run": super::fusion::schema("编辑")
                 },
@@ -112,6 +115,7 @@ impl Tool for EditTool {
     ) -> Result<ExecutionPlan, ToolError> {
         let mut args: EditArgs = parse_args(args, "edit")?;
         args.result_version = None;
+        args.expected_version = None;
         let then_run = args.then_run.take();
         if args.match_text.is_empty() {
             return Err(ToolError::InvalidArguments {
@@ -145,12 +149,8 @@ impl Tool for EditTool {
             targets: vec![PlanTarget {
                 target: TargetRef::local(path),
                 access: TargetAccess::Write,
-                // 明确给了就按它；没给就按 prepare 这一刻看到的那份内容。
-                expected_version: args
-                    .expected_version
-                    .as_ref()
-                    .map(ExpectedVersion::hash)
-                    .or(before_hash),
+                // 只按 prepare 这一刻看到的那份内容。
+                expected_version: before_hash,
             }],
             versions: PlanVersions::default(),
             resources: vec![],
@@ -206,8 +206,8 @@ fn missing(path: &std::path::Path) -> ToolError {
     }
 }
 
-/// 版本核对按哪一份：参数给了就按它，没给就按**计划里那一份**——`prepare` 从真实文件
-/// 算出来的 before-hash。`edit` 与 `write` 在这里不一样：write 覆盖一个已存在的文件
+/// 版本核对按哪一份：旧计划的参数里带了就按它（新计划里永远没有），否则按**计划里那一份**
+/// ——`prepare` 从真实文件算出来的 before-hash。`edit` 与 `write` 在这里不一样：write 覆盖一个已存在的文件
 /// 必须由模型明说预期版本（它写的是整份内容，没读过也能写），而 edit 的前提就是它刚刚
 /// 匹配到的那份内容，计划已经把它钉住了。
 fn expected(args: &EditArgs, plan: &ExecutionPlan) -> Option<ContentHash> {
@@ -350,34 +350,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_stale_expected_version_stops_the_edit() {
+    async fn an_expected_version_from_the_model_is_ignored_for_what_prepare_read() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
         let ctx = context(dir.path());
         let tool = EditTool::new();
-        let plan = plan_for(
-            &tool,
-            &ctx,
-            serde_json::json!({
-                "path": "a.txt",
-                "match_text": "alpha",
-                "replace_text": "ALPHA",
-                "expected_version": ContentHash::of_str("something else").as_str()
-            }),
-        )
-        .await
-        .unwrap();
-        let error = tool
-            .execute(plan, &ctx, &mut writer(&ctx))
+        for stale in [
+            "".to_string(),
+            ContentHash::of_str("older").as_str().to_string(),
+        ] {
+            std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+            let plan = plan_for(
+                &tool,
+                &ctx,
+                serde_json::json!({
+                    "path": "a.txt",
+                    "match_text": "alpha",
+                    "replace_text": "ALPHA",
+                    "expected_version": stale
+                }),
+            )
             .await
-            .unwrap_err();
+            .unwrap();
+            assert!(plan.args.get("expected_version").is_none(), "{}", plan.args);
+            tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "ALPHA\n"
+            );
+        }
+    }
+
+    #[test]
+    fn the_schema_no_longer_offers_expected_version() {
+        let definition = EditTool::new().definition();
         assert!(
-            matches!(error, ToolError::VersionConflict { .. }),
-            "{error:?}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-            "alpha\n"
+            definition.parameters["properties"]
+                .get("expected_version")
+                .is_none()
         );
     }
 

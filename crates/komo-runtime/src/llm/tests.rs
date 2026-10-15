@@ -99,6 +99,7 @@ async fn an_unset_effort_leaves_the_reasoning_field_out_of_the_request() {
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert!(body.get("previous_response_id").is_none());
     assert_eq!(body["instructions"], json!("你是 komo"));
+    assert_eq!(body["prompt_cache_key"], json!("s-1"), "按会话路由缓存");
     assert_eq!(
         transport.requests()[0].url,
         "https://llm.example.com/v1/responses"

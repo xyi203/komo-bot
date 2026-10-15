@@ -8,9 +8,12 @@
 //!
 //! - **同一个监听同时只有一条事件在飞。** 每条事件都是一条 Run、一轮模型；上一条没收尾时
 //!   新出的行攒着，合进下一条。脚本再吵，排进会话的也只有一条。
-//! - **不跨重启。** 进程只活在这一代 Gateway 里。停机时终止进程组；`runtime/monitors/`
+//! - **默认不跨重启。** 进程只活在这一代 Gateway 里。停机时终止进程组；`runtime/monitors/`
 //!   里留着的登记由下一代启动时收掉：遗留的进程组核对身份后终止，并告诉会话"中断了"。
 //!   续跑的 `monitor` 调用认不到同一个键时答"中断了"，绝不自己重新起进程（§8.6）。
+//!   例外只有一种：挂的时候模型声明了 `resume_after_restart`（脚本只读、重跑无副作用），
+//!   登记里就带着重挂要的东西，下一代按同一个 id、同一个请求键、剩余的时限重新起它，
+//!   不额外打扰会话，只在下一条事件里注明中间断过。
 //! - **在册是自己的。** 子进程不登记进执行器的 `runtime/children/`：那里一行活着的进程会让
 //!   恢复扫描把上一代的所有 Run 停下来（§8.7），而监听与任何一条 Run 都无关。
 
@@ -58,7 +61,8 @@ const STDERR_TAIL_LINES: usize = 20;
 /// 停机时等泵收尾的上限（`run_child` 自己 TERM → KILL 各等 5 秒）。
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(12);
 
-/// `runtime/monitors/<id>.json`：一个正在跑的监听。下一代启动时按它告诉会话"中断了"。
+/// `runtime/monitors/<id>.json`：一个正在跑的监听。下一代启动时按它告诉会话"中断了"，
+/// 或者（带着 [`Resume`] 时）把它重新挂上。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Record {
     id: String,
@@ -67,7 +71,27 @@ struct Record {
     command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     peer: Option<String>,
+    /// 2026-10-14 之前的登记没有这一格：一律按"不重挂"收。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<Resume>,
 }
+
+/// 重挂一个监听要的东西：模型挂它时声明了 `resume_after_restart` 才有。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct Resume {
+    /// 挂它那次调用的请求键：续跑的 `monitor` 调用凭它认回这个监听。
+    key: RequestKey,
+    /// 挂它的那条 Run。
+    run: RunId,
+    cwd: PathBuf,
+    timeout_minutes: u64,
+    /// 到这一刻为止；重挂时只给剩下的时限。
+    #[serde(with = "time::serde::rfc3339")]
+    expires_at: time::OffsetDateTime,
+}
+
+/// 重挂时至少还剩这么久才值得起；更短就按中断收。
+const MIN_RESUME_LEFT: Duration = Duration::from_secs(60);
 
 /// 监听为什么结束了。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +251,37 @@ impl GatewayMonitors {
                 let _ = std::fs::remove_file(&path);
                 continue;
             };
+            if let Some(resume) = record.resume.clone() {
+                let left = resume.expires_at - self.state.clock.now();
+                match u64::try_from(left.whole_seconds()) {
+                    Ok(secs) if Duration::from_secs(secs) >= MIN_RESUME_LEFT => {
+                        match self.launch(&record, &resume, Duration::from_secs(secs), true) {
+                            Ok(_) => {
+                                tracing::info!(monitor = %record.id, left_secs = secs, "Gateway 重启后重挂监听");
+                                continue;
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, monitor = %record.id, "监听重挂不上，按中断收")
+                            }
+                        }
+                    }
+                    _ => {
+                        let text = end_text(
+                            &record.id,
+                            &record.title,
+                            &format!(
+                                "已结束：Gateway 重启时它的 {} 分钟时限已经到了，没有重挂",
+                                resume.timeout_minutes
+                            ),
+                            &[],
+                            0,
+                            "",
+                        );
+                        self.report_end(&record, text).await;
+                        continue;
+                    }
+                }
+            }
             let text = end_text(
                 &record.id,
                 &record.title,
@@ -235,17 +290,22 @@ impl GatewayMonitors {
                 0,
                 "",
             );
-            let peer = record.peer.as_deref().and_then(ChannelPeer::parse);
-            let key = RequestKey::new(format!("monitor-end:{}", record.id));
-            if let Err(error) = self
-                .state
-                .submit(&record.session, key, text, peer, None)
-                .await
-            {
-                tracing::warn!(%error, monitor = %record.id, "监听中断的消息交不回会话");
-            }
-            self.forget_record(&record.id);
+            self.report_end(&record, text).await;
         }
+    }
+
+    /// 给上一代留下、这一代不再接着跑的监听交回一条结束消息，并销号。
+    async fn report_end(&self, record: &Record, text: String) {
+        let peer = record.peer.as_deref().and_then(ChannelPeer::parse);
+        let key = RequestKey::new(format!("monitor-end:{}", record.id));
+        if let Err(error) = self
+            .state
+            .submit(&record.session, key, text, peer, None)
+            .await
+        {
+            tracing::warn!(%error, monitor = %record.id, "监听中断的消息交不回会话");
+        }
+        self.forget_record(&record.id);
     }
 
     /// 上一代的监听进程组：还活着、而且起来的时刻对得上登记，才终止它。pid 会被复用，
@@ -291,6 +351,7 @@ impl GatewayMonitors {
         peer: Option<ChannelPeer>,
         spec: ChildSpec,
         attempt: AttemptRef,
+        restarted: bool,
     ) {
         let (title, cancel, ending, timeout_minutes) = {
             let running = self.running.lock().expect("监听表");
@@ -313,6 +374,18 @@ impl GatewayMonitors {
 
         let mut batch = Batch::default();
         let mut events = 0u64;
+        // 重挂的监听：第一条事件注明中间断过（断开那几秒里打的行没人收到）。
+        let mut gap_note = restarted;
+        // 事件的请求键：重挂后计数从头来，键里得多一段这一代独有的，否则撞上上一代交过的
+        // `monitor:{id}:1`，被当成同一个请求吞掉。
+        let key_prefix = if restarted {
+            format!(
+                "monitor:{id}:{}",
+                komo_kernel::types::ids::uuid_v7_at(self.state.clock.now())
+            )
+        } else {
+            format!("monitor:{id}")
+        };
         let mut in_flight: Option<(RunId, Instant)> = None;
         let mut ticker = tokio::time::interval(TICK);
         loop {
@@ -338,9 +411,12 @@ impl GatewayMonitors {
                         continue;
                     }
                     events += 1;
-                    let text = event_text(&id, &title, &batch.lines(), batch.omitted());
+                    let mut text = event_text(&id, &title, &batch.lines(), batch.omitted());
+                    if std::mem::take(&mut gap_note) {
+                        text.push_str(RESTART_NOTE);
+                    }
                     batch = Batch::default();
-                    let key = RequestKey::new(format!("monitor:{id}:{events}"));
+                    let key = RequestKey::new(format!("{key_prefix}:{events}"));
                     match self.state.submit(&session, key, text, peer.clone(), None).await {
                         Ok(response) => in_flight = Some((response.run, Instant::now())),
                         Err(error) => end_with(
@@ -378,6 +454,69 @@ impl GatewayMonitors {
             self.forget_record(&id);
         }
         self.running.lock().expect("监听表").remove(&id);
+    }
+
+    /// 起一个监听：写登记、起进程、交给泵。新挂与重挂都走这里；重挂用登记里原来的 id 与
+    /// 请求键，`limit` 是剩下的时限。
+    fn launch(
+        &self,
+        record: &Record,
+        resume: &Resume,
+        limit: Duration,
+        restarted: bool,
+    ) -> Result<MonitorHandle, MonitorError> {
+        let me = self
+            .me
+            .upgrade()
+            .ok_or_else(|| MonitorError::Failed("Gateway 正在停机".into()))?;
+        if !resume.cwd.is_dir() {
+            return Err(MonitorError::Failed(format!(
+                "工作目录不存在：{}",
+                resume.cwd.display()
+            )));
+        }
+        self.write_record(record)
+            .map_err(|error| MonitorError::Failed(format!("监听登记写不进去：{error}")))?;
+        let id = record.id.clone();
+        let session = record.session.clone();
+
+        let mut env: BTreeMap<String, String> = komo_runtime::tools::shell::base_environment();
+        env.insert("KOMO_SESSION".into(), session.to_string());
+        env.insert("KOMO_MONITOR".into(), id.clone());
+        let mut child = self.shell.child_spec(
+            &record.command,
+            resume.cwd.clone(),
+            env,
+            limit,
+            format!("monitor #{} · {}", monitor::short_id(&id), record.title),
+        );
+        child.register = Some(ChildRegistration {
+            registry: Arc::new(self.children.clone()),
+            executor: ExecutorId::from_raw(id.clone()),
+        });
+
+        let live = Live {
+            key: resume.key.clone(),
+            session: session.clone(),
+            title: record.title.clone(),
+            timeout_minutes: resume.timeout_minutes,
+            cancel: CancelToken::new(),
+            ending: Arc::new(Mutex::new(None)),
+        };
+        let handle = live.handle(&id);
+        self.running
+            .lock()
+            .expect("监听表")
+            .insert(id.clone(), live);
+        let attempt = AttemptRef {
+            session: session.clone(),
+            run: resume.run.clone(),
+            call: ToolCallId::from_raw(format!("monitor-{id}")),
+            attempt: AttemptId::from_raw(id.clone()),
+        };
+        let peer = record.peer.as_deref().and_then(ChannelPeer::parse);
+        tokio::spawn(me.pump(id, session, peer, child, attempt, restarted));
+        Ok(handle)
     }
 
     /// 在飞的那条事件收尾了吗：终态，或者停在要人处理的介入上（后面的事件反正排在它后面）。
@@ -440,6 +579,7 @@ impl Monitors for GatewayMonitors {
                 return Ok(live.handle(id));
             }
         }
+        // 声明了 `resume_after_restart` 的监听已经在上面按请求键认回来了（启动时重挂过）。
         if !fresh {
             return Err(MonitorError::Interrupted(
                 "上一次挂的监听随 Gateway 重启中断了，没有自动重挂；要接着盯就重新调用 monitor"
@@ -449,65 +589,31 @@ impl Monitors for GatewayMonitors {
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(MonitorError::Failed("Gateway 正在停机".into()));
         }
-        if !spec.cwd.is_dir() {
-            return Err(MonitorError::Failed(format!(
-                "工作目录不存在：{}",
-                spec.cwd.display()
-            )));
-        }
-        let me = self
-            .me
-            .upgrade()
-            .ok_or_else(|| MonitorError::Failed("Gateway 正在停机".into()))?;
         let (session, peer_raw) = self.origin_of(from).await?;
-        let id = komo_kernel::types::ids::uuid_v7_at(self.state.clock.now()).to_string();
-        self.write_record(&Record {
+        let now = self.state.clock.now();
+        let id = komo_kernel::types::ids::uuid_v7_at(now).to_string();
+        let resume = Resume {
+            key: request_key,
+            run: from.clone(),
+            cwd: spec.cwd.clone(),
+            timeout_minutes: spec.timeout_minutes,
+            expires_at: now + time::Duration::minutes(spec.timeout_minutes as i64),
+        };
+        let record = Record {
             id: id.clone(),
             session: session.clone(),
             title: spec.title.clone(),
             command: spec.command.clone(),
-            peer: peer_raw.clone(),
-        })
-        .map_err(|error| MonitorError::Failed(format!("监听登记写不进去：{error}")))?;
-
-        let mut env: BTreeMap<String, String> = komo_runtime::tools::shell::base_environment();
-        env.insert("KOMO_SESSION".into(), session.to_string());
-        env.insert("KOMO_MONITOR".into(), id.clone());
-        let mut child = self.shell.child_spec(
-            &spec.command,
-            spec.cwd.clone(),
-            env,
+            peer: peer_raw,
+            resume: spec.resume_after_restart.then(|| resume.clone()),
+        };
+        tracing::info!(monitor = %id, %session, title = %spec.title, resume = spec.resume_after_restart, "挂上监听");
+        self.launch(
+            &record,
+            &resume,
             Duration::from_secs(spec.timeout_minutes * 60),
-            format!("monitor #{} · {}", monitor::short_id(&id), spec.title),
-        );
-        child.register = Some(ChildRegistration {
-            registry: Arc::new(self.children.clone()),
-            executor: ExecutorId::from_raw(id.clone()),
-        });
-
-        let live = Live {
-            key: request_key,
-            session: session.clone(),
-            title: spec.title.clone(),
-            timeout_minutes: spec.timeout_minutes,
-            cancel: CancelToken::new(),
-            ending: Arc::new(Mutex::new(None)),
-        };
-        let handle = live.handle(&id);
-        self.running
-            .lock()
-            .expect("监听表")
-            .insert(id.clone(), live);
-        let attempt = AttemptRef {
-            session: session.clone(),
-            run: from.clone(),
-            call: ToolCallId::from_raw(format!("monitor-{id}")),
-            attempt: AttemptId::from_raw(id.clone()),
-        };
-        let peer = peer_raw.as_deref().and_then(ChannelPeer::parse);
-        tracing::info!(monitor = %id, %session, title = %spec.title, "挂上监听");
-        tokio::spawn(me.pump(id, session, peer, child, attempt));
-        Ok(handle)
+            false,
+        )
     }
 
     async fn stop(&self, from: &RunId, monitor_id: &str) -> Result<MonitorStopped, MonitorError> {
@@ -594,6 +700,10 @@ impl Batch {
         self.total - self.head.len() - self.tail.len()
     }
 }
+
+/// 重挂之后第一条事件的附注。
+const RESTART_NOTE: &str =
+    "\n\n（中间 Gateway 重启过，这个监听已按原短号自动重挂；断开那几秒里脚本打的行没有收到。）";
 
 /// 一条事件的正文。
 fn event_text(id: &str, title: &str, lines: &[String], omitted: usize) -> String {

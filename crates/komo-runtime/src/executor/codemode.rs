@@ -20,17 +20,7 @@ use serde::Serialize;
 use super::codemode_journal::{Intent, Journal, Record, Reply, uncertain};
 use super::{CallEnv, ToolExecutor};
 use crate::codemode::{ScriptCatalog, ScriptTool};
-
-/// 脚本里调不了的：编排操作、计划与脚本自己。
-const NOT_IN_SCRIPTS: &[&str] = &[
-    "codemode",
-    "delegate",
-    "dispatch",
-    "follow",
-    "monitor",
-    "monitor_stop",
-    "update_plan",
-];
+use crate::tools::codemode::NOT_IN_SCRIPTS;
 
 /// 摘要里每次调用的参数最多留这么长。
 const ARGS_PREVIEW: usize = 512;

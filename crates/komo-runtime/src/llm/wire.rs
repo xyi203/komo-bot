@@ -50,6 +50,24 @@ pub fn responses_request(
     Value::Object(body)
 }
 
+/// `prompt_cache_key` 的长度上限（OpenAI 拒收更长的）。
+pub const PROMPT_CACHE_KEY_MAX: usize = 64;
+
+/// 给请求体挂上 `prompt_cache_key`：同一个键的请求被路由到同一批缓存机器，前缀命中更稳。
+///
+/// 键用会话 id（照 pi 的 `openai-responses.ts` 与 `openai-codex-responses.ts`，两条路都发）。
+/// 不带它时，实测同一会话里 GPT 系模型的 `cache_read` 常常落后一轮甚至归零：
+/// `codex/gpt-6.1-sol` 命中 87%、`gpt-6-sol` 81%，同期 Claude 93.5%（2026-10-13/14）。
+pub fn with_prompt_cache_key(body: &mut Value, key: &str) {
+    if key.is_empty() {
+        return;
+    }
+    let key: String = key.chars().take(PROMPT_CACHE_KEY_MAX).collect();
+    if let Value::Object(map) = body {
+        map.insert("prompt_cache_key".into(), json!(key));
+    }
+}
+
 /// Responses 的函数工具是**扁的**：`name` / `description` / `parameters` 直接挂在
 /// item 上，不像 Chat Completions 那样再包一层 `function`。
 fn tool_schema(tool: &ToolDefinition) -> Value {
@@ -286,6 +304,24 @@ mod tests {
             timeout_secs: 30,
             context_window: None,
         }
+    }
+
+    #[test]
+    fn the_prompt_cache_key_is_the_session_id_clamped_to_the_limit() {
+        let mut body = responses_request(&config(None), "sys", &[], &[], None, None);
+        assert!(body.get("prompt_cache_key").is_none());
+        with_prompt_cache_key(&mut body, "01a1395b-c001-71bf-8c9d-a2d9429dcb37");
+        assert_eq!(
+            body["prompt_cache_key"],
+            json!("01a1395b-c001-71bf-8c9d-a2d9429dcb37")
+        );
+
+        let mut body = responses_request(&config(None), "sys", &[], &[], None, None);
+        with_prompt_cache_key(&mut body, &"会".repeat(80));
+        assert_eq!(
+            body["prompt_cache_key"].as_str().unwrap().chars().count(),
+            PROMPT_CACHE_KEY_MAX
+        );
     }
 
     #[test]

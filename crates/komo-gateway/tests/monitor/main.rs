@@ -1,6 +1,6 @@
 //! 监听（`docs/monitor.md`）：`monitor` 挂上的脚本每出一行，就作为一条内部输入交回挂它的
 //! 会话；脚本收尾时交回一条结束消息；`monitor_stop` 停掉它；Gateway 重启时监听中断并
-//! 告诉会话，不自动重挂。
+//! 告诉会话，不自动重挂——除非挂的时候声明了 `resume_after_restart`。
 //!
 //! 真数据目录、真 `service::start`、真子进程；模型是按输入分流的脚本。
 
@@ -79,6 +79,16 @@ impl LlmClient for MonitorLlm {
             self.inputs.lock().unwrap().push(input);
             tokio::time::sleep(self.event_delay).await;
             Script::Reply("收到".into())
+        } else if let Some(command) = input.strip_prefix("续挂：") {
+            Script::Call(
+                "monitor",
+                serde_json::json!({
+                    "command": command,
+                    "title": "测试监听",
+                    "timeout_minutes": 2,
+                    "resume_after_restart": true
+                }),
+            )
         } else if let Some(command) = input.strip_prefix("挂：") {
             Script::Call(
                 "monitor",
@@ -127,9 +137,13 @@ impl TurnDriver for ScriptDriver {
 
 /// 挂一个监听，返回会话与短号（从模型念出来的工具结果里抠）。
 async fn arm(gateway: &Gw, command: &str) -> (SessionId, String) {
+    arm_with(gateway, "挂", command).await
+}
+
+async fn arm_with(gateway: &Gw, verb: &str, command: &str) -> (SessionId, String) {
     let session = gateway.open_session().await;
     let submitted = gateway
-        .submit(&session, "arm", &format!("挂：{command}"))
+        .submit(&session, "arm", &format!("{verb}：{command}"))
         .await;
     let detail = gateway.wait_terminal(&submitted.run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
@@ -327,6 +341,95 @@ async fn a_restart_interrupts_the_monitor_and_tells_the_session() {
 
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(!marker.exists(), "重启不该把脚本重新起来");
+
+    gateway.stop().await;
+}
+
+/// 声明了 `resume_after_restart` 的监听：重启后按原短号重新起来，不交回"中断了"，下一条事件
+/// 注明中间断过；重启前后的事件都交回了（请求键不撞）。
+#[tokio::test]
+async fn a_resumable_monitor_is_relaunched_after_a_restart_under_the_same_short_id() {
+    let home = Home::with_config(&config());
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+
+    let marker = home.path().join("still-running");
+    let (session, short) = arm_with(
+        &gateway,
+        "续挂",
+        &format!(
+            "echo started; while true; do touch {}; sleep 0.2; done",
+            marker.display()
+        ),
+    )
+    .await;
+    wait_run_keyed(&gateway, &session, "monitor:", Duration::from_secs(20)).await;
+    gateway.stop().await;
+    assert_eq!(monitor_records(&home).len(), 1, "停机时登记留给下一代");
+    let _ = std::fs::remove_file(&marker);
+
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while llm.events().len() < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let events = llm.events();
+    assert_eq!(events.len(), 2, "重启前后各一条 started：{events:#?}");
+    assert!(
+        events
+            .iter()
+            .all(|e| e.starts_with(&format!("[监听 #{short}「测试监听」]"))),
+        "{events:#?}"
+    );
+    assert!(!events[0].contains("Gateway 重启过"), "{events:#?}");
+    assert!(events[1].contains("Gateway 重启过"), "{events:#?}");
+    assert!(marker.exists(), "重挂之后脚本该在跑");
+    assert!(
+        !runs_of(&gateway, &session)
+            .await
+            .iter()
+            .any(|run| run.request_key.as_str().starts_with("monitor-end:")),
+        "重挂了就不该交回中断"
+    );
+    assert_eq!(monitor_records(&home).len(), 1, "还在跑，登记留着");
+
+    gateway.stop().await;
+}
+
+/// 重启时时限已经过了的可重挂监听：不重起，交回一条"时限已到"。
+#[tokio::test]
+async fn a_resumable_monitor_past_its_deadline_is_not_relaunched() {
+    let home = Home::with_config(&config());
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+
+    let marker = home.path().join("still-running");
+    let (session, short) = arm_with(
+        &gateway,
+        "续挂",
+        &format!("while true; do touch {}; sleep 0.2; done", marker.display()),
+    )
+    .await;
+    gateway.stop().await;
+    // 把登记里的截止时刻改到过去。
+    let record = monitor_records(&home).pop().expect("有登记");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    value["resume"]["expires_at"] = serde_json::json!("2020-01-01T00:00:00Z");
+    std::fs::write(&record, value.to_string()).unwrap();
+    let _ = std::fs::remove_file(&marker);
+
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    wait_run_keyed(&gateway, &session, "monitor-end:", Duration::from_secs(20)).await;
+    let end = llm.events().last().cloned().unwrap_or_default();
+    assert!(
+        end.starts_with(&format!("[监听 #{short}「测试监听」已结束")),
+        "{end}"
+    );
+    assert!(end.contains("时限已经到了"), "{end}");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(!marker.exists(), "过了时限不该重起");
+    assert!(monitor_records(&home).is_empty());
 
     gateway.stop().await;
 }

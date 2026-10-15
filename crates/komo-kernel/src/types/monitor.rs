@@ -25,6 +25,10 @@ pub struct MonitorSpec {
     pub cwd: std::path::PathBuf,
     /// 最长跑多久，分钟（已按 [`MAX_MONITOR_MINUTES`] 收紧）。
     pub timeout_minutes: u64,
+    /// Gateway 重启后自动重挂（同一个 id 与短号，剩余时限接着算）。只有模型声明脚本只读、
+    /// 重跑无副作用时才是 `true`——任意命令默认不自动重跑（§8.6）。
+    #[serde(default)]
+    pub resume_after_restart: bool,
 }
 
 /// 一次 `monitor` 成功后的句柄：模型把它念给操作者听。

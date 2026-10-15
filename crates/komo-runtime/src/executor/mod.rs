@@ -829,6 +829,7 @@ impl ToolExecutor {
                 command,
                 title,
                 timeout_minutes,
+                resume_after_restart,
             } => Orchestration::Monitor {
                 monitors: monitors()?,
                 spec: MonitorSpec {
@@ -836,6 +837,7 @@ impl ToolExecutor {
                     title: title.clone(),
                     cwd: env.cwd.clone(),
                     timeout_minutes: *timeout_minutes,
+                    resume_after_restart: *resume_after_restart,
                 },
             },
             Operation::MonitorStop { monitor_id } => Orchestration::MonitorStop {

@@ -13,7 +13,11 @@ patterns.
 
 ```bash
 cargo build                    # cold build budget ≤ 60s (§13.4)
-cargo test --workspace         # ALWAYS --workspace
+cargo test --workspace         # ALWAYS --workspace; ~10 min cold — from komo's shell
+                               # tool pass timeout_secs ≥ 900
+scripts/install-local.sh       # release build → ~/.local/bin/komo (atomic) → gateway restart;
+                               # worktrees share the main checkout's target/
+
 cargo fmt --check
 cargo tree -d                  # duplicate versions must be attributed per channel
 cargo build --timings          # rerun at the end of every phase, record in docs
@@ -98,7 +102,7 @@ depends on `agent`; `client` knows only protocol types.
   table, no `/sethome`.
 - **The release convention is one string in three places** (§13.6): the repo
   name, `komo-<os>-<arch>.tar.gz`, and `SHA256SUMS` appear in
-  `.github/workflows/release.yml`, `install.sh`, and
+  `.github/workflows/release.yml`, `scripts/install.sh`, and
   `crates/komo/src/update.rs` — change one, change all three. The tag must
   equal `[workspace.package].version`, or `komo update` refuses the package.
 - **Config hot-reloads** (§3): one `Arc<ConfigSnapshot>` swapped atomically;

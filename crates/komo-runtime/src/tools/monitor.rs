@@ -28,6 +28,9 @@ pub struct MonitorArgs {
     /// 最长跑多久，分钟。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_minutes: Option<u64>,
+    /// 脚本只读、重跑无副作用：Gateway 重启后自动重挂。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume_after_restart: bool,
 }
 
 #[derive(Debug, Default)]
@@ -55,8 +58,11 @@ impl Tool for MonitorTool {
                  ③ 失败状态也要打印（failed / canceled / Error / 进程崩溃），只打成功标志的话出事时\
                  什么也看不到；④ 盯有终点的事（流水线跑完）就让脚本到终态时自己退出；\
                  ⑤ 轮询循环里 sleep 不要短于 15 秒。只要等一次结果的事用 shell 的轮询循环就够了，\
-                 不用挂监听。timeout_minutes 省略 = 30，上限 {MAX_MONITOR_MINUTES}；Gateway 重启时\
-                 监听会中断并通知你，不会自动重挂。"
+                 不用挂监听。timeout_minutes 省略 = 30，上限 {MAX_MONITOR_MINUTES}。\n\
+                 Gateway 重启时监听会中断：脚本只读、重跑一遍没有副作用（轮询状态、查进度、\
+                 tail 日志）就设 resume_after_restart = true，重启后按原短号自动重挂、剩余时限\
+                 接着算，不用你再挂；会改东西的脚本（发消息、写文件、触发操作）别设，中断时会\
+                 通知你。"
             ),
             parameters: serde_json::json!({
                 "type": "object",
@@ -77,6 +83,10 @@ impl Tool for MonitorTool {
                         "type": "integer",
                         "minimum": 1,
                         "description": "最长跑多久，分钟；省略 = 30"
+                    },
+                    "resume_after_restart": {
+                        "type": "boolean",
+                        "description": "脚本只读、重跑无副作用时设 true：Gateway 重启后自动重挂；默认 false"
                     }
                 },
                 "required": ["command", "title"],
@@ -114,6 +124,7 @@ impl Tool for MonitorTool {
                 command: args.command.clone(),
                 title: args.title.trim().to_string(),
                 timeout_minutes: clamp_minutes(args.timeout_minutes),
+                resume_after_restart: args.resume_after_restart,
             },
             run: Some(ctx.run.clone()),
             tool_call: Some(ctx.call.clone()),
@@ -249,6 +260,7 @@ mod tests {
             command,
             title,
             timeout_minutes,
+            resume_after_restart,
         } = &plan.operation
         else {
             panic!("{:?}", plan.operation)
@@ -256,8 +268,37 @@ mod tests {
         assert_eq!(command, "glab ci status --live");
         assert_eq!(title, "MR !12 流水线");
         assert_eq!(*timeout_minutes, MAX_MONITOR_MINUTES);
+        assert!(!resume_after_restart, "默认不自动重挂");
         assert_eq!(plan.cwd.as_deref(), Some(ctx.cwd.as_path()));
         assert_eq!(plan.recovery, RecoveryMode::VerifyTarget);
+    }
+
+    /// 旧计划没有 `resume_after_restart`：解码成 false，再编码一个字节不差（计划哈希不变）；
+    /// 声明了的才进 JSON。
+    #[tokio::test]
+    async fn resume_after_restart_is_opt_in_and_old_plans_keep_their_bytes() {
+        let old = serde_json::json!({
+            "kind": "monitor", "command": "glab ci status", "title": "t", "timeout_minutes": 30
+        });
+        let decoded: Operation = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), old);
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let plan = MonitorTool::new()
+            .prepare(
+                serde_json::json!({ "command": "glab ci status", "title": "t", "resume_after_restart": true }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            plan.operation,
+            Operation::Monitor {
+                resume_after_restart: true,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

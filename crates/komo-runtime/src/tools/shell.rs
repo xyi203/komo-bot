@@ -276,7 +276,8 @@ impl Tool for ShellTool {
                  只是看文件、搜代码、列文件用 read / rg（列文件设 list_files=true），\
                  要读要搜好几处用 codemode。\
                  等一件慢事（下载、构建、部署）就在一条命令里循环轮询、每轮打印一行进度，并把 \
-                 timeout_secs 给够；到点会终止进程组，到点前打印的输出照样交回，接着再发一条即可。\
+                 timeout_secs 给够：release 构建、整个工作区的测试常要 5–15 分钟，给 900 以上，\
+                 别用默认的 120；到点会终止进程组，到点前打印的输出照样交回，接着再发一条即可。\
                  不要每轮只 sleep 一下就交回来再问一次。"
                     .into(),
             parameters: serde_json::json!({

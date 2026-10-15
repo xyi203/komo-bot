@@ -57,22 +57,27 @@ stdin / stdout 正常。
 ```scheme
 (version 1)
 (deny default)
-(allow process-exec (literal "<sys.executable>") (subpath "<sys.prefix>") (subpath "<sys.base_prefix>"))
+(allow process-exec (literal "<sys.executable>") (literal "<它的真实路径>") <roots>)
 (allow process-fork)
 (allow file-map-executable)
 (allow file-read-metadata)
-(allow file-read* (subpath "<sys.prefix>") (subpath "<sys.base_prefix>")
+(allow file-read* <roots>
                   (subpath "/System") (subpath "/usr/lib") (subpath "/private/var/db/dyld")
                   (literal "/dev/null") (literal "/dev/urandom") (literal "/"))
 (allow sysctl-read)
 (allow file-write-data (literal "/dev/null"))
 ```
 
+- `<roots>` 是 `sys.prefix`、`sys.base_prefix` 与它们 `canonicalize` 之后的真实路径（去重）各一条
+  `subpath`。Seatbelt 按解析后的真实路径匹配：Homebrew 的框架版 Python 报的 prefix 走
+  `/opt/homebrew/opt/…` 这条符号链接，dyld 却从 `Cellar/…` 加载 `Python.framework`，只放前者
+  就起不来（2026-10-14 实测 3.14：`Library not loaded … file system sandbox blocked open()`）。
 - **没有** `network*`、没有 `file-write*`（`/dev/null` 除外）、`process-exec` 只放解释器与它的安装目录
   （框架版 Python 启动时会再 exec 一次安装目录里的 `Python.app`；起来的仍在同一个沙箱里）。
 - 解释器的路径在 Gateway 启动时探一次（`sys.executable`、它的真实路径、`sys.prefix`、
   `sys.base_prefix`）。托管 venv（§5.1）的 `site-packages` 在 `sys.prefix` 下，所以**装好的库
-  可以只读导入**；没建 venv 时退回系统 `python3`，只有标准库。
+  可以只读导入**；没建 venv 时退回 `PATH` 里版本最高的 `python3.N`（3.10 起；一个都没有才是裸
+  `python3`——macOS 上那常是 3.9），只有标准库。
 - 脚本不落盘：driver 用 `-c` 传入，脚本正文走 stdin。
 - 环境变量清空，只给 `LANG`；凭证一个都不给。
 
@@ -128,7 +133,11 @@ stdin / stdout 正常。
 `tools.<name>(**args)` → executor 的持久化子调用路径，依次：
 
 1. 名字必须在当前 Run 的 `AgentSurface` 及 executor 工具表里；不回退到全局目录。
-   `codemode`、`delegate`、`dispatch`、`follow`、`update_plan` 不能在脚本里调。
+   `shell`、`python`、`edit`、`write`、`codemode`、`delegate`、`dispatch`、`follow`、`monitor`、
+   `monitor_stop`、`update_plan` 不能在脚本里调（`tools/codemode.rs` 的 `NOT_IN_SCRIPTS`），也不进
+   `TOOLS`。脚本正文里字面写着 `tools.<这些名字>(` 的，`codemode` 的 `prepare` 就拒、脚本不运行：
+   实测模型常把 `tools.shell("git status")` 当成只读写进脚本，跑到那一行才被拒，整段作废，前面的
+   MCP 写也可能已经做了（2026-10-13/14 十二次）。`getattr` 之类的绕法认不出，照样在这一步与第 2 步拒。
 2. `tool.prepare(args)` 验证参数和约束。允许 `ReadFile`（read、rg）与 `McpCall`（含写操作）；
    本地 write / edit / shell / python、编排、`then_run` 仍在脚本外执行。
 3. 完整参数、准备计划与 `plan.recovery.replay().and(tool.replay())` 先发布外置正文，再同步追加

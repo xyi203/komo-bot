@@ -14,7 +14,7 @@
 ## 2. 形状（照 Claude Code 的 Monitor）
 
 ```text
-会话里的模型 ── monitor(command, title, timeout_minutes?) ──▶ "已开始监听 #3f2a：标题"，这一轮收尾
+会话里的模型 ── monitor(command, title, timeout_minutes?, resume_after_restart?) ──▶ "已开始监听 #3f2a：标题"，这一轮收尾
                                         │
                      Gateway 起脚本（bash、数据目录只读挂载，与 shell 同一套）
                                         │ stdout 逐行
@@ -65,14 +65,14 @@
 | 到了时限 | 结束消息：超时 | 删 |
 | 刷屏 / 事件到上限 / 交不回会话 | 结束消息：原因 | 删 |
 | 模型调 `monitor_stop` | 不交回（它自己知道） | 删 |
-| Gateway 停机 | 不交回 | **留着**，下一代启动时交回"中断了" |
+| Gateway 停机 | 不交回 | **留着**，下一代启动时交回"中断了"，或（声明了 `resume_after_restart`）重挂 |
 
 `monitor_stop(monitor_id)` 只在挂它的那个会话里找；短号对不上时列出这个会话还在跑的监听，
 撞号时列出 6 位候选。
 
 ## 5. 重启
 
-**监听不跨重启。** 进程只活在这一代 Gateway 里：
+**监听默认不跨重启。** 进程只活在这一代 Gateway 里：
 
 - 停机（`Running::stop`）先终止所有监听的进程组（`run_child` 的 TERM → KILL），登记
   `runtime/monitors/<id>.json` 留着。
@@ -80,7 +80,7 @@
   里的遗留进程组（Gateway 崩了没来得及停）**核对身份后**终止——pid 会复用，按
   `ps -o etime=` 换算的起来时刻与登记差 10 秒以内才算同一个，对不上宁可留着也不误杀；
   然后每份登记给它的会话交回一条"已中断：Gateway 重启了，脚本没有在跑，也不会自动重挂"，
-  登记删掉。
+  登记删掉。声明了 `resume_after_restart` 的例外，见下。
 - 在册不进执行器的 `runtime/children/`：那里一行活着的进程会让恢复扫描把上一代的所有 Run
   停下来（§8.7），而监听与任何一条 Run 都无关。
 
@@ -88,6 +88,25 @@
 调用，这一世回来收口时（`fresh = false`）只认同一个请求键 `monitor:{run}:{call}` 下还在跑
 的那个；认不到就答"上一次挂的监听随 Gateway 重启中断了，没有自动重挂"——任意命令不自动
 重跑（§8.6）。
+
+**可重挂的监听（2026-10-14）。** 模型挂的时候声明 `resume_after_restart = true`（工具说明：
+脚本只读、重跑一遍没有副作用——轮询状态、查进度、tail 日志），登记里就多一格 `resume`：
+挂它那次调用的请求键、挂它的 Run、工作目录、时限与截止时刻。下一代启动时（同样在调度器之前、
+收完遗留进程组之后）：
+
+- 截止前至少还剩 1 分钟：**同一个 id、同一个短号、同一个请求键**重新起脚本，时限只给剩下的；
+  不额外交回消息（一条消息就是一轮模型），只在重挂后的第一条事件末尾注明"中间 Gateway 重启过，
+  断开那几秒里脚本打的行没有收到"。事件的请求键多一段这一代独有的 UUIDv7
+  （`monitor:{id}:{代}:{n}`），否则重挂后从 1 数起，撞上上一代交过的 `monitor:{id}:1` 被吞掉。
+  续跑的 `monitor` 调用按请求键认回它，答的是同一个句柄。
+- 已经过了截止（或剩不到 1 分钟）、或重挂不上（工作目录没了）：照不可重挂的那样交回结束消息。
+- 2026-10-14 之前的登记没有 `resume`，一律按不重挂收；`Operation::Monitor` 的
+  `resume_after_restart` 为 `false` 时不进 JSON，旧计划的哈希不变。
+
+为什么要它：实测（10-14 会话 `01a13911`）盯一次 stg 刷数的 40 分钟里，Gateway 因为本地重装
+komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（读中断消息、查一遍现状、重新挂），
+而那个脚本只是每两分钟查一次库里的进度。为什么不默认开：任意命令不自动重跑（§8.6），
+"这个脚本重跑无害"只有写它的模型知道，与 `Tool::replay` 默认 `Unsafe` 同一个道理。
 
 ## 6. 没做的
 
@@ -109,9 +128,14 @@
   没了，不再交回结束消息。
 - `a_restart_interrupts_the_monitor_and_tells_the_session`：停机终止脚本、登记留着；重启后
   会话收到"已中断"，脚本没有被重新起来。
+- `a_resumable_monitor_is_relaunched_after_a_restart_under_the_same_short_id`：声明了
+  `resume_after_restart` 的，重启后脚本重新跑起来、短号不变、不交回"中断了"；重启前后各一条
+  事件都交回了，后一条注明断过。
+- `a_resumable_monitor_past_its_deadline_is_not_relaunched`：截止时刻已过的不重起，交回
+  "时限已经到了"。
 
 单元测试：`service::monitors`（切行、合批、结束原因、`etime` 解析、正文）、
-`tools::monitor`（计划、时限收紧、空参数）、`types::monitor`（短号、时限）。
+`tools::monitor`（计划、时限收紧、空参数、`resume_after_restart` 默认关且旧计划字节不变）、`types::monitor`（短号、时限）。
 
 **未验证**：Linux 上 bwrap 包着的脚本（`--die-with-parent` 让崩溃时脚本随 Gateway 一起没，
 遗留进程组那一支在 Linux 上走不到）与 systemd 停机时的进程组回收；以上测试都在 macOS 上跑。

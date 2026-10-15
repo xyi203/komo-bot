@@ -127,6 +127,44 @@ impl PythonEnvConfig {
     }
 }
 
+/// 受管理环境还没建时退回哪个系统解释器：`PATH` 里版本最高的 `python3.N`，一个都没有才是
+/// 裸的 `python3`。
+///
+/// 裸 `python3` 在 macOS 上常常是 `/usr/bin/python3`（3.9），哪怕 Homebrew / uv 装着 3.12、3.14——
+/// 它们只提供带版本号的名字。实测会话里因此缺 `tomllib`、`fromisoformat` 读不了 komo 自己的时间戳，
+/// 白费好几轮。
+///
+/// 从 3.20 往下找到 3.10；每个版本按 `PATH` 顺序取第一个可执行文件。
+pub fn system_interpreter(path_var: Option<&std::ffi::OsStr>) -> PathBuf {
+    let dirs: Vec<PathBuf> = path_var
+        .map(|value| std::env::split_paths(value).collect())
+        .unwrap_or_default();
+    for minor in (10..=20).rev() {
+        let name = format!("python3.{minor}");
+        for dir in &dirs {
+            let candidate = dir.join(&name);
+            if is_executable(&candidate) {
+                return candidate;
+            }
+        }
+    }
+    PathBuf::from("python3")
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
+}
+
 /// [`PythonHost`] 的生产实现。
 pub struct PythonRuntime {
     config: PythonEnvConfig,
@@ -1209,6 +1247,37 @@ def ping():
             .await
             .unwrap_err();
         assert!(matches!(error, PyError::Cancelled), "{error:?}");
+    }
+
+    #[cfg(unix)]
+    fn fake_python(dir: &Path, name: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_fallback_interpreter_is_the_newest_versioned_python_on_path() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        fake_python(first.path(), "python3");
+        fake_python(first.path(), "python3.11");
+        let newest = fake_python(second.path(), "python3.14");
+        // 不可执行的不算。
+        std::fs::write(first.path().join("python3.15"), "").unwrap();
+        let path = std::env::join_paths([first.path(), second.path()]).unwrap();
+        assert_eq!(system_interpreter(Some(&path)), newest);
+    }
+
+    #[test]
+    fn without_a_versioned_python_the_fallback_is_bare_python3() {
+        let empty = tempfile::tempdir().unwrap();
+        let path = std::env::join_paths([empty.path()]).unwrap();
+        assert_eq!(system_interpreter(Some(&path)), PathBuf::from("python3"));
+        assert_eq!(system_interpreter(None), PathBuf::from("python3"));
     }
 
     #[tokio::test]

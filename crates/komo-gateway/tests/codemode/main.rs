@@ -81,23 +81,42 @@ text("\n".join(hits))
     assert!(result.contains("调用了 2 次工具：read×2"), "{result}");
 }
 
-/// 会改东西的工具在脚本里调不了：抛 ToolError，文件没被写。
+/// 会改东西的工具在脚本里调不了：字面写着 `tools.write(` 的脚本在运行前就被拒，前面那句
+/// `text` 也没机会跑；文件没被写。
 #[tokio::test]
-async fn a_write_inside_a_script_is_refused() {
+async fn a_write_inside_a_script_is_refused_before_the_script_runs() {
+    let home = Home::new();
+    let code = r#"
+text("started")
+tools.write(path="x.txt", content="y")
+"#;
+    let Some((_, _, result)) = run_script(&home, code).await else {
+        return;
+    };
+    assert!(result.contains("脚本里调不了 write"), "{result}");
+    assert!(!result.contains("started"), "脚本不该跑过：{result}");
+    assert!(!home.workspace().join("x.txt").exists());
+}
+
+/// 绕过字面写法（`getattr`）也调不到：`write` 不在脚本的工具表里，抛 ToolError。
+#[tokio::test]
+async fn a_write_reached_through_getattr_is_still_refused() {
     let home = Home::new();
     let code = r#"
 try:
-    tools.write(path="x.txt", content="y")
+    getattr(tools, "write")(path="x.txt", content="y")
 except ToolError as error:
     text("refused: " + str(error))
+text("write" in TOOLS)
 "#;
     let Some((_, _, result)) = run_script(&home, code).await else {
         return;
     };
     assert!(
-        result.contains("refused: ") && result.contains("write 不是只读工具或 MCP"),
+        result.contains("refused: ") && result.contains("脚本里没有 write"),
         "{result}"
     );
+    assert!(result.contains("false"), "TOOLS 里不该有 write：{result}");
     assert!(!home.workspace().join("x.txt").exists());
 }
 

@@ -90,6 +90,12 @@ impl Tool for WriteTool {
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
         let mut args: WriteArgs = parse_args(args, "write")?;
+        // 空串不是一个版本，是没给：按没给走，覆盖已有文件时报的是「先 read 一次」，
+        // 而不是一句「预期 ，当前 …」的版本冲突。
+        if matches!(&args.expected_version, Some(ExpectedVersion::Hash(raw)) if raw.trim().is_empty())
+        {
+            args.expected_version = None;
+        }
         let then_run = args.then_run.take();
         let path = super::paths::resolve(&args.path, &ctx.cwd)?;
         // 唯一的硬限制（§7）：komo 自己的状态不许改。带 `then_run` 也一样——计划不成立，
@@ -310,21 +316,21 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
         let ctx = context(dir.path());
         let tool = WriteTool::new();
-        let plan = tool
-            .prepare(
-                serde_json::json!({ "path": "a.txt", "content": "new\n" }),
-                &ctx,
-            )
-            .await
-            .unwrap();
-        let error = tool
-            .execute(plan, &ctx, &mut writer(&ctx))
-            .await
-            .unwrap_err();
-        let ToolError::VersionConflict { path } = &error else {
-            panic!("{error:?}")
-        };
-        assert!(path.contains("expected_version"), "{path}");
+        // 空串与没给是同一回事：都要叫模型先 read。
+        for args in [
+            serde_json::json!({ "path": "a.txt", "content": "new\n" }),
+            serde_json::json!({ "path": "a.txt", "content": "new\n", "expected_version": "" }),
+        ] {
+            let plan = tool.prepare(args, &ctx).await.unwrap();
+            let error = tool
+                .execute(plan, &ctx, &mut writer(&ctx))
+                .await
+                .unwrap_err();
+            let ToolError::VersionConflict { path } = &error else {
+                panic!("{error:?}")
+            };
+            assert!(path.contains("先 read 一次"), "{path}");
+        }
         assert_eq!(
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "old\n",

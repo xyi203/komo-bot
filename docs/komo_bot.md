@@ -247,6 +247,8 @@ status / result / stdout / stderr / artifacts
 
 长期状态写入文件；依赖按锁定清单安装。环境变更串行进行，正在使用的环境版本保持不变。依赖升级需要新的环境版本，成功后再切换后续调用。
 
+虚拟环境还没建出来时，`python` 与 codemode 退回 `PATH` 里版本最高的 `python3.N`（3.10 起），一个都没有才用裸 `python3`，`env_version` 如实写成那个解释器的版本 + `no-lock`。不直接用裸 `python3` 的原因（2026-10-14）：macOS 上它是 `/usr/bin/python3`（3.9），Homebrew / uv 装的新版本只提供带版本号的名字；实测会话里模型因此缺 `tomllib`、`fromisoformat` 读不了 komo 自己小数位数不定的时间戳，白耗好几轮。
+
 ### 5.2 两种 Python 调用形式
 
 任意代码：
@@ -425,7 +427,7 @@ workspace = "code/komo"
 
 **后台任务。** home session 用它自己的 Agent 跑，不另设分发器身份；要跑很久的事由模型调 `dispatch` 派进一条独立的任务会话（同一个 Agent），结果收尾时作为一条内部输入交回派它的会话、由它转告，见 `docs/background-tasks.md`。
 
-**监听。** 要"每出一件事就知道"（MR 流水线的每个 job、工单的每次状态变化、日志里的每条报错）时，模型调 `monitor` 在 Gateway 里挂一个长时间跑的脚本：它的 stdout 每出一行（按批合并，同一个监听同时只有一条在飞）就作为一条内部输入交回挂它的会话，脚本退出或超时时再交回一条结束消息；`monitor_stop` 停掉它。监听不跨重启：停机终止脚本，下一代启动时告诉会话"中断了"，不自动重挂，见 `docs/monitor.md`。
+**监听。** 要"每出一件事就知道"（MR 流水线的每个 job、工单的每次状态变化、日志里的每条报错）时，模型调 `monitor` 在 Gateway 里挂一个长时间跑的脚本：它的 stdout 每出一行（按批合并，同一个监听同时只有一条在飞）就作为一条内部输入交回挂它的会话，脚本退出或超时时再交回一条结束消息；`monitor_stop` 停掉它。监听默认不跨重启：停机终止脚本，下一代启动时告诉会话"中断了"，不自动重挂；模型挂的时候声明了 `resume_after_restart`（脚本只读、重跑无副作用）的，下一代按原短号、剩余时限重新起它，见 `docs/monitor.md` §5。
 
 ### 6.2 冻结的是身份
 
@@ -1545,6 +1547,7 @@ model = "gpt-5-codex"
 ```
 
 - Codex 走的协议就是 OpenAI Responses API 的 SSE 流，复用同一个 Responses 适配器（`store: false` + `include: ["reasoning.encrypted_content"]`、原样回放 `provider_blocks`）——不是一个新协议，只是凭证来源不同。请求体不带 `max_output_tokens` / `temperature` / `top_p` / `stop` / `prompt_cache_retention`。
+- Responses 适配器（API key 与 Codex 两条路）的请求体都带 `prompt_cache_key: <当前 Session id>`（64 字符封顶），照 pi：同一个键的请求路由到同一批缓存机器。起因（2026-10-14）：不带时同一会话里 GPT 系模型的 `cache_read` 常落后一轮甚至归零，`codex/gpt-6.1-sol` 命中 87%、`gpt-6-sol` 81%，同期 Claude 93.5%。
 - 请求头额外带 `Authorization: Bearer <access_token>`、`ChatGPT-Account-ID: <JWT 里的 chatgpt_account_id>`、`originator: komo`、`session_id: <当前 Session id>`。
 - 凭证文件是 `<数据目录>/codex/auth.json`（权限 0600，原子写），**不是** `~/.codex/auth.json`——那是 Codex CLI 自己的文件，`refresh_token` 单次有效会轮换，写它一次就可能把 Codex CLI 挤下线。
 - `komo auth codex login`：设备码登录，终端显示配对码与网址，轮询直到确认或超时（约 10 分钟）；不经 Gateway，直接落盘（同 `komo channel wechat login` 的先例）。`komo auth codex status` 给账号、邮箱、套餐与过期时间，不打印 token。
@@ -1681,7 +1684,7 @@ kernel ← client ────────────────────�
 | `openlark` | 仅 gateway，feature `feishu`（默认开），`default-features = false, features = ["websocket"]` | 只要 ws 长连接；事件负载用 `register_raw` 拿原始 JSON、自己的宽容 serde 结构解析。带来 `prost 0.13`（turso 同步引擎用 0.14）和一份 `tokio-tungstenite` 重复——接受，不再自己额外引入 tungstenite |
 | `wechatbot` | 仅 gateway，feature `wechat`（默认开）；**`[patch.crates-io]` 指向 `vendor/wechatbot`**（0.4.0 原样复制，只改 `Cargo.toml` 一行：reqwest `0.12` 默认特性 → `0.13`，`default-features = false, features = ["json", "rustls-no-provider", "http2", "charset"]`） | 上游所有发布版本都写 `reqwest = { version = "0.12", features = ["json"] }`，默认特性开着 = native-tls = openssl-sys，自己一个 feature 都没有；cargo 特性只加不减，工作区里无论怎么声明都关不掉。patch 后复用 komo `main` 装的同一个 ring provider，openssl / native-tls / hyper-tls 整条 C 构建链消失，**构建不再依赖任何系统库**（Fedora 不必 `openssl-devel`，Mac 不必 `brew install openssl@3`），且 reqwest 只剩 0.13 一份（wechatbot 用到的 reqwest API 面极小，0.13 全保留；2026-09-16 实测默认特性全量构建通过）。不选 vendored openssl：OpenSSL 3.6.3、1210 个 .c，`make depend` / `install_dev` 串行，估 2–3 分钟且在 wechat 关键路径起点，会取代 turso 链成为新关键路径。升级 wechatbot = 重新复制 + 重打这一行，见 `vendor/README.md` |
 | `qrcode` | `default-features = false`；微信登录二维码渲染为终端字符 | 不需要 `image` |
-| `libc` | `0.2`，仅 komo-runtime 的 Linux 目标 | codemode 的 Linux 沙箱（`docs/codemode.md` §4）：Landlock / seccomp 走裸系统调用，要系统调用号与 `sock_filter`。原本就被 tokio 等拉进依赖树，不新增包、不新增重复版本；不引 `landlock` / `seccompiler` |
+| `libc` | `0.2`，仅 komo-runtime 的 unix 目标 | codemode 的 Linux 沙箱（`docs/codemode.md` §4）：Landlock / seccomp 走裸系统调用，要系统调用号与 `sock_filter`；Gateway 起来时 `setrlimit` 抬能开的文件数（`limits.rs`，launchd 默认软上限 256，子进程跑 `cargo test` 不够）。原本就被 tokio 等拉进依赖树，不新增包、不新增重复版本；不引 `landlock` / `seccompiler` |
 | `rmcp` | `3.x`，`default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest-tls-no-provider", "auth"]`；仅 komo-runtime | MCP 客户端（`docs/mcp.md`），官方 Rust SDK。HTTP 走工作区同一个 reqwest 0.13（rustls-no-provider），不开 server 与宏。`auth`（2026-10-14，`oauth = true` 的服务器，`docs/mcp.md` §2.1）新拉 `oauth2 5.0`（不开默认特性），它的 chrono / rand / url 等依赖图里已有，Cargo.lock 只多这一个包。新拉 `process-wrap`、`sse-stream`、`futures`，新增一条重复版本 `nix 0.31`（process-wrap；既有 0.29）。实测（2026-10-08，增量重编）：rmcp 2.8s + 构建脚本 0.3s + process-wrap / sse-stream 各 0.2–0.3s |
 | **不引入** | image | — |
 | `tantivy` / `zstd-sys`（经 `turso` 默认特性 `fts`） | **已做**：工作区的 `turso` 写 `default-features = false, features = ["mimalloc"]`；`toasty-driver-turso` 0.11 起上游自己对 `turso` 关了默认特性，原先 `vendor/toasty-driver-turso` 那份补丁（只改 manifest 里 `turso` 那几行）已删 | 实测（2026-09-16）：冷编 71.5s → 64.2s，编译单元 577 → 515，单元耗时总和 −36s CPU，`tantivy` / `zstd` / `lz4_flex` 从依赖树消失，少一条 C 工具链。墙钟只省 7s 是因为它们与 `aws-lc-sys` 并行、不在关键路径。功能零损失：turso 的 FTS 是索引方法，MVCC 直接拒绝。升级 toasty 时核对驱动对 `turso` 的版本与特性，CI 用 `cargo tree -e features -i turso` 断言只剩 `mimalloc`；见 `vendor/README.md` |
@@ -1873,7 +1876,7 @@ pub trait Clock: Send + Sync {
 
 发布产物由 `.github/workflows/release.yml` 在 `v*` 标签上构建，四个平台各一个包：`komo-darwin-arm64.tar.gz`、`komo-darwin-amd64.tar.gz`、`komo-linux-amd64.tar.gz`、`komo-linux-arm64.tar.gz`，外加一份共用的 `SHA256SUMS`（`sha256sum` 的默认两列格式）。**包内只有一个成员 `komo`**。linux 包在 Ubuntu 22.04 上原生构建（ring 与 mimalloc 编 C，不走交叉编译），glibc 下限因此是 2.35；darwin 两个架构都在 arm64 runner 上出。
 
-装与升级是同一条约定的两个入口：`install.sh`（仓库根，`curl -fsSL …/main/install.sh | bash`，认平台 → 问 `releases/latest` 或 `KOMO_VERSION` → 下包与 `SHA256SUMS` → `shasum`/`sha256sum` 核对 → `tar -xzf` → 落到 `komo.new` 再 `mv -f`；默认装到 `~/.local/bin`，不用 sudo，`--prefix` / `KOMO_INSTALL_DIR` 可改——2026-09-24 起，原来是 `/usr/local/bin`）和 `komo update`（§3，用 Rust 自己走一遍同一套名字与校验，`crates/komo/src/update.rs`）。仓库名、资产名、校验和文件名三处必须一致：那两个文件加这里。
+装与升级是同一条约定的两个入口：`scripts/install.sh`（`curl -fsSL …/main/scripts/install.sh | bash`，认平台 → 问 `releases/latest` 或 `KOMO_VERSION` → 下包与 `SHA256SUMS` → `shasum`/`sha256sum` 核对 → `tar -xzf` → 落到 `komo.new` 再 `mv -f`；默认装到 `~/.local/bin`，不用 sudo，`--prefix` / `KOMO_INSTALL_DIR` 可改——2026-09-24 起，原来是 `/usr/local/bin`）和 `komo update`（§3，用 Rust 自己走一遍同一套名字与校验，`crates/komo/src/update.rs`）。仓库名、资产名、校验和文件名三处必须一致：那两个文件加这里。
 
 `komo update` 的顺序是**下载 → 校验 sha256 → 解包 → 试跑 `--version` → 同目录 `rename`**。三条不变量：
 
@@ -1882,6 +1885,8 @@ pub trait Clock: Send + Sync {
 3. **只换磁盘上那份，不碰在跑的进程**。发现文件里核对得上一个在跑的 Gateway 时就打印 `komo gateway restart`，**不替操作者重启**：重启会打断正在跑的 Run，那不该由一条更新命令决定。
 
 只报告，不降级：装着的比最新发布新（源码构建的开发机、或者刚回滚过）时只说一句"发布的比它旧"，什么都不做。
+
+**从本地源码装**是第三个入口：`scripts/install-local.sh [--prefix DIR] [--no-restart]`——`cargo build --release --locked -p komo` → 试跑 `--version` → 复制成 `komo.new` 再 `mv -f`（旧的留 `komo.bak`）→ `komo gateway restart`。与 `komo update` 的第 3 条不变量不同，它**替操作者重启**：会跑它的人就是在本机改 komo 的人，装完不重启等于没装（实测会话里每次"本地重新安装"都以手动重启收尾）；在 komo 的 shell 工具里跑时重启照常推迟到这条命令的结果记进会话之后，声明了 `resume_after_restart` 的监听重启后自动重挂（`docs/monitor.md` §5）。在 git worktree 里跑、且没设 `CARGO_TARGET_DIR` 时共用主检出的 `target/`：实测（2026-10-14）在新 worktree 里冷编 release 用了 659 秒，而依赖本来可以共用。
 
 已核实（2026-09-20，本机 macOS arm64）：`install.sh --prefix` 走真实 `v0.0.2` 发布包，核对与安装都通过，包内成员名就是 `komo`；`komo update` 打真实 `api.github.com`，正确判定"发布的比它旧"并停在原地；`update.rs` 的下载 → 校验 → 解包三段用真实 `v0.0.2` 资产生跑过一遍——`SHA256SUMS` 认得、GNU tar 打的包解得出来（50318240 字节，与 `install.sh` 装出来的那份一致），试跑按预期拒收了标签对不上的那个包（`v0.0.2` 的二进制自报 `0.1.0+00b23c6`，正是上面第 2 条要挡的形状）。发布流程自身（四平台构建 + 校验和 + provenance + 发布）要等 v0.8 的第一个 `v*` 标签才会真跑一次。
 

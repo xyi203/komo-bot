@@ -5,6 +5,7 @@ pub mod codemode;
 pub mod config;
 pub mod embedding;
 pub mod executor;
+pub mod limits;
 pub mod llm;
 pub mod mcp;
 pub mod mcp_auth;

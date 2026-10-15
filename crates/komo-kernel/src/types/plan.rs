@@ -100,6 +100,10 @@ pub enum Operation {
         command: String,
         title: String,
         timeout_minutes: u64,
+        /// 模型声明脚本只读、重跑无副作用：Gateway 重启后按原短号自动重挂。`false` 不进
+        /// JSON，旧计划的哈希不变。
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        resume_after_restart: bool,
     },
     /// 停掉这个会话挂着的一个监听。`monitor_id` 是模型给的短号原文。
     MonitorStop { monitor_id: String },

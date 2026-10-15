@@ -577,12 +577,16 @@ pub fn python_env(
     // 不静默：`env_version` 会变成系统解释器的版本 + `no-lock`，那正是"这台机器上跑的
     // 是哪一个解释器、锁没锁依赖"的诚实答案（§5.1）。反过来，让整个 `python` 工具因为
     // 一个还没 `python -m venv` 过的目录而消失，等于把一句诊断换成一个空白。
+    // 退回的是 `PATH` 里版本最高的 `python3.N`，不是裸 `python3`（macOS 上那常是 3.9）。
     if !python.interpreter_path().exists() {
+        let fallback =
+            komo_runtime::python_runtime::system_interpreter(std::env::var_os("PATH").as_deref());
         tracing::warn!(
             env_root = %python.env_root.display(),
-            "受管理的 Python 环境还没建出来，这次退回系统 python3"
+            interpreter = %fallback.display(),
+            "受管理的 Python 环境还没建出来，这次退回系统解释器"
         );
-        python.interpreter = Some(std::path::PathBuf::from("python3"));
+        python.interpreter = Some(fallback);
     }
     python.toolbox_parent = Some(toolbox.layout().parent());
     python.denied_imports = toolbox.layout().denied_import_roots();
@@ -707,6 +711,18 @@ async fn build_tools(
 
 /// `komo gateway --foreground` 的主流程：起来，等停机信号，收尾。
 pub async fn run(options: ServiceOptions) -> Result<(), ServiceError> {
+    // 在起任何子进程之前：shell / python / 监听继承这个上限。
+    match komo_runtime::limits::raise_open_files() {
+        Ok(raised) if raised.after > raised.before => {
+            tracing::info!(
+                before = raised.before,
+                after = raised.after,
+                "抬高了能开的文件数"
+            )
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "抬不了能开的文件数，子进程沿用服务管理器给的上限"),
+    }
     let running = start(options).await?;
     wait_for_signal().await;
     tracing::info!("收到停机信号");

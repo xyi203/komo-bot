@@ -1372,6 +1372,93 @@ async fn purging_a_session_removes_its_content_and_is_idempotent() {
     assert!(all.iter().all(|one| one.session != session), "{all:?}");
 }
 
+/// §8.10 + §8.5：目录已经删了的 `purged` 会话，它在 outbox 里的审计行**不补写、标成已交付**，
+/// 不再每拍报"已提交范围缺失"、也不挡着别的会话补写。
+///
+/// 复现的是 2026-10-15 实测的那种：`purge` 排完 `session.purged` 就删目录，补写器跑在删之后，
+/// 那行就永远留在 outbox 里。这里在 purge 之后直接排一行，等于补写器输掉了那场竞态。**中间
+/// 要重启一次**：同一代进程里会话的写入器还拿着已删文件的句柄，补写会"成功"写进一个已经
+/// unlink 的 inode；卡死是在下一代——重新打开时文件没了、数据库却说写到过 seq N。
+#[tokio::test]
+async fn audit_rows_of_a_purged_session_are_discarded_and_do_not_block_others() {
+    use crate::service::test_support::harness::{FakeLlm, Home, text_round};
+
+    let home = Home::with_config(&config_toml(""));
+    let llm = FakeLlm::always(vec![text_round(1, "好。")]);
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let gone = gateway.open_session().await;
+    let run = gateway.submit(&gone, "purge-3", "说句话").await.run;
+    gateway.wait_terminal(&run).await;
+    let live = gateway.open_session().await;
+
+    let (code, body) = gateway
+        .post_json(
+            &format!("/v1/sessions/{gone}/delete"),
+            serde_json::json!({ "now": true }),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = gateway
+        .post_json(&format!("/v1/sessions/{gone}/purge"), serde_json::json!({}))
+        .await;
+    assert_eq!(code, 200, "{body}");
+    gateway.stop().await;
+    let gateway = home
+        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let state = gateway.state();
+    let paths = komo_store::SessionPaths::new(&state.snapshot().paths.sessions_dir, &gone);
+    assert!(!paths.root().exists(), "purge 之后目录该没了");
+
+    let enqueue = |session: komo_kernel::types::ids::SessionId, kind: &'static str| {
+        let db = state.db.clone();
+        let at = state.clock.now();
+        let event = komo_kernel::types::ids::EventId::new_at(at);
+        let payload = komo_kernel::events::EventPayload::Unknown {
+            event_type: kind.to_string(),
+            raw: serde_json::json!({ "session": session.as_str() }),
+        };
+        let id = event.clone();
+        async move {
+            db.with_write_retry(move |ex| {
+                let (session, event, payload) = (session.clone(), event.clone(), payload.clone());
+                Box::pin(async move {
+                    komo_store::repos::outbox::enqueue_in(ex, &session, &event, payload, at).await
+                })
+                    as komo_store::db::BoxFuture<'_, Result<(), komo_kernel::traits::StoreError>>
+            })
+            .await
+            .expect("排进 outbox");
+            id
+        }
+    };
+    let stale = enqueue(gone.clone(), "session.purged").await;
+    let fresh = enqueue(live.clone(), "session.note").await;
+
+    // 后台补写器也可能已经抢先处理过：按终态断言，不按这一次的返回值。
+    state.drain_audit().await;
+    let pending = komo_store::repos::outbox::pending(&state.db, 1024)
+        .await
+        .expect("读 outbox");
+    assert!(
+        pending.iter().all(|row| row.event_id != stale),
+        "purged 会话的行该标成已交付：{pending:?}"
+    );
+    assert!(
+        pending.iter().all(|row| row.event_id != fresh),
+        "别的会话照常补写：{pending:?}"
+    );
+    assert!(!paths.root().exists(), "丢弃不该把目录建回来");
+    let live_log = komo_store::SessionPaths::new(&state.snapshot().paths.sessions_dir, &live);
+    let text = std::fs::read_to_string(live_log.root().join("events.jsonl")).expect("读 JSONL");
+    assert!(
+        text.contains(fresh.as_str()),
+        "活着的会话里该有这条审计事件"
+    );
+}
+
 /// §8.10 第 3 条：**引用检查不过就 409 并列出要先处置什么**，不假装成功。
 #[tokio::test]
 async fn purging_a_session_with_unfinished_work_is_a_409_that_lists_the_blockers() {

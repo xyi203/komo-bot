@@ -1296,6 +1296,13 @@ impl GatewayState {
     /// 「重启后重发同一个 outbox 事件先按 `event_id` 去重，已写入就复用原事件位置」
     /// （§8.5）——幂等在 `Coordinator::append_audit` 里，这里只负责把它们递过去。返回
     /// 这次补写了几条。
+    ///
+    /// 所属会话已经 `purged` 的行**不补写，直接标成已交付**（`seq` 记 0：不在任何 JSONL 里）。
+    /// 审计副本要落的那份 JSONL 按设计已经删了（§8.10 第 3 条），`sessions.state` 才是权威；
+    /// 硬去写只会每拍报一次"已提交范围缺失"、永远留在 outbox 里。实测（2026-10-15）：
+    /// `purge` 排完 `session.deleted` / `session.purged` 就删目录，补写器跑在删之后的那 7 个
+    /// 会话留下 17 行，每分钟各报一次 WARN 报了三周；攒到 [`AUDIT_DRAIN_LIMIT`] 行还会把
+    /// 后面所有新的审计事件挡在外面——§8.10 说的"不能让一条旧行卡死补发循环"。
     pub async fn drain_audit(&self) -> usize {
         let pending = match komo_store::repos::outbox::pending(&self.db, AUDIT_DRAIN_LIMIT).await {
             Ok(pending) => pending,
@@ -1305,7 +1312,19 @@ impl GatewayState {
             }
         };
         let mut written = 0;
+        let mut discarded = 0;
         for audit in pending {
+            if self.session_purged(&audit.session).await {
+                match self.discard_audit(&audit.event_id).await {
+                    Ok(()) => discarded += 1,
+                    Err(error) => tracing::warn!(
+                        %error,
+                        event = %audit.event_id,
+                        "会话已 purged，审计事件丢弃不了，留在 outbox"
+                    ),
+                }
+                continue;
+            }
             match self
                 .turn_ledger
                 .append_audit(
@@ -1326,7 +1345,34 @@ impl GatewayState {
         if written > 0 {
             tracing::info!(written, "补写了审计事件");
         }
+        if discarded > 0 {
+            tracing::info!(discarded, "所属会话已 purged，审计事件不再补写，标成已交付");
+        }
         written
+    }
+
+    /// 这个会话是不是已经 `purged`。读不出来按"不是"走：照常补写，失败了下一拍再看。
+    async fn session_purged(&self, session: &SessionId) -> bool {
+        matches!(
+            komo_store::repos::session::state(&self.db, session).await,
+            Ok(Some(SessionState::Purged))
+        )
+    }
+
+    /// 不补写，只把这一行标成已交付。
+    async fn discard_audit(
+        &self,
+        event_id: &komo_kernel::types::ids::EventId,
+    ) -> Result<(), StoreError> {
+        let event_id = event_id.clone();
+        self.db
+            .with_write_retry(move |ex| {
+                let event_id = event_id.clone();
+                Box::pin(async move {
+                    komo_store::repos::outbox::mark_delivered_in(ex, &event_id).await
+                }) as komo_store::db::BoxFuture<'_, Result<(), StoreError>>
+            })
+            .await
     }
 
     /// 把卡在 `processing` 的记忆处理放回 `pending`（§9.3）。返回放回了几行。

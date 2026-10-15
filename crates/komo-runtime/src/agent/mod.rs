@@ -6,6 +6,7 @@
 //!   → Ledger::record_round        完整 assistant 回复 + 该轮全部调用计划，一个逻辑事件
 //!   → ToolExecutor::execute_round 执行本轮全部调用（只读的可以同时在飞，§6）
 //!   → [计划边界 / 贴着窗口] CompactionPlanner::plan → 摘要请求 → context.compacted → Recompose
+//!   → Ledger::absorb_interjections   插话：排着队的那句话并进来了 → Interjected
 //!   → 按 call_id 回传结果 → 下一轮
 //! ```
 //!
@@ -221,6 +222,13 @@ pub enum SegmentOutcome {
         rounds: u32,
         usage: TokenUsage,
     },
+    /// 插话（§6）：一轮收尾之后，排在后面要求插话的输入并了进来（`run.absorbed` 已落盘）。
+    /// 与 `Recompose` 一样交回去按日志重新装配、同一个 Run 接着跑——那几句话就在这一刻的
+    /// 位置上，前缀只追加，提示缓存照样命中。不算进压缩的重装配上限。
+    Interjected {
+        rounds: u32,
+        usage: TokenUsage,
+    },
 }
 
 /// 一次摘要请求的结局。
@@ -286,6 +294,8 @@ impl AgentLoop {
             compaction,
             mut compactor,
         } = segment;
+        // 命令直跑的 Run 不对话（§10），插不进话。
+        let takes_interjections = command.is_none();
 
         let mut rounds = 0;
         // 摘要请求的用量：不算轮数，但算进这个 Run 的 token 花销。
@@ -356,6 +366,15 @@ impl AgentLoop {
                         .await?
                 {
                     return Ok(with_driver_usage(done, &driver.usage()));
+                }
+                if takes_interjections && self.absorbed(&run, &env.cancel).await? {
+                    return Ok(with_driver_usage(
+                        SegmentOutcome::Interjected {
+                            rounds,
+                            usage: summaries,
+                        },
+                        &driver.usage(),
+                    ));
                 }
                 RoundInput::ToolResults {
                     results,
@@ -459,11 +478,40 @@ impl AgentLoop {
             {
                 return Ok(with_driver_usage(done, &driver.usage()));
             }
+            // 插话（§6）：排着队的那句话只在这里并——一轮的调用全部收尾、下一次请求之前，
+            // 它落在这一轮的结果之后、下一轮回复之前。这一轮是最终回答（没有调用）就轮不上，
+            // 它照常排在后面。
+            if takes_interjections && self.absorbed(&run, &env.cancel).await? {
+                return Ok(with_driver_usage(
+                    SegmentOutcome::Interjected {
+                        rounds,
+                        usage: summaries,
+                    },
+                    &driver.usage(),
+                ));
+            }
             input = RoundInput::ToolResults {
                 results: outcome.results,
                 revised: std::mem::take(&mut revised),
             };
         }
+    }
+
+    /// 插话（§6）：问账本有没有排着队、要求插话的输入，有就并进这条 Run。已经被取消的
+    /// Run 不并——并进来就没人答它了，它该照常排队。
+    async fn absorbed(
+        &self,
+        run: &RunId,
+        cancel: &komo_kernel::types::tool::CancelToken,
+    ) -> Result<bool, AgentError> {
+        if cancel.is_cancelled() {
+            return Ok(false);
+        }
+        let absorbed = self.ledger.absorb_interjections(run).await?;
+        if !absorbed.is_empty() {
+            tracing::info!(run = %run, absorbed = ?absorbed, "插话并进了这条 Run，按日志重新装配");
+        }
+        Ok(!absorbed.is_empty())
     }
 
     /// 一轮收尾之后问 planner；压成了（或摘要途中被取消）返回这一段的结局。不改、没压成、
@@ -746,12 +794,16 @@ pub(crate) fn spent(usage: &TokenUsage) -> u64 {
     usage.input.unwrap_or(0) + usage.output.unwrap_or(0)
 }
 
-/// `Recompose` 的用量再加上这一段 driver 自己的。
+/// `Recompose` / `Interjected` 的用量再加上这一段 driver 自己的。
 fn with_driver_usage(outcome: SegmentOutcome, driver: &TokenUsage) -> SegmentOutcome {
     match outcome {
         SegmentOutcome::Recompose { rounds, mut usage } => {
             add_usage(&mut usage, driver);
             SegmentOutcome::Recompose { rounds, usage }
+        }
+        SegmentOutcome::Interjected { rounds, mut usage } => {
+            add_usage(&mut usage, driver);
+            SegmentOutcome::Interjected { rounds, usage }
         }
         other => other,
     }

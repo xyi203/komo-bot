@@ -313,6 +313,13 @@ impl AgentRunHandler {
                     used_tokens += super::spent(&usage);
                     previous_cancel = Some(cancel);
                 }
+                // 插话（§6）：同样按日志重新装配、同一个 Run 接着跑；预算照扣，但不占压缩
+                // 的重装配次数——它的次数由人打了几句话决定，不会自己转圈。
+                Ok(SegmentOutcome::Interjected { rounds, usage }) => {
+                    used_rounds += rounds;
+                    used_tokens += super::spent(&usage);
+                    previous_cancel = Some(cancel);
+                }
                 other => break other,
             }
         };
@@ -323,7 +330,7 @@ impl AgentRunHandler {
             | Ok(SegmentOutcome::Suspended { .. })
             | Ok(SegmentOutcome::Failed { .. })
             | Ok(SegmentOutcome::Cancelled { .. }) => Ok(()),
-            Ok(SegmentOutcome::Recompose { .. }) => {
+            Ok(SegmentOutcome::Recompose { .. }) | Ok(SegmentOutcome::Interjected { .. }) => {
                 unreachable!("上面的循环接着跑，不会带着它出来")
             }
             // 只有账本 / 存储写不进去才到这里：什么都没写下，调度器 release 之后

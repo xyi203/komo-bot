@@ -1309,6 +1309,157 @@ mod compaction {
     }
 }
 
+/// 插话（§6）：一轮的调用全部收尾、下一次请求之前，排着队要求插话的输入被并进来，这一段
+/// 交回去按日志重新装配；最终回答那一轮没有"下一次请求"，轮不上。
+mod interjection {
+    use super::*;
+    use komo_kernel::events::EventPayload;
+    use komo_kernel::traits::Ledger;
+    use komo_kernel::types::ids::{ExecutorId, RequestKey, RunId, SessionId};
+    use komo_kernel::types::plan::PlanSource;
+    use komo_kernel::types::turn::AcceptInput;
+
+    async fn started(wired: &Wired) -> Segment {
+        let segment = wired.segment(CancelToken::new()).await;
+        wired
+            .harness
+            .ledger
+            .start_run(&segment.run, &ExecutorId::from_raw("ex-1"), 1)
+            .await
+            .unwrap();
+        segment
+    }
+
+    async fn typed(wired: &Wired, session: &SessionId, key: &str, interject: bool) -> RunId {
+        wired
+            .harness
+            .ledger
+            .accept_input(AcceptInput {
+                session: session.clone(),
+                request_key: RequestKey::new(key),
+                text: "顺便看下 b".into(),
+                source: PlanSource::Interactive {
+                    session: session.clone(),
+                },
+                peer: None,
+                model: sample_model(),
+                workdir: None,
+                delegate: None,
+                snapshot: None,
+                skip_memory: false,
+                interject,
+                at: wired.harness.clock.now(),
+            })
+            .await
+            .unwrap()
+            .run
+    }
+
+    #[tokio::test]
+    async fn an_interjection_is_absorbed_after_the_round_and_hands_back() {
+        let llm = Arc::new(ScriptedLlm::new(vec![vec![
+            round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
+            round(2, Some("不该发出去"), vec![]),
+        ]]));
+        let tool = Arc::new(RecordingTool::bash());
+        let wired = Wired::with_llm(llm.clone(), vec![tool.clone()]);
+        let segment = started(&wired).await;
+        let (session, host) = (segment.session.clone(), segment.run.clone());
+        let late = typed(&wired, &session, "tui:2", true).await;
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Interjected { rounds: 1, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(tool.ran(), 1);
+        assert_eq!(
+            llm.inputs.lock().unwrap().len(),
+            1,
+            "第二次请求留给重新装配之后"
+        );
+
+        let events = wired.harness.ledger.events();
+        let kinds: Vec<&str> = events.iter().map(|e| e.payload.type_name()).collect();
+        let result = kinds.iter().position(|k| *k == "tool.result").unwrap();
+        let absorbed = kinds.iter().position(|k| *k == "run.absorbed").unwrap();
+        assert!(result < absorbed, "并在这一轮的结果之后：{kinds:?}");
+        assert!(matches!(
+            &events[absorbed].payload,
+            EventPayload::RunAbsorbed(body) if body.into == host
+        ));
+        assert_eq!(events[absorbed].run.as_ref(), Some(&late));
+
+        let surface = surface(&wired.harness);
+        assert_eq!(surface.runs[&late].status, RunState::Absorbed);
+        assert_eq!(surface.runs[&host].status, RunState::Running);
+    }
+
+    #[tokio::test]
+    async fn a_final_answer_or_a_plain_input_leaves_it_queued() {
+        // 没要求插话的（监听事件、渠道消息）照旧排队，宿主照常跑完。
+        let wired = Wired::new(
+            vec![vec![
+                round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
+                round(2, Some("好了。"), vec![]),
+            ]],
+            vec![Arc::new(RecordingTool::bash())],
+        );
+        let segment = started(&wired).await;
+        let plain = typed(&wired, &segment.session.clone(), "api:2", false).await;
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Completed { rounds: 2, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            surface(&wired.harness).runs[&plain].status,
+            RunState::Queued
+        );
+
+        // 最终回答那一轮没有调用：没有"下一次请求之前"，那句话排在后面。
+        let wired = Wired::new(vec![vec![round(1, Some("好了。"), vec![])]], vec![]);
+        let segment = started(&wired).await;
+        let late = typed(&wired, &segment.session.clone(), "tui:2", true).await;
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(surface(&wired.harness).runs[&late].status, RunState::Queued);
+    }
+
+    /// 已经被取消的 Run 不并：并进来就没人答它了。
+    #[tokio::test]
+    async fn a_cancelled_host_takes_no_interjection() {
+        let cancel = CancelToken::new();
+        let tool = Arc::new(RecordingTool::bash());
+        let wired = Wired::new(
+            vec![vec![round(
+                1,
+                None,
+                vec![call("pc-1", "bash", serde_json::json!({}))],
+            )]],
+            vec![tool],
+        );
+        let segment = wired.segment(cancel.clone()).await;
+        wired
+            .harness
+            .ledger
+            .start_run(&segment.run, &ExecutorId::from_raw("ex-1"), 1)
+            .await
+            .unwrap();
+        let late = typed(&wired, &segment.session.clone(), "tui:2", true).await;
+        cancel.cancel();
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            !matches!(outcome, SegmentOutcome::Interjected { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(surface(&wired.harness).runs[&late].status, RunState::Queued);
+    }
+}
+
 /// OpenAI 的 `output_tokens` 已经含推理：预算只算一次。
 #[test]
 fn reasoning_is_not_counted_twice_against_the_budget() {

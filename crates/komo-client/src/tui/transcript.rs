@@ -31,7 +31,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::tui::app::{App, Draft, Notice, SubmissionState, ToolLine};
-use crate::tui::{markdown, spinner, tool_view};
+use crate::tui::{markdown, tool_view};
 
 /// 用户那一条的行首记号。
 pub const USER_MARK: &str = "-> ";
@@ -203,7 +203,8 @@ impl Emitted {
 
         // 模型正在打字的那一段：**不是历史**（`assistant_delta` 只在 SSE 上，永不进
         // JSONL）。写完的段落已经交出去了，这里只画还在写的那一段；`message.assistant`
-        // 到达时它就地清掉，余下的正文由那一条落进回滚区。
+        // 到达时它就地清掉，余下的正文由那一条落进回滚区。草稿下面不另起一行转圈：
+        // 状态行那一格已经在转，两处一起动只是重复。
         if let Some(draft) = &app.draft {
             let done = self.committed_len(draft);
             lines.extend(markdown::render_after(
@@ -211,10 +212,6 @@ impl Emitted {
                 &draft.text[done..],
                 width,
             ));
-            lines.push(Line::from(Span::styled(
-                format!("{} 生成中", spinner::frame(app.now)),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-            )));
         }
 
         for tool in app.tool_lines() {

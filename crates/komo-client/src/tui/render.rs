@@ -1007,8 +1007,9 @@ fn main() {
         assert!(text.contains("sess-1"), "{text}");
     }
 
+    /// 转圈只有状态行那一格：草稿下面不再另起一行"⠼ 生成中"。
     #[test]
-    fn a_draft_shows_on_screen_with_a_generating_marker_and_then_goes_away() {
+    fn a_draft_shows_on_screen_with_one_spinner_and_then_goes_away() {
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
         feed(&mut app, &fixture::conversation()[..3]);
         app.apply(ServerEvent::Frame(Box::new(SseFrame {
@@ -1020,14 +1021,19 @@ fn main() {
                 text: "我来清一".into(),
             },
         })));
+        app.apply(ServerEvent::Tick(fixture::T0));
         let drafting = screen(&app, 80, 24);
         assert!(drafting.contains("我来清一"), "{drafting}");
-        assert!(drafting.contains("生成中"), "{drafting}");
+        assert!(!drafting.contains("生成中"), "{drafting}");
+        let spinning: usize = crate::tui::spinner::FRAMES
+            .iter()
+            .map(|frame| drafting.matches(frame).count())
+            .sum();
+        assert_eq!(spinning, 1, "只有状态行那一格在转：{drafting}");
 
-        // 正式回复到了，草稿与记号一起消失，屏幕上只剩那一条。
+        // 正式回复到了，草稿消失，屏幕上只剩那一条。
         feed(&mut app, &fixture::conversation()[3..4]);
         let screen = screen(&app, 80, 24);
-        assert!(!screen.contains("生成中"), "{screen}");
         assert_eq!(screen.matches("我来清一下。").count(), 1, "{screen}");
     }
 

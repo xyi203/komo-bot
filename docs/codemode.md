@@ -20,7 +20,7 @@ codemode 让模型写**一段脚本**：脚本里调工具、在本地过滤和�
 | 方案 | 隔离 | 结论 |
 |---|---|---|
 | QuickJS（pi 的做法） | 引擎里没有文件 / 网络 / 进程 | 可行，新依赖 `rquickjs`，要写一层 Rust↔JS 桥；模型写 Python 更顺 |
-| 裸 Python（komo 已有的 `python` 工具） | 无：脚本就是任意代码 | 内层调用再只读也没用，脚本自己就能改东西、联网，也不能整段重跑 |
+| 裸 Python（当时已有的 `python` 工具，2026-10-15 已删除） | 无：脚本就是任意代码 | 内层调用再只读也没用，脚本自己就能改东西、联网，也不能整段重跑 |
 | CPython + 操作系统沙箱（2026-10-15 前的做法：macOS Seatbelt、Linux Landlock + seccomp） | 进程级：不能写文件、不能联网、不能起子进程 | 能用，但要按平台各写一套约束、探解释器、启动时自检，自检不过就没有 codemode；Python 没有确定性 VM，恢复只能走已记录的前缀 |
 | **pydantic Monty** | 语言层：解释器里没有 socket / subprocess，文件与环境变量只能经宿主放行的 OsCall（只放行读） | **采用** |
 
@@ -132,13 +132,13 @@ Monty 的 `max_turn_duration` 不含等宿主答复的时间，所以墙钟由�
 `tools.<name>(**args)` → executor 的持久化子调用路径，依次：
 
 1. 名字必须在当前 Run 的 `AgentSurface` 及 executor 工具表里；不回退到全局目录。
-   `bash`、`python`、`edit`、`write`、`codemode`、`delegate`、`dispatch`、`follow`、`monitor`、
+   `bash`、`edit`、`write`、`codemode`、`delegate`、`dispatch`、`follow`、`monitor`、
    `monitor_stop`、`update_plan` 不能在脚本里调（`tools/codemode.rs` 的 `NOT_IN_SCRIPTS`），也不进
    `TOOLS`。脚本正文里字面写着 `tools.<这些名字>(` 的，`codemode` 的 `prepare` 就拒、脚本不运行：
    实测模型常把 `tools.bash("git status")` 当成只读写进脚本，跑到那一行才被拒，整段作废，前面的
    MCP 写也可能已经做了（2026-10-13/14 十二次）。`getattr` 之类的绕法认不出，照样在这一步与第 2 步拒。
 2. `tool.prepare(args)` 验证参数和约束。允许 `ReadFile`（read、rg）与 `McpCall`（含写操作）；
-   本地 write / edit / bash / python、编排、`then_run` 仍在脚本外执行。
+   本地 write / edit / bash、编排、`then_run` 仍在脚本外执行。
 3. 完整参数、准备计划与 `plan.recovery.replay().and(tool.replay())` 先发布外置正文，再同步追加
    `intent` 记录。`started` 记录提交成功之后才允许执行工具。
 4. 流式 stdout / stderr 保存在子调用自己的尝试目录；工具返回后发布完整原始输出，再发布

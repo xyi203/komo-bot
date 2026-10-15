@@ -65,10 +65,8 @@ pub enum Operation {
     WriteFile,
     /// 任意 shell 命令。
     ShellCommand { command: String },
-    /// 任意 Python 代码（`mode = "code"`）。
+    /// 2026-10-15 python 工具删除后只为解码旧计划保留，没有构造方。
     PythonCode,
-    /// 修改 Python 环境（依赖安装、环境版本切换）。
-    PythonEnvChange,
     /// 自动记忆的内部变更与索引生成。
     MemoryChange,
     /// 把一个自包含子任务交给一条子 Run（§4）。
@@ -230,12 +228,12 @@ pub struct PlanVersions {
     /// 代码内容哈希（任意 code 模式、shell 命令正文的快照）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<ContentHash>,
-    /// Python 环境版本。
+    /// 旧 python 计划记的环境版本。2026-10-15 python 工具删除后只为解码旧计划保留，没有写入方。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<EnvVersion>,
 }
 
-/// 受管理的 Python 环境版本。依赖升级需要新的环境版本（§5.1）。
+/// 旧 python 计划里的环境版本（`PlanVersions::env`），只为解码保留。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct EnvVersion(pub String);

@@ -162,14 +162,14 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     let lock = InstanceLock::acquire(&home, &instance_id, clock.now())?;
 
     // 2b. 数据目录的骨架。**`workspaces/` 必须真的存在**：它是会话默认的 cwd（§12），
-    //     少了它每一次 shell / python 的 spawn 都以 ENOENT 失败，而报错只会说是程序
+    //     少了它每一次 shell 的 spawn 都以 ENOENT 失败，而报错只会说是程序
     //     起不来——一个把人引偏的结论。建不出来不让整台 Gateway 起来：别的工具照常，
     //     这一条报在日志里（与渠道、向量端点的处理同一个取舍）。
     if let Err(error) = std::fs::create_dir_all(&snapshot.paths.workspaces_dir) {
         tracing::warn!(
             dir = %snapshot.paths.workspaces_dir.display(),
             %error,
-            "工作目录建不出来，shell / python 会在这一步上失败"
+            "工作目录建不出来，shell 会在这一步上失败"
         );
     }
 
@@ -502,32 +502,6 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
     }
 }
 
-/// 受管理解释器的配置（§5.1）。
-pub fn python_env(config: &Arc<ConfigHolder>) -> komo_runtime::python_runtime::PythonEnvConfig {
-    let snapshot = config.current();
-    let mut python = komo_runtime::python_runtime::PythonEnvConfig::new(
-        snapshot.start_only.python_env_root.clone(),
-        snapshot.paths.workspaces_dir.clone(),
-    );
-    // 受管理环境还没建出来时**退回系统解释器**，并且说出来。
-    //
-    // 不静默：`env_version` 会变成系统解释器的版本 + `no-lock`，那正是"这台机器上跑的
-    // 是哪一个解释器、锁没锁依赖"的诚实答案（§5.1）。反过来，让整个 `python` 工具因为
-    // 一个还没 `python -m venv` 过的目录而消失，等于把一句诊断换成一个空白。
-    // 退回的是 `PATH` 里版本最高的 `python3.N`，不是裸 `python3`（macOS 上那常是 3.9）。
-    if !python.interpreter_path().exists() {
-        let fallback =
-            komo_runtime::python_runtime::system_interpreter(std::env::var_os("PATH").as_deref());
-        tracing::warn!(
-            env_root = %python.env_root.display(),
-            interpreter = %fallback.display(),
-            "受管理的 Python 环境还没建出来，这次退回系统解释器"
-        );
-        python.interpreter = Some(fallback);
-    }
-    python
-}
-
 /// Agent 配置在哪个文件里（`[agents.<id>]` 的出处，日志里要说清是"谁写的配置"）。
 pub fn agent_config_file(config: &ConfigHolder) -> PathBuf {
     config.home().join("config.toml")
@@ -551,8 +525,7 @@ fn codemode_worker() -> Option<komo_runtime::codemode::Worker> {
     Some(komo_runtime::codemode::Worker::in_process())
 }
 
-/// 六个基础工具（§4）与那条编排操作。`python` 要有一个跑得起来的解释器才挂；
-/// `codemode` 随 worker 一起装配（`docs/codemode.md` §3），worker 交给执行器。
+/// 六个基础工具（§4）与那条编排操作。`codemode` 随 worker 一起装配（`docs/codemode.md` §3），worker 交给执行器。
 async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
@@ -584,7 +557,7 @@ async fn build_tools(
                 .protecting(protected.clone()),
         ),
         // 搜索是**进程内**的（`grep` + `ignore` 书库）：没有外部二进制，也就没有"这台机器
-        // 上没装"这一种情况，不需要像 `python` 那样探测一遍。
+        // 上没装"这一种情况，不需要探测。
         Arc::new(RgTool::new()),
     ];
     // 委派是**编排**，不是第七个基础能力（§4）：子代理用的是同一套六个工具，它自己的
@@ -620,24 +593,12 @@ async fn build_tools(
     if codemode.is_some() {
         tools.push(Arc::new(komo_runtime::tools::CodemodeTool::new()));
     }
-    let python = python_env(config);
-    match komo_runtime::python_runtime::PythonRuntime::probe(python).await {
-        Ok(runtime) => {
-            tools.push(Arc::new(komo_runtime::tools::PythonTool::new(Arc::new(
-                runtime.registered(registration),
-            ))));
-        }
-        Err(error) => {
-            // 「没有解释器」不该让整台 Gateway 起不来——别的五个工具照常。
-            tracing::warn!(%error, "Python 环境探测不到：这台 Gateway 不挂 python 工具");
-        }
-    }
     (tools, codemode)
 }
 
 /// `komo gateway --foreground` 的主流程：起来，等停机信号，收尾。
 pub async fn run(options: ServiceOptions) -> Result<(), ServiceError> {
-    // 在起任何子进程之前：shell / python / 监听继承这个上限。
+    // 在起任何子进程之前：shell / 监听继承这个上限。
     match komo_runtime::limits::raise_open_files() {
         Ok(raised) if raised.after > raised.before => {
             tracing::info!(

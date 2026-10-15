@@ -624,6 +624,27 @@ mod tests {
         assert_eq!(body.plan_hash.as_str(), "abc");
     }
 
+    /// python 工具（2026-10-15 删除）留下的计划：形状取自真实会话里的一行，代码正文换成了占位。
+    /// 解得出来，`PythonCode` 与 `versions.env` 都保留，重新序列化与原样一致（计划哈希不变）。
+    #[test]
+    fn an_old_python_plan_still_decodes_and_keeps_its_shape() {
+        let data = r#"{"call_id":"01a0b3aa-c96f-7672-808e-02b5cde75b9b","plan":{"args":{"code":"print(1)","mode":"code"},"cwd":"/home/u/.komo/workspaces","operation":{"kind":"python_code"},"operation_id":"01a0b3aa-c975-75f6-b6fb-82cc56c52c9c","recovery":{"kind":"no_safe_recovery"},"run":"01a0b3aa-922a-71a3-b47f-237eb35db34e","source":{"kind":"interactive","session":"01a0b3aa-7207-792e-98dd-3d450ae2f4a9"},"tool":"python","tool_call":"01a0b3aa-c96f-7672-808e-02b5cde75b9b","versions":{"code":"cf63c33ffe0db31f284ff6a55b456f5d96338d362bad057c5954aaff7b8bec08","env":"py-3.9.6-no-lock"}},"plan_hash":"d26e1738297d7d3aae2389d93a20ba84e1698b57079aca6e3e56e292f2c01661"}"#;
+        let raw = line("tool.planned", data);
+        let event = Event::from_line(&raw).unwrap();
+        let EventPayload::ToolPlanned(body) = &event.payload else {
+            panic!("解成了 {:?}", event.payload);
+        };
+        let plan = body.plan.as_ref().expect("计划内联");
+        assert_eq!(plan.tool, "python");
+        assert_eq!(plan.operation, crate::types::plan::Operation::PythonCode);
+        assert_eq!(
+            plan.versions.env.as_ref().map(|env| env.0.as_str()),
+            Some("py-3.9.6-no-lock")
+        );
+        let original: serde_json::Value = serde_json::from_str(data).unwrap();
+        assert_eq!(serde_json::to_value(plan).unwrap(), original["plan"]);
+    }
+
     /// D2：旧的"停在审批上"那一行仍然解得出来。
     #[test]
     fn an_old_run_waiting_on_an_approval_still_decodes() {

@@ -13,8 +13,6 @@
 //! 接缝上一律 `Arc<dyn Trait>` / `Box<dyn Trait>`，异步 trait 用 `async_trait`——对象
 //! 安全，一次堆分配相对模型往返可忽略。
 
-use std::path::Path;
-
 use async_trait::async_trait;
 use time::OffsetDateTime;
 
@@ -33,8 +31,7 @@ use crate::types::refs::{
 use crate::types::status::{Claimed, RunEnd, WaitReason};
 use crate::types::systemone::{SystemOneError, SystemOneRequest, SystemOneResponse};
 use crate::types::tool::{
-    CancelToken, PyError, PythonJob, PythonResult, ToolContext, ToolDefinition, ToolError,
-    ToolExposure, ToolNamespace, ToolOutput,
+    CancelToken, ToolContext, ToolDefinition, ToolError, ToolExposure, ToolNamespace, ToolOutput,
 };
 use crate::types::turn::{
     AcceptInput, Accepted, AssistantRound, EventBatch, LlmError, Round, RoundInput, TurnRequest,
@@ -349,7 +346,7 @@ pub trait Ledger: Send + Sync {
 
 // ---------------------------------------------------------------- 输出存储
 
-/// 子进程 stdout / stderr 的流式落盘。`bash` / `python` 的测试需要替身。
+/// 子进程 stdout / stderr 的流式落盘。`bash` 的测试需要替身。
 #[async_trait]
 pub trait ToolOutputStore: Send + Sync {
     /// 为一次尝试打开流式写入器（stdout / stderr 写 `.partial`）。
@@ -562,36 +559,6 @@ pub trait EmbeddingClient: Send + Sync {
 #[async_trait]
 pub trait SystemOne: Send + Sync {
     async fn ask(&self, request: SystemOneRequest) -> Result<SystemOneResponse, SystemOneError>;
-}
-
-// ---------------------------------------------------------------- Python
-
-/// `python` 工具经它跑解释器。
-#[async_trait]
-pub trait PythonHost: Send + Sync {
-    /// 新进程执行，并把**产出目录**告诉它（§4.7）；stdout / stderr 流入 sink；取消时终止
-    /// **进程组**并等待回收——丢掉异步等待不等于进程结束（§4）。
-    ///
-    /// 子进程往这个目录里写的文件会被登记成这次调用的产物，之后以
-    /// `artifact://files/<run>/<名字>` 读回来——目录本身由宿主建（父目录不存在一并建）。
-    ///
-    /// `artifacts` 是**已经算好**的那一个路径（`<会话内容目录>/artifacts/<run>`）：`host`
-    /// 看不到这次执行的上下文，路径由调用方从 `ToolContext` 取。它是环境变量名
-    /// （`KOMO_ARTIFACT_DIR`）之外的概念——kernel 只传"产出目录在哪"，命名留给 runtime。
-    ///
-    /// `timeout` 是这一次的时限：`python` 工具传本次调用的活动执行时限（`call_timeout`），
-    /// 到点由宿主自己终止进程组、报 `Timeout`，而不是落到执行器的兜底计时器上成了"结果
-    /// 不明"。
-    async fn run_with_artifacts(
-        &self,
-        job: PythonJob,
-        artifacts: Option<&Path>,
-        timeout: std::time::Duration,
-        sink: &mut dyn OutputWriter,
-        cancel: CancelToken,
-    ) -> Result<PythonResult, PyError>;
-
-    fn env_version(&self) -> crate::types::plan::EnvVersion;
 }
 
 // ---------------------------------------------------------------- 工具
@@ -817,7 +784,6 @@ mod tests {
         assert_object_safe::<dyn LlmClient>();
         assert_object_safe::<dyn TurnDriver>();
         assert_object_safe::<dyn EmbeddingClient>();
-        assert_object_safe::<dyn PythonHost>();
         assert_object_safe::<dyn Tool>();
         assert_object_safe::<dyn TaskSpawner>();
         assert_object_safe::<dyn Channel>();

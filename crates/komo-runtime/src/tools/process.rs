@@ -1,8 +1,7 @@
 //! 子进程：自己的进程组、流式输出、输出上限、超时与取消回收（§4）。
 //!
-//! `bash` 和 `python_runtime` 用的是同一套：两者要的都是"起一个进程，把它的
-//! stdout / stderr 边跑边写进 [`OutputWriter`]，超时或取消时**终止整个进程组并等待
-//! 回收**"。Tokio 不会因为 handle 被丢掉就结束进程，而 `Child::kill` 只杀直接子进程
+//! `bash` 要的是"起一个进程，把它的 stdout / stderr 边跑边写进 [`OutputWriter`]，
+//! 超时或取消时**终止整个进程组并等待回收**"。Tokio 不会因为 handle 被丢掉就结束进程，而 `Child::kill` 只杀直接子进程
 //! ——`sh -c 'sleep 30 &'` 的孙子进程会活下来，所以信号必须发给进程组。
 
 use std::collections::BTreeMap;
@@ -16,7 +15,7 @@ use komo_kernel::types::ids::ExecutorId;
 use komo_kernel::types::tool::CancelToken;
 
 use crate::recovery::{ChildProcess, ChildRegistry};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 use crate::executor::cancel::cancelled;
@@ -47,9 +46,6 @@ pub struct ChildSpec {
     pub cwd: PathBuf,
     /// **明确的**环境变量集合——继承整个环境等于把凭证交给任意脚本。
     pub env: BTreeMap<String, String>,
-    #[allow(clippy::doc_markdown)]
-    /// 写进 stdin 的正文（`python` 的作业描述走这里）。
-    pub stdin: Option<Vec<u8>>,
     pub timeout: Duration,
     /// 写进 [`OutputWriter`] 的字节上限；超出后停止转发并置 `truncated`。
     pub output_limit: u64,
@@ -135,11 +131,7 @@ pub async fn run_child(
         .current_dir(&spec.cwd)
         .env_clear()
         .envs(&spec.env)
-        .stdin(if spec.stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         // 自己的进程组：取消时一个信号带走整棵子树。
@@ -182,14 +174,6 @@ pub async fn run_child(
         registration: spec.register.clone(),
         pid: pgid,
     };
-
-    if let Some(body) = &spec.stdin
-        && let Some(mut handle) = child.stdin.take()
-    {
-        // 写不进去（脚本没读 stdin 就退出）不是失败，输出还是要收。
-        let _ = handle.write_all(body).await;
-        let _ = handle.shutdown().await;
-    }
 
     let mut stdout = child.stdout.take();
     let mut stderr = child.stderr.take();
@@ -380,7 +364,6 @@ mod tests {
             args: vec!["-c".into(), command.into()],
             cwd: std::env::temp_dir(),
             env: BTreeMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]),
-            stdin: None,
             timeout: Duration::from_secs(30),
             output_limit: 1 << 20,
             register: None,
@@ -391,7 +374,7 @@ mod tests {
     /// 工作目录不存在时，报的必须是**工作目录**，不是程序名。
     ///
     /// spawn 的 ENOENT 挂在程序名上（`/bin/sh: No such file or directory`），而 `/bin/sh`
-    /// 明明在。这条已在现场把人引偏过一次（每个 shell / python 调用都"起不来"，真正
+    /// 明明在。这条已在现场把人引偏过一次（每个 shell 调用都"起不来"，真正
     /// 不在的是会话 cwd）。
     #[tokio::test]
     async fn a_missing_cwd_is_reported_as_such() {

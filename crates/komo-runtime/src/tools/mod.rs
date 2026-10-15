@@ -1,6 +1,6 @@
 //! 六个基础工具（§4）与它们共用的那点东西。
 //!
-//! 搜索走 `rg`，HTTP 走 Python 库或命令；Git、构建、测试、HA 和记录查询都是这六个的
+//! 搜索走 `rg`，HTTP 走命令；Git、构建、测试、HA 和记录查询都是这六个的
 //! 组合，**不新增第七个**。
 //!
 //! `delegate` 是这条规则的一个例外，而且它**不是第七个基础工具**：模型看不见任何新能力
@@ -19,7 +19,6 @@ pub mod monitor;
 pub mod paths;
 pub mod process;
 pub mod protect;
-pub mod python;
 pub mod read;
 pub mod resources;
 pub mod rg;
@@ -41,7 +40,6 @@ pub use edit::EditTool;
 pub use follow::FollowTool;
 pub use mcp::McpTool;
 pub use monitor::{MonitorStopTool, MonitorTool};
-pub use python::PythonTool;
 pub use read::ReadTool;
 pub use rg::RgTool;
 pub use update_plan::UpdatePlanTool;
@@ -116,11 +114,11 @@ pub fn current(path: &Path) -> Result<Option<(Vec<u8>, FileVersion)>, ToolError>
     }
 }
 
-/// 正文必须是 UTF-8——六个基础工具处理的是文本；二进制走 bash 或 Python。
+/// 正文必须是 UTF-8——六个基础工具处理的是文本；二进制走 bash。
 pub fn as_text(bytes: Vec<u8>, path: &Path) -> Result<String, ToolError> {
     String::from_utf8(bytes).map_err(|_| ToolError::InvalidArguments {
         message: format!(
-            "{} 不是 UTF-8 文本；二进制内容请用 bash 或 python 处理",
+            "{} 不是 UTF-8 文本；二进制内容请用 bash 处理",
             path.display()
         ),
     })
@@ -199,7 +197,6 @@ pub(crate) mod test_support {
                 writable: true,
                 label: "workspace".into(),
             }],
-            env_version: None,
             resumed: None,
             cancel,
             call_timeout: std::time::Duration::from_secs(

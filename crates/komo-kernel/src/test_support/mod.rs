@@ -18,7 +18,6 @@ mod ledger;
 mod memory;
 mod model;
 mod output;
-mod python;
 mod queue;
 #[cfg(test)]
 mod tests;
@@ -30,7 +29,6 @@ pub use ledger::MemLedger;
 pub use memory::MemMemoryRepo;
 pub use model::{FixedEmbeddingClient, ScriptedLlm, ScriptedTurnDriver};
 pub use output::{MemOutputStore, MemOutputWriter};
-pub use python::FakePythonHost;
 pub use queue::MemRunQueue;
 pub use zones::ScriptedZoneResolver;
 

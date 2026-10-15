@@ -66,8 +66,7 @@ pub use systemone::{
     SystemOneUsage,
 };
 pub use tool::{
-    CancelToken, PyError, PythonJob, PythonResult, ResumedCall, ToolContext, ToolDefinition,
-    ToolError, ToolOutput, WorkspaceRoot,
+    CancelToken, ResumedCall, ToolContext, ToolDefinition, ToolError, ToolOutput, WorkspaceRoot,
 };
 pub use turn::{
     AcceptInput, Accepted, AssistantRound, EventBatch, LlmError, MemoryUse, PlannedCall,

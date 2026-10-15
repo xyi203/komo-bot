@@ -2503,20 +2503,28 @@ async fn an_artifact_of_the_round_is_named_in_what_the_model_sees() {
         pointer: None,
     };
     let tool = Arc::new(
-        RecordingTool::new("python", Operation::PythonCode)
-            .with_recovery(RecoveryMode::SafeReread)
-            .with_outcome(Ok(ToolOutput {
-                status: ToolResultStatus::Completed,
-                result: serde_json::json!({ "ok": true }),
-                exit_code: Some(0),
-                artifacts: vec![report],
-                preview: Some("跑完了\n".into()),
-            })),
+        RecordingTool::new(
+            "bash",
+            Operation::ShellCommand {
+                command: "make-report".into(),
+            },
+        )
+        .with_recovery(RecoveryMode::SafeReread)
+        .with_outcome(Ok(ToolOutput {
+            status: ToolResultStatus::Completed,
+            result: serde_json::json!({ "ok": true }),
+            exit_code: Some(0),
+            artifacts: vec![report],
+            preview: Some("跑完了\n".into()),
+        })),
     );
     let executor = harness.executor(vec![tool]);
     let (session, run) = harness.open_run().await;
     let calls = harness
-        .record_round(&run, &[("python", serde_json::json!({ "code": "…" }))])
+        .record_round(
+            &run,
+            &[("bash", serde_json::json!({ "command": "make-report" }))],
+        )
         .await;
     let outcome = executor
         .execute_round(calls, &harness.env(&session, &run))
@@ -3939,10 +3947,9 @@ mod fused {
         assert_eq!(started(&harness).len(), 1, "没有新的尝试");
     }
 
-    /// `shell` 改名 `bash` 之前落账的调用：`started` 而无结果，恢复时照旧认那个名字，
-    /// 按 `bash` 的 `Unsafe` 记 uncertain 交给模型，既不重跑也不报"没有这个工具"。
-    #[tokio::test]
-    async fn a_started_call_recorded_under_the_old_shell_name_settles_as_uncertain() {
+    /// 一次在途调用的恢复：计划落了账、上一世 `started` 而无结果，但工具名后来从工具表里没了
+    /// （改名、删除）。结果不明、交给模型，不重跑，也不报"没有这个工具"。
+    async fn interrupted_call_of_retired_tool(old_name: &str, operation: Option<Operation>) {
         let harness = Harness::new();
         let root = seeded(&harness);
         let executor = harness.executor(tools());
@@ -3950,11 +3957,14 @@ mod fused {
         let mut calls = harness
             .record_round(
                 &run,
-                &[("shell", serde_json::json!({ "command": COUNTING }))],
+                &[(old_name, serde_json::json!({ "command": COUNTING }))],
             )
             .await;
         let mut plan = plan_of(&BashTool::new(), &harness, &session, &run, &calls[0]).await;
-        plan.tool = "shell".into();
+        plan.tool = old_name.into();
+        if let Some(operation) = operation {
+            plan.operation = operation;
+        }
         let previous = harness.crashed_attempt(&calls[0].call, &plan).await;
         calls[0].plan = Some(plan);
         calls[0].resumed = Some(resumed_from(
@@ -3981,28 +3991,46 @@ mod fused {
         assert_eq!(started(&harness).len(), 1, "没有新的尝试");
     }
 
-    /// 旧名字只给带着落账计划的调用留着：模型这一轮新发的 `shell` 仍是"没有这个工具"。
     #[tokio::test]
-    async fn a_fresh_call_to_the_old_shell_name_is_refused() {
-        let harness = Harness::new();
-        let root = seeded(&harness);
-        let executor = harness.executor(tools());
-        let (session, run) = harness.open_run().await;
-        let calls = harness
-            .record_round(
-                &run,
-                &[("shell", serde_json::json!({ "command": COUNTING }))],
-            )
-            .await;
+    async fn an_interrupted_call_to_the_renamed_shell_tool_settles_as_uncertain() {
+        interrupted_call_of_retired_tool("shell", None).await;
+    }
 
-        let outcome = executor
-            .execute_round(calls, &harness.env(&session, &run))
-            .await
-            .unwrap();
+    #[tokio::test]
+    async fn an_interrupted_call_to_the_removed_python_tool_settles_as_uncertain() {
+        interrupted_call_of_retired_tool("python", Some(Operation::PythonCode)).await;
+    }
 
-        assert!(outcome.results[0].is_error);
-        assert_eq!(runs(&root), 0);
-        assert!(started(&harness).is_empty());
+    /// 只有带着落账计划的在途调用走"结果不明"：模型这一轮新发的 `shell` / `python` 没有
+    /// 计划，仍被拒，并列出这次能用的工具。
+    #[tokio::test]
+    async fn a_fresh_call_to_a_retired_tool_is_refused_with_the_available_tools() {
+        for old_name in ["shell", "python"] {
+            let harness = Harness::new();
+            let root = seeded(&harness);
+            let executor = harness.executor(tools());
+            let (session, run) = harness.open_run().await;
+            let calls = harness
+                .record_round(
+                    &run,
+                    &[(old_name, serde_json::json!({ "command": COUNTING }))],
+                )
+                .await;
+
+            let outcome = executor
+                .execute_round(calls, &harness.env(&session, &run))
+                .await
+                .unwrap();
+
+            assert!(outcome.results[0].is_error);
+            let content = &outcome.results[0].content;
+            assert!(
+                content.contains(old_name) && content.contains("可用的是"),
+                "{content}"
+            );
+            assert_eq!(runs(&root), 0);
+            assert!(started(&harness).is_empty());
+        }
     }
 
     #[tokio::test]

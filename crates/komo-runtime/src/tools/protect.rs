@@ -6,7 +6,7 @@
 //! `prepare`：计划都不成立，`then_run` 的命令自然也不会跑。
 //!
 //! 一条 shell 命令写到哪里，事前说不清，`prepare` 拦不住；`bash` 改由 bwrap 把
-//! [`Protected::existing`] 列出的路径只读挂上（见 `bash.rs` 的 `Sandbox`）。python 不拦。
+//! [`Protected::existing`] 列出的路径只读挂上（见 `bash.rs` 的 `Sandbox`）。
 
 use std::path::{Path, PathBuf};
 

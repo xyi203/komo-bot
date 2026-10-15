@@ -67,7 +67,6 @@ pub struct StartOnly {
     /// 监听地址与端口。
     pub listen: String,
     pub db_path: PathBuf,
-    pub python_env_root: PathBuf,
     /// MCP 服务器（`[mcp.servers.<name>]`，`docs/mcp.md`）。启动时连接、列出工具、挂进
     /// 工具目录，改了要重启才生效。
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -689,7 +688,6 @@ mod tests {
                 data_dir: PathBuf::from("/home/u/.komo"),
                 listen: "127.0.0.1:7777".into(),
                 db_path: PathBuf::from("/home/u/.komo/state.db"),
-                python_env_root: PathBuf::from("/home/u/.komo/python-envs"),
                 mcp: Default::default(),
             },
             model_catalog: ModelCatalog::default(),

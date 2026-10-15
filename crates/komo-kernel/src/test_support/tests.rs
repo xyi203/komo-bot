@@ -6,10 +6,8 @@ use crate::events::{Event, EventPayload};
 use crate::traits::*;
 use crate::types::ids::*;
 use crate::types::model::{InputKind, TokenUsage};
-use crate::types::plan::EnvVersion;
 use crate::types::refs::{AttemptRef, ToolResultBody, ToolResultStatus};
 use crate::types::status::RunEnd;
-use crate::types::tool::{CancelToken, PyError, PythonJob, PythonResult};
 use crate::types::turn::{
     AcceptInput, AssistantRound, ProviderToolCall, Round, RoundInput, ToolCallRequest, TurnRequest,
 };
@@ -56,8 +54,8 @@ fn the_mem_ledger_writes_a_log_that_actually_folds() {
                     tool_calls: vec![ToolCallRequest {
                         call_id: call.clone(),
                         provider_call_id: "pc-7".into(),
-                        name: "python".into(),
-                        arguments: serde_json::json!({"mode":"code","code":"result = 1 + 1"}),
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command":"echo 2"}),
                         arguments_ref: None,
                     }],
                     provider_blocks: None,
@@ -68,7 +66,7 @@ fn the_mem_ledger_writes_a_log_that_actually_folds() {
             .unwrap();
         assert_eq!(calls, vec![call.clone()]);
 
-        let plan = sample_plan("python", &session);
+        let plan = sample_plan("bash", &session);
         ledger.plan_call(&call, &plan).await.unwrap();
         let attempt = ledger.start_call(&call, &plan).await.unwrap();
 
@@ -293,62 +291,6 @@ fn the_fixed_embedding_client_is_deterministic_and_normalized() {
                 .await
                 .is_err()
         );
-    });
-}
-
-#[test]
-fn the_fake_python_host_records_calls_and_streams_stdout() {
-    block_on(async {
-        let host = FakePythonHost::new();
-        host.push_stdout("hello\n");
-        host.push_result(PythonResult {
-            status: ToolResultStatus::Completed,
-            result: serde_json::json!(2),
-            error: None,
-            artifacts: vec![],
-            stdout_excerpt: String::new(),
-            env_version: EnvVersion("py-test-1".into()),
-        });
-
-        let mut writer = MemOutputWriter::new(AttemptRef {
-            session: SessionId::from_raw("s"),
-            run: RunId::from_raw("r"),
-            call: ToolCallId::from_raw("c"),
-            attempt: AttemptId::from_raw("a"),
-        });
-        let result = host
-            .run_with_artifacts(
-                PythonJob::Code {
-                    code: "result = 1 + 1".into(),
-                },
-                None,
-                std::time::Duration::from_secs(1),
-                &mut writer,
-                CancelToken::new(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result.result, serde_json::json!(2));
-        assert_eq!(writer.stdout, b"hello\n");
-        assert_eq!(
-            result.stdout_excerpt, "hello\n",
-            "写进 sink 的那段就是摘录——替身与真宿主一个事实"
-        );
-        assert_eq!(host.calls().len(), 1);
-
-        let cancelled = CancelToken::new();
-        cancelled.cancel();
-        assert!(matches!(
-            host.run_with_artifacts(
-                PythonJob::Code { code: "x".into() },
-                None,
-                std::time::Duration::from_secs(1),
-                &mut writer,
-                cancelled
-            )
-            .await,
-            Err(PyError::Cancelled)
-        ));
     });
 }
 

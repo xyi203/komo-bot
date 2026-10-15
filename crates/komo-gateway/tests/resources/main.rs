@@ -9,8 +9,8 @@
 //!   （审计回答的是"读了哪个逻辑资源"，不是它落在哪个文件）；
 //! - **`tool://`**：能力面之外的工具**在 `prepare` 就拒绝**，面内的读到
 //!   JSON Schema；
-//! - **`artifact://`**：python 写进 `$KOMO_ARTIFACT_DIR` 的文件登记成这次调用的产物，
-//!   **重启 Gateway 之后**按同一条 URI 读到的正文与第一次一致；
+//! - **`artifact://`**：会话目录 `artifacts/` 里的历史产物（python 工具删除前写下的），
+//!   重启 Gateway 前后按同一条 URI 读到的正文一致；
 //! - **别的会话的 run**：拿另一个会话的 `run` 拼出来的 URI 读不到——那是会话边界。
 //!
 //! 共用件在 `komo_gateway::service::test_support::harness`（真数据目录、真 `service::start`、
@@ -22,12 +22,9 @@ use std::sync::Arc;
 use komo_gateway::service::test_support::harness::{
     DEFAULT_ENV, FakeLlm, Home, call_round, text_round, write_home,
 };
-use komo_kernel::events::{Event, EventPayload, ToolResult};
+use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::traits::LlmClient;
-use komo_kernel::types::digest::ContentHash;
-use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::plan::ExecutionPlan;
-use komo_kernel::types::refs::{ContentRef, ToolResultBody, ToolResultStatus};
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{LlmError, Round, RoundInput};
 
@@ -80,38 +77,11 @@ fn home_with(config: &str) -> Home {
     home
 }
 
-/// 这台机器上有没有系统解释器——`python` 工具要有它才挂得起来（`service::python_env`
-/// 在受管理环境没建出来时退回 `python3`）。
-fn have_python() -> bool {
-    std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .is_ok()
-}
-
 // ---------------------------------------------------------------- 轮脚本
 
 /// 一次 `read`（路径可以是本地路径，也可以是资源 URI）。
 fn read_call(n: u32, id: &str, path: &str) -> Result<Round, LlmError> {
     call_round(n, id, "read", serde_json::json!({ "path": path }))
-}
-
-/// 一次 `python` code 调用：往 `$KOMO_ARTIFACT_DIR` 写一个文件（§4.7 的产出目录约定）。
-fn python_writes(round: u32, name: &str, body: &str) -> Result<Round, LlmError> {
-    call_round(
-        round,
-        "pc-python",
-        "python",
-        serde_json::json!({
-            "mode": "code",
-            "code": format!(
-                "import os, pathlib\n\
-                 target = pathlib.Path(os.environ['KOMO_ARTIFACT_DIR'], {name:?})\n\
-                 target.write_text({body:?}, encoding='utf-8')\n\
-                 result = 'ok'"
-            ),
-        }),
-    )
 }
 
 // ---------------------------------------------------------------- 断言助手
@@ -147,57 +117,6 @@ fn planned(events: &[Event]) -> Vec<ExecutionPlan> {
             _ => None,
         })
         .collect()
-}
-
-/// 这个 Session 里第一条 `tool.result` 的**完整正文**（`output.json` 里的 `body`，§8.3）。
-///
-/// 事件里那条只有状态、`output_ref` 与 ≤1 KiB 预览；`output.json` 本身是一层外壳
-/// （身份 + `status` + `body`），这次的产物引用在 `body.artifacts` 里。
-fn body_of(home: &Home, session: &SessionId) -> ToolResultBody {
-    let events = home.events(session);
-    let result: &ToolResult = events
-        .iter()
-        .find_map(|event| match &event.payload {
-            EventPayload::ToolResult(result) => Some(result),
-            _ => None,
-        })
-        .expect("有一条 tool.result");
-    let path = home.session_dir(session).join(result.output_ref.path());
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|error| panic!("读 {} 失败：{error}", path.display()));
-    serde_json::from_str::<komo_store::tool_output::OutputDocument>(&raw)
-        .expect("output.json 解析得出")
-        .body
-}
-
-/// 一条产物引用 → 读它的 URI。
-///
-/// 就是 §4.7 那句：`ContentRef.path` 相对会话目录（`artifacts/<run>/<…>`），正文里给出
-/// `artifact://files/<run>/<名字>`。
-fn uri_of(artifact: &ContentRef) -> String {
-    let relative = artifact
-        .path
-        .strip_prefix("artifacts/")
-        .unwrap_or_else(|| panic!("产物路径该以 artifacts/ 开头：{}", artifact.path));
-    format!("artifact://files/{relative}")
-}
-
-/// 工具结果投影正文里那**一行产物入口**（`产物：artifact://files/<run>/<名字>（13 B）`）
-/// 里给出的 URI。
-///
-/// 模型手里只有这一行——测试就用它去 `read`，这样验的正是"模型看到的那一条到底读不读得
-/// 回来"，而不是测试自己另拼一条同义的 URI。
-fn produced_uri(fed: &str) -> String {
-    let marker = "产物：";
-    let start = fed
-        .find(marker)
-        .unwrap_or_else(|| panic!("正文里没有产物那一行：{fed}"))
-        + marker.len();
-    let rest = &fed[start..];
-    let end = rest
-        .find('（')
-        .unwrap_or_else(|| panic!("产物入口后面该跟着大小：{rest}"));
-    rest[..end].to_string()
 }
 
 // ---------------------------------------------------------------- 本地路径照旧
@@ -363,85 +282,38 @@ async fn tool_uris_read_schema_inside_the_surface_and_are_refused_outside_it() {
 
 // ---------------------------------------------------------------- artifact://
 
-/// python 写进 `$KOMO_ARTIFACT_DIR` 的文件被登记成这次调用的产物（`ContentRef`），
-/// 之后可用 `artifact://files/<run>/<名字>` 读回；**重启 Gateway**（同一个数据目录）之后
-/// 读到的正文与第一次一致——产物是落盘的文件，不是内存里的一份。
+/// 会话目录 `artifacts/<run>/` 里的历史产物（python 工具删除前写下的）仍可用
+/// `artifact://files/<run>/<名字>` 读回；**重启 Gateway**（同一个数据目录）之后读到的正文
+/// 与之前一致——产物是落盘的文件，不是内存里的一份。
 #[tokio::test]
-async fn python_artifacts_are_registered_and_readable_after_a_restart() {
-    if !have_python() {
-        return;
-    }
-    let home = home_with(&config(&tools("\"read\", \"rg\", \"python\"")));
-    let llm = FakeLlm::new(vec![
-        // Run A：调一次 python，然后说一句话收尾。
-        vec![
-            python_writes(1, "报告.md", "产物正文\n"),
-            text_round(2, "写好了。"),
-        ],
-    ]);
+async fn historical_artifacts_stay_readable_after_a_restart() {
+    let home = home_with(&config(&tools("\"read\", \"rg\"")));
+    let llm = FakeLlm::new(vec![vec![
+        read_call(1, "pc-read", "artifact://files/run-old/报告.md"),
+        text_round(2, "读到了。"),
+    ]]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gw.open_session().await;
 
-    let run_a = gw
-        .submit(&session, "res-art", "把报告写到产物目录")
-        .await
-        .run;
+    let artifacts = home.session_dir(&session).join("artifacts/run-old");
+    std::fs::create_dir_all(&artifacts).expect("建产出目录");
+    std::fs::write(artifacts.join("报告.md"), "产物正文\n").expect("写历史产物");
+
+    let run_a = gw.submit(&session, "res-art", "读那份产物").await.run;
     let detail = gw.wait_terminal(&run_a).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
-
-    // 账本里那条 `tool.result` 的完整正文带着这次的产物引用。
-    let body = body_of(&home, &session);
-    assert_eq!(body.status, ToolResultStatus::Completed);
-    assert_eq!(body.artifacts.len(), 1, "{:?}", body.artifacts);
-    let artifact = &body.artifacts[0];
-    assert_eq!(
-        artifact.path,
-        format!("artifacts/{run_a}/报告.md"),
-        "引用路径相对会话目录"
-    );
-    assert_eq!(artifact.size, "产物正文\n".len() as u64);
-    assert_eq!(
-        artifact.hash,
-        ContentHash::of_str("产物正文\n"),
-        "哈希就是那份文件的字节"
-    );
-    assert_eq!(
-        uri_of(artifact),
-        format!("artifact://files/{run_a}/报告.md")
-    );
-
-    // 模型被喂回来的正文里印着**那一行产物入口**，而且 URI 就是从这一行取的——它手里
-    // 只有这一条指路的，之后那次 `read` 用的就是它（§4.7）。
-    let projected = fed_back(&llm);
-    assert_eq!(projected.len(), 1, "{projected:?}");
-    assert!(
-        projected[0].0.contains(&format!(
-            "产物：artifact://files/{run_a}/报告.md（{} B）",
-            "产物正文\n".len()
-        )),
-        "正文里要印出产物入口与大小：{}",
-        projected[0].0
-    );
-    let uri = produced_uri(&projected[0].0);
-    assert_eq!(uri, format!("artifact://files/{run_a}/报告.md"));
-
-    // 运行时**不复制第二份**：`artifact://files/…` 读的就是产出目录里那一份。
-    let session_root = std::fs::canonicalize(home.session_dir(&session)).expect("会话目录在");
-    assert_eq!(
-        std::fs::read_to_string(session_root.join(&artifact.path)).expect("产出目录里有那份文件"),
-        "产物正文\n"
-    );
-
+    let results = fed_back(&llm);
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert!(!results[0].1, "{}", results[0].0);
+    assert!(results[0].0.contains("产物正文"), "{}", results[0].0);
     gw.stop().await;
 
-    // 重启：同一个数据目录，`service::start` 再来一次。那条 URI 照样读得回来，正文与
-    // 第一次登记的那一份一致。
     let llm_b = FakeLlm::new(vec![vec![
-        read_call(1, "pc-read", &uri),
+        read_call(1, "pc-read", "artifact://files/run-old/报告.md"),
         text_round(2, "读到了。"),
     ]]);
     let gw_b = home.start(Arc::clone(&llm_b) as Arc<dyn LlmClient>).await;
-    let run_b = gw_b.submit(&session, "res-art-2", "读那份产物").await.run;
+    let run_b = gw_b.submit(&session, "res-art-2", "再读一遍").await.run;
     let detail = gw_b.wait_terminal(&run_b).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
 

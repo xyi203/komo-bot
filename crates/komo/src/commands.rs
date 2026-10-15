@@ -763,9 +763,9 @@ pub enum SkillsAction<'a> {
     Disable(&'a str),
 }
 
-/// `komo skills` 的门控上下文：与 Gateway 的目录行同一个口径（本机平台 + 5 个基础工具）。
+/// `komo skills` 的门控上下文：与 Gateway 的目录行同一个口径（本机平台 + 基础工具）。
 pub fn offer_context() -> OfferContext {
-    OfferContext::here(["read", "write", "edit", "bash", "python"])
+    OfferContext::here(["read", "write", "edit", "bash", "codemode"])
 }
 
 #[cfg(test)]

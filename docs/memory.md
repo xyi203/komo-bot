@@ -95,7 +95,7 @@ N、T 进 `[memory]` 配置，初值 3 次 / 90 天。判断放在 `merge` 之�
 （以及 `komo cron list` 等所有自查命令）连的是 `~/.komo` 的 Gateway**，读到另一个实例的
 记忆。这破坏了 2 节第一行"按需再查一次"的路，也让不同数据目录的实例互相串了状态。
 
-**改法。** shell（以及 python，若也要自查）给子进程显式注入 Gateway 自己的数据目录作为
+**改法。** shell 给子进程显式注入 Gateway 自己的数据目录作为
 `KOMO_HOME`——注入实际值，不是从 Gateway 环境继承，这样前台跑的 `KOMO_HOME=… komo gateway
 --foreground` 也对。`KOMO_HOME` 是路径不是凭证，不违反 §5.3。
 

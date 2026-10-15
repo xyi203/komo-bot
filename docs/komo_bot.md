@@ -18,7 +18,7 @@ v0.8 相对 v0.7 的变化：状态数据库改为 Turso + toasty（§8.2）；�
 | 进程入口 | 单个可执行程序 `komo`，包含 TUI 聊天客户端和 Gateway                                            |
 | 聊天     | `komo` 直接进入 TUI 聊天；Gateway 未运行时自动启动                                                |
 | 执行方式 | LLM 原生 tool call，由 Rust 校验和执行；没有 Policy 与审批（§7）                                 |
-| 基础工具 | 严格保留 `read`、`write`、`edit`、`bash`、`python`                                              |
+| 基础工具 | 严格保留 `read`、`write`、`edit`、`bash`、`codemode`（外加只读的 `rg`，§4）                      |
 | 能力扩展 | 可复用能力写成 Skill（`SKILL.md` + 脚本），由 `bash` 运行；没有 toolbox（2026-10-15 删除，§5.3）   |
 | 程序性说明 | Skills：人写的 `SKILL.md`，模型用 `read` 读取，不增加工具                                       |
 | 定时任务 | Cron 触发同一套 Agent Runtime                                                                    |
@@ -60,14 +60,14 @@ komo TUI / resume / 操作命令          飞书 ws · Telegram 轮询 · WeChat
              ┌──────┴──────┐
            执行           拒绝（明确的拒绝结果）
              │
-      read / write / edit / bash / python
+      read / write / edit / rg / bash / codemode
 ```
 
 MemoryManager 在 Run 开始时装配相关记忆，在 Run 完成后异步整理新证据。它管理本机记忆与检索索引；访问 Memos 通过 Memos skill 里的脚本由 `bash` 运行，不新增模型工具。
 
 Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境、运行状态和三个聊天渠道。TUI 负责提交输入、显示进度、回答介入和恢复会话；聊天渠道做同样的事，并且是介入的主入口（§11）。
 
-每个实例的 Gateway 自己执行任务。CLI 从 Mac 连接 NAS 的 Gateway 时，命令与 Python 都在 NAS 虚拟机中执行。
+每个实例的 Gateway 自己执行任务。CLI 从 Mac 连接 NAS 的 Gateway 时，命令都在 NAS 虚拟机中执行。
 
 ## 3. 命令与 Gateway 生命周期
 
@@ -122,7 +122,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
    **不认识的键不算错**（2026-09-24）：`config.toml` 里多出来的键——升级后留下的退役键、拼错的键、写到了别的表下面的键（`default_agent` 落进前一个 `[agents.x]` 是最常见的一种）——被忽略，配置照常装上，但每一个都以完整路径（如 `gateway.listen_typo`）作为**警告**出现在 `komo config check`、`komo doctor` 与重载日志里。键认识、值的类型不对仍然是错误。
 2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（arc-swap）。**读配置的地方按用途读当前快照，不缓存**：Dispatcher 判定 Principal 时读 `allow_from` / `groups`，Notifier 解析 home chat 时读 `home_chat`，新 Run 在 `accept_input` 时抓一份模型 / effort 快照存进 `runs.config_snapshot`——所以名单改完，下一条消息就按新名单判；模型改完，下一个 Run 用新模型，**正在跑的 Run 与后台记忆任务继续用它们各自开始时抓的快照**（§13.3），不在半路换模型。
 3. 逐段比对新旧快照，只重建变化了的东西：某个 `[channels.*]` 的 `enabled` 或凭证变了 → 只停掉并重启那个渠道的 `serve`（飞书重连 ws、Telegram 重新起轮询），其他渠道不受影响，未 ack 的入站消息按平台的至少一次投递重来；模型 `base_url` / 凭证变了 → 换掉对应 `LlmClient` 实例；向量模型变了 → 走 §9.5 的空间指纹与索引代次流程，不在重载里偷偷重建索引。
-4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径、Python 环境根目录。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
+4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
 
 重载事件带新旧快照的差异（键名，不带值，凭证更不带）写进 Gateway 日志；`komo doctor` 显示当前生效配置的加载时间与来源文件 mtime，两者不一致就是"文件改了但没装上"，把上一次校验错误一并印出来。
 
@@ -141,13 +141,15 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 | `edit`   | 路径、明确匹配内容、替换内容、预期版本；可选 `then_run` | 匹配失败返回错误，不模糊猜测。带 `then_run` 见下文 |
 | `rg`     | 正则、搜索路径、文件 glob；返回「路径:行号:正文」    | 只读（`Operation::ReadFile`，与 `read` 同属可并发的一类）；这台机器上没有 ripgrep 就不挂这个工具 |
 | `bash`   | 命令、工作目录、超时；返回退出码和输出               | 管理进程组、限制输出、支持取消；超时也交回到点前的输出 |
-| `python` | 代码或已保存模块调用；返回结果、输出和产物           | 使用受管理解释器，绑定代码版本                       |
+| `codemode` | 一段 Python 脚本；返回脚本的输出                   | 跑在 Monty 里，文件只读；脚本里经 `tools.<name>()` 调只读工具与 MCP（见下文与 `docs/codemode.md`） |
 
-**`shell` 改名 `bash`**（2026-10-15）。模型看见的工具名从 `shell` 改成 `bash`——它本来就是 `/bin/bash -c`（没有 bash 退到 `/bin/sh`）。`Operation::ShellCommand`（序列化标签 `shell_command`）不动。改名前落账的记录照旧叫 `shell`：投影（`komo-kernel::projection`）与 TUI 对 `shell` / `bash` 两个名字同样处理，回放逐字节不变；恢复时一条按 `shell` 落账、已 `started` 而无结果的调用由执行器按 `bash` 认（只对带着落账计划的调用生效），重放策略是 `Unsafe`，所以记 `uncertain` 交给模型，不重跑也不当"没有这个工具"。Profile / skill 里写的 `tools = ["shell"]`、`requires_tools: [shell]` 要自己改成 `bash`，没有别名。
+**`python` 工具删除**（2026-10-15）。模型不再有 `python`：`codemode`（Monty，文件只读，经 `tools.*` 调其他工具）覆盖聚合与过滤，需要完整 Python（第三方库、写文件、联网）就用 `bash` 跑 `python3`；Gateway 不再管理 Python 虚拟环境（`python-envs/`、`[paths] python_env_root`、`PythonHost`、`env_version`、`KOMO_ARTIFACT_DIR` 都没有了）。旧记录照常解码与回放：`Operation::PythonCode` 与 `PlanVersions.env` 只为解码旧计划保留（没有构造方、没有写入方），投影只认落盘事实、不认工具名，所以历史 `python` 结果逐字节不变；`artifact://files/…` 仍读得到会话目录 `artifacts/` 里已有的产物，只是不再有新的写入方。恢复时的通用规则见 §8.6。
+
+**`shell` 改名 `bash`**（2026-10-15）。模型看见的工具名从 `shell` 改成 `bash`——它本来就是 `/bin/bash -c`（没有 bash 退到 `/bin/sh`）。`Operation::ShellCommand`（序列化标签 `shell_command`）不动。改名前落账的记录照旧叫 `shell`：投影（`komo-kernel::projection`）与 TUI 对 `shell` / `bash` 两个名字同样处理，回放逐字节不变；恢复时一条按 `shell` 落账、已 `started` 而无结果的调用走 §8.6 那条通用规则（工具名已不在工具表里的在途调用记 `uncertain` 交给模型），不重跑也不当"没有这个工具"。Profile / skill 里写的 `tools = ["shell"]`、`requires_tools: [shell]` 要自己改成 `bash`，没有别名。
 
 **`then_run`：改完紧接着跑一条命令，一次调用、一条结果**（照 SoL-Pi 的 Action Fusion，省掉"改 → 模型 → 跑"中间那一次往返）。`edit` / `write` 的参数可以带 `then_run: { command, timeout_secs? }`；`prepare` 用 `bash` 自己的计划构造把它做成第二步，挂在计划的 `then_run` 上，`execute` 从 `plan.then_run` 取它；改动那一步照样受 §7 那条硬限制（不写 komo 自己的状态）。执行（`tools::fusion`）：改动失败 → 命令不跑，结果里写 `[then_run:skipped]`；改动之后目标的内容哈希必须仍是改动留下的那一份，否则同样跳过；命令走 `bash` 的正常执行（进程组、时限收紧到活动执行时限、取消），输出流进**同一次尝试**的 stdout / stderr；非零退出照实报（`exit_code`），改动不回滚。结果是 `{ mutation, then_run: { status: succeeded|failed|skipped, result } }`，状态只有"改动成功且退出码 0"才是完成；正文依次是改动的结论、`[then_run:…]` 标记、命令的输出。这次运行的能力面里没有 `bash`（或执行器没装它）时，带 `then_run` 的调用不放行、不执行，交回一句原因；交给模型的 schema 也一并摘掉 `then_run`。组合调用是写，所以是并发调度里的屏障（§6）。恢复见 §8.6。
 
-**搜索走 `rg` 工具，不拼 bash 命令。** 两者结果一样，计划不一样：`rg` 的计划是一次**只读**动作（`Operation::ReadFile`，目标是搜索范围），所以它能和别的读同时在飞（§6）、能被 codemode 脚本调用（脚本里只放行只读与 MCP，§4）、恢复时可以直接重读（§8.6）；`bash` 的任意命令三样都不是。（2026-10-11 之前还有一条理由：`bash` 一律 Ask，只读搜索每次都停下来等人；审批删掉之后这条不再成立，§7。）HTTP 请求通过 Python 库或命令完成；Git、构建、测试、HA 和记录查询都组合这些基础工具。
+**搜索走 `rg` 工具，不拼 bash 命令。** 两者结果一样，计划不一样：`rg` 的计划是一次**只读**动作（`Operation::ReadFile`，目标是搜索范围），所以它能和别的读同时在飞（§6）、能被 codemode 脚本调用（脚本里只放行只读与 MCP，§4）、恢复时可以直接重读（§8.6）；`bash` 的任意命令三样都不是。（2026-10-11 之前还有一条理由：`bash` 一律 Ask，只读搜索每次都停下来等人；审批删掉之后这条不再成立，§7。）HTTP 请求通过命令完成（需要库就 `bash` 跑 `python3`）；Git、构建、测试、HA 和记录查询都组合这些基础工具。
 
 `rg` 内嵌 ripgrep 的**书库**——[`grep`](https://github.com/BurntSushi/ripgrep/tree/master/crates/grep)（匹配、搜索、打印）加 [`ignore`](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore)（遍历：隐藏文件、`.gitignore`、覆盖 glob）——**进程内跑**：不起子进程，机器上也不需要装 `rg`。要书库不要命令，是因为外部二进制要么没装、要么各家版本不同；而遍历规则本来就该用这套经过验证的实现，不该自己再写一遍。正则语法就是 Rust regex（只连 `grep-regex`，不带 PCRE2）。遍历与搜索是阻塞的，所以跑在 `spawn_blocking` 上、匹配经队列流式写进输出存储（§8.3），取消与超时靠一个停止标志让那边收手。**默认完整保存匹配，不设 8 MiB 存储上限；给模型的视图按 50 KiB / 2000 行投影**，仍是完成；**超时（默认 30s）也交回已找到的部分**，标 `timed_out`、状态记失败（没搜完和"有读不了的"一样是不完整的搜索），不是一句光秃秃的"超时"。一行最多印 500 列（`rg --max-columns 500 --max-columns-preview`）：JSONL 事件一行动辄几十 KiB，不截的话一行就吃掉整份预算，要看全行就 `read` 那一行。停止标志被写入器看见时报的错**不能是 `Interrupted`**——`write_all` 会把它当成"再试一次"原地重试，搜索线程空转、队列不关（2026-09-24 实测：`cron|schedule` 搜 `~/.komo` 的副本，写满 8 MiB 后线程在 `write_all` 里空转，跑满 30s 只拿回"超时"、线程也不退出；修后 debug 构建 4.2s 完成，截到 500 列后只写下 2.9 MiB；把上限压到 1 MiB 时 3.3s 返回截断结果）。
 
@@ -164,7 +166,7 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 
 **`update_plan` 也不是第七个工具，是模型自己的工作计划。** 模型每次发**整份**计划（步骤 id / 目标 / `pending|in_progress|completed`，完成时可附 `progress`：改了哪些文件、怎么验证的、做了什么决定），以 `Operation::UpdatePlan` 进同一条执行路径——没有副作用。计划不另存：它整份内联在 `tool.planned` 里（超过内联上限在 `prepare` 就拒掉），这条 Run 现在的计划是从日志按 Run 折出来的，重启之后折出来的还是同一份；结果是计划快照加几句提醒（目标改了换 id、同时最多一个 in_progress……）。它是屏障，不和并发的读交错；started 而无结果的那次再收一次尾即可，不核对。**完成一个先前登记过、当时还没完成的步骤**是一个计划边界——一上来就标 completed 的新步骤只算补记历史；在线压缩以计划步骤完成为边界。
 
-**`codemode` 是组合，不是新能力。** 模型写一段 Python，在 Monty（pydantic 的 Python 子集解释器）里跑，跑在 komo 自己起的 worker 子进程中——语言本身没有网络、子进程，文件只读（宿主 `/` 只读挂载，komo 自己的状态连读也拒，写类一律拒；要写文件走 `write` / `edit`，要完整 Python 走 `bash` 的 `python3`；2026-10-15 起取代此前的 CPython + 操作系统沙箱：Seatbelt / Landlock + seccomp，以及启动自检），脚本里经 `tools.<name>()` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）与 `Operation::McpCall`（含写操作）的计划；本地 `write` / `edit` / `bash` / `python`、带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是语言本身（§7）。**脚本里的子调用逐次持久化**（2026-10-13，此前只放行只读、整段重跑）：每次子调用按 intent → started → delivered 记成 `codemode.journal` 事件、正文外置到 `tool-output/`，fold 不看它，不生成顶层 `tool.result`，模型只看见外层结果。中断后整段重跑脚本：已交付的子结果按序原样接回，started 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次绝不重做；脚本的时钟与随机数经宿主、记进 journal，恢复时原样还回去，所以重跑是确定的，越过已记录的前缀之后新调用照常执行（2026-10-15）；分歧（工具名 / 参数 / 读数对不上）或结果不明整段记 uncertain 交给模型。因为脚本里可能有 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）。见 `docs/codemode.md` §5、§7。
+**`codemode` 是组合，不是新能力。** 模型写一段 Python，在 Monty（pydantic 的 Python 子集解释器）里跑，跑在 komo 自己起的 worker 子进程中——语言本身没有网络、子进程，文件只读（宿主 `/` 只读挂载，komo 自己的状态连读也拒，写类一律拒；要写文件走 `write` / `edit`，要完整 Python 走 `bash` 的 `python3`（`python` 工具已于 2026-10-15 删除）；2026-10-15 起取代此前的 CPython + 操作系统沙箱：Seatbelt / Landlock + seccomp，以及启动自检），脚本里经 `tools.<name>()` 调其他工具——放行 `Operation::ReadFile`（`read`、`rg`）与 `Operation::McpCall`（含写操作）的计划；本地 `write` / `edit` / `bash`、带 `then_run` 的、编排操作与 codemode 自己仍要在脚本外调。只有脚本的输出回到模型。2026-10-11 之前还要"Policy 直接 Allow"；Policy 删掉之后范围外的读也放行（与当时的 auto 一致），边界是语言本身（§7）。**脚本里的子调用逐次持久化**（2026-10-13，此前只放行只读、整段重跑）：每次子调用按 intent → started → delivered 记成 `codemode.journal` 事件、正文外置到 `tool-output/`，fold 不看它，不生成顶层 `tool.result`，模型只看见外层结果。中断后整段重跑脚本：已交付的子结果按序原样接回，started 而没交付的按双 Safe 准则判（§8.6），unsafe 的那次绝不重做；脚本的时钟与随机数经宿主、记进 journal，恢复时原样还回去，所以重跑是确定的，越过已记录的前缀之后新调用照常执行（2026-10-15）；分歧（工具名 / 参数 / 读数对不上）或结果不明整段记 uncertain 交给模型。因为脚本里可能有 MCP 写，codemode 不再算只读计划（`is_read_only()` 为 false），是同一轮里的屏障（§6）。见 `docs/codemode.md` §5、§7。
 
 **MCP 工具也不是第七个工具，是操作者接进来的外部能力。** `[mcp.servers.<name>]` 里配的服务器在 Gateway 启动时连上，每个工具注册成 `mcp__<server>__<tool>`，与内置工具走同一条 `prepare` / 落账的路；只读与否由操作者声明，不信服务器自报——它决定恢复时能不能直接重读（§8.6）。codemode 脚本里 MCP 工具都能调，只读声明只决定中断后能不能重做（2026-10-13 之前它还决定 codemode 能不能调）。**默认不声明给模型**（2026-10-14，照 pi 的 `exposure`）：`exposure = "codemode"` 的 MCP 工具不进 schema、只在 codemode 脚本里调，脚本用 `search_tools` / `describe_tool` / `describe_namespace` 找；系统提示只给每台服务器一行摘要（配置的 `description`，没写就是服务器 instructions 的第一行），instructions 全文只在脚本里读。`direct` 照常声明，`hidden` 不挂。见 `docs/mcp.md` §3。
 
@@ -200,13 +202,13 @@ pub trait Tool: Send + Sync {
 }
 ```
 
-这是接口示意，辅助类型省略。prepare 可以解析参数和检查元信息，但不能通过导入未知 Python 模块、运行命令等方式提前执行代码——`prepare` 没有副作用，副作用只在 `start_call` 之后（§8.5）。
+这是接口示意，辅助类型省略。prepare 可以解析参数和检查元信息，但不能通过运行命令等方式提前执行代码——`prepare` 没有副作用，副作用只在 `start_call` 之后（§8.5）。
 
 `ExecutionPlan` 带 `recovery: RecoveryMode`（§8.6，决定计划里记下的重放策略）与 `plan_hash`，由 `prepare` 填写，模型参数不能指定。`execute` 按值收 `ExecutionPlan`（2026-10-11 之前收的是只能凭 Policy 允许或审批换来的 `ApprovedPlan` / `Proof`，随 Policy 一起删掉，§7）。
 
 ToolContext 由 Gateway 创建，包含 Session / Run / ToolCall 身份、工作目录、只读根、受保护路径名单（§7）和取消信号，不能由模型参数提升。
 
-bash 与 Python 子进程使用明确的环境变量集合。取消时停止所属进程组并等待回收，而不仅仅是丢弃异步等待。Tokio 默认不会因为进程 handle 被丢弃就终止进程。[Tokio process](https://docs.rs/tokio/latest/tokio/process/index.html)
+bash 子进程使用明确的环境变量集合。取消时停止所属进程组并等待回收，而不仅仅是丢弃异步等待。Tokio 默认不会因为进程 handle 被丢弃就终止进程。[Tokio process](https://docs.rs/tokio/latest/tokio/process/index.html)
 
 ### 资源命名空间：`skill://` / `tool://` / `artifact://`
 
@@ -226,48 +228,23 @@ artifact://<run>/<call>/<attempt>/<stdout|stderr|result>
 - **越权当场是错**：`..`、空段、`tool://` 里能力面之外的工具、别的会话的 `run`、没有会话目录，一律在 `prepare` 就拒绝（`ToolError::Failed` 说清原因），**不进计划就没有执行**；解析链接之后还要再核一次"仍在挂载点里面"。
 - **挂载由装配决定，不能由模型参数提升**：skill 根来自当前配置快照的 `paths.skill_dirs`，会话内容目录来自这一次的 Session，`tool://` 只认这一次的 `AgentSurface`。三者随 `ToolContext` / `CallEnv` 走。
 - **计划里的两种目标**：本地路径（序列化成 `{"path": …}`，与改造前逐字相同——旧计划的哈希不变）与资源（`{"uri": …, "resolved": …}`）。**没有磁盘目标的读**（`tool://`）不编假路径——给虚拟入口编一个假路径才是真的越权口子。
-- **首阶段不做**：memory / session 的任意写入、bash / Python 里的 URI 展开、通用 VFS。本地路径的用法一个字都不变。
+- **首阶段不做**：memory / session 的任意写入、bash 里的 URI 展开、通用 VFS。本地路径的用法一个字都不变。
 
-产物由运行时登记：Python 子进程拿 `KOMO_ARTIFACT_DIR`（= `<会话内容目录>/artifacts/<run>`）作为产出目录，跑完把这次新出现的文件记进工具结果的 `artifacts` 引用（**相对会话目录的路径**，落在 `output.json` 的 `body.artifacts` 里），投影那一处把它映射成 `artifact://files/<相对 artifacts 的那一段>`（映射函数在 kernel，落盘与投影共用同一个，§8.3）。工具输出那一条的引用直接由 §8.3 的投影给出（`artifact://<run>/<call>/<attempt>/stdout`），重启之后照样读得回来——它是**按引用回放**，不是把正文再抄一遍。
+产物（2026-10-15 python 工具删除后没有新的写入方，下面是历史记录的形状）由运行时登记：工具结果的 `artifacts` 引用记的是 `<会话内容目录>/artifacts/<run>` 里的文件（**相对会话目录的路径**，落在 `output.json` 的 `body.artifacts` 里），投影那一处把它映射成 `artifact://files/<相对 artifacts 的那一段>`（映射函数在 kernel，落盘与投影共用同一个，§8.3）。工具输出那一条的引用直接由 §8.3 的投影给出（`artifact://<run>/<call>/<attempt>/stdout`），重启之后照样读得回来——它是**按引用回放**，不是把正文再抄一遍。
 
-## 5. Python 执行与能力保存
+## 5. 能力保存
 
-### 5.1 执行环境
+### 5.1 / 5.2 Python 环境与 `python` 工具（已删除，2026-10-15）
 
-Gateway 管理一个 Python 虚拟环境；Rust 通过独立子进程调用解释器。首版每次 Python 调用创建新进程，不依赖跨调用的内存变量。
+`python` 工具与 Gateway 管理的 Python 虚拟环境（`python_runtime`、`python-envs/`、`[paths] python_env_root`、`PythonHost`、`env_version`）整体删除，没有迁移层。聚合与过滤用 `codemode`（Monty，文件只读，§4、`docs/codemode.md`），需要完整 Python（第三方库、写文件、联网）就用 `bash` 跑 `python3`；可复用的集成写成 Skill（§5.6）。章节号保留，是为了不让别处的 §5.3 以后的引用错位。
 
-每次返回结构化结果：
-
-```text
-status / result / stdout / stderr / artifacts
-```
-
-脚本可以设置 `result` 返回 JSON 可表达的数据；普通 print 输出单独收集。解释器驱动的协议使用独立通道或明确封装，脚本输出不能混入控制协议。
-
-长期状态写入文件；依赖按锁定清单安装。环境变更串行进行，正在使用的环境版本保持不变。依赖升级需要新的环境版本，成功后再切换后续调用。
-
-虚拟环境还没建出来时，`python` 退回 `PATH` 里版本最高的 `python3.N`（3.10 起），一个都没有才用裸 `python3`，`env_version` 如实写成那个解释器的版本 + `no-lock`。（codemode 自 2026-10-15 起不用解释器，跑在 Monty 里。）不直接用裸 `python3` 的原因（2026-10-14）：macOS 上它是 `/usr/bin/python3`（3.9），Homebrew / uv 装的新版本只提供带版本号的名字；实测会话里模型因此缺 `tomllib`、`fromisoformat` 读不了 komo 自己小数位数不定的时间戳，白耗好几轮。
-
-### 5.2 Python 调用形式
-
-任意代码：
-
-```json
-{
-  "mode": "code",
-  "code": "from pathlib import Path\nresult = [p.name for p in Path('.').iterdir()]"
-}
-```
-
-`mode` 是参数里的判别字段`mode` 是参数里的判别字段，但**模型偶尔会漏写**（真实会话里报的是 `missing field mode`，白跑一轮）。所以 Runtime 按参数形状补上：有 `code` 就是 `code`。补进去的值落在 `plan.args` 里，**计划哈希看的是补完之后的那份**——少一个判别字段不该换来一次失败往返，也不该让同一次调用有两种形状。
-
-`python` 交给模型的那段正文（§8.3 的投影）按这个顺序取：错误 → 结构化结果 → **stdout 的首尾摘录** → "没有返回值，也没有输出"。脚本只 `print` 是常见跑法，而字面量 `null` 会让模型以为工具坏了、改用 `bash` + `python3` 把同一件事重跑一遍（真实会话里就这么白花了两轮）。完整 stdout 照旧在 `stdout.txt` 里，抬头写着它的字节数。
+旧会话里的 `python` 调用照常读得出来：`Operation::PythonCode` 与 `PlanVersions.env` 只为解码保留（`komo-kernel/src/events.rs` 的测试用真实形状的旧计划钉着：解码、重新序列化一致、计划哈希不变；`projection.rs` 的测试钉着历史 `python` 结果的回放逐字节不变）。TUI 仍按名字渲染历史 `python` 调用的代码。
 
 ### 5.3 toolbox（已删除，2026-10-15）
 
-「把 Python 模块保存进 toolbox、候选测试后启用、用 `python` 的 `call` 模式调用」这一整套已删除：`toolbox/` 目录、`komo toolbox` 命令、`/v1/toolbox` 路由、`Operation::PythonCall` 与 `call` 形式的 `PythonJob`、`PlanVersions.module`、`[paths] toolbox_dir`、`python` 子进程的凭证注入与 import 禁区钩子，都不再存在，也没有迁移层。可复用的集成改写成 Skill（§5.6）：`SKILL.md` 写步骤，脚本放在 Skill 目录里，模型用 `bash` 运行。`python` 工具只剩 `mode = "code"`。
+「把 Python 模块保存进 toolbox、候选测试后启用、用 `python` 的 `call` 模式调用」这一整套已删除：`toolbox/` 目录、`komo toolbox` 命令、`/v1/toolbox` 路由、`Operation::PythonCall` 与 `call` 形式的 `PythonJob`、`PlanVersions.module`、`[paths] toolbox_dir`、`python` 子进程的凭证注入与 import 禁区钩子，都不再存在，也没有迁移层。可复用的集成改写成 Skill（§5.6）：`SKILL.md` 写步骤，脚本放在 Skill 目录里，模型用 `bash` 运行。
 
-凭证边界不变（别处引用 §5.3 指的就是这条）：原始凭证不放进模型提示词、不进计划、不进事件、不打印到对话或日志，也不进服务单元文件（§3）；`bash` / `python` 子进程只拿显式的环境变量集合，不继承 Gateway 的环境。
+凭证边界不变（别处引用 §5.3 指的就是这条）：原始凭证不放进模型提示词、不进计划、不进事件、不打印到对话或日志，也不进服务单元文件（§3）；`bash` 子进程只拿显式的环境变量集合，不继承 Gateway 的环境。
 
 ### 5.4 AI 迭代流程（已删除，2026-10-15）
 
@@ -298,7 +275,7 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、跑这个�
 - 搜索路径有序，**同名先到先得**；每次查询重扫目录，编辑或新增无需重启。
 - 只有系统提示里的**目录行**（名字 + 一句描述，总量有上限）是受理 Run 时的快照，为了提示前缀稳定；`platforms:` / `requires_tools:` 只门控这份目录，不门控加载。实现上这一块是两行开头加若干目录行：先给**按序的根**（只列真的出了条目的那些，顺序就是搜索顺序——"同名先到先得"因此落得下来），再给目录行；模型按这个顺序去找 `<根>/<名字>/SKILL.md` 并 `read` 它。一条能露面的都没有时这一块整个不出现（不留空标题）。受理一条 Run 时渲染一次，正文冻结进 `RunSnapshot.skills_ref`（§6.2），这条 Run 的每一段（包括等介入、等退避之后的续跑）都逐字用它——目录行是提示前缀的一部分，不能一段一个样；`SKILL.md` 的增删改、`disable` 名单、配置重载都从下一条 Run 起生效（2026-10-14 之前每一段都读活注册表，"启动时算一次"只是这里的说法）。**整批装得下「名字 + 一句描述」就用它，装不下就只留名字**——列全比列得详细要紧：166 个 skill 的实测里，2000 字符的预算只留下字母表前 16 条，`log-diagnosis` 根本没进提示，模型为了找它去 `ls` 了整个目录；只留名字是 2752 字符、装得下全部（默认上限已按这个实测改成 4000）。名字都装不下时末尾会写「另有 N 条没列出来」：**「没有它」和「没列出来」是两件事**。
 - **没有 skill 工具。**模型通过 `read` 读 `SKILL.md`——写本地路径，或者写 `skill://<名字>/SKILL.md`（§4.7，逻辑入口，审计显示的是它）；skills 目录是只读根（§4.7 的资源根也在 `ToolContext.roots` 里）。
-- **目录行的门控按这条 Run 的能力面**：某个 Agent 的面里没有 `python` 时，`requires_tools: [python]` 的 skill 不进它的目录行；而 `skill://` 仍然读得到——门控管的是"要不要摆在眼前"，不是"能不能读"。
+- **目录行的门控按这条 Run 的能力面**：某个 Agent 的面里没有 `bash` 时，`requires_tools: [bash]` 的 skill 不进它的目录行；而 `skill://` 仍然读得到——门控管的是"要不要摆在眼前"，不是"能不能读"。
 - Cron Job 可以声明 `skills = ["…"]`，触发时把这些 SKILL.md 正文预载进首轮上下文。
 - `komo skills list | inspect <name> | enable | disable`；`disable` 只从目录行隐藏，不删文件。没有安装 / 候选 / 治理流程——Skills 由人写、由人放进目录。
 
@@ -332,7 +309,7 @@ Skills 是**人写的程序性说明**——"做 X 时按这几步、跑这个�
 
 工具名称和参数来自 provider 原生字段，不从自然语言或代码块推断。完整 assistant 消息与每个工具结果保持调用 ID 配对，这是原生 function calling 的执行方式。[Function calling](https://developers.openai.com/api/docs/guides/function-calling)
 
-**同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走重放判定（§8.6），顺序由账本钉死；`write`、`edit`、`bash`、`python`、`codemode`（脚本里可能有 MCP 写，§4），`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何会停下来的判定（核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。"做它"是 `start_call` 及之后的一切：执行工具、受理子 Run、派任务、转话都等收尾之后；前面在飞的那条停下来时，屏障还没开始过，原样留在没轮到的那些里。并发上限是执行器自己的预算（默认 4 条）。两条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
+**同一轮的多个调用：只读的可以同时在飞，其余是屏障。** 够格的是 `Operation::ReadFile` 这一类计划（`read`、`rg`）里**没有上一世要接**的那次调用——续跑里"已经 `start` 过"的那些要走重放判定（§8.6），顺序由账本钉死；`write`、`edit`、`bash`、`codemode`（脚本里可能有 MCP 写，§4），`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何会停下来的判定（核对 / 取消），都是屏障——屏障之前已经在飞的先收尾，再按调用顺序做它。"做它"是 `start_call` 及之后的一切：执行工具、受理子 Run、派任务、转话都等收尾之后；前面在飞的那条停下来时，屏障还没开始过，原样留在没轮到的那些里。并发上限是执行器自己的预算（默认 4 条）。两条不变量不因为并发而改变：`start_call` 返回之后才允许产生副作用（§8.5）；完成事件按真实完成顺序落账，交给模型的那一份按**原始调用顺序**配对。
 
 **在线压缩（`[compaction]`，默认关，2026-10-09）。** 移植自 SoL-Pi 的 Online Context Compact，但 loop 是 komo 自己的，所以不需要"中止再补一条隐藏的续跑消息"。判断只在三种时机：一轮的调用**全部收尾之后**这一轮完成了一个计划步骤（`update_plan` 的边界）、日志里还压着一个没用掉的边界（比如边界那一轮随后停在了等待上，续跑的这一段开头再判）、估计的上下文贴着窗口（`context_window − window_reserve_tokens`，字节 / 4 的估计与实报用量取大）。Gateway 按日志重新装配出 provider 正看着的那份视图（投影、衰减之后）估价，`find_cut` 切在一轮的开头、近期至少留 `keep_recent_tokens`，用缓存账（`cache_write_read_ratio`、剩余请求估计、冷却、旧债）决定；不在边界上只为窗口保护压，压完仍贴着窗口就不压。**决定不压时 driver 原样接着跑**——下一次请求与关着压缩时逐字节相同，提示缓存照样命中；边界上不压记一条 `skipped` 把边界用掉。决定压时发一次摘要请求（没有工具，早先那段渲染成一条纯文本用户消息，带当前计划与已完成步骤的进度；系统提示说明里面是数据不是指令），成了记 `compacted` 并把这一段交回 handler（`SegmentOutcome::Recompose`）：同一个 Run、不重新入队、不再写 `run.started`，下一段按日志装配成**任务 → 摘要 → 切点起原样**；失败、截断记 `skipped`（带着那份决策），Run 照常往下，此后窗口压力不再触发重试，直到有真正的工具工作或新的边界。两次压缩之间至少隔一次真正的请求；一次领取里最多重装配 8 次；摘要请求不算轮数，但算进 token 花销，已用的轮数与 token 从下一段的预算里扣掉。
 
@@ -366,13 +343,13 @@ default_agent = "assistant"
 [agents.assistant]
 instructions = "你是家里那个助手，回答用中文。"
 model = "chat"                     # [model.<alias>] 的 alias；省略 = [models].default
-tools = ["read", "rg", "python"]   # 省略 = 目录里全部；[] = 一个都不给
+tools = ["read", "rg", "codemode"]   # 省略 = 目录里全部；[] = 一个都不给
 workspace = "home"                 # 相对数据目录；省略 = [paths] workspaces_dir
 memory_scope = "personal"
 
 [agents.coder]
 instructions = "你在仓库里干活，动手前先把计划说清楚。"
-tools = ["read", "write", "edit", "rg", "bash", "python"]
+tools = ["read", "write", "edit", "rg", "bash", "codemode"]
 workspace = "code/komo"
 ```
 
@@ -413,11 +390,11 @@ workspace = "code/komo"
 
 这条留下来的理由：Session 目录是内容权威、`state.db` 是调度权威（§8.2），模型一次手滑改了它们，坏的是 komo 自己的恢复能力——账本与 JSONL 对不上之后，§8.4 那张表只能把会话判成 `blocked`。别的写入坏了是用户的文件，这一类坏了是 komo 自己失忆。
 
-**它只拦得住 `write` / `edit`。** `bash` 与 `python` 跑的是任意代码，`rm sessions/…`、`sqlite3 state.db` 都在它外面；读也不拦（线上见过一条 WeChat 会话找不到数据时去读 `runtime/gateway.json` 与 `.env`）。这里如实写：这条限制挡的是手滑，不是有意绕过。
+**它只拦得住 `write` / `edit`。** `bash` 跑的是任意代码，`rm sessions/…`、`sqlite3 state.db` 都在它外面；读也不拦（线上见过一条 WeChat 会话找不到数据时去读 `runtime/gateway.json` 与 `.env`）。这里如实写：这条限制挡的是手滑，不是有意绕过。
 
 ### 7.3 执行边界：只来自执行环境
 
-内置文件工具可以在 Rust 里执行路径与版本限制；任意 shell / Python 代码一旦启动，就有它运行账号的全部操作系统权限，cwd 和参数检查不是进程沙箱。所以**真正的边界只能来自执行环境**，不能来自对命令文本的判断——2026-10-11 之前那张 `command_patterns` 网就是例子：`rm -r -f /`、`find -delete`、变量拼出来的命令全在网外。
+内置文件工具可以在 Rust 里执行路径与版本限制；任意 shell 代码一旦启动，就有它运行账号的全部操作系统权限，cwd 和参数检查不是进程沙箱。所以**真正的边界只能来自执行环境**，不能来自对命令文本的判断——2026-10-11 之前那张 `command_patterns` 网就是例子：`rm -r -f /`、`find -delete`、变量拼出来的命令全在网外。
 
 今天唯一的执行环境边界是 codemode（`docs/codemode.md`）：脚本跑在 Monty 里（2026-10-15 起，此前是 macOS Seatbelt / Linux Landlock + seccomp 里的 CPython），语言没有网络、子进程，文件只读（宿主 `/` 只读挂载，每个 OsCall 先在 worker 里拦：规范化后落在 komo 自己的状态里的连读也拒，名单与 `write` / `edit` 共用 `Protected`；写类一律拒），环境变量为空；worker 子进程由宿主管墙钟、内存与取消，到限 SIGKILL；脚本里经 `tools.<name>()` 的内层调用只放行只读计划与 MCP 调用（§4），本地写入、进程与编排仍在脚本外。这层边界是语言层的，不是内核隔离——Monty 自身的漏洞不在它的承诺里。要给 bash / python 也立边界，路只有一条：把它们放进同类的执行环境，而不是加回规则。
 
@@ -530,7 +507,7 @@ Schema 演进没有迁移脚本目录。每个 toasty 模型旁边放它的 `*_T
 以下是简化的调用片段；输出正文不在事件中，示例省略引用大小和哈希，实际准备计划还包含资源版本、代码快照和权限引用：
 
 ```jsonl
-{"v":1,"seq":41,"event_id":"evt-41","session_id":"sess-1","run_id":"run-1","at":"2026-09-15T08:00:00Z","type":"assistant.message","data":{"round":3,"tool_calls":[{"call_id":"call-7","provider_call_id":"pc-7","name":"python","arguments":{"mode":"code","code":"result = 1 + 1"}}]}}
+{"v":1,"seq":41,"event_id":"evt-41","session_id":"sess-1","run_id":"run-1","at":"2026-09-15T08:00:00Z","type":"assistant.message","data":{"round":3,"tool_calls":[{"call_id":"call-7","provider_call_id":"pc-7","name":"bash","arguments":{"command":"echo 2"}}]}}
 {"v":1,"seq":42,"event_id":"evt-42","session_id":"sess-1","run_id":"run-1","at":"2026-09-15T08:00:01Z","type":"tool.started","data":{"call_id":"call-7","attempt_id":"attempt-1","plan_ref":"evt-41"}}
 {"v":1,"seq":43,"event_id":"evt-43","session_id":"sess-1","run_id":"run-1","at":"2026-09-15T08:00:02Z","type":"tool.result","data":{"call_id":"call-7","attempt_id":"attempt-1","status":"completed","output_ref":{"path":"tool-output/run-1/call-7/attempt-1/output.json"},"preview":"result = 2"}}
 ```
@@ -560,7 +537,7 @@ stdout / stderr 在运行时流式写入 .partial 文件，避免在 Gateway 内
 - **回放给模型的是"这一段对话"，不是"这一条 Run"**：最新一个 `conversation.boundary` 之后的消息按 Run 分组、Run 之间先来后到；**正在跑的那条 Run 带完整协议**（`provider_blocks`、工具调用与结果），**历史 Run 只发布两件事——用户说了什么（`run.accepted`）、它最后答了什么**。三条理由：① 历史那半轮在取消 / 失败时合法地停在"有调用、没结果"上（§8.4），照搬进新请求就是 provider 400；② 几十轮工具往返会随对话长度线性涨上下文，而对"接着聊"没有增量；③ 子代理跑过的那几轮不属于父的对话，父的窗口里没有它的过程，子代理也拿不到父的历史（§4）。**子代理的"这一段对话"就是它那条线**（§4 的 `resumes` 链）：顺着 `resumes` 往回找到的那几条子 Run 加上正在跑的这条，规则与主对话一字不差——正在跑的带完整协议，线上更早的那几条只发布任务正文与最后的回答（`failed` 的那条没有最后回答，就只剩任务正文，外加一句它怎么结束的）。续跑因此不会把上一次停在半轮的调用带进新请求，而过程细节要的时候按引用 `read` 回来（`tool-output/` 是只读根）。线是从 JSONL 里 fold 出来的（`run.accepted.delegate.resumes`），不查 state.db：它决定模型看见什么，属于内容权威（§8.2）。还没被领走的 Run 整个不进（§8.4 的不越过）。**上一轮说的话因此必须还在**：少了它，"去查一下"指的是哪件事就只能靠猜。正文超限外置时按引用读回来——少读一次，模型看到的就是一条空的 user 消息，而它该看到的是原话。
 - Memory 的证据引用使用 Session ID + event_id / seq，稳定定位原始消息或工具结果。
 - **读事件不得创建或修改内容。** `Ledger::read` 与 `session_log::read_events` 是只读路径：文件不在就返回空（新会话本来就没有日志，`GET /v1/sessions/{id}/events` 依赖这一点），**绝不 `create`**。写路径（受理、`conversation.boundary`、挂起、终态）才建目录与文件。少了这条界线，"内容被删掉"会被一次读**静默地补成一个空日志**——于是 §8.9 的观察永远看不到它本该报出来的那件事（线上冒烟抓过一次：对账读会话就把目录建回来了）。
-- JSONL、state.db 和引用产物均为 Gateway 的受保护状态；`write` / `edit` 拒绝修改它们（§7.2）；bash / python 拦不住，§8.9 的 reconcile 把改坏的那一半报出来。回放只能接受 Gateway 写入的合法记录，不能把模型生成的 JSON 当作执行事实。
+- JSONL、state.db 和引用产物均为 Gateway 的受保护状态；`write` / `edit` 拒绝修改它们（§7.2）；bash 拦不住，§8.9 的 reconcile 把改坏的那一半报出来。回放只能接受 Gateway 写入的合法记录，不能把模型生成的 JSON 当作执行事实。
 
 尾部恢复时，先校验数据库已经引用的记录和检查点，再处理尚未应用的后续记录。只有末尾不完整、且不被已提交引用覆盖的行，才能先隔离保留原始字节再截断；完整有效行不能因为索引落后被删除。文件中间损坏、已提交范围缺失或哈希不匹配时停止受影响会话的自动执行，不能跳过坏行或退回旧检查点继续。
 
@@ -711,7 +688,7 @@ state.db 事务提交控制决定与 control_outbox（固定 event_id）
 
 ### 8.6 工具恢复：先判断是否发生，再决定是否重试
 
-Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子事务。副作用已发生、完整输出与结果事件尚未持久保存时，必须保留 uncertain，而不是用“重试成功”掩盖这段窗口。
+Runtime 无法对任意 shell 和外部服务共同提交一个原子事务。副作用已发生、完整输出与结果事件尚未持久保存时，必须保留 uncertain，而不是用“重试成功”掩盖这段窗口。
 
 **重启续跑时只问一件事：这次调用能不能重放**（2026-10-13，规则借自 pi-durable 的 `replay`）。一次 started 而没有结果的调用，盘上若有一份身份齐全、哈希对得上的 `output.json`，按 §8.4 补记结果、复用原输出，不重做；没有的话看两份重放策略：
 
@@ -725,14 +702,16 @@ Runtime 无法对任意 shell / Python 和外部服务共同提交一个原子�
 
 理由：停下来问人并不比模型更有把握——人多半也得去看一眼目标才答得上来，而模型手里就有 read / bash。**执行器本身不重跑 unsafe 的调用**，重做是模型发起的新一次调用，账本里看得见。**执行当中**工具自己报"结果不明"（如 unsafe 的调用超过时限、远端没回话）也一样：结果正文附同一段判断方法交给模型，Run 不停。账上找不到承载那次调用的尝试（账本自相矛盾）时补开一次 `tool.started` 记下结论，同样交给模型。仍交给人的只剩模型拿不到上下文、或放出去可能重复执行的：引用损坏、会话读不出来、无法确认旧执行已结束（§8.4）。升级前已经停在 `verify` 上的 Run（停在介入上、带 `uncertain` 调用、`last_error` 为空），Gateway 启动对账之后放回队列交给模型。
 
+**工具名后来没了的在途调用**（2026-10-15，替掉 `shell` → `bash` 那条别名）。恢复时一条调用已经有落账的计划、上一世接着往下做，而它的工具名不在这次的工具表或能力面里（`shell` 改名、`python` 删除，以后别的工具也一样）：执行器不看重放策略——没有工具可问——直接按中断处理，记 `uncertain`（带上它留在盘上的部分输出）交给模型，既不当"没开始"、也不停 Run。判据只有"带着落账计划与上一世的状态"：模型这一轮新发的调用没有这两样，叫到不存在的工具名照旧被拒，并列出这次能用的工具。
+
 `RecoveryMode` 由 `prepare` 填写，模型不能随意填"可重试"。它进计划哈希，四个变体都保留，旧计划照原样解码、哈希不变：
 
 | `RecoveryMode` | 重放策略 | 谁写它 |
 | --- | --- | --- |
 | `SafeReread` | safe | `read`、`rg`、`codemode`（safe 只表示可以重新进入子调用 journal：已交付的子结果原样接回，unsafe 子调用不重做，`docs/codemode.md` §7）、服务器标了只读的 MCP 工具 |
 | `IdempotencyKey` | safe | 外部接口确实保证去重、所有尝试复用同一逻辑操作的键；目前没有工具产出它 |
-| `VerifyTarget` | unsafe | 2026-10-13 之前的 write / edit / 带核对函数的 python 计划；新计划不再产生 |
-| `NoSafeRecovery` | unsafe | `write`、`edit`、`bash`、`python`、带 `then_run` 的组合调用、其余 MCP 工具 |
+| `VerifyTarget` | unsafe | 2026-10-13 之前的 write / edit / 带核对函数的 python 计划（python 工具 2026-10-15 已删除）；新计划不再产生 |
+| `NoSafeRecovery` | unsafe | `write`、`edit`、`bash`、带 `then_run` 的组合调用、其余 MCP 工具 |
 
 `Tool::replay` 默认 unsafe，只有重跑一遍确实无害的工具覆盖它，就是上表 safe 的那几个。
 
@@ -845,11 +824,11 @@ UPDATE runs SET claimed_by = NULL
 
 JSONL 追加和状态提交都校验领取代次。领取代次只防止旧执行者写账本，不能撤销已经发出的外部动作。因此必须先确认旧执行已停止，再考虑启动替代执行。
 
-首版不承诺让 shell / Python 进程本身跨 Gateway 重启继续存活。正常停机时停止接收新执行，给正在完成的工具短暂收尾时间，持久化可用结果；超时则回收所属进程及子进程，剩余任务交还领取权、由对账判成 `queued` 或 `waiting + intervention`。关键文件原子修改完成后再停，不在半次替换中主动取消。
+首版不承诺让 shell 进程本身跨 Gateway 重启继续存活。正常停机时停止接收新执行，给正在完成的工具短暂收尾时间，持久化可用结果；超时则回收所属进程及子进程，剩余任务交还领取权、由对账判成 `queued` 或 `waiting + intervention`。关键文件原子修改完成后再停，不在半次替换中主动取消。
 
 异常退出可能遗留子进程，不能仅凭一个 PID 判断是否为原进程；结合平台监督信息、启动身份和进程启动时间核对。无法确认旧执行已结束时，阻止该任务重复启动并显示原因。Tokio 的 Child handle 被丢弃并不默认终止进程，因此 kill_on_drop 不能取代异常退出和进程树回收方案。[Tokio process](https://docs.rs/tokio/latest/tokio/process/index.html)
 
-长脚本要拆成多个可观察的工具步骤，或由脚本把阶段进度写进文件。首版恢复到工具调用边界，不恢复 Python 内存、调用栈或某一行。脚本只有“进度标记”而没有副作用核对，仍不足以保证安全续跑。
+长脚本要拆成多个可观察的工具步骤，或由脚本把阶段进度写进文件。首版恢复到工具调用边界，不恢复脚本的内存、调用栈或某一行。脚本只有“进度标记”而没有副作用核对，仍不足以保证安全续跑。
 
 ### 8.8 恢复所需的上下文与用户体验
 
@@ -903,7 +882,7 @@ Session 不是只能追加的对象。删掉一个会话今天等于 `rm -rf ses
 1. **状态权威是 `sessions.state` 一列**（`ALTER TABLE ADD COLUMN`、`NOT NULL DEFAULT 'active'`，§8.2 只允许加列），外加一个"状态变更时刻"。JSONL 里追加 `session.closing` / `session.deleted` / `session.purged` 作为**审计副本**——走 §8.5 的反向补写：数据库先提交，事件随后补写；读事件**不产生状态**。**所属会话已经 `purged` 的 outbox 行不补写，直接标成已交付（`seq` 记 0）**：那份 JSONL 按第 3 条已经删了，审计副本没有地方落，硬写只会每拍报一次"已提交范围缺失"、永远留在 outbox 里，攒到补写器一拍取的上限（128）还会把后面所有会话的审计事件挡在外面。实测（2026-10-15）：`purge` 排完 `session.deleted` / `session.purged` 就删目录，补写器跑在删之后的那 7 个会话留下 17 行（含一个会话残留的旧 `approval.decided`），每分钟各报一次 WARN 报了三周；同一代进程里写入器还握着已删文件的句柄、补写会"成功"写进 unlink 掉的 inode，所以只在重启后的那一代卡死。
 2. **`closing → deleted` 是 reconcile 的判定，不是时钟**：只有这个 Session 再没有非终态 Run 时才推进。在那之前它一直是 `closing`，而"还有谁没跑完"正好是 §7.5 清单答得出的。操作者要立刻走完，`komo session delete --now` 把未完成的 Run 全部按 `abandon` 处置（各写一条明确的取消），再进 `deleted`。
 3. **`purged` 之前先算引用，而且状态先落、内容后删。** `memory_evidence` 指向这个 Session 事件的行、`checkpoints`、`deliveries` 里未送出的行、`cron_firings` 的 Session 引用都要先处置——停用无法再验证的记忆条目、把投递标成终止——然后：**数据库先提交 `purged` 这个墓碑，再删内容**，最后对账把"标了 `purged` 而内容还在"的会话收尾（幂等，删一半被杀也不会留下说不清的状态，因为 `purged` 已经声明了"这个目录要没了"）。**删不掉就说清楚，不假装成功**（§8.8 的原话照旧）；引用检查不过就 409 并列出要先处置什么。`purged` 之后 `jsonl_path` 这类列保留原值，但那个目录不该再被创建或读取：任何试图往 `purged` 会话写内容的路径都是 bug，不是"重新开始"。
-4. **禁止直接 `rm`。** 三层：命令层——删除只有一条路（`komo session delete` / `purge`），没有"手工删目录"这条经验路径；工具层——`write` / `edit` 拒绝写数据目录下的 `sessions/`、`state.db*`、`runtime/`、`.env`（§7.2，komo 唯一的硬限制），bash / python 拦不住（2026-10-11 之前还有一层 `command_patterns` 手滑网，随 Policy 删掉，§7.3）；reconcile 层——真正的保证在这里：目录没了而状态不是 `purged`，对账会把它**报出来**，而不是等下一轮模型对着空上下文说话。
+4. **禁止直接 `rm`。** 三层：命令层——删除只有一条路（`komo session delete` / `purge`），没有"手工删目录"这条经验路径；工具层——`write` / `edit` 拒绝写数据目录下的 `sessions/`、`state.db*`、`runtime/`、`.env`（§7.2，komo 唯一的硬限制），bash 拦不住（2026-10-11 之前还有一层 `command_patterns` 手滑网，随 Policy 删掉，§7.3）；reconcile 层——真正的保证在这里：目录没了而状态不是 `purged`，对账会把它**报出来**，而不是等下一轮模型对着空上下文说话。
 
 ## 9. Memory：自动积累、可信来源与混合检索
 
@@ -1233,7 +1212,7 @@ TELEGRAM_BOT_TOKEN=...
 
 **"在跑"用动的东西说，不用字。** 工具调用行首那一格与状态行前那一格，跑着的时候是一个转圈（八帧盲文点阵，每帧一列，换帧不会让后面的字左右跳），跑完了换成定住的符号：`✔` 完成 · `✖` 失败 · `?` 结果不明（§8.6 的 uncertain 既不是成功也不是失败，所以它不共用失败那个符号）· `·` 已计划未开跑。一块静止的"运行中"只在它变的那一刻有信息，之后就分不清是还在跑还是卡住了。**状态行同理，而且一切正常时它干脆不说话**：跑着有转圈、跑完了屏幕上就是那段回答，"空闲" / "运行中" / "已完成" 都是让人读一件他正看着的事；剩下那几个状态照旧写出来（已受理 · 排队中 · 等待中 · 已失败 · 已取消 · 已放弃），它们说的是转圈与回答都说不出的事，"等待中"后面那句"在等谁、等到什么时候"（§8.4）一并留着。
 
-**一次工具调用按工具分开画**（2026-10-14，照 pi）。头一行说这次调用动了什么，跑完了在末尾补耗时（`340ms` / `4.2s` / `2m05s`），按宽度折行、不截在一屏宽：`bash` 是 `$ 命令`，`read` 是 `路径:起-止`，`rg` 是 `模式 · 目录 · glob`，`edit` / `write` 是路径。头一行下面是它带的那段内容：多行命令与 `python` / `codemode` 脚本的续行、`write` 写进去的内容、`edit` 由 `match_text` → `replace_text` 逐行比出来的 diff（没改的长段只留挨着改动的 4 行，只改了一行里的一截就把那一截反白；客户端看不到文件，所以没有行号）。再下面以 `⎿` 起头的是结果，取 `tool.result` 的 `body.preview`（工具写给模型的那段完整正文，没有就取 `body.error`），不是顶层那份 ≤1 KiB 的预览；旧事件没有 body 才退回后者。`bash` 的结果留尾、其他留头；成功的 `read` / `edit` / `write` 不印结果——前者就是文件本身，后两者头一行已经说了——失败了照印，那是原因。折叠时每一块最多 10 行，超出的说一句还有几行、按 `Ctrl-T` 展开（照 pi 的 `… (N more lines, ctrl+o to expand)`），每行截在一屏宽；**`edit` 的 diff 不折**，改了什么就是这次调用的全部内容。`Ctrl-T` 打开就全给、长行折行，并以 `键: 值` 补上头一行与正文没用到的参数；已经印出去的调用跟着整段重画（见上）。工具输出里的颜色转义、制表符、进度条回车在进终端之前拿掉。工具调用之后的第一段正文先空一行，否则它紧贴在结果下面。codemode 的子调用（`codemode.journal`）还不画。
+**一次工具调用按工具分开画**（2026-10-14，照 pi）。头一行说这次调用动了什么，跑完了在末尾补耗时（`340ms` / `4.2s` / `2m05s`），按宽度折行、不截在一屏宽：`bash` 是 `$ 命令`，`read` 是 `路径:起-止`，`rg` 是 `模式 · 目录 · glob`，`edit` / `write` 是路径。头一行下面是它带的那段内容：多行命令与 `codemode` 脚本的续行（历史 `python` 调用同样渲染）、`write` 写进去的内容、`edit` 由 `match_text` → `replace_text` 逐行比出来的 diff（没改的长段只留挨着改动的 4 行，只改了一行里的一截就把那一截反白；客户端看不到文件，所以没有行号）。再下面以 `⎿` 起头的是结果，取 `tool.result` 的 `body.preview`（工具写给模型的那段完整正文，没有就取 `body.error`），不是顶层那份 ≤1 KiB 的预览；旧事件没有 body 才退回后者。`bash` 的结果留尾、其他留头；成功的 `read` / `edit` / `write` 不印结果——前者就是文件本身，后两者头一行已经说了——失败了照印，那是原因。折叠时每一块最多 10 行，超出的说一句还有几行、按 `Ctrl-T` 展开（照 pi 的 `… (N more lines, ctrl+o to expand)`），每行截在一屏宽；**`edit` 的 diff 不折**，改了什么就是这次调用的全部内容。`Ctrl-T` 打开就全给、长行折行，并以 `键: 值` 补上头一行与正文没用到的参数；已经印出去的调用跟着整段重画（见上）。工具输出里的颜色转义、制表符、进度条回车在进终端之前拿掉。工具调用之后的第一段正文先空一行，否则它紧贴在结果下面。codemode 的子调用（`codemode.journal`）还不画。
 
 状态行**左右两摊**：左边是"此刻在发生什么"（转圈 · 本轮耗时 · 真有事时的状态与理由 · 有人在等回答时的待处理条数），右边贴着右边沿对齐、位置不动的三格——**模型 · 连接 · 这一段对话花掉的 token**（照 pi 的页脚写成 `↑38 ↓7.6k R1.4M W108k CH99.5%`，由 `message.assistant` 每轮报的用量累加，补读历史时一并算上，所以 resume 回来看到的是整段的数。`input_tokens` 是含缓存读写的整个提示，所以 `↑` 是减掉缓存读写之后没走缓存的部分，`R` / `W` 是缓存读 / 写，四个加起来才是模型吃进去的；`CH` 是**最近一轮**的 缓存读 ÷ 整个提示——累计比例会被前面几十轮摊平，看不出刚才那一下缓存断了。`↑↓` 总在；`R` / `W` 是零就不出现，这一段对话从没报过缓存或最近一轮没报时不给 `CH`，未知不写成 0%。2026-10-14）。右边三格位置固定，眼睛不用每次重新找；窄终端上截的是左边那句话的后半段，不动右边。模型名在第一条消息之前就印得出来——网关开机时报过清单，默认是哪个它知道。帧由**时钟**算而不是帧计数器：状态机不读时钟，同一时刻画出来永远是同一帧，测试给一个固定时刻就能断言它转到哪了；交给回滚区的行不给钟，因而不会定格在某一帧随机的样子上。
 
@@ -1292,7 +1271,6 @@ TELEGRAM_BOT_TOKEN=...
 ├── runtime/             # 发现文件、锁等
 ├── skills/              # 人写的 SKILL.md（§5.6）
 ├── wechat/              # 微信登录凭证
-├── python-envs/         # 受管理的环境版本
 ├── workspaces/          # 项目副本和普通工作文件
 └── logs/                # Gateway 自身的运行日志
 ```
@@ -1370,7 +1348,6 @@ SSE 事件带 Session 内递增序号，断线后按游标补读。JSONL 事件�
 | 配置与结构化数据      | TOML、Serde；进程内唯一 `Arc<ConfigSnapshot>` 用 arc-swap 原子替换，mtime 轮询触发热重载（§3） |
 | Schema 与异步工具接口 | Schemars、async-trait                                                    |
 | 日志                  | tracing                                                                  |
-| Python                | 独立解释器进程和虚拟环境                                                 |
 | Cron                  | 支持指定五字段语义及时区的 Rust 调度库，落地时做语义验证                 |
 | TUI                   | ratatui + crossterm（不进备用屏：视口只占底下几行，正文交给终端回滚区），Markdown 用 pulldown-cmark；仅 komo-client |
 | 飞书                  | openlark，仅 `websocket` 特性；事件自己解析，回复走 reqwest（feature `feishu`）           |
@@ -1571,7 +1548,7 @@ komo-store     session_log（JSONL 写入器 / 范围读 / 尾部校验）、pay
                Turso Db + toasty 模型 + ensure_schema、repositories、Coordinator（impl Ledger）、checkpoint。
                唯一依赖 toasty/turso 的 crate。deps: kernel, toasty(turso only), turso, tokio(fs, sync), sha2
 
-komo-runtime   agent loop、executor、tools/{read,write,edit,rg,bash,python}、python_runtime、
+komo-runtime   agent loop、executor、tools/{read,write,edit,rg,bash}、
                codemode（Monty worker 与协议，`komo __codemode-worker` 的函数体也在这里）、
                memory（MemoryManager、索引、代次）、llm 与 embedding 适配器、
                scheduler、recovery、config。日常改动落在这里；它从不重新展开 toasty 宏。
@@ -1698,14 +1675,13 @@ codegen-units = 16
 | trait | 生产实现 | 测试实现 | 为什么是 trait |
 |---|---|---|---|
 | `Ledger` | `Coordinator`（store）：正文 → JSONL → 数据库 | `MemLedger` | Agent Loop 的唯一写入口；让 loop 和 executor 的测试不碰文件与 Turso |
-| `ToolOutputStore` | 文件流式写入 + 原子发布（store） | 内存 | 子进程 stdout/stderr 流式落盘，`bash` / `python` 测试需要替身 |
+| `ToolOutputStore` | 文件流式写入 + 原子发布（store） | 内存 | 子进程 stdout/stderr 流式落盘，`bash` 测试需要替身 |
 | `RunQueue` | `toasty::sql::statement` 条件更新 + 代次（store，无第二个 turso 句柄） | 内存 | 调度器、恢复扫描、Cron、手动 resume 共用的领取入口；并发领取测试 |
 | `CronRepo` | toasty（store） | 内存 | 调度器 + CLI + Gateway API |
 | `MemoryRepo` | toasty + `memory_terms`（store） | 内存 | `MemoryManager` 的全部状态读写；召回排序逻辑要在无数据库下测 |
 | `LlmClient` / `TurnDriver` | 每种协议一个适配器（runtime） | 脚本化 driver | 主模型、记忆模型是同一 trait 的两个实例；loop 测试用脚本化回合 |
 | `EmbeddingClient` | OpenAI-compatible / Ollama（runtime） | 固定向量 | 空间指纹与维度校验要在无网络下测 |
-| `PythonHost` | 子进程 + venv 版本（runtime） | 假宿主 | `python` 工具经它 |
-| `Tool` | 5 个（runtime） | — | §4 已定；executor 只认 trait |
+| `Tool` | 6 个（runtime） | — | §4 已定；executor 只认 trait |
 | `Channel` / `Inbound` / `Notifier` | 飞书、Telegram、WeChat、HTTP API、SSE（gateway） | 内存渠道 | 首版就有三个真实现；介入通知的渲染是各渠道实现的事 |
 | `Clock` | 系统时钟 | 可拨时钟 | Cron 到期、`valid_until`、重试退避全部依赖时间 |
 | `ZoneResolver` | tzdb 实现（runtime，W3 选 crate） | `ScriptedZoneResolver`（可编脚本的假时区）/ `FixedOffsetZone`（降级） | §10 的夏令时两条规则要在无 tzdb 下测；kernel 不带时区数据库 |
@@ -1778,13 +1754,6 @@ pub trait EmbeddingClient: Send + Sync {
     /// §9.5 的空间指纹；凭证不进入。
     fn space(&self) -> &EmbeddingSpace;
     async fn embed(&self, kind: InputKind, texts: &[String]) -> Result<Vec<Vector>, EmbedError>;
-}
-
-#[async_trait]
-pub trait PythonHost: Send + Sync {
-    /// 新进程执行；stdout/stderr 流入 sink；取消时终止进程组并等待回收。
-    async fn run(&self, job: PythonJob, sink: &mut dyn OutputWriter, cancel: CancelToken) -> Result<PythonResult, PyError>;
-    fn env_version(&self) -> EnvVersion;
 }
 
 #[async_trait]
@@ -1862,7 +1831,7 @@ pub trait Clock: Send + Sync {
 |---|---|---|
 | 1. 进程与会话骨架 | 六个 crate 骨架（§13.4）；komo、Gateway 自动启动、HTTP/SSE；`komo-store`：Turso 连接、`ensure_schema` + DDL 对齐测试、`with_write_retry`、统一 Session 目录与状态索引；`komo-client`：HTTP/SSE 客户端与 TUI 骨架；**编译预算首次测量** | 多个 CLI 同时启动仅产生一个实例；断线后能查看原会话；两个写入器对不同 Session 并发提交不互相阻塞，对同一行冲突时一方重试成功且只应用一次；DDL 对齐测试挂掉能定位到列；改 client 一行不重编 gateway；保存一份合法的 config.toml 后 `komo doctor` 一秒内显示新 mtime 已生效，保存一份非法的则旧配置继续生效且 home chat / 日志有具体错误 |
 | 2. AgentLoop 与执行 | 模型往返、执行计划、`prepare` → `start_call` → `execute`；`Ledger`；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测（2026-10-11 之前这一阶段还有 Policy、Allow/Ask/Deny、审批持久化与 `ApprovedPlan` 类型状态，§7） | `start_call` 返回之前没有副作用；同一轮的两条只读调用同时在飞（`read` / `rg`），写是屏障、取消要收齐已在飞的那些（§6）；**不在本次运行能力面里的工具，模型拼出名字也执行不了**，而交给模型的 schema 与执行时的表来自同一份（§4）；**`write` / `edit`（含 `then_run` 的改动那一步）写数据目录下的 `sessions/`、`state.db*`、`runtime/`、`.env` 在 `prepare` 被拒**，结果 `denied`、理由点名路径，账上有结果不悬着（§7.2） |
-| 3. 六个工具 | 文件、搜索、进程、Python 环境与输出处理；重放策略声明（`Tool::replay`，默认 unsafe，§8.6） | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 是只读计划（可并发、codemode 可调），且它不依赖机器上装没装 `rg` |
+| 3. 六个工具 | 文件、搜索、进程、codemode 与输出处理（`python` 工具与 Python 环境 2026-10-15 删除，§4）；重放策略声明（`Tool::replay`，默认 unsafe，§8.6） | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 是只读计划（可并发、codemode 可调），且它不依赖机器上装没装 `rg` |
 | 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、介入通知渲染、飞书 Run 回复卡片、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一条介入被答两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/answer` 重发只答一次；来源会话与 home chat 都收到介入通知且第二个答复得到"已决定"；`/approve`、`y` 不是命令；Gateway 重启后 pending 投递补发一次，老库里 `approval_request` / `approval_settled` 的 pending 行被跳过而不卡住补发；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的介入通知 |
 | 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，`toasty::sql`）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的介入仍能在手机上 `/answer`；**旧数据照常起来**：带 `approval.*` 事件的旧会话能加载、回放与续聊（那些事件按未知事件解码），停在 `waiting + approval` 的旧 Run 在 Gateway 启动后按"批准"续跑、那次调用只执行一次，老库里多出来的 `approval_requests` / `policy_grants` 表不妨碍启动（§7.4） |
 | 6. Skills | `SkillRegistry`、目录行门控、`read` 只读根（toolbox 已于 2026-10-15 删除，§5.3） | 新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect |
@@ -1943,7 +1912,7 @@ Memory 与模型验收覆盖：
 | 模型一轮里提了两个调用、其中一个没有结果时，会话后面的新 Run 会不会被毒住 | §8.3 回放窗口 | **已实测（2026-09-20，真实 provider）：会。** 旧二进制下模型一轮提了两个调用，一个被拒/没执行，那条 `message.assistant` 留在会话里；其后**同一会话的每一条新 Run** 首个模型请求都被 provider 400 拒（`No tool output found for tool call call_00_…`），且会连着重试。当时用"回放窗口按 Run 过滤"（`service/segment.rs` 的 `window(surface, Some(run))`）挡住了它——**那是拿对话连续性换的**（见本节末与下一行）。**已改（2026-09-21）**：窗口改回"这一段对话"，毒化由两件事挡住——① 正跑的那条 Run 之外的消息**不带协议**（历史 Run 只发布用户正文与它最后答的正文），"有调用、没结果"的半轮因此进不了新请求；② `fail_call` 与按引用恢复让每一次调用都真的有个结果（下面那句）。回归测试：`service::segment::tests::a_later_run_still_reads_what_the_earlier_one_said`（历史那轮的 `tool_calls` / `provider_blocks` 一条都不出现）、`the_running_run_keeps_its_whole_protocol`（正跑的那条一个都不能少）。**已修（2026-09-20，本机真实会话复盘）**：线上那次 400 的调用是两次 `delegate`——两个漏法都补上了。①`resumed()` 重建调用时不按引用读回外置的 `arguments` / `plan`（§8.3 原话要求"读取历史或恢复调用时按引用加载需要的内容"）：委派的任务正文 6 KB 被外置，重 `prepare` 拿到的是一份 `null` 参数，当场失败。②`execute_one` 的"未知工具 / prepare 失败 / 放行被拒 / 子代理不能再委派"四条分支把结论**只交给模型、不写账本**（`Ledger::fail_call` 就是补这一笔）：那次调用于是永远悬着，父的窗口里两个 `function_call` 一前一后，provider 报的是前面那个。回归测试：`service::segment::tests::an_externalized_argument_and_plan_come_back_by_reference`、`service::tests::a_delegated_task_over_the_inline_limit_still_settles_the_parent_call`（去掉任一处的回填就失败）、`service::tests::a_call_that_cannot_run_still_gets_a_result_in_the_ledger`（去掉 `fail_call` 就失败）。 |
 | 超限的**正文**（`run.accepted.text` / `message.assistant.text` 过 4 KiB）在回放窗口里是不是也需要按引用读回 | §8.3 的"读取历史或恢复调用时按引用加载" | **已核实（2026-09-20，真实会话）**：会外置（本次会话里两条子 Run 的 `run.accepted` 与一条 `message.assistant` 都是 `text: null` + `text_ref`），而当时全仓**没有任何一处**读 `text_ref`——`replay()` 交给模型的用户消息因此是空的（没炸只是因为子代理的任务正文同时也在它的系统提示里，正常 Run 的用户输入很少过 4 KiB）。**已做（2026-09-21）**：`replay()` 现在按引用读回正文（`segment.rs` 的 `message_text`：内联优先、`text_ref` 次之，哈希由 `PayloadStore::open` 校验，读不出来或不是 UTF-8 都算会话缺内容 → 停下来报告而不是发一条空消息）。回归测试：`service::segment::tests::an_externalized_message_comes_back_by_reference`（用户输入与模型回复两条路）、`a_payload_that_cannot_be_read_stops_the_segment`。 |
 | 内嵌 `grep` + `ignore` 之后冷编还在不在 60s 预算内 | §13.4 的编译预算 | **已实测（2026-09-21，本机 macOS M5，`cargo build --timings`、空 target 目录）：加之前 1m10s（`/tmp` 里 HEAD 的干净 worktree），加之后 1m10s——差值落在噪声里。** 新带进来的 13 个包（`globset` / `walkdir` / `termcolor` / `crossbeam-deque` / `memmap2` / `bstr` / `encoding_rs_io` 等）与 `turso_core` / `aws-lc-sys` 并行，不在关键路径上。**顺带发现：60s 这个预算当时就已经超了**（§13.4 记的 2026-09-16 是 64.2s），与这次改动无关——要么把预算调到实测值，要么回去找关键路径，待办。 |
-| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 50 KiB，2000 行上限，按 RunSnapshot 冻结）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**未核实**：50 KiB / 2000 行默认值对真实任务是否最优——要等真实会话的 recall 次数（§49 的指标）出来再调。**已补（2026-09-21）**：那四个数现在有得数了——每份观察落盘多少字节（`tool_output_bytes`）、产物多少（`artifact_bytes`）、投影给模型多少（`projected_bytes`），以及"模型回头 `read` 我们落盘的观察"的次数（`observation_recall_count`，判据是路径落在本 Session 的 `tool-output/` 或 `artifacts/` 底下）。四者都只进 trace（`komo::observation`），不进事件流（§47）；抓取与断言见 `komo-runtime/src/executor/tests.rs` 里那两条（`the_projection_reports_how_many_bytes_it_kept_and_stored`、`reading_back_an_observation_counts_as_a_recall`）。**已接（2026-09-24）**：§6 同句里的"活动执行时限"进了配置——`[execution] call_timeout_secs`（默认 1800，热生效，走 `CallEnv` / `ToolContext`）。起因是一次真实会话：模型给 `cargo test --workspace && cargo build --release` 传了 `timeout_secs: 1800`，执行器写死的 300s 先到点，shell 判成 `uncertain`，Run 停下等人核对。现在 shell 的超时取 `min(请求, 上限)`，由工具自己杀进程组报 `Timeout`；执行器的兜底计时器在上限之外多等 15s（进程组 TERM/KILL 回收各 5s），不再与工具抢同一个时刻。回归测试：`tools::shell::tests::a_requested_timeout_beyond_the_call_limit_is_clamped_to_it`、`config::tests::the_call_timeout_is_read_from_the_execution_section`。**已做（2026-10-11）**：模型发起的 `python` 不再有自己的 120s——时限就是这次调用的 `call_timeout`（`PythonHost::run_with_artifacts` 多一个 `timeout` 参数），到点由宿主终止进程组报 `Timeout`，不落到兜底成"结果不明"；`PythonEnvConfig.timeout`（120s）只剩 toolbox 启用那一路（`PythonHost::run`）在用（核对调用随核对梯子 2026-10-13 删掉）。回归测试：`tools::python::tests::a_python_call_runs_under_the_call_timeout_not_a_fixed_limit_of_its_own`、`python_runtime::tests::run_with_artifacts_stops_at_the_timeout_it_is_given`。 |
+| 工具结果的正文该给模型多少、由谁渲染 | §8.3 的投影与预算 | **已做（2026-09-21）**：`[execution] model_result_bytes`（默认 50 KiB，2000 行上限，按 RunSnapshot 冻结）+ `komo-kernel/src/projection.rs` 一处纯函数；事实只有落盘的（事件 + `output.json` 里的 `body.preview`），所以"刚跑完"与"回放"逐字节相同（`komo-gateway/tests/observation` 里有断言）。**未核实**：50 KiB / 2000 行默认值对真实任务是否最优——要等真实会话的 recall 次数（§49 的指标）出来再调。**已补（2026-09-21）**：那四个数现在有得数了——每份观察落盘多少字节（`tool_output_bytes`）、产物多少（`artifact_bytes`）、投影给模型多少（`projected_bytes`），以及"模型回头 `read` 我们落盘的观察"的次数（`observation_recall_count`，判据是路径落在本 Session 的 `tool-output/` 或 `artifacts/` 底下）。四者都只进 trace（`komo::observation`），不进事件流（§47）；抓取与断言见 `komo-runtime/src/executor/tests.rs` 里那两条（`the_projection_reports_how_many_bytes_it_kept_and_stored`、`reading_back_an_observation_counts_as_a_recall`）。**已接（2026-09-24）**：§6 同句里的"活动执行时限"进了配置——`[execution] call_timeout_secs`（默认 1800，热生效，走 `CallEnv` / `ToolContext`）。起因是一次真实会话：模型给 `cargo test --workspace && cargo build --release` 传了 `timeout_secs: 1800`，执行器写死的 300s 先到点，shell 判成 `uncertain`，Run 停下等人核对。现在 shell 的超时取 `min(请求, 上限)`，由工具自己杀进程组报 `Timeout`；执行器的兜底计时器在上限之外多等 15s（进程组 TERM/KILL 回收各 5s），不再与工具抢同一个时刻。回归测试：`tools::shell::tests::a_requested_timeout_beyond_the_call_limit_is_clamped_to_it`、`config::tests::the_call_timeout_is_read_from_the_execution_section`。2026-10-11 那条 `python` 沿用 `call_timeout` 的改动随 `python` 工具于 2026-10-15 删除，对应的两条回归测试一并删掉；`bash` 的时限仍取 `call_timeout`（上一句）。 |
 | `read` 一次读回来的正文够不够模型用 | §4 与 §8.3 | **已做（2026-09-21）**：`read` 交给模型的那一段从 400 字符改到 8 KiB（`read::PREVIEW_BYTES`），投影再按预算收。**未核实**：真实仓库里"读一个文件要几次 `read`"——如果还是很多次，说明该按结构切（一次给整段函数）而不是按字节。 |
 | 记忆召回的重排值不值（一次判断请求换来的排序） | §9.4 的可选重排 | **已做（2026-09-21）**：`[typesafe]` + `memory.retrieval.rerank` / `rerank_shortlist`——短名单（比 `top_k` 宽，校验拦「一样宽」的组合）交给一条 `Choice`，按回来的概率表排序，再照旧按 `top_k` 截；**只重排不增删**，挑中 `none` 或后端不可用都保持融合顺序。**已实测（2026-09-21，本机真机，4 条候选 / 中文输入）**：`jev-1.13.0` 一次 0.6s、约 650 输入 token，顺序 `[m-4, m-1, m-2, m-3]`——热水器与空调那两条排到了前面。离线验收在 `komo-runtime/src/memory/tests.rs`（抬高本来排不进的条目、`none` 不采纳、后端坏了照常召回、开关关着不发请求），真机那条是 `memory/rerank.rs` 里的 `mod live`（`--ignored`，要 `TYPESAFE_API_KEY`）。**未核实**：真实规模（成百上千条）下短名单取多宽、这一次请求值不值——按真实会话的命中率调，别凭感觉改 |
 | 系统提示里的 skill 目录行够不够用（166 个 skill 的机器） | §5.6 的目录行 | **已实测（2026-09-21，本机真实语料 + `komo skills list`）：不够，而且坏在两处。** ① `description: >` / `|` 这些 YAML 块标量没有解析——取值是字面量 `>`，325 份 `SKILL.md` 里 111 份的描述是这么写的，目录行长成 `- log-diagnosis：>`；② 2000 字符的预算按目录序 `continue` 丢弃，166 个不同名字里只剩 16 条进提示。真实会话里模型的第一批调用是读 `cart-loong-diff` / `ask-user`（正是那 16 条里的两条），找 `log-diagnosis` 靠的是 `ls` 整个目录，多花了好几轮。**已做（2026-09-21）**：frontmatter 支持块标量（`>` 折行 / `|` 字面，含 chomping，描述里的冒号不再被当成键）；目录改成**整批**定形状——描述装得下就是"名字 + 一句描述"，装不下就只留名字（166 条名字 2752 字符），名字都装不下时末尾写"另有 N 条没列出来"；默认上限 2000 → 4000。回归测试：`frontmatter::tests::a_folded_description_is_joined_into_one_sentence`、`skills::tests::every_skill_keeps_its_name_when_the_descriptions_do_not_fit`、`a_folded_description_becomes_one_catalog_line`。**未做**：按当前输入排序的 top-K——排序块不能进 system 前缀（§9.4 的前缀缓存），先看补全之后还错不错。 |

@@ -14,7 +14,7 @@
 //! artifact://<run>/<call>/<attempt>/<file>   → <会话>/tool-output/…         （只读）
 //! ```
 //!
-//! **首阶段不做**（§六）：memory / session 的任意写入、shell / Python 里的 URI 展开、
+//! **首阶段不做**（§六）：memory / session 的任意写入、shell 里的 URI 展开、
 //! 通用 VFS。本地路径的用法一个字都不变。
 //!
 //! 解析（把 URI 变成真实目标、`tool://` 现算内容）需要 I/O，落在运行时
@@ -488,9 +488,9 @@ mod tests {
         );
         assert_eq!(round_trip("skill://"), ResourceUri::SkillRoot);
         assert_eq!(
-            round_trip("tool://python/schema"),
+            round_trip("tool://bash/schema"),
             ResourceUri::Tool {
-                name: "python".into(),
+                name: "bash".into(),
                 part: ToolPart::Schema
             }
         );
@@ -549,12 +549,12 @@ mod tests {
         }
         // 段数不对 / 不认识的段。
         assert!(matches!(
-            ResourceUri::parse("tool://python/whatever"),
+            ResourceUri::parse("tool://bash/whatever"),
             Err(UriError::UnknownPart(_))
         ));
         assert!(
             matches!(
-                ResourceUri::parse("tool://python/a/b"),
+                ResourceUri::parse("tool://bash/a/b"),
                 Err(UriError::UnknownPart(_))
             ),
             "`tool://` 只认 schema 与 doc"

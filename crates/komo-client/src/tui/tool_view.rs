@@ -171,6 +171,7 @@ impl View {
                 used: vec!["path", "content"],
                 result: Keep::Hidden,
             },
+            // 历史记录里的 python 调用（2026-10-15 工具删除）照旧渲染。
             "python" if text("code").is_some() => View {
                 head: String::new(),
                 body: text_body(text("code").unwrap_or_default()),

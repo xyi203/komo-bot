@@ -57,7 +57,7 @@ use komo_kernel::types::delegate::{
 use komo_kernel::types::ids::{AttemptId, RequestKey, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::monitor::{MonitorHandle, MonitorSpec, MonitorStopped};
-use komo_kernel::types::plan::{EnvVersion, ExecutionPlan, Operation, PlanSource, Replay};
+use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanSource, Replay};
 use komo_kernel::types::refs::{
     AttemptRef, ContentRef, InterruptedOutput, PublishedOutput, ToolResultBody, ToolResultStatus,
 };
@@ -152,7 +152,6 @@ pub struct CallEnv {
     pub projection: ProjectionContext,
     /// 单次调用的活动执行时限（§6，`[execution] call_timeout_secs`）。同上，按快照热生效。
     pub call_timeout: Duration,
-    pub env_version: Option<EnvVersion>,
     pub principal: Option<Principal>,
     pub cancel: CancelToken,
     /// 本次 Run 固定的模型快照。委派受理子 Run 时要它：子代理不是另一个模型角色，
@@ -448,7 +447,7 @@ impl ToolExecutor {
     /// **只读的调用可以和同一轮里后面的调用同时在飞**：够格的是 `Operation::ReadFile`
     /// 这一类计划（`read` / `rg`）里没有"上一世"要接的那条（详见
     /// [`ReadyCall::parallel_with_siblings`]）。其余一切（`write` / `edit` / `bash` /
-    /// `python`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何
+    /// `codemode`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何
     /// 要停下来的判定）都是**屏障**：屏障之前已经在飞的先收尾，再按调用顺序做它。
     ///
     /// "做它"指的是 `start_call` 及之后的一切：`begin` 只放行（可能落 `tool.planned`），
@@ -548,8 +547,15 @@ impl ToolExecutor {
         // 能力边界**先于**"有没有这个工具"（§4 末）：不在这次运行的能力面里，就等于不认识
         // 这个名字——执行器不回退到全局工具目录，所以模型自己拼出一个没露过面的名字，
         // 拿到的也只是"这次运行的工具集里没有它"。
-        let name = resolved_tool_name(request);
-        if !env.surface.allows(name) {
+        //
+        // 在途调用例外：已经有落账计划、上一世接着往下做的调用，工具名可能是后来才没有的
+        // （改名、删除）。它也许已经动过手，不能判成"没开始"、更不能停下 Run：与别的 unsafe
+        // 中断一样记 uncertain 交给模型。模型这一轮新发的调用没有落账计划，照旧被拒。
+        let known = env.surface.allows(&request.tool) && self.tools.contains_key(&request.tool);
+        if !known && let (Some(plan), Some(state)) = (&request.plan, &request.resumed) {
+            return self.settle_interrupted(request, env, plan, state).await;
+        }
+        if !env.surface.allows(&request.tool) {
             let names = env.surface.names();
             let message = if names.is_empty() {
                 format!("这次运行没有可用的工具，{} 调不了", request.tool)
@@ -566,7 +572,7 @@ impl ToolExecutor {
         }
 
         // 未知工具名：作为错误内容交回模型，**不派发任何东西**（§14 阶段 3）。
-        let Some(tool) = self.tools.get(name).cloned() else {
+        let Some(tool) = self.tools.get(&request.tool).cloned() else {
             let known: Vec<&str> = self.tools.keys().map(String::as_str).collect();
             let message = format!(
                 "没有名为 {} 的工具；可用的是：{}",
@@ -1607,7 +1613,6 @@ impl ToolExecutor {
             cwd: env.cwd.clone(),
             roots: env.roots.clone(),
             mounts: env.mounts.clone(),
-            env_version: env.env_version.clone(),
             resumed: request.resumed.clone(),
             cancel: env.cancel.clone(),
             call_timeout: env.call_timeout,
@@ -1617,16 +1622,6 @@ impl ToolExecutor {
 
 /// `prepare` / `verify` 时还没有尝试——`start_call` 才发号。用一个认得出来的哨兵，
 /// 这样账本里的 attempt ID 与它不会混。
-/// 找工具、核对能力面用的名字。`shell` 在 2026-10-15 改名 `bash`：改名前落账的计划还叫
-/// `shell`，恢复时照旧认它（按 `bash` 的 `replay` 走，即 `Unsafe`，记 uncertain 交给模型）。
-/// 只对带着落账计划的调用生效——模型新发的 `shell` 仍是"没有这个工具"。
-fn resolved_tool_name(request: &CallRequest) -> &str {
-    match (request.tool.as_str(), request.plan.is_some()) {
-        ("shell", true) => "bash",
-        (name, _) => name,
-    }
-}
-
 const PENDING_ATTEMPT: &str = "attempt-not-started";
 
 /// 一个调用在**执行之前**的几种去向（[`ToolExecutor::begin`]）。

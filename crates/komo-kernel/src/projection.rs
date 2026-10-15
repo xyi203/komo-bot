@@ -654,6 +654,39 @@ mod tests {
         }
     }
 
+    /// python 工具（2026-10-15 删除）留下的结果：投影只认落盘的事实，不认工具名，所以回放与
+    /// 当年逐字节一致——抬头带 stdout 大小，长正文留头（不是 bash 那样留尾），截断时给完整引用。
+    #[test]
+    fn a_historical_python_result_replays_byte_for_byte() {
+        let stdout = STDOUT.clone();
+        let short = ToolResultFacts {
+            tool: "python",
+            ..facts(Some("{\"count\": 3}\n"), Some(&stdout))
+        };
+        assert_eq!(
+            project(&short, &budget(1024)),
+            "[python · 完成 · 1.2s · stdout 400 B]\n{\"count\": 3}\n完整输出：artifact://run-1/call-7/attempt-1/result（流：artifact://run-1/call-7/attempt-1/stdout）\n"
+        );
+
+        let text = format!("HEAD\n{}TAIL\n", "middle\n".repeat(200));
+        let long = ToolResultFacts {
+            tool: "python",
+            ..facts(Some(&text), Some(&stdout))
+        };
+        let printed = project(&long, &budget(400));
+        assert!(
+            printed.starts_with("[python · 完成 · 1.2s · stdout 400 B]\nHEAD\n"),
+            "{printed}"
+        );
+        assert!(!printed.contains("TAIL"), "{printed}");
+        assert!(
+            printed.ends_with(
+                "完整输出：artifact://run-1/call-7/attempt-1/result（流：artifact://run-1/call-7/attempt-1/stdout）\n"
+            ),
+            "{printed}"
+        );
+    }
+
     #[test]
     fn default_model_limits_match_pi() {
         assert_eq!(DEFAULT_MODEL_RESULT_BYTES, 50 * 1024);

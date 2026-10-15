@@ -205,7 +205,6 @@ impl Harness {
             cwd: env.cwd,
             roots: env.roots,
             mounts: env.mounts,
-            env_version: None,
             resumed: None,
             cancel: CancelToken::new(),
             call_timeout: env.call_timeout,
@@ -241,7 +240,6 @@ impl Harness {
             call_timeout: std::time::Duration::from_secs(
                 komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS,
             ),
-            env_version: None,
             principal: None,
             cancel,
             model: sample_model(),

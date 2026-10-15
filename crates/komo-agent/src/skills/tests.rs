@@ -11,7 +11,7 @@ fn write_skill(dir: &Path, name: &str, front: &str, body: &str) -> PathBuf {
 }
 
 fn context() -> OfferContext {
-    OfferContext::here(["read", "write", "edit", "bash", "python"]).on("linux")
+    OfferContext::here(["read", "write", "edit", "bash", "codemode"]).on("linux")
 }
 
 #[test]
@@ -377,7 +377,7 @@ fn the_prompt_block_names_only_a_tool_that_is_mounted() {
     );
 
     assert_eq!(
-        registry.prompt_block(&OfferContext::here(["write", "python"]).on("linux")),
+        registry.prompt_block(&OfferContext::here(["write", "edit"]).on("linux")),
         None,
         "没有能读文件的工具，目录就不该露面"
     );

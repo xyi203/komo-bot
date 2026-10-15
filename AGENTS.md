@@ -43,8 +43,8 @@ komo-kernel    value types, state machines, events + fold, cron math,
 komo-store     session_log (JSONL) · payloads · tool_output · Turso Db + toasty
                models + *_TABLE_DDL · repositories · Coordinator (impl Ledger).
                The only crate that sees toasty/turso.
-komo-runtime   agent loop · executor · tools/{read,write,edit,rg,bash,python} ·
-               python_runtime · codemode (Monty worker) · memory · llm · embedding ·
+komo-runtime   agent loop · executor · tools/{read,write,edit,rg,bash} ·
+               codemode (Monty worker) · memory · llm · embedding ·
                scheduler · recovery · config.
 komo-agent     AgentProfile → 能力面选择 · skills 发现与目录 · 编排操作名 ·
                上下文装配（context：ContextInput → AgentContext，系统提示、回放、记忆段）。
@@ -82,7 +82,7 @@ depends on `agent`; `client` knows only protocol types.
   skipped and never block a flush.
 - **The only hard limit lives in the tools:** `write`/`edit` refuse komo's own
   state (`sessions/`, `state.db*`, `runtime/`, `.env` under the data dir).
-  bash/python cannot be stopped; real boundaries come only from an execution
+  bash cannot be stopped; real boundaries come only from an execution
   environment (codemode's Monty engine: no network or subprocesses, files
   read-only with the same protected list denied even for reads; it runs in a
   `komo __codemode-worker` child the host can kill).

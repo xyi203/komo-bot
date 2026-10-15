@@ -140,8 +140,8 @@ pub fn write_home(home: &Path, config: &str, env: &str) {
     std::fs::write(home.join("config.toml"), config).expect("写 config.toml");
     std::fs::write(home.join(".env"), env).expect("写 .env");
     // **故意不建 `workspaces/`**：它是数据目录骨架的一部分，该由 Gateway 自己在启动时
-    // 建（§12）。这里替它建过，于是生产路径上少了那一步也一直看不出来——每一个 shell /
-    // python 调用都在报"程序起不来"，而真正不在的是会话 cwd。
+    // 建（§12）。这里替它建过，于是生产路径上少了那一步也一直看不出来——每一个 bash
+    // 调用都在报"程序起不来"，而真正不在的是会话 cwd。
 }
 
 // ---------------------------------------------------------------- 渠道替身

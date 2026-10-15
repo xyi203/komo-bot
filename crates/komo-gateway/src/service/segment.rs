@@ -684,7 +684,6 @@ impl SegmentSource for GatewaySegments {
             mounts,
             projection,
             call_timeout: self.call_timeout(),
-            env_version: None,
             principal: None,
             // 本 Run 是被谁派的（普通 Run 是 None）。runtime 用它硬拦"子代理再委派"。
             delegated: delegate.clone(),

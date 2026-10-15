@@ -22,7 +22,6 @@ pub const CODEMODE_TOOL: &str = "codemode";
 /// 才被拒，整段脚本作废，前面的 MCP 写也可能已经做了。
 pub const NOT_IN_SCRIPTS: &[&str] = &[
     "bash",
-    "python",
     "edit",
     "write",
     "codemode",
@@ -70,7 +69,7 @@ impl Tool for CodemodeTool {
                           text 是工具的正文输出（read 是文件内容，rg 是匹配行），result 是结构化\
                           结果。工具名里的 - 写成 _，写错名字得到 AttributeError，能调的名字见 TOOLS。\
                           能调 read、rg 与 MCP 工具（MCP 含写操作）；\
-                          bash、python、edit、write 与编排工具（delegate、dispatch、monitor 等）\
+                          bash、edit、write 与编排工具（delegate、dispatch、monitor 等）\
                           只能在脚本外直接调，脚本里写了 tools.bash(...) 会在运行前被拒。\
                           子调用逐次持久化，unsafe 中断不重跑；中断后重跑脚本，已记录的调用原样\
                           回放，之后的调用照常执行，分歧或结果不明会终止整段脚本。\n\

@@ -80,7 +80,6 @@ pub(super) struct GatewaySection {
 pub(super) struct PathsSection {
     pub data_dir: Option<PathBuf>,
     pub db_path: Option<PathBuf>,
-    pub python_env_root: Option<PathBuf>,
     pub sessions_dir: Option<PathBuf>,
     pub runtime_dir: Option<PathBuf>,
     pub logs_dir: Option<PathBuf>,
@@ -513,13 +512,6 @@ pub(super) fn assemble(
                 .db_path
                 .clone()
                 .unwrap_or_else(|| data_dir.join("state.db")),
-        ),
-        python_env_root: resolve(
-            &base,
-            file.paths
-                .python_env_root
-                .clone()
-                .unwrap_or_else(|| data_dir.join("python-envs")),
         ),
         data_dir: data_dir.clone(),
         listen,

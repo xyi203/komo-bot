@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 
 use super::ids::{AttemptId, RunId, SessionId, ToolCallId};
-use super::plan::{EnvVersion, PlanSource};
+use super::plan::PlanSource;
 use super::refs::{ContentRef, ToolResultStatus};
 use super::resource::ResourceMounts;
 use super::status::ToolCallState;
@@ -151,8 +151,6 @@ pub struct ToolContext {
     ///
     /// 它是**纯数据**，解析（含 I/O）在运行时；工具拿它决定一个资源 URI 指向哪里。
     pub mounts: ResourceMounts,
-    /// 当前 Python 环境版本。
-    pub env_version: Option<EnvVersion>,
     /// 这次 `execute` 是不是一次**恢复执行**（§8.4 第 6 / 7 行）。`None` = 首次。
     pub resumed: Option<ResumedCall>,
     pub cancel: CancelToken,
@@ -210,48 +208,6 @@ pub struct WorkspaceRoot {
     pub label: String,
 }
 
-/// 一次 Python 作业（§5.2）：任意代码。`mode` 判别字段留在线格式上。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum PythonJob {
-    Code { code: String },
-}
-
-/// 一次 Python 执行的结构化返回（§5.1）。脚本的普通 print 单独收集，不混进控制协议。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PythonResult {
-    pub status: ToolResultStatus,
-    #[serde(default)]
-    pub result: serde_json::Value,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub artifacts: Vec<ContentRef>,
-    /// stdout 的**首尾摘录**（最多几 KiB），只给模型看的那份预览用。
-    ///
-    /// 脚本只 `print` 不返回结构化结果时，预览不能是字面量 `null`——模型看到它会以为工具
-    /// 坏了，转头去 `bash` + `python3` 重跑一遍。完整 stdout 照旧在 `stdout.txt` 里。
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub stdout_excerpt: String,
-    pub env_version: EnvVersion,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PyError {
-    #[error("解释器启动失败：{0}")]
-    Spawn(String),
-    #[error("协议错误：{0}")]
-    Protocol(String),
-    #[error("环境版本不匹配：计划 {planned}，当前 {current}")]
-    EnvVersionMismatch { planned: String, current: String },
-    #[error("已取消")]
-    Cancelled,
-    #[error("超时：{after_secs}s")]
-    Timeout { after_secs: u64 },
-    #[error("{0}")]
-    Failed(String),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,7 +246,6 @@ mod tests {
                     label: "workspace".into(),
                 },
             ],
-            env_version: None,
             resumed: None,
             cancel: CancelToken::new(),
         };

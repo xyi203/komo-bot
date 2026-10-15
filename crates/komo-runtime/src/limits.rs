@@ -1,7 +1,7 @@
 //! 进程资源：Gateway 起来时把"能开几个文件"的软上限抬到够用；codemode worker 的常驻内存读数。
 //!
 //! launchd 给后台服务的默认软上限是 256（`launchctl limit maxfiles`），systemd 是 1024。
-//! shell / python 的子进程继承 Gateway 的上限，于是 `cargo test --workspace` 这类一次
+//! shell 的子进程继承 Gateway 的上限，于是 `cargo test --workspace` 这类一次
 //! 开几百个文件的命令在 komo 里跑就失败，在终端里跑却好好的——实测会话里模型得自己
 //! 摸索出 `ulimit -n 65536` 才跑得下去，白耗几轮。
 //!

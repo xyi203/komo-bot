@@ -17,6 +17,9 @@ use super::{
 
 /// 探测上限：这是一次元数据调用，不该占住启动或热重载。
 const PROBE_TIMEOUT_CAP_SECS: u64 = 10;
+/// Codex 后端按 `minimal_client_version` 过滤：报 komo 自己的版本号（0.8.x）只回空列表
+/// （2026-10-15 实测，gpt-6-sol 要 0.155.0），所以报一个足够大的 Codex 版本号。
+const CODEX_CLIENT_VERSION: &str = "99.0.0";
 const BODY_EXCERPT_CHARS: usize = 200;
 
 /// 探测失败。文案只含状态码、正文摘要与配置名，不含凭证。
@@ -64,7 +67,7 @@ async fn build_request(
                 .map_err(|e| ProbeError(e.to_string()))?;
             let chatgpt = matches!(credential, Credential::ChatGpt(_));
             let url = if chatgpt {
-                format!("{base}/models?client_version={}", env!("CARGO_PKG_VERSION"))
+                format!("{base}/models?client_version={CODEX_CLIENT_VERSION}")
             } else {
                 format!("{base}/models")
             };
@@ -259,7 +262,7 @@ mod tests {
             request.url,
             format!(
                 "https://chatgpt.com/backend-api/codex/models?client_version={}",
-                env!("CARGO_PKG_VERSION")
+                CODEX_CLIENT_VERSION
             )
         );
         assert_eq!(request.api_key.as_deref(), Some("tok-chatgpt"));

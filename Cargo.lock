@@ -2679,7 +2679,6 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
- "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.21",
  "time",

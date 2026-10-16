@@ -628,3 +628,56 @@ impl komo_kernel::traits::Tool for UnsureTool {
         })
     }
 }
+
+/// 2026-10-16 删掉之前的 `delegate`：计划照当时的 `DelegateTool::prepare` 写（`task` /
+/// `output_schema` / `schema_mode` → `Operation::Delegate`）。生产目录里已经没有它，测试装上
+/// 它在真实 Gateway 上重走旧委派调用的收尾路径（子 Run、领取豁免、父按 `run_end` 收尾，§4）。
+pub fn legacy_delegate() -> std::sync::Arc<dyn komo_kernel::traits::Tool> {
+    std::sync::Arc::new(LegacyDelegateTool)
+}
+
+struct LegacyDelegateTool;
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::Tool for LegacyDelegateTool {
+    fn definition(&self) -> komo_kernel::types::tool::ToolDefinition {
+        test_definition(komo_agent::DELEGATE_TOOL, "测试用：升级前的同步委派")
+    }
+
+    async fn prepare(
+        &self,
+        args: serde_json::Value,
+        ctx: &komo_kernel::types::tool::ToolContext,
+    ) -> Result<komo_kernel::types::plan::ExecutionPlan, komo_kernel::types::tool::ToolError> {
+        use komo_kernel::types::delegate::DelegateSpec;
+        use komo_kernel::types::plan::{Operation, RecoveryMode};
+        let mut spec = DelegateSpec::new(
+            ctx.run.clone(),
+            ctx.call.clone(),
+            args["task"].as_str().unwrap_or_default(),
+        );
+        if let Some(schema) = args.get("output_schema") {
+            let mode = args
+                .get("schema_mode")
+                .and_then(|mode| serde_json::from_value(mode.clone()).ok())
+                .unwrap_or_default();
+            spec = spec.with_contract(schema.clone(), mode);
+        }
+        Ok(komo_kernel::types::plan::ExecutionPlan {
+            operation: Operation::Delegate { spec },
+            recovery: RecoveryMode::VerifyTarget,
+            ..test_plan(komo_agent::DELEGATE_TOOL, args, ctx)
+        })
+    }
+
+    async fn execute(
+        &self,
+        _plan: komo_kernel::types::plan::ExecutionPlan,
+        _ctx: &komo_kernel::types::tool::ToolContext,
+        _sink: &mut dyn komo_kernel::traits::OutputWriter,
+    ) -> Result<komo_kernel::types::tool::ToolOutput, komo_kernel::types::tool::ToolError> {
+        Err(komo_kernel::types::tool::ToolError::Failed {
+            message: "delegate 不由工具执行".into(),
+        })
+    }
+}

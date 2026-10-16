@@ -69,25 +69,47 @@ pub enum Operation {
     PythonCode,
     /// 自动记忆的内部变更与索引生成。
     MemoryChange,
-    /// 把一个自包含子任务交给一条子 Run（§4）。
+    /// 把一个自包含子任务交给一条子 Run（§4）。2026-10-16 同步委派删掉之后不再产生，只为
+    /// 升级时还没收尾的旧调用解码、收尾。
     ///
     /// **它不是第七个基础工具**：模型看不见任何新能力，子代理用的是同一套六个工具，而它
     /// 自己的每一次调用照常走 executor。
     ///
     /// **整份 [`DelegateSpec`] 都在计划里**（含任务正文与结果契约）：计划是父 Run 续跑时手里唯一那份东西——它要拿同一份契约去复验子代理的结果（§8.6）。
     Delegate { spec: DelegateSpec },
-    /// 建一个**独立的任务会话**并提交第一条输入（`docs/background-tasks.md`）。
+    /// 建一个**独立的任务会话**并提交第一条输入（`docs/background-tasks.md`）。2026-10-16
+    /// 起由 [`Operation::Task`] 产生，这一支只为旧计划解码与幂等重放保留。
     ///
     /// 与 `Delegate` 同一类操作——不是第七个基础工具，模型看不见任何新能力，任务会话
     /// 里的每一次调用照常走 executor——但**不等它跑完**：executor 放行之后立刻收尾（不
     /// 返回 `RoundStop::Dependency`），home 不会被一个慢任务堵住。`task` / `title` 都
     /// 进计划：计划是幂等重放时唯一能对上的那份东西。
     Dispatch { task: String, title: String },
-    /// 把一句话提交进一个**已有的**任务会话（`docs/background-tasks.md`）。
+    /// 把一句话提交进一个**已有的**任务会话（`docs/background-tasks.md`）。与 `Dispatch`
+    /// 同理只为旧计划保留。
     ///
     /// `task_id` 是模型给的任务短号原文，解析成具体会话在执行侧做（只有 Gateway 查得到
     /// "这个会话派出去过哪些任务"）。
     Follow { task_id: String, text: String },
+    /// 后台任务（`task`，`docs/background-tasks.md`；2026-10-16 起取代 `Delegate` /
+    /// `Dispatch` / `Follow`，那三个只为旧计划解码与收尾保留）。
+    ///
+    /// 没有 `task_id` 是新派：建任务会话、提交第一条输入；有 `task_id` 是接着做：提交进那个
+    /// 已有的任务会话。两种都**不等**任务跑完。`model` 是 alias 原文，执行侧按当时的配置
+    /// 解析；整份参数都进计划，幂等重放时唯一能对上的就是它。
+    Task {
+        prompt: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        effort: Option<super::model::Effort>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        contract: Option<super::delegate::DelegateContract>,
+    },
     /// 挂一个长时间跑的监听脚本，stdout 的行交回这个会话（`docs/monitor.md`）。
     ///
     /// 与 `Dispatch` 同一类编排操作：执行器放行之后交给 Gateway 起进程、立刻收尾，不等

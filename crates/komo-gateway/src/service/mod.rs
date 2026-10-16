@@ -204,7 +204,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     let _ = state
         .inbound
         .set(Arc::clone(&dispatcher) as Arc<dyn Inbound>);
-    // `dispatch` / `follow` 的接缝：`GatewayTaskSpawner` 自己要一份 `Arc<GatewayState>`
+    // `task` 的接缝：`GatewayTaskSpawner` 自己要一份 `Arc<GatewayState>`
     // （建会话、`submit`），与上面这行同一个"先有整份状态才能自己引用自己"的理由
     // （`docs/background-tasks.md`）。
     state.wire_task_spawner();
@@ -548,8 +548,7 @@ async fn build_tools(
     Arc<komo_runtime::mcp::McpHub>,
 ) {
     use komo_runtime::tools::{
-        BashTool, DelegateTool, DispatchTool, EditTool, FollowTool, MonitorStopTool, MonitorTool,
-        ReadTool, RgTool, WriteTool,
+        BashTool, EditTool, MonitorStopTool, MonitorTool, ReadTool, RgTool, TaskTool, WriteTool,
     };
 
     let snapshot = config.current();
@@ -577,16 +576,11 @@ async fn build_tools(
         // 上没装"这一种情况，不需要探测。
         Arc::new(RgTool::new()),
     ];
-    // 委派是**编排**，不是第七个基础能力（§4）：子代理用的是同一套六个工具，它自己的
-    // 每一次调用照常落账。运行到它的那一步由 executor 接手（建子 Run、
-    // 让本 Run 等它），工具本身没有 execute。
-    tools.push(Arc::new(DelegateTool::new()));
-    // dispatch / follow：同一类编排操作，把需要工具的部分派给独立的任务会话
-    // （`docs/background-tasks.md`）。放行之后由 executor 调 `TaskSpawner`——没有
-    // 装配它时（`ToolExecutor::set_spawner` 没被叫过）两个操作按"这台 Gateway 没有接
-    // 任务分发"干净失败。
-    tools.push(Arc::new(DispatchTool::new()));
-    tools.push(Arc::new(FollowTool::new()));
+    // task：**编排**，不是第七个基础能力（§4），把耗时的事派给独立的任务会话
+    // （`docs/background-tasks.md`）。放行之后由 executor 调 `TaskSpawner`——没有装配它时
+    // （`ToolExecutor::set_spawner` 没被叫过）按"这台 Gateway 没有接任务分发"干净失败。
+    // model / effort 在 `prepare` 里按当前配置快照校验，所以它拿着配置。
+    tools.push(Arc::new(TaskTool::new(Arc::clone(config))));
     // monitor / monitor_stop：同一类编排操作，脚本的进程归 Gateway 的 `GatewayMonitors`
     // （`docs/monitor.md`）。
     tools.push(Arc::new(MonitorTool::new()));

@@ -1,6 +1,6 @@
 //! `codemode`：一段在 Monty 里跑的 Python 脚本（`docs/codemode.md`）。
 //!
-//! 与 [`super::dispatch`] 同一个模式：这里只有定义与 `prepare`，执行在 executor
+//! 与 [`super::task`] 同一个模式：这里只有定义与 `prepare`，执行在 executor
 //! （`Operation::Codemode` 分流到 `run_codemode`）——脚本里的工具调用要回到执行器
 //! 判定，工具自己够不到它。
 
@@ -25,9 +25,7 @@ pub const NOT_IN_SCRIPTS: &[&str] = &[
     "edit",
     "write",
     "codemode",
-    "delegate",
-    "dispatch",
-    "follow",
+    "task",
     "monitor",
     "monitor_stop",
 ];
@@ -68,7 +66,7 @@ impl Tool for CodemodeTool {
                           text 是工具的正文输出（read 是文件内容，rg 是匹配行），result 是结构化\
                           结果。工具名里的 - 写成 _，写错名字得到 AttributeError，能调的名字见 TOOLS。\
                           能调 read、rg 与 MCP 工具（MCP 含写操作）；\
-                          bash、edit、write 与编排工具（delegate、dispatch、monitor 等）\
+                          bash、edit、write 与编排工具（task、monitor 等）\
                           只能在脚本外直接调，脚本里写了 tools.bash(...) 会在运行前被拒。\
                           子调用逐次持久化，unsafe 中断不重跑；中断后重跑脚本，已记录的调用原样\
                           回放，之后的调用照常执行，分歧或结果不明会终止整段脚本。\n\

@@ -121,16 +121,16 @@ async fn a_background_task_in_flight_across_a_restart_still_reports_back() {
     let home = Home::new();
     let sender = MemSender::new(ChannelPlatform::Telegram);
 
-    // home 那一段调 `dispatch` 后收尾；任务那一段调 `unsure`，停在一条 `verify` 上。
+    // home 那一段调 `task` 后收尾；任务那一段调 `unsure`，停在一条 `verify` 上。
     let unsure = Unsure::new();
     home.install_tools(vec![unsure.tool()]);
     let llm = FakeLlm::new(vec![
         vec![
             call_round(
                 1,
-                "pc-dispatch",
-                "dispatch",
-                serde_json::json!({"task": "跑一下 echo", "title": "echo"}),
+                "pc-task",
+                "task",
+                serde_json::json!({"prompt": "跑一下 echo", "title": "echo"}),
             ),
             text_round(2, "已派出。"),
         ],

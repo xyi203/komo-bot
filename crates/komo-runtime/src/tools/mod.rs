@@ -3,16 +3,13 @@
 //! 搜索走 `rg`，HTTP 走命令；Git、构建、测试、HA 和记录查询都是这六个的
 //! 组合，**不新增第七个**。
 //!
-//! `delegate` 是这条规则的一个例外，而且它**不是第七个基础工具**：模型看不见任何新能力
-//! ——子代理用的还是这六个工具。委派只是"把一件事交给
-//! 另一条 Run"的入口，而且不由工具执行（见 [`delegate`]）。
+//! `task` / `monitor` 是这条规则的例外，而且它们**不是第七个基础工具**：
+//! 模型看不见任何新能力——任务会话用的还是这几个工具。它们是编排操作，不由工具执行
+//! （见 [`task`]）。
 
 pub mod bash;
 pub mod codemode;
-pub mod delegate;
-pub mod dispatch;
 pub mod edit;
-pub mod follow;
 pub mod fusion;
 pub mod mcp;
 pub mod monitor;
@@ -22,6 +19,7 @@ pub mod protect;
 pub mod read;
 pub mod resources;
 pub mod rg;
+pub mod task;
 pub mod write;
 
 use std::path::Path;
@@ -33,14 +31,12 @@ use serde::{Deserialize, Serialize};
 
 pub use bash::BashTool;
 pub use codemode::CodemodeTool;
-pub use delegate::DelegateTool;
-pub use dispatch::DispatchTool;
 pub use edit::EditTool;
-pub use follow::FollowTool;
 pub use mcp::McpTool;
 pub use monitor::{MonitorStopTool, MonitorTool};
 pub use read::ReadTool;
 pub use rg::RgTool;
+pub use task::TaskTool;
 pub use write::WriteTool;
 
 /// 一个文件的版本（§4：`read` 返回它，`write` / `edit` 覆盖时核对它）。

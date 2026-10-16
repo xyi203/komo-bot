@@ -118,6 +118,11 @@ impl ConfigHolder {
         }
     }
 
+    /// 校验 effort 用的那张声明表：加载与重载校验用的是它，`task` 的 `prepare` 也用它。
+    pub fn caps(&self) -> &EffortCapabilities {
+        &self.caps
+    }
+
     /// 当前快照。**按用途读当前快照、不缓存**（§3 第 2 步）。
     pub fn current(&self) -> Arc<ConfigSnapshot> {
         Arc::clone(&self.current.load().snapshot)

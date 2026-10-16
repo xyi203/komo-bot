@@ -139,6 +139,11 @@ pub struct RunSnapshot {
     /// Run 也认得出自己是命令直跑。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direct_command: Option<String>,
+    /// `task` 派给这条 Run 的结果契约（`docs/komo_bot.md` §4）。与 `direct_command` 一样不是
+    /// 身份，冻结在这里是因为两头都要在重启之后读到它：装配时补在任务后面，交回派它的
+    /// 会话之前按它复验最后回复。`None` = 没有契约，或者这一格出现之前受理的 Run。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<crate::types::delegate::DelegateContract>,
 }
 
 /// 一份项目规范文件（`AGENTS.md` / `CLAUDE.md`）：受理时从工作目录往上找到的，正文原样。
@@ -246,7 +251,7 @@ mod tests {
         assert_ne!(profile.revision(), before, "改了指令就是另一版");
     }
 
-    /// `project_files_ref` / `skills_ref` 是后加的格：没有时不落键（这些格出现之前的快照
+    /// `project_files_ref` / `skills_ref` / `contract` 是后加的格：没有时不落键（这些格出现之前的快照
     /// JSON 不变），没有这些键的旧快照读得回来、这些格是 `None`。
     #[test]
     fn a_snapshot_without_project_files_keeps_its_old_shape() {
@@ -263,9 +268,11 @@ mod tests {
             memory_scope: None,
             projection: None,
             direct_command: None,
+            contract: None,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert!(json.get("project_files_ref").is_none(), "{json}");
+        assert!(json.get("contract").is_none(), "{json}");
         assert!(json.get("project_files_update_ref").is_none(), "{json}");
         assert!(json.get("skills_ref").is_none(), "{json}");
         let back: RunSnapshot = serde_json::from_value(json).unwrap();

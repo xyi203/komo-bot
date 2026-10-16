@@ -27,6 +27,7 @@ use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::traits::{Ledger, LedgerError, ToolOutputStore};
 use komo_kernel::types::agent::{ProjectFile, RunSnapshot};
+use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::ids::RunId;
 use komo_kernel::types::memory::{Injection, MemoryScope};
 use komo_kernel::types::model::ModelConfig;
@@ -69,6 +70,8 @@ pub(crate) struct Identity {
     pub projection: Option<ProjectionContext>,
     /// TUI `!` 直接执行的命令（快照里冻结的那一份）；有值时这一段不经模型。
     pub direct_command: Option<String>,
+    /// `task` 给这条 Run 的结果契约（快照里冻结的那一份，§4）。
+    pub contract: Option<DelegateContract>,
 }
 
 /// 没有冻结快照时兜底身份要用到的那几样：当前配置、会话 workdir、`workspaces/`（§7）。
@@ -152,6 +155,7 @@ pub(crate) async fn identity_for(
         memory_scope: frozen.memory_scope,
         projection: frozen.projection,
         direct_command: frozen.direct_command,
+        contract: frozen.contract,
     })
 }
 
@@ -208,6 +212,7 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         memory_scope: profile.and_then(|profile| profile.memory_scope.clone()),
         projection: None,
         direct_command: None,
+        contract: None,
     }
 }
 
@@ -485,6 +490,7 @@ mod tests {
             instructions: None,
             project_files: Vec::new(),
             project_update: None,
+            contract: None,
             workspace: PathBuf::from("/work"),
             tools: Vec::new(),
             mcp_servers: Vec::new(),

@@ -21,10 +21,11 @@
 //! 在这里 `publish`。所有权不下放，因为"先持久化输出、再追加 `tool.result`"是 §8.5
 //! 的一步，而工具不知道这一步存在。
 //!
-//! **委派不走这条流水线的后半段**（§4）。`Operation::Delegate` 在重放判定之前就被分流：
-//! 同一轮前面在飞的调用收完之后，做的事是**受理一条子 Run**、`start_call`、然后停在 `dependency`
-//! 上——没有 `execute`、没有输出发布、也没有这一轮的 `finish_call`。父子两端由**账本**接起来：子 Run 一进终态，父侧那次调用
-//! 的结果就是它的终态（§8.6「可以核对目标状态」）。
+//! **编排调用不走这条流水线的后半段**（§4）。`task` / `monitor` 在重放判定之前
+//! 就被分流，同一轮前面在飞的调用收完之后才做它们的事。2026-10-16 删掉的同步委派
+//! （`Operation::Delegate`）只剩升级时还没收尾的旧调用：受理子 Run、`start_call`、停在
+//! `dependency` 上，子 Run 一进终态，父侧那次调用的结果就是它的终态（§8.6）。旧的
+//! `dispatch` / `follow` 调用同样按落账的计划收尾，工具已经不在目录里。
 
 pub mod cancel;
 mod codemode;
@@ -63,7 +64,7 @@ use komo_kernel::types::refs::{
 use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::status::{RunEnd, RunState, ToolCallState};
 use komo_kernel::types::surface::AgentSurface;
-use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskSpec};
+use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskOptions, TaskSpec};
 use komo_kernel::types::tool::{
     CancelToken, ResumedCall, ToolContext, ToolError, ToolExposure, ToolNamespace, ToolOutput,
     WorkspaceRoot,
@@ -454,7 +455,7 @@ impl ToolExecutor {
     /// **只读的调用可以和同一轮里后面的调用同时在飞**：够格的是 `Operation::ReadFile`
     /// 这一类计划（`read` / `rg`）里没有"上一世"要接的那条（详见
     /// [`ReadyCall::parallel_with_siblings`]）。其余一切（`write` / `edit` / `bash` /
-    /// `codemode`，`delegate` / `dispatch` / `follow` / `monitor` 这些编排调用，以及任何
+    /// `codemode`，`task` / `monitor` 这些编排调用（以及旧的 `delegate` / `dispatch` / `follow`），以及任何
     /// 要停下来的判定）都是**屏障**：屏障之前已经在飞的先收尾，再按调用顺序做它。
     ///
     /// "做它"指的是 `start_call` 及之后的一切：`begin` 只放行（可能落 `tool.planned`），
@@ -548,6 +549,15 @@ impl ToolExecutor {
         // 中断一样记 uncertain 交给模型。只落了计划、没 started 的确定没执行过（§8.4 第 6 行），
         // 与模型这一轮新发的调用一样照旧被拒。
         let tools = self.tools();
+        // 2026-10-16 删掉的 `delegate` / `dispatch` / `follow`：升级时还没收尾的调用带着落账的
+        // 计划回来，工具已经不在目录里。它们是编排调用，不问工具也不看重放策略——计划里就有
+        // 收尾要的一切——所以照删之前的路径收尾（§4、§8.6），不当成"工具名没了"的中断。
+        if let (Some(plan), Some(_)) = (&request.plan, &request.resumed)
+            && retired_orchestration(&plan.operation)
+            && let Some(begin) = self.orchestrate(request, env, plan).await?
+        {
+            return Ok(begin);
+        }
         let known = env.surface.allows(&request.tool) && tools.contains_key(&request.tool);
         if !known
             && let (Some(plan), Some(state)) = (&request.plan, &request.resumed)
@@ -602,18 +612,12 @@ impl ToolExecutor {
             },
         };
 
-        // 编排调用（delegate / dispatch / follow / monitor）不走"工具执行"那条路，也
-        // **不看重放策略**：它们 started 而无结果时该做什么都有确定答案——delegate 的结果在
-        // 我们自己的账本里（子 Run 的终态，§8.6「可以核对目标状态」），dispatch / follow /
-        // monitor 按请求键幂等重放（`docs/background-tasks.md`）。
-        match self.orchestration(&plan.operation, env) {
-            Ok(None) => {}
-            Ok(Some(kind)) => return self.begin_orchestration(request, env, plan, kind).await,
-            Err(message) => {
-                return Ok(Begin::Settled(
-                    self.fail_unstarted(request, env, message).await?,
-                ));
-            }
+        // 编排调用（task / monitor，以及旧的 delegate / dispatch / follow）不走"工具执行"那条路，
+        // 也**不看重放策略**：它们 started 而无结果时该做什么都有确定答案——task / monitor
+        // 按请求键幂等重放（`docs/background-tasks.md`），旧 delegate 的结果在我们自己的账本里
+        // （子 Run 的终态，§8.6）。
+        if let Some(begin) = self.orchestrate(request, env, &plan).await? {
+            return Ok(begin);
         }
 
         // §8.4 第 6 / 7 行、§8.6：started 而没有结果的调用，重放策略说了算（借自 pi-durable）。
@@ -786,6 +790,26 @@ impl ToolExecutor {
         }
     }
 
+    /// 这份计划是编排调用就放行（或按没有执行过的调用落账拒掉）；不是就交回 `None`，
+    /// 照普通工具往下走。
+    async fn orchestrate(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        plan: &ExecutionPlan,
+    ) -> Result<Option<Begin>, ExecError> {
+        match self.orchestration(&plan.operation, env) {
+            Ok(None) => Ok(None),
+            Ok(Some(kind)) => self
+                .begin_orchestration(request, env, plan.clone(), kind)
+                .await
+                .map(Some),
+            Err(message) => Ok(Some(Begin::Settled(
+                self.fail_unstarted(request, env, message).await?,
+            ))),
+        }
+    }
+
     /// 这份计划是不是一次编排调用；是的话先过只看能力的那几道（`Err` = 不合格的理由，
     /// 按没有执行过的调用落账）。
     fn orchestration(
@@ -820,17 +844,54 @@ impl ToolExecutor {
                 }
                 Orchestration::Delegate(spec.clone())
             }
-            Operation::Dispatch { task, title } => Orchestration::Dispatch {
+            Operation::Task {
+                prompt,
+                title,
+                task_id,
+                model,
+                effort,
+                contract,
+            } => {
+                let options = TaskOptions {
+                    model: model.clone(),
+                    effort: effort.clone(),
+                    contract: contract.clone(),
+                };
+                match task_id {
+                    None => Orchestration::Spawn {
+                        spawner: spawner()?,
+                        key: "task",
+                        spec: TaskSpec {
+                            task: prompt.clone(),
+                            title: title.clone().unwrap_or_default(),
+                            options,
+                        },
+                    },
+                    Some(task_id) => Orchestration::Follow {
+                        spawner: spawner()?,
+                        key: "task",
+                        task_id: task_id.clone(),
+                        text: prompt.clone(),
+                        options,
+                    },
+                }
+            }
+            // 旧计划：请求键沿用它们自己的前缀，重放才拿回原来那条。
+            Operation::Dispatch { task, title } => Orchestration::Spawn {
                 spawner: spawner()?,
+                key: "dispatch",
                 spec: TaskSpec {
                     task: task.clone(),
                     title: title.clone(),
+                    options: TaskOptions::default(),
                 },
             },
             Operation::Follow { task_id, text } => Orchestration::Follow {
                 spawner: spawner()?,
+                key: "follow",
                 task_id: task_id.clone(),
                 text: text.clone(),
+                options: TaskOptions::default(),
             },
             Operation::Monitor {
                 command,
@@ -899,10 +960,10 @@ impl ToolExecutor {
 
     /// 一次放行过的编排调用的收尾：`execute_round` 收完在飞的调用之后才走到这里。
     ///
-    /// dispatch / follow **不等**任何东西：`TaskSpawner` 一返回就收尾——这正是它们存在的
-    /// 理由，等任务跑完又会把派它的会话堵住（同一会话严格串行）。幂等靠
-    /// `request_key = dispatch|follow:{run}:{call}`：首次执行与"上一世已经 `start_call`
-    /// 过、这一世只是回来收口"的续跑调的是同一个键，`TaskSpawner` 内部走的是
+    /// task **不等**任何东西：`TaskSpawner` 一返回就收尾——这正是它存在的理由，等任务
+    /// 跑完又会把派它的会话堵住（同一会话严格串行）。幂等靠 `request_key = task:{run}:{call}`
+    /// （旧计划是 `dispatch|follow:{run}:{call}`）：首次执行与"上一世已经 `start_call` 过、
+    /// 这一世只是回来收口"的续跑调的是同一个键，`TaskSpawner` 内部走的是
     /// `GatewayState::submit` 那条按请求键去重的路（§8.5），重放拿回同一个任务会话。
     async fn settle_orchestrated(
         &self,
@@ -932,19 +993,22 @@ impl ToolExecutor {
             }
         };
         let settlement = match kind {
-            Orchestration::Dispatch { spawner, spec } => {
-                let key = RequestKey::new(format!("dispatch:{}:{}", env.run, request.call));
+            Orchestration::Spawn { spawner, key, spec } => {
+                let key = RequestKey::new(format!("{key}:{}:{}", env.run, request.call));
                 let outcome = spawner.spawn(&env.run, key, spec).await;
-                self.settle_dispatch(&request, env, attempt, outcome)
-                    .await?
+                self.settle_spawn(&request, env, attempt, outcome).await?
             }
             Orchestration::Follow {
                 spawner,
+                key,
                 task_id,
                 text,
+                options,
             } => {
-                let key = RequestKey::new(format!("follow:{}:{}", env.run, request.call));
-                let outcome = spawner.follow(&env.run, key, &task_id, &text).await;
+                let key = RequestKey::new(format!("{key}:{}:{}", env.run, request.call));
+                let outcome = spawner
+                    .follow(&env.run, key, &task_id, &text, options)
+                    .await;
                 self.settle_follow(&request, env, attempt, outcome).await?
             }
             Orchestration::Monitor { monitors, mut spec } => {
@@ -1174,9 +1238,9 @@ impl ToolExecutor {
         Ok(CallSettlement::Result(for_model(request, env, &recorded)))
     }
 
-    /// `dispatch` 的结论：`TaskHandle` 折成"已派出 #短号：标题"，`SpawnError` 折成一句
+    /// 新派任务的结论：`TaskHandle` 折成"已派出 #短号：标题"，`SpawnError` 折成一句
     /// 失败原因。
-    async fn settle_dispatch(
+    async fn settle_spawn(
         &self,
         request: &CallRequest,
         env: &CallEnv,
@@ -1270,7 +1334,7 @@ impl ToolExecutor {
             .await
     }
 
-    /// `follow` 的结论：`FollowOutcome` 折成"已转给 #短号"（或"正在跑，排在后面"），
+    /// 接着做的结论：`FollowOutcome` 折成"已转给 #短号"（或"正在跑，排在后面"），
     /// `SpawnError` 折成一句失败原因（短号解析不到 / 有歧义 / 提交失败）。
     async fn settle_follow(
         &self,
@@ -1305,7 +1369,7 @@ impl ToolExecutor {
             .await
     }
 
-    /// `dispatch` / `follow` / `monitor` 共用的收尾：给那次尝试写一条结果，交回模型
+    /// `task` / `monitor` 共用的收尾：给那次尝试写一条结果，交回模型
     /// 一句话。
     async fn settle_orchestration(
         &self,
@@ -1565,7 +1629,7 @@ enum Begin {
     /// 已经有结论：不需要执行（工具名不认识、参数准备不出来、被拒、核对收口），或者停在
     /// 交给人的判断上。
     Settled(CallSettlement),
-    /// 放行过的编排调用（delegate / dispatch / follow / monitor）：屏障，
+    /// 放行过的编排调用（task / monitor，以及旧的 delegate）：屏障，
     /// `execute_round` 先收完在飞的，才 `start_call` 并做它的事（[`Orchestrated`]）。
     Orchestrate(Box<Orchestrated>),
 }
@@ -1578,20 +1642,23 @@ struct Orchestrated {
     kind: Orchestration,
 }
 
-/// 编排调用的四种。只看能力的那几道（深度、有没有接任务分发）在造它之前已经过了。
+/// 编排调用的几种。只看能力的那几道（深度、有没有接任务分发）在造它之前已经过了。
 enum Orchestration {
-    /// 受理一条子 Run，停在 `dependency` 上等它的终态。
+    /// 旧的同步委派：受理一条子 Run，停在 `dependency` 上等它的终态。
     Delegate(DelegateSpec),
-    /// 派一条后台任务，立刻收尾。
-    Dispatch {
+    /// 派一条后台任务，立刻收尾。`key` 是请求键的前缀（`task`，旧计划 `dispatch`）。
+    Spawn {
         spawner: Arc<dyn TaskSpawner>,
+        key: &'static str,
         spec: TaskSpec,
     },
-    /// 往一条后台任务里转一句话，立刻收尾。
+    /// 往一条后台任务里转一句话，立刻收尾。`key` 同上（`task`，旧计划 `follow`）。
     Follow {
         spawner: Arc<dyn TaskSpawner>,
+        key: &'static str,
         task_id: String,
         text: String,
+        options: TaskOptions,
     },
     /// 挂一个监听，立刻收尾。
     Monitor {
@@ -1899,7 +1966,9 @@ fn state_word(state: RunState) -> &'static str {
 /// 可以去 `read` 那条 Run 的完整过程——**复验用的是父侧手里那份契约，过程由只读接口去取**
 /// （§8.6）。
 fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> ToolResultBody {
-    let (body, content) = match end {
+    // 2026-10-16 之前这里还附一句"再调一次 delegate 并带上 resume"：委派删掉之后只剩旧
+    // 调用收尾，那个工具已经调不到了，不再提示。
+    match end {
         RunEnd::Completed { final_message, .. } => {
             let text = final_message.as_deref().unwrap_or_default();
             match &spec.contract {
@@ -1908,7 +1977,7 @@ fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> ToolResultB
                     let mut result = outcome_map(child, end);
                     result.insert("final_message".into(), serde_json::json!(text));
                     let content = format!("子 Run {child} 已完成。它的最后一条回复：\n{text}");
-                    (completed_body(result, &content), content)
+                    completed_body(result, &content)
                 }
                 Some(contract) => contract_result(contract, child, end, text),
             }
@@ -1939,18 +2008,6 @@ fn child_result(spec: &DelegateSpec, child: &RunId, end: &RunEnd) -> ToolResultB
             end,
             serde_json::json!({ "by": by, "reason": reason }),
         ),
-    };
-    // completed / failed 都能续（§4：cancelled / abandoned 不能）；给模型一句能直接照着
-    // 做的提示，而不是让它自己想起来这条 id 还能被 resume。
-    match end {
-        RunEnd::Completed { .. } | RunEnd::Failed { .. } => {
-            let hint =
-                format!("\n\n还要接着这件事，再调一次 delegate 并带上 resume: \"{child}\"。");
-            let mut body = body;
-            body.preview = Some(format!("{content}{hint}"));
-            body
-        }
-        _ => body,
     }
 }
 
@@ -1960,7 +2017,7 @@ fn contract_result(
     child: &RunId,
     end: &RunEnd,
     text: &str,
-) -> (ToolResultBody, String) {
+) -> ToolResultBody {
     match check_contract(contract, text) {
         Ok((value, validation)) => {
             let mut result = outcome_map(child, end);
@@ -1979,7 +2036,7 @@ fn contract_result(
                     validation.ignored.join("、")
                 ));
             }
-            (completed_body(result, &content), content)
+            completed_body(result, &content)
         }
         Err(report) => match contract.mode {
             // permissive：不合规也把结果交给父侧，但**标记出来**——父侧要能把"子代理按
@@ -1994,7 +2051,7 @@ fn contract_result(
                     "子 Run {child} 已完成，但结果不符合契约（permissive 放行，未按契约交付）：\
                      {report}。它的最后一条回复：\n{text}"
                 );
-                (completed_body(result, &content), content)
+                completed_body(result, &content)
             }
             // strict：这次委派就是失败的。原因写全，父侧要能决定"要不要用别的方式再试"。
             SchemaMode::Strict => failed_result(
@@ -2007,12 +2064,13 @@ fn contract_result(
     }
 }
 
-/// 从子代理的最后一条回复里取 JSON 并按契约验一遍。
+/// 从最后一条回复里取 JSON 并按契约验一遍：旧委派的父侧收尾与 `task` 交回之前的复验
+/// （Gateway 的 `report_to_parent`）都用它。
 ///
-/// 校验器来自 kernel，**父子共用同一份代码**（§8.6）：两份实现会漂移，漂移的症状是
+/// 校验器来自 kernel，**两头共用同一份代码**（§8.6）：两份实现会漂移，漂移的症状是
 /// "子代理说成功、父侧说结果不合规"，而判断只能有一个出处。取 JSON 那一步与记忆提取
 /// 共用（两边都容忍围栏与前后闲话），理由相同。
-fn check_contract(
+pub fn check_contract(
     contract: &DelegateContract,
     text: &str,
 ) -> Result<(serde_json::Value, Validation), String> {
@@ -2058,21 +2116,26 @@ fn failed_result(
     child: &RunId,
     end: &RunEnd,
     extra: serde_json::Value,
-) -> (ToolResultBody, String) {
+) -> ToolResultBody {
     let mut result = outcome_map(child, end);
     if let serde_json::Value::Object(extra) = extra {
         result.extend(extra);
     }
-    (
-        ToolResultBody {
-            status: ToolResultStatus::Failed,
-            result: serde_json::Value::Object(result),
-            error: Some(summary.clone()),
-            exit_code: None,
-            artifacts: vec![],
-            preview: Some(summary.clone()),
-        },
-        summary,
+    ToolResultBody {
+        status: ToolResultStatus::Failed,
+        result: serde_json::Value::Object(result),
+        error: Some(summary.clone()),
+        exit_code: None,
+        artifacts: vec![],
+        preview: Some(summary),
+    }
+}
+
+/// 2026-10-16 删掉的那几个编排操作：工具已经不在目录里，只剩旧计划（§4）。
+fn retired_orchestration(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Delegate { .. } | Operation::Dispatch { .. } | Operation::Follow { .. }
     )
 }
 

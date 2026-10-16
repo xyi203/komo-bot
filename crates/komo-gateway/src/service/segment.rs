@@ -508,10 +508,16 @@ impl SegmentSource for GatewaySegments {
         // **唯一的 Context Assembly 入口**（§5）：Gateway 到这里为止只是"凑齐事实"，
         // "模型这一刻看见什么"由它一家决定——记忆段放在哪也是它说了算（§13.2）。历史
         // 以外的那些留成模板：在线压缩一轮收尾之后重新装配时原样再用（§6）。
+        // `task` 的结果契约只在任务 Run 自己的快照里；子代理继承的是父的快照，不跟着带。
+        let contract = match &delegate {
+            Some(_) => None,
+            None => identity.contract.clone(),
+        };
         let template = compaction::ContextTemplate {
             instructions: identity.instructions.clone(),
             project_files,
             project_update,
+            contract,
             workspace: cwd.clone(),
             tools: tool_names,
             mcp_servers,

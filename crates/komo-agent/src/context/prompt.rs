@@ -8,7 +8,7 @@
 use std::path::Path;
 
 use komo_kernel::types::agent::ProjectFile;
-use komo_kernel::types::delegate::DelegateSpec;
+use komo_kernel::types::delegate::{DelegateContract, DelegateSpec};
 use komo_kernel::types::tool::ToolNamespace;
 
 use super::InvocationContext;
@@ -262,19 +262,35 @@ fn subagent_prompt(workspace: &Path, rules: &str, spec: &DelegateSpec) -> String
         spec.task,
         workspace.display(),
     );
-    prompt.push_str("\n\n最后一条回复只放结果，不调工具、不寒暄：");
+    prompt.push_str("\n\n");
+    prompt.push_str(FINAL_REPLY);
     match &spec.contract {
         Some(contract) => {
             prompt.push_str(
                 "\n一个满足下面 schema 的 JSON 对象（父侧用同一份校验，不合规会退回）：\n",
             );
-            prompt.push_str(
-                &serde_json::to_string_pretty(&contract.schema).unwrap_or_else(|_| "{}".into()),
-            );
+            prompt.push_str(&contract_schema(contract));
         }
         None => prompt.push_str("\n一段能独立读懂的结论（父侧只拿走这段文本）。"),
     }
     prompt
+}
+
+/// 结果契约的开头一句：子代理的系统提示与 `task` 的契约段共用。
+const FINAL_REPLY: &str = "最后一条回复只放结果，不调工具、不寒暄：";
+
+fn contract_schema(contract: &DelegateContract) -> String {
+    serde_json::to_string_pretty(&contract.schema).unwrap_or_else(|_| "{}".into())
+}
+
+/// `task` 带契约时补在任务后面的那一段（`docs/komo_bot.md` §4）：与子代理的 Result Contract
+/// 同一套说法，但交回不退回——复验结论随结果一起交回派它的会话。
+pub(crate) fn task_contract_block(contract: &DelegateContract) -> String {
+    format!(
+        "（结果契约）{FINAL_REPLY}\n一个满足下面 schema 的 JSON 对象（交回之前用同一份校验复验，\
+         复验结论随结果一起交回）：\n{}",
+        contract_schema(contract)
+    )
 }
 
 #[cfg(test)]

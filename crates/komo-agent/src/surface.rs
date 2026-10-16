@@ -6,16 +6,13 @@
 use komo_kernel::types::agent::AgentProfile;
 use komo_kernel::types::surface::AgentSurface;
 
-/// 编排操作名。**注册与过滤两处共用它**：Gateway 装配工具目录时挂上这个名字，`segment`
-/// 给子 Run 装配能力面时摘掉它（§4 的深度只有一层）。另有一处测试钉住它与
-/// `DelegateTool` 自报的名字一致——两处各写一个字面量迟早会漂。
+/// 旧的同步委派（2026-10-16 删掉）：工具已经不在目录里，名字只剩旧子 Run 的能力面还要
+/// 摘掉它（`segment` 的 `without_delegate`，§4 的深度只有一层）。
 pub const DELEGATE_TOOL: &str = "delegate";
 
-/// `dispatch` / `follow`：把耗时的事派给独立任务会话在后台跑
-/// （`docs/background-tasks.md`）。与 `DELEGATE_TOOL` 同一个理由——注册与（将来的）
-/// 过滤两处共用同一个名字。
-pub const DISPATCH_TOOL: &str = "dispatch";
-pub const FOLLOW_TOOL: &str = "follow";
+/// `task`：把耗时的事派给独立任务会话在后台跑（`docs/background-tasks.md`）。受理时给
+/// 任务会话冻结能力面要摘掉它（深度只有一层），注册的那个工具自报同一个名字。
+pub const TASK_TOOL: &str = "task";
 
 /// 一份 Profile 在**这份工具目录**里挑出来的能力面。
 ///

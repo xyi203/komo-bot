@@ -136,53 +136,43 @@ async fn tool_results_go_back_to_the_model_keyed_by_call_id() {
     );
 }
 
-/// 委派：父 Run 停在 `dependency` 上**让出执行名额**，不在进程里等子 Run。
-///
-/// 它和"等介入"是同一件事的两种外因：停下来的形状都是 `waiting` + 一条 `WaitReason`，
-/// 而"在等谁"由理由说清楚——这里等的是那条子 Run 的终态，没有任何人要回答什么。
+/// 同步委派 2026-10-16 删掉：模型新发的 `delegate` 调用不再派子 Run，按"工具集里没有
+/// 它"落一条失败结果交给模型，Run 接着往下走，不停在 `dependency` 上。
 #[tokio::test]
-async fn a_delegated_call_suspends_the_run_on_its_child() {
+async fn a_new_delegate_call_is_refused_and_the_run_carries_on() {
     let wired = Wired::new(
-        vec![vec![round(
-            1,
-            None,
-            vec![call(
-                "pc-1",
-                "delegate",
-                serde_json::json!({ "task": "去查一下这个接口的超时" }),
-            )],
-        )]],
-        vec![Arc::new(crate::tools::DelegateTool::new())],
+        vec![vec![
+            round(
+                1,
+                None,
+                vec![call(
+                    "pc-1",
+                    "delegate",
+                    serde_json::json!({ "task": "去查一下这个接口的超时" }),
+                )],
+            ),
+            round(2, Some("我自己查。"), vec![]),
+        ]],
+        vec![Arc::new(RecordingTool::bash())],
     );
     let segment = wired.segment(CancelToken::new()).await;
-    let parent = segment.run.clone();
     let outcome = wired.agent.run(segment).await.unwrap();
 
-    let SegmentOutcome::Suspended {
-        wait: WaitReason::Dependency { run: child },
-        ..
-    } = &outcome
-    else {
-        panic!("{outcome:?}")
-    };
-
+    assert!(
+        matches!(outcome, SegmentOutcome::Completed { rounds: 2, .. }),
+        "{outcome:?}"
+    );
     let surface = surface(&wired.harness);
-    let view = &surface.runs[&parent];
-    assert_eq!(view.status, RunState::Waiting, "停着，不占执行名额");
-    assert_eq!(
-        view.wait,
-        Some(WaitReason::Dependency { run: child.clone() })
+    assert!(
+        surface.runs.values().all(|view| view.delegate.is_none()),
+        "没有派出子 Run"
     );
-    // 子 Run 是一条**普通 Run**：它已经在队列里等 worker，可领取、可取消，
-    // 而且带着那份 spec。
-    let child_view = &surface.runs[child];
-    assert_eq!(child_view.status, RunState::Queued);
-    assert_eq!(
-        child_view.delegate.as_ref().map(|spec| &spec.parent),
-        Some(&parent)
-    );
-    // 父这一次调用还没有结果：结果就是子 Run 的终态，它还没到。
-    assert!(surface.calls.values().all(|call| call.output.is_none()));
+    let tool_node = surface
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Tool)
+        .expect("有工具结果节点");
+    assert_eq!(tool_node.tool_results[0].status, ToolResultStatus::Failed);
 }
 
 /// ⑧ 工具失败作为结果回给模型，模型继续；Run 正常结束。

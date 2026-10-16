@@ -137,6 +137,7 @@ pub async fn submit(
                 &session,
                 request.request_key.clone(),
                 request.text.clone(),
+                None,
                 model,
             )
             .await?;

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::types::agent::ProjectFile;
-use komo_kernel::types::delegate::DelegateSpec;
+use komo_kernel::types::delegate::{DelegateContract, DelegateSpec};
 use komo_kernel::types::ids::ToolCallId;
 use komo_kernel::types::tool::ToolNamespace;
 use komo_kernel::types::turn::{ReplayMessage, Role};
@@ -40,6 +40,9 @@ pub struct ContextInput<'s> {
     /// 会话里规范改过之后、这条 Run 受理时的那一版：系统提示仍是会话里沿用的那份（前缀
     /// 缓存不作废），这一版补在这条 Run 的任务后面。`None` = 没变。
     pub project_update: Option<Vec<ProjectFile>>,
+    /// `task` 给这条 Run 的结果契约（冻结在它的快照里）：与 `project_update` 一样补在这条
+    /// Run 的任务后面，系统提示不变。`None` = 没有契约。
+    pub contract: Option<DelegateContract>,
     /// 解析过的真实工作目录。
     pub workspace: PathBuf,
     /// 这一段真正挂上的工具名，按 Schema 的顺序。RULES 按它挑规则（挂了 `rg` 才说"用
@@ -94,7 +97,8 @@ pub struct AgentContext {
 ///
 /// 顺序（§10）：Instructions（最前）→ Identity / Task / 工作目录 / RULES → komo 自查
 /// （仅主 Agent 且挂了 `bash`）→ 项目规范（仅主 Agent）→ Skills（仅主 Agent）→ Result
-/// Contract（仅子代理）→ Memory（最后，`\n\n` + 正文）。
+/// Contract（仅子代理）→ Memory（最后，`\n\n` + 正文）。`task` 的结果契约不进系统提示，
+/// 补在这条 Run 的任务后面。
 pub fn assemble(input: ContextInput<'_>) -> AgentContext {
     let mut prompt = prompt::build(
         &input.workspace,
@@ -119,6 +123,15 @@ pub fn assemble(input: ContextInput<'_>) -> AgentContext {
         let text = task.text.get_or_insert_with(String::new);
         text.push_str("\n\n");
         text.push_str(&prompt::project_update_block(files));
+    }
+    if let Some(contract) = &input.contract
+        && let Some(task) = messages
+            .get_mut(run_from)
+            .filter(|message| message.role == Role::User)
+    {
+        let text = task.text.get_or_insert_with(String::new);
+        text.push_str("\n\n");
+        text.push_str(&prompt::task_contract_block(contract));
     }
     AgentContext {
         system_prompt: prompt,

@@ -476,15 +476,16 @@ async fn a_session_without_an_owner_runs_as_the_default_agent() {
 
 // ---------------------------------------------------------------- 后台任务（`docs/background-tasks.md`）
 
-/// home 用的就是它自己的 Agent：能派后台任务（`dispatch` / `follow`），也能自己动手。
-/// 渠道是 Telegram（操作者 111，home chat 也是 111），DM 走真 Dispatcher，不绕过它。
+/// home 用的就是它自己的 Agent：能派后台任务（`task`），也能自己动手。两个模型：
+/// `main` 是默认，`cheap` 给任务用。渠道是 Telegram（操作者 111，home chat 也是 111），
+/// DM 走真 Dispatcher，不绕过它。
 fn tasks_config() -> String {
     r#"
 default_agent = "assistant"
 
 [agents.assistant]
 instructions = "你是助手（assistant 那一版身份）。"
-tools = ["dispatch", "follow", "read", "bash", "unsure"]
+tools = ["task", "read", "bash", "unsure", "gate"]
 
 [channels.telegram]
 enabled = true
@@ -498,6 +499,13 @@ base_url = "https://llm.example.com/v1"
 model = "gpt-test"
 api_key_env = "KOMO_LLM_API_KEY"
 
+[model.cheap]
+type = "completion"
+api_backend = "responses"
+base_url = "https://llm.example.com/v1"
+model = "gpt-cheap"
+api_key_env = "KOMO_LLM_API_KEY"
+
 [models]
 default = "main"
 
@@ -507,22 +515,25 @@ enabled = false
     .to_string()
 }
 
-/// 按**这一段最后一条用户消息**分流的脚本模型：home 与任务会话是同一个 Agent，系统
-/// 提示分不开它们，输入正文分得开。
+/// 按**这一段最后一条用户消息的第一行**分流的脚本模型：home 与任务会话是同一个 Agent，
+/// 系统提示分不开它们，输入正文分得开（任务带契约时正文后面还补着契约段）。
 ///
-/// - `帮我查一下空调`（home）→ 调 `dispatch`，再把工具结果原样念出来；
-/// - `功耗呢`（home）→ 调 `follow`（目标短号由测试写进 `follow_task_id`）；
-/// - `跑个慢命令`（home）→ 调 `dispatch`，派出去的任务会调 `unsure` 停在一条介入上；
+/// - `帮我查一下空调`（home）→ 调 `task`（用 `cheap`、带契约），再把工具结果原样念出来；
+/// - `功耗呢`（home）→ 调 `task` 接着做（目标短号由测试写进 `follow_task_id`，不给 model）；
+/// - `跑个慢命令`（home）→ 调 `task`，派出去的任务会调 `unsure` 停在一条介入上；
+/// - `派了再等`（home）→ 先调 `task`，再调 `gate` 停在门上，门开之后再说一句；
 /// - `[后台任务 …]`（home，任务交回的结果）→ 回一句 `转告：<结果正文那一行>`；
-/// - 任务会话收到的正文 → 各回一句固定的结论，或者调 `bash`。
+/// - 任务会话收到的正文 → 各回一句固定的结论，或者调 `bash` / `unsure` / `task`。
 struct TasksLlm {
     follow_task_id: Mutex<Option<String>>,
+    requests: Mutex<Vec<TurnRequest>>,
 }
 
 impl TasksLlm {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             follow_task_id: Mutex::new(None),
+            requests: Mutex::new(Vec::new()),
         })
     }
 
@@ -543,16 +554,22 @@ fn last_user_text(req: &TurnRequest) -> String {
 #[async_trait::async_trait]
 impl LlmClient for TasksLlm {
     async fn begin_turn(&self, req: TurnRequest) -> Result<Box<dyn TurnDriver>, LlmError> {
+        self.requests.lock().expect("请求").push(req.clone());
         let input = last_user_text(&req);
         let script = if input.starts_with("[后台任务") {
             let result = input.lines().nth(2).unwrap_or_default();
             Script::Reply(format!("转告：{result}"))
         } else {
-            match input.as_str() {
-                "帮我查一下空调" => Script::Call(
-                    "dispatch",
-                    serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
-                ),
+            match input.lines().next().unwrap_or_default() {
+                "帮我查一下空调" => Script::Calls(vec![(
+                    "task",
+                    serde_json::json!({
+                        "prompt": "查一下空调状态",
+                        "title": "查空调",
+                        "model": "cheap",
+                        "contract": { "type": "object", "required": ["on"] }
+                    }),
+                )]),
                 "功耗呢" => {
                     let task_id = self
                         .follow_task_id
@@ -560,51 +577,70 @@ impl LlmClient for TasksLlm {
                         .expect("follow 目标")
                         .clone()
                         .expect("follow 目标短号该在发这条消息之前写好");
-                    Script::Call(
-                        "follow",
-                        serde_json::json!({ "task_id": task_id, "text": "再看看功耗" }),
-                    )
+                    Script::Calls(vec![(
+                        "task",
+                        serde_json::json!({ "task_id": task_id, "prompt": "再看看功耗" }),
+                    )])
                 }
-                "跑个慢命令" => Script::Call(
-                    "dispatch",
-                    serde_json::json!({ "task": "跑一下 echo hi", "title": "慢命令" }),
-                ),
-                "跑一下 echo hi" => Script::Call("unsure", serde_json::json!({})),
+                "跑个慢命令" => Script::Calls(vec![(
+                    "task",
+                    serde_json::json!({ "prompt": "跑一下 echo hi", "title": "慢命令" }),
+                )]),
+                "派了再等" => Script::Calls(vec![
+                    (
+                        "task",
+                        serde_json::json!({ "prompt": "查一下热水器状态", "title": "查热水器" }),
+                    ),
+                    ("gate", serde_json::json!({})),
+                ]),
+                "再派一层" => Script::Calls(vec![(
+                    "task",
+                    serde_json::json!({ "prompt": "里面那层", "title": "里层" }),
+                )]),
+                "跑一下 echo hi" => Script::Calls(vec![("unsure", serde_json::json!({}))]),
                 "查一下空调状态" => Script::Reply("空调已经关掉了。".into()),
+                "查一下热水器状态" => Script::Reply("热水器 60 度。".into()),
                 "再看看功耗" => Script::Reply("功耗 300W。".into()),
                 "1+1 等于几" => Script::Reply("2".into()),
                 other => Script::Reply(format!("没见过这句：{other}")),
             }
         };
-        Ok(Box::new(ScriptDriver { script }))
+        Ok(Box::new(ScriptDriver { script, step: 0 }))
     }
 }
 
 enum Script {
     Reply(String),
-    Call(&'static str, serde_json::Value),
+    /// 一轮一个调用，按顺序；调用都收尾之后把最后一条工具结果原样念出来。
+    Calls(Vec<(&'static str, serde_json::Value)>),
 }
 
 struct ScriptDriver {
     script: Script,
+    step: usize,
 }
 
 #[async_trait::async_trait]
 impl TurnDriver for ScriptDriver {
     async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
-        match (&self.script, input) {
-            (Script::Reply(text), _) => text_round(1, text),
-            (Script::Call(tool, args), RoundInput::First) => {
-                call_round(1, &format!("pc-{tool}"), tool, args.clone())
-            }
-            // 原样念出工具结果：短号是运行时现生成的，脚本没法提前写死。
-            (Script::Call(..), RoundInput::ToolResults { results, .. }) => {
-                let text = results
-                    .first()
-                    .map(|result| result.content.clone())
-                    .unwrap_or_default();
-                text_round(2, &text)
-            }
+        self.step += 1;
+        let round = self.step as u32;
+        match &self.script {
+            Script::Reply(text) => text_round(round, text),
+            Script::Calls(calls) => match calls.get(self.step - 1) {
+                Some((tool, args)) => call_round(round, &format!("pc-{tool}"), tool, args.clone()),
+                // 原样念出工具结果：短号是运行时现生成的，脚本没法提前写死。
+                None => {
+                    let text = match input {
+                        RoundInput::ToolResults { results, .. } => results
+                            .first()
+                            .map(|result| result.content.clone())
+                            .unwrap_or_default(),
+                        RoundInput::First => String::new(),
+                    };
+                    text_round(round, &text)
+                }
+            },
         }
     }
 
@@ -651,6 +687,34 @@ async fn runs_of(gateway: &Gw, session: &SessionId) -> Vec<komo_store::repos::ru
         .expect("读得出会话的 Run")
 }
 
+/// 一个会话的 JSONL 里这条 Run 的 `run.accepted`。
+async fn accepted_of(
+    gateway: &Gw,
+    session: &SessionId,
+    run: &RunId,
+) -> komo_kernel::events::RunAccepted {
+    let paths = gateway.state().ledgers.paths_for(session);
+    let (events, _) = komo_store::session_log::read_events(
+        &paths,
+        session,
+        komo_kernel::types::ids::Seq::ZERO,
+        0,
+    )
+    .await
+    .expect("读得出会话");
+    events
+        .into_iter()
+        .find_map(|event| match event.payload {
+            komo_kernel::events::EventPayload::RunAccepted(body)
+                if event.run.as_ref() == Some(run) =>
+            {
+                Some(body)
+            }
+            _ => None,
+        })
+        .expect("这条 Run 受理过")
+}
+
 /// 任务交回的结果在 home 里受理成的那条 Run（请求键 `task-result:{run}`）。交回发生在
 /// 任务的看客收尾那一刻，是异步的，所以要等。
 async fn wait_report(gateway: &Gw, home: &SessionId, task_run: &RunId) -> RunId {
@@ -669,9 +733,10 @@ async fn wait_report(gateway: &Gw, home: &SessionId, task_run: &RunId) -> RunId 
     panic!("任务 {task_run} 的结果没有交回 home");
 }
 
-/// 端到端：DM → home 调 `dispatch`、回"已派出 #短号" → 任务会话以 home 的 Agent 跑完 →
-/// 结果**不直接**投给渠道，而是作为一条内部输入交回 home，由 home 转告 → `follow` 进同
-/// 一个任务会话，结果照样经 home 转告。
+/// 端到端：DM → home 调 `task`、回"已派出 #短号" → 任务会话以 home 的 Agent、用 `task` 给的
+/// 模型跑完 → 结果**不直接**投给渠道，而是作为一条内部输入交回 home（带契约复验结论、
+/// 不带模型），由 home 转告 → 带 `task_id` 接着做，沿用那个任务上一条 Run 的模型，结果照样
+/// 经 home 转告（§14 `task` 验收 ①④⑤⑥⑦）。
 #[tokio::test]
 async fn a_background_task_reports_back_through_home() {
     let home = Home::with_config(&tasks_config());
@@ -727,20 +792,183 @@ async fn a_background_task_reports_back_through_home() {
         "任务的原话不该直接投给渠道：{delivered:?}"
     );
 
-    // ── 4. follow 进同一个任务会话，结果照样经 home 转告。
+    // ④ 任务 Run 的快照是 `task` 给的模型；交回的那条输入按 home 自己的默认。
+    let task_record = runs_of(&gateway, &task.session).await.remove(0);
+    assert_eq!(task_record.model.model, "gpt-cheap");
+    let report_record = runs_of(&gateway, &home_session)
+        .await
+        .into_iter()
+        .find(|record| record.run == report)
+        .expect("交回的那条 Run");
+    assert_eq!(report_record.model.model, "gpt-test");
+    // ⑥ 带契约：任务的提示里有契约段，交回的输入里写着复验结论（不合契约也照样交回）。
+    let task_request = llm
+        .requests
+        .lock()
+        .expect("请求")
+        .iter()
+        .find(|request| request.session == task.session)
+        .cloned()
+        .expect("任务会话发过请求");
+    assert!(
+        last_user_text(&task_request).contains("（结果契约）"),
+        "{:?}",
+        task_request.messages
+    );
+    // ⑦ 任务会话的能力面里没有 `task`。
+    assert!(
+        !task_request
+            .tools
+            .iter()
+            .any(|tool| tool.name == komo_agent::TASK_TOOL),
+        "任务会话不该看得见 task"
+    );
+    let report_input = accepted_of(&gateway, &home_session, &report).await;
+    assert!(report_input.interject, "交回的输入带插话标记");
+    assert!(
+        report_input
+            .text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("结果契约复验：不符合"),
+        "{:?}",
+        report_input.text
+    );
+
+    // ── 4. 带 task_id 接着做：进同一个任务会话，沿用上一条 Run 的模型，结果照样经 home 转告。
     llm.set_follow_target(&komo_kernel::types::task::short_id(&task.session));
     let (_, home_run_2) = dm(&gateway, "功耗呢", "dm-2").await;
     gateway.wait_terminal(&home_run_2).await;
     let task_runs = runs_of(&gateway, &task.session).await;
     assert_eq!(task_runs.len(), 2, "{task_runs:?}");
+    assert_eq!(task_runs[1].model.model, "gpt-cheap", "⑤ 沿用上一条的模型");
     let report_2 = wait_report(&gateway, &home_session, &task_runs[1].run).await;
     gateway.wait_terminal(&report_2).await;
-    eventually("follow 的结果照样经 home 转告", || {
+    eventually("接着做的结果照样经 home 转告", || {
         texts_to(&sender, "111")
             .iter()
             .any(|text| text == "转告：功耗 300W。")
     })
     .await;
+
+    gateway.stop().await;
+}
+
+/// home 还在跑时交回的结果在一轮收尾后并进那条 Run（`run.absorbed`），不另开一条
+/// （§6 插话，§14 `task` 验收 ③）：home 派出任务后停在一道门上，任务跑完、结果交回时 home
+/// 还在跑；门开之后那一轮收尾，结果并进来，home 接着把它转告出去。
+#[tokio::test]
+async fn a_task_result_is_absorbed_into_a_running_home() {
+    use komo_gateway::service::test_support::Gate;
+
+    let home = Home::with_config(&tasks_config());
+    let gate = Gate::new();
+    home.install_tools(vec![gate.tool()]);
+    let llm = TasksLlm::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let (home_session, home_run) = dm(&gateway, "派了再等", "dm-1").await;
+    let task_session = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let sessions = komo_store::repos::session::list(&gateway.state().db, false)
+                .await
+                .expect("读会话列表");
+            if let Some(task) = sessions
+                .into_iter()
+                .find(|record| record.kind == komo_store::models::SessionKind::Task)
+            {
+                break task.session;
+            }
+            assert!(std::time::Instant::now() < deadline, "任务一直没派出去");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    let task_run = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Some(record) = runs_of(&gateway, &task_session).await.into_iter().next() {
+                break record.run;
+            }
+            assert!(std::time::Instant::now() < deadline, "任务会话里没有 Run");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    gateway.wait_terminal(&task_run).await;
+    let report = wait_report(&gateway, &home_session, &task_run).await;
+    assert_eq!(
+        gateway.db_state(&home_run).await,
+        RunState::Running,
+        "交回时 home 还在跑"
+    );
+
+    gate.release();
+    let detail = gateway.wait_terminal(&home_run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert_eq!(
+        gateway.wait_terminal(&report).await.summary.state,
+        RunState::Absorbed,
+        "交回的那条并进了 home，没有另开一条"
+    );
+    eventually("home 把并进来的结果转告了", || {
+        texts_to(&sender, "111")
+            .iter()
+            .any(|text| text == "转告：热水器 60 度。")
+    })
+    .await;
+
+    gateway.stop().await;
+}
+
+/// 任务会话里调不动 `task`：能力面里没有它（§14 `task` 验收 ⑦）。
+#[tokio::test]
+async fn a_task_session_cannot_spawn_another_task() {
+    let home = Home::with_config(&tasks_config());
+    let llm = TasksLlm::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    // 先让 home 派出一个任务、等它跑完，再往那个任务会话里说"再派一层"。
+    let (_, home_run) = dm(&gateway, "帮我查一下空调", "dm-1").await;
+    gateway.wait_terminal(&home_run).await;
+    let task = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表")
+        .into_iter()
+        .find(|record| record.kind == komo_store::models::SessionKind::Task)
+        .expect("派出了一个任务");
+    let first = runs_of(&gateway, &task.session).await[0].run.clone();
+    gateway.wait_terminal(&first).await;
+    let inner = gateway
+        .submit(&task.session, "inner-1", "再派一层")
+        .await
+        .run;
+    gateway.wait_terminal(&inner).await;
+
+    let sessions = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表");
+    assert_eq!(
+        sessions
+            .iter()
+            .filter(|record| record.kind == komo_store::models::SessionKind::Task)
+            .count(),
+        1,
+        "任务会话里没有再派出任务"
+    );
+    let detail = gateway.wait_terminal(&inner).await;
+    assert!(
+        detail
+            .calls
+            .iter()
+            .all(|call| call.state == komo_kernel::types::status::ToolCallState::Failed),
+        "{detail:?}"
+    );
 
     gateway.stop().await;
 }

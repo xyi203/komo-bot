@@ -16,10 +16,12 @@ use komo_kernel::traits::{
 };
 use komo_kernel::types::agent::{AgentProfile, RunSnapshot};
 use komo_kernel::types::chat::ChannelPeer;
+use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::ids::{ExecutorId, RequestKey, RunId, SessionId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::status::{RunEnd, RunState, SessionState};
+use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::turn::{AcceptInput, LlmError, TurnRequest};
 use komo_runtime::agent::handler::{AgentRunHandler, SegmentSource};
 use komo_runtime::agent::{AgentLoop, Budget, ResumedRound, RetryBudget, Segment};
@@ -1109,11 +1111,22 @@ impl GatewayState {
         //
         // 目录先补一次：刚登录的 MCP 服务器这时连上，它的工具进这条 Run 的能力面。
         self.refresh_mcp().await;
-        let surface = komo_agent::surface_of(
+        let mut surface = komo_agent::surface_of(
             profile,
             &self.tool_names(),
             &super::agent_config_file(&self.config),
         );
+        // 任务会话里没有 `task`：深度只有一层，结果只交回一层（`docs/background-tasks.md`）。
+        // `GatewayTaskSpawner::parent_of` 还留着第二道。
+        if record.is_some_and(|record| record.kind == komo_store::models::SessionKind::Task) {
+            surface = AgentSurface::new(
+                surface
+                    .names()
+                    .iter()
+                    .filter(|name| name.as_str() != komo_agent::TASK_TOOL)
+                    .cloned(),
+            );
+        }
 
         // 工作目录：**会话自己的 `workdir` 优先**，其次 Profile 的 `workspace`，最后
         // `[paths] workspaces_dir`。
@@ -1184,7 +1197,15 @@ impl GatewayState {
             memory_scope: profile.memory_scope.clone(),
             projection: Some(config.execution.projection()),
             direct_command: None,
+            contract: None,
         })
+    }
+
+    /// 这个 Agent 现在的默认模型（当前配置）：`task` 只给了 effort 时，按它校验档位。
+    pub(crate) fn default_model_of(&self, agent_id: &str) -> ModelConfig {
+        let config = self.snapshot();
+        let profile = config.agent.profile_of(agent_id);
+        self.agent_model(&config, profile)
     }
 
     /// Profile 指的那个模型 alias，解析不出来就用主模型。
@@ -1222,21 +1243,46 @@ impl GatewayState {
         peer: Option<ChannelPeer>,
         model: Option<ModelConfig>,
     ) -> Result<SubmitRunResponse, GatewayError> {
-        self.accept(session, request_key, text, peer, model, None, false)
+        self.accept(session, request_key, text, peer, model, None, None, false)
             .await
     }
 
+    /// 同 [`Self::submit`]，再带上 `task` 的结果契约（冻结进这条 Run 的快照，§4）。
+    pub async fn submit_task(
+        self: &Arc<Self>,
+        session: &SessionId,
+        request_key: RequestKey,
+        text: String,
+        peer: Option<ChannelPeer>,
+        model: Option<ModelConfig>,
+        contract: Option<DelegateContract>,
+    ) -> Result<SubmitRunResponse, GatewayError> {
+        self.accept(
+            session,
+            request_key,
+            text,
+            peer,
+            model,
+            None,
+            contract,
+            false,
+        )
+        .await
+    }
+
     /// 同 [`Self::submit`]，但这句话要求**插话**（§6）：会话里有 Run 正在跑时，由它在下一次
-    /// 请求模型之前并进去，而不是排到它后面。只有 HTTP 调它（TUI 的 Enter，
-    /// `SubmitRunRequest::interject`）；聊天渠道照旧排队。
+    /// 请求模型之前并进去，而不是排到它后面。HTTP 调它（TUI 的 Enter，
+    /// `SubmitRunRequest::interject`，没有对端）；`task` 交回的结果也走它，带着任务 Run 的
+    /// 来源对端——对端与宿主不同就不并（§6）。聊天渠道的消息照旧排队。
     pub async fn submit_interjecting(
         self: &Arc<Self>,
         session: &SessionId,
         request_key: RequestKey,
         text: String,
+        peer: Option<ChannelPeer>,
         model: Option<ModelConfig>,
     ) -> Result<SubmitRunResponse, GatewayError> {
-        self.accept(session, request_key, text, None, model, None, true)
+        self.accept(session, request_key, text, peer, model, None, None, true)
             .await
     }
 
@@ -1261,8 +1307,17 @@ impl GatewayState {
             ));
         }
         let text = format!("!{command}");
-        self.accept(session, request_key, text, None, None, Some(command), false)
-            .await
+        self.accept(
+            session,
+            request_key,
+            text,
+            None,
+            None,
+            Some(command),
+            None,
+            false,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1274,6 +1329,7 @@ impl GatewayState {
         peer: Option<ChannelPeer>,
         model: Option<ModelConfig>,
         direct_command: Option<String>,
+        contract: Option<DelegateContract>,
         interject: bool,
     ) -> Result<SubmitRunResponse, GatewayError> {
         if let Some(state) = self.input_refusal(session).await? {
@@ -1308,6 +1364,7 @@ impl GatewayState {
             )));
         }
         frozen.direct_command = direct_command;
+        frozen.contract = contract;
         let accepted = self
             .routed
             .accept_input(AcceptInput {

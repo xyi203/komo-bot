@@ -1495,8 +1495,12 @@ async fn purging_a_session_with_unfinished_work_is_a_409_that_lists_the_blockers
 }
 
 // ---------------------------------------------------------------- 委派（§4）
+//
+// 同步委派 2026-10-16 删掉，生产目录里没有 `delegate`。这一组装上测试用的旧工具
+// （`legacy_delegate`），验的是升级前的委派调用照删之前的路径收尾。
 
 use crate::service::test_support::harness::{FakeLlm, call_round, text_round};
+use crate::service::test_support::legacy_delegate;
 
 /// 委派的脚本：父要一次委派 → 子代理一轮给出结果 → 父拿到结果之后收尾。
 fn delegation_script(task: &str, child_text: &str) -> Arc<FakeLlm> {
@@ -1533,6 +1537,7 @@ async fn a_delegated_task_becomes_a_child_run_and_its_result_reaches_the_parent(
     let llm = delegation_script(TASK, CHILD_TEXT);
 
     let home = Home::with_config(&home_config());
+    home.install_tools(vec![legacy_delegate()]);
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
@@ -1616,6 +1621,7 @@ async fn a_delegated_task_over_the_inline_limit_still_settles_the_parent_call() 
     let llm = delegation_script(&task, r#"{"files": 3}"#);
 
     let home = Home::with_config(&home_config());
+    home.install_tools(vec![legacy_delegate()]);
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
@@ -1777,6 +1783,7 @@ async fn a_child_gets_only_its_task_and_its_rounds_stay_out_of_the_parent() {
     let llm = delegation_script(TASK, r#"{"files": 3}"#);
 
     let home = Home::with_config(&home_config());
+    home.install_tools(vec![legacy_delegate()]);
     let gateway = home
         .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
         .await;
@@ -1926,15 +1933,23 @@ async fn cancelling_the_parent_cancels_its_child_run() {
     );
 }
 
-/// 注册用的工具名与工具自己报的名字必须一致——「两处各写一个字面量」迟早会漂。
-#[test]
-fn the_delegate_tool_name_matches_the_registry() {
-    use komo_kernel::traits::Tool;
+/// 注册用的工具名与工具自己报的名字必须一致——「两处各写一个字面量」迟早会漂。目录里
+/// 有 `task`，没有 2026-10-16 删掉的 `delegate` / `dispatch` / `follow`。
+#[tokio::test]
+async fn the_catalog_has_task_and_none_of_the_retired_names() {
+    use crate::service::test_support::harness::{Home, home_config};
 
-    assert_eq!(
-        komo_runtime::tools::DelegateTool::new().definition().name,
-        komo_agent::DELEGATE_TOOL
+    let home = Home::with_config(&home_config());
+    let gateway = home.start(FakeLlm::finisher("好。")).await;
+    let names = gateway.state().tool_names();
+    assert!(
+        names.iter().any(|name| name == komo_agent::TASK_TOOL),
+        "{names:?}"
     );
+    for retired in ["delegate", "dispatch", "follow"] {
+        assert!(!names.iter().any(|name| name == retired), "{names:?}");
+    }
+    gateway.stop().await;
 }
 
 // ---------------------------------------------------------------- TUI 的 `!`

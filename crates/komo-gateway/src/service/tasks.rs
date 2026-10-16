@@ -4,7 +4,8 @@
 //! 建任务复用已有原语，一步都不新造：`SessionId::new_at` → `session::ensure_owned`（写死
 //! `kind = Task`、`agent_id` = 派它的会话的 Agent）→ `ledgers.open`（落目录、`events.jsonl`）
 //! → `session::set_title_if_empty`（标题先写死，`accept_input` 的"首行当标题"规则才不会
-//! 盖掉它）→ `GatewayState::submit`（冻结身份、受理输入、挂看客）。
+//! 盖掉它）→ `GatewayState::submit_task`（冻结身份、受理输入、挂看客；`task` 给的模型与
+//! 结果契约随快照冻结）。
 //!
 //! **它自己需要一份 `Arc<GatewayState>`**（建会话、`submit` 都要），所以只能在那份状态
 //! 造出来**之后**才能接上——与 `Dispatcher` / `GatewayState::inbound` 同一个"先有整份
@@ -13,18 +14,21 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use komo_kernel::events::EventPayload;
 use komo_kernel::traits::{SpawnError, TaskSpawner};
 use komo_kernel::types::chat::ChannelPeer;
 use komo_kernel::types::chat::{DeliveryTarget, Outbound};
+use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::ids::{RequestKey, RunId, SessionId};
+use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::status::RunState;
-use komo_kernel::types::task::{self, FollowOutcome, TaskHandle, TaskSpec};
+use komo_kernel::types::task::{self, FollowOutcome, TaskHandle, TaskOptions, TaskSpec};
 use komo_store::models::SessionKind;
 use komo_store::repos::session;
 
 use super::state::GatewayState;
 
-/// 任务会话的 `origin`：`task:{parent_session}`。`follow` 的解析与收尾时"结果交回谁"
+/// 任务会话的 `origin`：`task:{parent_session}`。`task_id` 的解析与收尾时"结果交回谁"
 /// 都按它——任务属于哪个会话不需要新列。
 pub fn task_origin(parent: &SessionId) -> String {
     format!("task:{parent}")
@@ -87,6 +91,43 @@ impl GatewayTaskSpawner {
         let peer = run.peer.as_deref().and_then(ChannelPeer::parse);
         Ok((parent, peer))
     }
+
+    /// 任务 Run 用的模型（`docs/komo_bot.md` §4）：给了 alias 就按当前配置解析；没给就是
+    /// `inherited`（接着做时那个任务上一条 Run 的，新派时 `None` = 交给受理按 Agent 的默认）。
+    /// 给了 `effort` 就按选定的那个模型的档位校验（§13.3）——只给 `effort` 时 `prepare`
+    /// 不知道选定的是哪个模型，在这里校验。
+    fn task_model(
+        &self,
+        options: &TaskOptions,
+        inherited: Option<ModelConfig>,
+        agent_id: &str,
+    ) -> Result<Option<ModelConfig>, SpawnError> {
+        let config = self.state.snapshot();
+        let mut model = match &options.model {
+            Some(alias) => Some(config.model_catalog.completion(alias).cloned().ok_or_else(
+                || {
+                    let aliases = config
+                        .model_catalog
+                        .completions()
+                        .map(|(alias, _)| alias)
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    SpawnError::Failed(format!("model `{alias}` 不是可选的模型；可选值：{aliases}"))
+                },
+            )?),
+            None => inherited,
+        };
+        if let Some(effort) = &options.effort {
+            let mut chosen = model.unwrap_or_else(|| self.state.default_model_of(agent_id));
+            chosen.effort = Some(effort.clone());
+            self.state
+                .caps
+                .check(&chosen)
+                .map_err(|problem| SpawnError::Failed(format!("effort 立不住：{problem}")))?;
+            model = Some(chosen);
+        }
+        Ok(model)
+    }
 }
 
 #[async_trait]
@@ -109,6 +150,8 @@ impl TaskSpawner for GatewayTaskSpawner {
             .map_err(|error| {
                 SpawnError::Failed(format!("读不出派它的会话归哪个 Agent：{error}"))
             })?;
+        // 模型先解析：解析不出来就不该留下一个空的任务会话。
+        let model = self.task_model(&spec.options, None, &worker)?;
 
         // 会话行**写死**在受理任何输入之前：`kind = Task`、`agent_id` 与派它的会话相同；
         // 幂等——同一个 id 重放只会原样返回已有的那一行。
@@ -139,7 +182,14 @@ impl TaskSpawner for GatewayTaskSpawner {
 
         let response = self
             .state
-            .submit(&task_session, request_key, spec.task, origin_peer, None)
+            .submit_task(
+                &task_session,
+                request_key,
+                spec.task,
+                origin_peer,
+                model,
+                spec.options.contract,
+            )
             .await
             .map_err(|error| SpawnError::Failed(format!("提交第一条输入失败：{error}")))?;
 
@@ -156,6 +206,7 @@ impl TaskSpawner for GatewayTaskSpawner {
         request_key: RequestKey,
         task_id: &str,
         text: &str,
+        options: TaskOptions,
     ) -> Result<FollowOutcome, SpawnError> {
         let (parent, origin_peer) = self.parent_of(from).await?;
 
@@ -181,14 +232,26 @@ impl TaskSpawner for GatewayTaskSpawner {
         }
         let target = candidates.remove(0);
 
+        // 没给 model 就沿用这个任务上一条 Run 的（连同它的 effort）。
+        let inherited = match &options.model {
+            Some(_) => None,
+            None => komo_store::repos::runs::list_for_session(&self.state.db, &target.session)
+                .await
+                .map_err(|error| SpawnError::Failed(format!("读不出这个任务的 Run：{error}")))?
+                .pop()
+                .map(|record| record.model),
+        };
+        let model = self.task_model(&options, inherited, &target.agent_id)?;
+
         let response = self
             .state
-            .submit(
+            .submit_task(
                 &target.session,
                 request_key,
                 text.to_string(),
                 origin_peer,
-                None,
+                model,
+                options.contract,
             )
             .await
             .map_err(|error| SpawnError::Failed(format!("提交失败：{error}")))?;
@@ -215,6 +278,10 @@ pub enum TaskOutcome {
 /// 而不是只看得见一句"已派出"。请求键 `task-result:{run}` 让同一条 Run 的结果只交回
 /// 一次——看客与重启补挂各收尾一遍也只受理一条。
 ///
+/// 交回的输入带插话标记（§6）：派它的会话正在跑、而且是同一个对端时，在一轮收尾之后并进
+/// 那条 Run，不另开一条；不带模型 / effort，按派它的会话自己的默认。任务 Run 带着结果契约
+/// 时，用同一份校验器复验它的最后回复，结论写进交回的输入——不合契约也照样交回。
+///
 /// 返回 `false` = 这不是任务会话，调用方照常把结果投给来源。交回失败（派它的会话已经
 /// 删掉了、受理出错）时退回直接投给来源，结果不能因此丢掉。
 pub async fn report_to_parent(
@@ -240,14 +307,23 @@ pub async fn report_to_parent(
         TaskOutcome::Completed => "已完成",
         TaskOutcome::NotCompleted => "没有完成",
     };
+    let verdict = match (outcome, contract_of(state, task_session, run).await) {
+        (TaskOutcome::Completed, Some(contract)) => {
+            format!("{}\n\n", contract_verdict(&contract, text))
+        }
+        _ => String::new(),
+    };
     let input = format!(
-        "[后台任务 #{short}「{title}」{headline}]\n\n{text}\n\n\
+        "[后台任务 #{short}「{title}」{headline}]\n\n{text}\n\n{verdict}\
          （这是后台任务交回的结果，不是用户发来的消息；用户看不到上面这段，请把结论转告用户。）",
         short = task::short_id(task_session),
         title = record.title,
     );
     let key = RequestKey::new(format!("task-result:{run}"));
-    match state.submit(&parent, key, input, peer.cloned(), None).await {
+    match state
+        .submit_interjecting(&parent, key, input, peer.cloned(), None)
+        .await
+    {
         Ok(_) => true,
         Err(error) => {
             tracing::warn!(%error, %run, %parent, "后台任务的结果交不回派它的会话，直接投给来源");
@@ -269,6 +345,39 @@ pub async fn report_to_parent(
             }
             true
         }
+    }
+}
+
+/// 这条任务 Run 受理时冻结的结果契约（`run.accepted` 的快照，§4）。读不出来就当没有。
+async fn contract_of(
+    state: &GatewayState,
+    task_session: &SessionId,
+    run: &RunId,
+) -> Option<DelegateContract> {
+    let events = match super::compaction::read_events(state.routed.as_ref(), task_session).await {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::warn!(%error, %run, "读不出任务会话的日志，交回时不复验契约");
+            return None;
+        }
+    };
+    events.into_iter().find_map(|event| match event.payload {
+        EventPayload::RunAccepted(body) if event.run.as_ref() == Some(run) => {
+            body.snapshot.and_then(|snapshot| snapshot.contract)
+        }
+        _ => None,
+    })
+}
+
+/// 复验结论：与旧委派的父侧收尾同一份取 JSON + 校验（`executor::check_contract`）。
+fn contract_verdict(contract: &DelegateContract, text: &str) -> String {
+    match komo_runtime::executor::check_contract(contract, text) {
+        Ok((_, validation)) if validation.ignored.is_empty() => "（结果契约复验：符合。）".into(),
+        Ok((_, validation)) => format!(
+            "（结果契约复验：符合；这些关键字没有检查：{}。）",
+            validation.ignored.join("、")
+        ),
+        Err(report) => format!("（结果契约复验：不符合——{report}。）"),
     }
 }
 

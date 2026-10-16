@@ -11,6 +11,7 @@ fn input(instructions: Option<&str>, memory: Option<&str>) -> ContextInput<'stat
         instructions: instructions.map(str::to_string),
         project_files: Vec::new(),
         project_update: None,
+        contract: None,
         workspace: PathBuf::from("/tmp/w"),
         tools: vec!["read".into()],
         mcp_servers: Vec::new(),
@@ -81,4 +82,83 @@ fn no_memory_means_no_trailing_section() {
         "{}",
         context.system_prompt
     );
+}
+
+/// `task` 的结果契约补在这条 Run 的任务后面，系统提示一个字不变（前缀缓存不作废）。
+#[test]
+fn a_task_contract_trails_the_task_not_the_system_prompt() {
+    use komo_kernel::events::{Event, EventPayload, RunAccepted, RunStarted};
+    use komo_kernel::traits::Clock;
+    use komo_kernel::types::digest::ContentHash;
+    use komo_kernel::types::ids::{EventId, ExecutorId, RequestKey, RunId, Seq, SessionId};
+    use komo_kernel::types::plan::PlanSource;
+
+    let run = RunId::from_raw("run-1");
+    let event = |seq: u64, payload| Event {
+        v: 1,
+        seq: Seq(seq),
+        event_id: EventId::from_raw(format!("evt-{seq}")),
+        session: SessionId::from_raw("sess-1"),
+        run: Some(run.clone()),
+        ts: komo_kernel::test_support::TestClock::fixed().now(),
+        payload,
+    };
+    let events = vec![
+        event(
+            1,
+            EventPayload::RunAccepted(RunAccepted {
+                request_key: RequestKey::new("key-1"),
+                input_hash: ContentHash::of_str("查一下空调"),
+                text: Some("查一下空调".into()),
+                text_ref: None,
+                source: PlanSource::Interactive {
+                    session: SessionId::from_raw("sess-1"),
+                },
+                peer: None,
+                model: None,
+                effort: None,
+                delegate: None,
+                snapshot: None,
+                interject: false,
+            }),
+        ),
+        event(
+            2,
+            EventPayload::RunStarted(RunStarted {
+                executor: ExecutorId::from_raw("exec-1"),
+                generation: 1,
+            }),
+        ),
+    ];
+    let surface = komo_kernel::fold::fold(&events);
+    let history = || {
+        entries(&surface, ReplayScope::Conversation(&run))
+            .into_iter()
+            .map(|entry| ResolvedMessage {
+                text: entry.message.text.clone(),
+                outputs: Vec::new(),
+                entry,
+            })
+            .collect::<Vec<_>>()
+    };
+    let plain = assemble(ContextInput {
+        history: history(),
+        ..input(None, None)
+    });
+    let with_contract = assemble(ContextInput {
+        history: history(),
+        contract: Some(DelegateContract {
+            schema: serde_json::json!({ "type": "object", "required": ["on"] }),
+            mode: Default::default(),
+        }),
+        ..input(None, None)
+    });
+
+    assert_eq!(with_contract.system_prompt, plain.system_prompt);
+    let task = with_contract.messages[with_contract.run_from]
+        .text
+        .clone()
+        .unwrap_or_default();
+    assert!(task.starts_with("查一下空调\n\n（结果契约）"), "{task}");
+    assert!(task.contains("\"required\""), "{task}");
 }

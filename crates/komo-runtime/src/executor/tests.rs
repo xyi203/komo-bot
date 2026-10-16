@@ -993,6 +993,10 @@ async fn codemode_only_tools_stay_callable_but_out_of_the_schema() {
 
 /// 委派（§4、§8.4 的 `dependency`）：一次子任务怎么变成一条子 Run、父调用怎么收尾。
 ///
+/// 2026-10-16 同步委派删掉，`delegate` 工具已经不在目录里：这一组验的是**升级前落账的**
+/// 调用照删之前的路径收尾。调用都以"计划已落账、还没开始"的形状交给执行器
+/// （[`legacy_planned`]），续跑走首次那条路。
+///
 /// 这一组全部用 [`MemLedger`]，因为要断言的正是**账本里发生了什么**——子 Run 的受理事件、
 /// 父调用那条悬着的 `tool.started`、落回那次尝试的结果。折出来的视图与事件都查得到。
 mod delegation {
@@ -1006,7 +1010,49 @@ mod delegation {
     use komo_kernel::types::status::RunEnd;
     use serde_json::json;
 
-    use crate::tools::DelegateTool;
+    /// 升级前落账的一次 `delegate` 调用：计划照当时 `DelegateTool::prepare` 的样子写进账本
+    /// （`tool.planned`），交回执行器时是"确定没开始过"的形状——工具已经删掉，账上只剩它。
+    pub(super) async fn legacy_planned(
+        harness: &Harness,
+        run: &RunId,
+        request: CallRequest,
+    ) -> CallRequest {
+        let args = &request.arguments;
+        let mut spec = DelegateSpec::new(
+            run.clone(),
+            request.call.clone(),
+            args["task"].as_str().expect("task"),
+        );
+        if let Some(schema) = args.get("output_schema") {
+            let mode = args
+                .get("schema_mode")
+                .map(|mode| serde_json::from_value(mode.clone()).expect("schema_mode"))
+                .unwrap_or_default();
+            spec = spec.with_contract(schema.clone(), mode);
+        }
+        if let Some(target) = args.get("resume").and_then(|value| value.as_str()) {
+            spec = spec.with_resumes(RunId::from_raw(target));
+        }
+        let session = komo_kernel::types::ids::SessionId::from_raw("sess-1");
+        let plan = ExecutionPlan {
+            operation: Operation::Delegate { spec },
+            run: Some(run.clone()),
+            tool_call: Some(request.call.clone()),
+            args: args.clone(),
+            recovery: komo_kernel::types::plan::RecoveryMode::VerifyTarget,
+            ..komo_kernel::test_support::sample_plan("delegate", &session)
+        };
+        harness
+            .ledger
+            .plan_call(&request.call, &plan)
+            .await
+            .expect("落计划");
+        CallRequest {
+            plan: Some(plan),
+            resumed: Some(resumed_from(ToolCallState::Planned, None, 0)),
+            ..request
+        }
+    }
 
     /// 账本里落过盘的那份计划——续跑时调用方手里拿到的就是它（§8.4：重新 prepare 会
     /// 换一个哈希，就不是账本上那次调用了）。
@@ -1058,7 +1104,9 @@ mod delegation {
     ) -> (komo_kernel::types::ids::SessionId, RunId, CallRequest) {
         let (session, run) = harness.open_run().await;
         let calls = harness.record_round(&run, &[("delegate", args)]).await;
-        (session, run, calls.into_iter().next().expect("一个调用"))
+        let request = calls.into_iter().next().expect("一个调用");
+        let request = legacy_planned(harness, &run, request).await;
+        (session, run, request)
     }
 
     /// 在**指定 Session 里一条新的 Run**上发起一次委派（§4「同一 Session 里后面的任何
@@ -1120,6 +1168,7 @@ mod delegation {
             .record_round(&run, round)
             .await
             .expect("记录回合");
+        let request = legacy_planned(harness, &run, request).await;
         (run, request)
     }
 
@@ -1152,7 +1201,7 @@ mod delegation {
     #[tokio::test]
     async fn a_delegated_task_becomes_a_child_run_and_the_call_waits() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) = delegate_round(
             &harness,
             json!({
@@ -1209,7 +1258,7 @@ mod delegation {
     #[tokio::test]
     async fn a_completed_child_settles_the_call_with_its_result() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) = delegate_round(
             &harness,
             json!({
@@ -1282,7 +1331,7 @@ mod delegation {
     async fn an_off_contract_result_is_marked_in_permissive_and_fails_in_strict() {
         for mode in [SchemaMode::Permissive, SchemaMode::Strict] {
             let harness = Harness::new();
-            let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+            let executor = harness.executor(vec![]);
             let (session, run, request) = delegate_round(
                 &harness,
                 json!({
@@ -1373,7 +1422,7 @@ mod delegation {
 
         for (end, kind) in endings {
             let harness = Harness::new();
-            let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+            let executor = harness.executor(vec![]);
             let (session, run, request) =
                 delegate_round(&harness, json!({ "task": "跑一遍检查" })).await;
             let env = harness.env(&session, &run);
@@ -1416,7 +1465,7 @@ mod delegation {
         }
         // 子 Run 失败的原因要能读到（这里只看最后一条：三条路径共用同一段折算）。
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "干活" })).await;
         let env = harness.env(&session, &run);
         let outcome = executor
@@ -1453,7 +1502,7 @@ mod delegation {
     #[tokio::test]
     async fn a_child_that_is_still_running_keeps_the_call_waiting() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "干活" })).await;
         let env = harness.env(&session, &run);
         let outcome = executor
@@ -1485,7 +1534,7 @@ mod delegation {
     #[tokio::test]
     async fn accepting_the_same_delegation_twice_reuses_the_child_run() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) =
             delegate_round(&harness, json!({ "task": "跑一遍检查" })).await;
         let env = harness.env(&session, &run);
@@ -1525,9 +1574,9 @@ mod delegation {
             Operation::ReadFile,
             Arc::new(Mutex::new(Vec::new())),
         ));
-        let executor = harness.executor(vec![probe, Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![probe]);
         let (session, run) = harness.open_run().await;
-        let calls = harness
+        let mut calls = harness
             .record_round(
                 &run,
                 &[
@@ -1536,6 +1585,8 @@ mod delegation {
                 ],
             )
             .await;
+        let delegate = calls.pop().expect("委派那一条");
+        calls.push(legacy_planned(&harness, &run, delegate).await);
 
         let outcome = executor
             .execute_round(calls, &harness.env(&session, &run))
@@ -1571,7 +1622,7 @@ mod delegation {
     #[tokio::test]
     async fn a_child_run_cannot_delegate_again() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         // 这条 Run 是被派的——`delegated` 说得出它是谁派出来的。
         let (session, run, request) =
             delegate_round(&harness, json!({ "task": "再派一层出去" })).await;
@@ -1605,7 +1656,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_completed_child_spawns_a_new_child_that_points_back_to_it() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let env = harness.env(&session, &run);
         let outcome = executor
@@ -1700,7 +1751,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_run_from_another_session_is_refused_with_a_ledger_result() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let other_session = komo_kernel::types::ids::SessionId::from_raw("sess-别处");
         let elsewhere = harness
             .ledger
@@ -1754,7 +1805,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_main_conversation_run_is_refused() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (main_session, main_run) = harness.open_run().await;
 
         let (session, run, request) = delegate_round(
@@ -1781,7 +1832,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_run_that_has_not_finished_is_refused() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let outcome = executor
             .execute_round(vec![request], &harness.env(&session, &run))
@@ -1823,7 +1874,7 @@ mod delegation {
             },
         ] {
             let harness = Harness::new();
-            let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+            let executor = harness.executor(vec![]);
             let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
             let outcome = executor
                 .execute_round(vec![request], &harness.env(&session, &run))
@@ -1856,7 +1907,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_a_run_before_the_latest_boundary_is_refused() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let outcome = executor
             .execute_round(vec![request], &harness.env(&session, &run))
@@ -1901,7 +1952,7 @@ mod delegation {
     #[tokio::test]
     async fn resuming_the_same_child_twice_is_refused_naming_the_tail() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let outcome = executor
             .execute_round(vec![request], &harness.env(&session, &run))
@@ -1966,7 +2017,7 @@ mod delegation {
     #[tokio::test]
     async fn a_resumed_child_cannot_delegate_again() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+        let executor = harness.executor(vec![]);
         let (session, run, request) = delegate_round(&harness, json!({ "task": "查 A" })).await;
         let outcome = executor
             .execute_round(vec![request], &harness.env(&session, &run))
@@ -2010,12 +2061,14 @@ mod delegation {
 
         // 续跑出来的子 Run 自己发起一次 delegate：能力面上它已经没有这个名字，这里验的是
         // 编排里的第二道（有人把含 `delegate` 的能力面塞给了它）。
-        let inner_request = harness
+        let mut inner_request = harness
             .record_round(
                 &resumed_child,
                 &[("delegate", json!({ "task": "再派一层" }))],
             )
             .await;
+        let inner = inner_request.pop().expect("一个调用");
+        inner_request.push(legacy_planned(&harness, &resumed_child, inner).await);
         let child_env = harness.child_env(&session, &resumed_child, spec);
         let outcome = executor
             .execute_round(inner_request, &child_env)
@@ -2687,12 +2740,12 @@ async fn a_resumed_read_that_never_ran_still_runs_beside_its_siblings() {
     );
 }
 
-/// `dispatch` / `follow`：`docs/background-tasks.md` 的验收。
+/// `task`：`docs/background-tasks.md` 的验收（2026-10-16 之前是 `dispatch` / `follow`）。
 ///
 /// 与 `delegation` 那一组不同，这里不需要真的在账本里建一条子 Run——`TaskSpawner`
 /// 把"建会话、提交输入"整个封在接缝后面，测试只关心 executor 这一侧的编排：放行之后
 /// 立刻调它、立刻收尾（不是 `RoundStop::Dependency`），以及幂等重放不重复派任务。
-mod dispatch_and_follow {
+mod task {
     use super::*;
 
     use std::collections::{HashMap, HashSet};
@@ -2700,9 +2753,14 @@ mod dispatch_and_follow {
 
     use komo_kernel::traits::{SpawnError, TaskSpawner};
     use komo_kernel::types::ids::{RequestKey, RunId};
-    use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskSpec};
+    use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskOptions, TaskSpec};
 
-    use crate::tools::{DispatchTool, FollowTool};
+    use crate::config::testing::Fixture;
+    use crate::tools::TaskTool;
+
+    pub(super) fn task_tool() -> Arc<TaskTool> {
+        Arc::new(TaskTool::new(Arc::new(Fixture::valid().holder())))
+    }
 
     /// 一份记账的假 `TaskSpawner`：`spawn` 按 `request_key` 幂等（同一个键第二次拿回
     /// 同一个任务句柄，不建"第二个"），`follow` 对配置过的"未知短号"答
@@ -2711,7 +2769,7 @@ mod dispatch_and_follow {
     struct FakeSpawnerState {
         spawn_calls: Vec<(RunId, RequestKey, TaskSpec)>,
         sessions_by_key: HashMap<RequestKey, TaskHandle>,
-        follow_calls: Vec<(RunId, RequestKey, String, String)>,
+        follow_calls: Vec<(RunId, RequestKey, String, String, TaskOptions)>,
         unknown: HashSet<String>,
         queued_behind: HashSet<String>,
     }
@@ -2766,6 +2824,14 @@ mod dispatch_and_follow {
         fn follow_calls(&self) -> usize {
             self.state.lock().expect("假分发器").follow_calls.len()
         }
+
+        fn spawned(&self) -> Vec<(RunId, RequestKey, TaskSpec)> {
+            self.state.lock().expect("假分发器").spawn_calls.clone()
+        }
+
+        fn followed(&self) -> Vec<(RunId, RequestKey, String, String, TaskOptions)> {
+            self.state.lock().expect("假分发器").follow_calls.clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -2799,6 +2865,7 @@ mod dispatch_and_follow {
             request_key: RequestKey,
             task_id: &str,
             text: &str,
+            options: TaskOptions,
         ) -> Result<FollowOutcome, SpawnError> {
             let mut state = self.state.lock().expect("假分发器");
             state.follow_calls.push((
@@ -2806,6 +2873,7 @@ mod dispatch_and_follow {
                 request_key.clone(),
                 task_id.to_string(),
                 text.to_string(),
+                options,
             ));
             if state.unknown.contains(task_id) {
                 return Err(SpawnError::UnknownTask(format!(
@@ -2820,8 +2888,7 @@ mod dispatch_and_follow {
         }
     }
 
-    /// 一条父 Run + 一次调用，策略是 §7.1 的初始建议表——dispatch / follow 在它之下也是
-    /// Allow（新增两行），不需要额外放宽。
+    /// 一条父 Run + 一次调用。
     async fn round(
         harness: &Harness,
         tool: &str,
@@ -2832,19 +2899,24 @@ mod dispatch_and_follow {
         (session, run, calls.into_iter().next().expect("一个调用"))
     }
 
-    /// ① dispatch 一放行就立刻收尾：不是 `RoundStop::Dependency`，结果里带着短号与标题。
+    /// ① 新派一放行就立刻收尾：不是 `RoundStop::Dependency`，结果里带着短号与标题；
+    /// model / effort / contract 原样交给 spawner，请求键是 `task:{run}:{call}`。
     #[tokio::test]
-    async fn dispatch_settles_immediately_with_the_returned_short_id() {
+    async fn a_new_task_settles_immediately_with_the_returned_short_id() {
         let harness = Harness::new();
         let fake = FakeSpawner::new();
-        let executor = harness.executor_with_spawner(
-            vec![Arc::new(DispatchTool::new())],
-            fake.clone() as Arc<dyn TaskSpawner>,
-        );
+        let executor =
+            harness.executor_with_spawner(vec![task_tool()], fake.clone() as Arc<dyn TaskSpawner>);
         let (session, run, request) = round(
             &harness,
-            "dispatch",
-            serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+            "task",
+            serde_json::json!({
+                "prompt": "查一下空调状态",
+                "title": "查空调",
+                "model": "chat",
+                "effort": "low",
+                "contract": { "type": "object" }
+            }),
         )
         .await;
 
@@ -2855,7 +2927,7 @@ mod dispatch_and_follow {
 
         assert!(
             outcome.stop.is_none(),
-            "dispatch 不等任务跑完，不该停在任何等待上：{:?}",
+            "task 不等任务跑完，不该停在任何等待上：{:?}",
             outcome.stop
         );
         assert_eq!(outcome.results.len(), 1);
@@ -2865,29 +2937,75 @@ mod dispatch_and_follow {
             "{}",
             outcome.results[0].content
         );
-        assert_eq!(fake.spawn_calls(), 1);
+        let spawned = fake.spawned();
+        assert_eq!(spawned.len(), 1);
+        let (_, key, spec) = &spawned[0];
+        assert_eq!(key.as_str(), format!("task:{run}:{}", request.call));
+        assert_eq!(spec.task, "查一下空调状态");
+        assert_eq!(spec.options.model.as_deref(), Some("chat"));
+        assert_eq!(
+            spec.options.effort.as_ref().map(|effort| effort.as_str()),
+            Some("low")
+        );
+        assert!(spec.options.contract.is_some());
+    }
+
+    /// 同一轮派几个就是几个：各自一个请求键、各自一个任务会话（§14 `task` 验收 ②）。
+    #[tokio::test]
+    async fn three_tasks_in_one_round_are_three_task_sessions() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new();
+        let executor =
+            harness.executor_with_spawner(vec![task_tool()], fake.clone() as Arc<dyn TaskSpawner>);
+        let (session, run) = harness.open_run().await;
+        let calls = harness
+            .record_round(
+                &run,
+                &[
+                    (
+                        "task",
+                        serde_json::json!({ "prompt": "查 A", "title": "A" }),
+                    ),
+                    (
+                        "task",
+                        serde_json::json!({ "prompt": "查 B", "title": "B" }),
+                    ),
+                    (
+                        "task",
+                        serde_json::json!({ "prompt": "查 C", "title": "C" }),
+                    ),
+                ],
+            )
+            .await;
+
+        let outcome = executor
+            .execute_round(calls, &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 3);
+        assert_eq!(fake.distinct_sessions(), 3);
     }
 
     /// ② 幂等：上一世已经 `start_call` 过（崩在"派出去"与"写结果"之间）的续跑，不重新
     /// 放行、不重新 `start_call`，直接把结果落回那次尝试——`spawner.spawn` 本身按
     /// `request_key` 幂等，即便两次收到同一个键也只认得出一个任务会话。
     #[tokio::test]
-    async fn a_replayed_dispatch_call_does_not_spawn_twice() {
+    async fn a_replayed_task_call_does_not_spawn_twice() {
         let harness = Harness::new();
         let fake = FakeSpawner::new();
-        let tool = DispatchTool::new();
-        let executor = harness.executor_with_spawner(
-            vec![Arc::new(DispatchTool::new())],
-            fake.clone() as Arc<dyn TaskSpawner>,
-        );
+        let tool = task_tool();
+        let executor =
+            harness.executor_with_spawner(vec![tool.clone()], fake.clone() as Arc<dyn TaskSpawner>);
         let (session, run, request) = round(
             &harness,
-            "dispatch",
-            serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+            "task",
+            serde_json::json!({ "prompt": "查一下空调状态", "title": "查空调" }),
         )
         .await;
         let env = harness.env(&session, &run);
-        let plan = plan_of(&tool, &harness, &session, &run, &request).await;
+        let plan = plan_of(&*tool, &harness, &session, &run, &request).await;
         let attempt = harness.crashed_attempt(&request.call, &plan).await;
 
         let resumed = {
@@ -2922,19 +3040,17 @@ mod dispatch_and_follow {
         );
     }
 
-    /// ③ follow 解析不到短号：干净失败，不是"结果不明"，也不悬着。
+    /// ③ 接着做解析不到短号：干净失败，不是"结果不明"，也不悬着。
     #[tokio::test]
-    async fn follow_with_an_unknown_task_id_fails_cleanly() {
+    async fn following_up_an_unknown_task_id_fails_cleanly() {
         let harness = Harness::new();
         let fake = FakeSpawner::new().with_unknown("dead");
-        let executor = harness.executor_with_spawner(
-            vec![Arc::new(FollowTool::new())],
-            fake.clone() as Arc<dyn TaskSpawner>,
-        );
+        let executor =
+            harness.executor_with_spawner(vec![task_tool()], fake.clone() as Arc<dyn TaskSpawner>);
         let (session, run, request) = round(
             &harness,
-            "follow",
-            serde_json::json!({ "task_id": "dead", "text": "再看看" }),
+            "task",
+            serde_json::json!({ "task_id": "dead", "prompt": "再看看" }),
         )
         .await;
 
@@ -2954,24 +3070,23 @@ mod dispatch_and_follow {
         assert_eq!(fake.follow_calls(), 1, "解析只问了一次，没有悄悄重试");
     }
 
-    /// ④ follow 命中一个正在跑的任务：措辞改成"排在后面"，不是"已转给"。
+    /// ④ 接着做命中一个正在跑的任务：措辞改成"排在后面"，不是"已转给"。没给 model 就不带
+    /// （沿用那个任务上一条 Run 的，由 spawner 去读）。
     #[tokio::test]
-    async fn follow_into_a_busy_task_says_it_is_queued_behind() {
+    async fn following_up_a_busy_task_says_it_is_queued_behind() {
         let harness = Harness::new();
         let fake = FakeSpawner::new().with_queued_behind("3f2a");
-        let executor = harness.executor_with_spawner(
-            vec![Arc::new(FollowTool::new())],
-            fake.clone() as Arc<dyn TaskSpawner>,
-        );
+        let executor =
+            harness.executor_with_spawner(vec![task_tool()], fake.clone() as Arc<dyn TaskSpawner>);
         let (session, run, request) = round(
             &harness,
-            "follow",
-            serde_json::json!({ "task_id": "3f2a", "text": "再看看" }),
+            "task",
+            serde_json::json!({ "task_id": "#3f2a", "prompt": "再看看" }),
         )
         .await;
 
         let outcome = executor
-            .execute_round(vec![request], &harness.env(&session, &run))
+            .execute_round(vec![request.clone()], &harness.env(&session, &run))
             .await
             .unwrap();
 
@@ -2981,20 +3096,86 @@ mod dispatch_and_follow {
             "{}",
             outcome.results[0].content
         );
+        let followed = fake.followed();
+        let (_, key, task_id, text, options) = &followed[0];
+        assert_eq!(key.as_str(), format!("task:{run}:{}", request.call));
+        assert_eq!((task_id.as_str(), text.as_str()), ("3f2a", "再看看"));
+        assert_eq!(options, &TaskOptions::default());
+    }
+
+    /// 升级前落账的 `dispatch` / `follow`：工具已经不在目录里，started 而没有结果的那次照样
+    /// 按请求键幂等收尾，键沿用它们自己的前缀（§8.6），不是"工具名没了"的中断。
+    #[tokio::test]
+    async fn a_legacy_dispatch_or_follow_settles_through_the_spawner_by_its_old_key() {
+        for (tool, operation, prefix) in [
+            (
+                "dispatch",
+                Operation::Dispatch {
+                    task: "查一下空调状态".into(),
+                    title: "查空调".into(),
+                },
+                "dispatch",
+            ),
+            (
+                "follow",
+                Operation::Follow {
+                    task_id: "3f2a".into(),
+                    text: "再看看".into(),
+                },
+                "follow",
+            ),
+        ] {
+            let harness = Harness::new();
+            let fake = FakeSpawner::new();
+            let executor =
+                harness.executor_with_spawner(vec![], fake.clone() as Arc<dyn TaskSpawner>);
+            let (session, run, mut request) = round(&harness, tool, serde_json::json!({})).await;
+            let plan = ExecutionPlan {
+                operation,
+                run: Some(run.clone()),
+                tool_call: Some(request.call.clone()),
+                recovery: RecoveryMode::VerifyTarget,
+                ..komo_kernel::test_support::sample_plan(tool, &session)
+            };
+            let attempt = harness.crashed_attempt(&request.call, &plan).await;
+            request.plan = Some(plan);
+            request.resumed = Some(resumed_from(ToolCallState::Started, Some(attempt), 1));
+
+            let outcome = executor
+                .execute_round(vec![request.clone()], &harness.env(&session, &run))
+                .await
+                .unwrap();
+
+            assert!(outcome.stop.is_none(), "{tool}：{:?}", outcome.stop);
+            assert!(
+                !outcome.results[0].is_error,
+                "{tool}：{:?}",
+                outcome.results[0]
+            );
+            let expected = format!("{prefix}:{run}:{}", request.call);
+            let keys: Vec<String> = fake
+                .spawned()
+                .into_iter()
+                .map(|(_, key, _)| key.as_str().to_string())
+                .chain(
+                    fake.followed()
+                        .into_iter()
+                        .map(|(_, key, ..)| key.as_str().to_string()),
+                )
+                .collect();
+            assert_eq!(keys, [expected], "{tool}");
+        }
     }
 
     /// ⑤ 没有装配 `TaskSpawner` 时两个操作都干净失败（不悬着），不是一个悬空的调用。
     #[tokio::test]
-    async fn without_a_spawner_dispatch_and_follow_fail_cleanly() {
+    async fn without_a_spawner_task_fails_cleanly() {
         let harness = Harness::new();
-        let executor = harness.executor(vec![
-            Arc::new(DispatchTool::new()),
-            Arc::new(FollowTool::new()),
-        ]);
+        let executor = harness.executor(vec![task_tool()]);
         let (session, run, request) = round(
             &harness,
-            "dispatch",
-            serde_json::json!({ "task": "干活", "title": "标题" }),
+            "task",
+            serde_json::json!({ "prompt": "干活", "title": "标题" }),
         )
         .await;
 
@@ -3019,17 +3200,17 @@ mod dispatch_and_follow {
             &komo_kernel::types::ids::RunId::from_raw("run-1"),
             &ToolCallId::from_raw("call-1"),
         );
-        let tool = DispatchTool::new();
+        let tool = task_tool();
         let a = tool
             .prepare(
-                serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+                serde_json::json!({ "prompt": "查一下空调状态", "title": "查空调" }),
                 &ctx,
             )
             .await
             .unwrap();
         let b = tool
             .prepare(
-                serde_json::json!({ "task": "查一下热水器状态", "title": "查空调" }),
+                serde_json::json!({ "prompt": "查一下热水器状态", "title": "查空调" }),
                 &ctx,
             )
             .await
@@ -3037,11 +3218,11 @@ mod dispatch_and_follow {
         assert_ne!(a.plan_hash(), b.plan_hash());
     }
 
-    /// ⑦ 前面在飞的读停下来（这里是取消），排在它后面的 dispatch 就是"还没轮到"：交回
+    /// ⑦ 前面在飞的读停下来（这里是取消），排在它后面的 task 就是"还没轮到"：交回
     /// `remaining` 的它不能已经派出去、也不能已经 `start_call` 过——否则续跑时交回来的是
     /// 一条已经有结果的调用，而它的结果这一轮也没交给模型。
     #[tokio::test]
-    async fn a_dispatch_behind_a_stopping_read_is_not_sent() {
+    async fn a_task_behind_a_stopping_read_is_not_sent() {
         let harness = Harness::new();
         let fake = FakeSpawner::new();
         let cancel = CancelToken::new();
@@ -3054,7 +3235,7 @@ mod dispatch_and_follow {
             .with_cancel(cancel.clone()),
         );
         let executor = harness.executor_with_spawner(
-            vec![reader, Arc::new(DispatchTool::new())],
+            vec![reader, task_tool()],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
         let (session, run) = harness.open_run().await;
@@ -3067,8 +3248,8 @@ mod dispatch_and_follow {
                         serde_json::json!({ "path": "a.txt", "delay_ms": 50 }),
                     ),
                     (
-                        "dispatch",
-                        serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+                        "task",
+                        serde_json::json!({ "prompt": "查一下空调状态", "title": "查空调" }),
                     ),
                 ],
             )
@@ -3086,7 +3267,7 @@ mod dispatch_and_follow {
         );
         let remaining: Vec<&ToolCallId> = outcome.remaining.iter().map(|r| &r.call).collect();
         assert_eq!(remaining, [&ToolCallId::from_raw("call-1")]);
-        assert_eq!(fake.spawn_calls(), 0, "还没轮到的 dispatch 已经派出去了");
+        assert_eq!(fake.spawn_calls(), 0, "还没轮到的 task 已经派出去了");
         let started = harness.ledger.events().iter().any(|event| {
             matches!(
                 &event.payload,
@@ -3094,12 +3275,12 @@ mod dispatch_and_follow {
                     if body.call_id == ToolCallId::from_raw("call-1")
             )
         });
-        assert!(!started, "还没轮到的 dispatch 已经 start_call 过");
+        assert!(!started, "还没轮到的 task 已经 start_call 过");
     }
 
-    /// ⑧ dispatch 是屏障：前面在飞的读先收尾它才派出去，后面的读等它收完才开始（§6）。
+    /// ⑧ task 是屏障：前面在飞的读先收尾它才派出去，后面的读等它收完才开始（§6）。
     #[tokio::test]
-    async fn dispatch_is_a_barrier() {
+    async fn task_is_a_barrier() {
         let harness = Harness::new();
         let fake = FakeSpawner::new();
         let probe = Arc::new(Probe::new(
@@ -3108,7 +3289,7 @@ mod dispatch_and_follow {
             Arc::new(Mutex::new(Vec::new())),
         ));
         let executor = harness.executor_with_spawner(
-            vec![probe.clone(), Arc::new(DispatchTool::new())],
+            vec![probe.clone(), task_tool()],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
         let (session, run) = harness.open_run().await;
@@ -3121,8 +3302,8 @@ mod dispatch_and_follow {
                         serde_json::json!({ "path": "a.txt", "delay_ms": 40 }),
                     ),
                     (
-                        "dispatch",
-                        serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+                        "task",
+                        serde_json::json!({ "prompt": "查一下空调状态", "title": "查空调" }),
                     ),
                     read_call("b.txt"),
                 ],
@@ -3139,11 +3320,11 @@ mod dispatch_and_follow {
         assert_eq!(fake.spawn_calls(), 1);
         assert!(
             seq_of(&harness, "call-0", "result") < seq_of(&harness, "call-1", "started"),
-            "前面的读还没收尾，dispatch 就派出去了"
+            "前面的读还没收尾，task 就派出去了"
         );
         assert!(
             seq_of(&harness, "call-1", "result") < seq_of(&harness, "call-2", "started"),
-            "dispatch 还没收尾，后面的读就开始了"
+            "task 还没收尾，后面的读就开始了"
         );
         assert_eq!(
             probe.log(),
@@ -3156,9 +3337,9 @@ mod dispatch_and_follow {
         );
     }
 
-    /// ⑨ follow 同样是屏障。
+    /// ⑨ 接着做同样是屏障。
     #[tokio::test]
-    async fn follow_is_a_barrier() {
+    async fn following_up_is_a_barrier() {
         let harness = Harness::new();
         let fake = FakeSpawner::new();
         let probe = Arc::new(Probe::new(
@@ -3167,7 +3348,7 @@ mod dispatch_and_follow {
             Arc::new(Mutex::new(Vec::new())),
         ));
         let executor = harness.executor_with_spawner(
-            vec![probe.clone(), Arc::new(FollowTool::new())],
+            vec![probe.clone(), task_tool()],
             fake.clone() as Arc<dyn TaskSpawner>,
         );
         let (session, run) = harness.open_run().await;
@@ -3180,8 +3361,8 @@ mod dispatch_and_follow {
                         serde_json::json!({ "path": "a.txt", "delay_ms": 40 }),
                     ),
                     (
-                        "follow",
-                        serde_json::json!({ "task_id": "3f2a", "text": "再看看" }),
+                        "task",
+                        serde_json::json!({ "task_id": "3f2a", "prompt": "再看看" }),
                     ),
                     read_call("b.txt"),
                 ],
@@ -3198,11 +3379,11 @@ mod dispatch_and_follow {
         assert_eq!(fake.follow_calls(), 1);
         assert!(
             seq_of(&harness, "call-0", "result") < seq_of(&harness, "call-1", "started"),
-            "前面的读还没收尾，follow 就转出去了"
+            "前面的读还没收尾，接着做就转出去了"
         );
         assert!(
             seq_of(&harness, "call-1", "result") < seq_of(&harness, "call-2", "started"),
-            "follow 还没收尾，后面的读就开始了"
+            "接着做还没收尾，后面的读就开始了"
         );
         assert_eq!(
             probe.log(),
@@ -3227,9 +3408,8 @@ mod one_projection {
     use komo_kernel::types::status::RunEnd;
     use komo_kernel::types::turn::ToolResultForModel;
 
-    use super::delegation::{attempt_of, resumed_request};
-    use super::dispatch_and_follow::FakeSpawner;
-    use crate::tools::{DelegateTool, DispatchTool, FollowTool};
+    use super::delegation::{attempt_of, legacy_planned, resumed_request};
+    use super::task::{FakeSpawner, task_tool};
 
     /// 回放那一侧拿得到的全部东西：`fold` 出来的那条结果与那次调用，加上 `output.json`
     /// 里的正文与产物——与 `komo-agent` 的 `to_replay_messages` 读的是同几格。
@@ -3325,22 +3505,22 @@ mod one_projection {
             assert_one_projection(&harness, path, &outcome.results[0]).await;
         }
 
-        // dispatch 放行即收尾；follow 转不过去也是一条落了盘的失败。
+        // task 放行即收尾；接着做转不过去也是一条落了盘的失败。
         for (path, tool, args) in [
             (
-                "dispatch",
-                "dispatch",
-                serde_json::json!({ "task": "查一下空调状态", "title": "查空调" }),
+                "task",
+                "task",
+                serde_json::json!({ "prompt": "查一下空调状态", "title": "查空调" }),
             ),
             (
-                "follow 失败",
-                "follow",
-                serde_json::json!({ "task_id": "beef", "text": "再看一眼" }),
+                "接着做失败",
+                "task",
+                serde_json::json!({ "task_id": "beef", "prompt": "再看一眼" }),
             ),
         ] {
             let harness = Harness::new();
             let executor = harness.executor_with_spawner(
-                vec![Arc::new(DispatchTool::new()), Arc::new(FollowTool::new())],
+                vec![task_tool()],
                 FakeSpawner::new().with_unknown("beef") as Arc<dyn TaskSpawner>,
             );
             let (session, run, request) = round(&harness, tool, args).await;
@@ -3355,13 +3535,14 @@ mod one_projection {
         // 子 Run 的终态回到父侧那次调用上。
         {
             let harness = Harness::new();
-            let executor = harness.executor(vec![Arc::new(DelegateTool::new())]);
+            let executor = harness.executor(vec![]);
             let (session, run, request) = round(
                 &harness,
                 "delegate",
                 serde_json::json!({ "task": "数一下 /tmp 下有几个文件" }),
             )
             .await;
+            let request = legacy_planned(&harness, &run, request).await;
             let env = harness.env(&session, &run);
             let waiting = executor
                 .execute_round(vec![request.clone()], &env)

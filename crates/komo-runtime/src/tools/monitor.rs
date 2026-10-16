@@ -1,7 +1,7 @@
 //! `monitor` / `monitor_stop`：挂一个长时间跑的脚本，它往 stdout 每打一行，就作为一条
 //! 内部输入交回这个会话（`docs/monitor.md`）。
 //!
-//! 与 [`super::dispatch`] 同一类编排操作：工具只做 `prepare`，起进程、逐行交回都在
+//! 与 [`super::task`] 同一类编排操作：工具只做 `prepare`，起进程、逐行交回都在
 //! Gateway 的 `Monitors` 实现里——进程要活得比这次调用、这条 Run 都久，工具与执行器都
 //! 拿不住它。`monitor` 提交成功就收尾，不等脚本跑完。
 

@@ -147,13 +147,13 @@ pub enum DeliverError {
     Other(String),
 }
 
-/// [`TaskSpawner`] 的失败：`dispatch` / `follow` 拿不到一个能交给模型的结论。
+/// [`TaskSpawner`] 的失败：`task` 拿不到一个能交给模型的结论。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum SpawnError {
     /// 建任务会话或提交第一条输入没做成（store / 账本错误）。
     #[error("{0}")]
     Failed(String),
-    /// `follow` 的短号解析不到——不是这个会话派出去的任务，或者根本没有这个短号。
+    /// `task_id` 的短号解析不到——不是这个会话派出去的任务，或者根本没有这个短号。
     #[error("{0}")]
     UnknownTask(String),
     /// 短号在候选里不唯一：正文列出候选（延长到 6 位，§4.3）。
@@ -676,26 +676,25 @@ pub enum MonitorError {
 
 // ---------------------------------------------------------------- 任务分发
 
-/// `dispatch` / `follow` 的接缝（`docs/background-tasks.md`）：把一个自包含任务派
-/// 进一条**独立的任务会话**，或者往已有的任务会话里再提交一句。
+/// `task` 的接缝（`docs/background-tasks.md`）：把一个自包含任务派进一条**独立的任务
+/// 会话**，或者往已有的任务会话里再提交一句。旧计划里的 `dispatch` / `follow` 走同两个方法。
 ///
 /// 工具只有 [`crate::types::tool::ToolContext`]，没有 Ledger 也没有 Gateway 句柄，
-/// `komo-runtime` 不依赖 Gateway——所以这条缝和 `delegate` 一样走**编排操作**
-/// （`Operation::Dispatch` / `Operation::Follow`）：executor 在放行之后调它，立即以
-/// 普通工具结果收尾，不等任务跑完（不返回 `RoundStop::Dependency`，与 `delegate` 的
-/// 最大差别）。
+/// `komo-runtime` 不依赖 Gateway——所以这条缝走**编排操作**（`Operation::Task`）：executor
+/// 在放行之后调它，立即以普通工具结果收尾，不等任务跑完（不返回 `RoundStop::Dependency`）。
 ///
 /// 生产实现是 Gateway 的 `GatewayTaskSpawner`（建会话、`GatewayState::submit`）；没有
-/// 装配它时（`ToolExecutor` 的这个槽是空的）两个操作按"这台 Gateway 没有接任务分发"
-/// 干净失败，不是一个悬着的调用。
+/// 装配它时（`ToolExecutor` 的这个槽是空的）按"这台 Gateway 没有接任务分发"干净失败，
+/// 不是一个悬着的调用。
 #[async_trait]
 pub trait TaskSpawner: Send + Sync {
     /// 建一个任务会话并提交第一条输入。任务收尾时结果交回**派它的那个会话**，由那边
     /// 转告来源渠道（`from` 的 `runs.peer`）。
     ///
-    /// `request_key` 由调用方按 `dispatch:{run}:{call}` 拼好（§4.2 的幂等）：同一次
-    /// 调用重放时，它落到 [`crate::types::turn::AcceptInput::request_key`] 上，
-    /// 账本按请求键去重，所以重放拿回的是**同一个**任务会话，不会多建一个。
+    /// `request_key` 由调用方按 `task:{run}:{call}`（旧计划 `dispatch:{run}:{call}`）拼好
+    /// （§4.2 的幂等）：同一次调用重放时，它落到
+    /// [`crate::types::turn::AcceptInput::request_key`] 上，账本按请求键去重，所以重放拿回
+    /// 的是**同一个**任务会话，不会多建一个。
     async fn spawn(
         &self,
         from: &crate::types::ids::RunId,
@@ -704,13 +703,15 @@ pub trait TaskSpawner: Send + Sync {
     ) -> Result<crate::types::task::TaskHandle, SpawnError>;
 
     /// 往一个已有的任务会话里再提交一条输入。`task_id` 是任务短号（模型给的原文，
-    /// 解析在实现里做——只有 Gateway 查得到"这个会话派出去过哪些任务"）。
+    /// 解析在实现里做——只有 Gateway 查得到"这个会话派出去过哪些任务"）。`options.model`
+    /// 省略时沿用那个任务上一条 Run 的模型与档位。
     async fn follow(
         &self,
         from: &crate::types::ids::RunId,
         request_key: crate::types::ids::RequestKey,
         task_id: &str,
         text: &str,
+        options: crate::types::task::TaskOptions,
     ) -> Result<crate::types::task::FollowOutcome, SpawnError>;
 }
 

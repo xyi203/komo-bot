@@ -253,7 +253,7 @@ event_payload! {
     Checkpoint(Checkpoint) => "checkpoint",
     /// resume 时操作者明确切换了模型 / effort（§13.3）。
     ConfigChanged(ConfigChanged) => "config.changed",
-    /// 在线压缩在一个计划边界上的结论：压了（摘要 + 从哪一轮起原样保留），或没压。
+    /// 在线压缩的结论：压了（摘要 + 从哪一轮起原样保留），或没压。
     ContextCompacted(ContextCompacted) => "context.compacted",
     /// 这一段对话钉住的记忆注入段（§9.4）：渲染好的正文与选中的条目，重启之后照它逐字复用。
     MemoryInjected(MemoryInjected) => "memory.injected",
@@ -513,7 +513,7 @@ pub struct ConfigChanged {
     pub reason: String,
 }
 
-/// 在线压缩在一个计划边界上的结论（§8.3）。追加，不改写：被摘要覆盖的那些行一个字节
+/// 在线压缩的结论（§8.3）。追加，不改写：被摘要覆盖的那些行一个字节
 /// 都没动，回放读到它才把这条 Run 早先的轮次换成摘要——**fold 决定它意味着什么**。
 ///
 /// **摘要只是模型视图，不是恢复依据。**恢复（§8.4、§8.6）从不读它："做没做过"仍然只按
@@ -538,7 +538,7 @@ pub enum ContextCompacted {
         usage: TokenUsage,
     },
     /// 一批大结果换成了短视图（§8.3）。和压缩一样是对上下文前缀的一次改写，所以同一个
-    /// 事件、同一本缓存账：缓存已冷、贴着窗口、或计划边界上账算得过来时才换，**一次换一批**
+    /// 事件、同一本缓存账：缓存已冷或贴着窗口时才换，**一次换一批**
     /// ——逐条到期逐条换，每一条都让它之后的缓存前缀失效一次。fold 把 `calls` 累进这条
     /// Run 的已衰减集合，回放按集合选视图。
     Decayed {

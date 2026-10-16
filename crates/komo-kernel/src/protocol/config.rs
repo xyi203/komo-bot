@@ -470,8 +470,8 @@ pub struct CompactionConfig {
     /// 离窗口还剩这么多 token 时不看账，直接压。
     #[serde(default = "default_window_reserve_tokens")]
     pub window_reserve_tokens: u64,
-    /// 上下文到这么多 token 就按"贴着窗口"处理，不等计划边界（与模型的 `context_window`
-    /// 取先到的那个）。1M 窗口的模型要到 98 万才贴窗口，而模型常常几十轮不报计划进度。
+    /// 上下文到这么多 token 就按"贴着窗口"处理（与模型的 `context_window` 取先到的
+    /// 那个）。1M 窗口的模型要到 98 万才贴窗口，压缩又只在贴着窗口时发生。
     #[serde(default = "default_max_context_tokens")]
     pub max_context_tokens: u64,
     /// 第一次压缩时把剩余请求估计放大的倍数。

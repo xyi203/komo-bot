@@ -590,21 +590,17 @@ impl SegmentSource for GatewaySegments {
                 // 压缩只在上一轮的调用全部收尾时判：切点落在轮次开头，一轮的调用与结果不分开。
                 // 衰减不切轮次、只换已完成结果的正文，没收尾的调用（恢复之后续跑）不受影响。
                 let settled = resume.is_none() && surface.open_calls(&run).is_empty();
-                let reshape = compaction::decide(
-                    self.routed.as_ref(),
-                    compaction::Facts {
-                        context: &context,
-                        tools: &tools,
-                        online: &online,
-                        config: &config,
-                        model: &model,
-                        session: &session,
-                        run: &run,
-                        cache_cold: compaction::cache_cold(&events, self.clock.now()),
-                        settled,
-                    },
-                )
-                .await;
+                let reshape = compaction::decide(compaction::Facts {
+                    context: &context,
+                    tools: &tools,
+                    online: &online,
+                    config: &config,
+                    model: &model,
+                    session: &session,
+                    run: &run,
+                    cache_cold: compaction::cache_cold(&events, self.clock.now()),
+                    settled,
+                });
                 let (job, context) = match reshape {
                     Some(Reshape::Compact(job)) => (Some(job), context),
                     // 先落账再重新装配：回放读到新的已衰减集合，第一次请求就带短视图。
@@ -657,7 +653,6 @@ impl SegmentSource for GatewaySegments {
                             .saturating_sub(config.window_reserve_tokens),
                     ),
                     estimate: komo_agent::context::compaction::price(&context, &tools).write_tokens,
-                    pending: !settled && online.pending_boundary,
                 };
                 (job, Some(compactor), context)
             }

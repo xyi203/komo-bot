@@ -549,7 +549,7 @@ async fn build_tools(
 ) {
     use komo_runtime::tools::{
         BashTool, DelegateTool, DispatchTool, EditTool, FollowTool, MonitorStopTool, MonitorTool,
-        ReadTool, RgTool, UpdatePlanTool, WriteTool,
+        ReadTool, RgTool, WriteTool,
     };
 
     let snapshot = config.current();
@@ -591,9 +591,6 @@ async fn build_tools(
     // （`docs/monitor.md`）。
     tools.push(Arc::new(MonitorTool::new()));
     tools.push(Arc::new(MonitorStopTool::new()));
-    // update_plan：模型的工作计划，同一类编排操作。没有副作用，计划只在日志里，按 Run
-    // 折出来。
-    tools.push(Arc::new(UpdatePlanTool::new()));
     // MCP（`docs/mcp.md`）：启动时连上、列出工具，挂进同一份目录——之后它们与内置工具
     // 走同一条落账的路。要登录的服务器留在 hub 里，登录后再挂（§2.2）。
     let mcp = Arc::new(

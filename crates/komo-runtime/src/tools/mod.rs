@@ -22,7 +22,6 @@ pub mod protect;
 pub mod read;
 pub mod resources;
 pub mod rg;
-pub mod update_plan;
 pub mod write;
 
 use std::path::Path;
@@ -42,7 +41,6 @@ pub use mcp::McpTool;
 pub use monitor::{MonitorStopTool, MonitorTool};
 pub use read::ReadTool;
 pub use rg::RgTool;
-pub use update_plan::UpdatePlanTool;
 pub use write::WriteTool;
 
 /// 一个文件的版本（§4：`read` 返回它，`write` / `edit` 覆盖时核对它）。

@@ -3,8 +3,7 @@
 //!
 //! 两个入口，同一套事实、同一个判断：
 //!
-//! - **装配时**（`GatewaySegments::segment`）：这一段开头就在计划边界上、贴着窗口、或者
-//!   缓存已经冷了——决定压就把摘要请求放进 `Segment.compaction`，loop 先压再跑；决定衰减
+//! - **装配时**（`GatewaySegments::segment`）：这一段开头就贴着窗口、或者缓存已经冷了——决定压就把摘要请求放进 `Segment.compaction`，loop 先压再跑；决定衰减
 //!   就先落账、再重新装配（回放读到新的已衰减集合）；
 //! - **一轮收尾之后**（[`GatewayPlanner`]，loop 经 `CompactionPlanner` 来问）：重新读一遍
 //!   日志、按同一份模板装配出 provider 正看着的那份视图，再判一次。
@@ -20,10 +19,8 @@ use async_trait::async_trait;
 use komo_agent::context::compaction::{CompactionSettings, Plan, PlanInput, plan};
 use komo_agent::context::history::{self, ReplayScope, ResolvedMessage};
 use komo_agent::context::{AgentContext, ContextInput, InvocationContext, assemble};
-use komo_kernel::compaction::{
-    CompactionDecision, OnlineState, PROMPT_CACHE_TTL, Reshape, online_state,
-};
-use komo_kernel::events::{ContextCompacted, Event, EventPayload};
+use komo_kernel::compaction::{OnlineState, PROMPT_CACHE_TTL, Reshape, online_state};
+use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::fold;
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::protocol::config::CompactionConfig;
@@ -129,15 +126,13 @@ pub(crate) struct Facts<'a> {
     pub session: &'a SessionId,
     pub run: &'a RunId,
     pub cache_cold: bool,
-    /// 上一轮的调用都收尾了。没收尾时不能压（切点会把一轮的调用与结果分开），边界也先
-    /// 不用掉；换短视图只动已完成结果的正文，照常算。
+    /// 上一轮的调用都收尾了。没收尾时不能压（切点会把一轮的调用与结果分开）——续跑那一轮
+    /// 收尾之后，loop 按同一份估计再判一次窗口；换短视图只动已完成结果的正文，照常算。
     pub settled: bool,
 }
 
-/// 判一次：要改写前缀就给出整批（摘要请求，或要换短视图的那批结果）；边界上不压就记一条
-/// `skipped` 把边界用掉。记不下去只留日志——改写是省钱的手段，账本写不进去的问题会在
-/// 下一次真正的写入上暴露。
-pub(crate) async fn decide(ledger: &dyn Ledger, facts: Facts<'_>) -> Option<Reshape> {
+/// 判一次：要改写前缀就给出整批（摘要请求，或要换短视图的那批结果）；不改什么都不记。
+pub(crate) fn decide(facts: Facts<'_>) -> Option<Reshape> {
     let settings = CompactionSettings::from(facts.config);
     let outcome = plan(PlanInput {
         context: facts.context,
@@ -153,22 +148,7 @@ pub(crate) async fn decide(ledger: &dyn Ledger, facts: Facts<'_>) -> Option<Resh
     match outcome {
         Plan::Compact(job) if facts.settled => Some(Reshape::Compact(job)),
         Plan::Decay(job) => Some(Reshape::Decay(job)),
-        Plan::Skip { reason, decision } if facts.settled => {
-            skip(ledger, facts.run, reason, decision).await;
-            None
-        }
-        Plan::Compact(_) | Plan::Skip { .. } | Plan::Nothing => None,
-    }
-}
-
-async fn skip(ledger: &dyn Ledger, run: &RunId, reason: String, decision: CompactionDecision) {
-    tracing::info!(run = %run, %reason, "在线压缩：这个计划边界上不压");
-    let skipped = ContextCompacted::Skipped {
-        reason,
-        decision: Some(decision),
-    };
-    if let Err(error) = ledger.record_compaction(run, skipped).await {
-        tracing::warn!(run = %run, %error, "记不下 context.compacted（skipped）");
+        Plan::Compact(_) | Plan::Nothing => None,
     }
 }
 
@@ -244,20 +224,16 @@ impl CompactionPlanner for GatewayPlanner {
             }
         };
         let online = online_state(&events, &self.run);
-        decide(
-            self.routed.as_ref(),
-            Facts {
-                context: &context,
-                tools: &self.tools,
-                online: &online,
-                config: &config,
-                model: &self.model,
-                session: &self.session,
-                run: &self.run,
-                cache_cold: cache_cold(&events, self.clock.now()),
-                settled: true,
-            },
-        )
-        .await
+        decide(Facts {
+            context: &context,
+            tools: &self.tools,
+            online: &online,
+            config: &config,
+            model: &self.model,
+            session: &self.session,
+            run: &self.run,
+            cache_cold: cache_cold(&events, self.clock.now()),
+            settled: true,
+        })
     }
 }

@@ -1,10 +1,10 @@
 //! §6 的在线压缩，端到端：真数据目录、真 `service::start`、脚本化模型。
 //!
-//! - **窗口保护**：`context_window` 调得很小、没有计划边界，几次大 `read` 把估计的上下文
-//!   推过线——摘要请求没有工具、带着计划；同一个 Run 接着跑，下一次主请求是任务 → 摘要 →
-//!   切点起原样；中途停在一条介入上、重启再答，回放的那一段逐字节不变。
-//! - **决定不压**：开着压缩、但账算不过来——不多发任何请求，driver 原样接着跑，模型拿到
-//!   的轮输入与关着压缩时一模一样；边界上记一条 `skipped`。
+//! - **窗口保护**：`context_window` 调得很小，几次大 `read` 把估计的上下文推过线——摘要
+//!   请求没有工具；同一个 Run 接着跑，下一次主请求是任务 → 摘要 → 切点起原样；中途停在
+//!   一条介入上、重启再答，回放的那一段逐字节不变。
+//! - **不贴窗口不压**：开着压缩、短任务——不多发任何请求，driver 原样接着跑，模型拿到的
+//!   轮输入与关着压缩时一模一样，日志里没有 `context.compacted`。
 //!
 //! 断言的是**模型收到了什么**（`FakeLlm` 记下的请求与轮输入）和日志里的 `context.compacted`。
 
@@ -16,7 +16,7 @@ use komo_gateway::service::test_support::Unsure;
 use komo_gateway::service::test_support::harness::{
     FakeLlm, Home, call_round, config_toml, text_round,
 };
-use komo_kernel::compaction::{CompactionReason, PlanStatus, PlanStep, format_snapshot};
+use komo_kernel::compaction::CompactionReason;
 use komo_kernel::events::{ContextCompacted, Event, EventPayload};
 use komo_kernel::traits::LlmClient;
 use komo_kernel::types::status::RunState;
@@ -30,10 +30,6 @@ fn compactions(events: &[Event]) -> Vec<ContextCompacted> {
             _ => None,
         })
         .collect()
-}
-
-fn step(id: &str, status: &str) -> serde_json::Value {
-    serde_json::json!({ "id": id, "goal": format!("做 {id}"), "status": status })
 }
 
 /// 模型拿到的每一份轮输入，去掉运行时自己发的 `call_id` 与抬头里的耗时：两台 Gateway
@@ -78,35 +74,33 @@ fn without_elapsed(content: &str) -> String {
     format!("{}\n{body}", fields.join(" · "))
 }
 
-/// 登记两步 → 完成第一步（一个计划边界）→ 收尾。
-fn boundary_script()
+/// 两条小命令 → 收尾。
+fn short_script()
 -> Vec<Vec<Result<komo_kernel::types::turn::Round, komo_kernel::types::turn::LlmError>>> {
     vec![vec![
         call_round(
             1,
-            "pc-p1",
-            "update_plan",
-            serde_json::json!({ "steps": [step("a", "in_progress"), step("b", "pending")] }),
+            "pc-b1",
+            "bash",
+            serde_json::json!({ "command": "echo a" }),
         ),
         call_round(
             2,
-            "pc-p2",
-            "update_plan",
-            serde_json::json!({
-                "steps": [step("a", "completed"), step("b", "in_progress")],
-                "progress": { "files_changed": [], "verification": ["看过了"], "decisions": [] },
-            }),
+            "pc-b2",
+            "bash",
+            serde_json::json!({ "command": "echo b" }),
         ),
         text_round(3, "都做完了。"),
     ]]
 }
 
-async fn run_boundary(config: &str) -> (Arc<FakeLlm>, Vec<Event>) {
+async fn run_short(config: &str) -> (Arc<FakeLlm>, Vec<Event>) {
     let home = Home::with_config(config);
-    let llm = FakeLlm::new(boundary_script());
+    std::fs::create_dir_all(home.workspace()).expect("工作目录");
+    let llm = FakeLlm::new(short_script());
     let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     let session = gateway.open_session().await;
-    let run = gateway.submit(&session, "boundary-1", "分两步做").await.run;
+    let run = gateway.submit(&session, "short-1", "跑两条命令").await.run;
     let detail = gateway.wait_terminal(&run).await;
     assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
     let events = home.events(&session);
@@ -114,12 +108,12 @@ async fn run_boundary(config: &str) -> (Arc<FakeLlm>, Vec<Event>) {
     (llm, events)
 }
 
-/// 开着压缩、账算不过来：边界上记一条 `skipped`，不多发请求，模型拿到的与关着时一样。
+/// 开着压缩、不贴窗口：什么都不记、不多发请求，模型拿到的与关着时一样。
 #[tokio::test]
-async fn an_unprofitable_boundary_is_skipped_and_the_driver_goes_on_unchanged() {
-    let (off, off_events) = run_boundary(&config_toml("")).await;
-    let (on, on_events) = run_boundary(&config_toml(
-        "[compaction]\nenabled = true\ncache_write_read_ratio = 1000000000.0\nkeep_recent_tokens = 1\nmemo_token_estimate = 1\n",
+async fn a_short_task_is_never_compacted_and_the_driver_goes_on_unchanged() {
+    let (off, off_events) = run_short(&config_toml("")).await;
+    let (on, on_events) = run_short(&config_toml(
+        "[compaction]\nenabled = true\nkeep_recent_tokens = 1\nmemo_token_estimate = 1\n",
     ))
     .await;
 
@@ -138,14 +132,11 @@ async fn an_unprofitable_boundary_is_skipped_and_the_driver_goes_on_unchanged() 
     assert_eq!(first(&on).tools, first(&off).tools);
 
     assert!(compactions(&off_events).is_empty());
-    let recorded = compactions(&on_events);
-    let [ContextCompacted::Skipped { reason, decision }] = recorded.as_slice() else {
-        panic!("{recorded:?}");
-    };
-    assert_eq!(reason, "deferred_economic");
-    let decision = decision.as_ref().expect("带着决策");
-    assert!(!decision.compact);
-    assert_eq!(decision.reason, CompactionReason::DeferredEconomic);
+    assert!(
+        compactions(&on_events).is_empty(),
+        "{:?}",
+        compactions(&on_events)
+    );
 }
 
 /// 一次请求的估价：与 Gateway 判断时同一把尺子。
@@ -167,8 +158,7 @@ const BASE_TOKENS: u64 = 2_740;
 const READS: u32 = 5;
 const RESERVE: u64 = 1_000;
 
-/// 没有计划边界、窗口很小：第五次大 `read` 之后估计过线，压；摘要请求没有工具、带着
-/// 计划；同一个 Run 接着跑，下一次主请求是任务 → 摘要 → 切点起原样；停在一条介入上
+/// 窗口很小：第五次大 `read` 之后估计过线，压；摘要请求没有工具；同一个 Run 接着跑，下一次主请求是任务 → 摘要 → 切点起原样；停在一条介入上
 /// （测试工具 `unsure`）、重启再答，那一段逐字节不变。
 #[tokio::test]
 async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail() {
@@ -192,15 +182,10 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
         std::fs::write(home.workspace().join(format!("big{n}.txt")), lines).expect("写文件");
     }
     let read = |n: u32| serde_json::json!({ "path": format!("big{n}.txt") });
-    let summary = "摘要：登记了 a、b 两步；读过 big1–big4，内容是编号行。";
-    let mut first = vec![call_round(
-        1,
-        "pc-plan",
-        "update_plan",
-        serde_json::json!({ "steps": [step("a", "in_progress"), step("b", "pending")] }),
-    )];
+    let summary = "摘要：读过 big1–big4，内容是编号行。";
+    let mut first = Vec::new();
     for n in 1..=READS {
-        first.push(call_round(n + 1, &format!("pc-r{n}"), "read", read(n)));
+        first.push(call_round(n, &format!("pc-r{n}"), "read", read(n)));
     }
     first.push(text_round(9, "不该走到这一轮：上面那一轮之后就该压了"));
     let llm = FakeLlm::new(vec![
@@ -222,24 +207,11 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
         "空会话的估价漂得太远（{base}），调一下 BASE_TOKENS"
     );
 
-    // 摘要请求：没有工具、一条纯文本、带着计划。
+    // 摘要请求：没有工具、一条纯文本。
     let summary_request = &requests[1];
     assert!(summary_request.tools.is_empty());
     assert_eq!(summary_request.messages.len(), 1);
     let text = summary_request.messages[0].text.as_deref().unwrap();
-    let plan = [
-        PlanStep {
-            id: "a".into(),
-            goal: "做 a".into(),
-            status: PlanStatus::InProgress,
-        },
-        PlanStep {
-            id: "b".into(),
-            goal: "做 b".into(),
-            status: PlanStatus::Pending,
-        },
-    ];
-    assert!(text.contains(&format_snapshot(&plan)), "带着计划：{text}");
     assert!(text.contains(task));
     assert!(
         text.contains("1-0000") && text.contains("4-0000"),
@@ -271,7 +243,8 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
         .map(|event| event.seq)
         .collect();
     assert_eq!(
-        *first_kept, rounds[READS as usize],
+        *first_kept,
+        rounds[READS as usize - 1],
         "切在最后一次 read 那一轮开头"
     );
     let started = events

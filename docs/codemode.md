@@ -133,7 +133,7 @@ Monty 的 `max_turn_duration` 不含等宿主答复的时间，所以墙钟由�
 
 1. 名字必须在当前 Run 的 `AgentSurface` 及 executor 工具表里；不回退到全局目录。
    `bash`、`edit`、`write`、`codemode`、`delegate`、`dispatch`、`follow`、`monitor`、
-   `monitor_stop`、`update_plan` 不能在脚本里调（`tools/codemode.rs` 的 `NOT_IN_SCRIPTS`），也不进
+   `monitor_stop` 不能在脚本里调（`tools/codemode.rs` 的 `NOT_IN_SCRIPTS`），也不进
    `TOOLS`。脚本正文里字面写着 `tools.<这些名字>(` 的，`codemode` 的 `prepare` 就拒、脚本不运行：
    实测模型常把 `tools.bash("git status")` 当成只读写进脚本，跑到那一行才被拒，整段作废，前面的
    MCP 写也可能已经做了（2026-10-13/14 十二次）。`getattr` 之类的绕法认不出，照样在这一步与第 2 步拒。

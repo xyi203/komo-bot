@@ -5,7 +5,7 @@
 //!   → TurnDriver::next            一回合一次 completion
 //!   → Ledger::record_round        完整 assistant 回复 + 该轮全部调用计划，一个逻辑事件
 //!   → ToolExecutor::execute_round 执行本轮全部调用（只读的可以同时在飞，§6）
-//!   → [计划边界 / 贴着窗口] CompactionPlanner::plan → 摘要请求 → context.compacted → Recompose
+//!   → [贴着窗口 / 缓存放冷] CompactionPlanner::plan → 摘要请求 → context.compacted → Recompose
 //!   → Ledger::absorb_interjections   插话：排着队的那句话并进来了 → Interjected
 //!   → 按 call_id 回传结果 → 下一轮
 //! ```
@@ -134,24 +134,19 @@ pub struct Segment {
 pub trait CompactionPlanner: Send + Sync {
     /// 一轮的调用**全部收尾之后**、下一次请求之前问。要压就给出摘要请求
     /// （[`Reshape::Compact`]）；要换短视图就给出整批（[`Reshape::Decay`]，loop 先落账再
-    /// 交给驱动）；在计划边界上决定不压由实现记一条 `skipped`（把边界用掉）；其余情形
-    /// 什么都不记。
+    /// 交给驱动）；其余情形什么都不记。
     async fn plan(&self) -> Option<Reshape>;
 }
 
-/// loop 这一侧：什么时候去问 [`CompactionPlanner`]（`None` = 压缩与衰减都关着）。只有四种时机——这一轮完成了一个计划
-/// 步骤、日志里还压着一个没用掉的边界、估计的上下文贴着窗口、距上一次 provider 请求已
-/// 超过提示缓存的存活时间（长时间的工具调用把缓存放冷了）；别的轮次一次都不问（问一次
-/// 要读一遍日志）。
+/// loop 这一侧：什么时候去问 [`CompactionPlanner`]（`None` = 压缩与衰减都关着）。只有两种时机——估计的
+/// 上下文贴着窗口、距上一次 provider 请求已超过提示缓存的存活时间（长时间的工具调用把
+/// 缓存放冷了）；别的轮次一次都不问（问一次要读一遍日志）。
 pub struct Compactor {
     pub planner: Arc<dyn CompactionPlanner>,
     /// 估计的上下文到这么多 token（窗口 − 预留）就问一次；`None` = 不知道窗口。
     pub pressure_tokens: Option<u64>,
     /// 这一段开头那次请求的估计（字节 / 4，与 planner 同一把尺子）；每轮往上加。
     pub estimate: u64,
-    /// 日志里已经有一个没用掉的边界，但这一段开头还有没收尾的调用、当时不能决定：续跑
-    /// 的那一轮收尾之后问一次。
-    pub pending: bool,
 }
 
 impl Compactor {
@@ -159,7 +154,6 @@ impl Compactor {
     /// 用量又不含这一轮新加的结果。
     fn due(
         &mut self,
-        boundary: bool,
         round: Option<&Round>,
         results: &[ToolResultForModel],
         idle: Duration,
@@ -188,9 +182,7 @@ impl Compactor {
         let pressure = self
             .pressure_tokens
             .is_some_and(|limit| self.estimate.max(reported) >= limit);
-        let due = boundary || self.pending || pressure || idle > PROMPT_CACHE_TTL;
-        self.pending = false;
-        due
+        pressure || idle > PROMPT_CACHE_TTL
     }
 }
 
@@ -347,12 +339,7 @@ impl AgentLoop {
                     return self.stop(&run, rounds, stop).await;
                 }
                 if let Some(compactor) = compactor.as_mut()
-                    && compactor.due(
-                        outcome.plan_boundary,
-                        None,
-                        &results,
-                        last_request.elapsed(),
-                    )
+                    && compactor.due(None, &results, last_request.elapsed())
                     && let Some(done) = self
                         .compact_now(
                             &run,
@@ -456,12 +443,7 @@ impl AgentLoop {
             // 这一轮的调用全部收尾了（没停下）：这时才可能压——切点只落在轮次开头，一轮
             // 的调用与结果不会被分开。
             if let Some(compactor) = compactor.as_mut()
-                && compactor.due(
-                    outcome.plan_boundary,
-                    Some(&round),
-                    &outcome.results,
-                    last_request.elapsed(),
-                )
+                && compactor.due(Some(&round), &outcome.results, last_request.elapsed())
                 && let Some(done) = self
                     .compact_now(
                         &run,

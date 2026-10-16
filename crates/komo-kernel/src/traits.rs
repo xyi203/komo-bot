@@ -301,7 +301,7 @@ pub trait Ledger: Send + Sync {
     /// `/new`：追加一个 `conversation.boundary`，**不切 Session**（§13.1）。
     async fn boundary(&self, session: &SessionId) -> Result<Seq, LedgerError>;
 
-    /// `context.compacted`：在线压缩在一个计划边界上的结论（§8.3）。内联的摘要超过上限
+    /// `context.compacted`：在线压缩的结论（§8.3）。内联的摘要超过上限
     /// 先外置到 `payloads/`（与 `record_round` 的正文同一条路），再追加并同步。它不碰
     /// state.db 的任何表——摘要只是模型视图，调度不看它。
     async fn record_compaction(

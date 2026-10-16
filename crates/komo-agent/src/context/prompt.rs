@@ -12,7 +12,6 @@ use komo_kernel::types::delegate::DelegateSpec;
 use komo_kernel::types::tool::ToolNamespace;
 
 use super::InvocationContext;
-use crate::surface::UPDATE_PLAN_TOOL;
 
 /// 提示里每条 Run 都说的那几句行为约束。
 ///
@@ -54,15 +53,6 @@ fn rules(tools: &[String]) -> String {
         lines.push(
             "- 同一个文件要改好几处，就在同一轮里连发几个 edit：它们按顺序执行，\
              后一个基于前一个改完的内容；别用 bash 跑脚本替换。",
-        );
-    }
-    // 2026-10-13 的统计：长任务里约 25～30 次调用报一次计划，有用；十几次调用的短任务
-    // 也拆成 2～3 步、报 3～4 次，且多是单独占一轮——每次多花一整次请求。
-    if tools.iter().any(|tool| tool == UPDATE_PLAN_TOOL) {
-        lines.push(
-            "- 要很多轮工具调用才做得完的事，先用 update_plan 登记计划，每做完一步更新一次；\
-             几次调用就能做完的不登记。更新计划时和下一步的工具调用放在同一轮一起发，\
-             别单独占一轮。",
         );
     }
     lines.push("- 调用被拒绝就当作结果，不要换个工具绕过。");

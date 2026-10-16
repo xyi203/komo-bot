@@ -989,7 +989,6 @@ mod compaction {
     use crate::agent::tests_support::{
         FakePlanner, HangingLlm, compaction_job, compactor, decay_job,
     };
-    use crate::tools::UpdatePlanTool;
     use komo_kernel::compaction::Reshape;
     use komo_kernel::events::{ContextCompacted, EventPayload};
     use komo_kernel::types::ids::Seq;
@@ -1016,41 +1015,34 @@ mod compaction {
             .count()
     }
 
-    fn plan(steps: &[(&str, &str)]) -> serde_json::Value {
-        let steps: Vec<_> = steps
-            .iter()
-            .map(|(id, status)| serde_json::json!({ "id": id, "goal": format!("做 {id}"), "status": status }))
-            .collect();
-        serde_json::json!({ "steps": steps })
-    }
-
-    /// 登记两步 → 做完第一步（一个计划边界）→ 本该收尾的第三轮。
-    fn boundary_rounds() -> Vec<Round> {
+    /// 一条小调用 → 一条参数很大的调用（把估计推过 [`pressured`] 的线）→ 本该收尾的第三轮。
+    fn pressure_rounds() -> Vec<Round> {
         vec![
-            round(
-                1,
-                None,
-                vec![call(
-                    "pc-1",
-                    "update_plan",
-                    plan(&[("a", "in_progress"), ("b", "pending")]),
-                )],
-            ),
+            round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
             round(
                 2,
                 None,
                 vec![call(
                     "pc-2",
-                    "update_plan",
-                    plan(&[("a", "completed"), ("b", "in_progress")]),
+                    "bash",
+                    serde_json::json!({ "x": "y".repeat(400) }),
                 )],
             ),
             round(3, Some("都做完了。"), vec![]),
         ]
     }
 
+    /// 线画在 100 token：[`pressure_rounds`] 只有第二轮过线。
+    fn pressured(planner: Arc<FakePlanner>) -> crate::agent::Compactor {
+        crate::agent::Compactor {
+            pressure_tokens: Some(100),
+            estimate: 10,
+            ..compactor(planner)
+        }
+    }
+
     fn wired(llm: Arc<ScriptedLlm>) -> Wired {
-        Wired::with_llm(llm, vec![Arc::new(UpdatePlanTool::new())])
+        Wired::with_llm(llm, vec![Arc::new(RecordingTool::bash())])
     }
 
     #[tokio::test]
@@ -1155,29 +1147,29 @@ mod compaction {
     }
 
     #[tokio::test]
-    async fn a_boundary_round_hands_back_for_recomposition() {
+    async fn a_pressured_round_hands_back_for_recomposition() {
         let llm = Arc::new(ScriptedLlm::new(vec![
-            boundary_rounds(),
+            pressure_rounds(),
             vec![round(1, Some("摘要：a 做完了。"), vec![])],
         ]));
         let wired = wired(Arc::clone(&llm));
         let mut segment = wired.segment(CancelToken::new()).await;
         let job = compaction_job(&segment.session, &segment.run);
         let planner = FakePlanner::new(vec![Some(Reshape::Compact(job))]);
-        segment.compactor = Some(compactor(Arc::clone(&planner)));
+        segment.compactor = Some(pressured(Arc::clone(&planner)));
 
         let outcome = wired.agent.run(segment).await.unwrap();
         assert!(
             matches!(outcome, SegmentOutcome::Recompose { rounds: 2, .. }),
             "{outcome:?}"
         );
-        assert_eq!(planner.asked(), 1, "登记那一轮不是边界，不问");
+        assert_eq!(planner.asked(), 1, "第一轮没过线，不问");
         assert_eq!(assistants(&wired.harness), 2, "第三轮没发出去");
         assert!(matches!(
             compactions(&wired.harness).as_slice(),
             [ContextCompacted::Compacted { .. }]
         ));
-        // 边界那一轮的结果已经落账，下一段的回放带着它；这一段的 driver 没再拿到它。
+        // 过线那一轮的结果已经落账，下一段的回放带着它；这一段的 driver 没再拿到它。
         let inputs = llm.inputs.lock().unwrap();
         assert_eq!(inputs.len(), 3, "主 driver 两轮 + 摘要一轮：{inputs:?}");
         assert!(matches!(inputs[2], RoundInput::First), "最后一次是摘要请求");
@@ -1186,11 +1178,11 @@ mod compaction {
     /// 决定不压：同一个 driver 接着跑，下一次请求就是没有这个功能时那一次。
     #[tokio::test]
     async fn a_planner_that_declines_leaves_the_driver_running() {
-        let llm = Arc::new(ScriptedLlm::new(vec![boundary_rounds()]));
+        let llm = Arc::new(ScriptedLlm::new(vec![pressure_rounds()]));
         let wired = wired(Arc::clone(&llm));
         let mut segment = wired.segment(CancelToken::new()).await;
         let planner = FakePlanner::new(vec![None]);
-        segment.compactor = Some(compactor(Arc::clone(&planner)));
+        segment.compactor = Some(pressured(Arc::clone(&planner)));
 
         let outcome = wired.agent.run(segment).await.unwrap();
         assert!(
@@ -1208,16 +1200,13 @@ mod compaction {
     /// 换短视图：先落 `decayed`，整批在下一次请求里交给驱动，这一段不 Recompose、driver 不重开。
     #[tokio::test]
     async fn a_decay_job_is_recorded_then_revised_without_recomposing() {
-        let llm = Arc::new(ScriptedLlm::new(vec![boundary_rounds()]));
+        let llm = Arc::new(ScriptedLlm::new(vec![pressure_rounds()]));
         let wired = wired(Arc::clone(&llm));
         let mut segment = wired.segment(CancelToken::new()).await;
         let job = decay_job("pc-old");
         let expected = job.revised.clone();
         let planner = FakePlanner::new(vec![Some(Reshape::Decay(job))]);
-        segment.compactor = Some(crate::agent::Compactor {
-            estimate: 1000,
-            ..compactor(Arc::clone(&planner))
-        });
+        segment.compactor = Some(pressured(Arc::clone(&planner)));
 
         let outcome = wired.agent.run(segment).await.unwrap();
         assert!(
@@ -1232,12 +1221,12 @@ mod compaction {
         }
         let inputs = llm.inputs.lock().unwrap();
         assert_eq!(inputs.len(), 3, "{inputs:?}");
-        // 边界那一轮之后的请求带着整批；再下一次不重复。
+        // 过线那一轮之后的请求带着整批；之前那次没有。
         assert_eq!(revised_of(&inputs[2]), expected.as_slice(), "{inputs:?}");
         assert!(revised_of(&inputs[1]).is_empty(), "{inputs:?}");
     }
 
-    /// 没有边界、没有压力：一条跑得比缓存存活时间还久的工具调用之后（缓存已冷）也要问；
+    /// 没有压力：一条跑得比缓存存活时间还久的工具调用之后（缓存已冷）也要问；
     /// 跑得快的那一轮不问。
     #[tokio::test(start_paused = true)]
     async fn a_tool_slower_than_the_cache_ttl_asks_the_planner() {
@@ -1263,7 +1252,7 @@ mod compaction {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn fast_tools_never_ask_the_planner_without_a_boundary() {
+    async fn fast_tools_never_ask_the_planner_without_pressure() {
         let tool = Arc::new(RecordingTool::bash());
         let llm = Arc::new(ScriptedLlm::new(vec![vec![
             round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),
@@ -1280,7 +1269,7 @@ mod compaction {
 
     #[tokio::test]
     async fn disabled_compaction_never_hands_back() {
-        let llm = Arc::new(ScriptedLlm::new(vec![boundary_rounds()]));
+        let llm = Arc::new(ScriptedLlm::new(vec![pressure_rounds()]));
         let wired = wired(Arc::clone(&llm));
         let segment = wired.segment(CancelToken::new()).await;
         assert!(segment.compactor.is_none() && segment.compaction.is_none());
@@ -1294,9 +1283,9 @@ mod compaction {
         assert!(compactions(&wired.harness).is_empty());
     }
 
-    /// 没有计划也要护住窗口：估计的上下文过了线就问，没过线的轮次一次都不问。
+    /// 估计的上下文过了线就问，没过线的轮次一次都不问。
     #[tokio::test]
-    async fn window_pressure_asks_without_a_boundary() {
+    async fn window_pressure_asks_the_planner() {
         let tool = Arc::new(RecordingTool::bash());
         let llm = Arc::new(ScriptedLlm::new(vec![vec![
             round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]),

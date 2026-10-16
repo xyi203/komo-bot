@@ -1937,16 +1937,6 @@ fn the_delegate_tool_name_matches_the_registry() {
     );
 }
 
-#[test]
-fn the_update_plan_tool_name_matches_the_registry() {
-    use komo_kernel::traits::Tool;
-
-    assert_eq!(
-        komo_runtime::tools::UpdatePlanTool::new().definition().name,
-        komo_agent::UPDATE_PLAN_TOOL
-    );
-}
-
 // ---------------------------------------------------------------- TUI 的 `!`
 /// **`!` 不经模型直接跑，结果记进会话**：同一会话连跑两条，两条都真的执行（不会把前
 /// 一条的结果认成这一条的），全程零模型请求；下一轮模型的回放窗口里看得见两条输出。

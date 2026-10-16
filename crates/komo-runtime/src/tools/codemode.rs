@@ -30,7 +30,6 @@ pub const NOT_IN_SCRIPTS: &[&str] = &[
     "follow",
     "monitor",
     "monitor_stop",
-    "update_plan",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

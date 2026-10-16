@@ -170,13 +170,12 @@ impl super::CompactionPlanner for FakePlanner {
     }
 }
 
-/// 一个 [`super::Compactor`]：不知道窗口，只在计划边界上问。
+/// 一个 [`super::Compactor`]：不知道窗口，只在缓存放冷时问。
 pub fn compactor(planner: std::sync::Arc<FakePlanner>) -> super::Compactor {
     super::Compactor {
         planner,
         pressure_tokens: None,
         estimate: 0,
-        pending: false,
     }
 }
 

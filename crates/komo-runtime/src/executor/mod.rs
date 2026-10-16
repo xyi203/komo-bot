@@ -42,7 +42,6 @@ use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 
-use komo_kernel::compaction::{PlanUpdate, analyze_transition, format_snapshot, online_state};
 use komo_kernel::events::Event;
 use komo_kernel::fold::fold;
 use komo_kernel::projection::{ProjectionContext, ToolResultFacts, project_views, select};
@@ -168,9 +167,6 @@ pub struct RoundOutcome {
     pub stop: Option<RoundStop>,
     /// 停下时还没轮到的调用。续跑时原样再交回来。
     pub remaining: Vec<CallRequest>,
-    /// 这一轮里有 `update_plan` 完成了一个**先前登记过、当时还没完成**的步骤——一个计划
-    /// 边界。判据与从日志折在线状态的那一步同一个（`analyze_transition`）。
-    pub plan_boundary: bool,
 }
 
 /// 只有这些会中断一轮——工具自己的失败是**结果**，交给模型修正（§6）。
@@ -458,7 +454,7 @@ impl ToolExecutor {
     /// **只读的调用可以和同一轮里后面的调用同时在飞**：够格的是 `Operation::ReadFile`
     /// 这一类计划（`read` / `rg`）里没有"上一世"要接的那条（详见
     /// [`ReadyCall::parallel_with_siblings`]）。其余一切（`write` / `edit` / `bash` /
-    /// `codemode`，`delegate` / `dispatch` / `follow` / `update_plan` 这些编排调用，以及任何
+    /// `codemode`，`delegate` / `dispatch` / `follow` / `monitor` 这些编排调用，以及任何
     /// 要停下来的判定）都是**屏障**：屏障之前已经在飞的先收尾，再按调用顺序做它。
     ///
     /// "做它"指的是 `start_call` 及之后的一切：`begin` 只放行（可能落 `tool.planned`），
@@ -480,13 +476,12 @@ impl ToolExecutor {
         let mut queue: VecDeque<(usize, CallRequest)> = calls.into_iter().enumerate().collect();
         let mut in_flight: InFlight<'_> = FuturesUnordered::new();
         let mut settled: Vec<(usize, ToolResultForModel)> = Vec::new();
-        let mut boundary = false;
 
         while let Some((index, request)) = queue.pop_front() {
             if env.cancel.is_cancelled() {
                 drain(&mut in_flight, &mut settled).await?;
                 queue.push_front((index, request));
-                return Ok(finish(Some(RoundStop::Cancelled), queue, settled, boundary));
+                return Ok(finish(Some(RoundStop::Cancelled), queue, settled));
             }
 
             let begin = self.begin(&request, env).await?;
@@ -513,18 +508,13 @@ impl ToolExecutor {
                     Begin::Settled(CallSettlement::Result(result)) => settled.push((index, result)),
                     _ => queue.push_front((index, request)),
                 }
-                return Ok(finish(Some(stop), queue, settled, boundary));
+                return Ok(finish(Some(stop), queue, settled));
             }
             let settlement = match begin {
                 Begin::Ready(ready) => self.execute_ready(*ready, env).await?,
                 Begin::Settled(settlement) => settlement,
-                // 放行过了，在飞的也收完了：这时才 `start_call`，才受理子 Run、派任务、转话、
-                // 读日志里的上一版计划。
-                Begin::Orchestrate(call) => {
-                    let (settlement, crossed) = self.settle_orchestrated(*call, env).await?;
-                    boundary |= crossed;
-                    settlement
-                }
+                // 放行过了，在飞的也收完了：这时才 `start_call`，才受理子 Run、派任务、转话。
+                Begin::Orchestrate(call) => self.settle_orchestrated(*call, env).await?,
             };
             match settlement {
                 CallSettlement::Result(result) => settled.push((index, result)),
@@ -533,14 +523,14 @@ impl ToolExecutor {
                     // 停在这一条自己身上：它这一轮没收尾，所以照旧算"还没轮到"的
                     //（续跑要按账本上的形状把它重新交回来）。
                     queue.push_front((index, request));
-                    return Ok(finish(Some(stop), queue, settled, boundary));
+                    return Ok(finish(Some(stop), queue, settled));
                 }
             }
         }
 
         // 收尾：最后一并收掉还在飞的。
         let stop = drain(&mut in_flight, &mut settled).await?;
-        Ok(finish(stop, queue, settled, boundary))
+        Ok(finish(stop, queue, settled))
     }
 
     /// 一个调用在**执行之前**该走完的那些步：找工具 → 生成或沿用计划 → 恢复核对梯子 →
@@ -612,10 +602,10 @@ impl ToolExecutor {
             },
         };
 
-        // 编排调用（delegate / dispatch / follow / update_plan）不走"工具执行"那条路，也
+        // 编排调用（delegate / dispatch / follow / monitor）不走"工具执行"那条路，也
         // **不看重放策略**：它们 started 而无结果时该做什么都有确定答案——delegate 的结果在
-        // 我们自己的账本里（子 Run 的终态，§8.6「可以核对目标状态」），dispatch / follow 按
-        // 请求键幂等重放（`docs/background-tasks.md`），update_plan 没有副作用。
+        // 我们自己的账本里（子 Run 的终态，§8.6「可以核对目标状态」），dispatch / follow /
+        // monitor 按请求键幂等重放（`docs/background-tasks.md`）。
         match self.orchestration(&plan.operation, env) {
             Ok(None) => {}
             Ok(Some(kind)) => return self.begin_orchestration(request, env, plan, kind).await,
@@ -861,13 +851,12 @@ impl ToolExecutor {
                 monitors: monitors()?,
                 monitor_id: monitor_id.clone(),
             },
-            Operation::UpdatePlan => Orchestration::UpdatePlan,
             _ => return Ok(None),
         }))
     }
 
     /// 一次编排调用的放行：续跑校验在这里，**副作用一个都不在**。
-    /// `start_call` 以及之后的受理子 Run、派任务、转话、比较计划都在
+    /// `start_call` 以及之后的受理子 Run、派任务、转话都在
     /// [`Self::settle_orchestrated`]——放进 [`Begin::Orchestrate`] 交回 `execute_round`，
     /// 在飞的读先收完再做，账本上的先后与调用顺序一致，停在前面那条上时它也还没发生。
     ///
@@ -908,8 +897,7 @@ impl ToolExecutor {
         })))
     }
 
-    /// 一次放行过的编排调用的收尾：`execute_round` 收完在飞的调用之后才走到这里。第二个
-    /// 返回值是 update_plan 的计划边界，别的编排调用恒为 `false`。
+    /// 一次放行过的编排调用的收尾：`execute_round` 收完在飞的调用之后才走到这里。
     ///
     /// dispatch / follow **不等**任何东西：`TaskSpawner` 一返回就收尾——这正是它们存在的
     /// 理由，等任务跑完又会把派它的会话堵住（同一会话严格串行）。幂等靠
@@ -920,7 +908,7 @@ impl ToolExecutor {
         &self,
         call: Orchestrated,
         env: &CallEnv,
-    ) -> Result<(CallSettlement, bool), ExecError> {
+    ) -> Result<CallSettlement, ExecError> {
         let Orchestrated {
             request,
             plan,
@@ -928,10 +916,9 @@ impl ToolExecutor {
             kind,
         } = call;
         if let Orchestration::Delegate(spec) = &kind {
-            let settlement = self
+            return self
                 .settle_delegate(&request, env, &plan, spec, start)
-                .await?;
-            return Ok((settlement, false));
+                .await;
         }
         let attempt = match start {
             OrchestrationStart::Fresh => self.ledger.start_call(&request.call, &plan).await?,
@@ -978,12 +965,9 @@ impl ToolExecutor {
                 self.settle_monitor_stop(&request, env, attempt, outcome)
                     .await?
             }
-            Orchestration::UpdatePlan => {
-                return self.settle_plan(&request, env, &plan, attempt).await;
-            }
             Orchestration::Delegate(_) => unreachable!("委派在上面已经收尾"),
         };
-        Ok((settlement, false))
+        Ok(settlement)
     }
 
     /// 一次委派的收尾（§4、§8.4 的 `dependency`）。
@@ -1321,71 +1305,7 @@ impl ToolExecutor {
             .await
     }
 
-    /// `update_plan` 的收尾：上一版计划从**这条 Run 的日志**折出来（与在线状态同一个
-    /// fold），和这一版比较；结果是这一版的快照加上给模型的提醒。第二个返回值是"完成了
-    /// 一个先前登记过的步骤"——计划边界。
-    ///
-    /// 上一世已经 `start_call` 过的那次：没有副作用，不核对，把结果再落到那次尝试上就是了
-    /// ——上一版计划仍从日志里读，这次调用自己还没有结果，不会算进去。
-    async fn settle_plan(
-        &self,
-        request: &CallRequest,
-        env: &CallEnv,
-        plan: &ExecutionPlan,
-        attempt: AttemptId,
-    ) -> Result<(CallSettlement, bool), ExecError> {
-        // `prepare` 校验过；这里还解不出来只可能是一份从账本读回的旧计划，照实报失败。
-        let update = match serde_json::from_value::<PlanUpdate>(plan.args.clone()) {
-            Ok(update) => update
-                .validate()
-                .map(|()| update)
-                .map_err(|e| e.to_string()),
-            Err(error) => Err(error.to_string()),
-        };
-        let update = match update {
-            Ok(update) => update,
-            Err(error) => {
-                let content = format!("update_plan 的计划不合法：{error}");
-                let settlement = self
-                    .settle_orchestration(
-                        request,
-                        env,
-                        attempt,
-                        serde_json::json!({ "error": content }),
-                        content,
-                        true,
-                    )
-                    .await?;
-                return Ok((settlement, false));
-            }
-        };
-
-        let events = self.events_of(&env.session).await?;
-        let previous = online_state(&events, &env.run).plan;
-        let transition = analyze_transition(&previous, &update.steps);
-        let boundary = !transition.completed.is_empty();
-        let completed: Vec<&str> = transition
-            .completed
-            .iter()
-            .map(|step| step.id.as_str())
-            .collect();
-        let result = serde_json::json!({
-            "boundary": boundary,
-            "completed_step_ids": completed,
-            "progress_recorded": boundary && update.progress.is_some(),
-            "plan": update.steps,
-        });
-        let content = std::iter::once(format_snapshot(&update.steps))
-            .chain(transition.advice)
-            .collect::<Vec<_>>()
-            .join("\n");
-        let settlement = self
-            .settle_orchestration(request, env, attempt, result, content, false)
-            .await?;
-        Ok((settlement, boundary))
-    }
-
-    /// `dispatch` / `follow` / `update_plan` 共用的收尾：给那次尝试写一条结果，交回模型
+    /// `dispatch` / `follow` / `monitor` 共用的收尾：给那次尝试写一条结果，交回模型
     /// 一句话。
     async fn settle_orchestration(
         &self,
@@ -1645,7 +1565,7 @@ enum Begin {
     /// 已经有结论：不需要执行（工具名不认识、参数准备不出来、被拒、核对收口），或者停在
     /// 交给人的判断上。
     Settled(CallSettlement),
-    /// 放行过的编排调用（delegate / dispatch / follow / update_plan）：屏障，
+    /// 放行过的编排调用（delegate / dispatch / follow / monitor）：屏障，
     /// `execute_round` 先收完在飞的，才 `start_call` 并做它的事（[`Orchestrated`]）。
     Orchestrate(Box<Orchestrated>),
 }
@@ -1683,8 +1603,6 @@ enum Orchestration {
         monitors: Arc<dyn Monitors>,
         monitor_id: String,
     },
-    /// 记一版计划，和日志里的上一版比较。
-    UpdatePlan,
 }
 
 enum OrchestrationStart {
@@ -1797,14 +1715,12 @@ fn finish(
     stop: Option<RoundStop>,
     queue: VecDeque<(usize, CallRequest)>,
     mut settled: Vec<(usize, ToolResultForModel)>,
-    plan_boundary: bool,
 ) -> RoundOutcome {
     settled.sort_by_key(|(index, _)| *index);
     RoundOutcome {
         results: settled.into_iter().map(|(_, result)| result).collect(),
         stop,
         remaining: queue.into_iter().map(|(_, request)| request).collect(),
-        plan_boundary,
     }
 }
 

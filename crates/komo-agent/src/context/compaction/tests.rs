@@ -1,6 +1,6 @@
 use super::*;
 use crate::context::DecayCandidate;
-use komo_kernel::compaction::{CompactionDebt, PlanStatus};
+use komo_kernel::compaction::{CompactionDebt, CompactionReason};
 use komo_kernel::test_support::sample_model;
 use komo_kernel::types::ids::ToolCallId;
 use komo_kernel::types::turn::{ToolCallRequest, ToolResultForModel};
@@ -43,7 +43,7 @@ fn result(seq: u64, id: &str, content: &str) -> ReplayMessage {
     }
 }
 
-/// 一条历史 Run 的两句转写 → 这条 Run：任务、读一个大文件、跑一条命令、报一次计划。
+/// 一条历史 Run 的两句转写 → 这条 Run：任务、读一个大文件、跑一条命令、搜一次。
 fn context() -> AgentContext {
     let big = format!(
         "[read · 完成]\n{}\n完整输出：{ARTIFACT}",
@@ -64,8 +64,8 @@ fn context() -> AgentContext {
                 serde_json::json!({ "command": "cargo test" }),
             ),
             result(14, "c2", "[bash · 完成]\ntest result: ok"),
-            call(15, "c3", "update_plan", serde_json::json!({ "steps": [] })),
-            result(16, "c3", "<komo-plan/>"),
+            call(15, "c3", "rg", serde_json::json!({ "pattern": "b" })),
+            result(16, "c3", "[rg · 完成]\nb.rs:1:b"),
         ],
         run_from: 2,
         decay_candidates: Vec::new(),
@@ -147,7 +147,7 @@ fn stored_provider_blocks_are_what_gets_priced() {
 fn the_cut_archives_whole_rounds_before_the_kept_tail() {
     let context = context();
     let pricing = price(&context, &tools());
-    // 只留最后一轮（update_plan 那一轮）。
+    // 只留最后一轮（rg 那一轮）。
     let cut = pricing.cut(1).expect("切得出来");
     assert_eq!(cut.first_kept, Seq(15));
     assert_eq!(cut.archived, 3..7);
@@ -158,40 +158,12 @@ fn the_cut_archives_whole_rounds_before_the_kept_tail() {
     assert_eq!(pricing.cut(u64::MAX), None, "全都要留就切不出");
 }
 
-fn plan_steps() -> Vec<PlanStep> {
-    vec![
-        PlanStep {
-            id: "a".into(),
-            goal: "做 a".into(),
-            status: PlanStatus::Completed,
-        },
-        PlanStep {
-            id: "b".into(),
-            goal: "做 b".into(),
-            status: PlanStatus::InProgress,
-        },
-    ]
-}
-
-fn progress() -> Vec<ProgressSummary> {
-    vec![ProgressSummary {
-        step_id: "a".into(),
-        goal: "做 a".into(),
-        files_changed: vec!["src/a.rs".into()],
-        verification: vec!["cargo test 通过".into()],
-        decisions: vec!["用 BTreeMap".into()],
-        next_work: vec!["做 b".into()],
-    }]
-}
-
 #[test]
 fn the_summary_request_is_one_plain_text_message_without_tools() {
     let context = context();
     let request = summary_request(
         Some("把 a 和 b 都做完"),
         &context.messages[3..7],
-        &plan_steps(),
-        &progress(),
         &SessionId::from_raw("sess-1"),
         &RunId::from_raw("run-1"),
         &sample_model(),
@@ -208,27 +180,15 @@ fn the_summary_request_is_one_plain_text_message_without_tools() {
 
     let text = only.text.as_deref().unwrap();
     assert!(text.contains("把 a 和 b 都做完"), "{text}");
-    assert!(
-        text.contains(&format_snapshot(&plan_steps())),
-        "带着当前计划"
-    );
-    for piece in ["src/a.rs", "cargo test 通过", "用 BTreeMap"] {
-        assert!(text.contains(piece), "带着进度：{piece}");
-    }
     assert!(text.contains(ARTIFACT), "artifact 引用原样保留");
     assert!(text.contains(r#"[助手调用 bash]"#) && text.contains("cargo test"));
     assert!(text.contains("test result: ok"));
 }
 
-fn online(boundary: bool) -> OnlineState {
+fn online() -> OnlineState {
     OnlineState {
-        plan: plan_steps(),
-        pending_progress: progress(),
         request_count: 4,
-        last_boundary_request_count: 4,
-        completed_boundary_request_counts: vec![3],
         last_context_tokens: Some(100),
-        pending_boundary: boundary,
         ..OnlineState::default()
     }
 }
@@ -294,17 +254,33 @@ fn tight_window() -> u64 {
     price(&context(), &tools()).write_tokens + 16_384
 }
 
+/// 只有贴着窗口才压：没有窗口、窗口很大都不动，账再好也不动；贴着就不看账，压。
 #[test]
-fn a_profitable_boundary_compacts_and_carries_the_plan_into_the_summary_request() {
-    let Plan::Compact(job) = decide_with(&online(true), &settings(1.25), None) else {
-        panic!("划算的边界应当压");
+fn only_a_full_window_compacts() {
+    assert!(
+        matches!(decide_with(&online(), &settings(1.25), None), Plan::Nothing),
+        "没有窗口：什么都不做"
+    );
+    assert!(matches!(
+        decide_with(&online(), &settings(1.25), Some(1_000_000)),
+        Plan::Nothing
+    ));
+    let Plan::Compact(job) = decide_with(&online(), &settings(1e9), Some(tight_window())) else {
+        panic!("贴着窗口要压");
     };
+    assert_eq!(job.decision.reason, CompactionReason::WindowProtection);
     assert_eq!(job.first_kept, Seq(15));
-    assert_eq!(job.decision.reason, CompactionReason::Economic);
     assert!(job.request.tools.is_empty());
     let text = job.request.messages[0].text.as_deref().unwrap();
-    assert!(text.contains(&format_snapshot(&plan_steps())));
+    assert!(text.contains("把 a 和 b 都做完"), "带着任务：{text}");
     assert!(text.contains(ARTIFACT));
+}
+
+#[test]
+fn a_compaction_takes_on_debt_by_the_cache_ratio() {
+    let Plan::Compact(job) = decide_with(&online(), &settings(1.25), Some(tight_window())) else {
+        panic!("贴着窗口要压");
+    };
     assert_eq!(
         job.decision.debt(),
         CompactionDebt {
@@ -314,44 +290,15 @@ fn a_profitable_boundary_compacts_and_carries_the_plan_into_the_summary_request(
     );
 }
 
+/// 模型窗口很大（或不知道）时，`max_context_tokens` 就是贴窗口的线。
 #[test]
-fn an_unprofitable_boundary_is_skipped_with_its_decision() {
-    let Plan::Skip { reason, decision } = decide_with(&online(true), &settings(1e9), None) else {
-        panic!("算不过来的边界要记 skipped");
-    };
-    assert_eq!(reason, "deferred_economic");
-    assert!(!decision.compact);
-}
-
-#[test]
-fn off_a_boundary_only_the_window_compacts() {
-    let economic = settings(1.25);
-    assert!(
-        matches!(decide_with(&online(false), &economic, None), Plan::Nothing),
-        "不在边界、没有窗口：什么都不做"
-    );
-    // 窗口很大：不贴着，就算账算得过来也不在边界之间压。
-    assert!(matches!(
-        decide_with(&online(false), &economic, Some(1_000_000)),
-        Plan::Nothing
-    ));
-    // 窗口小到贴着：不看账，压。
-    let tight = price(&context(), &tools()).write_tokens + 16_384;
-    let Plan::Compact(job) = decide_with(&online(false), &settings(1e9), Some(tight)) else {
-        panic!("贴着窗口要压");
-    };
-    assert_eq!(job.decision.reason, CompactionReason::WindowProtection);
-}
-
-/// 模型窗口很大（或不知道）时，`max_context_tokens` 就是贴窗口的线：不在边界上也压。
-#[test]
-fn the_context_cap_compacts_off_a_boundary_even_with_a_huge_window() {
+fn the_context_cap_compacts_even_with_a_huge_window() {
     let capped = CompactionSettings {
         max_context_tokens: price(&context(), &tools()).write_tokens,
         ..settings(1e9)
     };
     for window in [None, Some(1_000_000)] {
-        let Plan::Compact(job) = decide_with(&online(false), &capped, window) else {
+        let Plan::Compact(job) = decide_with(&online(), &capped, window) else {
             panic!("到了上限要压（窗口 {window:?}）");
         };
         assert_eq!(job.decision.reason, CompactionReason::WindowProtection);
@@ -359,30 +306,21 @@ fn the_context_cap_compacts_off_a_boundary_even_with_a_huge_window() {
 }
 
 #[test]
-fn never_twice_without_a_request_and_not_again_after_a_refusal_until_a_boundary() {
-    let tight = price(&context(), &tools()).write_tokens + 16_384;
-    let mut just_compacted = online(false);
+fn never_twice_without_a_request_and_not_again_after_a_refusal() {
+    let mut just_compacted = online();
     just_compacted.last_compaction_request_count = Some(just_compacted.request_count);
     just_compacted.compaction_count = 1;
     assert!(matches!(
-        decide_with(&just_compacted, &settings(1.25), Some(tight)),
+        decide_with(&just_compacted, &settings(1.25), Some(tight_window())),
         Plan::Nothing
     ));
 
-    let mut refused = online(false);
+    let mut refused = online();
     refused.compaction_refused = true;
     assert!(matches!(
-        decide_with(&refused, &settings(1.25), Some(tight)),
+        decide_with(&refused, &settings(1.25), Some(tight_window())),
         Plan::Nothing
     ));
-    refused.pending_boundary = true;
-    assert!(
-        matches!(
-            decide_with(&refused, &settings(1.25), Some(tight)),
-            Plan::Compact(_)
-        ),
-        "新的边界照常决策"
-    );
 }
 
 #[test]
@@ -390,26 +328,19 @@ fn a_compaction_that_cannot_get_below_the_reserve_is_not_attempted() {
     // 窗口只比系统提示大一点：压完还是贴着。
     let floor = estimate_tokens(&context().system_prompt);
     assert!(matches!(
-        decide_with(&online(false), &settings(1.25), Some(floor + 16_384)),
+        decide_with(&online(), &settings(1.25), Some(floor + 16_384)),
         Plan::Nothing
     ));
-    let Plan::Skip { reason, decision } =
-        decide_with(&online(true), &settings(1.25), Some(floor + 16_384))
-    else {
-        panic!("边界上要记 skipped");
-    };
-    assert!(reason.starts_with("压完仍贴着窗口"), "{reason}");
-    assert!(!decision.compact);
 }
 
-/// 缓存已冷：改写不欠债，有资格的全换，连计划边界与窗口都不用等。
+/// 缓存已冷：改写不欠债，有资格的全换，不用等窗口。
 #[test]
 fn a_cold_cache_decays_everything_eligible_without_debt() {
     let scenario = Scenario {
         cache_cold: true,
         ..Scenario::new(context_with_candidate())
     };
-    let Plan::Decay(job) = scenario.plan(&online(false), &settings(1e9)) else {
+    let Plan::Decay(job) = scenario.plan(&online(), &settings(1e9)) else {
         panic!("冷缓存有候选就换");
     };
     assert_eq!(job.decision.reason, CompactionReason::CacheCold);
@@ -423,7 +354,7 @@ fn a_cold_cache_decays_everything_eligible_without_debt() {
     assert!(job.decision.archive_tokens > 0, "saving 是两个视图的差");
 }
 
-/// 冷缓存但没有候选：没有东西可换，不在边界也不贴窗口就什么都不动。
+/// 冷缓存但没有候选：没有东西可换，不贴窗口就什么都不动。
 #[test]
 fn a_cold_cache_without_candidates_changes_nothing() {
     let scenario = Scenario {
@@ -431,14 +362,14 @@ fn a_cold_cache_without_candidates_changes_nothing() {
         ..Scenario::new(context())
     };
     assert!(matches!(
-        scenario.plan(&online(false), &settings(1.25)),
+        scenario.plan(&online(), &settings(1.25)),
         Plan::Nothing
     ));
 }
 
-/// 短任务从不改写：缓存是热的、不在边界、不贴窗口，有候选也不动前缀。
+/// 短任务从不改写：缓存是热的、不贴窗口，有候选也不动前缀。
 #[test]
-fn no_boundary_no_pressure_never_rewrites_the_prefix() {
+fn no_pressure_never_rewrites_the_prefix() {
     for enabled in [true, false] {
         let scenario = Scenario {
             window: Some(1_000_000),
@@ -446,7 +377,7 @@ fn no_boundary_no_pressure_never_rewrites_the_prefix() {
             ..Scenario::new(context_with_candidate())
         };
         assert!(matches!(
-            scenario.plan(&online(false), &settings(1.25)),
+            scenario.plan(&online(), &settings(1.25)),
             Plan::Nothing
         ));
     }
@@ -461,72 +392,23 @@ fn window_pressure_decays_before_compacting() {
             compaction_enabled: enabled,
             ..Scenario::new(context_with_candidate())
         };
-        let Plan::Decay(job) = scenario.plan(&online(false), &settings(1e9)) else {
+        let Plan::Decay(job) = scenario.plan(&online(), &settings(1e9)) else {
             panic!("贴着窗口先衰减");
         };
         assert_eq!(job.decision.reason, CompactionReason::WindowProtection);
     }
 }
 
-/// 边界上衰减划算：压缩关着就衰减。
+/// 贴着窗口、压缩关着、也没有可换的：什么都不动。
 #[test]
-fn a_profitable_boundary_decays_when_compaction_is_off() {
+fn a_full_window_with_compaction_off_and_nothing_to_decay_is_left_alone() {
     let scenario = Scenario {
-        compaction_enabled: false,
-        ..Scenario::new(context_with_candidate())
-    };
-    let Plan::Decay(job) = scenario.plan(&online(true), &settings(1.25)) else {
-        panic!("划算的边界应当衰减");
-    };
-    assert_eq!(job.decision.reason, CompactionReason::Economic);
-    assert_eq!(job.decision.memo_tokens, 0);
-}
-
-/// 边界上压缩与衰减都划算：压缩优先。
-#[test]
-fn a_boundary_prefers_compaction_when_it_pays() {
-    let scenario = Scenario::new(context_with_candidate());
-    assert!(matches!(
-        scenario.plan(&online(true), &settings(1.25)),
-        Plan::Compact(_)
-    ));
-}
-
-/// 边界上压缩不划算、衰减也不划算：记一条 skipped，带的是压缩那份账；压缩关着就带衰减的。
-#[test]
-fn a_boundary_where_nothing_pays_is_skipped() {
-    let scenario = Scenario::new(context_with_candidate());
-    let Plan::Skip { reason, decision } = scenario.plan(&online(true), &settings(1e9)) else {
-        panic!("都算不过来的边界要记 skipped");
-    };
-    assert_eq!(reason, "deferred_economic");
-    assert!(!decision.compact);
-    assert!(decision.archive_tokens > 0);
-    let compaction_archive = decision.archive_tokens;
-
-    let scenario = Scenario {
-        compaction_enabled: false,
-        ..Scenario::new(context_with_candidate())
-    };
-    let Plan::Skip { reason, decision } = scenario.plan(&online(true), &settings(1e9)) else {
-        panic!("压缩关着也要记 skipped");
-    };
-    assert_eq!(reason, "deferred_economic");
-    assert_ne!(
-        decision.archive_tokens, compaction_archive,
-        "这是衰减的账：saving 不是压缩的 archive"
-    );
-}
-
-/// 压缩关着、边界上也没有候选：没有东西可算，不记账。
-#[test]
-fn a_boundary_with_compaction_off_and_nothing_to_decay_is_left_alone() {
-    let scenario = Scenario {
+        window: Some(tight_window()),
         compaction_enabled: false,
         ..Scenario::new(context())
     };
     assert!(matches!(
-        scenario.plan(&online(true), &settings(1.25)),
+        scenario.plan(&online(), &settings(1.25)),
         Plan::Nothing
     ));
 }
@@ -541,7 +423,7 @@ fn the_rewrite_cost_depends_on_the_backend() {
             cache_cold: true,
             ..Scenario::new(context_with_candidate())
         };
-        let Plan::Decay(job) = scenario.plan(&online(false), &settings(1.25)) else {
+        let Plan::Decay(job) = scenario.plan(&online(), &settings(1.25)) else {
             panic!("冷缓存应当衰减");
         };
         job.decision.write_tokens

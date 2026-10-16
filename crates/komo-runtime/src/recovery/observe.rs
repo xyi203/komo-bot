@@ -309,7 +309,7 @@ mod tests {
         assert_eq!(log_tail(&events, &run()), LogTail::Final);
     }
 
-    /// 压缩事件落在一轮的结果之后（计划边界上的压缩正是这个位置）：尾部照旧判成"这一轮
+    /// 压缩事件落在一轮的结果之后（一轮收尾之后的压缩正是这个位置）：尾部照旧判成"这一轮
     /// 已落盘、最后一条是结果"，恢复从那里接着走。
     #[test]
     fn a_trailing_compaction_still_reads_as_the_round_it_follows() {

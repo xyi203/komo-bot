@@ -6,8 +6,6 @@
 //! - **预算**：`[execution] model_result_bytes` 说了算（§6），不是写死的 1 KiB；
 //! - **一份事实**：同一个 Run 的下一个执行段回放时，渲染出的字节与刚跑完那次**完全相同**
 //!   ——跑过的调用如此，没跑起来的（工具名不认识）也如此。
-//! - **计划**：`update_plan` 的计划只在日志里，重启之后折出同一份在线状态，回放的结果
-//!   与刚跑完那次逐字节相同。
 //! - **组合调用**：`edit` 带 `then_run` 两步各跑一次，结果是一条，回放逐字节相同。
 //! - **压缩**：账本里一条 `context.compacted` 之后，回放是任务 → 摘要 → 切点起的原样轮次，
 //!   外置的摘要按引用读回来，两次重启之间那一段逐字节不变。
@@ -545,7 +543,7 @@ async fn the_decayed_view_is_the_same_live_and_replayed() {
     );
 }
 
-/// 本次改动要修的回归：短任务里大结果从不被改写。多轮请求都带着大结果，没有计划边界、
+/// 本次改动要修的回归：短任务里大结果从不被改写。多轮请求都带着大结果，
 /// 没有窗口压力、缓存是热的——前缀只追加：日志里没有 `decayed`，驱动从没被要求改过前面
 /// 的消息，大结果每次都是完整正文；停在介入上、重启再答，回放给出的还是同一份完整正文。
 #[tokio::test]
@@ -648,132 +646,6 @@ async fn resuming_after_the_cache_went_cold_decays_at_the_segment_start() {
         revised_at(&llm2, 0).is_empty(),
         "第一次请求就带短视图，不靠 revised"
     );
-}
-
-/// `update_plan` 的计划只在日志里：两次更新（登记 → 完成一步）之后停在介入上，Gateway
-/// 重启，从日志折出的在线状态还是同一份计划、同样一个边界；第二段回放的计划结果与刚跑
-/// 完那次逐字节相同。
-#[tokio::test]
-async fn the_plan_survives_a_restart_and_replays_the_same_bytes() {
-    use komo_kernel::compaction::online_state;
-
-    let home = parking_home(&config_toml(""));
-    let step = |id: &str, status: &str| serde_json::json!({ "id": id, "goal": format!("做 {id}"), "status": status });
-    let llm = FakeLlm::new(vec![vec![
-        call_round(
-            1,
-            "pc-p1",
-            "update_plan",
-            serde_json::json!({ "steps": [step("a", "in_progress"), step("b", "pending")] }),
-        ),
-        call_round(
-            2,
-            "pc-p2",
-            "update_plan",
-            serde_json::json!({
-                "steps": [step("a", "completed"), step("b", "in_progress")],
-                "progress": {
-                    "files_changed": ["a.txt"],
-                    "verification": ["看过了"],
-                    "decisions": [],
-                },
-            }),
-        ),
-        park_call(3, "pc-shell"),
-    ]]);
-    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    let session = gateway.open_session().await;
-    let run = gateway
-        .submit(&session, "plan-1", "分两步做，最后跑一条命令")
-        .await
-        .run;
-
-    let pending = gateway.wait_intervention(&run).await;
-    assert!(
-        pending.question.contains("unsure"),
-        "停在那次结果不明的调用上，update_plan 不停：{}",
-        pending.question
-    );
-    let live = |provider_call_id: &str| {
-        llm.inputs
-            .lock()
-            .expect("轮输入")
-            .iter()
-            .find_map(|input| match input {
-                RoundInput::ToolResults { results, .. } => results
-                    .iter()
-                    .find(|result| result.provider_call_id == provider_call_id)
-                    .map(|result| result.content.clone()),
-                RoundInput::First => None,
-            })
-            .unwrap_or_else(|| panic!("模型没拿到 {provider_call_id} 的结果"))
-    };
-    let (live_p1, live_p2) = (live("pc-p1"), live("pc-p2"));
-    assert!(live_p1.contains("<komo-plan"), "{live_p1}");
-    assert!(
-        live_p2.contains(r#""id":"a","goal":"做 a","status":"completed""#),
-        "{live_p2}"
-    );
-
-    // 计划整份内联在 `tool.planned` 里——外置了，折在线状态那一步读不到它。
-    let events = home.events(&session);
-    let planned: Vec<_> = events
-        .iter()
-        .filter_map(|event| match &event.payload {
-            EventPayload::ToolPlanned(body) if body.plan_ref.is_none() => body
-                .plan
-                .as_ref()
-                .filter(|plan| plan.tool == "update_plan")
-                .map(|_| body.call_id.clone()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(planned.len(), 2, "两次更新的计划都内联：{events:?}");
-    let before = online_state(&events, &run);
-    assert_eq!(before.plan.len(), 2);
-    assert_eq!(
-        before.completed_boundary_request_counts.len(),
-        1,
-        "完成 a 是一个边界"
-    );
-
-    // 重启：在线状态只从日志来。
-    gateway.stop().await;
-    let llm = FakeLlm::finisher("都做完了。");
-    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    assert_eq!(
-        online_state(&home.events(&session), &run),
-        before,
-        "重启之后从日志折出的是同一份在线状态"
-    );
-
-    gateway.answer(&pending.handle, "satisfied").await;
-    let detail = gateway.wait_terminal(&run).await;
-    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
-
-    let after = online_state(&home.events(&session), &run);
-    assert_eq!(after.plan, before.plan);
-    assert_eq!(
-        after.completed_boundary_request_counts.len(),
-        1,
-        "第二段没有新的计划更新"
-    );
-
-    let replayed = |provider_call_id: &str| {
-        llm.requests
-            .lock()
-            .expect("请求")
-            .last()
-            .expect("第二段的请求")
-            .messages
-            .iter()
-            .flat_map(|message| message.tool_results.iter())
-            .find(|result| result.provider_call_id == provider_call_id)
-            .map(|result| result.content.clone())
-            .unwrap_or_else(|| panic!("回放窗口里没有 {provider_call_id}"))
-    };
-    assert_eq!(replayed("pc-p1"), live_p1, "登记那次回放要逐字节相同");
-    assert_eq!(replayed("pc-p2"), live_p2, "完成那次回放要逐字节相同");
 }
 
 /// 在线压缩的回放（§8.3）：三轮 `read` 之后停在介入上，账本里补一条 `context.compacted`

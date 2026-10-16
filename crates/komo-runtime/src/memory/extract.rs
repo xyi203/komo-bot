@@ -23,7 +23,7 @@ use komo_kernel::types::memory::{
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::status::RunState;
-use komo_kernel::types::turn::{RoundInput, TurnRequest};
+use komo_kernel::types::turn::{RoundInput, ToolCallRequest, TurnRequest};
 use serde::Deserialize;
 use time::OffsetDateTime;
 
@@ -31,12 +31,14 @@ use super::{MemoryError, MemoryWorkItem};
 
 /// 提示词版本。**改了提示词就改它**——它进 [`ExtractionMetadata`]，是"这条记忆是怎么来
 /// 的"里唯一能回答"按哪一版规则提的"的那一格（§9.2）。
-pub const PROMPT_VERSION: &str = "memory-extract/v2";
+pub const PROMPT_VERSION: &str = "memory-extract/v3";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
 const MAX_CONTENT_CHARS: usize = 300;
-/// 一次最多接受几条观察。模型话多不该变成库里一次涨一百条。
-const MAX_OBSERVATIONS: usize = 12;
+/// 一次最多接受几条观察。模型话多不该变成库里一次涨一堆；与提示词里的「最多 5 条」一致。
+const MAX_OBSERVATIONS: usize = 5;
+/// 会话窗口里每次工具调用的参数最多留几个字符——够看出读的是哪个文件、跑的是哪条命令。
+const MAX_CALL_ARGUMENT_CHARS: usize = 200;
 /// 交给记忆模型的会话窗口上限（字符）。
 const MAX_TRANSCRIPT_CHARS: usize = 24_000;
 
@@ -143,6 +145,9 @@ impl Transcript {
         let mut roles = BTreeMap::new();
         let mut lines: Vec<String> = Vec::new();
         let mut highest = cursor;
+        // call_id → 「工具名 参数」。工具结果事件自己不带工具名；记忆模型要靠它分清
+        // "读文档读到的"和"排查跑出来的"，前者随时能重读，不值得记。
+        let mut calls: BTreeMap<String, String> = BTreeMap::new();
 
         for event in events {
             // 只看这个 Run 的证据。别的 Run 有它自己的一次处理。
@@ -160,16 +165,29 @@ impl Transcript {
                     Role::User,
                     body.text.clone().unwrap_or_else(|| "（正文外置）".into()),
                 ),
-                EventPayload::MessageAssistant(body) => (
-                    Role::Assistant,
-                    body.text
-                        .clone()
-                        .unwrap_or_else(|| "（只有工具调用）".into()),
-                ),
+                EventPayload::MessageAssistant(body) => {
+                    let mut text = body.text.clone().unwrap_or_default();
+                    for call in &body.tool_calls {
+                        let summary = call_summary(call);
+                        if !text.is_empty() {
+                            text.push(' ');
+                        }
+                        text.push_str(&format!("（调用 {summary}）"));
+                        calls.insert(call.call_id.to_string(), summary);
+                    }
+                    if text.is_empty() {
+                        text = "（空回复）".into();
+                    }
+                    (Role::Assistant, text)
+                }
                 EventPayload::ToolResult(body) => (
                     Role::Tool,
                     format!(
-                        "{:?} · {}",
+                        "{} · {:?} · {}",
+                        calls
+                            .get(&body.call_id.to_string())
+                            .map(String::as_str)
+                            .unwrap_or("（调用未知）"),
                         body.status,
                         body.preview.clone().unwrap_or_else(|| "（无预览）".into())
                     ),
@@ -374,6 +392,20 @@ fn label(role: Role) -> &'static str {
     }
 }
 
+/// 一次工具调用的短摘要：工具名加压成一行、截到 200 字的参数。
+fn call_summary(call: &ToolCallRequest) -> String {
+    if call.arguments.is_null() && call.arguments_ref.is_some() {
+        return format!("{} （参数外置）", call.name);
+    }
+    let arguments = call.arguments.to_string().replace(['\n', '\r'], " ");
+    if arguments.chars().count() > MAX_CALL_ARGUMENT_CHARS {
+        let head: String = arguments.chars().take(MAX_CALL_ARGUMENT_CHARS).collect();
+        format!("{} {head}…", call.name)
+    } else {
+        format!("{} {arguments}", call.name)
+    }
+}
+
 fn one_line(text: &str) -> String {
     let flat = text.replace(['\n', '\r'], " ");
     if flat.chars().count() > 600 {
@@ -545,9 +577,14 @@ const SYSTEM_PROMPT: &str = "\
 4. 只记**以后的对话还用得上**的东西。一次性的操作流水（「删除了 9 个文件」「已重启某服务」\
 「把某配置改成了 X」）、这一轮的进度与结果都不是记忆；从中得出的可复用结论（某命令怎么用、\
 某设备该怎么查）才是。
-5. 不要写入任何密钥、令牌、密码或与任务无关的敏感输出。
-6. 不要报告确认状态或生命周期——那不是你的字段。
-7. 没有值得记的就交回 {\"observations\":[]}。不要编。";
+5. **随时能重新读到的不记。**工具结果前面写着是哪次调用：读文件、搜代码、看 --help 读到的\
+文档、源码、配置、skill 说明、命令用法，原样摘一句不是记忆——下次再读一遍就有，而且比记忆新。\
+值得记的是**翻不到**的东西：用户说的偏好、约定和背景；排查、试错之后才得出的结论；文档没写、\
+踩过才知道的坑。拿不准时，问自己「不记这条，下次是否要重新排查或让用户再说一遍」，否则不记。
+6. 宁缺毋滥：一次最多交回 5 条，挑复用价值最高的；同一件事只写一条。
+7. 不要写入任何密钥、令牌、密码或与任务无关的敏感输出。
+8. 不要报告确认状态或生命周期——那不是你的字段。
+9. 没有值得记的就交回 {\"observations\":[]}。这是常见情况。不要编。";
 
 fn user_prompt(transcript: &Transcript, now: OffsetDateTime) -> String {
     format!(

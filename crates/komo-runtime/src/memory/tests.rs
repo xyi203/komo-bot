@@ -1295,6 +1295,69 @@ fn a_claim_of_user_speech_without_a_user_event_is_demoted_to_an_inference() {
     assert_eq!(observations[1].state, MemoryState::Active);
 }
 
+/// 工具结果那一行标出是哪次调用产生的：记忆模型靠它分清"读文档读到的"（能重读，不记）
+/// 和"排查跑出来的"（§9.3）。
+#[test]
+fn a_tool_result_line_names_the_call_that_produced_it() {
+    let run = RunId::from_raw("run-1");
+    let mut call = assistant_event(2, &run, "");
+    if let EventPayload::MessageAssistant(body) = &mut call.payload {
+        body.text = None;
+        body.tool_calls = vec![komo_kernel::types::turn::ToolCallRequest {
+            call_id: ToolCallId::from_raw("call-1"),
+            provider_call_id: "p-1".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": "docs/komo_bot.md" }),
+            arguments_ref: None,
+        }];
+    }
+    let events = vec![
+        user_event(1, &run, "看看设计文档"),
+        call,
+        tool_event(3, &run, "## 9. Memory"),
+    ];
+
+    let rendered = transcript(&events).rendered;
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert!(
+        lines[1].contains(r#"（调用 read {"path":"docs/komo_bot.md"}）"#),
+        "{rendered}"
+    );
+    assert!(
+        lines[2].contains(r#"read {"path":"docs/komo_bot.md"} · Completed · ## 9. Memory"#),
+        "{rendered}"
+    );
+}
+
+/// 一个 Run 最多收 5 条：模型话多不该变成库里一次涨一堆。
+#[test]
+fn a_run_yields_at_most_five_observations() {
+    let run = RunId::from_raw("run-1");
+    let events = vec![user_event(1, &run, "记几条偏好")];
+    let transcript = transcript(&events);
+    let raw: Vec<RawObservation> = (0..8)
+        .map(|index| {
+            serde_json::from_value(serde_json::json!({
+                "content": format!("偏好 {index}"),
+                "kind": "preference",
+                "scope": "personal",
+                "said_by": "user_statement",
+                "evidence": ["evt-1"],
+            }))
+            .unwrap()
+        })
+        .collect();
+
+    let observations = transcript.validate(
+        raw,
+        &work_item(RunState::Completed, interactive()),
+        &model("memory-model", None),
+        NOW,
+    );
+    assert_eq!(observations.len(), 5);
+    assert_eq!(observations[4].content, "偏好 4", "按模型给的顺序留前面的");
+}
+
 /// 「取消、失败或结果未知的动作不能整理成成功经验」，以及「Cron 不能从自己的报告推断用户
 /// 偏好」（§9.3）。
 #[test]

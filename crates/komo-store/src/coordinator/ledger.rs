@@ -876,8 +876,9 @@ impl Ledger for Coordinator {
     }
 
     /// 插话（§6）。资格在 state.db 上判（宿主正在跑、是主 Run；输入是它后面的顶层 Run、
-    /// 还在排队、模型快照与宿主相同），"要不要插话"读那条输入的 `run.accepted`（它只在
-    /// JSONL 里）。每并一条走正向顺序：`run.absorbed` 追加并同步 → 派生提交成 `absorbed`。
+    /// 还在排队、模型快照与来源对端都与宿主相同），"要不要插话"读那条输入的 `run.accepted`
+    /// （它只在 JSONL 里）。对端不同不并：并进去的话由宿主作答，回复就投到了宿主的对端上
+    /// （`task` 交回的结果按任务 Run 的来源对端受理，§6）。每并一条走正向顺序：`run.absorbed` 追加并同步 → 派生提交成 `absorbed`。
     ///
     /// 一轮收尾问一次，通常一条候选都没有：那就是一次按会话索引的读，不碰日志。
     async fn absorb_interjections(&self, host: &RunId) -> Result<Vec<RunId>, LedgerError> {
@@ -916,6 +917,7 @@ impl Ledger for Coordinator {
                             && runs::order_key(row) > host_key
                             && row.model_snapshot == host.model_snapshot
                             && row.effort == host.effort
+                            && row.peer == host.peer
                         {
                             out.push((runs::order_key(row), row.id.clone(), row.input_seq));
                         }
@@ -1515,6 +1517,67 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.state, RunState::Queued);
+    }
+
+    /// 来源对端不同的不并：并进去由宿主作答，回复会投到宿主的对端上。`task` 交回的结果
+    /// 按任务 Run 的来源对端受理，与宿主同一个对端才并（§6）。
+    #[tokio::test]
+    async fn an_interjection_from_another_peer_is_not_absorbed() {
+        use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform};
+        let f = fixture().await;
+        let queue = crate::repos::queue::TursoRunQueue::new(f.db.clone());
+        let executor = ExecutorId::from_raw("exec-1");
+        let home = ChannelPeer::new(ChannelPlatform::Telegram, "111");
+        let host = f
+            .coordinator
+            .accept_input(AcceptInput {
+                peer: Some(home.clone()),
+                ..input("tg:1", "看下 A", &f.session)
+            })
+            .await
+            .unwrap();
+        let claimed = queue
+            .claim_run(&host.run, &executor)
+            .await
+            .unwrap()
+            .expect("领得到");
+        f.coordinator
+            .start_run(&host.run, &executor, claimed.generation)
+            .await
+            .unwrap();
+        let elsewhere = f
+            .coordinator
+            .accept_input(AcceptInput {
+                interject: true,
+                peer: Some(ChannelPeer::new(ChannelPlatform::Telegram, "222")),
+                ..input("task-result:a", "别处的结果", &f.session)
+            })
+            .await
+            .unwrap();
+        let no_peer = f
+            .coordinator
+            .accept_input(AcceptInput {
+                interject: true,
+                ..input("task-result:b", "没有对端的结果", &f.session)
+            })
+            .await
+            .unwrap();
+        let same = f
+            .coordinator
+            .accept_input(AcceptInput {
+                interject: true,
+                peer: Some(home),
+                ..input("task-result:c", "同一个对端的结果", &f.session)
+            })
+            .await
+            .unwrap();
+
+        let absorbed = f.coordinator.absorb_interjections(&host.run).await.unwrap();
+        assert_eq!(absorbed, vec![same.run.clone()]);
+        for run in [&elsewhere.run, &no_peer.run] {
+            let row = crate::repos::runs::get(&f.db, run).await.unwrap().unwrap();
+            assert_eq!(row.state, RunState::Waiting, "对端不同照常排队");
+        }
     }
 
     /// 崩在 `run.absorbed` 已同步、库还没提交之间：backfill 走同一处派生，补出来的就是

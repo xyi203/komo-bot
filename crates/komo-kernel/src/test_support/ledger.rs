@@ -573,7 +573,7 @@ impl Ledger for MemLedger {
     }
 
     /// 与 `Coordinator` 同一套判据，只是从折出来的现状里读：宿主是正在跑的主 Run，输入
-    /// 是它后面受理的、要求插话的、还没开跑的顶层 Run，且模型与宿主相同。
+    /// 是它后面受理的、要求插话的、还没开跑的顶层 Run，且模型与来源对端都与宿主相同。
     async fn absorb_interjections(&self, host: &RunId) -> Result<Vec<RunId>, LedgerError> {
         let mut state = self.state.lock().expect("账本");
         let session = state
@@ -583,10 +583,10 @@ impl Ledger for MemLedger {
             .ok_or_else(|| LedgerError::NotFound {
                 what: format!("run {host}"),
             })?;
-        let model_of = |run: &RunId| {
+        let model_and_peer_of = |run: &RunId| {
             state.events.iter().find_map(|event| match &event.payload {
                 EventPayload::RunAccepted(body) if event.run.as_ref() == Some(run) => {
-                    Some(body.model.clone())
+                    Some((body.model.clone(), body.peer.clone()))
                 }
                 _ => None,
             })
@@ -606,7 +606,7 @@ impl Ledger for MemLedger {
                     && run.delegate.is_none()
                     && run.first_seq > view.first_seq
                     && run.status.awaits_claim()
-                    && model_of(&run.run) == model_of(host)
+                    && model_and_peer_of(&run.run) == model_and_peer_of(host)
             })
             .collect();
         candidates.sort_by_key(|run| run.first_seq);

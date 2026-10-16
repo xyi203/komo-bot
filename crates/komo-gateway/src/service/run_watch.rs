@@ -326,6 +326,12 @@ async fn step(
             .await;
             Step::Done
         }
+        // 并进了正在跑的那条（§6 插话）：回答在宿主那里，由宿主的看客投出去；这一条没有
+        // 自己的回复要投，也不再有终态帧。
+        EventPayload::RunAbsorbed(_) => {
+            state.release_dependents().await;
+            Step::Done
+        }
         // 操作者在清单上放弃（§7.5）：**与取消分得开**——不是用户不想跑了，而是这件事
         // 不会再有下文。话也要说得不一样，否则那个 Run 看起来像是被人取消的。
         EventPayload::RunAbandoned(body) => {

@@ -36,7 +36,7 @@ use crossterm::style::{
     Attribute, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
 };
 use crossterm::terminal::{
-    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, disable_raw_mode,
+    BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate, SetTitle, disable_raw_mode,
     enable_raw_mode,
 };
 use crossterm::{execute, queue};
@@ -157,6 +157,10 @@ pub async fn run_tui(
         .map(|path| path.display().to_string())
         .unwrap_or_default();
     // 只排进这一帧，跟着下面第一次 `render` 一起写出去。
+    let _ = queue!(
+        terminal.terminal.backend_mut(),
+        SetTitle(render::title(&cwd))
+    );
     let _ = terminal.commit(render::banner(&app, &cwd));
     let mut emitted = Emitted::new();
     let mut ticker = tokio::time::interval(TICK);

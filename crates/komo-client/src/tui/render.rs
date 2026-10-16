@@ -392,6 +392,22 @@ pub fn banner(app: &App, cwd: &str) -> Vec<Line<'static>> {
     vec![Line::from(head), Line::default()]
 }
 
+/// 终端标签页上的标题：`κ` 加当前目录的最后一段（照 pi 的 `π - komo-bot`）。
+///
+/// 控制字符滤掉：目录名里混进一个 BEL 就会提前收掉这条 OSC，剩下的字节落到屏幕上。
+pub fn title(cwd: &str) -> String {
+    let name = std::path::Path::new(cwd)
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_default();
+    let name: String = name.chars().filter(|c| !c.is_control()).collect();
+    if name.is_empty() {
+        "κ".into()
+    } else {
+        format!("κ {name}")
+    }
+}
+
 fn run_colour(state: RunState) -> Color {
     match state {
         RunState::Accepted | RunState::Queued | RunState::Running => Color::Cyan,
@@ -656,6 +672,14 @@ fn main() {
                 row.trim_end().to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_title_is_kappa_and_the_directory_name() {
+        assert_eq!(title("/Users/x/01-code/komo-bot"), "κ komo-bot");
+        assert_eq!(title("/"), "κ", "根目录没有最后一段");
+        assert_eq!(title(""), "κ", "取不到当前目录");
+        assert_eq!(title("/tmp/a\u{7}b"), "κ ab", "控制字符不进 OSC");
     }
 
     /// **光标要落在输入框里、落在刚打完那个字的后面。** 不摆这一下，人在框里打字、插入符

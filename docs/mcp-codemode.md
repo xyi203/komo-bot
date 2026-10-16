@@ -159,7 +159,7 @@ raw source grammar 是后续优化，不作为功能依赖。
 
 脚本是 async 函数体，支持 `await`、`return`、`text(value)`、`exit()`。
 不提供 `process`、文件系统、网络、模块加载、计时器、凭证或 Gateway HTTP token。
-不能调用另一个 codemode，也不能调用 delegate/dispatch/follow 等编排入口。
+不能调用另一个 codemode，也不能调用 task（2026-10-16 之前的 delegate/dispatch/follow）等编排入口。
 
 MCP 调用返回 `{ content, structuredContent?, isError? }`；服务返回的业务错误保留为
 结构化结果。参数错误、能力面拒绝与非只读计划则拒绝该 Promise。

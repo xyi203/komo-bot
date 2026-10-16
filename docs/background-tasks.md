@@ -2,7 +2,7 @@
 
 > 状态：已落地（2026-10-08）。取代 `docs/home-dispatcher.md` 那套"home 改成分发器"的设计；
 > 与 `docs/komo_bot.md` 冲突处以本文为准。
-> 2026-10-16 定、代码待改：`dispatch` + `follow` 合成 `task`，同步 `delegate` 删掉、子代理并进来，
+> 2026-10-16 定并落地：`dispatch` + `follow` 合成 `task`，同步 `delegate` 删掉、子代理并进来，
 > 加 `model` / `effort` / `contract`，交回的结果在宿主还在跑时并入（§2a；`docs/komo_bot.md` §2、§4、§6）。
 
 ## 1. 问题
@@ -53,7 +53,7 @@
   会产生的介入只有 `blocked`）：消息前面
   挂上 `后台任务 #短号「标题」：`，同时看着几个任务时分得清是哪一个在问。
 
-## 2a. `task`：合并 `dispatch` / `follow` / `delegate`（2026-10-16 定，代码待改）
+## 2a. `task`：合并 `dispatch` / `follow` / `delegate`（2026-10-16 定并落地）
 
 同步的 `delegate`（子 Run 在同一 Session 里、父等它）删掉。不阻塞的子 Run 留不在父的 Session
 里——同一 Session 严格串行，父不等它，它就排在父后面；挪出去就是任务会话。它原来多出来的
@@ -64,15 +64,18 @@ task(prompt, title, task_id?, model?, effort?, contract?)
 ```
 
 - **`model` / `effort`**：alias 与档位按当前配置快照在 `prepare` 校验，可选 alias 以 enum 写进
-  工具说明。省略时新任务用 Agent 的默认，接着做沿用那个任务上一条 Run 的。透传给任务 Run 的
+  工具说明（只给 `effort` 时所选模型在派出那一步才知道，档位在 `GatewayTaskSpawner` 里校验）。省略时新任务用 Agent 的默认，接着做沿用那个任务上一条 Run 的。透传给任务 Run 的
   `submit`（冻结进它的快照）；**交回 home 的那条输入不带**，按 home 自己的默认。
-- **`contract`**：任务会话的提示带上它；`report_to_parent` 交回之前用同一份校验器复验任务的
-  最后回复，复验结论写进交回的输入（不合契约也照样交回）。
+- **`contract`**：冻结进任务 Run 的快照（`RunSnapshot.contract`），装配时补在那条 Run 的任务
+  后面；`report_to_parent` 交回之前用同一份校验器复验任务的最后回复，复验结论写进交回的输入
+  （不合契约也照样交回）。
+- **Cron 触发的 Run 不能派**：`prepare` 拒绝——结果交回 Cron 会话时没有对端也没有看客。
 - **不是子代理**：同一个 Agent、主 Agent 的装配（记忆、skills 照常），能力面里没有 `task`。
   原来子代理那套（子代理版身份、不召回记忆、`ReplayScope::Thread`、`without_delegate`）只为
   升级时还没跑完的旧子 Run 留着。
-- **并入**：交回的输入带插话标记，home 还在跑时在一轮收尾后并进来（`docs/komo_bot.md` §6），
-  不另开 Run；home 空闲时照旧开一条。
+- **并入**：交回的输入带插话标记，home 还在跑、且来源对端相同时在一轮收尾后并进来
+  （`docs/komo_bot.md` §6），不另开 Run；home 空闲时照旧开一条。被并走的那条的看客见到
+  `run.absorbed` 就收工，回复由宿主的看客投。
 - 旧的 `dispatch` / `follow` / `delegate` 调用按落盘时的名字回放，不改写。
 
 ## 3. 重启

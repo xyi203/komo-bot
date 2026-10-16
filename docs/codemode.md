@@ -132,7 +132,7 @@ Monty 的 `max_turn_duration` 不含等宿主答复的时间，所以墙钟由�
 `tools.<name>(**args)` → executor 的持久化子调用路径，依次：
 
 1. 名字必须在当前 Run 的 `AgentSurface` 及 executor 工具表里；不回退到全局目录。
-   `bash`、`edit`、`write`、`codemode`、`delegate`、`dispatch`、`follow`、`monitor`、
+   `bash`、`edit`、`write`、`codemode`、`task`（2026-10-16 之前是 `delegate`、`dispatch`、`follow`）、`monitor`、
    `monitor_stop` 不能在脚本里调（`tools/codemode.rs` 的 `NOT_IN_SCRIPTS`），也不进
    `TOOLS`。脚本正文里字面写着 `tools.<这些名字>(` 的，`codemode` 的 `prepare` 就拒、脚本不运行：
    实测模型常把 `tools.bash("git status")` 当成只读写进脚本，跑到那一行才被拒，整段作废，前面的
@@ -298,7 +298,7 @@ uncertain，Safe 才能按双 Safe 准则重做。`start` 已提交但第一个 
 | `komo-runtime` `codemode/prelude.py` | 拼在脚本前面：`ToolError`、`tools`、BM25 发现函数 |
 | `komo-runtime` `limits.rs` | `resident_bytes`：worker 的常驻内存读数 |
 | `komo-runtime` `tools/protect.rs` | `Protected`：komo 自己的状态名单，`write` / `edit` / `bash` 与 codemode worker 共用 |
-| `komo-runtime` `tools/codemode.rs` | `CodemodeTool`：定义 + `prepare`；`execute` 不该被走到（与 `dispatch` 同一模式） |
+| `komo-runtime` `tools/codemode.rs` | `CodemodeTool`：定义 + `prepare`；`execute` 不该被走到（与 `task` 同一模式） |
 | `komo-runtime` `executor/codemode.rs` | 起 worker、能力与 prepare 检查、子输出发布、宿主 fatal 锁、`start` 指纹 |
 | `komo-runtime` `executor/codemode_journal.rs` | journal 阶段、稳定身份、分页读取与回放校验 |
 | `komo-gateway` `service/mod.rs` | 启动时解析 `current_exe()`，注册工具并把 `Worker` 交给执行器 |

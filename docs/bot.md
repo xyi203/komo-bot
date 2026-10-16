@@ -222,7 +222,7 @@ main_session("reviewer")  → session-C
 
 ### 委派仍属于 Run 语义
 
-当前 delegate 在同一个 Session 内创建子 Run，并通过 `ReplayScope::Thread`（它自己那条续跑线）隔离上下文。
+2026-10-16 之前 delegate 在同一个 Session 内创建子 Run，并通过 `ReplayScope::Thread`（它自己那条续跑线）隔离上下文；同步委派删掉之后改由 `task` 派进独立的任务会话（`docs/background-tasks.md`），旧子 Run 仍按这条路收尾。
 
 先保留它。不要为了增加 `SessionKind`，强行把现有每个子 Run 都迁成新 Session。
 
@@ -406,7 +406,7 @@ TargetRef
     read C
 ```
 
-`write`、`edit`、`bash`、`python` 和 `delegate` 先作为顺序屏障。不根据模型声称“没有副作用”就并行。
+`write`、`edit`、`bash`、`python` 和 `delegate`（2026-10-16 起是 `task`）先作为顺序屏障。不根据模型声称“没有副作用”就并行。
 
 要守住的行为是：遇到要停下等人的判定（原稿写的是 Ask；2026-10-11 起只剩 uncertain 之类的介入）后不再启动后续调用；挂起前收齐已启动调用的结果；完成事件按真实发生顺序记录，交给模型时按原始调用关系配对；恢复只处理未收尾调用，不重放整批。
 

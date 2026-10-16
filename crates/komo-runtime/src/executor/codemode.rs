@@ -218,9 +218,10 @@ impl ToolExecutor {
     /// 脚本里发现工具用的说明（`docs/codemode.md` §6）：`names` 里每个工具的说明与 schema，
     /// 以及它们所属的组。不进指纹：发现只影响脚本往哪里调，调用本身已由工具名与参数核对。
     fn script_catalog(&self, names: &[String]) -> ScriptCatalog {
+        let tools = self.tools();
         let mut catalog = ScriptCatalog::default();
         for name in names {
-            let Some(tool) = self.tools.get(name) else {
+            let Some(tool) = tools.get(name) else {
                 continue;
             };
             let definition = tool.definition();
@@ -305,8 +306,8 @@ impl ToolExecutor {
     ) -> Result<Reply, ToolError> {
         let (index, child) = journal.lock().expect("journal").next(name)?;
         // 已记下的结果也要过当前能力面；不回退到全局工具表。
-        let tool = self
-            .tools
+        let tools = self.tools();
+        let tool = tools
             .get(name)
             .filter(|_| env.surface.allows(name) && !NOT_IN_SCRIPTS.contains(&name));
         let mut child_ctx = ctx.clone();

@@ -380,9 +380,9 @@ pub struct GatewayState {
     /// 本进程此刻还在手里的 Run（§8.9 的存活判定）。
     pub in_flight: Arc<InFlight>,
     pub segments: Arc<GatewaySegments>,
-    /// 执行器挂着的工具名。提示里的 skills 目录行按它门控（§5.6 的 `requires_tools:`），
-    /// 而重载重算那一块时要用——那时执行器已经造好了，名字留在这里最省事。
-    pub tool_names: Vec<String>,
+    /// MCP 服务器的连接（`docs/mcp.md` §2.2）：受理 Run 前问它一次，登录后才连上的服务器的
+    /// 工具从这里挂进执行器。
+    pub mcp: Arc<komo_runtime::mcp::McpHub>,
     /// 执行器本身。留一份具名的 `Arc`，只为了 [`Self::wire_task_spawner`]——`dispatch` /
     /// `follow` 的接缝（`TaskSpawner`）要一份 `Arc<GatewayState>`，而执行器是在这份状态
     /// 存在**之前**造出来的，只能在这里回头接上（`docs/background-tasks.md`）。
@@ -444,6 +444,8 @@ pub struct Assembly {
     pub tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
     /// codemode 的 worker（`docs/codemode.md`）；`None` = 没装配，`codemode` 也不在 `tools` 里。
     pub codemode: Option<komo_runtime::codemode::Worker>,
+    /// MCP 连接；`tools` 里已经有启动时连上的那些服务器的工具。
+    pub mcp: Arc<komo_runtime::mcp::McpHub>,
     /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
     pub channels: Vec<Arc<dyn ChannelFactory>>,
 }
@@ -464,6 +466,7 @@ impl GatewayState {
             shared_home,
             tools,
             codemode,
+            mcp,
             channels: factories,
         } = parts;
 
@@ -551,7 +554,6 @@ impl GatewayState {
 
         // §5.6 的目录行：注册表**启动时按快照造一份**，那一块文本按用途现渲染（系统提示
         // 一处、`skill://` 的挂载点一处）——两处同源，不会有"提示里有、读不到"这种事。
-        let tool_names: Vec<String> = tools.iter().map(|tool| tool.definition().name).collect();
         let skills = Arc::new(std::sync::RwLock::new(skills_registry(
             &snapshot,
             shared_home.as_deref(),
@@ -667,7 +669,7 @@ impl GatewayState {
             inbound: std::sync::OnceLock::new(),
             watching: Mutex::new(std::collections::BTreeSet::new()),
             interventions_delivered: Mutex::new(std::collections::BTreeSet::new()),
-            tool_names,
+            mcp,
             tool_executor: executor_tools,
             monitors: std::sync::OnceLock::new(),
             skills,
@@ -732,6 +734,24 @@ impl GatewayState {
             .install_reranker(build_reranker(&self.snapshot(), &self.config));
     }
 
+    /// 执行器此刻挂着的工具名。提示里的 skills 目录行按它门控（§5.6 的 `requires_tools:`）。
+    /// 登录后才连上的 MCP 服务器会让它变长（`docs/mcp.md` §2.2）。
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tool_executor.tool_names()
+    }
+
+    /// 等登录的 MCP 服务器凭证变了就连上，把它的工具挂进执行器（`docs/mcp.md` §2.2，pi 在每个
+    /// turn 开始时做同一件事）。受理 Run 之前调：新名字从这条 Run 起进能力面。
+    async fn refresh_mcp(&self) {
+        let added = self.tool_executor.install(self.mcp.refresh().await);
+        if !added.is_empty() {
+            tracing::info!(
+                tools = added.len(),
+                "MCP 服务器连上了，工具从这条 Run 起可用"
+            );
+        }
+    }
+
     /// 按**当前**快照重装 skill 注册表（§5.6）。
     ///
     /// 配置重载是唯一会动它的时刻：`paths.skill_dirs` 改了、人刚 `komo skills disable` 过，
@@ -740,7 +760,7 @@ impl GatewayState {
     /// 换完渲染出来还是同一段就不吭声——**注册表照换**，因为目录集合本身就是新的事实。
     pub fn refresh_skills_prompt(&self) {
         let snapshot = self.snapshot();
-        let tool_names = self.tool_names.clone();
+        let tool_names = self.tool_names();
         let fresh = skills_registry(&snapshot, self.shared_home.as_deref());
         let mut current = self.skills.write().expect("skills 注册表");
         let before = skills_block(&current, &tool_names);
@@ -1086,9 +1106,12 @@ impl GatewayState {
         // 能力面：Profile 在**这份工具目录**里挑出来的那一份（§4 末）。名字写了、目录里
         // 没有的名字**不算数**，而且必须报出来——静默采纳一份写错的配置，等于让操作者
         // 以为某个工具给了而其实没给。
+        //
+        // 目录先补一次：刚登录的 MCP 服务器这时连上，它的工具进这条 Run 的能力面。
+        self.refresh_mcp().await;
         let surface = komo_agent::surface_of(
             profile,
-            &self.tool_names,
+            &self.tool_names(),
             &super::agent_config_file(&self.config),
         );
 

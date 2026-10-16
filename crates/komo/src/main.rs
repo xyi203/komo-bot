@@ -386,7 +386,7 @@ enum AuthCommand {
 
 #[derive(Subcommand)]
 enum McpAuthCommand {
-    /// 打开浏览器授权（授权码 + PKCE），凭证写进数据目录；之后 `komo gateway restart`。
+    /// 打开浏览器授权（授权码 + PKCE），凭证写进数据目录；在跑的 Gateway 下一条消息时自动连上。
     Login {
         /// `[mcp.servers.<name>]` 里的名字。
         server: String,

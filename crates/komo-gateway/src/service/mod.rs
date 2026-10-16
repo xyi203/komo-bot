@@ -180,7 +180,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         .map_err(|error| ServiceError::Store(error.to_string()))?;
 
     // 4. 装配。
-    let (tools, codemode) = build_tools(&config, &instance_id).await;
+    let (tools, codemode, mcp) = build_tools(&config, &instance_id).await;
     let state = GatewayState::assemble(Assembly {
         home: home.clone(),
         config: Arc::clone(&config),
@@ -194,6 +194,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         shared_home: options.shared_home.clone(),
         tools,
         codemode,
+        mcp,
         channels: options.channels,
     })
     .await
@@ -529,10 +530,15 @@ fn codemode_worker() -> Option<komo_runtime::codemode::Worker> {
 }
 
 /// 六个基础工具（§4）与那条编排操作。`codemode` 随 worker 一起装配（`docs/codemode.md` §3），worker 交给执行器。
+/// MCP 的连接留在 [`komo_runtime::mcp::McpHub`] 里：登录后才连上的服务器，受理 Run 时再把工具挂进来。
 async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
-) -> (Vec<Arc<dyn Tool>>, Option<komo_runtime::codemode::Worker>) {
+) -> (
+    Vec<Arc<dyn Tool>>,
+    Option<komo_runtime::codemode::Worker>,
+    Arc<komo_runtime::mcp::McpHub>,
+) {
     use komo_runtime::tools::{
         BashTool, DelegateTool, DispatchTool, EditTool, FollowTool, MonitorStopTool, MonitorTool,
         ReadTool, RgTool, UpdatePlanTool, WriteTool,
@@ -581,11 +587,16 @@ async fn build_tools(
     // 折出来。
     tools.push(Arc::new(UpdatePlanTool::new()));
     // MCP（`docs/mcp.md`）：启动时连上、列出工具，挂进同一份目录——之后它们与内置工具
-    // 走同一条落账的路。
-    tools.extend(
-        komo_runtime::mcp::connect_all(&snapshot.start_only.mcp, &config.secrets(), config.home())
-            .await,
+    // 走同一条落账的路。要登录的服务器留在 hub 里，登录后再挂（§2.2）。
+    let mcp = Arc::new(
+        komo_runtime::mcp::McpHub::start(
+            &snapshot.start_only.mcp,
+            &config.secrets(),
+            config.home(),
+        )
+        .await,
     );
+    tools.extend(mcp.new_tools());
     // 测试专用的工具（`gate` / `unsure`，见 `test_support`）：只在测试为这个数据目录装过
     // 时才有，生产构建里这一行不存在。
     #[cfg(any(test, feature = "test-support"))]
@@ -596,7 +607,7 @@ async fn build_tools(
     if codemode.is_some() {
         tools.push(Arc::new(komo_runtime::tools::CodemodeTool::new()));
     }
-    (tools, codemode)
+    (tools, codemode, mcp)
 }
 
 /// `komo gateway --foreground` 的主流程：起来，等停机信号，收尾。

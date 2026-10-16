@@ -220,7 +220,9 @@ impl OperatorVerdict {
 }
 
 pub struct ToolExecutor {
-    tools: BTreeMap<String, Arc<dyn Tool>>,
+    /// 全局工具目录。启动后**只追加**（[`Self::install`]：登录后才连上的 MCP 服务器，
+    /// `docs/mcp.md` §2.2），名字一经挂上不换不撤；读的人拿一份快照。
+    tools: std::sync::RwLock<Arc<BTreeMap<String, Arc<dyn Tool>>>>,
     ledger: Arc<dyn Ledger>,
     outputs: Arc<dyn ToolOutputStore>,
     clock: Arc<dyn Clock>,
@@ -242,7 +244,7 @@ pub struct ToolExecutor {
 impl std::fmt::Debug for ToolExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolExecutor")
-            .field("tools", &self.tools.keys().collect::<Vec<_>>())
+            .field("tools", &self.tools().keys().collect::<Vec<_>>())
             .finish_non_exhaustive()
     }
 }
@@ -255,10 +257,12 @@ impl ToolExecutor {
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
-            tools: tools
-                .into_iter()
-                .map(|tool| (tool.definition().name, tool))
-                .collect(),
+            tools: std::sync::RwLock::new(Arc::new(
+                tools
+                    .into_iter()
+                    .map(|tool| (tool.definition().name, tool))
+                    .collect(),
+            )),
             ledger,
             outputs,
             clock,
@@ -308,7 +312,43 @@ impl ToolExecutor {
     /// 它**不是**执行时查找的表——执行看的是 [`CallEnv::surface`]。这两件事分开正是为了
     /// 让"目录里有"不等于"这次能用"（§4 末）。
     pub fn catalog(&self) -> Vec<komo_kernel::types::tool::ToolDefinition> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        self.tools()
+            .values()
+            .map(|tool| tool.definition())
+            .collect()
+    }
+
+    /// 目录里此刻的名字（受理 Run 时按它算能力面）。
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools().keys().cloned().collect()
+    }
+
+    /// 此刻的工具表。拿的是快照：之后 [`Self::install`] 进来的不在里面。
+    fn tools(&self) -> Arc<BTreeMap<String, Arc<dyn Tool>>> {
+        Arc::clone(&self.tools.read().expect("工具目录"))
+    }
+
+    /// 运行中往目录里追加工具：登录后才连上的 MCP 服务器（`docs/mcp.md` §2.2）。已经有的名字
+    /// 不换——在跑的 Run 的能力面里那个名字指的就是它。交回真的加进去的名字。
+    ///
+    /// 已经受理的 Run 不受影响：能力面在受理时冻结，新名字从下一条 Run 起才进来。
+    pub fn install(&self, tools: Vec<Arc<dyn Tool>>) -> Vec<String> {
+        if tools.is_empty() {
+            return Vec::new();
+        }
+        let mut guard = self.tools.write().expect("工具目录");
+        let mut next = BTreeMap::clone(&guard);
+        let mut added = Vec::new();
+        for tool in tools {
+            let name = tool.definition().name;
+            if next.contains_key(&name) {
+                continue;
+            }
+            next.insert(name.clone(), tool);
+            added.push(name);
+        }
+        *guard = Arc::new(next);
+        added
     }
 
     /// 交给模型的工具 Schema：**按能力面的顺序**、只列能力面里真的装着的那些。
@@ -343,9 +383,10 @@ impl ToolExecutor {
         if !self.can_run_codemode(surface) {
             return Vec::new();
         }
+        let tools = self.tools();
         let mut namespaces: Vec<ToolNamespace> = Vec::new();
         for name in surface.names() {
-            let Some(tool) = self.tools.get(name) else {
+            let Some(tool) = tools.get(name) else {
                 continue;
             };
             if tool.exposure() != ToolExposure::Codemode {
@@ -365,7 +406,7 @@ impl ToolExecutor {
         self.codemode.is_some()
             && surface.allows(crate::tools::codemode::CODEMODE_TOOL)
             && self
-                .tools
+                .tools()
                 .contains_key(crate::tools::codemode::CODEMODE_TOOL)
     }
 
@@ -375,17 +416,17 @@ impl ToolExecutor {
         include_codemode_only: bool,
     ) -> Vec<komo_kernel::types::tool::ToolDefinition> {
         let commands = self.can_run_commands(surface);
+        let tools = self.tools();
         surface
             .names()
             .iter()
             .filter(|name| {
                 include_codemode_only
-                    || self
-                        .tools
+                    || tools
                         .get(name.as_str())
                         .is_none_or(|tool| tool.exposure() == ToolExposure::Direct)
             })
-            .filter_map(|name| match self.tools.get(name) {
+            .filter_map(|name| match tools.get(name) {
                 Some(tool) => {
                     let mut definition = tool.definition();
                     if !commands
@@ -409,7 +450,7 @@ impl ToolExecutor {
     /// 这次运行能不能跑命令：能力面里有 `bash`，执行器也装着它。`then_run` 的放行与
     /// schema 都问它。
     fn can_run_commands(&self, surface: &AgentSurface) -> bool {
-        surface.allows("bash") && self.tools.contains_key("bash")
+        surface.allows("bash") && self.tools().contains_key("bash")
     }
 
     /// 一轮里每个调用的调度（§4 末、§6）。
@@ -516,7 +557,8 @@ impl ToolExecutor {
         // （改名、删除）。它也许已经动过手，不能判成"没开始"、更不能停下 Run：与别的 unsafe
         // 中断一样记 uncertain 交给模型。只落了计划、没 started 的确定没执行过（§8.4 第 6 行），
         // 与模型这一轮新发的调用一样照旧被拒。
-        let known = env.surface.allows(&request.tool) && self.tools.contains_key(&request.tool);
+        let tools = self.tools();
+        let known = env.surface.allows(&request.tool) && tools.contains_key(&request.tool);
         if !known
             && let (Some(plan), Some(state)) = (&request.plan, &request.resumed)
             && state.previous_state != ToolCallState::Planned
@@ -540,8 +582,8 @@ impl ToolExecutor {
         }
 
         // 未知工具名：作为错误内容交回模型，**不派发任何东西**（§14 阶段 3）。
-        let Some(tool) = self.tools.get(&request.tool).cloned() else {
-            let known: Vec<&str> = self.tools.keys().map(String::as_str).collect();
+        let Some(tool) = tools.get(&request.tool).cloned() else {
+            let known: Vec<&str> = tools.keys().map(String::as_str).collect();
             let message = format!(
                 "没有名为 {} 的工具；可用的是：{}",
                 request.tool,
@@ -654,7 +696,7 @@ impl ToolExecutor {
                 (Operation::Codemode { code }, _) => {
                     self.run_codemode(code, env, &ctx, writer.as_mut()).await
                 }
-                (_, Some(_)) => match self.tools.get("bash") {
+                (_, Some(_)) => match self.tools().get("bash") {
                     Some(shell) => {
                         crate::tools::fusion::execute_fused(
                             &*tool,

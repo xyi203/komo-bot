@@ -21,11 +21,12 @@ use komo_kernel::types::tool::{
 use rmcp::model::{CallToolResult, ContentBlock};
 
 use super::plan_time;
-use crate::mcp::McpServer;
+use crate::mcp::{CallError, McpConnection};
 
 #[derive(Debug)]
 pub struct McpTool {
-    server: Arc<McpServer>,
+    /// 连接一直在：没连上、断了、要登录，调用时由它当场处理（`docs/mcp.md` §2.2）。
+    server: Arc<McpConnection>,
     /// 服务器上的原名（调用时用它）。
     remote: String,
     definition: ToolDefinition,
@@ -36,7 +37,7 @@ pub struct McpTool {
 impl McpTool {
     /// `name` 是 [`crate::mcp::tool_name`] 给的模型侧名字。
     pub fn new(
-        server: Arc<McpServer>,
+        server: Arc<McpConnection>,
         remote: &rmcp::model::Tool,
         name: String,
         read_only: bool,
@@ -82,7 +83,7 @@ impl Tool for McpTool {
     }
 
     fn namespace(&self) -> Option<ToolNamespace> {
-        Some(self.server.namespace().clone())
+        Some(self.server.namespace())
     }
 
     async fn prepare(
@@ -137,19 +138,23 @@ impl Tool for McpTool {
             serde_json::Value::Object(map) => map.clone(),
             _ => Default::default(),
         };
-        let result = self
-            .server
-            .call(&self.remote, arguments)
-            .await
-            .map_err(|message| {
-                // 请求可能已经到了服务器：只读的当失败重读，其余的说不清发生没有。
-                let message = format!("MCP {} 调用失败：{message}", self.server.name());
-                if self.read_only {
-                    ToolError::Failed { message }
-                } else {
-                    ToolError::Uncertain { message }
-                }
-            })?;
+        let result =
+            self.server
+                .call(&self.remote, arguments)
+                .await
+                .map_err(|error| match error {
+                    // 没连上、凭证被拒：请求没到服务器，确定没执行。
+                    CallError::NotSent(message) => ToolError::Failed { message },
+                    // 请求可能已经到了服务器：只读的当失败重读，其余的说不清发生没有。
+                    CallError::Sent(message) => {
+                        let message = format!("MCP {} 调用失败：{message}", self.server.name());
+                        if self.read_only {
+                            ToolError::Failed { message }
+                        } else {
+                            ToolError::Uncertain { message }
+                        }
+                    }
+                })?;
         let text = render(&result);
         sink.write_stdout(text.as_bytes())
             .await

@@ -665,7 +665,7 @@ pub async fn auth_mcp_login(home: &Path, server: &str) -> Outcome {
         .await
         .map_err(failed)?;
     Ok(format!(
-        "{server} 登录成功，凭证已写入 {}；跑 `komo gateway restart` 让 Gateway 连上它",
+        "{server} 登录成功，凭证已写入 {}；在跑的 Gateway 下一条消息时自动连上，不用重启",
         path.display()
     ))
 }

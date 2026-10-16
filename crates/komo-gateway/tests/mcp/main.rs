@@ -74,11 +74,11 @@ async fn a_read_only_mcp_tool_runs_and_sees_only_declared_env() {
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     assert!(
         gw.state()
-            .tool_names
+            .tool_names()
             .iter()
             .any(|name| name == "mcp__demo__bump"),
         "{:?}",
-        gw.state().tool_names
+        gw.state().tool_names()
     );
 
     let session = gw.open_session().await;
@@ -124,7 +124,7 @@ command = "/nonexistent/mcp-server"
 "#,
     );
     let gw = home.start(FakeLlm::finisher("好")).await;
-    let names = &gw.state().tool_names;
+    let names = &gw.state().tool_names();
     assert!(
         names.iter().any(|name| name == "mcp__demo__echo"),
         "{names:?}"
@@ -155,7 +155,12 @@ tools.mcp__demo__bump()
         text_round(2, "好了"),
     ]]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    assert!(gw.state().tool_names.iter().any(|name| name == "codemode"));
+    assert!(
+        gw.state()
+            .tool_names()
+            .iter()
+            .any(|name| name == "codemode")
+    );
     let session = gw.open_session().await;
     let run = gw.submit(&session, "mcp-cm", "加一").await.run;
     let detail = gw.wait_terminal(&run).await;
@@ -202,7 +207,7 @@ tool_exposure = { "b*" = "hidden" }"#,
     );
     let llm = FakeLlm::finisher("好");
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    let names = &gw.state().tool_names;
+    let names = &gw.state().tool_names();
     assert!(
         names.iter().any(|name| name == "mcp__demo__echo"),
         "{names:?}"
@@ -249,7 +254,12 @@ async fn codemode_side_effecting_mcp_is_journaled_and_only_parent_enters_model_m
         text_round(2, "好了"),
     ]]);
     let gw = home.start(llm.clone()).await;
-    assert!(gw.state().tool_names.iter().any(|name| name == "codemode"));
+    assert!(
+        gw.state()
+            .tool_names()
+            .iter()
+            .any(|name| name == "codemode")
+    );
     let session = gw.open_session().await;
     let run = gw.submit(&session, "cm-write", "加一").await.run;
     assert_eq!(
@@ -299,7 +309,12 @@ async fn codemode_crash_window(delivery_committed: bool) {
             text_round(2, "好了"),
         ]]))
         .await;
-    assert!(gw.state().tool_names.iter().any(|name| name == "codemode"));
+    assert!(
+        gw.state()
+            .tool_names()
+            .iter()
+            .any(|name| name == "codemode")
+    );
     let session = gw.open_session().await;
     let run = gw.submit(&session, "cm-crash", "加一").await.run;
     fault.wait_tripped().await;
@@ -342,4 +357,177 @@ async fn codemode_restart_delivers_completed_unsafe_mcp_result_without_repeating
 #[tokio::test]
 async fn codemode_restart_does_not_repeat_unsafe_mcp_in_uncommitted_delivery_window() {
     codemode_crash_window(false).await;
+}
+
+/// 一台要 OAuth 的 HTTP MCP 服务器（`oauth_server.py`）。服务器此刻认哪个 token 写在一个文件里，
+/// 改它就是"token 作废"；`calls` 每真的执行一次 `whoami` 记一行。
+struct OAuthServer {
+    child: std::process::Child,
+    port: u16,
+    valid: std::path::PathBuf,
+    calls: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+}
+
+impl OAuthServer {
+    fn start(token: &str) -> OAuthServer {
+        use std::io::BufRead as _;
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("valid");
+        let calls = dir.path().join("calls");
+        std::fs::write(&valid, token).unwrap();
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mcp/oauth_server.py");
+        let mut child = std::process::Command::new("python3")
+            .arg(script)
+            .arg(&valid)
+            .arg(&calls)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        OAuthServer {
+            child,
+            port: line.trim().parse().unwrap(),
+            valid,
+            calls,
+            _dir: dir,
+        }
+    }
+
+    fn home(&self) -> Home {
+        Home::with_config(&config_toml(&format!(
+            r#"
+[mcp.servers.secure]
+url = "http://127.0.0.1:{port}/mcp"
+oauth = true
+exposure = "direct"
+"#,
+            port = self.port
+        )))
+    }
+
+    /// 服务器换了一个 token：手里的那个作废。
+    fn rotate(&self, token: &str) {
+        std::fs::write(&self.valid, token).unwrap();
+    }
+
+    /// `komo auth mcp login secure` 落盘的样子：一份带 access token、没有 refresh token 的凭证。
+    fn log_in(&self, home: &Home, token: &str) {
+        let path = komo_runtime::mcp_auth::credentials_path(home.path(), "secure");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let body = serde_json::json!({
+            "client_id": "komo-test",
+            "token_response": { "access_token": token, "token_type": "Bearer" },
+            "granted_scopes": [],
+            "token_received_at": null,
+        });
+        std::fs::write(path, serde_json::to_vec(&body).unwrap()).unwrap();
+    }
+
+    fn calls(&self) -> String {
+        std::fs::read_to_string(&self.calls).unwrap_or_default()
+    }
+}
+
+impl Drop for OAuthServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 启动时还没登录：Gateway 照常起来、这台服务器的工具不在；登录之后（凭证文件写进来）下一条 Run
+/// 受理时连上、工具挂进来，不用重启（`docs/mcp.md` §2.2）。
+#[tokio::test]
+async fn logging_in_after_start_mounts_the_tools_on_the_next_run() {
+    let secure = OAuthServer::start("good");
+    let home = secure.home();
+    let llm = FakeLlm::new(vec![
+        vec![text_round(1, "还没登录")],
+        vec![
+            call_round(1, "pc-1", "mcp__secure__whoami", serde_json::json!({})),
+            text_round(2, "好了"),
+        ],
+    ]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let names = gw.state().tool_names();
+    assert!(
+        !names.iter().any(|name| name.starts_with("mcp__secure__")),
+        "{names:?}"
+    );
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "before", "看看").await.run;
+    gw.wait_terminal(&run).await;
+
+    secure.log_in(&home, "good");
+    let run = gw.submit(&session, "after", "调一下").await.run;
+    let detail = gw.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    let results = tool_results(&llm);
+    assert!(
+        results.iter().any(|text| text.contains("you=good")),
+        "{results:?}"
+    );
+    assert_eq!(secure.calls(), "whoami\n");
+    gw.stop().await;
+}
+
+/// 运行中 token 作废：调用报"要登录"、请求没被执行（不是"结果不明"）；重新登录之后，同一台
+/// Gateway 的下一次调用就连上了。
+#[tokio::test]
+async fn a_rejected_token_asks_for_login_and_the_next_login_reconnects() {
+    let secure = OAuthServer::start("good");
+    let home = secure.home();
+    secure.log_in(&home, "good");
+    let whoami = |pc: &str| {
+        vec![
+            call_round(1, pc, "mcp__secure__whoami", serde_json::json!({})),
+            text_round(2, "好"),
+        ]
+    };
+    let llm = FakeLlm::new(vec![whoami("pc-1"), whoami("pc-2")]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    assert!(
+        gw.state()
+            .tool_names()
+            .iter()
+            .any(|name| name == "mcp__secure__whoami")
+    );
+
+    secure.rotate("fresh");
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "expired", "调一下").await.run;
+    gw.wait_terminal(&run).await;
+    let events = home.events(&session);
+    let rejected = *recovery::tool_results(&events).last().unwrap();
+    assert_eq!(
+        rejected.status,
+        komo_kernel::types::refs::ToolResultStatus::Failed,
+        "凭证被拒 = 没执行，不是结果不明"
+    );
+    let results = tool_results(&llm);
+    assert!(
+        results
+            .last()
+            .is_some_and(|text| text.contains("komo auth mcp login secure")),
+        "{results:?}"
+    );
+    assert_eq!(secure.calls(), "");
+
+    secure.log_in(&home, "fresh");
+    let run = gw.submit(&session, "again", "再调一下").await.run;
+    let detail = gw.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    let results = tool_results(&llm);
+    assert!(
+        results
+            .last()
+            .is_some_and(|text| text.contains("you=fresh")),
+        "{results:?}"
+    );
+    assert_eq!(secure.calls(), "whoami\n");
+    gw.stop().await;
 }

@@ -60,14 +60,38 @@ oauth = true                           # 与 bearer_token_env 只能写一个
   服务器（RFC 9728 / 8414）→ 动态注册客户端（RFC 7591，`client_name = "komo"`）→ 打开浏览器走
   授权码 + PKCE → 回调只听 `127.0.0.1` 的一个随机端口（5 分钟超时，`/callback` 以外的路径回 404）
   → 换 token。`client_id` 与 token 写进 `<数据目录>/mcp/<name>/credentials.json`（临时文件 +
-  rename，0600），不进 `.env`。之后 `komo gateway restart`。
+  rename，0600），不进 `.env`。不用重启 Gateway（§2.2）。
 - `komo auth mcp status`：每个 `oauth = true` 的服务器一行——登录与否、过期时间、能否自动刷新；
   不打印 token。
 - Gateway 连接时用这份文件装 rmcp 的 `AuthorizationManager`（`FileCredentialStore`，
-  `komo-runtime/src/mcp_auth.rs`）；没登录过就记 warn 跳过这个服务器，报错指名要跑的命令。
+  `komo-runtime/src/mcp_auth.rs`）；没登录过就记 warn、这台服务器等登录（§2.2），报错指名要跑的命令。
   取用与刷新交给 rmcp：每次请求从文件取 token，快过期时用 refresh token 换新并写回；服务器拒绝
-  token 时静默刷新重试一次。服务器不发 refresh token 时，过期后要重新 `login`——新 token 写进同一
-  份文件，在跑的 Gateway 下一次请求就读到，不必重启。
+  token 时静默刷新重试一次。服务器不发 refresh token 时，过期后要重新 `login`。
+
+### 2.2 登录后不用重启（2026-10-16，照 pi）
+
+照 pi 的 `McpServerConnection`（`packages/coding-agent/src/extensions/mcp/runtime.ts`）：每台配置过的
+服务器一个连接对象（`McpConnection`，全部放在 `McpHub` 里），Gateway 整个生命周期都在；连没连上是它
+的状态，不是"有没有这个对象"。以前启动时被 401 拒了就整台跳过、工具一个不挂，登录之后只能重启。
+
+- **状态**：已连上 / 等登录 / 连不上。只有 `oauth = true` 的服务器会进"等登录"；bearer token 在
+  `.env` 里，改它走配置。断开不单列：会话自己报已关闭，下一次调用时重连（pi 的 `getClient`）。
+- **进"等登录"时记下凭证文件此刻的内容**（pi 的 `tokensAtSignIn`）。**每条 Run 受理之前**比一次
+  （pi 在每个 turn 开始时）：文件变了 = 有人跑过 `komo auth mcp login`，当场重连；连上了就把工具追加
+  进执行器的工具目录，这条 Run 的能力面里就有它们。没人登录时只是读一下文件。
+- **工具目录只追加**：名字一经挂上不换不撤（`ToolExecutor::install`）。已经受理的 Run 能力面已冻结，
+  不受影响；新名字从下一条 Run 起才进来。
+- **运行中凭证被拒**（401，或 token 过期又刷新不了）：这台服务器转成"等登录"，这次调用报
+  `failed`，正文指名 `komo auth mcp login <name>`。401 说明服务器没处理这个请求，所以判"没执行"、
+  不判"结果不明"；**也不在登录后自动重试**（照 pi），要不要再调由模型决定。之后登录了，下一次调用
+  （或下一条 Run 受理时）重连。
+- **服务器段**：新连上的服务器从下一条 Run 起出现在系统提示里，这个会话的前缀缓存因此失效一次（同
+  skills 目录变了）。instructions 只记第一次连上时的，重连不换，免得摘要在会话中途变样。pi 是往对话
+  末尾追加新的服务器段，komo 暂不做（§6）。
+- **还在的限制**：启动时"连不上"（不是登录问题，比如网络断了、命令不存在）的服务器，Run 受理时不重试
+  ——每条 Run 都去连一台坏掉的服务器，会让受理平白多等一个握手超时。它的工具没挂上，就调不到它，要
+  `komo gateway restart`。连上过、后来断了的不受这条限制：调用时自己重连。
+- 实现：`komo-runtime/src/mcp.rs`（`McpHub` / `McpConnection`）、`GatewayState::refresh_mcp`。
 
 ## 3. 暴露方式（2026-10-14，照 pi）
 
@@ -90,7 +114,8 @@ MCP 工具默认**不声明给模型**，只在 codemode 脚本里调：一台�
   codemode（Profile 给了）时，每台服务器一行 `- mcp__<server>：<摘要>`。摘要是配置的
   `description`，没写就是服务器 instructions 的**第一行**（pi 的 `serverSummary`）。整段 4096 字、每台
   250 字封顶：先缩短摘要，名字都放不下时后面的只计数。codemode 调不到时这段不出现——说了"在脚本里
-  调"也调不到。内容只取决于能力面与启动时连上的服务器，Gateway 不重启就不变，不破坏前缀缓存。
+  调"也调不到。内容只取决于能力面与连上过的服务器：同一条 Run 里不变；登录后才连上的服务器从下一条
+  Run 起多出一行（§2.2），此外 Gateway 不重启就不变，不破坏前缀缓存。
 - **instructions 全文不进任何提示**（照 pi）：握手时服务器交回的 `instructions` 是外部文本，只在脚本里
   `describe_namespace("<server>")` 读得到，系统提示只取它的第一行作摘要。
 - codemode 调不到（Profile 没给它）时**不自动改成直接声明**（照 pi）：这些工具这次调不到，要直接
@@ -129,7 +154,7 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
 
 - （OAuth 原在此列，2026-10-14 落地，见 §2.1。）客户端凭证（client credentials）、
   企业托管授权等其他 OAuth 流程仍不做。
-- 断线重连：服务器进程挂了，它的工具调用会失败，重启 Gateway 才重新连。
+- （断线重连原在此列，2026-10-16 落地：断了的下一次调用时重连，见 §2.2。）
 - 热加载：增删服务器要重启。
 - `resources` / `prompts` / 采样（sampling）/ elicitation：只用 tools。
 - `deferred` 暴露（先搜再声明，pi 的 `tool_search`）：默认的 `codemode` 已经不把 schema 塞进上下文，
@@ -138,8 +163,8 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
   `additional_tools` 或客户端 `tool_search_call/output`）保住前缀缓存，Chat Completions 退回顶部完整
   列表、整段失效。komo 三个适配器都只会发顶部完整列表，做之前要先逐个 provider 接中途追加并实测
   `cache_read`（中转站是否转发 beta 未验证）。2026-10-14 决定暂不做。
-- 服务器 instructions 变化后在对话末尾追加新的服务器段（pi 的做法）：komo 的服务器只在启动时连，
-  段内容在 Gateway 生命周期里不变。
+- 服务器段变化后在对话末尾追加新的一段（pi 的做法）：komo 的段只在登录后才连上的服务器出现时变一次
+  （§2.2），直接换系统提示，代价是那个会话的前缀缓存失效一次。
 
 ## 7. 验收
 
@@ -148,6 +173,12 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
   服务器不影响别的；默认 `codemode` 时 schema 里没有 `mcp__*`、系统提示有服务器那一行（只取
   instructions 第一行），脚本里 `describe_namespace` 拿得到全文、`search_tools` 用中文搜得到、调用只
   执行一次；`direct` 进 schema、`hidden` 不挂、只剩直出工具时不出服务器段。
+- `komo-gateway/tests/mcp` 的 OAuth 两条（`tests/mcp/oauth_server.py`：真 HTTP 服务器，带 RFC 8414 /
+  9728 发现端点，只认文件里写的 bearer token）：
+  `logging_in_after_start_mounts_the_tools_on_the_next_run`（启动时没登录、工具不在；写进凭证后同一台
+  Gateway 的下一条 Run 调得到，服务器执行一次）、
+  `a_rejected_token_asks_for_login_and_the_next_login_reconnects`（服务器换 token 后调用记 `failed`、
+  正文指名 `komo auth mcp login secure`、服务器没执行；重新登录后下一条 Run 调通）。
 - `komo-kernel`：`protocol::config::tests`（`tool_exposure` 原名 > 最具体模式 > 服务器默认，`*` 匹配）。
 - `komo-agent`：`prompt::tests`（服务器段每台一行、摘要取法、主 / 子代理都有、预算内截断与计数）。
 - `komo-runtime`：`executor::tests::codemode_only_tools_stay_callable_but_out_of_the_schema`、

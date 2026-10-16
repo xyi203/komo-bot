@@ -36,7 +36,10 @@ async fn run_script(home: &Home, code: &str) -> (Gw, Arc<FakeLlm>, String) {
     ]]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     assert!(
-        gw.state().tool_names.iter().any(|name| name == "codemode"),
+        gw.state()
+            .tool_names()
+            .iter()
+            .any(|name| name == "codemode"),
         "codemode 该总是挂上"
     );
     let session = gw.open_session().await;

@@ -1,9 +1,12 @@
 //! 注入之前核对一遍记忆里提到的路径（§9.4 之后补的一步）。
 //!
 //! 记忆是某一刻的观察，机器上的东西会挪走、删掉：一条「技能在 ~/.komo/skills/ha-control」
-//! 在那个目录删掉之后还原样注入，模型就会照着一条过期的线索去做。这里只认**绝对路径**
-//! （`/…` 与 `~/…`，至少两级），不在磁盘上就在正文后面注一句，不删、不改库里的条目——
-//! 判断"这条该不该忘"是操作者的事（`komo memory forget`）。
+//! 在那个目录删掉之后还原样注入，模型就会照着一条过期的线索去做。这里只核对**能确定在
+//! 本机**的路径（`~/…` 与家目录下的绝对路径，§9.6「路径核对」），确实不在就在正文后面注
+//! 一句，不删、不改库里的条目——判断"这条该不该忘"是操作者的事（`komo memory forget`）。
+//!
+//! `/api/cart` 是 HTTP 路由，`/app/config` 可能在容器里，`/etc/nginx/...` 可能在远端那台
+//! 机器：宿主磁盘上找不到它们什么也证明不了，所以一律算"不知道"，不注、不提议 contested。
 
 use std::path::{Path, PathBuf};
 
@@ -27,12 +30,32 @@ pub fn mark_missing_paths(items: Vec<MemoryItem>, home: Option<&Path>) -> Vec<Me
         .collect()
 }
 
-/// 正文里提到、但此刻不在磁盘上的绝对路径。注入时标注与 sweep 时判 contested 共用它。
+/// 正文里提到、能确定在本机、而且此刻确实不在的路径。注入时标注与 sweep 时判 contested
+/// 共用它。判不了归属、或者探测本身出错的，都不在结果里——"不知道"不是"不存在"。
 pub fn missing_paths(content: &str, home: Option<&Path>) -> Vec<String> {
     paths_in(content)
         .into_iter()
-        .filter(|raw| !expand(raw, home).is_some_and(|path| path.exists()))
+        .filter(|raw| local(raw, home).is_some_and(|path| absent(&path)))
         .collect()
+}
+
+/// 能确定在本机的那个路径；判不了就 `None`。
+///
+/// 只认两种：`~/…`，和落在家目录下的绝对路径。没有家目录时两种都判不了。
+fn local(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
+    let home = home?;
+    match raw.strip_prefix("~/") {
+        Some(rest) => Some(home.join(rest)),
+        None => {
+            let path = Path::new(raw);
+            path.starts_with(home).then(|| path.to_path_buf())
+        }
+    }
+}
+
+/// 只有 `NotFound` 才算不存在；没权限、I/O 出错都是"不知道"。
+fn absent(path: &Path) -> bool {
+    matches!(std::fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// 正文里像绝对路径的片段。前一个字符是路径字符或 `:` `}` `)` `]` `>` 的不算（`a/b`、
@@ -79,13 +102,6 @@ fn paths_in(text: &str) -> Vec<String> {
 
 fn path_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '~' | '+' | '@')
-}
-
-fn expand(raw: &str, home: Option<&Path>) -> Option<PathBuf> {
-    match raw.strip_prefix("~/") {
-        Some(rest) => home.map(|home| home.join(rest)),
-        None => Some(PathBuf::from(raw)),
-    }
 }
 
 #[cfg(test)]
@@ -147,5 +163,34 @@ mod tests {
             marked[1].content,
             "技能在 ~/.komo/skills/ha-control（注：~/.komo/skills/ha-control 现在已不存在，这条可能过期）"
         );
+    }
+
+    #[test]
+    fn routes_and_paths_outside_home_are_unknown_not_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "购物车走 /api/cart，评论批量接口 /api/internal/v1/comment/batch，\
+                       容器里是 /app/config/settings.yaml，远端的 /etc/komo-nowhere/nginx.conf";
+        assert_eq!(paths_in(content).len(), 4, "仍然认得出这些片段");
+        assert!(
+            missing_paths(content, Some(dir.path())).is_empty(),
+            "不在家目录下的路径判不了归属，不能说它不存在"
+        );
+    }
+
+    #[test]
+    fn an_absolute_path_under_home_is_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("code/kept")).unwrap();
+        let kept = dir.path().join("code/kept").display().to_string();
+        let gone = dir.path().join("code/gone").display().to_string();
+        assert_eq!(
+            missing_paths(&format!("在 {kept} 与 {gone} 下"), Some(dir.path())),
+            vec![gone]
+        );
+    }
+
+    #[test]
+    fn without_a_home_nothing_can_be_judged() {
+        assert!(missing_paths("技能在 ~/.komo/skills/gone", None).is_empty());
     }
 }

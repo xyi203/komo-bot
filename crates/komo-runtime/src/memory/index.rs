@@ -29,8 +29,10 @@ pub const INDEX_BATCH: usize = 16;
 
 /// 覆盖率达到多少才切换生效代次（§9.5 第 4 步「追平截至切换时的有效条目后事务切换」）。
 ///
-/// **1.0 就是"追平"**：这一代对每一条当前有效的记忆都有一个当前版本的向量。低于 1 的
-/// 阈值意味着切换之后仍有条目只靠关键词命中，而那正是"重建中"该有的样子，不是"就绪"。
+/// **1.0 就是"追平"**：这一代对每一条当前有效的记忆都有一个当前版本的向量——**或者**
+/// 这一轮算过、向量没通过校验而被拒的那几条（它们留在关键词臂，与"并发修改来不及向量
+/// 化"同一处理，§9.5）。不把被拒的算进来，一条持续算不出合法向量的正文会让这一代永远
+/// 不生效。低于 1 的阈值意味着切换之后仍有条目根本没算过，那是"重建中"，不是"就绪"。
 pub const MIN_ACTIVATION_COVERAGE: f32 = 1.0;
 
 /// 错误列表里最多留几条。它是给人看的，不是日志。
@@ -118,6 +120,10 @@ impl IndexBuilder {
         // 第 2 步：按稳定游标分批。游标是"上一批最后一个 id"，而**候选集本身**是
         // "还欠向量的那些"——所以崩溃之后重跑不需要把游标存到哪里，重新问一次就是了。
         let mut errors: Vec<String> = Vec::new();
+        // 两种失败分开记：整批失败说明这一轮没走完（不切换）；单条被拒只让那一条留在
+        // 关键词臂（不拦切换），见 [`MIN_ACTIVATION_COVERAGE`]。
+        let mut stalled = false;
+        let mut rejected: u64 = 0;
         let mut cursor: Option<String> = None;
         loop {
             let batch = self
@@ -136,6 +142,7 @@ impl IndexBuilder {
                 Err(error) => {
                     // 「失败不删除记忆正文，也**不伪装成索引已完成**」（§9.5）。
                     errors.push(format!("这一批向量算不出来：{error}"));
+                    stalled = true;
                     break;
                 }
             };
@@ -145,6 +152,7 @@ impl IndexBuilder {
                     vectors.len(),
                     batch.len()
                 ));
+                stalled = true;
                 break;
             }
 
@@ -152,7 +160,11 @@ impl IndexBuilder {
                 // 「校验返回数量、维度、有限数值和非零范数，不能接受截断或结构错误的
                 // 向量」（§9.5）。
                 if !vector.is_usable(space.dimensions) {
-                    errors.push(format!("{} 的向量不合法，跳过", candidate.memory));
+                    errors.push(format!(
+                        "{} 的向量不合法，先只走关键词，下一轮重试",
+                        candidate.memory
+                    ));
+                    rejected += 1;
                     continue;
                 }
                 // `put_vector` 在事务里再核对一次正文 / revision / 状态；不满足则丢弃过期
@@ -173,6 +185,12 @@ impl IndexBuilder {
         } else {
             indexed as f32 / total as f32
         };
+        // 算过的 = 有向量的 + 这一轮被拒的。
+        let settled = if total == 0 {
+            1.0
+        } else {
+            (indexed + rejected) as f32 / total as f32
+        };
 
         let already_active = self
             .catalog
@@ -180,9 +198,21 @@ impl IndexBuilder {
             .await?
             .into_iter()
             .any(|row| row.id == generation && row.active);
-        let caught_up = errors.is_empty() && coverage >= MIN_ACTIVATION_COVERAGE;
+        let caught_up = !stalled && settled >= MIN_ACTIVATION_COVERAGE;
         if caught_up {
             self.catalog.activate_generation(&generation).await?;
+            if !errors.is_empty() {
+                // 生效了，但被拒的那几条要说出来：它们现在只靠关键词命中。
+                self.catalog
+                    .set_generation_progress(
+                        &generation,
+                        IndexState::Ready,
+                        indexed,
+                        total,
+                        &errors,
+                    )
+                    .await?;
+            }
             // 「随后按保留规则清理旧索引」（§9.5 第 4 步）。
             let removed = self.catalog.prune_generations(&generation).await?;
             if removed > 0 {

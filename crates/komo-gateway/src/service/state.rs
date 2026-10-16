@@ -1652,6 +1652,11 @@ fn spawn_embedding_probe(memories: Arc<MemoryManager>, config: Arc<ConfigHolder>
                     "向量后端就绪"
                 );
                 memories.install_embeddings(client);
+                // 后端就绪就补齐索引（§9.5）：每次启动都走这里，所以重启天然接上未完成
+                // 的代次；欠谁由仓储现算，不靠进程内记着。
+                if let Err(error) = memories.schedule_index() {
+                    tracing::warn!(%error, "索引补齐没提交上，先只靠关键词命中");
+                }
             }
             Err(error) => {
                 tracing::warn!(%error, "向量后端造不出来：检索这一侧会如实报降级，不静默当成关键词模式");

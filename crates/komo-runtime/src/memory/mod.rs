@@ -387,8 +387,11 @@ pub struct MemoryManager {
     /// 代价写在 §9.4 里：会话进行中新召回得到的条目，要等下一段才进来；被改写的条目在
     /// 本段内仍按原样注入（正文里带着 `id@revision`，读的人知道引用的是哪一版）。
     pins: Mutex<BTreeMap<SessionId, Pinned>>,
-    /// 正在重建的代次。`POST /v1/memory-index/rebuild` 的幂等就是它。
-    building: Mutex<BTreeSet<String>>,
+    /// 索引调度的账（§9.5「索引自动补齐」）：同一时刻最多一个构建任务。
+    /// `POST /v1/memory-index/rebuild` 的幂等也是它。
+    indexing: Mutex<IndexSchedule>,
+    /// 叫醒退避中的构建任务。只有操作者手动重建用它：人在等结果。
+    index_wake: tokio::sync::Notify,
     /// 已经报过一次失败的 Run。**只为不刷日志**：一分钟后还失败是同一件事，每拍都
     /// `warn` 一遍只会把别人的日志挤下去。成功的那些在这里被划掉，下次再失败照样报。
     reported: Mutex<BTreeSet<RunId>>,
@@ -436,6 +439,29 @@ const PIN_TTL: time::Duration = time::Duration::hours(6);
 /// 一次后台处理最多领几个 Run。
 pub const WORK_BATCH: usize = 8;
 
+/// 索引构建失败后第一次重试等多久；之后每次翻倍，封顶 [`INDEX_RETRY_MAX`]（§9.5）。
+const INDEX_RETRY_FIRST: time::Duration = time::Duration::seconds(30);
+const INDEX_RETRY_MAX: time::Duration = time::Duration::minutes(30);
+
+/// 索引调度的账。
+#[derive(Debug, Default)]
+struct IndexSchedule {
+    /// 有一个构建任务在跑（或在退避里等着重跑）。
+    running: bool,
+    /// 跑着的时候又来了信号：这一轮结束后再来一轮。
+    again: bool,
+    /// 连着失败了几轮；成功一轮清零。
+    failures: u32,
+    /// 退避中：下一次自动重试的时刻。
+    retry_at: Option<OffsetDateTime>,
+}
+
+/// 第 `failures` 次连续失败之后等多久。
+fn index_backoff(failures: u32) -> time::Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    (INDEX_RETRY_FIRST * 2_i32.pow(doublings)).min(INDEX_RETRY_MAX)
+}
+
 impl MemoryManager {
     pub fn new(parts: MemoryParts) -> Self {
         let configured = parts.config.embedding.is_some();
@@ -456,7 +482,8 @@ impl MemoryManager {
             clock: parts.clock,
             render: parts.render,
             pins: Mutex::new(BTreeMap::new()),
-            building: Mutex::new(BTreeSet::new()),
+            indexing: Mutex::new(IndexSchedule::default()),
+            index_wake: tokio::sync::Notify::new(),
             reported: Mutex::new(BTreeSet::new()),
         }
     }
@@ -1160,68 +1187,166 @@ impl MemoryManager {
 
     // ------------------------------------------------------------ 索引（§9.5）
 
-    /// 当前索引状态，外加一条**配置漂移**提示。
+    /// 当前索引状态，外加**配置漂移**、首代进度与调度的说明。
     ///
-    /// 「更换向量模型、维度或预处理方式时…创建新索引代次」（§9.5），而热重载不在半路
-    /// 偷偷重建（§13.3 最后一段的精神）：配置换了模型，这里只把"指纹对不上、需要一次
-    /// 重建"说出来，真正动手要操作者按 `komo memory index rebuild`。
+    /// 「更换向量模型、维度或预处理方式时…创建新索引代次」（§9.5）：配置的空间与生效
+    /// 代次对不上时，后台调度会把新空间那一代建起来、追平后切换，这里把漂移说出来。
     pub async fn index_status(&self) -> Result<MemoryIndexStatus, MemoryError> {
         let mut status = self.repo.index_status().await?;
-        if let Some(space) = self.space() {
-            let configured = IndexBuilder::generation_id(&space);
-            match &status.generation {
-                Some(active) if active == &configured => {}
-                Some(active) => status.errors.push(format!(
-                    "配置的向量空间（{configured}）与生效代次（{active}）不是同一个：\
-                     换了模型 / 维度 / 前缀就要新建代次，跑一次 `komo memory index rebuild`"
-                )),
-                None => status.errors.push(format!(
-                    "还没有生效代次；配置的空间是 {configured}，跑一次 \
-                     `komo memory index rebuild` 建起来"
-                )),
+        let Some(space) = self.space() else {
+            if self.configured {
+                // 配了 alias、后端还没装上：等后端，不是"没配置"（§9.4）。
+                status.errors.push(
+                    "配了 `memory.embedding`，但向量后端还没就绪（启动探测还在跑，或者失败了，\
+                     见 Gateway 日志）：先只有关键词臂，就绪后自动补齐索引"
+                        .into(),
+                );
             }
-            if status.state == IndexState::Unconfigured {
-                // 配了 embedding 却一个代次都没有，是"还没建"，不是"没配置"。
-                status.state = IndexState::Building;
+            return Ok(status);
+        };
+        let configured = IndexBuilder::generation_id(&space);
+        match &status.generation {
+            Some(active) if active == &configured => {}
+            Some(active) => status.errors.push(format!(
+                "配置的向量空间（{configured}）与生效代次（{active}）不是同一个：后台会把新代次\
+                 建起来、追平后切换；要立刻开始就跑 `komo memory index rebuild`"
+            )),
+            None => {
+                // 首代还没生效：报这一代的真实进度，而不是生效代次的 0%。
+                let record = self
+                    .catalog
+                    .generations()
+                    .await?
+                    .into_iter()
+                    .find(|row| row.id == configured);
                 status.space = Some(space);
+                status.indexed = self.catalog.indexed_in(&configured).await?;
+                status.coverage = if status.total == 0 {
+                    0.0
+                } else {
+                    status.indexed as f32 / status.total as f32
+                };
+                status.state = record
+                    .as_ref()
+                    .map(|row| row.state)
+                    .unwrap_or(IndexState::Building);
+                status.errors.push(format!(
+                    "还没有生效代次；配置的空间是 {configured}，后台在补齐（`komo memory index \
+                     rebuild` 可以立刻开始）"
+                ));
+                if let Some(row) = record {
+                    status.errors.extend(row.errors);
+                }
             }
+        }
+        let retry_at = self.indexing.lock().expect("索引调度").retry_at;
+        if let Some(at) = retry_at {
+            status.errors.push(format!(
+                "上一轮索引构建失败，{at} 自动重试；`komo memory index rebuild` 立刻重试"
+            ));
         }
         Ok(status)
     }
 
-    /// 幂等提交一次重建（§9.5、§13.1）。
+    /// 提交一次索引补齐（§9.5「索引自动补齐」）。自动信号走这里：向量后端就绪、后台
+    /// 提取写进了变更、恢复了一条记忆。
     ///
-    /// 同一个代次已经在跑时返回 `accepted = false` 并给回同一个代次号——「同代次进行中
-    /// 返回同一个任务」。
-    pub fn request_rebuild(self: &Arc<Self>) -> Result<(String, bool), MemoryError> {
+    /// 同一时刻最多一个构建任务：已经有一个在跑（或在退避里等）时只记一笔"这一轮结束
+    /// 再来一轮"，返回 `accepted = false` 和同一个代次号——「同代次进行中返回同一个任务」。
+    pub fn schedule_index(self: &Arc<Self>) -> Result<(String, bool), MemoryError> {
         let Some(space) = self.space() else {
             return Err(MemoryError::VectorUnconfigured);
         };
         let generation = IndexBuilder::generation_id(&space);
         {
-            let mut building = self.building.lock().expect("重建表");
-            if building.contains(&generation) {
+            let mut schedule = self.indexing.lock().expect("索引调度");
+            if schedule.running {
+                schedule.again = true;
                 return Ok((generation, false));
             }
-            building.insert(generation.clone());
+            schedule.running = true;
         }
         let manager = Arc::clone(self);
-        let named = generation.clone();
-        tokio::spawn(async move {
-            let outcome = manager.build_index().await;
-            manager.building.lock().expect("重建表").remove(&named);
-            match outcome {
-                Ok(outcome) => tracing::info!(
-                    generation = %named,
+        tokio::spawn(async move { manager.index_loop().await });
+        Ok((generation, true))
+    }
+
+    /// 操作者的 `komo memory index rebuild`（§9.5、§13.1）：同 [`Self::schedule_index`]，
+    /// 另外叫醒退避中的任务——人在等结果，不该让他等满退避。
+    ///
+    /// `notify_one` 而不是 `notify_waiters`：任务刚记下退避、还没进 `select` 的那一瞬间
+    /// 叫它，后者会丢；前者留一张许可。代价是没人在等时那张许可留到下一次退避，让那次
+    /// 立刻重跑一轮——多跑一轮无害。
+    pub fn request_rebuild(self: &Arc<Self>) -> Result<(String, bool), MemoryError> {
+        let submitted = self.schedule_index()?;
+        self.index_wake.notify_one();
+        Ok(submitted)
+    }
+
+    /// 构建任务本身：跑一轮；跑的时候又来了信号就再来一轮；失败就退避后重跑。
+    ///
+    /// 退避期间到来的信号不提前叫醒它（端点不通时新记忆不该变成紧密重试），手动重建叫得醒。
+    async fn index_loop(self: Arc<Self>) {
+        loop {
+            let outcome = self.build_index().await;
+            let failure = match &outcome {
+                Ok(outcome) if outcome.errors.is_empty() => None,
+                Ok(outcome) => Some(outcome.errors.join("；")),
+                Err(error) => Some(error.to_string()),
+            };
+            // 去留在**同一次加锁**里定：放开锁再看 `running`，中间可能已经有人起了新任务。
+            let (delay, failures, again) = {
+                let mut schedule = self.indexing.lock().expect("索引调度");
+                match failure {
+                    None => {
+                        schedule.failures = 0;
+                        schedule.retry_at = None;
+                        let again = std::mem::take(&mut schedule.again);
+                        if !again {
+                            schedule.running = false;
+                        }
+                        (None, 0, again)
+                    }
+                    Some(_) => {
+                        schedule.failures += 1;
+                        // 重跑本来就会补上这期间来的那些。
+                        schedule.again = false;
+                        let delay = index_backoff(schedule.failures);
+                        schedule.retry_at = Some(self.clock.now() + delay);
+                        (Some(delay), schedule.failures, false)
+                    }
+                }
+            };
+            match (&outcome, &failure) {
+                (Ok(outcome), None) => tracing::info!(
+                    generation = %outcome.generation,
                     indexed = outcome.indexed,
                     total = outcome.total,
                     activated = outcome.activated,
-                    "索引重建这一轮结束"
+                    "索引补齐这一轮结束"
                 ),
-                Err(error) => tracing::error!(%error, generation = %named, "索引重建失败"),
+                // 同一串失败只在第一次出声：端点挂着的时候每次退避都 `warn` 没有新信息。
+                (_, Some(failure)) if failures == 1 => {
+                    tracing::warn!(%failure, ?delay, "索引补齐失败，退避后重试")
+                }
+                (_, Some(failure)) => {
+                    tracing::debug!(%failure, failures, ?delay, "索引补齐仍然失败")
+                }
+                _ => {}
             }
-        });
-        Ok((generation, true))
+            let Some(delay) = delay else {
+                if again {
+                    continue;
+                }
+                return;
+            };
+            let wait = std::time::Duration::try_from(delay).unwrap_or_default();
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = self.index_wake.notified() => {}
+            }
+            self.indexing.lock().expect("索引调度").retry_at = None;
+        }
     }
 
     /// 同步地跑一轮索引构建（测试与启动补齐走它）。

@@ -221,4 +221,15 @@ mod tests {
         assert_eq!(actions[0].revision, 2);
         assert_eq!(actions[0].detail, "~/.komo/skills/gone 已不存在");
     }
+
+    #[test]
+    fn an_http_route_does_not_contest_a_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let items = vec![item(
+            "下单前先调 /api/cart 再调 /api/internal/v1/comment/batch",
+            DAY,
+            Some(DAY),
+        )];
+        assert!(rules(&items, Some(dir.path())).is_empty());
+    }
 }

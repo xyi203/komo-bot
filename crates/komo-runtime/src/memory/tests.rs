@@ -112,6 +112,10 @@ impl EmbeddingClient for ConceptEmbeddings {
         Ok(texts
             .iter()
             .map(|text| {
+                // 这一条的向量算坏了（§9.5 校验要拒的那种），别的照常。
+                if text.contains("坏向量") {
+                    return Vector(vec![f32::NAN; self.concepts.len()]);
+                }
                 let lower = text.to_lowercase();
                 let mut values: Vec<f32> = self
                     .concepts
@@ -812,6 +816,181 @@ async fn a_rebuild_without_an_embedding_model_is_a_configuration_error() {
         harness.manager.request_rebuild().unwrap_err(),
         MemoryError::VectorUnconfigured
     );
+}
+
+/// 一条向量被拒**不把整代挡在生效之外**：它留在关键词臂并说出来，其余的照常切换（§9.5）。
+#[tokio::test]
+async fn a_rejected_vector_does_not_keep_a_generation_from_activating() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    harness
+        .repo
+        .put(memory("m-2", "这一条会算出坏向量"), None)
+        .await
+        .unwrap();
+
+    let outcome = harness.manager.build_index().await.unwrap();
+    assert!(outcome.activated, "其余的追平了就切换：{outcome:?}");
+    assert_eq!((outcome.indexed, outcome.total), (1, 2));
+    assert!(
+        outcome.errors.iter().any(|error| error.contains("m-2")),
+        "被拒的那条要说出来：{outcome:?}"
+    );
+    let status = harness.manager.index_status().await.unwrap();
+    assert_eq!(status.state, IndexState::Ready);
+    assert!(
+        status.errors.iter().any(|error| error.contains("m-2")),
+        "{status:?}"
+    );
+
+    // 被拒的那条照样能被关键词命中。
+    let found = harness
+        .manager
+        .search(harness.manager.query("坏向量", None))
+        .await
+        .unwrap();
+    assert!(
+        found.items.iter().any(|item| item.id.as_str() == "m-2"),
+        "{found:?}"
+    );
+}
+
+/// 端点整批失败时**不切换**——那是这一轮没走完，不是个别条目的问题。
+#[tokio::test]
+async fn a_failed_batch_still_keeps_the_generation_inactive() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    harness.embeddings.set_down(true);
+    let outcome = harness.manager.build_index().await.unwrap();
+    assert!(!outcome.activated, "{outcome:?}");
+    assert_eq!(harness.repo.active_generation().await.unwrap(), None);
+}
+
+/// 等到 `index_status` 满足条件；10 秒没等到就失败。
+async fn wait_for_index(
+    manager: &MemoryManager,
+    what: &str,
+    done: impl Fn(&MemoryIndexStatus) -> bool,
+) -> MemoryIndexStatus {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let status = manager.index_status().await.unwrap();
+        if done(&status) {
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "等了 10 秒还没{what}：{status:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// 自动补齐（§9.5）：不必有人按 rebuild——提交一次就建起首代，之后新写的条目再提交
+/// 一次就补上，代次不变。
+#[tokio::test]
+async fn scheduled_indexing_catches_up_new_memories_without_a_manual_rebuild() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    let manager = &harness.manager;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+
+    let (generation, accepted) = manager.schedule_index().unwrap();
+    assert!(accepted);
+    wait_for_index(&manager, "建起首代", |status| {
+        status.state == IndexState::Ready && status.indexed == 1
+    })
+    .await;
+
+    harness
+        .repo
+        .put(memory("m-2", "界面用深色主题"), None)
+        .await
+        .unwrap();
+    let before = manager.index_status().await.unwrap();
+    assert_eq!((before.indexed, before.total), (1, 2), "新条目先欠着向量");
+
+    let (again, _) = manager.schedule_index().unwrap();
+    assert_eq!(again, generation, "同一个空间就是同一个代次");
+    let after = wait_for_index(&manager, "补上新条目", |status| status.indexed == 2).await;
+    assert_eq!(after.generation.as_deref(), Some(generation.as_str()));
+}
+
+/// 首代还没生效时，状态报**这一代的真实进度与失败**，而不是 0%；失败进入退避，手动
+/// 重建叫得醒它（§9.5）。
+#[tokio::test]
+async fn a_failing_first_build_reports_its_progress_and_a_manual_rebuild_wakes_the_retry() {
+    let harness = HarnessBuilder::new()
+        .config(memory_config(true, RetrievalMode::Hybrid))
+        .embeddings()
+        .build()
+        .await;
+    let manager = &harness.manager;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    harness.embeddings.set_down(true);
+
+    manager.schedule_index().unwrap();
+    let failing = wait_for_index(&manager, "进入退避", |status| {
+        status.errors.iter().any(|note| note.contains("自动重试"))
+    })
+    .await;
+    assert_eq!(failing.state, IndexState::Failed, "{failing:?}");
+    assert_eq!(failing.generation, None, "还没有生效代次");
+    assert!(failing.space.is_some(), "配置的空间要报出来");
+    assert!(
+        failing.errors.iter().any(|note| note.contains("算不出来")),
+        "这一代的失败原因要报出来：{failing:?}"
+    );
+
+    // 端点恢复；退避要等 30 秒，手动重建立刻叫醒它。
+    harness.embeddings.set_down(false);
+    let (_, accepted) = manager.request_rebuild().unwrap();
+    assert!(!accepted, "已经有一个在退避里等着，不另起一个");
+    let ready = wait_for_index(&manager, "重试成功", |status| {
+        status.state == IndexState::Ready
+    })
+    .await;
+    assert_eq!(ready.indexed, 1);
+    assert!(
+        !ready.errors.iter().any(|note| note.contains("自动重试")),
+        "{ready:?}"
+    );
+}
+
+#[test]
+fn index_retries_back_off_up_to_thirty_minutes() {
+    assert_eq!(index_backoff(1), time::Duration::seconds(30));
+    assert_eq!(index_backoff(2), time::Duration::seconds(60));
+    assert_eq!(index_backoff(3), time::Duration::seconds(120));
+    assert_eq!(index_backoff(7), time::Duration::minutes(30));
+    assert_eq!(index_backoff(u32::MAX), time::Duration::minutes(30));
 }
 
 // =========================================================== ⑥ 降级

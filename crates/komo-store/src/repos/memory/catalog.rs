@@ -37,6 +37,8 @@ pub struct GenerationRecord {
     pub dimensions: u32,
     pub active: bool,
     pub created_at: OffsetDateTime,
+    /// 最近一轮留下的错误（`set_generation_progress` 写的那一份）。
+    pub errors: Vec<String>,
 }
 
 impl TursoMemoryRepo {
@@ -252,6 +254,7 @@ impl TursoMemoryRepo {
                             dimensions: row.dimensions.max(0) as u32,
                             active: row.active,
                             created_at: crate::db::from_ts(row.created_at),
+                            errors: decode(&row.errors, "memory_index_generations.errors")?,
                         });
                     }
                     Ok(out)

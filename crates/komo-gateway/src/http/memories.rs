@@ -139,7 +139,7 @@ pub async fn forget(
 
 /// `POST /v1/memories/{id}/restore`：撤回一次遗忘或争议，回到 active。
 ///
-/// 向量在 forget 时删了：恢复之后顺手提交一次同代次重建，它只补缺的那些。没配向量就
+/// 向量在 forget 时删了：恢复之后顺手提交一次索引补齐，它只补缺的那些。没配向量就
 /// 不提交——关键词索引已经由 `put` 重写，恢复本身不依赖它。
 pub async fn restore(
     State(api): State<Api>,
@@ -161,7 +161,7 @@ pub async fn restore(
         .await
         .map_err(memory_failure)?;
     if api.state.memories.space().is_some()
-        && let Err(error) = api.state.memories.request_rebuild()
+        && let Err(error) = api.state.memories.schedule_index()
     {
         tracing::warn!(%error, memory = %memory, "恢复之后补向量没提交上，先只靠关键词命中");
     }

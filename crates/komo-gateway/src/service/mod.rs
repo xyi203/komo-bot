@@ -487,6 +487,14 @@ fn spawn_background(state: &Arc<GatewayState>, shutdown: &Shutdown) {
                             abandoned = report.abandoned,
                             "记忆提取这一轮结束"
                         );
+                        // 写进了变更就补向量（§9.3「标记相关索引待更新 → 后台生成向量」）。
+                        // 没有向量后端时什么都不做：关键词索引已经随正文写好了。
+                        if report.applied > 0
+                            && state.memories.space().is_some()
+                            && let Err(error) = state.memories.schedule_index()
+                        {
+                            tracing::warn!(%error, "索引补齐没提交上，新记忆先只靠关键词命中");
+                        }
                     }
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%error, "记忆提取这一轮没跑成"),

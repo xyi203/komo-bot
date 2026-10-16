@@ -291,15 +291,17 @@ impl<'a> Renderer<'a> {
             }
             Tag::HtmlBlock => self.open_block(at, false),
             Tag::CodeBlock(kind) => {
+                // 照 Claude Code：不画围栏、不铺底色（深色底在浅色终端上是一块黑斑），
+                // 有语言就在上方暗暗标一行。
                 self.open_block(at, false);
-                let label = match &kind {
-                    CodeBlockKind::Fenced(lang) if !lang.is_empty() => format!("```{lang}"),
-                    _ => "```".to_string(),
-                };
-                self.lines.push(Line::from(Span::styled(
-                    truncate_to_width(&label, self.width),
-                    Style::default().fg(Color::DarkGray),
-                )));
+                if let CodeBlockKind::Fenced(lang) = &kind
+                    && !lang.is_empty()
+                {
+                    self.lines.push(Line::from(Span::styled(
+                        truncate_to_width(lang, self.width),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
                 self.code = Some(Vec::new());
             }
             Tag::List(start) => {
@@ -399,14 +401,10 @@ impl<'a> Renderer<'a> {
                         // **横向截断**：代码块的对齐是内容，折行会毁掉它。
                         self.lines.push(Line::from(Span::styled(
                             truncate_to_width(line.trim_end_matches('\n'), self.width),
-                            Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 38)),
+                            Style::default().fg(Color::Cyan),
                         )));
                     }
                 }
-                self.lines.push(Line::from(Span::styled(
-                    "```",
-                    Style::default().fg(Color::DarkGray),
-                )));
                 self.close_block(false);
             }
             TagEnd::List(_) => {
@@ -702,9 +700,7 @@ mod tests {
                 "",
                 "二级",
                 "",
-                "```",
                 "x",
-                "```",
                 "",
                 "─".repeat(40).as_str(),
                 "",
@@ -801,11 +797,17 @@ fn main() { println!(\"这一行故意写得非常非常非常非常非常非常
     fn a_code_block_is_truncated_not_wrapped() {
         let markdown = "```\nabcdefghijklmnopqrstuvwxyz\n```";
         let lines = render(markdown, 12);
-        // ```、代码、``` 三行——代码没有被折成两行。
-        assert_eq!(lines.len(), 3, "{lines:?}");
-        let code = lines[1].spans[0].content.as_ref();
+        assert_eq!(lines.len(), 1, "代码没有被折成两行：{lines:?}");
+        let code = lines[0].spans[0].content.as_ref();
         assert!(code.ends_with('…'), "{code}");
         assert!(display_width(code) <= 12);
+    }
+
+    #[test]
+    fn a_code_block_shows_its_language_without_fences_or_background() {
+        let lines = render("```rust\nfn a() {}\n```", 40);
+        assert_eq!(plain(&lines), vec!["rust", "fn a() {}"]);
+        assert_eq!(lines[1].spans[0].style.bg, None);
     }
 
     #[test]

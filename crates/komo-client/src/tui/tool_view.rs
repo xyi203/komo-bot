@@ -132,7 +132,7 @@ pub fn group_lines(
     vec![fit_spans(
         vec![
             Span::styled(format!("  {mark}"), mark_style),
-            Span::styled(text, style),
+            Span::raw(text),
             Span::styled("（Ctrl-T 展开）", Style::default().fg(Color::DarkGray)),
         ],
         width as usize,
@@ -292,26 +292,29 @@ fn head_lines(
     width: usize,
     now: Option<OffsetDateTime>,
 ) -> Vec<Line<'static>> {
-    let style = Style::default().fg(state_colour(tool.state));
-    let mark = if tool.state == ToolCallState::Started && !spinner::lit(now) {
-        style.add_modifier(Modifier::DIM)
-    } else {
-        style
-    };
-    let text = format!(" {} {}", tool.tool, clean(summary));
-    let mut rows = wrap_spans(
-        vec![
-            Span::styled(format!("  {}", tool.marker(now)), mark),
-            Span::styled(text.trim_end().to_string(), style),
-        ],
-        width,
-        INDENT,
-    );
+    // 只有记号带状态色，工具名加粗、其余用终端本色（照 Claude Code）：整行上色会和下面
+    // diff 的红绿撞在一起。
+    let mut mark = Style::default().fg(state_colour(tool.state));
+    if tool.state == ToolCallState::Started && !spinner::lit(now) {
+        mark = mark.add_modifier(Modifier::DIM);
+    }
+    let summary = clean(summary);
+    let mut spans = vec![
+        Span::styled(format!("  {}", tool.marker(now)), mark),
+        Span::styled(
+            format!(" {}", tool.tool),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if !summary.trim().is_empty() {
+        spans.push(Span::raw(format!(" {}", summary.trim_end())));
+    }
+    let mut rows = wrap_spans(spans, width, INDENT);
     if !detail && rows.len() > BODY_LINES {
         rows.truncate(BODY_LINES);
         if let Some(last) = rows.pop() {
             let mut spans = last.spans;
-            spans.push(Span::styled("…", style));
+            spans.push(Span::raw("…"));
             rows.push(fit_spans(spans, width));
         }
     }
@@ -913,6 +916,23 @@ mod tests {
         assert_eq!(text.matches("    + ").count(), 12, "{text}");
         assert!(!text.contains("还有"), "{text}");
         assert!(!text.contains("替换了"), "成功的回执头一行已经说了：{text}");
+    }
+
+    /// 头一行只有记号带状态色，路径用终端本色——不和下面 diff 的绿色混成一片。
+    #[test]
+    fn only_the_marker_carries_the_state_colour() {
+        let tool = call(
+            "edit",
+            json!({ "path": "a.go", "match_text": "a", "replace_text": "b" }),
+            ToolCallState::Completed,
+            None,
+        );
+        let head = &lines(&tool, false, 80, None)[0];
+        assert_eq!(head.spans[0].style.fg, Some(Color::Green));
+        for span in &head.spans[1..3] {
+            assert_eq!(span.style.fg, None, "{:?} 不该着色", span.content);
+        }
+        assert!(head.spans[1].style.add_modifier.contains(Modifier::BOLD));
     }
 
     /// 只改了一行里的一截：那一截反白，两头照常。

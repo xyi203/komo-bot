@@ -10,7 +10,8 @@
 //! │ 还在动的那一小段（草稿 / 在跑的工具 / 刚按下 Enter 的那条）  ← 高度有上限，只画尾巴
 //! ├ 状态行（Run 状态 · 本轮耗时 · 模型 · effort · 连接 · 待处理 · 模式）
 //! │ 命令面板（只在输入以 `/` 开头时出现）/ `/model` 的选择菜单
-//! ╰ 输入框（会折行，光标摆在它真正在的那一格上）
+//! │ 输入框：上下两条横线夹着（照 Claude Code），会折行，光标摆在它真正在的那一格上
+//! ╰ 操作提示
 //! ```
 //!
 //! [`viewport_height`] 与 [`draw`] 必须算出同一个高度——驱动照前者开视口、照后者画，
@@ -21,7 +22,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Padding, Paragraph};
+use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::tui::app::{App, TokenTally, status_text};
 pub(crate) use crate::tui::markdown;
@@ -93,15 +94,23 @@ fn palette_height(app: &App) -> u16 {
     (app.palette().len() as u16).min(PALETTE_MAX)
 }
 
-/// 输入框连边框一共几行。
+/// 输入框行首的提示符（照 Claude Code）；折出来的后续行缩进同样宽。
+const PROMPT: &str = "❯ ";
+/// 输入框左右各留一列，与上面那段正文、状态行对齐。
+const INPUT_PAD: u16 = 1;
+
+/// 输入框连上下两条线、外加底下那行提示一共几行。提示行空着也占位：提示一出一没就改
+/// 视口高度，等于让底下那块整个重开一次。
 fn input_height(app: &App, width: u16) -> u16 {
-    (input_rows(app, width).len() as u16).clamp(1, INPUT_MAX_ROWS) + 2
+    (input_rows(app, width).len() as u16).clamp(1, INPUT_MAX_ROWS) + 3
 }
 
 /// 输入框里折好的每一行，附它在 [`crate::tui::paste::Input::display`] 那份文本里的起始
 /// 偏移——光标靠它落位。
 fn input_rows(app: &App, width: u16) -> Vec<(usize, String)> {
-    let inner = width.saturating_sub(2).max(1) as usize;
+    let inner = width
+        .saturating_sub(2 * INPUT_PAD + markdown::display_width(PROMPT) as u16)
+        .max(1) as usize;
     let text = if app.input_enabled() {
         app.input.display()
     } else {
@@ -130,7 +139,7 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // 框里放得下几行，以及从第几行开始画——光标跑出框外时跟着滚，人不会打着打着就看不见
     // 自己写到哪了。
-    let visible = area.height.saturating_sub(2).max(1) as usize;
+    let visible = area.height.saturating_sub(3).max(1) as usize;
     let offset = (caret_row + 1).saturating_sub(visible);
 
     let style = if enabled {
@@ -138,48 +147,70 @@ fn draw_input(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    // Shell 模式（草稿以 `!` 开头）：那个 `!` 与边框换个颜色，一眼看得出这一条不经模型。
+    // Shell 模式（草稿以 `!` 开头）：那个 `!`、提示符与横线换个颜色，一眼看得出这一条不经
+    // 模型。
     let shell = app.shell_mode();
+    let accent = if !enabled {
+        Color::Yellow
+    } else if shell {
+        SHELL_COLOUR
+    } else {
+        Color::DarkGray
+    };
+    let indent = " ".repeat(markdown::display_width(PROMPT));
     let body: Vec<Line<'static>> = rows
         .iter()
+        .enumerate()
         .skip(offset)
         .take(visible)
-        .map(|(at, line)| match line.strip_prefix('!') {
-            Some(rest) if shell && *at == 0 => Line::from(vec![
-                Span::styled(
-                    "!",
-                    Style::default()
-                        .fg(SHELL_COLOUR)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(rest.to_string(), style),
-            ]),
-            _ => Line::from(Span::styled(line.clone(), style)),
+        .map(|(index, (at, line))| {
+            let lead = if index == 0 {
+                Span::styled(PROMPT, Style::default().fg(accent))
+            } else {
+                Span::raw(indent.clone())
+            };
+            match line.strip_prefix('!') {
+                Some(rest) if shell && *at == 0 => Line::from(vec![
+                    lead,
+                    Span::styled(
+                        "!",
+                        Style::default()
+                            .fg(SHELL_COLOUR)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(rest.to_string(), style),
+                ]),
+                _ => Line::from(vec![lead, Span::styled(line.clone(), style)]),
+            }
         })
         .collect();
 
-    let hint = app.input_hint();
+    let [field, hint_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .title(if hint.is_empty() {
-            String::new()
-        } else {
-            format!(" {hint} ")
-        })
-        .border_style(Style::default().fg(if !enabled {
-            Color::Yellow
-        } else if shell {
-            SHELL_COLOUR
-        } else {
-            Color::DarkGray
-        }));
-    let inner = block.inner(area);
-    frame.render_widget(Paragraph::new(body).block(block), area);
+        .borders(Borders::TOP | Borders::BOTTOM)
+        .border_style(Style::default().fg(accent))
+        .padding(Padding::horizontal(INPUT_PAD));
+    let inner = block.inner(field);
+    frame.render_widget(Paragraph::new(body).block(block), field);
 
-    if enabled && inner.width > 0 && inner.height > 0 {
+    let hint = app.input_hint();
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            markdown::truncate_to_width(
+                &hint,
+                hint_area.width.saturating_sub(2 * INPUT_PAD) as usize,
+            ),
+            Style::default().fg(Color::DarkGray),
+        ))
+        .block(Block::default().padding(Padding::horizontal(INPUT_PAD))),
+        hint_area,
+    );
+
+    let prompt = markdown::display_width(PROMPT) as u16;
+    if enabled && inner.width > prompt && inner.height > 0 {
         frame.set_cursor_position(Position {
-            x: inner.x + (caret_column as u16).min(inner.width - 1),
+            x: inner.x + prompt + (caret_column as u16).min(inner.width - prompt - 1),
             y: inner.y + (caret_row.saturating_sub(offset) as u16).min(inner.height - 1),
         });
     }
@@ -637,14 +668,14 @@ fn main() {
         // 一个字都没打：光标在框内第一格。
         let mut terminal = viewport(&app, 60, height);
         let empty = terminal.get_cursor_position().expect("有光标");
-        assert_eq!(empty.x, 1, "框的左边框占掉第 0 列");
-        assert_eq!(empty.y, height - 2, "框内第一行");
+        assert_eq!(empty.x, 3, "左边留一列，再让过 `❯ `");
+        assert_eq!(empty.y, height - 3, "两条横线中间那一行，底下还有提示行");
 
         // 中文一个字占两列，所以四个字之后是第 8 列，不是第 4 列。
         app.input.set("清理一下");
         let mut terminal = viewport(&app, 60, height);
         let typed = terminal.get_cursor_position().expect("有光标");
-        assert_eq!(typed.x, 1 + 8, "宽字符按显示宽度算");
+        assert_eq!(typed.x, 3 + 8, "宽字符按显示宽度算");
         assert_eq!(typed.y, empty.y);
     }
 
@@ -667,7 +698,7 @@ fn main() {
         );
 
         let caret = terminal.get_cursor_position().expect("有光标");
-        assert!(caret.y > height - 3, "光标跟着折到后面的行：{caret:?}");
+        assert!(caret.y > height - 4, "光标跟着折到后面的行：{caret:?}");
     }
 
     #[test]

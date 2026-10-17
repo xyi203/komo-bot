@@ -2,8 +2,12 @@
 import json
 import os
 import sys
+import time
 
 COUNTER = sys.argv[1]
+# 可选：握手前先睡这么多秒（模拟 Gateway 重启后服务器还在连）。
+if len(sys.argv) > 2:
+    time.sleep(float(sys.argv[2]))
 
 TOOLS = [
     {

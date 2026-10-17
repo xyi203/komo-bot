@@ -123,6 +123,9 @@ impl ToolExecutor {
                 .map_err(|e| uncertain(e.to_string()))?;
             return Ok(output);
         }
+        // 被接续的 Run：能力面里的 MCP 工具可能还没挂上，先等它们的服务器，脚本才发现得到它们
+        // （[`ToolExecutor::await_mcp`]）。没连上的在脚本调到时报原因。
+        self.await_mcp(&names).await;
         let catalog = self.script_catalog(&names);
         let journal = Arc::new(Mutex::new(journal));
         let calls: Arc<Mutex<Vec<NestedCall>>> = Arc::default();
@@ -305,6 +308,12 @@ impl ToolExecutor {
         journal: &Mutex<Journal>,
     ) -> Result<Reply, ToolError> {
         let (index, child) = journal.lock().expect("journal").next(name)?;
+        // 能力面里有、还没挂上的 MCP 工具先等它的服务器（[`ToolExecutor::await_mcp`]）。
+        let mut pending_mcp = if env.surface.allows(name) && !NOT_IN_SCRIPTS.contains(&name) {
+            self.await_mcp(&[name.to_string()]).await
+        } else {
+            Default::default()
+        };
         // 已记下的结果也要过当前能力面；不回退到全局工具表。
         let tools = self.tools();
         let tool = tools
@@ -352,9 +361,13 @@ impl ToolExecutor {
                                 Ok(plan)
                             }
                         }),
-                    // 热重载撤掉的 MCP 工具说清楚为什么没了；那台服务器不在能力面里的照旧拒。
+                    // 热重载撤掉的、服务器还没连上的 MCP 工具说清楚为什么调不了；那台服务器不在
+                    // 能力面里的照旧拒。
                     None => Err(ToolError::Denied {
-                        reason: match self.withdrawn_reason(name) {
+                        reason: match self
+                            .withdrawn_reason(name)
+                            .or_else(|| pending_mcp.remove(name))
+                        {
                             Some(reason) if env.surface.allows(name) => reason,
                             _ => format!("脚本里不能调 {name}"),
                         },

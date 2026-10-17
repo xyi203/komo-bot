@@ -446,7 +446,7 @@ pub struct Assembly {
     pub tools: Vec<Arc<dyn komo_kernel::traits::Tool>>,
     /// codemode 的 worker（`docs/codemode.md`）；`None` = 没装配，`codemode` 也不在 `tools` 里。
     pub codemode: Option<komo_runtime::codemode::Worker>,
-    /// MCP 连接；`tools` 里已经有启动时连上的那些服务器的工具。
+    /// MCP 连接，后台连着；`tools` 里没有 MCP 工具，受理 Run 时才挂进来。
     pub mcp: Arc<komo_runtime::mcp::McpHub>,
     /// 渠道工厂：热重载时按平台重造（§3 第 3 步）。
     pub channels: Vec<Arc<dyn ChannelFactory>>,
@@ -567,7 +567,8 @@ impl GatewayState {
                 Arc::clone(&outputs),
                 Arc::clone(&clock),
             )
-            .with_codemode(codemode),
+            .with_codemode(codemode)
+            .with_mcp(Arc::clone(&mcp)),
         );
 
         let agent = Arc::new(AgentLoop::new(
@@ -745,10 +746,12 @@ impl GatewayState {
     /// 等登录的 MCP 服务器凭证变了就连上，把它的工具挂进执行器（`docs/mcp.md` §2.2，pi 在每个
     /// turn 开始时做同一件事）。受理 Run 之前调：新名字从这条 Run 起进能力面。
     ///
-    /// 先等热重载刚加的直出服务器（pi 的 `waitForDirectServers`），有上限；只在脚本里调的
-    /// 服务器不等，脚本调到时自己等。
-    async fn refresh_mcp(&self) {
-        self.mcp.wait_for_direct().await;
+    /// 先等还在连的服务器（启动时、热重载刚加的，照 pi 的 `waitForDirectServers`），从开始连
+    /// 时算至多 `STARTUP_WAIT`；到点没连上的这条 Run 先不等它。
+    ///
+    /// `pub` 是给测试看"受理时目录里有什么"：启动不等 MCP 握手，刚起来的目录里没有 MCP 工具。
+    pub async fn refresh_mcp(&self) {
+        self.mcp.wait_for_startup().await;
         let added = self.tool_executor.install(self.mcp.refresh().await);
         if !added.is_empty() {
             tracing::info!(

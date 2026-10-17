@@ -11,7 +11,7 @@ MCP 服务器是**操作者接进来的工具来源**，不是第七个基础工
 
 ```text
 config.toml [mcp.servers.<name>]
-   │  Gateway 启动时（build_tools）并行连接，30s 超时；连不上的记 warn 跳过
+   │  Gateway 启动时（build_tools）每台后台连，不等握手（§2.4）；30s 连不上算失败
    ▼
 rmcp 客户端（stdio 子进程 / Streamable HTTP）── initialize（取 instructions）+ tools/list
    ▼
@@ -110,11 +110,11 @@ mtime、`komo config reload`、`SIGHUP`）的变化键有 `mcp` / `mcp.*` 时，
 - `komo config reload` 的回应多一段 `mcp`：每台服务器此刻的状态（连接中 / 已连上 / 要登录 / 失败）。
   因为不等握手，刚加的、刚改的多半是"连接中"。
 
-**受理 Run 时**（pi 的 `waitForDirectServers`）：只等还在连、而且有工具声明给模型（`exposure = "direct"`
-或 `tool_exposure` 里有 `direct`）的服务器，上限 10 秒（pi 的 `startupWaitMs` 默认值），从这台服务器开始
-连时算起——挂住的服务器至多拖慢这一段，之后的 Run 不再等它。超时不阻塞受理，这条 Run 先不带它的工具。
-只在 codemode 里调的服务器不等：工具没挂上之前脚本里找不到它们，挂上之后调用时 `McpConnection::ready`
-自己等连接。
+**受理 Run 时**（照 pi 的 `waitForDirectServers`）：只等还在连、而且有工具挂得上（不全是 `hidden`）的
+服务器，上限 10 秒（pi 的 `startupWaitMs` 默认值），从这台服务器开始连时算起——挂住的服务器至多拖慢这
+一段，之后的 Run 不再等它。超时不阻塞受理，这条 Run 先不带它的工具。pi 只等直出的服务器，因为它的脚本
+侧调用时才按名字找服务器；komo 的能力面受理时按名字冻结，没挂上的工具这条 Run 从头到尾调不到，所以只
+在 codemode 里调的服务器也等（2026-10-17 随 §2.4 改）。
 
 **对在跑的 Run 的影响**（komo 比 pi 多的一条：pi 只在空闲时重载，komo 多会话并发，重载时总可能有 Run
 在跑）：
@@ -126,8 +126,37 @@ mtime、`komo config reload`、`SIGHUP`）的变化键有 `mcp` / `mcp.*` 时，
   X 已从配置移除，它的工具不能再调"，或"配置改了，正在重连；连上后从下一条 Run 起可用"。不执行、不
   panic、不停下来问人；同名工具重新挂上之后又调得到。
 
-实现：`McpHub::reconcile` / `wait_for_direct`、`McpConnection::close`、`ToolExecutor::withdraw`、
+实现：`McpHub::reconcile` / `wait_for_startup`、`McpConnection::close`、`ToolExecutor::withdraw`、
 `GatewayState::reconcile_mcp`、`komo-gateway/src/reload.rs` 的 `apply`。
+
+### 2.4 启动不等握手（2026-10-17，照 pi）
+
+以前 `build_tools` 等每台服务器握手完（每台最多 30 秒）才往下走：一台卡住的服务器让整个 Gateway 晚最多
+30 秒就绪，这段时间各渠道都收不到消息。现在同热重载新加的服务器一样（pi 的 `session_start` 不 await
+连接）：
+
+- **启动**：`McpHub::start` 建好每台的连接对象、各自后台连，立刻返回；`build_tools` 一个 MCP 工具也不挂。
+  刚起来的服务器状态是"连接中"。
+- **第一条 Run 受理时**挂工具：`GatewayState::refresh_mcp` 先按 §2.3 的规则等（至多开始连之后 10 秒），
+  再把连上的工具挂进目录、重渲 skills 目录行。不另写一条路。正常服务器握手只要百来毫秒，第一条 Run 基本
+  不用等。
+- **被接续的 Run**（Gateway 重启后从账本里接着跑的）不经过受理：它冻结的能力面里可能有 `mcp__memos__*`
+  这类名字，而那台服务器此刻还在连、执行器目录里还没有这个工具。执行器认出"这个名字属于一台还在连的
+  服务器"时先等它（`ToolExecutor::await_mcp` → `McpHub::await_tools`，同一个 10 秒上限），连上了挂工具
+  再执行；到点没连上、连接失败、要登录的，报一句指名服务器的工具错误（"MCP 服务器 X 还没连上（等了 10
+  秒）…"/"MCP 服务器 X 连接失败（原因）…"），**不再是"没有名为…的工具"**。Run 照常往下走，不停下来
+  问人。覆盖三处：装配这一段的 schema 时（`segment`，接续的 Run 的 schema 与服务器段才与受理时一样）、
+  顶层调用（`begin`）、codemode 子调用（`durable_nested_call`；脚本的发现目录装配前也先等一次）。
+- **怎么认归属**：工具还没 `tools/list` 之前只有名字可用。冻结的能力面（`AgentSurface`）只存名字、不存
+  来源，所以按命名规则认：`mcp__<server>__<tool>`，`<server>` 照 `tool_name` 的规则换掉特殊字符后比前缀。
+  服务器名里可以有 `__`，一个名字可能被不止一台认领，几台一起等。认不出服务器的名字（不是 MCP 的、
+  服务器已从配置删掉的）照旧报"没有这个工具"；服务器连上了却没列出这个工具的，同理。
+- 受理时那次"等登录的凭证变了没有"（`McpHub::refresh`）**不等正在连的服务器**：它握着连接锁，等它会把
+  受理拖到握手超时（30 秒）而不是上面的 10 秒。锁被占着就跳过，下一条 Run 再比。
+- 这里的等待**不重连**：第一次连接已经有了结果（失败）的服务器当场报原因，同 §2.2 "启动时连不上的服务器
+  Run 受理时不重试"一个口径。
+
+不做"第一次调用才起子进程"的完全懒加载：直出工具的 schema 受理时就要知道。
 
 ## 3. 暴露方式（2026-10-14，照 pi）
 
@@ -219,6 +248,15 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
   `a_server_removed_by_reload_is_gone_for_the_next_run`、`a_running_run_is_told_the_server_was_removed`
   （在跑的 Run 停在 `gate` 上时删掉服务器，之后再调拿到"已从配置移除"、Run 照常完成）、
   `an_invalid_mcp_reload_leaves_the_servers_alone`。
+- `komo-gateway/tests/mcp` 的启动三条（§2.4）：`a_stuck_server_does_not_delay_startup`（一台握手永远不回
+  的服务器下 Gateway 5 秒内就绪，第一条 Run 的 schema 里有正常服务器的工具并调通）、
+  `a_resumed_run_waits_for_its_mcp_server`（`Fault::BeforeStartRun` 造出受理过、没开跑的 Run，重启时服务器
+  握手前睡 2 秒：顶层调用与脚本里的调用都等它连上再调通）、
+  `a_resumed_run_is_told_why_its_mcp_server_is_missing`（重启后命令不存在：两处都报"MCP 服务器 demo 连接
+  失败"，Run 照常完成、不问人）。
+- `komo-runtime`：`mcp::tests` 的 `start_returns_without_waiting_for_a_stuck_server`、
+  `await_tools_waits_for_the_owner_and_explains_the_rest`、`a_tool_name_is_claimed_by_its_server_prefix`、
+  `a_call_to_a_tool_not_yet_mounted_waits_for_its_server`（执行器顶层调用先等服务器再调通）。
 - `komo-runtime`：`mcp::tests` 的 `reconcile_*`（增、删、改）与
   `removing_a_server_lets_the_call_in_flight_finish` / `changing_a_server_lets_the_call_in_flight_finish`
   （在途调用照常返回，子进程活到它返回之后才退）；

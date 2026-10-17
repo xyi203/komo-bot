@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use komo_gateway::service::test_support::harness::{
-    DEFAULT_ENV, FakeLlm, Home, call_round, config_toml, text_round,
+    DEFAULT_ENV, FakeLlm, Gw, Home, call_round, config_toml, text_round,
 };
 use komo_kernel::traits::LlmClient;
 use komo_kernel::types::status::RunState;
@@ -32,13 +32,27 @@ fn home_with_demo(extra_servers: &str) -> (Home, std::path::PathBuf) {
 
 /// 配着 `demo` 服务器的整份 config.toml。
 fn demo_config(home: &Home, extra_servers: &str) -> String {
+    demo_config_with(home, "python3", &[], extra_servers)
+}
+
+/// 同上，`demo` 的命令与 `server.py` 之后的参数自己给（第一个是握手前睡几秒）。
+fn demo_config_with(
+    home: &Home,
+    command: &str,
+    extra_args: &[&str],
+    extra_servers: &str,
+) -> String {
     let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mcp/server.py");
     let counter = home.path().join("bump.count");
+    let extra_args: String = extra_args
+        .iter()
+        .map(|arg| format!(", \"{arg}\""))
+        .collect();
     config_toml(&format!(
         r#"
 [mcp.servers.demo]
-command = "python3"
-args = ["{server}", "{counter}"]
+command = "{command}"
+args = ["{server}", "{counter}"{extra_args}]
 env = ["DEMO_TOKEN"]
 read_only = ["echo"]
 {extra_servers}
@@ -81,13 +95,10 @@ async fn a_read_only_mcp_tool_runs_and_sees_only_declared_env() {
         text_round(2, "好了"),
     ]]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let names = mounted(&gw).await;
     assert!(
-        gw.state()
-            .tool_names()
-            .iter()
-            .any(|name| name == "mcp__demo__bump"),
-        "{:?}",
-        gw.state().tool_names()
+        names.iter().any(|name| name == "mcp__demo__bump"),
+        "{names:?}"
     );
 
     let session = gw.open_session().await;
@@ -133,7 +144,7 @@ command = "/nonexistent/mcp-server"
 "#,
     );
     let gw = home.start(FakeLlm::finisher("好")).await;
-    let names = &gw.state().tool_names();
+    let names = &mounted(&gw).await;
     assert!(
         names.iter().any(|name| name == "mcp__demo__echo"),
         "{names:?}"
@@ -216,7 +227,7 @@ tool_exposure = { "b*" = "hidden" }"#,
     );
     let llm = FakeLlm::finisher("好");
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    let names = &gw.state().tool_names();
+    let names = &mounted(&gw).await;
     assert!(
         names.iter().any(|name| name == "mcp__demo__echo"),
         "{names:?}"
@@ -368,6 +379,186 @@ async fn codemode_restart_does_not_repeat_unsafe_mcp_in_uncommitted_delivery_win
     codemode_crash_window(false).await;
 }
 
+/// 启动不等 MCP 握手（`docs/mcp.md` §2.2）：一台握手永远不回的服务器不拖住 Gateway 就绪；第一条
+/// Run 受理时等到点就放手，正常服务器的工具照样在它的 Schema 里。
+#[tokio::test]
+async fn a_stuck_server_does_not_delay_startup() {
+    let (home, _) = home_with_demo("");
+    std::fs::write(
+        home.path().join("config.toml"),
+        demo_config_with(
+            &home,
+            "python3",
+            &[],
+            r#"exposure = "direct"
+
+[mcp.servers.stuck]
+command = "python3"
+args = ["-c", "import sys; sys.stdin.read()"]
+"#,
+        ),
+    )
+    .unwrap();
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-1",
+            "mcp__demo__echo",
+            serde_json::json!({ "text": "hi" }),
+        ),
+        text_round(2, "好了"),
+    ]]);
+    let begun = std::time::Instant::now();
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let ready = begun.elapsed();
+    assert!(
+        ready < std::time::Duration::from_secs(5),
+        "Gateway 等了 MCP 握手：{ready:?}"
+    );
+    let stuck = gw
+        .state()
+        .mcp
+        .statuses()
+        .into_iter()
+        .find(|status| status.name == "stuck")
+        .unwrap();
+    assert_eq!(
+        stuck.state,
+        komo_kernel::protocol::http::McpServerState::Connecting
+    );
+
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "first", "回显一下").await.run;
+    let detail = gw.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    // 受理时等卡住那台至多 `STARTUP_WAIT`（10 秒），不是它的握手超时（30 秒）。
+    let done = begun.elapsed();
+    assert!(
+        done < std::time::Duration::from_secs(20),
+        "第一条 Run 被卡住的服务器拖住了：{done:?}"
+    );
+    let request = llm.requests.lock().unwrap()[0].clone();
+    assert!(
+        request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "mcp__demo__echo"),
+        "{:?}",
+        request.tools
+    );
+    let results = tool_results(&llm);
+    assert!(
+        results.iter().any(|text| text.contains("hi token=s3cret")),
+        "{results:?}"
+    );
+    gw.stop().await;
+}
+
+/// 造一条受理过、还没开跑的 Run（能力面里冻结着 `mcp__demo__echo`），然后换 `demo` 的配置重启：
+/// 重启后它不经过受理，直接被接续（第二台 Gateway 用 `llm`）。交回第二台 Gateway 与 Run。
+async fn resume_with_demo(
+    home: &Home,
+    restart_config: String,
+    llm: &Arc<FakeLlm>,
+) -> (Gw, komo_kernel::types::ids::RunId) {
+    use recovery::{Fault, Injected};
+    let fault = home.inject(Fault::BeforeStartRun);
+    let gw = home.start(FakeLlm::finisher("不该到这里")).await;
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "resumed", "调一下").await.run;
+    fault.wait_tripped().await;
+    gw.stop().await;
+    home.clear_injection();
+
+    std::fs::write(home.path().join("config.toml"), restart_config).unwrap();
+    let gw = home.start(Arc::clone(llm) as Arc<dyn LlmClient>).await;
+    (gw, run)
+}
+
+/// 被接续的 Run 先直接调 `mcp__demo__echo`，再在脚本里调一次。
+fn echo_twice() -> Arc<FakeLlm> {
+    FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-1",
+            "mcp__demo__echo",
+            serde_json::json!({ "text": "top" }),
+        ),
+        call_round(
+            2,
+            "pc-2",
+            "codemode",
+            serde_json::json!({
+                "code": "text(tools.mcp__demo__echo(text='nested')['text'])"
+            }),
+        ),
+        text_round(3, "好了"),
+    ]])
+}
+
+/// 被接续的 Run 调 MCP 工具：重启后服务器还在连（握手前睡 2 秒），顶层调用与脚本里的调用都等它
+/// 连上再调通，而不是报"没有这个工具"。
+#[tokio::test]
+async fn a_resumed_run_waits_for_its_mcp_server() {
+    let (home, _) = home_with_demo("");
+    std::fs::write(
+        home.path().join("config.toml"),
+        demo_config(&home, r#"exposure = "direct""#),
+    )
+    .unwrap();
+    let llm = echo_twice();
+    let (gw, run) = resume_with_demo(
+        &home,
+        demo_config_with(&home, "python3", &["2"], r#"exposure = "direct""#),
+        &llm,
+    )
+    .await;
+    let detail = gw.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert!(gw.interventions().await.is_empty(), "不该停下来问人");
+    let results = tool_results(&llm);
+    assert_eq!(results.len(), 2, "{results:?}");
+    assert!(results[0].contains("top token=s3cret"), "{results:?}");
+    assert!(results[1].contains("nested token=s3cret"), "{results:?}");
+    gw.stop().await;
+}
+
+/// 被接续的 Run 调 MCP 工具，服务器重启后连不上：顶层调用与脚本里的调用都报"MCP 服务器 demo
+/// 连接失败"，不是"没有这个工具"；Run 照常收尾，不停下来问人。
+#[tokio::test]
+async fn a_resumed_run_is_told_why_its_mcp_server_is_missing() {
+    let (home, _) = home_with_demo("");
+    std::fs::write(
+        home.path().join("config.toml"),
+        demo_config(&home, r#"exposure = "direct""#),
+    )
+    .unwrap();
+    let missing = home.path().join("no-such-python");
+    let llm = echo_twice();
+    let (gw, run) = resume_with_demo(
+        &home,
+        demo_config_with(
+            &home,
+            &missing.display().to_string(),
+            &[],
+            r#"exposure = "direct""#,
+        ),
+        &llm,
+    )
+    .await;
+    let detail = gw.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert!(gw.interventions().await.is_empty(), "不该停下来问人");
+    let results = tool_results(&llm);
+    assert_eq!(results.len(), 2, "{results:?}");
+    for result in &results {
+        assert!(result.contains("MCP 服务器 demo 连接失败"), "{results:?}");
+        assert!(!result.contains("没有名为"), "{results:?}");
+        assert!(!result.contains("脚本里不能调"), "{results:?}");
+    }
+    gw.stop().await;
+}
+
 /// 一台要 OAuth 的 HTTP MCP 服务器（`oauth_server.py`）。服务器此刻认哪个 token 写在一个文件里，
 /// 改它就是"token 作废"；`calls` 每真的执行一次 `whoami` 记一行。
 struct OAuthServer {
@@ -500,8 +691,8 @@ async fn a_rejected_token_asks_for_login_and_the_next_login_reconnects() {
     let llm = FakeLlm::new(vec![whoami("pc-1"), whoami("pc-2")]);
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
     assert!(
-        gw.state()
-            .tool_names()
+        mounted(&gw)
+            .await
             .iter()
             .any(|name| name == "mcp__secure__whoami")
     );
@@ -544,6 +735,12 @@ async fn a_rejected_token_asks_for_login_and_the_next_login_reconnects() {
 /// 有没有 `mcp__demo__` 开头的工具。
 fn has_demo(names: &[String]) -> bool {
     names.iter().any(|name| name.starts_with("mcp__demo__"))
+}
+
+/// 受理 Run 时目录里有什么：启动不等 MCP 握手，先做一遍受理时那一步（等服务器、挂工具）再看。
+async fn mounted(gw: &Gw) -> Vec<String> {
+    gw.state().refresh_mcp().await;
+    gw.state().tool_names()
 }
 
 /// 热重载加一台服务器（`docs/mcp.md` §2.2）：不用重启，下一条 Run 就看得到它的工具。重载不等
@@ -613,7 +810,7 @@ async fn a_server_removed_by_reload_is_gone_for_the_next_run() {
     let (home, _) = home_with_demo(r#"exposure = "direct""#);
     let llm = FakeLlm::finisher("好");
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    assert!(has_demo(&gw.state().tool_names()));
+    assert!(has_demo(&mounted(&gw).await));
 
     std::fs::write(home.path().join("config.toml"), config_toml("")).unwrap();
     let response = komo_gateway::reload::reload(gw.state())
@@ -685,7 +882,7 @@ async fn an_invalid_mcp_reload_leaves_the_servers_alone() {
     let (home, _) = home_with_demo("");
     let llm = FakeLlm::finisher("好");
     let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
-    let before = gw.state().tool_names();
+    let before = mounted(&gw).await;
     assert!(has_demo(&before));
 
     std::fs::write(

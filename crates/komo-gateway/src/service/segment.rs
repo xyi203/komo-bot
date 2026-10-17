@@ -450,6 +450,13 @@ impl SegmentSource for GatewaySegments {
         // 是同一份 `AgentSurface`（`CallEnv::surface`）。两边各拿一份就会出现"schema 里没有
         // 这个名字、执行器却查得到"。tool definitions 要先算好——系统提示的 RULES 按它挑
         // 规则，skills 门控也按它（§16）。
+        //
+        // 被接续的 Run 不经过受理：Gateway 刚重启时它能力面里的 MCP 工具可能还没挂上，先等
+        // 它们的服务器（`docs/mcp.md` §2.2），schema 与服务器段才与受理时一样。没连上的照旧
+        // 缺着，调到时执行器报原因。
+        if let Some(executor) = &self.executor {
+            executor.await_mcp(identity.surface.names()).await;
+        }
         let tools = match &self.executor {
             Some(executor) => executor.definitions_for(&identity.surface),
             // 精简装配（没有执行器）：目录里这一段允许的那些就是 Schema——判据还是那一份

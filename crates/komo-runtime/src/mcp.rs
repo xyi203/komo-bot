@@ -13,6 +13,9 @@
 //! - **改 `[mcp.servers]` 热重载即生效**（照 pi 的 `mcp_servers_change`，§2.2）：新加的后台
 //!   连上，删掉的撤工具、断开，改了的先删后加。正在执行的那一次调用不被掐断：它握着自己那份
 //!   会话，返回之后才真的断开。
+//! - **启动不等握手**（2026-10-17）：每台服务器后台连，Gateway 立刻就绪。工具在受理 Run 时
+//!   挂上（[`McpHub::wait_for_startup`]）；被接续的 Run 不经过受理，调到还没挂上的工具时先等
+//!   那台服务器（[`McpHub::await_tools`]）。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -38,11 +41,12 @@ use rmcp::transport::{StreamableHttpClientTransport, TokioChildProcess};
 use crate::config::Secrets;
 use crate::tools::McpTool;
 
-/// 连接 + 握手 + 列工具的总时限：一个起不来的服务器不该把 Gateway 的启动拖住。
+/// 连接 + 握手 + 列工具的总时限：卡住的服务器到点算连不上，下一次用到时再连。
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 受理 Run 时等直出服务器连上的上限（照 pi 的 `startupWaitMs`，默认 10 秒）。从这台服务器
-/// 开始连时算起，不是每条 Run 各等一遍：挂住的服务器至多拖慢这一段，之后的 Run 不再等它。
+/// 等服务器第一次连上的上限（照 pi 的 `startupWaitMs`，默认 10 秒）：受理 Run 时、被接续的
+/// Run 调到还没挂上的工具时都按它等。从这台服务器开始连时算起，不是每条 Run 各等一遍：挂住的
+/// 服务器至多拖慢这一段，之后不再等它。
 pub const STARTUP_WAIT: Duration = Duration::from_secs(10);
 
 /// 模型侧工具名的长度上限（OpenAI 的 function name 是 64）。
@@ -248,16 +252,26 @@ fn forward_stderr(server: String, stderr: tokio::process::ChildStderr) {
 /// 模型看到的工具名：`mcp__<server>__<tool>`，JS / OpenAI 标识符里不能有的字符换成 `_`。
 /// 超过 [`MAX_TOOL_NAME`] 就是 `None`——截断会让两个工具撞成一个名字。
 pub fn tool_name(server: &str, tool: &str) -> Option<String> {
-    let clean = |raw: &str| -> String {
-        raw.chars()
-            .map(|c| match c {
-                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => c,
-                _ => '_',
-            })
-            .collect()
-    };
     let name = format!("mcp__{}__{}", clean(server), clean(tool));
     (name.len() <= MAX_TOOL_NAME).then_some(name)
+}
+
+fn clean(raw: &str) -> String {
+    raw.chars()
+        .map(|c| match c {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => c,
+            _ => '_',
+        })
+        .collect()
+}
+
+/// 这个模型侧工具名照 [`tool_name`] 的规则可能出自这台服务器：`mcp__<server>__` 开头、后面还有
+/// 东西。工具还没列出来之前只能这么认。
+fn claims(server: &str, tool: &str) -> bool {
+    tool.strip_prefix("mcp__")
+        .and_then(|rest| rest.strip_prefix(clean(server).as_str()))
+        .and_then(|rest| rest.strip_prefix("__"))
+        .is_some_and(|rest| !rest.is_empty())
 }
 
 /// 脚本里这台服务器的名字：`mcp__<server>`，`-` 换成 `_`（与 `tools.<name>` 的写法一致）。
@@ -348,11 +362,13 @@ pub struct McpConnection {
     pending: Mutex<Vec<rmcp::model::Tool>>,
     /// 已从配置移除。不进锁：重连可能握着锁好几秒，移除不该等它。
     closed: AtomicBool,
-    /// 第一次连接有了结果（连上、要登录、失败都算）。没有就是"连接中"：受理 Run 时等直出
-    /// 服务器看它（pi 的 `server.ready`）。
+    /// 第一次连接有了结果（连上、要登录、失败都算）。没有就是"连接中"：受理 Run 时等服务器
+    /// 看它（pi 的 `server.ready`）。
     settled: tokio::sync::watch::Sender<bool>,
-    /// 开始连的时刻：[`STARTUP_WAIT`] 从这里算。
+    /// 开始连的时刻：`startup_wait` 从这里算。
     started: Instant,
+    /// 等第一次连接的上限，生产里是 [`STARTUP_WAIT`]（测试改短）。
+    startup_wait: Duration,
 }
 
 impl std::fmt::Debug for McpConnection {
@@ -364,7 +380,13 @@ impl std::fmt::Debug for McpConnection {
 }
 
 impl McpConnection {
-    fn new(name: &str, config: &McpServerConfig, secrets: &Secrets, data_dir: &Path) -> Self {
+    fn new(
+        name: &str,
+        config: &McpServerConfig,
+        secrets: &Secrets,
+        data_dir: &Path,
+        startup_wait: Duration,
+    ) -> Self {
         McpConnection {
             name: name.to_string(),
             config: config.clone(),
@@ -381,6 +403,7 @@ impl McpConnection {
             closed: AtomicBool::new(false),
             settled: tokio::sync::watch::Sender::new(false),
             started: Instant::now(),
+            startup_wait,
         }
     }
 
@@ -388,8 +411,8 @@ impl McpConnection {
         &self.name
     }
 
-    /// 后台连第一次（pi 的 `session_start` 不 await `startConnection`）：热重载不等握手。
-    /// 调用先到、已经连过了，这里就什么也不做。
+    /// 后台连第一次（pi 的 `session_start` 不 await `startConnection`）：启动与热重载都不等
+    /// 握手。调用先到、已经连过了，这里就什么也不做。
     fn connect_in_background(self: &Arc<Self>) {
         let connection = Arc::clone(self);
         tokio::spawn(async move {
@@ -420,27 +443,70 @@ impl McpConnection {
         format!("MCP 服务器 {} 已从配置移除，它的工具不能再调", self.name)
     }
 
-    /// 有没有声明给模型的工具（pi 的 `hasDirectTools`）：受理 Run 时只等这样的服务器。
-    fn has_direct_tools(&self) -> bool {
-        self.config.exposure == McpExposure::Direct
+    /// 有没有挂得上的工具（直出或只在脚本里调，不全是 `hidden`）：受理 Run 时只等这样的服务器。
+    ///
+    /// pi 只等直出的（`hasDirectTools`），因为它的脚本侧工具调用时才按名字找服务器；komo 的能力面
+    /// 在受理时按名字冻结，没挂上的工具这条 Run 从头到尾调不到，所以只在脚本里调的也要等。
+    fn has_callable_tools(&self) -> bool {
+        self.config.exposure != McpExposure::Hidden
             || self
                 .config
                 .tool_exposure
                 .values()
-                .any(|exposure| *exposure == McpExposure::Direct)
+                .any(|exposure| *exposure != McpExposure::Hidden)
     }
 
-    /// 第一次连接还没有结果、离开始连不到 [`STARTUP_WAIT`]：等它，到点就不等了。
-    async fn wait_startup(&self) {
-        let Some(left) = STARTUP_WAIT.checked_sub(self.started.elapsed()) else {
-            return;
+    /// 第一次连接还没有结果、离开始连不到 `startup_wait`：等它，到点就不等了。交回第一次连接
+    /// 有没有结果。
+    async fn wait_startup(&self) -> bool {
+        let Some(left) = self.startup_wait.checked_sub(self.started.elapsed()) else {
+            return *self.settled.borrow();
         };
         let mut settled = self.settled.subscribe();
-        if tokio::time::timeout(left, settled.wait_for(|done| *done))
+        tokio::time::timeout(left, settled.wait_for(|done| *done))
             .await
-            .is_err()
-        {
-            tracing::info!(server = %self.name, "MCP 服务器还在连，这条 Run 先不等它，连上后工具从下一条 Run 起可用");
+            .is_ok()
+    }
+
+    /// 被接续的 Run 用到这台服务器、它的工具却还没挂上：等第一次连接有结果（同受理时的上限），
+    /// 交回没连上的原因。**不重连**：启动时就连不上的服务器受理 Run 时也不重试（`docs/mcp.md`
+    /// §2.2），同一个口径；连上过、后来断了的，调用时 [`Self::ready`] 自己重连。
+    async fn settle(&self) -> Result<(), String> {
+        if self.is_closed() {
+            return Err(self.removed_message());
+        }
+        if !self.wait_startup().await {
+            return Err(format!(
+                "MCP 服务器 {} 还没连上（等了 {} 秒），这次调用没有执行；稍后再调",
+                self.name,
+                self.startup_wait.as_secs()
+            ));
+        }
+        // `settled` 在 `connect_into` 写进结果之前就发了，连接的那一方这时可能还握着锁：在剩下的
+        // 窗口里真的拿一次锁，读到的才是这次连接的结果。窗口过了还拿不到，是一次调用在重连。
+        let left = self.startup_wait.saturating_sub(self.started.elapsed());
+        let link = match tokio::time::timeout(left, self.link.lock()).await {
+            Ok(link) => Some(link),
+            Err(_) => self.link.try_lock().ok(),
+        };
+        let reconnecting = || {
+            format!(
+                "MCP 服务器 {} 正在重连，这次调用没有执行；稍后再调",
+                self.name
+            )
+        };
+        let Some(link) = link else {
+            return Err(reconnecting());
+        };
+        match &*link {
+            Link::Connected(_) => Ok(()),
+            Link::Connecting => Err(reconnecting()),
+            Link::NeedsAuth { .. } => Err(self.login_hint()),
+            Link::Closed => Err(self.removed_message()),
+            Link::Failed(error) => Err(format!(
+                "MCP 服务器 {} 连接失败（{error}），这次调用没有执行",
+                self.name
+            )),
         }
     }
 
@@ -624,8 +690,13 @@ impl McpConnection {
     }
 
     /// 等登录、而凭证文件已经变了：重连。
+    ///
+    /// 锁被占着就是正在连（后台第一次连、或一次调用在重连），不是"等登录"：不等它，下一条 Run
+    /// 受理时再比。等的话，一台握手卡住的服务器会把受理拖到 [`CONNECT_TIMEOUT`]。
     async fn reconnect_if_signed_in(&self) {
-        let mut link = self.link.lock().await;
+        let Ok(mut link) = self.link.try_lock() else {
+            return;
+        };
         let Link::NeedsAuth { tokens } = &*link else {
             return;
         };
@@ -650,7 +721,7 @@ pub struct McpChange {
 
 /// 全部配置过的 MCP 服务器。Gateway 启动时造一份，一直留着；热重载时按配置增删
 /// （[`Self::reconcile`]）。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct McpHub {
     /// 名字 → 连接。
     connections: Mutex<BTreeMap<String, Arc<McpConnection>>>,
@@ -659,34 +730,59 @@ pub struct McpHub {
     registered: Mutex<BTreeMap<String, String>>,
     /// 热重载新加的服务器用它找登录凭证。
     data_dir: PathBuf,
+    /// 等第一次连接的上限，生产里是 [`STARTUP_WAIT`]。
+    startup_wait: Duration,
+}
+
+impl Default for McpHub {
+    fn default() -> Self {
+        McpHub {
+            connections: Mutex::default(),
+            registered: Mutex::default(),
+            data_dir: PathBuf::new(),
+            startup_wait: STARTUP_WAIT,
+        }
+    }
 }
 
 impl McpHub {
-    /// 启动时并行连全部服务器。连不上的不让 Gateway 起不来，也不让别的服务器的工具跟着
-    /// 消失：它留在这里，等登录或下一次用到时再连。
-    pub async fn start(
+    /// 启动时每台服务器各自后台连，**不等握手**：一台卡住的服务器不拖住 Gateway 就绪。连不上
+    /// 的也不让别的服务器的工具跟着消失：它留在这里，等登录或下一次用到时再连。工具在受理 Run
+    /// 时挂上（[`Self::wait_for_startup`] + [`Self::refresh`]）。
+    pub fn start(
         servers: &BTreeMap<String, McpServerConfig>,
         secrets: &Secrets,
         data_dir: &Path,
     ) -> Self {
+        Self::start_waiting(servers, secrets, data_dir, STARTUP_WAIT)
+    }
+
+    /// 同 [`Self::start`]，等第一次连接的上限自己给（测试用短的）。
+    pub fn start_waiting(
+        servers: &BTreeMap<String, McpServerConfig>,
+        secrets: &Secrets,
+        data_dir: &Path,
+        startup_wait: Duration,
+    ) -> Self {
         let connections: BTreeMap<String, Arc<McpConnection>> = servers
             .iter()
             .map(|(name, config)| {
-                (
-                    name.clone(),
-                    Arc::new(McpConnection::new(name, config, secrets, data_dir)),
-                )
+                let connection = Arc::new(McpConnection::new(
+                    name,
+                    config,
+                    secrets,
+                    data_dir,
+                    startup_wait,
+                ));
+                connection.connect_in_background();
+                (name.clone(), connection)
             })
             .collect();
-        futures_util::future::join_all(connections.values().map(|connection| async move {
-            let mut link = connection.link.lock().await;
-            connection.connect_into(&mut link).await;
-        }))
-        .await;
         McpHub {
             connections: Mutex::new(connections),
             registered: Mutex::new(BTreeMap::new()),
             data_dir: data_dir.to_path_buf(),
+            startup_wait,
         }
     }
 
@@ -758,7 +854,13 @@ impl McpHub {
             if connections.contains_key(name) {
                 continue;
             }
-            let connection = Arc::new(McpConnection::new(name, config, secrets, &self.data_dir));
+            let connection = Arc::new(McpConnection::new(
+                name,
+                config,
+                secrets,
+                &self.data_dir,
+                self.startup_wait,
+            ));
             connection.connect_in_background();
             connections.insert(name.clone(), connection);
             tracing::info!(server = %name, "MCP 服务器加进来了，后台连接");
@@ -767,17 +869,84 @@ impl McpHub {
         change
     }
 
-    /// 受理 Run 时先等直出服务器（pi 的 `waitForDirectServers`）：只等有工具声明给模型、而且
-    /// 第一次连接还没结果的那些，至多等到 [`STARTUP_WAIT`]。别的服务器（只在脚本里调的）不等，
-    /// 调用时 [`McpConnection::ready`] 自己等。
-    pub async fn wait_for_direct(&self) {
-        futures_util::future::join_all(
-            self.connections()
-                .iter()
-                .filter(|connection| connection.has_direct_tools())
-                .map(|connection| connection.wait_startup()),
+    /// 受理 Run 时先等还在连的服务器（照 pi 的 `waitForDirectServers`）：只等有工具挂得上、
+    /// 而且第一次连接还没结果的那些，至多等到开始连之后 [`STARTUP_WAIT`]。到点没连上的这条
+    /// Run 先不等它，连上后工具从下一条 Run 起可用。
+    pub async fn wait_for_startup(&self) {
+        let pending: Vec<Arc<McpConnection>> = self
+            .connections()
+            .into_iter()
+            .filter(|connection| connection.has_callable_tools())
+            .collect();
+        let settled = futures_util::future::join_all(
+            pending.iter().map(|connection| connection.wait_startup()),
         )
         .await;
+        for (connection, settled) in pending.iter().zip(settled) {
+            if !settled {
+                tracing::info!(server = %connection.name, "MCP 服务器还在连，这条 Run 先不等它，连上后工具从下一条 Run 起可用");
+            }
+        }
+    }
+
+    /// 被接续的 Run 不经过受理（`docs/mcp.md` §2.2）：它冻结的能力面里有 `names`，执行器目录里
+    /// 却还没有——Gateway 刚重启、服务器还在连。按 [`tool_name`] 的命名规则认出这些名字可能
+    /// 出自哪几台服务器，等它们第一次连接有结果（[`McpConnection::settle`]），交回这次挂得上
+    /// 的工具，以及仍然没有着落的名字 → 原因。
+    ///
+    /// 认不出服务器的名字（不是 MCP 的、服务器已从配置删掉的）不在交回的原因里：调用方照常报
+    /// "没有这个工具"。认出来的服务器连上了、却没列出这个工具的，同理。
+    pub async fn await_tools(
+        &self,
+        names: &[String],
+    ) -> (Vec<Arc<dyn Tool>>, BTreeMap<String, String>) {
+        let connections = self.connections();
+        let claimed: Vec<(&String, Vec<&Arc<McpConnection>>)> = names
+            .iter()
+            .map(|name| {
+                let owners = connections
+                    .iter()
+                    .filter(|connection| claims(connection.name(), name))
+                    .collect();
+                (name, owners)
+            })
+            .filter(|(_, owners): &(_, Vec<_>)| !owners.is_empty())
+            .collect();
+        if claimed.is_empty() {
+            return (Vec::new(), BTreeMap::new());
+        }
+        // 一台服务器只等一次，几台一起等。
+        let waiting: BTreeMap<&str, &Arc<McpConnection>> = claimed
+            .iter()
+            .flat_map(|(_, owners)| owners.iter().map(|owner| (owner.name(), *owner)))
+            .collect();
+        let outcomes: BTreeMap<&str, Result<(), String>> = waiting
+            .keys()
+            .copied()
+            .zip(
+                futures_util::future::join_all(
+                    waiting.values().map(|connection| connection.settle()),
+                )
+                .await,
+            )
+            .collect();
+        let tools = self.new_tools();
+        let registered = self.registered.lock().expect("MCP 工具名表");
+        let mut unresolved = BTreeMap::new();
+        for (name, owners) in claimed {
+            if registered.contains_key(name.as_str()) {
+                continue;
+            }
+            let reasons: Vec<&str> = owners
+                .iter()
+                .filter_map(|owner| outcomes.get(owner.name())?.as_ref().err())
+                .map(String::as_str)
+                .collect();
+            if !reasons.is_empty() {
+                unresolved.insert(name.clone(), reasons.join("；"));
+            }
+        }
+        (tools, unresolved)
     }
 
     /// 受理 Run 之前问一次（pi 在每个 turn 开始时）：等登录的服务器凭证文件变了就重连。交回
@@ -966,8 +1135,33 @@ for line in sys.stdin:
             self.dir.path().join(tag)
         }
 
+        /// 起一个 hub，等第一次连接有结果（与受理 Run 时同一个等法）。
         async fn hub(&self, servers: &[(&str, McpServerConfig)]) -> McpHub {
-            McpHub::start(&servers_of(servers), &Secrets::new(), self.dir.path()).await
+            let hub = McpHub::start(&servers_of(servers), &Secrets::new(), self.dir.path());
+            hub.wait_for_startup().await;
+            hub
+        }
+
+        /// 握手永远不回的服务器：进程起着，什么也不答。
+        fn stuck(&self) -> McpServerConfig {
+            let mut config = self.server("stuck", &[]);
+            config.transport = McpTransport::Stdio {
+                command: "python3".into(),
+                args: vec!["-c".into(), "import time; time.sleep(40)".into()],
+                env: vec![],
+            };
+            config
+        }
+
+        /// 起不来的服务器：命令不存在。
+        fn broken(&self) -> McpServerConfig {
+            let mut config = self.server("broken", &[]);
+            config.transport = McpTransport::Stdio {
+                command: self.dir.path().join("no-such-server").display().to_string(),
+                args: vec![],
+                env: vec![],
+            };
+            config
         }
 
         /// 标记文件出现为止（至多 20 秒）。
@@ -1194,5 +1388,181 @@ for line in sys.stdin:
         wait_exit(old_pid).await;
         let fresh = Arc::clone(&hub.connections()[0]);
         assert!(fresh.call("echo", JsonObject::new()).await.is_ok());
+    }
+
+    /// 工具还没列出来之前按命名规则认服务器：名字里的特殊字符照 [`tool_name`] 换掉再比。
+    #[test]
+    fn a_tool_name_is_claimed_by_its_server_prefix() {
+        assert!(claims("dev-radius", "mcp__dev-radius__search"));
+        assert!(claims("a.b", "mcp__a_b__x"));
+        assert!(claims("a", "mcp__a__b__c"));
+        assert!(!claims("a", "mcp__ab__x"));
+        assert!(!claims("a", "mcp__a__"));
+        assert!(!claims("a", "read"));
+    }
+
+    /// 启动不等握手：一台握手永远不回的服务器不拖住 `start`，另一台照样后台连上。
+    #[tokio::test]
+    async fn start_returns_without_waiting_for_a_stuck_server() {
+        let fixture = Fixture::new();
+        let begun = Instant::now();
+        let hub = McpHub::start_waiting(
+            &servers_of(&[
+                ("demo", fixture.server("a", &[])),
+                ("stuck", fixture.stuck()),
+            ]),
+            &Secrets::new(),
+            fixture.dir.path(),
+            Duration::from_secs(1),
+        );
+        assert!(
+            begun.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            begun.elapsed()
+        );
+        assert!(
+            hub.statuses()
+                .iter()
+                .all(|status| status.state == McpServerState::Connecting)
+        );
+
+        // 受理 Run 时的等待到点就放手，连上的那台工具交得出来。
+        hub.wait_for_startup().await;
+        assert!(
+            begun.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            begun.elapsed()
+        );
+        assert_eq!(
+            hub.new_tools()
+                .iter()
+                .map(|tool| tool.definition().name)
+                .collect::<Vec<_>>(),
+            vec!["mcp__demo__echo", "mcp__demo__slow"]
+        );
+        let stuck = hub
+            .statuses()
+            .into_iter()
+            .find(|status| status.name == "stuck")
+            .unwrap();
+        assert_eq!(stuck.state, McpServerState::Connecting);
+    }
+
+    /// 被接续的 Run 用的那条路：按名字认出服务器、等它，连上的工具交回来；还在连的、连不上的
+    /// 报原因；认不出服务器的名字不报（调用方照常说"没有这个工具"）。
+    #[tokio::test]
+    async fn await_tools_waits_for_the_owner_and_explains_the_rest() {
+        let fixture = Fixture::new();
+        let hub = McpHub::start_waiting(
+            &servers_of(&[
+                ("demo", fixture.server("a", &[])),
+                ("stuck", fixture.stuck()),
+                ("broken", fixture.broken()),
+            ]),
+            &Secrets::new(),
+            fixture.dir.path(),
+            Duration::from_secs(1),
+        );
+        let names: Vec<String> = [
+            "mcp__demo__echo",
+            "mcp__demo__nope",
+            "mcp__stuck__x",
+            "mcp__broken__x",
+            "mcp__ghost__x",
+            "read",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let (tools, unresolved) = hub.await_tools(&names).await;
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.definition().name)
+                .collect::<Vec<_>>(),
+            vec!["mcp__demo__echo", "mcp__demo__slow"]
+        );
+        assert_eq!(
+            unresolved.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["mcp__broken__x", "mcp__stuck__x"]
+        );
+        assert!(
+            unresolved["mcp__stuck__x"].contains("MCP 服务器 stuck 还没连上"),
+            "{unresolved:?}"
+        );
+        assert!(
+            unresolved["mcp__broken__x"].contains("MCP 服务器 broken 连接失败"),
+            "{unresolved:?}"
+        );
+
+        // 第二次不再等：工具已经挂过，还在连的那台到点了直接报。
+        let begun = Instant::now();
+        let (tools, unresolved) = hub.await_tools(&names).await;
+        assert!(tools.is_empty());
+        assert_eq!(unresolved.len(), 2);
+        assert!(
+            begun.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            begun.elapsed()
+        );
+    }
+
+    /// 执行器的顶层调用：能力面里有、目录里还没有的 MCP 工具，先等服务器连上再调通；连不上的
+    /// 报那台服务器为什么连不上，不是"没有名为…的工具"。
+    #[tokio::test]
+    async fn a_call_to_a_tool_not_yet_mounted_waits_for_its_server() {
+        use crate::executor::ToolExecutor;
+        use crate::executor::harness::Harness;
+
+        let fixture = Fixture::new();
+        let hub = Arc::new(McpHub::start_waiting(
+            &servers_of(&[
+                ("demo", fixture.server("a", &[])),
+                ("broken", fixture.broken()),
+            ]),
+            &Secrets::new(),
+            fixture.dir.path(),
+            Duration::from_secs(5),
+        ));
+        let harness = Harness::new();
+        let executor = ToolExecutor::new(
+            vec![],
+            harness.ledger.clone(),
+            harness.outputs.clone(),
+            Arc::new(harness.clock.clone()),
+        )
+        .with_mcp(Arc::clone(&hub));
+        assert!(executor.tool_names().is_empty());
+        let (session, run) = harness.open_run().await;
+        let mut env = harness.env(&session, &run);
+        env.surface =
+            komo_kernel::types::surface::AgentSurface::new(["mcp__demo__echo", "mcp__broken__x"]);
+
+        let calls = harness
+            .record_round(
+                &run,
+                &[
+                    ("mcp__demo__echo", serde_json::json!({})),
+                    ("mcp__broken__x", serde_json::json!({})),
+                ],
+            )
+            .await;
+        let outcome = executor.execute_round(calls, &env).await.unwrap();
+        assert!(outcome.stop.is_none());
+        let echoed = &outcome.results[0];
+        assert!(!echoed.is_error, "{}", echoed.content);
+        assert!(echoed.content.contains("echoed"), "{}", echoed.content);
+        let broken = &outcome.results[1];
+        assert!(broken.is_error);
+        assert!(
+            broken.content.contains("MCP 服务器 broken 连接失败"),
+            "{}",
+            broken.content
+        );
+        assert!(
+            executor
+                .tool_names()
+                .contains(&"mcp__demo__echo".to_string())
+        );
     }
 }

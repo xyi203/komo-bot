@@ -240,6 +240,9 @@ pub struct ToolExecutor {
     /// codemode 的 worker 启动方式（`docs/codemode.md`）。`None` = 这台执行器没有接 codemode
     /// （测试装配），`codemode` 也不会被注册。
     codemode: Option<crate::codemode::Worker>,
+    /// MCP 连接（`docs/mcp.md` §2.2）：被接续的 Run 调到还没挂上的 MCP 工具时先等那台服务器
+    /// （[`Self::await_mcp`]）。`None` = 没接 MCP（测试装配）。
+    mcp: Option<Arc<crate::mcp::McpHub>>,
 }
 
 impl std::fmt::Debug for ToolExecutor {
@@ -271,12 +274,46 @@ impl ToolExecutor {
             spawner: std::sync::OnceLock::new(),
             monitors: std::sync::OnceLock::new(),
             codemode: None,
+            mcp: None,
         }
     }
 
     pub fn with_codemode(mut self, worker: Option<crate::codemode::Worker>) -> Self {
         self.codemode = worker;
         self
+    }
+
+    pub fn with_mcp(mut self, hub: Arc<crate::mcp::McpHub>) -> Self {
+        self.mcp = Some(hub);
+        self
+    }
+
+    /// 能力面里有、目录里还没有的 MCP 工具（`docs/mcp.md` §2.2）：Gateway 启动不等 MCP 握手，
+    /// 被接续的 Run 又不经过受理，它冻结的能力面里的 MCP 工具这时可能还没挂上。先等那几台
+    /// 服务器第一次连上（至多 [`crate::mcp::STARTUP_WAIT`]），连上的工具挂进目录；交回仍然
+    /// 没有着落的名字 → 原因（"还没连上"、"连接失败"、"要登录"），调用方把它交给模型，而不是
+    /// 一句"没有这个工具"。目录里已经有的、撤掉过的不等。
+    pub async fn await_mcp(&self, names: &[String]) -> BTreeMap<String, String> {
+        let Some(hub) = &self.mcp else {
+            return BTreeMap::new();
+        };
+        let tools = self.tools();
+        let missing: Vec<String> = names
+            .iter()
+            .filter(|name| {
+                !tools.contains_key(name.as_str()) && self.withdrawn_reason(name).is_none()
+            })
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return BTreeMap::new();
+        }
+        let (fresh, unresolved) = hub.await_tools(&missing).await;
+        let added = self.install(fresh);
+        if !added.is_empty() {
+            tracing::info!(tools = %added.join("、"), "MCP 服务器连上了，工具挂进目录");
+        }
+        unresolved
     }
 
     /// 测试用的构造方式：装配时就给一个 spawner（生产走 [`Self::set_spawner`]，见
@@ -592,6 +629,14 @@ impl ToolExecutor {
         // （改名、删除）。它也许已经动过手，不能判成"没开始"、更不能停下 Run：与别的 unsafe
         // 中断一样记 uncertain 交给模型。只落了计划、没 started 的确定没执行过（§8.4 第 6 行），
         // 与模型这一轮新发的调用一样照旧被拒。
+        //
+        // 能力面里有、目录里还没有的 MCP 工具先等它的服务器连上（[`Self::await_mcp`]）：被接续
+        // 的 Run 不经过受理，Gateway 刚起来时它的 MCP 工具可能还没挂上。
+        let mut pending_mcp = if env.surface.allows(&request.tool) {
+            self.await_mcp(std::slice::from_ref(&request.tool)).await
+        } else {
+            BTreeMap::new()
+        };
         let tools = self.tools();
         // 2026-10-16 删掉的 `delegate` / `dispatch` / `follow`：升级时还没收尾的调用带着落账的
         // 计划回来，工具已经不在目录里。它们是编排调用，不问工具也不看重放策略——计划里就有
@@ -628,7 +673,10 @@ impl ToolExecutor {
         // 未知工具名：作为错误内容交回模型，**不派发任何东西**（§14 阶段 3）。热重载撤掉的
         // MCP 工具说清楚为什么没了。
         let Some(tool) = tools.get(&request.tool).cloned() else {
-            let message = match self.withdrawn_reason(&request.tool) {
+            let message = match self
+                .withdrawn_reason(&request.tool)
+                .or_else(|| pending_mcp.remove(&request.tool))
+            {
                 Some(reason) => reason,
                 None => {
                     let known: Vec<&str> = tools.keys().map(String::as_str).collect();

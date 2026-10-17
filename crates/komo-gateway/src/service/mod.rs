@@ -538,7 +538,7 @@ fn codemode_worker() -> Option<komo_runtime::codemode::Worker> {
 }
 
 /// 六个基础工具（§4）与那条编排操作。`codemode` 随 worker 一起装配（`docs/codemode.md` §3），worker 交给执行器。
-/// MCP 的连接留在 [`komo_runtime::mcp::McpHub`] 里：登录后才连上的服务器，受理 Run 时再把工具挂进来。
+/// MCP 的连接留在 [`komo_runtime::mcp::McpHub`] 里，后台连：连上的服务器受理 Run 时再把工具挂进来。
 async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
@@ -585,12 +585,14 @@ async fn build_tools(
     // （`docs/monitor.md`）。
     tools.push(Arc::new(MonitorTool::new()));
     tools.push(Arc::new(MonitorStopTool::new()));
-    // MCP（`docs/mcp.md`）：启动时连上、列出工具，挂进同一份目录——之后它们与内置工具
-    // 走同一条落账的路。要登录的服务器留在 hub 里，登录后再挂；热重载增删服务器（§2.2）。
-    let mcp = Arc::new(
-        komo_runtime::mcp::McpHub::start(&snapshot.mcp, &config.secrets(), config.home()).await,
-    );
-    tools.extend(mcp.new_tools());
+    // MCP（`docs/mcp.md` §2.2）：启动时每台服务器后台连，**不等握手**，这里一个 MCP 工具也不挂。
+    // 连上的工具在受理 Run 时挂进同一份目录（`GatewayState::refresh_mcp`），之后与内置工具走
+    // 同一条落账的路；被接续的 Run 调到时执行器自己等（`ToolExecutor::await_mcp`）。
+    let mcp = Arc::new(komo_runtime::mcp::McpHub::start(
+        &snapshot.mcp,
+        &config.secrets(),
+        config.home(),
+    ));
     // 测试专用的工具（`gate` / `unsure`，见 `test_support`）：只在测试为这个数据目录装过
     // 时才有，生产构建里这一行不存在。
     #[cfg(any(test, feature = "test-support"))]

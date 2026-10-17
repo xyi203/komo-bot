@@ -352,8 +352,12 @@ impl ToolExecutor {
                                 Ok(plan)
                             }
                         }),
+                    // 热重载撤掉的 MCP 工具说清楚为什么没了；那台服务器不在能力面里的照旧拒。
                     None => Err(ToolError::Denied {
-                        reason: format!("脚本里不能调 {name}"),
+                        reason: match self.withdrawn_reason(name) {
+                            Some(reason) if env.surface.allows(name) => reason,
+                            _ => format!("脚本里不能调 {name}"),
+                        },
                     }),
                 };
                 let intent = match prepared {

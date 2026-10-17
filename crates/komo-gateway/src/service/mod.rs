@@ -586,14 +586,9 @@ async fn build_tools(
     tools.push(Arc::new(MonitorTool::new()));
     tools.push(Arc::new(MonitorStopTool::new()));
     // MCP（`docs/mcp.md`）：启动时连上、列出工具，挂进同一份目录——之后它们与内置工具
-    // 走同一条落账的路。要登录的服务器留在 hub 里，登录后再挂（§2.2）。
+    // 走同一条落账的路。要登录的服务器留在 hub 里，登录后再挂；热重载增删服务器（§2.2）。
     let mcp = Arc::new(
-        komo_runtime::mcp::McpHub::start(
-            &snapshot.start_only.mcp,
-            &config.secrets(),
-            config.home(),
-        )
-        .await,
+        komo_runtime::mcp::McpHub::start(&snapshot.mcp, &config.secrets(), config.home()).await,
     );
     tools.extend(mcp.new_tools());
     // 测试专用的工具（`gate` / `unsure`，见 `test_support`）：只在测试为这个数据目录装过

@@ -447,7 +447,7 @@ fn check_compaction(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
 /// `[mcp.servers.<name>]`（`docs/mcp.md`）：名字要进工具名（`mcp__<name>__<tool>`），只能是
 /// 字母、数字、`_`、`-`；`read_only` 写了白名单之外的工具是笔误，不会生效。
 fn check_mcp(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
-    for (name, server) in &snapshot.start_only.mcp {
+    for (name, server) in &snapshot.mcp {
         let key = format!("mcp.servers.{name}");
         if name.is_empty()
             || !name
@@ -664,7 +664,6 @@ mod tests {
     fn an_mcp_server_name_that_cannot_go_into_a_tool_name_is_refused() {
         let mut snapshot = snapshot_fixture();
         snapshot
-            .start_only
             .mcp
             .insert("my server".into(), mcp_server(None, vec![]));
         assert_eq!(keys(&validate(&snapshot)), vec!["mcp.servers.my server"]);
@@ -673,7 +672,7 @@ mod tests {
     #[test]
     fn read_only_outside_the_allow_list_is_a_warning() {
         let mut snapshot = snapshot_fixture();
-        snapshot.start_only.mcp.insert(
+        snapshot.mcp.insert(
             "gh".into(),
             mcp_server(Some(vec!["search"]), vec!["search", "push"]),
         );

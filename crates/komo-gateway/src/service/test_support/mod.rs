@@ -96,7 +96,6 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             data_dir: "/tmp/komo".into(),
             listen: "127.0.0.1:7777".into(),
             db_path: "/tmp/komo/state.db".into(),
-            mcp: Default::default(),
         },
         model_catalog: ModelCatalog {
             default: "main".into(),
@@ -125,6 +124,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
         },
         typesafe: TypesafeConfig::default(),
         channels: ChannelsConfig::default(),
+        mcp: Default::default(),
         paths: PathsConfig {
             sessions_dir: "/tmp/komo/sessions".into(),
             skill_dirs: vec![],

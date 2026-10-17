@@ -587,7 +587,7 @@ tools = ["lookup"]
     write(&fixture.sources().config, &text);
 
     let loaded = load_config(&fixture.options()).unwrap();
-    let mcp = &loaded.snapshot.start_only.mcp;
+    let mcp = &loaded.snapshot.mcp;
     assert_eq!(
         mcp["gh"].transport,
         komo_kernel::protocol::config::McpTransport::Stdio {
@@ -608,7 +608,7 @@ fn an_oauth_mcp_server_loads_and_refuses_a_bearer_token_beside_it() {
     write(&fixture.sources().config, &text);
     let loaded = load_config(&fixture.options()).unwrap();
     assert_eq!(
-        loaded.snapshot.start_only.mcp["devops"].transport,
+        loaded.snapshot.mcp["devops"].transport,
         komo_kernel::protocol::config::McpTransport::Http {
             url: "https://mcp.example.com/mcp".into(),
             bearer_token_env: None,
@@ -634,7 +634,7 @@ fn mcp_exposure_defaults_to_codemode_and_loads_overrides() {
     );
     write(&fixture.sources().config, &text);
     let loaded = load_config(&fixture.options()).unwrap();
-    let server = &loaded.snapshot.start_only.mcp["devops"];
+    let server = &loaded.snapshot.mcp["devops"];
     assert_eq!(server.exposure, McpExposure::Codemode);
     assert_eq!(server.description.as_deref(), Some("发布与配置"));
     assert_eq!(server.exposure_of("issue_get"), McpExposure::Direct);

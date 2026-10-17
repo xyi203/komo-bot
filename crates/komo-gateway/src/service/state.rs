@@ -744,14 +744,41 @@ impl GatewayState {
 
     /// 等登录的 MCP 服务器凭证变了就连上，把它的工具挂进执行器（`docs/mcp.md` §2.2，pi 在每个
     /// turn 开始时做同一件事）。受理 Run 之前调：新名字从这条 Run 起进能力面。
+    ///
+    /// 先等热重载刚加的直出服务器（pi 的 `waitForDirectServers`），有上限；只在脚本里调的
+    /// 服务器不等，脚本调到时自己等。
     async fn refresh_mcp(&self) {
+        self.mcp.wait_for_direct().await;
         let added = self.tool_executor.install(self.mcp.refresh().await);
         if !added.is_empty() {
             tracing::info!(
                 tools = added.len(),
                 "MCP 服务器连上了，工具从这条 Run 起可用"
             );
+            // 热重载新加的服务器是后台连上的，到这里工具才挂上：skills 目录行的 `requires_tools`
+            // 按新的工具名再门控一次，不等下一次重载。
+            self.refresh_skills_prompt();
         }
+    }
+
+    /// 热重载换了 `[mcp.servers]`（照 pi 的 `mcp_servers_change`，`docs/mcp.md` §2.2）：删掉的、
+    /// 改了的服务器先撤工具再断开，新加的后台连。**不等握手**：连上之后工具在下一条 Run 受理时
+    /// 挂进来。交回每台服务器此刻的状态。
+    ///
+    /// 在跑的 Run 能力面不变：撤掉的名字再调时拿到一句"已从配置移除"，正在执行的那一次照常返回。
+    pub fn reconcile_mcp(&self) -> Vec<komo_kernel::protocol::http::McpServerStatus> {
+        let snapshot = self.snapshot();
+        let change = self.mcp.reconcile(&snapshot.mcp, &self.config.secrets());
+        let withdrawn = self.tool_executor.withdraw(change.withdrawn);
+        let added = self.tool_executor.install(self.mcp.new_tools());
+        tracing::info!(
+            added = %change.added.join("、"),
+            removed = %change.removed.join("、"),
+            withdrawn = withdrawn.len(),
+            installed = added.len(),
+            "MCP 服务器按新配置增删了"
+        );
+        self.mcp.statuses()
     }
 
     /// 按**当前**快照重装 skill 注册表（§5.6）。

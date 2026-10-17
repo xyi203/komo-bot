@@ -736,6 +736,24 @@ pub fn config_reload(response: &ConfigReloadResponse) -> String {
             out.push(format!("  {key}"));
         }
     }
+    if !response.mcp.is_empty() {
+        // 重载不等握手（`docs/mcp.md` §2.2）：刚加的多半还在连，连上后从下一条 Run 起可用。
+        use komo_kernel::protocol::http::McpServerState;
+        out.push(String::new());
+        out.push("MCP 服务器：".into());
+        for server in &response.mcp {
+            let state = match server.state {
+                McpServerState::Connecting => "连接中",
+                McpServerState::Connected => "已连上",
+                McpServerState::NeedsAuth => "要登录",
+                McpServerState::Failed => "失败",
+            };
+            match &server.detail {
+                Some(detail) => out.push(format!("  {:<12} {state}  {detail}", server.name)),
+                None => out.push(format!("  {:<12} {state}", server.name)),
+            }
+        }
+    }
     if !response.warnings.is_empty() {
         out.push(String::new());
         for issue in &response.warnings {

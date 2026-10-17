@@ -15,10 +15,26 @@ use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::RoundInput;
 
 fn home_with_demo(extra_servers: &str) -> (Home, std::path::PathBuf) {
-    let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mcp/server.py");
     let home = Home::with_config(&config_toml(""));
     let counter = home.path().join("bump.count");
-    let config = config_toml(&format!(
+    std::fs::write(
+        home.path().join("config.toml"),
+        demo_config(&home, extra_servers),
+    )
+    .unwrap();
+    std::fs::write(
+        home.path().join(".env"),
+        format!("{DEFAULT_ENV}DEMO_TOKEN=s3cret\n"),
+    )
+    .unwrap();
+    (home, counter)
+}
+
+/// 配着 `demo` 服务器的整份 config.toml。
+fn demo_config(home: &Home, extra_servers: &str) -> String {
+    let server = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mcp/server.py");
+    let counter = home.path().join("bump.count");
+    config_toml(&format!(
         r#"
 [mcp.servers.demo]
 command = "python3"
@@ -29,14 +45,7 @@ read_only = ["echo"]
 "#,
         server = server.display(),
         counter = counter.display(),
-    ));
-    std::fs::write(home.path().join("config.toml"), config).unwrap();
-    std::fs::write(
-        home.path().join(".env"),
-        format!("{DEFAULT_ENV}DEMO_TOKEN=s3cret\n"),
-    )
-    .unwrap();
-    (home, counter)
+    ))
 }
 
 fn tool_results(llm: &FakeLlm) -> Vec<String> {
@@ -529,5 +538,174 @@ async fn a_rejected_token_asks_for_login_and_the_next_login_reconnects() {
         "{results:?}"
     );
     assert_eq!(secure.calls(), "whoami\n");
+    gw.stop().await;
+}
+
+/// 有没有 `mcp__demo__` 开头的工具。
+fn has_demo(names: &[String]) -> bool {
+    names.iter().any(|name| name.starts_with("mcp__demo__"))
+}
+
+/// 热重载加一台服务器（`docs/mcp.md` §2.2）：不用重启，下一条 Run 就看得到它的工具。重载不等
+/// 握手；直出服务器在受理 Run 时等一下（照 pi 的 `waitForDirectServers`）。
+#[tokio::test]
+async fn a_server_added_by_reload_is_seen_by_the_next_run() {
+    let home = Home::with_config(&config_toml(""));
+    std::fs::write(
+        home.path().join(".env"),
+        format!("{DEFAULT_ENV}DEMO_TOKEN=s3cret\n"),
+    )
+    .unwrap();
+    let llm = FakeLlm::new(vec![vec![
+        call_round(
+            1,
+            "pc-1",
+            "mcp__demo__echo",
+            serde_json::json!({ "text": "hi" }),
+        ),
+        text_round(2, "好了"),
+    ]]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    assert!(!has_demo(&gw.state().tool_names()));
+
+    std::fs::write(
+        home.path().join("config.toml"),
+        demo_config(&home, r#"exposure = "direct""#),
+    )
+    .unwrap();
+    let response = komo_gateway::reload::reload(gw.state())
+        .await
+        .expect("新配置装得上");
+    assert!(response.start_only.is_empty(), "{response:?}");
+    assert_eq!(
+        response
+            .mcp
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["demo"]
+    );
+
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "hot-add", "回显一下").await.run;
+    let detail = gw.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    let request = llm.requests.lock().unwrap()[0].clone();
+    assert!(
+        request
+            .tools
+            .iter()
+            .any(|tool| tool.name == "mcp__demo__echo"),
+        "{:?}",
+        request.tools
+    );
+    let results = tool_results(&llm);
+    assert!(
+        results.iter().any(|text| text.contains("hi token=s3cret")),
+        "{results:?}"
+    );
+    gw.stop().await;
+}
+
+/// 热重载删掉一台服务器：它的工具从目录撤掉，之后受理的 Run 看不到。
+#[tokio::test]
+async fn a_server_removed_by_reload_is_gone_for_the_next_run() {
+    let (home, _) = home_with_demo(r#"exposure = "direct""#);
+    let llm = FakeLlm::finisher("好");
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    assert!(has_demo(&gw.state().tool_names()));
+
+    std::fs::write(home.path().join("config.toml"), config_toml("")).unwrap();
+    let response = komo_gateway::reload::reload(gw.state())
+        .await
+        .expect("新配置装得上");
+    assert!(response.start_only.is_empty(), "{response:?}");
+    assert!(response.mcp.is_empty(), "{response:?}");
+    assert!(!has_demo(&gw.state().tool_names()));
+
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "hot-remove", "看看").await.run;
+    gw.wait_terminal(&run).await;
+    let request = llm.requests.lock().unwrap()[0].clone();
+    assert!(
+        !request
+            .tools
+            .iter()
+            .any(|tool| tool.name.starts_with("mcp__demo__")),
+        "{:?}",
+        request.tools
+    );
+    gw.stop().await;
+}
+
+/// 在跑的 Run 能力面受理时冻结：服务器删掉之后它再调那个工具，拿到一句"已从配置移除"，
+/// Run 照常往下走，不 panic、不停下来问人。
+#[tokio::test]
+async fn a_running_run_is_told_the_server_was_removed() {
+    let (home, _) = home_with_demo(r#"exposure = "direct""#);
+    let gate = komo_gateway::service::test_support::Gate::new();
+    home.install_tools(vec![gate.tool()]);
+    let llm = FakeLlm::new(vec![vec![
+        call_round(1, "pc-1", "gate", serde_json::json!({})),
+        call_round(
+            2,
+            "pc-2",
+            "mcp__demo__echo",
+            serde_json::json!({ "text": "hi" }),
+        ),
+        text_round(3, "好"),
+    ]]);
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gw.open_session().await;
+    let run = gw.submit(&session, "in-flight", "调一下").await.run;
+    gate.wait_entered(1).await;
+
+    std::fs::write(home.path().join("config.toml"), config_toml("")).unwrap();
+    komo_gateway::reload::reload(gw.state())
+        .await
+        .expect("新配置装得上");
+    gate.release();
+
+    let detail = gw.wait_terminal(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert!(gw.interventions().await.is_empty(), "不该停下来问人");
+    let results = tool_results(&llm);
+    assert!(
+        results
+            .last()
+            .is_some_and(|text| text.contains("MCP 服务器 demo 已从配置移除")),
+        "{results:?}"
+    );
+    gw.stop().await;
+}
+
+/// 校验不过的 `[mcp.servers]` 不装（§3 第 1 步）：服务器与工具原样留着。
+#[tokio::test]
+async fn an_invalid_mcp_reload_leaves_the_servers_alone() {
+    let (home, _) = home_with_demo("");
+    let llm = FakeLlm::finisher("好");
+    let gw = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let before = gw.state().tool_names();
+    assert!(has_demo(&before));
+
+    std::fs::write(
+        home.path().join("config.toml"),
+        config_toml(
+            r#"
+[mcp.servers."my server"]
+command = "python3"
+"#,
+        ),
+    )
+    .unwrap();
+    let error = komo_gateway::reload::reload(gw.state())
+        .await
+        .expect_err("名字放不进工具名，装不上");
+    assert_eq!(
+        error.code(),
+        komo_kernel::protocol::http::ErrorCode::ConfigInvalid
+    );
+    assert_eq!(gw.state().tool_names(), before);
+    assert!(gw.state().snapshot().mcp.contains_key("demo"));
     gw.stop().await;
 }

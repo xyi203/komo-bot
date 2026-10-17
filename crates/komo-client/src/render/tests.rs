@@ -783,6 +783,7 @@ fn a_reload_names_the_keys_that_changed_without_their_values() {
         ],
         start_only: vec![KeyPath::new("start_only.listen")],
         warnings: vec![issues()[1].clone()],
+        mcp: vec![],
     });
     insta_like(
         &printed,
@@ -797,6 +798,33 @@ fn a_reload_names_the_keys_that_changed_without_their_values() {
     );
     // 只出键名，不出值。
     assert!(!printed.contains("127.0.0.1"), "{printed}");
+}
+
+/// 重载不等握手：每台 MCP 服务器报此刻的状态。
+#[test]
+fn a_reload_reports_each_mcp_server_state() {
+    use komo_kernel::protocol::http::{McpServerState, McpServerStatus};
+    let printed = config_reload(&ConfigReloadResponse {
+        changed: vec![KeyPath::new("mcp.servers.gh")],
+        mcp: vec![
+            McpServerStatus {
+                name: "gh".into(),
+                state: McpServerState::Connecting,
+                detail: None,
+            },
+            McpServerStatus {
+                name: "jira".into(),
+                state: McpServerState::Failed,
+                detail: Some("起不来".into()),
+            },
+        ],
+        ..Default::default()
+    });
+    insta_like(
+        &printed,
+        &["MCP 服务器", "gh", "连接中", "jira", "失败  起不来"],
+    );
+    assert!(!printed.contains("komo gateway restart"), "{printed}");
 }
 
 #[test]

@@ -517,16 +517,17 @@ pub(super) fn assemble(
         ),
         data_dir: data_dir.clone(),
         listen,
-        mcp: file
-            .mcp
-            .servers
-            .into_iter()
-            .map(|(name, server)| {
-                let config = server.into_config(&name, &base)?;
-                Ok((name, config))
-            })
-            .collect::<Result<_, ConfigError>>()?,
     };
+
+    let mcp = file
+        .mcp
+        .servers
+        .into_iter()
+        .map(|(name, server)| {
+            let config = server.into_config(&name, &base)?;
+            Ok((name, config))
+        })
+        .collect::<Result<_, ConfigError>>()?;
 
     let paths = PathsConfig {
         sessions_dir: resolve(
@@ -636,6 +637,7 @@ pub(super) fn assemble(
         compaction: file.compaction.into_compaction(),
         channels,
         paths,
+        mcp,
         credentials,
         loaded_at: now,
         sources: sources.stamps(),

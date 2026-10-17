@@ -60,6 +60,9 @@ impl fmt::Display for KeyPath {
 }
 
 /// 改了要重启 Gateway 才生效的那一小组键（§3 第 4 步）。
+///
+/// MCP 服务器不在这里：增删改热重载时就连上 / 断开（`docs/mcp.md` §2.2），见
+/// [`ConfigSnapshot::mcp`]。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartOnly {
     /// 数据目录 / `KOMO_HOME`。
@@ -67,10 +70,6 @@ pub struct StartOnly {
     /// 监听地址与端口。
     pub listen: String,
     pub db_path: PathBuf,
-    /// MCP 服务器（`[mcp.servers.<name>]`，`docs/mcp.md`）。启动时连接、列出工具、挂进
-    /// 工具目录，改了要重启才生效。
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub mcp: BTreeMap<String, McpServerConfig>,
 }
 
 /// 一个 MCP 服务器（`docs/mcp.md`）。凭证不在这里：`env` / `bearer_token_env` 写的是
@@ -601,6 +600,10 @@ pub struct ConfigSnapshot {
     pub compaction: CompactionConfig,
     pub channels: ChannelsConfig,
     pub paths: PathsConfig,
+    /// MCP 服务器（`[mcp.servers.<name>]`，`docs/mcp.md`）。重载时按名字比对：新增的后台连上，
+    /// 删掉的撤工具、断开，改了的先删后加（照 pi 的 `mcp_servers_change`）。
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, McpServerConfig>,
     /// 每个凭证**值**的哈希，按变量名索引。值本身不在快照里，这里只够回答"它变了
     /// 没有"。
     #[serde(default)]
@@ -707,7 +710,6 @@ mod tests {
                 data_dir: PathBuf::from("/home/u/.komo"),
                 listen: "127.0.0.1:7777".into(),
                 db_path: PathBuf::from("/home/u/.komo/state.db"),
-                mcp: Default::default(),
             },
             model_catalog: ModelCatalog::default(),
             model: model("chat-a"),
@@ -739,6 +741,7 @@ mod tests {
                 logs_dir: PathBuf::from("/home/u/.komo/logs"),
                 workspaces_dir: PathBuf::from("/home/u/.komo/workspaces"),
             },
+            mcp: BTreeMap::new(),
             credentials: BTreeMap::from([(
                 "KOMO_LLM_API_KEY".into(),
                 ContentHash::of_str("secret-1"),
@@ -801,6 +804,34 @@ mod tests {
             vec![KeyPath::new("start_only.listen")]
         );
         assert_eq!(before.diff(&after).len(), 2, "其余部分照常报告");
+    }
+
+    /// MCP 服务器热重载就生效（`docs/mcp.md` §2.2）：差异键是 `mcp`（从无到有、从有到无）或
+    /// `mcp.<name>`，不算"要重启"。
+    #[test]
+    fn mcp_changes_are_not_start_only() {
+        let server = |command: &str| McpServerConfig {
+            transport: McpTransport::Stdio {
+                command: command.into(),
+                args: vec![],
+                env: vec![],
+            },
+            tools: None,
+            read_only: vec![],
+            description: None,
+            exposure: McpExposure::default(),
+            tool_exposure: BTreeMap::new(),
+        };
+        let empty = snapshot();
+        let mut one = snapshot();
+        one.mcp.insert("gh".into(), server("x"));
+        assert_eq!(empty.diff(&one), vec![KeyPath::new("mcp")]);
+        assert_eq!(empty.start_only_changes(&one), vec![]);
+
+        let mut two = one.clone();
+        two.mcp.insert("jira".into(), server("y"));
+        assert_eq!(one.diff(&two), vec![KeyPath::new("mcp.jira")]);
+        assert_eq!(one.start_only_changes(&two), vec![]);
     }
 
     #[test]

@@ -217,9 +217,13 @@ impl OperatorVerdict {
 }
 
 pub struct ToolExecutor {
-    /// 全局工具目录。启动后**只追加**（[`Self::install`]：登录后才连上的 MCP 服务器，
-    /// `docs/mcp.md` §2.2），名字一经挂上不换不撤；读的人拿一份快照。
+    /// 全局工具目录。启动后会追加（[`Self::install`]：登录后才连上、热重载新加的 MCP 服务器，
+    /// `docs/mcp.md` §2.2），也会撤（[`Self::withdraw`]：从配置删掉的服务器）；挂着的名字不换。
+    /// 改动都是整份替换，读的人拿一份快照。
     tools: std::sync::RwLock<Arc<BTreeMap<String, Arc<dyn Tool>>>>,
+    /// 撤掉的名字 → 为什么撤。在跑的 Run 能力面里还有它，再调时把这句交给模型，而不是一句
+    /// "没有这个工具"。同名的又挂回来就删掉。
+    withdrawn: std::sync::RwLock<BTreeMap<String, String>>,
     ledger: Arc<dyn Ledger>,
     outputs: Arc<dyn ToolOutputStore>,
     clock: Arc<dyn Clock>,
@@ -260,6 +264,7 @@ impl ToolExecutor {
                     .map(|tool| (tool.definition().name, tool))
                     .collect(),
             )),
+            withdrawn: std::sync::RwLock::new(BTreeMap::new()),
             ledger,
             outputs,
             clock,
@@ -325,8 +330,8 @@ impl ToolExecutor {
         Arc::clone(&self.tools.read().expect("工具目录"))
     }
 
-    /// 运行中往目录里追加工具：登录后才连上的 MCP 服务器（`docs/mcp.md` §2.2）。已经有的名字
-    /// 不换——在跑的 Run 的能力面里那个名字指的就是它。交回真的加进去的名字。
+    /// 运行中往目录里追加工具：登录后才连上、热重载新加的 MCP 服务器（`docs/mcp.md` §2.2）。
+    /// 已经有的名字不换——在跑的 Run 的能力面里那个名字指的就是它。交回真的加进去的名字。
     ///
     /// 已经受理的 Run 不受影响：能力面在受理时冻结，新名字从下一条 Run 起才进来。
     pub fn install(&self, tools: Vec<Arc<dyn Tool>>) -> Vec<String> {
@@ -345,7 +350,43 @@ impl ToolExecutor {
             added.push(name);
         }
         *guard = Arc::new(next);
+        drop(guard);
+        let mut withdrawn = self.withdrawn.write().expect("撤掉的工具");
+        for name in &added {
+            withdrawn.remove(name);
+        }
         added
+    }
+
+    /// 从目录里撤掉工具（照 pi 的 `hideTools`）：从配置删掉、或改了配置要重连的 MCP 服务器。
+    /// 每个名字带一句原因，在跑的 Run 再调它时交给模型。交回真的撤掉的名字。
+    ///
+    /// 已经在执行的那一次调用不受影响：它手里有自己那份工具。之后受理的 Run 看不到这些名字。
+    pub fn withdraw(&self, tools: Vec<(String, String)>) -> Vec<String> {
+        if tools.is_empty() {
+            return Vec::new();
+        }
+        let mut guard = self.tools.write().expect("工具目录");
+        let mut next = BTreeMap::clone(&guard);
+        let mut withdrawn = self.withdrawn.write().expect("撤掉的工具");
+        let mut removed = Vec::new();
+        for (name, reason) in tools {
+            if next.remove(&name).is_some() {
+                removed.push(name.clone());
+            }
+            withdrawn.insert(name, reason);
+        }
+        *guard = Arc::new(next);
+        removed
+    }
+
+    /// 这个名字被撤过：交回撤的原因。
+    fn withdrawn_reason(&self, name: &str) -> Option<String> {
+        self.withdrawn
+            .read()
+            .expect("撤掉的工具")
+            .get(name)
+            .cloned()
     }
 
     /// 交给模型的工具 Schema：**按能力面的顺序**、只列能力面里真的装着的那些。
@@ -436,6 +477,9 @@ impl ToolExecutor {
                     }
                     Some(definition)
                 }
+                // 热重载撤掉的 MCP 工具：在跑的 Run 的能力面里还有名字，不再给模型看（照 pi 的
+                // `hideTools`）。不是装配错误，不告警。
+                None if self.withdrawn_reason(name).is_some() => None,
                 None => {
                     tracing::warn!(tool = %name, "能力面里的工具没有实现，跳过它的 schema");
                     None
@@ -581,14 +625,20 @@ impl ToolExecutor {
             ));
         }
 
-        // 未知工具名：作为错误内容交回模型，**不派发任何东西**（§14 阶段 3）。
+        // 未知工具名：作为错误内容交回模型，**不派发任何东西**（§14 阶段 3）。热重载撤掉的
+        // MCP 工具说清楚为什么没了。
         let Some(tool) = tools.get(&request.tool).cloned() else {
-            let known: Vec<&str> = tools.keys().map(String::as_str).collect();
-            let message = format!(
-                "没有名为 {} 的工具；可用的是：{}",
-                request.tool,
-                known.join("、")
-            );
+            let message = match self.withdrawn_reason(&request.tool) {
+                Some(reason) => reason,
+                None => {
+                    let known: Vec<&str> = tools.keys().map(String::as_str).collect();
+                    format!(
+                        "没有名为 {} 的工具；可用的是：{}",
+                        request.tool,
+                        known.join("、")
+                    )
+                }
+            };
             return Ok(Begin::Settled(
                 self.fail_unstarted(request, env, message).await?,
             ));

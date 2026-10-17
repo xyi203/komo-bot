@@ -139,6 +139,55 @@ async fn consecutive_edits_to_one_file_in_a_round_all_apply() {
     );
 }
 
+/// 热重载撤掉的工具（照 pi 的 `hideTools`，`docs/mcp.md` §2.2）：目录里没了，新 Run 看不到；
+/// 在跑的 Run 能力面里还有它，再调拿到撤的原因，不执行。同名的挂回来就又能调。
+#[tokio::test]
+async fn a_withdrawn_tool_says_why_and_comes_back_when_reinstalled() {
+    let harness = Harness::new();
+    let tool = Arc::new(RecordingTool::bash());
+    let executor = harness.executor(vec![tool.clone()]);
+    let (session, run) = harness.open_run().await;
+    let env = harness.env(&session, &run);
+
+    let removed = executor.withdraw(vec![(
+        "bash".into(),
+        "MCP 服务器 demo 已从配置移除，它的工具不能再调".into(),
+    )]);
+    assert_eq!(removed, vec!["bash".to_string()]);
+    assert!(!executor.tool_names().contains(&"bash".to_string()));
+    assert!(executor.definitions_for(&env.surface).is_empty());
+
+    let calls = harness
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "true" }))])
+        .await;
+    let outcome = executor.execute_round(calls, &env).await.unwrap();
+    assert!(outcome.stop.is_none());
+    let result = &outcome.results[0];
+    assert!(result.is_error);
+    assert!(
+        result.content.contains("MCP 服务器 demo 已从配置移除"),
+        "{}",
+        result.content
+    );
+    assert_eq!(tool.ran(), 0);
+
+    let again = Arc::new(RecordingTool::bash());
+    assert_eq!(
+        executor.install(vec![again.clone()]),
+        vec!["bash".to_string()]
+    );
+    let calls = harness
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "true" }))])
+        .await;
+    let outcome = executor.execute_round(calls, &env).await.unwrap();
+    assert!(
+        !outcome.results[0].is_error,
+        "{}",
+        outcome.results[0].content
+    );
+    assert_eq!(again.ran(), 1);
+}
+
 /// ⑥ 未知工具名无法调用——作为错误内容回给模型。
 #[tokio::test]
 async fn an_unknown_tool_name_cannot_be_called() {

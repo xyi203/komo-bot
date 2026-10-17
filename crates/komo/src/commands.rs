@@ -640,13 +640,7 @@ pub fn auth_codex_status(home: &Path) -> Outcome {
 fn oauth_server_url(home: &Path, server: &str) -> Result<String, String> {
     use komo_kernel::protocol::config::McpTransport;
     let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
-    match loaded
-        .snapshot
-        .start_only
-        .mcp
-        .get(server)
-        .map(|c| &c.transport)
-    {
+    match loaded.snapshot.mcp.get(server).map(|c| &c.transport) {
         Some(McpTransport::Http {
             url, oauth: true, ..
         }) => Ok(url.clone()),
@@ -675,7 +669,7 @@ pub fn auth_mcp_status(home: &Path) -> Outcome {
     use komo_kernel::protocol::config::McpTransport;
     let loaded = load_config(&LoadOptions::at(home)).map_err(failed)?;
     let mut lines = Vec::new();
-    for (name, config) in &loaded.snapshot.start_only.mcp {
+    for (name, config) in &loaded.snapshot.mcp {
         if !matches!(config.transport, McpTransport::Http { oauth: true, .. }) {
             continue;
         }

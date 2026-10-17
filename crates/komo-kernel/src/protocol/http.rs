@@ -985,6 +985,30 @@ pub struct ConfigReloadResponse {
     /// 装上了，但有话要说（例如"某渠道 enabled 但 allow_from 为空"）。
     #[serde(default)]
     pub warnings: Vec<ConfigIssue>,
+    /// `mcp.*` 有键变化时，每台 MCP 服务器此刻的状态（`docs/mcp.md` §2.2）。重载不等握手：
+    /// 刚加的、刚改的多半还是"连接中"。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp: Vec<McpServerStatus>,
+}
+
+/// 一台 MCP 服务器此刻的状态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub state: McpServerState,
+    /// 连不上的原因，或要登录时的提示。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// 照 pi 的 `connecting / connected / needs-auth / failed`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpServerState {
+    Connecting,
+    Connected,
+    NeedsAuth,
+    Failed,
 }
 
 #[cfg(test)]

@@ -7,14 +7,15 @@
 //!    home chat，重载命令返回该错误。**校验不过的配置永远不会被装上。**
 //! 2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（`ConfigHolder::reload`）。
 //! 3. 逐段比对，只重建变化了的东西：某个 `[channels.*]` 变了就只重启那个渠道；模型 /
-//!    凭证变了就换掉 `LlmClient` 实例。
+//!    凭证变了就换掉 `LlmClient` 实例；`[mcp.servers]` 变了就增删那几台服务器（不等握手，
+//!    `docs/mcp.md` §2.2）。
 //! 4. 只在启动时生效的那一组键：照常完成其余部分，然后**明确报告**它们需要
 //!    `komo gateway restart`。
 
 use std::sync::Arc;
 
 use komo_kernel::protocol::config::KeyPath;
-use komo_kernel::protocol::http::ConfigReloadResponse;
+use komo_kernel::protocol::http::{ConfigReloadResponse, McpServerStatus};
 use komo_kernel::types::chat::{ChannelPlatform, Outbound};
 use komo_runtime::config::ConfigError;
 
@@ -33,13 +34,14 @@ pub async fn reload(state: &Arc<GatewayState>) -> Result<ConfigReloadResponse, A
                 start_only = report.start_only.len(),
                 "配置已重载"
             );
-            apply(state, &report.changed).await;
+            let mcp = apply(state, &report.changed).await;
             announce_recovered(state).await;
             announce_start_only(state, &report.start_only).await;
             Ok(ConfigReloadResponse {
                 changed: report.changed,
                 start_only: report.start_only,
                 warnings: report.warnings,
+                mcp,
             })
         }
         Err(error) => {
@@ -79,8 +81,18 @@ async fn announce_recovered(state: &Arc<GatewayState>) {
     }
 }
 
-/// 第 3 步：按变化的键前缀重建。
-async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) {
+/// 第 3 步：按变化的键前缀重建。`mcp.*` 变了交回每台 MCP 服务器此刻的状态，否则是空的。
+async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) -> Vec<McpServerStatus> {
+    // MCP 服务器先增删（`docs/mcp.md` §2.2）：下面重渲 skills 目录行时，`requires_tools`
+    // 按撤完之后的工具名门控。从无到有、从有到无时差异键就是 `mcp` 本身。
+    let mcp = if changed
+        .iter()
+        .any(|key| key.as_str() == "mcp" || key.as_str().starts_with("mcp."))
+    {
+        state.reconcile_mcp()
+    } else {
+        Vec::new()
+    };
     if changed.iter().any(|key| {
         let key = key.as_str();
         key.starts_with("model_catalog.")
@@ -122,6 +134,7 @@ async fn apply(state: &Arc<GatewayState>, changed: &[KeyPath]) {
             state.restart_channel(platform).await;
         }
     }
+    mcp
 }
 
 /// 第 4 步：**不静默忽略，也不假装已生效**。

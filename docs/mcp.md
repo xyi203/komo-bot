@@ -43,8 +43,8 @@ tool_exposure    = { lookup = "direct", "delete_*" = "hidden" }
 - `command` 与 `url` 恰好写一个；`args` / `env` 只配 `command`，`bearer_token_env` 只配 `url`。
 - 凭证只在 `.env`。**stdio 子进程不继承 Gateway 的环境**：先清空，只放回 `PATH`、`HOME`、`USER`、
   `LANG`、`TMPDIR`、`SHELL`，再加 `env` 列出的变量。HTTP 的 token 同理。
-- 整段是**只在启动时生效**的键（`ConfigSnapshot.start_only.mcp`）：改了重载会报"需要
-  `komo gateway restart`"，不静默忽略。
+- 整段**热重载即生效**（`ConfigSnapshot.mcp`，2026-10-17 起；之前在 `start_only` 里、要重启）：
+  增删改服务器不用 `komo gateway restart`，见 §2.3。
 - 校验：服务器名只能是字母、数字、`_`、`-`（它要进工具名）；`read_only` 写了 `tools` 白名单
   之外的名字是警告。
 
@@ -79,8 +79,8 @@ oauth = true                           # 与 bearer_token_env 只能写一个
 - **进"等登录"时记下凭证文件此刻的内容**（pi 的 `tokensAtSignIn`）。**每条 Run 受理之前**比一次
   （pi 在每个 turn 开始时）：文件变了 = 有人跑过 `komo auth mcp login`，当场重连；连上了就把工具追加
   进执行器的工具目录，这条 Run 的能力面里就有它们。没人登录时只是读一下文件。
-- **工具目录只追加**：名字一经挂上不换不撤（`ToolExecutor::install`）。已经受理的 Run 能力面已冻结，
-  不受影响；新名字从下一条 Run 起才进来。
+- **工具目录追加与撤销**：挂着的名字不换（`ToolExecutor::install`）；只有服务器从配置删掉或改了配置
+  时才撤（`ToolExecutor::withdraw`，§2.3）。已经受理的 Run 能力面已冻结；新名字从下一条 Run 起才进来。
 - **运行中凭证被拒**（401，或 token 过期又刷新不了）：这台服务器转成"等登录"，这次调用报
   `failed`，正文指名 `komo auth mcp login <name>`。401 说明服务器没处理这个请求，所以判"没执行"、
   不判"结果不明"；**也不在登录后自动重试**（照 pi），要不要再调由模型决定。之后登录了，下一次调用
@@ -89,9 +89,45 @@ oauth = true                           # 与 bearer_token_env 只能写一个
   skills 目录变了）。instructions 只记第一次连上时的，重连不换，免得摘要在会话中途变样。pi 是往对话
   末尾追加新的服务器段，komo 暂不做（§6）。
 - **还在的限制**：启动时"连不上"（不是登录问题，比如网络断了、命令不存在）的服务器，Run 受理时不重试
-  ——每条 Run 都去连一台坏掉的服务器，会让受理平白多等一个握手超时。它的工具没挂上，就调不到它，要
-  `komo gateway restart`。连上过、后来断了的不受这条限制：调用时自己重连。
+  ——每条 Run 都去连一台坏掉的服务器，会让受理平白多等一个握手超时。它的工具没挂上，就调不到它；改好
+  这台服务器的配置后热重载（§2.3，配置变了 = 先删后加、重新连），或 `komo gateway restart`。配置一字
+  未改的重载不重连它。连上过、后来断了的不受这条限制：调用时自己重连。
 - 实现：`komo-runtime/src/mcp.rs`（`McpHub` / `McpConnection`）、`GatewayState::refresh_mcp`。
+
+### 2.3 改 `[mcp.servers]` 热重载即生效（2026-10-17，照 pi）
+
+照 pi 的 `mcp_servers_change`（`packages/coding-agent/src/extensions/mcp/index.ts`）。配置重载（文件
+mtime、`komo config reload`、`SIGHUP`）的变化键有 `mcp` / `mcp.*` 时，`McpHub::reconcile` 按服务器名
+比对新旧配置：
+
+- **新增**：建 `McpConnection`，**后台**连（pi 的 `session_start` 不 await 连接），重载不等握手。
+- **删除**：从 hub 拿掉，它的工具从执行器目录撤掉（pi 的 `hideTools`，`ToolExecutor::withdraw`），连接断开。
+- **修改**（`McpServerConfig` 不相等）：**先删后加**，同 pi 对配置变了的服务器的处理——旧工具撤掉、
+  旧连接断开，新连接用新配置后台连上，工具在下一条 Run 受理时重新挂上。
+- 配置没变的服务器原样留着，连接不动。校验不过的配置整份不装（`docs/komo_bot.md` §3 第 1 步），
+  服务器一台也不动。
+- 增删之后接着重渲 skills 目录行：`requires_tools` 按撤完 / 挂上之后的工具名门控。
+- `komo config reload` 的回应多一段 `mcp`：每台服务器此刻的状态（连接中 / 已连上 / 要登录 / 失败）。
+  因为不等握手，刚加的、刚改的多半是"连接中"。
+
+**受理 Run 时**（pi 的 `waitForDirectServers`）：只等还在连、而且有工具声明给模型（`exposure = "direct"`
+或 `tool_exposure` 里有 `direct`）的服务器，上限 10 秒（pi 的 `startupWaitMs` 默认值），从这台服务器开始
+连时算起——挂住的服务器至多拖慢这一段，之后的 Run 不再等它。超时不阻塞受理，这条 Run 先不带它的工具。
+只在 codemode 里调的服务器不等：工具没挂上之前脚本里找不到它们，挂上之后调用时 `McpConnection::ready`
+自己等连接。
+
+**对在跑的 Run 的影响**（komo 比 pi 多的一条：pi 只在空闲时重载，komo 多会话并发，重载时总可能有 Run
+在跑）：
+
+- 能力面受理时已冻结，不因重载变化。撤掉的工具不再出现在之后的模型请求的 schema 里。
+- **正在执行的那一次 MCP 调用不被掐断**：它握着自己那份会话（`Arc<McpServer>`），hub 放掉它的那份后，
+  调用照常返回；最后一个引用释放时 stdio 子进程才退。改了配置时也一样，旧子进程与新子进程短暂并存。
+- 之后再调已删除 / 改了配置的服务器的工具（顶层调用或 codemode 子调用）：拿到一句工具错误——"MCP 服务器
+  X 已从配置移除，它的工具不能再调"，或"配置改了，正在重连；连上后从下一条 Run 起可用"。不执行、不
+  panic、不停下来问人；同名工具重新挂上之后又调得到。
+
+实现：`McpHub::reconcile` / `wait_for_direct`、`McpConnection::close`、`ToolExecutor::withdraw`、
+`GatewayState::reconcile_mcp`、`komo-gateway/src/reload.rs` 的 `apply`。
 
 ## 3. 暴露方式（2026-10-14，照 pi）
 
@@ -155,7 +191,7 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
 - （OAuth 原在此列，2026-10-14 落地，见 §2.1。）客户端凭证（client credentials）、
   企业托管授权等其他 OAuth 流程仍不做。
 - （断线重连原在此列，2026-10-16 落地：断了的下一次调用时重连，见 §2.2。）
-- 热加载：增删服务器要重启。
+- （热加载原在此列，2026-10-17 落地：增删改服务器热重载即生效，见 §2.3。）
 - `resources` / `prompts` / 采样（sampling）/ elicitation：只用 tools。
 - `deferred` 暴露（先搜再声明，pi 的 `tool_search`）：默认的 `codemode` 已经不把 schema 塞进上下文，
   而且声明从头到尾不变。tool_search 每加载一次就改一次工具声明：pi 靠 provider 原生的对话中途追加
@@ -179,7 +215,16 @@ journal，已交付的写结果原样接回，不会重做（`docs/codemode.md` 
   Gateway 的下一条 Run 调得到，服务器执行一次）、
   `a_rejected_token_asks_for_login_and_the_next_login_reconnects`（服务器换 token 后调用记 `failed`、
   正文指名 `komo auth mcp login secure`、服务器没执行；重新登录后下一条 Run 调通）。
-- `komo-kernel`：`protocol::config::tests`（`tool_exposure` 原名 > 最具体模式 > 服务器默认，`*` 匹配）。
+- `komo-gateway/tests/mcp` 的热重载四条（§2.3）：`a_server_added_by_reload_is_seen_by_the_next_run`、
+  `a_server_removed_by_reload_is_gone_for_the_next_run`、`a_running_run_is_told_the_server_was_removed`
+  （在跑的 Run 停在 `gate` 上时删掉服务器，之后再调拿到"已从配置移除"、Run 照常完成）、
+  `an_invalid_mcp_reload_leaves_the_servers_alone`。
+- `komo-runtime`：`mcp::tests` 的 `reconcile_*`（增、删、改）与
+  `removing_a_server_lets_the_call_in_flight_finish` / `changing_a_server_lets_the_call_in_flight_finish`
+  （在途调用照常返回，子进程活到它返回之后才退）；
+  `executor::tests::a_withdrawn_tool_says_why_and_comes_back_when_reinstalled`。
+- `komo-kernel`：`protocol::config::tests`（`tool_exposure` 原名 > 最具体模式 > 服务器默认，`*` 匹配；
+  `mcp_changes_are_not_start_only`）。
 - `komo-agent`：`prompt::tests`（服务器段每台一行、摘要取法、主 / 子代理都有、预算内截断与计数）。
 - `komo-runtime`：`executor::tests::codemode_only_tools_stay_callable_but_out_of_the_schema`、
   `config::tests::mcp_exposure_defaults_to_codemode_and_loads_overrides`。

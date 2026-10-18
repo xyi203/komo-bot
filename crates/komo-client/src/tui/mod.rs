@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossterm::cursor::{MoveTo, Show};
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyEventKind,
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -667,7 +667,9 @@ impl TerminalGuard {
         &mut self,
         draw: impl FnOnce(&mut Self) -> Result<(), std::io::Error>,
     ) -> Result<(), std::io::Error> {
-        queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        // 画的时候光标要在屏幕上到处跳（交正文、擦视口、逐格画），先藏起来；画完 ratatui
+        // 会把它显示回输入框里。不支持同步输出的终端上，这就是"光标一闪一闪"的那一跳。
+        queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate, Hide)?;
         let drawn = draw(self);
         // 出错也要把同步标记收回去：不收，支持它的终端会冻在这一帧上直到它自己超时。
         let ended = queue!(self.terminal.backend_mut(), EndSynchronizedUpdate);
@@ -911,8 +913,15 @@ impl Drop for TerminalGuard {
 /// 平常的 `flush` 什么都不做：ratatui 画完一帧就会冲刷，那时同步输出的结束标记还没排
 /// 进来。只有 `present` 开关打开时的那次冲刷才真写——开关由 [`TerminalGuard::present`]
 /// 拨（ratatui 不给稳定的办法从后端里取回 writer，所以靠这个共用的开关）。
+///
+/// **与上一帧一字不差的一帧不写。** 主循环每一拍都画，空闲时 ratatui 的差分什么格子都不
+/// 出，可它每帧照样发一次"显示光标、移到输入框"——再加上帧头藏光标，终端每 80ms 被
+/// 拨一次光标，闪烁的相位跟着重来，看上去就是光标在乱闪；隔着 SSH 还是白白的流量。
+/// 屏幕上没有变化，这一帧的字节就与上一帧相同，跳过它终端停在的正是同一个状态。
 struct FrameWriter {
     pending: Vec<u8>,
+    /// 上一次真写出去的那一帧。
+    last: Vec<u8>,
     out: File,
     present: Rc<Cell<bool>>,
 }
@@ -921,6 +930,7 @@ impl FrameWriter {
     fn new(stdout: &std::io::Stdout, present: Rc<Cell<bool>>) -> Result<Self, std::io::Error> {
         Ok(FrameWriter {
             pending: Vec::with_capacity(16 * 1024),
+            last: Vec::new(),
             out: File::from(stdout.as_fd().try_clone_to_owned()?),
             present,
         })
@@ -937,7 +947,12 @@ impl Write for FrameWriter {
         if !self.present.get() || self.pending.is_empty() {
             return Ok(());
         }
+        if self.pending == self.last {
+            self.pending.clear();
+            return Ok(());
+        }
         let written = self.out.write_all(&self.pending);
+        std::mem::swap(&mut self.pending, &mut self.last);
         self.pending.clear();
         written
     }
@@ -973,6 +988,7 @@ mod tests {
         let present = Rc::new(Cell::new(false));
         let mut writer = FrameWriter {
             pending: Vec::new(),
+            last: Vec::new(),
             out: file.reopen().expect("能打开"),
             present: present.clone(),
         };
@@ -987,6 +1003,28 @@ mod tests {
         present.set(true);
         writer.flush().expect("能冲刷");
         assert_eq!(written(), b"\x1b[J line one\r\nredraw");
+        assert!(writer.pending.is_empty());
+    }
+
+    /// **屏幕没变的一帧一个字节都不写。** 空闲时每一拍都画，每一拍都拨一次光标，光标就
+    /// 一直在闪。
+    #[test]
+    fn an_unchanged_frame_is_not_written_again() {
+        let file = tempfile::NamedTempFile::new().expect("能建临时文件");
+        let present = Rc::new(Cell::new(true));
+        let mut writer = FrameWriter {
+            pending: Vec::new(),
+            last: Vec::new(),
+            out: file.reopen().expect("能打开"),
+            present,
+        };
+        let written = || std::fs::read(file.path()).expect("能读");
+
+        for frame in [&b"\x1b[?25l a \x1b[?25h"[..], b"\x1b[?25l a \x1b[?25h", b"b", b"b", b"a"] {
+            writer.write_all(frame).expect("能写");
+            writer.flush().expect("能冲刷");
+        }
+        assert_eq!(written(), b"\x1b[?25l a \x1b[?25hba");
         assert!(writer.pending.is_empty());
     }
 

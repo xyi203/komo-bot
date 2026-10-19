@@ -4,7 +4,8 @@ Guidance for coding agents working in this repository. `CLAUDE.md` is a
 symlink to this file — edit `AGENTS.md` only.
 
 komo v0.8 is a **from-scratch** Rust personal-agent framework. The design is
-`docs/komo_bot.md` and it is the single source of truth: when this file and
+`docs/komo_bot.md` (its §9 Memory lives in `docs/memory.md`, same section
+numbers) and it is the single source of truth: when this file and
 the design disagree, the design wins and this file is wrong. Nothing here
 carries over from the implementation on `main`; do not read that branch for
 patterns.
@@ -144,4 +145,6 @@ commands run, terminal output when CLI behavior changes.
 
 - Design: `docs/komo_bot.md` (§14 has the acceptance table and the
   "pending verification" list — write verified facts back there).
+- Memory: `docs/memory.md` — §9 spec, planned memory designs, and memory
+  research/analysis appendices. Memory changes update this file, not a new one.
 - Work plan: `.scratch/komo-v08-rewrite/PLAN.md`, progress in `STATUS.md`.

@@ -96,6 +96,7 @@ fn scoped_with(
         extraction: ExtractionMetadata::new("memory-test", None, "v1"),
         usage: MemoryUsage::default(),
         supersedes: None,
+        superseded_by: None,
     }
 }
 

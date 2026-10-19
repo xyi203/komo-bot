@@ -517,6 +517,7 @@ async fn a_paraphrase_still_recalls_the_same_preference_and_keeps_its_provenance
                 ),
                 usage: Default::default(),
                 supersedes: None,
+                superseded_by: None,
             },
             None,
         )
@@ -1567,7 +1568,7 @@ async fn a_contradiction_puts_both_sides_in_contested_and_out_of_recall() {
               "scope":"personal","said_by":"user_statement","evidence":["evt-1"]}]}"#,
         )])
         .script(vec![round(
-            r#"{"verdicts":[{"memory":"m-1","relation":"contradicts"}]}"#,
+            r#"{"verdicts":[{"memory":0,"relation":"contradicts"}]}"#,
         )])
         .work(vec![work_item(RunState::Completed, interactive())])
         .build()
@@ -1618,7 +1619,7 @@ async fn an_inference_may_not_supersede_a_user_statement() {
               "scope":"personal","said_by":"model_inference","evidence":["evt-1"]}]}"#,
         )])
         .script(vec![round(
-            r#"{"verdicts":[{"memory":"m-1","relation":"supersedes"}]}"#,
+            r#"{"verdicts":[{"memory":0,"relation":"supersedes"}]}"#,
         )])
         .work(vec![work_item(RunState::Completed, interactive())])
         .build()
@@ -1662,7 +1663,7 @@ async fn nothing_automatic_supersedes_what_the_user_confirmed() {
               "scope":"personal","said_by":"user_statement","evidence":["evt-1"]}]}"#,
         )])
         .script(vec![round(
-            r#"{"verdicts":[{"memory":"m-1","relation":"supersedes"}]}"#,
+            r#"{"verdicts":[{"memory":0,"relation":"supersedes"}]}"#,
         )])
         .work(vec![work_item(RunState::Completed, interactive())])
         .build()
@@ -1707,7 +1708,7 @@ async fn an_allowed_supersede_retires_the_old_one_and_links_forward() {
               "scope":"personal","said_by":"user_statement","evidence":["evt-1"]}]}"#,
         )])
         .script(vec![round(
-            r#"{"verdicts":[{"memory":"m-1","relation":"supersedes"}]}"#,
+            r#"{"verdicts":[{"memory":0,"relation":"supersedes"}]}"#,
         )])
         .work(vec![work_item(RunState::Completed, interactive())])
         .build()
@@ -1737,6 +1738,12 @@ async fn an_allowed_supersede_retires_the_old_one_and_links_forward() {
     let link = fresh.supersedes.as_ref().expect("链到旧的那条");
     assert_eq!(link.memory.as_str(), "m-1");
     assert_eq!(link.revision, 1);
+    let back = retired
+        .superseded_by
+        .as_ref()
+        .expect("旧的那条记下被谁取代");
+    assert_eq!(back.memory, fresh.id);
+    assert_eq!(back.revision, 1);
 
     // 被取代的那条退出自动召回。
     let recalled = harness
@@ -1746,6 +1753,97 @@ async fn an_allowed_supersede_retires_the_old_one_and_links_forward() {
         .unwrap();
     assert_eq!(recalled.items.len(), 1);
     assert_eq!(recalled.items[0].content, "客厅空调设 24 度");
+}
+
+/// 一条观察取代两条旧的：新条目的 `supersedes` 只留得下一条，两条旧的各自记下
+/// `superseded_by`，一条都不丢（§9.8）。
+#[tokio::test]
+async fn one_observation_superseding_two_olds_marks_both_with_superseded_by() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"客厅空调设 24 度","kind":"preference",
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"]}]}"#,
+        )])
+        .script(vec![round(
+            r#"{"verdicts":[{"memory":0,"relation":"supersedes"},
+              {"memory":1,"relation":"supersedes"}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    for (id, content) in [("m-1", "客厅空调设 26 度"), ("m-2", "客厅空调晚上设 27 度")]
+    {
+        let mut old = memory(id, content);
+        old.provenance = Provenance::ToolObservation;
+        harness.repo.put(old, None).await.unwrap();
+    }
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(1, &RunId::from_raw("run-1"), "空调改 24 度")],
+    );
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    let all = harness.repo.list(None, None, 10).await.unwrap();
+    let fresh = all
+        .iter()
+        .find(|item| !["m-1", "m-2"].contains(&item.id.as_str()))
+        .unwrap();
+    for id in ["m-1", "m-2"] {
+        let old = harness
+            .repo
+            .get(&MemoryId::from_raw(id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.state, MemoryState::Superseded, "{id}");
+        let by = old.superseded_by.as_ref().expect("记下被谁取代");
+        assert_eq!(by.memory, fresh.id, "{id}");
+        assert_eq!(by.revision, fresh.revision, "{id}");
+    }
+}
+
+// =========================================================== 候选编号（§9.9）
+
+fn candidates() -> Vec<komo_kernel::types::memory::MemoryItem> {
+    vec![memory("m-a", "甲"), memory("m-b", "乙")]
+}
+
+#[test]
+fn a_verdict_index_maps_back_to_the_listed_candidate() {
+    let verdicts = consolidate::parse_verdicts(
+        r#"{"verdicts":[{"memory":1,"relation":"same"},{"memory":"0","relation":"supports"}]}"#,
+        &candidates(),
+    )
+    .unwrap();
+    assert_eq!(verdicts.len(), 2);
+    assert_eq!(verdicts[0].memory.as_str(), "m-b");
+    assert_eq!(verdicts[0].relation, consolidate::Relation::Same);
+    assert_eq!(verdicts[1].memory.as_str(), "m-a", "数字字符串按整数接受");
+}
+
+#[test]
+fn an_out_of_range_index_is_dropped() {
+    let verdicts = consolidate::parse_verdicts(
+        r#"{"verdicts":[{"memory":2,"relation":"same"},{"memory":-1,"relation":"same"},
+          {"memory":1.5,"relation":"same"},{"memory":"m-a","relation":"same"},
+          {"memory":null,"relation":"same"},{"memory":0,"relation":"unrelated"}]}"#,
+        &candidates(),
+    )
+    .unwrap();
+    assert_eq!(verdicts.len(), 1, "只剩编号 0 那条：{verdicts:?}");
+    assert_eq!(verdicts[0].memory.as_str(), "m-a");
+}
+
+#[test]
+fn a_repeated_index_keeps_only_the_first_verdict() {
+    let verdicts = consolidate::parse_verdicts(
+        r#"{"verdicts":[{"memory":0,"relation":"supersedes"},{"memory":"0","relation":"same"}]}"#,
+        &candidates(),
+    )
+    .unwrap();
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts[0].relation, consolidate::Relation::Supersedes);
 }
 
 // =========================================================== 注入与预算
@@ -1849,6 +1947,7 @@ fn memory(id: &str, content: &str) -> komo_kernel::types::memory::MemoryItem {
         extraction: komo_kernel::types::memory::ExtractionMetadata::new("memory-model", None, "v1"),
         usage: Default::default(),
         supersedes: None,
+        superseded_by: None,
     }
 }
 

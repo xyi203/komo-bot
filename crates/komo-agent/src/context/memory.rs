@@ -151,6 +151,7 @@ mod tests {
             extraction: ExtractionMetadata::new("memory-model", None, "v1"),
             usage: Default::default(),
             supersedes: None,
+            superseded_by: None,
         }
     }
 
@@ -193,6 +194,7 @@ mod tests {
             extraction: ExtractionMetadata::new("m", None, "v1"),
             usage: Default::default(),
             supersedes: None,
+            superseded_by: None,
         };
         let items = vec![
             base(

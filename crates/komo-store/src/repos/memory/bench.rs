@@ -84,6 +84,7 @@ fn synthetic(index: usize, now: OffsetDateTime) -> MemoryItem {
         extraction: ExtractionMetadata::new("bench", None, "bench/v1"),
         usage: MemoryUsage::default(),
         supersedes: None,
+        superseded_by: None,
     }
 }
 

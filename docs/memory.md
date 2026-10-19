@@ -1,6 +1,6 @@
 # komo Memory
 
-> 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8–§9.10 是已认可、**尚未实现**的设计。附录 A–C 是调研与分析，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
+> 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.9 已实现；§9.8（仅 `superseded_by` 一列与写入时路径已实现）、§9.10 是已认可、**尚未实现**的设计。附录 A–C 是调研与分析，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
 > 文中不带文件名的其他章节号（§3、§8.2、§8.5、§10 …）指 [`komo_bot.md`](komo_bot.md)。附录内的编号只在本附录内有效。
 
 | 节 | 内容 | 状态 |
@@ -12,8 +12,8 @@
 | §9.5 | 向量索引与模型切换 | 规格 |
 | §9.6 | 冲突、失效与遗忘 | 规格 |
 | §9.7 | 与 resume 和权限的关系 | 规格 |
-| §9.8 | 离线整理 | 设计，未实现 |
-| §9.9 | 判关系时候选用编号 | 设计，未实现 |
+| §9.8 | 离线整理 | 设计，未实现（`superseded_by` 列与写入时路径已实现） |
+| §9.9 | 判关系时候选用编号 | 已实现 |
 | §9.10 | 按会话提取，一次调用 | 设计，未实现 |
 | 附录 A | 外部记忆仓库调研（graphiti / mem0 / OpenViking） | 2026-10-19 |
 | 附录 B | 记忆机制改进方案（原 `docs/memory-improvements.md`） | 2026-10-16 提案 |
@@ -49,6 +49,7 @@
 | created_at / updated_at   | 记忆管理时间                                                                          |
 | extraction_metadata       | 提取模型、effort、提示词版本、处理来源游标                                            |
 | usage                     | 使用次数与最近使用时间，只度量使用情况，不增加真实性                                  |
+| supersedes / superseded_by | 取代了谁 / 被谁取代（id + revision）；前者挂在新条目，后者挂在每条被取代的旧条目      |
 
 证据与内容版本分别保留。用户确认绑定具体 id / revision 和操作者事件；模型返回的 user_confirmed 字段没有写入权限。明确的用户原话可标为 active + user_statement + unconfirmed，展示为“自动整理自用户陈述”；模型推断默认 candidate，不作为已确认事实注入。
 
@@ -172,7 +173,7 @@ forget 立即停用内容，并使关键词、向量缓存与检查点中的引�
 
 Memory 内容以带来源的数据进入上下文，不能成为系统指令或自我更新工具的依据。
 
-## 9.8 离线整理（设计，2026-10-19 认可，未实现）
+## 9.8 离线整理（设计，2026-10-19 认可，未实现；`superseded_by` 列与写入时路径已实现）
 
 §9.3、§9.6 的整理只发生在**写入那一刻**：一条新观察只和同作用域召回的 6 条（`consolidate.rs` 的 `RELATED_LIMIT`）比较。已经在库里的重复、过时与"翻得到"的条目，以后再没有人看。本机 2026-10-19 的库存（附录 A.1）：抽样的 182 条生效记忆里，178 条出自 v1 / v2 提示词，81 条从没被注入过，抽样还能看到仓库目录结构、配置目录内容这类随时能重读的条目——它们正是 `memory-extract/v3` 不再收的东西（§9.3），可写入时的整理管不到存量。
 
@@ -214,7 +215,7 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 - 合并不能降低生效状态：被吸收方里有 `active`、keep 却不是 `active` → 不执行，报告标"需要人看"。否则一条生效记忆会被吸收进一条不参与召回的 candidate，等于绕过授权停掉了它。
 - `merge` 的成员里不能有 `contested`：吸收掉冲突的一方，另一方就成了没有对手的 contested。contested 只参与 `supersede` 与 `contest`。
 
-**数据模型的追加（schema 只加不删，§8.2）。** 现在 `supersedes: Option<SupersededRef>` 挂在**新条目**上、只指一条旧的；merge 是一对多，keep 也不是新条目。被吸收方要记下"被谁吸收"：`memory_items` 追加可空列 `superseded_by`（id + revision）。离线的 `merge` 与 `supersede` 都写这一列；**写入时的 `mark_superseded` 也写**，否则只有离线整理留下的关系能双向查。这也补上写入时的一个缺口：一条观察判出多条 supersedes 时，新条目的 `supersedes` 只留得下最后一条，`superseded_by` 记在每条旧条目上，一条都不丢。之后 `komo memory show` 能从任一方找到另一方。另一列是上面的 `consolidated_at`。
+**数据模型的追加（schema 只加不删，§8.2）。** 现在 `supersedes: Option<SupersededRef>` 挂在**新条目**上、只指一条旧的；merge 是一对多，keep 也不是新条目。被吸收方要记下"被谁吸收"：`memory_items` 追加可空列 `superseded_by`（id + revision）。离线的 `merge` 与 `supersede` 都写这一列；**写入时的 `mark_superseded` 也写**（列与写入时路径已实现：先落新条目、再标旧条目，`komo memory show` 两个方向都显示；离线部分未实现），否则只有离线整理留下的关系能双向查。这也补上写入时的一个缺口：一条观察判出多条 supersedes 时，新条目的 `supersedes` 只留得下最后一条，`superseded_by` 记在每条旧条目上，一条都不丢。之后 `komo memory show` 能从任一方找到另一方。另一列是上面的 `consolidated_at`。
 
 **落库与并发。** 每个动作带预期 revision，一组一个事务（`with_write_retry`）。判定之后、写库之前，后台提取可能已经改了组里某一条：revision 对不上，整组跳过并在报告里列出，不写 `consolidated_at`，下次重新分组。写完发一次索引补齐信号（§9.5）。
 
@@ -238,9 +239,9 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 
 **待定。** 分组的相似度阈值用实测定。
 
-## 9.9 判关系时，候选用编号而不是 id（设计，2026-10-19 认可，未实现）
+## 9.9 判关系时，候选用编号而不是 id（2026-10-19 认可，已实现）
 
-**现状。** `consolidate.rs` 的 `classify` 把相关条目列成 `- id=<UUIDv7> 状态=… 来源=… 确认=… 内容：…`，要模型回 `{"memory":"<id>","relation":…}`。模型回了不在候选集里的 id，代码会忽略它——安全，但这一条判断就白做了。UUIDv7 的前半段是时间戳，同一时期入库的条目只差后几位，正是最容易抄错的地方。
+**原状（已改）。** `consolidate.rs` 的 `classify` 原先把相关条目列成 `- id=<UUIDv7> 状态=… 来源=… 确认=… 内容：…`，要模型回 `{"memory":"<id>","relation":…}`。模型回了不在候选集里的 id，代码会忽略它——安全，但这一条判断就白做了。UUIDv7 的前半段是时间戳，同一时期入库的条目只差后几位，正是最容易抄错的地方。
 
 **改法（照 mem0 v3，附录 A.3）。** 候选按列出顺序编号 `0..N-1`，写成 `[0] 状态=… 来源=… 确认=… 内容：…`；模型回 `{"memory":0,"relation":…}`。Rust 用这次调用的编号表映射回 `MemoryId`：
 
@@ -250,7 +251,7 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 
 编号表只活在这一次调用里，不落库，也不出现在任何持久记录中——持久记录里写的永远是真实的 `id@revision`。§9.8 的离线整理、§9.10 合并后的提取调用用同一套编号；§9.10 落地后 `classify` 不再单独存在，编号规则跟着搬进提取。
 
-**验收。** `a_verdict_index_maps_back_to_the_listed_candidate`、`an_out_of_range_index_is_dropped`、`a_repeated_index_keeps_only_the_first_verdict`。
+**验收。** `a_verdict_index_maps_back_to_the_listed_candidate`（含数字字符串）、`an_out_of_range_index_is_dropped`、`a_repeated_index_keeps_only_the_first_verdict`，均在 `memory/tests.rs`。映射在 `consolidate::parse_verdicts`；`classify` 的提示词没有版本号，不用 bump。
 
 ## 9.10 按会话提取，一次调用（设计，2026-10-19 认可，未实现）
 

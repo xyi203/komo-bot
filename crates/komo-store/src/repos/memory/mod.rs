@@ -432,6 +432,10 @@ async fn put_in(
         Some(reference) => Some(encode(reference)?),
         None => None,
     };
+    let superseded_by = match &item.superseded_by {
+        Some(reference) => Some(encode(reference)?),
+        None => None,
+    };
     match existing {
         Some(mut row) => {
             row.update()
@@ -451,6 +455,7 @@ async fn put_in(
                 .usage_count(i64::try_from(item.usage.count).unwrap_or(i64::MAX))
                 .last_used_at(to_ts_opt(item.usage.last_used_at))
                 .supersedes(supersedes.clone())
+                .superseded_by(superseded_by.clone())
                 .exec(ex)
                 .await
                 .map_err(map_toasty)?;
@@ -475,6 +480,7 @@ async fn put_in(
                 usage_count: i64::try_from(item.usage.count).unwrap_or(i64::MAX),
                 last_used_at: to_ts_opt(item.usage.last_used_at),
                 supersedes: supersedes.clone(),
+                superseded_by: superseded_by.clone(),
             })
             .exec(ex)
             .await
@@ -845,6 +851,10 @@ pub(super) async fn load_item(
             Some(raw) => Some(decode(raw, "memory_items.supersedes")?),
             None => None,
         },
+        superseded_by: match &row.superseded_by {
+            Some(raw) => Some(decode(raw, "memory_items.superseded_by")?),
+            None => None,
+        },
     }))
 }
 
@@ -917,6 +927,7 @@ mod tests {
             extraction: ExtractionMetadata::new("memory-model", None, "v1"),
             usage: MemoryUsage::default(),
             supersedes: None,
+            superseded_by: None,
         }
     }
 

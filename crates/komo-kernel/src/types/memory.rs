@@ -224,6 +224,9 @@ pub struct MemoryItem {
     /// 取代了哪一条（§9.6）。`None` = 这条不取代任何东西。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<SupersededRef>,
+    /// 被哪一条取代了（§9.8）。`None` = 没被取代。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<SupersededRef>,
 }
 
 impl MemoryItem {
@@ -340,6 +343,7 @@ mod tests {
             extraction: ExtractionMetadata::new("m", None, "v1"),
             usage: MemoryUsage::default(),
             supersedes: None,
+            superseded_by: None,
         }
     }
 

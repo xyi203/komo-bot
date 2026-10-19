@@ -605,6 +605,7 @@ fn memory_item() -> MemoryItem {
             last_used_at: Some(NOW),
         },
         supersedes: None,
+        superseded_by: None,
     }
 }
 
@@ -677,6 +678,22 @@ fn a_memory_show_separates_when_it_was_observed_from_when_it_was_stored() {
             "sess-1#4",
         ],
     );
+}
+
+#[test]
+fn a_memory_show_names_the_supersession_in_both_directions() {
+    use komo_kernel::types::memory::SupersededRef;
+    let mut item = memory_item();
+    item.supersedes = Some(SupersededRef {
+        memory: MemoryId::from_raw("mem-old"),
+        revision: 2,
+    });
+    item.superseded_by = Some(SupersededRef {
+        memory: MemoryId::from_raw("mem-new"),
+        revision: 1,
+    });
+    let printed = memory_show(&item);
+    insta_like(&printed, &["取代了    mem-old@2", "被取代    mem-new@1"]);
 }
 
 #[test]

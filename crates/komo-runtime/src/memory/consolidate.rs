@@ -47,17 +47,24 @@ pub enum Relation {
     Unrelated,
 }
 
-/// 模型对一条已有记忆的判断。
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+/// 模型对一条已有记忆的判断。`memory` 已经按这次调用的编号表映射回真实 id（§9.9）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
-    pub memory: String,
+    pub memory: MemoryId,
     pub relation: Relation,
 }
 
+/// 模型原样交回的判断：`memory` 是候选编号，是不是整数还没验。
 #[derive(Debug, Deserialize)]
-struct Verdicts {
+struct RawVerdict {
+    memory: serde_json::Value,
+    relation: Relation,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawVerdicts {
     #[serde(default)]
-    verdicts: Vec<Verdict>,
+    verdicts: Vec<RawVerdict>,
 }
 
 /// 判完之后**实际要做**的事。模型说的是 [`Relation`]，能做的是这个。
@@ -141,7 +148,8 @@ impl<'a> Consolidator<'a> {
         // 第二道：相关条目。**候选与 contested 也要放行**——冲突最可能就发生在它们身上。
         let related = self.related(observation).await;
         if related.is_empty() {
-            self.insert(observation, None, now).await?;
+            self.insert(MemoryId::new_at(now), observation, None, now)
+                .await?;
             return Ok(1);
         }
 
@@ -156,15 +164,11 @@ impl<'a> Consolidator<'a> {
         };
 
         let mut changes = 0;
-        let mut supersedes: Option<SupersededRef> = None;
+        let mut superseded: Vec<&MemoryItem> = Vec::new();
         let mut contested_with: Vec<MemoryId> = Vec::new();
 
         for verdict in &verdicts {
-            let Some(existing) = related
-                .iter()
-                .find(|item| item.id.as_str() == verdict.memory)
-            else {
-                // 模型报了一个不在候选集里的 id：它不在这次判断的范围内，忽略。
+            let Some(existing) = related.iter().find(|item| item.id == verdict.memory) else {
                 continue;
             };
             match Plan::authorize(verdict.relation, observation, existing) {
@@ -177,13 +181,7 @@ impl<'a> Consolidator<'a> {
                     changes += self.contest(existing, now).await?;
                     contested_with.push(id);
                 }
-                Plan::Supersede(_) => {
-                    changes += self.mark_superseded(existing, now).await?;
-                    supersedes = Some(SupersededRef {
-                        memory: existing.id.clone(),
-                        revision: existing.revision,
-                    });
-                }
+                Plan::Supersede(_) => superseded.push(existing),
                 Plan::Insert => {}
             }
         }
@@ -194,8 +192,23 @@ impl<'a> Consolidator<'a> {
             // **双方都标**，所以新来的这条也进 contested，而不是带着冲突去注入。
             observation.state = MemoryState::Contested;
         }
-        self.insert(&observation, supersedes, now).await?;
+        // 新 id 先定下来，旧条目才记得下 `superseded_by`。先落新的、再标旧的：中途断了
+        // 顶多是新旧并存，不会丢掉这条新事实。
+        let new_id = MemoryId::new_at(now);
+        let supersedes = superseded.last().map(|old| SupersededRef {
+            memory: old.id.clone(),
+            revision: old.revision,
+        });
+        self.insert(new_id.clone(), &observation, supersedes, now)
+            .await?;
         changes += 1;
+        let by = SupersededRef {
+            memory: new_id,
+            revision: 1,
+        };
+        for old in superseded {
+            changes += self.mark_superseded(old, by.clone(), now).await?;
+        }
         Ok(changes)
     }
 
@@ -290,14 +303,16 @@ impl<'a> Consolidator<'a> {
         Ok(1)
     }
 
-    /// 旧版本标 superseded（§9.6）。正文不动——取代不是改写。
+    /// 旧版本标 superseded 并记下被谁取代（§9.6、§9.8）。正文不动——取代不是改写。
     async fn mark_superseded(
         &self,
         existing: &MemoryItem,
+        by: SupersededRef,
         now: OffsetDateTime,
     ) -> Result<usize, MemoryError> {
         let mut old = existing.clone();
         old.state = MemoryState::Superseded;
+        old.superseded_by = Some(by);
         old.updated_at = now;
         self.manager.repo.put(old, Some(existing.revision)).await?;
         Ok(1)
@@ -305,12 +320,13 @@ impl<'a> Consolidator<'a> {
 
     async fn insert(
         &self,
+        id: MemoryId,
         observation: &Observation,
         supersedes: Option<SupersededRef>,
         now: OffsetDateTime,
     ) -> Result<MemoryItem, MemoryError> {
         let item = MemoryItem {
-            id: MemoryId::new_at(now),
+            id,
             revision: 1,
             content: observation.content.clone(),
             kind: observation.kind,
@@ -327,6 +343,7 @@ impl<'a> Consolidator<'a> {
             extraction: observation.extraction.clone(),
             usage: MemoryUsage::default(),
             supersedes,
+            superseded_by: None,
         };
         Ok(self.manager.repo.put(item, None).await?)
     }
@@ -339,17 +356,18 @@ impl<'a> Consolidator<'a> {
     ) -> Result<Vec<Verdict>, MemoryError> {
         let listing: Vec<String> = related
             .iter()
-            .map(|item| {
+            .enumerate()
+            .map(|(index, item)| {
                 format!(
-                    "- id={} 状态={:?} 来源={:?} 确认={:?} 内容：{}",
-                    item.id, item.state, item.provenance, item.confirmation, item.content
+                    "[{index}] 状态={:?} 来源={:?} 确认={:?} 内容：{}",
+                    item.state, item.provenance, item.confirmation, item.content
                 )
             })
             .collect();
         let prompt = format!(
             "新观察（来源 {:?}）：{}\n\n已有的相关记忆：\n{}\n\n\
              对上面每一条，判断新观察与它的关系，只输出 JSON：\n\
-             {{\"verdicts\":[{{\"memory\":\"<id>\",\"relation\":\
+             {{\"verdicts\":[{{\"memory\":<方括号里的编号，整数>,\"relation\":\
              \"same|supports|contradicts|supersedes|unrelated\"}}]}}\n\n\
              same = 同一件事换了说法；supports = 不同主张但支持它；\
              contradicts = 实质冲突，两者不能同时为真；\
@@ -384,15 +402,42 @@ impl<'a> Consolidator<'a> {
 
         let mut driver = llm.begin_turn(request).await?;
         let round = driver.next(RoundInput::First).await?;
-        parse_verdicts(&round.text.unwrap_or_default())
+        parse_verdicts(&round.text.unwrap_or_default(), related)
     }
 }
 
-/// 从模型正文里解出关系判断。和提取那边共用同一套围栏 / 配平括号的处理。
-pub fn parse_verdicts(text: &str) -> Result<Vec<Verdict>, MemoryError> {
+/// 从模型正文里解出关系判断，并用这次调用的编号表（`candidates` 的下标）映射回真实 id
+/// （§9.9）。编号表不落库：越界、非整数的判断丢掉并记 warn；同一编号只认第一条；
+/// 数字字符串按整数收。和提取那边共用同一套围栏 / 配平括号的处理。
+pub fn parse_verdicts(text: &str, candidates: &[MemoryItem]) -> Result<Vec<Verdict>, MemoryError> {
     let body = super::extract::parse_json_object(text)
         .ok_or_else(|| MemoryError::Invalid("关系判断里找不到 JSON 对象".into()))?;
-    let parsed: Verdicts = serde_json::from_str(body)
+    let parsed: RawVerdicts = serde_json::from_str(body)
         .map_err(|error| MemoryError::Invalid(format!("关系判断的 JSON 解不开：{error}")))?;
-    Ok(parsed.verdicts)
+
+    let mut seen = std::collections::HashSet::new();
+    let mut verdicts = Vec::new();
+    for raw in parsed.verdicts {
+        let index = match &raw.memory {
+            serde_json::Value::Number(number) => number.as_u64(),
+            serde_json::Value::String(text) => text.trim().parse::<u64>().ok(),
+            _ => None,
+        };
+        let Some(item) = index
+            .and_then(|index| usize::try_from(index).ok())
+            .and_then(|index| candidates.get(index).map(|item| (index, item)))
+        else {
+            tracing::warn!(memory = %raw.memory, "关系判断里的候选编号不可用，丢弃这一条");
+            continue;
+        };
+        if !seen.insert(item.0) {
+            tracing::warn!(index = item.0, "关系判断里同一个编号出现多次，只认第一条");
+            continue;
+        }
+        verdicts.push(Verdict {
+            memory: item.1.id.clone(),
+            relation: raw.relation,
+        });
+    }
+    Ok(verdicts)
 }

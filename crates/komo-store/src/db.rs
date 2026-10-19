@@ -971,6 +971,30 @@ mod tests {
         insert(&db, "after-alter".to_string()).await.unwrap();
     }
 
+    /// `superseded_by` 在旧形状的 memory_items 表上补得回来（§9.8 的加列规则）。
+    #[tokio::test]
+    async fn the_superseded_by_column_is_added_to_an_existing_memory_items_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        let legacy = crate::models::memory_item::DDL.replace(r#""superseded_by" TEXT, "#, "");
+        assert!(!legacy.contains("superseded_by"), "旧形状里不该有这一列");
+        plain_build_old(&path, Some(("memory_items", legacy))).await;
+
+        let before = plain_columns(&path, "memory_items").await;
+        assert!(
+            !before.iter().any(|name| name == "superseded_by"),
+            "旧形状没落盘：{before:?}"
+        );
+
+        Db::connect(&path).await.unwrap();
+        let after = plain_columns(&path, "memory_items").await;
+        assert!(
+            after.iter().any(|name| name == "superseded_by"),
+            "补回来了，而且落盘：{after:?}"
+        );
+    }
+
     /// 委派那三列在**旧形状的 runs 表**上补得回来（§8.2 的加列规则，也是升级路径）。
     ///
     /// 同上：旧形状在普通连接上造、在另一条新连接上确认，然后才重开验迁移。

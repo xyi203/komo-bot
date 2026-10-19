@@ -159,6 +159,7 @@ mod live {
             extraction: ExtractionMetadata::new("memory-model", None, "v1"),
             usage: Default::default(),
             supersedes: None,
+            superseded_by: None,
         }
     }
 

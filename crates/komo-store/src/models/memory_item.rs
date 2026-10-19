@@ -41,6 +41,8 @@ pub struct MemoryItemRow {
     pub last_used_at: i64,
     /// `SupersededRef` 的 JSON；`NULL` = 这条不取代任何东西（§9.6）。
     pub supersedes: Option<String>,
+    /// `SupersededRef` 的 JSON，指向取代这条的新条目；`NULL` = 没被取代（§9.8）。
+    pub superseded_by: Option<String>,
 }
 
 pub const SPEC: TableSpec = TableSpec {
@@ -49,7 +51,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "memory_items" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "content" TEXT NOT NULL, "content_hash" TEXT NOT NULL, "kind" TEXT NOT NULL, "scope_kind" TEXT NOT NULL, "scope" TEXT NOT NULL, "provenance" TEXT NOT NULL, "confirmation" TEXT NOT NULL, "state" TEXT NOT NULL, "observed_at" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "extraction" TEXT NOT NULL, "usage_count" BIGINT NOT NULL, "last_used_at" BIGINT NOT NULL, "supersedes" TEXT, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "memory_items" ("id" TEXT NOT NULL, "revision" BIGINT NOT NULL, "content" TEXT NOT NULL, "content_hash" TEXT NOT NULL, "kind" TEXT NOT NULL, "scope_kind" TEXT NOT NULL, "scope" TEXT NOT NULL, "provenance" TEXT NOT NULL, "confirmation" TEXT NOT NULL, "state" TEXT NOT NULL, "observed_at" BIGINT NOT NULL, "valid_until" BIGINT NOT NULL, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "extraction" TEXT NOT NULL, "usage_count" BIGINT NOT NULL, "last_used_at" BIGINT NOT NULL, "supersedes" TEXT, "superseded_by" TEXT, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -70,4 +72,5 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("usage_count", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("last_used_at", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("supersedes", "TEXT"),
+    ColumnSpec::new("superseded_by", "TEXT"),
 ];

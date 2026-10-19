@@ -497,12 +497,15 @@ pub fn memory_show(item: &MemoryItem) -> String {
     if let Some(until) = item.valid_until {
         out.push(format!("有效期  至 {}", stamp(until)));
     }
-    // 取代关系是前向链：读到的人手里拿着的正是新的这一条（§9.6）。
+    // 取代关系两个方向都显示：从任一方都能找到另一方（§9.6、§9.8）。
     if let Some(superseded) = &item.supersedes {
         out.push(format!(
-            "取代      {}@{}",
+            "取代了    {}@{}",
             superseded.memory, superseded.revision
         ));
+    }
+    if let Some(by) = &item.superseded_by {
+        out.push(format!("被取代    {}@{}", by.memory, by.revision));
     }
     out.push(format!(
         "提取    {} / {} / prompt {}",

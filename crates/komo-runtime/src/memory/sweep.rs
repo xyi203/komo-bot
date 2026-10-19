@@ -151,6 +151,7 @@ mod tests {
                 last_used_at: last_used.map(|ago| now() - ago),
             },
             supersedes: None,
+            superseded_by: None,
         }
     }
 

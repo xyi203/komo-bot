@@ -13,8 +13,10 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::protocol::http::{
-    MemoryDetail, MemoryIndexStatus, MemoryListQuery, MemoryListResponse, MemoryRevisionRequest,
-    MemorySweepRequest, MemorySweepResponse, RebuildIndexRequest, RebuildIndexResponse,
+    ConsolidateGroupStatus, ConsolidateOutcome, MemoryConsolidateRequest,
+    MemoryConsolidateResponse, MemoryDetail, MemoryIndexStatus, MemoryListQuery,
+    MemoryListResponse, MemoryRevisionRequest, MemorySweepRequest, MemorySweepResponse,
+    RebuildIndexRequest, RebuildIndexResponse,
 };
 use komo_kernel::types::ids::MemoryId;
 use komo_runtime::memory::MemoryError;
@@ -185,6 +187,37 @@ pub async fn sweep(
             .await
             .map_err(memory_failure)?,
     ))
+}
+
+/// `POST /v1/memory-consolidate`：离线整理（§9.8）；`apply = false` 只预演。
+///
+/// 不走幂等键：预演无副作用，执行每组一个事务，重来一次只会看到上次盖过游标的组被跳过。
+/// 执行写过东西之后发一次索引补齐信号（§9.5）。
+pub async fn consolidate(
+    State(api): State<Api>,
+    Json(request): Json<MemoryConsolidateRequest>,
+) -> ApiResult<Json<MemoryConsolidateResponse>> {
+    let response = api
+        .state
+        .memories
+        .consolidate(&request)
+        .await
+        .map_err(memory_failure)?;
+    let wrote = response.applied
+        && response.groups.iter().any(|group| {
+            group.status == ConsolidateGroupStatus::Judged
+                && group
+                    .actions
+                    .iter()
+                    .any(|entry| entry.outcome != ConsolidateOutcome::Skipped)
+        });
+    if wrote
+        && api.state.memories.space().is_some()
+        && let Err(error) = api.state.memories.schedule_index()
+    {
+        tracing::warn!(%error, "离线整理之后补向量没提交上，先只靠关键词命中");
+    }
+    Ok(Json(response))
 }
 
 /// `GET /v1/memory-index`：当前空间、进度、覆盖率和错误。

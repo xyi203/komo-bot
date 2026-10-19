@@ -8,9 +8,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use komo_kernel::protocol::config::{
-    ChannelConfig, ChannelsConfig, CompactionConfig, ConfigSnapshot, ExecutionConfig, KeyPath,
-    McpExposure, McpServerConfig, McpTransport, MemoryConfig, PathsConfig, RetrievalConfig,
-    SourceFile, StartOnly, TypesafeConfig,
+    ChannelConfig, ChannelsConfig, CompactionConfig, ConfigSnapshot, ConsolidateConfig,
+    ExecutionConfig, KeyPath, McpExposure, McpServerConfig, McpTransport, MemoryConfig,
+    PathsConfig, RetrievalConfig, SourceFile, StartOnly, TypesafeConfig,
 };
 use komo_kernel::types::agent::{AgentConfig, AgentProfile};
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
@@ -138,6 +138,26 @@ pub(super) struct MemorySection {
     pub embedding: Option<String>,
     #[serde(default)]
     pub retrieval: RetrievalSection,
+    #[serde(default)]
+    pub consolidate: ConsolidateSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct ConsolidateSection {
+    pub max_groups: Option<u32>,
+    pub group_size: Option<u32>,
+    pub min_similarity_pct: Option<u32>,
+}
+
+impl ConsolidateSection {
+    fn into_consolidate(self) -> ConsolidateConfig {
+        let base = ConsolidateConfig::default();
+        ConsolidateConfig {
+            max_groups: self.max_groups.unwrap_or(base.max_groups),
+            group_size: self.group_size.unwrap_or(base.group_size),
+            min_similarity_pct: self.min_similarity_pct.unwrap_or(base.min_similarity_pct),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -616,6 +636,7 @@ pub(super) fn assemble(
         model: memory_model,
         embedding: memory_embedding,
         retrieval: file.memory.retrieval.into_retrieval(),
+        consolidate: file.memory.consolidate.into_consolidate(),
     };
 
     let channels = ChannelsConfig {

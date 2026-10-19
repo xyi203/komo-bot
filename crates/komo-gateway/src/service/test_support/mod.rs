@@ -114,6 +114,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             model,
             embedding: None,
             retrieval: RetrievalConfig::default(),
+            consolidate: Default::default(),
         },
         agent: AgentConfig {
             default_agent: "assistant".into(),

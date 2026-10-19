@@ -14,11 +14,11 @@ use komo_gateway::skills::{OfferContext, SkillRegistry, one_line};
 use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
     CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionListQuery,
-    InterventionVerdict, MemoryListQuery, MemoryRevisionRequest, MemorySweepRequest,
-    RebuildIndexRequest, SessionListQuery, UpdateCronRequest,
+    InterventionVerdict, MemoryConsolidateRequest, MemoryListQuery, MemoryRevisionRequest,
+    MemorySweepRequest, RebuildIndexRequest, SessionListQuery, UpdateCronRequest,
 };
 use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, SessionId};
-use komo_kernel::types::memory::{MemoryScope, MemoryState, RetrievalMode};
+use komo_kernel::types::memory::{MemoryKind, MemoryScope, MemoryState, RetrievalMode};
 use komo_kernel::types::model::Effort;
 
 pub type Outcome = Result<String, String>;
@@ -493,6 +493,42 @@ pub async fn memory_sweep(
         .await
         .map_err(failed)?;
     Ok(render::memory_sweep(&response))
+}
+
+pub async fn memory_consolidate(
+    client: &KomoClient,
+    scope: Option<String>,
+    kind: Option<String>,
+    instruction: Option<String>,
+    apply: bool,
+) -> Outcome {
+    let scope = scope
+        .map(|raw| {
+            raw.parse::<MemoryScope>()
+                .map_err(|error| error.to_string())
+        })
+        .transpose()?;
+    let kind = match kind.as_deref() {
+        None => None,
+        Some("preference") => Some(MemoryKind::Preference),
+        Some("fact") => Some(MemoryKind::Fact),
+        Some("experience") => Some(MemoryKind::Experience),
+        Some(other) => {
+            return Err(format!(
+                "不认识的种类 `{other}`：支持 preference / fact / experience"
+            ));
+        }
+    };
+    let response = client
+        .memory_consolidate(&MemoryConsolidateRequest {
+            scope,
+            kind,
+            instruction,
+            apply,
+        })
+        .await
+        .map_err(failed)?;
+    Ok(render::memory_consolidate(&response))
 }
 
 pub async fn memory_index(client: &KomoClient) -> Outcome {

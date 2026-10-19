@@ -66,6 +66,7 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
     if snapshot.memory.enabled {
         check_memory_embedding(snapshot, &mut issues);
         check_retrieval(snapshot, &mut issues);
+        check_consolidate(snapshot, &mut issues);
     }
 
     check_channels(snapshot, &mut issues);
@@ -292,6 +293,28 @@ fn check_embedding_options(embedding: &EmbeddingConfig, key: &str, issues: &mut 
         issues.push(error(
             &format!("{key}.revision"),
             "写了 revision 就要写一个非空的版本标识；不写就整行去掉",
+        ));
+    }
+}
+
+fn check_consolidate(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
+    let consolidate = &snapshot.memory.consolidate;
+    if consolidate.max_groups == 0 {
+        issues.push(error(
+            "memory.consolidate.max_groups",
+            "max_groups 不能是 0",
+        ));
+    }
+    if consolidate.group_size < 2 {
+        issues.push(error(
+            "memory.consolidate.group_size",
+            "group_size 至少是 2：只有一条的组不整理",
+        ));
+    }
+    if consolidate.min_similarity_pct > 100 {
+        issues.push(error(
+            "memory.consolidate.min_similarity_pct",
+            "min_similarity_pct 是 0 到 100 的百分数",
         ));
     }
 }

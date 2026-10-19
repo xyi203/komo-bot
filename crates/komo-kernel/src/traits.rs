@@ -488,6 +488,20 @@ pub trait CronRepo: Send + Sync {
 
 // ---------------------------------------------------------------- Memory
 
+/// 离线整理一组的落库请求（§9.8）：一个事务里先核对、再写、最后盖游标。
+#[derive(Debug, Clone)]
+pub struct ConsolidationWrite {
+    /// 判定时看到的每个成员：id、revision、updated_at。任何一个对不上（被后台提取、
+    /// 操作者的 confirm / forget 动过）整组一个字都不写、也不盖游标。
+    pub expected: Vec<(MemoryId, u32, OffsetDateTime)>,
+    /// 要写的新形态。revision 与 `expected` 里的相同——整理不升 revision。
+    pub puts: Vec<MemoryItem>,
+    /// 走 forget 同一条路停用的条目（状态、关键词与向量一起失效）。
+    pub forgets: Vec<MemoryId>,
+    /// 写完后给 `expected` 里每条盖上的 `consolidated_at`。
+    pub stamp_at: OffsetDateTime,
+}
+
 /// `MemoryManager` 的全部状态读写。**召回排序逻辑要在无数据库下可测**，所以它是
 /// trait。
 #[async_trait]
@@ -531,6 +545,16 @@ pub trait MemoryRepo: Send + Sync {
         generation: &str,
         vector: Vector,
     ) -> Result<(), RepoError>;
+
+    /// 离线整理的游标（§9.8）：每条最近一次被整理看过的时刻，没看过是 `None`。
+    async fn consolidation_marks(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<Vec<(MemoryId, Option<OffsetDateTime>)>, RepoError>;
+
+    /// 离线整理一组的落库（§9.8）：见 [`ConsolidationWrite`]。对不上预期就
+    /// [`RepoError::VersionConflict`]，什么都不写。
+    async fn apply_consolidation(&self, write: ConsolidationWrite) -> Result<(), RepoError>;
 
     /// 当前索引代次的覆盖情况。
     async fn index_status(&self) -> Result<crate::protocol::http::MemoryIndexStatus, RepoError>;

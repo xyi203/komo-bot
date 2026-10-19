@@ -249,6 +249,7 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
             rerank: false,
             rerank_shortlist: 20,
         },
+        consolidate: Default::default(),
     }
 }
 

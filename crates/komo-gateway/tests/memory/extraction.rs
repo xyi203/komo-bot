@@ -43,6 +43,7 @@ async fn run_and_learn(scripts: Vec<Vec<Round>>, text: &str) -> (TestGateway, Sc
     );
 
     // 后台那一拍是 30 秒一次；测试里直接消费一轮，走的是同一段代码。
+    past_extract_idle().await;
     gateway
         .state()
         .memories
@@ -353,6 +354,7 @@ async fn a_failed_extraction_stays_pending_for_the_next_round() {
     let (_session, run) = crate::a_run(&gateway, "rk-1", "客厅空调我一直设 26 度").await;
     wait_for_terminal(&gateway, &run).await;
 
+    past_extract_idle().await;
     let report = gateway.state().memories.process_pending(8).await.unwrap();
     assert_eq!(report.failed, 1, "{report:?}");
     assert_eq!(report.applied, 0);
@@ -431,5 +433,6 @@ async fn learn_with(gateway: &TestGateway, llm: ScriptedLlm) {
         render: komo_agent::context::memory::render,
     });
     // 直接用这一台新的消费队列——它读写的是**同一个 state.db**。
+    past_extract_idle().await;
     manager.process_pending(8).await.expect("提取跑得动");
 }

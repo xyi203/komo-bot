@@ -155,6 +155,8 @@ impl Rig {
                     ..RetrievalConfig::default()
                 },
                 consolidate,
+                extract_idle_secs: 600,
+                max_observations: 8,
             },
             repo: Arc::clone(&repo) as Arc<dyn MemoryRepo>,
             catalog: Arc::clone(&repo) as Arc<dyn MemoryCatalog>,

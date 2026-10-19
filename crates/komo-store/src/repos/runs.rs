@@ -16,7 +16,7 @@ use time::OffsetDateTime;
 use toasty::Executor;
 
 use crate::db::{BoxFuture, Db, decode, encode, map_toasty, to_ts};
-use crate::models::RunRow;
+use crate::models::{RunRow, SessionKind, SessionRow};
 
 /// 一个 Run，读出来的样子。
 #[derive(Debug, Clone, PartialEq)]
@@ -784,45 +784,103 @@ async fn require(ex: &mut dyn Executor, run: &RunId) -> Result<RunRow, StoreErro
 
 // ---------------------------------------------------------------- Memory 处理游标（§9.3）
 
-/// 领取一批待处理的 Run：**终态 + `memory_work = pending`**，领到就翻成 `processing`。
+/// 一个被领走的会话：它这一批全部待处理的 Run（按受理顺序）。
+#[derive(Debug, Clone)]
+pub struct ClaimedSession {
+    pub session: SessionId,
+    pub kind: SessionKind,
+    pub runs: Vec<RunRecord>,
+}
+
+/// 按会话领取（§9.10）：会话里**没有未到终态的 Run**，且最后一个 Run 结束已满 `idle`，
+/// 才一次领走它全部 `memory_work = pending` 的 Run，翻成 `processing`。最多领 `limit` 个会话。
 ///
 /// 领取是"读—核对—写"，整段在 `with_write_retry` 的事务里：两个消费者同时扫到同一行
 /// 时，后提交的那个会冲突重跑，重跑时读到的已经是 `processing`，于是只有一个领到。
 /// 「进程崩溃后可重新领取」（§9.3）由 [`requeue_stuck_memory_work`] 在启动时完成——
 /// 一个 `processing` 但没人在处理的行，和一个从未处理过的行是同一件事。
-pub async fn claim_memory_work(db: &Db, limit: usize) -> Result<Vec<RunRecord>, StoreError> {
+pub async fn claim_memory_work(
+    db: &Db,
+    now: OffsetDateTime,
+    idle: time::Duration,
+    limit: usize,
+) -> Result<Vec<ClaimedSession>, StoreError> {
     let limit = limit.max(1);
     db.with_write_retry(move |ex| {
         Box::pin(async move {
             let rows = RunRow::all().exec(ex).await.map_err(map_toasty)?;
-            let mut candidates: Vec<RunRow> = Vec::new();
+            let mut by_session: std::collections::BTreeMap<String, Vec<RunRow>> =
+                std::collections::BTreeMap::new();
             for row in rows {
-                if !state_of(&row)?.is_terminal() {
-                    continue;
-                }
-                if row.memory_work != memory_work_str(MemoryWork::Pending) {
-                    continue;
-                }
-                candidates.push(row);
+                by_session
+                    .entry(row.session_id.clone())
+                    .or_default()
+                    .push(row);
             }
-            candidates.sort_by(|a, b| a.id.cmp(&b.id));
-            candidates.truncate(limit);
 
-            let mut claimed = Vec::with_capacity(candidates.len());
-            for mut row in candidates {
-                let record = RunRecord::try_from_row(&row)?;
-                row.update()
-                    .memory_work(memory_work_str(MemoryWork::Processing))
+            let cutoff = to_ts(now - idle);
+            let pending = memory_work_str(MemoryWork::Pending);
+            let mut ready: Vec<(String, Vec<RunRow>)> = Vec::new();
+            for (session, runs) in by_session {
+                let mut open = false;
+                let mut last_end = 0_i64;
+                for row in &runs {
+                    if state_of(row)?.is_terminal() {
+                        last_end = last_end.max(row.ended_at);
+                    } else {
+                        open = true;
+                        break;
+                    }
+                }
+                if open || last_end > cutoff {
+                    continue;
+                }
+                let mut pending_runs: Vec<RunRow> = runs
+                    .into_iter()
+                    .filter(|row| row.memory_work == pending)
+                    .collect();
+                if pending_runs.is_empty() {
+                    continue;
+                }
+                pending_runs.sort_by(|a, b| (a.input_seq, &a.id).cmp(&(b.input_seq, &b.id)));
+                ready.push((session, pending_runs));
+            }
+            // 先到先处理：按这个会话最早的待处理 Run 排。
+            ready.sort_by(|a, b| a.1[0].id.cmp(&b.1[0].id));
+            ready.truncate(limit);
+
+            let mut claimed = Vec::with_capacity(ready.len());
+            for (session, runs) in ready {
+                let kind = match SessionRow::filter_by_id(&session)
+                    .first()
                     .exec(ex)
                     .await
-                    .map_err(map_toasty)?;
-                claimed.push(RunRecord {
-                    memory_work: MemoryWork::Processing,
-                    ..record
+                    .map_err(map_toasty)?
+                {
+                    Some(row) => crate::repos::session::kind_of_row(&row)?,
+                    None => SessionKind::Normal,
+                };
+                let mut records = Vec::with_capacity(runs.len());
+                for mut row in runs {
+                    let record = RunRecord::try_from_row(&row)?;
+                    row.update()
+                        .memory_work(memory_work_str(MemoryWork::Processing))
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?;
+                    records.push(RunRecord {
+                        memory_work: MemoryWork::Processing,
+                        ..record
+                    });
+                }
+                claimed.push(ClaimedSession {
+                    session: SessionId::from_raw(session),
+                    kind,
+                    runs: records,
                 });
             }
             Ok(claimed)
-        }) as BoxFuture<'_, Result<Vec<RunRecord>, StoreError>>
+        }) as BoxFuture<'_, Result<Vec<ClaimedSession>, StoreError>>
     })
     .await
 }
@@ -881,4 +939,186 @@ pub async fn requeue_stuck_memory_work(db: &Db) -> Result<u64, StoreError> {
         }) as BoxFuture<'_, Result<u64, StoreError>>
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    const NOW: OffsetDateTime = datetime!(2026-10-19 12:00:00 UTC);
+    const IDLE: time::Duration = time::Duration::minutes(10);
+
+    async fn insert(db: &Db, session: &str, id: &str, state: RunState, ended_ago: time::Duration) {
+        let (session, id) = (session.to_string(), id.to_string());
+        let ended = if state.is_terminal() {
+            to_ts(NOW - ended_ago)
+        } else {
+            0_i64
+        };
+        db.with_write_retry(move |ex| {
+            let (session, id) = (session.clone(), id.clone());
+            Box::pin(async move {
+                toasty::create!(RunRow {
+                    id,
+                    session_id: session,
+                    request_key: "k",
+                    input_hash: "h",
+                    input_event: None as Option<String>,
+                    input_seq: 0_i64,
+                    final_event: None as Option<String>,
+                    parent_run_id: None as Option<String>,
+                    delegate: None as Option<String>,
+                    status: String::new(),
+                    state: state.as_str(),
+                    wait_kind: None as Option<String>,
+                    wait_ref: None as Option<String>,
+                    wake_at: 0_i64,
+                    lease_until: 0_i64,
+                    source: r#"{"kind":"interactive","session":"s"}"#,
+                    peer: None as Option<String>,
+                    claimed_by: None as Option<String>,
+                    claim_generation: 0_i64,
+                    claimed_at: 0_i64,
+                    next_retry_at: 0_i64,
+                    retry_attempts: 0_i64,
+                    rounds: 0_i64,
+                    max_rounds: 0_i64,
+                    valid_until: 0_i64,
+                    model_snapshot: r#"{"provider":"test","base_url":"memory://test","model":"m","api_key_env":"K","timeout_secs":30}"#,
+                    effort: None as Option<String>,
+                    grants: "[]",
+                    memory_work: "pending",
+                    memory_cursor: 0_i64,
+                    last_error: None as Option<String>,
+                    created_at: 0_i64,
+                    updated_at: 0_i64,
+                    ended_at: ended,
+                })
+                .exec(ex)
+                .await
+                .map_err(map_toasty)?;
+                Ok(())
+            }) as BoxFuture<'_, Result<(), StoreError>>
+        })
+        .await
+        .expect("建 run 行");
+    }
+
+    async fn temp() -> (Db, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("临时目录");
+        let db = Db::connect(dir.path().join("state.db"))
+            .await
+            .expect("打开库");
+        (db, dir)
+    }
+
+    /// §9.10：会话里还有未到终态的 Run，或最后一个 Run 结束不满 `extract_idle`：不领。
+    #[tokio::test]
+    async fn a_session_is_not_claimed_while_busy_or_before_it_has_been_idle() {
+        let (db, _dir) = temp().await;
+        insert(
+            &db,
+            "busy",
+            "b-1",
+            RunState::Completed,
+            time::Duration::hours(2),
+        )
+        .await;
+        insert(&db, "busy", "b-2", RunState::Running, time::Duration::ZERO).await;
+        insert(
+            &db,
+            "fresh",
+            "f-1",
+            RunState::Completed,
+            time::Duration::minutes(3),
+        )
+        .await;
+
+        let claimed = claim_memory_work(&db, NOW, IDLE, 8).await.unwrap();
+        assert!(claimed.is_empty(), "{claimed:?}");
+    }
+
+    /// 空闲够了：一次领走该会话全部 pending 的 Run，翻成 `processing`，再领就没有了；别的
+    /// 会话不受牵连；放回 pending 之后整批会被重新领到。
+    #[tokio::test]
+    async fn an_idle_session_hands_over_all_its_pending_runs_at_once() {
+        let (db, _dir) = temp().await;
+        insert(
+            &db,
+            "s1",
+            "r-1",
+            RunState::Completed,
+            time::Duration::hours(2),
+        )
+        .await;
+        insert(
+            &db,
+            "s1",
+            "r-2",
+            RunState::Failed,
+            time::Duration::minutes(11),
+        )
+        .await;
+        insert(
+            &db,
+            "s2",
+            "x-1",
+            RunState::Completed,
+            time::Duration::minutes(1),
+        )
+        .await;
+
+        let claimed = claim_memory_work(&db, NOW, IDLE, 8).await.unwrap();
+        assert_eq!(claimed.len(), 1, "只有 s1 空闲够了");
+        let ids: Vec<&str> = claimed[0].runs.iter().map(|r| r.run.as_str()).collect();
+        assert_eq!(ids, vec!["r-1", "r-2"]);
+        assert!(
+            claimed[0]
+                .runs
+                .iter()
+                .all(|r| r.memory_work == MemoryWork::Processing)
+        );
+        assert!(
+            claim_memory_work(&db, NOW, IDLE, 8)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        for run in &claimed[0].runs {
+            finish_memory_work(&db, &run.run, MemoryWork::Pending, Seq::ZERO, NOW)
+                .await
+                .unwrap();
+        }
+        let again = claim_memory_work(&db, NOW, IDLE, 8).await.unwrap();
+        assert_eq!(again[0].runs.len(), 2);
+    }
+
+    /// 重启：卡在 `processing` 的批整批放回，之后照常按会话领。
+    #[tokio::test]
+    async fn a_batch_stuck_in_processing_comes_back_after_a_restart() {
+        let (db, _dir) = temp().await;
+        insert(
+            &db,
+            "s1",
+            "r-1",
+            RunState::Completed,
+            time::Duration::hours(1),
+        )
+        .await;
+        insert(
+            &db,
+            "s1",
+            "r-2",
+            RunState::Completed,
+            time::Duration::hours(1),
+        )
+        .await;
+        claim_memory_work(&db, NOW, IDLE, 8).await.unwrap();
+
+        assert_eq!(requeue_stuck_memory_work(&db).await.unwrap(), 2);
+        let again = claim_memory_work(&db, NOW, IDLE, 8).await.unwrap();
+        assert_eq!(again[0].runs.len(), 2);
+    }
 }

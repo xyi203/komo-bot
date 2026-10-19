@@ -147,6 +147,9 @@ pub(super) struct MemorySection {
     pub retrieval: RetrievalSection,
     #[serde(default)]
     pub consolidate: ConsolidateSection,
+    /// 会话空闲多久后提取：`"10m"`、`"90s"`、`"2h"`（§9.10）。
+    pub extract_idle: Option<String>,
+    pub max_observations: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -165,6 +168,19 @@ impl ConsolidateSection {
             min_similarity_pct: self.min_similarity_pct.unwrap_or(base.min_similarity_pct),
         }
     }
+}
+
+/// `"10m"` / `"90s"` / `"2h"` → 秒。
+fn parse_idle_secs(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    let (digits, unit) = raw.split_at(raw.len().checked_sub(1)?);
+    let unit = match unit {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        _ => return None,
+    };
+    digits.trim().parse::<u64>().ok()?.checked_mul(unit)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -643,12 +659,22 @@ pub(super) fn assemble(
             None => None,
         };
 
+    let defaults = MemoryConfig::default_extraction();
+    let extract_idle_secs = match file.memory.extract_idle.as_deref() {
+        Some(raw) => parse_idle_secs(raw).ok_or_else(|| ConfigError::Parse {
+            file: sources.config.clone(),
+            message: format!("memory.extract_idle `{raw}` 要写成 \"10m\" / \"90s\" / \"2h\""),
+        })?,
+        None => defaults.0,
+    };
     let memory = MemoryConfig {
         enabled: file.memory.enabled.unwrap_or(true),
         model: memory_model,
         embedding: memory_embedding,
         retrieval: file.memory.retrieval.into_retrieval(),
         consolidate: file.memory.consolidate.into_consolidate(),
+        extract_idle_secs,
+        max_observations: file.memory.max_observations.unwrap_or(defaults.1),
     };
 
     let channels = ChannelsConfig {

@@ -4,6 +4,8 @@
 //! 重复处理相同来源不重复新增。」——所以队列只有三个动作：领一批、处理完记状态与游标、
 //! 启动时把卡在 `processing` 的放回去。
 //!
+//! 领取按会话（§9.10）：会话空闲够久之后，一次领走它全部 pending 的 Run。
+//!
 //! 它是一个 trait 而不是直接调 store，只为了一件事：[`super::MemoryManager`] 的测试要能
 //! 在没有数据库的情况下断言"失败不推进游标"。
 
@@ -14,6 +16,7 @@ use komo_kernel::types::memory::MemoryWork;
 use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::status::RunState;
 use komo_store::Db;
+use komo_store::models::SessionKind;
 use std::sync::Arc;
 
 /// 领到的一个待处理 Run。
@@ -23,16 +26,29 @@ pub struct MemoryWorkItem {
     pub session: SessionId,
     /// 终态。取消的不整理成经验（§9.3）。
     pub status: RunState,
-    /// 来源。Cron 的 Run 不整理用户偏好（§9.3）。
+    /// 来源。Cron 的 Run 不提取（§9.10）。
     pub source: PlanSource,
     /// 已经处理到哪条 seq。
     pub cursor: Seq,
 }
 
+/// 一个会话这一批全部待处理的 Run（按受理顺序）：一次提取调用的单位。
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryBatch {
+    pub session: SessionId,
+    pub kind: SessionKind,
+    pub items: Vec<MemoryWorkItem>,
+}
+
 #[async_trait]
 pub trait MemoryWorkLog: Send + Sync {
-    /// 领一批。领到就翻成 `processing`——两个消费者不会领到同一个。
-    async fn claim(&self, limit: usize) -> Result<Vec<MemoryWorkItem>, StoreError>;
+    /// 领最多 `limit` 个空闲满 `idle` 的会话。领到就翻成 `processing`——两个消费者不会领
+    /// 到同一个。
+    async fn claim(
+        &self,
+        idle: time::Duration,
+        limit: usize,
+    ) -> Result<Vec<MemoryBatch>, StoreError>;
 
     /// 处理完：记状态与游标。**游标只进不退**，`Pending` + 原游标 = 下次重试。
     async fn finish(&self, run: &RunId, work: MemoryWork, cursor: Seq) -> Result<(), StoreError>;
@@ -62,16 +78,30 @@ impl DbMemoryWork {
 
 #[async_trait]
 impl MemoryWorkLog for DbMemoryWork {
-    async fn claim(&self, limit: usize) -> Result<Vec<MemoryWorkItem>, StoreError> {
-        let claimed = komo_store::repos::runs::claim_memory_work(&self.db, limit).await?;
+    async fn claim(
+        &self,
+        idle: time::Duration,
+        limit: usize,
+    ) -> Result<Vec<MemoryBatch>, StoreError> {
+        let claimed =
+            komo_store::repos::runs::claim_memory_work(&self.db, self.clock.now(), idle, limit)
+                .await?;
         Ok(claimed
             .into_iter()
-            .map(|record| MemoryWorkItem {
-                run: record.run,
-                session: record.session,
-                status: record.state,
-                source: record.source,
-                cursor: record.memory_cursor,
+            .map(|claimed| MemoryBatch {
+                session: claimed.session,
+                kind: claimed.kind,
+                items: claimed
+                    .runs
+                    .into_iter()
+                    .map(|record| MemoryWorkItem {
+                        run: record.run,
+                        session: record.session,
+                        status: record.state,
+                        source: record.source,
+                        cursor: record.memory_cursor,
+                    })
+                    .collect(),
             })
             .collect())
     }

@@ -26,6 +26,7 @@ use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::refs::{ContentRef, OutputRef, ToolResultStatus};
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{MemoryUse, Round};
+use komo_store::models::SessionKind;
 use komo_store::{Db, TursoMemoryRepo};
 use time::OffsetDateTime;
 use time::macros::datetime;
@@ -180,10 +181,12 @@ impl SessionEvents for SeedEvents {
 }
 
 /// 内存里的 [`MemoryWorkLog`]：断言"失败不推进游标"用它。
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct MemWork {
     items: Mutex<Vec<MemoryWorkItem>>,
     settled: Mutex<Vec<(RunId, MemoryWork, Seq)>>,
+    /// 领到的会话算什么种类。
+    kind: Mutex<SessionKind>,
 }
 
 impl MemWork {
@@ -191,6 +194,7 @@ impl MemWork {
         Arc::new(MemWork {
             items: Mutex::new(items),
             settled: Mutex::new(Vec::new()),
+            kind: Mutex::new(SessionKind::Normal),
         })
     }
 
@@ -201,10 +205,31 @@ impl MemWork {
 
 #[async_trait]
 impl MemoryWorkLog for MemWork {
-    async fn claim(&self, limit: usize) -> Result<Vec<MemoryWorkItem>, StoreError> {
+    async fn claim(
+        &self,
+        _idle: time::Duration,
+        limit: usize,
+    ) -> Result<Vec<MemoryBatch>, StoreError> {
+        // 空闲与否由 store 的测试管；这里只按会话把队列里的 Run 成批交出去。
         let mut items = self.items.lock().expect("队列");
-        let take = limit.min(items.len());
-        Ok(items.drain(..take).collect())
+        let kind = *self.kind.lock().expect("种类");
+        let mut batches: Vec<MemoryBatch> = Vec::new();
+        for item in items.iter() {
+            if let Some(batch) = batches
+                .iter_mut()
+                .find(|batch| batch.session == item.session)
+            {
+                batch.items.push(item.clone());
+            } else if batches.len() < limit {
+                batches.push(MemoryBatch {
+                    session: item.session.clone(),
+                    kind,
+                    items: vec![item.clone()],
+                });
+            }
+        }
+        items.retain(|item| !batches.iter().any(|batch| batch.session == item.session));
+        Ok(batches)
     }
 
     async fn finish(&self, run: &RunId, work: MemoryWork, cursor: Seq) -> Result<(), StoreError> {
@@ -250,6 +275,8 @@ fn memory_config(enabled: bool, mode: RetrievalMode) -> MemoryConfig {
             rerank_shortlist: 20,
         },
         consolidate: Default::default(),
+        extract_idle_secs: 600,
+        max_observations: 8,
     }
 }
 
@@ -304,6 +331,7 @@ struct HarnessBuilder {
     with_embeddings: bool,
     work: Vec<MemoryWorkItem>,
     reranker: Option<Reranker>,
+    kind: SessionKind,
 }
 
 impl HarnessBuilder {
@@ -314,6 +342,7 @@ impl HarnessBuilder {
             with_embeddings: false,
             work: Vec::new(),
             reranker: None,
+            kind: SessionKind::Normal,
         }
     }
 
@@ -343,6 +372,11 @@ impl HarnessBuilder {
         self
     }
 
+    fn session_kind(mut self, kind: SessionKind) -> Self {
+        self.kind = kind;
+        self
+    }
+
     async fn build(self) -> Harness {
         let dir = tempfile::tempdir().expect("临时目录");
         let db = Db::connect(dir.path().join("state.db"))
@@ -352,6 +386,7 @@ impl HarnessBuilder {
         let llm = ScriptedLlm::new(self.scripts);
         let embeddings = ConceptEmbeddings::new();
         let work = MemWork::with(self.work);
+        *work.kind.lock().expect("种类") = self.kind;
         let ledger = Arc::new(SeedEvents::default());
         let manager = Arc::new(MemoryManager::new(MemoryParts {
             config: self.config,
@@ -476,12 +511,19 @@ fn interactive() -> PlanSource {
 }
 
 fn transcript(events: &[Event]) -> extract::Transcript {
-    extract::Transcript::build(
-        &SessionId::from_raw("sess-1"),
-        &RunId::from_raw("run-1"),
-        events,
-        Seq::ZERO,
-    )
+    transcript_of(events, &[("run-1", RunState::Completed)])
+}
+
+fn transcript_of(events: &[Event], runs: &[(&str, RunState)]) -> extract::Transcript {
+    let windows: Vec<extract::RunWindow> = runs
+        .iter()
+        .map(|(run, status)| extract::RunWindow {
+            run: RunId::from_raw(*run),
+            status: *status,
+            cursor: Seq::ZERO,
+        })
+        .collect();
+    extract::Transcript::build(&SessionId::from_raw("sess-1"), &windows, events)
 }
 
 // =========================================================== ① 语义召回与 bigram
@@ -575,13 +617,21 @@ async fn extracting_the_same_claim_again_never_promotes_a_candidate() {
         .script(vec![round(extraction)])
         .work(vec![
             work_item(RunState::Completed, interactive()),
-            work_item(RunState::Completed, interactive()),
+            MemoryWorkItem {
+                run: RunId::from_raw("run-2"),
+                session: SessionId::from_raw("sess-2"),
+                ..work_item(RunState::Completed, interactive())
+            },
         ])
         .build()
         .await;
     harness.ledger.seed(
         &SessionId::from_raw("sess-1"),
         vec![user_event(1, &RunId::from_raw("run-1"), "把界面弄暗一点")],
+    );
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-2"),
+        vec![user_event(1, &RunId::from_raw("run-2"), "把界面弄暗一点")],
     );
 
     harness.manager.process_pending(1).await.unwrap();
@@ -1253,12 +1303,7 @@ fn an_observation_that_cites_only_the_assistant_is_dropped() {
     )
     .unwrap();
 
-    let observations = transcript.validate(
-        raw,
-        &work_item(RunState::Completed, interactive()),
-        &model("memory-model", None),
-        NOW,
-    );
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), NOW);
     assert_eq!(observations.len(), 1, "只有引得出真实用户消息的那一条留下");
     assert_eq!(observations[0].content, "空调设 26 度");
     assert_eq!(observations[0].provenance, Provenance::UserStatement);
@@ -1282,12 +1327,7 @@ fn a_claim_of_user_speech_without_a_user_event_is_demoted_to_an_inference() {
     )
     .unwrap();
 
-    let observations = transcript.validate(
-        raw,
-        &work_item(RunState::Completed, interactive()),
-        &model("memory-model", None),
-        NOW,
-    );
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), NOW);
     assert_eq!(observations.len(), 2);
     assert_eq!(
         observations[0].provenance,
@@ -1333,9 +1373,9 @@ fn a_tool_result_line_names_the_call_that_produced_it() {
     );
 }
 
-/// 一个 Run 最多收 5 条：模型话多不该变成库里一次涨一堆。
+/// 一批最多收 `max_observations` 条：模型话多不该变成库里一次涨一堆。
 #[test]
-fn a_run_yields_at_most_five_observations() {
+fn a_batch_yields_at_most_the_configured_observations() {
     let run = RunId::from_raw("run-1");
     let events = vec![user_event(1, &run, "记几条偏好")];
     let transcript = transcript(&events);
@@ -1352,23 +1392,17 @@ fn a_run_yields_at_most_five_observations() {
         })
         .collect();
 
-    let observations = transcript.validate(
-        raw,
-        &work_item(RunState::Completed, interactive()),
-        &model("memory-model", None),
-        NOW,
-    );
+    let observations = transcript.validate(raw, 5, &model("memory-model", None), NOW);
     assert_eq!(observations.len(), 5);
     assert_eq!(observations[4].content, "偏好 4", "按模型给的顺序留前面的");
 }
 
-/// 「取消、失败或结果未知的动作不能整理成成功经验」，以及「Cron 不能从自己的报告推断用户
-/// 偏好」（§9.3）。
+/// 「取消、失败或结果未知的动作不能整理成成功经验」（§9.3）。
 #[test]
-fn a_failed_run_yields_no_experience_and_a_cron_run_yields_no_preference() {
+fn a_failed_run_yields_no_experience() {
     let run = RunId::from_raw("run-1");
     let events = vec![user_event(1, &run, "帮我把构建目录清了")];
-    let transcript = transcript(&events);
+    let transcript = transcript_of(&events, &[("run-1", RunState::Failed)]);
     let raw: Vec<RawObservation> = serde_json::from_str(
         r#"[{"content":"清构建目录要先停掉 cargo watch","kind":"experience","scope":"personal",
              "said_by":"user_statement","evidence":["evt-1"]},
@@ -1377,34 +1411,11 @@ fn a_failed_run_yields_no_experience_and_a_cron_run_yields_no_preference() {
     )
     .unwrap();
 
-    let failed = transcript.validate(
-        raw.clone(),
-        &work_item(RunState::Failed, interactive()),
-        &model("memory-model", None),
-        NOW,
-    );
+    let failed = transcript.validate(raw, 8, &model("memory-model", None), NOW);
     assert_eq!(failed.len(), 1, "失败的 Run 整理不出成功经验");
     assert_eq!(
         failed[0].kind,
         komo_kernel::types::memory::MemoryKind::Preference
-    );
-
-    let cron = transcript.validate(
-        raw,
-        &work_item(
-            RunState::Completed,
-            PlanSource::Cron {
-                job: komo_kernel::types::ids::CronJobId::from_raw("job-1"),
-                job_version: 1,
-            },
-        ),
-        &model("memory-model", None),
-        NOW,
-    );
-    assert_eq!(cron.len(), 1, "Cron 的 Run 不整理用户偏好");
-    assert_eq!(
-        cron[0].kind,
-        komo_kernel::types::memory::MemoryKind::Experience
     );
 }
 
@@ -1426,12 +1437,7 @@ fn anything_that_looks_like_a_credential_is_dropped() {
     )
     .unwrap();
 
-    let observations = transcript.validate(
-        raw,
-        &work_item(RunState::Completed, interactive()),
-        &model("memory-model", None),
-        NOW,
-    );
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), NOW);
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].content, "备份放在 NAS 的 /srv/backup");
 }
@@ -1513,6 +1519,215 @@ async fn an_unreadable_session_abandons_the_run_instead_of_retrying_forever() {
         vec![(RunId::from_raw("run-1"), MemoryWork::Error, Seq(2))],
         "终态，队列不再为它空转"
     );
+}
+
+// =========================================================== §9.10 按会话提取
+
+fn run_item(run: &str, cursor: u64) -> MemoryWorkItem {
+    MemoryWorkItem {
+        run: RunId::from_raw(run),
+        cursor: Seq(cursor),
+        ..work_item(RunState::Completed, interactive())
+    }
+}
+
+const NOTHING: &str = r#"{"observations":[]}"#;
+
+/// 空闲够了：一个会话全部 pending 的 Run 一起处理，只调一次模型；证据按事件所在的 Run
+/// 记 `extracted_from_run`，每个 Run 的游标各自推进到它自己的末尾。
+#[tokio::test]
+async fn all_pending_runs_of_a_session_share_one_model_call() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[
+                {"content":"客厅空调设 26 度","kind":"preference","scope":"personal",
+                 "said_by":"user_statement","evidence":["evt-1"]},
+                {"content":"台灯放在书桌左边","kind":"fact","scope":"personal",
+                 "said_by":"user_statement","evidence":["evt-4"]}]}"#,
+        )])
+        .work(vec![run_item("run-1", 0), run_item("run-2", 0)])
+        .build()
+        .await;
+    let run_1 = RunId::from_raw("run-1");
+    let run_2 = RunId::from_raw("run-2");
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![
+            user_event(1, &run_1, "客厅空调设 26 度"),
+            assistant_event(2, &run_1, "好的"),
+            user_event(4, &run_2, "台灯放在书桌左边"),
+            assistant_event(5, &run_2, "记下了"),
+        ],
+    );
+
+    let report = harness.manager.process_pending(4).await.unwrap();
+
+    assert_eq!(
+        harness.llm.requests.lock().unwrap().len(),
+        1,
+        "一批一次调用"
+    );
+    assert_eq!((report.processed, report.applied), (2, 2), "{report:?}");
+    assert_eq!(
+        harness.work.settled(),
+        vec![
+            (run_1.clone(), MemoryWork::Done, Seq(2)),
+            (run_2.clone(), MemoryWork::Done, Seq(5)),
+        ],
+        "每个 Run 的游标各自推进"
+    );
+    let stored = harness.repo.list(None, None, 10).await.unwrap();
+    let from_run = |content: &str| {
+        let item = stored.iter().find(|item| item.content == content).unwrap();
+        item.evidence
+            .iter()
+            .map(|evidence| evidence.extracted_from_run.clone().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(from_run("客厅空调设 26 度"), vec![run_1]);
+    assert_eq!(from_run("台灯放在书桌左边"), vec![run_2]);
+}
+
+/// 后台任务会话、Cron 的 Run：不调模型，标 done，游标推到末尾，原因进日志记录。
+#[tokio::test]
+async fn task_sessions_and_cron_runs_are_skipped_without_a_model_call() {
+    let cron = PlanSource::Cron {
+        job: komo_kernel::types::ids::CronJobId::from_raw("job-1"),
+        job_version: 1,
+    };
+    let events = |run: &RunId| {
+        vec![
+            user_event(1, run, "排查一下"),
+            tool_event(2, run, "exit 0"),
+            assistant_event(3, run, "好了"),
+        ]
+    };
+
+    // Cron 的 Run 夹在一个普通会话的批里。
+    let harness = HarnessBuilder::new()
+        .work(vec![MemoryWorkItem {
+            source: cron,
+            ..run_item("run-1", 0)
+        }])
+        .build()
+        .await;
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        events(&RunId::from_raw("run-1")),
+    );
+    let report = harness.manager.process_pending(4).await.unwrap();
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert!(harness.llm.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        harness.work.settled(),
+        vec![(RunId::from_raw("run-1"), MemoryWork::Done, Seq(3))]
+    );
+
+    // 任务会话里所有的 Run。
+    let harness = HarnessBuilder::new()
+        .session_kind(SessionKind::Task)
+        .work(vec![run_item("run-1", 1)])
+        .build()
+        .await;
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        events(&RunId::from_raw("run-1")),
+    );
+    let report = harness.manager.process_pending(4).await.unwrap();
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert!(harness.llm.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        harness.work.settled(),
+        vec![(RunId::from_raw("run-1"), MemoryWork::Done, Seq(3))]
+    );
+}
+
+/// 窗口超限：用户输入行一行不丢，先删最旧的工具结果。
+#[test]
+fn every_user_line_survives_an_over_budget_window() {
+    let run = RunId::from_raw("run-1");
+    let mut events = vec![user_event(1, &run, "最初的请求：以后都用暗色")];
+    for seq in 2..=80 {
+        events.push(tool_event(seq, &run, &"x".repeat(580)));
+    }
+    events.push(user_event(81, &run, "最后补一句：台灯放左边"));
+
+    let transcript = transcript(&events);
+
+    assert!(
+        transcript.rendered.contains("最初的请求"),
+        "最早的用户行还在"
+    );
+    assert!(transcript.rendered.contains("最后补一句"));
+    assert!(transcript.rendered.contains("已省略"));
+    assert!(
+        !transcript.rendered.contains("evt-2 "),
+        "最旧的工具结果先被删"
+    );
+    assert!(
+        transcript.rendered.contains("evt-80 "),
+        "最新的工具结果还在"
+    );
+    assert!(transcript.window_chars() < 24_700);
+}
+
+/// 用户行加起来超预算：按 Run 边界切成几次调用，每个 Run 的游标各自推进。
+#[tokio::test]
+async fn an_over_budget_batch_is_split_at_run_boundaries() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(NOTHING)])
+        .script(vec![round(NOTHING)])
+        .work(vec![run_item("run-1", 0), run_item("run-2", 0)])
+        .build()
+        .await;
+    let run_1 = RunId::from_raw("run-1");
+    let run_2 = RunId::from_raw("run-2");
+    let long = "说".repeat(560);
+    let mut events: Vec<Event> = (1..=30).map(|seq| user_event(seq, &run_1, &long)).collect();
+    events.extend((31..=60).map(|seq| user_event(seq, &run_2, &long)));
+    harness.ledger.seed(&SessionId::from_raw("sess-1"), events);
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    assert_eq!(
+        harness.llm.requests.lock().unwrap().len(),
+        2,
+        "两段两次调用"
+    );
+    assert_eq!(
+        harness.work.settled(),
+        vec![
+            (run_1, MemoryWork::Done, Seq(30)),
+            (run_2, MemoryWork::Done, Seq(60)),
+        ]
+    );
+}
+
+/// 任务交回的结果以 `task-result:` 请求键进 home：它是任务 agent 写的摘要，不是用户原话，
+/// 引它当 `user_statement` 一律丢掉。
+#[test]
+fn a_task_result_input_cannot_be_cited_as_a_user_statement() {
+    let run = RunId::from_raw("run-1");
+    let mut returned = user_event(2, &run, "任务完成：发现 CI 要先装 protoc");
+    if let EventPayload::RunAccepted(body) = &mut returned.payload {
+        body.request_key = RequestKey::new("task-result:run-9");
+    }
+    let events = vec![user_event(1, &run, "帮我看看 CI"), returned];
+    let transcript = transcript(&events);
+    assert!(
+        transcript.rendered.contains("任务交回"),
+        "{}",
+        transcript.rendered
+    );
+
+    let raw: Vec<RawObservation> = serde_json::from_str(
+        r#"[{"content":"CI 要先装 protoc","kind":"fact","scope":"personal",
+             "said_by":"user_statement","evidence":["evt-2"]}]"#,
+    )
+    .unwrap();
+
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), NOW);
+    assert!(observations.is_empty(), "{observations:?}");
 }
 
 /// 写库路径全测：一条用户原话落 `active + user_statement + unconfirmed`，带着证据。

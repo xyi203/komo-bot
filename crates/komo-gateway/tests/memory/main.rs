@@ -27,6 +27,7 @@ mod harness;
 mod extraction;
 mod governance;
 mod index;
+mod inspect;
 mod recall;
 mod startup;
 

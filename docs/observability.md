@@ -145,8 +145,8 @@ otlp_endpoint = "http://127.0.0.1:4318"
 | 项 | 改法 |
 |---|---|
 | `message.assistant` | 追加可选字段 `reasoning_tokens`；旧行照常解码 |
-| `memory.injected` | 追加召回诊断：mode、是否降级、候选数、被预算挤掉的条数（附录 B.3.5 的"为什么选中"） |
-| `run inspect` 与 `/v1/runs/{id}` | 开始 / 结束时间、耗时、模型、失败原因（`runs.last_error`）、按轮汇总的 token（从 JSONL 的 `message.assistant` 求和）、压缩事件；修 `ended_at` 写死与 `memories` 恒空 |
+| `memory.injected` | **已落地**：可选 `recall`（`RecallDiagnostics`）：mode、`degraded` + 原因、融合前 / 后候选数、`dropped_by_budget`、`reused_pin`（附录 B.3.5 的"为什么选中"）。只在换块时写事件；后面沿用的 Run 没有自己的事件，`run inspect` 标"沿用这一段钉下的那块" |
+| `run inspect` 与 `/v1/runs/{id}` | 开始 / 结束时间、耗时、模型、失败原因（`runs.last_error`）、按轮汇总的 token（从 JSONL 的 `message.assistant` 求和）、压缩事件；修 `ended_at` 写死与 `memories` 恒空。**已落地**：`RunDetail` 加 `model` / `duration_ms` / `failure` / `tokens`（某项没人报则缺席，不是 0）/ `compactions` / `recall`，`ended_at` 取 `runs.ended_at`，`memories` 取这条 Run 生效的 `memory.injected`；`reasoning_tokens` 另算 |
 | 投递 | 不加命令；投递失败进 `komo.delivery` span 与指标。真要逐条查再说 |
 
 ## 6. 日志

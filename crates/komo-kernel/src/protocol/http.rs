@@ -382,6 +382,57 @@ pub struct RunDetail {
     /// 本次 Run 用到的记忆条目（审计证据，§9.7）。
     #[serde(default)]
     pub memories: Vec<crate::types::turn::MemoryUse>,
+    /// 注入这一段记忆时的召回诊断；`reused_pin` = 这条 Run 自己没有 `memory.injected`，
+    /// 沿用的是这一段之前钉下的那一块。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall: Option<crate::types::memory::RecallDiagnostics>,
+    /// 受理时冻结的模型名。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// 开始到进终态的毫秒数；没到终态为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// 失败原因（`runs.last_error`，缺则取 `run.failed` 的 `reason`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<String>,
+    /// 各轮 `message.assistant` 用量之和；一轮都没报则为 `None`，某一项没人报则那一项为 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<TokenTotals>,
+    /// 这条 Run 里的上下文压缩 / 衰减 / 跳过事件，按发生顺序。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compactions: Vec<CompactionSummary>,
+}
+
+/// 一条 Run 的 token 合计。未知不是零：没有任何一轮报过的项保持 `None`。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenTotals {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
+}
+
+/// 一次 `context.compacted` 的要点。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionSummary {
+    /// `compacted` / `decayed` / `skipped`。
+    pub outcome: String,
+    /// 被摘要覆盖的那段原本多少 token（`compacted` 与 `decayed` 的决策里有）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_tokens: Option<u64>,
+    /// 压缩之后要重写进缓存的上下文大小。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_compaction_tokens: Option<u64>,
+    /// `decayed`：换成短视图的调用数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decayed_calls: Option<u32>,
+    /// 决策理由（snake_case）或 `skipped` 的原因。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

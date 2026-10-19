@@ -2136,3 +2136,107 @@ context_window = 64000
         (WindowSource::Provider, Some(500_000))
     );
 }
+
+// ---------------------------------------------------------------- run inspect
+
+fn usage_round(
+    n: u32,
+    text: &str,
+    usage: komo_kernel::types::model::TokenUsage,
+) -> Result<komo_kernel::types::turn::Round, komo_kernel::types::turn::LlmError> {
+    Ok(komo_kernel::types::turn::Round {
+        usage,
+        ..crate::service::test_support::harness::text_round(n, text).unwrap()
+    })
+}
+
+/// `GET /v1/runs/{id}`：终态 Run 带结束时刻、耗时、模型与各轮用量之和。
+#[tokio::test]
+async fn a_completed_run_reports_end_time_duration_model_and_token_totals() {
+    use crate::service::test_support::harness::{FakeLlm, Home, call_round};
+    use komo_kernel::types::model::TokenUsage;
+
+    let home = Home::new();
+    let gateway = home
+        .start(FakeLlm::new(vec![vec![
+            call_round(1, "pc-1", "read", serde_json::json!({"path": "nope"})),
+            usage_round(
+                2,
+                "好了。",
+                TokenUsage {
+                    input: Some(50),
+                    output: Some(5),
+                    cache_read: Some(30),
+                    ..TokenUsage::default()
+                },
+            ),
+        ]]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway.submit(&session, "ins-1", "看一下").await.run;
+    gateway
+        .wait_db_state(&run, RunState::is_terminal, "终态")
+        .await;
+
+    let detail = gateway.run_detail(&run).await;
+    assert_eq!(detail.summary.state, RunState::Completed);
+    let ended = detail.summary.ended_at.expect("终态带结束时刻");
+    assert!(ended >= detail.summary.created_at);
+    assert!(detail.duration_ms.is_some());
+    assert!(detail.model.is_some(), "受理快照里的模型");
+    assert!(detail.failure.is_none());
+    let tokens = detail.tokens.expect("有一轮报了用量");
+    assert_eq!(tokens.input, Some(50));
+    assert_eq!(tokens.output, Some(5));
+    assert_eq!(tokens.cache_read, Some(30));
+    assert_eq!(tokens.cache_write, None, "没人报的项保持未知，不是 0");
+}
+
+/// 一轮都没报过用量：`tokens` 整个缺席，而不是一排 0。
+#[tokio::test]
+async fn a_run_without_reported_usage_leaves_token_totals_absent() {
+    use crate::service::test_support::harness::{FakeLlm, Home, text_round};
+
+    let home = Home::new();
+    let gateway = home
+        .start(FakeLlm::new(vec![vec![text_round(1, "好。")]])
+            as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway.submit(&session, "ins-2", "嗯").await.run;
+    gateway
+        .wait_db_state(&run, RunState::is_terminal, "终态")
+        .await;
+
+    let (status, body) = gateway.get(&format!("/v1/runs/{run}")).await;
+    assert_eq!(status, 200, "{body}");
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(json.get("tokens").is_none(), "{body}");
+    assert!(json.get("failure").is_none(), "{body}");
+}
+
+/// 失败的 Run 带上失败原因。
+#[tokio::test]
+async fn a_failed_run_reports_why() {
+    use crate::service::test_support::harness::{FakeLlm, Home};
+    use komo_kernel::types::turn::LlmError;
+
+    let home = Home::new();
+    let gateway = home
+        .start(FakeLlm::always(vec![Err(LlmError::Rejected {
+            status: 400,
+            message: "额度用完了".into(),
+        })]) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .await;
+    let session = gateway.open_session().await;
+    let run = gateway.submit(&session, "ins-3", "来").await.run;
+    gateway
+        .wait_db_state(&run, RunState::is_terminal, "终态")
+        .await;
+
+    let detail = gateway.run_detail(&run).await;
+    assert_eq!(detail.summary.state, RunState::Failed);
+    assert!(detail.summary.ended_at.is_some());
+    let reason = detail.failure.expect("失败原因");
+    assert!(reason.contains("额度用完了"), "{reason}");
+}

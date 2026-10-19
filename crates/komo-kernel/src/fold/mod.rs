@@ -775,6 +775,7 @@ mod tests {
                 text: Some(text.into()),
                 text_ref: None,
                 uses: Vec::new(),
+                recall: None,
             }),
         )
     }

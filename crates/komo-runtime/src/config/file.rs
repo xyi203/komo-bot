@@ -69,6 +69,13 @@ pub(super) struct FileConfig {
     pub channels: ChannelsSection,
     #[serde(default)]
     pub mcp: McpSection,
+    #[serde(default)]
+    pub telemetry: TelemetrySection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct TelemetrySection {
+    pub otlp_endpoint: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -517,6 +524,11 @@ pub(super) fn assemble(
         ),
         data_dir: data_dir.clone(),
         listen,
+        otlp_endpoint: file
+            .telemetry
+            .otlp_endpoint
+            .map(|endpoint| endpoint.trim().to_string())
+            .filter(|endpoint| !endpoint.is_empty()),
     };
 
     let mcp = file

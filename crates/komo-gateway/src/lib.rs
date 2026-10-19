@@ -12,6 +12,7 @@ pub mod reload;
 pub mod render;
 pub mod service;
 pub mod sse;
+pub mod telemetry;
 
 /// bin 要的几样**不经 Gateway** 的东西（§3 的命令表：`komo channel list|probe` 与
 /// `komo skills *` 只读文件系统与配置）。
@@ -31,3 +32,4 @@ pub use dispatcher::Dispatcher;
 pub use lock::{DiscoveryFile, GatewayDiscovery, InstanceLock};
 pub use notifier::HomeNotifier;
 pub use service::{Running, ServiceError, ServiceOptions, run, start};
+pub use telemetry::TelemetryStatus;

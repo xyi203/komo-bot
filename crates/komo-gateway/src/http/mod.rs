@@ -121,6 +121,12 @@ async fn healthz(State(api): State<Api>) -> Json<HealthResponse> {
         protocol_version: PROTOCOL_VERSION,
         started_at: api.state.started_at,
         data_dir: api.state.home.display().to_string(),
+        telemetry: api
+            .state
+            .telemetry
+            .get()
+            .map(|status| status.health())
+            .unwrap_or_default(),
     })
 }
 

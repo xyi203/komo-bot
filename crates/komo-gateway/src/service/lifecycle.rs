@@ -141,15 +141,28 @@ impl GatewayState {
         }
 
         // 一条汇总日志：**看了多少、判了什么**。它是对账唯一的可观察面（另一面是返回值）。
-        tracing::info!(
-            checked = report.checked,
-            resumed = report.resumed,
-            blocked = report.blocked,
-            reclaimed = report.reclaimed,
-            closed = report.closed,
-            purged = report.purged,
-            "对账完成"
-        );
+        // 每分钟都跑，什么都没改时降到 DEBUG；`checked` 不算"发生了什么"（挂着等人的 Run
+        // 每拍都会被看一遍）。
+        let acted =
+            report.resumed + report.blocked + report.reclaimed + report.closed + report.purged;
+        macro_rules! summary {
+            ($level:ident) => {
+                tracing::$level!(
+                    checked = report.checked,
+                    resumed = report.resumed,
+                    blocked = report.blocked,
+                    reclaimed = report.reclaimed,
+                    closed = report.closed,
+                    purged = report.purged,
+                    "对账完成"
+                )
+            };
+        }
+        if acted > 0 {
+            summary!(info);
+        } else {
+            summary!(debug);
+        }
         Ok((report, scan))
     }
 

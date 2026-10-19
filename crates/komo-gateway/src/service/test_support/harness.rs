@@ -551,6 +551,7 @@ impl GatewayBuilder {
             // 共享 skill 目录也钉在这份临时数据目录上（§5.6）：否则跑测试那台机器上
             // `~/.agents/skills` 里有什么，别的测试的断言就跟着变。
             shared_home: Some(home.clone()),
+            telemetry: None,
         })
         .await
         .expect("Gateway 起得来");
@@ -881,6 +882,7 @@ impl Home {
             embeddings: None,
             // 共享 skill 目录钉在这份临时数据目录上（§5.6），与 `GatewayBuilder` 同一个口径。
             shared_home: Some(self.dir.path().to_path_buf()),
+            telemetry: None,
         })
         .await
         .expect("Gateway 起得来");

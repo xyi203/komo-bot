@@ -95,6 +95,8 @@ pub struct ServiceOptions {
     /// 测试之间会互相污染（谁在 `~/.agents/skills` 里装过东西，别人的断言就变），多实例
     /// 部署也没法把共享面钉死。
     pub shared_home: Option<PathBuf>,
+    /// bin 里 OTLP 导出层记结果的地方；`/healthz` 读它。`None` = 没接遥测。
+    pub telemetry: Option<Arc<crate::telemetry::TelemetryStatus>>,
 }
 
 impl std::fmt::Debug for ServiceOptions {
@@ -199,6 +201,10 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     })
     .await
     .map_err(|error| ServiceError::Assemble(error.to_string()))?;
+
+    if let Some(telemetry) = options.telemetry {
+        let _ = state.telemetry.set(telemetry);
+    }
 
     let dispatcher = Arc::new(Dispatcher::new(Arc::clone(&state)));
     let _ = state

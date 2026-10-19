@@ -1,6 +1,6 @@
 # komo 可观测性
 
-> 状态：设计，2026-10-19 认可，**未实现**。与 [`komo_bot.md`](komo_bot.md) 冲突时，涉及本文范围（遥测、日志、运维视图）的以本文为准；落地后把对应规格写回这里，不再另起文件。
+> 状态：设计，2026-10-19 认可。**第 2 步（依赖 + `[telemetry]` + `init_tracing` 接 OTel 层 + `komo doctor` + 日志单写轮转 + 空闲降级）已实现**（2026-10-19）；埋点与指标（第 3 步起）未实现。与 [`komo_bot.md`](komo_bot.md) 冲突时，涉及本文范围（遥测、日志、运维视图）的以本文为准；落地后把对应规格写回这里，不再另起文件。
 > 文中不带文件名的章节号（§3、§8.3、§13.3 …）指 `komo_bot.md`，记忆的 §9.x 指 [`memory.md`](memory.md)。
 
 ## 1. 现状（2026-10-19 盘点）
@@ -86,12 +86,19 @@ invoke_agent                 一个 Run 段（受理/恢复 → 完成/挂起/�
 | 依赖 | 配置 | 理由 |
 |---|---|---|
 | `opentelemetry` / `opentelemetry_sdk` | `0.33`，`trace`、`metrics` | SDK 只在 bin 初始化 |
-| `opentelemetry-otlp` | `0.33`，`default-features = false, features = ["http-proto", "reqwest-client", "trace", "metrics"]` | OTLP/HTTP + protobuf；`reqwest-client` 走 `reqwest ^0.13.1`，与工作区同一份；`prost ^0.14` 已在依赖树里（turso 同步引擎）；不开 `grpc-tonic`、`logs` 和默认的 blocking 客户端 |
+| `opentelemetry-otlp` | `0.33`，`default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"]` | OTLP/HTTP + protobuf；走工作区同一份 reqwest 0.13（只多开它的 `blocking` 特性）；`prost ^0.14` 已在依赖树里（turso 同步引擎）；不开 `grpc-tonic`、`logs`。**用 blocking 而不是 `reqwest-client`**：SDK 0.33 的批量 span 处理器与周期指标读取器都在自己的线程上用 `futures_executor::block_on` 驱动导出，那里没有 tokio reactor，async 版 reqwest 会 panic（已读 SDK 源码确认）。blocking 客户端自带一个内部 runtime；因此 shutdown 在 async 里要走 `spawn_blocking` |
+| `tracing-appender` | `0.2`，`default-features = false` | 日志按天轮转、保留 7 个文件（§6）；tokio-rs 官方 |
 | `tracing-opentelemetry` | `0.34`（对应 `opentelemetry 0.33`），默认特性含 `metrics` | `OpenTelemetryLayer` 把 span 转成链路；`MetricsLayer` 把带 `histogram.` / `monotonic_counter.` 前缀字段的 tracing 事件转成指标——所以 runtime / gateway 不依赖任何 OTel 包 |
 
 加入时更新 §13.4 依赖表，`cargo tree -d` 核对没有新重复，`cargo build --timings` 核对冷编预算。
 
-**初始化。** `init_tracing` 在已有的两层之外加 `OpenTelemetryLayer` 与 `MetricsLayer`；资源属性 `service.name = komo`、`service.version`、`service.instance.id = 实例 id`（Mac 与 NAS 两个实例分得开）。退出时 flush。
+**初始化（已实现）。** `crates/komo/src/telemetry.rs` 建管线，`init_tracing` 只在前台 Gateway 进程且配了端点时接 `OpenTelemetryLayer` 与 `MetricsLayer`；CLI / TUI 从不导出。端点是启动期键，`main` 在装 tracing 之前用 `load_config` 读一次（读不出来就不上报，`run` 自己会带原因失败）。资源属性 `service.name = komo`、`service.version`、`service.instance.id`：此时 Gateway 的运行 id 还没生成，取**本机主机名**（Mac 与 NAS 分得开）。退出时 `spawn_blocking` 里 flush（最多等 3 秒）。
+
+**埋点约定。** 后面各步的埋点按这份约定写：
+
+- 链路：span 用 INFO 级；OTel 层收 INFO 及以上，与 `KOMO_LOG` 无关。
+- 指标：`tracing` 事件，`target: "komo::metrics"`，DEBUG 级，字段前缀 `histogram.` / `monotonic_counter.` / `counter.`（`MetricsLayer` 的约定）。写法 `tracing::event!(target: "komo::metrics", tracing::Level::DEBUG, histogram.xxx = v, 维度 = ..)`。
+- 过滤是**每层各自的**，没有全局过滤：文本日志（文件、stderr）按 `KOMO_LOG`，并且永远排除 `komo::metrics`；OTel 两层各用 `Targets`（默认 INFO，`komo::metrics` 放到 DEBUG）。所以 `KOMO_LOG` 调多低都不影响导出，指标事件也不会进日志文件（`main.rs` 的测试断言了这一点）。
 
 **配置。**
 
@@ -101,9 +108,9 @@ invoke_agent                 一个 Run 段（受理/恢复 → 完成/挂起/�
 otlp_endpoint = "http://127.0.0.1:4318"
 ```
 
-`otlp_endpoint` 是启动期键（exporter 在启动时建好），改了按 §3 的规则**报告**需要重启，不静默忽略。
+`otlp_endpoint` 是启动期键（exporter 在启动时建好），快照里是 `start_only.otlp_endpoint`，改了按 §3 的规则**报告**需要重启，不静默忽略。值必须是 http(s) 地址，否则整份配置装不上；空串等于没写。信号路径（`/v1/traces`、`/v1/metrics`）由 komo 补。
 
-**失败与背压。** 链路用批量处理器、指标用周期读取器（默认 60 秒）；队列有上限，满了丢弃。后端不通只在第一次失败与恢复时各记一条 warn / info，从不阻塞 Run。`komo doctor` 显示端点、最近一次导出成功或失败的时间与原因。
+**失败与背压。** 链路用批量处理器、指标用周期读取器（默认 60 秒）；队列有上限，满了丢弃。后端不通只在第一次失败与恢复时各记一条 warn / info，从不阻塞 Run（测试：指向无人监听的端口，发 1000 个 span 不等网络）。`komo doctor` 显示端点（或"未配置"）与最近一次 span 导出成功或失败的时间与原因：包了一层 span exporter 把每批结果记进 `TelemetryStatus`，`/healthz` 带出。指标导出的失败目前不进 doctor。
 
 ## 5. 本地仍要补的事实与视图
 
@@ -116,13 +123,11 @@ otlp_endpoint = "http://127.0.0.1:4318"
 | `run inspect` 与 `/v1/runs/{id}` | 开始 / 结束时间、耗时、模型、失败原因（`runs.last_error`）、按轮汇总的 token（从 JSONL 的 `message.assistant` 求和）、压缩事件；修 `ended_at` 写死与 `memories` 恒空 |
 | 投递 | 不加命令；投递失败进 `komo.delivery` span 与指标。真要逐条查再说 |
 
-## 6. 日志
+## 6. 日志（已实现）
 
-- 只写一份：Gateway 自己写 `logs/gateway.log`，按天轮转，保留 7 天；stderr 层只在前台交互运行时开，launchd / systemd 下不再收一份重复的。
-- 对账、记忆队列这类周期任务，什么都没做时降到 DEBUG。
+- 只写一份：Gateway 自己写 `logs/gateway.log.<日期>`（`tracing-appender` 按天轮转，保留 7 个），纯文本无 ANSI；stderr 层只在 stderr 是终端时开（前台手动跑），launchd / systemd 下不再收一份重复的。文件建不出来时退回 stderr。launchd 仍把 stdout / stderr 收进 `gateway.out.log` / `gateway.err.log`，现在里面只剩 panic 之类绕过 tracing 的输出。
+- 对账、恢复扫描这类周期任务，什么都没改时降到 DEBUG：对账汇总只在 resumed / blocked / reclaimed / closed / purged 有一项非零时 INFO；"恢复决定"对保持原状的 Run 降为 DEBUG。记忆队列与 Cron 的循环本来就只在有事时记。
 - 日志仍是纯文本，给人排障用；任何统计都不从日志里解析。日志进 Loki 不在第一版（要多一个 `opentelemetry-appender-tracing`）。
-
-轮转用 `tracing-appender`（tokio-rs 官方）；同样要进 §13.4 依赖表。
 
 ## 7. 本地后端
 

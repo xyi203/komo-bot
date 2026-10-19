@@ -655,3 +655,49 @@ fn an_mcp_server_needs_exactly_one_of_command_and_url() {
     let error = load_config(&fixture.options()).unwrap_err();
     assert!(error.to_string().contains("[mcp.servers.x]"), "{error}");
 }
+
+fn with_telemetry(fixture: &Fixture, body: &str) {
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str(body);
+    write(&fixture.sources().config, &text);
+}
+
+#[test]
+fn telemetry_is_off_unless_an_endpoint_is_written() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.start_only.otlp_endpoint, None);
+
+    with_telemetry(&fixture, "\n[telemetry]\n");
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.start_only.otlp_endpoint, None);
+}
+
+#[test]
+fn a_telemetry_endpoint_loads_into_the_start_only_keys() {
+    let fixture = Fixture::valid();
+    with_telemetry(
+        &fixture,
+        "\n[telemetry]\notlp_endpoint = \"http://127.0.0.1:4318\"\n",
+    );
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(
+        loaded.snapshot.start_only.otlp_endpoint.as_deref(),
+        Some("http://127.0.0.1:4318")
+    );
+    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+}
+
+#[test]
+fn a_telemetry_endpoint_that_is_not_an_http_url_refuses_the_load() {
+    for bad in ["not a url", "grpc://collector:4317", "127.0.0.1:4318"] {
+        let fixture = Fixture::valid();
+        with_telemetry(
+            &fixture,
+            &format!("\n[telemetry]\notlp_endpoint = \"{bad}\"\n"),
+        );
+        let error = load_config(&fixture.options()).unwrap_err();
+        let keys: Vec<&str> = error.issues().iter().map(|i| i.key.as_str()).collect();
+        assert_eq!(keys, vec!["start_only.otlp_endpoint"], "{bad}");
+    }
+}

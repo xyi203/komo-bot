@@ -12,7 +12,7 @@ use komo_kernel::protocol::http::{
     ConfigCheckResponse, ConfigReloadResponse, CronListResponse, HealthResponse, IndexState,
     InterventionDetail, InterventionListResponse, InterventionSummary, MemoryIndexStatus,
     MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, RunDetail,
-    SessionListResponse, SessionSummary, SweepRule, ToolCallSummary, WindowSource,
+    SessionListResponse, SessionSummary, SweepRule, TelemetryHealth, ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
@@ -819,6 +819,7 @@ pub fn doctor(health: &HealthResponse, config: Option<&ConfigCheckResponse>) -> 
         ),
         format!("启动于    {}", stamp(health.started_at)),
         format!("数据目录  {}", health.data_dir),
+        telemetry_line(&health.telemetry),
     ];
 
     match config {
@@ -837,6 +838,23 @@ pub fn doctor(health: &HealthResponse, config: Option<&ConfigCheckResponse>) -> 
         }
     }
     out.join("\n")
+}
+
+fn telemetry_line(telemetry: &TelemetryHealth) -> String {
+    let Some(endpoint) = &telemetry.endpoint else {
+        return "遥测      未配置".into();
+    };
+    let last = match (telemetry.last_ok_at, telemetry.last_error_at) {
+        (None, None) => "还没导出过".to_string(),
+        (ok, Some(error)) if ok.is_none_or(|ok| error >= ok) => format!(
+            "最近导出失败 {}：{}",
+            stamp(error),
+            telemetry.last_error.as_deref().unwrap_or("未知原因")
+        ),
+        (Some(ok), _) => format!("最近导出成功 {}", stamp(ok)),
+        (None, Some(_)) => unreachable!("上一个分支吃掉了 ok 为空的情形"),
+    };
+    format!("遥测      {endpoint}（{last}）")
 }
 
 fn issues_text(issues: &[ConfigIssue]) -> String {

@@ -70,6 +70,9 @@ pub struct StartOnly {
     /// 监听地址与端口。
     pub listen: String,
     pub db_path: PathBuf,
+    /// `[telemetry] otlp_endpoint`：OTLP/HTTP 端点。`None` = 不上报（docs/observability.md §4）。
+    #[serde(default)]
+    pub otlp_endpoint: Option<String>,
 }
 
 /// 一个 MCP 服务器（`docs/mcp.md`）。凭证不在这里：`env` / `bearer_token_env` 写的是
@@ -710,6 +713,7 @@ mod tests {
                 data_dir: PathBuf::from("/home/u/.komo"),
                 listen: "127.0.0.1:7777".into(),
                 db_path: PathBuf::from("/home/u/.komo/state.db"),
+                otlp_endpoint: None,
             },
             model_catalog: ModelCatalog::default(),
             model: model("chat-a"),

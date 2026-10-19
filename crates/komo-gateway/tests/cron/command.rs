@@ -128,6 +128,39 @@ async fn a_non_zero_exit_delivers_an_error_summary() {
     gw.stop().await;
 }
 
+/// 失败的触发：一个 `komo.cron.firing` span 带 job 与结果，失败计数按 job 记一次；
+/// 指标里没有 Run / 会话 id。
+#[tokio::test]
+async fn a_failed_firing_emits_its_span_and_counts_a_failure() {
+    let capture = komo_runtime::telemetry::capture::Capture::default();
+    let _guard = capture.install();
+    let home = Home::new();
+    let gw = home.start(FakeLlm::new(vec![]) as Arc<dyn LlmClient>).await;
+
+    let job = gw.add_job(command_job("boom", "exit 3")).await;
+    gw.make_due(&job.id).await;
+    let run = gw.tick().await.fired[0].run.clone();
+    gw.wait_state(&run, |s| s.is_terminal(), "终态").await;
+    eventually("失败的触发有了 span 结果", || {
+        capture
+            .spans("komo.cron.firing")
+            .iter()
+            .any(|span| span.fields.get("komo.cron.outcome").map(String::as_str) == Some("error"))
+    })
+    .await;
+
+    let span = &capture.spans("komo.cron.firing")[0];
+    assert_eq!(span.fields["komo.cron.job"], job.id.to_string());
+    let failures = capture.metrics("monotonic_counter.komo.cron.failures");
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].fields["komo.cron.job"], job.id.to_string());
+    for event in capture.all_metrics() {
+        let dump = format!("{:?}", event.fields);
+        assert!(!dump.contains(run.as_str()), "指标里不该有 Run id：{dump}");
+    }
+    gw.stop().await;
+}
+
 /// `komo cron add --command` 与 `--prompt` 二选一：都给或都不给，HTTP 层当场拒绝，
 /// 不创建任何 Job（§10）。
 #[tokio::test]

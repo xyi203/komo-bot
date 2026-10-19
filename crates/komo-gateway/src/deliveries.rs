@@ -7,6 +7,8 @@
 
 use std::sync::Arc;
 
+use tracing::Instrument;
+
 use komo_kernel::traits::{Clock, DeliverError};
 use komo_kernel::types::chat::{
     ChannelPeer, ChannelPlatform, Delivery, DeliveryState, DeliveryTarget, Outbound,
@@ -98,6 +100,7 @@ impl DeliveryLog {
         self.send_recorded_locked(&current).await
     }
 
+    /// 一次投递尝试一个 `komo.delivery` span（只带渠道、第几次、结果，不带正文与 id）。
     async fn send_recorded_locked(
         &self,
         record: &DeliveryRecord,
@@ -105,6 +108,36 @@ impl DeliveryLog {
         if record.state == DeliveryState::Sent {
             return Ok(record.delivery());
         }
+        let channel = record.target.peer.platform.as_str();
+        let span = tracing::info_span!(
+            "komo.delivery",
+            komo.delivery.channel = channel,
+            komo.delivery.attempt = u64::from(record.attempts) + 1,
+            komo.delivery.outcome = tracing::field::Empty,
+        );
+        let unavailable = self.channels.get(record.target.peer.platform).is_none();
+        let result = self.attempt(record).instrument(span.clone()).await;
+        let outcome = match &result {
+            Ok(delivery) if delivery.state == DeliveryState::Sent => "sent",
+            Ok(_) if unavailable => "unavailable",
+            Ok(_) => "deferred",
+            Err(_) => "error",
+        };
+        span.record("komo.delivery.outcome", outcome);
+        if matches!(outcome, "error" | "unavailable") {
+            tracing::event!(
+                target: "komo::metrics",
+                tracing::Level::DEBUG,
+                {
+                monotonic_counter.komo.delivery.failures = 1u64,
+                komo.delivery.channel = channel,
+                }
+            );
+        }
+        result
+    }
+
+    async fn attempt(&self, record: &DeliveryRecord) -> Result<Delivery, DeliverError> {
         let platform = record.target.peer.platform;
         let Some(sender) = self.channels.get(platform) else {
             // 渠道此刻不在（没起来、或者被重载停掉了）：留在 pending，下一次冲刷再试。
@@ -232,7 +265,7 @@ impl DeliveryLog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::{ChannelSender, test_channel::MemChannel};
+    use crate::channels::{ChannelSender, SendOutcome, test_channel::MemChannel};
     use komo_kernel::test_support::TestClock;
     use komo_kernel::types::chat::ChannelPlatform;
     use komo_store::test_support::TempStore;
@@ -325,6 +358,83 @@ mod tests {
             "行留着，等渠道回来"
         );
     }
+    struct Refusing;
+
+    #[async_trait::async_trait]
+    impl ChannelSender for Refusing {
+        fn platform(&self) -> ChannelPlatform {
+            ChannelPlatform::Telegram
+        }
+        async fn send(&self, _: &ChannelPeer, _: Outbound) -> Result<SendOutcome, DeliverError> {
+            Err(DeliverError::Rejected("机密正文不该出现".into()))
+        }
+    }
+
+    /// 一次尝试一个 `komo.delivery` span；失败（渠道拒绝、渠道不在）各记一次失败计数，
+    /// 送到了不记；span 与指标里没有 id 与正文。
+    #[tokio::test]
+    async fn each_attempt_has_a_span_and_failures_are_counted_by_channel() {
+        use komo_runtime::telemetry::capture::Capture;
+        let capture = Capture::default();
+        let _guard = capture.install();
+        let store = TempStore::open().await.unwrap();
+        let channel = MemChannel::new(ChannelPlatform::Telegram);
+        let ok = log(&store, &channel).await;
+        ok.deliver(
+            &target(ChannelPlatform::Telegram, "123"),
+            Outbound::Text {
+                text: "好了".into(),
+            },
+        )
+        .await
+        .unwrap();
+        ok.deliver(
+            &target(ChannelPlatform::Feishu, "oc_x"),
+            Outbound::Text { text: "在".into() },
+        )
+        .await
+        .unwrap();
+        let channels = Arc::new(ChannelRegistry::new());
+        channels.register(Arc::new(Refusing));
+        let refusing = DeliveryLog::new(
+            Arc::new(TursoDeliveryRepo::new(store.db().clone())),
+            channels,
+            Arc::new(TestClock::fixed()),
+        );
+        refusing
+            .deliver(
+                &target(ChannelPlatform::Telegram, "123"),
+                Outbound::Text {
+                    text: "秘密".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        let spans = capture.spans("komo.delivery");
+        let outcomes: Vec<_> = spans
+            .iter()
+            .map(|span| span.fields["komo.delivery.outcome"].as_str())
+            .collect();
+        assert_eq!(outcomes, ["sent", "unavailable", "error"]);
+        assert_eq!(spans[0].fields["komo.delivery.channel"], "telegram");
+        assert_eq!(spans[0].fields["komo.delivery.attempt"], "1");
+
+        let failures = capture.metrics("monotonic_counter.komo.delivery.failures");
+        let channels: Vec<_> = failures
+            .iter()
+            .map(|event| event.fields["komo.delivery.channel"].as_str())
+            .collect();
+        assert_eq!(channels, ["feishu", "telegram"]);
+        for event in capture.all_metrics() {
+            assert_eq!(event.fields.len(), 2, "只有计数与渠道：{:?}", event.fields);
+        }
+        for span in &spans {
+            let dump = format!("{:?}", span.fields);
+            assert!(!dump.contains("秘密") && !dump.contains("123"));
+        }
+    }
+
     #[tokio::test]
     async fn recovery_completion_reuses_sent_delivery_after_recreating_log() {
         use komo_kernel::types::ids::{RunId, SessionId};

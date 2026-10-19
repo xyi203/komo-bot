@@ -8,9 +8,11 @@ license.workspace = true
 # §13.4：日常改动落在这里；它从不重新展开 toasty 宏。
 [features]
 # 测试专用的注入口（`executor::TEST_PARK`）：只给 gateway 的集成测试脚手架开，生产构建里没有。
-test-support = ["komo-kernel/test-support"]
+test-support = ["komo-kernel/test-support", "dep:tracing-subscriber"]
 
 [dependencies]
+# 只在 test-support 下：telemetry::capture 让 gateway 的测试也能抓 span 与指标事件。
+tracing-subscriber = { workspace = true, optional = true }
 komo-kernel = { workspace = true }
 komo-store = { workspace = true }
 reqwest = { workspace = true }

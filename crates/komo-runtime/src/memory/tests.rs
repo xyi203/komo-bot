@@ -2736,3 +2736,83 @@ async fn the_judgement_sees_a_shortlist_wider_than_top_k() {
     };
     assert_eq!(criteria.len(), 4, "三条候选 + 一个 none（top_k 只有 1）");
 }
+
+// =========================================================== 埋点
+
+/// 一批一个 `komo.memory.extract` span，带条数；跳过的批记跳过原因与计数，指标里没有 id 与正文。
+#[tokio::test]
+async fn each_batch_emits_one_extract_span_and_skips_are_counted_by_reason() {
+    use crate::telemetry::capture::Capture;
+    let capture = Capture::default();
+    let _guard = capture.install();
+
+    let extraction = r#"{"observations":[{"content":"用户大概更喜欢深色主题",
+        "kind":"preference","scope":"personal","said_by":"model_inference",
+        "evidence":["evt-1"]}]}"#;
+    let harness = HarnessBuilder::new()
+        .script(vec![round(extraction)])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(1, &RunId::from_raw("run-1"), "把界面弄暗一点")],
+    );
+    harness.manager.process_pending(1).await.unwrap();
+
+    let spans = capture.spans("komo.memory.extract");
+    assert_eq!(spans.len(), 1);
+    let fields = &spans[0].fields;
+    assert_eq!(fields["komo.memory.runs"], "1");
+    assert_eq!(fields["komo.memory.returned"], "1");
+    assert_eq!(fields["komo.memory.applied"], "1");
+    assert!(fields["komo.memory.window_chars"].parse::<u64>().unwrap() > 0);
+    assert!(!fields.contains_key("komo.memory.skip_reason"));
+    assert!(
+        capture
+            .metrics("monotonic_counter.komo.memory.extract.skipped")
+            .is_empty()
+    );
+
+    let cancelled = HarnessBuilder::new()
+        .work(vec![work_item(RunState::Cancelled, interactive())])
+        .build()
+        .await;
+    cancelled.manager.process_pending(1).await.unwrap();
+    let spans = capture.spans("komo.memory.extract");
+    assert_eq!(spans.len(), 2);
+    assert_eq!(spans[1].fields["komo.memory.skip_reason"], "cancelled");
+    let skipped = capture.metrics("monotonic_counter.komo.memory.extract.skipped");
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0].fields["komo.memory.skip_reason"], "cancelled");
+    assert_eq!(skipped[0].fields.len(), 2, "只有计数与原因，没有 id");
+}
+
+/// 失败的批：span 的原因是低基数的 `failed`，错误正文不进 span 与指标。
+#[tokio::test]
+async fn a_failed_batch_reports_a_reason_label_not_the_error_text() {
+    use crate::telemetry::capture::Capture;
+    let capture = Capture::default();
+    let _guard = capture.install();
+
+    let harness = HarnessBuilder::new()
+        .script(vec![round("我觉得没什么好记的。")])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(
+            1,
+            &RunId::from_raw("run-1"),
+            "记一下：空调设 26 度",
+        )],
+    );
+    harness.manager.process_pending(1).await.unwrap();
+
+    let spans = capture.spans("komo.memory.extract");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].fields["komo.memory.skip_reason"], "failed");
+    let skipped = capture.metrics("monotonic_counter.komo.memory.extract.skipped");
+    assert_eq!(skipped[0].fields["komo.memory.skip_reason"], "failed");
+}

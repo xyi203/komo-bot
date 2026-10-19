@@ -38,7 +38,17 @@ pub struct Capture(Arc<Mutex<Inner>>);
 impl Capture {
     /// 装成当前线程的默认订阅者；守卫 drop 时撤掉。
     pub fn install(&self) -> tracing::subscriber::DefaultGuard {
-        tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()))
+        // 并行的测试里，别的线程没有订阅者时先登记的调用点会被缓存成"没人要"，本线程的
+        // 捕获层就再也看不到它。给进程装一个什么都不记的全局订阅者（已经有了就算了），
+        // 调用点的兴趣因此始终是"要"，是否真的记由各线程自己的捕获层决定。
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(tracing_subscriber::registry());
+        });
+        let guard =
+            tracing::subscriber::set_default(tracing_subscriber::registry().with(self.clone()));
+        tracing::callsite::rebuild_interest_cache();
+        guard
     }
 
     pub fn spans(&self, name: &str) -> Vec<SpanRec> {

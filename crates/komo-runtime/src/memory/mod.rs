@@ -1006,7 +1006,20 @@ impl MemoryManager {
     /// 一个会话这一批的完整处理，并发一条结构化日志（§9.10「逐会话记录」）。
     async fn process_batch(&self, batch: &MemoryBatch, report: &mut PassReport) {
         let mut record = BatchRecord::default();
-        let result = self.run_batch(batch, report, &mut record).await;
+        let span = tracing::info_span!(
+            "komo.memory.extract",
+            komo.session.kind = batch.kind.as_str(),
+            komo.memory.runs = batch.items.len() as u64,
+            komo.memory.window_chars = tracing::field::Empty,
+            komo.memory.skip_reason = tracing::field::Empty,
+            komo.memory.returned = tracing::field::Empty,
+            komo.memory.applied = tracing::field::Empty,
+        );
+        let result = tracing::Instrument::instrument(
+            self.run_batch(batch, report, &mut record),
+            span.clone(),
+        )
+        .await;
         if let Err(error) = result {
             let permanent = error.is_permanent();
             record.skip_reason = Some(format!("失败：{error}"));
@@ -1041,6 +1054,21 @@ impl MemoryManager {
                         .await;
                 }
             }
+        }
+        // 失败原因带错误正文，只进日志；span 与指标用低基数标签。
+        span.record("komo.memory.window_chars", record.window_chars as u64);
+        span.record("komo.memory.returned", record.observations as u64);
+        span.record("komo.memory.applied", record.applied as u64);
+        if let Some(reason) = skip_label(record.skip_reason.as_deref()) {
+            span.record("komo.memory.skip_reason", reason);
+            tracing::event!(
+                target: "komo::metrics",
+                tracing::Level::DEBUG,
+                {
+                monotonic_counter.komo.memory.extract.skipped = 1u64,
+                komo.memory.skip_reason = reason,
+                }
+            );
         }
         tracing::info!(
             session = %batch.session,
@@ -1491,6 +1519,24 @@ impl MemoryManager {
             .run()
             .await
     }
+}
+
+/// 跳过原因的低基数标签：`skip` 记下的是中文原句，"失败：…"还带着错误正文。
+fn skip_label(reason: Option<&str>) -> Option<&'static str> {
+    let reason = reason?;
+    Some(if reason.starts_with("失败") {
+        "failed"
+    } else if reason == "用户取消的任务" {
+        "cancelled"
+    } else if reason == "后台任务会话" {
+        "task_session"
+    } else if reason == "Cron 触发的 Run" {
+        "cron"
+    } else if reason == "提取结果一条都没通过校验" {
+        "invalid"
+    } else {
+        "no_evidence"
+    })
 }
 
 /// 一批处理里攒下来的账：已经落定的 Run，以及发进逐批日志的那几个数（§9.10）。

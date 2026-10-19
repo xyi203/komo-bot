@@ -182,7 +182,9 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
         .map_err(|error| ServiceError::Store(error.to_string()))?;
 
     // 4. 装配。
-    let (tools, codemode, mcp) = build_tools(&config, &instance_id).await;
+    // 转后台的接手方要等整份状态才造得出来：`bash` 先拿着空槽，`wire_monitors` 再接上。
+    let detach_slot = Arc::new(komo_runtime::tools::detach::DetachSlot::default());
+    let (tools, codemode, mcp) = build_tools(&config, &instance_id, &detach_slot).await;
     let state = GatewayState::assemble(Assembly {
         home: home.clone(),
         config: Arc::clone(&config),
@@ -215,7 +217,7 @@ pub async fn start(options: ServiceOptions) -> Result<Running, ServiceError> {
     // （`docs/background-tasks.md`）。
     state.wire_task_spawner();
     // `monitor` / `monitor_stop` 的接缝，同一个接法（`docs/monitor.md`）。
-    state.wire_monitors();
+    state.wire_monitors(&detach_slot);
     // 窗口探测放后台，不挡 `Gateway 就绪`。
     state.spawn_window_probes();
 
@@ -548,6 +550,7 @@ fn codemode_worker() -> Option<komo_runtime::codemode::Worker> {
 async fn build_tools(
     config: &Arc<ConfigHolder>,
     instance_id: &str,
+    detach_slot: &Arc<komo_runtime::tools::detach::DetachSlot>,
 ) -> (
     Vec<Arc<dyn Tool>>,
     Option<komo_runtime::codemode::Worker>,
@@ -576,7 +579,8 @@ async fn build_tools(
         Arc::new(
             BashTool::new()
                 .registered(registration.clone())
-                .protecting(protected.clone()),
+                .protecting(protected.clone())
+                .detaching(Arc::clone(detach_slot)),
         ),
         // 搜索是**进程内**的（`grep` + `ignore` 书库）：没有外部二进制，也就没有"这台机器
         // 上没装"这一种情况，不需要探测。

@@ -431,6 +431,10 @@ pub struct ExecutionConfig {
     /// 会被收紧到它以内，所以到点时是工具自己杀进程、报超时，而不是执行器丢下一个结果不明。
     #[serde(default = "default_call_timeout_secs")]
     pub call_timeout_secs: u64,
+    /// 对话会话里的 `bash` 跑过这么久还没完，就自动转到后台（`docs/monitor.md` §8）。
+    /// 0 = 不转。任务会话与 Cron 的 Run 不受它管。
+    #[serde(default = "default_detach_after_secs")]
+    pub detach_after_secs: u64,
     /// 投影超过这么多字节的结果，完整给过 `decay_full_sends` 次之后换成首尾摘录（§8.3）。
     /// 0 = 不衰减。
     #[serde(default = "default_decay_threshold_bytes")]
@@ -486,6 +490,12 @@ fn default_call_timeout_secs() -> u64 {
     DEFAULT_CALL_TIMEOUT_SECS
 }
 
+pub const DEFAULT_DETACH_AFTER_SECS: u64 = 120;
+
+fn default_detach_after_secs() -> u64 {
+    DEFAULT_DETACH_AFTER_SECS
+}
+
 fn default_model_result_bytes() -> usize {
     komo_kernel_model_result_bytes()
 }
@@ -500,6 +510,7 @@ impl Default for ExecutionConfig {
         Self {
             model_result_bytes: default_model_result_bytes(),
             call_timeout_secs: DEFAULT_CALL_TIMEOUT_SECS,
+            detach_after_secs: DEFAULT_DETACH_AFTER_SECS,
             decay_threshold_bytes: DEFAULT_DECAY_THRESHOLD_BYTES,
             decay_full_sends: DEFAULT_DECAY_FULL_SENDS,
             decay_head_bytes: DEFAULT_DECAY_HEAD_BYTES,

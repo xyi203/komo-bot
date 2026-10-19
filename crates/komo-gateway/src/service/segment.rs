@@ -33,7 +33,7 @@ use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::fold;
 use komo_kernel::traits::{Clock, Ledger, LedgerError, ToolOutputStore};
 use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
-use komo_kernel::types::plan::ExecutionPlan;
+use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::resource::{ResourceMounts, SkillMount};
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::surface::AgentSurface;
@@ -186,6 +186,29 @@ impl GatewaySegments {
             .map(|config| config.current().execution.call_timeout_secs)
             .unwrap_or(komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS);
         std::time::Duration::from_secs(secs)
+    }
+
+    /// 这是不是对话会话里直接受理的 Run：任务会话、Cron、子 Run 都没有"这条会话等着用户
+    /// 说话"的问题，转后台与禁 sleep 只对前者有意义（`docs/monitor.md` §8）。
+    fn is_conversation(
+        source: &PlanSource,
+        kind: Option<komo_store::models::session::SessionKind>,
+        delegated: bool,
+    ) -> bool {
+        use komo_store::models::session::SessionKind;
+        !delegated
+            && matches!(source, PlanSource::Interactive { .. })
+            && kind.is_some_and(|kind| kind != SessionKind::Task)
+    }
+
+    /// 对话会话里 `bash` 跑多久转后台（`[execution] detach_after_secs`，0 = 不转）。
+    fn detach_after(&self) -> Option<std::time::Duration> {
+        let secs = self
+            .config
+            .as_ref()
+            .map(|config| config.current().execution.detach_after_secs)
+            .unwrap_or(komo_kernel::protocol::config::DEFAULT_DETACH_AFTER_SECS);
+        (secs > 0).then(|| std::time::Duration::from_secs(secs))
     }
 
     /// 这一段能用哪些根。见 [`run_roots`]。
@@ -685,6 +708,11 @@ impl SegmentSource for GatewaySegments {
             covers: None,
         };
 
+        let conversation = Self::is_conversation(
+            &record.source,
+            session_record.as_ref().map(|record| record.kind),
+            delegate.is_some(),
+        );
         let env = CallEnv {
             surface: agent_surface,
             session: session.clone(),
@@ -695,6 +723,8 @@ impl SegmentSource for GatewaySegments {
             mounts,
             projection,
             call_timeout: self.call_timeout(),
+            detach_after: conversation.then(|| self.detach_after()).flatten(),
+            conversation,
             principal: None,
             // 本 Run 是被谁派的（普通 Run 是 None）。runtime 用它硬拦"子代理再委派"。
             delegated: delegate.clone(),
@@ -950,6 +980,30 @@ mod tests {
             ts: time::macros::datetime!(2026-09-16 08:00:00 UTC),
             payload,
         }
+    }
+
+    /// 转后台与禁 sleep 只管对话会话里直接受理的 Run：任务会话、Cron、子 Run 都不算。
+    #[test]
+    fn only_a_conversation_run_counts_as_a_conversation() {
+        use komo_store::models::session::SessionKind;
+        let session = SessionId::from_raw("sess-1");
+        let interactive = PlanSource::Interactive {
+            session: session.clone(),
+        };
+        let cron = PlanSource::Cron {
+            job: komo_kernel::types::ids::CronJobId::from_raw("job-1"),
+            job_version: 1,
+        };
+        let is = GatewaySegments::is_conversation;
+        assert!(is(&interactive, Some(SessionKind::Normal), false));
+        assert!(is(&interactive, Some(SessionKind::Main), false));
+        assert!(
+            !is(&interactive, Some(SessionKind::Task), false),
+            "任务会话"
+        );
+        assert!(!is(&cron, Some(SessionKind::Main), false), "Cron 的 Run");
+        assert!(!is(&interactive, Some(SessionKind::Normal), true), "子 Run");
+        assert!(!is(&interactive, None, false));
     }
 
     fn payloads() -> PayloadStore {

@@ -1730,6 +1730,33 @@ fn a_task_result_input_cannot_be_cited_as_a_user_statement() {
     assert!(observations.is_empty(), "{observations:?}");
 }
 
+/// 监听事件、监听结束、转后台命令的结束同样是系统交回，不是用户原话。
+#[test]
+fn monitor_and_background_command_inputs_cannot_be_cited_as_user_statements() {
+    for key in ["monitor:m1:1", "monitor-end:m1", "bash-done:call-7"] {
+        let run = RunId::from_raw("run-1");
+        let mut returned = user_event(2, &run, "[后台命令 #3f2a「cargo build」结束] 退出码 0");
+        if let EventPayload::RunAccepted(body) = &mut returned.payload {
+            body.request_key = RequestKey::new(key);
+        }
+        let events = vec![user_event(1, &run, "帮我编译"), returned];
+        let transcript = transcript(&events);
+        assert!(
+            transcript.rendered.contains("任务交回"),
+            "{key}: {}",
+            transcript.rendered
+        );
+
+        let raw: Vec<RawObservation> = serde_json::from_str(
+            r#"[{"content":"cargo build 退出码 0","kind":"fact","scope":"personal",
+                 "said_by":"user_statement","evidence":["evt-2"]}]"#,
+        )
+        .unwrap();
+        let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
+        assert!(observations.is_empty(), "{key}: {observations:?}");
+    }
+}
+
 /// 写库路径全测：一条用户原话落 `active + user_statement + unconfirmed`，带着证据。
 #[tokio::test]
 async fn a_user_statement_lands_active_and_unconfirmed_with_its_evidence() {

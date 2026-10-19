@@ -157,6 +157,12 @@ pub struct ToolContext {
     /// 活动执行时限（`[execution] call_timeout_secs`）。自带超时的工具把自己的超时收紧到
     /// 它以内：执行器的兜底只在工具不守时限时才触发，而那一刻只能报"结果不明"。
     pub call_timeout: std::time::Duration,
+    /// 跑过这么久还没完就把这次调用转到后台（`[execution] detach_after_secs`）。`None` =
+    /// 不转：任务会话、Cron 的 Run、子 Run、codemode 里的内层调用，或配置为 0。
+    pub detach_after: Option<std::time::Duration>,
+    /// 这是对话会话里直接受理的 Run（不是任务会话、Cron、子 Run）。`bash` 在这里拒绝
+    /// 10 秒以上的 `sleep`——等状态是 `monitor` 的事。
+    pub conversation: bool,
 }
 
 /// 这次执行是在接一次没有收尾的调用（§8.4、§8.6）。
@@ -233,6 +239,8 @@ mod tests {
             },
             cwd: PathBuf::from("/home/u/ws"),
             call_timeout: std::time::Duration::from_secs(60),
+            detach_after: None,
+            conversation: false,
             mounts: ResourceMounts::default(),
             roots: vec![
                 WorkspaceRoot {

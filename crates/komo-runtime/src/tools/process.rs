@@ -107,7 +107,7 @@ impl Excerpt {
         }
     }
 
-    fn into_string(self) -> String {
+    fn to_string_lossy(&self) -> String {
         let head = String::from_utf8_lossy(&self.head);
         let tail = String::from_utf8_lossy(&self.tail);
         let omitted = self.total - self.head.len() - self.tail.len();
@@ -117,6 +117,10 @@ impl Excerpt {
             format!("{head}\n…（中间省略 {omitted} 字节）…\n{tail}")
         }
     }
+
+    fn into_string(self) -> String {
+        self.to_string_lossy()
+    }
 }
 
 /// 起进程、流式收输出、按需终止进程组。
@@ -125,6 +129,64 @@ pub async fn run_child(
     sink: &mut dyn OutputWriter,
     cancel: &CancelToken,
 ) -> Result<ChildOutcome, ProcessError> {
+    match run_child_detachable(spec, sink, cancel, None).await? {
+        Driven::Done(outcome) => Ok(outcome),
+        Driven::Detached(_) => unreachable!("没有给 detach_after 就不会转后台"),
+    }
+}
+
+/// 一个跑着、已脱离原调用的子进程：管道、进程组、已经收到的字节数与摘录、从调用起点算
+/// 的截止时刻，都带着，由接手的一方（Gateway）用 [`drive`] 接着收。
+#[derive(Debug)]
+pub struct LiveChild {
+    child: tokio::process::Child,
+    pub pgid: u32,
+    /// 进程起来的时刻，给 pid 复用核对用（与在册登记同一个事实）。
+    pub started_at: time::OffsetDateTime,
+    stdout: Option<tokio::process::ChildStdout>,
+    stderr: Option<tokio::process::ChildStderr>,
+    outcome: ChildOutcome,
+    stdout_excerpt: Excerpt,
+    stderr_excerpt: Excerpt,
+    exit_status: Option<std::process::ExitStatus>,
+    /// 从**调用开始**算的截止（转后台不重置时限）。
+    pub deadline: tokio::time::Instant,
+    output_limit: u64,
+    /// 执行器那一份在册；转后台时销掉，由接手的一方登记自己的（`docs/monitor.md` §8）。
+    forget: Option<ForgetOnDrop>,
+}
+
+impl LiveChild {
+    /// 到目前为止收到的输出摘录与字节数，给"已转后台"的结果用。
+    pub fn so_far(&self) -> (u64, u64, String, String) {
+        (
+            self.outcome.stdout_bytes,
+            self.outcome.stderr_bytes,
+            self.stdout_excerpt.to_string_lossy(),
+            self.stderr_excerpt.to_string_lossy(),
+        )
+    }
+
+    /// 终止整个进程组并等回收。接手失败、不再需要它时用。
+    pub async fn terminate(mut self) {
+        reap(&mut self.child, self.pgid).await;
+    }
+}
+
+/// [`run_child_detachable`] 的两种结局。
+#[derive(Debug)]
+pub enum Driven {
+    Done(ChildOutcome),
+    Detached(Box<LiveChild>),
+}
+
+/// 与 [`run_child`] 一样，但 `detach_after` 到点进程还在跑就**不杀它**：连同管道交出去。
+pub async fn run_child_detachable(
+    spec: ChildSpec,
+    sink: &mut dyn OutputWriter,
+    cancel: &CancelToken,
+    detach_after: Option<Duration>,
+) -> Result<Driven, ProcessError> {
     let mut command = Command::new(&spec.program);
     command
         .args(&spec.args)
@@ -153,6 +215,7 @@ pub async fn run_child(
     let pgid = child
         .id()
         .ok_or_else(|| ProcessError::Spawn("子进程没有 pid".into()))?;
+    let started_at = time::OffsetDateTime::now_utc();
 
     // 在册：留下 pid、进程组与起来的时刻。`started_at` 走真实时钟——它是给 pid 复用
     // 核对用的事实，不是一个判决输入。登记失败只是少了一条恢复线索，不该让命令跑不起来。
@@ -162,7 +225,7 @@ pub async fn run_child(
             ChildProcess {
                 pid: pgid,
                 pgid: Some(pgid),
-                started_at: Some(time::OffsetDateTime::now_utc()),
+                started_at: Some(started_at),
                 what: spec.label.clone(),
             },
         )
@@ -170,21 +233,53 @@ pub async fn run_child(
         tracing::warn!(pid = pgid, %error, "子进程登记写不进去");
     }
     // 无论怎么收尾都要销号：正常退出、超时、取消、读输出出错，都从这个函数出去。
-    let _forget = ForgetOnDrop {
+    let forget = ForgetOnDrop {
         registration: spec.register.clone(),
         pid: pgid,
     };
 
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
-    let mut outcome = ChildOutcome::default();
-    let mut stdout_excerpt = Excerpt::default();
-    let mut stderr_excerpt = Excerpt::default();
+    let now = tokio::time::Instant::now();
+    let live = LiveChild {
+        stdout: child.stdout.take(),
+        stderr: child.stderr.take(),
+        child,
+        pgid,
+        started_at,
+        outcome: ChildOutcome::default(),
+        stdout_excerpt: Excerpt::default(),
+        stderr_excerpt: Excerpt::default(),
+        exit_status: None,
+        deadline: now + spec.timeout,
+        output_limit: spec.output_limit,
+        forget: Some(forget),
+    };
+    drive(live, sink, cancel, detach_after.map(|after| now + after)).await
+}
+
+/// 接着收一个 [`LiveChild`] 的输出直到它收尾（或，给了 `detach_at` 时，到点交出去）。
+pub async fn drive(
+    live: LiveChild,
+    sink: &mut dyn OutputWriter,
+    cancel: &CancelToken,
+    detach_at: Option<tokio::time::Instant>,
+) -> Result<Driven, ProcessError> {
+    let LiveChild {
+        mut child,
+        pgid,
+        started_at,
+        mut stdout,
+        mut stderr,
+        mut outcome,
+        mut stdout_excerpt,
+        mut stderr_excerpt,
+        mut exit_status,
+        deadline,
+        output_limit,
+        forget,
+    } = live;
     let mut stdout_buf = vec![0u8; 8192];
     let mut stderr_buf = vec![0u8; 8192];
-
-    let deadline = tokio::time::Instant::now() + spec.timeout;
-    let mut exit_status = None;
+    let mut detached = false;
 
     loop {
         if cancel.is_cancelled() {
@@ -208,6 +303,10 @@ pub async fn run_child(
                 outcome.timed_out = true;
                 break;
             }
+            () = async { tokio::time::sleep_until(detach_at.expect("已判断")).await }, if detach_at.is_some() => {
+                detached = true;
+                break;
+            }
             read = async {
                 stdout.as_mut().expect("已判断打开").read(&mut stdout_buf).await
             }, if out_open => {
@@ -216,7 +315,7 @@ pub async fn run_child(
                     Ok(n) => {
                         outcome.stdout_bytes += n as u64;
                         stdout_excerpt.push(&stdout_buf[..n]);
-                        forward(sink, &spec, &mut outcome, &stdout_buf[..n], true).await?;
+                        forward(sink, output_limit, &mut outcome, &stdout_buf[..n], true).await?;
                     }
                 }
             }
@@ -228,7 +327,7 @@ pub async fn run_child(
                     Ok(n) => {
                         outcome.stderr_bytes += n as u64;
                         stderr_excerpt.push(&stderr_buf[..n]);
-                        forward(sink, &spec, &mut outcome, &stderr_buf[..n], false).await?;
+                        forward(sink, output_limit, &mut outcome, &stderr_buf[..n], false).await?;
                     }
                 }
             }
@@ -239,16 +338,28 @@ pub async fn run_child(
         }
     }
 
+    if detached {
+        // 执行器那一份在册销掉（`forget` 在这里落地）；接手的一方登记自己的。
+        drop(forget);
+        return Ok(Driven::Detached(Box::new(LiveChild {
+            child,
+            pgid,
+            started_at,
+            stdout,
+            stderr,
+            outcome,
+            stdout_excerpt,
+            stderr_excerpt,
+            exit_status,
+            deadline,
+            output_limit,
+            forget: None,
+        })));
+    }
+
     if outcome.cancelled || outcome.timed_out {
         // **终止进程组并等待回收**：丢掉 handle 不等于进程结束。
-        kill_process_group(pgid, "TERM").await;
-        if tokio::time::timeout(REAP_TIMEOUT, child.wait())
-            .await
-            .is_err()
-        {
-            kill_process_group(pgid, "KILL").await;
-            let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
-        }
+        reap(&mut child, pgid).await;
     } else if exit_status.is_none() {
         exit_status = Some(
             child
@@ -261,21 +372,33 @@ pub async fn run_child(
     outcome.exit_code = exit_status.and_then(|status| status.code());
     outcome.stdout_excerpt = stdout_excerpt.into_string();
     outcome.stderr_excerpt = stderr_excerpt.into_string();
-    Ok(outcome)
+    drop(forget);
+    Ok(Driven::Done(outcome))
+}
+
+async fn reap(child: &mut tokio::process::Child, pgid: u32) {
+    kill_process_group(pgid, "TERM").await;
+    if tokio::time::timeout(REAP_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        kill_process_group(pgid, "KILL").await;
+        let _ = tokio::time::timeout(REAP_TIMEOUT, child.wait()).await;
+    }
 }
 
 async fn forward(
     sink: &mut dyn OutputWriter,
-    spec: &ChildSpec,
+    output_limit: u64,
     outcome: &mut ChildOutcome,
     chunk: &[u8],
     is_stdout: bool,
 ) -> Result<(), ProcessError> {
-    if sink.bytes_written() >= spec.output_limit {
+    if sink.bytes_written() >= output_limit {
         outcome.truncated = true;
         return Ok(());
     }
-    let room = (spec.output_limit - sink.bytes_written()) as usize;
+    let room = (output_limit - sink.bytes_written()) as usize;
     let slice = if chunk.len() > room {
         outcome.truncated = true;
         &chunk[..room]
@@ -291,6 +414,7 @@ async fn forward(
 }
 
 /// 收尾时把在册的那一行销掉。放在守卫里是因为 `run_child` 有好几条出口。
+#[derive(Debug)]
 struct ForgetOnDrop {
     registration: Option<ChildRegistration>,
     pid: u32,

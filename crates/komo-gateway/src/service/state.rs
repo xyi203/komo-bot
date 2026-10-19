@@ -696,7 +696,7 @@ impl GatewayState {
 
     /// 接上监听的实现（`docs/monitor.md`），与 [`Self::wire_task_spawner`] 同一个接法。
     /// 脚本按 `bash` 的规矩起：数据目录只读挂载的名单与 `bash` 工具同一份。
-    pub fn wire_monitors(self: &Arc<Self>) {
+    pub fn wire_monitors(self: &Arc<Self>, detach: &komo_runtime::tools::detach::DetachSlot) {
         let snapshot = self.snapshot();
         let shell =
             komo_runtime::tools::BashTool::new().protecting(protected_paths(&snapshot, &self.home));
@@ -709,6 +709,7 @@ impl GatewayState {
             tracing::warn!("监听已经接过一次，忽略这次重复设置");
             return;
         }
+        detach.set(Arc::clone(&monitors) as Arc<dyn komo_runtime::tools::detach::Detacher>);
         self.tool_executor
             .set_monitors(monitors as Arc<dyn komo_kernel::traits::Monitors>);
     }

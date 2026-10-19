@@ -208,6 +208,8 @@ impl Harness {
             resumed: None,
             cancel: CancelToken::new(),
             call_timeout: env.call_timeout,
+            detach_after: None,
+            conversation: false,
         }
     }
 
@@ -240,6 +242,8 @@ impl Harness {
             call_timeout: std::time::Duration::from_secs(
                 komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS,
             ),
+            detach_after: None,
+            conversation: false,
             principal: None,
             cancel,
             model: sample_model(),

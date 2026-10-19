@@ -41,6 +41,8 @@ use tokio::time::Instant;
 
 use super::state::GatewayState;
 
+mod detached;
+
 /// 第一行出来之后再等这么久，把连着出的行合进同一条事件。
 const BATCH_QUIET: Duration = Duration::from_secs(1);
 /// 泵看一眼"能不能交下一条"的间隔。
@@ -74,6 +76,9 @@ struct Record {
     /// 2026-10-14 之前的登记没有这一格：一律按"不重挂"收。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resume: Option<Resume>,
+    /// 转到后台的 `bash` 命令（`docs/monitor.md` §8）；监听没有这一格。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detached: Option<detached::DetachedInfo>,
 }
 
 /// 重挂一个监听要的东西：模型挂它时声明了 `resume_after_restart` 才有。
@@ -251,6 +256,11 @@ impl GatewayMonitors {
                 let _ = std::fs::remove_file(&path);
                 continue;
             };
+            if let Some(info) = &record.detached {
+                let text = Self::interrupted_text(&record, info);
+                self.report_end(&record, text).await;
+                continue;
+            }
             if let Some(resume) = record.resume.clone() {
                 let left = resume.expires_at - self.state.clock.now();
                 match u64::try_from(left.whole_seconds()) {
@@ -297,7 +307,10 @@ impl GatewayMonitors {
     /// 给上一代留下、这一代不再接着跑的监听交回一条结束消息，并销号。
     async fn report_end(&self, record: &Record, text: String) {
         let peer = record.peer.as_deref().and_then(ChannelPeer::parse);
-        let key = RequestKey::new(format!("monitor-end:{}", record.id));
+        let key = match &record.detached {
+            Some(info) => detached::end_key(&info.call),
+            None => RequestKey::new(format!("monitor-end:{}", record.id)),
+        };
         if let Err(error) = self
             .state
             .submit(&record.session, key, text, peer, None)
@@ -606,6 +619,7 @@ impl Monitors for GatewayMonitors {
             command: spec.command.clone(),
             peer: peer_raw,
             resume: spec.resume_after_restart.then(|| resume.clone()),
+            detached: None,
         };
         tracing::info!(monitor = %id, %session, title = %spec.title, resume = spec.resume_after_restart, "挂上监听");
         self.launch(

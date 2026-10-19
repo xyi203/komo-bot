@@ -77,7 +77,7 @@ run.completed 在 JSONL 持久保存后，state.db 提交终态与 memory_work =
 
 runs 中记录 pending / processing / done / error 与处理游标。进程崩溃后可重新领取，重复处理相同来源不重复新增；索引失败独立重试，不撤销已经保存的记忆正文。
 
-提取来源限定为新发生的用户陈述和可验证工具结果；已有记忆注入、助手摘要、模型生成报告和维护任务自己的输出不算新的独立证据。取消、失败或结果未知的动作不能整理成成功经验。Cron 触发的 Run 与后台任务会话（`kind = task`）不提取（§9.10）：它们的输出是任务自己的报告，不是用户说的话。任务交回 home 的结果（请求键 `task-result:`）在会话窗口里标为「任务交回」，不能被引为证据。
+提取来源限定为新发生的用户陈述和可验证工具结果；已有记忆注入、助手摘要、模型生成报告和维护任务自己的输出不算新的独立证据。取消、失败或结果未知的动作不能整理成成功经验。Cron 触发的 Run 与后台任务会话（`kind = task`）不提取（§9.10）：它们的输出是任务自己的报告，不是用户说的话。系统交回会话的内容（请求键 `task-result:`、`monitor:`、`monitor-end:`、`bash-done:`）在会话窗口里标为「任务交回」，不能被引为证据。
 
 记忆只收翻不到的东西。工作目录里的文档、源码、配置、skill 说明和命令帮助随时能重读，而且比记忆新，原样摘录不入库；值得记的是用户的偏好、约定与背景，排查或试错后才得出的结论，以及文档没写的坑。为让记忆模型分得清，会话窗口里每个工具结果都标出产生它的调用（工具名与截到 200 字的参数）。一批（一个会话空闲后的全部 Run，一次调用）最多收 `[memory].max_observations` 条，初值 8（提示词 `memory-extract/v5`，2026-10-19 起；v3 为每 Run 5 条，v2 为 12 条且窗口不带调用）。窗口超过 24 000 字符时用户输入行一行不丢，从最旧的工具结果删起，再删最旧的助手行；用户行自己就超预算时按 Run 边界切成几段，每段一次调用、各自推进游标。
 
@@ -291,7 +291,7 @@ Rust 侧不变的三道：逐字相同先合并（`find_by_content`），`Transc
 
 **窗口：用户输入一行不丢。** 现在窗口超过 `MAX_TRANSCRIPT_CHARS`（24 000 字符）时只留尾部（`extract.rs` 的 `Transcript::build`），长 Run 里用户最初的请求会被截掉——而用户陈述是 `user_statement` 唯一的来源。按本机日志估算，426 个 Run 里约 48 个超限。改成：用户输入行全部保留，从最旧的工具结果开始删。一批仍超预算时按 Run 边界切成几段，每段一次调用——"一次"是常态，不是保证。
 
-**交回的结果不是用户原话（现有缺口，一并修）。** 任务结果以请求键 `task-result:{run}` 的 `run.accepted` 交回 home（`service/tasks.rs` 的 `report_to_parent`），而 `Transcript::build` 把所有 `run.accepted` 都渲染成"用户"——模型把它标成 `user_statement` 时校验也会放行，任务 agent 写的摘要就以用户原话入库。§9.3 写明助手摘要不算独立证据。改成：这类输入渲染为"任务交回"，不能被 evidence 引用。
+**交回的结果不是用户原话（现有缺口，一并修）。** 任务结果以请求键 `task-result:{run}` 的 `run.accepted` 交回 home（`service/tasks.rs` 的 `report_to_parent`），而 `Transcript::build` 把所有 `run.accepted` 都渲染成"用户"——模型把它标成 `user_statement` 时校验也会放行，任务 agent 写的摘要就以用户原话入库。§9.3 写明助手摘要不算独立证据。改成：这类输入渲染为"任务交回"，不能被 evidence 引用。监听事件与结束（`monitor:` / `monitor-end:`）、转后台命令的结束（`bash-done:`）同样是系统交回的内容，同一处理（2026-10-19）。
 
 **逐会话记录。** 每批处理完发一个 `komo.memory.extract` span（[`observability.md`](observability.md) §3），同一份 tracing 埋点也写进文件日志：会话 id、`kind`、Run 数、窗口字符数、跳过原因、模型交回几条、落库几条。现在只有每拍的合计，分不出哪类会话总是空的；"一问一答"这类会话要不要加进跳过规则，等这份日志攒出数据再定。
 
@@ -305,7 +305,7 @@ Rust 侧不变的三道：逐字相同先合并（`find_by_content`），`Transc
 - 关系编号映射回正确的 `MemoryId`；越权关系照 `Plan::authorize` 降级。
 - 窗口超限时用户输入行全部保留。
 - 超预算的批按 Run 边界切成多次调用，每个 Run 的游标各自推进。
-- 请求键 `task-result:` 的输入不能被引为 `user_statement`。
+- 请求键 `task-result:`、`monitor:`、`monitor-end:`、`bash-done:` 的输入（任务结果、监听事件与结束、转后台命令的结束）不能被引为 `user_statement`。
 
 ---
 

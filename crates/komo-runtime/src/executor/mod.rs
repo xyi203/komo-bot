@@ -131,6 +131,11 @@ pub struct CallEnv {
     pub projection: ProjectionContext,
     /// 单次调用的活动执行时限（§6，`[execution] call_timeout_secs`）。同上，按快照热生效。
     pub call_timeout: Duration,
+    /// 对话会话里的 `bash` 跑多久转后台（`[execution] detach_after_secs`）。`None` = 不转：
+    /// 任务会话、Cron、子 Run、配置为 0。Gateway 按当前快照填。
+    pub detach_after: Option<Duration>,
+    /// 对话会话里直接受理的 Run：`bash` 拒绝 10 秒以上的 `sleep`。
+    pub conversation: bool,
     pub principal: Option<Principal>,
     pub cancel: CancelToken,
     /// 本次 Run 固定的模型快照。委派受理子 Run 时要它：子代理不是另一个模型角色，
@@ -1769,6 +1774,8 @@ impl ToolExecutor {
             resumed: request.resumed.clone(),
             cancel: env.cancel.clone(),
             call_timeout: env.call_timeout,
+            detach_after: env.detach_after,
+            conversation: env.conversation,
         }
     }
 }

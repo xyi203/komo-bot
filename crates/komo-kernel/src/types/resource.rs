@@ -63,6 +63,9 @@ impl ToolPart {
 pub enum OutputFile {
     Stdout,
     Stderr,
+    /// 命令转后台之后继续写的输出（stdout 与 stderr 按到达顺序混写）；转后台之前的
+    /// 部分在 `Stdout` / `Stderr` 里，它们发布时已按哈希封口，不能再追加。
+    Background,
     /// 落盘的那份 `output.json`（完整结果，投影出来的正文就是它的一个窗口）。
     Result,
 }
@@ -72,6 +75,7 @@ impl OutputFile {
         match self {
             Self::Stdout => "stdout",
             Self::Stderr => "stderr",
+            Self::Background => "background",
             Self::Result => "result",
         }
     }
@@ -81,6 +85,7 @@ impl OutputFile {
         match self {
             Self::Stdout => "stdout.txt",
             Self::Stderr => "stderr.txt",
+            Self::Background => "background.log",
             Self::Result => "output.json",
         }
     }
@@ -89,6 +94,7 @@ impl OutputFile {
         match raw {
             "stdout" => Some(Self::Stdout),
             "stderr" => Some(Self::Stderr),
+            "background" => Some(Self::Background),
             "result" => Some(Self::Result),
             _ => None,
         }
@@ -114,7 +120,7 @@ pub enum ResourceUri {
     ArtifactFile { path: String },
     /// `artifact://files`：产物根。
     ArtifactRoot,
-    /// `artifact://<run>/<call>/<attempt>/<stdout|stderr|result>`：工具输出。
+    /// `artifact://<run>/<call>/<attempt>/<stdout|stderr|background|result>`：工具输出。
     Output {
         run: RunId,
         call: ToolCallId,
@@ -271,7 +277,7 @@ fn parse_artifact(segments: Vec<&str>, raw: &str) -> Result<ResourceUri, UriErro
             })
         }
         [first, ..] if *first != ARTIFACT_FILES => Err(UriError::UnknownPart(format!(
-            "{raw}：`artifact://` 底下要么是 `files/<路径>`，要么是 `<run>/<call>/<attempt>/<stdout|stderr|result>`"
+            "{raw}：`artifact://` 底下要么是 `files/<路径>`，要么是 `<run>/<call>/<attempt>/<stdout|stderr|background|result>`"
         ))),
         _ => Err(UriError::UnknownPart(raw.to_string())),
     }

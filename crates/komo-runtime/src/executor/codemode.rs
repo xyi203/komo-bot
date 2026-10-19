@@ -324,6 +324,8 @@ impl ToolExecutor {
         child_ctx.call = attempt.call.clone();
         child_ctx.attempt = attempt.attempt.clone();
         child_ctx.resumed = None;
+        // 脚本等着内层调用的结果往下走：转后台只对模型直接发的调用有意义。
+        child_ctx.detach_after = None;
         let intent: Intent = match child.as_ref().and_then(|c| c.intent.as_ref()) {
             Some(reference) => {
                 let intent: Intent = self.codemode_open(reference).await?;

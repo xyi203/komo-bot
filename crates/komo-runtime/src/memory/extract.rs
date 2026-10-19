@@ -153,7 +153,8 @@ pub struct Transcript {
 enum Role {
     /// 用户陈述。
     User,
-    /// 任务交回 home 的结果（请求键 `task-result:`）。**不是用户说的话**，也不能当证据。
+    /// 系统交回会话的内容：任务结果（`task-result:`）、监听事件与结束（`monitor:` /
+    /// `monitor-end:`）、转后台命令的结束（`bash-done:`）。**不是用户说的话**，也不能当证据。
     TaskResult,
     /// 可验证的工具结果。
     Tool,
@@ -173,8 +174,8 @@ impl Line {
     }
 }
 
-/// 任务结果交回 home 时 `run.accepted` 的请求键前缀（`service/tasks.rs`）。
-const TASK_RESULT_KEY_PREFIX: &str = "task-result:";
+/// 系统交回内容时 `run.accepted` 的请求键前缀（`service/tasks.rs`、`service/monitors.rs`）。
+const HANDBACK_KEY_PREFIXES: [&str; 4] = ["task-result:", "monitor:", "monitor-end:", "bash-done:"];
 
 impl Transcript {
     /// 把一批 Run 的事件按 seq 顺序渲染成一个窗口。每个 Run 的 `cursor` 之前的不再算新
@@ -206,10 +207,9 @@ impl Transcript {
             let fresh = event.seq > window.cursor;
             let (role, body) = match &event.payload {
                 EventPayload::RunAccepted(body) => (
-                    if body
-                        .request_key
-                        .as_str()
-                        .starts_with(TASK_RESULT_KEY_PREFIX)
+                    if HANDBACK_KEY_PREFIXES
+                        .iter()
+                        .any(|prefix| body.request_key.as_str().starts_with(prefix))
                     {
                         Role::TaskResult
                     } else {
@@ -757,7 +757,7 @@ const SYSTEM_PROMPT: &str = "\
 
 规则：
 1. 每条都必须在 evidence 里引至少一个**用户**或**工具结果**事件的 ID，原样照抄方括号里\
-那个 ID。引不出来就不要提这一条。标成「任务交回」的是后台任务交回的结果摘要，**不是用户说的\
+那个 ID。引不出来就不要提这一条。标成「任务交回」的是后台任务、监听或后台命令交回的内容，**不是用户说的\
 话**，不能引用它，也不能把它当成 user_statement。
 2. said_by 如实说：用户原话是 user_statement，工具结果是 tool_observation，你自己从中\
 推断出来的是 model_inference。不要把推断说成用户原话。

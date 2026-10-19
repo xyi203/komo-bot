@@ -187,6 +187,7 @@ fn parse_idle_secs(raw: &str) -> Option<u64> {
 pub(super) struct ExecutionSection {
     pub model_result_bytes: Option<usize>,
     pub call_timeout_secs: Option<u64>,
+    pub detach_after_secs: Option<u64>,
     pub decay_threshold_bytes: Option<usize>,
     pub decay_full_sends: Option<u32>,
     pub decay_head_bytes: Option<usize>,
@@ -199,6 +200,7 @@ impl ExecutionSection {
         ExecutionConfig {
             model_result_bytes: self.model_result_bytes.unwrap_or(base.model_result_bytes),
             call_timeout_secs: self.call_timeout_secs.unwrap_or(base.call_timeout_secs),
+            detach_after_secs: self.detach_after_secs.unwrap_or(base.detach_after_secs),
             decay_threshold_bytes: self
                 .decay_threshold_bytes
                 .unwrap_or(base.decay_threshold_bytes),

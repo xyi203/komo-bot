@@ -19,8 +19,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use komo_kernel::traits::{Ledger, LedgerError, RunQueue, StoreError};
 use komo_kernel::types::ids::{ExecutorId, InterventionId};
+use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::status::{Claimed, WaitReason};
 use komo_kernel::types::tool::{CancelToken, ToolDefinition};
+use tracing::Instrument;
 
 use crate::executor::{ExecError, ToolExecutor};
 use crate::scheduler::{HandlerError, RunHandler};
@@ -210,7 +212,23 @@ impl AgentRunHandler {
 #[async_trait]
 impl RunHandler for AgentRunHandler {
     async fn run(&self, claimed: Claimed) -> Result<(), HandlerError> {
-        match self.attempt(&claimed).await {
+        // 一次领取 = 一个 Run 段 = 一个 `invoke_agent` span（`docs/observability.md` §3.1）。
+        // Run 可以挂起、跨重启恢复，span 活不过进程，所以用 `komo.run.id` 把几段串起来。
+        let span = tracing::info_span!(
+            "invoke_agent",
+            gen_ai.operation.name = "invoke_agent",
+            gen_ai.agent.name = tracing::field::Empty,
+            gen_ai.conversation.id = tracing::field::Empty,
+            komo.run.id = %claimed.run,
+            komo.run.source = tracing::field::Empty,
+            komo.session.kind = tracing::field::Empty,
+            komo.run.outcome = tracing::field::Empty,
+        );
+        let attempted = self.attempt(&claimed).instrument(span.clone()).await;
+        if attempted.is_err() {
+            span.record("komo.run.outcome", "error");
+        }
+        match attempted {
             Ok(()) => Ok(()),
             // 「JSONL 已提交范围缺失或中间损坏时停止受影响会话的自动执行」（§8.3、
             // §8.5）。停止的做法有两半，缺一不可：**账本上说清楚**（`waiting +
@@ -243,6 +261,69 @@ impl RunHandler for AgentRunHandler {
     }
 }
 
+/// 一个 Run 段的标签：记到 `invoke_agent` span 上，也是 Run 指标的维度（低基数，不含 id）。
+struct RunLabels {
+    source: &'static str,
+    session_kind: &'static str,
+}
+
+impl RunLabels {
+    fn of(segment: &Segment) -> Self {
+        let span = tracing::Span::current();
+        span.record("gen_ai.conversation.id", segment.session.to_string());
+        if let Some(agent) = &segment.telemetry.agent {
+            span.record("gen_ai.agent.name", agent.as_str());
+        }
+        let source = match &segment.env.source {
+            PlanSource::Interactive { .. } => "interactive",
+            PlanSource::Cron { .. } => "cron",
+            PlanSource::Memory { .. } => "memory",
+            PlanSource::Verification { .. } => "verification",
+        };
+        span.record("komo.run.source", source);
+        let session_kind = segment.telemetry.session_kind.unwrap_or("unknown");
+        span.record("komo.session.kind", session_kind);
+        RunLabels {
+            source,
+            session_kind,
+        }
+    }
+
+    /// 这一段收尾：outcome 记到 span 上，并发 Run 耗时与轮数指标。`earlier` 是同一次领取里
+    /// 之前几段（压缩、插话后重新装配）已经跑过的轮数。
+    fn finish(&self, outcome: &SegmentOutcome, earlier: u32, elapsed: Duration) {
+        let (word, rounds) = match outcome {
+            SegmentOutcome::Completed { rounds, .. } => ("completed", *rounds),
+            SegmentOutcome::Suspended { rounds, .. } => ("suspended", *rounds),
+            SegmentOutcome::Failed { rounds, .. } => ("failed", *rounds),
+            SegmentOutcome::Cancelled { rounds } => ("cancelled", *rounds),
+            SegmentOutcome::Recompose { rounds, .. }
+            | SegmentOutcome::Interjected { rounds, .. } => ("continued", *rounds),
+        };
+        tracing::Span::current().record("komo.run.outcome", word);
+        tracing::event!(
+            target: "komo::metrics",
+            tracing::Level::DEBUG,
+            {
+            histogram.komo.run.duration = elapsed.as_secs_f64(),
+            komo.run.outcome = word,
+            komo.run.source = self.source,
+            komo.session.kind = self.session_kind,
+            }
+        );
+        tracing::event!(
+            target: "komo::metrics",
+            tracing::Level::DEBUG,
+            {
+            histogram.komo.run.rounds = u64::from(earlier + rounds),
+            komo.run.outcome = word,
+            komo.run.source = self.source,
+            komo.session.kind = self.session_kind,
+            }
+        );
+    }
+}
+
 /// 损坏：读不出来的东西下一次照样读不出来。
 fn is_corrupt(error: &HandlerError) -> bool {
     matches!(
@@ -266,11 +347,16 @@ impl AgentRunHandler {
         let mut used_rounds = 0u32;
         let mut used_tokens = 0u64;
         let mut previous_cancel: Option<CancelToken> = None;
+        let started = std::time::Instant::now();
+        let mut labels: Option<RunLabels> = None;
         let outcome = loop {
             let mut segment = self
                 .source
                 .segment(claimed, self.executor.catalog())
                 .await?;
+            if labels.is_none() {
+                labels = Some(RunLabels::of(&segment));
+            }
             if let Some(limit) = segment.budget.max_rounds.as_mut() {
                 *limit = limit.saturating_sub(used_rounds);
             }
@@ -326,6 +412,10 @@ impl AgentRunHandler {
             }
         };
 
+        if let (Some(labels), Ok(done)) = (&labels, &outcome) {
+            labels.finish(done, used_rounds, started.elapsed());
+        }
+
         match outcome {
             // 终态与挂起都已经在账本上了（`AgentLoop::run` 返回前一定写过一条）。
             Ok(SegmentOutcome::Completed { .. })
@@ -373,6 +463,7 @@ mod tests {
             let (session, run) = (session.clone(), run.clone());
             async move {
                 Ok(Segment {
+                    telemetry: Default::default(),
                     request: turn_request(&session, &run),
                     env,
                     budget: Budget::default(),
@@ -866,6 +957,7 @@ mod tests {
                 let (session, run) = (session.clone(), run.clone());
                 async move {
                     Ok(Segment {
+                        telemetry: Default::default(),
                         request: turn_request(&session, &run),
                         env,
                         budget: Budget::default(),
@@ -946,6 +1038,7 @@ mod tests {
                         komo_kernel::compaction::Reshape::Compact(compaction_job(&session, &run)),
                     )]);
                     Ok(Segment {
+                        telemetry: Default::default(),
                         request: turn_request(&session, &run),
                         env,
                         budget: Budget {
@@ -983,5 +1076,196 @@ mod tests {
             "{view:?}"
         );
         assert_eq!(events_named(&harness, "message.assistant"), 3);
+    }
+
+    // ---- 埋点（docs/observability.md §3） ----
+
+    fn usage(input: u64, output: u64, cache_read: u64) -> TokenUsage {
+        TokenUsage {
+            input: Some(input),
+            output: Some(output),
+            reasoning: None,
+            cache_read: Some(cache_read),
+            cache_write: None,
+        }
+    }
+
+    /// 两轮的 Run：invoke_agent → 两个 komo.round → 第一轮 chat + execute_tool、第二轮 chat；
+    /// token 属性在 chat 上，服务商没报的（reasoning、cache_write）不出现，更不是 0；
+    /// 指标事件里没有任何会话 / Run / 调用 id。
+    #[tokio::test]
+    async fn a_two_round_run_leaves_the_span_tree_and_metrics_without_ids() {
+        use crate::telemetry::capture::Capture;
+        let capture = Capture::default();
+        let _guard = capture.install();
+
+        let harness = Harness::new();
+        let tool = Arc::new(crate::executor::harness::RecordingTool::bash());
+        let executor = harness.executor(vec![tool]);
+        let mut first = round(1, None, vec![call("pc-1", "bash", serde_json::json!({}))]);
+        first.usage = usage(100, 10, 80);
+        let mut second = round(2, Some("好了。"), vec![]);
+        second.usage = usage(130, 4, 100);
+        let llm = Arc::new(ScriptedLlm::once(vec![first, second]));
+        let agent = Arc::new(AgentLoop::new(
+            llm,
+            harness.ledger.clone(),
+            executor.clone(),
+            Arc::new(harness.clock.clone()),
+        ));
+        let (session, run) = harness.open_run().await;
+        let queue = LeaseFake::new();
+        let claimed = claim_one(&queue, &run).await;
+        let handler = handler(
+            &harness,
+            agent,
+            executor,
+            source_for(&harness, &session, &run),
+            Arc::clone(&queue) as Arc<dyn RunQueue>,
+        );
+        handler.run(claimed).await.expect("跑完了");
+
+        let invoke = capture.spans("invoke_agent");
+        assert_eq!(invoke.len(), 1);
+        let invoke = &invoke[0];
+        assert_eq!(invoke.fields["komo.run.id"], run.to_string());
+        assert_eq!(invoke.fields["gen_ai.conversation.id"], session.to_string());
+        assert_eq!(invoke.fields["komo.run.source"], "interactive");
+        assert_eq!(invoke.fields["komo.run.outcome"], "completed");
+
+        let rounds = capture.children(invoke, "komo.round");
+        assert_eq!(rounds.len(), 2, "{:?}", capture.all_spans());
+        assert_eq!(rounds[0].fields["komo.round"], "1");
+        assert_eq!(rounds[1].fields["komo.round"], "2");
+
+        let chat = capture.children(&rounds[0], "chat");
+        assert_eq!(chat.len(), 1);
+        let chat = &chat[0];
+        assert_eq!(chat.fields["gen_ai.operation.name"], "chat");
+        assert_eq!(chat.fields["komo.llm.role"], "main");
+        assert_eq!(
+            chat.fields["gen_ai.request.model"],
+            komo_kernel::test_support::sample_model().model
+        );
+        assert_eq!(chat.fields["komo.llm.attempt"], "1");
+        assert_eq!(chat.fields["gen_ai.usage.input_tokens"], "100");
+        assert_eq!(chat.fields["gen_ai.usage.output_tokens"], "10");
+        assert_eq!(chat.fields["komo.usage.cache_read_tokens"], "80");
+        for absent in [
+            "komo.usage.reasoning_tokens",
+            "komo.usage.cache_write_tokens",
+            "error.type",
+        ] {
+            assert!(!chat.fields.contains_key(absent), "{absent} 不该出现");
+        }
+
+        let exec = capture.children(&rounds[0], "execute_tool");
+        assert_eq!(exec.len(), 1);
+        assert_eq!(exec[0].fields["gen_ai.tool.name"], "bash");
+        assert!(exec[0].fields.contains_key("gen_ai.tool.call.id"));
+        assert_eq!(exec[0].fields["komo.tool.status"], "completed");
+        assert!(exec[0].fields.contains_key("komo.tool.output_bytes"));
+        assert_eq!(capture.children(&rounds[1], "chat").len(), 1);
+        assert!(capture.children(&rounds[1], "execute_tool").is_empty());
+
+        // 指标：只有低基数维度。
+        let metrics = capture.all_metrics();
+        assert!(!metrics.is_empty());
+        let (run_text, session_text) = (run.to_string(), session.to_string());
+        for event in &metrics {
+            for (key, value) in &event.fields {
+                assert!(
+                    !matches!(
+                        key.as_str(),
+                        "komo.run.id" | "gen_ai.conversation.id" | "gen_ai.tool.call.id"
+                    ),
+                    "{key} 不能当指标维度"
+                );
+                assert!(
+                    !value.contains(&run_text) && !value.contains(&session_text),
+                    "{key}={value}"
+                );
+            }
+        }
+        let tokens = capture.metrics("histogram.gen_ai.client.token.usage");
+        let kinds: Vec<&str> = tokens
+            .iter()
+            .map(|event| event.fields["gen_ai.token.type"].as_str())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "input",
+                "output",
+                "cache_read",
+                "input",
+                "output",
+                "cache_read"
+            ]
+        );
+        assert_eq!(
+            capture
+                .metrics("histogram.gen_ai.client.operation.duration")
+                .len(),
+            2
+        );
+        let tool = capture.metrics("histogram.komo.tool.duration");
+        assert_eq!(tool.len(), 1);
+        assert_eq!(tool[0].fields["gen_ai.tool.name"], "bash");
+        assert_eq!(tool[0].fields["komo.tool.status"], "completed");
+        let rounds_metric = capture.metrics("histogram.komo.run.rounds");
+        assert_eq!(rounds_metric.len(), 1);
+        assert_eq!(rounds_metric[0].fields["histogram.komo.run.rounds"], "2");
+        assert_eq!(rounds_metric[0].fields["komo.run.outcome"], "completed");
+        assert_eq!(rounds_metric[0].fields["komo.run.source"], "interactive");
+        assert_eq!(capture.metrics("histogram.komo.run.duration").len(), 1);
+    }
+
+    /// 失败的模型请求也是一个 `chat` span：带 `error.type` 与第几次尝试，没有用量；退避
+    /// 重试记一次计数；这一段以 suspended 收尾。
+    #[tokio::test]
+    async fn a_failed_model_request_is_a_chat_span_with_an_error_type_and_counts_a_retry() {
+        use crate::telemetry::capture::Capture;
+        let capture = Capture::default();
+        let _guard = capture.install();
+
+        let harness = Harness::new();
+        let executor = harness.executor(vec![]);
+        let agent = Arc::new(AgentLoop::new(
+            Arc::new(FailingLlm::at_round(LlmError::Timeout)),
+            harness.ledger.clone(),
+            executor.clone(),
+            Arc::new(harness.clock.clone()),
+        ));
+        let (session, run) = harness.open_run().await;
+        let queue = LeaseFake::new();
+        let claimed = claim_one(&queue, &run).await;
+        let handler = handler(
+            &harness,
+            agent,
+            executor,
+            source_for(&harness, &session, &run),
+            Arc::clone(&queue) as Arc<dyn RunQueue>,
+        );
+        handler.run(claimed).await.expect("跑完了");
+
+        let invoke = &capture.spans("invoke_agent")[0];
+        assert_eq!(invoke.fields["komo.run.outcome"], "suspended");
+        let round = &capture.children(invoke, "komo.round")[0];
+        let chat = &capture.children(round, "chat")[0];
+        assert_eq!(chat.fields["error.type"], "timeout");
+        assert_eq!(chat.fields["komo.llm.attempt"], "1");
+        assert!(!chat.fields.contains_key("gen_ai.usage.input_tokens"));
+
+        let retries = capture.metrics("monotonic_counter.komo.llm.retries");
+        assert_eq!(retries.len(), 1);
+        assert_eq!(retries[0].fields["komo.retry.cause"], "transport");
+        let duration = capture.metrics("histogram.gen_ai.client.operation.duration");
+        assert_eq!(duration[0].fields["error.type"], "timeout");
+        assert!(
+            capture
+                .metrics("histogram.gen_ai.client.token.usage")
+                .is_empty()
+        );
     }
 }

@@ -60,10 +60,11 @@ pub struct SystemOneResponse {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemOneUsage {
+    /// 没报就是 `None`——未知不是零。
     #[serde(default)]
-    pub input_tokens: u64,
+    pub input_tokens: Option<u64>,
     #[serde(default)]
-    pub output_tokens: u64,
+    pub output_tokens: Option<u64>,
 }
 
 /// 一条答复，形状跟着它的问句。
@@ -164,7 +165,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(response.model, "jev-1.13.0");
-        assert_eq!(response.usage.input_tokens, 296);
+        assert_eq!(response.usage.input_tokens, Some(296));
         assert!(matches!(
             response.answers["is_urgent"],
             Answer::Noul { noul } if (noul - 0.95).abs() < 1e-9

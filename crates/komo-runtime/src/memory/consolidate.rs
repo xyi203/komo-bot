@@ -383,7 +383,7 @@ impl<'a> Consolidator<'a> {
         let request = TurnRequest {
             session: komo_kernel::types::ids::SessionId::from_raw("memory-consolidation"),
             run: komo_kernel::types::ids::RunId::from_raw("memory-consolidation"),
-            model,
+            model: model.clone(),
             system_prompt: "你在整理一个个人助手的长期记忆库，判断新旧陈述之间的关系。\
                             只输出 JSON，不要解释。"
                 .to_string(),
@@ -401,7 +401,14 @@ impl<'a> Consolidator<'a> {
         };
 
         let mut driver = llm.begin_turn(request).await?;
-        let round = driver.next(RoundInput::First).await?;
+        let round = crate::telemetry::turn(
+            &mut *driver,
+            RoundInput::First,
+            crate::telemetry::role::MEMORY_CONSOLIDATE,
+            &model,
+            1,
+        )
+        .await?;
         parse_verdicts(&round.text.unwrap_or_default(), related)
     }
 }

@@ -539,6 +539,7 @@ mod tests {
                     output_tokens: None,
                     cache_read_tokens: None,
                     cache_write_tokens: None,
+                    reasoning_tokens: None,
                 }),
             ),
             event(
@@ -554,6 +555,7 @@ mod tests {
                     output_tokens: None,
                     cache_read_tokens: None,
                     cache_write_tokens: None,
+                    reasoning_tokens: None,
                 }),
             ),
             accepted_as(&second, 5, Some("接着上面那句"), None),

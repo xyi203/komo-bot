@@ -210,6 +210,7 @@ impl Ledger for MemLedger {
                 output_tokens: round.usage.output,
                 cache_read_tokens: round.usage.cache_read,
                 cache_write_tokens: round.usage.cache_write,
+                reasoning_tokens: round.usage.reasoning,
             }),
         );
         Ok(calls)

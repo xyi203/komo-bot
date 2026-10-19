@@ -1,6 +1,6 @@
 # komo 可观测性
 
-> 状态：设计，2026-10-19 认可，**未实现**。与 [`komo_bot.md`](komo_bot.md) 冲突时，涉及本文范围（遥测、日志、运维视图）的以本文为准；落地后把对应规格写回这里，不再另起文件。
+> 状态：设计，2026-10-19 认可。**已实现**：§3.1 的 `invoke_agent` / `komo.round` / `chat` / `execute_tool` 埋点、§3.2 的模型 / Run / 工具指标（第 3 步的埋点部分，名字见 §3.3）、`message.assistant.reasoning_tokens`；其余未实现。与 [`komo_bot.md`](komo_bot.md) 冲突时，涉及本文范围（遥测、日志、运维视图）的以本文为准；落地后把对应规格写回这里，不再另起文件。
 > 文中不带文件名的章节号（§3、§8.3、§13.3 …）指 `komo_bot.md`，记忆的 §9.x 指 [`memory.md`](memory.md)。
 
 ## 1. 现状（2026-10-19 盘点）
@@ -76,6 +76,39 @@ invoke_agent                 一个 Run 段（受理/恢复 → 完成/挂起/�
 | `komo.memory.injected` · `.used` · `.same` · `.contested` | counter | session.kind |
 | `komo.memory.extract.skipped` | counter | 原因 |
 | `komo.delivery.failures` · `komo.cron.failures` · `komo.mcp.connect.failures` | counter | 渠道 / job / 服务器 |
+
+### 3.3 已埋点的名字（2026-10-19，semconv 核对表）
+
+埋点代码在 `komo-runtime/src/telemetry.rs`（辅助函数）与 `agent/` · `executor/` · `llm/` · `memory/`。span 都是 INFO，指标事件都是 `target = "komo::metrics"`、DEBUG。
+
+| span | 位置 | 属性 |
+|---|---|---|
+| `invoke_agent` | `AgentRunHandler::run`，一次领取（含压缩 / 插话后的重新装配）一个 | `gen_ai.operation.name`、`gen_ai.agent.name`（Agent id）、`gen_ai.conversation.id`（会话 id）、`komo.run.id`、`komo.run.source`（interactive / cron / memory / verification）、`komo.session.kind`（main / normal / task）、`komo.run.outcome`（completed / suspended / failed / cancelled / error） |
+| `komo.round` | `AgentLoop::run`，包住 `chat` 与该轮的 `execute_tool`；续跑上一段停在半路的轮次时只有 `execute_tool` | `komo.round` |
+| `chat` | `telemetry::turn`：主对话、压缩摘要、记忆提取、记忆整理、标题；`telemetry::ask`：重排 | `gen_ai.operation.name`、`gen_ai.request.model`、`gen_ai.response.model`、`gen_ai.response.id`、`gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens`、`komo.usage.cache_read_tokens`、`komo.usage.cache_write_tokens`、`komo.usage.reasoning_tokens`、`komo.llm.role`、`komo.llm.effort`、`komo.llm.attempt`（从 1 起）、`error.type`（HTTP 状态码 / timeout / incomplete / transport / unsupported_effort / unknown） |
+| `embeddings` | `telemetry::embed`：记忆索引与查询向量 | `gen_ai.operation.name`、`gen_ai.request.model`、`komo.llm.role = embedding`、`error.type` |
+| `execute_tool` | `ToolExecutor::execute_ready`，一次执行尝试一个 | `gen_ai.operation.name`、`gen_ai.tool.name`、`gen_ai.tool.call.id`、`komo.tool.attempt`、`komo.tool.status`（completed / failed / uncertain）、`komo.tool.exit_code`、`komo.tool.output_bytes`（落盘的 output.json + stdout + stderr）、`error.type`（status 不是 completed 时） |
+
+| 指标 | 类型 | 维度 |
+|---|---|---|
+| `gen_ai.client.token.usage` | histogram | `gen_ai.request.model`、`komo.llm.role`、`gen_ai.token.type`（input / output / cache_read / cache_write / reasoning；没报的类型不发） |
+| `gen_ai.client.operation.duration` | histogram（秒） | `gen_ai.request.model`、`komo.llm.role`、`error.type`（失败时） |
+| `komo.llm.retries` | counter | `gen_ai.request.model`、`komo.retry.cause`（rate_limited / server / transport） |
+| `komo.run.duration`（秒）· `komo.run.rounds` | histogram | `komo.run.outcome`、`komo.run.source`、`komo.session.kind` |
+| `komo.tool.duration`（秒） | histogram | `gen_ai.tool.name`、`komo.tool.status` |
+
+语义约定里 `gen_ai.token.type` 只有 input / output，`cache_read` / `cache_write` / `reasoning` 是 komo 的扩展取值；`gen_ai.agent.name`、`gen_ai.conversation.id`、`gen_ai.tool.call.id`、`gen_ai.response.id` 对照的是写这一版时的 GenAI semconv，升级 SDK 时再核一遍。
+
+两处与 §3.1 图不一致的实际形状：
+
+- **重试不是同一个 round 下的兄弟。**模型请求失败后 Run 让出名额去等退避（§8.4），重试发生在下一次领取里，所以失败的 `chat` 在一棵 `invoke_agent` 树里、重试的 `chat` 在另一棵里；用 `komo.run.id` 与 `komo.llm.attempt`（从 `runs.retry_attempts` 续数）把它们对上。`telemetry::turn` 本身对同一父 span 下的多次调用给出兄弟 span（单测覆盖）。
+- **`execute_tool` 只覆盖真正执行的尝试。**被拒绝 / 不认识的工具名、编排类调用（`task`、`monitor`、`delegate` 一类）不开这个 span。
+
+**不进 span 与指标的**：提示词、回复、工具参数与输出、记忆正文；会话 / Run / 调用 id 只在 span 上，指标事件里一个都没有（`komo-runtime/src/agent/handler.rs` 的埋点测试逐条断言）。
+
+**重排的用量**：`SystemOneUsage` 改成 `Option`，没报就是未知；`chat`（role = rerank）上只记后端真报了的数。
+
+**未做**（后续步骤）：`komo.memory.*`、`komo.compaction`、`komo.cron.*`、`komo.delivery`、`komo.mcp.connect` 的 span，以及记忆 / Cron / 投递 / MCP 的指标（第 5 步）；`init_tracing` 里的 OpenTelemetry 层与 `[telemetry]` 配置（第 2 步，另一条线）。
 
 缓存命中率（cache_read ÷ input）、费用（token × 单价）、成功率都在 Grafana 里用查询或记录规则算，komo 里不放价格表。
 

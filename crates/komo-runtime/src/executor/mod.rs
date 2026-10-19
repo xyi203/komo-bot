@@ -42,6 +42,7 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 use komo_kernel::events::Event;
 use komo_kernel::fold::fold;
@@ -759,6 +760,31 @@ impl ToolExecutor {
         ready: ReadyCall,
         env: &CallEnv,
     ) -> Result<CallSettlement, ExecError> {
+        // 一次执行尝试一个 `execute_tool` span（`docs/observability.md` §3.1）。不带参数与
+        // 输出，只有名字、调用号、状态、退出码、落盘字节数。
+        let span = tracing::info_span!(
+            "execute_tool",
+            gen_ai.operation.name = "execute_tool",
+            gen_ai.tool.name = %ready.request.tool,
+            gen_ai.tool.call.id = %ready.request.call,
+            komo.tool.attempt = ready
+                .request
+                .resumed
+                .as_ref()
+                .map_or(1, |resumed| resumed.attempts_so_far + 1),
+            komo.tool.status = tracing::field::Empty,
+            komo.tool.exit_code = tracing::field::Empty,
+            komo.tool.output_bytes = tracing::field::Empty,
+            error.type = tracing::field::Empty,
+        );
+        self.run_ready(ready, env).instrument(span).await
+    }
+
+    async fn run_ready(
+        &self,
+        ready: ReadyCall,
+        env: &CallEnv,
+    ) -> Result<CallSettlement, ExecError> {
         let ReadyCall {
             request,
             tool,
@@ -840,6 +866,7 @@ impl ToolExecutor {
             .await?;
         let result = for_model(&request, env, &recorded);
         let published = &recorded.published;
+        observe_tool(&request.tool, published);
         // §48 的 `artifact_bytes`：这次尝试额外产生的产物。
         let artifact_bytes: u64 = recorded
             .artifacts
@@ -1925,6 +1952,33 @@ fn finish(
         stop,
         remaining: queue.into_iter().map(|(_, request)| request).collect(),
     }
+}
+
+/// 把这次尝试的结局记到当前的 `execute_tool` span 上，并发工具耗时指标。
+fn observe_tool(tool: &str, published: &PublishedOutput) {
+    let status = match published.status {
+        ToolResultStatus::Completed => "completed",
+        ToolResultStatus::Failed => "failed",
+        ToolResultStatus::Uncertain => "uncertain",
+    };
+    let span = tracing::Span::current();
+    span.record("komo.tool.status", status);
+    if let Some(code) = published.body.as_ref().and_then(|body| body.exit_code) {
+        span.record("komo.tool.exit_code", code);
+    }
+    span.record("komo.tool.output_bytes", stored_bytes(published));
+    if published.status != ToolResultStatus::Completed {
+        span.record("error.type", status);
+    }
+    tracing::event!(
+        target: "komo::metrics",
+        tracing::Level::DEBUG,
+        {
+        histogram.komo.tool.duration = published.elapsed_ms as f64 / 1000.0,
+        gen_ai.tool.name = tool,
+        komo.tool.status = status,
+        }
+    );
 }
 
 /// 这一次尝试落盘的字节总数：`output.json` 加两个流。

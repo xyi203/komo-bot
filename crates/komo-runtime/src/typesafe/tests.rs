@@ -60,7 +60,7 @@ async fn a_configured_backend_sends_the_state_and_reads_the_answers_back() {
     let response = client.ask(question()).await.expect("这一次成了");
 
     assert_eq!(response.model, "jev-1.13.0");
-    assert_eq!(response.usage.input_tokens, 120);
+    assert_eq!(response.usage.input_tokens, Some(120));
     let Answer::Choice { choice, .. } = &response.answers["most_relevant"] else {
         panic!("{:?}", response.answers["most_relevant"])
     };

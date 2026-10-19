@@ -168,6 +168,9 @@ pub struct EventPayload {
 pub struct ResponseBody {
     #[serde(default)]
     pub id: Option<String>,
+    /// 服务商实际用的模型（可能与请求的别名不同）。
+    #[serde(default)]
+    pub model: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
     /// 本轮全部 output items——**这是回放要原样带回去的那一份**。

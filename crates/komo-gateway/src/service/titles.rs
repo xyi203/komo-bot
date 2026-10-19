@@ -74,10 +74,11 @@ async fn retitle(
         return Ok(());
     }
 
+    let model = state.snapshot().memory.model.clone();
     let request = TurnRequest {
         session: session.clone(),
         run: run.clone(),
-        model: state.snapshot().memory.model.clone(),
+        model: model.clone(),
         system_prompt: SYSTEM_PROMPT.to_string(),
         messages: vec![ReplayMessage {
             role: Role::User,
@@ -100,10 +101,15 @@ async fn retitle(
         .begin_turn(request)
         .await
         .map_err(|error| error.to_string())?;
-    let round = driver
-        .next(RoundInput::First)
-        .await
-        .map_err(|error| error.to_string())?;
+    let round = komo_runtime::telemetry::turn(
+        &mut *driver,
+        RoundInput::First,
+        komo_runtime::telemetry::role::TITLE,
+        &model,
+        1,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
     let Some(title) = clean(round.text.as_deref().unwrap_or_default()) else {
         return Err("模型没给出能用的标题".into());
     };

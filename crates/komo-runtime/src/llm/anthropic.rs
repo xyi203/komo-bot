@@ -590,6 +590,10 @@ impl Assembled {
 
         match name {
             MESSAGE_START => {
+                crate::telemetry::note_response(
+                    payload.pointer("/message/id").and_then(Value::as_str),
+                    payload.pointer("/message/model").and_then(Value::as_str),
+                );
                 if let Some(usage) = payload.pointer("/message/usage") {
                     self.absorb_input_usage(usage);
                 }

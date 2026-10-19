@@ -197,6 +197,9 @@ docker run -d --name komo-lgtm --restart unless-stopped \
 - 端口只绑 127.0.0.1。镜像版本钉死，不用 `latest`；数据卷的容器内路径以该版本 README 为准，落地第 2 步核对重启后数据还在。
 - NAS 上的实例在自己的 `config.toml` 里指向自己的后端。
 - 仓库放一份 Grafana 看板 JSON（`docs/grafana/komo.json`）：模型 token 按用途 / 模型、缓存命中率、模型 p95 与错误率、Run 失败率与耗时、工具 p95 与失败率、记忆注入 / 采纳 / 重复交代、投递与 Cron 失败。
+  - 导入（uid `komo-overview`，重复导入覆盖）：`python3 -c 'import json;print(json.dumps({"dashboard":json.load(open("docs/grafana/komo.json")),"overwrite":True}))' | curl -s -u admin:admin -H 'Content-Type: application/json' -d @- http://127.0.0.1:3000/api/dashboards/db`
+  - 时长单位是秒。`komo_memory_used_total`、`komo_memory_extract_skipped_total`、`komo_cron_failures_total`、`komo_delivery_failures_total`、`komo_mcp_connect_failures_total`、`komo_llm_retries_total` 这些计数器第一次发生事件才会出现，此前对应面板为空是正常的。
+  - 「重复交代」尚无埋点，看板里没有该面板。
 
 ## 8. 不做
 

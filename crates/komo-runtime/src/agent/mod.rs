@@ -39,8 +39,10 @@ use komo_kernel::types::status::{RunEnd, WaitReason};
 use komo_kernel::types::turn::{
     AssistantRound, LlmError, Round, RoundInput, ToolCallRequest, ToolResultForModel, TurnRequest,
 };
+use tracing::Instrument;
 
 use crate::executor::{CallEnv, CallRequest, ExecError, RoundStop, ToolExecutor};
+use crate::telemetry;
 
 /// 一次执行段的预算（§6；总轮数默认不设上限）。**重启不重置预算**（§8.5）——所以
 /// 它由调用方从已保存的计数算出来，而不是每段从零开始。
@@ -105,8 +107,19 @@ pub struct ResumedRound {
     pub pending: Vec<CallRequest>,
 }
 
+/// 一段的遥测标签（`invoke_agent` span 的属性，`docs/observability.md` §3.1）。装配方
+/// 才知道，handler 不去查；不认识就留空，span 上也就没有这一项。
+#[derive(Debug, Clone, Default)]
+pub struct SegmentTelemetry {
+    /// `gen_ai.agent.name`：Run 所属 Agent 的 id。
+    pub agent: Option<String>,
+    /// `komo.session.kind`：`main` / `normal` / `task`。
+    pub session_kind: Option<&'static str>,
+}
+
 /// 一次执行段。
 pub struct Segment {
+    pub telemetry: SegmentTelemetry,
     pub session: SessionId,
     pub run: RunId,
     /// 工具 Schema、系统提示、记忆注入在这里装配好（`llm` 模块的事）。
@@ -275,6 +288,7 @@ impl AgentLoop {
     /// 跑一段。返回时 Run 一定有一个明确去处：终态、或者一个 [`Wait`]。
     pub async fn run(&self, segment: Segment) -> Result<SegmentOutcome, AgentError> {
         let Segment {
+            telemetry: _,
             session: _,
             run,
             request,
@@ -320,7 +334,11 @@ impl AgentLoop {
             Some(spec) => Box::new(command_driver::CommandDriver::new(spec, &request.messages)),
             None => match self.llm.begin_turn(request).await {
                 Ok(driver) => driver,
-                Err(error) => return self.llm_error(&run, rounds, &budget.retry, &error).await,
+                Err(error) => {
+                    return self
+                        .llm_error(&run, rounds, &budget.retry, &env.model.model, &error)
+                        .await;
+                }
             },
         };
 
@@ -333,7 +351,16 @@ impl AgentLoop {
             None => RoundInput::First,
             Some(resumed) => {
                 let mut results = resumed.settled;
-                let outcome = self.executor.execute_round(resumed.pending, &env).await?;
+                // 接的是上一段停在半路的那一轮。
+                let round_span = tracing::info_span!(
+                    "komo.round",
+                    komo.round = budget.first_round.saturating_sub(1)
+                );
+                let outcome = self
+                    .executor
+                    .execute_round(resumed.pending, &env)
+                    .instrument(round_span)
+                    .await?;
                 results.extend(outcome.results);
                 if let Some(stop) = outcome.stop {
                     return self.stop(&run, rounds, stop).await;
@@ -382,10 +409,30 @@ impl AgentLoop {
             }
 
             // 一回合一次 completion。取消和它赛跑——**每个 await 都要**。
-            let round = match crate::executor::cancel::race(&env.cancel, driver.next(input)).await {
+            let round_span =
+                tracing::info_span!("komo.round", komo.round = budget.first_round + rounds);
+            // 命令直跑的 Run 不对话（§10）：没有模型请求，也就没有 `chat` span。
+            let turn = async {
+                if takes_interjections {
+                    telemetry::turn(
+                        &mut *driver,
+                        input,
+                        telemetry::role::MAIN,
+                        &env.model,
+                        budget.retry.attempts + 1,
+                    )
+                    .await
+                } else {
+                    driver.next(input).await
+                }
+            }
+            .instrument(round_span.clone());
+            let round = match crate::executor::cancel::race(&env.cancel, turn).await {
                 None => return self.cancel(&run, rounds).await,
                 Some(Err(error)) => {
-                    return self.llm_error(&run, rounds, &budget.retry, &error).await;
+                    return self
+                        .llm_error(&run, rounds, &budget.retry, &env.model.model, &error)
+                        .await;
                 }
                 Some(Ok(round)) => round,
             };
@@ -436,7 +483,11 @@ impl AgentLoop {
                     .await;
             }
 
-            let outcome = self.executor.execute_round(calls, &env).await?;
+            let outcome = self
+                .executor
+                .execute_round(calls, &env)
+                .instrument(round_span.clone())
+                .await?;
             if let Some(stop) = outcome.stop {
                 return self.stop(&run, rounds, stop).await;
             }
@@ -601,15 +652,21 @@ impl AgentLoop {
         &self,
         request: TurnRequest,
     ) -> Result<(String, TokenUsage), (String, TokenUsage)> {
+        let model = request.model.clone();
         let mut driver = self
             .llm
             .begin_turn(request)
             .await
             .map_err(|error| (format!("摘要请求失败：{error}"), TokenUsage::default()))?;
-        let round = driver
-            .next(RoundInput::First)
-            .await
-            .map_err(|error| (format!("摘要请求失败：{error}"), TokenUsage::default()))?;
+        let round = telemetry::turn(
+            &mut *driver,
+            RoundInput::First,
+            telemetry::role::COMPACTION,
+            &model,
+            1,
+        )
+        .await
+        .map_err(|error| (format!("摘要请求失败：{error}"), TokenUsage::default()))?;
         if round.truncated {
             return Err(("摘要被截断".into(), round.usage));
         }
@@ -708,6 +765,7 @@ impl AgentLoop {
         run: &RunId,
         rounds: u32,
         budget: &RetryBudget,
+        model: &str,
         error: &LlmError,
     ) -> Result<SegmentOutcome, AgentError> {
         let Some(cause) = crate::llm::retry_cause(error) else {
@@ -739,6 +797,7 @@ impl AgentLoop {
             %error,
             "模型请求失败，让出执行名额去等退避"
         );
+        telemetry::count_retry(model, cause.as_str());
         let wait = WaitReason::Retry {
             attempts,
             not_before,

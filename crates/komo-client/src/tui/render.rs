@@ -638,6 +638,7 @@ fn main() {
                 output_tokens: Some(20),
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
             };
         }
         feed(&mut app, &events);

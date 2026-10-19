@@ -98,6 +98,7 @@ pub fn conversation() -> Vec<Event> {
                 output_tokens: Some(30),
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
             }),
         ),
         event(
@@ -154,6 +155,7 @@ pub fn conversation() -> Vec<Event> {
                 output_tokens: Some(20),
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
             }),
         ),
         event(
@@ -216,6 +218,7 @@ pub fn interjected() -> Vec<Event> {
                 output_tokens: Some(20),
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
             }),
         ),
         event(
@@ -283,6 +286,7 @@ pub fn explored() -> Vec<Event> {
                 output_tokens: Some(10),
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
             }),
         ));
         for (id, _, _) in calls {

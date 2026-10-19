@@ -50,6 +50,7 @@ impl Wired {
     ) -> Segment {
         let (session, run) = self.harness.open_run().await;
         Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: self.harness.env_with_cancel(&session, &run, cancel),
             budget: Budget::default(),
@@ -196,6 +197,7 @@ async fn a_tool_failure_is_handed_to_the_model_and_the_run_carries_on() {
     let (session, run) = harness.open_run().await;
     let outcome = agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget::default(),
@@ -288,6 +290,7 @@ async fn the_round_budget_ends_in_a_failure_not_a_loop() {
     let (session, run) = harness.open_run().await;
     let outcome = agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget {
@@ -383,6 +386,7 @@ async fn a_resumed_segment_finishes_the_round_it_came_back_to() {
 
     let outcome = agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget {
@@ -439,6 +443,7 @@ async fn a_resumed_uncertain_call_goes_on_to_the_model() {
 
     let outcome = agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget::default(),
@@ -512,6 +517,7 @@ async fn one_segment_begins_exactly_one_turn() {
     let (session, run) = harness.open_run().await;
     agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget::default(),
@@ -557,6 +563,7 @@ async fn the_driver_is_handed_results_paired_by_provider_call_id() {
     let (session, run) = harness.open_run().await;
     agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget::default(),
@@ -637,6 +644,7 @@ async fn a_retryable_model_error_suspends_on_a_backoff_instead_of_failing() {
     let (session, run) = harness.open_run().await;
     let outcome = agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget::default(),
@@ -701,6 +709,7 @@ async fn an_unknown_model_outcome_is_not_retried() {
     let (session, run) = harness.open_run().await;
     let outcome = agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget::default(),
@@ -735,6 +744,7 @@ async fn an_exhausted_retry_budget_ends_in_a_failure() {
     let (session, run) = harness.open_run().await;
     let outcome = agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget {
@@ -784,6 +794,7 @@ async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
 
     let outcome = agent
         .run(Segment {
+            telemetry: Default::default(),
             request: turn_request(&session, &run),
             env: harness.env(&session, &run),
             budget: Budget {

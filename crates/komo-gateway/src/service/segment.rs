@@ -714,7 +714,16 @@ impl SegmentSource for GatewaySegments {
             },
         };
 
+        let telemetry = komo_runtime::agent::SegmentTelemetry {
+            agent: session_record
+                .as_ref()
+                .map(|record| record.agent_id.clone())
+                .filter(|agent| !agent.is_empty()),
+            session_kind: session_record.as_ref().map(|record| record.kind.as_str()),
+        };
+
         Ok(Segment {
+            telemetry,
             session,
             run,
             request,
@@ -971,6 +980,7 @@ mod tests {
                 output_tokens: None,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
+                reasoning_tokens: None,
             }),
         )];
         let payloads = payloads();
@@ -1025,6 +1035,7 @@ mod tests {
                     output_tokens: None,
                     cache_read_tokens: None,
                     cache_write_tokens: None,
+                    reasoning_tokens: None,
                 }),
             ),
             event(

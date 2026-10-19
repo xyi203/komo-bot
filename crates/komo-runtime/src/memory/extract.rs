@@ -478,7 +478,14 @@ impl LearningPass {
         };
 
         let mut driver = self.llm.begin_turn(request).await?;
-        let round = driver.next(RoundInput::First).await?;
+        let round = crate::telemetry::turn(
+            &mut *driver,
+            RoundInput::First,
+            crate::telemetry::role::MEMORY_EXTRACT,
+            &self.model,
+            1,
+        )
+        .await?;
         if round.truncated {
             return Err(MemoryError::Invalid("回复被截断，这一轮不采信".into()));
         }

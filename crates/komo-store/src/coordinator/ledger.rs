@@ -273,6 +273,7 @@ impl Ledger for Coordinator {
                     output_tokens: round.usage.output,
                     cache_read_tokens: round.usage.cache_read,
                     cache_write_tokens: round.usage.cache_write,
+                    reasoning_tokens: round.usage.reasoning,
                 }),
             )
             .await?;
@@ -1732,7 +1733,7 @@ mod tests {
         answered.usage = TokenUsage {
             input: Some(1210),
             output: Some(4),
-            reasoning: None,
+            reasoning: Some(3),
             cache_read: Some(1000),
             cache_write: Some(200),
         };
@@ -1753,6 +1754,7 @@ mod tests {
         assert_eq!(body.input_tokens, Some(1210));
         assert_eq!(body.cache_read_tokens, Some(1000));
         assert_eq!(body.cache_write_tokens, Some(200));
+        assert_eq!(body.reasoning_tokens, Some(3));
     }
 
     /// 轮数由调用方交进来，事件与行上是同一个数——`RunCompleted.rounds` 不再恒为 0。

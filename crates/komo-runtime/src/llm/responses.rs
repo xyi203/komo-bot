@@ -489,8 +489,14 @@ impl Assembled {
 
         match name {
             wire::RESPONSE_CREATED => {
-                if let Some(id) = payload.response.as_ref().and_then(|r| r.id.as_deref()) {
-                    tracing::debug!(response = %id, "response.created");
+                if let Some(response) = payload.response.as_ref() {
+                    crate::telemetry::note_response(
+                        response.id.as_deref(),
+                        response.model.as_deref(),
+                    );
+                    if let Some(id) = response.id.as_deref() {
+                        tracing::debug!(response = %id, "response.created");
+                    }
                 }
             }
             wire::OUTPUT_ITEM_ADDED => {

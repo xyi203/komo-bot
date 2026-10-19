@@ -137,15 +137,17 @@ impl IndexBuilder {
 
             let texts: Vec<String> = batch.iter().map(|item| item.content.clone()).collect();
             // 文档侧用文档侧的输入规则（§9.5）。这一步在事务外。
-            let vectors = match self.embeddings.embed(InputKind::Document, &texts).await {
-                Ok(vectors) => vectors,
-                Err(error) => {
-                    // 「失败不删除记忆正文，也**不伪装成索引已完成**」（§9.5）。
-                    errors.push(format!("这一批向量算不出来：{error}"));
-                    stalled = true;
-                    break;
-                }
-            };
+            let vectors =
+                match crate::telemetry::embed(&*self.embeddings, InputKind::Document, &texts).await
+                {
+                    Ok(vectors) => vectors,
+                    Err(error) => {
+                        // 「失败不删除记忆正文，也**不伪装成索引已完成**」（§9.5）。
+                        errors.push(format!("这一批向量算不出来：{error}"));
+                        stalled = true;
+                        break;
+                    }
+                };
             if vectors.len() != batch.len() {
                 errors.push(format!(
                     "端点返回 {} 条向量，这一批有 {} 条：对不上就不入库",

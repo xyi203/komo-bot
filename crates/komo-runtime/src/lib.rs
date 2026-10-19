@@ -12,5 +12,6 @@ pub mod mcp_auth;
 pub mod memory;
 pub mod recovery;
 pub mod scheduler;
+pub mod telemetry;
 pub mod tools;
 pub mod typesafe;

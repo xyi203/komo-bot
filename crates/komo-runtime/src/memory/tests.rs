@@ -428,6 +428,7 @@ fn assistant_event(seq: u64, run: &RunId, text: &str) -> Event {
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
         }),
     )
 }

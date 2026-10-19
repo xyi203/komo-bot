@@ -543,6 +543,7 @@ fn assistant(
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
         }),
     )
 }
@@ -561,6 +562,7 @@ fn assistant_ref(run: &RunId, seq: u64, text_ref: PayloadRef) -> Event {
             output_tokens: None,
             cache_read_tokens: None,
             cache_write_tokens: None,
+            reasoning_tokens: None,
         }),
     )
 }

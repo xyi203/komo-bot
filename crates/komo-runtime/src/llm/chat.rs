@@ -327,6 +327,8 @@ struct ChatAssembled {
     usage: TokenUsage,
     completed: bool,
     failure: Option<LlmError>,
+    /// 响应 id / 实际模型已经记到 `chat` span 上。
+    response_noted: bool,
 }
 
 #[derive(Debug, Default)]
@@ -345,6 +347,12 @@ impl ChatAssembled {
         let Ok(chunk) = serde_json::from_str::<Value>(data) else {
             return;
         };
+        if !self.response_noted
+            && let Some(id) = chunk.get("id").and_then(Value::as_str)
+        {
+            self.response_noted = true;
+            crate::telemetry::note_response(Some(id), chunk.get("model").and_then(Value::as_str));
+        }
         if let Some(error) = chunk.get("error") {
             self.failure = Some(LlmError::Rejected {
                 status: 502,

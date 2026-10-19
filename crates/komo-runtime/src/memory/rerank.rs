@@ -56,7 +56,7 @@ pub(super) async fn order(
         )]),
     };
 
-    let response = backend.ask(request).await?;
+    let response = crate::telemetry::ask(backend, request, crate::telemetry::role::RERANK).await?;
     let Some(Answer::Choice {
         choice,
         probabilities,

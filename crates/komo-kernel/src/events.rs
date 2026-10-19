@@ -417,6 +417,11 @@ pub struct MessageAssistant {
     pub cache_read_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_write_tokens: Option<u64>,
+    /// `output_tokens` 里推理的部分（见 [`TokenUsage::reasoning`]）；没报的留空。
+    ///
+    /// [`TokenUsage::reasoning`]: crate::types::model::TokenUsage::reasoning
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -777,6 +782,31 @@ mod tests {
         };
         assert_eq!(body.cache_read_tokens, Some(1000));
         assert_eq!(body.cache_write_tokens, Some(150));
+        assert_eq!(Event::from_line(&event.to_line().unwrap()).unwrap(), event);
+    }
+
+    #[test]
+    fn assistant_reasoning_tokens_are_absent_on_old_lines_and_round_trip_on_new_ones() {
+        let raw = line(
+            "message.assistant",
+            r#"{"round":1,"input_tokens":120,"output_tokens":7}"#,
+        );
+        let event = Event::from_line(&raw).unwrap();
+        let EventPayload::MessageAssistant(body) = &event.payload else {
+            panic!()
+        };
+        assert!(body.reasoning_tokens.is_none());
+        assert!(!event.to_line().unwrap().contains("reasoning"));
+
+        let raw = line(
+            "message.assistant",
+            r#"{"round":2,"input_tokens":120,"output_tokens":70,"reasoning_tokens":55}"#,
+        );
+        let event = Event::from_line(&raw).unwrap();
+        let EventPayload::MessageAssistant(body) = &event.payload else {
+            panic!()
+        };
+        assert_eq!(body.reasoning_tokens, Some(55));
         assert_eq!(Event::from_line(&event.to_line().unwrap()).unwrap(), event);
     }
 

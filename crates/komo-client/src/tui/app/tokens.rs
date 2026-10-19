@@ -65,6 +65,7 @@ mod tests {
             output_tokens: Some(output),
             cache_read_tokens: read,
             cache_write_tokens: write,
+            reasoning_tokens: None,
         }
     }
 

@@ -27,6 +27,8 @@ use komo_kernel::types::chat::{ChannelPeer, DeliveryTarget, Outbound};
 use komo_kernel::types::ids::{RunId, SessionId};
 
 use super::cron_watch::Watched;
+use tracing::Instrument;
+
 use super::state::GatewayState;
 
 /// 这个 Run 是谁的。
@@ -63,26 +65,39 @@ pub fn watch(state: Arc<GatewayState>, session: SessionId, run: RunId, watcher: 
         return;
     }
     let mut events = state.hub.subscribe(&session);
-    tokio::spawn(async move {
-        loop {
-            let frame = match events.recv().await {
-                Ok(frame) => frame,
-                // 落后了就接着收：内存通知丢了不丢数据（§13.1），状态还有周期扫描兜底。
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(_) => break,
-            };
-            let komo_kernel::protocol::sse::SseEvent::Event(event) = &frame.event else {
-                continue;
-            };
-            if event.run.as_ref() != Some(&run) {
-                continue;
+    let span = match &watcher {
+        Watcher::Cron(watched) => tracing::info_span!(
+            "komo.cron.firing",
+            komo.cron.job = %watched.job,
+            komo.cron.scheduled = watched.scheduled,
+            komo.run.id = %run,
+            komo.cron.outcome = tracing::field::Empty,
+        ),
+        Watcher::Interactive { .. } => tracing::Span::none(),
+    };
+    tokio::spawn(
+        async move {
+            loop {
+                let frame = match events.recv().await {
+                    Ok(frame) => frame,
+                    // 落后了就接着收：内存通知丢了不丢数据（§13.1），状态还有周期扫描兜底。
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                };
+                let komo_kernel::protocol::sse::SseEvent::Event(event) = &frame.event else {
+                    continue;
+                };
+                if event.run.as_ref() != Some(&run) {
+                    continue;
+                }
+                if step(&state, &session, &run, &watcher, &event.payload).await == Step::Done {
+                    break;
+                }
             }
-            if step(&state, &session, &run, &watcher, &event.payload).await == Step::Done {
-                break;
-            }
+            state.stop_watching(&run);
         }
-        state.stop_watching(&run);
-    });
+        .instrument(span),
+    );
 }
 
 /// 重启后把未终态、且来自聊天的交互 Run 与后台任务 Run 重新挂上看客。
@@ -532,6 +547,18 @@ async fn finish(
             }
         }
         Watcher::Cron(watched) => {
+            use komo_kernel::cron::FiringStatus;
+            tracing::Span::current().record("komo.cron.outcome", status.as_str());
+            if status == FiringStatus::Error && watched.scheduled {
+                tracing::event!(
+                    target: "komo::metrics",
+                    tracing::Level::DEBUG,
+                    {
+                    monotonic_counter.komo.cron.failures = 1u64,
+                    komo.cron.job = %watched.job,
+                    }
+                );
+            }
             super::cron_watch::settle(state, watched, status, error).await;
             // 取消不报告：那是人自己按下的。空输出的命令 Job（`deliver = false`）同样
             // 不报告，但理由不同——那是看门狗，不是取消。

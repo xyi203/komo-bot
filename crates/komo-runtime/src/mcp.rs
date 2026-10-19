@@ -566,8 +566,33 @@ impl McpConnection {
     /// 连一次，结果写进 `link`。调用方握着锁。连的时候被移除了，连上的会话当场放掉。
     async fn connect_into(&self, link: &mut Link) {
         let tokens = self.stored_tokens();
-        let result = connect(&self.name, &self.config, &self.secrets, &self.data_dir).await;
+        let span = tracing::info_span!(
+            "komo.mcp.connect",
+            komo.mcp.server = %self.name,
+            komo.mcp.outcome = tracing::field::Empty,
+        );
+        let result = tracing::Instrument::instrument(
+            connect(&self.name, &self.config, &self.secrets, &self.data_dir),
+            span.clone(),
+        )
+        .await;
         self.settled.send_replace(true);
+        let outcome = match &result {
+            Ok(_) => "connected",
+            Err(error) if error.needs_login() && self.is_oauth() => "needs_auth",
+            Err(_) => "failed",
+        };
+        span.record("komo.mcp.outcome", outcome);
+        if outcome == "failed" {
+            tracing::event!(
+                target: "komo::metrics",
+                tracing::Level::DEBUG,
+                {
+                monotonic_counter.komo.mcp.connect.failures = 1u64,
+                komo.mcp.server = %self.name,
+                }
+            );
+        }
         if self.is_closed() {
             *link = Link::Closed;
             return;
@@ -1290,6 +1315,38 @@ for line in sys.stdin:
             Arc::ptr_eq(&before, &hub.connections()[0]),
             "配置没变不该重连"
         );
+    }
+
+    /// 每次连接一个 `komo.mcp.connect` span 带服务器名与结果；连不上才记失败计数（维度只有服务器名）。
+    #[tokio::test]
+    async fn each_connect_has_a_span_and_only_failures_are_counted() {
+        let capture = crate::telemetry::capture::Capture::default();
+        let _guard = capture.install();
+        let fixture = Fixture::new();
+        let mut broken = fixture.server("b", &[]);
+        broken.transport = McpTransport::Stdio {
+            command: "komo-no-such-binary".into(),
+            args: vec![],
+            env: vec![],
+        };
+        let hub = fixture
+            .hub(&[("good", fixture.server("a", &[])), ("bad", broken)])
+            .await;
+        drop(hub);
+
+        let outcome = |server: &str| {
+            capture
+                .spans("komo.mcp.connect")
+                .into_iter()
+                .find(|span| span.fields["komo.mcp.server"] == server)
+                .map(|span| span.fields["komo.mcp.outcome"].clone())
+        };
+        assert_eq!(outcome("good").as_deref(), Some("connected"));
+        assert_eq!(outcome("bad").as_deref(), Some("failed"));
+        let failures = capture.metrics("monotonic_counter.komo.mcp.connect.failures");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].fields["komo.mcp.server"], "bad");
+        assert_eq!(failures[0].fields.len(), 2);
     }
 
     /// 删除：从 hub 拿掉、工具撤掉（带原因）、连接断开；之后再调报"已从配置移除"。

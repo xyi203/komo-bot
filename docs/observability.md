@@ -1,6 +1,6 @@
 # komo 可观测性
 
-> 状态：设计，2026-10-19 认可。**已实现**：依赖、`[telemetry]`、`init_tracing` 接 OTel 层、`komo doctor` 的导出状态、日志单写轮转与空闲降级（§4、§6）；§3.1 的 `invoke_agent` / `komo.round` / `chat` / `execute_tool` 埋点与 §3.2 的模型 / Run / 工具指标（名字见 §3.3）；`message.assistant.reasoning_tokens`；§5 的 `run inspect` 与召回诊断。其余未实现。与 [`komo_bot.md`](komo_bot.md) 冲突时，涉及本文范围（遥测、日志、运维视图）的以本文为准；落地后把对应规格写回这里，不再另起文件。
+> 状态：设计，2026-10-19 认可。**已实现**：依赖、`[telemetry]`、`init_tracing` 接 OTel 层、`komo doctor` 的导出状态、日志单写轮转与空闲降级（§4、§6）；§3.1 的 `invoke_agent` / `komo.round` / `chat` / `execute_tool` 埋点与 §3.2 的模型 / Run / 工具指标（名字见 §3.3）；后台 span（`komo.memory.extract` · `komo.memory.consolidate` · `komo.cron.firing` · `komo.delivery` · `komo.mcp.connect`）与记忆 / 投递 / Cron / MCP 指标；`message.assistant.reasoning_tokens`；§5 的 `run inspect` 与召回诊断。其余未实现。与 [`komo_bot.md`](komo_bot.md) 冲突时，涉及本文范围（遥测、日志、运维视图）的以本文为准；落地后把对应规格写回这里，不再另起文件。
 > 文中不带文件名的章节号（§3、§8.3、§13.3 …）指 `komo_bot.md`，记忆的 §9.x 指 [`memory.md`](memory.md)。
 
 ## 1. 现状（2026-10-19 盘点）
@@ -108,7 +108,28 @@ invoke_agent                 一个 Run 段（受理/恢复 → 完成/挂起/�
 
 **重排的用量**：`SystemOneUsage` 改成 `Option`，没报就是未知；`chat`（role = rerank）上只记后端真报了的数。
 
-**未做**（后续步骤）：`komo.memory.*`、`komo.compaction`、`komo.cron.*`、`komo.delivery`、`komo.mcp.connect` 的 span，以及记忆 / Cron / 投递 / MCP 的指标（第 5 步）；`init_tracing` 里的 OpenTelemetry 层与 `[telemetry]` 配置（第 2 步，另一条线）。
+**后台 span 与指标（已实现）**
+
+| span | 位置 | 属性 |
+|---|---|---|
+| `komo.memory.extract` | `MemoryManager::process_batch`，一批一个；批内的 `chat`（role = memory.extract）是它的子 span | `komo.session.kind`、`komo.memory.runs`、`komo.memory.window_chars`、`komo.memory.returned`（模型交回的条数）、`komo.memory.applied`（写库变更数）、`komo.memory.skip_reason`（failed / cancelled / task_session / cron / invalid / no_evidence，没跳过则缺席）。原有的逐批 INFO 日志保留（给人看），span 不带错误正文 |
+| `komo.memory.consolidate` | `offline.rs`，一组一个 | `komo.memory.group_size` / `apply` / `prompt` / `actions` / `merge` / `supersede` / `contest` / `rereadable` / `outcome` |
+| `komo.cron.firing` | `run_watch::watch`，包住 Cron 看客的整个生命（触发 → 终态）；手动 run 也有，`komo.cron.scheduled = false` | `komo.cron.job`、`komo.cron.scheduled`、`komo.run.id`、`komo.cron.outcome`（ok / error / waiting；取消与放弃记 error） |
+| `komo.delivery` | `DeliveryLog::send_recorded_locked`，一次发送尝试一个（已 sent 的复用不开） | `komo.delivery.channel`、`komo.delivery.attempt`（`deliveries.attempts` + 1）、`komo.delivery.outcome`（sent / deferred / unavailable（渠道没起来）/ error） |
+| `komo.mcp.connect` | `McpConnection::connect_into`，每次连接与重连一个 | `komo.mcp.server`、`komo.mcp.outcome`（connected / needs_auth / failed） |
+
+| 指标 | 类型 | 维度 | 发出处 |
+|---|---|---|---|
+| `komo.memory.injected` | counter（条数） | `komo.session.kind` | `recall_for`：只在写下新一块注入段时记，沿用上一块不重复计 |
+| `komo.memory.extract.skipped` | counter | `komo.memory.skip_reason` | `process_batch` |
+| `komo.cron.failures` | counter | `komo.cron.job`（Job id，个人用量下低基数） | Cron 看客收到 error 终态，仅定时触发 |
+| `komo.delivery.failures` | counter | `komo.delivery.channel` | outcome 为 error / unavailable |
+| `komo.mcp.connect.failures` | counter | `komo.mcp.server` | outcome 为 failed（要登录不算失败） |
+
+**未做**：
+- `komo.memory.same` · `komo.memory.contested`（提取 span 上的 same / contested 计数）：这两个数在写入时关系判定里（`consolidate.rs`，第 5 步重写提取与 classify 合并的范围），批报告现在不暴露；等那边落地后在 `BatchRecord` 加计数、`process_batch` 收尾时发。`komo.memory.used` 同样依赖 §9.10 的 `used` 返回。
+- `komo.memory.recall`、`komo.compaction` 的 span。
+- Cron 在 Run 起来之前就失败的触发（调度器 fire 出错）没有 span；`komo.cron.firing` 只覆盖已经有 Run 的触发。
 
 缓存命中率（cache_read ÷ input）、费用（token × 单价）、成功率都在 Grafana 里用查询或记录规则算，komo 里不放价格表。
 
@@ -191,7 +212,7 @@ docker run -d --name komo-lgtm --restart unless-stopped \
 | 2 | 加依赖，`init_tracing` 接两层，`[telemetry]` 配置 | 冷编仍在预算内（`--timings`）；`cargo tree -d` 无新重复；不配端点时行为与文件日志不变 |
 | 3 | `invoke_agent` / `komo.round` / `chat` / `execute_tool` 埋点与模型、工具指标 | 测试：内存 exporter 断言两轮 Run 的 span 树与 token 属性、一次失败重试是兄弟 `chat` span、服务商没报的 token 不出现为 0；本机跑一个 Run，Tempo 里看到整棵树 |
 | 4 | 第 5 节的本地补齐 | 本机挑一个失败、一个完成的 Run，`run inspect` 逐项对得上 JSONL |
-| 5 | 记忆、Cron、投递、MCP 埋点（记忆部分随 §9.10） | Grafana 里对应指标有数 |
+| 5 | 记忆、Cron、投递、MCP 埋点（记忆部分随 §9.10）**（已实现，same / contested / used 待提取重写）** | Grafana 里对应指标有数 |
 | 6 | 日志单写、轮转、空闲降级 | 重启后只有一个文件在长；跨天出现轮转文件 |
 | 7 | 看板 JSON 进仓库 | 导入后每个面板有数据 |
 

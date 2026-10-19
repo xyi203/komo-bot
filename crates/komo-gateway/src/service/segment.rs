@@ -434,6 +434,9 @@ impl SegmentSource for GatewaySegments {
                     &run,
                     &surface,
                     &scopes,
+                    session_record
+                        .as_ref()
+                        .map_or("unknown", |record| record.kind.as_str()),
                 )
                 .await
             }

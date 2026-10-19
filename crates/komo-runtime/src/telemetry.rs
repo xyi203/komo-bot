@@ -257,7 +257,7 @@ pub async fn embed(
     result
 }
 
-#[cfg(test)]
-pub(crate) mod capture;
+#[cfg(any(test, feature = "test-support"))]
+pub mod capture;
 #[cfg(test)]
 mod tests;

@@ -276,6 +276,7 @@ pub(crate) async fn recall_for(
     run: &RunId,
     surface: &Surface,
     scopes: &[MemoryScope],
+    session_kind: &'static str,
 ) -> Injection {
     let Some(memories) = memories else {
         return Injection::default();
@@ -316,6 +317,14 @@ pub(crate) async fn recall_for(
         if let Err(error) = ledger.record_injection(run, event).await {
             tracing::warn!(%error, %run, "这一段的记忆注入没记进日志，重启之后会重新召回");
         }
+        tracing::event!(
+            target: "komo::metrics",
+            tracing::Level::DEBUG,
+            {
+            monotonic_counter.komo.memory.injected = injection.uses.len() as u64,
+            komo.session.kind = session_kind,
+            }
+        );
     }
     injection
 }

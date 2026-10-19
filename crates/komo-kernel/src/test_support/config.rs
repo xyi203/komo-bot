@@ -87,6 +87,8 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             model: memory_model,
             embedding: Some(embedding),
             retrieval: RetrievalConfig::default(),
+            extract_idle_secs: 600,
+            max_observations: 8,
         },
         agent: AgentConfig {
             default_agent: "assistant".into(),

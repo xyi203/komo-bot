@@ -62,6 +62,7 @@ default = "main"
 [memory]
 enabled = true
 model = "memory"
+extract_idle = "1s"
 {embedding_ref}
 
 [memory.retrieval]
@@ -71,6 +72,11 @@ top_k = 8
 max_tokens = 1500
 "#
     )
+}
+
+/// 等到会话空闲够了 `extract_idle`（上面的配置写的是 1s），后台才会领它（§9.10）。
+pub async fn past_extract_idle() {
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
 }
 
 /// 两个 Agent 各自带 `memory_scope`（§9.2）：默认那个不限作用域，`coder` 只看

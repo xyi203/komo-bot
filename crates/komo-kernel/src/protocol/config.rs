@@ -355,10 +355,31 @@ pub struct MemoryConfig {
     pub embedding: Option<EmbeddingConfig>,
     #[serde(default)]
     pub retrieval: RetrievalConfig,
+    /// 会话空闲多久之后才提取（§9.10）。文件里写 `extract_idle = "10m"`，快照里是秒。
+    #[serde(default = "default_extract_idle_secs")]
+    pub extract_idle_secs: u64,
+    /// 一批（一个会话空闲后的全部 Run）最多收几条观察（§9.10）。
+    #[serde(default = "default_max_observations")]
+    pub max_observations: usize,
+}
+
+impl MemoryConfig {
+    /// 提取节奏的两个默认值：（`extract_idle_secs`，`max_observations`）。
+    pub fn default_extraction() -> (u64, usize) {
+        (default_extract_idle_secs(), default_max_observations())
+    }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_extract_idle_secs() -> u64 {
+    600
+}
+
+fn default_max_observations() -> usize {
+    8
 }
 
 /// `[execution]`：Gateway 设置的执行预算（§6）。
@@ -718,6 +739,8 @@ mod tests {
                 model: model("memory-a"),
                 embedding: None,
                 retrieval: RetrievalConfig::default(),
+                extract_idle_secs: 600,
+                max_observations: 8,
             },
             agent: AgentConfig {
                 default_agent: "assistant".into(),

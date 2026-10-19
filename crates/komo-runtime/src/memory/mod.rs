@@ -60,7 +60,7 @@ pub use extract::{Observation, PROMPT_VERSION, RawObservation, SaidBy};
 // 对象"，两套括号处理迟早会有一边少一个分支（`delegate` 的复验在 executor 里）。
 pub(crate) use extract::parse_json_object;
 pub use index::{IndexBuilder, IndexOutcome, MIN_ACTIVATION_COVERAGE};
-pub use work::{DbMemoryWork, MemoryWorkItem, MemoryWorkLog};
+pub use work::{DbMemoryWork, MemoryBatch, MemoryWorkItem, MemoryWorkLog};
 
 /// 记忆这一层的失败。
 ///
@@ -418,6 +418,10 @@ struct Live {
     /// **记忆模型自己的那份完整配置**（§13.3）：端点、模型、effort 一起来，不拼装。
     model: ModelConfig,
     retrieval: RetrievalConfig,
+    /// 会话空闲多久之后才领来提取（§9.10）。
+    extract_idle: time::Duration,
+    /// 一批最多收几条观察（§9.10）。
+    max_observations: usize,
     llm: Arc<dyn LlmClient>,
 }
 
@@ -436,8 +440,12 @@ const PIN_SOFT_LIMIT: usize = 256;
 /// 多久没碰过就可以丢：一段对话不会跨这么久还接着答。
 const PIN_TTL: time::Duration = time::Duration::hours(6);
 
-/// 一次后台处理最多领几个 Run。
+/// 一次后台处理最多领几个会话（每个会话一批，§9.10）。
 pub const WORK_BATCH: usize = 8;
+
+fn extract_idle(config: &MemoryConfig) -> time::Duration {
+    time::Duration::seconds(i64::try_from(config.extract_idle_secs).unwrap_or(i64::MAX))
+}
 
 /// 索引构建失败后第一次重试等多久；之后每次翻倍，封顶 [`INDEX_RETRY_MAX`]（§9.5）。
 const INDEX_RETRY_FIRST: time::Duration = time::Duration::seconds(30);
@@ -470,6 +478,8 @@ impl MemoryManager {
                 enabled: parts.config.enabled,
                 model: parts.config.model.clone(),
                 retrieval: parts.config.retrieval.clone(),
+                extract_idle: extract_idle(&parts.config),
+                max_observations: parts.config.max_observations,
                 llm: parts.llm,
             }),
             repo: parts.repo,
@@ -502,6 +512,8 @@ impl MemoryManager {
             enabled: config.enabled,
             model: config.model.clone(),
             retrieval: config.retrieval.clone(),
+            extract_idle: extract_idle(config),
+            max_observations: config.max_observations,
             llm,
         };
     }
@@ -934,34 +946,53 @@ impl MemoryManager {
 
     // ------------------------------------------------------------ 自动积累（§9.3）
 
-    /// 领一批待处理的 Run 并逐个处理。
+    /// 领走空闲够久的会话，一个会话一批处理。
     ///
     /// 「run.completed 在 JSONL 持久保存后，state.db 提交终态与 memory_work = pending
-    /// → **后台领取该 Run 尚未处理的新证据**」（§9.3）。失败的放回 pending，下次重试；
-    /// 已经写进去的记忆正文不回滚——"索引失败独立重试，不撤销已经保存的记忆正文"。
+    /// → **后台领取该 Run 尚未处理的新证据**」（§9.3）——§9.10 把"领取"改成按会话：会话
+    /// 没有未到终态的 Run、且最后一个 Run 结束已满 `[memory].extract_idle`，才一次领走它
+    /// 全部 pending 的 Run，提取一次。失败的 Run 放回 pending，下次重试；已经写进去的
+    /// 记忆正文不回滚——"索引失败独立重试，不撤销已经保存的记忆正文"。
     ///
     /// **只有会好的失败才放回 pending。**证据读不出来是 §8.3 的"停止受影响会话，报告
     /// 损坏"——重试一万次也读不出来，所以标记翻成 `error`（§9.3 的四个状态里就是这一个
     /// 的用处），队列不再为它空转。见 [`MemoryError::is_permanent`]。
     pub async fn process_pending(&self, limit: usize) -> Result<PassReport, MemoryError> {
-        if !self.enabled() {
+        let live = self.live();
+        if !live.enabled {
             return Ok(PassReport::default());
         }
-        let claimed = self.work.claim(limit).await?;
+        let claimed = self.work.claim(live.extract_idle, limit).await?;
         let mut report = PassReport::default();
-        for item in claimed {
-            match self.process_run(&item).await {
-                Ok(Outcome::Applied { changes, cursor }) => {
-                    report.processed += 1;
-                    report.applied += changes;
-                    self.settle(&item.run, MemoryWork::Done, cursor).await;
-                }
-                Ok(Outcome::Skipped { reason, cursor }) => {
-                    report.skipped += 1;
-                    tracing::debug!(run = %item.run, %reason, "这个 Run 没有可提取的证据");
-                    self.settle(&item.run, MemoryWork::Done, cursor).await;
-                }
-                Err(error) if error.is_permanent() => {
+        for batch in &claimed {
+            self.process_batch(batch, &mut report).await;
+        }
+        Ok(report)
+    }
+
+    async fn settle(&self, run: &RunId, work: MemoryWork, cursor: Seq) {
+        // 这一条已经不在"报过的失败"里了：下次再失败要重新出声，而不是被旧记录压住。
+        if work != MemoryWork::Pending {
+            self.reported.lock().expect("失败表").remove(run);
+        }
+        if let Err(error) = self.work.finish(run, work, cursor).await {
+            tracing::warn!(%error, run = %run, "记忆处理标记写不下去");
+        }
+    }
+
+    /// 一个会话这一批的完整处理，并发一条结构化日志（§9.10「逐会话记录」）。
+    async fn process_batch(&self, batch: &MemoryBatch, report: &mut PassReport) {
+        let mut record = BatchRecord::default();
+        let result = self.run_batch(batch, report, &mut record).await;
+        if let Err(error) = result {
+            let permanent = error.is_permanent();
+            record.skip_reason = Some(format!("失败：{error}"));
+            for item in batch
+                .items
+                .iter()
+                .filter(|item| !record.settled.contains(&item.run))
+            {
+                if permanent {
                     report.abandoned += 1;
                     tracing::warn!(
                         %error,
@@ -969,8 +1000,7 @@ impl MemoryManager {
                         "证据读不出来，这个 Run 不再重试（标记翻成 error）"
                     );
                     self.settle(&item.run, MemoryWork::Error, item.cursor).await;
-                }
-                Err(error) => {
+                } else {
                     report.failed += 1;
                     // 同一条错误只报一次：下一拍还是它，`warn` 一遍没有新信息。
                     let first = self
@@ -989,56 +1019,136 @@ impl MemoryManager {
                 }
             }
         }
-        Ok(report)
+        tracing::info!(
+            session = %batch.session,
+            session_kind = batch.kind.as_str(),
+            runs = batch.items.len(),
+            window_chars = record.window_chars,
+            skip_reason = record.skip_reason.as_deref().unwrap_or(""),
+            observations = record.observations,
+            applied = record.applied,
+            "记忆提取处理了一批"
+        );
     }
 
-    async fn settle(&self, run: &RunId, work: MemoryWork, cursor: Seq) {
-        // 这一条已经不在"报过的失败"里了：下次再失败要重新出声，而不是被旧记录压住。
-        if work != MemoryWork::Pending {
-            self.reported.lock().expect("失败表").remove(run);
-        }
-        if let Err(error) = self.work.finish(run, work, cursor).await {
-            tracing::warn!(%error, run = %run, "记忆处理标记写不下去");
-        }
+    async fn skip(
+        &self,
+        item: &MemoryWorkItem,
+        cursor: Seq,
+        reason: &str,
+        report: &mut PassReport,
+        record: &mut BatchRecord,
+    ) {
+        report.skipped += 1;
+        tracing::debug!(run = %item.run, %reason, "这个 Run 没有可提取的证据");
+        record.settled.insert(item.run.clone());
+        record.skip_reason.get_or_insert_with(|| reason.to_string());
+        self.settle(&item.run, MemoryWork::Done, cursor).await;
     }
 
-    /// 一个 Run 的完整处理：读日志 → 提取 → 校验 → 去重 / 冲突 → 写库。
-    pub async fn process_run(&self, item: &MemoryWorkItem) -> Result<Outcome, MemoryError> {
+    /// 读日志 → 确定性跳过 → 按预算切段 → 每段一次提取 → 校验 → 去重 / 冲突 → 写库。
+    /// 处理完的 Run 当场记 `done` 与游标；出错时调用方把没处理完的放回去。
+    async fn run_batch(
+        &self,
+        batch: &MemoryBatch,
+        report: &mut PassReport,
+        record: &mut BatchRecord,
+    ) -> Result<(), MemoryError> {
+        use komo_kernel::types::plan::PlanSource;
+        use komo_kernel::types::status::RunState;
+        use komo_store::models::SessionKind;
+
         // 「取消、失败或结果未知的动作不能整理成成功经验」（§9.3）——取消的整个跳过：
         // 它停在用户的选择上，剩下的半截不是证据。
-        if item.status == komo_kernel::types::status::RunState::Cancelled {
-            return Ok(Outcome::Skipped {
-                reason: "用户取消的任务".into(),
-                cursor: item.cursor,
-            });
+        let mut items: Vec<&MemoryWorkItem> = Vec::new();
+        for item in &batch.items {
+            if item.status == RunState::Cancelled {
+                self.skip(item, item.cursor, "用户取消的任务", report, record)
+                    .await;
+            } else {
+                items.push(item);
+            }
+        }
+        if items.is_empty() {
+            return Ok(());
         }
 
-        let events = self.events.events_of(&item.session).await?;
-        let transcript = extract::Transcript::build(&item.session, &item.run, &events, item.cursor);
-        if !transcript.has_new_evidence() {
-            return Ok(Outcome::Skipped {
-                reason: "没有新的用户陈述或工具结果".into(),
-                cursor: transcript.cursor,
-            });
+        let events = self.events.events_of(&batch.session).await?;
+        let end_of = |item: &MemoryWorkItem| {
+            events
+                .iter()
+                .filter(|event| event.run.as_ref() == Some(&item.run))
+                .map(|event| event.seq)
+                .fold(item.cursor, Seq::max)
+        };
+
+        // 不调模型就跳过（§9.10）：后台任务会话里排查出来的东西只是任务的过程，home 收到
+        // 的是摘要，摘要不是证据；Cron 的 Run 是自己的报告，不是用户说的。
+        let mut windows = Vec::new();
+        for item in items {
+            let reason = if batch.kind == SessionKind::Task {
+                Some("后台任务会话")
+            } else if matches!(item.source, PlanSource::Cron { .. }) {
+                Some("Cron 触发的 Run")
+            } else {
+                None
+            };
+            match reason {
+                Some(reason) => {
+                    self.skip(item, end_of(item), reason, report, record).await;
+                }
+                None => windows.push(extract::RunWindow {
+                    run: item.run.clone(),
+                    status: item.status,
+                    cursor: item.cursor,
+                }),
+            }
+        }
+        if windows.is_empty() {
+            return Ok(());
         }
 
-        let (model, llm) = self.backend();
-        let pass = extract::LearningPass::new(llm, model.clone(), Arc::clone(&self.clock));
-        let raw = pass.extract(&transcript).await?;
-        let observations = transcript.validate(raw, item, &model, self.clock.now());
-        if observations.is_empty() {
-            return Ok(Outcome::Skipped {
-                reason: "提取结果一条都没通过校验".into(),
-                cursor: transcript.cursor,
-            });
+        let live = self.live();
+        let pass = extract::LearningPass::new(
+            live.llm,
+            live.model.clone(),
+            Arc::clone(&self.clock),
+            live.max_observations,
+        );
+        for segment in extract::split_batch(&batch.session, &windows, &events) {
+            let transcript = extract::Transcript::build(&batch.session, &segment, &events);
+            record.window_chars += transcript.window_chars();
+            let mut applied = 0;
+            let mut skipped = None;
+            if !transcript.has_new_evidence() {
+                skipped = Some("没有新的用户陈述或工具结果");
+            } else {
+                let raw = pass.extract(&transcript).await?;
+                record.observations += raw.len();
+                let observations =
+                    transcript.validate(raw, live.max_observations, &live.model, self.clock.now());
+                if observations.is_empty() {
+                    skipped = Some("提取结果一条都没通过校验");
+                } else {
+                    let consolidator = consolidate::Consolidator::new(self);
+                    applied = consolidator.apply(&observations).await?;
+                    record.applied += applied;
+                }
+            }
+            report.applied += applied;
+            for (run, cursor) in transcript.run_cursors() {
+                record.settled.insert(run.clone());
+                if let Some(reason) = skipped {
+                    report.skipped += 1;
+                    record.skip_reason.get_or_insert_with(|| reason.to_string());
+                    tracing::debug!(run = %run, %reason, "这个 Run 没有可提取的证据");
+                } else {
+                    report.processed += 1;
+                }
+                self.settle(run, MemoryWork::Done, cursor).await;
+            }
         }
-
-        let consolidator = consolidate::Consolidator::new(self);
-        let changes = consolidator.apply(&observations).await?;
-        Ok(Outcome::Applied {
-            changes,
-            cursor: transcript.cursor,
-        })
+        Ok(())
     }
 
     // ------------------------------------------------------------ 操作者路径（§9.6）
@@ -1360,11 +1470,14 @@ impl MemoryManager {
     }
 }
 
-/// 一个 Run 处理完的样子。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Outcome {
-    Applied { changes: usize, cursor: Seq },
-    Skipped { reason: String, cursor: Seq },
+/// 一批处理里攒下来的账：已经落定的 Run，以及发进逐批日志的那几个数（§9.10）。
+#[derive(Debug, Default)]
+struct BatchRecord {
+    settled: BTreeSet<RunId>,
+    window_chars: usize,
+    skip_reason: Option<String>,
+    observations: usize,
+    applied: usize,
 }
 
 #[cfg(test)]

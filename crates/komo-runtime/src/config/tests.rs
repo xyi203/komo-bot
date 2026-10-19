@@ -201,6 +201,40 @@ fn an_omitted_memory_model_inherits_the_whole_main_model_including_effort() {
     assert_eq!(loaded.snapshot.memory.model, loaded.snapshot.model);
 }
 
+/// §9.10：`[memory]` 的提取节奏有默认值，也读得出 `extract_idle` / `max_observations`；
+/// 写成 0 或看不懂的单位，要么校验报键名，要么加载失败。
+#[test]
+fn the_memory_extraction_pacing_has_defaults_and_is_read_from_config() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.memory.extract_idle_secs, 600);
+    assert_eq!(loaded.snapshot.memory.max_observations, 8);
+
+    let text = Fixture::config_text("chat-a", "medium");
+    write(
+        &fixture.sources().config,
+        &text.replace(
+            "model = \"memory\"\n",
+            "model = \"memory\"\nextract_idle = \"30m\"\nmax_observations = 3\n",
+        ),
+    );
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert_eq!(loaded.snapshot.memory.extract_idle_secs, 1800);
+    assert_eq!(loaded.snapshot.memory.max_observations, 3);
+
+    write(
+        &fixture.sources().config,
+        &text.replace(
+            "model = \"memory\"\n",
+            "model = \"memory\"\nextract_idle = \"soon\"\n",
+        ),
+    );
+    assert!(matches!(
+        load_config(&fixture.options()),
+        Err(ConfigError::Parse { .. })
+    ));
+}
+
 /// `policy.toml` 已经退役（§7）：还在就报一句警告，配置照常装上，规则一条都不读——
 /// 连写坏了的旧文件也不让加载失败。
 #[test]

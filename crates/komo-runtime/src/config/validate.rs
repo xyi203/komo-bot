@@ -66,6 +66,15 @@ pub fn validate_with(snapshot: &ConfigSnapshot, caps: &EffortCapabilities) -> Ve
     if snapshot.memory.enabled {
         check_memory_embedding(snapshot, &mut issues);
         check_retrieval(snapshot, &mut issues);
+        if snapshot.memory.extract_idle_secs == 0 {
+            issues.push(error("memory.extract_idle", "extract_idle 要大于 0"));
+        }
+        if snapshot.memory.max_observations == 0 {
+            issues.push(error(
+                "memory.max_observations",
+                "max_observations 不能是 0",
+            ));
+        }
     }
 
     check_channels(snapshot, &mut issues);
@@ -910,6 +919,17 @@ mod tests {
             issues[0].message.contains("some-other-mechanism"),
             "{:?}",
             issues[0]
+        );
+    }
+
+    #[test]
+    fn a_zero_extract_idle_or_observation_cap_is_rejected() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.memory.extract_idle_secs = 0;
+        snapshot.memory.max_observations = 0;
+        assert_eq!(
+            keys(&validate(&snapshot)),
+            vec!["memory.extract_idle", "memory.max_observations"]
         );
     }
 

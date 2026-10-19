@@ -114,6 +114,8 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             model,
             embedding: None,
             retrieval: RetrievalConfig::default(),
+            extract_idle_secs: 600,
+            max_observations: 8,
         },
         agent: AgentConfig {
             default_agent: "assistant".into(),

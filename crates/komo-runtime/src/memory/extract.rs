@@ -1,4 +1,4 @@
-//! LearningPass：一个已完成 Run 的会话窗口 → 结构化观察（§9.3）。
+//! LearningPass：一个会话空闲后一批 Run 的窗口 → 结构化观察（§9.3）。
 //!
 //! 「记忆模型提取结构化候选，**不提供执行工具** → **Rust 校验**来源角色、引用位置、
 //! 作用域与内容」——这两步在这个文件里是两段代码，中间没有捷径：
@@ -6,7 +6,7 @@
 //! - [`LearningPass::extract`] 只负责发一次请求、把 JSON 解出来。它交出的是
 //!   [`RawObservation`]，一个**模型说了什么**的记录，还不是一条记忆。
 //! - [`Transcript::validate`] 把 raw 变成 [`Observation`]。这里落三条硬规则：
-//!   证据必须指向**这个 Run 里真实存在的**用户消息或工具结果；来源角色由证据决定而不
+//!   证据必须指向**这一批 Run 里真实存在的**用户消息或工具结果；来源角色由证据决定而不
 //!   是由模型自称决定；`user_confirmed` 根本没有被反序列化进来——模型返回的那个字段
 //!   没有写入权限（§9.2），做法是这组类型里没有它的位置。
 
@@ -21,22 +21,19 @@ use komo_kernel::types::memory::{
     Provenance,
 };
 use komo_kernel::types::model::ModelConfig;
-use komo_kernel::types::plan::PlanSource;
 use komo_kernel::types::status::RunState;
 use komo_kernel::types::turn::{RoundInput, ToolCallRequest, TurnRequest};
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use super::{MemoryError, MemoryWorkItem};
+use super::MemoryError;
 
 /// 提示词版本。**改了提示词就改它**——它进 [`ExtractionMetadata`]，是"这条记忆是怎么来
 /// 的"里唯一能回答"按哪一版规则提的"的那一格（§9.2）。
-pub const PROMPT_VERSION: &str = "memory-extract/v3";
+pub const PROMPT_VERSION: &str = "memory-extract/v4";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
 const MAX_CONTENT_CHARS: usize = 300;
-/// 一次最多接受几条观察。模型话多不该变成库里一次涨一堆；与提示词里的「最多 5 条」一致。
-const MAX_OBSERVATIONS: usize = 5;
 /// 会话窗口里每次工具调用的参数最多留几个字符——够看出读的是哪个文件、跑的是哪条命令。
 const MAX_CALL_ARGUMENT_CHARS: usize = 200;
 /// 交给记忆模型的会话窗口上限（字符）。
@@ -73,7 +70,7 @@ pub struct RawObservation {
     #[serde(default)]
     pub scope: String,
     pub said_by: SaidBy,
-    /// 证据引用：这个 Run 的事件 ID。
+    /// 证据引用：这一批 Run 的事件 ID。
     #[serde(default)]
     pub evidence: Vec<String>,
     #[serde(default)]
@@ -115,17 +112,31 @@ impl Observation {
     }
 }
 
-/// 这个 Run 的会话窗口，连同"哪条事件是谁说的"的索引。
+/// 一批里的一个 Run：它的终态与处理游标（§9.3）。
+#[derive(Debug, Clone)]
+pub struct RunWindow {
+    pub run: RunId,
+    pub status: RunState,
+    /// `cursor` 之前的事件不再算新证据。
+    pub cursor: Seq,
+}
+
+/// 一批 Run（同一会话空闲后的全部待处理 Run，§9.10）的会话窗口，连同"哪条事件是谁
+/// 说的"的索引。
 #[derive(Debug, Clone)]
 pub struct Transcript {
     pub session: SessionId,
+    /// 窗口里最后一个 Run；请求要挂一个 Run id，用它。
     pub run: RunId,
     /// 渲染给记忆模型看的正文。
     pub rendered: String,
-    /// 处理到哪条 seq（处理完推进到这里）。
-    pub cursor: Seq,
-    /// 事件 ID → （seq，角色）。**校验引用位置**用的就是它。
-    roles: BTreeMap<String, (Seq, Role)>,
+    /// 每个 Run 处理完推进到哪条 seq。
+    cursors: BTreeMap<RunId, Seq>,
+    /// 窗口里用户输入行的字符数：判断一批要不要按 Run 边界切开用。
+    user_chars: usize,
+    statuses: BTreeMap<RunId, RunState>,
+    /// 事件 ID → （所属 Run，seq，角色）。**校验引用位置**用的就是它。
+    roles: BTreeMap<String, (RunId, Seq, Role)>,
 }
 
 /// 一条事件在提取里算什么。
@@ -133,32 +144,67 @@ pub struct Transcript {
 enum Role {
     /// 用户陈述。
     User,
+    /// 任务交回 home 的结果（请求键 `task-result:`）。**不是用户说的话**，也不能当证据。
+    TaskResult,
     /// 可验证的工具结果。
     Tool,
     /// 助手自己说的话。**不算新的独立证据**（§9.3）。
     Assistant,
 }
 
+struct Line {
+    event_id: String,
+    role: Role,
+    text: String,
+}
+
+impl Line {
+    fn chars(&self) -> usize {
+        self.text.chars().count() + 1
+    }
+}
+
+/// 任务结果交回 home 时 `run.accepted` 的请求键前缀（`service/tasks.rs`）。
+const TASK_RESULT_KEY_PREFIX: &str = "task-result:";
+
 impl Transcript {
-    /// 把一个 Run 的事件渲染成窗口。`cursor` 之前的不再算新证据（§9.3 的来源游标）。
-    pub fn build(session: &SessionId, run: &RunId, events: &[Event], cursor: Seq) -> Transcript {
+    /// 把一批 Run 的事件按 seq 顺序渲染成一个窗口。每个 Run 的 `cursor` 之前的不再算新
+    /// 证据（§9.3 的来源游标）。
+    ///
+    /// 超过 [`MAX_TRANSCRIPT_CHARS`] 时**用户输入行一行不丢**：先从最旧的工具结果删起，
+    /// 再删最旧的助手 / 任务交回行（§9.10）。
+    pub fn build(session: &SessionId, runs: &[RunWindow], events: &[Event]) -> Transcript {
         let mut roles = BTreeMap::new();
-        let mut lines: Vec<String> = Vec::new();
-        let mut highest = cursor;
+        let mut lines: Vec<Line> = Vec::new();
+        let mut cursors: BTreeMap<RunId, Seq> =
+            runs.iter().map(|w| (w.run.clone(), w.cursor)).collect();
+        let windows: BTreeMap<&RunId, &RunWindow> = runs.iter().map(|w| (&w.run, w)).collect();
         // call_id → 「工具名 参数」。工具结果事件自己不带工具名；记忆模型要靠它分清
         // "读文档读到的"和"排查跑出来的"，前者随时能重读，不值得记。
         let mut calls: BTreeMap<String, String> = BTreeMap::new();
 
         for event in events {
-            // 只看这个 Run 的证据。别的 Run 有它自己的一次处理。
-            if event.run.as_ref() != Some(run) {
+            // 只看这一批 Run 的证据。
+            let Some(run) = event.run.as_ref() else {
                 continue;
-            }
-            highest = highest.max(event.seq);
-            let fresh = event.seq > cursor;
+            };
+            let Some(window) = windows.get(run) else {
+                continue;
+            };
+            let highest = cursors.entry(run.clone()).or_insert(window.cursor);
+            *highest = (*highest).max(event.seq);
+            let fresh = event.seq > window.cursor;
             let (role, body) = match &event.payload {
                 EventPayload::RunAccepted(body) => (
-                    Role::User,
+                    if body
+                        .request_key
+                        .as_str()
+                        .starts_with(TASK_RESULT_KEY_PREFIX)
+                    {
+                        Role::TaskResult
+                    } else {
+                        Role::User
+                    },
                     body.text.clone().unwrap_or_else(|| "（正文外置）".into()),
                 ),
                 EventPayload::MessageUser(body) => (
@@ -194,71 +240,125 @@ impl Transcript {
                 ),
                 _ => continue,
             };
-            roles.insert(event.event_id.to_string(), (event.seq, role));
-            if !fresh {
-                // 旧证据仍然渲染给模型当上下文，但标出来——它不是新发生的事。
-                lines.push(format!(
-                    "[{} seq={} {} · 已处理过]{}",
+            roles.insert(event.event_id.to_string(), (run.clone(), event.seq, role));
+            // 旧证据仍然渲染给模型当上下文，但标出来——它不是新发生的事。
+            let seen = if fresh { "" } else { " · 已处理过" };
+            lines.push(Line {
+                event_id: event.event_id.to_string(),
+                role,
+                text: format!(
+                    "[{} seq={} {}{seen}] {}",
                     event.event_id,
                     event.seq,
                     label(role),
                     one_line(&body)
-                ));
-                continue;
-            }
-            lines.push(format!(
-                "[{} seq={} {}] {}",
-                event.event_id,
-                event.seq,
-                label(role),
-                one_line(&body)
-            ));
+                ),
+            });
         }
 
-        let mut rendered = lines.join("\n");
-        if rendered.chars().count() > MAX_TRANSCRIPT_CHARS {
-            // 从后往前留：最近发生的才是"新证据"。
-            let keep: String = rendered
-                .chars()
-                .rev()
-                .take(MAX_TRANSCRIPT_CHARS)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect();
-            rendered = format!("（前面的窗口已截断）\n{keep}");
+        let user_chars = lines
+            .iter()
+            .filter(|line| line.role == Role::User)
+            .map(Line::chars)
+            .sum();
+
+        let mut total: usize = lines.iter().map(Line::chars).sum();
+        let mut dropped = 0usize;
+        if total > MAX_TRANSCRIPT_CHARS {
+            let mut keep = vec![true; lines.len()];
+            for class in [
+                [Role::Tool, Role::Tool],
+                [Role::Assistant, Role::TaskResult],
+            ] {
+                for (index, line) in lines.iter().enumerate() {
+                    if total <= MAX_TRANSCRIPT_CHARS {
+                        break;
+                    }
+                    if class.contains(&line.role) {
+                        keep[index] = false;
+                        total -= line.chars();
+                        dropped += 1;
+                    }
+                }
+            }
+            let mut index = 0;
+            lines.retain(|line| {
+                let kept = keep[index];
+                index += 1;
+                if !kept {
+                    roles.remove(&line.event_id);
+                }
+                kept
+            });
+        }
+
+        let mut rendered = lines
+            .iter()
+            .map(|line| line.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if dropped > 0 {
+            rendered =
+                format!("（窗口超限，较早的 {dropped} 行工具结果 / 助手回复已省略）\n{rendered}");
         }
 
         Transcript {
             session: session.clone(),
-            run: run.clone(),
+            run: runs
+                .last()
+                .map(|w| w.run.clone())
+                .unwrap_or_else(|| RunId::from_raw("")),
             rendered,
-            cursor: highest,
+            cursors,
+            user_chars,
+            statuses: runs.iter().map(|w| (w.run.clone(), w.status)).collect(),
             roles,
         }
+    }
+
+    /// 每个 Run 处理完推进到的 seq。
+    pub fn run_cursors(&self) -> impl Iterator<Item = (&RunId, Seq)> {
+        self.cursors.iter().map(|(run, seq)| (run, *seq))
+    }
+
+    /// 窗口里用户输入行的字符数。
+    pub fn user_chars(&self) -> usize {
+        self.user_chars
+    }
+
+    /// 窗口字符数（渲染给模型的那一份）。
+    pub fn window_chars(&self) -> usize {
+        self.rendered.chars().count()
+    }
+
+    fn cursor(&self) -> Seq {
+        self.cursors.values().copied().max().unwrap_or(Seq::ZERO)
     }
 
     /// 这个窗口里有没有**新发生的**用户陈述或可验证工具结果（§9.3）。
     pub fn has_new_evidence(&self) -> bool {
         self.roles
             .values()
-            .any(|(_, role)| matches!(role, Role::User | Role::Tool))
+            .any(|(_, _, role)| matches!(role, Role::User | Role::Tool))
             && !self.rendered.is_empty()
     }
 
-    /// Rust 侧的校验（§9.3 那一步）。不合格的整条丢掉，并说清为什么。
+    /// Rust 侧的校验（§9.3 那一步）。不合格的整条丢掉，并说清为什么。一批最多收
+    /// `max_observations` 条。
     pub fn validate(
         &self,
         raw: Vec<RawObservation>,
-        item: &MemoryWorkItem,
+        max_observations: usize,
         model: &ModelConfig,
         now: OffsetDateTime,
     ) -> Vec<Observation> {
         let mut out = Vec::new();
-        for candidate in raw.into_iter().take(MAX_OBSERVATIONS) {
-            match self.validate_one(candidate, item, model, now) {
+        for candidate in raw.into_iter().take(max_observations) {
+            match self.validate_one(candidate, model, now) {
                 Ok(observation) => out.push(observation),
-                Err(reason) => tracing::debug!(run = %self.run, %reason, "丢掉一条提取"),
+                Err(reason) => {
+                    tracing::debug!(session = %self.session, %reason, "丢掉一条提取")
+                }
             }
         }
         out
@@ -267,7 +367,6 @@ impl Transcript {
     fn validate_one(
         &self,
         raw: RawObservation,
-        item: &MemoryWorkItem,
         model: &ModelConfig,
         now: OffsetDateTime,
     ) -> Result<Observation, String> {
@@ -296,30 +395,27 @@ impl Transcript {
                 .map_err(|error| format!("作用域不合法：{error}"))?
         };
 
-        // 「取消、失败或结果未知的动作不能整理成成功经验」（§9.3）。取消的 Run 整个不
-        // 进来；失败的 Run 里，**经验**这一类没有成立的基础。
-        if kind == MemoryKind::Experience && item.status != RunState::Completed {
-            return Err(format!("{:?} 的 Run 整理不出成功经验", item.status));
-        }
-        // 「Cron 只在任务授予的范围内积累有证据的事实和经验，**不能从自己的报告推断用户
-        // 偏好**」（§9.3）。
-        if kind == MemoryKind::Preference && matches!(item.source, PlanSource::Cron { .. }) {
-            return Err("Cron 的 Run 不整理用户偏好".into());
-        }
-
-        // 引用位置：每一条都要指向**这个 Run 里真实存在的**事件。
+        // 引用位置：每一条都要指向**这一批 Run 里真实存在的**事件。
         let mut evidence = Vec::new();
         let mut cited_user = false;
         let mut cited_tool = false;
         for reference in &raw.evidence {
-            let Some((seq, role)) = self.roles.get(reference.trim()) else {
+            let Some((run, seq, role)) = self.roles.get(reference.trim()) else {
                 continue;
             };
+            // 「取消、失败或结果未知的动作不能整理成成功经验」（§9.3）：经验这一类只认
+            // 已完成的 Run 里的证据。
+            if kind == MemoryKind::Experience
+                && self.statuses.get(run) != Some(&RunState::Completed)
+            {
+                continue;
+            }
             match role {
                 Role::User => cited_user = true,
                 Role::Tool => cited_tool = true,
-                // 助手摘要不算新的独立证据（§9.3），所以它连证据都不记。
-                Role::Assistant => continue,
+                // 助手摘要不算新的独立证据（§9.3）；任务交回的结果是任务 agent 写的摘要，
+                // 同理（§9.10）。所以它们连证据都不记。
+                Role::Assistant | Role::TaskResult => continue,
             }
             evidence.push(Evidence {
                 reference: EvidenceRef::Event {
@@ -332,7 +428,7 @@ impl Transcript {
                     _ => Provenance::ToolObservation,
                 },
                 observed_at: now,
-                extracted_from_run: Some(self.run.clone()),
+                extracted_from_run: Some(run.clone()),
             });
         }
         if evidence.is_empty() {
@@ -368,7 +464,7 @@ impl Transcript {
 
         let mut extraction =
             ExtractionMetadata::new(model.model.clone(), model.effort.clone(), PROMPT_VERSION);
-        extraction.source_cursor = Some(self.cursor);
+        extraction.source_cursor = Some(self.cursor());
 
         Ok(Observation {
             content,
@@ -384,9 +480,35 @@ impl Transcript {
     }
 }
 
+/// 把一批 Run 按受理顺序切成几段，每段的用户输入行加起来不超窗口预算（§9.10）。
+/// 常态是一段；单个 Run 自己就超预算时它独占一段（用户行照样全留）。
+pub fn split_batch(
+    session: &SessionId,
+    runs: &[RunWindow],
+    events: &[Event],
+) -> Vec<Vec<RunWindow>> {
+    let mut segments: Vec<Vec<RunWindow>> = Vec::new();
+    let mut used = 0usize;
+    for window in runs {
+        let chars = Transcript::build(session, std::slice::from_ref(window), events).user_chars();
+        match segments.last_mut() {
+            Some(current) if used + chars <= MAX_TRANSCRIPT_CHARS => {
+                current.push(window.clone());
+                used += chars;
+            }
+            _ => {
+                segments.push(vec![window.clone()]);
+                used = chars;
+            }
+        }
+    }
+    segments
+}
+
 fn label(role: Role) -> &'static str {
     match role {
         Role::User => "用户",
+        Role::TaskResult => "任务交回",
         Role::Tool => "工具结果",
         Role::Assistant => "助手",
     }
@@ -443,11 +565,23 @@ pub struct LearningPass {
     llm: Arc<dyn LlmClient>,
     model: ModelConfig,
     clock: Arc<dyn Clock>,
+    /// 一批最多收几条（提示词里要告诉模型；超出的 [`Transcript::validate`] 也会截掉）。
+    max_observations: usize,
 }
 
 impl LearningPass {
-    pub fn new(llm: Arc<dyn LlmClient>, model: ModelConfig, clock: Arc<dyn Clock>) -> Self {
-        LearningPass { llm, model, clock }
+    pub fn new(
+        llm: Arc<dyn LlmClient>,
+        model: ModelConfig,
+        clock: Arc<dyn Clock>,
+        max_observations: usize,
+    ) -> Self {
+        LearningPass {
+            llm,
+            model,
+            clock,
+            max_observations,
+        }
     }
 
     /// 发一次请求，把 JSON 解出来。**解不出来是错误，不是空结果**——"提取失败"和"这一
@@ -462,10 +596,10 @@ impl LearningPass {
             // **记忆模型自己的那份完整配置**（§13.3）：`RoutingLlm` 按它挑实例，所以
             // 切换聊天模型或它的 effort 碰不到这一次请求。
             model: self.model.clone(),
-            system_prompt: SYSTEM_PROMPT.to_string(),
+            system_prompt: system_prompt(self.max_observations),
             messages: vec![komo_kernel::types::turn::ReplayMessage {
                 role: komo_kernel::types::turn::Role::User,
-                seq: transcript.cursor,
+                seq: transcript.cursor(),
                 text: Some(user_prompt(transcript, self.clock.now())),
                 tool_calls: vec![],
                 tool_results: vec![],
@@ -556,8 +690,12 @@ fn first_object(text: &str) -> Option<&str> {
 /// 三句是硬的，因为它们各自对应一条 Rust 侧的闸：只提新发生的用户陈述与可验证工具结果
 /// （§9.3）；每条必须引事件 ID（校验引用位置）；不要报告确认状态（§9.2 那句"模型返回的
 /// user_confirmed 字段没有写入权限"——提示里说清楚，省得模型白写一遍）。
+fn system_prompt(max_observations: usize) -> String {
+    SYSTEM_PROMPT.replace("{MAX}", &max_observations.to_string())
+}
+
 const SYSTEM_PROMPT: &str = "\
-你在为一个个人助手整理长期记忆。读一段会话记录，挑出**值得长期记住**的偏好、项目事实和\
+你在为一个个人助手整理长期记忆。读一段会话记录（可能包含这个会话里的多个任务，按发生顺序排列），挑出**值得长期记住**的偏好、项目事实和\
 执行经验，用 JSON 交回来。
 
 只输出一个 JSON 对象，形如：
@@ -569,7 +707,8 @@ const SYSTEM_PROMPT: &str = "\
 
 规则：
 1. 每条都必须在 evidence 里引至少一个**用户**或**工具结果**事件的 ID，原样照抄方括号里\
-那个 ID。引不出来就不要提这一条。
+那个 ID。引不出来就不要提这一条。标成「任务交回」的是后台任务交回的结果摘要，**不是用户说的\
+话**，不能引用它，也不能把它当成 user_statement。
 2. said_by 如实说：用户原话是 user_statement，工具结果是 tool_observation，你自己从中\
 推断出来的是 model_inference。不要把推断说成用户原话。
 3. content 是一句独立成立的陈述，短，只说一件事，不含代词指代（「他」「那个」要展开）。\
@@ -581,17 +720,16 @@ const SYSTEM_PROMPT: &str = "\
 文档、源码、配置、skill 说明、命令用法，原样摘一句不是记忆——下次再读一遍就有，而且比记忆新。\
 值得记的是**翻不到**的东西：用户说的偏好、约定和背景；排查、试错之后才得出的结论；文档没写、\
 踩过才知道的坑。拿不准时，问自己「不记这条，下次是否要重新排查或让用户再说一遍」，否则不记。
-6. 宁缺毋滥：一次最多交回 5 条，挑复用价值最高的；同一件事只写一条。
+6. 宁缺毋滥：一次最多交回 {MAX} 条，挑复用价值最高的；同一件事只写一条。
 7. 不要写入任何密钥、令牌、密码或与任务无关的敏感输出。
 8. 不要报告确认状态或生命周期——那不是你的字段。
 9. 没有值得记的就交回 {\"observations\":[]}。这是常见情况。不要编。";
 
 fn user_prompt(transcript: &Transcript, now: OffsetDateTime) -> String {
     format!(
-        "当前时间：{}\n会话：{}\n任务：{}\n\n--- 会话记录 ---\n{}\n--- 记录结束 ---",
+        "当前时间：{}\n会话：{}\n\n--- 会话记录 ---\n{}\n--- 记录结束 ---",
         now.date(),
         transcript.session,
-        transcript.run,
         transcript.rendered
     )
 }

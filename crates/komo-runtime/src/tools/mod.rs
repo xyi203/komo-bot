@@ -9,6 +9,7 @@
 
 pub mod bash;
 pub mod codemode;
+pub mod detach;
 pub mod edit;
 pub mod fusion;
 pub mod mcp;
@@ -196,6 +197,8 @@ pub(crate) mod test_support {
             call_timeout: std::time::Duration::from_secs(
                 komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS,
             ),
+            detach_after: None,
+            conversation: false,
         }
     }
 

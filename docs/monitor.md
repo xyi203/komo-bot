@@ -1,6 +1,6 @@
 # 监听：脚本每出一行，就交回会话一条
 
-> 状态：已落地（2026-10-14）。与 `docs/komo_bot.md` 冲突处以本文为准。
+> 状态：已落地（2026-10-14）；长 `bash` 自动转后台与对话会话禁 `sleep` 等待见 §8（2026-10-19）。与 `docs/komo_bot.md` 冲突处以本文为准。
 
 ## 1. 问题
 
@@ -139,3 +139,52 @@ komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（
 
 **未验证**：Linux 上 bwrap 包着的脚本（`--die-with-parent` 让崩溃时脚本随 Gateway 一起没，
 遗留进程组那一支在 Linux 上走不到）与 systemd 停机时的进程组回收；以上测试都在 macOS 上跑。
+
+## 8. 长 `bash` 自动转后台（2026-10-19）
+
+**问题（实测，本机 2862 次 bash 调用）：** 224 次跑过 60 s，45 次过 300 s，18 次过 600 s（最长 960 s），
+全在 TUI / home 这类对话会话里，多半是等 CI / 工单的轮询循环和 release 构建；其中 65 次命令里带
+`sleep`，跑过 60 s 的 224 次里 35 次带 `sleep`。会话严格串行，用户要等十几分钟才说得上话。
+
+**形状：** 转后台就是一个**不发行事件、只在结束时交回一条消息**的监听。
+
+```text
+对话会话里的 bash ── 跑过 [execution] detach_after_secs（默认 120，0 = 不转）还没完
+   │ 这次调用立刻结算：「已转后台 #3f2a」+ 到现在的输出末尾（状态 completed，结果体 `detached: <id>`）
+   ▼
+活子进程（管道、进程组、已收到的字节）交给 Gateway 的 `GatewayMonitors`（runtime 的 `Detacher` 槽，
+   runtime 不依赖 gateway）；同一个 id 空间，`monitor_stop #3f2a` 停得掉它
+   │ 退出 / 超时 / 被停
+   ▼
+内部输入 `bash-done:{call_id}`：`[后台命令 #3f2a「命令首行」结束] 退出码 N，用时 …` + 输出末尾
+（开头 10 + 最新 30 行，stderr 另带末 20 行）+ `artifact://…/background`
+```
+
+- **只对对话会话。** 任务会话（`kind = task`）、Cron 的 Run、子 Run、codemode 里的内层调用都不转
+  （`ToolContext.detach_after = None`）；配置为 0 也不转。`CallEnv.detach_after` 由 `GatewaySegments`
+  按当前快照填，热生效，与 `call_timeout_secs` 同一条路。阈值不早于这次调用的时限时不转。
+- **调用已结算。** 转后台那一刻调用就有结果（不是 started 而无结果），所以重启恢复不会把它判成
+  `uncertain`、更不会重跑。没有新增状态值。
+- **输出。** `stdout.txt` / `stderr.txt` 在结算时已按哈希封口，不能再追加；转后台之后的输出（两路按到达
+  顺序混写）进同一尝试目录的 `background.log`，入口 `artifact://<run>/<call>/<attempt>/background`
+  （`OutputFile::Background`）。转后台之前的输出在那次调用的结果里。
+- **时限。** 原 `timeout_secs`（受 `call_timeout_secs` 收紧）从调用开始算，到点在后台终止进程组，结束消息
+  报「超时」。
+- **结束消息**与监听同一条投递路径（`submit`，对端取挂它那条 Run 的 `runs.peer`）。`monitor_stop` 停掉它
+  时与监听不同：**会**交回一条「已被 monitor_stop 停止」（监听是模型自己停的、不再交回）。
+- **重启。** 子进程随 Gateway 停机终止，登记 `runtime/monitors/<id>.json`（带 `detached`）留着；子进程
+  另在 `runtime/monitors/children/` 在册，崩溃遗留的进程组按监听同一套核对身份后终止。下一代启动给会话
+  交回「Gateway 重启，后台命令中断，结果不明」+ `background.log` 里已有的末尾，登记删掉。不重跑。
+- **记忆。** `monitor:` / `monitor-end:` / `bash-done:` 与 `task-result:` 一样渲染为「任务交回」，不能引为
+  `user_statement`（`docs/memory.md` §9.10）。
+
+**对话会话里禁 `sleep` 等待。** `bash` 的 `prepare` 在对话会话里拒绝命令中任何一个字面量、不短于 10 秒的
+`sleep`（`sleep 20`、`sleep 1m`、`sleep 0.5h`，含循环体里的；`sleep $N` 这类非字面量不管，短 sleep 放行），
+提示改挂 `monitor`（脚本只在完成或出错时打一行，间隔不短于 15 秒）并先回复用户。任务会话与 Cron 的 Run
+照常能 sleep（任务会话用不了 `monitor`）。判断是词法的，引号里的 `sleep 20` 也会被拒——代价是偶尔多问一次，
+换来不用解析 shell。
+
+验收：`crates/komo-gateway/tests/detach/main.rs`（真数据目录、真子进程）——转后台立刻返回且进程跑完后交回
+退出码 / 尾部 / 引用、`0` 不转、后台超时终止进程组、`monitor_stop` 停掉并说明、重启交回「结果不明」且原 Run
+仍 Completed、对话里长 sleep 被拒；单元：`tools::bash`（阈值、时限从调用开始算、无接手方不转、禁 sleep 的
+会话范围）、`tools::detach`（sleep 解析）、`service::segment`（谁算对话会话）、`memory::tests`。

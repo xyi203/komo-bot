@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -24,7 +25,8 @@ use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
 use serde::{Deserialize, Serialize};
 
-use super::process::{ChildRegistration, ChildSpec, ProcessError, run_child};
+use super::detach::{DetachSlot, DetachedCall, long_sleep, tail_lines};
+use super::process::{ChildRegistration, ChildSpec, Driven, ProcessError, run_child_detachable};
 use super::protect::Protected;
 use super::{normalized, parse_args, plan_time};
 
@@ -63,6 +65,9 @@ pub struct BashResult {
     /// 首尾摘录。完整 stdout / stderr 在这次尝试的输出目录里。
     pub stdout_excerpt: String,
     pub stderr_excerpt: String,
+    /// 命令转到了后台，值是它的 id（和 `monitor` 同一个 id 空间）。这次调用没有退出码。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detached: Option<String>,
 }
 
 /// 一条 shell 命令的执行计划**形状**：工具名、操作、命令正文的版本快照、恢复方式。
@@ -125,6 +130,8 @@ pub struct BashTool {
     register: Option<ChildRegistration>,
     /// 数据目录只读挂载。`None` = 直接跑（没给名单，或这台机器上 bwrap 用不了）。
     sandbox: Option<Sandbox>,
+    /// 转后台的接手方（Gateway 装配）。空 = 不转。
+    detach: Option<Arc<DetachSlot>>,
 }
 
 /// 用 bwrap 把 komo 自己的状态只读挂上再跑命令（§7 的硬限制延伸到 `bash`）。
@@ -214,7 +221,14 @@ impl BashTool {
             shell: default_shell(),
             register: None,
             sandbox: None,
+            detach: None,
         }
+    }
+
+    /// 对话会话里跑久了的命令交给这个槽里的接手方（`docs/monitor.md` §8）。
+    pub fn detaching(mut self, slot: Arc<DetachSlot>) -> Self {
+        self.detach = Some(slot);
+        self
     }
 
     /// 把这个工具起的子进程登记在册，恢复扫描才核实得了它们（§8.7）。
@@ -270,26 +284,25 @@ impl Tool for BashTool {
         ToolDefinition {
             name: "bash".into(),
             description:
-                "在自己的进程组里跑一条 bash 命令，返回退出码与输出。默认就在会话工作目录里跑，\
-                 不用先 cd 过去；要换目录给 cwd。git、构建、测试、跑程序走它；\
-                 只是看文件、搜代码、列文件用 read / rg（列文件设 list_files=true），\
-                 要读要搜好几处用 codemode。\
-                 等一件慢事（下载、构建、部署）就在一条命令里循环轮询、每轮打印一行进度，并把 \
-                 timeout_secs 给够：release 构建、整个工作区的测试常要 5–15 分钟，给 900 以上，\
-                 别用默认的 120；到点会终止进程组，到点前打印的输出照样交回，接着再发一条即可。\
-                 不要每轮只 sleep 一下就交回来再问一次。\
-                 命令跑着的时候，用户说的话要等它跑完才轮得到：在跟用户对话的会话里，预计要等\
-                 十分钟以上的事别在这里等——要接着做一串事、最后给结论的派 task，只是等一个结果\
-                 或盯一个状态的挂 monitor（脚本只在完成或出错时打一行），这一轮先回复用户。\
-                 你自己就是后台任务（没有 task 可用）时照上面在这里等，别挂 monitor：任务这一轮\
-                 一结束，结果就交回去了。"
+                "在自己的进程组里跑一条 bash 命令，返回退出码与输出。默认在会话工作目录里跑，\
+                 换目录给 cwd。git、构建、测试、跑程序走它；只是看文件、搜代码、列文件用 read / rg\
+                 （列文件设 list_files=true），要读要搜好几处用 codemode。\n\
+                 构建、下载、部署这类慢事照常写成一条命令，timeout_secs 按预计时长给足（省略 = 120）。\
+                 要等一个状态（流水线、工单、部署进度）别在这里 sleep 轮询——挂 monitor，脚本在完成或\
+                 出错时打一行；对话会话里 10 秒以上的 sleep 会被拒绝。\n\
+                 在跟用户对话的会话里，命令跑过 2 分钟还没完会自动转到后台：这次调用先返回「已转后台 #id」，\
+                 跑完时退出码和输出尾部会作为一条消息交回这个会话。拿到「已转后台」就先回复用户、结束这一轮\
+                 ——别 sleep 等它，也别再发命令去查；要停用 monitor_stop。\n\
+                 要中途每出一件事就知道（每个 job 的结果、日志里的每条报错）挂 monitor；要接着做一串事、\
+                 最后给结论派 task。\n\
+                 你自己就是后台任务时不会转后台，也可以 sleep 轮询，照常在这里等。"
                     .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "要执行的命令，交给 bash -c（没有 bash 的机器上是 /bin/sh -c）" },
                     "cwd": { "type": "string", "description": "工作目录；相对路径按会话工作目录解析" },
-                    "timeout_secs": { "type": "integer", "minimum": 1, "description": "活动执行时限，秒；省略 = 120，上限是这次调用的活动执行时限" }
+                    "timeout_secs": { "type": "integer", "minimum": 1, "description": "时限，秒，按预计时长给足；省略 = 120，上限是 [execution] call_timeout_secs。到点终止进程组（转到后台之后同样从调用开始算）" }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -303,6 +316,17 @@ impl Tool for BashTool {
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
         let args: BashArgs = parse_args(args, "bash")?;
+        if ctx.conversation
+            && let Some(sleep) = long_sleep(&args.command)
+        {
+            return Err(ToolError::Failed {
+                message: format!(
+                    "对话会话里不在 bash 里 sleep 等（命令里有 `{sleep}`）。等一个状态（流水线、工单、\
+                     部署进度）就挂 monitor：脚本在完成或出错时打一行，轮询间隔不短于 15 秒；挂完这一轮先\
+                     回复用户。短于 10 秒的 sleep（等服务起来之类）可以留在 bash 里。"
+                ),
+            });
+        }
         plan_for_call(&args, ctx)
     }
 
@@ -335,7 +359,16 @@ impl Tool for BashTool {
             label: format!("bash · run {} · call {}", ctx.run, ctx.call),
         };
 
-        let outcome = run_child(spec, sink, &ctx.cancel)
+        // 转后台要有接手方，而且得比时限早到点——否则命令先超时，没有"转"的余地。
+        let detach_after = ctx.detach_after.filter(|after| {
+            *after < timeout
+                && self
+                    .detach
+                    .as_ref()
+                    .is_some_and(|slot| slot.get().is_some())
+        });
+        let started = std::time::Instant::now();
+        let driven = run_child_detachable(spec, sink, &ctx.cancel, detach_after)
             .await
             .map_err(|error| match error {
                 ProcessError::Spawn(message) => ToolError::Failed {
@@ -345,6 +378,64 @@ impl Tool for BashTool {
                     ToolError::Failed { message }
                 }
             })?;
+        let outcome = match driven {
+            Driven::Done(outcome) => outcome,
+            Driven::Detached(live) => {
+                let (stdout_bytes, stderr_bytes, stdout_excerpt, stderr_excerpt) = live.so_far();
+                let detacher = self
+                    .detach
+                    .as_ref()
+                    .and_then(|slot| slot.get())
+                    .expect("detach_after 只在有接手方时给");
+                let handle = detacher
+                    .adopt(DetachedCall {
+                        attempt: sink.attempt().clone(),
+                        command: args.command.clone(),
+                        cwd: cwd.clone(),
+                        live: *live,
+                    })
+                    .await
+                    .map_err(|message| ToolError::Failed {
+                        message: format!("转后台没成功，命令已终止：{message}"),
+                    })?;
+                let elapsed = started.elapsed().as_secs();
+                let stderr_tail = tail_lines(&stderr_excerpt, 20);
+                let stderr_part = if stderr_tail.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n[stderr]\n{stderr_tail}")
+                };
+                let preview = format!(
+                    "已转后台 #{short}：命令跑了 {elapsed} 秒还没完（[execution] detach_after_secs），\
+                     仍在运行；结束时退出码和输出尾部会作为一条消息交回这个会话，要停用 \
+                     monitor_stop #{short}。先回复用户、结束这一轮，别 sleep 等它，也别再发命令去查。\n\
+                     到现在的输出（stdout={stdout_bytes}B stderr={stderr_bytes}B，只列末尾）：\n{}{stderr_part}",
+                    tail_lines(&stdout_excerpt, 40),
+                    short = handle.short_id,
+                );
+                let result = BashResult {
+                    command: args.command,
+                    cwd: cwd.display().to_string(),
+                    exit_code: None,
+                    timed_out: false,
+                    output_truncated: false,
+                    stdout_bytes,
+                    stderr_bytes,
+                    stdout_excerpt,
+                    stderr_excerpt,
+                    detached: Some(handle.id),
+                };
+                return Ok(ToolOutput {
+                    status: ToolResultStatus::Completed,
+                    result: serde_json::to_value(&result).map_err(|error| ToolError::Failed {
+                        message: error.to_string(),
+                    })?,
+                    exit_code: None,
+                    artifacts: vec![],
+                    preview: Some(preview),
+                });
+            }
+        };
 
         if outcome.cancelled {
             return Err(ToolError::Cancelled);
@@ -363,6 +454,7 @@ impl Tool for BashTool {
             stderr_bytes: outcome.stderr_bytes,
             stdout_excerpt: outcome.stdout_excerpt,
             stderr_excerpt: outcome.stderr_excerpt,
+            detached: None,
         };
         // 非零退出码是**结果**，不是工具失败：模型看得到退出码才改得动命令（§6）。
         let status = if outcome.exit_code == Some(0) && !outcome.timed_out {
@@ -436,7 +528,9 @@ pub fn base_environment() -> BTreeMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::detach::{Detached, Detacher};
     use crate::tools::process::process_group_alive;
+    use crate::tools::process::{ChildOutcome, drive};
     use crate::tools::test_support::{context, context_with_cancel, writer};
     use komo_kernel::types::tool::CancelToken;
 
@@ -719,6 +813,173 @@ mod tests {
             matches!(error, ToolError::InvalidArguments { .. }),
             "{error:?}"
         );
+    }
+
+    /// 对话会话里 10 秒以上的字面量 sleep 在 prepare 就被拒，提示用 monitor；短 sleep、
+    /// 非字面量放行；任务会话与 Cron 的 Run（`conversation = false`）照常能 sleep。
+    #[tokio::test]
+    async fn a_long_sleep_is_refused_in_a_conversation_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = BashTool::new();
+        let mut conversation = context(dir.path());
+        conversation.conversation = true;
+        let elsewhere = context(dir.path());
+
+        for command in [
+            "for i in $(seq 1 30); do glab ci status; sleep 20; done",
+            "sleep 1m",
+        ] {
+            let error = tool
+                .prepare(serde_json::json!({ "command": command }), &conversation)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, ToolError::Failed { message } if message.contains("monitor")),
+                "{command}: {error:?}"
+            );
+            tool.prepare(serde_json::json!({ "command": command }), &elsewhere)
+                .await
+                .expect("任务会话 / Cron 里放行");
+        }
+        for command in ["sleep 2 && curl localhost:8080", "sleep $N"] {
+            tool.prepare(serde_json::json!({ "command": command }), &conversation)
+                .await
+                .unwrap_or_else(|error| panic!("{command}: {error:?}"));
+        }
+    }
+
+    /// 接手方：把活子进程交给自己的任务跑到底，结果从 channel 出来。
+    struct Adopter {
+        done: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<ChildOutcome>>>,
+        stopped: CancelToken,
+    }
+
+    #[async_trait]
+    impl Detacher for Adopter {
+        async fn adopt(&self, call: DetachedCall) -> Result<Detached, String> {
+            let tx = self.done.lock().unwrap().take().expect("只接一次");
+            let cancel = self.stopped.clone();
+            let attempt = call.attempt.clone();
+            tokio::spawn(async move {
+                let mut sink = komo_kernel::test_support::MemOutputWriter::new(attempt);
+                if let Ok(Driven::Done(outcome)) = drive(call.live, &mut sink, &cancel, None).await
+                {
+                    let _ = tx.send(outcome);
+                }
+            });
+            Ok(Detached {
+                id: "0199-abcd".into(),
+                short_id: "abcd".into(),
+            })
+        }
+    }
+
+    fn adopting() -> (
+        BashTool,
+        tokio::sync::oneshot::Receiver<ChildOutcome>,
+        CancelToken,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let stopped = CancelToken::new();
+        let slot = Arc::new(DetachSlot::default());
+        slot.set(Arc::new(Adopter {
+            done: std::sync::Mutex::new(Some(tx)),
+            stopped: stopped.clone(),
+        }));
+        (BashTool::new().detaching(slot), rx, stopped)
+    }
+
+    /// 跑过阈值：这次调用立刻带着「已转后台」收尾（不等命令），进程接着在接手方手里跑完，
+    /// 退出码与转后台前后的输出都拿得到。
+    #[tokio::test]
+    async fn a_command_past_the_threshold_returns_detached_while_it_keeps_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path());
+        ctx.detach_after = Some(Duration::from_secs(1));
+        let (tool, done, _) = adopting();
+        let mut sink = writer(&ctx);
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "command": "echo before; sleep 3; echo after; exit 5" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "没等命令跑完"
+        );
+        assert_eq!(output.status, ToolResultStatus::Completed);
+        assert_eq!(output.exit_code, None);
+        assert_eq!(output.result["detached"], "0199-abcd");
+        let preview = output.preview.unwrap();
+        assert!(preview.starts_with("已转后台 #abcd"), "{preview}");
+        assert!(preview.contains("monitor_stop #abcd"), "{preview}");
+        assert!(preview.contains("before"), "{preview}");
+
+        let outcome = done.await.expect("接手方跑完了它");
+        assert_eq!(outcome.exit_code, Some(5));
+        assert!(outcome.stdout_excerpt.contains("before"));
+        assert!(outcome.stdout_excerpt.contains("after"));
+    }
+
+    /// 超时从调用开始算：转后台之后到点，接手方那边看到的是超时、进程组被终止。
+    #[tokio::test]
+    async fn the_timeout_counts_from_the_start_of_the_call_not_from_the_detach() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path());
+        ctx.detach_after = Some(Duration::from_secs(1));
+        let (tool, done, _) = adopting();
+        let mut sink = writer(&ctx);
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "command": "sleep 30", "timeout_secs": 2 }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert!(output.result["detached"].is_string());
+        let started = std::time::Instant::now();
+        let outcome = done.await.unwrap();
+        assert!(outcome.timed_out, "{outcome:?}");
+        assert!(
+            started.elapsed() < Duration::from_millis(1800),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// 没有接手方、没给阈值、阈值不早于时限：都不转，照旧在这里等。
+    #[tokio::test]
+    async fn without_a_detacher_or_a_threshold_it_waits_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path());
+        let mut sink = writer(&ctx);
+        // 阈值给了但没有接手方。
+        ctx.detach_after = Some(Duration::from_millis(200));
+        let bare = BashTool::new();
+        let plan = bare
+            .prepare(serde_json::json!({ "command": "sleep 1; echo ok" }), &ctx)
+            .await
+            .unwrap();
+        let output = bare.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert_eq!(output.exit_code, Some(0));
+
+        // 有接手方但这次调用没有阈值（任务会话、Cron、0）。
+        ctx.detach_after = None;
+        let (tool, _done, _) = adopting();
+        let mut sink = writer(&ctx);
+        let plan = tool
+            .prepare(serde_json::json!({ "command": "sleep 1; echo ok" }), &ctx)
+            .await
+            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        assert_eq!(output.exit_code, Some(0));
+        assert!(output.result.get("detached").is_none());
     }
 
     #[tokio::test]

@@ -156,11 +156,9 @@ pub async fn run_tui(
     let cwd = std::env::current_dir()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
-    // 只排进这一帧，跟着下面第一次 `render` 一起写出去。
-    let _ = queue!(
-        terminal.terminal.backend_mut(),
-        SetTitle(render::title(&cwd))
-    );
+    // 标签页标题上次设成了什么：Run 在跑时它随转圈换帧，**变了才发**——空闲时一帧照旧
+    // 一个字节不写（[`FrameWriter`]）。
+    let mut shown_title = String::new();
     let _ = terminal.commit(render::banner(&app, &cwd));
     let mut emitted = Emitted::new();
     let mut ticker = tokio::time::interval(TICK);
@@ -173,6 +171,12 @@ pub async fn run_tui(
             break Ok(());
         }
         app.now = Some(time::OffsetDateTime::now_utc());
+        let title = render::tab_title(&app, &cwd);
+        if title != shown_title {
+            // 只排进这一帧，跟着下面的 `render` 一起写出去。
+            let _ = queue!(terminal.terminal.backend_mut(), SetTitle(&title));
+            shown_title = title;
+        }
         let drawn = if std::mem::take(&mut app.repaint) {
             terminal.repaint(&app, &mut emitted, render::banner(&app, &cwd))
         } else {
@@ -242,6 +246,12 @@ pub async fn run_tui(
     if let Some(subscription) = subscription {
         subscription.abort();
     }
+    // 退出时 Run 可能还在跑：标题不许冻在某一帧星上。去掉星，跟着 `drop` 里最后那次
+    // 冲刷写出去。
+    let _ = queue!(
+        terminal.terminal.backend_mut(),
+        SetTitle(render::title(&cwd))
+    );
     drop(terminal);
     // 退出即暂停：Run 留在 Gateway 里照跑，人回来靠的是**这一行命令**。会话 Id 只在身份
     // 行上闪过一次，退出这一刻正是需要它的时刻。会话还没铸出来（`komo` 一个字没发就退）
@@ -1020,7 +1030,13 @@ mod tests {
         };
         let written = || std::fs::read(file.path()).expect("能读");
 
-        for frame in [&b"\x1b[?25l a \x1b[?25h"[..], b"\x1b[?25l a \x1b[?25h", b"b", b"b", b"a"] {
+        for frame in [
+            &b"\x1b[?25l a \x1b[?25h"[..],
+            b"\x1b[?25l a \x1b[?25h",
+            b"b",
+            b"b",
+            b"a",
+        ] {
             writer.write_all(frame).expect("能写");
             writer.flush().expect("能冲刷");
         }

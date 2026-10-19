@@ -408,6 +408,17 @@ pub fn title(cwd: &str) -> String {
     }
 }
 
+/// 这一刻标签页上该是什么：[`title`]，**Run 没跑完时前面挂着状态行那颗星**（同一帧）——
+/// 切到别的标签页也看得出它还在动，停下来了星就没了。
+pub fn tab_title(app: &App, cwd: &str) -> String {
+    match app.run_state() {
+        Some(state) if !state.is_terminal() => {
+            format!("{} {}", crate::tui::spinner::frame(app.now), title(cwd))
+        }
+        _ => title(cwd),
+    }
+}
+
 fn run_colour(state: RunState) -> Color {
     match state {
         RunState::Accepted | RunState::Queued | RunState::Running => Color::Cyan,
@@ -680,6 +691,29 @@ fn main() {
         assert_eq!(title("/"), "κ", "根目录没有最后一段");
         assert_eq!(title(""), "κ", "取不到当前目录");
         assert_eq!(title("/tmp/a\u{7}b"), "κ - ab", "控制字符不进 OSC");
+    }
+
+    /// 标签页标题跟着 Run 转：跑着时前面挂着状态行那颗星、随钟换帧，跑完了星就没了。
+    #[test]
+    fn the_title_spins_while_a_run_is_going_and_settles_when_it_ends() {
+        let cwd = "/Users/x/01-code/komo-bot";
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        assert_eq!(tab_title(&app, cwd), "κ - komo-bot", "还没跑过不挂星");
+        feed(&mut app, &fixture::conversation()[..5]);
+
+        app.apply(ServerEvent::Tick(fixture::T0));
+        let first = tab_title(&app, cwd);
+        assert_eq!(
+            first,
+            format!("{} κ - komo-bot", crate::tui::spinner::frame(app.now))
+        );
+        app.apply(ServerEvent::Tick(
+            fixture::T0 + time::Duration::milliseconds(crate::tui::spinner::FRAME_MS as i64),
+        ));
+        assert_ne!(tab_title(&app, cwd), first, "过了一帧，标题上的星该换一帧");
+
+        feed(&mut app, &fixture::conversation()[5..]);
+        assert_eq!(tab_title(&app, cwd), "κ - komo-bot", "跑完了不再挂星");
     }
 
     /// **光标要落在输入框里、落在刚打完那个字的后面。** 不摆这一下，人在框里打字、插入符

@@ -71,6 +71,8 @@ const BACKFILL_PAGE: u32 = 500;
 const TICK: Duration = Duration::from_millis(80);
 /// 清单上挂着东西时多久再问一次（[`App::poll_pending`]）：别处答掉的那条最多挂这么久。
 const PENDING_POLL: Duration = Duration::from_secs(5);
+/// 终端尺寸多久不再变，才算拖完（[`ResizeGate`]）。拖动时尺寸大约每 16ms 变一次。
+const RESIZE_SETTLE: Duration = Duration::from_millis(100);
 
 #[derive(Debug, thiserror::Error)]
 pub enum TuiError {
@@ -159,6 +161,9 @@ pub async fn run_tui(
     // 标签页标题上次设成了什么：Run 在跑时它随转圈换帧，**变了才发**——空闲时一帧照旧
     // 一个字节不写（[`FrameWriter`]）。
     let mut shown_title = String::new();
+    // 终端自己在标签页上转时（OSC 9;4），上次告诉它的是转还是停——同样变了才发。
+    let tab_spinner = render::TabSpinner::detect();
+    let mut shown_busy = false;
     let _ = terminal.commit(render::banner(&app, &cwd));
     let mut emitted = Emitted::new();
     let mut ticker = tokio::time::interval(TICK);
@@ -171,20 +176,46 @@ pub async fn run_tui(
             break Ok(());
         }
         app.now = Some(time::OffsetDateTime::now_utc());
-        let title = render::tab_title(&app, &cwd);
+        let title = render::tab_title(&app, &cwd, tab_spinner);
         if title != shown_title {
             // 只排进这一帧，跟着下面的 `render` 一起写出去。
             let _ = queue!(terminal.terminal.backend_mut(), SetTitle(&title));
             shown_title = title;
         }
-        let drawn = if std::mem::take(&mut app.repaint) {
-            terminal.repaint(&app, &mut emitted, render::banner(&app, &cwd))
-        } else {
-            terminal.render(&app, &mut emitted)
+        let busy = render::busy(&app);
+        if tab_spinner == render::TabSpinner::Native && busy != shown_busy {
+            let _ = queue!(
+                terminal.terminal.backend_mut(),
+                Print(render::tab_progress(busy))
+            );
+            shown_busy = busy;
+        }
+        // 终端被拉大拉小：照 pi，整段重画。已经画在屏幕上的视口会被终端按新宽度折行、
+        // 挪位，残骸留在视口上面；交出去的正文也是按旧宽度截的。只把视口贴回底部收拾
+        // 不了这两样。整段重画是把整段会话再写一遍，拖动时不能每变一次就来一遍
+        // （[`ResizeGate`]）。
+        let step = match terminal.resize_step(Instant::now()) {
+            Ok(step) => step,
+            Err(error) => break Err(TuiError::Terminal(error)),
+        };
+        let drawn = match step {
+            ResizeStep::Hold(_) => Ok(()),
+            ResizeStep::Repaint => {
+                app.repaint = false;
+                terminal.repaint(&app, &mut emitted, render::banner(&app, &cwd))
+            }
+            ResizeStep::Frame if std::mem::take(&mut app.repaint) => {
+                terminal.repaint(&app, &mut emitted, render::banner(&app, &cwd))
+            }
+            ResizeStep::Frame => terminal.render(&app, &mut emitted),
         };
         if let Err(error) = drawn {
             break Err(TuiError::Terminal(error));
         }
+        let settle_at = match step {
+            ResizeStep::Hold(until) => Some(until),
+            _ => None,
+        };
 
         tokio::select! {
             batch = input.recv() => match batch {
@@ -224,6 +255,10 @@ pub async fn run_tui(
                 spawn_effects(&client, app.session.as_ref(), effects, &events_tx);
             }
             _ = ticker.tick() => {}
+            // 拖完了：到点回来补那一次整段重画。
+            _ = tokio::time::sleep_until(
+                tokio::time::Instant::from_std(settle_at.unwrap_or_else(Instant::now))
+            ), if settle_at.is_some() => {}
             _ = pending_poll.tick() => {
                 let effects = app.poll_pending();
                 spawn_effects(&client, app.session.as_ref(), effects, &events_tx);
@@ -252,6 +287,13 @@ pub async fn run_tui(
         terminal.terminal.backend_mut(),
         SetTitle(render::title(&cwd))
     );
+    // 终端那边的转圈同理：不清掉，komo 退出之后标签页还在转。
+    if shown_busy {
+        let _ = queue!(
+            terminal.terminal.backend_mut(),
+            Print(render::tab_progress(false))
+        );
+    }
     drop(terminal);
     // 退出即暂停：Run 留在 Gateway 里照跑，人回来靠的是**这一行命令**。会话 Id 只在身份
     // 行上闪过一次，退出这一刻正是需要它的时刻。会话还没铸出来（`komo` 一个字没发就退）
@@ -529,8 +571,13 @@ fn spawn_input_reader(
                     break;
                 }
             }
+            // 尺寸变了不是输入，但要叫醒主循环：空的一批也送过去，它醒来自己去量尺寸，不必
+            // 等下一拍。
+            let resized = raw
+                .iter()
+                .any(|(event, _)| matches!(event, TermEvent::Resize(..)));
             let batch = interpret(raw);
-            if !batch.is_empty() && tx.blocking_send(batch).is_err() {
+            if (!batch.is_empty() || resized) && tx.blocking_send(batch).is_err() {
                 return;
             }
         }
@@ -589,6 +636,74 @@ struct TerminalGuard {
     size: Size,
     /// 与 [`FrameWriter`] 共用的那个开关：只有 [`TerminalGuard::present`] 的冲刷才真写。
     present: Rc<Cell<bool>>,
+    /// 尺寸变了什么时候整段重画。
+    resize: ResizeGate,
+}
+
+/// 这一拍按尺寸该怎么画。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResizeStep {
+    /// 照常一帧。
+    Frame,
+    /// 整段重画。
+    Repaint,
+    /// 还在拖：这一拍什么都不画，到这个时刻再看。
+    Hold(Instant),
+}
+
+/// 尺寸变了的整段重画，拖动时只来两次：变的第一下立刻画（只拉一下的，比如最大化，不必
+/// 等），之后尺寸还在变就先不画，停下 [`RESIZE_SETTLE`] 再按最后的尺寸补画一次。
+///
+/// 起因（2026-10-19）：伪终端里 0.34 秒内改 20 次尺寸，原来每次都整段重画，19 次共写出
+/// 4.7 MB——komo 自己画得不慢，是终端要在拖动途中把这么多字节解析、折行一遍。
+#[derive(Debug)]
+struct ResizeGate {
+    /// 上一拍量到的尺寸：拿来分辨"又变了"与"停在那儿"。
+    seen: Size,
+    /// 上一次整段重画之后的静默期截止时刻。
+    quiet_until: Option<Instant>,
+    /// 静默期里尺寸又变过：到点必须补画，哪怕最后拉回了原来的尺寸——中间那几次折行的
+    /// 残骸还在屏幕上。
+    held: bool,
+}
+
+impl ResizeGate {
+    fn new(size: Size) -> Self {
+        ResizeGate {
+            seen: size,
+            quiet_until: None,
+            held: false,
+        }
+    }
+
+    /// `painted` 是上一次画的时候的尺寸，`current` 是终端现在的尺寸。
+    fn step(&mut self, painted: Size, current: Size, now: Instant) -> ResizeStep {
+        let moved = current != self.seen;
+        self.seen = current;
+        match self.quiet_until {
+            Some(until) if now < until => {
+                if moved {
+                    self.held = true;
+                    let until = now + RESIZE_SETTLE;
+                    self.quiet_until = Some(until);
+                    ResizeStep::Hold(until)
+                } else if self.held {
+                    ResizeStep::Hold(until)
+                } else {
+                    ResizeStep::Frame
+                }
+            }
+            _ if self.held || current != painted => {
+                self.held = false;
+                self.quiet_until = Some(now + RESIZE_SETTLE);
+                ResizeStep::Repaint
+            }
+            _ => {
+                self.quiet_until = None;
+                ResizeStep::Frame
+            }
+        }
+    }
 }
 
 impl TerminalGuard {
@@ -635,6 +750,7 @@ impl TerminalGuard {
             gap,
             size,
             present,
+            resize: ResizeGate::new(size),
         })
     }
 
@@ -651,11 +767,12 @@ impl TerminalGuard {
         self.synchronized(|this| this.frame(app, emitted))
     }
 
-    /// 整段重画（`Ctrl-T`）：擦掉屏幕与终端的回滚区，从开场横幅起把整段会话按现在的
-    /// 样子重新交一遍。
+    /// 整段重画（`Ctrl-T`，以及终端尺寸变了）：擦掉屏幕与终端的回滚区，从开场横幅起把
+    /// 整段会话按现在的样子、现在的宽度重新交一遍。
     ///
-    /// 交出去的行终端不让改，要改只能整段收回——pi 的 Ctrl-O 也是这么做的。代价是进 TUI
-    /// 之前终端里的那些也一起擦掉了。与平常的一帧一样包在同步输出里，擦与重画一次上屏。
+    /// 交出去的行终端不让改，要改只能整段收回——pi 的 Ctrl-O 与 resize 也是这么做的。代价
+    /// 是进 TUI 之前终端里的那些也一起擦掉了。与平常的一帧一样包在同步输出里，擦与重画
+    /// 一次上屏。
     fn repaint(
         &mut self,
         app: &App,
@@ -663,6 +780,8 @@ impl TerminalGuard {
         banner: Vec<Line<'static>>,
     ) -> Result<(), std::io::Error> {
         self.synchronized(|this| {
+            // 先认下新尺寸：横幅与正文要按新宽度交。
+            this.follow_terminal_size()?;
             wipe(this.terminal.backend_mut())?;
             // 视口还贴着底边，它上面整块都空了：下一次往回滚区写从第一行开始。
             this.gap = this.view.y;
@@ -696,7 +815,8 @@ impl TerminalGuard {
     }
 
     fn frame(&mut self, app: &App, emitted: &mut Emitted) -> Result<(), std::io::Error> {
-        self.follow_terminal_size()?;
+        // 尺寸不在这里认：认了，这一拍屏幕上的残骸没擦，下一拍 [`Self::resized`] 也就看不出
+        // 变过。画到一半终端被拉了，下一拍整段重画。
         self.commit(emitted.take(app, self.size.width))?;
 
         let live = emitted.live(app, self.size.width);
@@ -709,9 +829,15 @@ impl TerminalGuard {
             .map(|_| ())
     }
 
-    /// 终端被拉大拉小了：把视口重新贴到底部。
+    /// 量一次终端尺寸，问 [`ResizeGate`] 这一拍怎么画。
+    fn resize_step(&mut self, now: Instant) -> Result<ResizeStep, std::io::Error> {
+        let (width, height) = crossterm::terminal::size()?;
+        Ok(self.resize.step(self.size, Size::new(width, height), now))
+    }
+
+    /// 认下终端的新尺寸：把视口重新贴到底部。
     ///
-    /// 上面那些历史怎么重排是终端自己的事——它们已经交出去了，这里不该、也没法再动它们。
+    /// 只管视口这一块的账，只从 [`Self::repaint`] 进来——屏幕上已有的东西由它擦掉重交。
     fn follow_terminal_size(&mut self) -> Result<(), std::io::Error> {
         let (width, height) = crossterm::terminal::size()?;
         let size = Size::new(width, height);
@@ -988,6 +1114,76 @@ mod tests {
 
     fn key(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)
+    }
+
+    fn ms(at: Instant, millis: u64) -> Instant {
+        at + Duration::from_millis(millis)
+    }
+
+    /// 只拉一下（比如最大化）：当场整段重画，不等静默期。
+    #[test]
+    fn a_single_resize_repaints_at_once() {
+        let t0 = Instant::now();
+        let (a, b) = (Size::new(140, 40), Size::new(100, 40));
+        let mut gate = ResizeGate::new(a);
+        assert_eq!(gate.step(a, a, t0), ResizeStep::Frame);
+        assert_eq!(gate.step(a, b, ms(t0, 10)), ResizeStep::Repaint);
+        assert_eq!(
+            gate.step(b, b, ms(t0, 20)),
+            ResizeStep::Frame,
+            "画过了就照常一帧"
+        );
+        assert_eq!(gate.step(b, b, ms(t0, 500)), ResizeStep::Frame);
+    }
+
+    /// 拖动：第一下画，拖动途中一次都不画，停下静默期之后按最后的尺寸再画一次。
+    #[test]
+    fn dragging_repaints_once_at_the_start_and_once_after_it_settles() {
+        let t0 = Instant::now();
+        let start = Size::new(140, 40);
+        let mut gate = ResizeGate::new(start);
+        let mut painted = start;
+        let mut repaints = 0;
+        let mut last = t0;
+        for i in 1..=20u16 {
+            last = ms(t0, 16 * u64::from(i));
+            let current = Size::new(140 - 2 * i, 40);
+            match gate.step(painted, current, last) {
+                ResizeStep::Repaint => {
+                    repaints += 1;
+                    painted = current;
+                }
+                ResizeStep::Hold(until) => assert_eq!(until, last + RESIZE_SETTLE),
+                ResizeStep::Frame => panic!("拖动途中尺寸一直在变，不该照常画"),
+            }
+        }
+        assert_eq!(repaints, 1, "拖动途中只有第一下画了");
+
+        let end = Size::new(100, 40);
+        assert!(matches!(
+            gate.step(painted, end, ms(last, 50)),
+            ResizeStep::Hold(_)
+        ));
+        assert_eq!(
+            gate.step(painted, end, last + RESIZE_SETTLE),
+            ResizeStep::Repaint
+        );
+        assert_eq!(gate.step(end, end, ms(last, 120)), ResizeStep::Frame);
+    }
+
+    /// 拖了一圈又回到原来的尺寸：中间折行的残骸还在，照样补画。
+    #[test]
+    fn dragging_back_to_the_painted_size_still_repaints() {
+        let t0 = Instant::now();
+        let (a, b) = (Size::new(140, 40), Size::new(120, 40));
+        let mut gate = ResizeGate::new(a);
+        assert_eq!(gate.step(a, b, t0), ResizeStep::Repaint);
+        assert!(matches!(gate.step(b, a, ms(t0, 16)), ResizeStep::Hold(_)));
+        assert!(matches!(gate.step(b, b, ms(t0, 32)), ResizeStep::Hold(_)));
+        assert_eq!(
+            gate.step(b, b, ms(t0, 32) + RESIZE_SETTLE),
+            ResizeStep::Repaint
+        );
     }
 
     /// **一帧只写一次。** ratatui 自己的冲刷、正文行里的换行都不许把半帧送出去——隔着

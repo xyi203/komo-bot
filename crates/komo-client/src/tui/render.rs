@@ -408,14 +408,55 @@ pub fn title(cwd: &str) -> String {
     }
 }
 
-/// 这一刻标签页上该是什么：[`title`]，**Run 没跑完时后面挂着状态行那颗星**（同一帧）——
-/// 切到别的标签页也看得出它还在动，停下来了星就没了。星挂在右边，左边的标题不随帧挪动。
-pub fn tab_title(app: &App, cwd: &str) -> String {
-    match app.run_state() {
-        Some(state) if !state.is_terminal() => {
-            format!("{} {}", title(cwd), crate::tui::spinner::frame(app.now))
+/// 标签页上"还在跑"由谁来画。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabSpinner {
+    /// 终端自己画：发 OSC 9;4 进度态，终端在标签页**最右边**的徽标位上转（Otty 的
+    /// tab 徽标就在那儿）。标题文字一个字不动，于是也不会因为多了一颗星整体挪半格。
+    Native,
+    /// 终端不认 OSC 9;4：星挂在标题文字后面。
+    InTitle,
+}
+
+impl TabSpinner {
+    /// 按 `TERM_PROGRAM` 认终端。
+    ///
+    /// **只认确认过的。** OSC 9;4 与 iTerm 式的 OSC 9 桌面通知共用一个号：不认 `4;` 子协议
+    /// 的终端会把 `4;3` 当成一条通知弹出来——每跑一轮弹两次，比不转还糟。
+    pub fn detect() -> Self {
+        Self::for_terminal(std::env::var("TERM_PROGRAM").ok().as_deref())
+    }
+
+    fn for_terminal(term_program: Option<&str>) -> Self {
+        match term_program {
+            Some(name) if name.eq_ignore_ascii_case("otty") => TabSpinner::Native,
+            _ => TabSpinner::InTitle,
         }
-        _ => title(cwd),
+    }
+}
+
+/// Run 还没到终态：标签页上该转。
+pub fn busy(app: &App) -> bool {
+    app.run_state().is_some_and(|state| !state.is_terminal())
+}
+
+/// 这一刻标签页上该是什么：[`title`]。终端自己画不了转圈时（[`TabSpinner::InTitle`]），
+/// **Run 没跑完时后面挂着状态行那颗星**（同一帧）——切到别的标签页也看得出它还在动，停
+/// 下来了星就没了。
+pub fn tab_title(app: &App, cwd: &str, spinner: TabSpinner) -> String {
+    if spinner == TabSpinner::InTitle && busy(app) {
+        format!("{} {}", title(cwd), crate::tui::spinner::frame(app.now))
+    } else {
+        title(cwd)
+    }
+}
+
+/// 让终端在标签页上转起来 / 停下来的那条 OSC 9;4（`3` 不定进度，`0` 清掉）。
+pub fn tab_progress(busy: bool) -> &'static str {
+    if busy {
+        "\x1b]9;4;3\x07"
+    } else {
+        "\x1b]9;4;0\x07"
     }
 }
 
@@ -697,12 +738,17 @@ fn main() {
     #[test]
     fn the_title_spins_while_a_run_is_going_and_settles_when_it_ends() {
         let cwd = "/Users/x/01-code/komo-bot";
+        let spinner = TabSpinner::InTitle;
         let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
-        assert_eq!(tab_title(&app, cwd), "κ - komo-bot", "还没跑过不挂星");
+        assert_eq!(
+            tab_title(&app, cwd, spinner),
+            "κ - komo-bot",
+            "还没跑过不挂星"
+        );
         feed(&mut app, &fixture::conversation()[..5]);
 
         app.apply(ServerEvent::Tick(fixture::T0));
-        let first = tab_title(&app, cwd);
+        let first = tab_title(&app, cwd, spinner);
         assert_eq!(
             first,
             format!("κ - komo-bot {}", crate::tui::spinner::frame(app.now))
@@ -710,10 +756,55 @@ fn main() {
         app.apply(ServerEvent::Tick(
             fixture::T0 + time::Duration::milliseconds(crate::tui::spinner::FRAME_MS as i64),
         ));
-        assert_ne!(tab_title(&app, cwd), first, "过了一帧，标题上的星该换一帧");
+        assert_ne!(
+            tab_title(&app, cwd, spinner),
+            first,
+            "过了一帧，标题上的星该换一帧"
+        );
 
         feed(&mut app, &fixture::conversation()[5..]);
-        assert_eq!(tab_title(&app, cwd), "κ - komo-bot", "跑完了不再挂星");
+        assert_eq!(
+            tab_title(&app, cwd, spinner),
+            "κ - komo-bot",
+            "跑完了不再挂星"
+        );
+    }
+
+    /// 终端自己会在标签页右边转（OSC 9;4）时，标题一个字都不变——转圈交给终端，跑没跑完
+    /// 只由 [`busy`] 说。
+    #[test]
+    fn a_terminal_that_draws_its_own_spinner_keeps_the_title_still() {
+        let cwd = "/Users/x/01-code/komo-bot";
+        let mut app = App::new(Some(fixture::session()), TuiMode::New, "seed");
+        assert!(!busy(&app));
+        feed(&mut app, &fixture::conversation()[..5]);
+        app.apply(ServerEvent::Tick(fixture::T0));
+        assert!(busy(&app));
+        assert_eq!(tab_title(&app, cwd, TabSpinner::Native), "κ - komo-bot");
+
+        feed(&mut app, &fixture::conversation()[5..]);
+        assert!(!busy(&app));
+        assert_eq!(tab_progress(true), "\x1b]9;4;3\x07");
+        assert_eq!(tab_progress(false), "\x1b]9;4;0\x07");
+    }
+
+    /// 只有确认认 OSC 9;4 的终端才交给终端画；认不准的照旧挂在标题上，免得 `4;3` 被当成
+    /// 一条桌面通知弹出来。
+    #[test]
+    fn only_known_terminals_get_the_native_tab_spinner() {
+        assert_eq!(TabSpinner::for_terminal(Some("otty")), TabSpinner::Native);
+        for other in [
+            Some("iTerm.app"),
+            Some("Apple_Terminal"),
+            Some("vscode"),
+            None,
+        ] {
+            assert_eq!(
+                TabSpinner::for_terminal(other),
+                TabSpinner::InTitle,
+                "{other:?}"
+            );
+        }
     }
 
     /// **光标要落在输入框里、落在刚打完那个字的后面。** 不摆这一下，人在框里打字、插入符

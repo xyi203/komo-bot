@@ -448,6 +448,8 @@ async fn put_in(
         Some(reference) => Some(encode(reference)?),
         None => None,
     };
+    let adopted_count = (item.usage.adopted_count > 0)
+        .then(|| i64::try_from(item.usage.adopted_count).unwrap_or(i64::MAX));
     match existing {
         Some(mut row) => {
             row.update()
@@ -468,6 +470,8 @@ async fn put_in(
                 .last_used_at(to_ts_opt(item.usage.last_used_at))
                 .supersedes(supersedes.clone())
                 .superseded_by(superseded_by.clone())
+                .adopted_count(adopted_count)
+                .last_adopted_at(item.usage.last_adopted_at.map(to_ts))
                 .exec(ex)
                 .await
                 .map_err(map_toasty)?;
@@ -494,6 +498,8 @@ async fn put_in(
                 supersedes: supersedes.clone(),
                 superseded_by: superseded_by.clone(),
                 consolidated_at: None,
+                adopted_count,
+                last_adopted_at: item.usage.last_adopted_at.map(to_ts),
             })
             .exec(ex)
             .await
@@ -863,6 +869,8 @@ pub(super) async fn load_item(
         usage: komo_kernel::types::memory::MemoryUsage {
             count: row.usage_count.max(0) as u64,
             last_used_at: from_ts_opt(row.last_used_at),
+            adopted_count: row.adopted_count.unwrap_or(0).max(0) as u64,
+            last_adopted_at: row.last_adopted_at.map(from_ts),
         },
         supersedes: match &row.supersedes {
             Some(raw) => Some(decode(raw, "memory_items.supersedes")?),

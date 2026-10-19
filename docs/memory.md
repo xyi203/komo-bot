@@ -14,7 +14,7 @@
 | §9.7 | 与 resume 和权限的关系 | 规格 |
 | §9.8 | 离线整理 | 已实现 |
 | §9.9 | 判关系时候选用编号 | 已实现 |
-| §9.10 | 按会话提取，一次调用 | 已实现（`used` 采纳字段未定，不做） |
+| §9.10 | 按会话提取，一次调用 | 已实现（含 `used` 采纳） |
 | 附录 A | 外部记忆仓库调研（graphiti / mem0 / OpenViking） | 2026-10-19 |
 | 附录 B | 记忆机制改进方案（原 `docs/memory-improvements.md`） | 2026-10-16 提案 |
 | 附录 C | 对照 v0.8 的差距分析（原 `docs/memory.md`） | 2026-09-24 分析 |
@@ -48,7 +48,7 @@
 | observed_at / valid_until | 事实的观察时间与可选有效期，区别于入库时间                                            |
 | created_at / updated_at   | 记忆管理时间                                                                          |
 | extraction_metadata       | 提取模型、effort、提示词版本、处理来源游标                                            |
-| usage                     | 使用次数与最近使用时间，只度量使用情况，不增加真实性                                  |
+| usage                     | 注入次数与最近注入时间；用上次数（`adopted_count`）与最近用上时间（§9.10），只度量使用情况，不增加真实性 |
 | supersedes / superseded_by | 取代了谁 / 被谁取代（id + revision）；前者挂在新条目，后者挂在每条被取代的旧条目      |
 
 证据与内容版本分别保留。用户确认绑定具体 id / revision 和操作者事件；模型返回的 user_confirmed 字段没有写入权限。明确的用户原话可标为 active + user_statement + unconfirmed，展示为“自动整理自用户陈述”；模型推断默认 candidate，不作为已确认事实注入。
@@ -256,10 +256,19 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 
 **验收。** `a_verdict_index_maps_back_to_the_listed_candidate`（含数字字符串）、`an_out_of_range_index_is_dropped`、`a_repeated_index_keeps_only_the_first_verdict`，均在 `memory/tests.rs`。映射在 `consolidate::map_verdicts`。
 
-## 9.10 按会话提取，一次调用（2026-10-19 认可，已实现；`used` 采纳字段未定）
+## 9.10 按会话提取，一次调用（2026-10-19 认可，已实现）
 
-> **实现状态（2026-10-19）。已落地：** 按会话空闲后整批领取（`[memory].extract_idle`，默认 10m，热重载，必须 > 0）；`kind = task` 会话与 Cron 的 Run 不调模型、标 `done`、游标推到末尾；一批一次提取调用，观察上限改为每批 `[memory].max_observations`（默认 8），证据可引批内任一 Run 的事件并按事件记 `extracted_from_run`；窗口保留全部用户行、超预算按 Run 边界切段；`task-result:` 输入渲染为「任务交回」且不能引为证据；提取与判关系合成一次调用（提取前整批召回 20 条编号放进提示词，观察可带 `relations`，`classify` 已删），提示词 `memory-extract/v5`；每批一条结构化 INFO 日志（会话、kind、Run 数、窗口字符数、跳过原因、模型交回数、落库数，字段名见 `process_batch`）。
-> **未做：** `komo.memory.extract` span（日志字段已备好）；`used`（模型自报采纳了哪几条）字段未定，不做。
+> **实现状态（2026-10-19）。已落地：** 按会话空闲后整批领取（`[memory].extract_idle`，默认 10m，热重载，必须 > 0）；`kind = task` 会话与 Cron 的 Run 不调模型、标 `done`、游标推到末尾；一批一次提取调用，观察上限改为每批 `[memory].max_observations`（默认 8），证据可引批内任一 Run 的事件并按事件记 `extracted_from_run`；窗口保留全部用户行、超预算按 Run 边界切段；`task-result:` 输入渲染为「任务交回」且不能引为证据；提取与判关系合成一次调用（提取前整批召回 20 条编号放进提示词，观察可带 `relations`，`classify` 已删），提示词 `memory-extract/v6`（并入 `used`）；每批一条结构化 INFO 日志（会话、kind、Run 数、窗口字符数、跳过原因、模型交回数、落库数，字段名见 `process_batch`）。
+> **未做：** `komo.memory.extract` span（日志字段已备好）。`used` 采纳见下一段，已实现。
+
+**采纳（`used`，已实现）。** `usage.count` 只数曝光（注入块里有它就 +1，跨 Run 沿用也累计），不等于被用上（附录 B.3.5、B.6.2）。同一次提取调用里，提示词在「本批注入的记忆」一节列出这批 Run 注入过的条目，编号 `[m0]…`，与关系候选的 `[0]…` 分开；批里没有任何注入时不出现这一节。模型交回顶层 `"used":[{"memory":"m0","evidence":["<事件 ID>"]}]`，只在助手回复或工具调用明显依赖了它时才算（话题相关、复述都不算）。
+
+- **注入来源**：批内每个 Run 结束前最近的一条 `memory.injected`（`komo_kernel::events::injection_at`，`run inspect` 同一解法；沿用上一块的 Run 自己没有事件）。条目现在的 revision 与注入时不同则不列（正文已不是注入的那句话）。
+- **校验**（`Transcript::validate_used`）：evidence 必须含一个批内**助手事件**（工具调用发起在助手事件上）；只引用户行、单独的工具结果或不存在的 ID，整条丢弃并 warn。编号规则同 §9.9：越界、非整数丢弃，重复取第一条。
+- **落库**：`memory_items.adopted_count`（可空整数）与 `last_adopted_at`（可空时间），加列规则同 `superseded_by`；每批每条 +1，不改 state / confirmation / revision（`MemoryCatalog::record_adoption`）。在该批 `apply` 成功之后、游标推进之前记：提取或 apply 失败整批重试时还没记过，不会重复计数。`apply` 之后、游标写入之前进程崩溃会多记一次，接受。
+- **展示**：`komo memory show` 与 `list --full` 显示 注入 N 次 · 用上 M 次。
+- **指标**：`monotonic_counter.komo.memory.used`（target `komo::metrics`，属性 `komo.session.kind`），批报告 `PassReport.used` 供 `komo.memory.extract` span 记录。
+- **不做**：采纳数不参与召回排序、晋升或清理（§9.2：usage 只度量使用）；`sweep` 的 `never_used` 仍按注入算，改不改等攒出数据再定。
 
 **落地前的现状与数据。** 提取以 Run 为单位：Gateway 每 30 秒（`MEMORY_TICK`）领最多 8 个结束的 Run（`WORK_BATCH`），每个 Run 调一次提取，得到最多 5 条观察；每条观察不是逐字重复、又召回到相关条目时，再调一次 `classify`（§9.9）。一个 Run 最多 6 次模型调用。本机 2026-10-19：94 个会话、426 个 Run，只有一个 Run 的会话 40 个（只占 Run 的 9%），其余 54 个会话平均约 7 个 Run；v3 上线（10-16）后处理的 152 个 Run 里 102 个什么都没留下。
 
@@ -306,6 +315,7 @@ Rust 侧不变的三道：逐字相同先合并（`find_by_content`），`Transc
 - 窗口超限时用户输入行全部保留。
 - 超预算的批按 Run 边界切成多次调用，每个 Run 的游标各自推进。
 - 请求键 `task-result:` 的输入不能被引为 `user_statement`。
+- `used`：引助手事件 → 用上次数 +1 并记时刻；引用户行 / 单独工具结果 / 不存在的 ID、编号越界或非整数 → 丢弃；沿用上一块注入的 Run 也能解出来；失败重试只计一次；没有注入的批提示里没有这一节；旧行两列为 NULL 读作 0。
 
 ---
 

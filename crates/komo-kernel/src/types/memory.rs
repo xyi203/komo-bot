@@ -178,6 +178,16 @@ pub struct MemoryUsage {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_used_at: Option<OffsetDateTime>,
+    /// 用上次数：提取时模型指认"这一批的回复或工具调用确实依赖了它"并通过校验的批数
+    /// （§9.10）。`count` 只数曝光，这里数采纳。
+    #[serde(default)]
+    pub adopted_count: u64,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub last_adopted_at: Option<OffsetDateTime>,
 }
 
 /// 这条内容取代了**哪一条记忆的哪个版本**（§9.6）。

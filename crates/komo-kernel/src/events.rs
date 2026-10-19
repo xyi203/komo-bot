@@ -509,6 +509,21 @@ pub struct MemoryInjected {
     pub recall: Option<crate::types::memory::RecallDiagnostics>,
 }
 
+/// 截至 `upto`（含）最近的一条 `memory.injected`：一个 Run 系统提示里带的那一块。
+///
+/// 同一段对话里注入段只在换块时才记一条，后面的 Run 沿用它而不再记，所以要往前找最近
+/// 的一条；`run inspect` 与记忆提取（"这一批注入了什么"）共用这一个解法。
+pub fn injection_at(events: &[Event], upto: Seq) -> Option<(&Event, &MemoryInjected)> {
+    events
+        .iter()
+        .filter(|event| event.seq <= upto)
+        .filter_map(|event| match &event.payload {
+            EventPayload::MemoryInjected(body) => Some((event, body)),
+            _ => None,
+        })
+        .next_back()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConfigChanged {
     /// 变化的键名，**不带值**（§3）。

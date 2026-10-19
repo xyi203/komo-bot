@@ -545,12 +545,14 @@ pub fn memory_list_full(response: &MemoryListResponse) -> String {
             .collect::<Vec<_>>()
             .join(" ");
         out.push(format!(
-            "{}@{}\t{}\t{}\t{}\t{}",
+            "{}@{}\t{}\t{}\t{}\t注入 {} 次 · 用上 {} 次\t{}",
             item.id,
             item.revision,
             memory_state(item.state),
             provenance(item.provenance),
             confirmation(item.confirmation),
+            item.usage.count,
+            item.usage.adopted_count,
             content
         ));
     }
@@ -605,11 +607,16 @@ pub fn memory_show(item: &MemoryItem) -> String {
         item.extraction.prompt_version
     ));
     out.push(format!(
-        "使用    {} 次{}",
+        "使用    注入 {} 次{} · 用上 {} 次{}",
         item.usage.count,
         item.usage
             .last_used_at
-            .map(|at| format!("，最近 {}", stamp(at)))
+            .map(|at| format!("（最近 {}）", stamp(at)))
+            .unwrap_or_default(),
+        item.usage.adopted_count,
+        item.usage
+            .last_adopted_at
+            .map(|at| format!("（最近 {}）", stamp(at)))
             .unwrap_or_default()
     ));
     if item.evidence.is_empty() {

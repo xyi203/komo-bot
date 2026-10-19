@@ -691,6 +691,8 @@ fn memory_item() -> MemoryItem {
         usage: MemoryUsage {
             count: 5,
             last_used_at: Some(NOW),
+            adopted_count: 2,
+            last_adopted_at: Some(NOW),
         },
         supersedes: None,
         superseded_by: None,
@@ -728,8 +730,8 @@ fn a_full_memory_list_is_one_untruncated_line_per_memory() {
     assert_eq!(
         lines,
         vec![
-            format!("mem-1@3\t候选\t模型推断\t未确认\t{long}").as_str(),
-            "mem-2@3\t候选\t模型推断\t未确认\t第一行 第二行",
+            format!("mem-1@3\t候选\t模型推断\t未确认\t注入 5 次 · 用上 2 次\t{long}").as_str(),
+            "mem-2@3\t候选\t模型推断\t未确认\t注入 5 次 · 用上 2 次\t第一行 第二行",
         ]
     );
 }
@@ -762,7 +764,8 @@ fn a_memory_show_separates_when_it_was_observed_from_when_it_was_stored() {
             "入库 2026-09-16",
             "mem-model",
             "prompt v1",
-            "使用    5 次",
+            "注入 5 次",
+            "用上 2 次",
             "sess-1#4",
         ],
     );

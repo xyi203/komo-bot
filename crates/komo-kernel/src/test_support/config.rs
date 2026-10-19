@@ -79,6 +79,7 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             // 改默认值时这里不必跟。
             listen: "127.0.0.1:7777".into(),
             db_path: home.join("state.db"),
+            otlp_endpoint: None,
         },
         model_catalog,
         model: main,

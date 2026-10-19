@@ -6,6 +6,7 @@
 
 mod commands;
 mod connect;
+mod telemetry;
 mod update;
 
 use std::path::Path;
@@ -460,7 +461,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
         // TUI 里发出第一条消息时才铸：看一眼、一个字没发就退出，不该在账本和磁盘上
         // 留下一个空壳会话。
         None => {
-            init_tracing(None);
+            init_tracing(None, None);
             let client = connect::connect_or_start(home).await?;
             run_tui(client, None, TuiMode::New)
                 .await
@@ -468,7 +469,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
             Ok(None)
         }
         Some(Command::Home) => {
-            init_tracing(None);
+            init_tracing(None, None);
             let client = connect::connect_or_start(home).await?;
             let discovery = komo_client::discovery::read_discovery_file(home)
                 .map_err(|error| error.to_string())?;
@@ -482,7 +483,7 @@ async fn dispatch(cli: Cli, home: &Path) -> Result<Option<String>, String> {
             Ok(None)
         }
         Some(Command::Resume { session_id }) => {
-            init_tracing(None);
+            init_tracing(None, None);
             let client = connect::connect_or_start(home).await?;
             run_tui(
                 client,
@@ -717,8 +718,26 @@ async fn gateway(
     match action {
         // 前台运行：服务管理器起的就是这一种。
         None if foreground => {
-            init_tracing(Some(home));
-            komo_gateway::run(komo_gateway::ServiceOptions {
+            // OTLP 端点是启动期键：在装 tracing 之前读，exporter 随 subscriber 一起建好。
+            // 读不出配置不在这里报——`run` 自己会带着原因失败。
+            let endpoint =
+                komo_gateway::config::load_config(&komo_gateway::config::LoadOptions::at(home))
+                    .ok()
+                    .and_then(|loaded| loaded.snapshot.start_only.otlp_endpoint.clone());
+            let status = std::sync::Arc::new(komo_gateway::TelemetryStatus::new(endpoint.clone()));
+            let telemetry = endpoint.as_deref().map(|endpoint| {
+                telemetry::Telemetry::build(endpoint, &host_name(), std::sync::Arc::clone(&status))
+            });
+            let (telemetry, build_error) = match telemetry {
+                Some(Ok(telemetry)) => (Some(telemetry), None),
+                Some(Err(error)) => (None, Some(error)),
+                None => (None, None),
+            };
+            init_tracing(Some(home), telemetry.as_ref());
+            if let Some(error) = build_error {
+                tracing::warn!(%error, "遥测导出没建起来，本次运行不上报");
+            }
+            let outcome = komo_gateway::run(komo_gateway::ServiceOptions {
                 home: Some(home.to_path_buf()),
                 listen: None,
                 channels: komo_gateway::channels::factories(),
@@ -727,14 +746,20 @@ async fn gateway(
                 // 生产上用当前用户的家目录：`~/.agents/skills` 是与其他本地 agent 共享的
                 // 那一份（§5.6）。
                 shared_home: None,
+                telemetry: telemetry.as_ref().map(|_| status),
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string());
+            if let Some(telemetry) = telemetry {
+                // SDK 的线程要 join、blocking reqwest 不能在 async 上下文里 drop。
+                let _ = tokio::task::spawn_blocking(move || telemetry.shutdown()).await;
+            }
+            outcome?;
             Ok(None)
         }
         // 后台启动，等就绪后返回。
         None => {
-            init_tracing(None);
+            init_tracing(None, None);
             connect::request_start(home)?;
             let client = connect::wait_ready(home).await?;
             let health = client.health().await.map_err(|error| error.to_string())?;
@@ -807,34 +832,74 @@ fn wait_for_caller(after_pid: Option<u32>) {
     }
 }
 
-/// 日志：级别看 `KOMO_LOG`，前台 Gateway 同时写 `logs/gateway.log`。
-fn init_tracing(gateway_home: Option<&Path>) {
+/// 实例标识：本机主机名（Mac 与 NAS 两个实例分得开）。取不到就是 `unknown`。
+fn host_name() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+/// 日志：级别看 `KOMO_LOG`。Gateway 只写一份 `logs/gateway.log.<日期>`（按天轮转，留 7 个）；
+/// stderr 层在 Gateway 里只有 stderr 是终端时才开——服务管理器会把 stderr 收进它自己的
+/// 文件，再开就是同一行写两份。文件开不出来时退回 stderr，不至于一行日志都没有。
+/// 文本日志（文件、stderr）的过滤：级别看 `KOMO_LOG`，并且**永远不含** `komo::metrics`
+/// 指标事件——它们只给 MetricsLayer（`telemetry::export_filter`）。
+fn log_filter() -> tracing_subscriber::EnvFilter {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("KOMO_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    exclude_metrics(filter)
+}
+
+fn exclude_metrics(filter: tracing_subscriber::EnvFilter) -> tracing_subscriber::EnvFilter {
+    filter.add_directive("komo::metrics=off".parse().expect("静态指令"))
+}
+
+fn init_tracing(gateway_home: Option<&Path>, telemetry: Option<&telemetry::Telemetry>) {
+    use std::io::IsTerminal;
+    use tracing_subscriber::Layer as _;
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
-    let filter = tracing_subscriber::EnvFilter::try_from_env("KOMO_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
-
     let file = gateway_home.and_then(|home| {
-        let dir = home.join("logs");
-        std::fs::create_dir_all(&dir).ok()?;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("gateway.log"))
+        let appender = tracing_appender::rolling::RollingFileAppender::builder()
+            .rotation(tracing_appender::rolling::Rotation::DAILY)
+            .filename_prefix("gateway.log")
+            .max_log_files(7)
+            .build(home.join("logs"))
             .ok()?;
         Some(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(std::sync::Arc::new(file)),
+                .with_writer(appender)
+                .with_filter(log_filter()),
         )
+    });
+    let stderr = (gateway_home.is_none() || file.is_none() || std::io::stderr().is_terminal())
+        .then(|| {
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(log_filter())
+        });
+    let otel = telemetry.map(|telemetry| {
+        telemetry
+            .trace_layer()
+            .with_filter(telemetry::export_filter())
+    });
+    let metrics = telemetry.map(|telemetry| {
+        telemetry
+            .metrics_layer()
+            .with_filter(telemetry::export_filter())
     });
 
     let _ = tracing_subscriber::registry()
-        .with(filter)
         .with(stderr)
         .with(file)
+        .with(otel)
+        .with(metrics)
         .try_init();
 }
 
@@ -842,6 +907,42 @@ fn init_tracing(gateway_home: Option<&Path>) {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    /// 指标事件（`komo::metrics`，DEBUG）不进文本日志：哪怕 `KOMO_LOG=debug`。
+    #[test]
+    fn metrics_events_stay_out_of_the_text_log() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        #[derive(Clone, Default)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let sink = buf.clone();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .with_filter(exclude_metrics(tracing_subscriber::EnvFilter::new("debug")));
+        tracing::subscriber::with_default(tracing_subscriber::registry().with(layer), || {
+            tracing::event!(target: "komo::metrics", tracing::Level::DEBUG, histogram.x_seconds = 0.5_f64, "m");
+            tracing::debug!("plain-debug-line");
+        });
+        let text = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(text.contains("plain-debug-line"), "{text}");
+        assert!(
+            !text.contains("komo::metrics") && !text.contains("x_seconds"),
+            "{text}"
+        );
+    }
 
     /// clap 的命令树自洽（重名、短选项冲突、必填与默认值打架都在这里挂）。
     #[test]

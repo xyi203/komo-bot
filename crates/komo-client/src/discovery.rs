@@ -290,6 +290,7 @@ mod tests {
             protocol_version: protocol,
             started_at: datetime!(2026-09-16 08:00:00 UTC),
             data_dir: data_dir.into(),
+            telemetry: Default::default(),
         }
     }
 

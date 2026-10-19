@@ -27,6 +27,11 @@ rustls = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "signal", "fs", "io-util", "net"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+tracing-appender = { workspace = true }
 
 # `komo update`（§13.6）：发 HTTP、校验 sha256、解 tar.gz。**只进这一条命令的图**——
 # gateway 与 runtime 谁也不更新自己，那两边的依赖清单不动。

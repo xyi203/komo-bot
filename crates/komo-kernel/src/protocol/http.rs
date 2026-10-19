@@ -97,6 +97,20 @@ pub struct HealthResponse {
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     pub data_dir: String,
+    /// 遥测导出状态（docs/observability.md §4）；`komo doctor` 显示。
+    #[serde(default)]
+    pub telemetry: TelemetryHealth,
+}
+
+/// OTLP 导出的现状：端点与最近一次导出的结果。`endpoint = None` = 没配，不上报。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryHealth {
+    pub endpoint: Option<String>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_ok_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_error_at: Option<OffsetDateTime>,
+    pub last_error: Option<String>,
 }
 
 // ---- /v1/sessions ----

@@ -68,8 +68,8 @@ pub async fn wait_ready(home: &Path) -> Result<KomoClient, String> {
     match discovery::wait_ready(home, READY_TIMEOUT, READY_POLL).await {
         Ok(found) => found.client().map_err(|error| error.to_string()),
         Err(DiscoveryError::Timeout { waited_ms, last }) => Err(format!(
-            "等了 {waited_ms}ms 还没就绪：{last}\n看一眼日志：{}",
-            home.join("logs/gateway.log").display()
+            "等了 {waited_ms}ms 还没就绪：{last}\n看一眼日志：{}（最新的那个）",
+            home.join("logs/gateway.log.*").display()
         )),
         Err(error) => Err(error.to_string()),
     }

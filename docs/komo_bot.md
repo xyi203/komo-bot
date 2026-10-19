@@ -1513,6 +1513,10 @@ kernel ← client ────────────────────�
 | `serde_ignored` | `0.1`，默认；仅 komo-runtime（`config`） | §3 的「不认识的键只警告」：包住 `toml::Deserializer`，把每个被忽略的键路径交给回调。只依赖 `serde`，不进别的 crate 的图 |
 | 判断后端（TypeSafe「System One」） | **不新增依赖**：走已有的 `reqwest`（`rustls-no-provider`）+ 同一个 ring provider；凭证只从 `.env` 的 `TYPESAFE_API_KEY` 读 | §9.4 的可选重排用它。默认关；开着时才会发请求，且会把候选记忆的正文（截到 200 字符）发给第三方端点 |
 | `tracing-subscriber` / `rustls`（**dev-only**） | 仅 komo-runtime 的 `[dev-dependencies]` | 前者用来抓 §47/§48 的行内指标做断言，后者让真机验收测试自己装一次 crypto provider（装 provider 是进程的事，见上面 `reqwest` 行）。**不进发布构建** |
+| `opentelemetry` / `opentelemetry_sdk` | `0.33`；sdk `default-features = false, features = ["trace", "metrics"]`；仅 bin | 遥测（`docs/observability.md` §4）。SDK 只在 bin 初始化，runtime / gateway 只写 `tracing`。实测编译（2026-10-19，`cargo clean -p` 这几个包后 `--timings`，与别的构建并发、含等锁）：opentelemetry 12.7s、opentelemetry_sdk 13.1s |
+| `opentelemetry-otlp` | `0.33`，`default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"]`；仅 bin | OTLP/HTTP + protobuf，走工作区同一份 reqwest 0.13（多开其 `blocking` 特性）；不开 `grpc-tonic` / `logs`。**blocking 而非 async 客户端**：SDK 在无 tokio reactor 的线程上 `block_on` 导出。`opentelemetry-otlp` 12.7s、`opentelemetry-http` 25.9s、`opentelemetry-proto` 6.9s；`cargo tree -d` 重复项与加之前逐条相同（95 个根），无新重复 |
+| `tracing-opentelemetry` | `0.34`，默认特性（含 `metrics`）；仅 bin | `OpenTelemetryLayer` + `MetricsLayer`（6.1s） |
+| `tracing-appender` | `0.2`，`default-features = false`；仅 bin | Gateway 日志按天轮转、留 7 个（`docs/observability.md` §6）（6.3s） |
 | `clap` | `derive` | 仅 bin |
 | `flate2` / `tar` | `flate2` 显式 `default-features = false, features = ["rust_backend"]`（miniz_oxide），`tar 0.4` | 仅 bin：`komo update` 解发布包（§13.6）。两者都是纯 Rust（不带 C 工具链），且**不进 gateway / runtime 的图**——它们谁也不更新自己；`rust_backend` 写死是不跟上游默认后端变 |
 | `ratatui` + `crossterm` + `pulldown-cmark` | 仅 komo-client | 在 client 支线上，与 gateway 并行编译 |

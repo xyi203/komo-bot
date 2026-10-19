@@ -134,6 +134,13 @@ serde_ignored = "0.1"
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# docs/observability.md §4：OpenTelemetry 只进 bin。OTLP/HTTP + protobuf，走工作区同一份 reqwest；
+# 不开 grpc-tonic / logs。
+opentelemetry = "0.33"
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "metrics"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
+tracing-opentelemetry = "0.34"
+tracing-appender = { version = "0.2", default-features = false }
 # runtime 的 ZoneResolver 实现（§10 / §13.5）：自带 tzdb，kernel 侧仍只用 `time`，靠 unix 时间戳换算。
 jiff = "0.2.38"
 futures-util = { version = "0.3", default-features = false, features = [

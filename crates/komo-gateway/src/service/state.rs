@@ -401,6 +401,8 @@ pub struct GatewayState {
     pub supervisor: Arc<super::channels::ChannelSupervisor>,
     /// Dispatcher。**构造之后才填**：它握着这份状态，反过来也要被渠道拿到。
     pub inbound: std::sync::OnceLock<Arc<dyn komo_kernel::traits::Inbound>>,
+    /// OTLP 导出的状态，`run` 接上；`/healthz` 读。
+    pub telemetry: std::sync::OnceLock<Arc<crate::telemetry::TelemetryStatus>>,
     /// 正在被人看着的 Run，以及已经投出去的 Intervention 句柄。
     ///
     /// **一个 Run 只有一个看的人**：Cron 的看客与交互的看客都走
@@ -670,6 +672,7 @@ impl GatewayState {
             segments,
             supervisor: Arc::new(super::channels::ChannelSupervisor::new(factories)),
             inbound: std::sync::OnceLock::new(),
+            telemetry: std::sync::OnceLock::new(),
             watching: Mutex::new(std::collections::BTreeSet::new()),
             interventions_delivered: Mutex::new(std::collections::BTreeSet::new()),
             mcp,

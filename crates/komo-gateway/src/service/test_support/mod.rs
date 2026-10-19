@@ -96,6 +96,7 @@ pub fn sample_snapshot() -> ConfigSnapshot {
             data_dir: "/tmp/komo".into(),
             listen: "127.0.0.1:7777".into(),
             db_path: "/tmp/komo/state.db".into(),
+            otlp_endpoint: None,
         },
         model_catalog: ModelCatalog {
             default: "main".into(),
@@ -168,6 +169,7 @@ impl TestGateway {
             embeddings: None,
             // 共享 skill 目录钉在临时数据目录上（§5.6）：测试不受这台机器上装过什么影响。
             shared_home: Some(home.path().to_path_buf()),
+            telemetry: None,
         })
         .await
         .expect("Gateway 起得来");

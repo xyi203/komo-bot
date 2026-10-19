@@ -439,6 +439,7 @@ async fn only_one_gateway_holds_a_data_directory() {
         llm: None,
         embeddings: None,
         shared_home: None,
+        telemetry: None,
     })
     .await;
     let error = second.expect_err("第二台起不来");

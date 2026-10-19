@@ -110,6 +110,16 @@ fn check_start_only(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
             format!("`{listen}` 不是一个 `地址:端口`"),
         ));
     }
+    if let Some(endpoint) = &snapshot.start_only.otlp_endpoint {
+        let valid = reqwest::Url::parse(endpoint)
+            .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host().is_some());
+        if !valid {
+            issues.push(error(
+                "start_only.otlp_endpoint",
+                format!("`{endpoint}` 不是 http(s) 地址（形如 http://127.0.0.1:4318）"),
+            ));
+        }
+    }
     if !snapshot.start_only.data_dir.is_absolute() {
         issues.push(error(
             "start_only.data_dir",

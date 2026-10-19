@@ -238,6 +238,23 @@ mod tests {
     }
 
     #[test]
+    fn changing_the_telemetry_endpoint_is_reported_as_needing_a_restart() {
+        let fixture = Fixture::valid();
+        let holder = fixture.holder();
+        let mut text = Fixture::config_text("chat-a", "medium");
+        text.push_str("\n[telemetry]\notlp_endpoint = \"http://127.0.0.1:4318\"\n");
+        write(&fixture.sources().config, &text);
+
+        let report = holder.reload().unwrap();
+        assert_eq!(
+            report.start_only,
+            vec![KeyPath::new("start_only.otlp_endpoint")],
+            "{report:?}"
+        );
+        assert!(report.summary().contains("komo gateway restart"));
+    }
+
+    #[test]
     fn a_start_only_key_is_reported_on_its_own() {
         let fixture = Fixture::valid();
         let holder = fixture.holder();

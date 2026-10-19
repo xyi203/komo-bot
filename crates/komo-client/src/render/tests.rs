@@ -839,6 +839,7 @@ fn health() -> HealthResponse {
         protocol_version: PROTOCOL_VERSION,
         started_at: NOW,
         data_dir: "/home/u/.komo".into(),
+        telemetry: Default::default(),
     }
 }
 

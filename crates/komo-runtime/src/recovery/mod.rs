@@ -423,14 +423,24 @@ impl RecoveryScan {
             };
 
             let applied = self.apply(&run, &action, orphan.as_ref()).await?;
-            tracing::info!(
-                run = %run.run,
-                session = %run.session,
-                state = ?run.state,
-                action = ?action,
-                ?applied,
-                "恢复决定"
-            );
+            // 保持原状的每拍都会再判一遍，只有真的改了什么才值得 INFO。
+            macro_rules! decided {
+                ($level:ident) => {
+                    tracing::$level!(
+                        run = %run.run,
+                        session = %run.session,
+                        state = ?run.state,
+                        action = ?action,
+                        ?applied,
+                        "恢复决定"
+                    )
+                };
+            }
+            if matches!(applied, Applied::LeftAsIs | Applied::Superseded) {
+                decided!(debug);
+            } else {
+                decided!(info);
+            }
             report.outcomes.push(RecoveryOutcome {
                 run: run.run.clone(),
                 session: run.session.clone(),

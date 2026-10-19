@@ -175,6 +175,9 @@ pub trait MemoryCatalog: Send + Sync {
     async fn prune_generations(&self, keep: &str) -> Result<u64, RepoError>;
 
     async fn record_use(&self, ids: &[MemoryId], at: OffsetDateTime) -> Result<(), RepoError>;
+
+    /// 一批提取里被指认用上的记忆各 +1（§9.10）。
+    async fn record_adoption(&self, ids: &[MemoryId], at: OffsetDateTime) -> Result<(), RepoError>;
 }
 
 #[async_trait]
@@ -252,6 +255,10 @@ impl MemoryCatalog for komo_store::TursoMemoryRepo {
     async fn record_use(&self, ids: &[MemoryId], at: OffsetDateTime) -> Result<(), RepoError> {
         komo_store::TursoMemoryRepo::record_use(self, ids, at).await
     }
+
+    async fn record_adoption(&self, ids: &[MemoryId], at: OffsetDateTime) -> Result<(), RepoError> {
+        komo_store::TursoMemoryRepo::record_adoption(self, ids, at).await
+    }
 }
 
 /// 一个 Session 的事件从哪里来。
@@ -308,6 +315,8 @@ pub struct PassReport {
     pub skipped: usize,
     /// 写进库的记忆变更数。
     pub applied: usize,
+    /// 被指认"用上了"并通过校验的记忆数（§9.10，每批每条至多一次）。
+    pub used: usize,
     /// 失败并放回 `pending` 的。
     pub failed: usize,
     /// 失败且**不再重试**的（证据读不出来，标记翻成 `error`）。
@@ -1078,6 +1087,7 @@ impl MemoryManager {
             skip_reason = record.skip_reason.as_deref().unwrap_or(""),
             observations = record.observations,
             applied = record.applied,
+            used = record.used,
             "记忆提取处理了一批"
         );
     }
@@ -1177,10 +1187,20 @@ impl MemoryManager {
                 let consolidator = consolidate::Consolidator::new(self);
                 // 提取前整批召回一次，编号后随提取调用一起交给模型（§9.10）。
                 let candidates = consolidator.recall(transcript.statements()).await;
-                let raw = pass.extract(&transcript, &candidates).await?;
-                record.observations += raw.len();
+                // 本批注入的记忆：只列版本没变的——正文变了，模型看到的就不是注入的那句话。
+                let mut injected = Vec::new();
+                for use_ in transcript.injected() {
+                    if let Ok(Some(item)) = self.repo.get(&use_.memory).await
+                        && item.revision == use_.revision
+                    {
+                        injected.push(item);
+                    }
+                }
+                let raw = pass.extract(&transcript, &candidates, &injected).await?;
+                record.observations += raw.observations.len();
+                let adopted = transcript.validate_used(raw.used, &injected);
                 let observations = transcript.validate(
-                    raw,
+                    raw.observations,
                     live.max_observations,
                     &live.model,
                     &candidates,
@@ -1191,6 +1211,28 @@ impl MemoryManager {
                 } else {
                     applied = consolidator.apply(&observations).await?;
                     record.applied += applied;
+                }
+                // 采纳计数放在 apply 之后、游标推进之前：apply 失败整批重试时还没记过，
+                // 不会重复计数；游标推进后这一批不再被领取。
+                if !adopted.is_empty() {
+                    if let Err(error) = self
+                        .catalog
+                        .record_adoption(&adopted, self.clock.now())
+                        .await
+                    {
+                        tracing::warn!(%error, "采纳计数没记上");
+                    } else {
+                        record.used += adopted.len();
+                        report.used += adopted.len();
+                        tracing::event!(
+                            target: "komo::metrics",
+                            tracing::Level::DEBUG,
+                            {
+                            monotonic_counter.komo.memory.used = adopted.len() as u64,
+                            komo.session.kind = batch.kind.as_str(),
+                            }
+                        );
+                    }
                 }
             }
             report.applied += applied;
@@ -1554,6 +1596,7 @@ struct BatchRecord {
     skip_reason: Option<String>,
     observations: usize,
     applied: usize,
+    used: usize,
 }
 
 #[cfg(test)]

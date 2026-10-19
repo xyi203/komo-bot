@@ -1016,6 +1016,27 @@ mod tests {
         );
     }
 
+    /// 采纳两列（§9.10）在旧形状的 memory_items 表上补得回来，旧行读出来是 NULL。
+    #[tokio::test]
+    async fn the_adoption_columns_are_added_to_an_existing_memory_items_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+
+        let legacy = crate::models::memory_item::DDL
+            .replace(r#""adopted_count" BIGINT, "last_adopted_at" BIGINT, "#, "");
+        assert!(!legacy.contains("adopted"), "旧形状里不该有这两列");
+        plain_build_old(&path, Some(("memory_items", legacy))).await;
+
+        Db::connect(&path).await.unwrap();
+        let after = plain_columns(&path, "memory_items").await;
+        for column in ["adopted_count", "last_adopted_at"] {
+            assert!(
+                after.iter().any(|name| name == column),
+                "{column} 补回来了，而且落盘：{after:?}"
+            );
+        }
+    }
+
     /// 委派那三列在**旧形状的 runs 表**上补得回来（§8.2 的加列规则，也是升级路径）。
     ///
     /// 同上：旧形状在普通连接上造、在另一条新连接上确认，然后才重开验迁移。

@@ -15,14 +15,14 @@ use std::sync::Arc;
 
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::traits::{Clock, LlmClient};
-use komo_kernel::types::ids::{EventId, RunId, Seq, SessionId};
+use komo_kernel::types::ids::{EventId, MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{
     Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryItem, MemoryKind, MemoryScope,
     MemoryState, Provenance,
 };
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::status::RunState;
-use komo_kernel::types::turn::{RoundInput, ToolCallRequest, TurnRequest};
+use komo_kernel::types::turn::{MemoryUse, RoundInput, ToolCallRequest, TurnRequest};
 use serde::Deserialize;
 use time::OffsetDateTime;
 
@@ -31,7 +31,7 @@ use super::consolidate::{RawVerdict, Verdict, map_verdicts};
 
 /// 提示词版本。**改了提示词就改它**——它进 [`ExtractionMetadata`]，是"这条记忆是怎么来
 /// 的"里唯一能回答"按哪一版规则提的"的那一格（§9.2）。
-pub const PROMPT_VERSION: &str = "memory-extract/v5";
+pub const PROMPT_VERSION: &str = "memory-extract/v6";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
 const MAX_CONTENT_CHARS: usize = 300;
@@ -88,10 +88,21 @@ fn default_kind() -> String {
     "fact".into()
 }
 
-#[derive(Debug, Deserialize)]
-struct Extraction {
+/// 模型一次交回的全部：观察，加上"这一批注入的记忆里哪些被用上了"（§9.10）。
+#[derive(Debug, Default, Deserialize)]
+pub struct RawExtraction {
     #[serde(default)]
-    observations: Vec<RawObservation>,
+    pub observations: Vec<RawObservation>,
+    /// 采纳判断，先按原样收下，[`Transcript::validate_used`] 逐条解——一条坏的不拖累整批。
+    #[serde(default)]
+    pub used: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawUse {
+    memory: serde_json::Value,
+    #[serde(default)]
+    evidence: Vec<String>,
 }
 
 /// 一条**校验过**的观察：来源角色对得上证据，引用指向真实存在的事件。
@@ -146,6 +157,8 @@ pub struct Transcript {
     statements: String,
     /// 事件 ID → （所属 Run，seq，角色）。**校验引用位置**用的就是它。
     roles: BTreeMap<String, (RunId, Seq, Role)>,
+    /// 这一批 Run 的系统提示里注入过的记忆（去重、按首次出现排序）。
+    injected: Vec<MemoryUse>,
 }
 
 /// 一条事件在提取里算什么。
@@ -305,6 +318,20 @@ impl Transcript {
             });
         }
 
+        // 每个 Run 注入了什么：它结束前最近的一条 `memory.injected`（沿用上一块的 Run 自己
+        // 没有事件）。
+        let mut injected: Vec<MemoryUse> = Vec::new();
+        for window in runs {
+            let upto = cursors.get(&window.run).copied().unwrap_or(window.cursor);
+            if let Some((_, body)) = komo_kernel::events::injection_at(events, upto) {
+                for use_ in &body.uses {
+                    if !injected.iter().any(|seen| seen.memory == use_.memory) {
+                        injected.push(use_.clone());
+                    }
+                }
+            }
+        }
+
         let mut rendered = lines
             .iter()
             .map(|line| line.text.as_str())
@@ -327,7 +354,67 @@ impl Transcript {
             statuses: runs.iter().map(|w| (w.run.clone(), w.status)).collect(),
             statements: statements.join("\n"),
             roles,
+            injected,
         }
+    }
+
+    /// 这一批 Run 注入过的记忆引用。
+    pub fn injected(&self) -> &[MemoryUse] {
+        &self.injected
+    }
+
+    /// 把模型的 `used` 映射回记忆 id（§9.10）。`injected` 是这次调用里 `[m<n>]` 的编号表。
+    ///
+    /// 采纳 = 这一批的助手回复或工具调用**明显依赖**了它，所以证据必须引批内的助手事件
+    /// （含它发起的工具调用）；用户行、单独的工具结果、不存在的 ID 都不算，整条丢弃。
+    /// 编号规则同 §9.9：越界或非整数丢弃，同一编号只认第一条。
+    pub fn validate_used(
+        &self,
+        raw: Vec<serde_json::Value>,
+        injected: &[MemoryItem],
+    ) -> Vec<MemoryId> {
+        let mut seen = std::collections::HashSet::new();
+        let mut adopted = Vec::new();
+        for value in raw {
+            let used: RawUse = match serde_json::from_value(value) {
+                Ok(used) => used,
+                Err(error) => {
+                    tracing::warn!(%error, "used 读不懂，丢弃这一条");
+                    continue;
+                }
+            };
+            let index = match &used.memory {
+                serde_json::Value::Number(number) => number.as_u64(),
+                serde_json::Value::String(text) => {
+                    let text = text.trim();
+                    text.strip_prefix('m').unwrap_or(text).parse::<u64>().ok()
+                }
+                _ => None,
+            };
+            let Some((index, item)) = index
+                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| injected.get(index).map(|item| (index, item)))
+            else {
+                tracing::warn!(memory = %used.memory, "used 里的编号不可用，丢弃这一条");
+                continue;
+            };
+            let cites_assistant = used.evidence.iter().any(|reference| {
+                matches!(
+                    self.roles.get(reference.trim()),
+                    Some((_, _, Role::Assistant))
+                )
+            });
+            if !cites_assistant {
+                tracing::warn!(index, "used 没有引批内的助手回复或工具调用，丢弃这一条");
+                continue;
+            }
+            if !seen.insert(index) {
+                tracing::warn!(index, "used 里同一个编号出现多次，只认第一条");
+                continue;
+            }
+            adopted.push(item.id.clone());
+        }
+        adopted
     }
 
     /// 每个 Run 处理完推进到的 seq。
@@ -630,7 +717,8 @@ impl LearningPass {
         &self,
         transcript: &Transcript,
         candidates: &[MemoryItem],
-    ) -> Result<Vec<RawObservation>, MemoryError> {
+        injected: &[MemoryItem],
+    ) -> Result<RawExtraction, MemoryError> {
         let request = TurnRequest {
             session: transcript.session.clone(),
             run: transcript.run.clone(),
@@ -641,7 +729,12 @@ impl LearningPass {
             messages: vec![komo_kernel::types::turn::ReplayMessage {
                 role: komo_kernel::types::turn::Role::User,
                 seq: transcript.cursor(),
-                text: Some(user_prompt(transcript, candidates, self.clock.now())),
+                text: Some(user_prompt(
+                    transcript,
+                    candidates,
+                    injected,
+                    self.clock.now(),
+                )),
                 tool_calls: vec![],
                 tool_results: vec![],
                 provider_blocks: None,
@@ -670,16 +763,15 @@ impl LearningPass {
 }
 
 /// 从模型正文里解出观察列表。容忍 ```json 围栏与前后的闲话。
-pub fn parse_extraction(text: &str) -> Result<Vec<RawObservation>, MemoryError> {
+pub fn parse_extraction(text: &str) -> Result<RawExtraction, MemoryError> {
     let Some(json) = parse_json_object(text) else {
         return Err(MemoryError::Invalid(format!(
             "回复里找不到 JSON 对象：{}",
             one_line(&text.chars().take(200).collect::<String>())
         )));
     };
-    let parsed: Extraction = serde_json::from_str(json)
-        .map_err(|error| MemoryError::Invalid(format!("JSON 解不开：{error}")))?;
-    Ok(parsed.observations)
+    serde_json::from_str(json)
+        .map_err(|error| MemoryError::Invalid(format!("JSON 解不开：{error}")))
 }
 
 /// 剥掉围栏、取出第一个配平的 JSON 对象。提取与关系判断共用它——两边容忍的东西不同，
@@ -753,7 +845,9 @@ const SYSTEM_PROMPT: &str = "\
 \"evidence\":[\"<事件 ID>\"],\"observed_at\":\"RFC3339，可省略\",\
 \"valid_until\":\"RFC3339，可省略\",\
 \"relations\":[{\"memory\":<已有记忆方括号里的编号，整数>,\"relation\":\
-\"same|supports|contradicts|supersedes|unrelated\"}]}]}
+\"same|supports|contradicts|supersedes|unrelated\"}]}],\
+\"used\":[{\"memory\":\"<注入记忆方括号里的编号，如 m0>\",\"evidence\":[\"<助手事件 ID>\"]}]}
+（used 只在记录里列了「本批注入的记忆」时才写，否则省略。）
 
 规则：
 1. 每条都必须在 evidence 里引至少一个**用户**或**工具结果**事件的 ID，原样照抄方括号里\
@@ -778,9 +872,30 @@ const SYSTEM_PROMPT: &str = "\
 编号只能用方括号里的整数，不要抄内容。same = 同一件事换了说法；supports = 不同主张但支持它；\
 contradicts = 实质冲突，两者不能同时为真；supersedes = 同一个问题的新答案，旧的已经不成立；\
 unrelated = 不相干（可不写）。判冲突前先看作用域和时间：不同项目的偏好不是冲突，不同时间发生的同类\
-事件（比如两次更换滤芯）也不是冲突，各自保留。只与同作用域的条目建立关系。";
+事件（比如两次更换滤芯）也不是冲突，各自保留。只与同作用域的条目建立关系。
+11. used 说明「本批注入的记忆」里哪几条被**用上**了：助手的回复或工具调用明显依赖了它，没有它\
+就会做得不一样（照着它选了参数、遵守了它说的偏好、引用了它的事实）。只是话题相关、助手复述了\
+一遍、或者根本没体现，都不算。evidence 引批内助手事件的 ID（工具调用在发起它的助手事件上），不能\
+引用户行或单独的工具结果。没有就交回空数组；不要凑。";
 
-fn user_prompt(transcript: &Transcript, candidates: &[MemoryItem], now: OffsetDateTime) -> String {
+fn user_prompt(
+    transcript: &Transcript,
+    candidates: &[MemoryItem],
+    injected: &[MemoryItem],
+    now: OffsetDateTime,
+) -> String {
+    // 编号落在自己的命名空间（m0、m1…），与上面候选的 [0]、[1] 不混。
+    let injected = if injected.is_empty() {
+        String::new()
+    } else {
+        let lines = injected
+            .iter()
+            .enumerate()
+            .map(|(index, item)| format!("[m{index}] {}", item.content))
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("--- 本批注入的记忆 ---\n{lines}\n--- 注入结束 ---\n\n")
+    };
     let existing = if candidates.is_empty() {
         "（没有）".to_string()
     } else {
@@ -797,7 +912,7 @@ fn user_prompt(transcript: &Transcript, candidates: &[MemoryItem], now: OffsetDa
             .join("\n")
     };
     format!(
-        "当前时间：{}\n会话：{}\n\n--- 已有的相关记忆 ---\n{existing}\n--- 记忆结束 ---\n\n\
+        "当前时间：{}\n会话：{}\n\n--- 已有的相关记忆 ---\n{existing}\n--- 记忆结束 ---\n\n{injected}\
          --- 会话记录 ---\n{}\n--- 记录结束 ---",
         now.date(),
         transcript.session,

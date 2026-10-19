@@ -53,7 +53,7 @@ invoke_agent                 一个 Run 段（受理/恢复 → 完成/挂起/�
  │                           komo.tool.exit_code · komo.tool.output_bytes · komo.tool.attempt
  └─ komo.compaction          variant（compacted / decayed / skipped）· 决策的 token 账
 后台（各自一棵树）：
- komo.memory.extract         §9.10 一批一个：session.kind · runs · window_chars · skip_reason
+ komo.memory.extract         §9.10 一批一个：session.kind · runs · window_chars · skip_reason · used
                              returned · applied · injected · used · same · contested
    └─ chat                   用途 komo.llm.role = memory.extract
  komo.memory.consolidate     §9.8 一组一个
@@ -96,6 +96,7 @@ invoke_agent                 一个 Run 段（受理/恢复 → 完成/挂起/�
 | `komo.llm.retries` | counter | `gen_ai.request.model`、`komo.retry.cause`（rate_limited / server / transport） |
 | `komo.run.duration`（秒）· `komo.run.rounds` | histogram | `komo.run.outcome`、`komo.run.source`、`komo.session.kind` |
 | `komo.tool.duration`（秒） | histogram | `gen_ai.tool.name`、`komo.tool.status` |
+| `komo.memory.used` | counter | `komo.session.kind`（`memory/mod.rs`：一批里通过校验的"被用上"条数，§9.10；与 `usage.count` 的曝光分开） |
 
 语义约定里 `gen_ai.token.type` 只有 input / output，`cache_read` / `cache_write` / `reasoning` 是 komo 的扩展取值；`gen_ai.agent.name`、`gen_ai.conversation.id`、`gen_ai.tool.call.id`、`gen_ai.response.id` 对照的是写这一版时的 GenAI semconv，升级 SDK 时再核一遍。
 

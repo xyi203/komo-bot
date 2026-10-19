@@ -410,6 +410,45 @@ impl TursoMemoryRepo {
             .await
             .map_err(RepoError::from)
     }
+
+    /// 记一次采纳（§9.10）：一批提取里被指认用上的记忆各 +1。与 [`Self::record_use`]
+    /// 一样只碰自己的两列——不升 revision、不动状态与确认。
+    pub async fn record_adoption(
+        &self,
+        ids: &[MemoryId],
+        at: OffsetDateTime,
+    ) -> Result<(), RepoError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let ids: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+        self.db()
+            .with_write_retry(move |ex| {
+                let ids = ids.clone();
+                Box::pin(async move {
+                    for id in &ids {
+                        let Some(mut row) = MemoryItemRow::filter_by_id(id)
+                            .first()
+                            .exec(ex)
+                            .await
+                            .map_err(map_toasty)?
+                        else {
+                            continue;
+                        };
+                        let count = row.adopted_count.unwrap_or(0).saturating_add(1);
+                        row.update()
+                            .adopted_count(Some(count))
+                            .last_adopted_at(Some(to_ts(at)))
+                            .exec(ex)
+                            .await
+                            .map_err(map_toasty)?;
+                    }
+                    Ok(())
+                }) as BoxFuture<'_, Result<(), StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
 }
 
 /// 让上面的方法拿得到 `Db`，同时不把这个字段公开出去。

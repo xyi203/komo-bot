@@ -183,15 +183,7 @@ fn injection_of(
     let Some(last) = of_run(events, run).map(|event| event.seq).max() else {
         return (Vec::new(), None);
     };
-    let latest = events
-        .iter()
-        .filter(|event| event.seq <= last)
-        .filter_map(|event| match &event.payload {
-            EventPayload::MemoryInjected(body) => Some((event, body)),
-            _ => None,
-        })
-        .next_back();
-    let Some((event, body)) = latest else {
+    let Some((event, body)) = komo_kernel::events::injection_at(events, last) else {
         return (Vec::new(), None);
     };
     let recall = if event.run.as_ref() == Some(run) {

@@ -2244,16 +2244,27 @@ async fn a_disabled_memory_section_injects_nothing_and_extracts_nothing() {
 fn the_extraction_parser_survives_fences_and_chatter() {
     let fenced = "好的，我看了一遍：\n```json\n{\"observations\":[{\"content\":\"a\",\
                   \"said_by\":\"user_statement\",\"evidence\":[\"evt-1\"]}]}\n```\n以上。";
-    assert_eq!(extract::parse_extraction(fenced).unwrap().len(), 1);
+    assert_eq!(
+        extract::parse_extraction(fenced)
+            .unwrap()
+            .observations
+            .len(),
+        1
+    );
 
     let bare = r#"{"observations":[]}"#;
-    assert!(extract::parse_extraction(bare).unwrap().is_empty());
+    assert!(
+        extract::parse_extraction(bare)
+            .unwrap()
+            .observations
+            .is_empty()
+    );
 
     // 正文里带花括号的字符串不该把配平算错。
     let tricky = r#"{"observations":[{"content":"用 {} 表示空对象","said_by":"user_statement",
                      "evidence":["evt-1"]}]}"#;
     assert_eq!(
-        extract::parse_extraction(tricky).unwrap()[0].content,
+        extract::parse_extraction(tricky).unwrap().observations[0].content,
         "用 {} 表示空对象"
     );
 
@@ -2261,6 +2272,247 @@ fn the_extraction_parser_survives_fences_and_chatter() {
         extract::parse_extraction("我觉得没什么好记的"),
         Err(MemoryError::Invalid(_))
     ));
+}
+
+// =========================================================== 采纳（used，§9.10）
+
+fn injected_event(seq: u64, run: &RunId, memories: &[(&str, u32)]) -> Event {
+    event(
+        seq,
+        run,
+        EventPayload::MemoryInjected(komo_kernel::events::MemoryInjected {
+            uses: memories
+                .iter()
+                .map(|(id, revision)| MemoryUse {
+                    memory: MemoryId::from_raw(*id),
+                    revision: *revision,
+                })
+                .collect(),
+            ..Default::default()
+        }),
+    )
+}
+
+/// 一台已有 `m-1`、一个待处理 Run 的 Harness；`events` 是这个会话的事件，`reply` 是
+/// 记忆模型这一次的回复。
+async fn adoption_harness(events: Vec<Event>, replies: &[&str]) -> Harness {
+    let mut builder =
+        HarnessBuilder::new().work(vec![work_item(RunState::Completed, interactive())]);
+    for reply in replies {
+        builder = builder.script(vec![round(reply)]);
+    }
+    let harness = builder.build().await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    harness.ledger.seed(&SessionId::from_raw("sess-1"), events);
+    harness
+}
+
+async fn adoption_of(harness: &Harness) -> (u64, Option<OffsetDateTime>, MemoryState, u32) {
+    let item = harness
+        .repo
+        .get(&MemoryId::from_raw("m-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    (
+        item.usage.adopted_count,
+        item.usage.last_adopted_at,
+        item.state,
+        item.revision,
+    )
+}
+
+fn injected_run_events(run: &RunId) -> Vec<Event> {
+    vec![
+        injected_event(1, run, &[("m-1", 1)]),
+        user_event(2, run, "把空调调一下"),
+        assistant_event(3, run, "按你习惯的 26 度调好了"),
+    ]
+}
+
+const USED_M0: &str = r#"{"observations":[],"used":[{"memory":"m0","evidence":["evt-3"]}]}"#;
+
+/// 注入的记忆被助手回复引为依据：用上次数 +1、记下时刻；状态、确认、版本一个字不动。
+#[tokio::test]
+async fn an_injected_memory_cited_by_an_assistant_reply_counts_as_adopted() {
+    let run = RunId::from_raw("run-1");
+    let harness = adoption_harness(injected_run_events(&run), &[USED_M0]).await;
+
+    let report = harness.manager.process_pending(4).await.unwrap();
+
+    assert_eq!(report.used, 1);
+    assert_eq!(
+        adoption_of(&harness).await,
+        (1, Some(NOW), MemoryState::Active, 1)
+    );
+    let prompt = harness.llm.requests.lock().unwrap()[0].messages[0]
+        .text
+        .clone()
+        .unwrap();
+    assert!(prompt.contains("[m0] 客厅空调设 26 度"), "{prompt}");
+}
+
+/// 工具调用发起在助手事件上，引它同样算；模型给整数编号也认。
+#[tokio::test]
+async fn a_tool_call_event_is_valid_evidence_and_a_bare_integer_index_works() {
+    let run = RunId::from_raw("run-1");
+    let harness = adoption_harness(
+        injected_run_events(&run),
+        &[r#"{"used":[{"memory":0,"evidence":["evt-3"]}]}"#],
+    )
+    .await;
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    assert_eq!(adoption_of(&harness).await.0, 1);
+}
+
+/// 证据指向用户行、单独的工具结果或不存在的事件：整条丢弃，不计数。
+#[tokio::test]
+async fn evidence_that_is_not_an_assistant_event_drops_the_entry() {
+    let run = RunId::from_raw("run-1");
+    let mut events = injected_run_events(&run);
+    events.push(tool_event(4, &run, "exit 0"));
+    for reply in [
+        r#"{"used":[{"memory":"m0","evidence":["evt-2"]}]}"#,
+        r#"{"used":[{"memory":"m0","evidence":["evt-4"]}]}"#,
+        r#"{"used":[{"memory":"m0","evidence":["evt-999"]}]}"#,
+        r#"{"used":[{"memory":"m0","evidence":[]}]}"#,
+    ] {
+        let harness = adoption_harness(events.clone(), &[reply]).await;
+        let report = harness.manager.process_pending(4).await.unwrap();
+        assert_eq!(report.used, 0, "{reply}");
+        assert_eq!(adoption_of(&harness).await.0, 0, "{reply}");
+        assert_eq!(adoption_of(&harness).await.1, None, "{reply}");
+    }
+}
+
+/// 编号越界、非整数丢弃；同一编号重复只算一次。
+#[tokio::test]
+async fn a_bad_or_repeated_used_index_is_dropped_or_counted_once() {
+    let run = RunId::from_raw("run-1");
+    let harness = adoption_harness(
+        injected_run_events(&run),
+        &[r#"{"used":[
+            {"memory":"m5","evidence":["evt-3"]},
+            {"memory":"abc","evidence":["evt-3"]},
+            {"memory":null,"evidence":["evt-3"]},
+            {"memory":"m0","evidence":["evt-3"]},
+            {"memory":0,"evidence":["evt-3"]}]}"#],
+    )
+    .await;
+
+    let report = harness.manager.process_pending(4).await.unwrap();
+
+    assert_eq!(report.used, 1);
+    assert_eq!(adoption_of(&harness).await.0, 1);
+}
+
+/// 沿用上一块注入的 Run 自己没有 `memory.injected`：按它结束前最近的一条解出来。
+#[tokio::test]
+async fn a_run_that_reused_an_earlier_pin_still_resolves_its_injection() {
+    let earlier = RunId::from_raw("run-0");
+    let run = RunId::from_raw("run-1");
+    let harness = adoption_harness(
+        vec![
+            injected_event(1, &earlier, &[("m-1", 1)]),
+            user_event(2, &run, "把空调调一下"),
+            assistant_event(3, &run, "按你习惯的 26 度调好了"),
+        ],
+        &[USED_M0],
+    )
+    .await;
+
+    let report = harness.manager.process_pending(4).await.unwrap();
+
+    assert_eq!(report.used, 1);
+    assert_eq!(adoption_of(&harness).await.0, 1);
+}
+
+/// 提取失败这一批什么都不记；重试成功只记一次。
+#[tokio::test]
+async fn a_retried_batch_counts_adoption_once() {
+    let run = RunId::from_raw("run-1");
+    let harness = adoption_harness(
+        injected_run_events(&run),
+        &["我觉得没什么好记的。", USED_M0],
+    )
+    .await;
+
+    let first = harness.manager.process_pending(4).await.unwrap();
+    assert_eq!((first.failed, first.used), (1, 0));
+    assert_eq!(adoption_of(&harness).await.0, 0);
+
+    harness
+        .work
+        .items
+        .lock()
+        .unwrap()
+        .push(work_item(RunState::Completed, interactive()));
+    let second = harness.manager.process_pending(4).await.unwrap();
+    assert_eq!(second.used, 1);
+    assert_eq!(adoption_of(&harness).await.0, 1);
+}
+
+/// 版本变了的注入条目不再列给模型（正文已不是注入的那句话），自然也记不上。
+#[tokio::test]
+async fn a_memory_whose_revision_moved_on_is_not_listed_for_adoption() {
+    let run = RunId::from_raw("run-1");
+    let mut events = injected_run_events(&run);
+    events[0] = injected_event(1, &run, &[("m-1", 9)]);
+    let harness = adoption_harness(events, &[USED_M0]).await;
+
+    let report = harness.manager.process_pending(4).await.unwrap();
+
+    assert_eq!(report.used, 0);
+    let prompt = harness.llm.requests.lock().unwrap()[0].messages[0]
+        .text
+        .clone()
+        .unwrap();
+    assert!(!prompt.contains("本批注入的记忆"), "{prompt}");
+}
+
+/// 没有注入过记忆的批，提示里没有 used 这一节。
+#[tokio::test]
+async fn a_batch_without_injections_has_no_used_section_in_the_prompt() {
+    let run = RunId::from_raw("run-1");
+    let harness = adoption_harness(
+        vec![
+            user_event(1, &run, "把空调调一下"),
+            assistant_event(2, &run, "调好了"),
+        ],
+        &[NOTHING],
+    )
+    .await;
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    let prompt = harness.llm.requests.lock().unwrap()[0].messages[0]
+        .text
+        .clone()
+        .unwrap();
+    assert!(!prompt.contains("本批注入的记忆"), "{prompt}");
+    assert!(!prompt.contains("[m0]"), "{prompt}");
+}
+
+/// 旧行（采纳两列是 NULL）读出来是 0 / None。
+#[tokio::test]
+async fn an_old_row_without_adoption_columns_reads_as_never_adopted() {
+    let harness = HarnessBuilder::new().build().await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        adoption_of(&harness).await,
+        (0, None, MemoryState::Active, 1)
+    );
 }
 
 // ---------------------------------------------------------------- 小工具

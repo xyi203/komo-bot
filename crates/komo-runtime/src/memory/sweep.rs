@@ -149,6 +149,7 @@ mod tests {
             usage: MemoryUsage {
                 count: u64::from(last_used.is_some()) * 3,
                 last_used_at: last_used.map(|ago| now() - ago),
+                ..MemoryUsage::default()
             },
             supersedes: None,
             superseded_by: None,

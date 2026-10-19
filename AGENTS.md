@@ -147,4 +147,6 @@ commands run, terminal output when CLI behavior changes.
   "pending verification" list — write verified facts back there).
 - Memory: `docs/memory.md` — §9 spec, planned memory designs, and memory
   research/analysis appendices. Memory changes update this file, not a new one.
+- Observability: `docs/observability.md` — OpenTelemetry traces/metrics, logs,
+  operator views. Telemetry is never a source of truth; nothing reads it back.
 - Work plan: `.scratch/komo-v08-rewrite/PLAN.md`, progress in `STATUS.md`.

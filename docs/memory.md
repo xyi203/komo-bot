@@ -1,6 +1,6 @@
 # komo Memory
 
-> 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8、§9.9 是已认可、**尚未实现**的设计。附录 A–C 是调研与分析，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
+> 状态：§9.1–§9.7 是 Memory 的**规格**，2026-10-19 从 [`komo_bot.md`](komo_bot.md) §9 原样迁来，小节号不变——代码注释与其他文档里的 §9.x 照旧指这里。§9.8–§9.10 是已认可、**尚未实现**的设计。附录 A–C 是调研与分析，不是规格；与正文冲突时以正文为准，任何一条要落地，先改正文。
 > 文中不带文件名的其他章节号（§3、§8.2、§8.5、§10 …）指 [`komo_bot.md`](komo_bot.md)。附录内的编号只在本附录内有效。
 
 | 节 | 内容 | 状态 |
@@ -14,6 +14,7 @@
 | §9.7 | 与 resume 和权限的关系 | 规格 |
 | §9.8 | 离线整理 | 设计，未实现 |
 | §9.9 | 判关系时候选用编号 | 设计，未实现 |
+| §9.10 | 按会话提取，一次调用 | 设计，未实现 |
 | 附录 A | 外部记忆仓库调研（graphiti / mem0 / OpenViking） | 2026-10-19 |
 | 附录 B | 记忆机制改进方案（原 `docs/memory-improvements.md`） | 2026-10-16 提案 |
 | 附录 C | 对照 v0.8 的差距分析（原 `docs/memory.md`） | 2026-09-24 分析 |
@@ -177,11 +178,19 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 
 做法参考 OpenViking 的 `ov compile --skill memory`（附录 A.3）：对一个作用域里**已有的**记忆就地去重、取代、标冲突，不引入外部来源、不新增事实。
 
-**入口。** `komo memory consolidate [--scope S] [--kind K] [--instruction TEXT] [--apply]`，由 Gateway 执行（CLI 不开 state，§3）。默认预演，加 `--apply` 才写库——与 `komo memory sweep` 同一个习惯。要定期跑，由操作者加一个 Cron 命令 Job（§10）调它，不另设调度器。
+**入口。** `komo memory consolidate [--scope S] [--kind K] [--instruction TEXT] [--apply]`，由 Gateway 执行（CLI 不开 state，§3）。默认预演，加 `--apply` 才写库——与 `komo memory sweep` 同一个习惯。不给 `--scope` 就逐个作用域跑，50 组的上限是这一次运行的合计。要定期跑，由操作者加一个 Cron 命令 Job（§10）调它，不另设调度器。
+
+**预演与执行各判各的。** 预演不落盘，只打印清单；`--apply` 在一次运行里自己做完分组 → 判定 → 授权 → 写库，**不执行**之前某次预演给出的动作。模型判定不是确定的，两次运行可能给出不同动作，所以预演只说明"现在跑会怎样"，不是一份待批的计划。危险动作由下面的授权规则挡，不靠人审预演——Cron 无人值守地跑 `--apply`，本来也没人审。
 
 **范围。** 一次一个作用域，可再限 kind；只看 `active` / `candidate` / `contested`，`superseded` / `forgotten` 不进来。不跨作用域：不同项目的偏好不能合并（§9.6）。
 
-**分组（纯 Rust，不调模型）。** 对范围内每一条用现有检索（关键词 ∪ 向量，放行 candidate 与 contested，同 `Consolidator::related`）取近邻，近邻关系做并查集连成组；一组最多 8 条，超了按相似度切开；只有自己一条的组跳过。一次最多处理 50 组，剩下的下次接着跑，先处理 `updated_at` 最早的组。分组数、组大小与相似度阈值进 `[memory]` 配置，这里写的是初值。
+**分组（纯 Rust，不调模型）。** 对范围内每一条用现有检索（关键词 ∪ 向量，放行 candidate 与 contested，同 `Consolidator::related`）取近邻，近邻关系做并查集连成组；一组最多 8 条，超了按相似度切开；只有自己一条的组跳过。一次最多处理 50 组，分组数、组大小与相似度阈值进 `[memory]` 配置，这里写的是初值。
+
+**游标：`consolidated_at`。** 只按 `updated_at` 排序会卡住：判成"保持原样"的组不写库，`updated_at` 不变，下次还排在最前，第 51 组以后永远轮不到。所以 `memory_items` 追加可空列 `consolidated_at`：
+
+- `--apply` 判完一组，不论动作是什么，组里每条都写上当前时间；不升 revision，不动 `updated_at`。预演不写。
+- 组按成员里最早的 `consolidated_at` 排，`NULL` 最前——新进库的条目所在的组先看。
+- 成员全部 `consolidated_at ≥ updated_at` 的组（上次看过之后谁都没变）跳过，不调模型。定期跑的调用数因此只跟上次之后新增、改动的条目有关。
 
 **判定（每组一次记忆模型调用）。** 用 `[memory].model`，提示词记版本 `memory-consolidate/v1`。组内条目用编号列出（§9.9），每条带状态、来源、确认、观察时间与正文；模型对每组输出零到多个动作，不输出就是"保持原样"：
 
@@ -196,18 +205,20 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 
 **第一版不生成新正文。** merge 只从组里挑一条现有正文当 keep，不让模型改写、合写或拆分。改写会把几条各自带来源、确认与证据的陈述揉成一段，新正文的来源算谁的都不对；OpenViking 整文件重写的问题就在这里（附录 A.3）。要做改写，单独设计来源与确认怎么继承。
 
-**授权（模型说的关系不等于可以执行的动作）。** 与写入时 `Plan::authorize` 同两条线（§9.6），外加两条只属于离线整理的：
+**授权（模型说的关系不等于可以执行的动作）。** 与写入时 `Plan::authorize` 同两条线（§9.6），外加几条只属于离线整理的：
 
 - 模型推断不能取代、吸收用户陈述：`supersede` 的 by 是 `model_inference`、old 是 `user_statement` → 降级为 `contest`；`merge` 的 keep 来源弱于某个被吸收者（被吸收方有 `user_statement`，keep 却不是）→ 这一组不执行，报告标"需要人看"。
 - 任何东西都不能取代 `user_confirmed`：`supersede` 的 old 是已确认 → 降级为 `contest`；被吸收方里有已确认、keep 却不是 → 不执行。
 - `rereadable` 只作用于 `unconfirmed`，且不作用于 `preference`：用户说过的偏好不因"像是能查到"而被遗忘。
 - 合并不提升确认等级：keep 多了证据，`state` 与 `confirmation` 照旧（§9.6"多次复述不能增加确认等级"）。
+- 合并不能降低生效状态：被吸收方里有 `active`、keep 却不是 `active` → 不执行，报告标"需要人看"。否则一条生效记忆会被吸收进一条不参与召回的 candidate，等于绕过授权停掉了它。
+- `merge` 的成员里不能有 `contested`：吸收掉冲突的一方，另一方就成了没有对手的 contested。contested 只参与 `supersede` 与 `contest`。
 
-**数据模型的一处追加。** 现在 `supersedes: Option<SupersededRef>` 挂在**新条目**上、只指一条旧的；merge 是一对多，keep 也不是新条目。被吸收方要记下"被谁吸收"：`memory_items` 追加可空列 `superseded_by`（id + revision），schema 只加不删（§8.2）。`supersede` 动作同样写这一列。之后 `komo memory show` 能从任一方找到另一方。
+**数据模型的追加（schema 只加不删，§8.2）。** 现在 `supersedes: Option<SupersededRef>` 挂在**新条目**上、只指一条旧的；merge 是一对多，keep 也不是新条目。被吸收方要记下"被谁吸收"：`memory_items` 追加可空列 `superseded_by`（id + revision）。离线的 `merge` 与 `supersede` 都写这一列；**写入时的 `mark_superseded` 也写**，否则只有离线整理留下的关系能双向查。这也补上写入时的一个缺口：一条观察判出多条 supersedes 时，新条目的 `supersedes` 只留得下最后一条，`superseded_by` 记在每条旧条目上，一条都不丢。之后 `komo memory show` 能从任一方找到另一方。另一列是上面的 `consolidated_at`。
 
-**落库与并发。** 每个动作带预期 revision，一组一个事务（`with_write_retry`）。预演之后、执行之前，后台提取可能已经改了组里某一条：revision 对不上，整组跳过并在报告里列出，下次重新分组。写完发一次索引补齐信号（§9.5）。
+**落库与并发。** 每个动作带预期 revision，一组一个事务（`with_write_retry`）。判定之后、写库之前，后台提取可能已经改了组里某一条：revision 对不上，整组跳过并在报告里列出，不写 `consolidated_at`，下次重新分组。写完发一次索引补齐信号（§9.5）。
 
-**报告。** 预演与执行输出同一份清单：每组成员 `id@revision`、模型给的动作与理由、授权结果（执行 / 降级 / 跳过及原因）。执行后 `superseded_by` 与 forget 记录本身就是审计痕迹。
+**报告。** 预演与执行输出同一种清单：每组成员 `id@revision`、模型给的动作与理由、授权结果（执行 / 降级 / 跳过及原因）。清单不落盘；执行后 `superseded_by` 与 forget 记录本身就是审计痕迹。
 
 **`--instruction`。** 作为软提示交给模型，用来点破模型自己判断不出的合并（比如"这两个名字是同一个项目"），照 OpenViking 的同名参数；它不改变上面任何一条授权规则。
 
@@ -216,15 +227,20 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 - 两条同义的 active：执行后 keep 的证据是并集、`state` / `confirmation` 不变，被吸收方 `superseded` 且 `superseded_by` 指向 keep；预演不改库。
 - 推断想吸收用户陈述：不执行，报告标"需要人看"。
 - `supersede` 一条 `user_confirmed`：降级为双方 `contested`。
-- 预演后组里某条 revision 变了：执行时整组跳过。
+- 判定后、写库前组里某条 revision 变了：整组跳过，组员的 `consolidated_at` 不变。
 - `rereadable` 不碰已确认条目与 preference；遗忘后同一来源不被后台重提取（§9.6）。
 - 不同作用域的同义条目不在同一组。
+- 判成"保持原样"的组下次排到最后；成员都没变时整组跳过，不调模型。
+- 超过 50 组时，第 51 组在第二次运行里被处理。
+- candidate 想吸收 active：不执行。
+- 成员里有 contested 的 `merge`：不执行。
+- 写入时的 supersede 判出两条旧条目：两条的 `superseded_by` 都指向新条目。
 
-**待定。** 报告要不要落盘、落在哪（state.db 新表还是数据目录下的文件）；分组的相似度阈值用实测定；以后是否在每次提取后只对新条目所在的组跑一遍（现在不做）。
+**待定。** 分组的相似度阈值用实测定。
 
 ## 9.9 判关系时，候选用编号而不是 id（设计，2026-10-19 认可，未实现）
 
-**现状。** `consolidate.rs` 的 `classify` 把相关条目列成 `- id=<UUIDv7> 状态=… 内容：…`，要模型回 `{"memory":"<id>","relation":…}`。模型回了不在候选集里的 id，代码会忽略它——安全，但这一条判断就白做了。UUIDv7 的前半段是时间戳，同一时期入库的条目只差后几位，正是最容易抄错的地方。
+**现状。** `consolidate.rs` 的 `classify` 把相关条目列成 `- id=<UUIDv7> 状态=… 来源=… 确认=… 内容：…`，要模型回 `{"memory":"<id>","relation":…}`。模型回了不在候选集里的 id，代码会忽略它——安全，但这一条判断就白做了。UUIDv7 的前半段是时间戳，同一时期入库的条目只差后几位，正是最容易抄错的地方。
 
 **改法（照 mem0 v3，附录 A.3）。** 候选按列出顺序编号 `0..N-1`，写成 `[0] 状态=… 来源=… 确认=… 内容：…`；模型回 `{"memory":0,"relation":…}`。Rust 用这次调用的编号表映射回 `MemoryId`：
 
@@ -232,9 +248,55 @@ Memory 内容以带来源的数据进入上下文，不能成为系统指令或�
 - 同一个编号出现多次 → 只认第一条；
 - 数字字符串（`"0"`）按整数接受，其余字符串一律丢弃。
 
-编号表只活在这一次调用里，不落库，也不出现在任何持久记录中——持久记录里写的永远是真实的 `id@revision`。§9.8 的离线整理用同一套编号。
+编号表只活在这一次调用里，不落库，也不出现在任何持久记录中——持久记录里写的永远是真实的 `id@revision`。§9.8 的离线整理、§9.10 合并后的提取调用用同一套编号；§9.10 落地后 `classify` 不再单独存在，编号规则跟着搬进提取。
 
 **验收。** `a_verdict_index_maps_back_to_the_listed_candidate`、`an_out_of_range_index_is_dropped`、`a_repeated_index_keeps_only_the_first_verdict`。
+
+## 9.10 按会话提取，一次调用（设计，2026-10-19 认可，未实现）
+
+**现状与数据。** 提取以 Run 为单位：Gateway 每 30 秒（`MEMORY_TICK`）领最多 8 个结束的 Run（`WORK_BATCH`），每个 Run 调一次提取，得到最多 5 条观察；每条观察不是逐字重复、又召回到相关条目时，再调一次 `classify`（§9.9）。一个 Run 最多 6 次模型调用。本机 2026-10-19：94 个会话、426 个 Run，只有一个 Run 的会话 40 个（只占 Run 的 9%），其余 54 个会话平均约 7 个 Run；v3 上线（10-16）后处理的 152 个 Run 里 102 个什么都没留下。
+
+**触发：会话空闲后整批处理。** `claim` 从按 Run 改成按会话：一个会话没有未到终态的 Run，且最后一个 Run 结束已满 `[memory].extract_idle`（初值 10 分钟），才一次领走它全部 `memory_work = pending` 的 Run。队列仍是 `runs.memory_work` 与每个 Run 自己的游标，schema 不变；失败时这一批 Run 都放回 pending，游标不推进。会话之后又被 resume，新 Run 等下一次空闲再成一批。会话没有"结束"这个事件——`resume`、`task(prompt, task_id)` 随时接着做——所以不按 Run 终态触发；一次性任务跑完就不再有动静，空闲后正好处理一次。
+
+**不调模型就跳过。** 领到后先按确定性规则筛，命中的 Run 标 `done`、游标推进到末尾，日志写明原因：
+
+| 跳过 | 怎么认 |
+|---|---|
+| 后台任务会话 | 会话 `kind = task`（`docs/background-tasks.md`） |
+| Cron 触发的 Run | `PlanSource::Cron` |
+| 用户取消的 Run | 已有，不变 |
+| 没有新的用户陈述或工具结果 | 已有，不变 |
+
+代价写明：任务会话里排查出来的坑不再进记忆。home 收到的只是任务的结论摘要，摘要不是证据（下面"交回的结果不是用户原话"）。
+
+**一次调用，提取与判关系合在一起（照 mem0 v3，附录 A.3）。** 先用这一批里的用户陈述在相关作用域做一次混合检索（§9.4，放行 candidate 与 contested），取约 20 条已有记忆，按 §9.9 编号放进提示词；模型交回新观察，每条可带与编号候选的关系：
+
+```json
+{"observations":[{"content":"…","kind":"…","scope":"…","said_by":"…","evidence":["…"],
+  "relations":[{"memory":3,"relation":"supersedes"}]}]}
+```
+
+Rust 侧不变的三道：逐字相同先合并（`find_by_content`），`Transcript::validate` 校验来源与引用，`Plan::authorize` 把越权关系降级；授权规则一条不改。单独的 `classify` 删掉。提示词升 `memory-extract/v4`；观察上限从每 Run 改成每批，初值 8，进 `[memory]` 配置。模型调用失败 → 整批放回 pending（与现在提取失败相同），不再有"判不出关系就按新建收"那条退路。
+
+**代价：召回精度。** 候选是按整段对话召回的，不是按每条观察的正文召回，某条观察真正相关的旧条目可能不在这 20 条里。漏掉的后果是多一条近义条目，不会误删误改；这些由 §9.8 离线整理收。分工：写入时省调用、粗判，离线时精判。
+
+**窗口：用户输入一行不丢。** 现在窗口超过 `MAX_TRANSCRIPT_CHARS`（24 000 字符）时只留尾部（`extract.rs` 的 `Transcript::build`），长 Run 里用户最初的请求会被截掉——而用户陈述是 `user_statement` 唯一的来源。按本机日志估算，426 个 Run 里约 48 个超限。改成：用户输入行全部保留，从最旧的工具结果开始删。一批仍超预算时按 Run 边界切成几段，每段一次调用——"一次"是常态，不是保证。
+
+**交回的结果不是用户原话（现有缺口，一并修）。** 任务结果以请求键 `task-result:{run}` 的 `run.accepted` 交回 home（`service/tasks.rs` 的 `report_to_parent`），而 `Transcript::build` 把所有 `run.accepted` 都渲染成"用户"——模型把它标成 `user_statement` 时校验也会放行，任务 agent 写的摘要就以用户原话入库。§9.3 写明助手摘要不算独立证据。改成：这类输入渲染为"任务交回"，不能被 evidence 引用。
+
+**逐会话记录。** 每批处理完发一个 `komo.memory.extract` span（[`observability.md`](observability.md) §3），同一份 tracing 埋点也写进文件日志：会话 id、`kind`、Run 数、窗口字符数、跳过原因、模型交回几条、落库几条。现在只有每拍的合计，分不出哪类会话总是空的；"一问一答"这类会话要不要加进跳过规则，等这份日志攒出数据再定。
+
+**落地时改 §9.3。** "一个 Run 最多收 5 条"改成每批的上限；"Cron 只在任务授予的范围内积累有证据的事实和经验"改成 Cron 的 Run 不提取；处理流程里"后台领取该 Run"改成按会话空闲领取。
+
+**验收（实现时写成测试）。**
+
+- 会话还有未到终态的 Run，或最后一个 Run 结束不满 `extract_idle`：不领。
+- 空闲够了：一次领走该会话全部 pending 的 Run，只调一次模型（mock 计数）。
+- `kind = task` 的会话、Cron 的 Run：不调模型，标 `done`，游标推进。
+- 关系编号映射回正确的 `MemoryId`；越权关系照 `Plan::authorize` 降级。
+- 窗口超限时用户输入行全部保留。
+- 超预算的批按 Run 边界切成多次调用，每个 Run 的游标各自推进。
+- 请求键 `task-result:` 的输入不能被引为 `user_statement`。
 
 ---
 

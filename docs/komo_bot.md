@@ -923,6 +923,7 @@ Memory 的规格在 [`docs/memory.md`](memory.md)（2026-10-19 从本节迁出�
 | §9.7 | 与 resume 和权限的关系 |
 | §9.8 | 离线整理（设计，未实现） |
 | §9.9 | 判关系时候选用编号（设计，未实现） |
+| §9.10 | 按会话空闲后提取，提取与判关系一次调用（设计，未实现） |
 
 同一文档的附录收着外部记忆仓库调研（graphiti / mem0 / OpenViking）与此前的改进方案、差距分析。
 
@@ -1431,7 +1432,7 @@ effort 的行为统一，取值按协议和具体模型校验：
 
 配置热重载（§3）：模型 / effort / 凭证改动对**新** Run 立即生效；当前 Run 与后台记忆任务保留各自开始时抓取的配置快照，跑完才换。resume 默认沿用原运行的模型 / effort；若操作者明确切换，记录配置变更事件并重新验证协议历史可回放性。任何情况下都不能通过重放已完成工具来适应新模型。
 
-每次生成与向量请求记录角色、模型身份、实际 effort 或 provider_default、耗时和错误；不记录密钥。每轮用量随 `message.assistant` 落盘：`input_tokens` 是**整个提示**（含缓存读写的部分——Anthropic 报三个互斥的数，适配器加总；OpenAI 两种协议本来就是总数），`cache_read_tokens` / `cache_write_tokens` 是其中由前缀缓存供给 / 这次写进缓存的部分（只有 Anthropic 报写入）；provider 没报的一律留空，不记成 0。具体服务可能更改默认值，所以未设置 effort 时只记录“服务端默认”，不能虚构当时采用的强度。索引任务还记录向量空间、代次与条目版本。
+每次生成与向量请求记录角色、模型身份、实际 effort 或 provider_default、耗时和错误；不记录密钥。每轮用量随 `message.assistant` 落盘：`input_tokens` 是**整个提示**（含缓存读写的部分——Anthropic 报三个互斥的数，适配器加总；OpenAI 两种协议本来就是总数），`cache_read_tokens` / `cache_write_tokens` 是其中由前缀缓存供给 / 这次写进缓存的部分（只有 Anthropic 报写入）；provider 没报的一律留空，不记成 0。具体服务可能更改默认值，所以未设置 effort 时只记录“服务端默认”，不能虚构当时采用的强度。索引任务还记录向量空间、代次与条目版本。遥测（OpenTelemetry 链路与指标）、日志与运维视图的设计在 [`docs/observability.md`](observability.md)。
 
 ### 13.4 Crate 划分与编译预算
 

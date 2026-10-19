@@ -1193,13 +1193,29 @@ for line in sys.stdin:
             .collect()
     }
 
-    /// 进程还在（僵尸不算）。
+    /// 进程还在（僵尸不算）。Linux 读 `/proc/<pid>/stat`，其他平台（macOS 没有 `/proc`）
+    /// 问 `ps -o stat=`，与 `recovery::processes::SysProcessProbe` 同一个分法。
     fn alive(pid: u32) -> bool {
-        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-            stat.rsplit(')')
-                .next()
-                .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
-        })
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit(')')
+                    .next()
+                    .is_some_and(|rest| !rest.trim_start().starts_with('Z'))
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|output| {
+                    let stat = String::from_utf8_lossy(&output.stdout);
+                    output.status.success()
+                        && !stat.trim().is_empty()
+                        && !stat.trim().starts_with('Z')
+                })
+        }
     }
 
     async fn wait_exit(pid: u32) {

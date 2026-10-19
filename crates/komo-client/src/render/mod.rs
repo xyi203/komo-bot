@@ -9,8 +9,9 @@
 use komo_kernel::cron::{FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, Trigger};
 use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
-    CompactionSummary, ConfigCheckResponse, ConfigReloadResponse, CronListResponse, HealthResponse,
-    IndexState, InterventionDetail, InterventionListResponse, InterventionSummary,
+    CompactionSummary, ConfigCheckResponse, ConfigReloadResponse, ConsolidateAction,
+    ConsolidateGroupStatus, ConsolidateOutcome, CronListResponse, HealthResponse, IndexState,
+    InterventionDetail, InterventionListResponse, InterventionSummary, MemoryConsolidateResponse,
     MemoryIndexStatus, MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse,
     RunDetail, SessionListResponse, SessionSummary, SweepRule, TelemetryHealth, ToolCallSummary,
     WindowSource,
@@ -681,6 +682,84 @@ fn scope_text(scope: &MemoryScope) -> String {
         MemoryScope::Project { project_id } => format!("项目 {project_id}"),
         MemoryScope::Environment { instance_id } => format!("环境 {instance_id}"),
     }
+}
+
+/// `komo memory consolidate`（§9.8）。预演与执行同一种清单：每组成员 `id@revision`、
+/// 模型给的动作与理由、授权结果。动作里的 id 都带上组里记下的 revision，方便照抄。
+pub fn memory_consolidate(response: &MemoryConsolidateResponse) -> String {
+    let mut out = vec![format!(
+        "{} {} 组；成员没变而跳过 {} 组；留给下次 {} 组",
+        if response.applied {
+            "已整理"
+        } else {
+            "预演，将整理"
+        },
+        response.groups.len(),
+        response.unchanged_groups,
+        response.deferred_groups
+    )];
+    for (index, group) in response.groups.iter().enumerate() {
+        let at = |id: &komo_kernel::types::ids::MemoryId| match group
+            .members
+            .iter()
+            .find(|member| &member.memory == id)
+        {
+            Some(member) => format!("{}@{}", member.memory, member.revision),
+            None => id.to_string(),
+        };
+        let action_text = |action: &ConsolidateAction| match action {
+            ConsolidateAction::Merge { keep, absorb } => format!(
+                "合并 保留 {}，并入 {}",
+                at(keep),
+                absorb.iter().map(&at).collect::<Vec<_>>().join("、")
+            ),
+            ConsolidateAction::Supersede { old, by } => {
+                format!("取代 {} 被 {} 取代", at(old), at(by))
+            }
+            ConsolidateAction::Contest { a, b } => format!("冲突 {} 与 {}", at(a), at(b)),
+            ConsolidateAction::Rereadable { item } => format!("可重读 {}", at(item)),
+        };
+        out.push(format!(
+            "\n组 {}（{}，{} 条）{}",
+            index + 1,
+            scope_text(&group.scope),
+            group.members.len(),
+            match group.status {
+                ConsolidateGroupStatus::Judged if group.actions.is_empty() => "：保持原样",
+                ConsolidateGroupStatus::Judged => "",
+                ConsolidateGroupStatus::Conflict => "：判定之后有条目变了，整组跳过，没盖游标",
+                ConsolidateGroupStatus::Failed => "：失败，没盖游标",
+            }
+        ));
+        for member in &group.members {
+            out.push(format!("  · {}@{}", member.memory, member.revision));
+        }
+        for entry in &group.actions {
+            let outcome = match entry.outcome {
+                ConsolidateOutcome::Executed => "执行",
+                ConsolidateOutcome::Downgraded => "降级",
+                ConsolidateOutcome::Skipped => "跳过",
+            };
+            out.push(format!(
+                "  [{outcome}] {}｜{}",
+                action_text(&entry.action),
+                entry.reason
+            ));
+            if let Some(executed) = &entry.executed_as {
+                out.push(format!("      实际：{}", action_text(executed)));
+            }
+            if let Some(note) = &entry.note {
+                out.push(format!("      {note}"));
+            }
+        }
+        if let Some(detail) = &group.detail {
+            out.push(format!("  ✗ {detail}"));
+        }
+    }
+    if !response.applied && !response.groups.is_empty() {
+        out.push("\n预演不写库；加 --apply 会重新判定后执行（不执行这份清单）".into());
+    }
+    out.join("\n")
 }
 
 /// `komo memory sweep`。每条都带 id@revision 与理由，撤回时照着抄 `komo memory restore`。

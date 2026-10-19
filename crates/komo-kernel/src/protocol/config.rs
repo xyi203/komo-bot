@@ -358,6 +358,39 @@ pub struct MemoryConfig {
     pub embedding: Option<EmbeddingConfig>,
     #[serde(default)]
     pub retrieval: RetrievalConfig,
+    #[serde(default)]
+    pub consolidate: ConsolidateConfig,
+}
+
+/// `[memory.consolidate]`：离线整理的分组预算（§9.8）。初值待实测调。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsolidateConfig {
+    /// 一次运行最多处理几组（所有作用域合计）。
+    #[serde(default = "default_consolidate_max_groups")]
+    pub max_groups: u32,
+    /// 一组最多几条；超了按相似度切开。
+    #[serde(default = "default_consolidate_group_size")]
+    pub group_size: u32,
+    /// 近邻关系成立的最低相似度（正文词元的 Jaccard，百分数）。0 = 检索给的近邻都算。
+    #[serde(default)]
+    pub min_similarity_pct: u32,
+}
+
+fn default_consolidate_max_groups() -> u32 {
+    50
+}
+fn default_consolidate_group_size() -> u32 {
+    8
+}
+
+impl Default for ConsolidateConfig {
+    fn default() -> Self {
+        ConsolidateConfig {
+            max_groups: default_consolidate_max_groups(),
+            group_size: default_consolidate_group_size(),
+            min_similarity_pct: 0,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -722,6 +755,7 @@ mod tests {
                 model: model("memory-a"),
                 embedding: None,
                 retrieval: RetrievalConfig::default(),
+                consolidate: ConsolidateConfig::default(),
             },
             agent: AgentConfig {
                 default_agent: "assistant".into(),

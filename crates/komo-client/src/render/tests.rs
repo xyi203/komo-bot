@@ -1105,3 +1105,65 @@ fn config_check_lists_window_sources_and_hints_for_unknown() {
         "{printed}"
     );
 }
+
+// ---- memory consolidate ----
+
+#[test]
+fn a_consolidation_report_shows_members_actions_reasons_and_authorization() {
+    use komo_kernel::protocol::http::{
+        ConsolidateActionReport, ConsolidateGroupReport, ConsolidateMember,
+    };
+    let id = |raw: &str| MemoryId::from_raw(raw);
+    let response = MemoryConsolidateResponse {
+        applied: false,
+        groups: vec![ConsolidateGroupReport {
+            scope: MemoryScope::Personal,
+            members: vec![
+                ConsolidateMember {
+                    memory: id("m-1"),
+                    revision: 2,
+                },
+                ConsolidateMember {
+                    memory: id("m-2"),
+                    revision: 1,
+                },
+            ],
+            actions: vec![
+                ConsolidateActionReport {
+                    action: ConsolidateAction::Merge {
+                        keep: id("m-1"),
+                        absorb: vec![id("m-2")],
+                    },
+                    reason: "同一件事".into(),
+                    outcome: ConsolidateOutcome::Executed,
+                    executed_as: None,
+                    note: None,
+                },
+                ConsolidateActionReport {
+                    action: ConsolidateAction::Supersede {
+                        old: id("m-1"),
+                        by: id("m-2"),
+                    },
+                    reason: "新答案".into(),
+                    outcome: ConsolidateOutcome::Downgraded,
+                    executed_as: Some(ConsolidateAction::Contest {
+                        a: id("m-1"),
+                        b: id("m-2"),
+                    }),
+                    note: Some("降级为 contest".into()),
+                },
+            ],
+            status: ConsolidateGroupStatus::Judged,
+            detail: None,
+        }],
+        unchanged_groups: 3,
+        deferred_groups: 1,
+    };
+    let text = memory_consolidate(&response);
+    assert!(text.contains("预演，将整理 1 组；成员没变而跳过 3 组；留给下次 1 组"));
+    assert!(text.contains("· m-1@2"));
+    assert!(text.contains("[执行] 合并 保留 m-1@2，并入 m-2@1｜同一件事"));
+    assert!(text.contains("[降级]"));
+    assert!(text.contains("实际：冲突 m-1@2 与 m-2@1"));
+    assert!(text.contains("加 --apply"));
+}

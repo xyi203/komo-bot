@@ -26,6 +26,7 @@
 mod consolidate;
 mod extract;
 mod index;
+mod offline;
 mod rerank;
 mod stale;
 mod sweep;
@@ -35,7 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
-use komo_kernel::protocol::config::{MemoryConfig, RetrievalConfig};
+use komo_kernel::protocol::config::{ConsolidateConfig, MemoryConfig, RetrievalConfig};
 use komo_kernel::protocol::http::{
     IndexState, MemoryIndexStatus, MemorySweepRequest, MemorySweepResponse,
 };
@@ -418,6 +419,7 @@ struct Live {
     /// **记忆模型自己的那份完整配置**（§13.3）：端点、模型、effort 一起来，不拼装。
     model: ModelConfig,
     retrieval: RetrievalConfig,
+    consolidate: ConsolidateConfig,
     llm: Arc<dyn LlmClient>,
 }
 
@@ -470,6 +472,7 @@ impl MemoryManager {
                 enabled: parts.config.enabled,
                 model: parts.config.model.clone(),
                 retrieval: parts.config.retrieval.clone(),
+                consolidate: parts.config.consolidate.clone(),
                 llm: parts.llm,
             }),
             repo: parts.repo,
@@ -502,6 +505,7 @@ impl MemoryManager {
             enabled: config.enabled,
             model: config.model.clone(),
             retrieval: config.retrieval.clone(),
+            consolidate: config.consolidate.clone(),
             llm,
         };
     }

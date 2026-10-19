@@ -18,6 +18,7 @@
 //! | `POST /v1/memories/{id}/forget` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memories/{id}/restore` | [`MemoryRevisionRequest`] | [`MemoryDetail`] |
 //! | `POST /v1/memory-sweep` | [`MemorySweepRequest`] | [`MemorySweepResponse`] |
+//! | `POST /v1/memory-consolidate` | [`MemoryConsolidateRequest`] | [`MemoryConsolidateResponse`] |
 //! | `GET /v1/models` | — | [`ModelsResponse`] |
 //! | `GET /v1/config/check` | — | [`ConfigCheckResponse`] |
 //! | `POST /v1/config/reload` | — | [`ConfigReloadResponse`]，失败走 [`ErrorBody`] |
@@ -32,7 +33,7 @@ use super::config::{ConfigIssue, KeyPath, SourceFile};
 use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
 use crate::types::chat::PeerId;
 use crate::types::ids::{CronJobId, MemoryId, RequestKey, RunId, Seq, SessionId};
-use crate::types::memory::{MemoryItem, MemoryScope, MemoryState, RetrievalMode};
+use crate::types::memory::{MemoryItem, MemoryKind, MemoryScope, MemoryState, RetrievalMode};
 use crate::types::model::{Effort, EmbeddingSpace, ModelConfig};
 use crate::types::plan::{PlanHash, PlanSource};
 use crate::types::status::{RunState, SessionState, WaitReason};
@@ -906,6 +907,109 @@ pub struct MemorySweepResponse {
     /// 应用时失败的那些（版本冲突之类），不让一条失败拦住其余的。
     #[serde(default)]
     pub errors: Vec<String>,
+}
+
+/// `POST /v1/memory-consolidate`：离线整理（§9.8）。`apply = false` 只预演，什么都不写。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryConsolidateRequest {
+    /// 只整理这个作用域；不给就逐个作用域跑。
+    #[serde(
+        default,
+        deserialize_with = "scope_from_text_or_object",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub scope: Option<MemoryScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<MemoryKind>,
+    /// 交给模型的软提示；不改变任何授权规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instruction: Option<String>,
+    #[serde(default)]
+    pub apply: bool,
+}
+
+/// 一组里的一条：真实的 `id@revision`（编号表只活在一次模型调用里，§9.9）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsolidateMember {
+    pub memory: MemoryId,
+    pub revision: u32,
+}
+
+/// 模型给出的动作（§9.8）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ConsolidateAction {
+    Merge {
+        keep: MemoryId,
+        absorb: Vec<MemoryId>,
+    },
+    Supersede {
+        old: MemoryId,
+        by: MemoryId,
+    },
+    Contest {
+        a: MemoryId,
+        b: MemoryId,
+    },
+    Rereadable {
+        item: MemoryId,
+    },
+}
+
+/// 授权结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidateOutcome {
+    Executed,
+    /// 越权，降级成 `executed_as` 里的动作。
+    Downgraded,
+    Skipped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsolidateActionReport {
+    pub action: ConsolidateAction,
+    /// 模型给的一句理由；只进报告，不进库。
+    pub reason: String,
+    pub outcome: ConsolidateOutcome,
+    /// 降级后实际执行的动作。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed_as: Option<ConsolidateAction>,
+    /// 降级或跳过的原因；"需要人看"的写在这里。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConsolidateGroupStatus {
+    /// 判完了（预演或执行；没有动作 = 保持原样）。
+    Judged,
+    /// 判定之后、写库之前组里有条目变了：整组跳过，没盖游标。
+    Conflict,
+    /// 模型调用或落库失败：没盖游标。
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsolidateGroupReport {
+    pub scope: MemoryScope,
+    pub members: Vec<ConsolidateMember>,
+    pub actions: Vec<ConsolidateActionReport>,
+    pub status: ConsolidateGroupStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// 预演与执行同一种清单；不落盘。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryConsolidateResponse {
+    pub applied: bool,
+    pub groups: Vec<ConsolidateGroupReport>,
+    /// 成员自上次整理以来都没变、没调模型的组数。
+    pub unchanged_groups: u32,
+    /// 超过一次运行上限、留给下一次的组数。
+    pub deferred_groups: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -88,6 +88,7 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
             model: memory_model,
             embedding: Some(embedding),
             retrieval: RetrievalConfig::default(),
+            consolidate: Default::default(),
         },
         agent: AgentConfig {
             default_agent: "assistant".into(),

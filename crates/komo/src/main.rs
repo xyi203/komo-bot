@@ -329,6 +329,21 @@ enum MemoryCommand {
         #[arg(long, default_value_t = 90)]
         idle_days: u32,
     },
+    /// 离线整理（§9.8）：对一个作用域里已有的记忆去重、取代、标冲突，不新增正文。默认只预演。
+    Consolidate {
+        /// 只整理这个作用域：personal / project:<id> / environment:<id>；不给就逐个作用域跑。
+        #[arg(long)]
+        scope: Option<String>,
+        /// 只整理这个种类：preference / fact / experience。
+        #[arg(long)]
+        kind: Option<String>,
+        /// 给模型的软提示（比如"这两个名字是同一个项目"）；不改变任何授权规则。
+        #[arg(long)]
+        instruction: Option<String>,
+        /// 真的执行；不加只列出现在跑会怎样。
+        #[arg(long)]
+        apply: bool,
+    },
     /// 向量索引（§9.5）。
     Index {
         #[command(subcommand)]
@@ -694,6 +709,12 @@ async fn operator(
                 never_used_days,
                 idle_days,
             } => commands::memory_sweep(client, apply, never_used_days, idle_days).await,
+            MemoryCommand::Consolidate {
+                scope,
+                kind,
+                instruction,
+                apply,
+            } => commands::memory_consolidate(client, scope, kind, instruction, apply).await,
             MemoryCommand::Index { action } => match action {
                 MemoryIndexCommand::Status => commands::memory_index(client).await,
                 MemoryIndexCommand::Rebuild => commands::memory_rebuild(client).await,

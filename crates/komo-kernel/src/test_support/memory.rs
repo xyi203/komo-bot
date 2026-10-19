@@ -23,6 +23,7 @@ pub struct MemMemoryRepo {
 struct MemoryState_ {
     items: BTreeMap<MemoryId, MemoryItem>,
     vectors: BTreeMap<MemoryId, Vector>,
+    marks: BTreeMap<MemoryId, OffsetDateTime>,
     /// 置位后 recall 明示降级。
     vector_backend_down: bool,
 }
@@ -153,6 +154,46 @@ impl MemoryRepo for MemMemoryRepo {
             return Ok(());
         }
         state.vectors.insert(id.clone(), vector);
+        Ok(())
+    }
+
+    async fn consolidation_marks(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<Vec<(MemoryId, Option<OffsetDateTime>)>, RepoError> {
+        let state = self.state.lock().expect("记忆");
+        Ok(ids
+            .iter()
+            .map(|id| (id.clone(), state.marks.get(id).copied()))
+            .collect())
+    }
+
+    async fn apply_consolidation(&self, write: ConsolidationWrite) -> Result<(), RepoError> {
+        let mut state = self.state.lock().expect("记忆");
+        for (id, revision, updated_at) in &write.expected {
+            let item = state.items.get(id).ok_or_else(|| RepoError::NotFound {
+                what: format!("memory {id}"),
+            })?;
+            if item.revision != *revision || item.updated_at != *updated_at {
+                return Err(RepoError::VersionConflict {
+                    expected: *revision,
+                    actual: item.revision,
+                });
+            }
+        }
+        for item in write.puts {
+            state.items.insert(item.id.clone(), item);
+        }
+        for id in &write.forgets {
+            if let Some(item) = state.items.get_mut(id) {
+                item.state = MemoryState::Forgotten;
+                item.updated_at = write.stamp_at;
+            }
+            state.vectors.remove(id);
+        }
+        for (id, _, _) in &write.expected {
+            state.marks.insert(id.clone(), write.stamp_at);
+        }
         Ok(())
     }
 

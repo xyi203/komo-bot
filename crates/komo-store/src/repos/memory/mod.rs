@@ -18,7 +18,7 @@
 
 use async_trait::async_trait;
 use komo_kernel::protocol::http::{IndexState, MemoryIndexStatus};
-use komo_kernel::traits::{MemoryRepo, RepoError, StoreError};
+use komo_kernel::traits::{ConsolidationWrite, MemoryRepo, RepoError, StoreError};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{MemoryId, RunId};
 use komo_kernel::types::memory::{
@@ -31,6 +31,7 @@ use toasty::Executor;
 #[cfg(test)]
 mod bench;
 mod catalog;
+mod consolidate;
 mod fuse;
 mod terms;
 
@@ -307,6 +308,17 @@ impl MemoryRepo for TursoMemoryRepo {
             .map_err(RepoError::from)
     }
 
+    async fn consolidation_marks(
+        &self,
+        ids: &[MemoryId],
+    ) -> Result<Vec<(MemoryId, Option<OffsetDateTime>)>, RepoError> {
+        consolidate::marks(&self.db, ids).await
+    }
+
+    async fn apply_consolidation(&self, write: ConsolidationWrite) -> Result<(), RepoError> {
+        consolidate::apply(&self.db, write).await
+    }
+
     async fn index_status(&self) -> Result<MemoryIndexStatus, RepoError> {
         self.db
             .read(move |ex| {
@@ -481,6 +493,7 @@ async fn put_in(
                 last_used_at: to_ts_opt(item.usage.last_used_at),
                 supersedes: supersedes.clone(),
                 superseded_by: superseded_by.clone(),
+                consolidated_at: None,
             })
             .exec(ex)
             .await
@@ -1667,6 +1680,101 @@ mod tests {
     }
 
     /// 取代链存得下、读得回（§9.6）。
+    #[tokio::test]
+    async fn consolidating_stamps_every_member_without_touching_revision_or_updated_at() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        let one = repo
+            .put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        let ids = [MemoryId::from_raw("m-1")];
+        assert_eq!(repo.consolidation_marks(&ids).await.unwrap()[0].1, None);
+
+        let at = NOW + time::Duration::hours(1);
+        repo.apply_consolidation(ConsolidationWrite {
+            expected: vec![(one.id.clone(), one.revision, one.updated_at)],
+            puts: vec![],
+            forgets: vec![],
+            stamp_at: at,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(repo.consolidation_marks(&ids).await.unwrap()[0].1, Some(at));
+        let read = repo.get(&one.id).await.unwrap().unwrap();
+        assert_eq!((read.revision, read.updated_at), (1, one.updated_at));
+    }
+
+    #[tokio::test]
+    async fn a_member_changed_since_judging_refuses_the_whole_group_and_stamps_nothing() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        let one = repo
+            .put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        let two = repo
+            .put(item("m-2", "卧室空调设 24 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        // 操作者在判定期间 confirm 了 m-2：revision 不变，updated_at 变了。
+        repo.confirm(&two.id, two.revision, NOW + time::Duration::minutes(5))
+            .await
+            .unwrap();
+
+        let mut changed = one.clone();
+        changed.state = MemoryState::Contested;
+        let result = repo
+            .apply_consolidation(ConsolidationWrite {
+                expected: vec![
+                    (one.id.clone(), one.revision, one.updated_at),
+                    (two.id.clone(), two.revision, two.updated_at),
+                ],
+                puts: vec![changed],
+                forgets: vec![],
+                stamp_at: NOW + time::Duration::hours(1),
+            })
+            .await;
+        assert!(matches!(result, Err(RepoError::VersionConflict { .. })));
+
+        let ids = [one.id.clone(), two.id.clone()];
+        assert!(
+            repo.consolidation_marks(&ids)
+                .await
+                .unwrap()
+                .iter()
+                .all(|(_, mark)| mark.is_none())
+        );
+        let read = repo.get(&one.id).await.unwrap().unwrap();
+        assert_eq!(read.state, MemoryState::Active, "整组回滚");
+    }
+
+    #[tokio::test]
+    async fn consolidating_forgets_through_the_same_path_as_forget() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        let one = repo
+            .put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        repo.apply_consolidation(ConsolidationWrite {
+            expected: vec![(one.id.clone(), one.revision, one.updated_at)],
+            puts: vec![],
+            forgets: vec![one.id.clone()],
+            stamp_at: NOW,
+        })
+        .await
+        .unwrap();
+        let read = repo.get(&one.id).await.unwrap().unwrap();
+        assert_eq!(read.state, MemoryState::Forgotten);
+        let found = repo
+            .recall(&query("空调", RetrievalMode::Keyword))
+            .await
+            .unwrap();
+        assert!(found.items.is_empty(), "关键词索引已失效");
+    }
+
     #[tokio::test]
     async fn a_supersedes_link_round_trips() {
         let (db, _dir) = temp().await;

@@ -518,6 +518,13 @@ impl KomoClient {
         self.post("/v1/memory-sweep", request).await
     }
 
+    pub async fn memory_consolidate(
+        &self,
+        request: &MemoryConsolidateRequest,
+    ) -> ClientResult<MemoryConsolidateResponse> {
+        self.post("/v1/memory-consolidate", request).await
+    }
+
     pub async fn memory_index(&self) -> ClientResult<MemoryIndexStatus> {
         self.get("/v1/memory-index").await
     }

@@ -1023,6 +1023,7 @@ impl MemoryManager {
             komo.memory.skip_reason = tracing::field::Empty,
             komo.memory.returned = tracing::field::Empty,
             komo.memory.applied = tracing::field::Empty,
+            komo.memory.used = tracing::field::Empty,
         );
         let result = tracing::Instrument::instrument(
             self.run_batch(batch, report, &mut record),
@@ -1068,6 +1069,7 @@ impl MemoryManager {
         span.record("komo.memory.window_chars", record.window_chars as u64);
         span.record("komo.memory.returned", record.observations as u64);
         span.record("komo.memory.applied", record.applied as u64);
+        span.record("komo.memory.used", record.used as u64);
         if let Some(reason) = skip_label(record.skip_reason.as_deref()) {
             span.record("komo.memory.skip_reason", reason);
             tracing::event!(

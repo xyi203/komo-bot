@@ -165,12 +165,14 @@ Fedora 使用 systemd 管理，Mac 使用 launchd；服务管理器运行前台�
 task(prompt, title, task_id?, model?, effort?, contract?)
   无 task_id → 新开任务会话（kind = task，同一个 Agent），回"已派出 #2a9c：标题"，这一轮照常往下
   有 task_id → prompt 提交进那个已有的任务会话，它带着自己的历史接着做
+  只有 task_id → 查进度：回那个任务最近一条 Run 的快照（状态、已跑多久、正在执行的调用与输出尾部），不提交任何输入
   任务的 Run 进终态 → 结果作为一条内部输入交回派它的会话（请求键 task-result:{run}，只交回一次）
 ```
 
 - **不是子代理。** 跑任务的是派它的会话的同一个 Agent（§6.1：Session 绑定一个 Agent，任务会话不换人格）；它拿不到父的消息历史，因为它是另一个会话，不是因为另一套提示。任务会话按主 Agent 装配（记忆、skills 照常），能力面里**没有 `task`**——深度只有一层，结果只交回一层。
 - **`model` / `effort`**：`model` 填 `[model.<alias>]` 的 alias，可选值以 enum 写进工具说明；`effort` 按所选模型的档位校验（§13.3）。都在 `prepare` 里按当前配置快照校验，不认识的拒绝并列出可选值（例外：只给 `effort` 不给 `model` 时，所选模型——Agent 的默认或那个任务上一条 Run 的——只有执行侧知道，档位在派出那一步校验，不合格同样是一条落账的失败结果）。可选 alias 是 `model` 参数的 JSON-schema `enum`，按每一段装配时的当前配置渲染。省略时，新任务用 Agent 的默认；接着做（有 `task_id`）沿用那个任务上一条 Run 的。它们透传给任务 Run 的受理（`SubmitRunRequest` 本来就有这两项），冻结进那条 Run 的快照（§6.2）。**交回父会话的那条输入不带它们**，按父会话自己的默认——任务用便宜模型，父的转告不跟着降级。可选值写进 schema 的代价：改 `[model.*]` 让工具前缀变化，而且 enum **不冻结进 RunSnapshot**——在飞的 Run 从下一段装配起也看到新的列表（提示缓存从工具定义起失效一次）。`[model.*]` 很少改，先不冻结；要冻结得把 alias 列表存进快照、改 schema 的渲染路径。
 - **`contract`**：结构化结果的契约（JSON Schema，校验器认得的子集，与旧 `delegate` 的 `output_schema` 同一形状）。它冻结进任务 Run 的快照（`RunSnapshot.contract`），装配时补在那条 Run 的任务后面（系统提示不变）；交回之前用**同一份校验器**（`executor::check_contract`）复验任务的最后回复，复验结论写进交回的那条输入。
+- **查进度（2026-10-19）**：只给 `task_id`、不给 `prompt` 是只读查询，计划是 `Operation::TaskStatus`、`SafeReread`（中断后可直接重查），不建会话、不受理 Run。快照取自任务会话的 JSONL（`fold::progress_of`，最近一条 Run：状态、已跑多久、轮数与调用数、上次活动、正在执行的调用与参数摘要、等什么、终态的结论），渲染成一段中文（`TaskProgress::render`）；正在执行的调用再带 stdout 尾部（至多读末尾 2 KiB、留最后 8 个非空行），读 `tool-output/<run>/<call>/<attempt>/stdout.txt.partial`（已发布就读 `stdout.txt`，stdout 为空退到 stderr），读不到不是错误。起因：会话 01a151ec（2026-10-19）里用户两次问"为什么要这么久"，没人说得出任务在做什么。主动报进度（任务自己隔一阵说一句）没做，见 `docs/background-tasks.md` §7。
 - **Cron 触发的 Run 不能派任务**：交回 Cron 会话的那条结果没有对端也没有看客，回复投不到任何人。`prepare` 拒绝，理由让它自己把事做完。
 - **同一轮派几个就是几个在并行**，各自交回；宿主还在跑时并入（§6 插话），否则各开一条 Run。"派几个、等齐了汇总"因此不在同一轮里完成。
 - 交回、重启补挂看客、"需要你判断"的投递见 `docs/background-tasks.md`。
@@ -1768,6 +1770,8 @@ pub trait Clock: Send + Sync {
 | 会话目录被手工删除，而状态仍是 `active` / `closing` | Run 不被领走（不按空上下文执行一轮），对账把这条不一致报成 `blocked` Intervention |
 
 目录与引用验收：工具事件、大参数、完整输出及 stdout / stderr 都位于同一 Session 目录；改变 Gateway 当前工作目录不影响引用读取；不同 Session 或不同 attempt 不能互相覆盖。清理历史时保留未完成任务、Memory 证据和持久产物仍需引用的文件。**读路径不写**：把会话目录删掉之后，`GET /v1/sessions/{id}/events`、会话详情、对账与恢复扫描都不得把它建回来，而且对账必须把这条 Run 停成 `waiting + intervention` 并说明缺内容。
+
+**task 进度查询验收（2026-10-19，§4，已做）**：① 任务正跑着一条 `bash`（已打出一行、还在 sleep）时，home 只给 `task_id` 调 `task`，快照里有 `正在执行：bash`、命令摘要和 `.partial` 里的输出尾部；② 查询不往任务会话提交任何输入（Run 数不变）；③ 查不存在的短号是一条落账的失败结果，开头 `查不到进度`，不建任务会话；④ 输出尾部读取：只取末尾最后几个非空行、起点落在多字节字符中间不出乱码、文件缺失或全空白是 `None`。测试：`komo-gateway` `tests/agents`（`a_status_query_shows_what_a_running_task_is_doing`、`a_status_query_for_an_unknown_task_fails_cleanly`）与 `service::tasks::tests`（尾部读取三条）；kernel 侧 `fold::progress`、`types::task` 的快照与渲染，runtime 侧 `tools::task::tests`、`executor::tests` 的状态查询。
 
 **`task` 验收（2026-10-16，§4，已做）**：① 派出后这一轮照常往下，同一会话里用户的下一句不等任务就开跑；② 一轮派三个，三个任务会话同时在跑，各自交回一次；③ 宿主还在跑时交回的结果在一轮收尾后并入（`run.absorbed`），宿主空闲时开一条新 Run；④ `model` 填不认识的 alias / 不合法的 effort 在 `prepare` 被拒且账上有结果，填对的那条任务 Run 的快照是它，交回的那条输入是父的默认；⑤ 有 `task_id` 时省略 `model` 沿用那个任务上一条 Run 的；⑥ 带 `contract` 时交回的输入里写着复验结论，不合契约也照样交回；⑦ 任务会话里调不动 `task`；⑧ 同一请求键重放不派第二个；⑨ 旧库里停在 `waiting + dependency{子 Run}` 的父 Run 升级后照旧收尾，旧的 `delegate` / `dispatch` / `follow` 调用回放逐字节不变。Cron 触发的 Run 调 `task` 在 `prepare` 被拒（原先待定的"结果回到 Cron 会话投给谁"因此不出现）。测试：`komo-runtime` `tools::task::tests`、`executor::tests::task`（①②④⑤⑧、旧 `dispatch` / `follow` 按旧键收尾）、`executor::tests::delegation`（⑨，旧委派调用以"已落账计划"的形状交给执行器，工具已不在目录里）、`agent::tests::a_new_delegate_call_is_refused_and_the_run_carries_on`；`komo-store` coordinator 的对端规则；`komo-agent` `context::tests::a_task_contract_trails_the_task_not_the_system_prompt`；`komo-gateway` `tests/agents`（①③④⑤⑥⑦端到端，③是 `a_task_result_is_absorbed_into_a_running_home`）与 `service::tests` 的委派一组（⑨，装上测试用的旧 `delegate` 在真实 Gateway 上重走收尾）。**未做**：真机上升级一个停在 `waiting + dependency` 的旧库。
 

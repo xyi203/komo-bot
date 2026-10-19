@@ -522,6 +522,9 @@ enabled = false
 /// - `功耗呢`（home）→ 调 `task` 接着做（目标短号由测试写进 `follow_task_id`，不给 model）；
 /// - `跑个慢命令`（home）→ 调 `task`，派出去的任务会调 `unsure` 停在一条介入上；
 /// - `派了再等`（home）→ 先调 `task`，再调 `gate` 停在门上，门开之后再说一句；
+/// - `派个慢 bash`（home）→ 调 `task`，派出去的任务会跑 `echo step-1; sleep 30`；
+/// - `进度呢`（home）→ 只带 `task_id`（写进 `follow_task_id`）调 `task` 查进度；`进度呢 zzzz`
+///   查一个不存在的短号；
 /// - `[后台任务 …]`（home，任务交回的结果）→ 回一句 `转告：<结果正文那一行>`；
 /// - 任务会话收到的正文 → 各回一句固定的结论，或者调 `bash` / `unsure` / `task`。
 struct TasksLlm {
@@ -593,6 +596,26 @@ impl LlmClient for TasksLlm {
                     ),
                     ("gate", serde_json::json!({})),
                 ]),
+                "派个慢 bash" => Script::Calls(vec![(
+                    "task",
+                    serde_json::json!({ "prompt": "跑慢 bash", "title": "慢 bash" }),
+                )]),
+                "跑慢 bash" => Script::Calls(vec![(
+                    "bash",
+                    serde_json::json!({ "command": "echo step-1; sleep 30" }),
+                )]),
+                "进度呢" => {
+                    let task_id = self
+                        .follow_task_id
+                        .lock()
+                        .expect("follow 目标")
+                        .clone()
+                        .expect("目标短号该在发这条消息之前写好");
+                    Script::Calls(vec![("task", serde_json::json!({ "task_id": task_id }))])
+                }
+                "进度呢 zzzz" => {
+                    Script::Calls(vec![("task", serde_json::json!({ "task_id": "zzzz" }))])
+                }
                 "再派一层" => Script::Calls(vec![(
                     "task",
                     serde_json::json!({ "prompt": "里面那层", "title": "里层" }),
@@ -1017,6 +1040,108 @@ async fn home_answers_while_a_task_waits_on_a_person() {
         gateway.db_state(&task_run).await,
         RunState::Waiting,
         "home 答完的时候任务还停在介入上"
+    );
+
+    gateway.stop().await;
+}
+
+/// 查进度（§14 task 进度查询验收）：任务正跑着一条 `bash`（已经打出一行、还在 sleep），
+/// home 只给 `task_id` 调 `task`——拿到的快照里有正在执行的调用、命令摘要和 `.partial`
+/// 里的输出尾部；查询不往任务会话里提交任何输入（没有新的 Run）。
+#[tokio::test]
+async fn a_status_query_shows_what_a_running_task_is_doing() {
+    let home = Home::with_config(&tasks_config());
+    let llm = TasksLlm::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let (_, home_run) = dm(&gateway, "派个慢 bash", "dm-1").await;
+    gateway.wait_terminal(&home_run).await;
+    let task = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表")
+        .into_iter()
+        .find(|record| record.kind == komo_store::models::SessionKind::Task)
+        .expect("派出了一个任务");
+
+    // 等 bash 的第一行输出落进 `.partial`：这时它还在 sleep。
+    let tool_output = gateway
+        .state()
+        .ledgers
+        .paths_for(&task.session)
+        .tool_output();
+    let partial_has_step_1 = || {
+        let mut stack = vec![tool_output.clone()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path
+                    .file_name()
+                    .is_some_and(|name| name == "stdout.txt.partial")
+                    && std::fs::read_to_string(&path).is_ok_and(|text| text.contains("step-1"))
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    eventually("bash 的 step-1 写进了 .partial", partial_has_step_1).await;
+    let runs_before = runs_of(&gateway, &task.session).await;
+    assert_eq!(runs_before.len(), 1, "{runs_before:?}");
+
+    llm.set_follow_target(&komo_kernel::types::task::short_id(&task.session));
+    let (_, ask) = dm(&gateway, "进度呢", "dm-2").await;
+    gateway.wait_terminal(&ask).await;
+
+    let replies = texts_to(&sender, "111");
+    let snapshot = replies
+        .iter()
+        .find(|text| text.contains("正在执行：bash"))
+        .unwrap_or_else(|| panic!("没有进度快照：{replies:?}"));
+    assert!(snapshot.contains("echo step-1; sleep 30"), "{snapshot}");
+    assert!(snapshot.contains("step-1"), "{snapshot}");
+    assert_eq!(
+        runs_of(&gateway, &task.session).await.len(),
+        1,
+        "查进度不提交任何输入"
+    );
+
+    gateway.stop().await;
+}
+
+/// 查一个不存在的短号：干净失败，开头是"查不到进度"。
+#[tokio::test]
+async fn a_status_query_for_an_unknown_task_fails_cleanly() {
+    let home = Home::with_config(&tasks_config());
+    let llm = TasksLlm::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let (_, run) = dm(&gateway, "进度呢 zzzz", "dm-1").await;
+    gateway.wait_terminal(&run).await;
+
+    let replies = texts_to(&sender, "111");
+    assert!(
+        replies.iter().any(|text| text.contains("查不到进度")),
+        "{replies:?}"
+    );
+    assert!(
+        komo_store::repos::session::list(&gateway.state().db, false)
+            .await
+            .expect("读会话列表")
+            .iter()
+            .all(|record| record.kind != komo_store::models::SessionKind::Task),
+        "查进度不建任务会话"
     );
 
     gateway.stop().await;

@@ -49,6 +49,10 @@
   `kind = task` 就拒绝，结果只交回一层。
 - **接着做**：`task(prompt, task_id)` 把一句话提交进已有的任务会话，它带着自己的历史接着做；
   结果同样交回 home。短号来自派出回执与交回消息。（2026-10-16 之前是单独的 `follow(task_id, text)`。）
+- **查进度**（2026-10-19）：`task(task_id)` 不带 `prompt` 只读地返回那个任务最近一条 Run 的快照
+  （状态、已跑多久、正在执行的调用及其 `.partial` 输出尾部），不提交任何输入；
+  `GatewayTaskSpawner::status` 与 `follow` 共用同一个按短号解析任务会话的 `resolve_task`。
+  起因：会话 01a151ec 里用户问"为什么要这么久"，没人答得上任务在做什么。
 - **"需要你判断"**（2026-10-11 起没有审批；2026-10-12 起结果不明交给模型，`verify` 只剩旧 Run，
   会产生的介入只有 `blocked`）：消息前面
   挂上 `后台任务 #短号「标题」：`，同时看着几个任务时分得清是哪一个在问。
@@ -109,10 +113,13 @@ HTTP 派出去的任务没有渠道对端，但结果仍要交回 home）。委�
   2026-10-12 起结果不明不再停 Run，`unsure` 靠 `TEST_PARK` 前缀停住，生产构建里没有这一支）。
 - `tests/recovery`：`reattach::a_background_task_in_flight_across_a_restart_still_reports_back`、
   `verdicts::a_chat_verify_is_delivered_once_even_after_the_sweep`。
+- 查进度：`tests/agents` 的 `a_status_query_shows_what_a_running_task_is_doing`、
+  `a_status_query_for_an_unknown_task_fails_cleanly`。
 
 ## 7. 后续
 
-- 长任务的进度提示（hermes 每 180 s 一句"还在跑"）。
+- 长任务的进度提示（hermes 每 180 s 一句"还在跑"）：**按需查询已做**（§2，`task(task_id)`）；
+  主动报进度（任务自己隔一阵说一句）仍未做。
 - 交回的那一轮允许模型不说话（hermes 的 NO_REPLY，只对内部输入开放）。
 - §3 的已知窗口（终态之后、交回之前崩溃不补交）：同步委派删掉之后，等结果的事都走交回，
   这个窗口变得要紧。交回按请求键幂等，可以在对账里对"终态了、没有对应 `task-result:{run}`

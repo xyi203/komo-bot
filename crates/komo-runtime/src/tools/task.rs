@@ -4,6 +4,9 @@
 //! 不带 `task_id` 是新派：建任务会话、提交第一条输入；带 `task_id` 是接着做：提交进那个已有
 //! 的任务会话。两种都不等任务跑完，同一会话严格串行，等它就把用户后面的每一句都堵住了。
 //!
+//! 只给 `task_id`、不给 `prompt` 是第三种：查进度（`Operation::TaskStatus`）。返回那个任务
+//! 最近一条 Run 的快照，什么都不提交，不打扰它。
+//!
 //! 两件**不在这里**发生的事：
 //!
 //! - **执行不在工具里。** 建任务会话、提交输入在 executor（`Operation::Task` 的分流），
@@ -33,7 +36,8 @@ use crate::config::ConfigHolder;
 /// 模型给的参数。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskArgs {
-    /// 自包含的任务描述：**任务会话看不到派它的那段对话**。
+    /// 自包含的任务描述：**任务会话看不到派它的那段对话**。只给 `task_id` 而空着它 = 查进度。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prompt: String,
     /// 给人看的标题，新派时必填（接着做时任务已经有标题，不用给）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -124,14 +128,17 @@ impl Tool for TaskTool {
                           追问一个派出去的任务：带上 task_id（派出时给的短号，例如 3f2a），prompt \
                           作为新的一句话提交进它自己的会话，它带着自己查到的东西接着做，不要为同一件\
                           事另派一个。要结构化的结果就给 contract（一份 JSON Schema），任务的最后\
-                          回复会按它复验，复验结论随结果一起交回。"
+                          回复会按它复验，复验结论随结果一起交回。\n\
+                          只给 task_id、不给 prompt 是查进度：返回那个任务现在在跑什么、跑了多久、\
+                          最近的输出，不打扰它；用户问进度时先查再答，别凭印象。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "交给任务会话的自包含任务；它看不到这段对话，所以别写\"见上文\""
+                        "description": "交给任务会话的自包含任务；它看不到这段对话，所以别写\"见上文\"。\
+                                        只查进度时不给（只给 task_id）"
                     },
                     "title": {
                         "type": "string",
@@ -139,7 +146,8 @@ impl Tool for TaskTool {
                     },
                     "task_id": {
                         "type": "string",
-                        "description": "接着做哪个任务：派出时给的短号（例如 3f2a）；不给就是新派一个"
+                        "description": "接着做或查进度的任务：派出时给的短号（例如 3f2a）；不给就是新派一个。\
+                                        只给它不给 prompt = 查进度"
                     },
                     "model": model,
                     "effort": {
@@ -153,7 +161,7 @@ impl Tool for TaskTool {
                                         要给一个符合它的 JSON 对象"
                     }
                 },
-                "required": ["prompt"],
+                "required": [],
                 "additionalProperties": false
             }),
         }
@@ -171,11 +179,12 @@ impl Tool for TaskTool {
             });
         }
         let args: TaskArgs = parse_args(args, "task")?;
-        if args.prompt.trim().is_empty() {
+        let status_query = args.prompt.trim().is_empty() && args.task_id.is_some();
+        if args.prompt.trim().is_empty() && !status_query {
             return Err(ToolError::InvalidArguments {
-                message:
-                    "prompt 不能是空的：任务会话只看得见它，空任务等于派出去一个什么都做不了的会话"
-                        .into(),
+                message: "prompt 不能是空的：任务会话只看得见它，空任务等于派出去一个什么都做不了\
+                          的会话；只想查某个任务的进度就只给 task_id"
+                    .into(),
             });
         }
         // `#3f2a` 这种带井号的写法也收——模型把回执里的短号原样抄过来时常带着它。
@@ -191,6 +200,38 @@ impl Tool for TaskTool {
             }
             None => None,
         };
+        if status_query {
+            if args.title.is_some()
+                || args.model.is_some()
+                || args.effort.is_some()
+                || args.contract.is_some()
+            {
+                return Err(ToolError::InvalidArguments {
+                    message:
+                        "查进度只要 task_id：不给 prompt 时 title / model / effort / contract \
+                              都不该出现；要给任务派活就写 prompt"
+                            .into(),
+                });
+            }
+            let Some(task_id) = task_id else {
+                unreachable!("status_query 蕴含 task_id")
+            };
+            return Ok(ExecutionPlan {
+                operation_id: OperationId::new_at(plan_time()),
+                source: ctx.source.clone(),
+                tool: "task".into(),
+                operation: Operation::TaskStatus { task_id },
+                run: Some(ctx.run.clone()),
+                tool_call: Some(ctx.call.clone()),
+                args: normalized(&args)?,
+                cwd: Some(ctx.cwd.clone()),
+                targets: vec![],
+                versions: PlanVersions::default(),
+                // 纯读我们自己的账本，重放一遍没有副作用。
+                recovery: RecoveryMode::SafeReread,
+                then_run: None,
+            });
+        }
         let title = match (&task_id, args.title.as_deref().map(str::trim)) {
             (Some(_), _) => None,
             (None, Some(title)) if !title.is_empty() => Some(title.to_string()),
@@ -337,6 +378,52 @@ mod tests {
             serde_json::json!({ "prompt": "干活" }),
             serde_json::json!({ "prompt": "干活", "title": " " }),
             serde_json::json!({ "prompt": "干活", "task_id": " # " }),
+        ] {
+            let error = tool
+                .prepare(args.clone(), &context(dir.path()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ToolError::InvalidArguments { .. }),
+                "{args}：{error:?}"
+            );
+        }
+    }
+
+    /// 查进度：只给 task_id，计划是只读的 `TaskStatus`，参数里没有 prompt。
+    #[tokio::test]
+    async fn a_task_id_without_prompt_is_a_status_query() {
+        let fixture = Fixture::valid();
+        let dir = tempfile::tempdir().unwrap();
+        let plan = tool(&fixture)
+            .prepare(
+                serde_json::json!({ "task_id": "#3f2a" }),
+                &context(dir.path()),
+            )
+            .await
+            .unwrap();
+        let Operation::TaskStatus { task_id } = &plan.operation else {
+            panic!("{:?}", plan.operation)
+        };
+        assert_eq!(task_id, "3f2a");
+        assert_eq!(plan.recovery, RecoveryMode::SafeReread);
+        assert!(plan.targets.is_empty());
+        assert!(plan.args.get("prompt").is_none(), "{}", plan.args);
+        assert_eq!(plan.args["task_id"], "#3f2a");
+    }
+
+    /// 查进度不带别的字段：带了就是没想清楚是查还是派，拒绝而不是悄悄丢掉。
+    #[tokio::test]
+    async fn a_status_query_with_extra_fields_is_refused() {
+        let fixture = Fixture::valid();
+        let dir = tempfile::tempdir().unwrap();
+        let tool = tool(&fixture);
+        for args in [
+            serde_json::json!({ "task_id": "3f2a", "title": "t" }),
+            serde_json::json!({ "task_id": "3f2a", "prompt": " ", "model": "chat" }),
+            serde_json::json!({ "task_id": "3f2a", "effort": "low" }),
+            serde_json::json!({ "task_id": "3f2a", "contract": { "type": "object" } }),
+            serde_json::json!({ "task_id": " # " }),
         ] {
             let error = tool
                 .prepare(args.clone(), &context(dir.path()))

@@ -2821,6 +2821,8 @@ mod task {
         follow_calls: Vec<(RunId, RequestKey, String, String, TaskOptions)>,
         unknown: HashSet<String>,
         queued_behind: HashSet<String>,
+        progress: HashMap<String, komo_kernel::types::task::TaskProgress>,
+        status_calls: Vec<String>,
     }
 
     pub(super) struct FakeSpawner {
@@ -2852,6 +2854,23 @@ mod task {
                 .queued_behind
                 .insert(task_id.to_string());
             self
+        }
+
+        fn with_progress(
+            self: Arc<Self>,
+            task_id: &str,
+            progress: komo_kernel::types::task::TaskProgress,
+        ) -> Arc<Self> {
+            self.state
+                .lock()
+                .expect("假分发器")
+                .progress
+                .insert(task_id.to_string(), progress);
+            self
+        }
+
+        fn status_calls(&self) -> Vec<String> {
+            self.state.lock().expect("假分发器").status_calls.clone()
         }
 
         fn spawn_calls(&self) -> usize {
@@ -2939,9 +2958,13 @@ mod task {
         async fn status(
             &self,
             _from: &RunId,
-            _task_id: &str,
+            task_id: &str,
         ) -> Result<komo_kernel::types::task::TaskProgress, SpawnError> {
-            Err(SpawnError::Failed("假分发器不查进度".into()))
+            let mut state = self.state.lock().expect("假分发器");
+            state.status_calls.push(task_id.to_string());
+            state.progress.get(task_id).cloned().ok_or_else(|| {
+                SpawnError::UnknownTask(format!("#{task_id} 不是这个 home 名下正在跑或最近的任务"))
+            })
         }
     }
 
@@ -3125,6 +3148,97 @@ mod task {
             outcome.results[0].content
         );
         assert_eq!(fake.follow_calls(), 1, "解析只问了一次，没有悄悄重试");
+    }
+
+    /// 一个正在跑 bash 的任务的快照。
+    fn running_bash_progress() -> komo_kernel::types::task::TaskProgress {
+        use komo_kernel::types::ids::ToolCallId;
+        use komo_kernel::types::task::{RunProgress, RunningCall, TaskProgress};
+        let now = time::OffsetDateTime::now_utc();
+        TaskProgress {
+            short_id: "3f2a".into(),
+            title: "查空调".into(),
+            run: Some(RunProgress {
+                run: RunId::from_raw("task-run-1"),
+                state: komo_kernel::types::status::RunState::Running,
+                accepted_at: now - time::Duration::minutes(5),
+                last_at: now,
+                rounds: 2,
+                calls: 3,
+                running: vec![RunningCall {
+                    call: ToolCallId::from_raw("call-1"),
+                    attempt: None,
+                    tool: "bash".into(),
+                    summary: "make test".into(),
+                    started_at: Some(now - time::Duration::minutes(2)),
+                    output_tail: Some("compiling foo\nrunning 12 tests".into()),
+                }],
+                note: None,
+                final_message: None,
+                reason: None,
+                waiting_on: None,
+            }),
+        }
+    }
+
+    /// 查进度：只给 task_id，结果是渲染好的快照；不提交任何东西（不 spawn、不 follow）。
+    #[tokio::test]
+    async fn a_status_query_returns_the_snapshot_without_submitting() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new().with_progress("3f2a", running_bash_progress());
+        let executor =
+            harness.executor_with_spawner(vec![task_tool()], fake.clone() as Arc<dyn TaskSpawner>);
+        let (session, run, request) =
+            round(&harness, "task", serde_json::json!({ "task_id": "#3f2a" })).await;
+
+        let outcome = executor
+            .execute_round(vec![request], &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        assert_eq!(outcome.results.len(), 1);
+        let result = &outcome.results[0];
+        assert!(!result.is_error, "{result:?}");
+        assert!(
+            result.content.contains("正在执行：bash"),
+            "{}",
+            result.content
+        );
+        assert!(
+            result.content.contains("running 12 tests"),
+            "{}",
+            result.content
+        );
+        assert_eq!(fake.status_calls(), vec!["3f2a".to_string()]);
+        assert_eq!(fake.spawn_calls(), 0);
+        assert_eq!(fake.follow_calls(), 0);
+    }
+
+    /// 查不存在的短号：干净失败，开头是"查不到进度"。
+    #[tokio::test]
+    async fn a_status_query_for_an_unknown_task_fails_cleanly() {
+        let harness = Harness::new();
+        let fake = FakeSpawner::new();
+        let executor =
+            harness.executor_with_spawner(vec![task_tool()], fake.clone() as Arc<dyn TaskSpawner>);
+        let (session, run, request) =
+            round(&harness, "task", serde_json::json!({ "task_id": "dead" })).await;
+
+        let outcome = executor
+            .execute_round(vec![request], &harness.env(&session, &run))
+            .await
+            .unwrap();
+
+        assert!(outcome.stop.is_none(), "{:?}", outcome.stop);
+        let result = &outcome.results[0];
+        assert!(result.is_error, "{result:?}");
+        assert!(
+            result.content.contains("查不到进度："),
+            "{}",
+            result.content
+        );
+        assert_eq!(fake.spawn_calls() + fake.follow_calls(), 0);
     }
 
     /// ④ 接着做命中一个正在跑的任务：措辞改成"排在后面"，不是"已转给"。没给 model 就不带

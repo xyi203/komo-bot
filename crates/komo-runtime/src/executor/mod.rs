@@ -64,7 +64,7 @@ use komo_kernel::types::refs::{
 use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::status::{RunEnd, RunState, ToolCallState};
 use komo_kernel::types::surface::AgentSurface;
-use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskOptions, TaskSpec};
+use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskOptions, TaskProgress, TaskSpec};
 use komo_kernel::types::tool::{
     CancelToken, ResumedCall, ToolContext, ToolError, ToolExposure, ToolNamespace, ToolOutput,
     WorkspaceRoot,
@@ -991,6 +991,10 @@ impl ToolExecutor {
                 text: text.clone(),
                 options: TaskOptions::default(),
             },
+            Operation::TaskStatus { task_id } => Orchestration::Status {
+                spawner: spawner()?,
+                task_id: task_id.clone(),
+            },
             Operation::Monitor {
                 command,
                 title,
@@ -1063,6 +1067,7 @@ impl ToolExecutor {
     /// （旧计划是 `dispatch|follow:{run}:{call}`）：首次执行与"上一世已经 `start_call` 过、
     /// 这一世只是回来收口"的续跑调的是同一个键，`TaskSpawner` 内部走的是
     /// `GatewayState::submit` 那条按请求键去重的路（§8.5），重放拿回同一个任务会话。
+    /// 查进度（`Status`）没有请求键：纯读，重放就是重读一遍。
     async fn settle_orchestrated(
         &self,
         call: Orchestrated,
@@ -1108,6 +1113,10 @@ impl ToolExecutor {
                     .follow(&env.run, key, &task_id, &text, options)
                     .await;
                 self.settle_follow(&request, env, attempt, outcome).await?
+            }
+            Orchestration::Status { spawner, task_id } => {
+                let outcome = spawner.status(&env.run, &task_id).await;
+                self.settle_status(&request, env, attempt, outcome).await?
             }
             Orchestration::Monitor { monitors, mut spec } => {
                 // 工作目录以计划为准（`prepare` 已经按模型给的 `cwd` 解析好）。
@@ -1467,6 +1476,30 @@ impl ToolExecutor {
             .await
     }
 
+    /// 查进度的结论：快照渲染成给模型看的中文；解析不到短号等折成一句失败原因。
+    async fn settle_status(
+        &self,
+        request: &CallRequest,
+        env: &CallEnv,
+        attempt: AttemptId,
+        outcome: Result<TaskProgress, SpawnError>,
+    ) -> Result<CallSettlement, ExecError> {
+        let (result, content, is_error) = match outcome {
+            Ok(progress) => {
+                let content = progress.render(self.clock.now());
+                let result =
+                    serde_json::to_value(&progress).unwrap_or_else(|_| serde_json::json!({}));
+                (result, content, false)
+            }
+            Err(error) => {
+                let content = format!("查不到进度：{error}");
+                (serde_json::json!({ "error": content }), content, true)
+            }
+        };
+        self.settle_orchestration(request, env, attempt, result, content, is_error)
+            .await
+    }
+
     /// `task` / `monitor` 共用的收尾：给那次尝试写一条结果，交回模型
     /// 一句话。
     async fn settle_orchestration(
@@ -1757,6 +1790,11 @@ enum Orchestration {
         task_id: String,
         text: String,
         options: TaskOptions,
+    },
+    /// 查一个后台任务的进度快照：只读，什么都不提交，没有请求键，重放即重读。
+    Status {
+        spawner: Arc<dyn TaskSpawner>,
+        task_id: String,
     },
     /// 挂一个监听，立刻收尾。
     Monitor {

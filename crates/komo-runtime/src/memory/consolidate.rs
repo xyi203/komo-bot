@@ -6,10 +6,12 @@
 //!    （§9.6）；它也是"重复处理相同来源不重复新增"（§9.3）在实现上的兜底——游标漏了
 //!    一次，这里还挡得住。
 //! 2. **相关条目召回** → 关键词 ∪ 向量，`include_states` 放行候选与 contested，因为
-//!    冲突恰恰最可能和一条候选冲突。
-//! 3. **记忆模型判关系** → same / supports / contradicts / supersedes / unrelated。
+//!    冲突恰恰最可能和一条候选冲突。召回在**提取之前、整批做一次**（[`Consolidator::recall`]），
+//!    候选连编号一起放进提取提示词（§9.10）。
+//! 3. **关系**由那一次提取调用顺带交回 → same / supports / contradicts / supersedes /
+//!    unrelated，编号已在 [`map_verdicts`] 映射回 id。没有单独的判关系调用。
 //!
-//! 判完之后是这个文件真正的内容：**模型说的关系不等于可以执行的动作**。两条不可越过的
+//! 落库时是这个文件真正的内容：**模型说的关系不等于可以执行的动作**。两条不可越过的
 //! 线（§9.6）在 [`Plan::authorize`] 里，各有一个测试：
 //!
 //! - 新推断不能覆盖用户陈述 → `model_inference` 取代 `user_statement`：降级成冲突。
@@ -22,15 +24,16 @@ use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryState, MemoryUsage, Provenance, RetrievalMode, SupersededRef,
 };
-use komo_kernel::types::turn::{RoundInput, TurnRequest};
 use serde::Deserialize;
 use time::OffsetDateTime;
 
 use super::extract::Observation;
 use super::{MemoryError, MemoryManager};
 
-/// 一次相关条目召回最多看几条。再多，判关系那一问就成了一篇文章。
-const RELATED_LIMIT: u32 = 6;
+/// 一批提取前召回最多放几条已有记忆进提示词（§9.10）。再多，提示词就成了一篇文章。
+pub const RECALL_LIMIT: u32 = 20;
+/// 召回查询文本（这一批的用户陈述）的字符上限。
+const MAX_QUERY_CHARS: usize = 2_000;
 
 /// 新观察与一条已有记忆的关系。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -55,16 +58,10 @@ pub struct Verdict {
 }
 
 /// 模型原样交回的判断：`memory` 是候选编号，是不是整数还没验。
-#[derive(Debug, Deserialize)]
-struct RawVerdict {
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RawVerdict {
     memory: serde_json::Value,
     relation: Relation,
-}
-
-#[derive(Debug, Deserialize)]
-struct RawVerdicts {
-    #[serde(default)]
-    verdicts: Vec<RawVerdict>,
 }
 
 /// 判完之后**实际要做**的事。模型说的是 [`Relation`]，能做的是这个。
@@ -145,40 +142,33 @@ impl<'a> Consolidator<'a> {
             return self.merge(&existing, observation, now).await;
         }
 
-        // 第二道：相关条目。**候选与 contested 也要放行**——冲突最可能就发生在它们身上。
-        let related = self.related(observation).await;
-        if related.is_empty() {
-            self.insert(MemoryId::new_at(now), observation, None, now)
-                .await?;
-            return Ok(1);
-        }
-
-        // 第三道：让记忆模型判关系。判不出来（模型报错、JSON 坏了）就当作全部 unrelated：
-        // 退回"新建一条候选"，这是本来就安全的那一侧。
-        let verdicts = match self.classify(observation, &related).await {
-            Ok(verdicts) => verdicts,
-            Err(error) => {
-                tracing::warn!(%error, "关系判断没跑成，这一条按新建收");
-                Vec::new()
-            }
-        };
-
         let mut changes = 0;
-        let mut superseded: Vec<&MemoryItem> = Vec::new();
+        let mut superseded: Vec<MemoryItem> = Vec::new();
         let mut contested_with: Vec<MemoryId> = Vec::new();
 
-        for verdict in &verdicts {
-            let Some(existing) = related.iter().find(|item| item.id == verdict.memory) else {
+        for verdict in &observation.relations {
+            // 重读一遍：同一批里前面的观察可能已经改过它（版本号变了、状态变了）。
+            let Some(existing) = self.manager.repo.get(&verdict.memory).await? else {
                 continue;
             };
-            match Plan::authorize(verdict.relation, observation, existing) {
+            // 召回跨作用域，但关系只在同作用域内成立；状态也只认召回放行的那几种。
+            if existing.scope != observation.scope
+                || !matches!(
+                    existing.state,
+                    MemoryState::Active | MemoryState::Candidate | MemoryState::Contested
+                )
+            {
+                tracing::debug!(memory = %existing.id, "关系指向的条目作用域不同或已退场，忽略");
+                continue;
+            }
+            match Plan::authorize(verdict.relation, observation, &existing) {
                 Plan::MergeInto(_) => {
-                    changes += self.merge(existing, observation, now).await?;
+                    changes += self.merge(&existing, observation, now).await?;
                     // 合并掉了就不再新建——它们是同一件事。
                     return Ok(changes);
                 }
                 Plan::Contest(id) => {
-                    changes += self.contest(existing, now).await?;
+                    changes += self.contest(&existing, now).await?;
                     contested_with.push(id);
                 }
                 Plan::Supersede(_) => superseded.push(existing),
@@ -206,37 +196,35 @@ impl<'a> Consolidator<'a> {
             memory: new_id,
             revision: 1,
         };
-        for old in superseded {
+        for old in &superseded {
             changes += self.mark_superseded(old, by.clone(), now).await?;
         }
         Ok(changes)
     }
 
-    /// 相关条目召回（§9.3 的"先关键词 + 向量召回相关条目"）。
-    async fn related(&self, observation: &Observation) -> Vec<MemoryItem> {
-        let mut query = self.manager.query(observation.content.clone(), None);
-        query.scopes = vec![observation.scope.clone()];
-        query.top_k = RELATED_LIMIT;
-        // 去重与冲突整理要看得见候选与已在争议中的条目。
-        query.include_states = vec![
+    /// 提取前的相关条目召回（§9.3、§9.10）：用这一批的用户陈述做一次混合检索，**不限
+    /// 作用域**（模型写进哪个作用域在提取之后才知道），放行候选与 contested——冲突最可能
+    /// 就发生在它们身上。召回不通只返回空：提取照常跑，只是这一批没有候选可关联。
+    pub async fn recall(&self, statements: &str) -> Vec<MemoryItem> {
+        let text: String = statements.chars().take(MAX_QUERY_CHARS).collect();
+        if text.trim().is_empty() {
+            return Vec::new();
+        }
+        let states = vec![
             MemoryState::Active,
             MemoryState::Candidate,
             MemoryState::Contested,
         ];
+        let mut query = self.manager.query(text.clone(), None);
+        query.top_k = RECALL_LIMIT;
+        query.include_states = states.clone();
         match self.manager.search(query).await {
             Ok(result) => result.items,
             Err(MemoryError::VectorUnconfigured) | Err(MemoryError::VectorUnavailable(_)) => {
                 // 向量臂不通时仍要整理——退到关键词，而不是把"查不了"当成"没有相关的"。
-                let mut fallback = self
-                    .manager
-                    .query(observation.content.clone(), Some(RetrievalMode::Keyword));
-                fallback.scopes = vec![observation.scope.clone()];
-                fallback.top_k = RELATED_LIMIT;
-                fallback.include_states = vec![
-                    MemoryState::Active,
-                    MemoryState::Candidate,
-                    MemoryState::Contested,
-                ];
+                let mut fallback = self.manager.query(text, Some(RetrievalMode::Keyword));
+                fallback.top_k = RECALL_LIMIT;
+                fallback.include_states = states;
                 self.manager
                     .search(fallback)
                     .await
@@ -244,7 +232,7 @@ impl<'a> Consolidator<'a> {
                     .unwrap_or_default()
             }
             Err(error) => {
-                tracing::warn!(%error, "相关条目召回失败，这一条按新建收");
+                tracing::warn!(%error, "相关条目召回失败，这一批没有候选");
                 Vec::new()
             }
         }
@@ -347,84 +335,14 @@ impl<'a> Consolidator<'a> {
         };
         Ok(self.manager.repo.put(item, None).await?)
     }
-
-    /// 让记忆模型判关系。**用记忆模型自己的那份配置**（§13.3）。
-    async fn classify(
-        &self,
-        observation: &Observation,
-        related: &[MemoryItem],
-    ) -> Result<Vec<Verdict>, MemoryError> {
-        let listing: Vec<String> = related
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                format!(
-                    "[{index}] 状态={:?} 来源={:?} 确认={:?} 内容：{}",
-                    item.state, item.provenance, item.confirmation, item.content
-                )
-            })
-            .collect();
-        let prompt = format!(
-            "新观察（来源 {:?}）：{}\n\n已有的相关记忆：\n{}\n\n\
-             对上面每一条，判断新观察与它的关系，只输出 JSON：\n\
-             {{\"verdicts\":[{{\"memory\":<方括号里的编号，整数>,\"relation\":\
-             \"same|supports|contradicts|supersedes|unrelated\"}}]}}\n\n\
-             same = 同一件事换了说法；supports = 不同主张但支持它；\
-             contradicts = 实质冲突，两者不能同时为真；\
-             supersedes = 同一个问题的新答案，旧的已经不成立；unrelated = 不相干。\n\
-             判断冲突前先看作用域和时间：不同项目的偏好不是冲突，\
-             不同时间发生的同类事件（比如两次更换滤芯）也不是冲突，各自保留。",
-            observation.provenance,
-            observation.content,
-            listing.join("\n")
-        );
-
-        let (model, llm) = self.manager.backend();
-        let request = TurnRequest {
-            session: komo_kernel::types::ids::SessionId::from_raw("memory-consolidation"),
-            run: komo_kernel::types::ids::RunId::from_raw("memory-consolidation"),
-            model: model.clone(),
-            system_prompt: "你在整理一个个人助手的长期记忆库，判断新旧陈述之间的关系。\
-                            只输出 JSON，不要解释。"
-                .to_string(),
-            messages: vec![komo_kernel::types::turn::ReplayMessage {
-                role: komo_kernel::types::turn::Role::User,
-                seq: komo_kernel::types::ids::Seq::ZERO,
-                text: Some(prompt),
-                tool_calls: vec![],
-                tool_results: vec![],
-                provider_blocks: None,
-            }],
-            tools: vec![],
-            memories: vec![],
-            covers: None,
-        };
-
-        let mut driver = llm.begin_turn(request).await?;
-        let round = crate::telemetry::turn(
-            &mut *driver,
-            RoundInput::First,
-            crate::telemetry::role::MEMORY_CONSOLIDATE,
-            &model,
-            1,
-        )
-        .await?;
-        parse_verdicts(&round.text.unwrap_or_default(), related)
-    }
 }
 
-/// 从模型正文里解出关系判断，并用这次调用的编号表（`candidates` 的下标）映射回真实 id
-/// （§9.9）。编号表不落库：越界、非整数的判断丢掉并记 warn；同一编号只认第一条；
-/// 数字字符串按整数收。和提取那边共用同一套围栏 / 配平括号的处理。
-pub fn parse_verdicts(text: &str, candidates: &[MemoryItem]) -> Result<Vec<Verdict>, MemoryError> {
-    let body = super::extract::parse_json_object(text)
-        .ok_or_else(|| MemoryError::Invalid("关系判断里找不到 JSON 对象".into()))?;
-    let parsed: RawVerdicts = serde_json::from_str(body)
-        .map_err(|error| MemoryError::Invalid(format!("关系判断的 JSON 解不开：{error}")))?;
-
+/// 用这次调用的编号表（`candidates` 的下标）把模型交回的关系映射回真实 id（§9.9）。
+/// 编号表不落库：越界、非整数的判断丢掉并记 warn；同一编号只认第一条；数字字符串按整数收。
+pub fn map_verdicts(raw: Vec<RawVerdict>, candidates: &[MemoryItem]) -> Vec<Verdict> {
     let mut seen = std::collections::HashSet::new();
     let mut verdicts = Vec::new();
-    for raw in parsed.verdicts {
+    for raw in raw {
         let index = match &raw.memory {
             serde_json::Value::Number(number) => number.as_u64(),
             serde_json::Value::String(text) => text.trim().parse::<u64>().ok(),
@@ -434,11 +352,11 @@ pub fn parse_verdicts(text: &str, candidates: &[MemoryItem]) -> Result<Vec<Verdi
             .and_then(|index| usize::try_from(index).ok())
             .and_then(|index| candidates.get(index).map(|item| (index, item)))
         else {
-            tracing::warn!(memory = %raw.memory, "关系判断里的候选编号不可用，丢弃这一条");
+            tracing::warn!(memory = %raw.memory, "关系里的候选编号不可用，丢弃这一条");
             continue;
         };
         if !seen.insert(item.0) {
-            tracing::warn!(index = item.0, "关系判断里同一个编号出现多次，只认第一条");
+            tracing::warn!(index = item.0, "关系里同一个编号出现多次，只认第一条");
             continue;
         }
         verdicts.push(Verdict {
@@ -446,5 +364,5 @@ pub fn parse_verdicts(text: &str, candidates: &[MemoryItem]) -> Result<Vec<Verdi
             relation: raw.relation,
         });
     }
-    Ok(verdicts)
+    verdicts
 }

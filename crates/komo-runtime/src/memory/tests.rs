@@ -1,6 +1,6 @@
 //! MemoryManager 的行为断言（§9、§14 的「Memory 与模型验收覆盖」）。
 //!
-//! 这里的模型是 [`ScriptedLlm`]：提取与关系判断各给一段固定 JSON，于是「写库路径全测」
+//! 这里的模型是 [`ScriptedLlm`]：提取（连同关系）给一段固定 JSON，于是「写库路径全测」
 //! （§14 第八条）不必碰网络。向量端点是 [`ConceptEmbeddings`]——一个**语义**替身：它按
 //! 正文里出现了哪些概念词落到固定的几维上，所以"喜欢深色主题"和"界面都给我用暗色"的
 //! 向量真的接近，而 `FixedEmbeddingClient` 那种按哈希摊开的替身在这件事上什么都证明不了。
@@ -1303,7 +1303,7 @@ fn an_observation_that_cites_only_the_assistant_is_dropped() {
     )
     .unwrap();
 
-    let observations = transcript.validate(raw, 8, &model("memory-model", None), NOW);
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
     assert_eq!(observations.len(), 1, "只有引得出真实用户消息的那一条留下");
     assert_eq!(observations[0].content, "空调设 26 度");
     assert_eq!(observations[0].provenance, Provenance::UserStatement);
@@ -1327,7 +1327,7 @@ fn a_claim_of_user_speech_without_a_user_event_is_demoted_to_an_inference() {
     )
     .unwrap();
 
-    let observations = transcript.validate(raw, 8, &model("memory-model", None), NOW);
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
     assert_eq!(observations.len(), 2);
     assert_eq!(
         observations[0].provenance,
@@ -1392,7 +1392,7 @@ fn a_batch_yields_at_most_the_configured_observations() {
         })
         .collect();
 
-    let observations = transcript.validate(raw, 5, &model("memory-model", None), NOW);
+    let observations = transcript.validate(raw, 5, &model("memory-model", None), &[], NOW);
     assert_eq!(observations.len(), 5);
     assert_eq!(observations[4].content, "偏好 4", "按模型给的顺序留前面的");
 }
@@ -1411,7 +1411,7 @@ fn a_failed_run_yields_no_experience() {
     )
     .unwrap();
 
-    let failed = transcript.validate(raw, 8, &model("memory-model", None), NOW);
+    let failed = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
     assert_eq!(failed.len(), 1, "失败的 Run 整理不出成功经验");
     assert_eq!(
         failed[0].kind,
@@ -1437,7 +1437,7 @@ fn anything_that_looks_like_a_credential_is_dropped() {
     )
     .unwrap();
 
-    let observations = transcript.validate(raw, 8, &model("memory-model", None), NOW);
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
     assert_eq!(observations.len(), 1);
     assert_eq!(observations[0].content, "备份放在 NAS 的 /srv/backup");
 }
@@ -1726,7 +1726,7 @@ fn a_task_result_input_cannot_be_cited_as_a_user_statement() {
     )
     .unwrap();
 
-    let observations = transcript.validate(raw, 8, &model("memory-model", None), NOW);
+    let observations = transcript.validate(raw, 8, &model("memory-model", None), &[], NOW);
     assert!(observations.is_empty(), "{observations:?}");
 }
 
@@ -1783,10 +1783,8 @@ async fn a_contradiction_puts_both_sides_in_contested_and_out_of_recall() {
     let harness = HarnessBuilder::new()
         .script(vec![round(
             r#"{"observations":[{"content":"客厅空调设 24 度","kind":"preference",
-              "scope":"personal","said_by":"user_statement","evidence":["evt-1"]}]}"#,
-        )])
-        .script(vec![round(
-            r#"{"verdicts":[{"memory":0,"relation":"contradicts"}]}"#,
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"],
+              "relations":[{"memory":0,"relation":"contradicts"}]}]}"#,
         )])
         .work(vec![work_item(RunState::Completed, interactive())])
         .build()
@@ -1834,10 +1832,8 @@ async fn an_inference_may_not_supersede_a_user_statement() {
     let harness = HarnessBuilder::new()
         .script(vec![round(
             r#"{"observations":[{"content":"客厅空调大概应该设 24 度","kind":"preference",
-              "scope":"personal","said_by":"model_inference","evidence":["evt-1"]}]}"#,
-        )])
-        .script(vec![round(
-            r#"{"verdicts":[{"memory":0,"relation":"supersedes"}]}"#,
+              "scope":"personal","said_by":"model_inference","evidence":["evt-1"],
+              "relations":[{"memory":0,"relation":"supersedes"}]}]}"#,
         )])
         .work(vec![work_item(RunState::Completed, interactive())])
         .build()
@@ -1878,10 +1874,8 @@ async fn nothing_automatic_supersedes_what_the_user_confirmed() {
     let harness = HarnessBuilder::new()
         .script(vec![round(
             r#"{"observations":[{"content":"客厅空调设 24 度","kind":"preference",
-              "scope":"personal","said_by":"user_statement","evidence":["evt-1"]}]}"#,
-        )])
-        .script(vec![round(
-            r#"{"verdicts":[{"memory":0,"relation":"supersedes"}]}"#,
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"],
+              "relations":[{"memory":0,"relation":"supersedes"}]}]}"#,
         )])
         .work(vec![work_item(RunState::Completed, interactive())])
         .build()
@@ -1923,10 +1917,8 @@ async fn an_allowed_supersede_retires_the_old_one_and_links_forward() {
     let harness = HarnessBuilder::new()
         .script(vec![round(
             r#"{"observations":[{"content":"客厅空调设 24 度","kind":"preference",
-              "scope":"personal","said_by":"user_statement","evidence":["evt-1"]}]}"#,
-        )])
-        .script(vec![round(
-            r#"{"verdicts":[{"memory":0,"relation":"supersedes"}]}"#,
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"],
+              "relations":[{"memory":0,"relation":"supersedes"}]}]}"#,
         )])
         .work(vec![work_item(RunState::Completed, interactive())])
         .build()
@@ -1980,11 +1972,8 @@ async fn one_observation_superseding_two_olds_marks_both_with_superseded_by() {
     let harness = HarnessBuilder::new()
         .script(vec![round(
             r#"{"observations":[{"content":"客厅空调设 24 度","kind":"preference",
-              "scope":"personal","said_by":"user_statement","evidence":["evt-1"]}]}"#,
-        )])
-        .script(vec![round(
-            r#"{"verdicts":[{"memory":0,"relation":"supersedes"},
-              {"memory":1,"relation":"supersedes"}]}"#,
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"],
+              "relations":[{"memory":0,"relation":"supersedes"}, {"memory":1,"relation":"supersedes"}]}]}"#,
         )])
         .work(vec![work_item(RunState::Completed, interactive())])
         .build()
@@ -2021,19 +2010,126 @@ async fn one_observation_superseding_two_olds_marks_both_with_superseded_by() {
     }
 }
 
+/// 提取与判关系是同一次调用：一批里几条观察都有相关旧条目，模型也只问一次（§9.10）。
+#[tokio::test]
+async fn several_related_observations_in_one_batch_cost_one_model_call() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[
+              {"content":"客厅空调设 24 度","kind":"preference","scope":"personal",
+               "said_by":"user_statement","evidence":["evt-1"],
+               "relations":[{"memory":0,"relation":"contradicts"}]},
+              {"content":"客厅空调晚上设 27 度","kind":"preference","scope":"personal",
+               "said_by":"user_statement","evidence":["evt-1"],
+               "relations":[{"memory":0,"relation":"supports"}]}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(1, &RunId::from_raw("run-1"), "空调改 24 度")],
+    );
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    let requests = harness.llm.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "只有提取这一次调用");
+    let prompt = requests[0].messages[0].text.clone().unwrap();
+    assert!(
+        prompt.contains("[0] 状态=Active") && prompt.contains("客厅空调设 26 度"),
+        "已有记忆带编号放进提示词：{prompt}"
+    );
+    assert_eq!(harness.repo.list(None, None, 10).await.unwrap().len(), 3);
+}
+
+/// 越界的关系编号丢掉：这一条按新建收，旧条目纹丝不动。
+#[tokio::test]
+async fn an_out_of_range_relation_is_dropped_and_the_old_memory_stays_untouched() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"客厅空调设 24 度","kind":"preference",
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"],
+              "relations":[{"memory":7,"relation":"supersedes"}]}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness
+        .repo
+        .put(memory("m-1", "客厅空调设 26 度"), None)
+        .await
+        .unwrap();
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(1, &RunId::from_raw("run-1"), "空调改 24 度")],
+    );
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    let old = harness
+        .repo
+        .get(&MemoryId::from_raw("m-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.state, MemoryState::Active);
+    assert_eq!(old.revision, 1);
+    assert_eq!(harness.repo.list(None, None, 10).await.unwrap().len(), 2);
+}
+
+/// 关系指向另一个作用域的候选：忽略。召回不限作用域，关系只在同作用域内成立。
+#[tokio::test]
+async fn a_relation_to_a_candidate_of_another_scope_is_ignored() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"客厅空调设 24 度","kind":"preference",
+              "scope":"personal","said_by":"user_statement","evidence":["evt-1"],
+              "relations":[{"memory":0,"relation":"contradicts"}]}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    let mut other = memory("m-1", "客厅空调设 26 度");
+    other.scope = "project:home".parse().unwrap();
+    harness.repo.put(other, None).await.unwrap();
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(1, &RunId::from_raw("run-1"), "空调改 24 度")],
+    );
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    let old = harness
+        .repo
+        .get(&MemoryId::from_raw("m-1"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(old.state, MemoryState::Active, "没被标冲突");
+    let all = harness.repo.list(None, None, 10).await.unwrap();
+    let fresh = all.iter().find(|item| item.id.as_str() != "m-1").unwrap();
+    assert_eq!(fresh.state, MemoryState::Active);
+}
+
 // =========================================================== 候选编号（§9.9）
 
 fn candidates() -> Vec<komo_kernel::types::memory::MemoryItem> {
     vec![memory("m-a", "甲"), memory("m-b", "乙")]
 }
 
+fn map(json: &str) -> Vec<consolidate::Verdict> {
+    consolidate::map_verdicts(serde_json::from_str(json).unwrap(), &candidates())
+}
+
 #[test]
 fn a_verdict_index_maps_back_to_the_listed_candidate() {
-    let verdicts = consolidate::parse_verdicts(
-        r#"{"verdicts":[{"memory":1,"relation":"same"},{"memory":"0","relation":"supports"}]}"#,
-        &candidates(),
-    )
-    .unwrap();
+    let verdicts = map(r#"[{"memory":1,"relation":"same"},{"memory":"0","relation":"supports"}]"#);
     assert_eq!(verdicts.len(), 2);
     assert_eq!(verdicts[0].memory.as_str(), "m-b");
     assert_eq!(verdicts[0].relation, consolidate::Relation::Same);
@@ -2042,24 +2138,19 @@ fn a_verdict_index_maps_back_to_the_listed_candidate() {
 
 #[test]
 fn an_out_of_range_index_is_dropped() {
-    let verdicts = consolidate::parse_verdicts(
-        r#"{"verdicts":[{"memory":2,"relation":"same"},{"memory":-1,"relation":"same"},
+    let verdicts = map(
+        r#"[{"memory":2,"relation":"same"},{"memory":-1,"relation":"same"},
           {"memory":1.5,"relation":"same"},{"memory":"m-a","relation":"same"},
-          {"memory":null,"relation":"same"},{"memory":0,"relation":"unrelated"}]}"#,
-        &candidates(),
-    )
-    .unwrap();
+          {"memory":null,"relation":"same"},{"memory":0,"relation":"unrelated"}]"#,
+    );
     assert_eq!(verdicts.len(), 1, "只剩编号 0 那条：{verdicts:?}");
     assert_eq!(verdicts[0].memory.as_str(), "m-a");
 }
 
 #[test]
 fn a_repeated_index_keeps_only_the_first_verdict() {
-    let verdicts = consolidate::parse_verdicts(
-        r#"{"verdicts":[{"memory":0,"relation":"supersedes"},{"memory":"0","relation":"same"}]}"#,
-        &candidates(),
-    )
-    .unwrap();
+    let verdicts =
+        map(r#"[{"memory":0,"relation":"supersedes"},{"memory":"0","relation":"same"}]"#);
     assert_eq!(verdicts.len(), 1);
     assert_eq!(verdicts[0].relation, consolidate::Relation::Supersedes);
 }

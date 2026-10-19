@@ -1146,14 +1146,21 @@ impl MemoryManager {
             if !transcript.has_new_evidence() {
                 skipped = Some("没有新的用户陈述或工具结果");
             } else {
-                let raw = pass.extract(&transcript).await?;
+                let consolidator = consolidate::Consolidator::new(self);
+                // 提取前整批召回一次，编号后随提取调用一起交给模型（§9.10）。
+                let candidates = consolidator.recall(transcript.statements()).await;
+                let raw = pass.extract(&transcript, &candidates).await?;
                 record.observations += raw.len();
-                let observations =
-                    transcript.validate(raw, live.max_observations, &live.model, self.clock.now());
+                let observations = transcript.validate(
+                    raw,
+                    live.max_observations,
+                    &live.model,
+                    &candidates,
+                    self.clock.now(),
+                );
                 if observations.is_empty() {
                     skipped = Some("提取结果一条都没通过校验");
                 } else {
-                    let consolidator = consolidate::Consolidator::new(self);
                     applied = consolidator.apply(&observations).await?;
                     record.applied += applied;
                 }

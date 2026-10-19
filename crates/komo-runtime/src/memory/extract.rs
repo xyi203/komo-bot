@@ -17,8 +17,8 @@ use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::traits::{Clock, LlmClient};
 use komo_kernel::types::ids::{EventId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{
-    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryKind, MemoryScope, MemoryState,
-    Provenance,
+    Confirmation, Evidence, EvidenceRef, ExtractionMetadata, MemoryItem, MemoryKind, MemoryScope,
+    MemoryState, Provenance,
 };
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::status::RunState;
@@ -27,10 +27,11 @@ use serde::Deserialize;
 use time::OffsetDateTime;
 
 use super::MemoryError;
+use super::consolidate::{RawVerdict, Verdict, map_verdicts};
 
 /// 提示词版本。**改了提示词就改它**——它进 [`ExtractionMetadata`]，是"这条记忆是怎么来
 /// 的"里唯一能回答"按哪一版规则提的"的那一格（§9.2）。
-pub const PROMPT_VERSION: &str = "memory-extract/v4";
+pub const PROMPT_VERSION: &str = "memory-extract/v5";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
 const MAX_CONTENT_CHARS: usize = 300;
@@ -77,6 +78,10 @@ pub struct RawObservation {
     pub observed_at: Option<String>,
     #[serde(default)]
     pub valid_until: Option<String>,
+    /// 与编号候选的关系（§9.10）。先按原样收下，[`Transcript::validate`] 里逐条解、
+    /// 再用编号表映射回 id——一条坏的不拖累整批。
+    #[serde(default)]
+    pub relations: Vec<serde_json::Value>,
 }
 
 fn default_kind() -> String {
@@ -102,6 +107,8 @@ pub struct Observation {
     pub observed_at: OffsetDateTime,
     pub valid_until: Option<OffsetDateTime>,
     pub extraction: ExtractionMetadata,
+    /// 与已有记忆的关系，编号已映射成 id（§9.9）。
+    pub relations: Vec<Verdict>,
 }
 
 impl Observation {
@@ -135,6 +142,8 @@ pub struct Transcript {
     /// 窗口里用户输入行的字符数：判断一批要不要按 Run 边界切开用。
     user_chars: usize,
     statuses: BTreeMap<RunId, RunState>,
+    /// 新发生的用户陈述，一行一条：提取前召回已有记忆的查询文本（§9.10）。
+    statements: String,
     /// 事件 ID → （所属 Run，seq，角色）。**校验引用位置**用的就是它。
     roles: BTreeMap<String, (RunId, Seq, Role)>,
 }
@@ -182,6 +191,7 @@ impl Transcript {
         // call_id → 「工具名 参数」。工具结果事件自己不带工具名；记忆模型要靠它分清
         // "读文档读到的"和"排查跑出来的"，前者随时能重读，不值得记。
         let mut calls: BTreeMap<String, String> = BTreeMap::new();
+        let mut statements: Vec<String> = Vec::new();
 
         for event in events {
             // 只看这一批 Run 的证据。
@@ -243,6 +253,9 @@ impl Transcript {
             roles.insert(event.event_id.to_string(), (run.clone(), event.seq, role));
             // 旧证据仍然渲染给模型当上下文，但标出来——它不是新发生的事。
             let seen = if fresh { "" } else { " · 已处理过" };
+            if fresh && role == Role::User {
+                statements.push(one_line(&body));
+            }
             lines.push(Line {
                 event_id: event.event_id.to_string(),
                 role,
@@ -312,6 +325,7 @@ impl Transcript {
             cursors,
             user_chars,
             statuses: runs.iter().map(|w| (w.run.clone(), w.status)).collect(),
+            statements: statements.join("\n"),
             roles,
         }
     }
@@ -324,6 +338,11 @@ impl Transcript {
     /// 窗口里用户输入行的字符数。
     pub fn user_chars(&self) -> usize {
         self.user_chars
+    }
+
+    /// 这一批新发生的用户陈述（召回已有记忆的查询文本）。
+    pub fn statements(&self) -> &str {
+        &self.statements
     }
 
     /// 窗口字符数（渲染给模型的那一份）。
@@ -345,16 +364,19 @@ impl Transcript {
 
     /// Rust 侧的校验（§9.3 那一步）。不合格的整条丢掉，并说清为什么。一批最多收
     /// `max_observations` 条。
+    ///
+    /// `candidates` 是这次提取调用的编号表（§9.9）：观察里的关系按它映射回 id。
     pub fn validate(
         &self,
         raw: Vec<RawObservation>,
         max_observations: usize,
         model: &ModelConfig,
+        candidates: &[MemoryItem],
         now: OffsetDateTime,
     ) -> Vec<Observation> {
         let mut out = Vec::new();
         for candidate in raw.into_iter().take(max_observations) {
-            match self.validate_one(candidate, model, now) {
+            match self.validate_one(candidate, model, candidates, now) {
                 Ok(observation) => out.push(observation),
                 Err(reason) => {
                     tracing::debug!(session = %self.session, %reason, "丢掉一条提取")
@@ -368,6 +390,7 @@ impl Transcript {
         &self,
         raw: RawObservation,
         model: &ModelConfig,
+        candidates: &[MemoryItem],
         now: OffsetDateTime,
     ) -> Result<Observation, String> {
         let content = raw.content.trim().to_string();
@@ -466,6 +489,20 @@ impl Transcript {
             ExtractionMetadata::new(model.model.clone(), model.effort.clone(), PROMPT_VERSION);
         extraction.source_cursor = Some(self.cursor());
 
+        let relations = map_verdicts(
+            raw.relations
+                .into_iter()
+                .filter_map(|value| match serde_json::from_value::<RawVerdict>(value) {
+                    Ok(verdict) => Some(verdict),
+                    Err(error) => {
+                        tracing::warn!(%error, "关系读不懂，丢弃这一条");
+                        None
+                    }
+                })
+                .collect(),
+            candidates,
+        );
+
         Ok(Observation {
             content,
             kind,
@@ -476,6 +513,7 @@ impl Transcript {
             observed_at,
             valid_until,
             extraction,
+            relations,
         })
     }
 }
@@ -586,9 +624,12 @@ impl LearningPass {
 
     /// 发一次请求，把 JSON 解出来。**解不出来是错误，不是空结果**——"提取失败"和"这一
     /// 轮没有可记的东西"是两件事，后者会推进游标而前者要重试（§9.3）。
+    ///
+    /// `candidates` 是提取前召回的已有记忆，按下标编号放进提示词（§9.9、§9.10）。
     pub async fn extract(
         &self,
         transcript: &Transcript,
+        candidates: &[MemoryItem],
     ) -> Result<Vec<RawObservation>, MemoryError> {
         let request = TurnRequest {
             session: transcript.session.clone(),
@@ -600,7 +641,7 @@ impl LearningPass {
             messages: vec![komo_kernel::types::turn::ReplayMessage {
                 role: komo_kernel::types::turn::Role::User,
                 seq: transcript.cursor(),
-                text: Some(user_prompt(transcript, self.clock.now())),
+                text: Some(user_prompt(transcript, candidates, self.clock.now())),
                 tool_calls: vec![],
                 tool_results: vec![],
                 provider_blocks: None,
@@ -710,7 +751,9 @@ const SYSTEM_PROMPT: &str = "\
 \"scope\":\"personal|project:<id>|environment:<id>\",\
 \"said_by\":\"user_statement|tool_observation|model_inference\",\
 \"evidence\":[\"<事件 ID>\"],\"observed_at\":\"RFC3339，可省略\",\
-\"valid_until\":\"RFC3339，可省略\"}]}
+\"valid_until\":\"RFC3339，可省略\",\
+\"relations\":[{\"memory\":<已有记忆方括号里的编号，整数>,\"relation\":\
+\"same|supports|contradicts|supersedes|unrelated\"}]}]}
 
 规则：
 1. 每条都必须在 evidence 里引至少一个**用户**或**工具结果**事件的 ID，原样照抄方括号里\
@@ -730,11 +773,32 @@ const SYSTEM_PROMPT: &str = "\
 6. 宁缺毋滥：一次最多交回 {MAX} 条，挑复用价值最高的；同一件事只写一条。
 7. 不要写入任何密钥、令牌、密码或与任务无关的敏感输出。
 8. 不要报告确认状态或生命周期——那不是你的字段。
-9. 没有值得记的就交回 {\"observations\":[]}。这是常见情况。不要编。";
+9. 没有值得记的就交回 {\"observations\":[]}。这是常见情况。不要编。
+10. 每条观察的 relations 说明它与「已有的相关记忆」里哪几条有关系，可以省略或留空。只写有关系的，\
+编号只能用方括号里的整数，不要抄内容。same = 同一件事换了说法；supports = 不同主张但支持它；\
+contradicts = 实质冲突，两者不能同时为真；supersedes = 同一个问题的新答案，旧的已经不成立；\
+unrelated = 不相干（可不写）。判冲突前先看作用域和时间：不同项目的偏好不是冲突，不同时间发生的同类\
+事件（比如两次更换滤芯）也不是冲突，各自保留。只与同作用域的条目建立关系。";
 
-fn user_prompt(transcript: &Transcript, now: OffsetDateTime) -> String {
+fn user_prompt(transcript: &Transcript, candidates: &[MemoryItem], now: OffsetDateTime) -> String {
+    let existing = if candidates.is_empty() {
+        "（没有）".to_string()
+    } else {
+        candidates
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                format!(
+                    "[{index}] 状态={:?} 来源={:?} 确认={:?} 作用域={} 内容：{}",
+                    item.state, item.provenance, item.confirmation, item.scope, item.content
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     format!(
-        "当前时间：{}\n会话：{}\n\n--- 会话记录 ---\n{}\n--- 记录结束 ---",
+        "当前时间：{}\n会话：{}\n\n--- 已有的相关记忆 ---\n{existing}\n--- 记忆结束 ---\n\n\
+         --- 会话记录 ---\n{}\n--- 记录结束 ---",
         now.date(),
         transcript.session,
         transcript.rendered

@@ -476,6 +476,7 @@ async fn rereadable_never_touches_confirmed_or_preference_and_a_forgotten_source
         observed_at: NOW,
         valid_until: None,
         extraction: ExtractionMetadata::new("memory-model", None, "v3"),
+        relations: vec![],
     };
     Consolidator::new(&rig.manager)
         .apply(&[observation])

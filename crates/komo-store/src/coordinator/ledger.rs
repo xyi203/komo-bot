@@ -801,12 +801,14 @@ impl Ledger for Coordinator {
                 text: Some(text),
                 text_ref: None,
                 uses,
+                recall,
             } => {
                 let (text, text_ref) = Self::inline_text(&text);
                 MemoryInjected {
                     text,
                     text_ref,
                     uses,
+                    recall,
                 }
             }
             other => other,

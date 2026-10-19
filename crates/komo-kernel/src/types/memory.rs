@@ -296,6 +296,36 @@ pub struct RecallResult {
     /// 向量覆盖率：多少候选条目有当前代次的向量。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vector_coverage: Option<f32>,
+    /// 两条臂各自给出的候选合计（融合之前，同一条可能算两次）。仓储不报则 `None`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates_before_fusion: Option<u32>,
+    /// 融合去重之后的候选数（还没按状态、作用域和 `top_k` 筛）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates_after_fusion: Option<u32>,
+}
+
+/// 一段注入是怎么来的（附录 B.3.5 的"为什么选中"）。只记进 `memory.injected` 供事后
+/// 排查，不参与"这一块与上一块是不是同一块"的判断。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecallDiagnostics {
+    /// 这次召回用的模式；`None` = 没有跑检索（沿用锚，或检查点里带来的条目仍然有效）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RetrievalMode>,
+    /// 向量臂没跑成，只有关键词臂（或整次召回失败）。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub degraded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub degraded_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates_before_fusion: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidates_after_fusion: Option<u32>,
+    /// 筛完之后因 token 预算没放进注入段的条数。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped_by_budget: Option<u32>,
+    /// 这一块是沿用这一段之前钉下的那一块，没有重新召回。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reused_pin: bool,
 }
 
 /// Run 的记忆处理进度（`runs.memory_work`，§9.3）。
@@ -309,13 +339,24 @@ pub enum MemoryWork {
 }
 
 /// 这一轮注入了什么（`docs/agent.md` §13.2：渲染搬到 `komo-agent`，这个值类型留在 kernel）。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Injection {
     /// 追加在系统提示后面的正文；`None` = 这一轮不注入。
     pub text: Option<String>,
     /// 注入了哪些条目的哪个版本——**审计证据**，resume 时重新核对（§9.7）。
     pub uses: Vec<super::turn::MemoryUse>,
+    /// 召回诊断。**不参与相等**：同一块沿用时它变（`reused_pin`），不该被当成换了一块。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<RecallDiagnostics>,
 }
+
+impl PartialEq for Injection {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text && self.uses == other.uses
+    }
+}
+
+impl Eq for Injection {}
 
 #[cfg(test)]
 mod tests {

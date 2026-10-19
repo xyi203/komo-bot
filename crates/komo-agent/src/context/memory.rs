@@ -60,6 +60,7 @@ pub fn render(items: &[MemoryItem], max_tokens: u32) -> Injection {
     Injection {
         text: Some(lines.join("\n")),
         uses,
+        diagnostics: None,
     }
 }
 

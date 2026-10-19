@@ -9,13 +9,14 @@
 use komo_kernel::cron::{FiringStatus, JobStatus, NotifyPolicy, OverlapPolicy, Trigger};
 use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
-    ConfigCheckResponse, ConfigReloadResponse, CronListResponse, HealthResponse, IndexState,
-    InterventionDetail, InterventionListResponse, InterventionSummary, MemoryIndexStatus,
-    MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, RunDetail,
-    SessionListResponse, SessionSummary, SweepRule, ToolCallSummary, WindowSource,
+    CompactionSummary, ConfigCheckResponse, ConfigReloadResponse, CronListResponse, HealthResponse,
+    IndexState, InterventionDetail, InterventionListResponse, InterventionSummary,
+    MemoryIndexStatus, MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse,
+    RunDetail, SessionListResponse, SessionSummary, SweepRule, ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
-    Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance,
+    Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance, RecallDiagnostics,
+    RetrievalMode,
 };
 use komo_kernel::types::status::{RunState, SessionState, ToolCallState, WaitReason};
 use time::OffsetDateTime;
@@ -131,14 +132,40 @@ pub fn run_inspect(detail: &RunDetail, now: OffsetDateTime) -> String {
         }
     ));
     out.push(format!("轮数   {}", summary.rounds));
+    if let Some(model) = &detail.model {
+        out.push(format!("模型   {model}"));
+    }
     out.push(format!(
-        "开始   {}{}",
+        "开始   {}{}{}",
         stamp(summary.created_at),
         match summary.ended_at {
             Some(ended) => format!("   结束 {}", stamp(ended)),
             None => String::new(),
+        },
+        match detail.duration_ms {
+            Some(ms) if ms < 1000 => format!("   耗时 {ms}ms"),
+            Some(ms) => format!("   耗时 {}", human_span((ms / 1000) as i64)),
+            None => String::new(),
         }
     ));
+    if let Some(reason) = detail.failure.as_deref().filter(|r| !r.trim().is_empty()) {
+        out.push(format!("失败   {}", one_line(reason)));
+    }
+    if let Some(tokens) = &detail.tokens {
+        let cells: Vec<String> = [
+            ("输入", tokens.input),
+            ("输出", tokens.output),
+            ("缓存读", tokens.cache_read),
+            ("缓存写", tokens.cache_write),
+        ]
+        .into_iter()
+        .filter_map(|(name, value)| value.map(|value| format!("{name} {value}")))
+        .collect();
+        out.push(format!("用量   {}", cells.join(" · ")));
+    }
+    for compaction in &detail.compactions {
+        out.push(format!("压缩   {}", compaction_line(compaction)));
+    }
 
     if detail.calls.is_empty() {
         out.push("调用   （无）".into());
@@ -166,6 +193,9 @@ pub fn run_inspect(detail: &RunDetail, now: OffsetDateTime) -> String {
             .collect();
         out.push(format!("记忆   {}", used.join(" · ")));
     }
+    if let Some(recall) = &detail.recall {
+        out.push(format!("召回   {}", recall_line(recall)));
+    }
 
     if let Some(message) = &detail.final_message {
         out.push("最终回复".into());
@@ -174,6 +204,61 @@ pub fn run_inspect(detail: &RunDetail, now: OffsetDateTime) -> String {
         }
     }
     out.join("\n")
+}
+
+fn compaction_line(compaction: &CompactionSummary) -> String {
+    let mut cells = vec![match compaction.outcome.as_str() {
+        "compacted" => "摘要".to_string(),
+        "decayed" => match compaction.decayed_calls {
+            Some(calls) => format!("衰减 {calls} 个结果"),
+            None => "衰减".to_string(),
+        },
+        "skipped" => "未压".to_string(),
+        other => other.to_string(),
+    }];
+    if let Some(archive) = compaction.archive_tokens {
+        cells.push(format!("原 {archive} tok"));
+    }
+    if let Some(post) = compaction.post_compaction_tokens {
+        cells.push(format!("压后上下文 {post} tok"));
+    }
+    if let Some(reason) = &compaction.reason {
+        cells.push(reason.clone());
+    }
+    cells.join(" · ")
+}
+
+fn recall_line(recall: &RecallDiagnostics) -> String {
+    let mut cells = Vec::new();
+    if recall.reused_pin {
+        cells.push("沿用这一段钉下的那块".to_string());
+    }
+    if let Some(mode) = recall.mode {
+        cells.push(
+            match mode {
+                RetrievalMode::Hybrid => "hybrid",
+                RetrievalMode::Keyword => "keyword",
+                RetrievalMode::Vector => "vector",
+            }
+            .to_string(),
+        );
+    }
+    if recall.degraded {
+        cells.push(match recall.degraded_reason.as_deref() {
+            Some(reason) => format!("降级（{}）", one_line(reason)),
+            None => "降级".to_string(),
+        });
+    }
+    if let (Some(before), Some(after)) = (
+        recall.candidates_before_fusion,
+        recall.candidates_after_fusion,
+    ) {
+        cells.push(format!("候选 {before}→{after}"));
+    }
+    if let Some(dropped) = recall.dropped_by_budget.filter(|dropped| *dropped > 0) {
+        cells.push(format!("预算挤掉 {dropped}"));
+    }
+    cells.join(" · ")
 }
 
 fn call_line(call: &ToolCallSummary) -> String {

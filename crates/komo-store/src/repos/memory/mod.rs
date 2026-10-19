@@ -607,7 +607,9 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
     if wants_vector && vector_note.is_none() {
         arms.push(vector);
     }
+    let before_fusion: usize = arms.iter().map(Vec::len).sum();
     let ranked = reciprocal_rank_fusion(&arms);
+    let after_fusion = ranked.len();
 
     // 去重后核对当前 revision、来源与冲突状态（§9.4）——`admits` 是"这一次放行哪些状态"
     // 那条规则的唯一实现，自动召回与显式 search 都经它。
@@ -634,6 +636,8 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
         degraded: vector_note.is_some(),
         degraded_reason: vector_note,
         vector_coverage: wants_vector.then_some(coverage),
+        candidates_before_fusion: Some(before_fusion as u32),
+        candidates_after_fusion: Some(after_fusion as u32),
     })
 }
 

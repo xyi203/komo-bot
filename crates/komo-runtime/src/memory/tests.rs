@@ -271,6 +271,7 @@ fn test_render(items: &[MemoryItem], _max_tokens: u32) -> Injection {
     Injection {
         text: Some(lines.join("\n")),
         uses,
+        diagnostics: None,
     }
 }
 

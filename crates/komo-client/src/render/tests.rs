@@ -235,6 +235,12 @@ fn run_detail(state: ToolCallState) -> RunDetail {
             memory: MemoryId::from_raw("mem-1"),
             revision: 3,
         }],
+        recall: None,
+        model: None,
+        duration_ms: None,
+        failure: None,
+        tokens: None,
+        compactions: Vec::new(),
     }
 }
 
@@ -246,6 +252,88 @@ fn run_inspect_prints_two_question_marks_for_an_uncertain_call() {
     assert!(printed.contains("结果不明"), "{printed}");
     assert!(printed.contains("尝试 2 次"), "{printed}");
     assert!(printed.contains("mem-1@3"), "§9.7 的审计证据：{printed}");
+}
+
+fn inspected_detail() -> RunDetail {
+    use komo_kernel::protocol::http::{CompactionSummary, TokenTotals};
+    use komo_kernel::types::memory::{RecallDiagnostics, RetrievalMode};
+
+    let mut detail = run_detail(ToolCallState::Completed);
+    detail.model = Some("gpt-5".into());
+    detail.duration_ms = Some(9_000);
+    detail.failure = Some("额度用完了".into());
+    detail.tokens = Some(TokenTotals {
+        input: Some(1200),
+        output: Some(80),
+        cache_read: Some(900),
+        cache_write: None,
+    });
+    detail.compactions = vec![
+        CompactionSummary {
+            outcome: "compacted".into(),
+            archive_tokens: Some(40_000),
+            post_compaction_tokens: Some(6_000),
+            decayed_calls: None,
+            reason: Some("cache_cold".into()),
+        },
+        CompactionSummary {
+            outcome: "decayed".into(),
+            decayed_calls: Some(4),
+            ..CompactionSummary::default()
+        },
+    ];
+    detail.recall = Some(RecallDiagnostics {
+        mode: Some(RetrievalMode::Hybrid),
+        degraded: true,
+        degraded_reason: Some("向量端点不通".into()),
+        candidates_before_fusion: Some(12),
+        candidates_after_fusion: Some(8),
+        dropped_by_budget: Some(2),
+        reused_pin: false,
+    });
+    detail
+}
+
+#[test]
+fn run_inspect_prints_model_duration_failure_usage_compaction_and_recall() {
+    let printed = run_inspect(&inspected_detail(), NOW);
+    for expected in [
+        "模型   gpt-5",
+        "耗时 9s",
+        "失败   额度用完了",
+        "用量   输入 1200 · 输出 80 · 缓存读 900",
+        "压缩   摘要 · 原 40000 tok · 压后上下文 6000 tok · cache_cold",
+        "压缩   衰减 4 个结果",
+        "召回   hybrid · 降级（向量端点不通） · 候选 12→8 · 预算挤掉 2",
+    ] {
+        assert!(printed.contains(expected), "缺 {expected:?}：\n{printed}");
+    }
+    assert!(!printed.contains("缓存写"), "没人报的项不印：{printed}");
+}
+
+#[test]
+fn run_inspect_stays_quiet_when_the_server_gives_none_of_the_new_facts() {
+    let printed = run_inspect(&run_detail(ToolCallState::Completed), NOW);
+    for absent in ["模型 ", "失败 ", "用量 ", "压缩 ", "召回 ", "耗时"] {
+        assert!(
+            !printed.contains(absent),
+            "{absent:?} 不该出现：\n{printed}"
+        );
+    }
+
+    let mut detail = run_detail(ToolCallState::Completed);
+    detail.recall = Some(komo_kernel::types::memory::RecallDiagnostics {
+        reused_pin: true,
+        ..Default::default()
+    });
+    assert!(run_inspect(&detail, NOW).contains("召回   沿用这一段钉下的那块"));
+}
+
+#[test]
+fn an_old_server_body_without_the_new_fields_still_decodes() {
+    let body = r#"{"run":"run-1","session":"sess-1","state":"completed","source":{"kind":"interactive","session":"sess-1"},"rounds":1,"created_at":"2026-09-15T08:00:00Z"}"#;
+    let detail: RunDetail = serde_json::from_str(body).expect("老响应照常解码");
+    assert!(detail.tokens.is_none() && detail.recall.is_none() && detail.compactions.is_empty());
 }
 
 #[test]

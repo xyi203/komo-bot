@@ -45,8 +45,8 @@ use komo_kernel::traits::{
 };
 use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{
-    Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallQuery, RecallResult,
-    RetrievalMode,
+    Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallDiagnostics, RecallQuery,
+    RecallResult, RetrievalMode,
 };
 use komo_kernel::types::model::{EmbeddingSpace, InputKind, ModelConfig, Vector};
 use komo_kernel::types::turn::{LlmError, MemoryUse};
@@ -727,10 +727,12 @@ impl MemoryManager {
         }
         let now = self.clock.now();
         let mut items = self.revalidate(carried, now).await;
+        let mut diagnostics = RecallDiagnostics::default();
 
         if items.is_empty() && !text.trim().is_empty() {
             let mut query = self.query(text, None);
             query.scopes = scopes.to_vec();
+            diagnostics.mode = Some(query.mode);
             match self.search(query).await {
                 Ok(result) => {
                     if result.degraded {
@@ -739,19 +741,29 @@ impl MemoryManager {
                             "这一次注入只有关键词臂"
                         );
                     }
+                    diagnostics.mode = Some(result.mode);
+                    diagnostics.degraded = result.degraded;
+                    diagnostics.degraded_reason = result.degraded_reason;
+                    diagnostics.candidates_before_fusion = result.candidates_before_fusion;
+                    diagnostics.candidates_after_fusion = result.candidates_after_fusion;
                     items = result.items;
                 }
                 Err(error) => {
                     // 召回失败**不拦住这一轮**：没有记忆的回答仍然是回答，而把一次故障
                     // 变成一次 Run 失败不是 §9 要的。它已经在日志里说清了是哪一种。
                     tracing::warn!(%error, run = %run, "这一次召回没跑成，本轮不注入记忆");
+                    diagnostics.degraded = true;
+                    diagnostics.degraded_reason = Some(error.to_string());
                 }
             }
         }
 
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let items = stale::mark_missing_paths(items, home.as_deref());
-        let injection = (self.render)(&items, self.retrieval().max_tokens);
+        let mut injection = (self.render)(&items, self.retrieval().max_tokens);
+        diagnostics.dropped_by_budget =
+            Some(items.len().saturating_sub(injection.uses.len()) as u32);
+        injection.diagnostics = Some(diagnostics);
         self.record_usage(&injection, now).await;
         injection
     }
@@ -835,7 +847,13 @@ impl MemoryManager {
                 lines = pinned.uses.len(),
                 "这一段对话沿用上一块注入，不改动提示前缀"
             );
-            return pinned;
+            return Injection {
+                diagnostics: Some(RecallDiagnostics {
+                    reused_pin: true,
+                    ..RecallDiagnostics::default()
+                }),
+                ..pinned
+            };
         }
 
         let injection = self.prepare(run, text, carried, scopes).await;

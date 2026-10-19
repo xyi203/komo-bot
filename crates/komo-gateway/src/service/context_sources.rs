@@ -311,6 +311,7 @@ pub(crate) async fn recall_for(
             text: injection.text.clone(),
             text_ref: None,
             uses: injection.uses.clone(),
+            recall: injection.diagnostics.clone(),
         };
         if let Err(error) = ledger.record_injection(run, event).await {
             tracing::warn!(%error, %run, "这一段的记忆注入没记进日志，重启之后会重新召回");
@@ -343,6 +344,7 @@ async fn recorded_injection(payloads: &PayloadStore, surface: &Surface) -> Optio
     Some(Injection {
         text,
         uses: recorded.uses.clone(),
+        diagnostics: None,
     })
 }
 

@@ -88,6 +88,8 @@ impl MemoryRepo for MemMemoryRepo {
                 .vector_backend_down
                 .then(|| "向量端点不可用，已退化为关键词".to_string()),
             vector_coverage: Some(if state.vectors.is_empty() { 0.0 } else { 1.0 }),
+            candidates_before_fusion: None,
+            candidates_after_fusion: None,
         })
     }
 

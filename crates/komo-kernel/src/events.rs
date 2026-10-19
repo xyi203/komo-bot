@@ -489,7 +489,7 @@ pub struct Checkpoint {
 /// 进程内存里的话，Gateway 一重启就会按另一句用户输入重新召回、换掉整段提示；记成事件，
 /// 内容权威就在 Session 目录（§8.2），重启前后折出来是同一份。`text` 为空 = 这一段确实
 /// 没有可注入的记忆（也要钉住，不然每一轮都会重新召回一次）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct MemoryInjected {
     /// 渲染好的注入段；超过内联上限外置到 `payloads/`。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -499,6 +499,9 @@ pub struct MemoryInjected {
     /// 注入段里的条目与版本：复用之前逐条核对还算不算数（遗忘立即生效，§9.2）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub uses: Vec<MemoryUse>,
+    /// 召回诊断；旧行没有。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recall: Option<crate::types::memory::RecallDiagnostics>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -568,6 +571,46 @@ mod tests {
         format!(
             r#"{{"v":1,"seq":41,"event_id":"evt-41","session_id":"sess-1","run_id":"run-1","at":"2026-09-15T08:00:00Z","type":"{event_type}","data":{data}}}"#
         )
+    }
+
+    #[test]
+    fn memory_injected_round_trips_with_and_without_recall_diagnostics() {
+        use crate::types::memory::{RecallDiagnostics, RetrievalMode};
+
+        // 旧行：没有 recall。
+        let old = Event::from_line(&line(
+            "memory.injected",
+            r#"{"text":"x","uses":[{"memory":"m-1","revision":2}]}"#,
+        ))
+        .unwrap();
+        let EventPayload::MemoryInjected(body) = &old.payload else {
+            panic!("解成了 {:?}", old.payload);
+        };
+        assert_eq!(body.recall, None);
+        assert_eq!(body.uses.len(), 1);
+        assert!(!old.to_line().unwrap().contains("recall"), "没有就不写");
+
+        // 新行：带诊断，序列化再解析原样回来。
+        let mut event = old.clone();
+        let recall = RecallDiagnostics {
+            mode: Some(RetrievalMode::Hybrid),
+            degraded: true,
+            degraded_reason: Some("向量端点不通".into()),
+            candidates_before_fusion: Some(12),
+            candidates_after_fusion: Some(8),
+            dropped_by_budget: Some(3),
+            reused_pin: false,
+        };
+        let EventPayload::MemoryInjected(body) = &mut event.payload else {
+            unreachable!()
+        };
+        body.recall = Some(recall.clone());
+        let back = Event::from_line(&event.to_line().unwrap()).unwrap();
+        assert_eq!(back, event);
+        let EventPayload::MemoryInjected(body) = &back.payload else {
+            unreachable!()
+        };
+        assert_eq!(body.recall, Some(recall));
     }
 
     #[test]

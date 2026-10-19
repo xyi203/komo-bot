@@ -408,12 +408,12 @@ pub fn title(cwd: &str) -> String {
     }
 }
 
-/// 这一刻标签页上该是什么：[`title`]，**Run 没跑完时前面挂着状态行那颗星**（同一帧）——
-/// 切到别的标签页也看得出它还在动，停下来了星就没了。
+/// 这一刻标签页上该是什么：[`title`]，**Run 没跑完时后面挂着状态行那颗星**（同一帧）——
+/// 切到别的标签页也看得出它还在动，停下来了星就没了。星挂在右边，左边的标题不随帧挪动。
 pub fn tab_title(app: &App, cwd: &str) -> String {
     match app.run_state() {
         Some(state) if !state.is_terminal() => {
-            format!("{} {}", crate::tui::spinner::frame(app.now), title(cwd))
+            format!("{} {}", title(cwd), crate::tui::spinner::frame(app.now))
         }
         _ => title(cwd),
     }
@@ -693,7 +693,7 @@ fn main() {
         assert_eq!(title("/tmp/a\u{7}b"), "κ - ab", "控制字符不进 OSC");
     }
 
-    /// 标签页标题跟着 Run 转：跑着时前面挂着状态行那颗星、随钟换帧，跑完了星就没了。
+    /// 标签页标题跟着 Run 转：跑着时后面挂着状态行那颗星、随钟换帧，跑完了星就没了。
     #[test]
     fn the_title_spins_while_a_run_is_going_and_settles_when_it_ends() {
         let cwd = "/Users/x/01-code/komo-bot";
@@ -705,7 +705,7 @@ fn main() {
         let first = tab_title(&app, cwd);
         assert_eq!(
             first,
-            format!("{} κ - komo-bot", crate::tui::spinner::frame(app.now))
+            format!("κ - komo-bot {}", crate::tui::spinner::frame(app.now))
         );
         app.apply(ServerEvent::Tick(
             fixture::T0 + time::Duration::milliseconds(crate::tui::spinner::FRAME_MS as i64),

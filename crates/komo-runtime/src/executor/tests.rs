@@ -2935,6 +2935,14 @@ mod task {
                 queued_behind: state.queued_behind.contains(task_id),
             })
         }
+
+        async fn status(
+            &self,
+            _from: &RunId,
+            _task_id: &str,
+        ) -> Result<komo_kernel::types::task::TaskProgress, SpawnError> {
+            Err(SpawnError::Failed("假分发器不查进度".into()))
+        }
     }
 
     /// 一条父 Run + 一次调用。

@@ -13,6 +13,7 @@
 //!    消息。fold **只记录**违例（[`FoldViolation`]），不改写日志：改写会让人读到的
 //!    历史和模型读到的历史不是同一份。
 
+mod progress;
 mod views;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+pub use progress::progress_of;
 pub use views::{
     CompactionView, FoldViolation, RunView, SurfaceMessage, SurfaceToolResult, ToolCallView,
     UnknownEvent,

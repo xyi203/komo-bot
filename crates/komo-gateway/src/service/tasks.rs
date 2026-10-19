@@ -262,6 +262,14 @@ impl TaskSpawner for GatewayTaskSpawner {
             queued_behind: response.state == RunState::Waiting,
         })
     }
+
+    async fn status(
+        &self,
+        _from: &RunId,
+        _task_id: &str,
+    ) -> Result<task::TaskProgress, SpawnError> {
+        Err(SpawnError::Failed("这台 Gateway 还不支持查任务进度".into()))
+    }
 }
 
 /// 一条任务 Run 收尾时怎么样了（[`report_to_parent`] 的标题那一半）。

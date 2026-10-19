@@ -713,6 +713,13 @@ pub trait TaskSpawner: Send + Sync {
         text: &str,
         options: crate::types::task::TaskOptions,
     ) -> Result<crate::types::task::FollowOutcome, SpawnError>;
+
+    /// 查一个任务现在跑到哪了：只读，不往那个会话里提交任何东西。`task_id` 解析同 `follow`。
+    async fn status(
+        &self,
+        from: &crate::types::ids::RunId,
+        task_id: &str,
+    ) -> Result<crate::types::task::TaskProgress, SpawnError>;
 }
 
 // ---------------------------------------------------------------- 渠道

@@ -110,6 +110,10 @@ pub enum Operation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         contract: Option<super::delegate::DelegateContract>,
     },
+    /// 查一个后台任务现在跑到哪了（`task` 只带 `task_id`、没有 `prompt`）：只读，不往任务会话里
+    /// 提交任何东西，也不碰文件。`task_id` 是模型给的任务短号原文，解析在执行侧做，同
+    /// [`Operation::Task`] 的接着做。
+    TaskStatus { task_id: String },
     /// 挂一个长时间跑的监听脚本，stdout 的行交回这个会话（`docs/monitor.md`）。
     ///
     /// 与 `Dispatch` 同一类编排操作：执行器放行之后交给 Gateway 起进程、立刻收尾，不等

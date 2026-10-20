@@ -414,3 +414,116 @@ async fn a_long_sleep_in_a_conversation_is_refused_with_the_monitor_hint() {
 
     gateway.stop().await;
 }
+
+/// 后台命令在宿主仍请求模型时结束：完成通知必须在下一个工具边界并入原 Run，
+/// 不能排到整条宿主 Run 之后，让它继续按「仍在后台」的旧状态调度。
+#[tokio::test]
+async fn a_detached_completion_interjects_into_the_still_running_host() {
+    use tokio::sync::Notify;
+
+    struct BusyLlm {
+        command: String,
+        waiting: Arc<Notify>,
+        proceed: Arc<Notify>,
+    }
+    struct BusyDriver {
+        command: String,
+        waiting: Arc<Notify>,
+        proceed: Arc<Notify>,
+        step: u32,
+    }
+    #[async_trait::async_trait]
+    impl LlmClient for BusyLlm {
+        async fn begin_turn(&self, req: TurnRequest) -> Result<Box<dyn TurnDriver>, LlmError> {
+            if last_user_text(&req).starts_with("[后台命令") {
+                return Ok(Box::new(ScriptDriver {
+                    script: Script::Reply("已读到后台结束通知".into()),
+                }));
+            }
+            Ok(Box::new(BusyDriver {
+                command: self.command.clone(),
+                waiting: self.waiting.clone(),
+                proceed: self.proceed.clone(),
+                step: 0,
+            }))
+        }
+    }
+    #[async_trait::async_trait]
+    impl TurnDriver for BusyDriver {
+        async fn next(&mut self, _input: RoundInput) -> Result<Round, LlmError> {
+            let step = self.step;
+            self.step += 1;
+            match step {
+                0 => call_round(
+                    1,
+                    "pc-background",
+                    "bash",
+                    serde_json::json!({"command": self.command}),
+                ),
+                1 => {
+                    self.waiting.notify_one();
+                    self.proceed.notified().await;
+                    call_round(
+                        2,
+                        "pc-boundary",
+                        "bash",
+                        serde_json::json!({"command": "echo checkpoint"}),
+                    )
+                }
+                _ => text_round(3, "仍未读到后台结束通知"),
+            }
+        }
+        fn usage(&self) -> TokenUsage {
+            TokenUsage::default()
+        }
+    }
+
+    let home = Home::with_config(&config(1));
+    let release = home.path().join("release-background");
+    let waiting = Arc::new(Notify::new());
+    let proceed = Arc::new(Notify::new());
+    let llm = Arc::new(BusyLlm {
+        command: format!(
+            "while [ ! -e '{}' ]; do sleep 0.05; done; echo finished; exit 1",
+            release.display()
+        ),
+        waiting: waiting.clone(),
+        proceed: proceed.clone(),
+    });
+    let gateway = home.start(llm).await;
+    let session = gateway.open_session().await;
+    let host = gateway
+        .submit(&session, "busy-host", "启动后台命令后继续处理")
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), waiting.notified())
+        .await
+        .expect("模型已拿到转后台回执");
+    std::fs::write(&release, "release").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if home.events(&session).iter().any(|event| {
+                matches!(&event.payload, komo_kernel::events::EventPayload::RunAccepted(body) if body.request_key.as_str().starts_with("bash-done:"))
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("结束通知已受理");
+    proceed.notify_one();
+    let detail = gateway.wait_terminal(&host.run).await;
+    wait_run_keyed(&gateway, &session, "bash-done:", Duration::from_secs(10)).await;
+    let runs = runs_of(&gateway, &session).await;
+    let end_state = runs
+        .iter()
+        .find(|run| run.request_key.as_str().starts_with("bash-done:"))
+        .unwrap()
+        .state;
+    gateway.stop().await;
+
+    assert_eq!(detail.final_message.as_deref(), Some("已读到后台结束通知"));
+    assert_eq!(
+        end_state,
+        RunState::Absorbed,
+        "完成通知应并进宿主，而非另排一轮"
+    );
+}

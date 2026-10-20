@@ -165,6 +165,13 @@ komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（
   按当前快照填，热生效，与 `call_timeout_secs` 同一条路。阈值不早于这次调用的时限时不转。
 - **调用已结算。** 转后台那一刻调用就有结果（不是 started 而无结果），所以重启恢复不会把它判成
   `uncertain`、更不会重跑。没有新增状态值。
+- **完成通知能插话（2026-10-20 修正）。** `watch_detached` 用 `submit_interjecting` 交回
+  `bash-done:{call_id}`，沿用已有的模型快照/对端资格检查：宿主仍在对话时，在下一次工具轮次
+  收尾的边界合入并重新装配；没有合适宿主时照常排队。不打断已经在飞的模型请求或工具，最终
+  回答没有工具边界时也仍排在后面。起因是 session `01a157e3`：#8b08 在 14:50:03 已结束，
+  普通通知却排到 14:52:34 才跑，宿主期间仍拿旧回执调用 monitor_stop。新回归
+  `a_detached_completion_interjects_into_the_still_running_host` 用可控子进程复现，确认完成通知
+  以 `absorbed` 合入原 Run。它不改变 `monitor_stop` 对未知编号的判定；完成与停止仍可能竞态。
 - **输出。** `stdout.txt` / `stderr.txt` 在结算时已按哈希封口，不能再追加；转后台之后的输出（两路按到达
   顺序混写）进同一尝试目录的 `background.log`，入口 `artifact://<run>/<call>/<attempt>/background`
   （`OutputFile::Background`）。转后台之前的输出在那次调用的结果里。

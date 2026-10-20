@@ -263,7 +263,13 @@ impl GatewayMonitors {
         if let Some(headline) = headline {
             let text = done_text(&id, &title, &headline, elapsed, &tail, &info.reference);
             let key = end_key(&info.call);
-            if let Err(error) = self.state.submit(&session, key, text, peer, None).await {
+            // 宿主可能拿到转后台回执后仍在跑；完成状态要在下一次工具边界让它看见，
+            // 不能排到整条 Run 后面。沿用插话的模型快照/对端资格检查。
+            if let Err(error) = self
+                .state
+                .submit_interjecting(&session, key, text, peer, None)
+                .await
+            {
                 tracing::warn!(%error, command = %id, "后台命令的结束消息交不回会话");
             }
         }

@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use komo_kernel::events::{Event, EventPayload, MessageAssistant, RunAccepted, ToolResult};
 use komo_kernel::protocol::config::{MemoryConfig, RetrievalConfig};
+use komo_kernel::protocol::http::MemoryAddRequest;
 use komo_kernel::test_support::ScriptedLlm;
 use komo_kernel::traits::{Clock, EmbedError, EmbeddingClient, LlmClient, MemoryRepo, StoreError};
 use komo_kernel::types::digest::ContentHash;
@@ -17,7 +18,8 @@ use komo_kernel::types::ids::{
     AttemptId, EventId, MemoryId, RequestKey, RunId, Seq, SessionId, ToolCallId,
 };
 use komo_kernel::types::memory::{
-    Confirmation, MemoryScope, MemoryState, MemoryWork, Provenance, RetrievalMode,
+    Confirmation, EvidenceRef, MemoryKind, MemoryScope, MemoryState, MemoryWork, Provenance,
+    RetrievalMode,
 };
 use komo_kernel::types::model::{
     DistanceRule, Effort, EmbeddingConfig, EmbeddingSpace, InputKind, ModelConfig, Vector,
@@ -3105,6 +3107,287 @@ async fn the_judgement_sees_a_shortlist_wider_than_top_k() {
         panic!("问的不是一个 Choice：{question:?}")
     };
     assert_eq!(criteria.len(), 4, "三条候选 + 一个 none（top_k 只有 1）");
+}
+
+// =========================================================== 手动记一条（§9.3）
+
+fn add_request(content: &str, kind: MemoryKind, in_run: Option<&str>) -> MemoryAddRequest {
+    MemoryAddRequest {
+        content: content.into(),
+        kind,
+        scope: MemoryScope::Personal,
+        session: in_run.map(|_| SessionId::from_raw("sess-1")),
+        run: in_run.map(RunId::from_raw),
+        request_key: None,
+    }
+}
+
+/// 一个 Run 里用户说的话，混着几样**不是**用户说的：后台任务交回、Cron 提示词。
+/// evt-3 是插话：带着自己的 Run，由 `run.absorbed` 指向 run-1。
+fn run_with_user_words() -> Vec<Event> {
+    let run = RunId::from_raw("run-1");
+    let interject = RunId::from_raw("run-2");
+    let mut handback = user_event(4, &run, "[后台任务 #ab12] 结果……");
+    if let EventPayload::RunAccepted(body) = &mut handback.payload {
+        body.request_key = RequestKey::new("task-result:ab12");
+    }
+    let mut cron = user_event(5, &run, "每天早上汇总一下邮件");
+    if let EventPayload::RunAccepted(body) = &mut cron.payload {
+        body.source = PlanSource::Cron {
+            job: komo_kernel::types::ids::CronJobId::from_raw("job-1"),
+            job_version: 1,
+        };
+    }
+    vec![
+        user_event(1, &run, "以后汇报先给结论，记住这个习惯"),
+        assistant_event(2, &run, "好的"),
+        user_event(3, &interject, "还有，别铺垫"),
+        event(
+            6,
+            &interject,
+            EventPayload::RunAbsorbed(komo_kernel::events::RunAbsorbed { into: run.clone() }),
+        ),
+        handback,
+        cron,
+    ]
+}
+
+fn cited_events(item: &MemoryItem) -> Vec<String> {
+    item.evidence
+        .iter()
+        .map(|evidence| match &evidence.reference {
+            EvidenceRef::Event { event, .. } => event.as_str().to_string(),
+            EvidenceRef::Memos { .. } => "memos".into(),
+        })
+        .collect()
+}
+
+/// Agent 在 Run 里替用户记：active + 用户原话 + **未确认**，证据是这个 Run 里用户自己
+/// 说的话（含插话），交回内容和 Cron 提示词不算。
+#[tokio::test]
+async fn an_add_from_inside_a_run_cites_the_users_words_and_stays_unconfirmed() {
+    let harness = HarnessBuilder::new().build().await;
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), run_with_user_words());
+
+    let (item, created) = harness
+        .manager
+        .add(&add_request(
+            "汇报先给结论再给依据",
+            MemoryKind::Preference,
+            Some("run-1"),
+        ))
+        .await
+        .unwrap();
+
+    assert!(created);
+    assert_eq!(item.state, MemoryState::Active, "用户原话直接生效（§9.2）");
+    assert_eq!(item.provenance, Provenance::UserStatement);
+    assert_eq!(
+        item.confirmation,
+        Confirmation::Unconfirmed,
+        "Agent 不替用户确认"
+    );
+    assert_eq!(cited_events(&item), vec!["evt-1", "evt-3"]);
+    assert!(add::is_manual(&item));
+}
+
+/// 操作者在终端自己记：不带会话，直接已确认。
+#[tokio::test]
+async fn an_add_from_the_operator_is_confirmed_on_the_spot() {
+    let harness = HarnessBuilder::new().build().await;
+
+    let (item, created) = harness
+        .manager
+        .add(&add_request("周末不开会", MemoryKind::Preference, None))
+        .await
+        .unwrap();
+
+    assert!(created);
+    assert_eq!(item.confirmation, Confirmation::UserConfirmed);
+    assert_eq!(item.state, MemoryState::Active);
+    assert!(item.evidence.is_empty());
+}
+
+/// 替用户记要有用户原话：Run 里只有 Cron 提示词时拒绝；半给的 session/run、空正文、
+/// 像密钥的正文也拒绝。
+#[tokio::test]
+async fn an_add_without_user_words_or_with_bad_input_is_refused() {
+    let harness = HarnessBuilder::new().build().await;
+    let run = RunId::from_raw("run-1");
+    let mut cron = user_event(1, &run, "每天早上汇总一下邮件");
+    if let EventPayload::RunAccepted(body) = &mut cron.payload {
+        body.source = PlanSource::Cron {
+            job: komo_kernel::types::ids::CronJobId::from_raw("job-1"),
+            job_version: 1,
+        };
+    }
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), vec![cron]);
+
+    let refused = |result: Result<(MemoryItem, bool), MemoryError>| {
+        matches!(result, Err(MemoryError::Invalid(_)))
+    };
+    assert!(refused(
+        harness
+            .manager
+            .add(&add_request(
+                "早上要汇总邮件",
+                MemoryKind::Preference,
+                Some("run-1")
+            ))
+            .await
+    ));
+    let mut half = add_request("早上要汇总邮件", MemoryKind::Preference, None);
+    half.run = Some(run.clone());
+    assert!(refused(harness.manager.add(&half).await));
+    assert!(refused(
+        harness
+            .manager
+            .add(&add_request("   ", MemoryKind::Fact, None))
+            .await
+    ));
+    assert!(refused(
+        harness
+            .manager
+            .add(&add_request(
+                "OpenAI key 是 sk-abc123",
+                MemoryKind::Fact,
+                None
+            ))
+            .await
+    ));
+    assert!(harness.repo.list(None, None, 10).await.unwrap().is_empty());
+}
+
+/// 同一句话再记一次不新建：Agent 先记、操作者再记一次 = 补上确认。
+#[tokio::test]
+async fn adding_the_same_words_again_reinforces_the_existing_one() {
+    let harness = HarnessBuilder::new().build().await;
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), run_with_user_words());
+    let request = add_request(
+        "汇报先给结论再给依据",
+        MemoryKind::Preference,
+        Some("run-1"),
+    );
+    let (first, _) = harness.manager.add(&request).await.unwrap();
+
+    let (again, created) = harness.manager.add(&request).await.unwrap();
+    assert!(!created);
+    assert_eq!(again.revision, first.revision, "证据一样，什么都不改");
+
+    let (confirmed, created) = harness
+        .manager
+        .add(&add_request(
+            "汇报先给结论再给依据",
+            MemoryKind::Preference,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert!(!created);
+    assert_eq!(confirmed.id, first.id);
+    assert_eq!(confirmed.confirmation, Confirmation::UserConfirmed);
+    assert_eq!(harness.repo.list(None, None, 10).await.unwrap().len(), 1);
+}
+
+/// 遗忘过的同一句话，add 不悄悄复活它（§9.6）。
+#[tokio::test]
+async fn adding_a_forgotten_memory_points_to_restore() {
+    let harness = HarnessBuilder::new().build().await;
+    let (item, _) = harness
+        .manager
+        .add(&add_request("周末不开会", MemoryKind::Preference, None))
+        .await
+        .unwrap();
+    harness
+        .manager
+        .forget(&item.id, item.revision)
+        .await
+        .unwrap();
+
+    let error = harness
+        .manager
+        .add(&add_request("周末不开会", MemoryKind::Preference, None))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("restore"), "{error}");
+}
+
+/// 后台提取碰到手动记过的那句话：提示里标出「本段已手动记下」；模型换个说法又交回
+/// 同种类的一条时，并进手动那条，不新增。
+#[tokio::test]
+async fn extraction_folds_a_rephrase_of_what_was_added_by_hand() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"用户希望汇报时先说结论",
+                "kind":"preference","scope":"personal","said_by":"user_statement",
+                "evidence":["evt-1"]}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), run_with_user_words());
+    let (added, _) = harness
+        .manager
+        .add(&add_request(
+            "汇报先给结论再给依据",
+            MemoryKind::Preference,
+            Some("run-1"),
+        ))
+        .await
+        .unwrap();
+
+    harness.manager.process_pending(1).await.unwrap();
+
+    let prompt = harness.llm.requests.lock().unwrap()[0].messages[0]
+        .text
+        .clone()
+        .unwrap();
+    assert!(prompt.contains("本段已手动记下"), "{prompt}");
+    let all = harness.repo.list(None, None, 10).await.unwrap();
+    assert_eq!(all.len(), 1, "并进手动那条，不新增");
+    assert_eq!(all[0].id, added.id);
+    assert_eq!(
+        all[0].content, "汇报先给结论再给依据",
+        "手动记的正文不被改写"
+    );
+}
+
+/// 同一句话里说到的另一件**不同种类**的事照常记下。
+#[tokio::test]
+async fn extraction_still_records_another_kind_said_in_the_same_breath() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"用户每周一早上有例会",
+                "kind":"fact","scope":"personal","said_by":"user_statement",
+                "evidence":["evt-1"]}]}"#,
+        )])
+        .work(vec![work_item(RunState::Completed, interactive())])
+        .build()
+        .await;
+    harness
+        .ledger
+        .seed(&SessionId::from_raw("sess-1"), run_with_user_words());
+    harness
+        .manager
+        .add(&add_request(
+            "汇报先给结论再给依据",
+            MemoryKind::Preference,
+            Some("run-1"),
+        ))
+        .await
+        .unwrap();
+
+    harness.manager.process_pending(1).await.unwrap();
+
+    assert_eq!(harness.repo.list(None, None, 10).await.unwrap().len(), 2);
 }
 
 // =========================================================== 埋点

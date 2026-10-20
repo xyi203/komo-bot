@@ -14,8 +14,9 @@ use komo_gateway::skills::{OfferContext, SkillRegistry, one_line};
 use komo_kernel::cron::{JobStatus, NotifyPolicy, OverlapPolicy};
 use komo_kernel::protocol::http::{
     CancelRunRequest, CreateCronRequest, InterventionAnswerRequest, InterventionListQuery,
-    InterventionVerdict, MemoryConsolidateRequest, MemoryListQuery, MemoryRevisionRequest,
-    MemorySweepRequest, RebuildIndexRequest, SessionListQuery, UpdateCronRequest,
+    InterventionVerdict, MemoryAddRequest, MemoryConsolidateRequest, MemoryListQuery,
+    MemoryRevisionRequest, MemorySweepRequest, RebuildIndexRequest, SessionListQuery,
+    UpdateCronRequest,
 };
 use komo_kernel::types::ids::{CronJobId, MemoryId, RunId, SessionId};
 use komo_kernel::types::memory::{MemoryKind, MemoryScope, MemoryState, RetrievalMode};
@@ -434,6 +435,39 @@ pub async fn memory_show(client: &KomoClient, id: &str) -> Outcome {
     Ok(render::memory_show(&detail.memory))
 }
 
+/// `komo memory add`：谁在调由环境说——bash 工具的子进程带着 `KOMO_SESSION` 与
+/// `KOMO_RUN`，Gateway 据此把它记成"Agent 替用户记、未确认"（§9.3「手动记一条」）。
+pub async fn memory_add(client: &KomoClient, content: &str, kind: &str, scope: &str) -> Outcome {
+    let kind = parse_kind(kind)?;
+    let scope = scope
+        .parse::<MemoryScope>()
+        .map_err(|error| error.to_string())?;
+    let from_env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let response = client
+        .memory_add(&MemoryAddRequest {
+            content: content.to_string(),
+            kind,
+            scope,
+            session: from_env("KOMO_SESSION").map(SessionId::from_raw),
+            run: from_env("KOMO_RUN").map(RunId::from_raw),
+            request_key: Some(RequestKeys::fresh(time::OffsetDateTime::now_utc())),
+        })
+        .await
+        .map_err(failed)?;
+    Ok(render::memory_added(&response))
+}
+
+fn parse_kind(raw: &str) -> Result<MemoryKind, String> {
+    match raw {
+        "preference" => Ok(MemoryKind::Preference),
+        "fact" => Ok(MemoryKind::Fact),
+        "experience" => Ok(MemoryKind::Experience),
+        other => Err(format!(
+            "不认识的种类 `{other}`：支持 preference / fact / experience"
+        )),
+    }
+}
+
 pub async fn memory_confirm(client: &KomoClient, id: &str, revision: u32) -> Outcome {
     let detail = client
         .memory_confirm(
@@ -508,17 +542,7 @@ pub async fn memory_consolidate(
                 .map_err(|error| error.to_string())
         })
         .transpose()?;
-    let kind = match kind.as_deref() {
-        None => None,
-        Some("preference") => Some(MemoryKind::Preference),
-        Some("fact") => Some(MemoryKind::Fact),
-        Some("experience") => Some(MemoryKind::Experience),
-        Some(other) => {
-            return Err(format!(
-                "不认识的种类 `{other}`：支持 preference / fact / experience"
-            ));
-        }
-    };
+    let kind = kind.as_deref().map(parse_kind).transpose()?;
     let response = client
         .memory_consolidate(&MemoryConsolidateRequest {
             scope,

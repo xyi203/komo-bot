@@ -295,6 +295,18 @@ enum MemoryCommand {
         /// 记忆 ID。
         memory_id: String,
     },
+    /// 手动记一条。在终端里跑记成已确认；Agent 在 Run 里跑（带 KOMO_SESSION / KOMO_RUN）
+    /// 记成未确认，证据是这个 Run 里用户说的话，等你 confirm。
+    Add {
+        /// 一句简短、只说一件事的陈述。
+        content: String,
+        /// 种类：preference（默认）/ fact / experience。
+        #[arg(long, default_value = "preference")]
+        kind: String,
+        /// 作用域：personal（默认）/ project:<id> / environment:<id>。
+        #[arg(long, default_value = "personal")]
+        scope: String,
+    },
     /// 操作者确认指定 revision。
     Confirm {
         /// 记忆 ID。
@@ -692,6 +704,11 @@ async fn operator(
                 .await
             }
             MemoryCommand::Show { memory_id } => commands::memory_show(client, &memory_id).await,
+            MemoryCommand::Add {
+                content,
+                kind,
+                scope,
+            } => commands::memory_add(client, &content, &kind, &scope).await,
             MemoryCommand::Confirm {
                 memory_id,
                 revision,

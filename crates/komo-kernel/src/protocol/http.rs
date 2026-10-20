@@ -859,6 +859,30 @@ pub struct MemoryDetail {
     pub memory: MemoryItem,
 }
 
+/// `POST /v1/memories`：手动记一条（§9.3「手动记一条」）。
+///
+/// `session` 与 `run` 要么都给、要么都不给：都给 = Agent 在这个 Run 里替用户记，证据是
+/// 这个 Run 里用户说的话，记成未确认；都不给 = 操作者在终端亲口说的，直接记成已确认。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryAddRequest {
+    pub content: String,
+    pub kind: MemoryKind,
+    pub scope: MemoryScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_key: Option<RequestKey>,
+}
+
+/// 记下的那一条；`created = false` 是库里已有逐字相同的一条，这次只补了证据或确认。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryAddResponse {
+    pub memory: MemoryItem,
+    pub created: bool,
+}
+
 /// `POST /v1/memories/sweep`：按规则遗忘。`apply = false` 只预演，什么都不改。
 ///
 /// 已确认的记忆不在任何规则的射程里：操作者亲口认过的东西，不该被"很久没用"拿掉。

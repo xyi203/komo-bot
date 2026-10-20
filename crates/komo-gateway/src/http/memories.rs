@@ -13,10 +13,10 @@
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use komo_kernel::protocol::http::{
-    ConsolidateGroupStatus, ConsolidateOutcome, MemoryConsolidateRequest,
-    MemoryConsolidateResponse, MemoryDetail, MemoryIndexStatus, MemoryListQuery,
-    MemoryListResponse, MemoryRevisionRequest, MemorySweepRequest, MemorySweepResponse,
-    RebuildIndexRequest, RebuildIndexResponse,
+    ConsolidateGroupStatus, ConsolidateOutcome, MemoryAddRequest, MemoryAddResponse,
+    MemoryConsolidateRequest, MemoryConsolidateResponse, MemoryDetail, MemoryIndexStatus,
+    MemoryListQuery, MemoryListResponse, MemoryRevisionRequest, MemorySweepRequest,
+    MemorySweepResponse, RebuildIndexRequest, RebuildIndexResponse,
 };
 use komo_kernel::types::ids::MemoryId;
 use komo_runtime::memory::MemoryError;
@@ -87,7 +87,8 @@ pub async fn show(State(api): State<Api>, Path(id): Path<String>) -> ApiResult<J
 /// `POST /v1/memories/{id}/confirm`：操作者确认指定 revision。
 ///
 /// **这条路是"受信任的操作者交互"那一侧**（§9.6）：`require_loopback` 与 bearer 在
-/// 路由层已经判过，Agent 通过 bash 调管理命令走不到这里——它没有令牌。
+/// 路由层已经判过。这不是对 Agent 的硬边界——bash 子进程读得到发现文件里的令牌（§7
+/// 没有 Policy）；Agent 不替用户确认靠的是系统提示与 §9.6 的约定。
 pub async fn confirm(
     State(api): State<Api>,
     Path(id): Path<String>,
@@ -111,6 +112,48 @@ pub async fn confirm(
     api.idempotency
         .remember(request.request_key.as_ref(), &hash, &detail);
     Ok(Json(detail))
+}
+
+/// `POST /v1/memories`：手动记一条（§9.3「手动记一条」）。
+///
+/// 带 `session` + `run` 的是 Agent 在 Run 里替用户记的，记成未确认；都不带的是操作者
+/// 自己记的，记成已确认（[`komo_runtime::memory::MemoryManager::add`]）。**后台任务会话不能替用户记**：那里
+/// 的「用户输入」是主 Agent 写的任务正文，不是用户原话。记下之后像 restore 一样提交一次
+/// 索引补齐。
+pub async fn add(
+    State(api): State<Api>,
+    Json(request): Json<MemoryAddRequest>,
+) -> ApiResult<Json<MemoryAddResponse>> {
+    let hash = body_hash(&request);
+    if let Some(previous) = api
+        .idempotency
+        .lookup::<MemoryAddResponse>(request.request_key.as_ref(), &hash)?
+    {
+        return Ok(Json(previous));
+    }
+    if let Some(session) = &request.session
+        && let Some(record) = komo_store::repos::session::get(&api.state.db, session).await?
+        && record.kind == komo_store::models::SessionKind::Task
+    {
+        return Err(ApiFailure::invalid(format!(
+            "会话 {session} 是后台任务：任务正文不是用户原话，不能替用户记；把要记的交回主会话"
+        )));
+    }
+    let (memory, created) = api
+        .state
+        .memories
+        .add(&request)
+        .await
+        .map_err(memory_failure)?;
+    if api.state.memories.space().is_some()
+        && let Err(error) = api.state.memories.schedule_index()
+    {
+        tracing::warn!(%error, memory = %memory.id, "手动记下之后补向量没提交上，先只靠关键词命中");
+    }
+    let response = MemoryAddResponse { memory, created };
+    api.idempotency
+        .remember(request.request_key.as_ref(), &hash, &response);
+    Ok(Json(response))
 }
 
 /// `POST /v1/memories/{id}/forget`：停用指定 revision 并失效索引。

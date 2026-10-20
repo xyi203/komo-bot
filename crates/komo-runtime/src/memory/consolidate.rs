@@ -113,11 +113,46 @@ impl Plan {
 /// 把一批观察落进库里。
 pub struct Consolidator<'a> {
     manager: &'a MemoryManager,
+    /// 这段对话里已经手动记过的条目（`komo memory add`，§9.3）。
+    recorded: Vec<MemoryItem>,
 }
 
 impl<'a> Consolidator<'a> {
     pub fn new(manager: &'a MemoryManager) -> Self {
-        Consolidator { manager }
+        Consolidator {
+            manager,
+            recorded: Vec::new(),
+        }
+    }
+
+    /// 告诉它这段对话里哪些已经手动记过：引的用户输入都被其中一条引过的观察，并进那条。
+    pub fn with_recorded(mut self, recorded: Vec<MemoryItem>) -> Self {
+        self.recorded = recorded;
+        self
+    }
+
+    /// 这条观察是不是手动记过的那句话又提了一遍：同作用域、同种类，而且它引的每一条证据
+    /// 都已经在**唯一一条**手动条目里。只认唯一：两条都盖得住时说不清是哪一条，照常走。
+    ///
+    /// 代价是用户同一句话里说了两件事、只手动记了一件时，同种类的另一件会被并掉——提示词
+    /// 里已经让模型别重提手动记过的那件（`本段已手动记下`），这里是模型没听话时的兜底。
+    fn recorded_as(&self, observation: &Observation) -> Option<&MemoryId> {
+        if observation.evidence.is_empty() {
+            return None;
+        }
+        let mut covering = self.recorded.iter().filter(|item| {
+            item.scope == observation.scope
+                && item.kind == observation.kind
+                && observation.evidence.iter().all(|evidence| {
+                    item.evidence
+                        .iter()
+                        .any(|have| have.reference == evidence.reference)
+                })
+        });
+        match (covering.next(), covering.next()) {
+            (Some(item), None) => Some(&item.id),
+            _ => None,
+        }
     }
 
     /// 返回写下去的变更条数。
@@ -139,6 +174,18 @@ impl<'a> Consolidator<'a> {
             .find_by_content(&observation.scope, &observation.content)
             .await?
         {
+            return self.merge(&existing, observation, now).await;
+        }
+
+        // 第一道半：这段对话里手动记过的那句话，换个说法又提了一遍（§9.3「手动记一条」）。
+        if let Some(id) = self.recorded_as(observation)
+            && let Some(existing) = self.manager.repo.get(id).await?
+            && matches!(
+                existing.state,
+                MemoryState::Active | MemoryState::Candidate | MemoryState::Contested
+            )
+        {
+            tracing::debug!(memory = %existing.id, "手动记过的那句话又被提取出来，并进去");
             return self.merge(&existing, observation, now).await;
         }
 

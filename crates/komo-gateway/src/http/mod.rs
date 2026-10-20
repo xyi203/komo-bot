@@ -83,7 +83,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/cron", get(cron::list).post(cron::create))
         .route("/v1/cron/{id}", patch(cron::update).delete(cron::remove))
         .route("/v1/cron/{id}/run", post(cron::run_now))
-        .route("/v1/memories", get(memories::list))
+        .route("/v1/memories", get(memories::list).post(memories::add))
         .route("/v1/memories/{id}", get(memories::show))
         .route("/v1/memories/{id}/confirm", post(memories::confirm))
         .route("/v1/memories/{id}/forget", post(memories::forget))

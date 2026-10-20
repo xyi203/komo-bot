@@ -484,6 +484,10 @@ impl KomoClient {
         self.get(&format!("/v1/memories/{memory}")).await
     }
 
+    pub async fn memory_add(&self, request: &MemoryAddRequest) -> ClientResult<MemoryAddResponse> {
+        self.post("/v1/memories", request).await
+    }
+
     pub async fn memory_confirm(
         &self,
         memory: &MemoryId,

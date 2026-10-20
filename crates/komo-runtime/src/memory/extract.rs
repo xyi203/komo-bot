@@ -31,10 +31,10 @@ use super::consolidate::{RawVerdict, Verdict, map_verdicts};
 
 /// 提示词版本。**改了提示词就改它**——它进 [`ExtractionMetadata`]，是"这条记忆是怎么来
 /// 的"里唯一能回答"按哪一版规则提的"的那一格（§9.2）。
-pub const PROMPT_VERSION: &str = "memory-extract/v6";
+pub const PROMPT_VERSION: &str = "memory-extract/v7";
 
 /// 一条记忆正文的上限。再长就不是"简短、尽量单一的陈述"了（§9.2）。
-const MAX_CONTENT_CHARS: usize = 300;
+pub(super) const MAX_CONTENT_CHARS: usize = 300;
 /// 会话窗口里每次工具调用的参数最多留几个字符——够看出读的是哪个文件、跑的是哪条命令。
 const MAX_CALL_ARGUMENT_CHARS: usize = 200;
 /// 交给记忆模型的会话窗口上限（字符）。
@@ -188,7 +188,8 @@ impl Line {
 }
 
 /// 系统交回内容时 `run.accepted` 的请求键前缀（`service/tasks.rs`、`service/monitors.rs`）。
-const HANDBACK_KEY_PREFIXES: [&str; 4] = ["task-result:", "monitor:", "monitor-end:", "bash-done:"];
+pub(super) const HANDBACK_KEY_PREFIXES: [&str; 4] =
+    ["task-result:", "monitor:", "monitor-end:", "bash-done:"];
 
 impl Transcript {
     /// 把一批 Run 的事件按 seq 顺序渲染成一个窗口。每个 Run 的 `cursor` 之前的不再算新
@@ -441,6 +442,26 @@ impl Transcript {
         self.cursors.values().copied().max().unwrap_or(Seq::ZERO)
     }
 
+    /// 这条证据指的是这个窗口里的一句用户输入。
+    pub fn cites_user(&self, reference: &EvidenceRef) -> bool {
+        match reference {
+            EvidenceRef::Event { session, event, .. } => {
+                session == &self.session
+                    && matches!(self.roles.get(event.as_str()), Some((_, _, Role::User)))
+            }
+            EvidenceRef::Memos { .. } => false,
+        }
+    }
+
+    /// 这段对话里已经手动记过的那一条（`komo memory add`，§9.3）：证据引了窗口里的用户输入。
+    pub fn recorded_by_hand(&self, item: &MemoryItem) -> bool {
+        super::add::is_manual(item)
+            && item
+                .evidence
+                .iter()
+                .any(|evidence| self.cites_user(&evidence.reference))
+    }
+
     /// 这个窗口里有没有**新发生的**用户陈述或可验证工具结果（§9.3）。
     pub fn has_new_evidence(&self) -> bool {
         self.roles
@@ -667,7 +688,7 @@ fn parse_time(raw: &str) -> Option<OffsetDateTime> {
 }
 
 /// 粗筛"看起来像凭证"的正文。宁可丢掉一条记忆，也不把一把密钥存成长期事实（§9.3）。
-fn looks_like_secret(text: &str) -> bool {
+pub(super) fn looks_like_secret(text: &str) -> bool {
     let lower = text.to_lowercase();
     const MARKERS: [&str; 6] = [
         "sk-",
@@ -876,7 +897,9 @@ unrelated = 不相干（可不写）。判冲突前先看作用域和时间：�
 11. used 说明「本批注入的记忆」里哪几条被**用上**了：助手的回复或工具调用明显依赖了它，没有它\
 就会做得不一样（照着它选了参数、遵守了它说的偏好、引用了它的事实）。只是话题相关、助手复述了\
 一遍、或者根本没体现，都不算。evidence 引批内助手事件的 ID（工具调用在发起它的助手事件上），不能\
-引用户行或单独的工具结果。没有就交回空数组；不要凑。";
+引用户行或单独的工具结果。没有就交回空数组；不要凑。
+12. 「已有的相关记忆」里标着「本段已手动记下」的，是这段对话里已经用 `komo memory add` 记过的：\
+同一件事不要再交回，换个说法也不要；同一句话里说到的**别的**值得记的事照常提。";
 
 fn user_prompt(
     transcript: &Transcript,
@@ -903,8 +926,13 @@ fn user_prompt(
             .iter()
             .enumerate()
             .map(|(index, item)| {
+                let by_hand = if transcript.recorded_by_hand(item) {
+                    " 本段已手动记下"
+                } else {
+                    ""
+                };
                 format!(
-                    "[{index}] 状态={:?} 来源={:?} 确认={:?} 作用域={} 内容：{}",
+                    "[{index}] 状态={:?} 来源={:?} 确认={:?} 作用域={}{by_hand} 内容：{}",
                     item.state, item.provenance, item.confirmation, item.scope, item.content
                 )
             })

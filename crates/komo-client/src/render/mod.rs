@@ -559,6 +559,20 @@ pub fn memory_list_full(response: &MemoryListResponse) -> String {
     out.join("\n")
 }
 
+/// `komo memory add`：先一句说清记成了什么，再是整条。
+pub fn memory_added(response: &komo_kernel::protocol::http::MemoryAddResponse) -> String {
+    let item = &response.memory;
+    let head = match (response.created, item.confirmation) {
+        (true, Confirmation::UserConfirmed) => "已记下（已确认）".to_string(),
+        (true, Confirmation::Unconfirmed) => format!(
+            "已记下（未确认）：要确认就跑 `komo memory confirm {} --revision {}`",
+            item.id, item.revision
+        ),
+        (false, _) => "库里已有逐字相同的一条：只补了证据 / 确认".to_string(),
+    };
+    format!("{head}\n\n{}", memory_show(item))
+}
+
 /// `komo memory show <id>`。
 pub fn memory_show(item: &MemoryItem) -> String {
     let mut out = vec![

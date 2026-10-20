@@ -1026,6 +1026,43 @@ mod tests {
         assert_eq!(confirmed.confirmation, Confirmation::UserConfirmed);
     }
 
+    /// 按会话找引用：只认**当前版本**的证据，旧版本留下的证据行不算。
+    #[tokio::test]
+    async fn citing_a_session_counts_only_the_current_revision() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        let elsewhere = |mut item: MemoryItem| {
+            item.evidence[0].reference = EvidenceRef::Event {
+                session: SessionId::from_raw("sess-2"),
+                event: EventId::from_raw("evt-9"),
+                seq: Seq(3),
+            };
+            item
+        };
+        repo.put(item("m-1", "喜欢深色主题", MemoryState::Active), None)
+            .await
+            .unwrap();
+        repo.put(
+            elsewhere(item("m-2", "客厅空调设 26 度", MemoryState::Active)),
+            None,
+        )
+        .await
+        .unwrap();
+        repo.put(item("m-3", "周末不开会", MemoryState::Active), None)
+            .await
+            .unwrap();
+        let mut moved = elsewhere(item("m-3", "周末不开会", MemoryState::Active));
+        moved.revision = 2;
+        repo.put(moved, Some(1)).await.unwrap();
+
+        let citing = repo
+            .citing_session(&SessionId::from_raw("sess-1"))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = citing.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["m-1"]);
+    }
+
     /// `forget` 立即停用内容，**并使关键词、向量里的引用失效**（§9.6）。
     #[tokio::test]
     async fn forgetting_also_invalidates_the_keyword_and_vector_index() {

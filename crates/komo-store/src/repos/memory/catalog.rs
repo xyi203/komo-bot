@@ -7,13 +7,13 @@
 
 use komo_kernel::protocol::http::IndexState;
 use komo_kernel::traits::{RepoError, StoreError};
-use komo_kernel::types::ids::MemoryId;
-use komo_kernel::types::memory::{MemoryItem, MemoryScope, MemoryState};
+use komo_kernel::types::ids::{MemoryId, SessionId};
+use komo_kernel::types::memory::{EvidenceRef, MemoryItem, MemoryScope, MemoryState};
 use komo_kernel::types::model::EmbeddingSpace;
 use time::OffsetDateTime;
 
 use crate::db::{BoxFuture, column_i64, column_string, decode, encode, map_toasty, to_ts};
-use crate::models::{MemoryIndexGenerationRow, MemoryItemRow, MemoryVectorRow};
+use crate::models::{MemoryEvidenceRow, MemoryIndexGenerationRow, MemoryItemRow, MemoryVectorRow};
 
 use super::{TursoMemoryRepo, enum_str, load_item, scope_kind};
 
@@ -123,6 +123,48 @@ impl TursoMemoryRepo {
                     }
                     Ok(None)
                 }) as BoxFuture<'_, Result<Option<MemoryItem>, StoreError>>
+            })
+            .await
+            .map_err(RepoError::from)
+    }
+
+    /// 当前版本的证据里引了这个会话事件的那些记忆，按 id 排序。
+    ///
+    /// 提取一批会话之前用它找"这段对话里已经手动记过的"（§9.3「手动记一条」）：那几条
+    /// 不一定被关键词召回到，却正是最容易被再提一遍的。和 `purge_blockers` 一样整表扫证据
+    /// ——个人库的规模下一次扫描比多建一列索引便宜。
+    pub async fn citing_session(&self, session: &SessionId) -> Result<Vec<MemoryItem>, RepoError> {
+        let session = session.clone();
+        self.db()
+            .read(move |ex| {
+                let session = session.clone();
+                Box::pin(async move {
+                    let rows = MemoryEvidenceRow::all().exec(ex).await.map_err(map_toasty)?;
+                    let mut ids: Vec<String> = rows
+                        .iter()
+                        .filter(|row| {
+                            matches!(
+                                serde_json::from_str::<EvidenceRef>(&row.reference),
+                                Ok(EvidenceRef::Event { session: cited, .. }) if cited == session
+                            )
+                        })
+                        .map(|row| row.memory_id.clone())
+                        .collect();
+                    ids.sort();
+                    ids.dedup();
+                    let mut out = Vec::new();
+                    for id in &ids {
+                        // 旧版本的证据行还在表里：只认当前版本仍然引着它的。
+                        if let Some(item) = load_item(ex, id).await?
+                            && item.evidence.iter().any(|e| {
+                                matches!(&e.reference, EvidenceRef::Event { session: cited, .. } if cited == &session)
+                            })
+                        {
+                            out.push(item);
+                        }
+                    }
+                    Ok(out)
+                }) as BoxFuture<'_, Result<Vec<MemoryItem>, StoreError>>
             })
             .await
             .map_err(RepoError::from)

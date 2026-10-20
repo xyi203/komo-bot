@@ -23,6 +23,7 @@
 //! （§9.5）。前两句在 [`consolidate`]，第三句在 [`index`] 与 [`MemoryManager::search`]
 //! ——向量在事务外算好，交给仓储的是一个 [`RecallQuery::query_vector`]。
 
+mod add;
 mod consolidate;
 mod extract;
 mod index;
@@ -140,6 +141,9 @@ pub trait MemoryCatalog: Send + Sync {
         content: &str,
     ) -> Result<Option<MemoryItem>, RepoError>;
 
+    /// 当前版本的证据引了这个会话事件的那些记忆（提取前找手动记过的，§9.3）。
+    async fn citing_session(&self, session: &SessionId) -> Result<Vec<MemoryItem>, RepoError>;
+
     async fn pending_vectors(
         &self,
         generation: &str,
@@ -197,6 +201,10 @@ impl MemoryCatalog for komo_store::TursoMemoryRepo {
         content: &str,
     ) -> Result<Option<MemoryItem>, RepoError> {
         komo_store::TursoMemoryRepo::find_by_content(self, scope, content).await
+    }
+
+    async fn citing_session(&self, session: &SessionId) -> Result<Vec<MemoryItem>, RepoError> {
+        komo_store::TursoMemoryRepo::citing_session(self, session).await
     }
 
     async fn pending_vectors(
@@ -1188,7 +1196,16 @@ impl MemoryManager {
             } else {
                 let consolidator = consolidate::Consolidator::new(self);
                 // 提取前整批召回一次，编号后随提取调用一起交给模型（§9.10）。
-                let candidates = consolidator.recall(transcript.statements()).await;
+                let mut candidates = consolidator.recall(transcript.statements()).await;
+                // 这段对话里已经手动记过的（§9.3「手动记一条」）：不一定召回得到，却最容易
+                // 被再提一遍。补进编号表并标出来，apply 时再兜一道。
+                let by_hand = self.recorded_by_hand(&transcript).await;
+                for item in &by_hand {
+                    if !candidates.iter().any(|have| have.id == item.id) {
+                        candidates.push(item.clone());
+                    }
+                }
+                let consolidator = consolidator.with_recorded(by_hand);
                 // 本批注入的记忆：只列版本没变的——正文变了，模型看到的就不是注入的那句话。
                 let mut injected = Vec::new();
                 for use_ in transcript.injected() {

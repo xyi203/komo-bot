@@ -89,6 +89,7 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo intervention list/show/answer`         | 待处理清单：结果不明、阻塞两类一张表；等价于聊天里的 `/pending` 与 `/answer`（§7.5、§11.3） |
 | `komo cron add/list/run/pause/resume/remove` | 管理定时任务                                                                |
 | `komo memory list/search/show`               | 查看自动记忆、来源与确认状态；search 支持 hybrid / keyword / vector；list --full 一条一行不截断 |
+| `komo memory add`                            | 手动记一条（§9.3）；在 Run 里（带 `KOMO_SESSION` / `KOMO_RUN`）记成未确认、引用户原话，终端里直接记成已确认 |
 | `komo memory confirm/forget`                 | 确认具体版本或停用自动记忆；不删除 Memos 原文                               |
 | `komo memory consolidate`                    | 离线整理（§9.8）：对已有记忆去重、取代、标冲突，不新增正文；`--scope` `--kind` `--instruction`，默认预演，`--apply` 才写 |
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |
@@ -1216,6 +1217,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | PATCH /v1/cron/{id}              | 更新定义或启停                                 |
 | DELETE /v1/cron/{id}             | 移除后续调度，已有执行历史保留                 |
 | GET /v1/memories                 | 按作用域、状态和查询条件列出记忆               |
+| POST /v1/memories                | 手动记一条（§9.3）；拒绝后台任务会话           |
 | GET /v1/memories/{id}            | 内容、版本、证据与确认记录                     |
 | POST /v1/memories/{id}/confirm   | 操作者确认指定 revision                        |
 | POST /v1/memories/{id}/forget    | 停用指定 revision 并失效索引                   |

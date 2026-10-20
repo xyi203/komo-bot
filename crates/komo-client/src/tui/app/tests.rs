@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::sse::ConnectionState;
-use crate::tui::paste::{InputEvent, PASTE_MIN_BYTES, PasteChip};
+use crate::tui::paste::{Input, InputEvent, PASTE_MIN_BYTES, PasteChip};
 use crate::tui::test_support as fixture;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use komo_kernel::events::{Event, EventPayload};
@@ -201,6 +201,23 @@ fn the_input_history_walks_back_and_restores_the_draft() {
     assert_eq!(app.input.text(), "第二句");
     app.handle_key(key(KeyCode::Down));
     assert_eq!(app.input.text(), "草稿", "走回底部要把草稿还回来");
+}
+
+/// 翻历史来回一趟，草稿里折起来的粘贴不能变成摊开的一大段；翻到的那条发过的消息里有
+/// 粘贴，也照样折着。
+#[test]
+fn history_keeps_folded_pastes_folded() {
+    let mut app = app();
+    app.handle_input(InputEvent::Paste("一\n二\n三\n四".into()));
+    app.handle_key(key(KeyCode::Enter));
+    type_text(&mut app, "草稿：");
+    app.handle_input(InputEvent::Paste("a\nb\nc\nd".into()));
+
+    app.handle_key(key(KeyCode::Up));
+    assert_eq!(app.input.display(), "[粘贴 4 行 · 15 B]");
+    app.handle_key(key(KeyCode::Down));
+    assert_eq!(app.input.display(), "草稿：[粘贴 4 行 · 7 B]");
+    assert_eq!(app.input.text(), "草稿：a\nb\nc\nd");
 }
 
 // ---- Esc 的两个意思 ----
@@ -764,6 +781,32 @@ fn a_tool_result_shows_the_full_body_not_the_one_kib_preview() {
         }
         feed(&mut app, &events);
         assert_eq!(app.tool_lines()[0].preview.as_deref(), Some(want));
+    }
+}
+
+/// 转到后台的 bash 在事件上是 completed，界面上不是成功：认的是结果里的 `detached`。
+#[test]
+fn a_result_handed_to_the_background_is_marked_detached() {
+    for (result, want) in [
+        (serde_json::json!({"detached": "0199-abcd"}), "↗"),
+        (serde_json::json!({"detached": null, "exit_code": 0}), "✔"),
+    ] {
+        let mut app = app();
+        let mut events = fixture::conversation();
+        for event in &mut events {
+            if let EventPayload::ToolResult(body) = &mut event.payload {
+                body.body = Some(Box::new(komo_kernel::types::refs::ToolResultBody {
+                    status: ToolResultStatus::Completed,
+                    result: result.clone(),
+                    error: None,
+                    exit_code: None,
+                    artifacts: vec![],
+                    preview: Some("已转后台 #abcd".into()),
+                }));
+            }
+        }
+        feed(&mut app, &events);
+        assert_eq!(app.tool_lines()[0].marker(None), want, "{result}");
     }
 }
 
@@ -1426,7 +1469,7 @@ fn enter_on_a_bang_sends_the_command_without_the_model() {
         app.pending_submissions[0].text, "!ls -la",
         "本地那条照原样显示"
     );
-    assert_eq!(app.history.last().map(String::as_str), Some("!ls -la"));
+    assert_eq!(app.history.last().map(Input::text), Some("!ls -la"));
 }
 
 #[test]

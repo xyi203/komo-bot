@@ -294,7 +294,12 @@ fn head_lines(
 ) -> Vec<Line<'static>> {
     // 只有记号带状态色，工具名加粗、其余用终端本色（照 Claude Code）：整行上色会和下面
     // diff 的红绿撞在一起。
-    let mut mark = Style::default().fg(state_colour(tool.state));
+    let colour = if tool.detached {
+        Color::Cyan
+    } else {
+        state_colour(tool.state)
+    };
+    let mut mark = Style::default().fg(colour);
     if tool.state == ToolCallState::Started && !spinner::lit(now) {
         mark = mark.add_modifier(Modifier::DIM);
     }
@@ -793,7 +798,28 @@ mod tests {
             preview: preview.map(Into::into),
             elapsed_ms: 1200,
             seq: Seq(1),
+            detached: false,
         }
+    }
+
+    /// 转到后台的那次 bash 不画 ✔：命令还在跑，成败要等交回来的消息。
+    #[test]
+    fn a_detached_command_is_not_drawn_as_a_success() {
+        let mut tool = call(
+            "bash",
+            json!({"command": "cargo test --workspace"}),
+            ToolCallState::Completed,
+            Some("已转后台 #d63a：命令跑了 120 秒还没完"),
+        );
+        tool.detached = true;
+        let lines = lines(&tool, false, 80, None);
+        let text = text_of(&lines);
+        assert!(
+            text.starts_with("  ↗ bash $ cargo test --workspace"),
+            "{text}"
+        );
+        assert!(!text.contains('✔'), "{text}");
+        assert_eq!(lines[0].spans[0].style.fg, Some(Color::Cyan));
     }
 
     fn text_of(lines: &[Line<'static>]) -> String {

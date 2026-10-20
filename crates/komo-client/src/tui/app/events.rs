@@ -409,6 +409,11 @@ impl App {
                     .and_then(|full| full.preview.clone().or_else(|| full.error.clone()))
                     .or_else(|| body.preview.clone());
                 line.elapsed_ms = body.elapsed_ms;
+                line.detached = body.body.as_ref().is_some_and(|full| {
+                    full.result
+                        .get("detached")
+                        .is_some_and(|handle| !handle.is_null())
+                });
             }
             _ => {}
         }

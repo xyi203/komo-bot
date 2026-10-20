@@ -221,6 +221,9 @@ pub struct ToolLine {
     pub preview: Option<String>,
     pub elapsed_ms: u64,
     pub seq: Seq,
+    /// 跑过阈值、转到后台的 `bash`（结果里带 `detached`）。事件上它是 completed——这次
+    /// 调用确实收了尾——但命令还在跑，成败要等交回来的那条消息，所以不画成功。
+    pub detached: bool,
 }
 
 impl ToolLine {
@@ -253,11 +256,14 @@ impl ToolLine {
     ///
     /// **`?` 是 uncertain**：副作用可能已经发生（§8.6），既不是成功也不是失败，所以它
     /// 不共用失败那个符号。
+    ///
+    /// **`↗` 是转到后台**：调用收了尾，命令还在跑，既不是成功也不是失败。
     pub fn marker(&self, now: Option<OffsetDateTime>) -> &'static str {
         match self.state {
             ToolCallState::Planned => "·",
             ToolCallState::Started if now.is_some() => crate::tui::spinner::PULSE,
             ToolCallState::Started => crate::tui::spinner::STILL,
+            ToolCallState::Completed if self.detached => "↗",
             ToolCallState::Completed => "✔",
             ToolCallState::Failed => "✖",
             ToolCallState::Uncertain => "?",
@@ -296,10 +302,11 @@ pub struct App {
     pub cursor: Seq,
     pub connection: ConnectionState,
     pub input: Input,
-    pub history: Vec<String>,
+    /// 发过的输入。存的是整个 [`Input`] 而不只是文字：翻回来时折起来的粘贴还是折着的。
+    pub history: Vec<Input>,
     history_pos: Option<usize>,
-    /// 翻历史前的草稿。
-    history_draft: Option<String>,
+    /// 翻历史前的草稿，连同它的折叠区。
+    history_draft: Option<Input>,
     pub notices: Vec<Notice>,
     /// Enter 后立即显示；收到同一 `request_key` 的 `run.accepted` 后移除。
     pub pending_submissions: Vec<PendingSubmission>,
@@ -659,6 +666,7 @@ fn blank_tool(call: ToolCallId, run: Option<RunId>, seq: Seq) -> ToolLine {
         preview: None,
         elapsed_ms: 0,
         seq,
+        detached: false,
     }
 }
 

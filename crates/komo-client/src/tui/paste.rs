@@ -170,30 +170,36 @@ impl Input {
         self.cursor = previous;
     }
 
+    /// 往左一个字符；左边贴着一段折起来的粘贴就整块跨过去。
+    ///
+    /// **光标从不停在 chip 里面**：屏幕上那里只有一个标签，停进去再打一个字，整段就被
+    /// 打散摊开了。下面按行走、按行删的那些同理，都只认屏幕上看得见的换行。
     pub fn move_left(&mut self) {
+        if let Some(chip) = self.chips.iter().find(|chip| chip.end == self.cursor) {
+            self.cursor = chip.start;
+            return;
+        }
         if let Some((index, _)) = self.text[..self.cursor].char_indices().next_back() {
             self.cursor = index;
         }
     }
 
     pub fn move_right(&mut self) {
+        if let Some(chip) = self.chips.iter().find(|chip| chip.start == self.cursor) {
+            self.cursor = chip.end;
+            return;
+        }
         if let Some(ch) = self.text[self.cursor..].chars().next() {
             self.cursor += ch.len_utf8();
         }
     }
 
     pub fn move_home(&mut self) {
-        self.cursor = self.text[..self.cursor]
-            .rfind('\n')
-            .map(|index| index + 1)
-            .unwrap_or(0);
+        self.cursor = self.line_start(self.cursor);
     }
 
     pub fn move_end(&mut self) {
-        self.cursor = self.text[self.cursor..]
-            .find('\n')
-            .map(|index| self.cursor + index)
-            .unwrap_or(self.text.len());
+        self.cursor = self.line_end(self.cursor);
     }
 
     /// 整段文本的开头 / 结尾（`Ctrl-Home` / `Ctrl-End`）。
@@ -312,10 +318,9 @@ impl Input {
     /// 删到行尾（`Ctrl-K`）。已经在行尾时删掉那个换行。
     pub fn delete_to_line_end(&mut self) {
         let start = self.cursor;
-        let end = match self.text[start..].find('\n') {
-            Some(0) => start + 1,
-            Some(index) => start + index,
-            None => self.text.len(),
+        let end = match self.line_end(start) {
+            end if end == start && end < self.text.len() => start + 1,
+            end => end,
         };
         if start < end {
             self.cut(start, end);
@@ -345,17 +350,29 @@ impl Input {
         }
     }
 
-    /// 输入里有几行。
+    /// 输入里有几行（折起来的一段算在它所在的那一行里）。
     pub fn line_count(&self) -> usize {
-        self.text.bytes().filter(|b| *b == b'\n').count() + 1
+        self.visible_newlines().count() + 1
     }
 
     /// 光标在第几行（从 0 数）。
     pub fn line_index(&self) -> usize {
-        self.text[..self.cursor]
-            .bytes()
-            .filter(|b| *b == b'\n')
+        self.visible_newlines()
+            .take_while(|at| *at < self.cursor)
             .count()
+    }
+
+    /// 屏幕上看得见的换行的字节偏移：折进 chip 里的那些不算。
+    fn visible_newlines(&self) -> impl Iterator<Item = usize> + '_ {
+        self.text
+            .match_indices('\n')
+            .map(|(at, _)| at)
+            .filter(|at| {
+                !self
+                    .chips
+                    .iter()
+                    .any(|chip| chip.start <= *at && *at < chip.end)
+            })
     }
 
     /// 上下移动一个**逻辑行**，列按显示宽度尽量对齐。移动不了（已经在首行 / 末行）返回
@@ -381,37 +398,87 @@ impl Input {
         true
     }
 
-    /// 光标离行首有几列（显示宽度）。
+    /// 光标离行首有几列（显示宽度，chip 按它的标签算）。
     fn column(&self) -> usize {
-        let start = self.line_start(self.cursor);
-        crate::tui::markdown::display_width(&self.text[start..self.cursor])
+        let mut at = self.line_start(self.cursor);
+        let mut used = 0usize;
+        while at < self.cursor {
+            let Some((next, width)) = self.step(at) else {
+                break;
+            };
+            used += width;
+            at = next;
+        }
+        used
     }
 
     fn line_start(&self, at: usize) -> usize {
-        self.text[..at]
-            .rfind('\n')
-            .map(|index| index + 1)
+        self.visible_newlines()
+            .take_while(|newline| *newline < at)
+            .last()
+            .map(|newline| newline + 1)
             .unwrap_or(0)
     }
 
     fn line_end(&self, at: usize) -> usize {
-        self.text[at..]
-            .find('\n')
-            .map(|index| at + index)
+        self.visible_newlines()
+            .find(|newline| *newline >= at)
             .unwrap_or(self.text.len())
     }
 
     /// 从 `line_start` 起走到第 `column` 列（或行尾）所在的字节偏移。
     fn offset_at_column(&self, line_start: usize, column: usize) -> usize {
         let end = self.line_end(line_start);
+        let mut at = line_start;
         let mut used = 0usize;
-        for (at, ch) in self.text[line_start..end].char_indices() {
+        while at < end {
             if used >= column {
-                return line_start + at;
+                return at;
             }
-            used += crate::tui::markdown::display_width(ch.encode_utf8(&mut [0u8; 4])).max(1);
+            let Some((next, width)) = self.step(at) else {
+                break;
+            };
+            used += width;
+            at = next;
         }
         end
+    }
+
+    /// 从 `at` 往右走一格：一个字符，或者一整段折起来的粘贴（宽度按它的标签算）。
+    fn step(&self, at: usize) -> Option<(usize, usize)> {
+        if let Some(chip) = self.chips.iter().find(|chip| chip.start == at) {
+            return Some((chip.end, crate::tui::markdown::display_width(&chip.label())));
+        }
+        let ch = self.text[at..].chars().next()?;
+        let width = crate::tui::markdown::display_width(ch.encode_utf8(&mut [0u8; 4])).max(1);
+        Some((at + ch.len_utf8(), width))
+    }
+
+    /// 去掉首尾空白的一份拷贝，光标在末尾，chip 跟着挪——翻历史时拿回来的还是折好的样子。
+    /// 空白只削到 chip 的边上：折起来的内容一个字节都不动。
+    pub fn trimmed(&self) -> Input {
+        let first = self
+            .chips
+            .first()
+            .map_or(self.text.len(), |chip| chip.start);
+        let last = self.chips.last().map_or(0, |chip| chip.end);
+        let lead = first - self.text[..first].trim_start().len();
+        let end = (last + self.text[last..].trim_end().len()).max(lead);
+        let text = self.text[lead..end].to_string();
+        let chips = self
+            .chips
+            .iter()
+            .map(|chip| PasteChip {
+                start: chip.start - lead,
+                end: chip.end - lead,
+                ..chip.clone()
+            })
+            .collect();
+        Input {
+            cursor: text.len(),
+            text,
+            chips,
+        }
     }
 
     /// 删掉 `[start, end)`，chip 与光标跟着挪。删之前先打散被切开的那个 chip。
@@ -422,6 +489,9 @@ impl Input {
     }
 
     fn cut_raw(&mut self, start: usize, end: usize) {
+        // 整块落在删掉的范围里的 chip 跟着内容一起走——留下来就是一个指着别处文字的标签。
+        self.chips
+            .retain(|chip| !(start <= chip.start && chip.end <= end));
         self.text.replace_range(start..end, "");
         self.shift(start, -((end - start) as isize));
         self.cursor = start;
@@ -633,7 +703,9 @@ mod tests {
     fn editing_inside_a_chip_dissolves_it_without_losing_text() {
         let mut input = Input::new();
         input.paste("a\nb\nc\nd");
-        input.move_left();
+        // 按键走不进 chip（见 `arrow_keys_cross_a_folded_paste_in_one_step`）；这里直接把
+        // 光标放进去，守的是万一进去了也不丢字。
+        input.cursor -= 1;
         input.insert_char('!');
         assert!(input.chips().is_empty());
         assert_eq!(input.text(), "a\nb\nc\n!d");
@@ -819,6 +891,98 @@ mod editor_tests {
         input.delete_forward();
         assert_eq!(input.text(), "前后", "往后删一下删掉整块");
         assert!(input.chips().is_empty());
+    }
+
+    /// 粘贴之后回到行首补一句话，是最常见的那一下：折起来的那段里的换行屏幕上看不见，
+    /// Home 不该停在它的最后一行上——停进去再打字，整段就摊开了。
+    #[test]
+    fn home_and_end_skip_the_newlines_folded_into_a_paste() {
+        let mut input = Input::new();
+        input.paste("一\n二\n三\n四");
+        input.move_home();
+        assert_eq!(input.cursor(), 0, "整个输入只有一行");
+        input.insert_str("看这个：");
+        assert_eq!(input.chips().len(), 1, "补的话在 chip 外面");
+        assert_eq!(input.display(), "看这个：[粘贴 4 行 · 15 B]");
+        input.move_end();
+        assert_eq!(input.cursor(), input.text().len());
+        assert_eq!(input.line_count(), 1);
+        assert_eq!(input.line_index(), 0);
+        assert!(!input.move_line_up(), "↑ 交给历史，不是走进 chip");
+    }
+
+    #[test]
+    fn arrow_keys_cross_a_folded_paste_in_one_step() {
+        let mut input = Input::new();
+        input.insert_str("前");
+        input.paste("a\nb\nc\nd");
+        input.move_left();
+        assert_eq!(input.cursor(), "前".len(), "整块跨过去");
+        input.move_right();
+        assert_eq!(input.cursor(), input.text().len());
+        input.move_left();
+        input.insert_char('!');
+        assert_eq!(input.display(), "前![粘贴 4 行 · 7 B]");
+    }
+
+    /// 上下走行时 chip 按它的标签算宽，列才对得上屏幕。
+    #[test]
+    fn walking_lines_lands_on_either_side_of_a_folded_paste() {
+        let mut input = Input::new();
+        input.insert_str("ab");
+        input.paste("1\n2\n3\n4");
+        input.insert_str("cd\nxy");
+        assert_eq!(input.line_count(), 2);
+        assert!(input.move_line_up());
+        assert_eq!(
+            &input.text()[..input.cursor()],
+            "ab",
+            "第二列落在 chip 前面"
+        );
+        input.move_end();
+        assert!(input.move_line_down());
+        assert_eq!(
+            &input.text()[input.cursor()..],
+            "",
+            "第一行比第二行长，落到末尾"
+        );
+        assert_eq!(input.chips().len(), 1);
+    }
+
+    /// 删词、删到行首，删到的是一整块 chip 就整块删掉，不留一个指着别处文字的标签。
+    #[test]
+    fn deleting_over_a_folded_paste_takes_all_of_it() {
+        let mut input = Input::new();
+        input.insert_str("前");
+        input.paste("a\nb\nc\nd");
+        input.delete_word_before();
+        assert_eq!(input.text(), "前");
+        assert!(input.chips().is_empty());
+        assert_eq!(input.display(), "前");
+
+        let mut input = Input::new();
+        input.insert_str("前");
+        input.paste("a\nb\nc\nd");
+        input.insert_str("后");
+        input.delete_to_line_start();
+        assert_eq!(input.text(), "");
+        assert!(input.chips().is_empty());
+    }
+
+    #[test]
+    fn a_trimmed_copy_keeps_the_paste_folded() {
+        let mut input = Input::new();
+        input.insert_str("  ");
+        input.paste(" a\nb\nc\nd ");
+        input.insert_str("\n\n");
+        let trimmed = input.trimmed();
+        assert_eq!(trimmed.text(), " a\nb\nc\nd ", "chip 里的空白不削");
+        assert_eq!(trimmed.display(), "[粘贴 4 行 · 9 B]");
+        assert_eq!(trimmed.cursor(), trimmed.text().len());
+
+        let mut plain = Input::new();
+        plain.insert_str("  ");
+        assert_eq!(plain.trimmed().text(), "");
     }
 
     #[test]

@@ -158,7 +158,7 @@ impl App {
         if text.is_empty() {
             return Vec::new();
         }
-        self.history.push(text.clone());
+        self.history.push(self.input.trimmed());
         self.reset_history_browse();
 
         if command::is_command(&text) {
@@ -422,14 +422,14 @@ impl App {
         }
         let next = match self.history_pos {
             None => {
-                self.history_draft = Some(self.input.text().to_string());
+                self.history_draft = Some(self.input.clone());
                 self.history.len() - 1
             }
             Some(0) => 0,
             Some(position) => position - 1,
         };
         self.history_pos = Some(next);
-        self.input.set(self.history[next].clone());
+        self.input = self.history[next].clone();
     }
 
     fn history_forward(&mut self) {
@@ -438,11 +438,10 @@ impl App {
         };
         if position + 1 < self.history.len() {
             self.history_pos = Some(position + 1);
-            self.input.set(self.history[position + 1].clone());
+            self.input = self.history[position + 1].clone();
         } else {
             self.history_pos = None;
-            let draft = self.history_draft.take().unwrap_or_default();
-            self.input.set(draft);
+            self.input = self.history_draft.take().unwrap_or_default();
         }
     }
 

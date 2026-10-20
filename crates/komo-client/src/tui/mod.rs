@@ -9,6 +9,7 @@ pub mod command;
 pub mod markdown;
 pub mod model_picker;
 pub mod paste;
+pub mod relaunch;
 pub mod render;
 pub mod shell;
 pub mod spinner;
@@ -164,6 +165,9 @@ pub async fn run_tui(
     // 终端自己在标签页上转时（OSC 9;4），上次告诉它的是转还是停——同样变了才发。
     let tab_spinner = render::TabSpinner::detect();
     let mut shown_busy = false;
+    if let Some(session) = app.session.as_ref() {
+        terminal.arm_relaunch(session, mode, &cwd);
+    }
     let _ = terminal.commit(render::banner(&app, &cwd));
     let mut emitted = Emitted::new();
     let mut ticker = tokio::time::interval(TICK);
@@ -268,6 +272,7 @@ pub async fn run_tui(
         // 会话刚铸出来：订阅在这里建立，`select!` 的分支体里换它借不过编译器——那一
         // 路正借着 `subscription`。
         if let Some(session) = just_opened.take() {
+            terminal.arm_relaunch(&session, mode, &cwd);
             subscription = Some(sse::subscribe(&client, session, Cursor::after(app.cursor)));
         }
         if ended {
@@ -295,6 +300,10 @@ pub async fn run_tui(
         );
     }
     drop(terminal);
+    // 人自己退出的才撤回重启声明；读键那一路断了（终端没了）不算，留着声明等终端拉回来。
+    if app.quit {
+        print!("{}", relaunch::CLEAR);
+    }
     // 退出即暂停：Run 留在 Gateway 里照跑，人回来靠的是**这一行命令**。会话 Id 只在身份
     // 行上闪过一次，退出这一刻正是需要它的时刻。会话还没铸出来（`komo` 一个字没发就退）
     // 就没有可 resume 的东西，什么都不印——那正是"不在账本上留空壳"的同一条规矩。
@@ -707,6 +716,13 @@ impl ResizeGate {
 }
 
 impl TerminalGuard {
+    /// 告诉终端重启后怎么把这个会话拉回来（[`relaunch`]）。与终端标题一样只排进这一帧。
+    fn arm_relaunch(&mut self, session: &SessionId, mode: TuiMode, cwd: &str) {
+        if let Some(sequence) = relaunch::arm(session, mode, cwd) {
+            let _ = queue!(self.terminal.backend_mut(), Print(sequence));
+        }
+    }
+
     fn enter(app: &App) -> Result<Self, std::io::Error> {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {

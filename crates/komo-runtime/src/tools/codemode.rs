@@ -65,7 +65,8 @@ impl Tool for CodemodeTool {
                           读不到环境变量，只有 json、re、math、time、datetime、collections、itertools \
                           等少数标准库，没有第三方库。要写文件用 write / edit，要完整的 Python \
                           （第三方库、写文件、联网）用 bash 跑 python3。每次调用都是独立脚本，\
-                          json、re、time 等必须在本段显式 import。datetime.fromtimestamp / \
+                          json、re、time 等必须在本段显式 import。json 只有 loads / dumps，\
+                          读 JSON 文件写 json.loads(open(p).read())。datetime.fromtimestamp / \
                           utcfromtimestamp 未实现；Unix 秒转 UTC 用：\n\
                           import time\n\
                           ts = 1729324800.25\n\
@@ -85,7 +86,7 @@ impl Tool for CodemodeTool {
                           回放，之后的调用照常执行，分歧或结果不明会终止整段脚本。\n\
                           - text(value)：加一段输出（非字符串转 JSON）。print 的内容附在最后。\n\
                           - TOOLS：能调的工具名。\n\
-                          - ALL_TOOLS（[{name, description}]）、search_tools(query, limit=8, \
+                          - ALL_TOOLS（变量，不是函数：[{name, description}] 列表）、search_tools(query, limit=8, \
                           namespace=None)、describe_tool(name)（说明与参数 schema）、\
                           describe_namespace(name)（一台 MCP 服务器的说明、instructions 与工具名）：\
                           找没声明给你的工具，比如 MCP 工具。\n\

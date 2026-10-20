@@ -67,8 +67,8 @@ use komo_kernel::types::status::{RunEnd, RunState, ToolCallState};
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskOptions, TaskProgress, TaskSpec};
 use komo_kernel::types::tool::{
-    CancelToken, ResumedCall, ToolContext, ToolError, ToolExposure, ToolNamespace, ToolOutput,
-    WorkspaceRoot,
+    CancelToken, InterjectSignal, ResumedCall, ToolContext, ToolError, ToolExposure, ToolNamespace,
+    ToolOutput, WorkspaceRoot,
 };
 use komo_kernel::types::turn::{AcceptInput, Accepted, ToolResultForModel};
 
@@ -134,6 +134,8 @@ pub struct CallEnv {
     /// 对话会话里的 `bash` 跑多久转后台（`[execution] detach_after_secs`）。`None` = 不转：
     /// 任务会话、Cron、子 Run、配置为 0。Gateway 按当前快照填。
     pub detach_after: Option<Duration>,
+    /// 用户插话的信号：这一段里前台的 `bash` 看到它就提前转后台。Gateway 每段换一个新的。
+    pub interjected: InterjectSignal,
     /// 对话会话里直接受理的 Run：`bash` 拒绝 10 秒以上的 `sleep`。
     pub conversation: bool,
     pub principal: Option<Principal>,
@@ -1775,6 +1777,7 @@ impl ToolExecutor {
             cancel: env.cancel.clone(),
             call_timeout: env.call_timeout,
             detach_after: env.detach_after,
+            interjected: env.interjected.clone(),
             conversation: env.conversation,
         }
     }

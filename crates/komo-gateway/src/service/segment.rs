@@ -37,7 +37,7 @@ use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
 use komo_kernel::types::resource::{ResourceMounts, SkillMount};
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::surface::AgentSurface;
-use komo_kernel::types::tool::{CancelToken, ToolDefinition, WorkspaceRoot};
+use komo_kernel::types::tool::{CancelToken, InterjectSignal, ToolDefinition, WorkspaceRoot};
 use komo_kernel::types::turn::{ToolResultForModel, TurnRequest};
 use komo_runtime::agent::handler::SegmentSource;
 use komo_runtime::agent::{Budget, ResumedRound, RetryBudget, Segment};
@@ -73,6 +73,9 @@ pub struct GatewaySegments {
     max_rounds: Option<u32>,
     max_retries: u32,
     cancels: Mutex<BTreeMap<RunId, CancelToken>>,
+    /// 对话会话当前这一段的插话信号（`docs/monitor.md` §8）。按会话记：TUI 插话时只知道
+    /// 会话，而对话会话同一时刻只有一段在跑。每段装配换一个新的。
+    interjections: Mutex<BTreeMap<SessionId, (RunId, InterjectSignal)>>,
     /// `None` = 这台 Gateway 没有记忆这一层（测试里的精简装配）。
     memories: Option<Arc<MemoryManager>>,
     checkpoints: Option<CheckpointStore>,
@@ -119,6 +122,7 @@ impl GatewaySegments {
             max_rounds,
             max_retries,
             cancels: Mutex::new(BTreeMap::new()),
+            interjections: Mutex::new(BTreeMap::new()),
             cron: None,
             memories: None,
             checkpoints: None,
@@ -320,6 +324,26 @@ impl GatewaySegments {
         let token = CancelToken::new();
         cancels.insert(run.clone(), token.clone());
         token
+    }
+
+    /// 用户在 TUI 里插话了（受理成 `input` 这条 Run）：这个会话正在跑的那一段里，前台的长
+    /// `bash` 提前转后台，别让这句话等它跑完。会话里没有在跑的段时，举起的是上一段留下的
+    /// 旧信号，没人看；宿主刚好结束、这句话自己已经开跑时，那一段是它自己的，不举。
+    pub fn interjected(&self, session: &SessionId, input: &RunId) {
+        if let Some((run, signal)) = self.interjections.lock().expect("插话表").get(session)
+            && run != input
+        {
+            signal.raise();
+        }
+    }
+
+    fn interjection_for(&self, session: &SessionId, run: &RunId) -> InterjectSignal {
+        let signal = InterjectSignal::new();
+        self.interjections
+            .lock()
+            .expect("插话表")
+            .insert(session.clone(), (run.clone(), signal.clone()));
+        signal
     }
 
     /// 读完这个 Session 的日志。
@@ -727,6 +751,12 @@ impl SegmentSource for GatewaySegments {
             projection,
             call_timeout: self.call_timeout(),
             detach_after: conversation.then(|| self.detach_after()).flatten(),
+            // 只有对话会话登记：任务会话、Cron、子 Run 不转后台，也不该顶掉宿主那一份。
+            interjected: if conversation {
+                self.interjection_for(&session, &run)
+            } else {
+                InterjectSignal::new()
+            },
             conversation,
             principal: None,
             // 本 Run 是被谁派的（普通 Run 是 None）。runtime 用它硬拦"子代理再委派"。

@@ -175,8 +175,9 @@ MCP 的 `read_only` 仍由操作者声明，只决定中断后能否安全重做
 
 工具 `codemode`，参数 `{"code": "<Python 源码>"}`。脚本是模块级代码：
 
-每次调用都是独立脚本，`json`、`re`、`time` 等要在本段显式 import。Monty 1.1.0 没有
-`datetime.datetime.fromtimestamp` / `utcfromtimestamp`；Unix 秒的展示使用已在真实 worker
+每次调用都是独立脚本，`json`、`re`、`time` 等要在本段显式 import。Monty 1.1.0 的 `json` 只有
+`loads` / `dumps`（`json.load` 报 AttributeError，失败首部会提示改写 `json.loads(open(p).read())`）；
+也没有 `datetime.datetime.fromtimestamp` / `utcfromtimestamp`；Unix 秒的展示使用已在真实 worker
 验证的写法（支持小数与负时间戳，只展示到秒）：
 
 ```python
@@ -200,7 +201,7 @@ CallToolResult，业务结构可能在 `structuredContent`，或需显式解析 
 | `ToolError` | 工具调用失败时抛的异常；`RuntimeError` 的别名（见下） |
 | `print(...)` | 进输出末尾的 `<console>` 段 |
 | `TOOLS` | 这次脚本能调的工具名列表 |
-| `ALL_TOOLS` | 能调的工具 `[{name, description}]`，含没声明给模型的（MCP 默认如此，`docs/mcp.md` §3） |
+| `ALL_TOOLS` | 变量（不是函数）：能调的工具 `[{name, description}]`，含没声明给模型的（MCP 默认如此，`docs/mcp.md` §3） |
 | `search_tools(query, limit=8, namespace=None)` | 按相关度排的 `[{name, description}]`（BM25，照 pi） |
 | `describe_tool(name)` | `{name, description, parameters, namespace?}`，没有就是 `None` |
 | `describe_namespace(name)` | 一台 MCP 服务器的 `{name, description?, instructions?, tools}`；认 `mcp__dev_radius`、`mcp__dev-radius`、`dev-radius`、`dev_radius` |

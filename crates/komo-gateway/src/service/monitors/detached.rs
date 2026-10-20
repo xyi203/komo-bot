@@ -226,7 +226,7 @@ impl GatewayMonitors {
                     written: 0,
                     attempt,
                 };
-                drive(live, &mut sink, &cancel, None)
+                drive(live, &mut sink, &cancel, None, None)
                     .await
                     .map_err(|error| error.to_string())
             }

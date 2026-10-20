@@ -35,6 +35,8 @@ pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// 默认把输出完整写进已有的 `tool-output`；模型视图的 50 KiB / 2000 行限制在 kernel
 /// 投影里执行。测试和嵌入方仍可通过 `with_limits` 明确设置存储上限。
 pub const DEFAULT_OUTPUT_LIMIT: u64 = u64::MAX;
+/// 用户插话后，前台命令至少跑这么久才提前转后台：几秒就完的命令照常跑完。
+const INTERJECT_GRACE: Duration = Duration::from_secs(3);
 
 /// 交给子进程的**明确**环境变量。继承整个环境等于把 API key 交给任意脚本。
 const INHERITED: &[&str] = &["PATH", "HOME", "LANG", "LC_ALL", "TZ", "USER", "TMPDIR"];
@@ -368,16 +370,22 @@ impl Tool for BashTool {
                     .is_some_and(|slot| slot.get().is_some())
         });
         let started = std::time::Instant::now();
-        let driven = run_child_detachable(spec, sink, &ctx.cancel, detach_after)
-            .await
-            .map_err(|error| match error {
-                ProcessError::Spawn(message) => ToolError::Failed {
-                    message: format!("起不来：{message}"),
-                },
-                ProcessError::Io(message) | ProcessError::Sink(message) => {
-                    ToolError::Failed { message }
-                }
-            })?;
+        let driven = run_child_detachable(
+            spec,
+            sink,
+            &ctx.cancel,
+            detach_after,
+            Some((&ctx.interjected, INTERJECT_GRACE)),
+        )
+        .await
+        .map_err(|error| match error {
+            ProcessError::Spawn(message) => ToolError::Failed {
+                message: format!("起不来：{message}"),
+            },
+            ProcessError::Io(message) | ProcessError::Sink(message) => {
+                ToolError::Failed { message }
+            }
+        })?;
         let outcome = match driven {
             Driven::Done(outcome) => outcome,
             Driven::Detached(live) => {
@@ -398,7 +406,14 @@ impl Tool for BashTool {
                     .map_err(|message| ToolError::Failed {
                         message: format!("转后台没成功，命令已终止：{message}"),
                     })?;
-                let elapsed = started.elapsed().as_secs();
+                let elapsed = started.elapsed();
+                // 没到阈值就交出去的，只能是插话。
+                let why = if detach_after.is_some_and(|after| elapsed < after) {
+                    "用户插话了"
+                } else {
+                    "[execution] detach_after_secs"
+                };
+                let elapsed = elapsed.as_secs();
                 let stderr_tail = tail_lines(&stderr_excerpt, 20);
                 let stderr_part = if stderr_tail.is_empty() {
                     String::new()
@@ -406,7 +421,7 @@ impl Tool for BashTool {
                     format!("\n[stderr]\n{stderr_tail}")
                 };
                 let preview = format!(
-                    "已转后台 #{short}：命令跑了 {elapsed} 秒还没完（[execution] detach_after_secs），\
+                    "已转后台 #{short}：命令跑了 {elapsed} 秒还没完（{why}），\
                      仍在运行；结束时退出码和输出尾部会作为一条消息交回这个会话，要停用 \
                      monitor_stop #{short}。先回复用户、结束这一轮，别 sleep 等它，也别再发命令去查。\n\
                      到现在的输出（stdout={stdout_bytes}B stderr={stderr_bytes}B，只列末尾）：\n{}{stderr_part}",
@@ -862,7 +877,8 @@ mod tests {
             let attempt = call.attempt.clone();
             tokio::spawn(async move {
                 let mut sink = komo_kernel::test_support::MemOutputWriter::new(attempt);
-                if let Ok(Driven::Done(outcome)) = drive(call.live, &mut sink, &cancel, None).await
+                if let Ok(Driven::Done(outcome)) =
+                    drive(call.live, &mut sink, &cancel, None, None).await
                 {
                     let _ = tx.send(outcome);
                 }
@@ -924,6 +940,63 @@ mod tests {
         assert_eq!(outcome.exit_code, Some(5));
         assert!(outcome.stdout_excerpt.contains("before"));
         assert!(outcome.stdout_excerpt.contains("after"));
+    }
+
+    /// 用户插话：跑满宽限就转后台，不等阈值；回执说清是插话，信号被这一次用掉。
+    #[tokio::test]
+    async fn an_interjection_detaches_a_long_command_before_the_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path());
+        ctx.detach_after = Some(Duration::from_secs(60));
+        ctx.interjected.raise();
+        let (tool, done, _) = adopting();
+        let mut sink = writer(&ctx);
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "command": "echo before; sleep 8; echo after" }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= INTERJECT_GRACE, "宽限内不转：{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(6), "没等阈值：{elapsed:?}");
+        assert_eq!(output.result["detached"], "0199-abcd");
+        let preview = output.preview.unwrap();
+        assert!(preview.contains("用户插话了"), "{preview}");
+        assert!(!ctx.interjected.is_raised(), "一次插话只换一次转后台");
+
+        let outcome = done.await.expect("接手方跑完了它");
+        assert!(outcome.stdout_excerpt.contains("after"));
+    }
+
+    /// 宽限内跑完的命令照常收尾；没给阈值（不转后台的会话）插话也不转。信号都还留着。
+    #[tokio::test]
+    async fn an_interjection_leaves_short_commands_and_undetachable_calls_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut ctx = context(dir.path());
+        ctx.interjected.raise();
+        for detach_after in [Some(Duration::from_secs(60)), None] {
+            ctx.detach_after = detach_after;
+            let (tool, _done, _) = adopting();
+            let mut sink = writer(&ctx);
+            let command = if detach_after.is_some() {
+                "sleep 1; echo ok"
+            } else {
+                "sleep 4; echo ok"
+            };
+            let plan = tool
+                .prepare(serde_json::json!({ "command": command }), &ctx)
+                .await
+                .unwrap();
+            let output = tool.execute(plan, &ctx, &mut sink).await.unwrap();
+            assert_eq!(output.exit_code, Some(0), "{detach_after:?}");
+            assert!(output.result.get("detached").is_none(), "{detach_after:?}");
+            assert!(ctx.interjected.is_raised());
+        }
     }
 
     /// 超时从调用开始算：转后台之后到点，接手方那边看到的是超时、进程组被终止。

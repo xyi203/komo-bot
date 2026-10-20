@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use komo_kernel::traits::OutputWriter;
 use komo_kernel::types::ids::ExecutorId;
-use komo_kernel::types::tool::CancelToken;
+use komo_kernel::types::tool::{CancelToken, InterjectSignal};
 
 use crate::recovery::{ChildProcess, ChildRegistry};
 use tokio::io::AsyncReadExt;
@@ -129,7 +129,7 @@ pub async fn run_child(
     sink: &mut dyn OutputWriter,
     cancel: &CancelToken,
 ) -> Result<ChildOutcome, ProcessError> {
-    match run_child_detachable(spec, sink, cancel, None).await? {
+    match run_child_detachable(spec, sink, cancel, None, None).await? {
         Driven::Done(outcome) => Ok(outcome),
         Driven::Detached(_) => unreachable!("没有给 detach_after 就不会转后台"),
     }
@@ -181,11 +181,15 @@ pub enum Driven {
 }
 
 /// 与 [`run_child`] 一样，但 `detach_after` 到点进程还在跑就**不杀它**：连同管道交出去。
+///
+/// `interjected` = (插话信号, 宽限)：给了 `detach_after` 时，进程跑满宽限后一看到信号就提前
+/// 交出去，不等阈值。宽限让几秒就完的命令照常跑完，不为一句插话多一次转后台。
 pub async fn run_child_detachable(
     spec: ChildSpec,
     sink: &mut dyn OutputWriter,
     cancel: &CancelToken,
     detach_after: Option<Duration>,
+    interjected: Option<(&InterjectSignal, Duration)>,
 ) -> Result<Driven, ProcessError> {
     let mut command = Command::new(&spec.program);
     command
@@ -253,16 +257,30 @@ pub async fn run_child_detachable(
         output_limit: spec.output_limit,
         forget: Some(forget),
     };
-    drive(live, sink, cancel, detach_after.map(|after| now + after)).await
+    drive(
+        live,
+        sink,
+        cancel,
+        detach_after.map(|after| now + after),
+        interjected.map(|(signal, grace)| (signal, now + grace)),
+    )
+    .await
 }
 
-/// 接着收一个 [`LiveChild`] 的输出直到它收尾（或，给了 `detach_at` 时，到点交出去）。
+/// 多久看一眼插话信号。只在给了插话信号、而且命令安静没有输出时才靠它醒。
+const INTERJECT_POLL: Duration = Duration::from_millis(250);
+
+/// 接着收一个 [`LiveChild`] 的输出直到它收尾（或，给了 `detach_at` 时，到点交出去；再给了
+/// `interjected` = (信号, 最早时刻) 时，过了最早时刻、信号举着也交出去）。
 pub async fn drive(
     live: LiveChild,
     sink: &mut dyn OutputWriter,
     cancel: &CancelToken,
     detach_at: Option<tokio::time::Instant>,
+    interjected: Option<(&InterjectSignal, tokio::time::Instant)>,
 ) -> Result<Driven, ProcessError> {
+    // 能转后台才谈得上为插话转。
+    let interjected = interjected.filter(|_| detach_at.is_some());
     let LiveChild {
         mut child,
         pgid,
@@ -289,6 +307,14 @@ pub async fn drive(
         let out_open = stdout.is_some();
         let err_open = stderr.is_some();
         if !out_open && !err_open && exit_status.is_some() {
+            break;
+        }
+        // 用户插话了：不等阈值。`take` 让一次插话只换一次转后台。
+        if let Some((signal, not_before)) = interjected
+            && tokio::time::Instant::now() >= not_before
+            && signal.take()
+        {
+            detached = true;
             break;
         }
 
@@ -335,6 +361,8 @@ pub async fn drive(
                 exit_status = Some(status.map_err(|e| ProcessError::Io(e.to_string()))?);
                 // 管道还可能有残留，循环继续读到 EOF。
             }
+            // 没输出的命令也要醒过来看一眼插话信号（判断在循环顶上）。
+            () = tokio::time::sleep(INTERJECT_POLL), if interjected.is_some() => {}
         }
     }
 

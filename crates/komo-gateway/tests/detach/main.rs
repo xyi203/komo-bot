@@ -252,6 +252,62 @@ async fn a_long_command_detaches_and_its_end_comes_back_as_an_input() {
     gateway.stop().await;
 }
 
+/// 端到端：阈值远没到，用户在 TUI 里插话——前台命令跑满宽限就转后台，宿主不再等它跑完，
+/// 回执说清是插话；命令照样在后台跑完并交回。
+#[tokio::test]
+async fn an_interjection_moves_the_foreground_command_to_the_background() {
+    let home = Home::with_config(&config(60));
+    let llm = DetachLlm::new();
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+
+    // 一共 15 秒，拆成三段：对话会话拒绝字面量 ≥10 秒的单个 `sleep`（`detach::long_sleep`）。
+    let started = Instant::now();
+    let host = gateway
+        .submit(
+            &session,
+            "host",
+            "跑：echo before; for i in 1 2 3; do sleep 5; done; echo after",
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !home
+            .event_types(&session)
+            .iter()
+            .any(|kind| kind == "tool.started")
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "命令没开跑：{}",
+            std::fs::read_to_string(home.events_path(&session)).unwrap_or_default()
+        )
+    });
+    let (code, body) = gateway
+        .post(
+            &format!("/v1/sessions/{session}/runs"),
+            serde_json::json!({ "request_key": "aside", "text": "顺便说一句", "interject": true }),
+        )
+        .await;
+    assert_eq!(code, 200, "{body}");
+
+    let detail = gateway.wait_terminal(&host.run).await;
+    let took = started.elapsed();
+    assert_eq!(detail.summary.state, RunState::Completed, "{detail:?}");
+    assert!(took < Duration::from_secs(10), "没等 15 秒的命令：{took:?}");
+    let log = std::fs::read_to_string(home.events_path(&session)).unwrap();
+    assert!(log.contains("用户插话了"), "回执说清是插话");
+
+    wait_run_keyed(&gateway, &session, "bash-done:", Duration::from_secs(30)).await;
+    let ends = llm.handbacks();
+    assert_eq!(ends.len(), 1, "{ends:#?}");
+    assert!(ends[0].contains("退出码 0"), "{}", ends[0]);
+    gateway.stop().await;
+}
+
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {

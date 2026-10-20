@@ -324,6 +324,8 @@ fn preview_of(result: &ReadResult) -> String {
     } else {
         format!("{} 共 {} 行", result.path, result.total_lines)
     };
+    // 覆盖写要抄的就是这一串（`write` 的 `expected_version`）：不印出来模型就只能编。
+    let header = format!("{header} · 版本 {}", result.version.shown());
     let room = PREVIEW_BYTES.saturating_sub(header.len() + 1);
     format!("{header}\n{}", clip(&result.text, room))
 }

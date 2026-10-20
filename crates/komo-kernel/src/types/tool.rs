@@ -135,6 +135,35 @@ impl CancelToken {
     }
 }
 
+/// 用户插话了：前台还在跑的长命令别再挡着他（`docs/monitor.md` §8）。
+///
+/// Gateway 在受理 TUI 插话时举起它，`bash` 看到就把前台命令提前转后台。一次插话只换一次
+/// 转后台（[`Self::take`]）——插话没能并进宿主时，旗子也不会让这一段里后面的每条命令都转。
+/// 每一段装配时换一个新的，所以并进去以后自然落下。
+#[derive(Debug, Clone, Default)]
+pub struct InterjectSignal {
+    flag: Arc<AtomicBool>,
+}
+
+impl InterjectSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn raise(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_raised(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// 举着就放下并返回 `true`。
+    pub fn take(&self) -> bool {
+        self.flag.swap(false, Ordering::SeqCst)
+    }
+}
+
 /// 工具执行的上下文。**由 Gateway 创建，不能由模型参数提升**（§4）。
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -160,6 +189,8 @@ pub struct ToolContext {
     /// 跑过这么久还没完就把这次调用转到后台（`[execution] detach_after_secs`）。`None` =
     /// 不转：任务会话、Cron 的 Run、子 Run、codemode 里的内层调用，或配置为 0。
     pub detach_after: Option<std::time::Duration>,
+    /// 用户插话了：给了 `detach_after` 的 `bash` 不等阈值，提前转后台。
+    pub interjected: InterjectSignal,
     /// 这是对话会话里直接受理的 Run（不是任务会话、Cron、子 Run）。`bash` 在这里拒绝
     /// 10 秒以上的 `sleep`——等状态是 `monitor` 的事。
     pub conversation: bool,
@@ -228,6 +259,18 @@ mod tests {
     }
 
     #[test]
+    fn an_interjection_is_taken_once() {
+        let signal = InterjectSignal::new();
+        let clone = signal.clone();
+        assert!(!clone.take());
+        signal.raise();
+        assert!(clone.is_raised());
+        assert!(clone.take());
+        assert!(!signal.is_raised());
+        assert!(!signal.take());
+    }
+
+    #[test]
     fn the_longest_matching_root_wins() {
         let ctx = ToolContext {
             session: SessionId::from_raw("s"),
@@ -240,6 +283,7 @@ mod tests {
             cwd: PathBuf::from("/home/u/ws"),
             call_timeout: std::time::Duration::from_secs(60),
             detach_after: None,
+            interjected: InterjectSignal::new(),
             conversation: false,
             mounts: ResourceMounts::default(),
             roots: vec![

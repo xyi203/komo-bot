@@ -54,7 +54,19 @@ pub struct FileVersion {
     pub size: u64,
 }
 
+/// 交给模型看的版本串有几位（`read` / `write` 的抬头）。完整哈希 64 位，每次读都印一遍
+/// 太占地方；核对时前缀够长就认（[`ExpectedVersion::matches`]）。
+pub const SHOWN_VERSION_CHARS: usize = 12;
+/// 前缀至少这么长才当版本认，再短就像是随手编的。
+const MIN_VERSION_PREFIX: usize = 8;
+
 impl FileVersion {
+    /// 抬头里给模型看的那一截。
+    pub fn shown(&self) -> &str {
+        let hash = self.hash.as_str();
+        &hash[..hash.len().min(SHOWN_VERSION_CHARS)]
+    }
+
     pub fn of(bytes: &[u8], metadata: Option<&std::fs::Metadata>) -> Self {
         Self {
             hash: ContentHash::of_bytes(bytes),
@@ -78,6 +90,9 @@ fn modified_ms(metadata: &std::fs::Metadata) -> Option<i64> {
 ///
 /// 两种写法都收：`read` 原样返回的那个对象，和只有哈希的那个串。让模型把读到的东西
 /// 原样传回来是最不容易出错的那条路，而手写一个哈希串也应该能用。
+///
+/// 模型看得到的只有抬头里那一截（[`SHOWN_VERSION_CHARS`] 位）：2026-10-20 之前 `read`
+/// 不印版本，覆盖写只能传 `{}` 或编一个串，64 次 `write` 里 4 次因此失败。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ExpectedVersion {
@@ -91,6 +106,16 @@ impl ExpectedVersion {
             ExpectedVersion::Hash(raw) => ContentHash::from_raw(raw.clone()),
             ExpectedVersion::Full(version) => version.hash.clone(),
         }
+    }
+
+    /// 与磁盘上的版本对得上：完整哈希相等，或者是它一段够长的十六进制前缀。
+    pub fn matches(&self, actual: &ContentHash) -> bool {
+        let expected = self.hash();
+        let expected = expected.as_str().trim();
+        expected == actual.as_str()
+            || (expected.len() >= MIN_VERSION_PREFIX
+                && expected.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && actual.as_str().starts_with(&expected.to_ascii_lowercase()))
     }
 }
 
@@ -198,6 +223,7 @@ pub(crate) mod test_support {
                 komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS,
             ),
             detach_after: None,
+            interjected: Default::default(),
             conversation: false,
         }
     }
@@ -235,6 +261,28 @@ mod tests {
         let full: ExpectedVersion =
             serde_json::from_str(r#"{"hash":"abc","size":5,"modified_ms":1}"#).unwrap();
         assert_eq!(full.hash().as_str(), "abc");
+    }
+
+    #[test]
+    fn a_long_enough_hex_prefix_matches_the_version() {
+        let actual = FileVersion::of(b"hello", None);
+        let full = actual.hash.as_str().to_string();
+        for expected in [
+            full.clone(),
+            actual.shown().to_string(),
+            full[..8].to_uppercase(),
+        ] {
+            assert!(
+                ExpectedVersion::Hash(expected.clone()).matches(&actual.hash),
+                "{expected}"
+            );
+        }
+        for expected in [full[..7].to_string(), "zzzzzzzzzzzz".into(), "".into()] {
+            assert!(
+                !ExpectedVersion::Hash(expected.clone()).matches(&actual.hash),
+                "{expected}"
+            );
+        }
     }
 
     #[test]

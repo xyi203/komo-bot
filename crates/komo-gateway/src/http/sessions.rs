@@ -141,6 +141,10 @@ pub async fn submit(
                 model,
             )
             .await?;
+        // 宿主前台还跑着长命令时，这句话不该等它跑完（`docs/monitor.md` §8）。
+        if !response.deduplicated {
+            api.state.segments.interjected(&session, &response.run);
+        }
         return Ok(Json(response));
     }
     // 幂等由账本自己答（§8.5）：同一请求键返回原 Run，内容不同则 409。

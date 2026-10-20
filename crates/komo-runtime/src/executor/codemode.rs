@@ -692,6 +692,17 @@ fn diagnostic(reason: &str) -> Option<String> {
     }) {
         return Some("当前 Monty 未实现这个时间 API。Unix 秒转 UTC：import time；time.strftime(\"%Y-%m-%d %H:%M:%S\", time.gmtime(float(ts)))；固定 UTC+8 在 gmtime 入参加 8*3600（不处理地区夏令时）。".into());
     }
+    // 2026-10-20 复盘 session 实测：`json.load(open(p))`。
+    if ["load", "dump"].iter().any(|method| {
+        reason.starts_with(&format!(
+            "AttributeError: module 'json' has no attribute '{method}'"
+        ))
+    }) {
+        return Some(
+            "当前 Monty 的 json 只有 loads / dumps：读文件写 json.loads(open(p).read())；写文件用 write 工具。"
+                .into(),
+        );
+    }
     for module in [
         "json",
         "re",
@@ -810,9 +821,17 @@ mod tests {
             "AttributeError: type object 'Widget' has no attribute 'fromtimestamp'",
             "NameError: name 'json_data' is not defined",
             "KeyError: json",
+            "AttributeError: module 'json' has no attribute 'loader'",
         ] {
             assert!(super::diagnostic(error).is_none(), "{error}");
         }
+    }
+
+    #[test]
+    fn json_load_points_at_loads_of_the_file_text() {
+        let hint = super::diagnostic("AttributeError: module 'json' has no attribute 'load'")
+            .expect("复现过的异常");
+        assert!(hint.contains("json.loads(open(p).read())"), "{hint}");
     }
 
     #[tokio::test]

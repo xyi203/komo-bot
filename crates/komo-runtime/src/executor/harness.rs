@@ -209,6 +209,7 @@ impl Harness {
             cancel: CancelToken::new(),
             call_timeout: env.call_timeout,
             detach_after: None,
+            interjected: env.interjected,
             conversation: false,
         }
     }
@@ -243,6 +244,7 @@ impl Harness {
                 komo_kernel::protocol::config::DEFAULT_CALL_TIMEOUT_SECS,
             ),
             detach_after: None,
+            interjected: Default::default(),
             conversation: false,
             principal: None,
             cancel,

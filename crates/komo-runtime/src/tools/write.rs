@@ -73,7 +73,7 @@ impl Tool for WriteTool {
                     "path": { "type": "string", "description": "文件路径；相对路径按工作目录解析" },
                     "content": { "type": "string", "description": "写入后文件的完整内容" },
                     "expected_version": {
-                        "description": "read 返回的 version（或它的 hash）。覆盖已有文件时必填",
+                        "description": "read 抬头里「版本」后面那一串（write 回执里也有）。覆盖已有文件时必填",
                         "anyOf": [{ "type": "string" }, { "type": "object" }]
                     },
                     "then_run": super::fusion::schema("写入")
@@ -89,7 +89,7 @@ impl Tool for WriteTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
-        let mut args: WriteArgs = parse_args(args, "write")?;
+        let mut args: WriteArgs = parse_args(loose_version(args)?, "write")?;
         // 空串不是一个版本，是没给：按没给走，覆盖已有文件时报的是「先 read 一次」，
         // 而不是一句「预期 ，当前 …」的版本冲突。
         if matches!(&args.expected_version, Some(ExpectedVersion::Hash(raw)) if raw.trim().is_empty())
@@ -159,16 +159,51 @@ impl Tool for WriteTool {
             exit_code: None,
             artifacts: vec![],
             preview: Some(format!(
-                "{} {}，{} 字节",
+                "{} {}，{} 字节 · 版本 {}",
                 result.path,
                 if result.created {
                     "已创建"
                 } else {
                     "已覆盖"
                 },
-                result.bytes
+                result.bytes,
+                result.version.shown()
             )),
         })
+    }
+}
+
+/// 模型手里没有版本时会传 `{}`、`null`，或只抄一个 `{"hash": …}`：前两种按没给走（覆盖时
+/// 报「先 read」），后一种取出哈希。别的形状说清该传什么，而不是一句 untagged enum 解不开。
+fn loose_version(mut args: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+    let Some(object) = args.as_object_mut() else {
+        return Ok(args);
+    };
+    let replacement = match object.get("expected_version") {
+        None | Some(serde_json::Value::String(_)) => return Ok(args),
+        Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(map)) if map.is_empty() => None,
+        Some(serde_json::Value::Object(map)) => match map.get("hash") {
+            Some(serde_json::Value::String(hash)) if map.get("size").is_none() => {
+                Some(serde_json::Value::String(hash.clone()))
+            }
+            Some(serde_json::Value::String(_)) => return Ok(args),
+            _ => return Err(bad_version()),
+        },
+        Some(_) => return Err(bad_version()),
+    };
+    match replacement {
+        Some(hash) => object.insert("expected_version".into(), hash),
+        None => object.remove("expected_version"),
+    };
+    Ok(args)
+}
+
+fn bad_version() -> ToolError {
+    ToolError::InvalidArguments {
+        message: "write 的 expected_version 应是一个版本串：read 抬头里「版本」后面那一串（或上次 \
+                  write 回执里的），不知道就先 read 这个文件"
+            .into(),
     }
 }
 
@@ -192,11 +227,11 @@ pub fn check_version(
         (None, _) => Ok(()),
         (Some(_), None) => Err(ToolError::VersionConflict {
             path: format!(
-                "{} 已存在；覆盖它必须给出 expected_version（先 read 一次）",
+                "{} 已存在；覆盖它必须给出 expected_version（先 read 一次，抄抬头里「版本」后面那一串）",
                 path.display()
             ),
         }),
-        (Some(actual), Some(expected)) if actual.hash == expected.hash() => Ok(()),
+        (Some(actual), Some(expected)) if expected.matches(&actual.hash) => Ok(()),
         (Some(actual), Some(expected)) => Err(ToolError::VersionConflict {
             path: format!(
                 "{}：预期 {}，实际 {}",
@@ -315,10 +350,12 @@ mod tests {
         std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
         let ctx = context(dir.path());
         let tool = WriteTool::new();
-        // 空串与没给是同一回事：都要叫模型先 read。
+        // 空串、`{}`、`null` 与没给是同一回事：都要叫模型先 read。
         for args in [
             serde_json::json!({ "path": "a.txt", "content": "new\n" }),
             serde_json::json!({ "path": "a.txt", "content": "new\n", "expected_version": "" }),
+            serde_json::json!({ "path": "a.txt", "content": "new\n", "expected_version": {} }),
+            serde_json::json!({ "path": "a.txt", "content": "new\n", "expected_version": null }),
         ] {
             let plan = tool.prepare(args, &ctx).await.unwrap();
             let error = tool
@@ -391,6 +428,66 @@ mod tests {
             std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
             "new\n"
         );
+    }
+
+    /// 抬头里印的那一截（或 `{"hash": …}`）就能覆盖；回执再印新版本，接着写不用再读。
+    /// 认不出的形状说清该传什么。
+    #[tokio::test]
+    async fn the_shown_version_is_enough_to_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "old\n").unwrap();
+        let ctx = context(dir.path());
+        let tool = WriteTool::new();
+        let shown = FileVersion::of(b"old\n", None).shown().to_string();
+        let plan = tool
+            .prepare(
+                serde_json::json!({ "path": "a.txt", "content": "new\n", "expected_version": shown }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
+        let next = FileVersion::of(b"new\n", None).shown().to_string();
+        assert!(
+            output
+                .preview
+                .as_deref()
+                .unwrap()
+                .ends_with(&format!("版本 {next}")),
+            "{:?}",
+            output.preview
+        );
+
+        let plan = tool
+            .prepare(
+                serde_json::json!({
+                    "path": "a.txt",
+                    "content": "newer\n",
+                    "expected_version": { "hash": next }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "newer\n"
+        );
+
+        for bad in [serde_json::json!(42), serde_json::json!({ "size": 3 })] {
+            let error = tool
+                .prepare(
+                    serde_json::json!({ "path": "a.txt", "content": "x", "expected_version": bad }),
+                    &ctx,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, ToolError::InvalidArguments { message } if message.contains("版本")),
+                "{error:?}"
+            );
+        }
     }
 
     /// 数据目录与工作区同在一个临时目录下：`home/` 是 komo 的数据目录，`ws/` 是工作区。

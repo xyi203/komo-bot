@@ -608,8 +608,9 @@ async fn build_tools(
     #[cfg(any(test, feature = "test-support"))]
     tools.extend(test_support::test_tools(config.home()));
 
-    // 脚本里的文件是只读的，但 komo 自己的状态连读也不行：与 write / edit 同一份名单。
-    let codemode = codemode_worker().map(|worker| worker.protecting(protected));
+    // 脚本里的文件是只读的；komo 自己的状态除会话日志外连读也不行（`sessions/` 与 `read` 一样可读）。
+    let unreadable = state::codemode_unreadable_paths(&snapshot, config.home());
+    let codemode = codemode_worker().map(|worker| worker.protecting(unreadable));
     if codemode.is_some() {
         tools.push(Arc::new(komo_runtime::tools::CodemodeTool::new()));
     }

@@ -74,9 +74,10 @@ Monty 是 Rust 写的 Python 子集解释器，语言本身没有文件、网络
   `exists` / `stat` 都能用，相对路径按这次调用的 cwd；`os.getcwd()` 就是它）。每个 OsCall 先在 worker 里拦，
   再交给挂载：
   - 路径先规范化（`..`、符号链接都解掉，与 `write` / `edit` 同一个 `real_path`），落在 komo 自己的状态里就
-    `PermissionError`——`<数据目录>/sessions/`、`state.db*`、`runtime/`、`.env`，**读也不行**。名单就是
-    `write` / `edit` 用的那一份（`tools/protect.rs` 的 `Protected`；Gateway 装配时交给 `Worker::protecting`，
-    随请求发进 worker），只有一处定义。符号链接指到状态里也认得出（比对的是真实路径）；硬链接认不出。
+    `PermissionError`——`state.db*`、`runtime/`、`.env`，**读也不行**。名单是 `write` / `edit` 那一份去掉
+    `<数据目录>/sessions/`（`state::codemode_unreadable_paths`，2026-10-20 起）：会话日志 `read` 与 bash 本来就
+    读得到，脚本里再拦只会逼复盘一类的活儿绕去 bash。比对用同一个 `tools/protect.rs` 的 `Protected`（Gateway
+    装配时交给 `Worker::protecting`，随请求发进 worker）。符号链接指到状态里也认得出（比对的是真实路径）；硬链接认不出。
   - 写类一律拒：`write_text` / `write_bytes` / append / `mkdir` / `unlink` / `rmdir` / `rename` / `open` 的
     `w` `a` `x` 模式，`PermissionError`，消息指路"用 write / edit 工具"。挂载本身也是只读的，是第二道。
   - 读到的是读的那一刻的磁盘，**不进 journal**；恢复时重读，内容变了会在后面的调用参数上露出（§7）。

@@ -1656,6 +1656,20 @@ pub fn protected_paths(snapshot: &ConfigSnapshot, home: &std::path::Path) -> Vec
     ]
 }
 
+/// codemode 脚本**连读也不行**的路径：[`protected_paths`] 去掉 `sessions/`。
+///
+/// 脚本里的写一律拒，这份名单只管读。会话日志 `read` 与 bash 本来就读得到，脚本里再拦
+/// 只会逼着复盘一类的活儿绕去 bash；数据库、`runtime/` 与 `.env` 仍然拦。
+pub fn codemode_unreadable_paths(
+    snapshot: &ConfigSnapshot,
+    home: &std::path::Path,
+) -> Vec<PathBuf> {
+    protected_paths(snapshot, home)
+        .into_iter()
+        .filter(|path| *path != snapshot.paths.sessions_dir)
+        .collect()
+}
+
 /// `sessions.origin` 里**主会话**的那个值。
 ///
 /// 它是"这条会话从哪个入口来"，不是身份：身份是 `agent_id`（§4.2）。一个 Agent 的主会话

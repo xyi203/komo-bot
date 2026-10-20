@@ -25,6 +25,5 @@ build/
 .turbo/
 .env.local
 
-# 本机会话复盘与运行目录，不提交生成内容
-session-reviews/
+# 本机运行目录，不提交生成内容
 /.komo/

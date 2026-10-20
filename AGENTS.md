@@ -85,7 +85,8 @@ depends on `agent`; `client` knows only protocol types.
   state (`sessions/`, `state.db*`, `runtime/`, `.env` under the data dir).
   bash cannot be stopped; real boundaries come only from an execution
   environment (codemode's Monty engine: no network or subprocesses, files
-  read-only with the same protected list denied even for reads; it runs in a
+  read-only with the same protected list denied even for reads, except
+  `sessions/`, which `read` and bash can read anyway; it runs in a
   `komo __codemode-worker` child the host can kill).
 - **Recovery decides "did it happen" before "retry"** (§8.4 table, §8.6).
   `started` alone proves nothing. A started call without a result reruns only

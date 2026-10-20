@@ -55,16 +55,29 @@ impl Tool for CodemodeTool {
                           更省。\n\
                           例子（读两个文件，只留函数签名）：\n\
                           for p in [\"src/a.rs\", \"src/b.rs\"]:\n\
-                          \x20   lines = tools.read(path=p)[\"text\"].splitlines()\n\
-                          \x20   text([l for l in lines if \"fn \" in l])\n\
+                          \x20   r = tools.read(path=p)\n\
+                          \x20   if r[\"status\"] == \"completed\":\n\
+                          \x20       text([l for l in r[\"text\"].splitlines() if \"fn \" in l])\n\
+                          \x20   else:\n\
+                          \x20       text({\"path\": p, \"status\": r[\"status\"], \"error\": r[\"text\"]})\n\
                           脚本跑在 Monty（一个受限的 Python 子集解释器）里：用来汇总和过滤工具\
                           结果。文件可以只读（open() / pathlib）；不能写文件、不能联网、不能起子进程、\
-                          读不到环境变量，只有 json、re、math、datetime、collections、itertools \
+                          读不到环境变量，只有 json、re、math、time、datetime、collections、itertools \
                           等少数标准库，没有第三方库。要写文件用 write / edit，要完整的 Python \
-                          （第三方库、写文件、联网）用 bash 跑 python3。\n\
+                          （第三方库、写文件、联网）用 bash 跑 python3。每次调用都是独立脚本，\
+                          json、re、time 等必须在本段显式 import。datetime.fromtimestamp / \
+                          utcfromtimestamp 未实现；Unix 秒转 UTC 用：\n\
+                          import time\n\
+                          ts = 1729324800.25\n\
+                          text(time.strftime(\"%Y-%m-%d %H:%M:%S\", time.gmtime(float(ts))))\n\
+                          固定 UTC+8 在 gmtime 入参加 8*3600；只展示到秒，不处理地区夏令时。\n\
                           - tools.<name>(**args)：调工具，返回 {\"status\", \"text\", \"result\"}；\
                           text 是工具的正文输出（read 是文件内容，rg 是匹配行），result 是结构化\
-                          结果。工具名里的 - 写成 _，写错名字得到 AttributeError，能调的名字见 TOOLS。\
+                          结果。先检查 status；failed 也可能正常返回字典，并不自动抛 ToolError。\
+                          MCP 的 result 是原生 CallToolResult，业务数据可能在 structuredContent，\
+                          或需 import json 后解析 content 中的 text；不要猜外层有 data。路径先用 \
+                          rg / list_files 定位，独立项可逐项捕获 ToolError 并保留成功项。\
+                          工具名里的 - 写成 _，写错名字得到 AttributeError，能调的名字见 TOOLS。\
                           能调 read、rg 与 MCP 工具（MCP 含写操作）；\
                           bash、edit、write 与编排工具（task、monitor 等）\
                           只能在脚本外直接调，脚本里写了 tools.bash(...) 会在运行前被拒。\

@@ -1,6 +1,9 @@
 #[path = "regression_tests.rs"]
 mod regression_tests;
 
+#[path = "feedback_tests.rs"]
+mod feedback_tests;
+
 use std::sync::{Arc, Mutex};
 
 use komo_kernel::events::EventPayload;

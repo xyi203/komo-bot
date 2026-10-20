@@ -62,6 +62,27 @@ async fn a_failed_sub_call_is_a_tool_error_the_script_can_catch() {
 }
 
 #[tokio::test]
+async fn timestamp_formatting_uses_explicit_imports_and_handles_utc_offsets_and_fractions() {
+    let code = r#"
+import time
+text([time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(ts) + offset))
+      for ts, offset in [(0, 0), (1729324800.25, 0), (1729324800.25, 8*3600), (-1, 0), (-0.25, 0)]])
+"#;
+    let outcome = run(&Worker::exe(exe()), code, Duration::from_secs(30)).await;
+    assert_eq!(outcome.error, None);
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&outcome.outputs[0]).unwrap(),
+        [
+            "1970-01-01 00:00:00",
+            "2024-10-19 08:00:00",
+            "2024-10-19 16:00:00",
+            "1969-12-31 23:59:59",
+            "1969-12-31 23:59:59",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn the_worker_process_reads_files_but_cannot_write_them_and_has_no_environment() {
     let dir = tempfile::tempdir().unwrap();
     let probe = dir.path().join("probe");

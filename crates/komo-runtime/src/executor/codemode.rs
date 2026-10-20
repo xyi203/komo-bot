@@ -15,6 +15,7 @@ use komo_kernel::traits::{OutputWriter, StoreError};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::plan::{Operation, Replay};
 use komo_kernel::types::refs::{AttemptRef, ToolResultStatus};
+use komo_kernel::types::resource::{OutputFile, ResourceUri};
 use komo_kernel::types::tool::{ToolContext, ToolError, ToolOutput};
 use serde::Serialize;
 
@@ -25,13 +26,22 @@ use crate::tools::codemode::NOT_IN_SCRIPTS;
 
 /// 摘要里每次调用的参数最多留这么长。
 const ARGS_PREVIEW: usize = 512;
+/// 正文只列少量子调用；完整清单保存在 result.calls，由统一投影给出完整结果入口。
+const SUMMARY_CALLS: usize = 8;
 
 /// 一次内层调用的摘要（外层 `output.json` 的 `result.calls`）。
 #[derive(Debug, Clone, Serialize)]
 struct NestedCall {
+    id: String,
     tool: String,
     args: String,
+    /// 宿主是否正常返回；不等同于工具结果的 status，保留旧字段含义。
     ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<ToolResultStatus>,
+    /// 已发布子输出的可读入口，来自 journal 里的原尝试（恢复时不换成当前 attempt）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
     elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -143,10 +153,36 @@ impl ToolExecutor {
                     let started = Instant::now();
                     let preview = truncate(&args.to_string(), ARGS_PREVIEW);
                     let result = self.nested_call(&name, args, env, ctx, &journal).await;
+                    let status = result
+                        .as_ref()
+                        .ok()
+                        .and_then(|value| value.get("status"))
+                        .and_then(|value| serde_json::from_value(value.clone()).ok());
+                    let (index, output) = {
+                        let journal = journal.lock().expect("journal");
+                        let output = journal
+                            .children
+                            .get(&journal.cursor)
+                            .filter(|child| child.delivered.is_some())
+                            .and_then(|child| child.attempt.as_ref())
+                            .map(|attempt| {
+                                ResourceUri::Output {
+                                    run: attempt.run.clone(),
+                                    call: attempt.call.clone(),
+                                    attempt: attempt.attempt.clone(),
+                                    file: OutputFile::Result,
+                                }
+                                .to_string()
+                            });
+                        (journal.cursor, output)
+                    };
                     calls.lock().expect("调用摘要").push(NestedCall {
+                        id: format!("c{index}"),
                         tool: name,
                         args: preview,
                         ok: result.is_ok(),
+                        status,
+                        output,
                         elapsed_ms: started.elapsed().as_millis() as u64,
                         error: result.as_ref().err().cloned(),
                     });
@@ -182,14 +218,23 @@ impl ToolExecutor {
         }
         let calls = std::mem::take(&mut *calls.lock().expect("调用摘要"));
 
-        let mut text = join_outputs(&outcome.outputs);
+        // 非 bash 结果的模型视图保留头部：失败原因与已交付调用必须先于大段脚本输出。
+        let child_failed = calls
+            .iter()
+            .any(|call| !call.ok || call.status == Some(ToolResultStatus::Failed));
+        let mut text = match &outcome.error {
+            Some(error) => failure_prefix(error, &calls),
+            None if child_failed => format!("（{}；脚本已正常结束）\n", summary(&calls)),
+            None => String::new(),
+        };
+        text.push_str(&join_outputs(&outcome.outputs));
         if !outcome.console.is_empty() {
             text.push_str(&format!("\n<console>\n{}</console>", outcome.console));
         }
         if let Some(error) = &outcome.error {
-            text.push_str(&format!("\n脚本出错：{error}"));
+            text.push_str(&format!("\n<traceback>\n{error}\n</traceback>"));
         }
-        if !calls.is_empty() {
+        if outcome.error.is_none() && !child_failed && !calls.is_empty() {
             text.push_str(&format!("\n（{}）", summary(&calls)));
         }
         let text = text.trim_start();
@@ -567,16 +612,102 @@ fn summary(calls: &[NestedCall]) -> String {
             None => counts.push((&call.tool, 1)),
         }
     }
-    let failed = calls.iter().filter(|call| !call.ok).count();
+    let failed = calls
+        .iter()
+        .filter(|call| !call.ok || call.status == Some(ToolResultStatus::Failed))
+        .count();
+    let unknown = calls
+        .iter()
+        .filter(|call| call.status == Some(ToolResultStatus::Uncertain))
+        .count();
     let listed = counts
         .iter()
+        .take(SUMMARY_CALLS)
         .map(|(tool, count)| format!("{tool}×{count}"))
         .collect::<Vec<_>>()
         .join("、");
-    match failed {
+    let mut text = match failed {
         0 => format!("调用了 {} 次工具：{listed}", calls.len()),
         n => format!("调用了 {} 次工具：{listed}；{n} 次失败", calls.len()),
+    };
+    if unknown > 0 {
+        text.push_str(&format!("；{unknown} 次结果不明"));
     }
+    if counts.len() > SUMMARY_CALLS {
+        text.push_str(&format!(
+            "；另 {} 种工具，完整清单见 result.calls",
+            counts.len() - SUMMARY_CALLS
+        ));
+    }
+    text
+}
+
+fn failure_prefix(error: &str, calls: &[NestedCall]) -> String {
+    let reason = error
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or(error);
+    let mut text = format!("脚本出错：{}\n", truncate(reason, 1024));
+    if let Some(hint) = diagnostic(reason) {
+        text.push_str(&format!("修复提示：{hint}\n"));
+    }
+    if !calls.is_empty() {
+        text.push_str(&format!("（{}）\n", summary(calls)));
+        if calls.iter().any(|call| call.output.is_some()) {
+            text.push_str(
+                "已执行的子调用不会因脚本报错回滚；先核对原始输出，再继续剩余步骤，勿整段重做。\n",
+            );
+        }
+        for call in calls.iter().take(SUMMARY_CALLS) {
+            let status = match call.status {
+                Some(ToolResultStatus::Completed) => "completed",
+                Some(ToolResultStatus::Failed) => "failed",
+                Some(ToolResultStatus::Uncertain) => "uncertain",
+                None => "未返回工具结果",
+            };
+            text.push_str(&format!("- {} {}：{status}", call.id, call.tool));
+            if let Some(output) = &call.output {
+                text.push_str(&format!("；原始输出：{output}"));
+            }
+            text.push('\n');
+        }
+        if calls.len() > SUMMARY_CALLS {
+            text.push_str(&format!(
+                "另 {} 次子调用未展开，完整清单与引用见本次完整输出的 result.calls。\n",
+                calls.len() - SUMMARY_CALLS
+            ));
+        }
+    }
+    text
+}
+
+/// 只匹配已经复现的异常，不根据脚本文字猜错因，也不重写或重跑代码。
+fn diagnostic(reason: &str) -> Option<String> {
+    if ["fromtimestamp", "utcfromtimestamp"].iter().any(|method| {
+        reason
+            == format!(
+                "AttributeError: type object 'datetime.datetime' has no attribute '{method}'"
+            )
+    }) {
+        return Some("当前 Monty 未实现这个时间 API。Unix 秒转 UTC：import time；time.strftime(\"%Y-%m-%d %H:%M:%S\", time.gmtime(float(ts)))；固定 UTC+8 在 gmtime 入参加 8*3600（不处理地区夏令时）。".into());
+    }
+    for module in [
+        "json",
+        "re",
+        "time",
+        "datetime",
+        "math",
+        "collections",
+        "itertools",
+    ] {
+        if reason.starts_with(&format!("NameError: name '{module}' is not defined")) {
+            return Some(format!(
+                "每次调用都是独立脚本，请在本段先 import {module}。"
+            ));
+        }
+    }
+    None
 }
 
 /// 多段 `text()` 拼起来：两段以上时每段前加 `==> text N/M <==`（学 pi 1.1.0）——直接用换行
@@ -672,6 +803,17 @@ impl OutputWriter for Capture {
 #[cfg(test)]
 mod tests {
     use super::join_outputs;
+
+    #[test]
+    fn diagnostics_do_not_guess_from_unrelated_names_or_attributes() {
+        for error in [
+            "AttributeError: type object 'Widget' has no attribute 'fromtimestamp'",
+            "NameError: name 'json_data' is not defined",
+            "KeyError: json",
+        ] {
+            assert!(super::diagnostic(error).is_none(), "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn nested_output_above_one_mib_is_not_lost_before_projection() {

@@ -174,6 +174,24 @@ MCP 的 `read_only` 仍由操作者声明，只决定中断后能否安全重做
 
 工具 `codemode`，参数 `{"code": "<Python 源码>"}`。脚本是模块级代码：
 
+每次调用都是独立脚本，`json`、`re`、`time` 等要在本段显式 import。Monty 1.1.0 没有
+`datetime.datetime.fromtimestamp` / `utcfromtimestamp`；Unix 秒的展示使用已在真实 worker
+验证的写法（支持小数与负时间戳，只展示到秒）：
+
+```python
+import time
+ts = 1729324800.25
+text(time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(float(ts))))
+```
+
+固定 UTC+8 在 `gmtime` 入参加 `8 * 3600`，不处理地区夏令时。这里仅补工具契约与精确的
+错误提示，不自动导入、不改前置代码、Monty 版本或恢复指纹。
+
+子工具的外层固定为 `{status, text, result}`：先检查 `status`，`failed` 可以正常返回字典，
+不自动抛 `ToolError`；脚本可自行处理后继续。`read` 的正文是 `text`，MCP 的 `result` 是原生
+CallToolResult，业务结构可能在 `structuredContent`，或需显式解析 `content` 中的 text，不能
+统一假设外层有 `data`。路径先用 `rg` / `list_files` 定位；独立项可以逐项捕获 `ToolError`，保留成功项。
+
 | 名字 | 作用 |
 |---|---|
 | `tools.<name>(**args)` | 调工具，见 §5。名字里的 `-` 写成 `_`（`tools.mcp__dev_radius__search`）|
@@ -205,8 +223,21 @@ BM25 在 Monty 里做完（原来 `driver.py` 的那份，逻辑未动），不�
 已按工具名与参数核对）。分词与停用词同 pi；pi 只认 a-z0-9，这里另把中日韩字切成单字与相邻两字，中文说明
 才搜得到。名字一律是脚本里的写法（`-` 换成 `_`）。
 
-结果正文：`text()` 各段按顺序，`<console>` 段随后，失败时附 `脚本出错：` 与 traceback（Monty 的回溯格式，
-行号是脚本自己的行），最后一行是调用摘要（`调用了 3 次工具：read×2、rg×1`）。超长照常由投影截头尾。
+结果正文：正常时 `text()` 各段按顺序，`<console>` 段随后，最后是调用摘要
+（`调用了 3 次工具：read×2、rg×1`）。子调用失败但脚本处理后正常结束时，失败计数放到正文首部，
+外层状态仍为 completed。脚本异常时先给异常原因、精确修复提示、调用摘要，再接脚本输出、console
+和完整 traceback（Monty 的回溯格式，行号是脚本自己的行）。非 bash 结果的模型投影保留头部，
+因此大段输出不会先把失败原因挤掉；没有另开一条模型投影路径。
+
+失败首部最多列 8 个子调用的 `c1..c256`、工具名、状态与原始输出的 `artifact://…/result` 入口，
+提醒已执行的子调用不会因脚本报错回滚，核对后继续剩余步骤。超过时说明省略数量，完整清单仍在
+外层 `output.json` 的 `result.calls`，统一投影在截断时给出完整输出入口。它不能阻止模型另起一次新写调用。
+
+`result.calls` 新增 `id`、可选 `status` 与可选 `output`（已发布子输出入口）；`ok` 仍只表示宿主正常
+返回，失败计数同时检查 `ok` 与工具自身的 `status=failed`。工具没有返回 ToolOutput 时不编造 status，
+首部显示“未返回工具结果”；prepare 阶段被拒且未执行时也不会给出虚假的子执行输出入口。
+引用来自 journal 中的原尝试，恢复时不替换成当前父 attempt。旧 `finished` 输出逐字复用，
+不会补新字段或重新生成提示；新结构不改写历史 output.json。
 
 ## 7. 计划、journal 与恢复
 
@@ -349,5 +380,20 @@ uncertain，Safe 才能按双 Safe 准则重做。`start` 已提交但第一个 
   调用序列（工具名 + 完整参数）全部与录像一致（132/132）：112 段干净跑完，20 段以脚本异常结束——都是录像里
   那次调用本来就返回了错误（被拒绝的 shell / edit、路径不存在）或脚本自己的 bug（`NameError`），与当时一致。
   升级 Monty 或改前置代码时要重跑。
+
+2026-10-20 失败反馈优化验证（macOS）：
+
+- 新增回归覆盖 payload failed 与宿主错误的区分、脚本处理子失败后正常完成、70KB 输出后
+  的 NameError 在 2KiB 投影首部可见、部分写入后的原尝试引用、摘要上限、旧 finished 原样回放；
+  真实 worker 验证 UTC / 固定 UTC+8 / 小数 / 负时间戳。改前实测 3 项行为测试失败，改后通过。
+- 主仓 `cargo test --workspace --offline --locked`：2065 passed、0 failed、8 ignored
+  （含此前后台完成通知修复）；`cargo fmt --all --check` 与 `git diff --check` 通过。
+- 隔离 worktree `cargo build --timings --offline --locked`：增量 dev 构建 1m32s；报告
+  `cargo-timing-20261020T072354554Z-b0081c9e8e56a87a.html`，target 位于
+  `/Users/xiangyi/code/komo-session-observability/target/cargo-timings/`。切换工作区导致多个 crate
+  重新编译，此耗时不作冷构建收益对比。
+- 两天 32 条真实失败记录中，27 条用录下的子工具回复与时钟/熵复现原异常；4 条涉及未保存的
+  发现目录、1 条没有可回放 journal，未计入有效回放。没有调用业务 MCP；这是失败复现，
+  不是旧脚本自动变成功。重试次数的改善仍需安装后用新 session 验证。
 
 旧引擎（CPython + Seatbelt / Landlock）的验证记录见 git 历史（2026-10-08 ～ 2026-10-13）。

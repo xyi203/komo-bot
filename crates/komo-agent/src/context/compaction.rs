@@ -293,19 +293,8 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
             write_tokens,
             archive_tokens,
             memo_tokens,
-            context_tokens,
-            // 剩余请求按"每个计划步骤花几次请求"估，计划已经没有了：估不出，只剩冷缓存与
-            // 窗口保护两条不看账的路。
-            completed_boundary_request_counts: None,
-            remaining_boundaries: 0,
-            average_context_token_increment: online.average_context_token_increment(),
-            context_window_tokens: Some(window),
-            prior_compaction_count: online.compaction_count,
-            requests_since_last_compaction: online.requests_since_last_compaction(),
-            carried_debt_tokens: online.cache_debt_tokens,
-            cache_debt_repayment_tokens: online.cache_debt_repayment_tokens,
-            cache_write_read_ratio: settings.cache_write_read_ratio,
             cache_cold,
+            ..base_input(online, settings, window, context_tokens)
         }
     };
     let decay = |cold: bool| {
@@ -383,16 +372,112 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
     if !decision.compact || decision.post_compaction_tokens >= threshold {
         return Plan::Nothing;
     }
-    let task = context
-        .messages
-        .get(context.run_from)
-        .filter(|message| message.role == Role::User)
-        .and_then(|message| message.text.as_deref());
     Plan::Compact(CompactionJob {
-        request: summary_request(task, &context.messages[cut.archived], session, run, model),
+        request: summary_request(
+            task_of(context),
+            &context.messages[cut.archived],
+            session,
+            run,
+            model,
+        ),
         first_kept: cut.first_kept,
         decision,
     })
+}
+
+/// provider 已经以上下文超长拒了请求（§6 溢出恢复）：不看缓存账、不看
+/// `compaction_enabled`（不压这条 Run 就失败了），也不判贴不贴窗口（字节 / 4 的估计
+/// 可能比 provider 的分词低）——按 `keep_recent_tokens` 切，强制压一次。
+///
+/// 不压（`None`）的情形都让 Run 照原样失败：上次压成摘要之后一次成功的请求都还没有
+/// （刚压过还是超长，再压只会转圈）；切不出可收的一段（比如只剩最后一轮）；摘要不比
+/// 那一段小。
+pub fn plan_overflow(input: PlanInput<'_>) -> Option<CompactionJob> {
+    let PlanInput {
+        context,
+        tools,
+        online,
+        settings,
+        model,
+        session,
+        run,
+        cache_cold,
+        compaction_enabled: _,
+    } = input;
+    if online.requests_since_last_summary() == Some(0) {
+        return None;
+    }
+    let pricing = price(context, tools);
+    let context_tokens = pricing
+        .write_tokens
+        .max(online.last_context_tokens.unwrap_or(0));
+    let window = effective_window(
+        model.context_window,
+        settings.max_context_tokens,
+        settings.economics.window_reserve_tokens,
+    );
+    let cut = pricing.cut(settings.keep_recent_tokens)?;
+    let decision = decide(
+        &CompactionInput {
+            write_tokens: context_tokens,
+            archive_tokens: cut.archive_tokens,
+            memo_tokens: settings.memo_tokens,
+            cache_cold,
+            ..base_input(online, settings, window, context_tokens)
+        },
+        &settings.economics,
+    )
+    .forced_by_overflow();
+    if !decision.compact {
+        return None;
+    }
+    Some(CompactionJob {
+        request: summary_request(
+            task_of(context),
+            &context.messages[cut.archived],
+            session,
+            run,
+            model,
+        ),
+        first_kept: cut.first_kept,
+        decision,
+    })
+}
+
+/// 两条路共用的决策输入：在线状态、窗口与当前配置；改写多少、收掉多少由调用方填。
+fn base_input(
+    online: &OnlineState,
+    settings: &CompactionSettings,
+    window: u64,
+    context_tokens: u64,
+) -> CompactionInput {
+    CompactionInput {
+        write_tokens: 0,
+        archive_tokens: 0,
+        memo_tokens: 0,
+        context_tokens,
+        // 剩余请求按"每个计划步骤花几次请求"估，计划已经没有了：估不出，只剩冷缓存与
+        // 窗口保护两条不看账的路。
+        completed_boundary_request_counts: None,
+        remaining_boundaries: 0,
+        average_context_token_increment: online.average_context_token_increment(),
+        context_window_tokens: Some(window),
+        prior_compaction_count: online.compaction_count,
+        requests_since_last_compaction: online.requests_since_last_compaction(),
+        carried_debt_tokens: online.cache_debt_tokens,
+        cache_debt_repayment_tokens: online.cache_debt_repayment_tokens,
+        cache_write_read_ratio: settings.cache_write_read_ratio,
+        cache_cold: false,
+    }
+}
+
+/// 这条 Run 开头那句任务：回放时总留着，摘要请求里只作背景。
+fn task_of(context: &AgentContext) -> Option<&str> {
+    context
+        .messages
+        .get(context.run_from)
+        .filter(|message| message.role == Role::User)
+        .and_then(|message| message.text.as_deref())
 }
 
 #[cfg(test)]

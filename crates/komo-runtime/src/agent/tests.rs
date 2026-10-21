@@ -1319,6 +1319,173 @@ mod compaction {
     }
 }
 
+/// 溢出恢复（§6）：provider 以上下文超长拒了请求，强制压一次、重新装配接着跑；只救一次。
+mod overflow {
+    use super::*;
+    use crate::agent::tests_support::{FakePlanner, SequenceLlm, compaction_job, compactor};
+    use komo_kernel::events::{ContextCompacted, EventPayload};
+    use komo_kernel::types::turn::LlmError;
+
+    fn too_long(status: u16) -> LlmError {
+        LlmError::Rejected {
+            status,
+            message: "prompt is too long: 213462 tokens > 200000 maximum".into(),
+        }
+    }
+
+    fn compactions(harness: &Harness) -> Vec<ContextCompacted> {
+        harness
+            .ledger
+            .events()
+            .into_iter()
+            .filter_map(|event| match event.payload {
+                EventPayload::ContextCompacted(body) => Some(body),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn forced_job(segment: &Segment) -> komo_kernel::compaction::CompactionJob {
+        let job = compaction_job(&segment.session, &segment.run);
+        komo_kernel::compaction::CompactionJob {
+            decision: job.decision.clone().forced_by_overflow(),
+            ..job
+        }
+    }
+
+    #[tokio::test]
+    async fn an_overflow_on_the_first_request_compacts_and_recomposes() {
+        let llm = SequenceLlm::new(vec![
+            Err(too_long(400)),
+            Ok(vec![Ok(round(1, Some("摘要：a 做完了。"), vec![]))]),
+        ]);
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![]);
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let planner = FakePlanner::with_overflow(vec![], vec![Some(forced_job(&segment))]);
+        segment.compactor = Some(compactor(Arc::clone(&planner)));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Recompose { rounds: 0, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(planner.overflow_asked(), 1);
+        let requests = llm.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "主请求 + 摘要请求");
+        assert!(requests[1].tools.is_empty(), "摘要请求没有工具");
+        drop(requests);
+        let recorded = compactions(&wired.harness);
+        let [ContextCompacted::Compacted { decision, .. }] = recorded.as_slice() else {
+            panic!("{recorded:?}");
+        };
+        assert!(decision.context_overflow && decision.compact);
+    }
+
+    #[tokio::test]
+    async fn an_overflow_mid_segment_compacts_after_the_finished_rounds() {
+        let llm = SequenceLlm::new(vec![
+            Ok(vec![
+                Ok(round(
+                    1,
+                    None,
+                    vec![call("pc-1", "bash", serde_json::json!({}))],
+                )),
+                Err(too_long(400)),
+            ]),
+            Ok(vec![Ok(round(1, Some("摘要"), vec![]))]),
+        ]);
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![Arc::new(RecordingTool::bash())]);
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let planner = FakePlanner::with_overflow(vec![], vec![Some(forced_job(&segment))]);
+        segment.compactor = Some(compactor(Arc::clone(&planner)));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Recompose { rounds: 1, .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(compactions(&wired.harness).len(), 1);
+    }
+
+    /// planner 说救不回来（刚压过还是超长、切不出）：照原样失败，不退避重试。
+    #[tokio::test]
+    async fn an_overflow_the_planner_cannot_cut_fails_the_run() {
+        let llm = SequenceLlm::new(vec![Err(too_long(400))]);
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![]);
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let planner = FakePlanner::with_overflow(vec![], vec![None]);
+        segment.compactor = Some(compactor(Arc::clone(&planner)));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        let SegmentOutcome::Failed { reason, .. } = &outcome else {
+            panic!("{outcome:?}");
+        };
+        assert!(reason.contains("prompt is too long"), "{reason}");
+        assert_eq!(planner.overflow_asked(), 1);
+        assert!(compactions(&wired.harness).is_empty());
+        assert_eq!(llm.requests.lock().unwrap().len(), 1);
+    }
+
+    /// 摘要没成：记 `skipped`，Run 按原来的超长失败——不再在这一段里重试。
+    #[tokio::test]
+    async fn a_failed_overflow_summary_is_skipped_and_the_run_fails() {
+        let truncated = Round {
+            truncated: true,
+            ..round(1, Some("摘要写到一半"), vec![])
+        };
+        let llm = SequenceLlm::new(vec![Err(too_long(400)), Ok(vec![Ok(truncated)])]);
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![]);
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let planner = FakePlanner::with_overflow(vec![], vec![Some(forced_job(&segment))]);
+        segment.compactor = Some(compactor(Arc::clone(&planner)));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+        let recorded = compactions(&wired.harness);
+        assert!(
+            matches!(recorded.as_slice(), [ContextCompacted::Skipped { .. }]),
+            "{recorded:?}"
+        );
+    }
+
+    /// 没有 planner（命令 Run、没接配置）：包成 500 的超长也不退避，直接失败。
+    #[tokio::test]
+    async fn an_overflow_without_a_planner_fails_instead_of_backing_off() {
+        let llm = SequenceLlm::new(vec![Err(too_long(500))]);
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![]);
+        let segment = wired.segment(CancelToken::new()).await;
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Failed { .. }),
+            "{outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_errors_never_ask_for_an_overflow_compaction() {
+        let llm = SequenceLlm::new(vec![Err(LlmError::Rejected {
+            status: 503,
+            message: "overloaded".into(),
+        })]);
+        let wired = Wired::with_llm(Arc::clone(&llm) as _, vec![]);
+        let mut segment = wired.segment(CancelToken::new()).await;
+        let planner = FakePlanner::with_overflow(vec![], vec![Some(forced_job(&segment))]);
+        segment.compactor = Some(compactor(Arc::clone(&planner)));
+
+        let outcome = wired.agent.run(segment).await.unwrap();
+        assert!(
+            matches!(outcome, SegmentOutcome::Suspended { .. }),
+            "照常退避：{outcome:?}"
+        );
+        assert_eq!(planner.overflow_asked(), 0);
+        assert!(compactions(&wired.harness).is_empty());
+    }
+}
+
 /// 插话（§6）：一轮的调用全部收尾、下一次请求之前，排着队要求插话的输入被并进来，这一段
 /// 交回去按日志重新装配；最终回答那一轮没有"下一次请求"，轮不上。
 mod interjection {

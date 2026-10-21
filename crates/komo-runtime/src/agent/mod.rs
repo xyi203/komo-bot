@@ -10,6 +10,9 @@
 //!   → 按 call_id 回传结果 → 下一轮
 //! ```
 //!
+//! LLM 请求以上下文超长被拒（`begin_turn` 或 `next`）、又有 planner 时，先
+//! `CompactionPlanner::plan_overflow` 强制压一次再 Recompose，只救一次；救不回来按原错误失败。
+//!
 //! **在线压缩只在真的压了时才把这一段交回去**（[`SegmentOutcome::Recompose`]）。决定不压
 //! 时 driver 原样接着跑，下一次请求与没有这个功能时逐字节相同——提示缓存照样命中；
 //! 决定压时前缀本来就要换，Gateway 按日志重新装配（任务 → 摘要 → 切点起原样）。
@@ -136,7 +139,9 @@ pub struct Segment {
     /// 装配时就决定了要压：这一段先发摘要请求，压成就交回去重新装配，没成记一条
     /// `skipped` 照常往下跑（§6）。
     pub compaction: Option<CompactionJob>,
-    /// 一轮收尾之后要不要再问一次改写前缀。`None` = 压缩与衰减都关着（或命令 Run）。
+    /// 一轮收尾之后要不要再问一次改写前缀，以及上下文超长时的溢出恢复。`None` = 命令 Run
+    /// 或没接配置；`[compaction] enabled = false` 也照样有（溢出恢复不受它管，自动判断由
+    /// planner 按当前配置自己关掉）。
     pub compactor: Option<Compactor>,
 }
 
@@ -149,9 +154,14 @@ pub trait CompactionPlanner: Send + Sync {
     /// （[`Reshape::Compact`]）；要换短视图就给出整批（[`Reshape::Decay`]，loop 先落账再
     /// 交给驱动）；其余情形什么都不记。
     async fn plan(&self) -> Option<Reshape>;
+
+    /// provider 以上下文超长拒了请求（[`crate::llm::is_context_overflow`]）之后问：不看
+    /// 缓存账、不看 `[compaction] enabled`，能切就给出一次强制压缩的摘要请求。`None` =
+    /// 救不回来（刚压过还是超长、切不出可收的一段），Run 照原样失败。
+    async fn plan_overflow(&self) -> Option<CompactionJob>;
 }
 
-/// loop 这一侧：什么时候去问 [`CompactionPlanner`]（`None` = 压缩与衰减都关着）。只有两种时机——估计的
+/// loop 这一侧：什么时候去问 [`CompactionPlanner`]。只有两种时机——估计的
 /// 上下文贴着窗口、距上一次 provider 请求已超过提示缓存的存活时间（长时间的工具调用把
 /// 缓存放冷了）；别的轮次一次都不问（问一次要读一遍日志）。
 pub struct Compactor {
@@ -335,6 +345,19 @@ impl AgentLoop {
             None => match self.llm.begin_turn(request).await {
                 Ok(driver) => driver,
                 Err(error) => {
+                    if let Some(done) = self
+                        .recover_overflow(
+                            &run,
+                            rounds,
+                            &error,
+                            compactor.as_ref(),
+                            &env.cancel,
+                            &mut summaries,
+                        )
+                        .await?
+                    {
+                        return Ok(done);
+                    }
                     return self
                         .llm_error(&run, rounds, &budget.retry, &env.model.model, &error)
                         .await;
@@ -430,6 +453,19 @@ impl AgentLoop {
             let round = match crate::executor::cancel::race(&env.cancel, turn).await {
                 None => return self.cancel(&run, rounds).await,
                 Some(Err(error)) => {
+                    if let Some(done) = self
+                        .recover_overflow(
+                            &run,
+                            rounds,
+                            &error,
+                            compactor.as_ref(),
+                            &env.cancel,
+                            &mut summaries,
+                        )
+                        .await?
+                    {
+                        return Ok(with_driver_usage(done, &driver.usage()));
+                    }
                     return self
                         .llm_error(&run, rounds, &budget.retry, &env.model.model, &error)
                         .await;
@@ -581,6 +617,41 @@ impl AgentLoop {
                 revised.extend(job.revised);
                 None
             }
+        })
+    }
+
+    /// 溢出恢复（§6）：provider 以上下文超长拒了请求、又有 planner，就强制压一次，压成了
+    /// 交回去重新装配（`Recompose`）。只救一次：刚压成摘要还是超长时 planner 不给第二次；
+    /// 同一次领取里的重装配次数另有 `MAX_RECOMPOSITIONS` 兜底（到上限 handler 拿掉
+    /// compactor，这里就无从恢复）。`None` = 不是超长、没有 planner、救不回来或摘要没成——
+    /// 按原来的错误走 [`Self::llm_error`]。
+    async fn recover_overflow(
+        &self,
+        run: &RunId,
+        rounds: u32,
+        error: &LlmError,
+        compactor: Option<&Compactor>,
+        cancel: &komo_kernel::types::tool::CancelToken,
+        summaries: &mut TokenUsage,
+    ) -> Result<Option<SegmentOutcome>, AgentError> {
+        if !crate::llm::is_context_overflow(error) {
+            return Ok(None);
+        }
+        let Some(compactor) = compactor else {
+            return Ok(None);
+        };
+        let Some(job) = compactor.planner.plan_overflow().await else {
+            tracing::warn!(run = %run, %error, "上下文超长，压不了（刚压过或切不出），按原错误收场");
+            return Ok(None);
+        };
+        tracing::info!(run = %run, %error, "上下文超长，强制压一次再重试");
+        Ok(match self.compact(run, job, cancel, summaries).await? {
+            Compaction::Compacted => Some(SegmentOutcome::Recompose {
+                rounds,
+                usage: *summaries,
+            }),
+            Compaction::Cancelled => Some(self.cancel(run, rounds).await?),
+            Compaction::Skipped => None,
         })
     }
 

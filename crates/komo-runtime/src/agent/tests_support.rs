@@ -146,19 +146,38 @@ pub fn decay_job(provider_call_id: &str) -> komo_kernel::compaction::DecayJob {
 /// 按脚本作答的 [`super::CompactionPlanner`]：第 n 次问给第 n 个答案，用完之后一律不压。
 pub struct FakePlanner {
     answers: std::sync::Mutex<std::collections::VecDeque<Option<komo_kernel::compaction::Reshape>>>,
+    /// 溢出恢复的答案，同样按次序给，用完之后一律不压。
+    overflow: std::sync::Mutex<
+        std::collections::VecDeque<Option<komo_kernel::compaction::CompactionJob>>,
+    >,
     pub asked: std::sync::atomic::AtomicUsize,
+    pub overflow_asked: std::sync::atomic::AtomicUsize,
 }
 
 impl FakePlanner {
     pub fn new(answers: Vec<Option<komo_kernel::compaction::Reshape>>) -> std::sync::Arc<Self> {
+        Self::with_overflow(answers, Vec::new())
+    }
+
+    pub fn with_overflow(
+        answers: Vec<Option<komo_kernel::compaction::Reshape>>,
+        overflow: Vec<Option<komo_kernel::compaction::CompactionJob>>,
+    ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             answers: std::sync::Mutex::new(answers.into_iter().collect()),
+            overflow: std::sync::Mutex::new(overflow.into_iter().collect()),
             asked: Default::default(),
+            overflow_asked: Default::default(),
         })
     }
 
     pub fn asked(&self) -> usize {
         self.asked.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn overflow_asked(&self) -> usize {
+        self.overflow_asked
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -167,6 +186,80 @@ impl super::CompactionPlanner for FakePlanner {
     async fn plan(&self) -> Option<komo_kernel::compaction::Reshape> {
         self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.answers.lock().expect("脚本").pop_front().flatten()
+    }
+
+    async fn plan_overflow(&self) -> Option<komo_kernel::compaction::CompactionJob> {
+        self.overflow_asked
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.overflow.lock().expect("脚本").pop_front().flatten()
+    }
+}
+
+/// 先按次序吐脚本里的每一段（`Err` = `begin_turn` 就失败），用完之后一律收尾的
+/// [`komo_kernel::traits::LlmClient`]：演"主请求超长 → 摘要成了 → 重装配后接着跑"。
+pub struct SequenceLlm {
+    scripts: std::sync::Mutex<
+        std::collections::VecDeque<
+            Result<
+                Vec<Result<Round, komo_kernel::types::turn::LlmError>>,
+                komo_kernel::types::turn::LlmError,
+            >,
+        >,
+    >,
+    pub requests: std::sync::Mutex<Vec<TurnRequest>>,
+}
+
+impl SequenceLlm {
+    #[allow(clippy::type_complexity)]
+    pub fn new(
+        scripts: Vec<
+            Result<
+                Vec<Result<Round, komo_kernel::types::turn::LlmError>>,
+                komo_kernel::types::turn::LlmError,
+            >,
+        >,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            scripts: std::sync::Mutex::new(scripts.into_iter().collect()),
+            requests: Default::default(),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::LlmClient for SequenceLlm {
+    async fn begin_turn(
+        &self,
+        req: TurnRequest,
+    ) -> Result<Box<dyn komo_kernel::traits::TurnDriver>, komo_kernel::types::turn::LlmError> {
+        self.requests.lock().expect("脚本").push(req);
+        let script = self
+            .scripts
+            .lock()
+            .expect("脚本")
+            .pop_front()
+            .unwrap_or_else(|| Ok(vec![Ok(round(99, Some("收尾"), vec![]))]))?;
+        Ok(Box::new(SequenceDriver(script.into_iter().collect())))
+    }
+}
+
+struct SequenceDriver(
+    std::collections::VecDeque<Result<Round, komo_kernel::types::turn::LlmError>>,
+);
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::TurnDriver for SequenceDriver {
+    async fn next(
+        &mut self,
+        _input: komo_kernel::types::turn::RoundInput,
+    ) -> Result<Round, komo_kernel::types::turn::LlmError> {
+        self.0
+            .pop_front()
+            .unwrap_or_else(|| Ok(round(99, Some("收尾"), vec![])))
+    }
+
+    fn usage(&self) -> komo_kernel::types::model::TokenUsage {
+        Default::default()
     }
 }
 

@@ -203,6 +203,11 @@ pub struct CompactionDecision {
     pub cache_debt_repayment_tokens: u64,
     pub compact: bool,
     pub reason: CompactionReason,
+    /// provider 以上下文超长拒了请求，这次是强制压的（§6 溢出恢复）。`reason` 记成
+    /// `window_protection`——加一个 reason 变体会让旧二进制解不出这条 `context.compacted`
+    /// （已知 type 的 payload 解不出算损坏，不会落成 Unknown）；多一个字段旧二进制只是忽略。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub context_overflow: bool,
 }
 
 /// 一次压缩欠下的缓存债，和它之后每次请求还多少。
@@ -218,6 +223,17 @@ impl CompactionDecision {
         if self.compact {
             self.compact = false;
             self.reason = CompactionReason::NativeNotCompactable;
+        }
+        self
+    }
+
+    /// provider 已经以上下文超长拒了请求：不看账，按窗口保护压——不压这条 Run 就失败了，
+    /// 缓存账没有意义。摘要不比被收掉的那一段小（`non_positive_saving`）照旧不压。
+    pub fn forced_by_overflow(mut self) -> Self {
+        self.context_overflow = true;
+        if self.archive_tokens > self.memo_tokens {
+            self.compact = true;
+            self.reason = CompactionReason::WindowProtection;
         }
         self
     }
@@ -353,6 +369,7 @@ pub fn decide(input: &CompactionInput, economics: &CompactionEconomics) -> Compa
         cache_debt_repayment_tokens: input.cache_debt_repayment_tokens,
         compact,
         reason,
+        context_overflow: false,
     }
 }
 
@@ -658,6 +675,62 @@ mod tests {
         )
         .mark_not_compactable();
         assert_eq!(deferred.reason, CompactionReason::CacheRatioUnavailable);
+    }
+
+    #[test]
+    fn an_overflow_forces_window_protection_whatever_the_economics_say() {
+        let economics = CompactionEconomics::default();
+        let deferred = decide(
+            &CompactionInput {
+                completed_boundary_request_counts: None,
+                ..base()
+            },
+            &economics,
+        );
+        assert!(!deferred.compact, "{deferred:?}");
+        let forced = deferred.forced_by_overflow();
+        assert_eq!(
+            (forced.compact, forced.reason, forced.context_overflow),
+            (true, CompactionReason::WindowProtection, true)
+        );
+
+        let nothing_to_save = decide(
+            &CompactionInput {
+                archive_tokens: 400,
+                memo_tokens: 500,
+                ..base()
+            },
+            &economics,
+        )
+        .forced_by_overflow();
+        assert_eq!(
+            (nothing_to_save.compact, nothing_to_save.reason),
+            (false, CompactionReason::NonPositiveSaving),
+            "摘要不比那一段小，压了也救不回来"
+        );
+    }
+
+    /// 旧二进制读新行：认识的字段之外多一个 `context_overflow`，照样解得出来；新二进制
+    /// 读旧行：没有这个字段就是 `false`。
+    #[test]
+    fn the_overflow_mark_is_an_additive_field() {
+        let economics = CompactionEconomics::default();
+        let plain = decide(&base(), &economics);
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("context_overflow").is_none(), "{json}");
+        assert_eq!(
+            serde_json::from_value::<CompactionDecision>(json).unwrap(),
+            plain
+        );
+
+        let forced = plain.forced_by_overflow();
+        let json = serde_json::to_value(&forced).unwrap();
+        assert_eq!(json["context_overflow"], true);
+        assert_eq!(json["reason"], "window_protection");
+        assert_eq!(
+            serde_json::from_value::<CompactionDecision>(json).unwrap(),
+            forced
+        );
     }
 
     #[test]

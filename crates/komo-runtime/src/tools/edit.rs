@@ -4,6 +4,14 @@
 //! 哪一处需要猜，而猜错和没找到的代价不一样，后者立刻可见，前者要等到有人读那份文件
 //! 才发现。想全改就明写 `replace_all`。
 //!
+//! 一次调用可以改同一个文件的多处（`edits[]`，2026-10-21，照 pi 的
+//! `applyEditsToNormalizedContent`）：每一处都对**原文件**匹配，不在前一处改完的结果上
+//! 接着找；每一处必须唯一，除非它自己写了 `replace_all`；各处的匹配区间不许重叠；全部
+//! 成立才从后往前替换，前面的偏移不受后面影响。任意一处不成立整个调用就失败，文件一个
+//! 字节都不动。此前模型改多处要连发几个 edit，每个都要一次往返、各绑一次版本。旧的单处
+//! 参数（顶层 `match_text` / `replace_text` / `replace_all`）照常解码、执行，就是只有一处的
+//! `edits`；schema 里不再给它们，两种写法不能混用。
+//!
 //! `prepare` 读一遍文件、先替换一遍：匹配不上当场失败，并把这一刻的内容哈希记成预期版本。
 //! 计划因此绑定了"从这一份内容出发"：文件在计划之后被人动过，执行时版本对不上就
 //! 按版本冲突失败（§7.2「执行前再次校验目标和版本」）。
@@ -16,7 +24,7 @@
 //! 重启后不重跑（`Tool::replay` 用默认的 unsafe，§8.6）：替换文本里含着被替换文本时，
 //! 重跑一遍会再替换一次。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use komo_kernel::traits::{OutputWriter, Tool};
@@ -39,16 +47,23 @@ use super::{ExpectedVersion, FileVersion, as_text, current, normalized, parse_ar
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EditArgs {
     pub path: String,
-    /// 要被替换掉的那段内容，逐字匹配。
-    pub match_text: String,
-    pub replace_text: String,
+    /// 单处写法：要被替换掉的那段内容，逐字匹配。与 `edits` 二选一；schema 里不再给，
+    /// 只为旧参数与旧计划保留。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub match_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_text: Option<String>,
     /// 2026-10-14 之前 schema 里有它、由模型给。只为解码旧参数保留：`prepare` 丢掉它，
     /// 新计划里永远是空的，预期版本只认 `prepare` 读到的那份。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_version: Option<ExpectedVersion>,
-    /// 匹配到多处时全部替换。默认 false：多处即歧义，歧义就报错。
-    #[serde(default)]
-    pub replace_all: bool,
+    /// 单处写法：匹配到多处时全部替换。没给按 false：多处即歧义，歧义就报错。`prepare`
+    /// 给单处写法补上明确的值，计划里的参数与有 `edits` 之前逐字节相同。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replace_all: Option<bool>,
+    /// 多处写法：每一处都对原文件匹配（见模块说明）。与顶层的单处写法二选一。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edits: Option<Vec<Replacement>>,
     /// 2026-10-13 之前 `prepare` 在这里记替换之后的内容哈希，给核对梯子用。只为解码
     /// 旧计划保留，新计划里永远是空的。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,6 +72,17 @@ pub struct EditArgs {
     /// 计划里的参数不再带它。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub then_run: Option<ThenRun>,
+}
+
+/// `edits[]` 里的一处替换。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Replacement {
+    /// 要被替换掉的那段内容，在原文件里逐字匹配。
+    pub match_text: String,
+    pub replace_text: String,
+    /// 这一处匹配到多处时全部替换。默认 false：多处即歧义，歧义就报错。
+    #[serde(default)]
+    pub replace_all: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,19 +116,33 @@ impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "edit".into(),
-            description:
-                "把文件里逐字匹配的一段内容替换掉。匹配不到或匹配到多处都会报错，不做模糊猜测。"
-                    .into(),
+            description: "把一个文件里逐字匹配的内容替换掉。同一文件改多处，用一次 edit 带多个 \
+                 edits[]，别连发几个 edit；每一处都对原文件匹配，必须唯一、互不重叠，相邻或挨得近\
+                 的改动合成一处。匹配不到或匹配到多处都会报错，不做模糊猜测；任意一处失败，文件\
+                 一个字节都不动。"
+                .into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "文件路径；相对路径按工作目录解析" },
-                    "match_text": { "type": "string", "description": "要替换掉的原文，逐字匹配" },
-                    "replace_text": { "type": "string", "description": "替换成什么" },
-                    "replace_all": { "type": "boolean", "description": "匹配到多处时全部替换；默认报错" },
+                    "edits": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "这个文件的一处或多处替换。每一处都对原文件匹配，不是在前一处改完的结果上接着找；不要给重叠或嵌套的几处，挨得近的改动合成一处",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "match_text": { "type": "string", "description": "这一处要替换掉的原文，逐字匹配；在原文件里必须唯一，且不与别处的 match_text 重叠。够唯一就行，别为了连起远处的改动带上大段没改的内容" },
+                                "replace_text": { "type": "string", "description": "这一处替换成什么" },
+                                "replace_all": { "type": "boolean", "description": "这一���匹配到多处时全部替换；默认报错" }
+                            },
+                            "required": ["match_text", "replace_text"],
+                            "additionalProperties": false
+                        }
+                    },
                     "then_run": super::fusion::schema("编辑")
                 },
-                "required": ["path", "match_text", "replace_text"],
+                "required": ["path", "edits"],
                 "additionalProperties": false
             }),
         }
@@ -113,14 +153,14 @@ impl Tool for EditTool {
         args: serde_json::Value,
         ctx: &ToolContext,
     ) -> Result<ExecutionPlan, ToolError> {
-        let mut args: EditArgs = parse_args(args, "edit")?;
+        let mut args: EditArgs = parse_args(lenient(args), "edit")?;
         args.result_version = None;
         args.expected_version = None;
         let then_run = args.then_run.take();
-        if args.match_text.is_empty() {
-            return Err(ToolError::InvalidArguments {
-                message: "match_text 不能是空串：空串在任何位置都匹配".into(),
-            });
+        // 写法不对、有一处是空串，不用读文件就能拒。
+        replacements(&args)?;
+        if args.edits.is_none() {
+            args.replace_all = Some(args.replace_all.unwrap_or(false));
         }
         let path = super::paths::resolve(&args.path, &ctx.cwd)?;
         // 唯一的硬限制（§7）：komo 自己的状态不许改。带 `then_run` 也一样——计划不成立，
@@ -237,28 +277,127 @@ fn check_expected(
     }
 }
 
-/// 逐字替换。匹配不到、或匹配到多处而没说要全改，都是错误。
-fn apply(text: &str, args: &EditArgs, path: &std::path::Path) -> Result<(String, u64), ToolError> {
-    let hits = text.matches(args.match_text.as_str()).count() as u64;
-    match hits {
-        0 => Err(ToolError::NoMatch {
-            path: path.display().to_string(),
-        }),
-        _ if hits > 1 && !args.replace_all => Err(ToolError::InvalidArguments {
-            message: format!(
-                "{} 里匹配到 {hits} 处；给一段唯一的上下文，或显式 replace_all",
-                path.display()
-            ),
-        }),
-        _ => {
-            let out = if args.replace_all {
-                text.replace(args.match_text.as_str(), &args.replace_text)
-            } else {
-                text.replacen(args.match_text.as_str(), &args.replace_text, 1)
-            };
-            Ok((out, hits))
+/// 照 pi 的 `prepareArguments`：有的模型把 `edits` 编成一段 JSON 字符串，或只给一个对象
+/// 而不是数组。认得出来就摆正，认不出来原样交给解析去报错。
+fn lenient(mut args: serde_json::Value) -> serde_json::Value {
+    let Some(edits) = args.get_mut("edits") else {
+        return args;
+    };
+    if let Some(Ok(parsed @ (serde_json::Value::Array(_) | serde_json::Value::Object(_)))) = edits
+        .as_str()
+        .map(serde_json::from_str::<serde_json::Value>)
+    {
+        *edits = parsed;
+    }
+    if edits.is_object() {
+        *edits = serde_json::Value::Array(vec![edits.take()]);
+    }
+    args
+}
+
+/// 这次调用要做的那几处替换：单处写法就是只有一处。两种写法混用、都没给、`edits` 是空的、
+/// 哪一处的 `match_text` 是空串，都是参数错误。
+fn replacements(args: &EditArgs) -> Result<Vec<Replacement>, ToolError> {
+    let invalid = |message: String| ToolError::InvalidArguments { message };
+    let single = args.match_text.is_some() || args.replace_text.is_some();
+    let list = match (&args.edits, &args.match_text, &args.replace_text) {
+        (Some(_), ..) if single || args.replace_all.is_some() => {
+            return Err(invalid(
+                "edits 与顶层的 match_text / replace_text / replace_all 只能用一种：\
+                 几处都放进 edits[]"
+                    .into(),
+            ));
+        }
+        (Some(edits), ..) if edits.is_empty() => {
+            return Err(invalid("edits 不能是空数组：至少给一处替换".into()));
+        }
+        (Some(edits), ..) => edits.clone(),
+        (None, Some(match_text), Some(replace_text)) => vec![Replacement {
+            match_text: match_text.clone(),
+            replace_text: replace_text.clone(),
+            replace_all: args.replace_all.unwrap_or(false),
+        }],
+        (None, ..) if single => {
+            return Err(invalid("match_text 与 replace_text 要一起给".into()));
+        }
+        (None, ..) => {
+            return Err(invalid(
+                "没有要替换的内容：给 edits[]，每一处带 match_text 与 replace_text".into(),
+            ));
+        }
+    };
+    for (index, each) in list.iter().enumerate() {
+        if each.match_text.is_empty() {
+            return Err(invalid(format!(
+                "{}match_text 不能是空串：空串在任何位置都匹配",
+                which(args, index)
+            )));
         }
     }
+    Ok(list)
+}
+
+/// 报错时怎么点名第 `index` 处：多处写法给下标，单处写法只有一处，不用点名。
+fn which(args: &EditArgs, index: usize) -> String {
+    match args.edits {
+        Some(_) => format!("edits[{index}]."),
+        None => String::new(),
+    }
+}
+
+/// 逐字替换，照 pi 的 `applyEditsToNormalizedContent`：每一处都在原文里找，匹配不到、
+/// 匹配到多处而这一处没说要全改、与别处的匹配区间重叠，都是错误；全部成立才从后往前换，
+/// 前面的偏移不受后面影响。返回新内容与一共换了几段。
+fn apply(text: &str, args: &EditArgs, path: &Path) -> Result<(String, u64), ToolError> {
+    let list = replacements(args)?;
+    // 每一段匹配：（起，止，第几处）。
+    let mut spans: Vec<(usize, usize, usize)> = Vec::new();
+    for (index, each) in list.iter().enumerate() {
+        let hits: Vec<usize> = text
+            .match_indices(each.match_text.as_str())
+            .map(|(at, _)| at)
+            .collect();
+        match hits.len() {
+            0 => {
+                return Err(ToolError::NoMatch {
+                    path: match args.edits {
+                        Some(_) => format!("{} 的 edits[{index}]", path.display()),
+                        None => path.display().to_string(),
+                    },
+                });
+            }
+            count if count > 1 && !each.replace_all => {
+                return Err(ToolError::InvalidArguments {
+                    message: format!(
+                        "{} 里 {}match_text 匹配到 {count} 处；给一段唯一的上下文，或显式 replace_all",
+                        path.display(),
+                        which(args, index)
+                    ),
+                });
+            }
+            _ => spans.extend(
+                hits.into_iter()
+                    .map(|at| (at, at + each.match_text.len(), index)),
+            ),
+        }
+    }
+    spans.sort_unstable();
+    for pair in spans.windows(2) {
+        let ((_, end, before), (start, _, after)) = (pair[0], pair[1]);
+        if end > start {
+            return Err(ToolError::InvalidArguments {
+                message: format!(
+                    "{} 里 edits[{before}] 与 edits[{after}] 的匹配区间重叠；合成一处，或各自对准不相交的地方",
+                    path.display()
+                ),
+            });
+        }
+    }
+    let mut out = text.to_string();
+    for &(start, end, index) in spans.iter().rev() {
+        out.replace_range(start..end, &list[index].replace_text);
+    }
+    Ok((out, spans.len() as u64))
 }
 
 #[cfg(test)]
@@ -450,22 +589,287 @@ mod tests {
         std::fs::write(home.join(".env"), "KEY=old\n").unwrap();
         let ctx = context(&dir.path().join("ws"));
         let tool = EditTool::new().protecting(vec![home.join("state.db"), home.join(".env")]);
-        let error = tool
-            .prepare(
-                serde_json::json!({
-                    "path": home.join(".env").display().to_string(),
-                    "match_text": "old",
-                    "replace_text": "new",
-                }),
-                &ctx,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(error, ToolError::Denied { .. }), "{error:?}");
+        let path = home.join(".env").display().to_string();
+        for args in [
+            serde_json::json!({ "path": path, "match_text": "old", "replace_text": "new" }),
+            serde_json::json!({
+                "path": path,
+                "edits": [{ "match_text": "old", "replace_text": "new" }],
+            }),
+        ] {
+            let error = tool.prepare(args, &ctx).await.unwrap_err();
+            assert!(matches!(error, ToolError::Denied { .. }), "{error:?}");
+        }
         assert_eq!(
             std::fs::read_to_string(home.join(".env")).unwrap(),
             "KEY=old\n"
         );
+    }
+
+    /// 改多处的那份计划：先 prepare 再 execute，返回改完的文件内容与回执。
+    async fn edit_many(
+        dir: &std::path::Path,
+        before: &str,
+        edits: serde_json::Value,
+    ) -> Result<(String, ToolOutput), ToolError> {
+        std::fs::write(dir.join("a.txt"), before).unwrap();
+        let ctx = context(dir);
+        let tool = EditTool::new();
+        let plan = plan_for(
+            &tool,
+            &ctx,
+            serde_json::json!({ "path": "a.txt", "edits": edits }),
+        )
+        .await?;
+        let output = tool.execute(plan, &ctx, &mut writer(&ctx)).await?;
+        Ok((std::fs::read_to_string(dir.join("a.txt")).unwrap(), output))
+    }
+
+    #[tokio::test]
+    async fn several_edits_in_one_call_all_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let (after, output) = edit_many(
+            dir.path(),
+            "alpha\nbeta\ngamma\n",
+            serde_json::json!([
+                { "match_text": "gamma", "replace_text": "GAMMA" },
+                { "match_text": "alpha", "replace_text": "ALPHA" },
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after, "ALPHA\nbeta\nGAMMA\n");
+        assert_eq!(output.result["replacements"], 2);
+    }
+
+    /// 每一处都对原文件匹配：第二处找的 `b` 只有原文里那一个，不算上第一处换出来的 `b`。
+    #[tokio::test]
+    async fn each_edit_matches_the_original_not_the_previous_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let (after, _) = edit_many(
+            dir.path(),
+            "a\nb\n",
+            serde_json::json!([
+                { "match_text": "a", "replace_text": "b" },
+                { "match_text": "b", "replace_text": "c" },
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after, "b\nc\n");
+    }
+
+    /// `replace_all` 只管写了它的那一处；其余各处照样必须唯一。
+    #[tokio::test]
+    async fn replace_all_belongs_to_its_own_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (after, output) = edit_many(
+            dir.path(),
+            "x y x\n",
+            serde_json::json!([
+                { "match_text": "x", "replace_text": "1", "replace_all": true },
+                { "match_text": "y", "replace_text": "2" },
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after, "1 2 1\n");
+        assert_eq!(output.result["replacements"], 3);
+
+        let error = edit_many(
+            dir.path(),
+            "x y x y\n",
+            serde_json::json!([
+                { "match_text": "x", "replace_text": "1", "replace_all": true },
+                { "match_text": "y", "replace_text": "2" },
+            ]),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&error, ToolError::InvalidArguments { message } if message.contains("edits[1]")),
+            "{error:?}"
+        );
+    }
+
+    /// 哪一处不成立，报错就点名它的下标；文件一个字节都不动。
+    #[tokio::test]
+    async fn a_failing_edit_names_its_index_and_leaves_the_file_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = "alpha\nbeta\nbeta\n";
+        let cases = [
+            (
+                serde_json::json!([
+                    { "match_text": "alpha", "replace_text": "ALPHA" },
+                    { "match_text": "delta", "replace_text": "DELTA" },
+                ]),
+                "edits[1]",
+            ),
+            (
+                serde_json::json!([
+                    { "match_text": "alpha", "replace_text": "ALPHA" },
+                    { "match_text": "beta", "replace_text": "BETA" },
+                ]),
+                "edits[1]",
+            ),
+            (
+                serde_json::json!([
+                    { "match_text": "", "replace_text": "x" },
+                    { "match_text": "alpha", "replace_text": "ALPHA" },
+                ]),
+                "edits[0]",
+            ),
+        ];
+        for (edits, named) in cases {
+            let error = edit_many(dir.path(), before, edits).await.unwrap_err();
+            assert!(error.to_string().contains(named), "{error}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                before
+            );
+        }
+    }
+
+    /// 两处的匹配区间重叠（含嵌套）就报错，点名是哪两处；首尾相接不算重叠。
+    #[tokio::test]
+    async fn overlapping_edits_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        for edits in [
+            serde_json::json!([
+                { "match_text": "alpha beta", "replace_text": "x" },
+                { "match_text": "beta gamma", "replace_text": "y" },
+            ]),
+            serde_json::json!([
+                { "match_text": "alpha beta gamma", "replace_text": "x" },
+                { "match_text": "beta", "replace_text": "y" },
+            ]),
+        ] {
+            let error = edit_many(dir.path(), "alpha beta gamma\n", edits)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&error, ToolError::InvalidArguments { message }
+                    if message.contains("edits[0]") && message.contains("edits[1]") && message.contains("重叠")),
+                "{error:?}"
+            );
+        }
+
+        let (after, _) = edit_many(
+            dir.path(),
+            "alphabeta\n",
+            serde_json::json!([
+                { "match_text": "beta", "replace_text": "B" },
+                { "match_text": "alpha", "replace_text": "A" },
+            ]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after, "AB\n");
+    }
+
+    /// 两种写法只能用一种；都没给、`edits` 是空数组，同样是参数错误。
+    #[tokio::test]
+    async fn mixing_both_forms_or_giving_neither_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        let ctx = context(dir.path());
+        let one = serde_json::json!([{ "match_text": "alpha", "replace_text": "ALPHA" }]);
+        for args in [
+            serde_json::json!({ "path": "a.txt", "edits": one, "match_text": "alpha", "replace_text": "x" }),
+            serde_json::json!({ "path": "a.txt", "edits": one, "replace_all": true }),
+            serde_json::json!({ "path": "a.txt", "edits": [] }),
+            serde_json::json!({ "path": "a.txt" }),
+            serde_json::json!({ "path": "a.txt", "match_text": "alpha" }),
+        ] {
+            let error = plan_for(&EditTool::new(), &ctx, args.clone())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, ToolError::InvalidArguments { .. }),
+                "{args}: {error:?}"
+            );
+        }
+    }
+
+    /// 照 pi：`edits` 编成 JSON 字符串、或只给了一个对象，摆正了照常改。
+    #[tokio::test]
+    async fn edits_sent_as_a_string_or_a_single_object_are_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let tool = EditTool::new();
+        for edits in [
+            serde_json::json!(r#"[{"match_text":"alpha","replace_text":"ALPHA"}]"#),
+            serde_json::json!({ "match_text": "alpha", "replace_text": "ALPHA" }),
+        ] {
+            std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+            let plan = plan_for(
+                &tool,
+                &ctx,
+                serde_json::json!({ "path": "a.txt", "edits": edits }),
+            )
+            .await
+            .unwrap();
+            assert!(plan.args["edits"].is_array(), "{}", plan.args);
+            tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+                "ALPHA\n"
+            );
+        }
+    }
+
+    /// 单处写法的计划参数和有 `edits` 之前逐字节相同；旧计划里那份参数照样能执行。
+    #[tokio::test]
+    async fn a_single_edit_plan_keeps_its_old_shape_and_old_plans_still_run() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        let ctx = context(dir.path());
+        let tool = EditTool::new();
+        let mut plan = plan_for(
+            &tool,
+            &ctx,
+            serde_json::json!({ "path": "a.txt", "match_text": "alpha", "replace_text": "ALPHA" }),
+        )
+        .await
+        .unwrap();
+        let old_shape = serde_json::json!({
+            "path": "a.txt",
+            "match_text": "alpha",
+            "replace_text": "ALPHA",
+            "replace_all": false
+        });
+        assert_eq!(
+            serde_json::to_string(&plan.args).unwrap(),
+            serde_json::to_string(&old_shape).unwrap()
+        );
+
+        // 旧计划：参数里还带着当时会写进去的 `result_version`。
+        plan.args = serde_json::json!({
+            "path": "a.txt",
+            "match_text": "alpha",
+            "replace_text": "ALPHA",
+            "replace_all": false,
+            "result_version": ContentHash::of_str("ALPHA\n").as_str()
+        });
+        tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ALPHA\n"
+        );
+    }
+
+    /// schema 只给 `edits`，引导"同一文件改多处用一次 edit"；顶层单处写法不再给模型看。
+    #[test]
+    fn the_schema_offers_edits_instead_of_a_single_match() {
+        let definition = EditTool::new().definition();
+        let parameters = &definition.parameters;
+        assert_eq!(parameters["required"], serde_json::json!(["path", "edits"]));
+        assert_eq!(
+            parameters["properties"]["edits"]["items"]["required"],
+            serde_json::json!(["match_text", "replace_text"])
+        );
+        assert!(parameters["properties"].get("match_text").is_none());
+        assert!(definition.description.contains("edits[]"));
     }
 
     #[tokio::test]

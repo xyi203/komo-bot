@@ -264,9 +264,9 @@ fn the_parallel_calls_rule_needs_read_or_rg() {
     assert!(!without.contains("放在同一轮一起发"), "{without}");
 }
 
-/// "同一个文件改好几处就连发几个 edit"只在挂了 `edit` 时出现。
+/// "同一个文件改好几处就用一次 edit 带多个 edits[]"只在挂了 `edit` 时出现。
 #[test]
-fn the_consecutive_edits_rule_needs_edit() {
+fn the_multi_edit_rule_needs_edit() {
     let with = build(
         Path::new("/tmp/w"),
         &["edit".to_string()],
@@ -275,7 +275,7 @@ fn the_consecutive_edits_rule_needs_edit() {
         &[],
         None,
     );
-    assert!(with.contains("连发几个 edit"), "{with}");
+    assert!(with.contains("用一次 edit 带多个 edits[]"), "{with}");
     let without = build(
         Path::new("/tmp/w"),
         &["read".to_string(), "write".to_string()],
@@ -284,7 +284,7 @@ fn the_consecutive_edits_rule_needs_edit() {
         &[],
         None,
     );
-    assert!(!without.contains("连发几个 edit"), "{without}");
+    assert!(!without.contains("edits[]"), "{without}");
 }
 
 fn project_file(path: &str, content: &str) -> ProjectFile {

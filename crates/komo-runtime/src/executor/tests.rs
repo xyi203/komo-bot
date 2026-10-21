@@ -101,7 +101,8 @@ async fn an_edit_runs_directly() {
 }
 
 /// 同一轮里对同一个文件连发几个 edit：后一个在前一个改完之后才做计划、绑定版本，
-/// 不会因为前一个改过文件而版本冲突（系统提示让模型这样改多处）。
+/// 不会因为前一个改过文件而版本冲突（2026-10-21 起系统提示让模型改多处用一次 edit 带
+/// `edits[]`，但模型照旧连发的这样仍要成立）。
 #[tokio::test]
 async fn consecutive_edits_to_one_file_in_a_round_all_apply() {
     let harness = Harness::new();

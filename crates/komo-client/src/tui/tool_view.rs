@@ -6,7 +6,7 @@
 //! - **头一行**说这次调用动了什么：`bash` 是 `$ 命令`，`read` 是 `路径:起-止`，`rg` 是
 //!   模式与目录。按宽度折行，不截在一屏宽；
 //! - **正文**是它带的那段内容：多行命令与脚本的续行、`write` 写进去的内容、`edit` 的
-//!   diff；
+//!   diff（`edits[]` 改了几处就几段，每段前面标一行 `@@ edits[i]`）；
 //! - **结果**以 `⎿` 起头：`bash`（旧记录叫 `shell`）留尾，其他留头。成功的 `read` / `edit` / `write` 不印——
 //!   前者就是文件本身，后两者的回执头一行已经说了；失败了照印，那是原因。
 //!
@@ -67,7 +67,16 @@ pub fn lines(
             INDENT,
             Style::default().fg(Color::DarkGray),
         )),
-        Body::Diff { old, new } => out.extend(diff_lines(old, new, detail, width)),
+        Body::Diff(hunks) => {
+            // 改了好几处：每一处前面标一行它是 edits 里的第几项，几段 diff 才分得开。
+            let labelled = hunks.len() > 1;
+            for (index, hunk) in hunks.iter().enumerate() {
+                if labelled {
+                    out.push(hunk_label(index, hunk.replace_all));
+                }
+                out.extend(diff_lines(&hunk.old, &hunk.new, detail, width));
+            }
+        }
     }
     if detail {
         out.extend(extra_args(&tool.args, &view.used, width));
@@ -154,11 +163,15 @@ enum Body {
     None,
     /// 一段原样印出来的正文：命令与脚本的续行、要写进文件的内容。
     Text(String),
-    /// `edit` 的 `match_text` → `replace_text`。
-    Diff {
-        old: String,
-        new: String,
-    },
+    /// `edit` 的每一处 `match_text` → `replace_text`；旧的单处参数就是只有一处。
+    Diff(Vec<Hunk>),
+}
+
+/// `edit` 里的一处替换。
+struct Hunk {
+    old: String,
+    new: String,
+    replace_all: bool,
 }
 
 /// 一段正文超出折叠的行数时留哪一头。
@@ -219,17 +232,17 @@ impl View {
                 }
             }
             "edit" => {
+                let hunks = hunks(args);
                 let mut head = text("path").unwrap_or_default().to_string();
-                if args.get("replace_all").and_then(Value::as_bool) == Some(true) {
-                    head.push_str("（全部替换）");
+                match hunks.as_slice() {
+                    [only] if only.replace_all => head.push_str("（全部替换）"),
+                    [] | [_] => {}
+                    many => head.push_str(&format!("（{} 处）", many.len())),
                 }
                 View {
                     head,
-                    body: Body::Diff {
-                        old: text("match_text").unwrap_or_default().to_string(),
-                        new: text("replace_text").unwrap_or_default().to_string(),
-                    },
-                    used: vec!["path", "match_text", "replace_text", "replace_all"],
+                    body: Body::Diff(hunks),
+                    used: vec!["path", "edits", "match_text", "replace_text", "replace_all"],
                     result: Keep::Hidden,
                 }
             }
@@ -273,6 +286,44 @@ impl View {
             },
         }
     }
+}
+
+/// `edit` 的每一处。`edits` 照工具那边一样宽容：编成 JSON 字符串、只给一个对象都认；没有
+/// `edits` 就是旧的单处参数。
+fn hunks(args: &Value) -> Vec<Hunk> {
+    let field = |value: &Value, key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let hunk = |value: &Value| Hunk {
+        old: field(value, "match_text"),
+        new: field(value, "replace_text"),
+        replace_all: value.get("replace_all").and_then(Value::as_bool) == Some(true),
+    };
+    let edits = match args.get("edits") {
+        Some(Value::String(text)) => serde_json::from_str(text).ok(),
+        other => other.cloned(),
+    };
+    match edits {
+        Some(Value::Array(items)) => items.iter().map(hunk).collect(),
+        Some(item @ Value::Object(_)) => vec![hunk(&item)],
+        _ => vec![hunk(args)],
+    }
+}
+
+/// 多处 diff 里每一段前面那一行：`edits` 里的第几项（与工具报错时点名的下标一致）。
+fn hunk_label(index: usize, replace_all: bool) -> Line<'static> {
+    let mut label = format!("@@ edits[{index}]");
+    if replace_all {
+        label.push_str("（全部替换）");
+    }
+    Line::from(vec![
+        Span::raw(INDENT),
+        Span::styled(label, Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 fn text_body(text: &str) -> Body {
@@ -446,7 +497,7 @@ enum Op {
     Added,
 }
 
-/// `edit` 的 diff：`match_text` 与 `replace_text` 逐行比对，没改的行只留首尾几行上下文。
+/// `edit` 一处的 diff：`match_text` 与 `replace_text` 逐行比对，没改的行只留首尾几行上下文。
 ///
 /// 没有行号——客户端看不到文件，只看得到模型给的那两段。
 fn diff_lines(old: &str, new: &str, detail: bool, width: usize) -> Vec<Line<'static>> {
@@ -1014,6 +1065,75 @@ mod tests {
         let text = text_of(&lines(&tool, false, 80, None));
         assert!(!text.contains("- "), "{text}");
         assert!(text.contains("+ b1") && text.contains("+ b2"), "{text}");
+    }
+
+    /// 一次 edit 改了几处：每处一段 diff，前面标一行是 edits 里的第几项；头一行说改了几处。
+    #[test]
+    fn several_edits_render_as_labelled_diffs() {
+        let tool = call(
+            "edit",
+            json!({
+                "path": "a.rs",
+                "edits": [
+                    { "match_text": "let a = 1;", "replace_text": "let a = 2;" },
+                    { "match_text": "x", "replace_text": "y", "replace_all": true },
+                ]
+            }),
+            ToolCallState::Completed,
+            Some("a.rs 替换了 3 处"),
+        );
+        let text = text_of(&lines(&tool, false, 80, None));
+        assert!(text.contains("edit a.rs（2 处）"), "{text}");
+        let first = text.find("@@ edits[0]").expect(&text);
+        let second = text.find("@@ edits[1]（全部替换）").expect(&text);
+        let gone = text.find("- let a = 1;").expect(&text);
+        let x = text.find("- x").expect(&text);
+        assert!(first < gone && gone < second && second < x, "{text}");
+        assert!(text.contains("+ y"), "{text}");
+        assert!(!text.contains("替换了"), "{text}");
+    }
+
+    /// 只有一处的 edits 与旧的单处参数画得一模一样，不标 `@@`；旧参数照常渲染。
+    #[test]
+    fn a_single_edit_looks_the_same_in_either_form() {
+        let legacy = call(
+            "edit",
+            json!({ "path": "a.txt", "match_text": "x\ny", "replace_text": "x\nz", "replace_all": true }),
+            ToolCallState::Completed,
+            None,
+        );
+        let listed = call(
+            "edit",
+            json!({
+                "path": "a.txt",
+                "edits": [{ "match_text": "x\ny", "replace_text": "x\nz", "replace_all": true }]
+            }),
+            ToolCallState::Completed,
+            None,
+        );
+        let legacy = text_of(&lines(&legacy, false, 80, None));
+        assert_eq!(text_of(&lines(&listed, false, 80, None)), legacy);
+        assert!(legacy.contains("a.txt（全部替换）"), "{legacy}");
+        assert!(legacy.contains("- y") && legacy.contains("+ z"), "{legacy}");
+        assert!(!legacy.contains("@@"), "{legacy}");
+    }
+
+    /// 编成 JSON 字符串的 edits 照样拆开画；展开时不再把 edits 当多余参数列一遍。
+    #[test]
+    fn edits_given_as_a_string_still_render_and_are_not_listed_again() {
+        let tool = call(
+            "edit",
+            json!({
+                "path": "a.txt",
+                "edits": r#"[{"match_text":"a","replace_text":"b"},{"match_text":"c","replace_text":"d"}]"#
+            }),
+            ToolCallState::Completed,
+            None,
+        );
+        let text = text_of(&lines(&tool, true, 80, None));
+        assert!(text.contains("@@ edits[1]"), "{text}");
+        assert!(text.contains("- c") && text.contains("+ d"), "{text}");
+        assert!(!text.contains("edits:"), "{text}");
     }
 
     /// 脚本折叠时只给前几行；`Ctrl-T` 打开全给，连同头一行没用到的参数。

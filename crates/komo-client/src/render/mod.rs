@@ -11,10 +11,10 @@ use komo_kernel::protocol::config::{ConfigIssue, IssueSeverity, SourceFile};
 use komo_kernel::protocol::http::{
     CompactionSummary, ConfigCheckResponse, ConfigReloadResponse, ConsolidateAction,
     ConsolidateGroupStatus, ConsolidateOutcome, CronListResponse, HealthResponse, IndexState,
-    InterventionDetail, InterventionListResponse, InterventionSummary, MemoryConsolidateResponse,
-    MemoryIndexStatus, MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse,
-    RunDetail, SessionListResponse, SessionSummary, SweepRule, TelemetryHealth, ToolCallSummary,
-    WindowSource,
+    InterventionDetail, InterventionListResponse, InterventionSummary, McpReconnectResponse,
+    McpServerState, McpServerStatus, MemoryConsolidateResponse, MemoryIndexStatus,
+    MemoryListResponse, MemorySweepResponse, ModelWindow, ModelsResponse, RunDetail,
+    SessionListResponse, SessionSummary, SweepRule, TelemetryHealth, ToolCallSummary, WindowSource,
 };
 use komo_kernel::types::memory::{
     Confirmation, MemoryItem, MemoryKind, MemoryScope, MemoryState, Provenance, RecallDiagnostics,
@@ -900,6 +900,43 @@ fn window_lines(windows: &[ModelWindow]) -> Vec<String> {
     out
 }
 
+/// `komo mcp reconnect`：重连等握手，每台报连完之后的状态（`docs/mcp.md` §2.5）。
+pub fn mcp_reconnect(response: &McpReconnectResponse) -> String {
+    if response.servers.is_empty() {
+        return "config.toml 里没有配置 MCP 服务器".into();
+    }
+    let mut out = vec!["MCP 服务器已重连：".to_string()];
+    out.extend(mcp_server_lines(&response.servers));
+    if response
+        .servers
+        .iter()
+        .any(|server| server.state == McpServerState::Connected)
+    {
+        out.push(String::new());
+        out.push("新连上的工具从下一条 Run 起可用。".into());
+    }
+    out.join("\n")
+}
+
+/// 每台 MCP 服务器一行：名字、状态，有原因就跟在后面。
+fn mcp_server_lines(servers: &[McpServerStatus]) -> Vec<String> {
+    servers
+        .iter()
+        .map(|server| {
+            let state = match server.state {
+                McpServerState::Connecting => "连接中",
+                McpServerState::Connected => "已连上",
+                McpServerState::NeedsAuth => "要登录",
+                McpServerState::Failed => "失败",
+            };
+            match &server.detail {
+                Some(detail) => format!("  {:<12} {state}  {detail}", server.name),
+                None => format!("  {:<12} {state}", server.name),
+            }
+        })
+        .collect()
+}
+
 /// `komo config reload`：**成功**的那一支。
 ///
 /// 校验不过根本走不到这里——那是一个带 `keys` 的 [`ErrorCode::ConfigInvalid`]
@@ -927,21 +964,9 @@ pub fn config_reload(response: &ConfigReloadResponse) -> String {
     }
     if !response.mcp.is_empty() {
         // 重载不等握手（`docs/mcp.md` §2.2）：刚加的多半还在连，连上后从下一条 Run 起可用。
-        use komo_kernel::protocol::http::McpServerState;
         out.push(String::new());
         out.push("MCP 服务器：".into());
-        for server in &response.mcp {
-            let state = match server.state {
-                McpServerState::Connecting => "连接中",
-                McpServerState::Connected => "已连上",
-                McpServerState::NeedsAuth => "要登录",
-                McpServerState::Failed => "失败",
-            };
-            match &server.detail {
-                Some(detail) => out.push(format!("  {:<12} {state}  {detail}", server.name)),
-                None => out.push(format!("  {:<12} {state}", server.name)),
-            }
-        }
+        out.extend(mcp_server_lines(&response.mcp));
     }
     if !response.warnings.is_empty() {
         out.push(String::new());

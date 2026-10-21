@@ -1194,6 +1194,21 @@ pub struct McpServerStatus {
     pub detail: Option<String>,
 }
 
+/// `POST /v1/mcp/reconnect`：点名的 MCP 服务器断开重连（`docs/mcp.md` §2.5）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpReconnectRequest {
+    /// `[mcp.servers.<name>]` 里的名字；空 = 全部。
+    #[serde(default)]
+    pub servers: Vec<String>,
+}
+
+/// 重连等握手：每台服务器连完之后的状态。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpReconnectResponse {
+    #[serde(default)]
+    pub servers: Vec<McpServerStatus>,
+}
+
 /// 照 pi 的 `connecting / connected / needs-auth / failed`。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

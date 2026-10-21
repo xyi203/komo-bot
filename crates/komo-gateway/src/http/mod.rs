@@ -12,6 +12,7 @@ pub mod error;
 pub mod events;
 pub mod idempotency;
 pub mod interventions;
+pub mod mcp;
 pub mod memories;
 pub mod runs;
 pub mod sessions;
@@ -95,6 +96,7 @@ pub fn router(api: Api) -> Router {
         .route("/v1/models", get(config::models))
         .route("/v1/config/check", get(config::check))
         .route("/v1/config/reload", post(config::reload))
+        .route("/v1/mcp/reconnect", post(mcp::reconnect))
         .layer(crate::auth::bearer(token));
 
     open.merge(guarded).with_state(api)

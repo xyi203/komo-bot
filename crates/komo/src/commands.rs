@@ -593,6 +593,11 @@ pub async fn config_reload(client: &KomoClient) -> Outcome {
     }
 }
 
+pub async fn mcp_reconnect(client: &KomoClient, servers: Vec<String>) -> Outcome {
+    let response = client.mcp_reconnect(servers).await.map_err(failed)?;
+    Ok(render::mcp_reconnect(&response))
+}
+
 pub async fn doctor(home: &Path, reconcile: bool) -> Outcome {
     let client = match crate::connect::connect(home).await {
         Ok(client) => client,

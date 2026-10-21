@@ -788,6 +788,24 @@ impl GatewayState {
         self.mcp.statuses()
     }
 
+    /// `komo mcp reconnect`（`docs/mcp.md` §2.5）：点名的服务器（空 = 全部）断开重连，等到有结果；
+    /// 新连上的工具挂进执行器，从下一条 Run 起可用。点了配置里没有的名字交回 `Err`，一台也不动。
+    pub async fn reconnect_mcp(
+        &self,
+        servers: &[String],
+    ) -> Result<Vec<komo_kernel::protocol::http::McpServerStatus>, String> {
+        let statuses = self.mcp.reconnect(servers).await?;
+        let added = self.tool_executor.install(self.mcp.new_tools());
+        if !added.is_empty() {
+            tracing::info!(
+                tools = added.len(),
+                "MCP 服务器重连后挂上了新工具，从下一条 Run 起可用"
+            );
+            self.refresh_skills_prompt();
+        }
+        Ok(statuses)
+    }
+
     /// 按**当前**快照重装 skill 注册表（§5.6）。
     ///
     /// 配置重载是唯一会动它的时刻：`paths.skill_dirs` 改了、人刚 `komo skills disable` 过，

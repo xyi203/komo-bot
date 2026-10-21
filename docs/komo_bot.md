@@ -95,6 +95,7 @@ Gateway 持有模型连接、数据库、Session JSONL 写入器、工具环境�
 | `komo memory index status/rebuild`           | 查看索引覆盖率或重建当前向量索引                                            |
 | `komo config check`                          | 校验各模型、effort、向量参数、渠道名单及其他配置；只读，不改变运行中的 Gateway。数据目录里还留着 `policy.toml` 时报一句"已不再使用，可以删掉"（§7） |
 | `komo config reload`                         | 让 Gateway 立即重载配置（等价于文件保存后的自动重载或 `SIGHUP`）；校验失败则保留旧配置并返回错误 |
+| `komo mcp reconnect [SERVER...]`             | 让 Gateway 断开重连 MCP 服务器（不点名 = 全部），等握手完报各自状态；新连上的工具从下一条 Run 起可用，不用重启 Gateway（`docs/mcp.md` §2.5） |
 | `komo channel list/probe`                    | 渠道清单与连通性核对（飞书 tenant token、Telegram `getMe`、微信凭证文件）；不经 Gateway |
 | `komo channel wechat login`                  | 终端显示二维码完成微信登录，凭证写入数据目录                                |
 | `komo auth codex login`                      | ChatGPT 账号 OAuth 设备码登录（Codex 模型走 `auth = "chatgpt"`，§13.3）；不经 Gateway，凭证写入 `<数据目录>/codex/auth.json`（同微信登录的先例） |
@@ -1226,6 +1227,7 @@ CLI 通过 HTTP 发命令，通过 SSE 观察运行。Gateway 内部采用函数
 | GET /v1/models                   | completion alias 菜单：显示名、上游 model、provider、协议、上下文与 effort 档位 |
 | GET /v1/config/check             | 当前配置的校验结果（与热重载同一个函数）       |
 | POST /v1/config/reload           | 热重载；校验不过 422 并保留原配置               |
+| POST /v1/mcp/reconnect           | 点名的 MCP 服务器（空 = 全部）断开重连，等握手完交回各自状态；名字不在配置里 400（`docs/mcp.md` §2.5） |
 | GET /v1/home-session             | 操作者的 home session（§11.2）                 |
 
 除最小健康检查外统一认证。提交输入、介入答复、Cron 与 Memory 变更都支持幂等请求键；同一键对应不同内容则拒绝。

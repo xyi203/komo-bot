@@ -562,6 +562,15 @@ impl KomoClient {
     pub async fn config_reload(&self) -> ClientResult<ConfigReloadResponse> {
         self.post("/v1/config/reload", &serde_json::json!({})).await
     }
+
+    // ---- /v1/mcp ----
+
+    /// `komo mcp reconnect`：点名的 MCP 服务器断开重连（空 = 全部），等握手完才返回
+    /// （`docs/mcp.md` §2.5）。点了配置里没有的名字是 400。
+    pub async fn mcp_reconnect(&self, servers: Vec<String>) -> ClientResult<McpReconnectResponse> {
+        self.post("/v1/mcp/reconnect", &McpReconnectRequest { servers })
+            .await
+    }
 }
 
 /// 把参数拼成 `?a=1&b=2`。
@@ -1199,6 +1208,29 @@ mod wire_tests {
         let response = server.client().config_reload().await.unwrap();
         assert_eq!(server.requests()[0].method, "POST");
         assert_eq!(response.start_only.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_posts_the_named_servers() {
+        let server = FakeGateway::spawn(|_, _| {
+            Reply::ok(serde_json::json!({
+                "servers": [{"name": "devops", "state": "connected"}]
+            }))
+        })
+        .await;
+        let response = server
+            .client()
+            .mcp_reconnect(vec!["devops".into()])
+            .await
+            .unwrap();
+        let request = &server.requests()[0];
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/v1/mcp/reconnect");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&request.body).unwrap(),
+            serde_json::json!({"servers": ["devops"]})
+        );
+        assert_eq!(response.servers[0].state, McpServerState::Connected);
     }
 
     #[tokio::test]

@@ -936,6 +936,40 @@ fn a_reload_reports_each_mcp_server_state() {
     assert!(!printed.contains("komo gateway restart"), "{printed}");
 }
 
+/// 重连等握手：每台报连完之后的状态，连上了就说工具从下一条 Run 起可用。
+#[test]
+fn a_reconnect_reports_each_server_after_the_handshake() {
+    let printed = mcp_reconnect(&McpReconnectResponse {
+        servers: vec![
+            McpServerStatus {
+                name: "devops".into(),
+                state: McpServerState::Connected,
+                detail: None,
+            },
+            McpServerStatus {
+                name: "jira".into(),
+                state: McpServerState::Failed,
+                detail: Some("握手失败".into()),
+            },
+        ],
+    });
+    insta_like(
+        &printed,
+        &[
+            "MCP 服务器已重连",
+            "devops",
+            "已连上",
+            "jira",
+            "失败  握手失败",
+            "下一条 Run",
+        ],
+    );
+    assert_eq!(
+        mcp_reconnect(&McpReconnectResponse::default()),
+        "config.toml 里没有配置 MCP 服务器"
+    );
+}
+
 #[test]
 fn a_reload_that_changed_nothing_says_so() {
     let printed = config_reload(&ConfigReloadResponse::default());

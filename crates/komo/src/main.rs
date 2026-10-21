@@ -76,6 +76,11 @@ enum Command {
         #[command(subcommand)]
         action: ConfigCommand,
     },
+    /// MCP 服务器（docs/mcp.md）。
+    Mcp {
+        #[command(subcommand)]
+        action: McpCommand,
+    },
     /// 渠道清单、连通性核对与微信登录；不经 Gateway（§3）。
     Channel {
         #[command(subcommand)]
@@ -377,6 +382,15 @@ enum ConfigCommand {
     Check,
     /// 让 Gateway 立即重载配置；校验失败则保留旧配置并返回错误。
     Reload,
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// 让 Gateway 断开重连 MCP 服务器，等握手完报各自的状态；不用重启 Gateway（docs/mcp.md §2.5）。
+    Reconnect {
+        /// `[mcp.servers.<name>]` 里的名字；不写就是全部。
+        servers: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -741,6 +755,9 @@ async fn operator(
             ConfigCommand::Check => commands::config_check(client).await,
             ConfigCommand::Reload => commands::config_reload(client).await,
         },
+        Command::Mcp { action } => match action {
+            McpCommand::Reconnect { servers } => commands::mcp_reconnect(client, servers).await,
+        },
         _ => Err("没有这条命令".into()),
     }
 }
@@ -1081,6 +1098,22 @@ mod tests {
 
         // 少一个必填项就该失败，而不是用一个猜出来的默认值跑起来。
         assert!(Cli::try_parse_from(["komo", "cron", "add", "--name", "x"]).is_err());
+    }
+
+    /// `komo mcp reconnect` 不点名就是全部，点名可以点几台。
+    #[test]
+    fn mcp_reconnect_takes_zero_or_more_servers() {
+        let servers = |args: &[&str]| match Cli::parse_from(args).command {
+            Some(Command::Mcp {
+                action: McpCommand::Reconnect { servers },
+            }) => servers,
+            _ => panic!("解析不出 mcp reconnect"),
+        };
+        assert!(servers(&["komo", "mcp", "reconnect"]).is_empty());
+        assert_eq!(
+            servers(&["komo", "mcp", "reconnect", "devops-mcp-prod", "cloudflare"]),
+            vec!["devops-mcp-prod", "cloudflare"]
+        );
     }
 
     /// §10 的 Job 字段在 CLI 上**全都有 flag**：`komo cron add` 是唯一的写入口

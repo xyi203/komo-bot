@@ -433,3 +433,111 @@ async fn a_resumable_monitor_past_its_deadline_is_not_relaunched() {
 
     gateway.stop().await;
 }
+
+/// 监听事件在宿主仍在跑时到达：必须在下一个工具边界并入原 Run，不能排到整条宿主 Run
+/// 之后（session `01a1588d` seq 177：结束消息排了 46 秒）。
+#[tokio::test]
+async fn a_monitor_event_interjects_into_the_still_running_host() {
+    use tokio::sync::Notify;
+
+    struct BusyLlm {
+        waiting: Arc<Notify>,
+        proceed: Arc<Notify>,
+    }
+    struct BusyDriver {
+        waiting: Arc<Notify>,
+        proceed: Arc<Notify>,
+        step: u32,
+    }
+    #[async_trait::async_trait]
+    impl LlmClient for BusyLlm {
+        async fn begin_turn(&self, req: TurnRequest) -> Result<Box<dyn TurnDriver>, LlmError> {
+            if last_user_text(&req).starts_with("[监听") {
+                return Ok(Box::new(ScriptDriver {
+                    script: Script::Reply("已读到监听事件".into()),
+                }));
+            }
+            Ok(Box::new(BusyDriver {
+                waiting: self.waiting.clone(),
+                proceed: self.proceed.clone(),
+                step: 0,
+            }))
+        }
+    }
+    #[async_trait::async_trait]
+    impl TurnDriver for BusyDriver {
+        async fn next(&mut self, _input: RoundInput) -> Result<Round, LlmError> {
+            let step = self.step;
+            self.step += 1;
+            match step {
+                0 => call_round(
+                    1,
+                    "pc-monitor",
+                    "monitor",
+                    serde_json::json!({
+                        "command": "echo tick; while true; do sleep 1; done",
+                        "title": "测试监听",
+                        "timeout_minutes": 2
+                    }),
+                ),
+                1 => {
+                    self.waiting.notify_one();
+                    self.proceed.notified().await;
+                    call_round(
+                        2,
+                        "pc-boundary",
+                        "bash",
+                        serde_json::json!({"command": "echo checkpoint"}),
+                    )
+                }
+                _ => text_round(3, "仍未读到监听事件"),
+            }
+        }
+        fn usage(&self) -> TokenUsage {
+            TokenUsage::default()
+        }
+    }
+
+    let home = Home::with_config(&config());
+    let waiting = Arc::new(Notify::new());
+    let proceed = Arc::new(Notify::new());
+    let llm = Arc::new(BusyLlm {
+        waiting: waiting.clone(),
+        proceed: proceed.clone(),
+    });
+    let gateway = home.start(llm).await;
+    let session = gateway.open_session().await;
+    let host = gateway
+        .submit(&session, "busy-host", "挂上监听后继续处理")
+        .await;
+    tokio::time::timeout(Duration::from_secs(10), waiting.notified())
+        .await
+        .expect("模型已拿到监听回执");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if home.events(&session).iter().any(|event| {
+                matches!(&event.payload, komo_kernel::events::EventPayload::RunAccepted(body) if body.request_key.as_str().starts_with("monitor:"))
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.expect("监听事件已受理");
+    proceed.notify_one();
+    let detail = gateway.wait_terminal(&host.run).await;
+    wait_run_keyed(&gateway, &session, "monitor:", Duration::from_secs(10)).await;
+    let event_state = runs_of(&gateway, &session)
+        .await
+        .iter()
+        .find(|run| run.request_key.as_str().starts_with("monitor:"))
+        .unwrap()
+        .state;
+    gateway.stop().await;
+
+    assert_eq!(detail.final_message.as_deref(), Some("已读到监听事件"));
+    assert_eq!(
+        event_state,
+        RunState::Absorbed,
+        "监听事件应并进宿主，而非另排一轮"
+    );
+}

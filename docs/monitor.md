@@ -20,7 +20,7 @@
                                         │ stdout 逐行
                                         ▼
                      泵：连着出的行合成一条，上一条没收尾时攒着
-                                        │ submit（请求键 monitor:{id}:{n}）
+                                        │ submit_interjecting（请求键 monitor:{id}:{n}）
                                         ▼
                      同一个会话："[监听 #3f2a「标题」]\n<行>…" → 模型跑一轮，需要的话转告用户
                                         │ 脚本退出 / 超时 / 刷屏
@@ -33,6 +33,11 @@
   （kernel 的 `Monitors` 接缝，装配与 `TaskSpawner` 同一个接法）。codemode 脚本里调不了。
 - **事件交回挂它的会话，投给挂它那条 Run 的来源对端**（`runs.peer`）。在 home 里挂的，
   事件经 home 的模型转告到聊天；在 TUI 里挂的，事件在事件流里看得到。
+- **事件与结束消息都按插话交回（2026-10-21）。** 事件、正常结束消息、重启后的"已中断"
+  都走 `submit_interjecting`，与后台命令的完成通知（§8）同一套资格检查：宿主还在跑、
+  对端与模型快照对得上时，在下一个工具边界并进去（`absorbed`，终态，泵照样放下一批）；
+  否则照常排队。起因是 session `01a1588d` seq 177：「监听已结束」排了 46.44s，等宿主 Run
+  收尾才处理；24ebb1a9 当时只改了 `detached.rs`。
 - **只有 stdout 的行算事件。** 空行丢掉；一行最多 1000 个字符。stderr 不当事件，结束时
   带最后 20 行。
 - **脚本按 `bash` 的规矩起**：`BashTool::child_spec` 给出 bash（没有就 `/bin/sh`）、bwrap
@@ -133,6 +138,8 @@ komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（
   事件都交回了，后一条注明断过。
 - `a_resumable_monitor_past_its_deadline_is_not_relaunched`：截止时刻已过的不重起，交回
   "时限已经到了"。
+- `a_monitor_event_interjects_into_the_still_running_host`：宿主挂完监听后还在跑，事件在下一个
+  工具边界以 `absorbed` 并进原 Run，宿主读得到它。换回 `submit` 时测试失败。
 
 单元测试：`service::monitors`（切行、合批、结束原因、`etime` 解析、正文）、
 `tools::monitor`（计划、时限收紧、空参数、`resume_after_restart` 默认关且旧计划字节不变）、`types::monitor`（短号、时限）。
@@ -184,7 +191,7 @@ komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（
   （`OutputFile::Background`）。转后台之前的输出在那次调用的结果里。
 - **时限。** 原 `timeout_secs`（受 `call_timeout_secs` 收紧）从调用开始算，到点在后台终止进程组，结束消息
   报「超时」。
-- **结束消息**与监听同一条投递路径（`submit`，对端取挂它那条 Run 的 `runs.peer`）。`monitor_stop` 停掉它
+- **结束消息**与监听同一条投递路径（`submit_interjecting`，对端取挂它那条 Run 的 `runs.peer`）。`monitor_stop` 停掉它
   时与监听不同：**会**交回一条「已被 monitor_stop 停止」（监听是模型自己停的、不再交回）。
 - **重启。** 子进程随 Gateway 停机终止，登记 `runtime/monitors/<id>.json`（带 `detached`）留着；子进程
   另在 `runtime/monitors/children/` 在册，崩溃遗留的进程组按监听同一套核对身份后终止。下一代启动给会话

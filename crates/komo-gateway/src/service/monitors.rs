@@ -313,7 +313,7 @@ impl GatewayMonitors {
         };
         if let Err(error) = self
             .state
-            .submit(&record.session, key, text, peer, None)
+            .submit_interjecting(&record.session, key, text, peer, None)
             .await
         {
             tracing::warn!(%error, monitor = %record.id, "监听中断的消息交不回会话");
@@ -430,7 +430,13 @@ impl GatewayMonitors {
                     }
                     batch = Batch::default();
                     let key = RequestKey::new(format!("{key_prefix}:{events}"));
-                    match self.state.submit(&session, key, text, peer.clone(), None).await {
+                    // 宿主还在跑时在下一个工具边界并进去，不排到整条 Run 后面；并进去的
+                    // `absorbed` 也是终态，`settled` 照样放下一批。
+                    match self
+                        .state
+                        .submit_interjecting(&session, key, text, peer.clone(), None)
+                        .await
+                    {
                         Ok(response) => in_flight = Some((response.run, Instant::now())),
                         Err(error) => end_with(
                             &ending,
@@ -457,7 +463,11 @@ impl GatewayMonitors {
                     &stderr,
                 );
                 let key = RequestKey::new(format!("monitor-end:{id}"));
-                if let Err(error) = self.state.submit(&session, key, text, peer, None).await {
+                if let Err(error) = self
+                    .state
+                    .submit_interjecting(&session, key, text, peer, None)
+                    .await
+                {
                     tracing::warn!(%error, monitor = %id, "监听的结束消息交不回会话");
                 }
             }

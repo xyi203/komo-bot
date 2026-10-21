@@ -58,16 +58,19 @@ impl EventHub {
     }
 
     /// 订阅一个 Session 的直播。**先订阅再补读**，中间新来的事件才不会漏。
+    ///
+    /// 广播表只留有人订阅的 Session：订阅者都走了的那些顺手在这里清掉（[`publish`]
+    /// 也会清自己那一条），否则表随 Session 数只增不减。清掉之后再订阅就新建一个——
+    /// 增删都在同一把锁里，不会和订阅抢。
+    ///
+    /// [`publish`]: EventHub::publish
     pub fn subscribe(&self, session: &SessionId) -> tokio::sync::broadcast::Receiver<SseFrame> {
-        self.sender(session).subscribe()
-    }
-
-    fn sender(&self, session: &SessionId) -> tokio::sync::broadcast::Sender<SseFrame> {
         let mut channels = self.channels.lock().expect("事件广播表");
+        channels.retain(|_, sender| sender.receiver_count() > 0);
         channels
             .entry(session.clone())
             .or_insert_with(|| tokio::sync::broadcast::channel(CHANNEL_CAPACITY).0)
-            .clone()
+            .subscribe()
     }
 
     /// 记下"有一个客户端在看这个 Session"，返回一个**掉了就减一**的守卫。
@@ -100,9 +103,20 @@ impl EventHub {
             .unwrap_or(0)
     }
 
-    /// 推一帧。没有订阅者就当没发生。
+    /// 推一帧。没有订阅者就当没发生——不为它建广播，订阅者都走了就把这一条删掉。
     pub fn publish(&self, frame: SseFrame) {
-        let _ = self.sender(&frame.session).send(frame);
+        let mut channels = self.channels.lock().expect("事件广播表");
+        let Some(sender) = channels.get(&frame.session) else {
+            return;
+        };
+        if sender.send(frame.clone()).is_err() {
+            channels.remove(&frame.session);
+        }
+    }
+
+    #[cfg(test)]
+    fn channel_count(&self) -> usize {
+        self.channels.lock().expect("事件广播表").len()
     }
 
     /// 一条日志事件进来时推出去的那几帧：事件本身，加上它派生出的状态帧。
@@ -242,6 +256,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn publishing_to_an_unwatched_session_keeps_no_channel() {
+        let hub = EventHub::new();
+        hub.publish_event(&completed(1));
+        assert_eq!(hub.channel_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_channel_is_dropped_once_its_last_subscriber_leaves() {
+        let hub = EventHub::new();
+        let session = SessionId::from_raw("sess-1");
+        drop(hub.subscribe(&session));
+        assert_eq!(hub.channel_count(), 1, "还没推过帧，表里先留着");
+
+        hub.publish_event(&completed(1));
+        assert_eq!(hub.channel_count(), 0, "推帧时发现没人订阅就删掉");
+
+        let mut sub = hub.subscribe(&session);
+        hub.publish_event(&completed(2));
+        let frame = sub.recv().await.expect("删掉后再订阅照样收得到");
+        assert_eq!(frame.id, Seq(2));
+    }
+
+    #[test]
+    fn subscribing_sweeps_channels_nobody_listens_to() {
+        let hub = EventHub::new();
+        drop(hub.subscribe(&SessionId::from_raw("sess-old")));
+        let _sub = hub.subscribe(&SessionId::from_raw("sess-new"));
+        assert_eq!(hub.channel_count(), 1);
     }
 
     #[test]

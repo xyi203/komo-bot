@@ -189,6 +189,7 @@ impl GatewayMonitors {
                 timeout_minutes: 0,
                 cancel: cancel.clone(),
                 ending: Arc::clone(&ending),
+                finished: None,
             },
         );
         let peer = record.peer.as_deref().and_then(ChannelPeer::parse);
@@ -260,6 +261,16 @@ impl GatewayMonitors {
             Ok(Driven::Detached(_)) => unreachable!("接手后不再给 detach_at"),
             Err(error) => (Some(format!("后台命令出错：{error}")), String::new()),
         };
+        self.finish(
+            &id,
+            match (&decided, &headline) {
+                (Some(Ending::Stopped), _) => Some("已经停掉了".into()),
+                (_, Some(headline)) => Some(format!(
+                    "已结束（{headline}）；结束消息会单独交回会话（可能已经到了）"
+                )),
+                (_, None) => None,
+            },
+        );
         if let Some(headline) = headline {
             let text = done_text(&id, &title, &headline, elapsed, &tail, &info.reference);
             let key = end_key(&info.call);
@@ -278,7 +289,7 @@ impl GatewayMonitors {
             self.forget_record(&id);
         }
         let _ = self.children.forget(&ExecutorId::from_raw(id.clone()), pid);
-        self.running.lock().expect("监听表").remove(&id);
+        self.retire(&id);
     }
 
     /// 上一代留下的转后台命令：进程已经没了（或被核对身份后终止），结果不明。

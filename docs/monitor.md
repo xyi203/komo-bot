@@ -75,6 +75,14 @@
 `monitor_stop(monitor_id)` 只在挂它的那个会话里找；短号对不上时列出这个会话还在跑的监听，
 撞号时列出 6 位候选。
 
+**停一个已经结束的不算失败（2026-10-21）。** 处理事件的 Run 常常在脚本自己退出之后才调
+`monitor_stop`：session `01a153c3` seq 3578，#cd64 05:55:53 已退出（exit=0），05:56:33 的 `monitor_stop`
+得到「停不了：#cd64 不在跑」；#24e5 同样撞上，模型据此误报「监听没报结果就没了」。现在进程收尾时
+（交结束消息之前）在 `Live.finished` 记下说法，摘表时挪进“刚结束”表（这一代 Gateway 内存里，最多 64 个）；
+`monitor_stop` 对上它就成功返回「不用停了：监听 #cd64「…」已结束：脚本退出（exit=0）；结束消息会单独
+交回会话（可能已经到了）」，再停一个自己停过的答「已经停掉了」。只认同一个会话；重启之后不认。
+转后台的 `bash` 走同一套。
+
 ## 5. 重启
 
 **监听默认不跨重启。** 进程只活在这一代 Gateway 里：
@@ -185,7 +193,7 @@ komo 重启了三次，监听断了三次，每次都要模型多跑一整轮（
   回答没有工具边界时也仍排在后面。起因是 session `01a157e3`：#8b08 在 14:50:03 已结束，
   普通通知却排到 14:52:34 才跑，宿主期间仍拿旧回执调用 monitor_stop。新回归
   `a_detached_completion_interjects_into_the_still_running_host` 用可控子进程复现，确认完成通知
-  以 `absorbed` 合入原 Run。它不改变 `monitor_stop` 对未知编号的判定；完成与停止仍可能竞态。
+  以 `absorbed` 合入原 Run。完成与停止仍可能竞态；竞态时 `monitor_stop` 答「不用停了：…已结束」（见 §4）。
 - **输出。** `stdout.txt` / `stderr.txt` 在结算时已按哈希封口，不能再追加；转后台之后的输出（两路按到达
   顺序混写）进同一尝试目录的 `background.log`，入口 `artifact://<run>/<call>/<attempt>/background`
   （`OutputFile::Background`）。转后台之前的输出在那次调用的结果里。

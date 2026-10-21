@@ -62,6 +62,9 @@ const IN_FLIGHT_PATIENCE: Duration = Duration::from_secs(600);
 const STDERR_TAIL_LINES: usize = 20;
 /// 停机时等泵收尾的上限（`run_child` 自己 TERM → KILL 各等 5 秒）。
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(12);
+/// 记住最近结束的这么多个监听：脚本自己收尾与 `monitor_stop` 竞态时，凭它答“已经结束了”，
+/// 不答“不在跑”。只活在这一代 Gateway 里。
+const RECENTLY_ENDED: usize = 64;
 
 /// `runtime/monitors/<id>.json`：一个正在跑的监听。下一代启动时按它告诉会话"中断了"，
 /// 或者（带着 [`Resume`] 时）把它重新挂上。
@@ -143,6 +146,17 @@ struct Live {
     cancel: CancelToken,
     /// 由外面决定的结束原因（停、停机、泵自己判的刷屏）。先写原因再取消。
     ending: Arc<Mutex<Option<Ending>>>,
+    /// 进程已经收尾、泵还在交结束消息：给 `monitor_stop` 的说法（见 [`Ended::how`]）。
+    finished: Option<String>,
+}
+
+/// 刚结束的一个监听（或转后台的命令）。
+struct Ended {
+    id: String,
+    session: SessionId,
+    title: String,
+    /// 怎么结束的、结束消息交不交回，原样念给调 `monitor_stop` 的模型。
+    how: String,
 }
 
 impl Live {
@@ -175,6 +189,8 @@ pub struct GatewayMonitors {
     /// `runtime/monitors/children`：每个监听一份在册（executor 位上写监听 id）。
     children: ChildRegistry,
     running: Mutex<HashMap<String, Live>>,
+    /// 最近结束的，最多 [`RECENTLY_ENDED`] 个。锁序：先 `running` 后它。
+    ended: Mutex<VecDeque<Ended>>,
     closing: std::sync::atomic::AtomicBool,
 }
 
@@ -188,8 +204,39 @@ impl GatewayMonitors {
             children: ChildRegistry::new(dir.join("children")),
             dir,
             running: Mutex::new(HashMap::new()),
+            ended: Mutex::new(VecDeque::new()),
             closing: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// 进程收尾了：记下给 `monitor_stop` 的说法（`None` 是停机，不记）。在交结束消息之前调，
+    /// 这之后的 `monitor_stop` 不再把它当成还在跑。
+    fn finish(&self, id: &str, how: Option<String>) {
+        if let Some(live) = self.running.lock().expect("监听表").get_mut(id) {
+            live.finished = how;
+        }
+    }
+
+    /// 从在跑表里摘掉；收尾时记过说法的挪进“刚结束”。摘与记在同一把锁里，`stop` 不会
+    /// 两边都看不到它。
+    fn retire(&self, id: &str) {
+        let mut running = self.running.lock().expect("监听表");
+        let Some(live) = running.remove(id) else {
+            return;
+        };
+        let Some(how) = live.finished else {
+            return;
+        };
+        let mut ended = self.ended.lock().expect("刚结束的监听");
+        if ended.len() >= RECENTLY_ENDED {
+            ended.pop_front();
+        }
+        ended.push_back(Ended {
+            id: id.to_string(),
+            session: live.session,
+            title: live.title,
+            how,
+        });
     }
 
     fn record_path(&self, id: &str) -> PathBuf {
@@ -451,6 +498,7 @@ impl GatewayMonitors {
         let outcome = child.await;
         let decided = ending.lock().expect("监听的结束原因").clone();
         let (end, stderr) = settle(decided, outcome, timeout_minutes);
+        self.finish(&id, stop_reply(&end));
         match end {
             Ending::Stopped | Ending::Shutdown => {}
             ref end => {
@@ -476,7 +524,7 @@ impl GatewayMonitors {
         if end != Ending::Shutdown {
             self.forget_record(&id);
         }
-        self.running.lock().expect("监听表").remove(&id);
+        self.retire(&id);
     }
 
     /// 起一个监听：写登记、起进程、交给泵。新挂与重挂都走这里；重挂用登记里原来的 id 与
@@ -525,6 +573,7 @@ impl GatewayMonitors {
             timeout_minutes: resume.timeout_minutes,
             cancel: CancelToken::new(),
             ending: Arc::new(Mutex::new(None)),
+            finished: None,
         };
         let handle = live.handle(&id);
         self.running
@@ -557,6 +606,18 @@ impl GatewayMonitors {
             // 读不出来就当它还在跑：等满 IN_FLIGHT_PATIENCE 或下一拍再看。
             Err(_) => false,
         }
+    }
+}
+
+/// 监听已经结束后再调 `monitor_stop` 时的说法。停机不记（下一代才交回“中断了”）。
+fn stop_reply(end: &Ending) -> Option<String> {
+    match end {
+        Ending::Shutdown => None,
+        Ending::Stopped => Some("已经停掉了".into()),
+        end => Some(format!(
+            "{}；结束消息会单独交回会话（可能已经到了）",
+            end.headline()
+        )),
     }
 }
 
@@ -653,6 +714,17 @@ impl Monitors for GatewayMonitors {
             .collect();
         match matched.as_slice() {
             [] => {
+                // 刚自己结束的：答它怎么结束的，不答“不在跑”。短号撞了取最近的那个。
+                let ended = self.ended.lock().expect("刚结束的监听");
+                if let Some(done) = ended.iter().rev().find(|done| {
+                    done.session == session && monitor::matches_short_id(&done.id, monitor_id)
+                }) {
+                    return Ok(MonitorStopped {
+                        short_id: monitor::short_id(&done.id),
+                        title: done.title.clone(),
+                        already_ended: Some(done.how.clone()),
+                    });
+                }
                 let listed = mine
                     .iter()
                     .map(|(id, live)| format!("#{}「{}」", monitor::short_id(id), live.title))
@@ -667,10 +739,13 @@ impl Monitors for GatewayMonitors {
                 }))
             }
             [(id, live)] => {
-                end_with(&live.ending, &live.cancel, Ending::Stopped);
+                if live.finished.is_none() {
+                    end_with(&live.ending, &live.cancel, Ending::Stopped);
+                }
                 Ok(MonitorStopped {
                     short_id: monitor::short_id(id),
                     title: live.title.clone(),
+                    already_ended: live.finished.clone(),
                 })
             }
             many => {

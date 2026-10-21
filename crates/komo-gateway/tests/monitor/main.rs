@@ -298,6 +298,13 @@ async fn stopping_kills_the_script_and_reports_nothing_more() {
     tokio::time::sleep(Duration::from_millis(800)).await;
     assert!(!marker.exists(), "停掉之后脚本还在跑");
 
+    let again = gateway
+        .submit(&session, "stop-again", &format!("停：{short}"))
+        .await;
+    let detail = gateway.wait_terminal(&again.run).await;
+    let reply = detail.final_message.unwrap_or_default();
+    assert!(reply.contains("已经停掉了"), "再停一次是幂等的：{reply}");
+
     assert!(
         !runs_of(&gateway, &session)
             .await
@@ -306,6 +313,42 @@ async fn stopping_kills_the_script_and_reports_nothing_more() {
         "模型自己停的，不该再交回结束消息"
     );
     assert!(monitor_records(&home).is_empty());
+
+    gateway.stop().await;
+}
+
+/// 脚本自己退出之后才调 `monitor_stop`（处理上一条事件的 Run 与脚本收尾竞态）：答“已经结束了”
+/// 和怎么结束的，不算失败，也不说它“不在跑”。起因是 session `01a153c3` seq 3578。
+#[tokio::test]
+async fn stopping_a_monitor_that_already_exited_says_how_it_ended() {
+    let home = Home::with_config(&config());
+    let llm = MonitorLlm::new(Duration::ZERO);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+
+    let (session, short) = arm(&gateway, "sleep 0.5; exit 0").await;
+    wait_run_keyed(&gateway, &session, "monitor-end:", Duration::from_secs(20)).await;
+
+    let stop = gateway
+        .submit(&session, "stop-late", &format!("停：{short}"))
+        .await;
+    let detail = gateway.wait_terminal(&stop.run).await;
+    let reply = detail.final_message.unwrap_or_default();
+    assert!(
+        reply.contains(&format!(
+            "不用停了：监听 #{short}「测试监听」已结束：脚本退出（exit=0）"
+        )),
+        "{reply}"
+    );
+    assert!(!reply.contains("停不了"), "{reply}");
+
+    // 别的会话用同一个短号停不到它。
+    let other = gateway.open_session().await;
+    let stop = gateway
+        .submit(&other, "stop-other", &format!("停：{short}"))
+        .await;
+    let detail = gateway.wait_terminal(&stop.run).await;
+    let reply = detail.final_message.unwrap_or_default();
+    assert!(reply.contains("停不了"), "{reply}");
 
     gateway.stop().await;
 }

@@ -177,7 +177,8 @@ impl Tool for MonitorStopTool {
             name: "monitor_stop".into(),
             description: "停掉这个会话挂着的一个监听（终止它的整个进程组）。monitor_id 是挂上时\
                           给的短号（例如 3f2a）；给错了会列出还在跑的那些。停掉之后不会再交回\
-                          结束消息。"
+                          结束消息。它已经自己结束了也没关系：会告诉你怎么结束的，\
+                          结束消息照常单独交回。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",

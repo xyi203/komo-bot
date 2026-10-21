@@ -49,6 +49,10 @@ pub struct MonitorHandle {
 pub struct MonitorStopped {
     pub short_id: String,
     pub title: String,
+    /// 停之前它已经自己结束了（脚本退出与停止竞态）：怎么结束的、结束消息会不会交回。
+    /// `None` 是这次停掉的。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub already_ended: Option<String>,
 }
 
 /// 监听短号：id 末 4 位（UUIDv7 的随机段），与任务短号同一个取法。

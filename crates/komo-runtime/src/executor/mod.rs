@@ -1456,11 +1456,18 @@ impl ToolExecutor {
     ) -> Result<CallSettlement, ExecError> {
         let (result, content, is_error) = match outcome {
             Ok(stopped) => {
-                let content = format!("已停止监听 #{}：{}", stopped.short_id, stopped.title);
+                let content = match &stopped.already_ended {
+                    None => format!("已停止监听 #{}：{}", stopped.short_id, stopped.title),
+                    Some(how) => format!(
+                        "不用停了：监听 #{}「{}」{how}",
+                        stopped.short_id, stopped.title
+                    ),
+                };
                 (
                     serde_json::json!({
                         "short_id": stopped.short_id,
                         "title": stopped.title,
+                        "already_ended": stopped.already_ended,
                     }),
                     content,
                     false,

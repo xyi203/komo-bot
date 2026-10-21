@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use komo_kernel::events::EventPayload;
+use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::traits::{Clock, Ledger, LedgerError, OutputWriter, StoreError, ToolOutputStore};
 use komo_kernel::types::ids::{AttemptId, EventId, ExecutorId, RunId, Seq, SessionId, ToolCallId};
 use komo_kernel::types::plan::{ExecutionPlan, PlanSource};
@@ -416,41 +416,43 @@ impl RoutedLedger {
     /// Run 能不能领靠的正是"内容在不在"。直接按路径读磁盘：目录不在就是读不出来（补记
     /// 不到任何东西），不替它造一份空的。
     pub async fn learn(&self, session: &SessionId) -> Result<(), LedgerError> {
-        let paths = self.ledgers.paths_for(session);
-        let mut from = Seq::ZERO;
-        loop {
-            let (events, more) =
-                komo_store::session_log::read_events(&paths, session, from, 0).await?;
-            if events.is_empty() {
-                return Ok(());
+        for event in &self.read_all(session).await? {
+            if let Some(run) = &event.run {
+                self.note_run(run, session);
             }
-            for event in &events {
-                from = from.max(event.seq);
-                if let Some(run) = &event.run {
-                    self.note_run(run, session);
+            match &event.payload {
+                EventPayload::MessageAssistant(body) => {
+                    for call in &body.tool_calls {
+                        self.note_call(&call.call_id, session);
+                    }
                 }
-                match &event.payload {
-                    EventPayload::MessageAssistant(body) => {
-                        for call in &body.tool_calls {
-                            self.note_call(&call.call_id, session);
-                        }
-                    }
-                    EventPayload::ToolPlanned(body) => self.note_call(&body.call_id, session),
-                    EventPayload::ToolStarted(body) => {
-                        self.note_call(&body.call_id, session);
-                        self.note_attempt(&body.attempt_id, session);
-                    }
-                    EventPayload::ToolResult(body) => {
-                        self.note_call(&body.call_id, session);
-                        self.note_attempt(&body.attempt_id, session);
-                    }
-                    _ => {}
+                EventPayload::ToolPlanned(body) => self.note_call(&body.call_id, session),
+                EventPayload::ToolStarted(body) => {
+                    self.note_call(&body.call_id, session);
+                    self.note_attempt(&body.attempt_id, session);
                 }
-            }
-            if !more {
-                return Ok(());
+                EventPayload::ToolResult(body) => {
+                    self.note_call(&body.call_id, session);
+                    self.note_attempt(&body.attempt_id, session);
+                }
+                _ => {}
             }
         }
+        Ok(())
+    }
+
+    /// 读完一个 Session 的日志：文件只读一次、每行只解析一次，不像 [`Ledger::read`]
+    /// 那样每翻一页都把整份文件重读重解析。与 `read` 同样直接按路径读磁盘（§8.9）。
+    pub async fn read_all(&self, session: &SessionId) -> Result<Vec<Event>, LedgerError> {
+        komo_store::session_log::read_all(&self.ledgers.paths_for(session), session).await
+    }
+
+    /// 最后一条事件的时间戳，只读日志末尾一小块（会话列表用）。
+    pub async fn last_event_ts(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<time::OffsetDateTime>, LedgerError> {
+        komo_store::session_log::last_event_ts(&self.ledgers.paths_for(session)).await
     }
 
     async fn for_run(&self, run: &RunId) -> Result<Arc<SessionEntry>, LedgerError> {

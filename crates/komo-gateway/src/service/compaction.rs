@@ -24,9 +24,9 @@ use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::fold;
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::protocol::config::CompactionConfig;
-use komo_kernel::traits::{Clock, Ledger, LedgerError, ToolOutputStore};
+use komo_kernel::traits::{Clock, LedgerError, ToolOutputStore};
 use komo_kernel::types::agent::ProjectFile;
-use komo_kernel::types::ids::{RunId, Seq, SessionId, ToolCallId};
+use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::tool::{ToolDefinition, ToolNamespace};
 use komo_runtime::agent::CompactionPlanner;
@@ -156,24 +156,10 @@ pub(crate) fn decide(facts: Facts<'_>) -> Option<Reshape> {
 
 /// 读完一个 Session 的日志。
 pub(crate) async fn read_events(
-    ledger: &dyn Ledger,
+    ledger: &RoutedLedger,
     session: &SessionId,
 ) -> Result<Vec<Event>, LedgerError> {
-    let mut all = Vec::new();
-    let mut from = Seq::ZERO;
-    loop {
-        let batch = ledger.read(session, from, 0).await?;
-        if batch.events.is_empty() {
-            return Ok(all);
-        }
-        for event in batch.events {
-            from = from.max(event.seq);
-            all.push(event);
-        }
-        if batch.next.is_none() {
-            return Ok(all);
-        }
-    }
+    ledger.read_all(session).await
 }
 
 /// 一轮收尾之后来问的那一个（`komo_runtime::agent::CompactionPlanner`）。这一段装配时

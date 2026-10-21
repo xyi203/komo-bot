@@ -2,7 +2,6 @@
 
 use axum::Json;
 use axum::extract::{Path, State};
-use komo_kernel::fold::fold;
 use komo_kernel::protocol::http::{
     BoundaryRequest, BoundaryResponse, CreateSessionRequest, DeleteSessionRequest,
     InterventionListQuery, PurgeSessionRequest, PurgeSessionResponse, ResumeRequest,
@@ -15,7 +14,7 @@ use komo_kernel::types::status::{RunState, WaitReason};
 
 use super::error::{ApiFailure, ApiResult};
 use super::idempotency::body_hash;
-use super::{Api, created_at, events_of};
+use super::{Api, created_at};
 
 /// `GET /v1/sessions`
 ///
@@ -342,9 +341,9 @@ async fn unfinished_of(
     )
 }
 
+/// 最后一条事件的时刻，与 `fold(..).last_at` 同义；只读日志末尾，不读全量历史。
 async fn last_event_at(api: &Api, session: &SessionId) -> Option<time::OffsetDateTime> {
-    let events = events_of(api, session).await.ok()?;
-    fold(&events).last_at
+    api.state.routed.last_event_ts(session).await.ok().flatten()
 }
 
 /// 本次 Run 的模型覆盖。

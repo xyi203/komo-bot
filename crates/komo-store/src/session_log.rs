@@ -386,29 +386,103 @@ pub async fn read_events(
     from: Seq,
     limit: u32,
 ) -> Result<(Vec<Event>, bool), LedgerError> {
-    let bytes = match tokio::fs::read(paths.events()).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), false)),
+    let Some(bytes) = read_file(paths).await? else {
+        return Ok((Vec::new(), false));
+    };
+    let page = if limit == 0 { DEFAULT_PAGE } else { limit } as usize;
+
+    // 校验照旧扫完整份；只把这一页的事件留下，多留一条用来判断后面还有没有。
+    let mut events = Vec::new();
+    scan_keeping(&bytes, session, &TailExpectation::default(), &mut |event| {
+        if event.seq.0 > from.0 && events.len() <= page {
+            events.push(event);
+        }
+    })?;
+    let more = events.len() > page;
+    events.truncate(page);
+    Ok((events, more))
+}
+
+/// 不持有写入器时读完整段历史：文件只读一次，每行只解析一次。
+///
+/// 校验与 [`read_events`] 同一套（中间损坏 / 未知版本一律 [`LedgerError::Corrupt`]），
+/// 只读、不隔离、不截断。末尾没以换行结束的半行不算事件。
+pub async fn read_all(
+    paths: &SessionPaths,
+    session: &SessionId,
+) -> Result<Vec<Event>, LedgerError> {
+    let Some(bytes) = read_file(paths).await? else {
+        return Ok(Vec::new());
+    };
+    let mut events = Vec::new();
+    scan_keeping(&bytes, session, &TailExpectation::default(), &mut |event| {
+        events.push(event)
+    })?;
+    Ok(events)
+}
+
+/// 最后一条完整事件的时间戳——会话列表的"最后活动"只要这一个值。
+///
+/// 只从文件末尾往回读一小块，解析最后一个完整行；**不校验整份文件**（那是读历史与
+/// 打开写入器的事）。末尾的半行跳过，与 [`read_all`] 看到的最后一条一致。
+pub async fn last_event_ts(paths: &SessionPaths) -> Result<Option<OffsetDateTime>, LedgerError> {
+    let mut file = match tokio::fs::File::open(paths.events()).await {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(persist(StoreError::Io(format!(
-                "读 events.jsonl 失败：{e}"
+                "打开 events.jsonl 失败：{e}"
             ))));
         }
     };
-    let scan = scan(&bytes, session, &TailExpectation::default())?;
-    let page = if limit == 0 { DEFAULT_PAGE } else { limit } as usize;
+    let size = file
+        .metadata()
+        .await
+        .map_err(|e| persist(StoreError::Io(format!("读 events.jsonl 元数据失败：{e}"))))?
+        .len();
 
-    let mut events = Vec::new();
-    let mut more = false;
-    for loc in scan.index.iter().filter(|l| l.seq > from.0) {
-        if events.len() == page {
-            more = true;
-            break;
+    let mut chunk = TAIL_CHUNK;
+    loop {
+        let start = size.saturating_sub(chunk);
+        let mut buffer = vec![0u8; (size - start) as usize];
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| LedgerError::Corrupt(format!("定位 events.jsonl 失败：{e}")))?;
+        file.read_exact(&mut buffer)
+            .await
+            .map_err(|e| LedgerError::Corrupt(format!("读 events.jsonl 失败：{e}")))?;
+
+        // 最后一个换行之前才是完整记录；再往前找上一个换行，中间就是最后一行。
+        let Some(end) = buffer.iter().rposition(|b| *b == b'\n') else {
+            if start == 0 {
+                return Ok(None);
+            }
+            chunk = chunk.saturating_mul(4);
+            continue;
+        };
+        match buffer[..end].iter().rposition(|b| *b == b'\n') {
+            Some(previous) => {
+                let line = &buffer[previous + 1..end];
+                return Ok(Some(parse_line(line, start + previous as u64 + 1)?.ts));
+            }
+            None if start == 0 => return Ok(Some(parse_line(&buffer[..end], 0)?.ts)),
+            // 这一块装不下整行，扩大再读。
+            None => chunk = chunk.saturating_mul(4),
         }
-        let line = &bytes[loc.offset as usize..(loc.offset + loc.len - 1) as usize];
-        events.push(parse_line(line, loc.offset)?);
     }
-    Ok((events, more))
+}
+
+/// [`last_event_ts`] 第一次从末尾读多少。正文都外置了，一行通常远小于它。
+const TAIL_CHUNK: u64 = 8 * 1024;
+
+async fn read_file(paths: &SessionPaths) -> Result<Option<Vec<u8>>, LedgerError> {
+    match tokio::fs::read(paths.events()).await {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(persist(StoreError::Io(format!(
+            "读 events.jsonl 失败：{e}"
+        )))),
+    }
 }
 
 /// 扫描一个 Session 的 JSONL，给出**每一行**的事件、坐标与摘要。
@@ -420,28 +494,28 @@ pub async fn scan_records(
     paths: &SessionPaths,
     session: &SessionId,
 ) -> Result<Vec<AppendedEvent>, LedgerError> {
-    let bytes = match tokio::fs::read(paths.events()).await {
-        Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => {
-            return Err(persist(StoreError::Io(format!(
-                "读 events.jsonl 失败：{e}"
-            ))));
-        }
+    let Some(bytes) = read_file(paths).await? else {
+        return Ok(Vec::new());
     };
-    let scan = scan(&bytes, session, &TailExpectation::default())?;
+    let mut events = Vec::new();
+    let scan = scan_keeping(&bytes, session, &TailExpectation::default(), &mut |event| {
+        events.push(event)
+    })?;
 
-    let mut out = Vec::with_capacity(scan.index.len());
-    for loc in &scan.index {
-        let line = &bytes[loc.offset as usize..(loc.offset + loc.len - 1) as usize];
-        out.push(AppendedEvent {
-            event: parse_line(line, loc.offset)?,
-            byte_offset: loc.offset,
-            byte_len: loc.len,
-            digest: ContentHash::of_bytes(line).as_str().to_string(),
-        });
-    }
-    Ok(out)
+    Ok(scan
+        .index
+        .iter()
+        .zip(events)
+        .map(|(loc, event)| {
+            let line = &bytes[loc.offset as usize..(loc.offset + loc.len - 1) as usize];
+            AppendedEvent {
+                event,
+                byte_offset: loc.offset,
+                byte_len: loc.len,
+                digest: ContentHash::of_bytes(line).as_str().to_string(),
+            }
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------- 扫描与校验
@@ -458,6 +532,16 @@ fn scan(
     bytes: &[u8],
     session: &SessionId,
     expectation: &TailExpectation,
+) -> Result<Scan, LedgerError> {
+    scan_keeping(bytes, session, expectation, &mut |_| {})
+}
+
+/// 同 [`scan`]；校验时解析出的每条事件按序交给 `keep`，省得调用方再解析一遍。
+fn scan_keeping(
+    bytes: &[u8],
+    session: &SessionId,
+    expectation: &TailExpectation,
+    keep: &mut dyn FnMut(Event),
 ) -> Result<Scan, LedgerError> {
     let mut index: Vec<LineLoc> = Vec::new();
     let mut offset: u64 = 0;
@@ -507,6 +591,7 @@ fn scan(
             offset,
             len,
         });
+        keep(event);
         offset += len;
         cursor += relative + 1;
     }
@@ -885,5 +970,74 @@ mod tests {
         let (events, more) = read_events(&paths, &session, Seq(2), 10).await.unwrap();
         assert_eq!(events.len(), 1);
         assert!(!more);
+        let (events, more) = read_events(&paths, &session, Seq::ZERO, 3).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(!more, "正好一页读完，后面没有了");
+    }
+
+    #[tokio::test]
+    async fn read_all_returns_every_event_in_one_pass() {
+        let (_dir, paths, session) = fresh().await;
+        write_three(&paths, &session).await;
+        let events = read_all(&paths, &session).await.unwrap();
+        let seqs: Vec<u64> = events.iter().map(|e| e.seq.0).collect();
+        assert_eq!(seqs, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn read_all_of_a_missing_log_is_empty_and_creates_nothing() {
+        let (_dir, paths, session) = fresh().await;
+        assert!(read_all(&paths, &session).await.unwrap().is_empty());
+        assert_eq!(last_event_ts(&paths).await.unwrap(), None);
+        assert!(!paths.root().exists(), "读不得创建内容");
+    }
+
+    #[tokio::test]
+    async fn read_all_still_refuses_a_corrupt_middle() {
+        let (_dir, paths, session) = fresh().await;
+        write_three(&paths, &session).await;
+        let mut bytes = tokio::fs::read(paths.events()).await.unwrap();
+        let first = bytes.iter().position(|b| *b == b'\n').unwrap();
+        bytes.insert(first + 1, b'\n');
+        tokio::fs::write(paths.events(), &bytes).await.unwrap();
+        assert!(matches!(
+            read_all(&paths, &session).await,
+            Err(LedgerError::Corrupt(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn last_event_ts_is_the_fold_last_at_and_skips_a_torn_tail() {
+        let (_dir, paths, session) = fresh().await;
+        write_three(&paths, &session).await;
+        let events = read_all(&paths, &session).await.unwrap();
+        let expected = komo_kernel::fold::fold(&events).last_at;
+        assert_eq!(last_event_ts(&paths).await.unwrap(), expected);
+
+        let mut file = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(paths.events())
+            .await
+            .unwrap();
+        file.write_all(b"{\"v\":1,\"half").await.unwrap();
+        assert_eq!(last_event_ts(&paths).await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn last_event_ts_reads_a_line_longer_than_the_first_chunk() {
+        let (_dir, paths, session) = fresh().await;
+        let mut log = open(&paths, &session).await.unwrap();
+        let long = "x".repeat(3 * TAIL_CHUNK as usize);
+        let appended = log
+            .append(PendingEvent::new(
+                EventId::from_raw("evt-long"),
+                None,
+                NOW,
+                user(&long),
+            ))
+            .await
+            .unwrap();
+        assert!(appended.byte_len > TAIL_CHUNK);
+        assert_eq!(last_event_ts(&paths).await.unwrap(), Some(NOW));
     }
 }

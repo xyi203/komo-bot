@@ -25,8 +25,7 @@ use axum::{Router, extract::State};
 use komo_kernel::events::Event;
 use komo_kernel::protocol::PROTOCOL_VERSION;
 use komo_kernel::protocol::http::{HealthResponse, ReconcileResponse, SessionSummary};
-use komo_kernel::traits::Ledger;
-use komo_kernel::types::ids::{Seq, SessionId};
+use komo_kernel::types::ids::SessionId;
 use time::OffsetDateTime;
 
 use crate::service::state::GatewayState;
@@ -144,25 +143,14 @@ async fn home_session(State(api): State<Api>) -> ApiResult<Json<SessionSummary>>
     Ok(Json(summary))
 }
 
-/// 读完一个 Session 的日志（短事务分页，§14 的既定对策）。
+/// 读完一个 Session 的日志，外置正文读回来。
 pub async fn events_of(api: &Api, session: &SessionId) -> Result<Vec<Event>, ApiFailure> {
-    let mut all = Vec::new();
-    let mut from = Seq::ZERO;
-    loop {
-        let batch = api.state.routed.read(session, from, 0).await?;
-        if batch.events.is_empty() {
-            return Ok(all);
-        }
-        let payloads = komo_store::PayloadStore::new(api.state.ledgers.paths_for(session));
-        for mut event in batch.events {
-            payloads.hydrate_event(&mut event).await?;
-            from = from.max(event.seq);
-            all.push(event);
-        }
-        if batch.next.is_none() {
-            return Ok(all);
-        }
+    let mut all = api.state.routed.read_all(session).await?;
+    let payloads = komo_store::PayloadStore::new(api.state.ledgers.paths_for(session));
+    for event in &mut all {
+        payloads.hydrate_event(event).await?;
     }
+    Ok(all)
 }
 
 /// 从 UUIDv7 里取出它的生成时刻。

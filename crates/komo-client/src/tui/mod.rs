@@ -58,7 +58,7 @@ pub use app::{App, Effect, Phase, ServerEvent, TuiMode};
 
 use crate::api::KomoClient;
 use crate::error::ClientError;
-use crate::sse::{self, ConnectionState, SseMessage};
+use crate::sse::{self, ConnectionState, SseMessage, SseUpdate as Stream};
 use crate::tui::paste::{InputEvent, TimedKey, coalesce_rapid_keys};
 use crate::tui::transcript::Emitted;
 
@@ -313,16 +313,6 @@ pub async fn run_tui(
     outcome
 }
 
-/// 订阅这一路给驱动的东西。
-enum Stream {
-    /// 事件流上的一帧。
-    Frame(SseMessage),
-    /// 连接状态变了——状态行读它。
-    Connection(ConnectionState),
-    /// 订阅结束了。
-    Ended,
-}
-
 /// 等订阅上的下一件事。
 ///
 /// **还没有会话时永不就绪**：`select!` 的分支数由代码写死，没有订阅不等于少一条分支。
@@ -330,14 +320,7 @@ async fn next_stream(subscription: &mut Option<sse::SseHandle>) -> Stream {
     let Some(handle) = subscription.as_mut() else {
         return std::future::pending().await;
     };
-    let mut connection = handle.state();
-    tokio::select! {
-        message = handle.recv() => match message {
-            Some(message) => Stream::Frame(message),
-            None => Stream::Ended,
-        },
-        Ok(()) = connection.changed() => Stream::Connection(connection.borrow().clone()),
-    }
+    handle.next().await
 }
 
 /// 第一条消息送出去之前把会话铸出来（`komo` 裸命令**不在启动时建会话**）。
@@ -1127,6 +1110,37 @@ fn restore_terminal() -> Result<(), std::io::Error> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// 同一次连接状态只消费一次；时钟取消等待后，再等仍须挂起。
+    #[tokio::test]
+    async fn idle_sse_state_is_consumed_once() {
+        use crate::test_server::{FakeGateway, Reply};
+
+        let server = FakeGateway::spawn(|_, _| Reply::SseOpen(vec![])).await;
+        let mut subscription = Some(sse::subscribe(
+            &server.client(),
+            SessionId::from_raw("sess-idle"),
+            Cursor::default(),
+        ));
+        let connected =
+            tokio::time::timeout(Duration::from_secs(2), next_stream(&mut subscription))
+                .await
+                .expect("能收到连接状态");
+        assert!(matches!(
+            connected,
+            Stream::Connection(ConnectionState::Connected)
+        ));
+
+        for _ in 0..2 {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(25), next_stream(&mut subscription),)
+                    .await
+                    .is_err(),
+                "没有新事件时必须等待，不能重复消费已连接状态并重绘"
+            );
+        }
+        subscription.take().expect("订阅还在").abort();
+    }
 
     fn key(ch: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE)

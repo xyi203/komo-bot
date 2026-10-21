@@ -115,7 +115,26 @@ pub struct SseHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// 帧与连接状态共用一次等待；状态游标由句柄持有，不随 TUI 的 select! 取消而丢失。
+pub(crate) enum SseUpdate {
+    Frame(SseMessage),
+    Connection(ConnectionState),
+    Ended,
+}
+
 impl SseHandle {
+    pub(crate) async fn next(&mut self) -> SseUpdate {
+        tokio::select! {
+            message = self.frames.recv() => match message {
+                Some(message) => SseUpdate::Frame(message),
+                None => SseUpdate::Ended,
+            },
+            Ok(()) = self.state.changed() => {
+                SseUpdate::Connection(self.state.borrow_and_update().clone())
+            },
+        }
+    }
+
     /// 下一帧。`None` = 订阅结束。
     pub async fn recv(&mut self) -> Option<SseMessage> {
         self.frames.recv().await
@@ -440,6 +459,52 @@ mod tests {
             frame.id.0,
             serde_json::to_string(frame).unwrap()
         )
+    }
+
+    #[tokio::test]
+    async fn updates_deliver_reconnections_frames_and_the_end() {
+        let (frames_tx, frames) = mpsc::channel(1);
+        let (state_tx, state) = watch::channel(ConnectionState::Connecting);
+        let mut subscription = SseHandle {
+            frames,
+            state,
+            task: tokio::spawn(std::future::pending()),
+        };
+
+        for expected in [
+            ConnectionState::Connected,
+            ConnectionState::Reconnecting {
+                attempt: 1,
+                reason: "connection reset".into(),
+            },
+            ConnectionState::Connected,
+        ] {
+            state_tx.send(expected.clone()).expect("句柄还在");
+            match subscription.next().await {
+                SseUpdate::Connection(actual) => assert_eq!(actual, expected),
+                _ => panic!("应收到连接状态变化"),
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), subscription.next())
+                    .await
+                    .is_err(),
+                "消费过的状态不能再次唤醒驱动"
+            );
+        }
+
+        // 状态流关掉也不影响已排队的帧；帧流随后关掉才结束订阅。
+        drop(state_tx);
+        frames_tx
+            .send(SseMessage::Frame(Box::new(frame(7))))
+            .await
+            .expect("句柄还在");
+        match subscription.next().await {
+            SseUpdate::Frame(message) => assert_eq!(message.cursor(), Seq(7)),
+            _ => panic!("应收到排队的事件帧"),
+        }
+        drop(frames_tx);
+        assert!(matches!(subscription.next().await, SseUpdate::Ended));
+        subscription.abort();
     }
 
     #[test]

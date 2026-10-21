@@ -1743,6 +1743,8 @@ pub trait Clock: Send + Sync {
 
 ## 14. 实现顺序与验收
 
+**TUI 空闲 CPU 验收（2026-10-21）**：`next_stream` 原先每次等待都 clone 连接状态的 `watch::Receiver`，只推进临时副本的已读版本；SSE 连上后，同一次状态变化会反复唤醒驱动并重绘。现在帧与状态在 `SseHandle::next` 中等待，句柄持有状态游标，并以 `borrow_and_update` 消费变化。回归测试：`tui::tests::idle_sse_state_is_consumed_once` 在修复前失败、修复后通过（收到一次已连接后，两次被时钟取消的等待均保持挂起）；`sse::tests::updates_deliver_reconnections_frames_and_the_end` 覆盖连接、重连、恢复、事件帧和订阅结束。`cargo test --workspace`：2096 通过、8 忽略、0 失败。隔离假 Gateway 的空会话、120×40 PTY、各测 3 秒：已安装 release 为 2.77 秒 CPU / 3.015 秒墙钟（91.9%），修复后的 dev 构建为 0.03 秒 CPU / 3.000 秒墙钟（1.0%）。真实会话的旧进程尚未更新。增量 `cargo build --timings`：7.73 秒，只重编 `komo-client` 与 `komo`；报告在 `target/cargo-timings/cargo-timing-20261021T020540806Z-cad003b0e67e15b9.html`。
+
 | 阶段 | 交付 | 验证 |
 |---|---|---|
 | 1. 进程与会话骨架 | 六个 crate 骨架（§13.4）；komo、Gateway 自动启动、HTTP/SSE；`komo-store`：Turso 连接、`ensure_schema` + DDL 对齐测试、`with_write_retry`、统一 Session 目录与状态索引；`komo-client`：HTTP/SSE 客户端与 TUI 骨架；**编译预算首次测量** | 多个 CLI 同时启动仅产生一个实例；断线后能查看原会话；两个写入器对不同 Session 并发提交不互相阻塞，对同一行冲突时一方重试成功且只应用一次；DDL 对齐测试挂掉能定位到列；改 client 一行不重编 gateway；保存一份合法的 config.toml 后 `komo doctor` 一秒内显示新 mtime 已生效，保存一份非法的则旧配置继续生效且 home chat / 日志有具体错误 |

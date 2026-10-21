@@ -524,13 +524,32 @@ impl Db {
     }
 }
 
-/// 把 `PRAGMA data_sync_retry = 1` 打到**每一个池槽**上。
+/// 每连接页缓存上限，单位 KiB（`PRAGMA cache_size` 的负值语义）。
 ///
-/// 它是每连接状态（`turso_core` 的 `connection.rs:452`），而 toasty 的驱动没有留连接
-/// 建立钩子——所以这里同时握住 `pool_size` 个连接，逼 deadpool 把每个槽都创建出来，逐
-/// 个设完再一起还回去。
+/// 2 MiB：`turso_core::storage::page_cache` 默认 2000 页 × 4 KiB ≈ 8 MiB，
+/// 乘上 [`DbOptions::pool_size`] 默认的 8 个连接约 64 MiB 常驻。压到这里之后
+/// 8 连接上限约 16 MiB。`PRAGMA cache_size` 的负数表示 KiB
+/// （`turso_core` 的 `translate/pragma.rs::update_cache_size`：
+/// `kb = |value| * 1024`，再除以页大小换算成页数），与 SQLite 一致。
+const PAGE_CACHE_SIZE_KIB: i64 = -2048;
+
+/// 把 `PRAGMA data_sync_retry = 1` 与 `PRAGMA cache_size` 打到**每一个池槽**上。
 ///
-/// TODO(decide: 池槽被健康检查淘汰后重建的那一个不会再被设到。彻底的做法是给
+/// 它们都是每连接状态（`data_sync_retry` 见 `connection.rs:452`；`cache_size` 对应的
+/// `Pager::page_cache` 每个连接各自一份），而 toasty 的驱动没有留连接建立钩子——所以
+/// 这里同时握住 `pool_size` 个连接，逼 deadpool 把每个槽都创建出来，逐个设完再一起还
+/// 回去。
+///
+/// `cache_size` 在 MVCC 连接上确实生效，不是「返回 Ok 却什么都不做」那一类坑：它不是
+/// DDL，不经 `BEGIN CONCURRENT`，`translate_pragma` 直接拿到 `compile_cmd` 传下来的那把
+/// `Arc<Pager>`（MVCC 游标的 `get_pager()` 转发到同一个 `btree_cursor.get_pager()`，读写
+/// 共用一个 Pager/PageCache），调 `pager.change_page_cache_size` 原地 `resize`，
+/// 返回 `TransactionMode::None`（实测：源码位置
+/// `~/.cargo/registry/.../turso_core-0.7.2/translate/pragma.rs:353-360,1775-1823`，
+/// `storage/pager.rs:3432`）。
+///
+/// TODO(decide: 池槽被健康检查淘汰后重建的那一个不会再被设到——`data_sync_retry` 原有
+/// 的这条限制同样适用于这里新加的 `cache_size`。彻底的做法是给
 /// `vendor/toasty-driver-turso` 的 `Driver::connect` 加一个 pragma 钩子，但那会把 vendor
 /// 从「只改 manifest」变成「改代码」——先记在这里，等编排者拍板。)
 async fn prime_connections(db: &toasty::Db, pool_size: usize) -> Result<(), StoreError> {
@@ -538,6 +557,10 @@ async fn prime_connections(db: &toasty::Db, pool_size: usize) -> Result<(), Stor
     for _ in 0..pool_size.max(1) {
         let mut conn = db.connection().await.map_err(map_toasty)?;
         toasty::sql::statement("PRAGMA data_sync_retry = 1")
+            .exec(&mut conn)
+            .await
+            .map_err(map_toasty)?;
+        toasty::sql::statement(format!("PRAGMA cache_size = {PAGE_CACHE_SIZE_KIB}"))
             .exec(&mut conn)
             .await
             .map_err(map_toasty)?;
@@ -1373,5 +1396,50 @@ mod tests {
                 .unwrap();
             assert_eq!(value, Some(1), "fsync 出错要能报告，而不是把进程带走");
         }
+    }
+
+    /// `cache_size` 真的打到了池里的连接上，读回来就是设进去的那个负值（KiB）——
+    /// 不是返回 `Ok` 却什么都没发生的那一类坏情况。
+    #[tokio::test]
+    async fn every_pooled_connection_reports_the_capped_cache_size() {
+        let (db, _dir) = temp().await;
+        for _ in 0..8 {
+            let value = db
+                .read(|ex| {
+                    Box::pin(async move {
+                        let rows = toasty::sql::query("PRAGMA cache_size")
+                            .exec(ex)
+                            .await
+                            .map_err(map_toasty)?;
+                        Ok(rows.first().and_then(|row| column_i64(row, 0)))
+                    }) as BoxFuture<'_, Result<Option<i64>, StoreError>>
+                })
+                .await
+                .unwrap();
+            assert_eq!(
+                value,
+                Some(PAGE_CACHE_SIZE_KIB),
+                "每连接页缓存该是设定的上限"
+            );
+        }
+    }
+
+    /// 同一条断言在内存库上也成立——`open_memory` 走的是另一条 `build` 分支。
+    #[tokio::test]
+    async fn the_capped_cache_size_also_applies_to_an_in_memory_db() {
+        let db = Db::open_memory().await.expect("打开内存库");
+        let value = db
+            .read(|ex| {
+                Box::pin(async move {
+                    let rows = toasty::sql::query("PRAGMA cache_size")
+                        .exec(ex)
+                        .await
+                        .map_err(map_toasty)?;
+                    Ok(rows.first().and_then(|row| column_i64(row, 0)))
+                }) as BoxFuture<'_, Result<Option<i64>, StoreError>>
+            })
+            .await
+            .unwrap();
+        assert_eq!(value, Some(PAGE_CACHE_SIZE_KIB));
     }
 }

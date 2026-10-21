@@ -19,7 +19,7 @@ mod wire;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use komo_kernel::protocol::config::ConfigSnapshot;
@@ -93,6 +93,9 @@ impl From<LlmBuildError> for LlmError {
 /// 拦下），而是"这一次没送达"，多等一会儿再发一次是安全的。
 pub fn retry_cause(error: &LlmError) -> Option<RetryCause> {
     match error {
+        // 上下文超长：同一份上下文再发一次还是超长（有的代理把它包成 500）。loop 先按
+        // `is_context_overflow` 强制压一次（§6），走到这里就是救不回来了。
+        error if is_context_overflow(error) => None,
         // 有些代理把参数错误包装成 HTTP 500；相同请求再发不会修好工具协议。
         LlmError::Rejected { message, .. } if invalid_request(message) => None,
         LlmError::Rejected { status, .. } => match status {
@@ -128,6 +131,73 @@ fn invalid_request(message: &str) -> bool {
     message.contains("No tool output found for")
         || message.contains("Duplicate tool output for call_id")
         || message.contains("code=invalid_request_error")
+}
+
+/// 各家"上下文超长"的报错文本（移植自 pi 的 `utils/overflow.ts`，不分大小写）。
+const OVERFLOW_PATTERNS: &[&str] = &[
+    r"prompt (?:is )?too long",               // Anthropic、z.ai
+    r"prompt exceeds max length",             // z.ai 国内端点
+    r"request_too_large",                     // Anthropic 按字节超限（413）
+    r"input is too long for requested model", // Amazon Bedrock
+    r"exceeds the context window",            // OpenAI（Completions 与 Responses）
+    r"exceeds (?:the )?(?:model'?s )?maximum context length(?: of [\d,]+ tokens?|\s*\([\d,]+\))", // OpenAI 兼容代理（LiteLLM）
+    r"input token count.*exceeds the maximum", // Google Gemini
+    r"maximum prompt length is \d+",           // xAI
+    r"reduce the length of the messages",      // Groq
+    r"maximum context length is \d+ tokens",   // OpenRouter
+    r"exceeds (?:the )?maximum allowed input length of [\d,]+ tokens?", // OpenRouter / Poolside
+    r"input \(\d+ tokens\) is longer than the model'?s context length \(\d+ tokens\)", // Together AI
+    r"exceeds the limit of \d+",           // GitHub Copilot
+    r"exceeds the available context size", // llama.cpp
+    r"greater than the context length",    // LM Studio
+    r"context window exceeds limit",       // MiniMax
+    r"exceeded model token limit",         // Kimi For Coding
+    r"too large for model with \d+ maximum context length", // Mistral
+    r"prompt has [\d,]+ tokens?, but the configured context size is [\d,]+ tokens?", // DS4
+    r"model_context_window_exceeded",      // z.ai 把 finish_reason 当错误报
+    r"prompt too long; exceeded (?:max )?context length", // Ollama
+    r"range of input length should be",    // DashScope / Qwen
+    r"context[_ ]length[_ ]exceeded",      // 通用
+    r"too many tokens",                    // 通用
+    r"token limit exceeded",               // 通用
+];
+
+/// 撞上上面的模式却不是超长的报错：限流一类（Bedrock 的限流写作 "Too many tokens,
+/// please wait"）。
+const NON_OVERFLOW_PATTERNS: &[&str] = &[
+    r"^(?:Throttling error|Service unavailable):",
+    r"rate limit",
+    r"too many requests",
+];
+
+fn any_of(patterns: &[&str]) -> grep::regex::RegexMatcher {
+    let joined = patterns
+        .iter()
+        .map(|pattern| format!("(?:{pattern})"))
+        .collect::<Vec<_>>()
+        .join("|");
+    grep::regex::RegexMatcherBuilder::new()
+        .case_insensitive(true)
+        .build(&joined)
+        .expect("溢出模式是写死的，必然合法")
+}
+
+/// provider 因为上下文超长拒了这次请求（§6）。只认报错文本——pi 另外两种（请求成功
+/// 但用量超窗口、输出为零的 length 截断）这里不认。只看 `Rejected`：HTTP 拒绝与流里的
+/// 错误帧都落在它上面；传输失败与结果不明说的不是请求内容。
+///
+/// 判断先于重试分类（[`retry_cause`]）：包成 5xx 的超长不退避重试。
+pub fn is_context_overflow(error: &LlmError) -> bool {
+    use grep::matcher::Matcher as _;
+    static OVERFLOW: OnceLock<grep::regex::RegexMatcher> = OnceLock::new();
+    static NON_OVERFLOW: OnceLock<grep::regex::RegexMatcher> = OnceLock::new();
+    let LlmError::Rejected { message, .. } = error else {
+        return false;
+    };
+    let matches =
+        |matcher: &grep::regex::RegexMatcher| matcher.is_match(message.as_bytes()).unwrap_or(false);
+    !matches(NON_OVERFLOW.get_or_init(|| any_of(NON_OVERFLOW_PATTERNS)))
+        && matches(OVERFLOW.get_or_init(|| any_of(OVERFLOW_PATTERNS)))
 }
 
 /// 这次失败可以重试吗——[`retry_cause`] 的另一种说法。

@@ -20,6 +20,10 @@ pub struct OnlineState {
     pub request_count: u64,
     /// 上次压缩时的 `request_count`；没压过是 `None`。
     pub last_compaction_request_count: Option<u64>,
+    /// 上次**压成摘要**时的 `request_count`（衰减不算）；没压成过是 `None`。溢出恢复只认
+    /// 它：压成之后一次成功的请求都还没有又超长，再压一次也救不回来。
+    #[serde(default)]
+    pub last_summary_request_count: Option<u64>,
     /// 最近一次请求的提示 token 数；不知道（用量缺失，或刚压缩过）是 `None`。
     pub last_context_tokens: Option<u64>,
     pub positive_context_delta_total: u64,
@@ -59,6 +63,7 @@ impl OnlineState {
     /// 压缩完成。
     pub fn record_compaction(&mut self, debt: CompactionDebt) {
         self.last_compaction_request_count = Some(self.request_count);
+        self.last_summary_request_count = Some(self.request_count);
         // 摘要换掉了前面的内容，上下文大小不能跨过它比较。
         self.last_context_tokens = None;
         self.compaction_count += 1;
@@ -99,6 +104,13 @@ impl OnlineState {
     /// 上次压缩之后过了几次请求；没压过是 `None`。
     pub fn requests_since_last_compaction(&self) -> Option<u64> {
         self.last_compaction_request_count
+            .map(|at| self.request_count.saturating_sub(at))
+    }
+
+    /// 上次压成摘要之后过了几次成功的请求；没压成过是 `None`。失败的请求不落
+    /// `message.assistant`，不算在内。
+    pub fn requests_since_last_summary(&self) -> Option<u64> {
+        self.last_summary_request_count
             .map(|at| self.request_count.saturating_sub(at))
     }
 }
@@ -338,6 +350,51 @@ mod tests {
         assert_eq!(state.cache_debt_tokens, 0.0);
         assert_eq!(state.cache_debt_repayment_tokens, 0);
         assert_eq!(state.requests_since_last_compaction(), Some(2));
+    }
+
+    /// 溢出恢复问的是"压成摘要之后有没有成功的请求"：衰减也重置冷却，但不重置它——衰减
+    /// 之后紧接着超长，正该压一次。
+    #[test]
+    fn only_a_summary_counts_toward_requests_since_last_summary() {
+        let run = RunId::from_raw(RUN);
+        let ContextCompacted::Compacted { decision, debt, .. } =
+            crate::test_support::compacted(Seq(8), "摘要")
+        else {
+            unreachable!()
+        };
+        let mut events = log();
+        assert_eq!(
+            online_state(&events, &run).requests_since_last_summary(),
+            None
+        );
+
+        events.push(compaction(
+            13,
+            RUN,
+            ContextCompacted::Decayed {
+                calls: vec![ToolCallId::from_raw("c1")],
+                decision: decision.clone(),
+                debt,
+            },
+        ));
+        let state = online_state(&events, &run);
+        assert_eq!(state.requests_since_last_compaction(), Some(0));
+        assert_eq!(state.requests_since_last_summary(), None);
+
+        events.push(compaction(
+            14,
+            RUN,
+            crate::test_support::compacted(Seq(8), "摘要"),
+        ));
+        assert_eq!(
+            online_state(&events, &run).requests_since_last_summary(),
+            Some(0)
+        );
+        events.push(assistant(15, RUN, Some(9_000)));
+        assert_eq!(
+            online_state(&events, &run).requests_since_last_summary(),
+            Some(1)
+        );
     }
 
     fn compaction(seq: u64, run: &str, payload: ContextCompacted) -> Event {

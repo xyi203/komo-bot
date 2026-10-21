@@ -16,10 +16,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use komo_agent::context::compaction::{CompactionSettings, Plan, PlanInput, plan};
+use komo_agent::context::compaction::{CompactionSettings, Plan, PlanInput, plan, plan_overflow};
 use komo_agent::context::history::{self, ReplayScope, ResolvedMessage};
 use komo_agent::context::{AgentContext, ContextInput, InvocationContext, assemble};
-use komo_kernel::compaction::{OnlineState, PROMPT_CACHE_TTL, Reshape, online_state};
+use komo_kernel::compaction::{
+    CompactionJob, OnlineState, PROMPT_CACHE_TTL, Reshape, online_state,
+};
 use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::fold::fold;
 use komo_kernel::projection::ProjectionContext;
@@ -191,12 +193,9 @@ impl GatewayPlanner {
         )
         .await
     }
-}
 
-#[async_trait]
-impl CompactionPlanner for GatewayPlanner {
-    async fn plan(&self) -> Option<Reshape> {
-        let config = current(self.config.as_ref())?;
+    /// 读日志、按模板装配：provider 正看着的那份视图和日志本身。读不出就不判。
+    async fn read(&self) -> Option<(Vec<Event>, AgentContext)> {
         let events = match read_events(self.routed.as_ref(), &self.session).await {
             Ok(events) => events,
             Err(error) => {
@@ -204,13 +203,25 @@ impl CompactionPlanner for GatewayPlanner {
                 return None;
             }
         };
-        let context = match self.context(&events).await {
-            Ok(context) => context,
+        match self.context(&events).await {
+            Ok(context) => Some((events, context)),
             Err(error) => {
                 tracing::warn!(run = %self.run, %error, "装配不出上下文，这一轮不判压缩");
-                return None;
+                None
             }
-        };
+        }
+    }
+}
+
+#[async_trait]
+impl CompactionPlanner for GatewayPlanner {
+    async fn plan(&self) -> Option<Reshape> {
+        let config = current(self.config.as_ref())?;
+        // 压缩与衰减都关着：planner 只为溢出恢复而在，自动判断不读日志。
+        if !config.enabled && self.template.projection.decay.is_none() {
+            return None;
+        }
+        let (events, context) = self.read().await?;
         let online = online_state(&events, &self.run);
         decide(Facts {
             context: &context,
@@ -222,6 +233,26 @@ impl CompactionPlanner for GatewayPlanner {
             run: &self.run,
             cache_cold: cache_cold(&events, self.clock.now()),
             settled: true,
+        })
+    }
+
+    /// 溢出恢复不看 `enabled`：不压这条 Run 就失败了。只救一次由 `plan_overflow` 按在线
+    /// 状态判（上次压成摘要之后还没有成功的请求就不再压）。
+    async fn plan_overflow(&self) -> Option<CompactionJob> {
+        let config = current(self.config.as_ref())?;
+        let (events, context) = self.read().await?;
+        let online = online_state(&events, &self.run);
+        let settings = CompactionSettings::from(&config);
+        plan_overflow(PlanInput {
+            context: &context,
+            tools: &self.tools,
+            online: &online,
+            settings: &settings,
+            model: &self.model,
+            session: &self.session,
+            run: &self.run,
+            cache_cold: cache_cold(&events, self.clock.now()),
+            compaction_enabled: config.enabled,
         })
     }
 }

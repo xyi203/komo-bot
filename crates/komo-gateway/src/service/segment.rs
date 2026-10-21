@@ -642,28 +642,32 @@ impl SegmentSource for GatewaySegments {
             .clone()
             .unwrap_or_else(|| record.model.clone());
 
-        // 改写前缀（§6）：压成摘要或把大结果换成短视图，共用一个决策点。压缩开着或衰减开着
-        // （冻结的投影里有 `decay`）、且不是命令 Run 才有。这一段开头就能判的现在判；其余
-        // 交给 loop 在一轮收尾之后、或缓存放冷之后来问。
+        // 改写前缀（§6）：压成摘要或把大结果换成短视图，共用一个决策点。不是命令 Run 就有
+        // planner——provider 以上下文超长拒了请求时的溢出恢复不受 `enabled` 管；自动判断
+        // 只在压缩开着或衰减开着（冻结的投影里有 `decay`）时做。这一段开头就能判的现在判；
+        // 其余交给 loop 在一轮收尾之后、或缓存放冷之后来问。
         let (compaction_job, compactor, context) = match compaction::current(self.config.as_ref()) {
-            Some(config)
-                if command.is_none() && (config.enabled || template.projection.decay.is_some()) =>
-            {
+            Some(config) if command.is_none() => {
                 let online = komo_kernel::compaction::online_state(&events, &run);
                 // 压缩只在上一轮的调用全部收尾时判：切点落在轮次开头，一轮的调用与结果不分开。
                 // 衰减不切轮次、只换已完成结果的正文，没收尾的调用（恢复之后续跑）不受影响。
                 let settled = resume.is_none() && surface.open_calls(&run).is_empty();
-                let reshape = compaction::decide(compaction::Facts {
-                    context: &context,
-                    tools: &tools,
-                    online: &online,
-                    config: &config,
-                    model: &model,
-                    session: &session,
-                    run: &run,
-                    cache_cold: compaction::cache_cold(&events, self.clock.now()),
-                    settled,
-                });
+                let automatic = config.enabled || template.projection.decay.is_some();
+                let reshape = automatic
+                    .then(|| {
+                        compaction::decide(compaction::Facts {
+                            context: &context,
+                            tools: &tools,
+                            online: &online,
+                            config: &config,
+                            model: &model,
+                            session: &session,
+                            run: &run,
+                            cache_cold: compaction::cache_cold(&events, self.clock.now()),
+                            settled,
+                        })
+                    })
+                    .flatten();
                 let (job, context) = match reshape {
                     Some(Reshape::Compact(job)) => (Some(job), context),
                     // 先落账再重新装配：回放读到新的已衰减集合，第一次请求就带短视图。

@@ -318,3 +318,96 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
     );
     gateway.stop().await;
 }
+
+// ------------------------------------------------------------------ 溢出恢复
+
+fn too_long() -> Result<komo_kernel::types::turn::Round, komo_kernel::types::turn::LlmError> {
+    Err(komo_kernel::types::turn::LlmError::Rejected {
+        status: 400,
+        message: "prompt is too long: 213462 tokens > 200000 maximum".into(),
+    })
+}
+
+/// 压缩关着、两次大 `read` 之后 provider 说超长：起一个 Gateway，跑到终态，交回日志。
+async fn run_into_overflow(
+    after_summary: Vec<Result<komo_kernel::types::turn::Round, komo_kernel::types::turn::LlmError>>,
+) -> (Arc<FakeLlm>, RunState, Vec<Event>) {
+    let home = Home::with_config(&config_toml(
+        "[execution]\nmodel_result_bytes = 65536\n\
+         [compaction]\nenabled = false\nkeep_recent_tokens = 1\nmemo_token_estimate = 50\n",
+    ));
+    std::fs::create_dir_all(home.workspace()).expect("工作目录");
+    for n in 1..=2 {
+        let lines: String = (0..600)
+            .map(|i| format!("{n}-{i:04} {}\n", "x".repeat(32)))
+            .collect();
+        std::fs::write(home.workspace().join(format!("big{n}.txt")), lines).expect("写文件");
+    }
+    let read = |n: u32| serde_json::json!({ "path": format!("big{n}.txt") });
+    let llm = FakeLlm::new(vec![
+        vec![
+            call_round(1, "pc-r1", "read", read(1)),
+            call_round(2, "pc-r2", "read", read(2)),
+            too_long(),
+        ],
+        vec![text_round(1, "摘要：读过 big1，内容是编号行。")],
+        after_summary,
+    ]);
+    let gateway = home.start(Arc::clone(&llm) as Arc<dyn LlmClient>).await;
+    let session = gateway.open_session().await;
+    let run = gateway
+        .submit(&session, "overflow-1", "把两个大文件读一遍")
+        .await
+        .run;
+    let detail = gateway.wait_terminal(&run).await;
+    let events = home.events(&session);
+    gateway.stop().await;
+    (llm, detail.summary.state, events)
+}
+
+/// 压缩关着也救：超长 → 强制压一次（记成窗口保护、标明来自溢出）→ 重新装配接着跑完。
+#[tokio::test]
+async fn an_overflow_is_compacted_once_even_with_compaction_off_and_the_run_completes() {
+    let (llm, state, events) = run_into_overflow(vec![text_round(3, "都读完了。")]).await;
+    assert_eq!(state, RunState::Completed);
+
+    let requests: Vec<TurnRequest> = llm.requests.lock().unwrap().clone();
+    assert_eq!(
+        requests.len(),
+        3,
+        "超长的主请求、摘要请求、重新装配后的主请求"
+    );
+    assert!(requests[1].tools.is_empty());
+    let text = requests[1].messages[0].text.as_deref().unwrap();
+    assert!(text.contains("1-0000"), "第一次 read 收进了摘要");
+    assert!(!text.contains("2-0000"), "最后一轮留着");
+    let after = serde_json::to_string(&requests[2].messages).unwrap();
+    assert!(after.contains(COMPACTION_PREFIX), "带着摘要重新装配");
+    assert!(
+        after.contains("pc-r2") && !after.contains("pc-r1"),
+        "{after}"
+    );
+
+    let recorded = compactions(&events);
+    let [ContextCompacted::Compacted { decision, .. }] = recorded.as_slice() else {
+        panic!("{recorded:?}");
+    };
+    assert_eq!(decision.reason, CompactionReason::WindowProtection);
+    assert!(decision.compact && decision.context_overflow);
+}
+
+/// 只救一次：刚压过、一次成功的请求都没有就又超长，Run 按原错误失败，不再压。
+#[tokio::test]
+async fn an_overflow_right_after_the_overflow_compaction_fails_the_run() {
+    let (llm, state, events) = run_into_overflow(vec![too_long()]).await;
+    assert_eq!(state, RunState::Failed);
+    assert_eq!(llm.requests.lock().unwrap().len(), 3, "没有第二次摘要请求");
+    assert!(
+        matches!(
+            compactions(&events).as_slice(),
+            [ContextCompacted::Compacted { .. }]
+        ),
+        "{:?}",
+        compactions(&events)
+    );
+}

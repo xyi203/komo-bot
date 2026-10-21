@@ -223,12 +223,29 @@ impl Scenario {
     }
 
     fn plan(&self, online: &OnlineState, settings: &CompactionSettings) -> Plan {
+        self.with_input(online, settings, plan)
+    }
+
+    fn plan_overflow(
+        &self,
+        online: &OnlineState,
+        settings: &CompactionSettings,
+    ) -> Option<CompactionJob> {
+        self.with_input(online, settings, plan_overflow)
+    }
+
+    fn with_input<T>(
+        &self,
+        online: &OnlineState,
+        settings: &CompactionSettings,
+        decide: impl FnOnce(PlanInput<'_>) -> T,
+    ) -> T {
         let model = ModelConfig {
             context_window: self.window,
             provider: self.provider.into(),
             ..sample_model()
         };
-        plan(PlanInput {
+        decide(PlanInput {
             context: &self.context,
             tools: &tools(),
             online,
@@ -240,6 +257,75 @@ impl Scenario {
             compaction_enabled: self.compaction_enabled,
         })
     }
+}
+
+/// provider 说超长了：不贴窗口、账不划算、压缩关着，照样按 `keep_recent_tokens` 压一次。
+#[test]
+fn an_overflow_compacts_regardless_of_window_economics_and_the_switch() {
+    let scenario = Scenario {
+        window: Some(1_000_000),
+        compaction_enabled: false,
+        ..Scenario::new(context())
+    };
+    assert!(
+        matches!(scenario.plan(&online(), &settings(1e9)), Plan::Nothing),
+        "平时什么都不做"
+    );
+    let job = scenario
+        .plan_overflow(&online(), &settings(1e9))
+        .expect("超长要强制压");
+    assert_eq!(job.first_kept, Seq(15));
+    assert_eq!(job.decision.reason, CompactionReason::WindowProtection);
+    assert!(job.decision.compact && job.decision.context_overflow);
+    assert!(job.request.tools.is_empty());
+    let text = job.request.messages[0].text.as_deref().unwrap();
+    assert!(text.contains("把 a 和 b 都做完"), "带着任务：{text}");
+}
+
+/// 只重试一次：压成摘要之后还没有一次成功的请求又超长，就照原样失败。衰减不算——
+/// 衰减之后紧接着超长，正该压。
+#[test]
+fn an_overflow_right_after_a_summary_is_not_compacted_again() {
+    let scenario = Scenario::new(context());
+    let mut just_summarized = online();
+    just_summarized.last_compaction_request_count = Some(just_summarized.request_count);
+    just_summarized.last_summary_request_count = Some(just_summarized.request_count);
+    just_summarized.compaction_count = 1;
+    assert!(
+        scenario
+            .plan_overflow(&just_summarized, &settings(1.25))
+            .is_none()
+    );
+
+    let mut just_decayed = online();
+    just_decayed.last_compaction_request_count = Some(just_decayed.request_count);
+    assert!(
+        scenario
+            .plan_overflow(&just_decayed, &settings(1.25))
+            .is_some()
+    );
+
+    let mut one_request_later = just_summarized;
+    one_request_later.request_count += 1;
+    assert!(
+        scenario
+            .plan_overflow(&one_request_later, &settings(1.25))
+            .is_some()
+    );
+}
+
+/// 切不出可收的一段（近期要留的比整段还多）：照常失败，不拿衰减兜底。
+#[test]
+fn an_overflow_with_nothing_to_cut_is_not_compacted() {
+    let keep_all = CompactionSettings {
+        keep_recent_tokens: u64::MAX,
+        ..settings(1.25)
+    };
+    assert!(
+        Scenario::new(context_with_candidate())
+            .plan_overflow(&online(), &keep_all)
+            .is_none()
+    );
 }
 
 fn decide_with(online: &OnlineState, settings: &CompactionSettings, window: Option<u64>) -> Plan {

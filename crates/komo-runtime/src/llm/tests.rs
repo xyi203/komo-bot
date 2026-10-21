@@ -560,6 +560,89 @@ fn a_retryable_failure_is_classified_by_what_failed() {
     assert_eq!(retry_cause(&LlmError::Unknown("结果不明".into())), None);
 }
 
+#[test]
+fn context_overflow_is_recognized_by_the_error_text_of_each_provider() {
+    let rejected = |status, message: &str| LlmError::Rejected {
+        status,
+        message: message.into(),
+    };
+    for (status, message) in [
+        (
+            400,
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213462 tokens > 200000 maximum"}}"#,
+        ),
+        (
+            413,
+            r#"{"error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#,
+        ),
+        (400, "Your input exceeds the context window of this model"),
+        (
+            400,
+            "Requested token count exceeds the model's maximum context length of 131072 tokens",
+        ),
+        (
+            400,
+            "Input length (265330) exceeds model's maximum context length (262144).",
+        ),
+        (
+            400,
+            "The input token count (1196265) exceeds the maximum number of tokens allowed (1048575)",
+        ),
+        (
+            400,
+            "This endpoint's maximum context length is 200000 tokens. However, you requested about 250000 tokens",
+        ),
+        (
+            400,
+            "Your request exceeded model token limit: 262144 (requested: 300000)",
+        ),
+        (400, "PROMPT TOO LONG"),
+    ] {
+        assert!(is_context_overflow(&rejected(status, message)), "{message}");
+    }
+}
+
+#[test]
+fn rate_limits_and_other_errors_are_not_overflow() {
+    let rejected = |status, message: &str| LlmError::Rejected {
+        status,
+        message: message.into(),
+    };
+    assert!(!is_context_overflow(&rejected(
+        503,
+        "Service unavailable: too many tokens in flight"
+    )));
+    assert!(!is_context_overflow(&rejected(
+        400,
+        "Throttling error: Too many tokens, please wait"
+    )));
+    assert!(!is_context_overflow(&rejected(
+        429,
+        "Rate limit reached: too many tokens per minute"
+    )));
+    assert!(!is_context_overflow(&rejected(401, "invalid x-api-key")));
+    assert!(!is_context_overflow(&rejected(503, "overloaded")));
+    // 只认 provider 的拒绝：传输失败与结果不明说的不是请求内容。
+    assert!(!is_context_overflow(&LlmError::Transport(
+        "prompt is too long".into()
+    )));
+    assert!(!is_context_overflow(&LlmError::Unknown(
+        "prompt is too long".into()
+    )));
+}
+
+/// 有的代理把超长包成 500：照 5xx 退避只会把同一份超长的上下文再发几遍。
+#[test]
+fn an_overflow_wrapped_as_a_server_error_is_not_retried() {
+    let wrapped = LlmError::Rejected {
+        status: 500,
+        message: "upstream error: prompt is too long: 213462 tokens > 200000 maximum".into(),
+    };
+    assert!(is_context_overflow(&wrapped));
+    assert_eq!(retry_cause(&wrapped), None);
+    assert!(!is_retryable(&wrapped));
+}
+
 /// §13.3：切换聊天模型或 effort 不影响独立配置的记忆模型。
 #[tokio::test]
 async fn the_router_hands_each_run_the_instance_its_own_snapshot_names() {

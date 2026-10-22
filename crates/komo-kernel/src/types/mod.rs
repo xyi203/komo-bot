@@ -49,7 +49,7 @@ pub use plan::{
     RecoveryMode, Replay, TargetAccess,
 };
 pub use refs::{
-    AttemptRef, ContentRef, INLINE_ARGUMENT_LIMIT_BYTES, OutputRef, PREVIEW_LIMIT_BYTES,
+    AttemptRef, ContentRef, INLINE_ARGUMENT_LIMIT_BYTES, ImageRef, OutputRef, PREVIEW_LIMIT_BYTES,
     PayloadRef, PublishedOutput, ToolResultBody, ToolResultStatus, VerifiedOutput,
 };
 pub use resource::{
@@ -66,7 +66,8 @@ pub use systemone::{
     SystemOneUsage,
 };
 pub use tool::{
-    CancelToken, ResumedCall, ToolContext, ToolDefinition, ToolError, ToolOutput, WorkspaceRoot,
+    CancelToken, IMAGE_LIMIT_BYTES, ResumedCall, ToolContext, ToolDefinition, ToolError, ToolImage,
+    ToolOutput, WorkspaceRoot, image_extension, image_mime,
 };
 pub use turn::{
     AcceptInput, Accepted, AssistantRound, EventBatch, LlmError, MemoryUse, PlannedCall,

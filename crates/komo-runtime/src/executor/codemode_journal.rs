@@ -8,7 +8,7 @@ use komo_kernel::events::{CodemodeJournal, EventPayload};
 use komo_kernel::types::ids::{AttemptId, EventId, Seq, ToolCallId};
 use komo_kernel::types::plan::{ExecutionPlan, Replay};
 use komo_kernel::types::refs::{AttemptRef, OutputRef, ToolResultBody, ToolResultStatus};
-use komo_kernel::types::tool::{ToolContext, ToolError};
+use komo_kernel::types::tool::{ToolContext, ToolError, ToolImage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -105,6 +105,9 @@ pub(super) struct Journal {
     pub recovering: bool,
     /// 宿主的致命错误锁住不放：Python 接住 `ToolError` 或自己伪造 done 都解不开。
     pub fatal: Option<ToolError>,
+    /// 这次运行里子调用交出来的图片（`read` 到的图、MCP 返回的图）：随外层结果附给模型。
+    /// 不进 journal——恢复时已经交付过的子调用不重跑，它们的图就不再附。
+    pub images: Vec<ToolImage>,
 }
 
 pub(super) fn uncertain(message: impl Into<String>) -> ToolError {
@@ -397,6 +400,7 @@ impl ToolExecutor {
                     error: None,
                     exit_code: None,
                     artifacts: vec![],
+                    images: vec![],
                     preview: None,
                 },
             )

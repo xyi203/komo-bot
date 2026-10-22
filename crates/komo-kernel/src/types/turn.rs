@@ -9,7 +9,7 @@ use super::ids::{EventId, MemoryId, RequestKey, RunId, Seq, SessionId, ToolCallI
 use super::model::{ModelConfig, TokenUsage};
 use super::plan::{ExecutionPlan, PlanSource};
 use super::refs::PayloadRef;
-use super::tool::ToolDefinition;
+use super::tool::{ToolDefinition, ToolImage};
 
 /// 回放面上一个节点的角色。
 ///
@@ -118,6 +118,11 @@ pub struct ToolResultForModel {
     pub content: String,
     #[serde(default)]
     pub is_error: bool,
+    /// 随这条结果交给模型的图片（按引用从输出目录读回来的原始字节）。不序列化：事实是
+    /// `output.json` 里的 [`ImageRef`](super::refs::ImageRef)，这里只是这一次请求要发的字节。
+    /// 修订（`revised`）只换正文，不动图片。
+    #[serde(skip)]
+    pub images: Vec<ToolImage>,
 }
 
 /// `LlmClient::begin_turn` 的输入：一次 Run 的一个执行段。工具 Schema、系统提示、
@@ -344,12 +349,14 @@ mod tests {
                 call_id: ToolCallId::from_raw("call-7"),
                 content: "result = 2".into(),
                 is_error: false,
+                images: vec![],
             }],
             revised: vec![ToolResultForModel {
                 provider_call_id: "pc-3".into(),
                 call_id: ToolCallId::from_raw("call-3"),
                 content: "短视图".into(),
                 is_error: true,
+                images: vec![],
             }],
         };
         let text = serde_json::to_string(&input).unwrap();

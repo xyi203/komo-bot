@@ -20,6 +20,7 @@ async fn a_handled_failed_payload_is_still_failed_in_the_call_summary() {
             result: json!({"isError": true}),
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some("remote failed".into()),
         })),
     );
@@ -134,6 +135,7 @@ async fn a_script_error_exposes_prior_write_before_large_output_and_replays_verb
             stdout: None,
             stderr: None,
             artifacts: &[],
+            images: &[],
         },
         &ProjectionContext {
             model_result_bytes: 2048,
@@ -215,6 +217,7 @@ async fn a_legacy_finished_output_is_returned_without_new_hints_or_fields() {
         result: json!({"calls": [{"tool": "read", "ok": true}], "error": "old"}),
         exit_code: None,
         artifacts: vec![],
+        images: vec![],
         preview: Some("old text\n脚本出错：old".into()),
     };
     let reference = executor

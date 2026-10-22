@@ -23,6 +23,9 @@ const POLL_SLACK: Duration = Duration::from_secs(15);
 /// 一次普通（非长轮询）调用的超时。
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// 下载一个文件的超时。
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Bot API 的失败。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TelegramError {
@@ -86,6 +89,27 @@ pub struct Message {
     pub from: Option<User>,
     #[serde(default)]
     pub text: Option<String>,
+    /// 图片 / 文件的附言。带图的消息没有 `text`，用户写的字在这里。
+    #[serde(default)]
+    pub caption: Option<String>,
+    /// 同一张图的几种尺寸，小的在前。
+    #[serde(default)]
+    pub photo: Vec<PhotoSize>,
+    /// 按文件发的东西。不压缩的截图就是这样来的。
+    #[serde(default)]
+    pub document: Option<Document>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PhotoSize {
+    pub file_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Document {
+    pub file_id: String,
+    #[serde(default)]
+    pub mime_type: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -118,6 +142,8 @@ pub struct BotApi {
     http: reqwest::Client,
     /// `{endpoint}/bot{token}`。**不进任何日志与错误**。
     base: String,
+    /// `{endpoint}/file/bot{token}`，文件下载走它。同样带着 token。
+    file_base: String,
 }
 
 impl std::fmt::Debug for BotApi {
@@ -134,9 +160,11 @@ impl BotApi {
 
     /// 换一个端点（测试里的假 Bot API，或一个自建代理）。
     pub fn with_endpoint(endpoint: &str, token: &str, http: reqwest::Client) -> Self {
+        let endpoint = endpoint.trim_end_matches('/');
         Self {
             http,
-            base: format!("{}/bot{}", endpoint.trim_end_matches('/'), token),
+            base: format!("{endpoint}/bot{token}"),
+            file_base: format!("{endpoint}/file/bot{token}"),
         }
     }
 
@@ -216,6 +244,36 @@ impl BotApi {
                 },
             )
             .collect())
+    }
+
+    /// `getFile` 再下载，返回文件的字节。Bot API 只给 20 MB 以内的文件。
+    pub async fn download_file(&self, file_id: &str) -> Result<Vec<u8>, TelegramError> {
+        #[derive(Deserialize)]
+        struct File {
+            #[serde(default)]
+            file_path: Option<String>,
+        }
+        let file: File = self
+            .call("getFile", json!({ "file_id": file_id }), CALL_TIMEOUT)
+            .await?;
+        let path = file
+            .file_path
+            .ok_or_else(|| TelegramError::Decode("getFile: 没有 file_path".into()))?;
+        let response = self
+            .http
+            .get(format!("{}/{path}", self.file_base))
+            .timeout(DOWNLOAD_TIMEOUT)
+            .send()
+            .await
+            .map_err(transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(TelegramError::Api {
+                code: i64::from(status.as_u16()),
+                description: "下载文件失败".into(),
+            });
+        }
+        Ok(response.bytes().await.map_err(transport)?.to_vec())
     }
 
     /// `sendMessage`，返回新消息的 `message_id`。

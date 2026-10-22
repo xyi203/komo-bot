@@ -60,15 +60,16 @@ use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::monitor::{MonitorHandle, MonitorSpec, MonitorStopped};
 use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanSource, Replay};
 use komo_kernel::types::refs::{
-    AttemptRef, ContentRef, InterruptedOutput, PublishedOutput, ToolResultBody, ToolResultStatus,
+    AttemptRef, ContentRef, ImageRef, InterruptedOutput, PublishedOutput, ToolResultBody,
+    ToolResultStatus,
 };
 use komo_kernel::types::resource::ResourceMounts;
 use komo_kernel::types::status::{RunEnd, RunState, ToolCallState};
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::task::{FollowOutcome, TaskHandle, TaskOptions, TaskProgress, TaskSpec};
 use komo_kernel::types::tool::{
-    CancelToken, InterjectSignal, ResumedCall, ToolContext, ToolError, ToolExposure, ToolNamespace,
-    ToolOutput, WorkspaceRoot,
+    CancelToken, IMAGE_LIMIT_BYTES, InterjectSignal, ResumedCall, ToolContext, ToolError,
+    ToolExposure, ToolImage, ToolNamespace, ToolOutput, WorkspaceRoot,
 };
 use komo_kernel::types::turn::{AcceptInput, Accepted, ToolResultForModel};
 
@@ -866,8 +867,14 @@ impl ToolExecutor {
                 outcome = Err(error);
             }
         }
-        let mut recorded = self.publish(writer, result_body(&outcome)).await?;
+        let mut body = result_body(&outcome);
+        let images = match &outcome {
+            Ok(output) => store_images(writer.as_mut(), &mut body, &output.images).await,
+            Err(_) => Vec::new(),
+        };
+        let mut recorded = self.publish(writer, body).await?;
         recorded.published.elapsed_ms = elapsed_ms;
+        recorded.image_bytes = images;
         self.ledger
             .finish_call(&attempt, recorded.published.clone())
             .await?;
@@ -1562,6 +1569,7 @@ impl ToolExecutor {
             error: is_error.then(|| content.clone()),
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(content),
         };
         let recorded = self
@@ -1611,6 +1619,7 @@ impl ToolExecutor {
             error: (status != ToolResultStatus::Completed).then(|| summary.clone()),
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(summary),
         };
         self.settle_attempt(attempt_ref, body).await?;
@@ -1686,6 +1695,7 @@ impl ToolExecutor {
             error: Some(message.clone()),
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(message),
         };
         let recorded = self.settle_attempt(attempt_ref, body).await?;
@@ -1723,11 +1733,14 @@ impl ToolExecutor {
     ) -> Result<Recorded, ExecError> {
         let text = body.preview.clone();
         let artifacts = body.artifacts.clone();
+        let images = body.images.clone();
         let published = self.outputs.publish(writer, body).await?;
         Ok(Recorded {
             published,
             text,
             artifacts,
+            images,
+            image_bytes: Vec::new(),
         })
     }
 
@@ -1756,6 +1769,7 @@ impl ToolExecutor {
             error: Some(message.clone()),
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(message),
         };
         let writer = self.outputs.begin(&attempt_ref).await?;
@@ -1905,6 +1919,51 @@ struct Recorded {
     published: PublishedOutput,
     text: Option<String>,
     artifacts: Vec<ContentRef>,
+    images: Vec<ImageRef>,
+    /// `images` 的字节：刚写下去的那一份，不用再从磁盘读回来。
+    image_bytes: Vec<ToolImage>,
+}
+
+/// 把工具交出来的图片写进这次尝试的输出目录，结果里只留引用；返回写下来的那几张，这一次
+/// 直接交给模型。超过上限或写不下来的那张不让整次调用失败：正文里补一句，模型知道少了什么。
+async fn store_images(
+    writer: &mut dyn OutputWriter,
+    body: &mut ToolResultBody,
+    images: &[ToolImage],
+) -> Vec<ToolImage> {
+    let mut stored = Vec::new();
+    let mut notes = Vec::new();
+    for image in images {
+        if image.bytes.len() > IMAGE_LIMIT_BYTES {
+            notes.push(format!(
+                "有一张 {} 图片 {} 字节，超过上限 {} 字节，没有附上",
+                image.mime,
+                image.bytes.len(),
+                IMAGE_LIMIT_BYTES
+            ));
+            continue;
+        }
+        match writer.write_image(&image.mime, &image.bytes).await {
+            Ok(reference) => {
+                body.images.push(reference);
+                stored.push(image.clone());
+            }
+            Err(error) => {
+                tracing::warn!(%error, mime = %image.mime, "结果图片没存下来");
+                notes.push(format!("有一张 {} 图片没存下来：{error}", image.mime));
+            }
+        }
+    }
+    if !notes.is_empty() {
+        let preview = body.preview.get_or_insert_with(String::new);
+        for note in notes {
+            if !preview.is_empty() {
+                preview.push('\n');
+            }
+            preview.push_str(&note);
+        }
+    }
+    stored
 }
 
 /// 交给模型的那一份：**每条结果都从这里过**，与回放（`komo-agent` 的
@@ -1921,6 +1980,7 @@ fn for_model(request: &CallRequest, env: &CallEnv, recorded: &Recorded) -> ToolR
         stdout: published.stdout.as_ref(),
         stderr: published.stderr.as_ref(),
         artifacts: &recorded.artifacts,
+        images: &recorded.images,
     };
     // 刚跑完的结果从不处于已衰减状态；之后要不要换短视图是 planner 对前缀的改写决策。
     let content = select(project_views(&facts, &env.projection), false);
@@ -1929,6 +1989,7 @@ fn for_model(request: &CallRequest, env: &CallEnv, recorded: &Recorded) -> ToolR
         call_id: request.call.clone(),
         content,
         is_error: published.status != ToolResultStatus::Completed,
+        images: recorded.image_bytes.clone(),
     }
 }
 
@@ -2096,6 +2157,8 @@ fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
             error: None,
             exit_code: output.exit_code,
             artifacts: output.artifacts.clone(),
+            // 图片要先写成文件才有引用：发布前由 [`store_images`] 填。
+            images: vec![],
             // 工具写给模型看的那段正文跟着结果一起落进 `output.json`：模型上下文的投影读
             // 这一份，而 JSONL 里的事件只留它的前 1 KiB。
             preview: output.preview.clone(),
@@ -2110,6 +2173,7 @@ fn result_body(outcome: &Result<ToolOutput, ToolError>) -> ToolResultBody {
             error: Some(error.to_string()),
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             // 工具失败时模型必须看见那句话（"版本冲突：a.txt"）——投影读的就是这一份。
             // 结果不明的再附上判断方法：它不停下来等人，由模型去核对。
             preview: Some(if error.is_uncertain() {
@@ -2312,6 +2376,7 @@ fn completed_body(
         error: None,
         exit_code: None,
         artifacts: vec![],
+        images: vec![],
         // 父侧那条结果的正文：模型看见的就是它（`tool.result` 里留前 1 KiB）。
         preview: Some(text.to_string()),
     }
@@ -2334,6 +2399,7 @@ fn failed_result(
         error: Some(summary.clone()),
         exit_code: None,
         artifacts: vec![],
+        images: vec![],
         preview: Some(summary),
     }
 }

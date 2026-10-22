@@ -576,6 +576,7 @@ impl World {
                     error: None,
                     exit_code: Some(0),
                     artifacts: vec![],
+                    images: vec![],
                     preview: None,
                 },
             )
@@ -681,6 +682,7 @@ async fn row_5_the_result_is_on_disk_and_verified_while_the_database_lags() {
                 error: None,
                 exit_code: Some(0),
                 artifacts: vec![],
+                images: vec![],
                 preview: None,
             },
         )
@@ -1110,6 +1112,7 @@ async fn an_altered_output_body_stops_the_task_too() {
                 error: None,
                 exit_code: Some(0),
                 artifacts: vec![],
+                images: vec![],
                 preview: None,
             },
         )

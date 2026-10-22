@@ -19,7 +19,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::types::ids::{AttemptId, RunId, ToolCallId};
-use crate::types::refs::{ContentRef, OutputRef, ToolResultStatus};
+use crate::types::refs::{ContentRef, ImageRef, OutputRef, ToolResultStatus};
 use crate::types::resource::{OutputFile, ResourceUri};
 
 /// 投影用的全部事实。
@@ -40,6 +40,8 @@ pub struct ToolResultFacts<'a> {
     /// 这一轮**产出**的文件（`output.json` 里那一格）。给模型的是入口与大小，不是正文
     /// ——正文按引用去 `read`（§4.7）。
     pub artifacts: &'a [ContentRef],
+    /// 随结果附给模型的图片（`output.json` 里那一格）。正文里只印一行说明，字节另走。
+    pub images: &'a [ImageRef],
 }
 
 /// 这一次投影的设置：正文预算与衰减策略。
@@ -123,6 +125,7 @@ pub fn project(facts: &ToolResultFacts<'_>, ctx: &ProjectionContext) -> String {
         out.push_str(&recall(facts));
     }
     out.push_str(&artifacts(facts));
+    out.push_str(&images(facts));
     out
 }
 
@@ -156,6 +159,7 @@ fn decay(facts: &ToolResultFacts<'_>, policy: &DecayPolicy) -> String {
     push_excerpt(&mut out, &cut);
     out.push_str(&recall(facts));
     out.push_str(&artifacts(facts));
+    out.push_str(&images(facts));
     out
 }
 
@@ -268,6 +272,21 @@ fn artifacts(facts: &ToolResultFacts<'_>) -> String {
         out.push_str(&format!("产物：{uri}（{}）\n", bytes(artifact.size)));
     }
     out
+}
+
+/// 随结果附上的图片：一行一张，印格式与大小。图片本身由各家接口接在这条结果后面。
+fn images(facts: &ToolResultFacts<'_>) -> String {
+    facts
+        .images
+        .iter()
+        .map(|image| {
+            format!(
+                "图片：{}（{}），已附在这条结果里\n",
+                image.mime,
+                bytes(image.content.size)
+            )
+        })
+        .collect()
 }
 
 /// 这段正文是不是只是整个输出的一部分。
@@ -476,6 +495,7 @@ mod tests {
             stdout,
             stderr: None,
             artifacts: &[],
+            images: &[],
         }
     }
 
@@ -596,6 +616,26 @@ mod tests {
             "映射不出入口的路径不是产物，别编一条：{printed}"
         );
         // 产物那条**不受预算影响**：它说的是"这一轮产出了什么"，与正文省了多少无关。
+        assert!(!printed.contains("完整输出："), "{printed}");
+    }
+
+    /// 图片只印一行说明；字节不进正文。
+    #[test]
+    fn an_attached_image_is_named_in_the_text() {
+        let images = [ImageRef {
+            mime: "image/png".into(),
+            content: reference("tool-output/run-1/call-7/attempt-1/image-1.png", 2048),
+        }];
+        let facts = ToolResultFacts {
+            tool: "read",
+            images: &images,
+            ..facts(Some("shot.png 是一张图片\n"), None)
+        };
+        let printed = project(&facts, &budget(1024));
+        assert!(
+            printed.ends_with("图片：image/png（2.0 KB），已附在这条结果里\n"),
+            "{printed}"
+        );
         assert!(!printed.contains("完整输出："), "{printed}");
     }
 

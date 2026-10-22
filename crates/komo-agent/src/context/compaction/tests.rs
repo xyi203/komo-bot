@@ -38,6 +38,7 @@ fn result(seq: u64, id: &str, content: &str) -> ReplayMessage {
             call_id: ToolCallId::from_raw(id),
             content: content.into(),
             is_error: false,
+            images: vec![],
         }],
         ..message(Role::Tool, seq, None)
     }

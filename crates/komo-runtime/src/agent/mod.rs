@@ -33,7 +33,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use komo_kernel::compaction::{CompactionJob, PROMPT_CACHE_TTL, Reshape, estimate_tokens};
+use komo_kernel::compaction::{
+    CompactionJob, IMAGE_TOKENS, PROMPT_CACHE_TTL, Reshape, estimate_tokens,
+};
 use komo_kernel::events::ContextCompacted;
 use komo_kernel::traits::{Clock, Ledger, LedgerError, LlmClient};
 use komo_kernel::types::ids::{RunId, SessionId, ToolCallId};
@@ -189,7 +191,9 @@ impl Compactor {
     ) -> bool {
         let results_tokens: u64 = results
             .iter()
-            .map(|result| estimate_tokens(&result.content))
+            .map(|result| {
+                estimate_tokens(&result.content) + IMAGE_TOKENS * result.images.len() as u64
+            })
             .sum();
         let round_tokens = round.map_or(0, |round| match &round.provider_blocks {
             Some(blocks) => estimate_tokens(&blocks.to_string()),

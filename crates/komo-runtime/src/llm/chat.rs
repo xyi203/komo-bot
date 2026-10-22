@@ -122,7 +122,7 @@ fn replay(messages: &[ReplayMessage]) -> Vec<Value> {
                     ));
                 }
             }
-            Role::Tool => out.extend(message.tool_results.iter().map(tool_message)),
+            Role::Tool => out.extend(tool_messages(&message.tool_results)),
         }
     }
     out
@@ -161,6 +161,30 @@ fn tool_message(result: &ToolResultForModel) -> Value {
     })
 }
 
+/// 一轮的工具结果。`role: "tool"` 的消息只收文字：结果里的图片并成一条紧跟在后面的 user
+/// 消息（照 pi），没有图片就没有这一条。
+fn tool_messages(results: &[ToolResultForModel]) -> Vec<Value> {
+    let mut out: Vec<Value> = results.iter().map(tool_message).collect();
+    let images: Vec<Value> = results
+        .iter()
+        .flat_map(|result| result.images.iter())
+        .map(|image| {
+            json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{};base64,{}", image.mime, super::image_base64(image)),
+                },
+            })
+        })
+        .collect();
+    if !images.is_empty() {
+        let mut content = vec![json!({ "type": "text", "text": "上面工具结果里附带的图片：" })];
+        content.extend(images);
+        out.push(json!({ "role": "user", "content": content }));
+    }
+    out
+}
+
 /// 把更早的工具结果换成新视图：只换那条 `role: "tool"` 消息的 `content`，
 /// `tool_call_id` 与位置不动，此后一直用新正文。
 fn revise(messages: &mut [Value], revised: &[ToolResultForModel]) {
@@ -195,7 +219,7 @@ impl TurnDriver for ChatDriver {
     async fn next(&mut self, input: RoundInput) -> Result<Round, LlmError> {
         if let RoundInput::ToolResults { results, revised } = &input {
             revise(&mut self.messages, revised);
-            self.messages.extend(results.iter().map(tool_message));
+            self.messages.extend(tool_messages(results));
         }
         self.round += 1;
         let effort = EffortSetting::from_option(self.model.effort.clone());
@@ -573,6 +597,7 @@ mod tests {
                     call_id: ToolCallId::from_raw("tc"),
                     content: "content".into(),
                     is_error: false,
+                    images: vec![],
                 }],
                 revised: Vec::new(),
             })
@@ -590,12 +615,37 @@ mod tests {
         assert_eq!(messages[2]["tool_call_id"], json!("call_1"));
     }
 
+    #[test]
+    fn images_in_tool_results_follow_as_one_user_message() {
+        let mut with_image = result("call_1", "shot.png 是一张图片");
+        with_image.images = vec![komo_kernel::types::tool::ToolImage {
+            mime: "image/png".into(),
+            bytes: b"png".to_vec(),
+        }];
+        let messages = tool_messages(&[with_image, result("call_2", "纯文字")]);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"], json!("shot.png 是一张图片"));
+        assert_eq!(messages[1]["tool_call_id"], json!("call_2"));
+        assert_eq!(messages[2]["role"], json!("user"));
+        assert_eq!(
+            messages[2]["content"][1]["image_url"]["url"],
+            json!("data:image/png;base64,cG5n")
+        );
+
+        assert_eq!(
+            tool_messages(&[result("call_3", "无图")]).len(),
+            1,
+            "没图就没有那条 user"
+        );
+    }
+
     fn result(provider_call_id: &str, content: &str) -> ToolResultForModel {
         ToolResultForModel {
             provider_call_id: provider_call_id.into(),
             call_id: ToolCallId::from_raw(format!("tc-{provider_call_id}")),
             content: content.into(),
             is_error: false,
+            images: vec![],
         }
     }
 

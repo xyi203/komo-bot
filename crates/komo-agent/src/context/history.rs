@@ -21,8 +21,9 @@ use komo_kernel::projection::{
     ProjectionContext, ToolResultFacts, decay_eligible, project_views, select,
 };
 use komo_kernel::types::ids::{RunId, Seq, ToolCallId};
-use komo_kernel::types::refs::{ContentRef, ToolResultStatus};
+use komo_kernel::types::refs::{ContentRef, ImageRef, ToolResultStatus};
 use komo_kernel::types::status::RunState;
+use komo_kernel::types::tool::ToolImage;
 use komo_kernel::types::turn::{ReplayMessage, Role, ToolCallRequest, ToolResultForModel};
 
 /// 当前 Run 里一条**有资格换成短视图、但还没换**的工具结果：改写决策（§6）的原料。
@@ -155,6 +156,10 @@ pub struct ResolvedMessage<'s> {
 pub struct StoredOutput {
     pub preview: Option<String>,
     pub artifacts: Vec<ContentRef>,
+    /// `output.json` 里记着的图片引用：投影正文按它每张印一行。
+    pub images: Vec<ImageRef>,
+    /// 按引用读回来、校验过的图片字节，随结果再交给模型；读不回来的那张就不在这里。
+    pub image_bytes: Vec<ToolImage>,
 }
 
 /// 纯函数：选窗口，并且已经筛掉历史 Run 里"不是用户正文、也不是最终回复"的那些
@@ -452,6 +457,10 @@ pub(crate) fn replay_messages(
                         .as_ref()
                         .map(|stored| stored.artifacts.as_slice())
                         .unwrap_or_default();
+                    let images: &[ImageRef] = stored
+                        .as_ref()
+                        .map(|stored| stored.images.as_slice())
+                        .unwrap_or_default();
                     let request = requests.get(&result.call).copied();
                     let facts = ToolResultFacts {
                         tool: request.map(|call| call.name.as_str()).unwrap_or("?"),
@@ -462,6 +471,7 @@ pub(crate) fn replay_messages(
                         stdout: result.stdout.as_ref(),
                         stderr: result.stderr.as_ref(),
                         artifacts,
+                        images,
                     };
                     let projected = project_views(&facts, projection);
                     let provider_call_id = request
@@ -485,6 +495,10 @@ pub(crate) fn replay_messages(
                         call_id: result.call.clone(),
                         content: select(projected, is_decayed),
                         is_error: !matches!(result.status, ToolResultStatus::Completed),
+                        images: stored
+                            .as_ref()
+                            .map(|stored| stored.image_bytes.clone())
+                            .unwrap_or_default(),
                     });
                 }
                 out.push(ReplayMessage {

@@ -18,8 +18,8 @@ use komo_kernel::traits::{OutputWriter, StoreError, ToolOutputStore};
 use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::SessionId;
 use komo_kernel::types::refs::{
-    AttemptRef, ContentRef, InterruptedOutput, OutputRef, PublishedOutput, ToolResultBody,
-    ToolResultStatus, VerifiedOutput,
+    AttemptRef, ContentRef, ImageRef, InterruptedOutput, OutputRef, PublishedOutput,
+    ToolResultBody, ToolResultStatus, VerifiedOutput,
 };
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +116,8 @@ pub struct FileOutputWriter {
     attempt: AttemptRef,
     dir: std::path::PathBuf,
     bytes: u64,
+    /// 这次已经写了几张图片：下一张叫 `image-<n+1>`。
+    images: usize,
     streams: Arc<tokio::sync::Mutex<HashMap<String, Streams>>>,
 }
 
@@ -167,6 +169,38 @@ impl OutputWriter for FileOutputWriter {
         self.stream("stderr.txt", chunk).await
     }
 
+    /// 和 `output.json` 一样：先写 `.partial`、同步、原子改名、同步目录。
+    async fn write_image(&mut self, mime: &str, bytes: &[u8]) -> Result<ImageRef, StoreError> {
+        self.images += 1;
+        let name = format!(
+            "image-{}.{}",
+            self.images,
+            komo_kernel::types::tool::image_extension(mime)
+        );
+        let temp_path = self.dir.join(format!("{name}.partial"));
+        let final_path = self.dir.join(&name);
+        tokio::fs::write(&temp_path, bytes)
+            .await
+            .map_err(|e| StoreError::Io(format!("写 {} 失败：{e}", temp_path.display())))?;
+        sync_file(&temp_path).await?;
+        tokio::fs::rename(&temp_path, &final_path)
+            .await
+            .map_err(|e| StoreError::Io(format!("发布 {} 失败：{e}", final_path.display())))?;
+        sync_dir(&self.dir).await?;
+        Ok(ImageRef {
+            mime: mime.to_string(),
+            content: ContentRef {
+                path: format!(
+                    "{}/{name}",
+                    FileToolOutputStore::attempt_relative(&self.attempt)
+                ),
+                size: bytes.len() as u64,
+                hash: ContentHash::of_bytes(bytes),
+                pointer: None,
+            },
+        })
+    }
+
     fn attempt(&self) -> &AttemptRef {
         &self.attempt
     }
@@ -206,6 +240,7 @@ impl ToolOutputStore for FileToolOutputStore {
             attempt: attempt.clone(),
             dir,
             bytes: 0,
+            images: 0,
             streams: self.streams.clone(),
         }))
     }
@@ -329,6 +364,25 @@ impl ToolOutputStore for FileToolOutputStore {
             reference: output.clone(),
             body: document.body,
         })
+    }
+
+    async fn open_image(&self, image: &ImageRef) -> Result<Vec<u8>, StoreError> {
+        let reference = &image.content;
+        let path = self.paths.resolve(&reference.path)?;
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StoreError::Corrupt(format!("引用的图片不在：{}", reference.path))
+            } else {
+                StoreError::Io(format!("读 {} 失败：{e}", path.display()))
+            }
+        })?;
+        if bytes.len() as u64 != reference.size || ContentHash::of_bytes(&bytes) != reference.hash {
+            return Err(StoreError::Corrupt(format!(
+                "{} 的大小或内容哈希与引用不符",
+                reference.path
+            )));
+        }
+        Ok(bytes)
     }
 
     async fn interrupted(
@@ -462,6 +516,7 @@ mod tests {
             error: None,
             exit_code: Some(0),
             artifacts: vec![],
+            images: vec![],
             preview: None,
         }
     }
@@ -564,6 +619,34 @@ mod tests {
 
         let verified = store.open(&published.output).await.unwrap();
         assert_eq!(verified.body, body(ToolResultStatus::Completed));
+    }
+
+    /// 图片落在尝试目录里，读回时核对；被改过就是损坏，不交出内容。
+    #[tokio::test]
+    async fn an_image_is_written_beside_the_output_and_verified_on_open() {
+        let (_dir, store, session) = store().await;
+        let mut writer = store.begin(&attempt(&session)).await.unwrap();
+        let png = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        let image = writer.write_image("image/png", &png).await.unwrap();
+        assert_eq!(
+            image.content.path,
+            "tool-output/run-1/call-7/attempt-1/image-1.png"
+        );
+        let mut result = body(ToolResultStatus::Completed);
+        result.images.push(image.clone());
+        let published = store.publish(writer, result).await.unwrap();
+        let verified = store.open(&published.output).await.unwrap();
+        assert_eq!(verified.body.images, vec![image.clone()]);
+        assert_eq!(store.open_image(&image).await.unwrap(), png);
+
+        let path = store.paths().resolve(&image.content.path).unwrap();
+        tokio::fs::write(&path, b"\x89PNG\r\n\x1a\nFAKE")
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.open_image(&image).await,
+            Err(StoreError::Corrupt(_))
+        ));
     }
 
     /// 没有 stdout / stderr 的工具不该留下空文件。

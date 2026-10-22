@@ -447,6 +447,7 @@ impl Tool for BashTool {
                     })?,
                     exit_code: None,
                     artifacts: vec![],
+                    images: vec![],
                     preview: Some(preview),
                 });
             }
@@ -509,6 +510,7 @@ impl Tool for BashTool {
             })?,
             exit_code: result.exit_code,
             artifacts: vec![],
+            images: vec![],
             preview: Some(preview),
         })
     }

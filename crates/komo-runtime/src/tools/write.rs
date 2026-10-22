@@ -158,6 +158,7 @@ impl Tool for WriteTool {
             })?,
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(format!(
                 "{} {}，{} 字节 · 版本 {}",
                 result.path,

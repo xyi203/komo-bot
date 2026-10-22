@@ -605,6 +605,7 @@ async fn a_tool_output_with_no_preview_still_produces_one() {
         result: serde_json::json!({ "value": 42 }),
         exit_code: None,
         artifacts: vec![],
+        images: vec![],
         preview: None,
     })));
     let wired = Wired::new(
@@ -975,6 +976,7 @@ async fn a_command_run_never_touches_the_llm_client_and_finishes_with_the_shell_
         result: serde_json::json!({}),
         exit_code: Some(0),
         artifacts: vec![],
+        images: vec![],
         preview: Some("hi".into()),
     })));
     let wired = Wired::with_llm(Arc::new(PanickingLlm), vec![tool.clone()]);
@@ -1008,6 +1010,7 @@ async fn a_non_zero_exit_still_completes_the_run_not_fails_it() {
         result: serde_json::json!({}),
         exit_code: Some(1),
         artifacts: vec![],
+        images: vec![],
         preview: Some("boom".into()),
     })));
     let wired = Wired::with_llm(Arc::new(PanickingLlm), vec![tool]);
@@ -1040,6 +1043,7 @@ fn reading(name: &'static str, status: ToolResultStatus, preview: String) -> Arc
                 result: serde_json::json!({}),
                 exit_code: None,
                 artifacts: vec![],
+                images: vec![],
                 preview: Some(preview),
             },
         )),

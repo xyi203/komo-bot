@@ -17,7 +17,7 @@ pub mod cut;
 pub mod economics;
 pub mod state;
 
-pub use cut::{estimate_tokens, find_cut};
+pub use cut::{IMAGE_TOKENS, estimate_tokens, find_cut};
 pub use economics::{
     CompactionDebt, CompactionDecision, CompactionEconomics, CompactionInput, CompactionReason,
     RequestHorizon, decide, effective_window, estimate_remaining_requests,

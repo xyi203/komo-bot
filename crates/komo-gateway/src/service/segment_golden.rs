@@ -236,6 +236,7 @@ async fn golden_full_main_agent() {
             result: serde_json::json!({ "ok": true }),
             error: None,
             exit_code: Some(0),
+            images: vec![],
             artifacts: vec![ContentRef {
                 path: "artifacts/run-2/报告.md".into(),
                 size: 13,

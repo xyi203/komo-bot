@@ -286,6 +286,7 @@ fn fused(
         }),
         exit_code: then.exit_code,
         artifacts,
+        images: vec![],
         preview: Some(preview),
     }
 }

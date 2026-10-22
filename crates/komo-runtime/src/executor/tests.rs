@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use komo_kernel::traits::{Clock, Ledger, OutputWriter, Tool};
+use komo_kernel::traits::{Clock, Ledger, OutputWriter, Tool, ToolOutputStore};
 use komo_kernel::types::ids::{AttemptId, OperationId, SessionId, ToolCallId};
 use komo_kernel::types::plan::{
     ExecutionPlan, Operation, PlanSource, PlanTarget, PlanVersions, RecoveryMode, Replay,
@@ -13,7 +13,9 @@ use komo_kernel::types::plan::{
 use komo_kernel::types::refs::{InterruptedOutput, PREVIEW_LIMIT_BYTES, ToolResultStatus};
 use komo_kernel::types::status::ToolCallState;
 use komo_kernel::types::surface::AgentSurface;
-use komo_kernel::types::tool::{CancelToken, ToolContext, ToolDefinition, ToolError, ToolOutput};
+use komo_kernel::types::tool::{
+    CancelToken, ToolContext, ToolDefinition, ToolError, ToolImage, ToolOutput,
+};
 
 use super::harness::{Harness, RecordingTool};
 use super::{CallRequest, OperatorVerdict, RoundStop, is_recall, resumed_from};
@@ -692,6 +694,7 @@ async fn the_preview_is_bounded_and_the_whole_output_lives_in_the_store() {
         result: serde_json::json!({ "stdout": body.clone() }),
         exit_code: Some(0),
         artifacts: vec![],
+        images: vec![],
         preview: Some(body.clone()),
     })));
     let executor = harness.executor(vec![tool]);
@@ -742,6 +745,73 @@ async fn the_preview_is_bounded_and_the_whole_output_lives_in_the_store() {
         .published_body(published.output_ref.path())
         .expect("输出存储里有它");
     assert_eq!(stored.result["stdout"], serde_json::json!(body));
+}
+
+/// 工具交出来的图片存成文件、账里只留引用，这一次直接附给模型；超限的那张不附，正文说明。
+#[tokio::test]
+async fn a_tool_image_is_stored_by_reference_and_attached_for_the_model() {
+    let harness = Harness::new();
+    let png = b"\x89PNG\r\n\x1a\nfake".to_vec();
+    let mut huge = png.clone();
+    huge.resize(komo_kernel::types::tool::IMAGE_LIMIT_BYTES + 1, 0);
+    let tool = Arc::new(RecordingTool::bash().with_outcome(Ok(ToolOutput {
+        status: ToolResultStatus::Completed,
+        result: serde_json::Value::Null,
+        exit_code: Some(0),
+        artifacts: vec![],
+        images: vec![
+            ToolImage {
+                mime: "image/png".into(),
+                bytes: png.clone(),
+            },
+            ToolImage {
+                mime: "image/png".into(),
+                bytes: huge,
+            },
+        ],
+        preview: Some("截了一张图".into()),
+    })));
+    let executor = harness.executor(vec![tool]);
+    let (session, run) = harness.open_run().await;
+    let calls = harness
+        .record_round(&run, &[("bash", serde_json::json!({ "command": "x" }))])
+        .await;
+
+    let outcome = executor
+        .execute_round(calls, &harness.env(&session, &run))
+        .await
+        .unwrap();
+
+    let result = &outcome.results[0];
+    assert_eq!(result.images.len(), 1, "超限的那张不附");
+    assert_eq!(result.images[0].bytes, png);
+    assert!(
+        result.content.contains("图片：image/png"),
+        "{}",
+        result.content
+    );
+    assert!(result.content.contains("超过上限"), "{}", result.content);
+
+    let published = harness
+        .ledger
+        .events()
+        .iter()
+        .find_map(|event| match &event.payload {
+            komo_kernel::events::EventPayload::ToolResult(result) => Some(result.clone()),
+            _ => None,
+        })
+        .expect("有一条 tool.result");
+    let stored = harness
+        .outputs
+        .published_body(published.output_ref.path())
+        .expect("输出存储里有它");
+    assert_eq!(stored.images.len(), 1);
+    let bytes = harness
+        .outputs
+        .open_image(&stored.images[0])
+        .await
+        .expect("按引用读得回来");
+    assert_eq!(bytes, png);
 }
 
 /// 取消停在当场：后面的调用一个都不派发。
@@ -2251,6 +2321,7 @@ impl Tool for Probe {
             result: serde_json::json!({ "call": ctx.call }),
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(format!("{tag} 完成")),
         })
     }
@@ -2565,6 +2636,7 @@ async fn the_projection_reports_how_many_bytes_it_kept_and_stored() {
             result: serde_json::json!({}),
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(preview.clone()),
         })),
     );
@@ -2659,6 +2731,7 @@ async fn an_artifact_of_the_round_is_named_in_what_the_model_sees() {
             result: serde_json::json!({ "ok": true }),
             exit_code: Some(0),
             artifacts: vec![report],
+            images: vec![],
             preview: Some("跑完了\n".into()),
         })),
     );
@@ -3617,6 +3690,7 @@ mod one_projection {
                 stdout: result.stdout.as_ref(),
                 stderr: result.stderr.as_ref(),
                 artifacts: &body.artifacts,
+                images: &body.images,
             },
             &ExecutionConfig::default().projection(),
         )
@@ -4197,6 +4271,7 @@ mod fused {
                 result: serde_json::json!({}),
                 exit_code: None,
                 artifacts: vec![],
+                images: vec![],
                 preview: Some("看过了".into()),
             })
         }

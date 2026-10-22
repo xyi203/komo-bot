@@ -10,6 +10,7 @@
 //! | `PATCH /open-apis/im/v1/messages/{id}` | Run 终态时换掉处理中卡片（§11.3） |
 //! | `POST /open-apis/im/v1/messages/{id}/reply` | 回复原消息发一张处理中卡片；`reply_in_thread` 时以话题回复（目标已在话题里就进那个话题）。话题只能这样进：发消息接口不能指定话题 |
 //! | `POST /open-apis/im/v1/messages/{id}/reactions` | 给原消息加表情回复（收到了） |
+//! | `GET /open-apis/im/v1/messages/{id}/resources/{key}?type=image` | 下载用户发来的图片（要 `im:resource` 权限） |
 //!
 //! 只解析用得到的字段，其余一律忽略：开放平台每月加字段，而一个多出来的键不应该让一
 //! 条事件或一次回复整体失败。
@@ -29,6 +30,9 @@ const DEFAULT_ENDPOINT: &str = "https://open.feishu.cn";
 
 /// 一次调用的超时。
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// 下载一张图的超时。图比一次 JSON 调用大得多。
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// 提前多久换一张新 token。
 ///
@@ -316,6 +320,49 @@ impl FeishuApi {
         )
         .await
         .map(|_| ())
+    }
+
+    /// 下载消息里的一张图，返回原始字节。
+    ///
+    /// 成功时响应体就是图片本身，失败时是一个 JSON 信封——所以按状态码与
+    /// `Content-Type` 分，不走 [`Self::call`]。
+    pub async fn download_image(
+        &self,
+        message_id: &str,
+        image_key: &str,
+    ) -> Result<Vec<u8>, FeishuError> {
+        let token = self.tenant_token().await?;
+        let response = self
+            .http
+            .get(format!(
+                "{}/open-apis/im/v1/messages/{message_id}/resources/{image_key}?type=image",
+                self.base
+            ))
+            .bearer_auth(&token)
+            .timeout(DOWNLOAD_TIMEOUT)
+            .send()
+            .await
+            .map_err(transport)?;
+        let status = response.status().as_u16();
+        let is_json = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"));
+        let bytes = response.bytes().await.map_err(transport)?;
+        if is_json || !(200..300).contains(&status) {
+            let envelope: Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            return Err(FeishuError::Api {
+                status,
+                code: envelope.get("code").and_then(Value::as_i64).unwrap_or(0),
+                msg: envelope
+                    .get("msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("（服务端没有说原因）")
+                    .to_string(),
+            });
+        }
+        Ok(bytes.to_vec())
     }
 
     #[cfg(test)]

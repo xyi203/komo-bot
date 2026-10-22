@@ -44,6 +44,7 @@ use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform};
 use komo_kernel::types::ids::RunId;
 use komo_runtime::config::Secrets;
 
+use crate::channels::inbox::{ImageInbox, SavedImage};
 use crate::channels::{BuiltChannel, ChannelFactory, ChannelSender};
 
 pub use api::{BotIdentity, FeishuApi, FeishuError, TokenProbe};
@@ -101,6 +102,8 @@ pub struct FeishuChannel {
     source: Mutex<Option<EventSource>>,
     /// 同进程的 `event_id` 去重。
     seen: Mutex<SeenEvents>,
+    /// 图片存在哪。`None` = 不收图片，只有图片的消息不进 Dispatcher。
+    inbox: Option<ImageInbox>,
 }
 
 impl std::fmt::Debug for FeishuChannel {
@@ -130,7 +133,14 @@ impl FeishuChannel {
             config,
             source: Mutex::new(Some(source)),
             seen: Mutex::new(SeenEvents::default()),
+            inbox: None,
         }
+    }
+
+    /// 接上图片收件箱（[`crate::channels::inbox`]）。
+    pub fn with_inbox(mut self, inbox: Option<ImageInbox>) -> Self {
+        self.inbox = inbox;
+        self
     }
 
     /// 测试用：事件从一个 channel 来，不建 ws。
@@ -199,6 +209,32 @@ impl FeishuChannel {
         })
     }
 
+    /// 把消息里的图片下载、存进收件箱。没接收件箱就什么都不做。
+    async fn save_images(
+        &self,
+        message_id: Option<&str>,
+        image_keys: &[String],
+    ) -> Vec<SavedImage> {
+        let Some(inbox) = &self.inbox else {
+            return Vec::new();
+        };
+        let mut saved = Vec::new();
+        for key in image_keys {
+            let outcome = match message_id {
+                None => Err("消息没有 message_id，没法下载".to_string()),
+                Some(id) => match self.api().download_image(id, key).await {
+                    Ok(bytes) => inbox.save(&bytes).await,
+                    Err(error) => Err(error.to_string()),
+                },
+            };
+            if let Err(reason) = &outcome {
+                tracing::warn!(%reason, "飞书：图片没存下来");
+            }
+            saved.push(outcome);
+        }
+        saved
+    }
+
     async fn handle_payload(&self, inbound: &dyn Inbound, bot: &BotIdentity, payload: &[u8]) {
         let Some(ParsedEvent { event_id, kind }) = inbound::parse(payload) else {
             return;
@@ -214,10 +250,19 @@ impl FeishuChannel {
         let EventKind::Message(event) = kind;
         // 原消息的 id 留在渠道里：加表情、回复卡片用它。
         let origin = Some(event.message.message_id.trim().to_string()).filter(|id| !id.is_empty());
-        let message = inbound::from_message(&event, &bot.open_id, request_key);
+        // 先准入再下载：群里没 @机器人 的图片不该去开放平台拉一次。
+        let message = match inbound::accept(&event, &bot.open_id) {
+            Some(accepted) => {
+                let images = self
+                    .save_images(origin.as_deref(), &accepted.image_keys)
+                    .await;
+                accepted.into_inbound(&images, request_key)
+            }
+            None => None,
+        };
 
         let Some(message) = message else {
-            // 群里没 @机器人、非文本消息：`Ignored`，不进 Dispatcher。
+            // 群里没 @机器人、语音 / 文件之类的消息：`Ignored`，不进 Dispatcher。
             tracing::debug!(%event_id, "飞书：忽略");
             return;
         };
@@ -387,12 +432,11 @@ impl ChannelFactory for FeishuFactory {
         let app_id = secrets.get(APP_ID_KEY).unwrap_or_default().trim();
         let app_secret = secrets.get(APP_SECRET_KEY).unwrap_or_default().trim();
 
-        let channel = Arc::new(FeishuChannel::new(
-            app_id,
-            app_secret,
-            config,
-            self.http.clone(),
-        ));
+        let channel = Arc::new(
+            FeishuChannel::new(app_id, app_secret, config, self.http.clone()).with_inbox(Some(
+                ImageInbox::for_platform(snapshot, ChannelPlatform::Feishu),
+            )),
+        );
         let sender = channel.sender() as Arc<dyn ChannelSender>;
         Ok(Some(BuiltChannel {
             channel: channel as Arc<dyn Channel>,
@@ -469,7 +513,8 @@ mod tests {
     use komo_kernel::types::ids::{RunId, SessionId};
 
     use super::fake::{
-        BOT_OPEN_ID, Behavior, FakeOpenApi, RecordingInbound, card_action_event, text_event,
+        BOT_OPEN_ID, Behavior, FakeOpenApi, RecordingInbound, card_action_event, image_event,
+        text_event,
     };
 
     /// 一个事件源可注入的渠道 + 往里塞事件的那一头。
@@ -530,6 +575,91 @@ mod tests {
         assert_eq!(received[0].request_key.as_str(), "feishu:evt-7");
         assert_eq!(received[0].text, "在吗");
         assert!(received[0].is_private);
+    }
+
+    #[tokio::test]
+    async fn an_image_is_downloaded_into_the_inbox_and_handed_over_as_a_path() {
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfake-png-body";
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        fake.host_image("img_v3_ok", PNG);
+        let home = tempfile::tempdir().expect("临时目录");
+        let inbox = ImageInbox::new(home.path().join("inbox/feishu"));
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::new(fake.log());
+
+        harness
+            .events
+            .send(image_event("evt-1", "oc_1", "ou_op", "img_v3_ok"))
+            .unwrap();
+        // 平台上没有的图：消息照样进，正文说没拿到。
+        harness
+            .events
+            .send(image_event("evt-2", "oc_1", "ou_op", "img_v3_gone"))
+            .unwrap();
+
+        serve_until(
+            harness.channel.with_inbox(Some(inbox.clone())),
+            recorder.clone(),
+            || recorder.received().len() >= 2,
+        )
+        .await;
+
+        assert!(fake.log().position("resource:om_evt-1/img_v3_ok").is_some());
+        let received = recorder.received();
+        assert_eq!(received.len(), 2, "{received:?}");
+        let saved = std::fs::read_dir(inbox.dir())
+            .expect("收件箱")
+            .map(|entry| entry.expect("条目").path())
+            .collect::<Vec<_>>();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(std::fs::read(&saved[0]).expect("读回"), PNG);
+        assert_eq!(
+            received[0].text,
+            format!(
+                "[用户发来一张图片，已存到 {}，用 read 查看]",
+                saved[0].display()
+            )
+        );
+        assert!(
+            received[1]
+                .text
+                .starts_with("[用户发来一张图片，但没能下载："),
+            "{}",
+            received[1].text
+        );
+        assert!(received[1].text.contains("234003"), "{}", received[1].text);
+    }
+
+    #[tokio::test]
+    async fn without_an_inbox_an_image_goes_nowhere_and_is_not_downloaded() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        fake.host_image("img_v3_ok", b"\x89PNG\r\n\x1a\n");
+        let harness = harness(&fake);
+        let recorder = RecordingInbound::new(fake.log());
+        harness
+            .events
+            .send(image_event("evt-1", "oc_1", "ou_op", "img_v3_ok"))
+            .unwrap();
+        // 跟一条文字：它到了，前面那条图就一定已经处理过。
+        harness
+            .events
+            .send(text_event("evt-2", "oc_1", "p2p", "ou_op", "在吗", &[]))
+            .unwrap();
+        serve_until(harness.channel, recorder.clone(), || {
+            !recorder.received().is_empty()
+        })
+        .await;
+        let received = recorder.received();
+        assert_eq!(received.len(), 1, "{received:?}");
+        assert_eq!(received[0].text, "在吗");
+        assert!(
+            !fake
+                .log()
+                .entries()
+                .iter()
+                .any(|e| e.starts_with("resource:")),
+            "没有收件箱就不该联网下载"
+        );
     }
 
     // ② 卡片按钮随审批一起删掉了（§7）：平台还推来的回调不进 Dispatcher，也不问平台。

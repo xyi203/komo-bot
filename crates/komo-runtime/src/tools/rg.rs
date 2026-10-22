@@ -414,6 +414,7 @@ impl Tool for RgTool {
             })?,
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(preview),
         })
     }

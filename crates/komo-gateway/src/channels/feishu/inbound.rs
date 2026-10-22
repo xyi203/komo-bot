@@ -9,6 +9,10 @@
 //! Dispatcher 不认识平台，所以只能是渠道做。群里没 @机器人 的消息 `Ignored`，**不进
 //! Dispatcher**。
 //!
+//! 收文本、图片与富文本（`post`）。图片不在这里下载：[`accept`] 先做完准入，渠道再去
+//! 开放平台拉图、存进收件箱（[`crate::channels::inbox`]），最后 [`Accepted::into_inbound`]
+//! 把路径写进正文——群里没 @机器人 的图片因此一次都不会被下载。
+//!
 //! 解析一律宽容：`#[serde(default)]` 到底，认不出的事件类型返回 `None` 而不是错误。
 //! 开放平台每月加字段，而一个多出来的键不应该让一条事件失败——但**缺 `event_id` 是另
 //! 一回事**：没有去重键的事件宁可不处理，也不能拿一个编出来的键去骗过去重。
@@ -19,6 +23,8 @@ use serde_json::Value;
 use komo_kernel::protocol::InboundMessage;
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, PeerId};
 use komo_kernel::types::ids::RequestKey;
+
+use crate::channels::inbox::{self, SavedImage};
 
 /// 去重键：`feishu:{event_id}`。
 ///
@@ -83,7 +89,7 @@ pub struct Message {
     /// `p2p` / `group`。
     #[serde(default)]
     pub chat_type: String,
-    /// `text` / `image` / `post` / …——首版只处理 `text`。
+    /// `text` / `image` / `post` / …——只处理这三种。
     #[serde(default)]
     pub message_type: String,
     /// 一个 **JSON 字符串**，不是对象。
@@ -168,44 +174,79 @@ fn decode<T: serde::de::DeserializeOwned>(event: Value, what: &str) -> Option<T>
         .ok()
 }
 
-/// 一条普通消息。返回 `None` = 这条不进 Dispatcher。
-pub fn from_message(
-    event: &MessageEvent,
-    bot_open_id: &str,
-    request_key: RequestKey,
-) -> Option<InboundMessage> {
-    // 首版只处理文本；图片、语音、富文本一律 Ignored。
-    if event.message.message_type != "text" {
-        return None;
+/// 一条过了准入的消息，图片还没下载。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Accepted {
+    peer: ChannelPeer,
+    is_private: bool,
+    sender: PeerId,
+    /// 用户写的字，@机器人 已经剥掉。
+    text: String,
+    /// 消息里图片的 `image_key`，按出现顺序。
+    pub image_keys: Vec<String>,
+}
+
+impl Accepted {
+    /// 图片下载完了（或者没接收件箱、根本没下），拼成一条入站消息。正文为空返回 `None`。
+    pub fn into_inbound(
+        self,
+        images: &[SavedImage],
+        request_key: RequestKey,
+    ) -> Option<InboundMessage> {
+        let text = inbox::compose_text(images, &self.text);
+        if text.is_empty() {
+            return None;
+        }
+        Some(InboundMessage {
+            peer: self.peer,
+            is_private: self.is_private,
+            sender: self.sender,
+            text,
+            request_key,
+        })
     }
+}
+
+/// 准入：这条消息要不要处理。返回 `None` = 不进 Dispatcher，图片也不下载。
+pub fn accept(event: &MessageEvent, bot_open_id: &str) -> Option<Accepted> {
     let sender = event.sender.sender_id.open_id.trim();
     let chat_id = event.message.chat_id.trim();
     if sender.is_empty() || chat_id.is_empty() {
         return None;
     }
 
-    let raw = text_of(&event.message.content)?;
+    // 语音、文件、卡片……一律 Ignored。
+    let content = content_of(&event.message)?;
     let is_private = event.message.is_private();
     let text = if is_private {
-        raw.trim().to_string()
+        content.text.trim().to_string()
     } else {
         // 群里只响应 @机器人 的消息并剥掉提及（§11.2）。
-        strip_bot_mentions(&raw, &event.message.mentions, bot_open_id)?
+        strip_bot_mentions(&content.text, &event.message.mentions, bot_open_id)?
     };
-    if text.is_empty() {
+    if text.is_empty() && content.image_keys.is_empty() {
         return None;
     }
 
     // 私聊与群一样，一个话题一个会话。
     let peer = peer_of(chat_id).in_thread(thread_anchor(&event.message)?);
 
-    Some(InboundMessage {
+    Some(Accepted {
         peer,
         is_private,
         sender: PeerId::new(sender),
         text,
-        request_key,
+        image_keys: content.image_keys,
     })
+}
+
+/// 一条普通消息，不下载图片。返回 `None` = 这条不进 Dispatcher——只有图片的消息也是。
+pub fn from_message(
+    event: &MessageEvent,
+    bot_open_id: &str,
+    request_key: RequestKey,
+) -> Option<InboundMessage> {
+    accept(event, bot_open_id)?.into_inbound(&[], request_key)
 }
 
 /// 消息所属话题的根消息 id；`None` = 这条消息没有 id，没法当锚点也没法回复。
@@ -226,16 +267,82 @@ pub fn peer_of(chat_id: &str) -> ChannelPeer {
     ChannelPeer::new(ChannelPlatform::Feishu, chat_id)
 }
 
-/// `message.content` 是一个 JSON 字符串；文本消息里只有 `text` 一个字段。
-fn text_of(content: &str) -> Option<String> {
-    #[derive(Deserialize)]
-    struct TextContent {
-        #[serde(default)]
-        text: String,
+/// 用户写的字与发的图。
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Content {
+    text: String,
+    image_keys: Vec<String>,
+}
+
+/// `message.content` 是一个 JSON 字符串，形状按 `message_type` 分。别的类型返回 `None`。
+fn content_of(message: &Message) -> Option<Content> {
+    let value: Value = serde_json::from_str(&message.content).ok()?;
+    match message.message_type.as_str() {
+        "text" => Some(Content {
+            text: str_at(&value, "text").to_string(),
+            image_keys: Vec::new(),
+        }),
+        "image" => Some(Content {
+            text: String::new(),
+            image_keys: Some(str_at(&value, "image_key"))
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+                .into_iter()
+                .collect(),
+        }),
+        "post" => Some(post_of(&value)),
+        _ => None,
     }
-    serde_json::from_str::<TextContent>(content)
-        .ok()
-        .map(|content| content.text)
+}
+
+/// 富文本：标题、每段的文字、@占位符与图片。截图配一句话发出去就是这种。
+///
+/// 接收事件里是 `{"title", "content": [[元素…]…]}`；外面多套一层语言（`{"zh_cn": {…}}`，
+/// 发送格式）也认，取第一种。`at` 写成占位符 `@_user_N`，群里剥 @机器人 靠它——和文本
+/// 消息同一套规矩。
+fn post_of(value: &Value) -> Content {
+    let body = if value.get("content").is_some() {
+        value
+    } else {
+        value
+            .as_object()
+            .and_then(|map| map.values().find(|v| v.get("content").is_some()))
+            .unwrap_or(value)
+    };
+    let mut lines = Vec::new();
+    let title = str_at(body, "title").trim();
+    if !title.is_empty() {
+        lines.push(title.to_string());
+    }
+    let mut image_keys = Vec::new();
+    let paragraphs = body.get("content").and_then(Value::as_array);
+    for paragraph in paragraphs.into_iter().flatten() {
+        let mut line = String::new();
+        for element in paragraph.as_array().into_iter().flatten() {
+            match str_at(element, "tag") {
+                "text" | "a" | "md" | "code_block" => line.push_str(str_at(element, "text")),
+                "at" => line.push_str(str_at(element, "user_id")),
+                "img" => {
+                    let key = str_at(element, "image_key");
+                    if !key.is_empty() {
+                        image_keys.push(key.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !line.trim().is_empty() {
+            lines.push(line);
+        }
+    }
+    Content {
+        text: lines.join("\n"),
+        image_keys,
+    }
+}
+
+fn str_at<'a>(value: &'a Value, key: &str) -> &'a str {
+    value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
 /// 剥掉 `@机器人`。没提到机器人就返回 `None`。
@@ -527,5 +634,91 @@ mod tests {
     #[test]
     fn a_card_callback_is_no_longer_an_event_we_handle() {
         assert_eq!(parse(&card_action_event("evt-20", "oc_1", "ou_op")), None);
+    }
+
+    fn image_event(chat_type: &str, image_key: &str) -> MessageEvent {
+        let mut event = message_event("oc_1", chat_type, "");
+        event.message.message_type = "image".into();
+        event.message.content = serde_json::json!({ "image_key": image_key }).to_string();
+        event
+    }
+
+    #[test]
+    fn an_image_is_accepted_with_its_key_and_becomes_a_path() {
+        let accepted = accept(&image_event("p2p", "img_v3_1"), BOT_OPEN_ID).expect("私聊图片要接");
+        assert_eq!(accepted.image_keys, vec!["img_v3_1".to_string()]);
+        let inbound = accepted
+            .into_inbound(
+                &[Ok(std::path::PathBuf::from("/w/inbox/feishu/a.png"))],
+                request_key("evt-30"),
+            )
+            .expect("进 Dispatcher");
+        assert_eq!(
+            inbound.text,
+            "[用户发来一张图片，已存到 /w/inbox/feishu/a.png，用 read 查看]"
+        );
+        // 没下载就没有正文：只有图片的消息照旧不进。
+        assert!(
+            from_message(
+                &image_event("p2p", "img_v3_1"),
+                BOT_OPEN_ID,
+                request_key("evt-31")
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn a_group_image_without_a_mention_is_not_accepted() {
+        assert!(accept(&image_event("group", "img_v3_1"), BOT_OPEN_ID).is_none());
+    }
+
+    #[test]
+    fn a_post_yields_its_text_mentions_and_images() {
+        let mut event = message_event("oc_1", "group", "");
+        event.message.message_type = "post".into();
+        event.message.content = serde_json::json!({
+            "title": "",
+            "content": [
+                [
+                    { "tag": "at", "user_id": "@_user_1", "user_name": "komo" },
+                    { "tag": "text", "text": " 看看这个报错" }
+                ],
+                [ { "tag": "img", "image_key": "img_v3_2", "width": 10, "height": 10 } ]
+            ]
+        })
+        .to_string();
+        event.message.mentions = vec![mention("@_user_1", BOT_OPEN_ID)];
+
+        let accepted = accept(&event, BOT_OPEN_ID).expect("@了机器人的富文本要接");
+        assert_eq!(accepted.image_keys, vec!["img_v3_2".to_string()]);
+        let inbound = accepted
+            .into_inbound(&[Err("http 403".into())], request_key("evt-32"))
+            .expect("进 Dispatcher");
+        assert_eq!(
+            inbound.text,
+            "[用户发来一张图片，但没能下载：http 403]\n看看这个报错"
+        );
+    }
+
+    #[test]
+    fn a_post_wrapped_in_a_locale_is_read_too() {
+        let mut event = message_event("oc_1", "p2p", "");
+        event.message.message_type = "post".into();
+        event.message.content = serde_json::json!({
+            "zh_cn": { "title": "标题", "content": [[ { "tag": "text", "text": "正文" } ]] }
+        })
+        .to_string();
+        let inbound =
+            from_message(&event, BOT_OPEN_ID, request_key("evt-33")).expect("纯文字的富文本也进");
+        assert_eq!(inbound.text, "标题\n正文");
+    }
+
+    #[test]
+    fn a_voice_message_is_still_ignored() {
+        let mut event = message_event("oc_1", "p2p", "");
+        event.message.message_type = "audio".into();
+        event.message.content = serde_json::json!({ "file_key": "f_1" }).to_string();
+        assert!(accept(&event, BOT_OPEN_ID).is_none());
     }
 }

@@ -118,6 +118,27 @@ pub fn function_call_output(call_id: &str, output: &str) -> Value {
     })
 }
 
+/// 带图片的函数调用结果：`output` 是一串内容项，正文在前，图片按 data URL 接在后面。
+/// `images` 是 `(mime, base64)`。
+pub fn function_call_output_with_images(
+    call_id: &str,
+    output: &str,
+    images: impl Iterator<Item = (String, String)>,
+) -> Value {
+    let mut parts = vec![json!({ "type": "input_text", "text": output })];
+    parts.extend(images.map(|(mime, data)| {
+        json!({
+            "type": "input_image",
+            "image_url": format!("data:{mime};base64,{data}"),
+        })
+    }));
+    json!({
+        "type": "function_call_output",
+        "call_id": call_id,
+        "output": parts,
+    })
+}
+
 // ---------------------------------------------------------------- SSE 事件
 
 /// 事件名。终止帧是 [`RESPONSE_COMPLETED`]——**没收到它就是没收齐**。

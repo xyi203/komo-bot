@@ -201,11 +201,28 @@ fn tool_results_message(results: &[ToolResultForModel]) -> Value {
     })
 }
 
+/// 没有图片时 `content` 还是一个字符串，和以前逐字节相同；有图片时是正文块 + base64 图片块。
 fn tool_result_block(result: &ToolResultForModel) -> Value {
+    let content = if result.images.is_empty() {
+        json!(result.content)
+    } else {
+        let mut blocks = vec![json!({ "type": "text", "text": result.content })];
+        blocks.extend(result.images.iter().map(|image| {
+            json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": image.mime,
+                    "data": super::image_base64(image),
+                },
+            })
+        }));
+        Value::Array(blocks)
+    };
     let mut block = json!({
         "type": "tool_result",
         "tool_use_id": result.provider_call_id,
-        "content": result.content,
+        "content": content,
     });
     if result.is_error {
         block["is_error"] = json!(true);
@@ -214,7 +231,7 @@ fn tool_result_block(result: &ToolResultForModel) -> Value {
 }
 
 /// 把更早的工具结果换成新视图：只换 `tool_result` 块的正文，`tool_use_id`、位置、
-/// `is_error` 都不动，此后一直用新正文。返回这次改到的最早一条消息的下标——缓存断点要
+/// `is_error` 都不动（带图片的只换正文块，图片留着），此后一直用新正文。返回这次改到的最早一条消息的下标——缓存断点要
 /// 补在它之前（[`messages_with_cache`]）。
 fn revise(messages: &mut [Value], revised: &[ToolResultForModel]) -> Option<usize> {
     let mut earliest: Option<usize> = None;
@@ -235,7 +252,14 @@ fn revise(messages: &mut [Value], revised: &[ToolResultForModel]) -> Option<usiz
             });
         match found {
             Some((index, block)) => {
-                block["content"] = json!(result.content);
+                match block["content"].as_array_mut() {
+                    Some(parts) => {
+                        if let Some(part) = parts.iter_mut().find(|part| part["type"] == "text") {
+                            part["text"] = json!(result.content);
+                        }
+                    }
+                    None => block["content"] = json!(result.content),
+                }
                 earliest = Some(earliest.map_or(index, |earliest| earliest.min(index)));
             }
             None => tracing::warn!(
@@ -1456,6 +1480,7 @@ mod tests {
                     call_id: ToolCallId::from_raw("tc-1"),
                     content: "结果1".into(),
                     is_error: false,
+                    images: vec![],
                 }],
                 revised: Vec::new(),
             })
@@ -1477,6 +1502,7 @@ mod tests {
                     call_id: ToolCallId::from_raw("tc-2"),
                     content: "结果2".into(),
                     is_error: false,
+                    images: vec![],
                 }],
                 revised: Vec::new(),
             })
@@ -1522,6 +1548,7 @@ mod tests {
             call_id: ToolCallId::from_raw(format!("tc-{provider_call_id}")),
             content: content.into(),
             is_error: false,
+            images: vec![],
         }
     }
 
@@ -1714,6 +1741,32 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_result_with_an_image_carries_a_base64_block_and_survives_revision() {
+        let mut with_image = result("call_1", "shot.png 是一张图片");
+        with_image.images = vec![komo_kernel::types::tool::ToolImage {
+            mime: "image/png".into(),
+            bytes: b"png".to_vec(),
+        }];
+        let mut messages = vec![tool_results_message(&[with_image.clone()])];
+        assert_eq!(
+            messages[0]["content"][0]["content"],
+            json!([
+                { "type": "text", "text": "shot.png 是一张图片" },
+                {
+                    "type": "image",
+                    "source": { "type": "base64", "media_type": "image/png", "data": "cG5n" },
+                },
+            ])
+        );
+
+        with_image.content = "短视图".into();
+        assert_eq!(revise(&mut messages, &[with_image]), Some(0));
+        let content = &messages[0]["content"][0]["content"];
+        assert_eq!(content[0]["text"], json!("短视图"));
+        assert_eq!(content[1]["type"], json!("image"), "图片不动");
+    }
+
+    #[test]
     fn multiple_tool_results_land_in_one_user_message() {
         let replayed = replay(&[ReplayMessage {
             role: Role::Tool,
@@ -1726,12 +1779,14 @@ mod tests {
                     call_id: ToolCallId::from_raw("tc-1"),
                     content: "文件内容".into(),
                     is_error: false,
+                    images: vec![],
                 },
                 ToolResultForModel {
                     provider_call_id: "call_2".into(),
                     call_id: ToolCallId::from_raw("tc-2"),
                     content: "boom".into(),
                     is_error: true,
+                    images: vec![],
                 },
             ],
             provider_blocks: None,
@@ -1892,6 +1947,7 @@ mod live {
                     call_id: komo_kernel::types::ids::ToolCallId::from_raw("live-probe-call"),
                     content: "北京时间 2026-09-23 15:00".into(),
                     is_error: false,
+                    images: vec![],
                 }],
                 revised: Vec::new(),
             })

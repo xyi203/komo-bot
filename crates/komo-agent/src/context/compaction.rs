@@ -9,8 +9,8 @@ use std::fmt::Write as _;
 use std::ops::Range;
 
 use komo_kernel::compaction::{
-    CompactionEconomics, CompactionInput, CompactionJob, DecayJob, OnlineState, decide,
-    effective_window, estimate_tokens, find_cut,
+    CompactionEconomics, CompactionInput, CompactionJob, DecayJob, IMAGE_TOKENS, OnlineState,
+    decide, effective_window, estimate_tokens, find_cut,
 };
 use komo_kernel::protocol::config::CompactionConfig;
 use komo_kernel::types::ids::{RunId, Seq, SessionId};
@@ -116,7 +116,7 @@ fn message_tokens(message: &ReplayMessage) -> u64 {
     body + message
         .tool_results
         .iter()
-        .map(|result| estimate_tokens(&result.content))
+        .map(|result| estimate_tokens(&result.content) + IMAGE_TOKENS * result.images.len() as u64)
         .sum::<u64>()
 }
 
@@ -339,6 +339,8 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
                     call_id: candidate.call_id.clone(),
                     content: candidate.decayed.clone(),
                     is_error: false,
+                    // 修订只换正文，原来附的图片留在原处。
+                    images: vec![],
                 })
                 .collect(),
             decision,

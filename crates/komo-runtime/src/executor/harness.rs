@@ -368,6 +368,7 @@ impl Tool for RecordingTool {
                     result: serde_json::json!({ "ok": true }),
                     exit_code: Some(0),
                     artifacts: vec![],
+                    images: vec![],
                     preview: Some("ok".into()),
                 })
             })

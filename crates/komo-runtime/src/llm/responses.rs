@@ -249,12 +249,23 @@ fn replay(messages: &[ReplayMessage]) -> Vec<Value> {
     input
 }
 
+/// 没有图片时 `output` 还是一个字符串，和以前逐字节相同（缓存前缀不变）。
 fn tool_output(result: &ToolResultForModel) -> Value {
-    wire::function_call_output(&result.provider_call_id, &result.content)
+    if result.images.is_empty() {
+        return wire::function_call_output(&result.provider_call_id, &result.content);
+    }
+    wire::function_call_output_with_images(
+        &result.provider_call_id,
+        &result.content,
+        result
+            .images
+            .iter()
+            .map(|image| (image.mime.clone(), super::image_base64(image))),
+    )
 }
 
 /// 把更早的工具结果换成新视图：只换那条 `function_call_output` 的 `output`，`call_id`
-/// 与位置不动，此后一直用新正文。
+/// 与位置不动，此后一直用新正文。带图片的那条只换 `input_text`，图片留着。
 fn revise(input: &mut [Value], revised: &[ToolResultForModel]) {
     for result in revised {
         let item = input.iter_mut().find(|item| {
@@ -262,7 +273,14 @@ fn revise(input: &mut [Value], revised: &[ToolResultForModel]) {
                 && item["call_id"] == result.provider_call_id.as_str()
         });
         match item {
-            Some(item) => item["output"] = json!(result.content),
+            Some(item) => match item["output"].as_array_mut() {
+                Some(parts) => {
+                    if let Some(part) = parts.iter_mut().find(|part| part["type"] == "input_text") {
+                        part["text"] = json!(result.content);
+                    }
+                }
+                None => item["output"] = json!(result.content),
+            },
             None => tracing::warn!(
                 provider_call_id = %result.provider_call_id,
                 "要修订的工具结果不在历史里，忽略"
@@ -942,6 +960,44 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_result_with_an_image_carries_it_as_a_data_url_and_survives_revision() {
+        let mut result = ToolResultForModel {
+            provider_call_id: "fc_1".into(),
+            call_id: ToolCallId::from_raw("call-1"),
+            content: "shot.png 是一张图片".into(),
+            is_error: false,
+            images: vec![komo_kernel::types::tool::ToolImage {
+                mime: "image/png".into(),
+                bytes: b"png".to_vec(),
+            }],
+        };
+        let mut input = vec![tool_output(&result)];
+        assert_eq!(
+            input[0]["output"],
+            json!([
+                { "type": "input_text", "text": "shot.png 是一张图片" },
+                { "type": "input_image", "image_url": "data:image/png;base64,cG5n" },
+            ])
+        );
+
+        result.content = "短视图".into();
+        revise(&mut input, &[result.clone()]);
+        assert_eq!(input[0]["output"][0]["text"], json!("短视图"));
+        assert_eq!(
+            input[0]["output"][1]["type"],
+            json!("input_image"),
+            "图片不动"
+        );
+
+        result.images.clear();
+        assert_eq!(
+            tool_output(&result)["output"],
+            json!("短视图"),
+            "没图就还是字符串"
+        );
+    }
+
+    #[test]
     fn a_user_message_and_tool_results_become_their_own_items() {
         let replayed = replay(&[
             ReplayMessage {
@@ -963,12 +1019,14 @@ mod tests {
                         call_id: ToolCallId::from_raw("tc-1"),
                         content: "文件内容".into(),
                         is_error: false,
+                        images: vec![],
                     },
                     ToolResultForModel {
                         provider_call_id: "call_2".into(),
                         call_id: ToolCallId::from_raw("tc-2"),
                         content: "boom".into(),
                         is_error: true,
+                        images: vec![],
                     },
                 ],
                 provider_blocks: None,

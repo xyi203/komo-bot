@@ -775,6 +775,7 @@ fn a_tool_result_shows_the_full_body_not_the_one_kib_preview() {
                     error: error.clone(),
                     exit_code: None,
                     artifacts: vec![],
+                    images: vec![],
                     preview: preview.clone(),
                 }));
             }
@@ -801,6 +802,7 @@ fn a_result_handed_to_the_background_is_marked_detached() {
                     error: None,
                     exit_code: None,
                     artifacts: vec![],
+                    images: vec![],
                     preview: Some("已转后台 #abcd".into()),
                 }));
             }

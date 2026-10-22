@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use crate::traits::*;
 
 use crate::types::refs::{
-    AttemptRef, ContentRef, InterruptedOutput, OutputRef, PublishedOutput, ToolResultBody,
-    VerifiedOutput,
+    AttemptRef, ContentRef, ImageRef, InterruptedOutput, OutputRef, PublishedOutput,
+    ToolResultBody, VerifiedOutput,
 };
 
 /// 内存里的 [`ToolOutputStore`]。
@@ -18,6 +18,8 @@ pub struct MemOutputStore {
     published: Arc<Mutex<BTreeMap<String, ToolResultBody>>>,
     /// 按 attempt ID：上一个进程被打断时留下的部分输出。
     interrupted: Arc<Mutex<BTreeMap<String, InterruptedOutput>>>,
+    /// 按引用路径：写入器存下的图片。
+    images: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
 }
 
 impl MemOutputStore {
@@ -45,6 +47,7 @@ pub struct MemOutputWriter {
     attempt: AttemptRef,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    images: Arc<Mutex<BTreeMap<String, Vec<u8>>>>,
 }
 
 impl MemOutputWriter {
@@ -53,6 +56,7 @@ impl MemOutputWriter {
             attempt,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            images: Arc::default(),
         }
     }
 }
@@ -69,6 +73,33 @@ impl OutputWriter for MemOutputWriter {
         Ok(())
     }
 
+    async fn write_image(&mut self, mime: &str, bytes: &[u8]) -> Result<ImageRef, StoreError> {
+        let mut images = self.images.lock().expect("输出存储");
+        let prefix = format!(
+            "tool-output/{}/{}/{}/image-",
+            self.attempt.run, self.attempt.call, self.attempt.attempt
+        );
+        let index = images
+            .keys()
+            .filter(|path| path.starts_with(&prefix))
+            .count()
+            + 1;
+        let path = format!(
+            "{prefix}{index}.{}",
+            crate::types::tool::image_extension(mime)
+        );
+        images.insert(path.clone(), bytes.to_vec());
+        Ok(ImageRef {
+            mime: mime.to_string(),
+            content: ContentRef {
+                path,
+                size: bytes.len() as u64,
+                hash: crate::types::digest::ContentHash::of_bytes(bytes),
+                pointer: None,
+            },
+        })
+    }
+
     fn attempt(&self) -> &AttemptRef {
         &self.attempt
     }
@@ -81,7 +112,23 @@ impl OutputWriter for MemOutputWriter {
 #[async_trait]
 impl ToolOutputStore for MemOutputStore {
     async fn begin(&self, attempt: &AttemptRef) -> Result<Box<dyn OutputWriter>, StoreError> {
-        Ok(Box::new(MemOutputWriter::new(attempt.clone())))
+        let mut writer = MemOutputWriter::new(attempt.clone());
+        writer.images = Arc::clone(&self.images);
+        Ok(Box::new(writer))
+    }
+
+    async fn open_image(&self, image: &ImageRef) -> Result<Vec<u8>, StoreError> {
+        let bytes = self
+            .images
+            .lock()
+            .expect("输出存储")
+            .get(&image.content.path)
+            .cloned()
+            .ok_or_else(|| StoreError::Corrupt(format!("{} 不在存储里", image.content.path)))?;
+        if crate::types::digest::ContentHash::of_bytes(&bytes) != image.content.hash {
+            return Err(StoreError::Corrupt("图片哈希不符".into()));
+        }
+        Ok(bytes)
     }
 
     async fn publish(

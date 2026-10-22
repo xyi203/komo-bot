@@ -139,6 +139,7 @@ mod tests {
                     error: None,
                     exit_code: Some(0),
                     artifacts: vec![],
+                    images: vec![],
                     preview: None,
                 },
             )

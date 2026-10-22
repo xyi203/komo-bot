@@ -26,6 +26,16 @@ pub struct ContentRef {
     pub pointer: Option<String>,
 }
 
+/// 工具结果附带的一张图片（§8.3）：执行器在发布结果时把它写进这次尝试的输出目录
+/// （`tool-output/<run>/<call>/<attempt>/image-<n>.<ext>`），`output.json` 与 JSONL 只记这条
+/// 引用，不记 base64。交给模型时按引用读回、核对哈希。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRef {
+    /// `image/png` 一类。
+    pub mime: String,
+    pub content: ContentRef,
+}
+
 /// 外置的模型消息 / 执行计划正文（`payloads/`）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -60,6 +70,9 @@ pub struct ToolResultBody {
     /// 产物引用（`artifacts/` 下），不重复复制到 tool-output。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ContentRef>,
+    /// 交给模型看的图片（落在这次尝试的输出目录里）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageRef>,
     /// 工具写给模型看的那段正文（§8.3）。
     ///
     /// 完整正文保存在 JSONL 的 body 与 output.json；模型上下文统一投影，
@@ -210,6 +223,7 @@ mod tests {
                 error: error.map(str::to_string),
                 exit_code: None,
                 artifacts: vec![],
+                images: vec![],
                 preview: preview.map(str::to_string),
             }
         };
@@ -255,6 +269,7 @@ mod tests {
             error: None,
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some("汉".repeat(500)),
         };
         let cut = body.event_preview().expect("有预览");

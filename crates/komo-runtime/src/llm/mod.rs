@@ -208,6 +208,12 @@ pub fn is_retryable(error: &LlmError) -> bool {
     retry_cause(error).is_some()
 }
 
+/// 工具结果里一张图片的 base64（三家接口都用标准字母表、带填充）。字节只在拼请求时编码，不进任何一份账。
+pub(crate) fn image_base64(image: &komo_kernel::types::tool::ToolImage) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(&image.bytes)
+}
+
 /// 适配器共用的出站通道。连接池共用一份就够；每次请求自己的超时由
 /// [`ModelConfig::timeout_secs`] 给。TLS provider 由 bin 在 `main` 里装（§13.4）。
 pub fn default_transport() -> Arc<dyn HttpTransport> {

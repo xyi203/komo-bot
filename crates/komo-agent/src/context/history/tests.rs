@@ -315,6 +315,8 @@ fn a_replayed_round_names_the_artifacts_it_produced() {
                     vec![Some(StoredOutput {
                         preview: Some("写完了一份报告\n".into()),
                         artifacts: artifacts.clone(),
+                        images: Vec::new(),
+                        image_bytes: Vec::new(),
                     })]
                 } else {
                     Vec::new()
@@ -561,6 +563,8 @@ fn replayed_after(
                 vec![Some(StoredOutput {
                     preview: Some(big.clone()),
                     artifacts: Vec::new(),
+                    images: Vec::new(),
+                    image_bytes: Vec::new(),
                 })]
             };
             ResolvedMessage {
@@ -834,6 +838,8 @@ fn decay_eligibility_on_the_kept_tail_is_unchanged() {
                                 _ => "小".into(),
                             }),
                             artifacts: Vec::new(),
+                            images: Vec::new(),
+                            image_bytes: Vec::new(),
                         })
                     })
                     .collect();

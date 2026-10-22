@@ -8,8 +8,8 @@
 //! 微信这一列比另外两个简单，因为它**只有 DM**（§11.2）：没有群、没有 @提及要剥，
 //! `is_private` 恒为 `true`，会话 id 就是对方的 `from_user_id`。留下的只有两件事：
 //!
-//! 1. **只处理文本**。图片 / 语音 / 文件 / 视频一律 `None`（不进 Dispatcher）——
-//!    首版的工具链接不了它们，把一条图片消息变成一句空文本只会让 Run 白跑一次。
+//! 1. **只处理文本与图片**。图片由渠道先存成本地文件（[`crate::channels::inbox`]），
+//!    正文里只写路径；语音 / 文件 / 视频一律 `None`（不进 Dispatcher）。
 //! 2. **去重键**。`wechat:{from_user_id}:{client_id}`，`client_id` 为空时回退到
 //!    `(from, 内容哈希, 60s 窗口)`——两者都住在 [`crate::render::wechat`] 里，因为它们
 //!    是纯函数，要能在没有 SDK 的情况下逐字断言。
@@ -17,8 +17,9 @@
 use komo_kernel::protocol::InboundMessage;
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, PeerId};
 use komo_kernel::types::ids::RequestKey;
-use wechatbot::types::{ContentType, IncomingMessage, WireMessage};
+use wechatbot::types::{ContentType, ImageItem, IncomingMessage, MessageType, WireMessage};
 
+use crate::channels::inbox::{self, SavedImage};
 use crate::render::wechat;
 
 /// 这条 wire 消息的去重键（§11.1）。
@@ -42,17 +43,39 @@ pub fn request_key(wire: &WireMessage) -> RequestKey {
     }
 }
 
+/// 这条消息里要下载的图片。机器人自己的回流不算——那条不会进 Dispatcher，下载它是白费。
+pub fn images_of(wire: &WireMessage) -> Vec<&ImageItem> {
+    if wire.message_type != MessageType::User {
+        return Vec::new();
+    }
+    wire.item_list
+        .iter()
+        .filter_map(|item| item.image_item.as_ref())
+        .collect()
+}
+
 /// 一条 wire 消息。返回 `None` = 这条不进 Dispatcher。
+///
+/// `images` 是渠道已经替 [`images_of`] 下载过的结果；没接收件箱时它是空的，一条只有图片的
+/// 消息于是照旧不进 Dispatcher。
 ///
 /// 解析走 SDK 的 [`IncomingMessage::from_wire`]——它是 crate 文档里给"自己驱动
 /// `get_updates` 的调用方"留的稳定入口，也是唯一一处知道 `message_type == Bot` 的消息
 /// （机器人自己发出去的那条回流）要被滤掉的地方。
-pub fn from_wire(wire: &WireMessage, request_key: RequestKey) -> Option<InboundMessage> {
+pub fn from_wire(
+    wire: &WireMessage,
+    request_key: RequestKey,
+    images: &[SavedImage],
+) -> Option<InboundMessage> {
     let incoming = IncomingMessage::from_wire(wire)?;
-    if incoming.content_type != ContentType::Text {
+    if !matches!(
+        incoming.content_type,
+        ContentType::Text | ContentType::Image
+    ) {
         return None;
     }
-    let text = incoming.text.trim();
+    // 不用 `incoming.text`：SDK 把图片也拼进去了（`[image]` 或它的 URL）。
+    let text = inbox::compose_text(images, &text_of(wire));
     if text.is_empty() {
         return None;
     }
@@ -65,7 +88,7 @@ pub fn from_wire(wire: &WireMessage, request_key: RequestKey) -> Option<InboundM
         // 微信只有 DM（§11.2）。这不是一个默认值，是这个平台的全部形态。
         is_private: true,
         sender: PeerId::new(incoming.user_id.clone()),
-        text: text.to_string(),
+        text,
         request_key,
     })
 }
@@ -88,13 +111,15 @@ fn text_of(wire: &WireMessage) -> String {
 mod tests {
     use super::*;
 
+    use std::path::PathBuf;
+
     use super::super::fake::{image_wire, text_wire};
     use wechatbot::types::{MessageItemType, MessageType, TextItem, WireMessageItem};
 
     #[test]
     fn a_dm_keeps_its_text_and_says_it_is_private() {
         let wire = text_wire("wxid_op", "cid-1", "  在吗  ");
-        let inbound = from_wire(&wire, request_key(&wire)).expect("文本消息进 Dispatcher");
+        let inbound = from_wire(&wire, request_key(&wire), &[]).expect("文本消息进 Dispatcher");
         assert!(inbound.is_private, "微信只有 DM（§11.2）");
         assert_eq!(inbound.text, "在吗");
         assert_eq!(inbound.peer.to_string(), "wechat:wxid_op");
@@ -103,9 +128,34 @@ mod tests {
     }
 
     #[test]
-    fn a_non_text_message_is_ignored() {
+    fn an_image_nobody_downloaded_is_ignored() {
         let wire = image_wire("wxid_op", "cid-2");
-        assert!(from_wire(&wire, request_key(&wire)).is_none());
+        assert_eq!(images_of(&wire).len(), 1);
+        assert!(from_wire(&wire, request_key(&wire), &[]).is_none());
+    }
+
+    #[test]
+    fn a_saved_image_becomes_a_path_in_the_text() {
+        let wire = image_wire("wxid_op", "cid-2");
+        let saved = [Ok(PathBuf::from("/w/inbox/wechat/ab.jpg"))];
+        let inbound = from_wire(&wire, request_key(&wire), &saved).expect("图片进 Dispatcher");
+        assert_eq!(
+            inbound.text,
+            "[用户发来一张图片，已存到 /w/inbox/wechat/ab.jpg，用 read 查看]"
+        );
+        assert!(
+            !inbound.text.contains("img.example"),
+            "SDK 拼的 URL 不进正文"
+        );
+    }
+
+    #[test]
+    fn a_voice_message_is_still_ignored() {
+        let mut wire = image_wire("wxid_op", "cid-5");
+        wire.item_list[0].item_type = MessageItemType::Voice;
+        wire.item_list[0].image_item = None;
+        assert!(images_of(&wire).is_empty());
+        assert!(from_wire(&wire, request_key(&wire), &[]).is_none());
     }
 
     #[test]
@@ -113,15 +163,19 @@ mod tests {
         let mut wire = text_wire("wxid_op", "cid-3", "回声");
         wire.message_type = MessageType::Bot;
         assert!(
-            from_wire(&wire, request_key(&wire)).is_none(),
+            from_wire(&wire, request_key(&wire), &[]).is_none(),
             "机器人自己的消息回流不是入站消息"
         );
+
+        let mut echo = image_wire("wxid_op", "cid-3b");
+        echo.message_type = MessageType::Bot;
+        assert!(images_of(&echo).is_empty(), "回流里的图片不下载");
     }
 
     #[test]
     fn an_empty_body_is_ignored() {
         let wire = text_wire("wxid_op", "cid-4", "   ");
-        assert!(from_wire(&wire, request_key(&wire)).is_none());
+        assert!(from_wire(&wire, request_key(&wire), &[]).is_none());
     }
 
     // ② `client_id` 为空 → 回退键。

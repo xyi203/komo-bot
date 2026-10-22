@@ -33,6 +33,7 @@ use komo_kernel::types::memory::{Injection, MemoryScope};
 use komo_kernel::types::model::ModelConfig;
 use komo_kernel::types::surface::AgentSurface;
 use komo_kernel::types::tool::ToolDefinition;
+use komo_kernel::types::tool::ToolImage;
 use komo_runtime::config::ConfigHolder;
 use komo_runtime::memory::MemoryManager;
 use komo_runtime::tools::paths;
@@ -423,9 +424,32 @@ pub(crate) async fn resolve_history<'s>(
                     Some(outputs) => outputs.open(&result.output).await.ok(),
                     None => None,
                 };
-                stored.push(verified.map(|verified| StoredOutput {
+                let Some(verified) = verified else {
+                    stored.push(None);
+                    continue;
+                };
+                // 图片字节按引用读回来、校验过才附上；读不回来的那张只少这一张，正文照旧。
+                let mut image_bytes = Vec::new();
+                if let Some(outputs) = outputs {
+                    for image in &verified.body.images {
+                        match outputs.open_image(image).await {
+                            Ok(bytes) => image_bytes.push(ToolImage {
+                                mime: image.mime.clone(),
+                                bytes,
+                            }),
+                            Err(error) => tracing::warn!(
+                                path = %image.content.path,
+                                %error,
+                                "工具结果里的图片读不回来，这次不附"
+                            ),
+                        }
+                    }
+                }
+                stored.push(Some(StoredOutput {
                     preview: verified.body.preview.clone(),
                     artifacts: verified.body.artifacts.clone(),
+                    images: verified.body.images.clone(),
+                    image_bytes,
                 }));
             }
         }

@@ -234,6 +234,7 @@ impl Tool for EditTool {
             })?,
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(format!("{} 替换了 {} 处", result.path, result.replacements)),
         })
     }

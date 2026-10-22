@@ -13,6 +13,7 @@
 
 #[cfg(feature = "feishu")]
 pub mod feishu;
+pub mod inbox;
 #[cfg(feature = "telegram")]
 pub mod telegram;
 #[cfg(feature = "wechat")]
@@ -242,11 +243,14 @@ impl ChannelFactory for TelegramFactory {
             return Ok(None);
         }
         let token = token(secrets, "TELEGRAM_BOT_TOKEN", "telegram")?;
-        let channel = Arc::new(telegram::TelegramChannel::new(
-            token,
-            config.clone(),
-            self.http.clone(),
-        ));
+        let channel = Arc::new(
+            telegram::TelegramChannel::new(token, config.clone(), self.http.clone()).with_inbox(
+                Some(inbox::ImageInbox::for_platform(
+                    snapshot,
+                    ChannelPlatform::Telegram,
+                )),
+            ),
+        );
         let sender = channel.sender() as Arc<dyn ChannelSender>;
         Ok(Some(BuiltChannel {
             channel: channel as Arc<dyn Channel>,

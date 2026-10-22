@@ -11,12 +11,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use komo_kernel::traits::{OutputWriter, Tool};
 use komo_kernel::types::ids::OperationId;
 use komo_kernel::types::plan::{ExecutionPlan, Operation, PlanVersions, RecoveryMode, Replay};
 use komo_kernel::types::refs::ToolResultStatus;
 use komo_kernel::types::tool::{
-    ToolContext, ToolDefinition, ToolError, ToolExposure, ToolNamespace, ToolOutput,
+    ToolContext, ToolDefinition, ToolError, ToolExposure, ToolImage, ToolNamespace, ToolOutput,
+    image_mime,
 };
 use rmcp::model::{CallToolResult, ContentBlock};
 
@@ -155,7 +157,7 @@ impl Tool for McpTool {
                         }
                     }
                 })?;
-        let text = render(&result);
+        let (text, images) = render(&result);
         sink.write_stdout(text.as_bytes())
             .await
             .map_err(|error| ToolError::Failed {
@@ -171,23 +173,32 @@ impl Tool for McpTool {
             result: serde_json::to_value(&result).unwrap_or_default(),
             exit_code: None,
             artifacts: vec![],
+            images,
             preview: Some(text),
         })
     }
 }
 
-/// 给模型看的正文：文本原样，图片 / 音频只留一句说明（base64 不是给模型读的），资源给
+/// 给模型看的正文与图片：文本原样；认得出的图片（PNG / JPEG / GIF / WebP）解出来随结果附给
+/// 模型，正文里留一句说明；认不出的图片和音频只留一句说明（base64 不是给模型读的）；资源给
 /// 出它的文本或 URI。一段文本都没有时退回结构化结果的 JSON。
-fn render(result: &CallToolResult) -> String {
+fn render(result: &CallToolResult) -> (String, Vec<ToolImage>) {
     let mut parts: Vec<String> = Vec::new();
+    let mut images = Vec::new();
     for block in &result.content {
         match block {
             ContentBlock::Text(text) => parts.push(text.text.clone()),
-            ContentBlock::Image(image) => parts.push(format!(
-                "[图片 {}，{} 字节 base64，未展开]",
-                image.mime_type,
-                image.data.len()
-            )),
+            ContentBlock::Image(image) => match decode_image(&image.data) {
+                Some(decoded) => {
+                    parts.push(format!("[图片 {}，已附在结果里]", decoded.mime));
+                    images.push(decoded);
+                }
+                None => parts.push(format!(
+                    "[图片 {}，{} 字节 base64，未展开]",
+                    image.mime_type,
+                    image.data.len()
+                )),
+            },
             ContentBlock::Audio(audio) => parts.push(format!(
                 "[音频 {}，{} 字节 base64，未展开]",
                 audio.mime_type,
@@ -205,5 +216,43 @@ fn render(result: &CallToolResult) -> String {
     {
         parts.push(serde_json::to_string_pretty(structured).unwrap_or_default());
     }
-    parts.join("\n")
+    (parts.join("\n"), images)
+}
+
+/// 解 base64、按文件头认格式。格式以字节为准，不信服务器报的 `mimeType`。
+fn decode_image(data: &str) -> Option<ToolImage> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .ok()?;
+    let mime = image_mime(&bytes)?;
+    Some(ToolImage {
+        mime: mime.to_string(),
+        bytes,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_recognised_image_is_attached_and_anything_else_stays_a_note() {
+        let png = b"\x89PNG\r\n\x1a\nfake".to_vec();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&png);
+        let result = CallToolResult::success(vec![
+            ContentBlock::text("截图如下"),
+            ContentBlock::image(encoded, "image/png"),
+            ContentBlock::image("bm90IGFuIGltYWdl", "image/png"),
+        ]);
+        let (text, images) = render(&result);
+        assert_eq!(
+            images,
+            vec![ToolImage {
+                mime: "image/png".into(),
+                bytes: png
+            }]
+        );
+        assert!(text.contains("[图片 image/png，已附在结果里]"), "{text}");
+        assert!(text.contains("未展开"), "认不出的那张只留说明：{text}");
+    }
 }

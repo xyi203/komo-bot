@@ -26,7 +26,8 @@ use crate::types::memory::{MemoryItem, RecallQuery, RecallResult};
 use crate::types::model::{EmbeddingSpace, InputKind, TokenUsage, Vector};
 use crate::types::plan::{ExecutionPlan, Replay};
 use crate::types::refs::{
-    AttemptRef, InterruptedOutput, OutputRef, PublishedOutput, ToolResultBody, VerifiedOutput,
+    AttemptRef, ImageRef, InterruptedOutput, OutputRef, PublishedOutput, ToolResultBody,
+    VerifiedOutput,
 };
 use crate::types::status::{Claimed, RunEnd, WaitReason};
 use crate::types::systemone::{SystemOneError, SystemOneRequest, SystemOneResponse};
@@ -375,6 +376,15 @@ pub trait ToolOutputStore: Send + Sync {
     /// 按引用读取并校验哈希；不匹配返回 [`StoreError::Corrupt`]，**不返回内容**。
     async fn open(&self, output: &OutputRef) -> Result<VerifiedOutput, StoreError>;
 
+    /// 按引用读回一张结果图片并校验大小与哈希；不匹配返回 [`StoreError::Corrupt`]。
+    /// 默认不支持：没有图片的替身不用管它。
+    async fn open_image(&self, image: &ImageRef) -> Result<Vec<u8>, StoreError> {
+        Err(StoreError::Other(format!(
+            "这个输出存储不存图片：{}",
+            image.content.path
+        )))
+    }
+
     /// 一次被打断的尝试留下的部分输出，各取末尾至多 `tail_bytes`（§8.6）。没有留下就是
     /// [`InterruptedOutput::default`]。只读：接管它的是之后对同一尝试的 [`Self::begin`]。
     async fn interrupted(
@@ -389,6 +399,11 @@ pub trait ToolOutputStore: Send + Sync {
 pub trait OutputWriter: Send + Sync {
     async fn write_stdout(&mut self, chunk: &[u8]) -> Result<(), StoreError>;
     async fn write_stderr(&mut self, chunk: &[u8]) -> Result<(), StoreError>;
+    /// 把一张结果图片写进这次尝试的输出目录（同步落盘），返回它的引用。执行器在发布前调。
+    /// 默认不支持。
+    async fn write_image(&mut self, mime: &str, _bytes: &[u8]) -> Result<ImageRef, StoreError> {
+        Err(StoreError::Other(format!("这个写入器不存图片（{mime}）")))
+    }
     /// 这次尝试的身份。
     fn attempt(&self) -> &AttemptRef;
     /// 到目前为止写了多少字节——输出长度预算按它判。

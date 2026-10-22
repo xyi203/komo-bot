@@ -31,6 +31,8 @@ use komo_kernel::protocol::config::ChannelConfig;
 use komo_kernel::traits::{Channel, ChannelError, Inbound, Shutdown};
 
 pub use api::{BotApi, BotIdentity, TelegramError};
+
+use crate::channels::inbox::{ImageInbox, SavedImage};
 pub use send::TelegramSender;
 
 use api::Update;
@@ -65,6 +67,8 @@ pub struct TelegramChannel {
     idle_floor: Duration,
     retry_base: Duration,
     retry_cap: Duration,
+    /// 图片存在哪。`None` = 不收图片，只有图片的消息不进 Dispatcher。
+    inbox: Option<ImageInbox>,
 }
 
 impl std::fmt::Debug for TelegramChannel {
@@ -90,7 +94,14 @@ impl TelegramChannel {
             idle_floor: DEFAULT_IDLE_FLOOR,
             retry_base: DEFAULT_RETRY_BASE,
             retry_cap: DEFAULT_RETRY_CAP,
+            inbox: None,
         }
+    }
+
+    /// 接上图片收件箱（[`crate::channels::inbox`]）。
+    pub fn with_inbox(mut self, inbox: Option<ImageInbox>) -> Self {
+        self.inbox = inbox;
+        self
     }
 
     /// 出站的那一半。Notifier 用它主动投递（§11.4）；它与入站共用同一个 [`BotApi`]。
@@ -137,15 +148,42 @@ impl TelegramChannel {
         }
     }
 
+    /// 把消息里的图片下载、存进收件箱。没接收件箱就什么都不做。
+    async fn save_images(&self, file_ids: &[String]) -> Vec<SavedImage> {
+        let Some(inbox) = &self.inbox else {
+            return Vec::new();
+        };
+        let mut saved = Vec::new();
+        for file_id in file_ids {
+            let outcome = match self.api().download_file(file_id).await {
+                Ok(bytes) => inbox.save(&bytes).await,
+                Err(error) => Err(error.to_string()),
+            };
+            if let Err(reason) = &outcome {
+                tracing::warn!(%reason, "telegram：图片没存下来");
+            }
+            saved.push(outcome);
+        }
+        saved
+    }
+
     async fn handle_update(&self, inbound: &dyn Inbound, identity: &BotIdentity, update: Update) {
         let request_key = inbound::request_key(update.update_id);
-        let message = update
+        // 先准入再下载：群里没 @机器人 的图片不该去拉一次。
+        let accepted = update
             .message
             .as_ref()
-            .and_then(|message| inbound::from_message(message, identity, request_key));
+            .and_then(|message| inbound::accept(message, identity));
+        let message = match accepted {
+            Some(accepted) => {
+                let images = self.save_images(&accepted.file_ids).await;
+                accepted.into_inbound(&images, request_key)
+            }
+            None => None,
+        };
 
         let Some(message) = message else {
-            // 群里没 @机器人、非文本消息：`Ignored`，不进 Dispatcher。
+            // 群里没 @机器人、语音 / 视频之类的消息：`Ignored`，不进 Dispatcher。
             tracing::debug!(update_id = update.update_id, "telegram：忽略");
             return;
         };
@@ -290,7 +328,9 @@ mod tests {
 
     use komo_kernel::types::ids::{RunId, SessionId};
 
-    use super::fake::{BOT_USERNAME, Behavior, FakeBotApi, RecordingInbound, text_update};
+    use super::fake::{
+        BOT_USERNAME, Behavior, FakeBotApi, RecordingInbound, photo_update, text_update,
+    };
 
     fn channel(fake: &FakeBotApi) -> TelegramChannel {
         TelegramChannel::with_api(fake.api(), ChannelConfig::default())
@@ -343,6 +383,86 @@ mod tests {
         let received = recorder.received();
         assert_eq!(received.len(), 1, "重投的那几次都被跳过了：{received:?}");
         assert_eq!(received[0].request_key.as_str(), "telegram:7");
+    }
+
+    #[tokio::test]
+    async fn a_photo_is_downloaded_into_the_inbox_and_handed_over_as_a_path() {
+        const JPEG: &[u8] = b"\xFF\xD8\xFF\xE0fake-jpeg-body";
+        let fake = FakeBotApi::start_with(
+            Behavior::default(),
+            vec![
+                photo_update(7, 11, "private", 777, "ph-1", Some("这是什么")),
+                photo_update(8, 11, "private", 777, "ph-gone", None),
+            ],
+        )
+        .await;
+        fake.host_file("ph-1", JPEG);
+        let home = tempfile::tempdir().expect("临时目录");
+        let inbox = ImageInbox::new(home.path().join("inbox/telegram"));
+        let recorder = RecordingInbound::new(fake.log());
+
+        serve_until(
+            channel(&fake).with_inbox(Some(inbox.clone())),
+            recorder.clone(),
+            || recorder.received().len() >= 2,
+        )
+        .await;
+
+        assert!(
+            fake.log().position("file:ph-1").is_some(),
+            "下的是最大的那一种尺寸"
+        );
+        let received = recorder.received();
+        assert_eq!(received.len(), 2, "{received:?}");
+        let saved = std::fs::read_dir(inbox.dir())
+            .expect("收件箱")
+            .map(|entry| entry.expect("条目").path())
+            .collect::<Vec<_>>();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(std::fs::read(&saved[0]).expect("读回"), JPEG);
+        assert_eq!(
+            received[0].text,
+            format!(
+                "[用户发来一张图片，已存到 {}，用 read 查看]\n这是什么",
+                saved[0].display()
+            )
+        );
+        assert!(
+            received[1]
+                .text
+                .starts_with("[用户发来一张图片，但没能下载："),
+            "{}",
+            received[1].text
+        );
+        assert!(
+            !received[1].text.contains("test-token"),
+            "错误里不该有 token"
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_inbox_a_bare_photo_goes_nowhere_and_is_not_downloaded() {
+        let fake = FakeBotApi::start_with(
+            Behavior::default(),
+            vec![
+                photo_update(7, 11, "private", 777, "ph-1", None),
+                text_update(8, 11, "private", 777, "在吗"),
+            ],
+        )
+        .await;
+        fake.host_file("ph-1", b"\x89PNG\r\n\x1a\n");
+        let recorder = RecordingInbound::new(fake.log());
+        serve_until(channel(&fake), recorder.clone(), || {
+            !recorder.received().is_empty()
+        })
+        .await;
+        let received = recorder.received();
+        assert_eq!(received.len(), 1, "{received:?}");
+        assert_eq!(received[0].text, "在吗");
+        assert!(
+            fake.calls_to("getFile").is_empty(),
+            "没有收件箱就不该联网下载"
+        );
     }
 
     // ③ 群里非 @机器人 的消息 Ignored，@机器人 的剥掉提及。

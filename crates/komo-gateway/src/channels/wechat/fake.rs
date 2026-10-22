@@ -7,20 +7,23 @@
 //! 能这么做是因为 [`ILinkClient`] 的每个方法都把 `base_url` 当参数收（而不是在构造时
 //! 定死），所以把它指向 loopback 不需要动 SDK 一行。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use axum::extract::{RawQuery, State};
-use axum::http::Uri;
+use axum::http::{StatusCode, Uri};
+use axum::response::IntoResponse;
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
+use wechatbot::crypto;
 use wechatbot::protocol::ILinkClient;
 use wechatbot::types::{
-    Credentials, ImageItem, MessageItemType, MessageState, MessageType, TextItem, WireMessage,
-    WireMessageItem,
+    CDNMedia, Credentials, ImageItem, MessageItemType, MessageState, MessageType, TextItem,
+    WireMessage, WireMessageItem,
 };
 
 use komo_kernel::protocol::{InboundAck, InboundMessage};
@@ -110,8 +113,13 @@ struct FakeState {
     msgs: Mutex<Vec<Value>>,
     /// 扫码状态的剧本，一次取一条；取空之后重复最后一条。
     qr_statuses: Mutex<Vec<Value>>,
+    /// 假 CDN：`encrypted_query_param` → 密文。
+    cdn: Mutex<HashMap<String, Vec<u8>>>,
     log: EventLog,
 }
+
+/// 假 CDN 上的加密密钥。**不是真密钥**。
+const CDN_KEY: [u8; 16] = *b"komo-test-aeskey";
 
 /// 一个跑起来的假 iLink。
 pub struct FakeILink {
@@ -151,6 +159,7 @@ impl FakeILink {
             calls: Mutex::new(Vec::new()),
             msgs: Mutex::new(msgs),
             qr_statuses: Mutex::new(qr_statuses),
+            cdn: Mutex::new(HashMap::new()),
             log: EventLog::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -158,6 +167,7 @@ impl FakeILink {
             .expect("绑定 loopback");
         let addr = listener.local_addr().expect("本地地址");
         let app = Router::new()
+            .route("/cdn/download", axum::routing::get(cdn_download))
             .fallback(handle)
             .with_state(Arc::clone(&state));
         let task = tokio::spawn(async move {
@@ -198,9 +208,29 @@ impl FakeILink {
         )
     }
 
-    /// 一个指向这个假服务端的渠道。
+    /// 一个指向这个假服务端的渠道（CDN 也指向它）。
     pub fn channel(&self) -> WeChatChannel {
         WeChatChannel::with_credentials(&self.credentials(), Default::default())
+            .with_cdn_base(format!("{}/cdn", self.endpoint()))
+    }
+
+    /// 把一张图加密放到假 CDN 上，返回消息里引用它的那一段。
+    pub fn host_image(&self, param: &str, plaintext: &[u8]) -> CDNMedia {
+        self.state.cdn.lock().expect("假 CDN").insert(
+            param.to_string(),
+            crypto::encrypt_aes_ecb(plaintext, &CDN_KEY),
+        );
+        CDNMedia {
+            encrypt_query_param: param.to_string(),
+            aes_key: crypto::encode_aes_key_base64(&CDN_KEY),
+            encrypt_type: None,
+            full_url: None,
+        }
+    }
+
+    /// 从假 CDN 上拿掉一张图（"过期了 / 下不到"）。
+    pub fn forget_image(&self, param: &str) {
+        self.state.cdn.lock().expect("假 CDN").remove(param);
     }
 
     /// 之后再塞一条入站消息（"用户又说话了"）。
@@ -238,6 +268,22 @@ impl FakeILink {
 
     pub fn call_count(&self, endpoint: &str) -> usize {
         self.calls_to(endpoint).len()
+    }
+}
+
+async fn cdn_download(
+    State(state): State<Arc<FakeState>>,
+    RawQuery(query): RawQuery,
+) -> axum::response::Response {
+    let param = query
+        .unwrap_or_default()
+        .strip_prefix("encrypted_query_param=")
+        .unwrap_or_default()
+        .to_string();
+    state.log.push(format!("cdn:{param}"));
+    match state.cdn.lock().expect("假 CDN").get(&param) {
+        Some(ciphertext) => ciphertext.clone().into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -352,14 +398,19 @@ pub fn text_wire(from: &str, client_id: &str, text: &str) -> WireMessage {
     }
 }
 
-/// 一条图片 wire 消息——渠道只处理文本，它该被忽略。
+/// 一条图片 wire 消息，没有 CDN 引用。
 pub fn image_wire(from: &str, client_id: &str) -> WireMessage {
+    image_wire_with(from, client_id, None)
+}
+
+/// 一条图片 wire 消息，图片在 `media` 那里。
+pub fn image_wire_with(from: &str, client_id: &str, media: Option<CDNMedia>) -> WireMessage {
     let mut wire = text_wire(from, client_id, "");
     wire.item_list = vec![WireMessageItem {
         item_type: MessageItemType::Image,
         text_item: None,
         image_item: Some(ImageItem {
-            media: None,
+            media,
             thumb_media: None,
             aeskey: None,
             url: Some("https://img.example/a.png".into()),

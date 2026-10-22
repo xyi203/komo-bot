@@ -10,6 +10,10 @@ pub fn estimate_tokens(text: &str) -> u64 {
     text.len().div_ceil(4) as u64
 }
 
+/// 一张图片按多少 token 记账（照 pi：4800 字符 ≈ 1200 token）。真实用量随分辨率变，压缩的账只要
+/// 不把图片当成零。
+pub const IMAGE_TOKENS: u64 = 1200;
+
 /// 从末尾往前数，保留至少 `keep_recent_tokens` 的近期内容，返回第一条保留下来的 seq。
 ///
 /// `candidates` 按日志顺序给出 `(seq, token 数, 是不是一轮助手回复的开头)`。切点只能落

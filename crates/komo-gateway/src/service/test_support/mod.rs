@@ -574,6 +574,7 @@ impl komo_kernel::traits::Tool for GateTool {
             result: serde_json::json!({ "gate": "open" }),
             exit_code: Some(0),
             artifacts: vec![],
+            images: vec![],
             preview: Some("门开了".into()),
         })
     }

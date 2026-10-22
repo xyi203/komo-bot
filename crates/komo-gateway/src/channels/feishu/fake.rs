@@ -7,14 +7,16 @@
 //! ws 那一侧没有替身：openlark 的协议实现不在我们手里，本机也没有凭证。`serve` 的事件
 //! 入口做成了一个可注入的 channel（`FeishuChannel::injected`），测试直接塞负载。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::State;
-use axum::http::{Method, Uri};
+use axum::extract::{Path, State};
+use axum::http::{Method, StatusCode, Uri};
+use axum::response::IntoResponse;
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -124,6 +126,8 @@ struct FakeState {
     patched: Mutex<Vec<String>>,
     log: EventLog,
     next_message_id: AtomicI64,
+    /// 消息里的图片：`image_key` → 字节。
+    resources: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 /// 一个跑起来的假开放平台。
@@ -147,12 +151,17 @@ impl FakeOpenApi {
             patched: Mutex::new(Vec::new()),
             log: EventLog::default(),
             next_message_id: AtomicI64::new(1000),
+            resources: Mutex::new(HashMap::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("绑定 loopback");
         let addr = listener.local_addr().expect("本地地址");
         let app = Router::new()
+            .route(
+                "/open-apis/im/v1/messages/{message_id}/resources/{key}",
+                axum::routing::get(resource),
+            )
             .fallback(handle)
             .with_state(Arc::clone(&state));
         let task = tokio::spawn(async move {
@@ -191,9 +200,34 @@ impl FakeOpenApi {
             .collect()
     }
 
+    /// 放一张图，`download_image` 按 `image_key` 取得到它。
+    pub fn host_image(&self, image_key: &str, bytes: &[u8]) {
+        self.state
+            .resources
+            .lock()
+            .expect("图片")
+            .insert(image_key.to_string(), bytes.to_vec());
+    }
+
     /// 被 PATCH 过的 `message_id`，按顺序。
     pub fn patched_message_ids(&self) -> Vec<String> {
         self.state.patched.lock().expect("PATCH 记录").clone()
+    }
+}
+
+/// 下载图片。日志记 `resource:{message_id}/{key}`。不存在时像真平台一样回一个 JSON 信封。
+async fn resource(
+    State(state): State<Arc<FakeState>>,
+    Path((message_id, key)): Path<(String, String)>,
+) -> axum::response::Response {
+    state.log.push(format!("resource:{message_id}/{key}"));
+    match state.resources.lock().expect("图片").get(&key) {
+        Some(bytes) => bytes.clone().into_response(),
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(refuse(234003, "File not in msg.")),
+        )
+            .into_response(),
     }
 }
 
@@ -350,6 +384,16 @@ pub fn text_event_replying(
     })
     .to_string()
     .into_bytes()
+}
+
+/// 一条私聊图片消息的原始负载。`message_id` 是 `om_{event_id}`。
+pub fn image_event(event_id: &str, chat_id: &str, sender: &str, image_key: &str) -> Vec<u8> {
+    let mut payload: Value =
+        serde_json::from_slice(&text_event(event_id, chat_id, "p2p", sender, "", &[]))
+            .expect("自己造的负载");
+    payload["event"]["message"]["message_type"] = json!("image");
+    payload["event"]["message"]["content"] = json!(json!({ "image_key": image_key }).to_string());
+    payload.to_string().into_bytes()
 }
 
 /// 一条 `card.action.trigger` 的原始负载。komo 已经不发带按钮的卡片（§7），留着它只为

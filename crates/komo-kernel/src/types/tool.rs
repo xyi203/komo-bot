@@ -68,9 +68,50 @@ pub struct ToolOutput {
     pub exit_code: Option<i32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ContentRef>,
+    /// 要交给模型看的图片。只在内存里走到执行器：发布时写成这次尝试的输出文件，结果里只留
+    /// [`ImageRef`](super::refs::ImageRef)——不序列化，base64 不进任何一份账。
+    #[serde(skip)]
+    pub images: Vec<ToolImage>,
     /// 给模型看的简短预览；完整正文在 `output.json` 里。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+}
+
+/// 工具交出来的一张图片（原始字节）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolImage {
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+/// 一张图片最多多大才交给模型。Anthropic 单张上限 5 MB（按 base64 计），3.5 MiB 的原图编码后
+/// 约 4.7 MiB。不引入 `image`（§13.4），没法缩图：超了就报错，让模型自己想办法（比如调 `sips`）。
+pub const IMAGE_LIMIT_BYTES: usize = 3584 * 1024;
+
+/// 按文件头认图片格式。只认三家接口都收的四种：PNG、JPEG、GIF、WebP。
+pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
+
+/// 图片文件的扩展名。
+pub fn image_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "bin",
+    }
 }
 
 /// 工具失败。普通失败作为结果交给模型修正；只有驱动 / LLM 错误中断整轮（§6）。
@@ -248,6 +289,17 @@ pub struct WorkspaceRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn images_are_recognised_by_their_magic_bytes() {
+        assert_eq!(image_mime(b"\x89PNG\r\n\x1a\nrest"), Some("image/png"));
+        assert_eq!(image_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"));
+        assert_eq!(image_mime(b"GIF89a.."), Some("image/gif"));
+        assert_eq!(image_mime(b"RIFF\0\0\0\0WEBPVP8 "), Some("image/webp"));
+        assert_eq!(image_mime(b"RIFF\0\0\0\0WAVEfmt "), None);
+        assert_eq!(image_mime(b"hello"), None);
+        assert_eq!(image_extension("image/jpeg"), "jpg");
+    }
 
     #[test]
     fn a_cancel_token_is_shared_by_its_clones() {

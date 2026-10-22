@@ -16,7 +16,9 @@ use komo_kernel::types::plan::{
     ExecutionPlan, Operation, PlanTarget, PlanVersions, RecoveryMode, Replay, TargetAccess,
 };
 use komo_kernel::types::refs::ToolResultStatus;
-use komo_kernel::types::tool::{ToolContext, ToolDefinition, ToolError, ToolOutput};
+use komo_kernel::types::tool::{
+    IMAGE_LIMIT_BYTES, ToolContext, ToolDefinition, ToolError, ToolImage, ToolOutput, image_mime,
+};
 use serde::{Deserialize, Serialize};
 
 use super::resources::{self, ResolvedResource, ResourceError};
@@ -95,7 +97,8 @@ impl Tool for ReadTool {
         ToolDefinition {
             name: "read".into(),
             description: "读取一份文本：本地文件，或者 skill:// / tool:// / artifact:// \
-                 三种只读资源入口。大文件会截断，并列出未读的行范围。"
+                 三种只读资源入口。大文件会截断，并列出未读的行范围。\
+                 PNG / JPEG / GIF / WebP 图片整张附在结果里给你看。"
                 .into(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -175,13 +178,16 @@ impl Tool for ReadTool {
                         message: missing_message(target),
                     });
                 };
-                let text = as_text(bytes, path)?;
                 // 抬头与截断提示：资源印**逻辑入口**（模型给的就是它），本地路径印的还是
                 // 模型给的那个字符串——解析出来的绝对路径不是它要的那份观察（§8.3）。
                 let display = match target.uri() {
                     Some(uri) => uri.to_string(),
                     None => args.path.clone(),
                 };
+                if let Some(mime) = image_mime(&bytes) {
+                    return image_output(display, mime, bytes, &version);
+                }
+                let text = as_text(bytes, path)?;
                 slice(&text, &version, &args, self.byte_limit, &display)
             }
         };
@@ -193,9 +199,51 @@ impl Tool for ReadTool {
             })?,
             exit_code: None,
             artifacts: vec![],
+            images: vec![],
             preview: Some(preview),
         })
     }
+}
+
+/// 读到的是一张图片：整张交给执行器附在结果里，正文只说它是什么。行范围对图片没有意义，忽略。
+/// 不引入 `image`（§13.4），缩不了图：超过上限就失败，告诉模型怎么办。
+fn image_output(
+    display: String,
+    mime: &str,
+    bytes: Vec<u8>,
+    version: &FileVersion,
+) -> Result<ToolOutput, ToolError> {
+    if bytes.len() > IMAGE_LIMIT_BYTES {
+        return Err(ToolError::Failed {
+            message: format!(
+                "{display} 是一张 {mime} 图片，{} 字节，超过可以交给模型的上限 {} 字节。\
+                 先缩小再读（macOS 上可以 `sips -Z 1600 原图 --out 新文件`）",
+                bytes.len(),
+                IMAGE_LIMIT_BYTES
+            ),
+        });
+    }
+    let preview = format!(
+        "{display} 是一张 {mime} 图片，{} 字节 · 版本 {}",
+        bytes.len(),
+        version.shown()
+    );
+    Ok(ToolOutput {
+        status: ToolResultStatus::Completed,
+        result: serde_json::json!({
+            "path": display,
+            "version": version,
+            "mime": mime,
+            "bytes": bytes.len(),
+        }),
+        exit_code: None,
+        artifacts: vec![],
+        images: vec![ToolImage {
+            mime: mime.to_string(),
+            bytes,
+        }],
+        preview: Some(preview),
+    })
 }
 
 /// 这次读取触及的目标。
@@ -402,6 +450,46 @@ mod tests {
         }
     }
 
+    /// 图片不当文本读：整张交给执行器，正文只说它是什么；太大的直接失败并给出办法。
+    #[tokio::test]
+    async fn an_image_is_attached_whole_and_an_oversized_one_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = context(dir.path());
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        std::fs::write(dir.path().join("shot.png"), &png).unwrap();
+        let tool = ReadTool::new();
+        let plan = tool
+            .prepare(serde_json::json!({ "path": "shot.png" }), &ctx)
+            .await
+            .unwrap();
+        let output = tool.execute(plan, &ctx, &mut writer(&ctx)).await.unwrap();
+        assert_eq!(
+            output.images,
+            vec![ToolImage {
+                mime: "image/png".into(),
+                bytes: png.clone()
+            }]
+        );
+        let preview = output.preview.unwrap();
+        assert!(
+            preview.starts_with("shot.png 是一张 image/png 图片，16 字节"),
+            "{preview}"
+        );
+
+        let mut big = png;
+        big.resize(IMAGE_LIMIT_BYTES + 1, 0);
+        std::fs::write(dir.path().join("big.png"), &big).unwrap();
+        let plan = tool
+            .prepare(serde_json::json!({ "path": "big.png" }), &ctx)
+            .await
+            .unwrap();
+        let error = tool
+            .execute(plan, &ctx, &mut writer(&ctx))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("sips"), "{error}");
+    }
+
     /// 磁盘上的资源走的是和本地路径**同一套**读法：计划里逻辑 URI 与真实目标都在，正文的
     /// 抬头印的是 URI。
     #[tokio::test]
@@ -584,6 +672,7 @@ mod tests {
             stdout: None,
             stderr: None,
             artifacts: &[],
+            images: &[],
         };
         let printed = project(
             &facts,

@@ -162,6 +162,7 @@ mod tests {
                     call_id: ToolCallId::from_raw("call-1"),
                     content: "hi".into(),
                     is_error: false,
+                    images: vec![],
                 }],
                 revised: Vec::new(),
             })
@@ -185,6 +186,7 @@ mod tests {
                 call_id: ToolCallId::from_raw("call-1"),
                 content: "hi".into(),
                 is_error: false,
+                images: vec![],
             }],
             provider_blocks: None,
         }];
@@ -211,6 +213,7 @@ mod tests {
                 call_id: ToolCallId::from_raw("call-1"),
                 content: "上一次".into(),
                 is_error: false,
+                images: vec![],
             }],
             provider_blocks: None,
         }];

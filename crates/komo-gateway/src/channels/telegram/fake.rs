@@ -5,14 +5,16 @@
 //! 按 `offset` 语义供货（**未确认的 update 原样再给一次**），于是"ack 在处理之后"就是
 //! 一条可断言的事实，而不是一段注释。
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use axum::extract::State;
-use axum::http::Uri;
+use axum::extract::{Path, State};
+use axum::http::{StatusCode, Uri};
+use axum::response::IntoResponse;
 use axum::{Json, Router};
 use bytes::Bytes;
 use serde_json::{Value, json};
@@ -95,6 +97,8 @@ struct FakeState {
     updates: Mutex<Vec<Value>>,
     log: EventLog,
     next_message_id: AtomicI64,
+    /// 可下载的文件：`file_id` → 字节。
+    files: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 /// 一个跑起来的假 Bot API。
@@ -122,12 +126,14 @@ impl FakeBotApi {
             updates: Mutex::new(updates),
             log: EventLog::default(),
             next_message_id: AtomicI64::new(1000),
+            files: Mutex::new(HashMap::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("绑定 loopback");
         let addr = listener.local_addr().expect("本地地址");
         let app = Router::new()
+            .route("/file/{bot}/{dir}/{name}", axum::routing::get(file))
             .fallback(handle)
             .with_state(Arc::clone(&state));
         let task = tokio::spawn(async move {
@@ -165,6 +171,15 @@ impl FakeBotApi {
             .collect()
     }
 
+    /// 放一个文件，`getFile` + 下载拿得到它。
+    pub fn host_file(&self, file_id: &str, bytes: &[u8]) {
+        self.state
+            .files
+            .lock()
+            .expect("文件")
+            .insert(file_id.to_string(), bytes.to_vec());
+    }
+
     /// 往队列里再放一条 update（测试运行中"平台又来了一条"）。
     pub fn push(&self, update: Value) {
         self.state.updates.lock().expect("update 队列").push(update);
@@ -185,6 +200,19 @@ impl FakeBotApi {
             .iter()
             .map(|body| body.get("offset").and_then(Value::as_i64))
             .collect()
+    }
+}
+
+/// 文件下载：`/file/bot{token}/photos/{file_id}.jpg`。日志记 `file:{file_id}`。
+async fn file(
+    State(state): State<Arc<FakeState>>,
+    Path((_bot, _dir, name)): Path<(String, String, String)>,
+) -> axum::response::Response {
+    let file_id = name.trim_end_matches(".jpg").to_string();
+    state.log.push(format!("file:{file_id}"));
+    match state.files.lock().expect("文件").get(&file_id) {
+        Some(bytes) => bytes.clone().into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -246,6 +274,17 @@ async fn handle(State(state): State<Arc<FakeState>>, uri: Uri, body: Bytes) -> J
                 }))
             }
         }
+        "getFile" => {
+            let file_id = body
+                .get("file_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if state.files.lock().expect("文件").contains_key(file_id) {
+                ok(json!({ "file_id": file_id, "file_path": format!("photos/{file_id}.jpg") }))
+            } else {
+                refuse(400, "Bad Request: invalid file_id")
+            }
+        }
         other => refuse(404, &format!("Not Found: {other}")),
     };
     Json(reply)
@@ -272,6 +311,31 @@ pub fn text_update(update_id: i64, chat_id: i64, chat_type: &str, from: i64, tex
             "text": text,
         },
     })
+}
+
+/// 一条图片消息：��种尺寸，大的那个是 `file_id`。
+pub fn photo_update(
+    update_id: i64,
+    chat_id: i64,
+    chat_type: &str,
+    from: i64,
+    file_id: &str,
+    caption: Option<&str>,
+) -> Value {
+    let mut update = text_update(update_id, chat_id, chat_type, from, "");
+    let message = update["message"].as_object_mut().expect("message");
+    message.remove("text");
+    message.insert(
+        "photo".into(),
+        json!([
+            { "file_id": format!("{file_id}-thumb"), "width": 90, "height": 90 },
+            { "file_id": file_id, "width": 1280, "height": 960 },
+        ]),
+    );
+    if let Some(caption) = caption {
+        message.insert("caption".into(), json!(caption));
+    }
+    update
 }
 
 // ---------------------------------------------------------------- Inbound 替身

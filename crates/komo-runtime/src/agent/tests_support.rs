@@ -150,6 +150,7 @@ pub fn decay_job(provider_call_id: &str) -> komo_kernel::compaction::DecayJob {
             call_id: call,
             content: "[read · 完成 · 短视图]".into(),
             is_error: false,
+            images: vec![],
         }],
         decision,
     }

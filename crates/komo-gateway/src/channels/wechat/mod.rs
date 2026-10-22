@@ -50,10 +50,12 @@ use komo_kernel::protocol::config::{ChannelConfig, ConfigSnapshot};
 use komo_kernel::traits::{Channel, ChannelError, Inbound, Shutdown};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform};
 use komo_runtime::config::Secrets;
+use wechatbot::cdn::CdnClient;
 use wechatbot::error::WeChatBotError;
 use wechatbot::protocol::ILinkClient;
 use wechatbot::types::{Credentials, WireMessage};
 
+use crate::channels::inbox::{ImageInbox, SavedImage};
 use crate::channels::{BuiltChannel, ChannelFactory, ChannelSender};
 
 pub use login::{LoginError, LoginOptions, LoginStep, credentials_path, login, login_with};
@@ -143,6 +145,10 @@ pub struct WeChatChannel {
     /// 构造那一刻的配置快照。**不拿它做准入判定**——见 [`inbound`] 的模块注释。
     config: ChannelConfig,
     alerts: Option<Arc<dyn AlertSink>>,
+    /// 图片存在哪。`None` = 不收图片，只有图片的消息不进 Dispatcher。
+    inbox: Option<ImageInbox>,
+    /// 图片在微信 CDN 上，AES 加密；SDK 的客户端下载并解密。
+    cdn: CdnClient,
     /// 同进程的去重（§11.1 的两条重投来源）。
     seen: Mutex<SeenKeys>,
     idle_floor: Duration,
@@ -180,6 +186,8 @@ impl WeChatChannel {
             sender,
             config,
             alerts: None,
+            inbox: None,
+            cdn: CdnClient::new(),
             seen: Mutex::new(SeenKeys::default()),
             idle_floor: DEFAULT_IDLE_FLOOR,
             retry_base: DEFAULT_RETRY_BASE,
@@ -190,6 +198,19 @@ impl WeChatChannel {
     /// 接上告警口（§11.4 末）。没接就只写日志。
     pub fn with_alerts(mut self, alerts: Option<Arc<dyn AlertSink>>) -> Self {
         self.alerts = alerts;
+        self
+    }
+
+    /// 接上图片收件箱（[`crate::channels::inbox`]）。
+    pub fn with_inbox(mut self, inbox: Option<ImageInbox>) -> Self {
+        self.inbox = inbox;
+        self
+    }
+
+    /// 换一个 CDN 端点（测试里的假 CDN）。
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_cdn_base(mut self, base_url: impl Into<String>) -> Self {
+        self.cdn = CdnClient::new().with_base_url(base_url);
         self
     }
 
@@ -239,8 +260,9 @@ impl WeChatChannel {
             return;
         }
 
-        let Some(message) = inbound::from_wire(wire, request_key.clone()) else {
-            // 非文本、机器人自己的回流、空正文：`Ignored`，不进 Dispatcher。
+        let images = self.save_images(wire).await;
+        let Some(message) = inbound::from_wire(wire, request_key.clone(), &images) else {
+            // 语音 / 文件 / 视频、机器人自己的回流、空正文：`Ignored`，不进 Dispatcher。
             tracing::debug!(%request_key, "微信：忽略");
             return;
         };
@@ -263,6 +285,28 @@ impl WeChatChannel {
         if let Err(error) = self.sender.send_text(&peer.chat_id, text).await {
             tracing::warn!(%peer, %error, "微信：回执没送出去");
         }
+    }
+
+    /// 把这条消息里的图片下载、解密、存进收件箱。没接收件箱就什么都不做。
+    async fn save_images(&self, wire: &WireMessage) -> Vec<SavedImage> {
+        let Some(inbox) = &self.inbox else {
+            return Vec::new();
+        };
+        let mut saved = Vec::new();
+        for image in inbound::images_of(wire) {
+            let outcome = match &image.media {
+                None => Err("消息里没有图片的下载引用".to_string()),
+                Some(media) => match self.cdn.download(media, image.aeskey.as_deref()).await {
+                    Ok(bytes) => inbox.save(&bytes).await,
+                    Err(error) => Err(error.to_string()),
+                },
+            };
+            if let Err(reason) = &outcome {
+                tracing::warn!(%reason, "微信：图片没存下来");
+            }
+            saved.push(outcome);
+        }
+        saved
     }
 }
 
@@ -518,7 +562,14 @@ impl ChannelFactory for WeChatFactory {
             );
             return Ok(None);
         }
-        let channel = Arc::new(WeChatChannel::new(&path, config)?.with_alerts(self.alerts.clone()));
+        let channel = Arc::new(
+            WeChatChannel::new(&path, config)?
+                .with_alerts(self.alerts.clone())
+                .with_inbox(Some(ImageInbox::for_platform(
+                    snapshot,
+                    ChannelPlatform::Wechat,
+                ))),
+        );
         let sender = channel.sender() as Arc<dyn ChannelSender>;
         Ok(Some(BuiltChannel {
             channel: channel as Arc<dyn Channel>,
@@ -540,7 +591,10 @@ impl ChannelFactory for WeChatFactory {
 mod tests {
     use super::*;
 
-    use fake::{Behavior, FakeILink, RecordingAlerts, RecordingInbound, TEST_TOKEN, text_wire};
+    use fake::{
+        Behavior, FakeILink, RecordingAlerts, RecordingInbound, TEST_TOKEN, image_wire_with,
+        text_wire,
+    };
     use komo_kernel::types::chat::PeerId;
 
     fn channel(fake: &FakeILink) -> WeChatChannel {
@@ -631,6 +685,74 @@ mod tests {
         let polls = fake.calls_to("/ilink/bot/getupdates");
         assert_eq!(polls[0]["get_updates_buf"], "", "第一次是空游标");
         assert_eq!(polls[1]["get_updates_buf"], "c1", "处理完才带上新游标");
+    }
+
+    #[tokio::test]
+    async fn an_image_is_decrypted_into_the_inbox_and_handed_over_as_a_path() {
+        const JPEG: &[u8] = b"\xFF\xD8\xFF\xE0fake-jpeg-body";
+        let fake = FakeILink::start(Behavior::default()).await;
+        let media = fake.host_image("img-1", JPEG);
+        fake.push(&image_wire_with("wxid_op", "cid-1", Some(media)));
+        // 一张 CDN 上没有的图：消息照样进，正文说没拿到。
+        let missing = fake.host_image("img-gone", JPEG);
+        fake.forget_image("img-gone");
+        fake.push(&image_wire_with("wxid_op", "cid-2", Some(missing)));
+
+        let home = tempfile::tempdir().expect("临时目录");
+        let inbox = ImageInbox::new(home.path().join("inbox/wechat"));
+        let recorder = RecordingInbound::new(fake.log());
+        serve_until(
+            channel(&fake).with_inbox(Some(inbox.clone())),
+            recorder.clone(),
+            || recorder.received().len() >= 2,
+        )
+        .await
+        .expect("正常拉取");
+
+        let received = recorder.received();
+        assert_eq!(received.len(), 2, "{received:?}");
+        let saved = std::fs::read_dir(inbox.dir())
+            .expect("收件箱")
+            .map(|entry| entry.expect("条目").path())
+            .collect::<Vec<_>>();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            std::fs::read(&saved[0]).expect("读回"),
+            JPEG,
+            "存的是解密后的原图"
+        );
+        assert_eq!(
+            received[0].text,
+            format!(
+                "[用户发来一张图片，已存到 {}，用 read 查看]",
+                saved[0].display()
+            )
+        );
+        assert!(
+            received[1]
+                .text
+                .starts_with("[用户发来一张图片，但没能下载："),
+            "{}",
+            received[1].text
+        );
+    }
+
+    #[tokio::test]
+    async fn without_an_inbox_an_image_goes_nowhere_and_is_not_downloaded() {
+        let fake = FakeILink::start(Behavior::default()).await;
+        let media = fake.host_image("img-1", b"\x89PNG\r\n\x1a\n");
+        fake.push(&image_wire_with("wxid_op", "cid-1", Some(media)));
+        let recorder = RecordingInbound::new(fake.log());
+        serve_until(channel(&fake), recorder.clone(), || {
+            fake.call_count("/ilink/bot/getupdates") >= 2
+        })
+        .await
+        .expect("正常拉取");
+        assert!(recorder.received().is_empty());
+        assert!(
+            fake.log().position("cdn:img-1").is_none(),
+            "没有收件箱就不该联网下载"
+        );
     }
 
     #[tokio::test]

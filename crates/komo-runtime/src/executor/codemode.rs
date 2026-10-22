@@ -247,6 +247,8 @@ impl ToolExecutor {
             result: serde_json::json!({ "calls": calls, "error": outcome.error }),
             exit_code: None,
             artifacts: vec![],
+            // 子调用交出来的图：脚本只拿得到文字，图随外层结果交给模型。
+            images: std::mem::take(&mut journal.lock().expect("journal").images),
             preview: Some(text.to_owned()),
         };
         // 先把整段结果外置、提交 `finished`，再交给外层发布：两步之间崩了，恢复时直接
@@ -526,6 +528,15 @@ impl ToolExecutor {
                 .map_err(|e| uncertain(e.to_string()))?;
             let mut capture = Capture::persistent(writer);
             let result = tool.execute(plan, &child_ctx, &mut capture).await;
+            if let Ok(output) = &result
+                && !output.images.is_empty()
+            {
+                journal
+                    .lock()
+                    .expect("journal")
+                    .images
+                    .extend(output.images.iter().cloned());
+            }
             // 工具可能把流写失败转成 Failed，甚至整个吞掉；宿主不管它怎么转，自己记着结果不明。
             if let Some(error) = &capture.write_error {
                 return Err(uncertain(format!("子调用输出写入失败：{error}")));

@@ -2240,6 +2240,7 @@ mod tests {
             error: None,
             exit_code: Some(0),
             artifacts: vec![],
+            images: vec![],
             preview: Some(full_text.clone()),
         };
         let mut output = published();
@@ -2368,6 +2369,7 @@ mod tests {
                     error: None,
                     exit_code: Some(0),
                     artifacts: vec![],
+                    images: vec![],
                     preview: None,
                 },
             )

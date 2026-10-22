@@ -674,6 +674,8 @@ pub async fn stop_without_event(
 
 /// 记这一轮之后的轮次计数。**只往上推**：backfill 会把整段日志重放一遍
 /// （`repos::derive`），一轮旧的 `message.assistant` 不该把数字拉回去。
+///
+/// 新的一轮是模型成功回了话，连续失败的重试计数随之清零——重试预算只管一串连续失败。
 pub async fn bump_rounds_in(
     ex: &mut dyn Executor,
     run: &RunId,
@@ -686,6 +688,7 @@ pub async fn bump_rounds_in(
     }
     row.update()
         .rounds(i64::from(rounds))
+        .retry_attempts(0)
         .updated_at(to_ts(now))
         .exec(ex)
         .await

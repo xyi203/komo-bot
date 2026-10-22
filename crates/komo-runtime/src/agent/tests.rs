@@ -802,6 +802,7 @@ async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
                     attempts: 2,
                     max_attempts: 5,
                     base: std::time::Duration::from_secs(2),
+                    ..RetryBudget::default()
                 },
                 ..Budget::default()
             },
@@ -845,6 +846,121 @@ async fn the_retry_count_continues_from_what_the_ledger_already_saved() {
         })
         .expect("有一条 run.waiting");
     assert_eq!(waiting, 3);
+}
+
+/// 预算只管**一串连续失败**：之前攒下的次数在模型成功回了一轮之后清零。长任务里
+/// 零星的几次抖动不该攒到后面，把一次短暂的 503 直接打成 failed（SR-007）。
+#[tokio::test]
+async fn a_successful_round_resets_the_retry_count() {
+    let tool = Arc::new(RecordingTool::bash());
+    let harness = Harness::new();
+    let executor = harness.executor(vec![tool.clone()]);
+    let agent = AgentLoop::new(
+        Arc::new(FailingLlm::after(
+            vec![round(
+                1,
+                None,
+                vec![call("pc-1", "bash", serde_json::json!({}))],
+            )],
+            komo_kernel::types::turn::LlmError::Rejected {
+                status: 503,
+                message: "No available accounts for this model.".into(),
+            },
+        )),
+        harness.ledger.clone(),
+        executor,
+        Arc::new(harness.clock.clone()),
+    );
+    let (session, run) = harness.open_run().await;
+    let started_at = harness.clock.now();
+
+    let outcome = agent
+        .run(Segment {
+            telemetry: Default::default(),
+            request: turn_request(&session, &run),
+            env: harness.env(&session, &run),
+            budget: Budget {
+                retry: RetryBudget {
+                    attempts: 9,
+                    max_attempts: 10,
+                    ..RetryBudget::default()
+                },
+                ..Budget::default()
+            },
+            resume: None,
+            command: None,
+            compaction: None,
+            compactor: None,
+            session,
+            run,
+        })
+        .await
+        .unwrap();
+
+    let SegmentOutcome::Suspended {
+        wait:
+            WaitReason::Retry {
+                attempts,
+                not_before,
+                cause,
+            },
+        ..
+    } = &outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    assert_eq!(*attempts, 1, "成功过一轮，从头数");
+    assert_eq!(*not_before, started_at + time::Duration::seconds(2));
+    assert_eq!(*cause, RetryCause::Server);
+}
+
+/// 指数退避**单次封顶**：连续失败到后面每次等 `max_wait`，不会一等几十分钟。
+#[tokio::test]
+async fn a_long_failure_streak_waits_at_most_max_wait_per_retry() {
+    let harness = Harness::new();
+    let executor = harness.executor(vec![]);
+    let agent = AgentLoop::new(
+        Arc::new(FailingLlm::at_round(
+            komo_kernel::types::turn::LlmError::Timeout,
+        )),
+        harness.ledger.clone(),
+        executor,
+        Arc::new(harness.clock.clone()),
+    );
+    let (session, run) = harness.open_run().await;
+    let started_at = harness.clock.now();
+
+    let outcome = agent
+        .run(Segment {
+            telemetry: Default::default(),
+            request: turn_request(&session, &run),
+            env: harness.env(&session, &run),
+            budget: Budget {
+                retry: RetryBudget {
+                    attempts: 8,
+                    ..RetryBudget::default()
+                },
+                ..Budget::default()
+            },
+            resume: None,
+            command: None,
+            compaction: None,
+            compactor: None,
+            session,
+            run,
+        })
+        .await
+        .unwrap();
+
+    let SegmentOutcome::Suspended {
+        wait: WaitReason::Retry { not_before, .. },
+        ..
+    } = &outcome
+    else {
+        panic!("{outcome:?}")
+    };
+    // 2s * 2^8 = 512s，封顶 60s。
+    assert_eq!(*not_before, started_at + time::Duration::seconds(60));
 }
 
 // ---- 命令直跑模式（§10）：选驱动按 Run 的来源，命令 Run 全程零模型请求 ----

@@ -2124,6 +2124,39 @@ mod tests {
         );
     }
 
+    /// 重试预算只管一串连续失败：退避之后模型成功回了一轮，账本上的次数清零，
+    /// 重启后续跑的那一段不会带着旧次数（SR-007）。
+    #[tokio::test]
+    async fn a_recorded_round_clears_the_retry_count() {
+        let f = fixture().await;
+        let accepted = f
+            .coordinator
+            .accept_input(input("api:retry-reset", "你好", &f.session))
+            .await
+            .unwrap();
+        f.coordinator
+            .suspend(
+                &accepted.run,
+                WaitReason::Retry {
+                    attempts: 3,
+                    not_before: f.clock.now(),
+                    cause: RetryCause::Server,
+                },
+            )
+            .await
+            .unwrap();
+        f.coordinator
+            .record_round(&accepted.run, round(1, vec![]))
+            .await
+            .unwrap();
+
+        let record = crate::repos::runs::get(&f.db, &accepted.run)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.retry_attempts, 0);
+    }
+
     #[tokio::test]
     async fn a_tool_result_keeps_its_complete_body_in_jsonl() {
         let f = fixture().await;

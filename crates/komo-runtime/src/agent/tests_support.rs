@@ -36,11 +36,13 @@ pub fn turn_request(session: &SessionId, run: &RunId) -> TurnRequest {
     }
 }
 
-/// 一开口就报同一个错的 [`LlmClient`]——`ScriptedLlm` 只演得了成功的回合。
+/// 报同一个错的 [`LlmClient`]——`ScriptedLlm` 只演得了成功的回合。
 pub struct FailingLlm {
     error: komo_kernel::types::turn::LlmError,
-    /// 错在 `begin_turn` 上，还是错在第一次 `next` 上。
+    /// 错在 `begin_turn` 上，还是错在 `next` 上。
     at_begin: bool,
+    /// 报错之前先成功演完的回合。
+    before: Vec<Round>,
 }
 
 impl FailingLlm {
@@ -48,13 +50,20 @@ impl FailingLlm {
         Self {
             error,
             at_begin: true,
+            before: vec![],
         }
     }
 
     pub fn at_round(error: komo_kernel::types::turn::LlmError) -> Self {
+        Self::after(vec![], error)
+    }
+
+    /// 先成功演完 `before` 这几轮，之后每一轮都报 `error`。
+    pub fn after(before: Vec<Round>, error: komo_kernel::types::turn::LlmError) -> Self {
         Self {
             error,
             at_begin: false,
+            before,
         }
     }
 }
@@ -70,6 +79,7 @@ impl komo_kernel::traits::LlmClient for FailingLlm {
         }
         Ok(Box::new(FailingDriver {
             error: self.error.clone(),
+            before: self.before.iter().rev().cloned().collect(),
         }))
     }
 }
@@ -90,6 +100,8 @@ impl komo_kernel::traits::LlmClient for PanickingLlm {
 
 struct FailingDriver {
     error: komo_kernel::types::turn::LlmError,
+    /// 倒序存放，`pop` 出来就是下一轮。
+    before: Vec<Round>,
 }
 
 #[async_trait::async_trait]
@@ -98,7 +110,7 @@ impl komo_kernel::traits::TurnDriver for FailingDriver {
         &mut self,
         _input: komo_kernel::types::turn::RoundInput,
     ) -> Result<Round, komo_kernel::types::turn::LlmError> {
-        Err(self.error.clone())
+        self.before.pop().ok_or_else(|| self.error.clone())
     }
 
     fn usage(&self) -> komo_kernel::types::model::TokenUsage {

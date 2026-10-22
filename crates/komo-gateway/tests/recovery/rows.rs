@@ -1150,7 +1150,6 @@ async fn resolve_lets_a_blocked_run_continue_once_its_premise_is_back() {
 #[tokio::test]
 async fn row_15_a_cancelled_run_never_revives_and_an_exhausted_budget_ends() {
     let home = Home::new();
-    let target = home.workspace().join("row15.txt");
 
     // ① 取消：一条还在跑的 Run（卡在测试工具 `gate` 上）被用户取消；排在后面的那条
     //    命令一次都不该跑。
@@ -1193,9 +1192,9 @@ async fn row_15_a_cancelled_run_never_revives_and_an_exhausted_budget_ends() {
     gw.stop().await;
     exhaust_retry_budget(&home, &exhausted_run).await;
 
-    let llm = write_then_done(&target, "row-15");
+    // 重启后模型还是回不齐：到点再试的这一次又失败了。
     let gw = home
-        .start(Arc::clone(&llm) as Arc<dyn komo_kernel::traits::LlmClient>)
+        .start(FakeLlm::always(vec![Err(LlmError::Incomplete)]))
         .await;
 
     assert_eq!(
@@ -1210,26 +1209,23 @@ async fn row_15_a_cancelled_run_never_revives_and_an_exhausted_budget_ends() {
     // 新事实，§8.9）。
     //
     // 预算耗尽这件事的判定在**错误路径**上（`AgentLoop::llm_error`：下一次失败时
-    // `attempts >= max_attempts` 才写 `failed`）。所以这一段断言的是：到点被再试一次，
-    // 而且**沿用了原来的次数**——重启既不重置预算，也不凭预算把一个还没失败过的请求
-    // 提前判死。
+    // `attempts >= max_attempts` 才写 `failed`）。所以这一段断言的是：到点被再试了一次，
+    // 这次失败**接着保存的 99 次数**成了第 100 次——重启既不重置预算，也不凭预算把一个
+    // 还没失败过的请求提前判死。到期重试成功的那条路由第 3 行管。
     let exhausted = gw
         .wait_state(&exhausted_run, |s| s.is_terminal(), "终态")
         .await;
     assert_eq!(
         exhausted.summary.state,
-        RunState::Completed,
-        "到点就再试一次，不是被恢复扫描判死：{exhausted:?}"
+        RunState::Failed,
+        "预算耗尽要有明确终态：{exhausted:?}"
     );
-    assert!(target.exists(), "这一次真的请求了模型，所以文件写出来了");
-    let carried = komo_store::repos::runs::get(&gw.state().db, &exhausted_run)
+    let reason = db_last_error(&home, &gw, &exhausted_run)
         .await
-        .expect("读得到")
-        .expect("有这个 Run")
-        .retry_attempts;
+        .unwrap_or_default();
     assert!(
-        carried >= 99,
-        "沿用了保存的次数（重启不重置预算）：{carried}"
+        reason.contains("重试预算已用完（100/"),
+        "到点又请求了一次、失败后沿用保存的次数判死：「{reason}」"
     );
     gw.stop().await;
 }

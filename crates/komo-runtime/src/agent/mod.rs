@@ -65,24 +65,30 @@ pub struct Budget {
 /// 预算**」（§8.5）。
 ///
 /// 所以 `attempts` 是**输入**：由调用方从账本里已保存的次数给，不是每段从零开始。
+/// 预算管的是**一串连续失败**：模型成功回了一轮就清零（账本那边由 `message.assistant`
+/// 推进轮次时一起清），否则长任务里零星的几次抖动会攒到后面，把一次短暂的 503 直接打成
+/// failed（SR-007）。
 #[derive(Debug, Clone)]
 pub struct RetryBudget {
-    /// 这个 Run 的模型请求已经重试过几次。
+    /// 这一串连续失败已经重试过几次。
     pub attempts: u32,
     /// 最多几次。到了就是 failed，不是无限循环（§8.4）。
     pub max_attempts: u32,
-    /// 指数退避的底：第 n 次等 `base * 2^n`。
+    /// 指数退避的底：第 n 次等 `base * 2^n`，封顶 `max_wait`。
     pub base: std::time::Duration,
+    pub max_wait: std::time::Duration,
 }
 
 impl Default for RetryBudget {
     fn default() -> Self {
         Self {
             attempts: 0,
-            max_attempts: 5,
-            // TODO(decide: 文档没有给退避的数。2s 起步、5 次封顶（累计约 1 分钟）是
-            // "限流一会儿就过去了"与"别把配额耗在重试上"之间的保守取值)。
+            // 2s 起步、单次封顶 60s、第 10 次失败才放弃：连续退避约 5 分钟
+            // （2+4+8+16+32+60×4）。等退避时 Run 让出执行名额，等得久不占资源；
+            // 中转站"No available accounts"这类 503 半分钟内常常还没恢复。
+            max_attempts: 10,
             base: std::time::Duration::from_secs(2),
+            max_wait: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -303,7 +309,7 @@ impl AgentLoop {
             run,
             request,
             env,
-            budget,
+            mut budget,
             resume,
             command,
             compaction,
@@ -473,6 +479,7 @@ impl AgentLoop {
                 Some(Ok(round)) => round,
             };
             rounds += 1;
+            budget.retry.attempts = 0;
             last_request = tokio::time::Instant::now();
 
             // 「模型回复截断或调用参数未收齐时不能开始执行」（§6）。
@@ -855,7 +862,10 @@ impl AgentLoop {
                 )
                 .await;
         }
-        let backoff = budget.base.saturating_mul(1u32 << budget.attempts.min(16));
+        let backoff = budget
+            .base
+            .saturating_mul(1u32 << budget.attempts.min(16))
+            .min(budget.max_wait);
         let not_before = self.clock.now()
             + time::Duration::try_from(backoff).unwrap_or(time::Duration::seconds(2));
         // 自由文本的失败原因在 `WaitReason::Retry` 里没有位置（它只有次数、到点时刻与

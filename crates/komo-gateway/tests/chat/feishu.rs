@@ -269,6 +269,26 @@ async fn queued(gateway: &TestGateway, message: InboundMessage) -> (SessionId, R
     }
 }
 
+/// 话题的 Session 被操作者删掉之后，同一个话题里再 @ 开的是新的 Session，不是被拒的旧墓碑。
+#[tokio::test]
+async fn a_deleted_thread_session_is_replaced_by_a_fresh_one() {
+    let wired = wire().await;
+    let (_, first) = group_mention("D1", "@_user_1 先说一句", "", "");
+    let (old, _) = queued(&wired.gateway, first.clone()).await;
+
+    wired
+        .gateway
+        .state()
+        .delete_session(&old, true)
+        .await
+        .expect("操作者删会话");
+
+    let (_, again) = group_mention("D2", "@_user_1 还在吗", "om_D1", "omt_d");
+    assert_eq!(again.peer, first.peer, "还是同一个话题");
+    let (fresh, _) = queued(&wired.gateway, again).await;
+    assert_ne!(fresh, old, "删掉的会话不再接收消息");
+}
+
 /// 群里 @ 一次开一个话题、一个话题一个 Session；话题里的所有出站都回到话题里。
 #[tokio::test]
 async fn a_group_mention_opens_a_thread_that_is_its_own_session() {

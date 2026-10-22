@@ -131,12 +131,14 @@ impl Dispatcher {
     ///
     /// 会话 ID 仍然是 UUID（kernel 的 ID 都是），"哪个群"记在 `sessions.origin` 上——
     /// 把 `{platform}:{chat_id}` 直接当 ID 会让每个消费者再去拆一次字符串。
+    /// 只认还收输入的会话：被删（或正在关闭）的那个不再接消息，下一条另开新的——
+    /// `origin` 上没有唯一约束，同一个 origin 本来就可以有墓碑与活的并存。
     pub async fn session_for_peer(&self, peer: &ChannelPeer) -> Result<SessionId, GatewayError> {
         let origin = chat_origin(peer);
-        let existing = komo_store::repos::session::list(&self.state.db, true)
+        let existing = komo_store::repos::session::list(&self.state.db, false)
             .await?
             .into_iter()
-            .filter(|record| record.origin == origin)
+            .filter(|record| record.origin == origin && record.state.accepts_input())
             .map(|record| record.session)
             .min();
         if let Some(session) = existing {

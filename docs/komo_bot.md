@@ -1079,6 +1079,7 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的�
 enabled    = true
 allow_from = ["ou_xxx"]            # 操作者的 open_id；为空则没人能说话
 home_chat  = "oc_xxx"              # 主动投递（介入通知、Cron 结果等）的目标会话
+allow_tenant = true               # 同一飞书企业的人都算操作者（外部人员、外部群除外）；省略 = false
 guest_agent = "guest"             # 群里非操作者 @机器人 时用的 Agent；不写 = 非操作者一律拒绝
 
 [agents.guest]                     # 访客 Agent：tools = []、memory 为 private/off、project_files = false（见下文「群里的访客」）
@@ -1161,6 +1162,8 @@ TELEGRAM_BOT_TOKEN=...
 - **竞态**：终态投递来自 Run 的看客任务，与发卡片并发，可能先到。所以拿到 `Queued` 后、任何网络调用之前先同步登记一个 pending 槽位，卡片发出去后填上 `message_id`（或标记失败）；终态遇到 pending 槽位时最多等 5 秒。等不到就把槽位标成"已放弃"改发文本，卡片之后才到的由发卡片那一侧自己把它收尾成"结果见下方消息"——两边在同一把锁里比较并交换，谁先到都只有一方认领那张卡片，不会出现"文本发了、卡片停在处理中"。剩下的窗口只有"Dispatcher 返回 `Queued` 到登记槽位"之间（同步代码、没有 await），Run 要在那里面跑完一整轮才会漏。
 
 **飞书群里的话题（2026-10-22；私聊已真机验证，群未验证）。** 群里 @机器人 与私聊里的每条消息一律以话题回复，**一个话题一个 Session**（做法同 OpenClaw 飞书渠道的 `group_topic` 会话范围与 `replyInThread`）。话题按根消息 id（`om_*`）认：消息带 `thread_id` 且有 `root_id`（已在话题里，飞书文档：话题内消息的 `root_id` 与 `parent_id` 都是话题根）就用 `root_id`；否则这条消息自己就是新话题的根——主流里的 @ 和主流里的引用回复都从当前这条开新话题，不把话题挂到被引用的老消息上。peer 写成 `feishu:{chat_id}#{om_root}`（`ChannelPeer.thread`），`runs.peer`、`sessions.origin`、`deliveries.thread` 都带着它，所以这个 Session 的一切出站——处理中卡片、终态的跟随分段与文本退路、命令回执、介入、后台任务与监听的通知、重启后补发——都进同一个话题。飞书发消息接口不能按 `thread_id` 发（`receive_id_type` 没有这一项），进话题只能回复话题里的消息：komo 一律回复话题根并带 `reply_in_thread: true`，处理中卡片回复触发的那条（主流里它就是根，带上这个参数就开出话题）。`/id` 与拒绝提示回显的会话不带话题，它是抄进 `home_chat` 的串。话题里没 @机器人 的消息照旧不响应（私聊不看 @）。**飞书私聊因此不再进 home session**：Dispatcher 对带话题的私聊走 `session_for_peer`，没有话题的私聊（Telegram、WeChat、TUI）照旧进 home；home 的主动投递（`home_chat`、后台任务通知）仍发到私聊主线。实测（2026-10-22，`home_chat` 那个 `chat_mode=p2p` 的会话）：回复根消息带 `reply_in_thread: true` 返回 `thread_id`，再回复同一根消息落在同一个 `thread_id`——私聊支持话题。`/cancel`、`/status`、`/new` 作用于所在话题的 Session。此前的整群 Session 与飞书私聊在 home 里的历史不再收到新消息，不迁移。平台对不支持话题回复的群报 `230071`，没有样本，不做退回主流的兜底。
+
+**同一企业都算操作者（2026-10-22，未真机验证）。** `[channels.feishu] allow_tenant = true`：发送者与机器人同属一个飞书企业、且会话不是外部群，就与 `allow_from` 里的人完全一样——默认 Agent、全部工具、命令，不做区分。判定（`InboundMessage.same_org`，`ChannelConfig::admits`）：事件 `header.tenant_key` 非空且等于 `event.sender.tenant_key`；群消息再查 `GET /im/v1/chats/{chat_id}` 的 `external == false`（按群缓存在进程里，查失败按"不是内部群"处理、不缓存、下一条重试）。外部联系人、外部群里的任何人都不算——`assistant` 拿得到生产 MCP、`.env` 与个人记忆，公司内共用是操作者的决定，流出公司就是泄露。只有飞书判得了"同一企业"，Telegram / WeChat 上写 `allow_tenant` 报错。实测（2026-10-22）：群信息接口返回 `external` 与 `tenant_key`，本企业 `tenant_key` 一致；接收事件文档的示例里 header 与 sender 的 `tenant_key` 不同、文档没解释——判错的后果是同事被拒（失败在安全的一侧），以真机为准。同事的话会和操作者的话一样进 Personal 记忆的提取。
 
 **群里的访客（2026-10-22，未真机验证）。** 群里不在 `allow_from` 的人 @机器人，渠道配了 `guest_agent` 才答，否则照旧回拒绝提示；私聊里的非操作者一律拒绝；非操作者的斜杠命令（含 `/answer`）一律拒绝，`/answer` 自己另有一道操作者检查。komo 没有审批、`bash` 拦不住，所以访客是**无工具的纯对话**，而且隔离按会话类型强制、不靠配置：
 - **会话**：`kind = guest`、`agent_id` = 访客 Agent，来源 `guest:{peer}`（飞书 `guest:feishu:{chat}#{om_root}`，Telegram 没有话题就是整群一个）。与操作者在同一话题里的 `chat:` 会话互不相见；回复仍落在同一个话题里。`guest_agent` 改了，下一条另开新会话。

@@ -358,7 +358,7 @@ Run 完成仅表示本轮结束。测试是否通过、性能是否改善、设�
 
 | 对象 | 是什么 | 住在哪 |
 | --- | --- | --- |
-| `AgentProfile` | 一个助手的长期定义：身份指令、模型、能给的工具、允许的 Skill、工作目录、记忆作用域 | 操作者写在 `config.toml` 里 |
+| `AgentProfile` | 一个助手的长期定义：身份指令、模型、能给的工具、允许的 Skill、工作目录、记忆模式与作用域、要不要项目文件 | 操作者写在 `config.toml` 里 |
 | Session | 一段持续对话，**绑定一个 Agent**（`sessions.agent_id`），不随消息路由改人格 | `state.db` 的行 |
 | `RunSnapshot` | 某一次执行受理时冻结的身份与能力 | 账本里那次受理上 |
 
@@ -378,7 +378,14 @@ memory_scope = "personal"
 instructions = "你在仓库里干活，动手前先把计划说清楚。"
 tools = ["read", "write", "edit", "rg", "bash", "codemode"]
 workspace = "code/komo"
+
+[agents.guest]                     # 群里的访客（§11.3）
+tools = []
+memory = "private"                 # shared（省略）/ private / off
+project_files = false              # 省略 = true
 ```
+
+**记忆模式与项目文件（2026-10-22）。** `memory`：`shared`（省略）= 召回 `memory_scope` + Personal，没写 `memory_scope` 就是全部作用域——**但不含任何 `agent:*`**；`private` = 这个 Agent 自己的 `agent:<id>` 作用域，召回只看它、不并 Personal，提取前的候选召回也只看它，提取结果不管模型选了什么都由 Rust 改写成 `agent:<id>`，别的 Agent 的召回与提取候选都看不见它（双向隔离，判断只有 `memory::scope_allowed` 一处）；`off` = 不召回，提取当场结案、不调模型。`private` 与 `memory_scope` 不能同写，任何 Profile 的 `memory_scope` 都不能写 `agent:...`——那一格只属于 `private`。模式冻结进 `RunSnapshot.memory_mode`（旧快照读回 `shared`），续跑与提取都按受理时那一档；带过来的旧注入按现在放行的作用域重新过一遍。`project_files = false` 不做项目文件的发现（发现会从工作目录一路往上到 `/`）。操作者看访客记忆要显式 `komo memory list --scope agent:guest`。
 
 两个字段各带一次"省略 ≠ 空"的区分，写在类型里（§4 的能力面）：`tools` 省略 = 目录里全部，`[]` = 一个都不给；写了目录里没有的工具名**不算数**，装配时 warn 出来，模型看到的 schema 里也不会出现它（`AgentProfile::surface` 把不认识的名字单独返回，就是为了不静默采纳一份写错的配置）。
 
@@ -1072,8 +1079,10 @@ allow_from = ["ou_xxx"]            # 操作者的 open_id；为空则没人能�
 home_chat  = "oc_xxx"              # 主动投递（介入通知、Cron 结果等）的目标会话
 guest_agent = "guest"             # 群里非操作者 @机器人 时用的 Agent；不写 = 非操作者一律拒绝
 
-[agents.guest]                     # 访客 Agent 必须显式 tools = []（见下文「群里的访客」）
+[agents.guest]                     # 访客 Agent：tools = []、memory 为 private/off、project_files = false（见下文「群里的访客」）
 tools = []
+memory = "private"
+project_files = false
 instructions = "你在一个群里回答同事的问题……"
 
 [channels.telegram]
@@ -1152,9 +1161,8 @@ TELEGRAM_BOT_TOKEN=...
 
 **群里的访客（2026-10-22，未真机验证）。** 群里不在 `allow_from` 的人 @机器人，渠道配了 `guest_agent` 才答，否则照旧回拒绝提示；私聊里的非操作者一律拒绝；非操作者的斜杠命令（含 `/answer`）一律拒绝，`/answer` 自己另有一道操作者检查。komo 没有审批、`bash` 拦不住，所以访客是**无工具的纯对话**，而且隔离按会话类型强制、不靠配置：
 - **会话**：`kind = guest`、`agent_id` = 访客 Agent，来源 `guest:{peer}`（飞书 `guest:feishu:{chat}#{om_root}`，Telegram 没有话题就是整群一个）。与操作者在同一话题里的 `chat:` 会话互不相见；回复仍落在同一个话题里。`guest_agent` 改了，下一条另开新会话。
-- **能力面恒为空**（`freeze_run` 按 kind，Profile 写了什么都不算）：`read` / `rg` 没有根目录限制，MCP 工具用的是操作者的凭据，现有的工具没有一样能交给陌生人。配置校验同样要求访客 Agent 显式写 `tools = []`（不写 = 整个目录，写了任何工具都报错），WeChat 上配 `guest_agent` 报错（只有私聊）。
-- **不读项目文件与 skills**：项目文件的发现从工作目录一路往上到 `/`，会读到 `~/AGENTS.md`。
-- **不召回、不提取记忆**：`recall_scopes` 总会带上 Personal，作用域挡不住；访客的话不是操作者的事实，提取会默认写进 Personal。召回在每一段装配时按 kind 跳过，提取在批处理的跳过名单里。
+- **能力面恒为空**（`freeze_run` 按 kind，Profile 写了什么都不算）：`read` / `rg` 没有根目录限制，MCP 工具用的是操作者的凭据，现有的工具没有一样能交给陌生人——这是按 kind 强制的唯一一条，其余都由 Profile 表达。配置校验同样要求访客 Agent 显式写 `tools = []`（不写 = 整个目录，写了任何工具都报错），WeChat 上配 `guest_agent` 报错（只有私聊）。
+- **记忆与项目文件按 Profile**（§6.1 记忆模式）：校验要求访客 Agent 写 `memory = "private"` 或 `"off"`、`project_files = false`——`shared` 会召回操作者的 Personal，项目文件的发现会读到 `~/AGENTS.md`。`private` 让访客记住群里常问的事：作用域 `agent:<id>`，整个访客 Profile 一份（所有群、所有访客共用），操作者的 Agent 看不见它，它也看不见操作者的。访客会话的 Profile 从配置里删掉时，这个会话的下一条消息被拒，不退回默认 Agent。skills 目录只在有 `read` / `bash` 时出现，访客没有。
 - **没堵上的**：系统提示固定的「工作目录：…」一行带着操作者的绝对路径；访客用操作者的模型额度、不限流——要省钱就给访客 Agent 配便宜的 `model`。
 
 一条普通消息在 Run 停在介入上时到达：Run 不会被越过（§6），消息排在它后面；不做"插话替换答复"这类特殊路径。聊天渠道的消息也不插话（插话只在 TUI，且只并进**正在跑**的 Run，§6）：渠道的回复卡片与"Run 结束时回复"按 Run 记账，一条消息被并走就没有自己的那次回复了。

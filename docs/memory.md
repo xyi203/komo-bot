@@ -41,7 +41,7 @@
 | ------------------------- | ------------------------------------------------------------------------------------- |
 | id / revision             | 稳定 ID 与递增内容版本；修改产生新版本                                                |
 | content / kind            | 简短、尽量单一的陈述；preference / fact / experience                                  |
-| scope                     | personal、project 或 environment，绑定当前操作者、稳定项目 ID 或实例 ID               |
+| scope                     | personal、project、environment 或 agent，绑定当前操作者、稳定项目 ID、实例 ID 或某个 Agent |
 | provenance                | user_statement / tool_observation / model_inference                                   |
 | confirmation              | unconfirmed / user_confirmed                                                          |
 | state                     | candidate / active / contested / superseded / forgotten                               |
@@ -55,6 +55,8 @@
 证据与内容版本分别保留。用户确认绑定具体 id / revision 和操作者事件；模型返回的 user_confirmed 字段没有写入权限。明确的用户原话可标为 active + user_statement + unconfirmed，展示为“自动整理自用户陈述”；模型推断默认 candidate，不作为已确认事实注入。
 
 用户主动保存到 Memos 表示“要求保留这段内容”，其中可能有引用、假设或待办，不等于确认了其中每一句话。只有用户明确确认的具体陈述才能获得 user_confirmed。
+
+**`agent:<id>` 是那个 Agent 的私有作用域（2026-10-22）。** 只有 Profile 写 `memory = "private"` 的那个 Agent 召回、提取得到它；不限作用域的召回与提取候选（`shared` 且没写 `memory_scope`）放行除 `agent:*` 之外的全部；两路检索都在排名、截断之前按作用域过滤（`scope_allowed`），一个作用域灌再多也挤不掉别的作用域的候选名额。`private` 的提取结果一律落在 `agent:<id>`，模型交回别的作用域也改写过去；`shared` 的提取交回 `agent:*` 丢弃。用途是群里的访客（`docs/komo_bot.md` §11.3）：陌生人的话只进访客自己的记忆，碰不到操作者的，也不会被操作者的 Agent 召回成一条注入通道。操作者的 CLI 显式 `--scope agent:<id>` 照常读写。
 
 NAS 和 Mac 的自动 Memory 各自独立。项目作用域使用实例内稳定的项目 ID，可映射多个临时仓库副本；工作路径相似不自动意味着同一项目。
 
@@ -763,7 +765,7 @@ Run 的任务附近；新对话再建立新的基线，避免每次修改整个 
 | 一次性任务约束 | 不自动升为持续偏好 |
 | 用户正文外置、工具结果很长 | 能处理必要真实证据；截断与缺失可诊断 |
 | 旧语境、助手总结与记忆附件重复出现 | 不形成新的独立佐证，不增加确认等级 |
-| Profile 有项目作用域 | 检索与提取都不能越过允许范围；子代理隔离保持有效 |
+| Profile 有项目作用域 | 检索与提取都不能越过允许范围；子代理隔离保持有效（2026-10-22：`memory = "private"` 已实现检索与提取都不越界；`shared` + `memory_scope` 的提取仍可写 Personal 等其他作用域，未收紧） |
 
 #### B.6.2 评估方法
 

@@ -789,7 +789,7 @@ pub struct CronDeleteResponse {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemoryListQuery {
-    /// **query string 里是一行文本**（`personal` / `project:<id>` / `environment:<id>`），
+    /// **query string 里是一行文本**（`personal` / `project:<id>` / `environment:<id>` / `agent:<id>`），
     /// JSON 里是一个带 `kind` 的对象——[`MemoryScope`] 的文档说的就是这两种写法。
     ///
     /// 这里必须有一个自定义反序列化：`?scope=` 送来的是字符串，而 `MemoryScope` 是内部

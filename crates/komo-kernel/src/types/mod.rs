@@ -21,7 +21,7 @@ pub mod task;
 pub mod tool;
 pub mod turn;
 
-pub use agent::{AgentConfig, AgentProfile, RunSnapshot};
+pub use agent::{AgentConfig, AgentProfile, MemoryMode, RunSnapshot};
 pub use chat::{
     ChannelPeer, ChannelPlatform, Delivery, DeliveryState, DeliveryTarget, Outbound, PeerId,
     Principal,

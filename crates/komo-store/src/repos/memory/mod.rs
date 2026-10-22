@@ -894,6 +894,7 @@ pub(super) fn scope_kind(scope: &MemoryScope) -> String {
         MemoryScope::Personal => "personal",
         MemoryScope::Project { .. } => "project",
         MemoryScope::Environment { .. } => "environment",
+        MemoryScope::Agent { .. } => "agent",
     }
     .to_string()
 }

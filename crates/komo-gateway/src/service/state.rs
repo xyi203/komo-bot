@@ -1259,6 +1259,7 @@ impl GatewayState {
             project_files_update_ref,
             skills_ref,
             memory_scope: profile.memory_scope.clone(),
+            memory_mode: profile.memory,
             projection: Some(config.execution.projection()),
             direct_command: None,
             contract: None,

@@ -12,7 +12,7 @@ use komo_kernel::protocol::config::{
     ExecutionConfig, KeyPath, McpExposure, McpServerConfig, McpTransport, MemoryConfig,
     PathsConfig, RetrievalConfig, SourceFile, StartOnly, TypesafeConfig,
 };
-use komo_kernel::types::agent::{AgentConfig, AgentProfile};
+use komo_kernel::types::agent::{AgentConfig, AgentProfile, MemoryMode};
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
 use komo_kernel::types::memory::{MemoryScopeParseError, RetrievalMode};
 use komo_kernel::types::model::{
@@ -280,6 +280,9 @@ pub(super) struct AgentSection {
     pub skills: Option<Vec<String>>,
     pub workspace: Option<PathBuf>,
     pub memory_scope: Option<String>,
+    #[serde(default)]
+    pub memory: MemoryMode,
+    pub project_files: Option<bool>,
 }
 
 /// `[mcp.servers.<name>]`（`docs/mcp.md`）。`command` 与 `url` 恰好写一个。
@@ -378,6 +381,8 @@ impl AgentSection {
             skills: self.skills,
             workspace: self.workspace.map(|path| resolve(base, path)),
             memory_scope,
+            memory: self.memory,
+            project_files: self.project_files.unwrap_or(true),
         })
     }
 }

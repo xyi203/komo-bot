@@ -25,14 +25,22 @@ pub enum MemoryKind {
 /// 项目（§9.2）。
 ///
 /// 在 JSON 里是一个带 `kind` 的对象；在 **query string 里**是一行文本
-/// （`personal` / `project:<id>` / `environment:<id>`，见 [`Display`] 与 [`FromStr`]），
+/// （`personal` / `project:<id>` / `environment:<id>` / `agent:<id>`，见 [`Display`] 与 [`FromStr`]），
 /// 因为 `?scope=` 装不下一个对象。两种写法必须能互相还原，所以它们有一个往返测试。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MemoryScope {
     Personal,
-    Project { project_id: String },
-    Environment { instance_id: String },
+    Project {
+        project_id: String,
+    },
+    Environment {
+        instance_id: String,
+    },
+    /// 某个 Agent 的私有记忆（`memory = "private"` 的 Profile 只读写这一格）。
+    Agent {
+        agent_id: String,
+    },
 }
 
 impl fmt::Display for MemoryScope {
@@ -41,13 +49,14 @@ impl fmt::Display for MemoryScope {
             MemoryScope::Personal => f.write_str("personal"),
             MemoryScope::Project { project_id } => write!(f, "project:{project_id}"),
             MemoryScope::Environment { instance_id } => write!(f, "environment:{instance_id}"),
+            MemoryScope::Agent { agent_id } => write!(f, "agent:{agent_id}"),
         }
     }
 }
 
 /// 解析作用域文本失败。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("作用域要写成 personal / project:<id> / environment:<id>，收到：{0}")]
+#[error("作用域要写成 personal / project:<id> / environment:<id> / agent:<id>，收到：{0}")]
 pub struct MemoryScopeParseError(String);
 
 impl FromStr for MemoryScope {
@@ -65,6 +74,9 @@ impl FromStr for MemoryScope {
             }),
             Some(("environment", id)) => Ok(MemoryScope::Environment {
                 instance_id: id.to_string(),
+            }),
+            Some(("agent", id)) => Ok(MemoryScope::Agent {
+                agent_id: id.to_string(),
             }),
             Some(_) => Err(invalid()),
         }
@@ -459,6 +471,9 @@ mod tests {
             MemoryScope::Environment {
                 instance_id: "nas".into(),
             },
+            MemoryScope::Agent {
+                agent_id: "guest".into(),
+            },
         ] {
             let text = scope.to_string();
             assert_eq!(text.parse::<MemoryScope>().unwrap(), scope, "{text}");
@@ -476,8 +491,16 @@ mod tests {
                 project_id: "a:b".into()
             }
         );
+        assert_eq!(
+            "agent:guest".parse::<MemoryScope>().unwrap(),
+            MemoryScope::Agent {
+                agent_id: "guest".into()
+            }
+        );
         for bad in [
             "",
+            "agent:",
+            "agent",
             "personal:x",
             "project",
             "project:",

@@ -17,6 +17,33 @@ use crate::types::model::ModelConfig;
 use crate::types::refs::PayloadRef;
 use crate::types::surface::AgentSurface;
 
+/// 一个助手怎么用记忆。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryMode {
+    /// 共享操作者的记忆：召回 `memory_scope` 与个人记忆，提取由模型选作用域。
+    #[default]
+    Shared,
+    /// 只读写自己的 `agent:<id>` 作用域，看不到也写不进操作者的记忆。
+    Private,
+    /// 不召回、不提取。
+    Off,
+}
+
+impl MemoryMode {
+    pub fn is_shared(&self) -> bool {
+        matches!(self, MemoryMode::Shared)
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
+}
+
 /// 一个助手的长期定义。
 ///
 /// **不含运行现场**：没有"当前会话"、没有正在跑的调用、没有取消令牌。并发跑两个助手时，
@@ -44,6 +71,12 @@ pub struct AgentProfile {
     /// 记忆作用域：只召回这个作用域（外加显式共享的用户资料）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_scope: Option<MemoryScope>,
+    /// 记忆模式。`private` 与 `memory_scope` 互斥（私有就是 `agent:<id>`）。
+    #[serde(default, skip_serializing_if = "MemoryMode::is_shared")]
+    pub memory: MemoryMode,
+    /// false = 不发现、不加载 AGENTS.md / CLAUDE.md 这类项目文件。
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub project_files: bool,
 }
 
 impl AgentProfile {
@@ -57,6 +90,8 @@ impl AgentProfile {
             skills: None,
             workspace: None,
             memory_scope: None,
+            memory: MemoryMode::Shared,
+            project_files: true,
         }
     }
 
@@ -130,6 +165,9 @@ pub struct RunSnapshot {
     pub skills_ref: Option<PayloadRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_scope: Option<MemoryScope>,
+    /// 受理时的记忆模式：续跑的片段与提取都按它，不看之后改过的 Profile。旧快照 = `Shared`。
+    #[serde(default, skip_serializing_if = "MemoryMode::is_shared")]
+    pub memory_mode: MemoryMode,
     /// 工具结果怎么投影给模型（`[execution]` 的预算与衰减，§8.3）。冻结在这里，刚跑完与
     /// 回放才按同一份渲染，热重载改不到已经受理的 Run。`None` = 这一格出现之前受理的 Run。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -266,6 +304,7 @@ mod tests {
             project_files_update_ref: None,
             skills_ref: None,
             memory_scope: None,
+            memory_mode: MemoryMode::Shared,
             projection: None,
             direct_command: None,
             contract: None,
@@ -277,6 +316,50 @@ mod tests {
         assert!(json.get("skills_ref").is_none(), "{json}");
         let back: RunSnapshot = serde_json::from_value(json).unwrap();
         assert_eq!(back, snapshot);
+    }
+
+    #[test]
+    fn a_profile_without_memory_keys_shares_memory_and_loads_project_files() {
+        let profile: AgentProfile = serde_json::from_str(r#"{"id":"assistant"}"#).unwrap();
+        assert_eq!(profile.memory, MemoryMode::Shared);
+        assert!(profile.project_files);
+        let json = serde_json::to_value(&profile).unwrap();
+        assert!(json.get("memory").is_none() && json.get("project_files").is_none());
+        assert_eq!(
+            profile.revision(),
+            AgentProfile::new("assistant").revision()
+        );
+
+        let closed: AgentProfile =
+            serde_json::from_str(r#"{"id":"g","memory":"private","project_files":false}"#).unwrap();
+        assert_eq!(closed.memory, MemoryMode::Private);
+        assert!(!closed.project_files);
+        assert_ne!(closed.revision(), AgentProfile::new("g").revision());
+    }
+
+    #[test]
+    fn an_old_snapshot_reads_back_with_shared_memory() {
+        let mut snapshot = serde_json::to_value(RunSnapshot {
+            agent_id: "assistant".into(),
+            profile_revision: AgentProfile::new("assistant").revision(),
+            model: crate::test_support::sample_model(),
+            workspace: PathBuf::from("/w"),
+            surface: AgentSurface::new(["read"]),
+            instructions_ref: None,
+            project_files_ref: None,
+            project_files_update_ref: None,
+            skills_ref: None,
+            memory_scope: None,
+            memory_mode: MemoryMode::Private,
+            projection: None,
+            direct_command: None,
+            contract: None,
+        })
+        .unwrap();
+        assert_eq!(snapshot["memory_mode"], "private");
+        snapshot.as_object_mut().unwrap().remove("memory_mode");
+        let back: RunSnapshot = serde_json::from_value(snapshot).unwrap();
+        assert_eq!(back.memory_mode, MemoryMode::Shared);
     }
 
     #[test]

@@ -702,6 +702,7 @@ fn scope_text(scope: &MemoryScope) -> String {
         MemoryScope::Personal => "个人".into(),
         MemoryScope::Project { project_id } => format!("项目 {project_id}"),
         MemoryScope::Environment { instance_id } => format!("环境 {instance_id}"),
+        MemoryScope::Agent { agent_id } => format!("助手 {agent_id}"),
     }
 }
 

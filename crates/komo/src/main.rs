@@ -266,7 +266,7 @@ struct CronAddArgs {
 enum MemoryCommand {
     /// 按作用域、状态和查询条件列出记忆。
     List {
-        /// 只看这个作用域：personal / project:<id> / environment:<id>。
+        /// 只看这个作用域：personal / project:<id> / environment:<id> / agent:<id>。
         #[arg(long)]
         scope: Option<String>,
         /// 只看这个状态：candidate / active / contested / superseded / forgotten。
@@ -286,7 +286,7 @@ enum MemoryCommand {
         /// 检索模式：hybrid（默认，按配置）/ keyword / vector。
         #[arg(long)]
         mode: Option<String>,
-        /// 只看这个作用域：personal / project:<id> / environment:<id>。
+        /// 只看这个作用域：personal / project:<id> / environment:<id> / agent:<id>。
         #[arg(long)]
         scope: Option<String>,
         /// 只看这个状态。**明确写出来才查得到 contested**（§9.6）。
@@ -348,7 +348,7 @@ enum MemoryCommand {
     },
     /// 离线整理（§9.8）：对一个作用域里已有的记忆去重、取代、标冲突，不新增正文。默认只预演。
     Consolidate {
-        /// 只整理这个作用域：personal / project:<id> / environment:<id>；不给就逐个作用域跑。
+        /// 只整理这个作用域：personal / project:<id> / environment:<id> / agent:<id>；不给就逐个作用域跑。
         #[arg(long)]
         scope: Option<String>,
         /// 只整理这个种类：preference / fact / experience。

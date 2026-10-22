@@ -10,6 +10,7 @@
 use komo_kernel::protocol::config::{
     ChannelConfig, ConfigIssue, ConfigSnapshot, IssueSeverity, KeyPath,
 };
+use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
 use komo_kernel::types::memory::RetrievalMode;
 use komo_kernel::types::model::{CatalogModel, EmbeddingConfig, ModelConfig};
@@ -548,6 +549,12 @@ fn check_agents(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
                 "写了 instructions 就不能是空的；不想要就整行去掉",
             ));
         }
+        if profile.memory == MemoryMode::Private && profile.memory_scope.is_some() {
+            issues.push(error(
+                &format!("agents.{id}.memory"),
+                "memory = \"private\" 已经固定为 agent:<id> 作用域，不能再写 memory_scope",
+            ));
+        }
     }
     if agent.default_agent.trim().is_empty() {
         issues.push(error(
@@ -650,6 +657,24 @@ fn check_guest_agent(
         issues.push(error(&key, format!("`{guest}` 不在 [agents.<id>] 里")));
         return;
     };
+    if profile.memory.is_shared() {
+        issues.push(error(
+            &key,
+            format!(
+                "`{guest}` 共享操作者的记忆，陌生人会召回到操作者的个人记忆；\
+                 在 [agents.{guest}] 里写 memory = \"private\"（或 \"off\"）"
+            ),
+        ));
+    }
+    if profile.project_files {
+        issues.push(error(
+            &key,
+            format!(
+                "`{guest}` 会加载项目文件；项目文件的发现一路向上找到 /，会读到 ~/AGENTS.md 之类的\
+                 私人规范，在 [agents.{guest}] 里写 project_files = false"
+            ),
+        ));
+    }
     match profile.tools.as_deref() {
         Some([]) => {}
         None => issues.push(error(
@@ -707,6 +732,7 @@ mod tests {
     use super::*;
     use crate::config::testing::snapshot_fixture;
     use komo_kernel::protocol::config::{McpServerConfig, McpTransport};
+    use komo_kernel::types::memory::MemoryScope;
     use komo_kernel::types::model::Effort;
 
     fn keys(issues: &[ConfigIssue]) -> Vec<&str> {
@@ -851,6 +877,8 @@ mod tests {
         let mut snapshot = snapshot_fixture();
         let mut guest = komo_kernel::types::agent::AgentProfile::new("guest");
         guest.tools = tools.map(|names| names.into_iter().map(String::from).collect());
+        guest.memory = MemoryMode::Private;
+        guest.project_files = false;
         snapshot.agent.agents.insert("guest".into(), guest);
         snapshot.channels.feishu.guest_agent = Some("guest".into());
         snapshot
@@ -882,6 +910,54 @@ mod tests {
         let issues = validate(&with_guest(Some(vec!["read"])));
         assert_eq!(keys(&issues), vec!["channels.feishu.guest_agent"]);
         assert!(has_errors(&issues));
+    }
+
+    #[test]
+    fn a_guest_agent_with_off_memory_is_accepted() {
+        let mut snapshot = with_guest(Some(vec![]));
+        snapshot.agent.agents.get_mut("guest").unwrap().memory = MemoryMode::Off;
+        assert_eq!(validate(&snapshot), vec![]);
+    }
+
+    #[test]
+    fn a_guest_agent_that_shares_the_operators_memory_is_refused() {
+        let mut snapshot = with_guest(Some(vec![]));
+        snapshot.agent.agents.get_mut("guest").unwrap().memory = MemoryMode::Shared;
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["channels.feishu.guest_agent"]);
+        assert!(
+            issues[0].message.contains("memory = \"private\""),
+            "{:?}",
+            issues[0]
+        );
+    }
+
+    #[test]
+    fn a_guest_agent_that_loads_project_files_is_refused() {
+        let mut snapshot = with_guest(Some(vec![]));
+        snapshot
+            .agent
+            .agents
+            .get_mut("guest")
+            .unwrap()
+            .project_files = true;
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["channels.feishu.guest_agent"]);
+        assert!(
+            issues[0].message.contains("project_files = false"),
+            "{:?}",
+            issues[0]
+        );
+    }
+
+    #[test]
+    fn a_private_memory_agent_cannot_also_name_a_memory_scope() {
+        let mut snapshot = snapshot_fixture();
+        let mut profile = komo_kernel::types::agent::AgentProfile::new("scribe");
+        profile.memory = MemoryMode::Private;
+        profile.memory_scope = Some(MemoryScope::Personal);
+        snapshot.agent.agents.insert("scribe".into(), profile);
+        assert_eq!(keys(&validate(&snapshot)), vec!["agents.scribe.memory"]);
     }
 
     #[test]

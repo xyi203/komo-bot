@@ -45,6 +45,8 @@ default_agent = "assistant"
 
 [agents.guest]
 tools = []
+memory = "private"
+project_files = false
 instructions = "你是群里的访客助手。"
 
 [model.main]

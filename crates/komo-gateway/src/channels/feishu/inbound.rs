@@ -72,6 +72,12 @@ pub struct Message {
     /// 渠道共用的类型。
     #[serde(default)]
     pub message_id: String,
+    /// 回复链的根消息。只有回复才有；话题内的消息它就是话题根。
+    #[serde(default)]
+    pub root_id: String,
+    /// 话题 id（`omt_*`）。只有消息属于话题时才有——引用回复有 `root_id` 却没有它。
+    #[serde(default)]
+    pub thread_id: String,
     #[serde(default)]
     pub chat_id: String,
     /// `p2p` / `group`。
@@ -190,13 +196,33 @@ pub fn from_message(
         return None;
     }
 
+    let peer = if is_private {
+        peer_of(chat_id)
+    } else {
+        peer_of(chat_id).in_thread(thread_anchor(&event.message)?)
+    };
+
     Some(InboundMessage {
-        peer: peer_of(chat_id),
+        peer,
         is_private,
         sender: PeerId::new(sender),
         text,
         request_key,
     })
+}
+
+/// 群消息所属话题的根消息 id；`None` = 这条消息没有 id，没法当锚点也没法回复。
+///
+/// 已经在话题里（`thread_id` 与 `root_id` 都有）就是 `root_id`；否则这条消息自己就是
+/// 新话题的根。引用回复只有 `root_id` 没有 `thread_id`：它在主流里，不能把话题挂到被
+/// 引用的老消息上。
+fn thread_anchor(message: &Message) -> Option<&str> {
+    let own = message.message_id.trim();
+    let root = message.root_id.trim();
+    if !message.thread_id.trim().is_empty() && !root.is_empty() {
+        return Some(root);
+    }
+    Some(own).filter(|id| !id.is_empty())
 }
 
 pub fn peer_of(chat_id: &str) -> ChannelPeer {
@@ -263,6 +289,8 @@ mod tests {
             },
             message: Message {
                 message_id: "om_1".into(),
+                root_id: String::new(),
+                thread_id: String::new(),
                 chat_id: chat_id.into(),
                 chat_type: chat_type.into(),
                 message_type: "text".into(),
@@ -371,7 +399,53 @@ mod tests {
         let inbound = from_message(&mentioned, BOT_OPEN_ID, request_key("evt-3")).expect("@了就进");
         assert!(!inbound.is_private);
         assert_eq!(inbound.text, "看一下日志", "占位符要剥掉");
-        assert_eq!(inbound.peer.to_string(), "feishu:oc_g");
+        assert_eq!(inbound.peer.to_string(), "feishu:oc_g#om_1");
+    }
+
+    fn mentioned_group_event() -> MessageEvent {
+        let mut event = message_event("oc_g", "group", "@_user_1 看一下日志");
+        event.message.mentions = vec![mention("@_user_1", BOT_OPEN_ID)];
+        event
+    }
+
+    #[test]
+    fn a_mention_in_the_main_stream_opens_a_thread_rooted_at_itself() {
+        let inbound = from_message(&mentioned_group_event(), BOT_OPEN_ID, request_key("evt-t1"))
+            .expect("@了就进");
+        assert_eq!(inbound.peer.thread, Some(PeerId::new("om_1")));
+    }
+
+    #[test]
+    fn a_mention_inside_a_thread_stays_on_the_topic_root() {
+        let mut event = mentioned_group_event();
+        event.message.message_id = "om_2".into();
+        event.message.thread_id = "omt_x".into();
+        event.message.root_id = "om_root".into();
+        let inbound = from_message(&event, BOT_OPEN_ID, request_key("evt-t2")).expect("@了就进");
+        assert_eq!(inbound.peer.to_string(), "feishu:oc_g#om_root");
+    }
+
+    #[test]
+    fn a_quote_reply_in_the_main_stream_does_not_hang_a_thread_off_the_old_message() {
+        let mut event = mentioned_group_event();
+        event.message.root_id = "om_old".into();
+        let inbound = from_message(&event, BOT_OPEN_ID, request_key("evt-t3")).expect("@了就进");
+        assert_eq!(inbound.peer.thread, Some(PeerId::new("om_1")));
+    }
+
+    #[test]
+    fn a_group_message_without_an_id_cannot_be_anchored() {
+        let mut event = mentioned_group_event();
+        event.message.message_id = String::new();
+        assert!(from_message(&event, BOT_OPEN_ID, request_key("evt-t4")).is_none());
+    }
+
+    #[test]
+    fn a_private_message_never_gets_a_thread() {
+        let mut event = message_event("oc_1", "p2p", "在吗");
+        event.message.root_id = "om_old".into();
+        let inbound = from_message(&event, BOT_OPEN_ID, request_key("evt-t5")).expect("私聊进");
+        assert_eq!(inbound.peer.thread, None);
     }
 
     #[test]

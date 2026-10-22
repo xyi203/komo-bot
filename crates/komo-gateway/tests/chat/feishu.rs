@@ -13,11 +13,18 @@ use std::sync::Arc;
 
 use komo_gateway::channels::ChannelSender;
 use komo_gateway::channels::feishu::{FeishuSender, inbound as feishu_inbound};
+use komo_gateway::service::test_support::Gate;
 use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform};
 
-use crate::harness::{FixedFactory, GatewayBuilder, TestGateway, config_toml, feishu_block};
-use komo_gateway::channels::feishu::fake::{BOT_OPEN_ID, Behavior, FakeOpenApi, text_event};
+use crate::harness::{
+    FakeLlm, FixedFactory, GatewayBuilder, TestGateway, call_round, config_toml, eventually,
+    feishu_block, text_round,
+};
+use komo_gateway::channels::feishu::fake::{
+    BOT_OPEN_ID, Behavior, FakeOpenApi, text_event, text_event_replying,
+};
+use komo_kernel::types::ids::{RunId, SessionId};
 
 struct Wired {
     gateway: TestGateway,
@@ -157,11 +164,13 @@ async fn a_feishu_group_needs_the_list_and_the_mention() {
         .map(|record| record.origin)
         .collect();
     assert!(
-        origins.contains(&"chat:feishu:oc_group".to_string()),
+        origins.contains(&"chat:feishu:oc_group#om_evt-g2".to_string()),
         "{origins:?}"
     );
     assert!(
-        !origins.contains(&"chat:feishu:oc_other".to_string()),
+        !origins
+            .iter()
+            .any(|origin| origin.starts_with("chat:feishu:oc_other")),
         "{origins:?}"
     );
 }
@@ -190,4 +199,119 @@ async fn a_feishu_stranger_leaves_no_delivery() {
         "也没有经投递账发过任何东西"
     );
     let _ = ChannelPeer::new(ChannelPlatform::Feishu, "oc_dm");
+}
+
+fn group_mention(
+    event_id: &str,
+    text: &str,
+    root_id: &str,
+    thread_id: &str,
+) -> (Vec<u8>, InboundMessage) {
+    let payload = text_event_replying(
+        event_id,
+        "oc_group",
+        "group",
+        "ou_op",
+        text,
+        &[("@_user_1", BOT_OPEN_ID)],
+        root_id,
+        thread_id,
+    );
+    let message = decode(&payload, false);
+    (payload, message)
+}
+
+async fn queued(gateway: &TestGateway, message: InboundMessage) -> (SessionId, RunId) {
+    match gateway.handle(message).await {
+        InboundAck::Queued { session, run } => (session, run),
+        other => panic!("应该排队：{other:?}"),
+    }
+}
+
+/// 群里 @ 一次开一个话题、一个话题一个 Session；话题里的所有出站都回到话题里。
+#[tokio::test]
+async fn a_group_mention_opens_a_thread_that_is_its_own_session() {
+    crate::harness::install_crypto();
+    let fake = Arc::new(FakeOpenApi::start(Behavior::default()).await);
+    let sender = Arc::new(FeishuSender::with_api(fake.api()));
+    let gate = Gate::new();
+    let gateway = GatewayBuilder::new(&config_toml(&feishu_block("\"ou_op\"")))
+        .env("KOMO_LLM_API_KEY=test-key\nFEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=test-app-secret\n")
+        .llm(FakeLlm::new(vec![
+            vec![
+                call_round(1, "pc-1", "gate", serde_json::json!({})),
+                text_round(2, "甲好了。"),
+            ],
+            vec![text_round(1, "乙好了。")],
+            vec![text_round(1, "丙好了。")],
+        ]))
+        .tool(gate.tool())
+        .factory(FixedFactory::sender_only(
+            Arc::clone(&sender) as Arc<dyn ChannelSender>
+        ))
+        .start()
+        .await;
+
+    // (a) 主流里 @：话题根就是这条消息，处理中卡片以话题回复发出，结果换在这张卡上。
+    let (_, first) = group_mention("A", "@_user_1 看一下日志", "", "");
+    assert_eq!(first.peer.to_string(), "feishu:oc_group#om_A");
+    let (session_a, run_a) = queued(&gateway, first.clone()).await;
+    gate.wait_entered(1).await;
+    let ticket = sender.expect_run_card(&run_a, &first.peer);
+    let card_id = sender
+        .reply_run_card(ticket, "om_A", true)
+        .await
+        .expect("处理中卡片");
+    gate.release();
+    {
+        let fake = Arc::clone(&fake);
+        let card_id = card_id.clone();
+        eventually("结果换在卡片上", move || {
+            fake.patched_message_ids() == vec![card_id.clone()]
+        })
+        .await;
+    }
+    let replies = fake.calls_to("reply");
+    assert_eq!(replies.len(), 1, "只有那张处理中卡片：{replies:?}");
+    assert_eq!(replies[0]["target"], "om_A");
+    assert_eq!(replies[0]["reply_in_thread"], serde_json::json!(true));
+    assert!(fake.calls_to("messages").is_empty(), "不能发到群主流");
+
+    // (b) 话题里再 @：同一个 Session；没登记卡片，结果以话题回复发到话题根。
+    let (_, second) = group_mention("B", "@_user_1 再看一眼", "om_A", "omt_x");
+    assert_eq!(second.peer, first.peer);
+    let (session_b, _) = queued(&gateway, second).await;
+    assert_eq!(session_b, session_a, "话题里的 @ 落在同一个 Session");
+    {
+        let fake = Arc::clone(&fake);
+        eventually("话题里收到结果", move || {
+            fake.calls_to("reply").len() == 2
+        })
+        .await;
+    }
+    let replies = fake.calls_to("reply");
+    assert_eq!(replies[1]["target"], "om_A");
+    assert_eq!(replies[1]["reply_in_thread"], serde_json::json!(true));
+    assert!(replies[1]["content"].as_str().unwrap().contains("乙好了。"));
+    assert!(fake.calls_to("messages").is_empty(), "不能发到群主流");
+
+    // (c) 主流里另起一条 @：另一个话题、另一个 Session。
+    let (_, third) = group_mention("C", "@_user_1 另一件事", "", "");
+    let (session_c, _) = queued(&gateway, third).await;
+    assert_ne!(session_c, session_a, "另一个话题是另一个 Session");
+
+    let mut origins: Vec<String> = gateway
+        .sessions()
+        .await
+        .into_iter()
+        .map(|record| record.origin)
+        .collect();
+    origins.sort();
+    assert_eq!(
+        origins,
+        vec![
+            "chat:feishu:oc_group#om_A".to_string(),
+            "chat:feishu:oc_group#om_C".to_string()
+        ]
+    );
 }

@@ -8,7 +8,7 @@
 //! | `GET /open-apis/bot/v3/info` | 机器人自己的 `open_id`——群里认 @提及 要用 |
 //! | `POST /open-apis/im/v1/messages` | 发文本 / 发卡片 |
 //! | `PATCH /open-apis/im/v1/messages/{id}` | Run 终态时换掉处理中卡片（§11.3） |
-//! | `POST /open-apis/im/v1/messages/{id}/reply` | 回复原消息发一张处理中卡片 |
+//! | `POST /open-apis/im/v1/messages/{id}/reply` | 回复原消息发一张处理中卡片；`reply_in_thread` 时以话题回复（目标已在话题里就进那个话题）。话题只能这样进：发消息接口不能指定话题 |
 //! | `POST /open-apis/im/v1/messages/{id}/reactions` | 给原消息加表情回复（收到了） |
 //!
 //! 只解析用得到的字段，其余一律忽略：开放平台每月加字段，而一个多出来的键不应该让一
@@ -250,11 +250,14 @@ impl FeishuApi {
     }
 
     /// 回复一条消息，返回回复那条的 `message_id`——Run 终态时要按它原地改。
+    ///
+    /// `in_thread` = 以话题回复；省略键等于 `false`。
     pub async fn reply_message(
         &self,
         message_id: &str,
         msg_type: &str,
         content: &str,
+        in_thread: bool,
     ) -> Result<String, FeishuError> {
         #[derive(Deserialize)]
         struct Sent {
@@ -262,12 +265,16 @@ impl FeishuApi {
             message_id: String,
         }
         let token = self.tenant_token().await?;
+        let mut body = json!({ "msg_type": msg_type, "content": content });
+        if in_thread {
+            body["reply_in_thread"] = json!(true);
+        }
         let sent: Sent = self
             .call_data(
                 reqwest::Method::POST,
                 &format!("/open-apis/im/v1/messages/{message_id}/reply"),
                 Some(&token),
-                Some(json!({ "msg_type": msg_type, "content": content })),
+                Some(body),
             )
             .await?;
         if sent.message_id.is_empty() {
@@ -538,7 +545,7 @@ mod tests {
         let fake = FakeOpenApi::start(Behavior::default()).await;
         let id = fake
             .api()
-            .reply_message("om_origin", "interactive", r#"{"schema":"2.0"}"#)
+            .reply_message("om_origin", "interactive", r#"{"schema":"2.0"}"#, false)
             .await
             .expect("回复");
         assert!(id.starts_with("om_"), "{id}");
@@ -547,6 +554,17 @@ mod tests {
         assert_eq!(replies[0]["target"], "om_origin");
         assert_eq!(replies[0]["msg_type"], "interactive");
         assert_eq!(replies[0]["content"], r#"{"schema":"2.0"}"#);
+        assert!(replies[0].get("reply_in_thread").is_none());
+    }
+
+    #[tokio::test]
+    async fn replying_in_thread_says_so() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        fake.api()
+            .reply_message("om_root", "text", r#"{"text":"在"}"#, true)
+            .await
+            .expect("回复");
+        assert_eq!(fake.calls_to("reply")[0]["reply_in_thread"], true);
     }
 
     #[tokio::test]

@@ -17,7 +17,7 @@ use async_trait::async_trait;
 use tokio::sync::watch;
 
 use komo_kernel::traits::DeliverError;
-use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Outbound, PeerId};
+use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, Outbound};
 use komo_kernel::types::ids::RunId;
 
 use super::api::{FeishuApi, FeishuError};
@@ -51,7 +51,7 @@ enum CardSlot {
 #[derive(Debug)]
 struct RunCard {
     run: RunId,
-    chat_id: String,
+    peer: ChannelPeer,
     slot: Arc<watch::Sender<CardSlot>>,
 }
 
@@ -136,8 +136,7 @@ impl FeishuSender {
                 Ok(SendOutcome::Sent)
             }
             other => {
-                self.send_all(peer.chat_id.as_str(), &feishu::render(&other))
-                    .await?;
+                self.send_all(peer, &feishu::render(&other)).await?;
                 Ok(SendOutcome::Sent)
             }
         }
@@ -147,11 +146,10 @@ impl FeishuSender {
     /// 切好段，这里按顺序发出去，返回每一段的 `message_id`。
     pub async fn send_text(
         &self,
-        chat_id: &PeerId,
+        peer: &ChannelPeer,
         text: &str,
     ) -> Result<Vec<String>, FeishuError> {
-        self.send_all(chat_id.as_str(), &feishu::text_segments(text))
-            .await
+        self.send_all(peer, &feishu::text_segments(text)).await
     }
 
     /// 给原消息加一个"收到了"的表情。
@@ -161,7 +159,7 @@ impl FeishuSender {
 
     /// 登记一张即将发出的 Run 回复卡片。**必须在任何网络调用之前**：终态可能在卡片发出去
     /// 之前就到，那时它要看得见"有一张卡在路上"。
-    pub fn expect_run_card(&self, run: &RunId, chat_id: &PeerId) -> RunCardTicket {
+    pub fn expect_run_card(&self, run: &RunId, peer: &ChannelPeer) -> RunCardTicket {
         let slot = Arc::new(watch::Sender::new(CardSlot::Pending));
         let mut cards = self.run_cards.lock().expect("Run 卡片备忘录锁");
         while cards.len() >= RUN_CARD_MEMO_CAP {
@@ -169,7 +167,7 @@ impl FeishuSender {
         }
         cards.push_back(RunCard {
             run: run.clone(),
-            chat_id: chat_id.as_str().to_string(),
+            peer: peer.clone(),
             slot: Arc::clone(&slot),
         });
         RunCardTicket { slot }
@@ -177,16 +175,20 @@ impl FeishuSender {
 
     /// 回复原消息发"处理中"卡片，并把结果填进登记好的槽位。返回卡片的 `message_id`。
     ///
+    /// `in_thread`：群里的会话都是话题。主流里原消息就是话题根，这一回复开出话题；话题里
+    /// 的消息则直接落进话题。
+    ///
     /// 终态已经等不及、改发了文本时，把刚发出去的卡片收尾成"结果见下方消息"。
     pub async fn reply_run_card(
         &self,
         ticket: RunCardTicket,
         origin: &str,
+        in_thread: bool,
     ) -> Result<String, FeishuError> {
         let pending = RenderedMessage::card(&feishu::run_pending_card());
         let message_id = match self
             .api
-            .reply_message(origin, pending.msg_type, &pending.content)
+            .reply_message(origin, pending.msg_type, &pending.content, in_thread)
             .await
         {
             Ok(message_id) => message_id,
@@ -213,55 +215,66 @@ impl FeishuSender {
         run: &RunId,
         summary: &str,
     ) -> Result<(), FeishuError> {
-        let chat_id = peer.chat_id.as_str();
-        let card_id = match self.take_run_card(run, chat_id) {
+        let card_id = match self.take_run_card(run, peer) {
             Some(slot) => settle(&slot, CARD_SETTLE_WAIT).await,
             None => None,
         };
         let Some(message_id) = card_id else {
-            self.send_all(chat_id, &feishu::text_segments(summary))
-                .await?;
+            self.send_all(peer, &feishu::text_segments(summary)).await?;
             return Ok(());
         };
         let (card, follow) = feishu::run_result_card(summary);
         if let Err(error) = self.api.patch_message(&message_id, &card.to_string()).await {
             tracing::warn!(%run, %error, "飞书：更新 Run 卡片失败，改发文本");
-            self.send_all(chat_id, &feishu::text_segments(summary))
-                .await?;
+            self.send_all(peer, &feishu::text_segments(summary)).await?;
             return Ok(());
         }
-        self.send_all(chat_id, &follow).await?;
+        self.send_all(peer, &follow).await?;
         Ok(())
     }
 
-    fn take_run_card(&self, run: &RunId, chat_id: &str) -> Option<Arc<watch::Sender<CardSlot>>> {
+    fn take_run_card(
+        &self,
+        run: &RunId,
+        peer: &ChannelPeer,
+    ) -> Option<Arc<watch::Sender<CardSlot>>> {
         let mut cards = self.run_cards.lock().expect("Run 卡片备忘录锁");
         let index = cards
             .iter()
-            .position(|card| &card.run == run && card.chat_id == chat_id)?;
+            .position(|card| &card.run == run && &card.peer == peer)?;
         cards.remove(index).map(|card| card.slot)
     }
 
     async fn send_all(
         &self,
-        chat_id: &str,
+        peer: &ChannelPeer,
         messages: &[RenderedMessage],
     ) -> Result<Vec<String>, FeishuError> {
         let mut ids = Vec::with_capacity(messages.len());
         for message in messages {
-            ids.push(self.send_one(chat_id, message).await?);
+            ids.push(self.send_one(peer, message).await?);
         }
         Ok(ids)
     }
 
+    /// 话题只能靠回复话题根进去：发消息接口不能指定话题。
     async fn send_one(
         &self,
-        chat_id: &str,
+        peer: &ChannelPeer,
         message: &RenderedMessage,
     ) -> Result<String, FeishuError> {
-        self.api
-            .send_message(chat_id, message.msg_type, &message.content)
-            .await
+        match &peer.thread {
+            Some(root) => {
+                self.api
+                    .reply_message(root.as_str(), message.msg_type, &message.content, true)
+                    .await
+            }
+            None => {
+                self.api
+                    .send_message(peer.chat_id.as_str(), message.msg_type, &message.content)
+                    .await
+            }
+        }
     }
 }
 
@@ -316,6 +329,10 @@ mod tests {
         ChannelPeer::new(ChannelPlatform::Feishu, chat)
     }
 
+    fn thread_peer(chat: &str, root: &str) -> ChannelPeer {
+        peer(chat).in_thread(root)
+    }
+
     fn sender(fake: &FakeOpenApi) -> FeishuSender {
         FeishuSender::with_api(fake.api())
     }
@@ -327,7 +344,7 @@ mod tests {
         let sender = sender(&fake);
 
         let body = "x".repeat(feishu::MESSAGE_LIMIT * 2 + 1);
-        let ids = sender.send_text(&PeerId::new("oc_1"), &body).await.unwrap();
+        let ids = sender.send_text(&peer("oc_1"), &body).await.unwrap();
         assert_eq!(ids.len(), 3);
 
         let sends = fake.calls_to("messages");
@@ -374,9 +391,9 @@ mod tests {
 
     /// 登记并发出一张处理中卡片，返回它的 `message_id`。
     async fn open_card(fake: &FakeOpenApi, sender: &FeishuSender) -> String {
-        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &PeerId::new("oc_1"));
+        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &peer("oc_1"));
         let message_id = sender
-            .reply_run_card(ticket, "om_origin")
+            .reply_run_card(ticket, "om_origin", false)
             .await
             .expect("处理中卡片");
         let replies = fake.calls_to("reply");
@@ -467,7 +484,7 @@ mod tests {
     async fn a_result_that_beats_its_card_waits_and_still_updates_the_card() {
         let fake = FakeOpenApi::start(Behavior::default()).await;
         let sender = Arc::new(sender(&fake));
-        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &PeerId::new("oc_1"));
+        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &peer("oc_1"));
 
         let finishing = {
             let sender = Arc::clone(&sender);
@@ -481,7 +498,10 @@ mod tests {
         // 终态先到、在槽位上等着；卡片随后才发出去。
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!finishing.is_finished(), "卡片还在路上时终态该等着");
-        let card_id = sender.reply_run_card(ticket, "om_origin").await.unwrap();
+        let card_id = sender
+            .reply_run_card(ticket, "om_origin", false)
+            .await
+            .unwrap();
         finishing.await.unwrap();
 
         assert_eq!(fake.patched_message_ids(), vec![card_id]);
@@ -495,8 +515,13 @@ mod tests {
     async fn a_card_that_never_went_out_lets_the_result_go_as_text_at_once() {
         let fake = FakeOpenApi::start(Behavior::refuse_replies()).await;
         let sender = sender(&fake);
-        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &PeerId::new("oc_1"));
-        assert!(sender.reply_run_card(ticket, "om_origin").await.is_err());
+        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &peer("oc_1"));
+        assert!(
+            sender
+                .reply_run_card(ticket, "om_origin", false)
+                .await
+                .is_err()
+        );
 
         let started = std::time::Instant::now();
         sender
@@ -515,16 +540,19 @@ mod tests {
     async fn a_card_that_arrives_after_the_result_gave_up_is_closed_not_left_pending() {
         let fake = FakeOpenApi::start(Behavior::default()).await;
         let sender = sender(&fake);
-        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &PeerId::new("oc_1"));
+        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &peer("oc_1"));
 
         // 终态等满了也没等到：槽位标成 GaveUp，改发文本。
         let slot = sender
-            .take_run_card(&RunId::from_raw("run-1"), "oc_1")
+            .take_run_card(&RunId::from_raw("run-1"), &peer("oc_1"))
             .expect("登记过");
         assert_eq!(settle(&slot, Duration::from_millis(10)).await, None);
 
         // 卡片这才发出去：它自己收尾成"结果见下方消息"。
-        let card_id = sender.reply_run_card(ticket, "om_origin").await.unwrap();
+        let card_id = sender
+            .reply_run_card(ticket, "om_origin", false)
+            .await
+            .unwrap();
         assert_eq!(fake.patched_message_ids(), vec![card_id]);
         assert!(
             patched_card(&fake, 0)
@@ -564,6 +592,83 @@ mod tests {
         let sends = fake.calls_to("messages");
         assert_eq!(sends[0]["msg_type"], "text");
         assert_eq!(sends[0]["content"], json!({ "text": "跑完了" }).to_string());
+        assert!(fake.calls_to("patch").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_text_to_a_thread_peer_replies_on_the_root() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        sender(&fake)
+            .send(
+                &thread_peer("oc_g", "om_root"),
+                Outbound::Text { text: "在".into() },
+            )
+            .await
+            .unwrap();
+        let replies = fake.calls_to("reply");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["target"], "om_root");
+        assert_eq!(replies[0]["reply_in_thread"], json!(true));
+        assert_eq!(replies[0]["content"], json!({ "text": "在" }).to_string());
+        assert!(fake.calls_to("messages").is_empty(), "不能发到群主流");
+    }
+
+    #[tokio::test]
+    async fn a_text_to_a_peer_without_a_thread_still_creates_a_message() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        sender(&fake)
+            .send(&peer("oc_1"), Outbound::Text { text: "在".into() })
+            .await
+            .unwrap();
+        assert_eq!(fake.calls_to("messages").len(), 1);
+        assert!(fake.calls_to("reply").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_thread_result_without_a_card_falls_back_to_a_threaded_reply() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        sender(&fake)
+            .send(&thread_peer("oc_g", "om_root"), run_finished("跑完了"))
+            .await
+            .unwrap();
+        let replies = fake.calls_to("reply");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0]["target"], "om_root");
+        assert_eq!(replies[0]["reply_in_thread"], json!(true));
+        assert!(fake.calls_to("messages").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pending_card_for_a_thread_peer_replies_in_thread() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let sender = sender(&fake);
+        let target = thread_peer("oc_g", "om_root");
+        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &target);
+        let card_id = sender
+            .reply_run_card(ticket, "om_root", true)
+            .await
+            .unwrap();
+        let replies = fake.calls_to("reply");
+        assert_eq!(replies[0]["target"], "om_root");
+        assert_eq!(replies[0]["reply_in_thread"], json!(true));
+
+        sender.send(&target, run_finished("跑完了")).await.unwrap();
+        assert_eq!(fake.patched_message_ids(), vec![card_id]);
+        assert_eq!(fake.calls_to("reply").len(), 1, "结果换卡，不再回复");
+    }
+
+    #[tokio::test]
+    async fn a_result_in_another_thread_does_not_touch_this_threads_card() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let sender = sender(&fake);
+        let ticket =
+            sender.expect_run_card(&RunId::from_raw("run-1"), &thread_peer("oc_g", "om_a"));
+        sender.reply_run_card(ticket, "om_a", true).await.unwrap();
+
+        sender
+            .send(&thread_peer("oc_g", "om_b"), run_finished("跑完了"))
+            .await
+            .unwrap();
         assert!(fake.calls_to("patch").is_empty());
     }
 }

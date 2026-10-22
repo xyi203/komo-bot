@@ -252,20 +252,23 @@ impl FeishuChannel {
     /// 登记在这里同步做，联网放进后台任务：`serve` 逐条处理事件，两次平台往返不该压住
     /// 下一条消息。
     fn acknowledge_run(&self, peer: &ChannelPeer, origin: String, run: &RunId) {
-        let ticket = self.sender.expect_run_card(run, &peer.chat_id);
+        let ticket = self.sender.expect_run_card(run, peer);
         let sender = Arc::clone(&self.sender);
         let peer = peer.clone();
         let run = run.clone();
         tokio::spawn(async move {
             react(Arc::clone(&sender), origin.clone()).await;
-            if let Err(error) = sender.reply_run_card(ticket, &origin).await {
+            if let Err(error) = sender
+                .reply_run_card(ticket, &origin, peer.thread.is_some())
+                .await
+            {
                 tracing::warn!(%peer, %run, %error, "飞书：处理中卡片没发出去，终态改发文本");
             }
         });
     }
 
     async fn reply(&self, peer: &ChannelPeer, text: &str) {
-        if let Err(error) = self.sender.send_text(&peer.chat_id, text).await {
+        if let Err(error) = self.sender.send_text(peer, text).await {
             tracing::warn!(%peer, %error, "飞书：回执没送出去");
         }
     }

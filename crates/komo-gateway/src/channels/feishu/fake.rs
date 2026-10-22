@@ -302,10 +302,39 @@ pub fn text_event(
     text: &str,
     mentions: &[(&str, &str)],
 ) -> Vec<u8> {
+    text_event_replying(event_id, chat_id, chat_type, sender, text, mentions, "", "")
+}
+
+/// 带 `root_id` / `thread_id` 的消息：群里话题内的消息两个都有，引用回复只有 `root_id`。
+/// 空串 = 平台没带这个键。
+#[allow(clippy::too_many_arguments)]
+pub fn text_event_replying(
+    event_id: &str,
+    chat_id: &str,
+    chat_type: &str,
+    sender: &str,
+    text: &str,
+    mentions: &[(&str, &str)],
+    root_id: &str,
+    thread_id: &str,
+) -> Vec<u8> {
     let mentions: Vec<Value> = mentions
         .iter()
         .map(|(key, open_id)| json!({ "key": key, "id": { "open_id": open_id }, "name": "komo" }))
         .collect();
+    let mut message = json!({
+        "message_id": format!("om_{event_id}"),
+        "chat_id": chat_id,
+        "chat_type": chat_type,
+        "message_type": "text",
+        "content": json!({ "text": text }).to_string(),
+        "mentions": mentions,
+    });
+    for (key, value) in [("root_id", root_id), ("thread_id", thread_id)] {
+        if !value.is_empty() {
+            message[key] = json!(value);
+        }
+    }
     json!({
         "schema": "2.0",
         "header": {
@@ -316,14 +345,7 @@ pub fn text_event(
         },
         "event": {
             "sender": { "sender_id": { "open_id": sender }, "sender_type": "user" },
-            "message": {
-                "message_id": format!("om_{event_id}"),
-                "chat_id": chat_id,
-                "chat_type": chat_type,
-                "message_type": "text",
-                "content": json!({ "text": text }).to_string(),
-                "mentions": mentions,
-            },
+            "message": message,
         },
     })
     .to_string()

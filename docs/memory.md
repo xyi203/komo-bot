@@ -56,7 +56,7 @@
 
 用户主动保存到 Memos 表示“要求保留这段内容”，其中可能有引用、假设或待办，不等于确认了其中每一句话。只有用户明确确认的具体陈述才能获得 user_confirmed。
 
-**`agent:<id>` 是那个 Agent 的私有作用域（2026-10-22）。** 只有 Profile 写 `memory = "private"` 的那个 Agent 召回、提取得到它；不限作用域的召回与提取候选（`shared` 且没写 `memory_scope`）放行除 `agent:*` 之外的全部；两路检索都在排名、截断之前按作用域过滤（`scope_allowed`），一个作用域灌再多也挤不掉别的作用域的候选名额。`private` 的提取结果一律落在 `agent:<id>`，模型交回别的作用域也改写过去；`shared` 的提取交回 `agent:*` 丢弃。用途是群里的访客（`docs/komo_bot.md` §11.3）：陌生人的话只进访客自己的记忆，碰不到操作者的，也不会被操作者的 Agent 召回成一条注入通道。操作者的 CLI 显式 `--scope agent:<id>` 照常读写。
+**`agent:<id>` 是那个 Agent 的私有作用域（2026-10-22）。** 只有 Profile 写 `memory = "private"` 的那个 Agent 召回、提取得到它；不限作用域的召回与提取候选（`shared` 且没写 `memory_scope`）放行除 `agent:*` 之外的全部；两路检索都在排名、截断之前按作用域过滤（`scope_allowed`），一个作用域灌再多也挤不掉别的作用域的候选名额。`private` 的提取结果一律落在 `agent:<id>`，模型交回别的作用域也改写过去；`shared` 的提取交回 `agent:*` 丢弃。用途是给别人用的 Agent：别人的话只进它自己的记忆，碰不到操作者的，也不会被操作者的 Agent 召回成一条注入通道。操作者的 CLI 显式 `--scope agent:<id>` 照常读写。
 
 NAS 和 Mac 的自动 Memory 各自独立。项目作用域使用实例内稳定的项目 ID，可映射多个临时仓库副本；工作路径相似不自动意味着同一项目。
 

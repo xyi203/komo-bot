@@ -400,13 +400,20 @@ fn reject(msg: &InboundMessage) -> InboundAck {
     InboundAck::Rejected {
         hint: format!(
             "这台 komo 只听它的操作者。把 {} 加进 config.toml 的 [channels.{}] allow_from 就可以了（当前会话：{}）。",
-            msg.sender, msg.peer.platform, msg.peer
+            msg.sender,
+            msg.peer.platform,
+            config_chat(msg)
         ),
     }
 }
 
 fn id_reply(msg: &InboundMessage) -> String {
-    format!("会话：{}\n发送者：{}", msg.peer, msg.sender)
+    format!("会话：{}\n发送者：{}", config_chat(msg), msg.sender)
+}
+
+/// 抄进 `groups` / `home_chat` 的那个串：不带话题，那两项只认会话本身。
+fn config_chat(msg: &InboundMessage) -> ChannelPeer {
+    ChannelPeer::new(msg.peer.platform, msg.peer.chat_id.as_str())
 }
 
 /// 决定时刻，按本地可读的样子。
@@ -648,6 +655,22 @@ mod tests {
     fn a_bot_suffix_and_case_do_not_hide_a_command() {
         assert_eq!(parse_command("/Status@komo_bot"), Some(ChatCommand::Status));
         assert_eq!(parse_command("  /id  "), Some(ChatCommand::Id));
+    }
+
+    #[test]
+    fn id_echoes_the_chat_without_the_thread() {
+        let msg = InboundMessage {
+            peer: ChannelPeer::new(ChannelPlatform::Feishu, "oc_g").in_thread("om_1"),
+            is_private: false,
+            sender: PeerId::new("ou_x"),
+            text: "/id".into(),
+            request_key: RequestKey::new("feishu:evt"),
+        };
+        assert_eq!(id_reply(&msg), "会话：feishu:oc_g\n发送者：ou_x");
+        let InboundAck::Rejected { hint } = reject(&msg) else {
+            unreachable!()
+        };
+        assert!(hint.contains("当前会话：feishu:oc_g）"), "{hint}");
     }
 
     #[test]

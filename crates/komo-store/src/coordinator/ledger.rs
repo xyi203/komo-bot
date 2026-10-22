@@ -1794,6 +1794,66 @@ mod tests {
         );
     }
 
+    /// 受理时就说了不进记忆（`skip_memory`，TUI 的 `!` 直跑命令）的 Run，结束时不会被
+    /// 终态写入改回 pending——不管是正常结束还是没有终态事件的那次取消。
+    #[tokio::test]
+    async fn a_run_accepted_without_memory_stays_out_of_extraction_after_it_ends() {
+        use komo_kernel::types::memory::MemoryWork;
+
+        let f = fixture().await;
+        let completed = f
+            .coordinator
+            .accept_input(AcceptInput {
+                skip_memory: true,
+                ..input("api:1", "!ls", &f.session)
+            })
+            .await
+            .unwrap();
+        f.coordinator
+            .complete(
+                &completed.run,
+                RunEnd::Completed {
+                    final_message: Some("a.txt".into()),
+                    rounds: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let stopped = f
+            .coordinator
+            .accept_input(AcceptInput {
+                skip_memory: true,
+                ..input("api:2", "!pwd", &f.session)
+            })
+            .await
+            .unwrap();
+        crate::repos::runs::stop_without_event(
+            &f.db,
+            &f.session,
+            &stopped.run,
+            RunState::Cancelled,
+            None,
+            time::macros::datetime!(2026-09-15 08:01:00 UTC),
+        )
+        .await
+        .unwrap();
+
+        for run in [&completed.run, &stopped.run] {
+            let record = crate::repos::runs::get(&f.db, run).await.unwrap().unwrap();
+            assert!(record.state.is_terminal());
+            assert_eq!(record.memory_work, MemoryWork::Done, "{run}");
+        }
+        let claimed = crate::repos::runs::claim_memory_work(
+            &f.db,
+            time::macros::datetime!(2100-01-01 00:00:00 UTC),
+            time::Duration::ZERO,
+            8,
+        )
+        .await
+        .unwrap();
+        assert!(claimed.is_empty(), "不该被提取批次领走：{claimed:?}");
+    }
+
     /// 同一请求键重发返回原 Run；内容哈希不同则拒绝（§8.5）。
     #[tokio::test]
     async fn the_same_request_key_returns_the_same_run_and_refuses_different_content() {

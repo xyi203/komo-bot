@@ -552,7 +552,12 @@ pub async fn mark_waiting_in(
     write_wait_in(ex, &mut row, wait, reason, now).await
 }
 
-/// 终态，连同最终事件引用与 Memory 待处理标记（§8.5 的"结束任务"）。
+/// 终态，连同最终事件引用（§8.5 的"结束任务"）。
+///
+/// **不碰 `memory_work`**：进不进记忆整理是受理时定的（[`reserve_in`]，`skip_memory` 记
+/// `done`，其余 `pending`），Run 没到终态前领取不会动它（[`claim_memory_work`] 只领没有
+/// 未终态 Run 的会话），所以这里原样留着就是受理时的决定。取消与失败照样是 `pending`：
+/// 后台自己判断有没有可提取的证据。
 pub async fn mark_final_in(
     ex: &mut dyn Executor,
     run: &RunId,
@@ -572,9 +577,6 @@ pub async fn mark_final_in(
         .final_event(Some(final_event.to_string()))
         .rounds(i64::from(rounds))
         .last_error(reason)
-        // 「run.completed 在 JSONL 持久保存后，state.db 提交终态与 memory_work =
-        // pending」（§9.3）。取消与失败也标：后台自己判断有没有可提取的证据。
-        .memory_work(memory_work_str(MemoryWork::Pending))
         .ended_at(to_ts(now))
         .updated_at(to_ts(now))
         .exec(ex)
@@ -587,6 +589,9 @@ pub async fn mark_final_in(
 /// 是 [`super::derive`] 的一支——实时提交与 backfill 走同一处，所以"JSONL 写了、库还没
 /// 提交"那一刻崩掉，重启补齐时这一行照样落成 `absorbed`。**已经是终态的不动**：并入之前
 /// 那一瞬间它要是已经被取消了，取消算数（§8.5：回放不能覆盖已记下的取消）。
+///
+/// `memory_work` 与 [`mark_final_in`] 一样留着受理时的值：它自己那句话是用户陈述，照常
+/// 进记忆整理（§9.3）；回答在宿主那里。
 pub async fn mark_absorbed_in(
     ex: &mut dyn Executor,
     run: &RunId,
@@ -604,8 +609,6 @@ pub async fn mark_absorbed_in(
         .wake_at(0_i64)
         .claimed_by(None as Option<String>)
         .final_event(Some(event.to_string()))
-        // 它自己那句话是用户陈述，照常进记忆整理（§9.3）；回答在宿主那里。
-        .memory_work(memory_work_str(MemoryWork::Pending))
         .ended_at(to_ts(now))
         .updated_at(to_ts(now))
         .exec(ex)
@@ -636,7 +639,6 @@ pub async fn mark_final_without_event_in(
         .wake_at(0_i64)
         .rounds(i64::from(rounds))
         .last_error(reason)
-        .memory_work(memory_work_str(MemoryWork::Pending))
         .ended_at(to_ts(now))
         .updated_at(to_ts(now))
         .exec(ex)

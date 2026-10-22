@@ -65,7 +65,7 @@ MemoryManager 对 AgentRuntime 提供三个主要入口：recall、process_compl
 处理流程：
 
 ```text
-run.completed 在 JSONL 持久保存后，state.db 提交终态与 memory_work = pending；索引补齐时也幂等补上该标记
+受理时登记 memory_work = pending（`skip_memory` 的 Run 直接记 done）；run.completed 在 JSONL 持久保存后 state.db 提交终态，终态写入不改这一列
   → 会话空闲满 `[memory].extract_idle` 后，后台一次领走该会话全部尚未处理的 Run（§9.10）
   → 提取前整批召回已有记忆一次（§9.10）
   → 记忆模型一次调用提取结构化候选并判与编号旧条目的关系，不提供执行工具

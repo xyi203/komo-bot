@@ -29,7 +29,7 @@ async fn run_and_learn(scripts: Vec<Vec<Round>>, text: &str) -> (TestGateway, Sc
 
     let (_session, run) = crate::a_run(&gateway, "rk-1", text).await;
 
-    // 等这一轮到终态——`mark_final_in` 就是在那一刻把 `memory_work` 标成 pending 的。
+    // 等这一轮到终态——`memory_work` 受理时就是 pending，终态之后会话才能被领取。
     wait_for_terminal(&gateway, &run).await;
 
     let record = komo_store::repos::runs::get(&gateway.state().db, &run)

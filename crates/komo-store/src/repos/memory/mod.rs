@@ -23,6 +23,7 @@ use komo_kernel::types::digest::ContentHash;
 use komo_kernel::types::ids::{MemoryId, RunId};
 use komo_kernel::types::memory::{
     Evidence, MemoryItem, MemoryScope, MemoryState, RecallQuery, RecallResult, RetrievalMode,
+    scope_allowed,
 };
 use komo_kernel::types::model::Vector;
 use time::OffsetDateTime;
@@ -646,9 +647,6 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
         if !query.admits(&item) {
             continue;
         }
-        if !komo_kernel::types::memory::scope_allowed(&query.scopes, &item.scope) {
-            continue;
-        }
         items.push(item);
         if items.len() >= query.top_k.max(1) as usize {
             break;
@@ -691,19 +689,31 @@ async fn keyword_arm(
     let mut scores: std::collections::BTreeMap<String, f64> = Default::default();
     for token in &tokens {
         let needle = format!(" {token} ");
-        let rows =
-            toasty::sql::query("SELECT memory_id FROM memory_terms WHERE instr(terms, ?1) > 0")
-                .bind(needle)
-                .exec(ex)
-                .await
-                .map_err(map_toasty)?;
+        let rows = toasty::sql::query(
+            "SELECT t.memory_id, i.scope FROM memory_terms t \
+             JOIN memory_items i ON i.id = t.memory_id WHERE instr(t.terms, ?1) > 0",
+        )
+        .bind(needle)
+        .exec(ex)
+        .await
+        .map_err(map_toasty)?;
+        // IDF 的统计保持全局（含不放行的作用域）：它只决定词之间的相对权重，作用域过滤在
+        // 下面、排名之前，灌水改不了谁进候选名额。
         let hits = rows.len().max(1) as f64;
         // 平滑的 IDF：常见 token 几乎不加分，罕见 token 加得多。
         let idf = (1.0 + (total_rows + 1.0) / (hits + 1.0)).ln();
         for row in &rows {
-            if let Some(id) = crate::db::column_string(row, 0) {
-                *scores.entry(id).or_insert(0.0) += idf;
+            let (Some(id), Some(scope)) = (
+                crate::db::column_string(row, 0),
+                crate::db::column_string(row, 1),
+            ) else {
+                continue;
+            };
+            // 作用域在排名与截断**之前**过滤（§9.4）：别的作用域灌满命中也挤不掉这一边。
+            if !scope_allowed(&query.scopes, &decode(&scope, "memory_items.scope")?) {
+                continue;
             }
+            *scores.entry(id).or_insert(0.0) += idf;
         }
     }
 
@@ -762,7 +772,7 @@ async fn vector_arm(
     }
 
     let rows = toasty::sql::query(
-        "SELECT v.memory_id, v.dimensions, v.vector FROM memory_vectors v \
+        "SELECT v.memory_id, v.dimensions, v.vector, i.scope FROM memory_vectors v \
          JOIN memory_items i ON i.id = v.memory_id AND i.revision = v.revision \
          AND i.content_hash = v.content_hash \
          WHERE v.generation = ?1 AND i.state != 'forgotten'",
@@ -787,13 +797,18 @@ async fn vector_arm(
 
     let mut scored: Vec<(String, f32)> = Vec::with_capacity(rows.len());
     for row in &rows {
-        let (Some(id), Some(dimensions), Some(bytes)) = (
+        let (Some(id), Some(dimensions), Some(bytes), Some(scope)) = (
             crate::db::column_string(row, 0),
             column_i64(row, 1),
             crate::db::column_bytes(row, 2),
+            crate::db::column_string(row, 3),
         ) else {
             continue;
         };
+        // 先过作用域再算分、再截断。
+        if !scope_allowed(&query.scopes, &decode(&scope, "memory_items.scope")?) {
+            continue;
+        }
         // 截断或结构错误的向量不接受（§9.5）——跳过，不拿半截去比。
         let Some(values) = decode_vector(&bytes, dimensions.max(0) as usize) else {
             tracing::warn!(memory = %id, "向量长度与声明的维度对不上，跳过");
@@ -1010,6 +1025,59 @@ mod tests {
             agent_id: "guest".into(),
         }];
         assert_eq!(ids(repo.recall(&own).await.unwrap()), ["m-3"]);
+    }
+
+    /// 一边的作用域灌满了同一个查询的命中，另一边的也不会被挤出候选名额：作用域在两条臂
+    /// 排名**之前**过滤，不是排名截断之后再筛。
+    #[tokio::test]
+    async fn a_flooded_scope_cannot_crowd_another_scope_out_of_the_candidates() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        let guest = MemoryScope::Agent {
+            agent_id: "guest".into(),
+        };
+        // 访客那五条三个词都命中，操作者那条只命中一个：不过滤的话前两名全是访客的。
+        for (index, tail) in ["甲", "乙", "丙", "丁", "戊"].iter().enumerate() {
+            let mut flood = item(
+                &format!("g-{index}"),
+                &format!("空调温度调到很高{tail}"),
+                MemoryState::Active,
+            );
+            flood.scope = guest.clone();
+            repo.put(flood, None).await.unwrap();
+        }
+        repo.put(item("p-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        let mut tight = query("空调温度", RetrievalMode::Keyword);
+        tight.candidate_limit = 2;
+
+        let unscoped = repo.recall(&tight).await.unwrap();
+        let ids: Vec<_> = unscoped.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["p-1"], "操作者的记忆被访客灌水挤掉了");
+
+        // 反过来：访客自己的召回，不被操作者那边的大量命中挤掉。
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        for (index, tail) in ["甲", "乙", "丙", "丁", "戊"].iter().enumerate() {
+            repo.put(
+                item(
+                    &format!("p-{index}"),
+                    &format!("空调温度调到很高{tail}"),
+                    MemoryState::Active,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        let mut own = item("g-1", "访客说空调设 28 度", MemoryState::Active);
+        own.scope = guest.clone();
+        repo.put(own, None).await.unwrap();
+        tight.scopes = vec![guest];
+        let result = repo.recall(&tight).await.unwrap();
+        let ids: Vec<_> = result.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["g-1"], "访客的记忆被操作者那边的命中挤掉了");
     }
 
     #[tokio::test]
@@ -1366,6 +1434,47 @@ mod tests {
         assert_eq!(hit.items.len(), 2);
         assert_eq!(hit.items[0].id.as_str(), "m-1", "方向最近的在前");
         assert_eq!(hit.vector_coverage, Some(1.0));
+    }
+
+    /// 向量臂同样先过作用域再取候选：访客那边方向更近的五条，挤不掉操作者的那一条。
+    #[tokio::test]
+    async fn a_flooded_scope_cannot_crowd_another_scope_out_of_the_vector_candidates() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put_generation("gen-1", Some(&space(2)), IndexState::Ready, true)
+            .await
+            .unwrap();
+        let put = |id: &str, scope: MemoryScope, vector: [f32; 2]| {
+            let mut it = item(id, &format!("记忆 {id}"), MemoryState::Active);
+            it.scope = scope;
+            (id.to_string(), it, vector)
+        };
+        let guest = MemoryScope::Agent {
+            agent_id: "guest".into(),
+        };
+        let mut rows: Vec<_> = (0..5)
+            .map(|n| put(&format!("g-{n}"), guest.clone(), [1.0, 0.0]))
+            .collect();
+        rows.push(put("p-1", MemoryScope::Personal, [0.6, 0.8]));
+        for (id, it, vector) in rows {
+            repo.put(it, None).await.unwrap();
+            repo.put_vector(&MemoryId::from_raw(id), 1, "gen-1", Vector(vector.to_vec()))
+                .await
+                .unwrap();
+        }
+        let mut probe = vector_query(RetrievalMode::Vector, &[1.0, 0.0]);
+        probe.candidate_limit = 2;
+
+        let unscoped = repo.recall(&probe).await.unwrap();
+        let ids: Vec<_> = unscoped.items.iter().map(|i| i.id.as_str()).collect();
+        assert_eq!(ids, ["p-1"]);
+
+        let mut flooded = vector_query(RetrievalMode::Vector, &[0.6, 0.8]);
+        flooded.scopes = vec![guest];
+        flooded.candidate_limit = 2;
+        let own = repo.recall(&flooded).await.unwrap();
+        assert_eq!(own.items.len(), 2, "访客自己的召回只在自己的作用域里取");
+        assert!(own.items.iter().all(|i| i.id.as_str().starts_with("g-")));
     }
 
     /// **修改记忆时旧 revision 不召回**（§14 的验收列第五条）。

@@ -353,6 +353,10 @@ async fn a_guest_run_sees_no_tools_its_own_memory_only_and_no_project_files() {
     assert!(!operator.tools.is_empty(), "操作者有工具");
     assert!(operator.system_prompt.contains(MEMORY_FACT));
     assert!(operator.system_prompt.contains(PROJECT_RULE));
+    assert!(
+        !operator.system_prompt.contains(GUEST_FACT),
+        "访客写的私有记忆不进操作者的 Agent"
+    );
 
     let guest = by(&guest);
     assert!(guest.tools.is_empty(), "访客没有工具：{:?}", guest.tools);

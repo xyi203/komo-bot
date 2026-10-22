@@ -12,7 +12,7 @@ use komo_kernel::protocol::config::{
 };
 use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::chat::{ChannelPlatform, PeerId};
-use komo_kernel::types::memory::RetrievalMode;
+use komo_kernel::types::memory::{MemoryScope, RetrievalMode};
 use komo_kernel::types::model::{CatalogModel, EmbeddingConfig, ModelConfig};
 
 use super::effort::EffortCapabilities;
@@ -549,6 +549,12 @@ fn check_agents(snapshot: &ConfigSnapshot, issues: &mut Vec<ConfigIssue>) {
                 "写了 instructions 就不能是空的；不想要就整行去掉",
             ));
         }
+        if matches!(profile.memory_scope, Some(MemoryScope::Agent { .. })) {
+            issues.push(error(
+                &format!("agents.{id}.memory_scope"),
+                "agent:<id> 是私有记忆的作用域，只能由 memory = \"private\" 的那个 Agent 自己使用",
+            ));
+        }
         if profile.memory == MemoryMode::Private && profile.memory_scope.is_some() {
             issues.push(error(
                 &format!("agents.{id}.memory"),
@@ -732,7 +738,6 @@ mod tests {
     use super::*;
     use crate::config::testing::snapshot_fixture;
     use komo_kernel::protocol::config::{McpServerConfig, McpTransport};
-    use komo_kernel::types::memory::MemoryScope;
     use komo_kernel::types::model::Effort;
 
     fn keys(issues: &[ConfigIssue]) -> Vec<&str> {
@@ -958,6 +963,20 @@ mod tests {
         profile.memory_scope = Some(MemoryScope::Personal);
         snapshot.agent.agents.insert("scribe".into(), profile);
         assert_eq!(keys(&validate(&snapshot)), vec!["agents.scribe.memory"]);
+    }
+
+    #[test]
+    fn a_memory_scope_naming_an_agent_scope_is_refused() {
+        let mut snapshot = snapshot_fixture();
+        let mut profile = komo_kernel::types::agent::AgentProfile::new("scribe");
+        profile.memory_scope = Some(MemoryScope::Agent {
+            agent_id: "guest".into(),
+        });
+        snapshot.agent.agents.insert("scribe".into(), profile);
+        assert_eq!(
+            keys(&validate(&snapshot)),
+            vec!["agents.scribe.memory_scope"]
+        );
     }
 
     #[test]

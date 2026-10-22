@@ -646,7 +646,7 @@ async fn recall_in(ex: &mut dyn Executor, query: &RecallQuery) -> Result<RecallR
         if !query.admits(&item) {
             continue;
         }
-        if !query.scopes.is_empty() && !query.scopes.contains(&item.scope) {
+        if !komo_kernel::types::memory::scope_allowed(&query.scopes, &item.scope) {
             continue;
         }
         items.push(item);
@@ -969,6 +969,47 @@ mod tests {
             query_vector: None,
             include_states: vec![],
         }
+    }
+
+    /// 不写作用域 = 除各 Agent 私有作用域之外的全部；显式写了 `agent:<id>` 才看得到那一格。
+    #[tokio::test]
+    async fn an_unscoped_recall_never_returns_an_agent_private_memory() {
+        let (db, _dir) = temp().await;
+        let repo = TursoMemoryRepo::new(db);
+        repo.put(item("m-1", "客厅空调设 26 度", MemoryState::Active), None)
+            .await
+            .unwrap();
+        let mut project = item("m-2", "书房空调设 24 度", MemoryState::Active);
+        project.scope = MemoryScope::Project {
+            project_id: "home".into(),
+        };
+        repo.put(project, None).await.unwrap();
+        let mut guest = item("m-3", "访客说卧室空调设 28 度", MemoryState::Active);
+        guest.scope = MemoryScope::Agent {
+            agent_id: "guest".into(),
+        };
+        repo.put(guest, None).await.unwrap();
+
+        let ids = |result: komo_kernel::types::memory::RecallResult| {
+            let mut ids: Vec<String> = result
+                .items
+                .iter()
+                .map(|item| item.id.as_str().to_string())
+                .collect();
+            ids.sort();
+            ids
+        };
+        let open = repo
+            .recall(&query("空调", RetrievalMode::Keyword))
+            .await
+            .unwrap();
+        assert_eq!(ids(open), ["m-1", "m-2"]);
+
+        let mut own = query("空调", RetrievalMode::Keyword);
+        own.scopes = vec![MemoryScope::Agent {
+            agent_id: "guest".into(),
+        }];
+        assert_eq!(ids(repo.recall(&own).await.unwrap()), ["m-3"]);
     }
 
     #[tokio::test]

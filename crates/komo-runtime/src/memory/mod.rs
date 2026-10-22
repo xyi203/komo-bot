@@ -50,7 +50,7 @@ use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{
     Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallDiagnostics, RecallQuery,
-    RecallResult, RetrievalMode,
+    RecallResult, RetrievalMode, scope_allowed,
 };
 use komo_kernel::types::model::{EmbeddingSpace, InputKind, ModelConfig, Vector};
 use komo_kernel::types::turn::{LlmError, MemoryUse};
@@ -763,6 +763,9 @@ impl MemoryManager {
         }
         let now = self.clock.now();
         let mut items = self.revalidate(carried, now).await;
+        // 带过来的旧注入也要落在**现在**放行的作用域里：模式或作用域改过、或者那一条本来
+        // 就不该被这个 Agent 看见（别的 Agent 的私有记忆）的，掉出去重新召回。
+        items.retain(|item| scope_allowed(scopes, &item.scope));
         let mut diagnostics = RecallDiagnostics::default();
 
         if items.is_empty() && !text.trim().is_empty() {
@@ -853,7 +856,7 @@ impl MemoryManager {
         // 这一条是验收项（`a_forgotten_memory_never_comes_back_into_a_turn`），不是优化
         // 可以牺牲的东西。
         let pinned = match pinned {
-            Some(pinned) if self.pin_still_valid(&pinned, now).await => Some(pinned),
+            Some(pinned) if self.pin_still_valid(&pinned, scopes, now).await => Some(pinned),
             Some(pinned) => {
                 tracing::info!(
                     %session,
@@ -933,10 +936,16 @@ impl MemoryManager {
     /// 读的人知道引用的是哪一版），本段结束后自然换过来。
     ///
     /// 代价是每个 Run 至多 `top_k` 次按 id 的短读；不涉及 embedding，也不涉及向量检索。
-    async fn pin_still_valid(&self, injection: &Injection, now: OffsetDateTime) -> bool {
+    async fn pin_still_valid(
+        &self,
+        injection: &Injection,
+        scopes: &[MemoryScope],
+        now: OffsetDateTime,
+    ) -> bool {
         for use_ in &injection.uses {
             match self.repo.get(&use_.memory).await {
-                Ok(Some(item)) if item.is_recallable_at(now) => {}
+                Ok(Some(item))
+                    if item.is_recallable_at(now) && scope_allowed(scopes, &item.scope) => {}
                 Ok(_) => return false,
                 Err(error) => {
                     // 读不出来 ≠ 没问题：宁可按失效处理，下一段重算（§8.5 一贯的口径）。
@@ -1236,7 +1245,7 @@ impl MemoryManager {
                     for use_ in transcript.injected() {
                         if let Ok(Some(item)) = self.repo.get(&use_.memory).await
                             && item.revision == use_.revision
-                            && confined.as_ref().is_none_or(|scope| &item.scope == scope)
+                            && scope_allowed(&scopes, &item.scope)
                         {
                             injected.push(item);
                         }

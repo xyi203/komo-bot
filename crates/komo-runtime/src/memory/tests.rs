@@ -3571,6 +3571,7 @@ async fn a_guest_session_is_not_skipped_by_its_kind_alone() {
     assert_eq!(harness.llm.requests.lock().unwrap().len(), 1);
 }
 
+const GUEST_TEXT: &str = "访客在群里说空调温度要开二十八度";
 const OPERATOR_SECRET: &str = "操作者的空调固定设二十六度";
 
 /// 一条放在 Personal 的操作者记忆，直接写进仓库（不走会话证据）。
@@ -3656,8 +3657,16 @@ async fn a_shared_batch_does_list_operator_memories_as_candidates() {
             "操作者的空调温度是多少，我喜欢深色主题",
         )],
     );
+    // 访客私有的那一条同样能被关键词命中，但 shared 的批次看不到它。
+    let mut stranger = memory("guest-1", GUEST_TEXT);
+    stranger.scope = guest_scope();
+    harness.repo.put(stranger, None).await.unwrap();
     harness.manager.process_pending(4).await.unwrap();
     let sent = all_requests_text(&harness);
+    assert!(
+        !sent.contains(GUEST_TEXT),
+        "访客的私有记忆进了 shared 的提取提示"
+    );
     assert!(sent.contains(OPERATOR_SECRET));
     assert!(sent.contains("personal|project:<id>|environment:<id>"));
 }
@@ -3734,4 +3743,47 @@ async fn runs_of_different_memory_modes_in_one_batch_are_extracted_under_their_o
     assert_eq!(scope_of("共享的偏好"), Some(MemoryScope::Personal));
     assert_eq!(scope_of("私有的偏好"), Some(guest_scope()));
     assert_eq!(harness.work.settled().len(), 3, "三条都落定");
+}
+
+/// shared 的 Agent（没写 `memory_scope`）召回 Personal 与项目记忆，但不召回任何 `agent:<id>`；
+/// 带过来的旧注入里落在那一格的条目也在续用时掉出去。
+#[tokio::test]
+async fn a_shared_recall_skips_agent_scopes_and_drops_carried_entries_from_them() {
+    let harness = HarnessBuilder::new().build().await;
+    let mut project = memory("p-1", "家里空调的项目约定是二十四度");
+    project.scope = MemoryScope::Project {
+        project_id: "home".into(),
+    };
+    let mut stranger = memory("g-1", GUEST_TEXT);
+    stranger.scope = guest_scope();
+    for item in [memory("m-1", OPERATOR_SECRET), project, stranger] {
+        harness.repo.put(item, None).await.unwrap();
+    }
+    let run = RunId::from_raw("run-1");
+
+    let fresh = harness.manager.prepare(&run, "空调", &[], &[]).await;
+    let mut got: Vec<_> = fresh.uses.iter().map(|u| u.memory.as_str()).collect();
+    got.sort();
+    assert_eq!(got, ["m-1", "p-1"]);
+
+    // 旧检查点里带着访客那一条：shared 续用时不再沿用。
+    let carried = [MemoryUse {
+        memory: MemoryId::from_raw("g-1"),
+        revision: 1,
+        ..fresh.uses[0].clone()
+    }];
+    let resumed = harness.manager.prepare(&run, "空调", &carried, &[]).await;
+    assert!(
+        resumed.uses.iter().all(|u| u.memory.as_str() != "g-1"),
+        "{:?}",
+        resumed.uses
+    );
+
+    // 私有的那个 Agent 自己仍然看得到。
+    let own = harness
+        .manager
+        .prepare(&run, "空调", &carried, &[guest_scope()])
+        .await;
+    assert_eq!(own.uses.len(), 1);
+    assert_eq!(own.uses[0].memory.as_str(), "g-1");
 }

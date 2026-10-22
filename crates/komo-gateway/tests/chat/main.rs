@@ -46,6 +46,7 @@ mod harness;
 
 mod cross;
 mod feishu;
+mod guest;
 mod skills;
 mod smoke;
 mod telegram;

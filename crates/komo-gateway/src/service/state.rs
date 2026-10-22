@@ -1163,11 +1163,20 @@ impl GatewayState {
         //
         // 目录先补一次：刚登录的 MCP 服务器这时连上，它的工具进这条 Run 的能力面。
         self.refresh_mcp().await;
-        let mut surface = komo_agent::surface_of(
-            profile,
-            &self.tool_names(),
-            &super::agent_config_file(&self.config),
-        );
+        //
+        // 访客会话（群里非操作者）按 `kind` 强制：能力面恒为空，项目文件与 skills 都不读。
+        // 这不依赖配置校验——Profile 写了什么工具、访客 Agent 改没改，都开不出工具来。
+        let guest =
+            record.is_some_and(|record| record.kind == komo_store::models::SessionKind::Guest);
+        let mut surface = if guest {
+            AgentSurface::new(std::iter::empty::<String>())
+        } else {
+            komo_agent::surface_of(
+                profile,
+                &self.tool_names(),
+                &super::agent_config_file(&self.config),
+            )
+        };
         // 任务会话里没有 `task`：深度只有一层，结果只交回一层（`docs/background-tasks.md`）。
         // `GatewayTaskSpawner::parent_of` 还留着第二道。
         if record.is_some_and(|record| record.kind == komo_store::models::SessionKind::Task) {
@@ -1216,17 +1225,20 @@ impl GatewayState {
         // `PayloadStore`。Run 停着的时候文件被改了，恢复出来的那一段仍是受理时那一版。
         // 同一会话里系统提示沿用上一条主 Run 那一份；现场找到的不一样，就另存一份，回放
         // 时补在这条 Run 的任务后面——改动从这一条起生效，前缀缓存不作废。
-        let found = super::project_files::discover(&workspace);
-        let current = super::project_files::freeze(&payloads, &found).await?;
-        let events = super::compaction::read_events(self.routed.as_ref(), session).await?;
-        let (project_files_ref, project_files_update_ref) =
+        let (project_files_ref, project_files_update_ref) = if guest {
+            (None, None)
+        } else {
+            let found = super::project_files::discover(&workspace);
+            let current = super::project_files::freeze(&payloads, &found).await?;
+            let events = super::compaction::read_events(self.routed.as_ref(), session).await?;
             match super::project_files::pinned(&events, &profile.id, &workspace) {
                 Some(pinned) if pinned != current => {
                     (pinned, Some(payloads.put_json(&found, None).await?))
                 }
                 Some(pinned) => (pinned, None),
                 None => (current, None),
-            };
+            }
+        };
         // skills 目录同一个理由，冻结的是**渲染好的正文**：续跑那一段的系统提示要与受理时
         // 逐字相同（provider 的前缀缓存从系统提示起算），注册表之后被重载、`SKILL.md` 被改，
         // 从下一条 Run 起生效。门控按这条 Run 的能力面。
@@ -1869,3 +1881,69 @@ pub fn repo_error(error: RepoError) -> GatewayError {
 
 #[allow(dead_code)]
 fn assert_segment_types(_: &ResumedRound, _: &Segment, _: &CallEnv, _: HandlerError) {}
+
+#[cfg(test)]
+mod tests {
+    use komo_kernel::types::agent::AgentProfile;
+    use komo_kernel::types::ids::SessionId;
+    use komo_store::models::SessionKind;
+
+    use crate::service::test_support::TestGateway;
+
+    /// 访客会话的能力面按 `kind` 强制为空：就算 Profile 写了工具（配置校验被绕过、或
+    /// 配置是后来改的），也开不出工具，更读不到项目文件。
+    #[tokio::test]
+    async fn a_guest_session_freezes_an_empty_surface_even_if_its_profile_lists_tools() {
+        let gateway = TestGateway::start().await;
+        let state = gateway.state();
+        let mut config = (*state.snapshot()).clone();
+        let mut profile = AgentProfile::new("guest");
+        profile.tools = Some(vec!["read".into(), "bash".into()]);
+        config.agent.agents.insert("guest".into(), profile);
+        std::fs::write(
+            config.paths.workspaces_dir.join("AGENTS.md"),
+            "项目规范暗号：蓝鲸",
+        )
+        .expect("写项目规范");
+
+        let freeze = |kind: SessionKind| {
+            let (state, config) = (state.clone(), config.clone());
+            async move {
+                let session = SessionId::new_at(state.clock.now());
+                let origin = format!("test:{session}");
+                komo_store::repos::session::ensure_owned(
+                    &state.db,
+                    &session,
+                    &origin,
+                    &format!("sessions/{session}/events.jsonl"),
+                    "guest",
+                    kind,
+                )
+                .await
+                .expect("会话行");
+                state
+                    .ledgers
+                    .open(&session, &origin)
+                    .await
+                    .expect("会话目录");
+                let record = komo_store::repos::session::get(&state.db, &session)
+                    .await
+                    .expect("读得出");
+                state
+                    .freeze_run(&config, "guest", &session, record.as_ref(), None)
+                    .await
+                    .expect("冻结")
+            }
+        };
+
+        let normal = freeze(SessionKind::Normal).await;
+        assert!(normal.surface.allows("read"), "对照：普通会话拿得到工具");
+        assert!(normal.project_files_ref.is_some(), "对照：读得到项目规范");
+
+        let guest = freeze(SessionKind::Guest).await;
+        assert!(guest.surface.names().is_empty(), "{:?}", guest.surface);
+        assert_eq!(guest.project_files_ref, None);
+        assert_eq!(guest.project_files_update_ref, None);
+        assert_eq!(guest.skills_ref, None);
+    }
+}

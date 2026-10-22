@@ -1642,6 +1642,24 @@ async fn task_sessions_and_cron_runs_are_skipped_without_a_model_call() {
         harness.work.settled(),
         vec![(RunId::from_raw("run-1"), MemoryWork::Done, Seq(3))]
     );
+
+    // 访客会话里所有的 Run（群里陌生人的话不进操作者的记忆）。
+    let harness = HarnessBuilder::new()
+        .session_kind(SessionKind::Guest)
+        .work(vec![run_item("run-1", 1)])
+        .build()
+        .await;
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        events(&RunId::from_raw("run-1")),
+    );
+    let report = harness.manager.process_pending(4).await.unwrap();
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert!(harness.llm.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        harness.work.settled(),
+        vec![(RunId::from_raw("run-1"), MemoryWork::Done, Seq(3))]
+    );
 }
 
 /// 窗口超限：用户输入行一行不丢，先删最旧的工具结果。

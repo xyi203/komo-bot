@@ -1159,6 +1159,9 @@ impl MemoryManager {
         for item in items {
             let reason = if batch.kind == SessionKind::Task {
                 Some("后台任务会话")
+            } else if batch.kind == SessionKind::Guest {
+                // 访客是群里的陌生人：他的话不是操作者的事实，不能写进操作者的记忆。
+                Some("访客会话")
             } else if matches!(item.source, PlanSource::Cron { .. }) {
                 Some("Cron 触发的 Run")
             } else {

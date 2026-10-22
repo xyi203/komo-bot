@@ -22,7 +22,8 @@
 
 use komo_kernel::types::ids::MemoryId;
 use komo_kernel::types::memory::{
-    Confirmation, MemoryItem, MemoryState, MemoryUsage, Provenance, RetrievalMode, SupersededRef,
+    Confirmation, MemoryItem, MemoryScope, MemoryState, MemoryUsage, Provenance, RetrievalMode,
+    SupersededRef,
 };
 use serde::Deserialize;
 use time::OffsetDateTime;
@@ -249,10 +250,13 @@ impl<'a> Consolidator<'a> {
         Ok(changes)
     }
 
-    /// 提取前的相关条目召回（§9.3、§9.10）：用这一批的用户陈述做一次混合检索，**不限
-    /// 作用域**（模型写进哪个作用域在提取之后才知道），放行候选与 contested——冲突最可能
-    /// 就发生在它们身上。召回不通只返回空：提取照常跑，只是这一批没有候选可关联。
-    pub async fn recall(&self, statements: &str) -> Vec<MemoryItem> {
+    /// 提取前的相关条目召回（§9.3、§9.10）：用这一批的用户陈述做一次混合检索，放行候选与
+    /// contested——冲突最可能就发生在它们身上。召回不通只返回空：提取照常跑，只是这一批
+    /// 没有候选可关联。
+    ///
+    /// `scopes` 空 = **不限作用域**（模型写进哪个作用域在提取之后才知道）；私有记忆的批次
+    /// 传它自己那一个，提取模型就看不到别的作用域里的记忆。
+    pub async fn recall(&self, statements: &str, scopes: &[MemoryScope]) -> Vec<MemoryItem> {
         let text: String = statements.chars().take(MAX_QUERY_CHARS).collect();
         if text.trim().is_empty() {
             return Vec::new();
@@ -265,6 +269,7 @@ impl<'a> Consolidator<'a> {
         let mut query = self.manager.query(text.clone(), None);
         query.top_k = RECALL_LIMIT;
         query.include_states = states.clone();
+        query.scopes = scopes.to_vec();
         match self.manager.search(query).await {
             Ok(result) => result.items,
             Err(MemoryError::VectorUnconfigured) | Err(MemoryError::VectorUnavailable(_)) => {
@@ -272,6 +277,7 @@ impl<'a> Consolidator<'a> {
                 let mut fallback = self.manager.query(text, Some(RetrievalMode::Keyword));
                 fallback.top_k = RECALL_LIMIT;
                 fallback.include_states = states;
+                fallback.scopes = scopes.to_vec();
                 self.manager
                     .search(fallback)
                     .await

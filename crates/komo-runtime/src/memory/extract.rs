@@ -159,6 +159,9 @@ pub struct Transcript {
     roles: BTreeMap<String, (RunId, Seq, Role)>,
     /// 这一批 Run 的系统提示里注入过的记忆（去重、按首次出现排序）。
     injected: Vec<MemoryUse>,
+    /// `memory = "private"` 的 Profile：这一批只许写进这一个作用域（`agent:<id>`）。模型
+    /// 返回什么作用域都不算，[`Transcript::validate`] 一律改写成它。`None` = 模型自己选。
+    confined: Option<MemoryScope>,
 }
 
 /// 一条事件在提取里算什么。
@@ -356,7 +359,19 @@ impl Transcript {
             statements: statements.join("\n"),
             roles,
             injected,
+            confined: None,
         }
+    }
+
+    /// 把这一批锁在一个作用域里（私有记忆的 Profile）。
+    pub fn confined_to(mut self, scope: MemoryScope) -> Self {
+        self.confined = Some(scope);
+        self
+    }
+
+    /// 这一批被锁在哪个作用域；`None` = 不锁。
+    pub fn confined(&self) -> Option<&MemoryScope> {
+        self.confined.as_ref()
     }
 
     /// 这一批 Run 注入过的记忆引用。
@@ -518,12 +533,19 @@ impl Transcript {
             "experience" => MemoryKind::Experience,
             _ => MemoryKind::Fact,
         };
-        let scope: MemoryScope = if raw.scope.trim().is_empty() {
-            MemoryScope::Personal
-        } else {
-            raw.scope
-                .parse()
-                .map_err(|error| format!("作用域不合法：{error}"))?
+        // 锁定的批次（私有记忆）**不信模型给的作用域**：写进哪里由宿主定。没锁的批次里
+        // 模型只能在 personal / project / environment 里选——`agent:<id>` 是私有记忆的
+        // 专属格，模型写出来也不收。
+        let scope: MemoryScope = match &self.confined {
+            Some(scope) => scope.clone(),
+            None if raw.scope.trim().is_empty() => MemoryScope::Personal,
+            None => match raw.scope.parse() {
+                Ok(MemoryScope::Agent { .. }) => {
+                    return Err("agent 作用域不是模型能选的".into());
+                }
+                Ok(scope) => scope,
+                Err(error) => return Err(format!("作用域不合法：{error}")),
+            },
         };
 
         // 引用位置：每一条都要指向**这一批 Run 里真实存在的**事件。
@@ -746,7 +768,7 @@ impl LearningPass {
             // **记忆模型自己的那份完整配置**（§13.3）：`RoutingLlm` 按它挑实例，所以
             // 切换聊天模型或它的 effort 碰不到这一次请求。
             model: self.model.clone(),
-            system_prompt: system_prompt(self.max_observations),
+            system_prompt: system_prompt(self.max_observations, transcript.confined()),
             messages: vec![komo_kernel::types::turn::ReplayMessage {
                 role: komo_kernel::types::turn::Role::User,
                 seq: transcript.cursor(),
@@ -851,8 +873,14 @@ fn first_object(text: &str) -> Option<&str> {
 /// 三句是硬的，因为它们各自对应一条 Rust 侧的闸：只提新发生的用户陈述与可验证工具结果
 /// （§9.3）；每条必须引事件 ID（校验引用位置）；不要报告确认状态（§9.2 那句"模型返回的
 /// user_confirmed 字段没有写入权限"——提示里说清楚，省得模型白写一遍）。
-fn system_prompt(max_observations: usize) -> String {
-    SYSTEM_PROMPT.replace("{MAX}", &max_observations.to_string())
+///
+/// 私有记忆的批次（`confined`）把允许的作用域收窄成它那一个：模型只被告知这一个。
+fn system_prompt(max_observations: usize, confined: Option<&MemoryScope>) -> String {
+    let prompt = SYSTEM_PROMPT.replace("{MAX}", &max_observations.to_string());
+    match confined {
+        Some(scope) => prompt.replace("personal|project:<id>|environment:<id>", &scope.to_string()),
+        None => prompt,
+    }
 }
 
 const SYSTEM_PROMPT: &str = "\

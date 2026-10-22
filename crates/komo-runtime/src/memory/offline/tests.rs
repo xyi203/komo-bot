@@ -335,6 +335,37 @@ async fn two_synonymous_actives_merge_and_a_preview_writes_nothing() {
     assert_eq!(rig.mark("a-2").await, Some(LATER));
 }
 
+/// `komo memory consolidate --scope agent:<id>`：私有作用域与别的作用域一样按组整理，
+/// 而且只碰它自己。
+#[tokio::test]
+async fn an_agent_scope_consolidates_on_its_own_and_leaves_personal_alone() {
+    let merge = merge_json(0, &[1]);
+    let rig = Rig::new(&[&merge]).await;
+    let guest = MemoryScope::Agent {
+        agent_id: "guest".into(),
+    };
+    rig.seed(Seed::new("g-1", DARK_A).scope(guest.clone()))
+        .await;
+    rig.seed(Seed::new("g-2", DARK_B).scope(guest.clone()))
+        .await;
+    rig.seed(Seed::new("p-1", DARK_A)).await;
+    rig.seed(Seed::new("p-2", DARK_B)).await;
+
+    let response = rig
+        .manager
+        .consolidate(&MemoryConsolidateRequest {
+            apply: true,
+            scope: Some(guest),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(response.groups.len(), 1);
+    assert_eq!(rig.get("g-2").await.state, MemoryState::Superseded);
+    assert_eq!(rig.get("p-1").await.state, MemoryState::Active);
+    assert_eq!(rig.get("p-2").await.state, MemoryState::Active);
+}
+
 #[tokio::test]
 async fn an_inference_absorbing_a_user_statement_is_not_executed() {
     let rig = Rig::new(&[&merge_json(0, &[1])]).await;

@@ -467,17 +467,17 @@ impl SegmentSource for GatewaySegments {
 
         // 子代理只拿得到任务本身：不注入记忆、不列 Skills、也**不带上父的对话历史**（它的
         // 回放窗口就是自己那条 Run，见下）。自包含这件事是父侧的责任，提示词里对它也说了。
-        // 访客会话（群里非操作者）不召回：记忆是操作者的，`recall_scopes` 又总会带上
-        // Personal，作用域挡不住。
-        let guest = session_record
-            .as_ref()
-            .is_some_and(|record| record.kind == komo_store::models::SessionKind::Guest);
-        let injection = match &delegate {
-            Some(_) => komo_kernel::types::memory::Injection::default(),
-            None if guest => komo_kernel::types::memory::Injection::default(),
-            // 记忆作用域来自 Profile（§9.2）：只召回这一个作用域，外加显式共享的用户资料。
-            None => {
-                let scopes = context_sources::recall_scopes(identity.memory_scope.as_ref());
+        // 记忆模式是冻结的那一份（`identity.memory_mode`）：`off` 不召回，`private` 只召回
+        // 这个 Agent 自己的作用域（访客 Agent 就是这么配的），`shared` 按 Profile 的
+        // `memory_scope`（§9.2）。
+        let scopes = context_sources::recall_scopes(
+            identity.memory_mode,
+            &identity.agent_id,
+            identity.memory_scope.as_ref(),
+        );
+        let injection = match (&delegate, scopes) {
+            (Some(_), _) | (None, None) => komo_kernel::types::memory::Injection::default(),
+            (None, Some(scopes)) => {
                 context_sources::recall_for(
                     self.memories.as_ref(),
                     self.checkpoints.as_ref(),

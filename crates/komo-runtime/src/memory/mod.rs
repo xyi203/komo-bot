@@ -37,6 +37,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
+use komo_kernel::events::{Event, EventPayload};
 use komo_kernel::protocol::config::{ConsolidateConfig, MemoryConfig, RetrievalConfig};
 use komo_kernel::protocol::http::{
     IndexState, MemoryIndexStatus, MemorySweepRequest, MemorySweepResponse,
@@ -45,6 +46,7 @@ use komo_kernel::traits::{
     Clock, EmbedError, EmbeddingClient, Ledger, LedgerError, LlmClient, MemoryRepo, RepoError,
     StoreError, SystemOne,
 };
+use komo_kernel::types::agent::MemoryMode;
 use komo_kernel::types::ids::{MemoryId, RunId, Seq, SessionId};
 use komo_kernel::types::memory::{
     Injection, MemoryItem, MemoryScope, MemoryState, MemoryWork, RecallDiagnostics, RecallQuery,
@@ -1154,14 +1156,20 @@ impl MemoryManager {
         };
 
         // 不调模型就跳过（§9.10）：后台任务会话里排查出来的东西只是任务的过程，home 收到
-        // 的是摘要，摘要不是证据；Cron 的 Run 是自己的报告，不是用户说的。
-        let mut windows = Vec::new();
+        // 的是摘要，摘要不是证据；Cron 的 Run 是自己的报告，不是用户说的；`memory = "off"`
+        // 的 Agent 受理时就说了不要记忆。
+        //
+        // 记忆模式取**受理时冻结的那一份**（`RunSnapshot::memory_mode`）：同一批里的 Run
+        // 可能各自不同，所以按 Run 分——`off` 的当场跳过，`private` 的按 `agent:<id>` 分组
+        // （一组锁在一个作用域里提取），`shared` 的一组、模型自己选作用域。每个 Run 都只在
+        // 自己那一档的限制下被提取，不存在"取一档最严的套在全批上"的失配。
+        let mut groups: BTreeMap<Option<MemoryScope>, Vec<extract::RunWindow>> = BTreeMap::new();
         for item in items {
+            let (mode, agent_id) = frozen_memory(&events, &item.run);
             let reason = if batch.kind == SessionKind::Task {
                 Some("后台任务会话")
-            } else if batch.kind == SessionKind::Guest {
-                // 访客是群里的陌生人：他的话不是操作者的事实，不能写进操作者的记忆。
-                Some("访客会话")
+            } else if mode == MemoryMode::Off {
+                Some("Agent 关了记忆")
             } else if matches!(item.source, PlanSource::Cron { .. }) {
                 Some("Cron 触发的 Run")
             } else {
@@ -1171,14 +1179,20 @@ impl MemoryManager {
                 Some(reason) => {
                     self.skip(item, end_of(item), reason, report, record).await;
                 }
-                None => windows.push(extract::RunWindow {
-                    run: item.run.clone(),
-                    status: item.status,
-                    cursor: item.cursor,
-                }),
+                None => groups
+                    .entry(match mode {
+                        MemoryMode::Private => Some(MemoryScope::Agent { agent_id }),
+                        _ => None,
+                    })
+                    .or_default()
+                    .push(extract::RunWindow {
+                        run: item.run.clone(),
+                        status: item.status,
+                        cursor: item.cursor,
+                    }),
             }
         }
-        if windows.is_empty() {
+        if groups.is_empty() {
             return Ok(());
         }
 
@@ -1189,85 +1203,95 @@ impl MemoryManager {
             Arc::clone(&self.clock),
             live.max_observations,
         );
-        for segment in extract::split_batch(&batch.session, &windows, &events) {
-            let transcript = extract::Transcript::build(&batch.session, &segment, &events);
-            record.window_chars += transcript.window_chars();
-            let mut applied = 0;
-            let mut skipped = None;
-            if !transcript.has_new_evidence() {
-                skipped = Some("没有新的用户陈述或工具结果");
-            } else {
-                let consolidator = consolidate::Consolidator::new(self);
-                // 提取前整批召回一次，编号后随提取调用一起交给模型（§9.10）。
-                let mut candidates = consolidator.recall(transcript.statements()).await;
-                // 这段对话里已经手动记过的（§9.3「手动记一条」）：不一定召回得到，却最容易
-                // 被再提一遍。补进编号表并标出来，apply 时再兜一道。
-                let by_hand = self.recorded_by_hand(&transcript).await;
-                for item in &by_hand {
-                    if !candidates.iter().any(|have| have.id == item.id) {
-                        candidates.push(item.clone());
-                    }
+        for (confined, windows) in groups {
+            for segment in extract::split_batch(&batch.session, &windows, &events) {
+                let mut transcript = extract::Transcript::build(&batch.session, &segment, &events);
+                if let Some(scope) = &confined {
+                    transcript = transcript.confined_to(scope.clone());
                 }
-                let consolidator = consolidator.with_recorded(by_hand);
-                // 本批注入的记忆：只列版本没变的——正文变了，模型看到的就不是注入的那句话。
-                let mut injected = Vec::new();
-                for use_ in transcript.injected() {
-                    if let Ok(Some(item)) = self.repo.get(&use_.memory).await
-                        && item.revision == use_.revision
-                    {
-                        injected.push(item);
-                    }
-                }
-                let raw = pass.extract(&transcript, &candidates, &injected).await?;
-                record.observations += raw.observations.len();
-                let adopted = transcript.validate_used(raw.used, &injected);
-                let observations = transcript.validate(
-                    raw.observations,
-                    live.max_observations,
-                    &live.model,
-                    &candidates,
-                    self.clock.now(),
-                );
-                if observations.is_empty() {
-                    skipped = Some("提取结果一条都没通过校验");
+                record.window_chars += transcript.window_chars();
+                let mut applied = 0;
+                let mut skipped = None;
+                if !transcript.has_new_evidence() {
+                    skipped = Some("没有新的用户陈述或工具结果");
                 } else {
-                    applied = consolidator.apply(&observations).await?;
-                    record.applied += applied;
-                }
-                // 采纳计数放在 apply 之后、游标推进之前：apply 失败整批重试时还没记过，
-                // 不会重复计数；游标推进后这一批不再被领取。
-                if !adopted.is_empty() {
-                    if let Err(error) = self
-                        .catalog
-                        .record_adoption(&adopted, self.clock.now())
-                        .await
-                    {
-                        tracing::warn!(%error, "采纳计数没记上");
+                    let consolidator = consolidate::Consolidator::new(self);
+                    // 提取前整批召回一次，编号后随提取调用一起交给模型（§9.10）。
+                    let scopes: Vec<MemoryScope> = confined.iter().cloned().collect();
+                    let mut candidates =
+                        consolidator.recall(transcript.statements(), &scopes).await;
+                    // 这段对话里已经手动记过的（§9.3「手动记一条」）：不一定召回得到，却最容易
+                    // 被再提一遍。补进编号表并标出来，apply 时再兜一道。
+                    let mut by_hand = self.recorded_by_hand(&transcript).await;
+                    by_hand
+                        .retain(|item| confined.as_ref().is_none_or(|scope| &item.scope == scope));
+                    for item in &by_hand {
+                        if !candidates.iter().any(|have| have.id == item.id) {
+                            candidates.push(item.clone());
+                        }
+                    }
+                    let consolidator = consolidator.with_recorded(by_hand);
+                    // 本批注入的记忆：只列版本没变的——正文变了，模型看到的就不是注入的那句话。
+                    let mut injected = Vec::new();
+                    for use_ in transcript.injected() {
+                        if let Ok(Some(item)) = self.repo.get(&use_.memory).await
+                            && item.revision == use_.revision
+                            && confined.as_ref().is_none_or(|scope| &item.scope == scope)
+                        {
+                            injected.push(item);
+                        }
+                    }
+                    let raw = pass.extract(&transcript, &candidates, &injected).await?;
+                    record.observations += raw.observations.len();
+                    let adopted = transcript.validate_used(raw.used, &injected);
+                    let observations = transcript.validate(
+                        raw.observations,
+                        live.max_observations,
+                        &live.model,
+                        &candidates,
+                        self.clock.now(),
+                    );
+                    if observations.is_empty() {
+                        skipped = Some("提取结果一条都没通过校验");
                     } else {
-                        record.used += adopted.len();
-                        report.used += adopted.len();
-                        tracing::event!(
-                            target: "komo::metrics",
-                            tracing::Level::DEBUG,
-                            {
-                            monotonic_counter.komo.memory.used = adopted.len() as u64,
-                            komo.session.kind = batch.kind.as_str(),
-                            }
-                        );
+                        applied = consolidator.apply(&observations).await?;
+                        record.applied += applied;
+                    }
+                    // 采纳计数放在 apply 之后、游标推进之前：apply 失败整批重试时还没记过，
+                    // 不会重复计数；游标推进后这一批不再被领取。
+                    if !adopted.is_empty() {
+                        if let Err(error) = self
+                            .catalog
+                            .record_adoption(&adopted, self.clock.now())
+                            .await
+                        {
+                            tracing::warn!(%error, "采纳计数没记上");
+                        } else {
+                            record.used += adopted.len();
+                            report.used += adopted.len();
+                            tracing::event!(
+                                target: "komo::metrics",
+                                tracing::Level::DEBUG,
+                                {
+                                monotonic_counter.komo.memory.used = adopted.len() as u64,
+                                komo.session.kind = batch.kind.as_str(),
+                                }
+                            );
+                        }
                     }
                 }
-            }
-            report.applied += applied;
-            for (run, cursor) in transcript.run_cursors() {
-                record.settled.insert(run.clone());
-                if let Some(reason) = skipped {
-                    report.skipped += 1;
-                    record.skip_reason.get_or_insert_with(|| reason.to_string());
-                    tracing::debug!(run = %run, %reason, "这个 Run 没有可提取的证据");
-                } else {
-                    report.processed += 1;
+                report.applied += applied;
+                for (run, cursor) in transcript.run_cursors() {
+                    record.settled.insert(run.clone());
+                    if let Some(reason) = skipped {
+                        report.skipped += 1;
+                        record.skip_reason.get_or_insert_with(|| reason.to_string());
+                        tracing::debug!(run = %run, %reason, "这个 Run 没有可提取的证据");
+                    } else {
+                        report.processed += 1;
+                    }
+                    self.settle(run, MemoryWork::Done, cursor).await;
                 }
-                self.settle(run, MemoryWork::Done, cursor).await;
             }
         }
         Ok(())
@@ -1601,6 +1625,8 @@ fn skip_label(reason: Option<&str>) -> Option<&'static str> {
         "cancelled"
     } else if reason == "后台任务会话" {
         "task_session"
+    } else if reason == "Agent 关了记忆" {
+        "memory_off"
     } else if reason == "Cron 触发的 Run" {
         "cron"
     } else if reason == "提取结果一条都没通过校验" {
@@ -1608,6 +1634,28 @@ fn skip_label(reason: Option<&str>) -> Option<&'static str> {
     } else {
         "no_evidence"
     })
+}
+
+/// 这个 Run 受理时冻结的记忆模式与 Agent（`run.accepted` 的快照）。子 Run 没有自己的
+/// 快照时用派它的那条 Run 的；都没有（旧行）= `Shared`，与改造之前一样。
+fn frozen_memory(events: &[Event], run: &RunId) -> (MemoryMode, String) {
+    let accepted = |run: &RunId| {
+        events.iter().find_map(|event| match &event.payload {
+            EventPayload::RunAccepted(body) if event.run.as_ref() == Some(run) => Some(body),
+            _ => None,
+        })
+    };
+    let Some(body) = accepted(run) else {
+        return (MemoryMode::Shared, String::new());
+    };
+    let snapshot = body.snapshot.as_deref().or_else(|| {
+        let parent = &body.delegate.as_ref()?.parent;
+        accepted(parent)?.snapshot.as_deref()
+    });
+    match snapshot {
+        Some(snapshot) => (snapshot.memory_mode, snapshot.agent_id.clone()),
+        None => (MemoryMode::Shared, String::new()),
+    }
 }
 
 /// 一批处理里攒下来的账：已经落定的 Run，以及发进逐批日志的那几个数（§9.10）。

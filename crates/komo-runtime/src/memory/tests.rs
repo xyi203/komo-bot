@@ -430,6 +430,31 @@ fn event(seq: u64, run: &RunId, payload: EventPayload) -> Event {
     }
 }
 
+/// 受理事件里冻结的记忆模式（`RunSnapshot::memory_mode`）：把 [`user_event`] 造的受理事件
+/// 改成"这个 Agent 用这种模式受理的"。
+fn accepted_with(mut event: Event, agent: &str, mode: MemoryMode) -> Event {
+    let EventPayload::RunAccepted(body) = &mut event.payload else {
+        panic!("不是受理事件");
+    };
+    body.snapshot = Some(Box::new(komo_kernel::types::agent::RunSnapshot {
+        agent_id: agent.into(),
+        profile_revision: ContentHash::of_str(agent),
+        model: komo_kernel::test_support::sample_model(),
+        workspace: "/w".into(),
+        surface: komo_kernel::types::surface::AgentSurface::new(["read"]),
+        instructions_ref: None,
+        project_files_ref: None,
+        project_files_update_ref: None,
+        skills_ref: None,
+        memory_scope: None,
+        memory_mode: mode,
+        projection: None,
+        direct_command: None,
+        contract: None,
+    }));
+    event
+}
+
 fn user_event(seq: u64, run: &RunId, text: &str) -> Event {
     event(
         seq,
@@ -1628,24 +1653,6 @@ async fn task_sessions_and_cron_runs_are_skipped_without_a_model_call() {
     // 任务会话里所有的 Run。
     let harness = HarnessBuilder::new()
         .session_kind(SessionKind::Task)
-        .work(vec![run_item("run-1", 1)])
-        .build()
-        .await;
-    harness.ledger.seed(
-        &SessionId::from_raw("sess-1"),
-        events(&RunId::from_raw("run-1")),
-    );
-    let report = harness.manager.process_pending(4).await.unwrap();
-    assert_eq!(report.skipped, 1, "{report:?}");
-    assert!(harness.llm.requests.lock().unwrap().is_empty());
-    assert_eq!(
-        harness.work.settled(),
-        vec![(RunId::from_raw("run-1"), MemoryWork::Done, Seq(3))]
-    );
-
-    // 访客会话里所有的 Run（群里陌生人的话不进操作者的记忆）。
-    let harness = HarnessBuilder::new()
-        .session_kind(SessionKind::Guest)
         .work(vec![run_item("run-1", 1)])
         .build()
         .await;
@@ -3486,4 +3493,245 @@ async fn a_failed_batch_reports_a_reason_label_not_the_error_text() {
     assert_eq!(spans[0].fields["komo.memory.skip_reason"], "failed");
     let skipped = capture.metrics("monotonic_counter.komo.memory.extract.skipped");
     assert_eq!(skipped[0].fields["komo.memory.skip_reason"], "failed");
+}
+
+// ---------------------------------------------------------------- 记忆模式（profile.memory）
+
+fn guest_scope() -> MemoryScope {
+    MemoryScope::Agent {
+        agent_id: "guest".into(),
+    }
+}
+
+fn all_requests_text(harness: &Harness) -> String {
+    harness
+        .llm
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|request| {
+            let text: String = request
+                .messages
+                .iter()
+                .filter_map(|message| message.text.clone())
+                .collect();
+            format!("{}\n{text}", request.system_prompt)
+        })
+        .collect()
+}
+
+/// `memory = "off"` 的 Run：不调模型、当场落定，与访客会话是什么种类无关。
+#[tokio::test]
+async fn a_run_accepted_with_memory_off_is_settled_without_a_model_call() {
+    for kind in [SessionKind::Normal, SessionKind::Guest] {
+        let harness = HarnessBuilder::new()
+            .session_kind(kind)
+            .work(vec![run_item("run-1", 1)])
+            .build()
+            .await;
+        let run = RunId::from_raw("run-1");
+        harness.ledger.seed(
+            &SessionId::from_raw("sess-1"),
+            vec![
+                accepted_with(
+                    user_event(1, &run, "我喜欢深色主题"),
+                    "guest",
+                    MemoryMode::Off,
+                ),
+                assistant_event(2, &run, "好的"),
+            ],
+        );
+        let report = harness.manager.process_pending(4).await.unwrap();
+        assert_eq!(report.skipped, 1, "{kind:?} {report:?}");
+        assert!(harness.llm.requests.lock().unwrap().is_empty(), "{kind:?}");
+        assert_eq!(
+            harness.work.settled(),
+            vec![(run.clone(), MemoryWork::Done, Seq(2))]
+        );
+    }
+}
+
+/// 访客会话本身不再是跳过的理由：它的 Profile 是 `shared` 时照常提取（配置校验另外拒掉
+/// 这种配置）。
+#[tokio::test]
+async fn a_guest_session_is_not_skipped_by_its_kind_alone() {
+    let harness = HarnessBuilder::new()
+        .session_kind(SessionKind::Guest)
+        .script(vec![round(NOTHING)])
+        .work(vec![run_item("run-1", 0)])
+        .build()
+        .await;
+    let run = RunId::from_raw("run-1");
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(1, &run, "我喜欢深色主题")],
+    );
+    harness.manager.process_pending(4).await.unwrap();
+    assert_eq!(harness.llm.requests.lock().unwrap().len(), 1);
+}
+
+const OPERATOR_SECRET: &str = "操作者的空调固定设二十六度";
+
+/// 一条放在 Personal 的操作者记忆，直接写进仓库（不走会话证据）。
+async fn seed_operator_memory(harness: &Harness) {
+    let mut item = memory("operator-1", OPERATOR_SECRET);
+    item.scope = MemoryScope::Personal;
+    harness.repo.put(item, None).await.unwrap();
+}
+
+/// 私有记忆的批次：模型说 personal 也写进 `agent:<id>`；候选召回与提示里的作用域都只有
+/// 这一格，操作者的记忆连提示都进不去。
+#[tokio::test]
+async fn a_private_agent_extracts_into_its_own_scope_and_never_sees_operator_memories() {
+    let harness = HarnessBuilder::new()
+        .session_kind(SessionKind::Guest)
+        .script(vec![round(
+            r#"{"observations":[
+                {"content":"访客喜欢深色主题","kind":"preference","scope":"personal",
+                 "said_by":"user_statement","evidence":["evt-1"]},
+                {"content":"访客在项目里用 cargo","kind":"fact","scope":"project:komo",
+                 "said_by":"user_statement","evidence":["evt-1"]}]}"#,
+        )])
+        .work(vec![run_item("run-1", 0)])
+        .build()
+        .await;
+    seed_operator_memory(&harness).await;
+    let run = RunId::from_raw("run-1");
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![
+            accepted_with(
+                user_event(1, &run, "操作者的空调温度是多少，我喜欢深色主题"),
+                "guest",
+                MemoryMode::Private,
+            ),
+            assistant_event(2, &run, "不知道"),
+        ],
+    );
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    let sent = all_requests_text(&harness);
+    assert!(!sent.contains(OPERATOR_SECRET), "操作者的记忆进了提取提示");
+    assert!(sent.contains("agent:guest"), "允许的作用域是它自己的");
+    assert!(
+        !sent.contains("personal|project"),
+        "不再把别的作用域列给模型"
+    );
+    let stored = harness.repo.list(None, None, 10).await.unwrap();
+    let written: Vec<_> = stored
+        .iter()
+        .filter(|item| item.id.as_str() != "operator-1")
+        .collect();
+    assert_eq!(written.len(), 2, "{written:?}");
+    assert!(
+        written.iter().all(|item| item.scope == guest_scope()),
+        "{written:?}"
+    );
+    let personal = harness
+        .repo
+        .list(Some(MemoryScope::Personal), None, 10)
+        .await
+        .unwrap();
+    assert_eq!(personal.len(), 1, "Personal 里还是只有操作者那一条");
+}
+
+/// 对照：同样的话在 `shared` 的 Run 里，操作者那条记忆会作为候选进提示（上一条测试的
+/// "进不去"不是因为这条记忆本来就召回不到）。
+#[tokio::test]
+async fn a_shared_batch_does_list_operator_memories_as_candidates() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(NOTHING)])
+        .work(vec![run_item("run-1", 0)])
+        .build()
+        .await;
+    seed_operator_memory(&harness).await;
+    let run = RunId::from_raw("run-1");
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(
+            1,
+            &run,
+            "操作者的空调温度是多少，我喜欢深色主题",
+        )],
+    );
+    harness.manager.process_pending(4).await.unwrap();
+    let sent = all_requests_text(&harness);
+    assert!(sent.contains(OPERATOR_SECRET));
+    assert!(sent.contains("personal|project:<id>|environment:<id>"));
+}
+
+/// 没锁的批次里，模型选 `agent:<id>` 不被接受：那一格只属于私有记忆的 Profile。
+#[tokio::test]
+async fn a_shared_batch_cannot_write_into_an_agent_scope() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[
+                {"content":"想写进别人的私有记忆","kind":"fact","scope":"agent:guest",
+                 "said_by":"user_statement","evidence":["evt-1"]}]}"#,
+        )])
+        .work(vec![run_item("run-1", 0)])
+        .build()
+        .await;
+    let run = RunId::from_raw("run-1");
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![user_event(1, &run, "想写进别人的私有记忆")],
+    );
+    harness.manager.process_pending(4).await.unwrap();
+    assert!(harness.repo.list(None, None, 10).await.unwrap().is_empty());
+}
+
+/// 同一批里各自受理的模式不同：每个 Run 按自己那一档提取（共享的照旧自选作用域、私有的
+/// 锁进 `agent:<id>`、关掉的跳过），不会被同批别的 Run 带着走。
+#[tokio::test]
+async fn runs_of_different_memory_modes_in_one_batch_are_extracted_under_their_own_limits() {
+    let harness = HarnessBuilder::new()
+        .script(vec![round(
+            r#"{"observations":[{"content":"共享的偏好","kind":"preference","scope":"personal",
+                "said_by":"user_statement","evidence":["evt-1"]}]}"#,
+        )])
+        .script(vec![round(
+            r#"{"observations":[{"content":"私有的偏好","kind":"preference","scope":"personal",
+                "said_by":"user_statement","evidence":["evt-3"]}]}"#,
+        )])
+        .work(vec![
+            run_item("run-1", 0),
+            run_item("run-2", 0),
+            run_item("run-3", 0),
+        ])
+        .build()
+        .await;
+    let (run_1, run_2, run_3) = (
+        RunId::from_raw("run-1"),
+        RunId::from_raw("run-2"),
+        RunId::from_raw("run-3"),
+    );
+    harness.ledger.seed(
+        &SessionId::from_raw("sess-1"),
+        vec![
+            user_event(1, &run_1, "共享的偏好"),
+            accepted_with(
+                user_event(3, &run_2, "私有的偏好"),
+                "guest",
+                MemoryMode::Private,
+            ),
+            accepted_with(user_event(5, &run_3, "关掉的"), "guest", MemoryMode::Off),
+        ],
+    );
+
+    harness.manager.process_pending(4).await.unwrap();
+
+    assert_eq!(harness.llm.requests.lock().unwrap().len(), 2);
+    let stored = harness.repo.list(None, None, 10).await.unwrap();
+    let scope_of = |content: &str| {
+        stored
+            .iter()
+            .find(|item| item.content == content)
+            .map(|item| item.scope.clone())
+    };
+    assert_eq!(scope_of("共享的偏好"), Some(MemoryScope::Personal));
+    assert_eq!(scope_of("私有的偏好"), Some(guest_scope()));
+    assert_eq!(harness.work.settled().len(), 3, "三条都落定");
 }

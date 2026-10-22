@@ -26,7 +26,7 @@ use komo_kernel::events::{Event, EventPayload, MemoryInjected};
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::projection::ProjectionContext;
 use komo_kernel::traits::{Ledger, LedgerError, ToolOutputStore};
-use komo_kernel::types::agent::{ProjectFile, RunSnapshot};
+use komo_kernel::types::agent::{MemoryMode, ProjectFile, RunSnapshot};
 use komo_kernel::types::delegate::DelegateContract;
 use komo_kernel::types::ids::RunId;
 use komo_kernel::types::memory::{Injection, MemoryScope};
@@ -66,6 +66,8 @@ pub(crate) struct Identity {
     pub skills: Option<String>,
     /// 记忆作用域（§9.2）。
     pub memory_scope: Option<MemoryScope>,
+    /// 记忆模式（冻结的那一份）：召回放行哪些作用域由它与 `agent_id` 定。
+    pub memory_mode: MemoryMode,
     /// 冻结的投影设置；`None` = 没有快照或快照早于这一格，调用方按当前配置。
     pub projection: Option<ProjectionContext>,
     /// TUI `!` 直接执行的命令（快照里冻结的那一份）；有值时这一段不经模型。
@@ -153,6 +155,7 @@ pub(crate) async fn identity_for(
         project_update,
         skills,
         memory_scope: frozen.memory_scope,
+        memory_mode: frozen.memory_mode,
         projection: frozen.projection,
         direct_command: frozen.direct_command,
         contract: frozen.contract,
@@ -204,12 +207,17 @@ fn ambient_identity(fallback: Fallback<'_>, catalog: &[ToolDefinition]) -> Ident
         model: None,
         surface,
         // 与指令读当前配置同一个口径：没有快照就按现在的磁盘。
-        project_files: super::project_files::discover(&workspace),
+        project_files: if profile.is_none_or(|profile| profile.project_files) {
+            super::project_files::discover(&workspace)
+        } else {
+            Vec::new()
+        },
         project_update: None,
         skills,
         workspace,
         instructions: profile.and_then(|profile| profile.instructions.clone()),
         memory_scope: profile.and_then(|profile| profile.memory_scope.clone()),
+        memory_mode: profile.map(|profile| profile.memory).unwrap_or_default(),
         projection: None,
         direct_command: None,
         contract: None,
@@ -237,21 +245,34 @@ fn delegate_parent(events: &[Event], run: &RunId) -> Option<RunId> {
     })
 }
 
-/// 这一次召回放行哪些作用域（§9.2）。
+/// 这一次召回放行哪些作用域（§9.2）；`None` = 这一段不召回。
 ///
-/// `None`（Profile 没写 `memory_scope`）= **不按作用域过滤**——`RecallQuery::scopes` 空
-/// 就是"全部"，与改造之前的行为一致。写了就只召回那一个，外加 [`MemoryScope::Personal`]：
-/// 用户资料是**显式共享**的那一份，每个 Agent 都该看得见（否则"用户偏好深色主题"要为每个
-/// Agent 各记一遍，而它们本来就都是同一个操作者的事）。
-pub(crate) fn recall_scopes(scope: Option<&MemoryScope>) -> Vec<MemoryScope> {
-    let Some(scope) = scope else {
-        return Vec::new();
-    };
-    let mut scopes = vec![scope.clone()];
-    if *scope != MemoryScope::Personal {
-        scopes.push(MemoryScope::Personal);
+/// `memory = "off"` 不召回；`"private"` 只放行这个 Agent 自己的 `agent:<id>`——**不带
+/// Personal**，那是操作者的个人记忆，访客之类的 Profile 不该碰；`"shared"` 看 Profile
+/// 的 `memory_scope`：没写 = **不按作用域过滤**（`RecallQuery::scopes` 空就是"全部"），
+/// 写了就只召回那一个，外加 [`MemoryScope::Personal`]——用户资料是**显式共享**的那一份，
+/// 每个 Agent 都该看得见。
+pub(crate) fn recall_scopes(
+    mode: MemoryMode,
+    agent_id: &str,
+    scope: Option<&MemoryScope>,
+) -> Option<Vec<MemoryScope>> {
+    match mode {
+        MemoryMode::Off => None,
+        MemoryMode::Private => Some(vec![MemoryScope::Agent {
+            agent_id: agent_id.to_string(),
+        }]),
+        MemoryMode::Shared => {
+            let Some(scope) = scope else {
+                return Some(Vec::new());
+            };
+            let mut scopes = vec![scope.clone()];
+            if *scope != MemoryScope::Personal {
+                scopes.push(MemoryScope::Personal);
+            }
+            Some(scopes)
+        }
     }
-    scopes
 }
 
 /// 这一段注入哪些记忆（§9.4、§9.7）。
@@ -425,6 +446,35 @@ mod tests {
     //! `komo_agent::context::assemble`。
 
     use super::*;
+
+    fn agent(id: &str) -> MemoryScope {
+        MemoryScope::Agent {
+            agent_id: id.into(),
+        }
+    }
+
+    #[test]
+    fn recall_scopes_follow_the_memory_mode() {
+        assert_eq!(recall_scopes(MemoryMode::Off, "guest", None), None);
+        // 私有：只有它自己的作用域，Profile 的 `memory_scope` 不参与、Personal 不带。
+        assert_eq!(
+            recall_scopes(MemoryMode::Private, "guest", Some(&MemoryScope::Personal)),
+            Some(vec![agent("guest")])
+        );
+        // 共享：与改造之前一样。
+        assert_eq!(
+            recall_scopes(MemoryMode::Shared, "assistant", None),
+            Some(vec![])
+        );
+        let project = MemoryScope::Project {
+            project_id: "komo".into(),
+        };
+        assert_eq!(
+            recall_scopes(MemoryMode::Shared, "assistant", Some(&project)),
+            Some(vec![project, MemoryScope::Personal])
+        );
+    }
+
     use komo_agent::context::history::{ReplayScope, entries};
     use komo_agent::context::{ContextInput, InvocationContext, assemble};
     use komo_kernel::events::{Event, EventPayload, RunAccepted, RunStarted};

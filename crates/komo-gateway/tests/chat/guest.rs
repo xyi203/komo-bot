@@ -1,4 +1,6 @@
-//! 访客模式：群里非操作者 @机器人，只拿到一段无工具、不碰记忆、不读项目文件的对话。
+//! 访客模式：群里非操作者 @机器人，只拿到一段无工具、读不到操作者记忆与项目文件的对话。
+//! 访客只是一个普通 Profile（`tools = []`、`memory = "private"`、`project_files = false`），
+//! 记忆与项目文件由 Profile 的设置定，不由会话种类写死。
 //!
 //! 入站同 `feishu.rs`：假开放平台给出的原始事件负载经 `parse` + `from_message`，再交给
 //! 真 Dispatcher。模型是脚本化替身，记下每一次 `TurnRequest`，"没有工具 / 没有记忆段"
@@ -23,6 +25,7 @@ use komo_store::models::SessionKind;
 use crate::harness::{FakeLlm, FixedFactory, GatewayBuilder, TestGateway, call_round, text_round};
 
 const MEMORY_FACT: &str = "客厅空调设 26 度";
+const GUEST_FACT: &str = "访客说过空调要开 28 度";
 const PROJECT_RULE: &str = "项目规范暗号：蓝鲸";
 
 struct Wired {
@@ -32,6 +35,10 @@ struct Wired {
 }
 
 fn config(guest_agent: bool) -> String {
+    config_with(guest_agent, "private")
+}
+
+fn config_with(guest_agent: bool, guest_memory: &str) -> String {
     let guest_line = if guest_agent {
         "guest_agent = \"guest\"\n"
     } else {
@@ -45,7 +52,7 @@ default_agent = "assistant"
 
 [agents.guest]
 tools = []
-memory = "private"
+memory = "{guest_memory}"
 project_files = false
 instructions = "你是群里的访客助手。"
 
@@ -166,13 +173,17 @@ async fn wait_terminal(gateway: &TestGateway, session: &SessionId) {
 }
 
 fn memory_item() -> MemoryItem {
+    scoped_item("m-1", MEMORY_FACT, MemoryScope::Personal)
+}
+
+fn scoped_item(id: &str, content: &str, scope: MemoryScope) -> MemoryItem {
     let now = time::OffsetDateTime::now_utc();
     MemoryItem {
-        id: MemoryId::from_raw("m-1"),
+        id: MemoryId::from_raw(id),
         revision: 1,
-        content: MEMORY_FACT.into(),
+        content: content.into(),
         kind: MemoryKind::Preference,
-        scope: MemoryScope::Personal,
+        scope,
         provenance: Provenance::UserStatement,
         confirmation: Confirmation::Unconfirmed,
         state: MemoryState::Active,
@@ -294,13 +305,28 @@ async fn removing_the_guest_agent_from_the_config_refuses_the_next_stranger() {
 }
 
 #[tokio::test]
-async fn a_guest_run_sees_no_tools_no_memory_and_no_project_files() {
+async fn a_guest_run_sees_no_tools_its_own_memory_only_and_no_project_files() {
     let wired = wire(true).await;
     let gateway = &wired.gateway;
     gateway
         .state()
         .memory
         .put(memory_item(), None)
+        .await
+        .expect("写得下");
+    gateway
+        .state()
+        .memory
+        .put(
+            scoped_item(
+                "m-2",
+                GUEST_FACT,
+                MemoryScope::Agent {
+                    agent_id: "guest".into(),
+                },
+            ),
+            None,
+        )
         .await
         .expect("写得下");
     std::fs::write(
@@ -331,16 +357,50 @@ async fn a_guest_run_sees_no_tools_no_memory_and_no_project_files() {
     let guest = by(&guest);
     assert!(guest.tools.is_empty(), "访客没有工具：{:?}", guest.tools);
     assert!(guest.system_prompt.contains("你是群里的访客助手。"));
-    assert!(!guest.system_prompt.contains(MEMORY_FACT));
-    assert!(!guest.system_prompt.contains("[已知记忆]"));
+    assert!(!guest.system_prompt.contains(MEMORY_FACT), "操作者的记忆");
+    assert!(
+        guest.system_prompt.contains(GUEST_FACT),
+        "访客自己的私有记忆照常召回"
+    );
     assert!(!guest.system_prompt.contains(PROJECT_RULE));
     assert!(!guest.system_prompt.contains("<project_instructions"));
-    assert!(guest.memories.is_empty());
+    assert!(
+        guest
+            .memories
+            .iter()
+            .all(|use_| use_.memory.as_str() == "m-2"),
+        "{:?}",
+        guest.memories
+    );
 }
 
 #[tokio::test]
-async fn a_guest_run_is_never_handed_to_memory_extraction() {
-    let wired = wire(true).await;
+async fn a_guest_with_memory_off_recalls_nothing() {
+    let wired = wire_with(&config_with(true, "off"), FakeLlm::new(vec![])).await;
+    let gateway = &wired.gateway;
+    gateway
+        .state()
+        .memory
+        .put(memory_item(), None)
+        .await
+        .expect("写得下");
+
+    let (guest, _) = queued(gateway, group("O1", "ou_a", "空调设多少度来着", "", "")).await;
+    wait_terminal(gateway, &guest).await;
+
+    let requests = wired.llm.requests.lock().expect("请求表").clone();
+    let request = requests
+        .iter()
+        .find(|request| request.session == guest)
+        .expect("访客的请求");
+    assert!(!request.system_prompt.contains(MEMORY_FACT));
+    assert!(!request.system_prompt.contains("[已知记忆]"));
+    assert!(request.memories.is_empty());
+}
+
+#[tokio::test]
+async fn a_guest_with_memory_off_is_never_handed_to_memory_extraction() {
+    let wired = wire_with(&config_with(true, "off"), FakeLlm::new(vec![])).await;
     let gateway = &wired.gateway;
 
     let (guest, _) = queued(gateway, group("E1", "ou_a", "我喜欢深色主题", "", "")).await;
@@ -370,4 +430,63 @@ async fn a_guest_run_is_never_handed_to_memory_extraction() {
         "操作者的 Run 该被提取：{:?}",
         wired.llm.models()
     );
+}
+
+/// 私有记忆的访客：Run 会交给记忆模型，但提取提示里没有操作者的记忆，允许的作用域只剩
+/// `agent:guest`。
+#[tokio::test]
+async fn a_private_guest_is_extracted_without_the_operators_memory_in_the_prompt() {
+    let wired = wire(true).await;
+    let gateway = &wired.gateway;
+    gateway
+        .state()
+        .memory
+        .put(memory_item(), None)
+        .await
+        .expect("写得下");
+
+    let (guest, _) = queued(gateway, group("X1", "ou_a", "空调设多少度来着", "", "")).await;
+    wait_terminal(gateway, &guest).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    gateway.state().memories.process_pending(8).await.unwrap();
+
+    let requests = wired.llm.requests.lock().expect("请求表").clone();
+    let extraction = requests
+        .iter()
+        .find(|request| request.model.model == "memory-test")
+        .expect("私有访客的 Run 会交给记忆模型");
+    let prompt: String = extraction
+        .messages
+        .iter()
+        .filter_map(|message| message.text.clone())
+        .collect();
+    assert!(!prompt.contains(MEMORY_FACT), "操作者的记忆进了提取提示");
+    assert!(extraction.system_prompt.contains("agent:guest"));
+}
+
+/// 访客的 Profile 被从配置里删掉后（旧会话还在）：拒绝受理，**不**退回默认 Agent。
+#[tokio::test]
+async fn a_guest_session_whose_profile_is_gone_is_refused_not_given_the_default_agent() {
+    let wired = wire(true).await;
+    let gateway = &wired.gateway;
+    let (guest, _) = queued(gateway, group("D1", "ou_a", "你好", "", "")).await;
+    wait_terminal(gateway, &guest).await;
+
+    // 渠道不再指它（校验不放行"指向不存在的 Profile"），Profile 也一并删掉。
+    gateway.write_config(&config(false).replace("[agents.guest]", "[agents.visitor]"));
+    gateway.reload().await;
+
+    let before = gateway.runs_of(&guest).await.len();
+    let result = gateway
+        .state()
+        .submit(
+            &guest,
+            komo_kernel::types::ids::RequestKey::new("D2"),
+            "还在吗".into(),
+            None,
+            None,
+        )
+        .await;
+    assert!(result.is_err(), "不该受理：{result:?}");
+    assert_eq!(gateway.runs_of(&guest).await.len(), before, "没有新 Run");
 }

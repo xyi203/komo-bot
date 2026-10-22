@@ -468,7 +468,7 @@ impl SegmentSource for GatewaySegments {
         // 子代理只拿得到任务本身：不注入记忆、不列 Skills、也**不带上父的对话历史**（它的
         // 回放窗口就是自己那条 Run，见下）。自包含这件事是父侧的责任，提示词里对它也说了。
         // 记忆模式是冻结的那一份（`identity.memory_mode`）：`off` 不召回，`private` 只召回
-        // 这个 Agent 自己的作用域（访客 Agent 就是这么配的），`shared` 按 Profile 的
+        // 这个 Agent 自己的作用域，`shared` 按 Profile 的
         // `memory_scope`（§9.2）。
         let scopes = context_sources::recall_scopes(
             identity.memory_mode,

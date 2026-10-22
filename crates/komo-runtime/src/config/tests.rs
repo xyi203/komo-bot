@@ -639,49 +639,23 @@ fn a_warning_rides_along_with_a_config_that_still_loads() {
 }
 
 #[test]
-fn a_guest_agent_loads_from_the_file_and_an_empty_tool_list_stays_empty() {
+fn a_private_agent_loads_from_the_file_and_an_empty_tool_list_stays_empty() {
     let fixture = Fixture::valid();
-    let text = Fixture::config_text("chat-a", "medium")
-        .replace(
-            "[agents.assistant]",
-            "[agents.assistant]\n\n[agents.guest]\ntools = []\nmemory = \"private\"\nproject_files = false",
-        )
-        .replace(
-            "home_chat = \"oc_home\"",
-            "home_chat = \"oc_home\"\nguest_agent = \"guest\"",
-        );
+    let text = Fixture::config_text("chat-a", "medium").replace(
+        "[agents.assistant]",
+        "[agents.assistant]\n\n[agents.helper]\ntools = []\nmemory = \"private\"\nproject_files = false",
+    );
     write(&fixture.sources().config, &text);
 
     let loaded = load_config(&fixture.options()).unwrap();
     assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
-    assert_eq!(
-        loaded.snapshot.channels.feishu.guest_agent.as_deref(),
-        Some("guest")
-    );
-    let guest = loaded.snapshot.agent.get("guest").unwrap();
-    assert_eq!(guest.tools, Some(Vec::new()));
-    assert_eq!(guest.memory, komo_kernel::types::MemoryMode::Private);
-    assert!(!guest.project_files);
+    let helper = loaded.snapshot.agent.get("helper").unwrap();
+    assert_eq!(helper.tools, Some(Vec::new()));
+    assert_eq!(helper.memory, komo_kernel::types::MemoryMode::Private);
+    assert!(!helper.project_files);
     let assistant = loaded.snapshot.agent.get("assistant").unwrap();
     assert_eq!(assistant.memory, komo_kernel::types::MemoryMode::Shared);
     assert!(assistant.project_files, "不写就是照常加载项目文件");
-}
-
-#[test]
-fn a_guest_agent_that_shares_memory_fails_to_load() {
-    let fixture = Fixture::valid();
-    let text = Fixture::config_text("chat-a", "medium")
-        .replace(
-            "[agents.assistant]",
-            "[agents.assistant]\n\n[agents.guest]\ntools = []\nproject_files = false",
-        )
-        .replace(
-            "home_chat = \"oc_home\"",
-            "home_chat = \"oc_home\"\nguest_agent = \"guest\"",
-        );
-    write(&fixture.sources().config, &text);
-    let error = load_config(&fixture.options()).unwrap_err();
-    assert!(format!("{error:?}").contains("memory = "), "{error:?}");
 }
 
 // ---------------------------------------------------------------- [mcp]（docs/mcp.md）

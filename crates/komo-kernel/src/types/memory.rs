@@ -299,7 +299,7 @@ pub struct RecallQuery {
 
 /// 这一次放行的作用域里有没有 `scope`。`allowed` 空 = 不限，但**不含**任何
 /// [`MemoryScope::Agent`]：`agent:<id>` 是那个 Agent 的私有记忆，只有它自己显式列出
-/// （`allowed = [agent:<id>]`）才进得来——否则陌生人写进访客记忆的话会被操作者的 Agent
+/// （`allowed = [agent:<id>]`）才进得来——否则别的 Agent 私有记忆里的话会被这个 Agent
 /// 召回，成为一条绕过对话的注入通道。召回、提取候选、续用旧注入都走这一个判断。
 pub fn scope_allowed(allowed: &[MemoryScope], scope: &MemoryScope) -> bool {
     if allowed.is_empty() {
@@ -483,7 +483,7 @@ mod tests {
                 instance_id: "nas".into(),
             },
             MemoryScope::Agent {
-                agent_id: "guest".into(),
+                agent_id: "helper".into(),
             },
         ] {
             let text = scope.to_string();
@@ -503,9 +503,9 @@ mod tests {
             }
         );
         assert_eq!(
-            "agent:guest".parse::<MemoryScope>().unwrap(),
+            "agent:helper".parse::<MemoryScope>().unwrap(),
             MemoryScope::Agent {
-                agent_id: "guest".into()
+                agent_id: "helper".into()
             }
         );
         for bad in [

@@ -32,7 +32,6 @@ use komo_kernel::traits::{GatewayError, Inbound};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform, PeerId, Principal};
 use komo_kernel::types::ids::{RequestKey, RunId, SessionId};
 use komo_kernel::types::status::{RunState, WaitReason};
-use komo_store::models::SessionKind;
 
 use crate::service::state::{GatewayState, HOME_ORIGIN};
 
@@ -42,11 +41,6 @@ const SEEN_LIMIT: usize = 4_096;
 /// 群聊会话在 `sessions.origin` 里的样子。
 fn chat_origin(peer: &ChannelPeer) -> String {
     format!("chat:{peer}")
-}
-
-/// 访客会话的 origin：与操作者同一话题的 `chat:` 会话分开，两边互不可见。
-fn guest_origin(peer: &ChannelPeer) -> String {
-    format!("guest:{peer}")
 }
 
 pub struct Dispatcher {
@@ -155,111 +149,6 @@ impl Dispatcher {
         self.state.ledgers.open(&session, &origin).await?;
         self.state.own_session(&session).await?;
         Ok(session)
-    }
-
-    /// 群里非操作者的那个访客会话：同一个话题里所有访客共用一个，与操作者的 `chat:` 会话
-    /// 分开。只认还收输入、且绑的是**当前**访客 Agent 的会话——`guest_agent` 改过之后另开
-    /// 新的，旧的那个不会拿着一个已不在配置里的身份继续答。
-    ///
-    /// 建的时候就把 `agent_id` 与 `kind = Guest` 写死（与任务会话同一个顺序）：不走
-    /// `own_session`，否则它会被认给默认 Agent。
-    async fn guest_session_for_peer(
-        &self,
-        peer: &ChannelPeer,
-        agent_id: &str,
-    ) -> Result<SessionId, GatewayError> {
-        let origin = guest_origin(peer);
-        let existing = komo_store::repos::session::list(&self.state.db, false)
-            .await?
-            .into_iter()
-            .filter(|record| {
-                record.origin == origin
-                    && record.kind == SessionKind::Guest
-                    && record.agent_id == agent_id
-                    && record.state.accepts_input()
-            })
-            .map(|record| record.session)
-            .min();
-        if let Some(session) = existing {
-            return Ok(session);
-        }
-        let session = SessionId::new_at(self.state.clock.now());
-        let jsonl_path = format!("sessions/{session}/events.jsonl");
-        komo_store::repos::session::ensure_owned(
-            &self.state.db,
-            &session,
-            &origin,
-            &jsonl_path,
-            agent_id,
-            SessionKind::Guest,
-        )
-        .await?;
-        self.state.ledgers.open(&session, &origin).await?;
-        Ok(session)
-    }
-
-    /// 非操作者能不能走访客路径，能就返回访客 Agent。
-    ///
-    /// 只有群里、渠道配了 `guest_agent`、且不是斜杠命令的消息才行——私聊与命令（含
-    /// `/answer`）照旧拒绝。每条消息现读当前快照。
-    fn guest_agent_for(&self, msg: &InboundMessage) -> Option<String> {
-        if msg.is_private || msg.text.trim_start().starts_with('/') {
-            return None;
-        }
-        self.state
-            .snapshot()
-            .channels
-            .get(msg.peer.platform)?
-            .guest_agent
-            .clone()
-    }
-
-    /// 访客的一句话：开（或接上）访客会话，当普通文本提交。没有命令、没有 `/answer`。
-    async fn guest(&self, msg: InboundMessage, agent_id: &str) -> Result<InboundAck, GatewayError> {
-        let session = self.guest_session_for_peer(&msg.peer, agent_id).await?;
-        self.state.notifier.flush(Some(&msg.peer)).await;
-        self.submit_text(&msg, session).await
-    }
-
-    /// 第 6 步：普通文本。操作者与访客共用。
-    async fn submit_text(
-        &self,
-        msg: &InboundMessage,
-        session: SessionId,
-    ) -> Result<InboundAck, GatewayError> {
-        let submitted = self
-            .state
-            .submit(
-                &session,
-                msg.request_key.clone(),
-                msg.text.clone(),
-                Some(msg.peer.clone()),
-                None,
-            )
-            .await
-            .map_err(|error| match error {
-                // 「已逻辑删除的会话拒绝新输入」（§8.10）：聊天这一侧也要说清楚是哪种
-                // 状态、以及该怎么做——HTTP 那侧是 409 加同一句话。
-                GatewayError::InvalidRequest(message) => GatewayError::InvalidRequest(format!(
-                    "{message}。要接着聊就在 TUI 里新建一个会话（`/new` 只是划一段边界）。"
-                )),
-                other => other,
-            })?;
-        // 谁在看这个 Run：`GatewayState::submit` 已经按来源会话起了一个看客
-        // （§11.4：终态回到来源会话，需要处理投来源会话 + home chat），所以这里不再
-        // 另起一个——两个看客会把同一条介入投两遍。
-        let ack = if submitted.deduplicated {
-            InboundAck::Duplicate {
-                run: Some(submitted.run.clone()),
-            }
-        } else {
-            InboundAck::Queued {
-                session,
-                run: submitted.run.clone(),
-            }
-        };
-        self.remember(&msg.request_key, &ack);
-        Ok(ack)
     }
 
     /// 第 5 步。
@@ -422,14 +311,10 @@ impl Inbound for Dispatcher {
         }
 
         // ② Principal。不在名单里 → 拒绝，**不留任何记录**（不进 Run、不写投递、也不
-        // 记进去重表——重投再被拒一次，代价只是一条固定提示）。唯一的例外：群里的普通
-        // 文本、且渠道配了 `guest_agent`——走访客会话（无工具，不碰记忆），见 [`Self::guest`]。
+        // 记进去重表——重投再被拒一次，代价只是一条固定提示）。
         let principal = self.principal(&msg);
         if !principal.is_operator() {
-            return match self.guest_agent_for(&msg) {
-                Some(agent) => self.guest(msg, &agent).await,
-                None => Ok(reject(&msg)),
-            };
+            return Ok(reject(&msg));
         }
 
         // ③ 哪一个会话。
@@ -475,7 +360,39 @@ impl Inbound for Dispatcher {
         }
 
         // ⑥ 普通文本。
-        self.submit_text(&msg, session).await
+        let submitted = self
+            .state
+            .submit(
+                &session,
+                msg.request_key.clone(),
+                msg.text.clone(),
+                Some(msg.peer.clone()),
+                None,
+            )
+            .await
+            .map_err(|error| match error {
+                // 「已逻辑删除的会话拒绝新输入」（§8.10）：聊天这一侧也要说清楚是哪种
+                // 状态、以及该怎么做——HTTP 那侧是 409 加同一句话。
+                GatewayError::InvalidRequest(message) => GatewayError::InvalidRequest(format!(
+                    "{message}。要接着聊就在 TUI 里新建一个会话（`/new` 只是划一段边界）。"
+                )),
+                other => other,
+            })?;
+        // 谁在看这个 Run：`GatewayState::submit` 已经按来源会话起了一个看客
+        // （§11.4：终态回到来源会话，需要处理投来源会话 + home chat），所以这里不再
+        // 另起一个——两个看客会把同一条介入投两遍。
+        let ack = if submitted.deduplicated {
+            InboundAck::Duplicate {
+                run: Some(submitted.run.clone()),
+            }
+        } else {
+            InboundAck::Queued {
+                session,
+                run: submitted.run.clone(),
+            }
+        };
+        self.remember(&msg.request_key, &ack);
+        Ok(ack)
     }
 }
 

@@ -341,12 +341,12 @@ async fn two_synonymous_actives_merge_and_a_preview_writes_nothing() {
 async fn an_agent_scope_consolidates_on_its_own_and_leaves_personal_alone() {
     let merge = merge_json(0, &[1]);
     let rig = Rig::new(&[&merge]).await;
-    let guest = MemoryScope::Agent {
-        agent_id: "guest".into(),
+    let helper = MemoryScope::Agent {
+        agent_id: "helper".into(),
     };
-    rig.seed(Seed::new("g-1", DARK_A).scope(guest.clone()))
+    rig.seed(Seed::new("g-1", DARK_A).scope(helper.clone()))
         .await;
-    rig.seed(Seed::new("g-2", DARK_B).scope(guest.clone()))
+    rig.seed(Seed::new("g-2", DARK_B).scope(helper.clone()))
         .await;
     rig.seed(Seed::new("p-1", DARK_A)).await;
     rig.seed(Seed::new("p-2", DARK_B)).await;
@@ -355,7 +355,7 @@ async fn an_agent_scope_consolidates_on_its_own_and_leaves_personal_alone() {
         .manager
         .consolidate(&MemoryConsolidateRequest {
             apply: true,
-            scope: Some(guest),
+            scope: Some(helper),
             ..Default::default()
         })
         .await

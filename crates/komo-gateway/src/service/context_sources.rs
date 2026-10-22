@@ -249,7 +249,7 @@ fn delegate_parent(events: &[Event], run: &RunId) -> Option<RunId> {
 /// 这一次召回放行哪些作用域（§9.2）；`None` = 这一段不召回。
 ///
 /// `memory = "off"` 不召回；`"private"` 只放行这个 Agent 自己的 `agent:<id>`——**不带
-/// Personal**，那是操作者的个人记忆，访客之类的 Profile 不该碰；`"shared"` 看 Profile
+/// Personal**，那是操作者的个人记忆，私有记忆的 Profile 不该碰；`"shared"` 看 Profile
 /// 的 `memory_scope`：没写 = **不按作用域过滤**（`RecallQuery::scopes` 空就是"全部"），
 /// 写了就只召回那一个，外加 [`MemoryScope::Personal`]——用户资料是**显式共享**的那一份，
 /// 每个 Agent 都该看得见。
@@ -479,11 +479,11 @@ mod tests {
 
     #[test]
     fn recall_scopes_follow_the_memory_mode() {
-        assert_eq!(recall_scopes(MemoryMode::Off, "guest", None), None);
+        assert_eq!(recall_scopes(MemoryMode::Off, "helper", None), None);
         // 私有：只有它自己的作用域，Profile 的 `memory_scope` 不参与、Personal 不带。
         assert_eq!(
-            recall_scopes(MemoryMode::Private, "guest", Some(&MemoryScope::Personal)),
-            Some(vec![agent("guest")])
+            recall_scopes(MemoryMode::Private, "helper", Some(&MemoryScope::Personal)),
+            Some(vec![agent("helper")])
         );
         // 共享：与改造之前一样。
         assert_eq!(

@@ -3497,9 +3497,9 @@ async fn a_failed_batch_reports_a_reason_label_not_the_error_text() {
 
 // ---------------------------------------------------------------- 记忆模式（profile.memory）
 
-fn guest_scope() -> MemoryScope {
+fn helper_scope() -> MemoryScope {
     MemoryScope::Agent {
-        agent_id: "guest".into(),
+        agent_id: "helper".into(),
     }
 }
 
@@ -3521,57 +3521,35 @@ fn all_requests_text(harness: &Harness) -> String {
         .collect()
 }
 
-/// `memory = "off"` 的 Run：不调模型、当场落定，与访客会话是什么种类无关。
+/// `memory = "off"` 的 Run：不调模型、当场落定。
 #[tokio::test]
 async fn a_run_accepted_with_memory_off_is_settled_without_a_model_call() {
-    for kind in [SessionKind::Normal, SessionKind::Guest] {
-        let harness = HarnessBuilder::new()
-            .session_kind(kind)
-            .work(vec![run_item("run-1", 1)])
-            .build()
-            .await;
-        let run = RunId::from_raw("run-1");
-        harness.ledger.seed(
-            &SessionId::from_raw("sess-1"),
-            vec![
-                accepted_with(
-                    user_event(1, &run, "我喜欢深色主题"),
-                    "guest",
-                    MemoryMode::Off,
-                ),
-                assistant_event(2, &run, "好的"),
-            ],
-        );
-        let report = harness.manager.process_pending(4).await.unwrap();
-        assert_eq!(report.skipped, 1, "{kind:?} {report:?}");
-        assert!(harness.llm.requests.lock().unwrap().is_empty(), "{kind:?}");
-        assert_eq!(
-            harness.work.settled(),
-            vec![(run.clone(), MemoryWork::Done, Seq(2))]
-        );
-    }
-}
-
-/// 访客会话本身不再是跳过的理由：它的 Profile 是 `shared` 时照常提取（配置校验另外拒掉
-/// 这种配置）。
-#[tokio::test]
-async fn a_guest_session_is_not_skipped_by_its_kind_alone() {
     let harness = HarnessBuilder::new()
-        .session_kind(SessionKind::Guest)
-        .script(vec![round(NOTHING)])
-        .work(vec![run_item("run-1", 0)])
+        .work(vec![run_item("run-1", 1)])
         .build()
         .await;
     let run = RunId::from_raw("run-1");
     harness.ledger.seed(
         &SessionId::from_raw("sess-1"),
-        vec![user_event(1, &run, "我喜欢深色主题")],
+        vec![
+            accepted_with(
+                user_event(1, &run, "我喜欢深色主题"),
+                "helper",
+                MemoryMode::Off,
+            ),
+            assistant_event(2, &run, "好的"),
+        ],
     );
-    harness.manager.process_pending(4).await.unwrap();
-    assert_eq!(harness.llm.requests.lock().unwrap().len(), 1);
+    let report = harness.manager.process_pending(4).await.unwrap();
+    assert_eq!(report.skipped, 1, "{report:?}");
+    assert!(harness.llm.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        harness.work.settled(),
+        vec![(run.clone(), MemoryWork::Done, Seq(2))]
+    );
 }
 
-const GUEST_TEXT: &str = "访客在群里说空调温度要开二十八度";
+const HELPER_TEXT: &str = "助手记下空调温度要开二十八度";
 const OPERATOR_SECRET: &str = "操作者的空调固定设二十六度";
 
 /// 一条放在 Personal 的操作者记忆，直接写进仓库（不走会话证据）。
@@ -3586,12 +3564,11 @@ async fn seed_operator_memory(harness: &Harness) {
 #[tokio::test]
 async fn a_private_agent_extracts_into_its_own_scope_and_never_sees_operator_memories() {
     let harness = HarnessBuilder::new()
-        .session_kind(SessionKind::Guest)
         .script(vec![round(
             r#"{"observations":[
-                {"content":"访客喜欢深色主题","kind":"preference","scope":"personal",
+                {"content":"助手喜欢深色主题","kind":"preference","scope":"personal",
                  "said_by":"user_statement","evidence":["evt-1"]},
-                {"content":"访客在项目里用 cargo","kind":"fact","scope":"project:komo",
+                {"content":"助手在项目里用 cargo","kind":"fact","scope":"project:komo",
                  "said_by":"user_statement","evidence":["evt-1"]}]}"#,
         )])
         .work(vec![run_item("run-1", 0)])
@@ -3604,7 +3581,7 @@ async fn a_private_agent_extracts_into_its_own_scope_and_never_sees_operator_mem
         vec![
             accepted_with(
                 user_event(1, &run, "操作者的空调温度是多少，我喜欢深色主题"),
-                "guest",
+                "helper",
                 MemoryMode::Private,
             ),
             assistant_event(2, &run, "不知道"),
@@ -3615,7 +3592,7 @@ async fn a_private_agent_extracts_into_its_own_scope_and_never_sees_operator_mem
 
     let sent = all_requests_text(&harness);
     assert!(!sent.contains(OPERATOR_SECRET), "操作者的记忆进了提取提示");
-    assert!(sent.contains("agent:guest"), "允许的作用域是它自己的");
+    assert!(sent.contains("agent:helper"), "允许的作用域是它自己的");
     assert!(
         !sent.contains("personal|project"),
         "不再把别的作用域列给模型"
@@ -3627,7 +3604,7 @@ async fn a_private_agent_extracts_into_its_own_scope_and_never_sees_operator_mem
         .collect();
     assert_eq!(written.len(), 2, "{written:?}");
     assert!(
-        written.iter().all(|item| item.scope == guest_scope()),
+        written.iter().all(|item| item.scope == helper_scope()),
         "{written:?}"
     );
     let personal = harness
@@ -3657,15 +3634,15 @@ async fn a_shared_batch_does_list_operator_memories_as_candidates() {
             "操作者的空调温度是多少，我喜欢深色主题",
         )],
     );
-    // 访客私有的那一条同样能被关键词命中，但 shared 的批次看不到它。
-    let mut stranger = memory("guest-1", GUEST_TEXT);
-    stranger.scope = guest_scope();
+    // 私有的那一条同样能被关键词命中，但 shared 的批次看不到它。
+    let mut stranger = memory("helper-1", HELPER_TEXT);
+    stranger.scope = helper_scope();
     harness.repo.put(stranger, None).await.unwrap();
     harness.manager.process_pending(4).await.unwrap();
     let sent = all_requests_text(&harness);
     assert!(
-        !sent.contains(GUEST_TEXT),
-        "访客的私有记忆进了 shared 的提取提示"
+        !sent.contains(HELPER_TEXT),
+        "私有记忆进了 shared 的提取提示"
     );
     assert!(sent.contains(OPERATOR_SECRET));
     assert!(sent.contains("personal|project:<id>|environment:<id>"));
@@ -3677,7 +3654,7 @@ async fn a_shared_batch_cannot_write_into_an_agent_scope() {
     let harness = HarnessBuilder::new()
         .script(vec![round(
             r#"{"observations":[
-                {"content":"想写进别人的私有记忆","kind":"fact","scope":"agent:guest",
+                {"content":"想写进别人的私有记忆","kind":"fact","scope":"agent:helper",
                  "said_by":"user_statement","evidence":["evt-1"]}]}"#,
         )])
         .work(vec![run_item("run-1", 0)])
@@ -3723,10 +3700,10 @@ async fn runs_of_different_memory_modes_in_one_batch_are_extracted_under_their_o
             user_event(1, &run_1, "共享的偏好"),
             accepted_with(
                 user_event(3, &run_2, "私有的偏好"),
-                "guest",
+                "helper",
                 MemoryMode::Private,
             ),
-            accepted_with(user_event(5, &run_3, "关掉的"), "guest", MemoryMode::Off),
+            accepted_with(user_event(5, &run_3, "关掉的"), "helper", MemoryMode::Off),
         ],
     );
 
@@ -3741,7 +3718,7 @@ async fn runs_of_different_memory_modes_in_one_batch_are_extracted_under_their_o
             .map(|item| item.scope.clone())
     };
     assert_eq!(scope_of("共享的偏好"), Some(MemoryScope::Personal));
-    assert_eq!(scope_of("私有的偏好"), Some(guest_scope()));
+    assert_eq!(scope_of("私有的偏好"), Some(helper_scope()));
     assert_eq!(harness.work.settled().len(), 3, "三条都落定");
 }
 
@@ -3754,8 +3731,8 @@ async fn a_shared_recall_skips_agent_scopes_and_drops_carried_entries_from_them(
     project.scope = MemoryScope::Project {
         project_id: "home".into(),
     };
-    let mut stranger = memory("g-1", GUEST_TEXT);
-    stranger.scope = guest_scope();
+    let mut stranger = memory("g-1", HELPER_TEXT);
+    stranger.scope = helper_scope();
     for item in [memory("m-1", OPERATOR_SECRET), project, stranger] {
         harness.repo.put(item, None).await.unwrap();
     }
@@ -3766,7 +3743,7 @@ async fn a_shared_recall_skips_agent_scopes_and_drops_carried_entries_from_them(
     got.sort();
     assert_eq!(got, ["m-1", "p-1"]);
 
-    // 旧检查点里带着访客那一条：shared 续用时不再沿用。
+    // 旧检查点里带着私有记忆那一条：shared 续用时不再沿用。
     let carried = [MemoryUse {
         memory: MemoryId::from_raw("g-1"),
         revision: 1,
@@ -3782,7 +3759,7 @@ async fn a_shared_recall_skips_agent_scopes_and_drops_carried_entries_from_them(
     // 私有的那个 Agent 自己仍然看得到。
     let own = harness
         .manager
-        .prepare(&run, "空调", &carried, &[guest_scope()])
+        .prepare(&run, "空调", &carried, &[helper_scope()])
         .await;
     assert_eq!(own.uses.len(), 1);
     assert_eq!(own.uses[0].memory.as_str(), "g-1");

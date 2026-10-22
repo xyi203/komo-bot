@@ -1140,21 +1140,8 @@ impl GatewayState {
         record: Option<&komo_store::repos::session::SessionRecord>,
         model: Option<ModelConfig>,
     ) -> Result<RunSnapshot, GatewayError> {
-        // 访客会话（群里非操作者）：能力面恒为空——按 `kind` 强制，不依赖配置校验，Profile
-        // 写了什么工具都开不出工具来。记忆与项目文件则按 Profile 自己的设置走
-        // （`memory` / `project_files`，访客 Agent 在配置校验里被要求关掉它们）。
-        let guest =
-            record.is_some_and(|record| record.kind == komo_store::models::SessionKind::Guest);
         let profile = match config.agent.get(agent_id) {
             Some(profile) => profile,
-            // 访客的 Profile 不见了就拒绝受理：退回默认 Agent 等于把操作者的指令与共享记忆
-            // 交给陌生人。这一步在 `accept_input` 之前，没有 Run、没有落账，消息被拒。
-            None if guest => {
-                tracing::warn!(agent = %agent_id, session = %session, "访客会话绑的 Agent 已经不在配置里，拒绝受理");
-                return Err(GatewayError::InvalidRequest(format!(
-                    "访客 Agent `{agent_id}` 不在配置里，这个访客会话不再受理输入"
-                )));
-            }
             None => {
                 // 配置里已经没有这个 Agent 了（`[agents]` 被改过）。**一条配置改动不该让
                 // 输入失败**：退回默认 Agent 并把"是谁不见了"说清楚（§八：旧归属归入
@@ -1176,15 +1163,11 @@ impl GatewayState {
         //
         // 目录先补一次：刚登录的 MCP 服务器这时连上，它的工具进这条 Run 的能力面。
         self.refresh_mcp().await;
-        let mut surface = if guest {
-            AgentSurface::new(std::iter::empty::<String>())
-        } else {
-            komo_agent::surface_of(
-                profile,
-                &self.tool_names(),
-                &super::agent_config_file(&self.config),
-            )
-        };
+        let mut surface = komo_agent::surface_of(
+            profile,
+            &self.tool_names(),
+            &super::agent_config_file(&self.config),
+        );
         // 任务会话里没有 `task`：深度只有一层，结果只交回一层（`docs/background-tasks.md`）。
         // `GatewayTaskSpawner::parent_of` 还留着第二道。
         if record.is_some_and(|record| record.kind == komo_store::models::SessionKind::Task) {
@@ -1893,7 +1876,7 @@ fn assert_segment_types(_: &ResumedRound, _: &Segment, _: &CallEnv, _: HandlerEr
 
 #[cfg(test)]
 mod tests {
-    use komo_kernel::types::agent::{AgentProfile, MemoryMode};
+    use komo_kernel::types::agent::AgentProfile;
     use komo_kernel::types::ids::SessionId;
     use komo_store::models::SessionKind;
 
@@ -1903,7 +1886,6 @@ mod tests {
         state: &std::sync::Arc<crate::service::GatewayState>,
         config: &komo_kernel::protocol::config::ConfigSnapshot,
         agent: &str,
-        kind: SessionKind,
     ) -> Result<komo_kernel::types::agent::RunSnapshot, komo_kernel::traits::GatewayError> {
         let session = SessionId::new_at(state.clock.now());
         let origin = format!("test:{session}");
@@ -1913,7 +1895,7 @@ mod tests {
             &origin,
             &format!("sessions/{session}/events.jsonl"),
             agent,
-            kind,
+            SessionKind::Normal,
         )
         .await
         .expect("会话行");
@@ -1930,51 +1912,9 @@ mod tests {
             .await
     }
 
-    /// 访客会话的能力面按 `kind` 强制为空：就算 Profile 写了工具（配置校验被绕过、或
-    /// 配置是后来改的），也开不出工具来。项目文件与记忆则看 Profile 自己写的。
+    /// 项目文件看 Profile 的 `project_files`：关掉就读不到，开着就读得到。
     #[tokio::test]
-    async fn a_guest_session_freezes_an_empty_surface_even_if_its_profile_lists_tools() {
-        let gateway = TestGateway::start().await;
-        let state = gateway.state();
-        let mut config = (*state.snapshot()).clone();
-        for (id, memory, project_files) in [
-            ("guest", MemoryMode::Private, false),
-            ("worker", MemoryMode::Shared, true),
-        ] {
-            let mut profile = AgentProfile::new(id);
-            profile.tools = Some(vec!["read".into(), "bash".into()]);
-            profile.memory = memory;
-            profile.project_files = project_files;
-            config.agent.agents.insert(id.into(), profile);
-        }
-        std::fs::write(
-            config.paths.workspaces_dir.join("AGENTS.md"),
-            "项目规范暗号：蓝鲸",
-        )
-        .expect("写项目规范");
-
-        let normal = freeze_as(&state, &config, "worker", SessionKind::Normal)
-            .await
-            .expect("冻结");
-        assert!(normal.surface.allows("read"), "对照：普通会话拿得到工具");
-        assert!(normal.project_files_ref.is_some(), "对照：读得到项目规范");
-        assert_eq!(normal.memory_mode, MemoryMode::Shared);
-
-        let guest = freeze_as(&state, &config, "guest", SessionKind::Guest)
-            .await
-            .expect("冻结");
-        assert!(guest.surface.names().is_empty(), "{:?}", guest.surface);
-        assert_eq!(guest.project_files_ref, None);
-        assert_eq!(guest.project_files_update_ref, None);
-        assert_eq!(guest.skills_ref, None);
-        assert_eq!(guest.memory_mode, MemoryMode::Private);
-        assert_eq!(guest.agent_id, "guest");
-    }
-
-    /// 项目文件看 Profile 的 `project_files`，不看会话种类：普通会话关掉它也读不到，
-    /// 访客会话的 Profile 开着它就读得到（配置校验另外拒掉这种访客配置）。
-    #[tokio::test]
-    async fn project_files_follow_the_profile_not_the_session_kind() {
+    async fn project_files_follow_the_profile() {
         let gateway = TestGateway::start().await;
         let state = gateway.state();
         let mut config = (*state.snapshot()).clone();
@@ -1991,35 +1931,22 @@ mod tests {
         )
         .expect("写项目规范");
 
-        let closed = freeze_as(&state, &config, "closed", SessionKind::Normal)
-            .await
-            .expect("冻结");
+        let closed = freeze_as(&state, &config, "closed").await.expect("冻结");
         assert_eq!(closed.project_files_ref, None);
-        let open = freeze_as(&state, &config, "open", SessionKind::Guest)
-            .await
-            .expect("冻结");
+        let open = freeze_as(&state, &config, "open").await.expect("冻结");
         assert!(open.project_files_ref.is_some());
     }
 
-    /// 访客会话绑的 Profile 不在配置里：拒绝受理，不退回默认 Agent（那会把操作者的指令与
-    /// 共享记忆交给陌生人）。普通会话照旧退回默认 Agent。
+    /// 会话绑的 Profile 不在配置里：退回默认 Agent。
     #[tokio::test]
-    async fn a_guest_session_without_its_profile_is_refused_but_a_normal_one_falls_back() {
+    async fn a_session_without_its_profile_falls_back_to_the_default_agent() {
         let gateway = TestGateway::start().await;
         let state = gateway.state();
         let config = (*state.snapshot()).clone();
 
-        let refused = freeze_as(&state, &config, "ghost", SessionKind::Guest).await;
-        assert!(
-            matches!(
-                refused,
-                Err(komo_kernel::traits::GatewayError::InvalidRequest(_))
-            ),
-            "{refused:?}"
-        );
-        let fallback = freeze_as(&state, &config, "ghost", SessionKind::Normal)
+        let fallback = freeze_as(&state, &config, "ghost")
             .await
-            .expect("普通会话退回默认 Agent");
+            .expect("退回默认 Agent");
         assert_eq!(fallback.agent_id, config.agent.default_agent);
     }
 }

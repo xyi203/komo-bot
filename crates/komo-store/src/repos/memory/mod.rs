@@ -999,11 +999,11 @@ mod tests {
             project_id: "home".into(),
         };
         repo.put(project, None).await.unwrap();
-        let mut guest = item("m-3", "访客说卧室空调设 28 度", MemoryState::Active);
-        guest.scope = MemoryScope::Agent {
-            agent_id: "guest".into(),
+        let mut helper = item("m-3", "助手说卧室空调设 28 度", MemoryState::Active);
+        helper.scope = MemoryScope::Agent {
+            agent_id: "helper".into(),
         };
-        repo.put(guest, None).await.unwrap();
+        repo.put(helper, None).await.unwrap();
 
         let ids = |result: komo_kernel::types::memory::RecallResult| {
             let mut ids: Vec<String> = result
@@ -1022,7 +1022,7 @@ mod tests {
 
         let mut own = query("空调", RetrievalMode::Keyword);
         own.scopes = vec![MemoryScope::Agent {
-            agent_id: "guest".into(),
+            agent_id: "helper".into(),
         }];
         assert_eq!(ids(repo.recall(&own).await.unwrap()), ["m-3"]);
     }
@@ -1033,17 +1033,17 @@ mod tests {
     async fn a_flooded_scope_cannot_crowd_another_scope_out_of_the_candidates() {
         let (db, _dir) = temp().await;
         let repo = TursoMemoryRepo::new(db);
-        let guest = MemoryScope::Agent {
-            agent_id: "guest".into(),
+        let helper = MemoryScope::Agent {
+            agent_id: "helper".into(),
         };
-        // 访客那五条三个词都命中，操作者那条只命中一个：不过滤的话前两名全是访客的。
+        // 私有作用域那五条三个词都命中，操作者那条只命中一个：不过滤的话前两名全是它的。
         for (index, tail) in ["甲", "乙", "丙", "丁", "戊"].iter().enumerate() {
             let mut flood = item(
                 &format!("g-{index}"),
                 &format!("空调温度调到很高{tail}"),
                 MemoryState::Active,
             );
-            flood.scope = guest.clone();
+            flood.scope = helper.clone();
             repo.put(flood, None).await.unwrap();
         }
         repo.put(item("p-1", "客厅空调设 26 度", MemoryState::Active), None)
@@ -1054,9 +1054,9 @@ mod tests {
 
         let unscoped = repo.recall(&tight).await.unwrap();
         let ids: Vec<_> = unscoped.items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, ["p-1"], "操作者的记忆被访客灌水挤掉了");
+        assert_eq!(ids, ["p-1"], "操作者的记忆被私有记忆灌水挤掉了");
 
-        // 反过来：访客自己的召回，不被操作者那边的大量命中挤掉。
+        // 反过来：它自己的召回，不被操作者那边的大量命中挤掉。
         let (db, _dir) = temp().await;
         let repo = TursoMemoryRepo::new(db);
         for (index, tail) in ["甲", "乙", "丙", "丁", "戊"].iter().enumerate() {
@@ -1071,13 +1071,13 @@ mod tests {
             .await
             .unwrap();
         }
-        let mut own = item("g-1", "访客说空调设 28 度", MemoryState::Active);
-        own.scope = guest.clone();
+        let mut own = item("g-1", "助手说空调设 28 度", MemoryState::Active);
+        own.scope = helper.clone();
         repo.put(own, None).await.unwrap();
-        tight.scopes = vec![guest];
+        tight.scopes = vec![helper];
         let result = repo.recall(&tight).await.unwrap();
         let ids: Vec<_> = result.items.iter().map(|i| i.id.as_str()).collect();
-        assert_eq!(ids, ["g-1"], "访客的记忆被操作者那边的命中挤掉了");
+        assert_eq!(ids, ["g-1"], "它的记忆被操作者那边的命中挤掉了");
     }
 
     #[tokio::test]
@@ -1436,7 +1436,7 @@ mod tests {
         assert_eq!(hit.vector_coverage, Some(1.0));
     }
 
-    /// 向量臂同样先过作用域再取候选：访客那边方向更近的五条，挤不掉操作者的那一条。
+    /// 向量臂同样先过作用域再取候选：私有作用域里方向更近的五条，挤不掉操作者的那一条。
     #[tokio::test]
     async fn a_flooded_scope_cannot_crowd_another_scope_out_of_the_vector_candidates() {
         let (db, _dir) = temp().await;
@@ -1449,11 +1449,11 @@ mod tests {
             it.scope = scope;
             (id.to_string(), it, vector)
         };
-        let guest = MemoryScope::Agent {
-            agent_id: "guest".into(),
+        let helper = MemoryScope::Agent {
+            agent_id: "helper".into(),
         };
         let mut rows: Vec<_> = (0..5)
-            .map(|n| put(&format!("g-{n}"), guest.clone(), [1.0, 0.0]))
+            .map(|n| put(&format!("g-{n}"), helper.clone(), [1.0, 0.0]))
             .collect();
         rows.push(put("p-1", MemoryScope::Personal, [0.6, 0.8]));
         for (id, it, vector) in rows {
@@ -1470,10 +1470,10 @@ mod tests {
         assert_eq!(ids, ["p-1"]);
 
         let mut flooded = vector_query(RetrievalMode::Vector, &[0.6, 0.8]);
-        flooded.scopes = vec![guest];
+        flooded.scopes = vec![helper];
         flooded.candidate_limit = 2;
         let own = repo.recall(&flooded).await.unwrap();
-        assert_eq!(own.items.len(), 2, "访客自己的召回只在自己的作用域里取");
+        assert_eq!(own.items.len(), 2, "它自己的召回只在自己的作用域里取");
         assert!(own.items.iter().all(|i| i.id.as_str().starts_with("g-")));
     }
 

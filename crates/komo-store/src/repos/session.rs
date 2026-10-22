@@ -67,7 +67,7 @@ impl SessionRecord {
 pub fn kind_of_row(row: &SessionRow) -> Result<SessionKind, StoreError> {
     SessionKind::parse(&row.kind).ok_or_else(|| {
         StoreError::Corrupt(format!(
-            "sessions.kind 认不出的值 {:?}（会话 {}）：只认 main / normal / task / guest",
+            "sessions.kind 认不出的值 {:?}（会话 {}）：只认 main / normal / task",
             row.kind, row.id
         ))
     })

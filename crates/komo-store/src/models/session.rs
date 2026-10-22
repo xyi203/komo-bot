@@ -70,7 +70,7 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("state_changed_at", "BIGINT NOT NULL DEFAULT 0"),
 ];
 
-/// `sessions.kind` 里那三个词（`docs/bot.md` §4.2：「先保持简单」——不要一开始枚举所有
+/// `sessions.kind` 里那几个词（`docs/bot.md` §4.2：「先保持简单」——不要一开始枚举所有
 /// 平台和业务场景）。
 ///
 /// 它是**用途**，不是身份：身份是 `agent_id`。同一个 Agent 的主会话与任务会话只有 `kind`
@@ -85,6 +85,27 @@ pub enum SessionKind {
     /// 独立任务会话：跨 Agent 委派时给目标 Agent 建的**任务**会话——不是它的主聊天
     /// （§4.2 最后一段：不要默认把子任务塞进目标 Bot 的主会话）。
     Task,
+    /// 群里非操作者 @ 机器人开出的会话（`[channels.*] guest_agent`）：无工具、不碰记忆、
+    /// 不读项目文件——这些在受理与装配时按这个 `kind` 强制，不只看配置。
+    Guest,
+}
+
+#[cfg(test)]
+mod kind_tests {
+    use super::SessionKind;
+
+    #[test]
+    fn every_kind_round_trips_through_its_column_word() {
+        for kind in [
+            SessionKind::Main,
+            SessionKind::Normal,
+            SessionKind::Task,
+            SessionKind::Guest,
+        ] {
+            assert_eq!(SessionKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(SessionKind::parse("stranger"), None);
+    }
 }
 
 impl SessionKind {
@@ -94,6 +115,7 @@ impl SessionKind {
             SessionKind::Main => "main",
             SessionKind::Normal => "normal",
             SessionKind::Task => "task",
+            SessionKind::Guest => "guest",
         }
     }
 
@@ -105,6 +127,7 @@ impl SessionKind {
             "main" => Some(SessionKind::Main),
             "normal" => Some(SessionKind::Normal),
             "task" => Some(SessionKind::Task),
+            "guest" => Some(SessionKind::Guest),
             _ => None,
         }
     }

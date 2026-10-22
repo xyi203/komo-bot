@@ -422,6 +422,7 @@ pub(super) struct ChannelSection {
     #[serde(default)]
     pub allow_from: Vec<PeerId>,
     pub home_chat: Option<PeerId>,
+    pub guest_agent: Option<String>,
 }
 
 impl ChannelSection {
@@ -430,6 +431,7 @@ impl ChannelSection {
             enabled: self.enabled,
             allow_from: self.allow_from,
             home_chat: self.home_chat,
+            guest_agent: self.guest_agent,
         }
     }
 }

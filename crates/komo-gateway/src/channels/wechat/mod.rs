@@ -854,6 +854,7 @@ mod tests {
             enabled: true,
             allow_from: vec![PeerId::new("wxid_op")],
             home_chat: Some(PeerId::new("wxid_op")),
+            guest_agent: None,
         };
         assert!(
             factory

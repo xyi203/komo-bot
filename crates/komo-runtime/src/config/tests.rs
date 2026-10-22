@@ -618,6 +618,32 @@ fn a_warning_rides_along_with_a_config_that_still_loads() {
     );
 }
 
+#[test]
+fn a_guest_agent_loads_from_the_file_and_an_empty_tool_list_stays_empty() {
+    let fixture = Fixture::valid();
+    let text = Fixture::config_text("chat-a", "medium")
+        .replace(
+            "[agents.assistant]",
+            "[agents.assistant]\n\n[agents.guest]\ntools = []",
+        )
+        .replace(
+            "home_chat = \"oc_home\"",
+            "home_chat = \"oc_home\"\nguest_agent = \"guest\"",
+        );
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(loaded.issues.is_empty(), "{:?}", loaded.issues);
+    assert_eq!(
+        loaded.snapshot.channels.feishu.guest_agent.as_deref(),
+        Some("guest")
+    );
+    assert_eq!(
+        loaded.snapshot.agent.get("guest").unwrap().tools,
+        Some(Vec::new())
+    );
+}
+
 // ---------------------------------------------------------------- [mcp]（docs/mcp.md）
 
 #[test]

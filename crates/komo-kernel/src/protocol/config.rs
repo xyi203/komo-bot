@@ -193,6 +193,9 @@ pub struct ChannelConfig {
     /// 主动投递（Run 结束、需要人判断等）的目标会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_chat: Option<PeerId>,
+    /// 群里非操作者 @机器人 时用的 Agent；不写 = 非操作者一律拒绝。私聊不受它影响。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_agent: Option<String>,
 }
 
 impl ChannelConfig {
@@ -793,6 +796,7 @@ mod tests {
                     enabled: true,
                     allow_from: vec![PeerId::new("ou_xxx")],
                     home_chat: Some(PeerId::new("oc_xxx")),
+                    guest_agent: None,
                 },
                 telegram: ChannelConfig::default(),
                 wechat: ChannelConfig::default(),
@@ -904,11 +908,13 @@ mod tests {
             enabled: true,
             allow_from: vec![PeerId::new("123")],
             home_chat: Some(PeerId::new("123")),
+            guest_agent: None,
         };
         snapshot.channels.wechat = ChannelConfig {
             enabled: true,
             allow_from: vec![PeerId::new("wxid_x")],
             home_chat: Some(PeerId::new("wxid_x")),
+            guest_agent: None,
         };
         let order: Vec<ChannelPlatform> = snapshot
             .channels
@@ -932,6 +938,7 @@ mod tests {
             enabled: true,
             allow_from: vec![],
             home_chat: Some(PeerId::new("oc_x")),
+            guest_agent: None,
         };
         assert!(channel.is_outbound_only());
         assert!(!channel.is_operator(&PeerId::new("ou_x")));

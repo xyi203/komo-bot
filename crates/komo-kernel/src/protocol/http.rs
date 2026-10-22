@@ -148,9 +148,9 @@ pub struct SessionSummary {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
-    /// 会话用途：`main` / `normal` / `task`（`docs/background-tasks.md`）。
+    /// 会话用途：`main` / `normal` / `task` / `guest`（`docs/background-tasks.md`）。
     /// 老客户端读到的是默认的 `"normal"`（这个字段之前不存在）。值镜像
-    /// `komo_store::models::SessionKind::as_str()` 的三个词——kernel 不依赖 store，这里
+    /// `komo_store::models::SessionKind::as_str()` 的那几个词——kernel 不依赖 store，这里
     /// 就不定义那个枚举本身，只带它的字符串表示。
     #[serde(default = "session_kind_default")]
     pub kind: String,

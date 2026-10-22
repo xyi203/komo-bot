@@ -596,6 +596,10 @@ fn check_channel(
         }
     }
 
+    if let Some(guest) = &channel.guest_agent {
+        check_guest_agent(guest, platform, key, snapshot, issues);
+    }
+
     if let Some(home) = &channel.home_chat {
         if let Err(message) = check_peer_id(platform, home) {
             issues.push(error(&format!("{key}.home_chat"), message));
@@ -625,6 +629,43 @@ fn check_channel(
                 "名单为空：这个渠道只出不进（还能收主动投递，但没人能通过它下指令）",
             ));
         }
+    }
+}
+
+/// 访客 Agent 只能是无工具的对话：`read` / `rg` 没有根目录限制，MCP 工具用的是操作者的
+/// 凭据，bash 管不住——群里陌生人 @ 一句就能触发 Run，工具表必须由配置**显式**写成空。
+fn check_guest_agent(
+    guest: &str,
+    platform: ChannelPlatform,
+    key: &str,
+    snapshot: &ConfigSnapshot,
+    issues: &mut Vec<ConfigIssue>,
+) {
+    let key = format!("{key}.guest_agent");
+    if platform == ChannelPlatform::Wechat {
+        issues.push(error(&key, "微信只有私聊，没有群可以放访客"));
+        return;
+    }
+    let Some(profile) = snapshot.agent.get(guest) else {
+        issues.push(error(&key, format!("`{guest}` 不在 [agents.<id>] 里")));
+        return;
+    };
+    match profile.tools.as_deref() {
+        Some([]) => {}
+        None => issues.push(error(
+            &key,
+            format!(
+                "`{guest}` 没写 tools，会拿到整个工具目录；访客只能是无工具的对话，\
+                 在 [agents.{guest}] 里写 tools = []（read/rg 没有根目录限制，MCP 用的是操作者的凭据）"
+            ),
+        )),
+        Some(_) => issues.push(error(
+            &key,
+            format!(
+                "`{guest}` 给了工具；访客只能是无工具的对话，改成 tools = []\
+                 （read/rg 没有根目录限制，MCP 用的是操作者的凭据）"
+            ),
+        )),
     }
 }
 
@@ -804,6 +845,52 @@ mod tests {
         let issues = validate(&snapshot);
         assert_eq!(keys(&issues), vec!["channels.feishu.allow_from"]);
         assert!(issues[0].message.starts_with("[1]"), "{:?}", issues[0]);
+    }
+
+    fn with_guest(tools: Option<Vec<&str>>) -> ConfigSnapshot {
+        let mut snapshot = snapshot_fixture();
+        let mut guest = komo_kernel::types::agent::AgentProfile::new("guest");
+        guest.tools = tools.map(|names| names.into_iter().map(String::from).collect());
+        snapshot.agent.agents.insert("guest".into(), guest);
+        snapshot.channels.feishu.guest_agent = Some("guest".into());
+        snapshot
+    }
+
+    #[test]
+    fn a_guest_agent_with_an_explicit_empty_tool_list_is_accepted() {
+        assert_eq!(validate(&with_guest(Some(vec![]))), vec![]);
+    }
+
+    #[test]
+    fn a_guest_agent_that_is_not_declared_is_refused() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.channels.feishu.guest_agent = Some("ghost".into());
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["channels.feishu.guest_agent"]);
+        assert!(has_errors(&issues));
+    }
+
+    #[test]
+    fn a_guest_agent_without_an_explicit_tool_list_is_refused() {
+        let issues = validate(&with_guest(None));
+        assert_eq!(keys(&issues), vec!["channels.feishu.guest_agent"]);
+        assert!(issues[0].message.contains("tools = []"), "{:?}", issues[0]);
+    }
+
+    #[test]
+    fn a_guest_agent_that_lists_any_tool_is_refused() {
+        let issues = validate(&with_guest(Some(vec!["read"])));
+        assert_eq!(keys(&issues), vec!["channels.feishu.guest_agent"]);
+        assert!(has_errors(&issues));
+    }
+
+    #[test]
+    fn a_guest_agent_on_wechat_is_refused() {
+        let mut snapshot = with_guest(Some(vec![]));
+        snapshot.channels.feishu.guest_agent = None;
+        snapshot.channels.wechat.guest_agent = Some("guest".into());
+        let issues = validate(&snapshot);
+        assert_eq!(keys(&issues), vec!["channels.wechat.guest_agent"]);
     }
 
     #[test]

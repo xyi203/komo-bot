@@ -125,7 +125,7 @@ Gateway 对数据目录持有进程锁。多个 CLI 同时启动时，只允许�
 
 1. 重新解析两个文件成一份**完整的**新快照，跑与 `komo config check` 相同的校验；任何错误 → 旧快照原样保留，错误写日志并投递到 home chat，重载命令返回该错误。**校验不过的配置永远不会被装上**，哪怕只错一个键。
    **不认识的键不算错**（2026-09-24）：`config.toml` 里多出来的键——升级后留下的退役键、拼错的键、写到了别的表下面的键（`default_agent` 落进前一个 `[agents.x]` 是最常见的一种）——被忽略，配置照常装上，但每一个都以完整路径（如 `gateway.listen_typo`）作为**警告**出现在 `komo config check`、`komo doctor` 与重载日志里。键认识、值的类型不对仍然是错误。
-2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（arc-swap）。**读配置的地方按用途读当前快照，不缓存**：Dispatcher 判定 Principal 时读 `allow_from` / `groups`，Notifier 解析 home chat 时读 `home_chat`，新 Run 在 `accept_input` 时抓一份模型 / effort 快照存进 `runs.config_snapshot`——所以名单改完，下一条消息就按新名单判；模型改完，下一个 Run 用新模型，**正在跑的 Run 与后台记忆任务继续用它们各自开始时抓的快照**（§13.3），不在半路换模型。
+2. 校验通过 → 原子替换进程内唯一的 `Arc<ConfigSnapshot>`（arc-swap）。**读配置的地方按用途读当前快照，不缓存**：Dispatcher 判定 Principal 时读 `allow_from` / `guest_agent`，Notifier 解析 home chat 时读 `home_chat`，新 Run 在 `accept_input` 时抓一份模型 / effort 快照存进 `runs.config_snapshot`——所以名单改完，下一条消息就按新名单判；模型改完，下一个 Run 用新模型，**正在跑的 Run 与后台记忆任务继续用它们各自开始时抓的快照**（§13.3），不在半路换模型。
 3. 逐段比对新旧快照，只重建变化了的东西：某个 `[channels.*]` 的 `enabled` 或凭证变了 → 只停掉并重启那个渠道的 `serve`（飞书重连 ws、Telegram 重新起轮询），其他渠道不受影响，未 ack 的入站消息按平台的至少一次投递重来；模型 `base_url` / 凭证变了 → 换掉对应 `LlmClient` 实例；向量模型变了 → 走 §9.5 的空间指纹与索引代次流程，不在重载里偷偷重建索引。
 4. 一小组键**只在启动时生效**：数据目录 / `KOMO_HOME`、监听地址与端口、数据库路径。这些键改了，重载照常完成其余部分，然后明确报告"以下键需要 `komo gateway restart`"，不静默忽略，也不假装已生效。
 
@@ -1070,7 +1070,11 @@ HTTP API (TUI / CLI) ──┘      1. request_key 去重（durable，§8.5 的�
 enabled    = true
 allow_from = ["ou_xxx"]            # 操作者的 open_id；为空则没人能说话
 home_chat  = "oc_xxx"              # 主动投递（介入通知、Cron 结果等）的目标会话
-groups     = ["oc_yyy"]            # 允许响应的群；缺省 = 只响应 allow_from 的私聊
+guest_agent = "guest"             # 群里非操作者 @机器人 时用的 Agent；不写 = 非操作者一律拒绝
+
+[agents.guest]                     # 访客 Agent 必须显式 tools = []（见下文「群里的访客」）
+tools = []
+instructions = "你在一个群里回答同事的问题……"
 
 [channels.telegram]
 enabled    = true
@@ -1092,8 +1096,8 @@ TELEGRAM_BOT_TOKEN=...
 
 - **Principal**：发送者在该渠道 `allow_from` 里就是操作者，否则**拒绝**——回一条固定提示，带上发送者在该平台的 id（`ou_xxx` / `123456789` / `wxid_xxx`），操作者把它抄进 `allow_from` 即可；消息不进入 Run，也不留任何记录。`allow_from` 为空的渠道等于只出不进：还能作 `home_chat` 收投递，但没人能通过它下指令。**`/answer` 等命令只接受操作者。**
 - **怎么知道自己的 id**：任何人对机器人说 `/id`，机器人回 `{platform}:{chat_id}` 与发送者 id——被拒绝的提示里也带着同样的信息。这是唯一的"发现"手段，没有别的准入流程。
-- **Conversation**：操作者的**私聊**（Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书私聊例外，与飞书群一样一个话题一个 Session（见下文「飞书群里的话题」）；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session（飞书群里改为一个话题一个 Session，见下文「飞书群里的话题」），只有 `groups` 列出的群会被响应，群里只响应 @机器人 的消息并剥掉提及，且发送者仍须在 `allow_from` 里。WeChat 只有 DM。要跑很久的事派给独立的任务会话在后台跑，结果交回 home session 由它转告，home 不被一件慢事堵住，见 `docs/background-tasks.md`。
-- **改名单不改数据库，也不重启**：`allow_from` / `home_chat` / `groups` 每条消息、每次投递都从当前配置快照读（§3 热重载第 2 步），文件保存后下一条消息就按新名单判定；`komo config check` 与重载共用同一套校验（id 形态、`home_chat` 所属渠道必须 enabled 且有凭证），校验不过则旧名单继续生效并在 home chat 报错。`komo doctor` 把"某渠道 enabled 但 `allow_from` 为空"当作警告列出。
+- **Conversation**：操作者的**私聊**（Telegram DM、WeChat、TUI）落到同一个 **home session**——早上在微信说的话，回到终端接着说；飞书私聊例外，与飞书群一样一个话题一个 Session（见下文「飞书群里的话题」）；飞书 / Telegram 的群聊按 `{platform}:{chat_id}` 各自一个 Session（飞书群里改为一个话题一个 Session，见下文「飞书群里的话题」）。**没有群名单**（`groups` 2026-10-22 删除，旧配置里的这个键只报"不认识、已忽略"）：机器人所在的群里只响应 @机器人 的消息并剥掉提及；发送者在 `allow_from` 里就是操作者、照常全能力，不在的走「群里的访客」（下文）或被拒。已删除（或正在关闭）的会话不再接收平台消息，同一来源的下一条另开新会话。WeChat 只有 DM。要跑很久的事派给独立的任务会话在后台跑，结果交回 home session 由它转告，home 不被一件慢事堵住，见 `docs/background-tasks.md`。
+- **改名单不改数据库，也不重启**：`allow_from` / `home_chat` / `guest_agent` 每条消息、每次投递都从当前配置快照读（§3 热重载第 2 步），文件保存后下一条消息就按新名单判定；`komo config check` 与重载共用同一套校验（id 形态、`home_chat` 所属渠道必须 enabled 且有凭证），校验不过则旧名单继续生效并在 home chat 报错。`komo doctor` 把"某渠道 enabled 但 `allow_from` 为空"当作警告列出。
 - Cron 触发的 Run 来源仍是 Cron（§8.8）；在聊天里 `/answer` 它的介入，不会让它获得交互操作者的身份。
 
 ### 11.3 介入在聊天里
@@ -1111,7 +1115,7 @@ TELEGRAM_BOT_TOKEN=...
 | `/new` | 当前 Session 追加 `conversation.boundary`，不切 Session |
 | `/cancel` | 取消该 Session 当前 Run |
 | `/status` | 当前 Run 状态、待处理介入数 |
-| `/id` | 回显 `{platform}:{chat_id}` 与发送者 id，供抄进 config.toml 的 `allow_from` / `home_chat` / `groups`；任何人可用，也是唯一不要求操作者身份的命令 |
+| `/id` | 回显 `{platform}:{chat_id}` 与发送者 id，供抄进 config.toml 的 `allow_from` / `home_chat`；任何人可用，也是唯一不要求操作者身份的命令 |
 
 **TUI 不接管整屏。** 它只占终端**最底下**那一小块**视口**（还在动的那一小段 · 状态行 · 命令面板 · 输入框），会话正文一条条**交还给终端自己的回滚区**：滚轮、选中复制、退出之后留在屏幕上的那段记录，都是终端本来就会做的事，不必在这里重做一遍，而且每条正文只画一次，不随每一帧重算。交出去的行**从此不再改**（例外只有整段重画：下面的 `Ctrl-T`，以及终端被拉大拉小——照 pi，尺寸一变就擦屏、擦回滚区、按新宽度从横幅起重交一遍，否则旧视口被终端折行挪位留下残骸，正文也停在旧宽度上；2026-10-19。整段重画就是把整段会话再写一遍，拖动时只画两次：变的第一下当场画，之后尺寸还在变就不画，停下 100ms 再按最后的尺寸补一次——伪终端里 0.34 秒改 20 次尺寸，原来整段重画 19 次、写出 4.7 MB，现在 2 次、0.5 MB），所以"定型"要判得保守：用户那条消息、助手那段回答、跑完（或所属 Run 已结束）的一次调用、一条提示才交；还没收到 `run.accepted` 的提交、草稿里正在写的那一段、还在跑的调用留在视口里逐帧重画。两边不重叠——定型的那一帧它从视口消失、同时出现在回滚区上。**草稿边生成边交**（2026-10-13）：停在代码块之外的空行之前的段落已经定型——渲染器一块一块出行，这一段单独渲染与整段渲染的开头逐行相同——当场交给回滚区（块与块之间空一行，照 pi，2026-10-15：空行只插在后一块之前、头尾不留，所以接缝上那一行由接着交的那一段补；紧跟在一段话下、原文没隔空行的列表不空；标题一、二级不写 `#`，一级加粗加下划线、二级加粗，三级起才留 `###` 前缀），视口只留正在写的那一段；正式的 `message.assistant` 到了只补余下的部分。否则一段几十行的回答生成期间只露出视口里几行尾巴，往上滚也滚不到开头。定稿与交出去的那段对不上（断线后草稿接错）就照实给出整条定稿并说明；Run 没等到定稿就结束了，交出去的半段留着，补一句没写完。**终端模式（输入以 `!` 开头）不给文字提示**：输入框标题不写说明，跑完也不补"为什么"，洋红色的边框与 `!` 已经说清这一条不经模型；只有发出去之前就注定跑不起来的命令（编辑器、分页器、`sudo`……）仍然当场拦下并说一句，否则按了 Enter 什么都不发生。`Ctrl-T` 因此是一个**模式**而不是对某一条的展开，管的是整段会话（2026-10-14，照 pi 的 Ctrl-O）：切换时擦掉屏幕与终端的回滚区（先 `ESC[2J` 擦屏、回左上角、再 `ESC[3J` 擦回滚区——反过来，有的终端擦屏时推进回滚区的那一页会留下），从开场横幅起按新模式把整段会话重新交一遍，与平常的一帧一样包在同步输出里。代价是进 TUI 之前终端里的内容一并擦掉。提示没有自己的 seq，记下它出现时已经收到的最后一条事件，重交时排回那条之后（同一个 seq 上排在消息与调用后面），不挤到最后；提示只留最近 50 条，更早的重画后就没有了。
 
@@ -1144,7 +1148,14 @@ TELEGRAM_BOT_TOKEN=...
 - **正文过长**：卡片只放前 3000 个字符（飞书卡片请求体上限 30 KB，PATCH 时卡片 JSON 还要再转义一层，取一个保守值）并注明"其余见下方消息"，余下的按普通文本分段发。
 - **竞态**：终态投递来自 Run 的看客任务，与发卡片并发，可能先到。所以拿到 `Queued` 后、任何网络调用之前先同步登记一个 pending 槽位，卡片发出去后填上 `message_id`（或标记失败）；终态遇到 pending 槽位时最多等 5 秒。等不到就把槽位标成"已放弃"改发文本，卡片之后才到的由发卡片那一侧自己把它收尾成"结果见下方消息"——两边在同一把锁里比较并交换，谁先到都只有一方认领那张卡片，不会出现"文本发了、卡片停在处理中"。剩下的窗口只有"Dispatcher 返回 `Queued` 到登记槽位"之间（同步代码、没有 await），Run 要在那里面跑完一整轮才会漏。
 
-**飞书群里的话题（2026-10-22；私聊已真机验证，群未验证）。** 群里 @机器人 与私聊里的每条消息一律以话题回复，**一个话题一个 Session**（做法同 OpenClaw 飞书渠道的 `group_topic` 会话范围与 `replyInThread`）。话题按根消息 id（`om_*`）认：消息带 `thread_id` 且有 `root_id`（已在话题里，飞书文档：话题内消息的 `root_id` 与 `parent_id` 都是话题根）就用 `root_id`；否则这条消息自己就是新话题的根——主流里的 @ 和主流里的引用回复都从当前这条开新话题，不把话题挂到被引用的老消息上。peer 写成 `feishu:{chat_id}#{om_root}`（`ChannelPeer.thread`），`runs.peer`、`sessions.origin`、`deliveries.thread` 都带着它，所以这个 Session 的一切出站——处理中卡片、终态的跟随分段与文本退路、命令回执、介入、后台任务与监听的通知、重启后补发——都进同一个话题。飞书发消息接口不能按 `thread_id` 发（`receive_id_type` 没有这一项），进话题只能回复话题里的消息：komo 一律回复话题根并带 `reply_in_thread: true`，处理中卡片回复触发的那条（主流里它就是根，带上这个参数就开出话题）。群准入仍只看 `chat_id`；`/id` 与拒绝提示回显的会话不带话题，它是抄进 `groups` / `home_chat` 的串。话题里没 @机器人 的消息照旧不响应（私聊不看 @）。**飞书私聊因此不再进 home session**：Dispatcher 对带话题的私聊走 `session_for_peer`，没有话题的私聊（Telegram、WeChat、TUI）照旧进 home；home 的主动投递（`home_chat`、后台任务通知）仍发到私聊主线。实测（2026-10-22，`home_chat` 那个 `chat_mode=p2p` 的会话）：回复根消息带 `reply_in_thread: true` 返回 `thread_id`，再回复同一根消息落在同一个 `thread_id`——私聊支持话题。`/cancel`、`/status`、`/new` 作用于所在话题的 Session。此前的整群 Session 与飞书私聊在 home 里的历史不再收到新消息，不迁移。平台对不支持话题回复的群报 `230071`，没有样本，不做退回主流的兜底。
+**飞书群里的话题（2026-10-22；私聊已真机验证，群未验证）。** 群里 @机器人 与私聊里的每条消息一律以话题回复，**一个话题一个 Session**（做法同 OpenClaw 飞书渠道的 `group_topic` 会话范围与 `replyInThread`）。话题按根消息 id（`om_*`）认：消息带 `thread_id` 且有 `root_id`（已在话题里，飞书文档：话题内消息的 `root_id` 与 `parent_id` 都是话题根）就用 `root_id`；否则这条消息自己就是新话题的根——主流里的 @ 和主流里的引用回复都从当前这条开新话题，不把话题挂到被引用的老消息上。peer 写成 `feishu:{chat_id}#{om_root}`（`ChannelPeer.thread`），`runs.peer`、`sessions.origin`、`deliveries.thread` 都带着它，所以这个 Session 的一切出站——处理中卡片、终态的跟随分段与文本退路、命令回执、介入、后台任务与监听的通知、重启后补发——都进同一个话题。飞书发消息接口不能按 `thread_id` 发（`receive_id_type` 没有这一项），进话题只能回复话题里的消息：komo 一律回复话题根并带 `reply_in_thread: true`，处理中卡片回复触发的那条（主流里它就是根，带上这个参数就开出话题）。`/id` 与拒绝提示回显的会话不带话题，它是抄进 `home_chat` 的串。话题里没 @机器人 的消息照旧不响应（私聊不看 @）。**飞书私聊因此不再进 home session**：Dispatcher 对带话题的私聊走 `session_for_peer`，没有话题的私聊（Telegram、WeChat、TUI）照旧进 home；home 的主动投递（`home_chat`、后台任务通知）仍发到私聊主线。实测（2026-10-22，`home_chat` 那个 `chat_mode=p2p` 的会话）：回复根消息带 `reply_in_thread: true` 返回 `thread_id`，再回复同一根消息落在同一个 `thread_id`——私聊支持话题。`/cancel`、`/status`、`/new` 作用于所在话题的 Session。此前的整群 Session 与飞书私聊在 home 里的历史不再收到新消息，不迁移。平台对不支持话题回复的群报 `230071`，没有样本，不做退回主流的兜底。
+
+**群里的访客（2026-10-22，未真机验证）。** 群里不在 `allow_from` 的人 @机器人，渠道配了 `guest_agent` 才答，否则照旧回拒绝提示；私聊里的非操作者一律拒绝；非操作者的斜杠命令（含 `/answer`）一律拒绝，`/answer` 自己另有一道操作者检查。komo 没有审批、`bash` 拦不住，所以访客是**无工具的纯对话**，而且隔离按会话类型强制、不靠配置：
+- **会话**：`kind = guest`、`agent_id` = 访客 Agent，来源 `guest:{peer}`（飞书 `guest:feishu:{chat}#{om_root}`，Telegram 没有话题就是整群一个）。与操作者在同一话题里的 `chat:` 会话互不相见；回复仍落在同一个话题里。`guest_agent` 改了，下一条另开新会话。
+- **能力面恒为空**（`freeze_run` 按 kind，Profile 写了什么都不算）：`read` / `rg` 没有根目录限制，MCP 工具用的是操作者的凭据，现有的工具没有一样能交给陌生人。配置校验同样要求访客 Agent 显式写 `tools = []`（不写 = 整个目录，写了任何工具都报错），WeChat 上配 `guest_agent` 报错（只有私聊）。
+- **不读项目文件与 skills**：项目文件的发现从工作目录一路往上到 `/`，会读到 `~/AGENTS.md`。
+- **不召回、不提取记忆**：`recall_scopes` 总会带上 Personal，作用域挡不住；访客的话不是操作者的事实，提取会默认写进 Personal。召回在每一段装配时按 kind 跳过，提取在批处理的跳过名单里。
+- **没堵上的**：系统提示固定的「工作目录：…」一行带着操作者的绝对路径；访客用操作者的模型额度、不限流——要省钱就给访客 Agent 配便宜的 `model`。
 
 一条普通消息在 Run 停在介入上时到达：Run 不会被越过（§6），消息排在它后面；不做"插话替换答复"这类特殊路径。聊天渠道的消息也不插话（插话只在 TUI，且只并进**正在跑**的 Run，§6）：渠道的回复卡片与"Run 结束时回复"按 Run 记账，一条消息被并走就没有自己的那次回复了。
 
@@ -1168,7 +1179,7 @@ TELEGRAM_BOT_TOKEN=...
 
 ```text
 ~/.komo/
-├── config.toml          # 行为配置：模型、渠道的 allow_from / home_chat / groups 等
+├── config.toml          # 行为配置：模型、渠道的 allow_from / home_chat / guest_agent 等
 ├── .env                 # 凭证：飞书 app secret、Telegram bot token、模型 key
 ├── state.db             # Turso；调度状态、投递记录、Cron、Memory 与内容索引
 ├── sessions/
@@ -1761,7 +1772,7 @@ pub trait Clock: Send + Sync {
 | 1. 进程与会话骨架 | 六个 crate 骨架（§13.4）；komo、Gateway 自动启动、HTTP/SSE；`komo-store`：Turso 连接、`ensure_schema` + DDL 对齐测试、`with_write_retry`、统一 Session 目录与状态索引；`komo-client`：HTTP/SSE 客户端与 TUI 骨架；**编译预算首次测量** | 多个 CLI 同时启动仅产生一个实例；断线后能查看原会话；两个写入器对不同 Session 并发提交不互相阻塞，对同一行冲突时一方重试成功且只应用一次；DDL 对齐测试挂掉能定位到列；改 client 一行不重编 gateway；保存一份合法的 config.toml 后 `komo doctor` 一秒内显示新 mtime 已生效，保存一份非法的则旧配置继续生效且 home chat / 日志有具体错误 |
 | 2. AgentLoop 与执行 | 模型往返、执行计划、`prepare` → `start_call` → `execute`；`Ledger`；loop 用 `MemLedger` + 脚本化 `TurnDriver` 测（2026-10-11 之前这一阶段还有 Policy、Allow/Ask/Deny、审批持久化与 `ApprovedPlan` 类型状态，§7） | `start_call` 返回之前没有副作用；同一轮的两条只读调用同时在飞（`read` / `rg`），写是屏障、取消要收齐已在飞的那些（§6）；**不在本次运行能力面里的工具，模型拼出名字也执行不了**，而交给模型的 schema 与执行时的表来自同一份（§4）；**`write` / `edit`（含 `then_run` 的改动那一步）写数据目录下的 `sessions/`、`state.db*`、`runtime/`、`.env` 在 `prepare` 被拒**，结果 `denied`、理由点名路径，账上有结果不悬着（§7.2） |
 | 3. 六个工具 | 文件、搜索、进程、codemode 与输出处理（`python` 工具与 Python 环境 2026-10-15 删除，§4）；重放策略声明（`Tool::replay`，默认 unsafe，§8.6） | 文件版本冲突可见；取消停止子进程；未知工具无法调用；`rg` 是只读计划（可并发、codemode 可调），且它不依赖机器上装没装 `rg` |
-| 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `groups` 配置与 `/id`、`deliveries`、介入通知渲染、飞书 Run 回复卡片、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一条介入被答两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/answer` 重发只答一次；来源会话与 home chat 都收到介入通知且第二个答复得到"已决定"；`/approve`、`y` 不是命令；Gateway 重启后 pending 投递补发一次，老库里 `approval_request` / `approval_settled` 的 pending 行被跳过而不卡住补发；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的介入通知 |
+| 4. 聊天入口（飞书 + Telegram + WeChat） | `Channel` / `Inbound` / `Notifier`、Dispatcher、`allow_from` / `home_chat` / `guest_agent` 配置与 `/id`、`deliveries`、介入通知渲染、飞书 Run 回复卡片、`komo channel probe` | 同一 `event_id` / `update_id` / `msg_id` 重发只产生一个 Run，同一条介入被答两次第二次得到「已决定」；不在 `allow_from` 的发送者被拒且不留记录，`/id` 对其仍可用；把发送者加进 `allow_from` 并保存后，不重启 Gateway 其下一条消息即进入 Run；`/answer` 重发只答一次；来源会话与 home chat 都收到介入通知且第二个答复得到"已决定"；`/approve`、`y` 不是命令；Gateway 重启后 pending 投递补发一次，老库里 `approval_request` / `approval_settled` 的 pending 行被跳过而不卡住补发；飞书 ws 断线重连不丢事件也不重跑 Run；微信在用户未发消息前 `Deferred`，发消息后先收到积压的介入通知 |
 | 5. 自动恢复与 resume | 持久队列、启动扫描、领取去重（`RunQueue` 条件更新 + 代次，`toasty::sql`）、检查点、调用核对与子进程回收；恢复决策表在 kernel 里是纯函数 | 重启自动接续原 Run；已完成动作不重放；未知效果不盲目重试；两个执行者并发 `claim` 同一 Run 只有一个成功；决策表对 §8.4 每一行有一个单元测试；重启后等待中的介入仍能在手机上 `/answer`；**旧数据照常起来**：带 `approval.*` 事件的旧会话能加载、回放与续聊（那些事件按未知事件解码），停在 `waiting + approval` 的旧 Run 在 Gateway 启动后按"批准"续跑、那次调用只执行一次，老库里多出来的 `approval_requests` / `policy_grants` 表不妨碍启动（§7.4） |
 | 6. Skills | `SkillRegistry`、目录行门控、`read` 只读根（toolbox 已于 2026-10-15 删除，§5.3） | 新增 SKILL.md 无需重启即被 `komo skills list` 看到；`requires_tools` 不满足时不出现在提示里但仍可 inspect |
 | 7. Cron | 持久调度、去重、重叠处理、人工接手 | 重启不重复创建同次触发；命令 Job 触发时直接执行、全程零模型请求，`cron add` 不签任何授权；Cron Run 的介入在聊天里 `/answer` 后继续，不获得交互操作者身份 |
@@ -1841,7 +1852,8 @@ Memory 与模型验收覆盖：
 | 补发积压投递的真实代价（启动路径） | §3 第 4 步、§11.4 | **已核实（2026-09-18，本机实测）：它就是"重启好慢"的全部。** `komo gateway restart` 9.0s：bootout + 等待 launchctl 卸完 + bootstrap 只占 0.22s（分别 6ms / 220ms / 11ms），**约 5.1s 花在渠道起来时的按平台补发、2.9s 花在启动时的整体补发**——两者都在 "Gateway 就绪" 之前同步跑，每条 pending 一个平台往返（飞书 ~290ms），而当时积压的投递因为卡片被平台拒（下一行）永远送不出去。改成就绪之后后台跑之后：**2.7s**，其中进程启动到就绪 1.8s。剩余 1.25s 是启动时的 embedding 维度探测（本地 ollama 往返），与补发无关，**已做（2026-09-18，本机 Fedora 实测）**：探测移出就绪路径（§3「就绪也不等模型探测」）——把向量端点指向一个只收连接不回话的 socket 时，修复前发现文件与 `Gateway 就绪` **都在 120.12s**（等满模型超时），修复后 **0.16s**；探测改在后台，`docs/komo_bot.md` 的那 1.25s 同样不再落在重启上。回归测试 `komo-gateway/tests/memory/startup.rs`（预修版本 5s 超时失败） |
 | 飞书卡片 2.0 支持哪些组件 | §11.3 卡片渲染 | **已核实（2026-09-18，官方不兼容变更 + 线上报文）：2.0 不再支持 `note` 组件与 `action` 模块**，且 2.0 对不认识的组件是**整张卡打回**而不是忽略。线上表现（当时）：每一个审批请求都被拒（`http 400 / code 230099`，`ErrCode 200861 unsupported tag note`），**审批一条都到不了聊天里**，而失败只落在网关日志的一行 WARN 上——审批的主入口（§11.3）整个是死的，操作者只看得到"等待审批"的 Run。今天这条约束管的是 Run 回复卡片。替代写法已按官方给的来：备注 = 普通文本组件 + `notation` 字号 + 灰色；按钮行 = `column_set` 每列一个 button，那一块带固定 `element_id` 供决定后整块摘掉 |
 | 飞书 Run 回复卡片的真机行为（§11.3）：`Get` 表情与 reply 接口需要的权限 scope、markdown 组件对模型最终回复的排版 | §11.3 飞书的 Run 回复卡片 | **未真机验证（2026-09-25，只有假开放平台上的测试）。** 表情或回复被平台拒时按设计退化：表情失败只记 WARN，卡片没发出去则终态照旧发文本；排版不理想时改渲染，不改投递路径 |
-| 飞书话题回复的真机行为（§11.3 飞书群里的话题） | 主流消息是否开出话题、话题内消息的事件是否带 `thread_id` + `root_id`、后台通知是否落进话题 | **私聊已验证（2026-10-22，会话 01a16243）**：主线第一条开出话题 `omt_19bc2202…`；话题里第二条的事件带回 `root_id`，落到同一个 `chat:feishu:{chat}#{om_root}`；两张处理中卡片都更新成结果；后台命令跑完的结果以文本回复进同一话题；用 `GET /im/v1/messages?container_id_type=thread` 读回，话题里 5 条齐全，主线没有机器人消息。**群未验证**（本机 `groups` 为空）：群里同一套路径，只多了 @提及过滤 |
+| 飞书话题回复的真机行为（§11.3 飞书群里的话题） | 主流消息是否开出话题、话题内消息的事件是否带 `thread_id` + `root_id`、后台通知是否落进话题 | **私聊已验证（2026-10-22，会话 01a16243）**：主线第一条开出话题 `omt_19bc2202…`；话题里第二条的事件带回 `root_id`，落到同一个 `chat:feishu:{chat}#{om_root}`；两张处理中卡片都更新成结果；后台命令跑完的结果以文本回复进同一话题；用 `GET /im/v1/messages?container_id_type=thread` 读回，话题里 5 条齐全，主线没有机器人消息。**群未验证**：群里同一套路径，只多了 @提及过滤 |
+| 群里访客的真机行为（§11.3 群里的访客） | 非操作者 @ 是否进 `guest:` 会话、回复是否在同一话题、模型请求里有没有工具与记忆 | **未真机验证（2026-10-22，只有假开放平台上的测试）**：需要另一个人在群里 @ 一次，看 `sessions` 里 `kind = guest` 那一行与网关日志 |
 | reconcile 一拍的真实成本（目标：1 万 Run / 1 千 Session）与它该排在哪个周期 | §8.9 的周期兜底 | 从 `AUDIT_TICK` 那一拍拆出来，按更粗的间隔跑（例如 5 分钟），或只对"启动后还没对过账的那些"跑；启动时那一次无论如何都要跑 |
 | `sessions.state` 之外是否还需要一个"回收进行中"的中间态 | §8.10 的 `purge` | 当前设计靠"墓碑先落、内容后删"取得幂等，不需要第四个状态；若实测发现"内容删到一半"无法与"内容被外部删掉"区分，再补一个状态列值（仍是加列/加值，不改 schema 形状） |
 | **既有的 state.db 能不能加上新列**（§8.2 那句"schema 变化只增不改、`ensure_schema` 连上时补列"） | 升级路径：任何一个加了列的新版本在旧库上都起不来 | **已实测（2026-09-20，委派那两列 `runs.parent_run_id` / `runs.delegate`，本机 macOS + 真实 Turso MVCC 库）：补列会静默丢掉。** 现象：旧二进制建的库 → 新二进制启动 → 日志有 `补一列 table="runs" column="parent_run_id"` 两条 → 但同进程随后的每一条用到该列的语句都报 `Parse error: no such column: parent_run_id`（领取 SQL、待处理清单、对账、建会话全中），**重启也没用**；与此同时把 `state.db` 单独复制出来、由另一个进程打开时，同一段 `ensure_schema` 又能"补上"并打印出带新列的 DDL（所以库里没有落盘、那个进程看到的只是自己那份视图）。**新装的库完全正常**（真机端到端委派已验证），坏的只有"旧库 + 新列"这一条路。待办：查 Turso MVCC 下 DDL 的持久化语义（是否必须走非 MVCC 连接 / 是否要升级 turso），再决定补列是改成"用原始连接迁移"还是"表重建"。 **已定位并已改（2026-09-20，同日）：MVCC 连接上的 DDL 不落盘**（`Ok` + 日志照打，重开即无），所以补列改走**建池之前**——`Db::connect` 在 `toasty::Db::builder` 之前用**普通（非 MVCC）连接**把已存在的文件补到当前 schema（`migrate_file`：建缺失表 → `ALTER TABLE ADD COLUMN` → 建缺失索引），全部幂等；`ensure_schema` 退成**守卫**：文件库再缺列就**报错**（"补列必须走建池之前的迁移"），只有内存库（没有文件）还由它补。实现上还有个坑：turso 的读游标拖着一条读事务，**同一条连接上"边读边改"会 panic**在 `vdbe/execute.rs` 的 `SetCookie`（`invalid transaction state for SetCookie: TransactionState::Read, should be write`），所以那段是"一次读清 → 丢连接 → 只用一条只写连接改"。**已验证（真库副本，本机 macOS）**：副本 `sessions` 少 `state`/`state_changed_at`、`runs` 少 8 列 → `Db::connect` 之后 12/31 列齐全、另开一条连接读得回（确实落盘），按模型读 sessions 25 行（含 `origin`）、runs 正常。回归测试两条 `a_missing_column_is_added_on_reopen` / `the_delegate_columns_are_added_to_an_existing_runs_table`：**在普通连接上造旧形状、在另一条新连接上确认落盘**，原先那两条在池连接上造形状，两边都在空转——这正是真机上漏过去的原因。未核实：断电 / 内核崩溃下的持久性，以及升级 turso 后行为是否改变。 |

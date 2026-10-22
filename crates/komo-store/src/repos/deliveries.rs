@@ -127,6 +127,12 @@ impl TursoDeliveryRepo {
                         .await
                         .map_err(map_toasty)?;
                         for row in rows {
+                            // 同一群里不同话题是不同目标。
+                            if row.thread.as_deref()
+                                != target.peer.thread.as_ref().map(PeerId::as_str)
+                            {
+                                continue;
+                            }
                             // 旧版记录没有 key；完成 / 介入通知仍按原正文里的身份识别。
                             // 已作废的旧审批行解出来是 `None`，谁也不匹配。
                             let legacy_matches = if row.notification_key.is_none() {
@@ -174,6 +180,7 @@ impl TursoDeliveryRepo {
                         last_error: None as Option<String>,
                         created_at: to_ts(now),
                         updated_at: to_ts(now),
+                        thread: target.peer.thread.as_ref().map(|t| t.as_str().to_string()),
                     })
                     .exec(ex)
                     .await
@@ -254,6 +261,7 @@ impl TursoDeliveryRepo {
                         rows.retain(|row| {
                             row.platform == peer.platform.as_str()
                                 && row.chat_id == peer.chat_id.as_str()
+                                && row.thread.as_deref() == peer.thread.as_ref().map(PeerId::as_str)
                         });
                     }
                     rows.sort_by(|a, b| a.id.cmp(&b.id));
@@ -356,6 +364,7 @@ fn record_from_row(row: &DeliveryRow) -> Result<Option<DeliveryRecord>, StoreErr
             peer: ChannelPeer {
                 platform,
                 chat_id: PeerId::new(row.chat_id.clone()),
+                thread: row.thread.clone().map(PeerId::new),
             },
             is_home: row.is_home,
         },
@@ -683,5 +692,87 @@ mod tests {
         let read = repo.get(&id).await.unwrap().unwrap();
         assert_eq!(read.outbound, body);
         assert!(read.target.is_home);
+    }
+
+    fn thread_target(thread: Option<&str>) -> DeliveryTarget {
+        let peer = ChannelPeer::new(ChannelPlatform::Feishu, "oc_g");
+        DeliveryTarget {
+            peer: match thread {
+                Some(t) => peer.in_thread(t),
+                None => peer,
+            },
+            is_home: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_thread_peer_keeps_its_thread_through_the_store() {
+        let (db, _dir) = temp().await;
+        let repo = TursoDeliveryRepo::new(db);
+        let id = DeliveryId::from_raw("d-1");
+        repo.record(&id, &thread_target(Some("om_a")), &text(), NOW)
+            .await
+            .unwrap();
+        let read = repo.get(&id).await.unwrap().unwrap();
+        assert_eq!(read.target.peer.thread, Some(PeerId::new("om_a")));
+    }
+
+    #[tokio::test]
+    async fn pending_for_a_peer_only_returns_that_threads_rows() {
+        let (db, _dir) = temp().await;
+        let repo = TursoDeliveryRepo::new(db);
+        for (id, thread) in [("d-a", Some("om_a")), ("d-b", Some("om_b")), ("d-n", None)] {
+            repo.record(
+                &DeliveryId::from_raw(id),
+                &thread_target(thread),
+                &text(),
+                NOW,
+            )
+            .await
+            .unwrap();
+        }
+        let ids = |records: Vec<DeliveryRecord>| -> Vec<String> {
+            records.iter().map(|r| r.id.to_string()).collect()
+        };
+        let a = thread_target(Some("om_a")).peer;
+        assert_eq!(ids(repo.pending(Some(&a)).await.unwrap()), ["d-a"]);
+        let none = thread_target(None).peer;
+        assert_eq!(ids(repo.pending(Some(&none)).await.unwrap()), ["d-n"]);
+    }
+
+    #[tokio::test]
+    async fn the_same_notification_key_in_two_threads_makes_two_rows() {
+        let (db, _dir) = temp().await;
+        let repo = TursoDeliveryRepo::new(db);
+        let body = attention("r-1");
+        let a = repo
+            .record(
+                &DeliveryId::from_raw("d-a"),
+                &thread_target(Some("om_a")),
+                &body,
+                NOW,
+            )
+            .await
+            .unwrap();
+        let b = repo
+            .record(
+                &DeliveryId::from_raw("d-b"),
+                &thread_target(Some("om_b")),
+                &body,
+                NOW,
+            )
+            .await
+            .unwrap();
+        let again = repo
+            .record(
+                &DeliveryId::from_raw("d-c"),
+                &thread_target(Some("om_a")),
+                &body,
+                NOW,
+            )
+            .await
+            .unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(again.id, a.id);
     }
 }

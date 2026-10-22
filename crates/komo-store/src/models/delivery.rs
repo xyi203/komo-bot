@@ -28,6 +28,8 @@ pub struct DeliveryRow {
     pub last_error: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 群里的话题（话题根消息 id）；NULL = 没有话题（含老行）。
+    pub thread: Option<String>,
 }
 
 pub const SPEC: TableSpec = TableSpec {
@@ -36,7 +38,7 @@ pub const SPEC: TableSpec = TableSpec {
     columns: COLUMNS,
 };
 
-pub const DDL: &str = r#"CREATE TABLE "deliveries" ("id" TEXT NOT NULL, "platform" TEXT NOT NULL, "chat_id" TEXT NOT NULL, "is_home" BOOLEAN NOT NULL, "outbound" TEXT NOT NULL, "approval_id" TEXT, "notification_key" TEXT, "state" TEXT NOT NULL, "attempts" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, PRIMARY KEY ("id"))"#;
+pub const DDL: &str = r#"CREATE TABLE "deliveries" ("id" TEXT NOT NULL, "platform" TEXT NOT NULL, "chat_id" TEXT NOT NULL, "is_home" BOOLEAN NOT NULL, "outbound" TEXT NOT NULL, "approval_id" TEXT, "notification_key" TEXT, "state" TEXT NOT NULL, "attempts" BIGINT NOT NULL, "last_error" TEXT, "created_at" BIGINT NOT NULL, "updated_at" BIGINT NOT NULL, "thread" TEXT, PRIMARY KEY ("id"))"#;
 
 pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("id", "TEXT NOT NULL DEFAULT ''"),
@@ -51,4 +53,5 @@ pub const COLUMNS: &[ColumnSpec] = &[
     ColumnSpec::new("last_error", "TEXT"),
     ColumnSpec::new("created_at", "BIGINT NOT NULL DEFAULT 0"),
     ColumnSpec::new("updated_at", "BIGINT NOT NULL DEFAULT 0"),
+    ColumnSpec::new("thread", "TEXT"),
 ];

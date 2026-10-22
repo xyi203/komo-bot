@@ -97,12 +97,17 @@ impl<'de> Deserialize<'de> for PeerId {
     }
 }
 
-/// 一个平台上的一个会话。`{platform}:{chat_id}` 是它的规范写法，`/id` 回显的就是
-/// 这个串（§11.2）。
+/// 一个平台上的一个会话，群里还可以再落到某个话题。规范写法 `{platform}:{chat_id}`，
+/// 有话题时 `{platform}:{chat_id}#{thread}`；`/id` 回显的就是这个串（§11.2）。
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ChannelPeer {
     pub platform: ChannelPlatform,
     pub chat_id: PeerId,
+    /// 群里的一个话题：话题根消息的 id（飞书 `om_*`）。`None` = 整个会话（私聊、没开话题
+    /// 的渠道）。`runs.peer` 与 `sessions.origin`（`chat:{peer}`）存的都是 `Display` 串，
+    /// 所以每个话题自然是自己的 Session。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<PeerId>,
 }
 
 impl ChannelPeer {
@@ -110,27 +115,49 @@ impl ChannelPeer {
         Self {
             platform,
             chat_id: PeerId::new(chat_id),
+            thread: None,
         }
     }
 
-    /// [`Display`](fmt::Display) 的反过来：把 `runs.peer` 里存的 `"{platform}:{chat_id}"`
-    /// 解回一个 [`ChannelPeer`]。重启后重挂交互 Run 的看客要用它——`peer` 存的从来就是这个 `Display` 出来的串，这里只是原样切回去。
+    /// 落到群里的某个话题（`thread` 是话题根消息 id）。
+    pub fn in_thread(mut self, thread: impl Into<String>) -> Self {
+        self.thread = Some(PeerId::new(thread));
+        self
+    }
+
+    /// [`Display`](fmt::Display) 的反过来：把 `runs.peer` 里存的
+    /// `"{platform}:{chat_id}"` / `"{platform}:{chat_id}#{thread}"` 解回一个
+    /// [`ChannelPeer`]。重启后重挂交互 Run 的看客要用它——`peer` 存的从来就是这个
+    /// `Display` 出来的串，这里只是原样切回去。
     ///
     /// 只切**第一个**冒号：`chat_id` 本身可能带冒号（不是已知渠道会这么写，但不排除），
-    /// `platform` 那几个词都不带。空的 `chat_id` 认不出来。
+    /// `platform` 那几个词都不带；其后再切**第一个** `#` 取话题。空的 `chat_id`、`#` 后
+    /// 面是空的话题，都认不出来。
     pub fn parse(raw: &str) -> Option<Self> {
-        let (platform, chat_id) = raw.split_once(':')?;
+        let (platform, rest) = raw.split_once(':')?;
         let platform = ChannelPlatform::parse(platform)?;
-        if chat_id.is_empty() {
+        let (chat_id, thread) = match rest.split_once('#') {
+            Some((chat_id, thread)) => (chat_id, Some(thread)),
+            None => (rest, None),
+        };
+        if chat_id.is_empty() || thread == Some("") {
             return None;
         }
-        Some(ChannelPeer::new(platform, chat_id))
+        let peer = ChannelPeer::new(platform, chat_id);
+        Some(match thread {
+            Some(thread) => peer.in_thread(thread),
+            None => peer,
+        })
     }
 }
 
 impl fmt::Display for ChannelPeer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.platform, self.chat_id)
+        write!(f, "{}:{}", self.platform, self.chat_id)?;
+        if let Some(thread) = &self.thread {
+            write!(f, "#{thread}")?;
+        }
+        Ok(())
     }
 }
 
@@ -286,6 +313,46 @@ mod tests {
         ] {
             assert_eq!(ChannelPeer::parse(&peer.to_string()), Some(peer));
         }
+    }
+
+    #[test]
+    fn a_thread_peer_renders_with_a_hash_and_round_trips() {
+        let peer = ChannelPeer::new(ChannelPlatform::Feishu, "oc_x").in_thread("om_root");
+        assert_eq!(peer.to_string(), "feishu:oc_x#om_root");
+        assert_eq!(ChannelPeer::parse("feishu:oc_x#om_root"), Some(peer));
+    }
+
+    #[test]
+    fn an_old_peer_string_parses_without_a_thread() {
+        let peer = ChannelPeer::parse("feishu:oc_x").unwrap();
+        assert_eq!(peer.thread, None);
+        assert_eq!(peer.chat_id.as_str(), "oc_x");
+    }
+
+    #[test]
+    fn parse_rejects_an_empty_thread_after_the_hash() {
+        assert_eq!(ChannelPeer::parse("feishu:oc_x#"), None);
+        assert_eq!(ChannelPeer::parse("feishu:#om_root"), None);
+    }
+
+    #[test]
+    fn a_peer_without_a_thread_serializes_without_the_key() {
+        let peer = ChannelPeer::new(ChannelPlatform::Feishu, "oc_x");
+        assert_eq!(
+            serde_json::to_string(&peer).unwrap(),
+            r#"{"platform":"feishu","chat_id":"oc_x"}"#
+        );
+        let back: ChannelPeer =
+            serde_json::from_str(r#"{"platform":"feishu","chat_id":"oc_x"}"#).unwrap();
+        assert_eq!(back.thread, None);
+
+        let threaded = peer.in_thread("om_root");
+        let json = serde_json::to_string(&threaded).unwrap();
+        assert!(json.contains(r#""thread":"om_root""#));
+        assert_eq!(
+            serde_json::from_str::<ChannelPeer>(&json).unwrap(),
+            threaded
+        );
     }
 
     #[test]

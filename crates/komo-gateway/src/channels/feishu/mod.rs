@@ -1047,7 +1047,7 @@ mod tests {
     fn a_built_channel_keeps_the_config_snapshot_it_was_built_with() {
         let factory = FeishuFactory::new();
         let mut snapshot = snapshot_with(true);
-        snapshot.channels.feishu.groups = vec![komo_kernel::types::chat::PeerId::new("oc_g")];
+        snapshot.channels.feishu.home_chat = Some(komo_kernel::types::chat::PeerId::new("oc_g"));
         let built = factory.build(&snapshot, &credentials()).unwrap().unwrap();
         // 渠道**不拿**它做准入判定（见 `inbound` 的模块注释），但热重载要靠它判断
         // "这个渠道的配置变了没有"。

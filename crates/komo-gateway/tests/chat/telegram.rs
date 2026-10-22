@@ -86,7 +86,7 @@ async fn a_replayed_update_produces_one_run() {
     assert_eq!(runs.len(), 1, "重投不该开第二个 Run：{runs:?}");
 }
 
-/// §11.2：群里只响应 @机器人 的消息，并剥掉提及；不在 `groups` 里的群一律不响应。
+/// §11.2：群里只响应 @机器人 的消息，并剥掉提及；群不用事先登记。
 #[tokio::test]
 async fn a_group_message_only_counts_when_it_names_the_bot() {
     let wired = wire(
@@ -144,9 +144,9 @@ async fn a_group_message_only_counts_when_it_names_the_bot() {
     );
 }
 
-/// 不在 `groups` 里的群，@ 了也不响应。
+/// 机器人所在的任何群，操作者 @ 了就响应，不用事先登记。
 #[tokio::test]
-async fn a_group_outside_the_list_is_ignored_even_when_it_names_the_bot() {
+async fn an_unregistered_group_is_answered_when_it_names_the_bot() {
     let wired = wire(
         Behavior::default(),
         vec![text_update(
@@ -162,11 +162,24 @@ async fn a_group_outside_the_list_is_ignored_even_when_it_names_the_bot() {
     )
     .await;
 
-    wired.polled_at_least(3).await;
-    assert!(
-        wired.gateway.sessions().await.is_empty(),
-        "只有 groups 列出的群会被响应（§11.2）"
-    );
+    let gateway = &wired.gateway;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let origins: Vec<String> = gateway
+            .sessions()
+            .await
+            .into_iter()
+            .map(|record| record.origin)
+            .collect();
+        if origins.iter().any(|origin| origin == "chat:telegram:333") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "没登记的群 @ 了也要进 Run：{origins:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// §11.3 命令表：`/status`、`/pending`、`/cancel` 都有回执；退役的 `/approve` 答一句帮助。

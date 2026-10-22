@@ -366,6 +366,26 @@ fn an_unknown_key_inside_a_table_is_reported_with_its_full_path() {
     );
 }
 
+/// 退役的 `groups` 名单：旧配置里留着它照常加载，只是一条警告（群里 @ 就响应，没有名单了）。
+#[test]
+fn a_retired_groups_list_still_loads_with_a_warning() {
+    let fixture = Fixture::valid();
+    let mut text = Fixture::config_text("chat-a", "medium");
+    text.push_str("groups = [\"oc_x\"]\n");
+    write(&fixture.sources().config, &text);
+
+    let loaded = load_config(&fixture.options()).expect("退役的键不挡加载");
+    assert!(
+        loaded
+            .issues
+            .iter()
+            .any(|issue| issue.key.as_str() == "channels.feishu.groups"
+                && issue.severity == IssueSeverity::Warning),
+        "{:?}",
+        loaded.issues
+    );
+}
+
 /// 键认识、值的类型不对仍然是解析错误：那种情况没有"忽略"这个安全的解释。
 #[test]
 fn a_known_key_with_the_wrong_type_still_refuses_the_load() {

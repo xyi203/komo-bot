@@ -105,7 +105,6 @@ pub fn snapshot_fixture() -> ConfigSnapshot {
                 enabled: true,
                 allow_from: vec![PeerId::new("ou_operator")],
                 home_chat: Some(PeerId::new("oc_home")),
-                groups: vec![],
             },
             telegram: ChannelConfig::default(),
             wechat: ChannelConfig::default(),

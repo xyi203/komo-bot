@@ -116,23 +116,15 @@ impl Dispatcher {
     /// 操作者的**私聊**（Telegram DM、WeChat、TUI）落到**默认 Agent 的主会话**
     /// ——它们没有"找谁"这一维，所以走 §四 说的 `default_agent`。带话题的私聊（飞书）
     /// 与群一样一个话题一个会话；群聊按 `{platform}:{chat_id}`（有话题再加 `#{thread}`）
-    /// 各自一个，且只有 `groups` 列出的群会被响应（§11.2）。
-    async fn conversation(&self, msg: &InboundMessage) -> Result<Option<SessionId>, GatewayError> {
+    /// 各自一个；机器人所在的群里，操作者 @ 它就响应（@ 的过滤在渠道里，§11.2）。
+    async fn conversation(&self, msg: &InboundMessage) -> Result<SessionId, GatewayError> {
         if msg.is_private {
             if msg.peer.thread.is_some() {
-                return self.session_for_peer(&msg.peer).await.map(Some);
+                return self.session_for_peer(&msg.peer).await;
             }
-            return self.state.default_main_session().await.map(Some);
+            return self.state.default_main_session().await;
         }
-        let snapshot = self.state.snapshot();
-        let responds = snapshot
-            .channels
-            .get(msg.peer.platform)
-            .is_some_and(|channel| channel.responds_in_group(&msg.peer.chat_id));
-        if !responds {
-            return Ok(None);
-        }
-        self.session_for_peer(&msg.peer).await.map(Some)
+        self.session_for_peer(&msg.peer).await
     }
 
     /// 一个群聊对应的那个 Session。
@@ -323,9 +315,7 @@ impl Inbound for Dispatcher {
         }
 
         // ③ 哪一个会话。
-        let Some(session) = self.conversation(&msg).await? else {
-            return Ok(InboundAck::Ignored);
-        };
+        let session = self.conversation(&msg).await?;
 
         // ④ 冲刷这个会话还没送到的投递（§11.1 第 4 步）——**先补上积压的，再处理新的**。
         self.state.notifier.flush(Some(&msg.peer)).await;
@@ -415,7 +405,7 @@ fn id_reply(msg: &InboundMessage) -> String {
     format!("会话：{}\n发送者：{}", config_chat(msg), msg.sender)
 }
 
-/// 抄进 `groups` / `home_chat` 的那个串：不带话题，那两项只认会话本身。
+/// 抄进 `home_chat` 的那个串：不带话题，那一项只认会话本身。
 fn config_chat(msg: &InboundMessage) -> ChannelPeer {
     ChannelPeer::new(msg.peer.platform, msg.peer.chat_id.as_str())
 }

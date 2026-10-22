@@ -422,8 +422,6 @@ pub(super) struct ChannelSection {
     #[serde(default)]
     pub allow_from: Vec<PeerId>,
     pub home_chat: Option<PeerId>,
-    #[serde(default)]
-    pub groups: Vec<PeerId>,
 }
 
 impl ChannelSection {
@@ -432,7 +430,6 @@ impl ChannelSection {
             enabled: self.enabled,
             allow_from: self.allow_from,
             home_chat: self.home_chat,
-            groups: self.groups,
         }
     }
 }

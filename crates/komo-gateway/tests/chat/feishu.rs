@@ -156,12 +156,12 @@ async fn a_feishu_dm_opens_a_thread_session_instead_of_home() {
     );
 }
 
-/// §11.2：群里只响应 `groups` 列出的群，且只响应 @机器人 的消息。
+/// §11.2：任何群里，操作者 @机器人 就响应，不用事先登记；没 @ 的消息不进 Dispatcher。
 #[tokio::test]
-async fn a_feishu_group_needs_the_list_and_the_mention() {
+async fn a_feishu_group_needs_only_the_mention() {
     let wired = wire().await;
 
-    // 名单内的群，但没有 @机器人 → 渠道那一步就 None（不进 Dispatcher）。
+    // 没有 @机器人 → 渠道那一步就 None（不进 Dispatcher）。
     let plain = text_event("evt-g1", "oc_group", "group", "ou_op", "大家早", &[]);
     let parsed = feishu_inbound::parse(&plain).expect("认得出");
     let feishu_inbound::EventKind::Message(event) = parsed.kind;
@@ -175,7 +175,7 @@ async fn a_feishu_group_needs_the_list_and_the_mention() {
         "群里没 @机器人 的消息不进 Dispatcher"
     );
 
-    // @ 了，且群在名单里 → 进 Run。
+    // @ 了 → 进 Run。
     let mentioned = text_event(
         "evt-g2",
         "oc_group",
@@ -187,7 +187,7 @@ async fn a_feishu_group_needs_the_list_and_the_mention() {
     let ack = wired.gateway.handle(decode(&mentioned, false)).await;
     assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
 
-    // @ 了但群不在名单里 → Ignored。
+    // 另一个从没登记过的群，@ 了照样进 Run。
     let outside = text_event(
         "evt-g3",
         "oc_other",
@@ -197,7 +197,7 @@ async fn a_feishu_group_needs_the_list_and_the_mention() {
         &[("@_user_1", BOT_OPEN_ID)],
     );
     let ack = wired.gateway.handle(decode(&outside, false)).await;
-    assert_eq!(ack, InboundAck::Ignored, "只有 groups 列出的群会被响应");
+    assert!(matches!(ack, InboundAck::Queued { .. }), "{ack:?}");
 
     let origins: Vec<String> = wired
         .gateway
@@ -211,9 +211,7 @@ async fn a_feishu_group_needs_the_list_and_the_mention() {
         "{origins:?}"
     );
     assert!(
-        !origins
-            .iter()
-            .any(|origin| origin.starts_with("chat:feishu:oc_other")),
+        origins.contains(&"chat:feishu:oc_other#om_evt-g3".to_string()),
         "{origins:?}"
     );
 }

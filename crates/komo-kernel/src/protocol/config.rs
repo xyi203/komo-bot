@@ -193,20 +193,12 @@ pub struct ChannelConfig {
     /// 主动投递（Run 结束、需要人判断等）的目标会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_chat: Option<PeerId>,
-    /// 允许响应的群。缺省 = 只响应 `allow_from` 的私聊。
-    #[serde(default)]
-    pub groups: Vec<PeerId>,
 }
 
 impl ChannelConfig {
     /// 这个发送者是不是操作者。
     pub fn is_operator(&self, sender: &PeerId) -> bool {
         self.allow_from.contains(sender)
-    }
-
-    /// 这个群会不会被响应。
-    pub fn responds_in_group(&self, chat: &PeerId) -> bool {
-        self.groups.contains(chat)
     }
 
     /// enabled 但没人能说话——`komo doctor` 把它列为警告（§11.2）。
@@ -801,7 +793,6 @@ mod tests {
                     enabled: true,
                     allow_from: vec![PeerId::new("ou_xxx")],
                     home_chat: Some(PeerId::new("oc_xxx")),
-                    groups: vec![],
                 },
                 telegram: ChannelConfig::default(),
                 wechat: ChannelConfig::default(),
@@ -913,13 +904,11 @@ mod tests {
             enabled: true,
             allow_from: vec![PeerId::new("123")],
             home_chat: Some(PeerId::new("123")),
-            groups: vec![],
         };
         snapshot.channels.wechat = ChannelConfig {
             enabled: true,
             allow_from: vec![PeerId::new("wxid_x")],
             home_chat: Some(PeerId::new("wxid_x")),
-            groups: vec![],
         };
         let order: Vec<ChannelPlatform> = snapshot
             .channels
@@ -943,7 +932,6 @@ mod tests {
             enabled: true,
             allow_from: vec![],
             home_chat: Some(PeerId::new("oc_x")),
-            groups: vec![],
         };
         assert!(channel.is_outbound_only());
         assert!(!channel.is_operator(&PeerId::new("ou_x")));

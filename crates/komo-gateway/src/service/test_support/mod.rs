@@ -61,7 +61,7 @@ enabled = false
     )
 }
 
-/// 配置里有一个 Telegram 渠道：操作者 111，home chat 111，允许的群 222。
+/// 配置里有一个 Telegram 渠道：操作者 111，home chat 111。
 #[cfg(test)]
 pub fn telegram_config(allow_from: &str) -> String {
     config_toml(&format!(
@@ -70,7 +70,6 @@ pub fn telegram_config(allow_from: &str) -> String {
 enabled = true
 allow_from = [{allow_from}]
 home_chat = 111
-groups = [222]
 "#
     ))
 }

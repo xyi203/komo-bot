@@ -74,7 +74,7 @@ enabled = false
     )
 }
 
-/// `[channels.telegram]`：操作者 111，home chat 111，允许的群 222。
+/// `[channels.telegram]`：操作者 111，home chat 111。
 pub fn telegram_block(allow_from: &str) -> String {
     format!(
         r#"
@@ -82,12 +82,11 @@ pub fn telegram_block(allow_from: &str) -> String {
 enabled = true
 allow_from = [{allow_from}]
 home_chat = 111
-groups = [222]
 "#
     )
 }
 
-/// `[channels.feishu]`：操作者 `ou_op`，home chat `oc_home`，允许的群 `oc_group`。
+/// `[channels.feishu]`：操作者 `ou_op`，home chat `oc_home`。
 pub fn feishu_block(allow_from: &str) -> String {
     format!(
         r#"
@@ -95,7 +94,6 @@ pub fn feishu_block(allow_from: &str) -> String {
 enabled = true
 allow_from = [{allow_from}]
 home_chat = "oc_home"
-groups = ["oc_group"]
 "#
     )
 }
@@ -117,7 +115,7 @@ pub fn telegram_config(allow_from: &str) -> String {
     config_toml(&telegram_block(allow_from))
 }
 
-/// [`Home`] 的默认配置：**配了 home chat 的** Telegram 渠道，没有群。
+/// [`Home`] 的默认配置：**配了 home chat 的** Telegram 渠道。
 ///
 /// 无人值守的那些测试（cron / recovery）要的正是这一份：要人处理的介入有一个出口，而
 /// "群里说话"不在它们的范围里。

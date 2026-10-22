@@ -650,9 +650,6 @@ pub fn channel_list(home: &Path) -> Outcome {
         if let Some(home_chat) = &config.home_chat {
             line.push_str(&format!("  home_chat {home_chat}"));
         }
-        if !config.groups.is_empty() {
-            line.push_str(&format!("  groups {}", config.groups.len()));
-        }
         // 「某渠道 enabled 但 allow_from 为空」是一条警告（§11.2）。
         if config.is_outbound_only() {
             line.push_str("  ⚠ 只出不进（allow_from 为空，没人能通过它下指令）");

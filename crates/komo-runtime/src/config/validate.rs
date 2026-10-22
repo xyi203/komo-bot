@@ -595,21 +595,6 @@ fn check_channel(
             ));
         }
     }
-    for (index, peer) in channel.groups.iter().enumerate() {
-        if let Err(message) = check_peer_id(platform, peer) {
-            issues.push(error(
-                &format!("{key}.groups"),
-                format!("[{index}] {message}"),
-            ));
-        }
-    }
-    // §11.2：微信只有 DM。
-    if platform == ChannelPlatform::Wechat && !channel.groups.is_empty() {
-        issues.push(error(
-            &format!("{key}.groups"),
-            "微信只有私聊，没有可以响应的群",
-        ));
-    }
 
     if let Some(home) = &channel.home_chat {
         if let Err(message) = check_peer_id(platform, home) {

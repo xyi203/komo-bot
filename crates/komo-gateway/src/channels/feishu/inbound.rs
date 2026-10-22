@@ -94,8 +94,8 @@ pub struct Message {
 }
 
 impl Message {
-    /// 操作者的私聊全部落到同一个 home session——**哪个**会话是 Dispatcher 的事，
-    /// 渠道只负责把这个布尔填对（§11.2）。
+    /// 私聊不看 @提及。**哪个**会话是 Dispatcher 的事，渠道只负责把这个布尔填对
+    /// （§11.2）。
     pub fn is_private(&self) -> bool {
         self.chat_type == "p2p"
     }
@@ -196,11 +196,8 @@ pub fn from_message(
         return None;
     }
 
-    let peer = if is_private {
-        peer_of(chat_id)
-    } else {
-        peer_of(chat_id).in_thread(thread_anchor(&event.message)?)
-    };
+    // 私聊与群一样，一个话题一个会话。
+    let peer = peer_of(chat_id).in_thread(thread_anchor(&event.message)?);
 
     Some(InboundMessage {
         peer,
@@ -211,7 +208,7 @@ pub fn from_message(
     })
 }
 
-/// 群消息所属话题的根消息 id；`None` = 这条消息没有 id，没法当锚点也没法回复。
+/// 消息所属话题的根消息 id；`None` = 这条消息没有 id，没法当锚点也没法回复。
 ///
 /// 已经在话题里（`thread_id` 与 `root_id` 都有）就是 `root_id`；否则这条消息自己就是
 /// 新话题的根。引用回复只有 `root_id` 没有 `thread_id`：它在主流里，不能把话题挂到被
@@ -380,7 +377,7 @@ mod tests {
         .expect("私聊总是进 Dispatcher");
         assert!(inbound.is_private);
         assert_eq!(inbound.text, "在吗");
-        assert_eq!(inbound.peer.to_string(), "feishu:oc_1");
+        assert_eq!(inbound.peer.to_string(), "feishu:oc_1#om_1");
         assert_eq!(inbound.sender.as_str(), "ou_op");
         assert_eq!(inbound.request_key.as_str(), "feishu:evt-1");
     }
@@ -441,11 +438,18 @@ mod tests {
     }
 
     #[test]
-    fn a_private_message_never_gets_a_thread() {
-        let mut event = message_event("oc_1", "p2p", "在吗");
-        event.message.root_id = "om_old".into();
+    fn a_private_message_opens_a_thread_like_a_group_mention() {
+        let event = message_event("oc_1", "p2p", "在吗");
         let inbound = from_message(&event, BOT_OPEN_ID, request_key("evt-t5")).expect("私聊进");
-        assert_eq!(inbound.peer.thread, None);
+        assert!(inbound.is_private);
+        assert_eq!(inbound.peer.thread, Some(PeerId::new("om_1")));
+
+        let mut inside = message_event("oc_1", "p2p", "接着说");
+        inside.message.message_id = "om_2".into();
+        inside.message.thread_id = "omt_x".into();
+        inside.message.root_id = "om_1".into();
+        let inbound = from_message(&inside, BOT_OPEN_ID, request_key("evt-t6")).expect("私聊进");
+        assert_eq!(inbound.peer.to_string(), "feishu:oc_1#om_1");
     }
 
     #[test]

@@ -87,7 +87,17 @@ async fn a_replayed_event_produces_one_run() {
 async fn a_reconnect_loses_nothing_and_reruns_nothing() {
     let wired = wire().await;
     let before = text_event("evt-a", "oc_dm", "p2p", "ou_op", "第一件事", &[]);
-    let during = text_event("evt-b", "oc_dm", "p2p", "ou_op", "第二件事", &[]);
+    // 第二条接在第一条开出的话题里，同一个会话。
+    let during = text_event_replying(
+        "evt-b",
+        "oc_dm",
+        "p2p",
+        "ou_op",
+        "第二件事",
+        &[],
+        "om_evt-a",
+        "omt_a",
+    );
 
     let first = wired.gateway.handle(decode(&before, true)).await;
     let InboundAck::Queued { session, run } = first else {
@@ -111,6 +121,39 @@ async fn a_reconnect_loses_nothing_and_reruns_nothing() {
 
     let runs = wired.gateway.runs_of(&session).await;
     assert_eq!(runs.len(), 2, "一共两条输入、两个 Run：{runs:?}");
+}
+
+/// 飞书私聊也是一个话题一个会话：主线里每一条都开新话题、新会话，都不是 home。
+#[tokio::test]
+async fn a_feishu_dm_opens_a_thread_session_instead_of_home() {
+    let wired = wire().await;
+    let first = text_event("evt-d1", "oc_dm", "p2p", "ou_op", "第一件事", &[]);
+    let second = text_event("evt-d2", "oc_dm", "p2p", "ou_op", "另一件事", &[]);
+
+    let InboundAck::Queued { session: a, .. } = wired.gateway.handle(decode(&first, true)).await
+    else {
+        panic!("第一条应该排队");
+    };
+    let InboundAck::Queued { session: b, .. } = wired.gateway.handle(decode(&second, true)).await
+    else {
+        panic!("第二条应该排队");
+    };
+    assert_ne!(a, b, "主线里的两条是两个话题");
+    let home = wired.gateway.state().default_main_session().await.unwrap();
+    assert_ne!(a, home);
+    assert_ne!(b, home);
+
+    let origins: Vec<String> = wired
+        .gateway
+        .sessions()
+        .await
+        .into_iter()
+        .map(|record| record.origin)
+        .collect();
+    assert!(
+        origins.contains(&"chat:feishu:oc_dm#om_evt-d1".to_string()),
+        "{origins:?}"
+    );
 }
 
 /// §11.2：群里只响应 `groups` 列出的群，且只响应 @机器人 的消息。

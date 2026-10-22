@@ -113,11 +113,15 @@ impl Dispatcher {
 
     /// 第 3 步：哪一个会话。
     ///
-    /// 操作者的**私聊**（飞书 DM、Telegram DM、WeChat、TUI）落到**默认 Agent 的主会话**
-    /// ——它们没有"找谁"这一维，所以走 §四 说的 `default_agent`；群聊按
-    /// `{platform}:{chat_id}` 各自一个，且只有 `groups` 列出的群会被响应（§11.2）。
+    /// 操作者的**私聊**（Telegram DM、WeChat、TUI）落到**默认 Agent 的主会话**
+    /// ——它们没有"找谁"这一维，所以走 §四 说的 `default_agent`。带话题的私聊（飞书）
+    /// 与群一样一个话题一个会话；群聊按 `{platform}:{chat_id}`（有话题再加 `#{thread}`）
+    /// 各自一个，且只有 `groups` 列出的群会被响应（§11.2）。
     async fn conversation(&self, msg: &InboundMessage) -> Result<Option<SessionId>, GatewayError> {
         if msg.is_private {
+            if msg.peer.thread.is_some() {
+                return self.session_for_peer(&msg.peer).await.map(Some);
+            }
             return self.state.default_main_session().await.map(Some);
         }
         let snapshot = self.state.snapshot();

@@ -634,7 +634,7 @@ mod tests {
             .unwrap();
 
         serve_until(harness.channel, recorder.clone(), || {
-            !fake.calls_to("messages").is_empty()
+            !fake.calls_to("reply").is_empty()
         })
         .await;
 
@@ -642,13 +642,13 @@ mod tests {
         let handled = log.position("handle:end").expect("handle 跑过了");
         let replied = entries
             .iter()
-            .position(|event| event == "messages")
+            .position(|event| event == "reply")
             .expect("回执发出去了");
         assert!(replied > handled, "回执抢在 handle 之前：{entries:?}");
     }
 
     #[tokio::test]
-    async fn a_reply_goes_straight_back_to_the_chat() {
+    async fn a_reply_goes_back_into_the_messages_thread() {
         let fake = FakeOpenApi::start(Behavior::default()).await;
         let harness = harness(&fake);
         let recorder = RecordingInbound::with_ack(
@@ -671,18 +671,20 @@ mod tests {
             .unwrap();
 
         serve_until(harness.channel, recorder, || {
-            !fake.calls_to("messages").is_empty()
+            !fake.calls_to("reply").is_empty()
         })
         .await;
 
-        let sends = fake.calls_to("messages");
-        assert_eq!(sends[0]["receive_id"], "oc_1");
+        let replies = fake.calls_to("reply");
+        assert_eq!(replies[0]["target"], "om_evt-60", "回复的是开出话题的那条");
+        assert_eq!(replies[0]["reply_in_thread"], true);
         assert!(
-            sends[0]["content"]
+            replies[0]["content"]
                 .as_str()
                 .unwrap()
                 .contains("现在没有待处理的 Intervention。")
         );
+        assert!(fake.calls_to("messages").is_empty(), "不在主线另发");
     }
 
     #[tokio::test]
@@ -709,18 +711,20 @@ mod tests {
             .unwrap();
 
         serve_until(harness.channel, recorder, || {
-            !fake.calls_to("messages").is_empty()
+            !fake.calls_to("reply").is_empty()
         })
         .await;
 
+        let replies = fake.calls_to("reply");
         assert!(
-            fake.calls_to("messages")[0]["content"]
+            replies[0]["content"]
                 .as_str()
                 .unwrap()
                 .contains("allow_from")
         );
+        assert_eq!(replies[0]["msg_type"], "text", "提示是文本，不是卡片");
         assert!(fake.calls_to("reactions").is_empty(), "被拒的消息不加表情");
-        assert!(fake.calls_to("reply").is_empty());
+        assert!(fake.calls_to("messages").is_empty());
     }
 
     fn queued() -> InboundAck {
@@ -803,13 +807,18 @@ mod tests {
 
         // 表情在后台加、回执就地发，两者谁先到平台没有次序：两样都等到。
         serve_until(harness.channel, recorder, || {
-            !fake.calls_to("messages").is_empty() && !fake.calls_to("reactions").is_empty()
+            !fake.calls_to("reply").is_empty() && !fake.calls_to("reactions").is_empty()
         })
         .await;
 
         assert_eq!(fake.calls_to("reactions")[0]["target"], "om_evt-64");
-        assert!(fake.calls_to("reply").is_empty(), "命令回执不发卡片");
-        assert_eq!(fake.calls_to("messages").len(), 1, "回执照旧是文本");
+        let replies = fake.calls_to("reply");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0]["msg_type"], "text",
+            "命令回执不发卡片，照旧是文本"
+        );
+        assert!(fake.calls_to("messages").is_empty());
     }
 
     #[tokio::test]
@@ -893,7 +902,10 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 sender
-                    .send(&inbound::peer_of("oc_1"), run_finished("跑完了"))
+                    .send(
+                        &inbound::peer_of("oc_1").in_thread("om_evt-67"),
+                        run_finished("跑完了"),
+                    )
                     .await
             })
         };
@@ -924,12 +936,12 @@ mod tests {
             .unwrap();
 
         serve_until(harness.channel, recorder, || {
-            !fake.calls_to("messages").is_empty()
+            !fake.calls_to("reply").is_empty()
         })
         .await;
 
         assert!(
-            fake.calls_to("messages")[0]["content"]
+            fake.calls_to("reply")[0]["content"]
                 .as_str()
                 .unwrap()
                 .contains("内部错误")

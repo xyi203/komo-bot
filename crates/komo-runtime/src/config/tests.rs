@@ -604,6 +604,26 @@ fn the_snapshot_records_the_source_files_it_was_built_from() {
 }
 
 #[test]
+fn allow_tenant_loads_from_the_file_and_defaults_off() {
+    let fixture = Fixture::valid();
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(!loaded.snapshot.channels.feishu.allow_tenant);
+
+    let text = Fixture::config_text("chat-a", "medium").replace(
+        "allow_from = [\"ou_operator\"]",
+        "allow_from = []\nallow_tenant = true",
+    );
+    write(&fixture.sources().config, &text);
+    let loaded = load_config(&fixture.options()).unwrap();
+    assert!(loaded.snapshot.channels.feishu.allow_tenant);
+    assert!(
+        loaded.issues.is_empty(),
+        "靠租户进来的渠道不是只出不进：{:?}",
+        loaded.issues
+    );
+}
+
+#[test]
 fn a_warning_rides_along_with_a_config_that_still_loads() {
     let fixture = Fixture::valid();
     let text = Fixture::config_text("chat-a", "medium")

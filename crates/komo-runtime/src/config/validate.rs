@@ -609,6 +609,13 @@ fn check_channel(
         }
     }
 
+    if channel.allow_tenant && platform != ChannelPlatform::Feishu {
+        issues.push(error(
+            &format!("{key}.allow_tenant"),
+            "只有飞书能判断是不是同一家企业",
+        ));
+    }
+
     if let Some(guest) = &channel.guest_agent {
         check_guest_agent(guest, platform, key, snapshot, issues);
     }
@@ -986,6 +993,22 @@ mod tests {
         snapshot.channels.wechat.guest_agent = Some("guest".into());
         let issues = validate(&snapshot);
         assert_eq!(keys(&issues), vec!["channels.wechat.guest_agent"]);
+    }
+
+    #[test]
+    fn allow_tenant_is_refused_outside_feishu() {
+        let mut snapshot = snapshot_fixture();
+        snapshot.channels.feishu.allow_tenant = true;
+        assert!(keys(&validate(&snapshot)).is_empty(), "飞书可以开");
+        snapshot.channels.telegram.allow_tenant = true;
+        snapshot.channels.wechat.allow_tenant = true;
+        assert_eq!(
+            keys(&validate(&snapshot)),
+            vec![
+                "channels.telegram.allow_tenant",
+                "channels.wechat.allow_tenant"
+            ]
+        );
     }
 
     #[test]

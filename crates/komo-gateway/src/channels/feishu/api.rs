@@ -6,6 +6,7 @@
 //! |---|---|
 //! | `POST /open-apis/auth/v3/tenant_access_token/internal` | 拿 tenant token（`komo channel probe` 也是它） |
 //! | `GET /open-apis/bot/v3/info` | 机器人自己的 `open_id`——群里认 @提及 要用 |
+//! | `GET /open-apis/im/v1/chats/{chat_id}` | 群里有没有组织外的成员（`external`）——`allow_tenant` 靠它排除外部群 |
 //! | `POST /open-apis/im/v1/messages` | 发文本 / 发卡片 |
 //! | `PATCH /open-apis/im/v1/messages/{id}` | Run 终态时换掉处理中卡片（§11.3） |
 //! | `POST /open-apis/im/v1/messages/{id}/reply` | 回复原消息发一张处理中卡片；`reply_in_thread` 时以话题回复（目标已在话题里就进那个话题）。话题只能这样进：发消息接口不能指定话题 |
@@ -220,6 +221,25 @@ impl FeishuApi {
             .await?;
         body.bot
             .ok_or_else(|| FeishuError::Decode("bot/v3/info 没有 bot".into()))
+    }
+
+    /// 这个会话是不是外部群（含组织外成员）。`allow_tenant` 只在内部群里生效。
+    pub async fn chat_is_external(&self, chat_id: &str) -> Result<bool, FeishuError> {
+        #[derive(Deserialize)]
+        struct Chat {
+            #[serde(default)]
+            external: bool,
+        }
+        let token = self.tenant_token().await?;
+        let chat: Chat = self
+            .call_data(
+                reqwest::Method::GET,
+                &format!("/open-apis/im/v1/chats/{chat_id}"),
+                Some(&token),
+                None,
+            )
+            .await?;
+        Ok(chat.external)
     }
 
     /// 发一条消息，返回它的 `message_id`——决定之后要按它原地改（§11.3）。

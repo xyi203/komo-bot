@@ -155,6 +155,7 @@ mod tests {
         ChannelConfig {
             enabled: true,
             allow_from: vec![PeerId::new("ou_op")],
+            allow_tenant: false,
             home_chat: Some(PeerId::new(chat)),
             guest_agent: None,
         }

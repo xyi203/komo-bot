@@ -95,12 +95,13 @@ impl Dispatcher {
             })
     }
 
-    /// 第 2 步：发送者在该渠道 `allow_from` 里就是操作者，否则不是。**每条消息现读**
+    /// 第 2 步：发送者在该渠道 `allow_from` 里（或 `allow_tenant` 且渠道核实了同一组织）
+    /// 就是操作者，否则不是。**每条消息现读**
     /// 当前快照（§3 第 2 步、§11.2）。
     fn principal(&self, msg: &InboundMessage) -> Principal {
         let snapshot = self.state.snapshot();
         let operator = match snapshot.channels.get(msg.peer.platform) {
-            Some(channel) => channel.is_operator(&msg.sender),
+            Some(channel) => channel.admits(&msg.sender, msg.same_org),
             // HTTP / TUI 的入口自己有认证（§13.1 的 Bearer），到这里就是操作者。
             None => msg.peer.platform == ChannelPlatform::Api,
         };
@@ -693,6 +694,7 @@ pub fn inbound(
         is_private,
         sender: PeerId::new(sender),
         text: text.to_string(),
+        same_org: false,
         request_key: RequestKey::new(request_key),
     }
 }
@@ -747,6 +749,7 @@ mod tests {
             is_private: false,
             sender: PeerId::new("ou_x"),
             text: "/id".into(),
+            same_org: false,
             request_key: RequestKey::new("feishu:evt"),
         };
         assert_eq!(id_reply(&msg), "会话：feishu:oc_g\n发送者：ou_x");

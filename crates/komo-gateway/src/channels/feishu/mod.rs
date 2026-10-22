@@ -30,7 +30,7 @@ pub mod ws;
 #[cfg(any(test, feature = "test-support"))]
 pub mod fake;
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -104,6 +104,9 @@ pub struct FeishuChannel {
     seen: Mutex<SeenEvents>,
     /// 图片存在哪。`None` = 不收图片，只有图片的消息不进 Dispatcher。
     inbox: Option<ImageInbox>,
+    /// `chat_id` → 这个群是不是内部群（没有外部成员）。只缓存查到的结果；群的外部标志
+    /// 基本不会翻回去，所以不设过期。
+    internal_chats: Mutex<HashMap<String, bool>>,
 }
 
 impl std::fmt::Debug for FeishuChannel {
@@ -134,6 +137,28 @@ impl FeishuChannel {
             source: Mutex::new(Some(source)),
             seen: Mutex::new(SeenEvents::default()),
             inbox: None,
+            internal_chats: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// 这个群里是不是只有组织内的人。**查不到就当不是**（fail closed）：外部群里的回复
+    /// 组织外的人也看得见，不能凭一次接口失败就当它是内部群。
+    async fn chat_is_internal(&self, chat_id: &str) -> bool {
+        if let Some(known) = self.internal_chats.lock().expect("群缓存").get(chat_id) {
+            return *known;
+        }
+        match self.api().chat_is_external(chat_id).await {
+            Ok(external) => {
+                self.internal_chats
+                    .lock()
+                    .expect("群缓存")
+                    .insert(chat_id.to_string(), !external);
+                !external
+            }
+            Err(error) => {
+                tracing::warn!(%error, chat_id, "飞书：查不到群信息，这个群不按同一企业算");
+                false
+            }
         }
     }
 
@@ -252,7 +277,11 @@ impl FeishuChannel {
         let origin = Some(event.message.message_id.trim().to_string()).filter(|id| !id.is_empty());
         // 先准入再下载：群里没 @机器人 的图片不该去开放平台拉一次。
         let message = match inbound::accept(&event, &bot.open_id) {
-            Some(accepted) => {
+            Some(mut accepted) => {
+                // 群里是不是同一企业：发送者同租户之后再问一次群里有没有外部成员。
+                if !accepted.is_private() && event.same_tenant() {
+                    accepted.same_org = self.chat_is_internal(event.message.chat_id.trim()).await;
+                }
                 let images = self
                     .save_images(origin.as_deref(), &accepted.image_keys)
                     .await;
@@ -514,7 +543,7 @@ mod tests {
 
     use super::fake::{
         BOT_OPEN_ID, Behavior, FakeOpenApi, RecordingInbound, card_action_event, image_event,
-        text_event,
+        text_event, text_event_from_tenant,
     };
 
     /// 一个事件源可注入的渠道 + 往里塞事件的那一头。
@@ -660,6 +689,63 @@ mod tests {
                 .any(|e| e.starts_with("resource:")),
             "没有收件箱就不该联网下载"
         );
+    }
+
+    /// 同一租户的人在 `chat_id` 这个群里 @机器人，走完 serve，回 Inbound 收到的那条。
+    async fn group_mention_same_org(fake: &FakeOpenApi, tenant: &str) -> Vec<bool> {
+        let harness = harness(fake);
+        let recorder = RecordingInbound::new(fake.log());
+        for (index, chat) in ["oc_in", "oc_in", "oc_out"].into_iter().enumerate() {
+            harness
+                .events
+                .send(text_event_from_tenant(
+                    &format!("evt-g{index}"),
+                    chat,
+                    "group",
+                    "ou_colleague",
+                    tenant,
+                    "@_user_1 嗨",
+                    &[("@_user_1", BOT_OPEN_ID)],
+                ))
+                .unwrap();
+        }
+        serve_until(harness.channel, recorder.clone(), || {
+            recorder.received().len() == 3
+        })
+        .await;
+        recorder.received().iter().map(|m| m.same_org).collect()
+    }
+
+    #[tokio::test]
+    async fn a_same_tenant_group_is_same_org_only_when_the_chat_has_no_outsiders() {
+        let fake = FakeOpenApi::start(Behavior::external_chats(&["oc_out"])).await;
+        let verdicts = group_mention_same_org(&fake, super::fake::APP_TENANT).await;
+        assert_eq!(verdicts, vec![true, true, false]);
+        assert_eq!(
+            fake.calls_to("chat_info").len(),
+            2,
+            "同一个群只问一次，结果缓存"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_chat_lookup_is_not_same_org() {
+        let fake = FakeOpenApi::start(Behavior::refuse_chat_info()).await;
+        let verdicts = group_mention_same_org(&fake, super::fake::APP_TENANT).await;
+        assert_eq!(verdicts, vec![false, false, false], "查不到就不当同事");
+        assert_eq!(
+            fake.calls_to("chat_info").len(),
+            3,
+            "失败不缓存，下一条再问"
+        );
+    }
+
+    #[tokio::test]
+    async fn another_tenants_group_message_never_asks_about_the_chat() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let verdicts = group_mention_same_org(&fake, "tenant_other").await;
+        assert_eq!(verdicts, vec![false, false, false]);
+        assert!(fake.calls_to("chat_info").is_empty());
     }
 
     // ② 卡片按钮随审批一起删掉了（§7）：平台还推来的回调不进 Dispatcher，也不问平台。

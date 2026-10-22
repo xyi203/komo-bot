@@ -190,6 +190,10 @@ pub struct ChannelConfig {
     /// 下指令。
     #[serde(default)]
     pub allow_from: Vec<PeerId>,
+    /// 与机器人同一租户（企业）的人都算操作者，等同写进 `allow_from`。只有飞书能核实，
+    /// 且外部联系人、外部群（含组织外成员的群）里的消息不算。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_tenant: bool,
     /// 主动投递（Run 结束、需要人判断等）的目标会话。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_chat: Option<PeerId>,
@@ -204,9 +208,15 @@ impl ChannelConfig {
         self.allow_from.contains(sender)
     }
 
+    /// 这条消息的发送者算不算操作者：在 `allow_from` 里，或开了 `allow_tenant` 且渠道
+    /// 核实了同一组织（[`InboundMessage::same_org`](crate::protocol::InboundMessage)）。
+    pub fn admits(&self, sender: &PeerId, same_org: bool) -> bool {
+        self.is_operator(sender) || (self.allow_tenant && same_org)
+    }
+
     /// enabled 但没人能说话——`komo doctor` 把它列为警告（§11.2）。
     pub fn is_outbound_only(&self) -> bool {
-        self.enabled && self.allow_from.is_empty()
+        self.enabled && self.allow_from.is_empty() && !self.allow_tenant
     }
 }
 
@@ -795,6 +805,7 @@ mod tests {
                 feishu: ChannelConfig {
                     enabled: true,
                     allow_from: vec![PeerId::new("ou_xxx")],
+                    allow_tenant: false,
                     home_chat: Some(PeerId::new("oc_xxx")),
                     guest_agent: None,
                 },
@@ -907,12 +918,14 @@ mod tests {
         snapshot.channels.telegram = ChannelConfig {
             enabled: true,
             allow_from: vec![PeerId::new("123")],
+            allow_tenant: false,
             home_chat: Some(PeerId::new("123")),
             guest_agent: None,
         };
         snapshot.channels.wechat = ChannelConfig {
             enabled: true,
             allow_from: vec![PeerId::new("wxid_x")],
+            allow_tenant: false,
             home_chat: Some(PeerId::new("wxid_x")),
             guest_agent: None,
         };
@@ -937,11 +950,34 @@ mod tests {
         let channel = ChannelConfig {
             enabled: true,
             allow_from: vec![],
+            allow_tenant: false,
             home_chat: Some(PeerId::new("oc_x")),
             guest_agent: None,
         };
         assert!(channel.is_outbound_only());
         assert!(!channel.is_operator(&PeerId::new("ou_x")));
+    }
+
+    #[test]
+    fn allow_tenant_admits_a_verified_same_org_sender_only() {
+        let channel = ChannelConfig {
+            enabled: true,
+            allow_tenant: true,
+            ..ChannelConfig::default()
+        };
+        let sender = PeerId::new("ou_colleague");
+        assert!(channel.admits(&sender, true));
+        assert!(!channel.admits(&sender, false), "渠道没核实就不算");
+        assert!(!channel.is_outbound_only(), "靠租户进来的人也能下指令");
+
+        let closed = ChannelConfig {
+            enabled: true,
+            ..ChannelConfig::default()
+        };
+        assert!(
+            !closed.admits(&sender, true),
+            "没开 allow_tenant 就不看 same_org"
+        );
     }
 
     /// `tool_exposure`：原名最优先；模式里字面部分最长的赢；都不中就是服务器的 `exposure`。

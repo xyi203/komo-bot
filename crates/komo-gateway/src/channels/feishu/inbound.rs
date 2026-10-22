@@ -54,6 +54,9 @@ pub enum EventKind {
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 pub struct MessageEvent {
+    /// `header.tenant_key`：机器人所在的租户。不在事件正文里，由 [`parse`] 从信封填。
+    #[serde(skip)]
+    pub app_tenant_key: String,
     #[serde(default)]
     pub sender: Sender,
     #[serde(default)]
@@ -64,6 +67,18 @@ pub struct MessageEvent {
 pub struct Sender {
     #[serde(default)]
     pub sender_id: SenderId,
+    /// 发送者所在的租户。外部联系人的租户与机器人的不同。
+    #[serde(default)]
+    pub tenant_key: String,
+}
+
+impl MessageEvent {
+    /// 发送者与机器人是同一个租户。任何一边缺租户信息都当作不是：宁可多问一句也不把
+    /// 外人当同事。
+    pub fn same_tenant(&self) -> bool {
+        let app = self.app_tenant_key.trim();
+        !app.is_empty() && app == self.sender.tenant_key.trim()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
@@ -139,6 +154,8 @@ pub fn parse(payload: &[u8]) -> Option<ParsedEvent> {
         event_id: String,
         #[serde(default)]
         event_type: String,
+        #[serde(default)]
+        tenant_key: String,
     }
 
     let envelope: Envelope = serde_json::from_slice(payload)
@@ -155,7 +172,9 @@ pub fn parse(payload: &[u8]) -> Option<ParsedEvent> {
 
     let kind = match envelope.header.event_type.as_str() {
         "im.message.receive_v1" => {
-            EventKind::Message(decode(envelope.event, "im.message.receive_v1")?)
+            let mut event: MessageEvent = decode(envelope.event, "im.message.receive_v1")?;
+            event.app_tenant_key = envelope.header.tenant_key;
+            EventKind::Message(event)
         }
         other => {
             tracing::debug!(event_type = other, "飞书：不处理这个事件类型");
@@ -184,9 +203,15 @@ pub struct Accepted {
     text: String,
     /// 消息里图片的 `image_key`，按出现顺序。
     pub image_keys: Vec<String>,
+    /// 见 [`InboundMessage::same_org`]。
+    pub same_org: bool,
 }
 
 impl Accepted {
+    pub fn is_private(&self) -> bool {
+        self.is_private
+    }
+
     /// 图片下载完了（或者没接收件箱、根本没下），拼成一条入站消息。正文为空返回 `None`。
     pub fn into_inbound(
         self,
@@ -202,6 +227,7 @@ impl Accepted {
             is_private: self.is_private,
             sender: self.sender,
             text,
+            same_org: self.same_org,
             request_key,
         })
     }
@@ -237,6 +263,9 @@ pub fn accept(event: &MessageEvent, bot_open_id: &str) -> Option<Accepted> {
         sender: PeerId::new(sender),
         text,
         image_keys: content.image_keys,
+        // 群还要再问一次"群里有没有外部成员"，那一步要联网，不在这里（见渠道的
+        // `handle_payload`）；这里只给私聊定。
+        same_org: is_private && event.same_tenant(),
     })
 }
 
@@ -382,14 +411,18 @@ fn strip_bot_mentions(text: &str, mentions: &[Mention], bot_open_id: &str) -> Op
 mod tests {
     use super::*;
 
-    use super::super::fake::{BOT_OPEN_ID, card_action_event, text_event};
+    use super::super::fake::{
+        APP_TENANT, BOT_OPEN_ID, card_action_event, text_event, text_event_from_tenant,
+    };
 
     fn message_event(chat_id: &str, chat_type: &str, text: &str) -> MessageEvent {
         MessageEvent {
+            app_tenant_key: String::new(),
             sender: Sender {
                 sender_id: SenderId {
                     open_id: "ou_op".into(),
                 },
+                tenant_key: String::new(),
             },
             message: Message {
                 message_id: "om_1".into(),
@@ -412,6 +445,61 @@ mod tests {
             },
             name: "komo".into(),
         }
+    }
+
+    fn dm_from_tenant(sender_tenant: &str) -> InboundMessage {
+        let payload =
+            text_event_from_tenant("evt-t", "oc_1", "p2p", "ou_x", sender_tenant, "在吗", &[]);
+        let EventKind::Message(event) = parse(&payload).expect("认得出").kind;
+        from_message(&event, BOT_OPEN_ID, request_key("evt-t")).expect("私聊总是进")
+    }
+
+    #[test]
+    fn a_dm_from_the_same_tenant_is_same_org() {
+        assert!(dm_from_tenant(APP_TENANT).same_org);
+    }
+
+    #[test]
+    fn a_dm_from_another_tenant_is_not_same_org() {
+        assert!(!dm_from_tenant("tenant_other").same_org);
+    }
+
+    #[test]
+    fn a_missing_tenant_key_is_never_same_org() {
+        assert!(!dm_from_tenant("").same_org, "发送者没带租户");
+
+        let payload = serde_json::json!({
+            "header": { "event_id": "evt-n", "event_type": "im.message.receive_v1" },
+            "event": {
+                "sender": { "sender_id": { "open_id": "ou_x" } },
+                "message": {
+                    "message_id": "om_1", "chat_id": "oc_1", "chat_type": "p2p",
+                    "message_type": "text", "content": "{\"text\":\"嗨\"}",
+                },
+            },
+        })
+        .to_string()
+        .into_bytes();
+        let EventKind::Message(event) = parse(&payload).expect("认得出").kind;
+        let inbound = from_message(&event, BOT_OPEN_ID, request_key("evt-n")).unwrap();
+        assert!(!inbound.same_org, "两边都没带租户不能算相等");
+    }
+
+    #[test]
+    fn a_group_message_is_not_same_org_until_the_chat_is_checked() {
+        let payload = text_event_from_tenant(
+            "evt-g",
+            "oc_g",
+            "group",
+            "ou_x",
+            APP_TENANT,
+            "@_user_1 嗨",
+            &[("@_user_1", BOT_OPEN_ID)],
+        );
+        let EventKind::Message(event) = parse(&payload).expect("认得出").kind;
+        assert!(event.same_tenant());
+        let inbound = from_message(&event, BOT_OPEN_ID, request_key("evt-g")).unwrap();
+        assert!(!inbound.same_org, "群要再问一次有没有外部成员");
     }
 
     #[test]

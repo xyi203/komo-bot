@@ -31,6 +31,9 @@ use super::api::FeishuApi;
 /// 假平台上机器人自己的 open_id。
 pub const BOT_OPEN_ID: &str = "ou_komo_bot";
 
+/// 假平台上机器人所在的租户；`text_event` 里的发送者默认也在这个租户。
+pub const APP_TENANT: &str = "tenant_app";
+
 /// 一串按发生顺序记下来的事件名。断言"谁在谁之后"用它。
 #[derive(Clone, Default)]
 pub struct EventLog(Arc<Mutex<Vec<String>>>);
@@ -65,6 +68,10 @@ pub struct Behavior {
     pub refuse_replies: bool,
     /// 加表情一律被拒。
     pub refuse_reactions: bool,
+    /// 这些会话是外部群（`chats/{id}` 返回 `external: true`）。
+    pub external_chats: Vec<String>,
+    /// 查群信息一律被拒。
+    pub refuse_chat_info: bool,
     /// 每次回复先睡这么久——让"终态先于卡片"变得可复现。
     pub reply_delay: Duration,
 }
@@ -108,6 +115,20 @@ impl Behavior {
     pub fn refuse_reactions() -> Self {
         Self {
             refuse_reactions: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn external_chats(chats: &[&str]) -> Self {
+        Self {
+            external_chats: chats.iter().map(|chat| chat.to_string()).collect(),
+            ..Self::default()
+        }
+    }
+
+    pub fn refuse_chat_info() -> Self {
+        Self {
+            refuse_chat_info: true,
             ..Self::default()
         }
     }
@@ -287,6 +308,14 @@ async fn handle(
         } else {
             json!({ "code": 0, "msg": "ok", "data": { "reaction_id": "r_1" } })
         }
+    } else if path.contains("/im/v1/chats/") {
+        state.record("chat_info", &body);
+        if state.behavior.refuse_chat_info {
+            refuse(232011, "no permission to read the chat")
+        } else {
+            let external = state.behavior.external_chats.contains(&last);
+            json!({ "code": 0, "msg": "ok", "data": { "name": "群", "external": external } })
+        }
     } else if path.ends_with("/im/v1/messages") {
         state.record("messages", &body);
         if state.behavior.refuse_sends {
@@ -339,6 +368,32 @@ pub fn text_event(
     text_event_replying(event_id, chat_id, chat_type, sender, text, mentions, "", "")
 }
 
+/// 发送者在 `sender_tenant` 租户的消息；`header.tenant_key` 恒为 [`APP_TENANT`]。
+/// 空串 = 平台没带这个键。
+pub fn text_event_from_tenant(
+    event_id: &str,
+    chat_id: &str,
+    chat_type: &str,
+    sender: &str,
+    sender_tenant: &str,
+    text: &str,
+    mentions: &[(&str, &str)],
+) -> Vec<u8> {
+    let mut payload: Value = serde_json::from_slice(&text_event(
+        event_id, chat_id, chat_type, sender, text, mentions,
+    ))
+    .expect("自己构造的负载");
+    if sender_tenant.is_empty() {
+        payload["event"]["sender"]
+            .as_object_mut()
+            .expect("sender")
+            .remove("tenant_key");
+    } else {
+        payload["event"]["sender"]["tenant_key"] = json!(sender_tenant);
+    }
+    payload.to_string().into_bytes()
+}
+
 /// 带 `root_id` / `thread_id` 的消息：群里话题内的消息两个都有，引用回复只有 `root_id`。
 /// 空串 = 平台没带这个键。
 #[allow(clippy::too_many_arguments)]
@@ -376,9 +431,14 @@ pub fn text_event_replying(
             "event_type": "im.message.receive_v1",
             "token": "v-token",
             "create_time": "1760000000000",
+            "tenant_key": APP_TENANT,
         },
         "event": {
-            "sender": { "sender_id": { "open_id": sender }, "sender_type": "user" },
+            "sender": {
+                "sender_id": { "open_id": sender },
+                "sender_type": "user",
+                "tenant_key": APP_TENANT,
+            },
             "message": message,
         },
     })

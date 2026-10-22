@@ -54,6 +54,7 @@ impl Accepted {
             is_private: self.is_private,
             sender: self.sender,
             text,
+            same_org: false,
             request_key,
         })
     }

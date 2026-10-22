@@ -37,6 +37,11 @@ pub struct InboundMessage {
     pub sender: PeerId,
     /// 正文。群里已经剥掉 @机器人 的提及。
     pub text: String,
+    /// 渠道已核实：发送者与机器人在同一个组织（飞书：同一租户），且这个会话里没有组织
+    /// 外的人（私聊，或不含外部成员的群）。只有飞书会置位；`allow_tenant` 靠它把整家
+    /// 企业算作操作者。核实不了就是 `false`。
+    #[serde(default)]
+    pub same_org: bool,
     /// 去重键：`feishu:{event_id}` / `telegram:{update_id}` / `wechat:{from}:{msg_id}`。
     /// **命令也去重**——重发的 `/cancel` 不会取消两次（§11.1）。
     pub request_key: RequestKey,
@@ -90,6 +95,7 @@ mod tests {
             is_private: true,
             sender: PeerId::new("123456789"),
             text: "/pending".into(),
+            same_org: false,
             request_key: RequestKey::new("telegram:42"),
         };
         let text = serde_json::to_string(&message).unwrap();

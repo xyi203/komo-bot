@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use komo_gateway::channels::ChannelSender;
-use komo_gateway::channels::feishu::{FeishuSender, inbound as feishu_inbound};
+use komo_gateway::channels::feishu::{FeishuChannel, FeishuSender, inbound as feishu_inbound};
 use komo_gateway::service::test_support::Gate;
 use komo_kernel::protocol::{InboundAck, InboundMessage};
 use komo_kernel::types::chat::{ChannelPeer, ChannelPlatform};
@@ -22,7 +22,7 @@ use crate::harness::{
     feishu_block, text_round,
 };
 use komo_gateway::channels::feishu::fake::{
-    BOT_OPEN_ID, Behavior, FakeOpenApi, text_event, text_event_replying,
+    BOT_OPEN_ID, Behavior, FakeOpenApi, text_event, text_event_from_tenant, text_event_replying,
 };
 use komo_kernel::types::ids::{RunId, SessionId};
 
@@ -375,4 +375,162 @@ async fn a_group_mention_opens_a_thread_that_is_its_own_session() {
             "chat:feishu:oc_group#om_C".to_string()
         ]
     );
+}
+
+// ---------------------------------------------------------------- allow_tenant
+
+/// 转给真 Dispatcher，并记下每条消息的回执——`serve` 把回执吞进了回复里。
+struct Tap {
+    inner: Arc<komo_gateway::Dispatcher>,
+    acks: std::sync::Mutex<Vec<InboundAck>>,
+}
+
+#[async_trait::async_trait]
+impl komo_kernel::traits::Inbound for Tap {
+    async fn handle(
+        &self,
+        msg: InboundMessage,
+    ) -> Result<InboundAck, komo_kernel::traits::GatewayError> {
+        let ack = self.inner.handle(msg).await?;
+        self.acks.lock().unwrap().push(ack.clone());
+        Ok(ack)
+    }
+}
+
+/// 没有 `allow_from`、只靠 `allow_tenant` 的飞书渠道；事件走真的 `serve`（租户比对与
+/// 群信息查询都在那里），后面是真 Dispatcher。
+struct Tenant {
+    gateway: TestGateway,
+    tap: Arc<Tap>,
+    events: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    shutdown: komo_kernel::traits::Shutdown,
+}
+
+impl Drop for Tenant {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+async fn wire_tenant(allow_tenant: bool, external_chats: &[&str]) -> Tenant {
+    use komo_kernel::traits::Channel;
+    crate::harness::install_crypto();
+    let fake = Arc::new(FakeOpenApi::start(Behavior::external_chats(external_chats)).await);
+    let sender = Arc::new(FeishuSender::with_api(fake.api())) as Arc<dyn ChannelSender>;
+    let block = format!(
+        "\n[channels.feishu]\nenabled = true\nallow_from = []\nallow_tenant = {allow_tenant}\n\
+         home_chat = \"oc_home\"\n"
+    );
+    let gateway = GatewayBuilder::new(&config_toml(&block))
+        .env("KOMO_LLM_API_KEY=test-key\nFEISHU_APP_ID=cli_test\nFEISHU_APP_SECRET=test-app-secret\n")
+        .factory(FixedFactory::sender_only(sender))
+        .start()
+        .await;
+    let tap = Arc::new(Tap {
+        inner: Arc::clone(gateway.dispatcher()),
+        acks: Default::default(),
+    });
+    let (events, rx) = tokio::sync::mpsc::unbounded_channel();
+    let channel = FeishuChannel::injected(fake.api(), rx);
+    let shutdown = komo_kernel::traits::Shutdown::new();
+    {
+        let (tap, shutdown) = (Arc::clone(&tap), shutdown.clone());
+        tokio::spawn(async move {
+            let _keep = fake;
+            let _ = channel.serve(tap, shutdown).await;
+        });
+    }
+    Tenant {
+        gateway,
+        tap,
+        events,
+        shutdown,
+    }
+}
+
+impl Tenant {
+    /// 群里 @机器人，等 Dispatcher 给出回执。
+    async fn say(
+        &self,
+        event: &str,
+        chat: &str,
+        sender: &str,
+        tenant: &str,
+        text: &str,
+    ) -> InboundAck {
+        let before = self.tap.acks.lock().unwrap().len();
+        self.events
+            .send(text_event_from_tenant(
+                event,
+                chat,
+                "group",
+                sender,
+                tenant,
+                &format!("@_user_1 {text}"),
+                &[("@_user_1", BOT_OPEN_ID)],
+            ))
+            .unwrap();
+        let tap = Arc::clone(&self.tap);
+        eventually("Dispatcher 给出回执", move || {
+            tap.acks.lock().unwrap().len() > before
+        })
+        .await;
+        self.tap.acks.lock().unwrap()[before].clone()
+    }
+}
+
+#[tokio::test]
+async fn a_colleague_in_an_internal_group_is_an_operator_with_allow_tenant() {
+    use komo_gateway::channels::feishu::fake::APP_TENANT;
+    let wired = wire_tenant(true, &[]).await;
+
+    let ack = wired
+        .say("T1", "oc_group", "ou_colleague", APP_TENANT, "看一下日志")
+        .await;
+    let InboundAck::Queued { session, .. } = ack else {
+        panic!("同事应该排队：{ack:?}");
+    };
+    let record = komo_store::repos::session::get(&wired.gateway.state().db, &session)
+        .await
+        .unwrap()
+        .expect("会话在");
+    assert_eq!(record.kind, komo_store::models::SessionKind::Normal);
+    assert_eq!(record.agent_id, "assistant");
+    assert_eq!(record.origin, "chat:feishu:oc_group#om_T1");
+
+    let status = wired
+        .say("T2", "oc_group", "ou_colleague", APP_TENANT, "/status")
+        .await;
+    assert!(matches!(status, InboundAck::Replied { .. }), "{status:?}");
+}
+
+#[tokio::test]
+async fn an_external_tenant_sender_is_rejected_even_with_allow_tenant() {
+    let wired = wire_tenant(true, &[]).await;
+    let ack = wired
+        .say("T3", "oc_group", "ou_outsider", "tenant_other", "你好")
+        .await;
+    assert!(matches!(ack, InboundAck::Rejected { .. }), "{ack:?}");
+    assert!(wired.gateway.sessions().await.is_empty(), "不留会话");
+}
+
+#[tokio::test]
+async fn a_colleague_in_an_external_group_is_rejected_even_with_allow_tenant() {
+    use komo_gateway::channels::feishu::fake::APP_TENANT;
+    let wired = wire_tenant(true, &["oc_ext"]).await;
+    let ack = wired
+        .say("T4", "oc_ext", "ou_colleague", APP_TENANT, "你好")
+        .await;
+    assert!(matches!(ack, InboundAck::Rejected { .. }), "{ack:?}");
+    assert!(wired.gateway.sessions().await.is_empty(), "不留会话");
+}
+
+#[tokio::test]
+async fn a_colleague_is_rejected_when_allow_tenant_is_off() {
+    use komo_gateway::channels::feishu::fake::APP_TENANT;
+    let wired = wire_tenant(false, &[]).await;
+    let ack = wired
+        .say("T5", "oc_group", "ou_colleague", APP_TENANT, "你好")
+        .await;
+    assert!(matches!(ack, InboundAck::Rejected { .. }), "{ack:?}");
 }

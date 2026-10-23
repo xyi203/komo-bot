@@ -14,6 +14,7 @@ pub mod memory;
 pub mod message;
 pub mod records;
 pub mod storage;
+pub mod task;
 
 pub use context::{ContextView, derive_context, order_tool_results};
 pub use fork::{ForkError, ForkSegment, fork_chain, visible_entries};

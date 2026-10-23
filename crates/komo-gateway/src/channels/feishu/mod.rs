@@ -24,6 +24,7 @@
 
 pub mod api;
 pub mod inbound;
+pub mod names;
 pub mod send;
 pub mod topic;
 pub mod ws;
@@ -108,6 +109,8 @@ pub struct FeishuChannel {
     /// `chat_id` → 这个群是不是内部群（没有外部成员）。只缓存查到的结果；群的外部标志
     /// 基本不会翻回去，所以不设过期。
     internal_chats: Mutex<HashMap<String, bool>>,
+    /// 话题上下文里发送者的名字（§11.3）。
+    names: names::SenderNames,
 }
 
 impl std::fmt::Debug for FeishuChannel {
@@ -139,6 +142,7 @@ impl FeishuChannel {
             seen: Mutex::new(SeenEvents::default()),
             inbox: None,
             internal_chats: Mutex::new(HashMap::new()),
+            names: names::SenderNames::default(),
         }
     }
 
@@ -303,6 +307,7 @@ impl FeishuChannel {
         if !thread_id.is_empty() {
             message.context = topic::context(
                 self.api(),
+                &self.names,
                 thread_id,
                 topic::Current {
                     message_id: event.message.message_id.trim(),

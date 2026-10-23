@@ -78,6 +78,10 @@ pub struct Behavior {
     pub refuse_thread_list: bool,
     /// 读话题消息先睡这么久——让超时变得可复现。
     pub thread_list_delay: Duration,
+    /// 查用户 / 应用名字一律被拒（没有通讯录或应用信息权限）。
+    pub refuse_names: bool,
+    /// 查用户 / 应用名字先睡这么久。
+    pub name_delay: Duration,
 }
 
 impl Behavior {
@@ -151,6 +155,20 @@ impl Behavior {
         }
     }
 
+    pub fn refuse_names() -> Self {
+        Self {
+            refuse_names: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn slow_names(delay: Duration) -> Self {
+        Self {
+            name_delay: delay,
+            ..Self::default()
+        }
+    }
+
     pub fn slow_replies(delay: Duration) -> Self {
         Self {
             reply_delay: delay,
@@ -169,6 +187,8 @@ struct FakeState {
     resources: Mutex<HashMap<String, Vec<u8>>>,
     /// 话题里的消息：`thread_id` → 按时间正序。
     threads: Mutex<HashMap<String, Vec<ThreadMessage>>>,
+    /// 通讯录与应用：`open_id` / `app_id` → 名字。
+    names: Mutex<HashMap<String, String>>,
 }
 
 /// 一个跑起来的假开放平台。
@@ -194,6 +214,7 @@ impl FakeOpenApi {
             next_message_id: AtomicI64::new(1000),
             resources: Mutex::new(HashMap::new()),
             threads: Mutex::new(HashMap::new()),
+            names: Mutex::new(HashMap::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -260,6 +281,24 @@ impl FakeOpenApi {
             .insert(thread_id.to_string(), items);
     }
 
+    /// 通讯录里放一个用户，`contact/v3/users/{open_id}` 查得到他的名字。
+    pub fn host_user(&self, open_id: &str, name: &str) {
+        self.host_name(open_id, name);
+    }
+
+    /// 放一个应用，`application/v6/applications/{app_id}` 查得到它的 `app_name`。
+    pub fn host_app(&self, app_id: &str, name: &str) {
+        self.host_name(app_id, name);
+    }
+
+    fn host_name(&self, id: &str, name: &str) {
+        self.state
+            .names
+            .lock()
+            .expect("名字")
+            .insert(id.to_string(), name.to_string());
+    }
+
     /// 被 PATCH 过的 `message_id`，按顺序。
     pub fn patched_message_ids(&self) -> Vec<String> {
         self.state.patched.lock().expect("PATCH 记录").clone()
@@ -311,6 +350,31 @@ async fn handle(
             "msg": "ok",
             "bot": { "open_id": BOT_OPEN_ID, "app_name": "komo" },
         })
+    } else if path.contains("/contact/v3/users/") || path.contains("/application/v6/applications/")
+    {
+        // 记下来的是查询串加一个 `id`：查的是谁。
+        let is_user = path.contains("/contact/v3/users/");
+        let mut query = parse_query(uri.query().unwrap_or_default());
+        query.insert("id".into(), last.clone());
+        state.record(
+            if is_user { "user_info" } else { "app_info" },
+            &json!(query),
+        );
+        if !state.behavior.name_delay.is_zero() {
+            tokio::time::sleep(state.behavior.name_delay).await;
+        }
+        let name = state.names.lock().expect("名字").get(&last).cloned();
+        match name {
+            _ if state.behavior.refuse_names => refuse(99991672, "Access denied"),
+            None if is_user => refuse(41050, "no user authority error"),
+            None => refuse(210501, "app not found"),
+            Some(name) if is_user => {
+                json!({ "code": 0, "msg": "success", "data": { "user": { "open_id": last, "name": name } } })
+            }
+            Some(name) => {
+                json!({ "code": 0, "msg": "success", "data": { "app": { "app_id": last, "app_name": name } } })
+            }
+        }
     } else if method == Method::PATCH {
         state.record("patch", &body);
         state.patched.lock().expect("PATCH 记录").push(last.clone());

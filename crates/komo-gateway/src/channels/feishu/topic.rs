@@ -14,14 +14,19 @@
 //!
 //! 渲染成纯文本，每条以 `发送者 HH:MM：` 开头；总长有上限，超了留最近的。**任何失败都只
 //! 记 WARN 并退回"没有上下文"**——读不到话题不该挡住用户这句话。
+//!
+//! 发送者名字先从话题里的 `mentions` 找，找不到的再去开放平台查（[`SenderNames`]），
+//! 用的是同一个超时里读完话题剩下的时间；查不到或到点就写 id，不影响其余部分。
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use jiff::tz::TimeZone;
 use serde_json::{Map, Value};
+use tokio::time::Instant;
 
 use super::api::{FeishuApi, FeishuError, ThreadMessage};
+use super::names::SenderNames;
 
 /// 最多读多少条（含被排除的）。话题再长，被 @ 时要的是最近那一段。
 pub const MAX_MESSAGES: usize = 200;
@@ -29,7 +34,7 @@ pub const MAX_MESSAGES: usize = 200;
 /// 渲染后总字符数上限。超了保留最近的，更早的整条省略。
 pub const MAX_CHARS: usize = 16_000;
 
-/// 整个读取（含分页）的超时。
+/// 整个读取（含分页与查名字）的超时。
 pub const FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// 机器人自己是谁：话题列表里它发的消息 `sender.id` 是 app_id，@ 它的 `mentions[].id`
@@ -48,30 +53,46 @@ pub struct Current<'a> {
     pub created_ms: Option<i64>,
 }
 
-/// 读话题、选消息、渲染。`None` = 没有要给的上下文（含读取失败，失败只记 WARN）。
+/// 读话题、选消息、查名字、渲染。`None` = 没有要给的上下文（含读取失败，失败只记 WARN）。
 pub async fn context(
     api: &FeishuApi,
+    names: &SenderNames,
     thread_id: &str,
     current: Current<'_>,
     me: Me<'_>,
     tz: &TimeZone,
     timeout: Duration,
 ) -> Option<String> {
-    let work = async {
-        let collected = collect(api, thread_id, current, me).await?;
-        Ok::<_, FeishuError>(render_context(&collected, current, me, tz))
-    };
-    match tokio::time::timeout(timeout, work).await {
-        Ok(Ok(text)) => text,
-        Ok(Err(error)) => {
-            tracing::warn!(%error, thread_id, "飞书：话题消息没读到，只交原文");
-            None
-        }
-        Err(_) => {
-            tracing::warn!(thread_id, ?timeout, "飞书：读话题超时，只交原文");
-            None
-        }
-    }
+    let deadline = Instant::now() + timeout;
+    let collected =
+        match tokio::time::timeout_at(deadline, collect(api, thread_id, current, me)).await {
+            Ok(Ok(collected)) => collected,
+            Ok(Err(error)) => {
+                tracing::warn!(%error, thread_id, "飞书：话题消息没读到，只交原文");
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(thread_id, ?timeout, "飞书：读话题超时，只交原文");
+                return None;
+            }
+        };
+
+    let cutoff = current.created_ms.or_else(|| {
+        collected
+            .messages
+            .iter()
+            .find(|m| m.message_id == current.message_id)
+            .and_then(ThreadMessage::created_ms)
+    });
+    let chosen = select(&collected.messages, current.message_id, cutoff, me);
+    let mut known = mention_names(&collected.messages);
+    let unnamed = chosen
+        .iter()
+        .map(|m| &m.sender)
+        .filter(|sender| !known.contains_key(&sender.id));
+    let looked_up = names.resolve(api, unnamed, deadline).await;
+    known.extend(looked_up);
+    render(&chosen, &known, tz, MAX_CHARS, !collected.complete)
 }
 
 /// 读到的话题消息，按时间正序。
@@ -125,29 +146,6 @@ async fn collect(
     })
 }
 
-fn render_context(
-    collected: &Collected,
-    current: Current<'_>,
-    me: Me<'_>,
-    tz: &TimeZone,
-) -> Option<String> {
-    let cutoff = current.created_ms.or_else(|| {
-        collected
-            .messages
-            .iter()
-            .find(|m| m.message_id == current.message_id)
-            .and_then(ThreadMessage::created_ms)
-    });
-    let chosen = select(&collected.messages, current.message_id, cutoff, me);
-    render(
-        &chosen,
-        &collected.messages,
-        tz,
-        MAX_CHARS,
-        !collected.complete,
-    )
-}
-
 fn is_mine(message: &ThreadMessage, me: Me<'_>) -> bool {
     let id = message.sender.id.as_str();
     !id.is_empty() && (id == me.app_id || id == me.open_id)
@@ -189,11 +187,19 @@ fn select<'a>(
         .collect()
 }
 
-/// 渲染。`all` 只用来查名字：任何一条消息里被 @ 的人都带着名字，话题列表里发送者
-/// 自己没有名字。`incomplete` = 更早的消息没读。
+/// 话题里被 @ 过的人与机器人：`mentions` 带着名字，话题列表里发送者自己没有。
+fn mention_names(all: &[ThreadMessage]) -> HashMap<String, String> {
+    all.iter()
+        .flat_map(|m| &m.mentions)
+        .filter(|m| !m.id.is_empty() && !m.name.is_empty())
+        .map(|m| (m.id.clone(), m.name.clone()))
+        .collect()
+}
+
+/// 渲染。`names` 是 id → 名字，没有的写 id。`incomplete` = 更早的消息没读。
 fn render(
     chosen: &[&ThreadMessage],
-    all: &[ThreadMessage],
+    names: &HashMap<String, String>,
     tz: &TimeZone,
     max_chars: usize,
     incomplete: bool,
@@ -201,20 +207,10 @@ fn render(
     if chosen.is_empty() {
         return None;
     }
-    let names: HashMap<&str, &str> = all
-        .iter()
-        .flat_map(|m| &m.mentions)
-        .filter(|m| !m.id.is_empty() && !m.name.is_empty())
-        .map(|m| (m.id.as_str(), m.name.as_str()))
-        .collect();
-
     let lines: Vec<String> = chosen
         .iter()
         .map(|m| {
-            let who = names
-                .get(m.sender.id.as_str())
-                .copied()
-                .unwrap_or(m.sender.id.as_str());
+            let who = names.get(&m.sender.id).unwrap_or(&m.sender.id);
             format!("{who} {}：{}", clock(m.created_ms(), tz), message_text(m))
         })
         .collect();
@@ -759,7 +755,14 @@ mod tests {
             &[("@_user_1", "ou_jeeson", "Jeeson Bot")],
         )];
         let chosen: Vec<&ThreadMessage> = all.iter().collect();
-        let out = render(&chosen, &all, &TimeZone::UTC, MAX_CHARS, false).unwrap();
+        let out = render(
+            &chosen,
+            &mention_names(&all),
+            &TimeZone::UTC,
+            MAX_CHARS,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             out, "ou_a 02:33：@Jeeson Bot 帮忙 CR 一下",
             "没有名字就用 id，@ 换成名字"
@@ -781,7 +784,14 @@ mod tests {
             text("om_2", 2000, "ou_b", "好"),
         ];
         let chosen: Vec<&ThreadMessage> = all.iter().collect();
-        let out = render(&chosen, &all, &TimeZone::UTC, MAX_CHARS, false).unwrap();
+        let out = render(
+            &chosen,
+            &mention_names(&all),
+            &TimeZone::UTC,
+            MAX_CHARS,
+            false,
+        )
+        .unwrap();
         assert!(out.lines().nth(1).unwrap().starts_with("张三 "), "{out}");
     }
 
@@ -840,11 +850,24 @@ mod tests {
             .collect();
         let chosen: Vec<&ThreadMessage> = all.iter().collect();
         // 每行约 "ou_a --:--：第N条" + 20 字，给三条多一点的预算。
-        let line_len = render(&chosen[4..], &all, &TimeZone::UTC, MAX_CHARS, false)
-            .unwrap()
-            .chars()
-            .count();
-        let out = render(&chosen, &all, &TimeZone::UTC, (line_len + 1) * 3 + 2, false).unwrap();
+        let line_len = render(
+            &chosen[4..],
+            &mention_names(&all),
+            &TimeZone::UTC,
+            MAX_CHARS,
+            false,
+        )
+        .unwrap()
+        .chars()
+        .count();
+        let out = render(
+            &chosen,
+            &mention_names(&all),
+            &TimeZone::UTC,
+            (line_len + 1) * 3 + 2,
+            false,
+        )
+        .unwrap();
         assert!(out.starts_with("（更早的 2 条省略）\n"), "{out}");
         assert!(out.contains("第2条") && out.contains("第4条"), "{out}");
         assert!(!out.contains("第1条") && !out.contains("第0条"), "{out}");
@@ -854,7 +877,7 @@ mod tests {
     fn one_huge_newest_message_is_cut_not_dropped() {
         let all = vec![text("om_1", 1000, "ou_a", &"长".repeat(500))];
         let chosen: Vec<&ThreadMessage> = all.iter().collect();
-        let out = render(&chosen, &all, &TimeZone::UTC, 100, false).unwrap();
+        let out = render(&chosen, &mention_names(&all), &TimeZone::UTC, 100, false).unwrap();
         assert!(out.ends_with("…（后略）"), "{out}");
         assert!(out.chars().count() < 120, "{}", out.chars().count());
     }
@@ -863,7 +886,14 @@ mod tests {
     fn an_incomplete_read_says_so() {
         let all = vec![text("om_1", 1000, "ou_a", "x")];
         let chosen: Vec<&ThreadMessage> = all.iter().collect();
-        let out = render(&chosen, &all, &TimeZone::UTC, MAX_CHARS, true).unwrap();
+        let out = render(
+            &chosen,
+            &mention_names(&all),
+            &TimeZone::UTC,
+            MAX_CHARS,
+            true,
+        )
+        .unwrap();
         assert!(out.starts_with("（话题更早的消息没有读取"), "{out}");
     }
 
@@ -957,7 +987,17 @@ mod tests {
     }
 
     async fn read(fake: &FakeOpenApi, now: Current<'_>, timeout: Duration) -> Option<String> {
-        context(&fake.api(), "omt_1", now, ME, &TimeZone::UTC, timeout).await
+        let names = SenderNames::default();
+        context(
+            &fake.api(),
+            &names,
+            "omt_1",
+            now,
+            ME,
+            &TimeZone::UTC,
+            timeout,
+        )
+        .await
     }
 
     #[tokio::test]
@@ -1021,6 +1061,96 @@ mod tests {
         assert!(out.contains("话题更早的消息没有读取"), "{out}");
         // 200 条里含当前这一条，所以渲染出来 199 条正文。
         assert_eq!(out.lines().filter(|l| l.starts_with("ou_a ")).count(), 199);
+    }
+
+    #[tokio::test]
+    async fn senders_without_a_mention_are_named_from_the_open_platform() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        fake.host_user("ou_a", "张三");
+        fake.host_app("cli_jeeson", "Jeeson Bot");
+        fake.host_thread(
+            "omt_1",
+            vec![
+                text("om_root", 1000, "ou_a", "帮忙 CR"),
+                text("om_review", 2000, "cli_jeeson", "审完了"),
+                text("om_b", 3000, "ou_a", "收到"),
+                text("om_now", 4000, "ou_a", "当前"),
+            ],
+        );
+        let out = read(&fake, current("om_now", 4000), FETCH_TIMEOUT)
+            .await
+            .expect("有上下文");
+        assert_eq!(
+            out,
+            "张三 00:00：帮忙 CR\nJeeson Bot 00:00：审完了\n张三 00:00：收到"
+        );
+        assert_eq!(fake.calls_to("user_info").len(), 1, "同一个人只查一次");
+        assert_eq!(fake.calls_to("app_info").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_sender_named_by_a_mention_is_not_looked_up() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        fake.host_thread(
+            "omt_1",
+            vec![
+                thread_item(
+                    "om_root",
+                    1000,
+                    "ou_a",
+                    "text",
+                    &json!({ "text": "@_user_1 看看" }),
+                    &[("@_user_1", "cli_jeeson", "Jeeson Bot")],
+                ),
+                text("om_review", 2000, "cli_jeeson", "好"),
+                text("om_now", 4000, "ou_b", "当前"),
+            ],
+        );
+        fake.host_user("ou_a", "张三");
+        let out = read(&fake, current("om_now", 4000), FETCH_TIMEOUT)
+            .await
+            .expect("有上下文");
+        assert!(out.contains("\nJeeson Bot 00:00：好"), "{out}");
+        assert!(fake.calls_to("app_info").is_empty(), "mentions 里有就不查");
+    }
+
+    #[tokio::test]
+    async fn refused_name_lookups_fall_back_to_ids() {
+        let fake = FakeOpenApi::start(Behavior::refuse_names()).await;
+        fake.host_thread(
+            "omt_1",
+            vec![
+                text("om_root", 1000, "ou_a", "帮忙 CR"),
+                text("om_review", 2000, "cli_jeeson", "审完了"),
+                text("om_now", 4000, "ou_a", "当前"),
+            ],
+        );
+        let out = read(&fake, current("om_now", 4000), FETCH_TIMEOUT).await;
+        assert_eq!(
+            out.as_deref(),
+            Some("ou_a 00:00：帮忙 CR\ncli_jeeson 00:00：审完了")
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_name_lookups_keep_the_context_within_the_timeout() {
+        let fake = FakeOpenApi::start(Behavior::slow_names(Duration::from_secs(2))).await;
+        fake.host_user("ou_a", "张三");
+        fake.host_thread(
+            "omt_1",
+            vec![
+                text("om_root", 1000, "ou_a", "帮忙 CR"),
+                text("om_now", 4000, "ou_b", "当前"),
+            ],
+        );
+        let started = std::time::Instant::now();
+        let out = read(&fake, current("om_now", 4000), Duration::from_millis(300)).await;
+        assert_eq!(
+            out.as_deref(),
+            Some("ou_a 00:00：帮忙 CR"),
+            "名字没等到，正文还在"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "按超时返回");
     }
 
     #[tokio::test]

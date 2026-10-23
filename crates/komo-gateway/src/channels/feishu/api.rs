@@ -13,6 +13,8 @@
 //! | `POST /open-apis/im/v1/messages/{id}/reactions` | 给原消息加表情回复（收到了） |
 //! | `GET /open-apis/im/v1/messages?container_id_type=thread&…` | 读一个话题里的全部消息（话题上下文，§11.3）：bot 身份即可，按时间倒序分页；卡片要带 `card_msg_content_type=raw_card_content` 才给原始 JSON |
 //! | `GET /open-apis/im/v1/messages/{id}/resources/{key}?type=image` | 下载用户发来的图片（要 `im:resource` 权限） |
+//! | `GET /open-apis/contact/v3/users/{open_id}?user_id_type=open_id` | 话题上下文里用户发送者的名字（话题列表不给名字，§11.3）；要通讯录读权限且对方在可见范围内 |
+//! | `GET /open-apis/application/v6/applications/{app_id}?lang=zh_cn` | 话题上下文里机器人发送者的名字（`app_name`）；要应用信息读权限 |
 //!
 //! 只解析用得到的字段，其余一律忽略：开放平台每月加字段，而一个多出来的键不应该让一
 //! 条事件或一次回复整体失败。
@@ -336,6 +338,63 @@ impl FeishuApi {
             .await
     }
 
+    /// 一个用户的名字（话题上下文的发送者，§11.3）。名字为空当作查不到。
+    pub async fn user_name(&self, open_id: &str) -> Result<String, FeishuError> {
+        #[derive(Deserialize)]
+        struct Body {
+            #[serde(default)]
+            user: Named,
+        }
+        #[derive(Default, Deserialize)]
+        struct Named {
+            #[serde(default)]
+            name: String,
+        }
+        let token = self.tenant_token().await?;
+        let body: Body = self
+            .call_data(
+                reqwest::Method::GET,
+                &format!(
+                    "/open-apis/contact/v3/users/{}?user_id_type=open_id",
+                    query_value(open_id)
+                ),
+                Some(&token),
+                None,
+            )
+            .await?;
+        non_empty(body.user.name, "contact/v3/users 没有名字")
+    }
+
+    /// 一个应用（机器人）的名字（话题上下文的发送者，§11.3）。名字为空当作查不到。
+    pub async fn app_name(&self, app_id: &str) -> Result<String, FeishuError> {
+        #[derive(Deserialize)]
+        struct Body {
+            #[serde(default)]
+            app: Named,
+        }
+        #[derive(Default, Deserialize)]
+        struct Named {
+            #[serde(default)]
+            app_name: String,
+        }
+        let token = self.tenant_token().await?;
+        let body: Body = self
+            .call_data(
+                reqwest::Method::GET,
+                &format!(
+                    "/open-apis/application/v6/applications/{}?lang=zh_cn",
+                    query_value(app_id)
+                ),
+                Some(&token),
+                None,
+            )
+            .await?;
+        non_empty(
+            body.app.app_name,
+            "application/v6/applications 没有 app_name",
+        )
+    }
+
     /// 发一条消息，返回它的 `message_id`——决定之后要按它原地改（§11.3）。
     pub async fn send_message(
         &self,
@@ -596,6 +655,15 @@ fn query_value(value: &str) -> String {
         }
     }
     out
+}
+
+fn non_empty(name: String, what: &str) -> Result<String, FeishuError> {
+    let name = name.trim();
+    if name.is_empty() {
+        Err(FeishuError::Decode(what.into()))
+    } else {
+        Ok(name.to_string())
+    }
 }
 
 /// reqwest 的错误里带 URL。飞书的 URL 里没有凭证，但错误会进日志，少一样是一样。

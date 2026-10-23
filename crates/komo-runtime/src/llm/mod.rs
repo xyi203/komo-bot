@@ -11,6 +11,7 @@
 mod anthropic;
 mod chat;
 pub mod codex_auth;
+mod model_stream;
 mod models;
 mod responses;
 mod sse;
@@ -30,6 +31,11 @@ use komo_kernel::types::turn::{LlmError, TurnRequest};
 
 pub use anthropic::AnthropicMessagesLlm;
 pub use chat::ChatCompletionsLlm;
+pub use model_stream::{
+    API_ANTHROPIC, API_CHAT, API_RESPONSES, ImageLoadError, ImageRef, ImageResolver, ModelRequest,
+    ModelStream, PROVIDER_BLOCKS, RequestOptions, SystemState, load_image, replay_system,
+    usage_json, usage_of,
+};
 pub use models::{ProbeError, probe_context_window};
 pub use responses::{Credential, OpenAiResponsesLlm};
 pub use transport::{HttpTransport, ReqwestTransport, TransportError};
@@ -450,5 +456,7 @@ impl LlmClient for RoutingLlm {
     }
 }
 
+#[cfg(test)]
+mod stream_tests;
 #[cfg(test)]
 mod tests;

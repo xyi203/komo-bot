@@ -35,6 +35,8 @@ use super::transport::{HttpRequest, HttpTransport, TransportError};
 use super::wire::{self, EventPayload};
 use crate::config::EffortCapabilities;
 
+mod stateless;
+
 /// 这个客户端的凭证来源：`.env` 里的一个变量，或者 ChatGPT 账号 OAuth（§13.3）。
 ///
 /// **每次请求都读当前的那份**——`Env` 是构造时就抓死的值（本来就来自不变的环境变量），

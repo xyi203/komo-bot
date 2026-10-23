@@ -12,13 +12,14 @@ use time::OffsetDateTime;
 
 use komo_kernel::durable::records::{JoinPolicy, TaskOutcome, TaskOutcomeError};
 use komo_kernel::durable::storage::{
-    ConversationQuery, DocumentQuery, EntryQuery, StoredEntry, SubmissionQuery, TaskQuery,
+    ConversationQuery, DocumentQuery, EntryQuery, SessionCursor, SessionPage, SessionQuery,
+    StoredEntry, SubmissionQuery, TaskQuery,
 };
 use komo_kernel::durable::task::{NextTaskState, RunningTask};
 use komo_kernel::durable::{
     ConversationId, ConversationRecord, Cursor, DocumentAddress, DocumentId, DocumentRecord,
-    EntryId, EntryRecord, MemoryStorage, Page, ROOT_CONVERSATION_ID, Seq, Storage, StorageError,
-    StorageWrite, SubmissionId, SubmissionRecord, TaskId, TaskRecord, TaskState,
+    EntryId, EntryRecord, MemoryStorage, Page, ROOT_CONVERSATION_ID, Seq, SessionRecord, Storage,
+    StorageError, StorageWrite, SubmissionId, SubmissionRecord, TaskId, TaskRecord, TaskState,
 };
 use komo_kernel::traits::Clock;
 
@@ -403,6 +404,19 @@ impl Storage for FlakyStorage {
         cursor: Option<&Cursor>,
     ) -> Result<Page<DocumentRecord>, StorageError> {
         self.inner.scan_documents(query, limit, cursor).await
+    }
+
+    async fn session(&self, id: &str) -> Result<Option<SessionRecord>, StorageError> {
+        self.inner.session(id).await
+    }
+
+    async fn scan_sessions(
+        &self,
+        query: &SessionQuery,
+        limit: usize,
+        cursor: Option<&SessionCursor>,
+    ) -> Result<SessionPage, StorageError> {
+        self.inner.scan_sessions(query, limit, cursor).await
     }
 
     async fn close(&self) -> Result<(), StorageError> {

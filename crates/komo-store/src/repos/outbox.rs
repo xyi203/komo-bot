@@ -129,6 +129,7 @@ pub async fn mark_delivered_in(
 /// `EventPayload` 拆成 `type` 与 `data`——列里存的就是这两样，和 JSONL 的信封同形。
 fn split_payload(payload: &EventPayload) -> Result<(String, String), StoreError> {
     let event = komo_kernel::events::Event {
+        entry: None,
         v: komo_kernel::events::EVENT_FORMAT_VERSION,
         seq: Seq::ZERO,
         event_id: EventId::from_raw("outbox"),

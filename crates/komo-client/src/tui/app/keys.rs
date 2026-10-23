@@ -37,6 +37,21 @@ impl App {
             self.quit = true;
             return vec![Effect::Quit];
         }
+        if self.opening_tree.is_some() {
+            if key.code == KeyCode::Esc {
+                self.opening_tree = None;
+            }
+            return Vec::new();
+        }
+        if self.tree_picker.is_some() {
+            return self.tree_key(key);
+        }
+        if self.tree_busy {
+            if key.code == KeyCode::Esc {
+                self.opening_tree = None;
+            }
+            return Vec::new();
+        }
         if self.model_picker.is_some() {
             return self.model_picker_key(key);
         }
@@ -219,6 +234,33 @@ impl App {
             }
         };
         match command {
+            Command::Tree { target, summarize } => match target {
+                Some(target) => self.tree_mutation(Effect::Navigate { target, summarize }),
+                None => self.open_tree(crate::tui::tree_picker::TreePurpose::Navigate),
+            },
+            Command::Fork { target } => match target {
+                Some(target) => self.tree_mutation(Effect::Fork {
+                    target: Some(target),
+                    clone: false,
+                }),
+                None => self.open_tree(crate::tui::tree_picker::TreePurpose::Fork),
+            },
+            Command::Clone => self.tree_mutation(Effect::Fork {
+                target: None,
+                clone: true,
+            }),
+            Command::Name(name) => self.tree_mutation(Effect::Name(name)),
+            Command::Label { target, label } => self.tree_mutation(Effect::Label { target, label }),
+            Command::ContextEdit {
+                target,
+                replacement,
+            } => self.tree_mutation(Effect::ContextEdit {
+                target,
+                replacement,
+            }),
+            Command::Compact { instructions } => {
+                self.tree_mutation(Effect::Compact { instructions })
+            }
             Command::New => {
                 // 会话还没铸出来（`komo` 裸命令、还没发过消息）：没有可划的边界。
                 if self.session.is_none() {

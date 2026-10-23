@@ -26,6 +26,7 @@ const BUDGET: ProjectionContext = ProjectionContext {
 /// `komo_kernel::traits::Clock`）拿一个固定时间戳，不必自己拼这个类型的路径。
 fn event(seq: u64, run: &RunId, payload: EventPayload) -> Event {
     Event {
+        entry: None,
         v: 1,
         seq: Seq(seq),
         event_id: EventId::from_raw(format!("evt-{seq}")),

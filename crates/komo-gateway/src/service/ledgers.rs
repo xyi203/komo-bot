@@ -96,6 +96,27 @@ impl SessionLedgers {
         }
     }
 
+    pub async fn tree(
+        &self,
+        session: &SessionId,
+    ) -> Result<komo_kernel::session::SessionTree, LedgerError> {
+        if let Some(entry) = self.entries.lock().await.get(session).cloned() {
+            return entry.coordinator.tree().await;
+        }
+        let paths = self.paths_for(session);
+        let mut events = komo_store::session_log::read_all(&paths, session).await?;
+        let payloads = komo_store::PayloadStore::new(paths);
+        for event in &mut events {
+            payloads
+                .hydrate_event(event)
+                .await
+                .map_err(komo_store::db::store_to_ledger)?;
+        }
+        komo_kernel::session_events::TreeState::from_events(&events)
+            .and_then(|state| state.tree())
+            .map_err(LedgerError::Corrupt)
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

@@ -32,6 +32,26 @@ pub enum Command {
     Effort {
         level: Option<Effort>,
     },
+    Tree {
+        target: Option<String>,
+        summarize: bool,
+    },
+    Fork {
+        target: Option<String>,
+    },
+    Clone,
+    Name(String),
+    Label {
+        target: String,
+        label: Option<String>,
+    },
+    ContextEdit {
+        target: String,
+        replacement: Option<serde_json::Value>,
+    },
+    Compact {
+        instructions: Option<String>,
+    },
     Help,
     /// `/quit`
     Quit,
@@ -40,6 +60,8 @@ pub enum Command {
 /// 解析失败。每一条都要能直接印给人看。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CommandError {
+    #[error("{0}")]
+    Usage(String),
     #[error("没有 /{name} 这个命令。/help 看全部")]
     Unknown { name: String },
     #[error("/{name} 不带参数，收到「{extra}」")]
@@ -119,7 +141,7 @@ pub const KEYS: &[&str] = &[
     "按键  ! 开头 = Shell 模式：Enter 在 Gateway 里直接跑这条命令，不经过模型；结果记进会话，接着问模型就能看见",
 ];
 
-pub const COMMANDS: [(&str, &str); 9] = [
+pub const COMMANDS: [(&str, &str); 16] = [
     ("/new", "在当前会话划一条回放边界（不切会话）"),
     ("/cancel", "取消本会话正在跑的 Run"),
     ("/status", "当前 Run 状态与待处理条数"),
@@ -133,6 +155,16 @@ pub const COMMANDS: [(&str, &str); 9] = [
     ),
     ("/model", "[模型] 列出或设定下一个 Run 的模型"),
     ("/effort", "[档位] 列出或设定下一个 Run 的推理强度"),
+    ("/tree", "[条目 ID] [--summarize] 浏览或切换分支"),
+    ("/fork", "[用户条目 ID] 从历史输入建立独立会话"),
+    ("/clone", "复制当前路径到独立会话"),
+    ("/name", "<名称> 命名当前会话"),
+    ("/label", "<条目 ID> [标签] 设置或清除标签"),
+    (
+        "/context-edit",
+        "<条目 ID> <消息 JSON | null> 替换或省略未来上下文",
+    ),
+    ("/compact", "[指示] 压缩当前分支"),
     ("/help", "这张表"),
     ("/quit", "退出 TUI（不取消后台运行）"),
 ];
@@ -200,6 +232,44 @@ pub fn parse(text: &str, menu: &CommandMenu) -> Result<Command, CommandError> {
     };
 
     match name.as_str() {
+        "tree" => {
+            let summarize = args.contains(&"--summarize");
+            let ids: Vec<_> = args.iter().filter(|a| **a != "--summarize").collect();
+            if ids.len() > 1 || (summarize && ids.is_empty()) {
+                return Err(CommandError::Usage(
+                    "用法：/tree [条目 ID [--summarize]]".into(),
+                ));
+            }
+            Ok(Command::Tree {
+                target: ids.first().map(|s| s.to_string()),
+                summarize,
+            })
+        }
+        "fork" if args.len() <= 1 => Ok(Command::Fork {
+            target: args.first().map(|s| s.to_string()),
+        }),
+        "clone" => no_args(Command::Clone),
+        "name" if !args.is_empty() => Ok(Command::Name(body[name.len()..].trim().to_string())),
+        "label" if !args.is_empty() => Ok(Command::Label {
+            target: args[0].into(),
+            label: (!args[1..].is_empty()).then(|| args[1..].join(" ")),
+        }),
+        "compact" => Ok(Command::Compact {
+            instructions: (!args.is_empty()).then(|| body[name.len()..].trim().to_string()),
+        }),
+        "context-edit" => {
+            let rest = body[name.len()..].trim();
+            let (target, json) = rest.split_once(char::is_whitespace).ok_or_else(|| {
+                CommandError::Usage("用法：/context-edit <条目 ID> <消息 JSON | null>".into())
+            })?;
+            let replacement: serde_json::Value = serde_json::from_str(json.trim())
+                .map_err(|e| CommandError::Usage(format!("上下文 JSON 无效：{e}")))?;
+            Ok(Command::ContextEdit {
+                target: target.into(),
+                replacement: (!replacement.is_null()).then_some(replacement),
+            })
+        }
+        "fork" | "name" | "label" => Err(CommandError::Usage(format!("用法见 /help：/{name}"))),
         "new" => no_args(Command::New),
         "cancel" => no_args(Command::Cancel),
         "status" => no_args(Command::Status),
@@ -268,6 +338,89 @@ pub fn parse(text: &str, menu: &CommandMenu) -> Result<Command, CommandError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tree_workflows_parse_names_labels_summaries_and_context_json() {
+        let menu = CommandMenu::default();
+        assert_eq!(
+            parse("/tree", &menu).unwrap(),
+            Command::Tree {
+                target: None,
+                summarize: false
+            }
+        );
+        assert_eq!(
+            parse("/tree a1 --summarize", &menu).unwrap(),
+            Command::Tree {
+                target: Some("a1".into()),
+                summarize: true
+            }
+        );
+        assert_eq!(
+            parse("/fork", &menu).unwrap(),
+            Command::Fork { target: None }
+        );
+        assert_eq!(
+            parse("/fork u1", &menu).unwrap(),
+            Command::Fork {
+                target: Some("u1".into())
+            }
+        );
+        assert_eq!(parse("/clone", &menu).unwrap(), Command::Clone);
+        assert_eq!(
+            parse("/name order investigation", &menu).unwrap(),
+            Command::Name("order investigation".into())
+        );
+        assert_eq!(
+            parse("/label u1", &menu).unwrap(),
+            Command::Label {
+                target: "u1".into(),
+                label: None
+            }
+        );
+        assert_eq!(
+            parse("/label u1 key decision", &menu).unwrap(),
+            Command::Label {
+                target: "u1".into(),
+                label: Some("key decision".into())
+            }
+        );
+        assert_eq!(
+            parse("/context-edit u1 null", &menu).unwrap(),
+            Command::ContextEdit {
+                target: "u1".into(),
+                replacement: None
+            }
+        );
+        assert_eq!(
+            parse(
+                r#"/context-edit u1 {"role":"user","content":"shorter message"}"#,
+                &menu
+            )
+            .unwrap(),
+            Command::ContextEdit {
+                target: "u1".into(),
+                replacement: Some(serde_json::json!({"role":"user","content":"shorter message"}))
+            }
+        );
+        assert_eq!(
+            parse("/compact keep request IDs", &menu).unwrap(),
+            Command::Compact {
+                instructions: Some("keep request IDs".into())
+            }
+        );
+        for invalid in [
+            "/tree --summarize",
+            "/tree a b",
+            "/fork a b",
+            "/name",
+            "/label",
+            "/context-edit u1 invalid",
+            "/clone extra",
+        ] {
+            assert!(parse(invalid, &menu).is_err(), "{invalid}");
+        }
+    }
 
     /// 菜单还没取到的那一刻：模型不校验，effort 用内建白名单。
     fn menu() -> CommandMenu {

@@ -15,6 +15,7 @@ pub mod shell;
 pub mod spinner;
 pub mod tool_view;
 pub mod transcript;
+pub mod tree_picker;
 
 #[cfg(test)]
 pub mod test_support;
@@ -42,8 +43,9 @@ use crossterm::terminal::{
 };
 use crossterm::{execute, queue};
 use komo_kernel::protocol::http::{
-    BoundaryRequest, CancelRunRequest, CreateSessionRequest, EventQuery, InterventionAnswerRequest,
-    InterventionListQuery, ResumeRequest, SubmitRunRequest,
+    BoundaryRequest, CancelRunRequest, CreateSessionRequest, EditSessionContextRequest, EventQuery,
+    ForkSessionRequest, InterventionAnswerRequest, InterventionListQuery, LabelSessionRequest,
+    NameSessionRequest, NavigateSessionRequest, ResumeRequest, SubmitRunRequest,
 };
 use komo_kernel::protocol::sse::Cursor;
 use komo_kernel::types::ids::{SessionId, uuid_v7_at};
@@ -140,6 +142,23 @@ pub async fn run_tui(
     while let Ok(event) = events.try_recv() {
         let effects = app.apply(event);
         spawn_effects(&client, app.session.as_ref(), effects, &events_tx);
+    }
+
+    if let Some(session) = app.session.as_ref() {
+        match client.session_tree(session).await {
+            Ok(response) => {
+                app.apply(ServerEvent::Tree {
+                    response: Box::new(response),
+                    generation: 0,
+                });
+            }
+            Err(error) => {
+                app.apply(ServerEvent::TreeFailed {
+                    error: error.to_string(),
+                    generation: 0,
+                });
+            }
+        }
     }
 
     // 还没有会话（`komo` 裸命令）就没有订阅：它在第一条消息铸出会话之后才建立。
@@ -245,7 +264,8 @@ pub async fn run_tui(
                     app.apply(ServerEvent::FrameRetired { id });
                 }
                 Stream::Connection(state) => {
-                    app.apply(ServerEvent::Connection(state));
+                    let effects = app.apply(ServerEvent::Connection(state));
+                    spawn_effects(&client, app.session.as_ref(), effects, &events_tx);
                 }
                 Stream::Ended => {
                     // 句柄在 `select!` 之外丢掉：`recv` 关掉之后恒返回 `None`，留着这条
@@ -255,7 +275,13 @@ pub async fn run_tui(
                 }
             },
             Some(event) = events.recv() => {
+                let previous = app.session.clone();
                 let effects = app.apply(event);
+                if app.session != previous {
+                    if let Some(old) = subscription.take() { old.abort(); }
+                    just_opened = app.session.clone();
+                    ended = false;
+                }
                 spawn_effects(&client, app.session.as_ref(), effects, &events_tx);
             }
             _ = ticker.tick() => {}
@@ -272,7 +298,7 @@ pub async fn run_tui(
         // 会话刚铸出来：订阅在这里建立，`select!` 的分支体里换它借不过编译器——那一
         // 路正借着 `subscription`。
         if let Some(session) = just_opened.take() {
-            terminal.arm_relaunch(&session, mode, &cwd);
+            terminal.arm_relaunch(&session, app.mode, &cwd);
             subscription = Some(sse::subscribe(&client, session, Cursor::after(app.cursor)));
         }
         if ended {
@@ -533,6 +559,138 @@ async fn run_effect(
             Ok(response) => Some(ServerEvent::ModelMenu(response.models)),
             Err(error) => Some(ServerEvent::Failed(format!("取模型清单失败：{error}"))),
         },
+        Effect::FetchTree { generation } => {
+            let result = match session {
+                Some(session) => client.session_tree(session).await,
+                None => return None,
+            };
+            Some(match result {
+                Ok(response) => ServerEvent::Tree {
+                    response: Box::new(response),
+                    generation,
+                },
+                Err(error) => ServerEvent::TreeFailed {
+                    error: error.to_string(),
+                    generation,
+                },
+            })
+        }
+        Effect::Navigate { target, summarize } => {
+            let session = session?;
+            Some(
+                match client
+                    .navigate_session(
+                        session,
+                        &NavigateSessionRequest {
+                            target_id: target,
+                            summarize,
+                            instructions: None,
+                            label: None,
+                        },
+                    )
+                    .await
+                {
+                    Ok(response) => ServerEvent::TreeChanged(Box::new(response)),
+                    Err(error) => ServerEvent::TreeMutationFailed(format!("导航失败：{error}")),
+                },
+            )
+        }
+        Effect::Fork { target, clone } => {
+            let session = session?;
+            let editor_text = if !clone {
+                if let Some(target) = &target {
+                    match client.session_tree(session).await {
+                        Ok(tree) => tree.entries.iter().find(|e| &e.id == target).and_then(|e| {
+                            match &e.kind {
+                                komo_kernel::session::EntryKind::Message { message }
+                                    if message["role"] == "user" =>
+                                {
+                                    Some(tree_picker::content_text(&message["content"]))
+                                }
+                                _ => None,
+                            }
+                        }),
+                        Err(error) => {
+                            return Some(ServerEvent::TreeMutationFailed(format!(
+                                "读取 fork 输入失败：{error}"
+                            )));
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            Some(
+                match client
+                    .fork_session(
+                        session,
+                        &ForkSessionRequest {
+                            target_id: target,
+                            clone,
+                        },
+                    )
+                    .await
+                {
+                    Ok(response) => ServerEvent::Forked {
+                        session: response.session,
+                        editor_text,
+                    },
+                    Err(error) => {
+                        ServerEvent::TreeMutationFailed(format!("fork/clone 失败：{error}"))
+                    }
+                },
+            )
+        }
+        Effect::Compact { instructions } => {
+            let session = session?;
+            Some(match client.compact_session(session, instructions).await {
+                Ok(response) => ServerEvent::TreeChanged(Box::new(response)),
+                Err(error) => ServerEvent::TreeMutationFailed(format!("压缩失败：{error}")),
+            })
+        }
+        effect @ (Effect::ContextEdit { .. } | Effect::Label { .. } | Effect::Name(_)) => {
+            let session = session?;
+            let result = match effect {
+                Effect::ContextEdit {
+                    target,
+                    replacement,
+                } => {
+                    client
+                        .edit_session_context(
+                            session,
+                            &EditSessionContextRequest {
+                                target_id: target,
+                                replacement,
+                            },
+                        )
+                        .await
+                }
+                Effect::Label { target, label } => {
+                    client
+                        .label_session(
+                            session,
+                            &LabelSessionRequest {
+                                target_id: target,
+                                label,
+                            },
+                        )
+                        .await
+                }
+                Effect::Name(name) => {
+                    client
+                        .name_session(session, &NameSessionRequest { name })
+                        .await
+                }
+                _ => unreachable!(),
+            };
+            Some(match result {
+                Ok(response) if response.cancelled => ServerEvent::TreeChanged(Box::new(response)),
+                Ok(_) => ServerEvent::TreeUpdated,
+                Err(error) => ServerEvent::TreeMutationFailed(format!("更新会话失败：{error}")),
+            })
+        }
         Effect::Quit => None,
     }
 }
@@ -1110,6 +1268,63 @@ fn restore_terminal() -> Result<(), std::io::Error> {
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    #[tokio::test]
+    async fn fork_effect_opens_independent_session_and_restores_selected_input() {
+        use crate::test_server::{FakeGateway, Reply};
+        use serde_json::json;
+        let server = FakeGateway::spawn(|request, _| {
+            if request.path.ends_with("/fork") { return Reply::ok(json!({"session":"forked"})); }
+            let entries = vec![
+                json!({"id":"root","parentId":null,"timestamp":"now","type":"message","message":{"role":"assistant","content":"shared ancestor"}}),
+                json!({"id":"selected","parentId":"root","timestamp":"now","type":"message","message":{"role":"user","content":[{"type":"text","text":"edit this question"}]}}),
+            ];
+            Reply::ok(json!({"entries":entries,"leafId":"root"}))
+        }).await;
+        let client = server.client();
+        let source = SessionId::from_raw("source");
+        let mut app = App::new(Some(source.clone()), TuiMode::New, "fork-effect");
+        app.cursor = komo_kernel::types::ids::Seq(99);
+        let reply = run_effect(
+            &client,
+            Some(&source),
+            Effect::Fork {
+                target: Some("selected".into()),
+                clone: false,
+            },
+        )
+        .await
+        .unwrap();
+        let effects = app.apply(reply);
+        assert_eq!(app.session.as_ref().unwrap().as_str(), "forked");
+        assert_eq!(app.cursor, komo_kernel::types::ids::Seq::ZERO);
+        assert_eq!(app.input.text(), "edit this question");
+        let tree = run_effect(
+            &client,
+            app.session.as_ref(),
+            effects.into_iter().next().unwrap(),
+        )
+        .await
+        .unwrap();
+        app.apply(tree);
+        assert_eq!(app.messages().len(), 1);
+        assert_eq!(app.messages()[0].text.as_deref(), Some("shared ancestor"));
+        assert!(app.input_enabled());
+        assert!(app.repaint);
+        let requests = server.requests();
+        assert_eq!(
+            requests.iter().map(|r| r.path.as_str()).collect::<Vec<_>>(),
+            [
+                "/v1/sessions/source/tree",
+                "/v1/sessions/source/fork",
+                "/v1/sessions/forked/tree"
+            ]
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&requests[1].body).unwrap(),
+            json!({"targetId":"selected","clone":false})
+        );
+    }
 
     /// 同一次连接状态只消费一次；时钟取消等待后，再等仍须挂起。
     #[tokio::test]

@@ -234,6 +234,35 @@ impl KomoClient {
             .await
     }
 
+    // Tree operations have no idempotency keys. A transport failure can follow a
+    // committed fork or summary, so only an explicit authentication rejection is
+    // safe to retry after refreshing discovery.
+    async fn post_session_change<B: Serialize, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> ClientResult<T> {
+        let result = self
+            .send_once(self.http.post(self.url(path)).json(body))
+            .await;
+        match result {
+            Err(error)
+                if matches!(
+                    &error,
+                    ClientError::Api { status: 401, .. } | ClientError::Http { status: 401, .. }
+                ) =>
+            {
+                if self.refresh().await {
+                    self.send_once(self.http.post(self.url(path)).json(body))
+                        .await
+                } else {
+                    Err(error)
+                }
+            }
+            other => other,
+        }
+    }
+
     // ---- GET /healthz ----
 
     /// **唯一不认证的接口**（§13.1）。
@@ -267,6 +296,67 @@ impl KomoClient {
             params.push(("all", "true".into()));
         }
         self.get_with("/v1/sessions", &params).await
+    }
+
+    pub async fn session_tree(&self, session: &SessionId) -> ClientResult<SessionTreeResponse> {
+        self.get(&format!("/v1/sessions/{session}/tree")).await
+    }
+
+    pub async fn navigate_session(
+        &self,
+        session: &SessionId,
+        request: &NavigateSessionRequest,
+    ) -> ClientResult<NavigateSessionResponse> {
+        self.post_session_change(&format!("/v1/sessions/{session}/navigate"), request)
+            .await
+    }
+
+    pub async fn fork_session(
+        &self,
+        session: &SessionId,
+        request: &ForkSessionRequest,
+    ) -> ClientResult<ForkSessionResponse> {
+        self.post_session_change(&format!("/v1/sessions/{session}/fork"), request)
+            .await
+    }
+
+    pub async fn edit_session_context(
+        &self,
+        session: &SessionId,
+        request: &EditSessionContextRequest,
+    ) -> ClientResult<NavigateSessionResponse> {
+        self.post_session_change(&format!("/v1/sessions/{session}/context-edit"), request)
+            .await
+    }
+
+    pub async fn label_session(
+        &self,
+        session: &SessionId,
+        request: &LabelSessionRequest,
+    ) -> ClientResult<NavigateSessionResponse> {
+        self.post_session_change(&format!("/v1/sessions/{session}/label"), request)
+            .await
+    }
+
+    pub async fn name_session(
+        &self,
+        session: &SessionId,
+        request: &NameSessionRequest,
+    ) -> ClientResult<NavigateSessionResponse> {
+        self.post_session_change(&format!("/v1/sessions/{session}/name"), request)
+            .await
+    }
+
+    pub async fn compact_session(
+        &self,
+        session: &SessionId,
+        instructions: Option<String>,
+    ) -> ClientResult<NavigateSessionResponse> {
+        self.post_session_change(
+            &format!("/v1/sessions/{session}/compact"),
+            &serde_json::json!({"instructions": instructions}),
+        )
+        .await
     }
 
     pub async fn session(&self, session: &SessionId) -> ClientResult<SessionDetail> {
@@ -1276,6 +1366,146 @@ mod wire_tests {
         let sent = &server.requests()[0];
         assert_eq!(sent.method, "POST");
         assert_eq!(sent.path, "/v1/interventions/run-1/answer");
+    }
+
+    #[tokio::test]
+    async fn session_tree_operations_preserve_wire_contract_and_server_errors() {
+        let server = FakeGateway::spawn(|request, _| {
+            match request.path.rsplit('/').next().unwrap() {
+                "tree" => Reply::ok(serde_json::json!({"entries":[{"id":"u1","parentId":null,"timestamp":"now","type":"message","message":{"role":"user","content":"original"}}],"leafId":null})),
+                "navigate" => Reply::ok(serde_json::json!({"leafId":null,"editorText":"original","cancelled":false})),
+                "fork" => Reply::ok(serde_json::json!({"session":"forked-session"})),
+                "compact" => Reply::ok(serde_json::json!({"leafId":"summary","editorText":null,"cancelled":false})),
+                "context-edit" | "label" | "name" => Reply::ok(serde_json::json!({"leafId":"metadata","editorText":null,"cancelled":false})),
+                _ => unreachable!(),
+            }
+        }).await;
+        let client = server.client();
+        let session = SessionId::from_raw("sess-1");
+        let tree = client.session_tree(&session).await.unwrap();
+        assert!(tree.leaf_id.is_none());
+        assert_eq!(tree.entries[0].id, "u1");
+        let navigation = client
+            .navigate_session(
+                &session,
+                &NavigateSessionRequest {
+                    target_id: "u1".into(),
+                    summarize: true,
+                    instructions: Some("keep decisions".into()),
+                    label: Some("branch".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(navigation.editor_text.as_deref(), Some("original"));
+        assert_eq!(
+            client
+                .fork_session(
+                    &session,
+                    &ForkSessionRequest {
+                        target_id: Some("u1".into()),
+                        clone: false
+                    }
+                )
+                .await
+                .unwrap()
+                .session
+                .as_str(),
+            "forked-session"
+        );
+        client
+            .fork_session(
+                &session,
+                &ForkSessionRequest {
+                    target_id: None,
+                    clone: true,
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .edit_session_context(
+                &session,
+                &EditSessionContextRequest {
+                    target_id: "u1".into(),
+                    replacement: None,
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .label_session(
+                &session,
+                &LabelSessionRequest {
+                    target_id: "u1".into(),
+                    label: Some("decision".into()),
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .name_session(
+                &session,
+                &NameSessionRequest {
+                    name: "investigation".into(),
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .compact_session(&session, Some("retain evidence".into()))
+            .await
+            .unwrap();
+        let requests = server.requests();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].path, "/v1/sessions/sess-1/tree");
+        for request in &requests {
+            assert_eq!(request.header("authorization"), Some("Bearer test-token"));
+        }
+        let bodies: Vec<serde_json::Value> = requests[1..]
+            .iter()
+            .map(|r| serde_json::from_str(&r.body).unwrap())
+            .collect();
+        assert_eq!(
+            bodies[0],
+            serde_json::json!({"targetId":"u1","summarize":true,"instructions":"keep decisions","label":"branch"})
+        );
+        assert_eq!(
+            bodies[1],
+            serde_json::json!({"targetId":"u1","clone":false})
+        );
+        assert_eq!(bodies[2], serde_json::json!({"targetId":null,"clone":true}));
+        assert_eq!(
+            bodies[3],
+            serde_json::json!({"targetId":"u1","replacement":null})
+        );
+        assert_eq!(
+            bodies[4],
+            serde_json::json!({"targetId":"u1","label":"decision"})
+        );
+        assert_eq!(bodies[5], serde_json::json!({"name":"investigation"}));
+        assert_eq!(
+            bodies[6],
+            serde_json::json!({"instructions":"retain evidence"})
+        );
+
+        let blocked =
+            FakeGateway::spawn(|_, _| Reply::error(409, "conflict", "unfinished run")).await;
+        let error = blocked
+            .client()
+            .navigate_session(
+                &session,
+                &NavigateSessionRequest {
+                    target_id: "u1".into(),
+                    summarize: false,
+                    instructions: None,
+                    label: None,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Some(ErrorCode::Conflict));
+        assert!(error.to_string().contains("unfinished run"));
     }
 
     /// 旧 Gateway 的回执还带着 `decision`（2026-10-11 之前的审批字段）：多出来的字段不该

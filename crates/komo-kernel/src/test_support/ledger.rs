@@ -96,6 +96,7 @@ impl MemLedger {
         let seq = Seq(state.next_seq);
         let event_id = EventId::new_at(self.clock.now());
         state.events.push(Event {
+            entry: None,
             v: EVENT_FORMAT_VERSION,
             seq,
             event_id: event_id.clone(),
@@ -561,6 +562,7 @@ impl Ledger for MemLedger {
         state.next_seq += 1;
         let seq = Seq(state.next_seq);
         state.events.push(Event {
+            entry: None,
             v: EVENT_FORMAT_VERSION,
             seq,
             event_id: event_id.clone(),

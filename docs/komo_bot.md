@@ -481,6 +481,8 @@ project_files = false              # 省略 = true
 
 ## 8. 通用 Session 存储与自动恢复
 
+**会话树已按 §8.11 实现主体（2026-10-23）：完整采用 pi 的 session 树与上下文语义。** §8.1–§8.10 描述现有存储与恢复机制；改造时，会话内容、路径选择与压缩以 §8.11 的目标为准，执行耐久性与恢复约束继续适用。
+
 ### 8.1 三个核心对象
 
 | 对象     | 含义                                                      |
@@ -945,6 +947,75 @@ Session 不是只能追加的对象。删掉一个会话今天等于 `rm -rf ses
 2. **`closing → deleted` 是 reconcile 的判定，不是时钟**：只有这个 Session 再没有非终态 Run 时才推进。在那之前它一直是 `closing`，而"还有谁没跑完"正好是 §7.5 清单答得出的。操作者要立刻走完，`komo session delete --now` 把未完成的 Run 全部按 `abandon` 处置（各写一条明确的取消），再进 `deleted`。
 3. **`purged` 之前先算引用，而且状态先落、内容后删。** `memory_evidence` 指向这个 Session 事件的行、`checkpoints`、`deliveries` 里未送出的行、`cron_firings` 的 Session 引用都要先处置——停用无法再验证的记忆条目、把投递标成终止——然后：**数据库先提交 `purged` 这个墓碑，再删内容**，最后对账把"标了 `purged` 而内容还在"的会话收尾（幂等，删一半被杀也不会留下说不清的状态，因为 `purged` 已经声明了"这个目录要没了"）。**删不掉就说清楚，不假装成功**（§8.8 的原话照旧）；引用检查不过就 409 并列出要先处置什么。`purged` 之后 `jsonl_path` 这类列保留原值，但那个目录不该再被创建或读取：任何试图往 `purged` 会话写内容的路径都是 bug，不是"重新开始"。
 4. **禁止直接 `rm`。** 三层：命令层——删除只有一条路（`komo session delete` / `purge`），没有"手工删目录"这条经验路径；工具层——`write` / `edit` 拒绝写数据目录下的 `sessions/`、`state.db*`、`runtime/`、`.env`（§7.2，komo 唯一的硬限制），bash 拦不住（2026-10-11 之前还有一层 `command_patterns` 手滑网，随 Policy 删掉，§7.3）；reconcile 层——真正的保证在这里：目录没了而状态不是 `purged`，对账会把它**报出来**，而不是等下一轮模型对着空上下文说话。
+
+### 8.11 完整采用 pi 的 Session 树（已实现主体，2026-10-23）
+
+采用完整的 pi SessionManager 模型：会话由 entry 树构成，当前路径决定模型上下文。消息树是会话正文的唯一存储，Run / ToolCall 账本通过 ID 关联消息，负责执行、调度、取消与恢复。不是在现有线性转写上加一个树形浏览器，也不把 Run 当作只能整体分叉的节点。
+
+对照基线是本机 pi coding-agent **1.4.0** 的 `core/session-manager`、`AgentSession.navigateTree`，以及 [Session File Format](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/session-format.md) 和 [Compaction Reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/compaction.md)。远端文档会变化；实现与对照测试必须使用固定版本。
+
+#### 会话模型与用户行为
+
+- 首行是 session header；后续 entry 以 `id` / `parentId` 连接，`parentId: null` 表示根。支持多根、共享祖先和多个分支；下一条 entry 接在当前 `leafId` 后面。
+- 采用 pi 的 entry 语义：`message`、`model_change`、`thinking_level_change`、`usage`、`compaction`、`context_edit`、`branch_summary`、`custom`、`custom_message`、`label`、`session_info`。系统提示与工具声明通过 system message 保存，压缩时保存相应 checkpoint。`custom` 不进入模型上下文，`custom_message` 可以进入。
+- `/tree` 在同一 Session 内导航。选择 user / custom message 时，当前位置移到其父节点，原文回到输入框；选择其他条目时，从该条目之后继续。提交编辑后的输入才形成新分支，旧分支原样保留。
+- `/fork` 从选中的历史输入提取路径，建立独立 Session；`/clone` 复制当前路径。新会话记录 `parentSession`，但后续读取不能依赖原会话继续存在。
+- 导航可选择总结离开的分支；沿旧路径找到共同祖先，摘要作为 `branch_summary` 接到目标位置。标签、会话命名、树的搜索与当前位置显示一并纳入用户体验。
+- 与 pi 一样，生成回复、压缩或分支总结期间不能同时导航。komo 还必须协调排队和等待恢复的 Run，禁止导航使已受理输入改接到其他路径。
+- 导航改变的是对话路径，已经发生的文件修改、外部请求和工具副作用不会回退。
+
+#### 上下文的唯一来源
+
+```text
+Session entries + leafId
+           │
+           ▼
+    根到当前位置的路径
+           │
+           ▼
+ 最新 compaction + 保留范围
+           │
+           ▼
+ 当前路径生效的 context_edit
+           │
+           ▼
+ 模型消息、系统提示与工具状态
+```
+
+完整采用 pi 的路径选择、压缩边界和投影规则：
+
+1. 先从当前节点向根取路径，不把兄弟分支混入历史。
+2. 路径上的最新 `compaction` 提供摘要与 system checkpoint，`firstKeptEntryId` 决定保留的早期条目，再接上压缩之后的条目；支持不保留早期条目的情况和反复压缩。
+3. `context_edit` 只改变未来模型上下文；同一路径对同一目标的最后一次编辑生效，`null` 表示省略。原消息、界面历史、导出和用量统计保留原记录。
+4. 模型与 thinking level 沿路径恢复，系统提示与工具声明按 system message 重放。komo 的实际模型连接、能力校验与运行快照仍由 Gateway / Runtime 提供。
+5. 消息和工具往返跨 Run 保留，直到压缩或上下文编辑改变模型视图。**替换 §8.3“历史 Run 只回放输入和最终答复”的规则，以及现有只在当前 Run 内压缩的限制。** 工具调用、结果和 provider 原生块的配对与异常请求修复纳入同一套投影验收，不能因完整回放重新引入缺少工具结果的 provider 错误。
+6. 分支摘要、上下文编辑、压缩和已保存的记忆注入，只能从选中的路径取。长期 Memory 仍按作用域共享；切换分支不撤销已经形成的记忆，也不把跨分支重新召回的内容伪装成该路径的原始对话。
+
+#### 与执行账本的关系
+
+用户正文、assistant 正文、模型工具调用与模型可见的结果内容归 message entry；不再把同一份会话正文同时写进树和 `run.accepted` / assistant 执行事件。Run 账本保存消息引用与执行所需的元数据、计划、领取代次和状态。完整 stdout / stderr、执行尝试身份和输出校验材料仍由工具输出存储承担，它们与模型消息的用途不同。
+
+- Run 固定自己的会话路径，重启恢复按该路径继续。当前 UI 的 `leafId` 不能决定旧 Run 的恢复输入。
+- 插话在实际并入宿主的协议位置成为对话节点；排队输入不能按受理时的日志相邻关系误接到尚未完成的工具调用之间。
+- JSONL 的物理追加顺序和 SSE 游标继续单调递增；树边表达上下文关系。执行状态与生命周期审计不应改变对话接续位置。
+- 内容仍由 Gateway 唯一写入。写入完成并同步之后，才提交数据库引用；控制决定仍按既有 outbox 路径处理。不能照搬 pi 的普通文件追加而取消 komo 的同步与恢复保证。
+- fork / clone 必须保留所选路径需要的工具输出、图片、产物以及 context-edit / compaction 的目标关系；原 Session 被合法回收后，新 Session 仍可读取。生成的新会话不能复制原 Run 的可执行状态，也不能重放已发生的工具动作。
+
+pi 的普通 `branch()` / `resetLeaf()` 只移动内存位置，重载时由最后写入的 entry 恢复 `leafId`。**本次沿用该行为**：只导航、未追加任何 entry 就退出时，不额外保存浏览位置；追加消息、标签或分支摘要之后，按文件中的最后 entry 恢复位置。
+
+#### 兼容与验收
+
+旧会话保留原始日志、事件 ID 和输出引用；读取和只读浏览不触发迁移。新树存储切换必须明确版本、建立可恢复的迁移提交点，并保留旧证据定位。不能靠旧程序忽略未知事件来兼容新树：旧程序会把兄弟分支拼成线性上下文，新格式必须阻止这种读取或执行。使用新格式后不能直接降级旧二进制继续写同一会话。
+
+实现涉及 kernel 的 entry 类型与纯树操作、store 的持久化和迁移、agent 的上下文投影、Gateway 的会话操作与恢复绑定、client 的 API 和 TUI，超过八个文件。无须引入新的服务或语言，也不引入 Node 作为运行依赖；以 Rust 移植固定版本的算法和格式契约。
+
+验收以同一组 entry 在 pi 与 komo 中的结果为依据：根与空路径、用户消息重新编辑、分支切换、fork / clone、标签、模型切换、system checkpoint、重复压缩、retain-none、context_edit 覆盖与省略，以及分支摘要；比较路径 ID、保留条目、模型内容、模型与 thinking 状态。另加 komo 的故障与并发验收：输入幂等、排队与插话定位、导航竞争、各持久化边界中断、原 Run 恢复、工具动作不重放、输出引用缺失、原会话回收后 fork 可读，以及旧数据迁移失败不丢原文。所有分支行为必须经 API / TUI 端到端验证。
+
+**实现状态（2026-10-23）。** 已落地：kernel 的纯消息树（`komo_kernel::session`）、`session_events::TreeState`（从执行事件重建树，Run 固定自己的路径）、pi v3 记录格式（`v:2` 的 entry 加 `komo` 执行元数据，旧二进制读到即报错）、按分支回放与跨 Run 压缩（`komo_agent::context::tree`）、Gateway 的 `/tree` `navigate` `fork`（含 clone）`context-edit` `label` `name` `compact` 接口、TUI 的树浏览器与对应斜杠命令。`cargo test --workspace` 全部通过。
+
+与旧正文的差异：压缩不再单独保留开头那句任务，摘要取代切点之前的一切（与 pi 一致）；fork 里冻结前缀的 `seq` 清零，不进入本会话的压缩切点。
+
+**尚未验证 / 未做**：① 真机端到端（真实 Gateway + TUI 的 `/tree` 切换、重启恢复、fork 后回收源会话）；② 手动分支摘要与 `/compact` 仍把原始 entry JSON 当文本发给模型，应改走 `assemble_tree_context`；③ 旧会话迁移只有单元覆盖，没有用真实旧目录验证；④ 本节之外 §8.3 里关于“历史 Run 只回放输入与最终答复”的旧段落尚未改写。
 
 ## 9. Memory：自动积累、可信来源与混合检索
 

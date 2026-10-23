@@ -19,6 +19,8 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use time::OffsetDateTime;
 
+mod tree_codec;
+
 use crate::compaction::{CompactionDebt, CompactionDecision};
 use crate::types::chat::PeerId;
 use crate::types::digest::ContentHash;
@@ -45,18 +47,25 @@ pub struct Event {
     pub run: Option<RunId>,
     pub ts: OffsetDateTime,
     pub payload: EventPayload,
+    /// Canonical pi entry. Legacy events have no entry until projected for migration.
+    pub entry: Option<Box<crate::session::SessionEntry>>,
 }
 
 impl Event {
     /// 解析一行。
     pub fn from_line(line: &str) -> Result<Event, EventDecodeError> {
-        let raw: RawEvent = serde_json::from_str(line).map_err(EventDecodeError::Envelope)?;
-        Event::from_raw(raw)
+        let value: serde_json::Value =
+            serde_json::from_str(line).map_err(EventDecodeError::Envelope)?;
+        if value.get("komo").is_some() {
+            serde_json::from_value(value).map_err(EventDecodeError::Envelope)
+        } else {
+            Event::from_raw(serde_json::from_value(value).map_err(EventDecodeError::Envelope)?)
+        }
     }
 
     /// 序列化成一行（**不**带结尾换行；写入器负责补上并要求每条完整记录以换行结束）。
     pub fn to_line(&self) -> Result<String, serde_json::Error> {
-        serde_json::to_string(&self.to_raw()?)
+        serde_json::to_string(self)
     }
 
     /// 这条事件的 `type` 字符串。
@@ -73,6 +82,7 @@ impl Event {
         }
         let payload = EventPayload::from_parts(&raw.event_type, raw.data)?;
         Ok(Event {
+            entry: None,
             v: raw.v,
             seq: Seq(raw.seq),
             event_id: raw.event_id,
@@ -99,16 +109,27 @@ impl Event {
 
 impl Serialize for Event {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.to_raw()
-            .map_err(serde::ser::Error::custom)?
-            .serialize(serializer)
+        match &self.entry {
+            Some(entry) => tree_codec::encode(self, entry)
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer),
+            None => self
+                .to_raw()
+                .map_err(serde::ser::Error::custom)?
+                .serialize(serializer),
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for Event {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = RawEvent::deserialize(deserializer)?;
-        Event::from_raw(raw).map_err(D::Error::custom)
+        let value = serde_json::Value::deserialize(deserializer)?;
+        if value.get("komo").is_some() {
+            tree_codec::decode(value).map_err(D::Error::custom)
+        } else {
+            let raw: RawEvent = serde_json::from_value(value).map_err(D::Error::custom)?;
+            Event::from_raw(raw).map_err(D::Error::custom)
+        }
     }
 }
 
@@ -871,6 +892,7 @@ mod tests {
     #[test]
     fn an_event_serializes_onto_one_physical_line() {
         let event = Event {
+            entry: None,
             v: EVENT_FORMAT_VERSION,
             seq: Seq(1),
             event_id: EventId::from_raw("evt-1"),
@@ -889,6 +911,7 @@ mod tests {
     #[test]
     fn newlines_inside_content_are_escaped_not_emitted() {
         let event = Event {
+            entry: None,
             v: EVENT_FORMAT_VERSION,
             seq: Seq(2),
             event_id: EventId::from_raw("evt-2"),
@@ -908,6 +931,7 @@ mod tests {
     #[test]
     fn both_compaction_outcomes_round_trip_and_say_which_they_are() {
         let event = |seq: u64, payload: ContextCompacted| Event {
+            entry: None,
             v: EVENT_FORMAT_VERSION,
             seq: Seq(seq),
             event_id: EventId::from_raw(format!("evt-{seq}")),

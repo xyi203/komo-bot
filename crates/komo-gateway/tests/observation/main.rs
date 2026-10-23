@@ -761,11 +761,6 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
     assert_eq!(
         shape,
         vec![
-            (
-                Role::User,
-                Some("读三遍小文件，再跑两条命令".into()),
-                vec![]
-            ),
             (Role::User, Some("<摘要>".into()), vec![]),
             (Role::Assistant, None, vec!["pc-r3".into()]),
             (Role::Tool, None, vec!["pc-r3".into()]),
@@ -773,7 +768,7 @@ async fn a_compacted_run_replays_the_same_summary_and_tail_across_restarts() {
             (Role::Assistant, None, vec!["pc-s1".into()]),
             (Role::Tool, None, vec!["pc-s1".into()]),
         ],
-        "任务 → 摘要（外置的正文按引用读回来）→ 第三轮起原样"
+        "摘要（外置的正文按引用读回来）→ 第三轮起原样"
     );
 
     // 再重启 → 答 → 第三段：同一段前缀逐字节不变。

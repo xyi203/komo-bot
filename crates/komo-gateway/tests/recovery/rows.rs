@@ -1324,6 +1324,7 @@ fn append_tool_result(
     });
     let next = home.events(session).len() as u64 + 1;
     let event = komo_kernel::events::Event {
+        entry: None,
         v: komo_kernel::events::EVENT_FORMAT_VERSION,
         seq: komo_kernel::types::ids::Seq(next),
         event_id: komo_kernel::types::ids::EventId::from_raw("evt-handwritten-result"),

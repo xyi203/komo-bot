@@ -177,6 +177,7 @@ mod tests {
 
     fn event(seq: u64, run: &str, payload: EventPayload) -> Event {
         Event {
+            entry: None,
             v: EVENT_FORMAT_VERSION,
             seq: Seq(seq),
             event_id: EventId::from_raw(format!("evt-{seq}")),

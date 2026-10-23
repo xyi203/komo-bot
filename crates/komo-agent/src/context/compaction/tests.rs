@@ -526,3 +526,33 @@ fn the_rewrite_cost_depends_on_the_backend() {
     }
     assert!(suffix < everything);
 }
+
+#[test]
+fn a_tree_cut_archives_the_whole_branch_and_first_task_across_runs() {
+    let mut context = context();
+    context.run_from = 0;
+    let pricing = price_branch(&context, &[]);
+    assert_eq!(pricing.candidates[0].0, Seq(1));
+    let cut = pricing.cut(1).unwrap();
+    assert_eq!(cut.archived.start, 0);
+    assert!(cut.archived.end > 2);
+    let request = summary_request(
+        None,
+        &context.messages[cut.archived],
+        &SessionId::from_raw("s"),
+        &RunId::from_raw("r"),
+        &sample_model(),
+    );
+    let text = request.messages[0].text.as_ref().unwrap();
+    assert!(text.contains("上一件事"));
+    assert!(text.contains("把 a 和 b 都做完"));
+}
+
+#[test]
+fn frozen_prefix_sequences_cannot_become_tree_compaction_references() {
+    let mut context = context();
+    context.run_from = 0;
+    context.messages[1].seq = Seq::ZERO;
+    let pricing = price_branch(&context, &[]);
+    assert!(!pricing.candidates[1].2);
+}

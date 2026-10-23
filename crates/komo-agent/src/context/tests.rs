@@ -96,6 +96,7 @@ fn a_task_contract_trails_the_task_not_the_system_prompt() {
 
     let run = RunId::from_raw("run-1");
     let event = |seq: u64, payload| Event {
+        entry: None,
         v: 1,
         seq: Seq(seq),
         event_id: EventId::from_raw(format!("evt-{seq}")),

@@ -25,6 +25,7 @@ pub mod models;
 pub mod payloads;
 pub mod repos;
 pub mod session_log;
+pub mod session_tree;
 pub mod tool_output;
 
 pub use checkpoint::{CheckpointRecord, CheckpointStore};

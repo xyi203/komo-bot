@@ -176,6 +176,7 @@ mod tests {
 
     fn completed(seq: u64) -> Event {
         Event {
+            entry: None,
             v: 1,
             seq: Seq(seq),
             event_id: EventId::from_raw(format!("evt-{seq}")),

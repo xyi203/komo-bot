@@ -72,7 +72,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, live: &[Line<'static>]) {
         frame.render_widget(live_block(live, live_height), chunks[0]);
     }
     frame.render_widget(status_line(app, area.width), chunks[1]);
-    if let Some(picker) = app.model_picker.as_ref() {
+    if let Some(picker) = app.tree_picker.as_ref() {
+        frame.render_widget(
+            Paragraph::new(picker.lines(chunks[2].height as usize)),
+            chunks[2],
+        );
+    } else if let Some(picker) = app.model_picker.as_ref() {
         let current = app.model.as_deref();
         frame.render_widget(picker_block(picker, current, chunks[2]), chunks[2]);
     } else if palette_height > 0 {
@@ -88,6 +93,9 @@ fn live_block(lines: &[Line<'static>], height: u16) -> Paragraph<'static> {
 }
 
 fn palette_height(app: &App) -> u16 {
+    if let Some(picker) = app.tree_picker.as_ref() {
+        return (picker.visible().len().max(1) as u16).min(PICKER_MAX);
+    }
     if let Some(picker) = app.model_picker.as_ref() {
         return (picker.entries.len() as u16).min(PICKER_MAX);
     }
@@ -387,6 +395,12 @@ pub fn banner(app: &App, cwd: &str) -> Vec<Line<'static>> {
         head.push(Span::styled(
             format!(" · {session}"),
             Style::default().fg(Color::DarkGray),
+        ));
+    }
+    if let Some(name) = &app.session_name {
+        head.push(Span::styled(
+            format!(" · {name}"),
+            Style::default().fg(Color::Cyan),
         ));
     }
     vec![Line::from(head), Line::default()]

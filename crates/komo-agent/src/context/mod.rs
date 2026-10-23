@@ -11,6 +11,7 @@ pub mod compaction;
 pub mod history;
 pub mod memory;
 mod prompt;
+pub mod tree;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -89,8 +90,8 @@ pub enum InvocationContext {
 pub struct AgentContext {
     pub system_prompt: String,
     pub messages: Vec<ReplayMessage>,
-    /// 正在跑的这条 Run 从 `messages` 的第几条开始（它开头那句任务）；之前的是别的 Run
-    /// 的转写。在线压缩只在这一段里切（[`compaction`]）。
+    /// Legacy replay starts compaction at the current Run. Canonical tree replay
+    /// uses zero: the entire selected branch can be compacted across Runs.
     pub run_from: usize,
     /// 当前 Run 里有资格换成短视图、还没换的工具结果：改写决策（[`compaction::plan`]）
     /// 据此算账；决定换了才记 `decayed`，回放才给短视图。
@@ -170,3 +171,27 @@ fn with_instructions(instructions: Option<&str>, prompt: String) -> String {
 
 #[cfg(test)]
 mod tests;
+
+/// Apply this Run's per-task additions after canonical tree assembly.
+pub fn append_task_context(
+    context: &mut AgentContext,
+    task_seq: komo_kernel::types::ids::Seq,
+    project_update: Option<&[ProjectFile]>,
+    contract: Option<&DelegateContract>,
+) {
+    if let Some(task) = context
+        .messages
+        .iter_mut()
+        .find(|message| message.seq == task_seq && message.role == Role::User)
+    {
+        let text = task.text.get_or_insert_with(String::new);
+        if let Some(files) = project_update {
+            text.push_str("\n\n");
+            text.push_str(&prompt::project_update_block(files));
+        }
+        if let Some(contract) = contract {
+            text.push_str("\n\n");
+            text.push_str(&prompt::task_contract_block(contract));
+        }
+    }
+}

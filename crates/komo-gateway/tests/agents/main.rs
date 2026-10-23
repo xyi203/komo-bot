@@ -1262,7 +1262,23 @@ async fn a_fork_starts_from_the_parents_conversation_and_shares_its_prefix() {
             .any(|tool| tool.name == komo_agent::TASK_TOOL)
     );
     let n = parent.messages.len();
-    assert_eq!(fork.messages[..n], parent.messages[..]);
+    // `seq` indexes the source Session's ledger; the fork's tree-mode context zeroes it
+    // so it can never collide with this Session's own compaction cut points. It is never
+    // sent to a provider, so the shared prefix is compared by content.
+    let unsequenced = |messages: &[komo_kernel::types::turn::ReplayMessage]| {
+        messages
+            .iter()
+            .cloned()
+            .map(|mut message| {
+                message.seq = komo_kernel::types::ids::Seq::ZERO;
+                message
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        unsequenced(&fork.messages[..n]),
+        unsequenced(&parent.messages[..])
+    );
     use komo_kernel::types::turn::Role;
     let call = &fork.messages[n];
     assert_eq!(call.role, Role::Assistant);
@@ -1341,7 +1357,10 @@ async fn a_fork_starts_from_the_parents_conversation_and_shares_its_prefix() {
         .cloned()
         .expect("追问发过请求");
     assert_eq!(follow_request.system_prompt, parent.system_prompt);
-    assert_eq!(follow_request.messages[..n], parent.messages[..]);
+    assert_eq!(
+        unsequenced(&follow_request.messages[..n]),
+        unsequenced(&parent.messages[..])
+    );
     assert_eq!(follow_request.tools, parent.tools, "追问沿用 fork 的能力面");
 
     gateway.stop().await;

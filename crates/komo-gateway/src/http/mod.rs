@@ -15,6 +15,7 @@ pub mod interventions;
 pub mod mcp;
 pub mod memories;
 pub mod runs;
+pub mod session_tree;
 pub mod sessions;
 
 use std::sync::Arc;
@@ -64,6 +65,13 @@ pub fn router(api: Api) -> Router {
         .route("/v1/home-session", get(home_session))
         .route("/v1/sessions", get(sessions::list).post(sessions::create))
         .route("/v1/sessions/{id}", get(sessions::detail))
+        .route("/v1/sessions/{id}/tree", get(session_tree::tree))
+        .route("/v1/sessions/{id}/navigate", post(session_tree::navigate))
+        .route("/v1/sessions/{id}/fork", post(session_tree::fork))
+        .route("/v1/sessions/{id}/context-edit", post(session_tree::edit))
+        .route("/v1/sessions/{id}/label", post(session_tree::label))
+        .route("/v1/sessions/{id}/name", post(session_tree::name))
+        .route("/v1/sessions/{id}/compact", post(session_tree::compact))
         .route("/v1/sessions/{id}/events", get(events::stream))
         .route("/v1/sessions/{id}/runs", post(sessions::submit))
         .route("/v1/sessions/{id}/resume", post(sessions::resume))

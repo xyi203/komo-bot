@@ -65,6 +65,15 @@ impl Pricing {
 
 /// 估价：用 `estimate_tokens`（字节 / 4）量系统提示、工具表与每条消息。
 pub fn price(context: &AgentContext, tools: &[ToolDefinition]) -> Pricing {
+    price_impl(context, tools, false)
+}
+
+/// Price the complete selected pi branch, including its first user/summary.
+pub fn price_branch(context: &AgentContext, tools: &[ToolDefinition]) -> Pricing {
+    price_impl(context, tools, true)
+}
+
+fn price_impl(context: &AgentContext, tools: &[ToolDefinition], branch: bool) -> Pricing {
     let tool_tokens: u64 = tools
         .iter()
         .map(|tool| {
@@ -74,19 +83,29 @@ pub fn price(context: &AgentContext, tools: &[ToolDefinition]) -> Pricing {
         })
         .sum();
     let message_tokens: Vec<u64> = context.messages.iter().map(message_tokens).collect();
-    let from = context.run_from
-        + usize::from(
-            context
-                .messages
-                .get(context.run_from)
-                .is_some_and(|message| message.role == Role::User),
-        );
+    let from = if branch {
+        0
+    } else {
+        context.run_from
+            + usize::from(
+                context
+                    .messages
+                    .get(context.run_from)
+                    .is_some_and(|message| message.role == Role::User),
+            )
+    };
     let candidates = context
         .messages
         .iter()
         .zip(&message_tokens)
         .skip(from)
-        .map(|(message, &tokens)| (message.seq, tokens, message.role == Role::Assistant))
+        .map(|(message, &tokens)| {
+            (
+                message.seq,
+                tokens,
+                message.role == Role::Assistant && (!branch || message.seq != Seq::ZERO),
+            )
+        })
         .collect();
     Pricing {
         write_tokens: estimate_tokens(&context.system_prompt)
@@ -257,6 +276,15 @@ pub enum Plan {
 /// 判断的时机只有两种：缓存已冷（改写不欠债，有资格的全换）；贴着窗口（不看账，先换
 /// 短视图——比压缩便宜；没有可换的再压缩）。其余时候什么都不动：短任务从不改写前缀。
 pub fn plan(input: PlanInput<'_>) -> Plan {
+    plan_impl(input, false)
+}
+
+/// Automatic compaction over the whole canonical branch, across Run boundaries.
+pub fn plan_branch(input: PlanInput<'_>) -> Plan {
+    plan_impl(input, true)
+}
+
+fn plan_impl(input: PlanInput<'_>, branch: bool) -> Plan {
     let PlanInput {
         context,
         tools,
@@ -268,7 +296,7 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
         cache_cold,
         compaction_enabled,
     } = input;
-    let pricing = price(context, tools);
+    let pricing = price_impl(context, tools, branch);
     // 估出来的与上一次请求实报的取大（SoL-Pi 同口径）：估计对中日韩文字偏低，实报又
     // 不含上一次回复之后新加的东西。
     let context_tokens = pricing
@@ -377,7 +405,7 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
     }
     Plan::Compact(CompactionJob {
         request: summary_request(
-            task_of(context),
+            if branch { None } else { task_of(context) },
             &context.messages[cut.archived],
             session,
             run,
@@ -396,6 +424,14 @@ pub fn plan(input: PlanInput<'_>) -> Plan {
 /// （刚压过还是超长，再压只会转圈）；切不出可收的一段（比如只剩最后一轮）；摘要不比
 /// 那一段小。
 pub fn plan_overflow(input: PlanInput<'_>) -> Option<CompactionJob> {
+    plan_overflow_impl(input, false)
+}
+
+pub fn plan_overflow_branch(input: PlanInput<'_>) -> Option<CompactionJob> {
+    plan_overflow_impl(input, true)
+}
+
+fn plan_overflow_impl(input: PlanInput<'_>, branch: bool) -> Option<CompactionJob> {
     let PlanInput {
         context,
         tools,
@@ -410,7 +446,7 @@ pub fn plan_overflow(input: PlanInput<'_>) -> Option<CompactionJob> {
     if online.requests_since_last_summary() == Some(0) {
         return None;
     }
-    let pricing = price(context, tools);
+    let pricing = price_impl(context, tools, branch);
     let context_tokens = pricing
         .write_tokens
         .max(online.last_context_tokens.unwrap_or(0));
@@ -436,7 +472,7 @@ pub fn plan_overflow(input: PlanInput<'_>) -> Option<CompactionJob> {
     }
     Some(CompactionJob {
         request: summary_request(
-            task_of(context),
+            if branch { None } else { task_of(context) },
             &context.messages[cut.archived],
             session,
             run,

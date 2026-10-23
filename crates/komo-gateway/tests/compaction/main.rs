@@ -276,7 +276,7 @@ async fn window_protection_compacts_and_the_run_goes_on_with_task_summary_tail()
     assert_eq!(
         shape,
         vec![
-            (Role::User, Some(task.into()), vec![]),
+            // §8.11：压缩与 pi 一致，摘要取代切点之前的一切，任务原文随摘要请求一起被概括。
             (
                 Role::User,
                 Some(format!("{COMPACTION_PREFIX}\n\n{summary}")),

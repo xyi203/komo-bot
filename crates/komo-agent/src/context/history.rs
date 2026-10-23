@@ -374,6 +374,16 @@ pub(crate) fn replay_messages(
     projection: &ProjectionContext,
     decayed: &BTreeSet<ToolCallId>,
 ) -> (Vec<ReplayMessage>, usize, Vec<DecayCandidate>) {
+    replay_with_projections(history, projection, decayed, &BTreeMap::new())
+}
+
+/// Tree replay can include tools from Runs with different frozen output budgets.
+pub(crate) fn replay_with_projections(
+    history: Vec<ResolvedMessage<'_>>,
+    projection: &ProjectionContext,
+    decayed: &BTreeSet<ToolCallId>,
+    projections: &BTreeMap<Seq, ProjectionContext>,
+) -> (Vec<ReplayMessage>, usize, Vec<DecayCandidate>) {
     // 结果落在**另一条**消息上（`Role::Tool` 的节点），工具名与 provider 的 call_id 要靠
     // 这份索引从原始请求里找回来——先把这一段窗口里出现过的调用都记一遍。
     let mut requests: BTreeMap<&ToolCallId, &ToolCallRequest> = BTreeMap::new();
@@ -403,6 +413,7 @@ pub(crate) fn replay_messages(
     let mut run_from = None;
     for (resolved, sends_so_far) in history.into_iter().zip(later_rounds) {
         let message = resolved.entry.message;
+        let projection = projections.get(&message.seq).unwrap_or(projection);
         if resolved.entry.kind != EntryKind::Transcript && run_from.is_none() {
             run_from = Some(out.len());
         }

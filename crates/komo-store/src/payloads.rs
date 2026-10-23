@@ -165,6 +165,36 @@ impl PayloadStore {
             }
             _ => {}
         }
+        if let Some(entry) = event.entry.as_mut() {
+            if let komo_kernel::session::EntryKind::Message { message } = &mut entry.kind {
+                match &event.payload {
+                    EventPayload::RunAccepted(body) if body.text_ref.is_some() => {
+                        message["content"] = serde_json::json!(body.text)
+                    }
+                    EventPayload::MessageUser(body) if body.text_ref.is_some() => {
+                        message["content"] = serde_json::json!(body.text)
+                    }
+                    EventPayload::MessageAssistant(body) => {
+                        if body.text_ref.is_some()
+                            || body
+                                .tool_calls
+                                .iter()
+                                .any(|call| call.arguments_ref.is_some())
+                        {
+                            let mut content = Vec::new();
+                            if let Some(text) = &body.text {
+                                content.push(serde_json::json!({"type":"text","text":text}));
+                            }
+                            for call in &body.tool_calls {
+                                content.push(serde_json::json!({"type":"toolCall","id":call.provider_call_id,"name":call.name,"arguments":call.arguments}));
+                            }
+                            message["content"] = serde_json::json!(content);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         Ok(())
     }
 
@@ -284,6 +314,7 @@ mod tests {
         let arguments = serde_json::json!({"code": "x".repeat(5000)});
         let arguments_ref = store.put_json(&arguments, None).await.unwrap();
         let mut event = Event {
+            entry: None,
             v: 1,
             seq: Seq(1),
             event_id: EventId::from_raw("evt-1"),

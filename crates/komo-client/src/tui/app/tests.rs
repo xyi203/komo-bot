@@ -286,7 +286,10 @@ fn reconnecting_after_a_drop_asks_for_the_pending_list() {
         reason: "Gateway 断开了连接".into(),
     }));
     let effects = app.apply(ServerEvent::Connection(ConnectionState::Connected));
-    assert_eq!(effects, vec![Effect::FetchPending]);
+    assert_eq!(
+        effects,
+        vec![Effect::FetchPending, Effect::FetchTree { generation: 0 }]
+    );
     assert!(
         notices(&app).contains("事件订阅已恢复"),
         "{}",

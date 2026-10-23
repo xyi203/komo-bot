@@ -28,6 +28,7 @@ use super::Coordinator;
 #[async_trait]
 impl Ledger for Coordinator {
     async fn accept_input(&self, input: AcceptInput) -> Result<Accepted, LedgerError> {
+        let _operation = self.session_guard().await;
         if input.session != self.session {
             return Err(LedgerError::Conflict(format!(
                 "这个 Coordinator 是 {} 的，输入属于 {}",
@@ -330,6 +331,53 @@ impl Ledger for Coordinator {
                 held: generation,
                 current,
             });
+        }
+        if let Some(record) = runs::get(&self.db, run).await.map_err(store_to_ledger)? {
+            let mut tree = self.tree().await?;
+            if let Some(head) = {
+                self.log
+                    .lock()
+                    .await
+                    .tree_state()
+                    .head_for(run)
+                    .map(str::to_string)
+            } {
+                tree.branch(Some(&head)).map_err(LedgerError::Corrupt)?;
+            }
+            let desired = record
+                .model
+                .effort
+                .as_ref()
+                .map_or("off", |effort| effort.as_str());
+            let current = tree.project().map_err(LedgerError::Corrupt)?.thinking_level;
+            if current != desired
+                || !tree
+                    .path(tree.leaf_id())
+                    .map_err(LedgerError::Corrupt)?
+                    .iter()
+                    .any(|entry| {
+                        matches!(
+                            entry.kind,
+                            komo_kernel::session::EntryKind::ThinkingLevelChange { .. }
+                        )
+                    })
+            {
+                let now = self.clock.now();
+                self.append_run_session_entry(
+                    run,
+                    komo_kernel::session::SessionEntry {
+                        id: EventId::new_at(now).to_string(),
+                        parent_id: tree.leaf_id().map(str::to_string),
+                        timestamp: now
+                            .format(&time::format_description::well_known::Rfc3339)
+                            .map_err(|e| LedgerError::Persist(e.to_string()))?,
+                        kind: komo_kernel::session::EntryKind::ThinkingLevelChange {
+                            thinking_level: desired.into(),
+                        },
+                    },
+                )
+                .await?;
+            }
         }
         Ok(())
     }
@@ -1303,9 +1351,10 @@ mod tests {
             .await
             .unwrap();
 
+        // The start also records the run's thinking level as a pi session entry.
         assert_eq!(
-            types(&f.coordinator, &f.session).await.last().unwrap(),
-            "run.started"
+            types(&f.coordinator, &f.session).await[2..],
+            ["run.started", "session.entry"]
         );
         let batch = f.coordinator.read(&f.session, Seq::ZERO, 0).await.unwrap();
         let started = batch

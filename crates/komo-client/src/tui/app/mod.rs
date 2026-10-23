@@ -4,8 +4,8 @@
 //! [`Effect`] 出来，由 [`crate::tui`] 的驱动去执行。于是「Esc 在 Run 进行中 = 取消，
 //! 空闲时不动草稿」这类规则是一个断言，不是一次手测。
 //!
-//! 消息面由 kernel 的 [`Surface`] 折出来——**这里不写第二套折叠**。Surface 说不出的
-//! 两件事各有一张边表：工具调用的**名字与参数**（它们在 `message.assistant` 的
+//! 执行状态由 kernel 的 [`Surface`] 折出来；树会话正文按服务端 leaf 的路径重建，旧事件
+//! 仍使用 Surface 的线性消息。Surface 说不出的两件事各有一张边表：工具调用的**名字与参数**（它们在 `message.assistant` 的
 //! `tool_calls` 和 `tool.planned` 的计划里，Surface 只留状态），以及每个 Run 的**开始
 //! 时刻与模型**（状态行要印本轮耗时与模型，而 Surface 不记时间）。
 
@@ -14,13 +14,15 @@ mod keys;
 #[cfg(test)]
 mod tests;
 mod tokens;
+mod tree;
 
 use std::collections::BTreeMap;
 
 use komo_kernel::fold::{Surface, SurfaceMessage};
 use komo_kernel::protocol::http::{
     EventPage, InterventionAnswerResponse, InterventionKind, InterventionSummary,
-    InterventionVerdict, ModelMenuEntry, ResumeResponse, SessionDetail, SubmitRunResponse,
+    InterventionVerdict, ModelMenuEntry, NavigateSessionResponse, ResumeResponse, SessionDetail,
+    SessionTreeResponse, SubmitRunResponse,
 };
 use komo_kernel::protocol::sse::SseFrame;
 use komo_kernel::types::ids::{RequestKey, RunId, Seq, SessionId, ToolCallId};
@@ -101,6 +103,21 @@ pub enum ServerEvent {
     PendingRefreshed(Vec<InterventionSummary>),
     /// `GET /v1/models` 的结果。
     ModelMenu(Vec<ModelMenuEntry>),
+    Tree {
+        response: Box<SessionTreeResponse>,
+        generation: u64,
+    },
+    TreeFailed {
+        error: String,
+        generation: u64,
+    },
+    TreeChanged(Box<NavigateSessionResponse>),
+    TreeUpdated,
+    TreeMutationFailed(String),
+    Forked {
+        session: SessionId,
+        editor_text: Option<String>,
+    },
     /// 一次操作失败。
     Failed(String),
     /// 提交 HTTP 已确认；权威的用户消息仍等 `run.accepted` 从事件流对账。
@@ -151,6 +168,29 @@ pub enum Effect {
     FetchStatus,
     /// `GET /v1/models`：模型清单与每个模型支持的 effort 档位。
     FetchModels,
+    FetchTree {
+        generation: u64,
+    },
+    Navigate {
+        target: String,
+        summarize: bool,
+    },
+    Fork {
+        target: Option<String>,
+        clone: bool,
+    },
+    ContextEdit {
+        target: String,
+        replacement: Option<serde_json::Value>,
+    },
+    Label {
+        target: String,
+        label: Option<String>,
+    },
+    Name(String),
+    Compact {
+        instructions: Option<String>,
+    },
     Quit,
 }
 
@@ -296,7 +336,7 @@ pub struct App {
     pub session: Option<SessionId>,
     pub mode: TuiMode,
     pub phase: Phase,
-    /// 由 kernel 的 fold 折出来的消息面。
+    /// kernel fold 的执行状态与旧格式消息；树模式正文由选中路径提供。
     pub surface: Surface,
     /// 已经收到的最大 seq——订阅从它之后续读。
     pub cursor: Seq,
@@ -327,6 +367,8 @@ pub struct App {
     pub draft: Option<Draft>,
     pub runs: BTreeMap<RunId, RunMeta>,
     tools: BTreeMap<ToolCallId, ToolLine>,
+    provider_calls: BTreeMap<String, ToolCallId>,
+    entry_runs: BTreeMap<String, RunId>,
     /// 下一个 Run 的模型 / effort 覆盖（`/model` `/effort`）。
     pub model: Option<String>,
     pub effort: Option<Effort>,
@@ -335,6 +377,19 @@ pub struct App {
     listing_models: bool,
     /// `/model` 的选择菜单（[`ModelPicker`]）。开着的时候按键归它，输入框禁用。
     pub model_picker: Option<ModelPicker>,
+    /// Modal browsing is opened only by an explicit command, never by SSE refresh.
+    pub tree_picker: Option<crate::tui::tree_picker::TreePicker>,
+    pub tree: Option<SessionTreeResponse>,
+    pub session_name: Option<String>,
+    branch_messages: Option<Vec<SurfaceMessage>>,
+    tree_generation: u64,
+    tree_fetching: bool,
+    tree_dirty: bool,
+    tree_projection_dirty: bool,
+    opening_tree: Option<crate::tui::tree_picker::TreePurpose>,
+    tree_busy: bool,
+    tree_mutating: bool,
+    restore_tree_controls: bool,
     /// 已经提示过"有一帧读不懂"——只说一次，之后只进日志（见
     /// [`ServerEvent::FrameSkipped`]）。
     skipped_noticed: bool,
@@ -383,11 +438,25 @@ impl App {
             draft: None,
             runs: BTreeMap::new(),
             tools: BTreeMap::new(),
+            provider_calls: BTreeMap::new(),
+            entry_runs: BTreeMap::new(),
             model: None,
             effort: None,
             model_menu: Vec::new(),
             listing_models: false,
             model_picker: None,
+            tree_picker: None,
+            tree: None,
+            session_name: None,
+            branch_messages: None,
+            tree_generation: 0,
+            tree_fetching: false,
+            tree_dirty: false,
+            tree_projection_dirty: false,
+            opening_tree: None,
+            tree_busy: false,
+            tree_mutating: false,
+            restore_tree_controls: false,
             skipped_noticed: false,
             tokens: TokenTally::default(),
             counted: Seq::ZERO,
@@ -404,7 +473,9 @@ impl App {
     // ---- 读视图 ----
 
     pub fn messages(&self) -> &[SurfaceMessage] {
-        &self.surface.messages
+        self.branch_messages
+            .as_deref()
+            .unwrap_or(&self.surface.messages)
     }
 
     /// 工具调用，按它们出现的顺序。
@@ -584,10 +655,26 @@ impl App {
 
     /// 模型菜单开着或正在补读历史时输入框禁用。
     pub fn input_enabled(&self) -> bool {
-        self.model_picker.is_none() && !self.phase.is_backfilling()
+        self.model_picker.is_none()
+            && self.tree_picker.is_none()
+            && !self.tree_busy
+            && self.opening_tree.is_none()
+            && !self.phase.is_backfilling()
     }
 
     pub fn input_hint(&self) -> String {
+        if let Some(picker) = &self.tree_picker {
+            return format!(
+                "树筛选: {} · ↑↓ 选择 · Enter 导航 · Ctrl-S 总结导航 · Ctrl-F fork · Esc 关闭",
+                picker.query
+            );
+        }
+        if self.opening_tree.is_some() {
+            return "正在读取会话树…… · Esc 关闭".into();
+        }
+        if self.tree_busy {
+            return "正在更新会话路径……".into();
+        }
         let (verify, blocked) = self.pending_breakdown();
         if let Some(picker) = &self.model_picker {
             return format!("选择下一个 Run 的模型 · {}", picker.keys_hint());

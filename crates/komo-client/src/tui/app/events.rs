@@ -18,6 +18,90 @@ impl App {
 
     pub fn apply(&mut self, event: ServerEvent) -> Vec<Effect> {
         match event {
+            ServerEvent::Tree {
+                response,
+                generation,
+            } => self.receive_tree(*response, generation),
+            ServerEvent::TreeFailed { error, generation } => {
+                if generation == self.tree_generation {
+                    self.tree_fetching = false;
+                    self.tree_busy = false;
+                    self.opening_tree = None;
+                    self.tree_dirty = false;
+                    if self.tree.is_none() && self.branch_messages.is_some() {
+                        self.tools.clear();
+                        self.repaint = true;
+                    }
+                    self.fail(format!("读取会话树失败：{error}"));
+                }
+                Vec::new()
+            }
+            ServerEvent::TreeUpdated => {
+                self.tree_mutating = false;
+                self.refresh_tree()
+            }
+            ServerEvent::TreeChanged(response) => {
+                self.tree_mutating = false;
+                if response.cancelled {
+                    self.tree_busy = false;
+                    self.restore_tree_controls = false;
+                    self.note("会话操作已取消");
+                    return Vec::new();
+                }
+                if let Some(text) = &response.editor_text {
+                    self.input.set(text.clone());
+                    self.history_pos = None;
+                    self.history_draft = None;
+                }
+                self.draft = None;
+                self.current_run = None;
+                // Use the acknowledged leaf immediately. A summary may introduce a
+                // new node, in which case hide the departed branch until GET returns.
+                let cached = self.tree.clone().map(|mut tree| {
+                    tree.leaf_id = response.leaf_id.clone();
+                    tree
+                });
+                if let Some(tree) = cached.filter(|tree| self.rebuild_branch(tree).is_ok()) {
+                    self.tree = Some(tree);
+                } else {
+                    self.branch_messages = Some(Vec::new());
+                    self.tools.clear();
+                }
+                self.repaint = true;
+                self.refresh_tree()
+            }
+            ServerEvent::TreeMutationFailed(error) => {
+                self.tree_mutating = false;
+                self.tree_busy = false;
+                self.restore_tree_controls = false;
+                self.fail(error);
+                Vec::new()
+            }
+            ServerEvent::Forked {
+                session,
+                editor_text,
+            } => {
+                let model_menu = self.model_menu.clone();
+                let model = self.model.clone();
+                let effort = self.effort.clone();
+                let seed = self.key_seed.clone();
+                let counter = self.key_counter;
+                let generation = self.tree_generation + 1;
+                *self = App::new(Some(session), super::TuiMode::Resume, seed);
+                self.model_menu = model_menu;
+                self.model = model;
+                self.effort = effort;
+                self.key_counter = counter;
+                self.tree_generation = generation;
+                self.phase = Phase::Interactive;
+                self.repaint = true;
+                self.tree_busy = true;
+                if let Some(text) = editor_text {
+                    self.input.set(text);
+                }
+                self.note("已切换到新会话");
+                self.refresh_tree()
+            }
             ServerEvent::HistoryPage(page) => {
                 for event in &page.events {
                     self.absorb(event);
@@ -84,7 +168,9 @@ impl App {
                     crate::sse::ConnectionState::Connected if was_reconnecting => {
                         self.connection = state;
                         self.note("事件订阅已恢复");
-                        return vec![Effect::FetchPending];
+                        let mut effects = vec![Effect::FetchPending];
+                        effects.extend(self.refresh_tree());
+                        return effects;
                     }
                     _ => {}
                 }
@@ -204,8 +290,27 @@ impl App {
     fn frame(&mut self, frame: SseFrame) -> Vec<Effect> {
         match frame.event {
             SseEvent::Event(event) => {
+                let refresh = matches!(
+                    &event.payload,
+                    EventPayload::MessageAssistant(_)
+                        | EventPayload::MessageUser(_)
+                        | EventPayload::ConversationBoundary(_)
+                        | EventPayload::ToolResult(_)
+                        | EventPayload::RunAccepted(_)
+                        | EventPayload::RunCompleted(_)
+                        | EventPayload::RunFailed(_)
+                        | EventPayload::RunCancelled(_)
+                        | EventPayload::RunAbandoned(_)
+                        | EventPayload::RunAbsorbed(_)
+                        | EventPayload::ContextCompacted(_)
+                        | EventPayload::ConfigChanged(_)
+                ) || event.entry.is_some();
                 self.absorb(&event);
-                Vec::new()
+                if refresh {
+                    self.refresh_tree()
+                } else {
+                    Vec::new()
+                }
             }
             // 模型正在打字。**纯界面提示**：不进 `Surface`，丢了也不影响任何东西——
             // 一轮结束时 `message.assistant` 会把完整回复正式送到（kernel 的
@@ -270,6 +375,21 @@ impl App {
         // 补读与订阅各读各的一段（订阅从游标之后起），照理不会重叠；真重了也不能把用量
         // 加两遍——**只有没见过的那一条才计数**。游标不能当这个记号：它在别处（`frame`）
         // 就已经推过了，等走到这里永远是"见过"。
+        if event.entry.is_some() && self.branch_messages.is_none() {
+            // A tree record cannot be rendered as linear event history while its
+            // authoritative path is still loading (or the tree request failed).
+            self.branch_messages = Some(Vec::new());
+        }
+        if let (Some(entry), Some(run)) = (&event.entry, &event.run) {
+            if self
+                .entry_runs
+                .insert(entry.id.clone(), run.clone())
+                .as_ref()
+                != Some(run)
+            {
+                self.tree_projection_dirty = true;
+            }
+        }
         let fresh = event.seq > self.counted;
         self.counted = self.counted.max(event.seq);
         self.surface.extend([event]);
@@ -368,6 +488,14 @@ impl App {
                     self.draft = None;
                 }
                 for call in &body.tool_calls {
+                    if self
+                        .provider_calls
+                        .insert(call.provider_call_id.clone(), call.call_id.clone())
+                        .as_ref()
+                        != Some(&call.call_id)
+                    {
+                        self.tree_projection_dirty = true;
+                    }
                     let line = self.tools.entry(call.call_id.clone()).or_insert_with(|| {
                         blank_tool(call.call_id.clone(), event.run.clone(), event.seq)
                     });

@@ -822,6 +822,7 @@ mod tests {
     fn appended(seq: u64, event: &str) -> AppendedEvent {
         AppendedEvent {
             event: komo_kernel::events::Event {
+                entry: None,
                 v: EVENT_FORMAT_VERSION,
                 seq: Seq(seq),
                 event_id: EventId::from_raw(event),

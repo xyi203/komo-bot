@@ -181,6 +181,7 @@ pub struct SessionLog {
     /// 每条记录的坐标，按追加顺序。范围读靠它 seek，不必反复解析整个会话（§8.3）。
     index: Vec<LineLoc>,
     repair: TailRepair,
+    tree: crate::session_tree::TreeState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +212,12 @@ impl SessionLog {
             }
         };
 
-        let scan = scan(&existing, &session, expectation)?;
+        let mut restored = Vec::new();
+        let scan = scan_keeping(&existing, &session, expectation, &mut |event| {
+            restored.push(event)
+        })?;
+        let tree =
+            crate::session_tree::TreeState::from_events(&restored).map_err(LedgerError::Corrupt)?;
 
         let repair = if scan.tail_bytes.is_empty() {
             TailRepair::Clean
@@ -240,7 +246,7 @@ impl SessionLog {
             }
         };
 
-        let file = tokio::fs::OpenOptions::new()
+        let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .read(true)
@@ -250,14 +256,27 @@ impl SessionLog {
         // 新建文件时目录项本身也要落盘。
         sync_dir(paths.root()).await.map_err(persist)?;
 
+        let mut length = scan.complete_len;
+        if existing.is_empty() {
+            let header = serde_json::json!({"type":"session","version":3,"id":session.as_str(),"timestamp":OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).map_err(|e| LedgerError::Persist(e.to_string()))?,"cwd":std::env::current_dir().map_err(|e| LedgerError::Persist(e.to_string()))?});
+            let bytes = format!("{header}\n");
+            file.write_all(bytes.as_bytes())
+                .await
+                .map_err(|e| LedgerError::Persist(e.to_string()))?;
+            file.sync_all()
+                .await
+                .map_err(|e| LedgerError::Persist(e.to_string()))?;
+            length = bytes.len() as u64;
+        }
         let next_seq = scan.index.last().map(|l| l.seq + 1).unwrap_or(1);
         Ok(SessionLog {
             paths,
             session,
             file,
-            length: scan.complete_len,
+            length,
             next_seq,
             index: scan.index,
+            tree,
             repair,
         })
     }
@@ -289,7 +308,24 @@ impl SessionLog {
     /// 返回之后调用方才能提交数据库事务（§8.5 的箭头顺序）。同步失败返回
     /// [`LedgerError::Persist`]，**此时不能执行后续副作用**。
     pub async fn append(&mut self, pending: PendingEvent) -> Result<AppendedEvent, LedgerError> {
-        let event = Event {
+        self.append_entry(pending, None).await
+    }
+
+    pub fn tree_state(&self) -> &crate::session_tree::TreeState {
+        &self.tree
+    }
+
+    pub fn branch(&mut self, target: Option<&str>) -> Result<(), LedgerError> {
+        self.tree.branch(target).map_err(LedgerError::Conflict)
+    }
+
+    pub async fn append_entry(
+        &mut self,
+        pending: PendingEvent,
+        entry: Option<komo_kernel::session::SessionEntry>,
+    ) -> Result<AppendedEvent, LedgerError> {
+        let mut event = Event {
+            entry: entry.map(Box::new),
             v: EVENT_FORMAT_VERSION,
             seq: Seq(self.next_seq),
             event_id: pending.event_id,
@@ -298,6 +334,14 @@ impl SessionLog {
             ts: pending.ts,
             payload: pending.payload,
         };
+        let canonical = self.tree.entry_for(&event);
+        if self.tree.contains(&canonical.id) {
+            return Err(LedgerError::Conflict(format!(
+                "duplicate session entry {}",
+                canonical.id
+            )));
+        }
+        event.entry = Some(Box::new(canonical.clone()));
         let line = event
             .to_line()
             .map_err(|e| LedgerError::Persist(format!("事件序列化失败：{e}")))?;
@@ -321,6 +365,9 @@ impl SessionLog {
             .await
             .map_err(|e| LedgerError::Persist(format!("同步 events.jsonl 失败：{e}")))?;
 
+        self.tree
+            .apply(&event, canonical)
+            .map_err(LedgerError::Corrupt)?;
         let len = bytes.len() as u64;
         self.length += len;
         self.next_seq += 1;
@@ -369,7 +416,9 @@ impl SessionLog {
             if line.is_empty() {
                 continue;
             }
-            events.push(parse_line(line, self.index[start + events.len()].offset)?);
+            let mut event = parse_line(line, self.index[start + events.len()].offset)?;
+            self.tree.hydrate_final(&mut event);
+            events.push(event);
         }
         let more = slice.len() > take;
         Ok((events, more))
@@ -391,13 +440,19 @@ pub async fn read_events(
     };
     let page = if limit == 0 { DEFAULT_PAGE } else { limit } as usize;
 
-    // 校验照旧扫完整份；只把这一页的事件留下，多留一条用来判断后面还有没有。
-    let mut events = Vec::new();
+    let mut all = Vec::new();
     scan_keeping(&bytes, session, &TailExpectation::default(), &mut |event| {
-        if event.seq.0 > from.0 && events.len() <= page {
-            events.push(event);
-        }
+        all.push(event)
     })?;
+    let state = crate::session_tree::TreeState::from_events(&all).map_err(LedgerError::Corrupt)?;
+    let mut events = all
+        .into_iter()
+        .filter(|event| event.seq.0 > from.0)
+        .take(page + 1)
+        .collect::<Vec<_>>();
+    for event in &mut events {
+        state.hydrate_final(event);
+    }
     let more = events.len() > page;
     events.truncate(page);
     Ok((events, more))
@@ -418,6 +473,14 @@ pub async fn read_all(
     scan_keeping(&bytes, session, &TailExpectation::default(), &mut |event| {
         events.push(event)
     })?;
+    let state =
+        crate::session_tree::TreeState::from_events(&events).map_err(LedgerError::Corrupt)?;
+    for event in &mut events {
+        state.hydrate_final(event);
+        if event.entry.is_none() {
+            event.entry = state.entry_at_seq(event.seq.0).cloned().map(Box::new);
+        }
+    }
     Ok(events)
 }
 
@@ -463,9 +526,18 @@ pub async fn last_event_ts(paths: &SessionPaths) -> Result<Option<OffsetDateTime
         match buffer[..end].iter().rposition(|b| *b == b'\n') {
             Some(previous) => {
                 let line = &buffer[previous + 1..end];
+                if is_header(line) {
+                    return Ok(None);
+                }
                 return Ok(Some(parse_line(line, start + previous as u64 + 1)?.ts));
             }
-            None if start == 0 => return Ok(Some(parse_line(&buffer[..end], 0)?.ts)),
+            None if start == 0 => {
+                return if is_header(&buffer[..end]) {
+                    Ok(None)
+                } else {
+                    Ok(Some(parse_line(&buffer[..end], 0)?.ts))
+                };
+            }
             // 这一块装不下整行，扩大再读。
             None => chunk = chunk.saturating_mul(4),
         }
@@ -528,14 +600,6 @@ struct Scan {
     tail_bytes: Vec<u8>,
 }
 
-fn scan(
-    bytes: &[u8],
-    session: &SessionId,
-    expectation: &TailExpectation,
-) -> Result<Scan, LedgerError> {
-    scan_keeping(bytes, session, expectation, &mut |_| {})
-}
-
 /// 同 [`scan`]；校验时解析出的每条事件按序交给 `keep`，省得调用方再解析一遍。
 fn scan_keeping(
     bytes: &[u8],
@@ -562,6 +626,18 @@ fn scan_keeping(
             )));
         }
 
+        if offset == 0 && is_header(line) {
+            let header: serde_json::Value =
+                serde_json::from_slice(line).map_err(|e| LedgerError::Corrupt(e.to_string()))?;
+            if header["version"] != 3 || header["id"] != session.as_str() {
+                return Err(LedgerError::Corrupt(
+                    "session header identity/version mismatch".into(),
+                ));
+            }
+            offset += len;
+            cursor += relative + 1;
+            continue;
+        }
         let event = parse_line(line, offset)?;
         if event.session != *session {
             return Err(LedgerError::Corrupt(format!(
@@ -612,6 +688,12 @@ fn scan_keeping(
         complete_len,
         tail_bytes,
     })
+}
+
+fn is_header(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .is_some_and(|value| value["type"] == "session")
 }
 
 fn parse_line(line: &[u8], offset: u64) -> Result<Event, LedgerError> {
@@ -756,8 +838,9 @@ mod tests {
         let bytes = tokio::fs::read(paths.events()).await.unwrap();
         assert_eq!(bytes.last(), Some(&b'\n'), "完整记录以换行结束");
         assert_eq!(
+            // pi header + one event record.
             bytes.iter().filter(|b| **b == b'\n').count(),
-            1,
+            2,
             "内容里的换行由 JSON 转义，不是物理换行"
         );
     }

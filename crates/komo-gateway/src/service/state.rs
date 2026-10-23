@@ -1483,6 +1483,39 @@ impl GatewayState {
         // 它随 `run.accepted` 落账，恢复时按它装配——等待期间 Profile 被改过也换不掉
         // 这一条 Run 的面孔。
         let config = self.snapshot();
+        let model = match model {
+            Some(model) => Some(model),
+            None => {
+                let tree = self.ledgers.tree(session).await?;
+                let projected = tree.project().map_err(GatewayError::InvalidRequest)?;
+                match projected.model {
+                    Some((provider, model_id)) if !model_id.is_empty() => {
+                        let mut selected=config.model_catalog.completions().filter_map(|(_,entry)|entry.completion()).find(|model|model.model==model_id&&(provider.is_empty()||model.provider==provider)).cloned().ok_or_else(||GatewayError::InvalidRequest(format!("当前分支的模型 {provider}/{model_id} 不在配置中，请先用 /model 选择可用模型")))?;
+                        let has_effort = tree
+                            .path(tree.leaf_id())
+                            .map_err(GatewayError::InvalidRequest)?
+                            .iter()
+                            .any(|entry| {
+                                matches!(
+                                    entry.kind,
+                                    komo_kernel::session::EntryKind::ThinkingLevelChange { .. }
+                                )
+                            });
+                        if has_effort {
+                            selected.effort = if projected.thinking_level == "off" {
+                                None
+                            } else {
+                                Some(komo_kernel::types::model::Effort::new(
+                                    &projected.thinking_level,
+                                ))
+                            };
+                        }
+                        Some(selected)
+                    }
+                    _ => None,
+                }
+            }
+        };
         let record = komo_store::repos::session::get(&self.db, session).await?;
         let agent_id = self.owner_or_default(
             record

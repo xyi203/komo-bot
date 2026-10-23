@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use komo_agent::DELEGATE_TOOL;
-use komo_agent::context::history::{self, ReplayScope};
+use komo_agent::context::history;
 use komo_agent::context::{AgentContext, InvocationContext};
 use komo_kernel::compaction::Reshape;
 use komo_kernel::events::{Event, EventPayload};
@@ -502,13 +502,6 @@ impl SegmentSource for GatewaySegments {
             }
         };
 
-        // 回放给模型的是**这一段对话**，不是这一条 Run（§8.3）。子代理的"这一段对话"
-        // 就是它那条线（§4 的 `resumes` 链）。
-        let scope = match &thread {
-            Some(chain) => ReplayScope::Thread(chain),
-            None => ReplayScope::Conversation(&run),
-        };
-
         // 交给模型的 Schema 是**能力面**渲染出来的（§4 末）：一个来源，两处用——执行器查的
         // 是同一份 `AgentSurface`（`CallEnv::surface`）。两边各拿一份就会出现"schema 里没有
         // 这个名字、执行器却查得到"。tool definitions 要先算好——系统提示的 RULES 按它挑
@@ -520,7 +513,7 @@ impl SegmentSource for GatewaySegments {
         if let Some(executor) = &self.executor {
             executor.await_mcp(identity.surface.names()).await;
         }
-        let tools = match &self.executor {
+        let mut tools = match &self.executor {
             Some(executor) => executor.definitions_for(&identity.surface),
             // 精简装配（没有执行器）：目录里这一段允许的那些就是 Schema——判据还是那一份
             // 能力面，不是又一句"这次能用什么"。
@@ -557,19 +550,6 @@ impl SegmentSource for GatewaySegments {
             ),
         };
 
-        // history 的纯逻辑先选窗口（`komo-agent`），再对**选中的**条目读正文与
-        // `output.json`（`context_sources`，§8）。
-        let selected = history::entries(&surface, scope);
-        let resolved =
-            match context_sources::resolve_history(selected, &payloads, self.outputs.as_deref())
-                .await
-            {
-                Ok(resolved) => resolved,
-                // 外置的正文按引用读不出来 = 会话缺内容：停下来报告（§8.3），别把一条空的
-                // 用户消息当成"用户就是这么说的"发出去。
-                Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
-            };
-
         let invocation = match &delegate {
             Some(spec) => InvocationContext::Delegated(spec.clone()),
             None => InvocationContext::Main,
@@ -605,12 +585,20 @@ impl SegmentSource for GatewaySegments {
             invocation,
             projection,
         };
-        let decayed = surface
-            .runs
-            .get(&run)
-            .map(|view| view.decayed.clone())
-            .unwrap_or_default();
-        let context = template.clone().assemble(resolved, decayed);
+        let context = match compaction::assemble_context_with_tools(
+            &events,
+            &run,
+            thread.as_deref(),
+            template.clone(),
+            &payloads,
+            self.outputs.as_deref(),
+            &mut tools,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(error) => return Err(self.halt_if_corrupt(&run, error).await),
+        };
         self.templates
             .lock()
             .expect("装配模板")
@@ -674,7 +662,7 @@ impl SegmentSource for GatewaySegments {
         // 其余交给 loop 在一轮收尾之后、或缓存放冷之后来问。
         let (compaction_job, compactor, context) = match compaction::current(self.config.as_ref()) {
             Some(config) if command.is_none() => {
-                let online = komo_kernel::compaction::online_state(&events, &run);
+                let online = compaction::context_online(&events, &run, thread.as_deref());
                 // 压缩只在上一轮的调用全部收尾时判：切点落在轮次开头，一轮的调用与结果不分开。
                 // 衰减不切轮次、只换已完成结果的正文，没收尾的调用（恢复之后续跑）不受影响。
                 let settled = resume.is_none() && surface.open_calls(&run).is_empty();
@@ -689,8 +677,14 @@ impl SegmentSource for GatewaySegments {
                             model: &model,
                             session: &session,
                             run: &run,
-                            cache_cold: compaction::cache_cold(&events, self.clock.now()),
+                            cache_cold: compaction::context_cache_cold(
+                                &events,
+                                &run,
+                                thread.as_deref(),
+                                self.clock.now(),
+                            ),
                             settled,
+                            branch: komo_agent::context::tree::enabled(&events),
                         })
                     })
                     .flatten();
@@ -709,13 +703,14 @@ impl SegmentSource for GatewaySegments {
                             }
                             Err(other) => return Err(other),
                         };
-                        let context = match compaction::assemble_context(
+                        let context = match compaction::assemble_context_with_tools(
                             &events,
                             &run,
                             thread.as_deref(),
                             template.clone(),
                             &payloads,
                             self.outputs.as_deref(),
+                            &mut tools,
                         )
                         .await
                         {
@@ -1069,6 +1064,7 @@ mod tests {
 
     fn event(seq: u64, run: &RunId, payload: EventPayload) -> Event {
         Event {
+            entry: None,
             v: 1,
             seq: Seq(seq),
             event_id: EventId::from_raw(format!("evt-{seq}")),

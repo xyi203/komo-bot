@@ -29,6 +29,10 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+#[path = "session.rs"]
+pub mod session;
+pub use session::*;
+
 use super::config::{ConfigIssue, KeyPath, SourceFile};
 use crate::cron::{CronFiring, CronJob, JobStatus, NotifyPolicy, OverlapPolicy};
 use crate::types::chat::PeerId;

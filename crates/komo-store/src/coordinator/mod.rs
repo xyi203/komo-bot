@@ -47,6 +47,7 @@ pub struct Coordinator {
     paths: SessionPaths,
     payloads: PayloadStore,
     log: tokio::sync::Mutex<SessionLog>,
+    operation: tokio::sync::Mutex<()>,
     clock: Arc<dyn Clock>,
     /// 本次启动身份，写进 `tool_attempts.executor`（§8.7）。
     executor: Option<ExecutorId>,
@@ -105,6 +106,7 @@ impl Coordinator {
             payloads: PayloadStore::new(paths.clone()),
             paths,
             log: tokio::sync::Mutex::new(log),
+            operation: tokio::sync::Mutex::new(()),
             clock,
             executor: None,
         })
@@ -115,6 +117,121 @@ impl Coordinator {
     pub fn with_executor(mut self, executor: ExecutorId) -> Self {
         self.executor = Some(executor);
         self
+    }
+
+    pub async fn session_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.operation.lock().await
+    }
+
+    pub async fn ensure_idle(&self) -> Result<(), LedgerError> {
+        if crate::repos::runs::list_for_session(&self.db, &self.session)
+            .await
+            .map_err(store_to_ledger)?
+            .iter()
+            .any(|run| !run.state.is_terminal())
+        {
+            return Err(LedgerError::Conflict(
+                "等待当前会话的任务结束或取消后再切换、编辑或复制分支".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn tree(&self) -> Result<komo_kernel::session::SessionTree, LedgerError> {
+        self.log
+            .lock()
+            .await
+            .tree_state()
+            .tree()
+            .map_err(LedgerError::Corrupt)
+    }
+
+    pub async fn branch(&self, target: Option<&str>) -> Result<(), LedgerError> {
+        self.log.lock().await.branch(target)
+    }
+
+    pub async fn append_session_entry(
+        &self,
+        entry: komo_kernel::session::SessionEntry,
+    ) -> Result<Seq, LedgerError> {
+        let now = self.clock.now();
+        let appended = self
+            .log
+            .lock()
+            .await
+            .append_entry(
+                PendingEvent::new(
+                    EventId::new_at(now),
+                    None,
+                    now,
+                    EventPayload::Unknown {
+                        event_type: "session.entry".into(),
+                        raw: serde_json::Value::Null,
+                    },
+                ),
+                Some(entry),
+            )
+            .await?;
+        self.commit(&appended, |_ex, _appended, _now| Box::pin(async { Ok(()) }))
+            .await?;
+        Ok(appended.seq())
+    }
+
+    pub async fn index_imported(&self) -> Result<(), LedgerError> {
+        let records = crate::session_log::scan_records(&self.paths, &self.session).await?;
+        let session = self.session.clone();
+        let bytes = self.log.lock().await.byte_len();
+        let now = self.clock.now();
+        self.db
+            .with_write_retry(move |ex| {
+                let (records, session) = (records.clone(), session.clone());
+                Box::pin(async move {
+                    for record in &records {
+                        crate::repos::session::index_event_in(ex, record).await?;
+                    }
+                    if let Some(last) = records.last() {
+                        crate::repos::session::advance_applied_in(
+                            ex,
+                            &session,
+                            last.seq(),
+                            bytes,
+                            now,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                }) as BoxFuture<'_, Result<(), StoreError>>
+            })
+            .await
+            .map_err(store_to_ledger)
+    }
+
+    pub async fn append_run_session_entry(
+        &self,
+        run: &RunId,
+        entry: komo_kernel::session::SessionEntry,
+    ) -> Result<Seq, LedgerError> {
+        let now = self.clock.now();
+        let appended = self
+            .log
+            .lock()
+            .await
+            .append_entry(
+                PendingEvent::new(
+                    EventId::new_at(now),
+                    Some(run.clone()),
+                    now,
+                    EventPayload::Unknown {
+                        event_type: "session.entry".into(),
+                        raw: serde_json::Value::Null,
+                    },
+                ),
+                Some(entry),
+            )
+            .await?;
+        self.commit(&appended, |_ex, _event, _now| Box::pin(async { Ok(()) }))
+            .await?;
+        Ok(appended.seq())
     }
 
     pub fn session(&self) -> &SessionId {

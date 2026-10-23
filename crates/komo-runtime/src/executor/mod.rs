@@ -1489,7 +1489,7 @@ impl ToolExecutor {
             .await
     }
 
-    /// 接着做的结论：`FollowOutcome` 折成"已转给 #短号"（或"正在跑，排在后面"），
+    /// 接着做的结论：`FollowOutcome` 折成"已转给 #短号"（或"正在跑，会并进去 / 排在后面"），
     /// `SpawnError` 折成一句失败原因（短号解析不到 / 有歧义 / 提交失败）。
     async fn settle_follow(
         &self,
@@ -1501,7 +1501,12 @@ impl ToolExecutor {
         let (result, content, is_error) = match outcome {
             Ok(followed) => {
                 let content = if followed.queued_behind {
-                    format!("#{} 正在跑，这句排在它后面", followed.short_id)
+                    // 不带契约的追问以插话受理，在它下一步之前并进去；并不进去（带契约、模型
+                    // 不同）就排在后面。受理那一刻分不出是哪一种，两句都说。
+                    format!(
+                        "#{} 正在跑，这句会在它下一步之前并进去；并不进去的（带结果契约等）排在它后面",
+                        followed.short_id
+                    )
                 } else {
                     format!("已转给 #{}", followed.short_id)
                 };

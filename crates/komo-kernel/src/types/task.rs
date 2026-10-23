@@ -57,7 +57,7 @@ pub struct FollowOutcome {
     pub session: SessionId,
     pub short_id: String,
     /// 提交的这一刻，那个任务会话已经有一条没跑完的 Run——模型据此措辞
-    /// "正在跑，这句排在它后面"而不是"已转给"（§4.1）。
+    /// "正在跑，这句会并进去 / 排在后面"而不是"已转给"（§4.1）。
     pub queued_behind: bool,
 }
 

@@ -359,10 +359,11 @@ impl Inbound for Dispatcher {
             return Ok(ack);
         }
 
-        // ⑥ 普通文本。
+        // ⑥ 普通文本。**插话**（§6）：宿主 Run 忙着跑工具时，这句话由它在下一次请求模型
+        // 之前并进去，不排到整条 Run 后面（实测排过 18–22 分钟，2026-10-23）。
         let submitted = self
             .state
-            .submit(
+            .submit_interjecting(
                 &session,
                 msg.request_key.clone(),
                 msg.text.clone(),

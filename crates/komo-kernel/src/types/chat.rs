@@ -223,6 +223,13 @@ pub enum Outbound {
         run: RunId,
         reason: String,
     },
+    /// 这条 Run 并进了正在跑的另一条（`into`，§6 插话）：回答由宿主给，这条自己没有终态
+    /// 回复。只有带"处理中"回复卡片的渠道（飞书）要据此把卡片收尾；其余渠道视为已处理。
+    RunAbsorbed {
+        session: SessionId,
+        run: RunId,
+        into: RunId,
+    },
 }
 
 impl Outbound {
@@ -398,6 +405,18 @@ mod tests {
         );
         assert!(Outbound::from_stored(r#"{"kind":"carrier_pigeon"}"#).is_err());
         assert!(Outbound::from_stored("not json").is_err());
+    }
+
+    #[test]
+    fn a_run_absorbed_delivery_round_trips_through_storage() {
+        let absorbed = Outbound::RunAbsorbed {
+            session: SessionId::from_raw("s-1"),
+            run: RunId::from_raw("r-2"),
+            into: RunId::from_raw("r-1"),
+        };
+        let json = serde_json::to_string(&absorbed).unwrap();
+        assert!(json.contains(r#""kind":"run_absorbed""#), "{json}");
+        assert_eq!(Outbound::from_stored(&json).unwrap(), Some(absorbed));
     }
 
     #[test]

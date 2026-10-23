@@ -51,6 +51,43 @@ async fn a_replayed_message_produces_one_run() {
     assert_eq!(runs.len(), 1, "账本上只有一个 Run");
 }
 
+/// 聊天渠道的普通消息以插话受理（§6，2026-10-23）：宿主 Run 忙着跑工具时，排队的消息
+/// 要靠 `run.accepted` 上的 `interject` 才并得进去——实测不带它排过 18–22 分钟。
+#[tokio::test]
+async fn a_plain_chat_message_is_accepted_as_an_interjection() {
+    let gateway = TestGateway::start().await;
+    let ack = gateway
+        .dispatcher()
+        .handle(operator_dm("稍等", "telegram:50"))
+        .await
+        .expect("处理了");
+    let InboundAck::Queued { session, run } = ack else {
+        panic!("应该排队：{ack:?}");
+    };
+
+    let paths = gateway.state().ledgers.paths_for(&session);
+    let (events, _) = komo_store::session_log::read_events(
+        &paths,
+        &session,
+        komo_kernel::types::ids::Seq::ZERO,
+        0,
+    )
+    .await
+    .expect("读得出会话");
+    let accepted = events
+        .into_iter()
+        .find_map(|event| match event.payload {
+            komo_kernel::events::EventPayload::RunAccepted(body)
+                if event.run.as_ref() == Some(&run) =>
+            {
+                Some(body)
+            }
+            _ => None,
+        })
+        .expect("这条 Run 受理过");
+    assert!(accepted.interject, "渠道的普通消息带插话标记");
+}
+
 /// ① 的另一半：重发的 `/answer` 只答一次。
 ///
 /// 停住 Run 的是一次"结果不明"（测试工具 `unsure`，§7.5 的 `verify`）：平台重投同一条

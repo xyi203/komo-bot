@@ -124,7 +124,7 @@ impl FeishuSender {
 
     /// 一个 `Outbound` 送到一个会话。
     ///
-    /// `RunFinished` 有回复卡片就换掉那张卡片，没有才发文本。
+    /// `RunFinished` 有回复卡片就换掉那张卡片，没有才发文本；`RunAbsorbed` 只收尾卡片。
     pub async fn deliver(
         &self,
         peer: &ChannelPeer,
@@ -133,6 +133,10 @@ impl FeishuSender {
         match message {
             Outbound::RunFinished { run, summary, .. } => {
                 self.finish_run(peer, &run, &summary).await?;
+                Ok(SendOutcome::Sent)
+            }
+            Outbound::RunAbsorbed { run, .. } => {
+                self.absorb_run(peer, &run).await;
                 Ok(SendOutcome::Sent)
             }
             other => {
@@ -231,6 +235,27 @@ impl FeishuSender {
         }
         self.send_all(peer, &follow).await?;
         Ok(())
+    }
+
+    /// Run 并进了正在跑的另一条（§6 插话）：它的"处理中"卡片换成灰色的"已并入"。
+    ///
+    /// 没有卡片（重启后账没了、卡片没发出去）就什么都不发——回答在宿主那条 Run 上，
+    /// 这里补一条文本只是刷屏。PATCH 失败也只记日志：重试时账里的卡片已经取走，重投
+    /// 什么也做不了。
+    async fn absorb_run(&self, peer: &ChannelPeer, run: &RunId) {
+        let Some(slot) = self.take_run_card(run, peer) else {
+            return;
+        };
+        let Some(message_id) = settle(&slot, CARD_SETTLE_WAIT).await else {
+            return;
+        };
+        if let Err(error) = self
+            .api
+            .patch_message(&message_id, &feishu::run_absorbed_card().to_string())
+            .await
+        {
+            tracing::warn!(%run, %error, "飞书：把被并入的 Run 卡片收尾失败");
+        }
     }
 
     fn take_run_card(
@@ -638,6 +663,43 @@ mod tests {
         assert!(fake.calls_to("messages").is_empty());
     }
 
+    fn run_absorbed() -> Outbound {
+        Outbound::RunAbsorbed {
+            session: komo_kernel::types::ids::SessionId::from_raw("s-1"),
+            run: RunId::from_raw("run-1"),
+            into: RunId::from_raw("run-0"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_absorbed_run_turns_its_card_into_a_grey_absorbed_card() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let sender = sender(&fake);
+        let card_id = open_card(&fake, &sender).await;
+
+        let outcome = sender.send(&peer("oc_1"), run_absorbed()).await.unwrap();
+
+        assert_eq!(outcome, SendOutcome::Sent);
+        assert_eq!(fake.patched_message_ids(), vec![card_id]);
+        let card = patched_card(&fake, 0);
+        assert_eq!(card["config"]["update_multi"], json!(true));
+        assert_eq!(card["header"]["template"], json!("grey"));
+        assert!(card.to_string().contains("已并入正在进行的回答"), "{card}");
+        assert!(fake.calls_to("messages").is_empty(), "不该发文本刷屏");
+    }
+
+    #[tokio::test]
+    async fn an_absorbed_run_without_a_card_sends_nothing() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let outcome = sender(&fake)
+            .send(&peer("oc_1"), run_absorbed())
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendOutcome::Sent);
+        assert!(fake.calls_to("patch").is_empty());
+        assert!(fake.calls_to("messages").is_empty());
+    }
+
     #[tokio::test]
     async fn a_pending_card_for_a_thread_peer_replies_in_thread() {
         let fake = FakeOpenApi::start(Behavior::default()).await;
@@ -670,5 +732,42 @@ mod tests {
             .await
             .unwrap();
         assert!(fake.calls_to("patch").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_absorbed_run_that_beats_its_card_waits_and_still_closes_the_card() {
+        let fake = FakeOpenApi::start(Behavior::default()).await;
+        let sender = Arc::new(sender(&fake));
+        let ticket = sender.expect_run_card(&RunId::from_raw("run-1"), &peer("oc_1"));
+
+        let absorbing = {
+            let sender = Arc::clone(&sender);
+            tokio::spawn(async move { sender.send(&peer("oc_1"), run_absorbed()).await.unwrap() })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!absorbing.is_finished(), "卡片还在路上时并入通知该等着");
+        let card_id = sender
+            .reply_run_card(ticket, "om_origin", false)
+            .await
+            .unwrap();
+        absorbing.await.unwrap();
+
+        assert_eq!(fake.patched_message_ids(), vec![card_id]);
+        assert!(patched_card(&fake, 0).to_string().contains("已并入"));
+        assert!(fake.calls_to("messages").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_absorbed_card_update_is_not_resent_as_text() {
+        let fake = FakeOpenApi::start(Behavior::refuse_patch()).await;
+        let sender = sender(&fake);
+        open_card(&fake, &sender).await;
+
+        sender
+            .send(&peer("oc_1"), run_absorbed())
+            .await
+            .expect("收尾失败只记日志");
+        assert_eq!(fake.calls_to("patch").len(), 1);
+        assert!(fake.calls_to("messages").is_empty(), "不发文本刷屏");
     }
 }

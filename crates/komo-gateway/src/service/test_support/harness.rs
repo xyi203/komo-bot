@@ -179,10 +179,12 @@ impl MemSender {
     pub fn texts(&self) -> Vec<String> {
         self.sent()
             .into_iter()
-            .map(|message| match message.outbound {
-                Outbound::Text { text } => text,
-                Outbound::RunFinished { summary, .. } => summary,
-                Outbound::NeedsAttention { reason, .. } => reason,
+            .filter_map(|message| match message.outbound {
+                Outbound::Text { text } => Some(text),
+                Outbound::RunFinished { summary, .. } => Some(summary),
+                Outbound::NeedsAttention { reason, .. } => Some(reason),
+                // 不是文本：只是告诉渠道"这条并进别的 Run 了"。
+                Outbound::RunAbsorbed { .. } => None,
             })
             .collect()
     }

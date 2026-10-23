@@ -45,6 +45,10 @@ impl TelegramSender {
         peer: &ChannelPeer,
         message: Outbound,
     ) -> Result<SendOutcome, TelegramError> {
+        // 并入别的 Run 的那条没有回复卡片可收尾：视为已处理，不发消息。
+        if matches!(message, Outbound::RunAbsorbed { .. }) {
+            return Ok(SendOutcome::Sent);
+        }
         self.send_rendered_all(peer.chat_id.as_str(), &telegram::render(&message))
             .await?;
         Ok(SendOutcome::Sent)
@@ -132,6 +136,26 @@ mod tests {
         assert_eq!(sends[0]["parse_mode"], "MarkdownV2");
         assert!(sends[1].get("parse_mode").is_none(), "重发不带 parse_mode");
         assert_eq!(sends[0]["text"], sends[1]["text"], "正文原样重发");
+    }
+
+    /// 并入别的 Run 的那条没有回复卡片：视为已处理，一条消息也不发。
+    #[tokio::test]
+    async fn an_absorbed_run_is_settled_without_sending_anything() {
+        let fake = FakeBotApi::start(Behavior::default()).await;
+        let sender = TelegramSender::with_api(fake.api());
+        let outcome = sender
+            .send(
+                &ChannelPeer::new(ChannelPlatform::Telegram, "11"),
+                Outbound::RunAbsorbed {
+                    session: komo_kernel::types::ids::SessionId::from_raw("s-1"),
+                    run: komo_kernel::types::ids::RunId::from_raw("run-2"),
+                    into: komo_kernel::types::ids::RunId::from_raw("run-1"),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendOutcome::Sent);
+        assert!(fake.calls_to("sendMessage").is_empty());
     }
 
     #[tokio::test]

@@ -585,6 +585,40 @@ impl LlmClient for TasksLlm {
                         serde_json::json!({ "task_id": task_id, "prompt": "再看看功耗" }),
                     )])
                 }
+                // 带 task_id 又带契约的追问：照旧排队，不插话（并入会丢掉新契约）。
+                "功耗带契约" => {
+                    let task_id = self
+                        .follow_task_id
+                        .lock()
+                        .expect("follow 目标")
+                        .clone()
+                        .expect("follow 目标短号该在发这条消息之前写好");
+                    Script::Calls(vec![(
+                        "task",
+                        serde_json::json!({
+                            "task_id": task_id,
+                            "prompt": "再看看功耗",
+                            "contract": { "type": "object", "required": ["watts"] }
+                        }),
+                    )])
+                }
+                "等门" | "任务等门" => Script::Calls(vec![("gate", serde_json::json!({}))]),
+                "派等门任务" => Script::Calls(vec![(
+                    "task",
+                    serde_json::json!({ "prompt": "任务等门", "title": "等门任务" }),
+                )]),
+                "追问等门任务" => {
+                    let task_id = self
+                        .follow_task_id
+                        .lock()
+                        .expect("follow 目标")
+                        .clone()
+                        .expect("follow 目标短号该在发这条消息之前写好");
+                    Script::Calls(vec![(
+                        "task",
+                        serde_json::json!({ "task_id": task_id, "prompt": "任务补一句" }),
+                    )])
+                }
                 "跑个慢命令" => Script::Calls(vec![(
                     "task",
                     serde_json::json!({ "prompt": "跑一下 echo hi", "title": "慢命令" }),
@@ -865,12 +899,90 @@ async fn a_background_task_reports_back_through_home() {
     let task_runs = runs_of(&gateway, &task.session).await;
     assert_eq!(task_runs.len(), 2, "{task_runs:?}");
     assert_eq!(task_runs[1].model.model, "gpt-cheap", "⑤ 沿用上一条的模型");
+    // 派出去的第一条输入没有宿主可并，不带插话标记；不带契约的追问以插话受理。
+    assert!(
+        !accepted_of(&gateway, &task.session, &task_runs[0].run)
+            .await
+            .interject
+    );
+    assert!(
+        accepted_of(&gateway, &task.session, &task_runs[1].run)
+            .await
+            .interject,
+        "无契约的追问以插话受理"
+    );
     let report_2 = wait_report(&gateway, &home_session, &task_runs[1].run).await;
     gateway.wait_terminal(&report_2).await;
     eventually("接着做的结果照样经 home 转告", || {
         texts_to(&sender, "111")
             .iter()
             .any(|text| text == "转告：功耗 300W。")
+    })
+    .await;
+
+    // ── 5. 带契约的追问照旧排队：并入沿用宿主的快照，新契约会丢。
+    let (_, home_run_3) = dm(&gateway, "功耗带契约", "dm-3").await;
+    gateway.wait_terminal(&home_run_3).await;
+    let task_runs = runs_of(&gateway, &task.session).await;
+    assert_eq!(task_runs.len(), 3, "{task_runs:?}");
+    assert!(
+        !accepted_of(&gateway, &task.session, &task_runs[2].run)
+            .await
+            .interject,
+        "带契约的追问不插话"
+    );
+
+    gateway.stop().await;
+}
+
+/// 渠道的普通消息插话（§6，2026-10-23）：home 忙着跑工具（停在一道门上）时说的第二句话，
+/// 门开之后并进同一条 Run，不另开一条；被并走的那条是终态 `absorbed`，渠道收到一条
+/// `RunAbsorbed`（飞书据此收尾它的"处理中"卡片），回答只由宿主给一次。
+#[tokio::test]
+async fn a_chat_message_is_absorbed_into_a_running_home_and_its_channel_is_told() {
+    use komo_gateway::service::test_support::Gate;
+
+    let home = Home::with_config(&tasks_config());
+    let gate = Gate::new();
+    home.install_tools(vec![gate.tool()]);
+    let llm = TasksLlm::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let (_, host) = dm(&gateway, "等门", "dm-1").await;
+    gate.wait_entered(1).await;
+    let (_, second) = dm(&gateway, "补一句", "dm-2").await;
+    assert_eq!(
+        gateway.db_state(&host).await,
+        RunState::Running,
+        "第二句到的时候 home 还在跑"
+    );
+
+    gate.release();
+    assert_eq!(
+        gateway.wait_terminal(&host).await.summary.state,
+        RunState::Completed
+    );
+    assert_eq!(
+        gateway.wait_terminal(&second).await.summary.state,
+        RunState::Absorbed,
+        "第二句并进了 home，没有另开一条"
+    );
+
+    eventually("渠道收到了并入通知", || {
+        sender.to_chat("111").iter().any(|message| {
+            matches!(&message.outbound, Outbound::RunAbsorbed { run, into, .. }
+                if run == &second && into == &host)
+        })
+    })
+    .await;
+    // 回答只有宿主那一次：被并走的那条自己没有回复。
+    eventually("宿主答了并进来的那句", || {
+        texts_to(&sender, "111")
+            .iter()
+            .any(|text| text == "没见过这句：补一句")
     })
     .await;
 
@@ -942,6 +1054,73 @@ async fn a_task_result_is_absorbed_into_a_running_home() {
             .any(|text| text == "转告：热水器 60 度。")
     })
     .await;
+
+    gateway.stop().await;
+}
+
+/// 任务正忙时的追问（无契约）并进它正在跑的那条 Run：被并走的追问是终态 `absorbed`，
+/// 结果只由宿主那一次交回 home，不会为追问另交一份（§4、§6，2026-10-23）。
+#[tokio::test]
+async fn a_follow_up_absorbed_into_a_busy_task_reports_back_once() {
+    use komo_gateway::service::test_support::Gate;
+
+    let home = Home::with_config(&tasks_config());
+    let gate = Gate::new();
+    home.install_tools(vec![gate.tool()]);
+    let llm = TasksLlm::new();
+    let sender = MemSender::new(ChannelPlatform::Telegram);
+    let gateway = home
+        .start_with(Arc::clone(&llm) as Arc<dyn LlmClient>, Arc::clone(&sender))
+        .await;
+
+    let (home_session, first) = dm(&gateway, "派等门任务", "dm-1").await;
+    gateway.wait_terminal(&first).await;
+    gate.wait_entered(1).await;
+    let task = komo_store::repos::session::list(&gateway.state().db, false)
+        .await
+        .expect("读会话列表")
+        .into_iter()
+        .find(|record| record.kind == komo_store::models::SessionKind::Task)
+        .expect("派出了一个任务");
+    let host = runs_of(&gateway, &task.session).await[0].run.clone();
+    assert_eq!(gateway.db_state(&host).await, RunState::Running);
+
+    llm.set_follow_target(&komo_kernel::types::task::short_id(&task.session));
+    let (_, follow) = dm(&gateway, "追问等门任务", "dm-2").await;
+    gateway.wait_terminal(&follow).await;
+    let task_runs = runs_of(&gateway, &task.session).await;
+    assert_eq!(task_runs.len(), 2, "{task_runs:?}");
+    let follow_up = task_runs[1].run.clone();
+
+    gate.release();
+    assert_eq!(
+        gateway.wait_terminal(&host).await.summary.state,
+        RunState::Completed
+    );
+    assert_eq!(
+        gateway.wait_terminal(&follow_up).await.summary.state,
+        RunState::Absorbed,
+        "追问并进了正在跑的任务，没有另开一条"
+    );
+    eventually("宿主那一次把结果交回并转告", || {
+        texts_to(&sender, "111")
+            .iter()
+            .any(|text| text == "转告：没见过这句：任务补一句")
+    })
+    .await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let reports = runs_of(&gateway, &home_session)
+        .await
+        .into_iter()
+        .filter(|record| record.request_key.as_str().starts_with("task-result:"))
+        .collect::<Vec<_>>();
+    assert_eq!(reports.len(), 1, "只有宿主那一次交回：{reports:?}");
+    assert_eq!(
+        reports[0].request_key.as_str(),
+        format!("task-result:{host}"),
+        "被并走的追问不另交回"
+    );
 
     gateway.stop().await;
 }

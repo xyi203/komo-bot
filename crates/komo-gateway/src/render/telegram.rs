@@ -69,6 +69,8 @@ pub fn render(outbound: &Outbound) -> Vec<RenderedMessage> {
         Outbound::NeedsAttention { reason, .. } => {
             markdown_segments(&format!("⚠️ 需要你判断\n\n{reason}"))
         }
+        // 没有回复卡片可收尾：什么都不发。
+        Outbound::RunAbsorbed { .. } => Vec::new(),
     }
 }
 

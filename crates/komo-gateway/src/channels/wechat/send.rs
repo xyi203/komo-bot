@@ -182,6 +182,10 @@ impl WeChatSender {
         peer: &ChannelPeer,
         message: Outbound,
     ) -> Result<SendOutcome, WeChatBotError> {
+        // 并入别的 Run 的那条没有回复卡片可收尾；没有令牌时也不该因此挂成 `Deferred`。
+        if matches!(message, Outbound::RunAbsorbed { .. }) {
+            return Ok(SendOutcome::Sent);
+        }
         let text = wechat::render(&message);
         self.send_text(&peer.chat_id, &text).await?;
         Ok(SendOutcome::Sent)
@@ -262,6 +266,26 @@ mod tests {
             fake.calls_to("/ilink/bot/sendmessage").is_empty(),
             "Deferred 不联网补（§11.4）"
         );
+    }
+
+    /// 并入别的 Run 的那条没有回复卡片：没有令牌也不 `Deferred`，更不联网。
+    #[tokio::test]
+    async fn an_absorbed_run_is_settled_without_a_token_or_a_message() {
+        let fake = FakeILink::start(Default::default()).await;
+        let outcome = fake
+            .sender()
+            .send(
+                &peer("wxid_op"),
+                Outbound::RunAbsorbed {
+                    session: komo_kernel::types::ids::SessionId::from_raw("s-1"),
+                    run: komo_kernel::types::ids::RunId::from_raw("run-2"),
+                    into: komo_kernel::types::ids::RunId::from_raw("run-1"),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome, SendOutcome::Sent);
+        assert!(fake.calls_to("/ilink/bot/sendmessage").is_empty());
     }
 
     /// `NoContext` 这个**变体**就是触发条件，不是某段文案。

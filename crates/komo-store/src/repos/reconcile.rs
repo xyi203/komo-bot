@@ -243,7 +243,8 @@ async fn deliveries_blocking(ex: &mut dyn Executor, session: &str) -> Result<usi
         .filter(|row| {
             match Outbound::from_stored(&row.outbound) {
                 Ok(Some(Outbound::RunFinished { session: s, .. }))
-                | Ok(Some(Outbound::NeedsAttention { session: s, .. })) => s.as_str() == session,
+                | Ok(Some(Outbound::NeedsAttention { session: s, .. }))
+                | Ok(Some(Outbound::RunAbsorbed { session: s, .. })) => s.as_str() == session,
                 Ok(Some(Outbound::Text { .. })) => origin.as_deref().is_some_and(|origin| {
                     origin.split_once(':').is_some_and(|(platform, chat)| {
                         platform == row.platform && chat == row.chat_id

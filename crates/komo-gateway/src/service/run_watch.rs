@@ -342,9 +342,28 @@ async fn step(
             Step::Done
         }
         // 并进了正在跑的那条（§6 插话）：回答在宿主那里，由宿主的看客投出去；这一条没有
-        // 自己的回复要投，也不再有终态帧。
-        EventPayload::RunAbsorbed(_) => {
+        // 自己的回复要投，也不再有终态帧。**不调 `finish`**：后台任务只由宿主那一次交回
+        // （`report_to_parent`），被并走的追问不另交一份。
+        //
+        // 有渠道来源的，把"并入"投给来源：飞书那张"处理中"卡片靠它收尾，别的渠道忽略。
+        EventPayload::RunAbsorbed(body) => {
             state.release_dependents().await;
+            if let Some(peer) = watcher.peer()
+                && let Err(error) = state
+                    .notifier
+                    .log()
+                    .deliver(
+                        &DeliveryTarget::to_peer(peer.clone()),
+                        Outbound::RunAbsorbed {
+                            session: session.clone(),
+                            run: run.clone(),
+                            into: body.into.clone(),
+                        },
+                    )
+                    .await
+            {
+                tracing::warn!(%error, %run, "并入通知投不出去");
+            }
             Step::Done
         }
         // 操作者在清单上放弃（§7.5）：**与取消分得开**——不是用户不想跑了，而是这件事

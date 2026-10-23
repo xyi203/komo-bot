@@ -226,6 +226,7 @@ impl TaskSpawner for GatewayTaskSpawner {
                 origin_peer,
                 model,
                 spec.options.contract,
+                false,
             )
             .await
             .map_err(|error| SpawnError::Failed(format!("提交第一条输入失败：{error}")))?;
@@ -260,6 +261,9 @@ impl TaskSpawner for GatewayTaskSpawner {
         };
         let model = self.task_model(&options, inherited, &target.agent_id)?;
 
+        // 追问以插话受理：任务正忙时在它下一次请求模型之前并进去，不排到整条 Run 后面。
+        // 带契约的照旧排队——并入沿用宿主的快照，新契约会丢（§6）。
+        let interject = options.contract.is_none();
         let response = self
             .state
             .submit_task(
@@ -269,6 +273,7 @@ impl TaskSpawner for GatewayTaskSpawner {
                 origin_peer,
                 model,
                 options.contract,
+                interject,
             )
             .await
             .map_err(|error| SpawnError::Failed(format!("提交失败：{error}")))?;

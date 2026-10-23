@@ -1303,7 +1303,9 @@ impl GatewayState {
             .await
     }
 
-    /// 同 [`Self::submit`]，再带上 `task` 的结果契约（冻结进这条 Run 的快照，§4）。
+    /// 同 [`Self::submit`]，再带上 `task` 的结果契约（冻结进这条 Run 的快照，§4），以及
+    /// 要不要插话（`interject`）。**带契约的输入不该插话**：并入沿用宿主的快照，新契约会
+    /// 丢，所以调用方带 `contract` 时传 `false`。
     pub async fn submit_task(
         self: &Arc<Self>,
         session: &SessionId,
@@ -1312,6 +1314,7 @@ impl GatewayState {
         peer: Option<ChannelPeer>,
         model: Option<ModelConfig>,
         contract: Option<DelegateContract>,
+        interject: bool,
     ) -> Result<SubmitRunResponse, GatewayError> {
         self.accept(
             session,
@@ -1321,7 +1324,7 @@ impl GatewayState {
             model,
             None,
             contract,
-            false,
+            interject,
         )
         .await
     }
@@ -1329,7 +1332,7 @@ impl GatewayState {
     /// 同 [`Self::submit`]，但这句话要求**插话**（§6）：会话里有 Run 正在跑时，由它在下一次
     /// 请求模型之前并进去，而不是排到它后面。HTTP 调它（TUI 的 Enter，
     /// `SubmitRunRequest::interject`，没有对端）；`task` 交回的结果也走它，带着任务 Run 的
-    /// 来源对端——对端与宿主不同就不并（§6）。聊天渠道的消息照旧排队。
+    /// 来源对端——对端与宿主不同就不并（§6）。聊天渠道的普通消息同样走它（2026-10-23）。
     pub async fn submit_interjecting(
         self: &Arc<Self>,
         session: &SessionId,

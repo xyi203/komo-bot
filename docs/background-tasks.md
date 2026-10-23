@@ -80,6 +80,8 @@ task(prompt, title, task_id?, model?, effort?, contract?)
 - **并入**：交回的输入带插话标记，home 还在跑、且来源对端相同时在一轮收尾后并进来
   （`docs/komo_bot.md` §6），不另开 Run；home 空闲时照旧开一条。被并走的那条的看客见到
   `run.absorbed` 就收工，回复由宿主的看客投。
+  带 `task_id`、没有 `contract` 的追问同样以插话受理（2026-10-23），并进任务正在跑的那条 Run，
+  结果只由宿主那一次交回；带 `contract` 的追问照旧排队（并入会沿用宿主的契约，新契约会丢）。
 - 旧的 `dispatch` / `follow` / `delegate` 调用按落盘时的名字回放，不改写。
 
 ## 3. 重启

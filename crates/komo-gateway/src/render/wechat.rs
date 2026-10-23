@@ -38,6 +38,8 @@ pub fn render(outbound: &Outbound) -> String {
         Outbound::NeedsAttention { reason, .. } => {
             truncate(&format!("⚠️ 需要你判断\n\n{reason}"), MESSAGE_LIMIT)
         }
+        // 没有回复卡片可收尾，也不该发一句空话：发送口在渲染之前就跳过了它。
+        Outbound::RunAbsorbed { .. } => String::new(),
     }
 }
 

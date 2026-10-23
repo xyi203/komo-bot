@@ -70,6 +70,8 @@ pub fn render(outbound: &Outbound) -> Vec<RenderedMessage> {
         Outbound::NeedsAttention { reason, .. } => {
             text_segments(&format!("⚠️ 需要你判断\n\n{reason}"))
         }
+        // 只收尾回复卡片（`FeishuSender::deliver` 处理），不是一条要发的消息。
+        Outbound::RunAbsorbed { .. } => Vec::new(),
     }
 }
 
@@ -131,6 +133,16 @@ pub fn run_moved_card() -> Value {
         "已结束".to_string(),
         "grey",
         json!([note("结果见下方消息")]),
+    )
+}
+
+/// 这条消息并进了正在跑的那条 Run（§6 插话）时，把它的"处理中"卡片收尾：回答在另一张
+/// 卡片上，这一张不会再有结果。
+pub fn run_absorbed_card() -> Value {
+    card(
+        "已并入".to_string(),
+        "grey",
+        json!([note("已并入正在进行的回答")]),
     )
 }
 
@@ -230,7 +242,12 @@ mod tests {
     /// 不只看第一层：以后它们长到哪一层都得拦住。
     #[test]
     fn a_card_carries_no_component_the_2_0_schema_dropped() {
-        for card in [run_pending_card(), run_moved_card(), run_result_card("x").0] {
+        for card in [
+            run_pending_card(),
+            run_moved_card(),
+            run_absorbed_card(),
+            run_result_card("x").0,
+        ] {
             let mut pending = vec![card.clone()];
             while let Some(node) = pending.pop() {
                 match node {

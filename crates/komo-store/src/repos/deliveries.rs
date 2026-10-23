@@ -78,6 +78,7 @@ impl TursoDeliveryRepo {
             Outbound::NeedsAttention { session, run, .. } => {
                 Some(format!("attention:{session}:{run}"))
             }
+            Outbound::RunAbsorbed { session, run, .. } => Some(format!("absorbed:{session}:{run}")),
             Outbound::Text { .. } => None,
         };
         self.record_once(id, target, outbound, key.as_deref(), now)
